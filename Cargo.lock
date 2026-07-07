@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -430,6 +430,7 @@ dependencies = [
  "cortiq-core",
  "cortiq-engine",
  "cortiq-server",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -437,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64",
  "bincode",
@@ -451,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-engine"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -473,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-server"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "axum",

@@ -1,5 +1,7 @@
 //! Cortiq CLI — sparse task-routed model inference.
 
+mod convert;
+
 use clap::{Parser, Subcommand};
 use cortiq_core::CmfModel;
 use cortiq_engine::{CortiqRuntime, Pipeline, SamplerConfig};
@@ -121,6 +123,18 @@ enum Commands {
         /// Also listen on ollama-compatible port
         #[arg(long)]
         compat_port: Option<u16>,
+    },
+    /// Convert a Hugging Face checkpoint to .cmf — native Rust, no Python
+    Convert {
+        /// HF model directory (config.json + *.safetensors + tokenizer.json)
+        #[arg(long)]
+        model: String,
+        /// Quantization for 2-D weights: q8 | q4 | f16
+        #[arg(long, default_value = "q8")]
+        quant: String,
+        /// Output .cmf path
+        #[arg(long)]
+        output: String,
     },
     /// Interactive chat mode
     Run {
@@ -302,6 +316,13 @@ async fn main() -> anyhow::Result<()> {
             task,
             compat_port,
         } => cmd_serve(&model, &host, port, &task, compat_port).await,
+        Commands::Convert { model, quant, output } => {
+            convert::run_convert(&model, &quant, &output, |f| {
+                println!("@PROGRESS {f:.4}");
+            })?;
+            println!("✓ wrote {output}");
+            Ok(())
+        }
         Commands::Run {
             model,
             task,
