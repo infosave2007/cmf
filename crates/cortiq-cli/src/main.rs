@@ -112,6 +112,9 @@ enum Commands {
         /// Port to listen on
         #[arg(short, long, default_value = "8080")]
         port: u16,
+        /// Host / interface to bind (use 127.0.0.1 for local-only)
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
         /// Default task mask
         #[arg(short, long, default_value = "general")]
         task: String,
@@ -295,9 +298,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Serve {
             model,
             port,
+            host,
             task,
             compat_port,
-        } => cmd_serve(&model, port, &task, compat_port).await,
+        } => cmd_serve(&model, &host, port, &task, compat_port).await,
         Commands::Run {
             model,
             task,
@@ -343,6 +347,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn cmd_serve(
     model_path: &str,
+    host: &str,
     port: u16,
     default_task: &str,
     _compat_port: Option<u16>,
@@ -382,8 +387,8 @@ async fn cmd_serve(
     let app = build_router(state);
 
     // Start server
-    let addr = format!("0.0.0.0:{}", port);
-    println!("  ✓ API server:     http://localhost:{}/v1/chat/completions", port);
+    let addr = format!("{}:{}", host, port);
+    println!("  ✓ API server:     http://{}:{}/v1/chat/completions", host, port);
     println!("  ✓ Web dashboard:  http://localhost:{}/", port);
     println!("  ✓ Status:         http://localhost:{}/v1/cortiq/status", port);
     println!();

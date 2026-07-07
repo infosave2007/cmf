@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-07-07
+
+### Added
+
+- `cortiq serve --host <HOST>` to control the bind address (default `0.0.0.0`;
+  set `127.0.0.1` for a local-only server).
+- A `/healthz` liveness endpoint on the server — for process managers that embed
+  `cortiq serve` as a local model backend (e.g. an LLM gateway).
+
 ## [0.1.1] — 2026-07-07
 
 ### Added
@@ -46,6 +55,7 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/infosave2007/cmf/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/infosave2007/cmf/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/infosave2007/cmf/releases/tag/v0.1.0
