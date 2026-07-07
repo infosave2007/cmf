@@ -7,8 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Native GatedDeltaNet (Qwen3.5 linear-attention) conversion — currently still
-  uses the Python path.
+## [0.1.7] — 2026-07-07
+
+### Added
+
+- **GatedDeltaNet linear attention** (Qwen3.5 hub layout) in `cortiq convert` —
+  the per-layer linear/full schedule, the canonical GatedDeltaNet core, the
+  zero-centered `(1+w)` norms, and the multimodal-wrapper tensor names are all
+  handled natively. Validated: Qwen3.5-0.8B converts and generates identically
+  to the reference Python converter. Fused qwen3_next / AgentWorld checkpoints
+  (interleaved `in_proj_qkvz`/`in_proj_ba`) still use the Python path.
 
 ## [0.1.6] — 2026-07-07
 
@@ -114,7 +122,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/infosave2007/cmf/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/infosave2007/cmf/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/infosave2007/cmf/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/infosave2007/cmf/compare/v0.1.3...v0.1.4

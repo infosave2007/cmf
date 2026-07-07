@@ -99,9 +99,9 @@ cortiq import-gguf model.gguf --output model.cmf --quant q8
 ```
 
 Quantization: `q8` · `q8_2f` (two-field, best quality/size) · `q4` · `f16`.
-Standard dense **and mixture-of-experts** models (qwen2 / qwen3 / llama /
-mistral / qwen-moe) convert natively; linear-attention (GatedDeltaNet)
-architectures still use the bundled Python converter (`converter/`).
+Dense, **mixture-of-experts**, and **GatedDeltaNet** models (qwen2 / qwen3 /
+qwen3.5 / llama / mistral / qwen-moe) convert natively; fused qwen3_next
+checkpoints still use the bundled Python converter (`converter/`).
 
 Run inference:
 

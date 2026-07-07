@@ -7,12 +7,13 @@
 //! RMSNorm + RoPE + SwiGLU, optional attention biases). Tensor handling is
 //! arch-agnostic — 1-D tensors are stored f16, 2-D weights are quantized — so
 //! it works by tensor presence without a hard-coded tensor set. Mixture-of-experts
-//! is supported (router + per-expert matrices). Linear-attention (GatedDeltaNet)
-//! folding is not implemented natively yet and still uses the Python path.
+//! is supported (router + per-expert matrices), as is GatedDeltaNet linear
+//! attention in the Qwen3.5 hub layout (separate in_proj_qkv/z/a/b). Fused
+//! qwen3_next / AgentWorld checkpoints still use the Python path.
 
 use cortiq_core::format::{CmfHeader, CmfModel, TensorSpec, TokenizerBundle, CMF_VERSION};
 use cortiq_core::quant::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use cortiq_core::types::{LayerType, ModelArch, MoeConfig, NormStyle, QuantType, TensorDtype};
+use cortiq_core::types::{LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle, QuantType, TensorDtype};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -30,6 +31,31 @@ const F16_TINY: f32 = 6.103_515_625e-5;
 /// stored scale disagree and inference degrades to garbage.
 fn f16_scale(raw: f32) -> f32 {
     f16_to_f32(f32_to_f16(raw)).max(F16_TINY)
+}
+
+/// Canonicalize a source tensor name to the CMF layout the runtime expects, or
+/// `None` to skip it. Multimodal wrappers (Qwen3.5) nest the text model under
+/// `model.language_model.*`; vision (`*.visual.*`) and the MTP head (`mtp.*`) are
+/// dropped — plain greedy decoding is correct without MTP.
+fn canon_name(raw: &str) -> Option<String> {
+    if raw.contains(".visual.") || raw.starts_with("visual.") || raw.starts_with("mtp.") || raw.contains(".mtp.") {
+        return None;
+    }
+    for pfx in ["model.language_model.", "language_model.model.", "language_model."] {
+        if let Some(rest) = raw.strip_prefix(pfx) {
+            return Some(format!("model.{rest}"));
+        }
+    }
+    Some(raw.to_string())
+}
+
+/// Small, noise-sensitive 2-D projections the reference converter keeps at f16
+/// (a bit-flip there is costly): the GDN a/b gate projections and MoE routers.
+fn force_f16(name: &str) -> bool {
+    name.ends_with("linear_attn.in_proj_a.weight")
+        || name.ends_with("linear_attn.in_proj_b.weight")
+        || name.ends_with("mlp.gate.weight")
+        || name.ends_with("shared_expert_gate.weight")
 }
 
 /// Quantization choice for 2-D weight matrices.
@@ -237,10 +263,47 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     let hidden = cfg_usize(tc, "hidden_size").ok_or_else(|| anyhow::anyhow!("config: missing hidden_size"))?;
     let n_heads = cfg_usize(tc, "num_attention_heads").ok_or_else(|| anyhow::anyhow!("config: missing num_attention_heads"))?;
     let n_layers = cfg_usize(tc, "num_hidden_layers").ok_or_else(|| anyhow::anyhow!("config: missing num_hidden_layers"))?;
-    // Linear-attention (GatedDeltaNet) folding is not implemented natively yet.
-    if tc.get("linear_num_value_heads").is_some() || tc.get("linear_conv_kernel_dim").is_some() {
-        anyhow::bail!("this model uses linear-attention (GatedDeltaNet) layers — not supported by the native converter yet (use the Python converter)");
-    }
+    // Linear-attention (GatedDeltaNet, Qwen3.5): the per-layer schedule comes
+    // from config.layer_types; the vendor operator is carried 1:1 and we declare
+    // the canonical core so the runtime dispatches it.
+    let layer_types: Vec<LayerType> = match tc.get("layer_types").and_then(|v| v.as_array()) {
+        Some(a) => a
+            .iter()
+            .map(|v| {
+                if v.as_str() == Some("linear_attention") {
+                    LayerType::LinearAttention
+                } else {
+                    LayerType::FullAttention
+                }
+            })
+            .collect(),
+        None => vec![LayerType::FullAttention; n_layers],
+    };
+    let has_linear = layer_types.iter().any(|t| matches!(t, LayerType::LinearAttention));
+    let lnv = cfg_usize(tc, "linear_num_value_heads");
+    let lvd = cfg_usize(tc, "linear_value_head_dim");
+    let linear_core = if has_linear {
+        Some(LinearCoreConfig {
+            kind: "gated_delta_net".into(),
+            num_heads: lnv.unwrap_or(0),
+            nphase: None,
+            value_head_dim: lvd.unwrap_or(0),
+        })
+    } else {
+        None
+    };
+    // Qwen3.5 nests rope params under `rope_parameters`.
+    let rope = tc.get("rope_parameters");
+    let rope_theta = tc
+        .get("rope_theta")
+        .and_then(|v| v.as_f64())
+        .or_else(|| rope.and_then(|r| r.get("rope_theta")).and_then(|v| v.as_f64()))
+        .unwrap_or(10_000.0);
+    let prf = tc
+        .get("partial_rotary_factor")
+        .and_then(|v| v.as_f64())
+        .or_else(|| rope.and_then(|r| r.get("partial_rotary_factor")).and_then(|v| v.as_f64()))
+        .unwrap_or(1.0) as f32;
     // Mixture-of-experts: the FFN becomes a router + per-expert matrices. Tensor
     // handling is unchanged (experts are ordinary 2-D matrices); we just declare
     // the MoE config so the runtime dispatches it. Router presence per layer
@@ -257,7 +320,13 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         }
     });
     let head_dim = cfg_usize(tc, "head_dim").unwrap_or(hidden / n_heads.max(1));
-    let norm_style = if model_type.to_lowercase().contains("gemma") { NormStyle::Gemma } else { NormStyle::Qwen };
+    // Zero-centered RMSNorm x̂·(1+w): Gemma family and Qwen3.5 / Qwen3-Next.
+    let mt = model_type.to_lowercase();
+    let norm_style = if mt.contains("gemma") || mt.starts_with("qwen3_5") || mt.contains("qwen3_next") {
+        NormStyle::Gemma
+    } else {
+        NormStyle::Qwen
+    };
     Ok(ModelArch {
         arch_name: model_type,
         hidden_size: hidden,
@@ -269,21 +338,21 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         num_kv_heads: cfg_usize(tc, "num_key_value_heads").unwrap_or(n_heads),
         head_dim,
         vocab_size: cfg_usize(tc, "vocab_size").ok_or_else(|| anyhow::anyhow!("config: missing vocab_size"))?,
-        layer_types: vec![LayerType::FullAttention; n_layers],
+        layer_types,
         rms_norm_eps: tc.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6),
         norm_style,
-        rope_theta: tc.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(10_000.0),
+        rope_theta,
         tie_word_embeddings: config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false),
-        partial_rotary_factor: tc.get("partial_rotary_factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+        partial_rotary_factor: prf,
         mtp: None,
         moe,
-        linear_core: None,
+        linear_core,
         max_position_embeddings: cfg_usize(tc, "max_position_embeddings").unwrap_or(32_768),
-        linear_conv_kernel_dim: None,
-        linear_num_key_heads: None,
-        linear_num_value_heads: None,
-        linear_key_head_dim: None,
-        linear_value_head_dim: None,
+        linear_conv_kernel_dim: cfg_usize(tc, "linear_conv_kernel_dim"),
+        linear_num_key_heads: cfg_usize(tc, "linear_num_key_heads"),
+        linear_num_value_heads: lnv,
+        linear_key_head_dim: cfg_usize(tc, "linear_key_head_dim"),
+        linear_value_head_dim: lvd,
     })
 }
 
@@ -528,21 +597,29 @@ pub fn run_convert(
     let mut done = 0usize;
     for file in &files {
         for m in &file.tensors {
+            done += 1;
+            progress(done as f32 / total as f32);
+            let Some(name) = canon_name(&m.name) else { continue };
+            // qwen3_next/AgentWorld checkpoints fuse the GDN projections
+            // (in_proj_qkvz / in_proj_ba) with a group-interleaved layout the
+            // native converter doesn't split yet; the hub Qwen3.5 layout
+            // (separate in_proj_qkv/z/a/b) converts fine.
+            if name.contains(".linear_attn.in_proj_qkvz") || name.contains(".linear_attn.in_proj_ba") {
+                anyhow::bail!("fused GDN projections (qwen3_next / AgentWorld checkpoint) — use the Python converter; the hub Qwen3.5 layout converts natively");
+            }
             let vals = to_f32(&m.dtype, file.bytes(m))?;
             let numel: usize = m.shape.iter().product();
             if numel != vals.len() {
-                anyhow::bail!("tensor '{}': {} values for shape {:?}", m.name, vals.len(), m.shape);
+                anyhow::bail!("tensor '{name}': {} values for shape {:?}", vals.len(), m.shape);
             }
-            // 1-D tensors, tiny tensors, and non-2-D always go f16 (norms, biases).
-            let two_d = m.shape.len() == 2 && numel >= GROUP_SIZE;
+            // 1-D tensors, tiny tensors, non-2-D, and gate-critical projections go f16.
+            let two_d = m.shape.len() == 2 && numel >= GROUP_SIZE && !force_f16(&name);
             let (dt, data) = if two_d {
                 quantize_2d(quant, &vals, m.shape[0], m.shape[1])
             } else {
                 (TensorDtype::F16, encode_f16(&vals))
             };
-            tensors.push(TensorSpec { name: m.name.clone(), dtype: dt, shape: m.shape.clone(), data });
-            done += 1;
-            progress(done as f32 / total as f32);
+            tensors.push(TensorSpec { name, dtype: dt, shape: m.shape.clone(), data });
         }
     }
 

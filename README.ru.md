@@ -101,9 +101,9 @@ cortiq import-gguf model.gguf --output model.cmf --quant q8
 ```
 
 Квантизация: `q8` · `q8_2f` (двухполевая, лучшее качество/размер) · `q4` · `f16`.
-Стандартные dense- **и MoE-модели** (qwen2 / qwen3 / llama / mistral / qwen-moe)
-конвертируются нативно; для линейного внимания (GatedDeltaNet) пока используется
-встроенный Python-конвертер (`converter/`).
+Dense-, **MoE-** и **GatedDeltaNet-модели** (qwen2 / qwen3 / qwen3.5 / llama /
+mistral / qwen-moe) конвертируются нативно; для слитых qwen3_next-чекпоинтов пока
+используется встроенный Python-конвертер (`converter/`).
 
 Запустите инференс:
 
