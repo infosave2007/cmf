@@ -1,0 +1,277 @@
+//! Canonical quantization layouts and scalar dequantization.
+//!
+//! Layouts are byte-identical to `.vmfc` ("quants first, then scales"):
+//! - `q8_row`  (2-D `[out, in]`): `[int8: out·in][f16: out]`,
+//!   `w = q[o,i] · scale[o]`, `scale[o] = absmax(row_o) / 127`.
+//! - `q4_block`: groups of 32 over the flattened tensor (zero-padded),
+//!   `[u8: ceil(n/32)·16][f16: ceil(n/32)]`, nibbles low-first,
+//!   `w = (q − 8) · scale`, `scale = absmax(group) / 7`.
+//!
+//! 1-D tensors (norms) are always stored `f16`.
+
+use crate::format::TensorEntry;
+use crate::types::TensorDtype;
+
+pub const GROUP_SIZE: usize = 32;
+
+/// IEEE half → f32.
+#[inline]
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h >> 15) as u32;
+    let exp = ((h >> 10) & 0x1F) as u32;
+    let mant = (h & 0x3FF) as u32;
+    let bits = if exp == 0 {
+        if mant == 0 {
+            sign << 31
+        } else {
+            // subnormal: normalize
+            let mut e = 0u32;
+            let mut m = mant;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e += 1;
+            }
+            m &= 0x3FF;
+            (sign << 31) | ((127 - 15 - e) << 23) | (m << 13)
+        }
+    } else if exp == 0x1F {
+        (sign << 31) | (0xFF << 23) | (mant << 13)
+    } else {
+        (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// f32 → IEEE half (round-to-nearest-even). Used by the Rust writer.
+#[inline]
+pub fn f32_to_f16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let mut exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x7F_FFFF;
+
+    if exp == 0xFF {
+        // Inf / NaN
+        return sign | 0x7C00 | if mant != 0 { 0x200 } else { 0 };
+    }
+    exp -= 127 - 15;
+    if exp >= 0x1F {
+        return sign | 0x7C00; // overflow → Inf
+    }
+    if exp <= 0 {
+        if exp < -10 {
+            return sign; // underflow → 0
+        }
+        // subnormal
+        let m = mant | 0x80_0000;
+        let shift = (14 - exp) as u32;
+        let half = m >> shift;
+        let round = (m >> (shift - 1)) & 1;
+        return sign | ((half + round) as u16);
+    }
+    let half = ((exp as u32) << 10) | (mant >> 13);
+    let round = (mant >> 12) & 1;
+    // round-to-nearest-even: bump if round bit set and (sticky or odd)
+    let sticky = (mant & 0xFFF) != 0;
+    let bump = round & (sticky as u32 | (half & 1));
+    sign | ((half + bump) as u16)
+}
+
+/// bfloat16 → f32.
+#[inline]
+pub fn bf16_to_f32(h: u16) -> f32 {
+    f32::from_bits((h as u32) << 16)
+}
+
+/// Dequantize a full `q8_row` tensor: `[int8: out·in][f16: out]`.
+pub fn dequant_q8_row(bytes: &[u8], out_dim: usize, in_dim: usize, dst: &mut [f32]) {
+    debug_assert_eq!(bytes.len(), out_dim * in_dim + out_dim * 2);
+    debug_assert_eq!(dst.len(), out_dim * in_dim);
+    let (q, scales) = bytes.split_at(out_dim * in_dim);
+    for o in 0..out_dim {
+        let s = f16_to_f32(u16::from_le_bytes([scales[o * 2], scales[o * 2 + 1]]));
+        let row = &q[o * in_dim..(o + 1) * in_dim];
+        let out = &mut dst[o * in_dim..(o + 1) * in_dim];
+        for (d, &b) in out.iter_mut().zip(row) {
+            *d = (b as i8) as f32 * s;
+        }
+    }
+}
+
+/// Dequantize a full `q8_2f` tensor (two-field 𝒲×θ, dtype 9):
+/// `[int8: out·in][f16 row_scale: out][f16 col: in]`,
+/// `w[o,i] = q[o,i] · row_scale[o] · col[i]`. The column field absorbs
+/// outlier input channels — validated in vmfcore (+37% at equal size
+/// for the two-field family; q8_2f recovers ~75% of the q8→f16 gap).
+pub fn dequant_q8_2f(bytes: &[u8], out_dim: usize, in_dim: usize, dst: &mut [f32]) {
+    debug_assert_eq!(bytes.len(), out_dim * in_dim + out_dim * 2 + in_dim * 2);
+    debug_assert_eq!(dst.len(), out_dim * in_dim);
+    let (q, rest) = bytes.split_at(out_dim * in_dim);
+    let (scales, cols) = rest.split_at(out_dim * 2);
+    let col: Vec<f32> = (0..in_dim)
+        .map(|i| f16_to_f32(u16::from_le_bytes([cols[i * 2], cols[i * 2 + 1]])))
+        .collect();
+    for o in 0..out_dim {
+        let s = f16_to_f32(u16::from_le_bytes([scales[o * 2], scales[o * 2 + 1]]));
+        let row = &q[o * in_dim..(o + 1) * in_dim];
+        let out = &mut dst[o * in_dim..(o + 1) * in_dim];
+        for i in 0..in_dim {
+            out[i] = (row[i] as i8) as f32 * s * col[i];
+        }
+    }
+}
+
+/// Dequantize a full `q4_block` tensor into `dst` (`dst.len()` = real
+/// element count; the trailing pad group elements are discarded).
+pub fn dequant_q4_block(bytes: &[u8], dst: &mut [f32]) {
+    let n_groups = (dst.len() + GROUP_SIZE - 1) / GROUP_SIZE;
+    let packed_len = n_groups * GROUP_SIZE / 2;
+    debug_assert_eq!(bytes.len(), packed_len + n_groups * 2);
+    let (packed, scales) = bytes.split_at(packed_len);
+    for g in 0..n_groups {
+        let s = f16_to_f32(u16::from_le_bytes([scales[g * 2], scales[g * 2 + 1]]));
+        let base = g * GROUP_SIZE;
+        let pk = &packed[g * 16..(g + 1) * 16];
+        for (k, &byte) in pk.iter().enumerate() {
+            let i0 = base + k * 2;
+            let i1 = i0 + 1;
+            if i0 < dst.len() {
+                dst[i0] = ((byte & 0x0F) as f32 - 8.0) * s;
+            }
+            if i1 < dst.len() {
+                dst[i1] = (((byte >> 4) & 0x0F) as f32 - 8.0) * s;
+            }
+        }
+    }
+}
+
+/// Dequantize a full `vbit` tensor (P13 FIG.3, grouped variant):
+/// [u8 bits: rows][f16 scales: rows·cols/32][bit-packed rows MSB-first,
+/// each row padded to a whole byte]. w = (u − L)·scale, L = 2^{b−1}−1.
+pub fn dequant_vbit(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) -> Result<(), String> {
+    if cols % GROUP_SIZE != 0 {
+        return Err(format!("vbit: cols {cols} not a multiple of {GROUP_SIZE}"));
+    }
+    let ng = cols / GROUP_SIZE;
+    let bits = &bytes[..rows];
+    if let Some(&b) = bits.iter().find(|&&b| !(3..=8).contains(&b)) {
+        return Err(format!("vbit: bit-width {b} outside safe range 3..=8"));
+    }
+    let sc_off = rows;
+    let data_off = sc_off + rows * ng * 2;
+    let mut off = data_off;
+    for r in 0..rows {
+        let b = bits[r] as usize;
+        let l = ((1usize << (b - 1)) - 1) as f32;
+        let rowlen = (cols * b + 7) / 8;
+        let data = &bytes[off..off + rowlen];
+        let (mut acc, mut nbits, mut idx) = (0u64, 0usize, 0usize);
+        for i in 0..cols {
+            while nbits < b {
+                acc = (acc << 8) | data[idx] as u64;
+                idx += 1;
+                nbits += 8;
+            }
+            let u = ((acc >> (nbits - b)) & ((1u64 << b) - 1)) as f32;
+            nbits -= b;
+            let so = (r * ng + i / GROUP_SIZE) * 2;
+            let s = f16_to_f32(u16::from_le_bytes([bytes[sc_off + so], bytes[sc_off + so + 1]]));
+            dst[r * cols + i] = (u - l) * s;
+        }
+        off += rowlen;
+    }
+    Ok(())
+}
+
+
+/// Expected byte length of a tensor given dtype and element count.
+pub fn expected_nbytes(dtype: TensorDtype, shape: &[usize]) -> Option<usize> {
+    let n: usize = shape.iter().product();
+    Some(match dtype {
+        TensorDtype::F32 => n * 4,
+        TensorDtype::F16 | TensorDtype::Bf16 => n * 2,
+        TensorDtype::Q8Row => {
+            let out = *shape.first()?;
+            n + out * 2
+        }
+        TensorDtype::Q4Block => {
+            let groups = (n + GROUP_SIZE - 1) / GROUP_SIZE;
+            groups * 16 + groups * 2
+        }
+        TensorDtype::Q8_2f => {
+            let out = *shape.first()?;
+            let inn = n / out.max(1);
+            n + out * 2 + inn * 2
+        }
+        _ => return None, // reserved dtypes: size not defined by this reader
+    })
+}
+
+/// Dequantize any supported tensor into f32.
+pub fn dequant_tensor(entry: &TensorEntry, bytes: &[u8], dst: &mut [f32]) -> Result<(), String> {
+    let n: usize = entry.shape.iter().product();
+    if dst.len() != n {
+        return Err(format!(
+            "dst len {} != tensor elems {} for '{}'",
+            dst.len(),
+            n,
+            entry.name
+        ));
+    }
+    match entry.dtype {
+        TensorDtype::F32 => {
+            for (i, d) in dst.iter_mut().enumerate() {
+                *d = f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+            }
+        }
+        TensorDtype::F16 => {
+            for (i, d) in dst.iter_mut().enumerate() {
+                *d = f16_to_f32(u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]));
+            }
+        }
+        TensorDtype::Bf16 => {
+            for (i, d) in dst.iter_mut().enumerate() {
+                *d = bf16_to_f32(u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]));
+            }
+        }
+        TensorDtype::Q8Row => {
+            if entry.shape.len() != 2 {
+                return Err(format!("q8_row tensor '{}' must be 2-D", entry.name));
+            }
+            dequant_q8_row(bytes, entry.shape[0], entry.shape[1], dst);
+        }
+        TensorDtype::Q4Block => dequant_q4_block(bytes, dst),
+        TensorDtype::Vbit => {
+            if entry.shape.len() != 2 {
+                return Err(format!("vbit tensor '{}' must be 2-D", entry.name));
+            }
+            dequant_vbit(bytes, entry.shape[0], entry.shape[1], dst)?;
+        }
+        TensorDtype::Q8_2f => {
+            if entry.shape.len() != 2 {
+                return Err(format!("q8_2f tensor '{}' must be 2-D", entry.name));
+            }
+            dequant_q8_2f(bytes, entry.shape[0], entry.shape[1], dst);
+        }
+        other => {
+            return Err(format!(
+                "dtype {} of '{}' is reserved — not decodable by this runtime",
+                other.name(),
+                entry.name
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// Approximate stored bytes per weight for a dtype (informational).
+pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
+    match dtype {
+        TensorDtype::F32 => 4.0,
+        TensorDtype::F16 | TensorDtype::Bf16 => 2.0,
+        TensorDtype::Q8Row | TensorDtype::Q8_2f => 1.0,
+        TensorDtype::Q4Block | TensorDtype::Q4Col | TensorDtype::Mix84 => 0.5625,
+        TensorDtype::Vbit => 0.5,
+        TensorDtype::U8 => 1.0,
+    }
+}

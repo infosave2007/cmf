@@ -1,0 +1,420 @@
+//! OpenAI-compatible API endpoints, backed by the real inference
+//! pipeline. Generation runs in `spawn_blocking` behind a Mutex — a
+//! panic inside the pipeline becomes a 500, never a dead process.
+
+use crate::streaming::{self, ChatStream};
+use crate::AppState;
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Json, Response},
+    routing::{get, post},
+    Router,
+};
+use cortiq_engine::pipeline::GenerateResult;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+/// Register OpenAI-compatible routes.
+pub fn routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/v1/models", get(list_models))
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(completions))
+}
+
+// ─── Models ──────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct ModelsResponse {
+    object: String,
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Serialize)]
+struct ModelEntry {
+    id: String,
+    object: String,
+    created: u64,
+    owned_by: String,
+}
+
+async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse> {
+    let arch = state.runtime.model().arch();
+    Json(ModelsResponse {
+        object: "list".to_string(),
+        data: vec![ModelEntry {
+            id: format!("{}-cortiq", arch.arch_name),
+            object: "model".to_string(),
+            created: chrono::Utc::now().timestamp() as u64,
+            owned_by: "cortiq".to_string(),
+        }],
+    })
+}
+
+// ─── Shared types ────────────────────────────────────────
+
+#[derive(Deserialize, Serialize, Clone)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct CortiqExtension {
+    task: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Usage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+}
+
+#[derive(Serialize)]
+struct CortiqResponseMeta {
+    task_used: String,
+    sparsity: f32,
+    active_layers: usize,
+    execution_mode: String,
+    tokens_per_second: f64,
+}
+
+#[derive(Serialize)]
+struct ApiError {
+    error: ApiErrorBody,
+}
+
+#[derive(Serialize)]
+struct ApiErrorBody {
+    message: String,
+    r#type: String,
+}
+
+fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(ApiError {
+            error: ApiErrorBody {
+                message: message.into(),
+                r#type: "invalid_request_error".to_string(),
+            },
+        }),
+    )
+        .into_response()
+}
+
+/// Run one generation on the shared pipeline (blocking thread).
+/// Returns the result plus wall-clock milliseconds.
+async fn run_generation(
+    state: Arc<AppState>,
+    prompt_ids: Vec<u32>,
+    max_tokens: usize,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
+    on_token: Option<cortiq_engine::TokenCallback>,
+) -> Result<(GenerateResult, f64), Response> {
+    let mask = state.runtime.active_mask().await;
+    let started = std::time::Instant::now();
+
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut p = state.pipeline.blocking_lock();
+        if let Some(t) = temperature {
+            p.sampler_config.temperature = t;
+        }
+        if let Some(tp) = top_p {
+            p.sampler_config.top_p = tp;
+        }
+        if seed.is_some() {
+            p.sampler_config.seed = seed;
+        }
+        p.generate_from_ids(&prompt_ids, max_tokens, mask.as_ref(), on_token)
+    })
+    .await;
+
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    match outcome {
+        Ok(Ok(result)) => Ok((result, elapsed_ms)),
+        Ok(Err(e)) => Err(error_response(StatusCode::BAD_REQUEST, e)),
+        Err(join_err) => {
+            tracing::error!("generation task panicked: {join_err}");
+            Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "generation failed",
+            ))
+        }
+    }
+}
+
+// ─── Chat Completions ────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ChatCompletionsRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: u32,
+    #[serde(default)]
+    stream: bool,
+    /// Cortiq extension: task routing
+    #[serde(default)]
+    cortiq: Option<CortiqExtension>,
+}
+
+#[derive(Serialize)]
+struct ChatCompletionsResponse {
+    id: String,
+    object: String,
+    created: u64,
+    model: String,
+    choices: Vec<ChatChoice>,
+    usage: Usage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cortiq: Option<CortiqResponseMeta>,
+}
+
+#[derive(Serialize)]
+struct ChatChoice {
+    index: u32,
+    message: ChatMessage,
+    finish_reason: String,
+}
+
+async fn chat_completions(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ChatCompletionsRequest>,
+) -> Response {
+    // Task routing: an unknown task is the caller's error, said loudly.
+    if let Some(task) = req.cortiq.as_ref().and_then(|c| c.task.as_deref()) {
+        if let Err(e) = state.runtime.switch_task(task).await {
+            return error_response(StatusCode::NOT_FOUND, e.to_string());
+        }
+    }
+
+    if req.messages.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "messages must not be empty");
+    }
+
+    // Chat template → prompt ids (uses real special tokens).
+    let prompt_ids = {
+        let p = state.pipeline.lock().await;
+        let msgs: Vec<(String, String)> = req
+            .messages
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect();
+        p.tokenizer.apply_chat_template(&msgs)
+    };
+
+    let request_id = format!("cmf-{}", uuid::Uuid::new_v4());
+    let created = chrono::Utc::now().timestamp() as u64;
+    let max_tokens = req.max_tokens as usize;
+
+    if req.stream {
+        let (tx, stream) = ChatStream::new(64);
+        let model = req.model.clone();
+        let id = request_id.clone();
+        let state2 = state.clone();
+
+        tokio::spawn(async move {
+            // Role prelude chunk.
+            let _ = tx
+                .send(streaming::StreamChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created,
+                    model: model.clone(),
+                    choices: vec![streaming::StreamChoice {
+                        index: 0,
+                        delta: streaming::StreamDelta {
+                            role: Some("assistant".to_string()),
+                            content: None,
+                        },
+                        finish_reason: None,
+                    }],
+                })
+                .await;
+
+            // Real tokens flow from the generation thread through the
+            // channel; a closed channel (client gone) cancels generation.
+            let tx_tokens = tx.clone();
+            let id2 = id.clone();
+            let model2 = model.clone();
+            let callback: cortiq_engine::TokenCallback = Box::new(move |token: &str| {
+                let chunk = streaming::token_chunk(&id2, &model2, token, created);
+                tx_tokens.blocking_send(chunk).is_ok()
+            });
+
+            let outcome = run_generation(
+                state2.clone(),
+                prompt_ids,
+                max_tokens,
+                req.temperature,
+                req.top_p,
+                req.seed,
+                Some(callback),
+            )
+            .await;
+
+            match outcome {
+                Ok((result, elapsed_ms)) => {
+                    state2
+                        .runtime
+                        .record_generation(result.tokens_generated, elapsed_ms, elapsed_ms)
+                        .await;
+                    let _ = tx
+                        .send(streaming::finish_chunk(
+                            &id,
+                            &model,
+                            &result.finish_reason,
+                            created,
+                        ))
+                        .await;
+                }
+                Err(_) => {
+                    let _ = tx
+                        .send(streaming::finish_chunk(&id, &model, "error", created))
+                        .await;
+                }
+            }
+        });
+
+        stream.into_sse().into_response()
+    } else {
+        let (result, elapsed_ms) = match run_generation(
+            state.clone(),
+            prompt_ids,
+            max_tokens,
+            req.temperature,
+            req.top_p,
+            req.seed,
+            None,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+
+        state
+            .runtime
+            .record_generation(result.tokens_generated, elapsed_ms, elapsed_ms)
+            .await;
+        let status = state.runtime.status().await;
+
+        let cortiq_meta = req.cortiq.as_ref().map(|_| CortiqResponseMeta {
+            task_used: status.active_task.clone(),
+            sparsity: status.active_sparsity,
+            active_layers: status.active_layers,
+            execution_mode: format!("{:?}", status.execution_mode),
+            tokens_per_second: result.tokens_generated as f64 / (elapsed_ms / 1000.0).max(1e-9),
+        });
+
+        Json(ChatCompletionsResponse {
+            id: request_id,
+            object: "chat.completion".to_string(),
+            created,
+            model: req.model,
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: result.text.clone(),
+                },
+                finish_reason: result.finish_reason.clone(),
+            }],
+            usage: Usage {
+                prompt_tokens: result.prompt_tokens as u32,
+                completion_tokens: result.tokens_generated as u32,
+                total_tokens: (result.prompt_tokens + result.tokens_generated) as u32,
+            },
+            cortiq: cortiq_meta,
+        })
+        .into_response()
+    }
+}
+
+// ─── Completions (legacy) ────────────────────────────────
+
+#[derive(Deserialize)]
+struct CompletionsRequest {
+    model: String,
+    prompt: String,
+    temperature: Option<f32>,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: u32,
+}
+
+#[derive(Serialize)]
+struct CompletionsResponse {
+    id: String,
+    object: String,
+    created: u64,
+    model: String,
+    choices: Vec<CompletionChoice>,
+    usage: Usage,
+}
+
+#[derive(Serialize)]
+struct CompletionChoice {
+    text: String,
+    index: u32,
+    finish_reason: String,
+}
+
+async fn completions(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CompletionsRequest>,
+) -> Response {
+    let prompt_ids = {
+        let p = state.pipeline.lock().await;
+        p.tokenizer.encode(&req.prompt)
+    };
+
+    let (result, elapsed_ms) = match run_generation(
+        state.clone(),
+        prompt_ids,
+        req.max_tokens as usize,
+        req.temperature,
+        None,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    state
+        .runtime
+        .record_generation(result.tokens_generated, elapsed_ms, elapsed_ms)
+        .await;
+
+    Json(CompletionsResponse {
+        id: format!("cmf-{}", uuid::Uuid::new_v4()),
+        object: "text_completion".to_string(),
+        created: chrono::Utc::now().timestamp() as u64,
+        model: req.model,
+        choices: vec![CompletionChoice {
+            text: result.text,
+            index: 0,
+            finish_reason: result.finish_reason,
+        }],
+        usage: Usage {
+            prompt_tokens: result.prompt_tokens as u32,
+            completion_tokens: result.tokens_generated as u32,
+            total_tokens: (result.prompt_tokens + result.tokens_generated) as u32,
+        },
+    })
+    .into_response()
+}
+
+fn default_max_tokens() -> u32 {
+    256
+}

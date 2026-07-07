@@ -1,0 +1,41 @@
+[package]
+name = "cortiq-engine"
+version.workspace = true
+edition.workspace = true
+description = "Portable, dependency-free inference runtime for the CMF model format: runs on CPU and GPU (Vulkan / Metal / DX12), with tokenizer, chat templates and dynamic per-skill weight overlay."
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cortiq-core = { path = "../cortiq-core", version = "0.1.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+fancy-regex = { workspace = true }
+unicode-normalization = { workspace = true }
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
+base64 = { workspace = true }
+
+# Cross-platform GPU backend (C1): wgpu -> Vulkan/DX12/Metal (NVIDIA,
+# Radeon, Intel, Apple). Optional: a plain CPU build does not pull it in.
+wgpu = { version = "30", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+
+[features]
+# `--features gpu` enables the wgpu path; test on a discrete card.
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+# GPU path (D5): Metal on Apple Silicon; unified memory + no-copy buffers.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.29"

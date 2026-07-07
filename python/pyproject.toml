@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cmf-reader"
+version = "0.1.0"
+description = "Standalone reader for CMF v2 (Cortiq Model Format): quantized weights, skill swarms, shards, integrity verification. numpy is the only dependency."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "Cortiq" }]
+dependencies = ["numpy>=1.22"]
+keywords = ["llm", "model-format", "quantization", "mmap", "moe"]
+
+[project.scripts]
+cmf-reader = "cmf_reader:_main"
+
+[tool.setuptools]
+py-modules = ["cmf_reader"]

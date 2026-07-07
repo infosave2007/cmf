@@ -1,0 +1,32 @@
+[package]
+name = "cortiq-cli"
+version.workspace = true
+edition.workspace = true
+description = "Command-line tools for the CMF model format: inspect, convert, run and serve .cmf models."
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "cortiq"
+path = "src/main.rs"
+
+[features]
+# Forward the cross-platform GPU backend (C1) down into the engine.
+gpu = ["cortiq-engine/gpu"]
+
+[dependencies]
+cortiq-core = { path = "../cortiq-core", version = "0.1.0" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.1.0" }
+cortiq-server = { path = "../cortiq-server", version = "0.1.0" }
+clap = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
