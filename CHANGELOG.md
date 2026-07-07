@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `cortiq run --max-tokens <N>` (short `-n`) to cap the number of generated
+  tokens (default 256); previously the generation length was fixed at 256.
+
 ## [0.1.0] — 2026-07-07
 
 Initial public release.

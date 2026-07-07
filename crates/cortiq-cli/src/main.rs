@@ -129,6 +129,9 @@ enum Commands {
         /// Single prompt (non-interactive)
         #[arg(short, long)]
         prompt: Option<String>,
+        /// Maximum number of tokens to generate
+        #[arg(short = 'n', long, default_value = "256")]
+        max_tokens: usize,
         /// Skill to overlay (spec §9): replacement tensors are read in
         /// place of backbone tensors
         #[arg(long)]
@@ -299,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             task,
             prompt,
+            max_tokens,
             skill,
             greedy,
             blend,
@@ -308,7 +312,7 @@ async fn main() -> anyhow::Result<()> {
             trace_json,
             state,
         } => {
-            cmd_run(&model, &task, prompt.as_deref(), skill.as_deref(), greedy,
+            cmd_run(&model, &task, prompt.as_deref(), max_tokens, skill.as_deref(), greedy,
                     blend.as_deref(), route_dynamic, confidence, trace, trace_json,
                     state.as_deref())
             .await
@@ -780,6 +784,7 @@ async fn cmd_run(
     model_path: &str,
     task: &str,
     prompt: Option<&str>,
+    max_tokens: usize,
     skill: Option<&str>,
     greedy: bool,
     blend: Option<&str>,
@@ -898,9 +903,9 @@ async fn cmd_run(
         let mut ids = resume_prefix.clone();
         ids.extend(pipeline.tokenizer.encode(text));
         let outcome = if resume_prefix.is_empty() {
-            pipeline.generate(text, 256, mask.as_ref(), Some(cb))
+            pipeline.generate(text, max_tokens, mask.as_ref(), Some(cb))
         } else {
-            pipeline.generate_from_ids(&ids, 256, mask.as_ref(), Some(cb))
+            pipeline.generate_from_ids(&ids, max_tokens, mask.as_ref(), Some(cb))
         };
         match outcome {
             Ok(r) => {
