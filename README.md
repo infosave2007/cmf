@@ -45,6 +45,7 @@ Prompt: What is the capital of France?
 - **One file, no sidecars.** The HF tokenizer (byte-level BPE) and the chat template (Jinja) travel inside the model — the file defines chat behavior, not your runtime binary.
 - **Trust the file.** A fixed 128-byte envelope plus a 64-bit hash per tensor mean a `.cmf` is either valid or `open()` returns an error; `cortiq verify` checks the whole chain.
 - **Runs anywhere.** A dependency-free Rust core on CPU, plus an optional GPU backend (wgpu → Vulkan · Metal · DX12).
+- **Convert in one command.** `cortiq convert --model <hf-repo>` — native Rust, no Python/numpy/torch; the model is downloaded (in parallel) and quantized in one step.
 
 ## How it compares
 
@@ -83,21 +84,18 @@ cortiq masks model.cmf
 cortiq verify model.cmf     # envelope, sections, per-tensor hashes
 ```
 
-Convert a Hugging Face checkpoint to `.cmf`:
+Convert a model to `.cmf` — **native Rust, no Python/numpy/torch**. Pass a
+Hugging Face repo id (downloaded in parallel) or a local model directory:
 
 ```sh
-python converter/convert_dtgma_to_cmf.py \
-    --model  ./my-hf-checkpoint \
-    --quant  Q8_ROW \
-    --output model.cmf
+cortiq convert --model Qwen/Qwen2.5-0.5B-Instruct --quant q8    --output model.cmf
+cortiq convert --model ./my-hf-checkpoint         --quant q8_2f --output model.cmf
 ```
 
-Import a GGUF model (llama / qwen2 / qwen3) — GGUF → HF directory → `.cmf`:
-
-```sh
-python converter/import_gguf.py model.gguf ./hf-out
-python converter/convert_dtgma_to_cmf.py --model ./hf-out --quant Q8_ROW --output model.cmf
-```
+Quantization: `q8` · `q8_2f` (two-field, best quality/size) · `q4` · `f16`.
+Standard dense models (qwen2 / qwen3 / llama / mistral) convert natively; for
+MoE / linear-attention (GatedDeltaNet) architectures the bundled Python
+converter (`converter/`) is still used.
 
 Run inference:
 
@@ -179,7 +177,7 @@ crates/
   cortiq-engine   portable CPU/GPU inference runtime, tokenizer, chat, skill overlay
   cortiq-server   OpenAI-compatible HTTP serving
   cortiq-cli      the `cortiq` command-line tool (inspect/convert/run/serve)
-converter/        Python writers: HF → .cmf, GGUF → .cmf
+converter/        Python converters for exotic archs (MoE / linear-attention)
 python/           dependency-free reader (stdlib + numpy)
 docs/             format specification and comparison
 ```

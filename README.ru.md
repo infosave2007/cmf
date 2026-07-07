@@ -47,6 +47,7 @@ Prompt: What is the capital of France?
 - **Один файл, никаких спутников.** Токенизатор HF (byte-level BPE) и шаблон чата (Jinja) путешествуют внутри модели — поведение в чате задаёт сам файл, а не ваш рантайм-бинарник.
 - **Доверяйте файлу.** Фиксированный 128-byte конверт плюс 64-bit хеш на каждый тензор означают, что `.cmf` либо валиден, либо `open()` возвращает ошибку; `cortiq verify` проверяет всю цепочку.
 - **Работает где угодно.** Ядро на Rust без зависимостей на CPU, плюс опциональный GPU-бэкенд (wgpu → Vulkan · Metal · DX12).
+- **Конвертация одной командой.** `cortiq convert --model <hf-repo>` — нативно на Rust, без Python/numpy/torch; модель скачивается (параллельно) и квантуется за один шаг.
 
 ## Как это соотносится с другими подходами
 
@@ -85,21 +86,18 @@ cortiq masks model.cmf
 cortiq verify model.cmf     # envelope, sections, per-tensor hashes
 ```
 
-Сконвертируйте чекпоинт Hugging Face в `.cmf`:
+Сконвертируйте модель в `.cmf` — **нативно на Rust, без Python/numpy/torch**.
+Укажите id репозитория Hugging Face (скачается параллельно) или локальную папку модели:
 
 ```sh
-python converter/convert_dtgma_to_cmf.py \
-    --model  ./my-hf-checkpoint \
-    --quant  Q8_ROW \
-    --output model.cmf
+cortiq convert --model Qwen/Qwen2.5-0.5B-Instruct --quant q8    --output model.cmf
+cortiq convert --model ./my-hf-checkpoint         --quant q8_2f --output model.cmf
 ```
 
-Импортируйте GGUF-модель (llama / qwen2 / qwen3) — GGUF → HF-директория → `.cmf`:
-
-```sh
-python converter/import_gguf.py model.gguf ./hf-out
-python converter/convert_dtgma_to_cmf.py --model ./hf-out --quant Q8_ROW --output model.cmf
-```
+Квантизация: `q8` · `q8_2f` (двухполевая, лучшее качество/размер) · `q4` · `f16`.
+Стандартные dense-модели (qwen2 / qwen3 / llama / mistral) конвертируются нативно;
+для MoE / линейного внимания (GatedDeltaNet) пока используется встроенный
+Python-конвертер (`converter/`).
 
 Запустите инференс:
 
@@ -181,7 +179,7 @@ crates/
   cortiq-engine   portable CPU/GPU inference runtime, tokenizer, chat, skill overlay
   cortiq-server   OpenAI-compatible HTTP serving
   cortiq-cli      the `cortiq` command-line tool (inspect/convert/run/serve)
-converter/        Python writers: HF → .cmf, GGUF → .cmf
+converter/        Python converters for exotic archs (MoE / linear-attention)
 python/           dependency-free reader (stdlib + numpy)
 docs/             format specification and comparison
 ```

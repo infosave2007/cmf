@@ -35,6 +35,7 @@ fn f16_scale(raw: f32) -> f32 {
 #[derive(Clone, Copy, PartialEq)]
 enum Quant {
     Q8Row,
+    Q8_2f,
     Q4Block,
     F16,
 }
@@ -42,9 +43,10 @@ enum Quant {
 fn parse_quant(s: &str) -> anyhow::Result<Quant> {
     Ok(match s.to_ascii_lowercase().as_str() {
         "q8" | "q8_row" | "q8row" => Quant::Q8Row,
+        "q8_2f" | "q82f" | "q8f" => Quant::Q8_2f,
         "q4" | "q4_block" | "q4block" => Quant::Q4Block,
         "f16" | "fp16" => Quant::F16,
-        other => anyhow::bail!("unknown quant '{other}' (use q8, q4, or f16)"),
+        other => anyhow::bail!("unknown quant '{other}' (use q8, q8_2f, q4, or f16)"),
     })
 }
 
@@ -57,7 +59,8 @@ fn encode_q8_row(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
         let absmax = row.iter().fold(0f32, |m, v| m.max(v.abs()));
         let scale = f16_scale(absmax / 127.0);
         for &v in row {
-            q.push((v / scale).round().clamp(-128.0, 127.0) as i8 as u8);
+            // round-half-to-even matches numpy's np.round → byte-identical weights.
+            q.push((v / scale).round_ties_even().clamp(-128.0, 127.0) as i8 as u8);
         }
         scales.extend_from_slice(&f32_to_f16(scale).to_le_bytes());
     }
@@ -77,14 +80,52 @@ fn encode_q4_block(vals: &[f32]) -> Vec<u8> {
         let absmax = group.iter().fold(0f32, |m, v| m.max(v.abs()));
         let scale = f16_scale(absmax / 7.0);
         for k in 0..16 {
-            let q0 = ((group[k * 2] / scale).round().clamp(-8.0, 7.0) as i8 + 8) as u8;
-            let q1 = ((group[k * 2 + 1] / scale).round().clamp(-8.0, 7.0) as i8 + 8) as u8;
+            let q0 = ((group[k * 2] / scale).round_ties_even().clamp(-8.0, 7.0) as i8 + 8) as u8;
+            let q1 = ((group[k * 2 + 1] / scale).round_ties_even().clamp(-8.0, 7.0) as i8 + 8) as u8;
             packed.push((q0 & 0x0F) | (q1 << 4));
         }
         scales.extend_from_slice(&f32_to_f16(scale).to_le_bytes());
     }
     packed.extend_from_slice(&scales);
     packed
+}
+
+/// q8_2f (two-field 𝒲×θ): `[int8: out·in][f16 row_scale: out][f16 col: in]`.
+/// `col[i]` = RMS over rows (absorbs outlier input channels); each row is int8
+/// over the residual normalized by col. Dequant: `w = q·scale[o]·col[i]`.
+/// Recovers most of the q8→f16 quality gap at the same size.
+fn encode_q8_2f(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
+    // Column field: RMS over rows, f16-rounded (the decoder multiplies by these).
+    let mut col = vec![0f32; in_dim];
+    for (i, c) in col.iter_mut().enumerate() {
+        let mut acc = 0f64;
+        for o in 0..out_dim {
+            let v = vals[o * in_dim + i] as f64;
+            acc += v * v;
+        }
+        let rms = (acc / out_dim as f64).sqrt().max(1e-12) as f32;
+        *c = f16_to_f32(f32_to_f16(rms)).max(F16_TINY);
+    }
+    let mut q = Vec::with_capacity(out_dim * in_dim);
+    let mut scales = Vec::with_capacity(out_dim * 2);
+    for o in 0..out_dim {
+        let mut absmax = 0f32;
+        for i in 0..in_dim {
+            absmax = absmax.max((vals[o * in_dim + i] / col[i]).abs());
+        }
+        let scale = f16_scale(absmax.max(1e-12) / 127.0);
+        for i in 0..in_dim {
+            let wn = vals[o * in_dim + i] / col[i];
+            q.push((wn / scale).round_ties_even().clamp(-127.0, 127.0) as i8 as u8);
+        }
+        scales.extend_from_slice(&f32_to_f16(scale).to_le_bytes());
+    }
+    let mut out = q;
+    out.extend_from_slice(&scales);
+    for &c in &col {
+        out.extend_from_slice(&f32_to_f16(c).to_le_bytes());
+    }
+    out
 }
 
 /// f16 blob for a 1-D / small tensor.
@@ -106,18 +147,40 @@ fn to_f32(dtype: &str, raw: &[u8]) -> anyhow::Result<Vec<f32>> {
     })
 }
 
-/// One safetensors file → (name, dtype, shape, raw-bytes) per tensor.
-#[allow(clippy::type_complexity)]
-fn read_safetensors(path: &Path) -> anyhow::Result<Vec<(String, String, Vec<usize>, Vec<u8>)>> {
-    let bytes = fs::read(path)?;
-    if bytes.len() < 8 {
+/// A tensor's metadata within a safetensors file (bytes are read lazily from mmap).
+struct TensorMeta {
+    name: String,
+    dtype: String,
+    shape: Vec<usize>,
+    start: usize,
+    end: usize,
+}
+
+/// A memory-mapped safetensors file — tensor bytes are borrowed from the mmap, so
+/// the raw weights are never fully loaded into RAM (peak stays ~one tensor).
+struct SafeTensors {
+    mmap: memmap2::Mmap,
+    data_start: usize,
+    tensors: Vec<TensorMeta>,
+}
+
+impl SafeTensors {
+    fn bytes(&self, m: &TensorMeta) -> &[u8] {
+        &self.mmap[self.data_start + m.start..self.data_start + m.end]
+    }
+}
+
+fn open_safetensors(path: &Path) -> anyhow::Result<SafeTensors> {
+    let file = fs::File::open(path).map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    if mmap.len() < 8 {
         anyhow::bail!("{}: too small to be safetensors", path.display());
     }
-    let hlen = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
-    let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + hlen])?;
+    let hlen = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
+    let header: serde_json::Value = serde_json::from_slice(&mmap[8..8 + hlen])?;
     let data_start = 8 + hlen;
     let obj = header.as_object().ok_or_else(|| anyhow::anyhow!("bad safetensors header"))?;
-    let mut out = Vec::new();
+    let mut tensors = Vec::new();
     for (name, v) in obj {
         if name == "__metadata__" {
             continue;
@@ -126,32 +189,27 @@ fn read_safetensors(path: &Path) -> anyhow::Result<Vec<(String, String, Vec<usiz
         let shape: Vec<usize> =
             v["shape"].as_array().map(|a| a.iter().map(|x| x.as_u64().unwrap_or(0) as usize).collect()).unwrap_or_default();
         let offs = v["data_offsets"].as_array().ok_or_else(|| anyhow::anyhow!("tensor '{name}': no data_offsets"))?;
-        let s = offs[0].as_u64().unwrap_or(0) as usize;
-        let e = offs[1].as_u64().unwrap_or(0) as usize;
-        out.push((name.clone(), dtype, shape, bytes[data_start + s..data_start + e].to_vec()));
+        let start = offs[0].as_u64().unwrap_or(0) as usize;
+        let end = offs[1].as_u64().unwrap_or(0) as usize;
+        tensors.push(TensorMeta { name: name.clone(), dtype, shape, start, end });
     }
-    Ok(out)
+    Ok(SafeTensors { mmap, data_start, tensors })
 }
 
-/// Gather all tensors from a model dir (single file or sharded index).
-#[allow(clippy::type_complexity)]
-fn read_model_tensors(dir: &Path) -> anyhow::Result<Vec<(String, String, Vec<usize>, Vec<u8>)>> {
-    let index = dir.join("model.safetensors.index.json");
+/// Memory-map a model dir's weights (single file or sharded index).
+fn open_model(dir: &Path) -> anyhow::Result<Vec<SafeTensors>> {
     let single = dir.join("model.safetensors");
     if single.exists() {
-        return read_safetensors(&single);
+        return Ok(vec![open_safetensors(&single)?]);
     }
+    let index = dir.join("model.safetensors.index.json");
     if index.exists() {
         let idx: serde_json::Value = serde_json::from_slice(&fs::read(&index)?)?;
         let map = idx["weight_map"].as_object().ok_or_else(|| anyhow::anyhow!("bad index json"))?;
         let mut files: Vec<String> = map.values().filter_map(|v| v.as_str().map(String::from)).collect();
         files.sort();
         files.dedup();
-        let mut all = Vec::new();
-        for f in files {
-            all.extend(read_safetensors(&dir.join(f))?);
-        }
-        return Ok(all);
+        return files.iter().map(|f| open_safetensors(&dir.join(f))).collect();
     }
     anyhow::bail!("no model.safetensors or model.safetensors.index.json in {}", dir.display())
 }
@@ -280,6 +338,25 @@ fn write_at(path: &Path, offset: u64, data: &[u8]) -> std::io::Result<()> {
     f.write_all(data)
 }
 
+/// Retry `f` with exponential backoff — smooths over transient network errors.
+fn with_retry<T>(attempts: u32, mut f: impl FnMut() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    let mut delay = Duration::from_millis(400);
+    let mut last: Option<anyhow::Error> = None;
+    for a in 0..attempts {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last = Some(e);
+                if a + 1 < attempts {
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(Duration::from_secs(8));
+                }
+            }
+        }
+    }
+    Err(last.unwrap())
+}
+
 /// Fetch one file into `dest` (cached). Large range-capable files are pulled in
 /// parallel 32 MiB chunks over `threads` reused connections; otherwise a single
 /// stream. Returns false on 404 when `required` is false.
@@ -297,8 +374,10 @@ fn fetch(agent: &ureq::Agent, url: &str, dest: &Path, token: Option<&str>, requi
             }
             let chunks: Vec<(u64, u64)> =
                 (0..sz).step_by(HF_CHUNK as usize).map(|s| (s, (s + HF_CHUNK).min(sz))).collect();
+            let total = chunks.len();
             let queue = Mutex::new(chunks);
             let err: Mutex<Option<String>> = Mutex::new(None);
+            let done = std::sync::atomic::AtomicUsize::new(0);
             std::thread::scope(|scope| {
                 for _ in 0..threads {
                     scope.spawn(|| loop {
@@ -306,15 +385,23 @@ fn fetch(agent: &ureq::Agent, url: &str, dest: &Path, token: Option<&str>, requi
                             break;
                         }
                         let Some((start, end)) = queue.lock().unwrap().pop() else { break };
-                        let r = get_range(agent, url, token, start, end)
+                        // Each chunk retries on a transient failure before aborting.
+                        let r = with_retry(4, || get_range(agent, url, token, start, end))
                             .and_then(|buf| write_at(&tmp, start, &buf).map_err(Into::into));
-                        if let Err(e) = r {
-                            *err.lock().unwrap() = Some(e.to_string());
-                            break;
+                        match r {
+                            Ok(()) => {
+                                let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                eprint!("\r    downloading: {:>3}% ({d}/{total} chunks)", d * 100 / total);
+                            }
+                            Err(e) => {
+                                *err.lock().unwrap() = Some(e.to_string());
+                                break;
+                            }
                         }
                     });
                 }
             });
+            eprintln!();
             if let Some(e) = err.into_inner().unwrap() {
                 anyhow::bail!("download {url}: {e}");
             }
@@ -322,17 +409,24 @@ fn fetch(agent: &ureq::Agent, url: &str, dest: &Path, token: Option<&str>, requi
             return Ok(true);
         }
     }
-    // Small file / no range support → single stream.
-    match auth(agent.get(url), token).call() {
+    // Small file / no range support → single stream (with retry). Returns
+    // Some(()) on success, None on an allowed 404 (optional file).
+    let got = with_retry(4, || match auth(agent.get(url), token).call() {
         Ok(resp) => {
             let mut r = resp.into_reader();
             let mut f = fs::File::create(&tmp)?;
             std::io::copy(&mut r, &mut f)?;
+            Ok(Some(()))
+        }
+        Err(ureq::Error::Status(404, _)) if !required => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("download {url}: {e}")),
+    })?;
+    match got {
+        Some(()) => {
             fs::rename(&tmp, dest)?;
             Ok(true)
         }
-        Err(ureq::Error::Status(404, _)) if !required => Ok(false),
-        Err(e) => anyhow::bail!("download {url}: {e}"),
+        None => Ok(false),
     }
 }
 
@@ -399,28 +493,35 @@ pub fn run_convert(
         .map_err(|e| anyhow::anyhow!("read config.json: {e}"))?)?;
     let arch = build_arch(&config)?;
 
-    let raw = read_model_tensors(dir)?;
-    let total = raw.len().max(1);
-    let mut tensors: Vec<TensorSpec> = Vec::with_capacity(raw.len());
-    for (i, (name, dtype, shape, bytes)) in raw.into_iter().enumerate() {
-        let vals = to_f32(&dtype, &bytes)?;
-        let numel: usize = shape.iter().product();
-        if numel != vals.len() {
-            anyhow::bail!("tensor '{name}': {} values for shape {:?}", vals.len(), shape);
-        }
-        // 1-D tensors, tiny tensors, and non-2-D always go f16 (norms, biases).
-        let two_d = shape.len() == 2 && numel >= GROUP_SIZE;
-        let (dt, data) = if !two_d {
-            (TensorDtype::F16, encode_f16(&vals))
-        } else {
-            match quant {
-                Quant::Q8Row => (TensorDtype::Q8Row, encode_q8_row(&vals, shape[0], shape[1])),
-                Quant::Q4Block => (TensorDtype::Q4Block, encode_q4_block(&vals)),
-                Quant::F16 => (TensorDtype::F16, encode_f16(&vals)),
+    // Memory-map the weights and process one tensor at a time — the raw model is
+    // never fully loaded into RAM (peak ≈ the .cmf output + one tensor).
+    let files = open_model(dir)?;
+    let total: usize = files.iter().map(|f| f.tensors.len()).sum::<usize>().max(1);
+    let mut tensors: Vec<TensorSpec> = Vec::with_capacity(total);
+    let mut done = 0usize;
+    for file in &files {
+        for m in &file.tensors {
+            let vals = to_f32(&m.dtype, file.bytes(m))?;
+            let numel: usize = m.shape.iter().product();
+            if numel != vals.len() {
+                anyhow::bail!("tensor '{}': {} values for shape {:?}", m.name, vals.len(), m.shape);
             }
-        };
-        tensors.push(TensorSpec { name, dtype: dt, shape, data });
-        progress((i + 1) as f32 / total as f32);
+            // 1-D tensors, tiny tensors, and non-2-D always go f16 (norms, biases).
+            let two_d = m.shape.len() == 2 && numel >= GROUP_SIZE;
+            let (dt, data) = if !two_d {
+                (TensorDtype::F16, encode_f16(&vals))
+            } else {
+                match quant {
+                    Quant::Q8Row => (TensorDtype::Q8Row, encode_q8_row(&vals, m.shape[0], m.shape[1])),
+                    Quant::Q8_2f => (TensorDtype::Q8_2f, encode_q8_2f(&vals, m.shape[0], m.shape[1])),
+                    Quant::Q4Block => (TensorDtype::Q4Block, encode_q4_block(&vals)),
+                    Quant::F16 => (TensorDtype::F16, encode_f16(&vals)),
+                }
+            };
+            tensors.push(TensorSpec { name: m.name.clone(), dtype: dt, shape: m.shape.clone(), data });
+            done += 1;
+            progress(done as f32 / total as f32);
+        }
     }
 
     // Tokenizer + chat bundle (optional but recommended).
@@ -440,6 +541,7 @@ pub fn run_convert(
 
     let quant_type = match quant {
         Quant::Q8Row => QuantType::Q8Row,
+        Quant::Q8_2f => QuantType::Q8_2f,
         Quant::Q4Block => QuantType::Q4Block,
         Quant::F16 => QuantType::F16,
     };
@@ -460,4 +562,101 @@ pub fn run_convert(
         .map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;
     progress(1.0);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cortiq_core::quant::{dequant_q4_block, dequant_q8_2f, dequant_q8_row};
+
+    #[test]
+    fn parse_quant_variants() {
+        for q in ["q8", "q8_row", "q8_2f", "q4", "q4_block", "f16"] {
+            assert!(parse_quant(q).is_ok(), "{q}");
+        }
+        assert!(parse_quant("nope").is_err());
+    }
+
+    #[test]
+    fn q8_row_roundtrips() {
+        let (o, i) = (4usize, 64usize);
+        let vals: Vec<f32> = (0..o * i).map(|k| (k as f32 * 0.017).sin() * 2.5).collect();
+        let bytes = encode_q8_row(&vals, o, i);
+        assert_eq!(bytes.len(), o * i + o * 2);
+        let mut back = vec![0f32; o * i];
+        dequant_q8_row(&bytes, o, i, &mut back);
+        for (a, b) in vals.iter().zip(&back) {
+            assert!((a - b).abs() < 0.05, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn q8_2f_roundtrips() {
+        let (o, i) = (8usize, 48usize);
+        let vals: Vec<f32> = (0..o * i).map(|k| (k as f32 * 0.023).cos() * 1.7).collect();
+        let bytes = encode_q8_2f(&vals, o, i);
+        assert_eq!(bytes.len(), o * i + o * 2 + i * 2);
+        let mut back = vec![0f32; o * i];
+        dequant_q8_2f(&bytes, o, i, &mut back);
+        for (a, b) in vals.iter().zip(&back) {
+            assert!((a - b).abs() < 0.1, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn q4_block_roundtrips() {
+        let vals: Vec<f32> = (0..128).map(|k| (k as f32 * 0.05).sin()).collect();
+        let bytes = encode_q4_block(&vals);
+        let mut back = vec![0f32; 128];
+        dequant_q4_block(&bytes, &mut back);
+        for (a, b) in vals.iter().zip(&back) {
+            assert!((a - b).abs() < 0.2, "{a} vs {b}");
+        }
+    }
+
+    /// A raw safetensors blob from F32 tensors, for the end-to-end test.
+    fn tiny_safetensors(tensors: &[(&str, Vec<usize>, Vec<f32>)]) -> Vec<u8> {
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, shape, vals) in tensors {
+            let start = data.len();
+            for &v in vals {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+            header.insert(
+                name.to_string(),
+                serde_json::json!({"dtype":"F32","shape":shape,"data_offsets":[start, data.len()]}),
+            );
+        }
+        let hjson = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = (hjson.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(&hjson);
+        out.extend_from_slice(&data);
+        out
+    }
+
+    #[test]
+    fn convert_tiny_model_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("cortiq-convtest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"llama","hidden_size":64,"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":4,"intermediate_size":128,"vocab_size":32,"rms_norm_eps":0.000001,"tie_word_embeddings":true}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+        let st = tiny_safetensors(&[
+            ("model.embed_tokens.weight", vec![32, 64], (0..32 * 64).map(|k| (k as f32 * 0.01).sin()).collect()),
+            ("model.norm.weight", vec![64], vec![1.0f32; 64]),
+        ]);
+        fs::write(dir.join("model.safetensors"), &st).unwrap();
+        let out = dir.join("m.cmf");
+        run_convert(dir.to_str().unwrap(), "q8", out.to_str().unwrap(), None, |_| {}).unwrap();
+
+        let model = CmfModel::open(&out).unwrap();
+        assert_eq!(model.arch().vocab_size, 32);
+        assert_eq!(model.arch().num_layers, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

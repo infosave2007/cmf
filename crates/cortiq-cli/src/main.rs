@@ -130,7 +130,7 @@ enum Commands {
         /// or a hub repo id like `Qwen/Qwen2.5-0.5B-Instruct` (downloaded)
         #[arg(long)]
         model: String,
-        /// Quantization for 2-D weights: q8 | q4 | f16
+        /// Quantization for 2-D weights: q8 | q8_2f | q4 | f16
         #[arg(long, default_value = "q8")]
         quant: String,
         /// Output .cmf path

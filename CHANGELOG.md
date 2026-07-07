@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-07-07
+
+### Added
+
+- `cortiq convert --quant q8_2f` — the two-field (𝒲×θ) int8 quantization that
+  recovers most of the int8→fp16 quality gap at the same file size.
+- Converter round-trip tests (q8 / q8_2f / q4 encoders + a tiny end-to-end
+  convert) run in CI.
+- A release workflow that attaches prebuilt `cortiq` binaries (Linux x86_64,
+  macOS arm64 / x86_64) to each GitHub Release — usable with no Rust toolchain.
+
+### Changed
+
+- **Byte-faithful, lighter conversion**: round-half-to-even quantization (matches
+  numpy — weights are now byte-identical to the reference converter), and the
+  input safetensors are memory-mapped and processed one tensor at a time, so peak
+  RAM is ≈ the output size rather than the whole model.
+- **Resilient downloads**: each byte-range chunk retries with exponential backoff
+  and shows a live percentage.
+
 ## [0.1.4] — 2026-07-07
 
 ### Added
@@ -80,7 +100,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/infosave2007/cmf/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/infosave2007/cmf/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/infosave2007/cmf/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/infosave2007/cmf/compare/v0.1.1...v0.1.2

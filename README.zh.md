@@ -47,6 +47,7 @@ Prompt: What is the capital of France?
 - **单个文件，无附属文件。** HF 分词器（byte-level BPE）与聊天模板（Jinja）都随模型一同携带——是文件本身定义聊天行为，而非你的运行时二进制。
 - **信任这个文件。** 固定的 128-byte 信封加上每张量一个 64-bit 哈希，意味着一个 `.cmf` 要么有效、要么 `open()` 直接返回错误；`cortiq verify` 会校验整条链路。
 - **随处可运行。** 一个无依赖的 Rust 核心跑在 CPU 上，另有可选的 GPU 后端（wgpu → Vulkan · Metal · DX12）。
+- **一条命令完成转换。** `cortiq convert --model <hf-repo>`——纯 Rust，无需 Python/numpy/torch；模型会（并行）下载并一步量化。
 
 ## 横向对比
 
@@ -85,21 +86,17 @@ cortiq masks model.cmf
 cortiq verify model.cmf     # envelope, sections, per-tensor hashes
 ```
 
-把一个 Hugging Face 检查点转换为 `.cmf`：
+把模型转换为 `.cmf`——**纯 Rust，无需 Python/numpy/torch**。传入一个
+Hugging Face 仓库 id（并行下载）或一个本地模型目录：
 
 ```sh
-python converter/convert_dtgma_to_cmf.py \
-    --model  ./my-hf-checkpoint \
-    --quant  Q8_ROW \
-    --output model.cmf
+cortiq convert --model Qwen/Qwen2.5-0.5B-Instruct --quant q8    --output model.cmf
+cortiq convert --model ./my-hf-checkpoint         --quant q8_2f --output model.cmf
 ```
 
-导入一个 GGUF 模型（llama / qwen2 / qwen3）——GGUF → HF 目录 → `.cmf`：
-
-```sh
-python converter/import_gguf.py model.gguf ./hf-out
-python converter/convert_dtgma_to_cmf.py --model ./hf-out --quant Q8_ROW --output model.cmf
-```
+量化：`q8` · `q8_2f`（双字段，质量/体积最佳）· `q4` · `f16`。
+标准 dense 模型（qwen2 / qwen3 / llama / mistral）原生转换；对于 MoE /
+线性注意力（GatedDeltaNet）架构，目前仍使用内置的 Python 转换器（`converter/`）。
 
 运行推理：
 
@@ -181,7 +178,7 @@ crates/
   cortiq-engine   portable CPU/GPU inference runtime, tokenizer, chat, skill overlay
   cortiq-server   OpenAI-compatible HTTP serving
   cortiq-cli      the `cortiq` command-line tool (inspect/convert/run/serve)
-converter/        Python writers: HF → .cmf, GGUF → .cmf
+converter/        Python converters for exotic archs (MoE / linear-attention)
 python/           dependency-free reader (stdlib + numpy)
 docs/             format specification and comparison
 ```
