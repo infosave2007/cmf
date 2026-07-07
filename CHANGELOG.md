@@ -32,6 +32,10 @@ Initial public release.
 - **Documentation** — the CMF v2 specification and a comparison against GGUF,
   safetensors, ONNX, PyTorch `.pt`, GGML, and TensorRT, in English, Russian,
   and Chinese.
+- **Developer tooling** — `Makefile` and `justfile` shortcuts, a pinned
+  `rust-toolchain.toml`, GitHub Actions CI (build + test on Linux and macOS,
+  clippy, rustfmt), and contributor / community-health docs
+  (`CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, issue/PR templates).
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 

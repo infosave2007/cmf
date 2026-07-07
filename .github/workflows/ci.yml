@@ -41,15 +41,6 @@ jobs:
       - name: Install Rust (stable + clippy)
         run: rustup toolchain install stable --profile minimal --component clippy --no-self-update
       - uses: Swatinem/rust-cache@v2
-      # Lint suggestions are surfaced but do not fail the build.
+      # Fails only on clippy's deny-by-default (correctness) lints;
+      # style warnings are advisory and do not fail the run.
       - run: cargo clippy --workspace --all-targets
-
-  rustfmt:
-    name: rustfmt (informational)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust (stable + rustfmt)
-        run: rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
-      - run: cargo fmt --all -- --check

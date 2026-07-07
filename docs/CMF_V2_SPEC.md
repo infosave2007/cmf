@@ -1,12 +1,13 @@
 # CMF v2 — Format Specification
 
+*Languages: **English** · [Русский](CMF_V2_SPEC.ru.md) · [中文](CMF_V2_SPEC.zh.md)*
+
 **Cortiq Model Format** — a single file carrying everything needed for
 sparse, task-routed inference: quantized weights, tokenizer, per-task
 masks, a precomputed sparse index — and, uniquely, a **swarm of skills**
 sharing one backbone (Patent 15).
 
-> Normative source: this document, kept in sync with the Russian
-> original ([CMF_V2_SPEC.md](CMF_V2_SPEC.md)). Reference
+> Normative source: this document. Reference
 > implementations: Rust reader/runtime (`crates/cortiq-core`,
 > `crates/cortiq-engine`), Python writer (`converter/`), and a
 > dependency-free Python reader (`python/cmf_reader.py`, numpy only).
@@ -501,7 +502,7 @@ byte-exactly on the same binary; `verify` green on every shard alone.
 
 ---
 
-*Related: [CMF_PRODUCT_VISION.md](CMF_PRODUCT_VISION.md) (roadmap),
-[JOURNAL.md](JOURNAL.md) (chronology with measurements, RU),
+*Related: [COMPARISON.md](COMPARISON.md) (CMF vs. other model formats),
+[project README](../README.md) (overview and quick start),
 `python/cmf_reader.py` (standalone reader: stdlib + numpy, reads every
 dtype, shards, skills, verify).*

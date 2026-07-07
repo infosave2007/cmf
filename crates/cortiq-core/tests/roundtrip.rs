@@ -199,7 +199,7 @@ fn hash64_matches_vmfcore_reference() {
 
 #[test]
 fn f16_roundtrip() {
-    for v in [0.0f32, 1.0, -1.0, 0.5, 65504.0, 1e-4, -3.1415926] {
+    for v in [0.0f32, 1.0, -1.0, 0.5, 65504.0, 1e-4, -std::f32::consts::PI] {
         let back = f16_to_f32(f32_to_f16(v));
         assert!((back - v).abs() <= v.abs() * 1e-3 + 1e-7, "{v} -> {back}");
     }

@@ -1792,8 +1792,11 @@ unsafe impl Send for SendMut {}
 unsafe impl Sync for SendMut {}
 impl SendMut {
     #[inline]
+    // Deliberate unsynchronized scatter: pool workers write disjoint indices
+    // in parallel, so returning `&mut` from `&self` is intentional here.
+    #[allow(clippy::mut_from_ref)]
     unsafe fn at(&self, i: usize) -> &mut f32 {
-        &mut *self.0.add(i)
+        unsafe { &mut *self.0.add(i) }
     }
 }
 

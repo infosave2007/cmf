@@ -10,6 +10,7 @@
 //!   - activate a skill only when its E drops below `e_on` (nucleation);
 //!   - abandon the active skill only when its E rises above `e_off`
 //!     (> e_on), or a rival beats it by more than `margin`.
+//!
 //! The barrier `e_off − e_on` is exactly what suppresses thrashing at
 //! domain boundaries (the very effect a single threshold cannot give).
 
