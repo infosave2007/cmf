@@ -4,6 +4,7 @@ English: [README.md](README.md) · 中文: [README.zh.md](README.zh.md)
 
 **Один самоописываемый файл для квантованной LLM — веса, токенизатор, шаблон чата, маски задач и оверлеи под каждый навык — с портативным рантаймом на Rust без зависимостей, работающим на CPU и GPU (Vulkan · Metal · DX12).**
 
+[![CI](https://github.com/infosave2007/cmf/actions/workflows/ci.yml/badge.svg)](https://github.com/infosave2007/cmf/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/cortiq-core.svg)](https://crates.io/crates/cortiq-core)
 [![docs.rs](https://img.shields.io/docsrs/cortiq-core)](https://docs.rs/cortiq-core)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/infosave2007/cmf/blob/master/LICENSE)

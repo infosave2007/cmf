@@ -2,6 +2,7 @@
 
 **用一个自描述文件承载量化后的 LLM——权重、分词器、对话模板、任务掩码以及按技能划分的覆盖层——并配备可移植、零依赖的 Rust 运行时，可在 CPU 和 GPU（Vulkan · Metal · DX12）上运行。**
 
+[![CI](https://github.com/infosave2007/cmf/actions/workflows/ci.yml/badge.svg)](https://github.com/infosave2007/cmf/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/cortiq-core.svg)](https://crates.io/crates/cortiq-core)
 [![docs.rs](https://img.shields.io/docsrs/cortiq-core)](https://docs.rs/cortiq-core)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/infosave2007/cmf/blob/master/LICENSE)

@@ -2,6 +2,7 @@
 
 **One self-describing file for a quantized LLM — weights, tokenizer, chat template, task masks and per-skill overlays — with a portable, dependency-free Rust runtime that runs on CPU and GPU (Vulkan · Metal · DX12).**
 
+[![CI](https://github.com/infosave2007/cmf/actions/workflows/ci.yml/badge.svg)](https://github.com/infosave2007/cmf/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/cortiq-core.svg)](https://crates.io/crates/cortiq-core)
 [![docs.rs](https://img.shields.io/docsrs/cortiq-core)](https://docs.rs/cortiq-core)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/infosave2007/cmf/blob/master/LICENSE)
