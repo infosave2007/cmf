@@ -1,21 +1,116 @@
 # CMF — Cortiq Model Format
 
-**One self-describing file for a quantized LLM — weights, tokenizer, chat template, task masks and per-skill overlays — with a portable, dependency-free Rust runtime that runs on CPU and GPU (Vulkan · Metal · DX12).**
+**Serve many specialized LLMs from one shared model — in a single file, on CPU or GPU.**
 
 [![CI](https://github.com/infosave2007/cmf/actions/workflows/ci.yml/badge.svg)](https://github.com/infosave2007/cmf/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/cortiq-core.svg)](https://crates.io/crates/cortiq-core)
+[![downloads](https://img.shields.io/crates/d/cortiq-cli.svg)](https://crates.io/crates/cortiq-cli)
 [![docs.rs](https://img.shields.io/docsrs/cortiq-core)](https://docs.rs/cortiq-core)
+[![stars](https://img.shields.io/github/stars/infosave2007/cmf?style=flat)](https://github.com/infosave2007/cmf)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/infosave2007/cmf/blob/master/LICENSE)
 
 ---
 
-## Why CMF
+## The problem
 
-- **One file.** Weights, tokenizer, chat template, per-task masks and per-skill delta records ship as a single `.cmf` container — one unit of distribution, no sidecars.
-- **Self-describing.** A fixed 128-byte envelope addresses every section; a binary tensor directory is the single source of truth for the layout. Files are validated, never guessed — a `.cmf` is either valid or `open()` returns an error.
-- **mmap, zero-copy, runs anywhere.** The weight blob is page-aligned and every tensor is 64-byte aligned for SIMD. The runtime memory-maps the file and reads weights in place — cold (masked-out) weights cost no RSS. A dependency-free CPU core needs nothing else; an optional GPU backend targets Vulkan, Metal and DX12.
-- **Quantized.** Per-tensor dtypes include `q8_row`, `q4_block`, two-field `q8_2f`, and variable-bit `vbit` (3–8 bit), mixed freely within one model.
-- **Multi-skill overlay.** A single shared backbone plus per-skill full-shape replacement tensors. At forward time the runtime reads a selected skill's tensors *in place of* the backbone — without materializing a separate model. Storage scales as `|backbone| + Σ|deltas|`.
+Shipping a fleet of task-specialized models is expensive. *N* fine-tunes usually mean *N* full copies on disk and in RAM — plus loose `config.json` / `tokenizer.json` / adapter sidecars to keep in sync, and no built-in way to tell a corrupt file from a good one.
+
+## The idea
+
+**CMF keeps one backbone and layers lightweight per-skill overlays on top of it.** A skill stores only the tensors it actually changes; at inference the runtime reads a selected skill's tensors *in place of* the backbone — no separate model is ever assembled. So a whole set of specialists lives in **one self-describing file** and runs from a laptop, with weights read straight off disk (`mmap`, zero-copy) and unused skills costing no RAM.
+
+And the specialist is not just cheaper — it's *better on its task*: measured on held-out data, a skill overlaid on its backbone cuts **task perplexity by 24.9%** versus the backbone alone (see [spec §9](docs/CMF_V2_SPEC.md)).
+
+## Who it's for
+
+- **Agent / plugin builders** — one model carrying 20 skills (SQL, code, translation…) instead of 20 models to store, load, and route between.
+- **Edge / local deployment** — fit a routed multi-skill model into the RAM budget of a single model; weights are paged from disk on demand.
+- **Anyone shipping quantized LLMs** — one integrity-checked file carries weights **+ tokenizer + chat template**, so there are no sidecars to lose and corruption is caught by per-tensor hashes.
+
+## See it run
+
+```console
+$ cortiq run model.cmf --prompt "What is the capital of France?" --greedy
+Ready: qwen2 | Task: general | Sparsity: 0%
+Prompt: What is the capital of France?
+ The capital of France is Paris.
+[8 tokens, 33.6 tok/s, finish: stop]
+```
+
+## Why CMF — what you get
+
+- **Add a skill without copying the model.** One backbone + small per-skill deltas: storage is `|backbone| + Σ|deltas|`, not `N × |model|`.
+- **Starts instantly, light on RAM.** Weights are memory-mapped and read in place; masked-out or unused weights never touch RAM.
+- **Smaller on disk, honestly.** Mix quantizations per tensor — `q8`, `q4`, two-field `q8_2f`, variable-bit (3–8 bit) — down to ~1 byte/param and below. The two-field and variable-bit codecs recover most of the int8→fp16 quality gap at the same file size, and the accuracy trade is *measured*, never declared.
+- **One file, no sidecars.** The HF tokenizer (byte-level BPE) and the chat template (Jinja) travel inside the model — the file defines chat behavior, not your runtime binary.
+- **Trust the file.** A fixed 128-byte envelope plus a 64-bit hash per tensor mean a `.cmf` is either valid or `open()` returns an error; `cortiq verify` checks the whole chain.
+- **Runs anywhere.** A dependency-free Rust core on CPU, plus an optional GPU backend (wgpu → Vulkan · Metal · DX12).
+
+## How it compares
+
+Serving **N task-specialists**:
+
+| | N full fine-tunes | Base + N external LoRA | **CMF — one backbone + N skills** |
+|---|---|---|---|
+| On disk | N × full model | base + N adapters (sidecars) | one backbone + N small deltas, **one file** |
+| Tokenizer + chat template | per copy / sidecar | sidecar | **embedded** |
+| Per-tensor integrity hash | — | — | **yes** |
+| Cold / unused skill in RAM | loaded | loaded | **0** (paged on use) |
+
+The full, honest format-by-format comparison — GGUF, safetensors, ONNX, PyTorch, GGML, TensorRT, with the trade-offs spelled out — is in [docs/COMPARISON.md](docs/COMPARISON.md).
+
+## Install
+
+Install the command-line tool:
+
+```sh
+cargo install cortiq-cli
+```
+
+Use the format from your own Rust project:
+
+```sh
+cargo add cortiq-core
+```
+
+## Quick start
+
+Inspect a `.cmf` — arch, tensors, quantization, masks and skills:
+
+```sh
+cortiq info  model.cmf
+cortiq masks model.cmf
+cortiq verify model.cmf     # envelope, sections, per-tensor hashes
+```
+
+Convert a Hugging Face checkpoint to `.cmf`:
+
+```sh
+python converter/convert_dtgma_to_cmf.py \
+    --model  ./my-hf-checkpoint \
+    --quant  Q8_ROW \
+    --output model.cmf
+```
+
+Import a GGUF model (llama / qwen2 / qwen3) — GGUF → HF directory → `.cmf`:
+
+```sh
+python converter/import_gguf.py model.gguf ./hf-out
+python converter/convert_dtgma_to_cmf.py --model ./hf-out --quant Q8_ROW --output model.cmf
+```
+
+Run inference:
+
+```sh
+# Interactive chat
+cortiq run model.cmf
+
+# Single prompt, greedy decoding, capped length
+cortiq run model.cmf --prompt "Write a haiku about memory-mapped files." --greedy --max-tokens 64
+
+# Overlay a specific skill — its replacement tensors are read in place of the backbone
+cortiq run model.cmf --prompt "SELECT ..." --skill sql
+```
 
 ## Container layout
 
@@ -52,72 +147,17 @@ A reader addresses sections **only** through the envelope — never by assuming 
 - Single-file, memory-mappable, self-validating binary container.
 - Binary tensor directory with 1:1 source-model tensor names and a per-tensor 64-bit hash for corruption detection.
 - Mixed quantization per tensor: `f32`, `f16`, `bf16`, `q8_row`, `q4_block`, `q8_2f`, `vbit`.
-- Embedded tokenizer (HF byte-level BPE parity) and chat template (Jinja, HF semantics) — the file defines chat behavior, not the binary.
+- Embedded tokenizer (HF byte-level BPE parity) and chat template (Jinja, HF semantics).
 - Per-task masks (bit-packed) and a precomputed sparse index.
-- Multi-skill swarm: one backbone + per-skill full-shape replacement tensors, overlaid at forward time via tensor-source indirection; append-only growth and compaction.
+- Multi-skill swarm: one backbone + per-skill full-shape replacement tensors, overlaid at forward time; append-only growth and compaction.
 - Optional multi-token-prediction (MTP) head and mixture-of-experts (MoE) FFN layers.
 - Sharding: a model split across `N` standalone-valid `.cmf` files.
-- Dependency-free Rust runtime that runs on **CPU and GPU** (optional `gpu` feature: wgpu → Vulkan / DX12 / Metal).
+- Dependency-free Rust runtime on **CPU and GPU** (optional `gpu` feature: wgpu → Vulkan / DX12 / Metal).
 - Reference implementations in Rust (reader + runtime) and Python (writer + a stdlib+numpy reader).
-
-## Install
-
-Install the command-line tool:
-
-```sh
-cargo install cortiq-cli
-```
-
-Use the format from your own Rust project:
-
-```sh
-cargo add cortiq-core
-```
-
-## Quick start
-
-Inspect a `.cmf` — arch, tensors, quantization, masks and skills:
-
-```sh
-cortiq info model.cmf
-cortiq masks model.cmf
-```
-
-Convert a Hugging Face checkpoint to `.cmf`:
-
-```sh
-python converter/convert_dtgma_to_cmf.py \
-    --model  ./my-hf-checkpoint \
-    --quant  Q8_ROW \
-    --output model.cmf
-```
-
-Import a GGUF model:
-
-```sh
-python converter/import_gguf.py --input model.gguf --output model.cmf
-```
-
-Run inference:
-
-```sh
-# Interactive chat
-cortiq run model.cmf
-
-# Single prompt, greedy decoding
-cortiq run model.cmf --prompt "Write a haiku about memory-mapped files." --greedy
-
-# Overlay a specific skill (replacement tensors read in place of the backbone)
-cortiq run model.cmf --prompt "SELECT ..." --skill sql
-```
 
 ## Format overview
 
 The complete normative specification — envelope, header JSON, tensor directory, quant layouts, masks, tokenizer bundle, sparse index, `hash64`, skills and sharding — is in [docs/CMF_V2_SPEC.md](docs/CMF_V2_SPEC.md).
-
-## Comparison
-
-How CMF relates to safetensors, GGUF and raw HF checkpoints — the one-file, self-describing, mmap-quantized, multi-skill trade-offs — is in [docs/COMPARISON.md](docs/COMPARISON.md).
 
 ## Build from source
 
