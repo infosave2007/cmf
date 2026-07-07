@@ -6,12 +6,13 @@
 //! Scope: standard dense transformers (qwen2 / qwen3 / llama / mistral-style,
 //! RMSNorm + RoPE + SwiGLU, optional attention biases). Tensor handling is
 //! arch-agnostic — 1-D tensors are stored f16, 2-D weights are quantized — so
-//! it works by tensor presence without a hard-coded tensor set. Exotic layers
-//! (GatedDeltaNet, MoE) are out of scope here and still use the Python path.
+//! it works by tensor presence without a hard-coded tensor set. Mixture-of-experts
+//! is supported (router + per-expert matrices). Linear-attention (GatedDeltaNet)
+//! folding is not implemented natively yet and still uses the Python path.
 
 use cortiq_core::format::{CmfHeader, CmfModel, TensorSpec, TokenizerBundle, CMF_VERSION};
 use cortiq_core::quant::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use cortiq_core::types::{LayerType, ModelArch, NormStyle, QuantType, TensorDtype};
+use cortiq_core::types::{LayerType, ModelArch, MoeConfig, NormStyle, QuantType, TensorDtype};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -33,14 +34,24 @@ fn f16_scale(raw: f32) -> f32 {
 
 /// Quantization choice for 2-D weight matrices.
 #[derive(Clone, Copy, PartialEq)]
-enum Quant {
+pub(crate) enum Quant {
     Q8Row,
     Q8_2f,
     Q4Block,
     F16,
 }
 
-fn parse_quant(s: &str) -> anyhow::Result<Quant> {
+/// Quantize a 2-D matrix `[out_dim, in_dim]` per the chosen scheme.
+pub(crate) fn quantize_2d(quant: Quant, vals: &[f32], out_dim: usize, in_dim: usize) -> (TensorDtype, Vec<u8>) {
+    match quant {
+        Quant::Q8Row => (TensorDtype::Q8Row, encode_q8_row(vals, out_dim, in_dim)),
+        Quant::Q8_2f => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
+        Quant::Q4Block => (TensorDtype::Q4Block, encode_q4_block(vals)),
+        Quant::F16 => (TensorDtype::F16, encode_f16(vals)),
+    }
+}
+
+pub(crate) fn parse_quant(s: &str) -> anyhow::Result<Quant> {
     Ok(match s.to_ascii_lowercase().as_str() {
         "q8" | "q8_row" | "q8row" => Quant::Q8Row,
         "q8_2f" | "q82f" | "q8f" => Quant::Q8_2f,
@@ -129,7 +140,7 @@ fn encode_q8_2f(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
 }
 
 /// f16 blob for a 1-D / small tensor.
-fn encode_f16(vals: &[f32]) -> Vec<u8> {
+pub(crate) fn encode_f16(vals: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(vals.len() * 2);
     for &v in vals {
         out.extend_from_slice(&f32_to_f16(v).to_le_bytes());
@@ -226,17 +237,33 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     let hidden = cfg_usize(tc, "hidden_size").ok_or_else(|| anyhow::anyhow!("config: missing hidden_size"))?;
     let n_heads = cfg_usize(tc, "num_attention_heads").ok_or_else(|| anyhow::anyhow!("config: missing num_attention_heads"))?;
     let n_layers = cfg_usize(tc, "num_hidden_layers").ok_or_else(|| anyhow::anyhow!("config: missing num_hidden_layers"))?;
-    if tc.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(0) > 0
-        || tc.get("linear_num_value_heads").is_some()
-    {
-        anyhow::bail!("this model uses MoE / linear-attention layers — not supported by the native converter yet (use the Python converter)");
+    // Linear-attention (GatedDeltaNet) folding is not implemented natively yet.
+    if tc.get("linear_num_value_heads").is_some() || tc.get("linear_conv_kernel_dim").is_some() {
+        anyhow::bail!("this model uses linear-attention (GatedDeltaNet) layers — not supported by the native converter yet (use the Python converter)");
     }
+    // Mixture-of-experts: the FFN becomes a router + per-expert matrices. Tensor
+    // handling is unchanged (experts are ordinary 2-D matrices); we just declare
+    // the MoE config so the runtime dispatches it. Router presence per layer
+    // (in the directory) decides which layers are sparse.
+    let moe = tc.get("num_experts").and_then(|v| v.as_u64()).filter(|&n| n > 0).map(|ne| {
+        let mt = model_type.to_lowercase();
+        let ntp_default = mt.starts_with("qwen3_5") || mt.contains("qwen3_next");
+        MoeConfig {
+            num_experts: ne as usize,
+            top_k: cfg_usize(tc, "num_experts_per_tok").unwrap_or(2),
+            moe_intermediate_size: cfg_usize(tc, "moe_intermediate_size").unwrap_or(0),
+            norm_topk_prob: tc.get("norm_topk_prob").and_then(|v| v.as_bool()).unwrap_or(ntp_default),
+            shared_expert_intermediate_size: cfg_usize(tc, "shared_expert_intermediate_size"),
+        }
+    });
     let head_dim = cfg_usize(tc, "head_dim").unwrap_or(hidden / n_heads.max(1));
     let norm_style = if model_type.to_lowercase().contains("gemma") { NormStyle::Gemma } else { NormStyle::Qwen };
     Ok(ModelArch {
         arch_name: model_type,
         hidden_size: hidden,
-        intermediate_size: cfg_usize(tc, "intermediate_size").ok_or_else(|| anyhow::anyhow!("config: missing intermediate_size"))?,
+        intermediate_size: cfg_usize(tc, "intermediate_size")
+            .or_else(|| cfg_usize(tc, "moe_intermediate_size"))
+            .ok_or_else(|| anyhow::anyhow!("config: missing intermediate_size"))?,
         num_layers: n_layers,
         num_attention_heads: n_heads,
         num_kv_heads: cfg_usize(tc, "num_key_value_heads").unwrap_or(n_heads),
@@ -249,7 +276,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         tie_word_embeddings: config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false),
         partial_rotary_factor: tc.get("partial_rotary_factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
         mtp: None,
-        moe: None,
+        moe,
         linear_core: None,
         max_position_embeddings: cfg_usize(tc, "max_position_embeddings").unwrap_or(32_768),
         linear_conv_kernel_dim: None,
@@ -508,15 +535,10 @@ pub fn run_convert(
             }
             // 1-D tensors, tiny tensors, and non-2-D always go f16 (norms, biases).
             let two_d = m.shape.len() == 2 && numel >= GROUP_SIZE;
-            let (dt, data) = if !two_d {
-                (TensorDtype::F16, encode_f16(&vals))
+            let (dt, data) = if two_d {
+                quantize_2d(quant, &vals, m.shape[0], m.shape[1])
             } else {
-                match quant {
-                    Quant::Q8Row => (TensorDtype::Q8Row, encode_q8_row(&vals, m.shape[0], m.shape[1])),
-                    Quant::Q8_2f => (TensorDtype::Q8_2f, encode_q8_2f(&vals, m.shape[0], m.shape[1])),
-                    Quant::Q4Block => (TensorDtype::Q4Block, encode_q4_block(&vals)),
-                    Quant::F16 => (TensorDtype::F16, encode_f16(&vals)),
-                }
+                (TensorDtype::F16, encode_f16(&vals))
             };
             tensors.push(TensorSpec { name: m.name.clone(), dtype: dt, shape: m.shape.clone(), data });
             done += 1;

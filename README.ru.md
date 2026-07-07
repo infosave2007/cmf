@@ -94,10 +94,16 @@ cortiq convert --model Qwen/Qwen2.5-0.5B-Instruct --quant q8    --output model.c
 cortiq convert --model ./my-hf-checkpoint         --quant q8_2f --output model.cmf
 ```
 
+Или импортируйте GGUF-файл напрямую (F32 / F16 / Q8_0):
+
+```sh
+cortiq import-gguf model.gguf --output model.cmf --quant q8
+```
+
 Квантизация: `q8` · `q8_2f` (двухполевая, лучшее качество/размер) · `q4` · `f16`.
-Стандартные dense-модели (qwen2 / qwen3 / llama / mistral) конвертируются нативно;
-для MoE / линейного внимания (GatedDeltaNet) пока используется встроенный
-Python-конвертер (`converter/`).
+Стандартные dense- **и MoE-модели** (qwen2 / qwen3 / llama / mistral / qwen-moe)
+конвертируются нативно; для линейного внимания (GatedDeltaNet) пока используется
+встроенный Python-конвертер (`converter/`).
 
 Запустите инференс:
 

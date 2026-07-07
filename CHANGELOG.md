@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Native GatedDeltaNet (Qwen3.5 linear-attention) conversion — currently still
+  uses the Python path.
+
+## [0.1.6] — 2026-07-07
+
+### Added
+
+- **`cortiq import-gguf <file.gguf> --output model.cmf`** — a native Rust GGUF
+  importer (F32 / F16 / Q8_0; llama / qwen2 / qwen3), which also reconstructs a
+  Hugging Face tokenizer.json from the embedded ggml metadata. No Python.
+  K-quants (Q4_K / Q5_K / Q6_K) still use the Python importer.
+- **Mixture-of-experts** in `cortiq convert` — the router and per-expert matrices
+  are converted and the runtime dispatches the sparse FFN (qwen2-moe / qwen3-moe).
+
 ## [0.1.5] — 2026-07-07
 
 ### Added
@@ -100,7 +114,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/infosave2007/cmf/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/infosave2007/cmf/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/infosave2007/cmf/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/infosave2007/cmf/compare/v0.1.2...v0.1.3

@@ -94,9 +94,15 @@ cortiq convert --model Qwen/Qwen2.5-0.5B-Instruct --quant q8    --output model.c
 cortiq convert --model ./my-hf-checkpoint         --quant q8_2f --output model.cmf
 ```
 
+或直接导入一个 GGUF 文件（F32 / F16 / Q8_0）：
+
+```sh
+cortiq import-gguf model.gguf --output model.cmf --quant q8
+```
+
 量化：`q8` · `q8_2f`（双字段，质量/体积最佳）· `q4` · `f16`。
-标准 dense 模型（qwen2 / qwen3 / llama / mistral）原生转换；对于 MoE /
-线性注意力（GatedDeltaNet）架构，目前仍使用内置的 Python 转换器（`converter/`）。
+标准 dense **及 MoE 模型**（qwen2 / qwen3 / llama / mistral / qwen-moe）原生转换；
+线性注意力（GatedDeltaNet）架构目前仍使用内置的 Python 转换器（`converter/`）。
 
 运行推理：
 

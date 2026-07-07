@@ -92,10 +92,16 @@ cortiq convert --model Qwen/Qwen2.5-0.5B-Instruct --quant q8    --output model.c
 cortiq convert --model ./my-hf-checkpoint         --quant q8_2f --output model.cmf
 ```
 
+Or import a GGUF file directly (F32 / F16 / Q8_0):
+
+```sh
+cortiq import-gguf model.gguf --output model.cmf --quant q8
+```
+
 Quantization: `q8` · `q8_2f` (two-field, best quality/size) · `q4` · `f16`.
-Standard dense models (qwen2 / qwen3 / llama / mistral) convert natively; for
-MoE / linear-attention (GatedDeltaNet) architectures the bundled Python
-converter (`converter/`) is still used.
+Standard dense **and mixture-of-experts** models (qwen2 / qwen3 / llama /
+mistral / qwen-moe) convert natively; linear-attention (GatedDeltaNet)
+architectures still use the bundled Python converter (`converter/`).
 
 Run inference:
 

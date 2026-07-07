@@ -1,6 +1,7 @@
 //! Cortiq CLI — sparse task-routed model inference.
 
 mod convert;
+mod gguf;
 
 use clap::{Parser, Subcommand};
 use cortiq_core::CmfModel;
@@ -139,6 +140,17 @@ enum Commands {
         /// Hugging Face token (for gated/private repos)
         #[arg(long)]
         hf_token: Option<String>,
+    },
+    /// Import a GGUF model to .cmf — native Rust (F32/F16/Q8_0; llama/qwen2/qwen3)
+    ImportGguf {
+        /// Path to the .gguf file
+        gguf: String,
+        /// Output .cmf path
+        #[arg(long)]
+        output: String,
+        /// Quantization for 2-D weights: q8 | q8_2f | q4 | f16
+        #[arg(long, default_value = "q8")]
+        quant: String,
     },
     /// Interactive chat mode
     Run {
@@ -322,6 +334,13 @@ async fn main() -> anyhow::Result<()> {
         } => cmd_serve(&model, &host, port, &task, compat_port).await,
         Commands::Convert { model, quant, output, hf_token } => {
             convert::run_convert(&model, &quant, &output, hf_token.as_deref(), |f| {
+                println!("@PROGRESS {f:.4}");
+            })?;
+            println!("✓ wrote {output}");
+            Ok(())
+        }
+        Commands::ImportGguf { gguf, output, quant } => {
+            gguf::run_import_gguf(&gguf, &quant, &output, |f| {
                 println!("@PROGRESS {f:.4}");
             })?;
             println!("✓ wrote {output}");
