@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-07-07
+
+### Added
+
+- `cortiq convert --model <owner/name>` now accepts a **Hugging Face repo id**
+  directly and downloads it (config, tokenizer, and safetensors weights) before
+  converting — the whole HF → `.cmf` pipeline lives in one place, no external
+  tooling. `--hf-token` for gated/private repos.
+- **Parallel downloads**: weight files are fetched in concurrent 32 MiB
+  byte-range chunks over reused connections (saturates bandwidth for both a
+  single large file and sharded models). Tunable via `CORTIQ_HF_THREADS`
+  (default 8). Downloads are cached under `~/.cache/cortiq/hf`.
+
 ## [0.1.3] — 2026-07-07
 
 ### Added
@@ -67,7 +80,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/infosave2007/cmf/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/infosave2007/cmf/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/infosave2007/cmf/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/infosave2007/cmf/compare/v0.1.0...v0.1.1

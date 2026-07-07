@@ -21,9 +21,9 @@ path = "src/main.rs"
 gpu = ["cortiq-engine/gpu"]
 
 [dependencies]
-cortiq-core = { path = "../cortiq-core", version = "0.1.3" }
-cortiq-engine = { path = "../cortiq-engine", version = "0.1.3" }
-cortiq-server = { path = "../cortiq-server", version = "0.1.3" }
+cortiq-core = { path = "../cortiq-core", version = "0.1.4" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.1.4" }
+cortiq-server = { path = "../cortiq-server", version = "0.1.4" }
 clap = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -31,3 +31,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+# Minimal blocking HTTP client (rustls) so `cortiq convert` can pull a model
+# straight from the Hugging Face hub — keeps the whole convert pipeline in one crate.
+ureq = { version = "2", features = ["json", "tls"] }

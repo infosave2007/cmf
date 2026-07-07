@@ -13,7 +13,10 @@ use cortiq_core::format::{CmfHeader, CmfModel, TensorSpec, TokenizerBundle, CMF_
 use cortiq_core::quant::{bf16_to_f32, f16_to_f32, f32_to_f16};
 use cortiq_core::types::{LayerType, ModelArch, NormStyle, QuantType, TensorDtype};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::Duration;
 
 const GROUP_SIZE: usize = 32;
 /// Smallest normal f16 — floor for degenerate (all-zero) rows so the stored
@@ -214,16 +217,183 @@ fn eos_ids(gen_cfg: &serde_json::Value, config: &serde_json::Value) -> Vec<u32> 
     Vec::new()
 }
 
-/// Convert a HF model directory to a `.cmf` file. `progress` receives fraction
-/// 0..1 (used to stream `@PROGRESS` markers for a UI).
+/// `owner/name` HF repo id (not an existing local path).
+fn looks_like_repo(s: &str) -> bool {
+    let s = s.trim_matches('/');
+    s.split('/').count() == 2 && !s.contains(char::is_whitespace) && !Path::new(s).exists()
+}
+
+/// Local cache dir for a downloaded HF repo (`~/.cache/cortiq/hf/owner--name`).
+fn hf_cache_dir(repo: &str) -> anyhow::Result<std::path::PathBuf> {
+    let base = std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".cache/cortiq/hf"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".cortiq-hf"));
+    let dir = base.join(repo.replace('/', "--"));
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Parallel range chunk size (32 MiB) and default connection count.
+const HF_CHUNK: u64 = 32 * 1024 * 1024;
+
+fn hf_threads() -> usize {
+    std::env::var("CORTIQ_HF_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(8)
+        .min(16)
+}
+
+fn cached(dest: &Path) -> bool {
+    dest.exists() && fs::metadata(dest).map(|m| m.len() > 0).unwrap_or(false)
+}
+
+fn auth<'a>(mut req: ureq::Request, token: Option<&'a str>) -> ureq::Request {
+    req = req.set("User-Agent", "cortiq-convert");
+    if let Some(t) = token {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    req
+}
+
+/// Total size of a remote file via a `Range: bytes=0-0` probe (Content-Range),
+/// or None if the server doesn't support/report ranges (→ single stream).
+fn probe_size(agent: &ureq::Agent, url: &str, token: Option<&str>) -> Option<u64> {
+    let resp = auth(agent.get(url).set("Range", "bytes=0-0"), token).call().ok()?;
+    resp.header("Content-Range")?.rsplit('/').next()?.trim().parse::<u64>().ok()
+}
+
+fn get_range(agent: &ureq::Agent, url: &str, token: Option<&str>, start: u64, end: u64) -> anyhow::Result<Vec<u8>> {
+    let resp = auth(agent.get(url).set("Range", &format!("bytes={}-{}", start, end - 1)), token)
+        .call()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut buf = Vec::with_capacity((end - start) as usize);
+    resp.into_reader().read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+fn write_at(path: &Path, offset: u64, data: &[u8]) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = fs::OpenOptions::new().write(true).open(path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.write_all(data)
+}
+
+/// Fetch one file into `dest` (cached). Large range-capable files are pulled in
+/// parallel 32 MiB chunks over `threads` reused connections; otherwise a single
+/// stream. Returns false on 404 when `required` is false.
+fn fetch(agent: &ureq::Agent, url: &str, dest: &Path, token: Option<&str>, required: bool, threads: usize) -> anyhow::Result<bool> {
+    if cached(dest) {
+        return Ok(true);
+    }
+    let tmp = dest.with_extension("part");
+    let size = probe_size(agent, url, token);
+    if let Some(sz) = size {
+        if sz > HF_CHUNK && threads > 1 {
+            {
+                let f = fs::File::create(&tmp)?;
+                f.set_len(sz)?;
+            }
+            let chunks: Vec<(u64, u64)> =
+                (0..sz).step_by(HF_CHUNK as usize).map(|s| (s, (s + HF_CHUNK).min(sz))).collect();
+            let queue = Mutex::new(chunks);
+            let err: Mutex<Option<String>> = Mutex::new(None);
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|| loop {
+                        if err.lock().unwrap().is_some() {
+                            break;
+                        }
+                        let Some((start, end)) = queue.lock().unwrap().pop() else { break };
+                        let r = get_range(agent, url, token, start, end)
+                            .and_then(|buf| write_at(&tmp, start, &buf).map_err(Into::into));
+                        if let Err(e) = r {
+                            *err.lock().unwrap() = Some(e.to_string());
+                            break;
+                        }
+                    });
+                }
+            });
+            if let Some(e) = err.into_inner().unwrap() {
+                anyhow::bail!("download {url}: {e}");
+            }
+            fs::rename(&tmp, dest)?;
+            return Ok(true);
+        }
+    }
+    // Small file / no range support → single stream.
+    match auth(agent.get(url), token).call() {
+        Ok(resp) => {
+            let mut r = resp.into_reader();
+            let mut f = fs::File::create(&tmp)?;
+            std::io::copy(&mut r, &mut f)?;
+            fs::rename(&tmp, dest)?;
+            Ok(true)
+        }
+        Err(ureq::Error::Status(404, _)) if !required => Ok(false),
+        Err(e) => anyhow::bail!("download {url}: {e}"),
+    }
+}
+
+/// Fetch a HF repo's convertible files (config, tokenizer, weights) into the
+/// cache, with parallel chunked downloads for the weight shards.
+fn hf_download(repo: &str, token: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+    let dir = hf_cache_dir(repo)?;
+    let base = format!("https://huggingface.co/{repo}/resolve/main");
+    let threads = hf_threads();
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(20))
+        .timeout_read(Duration::from_secs(300))
+        .build();
+    for (f, required) in [
+        ("config.json", true),
+        ("tokenizer.json", true),
+        ("tokenizer_config.json", false),
+        ("generation_config.json", false),
+    ] {
+        fetch(&agent, &format!("{base}/{f}"), &dir.join(f), token, required, threads)?;
+    }
+    let idx = dir.join("model.safetensors.index.json");
+    if fetch(&agent, &format!("{base}/model.safetensors.index.json"), &idx, token, false, 1)? {
+        let j: serde_json::Value = serde_json::from_slice(&fs::read(&idx)?)?;
+        let map = j["weight_map"].as_object().ok_or_else(|| anyhow::anyhow!("bad safetensors index"))?;
+        let mut shards: Vec<String> = map.values().filter_map(|v| v.as_str().map(String::from)).collect();
+        shards.sort();
+        shards.dedup();
+        for (i, s) in shards.iter().enumerate() {
+            eprintln!("  shard {}/{} ({threads}× parallel): {s}", i + 1, shards.len());
+            fetch(&agent, &format!("{base}/{s}"), &dir.join(s), token, true, threads)?;
+        }
+    } else {
+        eprintln!("  model.safetensors ({threads}× parallel)");
+        fetch(&agent, &format!("{base}/model.safetensors"), &dir.join("model.safetensors"), token, true, threads)?;
+    }
+    Ok(dir)
+}
+
+/// Convert a HF model (local directory or `owner/name` repo id) to a `.cmf`
+/// file. `progress` receives fraction 0..1 (streamed as `@PROGRESS` markers).
 pub fn run_convert(
-    model_dir: &str,
+    model: &str,
     quant: &str,
     output: &str,
+    hf_token: Option<&str>,
     mut progress: impl FnMut(f32),
 ) -> anyhow::Result<()> {
-    let dir = Path::new(model_dir);
     let quant = parse_quant(quant)?;
+
+    // Source: a local HF directory, or an HF repo id to download.
+    let downloaded;
+    let dir: &Path = if Path::new(model).join("config.json").exists() {
+        Path::new(model)
+    } else if looks_like_repo(model) {
+        eprintln!("downloading {model} from Hugging Face…");
+        downloaded = hf_download(model, hf_token)?;
+        downloaded.as_path()
+    } else {
+        anyhow::bail!("'{model}': not a local model dir (no config.json) and not an HF repo id (owner/name)");
+    };
 
     let config: serde_json::Value = serde_json::from_slice(&fs::read(dir.join("config.json"))
         .map_err(|e| anyhow::anyhow!("read config.json: {e}"))?)?;
@@ -278,7 +448,7 @@ pub fn run_convert(
         version: CMF_VERSION,
         arch,
         quant_type,
-        provenance: Some(serde_json::json!({ "tool": "cortiq convert", "source_model": model_dir })),
+        provenance: Some(serde_json::json!({ "tool": "cortiq convert", "source_model": model })),
         tokenizer_config: Some(bundle),
         section_hashes: None,
         skills: Vec::new(),

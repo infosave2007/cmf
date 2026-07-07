@@ -126,7 +126,8 @@ enum Commands {
     },
     /// Convert a Hugging Face checkpoint to .cmf — native Rust, no Python
     Convert {
-        /// HF model directory (config.json + *.safetensors + tokenizer.json)
+        /// HF model: a local dir (config.json + *.safetensors + tokenizer.json)
+        /// or a hub repo id like `Qwen/Qwen2.5-0.5B-Instruct` (downloaded)
         #[arg(long)]
         model: String,
         /// Quantization for 2-D weights: q8 | q4 | f16
@@ -135,6 +136,9 @@ enum Commands {
         /// Output .cmf path
         #[arg(long)]
         output: String,
+        /// Hugging Face token (for gated/private repos)
+        #[arg(long)]
+        hf_token: Option<String>,
     },
     /// Interactive chat mode
     Run {
@@ -316,8 +320,8 @@ async fn main() -> anyhow::Result<()> {
             task,
             compat_port,
         } => cmd_serve(&model, &host, port, &task, compat_port).await,
-        Commands::Convert { model, quant, output } => {
-            convert::run_convert(&model, &quant, &output, |f| {
+        Commands::Convert { model, quant, output, hf_token } => {
+            convert::run_convert(&model, &quant, &output, hf_token.as_deref(), |f| {
                 println!("@PROGRESS {f:.4}");
             })?;
             println!("✓ wrote {output}");
