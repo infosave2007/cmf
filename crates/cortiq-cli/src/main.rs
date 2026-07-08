@@ -140,6 +140,11 @@ enum Commands {
         /// Hugging Face token (for gated/private repos)
         #[arg(long)]
         hf_token: Option<String>,
+        /// Target mean bits for `--quant vbit` (3.0–8.0; default 4.25). Higher =
+        /// better quality + larger file. Precision-sensitive architectures
+        /// (e.g. GatedDeltaNet) may need 5.5–6 to stay coherent.
+        #[arg(long, default_value = "4.25")]
+        mean_bits: f32,
     },
     /// Import a GGUF model to .cmf — native Rust (F32/F16/BF16/Q4_0..Q6_K + K-quants; llama/qwen2/qwen3)
     ImportGguf {
@@ -335,7 +340,8 @@ async fn main() -> anyhow::Result<()> {
             task,
             compat_port,
         } => cmd_serve(&model, &host, port, &task, compat_port).await,
-        Commands::Convert { model, quant, output, hf_token } => {
+        Commands::Convert { model, quant, output, hf_token, mean_bits } => {
+            convert::set_vbit_mean_bits(mean_bits);
             convert::run_convert(&model, &quant, &output, hf_token.as_deref(), |f| {
                 println!("@PROGRESS {f:.4}");
             })?;

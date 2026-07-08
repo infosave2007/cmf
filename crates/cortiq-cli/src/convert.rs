@@ -17,6 +17,7 @@ use cortiq_core::types::{LayerType, LinearCoreConfig, ModelArch, MoeConfig, Norm
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -178,7 +179,16 @@ fn encode_q8_2f(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
 //    MSB-first b-bit codes, zero-padded]. w = (u − L)·scale, L = 2^(b−1)−1.
 // The GPTQ / calibrated variant (needs a Hessian) stays in the Python converter.
 const VBIT_LEVELS: [u8; 5] = [3, 4, 5, 6, 8];
-const VBIT_MEAN_BITS: f32 = 4.25;
+/// Target mean bit-width for VBIT water-filling. Default 4.25; overridable via
+/// `cortiq convert --mean-bits` (stored ×1000 in a static to avoid signature churn).
+static VBIT_MEAN_BITS_MILLI: AtomicU32 = AtomicU32::new(4250);
+/// Set the VBIT target mean bit-width (converter CLI knob). Clamped to [3.0, 8.0].
+pub fn set_vbit_mean_bits(bits: f32) {
+    VBIT_MEAN_BITS_MILLI.store((bits.clamp(3.0, 8.0) * 1000.0) as u32, Ordering::Relaxed);
+}
+fn vbit_mean_bits() -> f32 {
+    VBIT_MEAN_BITS_MILLI.load(Ordering::Relaxed) as f32 / 1000.0
+}
 
 /// Snap `x` to the nearest allowed bit-width (first wins on a tie, like argmin).
 fn vbit_snap_level(x: f32) -> u8 {
@@ -238,7 +248,7 @@ impl BitWriter {
 
 fn encode_vbit(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
     let ng = in_dim / GROUP_SIZE;
-    let bits = vbit_bits(vals, out_dim, in_dim, VBIT_MEAN_BITS);
+    let bits = vbit_bits(vals, out_dim, in_dim, vbit_mean_bits());
 
     // Per-(row, group) scale = group absmax / L, f16-rounded and floored.
     let mut scale = vec![0f32; out_dim * ng];
