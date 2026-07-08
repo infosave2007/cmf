@@ -170,6 +170,13 @@ A reader addresses sections **only** through the envelope — never by assuming 
 
 The complete normative specification — envelope, header JSON, tensor directory, quant layouts, masks, tokenizer bundle, sparse index, `hash64`, skills and sharding — is in [docs/CMF_V2_SPEC.md](docs/CMF_V2_SPEC.md).
 
+## Theory & background
+
+CMF's design is derived from the author's physical theory — the **Vacuum Mass Fraction (VMF)**, within **Null-Vector Gravity (NVG)**. Twelve NVG/VMF principles map to concrete format elements (one shared backbone, two-field `q8_2f`, task masks, the held-out quality contract, resonance routing, the variable-bit codec…), with a hard line between what is *measured* and what stays a metaphor.
+
+- **[The VMF/NVG principles behind CMF](VMF_principles_in_CMF.md)** — the full mapping ([Русский](VMF_principles_in_CMF.ru.md) · [中文](VMF_principles_in_CMF.zh.md)).
+- **[NVG/VMF theory repository](https://github.com/infosave2007/vmf)** — the physics itself.
+
 ## Build from source
 
 ```sh

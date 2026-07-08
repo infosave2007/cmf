@@ -169,6 +169,13 @@ cortiq run model.cmf --prompt "SELECT ..." --skill sql
 
 完整的规范性说明——信封、header JSON、张量目录、量化布局、掩码、分词器捆绑包、稀疏索引、`hash64`、技能与分片——见 [docs/CMF_V2_SPEC.md](docs/CMF_V2_SPEC.md)。
 
+## 理论与背景
+
+CMF 的设计源自作者的物理理论——**真空质量分数（VMF）**，隶属于 **零矢量引力（NVG）** 框架。十二条 NVG/VMF 原理映射到具体的格式元素（单一共享骨干、双字段 `q8_2f`、任务掩码、留出数据上的质量契约、共振路由、可变位宽编解码器……），并在*已测量*与仍为隐喻者之间划下硬界线。
+
+- **[CMF 背后的 VMF/NVG 原理](VMF_principles_in_CMF.zh.md)** — 完整映射（[English](VMF_principles_in_CMF.md) · [Русский](VMF_principles_in_CMF.ru.md)）。
+- **[NVG/VMF 理论仓库](https://github.com/infosave2007/vmf)** — 物理本身。
+
 ## 从源码构建
 
 ```sh
