@@ -104,11 +104,13 @@ cortiq import-gguf Qwen/Qwen2.5-0.5B-Instruct-GGUF --output model.cmf --quant q8
 cortiq import-gguf model.gguf                      --output model.cmf --quant q8
 ```
 
-Квантизация: `q8` · `q8_2f` (двухполевая, лучшее качество/размер) · `q4` · `f16`.
+Квантизация: `q8` · `q8_2f` (двухполевая, лучшее качество/размер) · `q4` · `f16` ·
+`vbit` (переменная 3–8 бит, ~4.25 в среднем).
 Dense-, **MoE-** и **GatedDeltaNet-модели** (qwen2 / qwen3 / qwen3.5 / llama /
 mistral / qwen-moe) конвертируются нативно — включая слитую раскладку
 qwen3_next / AgentWorld. Встроенный Python-конвертер (`converter/`) теперь нужен
-лишь для исследовательских опций v-bit / калибровки.
+лишь для **GPTQ-калиброванного** v-bit (требует гессиан активаций) — базовый
+v-bit по весам нативный.
 
 Запустите инференс:
 

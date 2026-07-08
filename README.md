@@ -102,11 +102,13 @@ cortiq import-gguf Qwen/Qwen2.5-0.5B-Instruct-GGUF --output model.cmf --quant q8
 cortiq import-gguf model.gguf                      --output model.cmf --quant q8
 ```
 
-Quantization: `q8` · `q8_2f` (two-field, best quality/size) · `q4` · `f16`.
+Quantization: `q8` · `q8_2f` (two-field, best quality/size) · `q4` · `f16` ·
+`vbit` (variable 3–8 bit, ~4.25 avg).
 Dense, **mixture-of-experts**, and **GatedDeltaNet** models (qwen2 / qwen3 /
 qwen3.5 / llama / mistral / qwen-moe) convert natively — including the fused
 qwen3_next / AgentWorld layout. The Python converter (`converter/`) is now only
-needed for the research-only v-bit / calibration options.
+needed for the **GPTQ-calibrated** v-bit variant (which needs an activation
+Hessian) — the weight-only v-bit path is native.
 
 Run inference:
 

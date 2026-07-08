@@ -103,10 +103,11 @@ cortiq import-gguf Qwen/Qwen2.5-0.5B-Instruct-GGUF --output model.cmf --quant q8
 cortiq import-gguf model.gguf                      --output model.cmf --quant q8
 ```
 
-量化：`q8` · `q8_2f`（双字段，质量/体积最佳）· `q4` · `f16`。
+量化：`q8` · `q8_2f`（双字段，质量/体积最佳）· `q4` · `f16` · `vbit`（可变 3–8 bit，均值约 4.25）。
 dense、**MoE** 及 **GatedDeltaNet** 模型（qwen2 / qwen3 / qwen3.5 / llama /
 mistral / qwen-moe）均可原生转换——包括融合的 qwen3_next / AgentWorld 布局。内置的
-Python 转换器（`converter/`）现在仅用于研究性的 v-bit / 校准选项。
+Python 转换器（`converter/`）现在仅用于 **GPTQ 校准**的 v-bit 变体（需要激活
+Hessian）——仅按权重的 v-bit 路径已原生实现。
 
 运行推理：
 

@@ -65,6 +65,8 @@ pub(crate) enum Quant {
     Q8_2f,
     Q4Block,
     F16,
+    /// Grouped variable-bit (per-row 3–8 bit, water-filled by row amplitude).
+    Vbit,
 }
 
 /// Quantize a 2-D matrix `[out_dim, in_dim]` per the chosen scheme.
@@ -74,6 +76,10 @@ pub(crate) fn quantize_2d(quant: Quant, vals: &[f32], out_dim: usize, in_dim: us
         Quant::Q8_2f => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
         Quant::Q4Block => (TensorDtype::Q4Block, encode_q4_block(vals)),
         Quant::F16 => (TensorDtype::F16, encode_f16(vals)),
+        // v-bit needs the input dim to be a multiple of the group size; other
+        // shapes fall back to the two-field q8_2f (best equal-size alternative).
+        Quant::Vbit if in_dim % GROUP_SIZE == 0 => (TensorDtype::Vbit, encode_vbit(vals, out_dim, in_dim)),
+        Quant::Vbit => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
     }
 }
 
@@ -83,7 +89,8 @@ pub(crate) fn parse_quant(s: &str) -> anyhow::Result<Quant> {
         "q8_2f" | "q82f" | "q8f" => Quant::Q8_2f,
         "q4" | "q4_block" | "q4block" => Quant::Q4Block,
         "f16" | "fp16" => Quant::F16,
-        other => anyhow::bail!("unknown quant '{other}' (use q8, q8_2f, q4, or f16)"),
+        "vbit" | "v_bit" => Quant::Vbit,
+        other => anyhow::bail!("unknown quant '{other}' (use q8, q8_2f, q4, f16, or vbit)"),
     })
 }
 
@@ -162,6 +169,107 @@ fn encode_q8_2f(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
     for &c in &col {
         out.extend_from_slice(&f32_to_f16(c).to_le_bytes());
     }
+    out
+}
+
+// Grouped variable-bit (v-bit) encoder — the weight-only (round-to-nearest) path
+// of the reference converter. On-disk layout read by `cortiq_core::dequant_vbit`:
+//   [u8 bits: rows][f16 scales: rows·(in/32)][per row: ceil(in·b/8) bytes,
+//    MSB-first b-bit codes, zero-padded]. w = (u − L)·scale, L = 2^(b−1)−1.
+// The GPTQ / calibrated variant (needs a Hessian) stays in the Python converter.
+const VBIT_LEVELS: [u8; 5] = [3, 4, 5, 6, 8];
+const VBIT_MEAN_BITS: f32 = 4.25;
+
+/// Snap `x` to the nearest allowed bit-width (first wins on a tie, like argmin).
+fn vbit_snap_level(x: f32) -> u8 {
+    let mut best = VBIT_LEVELS[0];
+    let mut bestd = (x - best as f32).abs();
+    for &lv in &VBIT_LEVELS[1..] {
+        let d = (x - lv as f32).abs();
+        if d < bestd {
+            bestd = d;
+            best = lv;
+        }
+    }
+    best
+}
+
+/// Per-row bit-width via water-filling over log2 row amplitude (floor 3 bits).
+fn vbit_bits(vals: &[f32], out_dim: usize, in_dim: usize, mean_bits: f32) -> Vec<u8> {
+    let a: Vec<f32> = (0..out_dim)
+        .map(|o| {
+            let mx = vals[o * in_dim..(o + 1) * in_dim].iter().fold(0f32, |m, v| m.max(v.abs()));
+            mx.max(1e-12).log2()
+        })
+        .collect();
+    let amean = a.iter().sum::<f32>() / out_dim as f32;
+    a.iter().map(|&ar| vbit_snap_level(mean_bits + (ar - amean)).max(3)).collect()
+}
+
+/// Big-endian (MSB-first) bit packer; the last byte of each row is zero-padded.
+struct BitWriter {
+    buf: Vec<u8>,
+    cur: u8,
+    nbits: u8,
+}
+impl BitWriter {
+    fn with_capacity(n: usize) -> Self {
+        Self { buf: Vec::with_capacity(n), cur: 0, nbits: 0 }
+    }
+    fn push(&mut self, v: u32, b: u32) {
+        for i in (0..b).rev() {
+            self.cur = (self.cur << 1) | ((v >> i) & 1) as u8;
+            self.nbits += 1;
+            if self.nbits == 8 {
+                self.buf.push(self.cur);
+                self.cur = 0;
+                self.nbits = 0;
+            }
+        }
+    }
+    fn flush_row(&mut self) {
+        if self.nbits > 0 {
+            self.buf.push(self.cur << (8 - self.nbits));
+            self.cur = 0;
+            self.nbits = 0;
+        }
+    }
+}
+
+fn encode_vbit(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
+    let ng = in_dim / GROUP_SIZE;
+    let bits = vbit_bits(vals, out_dim, in_dim, VBIT_MEAN_BITS);
+
+    // Per-(row, group) scale = group absmax / L, f16-rounded and floored.
+    let mut scale = vec![0f32; out_dim * ng];
+    let mut sc_bytes = Vec::with_capacity(out_dim * ng * 2);
+    for o in 0..out_dim {
+        let l = (2f32.powi(bits[o] as i32 - 1) - 1.0).max(1.0);
+        for g in 0..ng {
+            let base = o * in_dim + g * GROUP_SIZE;
+            let mx = vals[base..base + GROUP_SIZE].iter().fold(0f32, |m, v| m.max(v.abs()));
+            let s = f16_scale(mx / l);
+            scale[o * ng + g] = s;
+            sc_bytes.extend_from_slice(&f32_to_f16(s).to_le_bytes());
+        }
+    }
+
+    let mut out = Vec::with_capacity(out_dim + sc_bytes.len() + out_dim * in_dim);
+    out.extend_from_slice(&bits);
+    out.extend_from_slice(&sc_bytes);
+    let mut bw = BitWriter::with_capacity(out_dim * in_dim);
+    for o in 0..out_dim {
+        let b = bits[o] as u32;
+        let l = 2f32.powi(bits[o] as i32 - 1) - 1.0;
+        let maxq = 2f32.powi(bits[o] as i32) - 1.0;
+        for c in 0..in_dim {
+            let s = scale[o * ng + c / GROUP_SIZE];
+            let q = ((vals[o * in_dim + c] / s).round_ties_even() + l).clamp(0.0, maxq) as u32;
+            bw.push(q, b);
+        }
+        bw.flush_row();
+    }
+    out.extend_from_slice(&bw.buf);
     out
 }
 
@@ -814,6 +922,7 @@ pub fn run_convert(
         Quant::Q8_2f => QuantType::Q8_2f,
         Quant::Q4Block => QuantType::Q4Block,
         Quant::F16 => QuantType::F16,
+        Quant::Vbit => QuantType::Vbit,
     };
     let header = CmfHeader {
         format: "cmf".into(),
@@ -837,7 +946,32 @@ pub fn run_convert(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cortiq_core::quant::{dequant_q4_block, dequant_q8_2f, dequant_q8_row};
+    use cortiq_core::quant::{dequant_q4_block, dequant_q8_2f, dequant_q8_row, dequant_vbit};
+
+    #[test]
+    fn vbit_roundtrip_within_quant_error() {
+        // rows with distinct amplitudes → distinct bit-widths; 2 groups per row.
+        let (rows, cols) = (5usize, 64usize);
+        let mut vals = vec![0f32; rows * cols];
+        for o in 0..rows {
+            for i in 0..cols {
+                vals[o * cols + i] = (o as f32 + 1.0) * 0.13 * (i as f32 * 0.27).sin();
+            }
+        }
+        let enc = encode_vbit(&vals, rows, cols);
+        // header sizes match the decoder's expectation.
+        let bits = &enc[..rows];
+        assert!(bits.iter().all(|&b| (3..=8).contains(&b)));
+        let mut dec = vec![0f32; rows * cols];
+        dequant_vbit(&enc, rows, cols, &mut dec).unwrap();
+        for o in 0..rows {
+            let amp = vals[o * cols..(o + 1) * cols].iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            for i in 0..cols {
+                let e = (dec[o * cols + i] - vals[o * cols + i]).abs();
+                assert!(e <= amp * 0.2, "row {o} col {i}: err {e} vs amp {amp} (bits {})", bits[o]);
+            }
+        }
+    }
 
     #[test]
     fn fused_gdn_split_is_correct_permutation() {

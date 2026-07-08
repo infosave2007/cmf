@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-07-08
+
+### Added
+
+- **Native v-bit quantization** — `cortiq convert --quant vbit` /
+  `cortiq import-gguf … --quant vbit` now encode the grouped variable-bit format
+  in Rust (no Python): per-row bit-width (3–8, water-filled by log2 row
+  amplitude toward a 4.25-bit budget), per-32-group f16 scale, MSB-first packing
+  — byte-compatible with the `cortiq-core` v-bit reader. A round-trip unit test
+  and a real-model convert→run confirm it (≈40% smaller than q8, coherent
+  output). Only the **GPTQ-calibrated** v-bit variant (which needs an activation
+  Hessian) still uses the Python converter; the weight-only path is fully native.
+
 ## [0.1.8] — 2026-07-08
 
 ### Fixed
@@ -158,7 +171,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/infosave2007/cmf/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/infosave2007/cmf/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/infosave2007/cmf/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/infosave2007/cmf/compare/v0.1.5...v0.1.6
