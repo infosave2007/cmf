@@ -141,9 +141,9 @@ enum Commands {
         #[arg(long)]
         hf_token: Option<String>,
     },
-    /// Import a GGUF model to .cmf — native Rust (F32/F16/Q8_0; llama/qwen2/qwen3)
+    /// Import a GGUF model to .cmf — native Rust (F32/F16/BF16/Q4_0..Q6_K + K-quants; llama/qwen2/qwen3)
     ImportGguf {
-        /// Path to the .gguf file
+        /// A local .gguf file, an HF repo id (owner/name — best .gguf auto-picked), or owner/name/file.gguf
         gguf: String,
         /// Output .cmf path
         #[arg(long)]
@@ -151,6 +151,9 @@ enum Commands {
         /// Quantization for 2-D weights: q8 | q8_2f | q4 | f16
         #[arg(long, default_value = "q8")]
         quant: String,
+        /// Hugging Face token for gated/private GGUF repos
+        #[arg(long)]
+        hf_token: Option<String>,
     },
     /// Interactive chat mode
     Run {
@@ -339,8 +342,8 @@ async fn main() -> anyhow::Result<()> {
             println!("✓ wrote {output}");
             Ok(())
         }
-        Commands::ImportGguf { gguf, output, quant } => {
-            gguf::run_import_gguf(&gguf, &quant, &output, |f| {
+        Commands::ImportGguf { gguf, output, quant, hf_token } => {
+            gguf::run_import_gguf(&gguf, &quant, &output, hf_token.as_deref(), |f| {
                 println!("@PROGRESS {f:.4}");
             })?;
             println!("✓ wrote {output}");

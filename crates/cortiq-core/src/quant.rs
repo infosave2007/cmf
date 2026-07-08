@@ -24,7 +24,11 @@ pub fn f16_to_f32(h: u16) -> f32 {
         if mant == 0 {
             sign << 31
         } else {
-            // subnormal: normalize
+            // subnormal: normalize. A subnormal half equals mant·2^-24; shifting
+            // its MSB up to bit 10 takes e = 10-b shifts (b = MSB position), so
+            // the true exponent is b-24 and the f32 biased exponent is b+103 =
+            // 113-e. (The old `127-15-e` form was off by one — it halved every
+            // subnormal, which corrupts K-quant super-block scales.)
             let mut e = 0u32;
             let mut m = mant;
             while m & 0x400 == 0 {
@@ -32,7 +36,7 @@ pub fn f16_to_f32(h: u16) -> f32 {
                 e += 1;
             }
             m &= 0x3FF;
-            (sign << 31) | ((127 - 15 - e) << 23) | (m << 13)
+            (sign << 31) | ((113 - e) << 23) | (m << 13)
         }
     } else if exp == 0x1F {
         (sign << 31) | (0xFF << 23) | (mant << 13)
@@ -273,5 +277,31 @@ pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
         TensorDtype::Q4Block | TensorDtype::Q4Col | TensorDtype::Mix84 => 0.5625,
         TensorDtype::Vbit => 0.5,
         TensorDtype::U8 => 1.0,
+    }
+}
+
+#[cfg(test)]
+mod f16_tests {
+    use super::{f16_to_f32, f32_to_f16};
+
+    #[test]
+    fn f16_subnormals_decode_correctly() {
+        // Smallest positive subnormal: 2^-24.
+        assert!((f16_to_f32(0x0001) - 5.9604645e-8).abs() < 1e-12);
+        // Largest subnormal: 1023 * 2^-24.
+        assert!((f16_to_f32(0x03FF) - 6.0975552e-5).abs() < 1e-9);
+        // The value that exposed the halving bug (mant=299, subnormal).
+        assert!((f16_to_f32(0x812b) - -1.7821789e-5).abs() < 1e-9);
+        // Smallest normal (boundary) still correct: 2^-14.
+        assert!((f16_to_f32(0x0400) - 6.1035156e-5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn f16_roundtrip_including_subnormals() {
+        for &v in &[0.0f32, 1.0, -2.5, 6.097e-5, 3.0e-5, 5.96e-8, -1.782e-5, 65504.0] {
+            let back = f16_to_f32(f32_to_f16(v));
+            let tol = (v.abs() * 1e-3).max(1e-9);
+            assert!((back - v).abs() <= tol, "roundtrip {v} -> {back}");
+        }
     }
 }

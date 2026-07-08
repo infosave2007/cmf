@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-07-08
+
+### Fixed
+
+- **f16 subnormal decode bug** (`cortiq-core`) — `f16_to_f32` computed the
+  subnormal exponent as `127-15-e`, one too small, which **halved every
+  subnormal half-float**. This corrupted GGUF K-quant super-block scales (which
+  are frequently subnormal), producing garbage output. The biased exponent is
+  now `113-e`; covered by new round-trip tests. It also slightly affects any
+  runtime f16 weight that happened to be subnormal.
+
+### Added
+
+- **Full GGUF quant coverage** in `cortiq import-gguf` — every common ggml type
+  is now dequantized natively (no Python): `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`,
+  `Q8_0`, the K-quants `Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K`, `Q8_K`, `BF16`, and
+  the non-linear-codebook `IQ4_NL` / `IQ4_XS` (used inside `q2_k`/`q3_k` mixes).
+  Each codec is a faithful port of ggml `dequantize_row_*`; Q4_K/Q5_K/Q6_K have
+  unit tests against fp16 ground truth, and all nine Qwen2.5 GGUF quantizations
+  convert and generate coherently. Only the `IQ1`/`IQ2`/`IQ3` grid codebooks
+  remain unsupported (an honest error, never silent garbage).
+- **`cortiq import-gguf <owner/repo>`** now accepts a Hugging Face repo id (the
+  best natively-supported `.gguf` is picked and downloaded in parallel), or
+  `owner/repo/file.gguf` for a specific file, or a local path. `--hf-token` for
+  gated repos. A linear-attention / SSM (GatedDeltaNet) GGUF is refused with a
+  clear message pointing at the safetensors path — never silently mangled.
+- **Native fused-GatedDeltaNet split** in `cortiq convert` — qwen3_next /
+  AgentWorld checkpoints that fuse the GDN projections (`in_proj_qkvz` /
+  `in_proj_ba`, group-interleaved) are split into the canonical hub tensors
+  natively, so those models no longer need the Python converter. The split is a
+  pure row permutation with a unit test; it is not yet generation-verified on
+  real fused weights (no small public fused checkpoint exists).
+- A GGUF-only repo passed to `cortiq convert` now returns an actionable error
+  (use `import-gguf`, or convert the source safetensors repo) instead of a raw
+  404 on the missing `config.json`.
+
 ## [0.1.7] — 2026-07-07
 
 ### Added
@@ -122,7 +158,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/infosave2007/cmf/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/infosave2007/cmf/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/infosave2007/cmf/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/infosave2007/cmf/compare/v0.1.4...v0.1.5

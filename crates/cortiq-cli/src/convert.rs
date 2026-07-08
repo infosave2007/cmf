@@ -372,9 +372,37 @@ fn eos_ids(gen_cfg: &serde_json::Value, config: &serde_json::Value) -> Vec<u32> 
 }
 
 /// `owner/name` HF repo id (not an existing local path).
-fn looks_like_repo(s: &str) -> bool {
+pub(crate) fn looks_like_repo(s: &str) -> bool {
     let s = s.trim_matches('/');
     s.split('/').count() == 2 && !s.contains(char::is_whitespace) && !Path::new(s).exists()
+}
+
+/// A fresh ureq agent with the same timeouts the downloader uses.
+fn hf_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(20))
+        .timeout_read(Duration::from_secs(300))
+        .build()
+}
+
+/// List a repo's files via the HF API (best-effort; empty on failure). Reused by
+/// the GGUF importer to pick a `.gguf` from a repo.
+pub(crate) fn hf_repo_files(repo: &str, token: Option<&str>) -> Vec<String> {
+    repo_files(&hf_agent(), repo, token)
+}
+
+/// Download a single named file from an HF repo into the cache (parallel chunks
+/// for large files); returns its local path. Used to fetch one `.gguf`.
+pub(crate) fn hf_fetch_file(
+    repo: &str,
+    filename: &str,
+    token: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let dir = hf_cache_dir(repo)?;
+    let dest = dir.join(filename.replace('/', "__"));
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
+    fetch(&hf_agent(), &url, &dest, token, true, hf_threads())?;
+    Ok(dest)
 }
 
 /// Local cache dir for a downloaded HF repo (`~/.cache/cortiq/hf/owner--name`).
@@ -526,6 +554,23 @@ fn fetch(agent: &ureq::Agent, url: &str, dest: &Path, token: Option<&str>, requi
     }
 }
 
+/// List a repo's file names via the HF API (best-effort; empty on any failure).
+fn repo_files(agent: &ureq::Agent, repo: &str, token: Option<&str>) -> Vec<String> {
+    let url = format!("https://huggingface.co/api/models/{repo}");
+    match auth(agent.get(&url), token).call() {
+        Ok(resp) => resp
+            .into_json::<serde_json::Value>()
+            .ok()
+            .and_then(|j| {
+                j["siblings"].as_array().map(|a| {
+                    a.iter().filter_map(|s| s["rfilename"].as_str().map(String::from)).collect()
+                })
+            })
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Fetch a HF repo's convertible files (config, tokenizer, weights) into the
 /// cache, with parallel chunked downloads for the weight shards.
 fn hf_download(repo: &str, token: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
@@ -536,8 +581,31 @@ fn hf_download(repo: &str, token: Option<&str>) -> anyhow::Result<std::path::Pat
         .timeout_connect(Duration::from_secs(20))
         .timeout_read(Duration::from_secs(300))
         .build();
+    // config.json is mandatory for the safetensors path. If it is absent, give an
+    // actionable message rather than a raw 404 — most often the repo is a GGUF-only
+    // distribution (has `*.gguf`, no `config.json`), which needs a different tool.
+    if !fetch(&agent, &format!("{base}/config.json"), &dir.join("config.json"), token, false, threads)? {
+        let files = repo_files(&agent, repo, token);
+        let ggufs = files.iter().filter(|f| f.to_lowercase().ends_with(".gguf")).count();
+        if ggufs > 0 {
+            let src = repo
+                .strip_suffix("-GGUF")
+                .or_else(|| repo.strip_suffix("-gguf"))
+                .filter(|s| !s.is_empty());
+            anyhow::bail!(
+                "'{repo}' is a GGUF repository ({ggufs} .gguf file(s), no config.json); \
+                 `cortiq convert` needs a safetensors checkpoint. Either import a GGUF file \
+                 directly with `cortiq import-gguf <file.gguf>` (dense llama/qwen2/qwen3, F32/F16/Q8_0), \
+                 or convert the source safetensors repo instead{}.",
+                match src {
+                    Some(s) => format!(" — try `--model {s}`"),
+                    None => String::new(),
+                }
+            );
+        }
+        anyhow::bail!("'{repo}': no config.json — not a Hugging Face safetensors checkpoint");
+    }
     for (f, required) in [
-        ("config.json", true),
         ("tokenizer.json", true),
         ("tokenizer_config.json", false),
         ("generation_config.json", false),
@@ -560,6 +628,90 @@ fn hf_download(repo: &str, token: Option<&str>) -> anyhow::Result<std::path::Pat
         fetch(&agent, &format!("{base}/model.safetensors"), &dir.join("model.safetensors"), token, true, threads)?;
     }
     Ok(dir)
+}
+
+/// Split a fused GDN projection (`in_proj_qkvz` or `in_proj_ba`) into the
+/// canonical hub tensors. The fused weight is `[nk · group_width, hid]`; rows
+/// are grouped by k-head. This mirrors transformers' `fix_query_key_value_ordering`
+/// inverse — a pure row permutation, no value changes. Returns `(name, values,
+/// out_rows)` for each produced tensor.
+fn split_fused_gdn(
+    name: &str,
+    w: &[f32],
+    hid: usize,
+    nk: usize,
+    dk: usize,
+    nv: usize,
+    dv: usize,
+) -> anyhow::Result<Vec<(String, Vec<f32>, usize)>> {
+    if nk == 0 || nv % nk != 0 {
+        anyhow::bail!("fused GDN: bad head config nk={nk} nv={nv}");
+    }
+    let r = nv / nk;
+    // Row `g·gw + gr` of the source (group g, within-group row gr).
+    let row = |w: &[f32], gw: usize, g: usize, gr: usize| -> Vec<f32> {
+        let base = (g * gw + gr) * hid;
+        w[base..base + hid].to_vec()
+    };
+
+    if name.contains("in_proj_qkvz") {
+        let gw = 2 * dk + 2 * r * dv;
+        if w.len() != nk * gw * hid {
+            anyhow::bail!("fused GDN qkvz: {} values, expected {}", w.len(), nk * gw * hid);
+        }
+        // qkv = [q: nk·dk][k: nk·dk][v: nv·dv]
+        let mut qkv = Vec::with_capacity((2 * nk * dk + nv * dv) * hid);
+        for g in 0..nk {
+            for rr in 0..dk {
+                qkv.extend_from_slice(&row(w, gw, g, rr));
+            }
+        }
+        for g in 0..nk {
+            for rr in 0..dk {
+                qkv.extend_from_slice(&row(w, gw, g, dk + rr));
+            }
+        }
+        for g in 0..nk {
+            for rr in 0..r * dv {
+                qkv.extend_from_slice(&row(w, gw, g, 2 * dk + rr));
+            }
+        }
+        // z = nv·dv
+        let mut z = Vec::with_capacity(nv * dv * hid);
+        for g in 0..nk {
+            for rr in 0..r * dv {
+                z.extend_from_slice(&row(w, gw, g, 2 * dk + r * dv + rr));
+            }
+        }
+        let p = name.strip_suffix("in_proj_qkvz.weight").unwrap_or(name);
+        Ok(vec![
+            (format!("{p}in_proj_qkv.weight"), qkv, 2 * nk * dk + nv * dv),
+            (format!("{p}in_proj_z.weight"), z, nv * dv),
+        ])
+    } else {
+        // in_proj_ba: group width 2·r → b (first r per group), a (next r) → nv rows each.
+        let gw = 2 * r;
+        if w.len() != nk * gw * hid {
+            anyhow::bail!("fused GDN ba: {} values, expected {}", w.len(), nk * gw * hid);
+        }
+        let mut b = Vec::with_capacity(nv * hid);
+        let mut a = Vec::with_capacity(nv * hid);
+        for g in 0..nk {
+            for rr in 0..r {
+                b.extend_from_slice(&row(w, gw, g, rr));
+            }
+        }
+        for g in 0..nk {
+            for rr in 0..r {
+                a.extend_from_slice(&row(w, gw, g, r + rr));
+            }
+        }
+        let p = name.strip_suffix("in_proj_ba.weight").unwrap_or(name);
+        Ok(vec![
+            (format!("{p}in_proj_b.weight"), b, nv),
+            (format!("{p}in_proj_a.weight"), a, nv),
+        ])
+    }
 }
 
 /// Convert a HF model (local directory or `owner/name` repo id) to a `.cmf`
@@ -600,12 +752,31 @@ pub fn run_convert(
             done += 1;
             progress(done as f32 / total as f32);
             let Some(name) = canon_name(&m.name) else { continue };
-            // qwen3_next/AgentWorld checkpoints fuse the GDN projections
-            // (in_proj_qkvz / in_proj_ba) with a group-interleaved layout the
-            // native converter doesn't split yet; the hub Qwen3.5 layout
-            // (separate in_proj_qkv/z/a/b) converts fine.
+            // qwen3_next / AgentWorld fuse the GDN projections (in_proj_qkvz /
+            // in_proj_ba) with a group-interleaved layout; split them natively
+            // into the canonical hub tensors (in_proj_qkv/z/a/b). Pure row
+            // permutation — no value is changed.
             if name.contains(".linear_attn.in_proj_qkvz") || name.contains(".linear_attn.in_proj_ba") {
-                anyhow::bail!("fused GDN projections (qwen3_next / AgentWorld checkpoint) — use the Python converter; the hub Qwen3.5 layout converts natively");
+                if m.shape.len() != 2 {
+                    anyhow::bail!("fused GDN tensor '{name}': expected 2-D, got {:?}", m.shape);
+                }
+                let w = to_f32(&m.dtype, file.bytes(m))?;
+                let hid = m.shape[1];
+                let miss = |k: &str| anyhow::anyhow!("fused GDN needs {k} in config");
+                let nk = arch.linear_num_key_heads.ok_or_else(|| miss("linear_num_key_heads"))?;
+                let dk = arch.linear_key_head_dim.ok_or_else(|| miss("linear_key_head_dim"))?;
+                let nv = arch.linear_num_value_heads.ok_or_else(|| miss("linear_num_value_heads"))?;
+                let dv = arch.linear_value_head_dim.ok_or_else(|| miss("linear_value_head_dim"))?;
+                for (out_name, out_vals, out_rows) in split_fused_gdn(&name, &w, hid, nk, dk, nv, dv)? {
+                    let two_d = out_rows * hid >= GROUP_SIZE && !force_f16(&out_name);
+                    let (dt, data) = if two_d {
+                        quantize_2d(quant, &out_vals, out_rows, hid)
+                    } else {
+                        (TensorDtype::F16, encode_f16(&out_vals))
+                    };
+                    tensors.push(TensorSpec { name: out_name, dtype: dt, shape: vec![out_rows, hid], data });
+                }
+                continue;
             }
             let vals = to_f32(&m.dtype, file.bytes(m))?;
             let numel: usize = m.shape.iter().product();
@@ -667,6 +838,45 @@ pub fn run_convert(
 mod tests {
     use super::*;
     use cortiq_core::quant::{dequant_q4_block, dequant_q8_2f, dequant_q8_row};
+
+    #[test]
+    fn fused_gdn_split_is_correct_permutation() {
+        // nk=2, dk=3, nv=4 (r=2), dv=2, hid=1. Each source row's value = its flat
+        // row index, so we can trace exactly where each row lands after the split.
+        let (nk, dk, nv, dv, hid) = (2usize, 3usize, 4usize, 2usize, 1usize);
+        let r = nv / nk; // 2
+        let gw = 2 * dk + 2 * r * dv; // 6 + 8 = 14
+        let w: Vec<f32> = (0..nk * gw * hid).map(|i| i as f32).collect();
+        let out = split_fused_gdn("m.linear_attn.in_proj_qkvz.weight", &w, hid, nk, dk, nv, dv).unwrap();
+        let qkv = &out[0];
+        assert_eq!(qkv.0, "m.linear_attn.in_proj_qkv.weight");
+        assert_eq!(qkv.2, 2 * nk * dk + nv * dv); // 12 + 8 = 20
+        // q rows: group g row rr -> source flat row g*gw+rr.
+        // g=0 -> rows 0,1,2 ; g=1 -> rows 14,15,16
+        assert_eq!(qkv.1[0..3], [0.0, 1.0, 2.0]);
+        assert_eq!(qkv.1[3..6], [14.0, 15.0, 16.0]);
+        // k rows: source g*gw + dk+rr. g=0 -> 3,4,5 ; g=1 -> 17,18,19
+        assert_eq!(qkv.1[6..9], [3.0, 4.0, 5.0]);
+        assert_eq!(qkv.1[9..12], [17.0, 18.0, 19.0]);
+        // v rows: source g*gw + 2dk+rr (rr 0..4). g=0 -> 6,7,8,9 ; g=1 -> 20,21,22,23
+        assert_eq!(qkv.1[12..16], [6.0, 7.0, 8.0, 9.0]);
+        assert_eq!(qkv.1[16..20], [20.0, 21.0, 22.0, 23.0]);
+        let z = &out[1];
+        assert_eq!(z.0, "m.linear_attn.in_proj_z.weight");
+        assert_eq!(z.2, nv * dv); // 8
+        // z rows: source g*gw + 2dk+r*dv+rr. g=0 -> 10,11,12,13 ; g=1 -> 24,25,26,27
+        assert_eq!(z.1, [10.0, 11.0, 12.0, 13.0, 24.0, 25.0, 26.0, 27.0]);
+
+        // in_proj_ba: group width 2r=4. rows nk*4 = 8.
+        let wb: Vec<f32> = (0..nk * 2 * r * hid).map(|i| i as f32).collect();
+        let outb = split_fused_gdn("m.linear_attn.in_proj_ba.weight", &wb, hid, nk, dk, nv, dv).unwrap();
+        // b = first r per group: g=0 -> 0,1 ; g=1 -> 4,5
+        assert_eq!(outb[0].0, "m.linear_attn.in_proj_b.weight");
+        assert_eq!(outb[0].1, [0.0, 1.0, 4.0, 5.0]);
+        // a = next r per group: g=0 -> 2,3 ; g=1 -> 6,7
+        assert_eq!(outb[1].0, "m.linear_attn.in_proj_a.weight");
+        assert_eq!(outb[1].1, [2.0, 3.0, 6.0, 7.0]);
+    }
 
     #[test]
     fn parse_quant_variants() {

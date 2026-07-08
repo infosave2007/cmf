@@ -92,16 +92,21 @@ cortiq convert --model Qwen/Qwen2.5-0.5B-Instruct --quant q8    --output model.c
 cortiq convert --model ./my-hf-checkpoint         --quant q8_2f --output model.cmf
 ```
 
-Or import a GGUF file directly (F32 / F16 / Q8_0):
+Or import a GGUF directly — a local file, or a Hugging Face GGUF **repo id**
+(the best `.gguf` is picked and downloaded). Every common ggml quant is
+dequantized natively (`Q4_0/1`, `Q5_0/1`, `Q8_0`, `Q2_K`…`Q6_K`, `IQ4_NL/XS`,
+`BF16`) — no Python:
 
 ```sh
-cortiq import-gguf model.gguf --output model.cmf --quant q8
+cortiq import-gguf Qwen/Qwen2.5-0.5B-Instruct-GGUF --output model.cmf --quant q8
+cortiq import-gguf model.gguf                      --output model.cmf --quant q8
 ```
 
 Quantization: `q8` · `q8_2f` (two-field, best quality/size) · `q4` · `f16`.
 Dense, **mixture-of-experts**, and **GatedDeltaNet** models (qwen2 / qwen3 /
-qwen3.5 / llama / mistral / qwen-moe) convert natively; fused qwen3_next
-checkpoints still use the bundled Python converter (`converter/`).
+qwen3.5 / llama / mistral / qwen-moe) convert natively — including the fused
+qwen3_next / AgentWorld layout. The Python converter (`converter/`) is now only
+needed for the research-only v-bit / calibration options.
 
 Run inference:
 
