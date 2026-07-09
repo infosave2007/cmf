@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10] — 2026-07-09
+
+### Added
+
+- **Physical defragmentation** — `cortiq convert --defrag <skill_dir>` drops
+  pruned FFN neurons so they are neither stored nor computed (Patent 2 claims
+  9/10; spec §11). The mask overlay (§5) is virtual sparsity — the full tensors
+  stay on disk; defrag bakes one task's keep-set into the weights and emits a
+  standalone, smaller dense `.cmf`. Per-layer variable: each layer shrinks to
+  its own live-neuron count (no global-max bottleneck). The keep-set comes from
+  an explicit `ffn_keep.npy`, or is autodetected from zeroed `down_proj` columns.
+  Native Rust (minimal `.npy` reader); masks are dropped; provenance records the
+  pre/post neuron counts. FFN output is bit-identical to the masked model before
+  quantization.
+
+### Changed
+
+- The FFN dims are derived from tensor shapes throughout; the loader now
+  enforces the FFN triple invariant (`gate.rows == up.rows == down.cols`,
+  `down.rows == hidden`) loudly, and runtime telemetry reports per-layer neuron
+  counts from the actual shapes rather than the nominal `intermediate_size`.
+
 ## [0.1.9] — 2026-07-08
 
 ### Added

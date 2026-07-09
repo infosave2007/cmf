@@ -500,6 +500,90 @@ file. Errors: opening a non-first shard directly, a missing sibling, a
 Gate (Qwen3.5-0.8B q8_2f, 5 shards ≤ 0.6 GB): sharded PPL == unsharded
 byte-exactly on the same binary; `verify` green on every shard alone.
 
+## 11. Defragmentation — physical pruning (Patent 2, claims 9/10)
+
+A mask (§5) is **virtual sparsity**: pruned neurons are flagged but still
+stored in full (all tasks share one backbone — you cannot physically cut
+it until you commit to ONE task). Defragmentation turns virtual sparsity
+into **physical compression**: pruned FFN neurons are dropped from the
+file — they are **neither stored nor computed**. This is Factory-Hard →
+defrag from Patent 2: "bake one mask into the weights" and emit a
+standalone compact `.cmf`.
+
+**Representation — no new feature bit, backward compatible.** Physical
+pruning is expressed ONLY by smaller tensor shapes in the directory (§3
+"no computable layout"; the directory is the sole shape authority). The
+runtime derives the FFN size from the tensor shape (`gate_proj.rows()`),
+not from `arch.intermediate_size`, so a defragged file is an ordinary
+smaller dense model that existing readers load unchanged. The masks
+section (§5) is **absent** in a defragged file (the mask is the identity
+after pruning). `arch.intermediate_size` becomes nominal (= the per-layer
+max); the true size lives in each tensor.
+
+**Per-layer variance — better than the patent.** Because the directory
+carries an arbitrary shape per tensor, each layer shrinks to its OWN
+live-neuron count. The patent must truncate every layer to `max(active)`
+(one bottleneck layer caps the ratio at 80.2% vs. 94% achievable) — CMF
+has no such limit.
+
+**Invariants (mandatory):**
+
+- per-layer triple: `gate_proj.rows() == up_proj.rows() ==
+  down_proj.cols() == inter'ₗ`, and `down_proj.rows() == hidden_size`.
+  One keep-set indexes all three (gate row i, up row i, down col i are
+  the same neuron);
+- neuron axis: rows (axis 0) for `gate_proj`/`up_proj`, columns (axis 1)
+  for `down_proj`;
+- quant group of 32: the `down_proj` neuron axis is its COLUMNS, and
+  `vbit`/`q4_block` require `in % 32 == 0`. A `down_proj` whose `inter'`
+  is not a multiple of 32 is written as `q8_2f` (per-row scale — no
+  column constraint; the converter downgrades automatically). `gate/up`
+  drop rows, so their columns (= hidden) are unaffected;
+- NOT a byte truncation: quant scales are per-group/per-row, so pruning
+  is dequant → gather live neurons → **requant** at the smaller shape
+  (the `q8_2f` col-field / `vbit` scales of `down_proj` regenerate for
+  the shrunk column set); tensor hashes are recomputed;
+- `hidden_size`, `embed_tokens`, `lm_head`, and norms are untouched
+  (skill-selection subspaces depend on hidden).
+
+**One task, standalone file.** Defrag is destructive: one `.cmf` bakes
+exactly one task. Multi-task serving stays on masks (§5) or per-skill
+replacement tensors (§9).
+
+**Provenance (honest contract).** Header `provenance.defrag`:
+
+```jsonc
+"defrag": {
+  "source_skill": "…/skill_ru",
+  "pre_intermediate": 3072,
+  "post_intermediate_max": 640,
+  "kept_per_layer": [608, 640, 512, ...],
+  "pruned_ratio": 0.803
+}
+```
+
+Numerically the dense output of a defragged model is IDENTICAL to the
+masked output before quantization (a dead neuron contributes `act·0`
+under a mask and is simply absent after defrag); after quantization the
+only difference comes from quantizing the smaller matrices.
+
+**Scope:** FFN neurons only (dense). Attention-head pruning (the head
+count is a global runtime scalar) and MoE-expert pruning are out of scope.
+
+**Producing it (native Rust):**
+
+```
+cortiq convert --model <hf_dir_or_repo> --defrag <skill_dir> \
+  --quant q8_2f --output model.cmf
+```
+
+`<skill_dir>` carries baked FFN overlays (`tensors/*.npy`) and, if
+available, a keep-set `ffn_keep.npy` (bool `[n_layers, intermediate]`,
+True = live) from the pruning pipeline. Without `ffn_keep.npy` the
+keep-set is autodetected from all-zero `down_proj` columns (the
+Factory-Hard bake). The mask-training / bake step lives in the private
+research pipeline; the public tool only consumes its artifacts.
+
 ---
 
 *Related: [COMPARISON.md](COMPARISON.md) (CMF vs. other model formats),

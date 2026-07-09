@@ -68,12 +68,22 @@ impl CortiqRuntime {
         // Detect execution mode
         let execution_mode = Self::detect_execution_mode();
 
-        // Default layer stats
+        // Default layer stats. FFN neuron counts come from the actual
+        // gate_proj shape (the directory is the size authority) so a
+        // physically-defragged layer (spec §11) reports its true reduced
+        // count, not the nominal arch scalar; fall back to the scalar when
+        // no dense gate_proj is present (e.g. MoE router layers).
+        let ffn_neurons = |i: usize| -> usize {
+            model
+                .tensor(&format!("model.layers.{i}.mlp.gate_proj.weight"))
+                .and_then(|t| t.shape.first().copied())
+                .unwrap_or(arch.intermediate_size)
+        };
         let layer_stats: Vec<LayerStats> = (0..n_layers)
             .map(|i| LayerStats {
                 layer_idx: i,
-                active_neurons: arch.intermediate_size,
-                total_neurons: arch.intermediate_size,
+                active_neurons: ffn_neurons(i),
+                total_neurons: ffn_neurons(i),
                 active_heads: arch.num_attention_heads,
                 total_heads: arch.num_attention_heads,
                 is_alive: true,

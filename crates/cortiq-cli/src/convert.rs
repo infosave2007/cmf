@@ -11,9 +11,11 @@
 //! attention in the Qwen3.5 hub layout (separate in_proj_qkv/z/a/b). Fused
 //! qwen3_next / AgentWorld checkpoints still use the Python path.
 
+use crate::npy;
 use cortiq_core::format::{CmfHeader, CmfModel, TensorSpec, TokenizerBundle, CMF_VERSION};
 use cortiq_core::quant::{bf16_to_f32, f16_to_f32, f32_to_f16};
 use cortiq_core::types::{LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle, QuantType, TensorDtype};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -834,11 +836,166 @@ fn split_fused_gdn(
 
 /// Convert a HF model (local directory or `owner/name` repo id) to a `.cmf`
 /// file. `progress` receives fraction 0..1 (streamed as `@PROGRESS` markers).
+// ───────────────────────── defrag (spec §11, Patent 2 claims 9/10) ─────────────────────────
+
+enum FfnKind {
+    Gate,
+    Up,
+    Down,
+}
+
+/// Match `model.layers.{li}.mlp.{gate|up|down}_proj.weight` → (layer, kind).
+fn ffn_kind(name: &str) -> Option<(usize, FfnKind)> {
+    let rest = name.strip_prefix("model.layers.")?;
+    let dot = rest.find('.')?;
+    let li: usize = rest[..dot].parse().ok()?;
+    let kind = match &rest[dot + 1..] {
+        "mlp.gate_proj.weight" => FfnKind::Gate,
+        "mlp.up_proj.weight" => FfnKind::Up,
+        "mlp.down_proj.weight" => FfnKind::Down,
+        _ => return None,
+    };
+    Some((li, kind))
+}
+
+/// Drop dead neurons: gate/up keep ROWS (axis 0), down keeps COLUMNS
+/// (axis 1). `keep` indexes the intermediate dim. Returns (reduced shape,
+/// reduced f32 values).
+fn slice_ffn(kind: &FfnKind, shape: &[usize], vals: &[f32], keep: &[bool]) -> anyhow::Result<(Vec<usize>, Vec<f32>)> {
+    let k = keep.iter().filter(|&&b| b).count();
+    match kind {
+        FfnKind::Gate | FfnKind::Up => {
+            let (inter, hidden) = (shape[0], shape[1]);
+            if keep.len() != inter {
+                anyhow::bail!("defrag: keep len {} != gate/up rows {inter}", keep.len());
+            }
+            let mut out = Vec::with_capacity(k * hidden);
+            for r in 0..inter {
+                if keep[r] {
+                    out.extend_from_slice(&vals[r * hidden..(r + 1) * hidden]);
+                }
+            }
+            Ok((vec![k, hidden], out))
+        }
+        FfnKind::Down => {
+            let (hidden, inter) = (shape[0], shape[1]);
+            if keep.len() != inter {
+                anyhow::bail!("defrag: keep len {} != down cols {inter}", keep.len());
+            }
+            let mut out = Vec::with_capacity(hidden * k);
+            for r in 0..hidden {
+                for c in 0..inter {
+                    if keep[c] {
+                        out.push(vals[r * inter + c]);
+                    }
+                }
+            }
+            Ok((vec![hidden, k], out))
+        }
+    }
+}
+
+/// Effective f32 for a canonical tensor: the baked overlay if present,
+/// otherwise the backbone tensor from the safetensors files.
+fn effective_tensor(
+    overlay: &HashMap<String, (Vec<usize>, Vec<f32>)>,
+    files: &[SafeTensors],
+    name: &str,
+) -> anyhow::Result<(Vec<usize>, Vec<f32>)> {
+    if let Some((s, v)) = overlay.get(name) {
+        return Ok((s.clone(), v.clone()));
+    }
+    for f in files {
+        for m in &f.tensors {
+            if canon_name(&m.name).as_deref() == Some(name) {
+                return Ok((m.shape.clone(), to_f32(&m.dtype, f.bytes(m))?));
+            }
+        }
+    }
+    anyhow::bail!("defrag: tensor '{name}' not in overlay or base model")
+}
+
+struct DefragPlan {
+    /// Baked FFN replacements (canonical name → shape + f32), overriding
+    /// the backbone before pruning (carries FCD-retrained weights).
+    overlay: HashMap<String, (Vec<usize>, Vec<f32>)>,
+    /// Per-layer live-neuron mask over the intermediate dim.
+    keep: HashMap<usize, Vec<bool>>,
+}
+
+/// Build the defrag plan from a skill dir: baked overlays (`tensors/*.npy`)
+/// and a keep-set — explicit `ffn_keep.npy` if present, else autodetected
+/// from zeroed down_proj columns (the Factory-Hard bake).
+fn build_defrag_plan(dir: &Path, arch: &ModelArch, files: &[SafeTensors]) -> anyhow::Result<DefragPlan> {
+    let mut overlay: HashMap<String, (Vec<usize>, Vec<f32>)> = HashMap::new();
+    let tdir = dir.join("tensors");
+    if tdir.is_dir() {
+        for entry in fs::read_dir(&tdir)? {
+            let p = entry?.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("npy") {
+                continue;
+            }
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+            let a = npy::read(&p)?;
+            let vals = match a.data {
+                npy::NpyData::F32(v) => v,
+                npy::NpyData::Bool(_) => anyhow::bail!("defrag overlay {stem}: expected float, got bool"),
+            };
+            overlay.insert(stem, (a.shape, vals));
+        }
+    }
+    println!("  Defrag overlay: {} baked tensors from {}", overlay.len(), dir.display());
+
+    let (nl, inter) = (arch.num_layers, arch.intermediate_size);
+    let mut keep: HashMap<usize, Vec<bool>> = HashMap::new();
+    let keep_path = dir.join("ffn_keep.npy");
+    if keep_path.exists() {
+        let a = npy::read(&keep_path)?;
+        if a.shape != [nl, inter] {
+            anyhow::bail!("ffn_keep.npy shape {:?} != model ({nl}, {inter})", a.shape);
+        }
+        let flags: Vec<bool> = match a.data {
+            npy::NpyData::Bool(v) => v,
+            npy::NpyData::F32(v) => v.iter().map(|&x| x != 0.0).collect(),
+        };
+        for li in 0..nl {
+            let row = flags[li * inter..(li + 1) * inter].to_vec();
+            if !row.iter().any(|&b| b) {
+                anyhow::bail!("defrag: layer {li} has 0 live neurons");
+            }
+            keep.insert(li, row);
+        }
+    } else {
+        // Producer-free: a neuron is dead iff its down_proj INPUT column is
+        // all-zero (Factory-Hard bake). Reads each layer's effective down.
+        println!("  Defrag: no ffn_keep.npy — autodetecting from zero down_proj columns");
+        for li in 0..nl {
+            let name = format!("model.layers.{li}.mlp.down_proj.weight");
+            let (shape, vals) = effective_tensor(&overlay, files, &name)?;
+            let (hidden, cols) = (shape[0], shape[1]);
+            let mut alive = vec![false; cols];
+            for r in 0..hidden {
+                for c in 0..cols {
+                    if vals[r * cols + c] != 0.0 {
+                        alive[c] = true;
+                    }
+                }
+            }
+            if !alive.iter().any(|&b| b) {
+                anyhow::bail!("defrag: layer {li} autodetected 0 live neurons");
+            }
+            keep.insert(li, alive);
+        }
+    }
+    Ok(DefragPlan { overlay, keep })
+}
+
 pub fn run_convert(
     model: &str,
     quant: &str,
     output: &str,
     hf_token: Option<&str>,
+    defrag: Option<&str>,
     mut progress: impl FnMut(f32),
 ) -> anyhow::Result<()> {
     let quant = parse_quant(quant)?;
@@ -857,11 +1014,27 @@ pub fn run_convert(
 
     let config: serde_json::Value = serde_json::from_slice(&fs::read(dir.join("config.json"))
         .map_err(|e| anyhow::anyhow!("read config.json: {e}"))?)?;
-    let arch = build_arch(&config)?;
+    let mut arch = build_arch(&config)?;
 
     // Memory-map the weights and process one tensor at a time — the raw model is
     // never fully loaded into RAM (peak ≈ the .cmf output + one tensor).
     let files = open_model(dir)?;
+
+    // Physical defragmentation plan (spec §11): drop pruned FFN neurons so
+    // they are neither stored nor computed. arch.intermediate_size becomes
+    // nominal/max (per-layer truth lives in the reduced tensor shapes).
+    let orig_inter = arch.intermediate_size;
+    let defrag_plan = match defrag {
+        Some(d) => Some(build_defrag_plan(Path::new(d), &arch, &files)?),
+        None => None,
+    };
+    if let Some(plan) = &defrag_plan {
+        let max_kept = (0..arch.num_layers)
+            .filter_map(|li| plan.keep.get(&li).map(|k| k.iter().filter(|&&b| b).count()))
+            .max()
+            .unwrap_or(orig_inter);
+        arch.intermediate_size = max_kept;
+    }
     let total: usize = files.iter().map(|f| f.tensors.len()).sum::<usize>().max(1);
     let mut tensors: Vec<TensorSpec> = Vec::with_capacity(total);
     let mut done = 0usize;
@@ -895,6 +1068,30 @@ pub fn run_convert(
                     tensors.push(TensorSpec { name: out_name, dtype: dt, shape: vec![out_rows, hid], data });
                 }
                 continue;
+            }
+            // Defrag: for an FFN weight of a pruned layer, take the baked
+            // overlay (if any) else the backbone value, drop dead neurons
+            // (gate/up rows, down columns), then quantize the reduced shape.
+            // The neuron never enters the blob — nor the runtime's math.
+            if let Some(plan) = defrag_plan.as_ref() {
+                if let Some((li, kind)) = ffn_kind(&name) {
+                    if let Some(keep) = plan.keep.get(&li) {
+                        let (shape, vals) = match plan.overlay.get(&name) {
+                            Some((s, v)) => (s.clone(), v.clone()),
+                            None => (m.shape.clone(), to_f32(&m.dtype, file.bytes(m))?),
+                        };
+                        let (out_shape, out_vals) = slice_ffn(&kind, &shape, &vals, keep)?;
+                        let numel = out_shape[0] * out_shape[1];
+                        let two_d = numel >= GROUP_SIZE && !force_f16(&name);
+                        let (dt, data) = if two_d {
+                            quantize_2d(quant, &out_vals, out_shape[0], out_shape[1])
+                        } else {
+                            (TensorDtype::F16, encode_f16(&out_vals))
+                        };
+                        tensors.push(TensorSpec { name, dtype: dt, shape: out_shape, data });
+                        continue;
+                    }
+                }
             }
             let vals = to_f32(&m.dtype, file.bytes(m))?;
             let numel: usize = m.shape.iter().product();
@@ -934,12 +1131,44 @@ pub fn run_convert(
         Quant::F16 => QuantType::F16,
         Quant::Vbit => QuantType::Vbit,
     };
+    let provenance = match &defrag_plan {
+        Some(plan) => {
+            let kept: Vec<usize> = (0..arch.num_layers)
+                .map(|li| {
+                    plan.keep
+                        .get(&li)
+                        .map(|k| k.iter().filter(|&&b| b).count())
+                        .unwrap_or(orig_inter)
+                })
+                .collect();
+            let live: usize = kept.iter().sum();
+            let ratio = 1.0 - live as f64 / (arch.num_layers as f64 * orig_inter as f64);
+            eprintln!(
+                "defrag: FFN pruned per-layer, {live}/{} live ({:.0}% pruned), inter {orig_inter} -> max {} (per-layer variable); masks dropped",
+                arch.num_layers * orig_inter,
+                ratio * 100.0,
+                arch.intermediate_size
+            );
+            serde_json::json!({
+                "tool": "cortiq convert",
+                "source_model": model,
+                "defrag": {
+                    "source_skill": defrag,
+                    "pre_intermediate": orig_inter,
+                    "post_intermediate_max": arch.intermediate_size,
+                    "kept_per_layer": kept,
+                    "pruned_ratio": (ratio * 10000.0).round() / 10000.0,
+                }
+            })
+        }
+        None => serde_json::json!({ "tool": "cortiq convert", "source_model": model }),
+    };
     let header = CmfHeader {
         format: "cmf".into(),
         version: CMF_VERSION,
         arch,
         quant_type,
-        provenance: Some(serde_json::json!({ "tool": "cortiq convert", "source_model": model })),
+        provenance: Some(provenance),
         tokenizer_config: Some(bundle),
         section_hashes: None,
         skills: Vec::new(),
@@ -1105,7 +1334,7 @@ mod tests {
         ]);
         fs::write(dir.join("model.safetensors"), &st).unwrap();
         let out = dir.join("m.cmf");
-        run_convert(dir.to_str().unwrap(), "q8", out.to_str().unwrap(), None, |_| {}).unwrap();
+        run_convert(dir.to_str().unwrap(), "q8", out.to_str().unwrap(), None, None, |_| {}).unwrap();
 
         let model = CmfModel::open(&out).unwrap();
         assert_eq!(model.arch().vocab_size, 32);

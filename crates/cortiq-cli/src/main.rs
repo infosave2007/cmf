@@ -2,6 +2,7 @@
 
 mod convert;
 mod gguf;
+mod npy;
 
 use clap::{Parser, Subcommand};
 use cortiq_core::CmfModel;
@@ -145,6 +146,13 @@ enum Commands {
         /// (e.g. GatedDeltaNet) may need 5.5–6 to stay coherent.
         #[arg(long, default_value = "4.25")]
         mean_bits: f32,
+        /// Physically defragment (Patent 2 claims 9/10): drop pruned FFN
+        /// neurons so they are neither stored nor computed. Points at a
+        /// skill dir with baked FFN overlays (tensors/*.npy) and/or a
+        /// keep-set (ffn_keep.npy); without ffn_keep.npy the keep-set is
+        /// autodetected from zeroed down_proj columns. Drops masks. (spec §11)
+        #[arg(long)]
+        defrag: Option<String>,
     },
     /// Import a GGUF model to .cmf — native Rust (F32/F16/BF16/Q4_0..Q6_K + K-quants; llama/qwen2/qwen3)
     ImportGguf {
@@ -340,9 +348,9 @@ async fn main() -> anyhow::Result<()> {
             task,
             compat_port,
         } => cmd_serve(&model, &host, port, &task, compat_port).await,
-        Commands::Convert { model, quant, output, hf_token, mean_bits } => {
+        Commands::Convert { model, quant, output, hf_token, mean_bits, defrag } => {
             convert::set_vbit_mean_bits(mean_bits);
-            convert::run_convert(&model, &quant, &output, hf_token.as_deref(), |f| {
+            convert::run_convert(&model, &quant, &output, hf_token.as_deref(), defrag.as_deref(), |f| {
                 println!("@PROGRESS {f:.4}");
             })?;
             println!("✓ wrote {output}");

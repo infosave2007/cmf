@@ -21,9 +21,9 @@ path = "src/main.rs"
 gpu = ["cortiq-engine/gpu"]
 
 [dependencies]
-cortiq-core = { path = "../cortiq-core", version = "0.1.9" }
-cortiq-engine = { path = "../cortiq-engine", version = "0.1.9" }
-cortiq-server = { path = "../cortiq-server", version = "0.1.9" }
+cortiq-core = { path = "../cortiq-core", version = "0.1.10" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.1.10" }
+cortiq-server = { path = "../cortiq-server", version = "0.1.10" }
 clap = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }

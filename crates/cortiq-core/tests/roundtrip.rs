@@ -417,6 +417,72 @@ fn sparse_index_encode_decode() {
     assert_eq!(idx, back);
 }
 
+// ───────────────────────── defrag (spec §11) ─────────────────────────
+
+/// A physically-defragged file (spec §11, Patent 2 claims 9/10): each
+/// layer keeps its OWN reduced FFN neuron count and the masks section is
+/// absent. The directory is the size authority, so open() must accept
+/// per-layer-different FFN shapes that diverge from the nominal arch
+/// scalar — that is exactly what makes pruned neurons "not stored".
+#[test]
+fn defrag_per_layer_ffn_shapes_roundtrip() {
+    let dir = tempdir();
+    let path = dir.join("defrag.cmf");
+    let arch = tiny_arch(); // hidden=8, nominal intermediate=16
+    let hidden = arch.hidden_size;
+
+    // Full FFN triple per layer, q8_row (row-wise → any inter' is legal).
+    // Layer 0 keeps 12 neurons, layer 1 keeps 8 — both below the nominal
+    // 16 and different from each other.
+    let mk_triple = |li: usize, inter: usize| -> Vec<TensorSpec> {
+        let gate: Vec<f32> = (0..inter * hidden).map(|i| ((i + li) as f32 * 0.07).cos()).collect();
+        let up: Vec<f32> = (0..inter * hidden).map(|i| ((i + li) as f32 * 0.05).sin()).collect();
+        let down: Vec<f32> = (0..hidden * inter).map(|i| ((i + li) as f32 * 0.03).cos()).collect();
+        vec![
+            TensorSpec {
+                name: format!("model.layers.{li}.mlp.gate_proj.weight"),
+                dtype: TensorDtype::Q8Row,
+                shape: vec![inter, hidden],
+                data: encode_q8_row(&gate, inter, hidden),
+            },
+            TensorSpec {
+                name: format!("model.layers.{li}.mlp.up_proj.weight"),
+                dtype: TensorDtype::Q8Row,
+                shape: vec![inter, hidden],
+                data: encode_q8_row(&up, inter, hidden),
+            },
+            TensorSpec {
+                name: format!("model.layers.{li}.mlp.down_proj.weight"),
+                dtype: TensorDtype::Q8Row,
+                shape: vec![hidden, inter],
+                data: encode_q8_row(&down, hidden, inter),
+            },
+        ]
+    };
+    let mut tensors = mk_triple(0, 12);
+    tensors.extend(mk_triple(1, 8));
+
+    // No masks (None) — identity after physical pruning.
+    CmfModel::write(&path, &tiny_header(), &tensors, None, None).unwrap();
+
+    let model = CmfModel::open(&path).unwrap();
+    assert!(model.masks.masks.is_empty(), "defragged file carries no masks");
+
+    let g0 = model.tensor("model.layers.0.mlp.gate_proj.weight").unwrap();
+    let u0 = model.tensor("model.layers.0.mlp.up_proj.weight").unwrap();
+    let d0 = model.tensor("model.layers.0.mlp.down_proj.weight").unwrap();
+    assert_eq!(g0.shape, vec![12, hidden]);
+    assert_eq!(u0.shape, vec![12, hidden]);
+    assert_eq!(d0.shape, vec![hidden, 12], "down cols == inter'");
+
+    let g1 = model.tensor("model.layers.1.mlp.gate_proj.weight").unwrap();
+    assert_eq!(g1.shape, vec![8, hidden], "layer 1 keeps its OWN smaller size");
+
+    // The nominal arch scalar is untouched (per-layer truth is in shapes).
+    assert!(model.arch().intermediate_size >= 12);
+    assert!(model.verify().is_empty(), "per-tensor hashes intact");
+}
+
 // ───────────────────────── util ─────────────────────────
 
 fn tempdir() -> std::path::PathBuf {

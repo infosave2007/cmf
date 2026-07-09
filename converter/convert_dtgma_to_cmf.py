@@ -1207,6 +1207,145 @@ class SkillsSource:
         return self.inner.load(name)
 
 
+class SkillOverlaySource:
+    """Fold ONE skill's baked tensors into the backbone as DIRECT
+    replacements (canonical name, NOT `skill.{id}.*`). Used before
+    defrag to produce a standalone single-task model: the skill's
+    Factory-Hard down_proj (zeroed columns) and FCD-retrained gate/up
+    override the backbone; everything else passes through."""
+
+    def __init__(self, inner, skill_dir):
+        self.inner = inner
+        self.extra = {}  # canonical tensor name → npy path
+        tdir = Path(skill_dir) / "tensors"
+        for f in sorted(tdir.glob("*.npy")) if tdir.exists() else []:
+            self.extra[f.stem] = f  # stem strips ".npy" → full canonical name
+        print(f"  Defrag overlay: {len(self.extra)} baked tensors from {skill_dir}")
+
+    def names(self):
+        return sorted(set(self.inner.names()) | set(self.extra))
+
+    def shape(self, name):
+        if name in self.extra:
+            return list(np.load(self.extra[name], mmap_mode="r").shape)
+        return self.inner.shape(name)
+
+    def load(self, name):
+        if name in self.extra:
+            return np.load(self.extra[name]).astype(np.float32)
+        return self.inner.load(name)
+
+
+class DefragSource:
+    """Physical pruning / defragmentation (Patent 2 claims 9/10): drop the
+    pruned FFN neurons so they are NEITHER STORED NOR COMPUTED — the
+    opposite of the mask overlay (virtual sparsity), which keeps full
+    tensors. Per-layer variable: each layer shrinks to its OWN live-neuron
+    count (CMF's per-tensor directory carries arbitrary shapes, so there is
+    no global-max bottleneck the patent's uniform truncation suffered).
+
+    Neuron axis: gate_proj rows (axis 0), up_proj rows (axis 0),
+    down_proj COLUMNS (axis 1) — one keep-set indexes all three (gate row i,
+    up row i, down col i are the same neuron). The runtime derives the FFN
+    dim from tensor shapes (gate_proj.rows()), so the output is a plain
+    smaller dense model; masks are the identity after pruning and dropped.
+
+    Requantization is free: inner.load() returns f32 and the writer
+    re-quantizes at the reduced shape (down_proj's q8_2f col-field / vbit
+    scales regenerate for the shrunk column set). For q4_block/vbit the
+    down_proj neuron axis is the group-of-32 column axis; pick_dtype()
+    already downgrades a non-multiple-of-32 down_proj to q8_2f (row-wise,
+    no column constraint), so any per-layer count is safe."""
+
+    _RE = None
+
+    def __init__(self, inner, keep: dict):
+        import re
+        self.inner = inner
+        self.keep = keep  # {layer_idx: 1-D bool array over original intermediate}
+        DefragSource._RE = re.compile(
+            r"^model\.layers\.(\d+)\.mlp\.(gate|up|down)_proj\.weight$")
+
+    def _match(self, name):
+        m = DefragSource._RE.match(name)
+        if not m:
+            return None
+        li = int(m.group(1))
+        if li not in self.keep:
+            return None
+        return li, m.group(2)
+
+    def names(self):
+        return self.inner.names()
+
+    def shape(self, name):
+        lk = self._match(name)
+        s = self.inner.shape(name)
+        if lk is None:
+            return s
+        li, kind = lk
+        k = int(self.keep[li].sum())
+        return [k, s[1]] if kind in ("gate", "up") else [s[0], k]
+
+    def load(self, name):
+        lk = self._match(name)
+        t = self.inner.load(name)
+        if lk is None:
+            return t
+        li, kind = lk
+        keep = self.keep[li].astype(bool)
+        axis_len = t.shape[0] if kind in ("gate", "up") else t.shape[1]
+        if keep.shape[0] != axis_len:
+            raise SystemExit(
+                f"defrag: layer {li} {kind}_proj neuron axis {axis_len} != "
+                f"keep-mask length {keep.shape[0]} (wrong keep-set for this model)")
+        if kind in ("gate", "up"):
+            return np.ascontiguousarray(t[keep])
+        return np.ascontiguousarray(t[:, keep])
+
+
+def load_defrag_keep(skill_dir: str, arch: dict):
+    """Per-layer FFN keep-set from an explicit `ffn_keep.npy` (bool
+    [n_layers, intermediate], True = live) in the skill dir. Returns None
+    if absent (caller falls back to zero-column autodetection). The
+    explicit mask is preferred because gate/up rows of dead neurons are
+    not zeroed in the bake — only down_proj columns are (spec §11)."""
+    kf = Path(skill_dir) / "ffn_keep.npy"
+    if not kf.exists():
+        return None
+    arr = np.load(kf)
+    nL, inter = arch["num_layers"], arch["intermediate_size"]
+    if arr.shape != (nL, inter):
+        raise SystemExit(f"--defrag: ffn_keep.npy shape {tuple(arr.shape)} != "
+                         f"model ({nL}, {inter})")
+    keep = {li: arr[li].astype(bool) for li in range(nL)}
+    for li, k in keep.items():
+        if int(k.sum()) == 0:
+            raise SystemExit(f"--defrag: layer {li} has 0 live neurons")
+    return keep
+
+
+def autodetect_defrag_keep(source, arch: dict) -> dict:
+    """Producer-free keep-set: a neuron is dead iff its down_proj INPUT
+    column is all-zero (the Factory-Hard bake, spec §5). Reads each
+    layer's down_proj once. Layers with no pruning keep all neurons
+    (no-op). Less precise than an explicit mask (a legitimately near-zero
+    column reads as alive), but needs no external artifact."""
+    keep = {}
+    for li in range(arch["num_layers"]):
+        name = f"model.layers.{li}.mlp.down_proj.weight"
+        if name not in set(source.names()):
+            continue
+        d = source.load(name)  # [hidden, intermediate]
+        alive = np.abs(d).sum(axis=0) > 0.0
+        if not alive.any():
+            raise SystemExit(f"--defrag: layer {li} autodetected 0 live neurons")
+        keep[li] = alive
+    if not keep:
+        raise SystemExit("--defrag: no down_proj tensors found to autodetect")
+    return keep
+
+
 def load_tokenizer_bundle(model_dir: Path):
     """Chat/eos bundle (spec §6.1): chat_template.jinja (preferred) or
     tokenizer_config.json's chat_template; stop ids from
@@ -1266,7 +1405,8 @@ def convert(model_path: str, masks_dir: str | None, quant: str,
             linear_core: str = "vmf_phase", nphase: int = 64,
             heal_dir: str | None = None, skill_dirs: list | None = None,
             shard_max_gb: float | None = None, vbit_flat: bool = False,
-            skip_mtp: bool = False, route_stats: str | None = None):
+            skip_mtp: bool = False, route_stats: str | None = None,
+            defrag: str | None = None):
     # A non-local path = HF repo-id / URL → streaming conversion:
     # the meta (config/tokenizer) goes into a staging dir, weights — ranged GET.
     stream = None
@@ -1387,6 +1527,45 @@ def convert(model_path: str, masks_dir: str | None, quant: str,
         source = SkillsSource(source, skill_dirs)
         names = source.names()
         skills_meta = source.records
+
+    # Physical defragmentation (P2 claims 9/10): fold ONE skill's baked
+    # FFN into the backbone and drop the pruned neurons, so they are
+    # neither stored nor computed. Dense-only, single-task, standalone;
+    # replaces the mask overlay (masks are the identity after pruning).
+    defrag_info = None
+    if defrag:
+        if shard_max_gb:
+            raise SystemExit("--defrag and --shard-max-gb are mutually exclusive")
+        if masks_dir:
+            raise SystemExit("--defrag replaces virtual-sparsity masks; "
+                             "drop --masks when defragging")
+        inter0 = arch["intermediate_size"]
+        keep = load_defrag_keep(defrag, arch)          # explicit ffn_keep.npy
+        source = SkillOverlaySource(source, defrag)     # fold baked tensors
+        if keep is None:                                # producer-free fallback
+            keep = autodetect_defrag_keep(source, arch)
+            print("  Defrag: no ffn_keep.npy — keep-set autodetected from "
+                  "zero down_proj columns")
+        source = DefragSource(source, keep)
+        names = source.names()
+        kept = [int(keep[li].sum()) for li in range(arch["num_layers"])
+                if li in keep]
+        # Per-layer variance lives in the tensor shapes; the arch scalar
+        # is nominal/max only (runtime derives the FFN dim from shapes).
+        arch["intermediate_size"] = max(kept)
+        masks_dir = None
+        defrag_info = {
+            "source_skill": str(defrag),
+            "pre_intermediate": inter0,
+            "post_intermediate_max": max(kept),
+            "kept_per_layer": kept,
+            "pruned_ratio": round(1 - sum(kept) / (len(kept) * inter0), 4),
+        }
+        print(f"  Defrag: FFN neurons pruned per-layer "
+              f"{sum(kept)}/{len(kept) * inter0} live "
+              f"({defrag_info['pruned_ratio']:.0%} pruned), "
+              f"inter {inter0} -> max {max(kept)} (per-layer variable); "
+              f"masks dropped")
 
     # C4 (P15 claim 12): per-expert bit allocation. Experts of one
     # layer and one projection share a COMMON bit budget: the shift
@@ -1512,12 +1691,13 @@ def convert(model_path: str, masks_dir: str | None, quant: str,
 
     _write_cmf(source, arch, quant, output_path, model_path, skills_meta,
                masks_dir, tokenizer_path, heal_dir,
-               shard=None, with_extras=True)
+               shard=None, with_extras=True, defrag_info=defrag_info)
     _progress(1.0, "done")
 
 
 def _write_cmf(source, arch, quant, output_path, model_path, skills_meta,
-               masks_dir, tokenizer_path, heal_dir, shard, with_extras):
+               masks_dir, tokenizer_path, heal_dir, shard, with_extras,
+               defrag_info=None):
     names = source.names()
     default_dtype = QUANT_CHOICES[quant]
 
@@ -1617,6 +1797,7 @@ def _write_cmf(source, arch, quant, output_path, model_path, skills_meta,
             } if arch.get("linear_core", {}).get("kind") == "vmf_phase"
                 else ({"carried": "gated_delta_net 1:1 (faithful, no training)"}
                       if "linear_core" in arch else None)),
+            "defrag": defrag_info,  # None unless --defrag (P2 claims 9/10)
         },
     }
     # Section hashes go INTO the header (spec §8.1): the envelope's

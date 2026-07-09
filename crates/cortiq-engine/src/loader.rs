@@ -112,10 +112,32 @@ pub(crate) fn build_layer_ffn(
 ) -> Result<FfnKind, CmfError> {
     let prefix = format!("model.layers.{li}.");
     let load_dense = |p: &str| -> Result<DenseFfn, CmfError> {
+        let gate_proj = load_matrix(model, &format!("{p}gate_proj.weight"), force_f32, ov)?;
+        let up_proj = load_matrix(model, &format!("{p}up_proj.weight"), force_f32, ov)?;
+        let down_proj = load_matrix(model, &format!("{p}down_proj.weight"), force_f32, ov)?;
+        // FFN triple invariant (holds for dense and each MoE expert;
+        // enforced loudly so a malformed defrag/repack — spec §11 — fails
+        // at load instead of silently mis-computing). inter' is per-layer.
+        let inter = gate_proj.rows();
+        if up_proj.rows() != inter || down_proj.cols() != inter {
+            return Err(CmfError::Parse(format!(
+                "{p}: FFN dims disagree (gate.rows={inter}, up.rows={}, \
+                 down.cols={}); all three must equal inter'",
+                up_proj.rows(),
+                down_proj.cols()
+            )));
+        }
+        if down_proj.rows() != arch.hidden_size {
+            return Err(CmfError::Parse(format!(
+                "{p}: down_proj.rows={} != hidden_size={}",
+                down_proj.rows(),
+                arch.hidden_size
+            )));
+        }
         Ok(DenseFfn {
-            gate_proj: load_matrix(model, &format!("{p}gate_proj.weight"), force_f32, ov)?,
-            up_proj: load_matrix(model, &format!("{p}up_proj.weight"), force_f32, ov)?,
-            down_proj: load_matrix(model, &format!("{p}down_proj.weight"), force_f32, ov)?,
+            gate_proj,
+            up_proj,
+            down_proj,
         })
     };
     let router_name = format!("{prefix}mlp.gate.weight");
