@@ -360,7 +360,12 @@ impl LayerKvCache {
             + self.vcol.iter().map(Vec::len).sum::<usize>();
         let bytes: usize = self.kq.iter().map(Vec::len).sum::<usize>()
             + self.vq.iter().map(Vec::len).sum::<usize>();
-        floats * std::mem::size_of::<f32>() + bytes
+        floats * std::mem::size_of::<f32>()
+            + bytes
+            // O(1) recurrent state of linear-core layers (vmf_phase/GDN):
+            // constant in context, but real memory — the honest "KV+state"
+            // line must count it (a pure-linear model reported 0 before).
+            + self.linear_state.len() * std::mem::size_of::<f64>()
     }
 
     /// Drop oldest positions, keeping the last `keep_last`.
