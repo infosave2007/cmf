@@ -249,6 +249,12 @@ enum Commands {
         /// Number of tokens to generate
         #[arg(long, default_value = "100")]
         tokens: u32,
+        /// Long-context mode: synthetic prompt of N tokens; reports
+        /// prefill/decode at that depth plus the KV/state memory —
+        /// O(context) KV for full-attention vs O(1) state for the
+        /// linear core (spec §2, vmf_phase)
+        #[arg(long)]
+        ctx: Option<usize>,
     },
     /// Score skills for a prompt (recon-argmin routing, spec 9)
     Route {
@@ -401,7 +407,8 @@ async fn main() -> anyhow::Result<()> {
             model,
             task,
             tokens,
-        } => cmd_bench(&model, &task, tokens).await,
+            ctx,
+        } => cmd_bench(&model, &task, tokens, ctx).await,
         Commands::Verify { model } => cmd_verify(&model).await,
     }
 }
@@ -1442,8 +1449,18 @@ async fn cmd_bench(
     model_path: &str,
     task: &str,
     tokens: u32,
+    ctx: Option<usize>,
 ) -> anyhow::Result<()> {
     println!("Benchmark: {} | task={} | tokens={}", model_path, task, tokens);
+    if let Some(n) = ctx {
+        // Long-context mode must not silently evict mid-measurement:
+        // raise the cap to cover prompt + generation unless the user
+        // pinned it explicitly.
+        if std::env::var("CMF_MAX_SEQ").is_err() {
+            // SAFETY: single-threaded here — before any pipeline/pool spawn.
+            unsafe { std::env::set_var("CMF_MAX_SEQ", (n + tokens as usize + 64).to_string()) };
+        }
+    }
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     let mut pipeline = Pipeline::from_model(
         &model,
@@ -1468,8 +1485,19 @@ async fn cmd_bench(
     // Warmup: touch every weight page once so the numbers below are
     // steady-state (a cold 14 GB mmap otherwise bills its first pass
     // to whichever phase runs first).
-    let prompt = "The quick brown fox jumps over the lazy dog. ".repeat(4);
-    let prompt_ids = pipeline.tokenizer.encode(&prompt);
+    let prompt = match ctx {
+        // Long-context mode: repeat until the token budget is covered
+        // (~9 tokens per sentence), then truncate exactly below.
+        Some(n) => "The quick brown fox jumps over the lazy dog. ".repeat(n / 8 + 2),
+        None => "The quick brown fox jumps over the lazy dog. ".repeat(4),
+    };
+    let mut prompt_ids = pipeline.tokenizer.encode(&prompt);
+    if let Some(n) = ctx {
+        prompt_ids.truncate(n);
+        if prompt_ids.len() < n {
+            anyhow::bail!("ctx {n}: synthetic prompt tokenized to only {} tokens", prompt_ids.len());
+        }
+    }
     let _ = pipeline
         .forward_ids(&prompt_ids[..2.min(prompt_ids.len())], mask.as_ref())
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -1504,6 +1532,14 @@ async fn cmd_bench(
         singles_ms,
         pair_ms,
         singles_ms / pair_ms.max(1e-9)
+    );
+    // KV/state residency at the end of the run: full-attention layers
+    // grow O(context); the linear core (vmf_phase/GDN) holds an O(1)
+    // state — this line is the long-context memory claim, measured.
+    println!(
+        "  Memory:  KV+state {:.1} MB at seq_len {}",
+        pipeline.kv_cache.total_memory_bytes() as f64 / 1e6,
+        pipeline.kv_cache.seq_len()
     );
     if result.mtp_drafted > 0 {
         println!(

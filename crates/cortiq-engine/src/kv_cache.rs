@@ -226,15 +226,17 @@ impl LayerKvCache {
             let ng = hd.div_ceil(KV_K_GROUP);
             for p in 0..stored {
                 let row = &kq[p * hd..(p + 1) * hd];
+                // SAFETY: i8 and u8 share layout; dot_i8_f32 reads the
+                // bytes back as i8.
+                let row_u8 = unsafe {
+                    std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len())
+                };
                 let mut dot = 0.0f32;
                 for g in 0..ng {
                     let g0 = g * KV_K_GROUP;
                     let g1 = (g0 + KV_K_GROUP).min(hd);
-                    let mut gd = 0.0f32;
-                    for d in g0..g1 {
-                        gd += qc[d] * row[d] as f32;
-                    }
-                    dot += gd * ks[p * ng + g];
+                    dot += crate::qtensor::dot_i8_f32(&row_u8[g0..g1], &qc[g0..g1])
+                        * ks[p * ng + g];
                 }
                 scores[p] = dot * scale;
             }
@@ -242,11 +244,7 @@ impl LayerKvCache {
             let k = &self.k[kv_head];
             for p in 0..stored {
                 let row = &k[p * hd..(p + 1) * hd];
-                let mut dot = 0.0f32;
-                for d in 0..hd {
-                    dot += q[d] * row[d];
-                }
-                scores[p] = dot * scale;
+                scores[p] = crate::attention::dot_f32(q, row) * scale;
             }
         }
         let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -268,10 +266,7 @@ impl LayerKvCache {
                 if w.abs() < 1e-12 {
                     continue;
                 }
-                let row = &vq[p * hd..(p + 1) * hd];
-                for d in 0..hd {
-                    acc[d] += w * row[d] as f32;
-                }
+                crate::qtensor::axpy_i8_f32(&mut acc, &vq[p * hd..(p + 1) * hd], w);
             }
             let vcol = &self.vcol[kv_head];
             if !vcol.is_empty() {
@@ -286,10 +281,7 @@ impl LayerKvCache {
                 if w.abs() < 1e-12 {
                     continue;
                 }
-                let row = &v[p * hd..(p + 1) * hd];
-                for d in 0..hd {
-                    acc[d] += w * row[d];
-                }
+                crate::attention::axpy_f32(&mut acc, &v[p * hd..(p + 1) * hd], w);
             }
         }
         (acc, scores)

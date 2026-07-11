@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **NEON decode attention** — `attention_head` score/weighted-sum loops and
+  the q8-KV `attend` branches now run through NEON kernels (`dot_f32`,
+  `axpy_f32`, per-group `dot_i8_f32`, `axpy_i8_f32`). Measured on
+  Qwen3-0.6B q8 (28 full-attention layers, teacher-forced 1536 tokens,
+  interleaved rounds): **×1.61 wall-time** (29.5 s → 18.3 s); the gain grows
+  linearly with context depth. PPL 22.053 → 22.084 (+0.14%, summation
+  regrouping only).
+- **Long-context bench mode** — `cortiq bench --ctx N` builds a synthetic
+  N-token prompt, raises `CMF_MAX_SEQ` so eviction cannot skew the curve,
+  and prints `Memory: KV+state X MB at seq_len N` (O(context) KV for
+  full-attention vs O(1) state for the linear core, measured).
+- Hot-path hygiene: `row_dot` (active-neuron path) NEON for q8_row/q8_2f
+  (new `dot_i8_col_f32` folds the θ col-field without a prescaled copy);
+  vbit SDOT per-row heap allocation replaced by a per-worker scratch
+  (lm_head ≈ 150k rows/token); `prescale` returns borrowed activations
+  for non-q8_2f dtypes (was an unconditional copy per matvec). Short-ctx
+  q4 decode +4% (64.0 vs 61.6 tok/s, interleaved).
+
 - **q4 SDOT decode path** — `q4_block` matvec now runs through the A8W8
   int8 `sdot` kernel on ARMv8.2+ (nibbles → centered i8 per 32-group, exact
   outlier correction), replacing the scalar inner loop. Measured on

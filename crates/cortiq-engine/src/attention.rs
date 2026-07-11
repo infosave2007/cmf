@@ -46,14 +46,13 @@ pub fn attention_head(
 ) -> (Vec<f32>, Vec<f32>) {
     let scale = 1.0 / (head_dim as f32).sqrt();
 
+    // These two loops are the decode-attention hot path: cost grows
+    // linearly with the stored context, so they are NEON-vectorized
+    // (regrouped summation only — same products).
     let mut scores = vec![0.0f32; seq_len];
     for s in 0..seq_len {
-        let mut dot = 0.0f32;
         let k = &k_cache[s * head_dim..(s + 1) * head_dim];
-        for d in 0..head_dim {
-            dot += q[d] * k[d];
-        }
-        scores[s] = dot * scale;
+        scores[s] = dot_f32(q, k) * scale;
     }
 
     // Numerically stable softmax.
@@ -76,11 +75,88 @@ pub fn attention_head(
             continue;
         }
         let v = &v_cache[s * head_dim..(s + 1) * head_dim];
-        for d in 0..head_dim {
-            output[d] += w * v[d];
-        }
+        axpy_f32(&mut output, v, w);
     }
     (output, scores)
+}
+
+/// f32 dot with 4 independent accumulators — NEON on aarch64, scalar
+/// elsewhere. Same products as the sequential loop, regrouped sums.
+#[inline]
+pub(crate) fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return dot_f32_neon(a, b);
+    }
+    #[allow(unreachable_code)]
+    {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: callers pass equal-length slices (head_dim rows).
+    unsafe {
+        use core::arch::aarch64::*;
+        let n = a.len().min(b.len());
+        let (ap, bp) = (a.as_ptr(), b.as_ptr());
+        let (mut a0, mut a1, mut a2, mut a3) =
+            (vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+        let mut j = 0usize;
+        while j + 16 <= n {
+            a0 = vfmaq_f32(a0, vld1q_f32(ap.add(j)), vld1q_f32(bp.add(j)));
+            a1 = vfmaq_f32(a1, vld1q_f32(ap.add(j + 4)), vld1q_f32(bp.add(j + 4)));
+            a2 = vfmaq_f32(a2, vld1q_f32(ap.add(j + 8)), vld1q_f32(bp.add(j + 8)));
+            a3 = vfmaq_f32(a3, vld1q_f32(ap.add(j + 12)), vld1q_f32(bp.add(j + 12)));
+            j += 16;
+        }
+        let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+        while j < n {
+            sum += *ap.add(j) * *bp.add(j);
+            j += 1;
+        }
+        sum
+}
+}
+
+/// `acc += w · row` (f32 axpy) — NEON on aarch64, scalar elsewhere.
+#[inline]
+pub(crate) fn axpy_f32(acc: &mut [f32], row: &[f32], w: f32) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return axpy_f32_neon(acc, row, w);
+    }
+    #[allow(unreachable_code)]
+    {
+        for (a, &r) in acc.iter_mut().zip(row) {
+            *a += w * r;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn axpy_f32_neon(acc: &mut [f32], row: &[f32], w: f32) {
+    // SAFETY: callers pass equal-length slices (head_dim rows).
+    unsafe {
+        use core::arch::aarch64::*;
+        let n = acc.len().min(row.len());
+        let ap = acc.as_mut_ptr();
+        let rp = row.as_ptr();
+        let wv = vdupq_n_f32(w);
+        let mut j = 0usize;
+        while j + 4 <= n {
+            let v = vfmaq_f32(vld1q_f32(ap.add(j)), wv, vld1q_f32(rp.add(j)));
+            vst1q_f32(ap.add(j), v);
+            j += 4;
+        }
+        while j < n {
+            *ap.add(j) += w * *rp.add(j);
+            j += 1;
+        }
+}
 }
 
 /// Multi-head GQA attention for one position.

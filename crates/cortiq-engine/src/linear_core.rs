@@ -441,7 +441,7 @@ fn gdn_projs_gpu(w: &GdnWeights, x: &[f32], qkv: &mut [f32], z: &mut [f32]) -> b
                 rows: *rows,
                 cols: *cols,
                 row_scale,
-                xs: prescale(x, col_field, *dt),
+                xs: prescale(x, col_field, *dt).into_owned(),
             },
         )),
         _ => None,

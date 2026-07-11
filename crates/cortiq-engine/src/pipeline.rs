@@ -1908,8 +1908,8 @@ fn moe_ffn_gpu(
             gate: (gi, gr, gc, grs),
             up: (ui, ur, uc, urs),
             down: (di, dr, dc, drs),
-            xs_gate: prescale(x, gcf, TensorDtype::Q8_2f),
-            xs_up: prescale(x, ucf, TensorDtype::Q8_2f),
+            xs_gate: prescale(x, gcf, TensorDtype::Q8_2f).into_owned(),
+            xs_up: prescale(x, ucf, TensorDtype::Q8_2f).into_owned(),
             down_col: dcf,
             w,
         });

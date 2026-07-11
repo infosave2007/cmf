@@ -282,18 +282,11 @@ impl QTensor {
             Self::Mapped { dtype, row_scale, col_field, .. } => match dtype {
                 TensorDtype::Q8Row => {
                     let q = &self.quant_bytes()[r * cols..(r + 1) * cols];
-                    let s: f32 = q.iter().zip(x).map(|(&b, v)| (b as i8) as f32 * v).sum();
-                    s * row_scale[r]
+                    dot_i8_f32(q, x) * row_scale[r]
                 }
                 TensorDtype::Q8_2f => {
                     let q = &self.quant_bytes()[r * cols..(r + 1) * cols];
-                    let s: f32 = q
-                        .iter()
-                        .zip(x)
-                        .zip(col_field)
-                        .map(|((&b, v), c)| (b as i8) as f32 * v * c)
-                        .sum();
-                    s * row_scale[r]
+                    dot_i8_col_f32(q, x, col_field) * row_scale[r]
                 }
                 _ => {
                     self.row_f32(r, scratch);
@@ -464,7 +457,7 @@ impl QTensor {
                     }
                     return;
                 }
-                let pre: Vec<Vec<f32>> = (0..b)
+                let pre: Vec<std::borrow::Cow<'_, [f32]>> = (0..b)
                     .map(|bi| {
                         prescale(&xs_all[bi * cols..(bi + 1) * cols], col_field, *dtype)
                     })
@@ -497,7 +490,7 @@ impl QTensor {
 fn qmatmat(
     q: &[u8],
     row_scale: &[f32],
-    pre: &[Vec<f32>],
+    pre: &[std::borrow::Cow<'_, [f32]>],
     rows: usize,
     cols: usize,
     out: &mut [f32],
@@ -636,7 +629,13 @@ fn vbitmatvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]
                 }
                 return dot;
             }
-            let mut buf = vec![0u8; cols]; // centered i8 stored as u8 bits
+            // Per-worker scratch: this closure runs for every row of the
+            // tensor (lm_head ≈ 150k rows/token) — a heap allocation per
+            // row was measurable pure overhead.
+            thread_local! {
+                static VBIT_SCRATCH: std::cell::RefCell<Vec<u8>> =
+                    const { std::cell::RefCell::new(Vec::new()) };
+            }
             #[inline(always)]
             fn fill<const B: usize>(data: &[u8], l: i32, buf: &mut [u8]) {
                 for (blk, chunk) in buf.chunks_exact_mut(8).enumerate() {
@@ -647,39 +646,43 @@ fn vbitmatvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]
                 }
             }
             let _ = mask;
-            match b {
-                3 => fill::<3>(data, l, &mut buf),
-                4 => fill::<4>(data, l, &mut buf),
-                5 => fill::<5>(data, l, &mut buf),
-                6 => fill::<6>(data, l, &mut buf),
-                _ => unreachable!(),
-            }
-            let mut dot = 0f32;
-            for g in 0..ng {
-                let so = (r * ng + g) * 2;
-                let s = f16_to_f32(u16::from_le_bytes([
-                    bytes[sc_off + so],
-                    bytes[sc_off + so + 1],
-                ]));
-                let d = unsafe {
-                    dot_i8_sdot(
-                        &buf[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
-                        &act.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
-                    )
-                } as f32
-                    * act.sx;
-                dot += d * s;
-            }
-            for &(j, xv) in &act.outliers {
-                let so = (r * ng + j / GROUP_SIZE) * 2;
-                let s = f16_to_f32(u16::from_le_bytes([
-                    bytes[sc_off + so],
-                    bytes[sc_off + so + 1],
-                ]));
-                // xq is zeroed at outlier slots — add the exact term.
-                dot += (buf[j] as i8) as f32 * s * xv;
-            }
-            dot
+            VBIT_SCRATCH.with(|scratch| {
+                let mut buf = scratch.borrow_mut();
+                buf.resize(cols, 0);
+                match b {
+                    3 => fill::<3>(data, l, &mut buf),
+                    4 => fill::<4>(data, l, &mut buf),
+                    5 => fill::<5>(data, l, &mut buf),
+                    6 => fill::<6>(data, l, &mut buf),
+                    _ => unreachable!(),
+                }
+                let mut dot = 0f32;
+                for g in 0..ng {
+                    let so = (r * ng + g) * 2;
+                    let s = f16_to_f32(u16::from_le_bytes([
+                        bytes[sc_off + so],
+                        bytes[sc_off + so + 1],
+                    ]));
+                    let d = unsafe {
+                        dot_i8_sdot(
+                            &buf[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
+                            &act.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
+                        )
+                    } as f32
+                        * act.sx;
+                    dot += d * s;
+                }
+                for &(j, xv) in &act.outliers {
+                    let so = (r * ng + j / GROUP_SIZE) * 2;
+                    let s = f16_to_f32(u16::from_le_bytes([
+                        bytes[sc_off + so],
+                        bytes[sc_off + so + 1],
+                    ]));
+                    // xq is zeroed at outlier slots — add the exact term.
+                    dot += (buf[j] as i8) as f32 * s * xv;
+                }
+                dot
+            })
         };
         match pool {
             Some(pool) if rows >= 256 => {
@@ -856,11 +859,18 @@ fn q4matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], 
     }
 }
 
-pub(crate) fn prescale(x: &[f32], col_field: &[f32], dtype: TensorDtype) -> Vec<f32> {
+/// θ col-field fold for q8_2f activations. Borrowed pass-through for
+/// every other dtype — the old unconditional `x.to_vec()` was a pure
+/// per-matvec allocation on the q8_row hot path.
+pub(crate) fn prescale<'a>(
+    x: &'a [f32],
+    col_field: &[f32],
+    dtype: TensorDtype,
+) -> std::borrow::Cow<'a, [f32]> {
     if dtype == TensorDtype::Q8_2f {
         x.iter().zip(col_field).map(|(a, c)| a * c).collect()
     } else {
-        x.to_vec()
+        std::borrow::Cow::Borrowed(x)
     }
 }
 
@@ -1070,10 +1080,57 @@ unsafe fn dot_q4_row_sdot(packed: &[u8], scales: &[u8], g0: usize, gpr: usize, x
 
 // ───────────────────── fused int8 kernels ─────────────────────
 
+/// `acc += w · row` where the row is centered i8 — NEON widen+fma on
+/// aarch64, scalar elsewhere. The KV-cache q8 value path rides on this.
+#[inline]
+pub(crate) fn axpy_i8_f32(acc: &mut [f32], row: &[i8], w: f32) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return axpy_i8_f32_neon(acc, row, w);
+    }
+    #[allow(unreachable_code)]
+    {
+        for (a, &b) in acc.iter_mut().zip(row) {
+            *a += w * b as f32;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn axpy_i8_f32_neon(acc: &mut [f32], row: &[i8], w: f32) {
+    // SAFETY: callers uphold slice-length contracts (see call sites).
+    unsafe {
+        use core::arch::aarch64::*;
+        let n = acc.len().min(row.len());
+        let ap = acc.as_mut_ptr();
+        let rp = row.as_ptr();
+        let wv = vdupq_n_f32(w);
+        let mut j = 0usize;
+        while j + 16 <= n {
+            let rb = vld1q_s8(rp.add(j));
+            let lo = vmovl_s8(vget_low_s8(rb));
+            let hi = vmovl_s8(vget_high_s8(rb));
+            for (off, half) in [(0, lo), (8, hi)] {
+                let f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(half)));
+                let f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(half)));
+                let o = j + off;
+                vst1q_f32(ap.add(o), vfmaq_f32(vld1q_f32(ap.add(o)), wv, f0));
+                vst1q_f32(ap.add(o + 4), vfmaq_f32(vld1q_f32(ap.add(o + 4)), wv, f1));
+            }
+            j += 16;
+        }
+        while j < n {
+            *ap.add(j) += w * (*rp.add(j)) as f32;
+            j += 1;
+        }
+}
+}
+
 /// i8 row · f32 x. NEON on aarch64 (ported from vmfcore `dot_i8_f32_neon`,
 /// ≈9× scalar), scalar elsewhere.
 #[inline]
-fn dot_i8_f32(w: &[u8], x: &[f32]) -> f32 {
+pub(crate) fn dot_i8_f32(w: &[u8], x: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         return dot_i8_f32_neon(w, x);
@@ -1086,6 +1143,61 @@ fn dot_i8_f32(w: &[u8], x: &[f32]) -> f32 {
         }
         sum
     }
+}
+
+/// i8 row · (x ⊙ col_field) — the q8_2f row dot with the θ col-field
+/// folded into the product (no prescaled copy of x). NEON on aarch64,
+/// scalar elsewhere. Used by the active-neuron path `row_dot`.
+#[inline]
+fn dot_i8_col_f32(w: &[u8], x: &[f32], col: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return dot_i8_col_f32_neon(w, x, col);
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut sum = 0.0f32;
+        for (j, &b) in w.iter().enumerate() {
+            sum += (b as i8) as f32 * x[j] * col[j];
+        }
+        sum
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_i8_col_f32_neon(w: &[u8], x: &[f32], col: &[f32]) -> f32 {
+    // SAFETY: callers uphold slice-length contracts (see call sites).
+    unsafe {
+        use core::arch::aarch64::*;
+        let n = x.len();
+        let wp = w.as_ptr() as *const i8;
+        let xp = x.as_ptr();
+        let cp = col.as_ptr();
+        let (mut a0, mut a1, mut a2, mut a3) =
+            (vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+        let mut j = 0usize;
+        while j + 16 <= n {
+            let wb = vld1q_s8(wp.add(j));
+            let lo = vmovl_s8(vget_low_s8(wb));
+            let hi = vmovl_s8(vget_high_s8(wb));
+            let w0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo)));
+            let w1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo)));
+            let w2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi)));
+            let w3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi)));
+            a0 = vfmaq_f32(a0, w0, vmulq_f32(vld1q_f32(xp.add(j)), vld1q_f32(cp.add(j))));
+            a1 = vfmaq_f32(a1, w1, vmulq_f32(vld1q_f32(xp.add(j + 4)), vld1q_f32(cp.add(j + 4))));
+            a2 = vfmaq_f32(a2, w2, vmulq_f32(vld1q_f32(xp.add(j + 8)), vld1q_f32(cp.add(j + 8))));
+            a3 = vfmaq_f32(a3, w3, vmulq_f32(vld1q_f32(xp.add(j + 12)), vld1q_f32(cp.add(j + 12))));
+            j += 16;
+        }
+        let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+        while j < n {
+            sum += (*wp.add(j)) as f32 * *xp.add(j) * *cp.add(j);
+            j += 1;
+        }
+        sum
+}
 }
 
 #[cfg(target_arch = "aarch64")]
