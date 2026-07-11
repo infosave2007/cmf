@@ -436,6 +436,20 @@ impl Pipeline {
             }
             let t = |suffix: &str| load_matrix(model, &format!("{prefix}vmf_attn.{suffix}"), force_f32, ov);
             let a_log = load_f32(model, &format!("{prefix}vmf_attn.A_log"), ov).map_err(err)?;
+            // Selective-write gate κ (hybrid_k core): optional by tensor
+            // presence — files without it run the classic phase kernel
+            // bit-identically.
+            let k_gate = if model
+                .tensor(&format!("{prefix}vmf_attn.k_gate.weight"))
+                .is_some()
+            {
+                Some((
+                    t("k_gate.weight")?,
+                    load_f32(model, &format!("{prefix}vmf_attn.k_gate.bias"), ov).map_err(err)?,
+                ))
+            } else {
+                None
+            };
             Ok(AttnKind::Linear(VmfPhaseWeights {
                 thq: t("thq.weight")?,
                 thk: t("thk.weight")?,
@@ -445,6 +459,7 @@ impl Pipeline {
                     .iter()
                     .map(|&a| (-(a as f64).exp()).exp())
                     .collect(),
+                k_gate,
             }))
         };
 

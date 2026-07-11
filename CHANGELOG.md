@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **hybrid_k core support** — the vmf_phase linear core now honors an
+  optional selective-write gate: `model.layers.{i}.vmf_attn.k_gate.weight`
+  `[nh, hidden]` + `.bias [nh]`; κ_h = σ(W_k·x + b)_h multiplies the state
+  write (`S = decay·S + κ·φk⊗v`). Presence-driven: files without the
+  tensors run the classic phase kernel unchanged. Mechanism-level basis
+  («phase + input gate», stage 71): fastest convergence and best/tied
+  accuracy across the recall grid, correlated-noise robustness the bare
+  phase kernel lacks, and an LM crossover vs softmax at SEQ 512.
+
 - **NEON decode attention** — `attention_head` score/weighted-sum loops and
   the q8-KV `attend` branches now run through NEON kernels (`dot_f32`,
   `axpy_f32`, per-group `dot_i8_f32`, `axpy_i8_f32`). Measured on

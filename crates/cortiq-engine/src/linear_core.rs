@@ -38,6 +38,13 @@ pub struct VmfPhaseWeights {
     pub out_proj: QTensor,
     /// Per-component decay exp(−exp(A_log)), len nh·2·nphase (precomputed).
     pub decay: Vec<f64>,
+    /// Selective-write input gate κ (hybrid_k core, stage 71): weight
+    /// [nh, hidden] + bias [nh]; κ_h = σ(W_k·x + b)_h multiplies the
+    /// state WRITE (S = decay·S + κ·φk⊗v). None = classic phase core,
+    /// bit-identical to the pre-κ kernel. Measured at mechanism level:
+    /// knee ×2–6 earlier, restores correlated-noise robustness, LM
+    /// crossover vs softmax at SEQ 512 (experiments/lc_final_merged.json).
+    pub k_gate: Option<(QTensor, Vec<f32>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +77,7 @@ fn phase_step(
     thk: &[f32],
     v: &[f32],
     decay: &[f64],
+    kap: Option<&[f32]>,
     cfg: &VmfPhaseCfg,
     state: &mut [f64],
     out: &mut [f32],
@@ -85,6 +93,8 @@ fn phase_step(
         let vt = &v[h * dv..(h + 1) * dv];
         let ot = &mut out[h * dv..(h + 1) * dv];
         let dec = &decay[h * p2..(h + 1) * p2];
+        // Selective write (hybrid_k): κ scales what enters the condensate.
+        let kh = kap.map_or(1.0f64, |k| k[h] as f64);
         for f in 0..p2 {
             // φ(θ) = [cos·nph, sin·nph], θ scaled by the mass factor.
             let (fk, fq) = if f < nph {
@@ -95,14 +105,27 @@ fn phase_step(
                     (thq_h[f - nph] as f64 * mscale).sin(),
                 )
             };
+            let fkw = fk * kh;
             let row = &mut s[f * dv..(f + 1) * dv];
             let dcf = dec[f];
             for d in 0..dv {
-                row[d] = dcf * row[d] + fk * vt[d] as f64; // S = decay·S + φk⊗v
+                row[d] = dcf * row[d] + fkw * vt[d] as f64; // S = decay·S + κ·φk⊗v
                 ot[d] += (fq * row[d]) as f32; // o = Σ φq·S
             }
         }
     }
+}
+
+/// κ_h = σ(W_k·x + b)_h — the per-head write gate (None when the layer
+/// has no k_gate tensors: classic phase core).
+fn kappa_of(x: &[f32], w: &VmfPhaseWeights, nh: usize, pool: Option<&Pool>) -> Option<Vec<f32>> {
+    let (kw, kb) = w.k_gate.as_ref()?;
+    let mut k = vec![0.0f32; nh];
+    kw.matvec(x, &mut k, pool);
+    for (v, b) in k.iter_mut().zip(kb) {
+        *v = 1.0 / (1.0 + (-(*v + b)).exp());
+    }
+    Some(k)
 }
 
 /// Forward one position through a vmf_phase layer, advancing `state`.
@@ -125,8 +148,9 @@ pub fn vmf_phase_forward(
     let mut v = vec![0.0f32; nh * dv];
     w.v_proj.matvec(x, &mut v, pool);
 
+    let kap = kappa_of(x, w, nh, pool);
     let mut o = vec![0.0f32; nh * dv];
-    phase_step(&thq, &thk, &v, &w.decay, cfg, state, &mut o);
+    phase_step(&thq, &thk, &v, &w.decay, kap.as_deref(), cfg, state, &mut o);
 
     let mut out = vec![0.0f32; cfg.hidden_size];
     w.out_proj.matvec(&o, &mut out, pool);
@@ -163,14 +187,16 @@ pub fn vmf_phase_pair(
     w.v_proj.matvec2(x1, x2, &mut v1, &mut v2, pool);
 
     // Lane 1 commits into the real state.
+    let kap1 = kappa_of(x1, w, nh, pool);
     let mut o1 = vec![0.0f32; nh * dv];
-    phase_step(&thq1, &thk1, &v1, &w.decay, cfg, state, &mut o1);
+    phase_step(&thq1, &thk1, &v1, &w.decay, kap1.as_deref(), cfg, state, &mut o1);
 
     // Lane 2 runs on a copy — tentative until the draft is verified.
+    let kap2 = kappa_of(x2, w, nh, pool);
     scratch.clear();
     scratch.extend_from_slice(state);
     let mut o2 = vec![0.0f32; nh * dv];
-    phase_step(&thq2, &thk2, &v2, &w.decay, cfg, scratch, &mut o2);
+    phase_step(&thq2, &thk2, &v2, &w.decay, kap2.as_deref(), cfg, scratch, &mut o2);
 
     let mut out1 = vec![0.0f32; cfg.hidden_size];
     let mut out2 = vec![0.0f32; cfg.hidden_size];
@@ -529,6 +555,7 @@ mod tests {
             decay: (0..cfg.num_heads * 2 * cfg.nphase)
                 .map(|i| 0.9 + 0.005 * (i % 10) as f64)
                 .collect(),
+            k_gate: None,
         };
         (w, cfg)
     }
@@ -569,6 +596,42 @@ mod tests {
             "mass>0 must change the output"
         );
         assert!(massed.iter().all(|v| v.is_finite()));
+    }
+
+    /// κ write gate (hybrid_k): saturated-open gate (bias ≫ 0 → κ→1)
+    /// matches the gateless kernel within fp tolerance; a closed gate
+    /// (bias ≪ 0 → κ→0) writes nothing — the state stays zero and the
+    /// output collapses to the empty-condensate readout.
+    #[test]
+    fn kappa_gate_open_matches_none_and_closed_writes_nothing() {
+        let (mut w, cfg) = tiny();
+        let x: Vec<f32> = (0..8).map(|i| (i as f32 * 0.3).sin()).collect();
+
+        let mut s_none = Vec::new();
+        let base1 = vmf_phase_forward(&x, &w, &cfg, &mut s_none, None);
+        let base2 = vmf_phase_forward(&x, &w, &cfg, &mut s_none, None);
+
+        // Open gate: W=0, bias=+20 → κ = σ(20) ≈ 1 − 2e−9.
+        w.k_gate = Some((
+            QTensor::from_f32(vec![0.0; cfg.num_heads * cfg.hidden_size], cfg.num_heads, cfg.hidden_size),
+            vec![20.0; cfg.num_heads],
+        ));
+        let mut s_open = Vec::new();
+        let o1 = vmf_phase_forward(&x, &w, &cfg, &mut s_open, None);
+        let o2 = vmf_phase_forward(&x, &w, &cfg, &mut s_open, None);
+        for (a, b) in base1.iter().zip(&o1).chain(base2.iter().zip(&o2)) {
+            assert!((a - b).abs() < 1e-5, "open κ must match gateless: {a} vs {b}");
+        }
+
+        // Closed gate: bias=−20 → κ ≈ 0 → nothing is written.
+        w.k_gate = Some((
+            QTensor::from_f32(vec![0.0; cfg.num_heads * cfg.hidden_size], cfg.num_heads, cfg.hidden_size),
+            vec![-20.0; cfg.num_heads],
+        ));
+        let mut s_closed = Vec::new();
+        let oc = vmf_phase_forward(&x, &w, &cfg, &mut s_closed, None);
+        assert!(s_closed.iter().all(|&v| v.abs() < 1e-7), "closed κ: state must stay empty");
+        assert!(oc.iter().all(|&v| v.abs() < 1e-6), "closed κ: empty-condensate readout");
     }
 
     #[test]
