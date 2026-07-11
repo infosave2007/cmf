@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **q4 SDOT decode path** — `q4_block` matvec now runs through the A8W8
+  int8 `sdot` kernel on ARMv8.2+ (nibbles → centered i8 per 32-group, exact
+  outlier correction), replacing the scalar inner loop. Measured on
+  Qwen3.5-0.8B q4 (M4, interleaved runs): decode 5.3 → 14.4 tok/s (×2.7),
+  prefill 7.3 → 24 tok/s (×3.3), PPL 4.008 → 4.022 (+0.35%, bounded A8W8
+  noise — the same contract as q8/vbit). `CMF_SDOT=0` keeps the exact
+  scalar path.
+
 ## [0.1.10] — 2026-07-09
 
 ### Added

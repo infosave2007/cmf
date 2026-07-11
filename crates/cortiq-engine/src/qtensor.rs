@@ -767,13 +767,58 @@ fn vbitmatvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]
     }
 }
 
-/// Fused q4_block matvec straight from the mapped bytes. Scalar inner
-/// loop for now — correctness (and the ×8 RAM fix) first; a nibble
-/// SDOT port (vmfcore: +23%) is the follow-up optimization.
+/// Fused q4_block matvec straight from the mapped bytes. SDOT path when
+/// dotprod is available (port of vmfcore `dot_q4_block_sdot`, measured
+/// +23% on q4 decode): nibbles → centered i8, int8×int8 `sdot` per
+/// 32-group, exact outlier correction — the same A8W8 contract as q8.
+/// `CMF_SDOT=0` keeps the exact scalar path.
 fn q4matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
     debug_assert_eq!(out.len(), rows);
     let (packed, scales) = q4_split(bytes, rows, cols);
     let gpr = cols / GROUP_SIZE;
+
+    #[cfg(target_arch = "aarch64")]
+    if sdot_enabled() {
+        let act = split_act(x);
+        let act = &act;
+        let row_dot = move |r: usize| -> f32 {
+            let mut acc =
+                unsafe { dot_q4_row_sdot(packed, scales, r * gpr, gpr, &act.xq) } * act.sx;
+            // xq is zeroed at outlier slots — add the exact terms.
+            for &(j, xv) in &act.outliers {
+                let flat = r * cols + j;
+                let byte = packed[flat / 2];
+                let nib = if flat & 1 == 0 { byte & 0x0F } else { byte >> 4 };
+                let s = f16_to_f32(u16::from_le_bytes([
+                    scales[(flat / GROUP_SIZE) * 2],
+                    scales[(flat / GROUP_SIZE) * 2 + 1],
+                ]));
+                acc += ((nib as i32 - 8) as f32) * s * xv;
+            }
+            acc
+        };
+        match pool {
+            Some(pool) if rows >= 256 => {
+                let out_addr = SendMut(out.as_mut_ptr());
+                pool.run(&move |widx, n| {
+                    let chunk = rows.div_ceil(n);
+                    let start = widx * chunk;
+                    let end = (start + chunk).min(rows);
+                    for r in start..end {
+                        // SAFETY: disjoint row ranges per worker.
+                        unsafe { *out_addr.at(r) = row_dot(r) };
+                    }
+                });
+            }
+            _ => {
+                for (r, dst) in out.iter_mut().enumerate() {
+                    *dst = row_dot(r);
+                }
+            }
+        }
+        return;
+    }
+
     let row_dot = |r: usize| -> f32 {
         let mut acc = 0f32;
         for gi in 0..gpr {
@@ -979,6 +1024,48 @@ fn row_dot_sdot(row: &[u8], act: &SplitAct) -> f32 {
         acc += (row[j] as i8) as f32 * xv;
     }
     acc
+}
+
+/// One q4 row via SDOT: each 32-group's nibbles unpack to centered i8
+/// (nib−8 ∈ [−8,7]), int8×int8 `sdot` against the pre-quantized
+/// activation group, × the group's f16 scale. Returns Σ_g dot_g·s_g;
+/// the caller multiplies by the activation scale and adds the exact
+/// outlier terms (port of vmfcore `dot_q4_block_sdot`, +23% measured).
+/// Nibble order matches the writer: element 2k = low nibble, 2k+1 = high
+/// → zip(lo,hi) restores flat order.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn dot_q4_row_sdot(packed: &[u8], scales: &[u8], g0: usize, gpr: usize, xq: &[i8]) -> f32 {
+    // SAFETY: callers uphold slice-length contracts (16 packed bytes and
+    // 2 scale bytes per group; xq.len() == gpr·GROUP_SIZE).
+    unsafe {
+        use core::arch::aarch64::*;
+        use core::arch::asm;
+        let lomask = vdupq_n_u8(0x0F);
+        let eight = vdupq_n_s8(8);
+        let mut acc = 0f32;
+        for gi in 0..gpr {
+            let g = g0 + gi;
+            let s = f16_to_f32(u16::from_le_bytes([scales[g * 2], scales[g * 2 + 1]]));
+            let b = vld1q_u8(packed.as_ptr().add(g * 16));
+            let lo = vandq_u8(b, lomask);
+            let hi = vshrq_n_u8::<4>(b);
+            let e0 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(lo, hi)), eight);
+            let e1 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(lo, hi)), eight);
+            let x0 = vld1q_s8(xq.as_ptr().add(gi * GROUP_SIZE));
+            let x1 = vld1q_s8(xq.as_ptr().add(gi * GROUP_SIZE + 16));
+            let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+            asm!(
+                "sdot {a0:v}.4s, {e0:v}.16b, {x0:v}.16b",
+                "sdot {a1:v}.4s, {e1:v}.16b, {x1:v}.16b",
+                a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                e0 = in(vreg) e0, x0 = in(vreg) x0, e1 = in(vreg) e1, x1 = in(vreg) x1,
+                options(pure, nomem, nostack),
+            );
+            acc += vaddvq_s32(vaddq_s32(a0, a1)) as f32 * s;
+        }
+        acc
+    }
 }
 
 // ───────────────────── fused int8 kernels ─────────────────────
@@ -1382,10 +1469,65 @@ mod tests {
 
         let mut got = vec![0.0f32; rows];
         q4matvec(&bytes, &x, rows, cols, &mut got, None);
+        // SDOT path quantizes activations to i8 (A8W8): bounded noise,
+        // same contract as q8/vbit (exact path is pinned by CMF_SDOT=0
+        // in the golden-parity gate).
+        let tol = if sdot_enabled() { 6e-2 } else { 1e-4 };
+        let scale = expect.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
         for r in 0..rows {
             assert!(
-                (got[r] - expect[r]).abs() < 1e-4 * expect[r].abs().max(1.0),
+                (got[r] - expect[r]).abs() < tol * scale,
                 "row {r}: {} vs {}",
+                got[r],
+                expect[r]
+            );
+        }
+    }
+
+    /// q4 SDOT outlier correction: a single huge activation channel
+    /// (>8·rms → outlier, zeroed in xq) must still contribute its EXACT
+    /// term. On-grid bulk (±1/0 → xq dequantizes exactly) isolates the
+    /// correction from A8W8 noise. cols must exceed 64: at n=64 the
+    /// 8·rms threshold equals sqrt(v²+rest) ≥ v, so a single outlier
+    /// can never qualify (8² = n).
+    #[test]
+    fn q4matvec_sdot_outlier_exact() {
+        let (rows, cols) = (4, 128);
+        let groups = rows * cols / GROUP_SIZE;
+        let mut bytes = Vec::with_capacity(groups * 16 + groups * 2);
+        for i in 0..groups * 16 {
+            bytes.push(((i * 11 + 5) % 256) as u8);
+        }
+        for g in 0..groups {
+            let s = 0.02 + 0.002 * g as f32;
+            bytes.extend_from_slice(&cortiq_core::quant::f32_to_f16(s).to_le_bytes());
+        }
+        let mut x: Vec<f32> = (0..cols)
+            .map(|i| match i % 3 {
+                0 => 1.0,
+                1 => -1.0,
+                _ => 0.0,
+            })
+            .collect();
+        x[17] = 300.0; // ≫ 8·rms → outlier channel
+
+        let mut reference = vec![0.0f32; rows * cols];
+        cortiq_core::quant::dequant_q4_block(&bytes, &mut reference);
+        let mut expect = vec![0.0f32; rows];
+        for r in 0..rows {
+            expect[r] = reference[r * cols..(r + 1) * cols]
+                .iter()
+                .zip(&x)
+                .map(|(w, xv)| w * xv)
+                .sum();
+        }
+        let mut got = vec![0.0f32; rows];
+        q4matvec(&bytes, &x, rows, cols, &mut got, None);
+        let scale = expect.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+        for r in 0..rows {
+            assert!(
+                (got[r] - expect[r]).abs() < 2e-3 * scale,
+                "row {r}: {} vs {} (outlier term must be exact)",
                 got[r],
                 expect[r]
             );
