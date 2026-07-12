@@ -81,6 +81,11 @@ pub struct Pipeline {
     /// Hysteresis router driving per-token skill switches during decode
     /// (None = static/no dynamic routing). Taken out during generation.
     pub dyn_router: Option<crate::swarm::DynRouter>,
+    /// O(1) Nyström attention setting (CLI/env/header-hint resolved by
+    /// the caller; None = plain cache attention everywhere).
+    o1_cfg: Option<crate::nystrom::O1Cfg>,
+    /// Per-layer o1 flags derived from `o1_cfg` (Full layers only).
+    o1_flags: Vec<bool>,
     /// Emit a structured per-token trace (B4 telemetry channel). Off by
     /// default — the runtime is silent unless observation is requested.
     trace: bool,
@@ -305,8 +310,69 @@ impl Pipeline {
             dyn_phi_ema: Vec::new(),
             dyn_phi_seen: 0,
             dyn_router: None,
+            o1_cfg: None,
+            o1_flags: Vec::new(),
             trace: false,
             calib_temp: 1.0,
+        }
+    }
+
+    /// Enable/disable per-layer O(1) Nyström attention. Only Full
+    /// layers are eligible (a linear layer keeps its own operator).
+    /// Applies to generation (`generate*`/`forward_ids`): the prompt
+    /// pass stays exact, the seal happens once after prefill, decode
+    /// runs on the O(1) state. Teacher-forced scoring (`ppl_ids`)
+    /// intentionally stays exact.
+    pub fn set_o1(&mut self, cfg: Option<crate::nystrom::O1Cfg>) {
+        self.o1_flags = match &cfg {
+            Some(c) => {
+                let mut flags = c.layer_flags(self.num_layers);
+                for (li, f) in flags.iter_mut().enumerate() {
+                    if *f && !matches!(self.weights.layers[li].attn, AttnKind::Full { .. }) {
+                        *f = false;
+                    }
+                }
+                flags
+            }
+            None => Vec::new(),
+        };
+        if let Some(c) = &cfg {
+            let n = self.o1_flags.iter().filter(|&&f| f).count();
+            tracing::info!(
+                "o1 nystrom attention: {n}/{} layer(s), m={} w={} sink={}",
+                self.num_layers, c.m, c.w, c.sink
+            );
+        }
+        self.o1_cfg = cfg;
+    }
+
+    /// True when at least one layer runs the O(1) kernel.
+    pub fn o1_active(&self) -> bool {
+        self.o1_cfg.is_some() && self.o1_flags.iter().any(|&f| f)
+    }
+
+    /// Arm query collection on the o1 layers (fresh prompt pass).
+    fn o1_begin(&mut self) {
+        if let Some(c) = &self.o1_cfg {
+            let (m, w, sink) = (c.m, c.w, c.sink);
+            for (li, &f) in self.o1_flags.iter().enumerate() {
+                if f {
+                    self.kv_cache.layers[li].o1_begin(m, w, sink);
+                }
+            }
+        }
+    }
+
+    /// Freeze landmarks + skeleton state after the prompt pass and drop
+    /// the o1 layers' full KV; decode then runs `step()` per token.
+    fn o1_seal(&mut self) {
+        if self.o1_cfg.is_none() {
+            return;
+        }
+        for li in 0..self.num_layers {
+            if self.o1_flags.get(li).copied().unwrap_or(false) {
+                self.kv_cache.layers[li].o1_seal(self.num_heads);
+            }
         }
     }
 
@@ -384,10 +450,15 @@ impl Pipeline {
 
         // Fresh sequence — the cache holds absolute positions.
         self.kv_cache.clear();
+        self.o1_begin();
 
+        // Speculative decode is off under o1: a rejected draft can't be
+        // rolled back out of the far accumulators / ring window (the
+        // Nyström insertion is irreversible by design).
         let spec_active = self.speculative
             && self.mtp.is_some()
             && task_mask.is_none()
+            && !self.o1_active()
             && self.sampler_config.temperature < 1e-6;
         // The MTP module is detached during generation so its mutable
         // state does not fight the borrow on `self`.
@@ -424,7 +495,8 @@ impl Pipeline {
         let mut pos = 0usize;
         // With dynamic routing, prefill sequentially so the φ hook fires
         // over the PROMPT — the router enters decode with a warm φ (the
-        // fused-pair path skips the per-layer φ capture).
+        // fused-pair path skips the per-layer φ capture). o1 layers
+        // collect their query trace in both the single and pair paths.
         let dyn_prefill = router.is_some();
         if task_mask.is_none() && !dyn_prefill {
             while pos + 1 < input_ids.len() {
@@ -452,6 +524,9 @@ impl Pipeline {
             }
             pos += 1;
         }
+        // Prompt absorbed → freeze the o1 layers' skeletons; from here
+        // every decode step on those layers is O(W + m·dv + m²).
+        self.o1_seal();
 
         // Commit one token: push, check EOS, stream. Returns false = stop.
         macro_rules! commit {
@@ -816,10 +891,13 @@ impl Pipeline {
             return Err("empty id sequence".to_string());
         }
         self.kv_cache.clear();
+        self.o1_begin();
         let mut hidden = vec![0.0f32; self.hidden_size];
         let mut pos = 0usize;
         if task_mask.is_none() && prefill_batched() && ids.len() > 2 {
-            // prefill-GEMM in chunks; only the last position's hidden is needed.
+            // prefill-GEMM in chunks; only the last position's hidden is
+            // needed. (o1-compatible: the batch path attends per position
+            // through qwen_attention, which carries the collection hook.)
             const CHUNK: usize = 48;
             let hs = self.hidden_size;
             while pos < ids.len() {
@@ -843,6 +921,10 @@ impl Pipeline {
             hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, task_mask);
             pos += 1;
         }
+        // Harness contract: after forward_ids the cache is decode-ready —
+        // under o1 that means sealed (bench measures the seal as part of
+        // prefill, honestly).
+        self.o1_seal();
         let normed = inference::rms_norm(
             &hidden,
             &self.weights.final_norm,
@@ -1231,6 +1313,46 @@ impl Pipeline {
                         &cfg,
                         &mut self.kv_cache.layers[li].linear_state,
                         self.pool.as_deref(),
+                    )
+                }
+                AttnKind::Full {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                    output_gate,
+                    bias,
+                } if self.kv_cache.layers[li].o1_sealed() => {
+                    // O(1) override: decode on the sealed Nyström state
+                    // instead of the growing KV cache.
+                    let cfg = QwenAttnCfg {
+                        num_heads: nh,
+                        num_kv_heads: nkv,
+                        head_dim: hd,
+                        hidden_size: hs,
+                        position,
+                        inv_freq: &inv_freq,
+                        rotary_dim: rd,
+                        q_norm: q_norm.as_deref(),
+                        k_norm: k_norm.as_deref(),
+                        output_gate: *output_gate,
+                        bias: bias
+                            .as_ref()
+                            .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
+                        rms_eps: eps,
+                        norm_style: self.norm_style,
+                        pool: pool.as_deref(),
+                    };
+                    attention::qwen_attention_nystrom(
+                        &normed,
+                        wq,
+                        wk,
+                        wv,
+                        wo,
+                        &mut self.kv_cache.layers[li],
+                        &cfg,
                     )
                 }
                 AttnKind::Full {

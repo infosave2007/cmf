@@ -996,6 +996,9 @@ pub fn run_convert(
     output: &str,
     hf_token: Option<&str>,
     defrag: Option<&str>,
+    // O(1) Nyström runtime hint (`--o1`): recorded in header provenance,
+    // weights untouched — the runtime resolves it at load (loader.rs).
+    o1_hint: Option<serde_json::Value>,
     mut progress: impl FnMut(f32),
 ) -> anyhow::Result<()> {
     let quant = parse_quant(quant)?;
@@ -1162,6 +1165,14 @@ pub fn run_convert(
             })
         }
         None => serde_json::json!({ "tool": "cortiq convert", "source_model": model }),
+    };
+    let provenance = match o1_hint {
+        Some(h) => {
+            let mut p = provenance;
+            p["o1_attn"] = h;
+            p
+        }
+        None => provenance,
     };
     let header = CmfHeader {
         format: "cmf".into(),
@@ -1334,7 +1345,7 @@ mod tests {
         ]);
         fs::write(dir.join("model.safetensors"), &st).unwrap();
         let out = dir.join("m.cmf");
-        run_convert(dir.to_str().unwrap(), "q8", out.to_str().unwrap(), None, None, |_| {}).unwrap();
+        run_convert(dir.to_str().unwrap(), "q8", out.to_str().unwrap(), None, None, None, |_| {}).unwrap();
 
         let model = CmfModel::open(&out).unwrap();
         assert_eq!(model.arch().vocab_size, 32);

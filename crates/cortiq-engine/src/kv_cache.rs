@@ -45,6 +45,32 @@ const KV_COL_WARMUP: usize = 64;
 /// → target <1% with a per-group one). V — per-row scale (measured +0.56%).
 const KV_K_GROUP: usize = 32;
 
+/// Per-layer O(1) Nyström attention state (runtime `attn_type`
+/// override — spec §7 presence-driven pattern, no format change).
+///
+/// Collecting: the prompt pass still runs EXACT cache attention (the
+/// prefill outputs feed the residual stream, so they cannot be
+/// deferred) while the per-position rotated queries are buffered;
+/// `o1_seal()` then freezes landmarks + M from the full prompt, replays
+/// it into per-Q-head streaming states, and DROPS the full KV. Sealed:
+/// decode replaces cache attention with `NystromState::step()`.
+#[derive(Debug, Clone)]
+pub enum O1State {
+    Collecting {
+        m: usize,
+        w: usize,
+        sink: usize,
+        /// Rotated post-norm queries, `[pos × num_heads × head_dim]`.
+        q_buf: Vec<f32>,
+    },
+    /// One state per Q head: the far field T̂/Ẑ depends on that head's
+    /// own query landmarks, so GQA groups cannot share it. The window
+    /// K/V is duplicated across the group's Q heads (×heads_per_kv) —
+    /// the price of keeping the golden-parity kernel intact; still O(1)
+    /// in context and far below full KV at depth.
+    Sealed { states: Vec<crate::nystrom::NystromState> },
+}
+
 /// KV cache for a single layer, head-major.
 #[derive(Debug, Clone)]
 pub struct LayerKvCache {
@@ -72,6 +98,8 @@ pub struct LayerKvCache {
     pub linear_state: Vec<f64>,
     /// Tentative lane-2 state during speculative verify.
     pub linear_scratch: Vec<f64>,
+    /// O(1) Nyström override (None = plain cache attention).
+    pub o1: Option<O1State>,
 }
 
 impl LayerKvCache {
@@ -92,6 +120,125 @@ impl LayerKvCache {
             head_dim,
             linear_state: Vec::new(),
             linear_scratch: Vec::new(),
+            o1: None,
+        }
+    }
+
+    // ── O(1) Nyström override ──
+
+    /// Arm query collection for a fresh prompt pass (a cleared cache).
+    pub fn o1_begin(&mut self, m: usize, w: usize, sink: usize) {
+        self.o1 = Some(O1State::Collecting { m, w, sink, q_buf: Vec::new() });
+    }
+
+    /// Record one position's rotated queries (`[num_heads × head_dim]`)
+    /// during the exact prompt pass. No-op unless collecting — the hook
+    /// sits inside qwen_attention so every prefill flavor (sequential,
+    /// batched) feeds the same trace.
+    pub fn o1_push_q(&mut self, q_all: &[f32]) {
+        if let Some(O1State::Collecting { q_buf, .. }) = &mut self.o1 {
+            q_buf.extend_from_slice(q_all);
+        }
+    }
+
+    pub fn o1_sealed(&self) -> bool {
+        matches!(self.o1, Some(O1State::Sealed { .. }))
+    }
+
+    /// Freeze the prompt into per-Q-head Nyström states and drop this
+    /// layer's full KV. Returns false (layer stays exact, KV kept) when
+    /// the preconditions fail: the seal needs f32 KV rows (`CMF_KV=q8`
+    /// stores int8), every group densely stored, and a full q trace.
+    pub fn o1_seal(&mut self, num_heads: usize) -> bool {
+        // Idempotent: sealing a sealed (or plain) layer must not
+        // disturb its state — check before take().
+        if !matches!(self.o1, Some(O1State::Collecting { .. })) {
+            return self.o1_sealed();
+        }
+        let Some(O1State::Collecting { m, w, sink, q_buf }) = self.o1.take() else {
+            unreachable!("checked above");
+        };
+        let (hd, t) = (self.head_dim, self.seq_len);
+        let hpk = num_heads / self.num_kv_heads.max(1);
+        let ok = t > 0
+            && self.mode == KvMode::F32
+            && q_buf.len() == t * num_heads * hd
+            && (0..self.num_kv_heads).all(|g| self.head_len(g) == t);
+        if !ok {
+            tracing::warn!(
+                "o1: cannot seal (needs f32 KV mode, dense heads, full query \
+                 trace) — layer keeps exact attention"
+            );
+            return false;
+        }
+        let mut states = Vec::with_capacity(num_heads);
+        let mut qh = vec![0.0f32; t * hd];
+        for h in 0..num_heads {
+            let g = h / hpk;
+            for p in 0..t {
+                let src = (p * num_heads + h) * hd;
+                qh[p * hd..(p + 1) * hd].copy_from_slice(&q_buf[src..src + hd]);
+            }
+            let mut st = crate::nystrom::NystromState::new(m, w, sink);
+            st.prefill(&qh, &self.k[g], &self.v[g], t, hd, hd);
+            states.push(st);
+        }
+        // The states now carry everything decode needs — release the
+        // O(context) storage (this is the memory claim, not a cosmetic).
+        for h in 0..self.num_kv_heads {
+            self.k[h] = Vec::new();
+            self.v[h] = Vec::new();
+        }
+        self.imp = Vec::new();
+        self.o1 = Some(O1State::Sealed { states });
+        true
+    }
+
+    /// One decode step on a sealed layer: per Q head, insert the GQA
+    /// group's fresh (k, v) and read the attention output. Returns
+    /// `[num_heads × head_dim]`. The same (k, v) is inserted into each
+    /// of the group's per-Q-head states — same math as the shared KV
+    /// row the exact path would have appended once.
+    pub fn o1_step(
+        &mut self,
+        q_all: &[f32],
+        k_new: &[f32],
+        v_new: &[f32],
+        num_heads: usize,
+    ) -> Vec<f32> {
+        let hd = self.head_dim;
+        let hpk = num_heads / self.num_kv_heads.max(1);
+        let mut out = vec![0.0f32; num_heads * hd];
+        let Some(O1State::Sealed { states }) = &mut self.o1 else {
+            debug_assert!(false, "o1_step on an unsealed layer");
+            return out;
+        };
+        for h in 0..num_heads {
+            let g = h / hpk;
+            states[h].step(
+                &q_all[h * hd..(h + 1) * hd],
+                &k_new[g * hd..(g + 1) * hd],
+                &v_new[g * hd..(g + 1) * hd],
+                &mut out[h * hd..(h + 1) * hd],
+            );
+        }
+        // Track the true context depth for the honest memory/seq report
+        // (nothing is stored per position — the state is O(1)).
+        self.seq_len += 1;
+        out
+    }
+
+    /// Bytes held by the O(1) override (query trace while collecting,
+    /// per-head states once sealed).
+    pub fn o1_memory_bytes(&self) -> usize {
+        match &self.o1 {
+            Some(O1State::Collecting { q_buf, .. }) => {
+                q_buf.len() * std::mem::size_of::<f32>()
+            }
+            Some(O1State::Sealed { states }) => {
+                states.iter().map(|s| s.memory_bytes()).sum()
+            }
+            None => 0,
         }
     }
 
@@ -347,6 +494,9 @@ impl LayerKvCache {
         self.imp.clear();
         self.linear_state.clear();
         self.linear_scratch.clear();
+        // Fresh conversation → the pipeline re-arms collection if the
+        // layer is o1-flagged (landmarks are per-prompt, never reused).
+        self.o1 = None;
         self.seq_len = 0;
     }
 
@@ -366,11 +516,17 @@ impl LayerKvCache {
             // constant in context, but real memory — the honest "KV+state"
             // line must count it (a pure-linear model reported 0 before).
             + self.linear_state.len() * std::mem::size_of::<f64>()
+            // O(1) Nyström state (window + sinks + skeleton) — same
+            // discipline: constant in context, but real memory.
+            + self.o1_memory_bytes()
     }
 
     /// Drop oldest positions, keeping the last `keep_last`.
     fn evict(&mut self, keep_last: usize) {
-        if self.seq_len <= keep_last {
+        // A sealed o1 layer stores nothing per position — the Nyström
+        // state IS the eviction policy; resetting seq_len here would lie
+        // about the context depth.
+        if self.o1_sealed() || self.seq_len <= keep_last {
             return;
         }
         let drop = self.seq_len - keep_last;
@@ -400,6 +556,9 @@ impl LayerKvCache {
     /// with the positions carrying the highest accumulated attention
     /// mass (vmfcore: PPL 8.342 vs 8.687 for recency-only, full 8.295).
     fn evict_born(&mut self, keep_last: usize, sink: usize, recent: usize) {
+        if self.o1_sealed() {
+            return; // see evict(): the o1 state is its own eviction
+        }
         let stored = self.imp.len();
         if stored <= keep_last {
             return;

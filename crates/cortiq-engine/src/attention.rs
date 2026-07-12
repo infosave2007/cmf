@@ -542,10 +542,40 @@ pub fn qwen_attention(
     let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
     let heads_per_kv = nh / nkv;
     let p = project_position(hidden, wq, wk, wv, cfg, cfg.position);
+    // O(1) prefill trace: while a nystrom layer is collecting, the exact
+    // prompt pass also records this position's queries for the seal
+    // (no-op on plain layers).
+    cache.o1_push_q(&p.q);
     cache.append(&p.k, &p.v, &vec![true; nkv]);
 
     let (mut ao, imp) = attend_all_heads(&p.q, cache, nh, heads_per_kv, hd);
     cache.accumulate_imp(&imp);
+    if cfg.output_gate {
+        apply_gate(&mut ao, &p.gate);
+    }
+    let mut out = vec![0.0f32; cfg.hidden_size];
+    wo.matvec(&ao, &mut out, cfg.pool);
+    out
+}
+
+/// Dense GQA attention for one DECODE position on a SEALED O(1) layer:
+/// projection / qk-norm / partial RoPE / output gate are identical to
+/// `qwen_attention`, but the KV cache is replaced by per-Q-head
+/// streaming Nyström states (exact window + permanent sinks + landmark
+/// skeleton). Head masks don't apply — the o1 path is dense, like the
+/// masked-on-quantized fallback.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen_attention_nystrom(
+    hidden: &[f32],
+    wq: &QTensor,
+    wk: &QTensor,
+    wv: &QTensor,
+    wo: &QTensor,
+    cache: &mut LayerKvCache,
+    cfg: &QwenAttnCfg,
+) -> Vec<f32> {
+    let p = project_position(hidden, wq, wk, wv, cfg, cfg.position);
+    let mut ao = cache.o1_step(&p.q, &p.k, &p.v, cfg.num_heads);
     if cfg.output_gate {
         apply_gate(&mut ao, &p.gate);
     }
@@ -635,6 +665,10 @@ pub fn qwen_attention_pair(
     let (qb, gate2) = finish(q2r, &mut k2, cfg.position + 1);
     let alive = vec![true; nkv];
 
+    // O(1) prefill trace (see qwen_attention): lane order = position
+    // order, so the collected buffer stays position-major.
+    cache.o1_push_q(&qa);
+    cache.o1_push_q(&qb);
     cache.append(&k1, &v1, &alive);
     let (mut a1, imp1) = attend_all_heads(&qa, cache, nh, heads_per_kv, hd);
     cache.accumulate_imp(&imp1);

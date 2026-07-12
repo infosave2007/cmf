@@ -10,6 +10,7 @@ pub mod inference;
 pub mod kv_cache;
 pub mod linear_core;
 pub mod loader;
+pub mod nystrom;
 pub mod pipeline;
 pub mod pool;
 pub mod qtensor;
@@ -19,6 +20,7 @@ pub mod sampler;
 pub mod swarm;
 pub mod tokenizer;
 
+pub use nystrom::NystromState;
 pub use pipeline::{GenerateResult, Pipeline, TokenCallback, TokenTrace};
 pub use runtime::CortiqRuntime;
 pub use sampler::SamplerConfig;

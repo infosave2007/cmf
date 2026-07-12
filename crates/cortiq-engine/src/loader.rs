@@ -580,6 +580,24 @@ impl Pipeline {
         if let Some(c) = &model.header.calibration {
             pipeline.set_calib_temp(c.temperature);
         }
+        // O(1) Nyström attention (runtime-level, no format change):
+        // env CMF_O1 decides; unset falls through to the converter hint
+        // in header.provenance.o1_attn (`cortiq convert --o1`), and
+        // CMF_O1=off force-disables even the hint. CLI flags override
+        // later via set_o1().
+        let o1 = match crate::nystrom::o1_from_env() {
+            crate::nystrom::O1Env::Off => None,
+            crate::nystrom::O1Env::On(cfg) => Some(cfg),
+            crate::nystrom::O1Env::Unset => model
+                .header
+                .provenance
+                .as_ref()
+                .and_then(|p| p.get("o1_attn"))
+                .and_then(crate::nystrom::O1Cfg::from_json),
+        };
+        if o1.is_some() {
+            pipeline.set_o1(o1);
+        }
         Ok(pipeline)
     }
 

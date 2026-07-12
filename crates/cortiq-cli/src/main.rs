@@ -98,6 +98,26 @@ impl SessionState {
     }
 }
 
+/// Bundled `--o1*` CLI flags for run/serve/bench. `spec = None` keeps
+/// whatever env CMF_O1 / the file's converter hint resolved at load;
+/// an explicit spec (including `off`) replaces it.
+struct O1Flags {
+    spec: Option<String>,
+    m: Option<usize>,
+    w: Option<usize>,
+    sink: Option<usize>,
+}
+
+impl O1Flags {
+    fn apply(&self, pipeline: &mut Pipeline) {
+        if let Some(spec) = self.spec.as_deref() {
+            pipeline.set_o1(cortiq_engine::nystrom::O1Cfg::from_spec(
+                spec, self.m, self.w, self.sink,
+            ));
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "cortiq")]
 #[command(about = "Sparse task-routed model inference engine")]
@@ -125,6 +145,20 @@ enum Commands {
         /// Also listen on ollama-compatible port
         #[arg(long)]
         compat_port: Option<u16>,
+        /// O(1) Nyström attention: replace KV-cache attention on the
+        /// given layers (all | deepN | i,j,k | off). Overrides CMF_O1
+        /// and the file's converter hint.
+        #[arg(long)]
+        o1: Option<String>,
+        /// Landmark budget for --o1 (validated default 32)
+        #[arg(long)]
+        o1_m: Option<usize>,
+        /// Exact-window width for --o1 (validated default 128)
+        #[arg(long)]
+        o1_window: Option<usize>,
+        /// Permanent exact sink keys for --o1 (validated default 4)
+        #[arg(long)]
+        o1_sink: Option<usize>,
     },
     /// Convert a Hugging Face checkpoint to .cmf — native Rust, no Python
     Convert {
@@ -153,6 +187,21 @@ enum Commands {
         /// autodetected from zeroed down_proj columns. Drops masks. (spec §11)
         #[arg(long)]
         defrag: Option<String>,
+        /// Record an O(1) Nyström attention hint (all | deepN | i,j,k):
+        /// weights pass through UNCHANGED; the runtime reads the hint at
+        /// load (override at serve time with --o1 off). Validated on
+        /// Qwen3-0.6B: all-layer conversion ×1.177 ppl zero-shot.
+        #[arg(long)]
+        o1: Option<String>,
+        /// Landmark budget for the --o1 hint (validated default 32)
+        #[arg(long)]
+        o1_m: Option<usize>,
+        /// Exact-window width for the --o1 hint (validated default 128)
+        #[arg(long)]
+        o1_window: Option<usize>,
+        /// Permanent exact sink keys for the --o1 hint (validated default 4)
+        #[arg(long)]
+        o1_sink: Option<usize>,
     },
     /// Import a GGUF model to .cmf — native Rust (F32/F16/BF16/Q4_0..Q6_K + K-quants; llama/qwen2/qwen3)
     ImportGguf {
@@ -213,6 +262,20 @@ enum Commands {
         /// prefix + its skill before this prompt (bit-identical warm state).
         #[arg(long)]
         state: Option<String>,
+        /// O(1) Nyström attention: replace KV-cache attention on the
+        /// given layers (all | deepN | i,j,k | off). Overrides CMF_O1
+        /// and the file's converter hint.
+        #[arg(long)]
+        o1: Option<String>,
+        /// Landmark budget for --o1 (validated default 32)
+        #[arg(long)]
+        o1_m: Option<usize>,
+        /// Exact-window width for --o1 (validated default 128)
+        #[arg(long)]
+        o1_window: Option<usize>,
+        /// Permanent exact sink keys for --o1 (validated default 4)
+        #[arg(long)]
+        o1_sink: Option<usize>,
     },
     /// Freeze the current context into a `.cmfstate` (B2): the token prefix
     /// + active skill + seed + model fingerprint. Resume with `run --state`.
@@ -255,6 +318,20 @@ enum Commands {
         /// linear core (spec §2, vmf_phase)
         #[arg(long)]
         ctx: Option<usize>,
+        /// O(1) Nyström attention: replace KV-cache attention on the
+        /// given layers (all | deepN | i,j,k | off). Overrides CMF_O1
+        /// and the file's converter hint.
+        #[arg(long)]
+        o1: Option<String>,
+        /// Landmark budget for --o1 (validated default 32)
+        #[arg(long)]
+        o1_m: Option<usize>,
+        /// Exact-window width for --o1 (validated default 128)
+        #[arg(long)]
+        o1_window: Option<usize>,
+        /// Permanent exact sink keys for --o1 (validated default 4)
+        #[arg(long)]
+        o1_sink: Option<usize>,
     },
     /// Score skills for a prompt (recon-argmin routing, spec 9)
     Route {
@@ -353,10 +430,41 @@ async fn main() -> anyhow::Result<()> {
             host,
             task,
             compat_port,
-        } => cmd_serve(&model, &host, port, &task, compat_port).await,
-        Commands::Convert { model, quant, output, hf_token, mean_bits, defrag } => {
+            o1,
+            o1_m,
+            o1_window,
+            o1_sink,
+        } => {
+            let o1 = O1Flags { spec: o1, m: o1_m, w: o1_window, sink: o1_sink };
+            cmd_serve(&model, &host, port, &task, compat_port, &o1).await
+        }
+        Commands::Convert {
+            model, quant, output, hf_token, mean_bits, defrag,
+            o1, o1_m, o1_window, o1_sink,
+        } => {
             convert::set_vbit_mean_bits(mean_bits);
-            convert::run_convert(&model, &quant, &output, hf_token.as_deref(), defrag.as_deref(), |f| {
+            // --o1: record the runtime hint in header provenance; the
+            // weights pass through unchanged (this is metadata only).
+            let o1_hint = match o1.as_deref() {
+                None => None,
+                Some(spec) => {
+                    let cfg = cortiq_engine::nystrom::O1Cfg::from_spec(
+                        spec, o1_m, o1_window, o1_sink,
+                    )
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("--o1 {spec}: expected all | deepN | i,j,k")
+                    })?;
+                    println!(
+                        "o1 hint: layers {spec}, m={} w={} sink={} — weights unchanged; \
+                         serve/run/bench read the hint automatically (disable with --o1 off)",
+                        cfg.m, cfg.w, cfg.sink
+                    );
+                    Some(serde_json::json!({
+                        "layers": spec, "m": cfg.m, "w": cfg.w, "sink": cfg.sink,
+                    }))
+                }
+            };
+            convert::run_convert(&model, &quant, &output, hf_token.as_deref(), defrag.as_deref(), o1_hint, |f| {
                 println!("@PROGRESS {f:.4}");
             })?;
             println!("✓ wrote {output}");
@@ -382,10 +490,15 @@ async fn main() -> anyhow::Result<()> {
             trace,
             trace_json,
             state,
+            o1,
+            o1_m,
+            o1_window,
+            o1_sink,
         } => {
+            let o1 = O1Flags { spec: o1, m: o1_m, w: o1_window, sink: o1_sink };
             cmd_run(&model, &task, prompt.as_deref(), max_tokens, skill.as_deref(), greedy,
                     blend.as_deref(), route_dynamic, confidence, trace, trace_json,
-                    state.as_deref())
+                    state.as_deref(), &o1)
             .await
         }
         Commands::Freeze { model, prompt, out, skill } => {
@@ -408,7 +521,14 @@ async fn main() -> anyhow::Result<()> {
             task,
             tokens,
             ctx,
-        } => cmd_bench(&model, &task, tokens, ctx).await,
+            o1,
+            o1_m,
+            o1_window,
+            o1_sink,
+        } => {
+            let o1 = O1Flags { spec: o1, m: o1_m, w: o1_window, sink: o1_sink };
+            cmd_bench(&model, &task, tokens, ctx, &o1).await
+        }
         Commands::Verify { model } => cmd_verify(&model).await,
     }
 }
@@ -419,6 +539,7 @@ async fn cmd_serve(
     port: u16,
     default_task: &str,
     _compat_port: Option<u16>,
+    o1: &O1Flags,
 ) -> anyhow::Result<()> {
     println!();
     println!("  ╔═══════════════════════════════════════╗");
@@ -437,7 +558,11 @@ async fn cmd_serve(
     println!("    Quantization: {:?}", model.header.quant_type);
     println!("    Masks: {}", model.masks.masks.len());
 
-    let pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
+    let mut pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
+    o1.apply(&mut pipeline);
+    if pipeline.o1_active() {
+        println!("    O(1) attention: nystrom (see load log for layers/params)");
+    }
     println!("    Pipeline: loaded ({:.2}B params)", model.total_param_count() as f64 / 1e9);
     println!();
 
@@ -866,6 +991,7 @@ async fn cmd_run(
     trace: bool,
     trace_json: bool,
     state: Option<&str>,
+    o1: &O1Flags,
 ) -> anyhow::Result<()> {
     println!("Loading model: {}", model_path);
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
@@ -925,6 +1051,7 @@ async fn cmd_run(
         }
         None => Pipeline::from_model_with_skill(&model, sampler, skill.as_deref())?,
     };
+    o1.apply(&mut pipeline);
     if route_dynamic {
         if skill.is_some() || blend.is_some() {
             println!(
@@ -1450,6 +1577,7 @@ async fn cmd_bench(
     task: &str,
     tokens: u32,
     ctx: Option<usize>,
+    o1: &O1Flags,
 ) -> anyhow::Result<()> {
     println!("Benchmark: {} | task={} | tokens={}", model_path, task, tokens);
     if let Some(n) = ctx {
@@ -1470,6 +1598,10 @@ async fn cmd_bench(
             ..Default::default()
         },
     )?;
+    o1.apply(&mut pipeline);
+    if pipeline.o1_active() {
+        println!("  O(1):    nystrom attention on (KV replaced on flagged layers)");
+    }
     let runtime = CortiqRuntime::new(model);
     if runtime.masks().get(task).is_some() {
         let _ = runtime.switch_task(task).await;
@@ -1509,38 +1641,87 @@ async fn cmd_bench(
         .map_err(|e| anyhow::anyhow!(e))?;
     let prefill_s = t0.elapsed().as_secs_f64();
 
-    // Pair-fusion micro-bench: the memory-traffic win MTP verify rides on.
-    let (singles_ms, pair_ms) = pipeline.measure_pair_fusion(8);
+    // Pair-fusion micro-bench: the memory-traffic win MTP verify rides
+    // on. Skipped under o1 — forward_pair appends into the (sealed,
+    // emptied) cache, so its numbers would be meaningless there.
+    let (singles_ms, pair_ms) = if pipeline.o1_active() {
+        (0.0, 0.0)
+    } else {
+        pipeline.measure_pair_fusion(8)
+    };
 
-    // Decode benchmark.
+    // Decode benchmark. Steady-state decode speed comes from the
+    // inter-token timestamps: generation's own prefill (fused pairs; +
+    // the one-off o1 seal) differs from the timed forward_ids prefill
+    // above, so deriving decode by subtraction billed that difference
+    // to the decode line — wrong for both arms, worst at long ctx.
+    let stamps: Arc<std::sync::Mutex<Vec<std::time::Instant>>> = Arc::default();
+    let st = stamps.clone();
+    let cb: cortiq_engine::TokenCallback = Box::new(move |_tok| {
+        st.lock().unwrap().push(std::time::Instant::now());
+        true
+    });
     let t1 = std::time::Instant::now();
     let result = pipeline
-        .generate_from_ids(&prompt_ids, tokens as usize, mask.as_ref(), None)
+        .generate_from_ids(&prompt_ids, tokens as usize, mask.as_ref(), Some(cb))
         .map_err(|e| anyhow::anyhow!(e))?;
     let total_s = t1.elapsed().as_secs_f64();
 
     println!("  Prompt:  {} tokens | prefill {:.1} tok/s", prompt_ids.len(), prompt_ids.len() as f64 / prefill_s.max(1e-9));
-    let decode_s = (total_s - prefill_s).max(1e-9);
+    let stamps = stamps.lock().unwrap();
+    // stamp[0] fires right after generation's prefill (the first token
+    // is sampled from the prefill hidden, no decode forward yet).
+    let decode_tps = if stamps.len() >= 2 {
+        (stamps.len() - 1) as f64
+            / (stamps[stamps.len() - 1] - stamps[0]).as_secs_f64().max(1e-9)
+    } else {
+        0.0
+    };
+    let ttft_s = stamps
+        .first()
+        .map(|s| s.duration_since(t1).as_secs_f64())
+        .unwrap_or(0.0);
     println!(
-        "  Decode:  {} tokens | {:.1} tok/s pure ({:.1} incl. prefill)",
+        "  Decode:  {} tokens | {:.1} tok/s steady (TTFT {:.2}s, {:.1} incl. prefill)",
         result.tokens_generated,
-        result.tokens_generated as f64 / decode_s,
+        decode_tps,
+        ttft_s,
         result.tokens_generated as f64 / total_s.max(1e-9)
     );
-    println!(
-        "  Pair:    2 singles {:.2} ms vs fused {:.2} ms (×{:.2} cheaper second lane)",
-        singles_ms,
-        pair_ms,
-        singles_ms / pair_ms.max(1e-9)
-    );
+    if pair_ms > 0.0 {
+        println!(
+            "  Pair:    2 singles {:.2} ms vs fused {:.2} ms (×{:.2} cheaper second lane)",
+            singles_ms,
+            pair_ms,
+            singles_ms / pair_ms.max(1e-9)
+        );
+    }
     // KV/state residency at the end of the run: full-attention layers
-    // grow O(context); the linear core (vmf_phase/GDN) holds an O(1)
-    // state — this line is the long-context memory claim, measured.
-    println!(
-        "  Memory:  KV+state {:.1} MB at seq_len {}",
-        pipeline.kv_cache.total_memory_bytes() as f64 / 1e6,
-        pipeline.kv_cache.seq_len()
-    );
+    // grow O(context); the linear core (vmf_phase/GDN) and the nystrom
+    // override hold O(1) state — this line is the long-context memory
+    // claim, measured.
+    let total_mem = pipeline.kv_cache.total_memory_bytes();
+    let nystrom_mem: usize = pipeline
+        .kv_cache
+        .layers
+        .iter()
+        .map(|l| l.o1_memory_bytes())
+        .sum();
+    if nystrom_mem > 0 {
+        println!(
+            "  Memory:  KV+state {:.1} MB (exact KV {:.1} MB + nystrom state {:.1} MB) at seq_len {}",
+            total_mem as f64 / 1e6,
+            (total_mem - nystrom_mem) as f64 / 1e6,
+            nystrom_mem as f64 / 1e6,
+            pipeline.kv_cache.seq_len()
+        );
+    } else {
+        println!(
+            "  Memory:  KV+state {:.1} MB at seq_len {}",
+            total_mem as f64 / 1e6,
+            pipeline.kv_cache.seq_len()
+        );
+    }
     if result.mtp_drafted > 0 {
         println!(
             "  MTP:     drafted {} | accepted {} ({:.0}%)",
