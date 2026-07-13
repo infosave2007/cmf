@@ -447,7 +447,9 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// this runs once per prefill on an m×m matrix (m ≤ 32).  If Cholesky
 /// fails (Au numerically singular despite the m_eff clamp), λ grows
 /// tenfold — the jitter fallback of the reference probe.
-fn ridge_pinv(a: &[f64], n: usize) -> Vec<f64> {
+/// pub(crate): the FCD polish trainer builds its (constant-in-backward)
+/// mixing matrix with the SAME solver the runtime seals with.
+pub(crate) fn ridge_pinv(a: &[f64], n: usize) -> Vec<f64> {
     let mut ata = vec![0.0f64; n * n];
     for i in 0..n {
         for j in 0..n {

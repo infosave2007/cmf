@@ -409,6 +409,72 @@ enum Commands {
         /// Path to .cmf model file
         model: String,
     },
+    /// FCD polish for O(1)-converted models: train the converted
+    /// layers' LN gains + FFN against the exact-attention teacher
+    /// (0.3·CE + 0.7·KL certified recipe), restore the best checkpoint,
+    /// write `<model>.fcd.cmf` (docs/RUST_FCD.md)
+    Fcd {
+        /// Path to .cmf model file
+        model: String,
+        /// Plain-text training corpus (tokenized with the embedded tokenizer)
+        #[arg(long)]
+        corpus: String,
+        /// Separate validation text (default: hold out the corpus tail)
+        #[arg(long)]
+        val_corpus: Option<String>,
+        /// Layers to convert+polish: all | deepN | i,j,k (default: the
+        /// file's converter hint, else all)
+        #[arg(long)]
+        o1: Option<String>,
+        /// Landmark budget (validated default 32)
+        #[arg(long)]
+        o1_m: Option<usize>,
+        /// Exact-window width (validated default 128)
+        #[arg(long)]
+        o1_window: Option<usize>,
+        /// Permanent exact sink keys (validated default 4)
+        #[arg(long)]
+        o1_sink: Option<usize>,
+        /// Training steps (certified: 300, best at 150)
+        #[arg(long, default_value_t = 300)]
+        steps: usize,
+        /// AdamW learning rate
+        #[arg(long, default_value_t = 5e-5)]
+        lr: f64,
+        /// KL(teacher‖student) weight in the loss
+        #[arg(long, default_value_t = 0.7)]
+        kl: f64,
+        /// Quick-val cadence (steps)
+        #[arg(long, default_value_t = 25)]
+        eval_every: usize,
+        /// Sequences per step
+        #[arg(long, default_value_t = 2)]
+        bs: usize,
+        /// Window length in tokens
+        #[arg(long, default_value_t = 512)]
+        seq: usize,
+        /// Output path (default: <model>.fcd.cmf)
+        #[arg(long)]
+        out: Option<String>,
+        /// Run 3 greedy 400-token-prompt generations through the REAL
+        /// streaming O(1) runtime before and after the polish (the loop
+        /// gate)
+        #[arg(long, default_value_t = false)]
+        gen_check: bool,
+        /// Generation-gated checkpoint selection (Patent 16 draft,
+        /// claim 13): only checkpoints whose greedy generations stay
+        /// under the loop-score gate are eligible for restore; if none
+        /// passes, the zero-shot state is written (identity polish).
+        /// Defaults ON when --gen-check is on.
+        #[arg(long, default_value_t = false)]
+        gen_gate: bool,
+        /// Gate: max loop score per prompt (checkpoint fails above)
+        #[arg(long, default_value_t = 0.35)]
+        gate_threshold: f64,
+        /// Gate: max loop-score increase over the zero-shot baseline
+        #[arg(long, default_value_t = 0.10)]
+        gate_slack: f64,
+    },
 }
 
 #[tokio::main]
@@ -530,6 +596,45 @@ async fn main() -> anyhow::Result<()> {
             cmd_bench(&model, &task, tokens, ctx, &o1).await
         }
         Commands::Verify { model } => cmd_verify(&model).await,
+        Commands::Fcd {
+            model,
+            corpus,
+            val_corpus,
+            o1,
+            o1_m,
+            o1_window,
+            o1_sink,
+            steps,
+            lr,
+            kl,
+            eval_every,
+            bs,
+            seq,
+            out,
+            gen_check,
+            gen_gate,
+            gate_threshold,
+            gate_slack,
+        } => cmd_fcd(
+            &model,
+            &corpus,
+            val_corpus.as_deref(),
+            o1.as_deref(),
+            o1_m,
+            o1_window,
+            o1_sink,
+            steps,
+            lr,
+            kl,
+            eval_every,
+            bs,
+            seq,
+            out.as_deref(),
+            gen_check,
+            gen_gate,
+            gate_threshold,
+            gate_slack,
+        ),
     }
 }
 
@@ -629,6 +734,189 @@ fn parse_blend(spec: &str) -> anyhow::Result<Vec<(String, f32)>> {
         *w /= sum.max(1e-9);
     }
     Ok(out)
+}
+
+/// Char caps for the FCD corpus — the certified recipe tokenized the
+/// first 2M train / 200K val chars of wikitext-2-raw.
+const FCD_TRAIN_CHARS: usize = 2_000_000;
+const FCD_VAL_CHARS: usize = 200_000;
+
+/// Three greedy generations from 400-token val prompts through the
+/// REAL streaming O(1) runtime (the loop gate of the torch reference:
+/// offsets L/10, L/2, 8L/10 of the val stream).
+fn fcd_gen_check(
+    model: &Arc<CmfModel>,
+    o1: &cortiq_engine::nystrom::O1Cfg,
+    va: &[u32],
+    tag: &str,
+) -> anyhow::Result<()> {
+    let greedy = SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        repetition_penalty: 1.0,
+        min_p: 0.0,
+        seed: Some(0),
+    };
+    let mut pipeline = Pipeline::from_model(model, greedy)?;
+    pipeline.set_o1(Some(o1.clone()));
+    let l = va.len().saturating_sub(500);
+    if l < 400 {
+        println!("gen-check {tag}: val stream too short, skipped");
+        return Ok(());
+    }
+    for off in [l / 10, l / 2, 8 * l / 10] {
+        let prompt = &va[off..off + 400];
+        let r = pipeline
+            .generate_from_ids(prompt, 60, None, None)
+            .map_err(|e| anyhow::anyhow!("generation: {e}"))?;
+        println!(
+            "GEN {tag} (off {off}, loop-score {:.2}): {}",
+            cortiq_engine::fcd::loop_score(&r.token_ids),
+            r.text.replace('\n', "\\n")
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_fcd(
+    model_path: &str,
+    corpus: &str,
+    val_corpus: Option<&str>,
+    o1: Option<&str>,
+    o1_m: Option<usize>,
+    o1_w: Option<usize>,
+    o1_sink: Option<usize>,
+    steps: usize,
+    lr: f64,
+    kl: f64,
+    eval_every: usize,
+    bs: usize,
+    seq: usize,
+    out: Option<&str>,
+    gen_check: bool,
+    gen_gate: bool,
+    gate_threshold: f64,
+    gate_slack: f64,
+) -> anyhow::Result<()> {
+    use cortiq_engine::fcd::{run_polish, FcdHyper, GenGateCfg};
+    use cortiq_engine::nystrom::O1Cfg;
+
+    let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    // Layer set: explicit flag > file converter hint > all.
+    let cfg = match o1 {
+        Some(spec) => O1Cfg::from_spec(spec, o1_m, o1_w, o1_sink).ok_or_else(|| {
+            anyhow::anyhow!("--o1 '{spec}' is off or malformed — nothing to polish")
+        })?,
+        None => model
+            .header
+            .provenance
+            .as_ref()
+            .and_then(|p| p.get("o1_attn"))
+            .and_then(O1Cfg::from_json)
+            .or_else(|| O1Cfg::from_spec("all", o1_m, o1_w, o1_sink))
+            .expect("'all' always parses"),
+    };
+
+    // Tokenizer: embedded → sidecar. No byte-level fallback here — the
+    // polish must train on the model's true token ids.
+    let tokenizer = if let Some(vb) = &model.vocab {
+        cortiq_engine::tokenizer::Tokenizer::from_bytes(vb)
+            .map_err(|e| anyhow::anyhow!("embedded tokenizer: {e}"))?
+    } else {
+        let sidecar = std::path::Path::new(model_path).with_file_name("tokenizer.json");
+        anyhow::ensure!(
+            sidecar.exists(),
+            "no tokenizer in the file or beside it — cannot tokenize the corpus"
+        );
+        cortiq_engine::tokenizer::Tokenizer::from_file(&sidecar)
+            .map_err(|e| anyhow::anyhow!("sidecar tokenizer: {e}"))?
+    };
+
+    let cap = |s: String, n: usize| -> String {
+        if s.len() > n {
+            let mut end = n;
+            while !s.is_char_boundary(end) {
+                end += 1;
+            }
+            s[..end].to_string()
+        } else {
+            s
+        }
+    };
+    let train_text = cap(std::fs::read_to_string(corpus)?, FCD_TRAIN_CHARS);
+    println!("tokenizing corpus ({} chars)…", train_text.len());
+    let mut tr = tokenizer.encode(&train_text);
+    let va: Vec<u32> = match val_corpus {
+        Some(p) => {
+            let vt = cap(std::fs::read_to_string(p)?, FCD_VAL_CHARS);
+            tokenizer.encode(&vt)
+        }
+        None => {
+            // Hold out the corpus tail (never sampled for training).
+            let cut = tr.len() - tr.len() / 10;
+            tr.split_off(cut)
+        }
+    };
+    println!("corpus: train {} tokens, val {} tokens", tr.len(), va.len());
+
+    if gen_check {
+        println!("── gen-check BEFORE polish (zero-shot O(1)) ──");
+        fcd_gen_check(&model, &cfg, &va, "before")?;
+    }
+
+    let hp = FcdHyper { steps, lr, kl_w: kl, eval_every, bs, seq, seed: 0 };
+    let out_path = out
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("{model_path}.fcd.cmf")));
+    // Gate default: on whenever --gen-check is on (claim 13 discipline).
+    let gate_cfg = (gen_gate || gen_check)
+        .then(|| GenGateCfg::standard(&va))
+        .flatten()
+        .map(|mut g| {
+            g.threshold = gate_threshold;
+            g.baseline_slack = gate_slack;
+            g
+        });
+    let report = run_polish(&model, &cfg, &hp, &tr, &va, &out_path, gate_cfg.as_ref())
+        .map_err(|e| anyhow::anyhow!("fcd polish: {e}"))?;
+
+    println!("── FCD polish report ──");
+    println!("converted layers : {:?}", report.converted);
+    println!("teacher val-ppl  : {:.2}", report.teacher_ppl);
+    println!("student ppl start: {:.2} (zero-shot O(1))", report.ppl_start);
+    println!(
+        "student ppl best : {:.2} (step {}), final {:.2}",
+        report.ppl_best, report.best_step, report.ppl_final
+    );
+    println!(
+        "steps            : {} ({:.1}s/step)",
+        report.steps_run, report.sec_per_step
+    );
+    if let Some(gr) = &report.gate {
+        println!("gen-gate baseline: {:?}", gr.baseline);
+        for (st, ppl, scores, pass) in &gr.evals {
+            println!(
+                "gen-gate step {st}: ppl {ppl:.2} scores {scores:?} → {}",
+                if *pass { "PASS" } else { "FAIL" }
+            );
+        }
+        match gr.chosen {
+            Some(st) => println!("gen-gate chose   : step {st}"),
+            None => println!("gen-gate chose   : IDENTITY (polish rejected)"),
+        }
+    }
+    println!("wrote            : {}", out_path.display());
+
+    if gen_check {
+        println!("── gen-check AFTER polish (streaming O(1) runtime) ──");
+        let polished = Arc::new(CmfModel::open_sharded(
+            out_path.to_str().unwrap_or_default(),
+        )?);
+        fcd_gen_check(&polished, &cfg, &va, "after")?;
+    }
+    Ok(())
 }
 
 fn cmd_ppl(

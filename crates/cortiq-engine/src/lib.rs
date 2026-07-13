@@ -1,6 +1,8 @@
 //! Cortiq inference engine — sparse forward pass, attention, tokenization, sampling.
 
 pub mod attention;
+pub mod fcd;
+pub mod fcd_ops;
 pub mod gpu;
 #[cfg(target_os = "macos")]
 pub mod gpu_metal;
