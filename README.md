@@ -123,6 +123,47 @@ cortiq run model.cmf --prompt "Write a haiku about memory-mapped files." --greed
 cortiq run model.cmf --prompt "SELECT ..." --skill sql
 ```
 
+### Constant-memory attention — O(1) conversion
+
+Convert softmax attention layers to a constant-memory streaming operator
+(exact sink anchors + exact ring window + landmark far field under one
+softmax denominator). Weights stay **byte-identical** — the flag only records
+a hint; conversion is instant. Measured on a 0.6B model at 4096-token
+context: decode ×3.5 faster, attention memory 954 → 85 MB **constant**:
+
+```sh
+# Record the O(1) hint at convert time (all layers, or deepN, or an explicit list)
+cortiq convert --model Qwen/Qwen3-0.6B --quant q8 --o1 all    --output model.cmf
+cortiq convert --model Qwen/Qwen3-0.6B --quant q8 --o1 deep12 --output model.cmf
+
+# run / serve / bench pick the hint up automatically…
+cortiq run model.cmf --prompt "Summarize this long document: ..." 
+
+# …or control it at load time without reconverting
+cortiq run   model.cmf --o1 all            # force-convert every softmax layer
+cortiq run   model.cmf --o1 off            # back to exact attention
+cortiq bench model.cmf --ctx 4096          # memory + tok/s, with vs without: use --o1
+CMF_O1=deep6 cortiq serve model.cmf        # env override, same spec syntax
+
+# Tuning knobs (validated defaults: 32 landmarks, window 128, 4 sink keys)
+cortiq run model.cmf --o1 all --o1-m 32 --o1-window 128 --o1-sink 4
+```
+
+Optional quality polish — a bounded, native training pass (**no Python, no
+ML framework**) that tunes only the converted layers' norm/FFN tensors
+against the same model running exact attention (KL-anchored), and only keeps
+a checkpoint if long-context generation stays loop-free:
+
+```sh
+cortiq fcd model.cmf --corpus corpus.txt --gen-check --gen-gate --out model.fcd.cmf
+# knobs: --steps 300 --eval-every 25 --kl 0.7 --lr 5e-5 --o1 all|deepN|i,j,k
+#        --val-corpus val.txt --gate-threshold 0.35 --gate-slack 0.10
+```
+
+On hybrid models (e.g. qwen3.5: GatedDeltaNet + softmax islands) `--o1 all`
+converts just the softmax layers — the whole model's attention state becomes
+constant in context length.
+
 ## Container layout
 
 ```
@@ -164,8 +205,8 @@ A reader addresses sections **only** through the envelope — never by assuming 
 - Optional multi-token-prediction (MTP) head and mixture-of-experts (MoE) FFN layers.
 - Sharding: a model split across `N` standalone-valid `.cmf` files.
 - Dependency-free Rust runtime on **CPU and GPU** (optional `gpu` feature: wgpu → Vulkan / DX12 / Metal).
-- **O(1) streaming attention conversion** (`cortiq convert --o1`): replaces softmax attention of a pretrained model with a constant-memory sink/window/landmark operator — weights byte-identical, conversion in seconds; at 4096-token context: decode ×3.5 faster at ÷11 attention memory (85 MB constant), measured on an M4 CPU.
-- **Native restoration trainer** (`cortiq fcd`): bounded KL-to-teacher polish of the converted layers' norm/FFN tensors with generation-gated checkpoint selection — no ML framework, same single binary.
+- **O(1) attention conversion** (`--o1`): constant-memory streaming attention for any converted layer — weights byte-identical, KV cache released after prefill.
+- **Native restoration trainer** (`cortiq fcd`): KL-to-teacher polish with generation-gated checkpoint selection, no ML framework.
 - Reference implementations in Rust (reader + runtime) and Python (writer + a stdlib+numpy reader).
 
 ## Format overview
