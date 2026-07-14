@@ -1,0 +1,34 @@
+# Publish the workspace crates to crates.io in dependency order.
+# Manual trigger: Actions → "publish crates" → Run workflow.
+# Each `cargo publish` is tolerant of the version already existing on the
+# registry, so re-runs after a partial publish are safe.
+name: publish crates
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish (core → engine → server → cli)
+        run: |
+          set -e
+          for c in cortiq-core cortiq-engine cortiq-server cortiq-cli; do
+            echo "── publishing $c ──"
+            if cargo publish -p "$c" 2>err.log; then
+              echo "$c published"
+            elif grep -qiE "already (exists|uploaded)|crate version .* is already" err.log; then
+              echo "$c: version already on crates.io — skipping"
+            else
+              cat err.log
+              exit 1
+            fi
+          done
