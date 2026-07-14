@@ -250,3 +250,4 @@ docs/             format specification and comparison
 Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE).
 
 This software implements methods that are the subject of four United States patent applications; details are in [PATENTS.md](PATENTS.md). The Apache-2.0 Section 3 patent grant applies to those three referenced applications, giving every user a royalty-free license to the patent claims necessarily infringed by this software as distributed.
+
