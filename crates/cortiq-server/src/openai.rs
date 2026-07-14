@@ -161,9 +161,30 @@ struct ChatCompletionsRequest {
     max_tokens: u32,
     #[serde(default)]
     stream: bool,
+    /// Reasoning-model switch: `false` renders the chat template with
+    /// `enable_thinking=false` (e.g. Qwen3/3.5 prefill an empty <think> block,
+    /// so the model answers directly). Absent = the template's default.
+    #[serde(default)]
+    enable_thinking: Option<bool>,
+    /// vLLM-style alternative: {"enable_thinking": false} — the explicit
+    /// top-level field above wins when both are present.
+    #[serde(default)]
+    chat_template_kwargs: Option<serde_json::Value>,
     /// Cortiq extension: task routing
     #[serde(default)]
     cortiq: Option<CortiqExtension>,
+}
+
+impl ChatCompletionsRequest {
+    /// Effective enable_thinking: top-level field, else chat_template_kwargs.
+    fn thinking(&self) -> Option<bool> {
+        self.enable_thinking.or_else(|| {
+            self.chat_template_kwargs
+                .as_ref()
+                .and_then(|k| k.get("enable_thinking"))
+                .and_then(|v| v.as_bool())
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -208,7 +229,7 @@ async fn chat_completions(
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))
             .collect();
-        p.tokenizer.apply_chat_template(&msgs)
+        p.tokenizer.apply_chat_template_opts(&msgs, req.thinking())
     };
 
     let request_id = format!("cmf-{}", uuid::Uuid::new_v4());

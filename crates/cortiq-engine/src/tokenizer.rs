@@ -619,8 +619,20 @@ impl Tokenizer {
     /// trim_blocks + lstrip_blocks + loop controls) and encode it.
     /// Falls back to hardcoded ChatML when the file carries none.
     pub fn apply_chat_template(&self, messages: &[(String, String)]) -> Vec<u32> {
+        self.apply_chat_template_opts(messages, None)
+    }
+
+    /// Like `apply_chat_template`, with an explicit `enable_thinking` value for
+    /// reasoning-model templates (Qwen3/3.5 emit an empty <think> block when it
+    /// is false, so the model answers directly). `None` leaves the variable
+    /// undefined — the template's own default applies.
+    pub fn apply_chat_template_opts(
+        &self,
+        messages: &[(String, String)],
+        enable_thinking: Option<bool>,
+    ) -> Vec<u32> {
         if let Some(tpl) = &self.chat_template {
-            match self.render_template(tpl, messages) {
+            match self.render_template(tpl, messages, enable_thinking) {
                 Ok(text) => return self.with_bos(self.encode(&text)),
                 Err(e) => {
                     tracing::error!("chat template render failed ({e}); ChatML fallback");
@@ -645,7 +657,7 @@ impl Tokenizer {
     /// Render the carried template to text (parity-testable surface).
     pub fn render_chat(&self, messages: &[(String, String)]) -> Option<String> {
         let tpl = self.chat_template.as_ref()?;
-        match self.render_template(tpl, messages) {
+        match self.render_template(tpl, messages, None) {
             Ok(t) => Some(t),
             Err(e) => {
                 tracing::error!("chat template render: {e:#}");
@@ -658,6 +670,7 @@ impl Tokenizer {
         &self,
         tpl: &str,
         messages: &[(String, String)],
+        enable_thinking: Option<bool>,
     ) -> Result<String, minijinja::Error> {
         let mut env = minijinja::Environment::new();
         env.set_trim_blocks(true);
@@ -671,10 +684,19 @@ impl Tokenizer {
                 minijinja::context! { role => role, content => content }
             })
             .collect();
-        env.get_template("chat")?.render(minijinja::context! {
-            messages => msgs,
-            add_generation_prompt => true,
-        })
+        // `enable_thinking` stays UNDEFINED when None — reasoning templates
+        // check `enable_thinking is defined` and fall back to their default.
+        match enable_thinking {
+            Some(v) => env.get_template("chat")?.render(minijinja::context! {
+                messages => msgs,
+                add_generation_prompt => true,
+                enable_thinking => v,
+            }),
+            None => env.get_template("chat")?.render(minijinja::context! {
+                messages => msgs,
+                add_generation_prompt => true,
+            }),
+        }
     }
 
     /// Hardcoded Qwen ChatML (pre-§6.1 files).
