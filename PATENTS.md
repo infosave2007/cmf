@@ -9,6 +9,7 @@ Urevich Kirichenko:
 | 1 | 19/452,440 | January 19, 2026 | Resonance Routing (unsupervised task selection by reconstruction-error minimization) |
 | 2 | 19/452,464 | January 19, 2026 | Dynamic Task-Guided Mask Activation (DTG-MA) Compression |
 | 3 | 19/731,402 | July 6, 2026 | Unified Execution Architecture for Serving a Plurality of Specialized Language Models from a Single Shared Backbone via Dynamically Overlaid Compressed Delta Representations Without Materializing Separate Models |
+| 4 | 19/738,763 | July 13, 2026 | Training-Free Constant-Memory Streaming Attention Conversion |
 
 Where these methods appear in this repository:
 
@@ -22,6 +23,11 @@ Where these methods appear in this repository:
   tensors + byte-offset delta index) and the dependency-free overlay runtime
   that reads replacement tensors *in place of* the backbone at forward time
   without materializing a per-skill model.
+- **Streaming Attention Conversion (App. 19/738,763)** — the training-free
+  O(1) attention path: `cortiq convert --o1` (weights byte-identical), the
+  streaming sink/window/landmark-skeleton kernel with delayed insertion and
+  a single joint denominator (`nystrom.rs`, runtime seal that releases the
+  KV cache), and the generation-gated `cortiq fcd` restoration stage.
 
 ## Patent grant
 

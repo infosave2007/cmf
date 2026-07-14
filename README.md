@@ -164,6 +164,8 @@ A reader addresses sections **only** through the envelope — never by assuming 
 - Optional multi-token-prediction (MTP) head and mixture-of-experts (MoE) FFN layers.
 - Sharding: a model split across `N` standalone-valid `.cmf` files.
 - Dependency-free Rust runtime on **CPU and GPU** (optional `gpu` feature: wgpu → Vulkan / DX12 / Metal).
+- **O(1) streaming attention conversion** (`cortiq convert --o1`): replaces softmax attention of a pretrained model with a constant-memory sink/window/landmark operator — weights byte-identical, conversion in seconds; at 4096-token context: decode ×3.5 faster at ÷11 attention memory (85 MB constant), measured on an M4 CPU.
+- **Native restoration trainer** (`cortiq fcd`): bounded KL-to-teacher polish of the converted layers' norm/FFN tensors with generation-gated checkpoint selection — no ML framework, same single binary.
 - Reference implementations in Rust (reader + runtime) and Python (writer + a stdlib+numpy reader).
 
 ## Format overview
@@ -206,4 +208,4 @@ docs/             format specification and comparison
 
 Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE).
 
-This software implements methods that are the subject of three United States patent applications; details are in [PATENTS.md](PATENTS.md). The Apache-2.0 Section 3 patent grant applies to those three referenced applications, giving every user a royalty-free license to the patent claims necessarily infringed by this software as distributed.
+This software implements methods that are the subject of four United States patent applications; details are in [PATENTS.md](PATENTS.md). The Apache-2.0 Section 3 patent grant applies to those three referenced applications, giving every user a royalty-free license to the patent claims necessarily infringed by this software as distributed.
