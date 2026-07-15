@@ -60,6 +60,7 @@ pub enum O1State {
         m: usize,
         w: usize,
         sink: usize,
+        rect: crate::nystrom::O1Rect,
         /// Rotated post-norm queries, `[pos × num_heads × head_dim]`.
         q_buf: Vec<f32>,
     },
@@ -127,8 +128,8 @@ impl LayerKvCache {
     // ── O(1) Nyström override ──
 
     /// Arm query collection for a fresh prompt pass (a cleared cache).
-    pub fn o1_begin(&mut self, m: usize, w: usize, sink: usize) {
-        self.o1 = Some(O1State::Collecting { m, w, sink, q_buf: Vec::new() });
+    pub fn o1_begin(&mut self, m: usize, w: usize, sink: usize, rect: crate::nystrom::O1Rect) {
+        self.o1 = Some(O1State::Collecting { m, w, sink, rect, q_buf: Vec::new() });
     }
 
     /// Record one position's rotated queries (`[num_heads × head_dim]`)
@@ -155,7 +156,7 @@ impl LayerKvCache {
         if !matches!(self.o1, Some(O1State::Collecting { .. })) {
             return self.o1_sealed();
         }
-        let Some(O1State::Collecting { m, w, sink, q_buf }) = self.o1.take() else {
+        let Some(O1State::Collecting { m, w, sink, rect, q_buf }) = self.o1.take() else {
             unreachable!("checked above");
         };
         let (hd, t) = (self.head_dim, self.seq_len);
@@ -179,7 +180,7 @@ impl LayerKvCache {
                 let src = (p * num_heads + h) * hd;
                 qh[p * hd..(p + 1) * hd].copy_from_slice(&q_buf[src..src + hd]);
             }
-            let mut st = crate::nystrom::NystromState::new(m, w, sink);
+            let mut st = crate::nystrom::NystromState::new(m, w, sink).with_rect(rect);
             st.prefill(&qh, &self.k[g], &self.v[g], t, hd, hd);
             states.push(st);
         }

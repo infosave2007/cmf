@@ -104,6 +104,30 @@ impl Pool {
         self.txs.len()
     }
 
+    /// Run `f(row_start, row_end)` over `0..rows`, self-balancing.
+    ///
+    /// One dispatch, but workers pull row-ranges from a shared cursor
+    /// instead of each taking a fixed 1/n slice. On a heterogeneous CPU
+    /// (Apple Silicon: 4 P-cores + 6 E-cores here) a static split makes
+    /// every matvec end at the SLOWEST core's pace while the fast ones
+    /// idle at the latch; pulling by grain lets a P-core take several
+    /// chunks for each one an E-core takes, so skew collapses to a
+    /// single grain. Row ranges stay disjoint and each row's dot is
+    /// computed exactly as in the serial path → bit-identical output.
+    pub fn run_rows(&self, rows: usize, f: &(dyn Fn(usize, usize) + Sync)) {
+        // Enough chunks to balance, large enough to keep the SDOT inner
+        // loop and the hardware prefetcher in their stride.
+        let grain = (rows / (self.txs.len() * 8)).max(32);
+        let next = AtomicUsize::new(0);
+        self.run(&|_w, _n| loop {
+            let start = next.fetch_add(grain, Ordering::Relaxed);
+            if start >= rows {
+                break;
+            }
+            f(start, (start + grain).min(rows));
+        });
+    }
+
     /// Run `f(worker_idx, n_workers)` on every worker; blocks until all
     /// have finished.
     pub fn run(&self, f: &(dyn Fn(usize, usize) + Sync)) {

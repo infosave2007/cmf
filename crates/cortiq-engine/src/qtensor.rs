@@ -530,19 +530,11 @@ fn qmatmat(
     dispatch_rows(pool, rows, &run);
 }
 
-/// Split rows across pool workers (shared qmatvec pattern).
+/// Split rows across pool workers (shared qmatvec pattern). Self-balancing
+/// — see `Pool::run_rows` for why a static 1/n split is wrong here.
 fn dispatch_rows(pool: Option<&Pool>, rows: usize, run: &(dyn Fn(usize, usize) + Sync)) {
     match pool {
-        Some(pool) if rows >= 256 => {
-            pool.run(&|widx, n| {
-                let chunk = rows.div_ceil(n);
-                let start = widx * chunk;
-                let end = (start + chunk).min(rows);
-                if start < end {
-                    run(start, end);
-                }
-            });
-        }
+        Some(pool) if rows >= 256 => pool.run_rows(rows, run),
         _ => run(0, rows),
     }
 }
@@ -1280,13 +1272,7 @@ fn qmatvec(
             }
         };
         match pool {
-            Some(pool) if rows >= 256 => {
-                pool.run(&|widx, n| {
-                    let chunk = rows.div_ceil(n);
-                    let start = widx * chunk;
-                    run_range(start, (start + chunk).min(rows));
-                });
-            }
+            Some(pool) if rows >= 256 => pool.run_rows(rows, &run_range),
             _ => run_range(0, rows),
         }
         return;

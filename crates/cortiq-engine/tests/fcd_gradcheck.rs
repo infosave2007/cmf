@@ -230,10 +230,14 @@ fn gradcheck_nystrom_joint_head_frozen_mu() {
     // CONSTANT in backward — so the gradcheck freezes M in the FD
     // functional too (via the _mu hooks) and demands tight agreement.
     // This validates every OTHER far-field chain: Fu/E exponentials,
-    // the two skeleton matmuls, the clamp mask, the joint denominator,
-    // the c-shift invariance, and the landmark segment-mean scatter.
+    // the two skeleton matmuls, the aggregate guard's row gate, the
+    // joint denominator, the c-shift invariance, and the landmark
+    // segment-mean scatter into the prefix.
     let (t, d, dv) = (40usize, 6usize, 5usize);
-    let cfg = ops::NysCfg { m: 4, w: 8, sink: 2 };
+    // prefill=20 is the default (t/2) written out: it must stay above
+    // w+sink+8=18 or the kernel degenerates to exact attention and this
+    // test would silently stop covering the skeleton.
+    let cfg = ops::NysCfg { m: 4, w: 8, sink: 2, prefill: Some(20) };
     let mut q = synth(t * d, 20);
     let mut k = synth(t * d, 21);
     let mut v = synth(t * dv, 22);
@@ -272,7 +276,7 @@ fn gradcheck_nystrom_joint_head_full_functional() {
     // check documents the size of that intentional gap — it must be
     // moderate (the convention is workable), not tiny.
     let (t, d, dv) = (40usize, 6usize, 5usize);
-    let cfg = ops::NysCfg { m: 4, w: 8, sink: 2 };
+    let cfg = ops::NysCfg { m: 4, w: 8, sink: 2, prefill: Some(20) };
     let mut q = synth(t * d, 20);
     let mut k = synth(t * d, 21);
     let v = synth(t * dv, 22);
@@ -311,7 +315,7 @@ fn gradcheck_nystrom_near_only_tight() {
     let (t, d, dv) = (40usize, 6usize, 5usize);
     // w ≥ t → every key is near → joint == exact softmax path but still
     // goes through the skeleton-free branch of the SAME kernel code.
-    let cfg = ops::NysCfg { m: 4, w: 64, sink: 0 };
+    let cfg = ops::NysCfg { m: 4, w: 64, sink: 0, prefill: Some(20) };
     let mut q = synth(t * d, 24);
     let mut k = synth(t * d, 25);
     let v = synth(t * dv, 26);

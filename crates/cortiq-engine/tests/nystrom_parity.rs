@@ -1,8 +1,18 @@
 //! Nyström kernel golden parity: the f32 streaming kernel vs the
 //! validated fp64 matrix math (nystrom_ppl3_06b.py head_out, transposed
 //! to streaming semantics).  Fixture: tools/gen_nystrom_golden.py.
+//!
+//! These tests pin `O1Rect::Aggregate` DELIBERATELY, whatever the
+//! runtime default is.  The matrix reference rectifies per-(t, j);
+//! `Aggregate` is the streaming operator meant to track it, so it is the
+//! one this fixture can hold to account.  `Fm` is a deliberately
+//! different (strictly more conservative) operator — on this very
+//! fixture 34.6% of the FM entries are negative even though the probe's
+//! per-(t, j) clamp never fires, so FM outputs are EXPECTED to differ
+//! from the matrix math and are gated on end-to-end ppl instead
+//! (`fm_rect_is_nonnegative_far_mass` below covers its contract).
 
-use cortiq_engine::nystrom::NystromState;
+use cortiq_engine::nystrom::{NystromState, O1Rect};
 
 fn rows(v: &serde_json::Value) -> Vec<Vec<f32>> {
     v.as_array()
@@ -34,7 +44,7 @@ fn run_golden(sink: usize, out_key: &str) {
     let v = rows(&fx["v"]);
     let expect = rows(&fx[out_key]);
 
-    let mut st = NystromState::new(m, w, sink);
+    let mut st = NystromState::new(m, w, sink).with_rect(O1Rect::Aggregate);
     st.prefill(&flat(&q, 0..p), &flat(&k, 0..p), &flat(&v, 0..p), p, d, dv);
 
     let mut out = vec![0.0f32; dv];
@@ -73,13 +83,17 @@ fn nystrom_sink0_matches_legacy_golden() {
     run_golden(0, "out_sink0");
 }
 
-/// Deterministic pseudo-random f32 in [-1, 1] (LCG) — the short test
+/// Deterministic pseudo-random f32 in [-1, 1) (LCG) — the short test
 /// needs no fixture.
 struct Lcg(u64);
 impl Lcg {
     fn next_f32(&mut self) -> f32 {
         self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        ((self.0 >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        // >> 32 keeps 32 bits, so the ratio spans [0, 2) and the result
+        // is centred. (A >> 33 here yields [-1, 0): every component
+        // negative, hence q·k a large positive sum and near-rank-1 data
+        // — which silently defeats any adversarial-conditioning test.)
+        ((self.0 >> 32) as f32 / (1u64 << 31) as f32) - 1.0
     }
     fn vec(&mut self, n: usize) -> Vec<f32> {
         (0..n).map(|_| self.next_f32()).collect()
@@ -110,6 +124,75 @@ fn softmax_row(q: &[f32], ks: &[Vec<f32>], vs: &[Vec<f32>], upto: usize, dv: usi
         }
     }
     out
+}
+
+/// The FM rectifier's contract: every far weight is non-negative, so
+/// the joint row is a CONVEX combination of the causal values and each
+/// output component must land inside that value range. IID gaussian
+/// data is the adversarial regime for any Nyström skeleton (the probe's
+/// per-(t,j) clamp fires constantly here) — exactly where the aggregate
+/// guard is known to leak negative per-key mass, so it is the regime
+/// that separates the two operators.
+#[test]
+fn fm_rect_is_nonnegative_far_mass() {
+    let (d, dv, m, w, sink, t, p) =
+        (16usize, 4usize, 32usize, 16usize, 4usize, 320usize, 256usize);
+    let mut rng = Lcg(777);
+    // Scale 3 puts the landmark logits at the magnitude real post-RoPE
+    // heads reach; exp(Q̃K̃ᵀ/√d) is then violently ill-conditioned, M is
+    // strongly indefinite, and the skeleton estimates negative weights —
+    // the regime the whole rectifier question lives in.
+    let q: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(d).iter().map(|x| x * 3.0).collect()).collect();
+    let k: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(d).iter().map(|x| x * 3.0).collect()).collect();
+    // Values in [0, 2): a negative output component is then proof of
+    // negative weight mass, no bookkeeping needed.
+    let v: Vec<Vec<f32>> = (0..t)
+        .map(|_| rng.vec(dv).iter().map(|x| x + 1.0).collect())
+        .collect();
+
+    let fl = |rows: &[Vec<f32>], hi: usize| -> Vec<f32> {
+        rows[..hi].iter().flatten().copied().collect()
+    };
+    // All weights ≥ 0 ⇒ the row is a CONVEX combination of the causal
+    // values ⇒ every output component lands inside the value range.
+    // Negative weight mass breaks that bound in EITHER direction (an
+    // over-shoot above max(v) is the likelier witness: the near field
+    // keeps the sum positive while a negative far key inflates the
+    // complementary keys' share), so measure the worst excursion out of
+    // [min v, max v] rather than only the sign.
+    let (vlo, vhi) = v.iter().flatten().fold((f32::MAX, f32::MIN), |(a, b), &x| {
+        (a.min(x), b.max(x))
+    });
+    let run = |rect: O1Rect| -> f32 {
+        let mut st = NystromState::new(m, w, sink).with_rect(rect);
+        st.prefill(&fl(&q, p), &fl(&k, p), &fl(&v, p), p, d, dv);
+        let mut out = vec![0.0f32; dv];
+        let mut worst = 0.0f32; // worst distance outside [vlo, vhi]
+        for i in p..t {
+            st.step(&q[i], &k[i], &v[i], &mut out);
+            for &o in out.iter() {
+                worst = worst.max(vlo - o).max(o - vhi);
+            }
+        }
+        worst
+    };
+    let fm = run(O1Rect::Fm);
+    let agg = run(O1Rect::Aggregate);
+    println!(
+        "worst excursion outside v∈[{vlo:.3}, {vhi:.3}]: fm={fm:.4e} aggregate={agg:.4e}"
+    );
+    // FM: every weight ≥ 0 ⇒ the row cannot leave the value hull.
+    assert!(fm < 1e-3, "FM rect left the value hull by {fm:.3e} — negative far mass");
+    // …and the aggregate guard gives no such guarantee: it only inspects
+    // the row SUM, so per-key negative mass survives whenever the sum
+    // stays positive. If this ever stops holding, the fixture drifted out
+    // of the ill-conditioned regime and the assertion above went vacuous —
+    // fail loudly rather than keep a green test that proves nothing.
+    assert!(
+        agg > 1e-2,
+        "aggregate guard stayed inside the value hull ({agg:.3e}) — the regime is \
+         no longer adversarial, so the FM assertion above is vacuous"
+    );
 }
 
 #[test]

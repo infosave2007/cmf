@@ -526,12 +526,33 @@ pub fn attn_head_bwd<F: Fp>(
 /// Nyström joint kernel geometry — matches `nystrom::O1Cfg` semantics.
 #[derive(Clone, Copy, Debug)]
 pub struct NysCfg {
-    /// Landmark budget (m_eff = clamp(t/8, 4, m) at runtime).
+    /// Landmark budget (m_eff = clamp(t_prefill/8, 4, m), as sealed).
     pub m: usize,
     /// Exact-window width.
     pub w: usize,
     /// Permanent exact sink keys.
     pub sink: usize,
+    /// Tokens of each training window that run the EXACT prompt pass
+    /// before the O(1) seal. `None` = half the window.
+    ///
+    /// This is not a free knob: it is the train/serve contract. The
+    /// runtime (`nystrom::NystromState::prefill`) freezes landmarks from
+    /// the PROMPT ONLY and then serves every later position off that
+    /// frozen skeleton, so a trainer that seals from the whole window is
+    /// optimizing a model that is never served. The default mirrors
+    /// `cortiq ppl --o1`'s own default (`o1_prefill = len/2`), which is
+    /// the discipline every published o1 quality number was measured
+    /// with — keep them equal or the polish and the gate disagree.
+    pub prefill: Option<usize>,
+}
+
+impl NysCfg {
+    /// Prompt length for a `t`-token window: the seal point. Clamped to
+    /// [1, t] so a caller cannot ask for a prefix longer than the window.
+    #[inline]
+    pub fn prefill_len(&self, t: usize) -> usize {
+        self.prefill.unwrap_or(t / 2).clamp(1, t)
+    }
 }
 
 /// Joint-denominator floor (mirrors the reference probe / runtime).
@@ -542,19 +563,38 @@ const NYS_DEN_EPS: f64 = 1e-30;
 /// f32; the certified CPU probe ran the skeleton in f64).
 struct NysGraph<F: Fp> {
     m_eff: usize,
+    /// Seal point: rows < tp are exact (the prompt pass), rows ≥ tp are
+    /// served off the frozen skeleton.
+    tp: usize,
     q_l: Vec<F>,
     k_l: Vec<F>,
     mu: Vec<F>,
     fu: Vec<F>,
     e: Vec<F>,
     fumu: Vec<F>,
-    /// Raw skeleton estimate Fu·Mu·E (pre-clamp) — the backward masks
-    /// the far grad on a > 0 (the clamp's subgradient).
-    a: Vec<F>,
-    /// Final joint weights: exp(lg−c) on near, max(a,0)·e^{−c} on far.
+    /// Per row: did the AGGREGATE far denominator survive the guard?
+    /// False ⇒ this row's far field is dropped entirely (weights and
+    /// gradient alike) — see `nys_graph`.
+    ///
+    /// This replaces the raw skeleton estimate `a`, which the backward
+    /// used to carry ONLY to evaluate the per-(t,j) clamp's `[a>0]`
+    /// subgradient mask. The shipped operator gates per ROW, so the mask
+    /// — and the whole T×T buffer behind it — is gone.
+    far_keep: Vec<bool>,
+    /// Final joint weights: exp(lg−c) on near, a·e^{−c} on a kept far
+    /// field, 0 on a dropped one.
     wmat: Vec<F>,
     c_row: Vec<F>,
     den: Vec<F>,
+}
+
+/// Is this row served exactly? Positions before the seal are the
+/// runtime's PROMPT PASS: `Pipeline::nll_ids_o1` runs them through
+/// ordinary full-KV attention and only then calls `o1_seal`, so the
+/// skeleton must not touch them.
+#[inline]
+fn nys_exact_row(ti: usize, tp: usize) -> bool {
+    ti < tp
 }
 
 /// near mask (spec §5b): (t−j < W) OR (j < sink), causal.
@@ -577,11 +617,16 @@ fn nys_graph<F: Fp>(
 ) -> NysGraph<F> {
     let scale = 1.0 / (d as f64).sqrt();
     let fscale = F::fromf(scale);
-    let m_eff = (t / 8).clamp(4, cfg.m);
+    // Landmarks are sealed from the PROMPT PREFIX, exactly as
+    // `NystromState::prefill` does — including m_eff, which the runtime
+    // derives from the prompt length it sealed at, not from how far the
+    // sequence later runs.
+    let tp = cfg.prefill_len(t);
+    let m_eff = (tp / 8).clamp(4, cfg.m);
     let mut q_l = vec![F::ZERO; m_eff * d];
     let mut k_l = vec![F::ZERO; m_eff * d];
-    seg_means(q, t, d, m_eff, &mut q_l);
-    seg_means(k, t, d, m_eff, &mut k_l);
+    seg_means(&q[..tp * d], tp, d, m_eff, &mut q_l);
+    seg_means(&k[..tp * d], tp, d, m_eff, &mut k_l);
 
     // Au and its ridge pinv in f64 — one m×m solve, constant in backward.
     let mut au = vec![0f64; m_eff * m_eff];
@@ -630,8 +675,10 @@ fn nys_graph<F: Fp>(
     );
     // a[t,j] = Σ_i fumu[t,i]·e[i,j] — e is [m,t], so column j of e is
     // strided; loop with accumulation over i keeps rows contiguous.
+    // Rows before the seal are exact, so their skeleton is never
+    // evaluated (and stays ZERO — the backward relies on that).
     let mut a = vec![F::ZERO; t * t];
-    for ti in 0..t {
+    for ti in tp..t {
         let fr = &fumu[ti * m_eff..(ti + 1) * m_eff];
         let ar = &mut a[ti * t..ti * t + ti + 1]; // causal: j ≤ ti
         for (i, &f) in fr.iter().enumerate() {
@@ -647,6 +694,7 @@ fn nys_graph<F: Fp>(
     let mut wmat = vec![F::ZERO; t * t];
     let mut c_row = vec![F::ZERO; t];
     let mut den = vec![F::ZERO; t];
+    let mut far_keep = vec![false; t];
     let mut lg_row = vec![F::ZERO; t];
     for ti in 0..t {
         let qr = &q[ti * d..(ti + 1) * d];
@@ -658,20 +706,49 @@ fn nys_graph<F: Fp>(
         }
         c_row[ti] = c;
         let emc = (-c).exp();
+        let exact_row = nys_exact_row(ti, tp);
+
+        // AGGREGATE guard (`O1Rect::Aggregate`, the shipped default).
+        // The runtime never materializes a per-(t,j) weight — it only
+        // ever holds the far field already contracted into accumulators,
+        // so the ONLY quantity it can test is the row's total far
+        // denominator:
+        //   far_den = Σ_b u[b]·ẑ[b] = e^{−c_all}·Σ_{j far} a[t,j]
+        // (`nystrom.rs::step`). e^{−c_all} > 0, so the runtime's
+        // `far_den >= 0` predicate is exactly `Σ_{j far} a[t,j] >= 0`
+        // here. A row that fails drops its far field ENTIRELY; a row
+        // that passes keeps every far weight RAW — negative per-key mass
+        // included. That is not an oversight: clamping per key (what the
+        // torch probe did, and what this trainer used to do) is a
+        // strictly different, measurably worse operator (`O1Rect::Fm`,
+        // ×1.414 vs ×1.296) that no streaming kernel can execute.
+        let mut far_sum = F::ZERO;
+        if !exact_row {
+            for j in 0..=ti {
+                if !nys_near(ti, j, cfg.w, cfg.sink) {
+                    far_sum += a[ti * t + j];
+                }
+            }
+        }
+        let keep = !exact_row && far_sum.f64() >= 0.0;
+        far_keep[ti] = keep;
+
         let wr = &mut wmat[ti * t..(ti + 1) * t];
         let mut dsum = F::ZERO;
         for j in 0..=ti {
-            let wv = if nys_near(ti, j, cfg.w, cfg.sink) {
+            let wv = if exact_row || nys_near(ti, j, cfg.w, cfg.sink) {
                 (lg_row[j] - c).exp()
+            } else if keep {
+                a[ti * t + j] * emc
             } else {
-                a[ti * t + j].maxf(F::ZERO) * emc
+                F::ZERO
             };
             wr[j] = wv;
             dsum += wv;
         }
         den[ti] = dsum.maxf(F::fromf(NYS_DEN_EPS));
     }
-    NysGraph { m_eff, q_l, k_l, mu, fu, e, fumu, a, wmat, c_row, den }
+    NysGraph { m_eff, tp, q_l, k_l, mu, fu, e, fumu, far_keep, wmat, c_row, den }
 }
 
 fn transpose<F: Fp>(x: &[F], rows: usize, cols: usize) -> Vec<F> {
@@ -697,11 +774,24 @@ pub fn nystrom_head_fwd<F: Fp>(
     cfg: &NysCfg,
     out: &mut [F],
 ) {
-    if t <= cfg.w + cfg.sink + 8 {
+    if nys_degenerate(t, cfg) {
         attn_head_fwd(q, k, v, t, d, dv, out);
         return;
     }
     nystrom_head_fwd_mu(q, k, v, t, d, dv, cfg, None, out);
+}
+
+/// Does the runtime skip the skeleton for this window entirely?
+///
+/// `NystromState::prefill` decides `exact_only` from the PROMPT length
+/// (`t <= w + sink + EXACT_SLACK`), not from how long the sequence
+/// eventually grows: a short prompt seals no skeleton, so every later
+/// key stays a permanent exact key. Keying this off the full window `t`
+/// (as this did before) would build a skeleton for windows the runtime
+/// serves exactly.
+#[inline]
+fn nys_degenerate(t: usize, cfg: &NysCfg) -> bool {
+    cfg.prefill_len(t) <= cfg.w + cfg.sink + 8
 }
 
 /// The landmark mixing matrix M of this (q, k) — gradcheck hook for
@@ -749,10 +839,12 @@ pub fn nystrom_head_fwd_mu<F: Fp>(
 /// graph is recomputed (layer checkpointing) — see docs/RUST_FCD.md
 /// §2.2 for the derivation. Chain summary:
 ///   dw[t,j]   = dout_t·(v_j − out_t)/den_t
-///   near:  dlg = dw·w                 → dq, dk (±scale)
-///   far:   da  = dw·e^{−c}·[a>0]      → dFu, dE through the two
-///          matmuls with M constant    → dq, dk, dQ̃, dK̃
-///   landmarks: segment-mean scatter back into dq, dk.
+///   near:  dlg = dw·w                     → dq, dk (±scale)
+///   far:   da  = dw·e^{−c}·[row kept]     → dFu, dE through the two
+///          matmuls with M constant        → dq, dk, dQ̃, dK̃
+///   landmarks: segment-mean scatter back into the PREFIX rows of
+///          dq, dk (the seal only saw those).
+/// The far gate is per ROW (the aggregate guard), not per key.
 #[allow(clippy::too_many_arguments)]
 pub fn nystrom_head_bwd<F: Fp>(
     q: &[F],
@@ -767,7 +859,7 @@ pub fn nystrom_head_bwd<F: Fp>(
     dk: &mut [F],
     dvv: &mut [F],
 ) {
-    if t <= cfg.w + cfg.sink + 8 {
+    if nys_degenerate(t, cfg) {
         attn_head_bwd(q, k, v, dout, t, d, dv, dq, dk, dvv);
         return;
     }
@@ -831,12 +923,13 @@ pub fn nystrom_head_bwd_mu<F: Fp>(
         }
     }
 
-    // Near half: dlg = dw·w, straight to dq/dk.
+    // Near half: dlg = dw·w, straight to dq/dk. A pre-seal row is
+    // exact, so EVERY causal j is a near key for it.
     for ti in 0..t {
         let qr = &q[ti * d..(ti + 1) * d];
         let dqr_base = ti * d;
         for j in 0..=ti {
-            if !nys_near(ti, j, cfg.w, cfg.sink) {
+            if !(nys_exact_row(ti, g.tp) || nys_near(ti, j, cfg.w, cfg.sink)) {
                 continue;
             }
             let dlg = dwmat[ti * t + j] * g.wmat[ti * t + j] * scale;
@@ -854,17 +947,31 @@ pub fn nystrom_head_bwd_mu<F: Fp>(
         }
     }
 
-    // Far half: da masked by the clamp, then back through the skeleton.
+    // Far half: da gated by the AGGREGATE guard, then back through the
+    // skeleton.
+    //
+    // Gradient of the guard: the far field enters as the piecewise
+    // function  far(row) = [Σ_far a ≥ 0] · a·e^{−c}, i.e. a per-ROW
+    // switch, not a per-key clamp. On the kept branch it is the identity
+    // in a — so the far grad flows RAW, with no [a>0] mask (that mask
+    // belonged to the per-key clamp this replaces and would now zero the
+    // gradient of exactly the negative-mass keys the shipped operator
+    // keeps). On the dropped branch the far field is identically 0 in a
+    // neighbourhood of a, so its gradient is 0. The switching boundary
+    // itself (Σ_far a = 0) is measure-zero and, like any subgradient
+    // convention, is not differentiated — at that point far ≡ 0 anyway,
+    // so the two branches agree in value and only the derivative jumps.
     let mut da = vec![F::ZERO; t * t];
-    for ti in 0..t {
+    for ti in g.tp..t {
+        if !g.far_keep[ti] {
+            continue; // dropped row: zero gradient through its far field
+        }
         let emc = (-g.c_row[ti]).exp();
         for j in 0..=ti {
             if nys_near(ti, j, cfg.w, cfg.sink) {
                 continue;
             }
-            if g.a[ti * t + j].f64() > 0.0 {
-                da[ti * t + j] = dwmat[ti * t + j] * emc;
-            }
+            da[ti * t + j] = dwmat[ti * t + j] * emc;
         }
     }
     // dFuMu[t,i] = Σ_j da[t,j]·e[i,j]
@@ -937,8 +1044,12 @@ pub fn nystrom_head_bwd_mu<F: Fp>(
             }
         }
     }
-    seg_means_bwd(&dq_l, t, d, m_eff, dq);
-    seg_means_bwd(&dk_l, t, d, m_eff, dk);
+    // Landmarks were sealed from the prompt prefix, so their gradient
+    // scatters back into those rows ONLY — a post-seal token cannot move
+    // a landmark it never contributed to.
+    let tp = g.tp;
+    seg_means_bwd(&dq_l, tp, d, m_eff, &mut dq[..tp * d]);
+    seg_means_bwd(&dk_l, tp, d, m_eff, &mut dk[..tp * d]);
 }
 
 // ───────────────────────────── losses ─────────────────────────────

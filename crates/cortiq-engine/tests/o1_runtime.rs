@@ -5,15 +5,18 @@
 //! prompt pass + seal + step lifecycle, GQA head mapping through the
 //! pipeline, the short-prompt guard, and the memory accounting.
 
-use cortiq_engine::nystrom::{O1Cfg, O1Layers};
+use cortiq_engine::nystrom::{
+    O1Cfg, O1Layers, O1Rect, O1_DEFAULT_M, O1_DEFAULT_RECT, O1_DEFAULT_SINK, O1_DEFAULT_W,
+};
 use cortiq_engine::pipeline::create_test_pipeline;
 
 fn o1(layers: O1Layers, m: usize, w: usize, sink: usize) -> Option<O1Cfg> {
-    Some(O1Cfg { layers, m, w, sink })
+    Some(O1Cfg { layers, m, w, sink, rect: O1_DEFAULT_RECT })
 }
 
 #[test]
 fn config_spec_parsing() {
+    let defaults = (O1_DEFAULT_M, O1_DEFAULT_W, O1_DEFAULT_SINK);
     assert_eq!(O1Cfg::parse_layers("all"), Some(O1Layers::All));
     assert_eq!(O1Cfg::parse_layers("deep6"), Some(O1Layers::Deep(6)));
     assert_eq!(
@@ -24,14 +27,22 @@ fn config_spec_parsing() {
     assert_eq!(O1Cfg::parse_layers("deepX"), None);
     assert_eq!(O1Cfg::parse_layers("1,x"), None);
 
+    assert_eq!(O1Cfg::parse_rect("agg"), Some(O1Rect::Aggregate));
+    assert_eq!(O1Cfg::parse_rect("aggregate"), Some(O1Rect::Aggregate));
+    assert_eq!(O1Cfg::parse_rect("fm"), Some(O1Rect::Fm));
+    assert_eq!(O1Cfg::parse_rect("clamp"), None);
+
     // deep-N flags = the N deepest layers; out-of-range list indices drop.
-    let cfg = O1Cfg::from_spec("deep2", None, None, None).unwrap();
+    let cfg = O1Cfg::from_spec("deep2", None, None, None, None).unwrap();
     assert_eq!(cfg.layer_flags(4), vec![false, false, true, true]);
-    assert_eq!((cfg.m, cfg.w, cfg.sink), (32, 128, 4), "validated defaults");
-    let cfg = O1Cfg::from_spec("1,99", Some(8), Some(16), Some(0)).unwrap();
+    assert_eq!((cfg.m, cfg.w, cfg.sink), defaults, "validated defaults");
+    assert_eq!(cfg.rect, O1_DEFAULT_RECT);
+    let cfg = O1Cfg::from_spec("1,99", Some(8), Some(16), Some(0), Some(O1Rect::Aggregate))
+        .unwrap();
     assert_eq!(cfg.layer_flags(3), vec![false, true, false]);
     assert_eq!((cfg.m, cfg.w, cfg.sink), (8, 16, 0));
-    assert!(O1Cfg::from_spec("off", None, None, None).is_none());
+    assert_eq!(cfg.rect, O1Rect::Aggregate, "explicit rect wins");
+    assert!(O1Cfg::from_spec("off", None, None, None, None).is_none());
 
     // Header-hint JSON: string spec and explicit index array.
     let j = serde_json::json!({"layers": "all", "m": 8, "w": 32, "sink": 2});
@@ -41,7 +52,9 @@ fn config_spec_parsing() {
     let j = serde_json::json!({"layers": [0, 2]});
     let cfg = O1Cfg::from_json(&j).unwrap();
     assert_eq!(cfg.layers, O1Layers::List(vec![0, 2]));
-    assert_eq!((cfg.m, cfg.w, cfg.sink), (32, 128, 4));
+    assert_eq!((cfg.m, cfg.w, cfg.sink), defaults);
+    // The rectifier is a runtime knob: a file hint cannot pin it.
+    assert_eq!(cfg.rect, O1_DEFAULT_RECT);
 }
 
 /// With a window wider than the whole run the kernel stays in

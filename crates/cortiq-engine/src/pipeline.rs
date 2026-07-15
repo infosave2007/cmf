@@ -339,8 +339,8 @@ impl Pipeline {
         if let Some(c) = &cfg {
             let n = self.o1_flags.iter().filter(|&&f| f).count();
             tracing::info!(
-                "o1 nystrom attention: {n}/{} layer(s), m={} w={} sink={}",
-                self.num_layers, c.m, c.w, c.sink
+                "o1 nystrom attention: {n}/{} layer(s), m={} w={} sink={} rect={:?}",
+                self.num_layers, c.m, c.w, c.sink, c.rect
             );
         }
         self.o1_cfg = cfg;
@@ -354,10 +354,10 @@ impl Pipeline {
     /// Arm query collection on the o1 layers (fresh prompt pass).
     fn o1_begin(&mut self) {
         if let Some(c) = &self.o1_cfg {
-            let (m, w, sink) = (c.m, c.w, c.sink);
+            let (m, w, sink, rect) = (c.m, c.w, c.sink, c.rect);
             for (li, &f) in self.o1_flags.iter().enumerate() {
                 if f {
-                    self.kv_cache.layers[li].o1_begin(m, w, sink);
+                    self.kv_cache.layers[li].o1_begin(m, w, sink, rect);
                 }
             }
         }
@@ -936,7 +936,24 @@ impl Pipeline {
 
     /// Teacher-forced perplexity over a token sequence (phase-C gate:
     /// honest quant comparisons instead of prompt vibes).
+    ///
+    /// Attention is EXACT even on a model whose layers are flagged for
+    /// the O(1) kernel — scoring the backbone is the default on purpose
+    /// (it is the yardstick). `nll_ids_o1` scores the CONVERTED model.
     pub fn ppl_ids(&mut self, ids: &[u32]) -> f64 {
+        let (nll, cnt) = self.nll_ids_from(ids, 0);
+        (nll / cnt.max(1) as f64).exp()
+    }
+
+    /// Teacher-forced NLL sum + scored-token count over positions
+    /// `start..len-1`, attention EXACT. Positions below `start` still
+    /// run — they are the context — they are just not scored, so this
+    /// pairs with `nll_ids_o1(ids, start)` over the very same tokens.
+    ///
+    /// Returning (nll, cnt) rather than a ppl is what lets a windowed
+    /// caller combine windows before the exp, so every scored token
+    /// weighs the same regardless of how the windows are cut.
+    pub fn nll_ids_from(&mut self, ids: &[u32], start: usize) -> (f64, usize) {
         self.kv_cache.clear();
         let mut nll = 0f64;
         let mut cnt = 0usize;
@@ -960,6 +977,12 @@ impl Pipeline {
                 while k0 < bsz {
                     let k1 = (k0 + LM_SUB).min(bsz);
                     let sb = k1 - k0;
+                    // Sub-block entirely below the scored range: the KV
+                    // it just built is all this pass needed from it.
+                    if pos + k1 <= start {
+                        k0 = k1;
+                        continue;
+                    }
                     let mut normed = vec![0.0f32; sb * hs];
                     for k in 0..sb {
                         let r = inference::rms_norm(
@@ -975,6 +998,9 @@ impl Pipeline {
                         .lm_head
                         .matmat(&normed, sb, &mut logits, self.pool.as_deref());
                     for k in 0..sb {
+                        if pos + k0 + k < start {
+                            continue;
+                        }
                         let lg = &logits[k * rows..k * rows + self.vocab_size.min(rows)];
                         let target = ids[pos + k0 + k + 1] as usize;
                         let max = lg.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
@@ -992,9 +1018,71 @@ impl Pipeline {
                 pos = end;
             }
             self.kv_cache.clear();
-            return (nll / cnt.max(1) as f64).exp();
+            return (nll, cnt);
         }
         for pos in 0..ids.len().saturating_sub(1) {
+            let hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, None);
+            if pos < start {
+                continue;
+            }
+            let normed = inference::rms_norm(
+                &hidden,
+                &self.weights.final_norm,
+                self.rms_eps,
+                self.norm_style,
+            );
+            let logits = self.lm_head_forward(&normed);
+            let target = ids[pos + 1] as usize;
+            let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+            let lse: f64 = logits.iter().map(|&v| ((v - max) as f64).exp()).sum::<f64>().ln()
+                + max as f64;
+            nll += lse - logits[target] as f64;
+            cnt += 1;
+        }
+        self.kv_cache.clear();
+        (nll, cnt)
+    }
+
+    /// Teacher-forced NLL of the CONVERTED model: the O(1) Nyström path
+    /// is ACTIVE over the scored positions. Returns (nll sum, scored
+    /// count) over `prefill..len-1`.
+    ///
+    /// Runtime discipline, deliberately NOT the matrix probe's: the
+    /// first `prefill` tokens run the exact prompt pass — that pass is
+    /// what freezes the landmarks and M — and every scored position then
+    /// goes through `NystromState::step()`, the same code decode runs.
+    /// So the landmarks are PREFILL-frozen (what ships), not
+    /// full-sequence oracles (what the published probe measured), and
+    /// every scored row carries a real far field rather than sitting
+    /// inside the exact window.
+    ///
+    /// Pair with `nll_ids_from(ids, prefill)` for the exact baseline
+    /// over the identical token set — that ratio is the honest one.
+    pub fn nll_ids_o1(&mut self, ids: &[u32], prefill: usize) -> (f64, usize) {
+        self.kv_cache.clear();
+        self.o1_begin();
+        let n = ids.len().saturating_sub(1);
+        let p = prefill.min(n);
+        // Exact prompt pass over ids[..p]: the seal consumes its q/k/v.
+        let mut pos = 0usize;
+        if prefill_batched() {
+            const CHUNK: usize = 128;
+            while pos < p {
+                let end = (pos + CHUNK).min(p);
+                let _ = self.prefill_batch(&ids[pos..end], pos);
+                pos = end;
+            }
+        } else {
+            while pos < p {
+                let _ = self.forward_layers(&self.embed_single(ids[pos]), pos, None);
+                pos += 1;
+            }
+        }
+        self.o1_seal();
+
+        let mut nll = 0f64;
+        let mut cnt = 0usize;
+        for pos in p..n {
             let hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, None);
             let normed = inference::rms_norm(
                 &hidden,
@@ -1011,7 +1099,7 @@ impl Pipeline {
             cnt += 1;
         }
         self.kv_cache.clear();
-        (nll / cnt.max(1) as f64).exp()
+        (nll, cnt)
     }
 
     /// Teacher-forced calibration data (B1): for each position, whether the

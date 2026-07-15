@@ -106,15 +106,62 @@ struct O1Flags {
     m: Option<usize>,
     w: Option<usize>,
     sink: Option<usize>,
+    rect: Option<String>,
 }
 
 impl O1Flags {
+    /// Parsed rectifier; None = fall through to CMF_O1_RECT / default.
+    fn rect(&self) -> anyhow::Result<Option<cortiq_engine::nystrom::O1Rect>> {
+        match self.rect.as_deref() {
+            None => Ok(None),
+            Some(s) => cortiq_engine::nystrom::O1Cfg::parse_rect(s).map(Some).ok_or_else(|| {
+                anyhow::anyhow!("--o1-rect '{s}' is not one of: agg | fm")
+            }),
+        }
+    }
+
+    /// The config this flag set resolves to, or None for `off`/absent.
+    fn cfg(&self) -> anyhow::Result<Option<cortiq_engine::nystrom::O1Cfg>> {
+        let rect = self.rect()?;
+        Ok(self.spec.as_deref().and_then(|spec| {
+            cortiq_engine::nystrom::O1Cfg::from_spec(spec, self.m, self.w, self.sink, rect)
+        }))
+    }
+
     fn apply(&self, pipeline: &mut Pipeline) {
         if let Some(spec) = self.spec.as_deref() {
+            let rect = self.rect().unwrap_or(None);
             pipeline.set_o1(cortiq_engine::nystrom::O1Cfg::from_spec(
-                spec, self.m, self.w, self.sink,
+                spec, self.m, self.w, self.sink, rect,
             ));
         }
+    }
+}
+
+/// `ppl --windows N --window-len L`: the val_ppl window discipline.
+struct PplWindows {
+    windows: Option<usize>,
+    window_len: usize,
+}
+
+impl PplWindows {
+    /// Offsets of the scored windows over `n` tokens: `windows` evenly
+    /// spaced starts, `stride = (n - len - 1) / windows` — the exact
+    /// selection of `heal_hybridk_06b.py::val_ppl(m, va, bs, n)`, whose
+    /// N = n*bs windows sit at (j*bs + b)*stride, i.e. k*stride for
+    /// k = 0..N-1. None = score one --tokens prefix instead.
+    fn offsets(&self, n: usize) -> anyhow::Result<Option<Vec<usize>>> {
+        let Some(w) = self.windows.filter(|&w| w > 0) else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            n > self.window_len + 1,
+            "corpus has {n} tokens < window_len+2 = {}",
+            self.window_len + 2
+        );
+        let stride = (n - self.window_len - 1) / w;
+        anyhow::ensure!(stride > 0, "{w} windows of {} do not fit in {n} tokens", self.window_len);
+        Ok(Some((0..w).map(|k| k * stride).collect()))
     }
 }
 
@@ -189,8 +236,9 @@ enum Commands {
         defrag: Option<String>,
         /// Record an O(1) Nyström attention hint (all | deepN | i,j,k):
         /// weights pass through UNCHANGED; the runtime reads the hint at
-        /// load (override at serve time with --o1 off). Validated on
-        /// Qwen3-0.6B: all-layer conversion ×1.177 ppl zero-shot.
+        /// load (override at serve time with --o1 off). Measured through
+        /// the real runtime on Qwen3-0.6B (all 28 layers, wikitext-2):
+        /// ×1.296 ppl zero-shot — reproduce with `cortiq ppl --o1 all`.
         #[arg(long)]
         o1: Option<String>,
         /// Landmark budget for the --o1 hint (validated default 32)
@@ -361,6 +409,44 @@ enum Commands {
         /// (VMF experiment: CMF_ROUTE_EON/EOFF/MARGIN/PERIOD).
         #[arg(long)]
         route_dynamic: bool,
+        /// Score N evenly spaced windows of --window-len tokens instead of
+        /// one --tokens prefix, combining them before the exp (the val_ppl
+        /// discipline the published Qwen3-0.6B yardstick was measured with:
+        /// 12 windows x 512 tokens).
+        #[arg(long)]
+        windows: Option<usize>,
+        /// Token length of each --windows window
+        #[arg(long, default_value = "512")]
+        window_len: usize,
+        /// Score the CONVERTED model: run the O(1) Nyström attention path
+        /// (all | deepN | i,j,k | off) over the scored positions instead of
+        /// exact attention. Each window's first --o1-prefill tokens run the
+        /// exact prompt pass that freezes the landmarks, then every scored
+        /// position goes through the real streaming decode kernel. The
+        /// EXACT baseline over the identical tokens is printed next to it,
+        /// so the ratio is apples-to-apples. Without this flag `ppl` scores
+        /// the backbone exactly, even for a model carrying an --o1 hint.
+        #[arg(long)]
+        o1: Option<String>,
+        /// Landmark budget for --o1 (default 32)
+        #[arg(long)]
+        o1_m: Option<usize>,
+        /// Exact-window width for --o1 (default 128)
+        #[arg(long)]
+        o1_window: Option<usize>,
+        /// Permanent exact sink keys for --o1 (default 4)
+        #[arg(long)]
+        o1_sink: Option<usize>,
+        /// Skeleton rectifier for --o1: agg (clamp the aggregate far
+        /// denominator) | fm (clamp F_u*M_u >= 0 — per-key non-negativity)
+        #[arg(long)]
+        o1_rect: Option<String>,
+        /// Tokens per window that run the exact prompt pass before the O(1)
+        /// seal (default: half the window). Landmarks are frozen from these
+        /// tokens only — the runtime never sees the full-sequence landmarks
+        /// the published torch probe used.
+        #[arg(long)]
+        o1_prefill: Option<usize>,
     },
     /// Tell the model's life story: origin, body, skills, integrity —
     /// the file's verifiable autobiography from its own header.
@@ -501,7 +587,7 @@ async fn main() -> anyhow::Result<()> {
             o1_window,
             o1_sink,
         } => {
-            let o1 = O1Flags { spec: o1, m: o1_m, w: o1_window, sink: o1_sink };
+            let o1 = O1Flags { spec: o1, m: o1_m, w: o1_window, sink: o1_sink, rect: None };
             cmd_serve(&model, &host, port, &task, compat_port, &o1).await
         }
         Commands::Convert {
@@ -514,8 +600,10 @@ async fn main() -> anyhow::Result<()> {
             let o1_hint = match o1.as_deref() {
                 None => None,
                 Some(spec) => {
+                    // The rectifier is a runtime knob, not a property of
+                    // the weights — a file hint never pins it.
                     let cfg = cortiq_engine::nystrom::O1Cfg::from_spec(
-                        spec, o1_m, o1_window, o1_sink,
+                        spec, o1_m, o1_window, o1_sink, None,
                     )
                     .ok_or_else(|| {
                         anyhow::anyhow!("--o1 {spec}: expected all | deepN | i,j,k")
@@ -561,7 +649,7 @@ async fn main() -> anyhow::Result<()> {
             o1_window,
             o1_sink,
         } => {
-            let o1 = O1Flags { spec: o1, m: o1_m, w: o1_window, sink: o1_sink };
+            let o1 = O1Flags { spec: o1, m: o1_m, w: o1_window, sink: o1_sink, rect: None };
             cmd_run(&model, &task, prompt.as_deref(), max_tokens, skill.as_deref(), greedy,
                     blend.as_deref(), route_dynamic, confidence, trace, trace_json,
                     state.as_deref(), &o1)
@@ -571,9 +659,32 @@ async fn main() -> anyhow::Result<()> {
             cmd_freeze(&model, &prompt, &out, skill.as_deref())
         }
         Commands::Route { model, prompt } => cmd_route(&model, &prompt),
-        Commands::Ppl { model, file, tokens, skill, blend, route_dynamic } => {
-            cmd_ppl(&model, &file, tokens, skill.as_deref(), blend.as_deref(), route_dynamic)
-        }
+        Commands::Ppl {
+            model,
+            file,
+            tokens,
+            skill,
+            blend,
+            route_dynamic,
+            windows,
+            window_len,
+            o1,
+            o1_m,
+            o1_window,
+            o1_sink,
+            o1_rect,
+            o1_prefill,
+        } => cmd_ppl(
+            &model,
+            &file,
+            tokens,
+            skill.as_deref(),
+            blend.as_deref(),
+            route_dynamic,
+            PplWindows { windows, window_len },
+            &O1Flags { spec: o1, m: o1_m, w: o1_window, sink: o1_sink, rect: o1_rect },
+            o1_prefill,
+        ),
         Commands::Info { model } => cmd_info(&model).await,
         Commands::Story { model } => cmd_story(&model),
         Commands::Diff { a, b } => cmd_diff(&a, &b),
@@ -592,7 +703,7 @@ async fn main() -> anyhow::Result<()> {
             o1_window,
             o1_sink,
         } => {
-            let o1 = O1Flags { spec: o1, m: o1_m, w: o1_window, sink: o1_sink };
+            let o1 = O1Flags { spec: o1, m: o1_m, w: o1_window, sink: o1_sink, rect: None };
             cmd_bench(&model, &task, tokens, ctx, &o1).await
         }
         Commands::Verify { model } => cmd_verify(&model).await,
@@ -806,7 +917,7 @@ fn cmd_fcd(
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     // Layer set: explicit flag > file converter hint > all.
     let cfg = match o1 {
-        Some(spec) => O1Cfg::from_spec(spec, o1_m, o1_w, o1_sink).ok_or_else(|| {
+        Some(spec) => O1Cfg::from_spec(spec, o1_m, o1_w, o1_sink, None).ok_or_else(|| {
             anyhow::anyhow!("--o1 '{spec}' is off or malformed — nothing to polish")
         })?,
         None => model
@@ -815,7 +926,7 @@ fn cmd_fcd(
             .as_ref()
             .and_then(|p| p.get("o1_attn"))
             .and_then(O1Cfg::from_json)
-            .or_else(|| O1Cfg::from_spec("all", o1_m, o1_w, o1_sink))
+            .or_else(|| O1Cfg::from_spec("all", o1_m, o1_w, o1_sink, None))
             .expect("'all' always parses"),
     };
 
@@ -919,6 +1030,7 @@ fn cmd_fcd(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_ppl(
     model_path: &str,
     file: &str,
@@ -926,6 +1038,9 @@ fn cmd_ppl(
     skill: Option<&str>,
     blend: Option<&str>,
     route_dynamic: bool,
+    win: PplWindows,
+    o1: &O1Flags,
+    o1_prefill: Option<usize>,
 ) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     let text = std::fs::read_to_string(file)?;
@@ -942,8 +1057,33 @@ fn cmd_ppl(
         }
         None => Pipeline::from_model_with_skill(&model, SamplerConfig::default(), skill)?,
     };
-    let mut ids = pipeline.tokenizer.with_bos(pipeline.tokenizer.encode(&text));
-    ids.truncate(max_tokens);
+    // Windowed scoring keeps the RAW token stream: the val_ppl yardstick
+    // slices windows out of the middle of the corpus, where a prepended
+    // BOS would be a token the reference never scored.
+    let windowed = win.offsets(pipeline.tokenizer.encode(&text).len())?;
+    let mut ids = match &windowed {
+        Some(_) => pipeline.tokenizer.encode(&text),
+        None => pipeline.tokenizer.with_bos(pipeline.tokenizer.encode(&text)),
+    };
+    if windowed.is_none() {
+        ids.truncate(max_tokens);
+    }
+
+    if let Some(offsets) = windowed {
+        return ppl_windows(&mut pipeline, &ids, &offsets, win.window_len, o1, o1_prefill);
+    }
+    if let Some(cfg) = o1.cfg()? {
+        // Single-prefix o1 scoring: seal after --o1-prefill (default:
+        // half the sequence), score the rest through the O(1) kernel.
+        pipeline.set_o1(Some(cfg));
+        let prefill = o1_prefill.unwrap_or(ids.len() / 2).min(ids.len().saturating_sub(1));
+        let (n_o1, c) = pipeline.nll_ids_o1(&ids, prefill);
+        pipeline.set_o1(None);
+        let (n_ex, _) = pipeline.nll_ids_from(&ids, prefill);
+        report_o1_ppl(n_o1, n_ex, c, prefill, ids.len());
+        dump_moe_stats(&pipeline)?;
+        return Ok(());
+    }
     if route_dynamic {
         let n = pipeline.enable_dynamic_routing();
         let (ppl, switches) = pipeline.ppl_ids_dynamic(&ids);
@@ -960,6 +1100,77 @@ fn cmd_ppl(
     // B-field of claim 12: router expert-selection frequencies on this
     // run → JSON {layer: [counts]} for the converter's flood-fill.
     dump_moe_stats(&pipeline)?;
+    Ok(())
+}
+
+/// The O(1) score against its own exact baseline. `cnt` scored tokens
+/// per sequence, positions `prefill..len-1`.
+fn report_o1_ppl(nll_o1: f64, nll_exact: f64, cnt: usize, prefill: usize, len: usize) {
+    let c = cnt.max(1) as f64;
+    let (p_o1, p_ex) = ((nll_o1 / c).exp(), (nll_exact / c).exp());
+    // Scored positions are prefill..len-1 EXCLUSIVE: position len-1 has
+    // no next token to predict.
+    println!(
+        "PPL(o1, CONVERTED model) = {p_o1:.3} over {cnt} scored token(s) \
+         [positions {prefill}..{} of {len}, per sequence]",
+        len.saturating_sub(1)
+    );
+    println!("PPL(exact, same tokens)  = {p_ex:.3}");
+    println!("ratio                    = x{:.3}", p_o1 / p_ex);
+}
+
+/// Score `offsets.len()` windows of `wlen` tokens, combining NLL across
+/// windows BEFORE the exp (val_ppl discipline). With `--o1`, each window
+/// is prefilled exactly, sealed, and its tail scored through the O(1)
+/// kernel, next to the exact baseline over the identical tokens.
+fn ppl_windows(
+    pipeline: &mut Pipeline,
+    ids: &[u32],
+    offsets: &[usize],
+    wlen: usize,
+    o1: &O1Flags,
+    o1_prefill: Option<usize>,
+) -> anyhow::Result<()> {
+    let cfg = o1.cfg()?;
+    let prefill = match &cfg {
+        Some(_) => o1_prefill.unwrap_or(wlen / 2).min(wlen.saturating_sub(1)),
+        None => 0,
+    };
+    let (mut nll_o1, mut nll_ex, mut cnt) = (0f64, 0f64, 0usize);
+    for &off in offsets {
+        let w = &ids[off..off + wlen];
+        if let Some(c) = &cfg {
+            pipeline.set_o1(Some(c.clone()));
+            let (n, k) = pipeline.nll_ids_o1(w, prefill);
+            nll_o1 += n;
+            pipeline.set_o1(None);
+            let (n, k2) = pipeline.nll_ids_from(w, prefill);
+            debug_assert_eq!(k, k2, "o1 and exact must score the same tokens");
+            nll_ex += n;
+            cnt += k;
+        } else {
+            let (n, k) = pipeline.nll_ids_from(w, 0);
+            nll_ex += n;
+            cnt += k;
+        }
+    }
+    println!(
+        "windows: {} x {wlen} tokens at stride {} ({} scored)",
+        offsets.len(),
+        offsets.get(1).copied().unwrap_or(0),
+        cnt
+    );
+    match &cfg {
+        Some(c) => {
+            println!(
+                "o1: layers {:?}, m={} w={} sink={} rect={:?}, prefill={prefill}",
+                c.layers, c.m, c.w, c.sink, c.rect
+            );
+            report_o1_ppl(nll_o1, nll_ex, cnt, prefill, wlen);
+        }
+        None => println!("PPL = {:.3} (exact attention)", (nll_ex / cnt.max(1) as f64).exp()),
+    }
+    dump_moe_stats(pipeline)?;
     Ok(())
 }
 

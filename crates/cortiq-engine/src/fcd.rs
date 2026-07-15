@@ -405,7 +405,9 @@ impl FcdModel {
             final_norm,
             layers,
             o1_flags: flags,
-            nys: NysCfg { m: o1.m, w: o1.w, sink: o1.sink },
+            // prefill: None = half the window, the same seal point
+            // `cortiq ppl --o1` defaults to (see NysCfg::prefill).
+            nys: NysCfg { m: o1.m, w: o1.w, sink: o1.sink, prefill: None },
             gdn,
             pool: Pool::from_env(),
         })

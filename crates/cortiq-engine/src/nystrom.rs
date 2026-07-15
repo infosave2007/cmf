@@ -28,13 +28,77 @@
 //! Here they never enter the ring window in the first place (they live
 //! in a dedicated buffer), so delayed insertion cannot see them: no
 //! double count, no gap.  Measured: sinks make the full 28/28-layer
-//! O(1) conversion viable (×1.177 zero-shot) — the default mode.
+//! O(1) conversion viable — the default mode.
+//!
+//! Quality of THIS kernel, measured through it (`cortiq ppl --o1 all`,
+//! Qwen3-0.6B, all 28 layers, m=32 W=128 sink=4, wikitext-2 val, 12×512
+//! windows, landmarks frozen at a 256-token prefill): ×1.296 vs exact
+//! attention over the same scored tokens (28.04 vs 21.63).
+//!
+//! The older ×1.177 figure is NOT this operator: it comes from the torch
+//! matrix probe, which (a) rectifies every per-(t,j) weight — impossible
+//! to stream, the weights are never materialized — (b) builds landmarks
+//! from the FULL sequence rather than the prefill, and (c) averages in
+//! the first W positions, which are pure-exact and cost nothing.  Quote
+//! ×1.296 for the runtime; ×1.177 is an upper bound the runtime cannot
+//! reach by construction.
 //!
 //! fp32 numerics: raw exp overflows on real logits, so shifts are
 //! absorbed into diagonals.  T̂[i]/Ẑ[i] live at scale e^{-m_i} with a
 //! per-landmark running max m_i (flash-style rescale on growth); each
 //! token's landmark row uses its own shift f; near and far are brought
 //! to one common scale before the single joint division.
+
+/// Which rectifier keeps the skeleton's estimated far mass non-negative.
+///
+/// pinv(exp(Q̃K̃ᵀ/√d)) is violently ill-conditioned, so M is indefinite
+/// and the raw skeleton estimates negative weights for a large minority
+/// of keys (measured on Qwen3-0.6B: 23.5% of far weights negative,
+/// carrying 24.5% of the absolute far mass).  Unrectified, the joint
+/// denominator goes near-zero/negative and the model collapses (×510).
+///
+/// The matrix probe rectifies every estimated weight — `west =
+/// ((Fu@Mu)@E).clamp_min(0)`.  A STREAMING kernel cannot do that: the
+/// per-(t, j) weights are never materialized, they exist only already
+/// contracted against the accumulators.  Two streaming-legal stand-ins:
+///
+/// MEASURED (Qwen3-0.6B, all 28 layers, W=128, sink=4, wikitext-2 val,
+/// 12×512 windows, landmarks frozen at a 256-token prefill — i.e. the
+/// runtime's real discipline, `cortiq ppl --o1`):
+///
+/// ```text
+///        m=8              m=16             m=32
+/// agg    28.51 (×1.318)   28.82 (×1.332)   28.04 (×1.296)  ← default
+/// fm     28.97 (×1.340)   29.69 (×1.373)   30.58 (×1.414)
+/// ```
+///
+/// `Aggregate` wins at every m, so it stays the default.  `Fm` is kept
+/// selectable because its per-key guarantee is the intuitively "correct"
+/// fix and someone will re-derive it: this table is the evidence that it
+/// costs quality HERE, and the reason is that the guarantee is bought by
+/// destroying signal — clamping a landmark's coefficient zeroes its
+/// contribution to EVERY far key, including the majority where the
+/// weighted sum was already positive and accurate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum O1Rect {
+    /// Clamp only the AGGREGATE far denominator: a row whose skeleton
+    /// denominator comes out negative drops its far field entirely.
+    /// Coarse — negative per-key mass survives untouched whenever the
+    /// row sum happens to stay positive — but measured BEST (see above):
+    /// the surviving negatives are apparently error-cancelling, not
+    /// error-causing.
+    Aggregate,
+    /// Clamp FM = F_u·M_u (an m-vector, per query row) at zero.
+    /// ŵ(t,j) = Σ_b FM[b]·E[b,j] and E = exp(·) ≥ 0 ELEMENTWISE, so
+    /// FM ≥ 0 is SUFFICIENT for every far weight to be non-negative —
+    /// a per-key guarantee bought with O(m) work on a vector the row
+    /// already materializes, state untouched.  It is strictly stronger
+    /// than the probe's clamp (a negative landmark is dropped for every
+    /// key, not only where the sum would go negative), so this is a
+    /// DIFFERENT operator, not an emulation of the matrix reference —
+    /// and, measured, a worse one.  Opt in with `--o1-rect fm`.
+    Fm,
+}
 
 /// Ridge factor for the regularized pseudo-inverse of the landmark
 /// kernel: λ = RIDGE_REL · mean(diag(AᵀA)).
@@ -58,6 +122,8 @@ pub struct NystromState {
     w: usize,
     /// Permanent exact sink keys at positions 0..sink (spec §5b).
     sink: usize,
+    /// How the indefinite skeleton is rectified (see `O1Rect`).
+    rect: O1Rect,
     d: usize,
     dv: usize,
     /// Effective landmark count: clamp(t/8, 4, m) at prefill.
@@ -105,10 +171,12 @@ pub struct NystromState {
 }
 
 impl NystromState {
-    /// `m` — landmark budget (≥ 4; validated setting is 32),
+    /// `m` — landmark budget (≥ 4; see `O1_DEFAULT_M`),
     /// `w` — exact window width (validated setting is 128),
     /// `sink` — permanent exact sink keys (validated default is 4;
     /// 0 reproduces the sink-free kernel bit-for-bit).
+    /// Rectifier defaults to `O1_DEFAULT_RECT`; override with
+    /// `with_rect` (the golden-parity test pins it explicitly).
     pub fn new(m: usize, w: usize, sink: usize) -> Self {
         assert!(m >= 4, "landmark budget must be at least 4");
         assert!(w >= 1, "window must hold at least one key");
@@ -116,6 +184,7 @@ impl NystromState {
             m,
             w,
             sink,
+            rect: O1_DEFAULT_RECT,
             d: 0,
             dv: 0,
             m_eff: 0,
@@ -140,6 +209,12 @@ impl NystromState {
             scr_u: Vec::new(),
             scr_l: Vec::new(),
         }
+    }
+
+    /// Select the skeleton rectifier (builder; see `O1Rect`).
+    pub fn with_rect(mut self, rect: O1Rect) -> Self {
+        self.rect = rect;
+        self
     }
 
     /// Absorb the whole prompt for this head: freeze landmarks and M,
@@ -275,13 +350,21 @@ impl NystromState {
             for a in 0..self.m_eff {
                 self.scr_fh[a] = (self.scr_fh[a] - f).exp();
             }
-            // u = (F·e^{-f}) · M — the landmark mixing row.
+            // u = (F·e^{-f}) · M — the landmark mixing row (= FM, up to
+            // the positive factor e^{-f}).
             for b in 0..self.m_eff {
                 let mut s = 0.0f32;
                 for a in 0..self.m_eff {
                     s += self.scr_fh[a] * self.mu[a * self.m_eff + b];
                 }
-                self.scr_u[b] = s;
+                // FM rectifier: every far weight is Σ_b FM[b]·E[b,j]
+                // with E ≥ 0 elementwise, so clamping this m-vector is
+                // enough to make all of them non-negative — the per-key
+                // guarantee the streaming form otherwise cannot state.
+                // The row shift e^{-f} and the flash factors below are
+                // strictly positive, so clamping here or after the
+                // rescale is the same predicate.
+                self.scr_u[b] = if self.rect == O1Rect::Fm { s.max(0.0) } else { s };
             }
             // Joint scale: the far term b carries e^{f + m_max[b]}, the
             // near term e^{c}; take the max so every factor is ≤ 1.
@@ -293,11 +376,11 @@ impl NystromState {
                 self.scr_u[b] = g;
                 far_den += g * self.z_hat[b];
             }
-            // Guard: M is indefinite, so the aggregated far mass can go
-            // negative; a negative denominator means the skeleton
+            // Aggregate guard — the rectifier of `O1Rect::Aggregate`,
+            // and a second line of defence under `Fm` (where far_den is
+            // a sum of non-negative terms, so this can only fire on
+            // rounding): a negative denominator means the skeleton
             // estimate is unusable for this row — drop the far field.
-            // (The matrix probe clamps per-(t,j); per-key weights no
-            // longer exist after aggregation, so the guard is coarser.)
             if far_den >= 0.0 {
                 have_far = true;
             } else {
@@ -521,6 +604,8 @@ pub(crate) fn ridge_pinv(a: &[f64], n: usize) -> Vec<f64> {
 pub const O1_DEFAULT_M: usize = 32;
 pub const O1_DEFAULT_W: usize = 128;
 pub const O1_DEFAULT_SINK: usize = 4;
+/// Rectifier default (see `O1Rect`).
+pub const O1_DEFAULT_RECT: O1Rect = O1Rect::Aggregate;
 
 /// Which layers run the O(1) kernel.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -544,6 +629,8 @@ pub struct O1Cfg {
     pub w: usize,
     /// Permanent exact sink keys (StreamingLLM discipline, spec §5b).
     pub sink: usize,
+    /// Skeleton rectifier (see `O1Rect`).
+    pub rect: O1Rect,
 }
 
 /// Three-state env reading: unset falls through to the header hint,
@@ -573,13 +660,31 @@ impl O1Cfg {
         }
     }
 
+    /// Parse a rectifier spec: `agg`/`aggregate` | `fm`. None = not a
+    /// spec.
+    pub fn parse_rect(spec: &str) -> Option<O1Rect> {
+        match spec.trim() {
+            "agg" | "aggregate" => Some(O1Rect::Aggregate),
+            "fm" => Some(O1Rect::Fm),
+            _ => None,
+        }
+    }
+
+    /// Rectifier from an explicit value, else `CMF_O1_RECT`, else the
+    /// default.
+    fn rect_or_env(rect: Option<O1Rect>) -> O1Rect {
+        rect.or_else(|| std::env::var("CMF_O1_RECT").ok().as_deref().and_then(Self::parse_rect))
+            .unwrap_or(O1_DEFAULT_RECT)
+    }
+
     /// Build from an explicit spec (CLI path). None = `off` or malformed.
-    /// Explicit m/w/sink beat env overrides beat validated defaults.
+    /// Explicit m/w/sink/rect beat env overrides beat validated defaults.
     pub fn from_spec(
         spec: &str,
         m: Option<usize>,
         w: Option<usize>,
         sink: Option<usize>,
+        rect: Option<O1Rect>,
     ) -> Option<O1Cfg> {
         let layers = Self::parse_layers(spec)?;
         let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
@@ -590,6 +695,7 @@ impl O1Cfg {
             m: m.or_else(|| env("CMF_O1_M")).unwrap_or(O1_DEFAULT_M).max(4),
             w: w.or_else(|| env("CMF_O1_WINDOW")).unwrap_or(O1_DEFAULT_W).max(1),
             sink: sink.or_else(|| env("CMF_O1_SINK")).unwrap_or(O1_DEFAULT_SINK),
+            rect: Self::rect_or_env(rect),
         })
     }
 
@@ -611,6 +717,9 @@ impl O1Cfg {
             m: env("CMF_O1_M").or_else(|| f("m")).unwrap_or(O1_DEFAULT_M).max(4),
             w: env("CMF_O1_WINDOW").or_else(|| f("w")).unwrap_or(O1_DEFAULT_W).max(1),
             sink: env("CMF_O1_SINK").or_else(|| f("sink")).unwrap_or(O1_DEFAULT_SINK),
+            // The rectifier is a runtime property of the kernel, not a
+            // property of the weights — a file hint cannot pin it.
+            rect: Self::rect_or_env(None),
         })
     }
 
@@ -643,7 +752,7 @@ impl O1Cfg {
 pub fn o1_from_env() -> O1Env {
     match std::env::var("CMF_O1") {
         Err(_) => O1Env::Unset,
-        Ok(s) => match O1Cfg::from_spec(&s, None, None, None) {
+        Ok(s) => match O1Cfg::from_spec(&s, None, None, None, None) {
             Some(cfg) => O1Env::On(cfg),
             None => O1Env::Off,
         },
