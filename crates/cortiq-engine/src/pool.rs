@@ -55,6 +55,15 @@ struct Inner {
 // publication that follows the write.
 unsafe impl Sync for Inner {}
 
+/// Process-wide dispatch counter (roadmap §3 P0 «измерения»): one tick
+/// per published job. `bench --json` reports dispatches/token from it.
+static DISPATCHES: AtomicUsize = AtomicUsize::new(0);
+
+/// Total pool jobs published since process start (all pools).
+pub fn dispatch_count() -> usize {
+    DISPATCHES.load(Ordering::Relaxed)
+}
+
 /// Persistent thread pool: shared job slot, epoch dispatch, caller
 /// participation.
 pub struct Pool {
@@ -150,6 +159,7 @@ impl Pool {
     /// calling thread (`worker_idx = n_workers()` for the caller);
     /// returns when all participants have finished.
     pub fn run(&self, f: &(dyn Fn(usize, usize) + Sync)) {
+        DISPATCHES.fetch_add(1, Ordering::Relaxed);
         let nw = self.threads.len();
         let n = nw + 1; // caller participates
         // SAFETY: the wait loop below blocks until every worker is done,

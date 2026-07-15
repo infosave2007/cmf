@@ -6,6 +6,32 @@ mod npy;
 
 use clap::{Parser, Subcommand};
 use cortiq_core::CmfModel;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+/// Counting allocator: one relaxed increment per allocation — cheap
+/// enough to keep always-on, precise enough for the roadmap's
+/// «allocations/token in steady decode» counter (`bench --json`).
+struct CountingAlloc;
+
+static ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+unsafe impl GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCS.fetch_add(1, AtomicOrdering::Relaxed);
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        ALLOCS.fetch_add(1, AtomicOrdering::Relaxed);
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL_ALLOC: CountingAlloc = CountingAlloc;
 use cortiq_engine::{CortiqRuntime, Pipeline, SamplerConfig};
 use cortiq_server::{build_router, AppState};
 use std::sync::Arc;
@@ -371,6 +397,11 @@ enum Commands {
         /// Number of tokens to generate
         #[arg(long, default_value = "100")]
         tokens: u32,
+        /// Machine-readable output: one JSON object with tok/s plus
+        /// steady-state counters (allocations/token, pool
+        /// dispatches/token) — the benchmark contract of the roadmap
+        #[arg(long)]
+        json: bool,
         /// Long-context mode: synthetic prompt of N tokens; reports
         /// prefill/decode at that depth plus the KV/state memory —
         /// O(context) KV for full-attention vs O(1) state for the
@@ -736,6 +767,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             task,
             tokens,
+            json,
             ctx,
             o1,
             o1_m,
@@ -743,7 +775,7 @@ async fn main() -> anyhow::Result<()> {
             o1_sink,
         } => {
             let o1 = O1Flags { spec: o1, m: o1_m, w: o1_window, sink: o1_sink, rect: None };
-            cmd_bench(&model, &task, tokens, ctx, &o1).await
+            cmd_bench(&model, &task, tokens, ctx, &o1, json).await
         }
         Commands::Verify { model } => cmd_verify(&model).await,
         Commands::Fcd {
@@ -2187,8 +2219,11 @@ async fn cmd_bench(
     tokens: u32,
     ctx: Option<usize>,
     o1: &O1Flags,
+    json: bool,
 ) -> anyhow::Result<()> {
-    println!("Benchmark: {} | task={} | tokens={}", model_path, task, tokens);
+    if !json {
+        println!("Benchmark: {} | task={} | tokens={}", model_path, task, tokens);
+    }
     if let Some(n) = ctx {
         // Long-context mode must not silently evict mid-measurement:
         // raise the cap to cover prompt + generation unless the user
@@ -2264,10 +2299,18 @@ async fn cmd_bench(
     // the one-off o1 seal) differs from the timed forward_ids prefill
     // above, so deriving decode by subtraction billed that difference
     // to the decode line — wrong for both arms, worst at long ctx.
-    let stamps: Arc<std::sync::Mutex<Vec<std::time::Instant>>> = Arc::default();
+    // Per-token stamps carry the counter snapshots too: steady-state
+    // allocations/token and pool dispatches/token come from the same
+    // inter-token deltas as the steady tok/s (roadmap этап 0).
+    type Stamp = (std::time::Instant, u64, usize);
+    let stamps: Arc<std::sync::Mutex<Vec<Stamp>>> = Arc::default();
     let st = stamps.clone();
     let cb: cortiq_engine::TokenCallback = Box::new(move |_tok| {
-        st.lock().unwrap().push(std::time::Instant::now());
+        st.lock().unwrap().push((
+            std::time::Instant::now(),
+            ALLOCS.load(AtomicOrdering::Relaxed),
+            cortiq_engine::pool::dispatch_count(),
+        ));
         true
     });
     let t1 = std::time::Instant::now();
@@ -2276,35 +2319,33 @@ async fn cmd_bench(
         .map_err(|e| anyhow::anyhow!(e))?;
     let total_s = t1.elapsed().as_secs_f64();
 
-    println!("  Prompt:  {} tokens | prefill {:.1} tok/s", prompt_ids.len(), prompt_ids.len() as f64 / prefill_s.max(1e-9));
+    if !json {
+        println!("  Prompt:  {} tokens | prefill {:.1} tok/s", prompt_ids.len(), prompt_ids.len() as f64 / prefill_s.max(1e-9));
+    }
     let stamps = stamps.lock().unwrap();
     // stamp[0] fires right after generation's prefill (the first token
     // is sampled from the prefill hidden, no decode forward yet).
-    let decode_tps = if stamps.len() >= 2 {
-        (stamps.len() - 1) as f64
-            / (stamps[stamps.len() - 1] - stamps[0]).as_secs_f64().max(1e-9)
+    let n_st = stamps.len();
+    let decode_tps = if n_st >= 2 {
+        (n_st - 1) as f64
+            / (stamps[n_st - 1].0 - stamps[0].0).as_secs_f64().max(1e-9)
     } else {
         0.0
     };
+    // Steady-state counters over the same inter-token window as tok/s.
+    let (allocs_per_token, dispatches_per_token) = if n_st >= 2 {
+        let steps = (n_st - 1) as f64;
+        (
+            (stamps[n_st - 1].1 - stamps[0].1) as f64 / steps,
+            (stamps[n_st - 1].2 - stamps[0].2) as f64 / steps,
+        )
+    } else {
+        (0.0, 0.0)
+    };
     let ttft_s = stamps
         .first()
-        .map(|s| s.duration_since(t1).as_secs_f64())
+        .map(|s| s.0.duration_since(t1).as_secs_f64())
         .unwrap_or(0.0);
-    println!(
-        "  Decode:  {} tokens | {:.1} tok/s steady (TTFT {:.2}s, {:.1} incl. prefill)",
-        result.tokens_generated,
-        decode_tps,
-        ttft_s,
-        result.tokens_generated as f64 / total_s.max(1e-9)
-    );
-    if pair_ms > 0.0 {
-        println!(
-            "  Pair:    2 singles {:.2} ms vs fused {:.2} ms (×{:.2} cheaper second lane)",
-            singles_ms,
-            pair_ms,
-            singles_ms / pair_ms.max(1e-9)
-        );
-    }
     // KV/state residency at the end of the run: full-attention layers
     // grow O(context); the linear core (vmf_phase/GDN) and the nystrom
     // override hold O(1) state — this line is the long-context memory
@@ -2316,6 +2357,54 @@ async fn cmd_bench(
         .iter()
         .map(|l| l.o1_memory_bytes())
         .sum();
+    if json {
+        // llama-bench-compatible spirit: one flat JSON object, raw
+        // numbers only — joinable without parsing human text.
+        let obj = serde_json::json!({
+            "model": model_path,
+            "task": task,
+            "ctx": ctx,
+            "o1": pipeline.o1_active(),
+            "threads_env": std::env::var("CMF_THREADS").ok(),
+            "prompt_tokens": prompt_ids.len(),
+            "prefill_tok_s": prompt_ids.len() as f64 / prefill_s.max(1e-9),
+            "tokens_generated": result.tokens_generated,
+            "decode_tok_s_steady": decode_tps,
+            "decode_tok_s_incl_prefill": result.tokens_generated as f64 / total_s.max(1e-9),
+            "ttft_s": ttft_s,
+            "allocs_per_token": allocs_per_token,
+            "pool_dispatches_per_token": dispatches_per_token,
+            "pair_singles_ms": singles_ms,
+            "pair_fused_ms": pair_ms,
+            "kv_state_bytes": total_mem,
+            "nystrom_state_bytes": nystrom_mem,
+            "seq_len": pipeline.kv_cache.seq_len(),
+            "mtp_drafted": result.mtp_drafted,
+            "mtp_accepted": result.mtp_accepted,
+            "finish_reason": result.finish_reason,
+        });
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+        return Ok(());
+    }
+    println!(
+        "  Decode:  {} tokens | {:.1} tok/s steady (TTFT {:.2}s, {:.1} incl. prefill)",
+        result.tokens_generated,
+        decode_tps,
+        ttft_s,
+        result.tokens_generated as f64 / total_s.max(1e-9)
+    );
+    println!(
+        "  Steady:  {:.1} allocs/token | {:.1} pool dispatches/token",
+        allocs_per_token, dispatches_per_token
+    );
+    if pair_ms > 0.0 {
+        println!(
+            "  Pair:    2 singles {:.2} ms vs fused {:.2} ms (×{:.2} cheaper second lane)",
+            singles_ms,
+            pair_ms,
+            singles_ms / pair_ms.max(1e-9)
+        );
+    }
     if nystrom_mem > 0 {
         println!(
             "  Memory:  KV+state {:.1} MB (exact KV {:.1} MB + nystrom state {:.1} MB) at seq_len {}",
