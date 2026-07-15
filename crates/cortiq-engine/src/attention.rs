@@ -560,10 +560,10 @@ pub fn qwen_attention(
 
 /// Dense GQA attention for one DECODE position on a SEALED O(1) layer:
 /// projection / qk-norm / partial RoPE / output gate are identical to
-/// `qwen_attention`, but the KV cache is replaced by per-Q-head
+/// `qwen_attention`, but the KV cache is replaced by per-KV-group
 /// streaming Nyström states (exact window + permanent sinks + landmark
-/// skeleton). Head masks don't apply — the o1 path is dense, like the
-/// masked-on-quantized fallback.
+/// skeleton, shared across the group's Q heads). Head masks don't
+/// apply — the o1 path is dense, like the masked-on-quantized fallback.
 #[allow(clippy::too_many_arguments)]
 pub fn qwen_attention_nystrom(
     hidden: &[f32],

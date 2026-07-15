@@ -137,14 +137,14 @@ converts the 8; Apple M4, every cell run on a cooled machine):
 
 | context | attention memory, `--o1 off` | `--o1 all` | decode |
 |---|---|---|---|
-| 543 | 141.0 MB | 153.2 MB | 15.7 → 16.5 tok/s |
-| 1055 | 174.5 MB | **153.2 MB** | 15.5 → 16.5 tok/s |
-| 4127 | 375.8 MB | **153.2 MB** (÷2.45) | 8.2 → 10.7 tok/s |
+| 543 | 141.0 MB | **124.1 MB** | 15.7 → 16.5 tok/s |
+| 1055 | 174.5 MB | **124.1 MB** | 15.5 → 16.5 tok/s |
+| 4127 | 380.3 MB | **124.1 MB** (÷3.06) | 8.2 → 10.7 tok/s |
 
 The state is **byte-identical at 8× context** — that is the whole point. It
-decomposes as a constant recurrent-layer floor plus a fixed 47.9 MB in place
-of the softmax layers' KV (~65 KB/token here), so o1 *costs* ~12 MB below a
-**~700-token crossover** and saves from there on: ÷2.45 at 4k, ÷14 at 32k.
+decomposes as a constant recurrent-layer floor plus a fixed 18.8 MB in place
+of the softmax layers' KV (~64 KiB/token here), so o1 pays off past a
+**~290-token crossover** and saves from there on: ÷3.06 at 4k, ÷17 at 32k.
 Quality, measured through the real streaming kernel on the harshest region
 (landmarks sealed from a 256-token prefill, scoring only later positions):
 **×1.132** on this hybrid, **×1.296** on a pure-attention 0.6B — check any

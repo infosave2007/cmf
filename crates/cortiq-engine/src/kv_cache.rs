@@ -52,8 +52,9 @@ const KV_K_GROUP: usize = 32;
 /// prefill outputs feed the residual stream, so they cannot be
 /// deferred) while the per-position rotated queries are buffered;
 /// `o1_seal()` then freezes landmarks + M from the full prompt, replays
-/// it into per-Q-head streaming states, and DROPS the full KV. Sealed:
-/// decode replaces cache attention with `NystromState::step()`.
+/// it into per-KV-group streaming states, and DROPS the full KV.
+/// Sealed: decode replaces cache attention with
+/// `NystromState::step_group()`.
 #[derive(Debug, Clone)]
 pub enum O1State {
     Collecting {
@@ -64,12 +65,12 @@ pub enum O1State {
         /// Rotated post-norm queries, `[pos × num_heads × head_dim]`.
         q_buf: Vec<f32>,
     },
-    /// One state per Q head: the far field T̂/Ẑ depends on that head's
-    /// own query landmarks, so GQA groups cannot share it. The window
-    /// K/V is duplicated across the group's Q heads (×heads_per_kv) —
-    /// the price of keeping the golden-parity kernel intact; still O(1)
-    /// in context and far below full KV at depth.
-    Sealed { states: Vec<crate::nystrom::NystromState> },
+    /// One state per KV GROUP, each holding its group's Q heads. The
+    /// exact window / sinks / K̃ are stored once per group (every Q head
+    /// of the group reads the same k/v rows); only the far field, Q̃ and
+    /// M — the query-dependent pieces — stay per Q head. See
+    /// `NystromState` for which piece is which and why.
+    Sealed { groups: Vec<crate::nystrom::NystromState> },
 }
 
 /// KV cache for a single layer, head-major.
@@ -146,10 +147,11 @@ impl LayerKvCache {
         matches!(self.o1, Some(O1State::Sealed { .. }))
     }
 
-    /// Freeze the prompt into per-Q-head Nyström states and drop this
+    /// Freeze the prompt into per-KV-group Nyström states and drop this
     /// layer's full KV. Returns false (layer stays exact, KV kept) when
     /// the preconditions fail: the seal needs f32 KV rows (`CMF_KV=q8`
-    /// stores int8), every group densely stored, and a full q trace.
+    /// stores int8), every group densely stored, a full q trace, and a
+    /// GQA fan-out that actually divides.
     pub fn o1_seal(&mut self, num_heads: usize) -> bool {
         // Idempotent: sealing a sealed (or plain) layer must not
         // disturb its state — check before take().
@@ -160,29 +162,38 @@ impl LayerKvCache {
             unreachable!("checked above");
         };
         let (hd, t) = (self.head_dim, self.seq_len);
-        let hpk = num_heads / self.num_kv_heads.max(1);
+        let nkv = self.num_kv_heads.max(1);
+        let hpk = num_heads / nkv;
         let ok = t > 0
             && self.mode == KvMode::F32
             && q_buf.len() == t * num_heads * hd
+            && hpk * nkv == num_heads
             && (0..self.num_kv_heads).all(|g| self.head_len(g) == t);
         if !ok {
             tracing::warn!(
                 "o1: cannot seal (needs f32 KV mode, dense heads, full query \
-                 trace) — layer keeps exact attention"
+                 trace, num_heads divisible by num_kv_heads) — layer keeps \
+                 exact attention"
             );
             return false;
         }
-        let mut states = Vec::with_capacity(num_heads);
-        let mut qh = vec![0.0f32; t * hd];
-        for h in 0..num_heads {
-            let g = h / hpk;
-            for p in 0..t {
-                let src = (p * num_heads + h) * hd;
-                qh[p * hd..(p + 1) * hd].copy_from_slice(&q_buf[src..src + hd]);
+        let mut groups = Vec::with_capacity(self.num_kv_heads);
+        // Query trace is position-major; the state wants each head's
+        // queries contiguous, so transpose one group at a time.
+        let mut qh = vec![0.0f32; hpk * t * hd];
+        for g in 0..self.num_kv_heads {
+            for hh in 0..hpk {
+                let h = g * hpk + hh;
+                for p in 0..t {
+                    let src = (p * num_heads + h) * hd;
+                    let dst = (hh * t + p) * hd;
+                    qh[dst..dst + hd].copy_from_slice(&q_buf[src..src + hd]);
+                }
             }
-            let mut st = crate::nystrom::NystromState::new(m, w, sink).with_rect(rect);
-            st.prefill(&qh, &self.k[g], &self.v[g], t, hd, hd);
-            states.push(st);
+            let qs: Vec<&[f32]> = (0..hpk).map(|hh| &qh[hh * t * hd..(hh + 1) * t * hd]).collect();
+            let mut st = crate::nystrom::NystromState::new_group(m, w, sink, hpk).with_rect(rect);
+            st.prefill_group(&qs, &self.k[g], &self.v[g], t, hd, hd);
+            groups.push(st);
         }
         // The states now carry everything decode needs — release the
         // O(context) storage (this is the memory claim, not a cosmetic).
@@ -191,15 +202,15 @@ impl LayerKvCache {
             self.v[h] = Vec::new();
         }
         self.imp = Vec::new();
-        self.o1 = Some(O1State::Sealed { states });
+        self.o1 = Some(O1State::Sealed { groups });
         true
     }
 
-    /// One decode step on a sealed layer: per Q head, insert the GQA
-    /// group's fresh (k, v) and read the attention output. Returns
-    /// `[num_heads × head_dim]`. The same (k, v) is inserted into each
-    /// of the group's per-Q-head states — same math as the shared KV
-    /// row the exact path would have appended once.
+    /// One decode step on a sealed layer: per KV group, insert the
+    /// group's fresh (k, v) ONCE and read every Q head's attention
+    /// output. Returns `[num_heads × head_dim]`. Head h belongs to group
+    /// h/hpk, so a group's Q heads are contiguous in `q_all`/`out` —
+    /// same math as the shared KV row the exact path appends once.
     pub fn o1_step(
         &mut self,
         q_all: &[f32],
@@ -210,17 +221,17 @@ impl LayerKvCache {
         let hd = self.head_dim;
         let hpk = num_heads / self.num_kv_heads.max(1);
         let mut out = vec![0.0f32; num_heads * hd];
-        let Some(O1State::Sealed { states }) = &mut self.o1 else {
+        let Some(O1State::Sealed { groups }) = &mut self.o1 else {
             debug_assert!(false, "o1_step on an unsealed layer");
             return out;
         };
-        for h in 0..num_heads {
-            let g = h / hpk;
-            states[h].step(
-                &q_all[h * hd..(h + 1) * hd],
+        for (g, st) in groups.iter_mut().enumerate() {
+            let (lo, hi) = (g * hpk * hd, (g + 1) * hpk * hd);
+            st.step_group(
+                &q_all[lo..hi],
                 &k_new[g * hd..(g + 1) * hd],
                 &v_new[g * hd..(g + 1) * hd],
-                &mut out[h * hd..(h + 1) * hd],
+                &mut out[lo..hi],
             );
         }
         // Track the true context depth for the honest memory/seq report
@@ -230,14 +241,14 @@ impl LayerKvCache {
     }
 
     /// Bytes held by the O(1) override (query trace while collecting,
-    /// per-head states once sealed).
+    /// per-KV-group states once sealed).
     pub fn o1_memory_bytes(&self) -> usize {
         match &self.o1 {
             Some(O1State::Collecting { q_buf, .. }) => {
                 q_buf.len() * std::mem::size_of::<f32>()
             }
-            Some(O1State::Sealed { states }) => {
-                states.iter().map(|s| s.memory_bytes()).sum()
+            Some(O1State::Sealed { groups }) => {
+                groups.iter().map(|s| s.memory_bytes()).sum()
             }
             None => 0,
         }

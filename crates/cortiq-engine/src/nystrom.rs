@@ -1,5 +1,5 @@
-//! Nyström (landmark) attention kernel — streaming per-head runtime for
-//! long-context `attn_type: nystrom` layers.
+//! Nyström (landmark) attention kernel — streaming per-GQA-group runtime
+//! for long-context `attn_type: nystrom` layers.
 //!
 //! Attention splits into an EXACT sliding window (last `w` keys) and a
 //! landmark-skeleton far field sharing ONE joint denominator:
@@ -109,24 +109,50 @@ const DEN_EPS: f32 = 1e-30;
 /// tiny prefills duplicate segment-mean landmarks (singular Au).
 const EXACT_SLACK: usize = 8;
 
-/// Streaming per-head Nyström attention state.
+/// Streaming Nyström attention state for ONE GQA group.
+///
+/// State splits along the GQA grain, because the operator does:
+///
+/// * SHARED per KV group (`NystromGroup`) — the exact window ring, the
+///   sink buffer and the key landmarks K̃.  Under GQA every Q head of a
+///   group reads the SAME k/v rows, so all three are bit-identical
+///   across the group; storing them once per group instead of once per
+///   Q head is the point of this split (identical arithmetic,
+///   ×heads_per_kv less window memory).  K̃ = seg_means(ks, t, d, m_eff)
+///   is a pure function of the group's keys and of `t` (which fixes
+///   m_eff), so it is shareable for the same reason the keys are.
+/// * PRIVATE per Q head (`NystromHead`) — the far accumulators T̂/Ẑ and
+///   their per-landmark running maxima, the QUERY landmarks Q̃, and the
+///   mixing matrix M = pinv(exp(Q̃K̃ᵀ/√d)).  Q̃ is built from that head's
+///   own queries, so M and the far field it drives are per-Q-head and
+///   cannot be shared: the far mass a head accumulates is contracted
+///   against its own query landmarks.
 ///
 /// Lifecycle: `new(m, w, sink)` → `prefill(prompt)` once → `step()` per
-/// decode token.  All buffers are flat `Vec<f32>`, row-major; the
-/// skeleton path performs no allocations inside `step()`.
+/// decode token (single-head façade), or `new_group`/`prefill_group`/
+/// `step_group` for a whole GQA group at once.  All buffers are flat
+/// `Vec<f32>`, row-major; the skeleton path performs no allocations
+/// inside `step()`.
 #[derive(Clone, Debug)]
 pub struct NystromState {
+    group: NystromGroup,
+    heads: Vec<NystromHead>,
+}
+
+/// The part of the state a GQA group shares: everything derived from
+/// the group's KEYS and VALUES alone (see `NystromState`).
+#[derive(Clone, Debug)]
+struct NystromGroup {
     /// Landmark budget (m) — effective count may be lower (`m_eff`).
     m: usize,
     /// Exact-window width in keys.
     w: usize,
     /// Permanent exact sink keys at positions 0..sink (spec §5b).
     sink: usize,
-    /// How the indefinite skeleton is rectified (see `O1Rect`).
-    rect: O1Rect,
     d: usize,
     dv: usize,
-    /// Effective landmark count: clamp(t/8, 4, m) at prefill.
+    /// Effective landmark count: clamp(t/8, 4, m) at prefill.  Derived
+    /// from the prompt length, hence equal for every head of the group.
     m_eff: usize,
     /// Short-prompt mode: window holds ALL keys, no skeleton.  The
     /// buffer grows on decode, so this mode may allocate in `step()` —
@@ -148,6 +174,16 @@ pub struct NystromState {
     /// Number of stored sink tokens (0 in exact-only mode, where every
     /// key is permanent-exact anyway).
     sink_len: usize,
+    /// Key landmarks `[m_eff][d]` — segment means of the group's keys.
+    k_tilde: Vec<f32>,
+}
+
+/// The part of the state that is private to one Q head: everything that
+/// touches that head's QUERIES (see `NystromState`).
+#[derive(Clone, Debug)]
+struct NystromHead {
+    /// How the indefinite skeleton is rectified (see `O1Rect`).
+    rect: O1Rect,
     /// Far numerator `[m_eff][dv]`, stored at scale e^{-m_max[i]}.
     t_hat: Vec<f32>,
     /// Far denominator `[m_eff]`, same scale.
@@ -158,12 +194,11 @@ pub struct NystromState {
     far_len: usize,
     /// Query landmarks `[m_eff][d]` (segment means of the prefill).
     q_tilde: Vec<f32>,
-    /// Key landmarks `[m_eff][d]`.
-    k_tilde: Vec<f32>,
     /// Regularized pseudo-inverse of Au = exp(Q̃·K̃ᵀ/√d), `[m_eff][m_eff]`.
     mu: Vec<f32>,
     // Scratch preallocated at prefill so skeleton-mode step() is
-    // allocation-free.
+    // allocation-free.  Per head rather than per group: the heads of a
+    // group write it independently, and it is ~0.5 KB.
     scr_s: Vec<f32>,
     scr_fh: Vec<f32>,
     scr_u: Vec<f32>,
@@ -171,6 +206,9 @@ pub struct NystromState {
 }
 
 impl NystromState {
+    /// Single-head state (`heads_per_kv == 1`, and the shape the kernel
+    /// unit tests use).
+    ///
     /// `m` — landmark budget (≥ 4; see `O1_DEFAULT_M`),
     /// `w` — exact window width (validated setting is 128),
     /// `sink` — permanent exact sink keys (validated default is 4;
@@ -178,59 +216,204 @@ impl NystromState {
     /// Rectifier defaults to `O1_DEFAULT_RECT`; override with
     /// `with_rect` (the golden-parity test pins it explicitly).
     pub fn new(m: usize, w: usize, sink: usize) -> Self {
+        Self::new_group(m, w, sink, 1)
+    }
+
+    /// State for one GQA group of `q_heads` query heads sharing a KV
+    /// head.  The window/sink/K̃ are stored ONCE for the group; each Q
+    /// head keeps its own far field, Q̃ and M.
+    pub fn new_group(m: usize, w: usize, sink: usize, q_heads: usize) -> Self {
         assert!(m >= 4, "landmark budget must be at least 4");
         assert!(w >= 1, "window must hold at least one key");
+        assert!(q_heads >= 1, "a GQA group needs at least one query head");
         NystromState {
-            m,
-            w,
-            sink,
-            rect: O1_DEFAULT_RECT,
-            d: 0,
-            dv: 0,
-            m_eff: 0,
-            exact_only: true,
-            scale: 0.0,
-            win_k: Vec::new(),
-            win_v: Vec::new(),
-            win_len: 0,
-            win_head: 0,
-            sink_k: Vec::new(),
-            sink_v: Vec::new(),
-            sink_len: 0,
-            t_hat: Vec::new(),
-            z_hat: Vec::new(),
-            m_max: Vec::new(),
-            far_len: 0,
-            q_tilde: Vec::new(),
-            k_tilde: Vec::new(),
-            mu: Vec::new(),
-            scr_s: Vec::new(),
-            scr_fh: Vec::new(),
-            scr_u: Vec::new(),
-            scr_l: Vec::new(),
+            group: NystromGroup {
+                m,
+                w,
+                sink,
+                d: 0,
+                dv: 0,
+                m_eff: 0,
+                exact_only: true,
+                scale: 0.0,
+                win_k: Vec::new(),
+                win_v: Vec::new(),
+                win_len: 0,
+                win_head: 0,
+                sink_k: Vec::new(),
+                sink_v: Vec::new(),
+                sink_len: 0,
+                k_tilde: Vec::new(),
+            },
+            heads: (0..q_heads).map(|_| NystromHead::new()).collect(),
         }
     }
 
-    /// Select the skeleton rectifier (builder; see `O1Rect`).
+    /// Select the skeleton rectifier for every head of the group
+    /// (builder; see `O1Rect`).
     pub fn with_rect(mut self, rect: O1Rect) -> Self {
-        self.rect = rect;
+        for h in &mut self.heads {
+            h.rect = rect;
+        }
         self
     }
 
-    /// Absorb the whole prompt for this head: freeze landmarks and M,
-    /// then replay the prompt through the step() state semantics
-    /// (window fill + delayed far insertion).  `qs`/`ks` are `[t][d]`,
-    /// `vs` is `[t][dv]`, all row-major.
+    /// Query heads in this group.
+    pub fn num_q_heads(&self) -> usize {
+        self.heads.len()
+    }
+
+    /// Keys absorbed into head `head`'s far field.  Exposed for the
+    /// delayed-insertion invariant test: eviction is a GROUP event, but
+    /// each head must absorb the evicted key EXACTLY once, so this must
+    /// equal the number of evictions — never a multiple of it.
+    pub fn far_len(&self, head: usize) -> usize {
+        self.heads[head].far_len
+    }
+
+    /// Absorb the whole prompt for a single-head state — see
+    /// `prefill_group`.
     pub fn prefill(&mut self, qs: &[f32], ks: &[f32], vs: &[f32], t: usize, d: usize, dv: usize) {
-        assert_eq!(qs.len(), t * d);
+        assert_eq!(self.heads.len(), 1, "use prefill_group for a GQA group");
+        self.prefill_group(&[qs], ks, vs, t, d, dv);
+    }
+
+    /// Absorb the whole prompt for a GQA group: freeze each head's
+    /// landmarks and M, then replay the prompt through the step() state
+    /// semantics (window fill + delayed far insertion).  `qs[h]` is that
+    /// head's `[t][d]` query block; `ks` is `[t][d]` and `vs` is
+    /// `[t][dv]` — the group's shared keys/values, row-major.
+    pub fn prefill_group(
+        &mut self,
+        qs: &[&[f32]],
+        ks: &[f32],
+        vs: &[f32],
+        t: usize,
+        d: usize,
+        dv: usize,
+    ) {
+        assert_eq!(qs.len(), self.heads.len(), "one query block per head");
+        for q in qs {
+            assert_eq!(q.len(), t * d);
+        }
         assert_eq!(ks.len(), t * d);
         assert_eq!(vs.len(), t * dv);
+
+        let Some(k_tilde64) = self.group.prefill_shared(ks, vs, t, d, dv) else {
+            // exact-only: no skeleton, no far field — nothing per head
+            // beyond the score scratch.
+            for h in &mut self.heads {
+                h.seal_exact(t);
+            }
+            return;
+        };
+        for (h, q) in self.heads.iter_mut().zip(qs) {
+            h.seal(&self.group, q, t, &k_tilde64);
+        }
+        // Replay the post-sink prompt ONCE for the group: each key
+        // enters the shared window, evicting the (j-w)-th into every
+        // head's far field.
+        for j in self.group.sink..t {
+            Self::advance(
+                &mut self.group,
+                &mut self.heads,
+                &ks[j * d..(j + 1) * d],
+                &vs[j * dv..(j + 1) * dv],
+            );
+        }
+    }
+
+    /// One decode step for a single-head state — see `step_group`.
+    pub fn step(&mut self, q: &[f32], k: &[f32], v: &[f32], out: &mut [f32]) {
+        assert_eq!(self.heads.len(), 1, "use step_group for a GQA group");
+        self.step_group(q, k, v, out);
+    }
+
+    /// One decode step for the whole GQA group.  Inserts the group's
+    /// (k, v) ONCE, evicting the oldest window key into every head's far
+    /// accumulators, then writes each head's attention output.
+    /// `q_all` is `[q_heads][d]`, `out_all` is `[q_heads][dv]`.
+    pub fn step_group(&mut self, q_all: &[f32], k: &[f32], v: &[f32], out_all: &mut [f32]) {
+        let (d, dv) = (self.group.d, self.group.dv);
+        assert!(d > 0, "prefill() must run before step()");
+        let nh = self.heads.len();
+        assert_eq!(q_all.len(), nh * d);
+        assert_eq!(k.len(), d);
+        assert_eq!(v.len(), dv);
+        assert_eq!(out_all.len(), nh * dv);
+        // The current token is part of its own near window (t-j = 0),
+        // so insertion happens BEFORE any output is computed.
+        Self::advance(&mut self.group, &mut self.heads, k, v);
+        for (h, head) in self.heads.iter_mut().enumerate() {
+            head.step(
+                &self.group,
+                &q_all[h * d..(h + 1) * d],
+                &mut out_all[h * dv..(h + 1) * dv],
+            );
+        }
+    }
+
+    /// Heap bytes held by this group's state (shared window + sinks +
+    /// K̃, plus each head's skeleton and scratch) — feeds the honest
+    /// "KV+state" memory line, same discipline as counting
+    /// `linear_state` for the linear core.
+    pub fn memory_bytes(&self) -> usize {
+        self.group.memory_bytes()
+            + self.heads.iter().map(NystromHead::memory_bytes).sum::<usize>()
+    }
+
+    /// Push the group's (k, v) into the shared window.  In skeleton mode
+    /// a full ring first evicts its oldest key (delayed insertion — the
+    /// key leaves the exact window at this very step).
+    ///
+    /// The eviction is a GROUP event: the window is shared, so there is
+    /// exactly ONE eviction per position, not one per Q head.  The far
+    /// accumulators are per head, though, so that single evicted key is
+    /// absorbed once into EACH head — one eviction, `q_heads`
+    /// insertions.  Getting this wrong in either direction breaks the
+    /// boundary invariant (a key enters the far field at exactly the
+    /// step it leaves the window: no double count, no hole).
+    fn advance(g: &mut NystromGroup, heads: &mut [NystromHead], k: &[f32], v: &[f32]) {
+        let (d, dv) = (g.d, g.dv);
+        if !g.exact_only && g.win_len == g.w {
+            let slot = g.win_head;
+            // Every head absorbs the outgoing key BEFORE the slot is
+            // overwritten by the incoming one.
+            for h in heads.iter_mut() {
+                h.far_insert(g, slot);
+            }
+            g.win_k[slot * d..(slot + 1) * d].copy_from_slice(k);
+            g.win_v[slot * dv..(slot + 1) * dv].copy_from_slice(v);
+            g.win_head = (g.win_head + 1) % g.w;
+        } else if g.exact_only {
+            g.win_k.extend_from_slice(k);
+            g.win_v.extend_from_slice(v);
+            g.win_len += 1;
+        } else {
+            g.win_k[g.win_len * d..(g.win_len + 1) * d].copy_from_slice(k);
+            g.win_v[g.win_len * dv..(g.win_len + 1) * dv].copy_from_slice(v);
+            g.win_len += 1;
+        }
+    }
+}
+
+impl NystromGroup {
+    /// Freeze the group-shared geometry from the prompt's keys/values.
+    /// Returns the f64 key landmarks (which the heads need at full
+    /// precision to build Au), or None in exact-only mode.
+    fn prefill_shared(
+        &mut self,
+        ks: &[f32],
+        vs: &[f32],
+        t: usize,
+        d: usize,
+        dv: usize,
+    ) -> Option<Vec<f64>> {
         self.d = d;
         self.dv = dv;
         self.scale = 1.0 / (d as f32).sqrt();
         self.win_len = 0;
         self.win_head = 0;
-        self.far_len = 0;
         self.sink_len = 0;
         self.exact_only = t <= self.w + self.sink + EXACT_SLACK;
 
@@ -244,26 +427,70 @@ impl NystromState {
             self.win_k.extend_from_slice(ks);
             self.win_v.extend_from_slice(vs);
             self.win_len = t;
-            self.scr_s = Vec::with_capacity(t + 64);
-            return;
+            return None;
         }
 
         // Sink tokens: positions 0..sink become permanent exact keys.
         // They bypass the ring window entirely, so the delayed-insertion
-        // path below can never move them into the far accumulators.
+        // path can never move them into the far accumulators.
         self.sink_len = self.sink; // skeleton mode guarantees t > sink
         self.sink_k = ks[..self.sink * d].to_vec();
         self.sink_v = vs[..self.sink * dv].to_vec();
 
-        // Landmarks: contiguous segment means of the prompt (per-head).
-        // The integer split (i·t)/m matches the reference probe; the
-        // clamp keeps tiny prompts from producing duplicate landmarks.
+        // Landmarks: contiguous segment means of the prompt.  The
+        // integer split (i·t)/m matches the reference probe; the clamp
+        // keeps tiny prompts from producing duplicate landmarks.
         let m_eff = (t / 8).clamp(4, self.m);
         self.m_eff = m_eff;
-        let q_tilde64 = seg_means(qs, t, d, m_eff);
         let k_tilde64 = seg_means(ks, t, d, m_eff);
-        self.q_tilde = q_tilde64.iter().map(|&x| x as f32).collect();
         self.k_tilde = k_tilde64.iter().map(|&x| x as f32).collect();
+
+        self.win_k = vec![0.0; self.w * d];
+        self.win_v = vec![0.0; self.w * dv];
+        Some(k_tilde64)
+    }
+
+    fn memory_bytes(&self) -> usize {
+        (self.win_k.len()
+            + self.win_v.len()
+            + self.sink_k.len()
+            + self.sink_v.len()
+            + self.k_tilde.len())
+            * std::mem::size_of::<f32>()
+    }
+}
+
+impl NystromHead {
+    fn new() -> Self {
+        NystromHead {
+            rect: O1_DEFAULT_RECT,
+            t_hat: Vec::new(),
+            z_hat: Vec::new(),
+            m_max: Vec::new(),
+            far_len: 0,
+            q_tilde: Vec::new(),
+            mu: Vec::new(),
+            scr_s: Vec::new(),
+            scr_fh: Vec::new(),
+            scr_u: Vec::new(),
+            scr_l: Vec::new(),
+        }
+    }
+
+    /// exact-only mode: no skeleton state at all, just room to score the
+    /// growing window.
+    fn seal_exact(&mut self, t: usize) {
+        self.far_len = 0;
+        self.scr_s = Vec::with_capacity(t + 64);
+    }
+
+    /// Freeze this head's query landmarks and mixing matrix against the
+    /// group's (already frozen) key landmarks.
+    fn seal(&mut self, g: &NystromGroup, qs: &[f32], t: usize, k_tilde64: &[f64]) {
+        let (d, dv, m_eff) = (g.d, g.dv, g.m_eff);
+        self.far_len = 0;
+        let q_tilde64 = seg_means(qs, t, d, m_eff);
+        self.q_tilde = q_tilde64.iter().map(|&x| x as f32).collect();
 
         // Au and its regularized pseudo-inverse in f64 — one-off m×m
         // work at prefill only; the hot path stays f32.
@@ -274,7 +501,7 @@ impl NystromState {
                 for c in 0..d {
                     s += q_tilde64[i * d + c] * k_tilde64[j * d + c];
                 }
-                au[i * m_eff + j] = (s * self.scale as f64).exp();
+                au[i * m_eff + j] = (s * g.scale as f64).exp();
             }
         }
         let mu64 = ridge_pinv(&au, m_eff);
@@ -283,52 +510,36 @@ impl NystromState {
         self.t_hat = vec![0.0; m_eff * dv];
         self.z_hat = vec![0.0; m_eff];
         self.m_max = vec![f32::NEG_INFINITY; m_eff];
-        self.win_k = vec![0.0; self.w * d];
-        self.win_v = vec![0.0; self.w * dv];
-        self.scr_s = vec![0.0; self.sink + self.w];
+        self.scr_s = vec![0.0; g.sink + g.w];
         self.scr_fh = vec![0.0; m_eff];
         self.scr_u = vec![0.0; m_eff];
         self.scr_l = vec![0.0; m_eff];
-
-        // Replay the post-sink prompt through step() state semantics:
-        // each key enters the window, evicting the (j-w)-th into the
-        // far field.
-        for j in self.sink..t {
-            self.advance_window(&ks[j * d..(j + 1) * d], &vs[j * dv..(j + 1) * dv]);
-        }
     }
 
-    /// One decode step.  Inserts (k, v), evicting the oldest window key
-    /// into the far accumulators, then writes attention output for `q`
-    /// into `out` (`[dv]`).
-    pub fn step(&mut self, q: &[f32], k: &[f32], v: &[f32], out: &mut [f32]) {
-        let (d, dv) = (self.d, self.dv);
-        assert!(d > 0, "prefill() must run before step()");
+    /// This head's output for `q` against the group's current window and
+    /// sinks and its own far field.  The window insertion for this
+    /// position already happened at group level (`NystromState::advance`).
+    fn step(&mut self, g: &NystromGroup, q: &[f32], out: &mut [f32]) {
+        let (d, dv) = (g.d, g.dv);
         assert_eq!(q.len(), d);
-        assert_eq!(k.len(), d);
-        assert_eq!(v.len(), dv);
         assert_eq!(out.len(), dv);
-        // The current token is part of its own near window (t-j = 0),
-        // so insertion happens BEFORE the output is computed.
-        self.advance_window(k, v);
 
         // Near field: exact logits over sinks + window, one shared
         // shift.  Sinks are permanent exact keys (near mask §5b:
         // t-j < w OR j < sink); sink_len = 0 in exact-only mode.
-        let ns = self.sink_len;
-        let n = ns + self.win_len;
+        let ns = g.sink_len;
+        let n = ns + g.win_len;
         self.scr_s.resize(n, 0.0);
         let mut c = f32::NEG_INFINITY;
         for s in 0..ns {
-            let lg = dot(q, &self.sink_k[s * d..(s + 1) * d]) * self.scale;
+            let lg = dot(q, &g.sink_k[s * d..(s + 1) * d]) * g.scale;
             self.scr_s[s] = lg;
             c = c.max(lg);
         }
         // Window scores are the decode hot loop — NEON dot (same
         // products, regrouped sums; parity-gated by the golden tests).
-        for s in 0..self.win_len {
-            let lg =
-                crate::attention::dot_f32(q, &self.win_k[s * d..(s + 1) * d]) * self.scale;
+        for s in 0..g.win_len {
+            let lg = crate::attention::dot_f32(q, &g.win_k[s * d..(s + 1) * d]) * g.scale;
             self.scr_s[ns + s] = lg;
             c = c.max(lg);
         }
@@ -341,21 +552,20 @@ impl NystromState {
         if self.far_len > 0 {
             // Per-token row shift f over landmark scores.
             let mut f = f32::NEG_INFINITY;
-            for a in 0..self.m_eff {
-                let s = crate::attention::dot_f32(q, &self.k_tilde[a * d..(a + 1) * d])
-                    * self.scale;
+            for a in 0..g.m_eff {
+                let s = crate::attention::dot_f32(q, &g.k_tilde[a * d..(a + 1) * d]) * g.scale;
                 self.scr_fh[a] = s;
                 f = f.max(s);
             }
-            for a in 0..self.m_eff {
+            for a in 0..g.m_eff {
                 self.scr_fh[a] = (self.scr_fh[a] - f).exp();
             }
             // u = (F·e^{-f}) · M — the landmark mixing row (= FM, up to
             // the positive factor e^{-f}).
-            for b in 0..self.m_eff {
+            for b in 0..g.m_eff {
                 let mut s = 0.0f32;
-                for a in 0..self.m_eff {
-                    s += self.scr_fh[a] * self.mu[a * self.m_eff + b];
+                for a in 0..g.m_eff {
+                    s += self.scr_fh[a] * self.mu[a * g.m_eff + b];
                 }
                 // FM rectifier: every far weight is Σ_b FM[b]·E[b,j]
                 // with E ≥ 0 elementwise, so clamping this m-vector is
@@ -368,13 +578,13 @@ impl NystromState {
             }
             // Joint scale: the far term b carries e^{f + m_max[b]}, the
             // near term e^{c}; take the max so every factor is ≤ 1.
-            for b in 0..self.m_eff {
+            for b in 0..g.m_eff {
                 c_all = c_all.max(f + self.m_max[b]);
             }
-            for b in 0..self.m_eff {
-                let g = self.scr_u[b] * (f + self.m_max[b] - c_all).exp();
-                self.scr_u[b] = g;
-                far_den += g * self.z_hat[b];
+            for b in 0..g.m_eff {
+                let gain = self.scr_u[b] * (f + self.m_max[b] - c_all).exp();
+                self.scr_u[b] = gain;
+                far_den += gain * self.z_hat[b];
             }
             // Aggregate guard — the rectifier of `O1Rect::Aggregate`,
             // and a second line of defence under `Fm` (where far_den is
@@ -392,12 +602,8 @@ impl NystromState {
             *o = 0.0;
         }
         if have_far {
-            for b in 0..self.m_eff {
-                crate::attention::axpy_f32(
-                    out,
-                    &self.t_hat[b * dv..(b + 1) * dv],
-                    self.scr_u[b],
-                );
+            for b in 0..g.m_eff {
+                crate::attention::axpy_f32(out, &self.t_hat[b * dv..(b + 1) * dv], self.scr_u[b]);
             }
         }
         let mut den = far_den;
@@ -406,9 +612,9 @@ impl NystromState {
             den += p;
             // scr_s rows 0..ns are sinks, the rest are window entries.
             let vv = if s < ns {
-                &self.sink_v[s * dv..(s + 1) * dv]
+                &g.sink_v[s * dv..(s + 1) * dv]
             } else {
-                &self.win_v[(s - ns) * dv..(s - ns + 1) * dv]
+                &g.win_v[(s - ns) * dv..(s - ns + 1) * dv]
             };
             crate::attention::axpy_f32(out, vv, p);
         }
@@ -418,64 +624,22 @@ impl NystromState {
         }
     }
 
-    /// Heap bytes held by this state (window + sinks + skeleton +
-    /// scratch) — feeds the honest "KV+state" memory line, same
-    /// discipline as counting `linear_state` for the linear core.
-    pub fn memory_bytes(&self) -> usize {
-        (self.win_k.len()
-            + self.win_v.len()
-            + self.sink_k.len()
-            + self.sink_v.len()
-            + self.t_hat.len()
-            + self.z_hat.len()
-            + self.m_max.len()
-            + self.q_tilde.len()
-            + self.k_tilde.len()
-            + self.mu.len()
-            + self.scr_s.len()
-            + self.scr_fh.len()
-            + self.scr_u.len()
-            + self.scr_l.len())
-            * std::mem::size_of::<f32>()
-    }
-
-    /// Push (k, v) into the window; in skeleton mode a full ring first
-    /// evicts its oldest key into the far accumulators (delayed
-    /// insertion — the key leaves the exact window at this very step).
-    fn advance_window(&mut self, k: &[f32], v: &[f32]) {
-        let (d, dv) = (self.d, self.dv);
-        if !self.exact_only && self.win_len == self.w {
-            let slot = self.win_head;
-            self.far_insert(slot);
-            self.win_k[slot * d..(slot + 1) * d].copy_from_slice(k);
-            self.win_v[slot * dv..(slot + 1) * dv].copy_from_slice(v);
-            self.win_head = (self.win_head + 1) % self.w;
-        } else if self.exact_only {
-            self.win_k.extend_from_slice(k);
-            self.win_v.extend_from_slice(v);
-            self.win_len += 1;
-        } else {
-            self.win_k[self.win_len * d..(self.win_len + 1) * d].copy_from_slice(k);
-            self.win_v[self.win_len * dv..(self.win_len + 1) * dv].copy_from_slice(v);
-            self.win_len += 1;
-        }
-    }
-
-    /// Absorb the window slot into the far accumulators with the
-    /// per-landmark flash shift: T̂[i]/Ẑ[i] live at scale e^{-m_max[i]};
-    /// when a new logit raises the max, existing mass is rescaled by
-    /// e^{old-new} (exactly 0 on first insertion, since m_max = -inf).
-    fn far_insert(&mut self, slot: usize) {
-        let (d, dv) = (self.d, self.dv);
+    /// Absorb the group's window slot into THIS head's far accumulators
+    /// with the per-landmark flash shift: T̂[i]/Ẑ[i] live at scale
+    /// e^{-m_max[i]}; when a new logit raises the max, existing mass is
+    /// rescaled by e^{old-new} (exactly 0 on first insertion, since
+    /// m_max = -inf).
+    fn far_insert(&mut self, g: &NystromGroup, slot: usize) {
+        let (d, dv) = (g.d, g.dv);
         // Runs once per evicted key per head — NEON dot/axpy like the
         // decode loop (same products, regrouped sums).
-        for i in 0..self.m_eff {
+        for i in 0..g.m_eff {
             self.scr_l[i] = crate::attention::dot_f32(
                 &self.q_tilde[i * d..(i + 1) * d],
-                &self.win_k[slot * d..(slot + 1) * d],
-            ) * self.scale;
+                &g.win_k[slot * d..(slot + 1) * d],
+            ) * g.scale;
         }
-        for i in 0..self.m_eff {
+        for i in 0..g.m_eff {
             let l = self.scr_l[i];
             if l > self.m_max[i] {
                 let r = (self.m_max[i] - l).exp();
@@ -489,11 +653,24 @@ impl NystromState {
             self.z_hat[i] += e;
             crate::attention::axpy_f32(
                 &mut self.t_hat[i * dv..(i + 1) * dv],
-                &self.win_v[slot * dv..(slot + 1) * dv],
+                &g.win_v[slot * dv..(slot + 1) * dv],
                 e,
             );
         }
         self.far_len += 1;
+    }
+
+    fn memory_bytes(&self) -> usize {
+        (self.t_hat.len()
+            + self.z_hat.len()
+            + self.m_max.len()
+            + self.q_tilde.len()
+            + self.mu.len()
+            + self.scr_s.len()
+            + self.scr_fh.len()
+            + self.scr_u.len()
+            + self.scr_l.len())
+            * std::mem::size_of::<f32>()
     }
 }
 

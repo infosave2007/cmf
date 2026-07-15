@@ -195,6 +195,129 @@ fn fm_rect_is_nonnegative_far_mass() {
     );
 }
 
+/// GQA sharing is an ARITHMETIC NO-OP: a group of Q heads sharing one
+/// window/sink/K̃ must produce, bit for bit, what the same heads produce
+/// as fully independent single-head states. This is the whole claim of
+/// the per-group split — less memory, identical output — so it is tested
+/// on `to_bits()`, not on a tolerance.
+#[test]
+fn group_output_is_bit_identical_to_independent_heads() {
+    let (d, dv, m, w, sink, t, p, hpk) =
+        (16usize, 8usize, 8usize, 16usize, 4usize, 200usize, 120usize, 4usize);
+    let mut rng = Lcg(4242);
+    // One k/v stream (the KV head), hpk DIFFERENT query streams — the
+    // real GQA shape. Identical queries would hide a head-indexing bug.
+    let k: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(d).iter().map(|x| x * 2.0).collect()).collect();
+    let v: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(dv)).collect();
+    let q: Vec<Vec<Vec<f32>>> = (0..hpk)
+        .map(|_| (0..t).map(|_| rng.vec(d).iter().map(|x| x * 2.0).collect()).collect())
+        .collect();
+
+    let fl = |rows: &[Vec<f32>], hi: usize| -> Vec<f32> {
+        rows[..hi].iter().flatten().copied().collect()
+    };
+    let (kp, vp) = (fl(&k, p), fl(&v, p));
+
+    // Reference: hpk independent single-head states (the pre-split shape).
+    let mut solo: Vec<NystromState> = (0..hpk)
+        .map(|h| {
+            let mut st = NystromState::new(m, w, sink).with_rect(O1Rect::Aggregate);
+            st.prefill(&fl(&q[h], p), &kp, &vp, p, d, dv);
+            st
+        })
+        .collect();
+
+    // Under test: one shared-window group.
+    let qs: Vec<Vec<f32>> = (0..hpk).map(|h| fl(&q[h], p)).collect();
+    let qrefs: Vec<&[f32]> = qs.iter().map(|x| x.as_slice()).collect();
+    let mut grp = NystromState::new_group(m, w, sink, hpk).with_rect(O1Rect::Aggregate);
+    grp.prefill_group(&qrefs, &kp, &vp, p, d, dv);
+
+    let mut got = vec![0.0f32; hpk * dv];
+    let mut want = vec![0.0f32; dv];
+    for i in p..t {
+        let q_all: Vec<f32> = (0..hpk).flat_map(|h| q[h][i].iter().copied()).collect();
+        grp.step_group(&q_all, &k[i], &v[i], &mut got);
+        for h in 0..hpk {
+            solo[h].step(&q[h][i], &k[i], &v[i], &mut want);
+            for c in 0..dv {
+                assert_eq!(
+                    got[h * dv + c].to_bits(),
+                    want[c].to_bits(),
+                    "pos {i} head {h} chan {c}: group {} vs solo {} — sharing the \
+                     window changed the arithmetic",
+                    got[h * dv + c],
+                    want[c]
+                );
+            }
+        }
+    }
+    // …and the sharing actually saved something.
+    let solo_bytes: usize = solo.iter().map(|s| s.memory_bytes()).sum();
+    println!(
+        "group {} B vs {} independent heads {} B (÷{:.2})",
+        grp.memory_bytes(),
+        hpk,
+        solo_bytes,
+        solo_bytes as f64 / grp.memory_bytes() as f64
+    );
+    assert!(grp.memory_bytes() < solo_bytes, "shared group must be smaller");
+}
+
+/// Delayed insertion stays EXACTLY once per position per head after the
+/// split. The window is shared, so eviction is one GROUP event per
+/// position; the far accumulators are per head, so each head absorbs the
+/// evicted key once. The bug this pins: driving `far_insert` from a
+/// per-head loop over a per-group eviction (each head would absorb the
+/// key hpk times — far_len ×hpk, mass double-counted), or evicting per
+/// head (the window would advance hpk positions per token — a hole).
+#[test]
+fn group_far_insert_runs_once_per_evicted_position_per_head() {
+    let (d, dv, m, w, sink, t, p, hpk) =
+        (8usize, 4usize, 4usize, 16usize, 4usize, 90usize, 64usize, 3usize);
+    let mut rng = Lcg(99);
+    let k: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(d)).collect();
+    let v: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(dv)).collect();
+    let q: Vec<Vec<Vec<f32>>> =
+        (0..hpk).map(|_| (0..t).map(|_| rng.vec(d)).collect()).collect();
+    let fl = |rows: &[Vec<f32>], hi: usize| -> Vec<f32> {
+        rows[..hi].iter().flatten().copied().collect()
+    };
+
+    let qs: Vec<Vec<f32>> = (0..hpk).map(|h| fl(&q[h], p)).collect();
+    let qrefs: Vec<&[f32]> = qs.iter().map(|x| x.as_slice()).collect();
+    let mut grp = NystromState::new_group(m, w, sink, hpk).with_rect(O1Rect::Aggregate);
+    grp.prefill_group(&qrefs, &fl(&k, p), &fl(&v, p), p, d, dv);
+
+    // Prefill replays positions sink..p through the window: the first w
+    // fill it, every later one evicts exactly one key.
+    let expect_prefill = p - sink - w;
+    for h in 0..hpk {
+        assert_eq!(
+            grp.far_len(h),
+            expect_prefill,
+            "head {h}: prefill absorbed {} keys, expected {expect_prefill} \
+             (one per evicted position, not per head)",
+            grp.far_len(h)
+        );
+    }
+    // Then one eviction per decode step — the window is already full.
+    let mut out = vec![0.0f32; hpk * dv];
+    for i in p..t {
+        let q_all: Vec<f32> = (0..hpk).flat_map(|h| q[h][i].iter().copied()).collect();
+        grp.step_group(&q_all, &k[i], &v[i], &mut out);
+        for h in 0..hpk {
+            assert_eq!(
+                grp.far_len(h),
+                expect_prefill + (i - p + 1),
+                "head {h} at pos {i}: far field grew by more than one key per step"
+            );
+        }
+    }
+    // Every key is accounted for exactly once: far + window + sink = t.
+    assert_eq!(grp.far_len(0) + w + sink, t, "no double count, no hole");
+}
+
 #[test]
 fn nystrom_short_prompt_is_exact_softmax() {
     // t = 20 < w = 32 → exact-only mode: no skeleton, and the window
