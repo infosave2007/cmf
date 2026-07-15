@@ -31,6 +31,13 @@ jobs:
             target: aarch64-apple-darwin
           - os: macos-latest
             target: x86_64-apple-darwin
+          # Windows: MSVC toolchain, zip archives (the convention there); the
+          # aarch64 target cross-compiles from the x86_64 runner — the MSVC
+          # linker is multi-arch, same trick as the Intel-macOS row above.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -40,14 +47,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release -p cortiq-cli --target ${{ matrix.target }}
-      - name: Package
+      - name: Package (unix)
+        if: runner.os != 'Windows'
         run: |
           bindir="target/${{ matrix.target }}/release"
           tar -C "$bindir" -czf "cortiq-${{ matrix.target }}.tar.gz" cortiq
           shasum -a 256 "cortiq-${{ matrix.target }}.tar.gz" > "cortiq-${{ matrix.target }}.tar.gz.sha256"
-      - name: Attach to release
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release/cortiq.exe"
+          $zip = "cortiq-${{ matrix.target }}.zip"
+          Compress-Archive -Path $bin -DestinationPath $zip -Force
+          (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() + "  " + $zip |
+            Out-File -Encoding ascii "$zip.sha256"
+      - name: Attach to release (unix)
+        if: runner.os != 'Windows'
         uses: softprops/action-gh-release@v2
         with:
           files: |
             cortiq-${{ matrix.target }}.tar.gz
             cortiq-${{ matrix.target }}.tar.gz.sha256
+      - name: Attach to release (windows)
+        if: runner.os == 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            cortiq-${{ matrix.target }}.zip
+            cortiq-${{ matrix.target }}.zip.sha256

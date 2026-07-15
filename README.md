@@ -68,6 +68,8 @@ Install the command-line tool:
 cargo install cortiq-cli
 ```
 
+Or grab a prebuilt binary from the [latest release](https://github.com/infosave2007/cmf/releases/latest) — Linux x86-64, macOS (Apple Silicon and Intel), Windows (x86-64 and ARM64); each archive ships with a `.sha256`.
+
 Use the format from your own Rust project:
 
 ```sh
@@ -128,8 +130,25 @@ cortiq run model.cmf --prompt "SELECT ..." --skill sql
 Convert softmax attention layers to a constant-memory streaming operator
 (exact sink anchors + exact ring window + landmark far field under one
 softmax denominator). Weights stay **byte-identical** — the flag only records
-a hint; conversion is instant. Measured on a 0.6B model at 4096-token
-context: decode ×3.5 faster, attention memory 954 → 85 MB **constant**:
+a hint; conversion is instant.
+
+Measured on a **4B hybrid** (24 recurrent + 8 softmax layers, `--o1 all`
+converts the 8; Apple M4, every cell run on a cooled machine):
+
+| context | attention memory, `--o1 off` | `--o1 all` | decode |
+|---|---|---|---|
+| 543 | 141.0 MB | 153.2 MB | 15.7 → 16.5 tok/s |
+| 1055 | 174.5 MB | **153.2 MB** | 15.5 → 16.5 tok/s |
+| 4127 | 375.8 MB | **153.2 MB** (÷2.45) | 8.2 → 10.7 tok/s |
+
+The state is **byte-identical at 8× context** — that is the whole point. It
+decomposes as a constant recurrent-layer floor plus a fixed 47.9 MB in place
+of the softmax layers' KV (~65 KB/token here), so o1 *costs* ~12 MB below a
+**~700-token crossover** and saves from there on: ÷2.45 at 4k, ÷14 at 32k.
+Quality, measured through the real streaming kernel on the harshest region
+(landmarks sealed from a 256-token prefill, scoring only later positions):
+**×1.132** on this hybrid, **×1.296** on a pure-attention 0.6B — check any
+model yourself with `cortiq ppl model.cmf --o1 all`.
 
 ```sh
 # Record the O(1) hint at convert time (all layers, or deepN, or an explicit list)
