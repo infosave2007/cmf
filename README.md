@@ -135,11 +135,11 @@ a bounded native training pass — see [O(1) in depth](#o1-in-depth). We haven't
 published a clean before/after figure for it yet.
 
 To be clear about the axis: CMF is not trying to beat `llama.cpp` on tokens per
-second, and today it doesn't. It is trying to make the memory curve flat — and
-the decode column above is the second half of that. Exact attention decays from
-15.7 to 8.2 tok/s as the context grows, while `--o1` holds at ~16.5. If
-single-stream throughput on a short prompt is your only constraint, use
-`llama.cpp`. Take this for the long-context tail.
+second, and today it doesn't. What it flattens is how cost grows with context —
+the memory column is one half of that, the decode column the other: exact
+attention decays from 15.7 to 8.2 tok/s as the context grows, while `--o1` holds
+at ~16.5. If single-stream throughput on a short prompt is your only constraint,
+use `llama.cpp`. Take this for the long-context tail.
 
 ### One file, nothing on the side
 
@@ -347,10 +347,10 @@ Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 This software practices methods claimed in four pending US patent applications by
 the author, listed in [PATENTS.md](PATENTS.md). Apache-2.0 Section 3 grants you a
-perpetual, worldwide, royalty-free patent license to the claims those applications
-necessarily practice in this code as distributed: **running, forking and shipping
-this software is covered**, and the grant lapses only if you sue the project over
-patents.
+perpetual, worldwide, royalty-free patent license to those applications' claims
+that are necessarily infringed by this software as distributed: **running, forking
+and shipping this software is covered**, and the grant lapses only if you sue the
+project over patents.
 
 That grant is scoped to this Work, as Apache-2.0 §3 always is — it does not by
 itself extend to an independent reimplementation of the container. If you want to
