@@ -7,8 +7,8 @@ CMF is pre-1.0. Security fixes are applied to the latest `0.x` release and the
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | ✅        |
-| < 0.1   | ❌        |
+| 0.2.x   | ✅        |
+| < 0.2   | ❌        |
 
 ## Reporting a vulnerability
 

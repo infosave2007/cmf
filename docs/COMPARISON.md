@@ -32,7 +32,7 @@ format; **N/A** = not applicable to this kind of artifact.
 | Embedded tokenizer | Yes | Yes | No | No | No | Partial | No |
 | Embedded chat template | Yes | Yes | No | No | No | No | No |
 | Multi-model / adapter / skill overlay from one base | Yes | Partial | No | No | No | No | Partial |
-| CPU-only dependency-free runtime | Yes | Yes | N/A | Partial | No | Yes | No |
+| Runs without an ML framework | Yes | Yes | N/A | Partial | No | Yes | No |
 | Streaming / partial load | Partial | Partial | Yes | Partial | Partial | Partial | No |
 | Integrity hashing | Yes | No | No | No | No | No | Partial |
 | Primary language / runtime | Rust (+ numpy Python reader) | C/C++ (llama.cpp) | Rust lib (framework-agnostic) | Protobuf spec / ONNX Runtime (C++) | Python / PyTorch | C (ggml) | C++ / CUDA (TensorRT) |
@@ -58,7 +58,7 @@ format; **N/A** = not applicable to this kind of artifact.
   version, but no built-in per-tensor content hash. Corruption is not
   caught by the format itself.
 - **safetensors — runtime = N/A:** it is a storage format with a small
-  loader library, not an inference runtime; "CPU-only dependency-free
+  loader library, not an inference runtime; "Runs without an ML framework
   runtime" does not apply.
 - **ONNX / PyTorch — single file = Partial:** both routinely spill large
   weights to external data files (ONNX external data; sharded / `zip`
@@ -139,7 +139,7 @@ feature — when you want **many task-specialized skills to share one
 backbone** in one file (or one sharded set), overlaying full-shape
 replacement tensors without assembling a separate model per skill. Its
 built-in two-field and variable-bit quantization, mandatory per-tensor
-and per-section hashing, and dependency-free reference runtimes (Rust,
+and per-section hashing, and reference runtimes with no ML framework (Rust,
 plus a stdlib-plus-numpy Python reader) make it a good fit for
 distributing and serving compact, routed, verifiable models on
 commodity hardware. If you instead need the broadest existing tooling

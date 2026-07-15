@@ -23,7 +23,7 @@ approach and avoid wasted work.
 ```
 crates/
   cortiq-core     on-disk format: envelope, sections, quantization codecs
-  cortiq-engine   dependency-free runtime (CPU + optional wgpu GPU)
+  cortiq-engine   runtime, no ML framework (CPU + optional wgpu GPU)
   cortiq-server   optional axum HTTP serving layer
   cortiq-cli      the `cortiq` command-line binary
 converter/        Python converters (source model -> .cmf)
@@ -73,7 +73,7 @@ cargo clippy --workspace --all-targets
 - **Comments and identifiers are English.** Test fixtures may contain
   non-English text on purpose (multilingual tokenizer cases).
 - **No new mandatory dependencies** in `cortiq-core` / `cortiq-engine` — the
-  dependency-free runtime is a core property of the project. Discuss first if
+  no-ML-framework runtime is a core property of the project. Discuss first if
   you believe one is unavoidable.
 
 ## Commit and PR guidelines

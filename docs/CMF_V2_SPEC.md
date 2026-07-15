@@ -10,7 +10,7 @@ sharing one backbone (Patent 15).
 > Normative source: this document. Reference
 > implementations: Rust reader/runtime (`crates/cortiq-core`,
 > `crates/cortiq-engine`), Python writer (`converter/`), and a
-> dependency-free Python reader (`python/cmf_reader.py`, numpy only).
+> standalone Python reader (`python/cmf_reader.py`, stdlib + numpy).
 
 Three requirements, in priority order:
 

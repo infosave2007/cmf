@@ -1,177 +1,275 @@
+Русский: [README.ru.md](README.ru.md) · 中文: [README.zh.md](README.zh.md)
+
 # CMF — Cortiq Model Format
 
-**Serve many specialized LLMs from one shared model — in a single file, on CPU or GPU.**
+**A single-file LLM format whose attention memory stops growing with the context.**
 
 [![CI](https://github.com/infosave2007/cmf/actions/workflows/ci.yml/badge.svg)](https://github.com/infosave2007/cmf/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/cortiq-core.svg)](https://crates.io/crates/cortiq-core)
 [![downloads](https://img.shields.io/crates/d/cortiq-cli.svg)](https://crates.io/crates/cortiq-cli)
 [![docs.rs](https://img.shields.io/docsrs/cortiq-core)](https://docs.rs/cortiq-core)
-[![stars](https://img.shields.io/github/stars/infosave2007/cmf?style=flat)](https://github.com/infosave2007/cmf)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/infosave2007/cmf/blob/master/LICENSE)
 
----
+A `.cmf` file carries the weights, the tokenizer and the chat template together,
+checks its own integrity, and memory-maps straight off disk. The runtime is a
+small Rust core with no ML framework under it — no torch, no BLAS, no ONNX, no
+CUDA install, no C++ toolchain — running on CPU everywhere, and on GPU via wgpu
+(Vulkan / DX12 / Metal) in a source build. Converting a model takes one command
+and no Python.
 
-## The problem
+What makes it different: **you can convert a model's attention into a
+constant-memory streaming operator with one flag** — no retraining, weights
+byte-identical — so a long conversation stops costing more memory than a short
+one.
 
-Shipping a fleet of task-specialized models is expensive. *N* fine-tunes usually mean *N* full copies on disk and in RAM — plus loose `config.json` / `tokenizer.json` / adapter sidecars to keep in sync, and no built-in way to tell a corrupt file from a good one.
+## Try it
 
-## The idea
+```sh
+# prebuilt binary: github.com/infosave2007/cmf/releases/latest
+# or, with a Rust toolchain:
+cargo install cortiq-cli
 
-**CMF keeps one backbone and layers lightweight per-skill overlays on top of it.** A skill stores only the tensors it actually changes; at inference the runtime reads a selected skill's tensors *in place of* the backbone — no separate model is ever assembled. So a whole set of specialists lives in **one self-describing file** and runs from a laptop, with weights read straight off disk (`mmap`, zero-copy) and unused skills costing no RAM.
-
-And the specialist is not just cheaper — it's *better on its task*: measured on held-out data, a skill overlaid on its backbone cuts **task perplexity by 24.9%** versus the backbone alone (see [spec §9](docs/CMF_V2_SPEC.md)).
-
-## Who it's for
-
-- **Agent / plugin builders** — one model carrying 20 skills (SQL, code, translation…) instead of 20 models to store, load, and route between.
-- **Edge / local deployment** — fit a routed multi-skill model into the RAM budget of a single model; weights are paged from disk on demand.
-- **Anyone shipping quantized LLMs** — one integrity-checked file carries weights **+ tokenizer + chat template**, so there are no sidecars to lose and corruption is caught by per-tensor hashes.
-
-## See it run
-
-```console
-$ cortiq run model.cmf --prompt "What is the capital of France?" --greedy
-Ready: qwen2 | Task: general | Sparsity: 0%
-Prompt: What is the capital of France?
- The capital of France is Paris.
-[8 tokens, 33.6 tok/s, finish: stop]
+cortiq convert --model Qwen/Qwen3-0.6B --quant q8 --output qwen.cmf
+cortiq run qwen.cmf --prompt "What is the capital of France?" --greedy --no-think
 ```
 
-## Why CMF — what you get
+```console
+Loading model: qwen.cmf
+Ready: qwen3 | Task: general | Sparsity: 0%
 
-- **Add a skill without copying the model.** One backbone + small per-skill deltas: storage is `|backbone| + Σ|deltas|`, not `N × |model|`.
-- **Starts instantly, light on RAM.** Weights are memory-mapped and read in place; masked-out or unused weights never touch RAM.
-- **Smaller on disk, honestly.** Mix quantizations per tensor — `q8`, `q4`, two-field `q8_2f`, variable-bit (3–8 bit) — down to ~1 byte/param and below. The two-field and variable-bit codecs recover most of the int8→fp16 quality gap at the same file size, and the accuracy trade is *measured*, never declared.
-- **One file, no sidecars.** The HF tokenizer (byte-level BPE) and the chat template (Jinja) travel inside the model — the file defines chat behavior, not your runtime binary.
-- **Trust the file.** A fixed 128-byte envelope plus a 64-bit hash per tensor mean a `.cmf` is either valid or `open()` returns an error; `cortiq verify` checks the whole chain.
-- **Runs anywhere.** A dependency-free Rust core on CPU, plus an optional GPU backend (wgpu → Vulkan · Metal · DX12).
-- **Convert in one command.** `cortiq convert --model <hf-repo>` — native Rust, no Python/numpy/torch; the model is downloaded (in parallel) and quantized in one step.
+Prompt: What is the capital of France?
 
-## How it compares
+The capital of France is **Paris**.
+[10 tokens, 40.1 tok/s, finish: stop]
+```
 
-Serving **N task-specialists**:
+`convert` pulls the checkpoint from Hugging Face (shards in parallel), quantizes
+it and writes one self-contained file — native Rust, no torch, no numpy. Already
+have a GGUF? `cortiq import-gguf <file-or-repo-id> --output model.cmf` reads it
+natively too.
 
-| | N full fine-tunes | Base + N external LoRA | **CMF — one backbone + N skills** |
+`run` applies the chat template stored in the file, so this is a real chat turn
+and the model stops on its own. Qwen3 is a reasoning model — drop `--no-think`
+and it shows its `<think>` reasoning first. `--raw` skips the template entirely
+(completion mode). `Task` and `Sparsity` report the skill overlay; with no skill
+selected they read `general` / `0%` — more on [skills](#many-specialists-one-backbone) below.
+
+**Does it run your model?** Native conversion today: qwen2 · qwen3 · qwen3.5
+(including the fused qwen3_next / AgentWorld layout) · llama · mistral ·
+qwen-moe — dense, MoE and GatedDeltaNet. Not yet: gemma, phi, deepseek. Anything
+else, try `import-gguf` — and if it refuses, that is a bug worth filing.
+
+## Plug it into what you already use
+
+`cortiq serve` speaks the OpenAI API, so existing clients and SDKs work unchanged
+— just point them at it:
+
+```sh
+cortiq serve qwen.cmf --port 8080        # + a web dashboard on /
+```
+
+```sh
+curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "cmf",
+  "messages": [{"role": "user", "content": "Explain mmap in one sentence."}]
+}'
+```
+
+`/v1/models`, `/v1/completions` and `/healthz` are there too, and streaming
+(`"stream": true`) works. The `model` field is required by the schema but is not
+matched against anything — send whatever your client sends.
+
+Scope it honestly before you deploy: **requests are serialized** (one at a time
+per model) and **there is no authentication** — this is a local-first server, not
+a multi-tenant gateway. Don't expose it to a network you don't trust.
+
+## Why CMF
+
+### Attention that stops growing with the context
+
+Normally every token you add to a conversation adds to the KV cache, forever.
+`--o1` replaces a layer's softmax attention with a streaming operator that keeps
+a **fixed-size state** instead: a few exact anchor keys, an exact recent window,
+and a landmark sketch of everything older, all under one shared softmax
+denominator. Conversion is instant and **the weights never change** — the flag
+only records a hint in the header.
+
+Measured on **Qwen3.5-4B** (24 GatedDeltaNet + 8 softmax layers; `--o1 all`
+converts the 8; 16 query heads / 4 KV heads, head_dim 256; q8_2f). Apple M4, the
+machine allowed to cool between runs:
+
+| context | attention memory, `--o1 off` | `--o1 all` | decode, `off` → `all` |
+|---:|---:|---:|---:|
+| 543 | 141.0 MB | **124.1 MB** | 15.7 → 16.5 tok/s |
+| 1055 | 174.5 MB | **124.1 MB** | 15.5 → 16.5 tok/s |
+| 4127 | 380.3 MB | **124.1 MB** — 3.1× less | 8.2 → 10.7 tok/s |
+
+**124.1 MB at every context length** — that is the whole point. It breaks down as
+a constant recurrent-layer floor plus a fixed **18.8 MB** stand-in for the softmax
+layers' KV cache. That KV would otherwise grow at ~64 KiB/token, so the two curves
+cross at about **290 tokens**: below that, `--o1` costs you a few MB; above it, it
+only saves — 3.1× less at 4k, and ~17× at 32k by extrapolation (the state is
+constant, so the ratio keeps climbing; we have benchmarked to 4k — run
+`cortiq bench model.cmf --ctx 32768` on your own box).
+
+**What it costs.** The sketch is an approximation, and you pay for it in quality:
+perplexity rises **1.13×** on Qwen3.5-4B and **1.30×** on Qwen3-0.6B (28/28 layers
+converted) — measured on held-out wikitext through the real streaming kernel on
+the harshest region (landmarks sealed from a 256-token prefill, scoring only the
+drift rows). The more of the model is softmax attention, the more `--o1` costs: a
+hybrid has recurrent layers to carry long-range state, a pure-attention model
+makes the sketch do all the work. Treat `--o1` as a memory/quality dial, not a
+free win. The cost doesn't grow with context — the state doesn't either. Don't
+take our word for any of it; measure your own model:
+
+```sh
+cortiq ppl model.cmf --file wiki.txt --o1 all
+```
+
+It scores the converted model through the real streaming kernel and prints the
+exact-attention baseline over the identical tokens next to it, so the ratio is a
+like-for-like measurement rather than a claim.
+
+If that cost is too high for your use case, `cortiq fcd` recovers part of it with
+a bounded native training pass — see [O(1) in depth](#o1-in-depth). We haven't
+published a clean before/after figure for it yet.
+
+To be clear about the axis: CMF is not trying to beat `llama.cpp` on tokens per
+second, and today it doesn't. It is trying to make the memory curve flat — and
+the decode column above is the second half of that. Exact attention decays from
+15.7 to 8.2 tok/s as the context grows, while `--o1` holds at ~16.5. If
+single-stream throughput on a short prompt is your only constraint, use
+`llama.cpp`. Take this for the long-context tail.
+
+### One file, nothing on the side
+
+The tokenizer (HF byte-level BPE) and the chat template (Jinja) travel **inside**
+the model — GGUF does this too, and it was right to: the file, not your runtime
+binary, defines chat behavior, and there are no sidecars to lose or let drift out
+of sync. What a `.cmf` adds on top is integrity: a fixed 128-byte envelope plus a
+64-bit hash per tensor means a `.cmf` is either valid or `open()` fails loudly. It
+detects truncation and bit-rot; it is not a signature.
+
+```sh
+cortiq verify model.cmf     # envelope, sections, every tensor hash
+cortiq info   model.cmf     # arch, tensors, quantization, skills
+```
+
+Weights are memory-mapped and read in place, so startup is instant and unused
+weights never touch RAM. Quantization is per tensor and mixable — `q8`
+(1 byte/param) · `q8_2f` (int8 with both a per-row and a per-column scale — better
+quality at the same byte count) · `q4` (0.5) · `f16` · `vbit` (variable 3–8 bit,
+~4.25 avg ≈ 0.53) — so you can keep attention at q8 and push the FFN to q4 in the
+same file.
+
+### Many specialists, one backbone
+
+Shipping *N* fine-tunes normally means *N* full copies on disk and in RAM. CMF
+keeps **one backbone plus one small skill per specialist**: a skill stores only
+the tensors it actually replaces, and at inference the runtime reads those *in
+place of* the backbone's — no separate model is ever assembled. Storage is
+`|backbone| + Σ|skills|`, not `N × |model|`, and a skill you don't use costs
+**zero RAM**.
+
+A skill isn't just cheaper to ship — on its own task it beats the backbone it sits
+on: on held-out data, a skill overlay cuts task perplexity by **24.9%**
+([spec §9](docs/CMF_V2_SPEC.md)). Skills pay off most where the backbone is
+weakest; on domains it already handles well, expect less.
+
+```sh
+cortiq run model.cmf --prompt "SELECT ..." --skill sql
+```
+
+Don't want to pick by hand? `cortiq route` chooses a skill from the prompt, and
+`cortiq explain` shows you why.
+
+Serving *N* task-specialists:
+
+| | N full fine-tunes | base + N external LoRAs | **CMF** |
 |---|---|---|---|
-| On disk | N × full model | base + N adapters (sidecars) | one backbone + N small deltas, **one file** |
-| Tokenizer + chat template | per copy / sidecar | sidecar | **embedded** |
+| On disk | N × full model | base + N adapters (sidecars) | one backbone + N small skills, **one file** |
+| Tokenizer + chat template | per copy / sidecar | embedded if the base is GGUF, else sidecar | **embedded** |
 | Per-tensor integrity hash | — | — | **yes** |
-| Cold / unused skill in RAM | loaded | loaded | **0** (paged on use) |
+| Unused skill in RAM | loaded | 0 with an adapter-paging server (S-LoRA / vLLM); loaded otherwise | **0**, paged on use, no serving stack required |
+| Skill ships inside the model file | — | no (separate adapter files) | **yes, under the same hash chain** |
 
-The full, honest format-by-format comparison — GGUF, safetensors, ONNX, PyTorch, GGML, TensorRT, with the trade-offs spelled out — is in [docs/COMPARISON.md](docs/COMPARISON.md).
+A full format-by-format comparison — GGUF, safetensors, ONNX, PyTorch, GGML,
+TensorRT, with the trade-offs spelled out — is in
+[docs/COMPARISON.md](docs/COMPARISON.md).
 
 ## Install
 
-Install the command-line tool:
-
 ```sh
-cargo install cortiq-cli
+cargo install cortiq-cli                 # the `cortiq` command-line tool
+cargo add cortiq-core                    # or use the format from your own Rust code
 ```
 
-Or grab a prebuilt binary from the [latest release](https://github.com/infosave2007/cmf/releases/latest) — Linux x86-64, macOS (Apple Silicon and Intel), Windows (x86-64 and ARM64); each archive ships with a `.sha256`.
+Prebuilt binaries are on the [latest release](https://github.com/infosave2007/cmf/releases/latest)
+— Linux x86-64, macOS (Apple Silicon and Intel), Windows (x86-64 and ARM64); every
+archive ships a `.sha256`. They are **CPU-only**; for the GPU backend, build from
+source with `--features gpu`.
 
-Use the format from your own Rust project:
+## Commands
 
-```sh
-cargo add cortiq-core
-```
+| command | what it does |
+|---|---|
+| `cortiq convert --model <hf-repo\|dir>` | Hugging Face checkpoint → `.cmf` (native Rust) |
+| `cortiq import-gguf <file\|hf-repo>` | GGUF → `.cmf`, every common ggml quant |
+| `cortiq run model.cmf` | chat, or `--prompt` for one shot |
+| `cortiq serve model.cmf` | OpenAI-compatible HTTP server + dashboard |
+| `cortiq info` · `masks` · `verify` | inspect arch, tensors, skills; check integrity |
+| `cortiq bench --ctx 4096` | tok/s and memory at a given context |
+| `cortiq ppl --file f.txt` | teacher-forced perplexity — the quality gate |
+| `cortiq fcd` | restoration trainer for `--o1` models (KL-anchored, generation-gated) |
+| `cortiq diff a.cmf b.cmf` | what changed between two model versions |
+| `cortiq route` · `explain` | which skill the router picks, and why |
 
-## Quick start
+`cortiq <command> --help` documents every flag.
 
-Inspect a `.cmf` — arch, tensors, quantization, masks and skills:
-
-```sh
-cortiq info  model.cmf
-cortiq masks model.cmf
-cortiq verify model.cmf     # envelope, sections, per-tensor hashes
-```
-
-Convert a model to `.cmf` — **native Rust, no Python/numpy/torch**. Pass a
-Hugging Face repo id (downloaded in parallel) or a local model directory:
+### Converting
 
 ```sh
 cortiq convert --model Qwen/Qwen2.5-0.5B-Instruct --quant q8    --output model.cmf
 cortiq convert --model ./my-hf-checkpoint         --quant q8_2f --output model.cmf
-```
-
-Or import a GGUF directly — a local file, or a Hugging Face GGUF **repo id**
-(the best `.gguf` is picked and downloaded). Every common ggml quant is
-dequantized natively (`Q4_0/1`, `Q5_0/1`, `Q8_0`, `Q2_K`…`Q6_K`, `IQ4_NL/XS`,
-`BF16`) — no Python:
-
-```sh
 cortiq import-gguf Qwen/Qwen2.5-0.5B-Instruct-GGUF --output model.cmf --quant q8
-cortiq import-gguf model.gguf                      --output model.cmf --quant q8
 ```
 
-Quantization: `q8` · `q8_2f` (two-field, best quality/size) · `q4` · `f16` ·
-`vbit` (variable 3–8 bit, ~4.25 avg).
-Dense, **mixture-of-experts**, and **GatedDeltaNet** models (qwen2 / qwen3 /
-qwen3.5 / llama / mistral / qwen-moe) convert natively — including the fused
-qwen3_next / AgentWorld layout. The Python converter (`converter/`) is now only
-needed for the **GPTQ-calibrated** v-bit variant (which needs an activation
-Hessian) — the weight-only v-bit path is native.
+GGUF import covers `Q4_0/1`, `Q5_0/1`, `Q8_0`, `Q2_K`…`Q6_K`, `IQ4_NL/XS` and
+`BF16`.
 
-Run inference:
+The native converter writes **backbones**. The Python tooling in `converter/` is
+still what produces the per-skill replacement tensors and task masks described
+above, and the GPTQ-calibrated v-bit variant, which needs an activation Hessian.
+The weight-only v-bit path is native.
 
-```sh
-# Interactive chat
-cortiq run model.cmf
+## O(1) in depth
 
-# Single prompt, greedy decoding, capped length
-cortiq run model.cmf --prompt "Write a haiku about memory-mapped files." --greedy --max-tokens 64
-
-# Overlay a specific skill — its replacement tensors are read in place of the backbone
-cortiq run model.cmf --prompt "SELECT ..." --skill sql
-```
-
-### Constant-memory attention — O(1) conversion
-
-Convert softmax attention layers to a constant-memory streaming operator
-(exact sink anchors + exact ring window + landmark far field under one
-softmax denominator). Weights stay **byte-identical** — the flag only records
-a hint; conversion is instant.
-
-Measured on a **4B hybrid** (24 recurrent + 8 softmax layers, `--o1 all`
-converts the 8; Apple M4, every cell run on a cooled machine):
-
-| context | attention memory, `--o1 off` | `--o1 all` | decode |
-|---|---|---|---|
-| 543 | 141.0 MB | **124.1 MB** | 15.7 → 16.5 tok/s |
-| 1055 | 174.5 MB | **124.1 MB** | 15.5 → 16.5 tok/s |
-| 4127 | 380.3 MB | **124.1 MB** (÷3.06) | 8.2 → 10.7 tok/s |
-
-The state is **byte-identical at 8× context** — that is the whole point. It
-decomposes as a constant recurrent-layer floor plus a fixed 18.8 MB in place
-of the softmax layers' KV (~64 KiB/token here), so o1 pays off past a
-**~290-token crossover** and saves from there on: ÷3.06 at 4k, ÷17 at 32k.
-Quality, measured through the real streaming kernel on the harshest region
-(landmarks sealed from a 256-token prefill, scoring only later positions):
-**×1.132** on this hybrid, **×1.296** on a pure-attention 0.6B — check any
-model yourself with `cortiq ppl model.cmf --o1 all`.
+Record the hint at convert time, or decide at load time — the runtime picks the
+header hint up automatically:
 
 ```sh
-# Record the O(1) hint at convert time (all layers, or deepN, or an explicit list)
+# at convert time: all softmax layers, the deepest N, or an explicit list
 cortiq convert --model Qwen/Qwen3-0.6B --quant q8 --o1 all    --output model.cmf
 cortiq convert --model Qwen/Qwen3-0.6B --quant q8 --o1 deep12 --output model.cmf
 
-# run / serve / bench pick the hint up automatically…
-cortiq run model.cmf --prompt "Summarize this long document: ..." 
+# or override at load time, without reconverting
+cortiq run   model.cmf --o1 all      # force-convert every softmax layer
+cortiq run   model.cmf --o1 off      # back to exact attention
+cortiq bench model.cmf --ctx 4096    # memory + tok/s, with and without
+CMF_O1=deep6 cortiq serve model.cmf  # env override, same syntax
 
-# …or control it at load time without reconverting
-cortiq run   model.cmf --o1 all            # force-convert every softmax layer
-cortiq run   model.cmf --o1 off            # back to exact attention
-cortiq bench model.cmf --ctx 4096          # memory + tok/s, with vs without: use --o1
-CMF_O1=deep6 cortiq serve model.cmf        # env override, same spec syntax
-
-# Tuning knobs (validated defaults: 32 landmarks, window 128, 4 sink keys)
+# tuning (validated defaults: 32 landmarks, window 128, 4 anchor keys)
 cortiq run model.cmf --o1 all --o1-m 32 --o1-window 128 --o1-sink 4
 ```
 
-Optional quality polish — a bounded, native training pass (**no Python, no
-ML framework**) that tunes only the converted layers' norm/FFN tensors
-against the same model running exact attention (KL-anchored), and only keeps
-a checkpoint if long-context generation stays loop-free:
+On hybrid models (e.g. qwen3.5: GatedDeltaNet layers with softmax islands)
+`--o1 all` converts just the softmax layers, which makes the whole model's
+attention state constant in context length.
+
+**Restoration.** `cortiq fcd` is a bounded native training pass — no Python, no ML
+framework — that tunes only the converted layers' norm/FFN tensors against the
+same model running exact attention (KL-anchored), and keeps a checkpoint only if
+long-context generation stays loop-free:
 
 ```sh
 cortiq fcd model.cmf --corpus corpus.txt --gen-check --gen-gate --out model.fcd.cmf
@@ -179,94 +277,94 @@ cortiq fcd model.cmf --corpus corpus.txt --gen-check --gen-gate --out model.fcd.
 #        --val-corpus val.txt --gate-threshold 0.35 --gate-slack 0.10
 ```
 
-On hybrid models (e.g. qwen3.5: GatedDeltaNet + softmax islands) `--o1 all`
-converts just the softmax layers — the whole model's attention state becomes
-constant in context length.
+## The format
 
-## Container layout
+A `.cmf` is a fixed 128-byte envelope followed by sections that a reader addresses
+**only** through that envelope, never by assuming order:
 
-```
- .cmf file
- ┌──────────────────────────────────────────────────────────┐
- │ Envelope        128 bytes, fixed                          │
- │   magic "CMF\x01" · version · feature bits · section       │
- │   offsets+lengths (header, dir, data, masks, vocab, index)│
- ├──────────────────────────────────────────────────────────┤
- │ Header JSON     arch, quant defaults, chat bundle,        │
- │                 skill registry, provenance                │
- ├──────────────────────────────────────────────────────────┤
- │ Tensor directory   binary 56-byte records:                │
- │                 name · dtype · shape · offset · nbytes ·  │
- │                 hash64  (read without parsing)            │
- ├──────────────────────────────────────────────────────────┤
- │ Weight blob     page-aligned (4096); every tensor 64-byte │
- │                 aligned; quantized; mmap zero-copy        │
- ├──────────────────────────────────────────────────────────┤
- │ Masks / Skills  bit-packed per-task masks (1 bit/neuron)  │
- │                 + per-skill replacement tensors           │
- ├──────────────────────────────────────────────────────────┤
- │ Tokenizer       HF tokenizer.json, verbatim               │
- ├──────────────────────────────────────────────────────────┤
- │ Sparse index    precomputed mask → active groups/heads    │
- └──────────────────────────────────────────────────────────┘
+- **header JSON** — arch, quant defaults, chat bundle, skill registry, provenance
+- **tensor directory** — 56-byte binary records (name, dtype, shape, offset, nbytes, hash64), readable without touching the JSON
+- **weight blob** — page-aligned, mapped and read in place
+- **skills** — bit-packed task masks and per-skill replacement tensors
+- **tokenizer** — the verbatim Hugging Face file
+- **sparse index** — precomputed
+
+Also supported: multi-token-prediction (MTP) heads, MoE FFN layers, append-only
+skill growth with compaction, and sharding a model across `N` standalone-valid
+files.
+
+**You are not locked in.** `python/cmf_reader.py` is a complete reader in ~300
+lines of stdlib + numpy that shares no code with the Rust runtime — it was written
+from the spec, on purpose, to prove the format outlives this implementation:
+
+```python
+from cmf_reader import CmfReader
+r = CmfReader("model.cmf")
+w = r.tensor("model.layers.0.mlp.gate_proj.weight")   # np.ndarray, dequantized
+assert r.verify() == []                               # every tensor hash checks
 ```
 
-A reader addresses sections **only** through the envelope — never by assuming order.
+If this project disappeared tomorrow, your weights are still readable from the
+spec alone. The complete normative specification is in
+[docs/CMF_V2_SPEC.md](docs/CMF_V2_SPEC.md).
 
-## Features
+## Status
 
-- Single-file, memory-mappable, self-validating binary container.
-- Binary tensor directory with 1:1 source-model tensor names and a per-tensor 64-bit hash for corruption detection.
-- Mixed quantization per tensor: `f32`, `f16`, `bf16`, `q8_row`, `q4_block`, `q8_2f`, `vbit`.
-- Embedded tokenizer (HF byte-level BPE parity) and chat template (Jinja, HF semantics).
-- Per-task masks (bit-packed) and a precomputed sparse index.
-- Multi-skill swarm: one backbone + per-skill full-shape replacement tensors, overlaid at forward time; append-only growth and compaction.
-- Optional multi-token-prediction (MTP) head and mixture-of-experts (MoE) FFN layers.
-- Sharding: a model split across `N` standalone-valid `.cmf` files.
-- Dependency-free Rust runtime on **CPU and GPU** (optional `gpu` feature: wgpu → Vulkan / DX12 / Metal).
-- **O(1) attention conversion** (`--o1`): constant-memory streaming attention for any converted layer — weights byte-identical, KV cache released after prefill.
-- **Native restoration trainer** (`cortiq fcd`): KL-to-teacher polish with generation-gated checkpoint selection, no ML framework.
-- Reference implementations in Rust (reader + runtime) and Python (writer + a stdlib+numpy reader).
+CMF is **0.2.x** and young — first public release July 2026, one author. The crate
+APIs may still move before 1.0. The **format** is the settled part: it is v2,
+readers navigate only through the envelope, unknown header fields are ignored
+(additive evolution), and a breaking change costs a feature bit or a `version`
+bump — never a silent reinterpretation. A `.cmf` written today stays readable;
+`cortiq verify` is the contract. Every change is in [CHANGELOG.md](CHANGELOG.md).
 
-## Format overview
-
-The complete normative specification — envelope, header JSON, tensor directory, quant layouts, masks, tokenizer bundle, sparse index, `hash64`, skills and sharding — is in [docs/CMF_V2_SPEC.md](docs/CMF_V2_SPEC.md).
-
-## Theory & background
-
-CMF's design is derived from the author's physical theory — the **Vacuum Mass Fraction (VMF)**, within **Null-Vector Gravity (NVG)**. Twelve NVG/VMF principles map to concrete format elements (one shared backbone, two-field `q8_2f`, task masks, the held-out quality contract, resonance routing, the variable-bit codec…), with a hard line between what is *measured* and what stays a metaphor.
-
-- **[The VMF/NVG principles behind CMF](VMF_principles_in_CMF.md)** — the full mapping ([Русский](VMF_principles_in_CMF.ru.md) · [中文](VMF_principles_in_CMF.zh.md)).
-- **[NVG/VMF theory repository](https://github.com/infosave2007/vmf)** — the physics itself.
+Bugs and feature requests: [open an issue](https://github.com/infosave2007/cmf/issues).
+Security problems: **do not** open a public issue — see [SECURITY.md](SECURITY.md).
+A model that won't convert is a bug report, not a user error.
 
 ## Build from source
 
 ```sh
 cargo build --release --workspace
+cargo build --release --workspace --features gpu   # + wgpu → Vulkan / DX12 / Metal
 ```
-
-Optional cross-platform GPU backend (wgpu → Vulkan / DX12 / Metal):
-
-```sh
-cargo build --release --workspace --features gpu
-```
-
-## Project layout
 
 ```
 crates/
   cortiq-core     format reader: envelope, directory, quant, masks, mmap
-  cortiq-engine   portable CPU/GPU inference runtime, tokenizer, chat, skill overlay
+  cortiq-engine   portable CPU/GPU inference runtime, tokenizer, chat, skills
   cortiq-server   OpenAI-compatible HTTP serving
-  cortiq-cli      the `cortiq` command-line tool (inspect/convert/run/serve)
-converter/        Python converters for exotic archs (MoE / linear-attention)
-python/           dependency-free reader (stdlib + numpy)
+  cortiq-cli      the `cortiq` command-line tool
+converter/        Python: DTG-MA skills/masks + the GPTQ-calibrated v-bit path
+python/           reference reader — stdlib plus numpy, nothing else
 docs/             format specification and comparison
 ```
 
-## License & patents
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE).
+## License
 
-This software implements methods that are the subject of four United States patent applications; details are in [PATENTS.md](PATENTS.md). The Apache-2.0 Section 3 patent grant applies to those three referenced applications, giving every user a royalty-free license to the patent claims necessarily infringed by this software as distributed.
+**Apache-2.0** ([LICENSE](LICENSE)) — use it, modify it, ship it commercially.
 
+This software practices methods claimed in four pending US patent applications by
+the author, listed in [PATENTS.md](PATENTS.md). Apache-2.0 Section 3 grants you a
+perpetual, worldwide, royalty-free patent license to the claims those applications
+necessarily practice in this code as distributed: **running, forking and shipping
+this software is covered**, and the grant lapses only if you sue the project over
+patents.
+
+That grant is scoped to this Work, as Apache-2.0 §3 always is — it does not by
+itself extend to an independent reimplementation of the container. If you want to
+implement CMF in another language or embed it in your own runtime, email
+urevich55@gmail.com: an implementer's grant is available, and the format is meant
+to be implemented widely.
+
+## Where this came from
+
+The design ideas came out of the author's separate work on a physics theory — the
+Vacuum Mass Fraction (VMF) within Null-Vector Gravity (NVG): the
+shared-backbone-plus-perturbations model, the two-field quantization. Nothing in
+the format depends on that theory being right; it stands on the spec and the
+numbers above. The mapping, with a hard line drawn between what is *measured* and
+what stays a metaphor: [the VMF/NVG principles behind CMF](VMF_principles_in_CMF.md)
+([Русский](VMF_principles_in_CMF.ru.md) · [中文](VMF_principles_in_CMF.zh.md)).
+The physics itself lives in [its own repository](https://github.com/infosave2007/vmf).

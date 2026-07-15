@@ -20,7 +20,7 @@ Where these methods appear in this repository:
   production path used by the converter to derive per-skill delta records.
 - **Unified Execution Architecture (App. 19/731,402)** — the CMF container
   itself (shared backbone stored once + per-skill full-shape replacement
-  tensors + byte-offset delta index) and the dependency-free overlay runtime
+  tensors + byte-offset delta index) and the overlay runtime
   that reads replacement tensors *in place of* the backbone at forward time
   without materializing a per-skill model.
 - **Streaming Attention Conversion (App. 19/738,763)** — the training-free

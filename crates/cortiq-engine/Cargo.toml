@@ -2,7 +2,7 @@
 name = "cortiq-engine"
 version.workspace = true
 edition.workspace = true
-description = "Portable, dependency-free inference runtime for the CMF model format: runs on CPU and GPU (Vulkan / Metal / DX12), with tokenizer, chat templates and dynamic per-skill weight overlay."
+description = "Portable inference runtime for the CMF model format, with no ML framework underneath: runs on CPU, and on GPU (Vulkan / Metal / DX12) with the `gpu` feature; tokenizer, chat templates and dynamic per-skill weight overlay."
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

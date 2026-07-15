@@ -7,8 +7,192 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-07-15
+
 ### Added
 
+- **`cortiq ppl --o1 all|deepN|list|off`** (with `--o1-m` / `--o1-window` /
+  `--o1-sink` / `--o1-prefill`, `--windows`, `--window-len`) — scores the
+  **converted** model through the real streaming kernel and prints the exact
+  baseline over the identical tokens next to it. The O(1) path's quality had
+  never been measurable natively: the scoring path ran exact attention by
+  design, so the only published numbers came from the reference probe, which
+  rectifies every estimated far weight individually — a step a streaming
+  operator cannot perform — and derives landmarks from the whole scored
+  window. Each window's first `--o1-prefill` tokens run the exact pass that
+  freezes the landmarks; every scored position then goes through
+  `NystromState::step()`, the same code decode runs. The default is
+  unchanged: `ppl` scores the backbone exactly even for a model carrying an
+  `--o1` hint.
+- **`--o1-rect agg|fm`** (and `CMF_O1_RECT`) — selects how the indefinite
+  skeleton is rectified. `agg` (default) clamps only the aggregate far
+  denominator; `fm` clamps `FM = F_u·M_u` per query row, which is the
+  intuitively "correct" per-key guarantee and, measured, the worse one
+  (×1.296 vs ×1.414 at the default landmark budget). `agg` wins at every m.
+- Prebuilt **Windows** binaries in GitHub Releases — `x86_64-pc-windows-msvc`
+  and `aarch64-pc-windows-msvc`, shipped as `.zip` + `.sha256` (the
+  convention there) rather than `.tar.gz`; the ARM64 row cross-compiles from
+  the x86_64 runner. The runtime needed no porting: Metal is gated behind
+  `cfg(target_os = "macos")`, the NEON/SDOT kernels behind
+  `cfg(target_arch = "aarch64")`, and `memmap2` covers Windows.
+- The release workflow accepts `workflow_dispatch`, so the binaries for an
+  existing tag can be rebuilt on demand.
+
+### Changed
+
+- **The O(1) exact window, sink buffer and landmark keys (K̃) are now shared
+  per KV group.** The window ring and sink buffer hold the *group's* keys and
+  values, and K̃ is `seg_means` over those same keys, so under grouped-query
+  attention every query head in a group was storing byte-identical copies.
+  `NystromState` is now one state per KV group — a shared `NystromGroup`
+  (ring, sinks, K̃, `m_eff`, geometry) plus a `Vec<NystromHead>` for what
+  genuinely depends on the head's queries: the far accumulators and their
+  running maxima, Q̃, and the mixing matrix `M = pinv(exp(Q̃K̃ᵀ/√d))`.
+  Eviction becomes a group event — `advance()` evicts a position once and
+  each head then absorbs that key into its own accumulators before the slot
+  is reused (one eviction, one insertion per head, which is the invariant the
+  partition rests on). **Arithmetic is untouched and the output is
+  bit-identical**, proven three ways: a 4-head group and 4 independent
+  single-head states agree on `to_bits()`; on a real 4B hybrid, greedy
+  generation from a 370-token prompt matches on token ids and top-1
+  confidences to 1e-6 — also with a narrow `W=16 m=8 sink=2` window that
+  maximizes evictions; and `ppl --o1 all` reproduces to the digit.
+  `fcd_runtime_parity` is unmoved at 9.373e-7 against its pinned 9.4e-7. A
+  dedicated test asserts each head's `far_len` equals the eviction count and
+  closes the books with `far_len + w + sink == t`; it was verified to have
+  teeth by injecting a double insert (the bit-identity test alone does *not*
+  catch that mutant, since both paths share `advance`). Measured (qwen3_5 4B
+  hybrid, 16 q-heads / 4 kv-heads, head_dim 256, `W=128 m=32 sink=4`, Apple
+  M4): nystrom state **47.9 → 18.8 MB** (÷2.55), KV+state **153.2 → 124.1
+  MB**, and against plain KV at ctx 4096 **÷2.48 → ÷3.06**; the crossover
+  where `--o1` starts *saving* memory moves **731 → 287 tokens**.
+- **Dynamic row chunking in the thread pool** — `Pool::run_rows` hands out
+  row ranges from an atomic cursor instead of a static 1/n split, so a
+  performance core takes several chunks per efficiency-core chunk instead of
+  waiting at the latch; on an asymmetric-core machine the cores no longer
+  wait on each other. Rows stay disjoint, so output is bit-identical.
+  Measured: weight-path bandwidth 54.5 → 58.9 GB/s (+8%), decode +4–5% at
+  every thread count on a 4B q8_2f model.
+- **Corrected O(1) conversion quality figures.** Measured through the shipped
+  streaming kernel on held-out wikitext, landmarks sealed from a 256-token
+  prefill, scoring only the drift rows (the harshest region): Qwen3-0.6B with
+  28/28 layers converted ×1.296; a Qwen3.5-4B hybrid with 8/32
+  converted ×1.132. The ×1.177 previously in the docs was the reference
+  operator with whole-window landmarks — an upper bound this runtime cannot
+  reach by construction. Corrected in the module docs and the
+  `convert --o1` help.
+
+- `cortiq run` defaults to the `warn` log level — the loader's INFO lines are
+  noise in front of an answer. `RUST_LOG` overrides; every other command
+  keeps `info`.
+- `convert` / `import-gguf` paint one in-place progress line on a terminal
+  instead of several hundred `@PROGRESS` lines. The markers are byte-for-byte
+  unchanged when stdout is not a terminal, which is where supervisors parse
+  them.
+
+### Fixed
+
+- **`cortiq run` is a chat again.** It advertised "Interactive chat mode" but
+  never rendered the container's chat template — `generate()` encodes the
+  prompt verbatim — and `generate_from_ids` clears the KV cache per call
+  ("Fresh sequence"), so the interactive loop carried no history either. The
+  first command a new user runs answered correctly and then repeated "The
+  answer is correct." until `max_tokens`; `finish: stop` was unreachable,
+  because raw completion never emits `<|im_end|>`. `run` now renders the
+  file's template through `apply_chat_template_opts` — the same call the
+  server makes — and carries the conversation across turns. The gate is
+  `chat_template.is_some()`, **not** the template call itself: with no
+  template that helper falls back to hardcoded ChatML, which is not what a
+  base model wants, so those still run completion — as does `--state`, whose
+  frozen prefix is a raw token replay. A long chat drops its oldest exchange
+  (never a system turn) rather than prefill past the RoPE range.
+  - `--raw` — skip the template: the previous behavior, verbatim.
+  - `--no-think` — render with `enable_thinking=false`; Qwen3/3.5 answer
+    directly instead of emitting a `<think>` block.
+
+- **`cortiq fcd` polished an operator the runtime never serves** — the
+  trainer built its far field from whole-window landmarks and the per-(t,j)
+  clamp. It now seals landmarks from a prompt prefix (`NysCfg.prefill`,
+  default `t/2` — the same discipline `ppl --o1` uses), derives `m_eff` from
+  the sealed prompt, runs the aggregate far-denominator guard with raw
+  negative mass kept on passing rows, and leaves pre-seal rows exact. A new
+  `fcd_runtime_parity` test pins the trainer forward against the live
+  `NystromState` at 9.4e-7 (tol 2e-5), while the per-key rectifier differs by
+  5.7e-2 on the same fixture — the test cannot pass a trainer that reinstates
+  the clamp. The trainer-reported zero-shot ratio moves ×1.168 → ×1.146 on
+  its own windows (teacher identical, a clean control).
+- **`o1_seal`** now requires `num_heads % num_kv_heads == 0` and degrades to
+  exact attention instead of panicking on an index overflow.
+
+## [0.2.1] — 2026-07-14
+
+### Added
+
+- **`enable_thinking`** — `/v1/chat/completions` accepts `enable_thinking`
+  (top-level) or the vLLM-style `chat_template_kwargs.enable_thinking`.
+  `false` renders the chat template with `enable_thinking=false` — Qwen3/3.5
+  prefill an empty `<think>` block and answer directly. Absent = the
+  template's default. The tokenizer gains `apply_chat_template_opts`; the
+  render context defines the variable only when it is set.
+
+### Changed
+
+- README: an O(1) conversion quick-start — the `convert --o1` commands, the
+  `run` / `serve` / `bench` overrides, `CMF_O1`, the tuning knobs, and the
+  `cortiq fcd` polish stage.
+
+### Fixed
+
+- **Corrupt published crate tarball** — `cargo package` deterministically
+  corrupted the tarball on the previous `README.md` byte layout; a trailing
+  newline works around it.
+
+## [0.2.0] — 2026-07-14
+
+### Added
+
+- **O(1) constant-memory streaming attention conversion** — `cortiq convert
+  --o1 all|deepN|list` (with `--o1-m` / `--o1-window` / `--o1-sink`) converts
+  any softmax checkpoint to per-layer O(1) attention in seconds, with the
+  **weights byte-identical**: the conversion records a hint in provenance and
+  the binary envelope is unchanged. The kernel (`nystrom.rs`) is an exact
+  sliding window plus a PSD far-field skeleton under a single joint
+  denominator, with permanent sink tokens (the first `S=4`, which never enter
+  the far field), per-landmark flash-style running-max accumulators, and
+  delayed insertion — a key enters the far state only when it leaves the
+  exact window. Guards: short-prompt exact mode, `m_eff = clamp(T/8, 4, m)`,
+  and a ridge pseudo-inverse (f64 Cholesky) with jitter fallback. At runtime
+  prefill runs exact attention, then `seal()` builds the landmarks and `M`
+  per head, replays the prompt into the state and **drops the layer's full
+  KV**; seal refuses on q8 KV and masked-sparse heads, the speculative pair
+  path is disabled under o1, and eviction no-ops on sealed layers. Dispatch
+  priority: CLI > `CMF_O1` env > the `provenance.o1_attn` header hint. Golden
+  parity vs the validated reference math: max 1.1e-6 (sink=4). Measured (M4,
+  Qwen3-0.6B q8, `--o1 all`): ctx 4096 decode 19.6 → 68.6 tok/s (×3.5) at
+  84.9 MB constant state vs 954 MB KV (÷11.2); ctx 1024 ×1.5 / ÷2.9 — decode
+  is near-flat in context length. (The zero-shot quality ratios published
+  with this release came from the reference probe rather than the shipped
+  kernel; corrected in 0.2.2.)
+- **Native FCD restoration trainer** — `cortiq fcd <model.cmf> --corpus …`
+  (`--steps`, `--eval-every`, `--kl`, `--gen-check`, `--gen-gate`,
+  `--gate-threshold`, `--gate-slack`, `--out`): the bounded KL-anchored
+  polish stage for `--o1` conversions, with **no ML framework** — one binary
+  end to end. `fcd_ops.rs` is a fixed-graph op library with hand-derived
+  backwards over an `Fp` trait (pooled f32 GEMMs, RMSNorm plain and
+  zero-centered, RoPE, SwiGLU, segment means, exact causal attention,
+  Nyström-joint attention, GatedDeltaNet BPTT, and CE + KL(teacher‖student)
+  loss); every op carries a central finite-difference gradcheck (rel err
+  1e-9…1e-12; whole-graph block checks ≤ 8.9e-4; GDN forward parity vs the
+  runtime kernel 3.4e-8). Teacher and student share one frozen mmap and the
+  trainable set is only the normalization gains and FFN tensors of converted
+  layers (AdamW, grad clip, deterministic held-out eval, best-checkpoint
+  restore, `provenance.fcd` on the written tensors). **Generation-gated
+  selection**: each eval probes greedy long-context generation through the
+  real streaming kernel and admits a checkpoint only if no prompt loops — if
+  none passes, the zero-shot state is restored, so the stage cannot make
+  generation worse than conversion alone. The motive is measured: on a
+  6/24-softmax hybrid, ppl-only selection reached ×0.86 teacher ppl yet
+  regressed all three generation probes into loops.
 - **hybrid_k core support** — the vmf_phase linear core now honors an
   optional selective-write gate: `model.layers.{i}.vmf_attn.k_gate.weight`
   `[nh, hidden]` + `.bias [nh]`; κ_h = σ(W_k·x + b)_h multiplies the state
@@ -43,6 +227,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefill 7.3 → 24 tok/s (×3.3), PPL 4.008 → 4.022 (+0.35%, bounded A8W8
   noise — the same contract as q8/vbit). `CMF_SDOT=0` keeps the exact
   scalar path.
+
+### Fixed
+
+- **The `bench` memory line under-reported a fully-folded model** — an
+  all-linear model reported `KV+state 0.0 MB` because the recurrent state
+  (f64, constant in context) was not counted. Both cache kinds are now
+  honest: the folded 0.6B reports its analytic 58.7 MB constant state against
+  242 → 946 MB of growing KV for the softmax original.
+- **The `x86_64-apple-darwin` release binary is published again** — the
+  retired `macos-13` runner pool left the Intel job queued with zero steps
+  for 24 h before being auto-cancelled, losing that asset on v0.1.8, v0.1.9
+  and v0.1.10. It now cross-compiles on `macos-latest`, with a 30-minute
+  timeout so a stuck pool fails loudly instead of silently dropping the
+  binary.
 
 ## [0.1.10] — 2026-07-09
 
@@ -230,7 +428,11 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/infosave2007/cmf/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/infosave2007/cmf/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/infosave2007/cmf/compare/v0.1.10...v0.2.0
+[0.1.10]: https://github.com/infosave2007/cmf/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/infosave2007/cmf/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/infosave2007/cmf/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/infosave2007/cmf/compare/v0.1.6...v0.1.7
