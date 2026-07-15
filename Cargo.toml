@@ -7,6 +7,12 @@ members = [
 ]
 resolver = "2"
 
+# Roadmap §5: portable release stays the default; LTO + single codegen
+# unit keep the NEON/SDOT hot loops inlined across crate boundaries.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [workspace.package]
 version = "0.2.2"
 edition = "2024"

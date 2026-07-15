@@ -571,6 +571,12 @@ impl CmfModel {
         self.by_name.get(name).map(|&i| &self.tensors[i])
     }
 
+    /// Directory index of a tensor by name (same resolution as
+    /// [`Self::tensor`] — engines must not re-scan the directory).
+    pub fn tensor_index(&self, name: &str) -> Option<usize> {
+        self.by_name.get(name).copied()
+    }
+
     /// Tensor-source indirection (spec §9, Patent 15 fig3/302): the
     /// skill's replacement is read IN PLACE OF the backbone tensor —
     /// either/or, never combined. None skill → backbone directly.

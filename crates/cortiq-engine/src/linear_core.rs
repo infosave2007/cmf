@@ -460,6 +460,7 @@ fn gdn_projs_gpu(w: &GdnWeights, x: &[f32], qkv: &mut [f32], z: &mut [f32]) -> b
             cols,
             row_scale,
             col_field,
+            ..
         } => Some((
             model.clone(),
             BatchJob {

@@ -17,20 +17,29 @@ pub fn silu(x: f32) -> f32 {
 /// Applying the wrong style corrupts every normalization in the
 /// forward pass — the style comes from the model arch, never guessed.
 pub fn rms_norm(input: &[f32], weight: &[f32], eps: f64, style: NormStyle) -> Vec<f32> {
+    let mut out = vec![0.0f32; input.len()];
+    rms_norm_into(input, weight, eps, style, &mut out);
+    out
+}
+
+/// `rms_norm` writing into a caller-owned buffer — the decode hot path
+/// calls this twice per layer; the returning variant allocated each time.
+pub fn rms_norm_into(input: &[f32], weight: &[f32], eps: f64, style: NormStyle, out: &mut [f32]) {
     let n = input.len();
+    debug_assert_eq!(out.len(), n);
     let mean_sq: f64 = input.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / n as f64;
     let inv_rms = 1.0 / (mean_sq + eps).sqrt() as f32;
     match style {
-        NormStyle::Qwen => input
-            .iter()
-            .zip(weight)
-            .map(|(&x, &w)| x * inv_rms * w)
-            .collect(),
-        NormStyle::Gemma => input
-            .iter()
-            .zip(weight)
-            .map(|(&x, &w)| x * inv_rms * (1.0 + w))
-            .collect(),
+        NormStyle::Qwen => {
+            for (o, (&x, &w)) in out.iter_mut().zip(input.iter().zip(weight)) {
+                *o = x * inv_rms * w;
+            }
+        }
+        NormStyle::Gemma => {
+            for (o, (&x, &w)) in out.iter_mut().zip(input.iter().zip(weight)) {
+                *o = x * inv_rms * (1.0 + w);
+            }
+        }
     }
 }
 

@@ -9,3 +9,4 @@ __pycache__/
 *.egg-info/
 .venv/
 venv*/
+docs/PERFORMANCE_ROADMAP.ru.md

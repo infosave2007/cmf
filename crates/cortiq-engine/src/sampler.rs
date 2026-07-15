@@ -164,14 +164,19 @@ fn apply_repetition_penalty(logits: &mut [f32], past_tokens: &[u32], penalty: f3
 }
 
 /// Keep the k highest-probability tokens (plus exact ties at the
-/// threshold), zero the rest.
+/// threshold), zero the rest. Selection, not a full vocab sort — the
+/// old double `sort_by` over ~150k probs was ~1ms of pure per-token
+/// overhead (roadmap §3 P0).
 fn apply_top_k(probs: &mut [f32], k: usize) {
     if k == 0 || k >= probs.len() {
         return;
     }
-    let mut sorted: Vec<f32> = probs.to_vec();
-    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let threshold = sorted[k - 1];
+    let mut sel: Vec<f32> = probs.to_vec();
+    // k-th largest = (k-1)-th index in a descending partition.
+    let (_, kth, _) = sel.select_nth_unstable_by(k - 1, |a, b| {
+        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let threshold = *kth;
     for p in probs.iter_mut() {
         if *p < threshold {
             *p = 0.0;
@@ -180,9 +185,16 @@ fn apply_top_k(probs: &mut [f32], k: usize) {
 }
 
 /// Nucleus: keep the smallest prefix of tokens whose cumulative
-/// probability reaches top_p.
+/// probability reaches top_p. Only surviving (non-zero) candidates are
+/// sorted — after top-k that is ≤ k elements, not the whole vocab; the
+/// kept set is marked in-place instead of a per-token HashSet.
 fn apply_top_p(probs: &mut [f32], top_p: f32) {
-    let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
+    let mut indexed: Vec<(usize, f32)> = probs
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, p)| p > 0.0)
+        .collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut cumsum = 0.0f32;
@@ -195,12 +207,9 @@ fn apply_top_p(probs: &mut [f32], top_p: f32) {
         }
     }
 
-    let kept: std::collections::HashSet<usize> =
-        indexed[..cutoff_idx].iter().map(|&(i, _)| i).collect();
-    for (i, p) in probs.iter_mut().enumerate() {
-        if !kept.contains(&i) {
-            *p = 0.0;
-        }
+    // Zero the dropped tail directly — indices, not membership tests.
+    for &(i, _) in &indexed[cutoff_idx..] {
+        probs[i] = 0.0;
     }
 }
 

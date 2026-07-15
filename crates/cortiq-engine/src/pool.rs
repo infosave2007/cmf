@@ -1,85 +1,102 @@
 //! Persistent worker pool for row-parallel matvecs.
 //!
-//! Threads are spawned once and parked between calls — vmfcore measured
-//! spawn-per-matvec at ~+27% decode cost versus a persistent pool.
-//! Parallelism is by disjoint row ranges, so results are bit-identical
-//! to the serial path (each row's dot product is computed the same way).
+//! Threads are spawned once and spin-then-park between calls — vmfcore
+//! measured spawn-per-matvec at ~+27% decode cost versus a persistent
+//! pool. Parallelism is by disjoint row ranges, so results are
+//! bit-identical to the serial path (each row's dot product is computed
+//! the same way).
+//!
+//! Dispatch is a single shared job slot + atomic epoch (roadmap §3 P0):
+//! the caller publishes one pointer, bumps the epoch and JOINS THE WORK
+//! as the extra worker instead of blocking on a latch. The previous
+//! design allocated an `Arc<Latch>` and pushed a message into every
+//! worker's mpsc channel for every matvec (~200 dispatches/token) —
+//! with decode-grade matvecs that synchronization was its own budget.
+//! Workers spin for `CMF_POOL_SPIN` iterations before parking.
+//! Default 0 (park immediately): on Apple Silicon unpark is cheap and
+//! measured A/B showed spinning workers stealing cycles from the
+//! caller's serial sections (q8 decode 299–345 tok/s at spin=6000 vs
+//! 406–412 at spin=0 on the 50M bench model). Set CMF_POOL_SPIN>0 to
+//! experiment on platforms with slower futex wakeups.
 //!
 //! `CMF_THREADS` env: 0/1 = serial, N = worker count
 //! (default: available_parallelism − 1, capped at 8).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// A `*const dyn Fn` that may cross a thread boundary. Safety is
 /// provided by `Pool::run`: the caller blocks until every worker has
 /// finished, so the borrow outlives all uses.
+#[derive(Clone, Copy)]
 struct TaskPtr(*const (dyn Fn(usize, usize) + Sync));
 unsafe impl Send for TaskPtr {}
 
-struct Latch {
+struct Inner {
+    /// Bumped once per published job; workers watch it.
+    epoch: AtomicUsize,
+    /// Workers still running the current job (excludes the caller).
     remaining: AtomicUsize,
-    lock: Mutex<()>,
-    cv: Condvar,
+    /// The published job: closure pointer + total participant count.
+    /// Written by the caller BEFORE the epoch bump, read by workers
+    /// AFTER they observe the new epoch (acquire/release pairing).
+    slot: UnsafeCell<Option<(TaskPtr, usize)>>,
+    shutdown: AtomicBool,
+    /// Spin iterations before a worker parks (0 = park immediately).
+    spin_budget: usize,
+    /// Per-worker "I am parked" flags — lets the caller skip the unpark
+    /// syscall for workers that are still spinning.
+    parked: Box<[AtomicBool]>,
 }
 
-impl Latch {
-    fn new(n: usize) -> Arc<Self> {
-        Arc::new(Self {
-            remaining: AtomicUsize::new(n),
-            lock: Mutex::new(()),
-            cv: Condvar::new(),
-        })
-    }
+// SAFETY: `slot` is only written while no job is in flight (run()
+// returns after `remaining` hits 0) and only read after the epoch
+// publication that follows the write.
+unsafe impl Sync for Inner {}
 
-    fn count_down(&self) {
-        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let _g = self.lock.lock().unwrap();
-            self.cv.notify_all();
-        }
-    }
-
-    fn wait(&self) {
-        let mut g = self.lock.lock().unwrap();
-        while self.remaining.load(Ordering::Acquire) != 0 {
-            g = self.cv.wait(g).unwrap();
-        }
-    }
-}
-
-struct Job {
-    task: TaskPtr,
-    worker_idx: usize,
-    n_workers: usize,
-    latch: Arc<Latch>,
-}
-
-/// Persistent thread pool. Workers park on a channel between jobs.
+/// Persistent thread pool: shared job slot, epoch dispatch, caller
+/// participation.
 pub struct Pool {
-    txs: Vec<Sender<Job>>,
+    inner: Arc<Inner>,
+    /// Thread handles for `unpark` (same order as `parked`).
+    threads: Vec<std::thread::Thread>,
+    joins: Vec<std::thread::JoinHandle<()>>,
+}
+
+fn spin_budget_from_env() -> usize {
+    std::env::var("CMF_POOL_SPIN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
 impl Pool {
     pub fn new(n_workers: usize) -> Self {
-        let mut txs = Vec::with_capacity(n_workers);
+        Self::with_spin(n_workers, spin_budget_from_env())
+    }
+
+    /// Explicit spin budget (tests pin it without touching the env).
+    pub fn with_spin(n_workers: usize, spin_budget: usize) -> Self {
+        let inner = Arc::new(Inner {
+            epoch: AtomicUsize::new(0),
+            remaining: AtomicUsize::new(0),
+            slot: UnsafeCell::new(None),
+            shutdown: AtomicBool::new(false),
+            spin_budget,
+            parked: (0..n_workers).map(|_| AtomicBool::new(false)).collect(),
+        });
+        let mut joins = Vec::with_capacity(n_workers);
         for w in 0..n_workers {
-            let (tx, rx) = channel::<Job>();
-            std::thread::Builder::new()
+            let inner = inner.clone();
+            let h = std::thread::Builder::new()
                 .name(format!("cmf-pool-{w}"))
-                .spawn(move || {
-                    while let Ok(job) = rx.recv() {
-                        // SAFETY: Pool::run blocks on the latch until this
-                        // call returns, keeping the closure borrow alive.
-                        let f = unsafe { &*job.task.0 };
-                        f(job.worker_idx, job.n_workers);
-                        job.latch.count_down();
-                    }
-                })
+                .spawn(move || worker_loop(&inner, w))
                 .expect("spawn pool worker");
-            txs.push(tx);
+            joins.push(h);
         }
-        Self { txs }
+        let threads = joins.iter().map(|h| h.thread().clone()).collect();
+        Self { inner, threads, joins }
     }
 
     /// Pool sized from `CMF_THREADS` (see module docs). `None` = serial.
@@ -100,8 +117,9 @@ impl Pool {
         }
     }
 
+    /// Spawned worker threads (the caller joins each job on top).
     pub fn n_workers(&self) -> usize {
-        self.txs.len()
+        self.threads.len()
     }
 
     /// Run `f(row_start, row_end)` over `0..rows`, self-balancing.
@@ -110,14 +128,14 @@ impl Pool {
     /// instead of each taking a fixed 1/n slice. On a heterogeneous CPU
     /// (Apple Silicon: 4 P-cores + 6 E-cores here) a static split makes
     /// every matvec end at the SLOWEST core's pace while the fast ones
-    /// idle at the latch; pulling by grain lets a P-core take several
+    /// idle at the barrier; pulling by grain lets a P-core take several
     /// chunks for each one an E-core takes, so skew collapses to a
     /// single grain. Row ranges stay disjoint and each row's dot is
     /// computed exactly as in the serial path → bit-identical output.
     pub fn run_rows(&self, rows: usize, f: &(dyn Fn(usize, usize) + Sync)) {
         // Enough chunks to balance, large enough to keep the SDOT inner
         // loop and the hardware prefetcher in their stride.
-        let grain = (rows / (self.txs.len() * 8)).max(32);
+        let grain = (rows / ((self.threads.len() + 1) * 8)).max(32);
         let next = AtomicUsize::new(0);
         self.run(&|_w, _n| loop {
             let start = next.fetch_add(grain, Ordering::Relaxed);
@@ -128,26 +146,100 @@ impl Pool {
         });
     }
 
-    /// Run `f(worker_idx, n_workers)` on every worker; blocks until all
-    /// have finished.
+    /// Run `f(worker_idx, n_participants)` on every worker AND the
+    /// calling thread (`worker_idx = n_workers()` for the caller);
+    /// returns when all participants have finished.
     pub fn run(&self, f: &(dyn Fn(usize, usize) + Sync)) {
-        let n = self.txs.len();
-        let latch = Latch::new(n);
-        // SAFETY: `wait()` below blocks until every worker is done, so
-        // extending the borrow to 'static never outlives the call.
+        let nw = self.threads.len();
+        let n = nw + 1; // caller participates
+        // SAFETY: the wait loop below blocks until every worker is done,
+        // so extending the borrow to 'static never outlives the call.
         let ptr: *const (dyn Fn(usize, usize) + Sync) = f;
         let ptr: *const (dyn Fn(usize, usize) + Sync + 'static) =
             unsafe { std::mem::transmute(ptr) };
-        for (i, tx) in self.txs.iter().enumerate() {
-            let job = Job {
-                task: TaskPtr(ptr),
-                worker_idx: i,
-                n_workers: n,
-                latch: latch.clone(),
-            };
-            tx.send(job).expect("pool worker died");
+        // SAFETY: no job in flight (previous run() drained `remaining`),
+        // so the slot is not being read.
+        unsafe { *self.inner.slot.get() = Some((TaskPtr(ptr), n)) };
+        self.inner.remaining.store(nw, Ordering::Relaxed);
+        self.inner.epoch.fetch_add(1, Ordering::SeqCst);
+        for (i, t) in self.threads.iter().enumerate() {
+            if self.inner.parked[i].load(Ordering::SeqCst) {
+                t.unpark();
+            }
         }
-        latch.wait();
+
+        // The caller's share — the barrier costs nothing while there is
+        // real work to do.
+        f(nw, n);
+
+        // Wait for the stragglers (bounded by one worker's chunk).
+        let mut spins = 0usize;
+        while self.inner.remaining.load(Ordering::Acquire) != 0 {
+            spins += 1;
+            if spins < 10_000 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.inner.shutdown.store(true, Ordering::SeqCst);
+        for t in &self.threads {
+            t.unpark();
+        }
+        for h in self.joins.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+fn worker_loop(inner: &Inner, idx: usize) {
+    // The pool is created at epoch 0; baseline MUST be 0, not a fresh
+    // epoch read — if the caller publishes a job before the OS actually
+    // starts this thread, reading the live epoch would adopt that job's
+    // epoch as "already seen", skip it, and deadlock the caller's wait.
+    let mut seen = 0usize;
+    loop {
+        // Wait for a new epoch: spin first (decode publishes the next
+        // matvec within microseconds), park only when idle for real.
+        let mut spins = 0usize;
+        loop {
+            let e = inner.epoch.load(Ordering::Acquire);
+            if e != seen {
+                seen = e;
+                break;
+            }
+            if inner.shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            if spins < inner.spin_budget {
+                spins += 1;
+                std::hint::spin_loop();
+            } else {
+                inner.parked[idx].store(true, Ordering::SeqCst);
+                // Re-check under SeqCst: the caller bumps the epoch
+                // BEFORE reading `parked`, so either it sees our flag
+                // (and unparks) or we see its epoch here — a missed
+                // wakeup is impossible. Spurious unparks just loop.
+                if inner.epoch.load(Ordering::SeqCst) == seen
+                    && !inner.shutdown.load(Ordering::Relaxed)
+                {
+                    std::thread::park();
+                }
+                inner.parked[idx].store(false, Ordering::SeqCst);
+            }
+        }
+        // SAFETY: the slot was written before the epoch bump we just
+        // observed (release/acquire), and stays valid until `remaining`
+        // drops to zero — which happens only after `f` returns below.
+        let (task, n) = unsafe { (*inner.slot.get()).expect("job published with epoch") };
+        let f = unsafe { &*task.0 };
+        f(idx, n);
+        inner.remaining.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -168,7 +260,7 @@ pub fn matvec_rows(pool: Option<&Pool>, w: &[f32], x: &[f32], out: &mut [f32]) {
     };
 
     match pool {
-        // Small outputs are not worth the latch round-trip.
+        // Small outputs are not worth the barrier round-trip.
         Some(pool) if out_dim >= 256 => {
             let out_addr = SendMut(out.as_mut_ptr());
             pool.run(&move |widx, n| {
@@ -310,6 +402,38 @@ mod tests {
                 counter.fetch_add(1, Ordering::Relaxed);
             });
         }
-        assert_eq!(counter.load(Ordering::Relaxed), 300);
+        // 3 workers + the participating caller = 4 executions per run.
+        assert_eq!(counter.load(Ordering::Relaxed), 400);
+    }
+
+    #[test]
+    fn pool_wakes_after_park() {
+        // Force immediate parking (no spin) — the epoch/parked handshake
+        // must still never miss a wakeup.
+        let pool = Pool::with_spin(2, 0);
+        let counter = AtomicUsize::new(0);
+        for _ in 0..50 {
+            pool.run(&|_, _| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            });
+            // Give workers time to actually park between jobs.
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 150);
+    }
+
+    #[test]
+    fn worker_indices_are_distinct_and_cover_range() {
+        let pool = Pool::new(3);
+        let hits: Vec<AtomicUsize> = (0..4).map(|_| AtomicUsize::new(0)).collect();
+        for _ in 0..20 {
+            pool.run(&|widx, n| {
+                assert_eq!(n, 4);
+                hits[widx].fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        for (i, h) in hits.iter().enumerate() {
+            assert_eq!(h.load(Ordering::Relaxed), 20, "participant {i} missed runs");
+        }
     }
 }

@@ -33,7 +33,26 @@ pub enum QTensor {
         row_scale: Vec<f32>,
         /// q8_2f column field (θ), dequantized up front; empty for q8_row.
         col_field: Vec<f32>,
+        /// Vbit only: byte offset of each row's packed data within the
+        /// tensor blob (`[rows + 1]`, computed once at load — the per-
+        /// matvec prefix scan over row bit-widths was O(rows) each call).
+        vbit_offsets: Vec<usize>,
     },
+}
+
+/// Prefix-sum of vbit row payload offsets (absolute within the tensor
+/// bytes). `offsets[r]..offsets[r+1]` is row r's packed data.
+fn vbit_row_offsets(bytes: &[u8], rows: usize, cols: usize) -> Vec<usize> {
+    let ng = cols / GROUP_SIZE;
+    let bits = &bytes[..rows];
+    let mut offsets = Vec::with_capacity(rows + 1);
+    let mut off = rows + rows * ng * 2;
+    for r in 0..rows {
+        offsets.push(off);
+        off += (cols * bits[r] as usize + 7) / 8;
+    }
+    offsets.push(off);
+    offsets
 }
 
 impl QTensor {
@@ -45,10 +64,10 @@ impl QTensor {
     /// Wrap a directory tensor without dequantizing the payload.
     /// Falls back to dequantized f32 for dtypes without a fused kernel.
     pub fn from_model(model: &Arc<CmfModel>, name: &str) -> Result<Self, String> {
+        // Indexed lookup: the linear directory scan made pipeline build
+        // O(N²) on MoE/skills files with thousands of tensors.
         let idx = model
-            .tensors
-            .iter()
-            .position(|t| t.name == name)
+            .tensor_index(name)
             .ok_or_else(|| format!("tensor '{name}' not found in CMF directory"))?;
         let entry = &model.tensors[idx];
         if entry.shape.len() != 2 {
@@ -90,6 +109,7 @@ impl QTensor {
                     cols,
                     row_scale,
                     col_field,
+                    vbit_offsets: Vec::new(),
                 })
             }
             // vbit: fused kernel unpacks variable-bit rows from mmap.
@@ -101,6 +121,7 @@ impl QTensor {
                 cols,
                 row_scale: Vec::new(),
                 col_field: Vec::new(),
+                vbit_offsets: vbit_row_offsets(bytes, rows, cols),
             }),
             // q4_block: fused kernel reads nibbles straight from mmap —
             // a 14B q4 file no longer explodes into ×8 f32 RAM.
@@ -112,6 +133,7 @@ impl QTensor {
                 cols,
                 row_scale: Vec::new(),
                 col_field: Vec::new(),
+                vbit_offsets: Vec::new(),
             }),
             // No fused kernel yet → dequantize once (correct, more RAM).
             _ => {
@@ -160,6 +182,7 @@ impl QTensor {
                 dtype,
                 row_scale,
                 col_field,
+                vbit_offsets,
                 ..
             } => {
                 if *dtype == TensorDtype::Q4Block {
@@ -181,10 +204,9 @@ impl QTensor {
                     let ng = cols / GROUP_SIZE;
                     let bits = &bytes[..rows];
                     let sc_off = rows;
-                    let mut off = sc_off + rows * ng * 2;
-                    for rr in 0..r {
-                        off += (cols * bits[rr] as usize + 7) / 8;
-                    }
+                    // Precomputed at load — embedding lookup used to scan
+                    // the bit-widths of every preceding row (O(token_id)).
+                    let off = vbit_offsets[r];
                     let b = bits[r] as usize;
                     let l = ((1usize << (b - 1)) - 1) as f32;
                     let data = &bytes[off..];
@@ -309,6 +331,7 @@ impl QTensor {
                 cols,
                 row_scale,
                 col_field,
+                vbit_offsets,
             } => {
                 let _ = (model, idx);
                 if *dtype == TensorDtype::Q4Block {
@@ -316,7 +339,7 @@ impl QTensor {
                     return;
                 }
                 if *dtype == TensorDtype::Vbit {
-                    vbitmatvec(self.quant_bytes(), x, *rows, *cols, out, pool);
+                    vbitmatvec(self.quant_bytes(), vbit_offsets, x, *rows, *cols, out, pool);
                     return;
                 }
                 let xs = prescale(x, col_field, *dtype);
@@ -393,16 +416,15 @@ impl QTensor {
                 cols,
                 row_scale,
                 col_field,
+                vbit_offsets,
                 ..
             } => {
                 if *dtype == TensorDtype::Q4Block {
-                    q4matvec(self.quant_bytes(), x1, *rows, *cols, o1, pool);
-                    q4matvec(self.quant_bytes(), x2, *rows, *cols, o2, pool);
+                    q4matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
                     return;
                 }
                 if *dtype == TensorDtype::Vbit {
-                    vbitmatvec(self.quant_bytes(), x1, *rows, *cols, o1, pool);
-                    vbitmatvec(self.quant_bytes(), x2, *rows, *cols, o2, pool);
+                    vbitmatvec2(self.quant_bytes(), vbit_offsets, x1, x2, *rows, *cols, o1, o2, pool);
                     return;
                 }
                 let x1s = prescale(x1, col_field, *dtype);
@@ -445,16 +467,15 @@ impl QTensor {
                 dtype,
                 row_scale,
                 col_field,
+                vbit_offsets,
                 ..
             } => {
-                if matches!(dtype, TensorDtype::Q4Block | TensorDtype::Vbit) {
-                    // No batch kernel — honest element-wise fallback.
-                    for bi in 0..b {
-                        let x = &xs_all[bi * cols..(bi + 1) * cols];
-                        let (head, tail) = out[bi * rows..].split_at_mut(rows);
-                        let _ = tail;
-                        self.matvec(x, head, pool);
-                    }
+                if *dtype == TensorDtype::Q4Block {
+                    q4matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
+                    return;
+                }
+                if *dtype == TensorDtype::Vbit {
+                    vbitmatmat(self.quant_bytes(), vbit_offsets, xs_all, b, rows, cols, out, pool);
                     return;
                 }
                 let pre: Vec<std::borrow::Cow<'_, [f32]>> = (0..b)
@@ -565,23 +586,24 @@ fn unpack8<const B: usize>(data: &[u8]) -> [i32; 8] {
 
 /// Fused vbit matvec straight from the mapped bytes (spec §3, P13
 /// FIG.3): [u8 bits: rows][f16 scales: rows·cols/32][bit-packed rows,
-/// MSB-first, byte-padded]. Row data offsets are a prefix sum over
-/// bits — computed once per call, then rows split across the pool.
-fn vbitmatvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
+/// MSB-first, byte-padded]. Row data offsets are precomputed at load
+/// (`vbit_row_offsets`) — the per-call prefix scan was O(rows) pure
+/// overhead on every matvec.
+#[allow(clippy::too_many_arguments)]
+fn vbitmatvec(
+    bytes: &[u8],
+    offsets: &[usize],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
     debug_assert_eq!(out.len(), rows);
+    debug_assert_eq!(offsets.len(), rows + 1);
     let ng = cols / GROUP_SIZE;
     let bits = &bytes[..rows];
     let sc_off = rows;
-    let data_off = sc_off + rows * ng * 2;
-    let mut offsets = Vec::with_capacity(rows + 1);
-    let mut off = data_off;
-    for r in 0..rows {
-        offsets.push(off);
-        off += (cols * bits[r] as usize + 7) / 8;
-    }
-    offsets.push(off);
-
-    let offsets = &offsets;
 
     // SDOT path: unpack the row to centered i8 once, then per-group
     // int8 dot against the quantized activations — same A8W8 contract
@@ -762,6 +784,205 @@ fn vbitmatvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]
     }
 }
 
+/// Fused two-input vbit matvec: each row is unpacked from the mmap ONCE
+/// and dotted against BOTH activations (MTP verify / pair prefill used
+/// to run two full matvecs — double weight traffic and double unpack).
+/// Per-input math is identical to `vbitmatvec` → same accuracy contract.
+#[allow(clippy::too_many_arguments)]
+fn vbitmatvec2(
+    bytes: &[u8],
+    offsets: &[usize],
+    x1: &[f32],
+    x2: &[f32],
+    rows: usize,
+    cols: usize,
+    o1: &mut [f32],
+    o2: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    debug_assert_eq!(o1.len(), rows);
+    debug_assert_eq!(o2.len(), rows);
+    let ng = cols / GROUP_SIZE;
+    let bits = &bytes[..rows];
+    let sc_off = rows;
+
+    #[cfg(target_arch = "aarch64")]
+    if sdot_enabled() {
+        let a1 = split_act(x1);
+        let a2 = split_act(x2);
+        let (a1, a2) = (&a1, &a2);
+        let row_dots = move |r: usize| -> (f32, f32) {
+            let b = bits[r] as usize;
+            let l = (1i32 << (b - 1)) - 1;
+            let data = &bytes[offsets[r]..offsets[r + 1]];
+            if b == 8 {
+                // u−L reaches 128 → does not fit i8; exact f32 path,
+                // bits still streamed once for both lanes.
+                let (mut acc, mut nbits, mut idx) = (0u64, 0usize, 0usize);
+                let (mut d1, mut d2) = (0f32, 0f32);
+                for g in 0..ng {
+                    let so = (r * ng + g) * 2;
+                    let sgf = f16_to_f32(u16::from_le_bytes([
+                        bytes[sc_off + so],
+                        bytes[sc_off + so + 1],
+                    ]));
+                    let (mut g1, mut g2) = (0f32, 0f32);
+                    for k in 0..GROUP_SIZE {
+                        if nbits < 8 {
+                            acc = (acc << 8) | data[idx] as u64;
+                            idx += 1;
+                            nbits += 8;
+                        }
+                        let u = ((acc >> (nbits - 8)) & 0xFF) as i32;
+                        nbits -= 8;
+                        let w = (u - l) as f32;
+                        g1 += w * x1[g * GROUP_SIZE + k];
+                        g2 += w * x2[g * GROUP_SIZE + k];
+                    }
+                    d1 += g1 * sgf;
+                    d2 += g2 * sgf;
+                }
+                return (d1, d2);
+            }
+            thread_local! {
+                static VBIT_SCRATCH2: std::cell::RefCell<Vec<u8>> =
+                    const { std::cell::RefCell::new(Vec::new()) };
+            }
+            #[inline(always)]
+            fn fill<const B: usize>(data: &[u8], l: i32, buf: &mut [u8]) {
+                for (blk, chunk) in buf.chunks_exact_mut(8).enumerate() {
+                    let u = unpack8::<B>(&data[blk * B..]);
+                    for k in 0..8 {
+                        chunk[k] = (u[k] - l) as i8 as u8;
+                    }
+                }
+            }
+            VBIT_SCRATCH2.with(|scratch| {
+                let mut buf = scratch.borrow_mut();
+                buf.resize(cols, 0);
+                match b {
+                    3 => fill::<3>(data, l, &mut buf),
+                    4 => fill::<4>(data, l, &mut buf),
+                    5 => fill::<5>(data, l, &mut buf),
+                    6 => fill::<6>(data, l, &mut buf),
+                    _ => unreachable!(),
+                }
+                let (mut d1, mut d2) = (0f32, 0f32);
+                for g in 0..ng {
+                    let so = (r * ng + g) * 2;
+                    let s = f16_to_f32(u16::from_le_bytes([
+                        bytes[sc_off + so],
+                        bytes[sc_off + so + 1],
+                    ]));
+                    let wg = &buf[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+                    let v1 = unsafe {
+                        dot_i8_sdot(wg, &a1.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE])
+                    } as f32
+                        * a1.sx;
+                    let v2 = unsafe {
+                        dot_i8_sdot(wg, &a2.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE])
+                    } as f32
+                        * a2.sx;
+                    d1 += v1 * s;
+                    d2 += v2 * s;
+                }
+                for &(j, xv) in &a1.outliers {
+                    let so = (r * ng + j / GROUP_SIZE) * 2;
+                    let s = f16_to_f32(u16::from_le_bytes([
+                        bytes[sc_off + so],
+                        bytes[sc_off + so + 1],
+                    ]));
+                    d1 += (buf[j] as i8) as f32 * s * xv;
+                }
+                for &(j, xv) in &a2.outliers {
+                    let so = (r * ng + j / GROUP_SIZE) * 2;
+                    let s = f16_to_f32(u16::from_le_bytes([
+                        bytes[sc_off + so],
+                        bytes[sc_off + so + 1],
+                    ]));
+                    d2 += (buf[j] as i8) as f32 * s * xv;
+                }
+                (d1, d2)
+            })
+        };
+        let p1 = SendMut(o1.as_mut_ptr());
+        let p2 = SendMut(o2.as_mut_ptr());
+        let run = move |start: usize, end: usize| {
+            for r in start..end {
+                let (v1, v2) = row_dots(r);
+                // SAFETY: disjoint row ranges per worker.
+                unsafe {
+                    *p1.at(r) = v1;
+                    *p2.at(r) = v2;
+                }
+            }
+        };
+        dispatch_rows(pool, rows, &run);
+        return;
+    }
+
+    // Scalar path: per-bit-width specialized, two accumulators per row —
+    // per-lane accumulation order matches `vbitmatvec` exactly.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn dot_row2<const B: usize>(
+        data: &[u8],
+        bytes: &[u8],
+        sc_off: usize,
+        r: usize,
+        ng: usize,
+        x1: &[f32],
+        x2: &[f32],
+    ) -> (f32, f32) {
+        let l = ((1i32 << (B - 1)) - 1) as f32;
+        let gbytes = GROUP_SIZE * B / 8;
+        let (mut d1, mut d2) = (0f32, 0f32);
+        for g in 0..ng {
+            let so = (r * ng + g) * 2;
+            let s = f16_to_f32(u16::from_le_bytes([bytes[sc_off + so], bytes[sc_off + so + 1]]));
+            let x1g = &x1[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+            let x2g = &x2[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+            let gd0 = &data[g * gbytes..(g + 1) * gbytes];
+            let (mut g1, mut g2) = (0f32, 0f32);
+            for blk in 0..GROUP_SIZE / 8 {
+                let u = unpack8::<B>(&gd0[blk * B..]);
+                for k in 0..8 {
+                    let w = u[k] as f32 - l;
+                    g1 += w * x1g[blk * 8 + k];
+                    g2 += w * x2g[blk * 8 + k];
+                }
+            }
+            d1 += g1 * s;
+            d2 += g2 * s;
+        }
+        (d1, d2)
+    }
+    let row_dots = move |r: usize| -> (f32, f32) {
+        let data = &bytes[offsets[r]..offsets[r + 1]];
+        match bits[r] {
+            3 => dot_row2::<3>(data, bytes, sc_off, r, ng, x1, x2),
+            4 => dot_row2::<4>(data, bytes, sc_off, r, ng, x1, x2),
+            5 => dot_row2::<5>(data, bytes, sc_off, r, ng, x1, x2),
+            6 => dot_row2::<6>(data, bytes, sc_off, r, ng, x1, x2),
+            8 => dot_row2::<8>(data, bytes, sc_off, r, ng, x1, x2),
+            b => unreachable!("vbit bit-width {b} (validated at load)"),
+        }
+    };
+    let p1 = SendMut(o1.as_mut_ptr());
+    let p2 = SendMut(o2.as_mut_ptr());
+    let run = move |start: usize, end: usize| {
+        for r in start..end {
+            let (v1, v2) = row_dots(r);
+            // SAFETY: disjoint row ranges per worker.
+            unsafe {
+                *p1.at(r) = v1;
+                *p2.at(r) = v2;
+            }
+        }
+    };
+    dispatch_rows(pool, rows, &run);
+}
+
 /// Fused q4_block matvec straight from the mapped bytes. SDOT path when
 /// dotprod is available (port of vmfcore `dot_q4_block_sdot`, measured
 /// +23% on q4 decode): nibbles → centered i8, int8×int8 `sdot` per
@@ -851,6 +1072,361 @@ fn q4matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], 
     }
 }
 
+/// Fused two-input q4 matvec: nibbles are unpacked ONCE per group and
+/// dotted against both activations (was: two full matvecs — double
+/// weight traffic). Per-lane math matches `q4matvec` exactly.
+#[allow(clippy::too_many_arguments)]
+fn q4matvec2(
+    bytes: &[u8],
+    x1: &[f32],
+    x2: &[f32],
+    rows: usize,
+    cols: usize,
+    o1: &mut [f32],
+    o2: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    debug_assert_eq!(o1.len(), rows);
+    debug_assert_eq!(o2.len(), rows);
+    let (packed, scales) = q4_split(bytes, rows, cols);
+    let gpr = cols / GROUP_SIZE;
+
+    #[cfg(target_arch = "aarch64")]
+    if sdot_enabled() {
+        let a1 = split_act(x1);
+        let a2 = split_act(x2);
+        let (a1, a2) = (&a1, &a2);
+        let row_dots = move |r: usize| -> (f32, f32) {
+            let (s1, s2) =
+                unsafe { dot_q4_row_sdot2(packed, scales, r * gpr, gpr, &a1.xq, &a2.xq) };
+            let mut acc1 = s1 * a1.sx;
+            let mut acc2 = s2 * a2.sx;
+            // xq is zeroed at outlier slots — add the exact terms.
+            let fix = |outliers: &[(usize, f32)], acc: &mut f32| {
+                for &(j, xv) in outliers {
+                    let flat = r * cols + j;
+                    let byte = packed[flat / 2];
+                    let nib = if flat & 1 == 0 { byte & 0x0F } else { byte >> 4 };
+                    let s = f16_to_f32(u16::from_le_bytes([
+                        scales[(flat / GROUP_SIZE) * 2],
+                        scales[(flat / GROUP_SIZE) * 2 + 1],
+                    ]));
+                    *acc += ((nib as i32 - 8) as f32) * s * xv;
+                }
+            };
+            fix(&a1.outliers, &mut acc1);
+            fix(&a2.outliers, &mut acc2);
+            (acc1, acc2)
+        };
+        let p1 = SendMut(o1.as_mut_ptr());
+        let p2 = SendMut(o2.as_mut_ptr());
+        let run = move |start: usize, end: usize| {
+            for r in start..end {
+                let (v1, v2) = row_dots(r);
+                // SAFETY: disjoint row ranges per worker.
+                unsafe {
+                    *p1.at(r) = v1;
+                    *p2.at(r) = v2;
+                }
+            }
+        };
+        dispatch_rows(pool, rows, &run);
+        return;
+    }
+
+    let row_dots = |r: usize| -> (f32, f32) {
+        let (mut acc1, mut acc2) = (0f32, 0f32);
+        for gi in 0..gpr {
+            let g = r * gpr + gi;
+            let s = f16_to_f32(u16::from_le_bytes([scales[g * 2], scales[g * 2 + 1]]));
+            let pk = &packed[g * 16..(g + 1) * 16];
+            let x1g = &x1[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE];
+            let x2g = &x2[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE];
+            let (mut g1, mut g2) = (0f32, 0f32);
+            for (k, &b) in pk.iter().enumerate() {
+                let wl = (b & 0x0F) as f32 - 8.0;
+                let wh = ((b >> 4) & 0x0F) as f32 - 8.0;
+                g1 += wl * x1g[k * 2] + wh * x1g[k * 2 + 1];
+                g2 += wl * x2g[k * 2] + wh * x2g[k * 2 + 1];
+            }
+            acc1 += g1 * s;
+            acc2 += g2 * s;
+        }
+        (acc1, acc2)
+    };
+    let p1 = SendMut(o1.as_mut_ptr());
+    let p2 = SendMut(o2.as_mut_ptr());
+    let run = move |start: usize, end: usize| {
+        for r in start..end {
+            let (v1, v2) = row_dots(r);
+            // SAFETY: disjoint row ranges per worker.
+            unsafe {
+                *p1.at(r) = v1;
+                *p2.at(r) = v2;
+            }
+        }
+    };
+    dispatch_rows(pool, rows, &run);
+}
+
+thread_local! {
+    /// Per-worker decoded-row scratch for the batched q4/vbit kernels
+    /// (centered i8 for SDOT, f32 for the exact/scalar paths).
+    static ROW_I8: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static ROW_F32: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Batched q4 matmat: each weight row is unpacked from the mmap ONCE
+/// and dotted against ALL b activations (prefill used to fall back to b
+/// full matvecs — b× weight traffic and b× nibble decode). Per-position
+/// math matches `q4matvec` exactly: same group order, same accumulation.
+/// `out` is row-major [b, rows] like `qmatmat`.
+#[allow(clippy::too_many_arguments)]
+fn q4matmat(
+    bytes: &[u8],
+    xs_all: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    debug_assert_eq!(xs_all.len(), b * cols);
+    debug_assert_eq!(out.len(), b * rows);
+    let (packed, scales) = q4_split(bytes, rows, cols);
+    let gpr = cols / GROUP_SIZE;
+    let gscale = |g: usize| f16_to_f32(u16::from_le_bytes([scales[g * 2], scales[g * 2 + 1]]));
+
+    #[cfg(target_arch = "aarch64")]
+    if sdot_enabled() {
+        let acts: Vec<SplitAct> =
+            (0..b).map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols])).collect();
+        let acts = &acts;
+        let out_addr = SendMut(out.as_mut_ptr());
+        let run = move |start: usize, end: usize| {
+            ROW_I8.with(|rb| {
+                let mut buf = rb.borrow_mut();
+                buf.resize(cols, 0);
+                for r in start..end {
+                    // Unpack the row's nibbles to centered i8 once
+                    // (element 2k = low nibble, 2k+1 = high — flat order,
+                    // same as dot_q4_row_sdot's zip).
+                    for gi in 0..gpr {
+                        let g = r * gpr + gi;
+                        for (k, &bt) in packed[g * 16..(g + 1) * 16].iter().enumerate() {
+                            buf[gi * GROUP_SIZE + k * 2] = ((bt & 0x0F) as i32 - 8) as i8 as u8;
+                            buf[gi * GROUP_SIZE + k * 2 + 1] =
+                                (((bt >> 4) & 0x0F) as i32 - 8) as i8 as u8;
+                        }
+                    }
+                    for (bi, act) in acts.iter().enumerate() {
+                        let mut acc = 0f32;
+                        for gi in 0..gpr {
+                            let d = unsafe {
+                                dot_i8_sdot(
+                                    &buf[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE],
+                                    &act.xq[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE],
+                                )
+                            };
+                            acc += d as f32 * gscale(r * gpr + gi);
+                        }
+                        acc *= act.sx;
+                        // xq is zeroed at outlier slots — exact terms.
+                        for &(j, xv) in &act.outliers {
+                            acc += (buf[j] as i8) as f32 * gscale((r * cols + j) / GROUP_SIZE) * xv;
+                        }
+                        // SAFETY: disjoint (bi, r) cells per worker row range.
+                        unsafe { *out_addr.at(bi * rows + r) = acc };
+                    }
+                }
+            })
+        };
+        dispatch_rows(pool, rows, &run);
+        return;
+    }
+
+    let out_addr = SendMut(out.as_mut_ptr());
+    let run = move |start: usize, end: usize| {
+        ROW_F32.with(|rb| {
+            let mut buf = rb.borrow_mut();
+            buf.resize(cols, 0.0);
+            for r in start..end {
+                // Decode raw (nib − 8) values once; scales stay per-group
+                // so the accumulation order matches q4matvec bit-for-bit.
+                for gi in 0..gpr {
+                    let g = r * gpr + gi;
+                    for (k, &bt) in packed[g * 16..(g + 1) * 16].iter().enumerate() {
+                        buf[gi * GROUP_SIZE + k * 2] = (bt & 0x0F) as f32 - 8.0;
+                        buf[gi * GROUP_SIZE + k * 2 + 1] = ((bt >> 4) & 0x0F) as f32 - 8.0;
+                    }
+                }
+                for bi in 0..b {
+                    let x = &xs_all[bi * cols..(bi + 1) * cols];
+                    let mut acc = 0f32;
+                    for gi in 0..gpr {
+                        let mut ga = 0f32;
+                        for k in 0..GROUP_SIZE {
+                            ga += buf[gi * GROUP_SIZE + k] * x[gi * GROUP_SIZE + k];
+                        }
+                        acc += ga * gscale(r * gpr + gi);
+                    }
+                    // SAFETY: disjoint (bi, r) cells per worker row range.
+                    unsafe { *out_addr.at(bi * rows + r) = acc };
+                }
+            }
+        })
+    };
+    dispatch_rows(pool, rows, &run);
+}
+
+/// Batched vbit matmat: each variable-bit row is decoded from the mmap
+/// ONCE for the whole microbatch. Same per-position math as
+/// `vbitmatvec` (SDOT A8W8 with exact outliers / exact f32 for b=8 rows
+/// and the scalar path).
+#[allow(clippy::too_many_arguments)]
+fn vbitmatmat(
+    bytes: &[u8],
+    offsets: &[usize],
+    xs_all: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    debug_assert_eq!(xs_all.len(), b * cols);
+    debug_assert_eq!(out.len(), b * rows);
+    debug_assert_eq!(offsets.len(), rows + 1);
+    let ng = cols / GROUP_SIZE;
+    let bits = &bytes[..rows];
+    let sc_off = rows;
+    let gscale = |r: usize, g: usize| {
+        let so = (r * ng + g) * 2;
+        f16_to_f32(u16::from_le_bytes([bytes[sc_off + so], bytes[sc_off + so + 1]]))
+    };
+
+    // Decode row r's raw (u − L) values into `dst` (f32, unscaled).
+    let decode_f32 = |r: usize, dst: &mut [f32]| {
+        let bw = bits[r] as usize;
+        let l = ((1i32 << (bw - 1)) - 1) as f32;
+        let data = &bytes[offsets[r]..offsets[r + 1]];
+        let (mut acc, mut nbits, mut idx) = (0u64, 0usize, 0usize);
+        for d in dst.iter_mut() {
+            while nbits < bw {
+                acc = (acc << 8) | data[idx] as u64;
+                idx += 1;
+                nbits += 8;
+            }
+            let u = ((acc >> (nbits - bw)) & ((1u64 << bw) - 1)) as f32;
+            nbits -= bw;
+            *d = u - l;
+        }
+    };
+
+    #[cfg(target_arch = "aarch64")]
+    if sdot_enabled() {
+        let acts: Vec<SplitAct> =
+            (0..b).map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols])).collect();
+        let acts = &acts;
+        let out_addr = SendMut(out.as_mut_ptr());
+        let run = move |start: usize, end: usize| {
+            for r in start..end {
+                let bw = bits[r] as usize;
+                if bw == 8 {
+                    // u−L reaches 128 → no i8 path; decode once, exact
+                    // f32 dots for every position (same as vbitmatvec).
+                    ROW_F32.with(|rb| {
+                        let mut buf = rb.borrow_mut();
+                        buf.resize(cols, 0.0);
+                        decode_f32(r, &mut buf);
+                        for bi in 0..b {
+                            let x = &xs_all[bi * cols..(bi + 1) * cols];
+                            let mut dot = 0f32;
+                            for g in 0..ng {
+                                let mut gd = 0f32;
+                                for k in 0..GROUP_SIZE {
+                                    gd += buf[g * GROUP_SIZE + k] * x[g * GROUP_SIZE + k];
+                                }
+                                dot += gd * gscale(r, g);
+                            }
+                            // SAFETY: disjoint (bi, r) cells per worker range.
+                            unsafe { *out_addr.at(bi * rows + r) = dot };
+                        }
+                    });
+                    continue;
+                }
+                let l = (1i32 << (bw - 1)) - 1;
+                let data = &bytes[offsets[r]..offsets[r + 1]];
+                ROW_I8.with(|rb| {
+                    let mut buf = rb.borrow_mut();
+                    buf.resize(cols, 0);
+                    #[inline(always)]
+                    fn fill<const B: usize>(data: &[u8], l: i32, buf: &mut [u8]) {
+                        for (blk, chunk) in buf.chunks_exact_mut(8).enumerate() {
+                            let u = unpack8::<B>(&data[blk * B..]);
+                            for k in 0..8 {
+                                chunk[k] = (u[k] - l) as i8 as u8;
+                            }
+                        }
+                    }
+                    match bw {
+                        3 => fill::<3>(data, l, &mut buf),
+                        4 => fill::<4>(data, l, &mut buf),
+                        5 => fill::<5>(data, l, &mut buf),
+                        6 => fill::<6>(data, l, &mut buf),
+                        _ => unreachable!("vbit bit-width {bw} (validated at load)"),
+                    }
+                    for (bi, act) in acts.iter().enumerate() {
+                        let mut dot = 0f32;
+                        for g in 0..ng {
+                            let d = unsafe {
+                                dot_i8_sdot(
+                                    &buf[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
+                                    &act.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
+                                )
+                            } as f32
+                                * act.sx;
+                            dot += d * gscale(r, g);
+                        }
+                        for &(j, xv) in &act.outliers {
+                            dot += (buf[j] as i8) as f32 * gscale(r, j / GROUP_SIZE) * xv;
+                        }
+                        // SAFETY: disjoint (bi, r) cells per worker range.
+                        unsafe { *out_addr.at(bi * rows + r) = dot };
+                    }
+                });
+            }
+        };
+        dispatch_rows(pool, rows, &run);
+        return;
+    }
+
+    let out_addr = SendMut(out.as_mut_ptr());
+    let run = move |start: usize, end: usize| {
+        ROW_F32.with(|rb| {
+            let mut buf = rb.borrow_mut();
+            buf.resize(cols, 0.0);
+            for r in start..end {
+                decode_f32(r, &mut buf);
+                for bi in 0..b {
+                    let x = &xs_all[bi * cols..(bi + 1) * cols];
+                    let mut dot = 0f32;
+                    for g in 0..ng {
+                        let mut gd = 0f32;
+                        for k in 0..GROUP_SIZE {
+                            gd += buf[g * GROUP_SIZE + k] * x[g * GROUP_SIZE + k];
+                        }
+                        dot += gd * gscale(r, g);
+                    }
+                    // SAFETY: disjoint (bi, r) cells per worker range.
+                    unsafe { *out_addr.at(bi * rows + r) = dot };
+                }
+            }
+        })
+    };
+    dispatch_rows(pool, rows, &run);
+}
+
 /// θ col-field fold for q8_2f activations. Borrowed pass-through for
 /// every other dtype — the old unconditional `x.to_vec()` was a pure
 /// per-matvec allocation on the q8_row hot path.
@@ -897,25 +1473,61 @@ struct SplitAct {
     outliers: Vec<(usize, f32)>,
 }
 
+thread_local! {
+    /// Recycled xq buffers: split_act runs for every matvec (~200/token)
+    /// and its hidden-size allocation was steady-state heap churn.
+    static XQ_FREE: std::cell::RefCell<Vec<Vec<i8>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl Drop for SplitAct {
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.xq);
+        if buf.capacity() > 0 {
+            XQ_FREE.with(|f| {
+                let mut f = f.borrow_mut();
+                if f.len() < 16 {
+                    f.push(buf);
+                }
+            });
+        }
+    }
+}
+
 fn split_act(x: &[f32]) -> SplitAct {
     let n = x.len();
     let rms = (x.iter().map(|&v| (v * v) as f64).sum::<f64>() / n.max(1) as f64).sqrt() as f32;
     let thr = 8.0 * rms;
-    let outliers: Vec<(usize, f32)> = (0..n)
-        .filter(|&j| x[j].abs() > thr)
-        .map(|j| (j, x[j]))
-        .collect();
-    let mut xb = x.to_vec();
-    for &(j, _) in &outliers {
-        xb[j] = 0.0;
+    // One pass: collect outliers and the bulk absmax (outliers excluded —
+    // identical to the old zero-then-fold over a copied buffer, minus the
+    // full-vector copy).
+    let mut outliers: Vec<(usize, f32)> = Vec::new();
+    let mut amax = 0f32;
+    for (j, &v) in x.iter().enumerate() {
+        let a = v.abs();
+        if a > thr {
+            outliers.push((j, v));
+        } else if a > amax {
+            amax = a;
+        }
     }
-    let amax = xb.iter().fold(0f32, |m, &v| m.max(v.abs()));
     let sx = if amax > 0.0 { amax / 127.0 } else { 1.0 };
     let inv = 1.0 / sx;
-    let xq = xb
-        .iter()
-        .map(|&v| (v * inv).round().clamp(-127.0, 127.0) as i8)
-        .collect();
+    let mut xq = XQ_FREE.with(|f| f.borrow_mut().pop()).unwrap_or_default();
+    xq.clear();
+    xq.reserve(n);
+    if outliers.is_empty() {
+        xq.extend(x.iter().map(|&v| (v * inv).round().clamp(-127.0, 127.0) as i8));
+    } else {
+        // Outlier slots quantize to 0 (their exact term is added later).
+        xq.extend(x.iter().map(|&v| {
+            if v.abs() > thr {
+                0
+            } else {
+                (v * inv).round().clamp(-127.0, 127.0) as i8
+            }
+        }));
+    }
     SplitAct { xq, sx, outliers }
 }
 
@@ -1067,6 +1679,61 @@ unsafe fn dot_q4_row_sdot(packed: &[u8], scales: &[u8], g0: usize, gpr: usize, x
             acc += vaddvq_s32(vaddq_s32(a0, a1)) as f32 * s;
         }
         acc
+    }
+}
+
+/// Two-activation q4 row via SDOT: the nibble unpack (the expensive
+/// part) happens ONCE per group; both pre-quantized activations are
+/// dotted against the same centered i8 registers. Per-lane math matches
+/// `dot_q4_row_sdot` exactly.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn dot_q4_row_sdot2(
+    packed: &[u8],
+    scales: &[u8],
+    g0: usize,
+    gpr: usize,
+    xq1: &[i8],
+    xq2: &[i8],
+) -> (f32, f32) {
+    // SAFETY: callers uphold slice-length contracts (16 packed bytes and
+    // 2 scale bytes per group; xq*.len() == gpr·GROUP_SIZE).
+    unsafe {
+        use core::arch::aarch64::*;
+        use core::arch::asm;
+        let lomask = vdupq_n_u8(0x0F);
+        let eight = vdupq_n_s8(8);
+        let (mut acc1, mut acc2) = (0f32, 0f32);
+        for gi in 0..gpr {
+            let g = g0 + gi;
+            let s = f16_to_f32(u16::from_le_bytes([scales[g * 2], scales[g * 2 + 1]]));
+            let b = vld1q_u8(packed.as_ptr().add(g * 16));
+            let lo = vandq_u8(b, lomask);
+            let hi = vshrq_n_u8::<4>(b);
+            let e0 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(lo, hi)), eight);
+            let e1 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(lo, hi)), eight);
+            let x10 = vld1q_s8(xq1.as_ptr().add(gi * GROUP_SIZE));
+            let x11 = vld1q_s8(xq1.as_ptr().add(gi * GROUP_SIZE + 16));
+            let x20 = vld1q_s8(xq2.as_ptr().add(gi * GROUP_SIZE));
+            let x21 = vld1q_s8(xq2.as_ptr().add(gi * GROUP_SIZE + 16));
+            let (mut a0, mut a1, mut b0, mut b1) =
+                (vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0));
+            asm!(
+                "sdot {a0:v}.4s, {e0:v}.16b, {x10:v}.16b",
+                "sdot {a1:v}.4s, {e1:v}.16b, {x11:v}.16b",
+                "sdot {b0:v}.4s, {e0:v}.16b, {x20:v}.16b",
+                "sdot {b1:v}.4s, {e1:v}.16b, {x21:v}.16b",
+                a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                b0 = inout(vreg) b0, b1 = inout(vreg) b1,
+                e0 = in(vreg) e0, e1 = in(vreg) e1,
+                x10 = in(vreg) x10, x11 = in(vreg) x11,
+                x20 = in(vreg) x20, x21 = in(vreg) x21,
+                options(pure, nomem, nostack),
+            );
+            acc1 += vaddvq_s32(vaddq_s32(a0, a1)) as f32 * s;
+            acc2 += vaddvq_s32(vaddq_s32(b0, b1)) as f32 * s;
+        }
+        (acc1, acc2)
     }
 }
 
@@ -1521,7 +2188,8 @@ mod tests {
                 .sum();
         }
         let mut got = vec![0f32; rows];
-        vbitmatvec(&bytes, &x, rows, cols, &mut got, None);
+        let offsets = vbit_row_offsets(&bytes, rows, cols);
+        vbitmatvec(&bytes, &offsets, &x, rows, cols, &mut got, None);
         // SDOT path quantizes activations to i8 (A8W8): bounded noise,
         // same contract as q8 (exact path is pinned by CMF_SDOT=0 in
         // the golden-parity gate).
@@ -1579,6 +2247,145 @@ mod tests {
                 got[r],
                 expect[r]
             );
+        }
+    }
+
+    /// Fused two-input vbit matvec must equal two single matvecs exactly
+    /// (same per-lane accumulation order on both scalar and SDOT paths).
+    #[test]
+    fn vbitmatvec2_equals_two_singles() {
+        let (rows, cols) = (6, 64);
+        let ng = cols / GROUP_SIZE;
+        let bits: Vec<u8> = vec![3, 4, 5, 6, 8, 4];
+        let mut bytes = bits.clone();
+        for g in 0..rows * ng {
+            let s = 0.02 + 0.001 * g as f32;
+            bytes.extend_from_slice(&cortiq_core::quant::f32_to_f16(s).to_le_bytes());
+        }
+        for r in 0..rows {
+            let b = bits[r] as usize;
+            let (mut acc, mut nb) = (0u64, 0usize);
+            let mut rowbytes = Vec::new();
+            for i in 0..cols {
+                let v = ((i * 7 + r * 13) % (1 << b)) as u64;
+                acc = (acc << b) | v;
+                nb += b;
+                while nb >= 8 {
+                    nb -= 8;
+                    rowbytes.push(((acc >> nb) & 0xFF) as u8);
+                }
+            }
+            if nb > 0 {
+                rowbytes.push(((acc << (8 - nb)) & 0xFF) as u8);
+            }
+            bytes.extend_from_slice(&rowbytes);
+        }
+        let x1: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.19).sin()).collect();
+        let x2: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.11).cos()).collect();
+        let offsets = vbit_row_offsets(&bytes, rows, cols);
+
+        let (mut a1, mut a2) = (vec![0f32; rows], vec![0f32; rows]);
+        vbitmatvec(&bytes, &offsets, &x1, rows, cols, &mut a1, None);
+        vbitmatvec(&bytes, &offsets, &x2, rows, cols, &mut a2, None);
+        let (mut b1, mut b2) = (vec![0f32; rows], vec![0f32; rows]);
+        vbitmatvec2(&bytes, &offsets, &x1, &x2, rows, cols, &mut b1, &mut b2, None);
+        assert_eq!(a1, b1, "fused vbit lane 1 must be bit-identical");
+        assert_eq!(a2, b2, "fused vbit lane 2 must be bit-identical");
+    }
+
+    /// Fused two-input q4 matvec must equal two single matvecs exactly.
+    #[test]
+    fn q4matvec2_equals_two_singles() {
+        let (rows, cols) = (8, 128);
+        let groups = rows * cols / GROUP_SIZE;
+        let mut bytes = Vec::with_capacity(groups * 16 + groups * 2);
+        for i in 0..groups * 16 {
+            bytes.push((((i * 7 + 3) % 256) & 0xFF) as u8);
+        }
+        for g in 0..groups {
+            let s = 0.01 + 0.003 * g as f32;
+            bytes.extend_from_slice(&cortiq_core::quant::f32_to_f16(s).to_le_bytes());
+        }
+        // Include an outlier channel so the SDOT correction path is
+        // exercised in the pair kernel too.
+        let mut x1: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.17).sin()).collect();
+        x1[9] = 250.0;
+        let x2: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.23).cos()).collect();
+
+        let (mut a1, mut a2) = (vec![0f32; rows], vec![0f32; rows]);
+        q4matvec(&bytes, &x1, rows, cols, &mut a1, None);
+        q4matvec(&bytes, &x2, rows, cols, &mut a2, None);
+        let (mut b1, mut b2) = (vec![0f32; rows], vec![0f32; rows]);
+        q4matvec2(&bytes, &x1, &x2, rows, cols, &mut b1, &mut b2, None);
+        assert_eq!(a1, b1, "fused q4 lane 1 must be bit-identical");
+        assert_eq!(a2, b2, "fused q4 lane 2 must be bit-identical");
+    }
+
+    /// Batched q4/vbit matmat must equal per-position matvec calls
+    /// exactly (the fallback it replaced) — same kernels, same order.
+    #[test]
+    fn batched_matmat_equals_per_position_matvec() {
+        let (rows, cols, b) = (8, 64, 5);
+        // q4 blob.
+        let groups = rows * cols / GROUP_SIZE;
+        let mut q4 = Vec::new();
+        for i in 0..groups * 16 {
+            q4.push((((i * 7 + 3) % 256) & 0xFF) as u8);
+        }
+        for g in 0..groups {
+            q4.extend_from_slice(
+                &cortiq_core::quant::f32_to_f16(0.01 + 0.003 * g as f32).to_le_bytes(),
+            );
+        }
+        // vbit blob (mixed widths incl. 8).
+        let ng = cols / GROUP_SIZE;
+        let bits: Vec<u8> = vec![3, 4, 5, 6, 8, 4, 5, 3];
+        let mut vb = bits.clone();
+        for g in 0..rows * ng {
+            vb.extend_from_slice(
+                &cortiq_core::quant::f32_to_f16(0.02 + 0.001 * g as f32).to_le_bytes(),
+            );
+        }
+        for r in 0..rows {
+            let bw = bits[r] as usize;
+            let (mut acc, mut nb) = (0u64, 0usize);
+            let mut rowbytes = Vec::new();
+            for i in 0..cols {
+                let v = ((i * 7 + r * 13) % (1 << bw)) as u64;
+                acc = (acc << bw) | v;
+                nb += bw;
+                while nb >= 8 {
+                    nb -= 8;
+                    rowbytes.push(((acc >> nb) & 0xFF) as u8);
+                }
+            }
+            if nb > 0 {
+                rowbytes.push(((acc << (8 - nb)) & 0xFF) as u8);
+            }
+            vb.extend_from_slice(&rowbytes);
+        }
+        let offsets = vbit_row_offsets(&vb, rows, cols);
+
+        let xs: Vec<f32> = (0..b * cols).map(|i| (i as f32 * 0.13).sin()).collect();
+
+        // q4: batch vs singles.
+        let mut got = vec![0f32; b * rows];
+        q4matmat(&q4, &xs, b, rows, cols, &mut got, None);
+        for bi in 0..b {
+            let mut expect = vec![0f32; rows];
+            q4matvec(&q4, &xs[bi * cols..(bi + 1) * cols], rows, cols, &mut expect, None);
+            assert_eq!(&got[bi * rows..(bi + 1) * rows], &expect[..], "q4 batch pos {bi}");
+        }
+
+        // vbit: batch vs singles.
+        let mut got = vec![0f32; b * rows];
+        vbitmatmat(&vb, &offsets, &xs, b, rows, cols, &mut got, None);
+        for bi in 0..b {
+            let mut expect = vec![0f32; rows];
+            vbitmatvec(
+                &vb, &offsets, &xs[bi * cols..(bi + 1) * cols], rows, cols, &mut expect, None,
+            );
+            assert_eq!(&got[bi * rows..(bi + 1) * rows], &expect[..], "vbit batch pos {bi}");
         }
     }
 

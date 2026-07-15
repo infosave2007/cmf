@@ -20,6 +20,27 @@ use crate::tokenizer::Tokenizer;
 use cortiq_core::mask::TaskMask;
 use cortiq_core::types::NormStyle;
 
+/// Reusable per-pipeline forward scratch: the four norm outputs the
+/// decode paths recompute every layer (single: n1/p1; pair: all four).
+/// Plain buffers, resized once — steady-state decode reuses them.
+struct ForwardScratch {
+    n1: Vec<f32>,
+    n2: Vec<f32>,
+    p1: Vec<f32>,
+    p2: Vec<f32>,
+}
+
+impl ForwardScratch {
+    fn new(hidden: usize) -> Self {
+        Self {
+            n1: vec![0.0; hidden],
+            n2: vec![0.0; hidden],
+            p1: vec![0.0; hidden],
+            p2: vec![0.0; hidden],
+        }
+    }
+}
+
 /// Complete inference pipeline state.
 pub struct Pipeline {
     pub tokenizer: Tokenizer,
@@ -47,8 +68,14 @@ pub struct Pipeline {
     /// Speculative decode via MTP (greedy only; `CMF_MTP=0` disables).
     pub speculative: bool,
     rng: SplitMix64,
-    /// Precomputed RoPE inverse frequencies [head_dim/2].
-    inv_freq: Vec<f32>,
+    /// Precomputed RoPE inverse frequencies [head_dim/2]. Arc: the
+    /// forward path clones a handle to escape the &mut self borrow —
+    /// cloning the table itself was a per-forward allocation.
+    inv_freq: std::sync::Arc<Vec<f32>>,
+    /// Reusable norm buffers for the decode hot path (roadmap §3 P0:
+    /// steady-state forward should not heap-allocate). Disjoint field
+    /// from `weights`/`kv_cache`, so split borrows keep working.
+    ws: ForwardScratch,
     /// Persistent worker pool (None = serial; see CMF_THREADS).
     pool: Option<std::sync::Arc<Pool>>,
     // ── Dynamic per-token skill routing (spec §9, claim 14/16) ──
@@ -273,7 +300,7 @@ impl Pipeline {
             Some(s) => SplitMix64::new(s),
             None => SplitMix64::from_entropy(),
         };
-        let inv_freq = attention::rope_inv_freq(head_dim, rope_base);
+        let inv_freq = std::sync::Arc::new(attention::rope_inv_freq(head_dim, rope_base));
         let pool = Pool::from_env();
         if let Some(p) = &pool {
             tracing::info!("worker pool: {} threads", p.n_workers());
@@ -300,6 +327,7 @@ impl Pipeline {
             speculative: std::env::var("CMF_MTP").map(|v| v != "0").unwrap_or(true),
             rng,
             inv_freq,
+            ws: ForwardScratch::new(hidden_size),
             pool,
             model: None,
             dyn_force_f32: false,
@@ -396,7 +424,7 @@ impl Pipeline {
     /// the frequency table is rebuilt over the rotary dims.
     pub fn set_rotary(&mut self, rotary_dim: usize, base: f32) {
         self.rotary_dim = rotary_dim.min(self.head_dim);
-        self.inv_freq = attention::rope_inv_freq(self.rotary_dim, base);
+        self.inv_freq = std::sync::Arc::new(attention::rope_inv_freq(self.rotary_dim, base));
     }
 
     fn attn_cfg(&self, position: usize) -> QwenAttnCfg<'_> {
@@ -553,13 +581,14 @@ impl Pipeline {
         // ── Decode ──
         let mut next_pos = input_ids.len();
         'decode: while generated < max_tokens {
-            let normed = inference::rms_norm(
+            inference::rms_norm_into(
                 &hidden,
                 &self.weights.final_norm,
                 self.rms_eps,
                 self.norm_style,
+                &mut self.ws.n1,
             );
-            let logits = self.lm_head_forward(&normed);
+            let logits = self.lm_head_forward(&self.ws.n1);
             let t_next = sampler::sample(&logits, &self.sampler_config, &all_ids, &mut self.rng);
             confidence.push(top1_prob_t(&logits, t_next, calib_temp));
             if trace_on {
@@ -597,13 +626,14 @@ impl Pipeline {
                     let emb2 = self.embed_single(draft);
                     let (h1, h2) = self.forward_pair(&emb1, &emb2, next_pos);
 
-                    let n1 = inference::rms_norm(
+                    inference::rms_norm_into(
                         &h1,
                         &self.weights.final_norm,
                         self.rms_eps,
                         self.norm_style,
+                        &mut self.ws.n1,
                     );
-                    let logits1 = self.lm_head_forward(&n1);
+                    let logits1 = self.lm_head_forward(&self.ws.n1);
                     let t_after =
                         sampler::sample(&logits1, &self.sampler_config, &all_ids, &mut self.rng);
                     confidence.push(top1_prob_t(&logits1, t_after, calib_temp));
@@ -696,21 +726,20 @@ impl Pipeline {
     /// advance its KV cache at position `p`, return the drafted token
     /// for position `p+2`.
     fn mtp_step(&mut self, m: &mut MtpModule, hidden: &[f32], next_token: u32, position: usize) -> u32 {
-        let h_n = inference::rms_norm(hidden, &m.hnorm, self.rms_eps, self.norm_style);
-        let e = self.embed_single(next_token);
-        let e_n = inference::rms_norm(&e, &m.enorm, self.rms_eps, self.norm_style);
         // fc concat order is [enorm(embed); hnorm(hidden)] — EMBEDDING
         // FIRST. Verified by the oracle (converter/mtp_oracle.py):
         // [emb;hid] → 45.8% acceptance, [hid;emb] → 0.00%.
-        let mut cat = Vec::with_capacity(2 * self.hidden_size);
-        cat.extend_from_slice(&e_n);
-        cat.extend_from_slice(&h_n);
+        let e = self.embed_single(next_token);
+        let mut cat = vec![0.0f32; 2 * self.hidden_size];
+        let (cat_e, cat_h) = cat.split_at_mut(self.hidden_size);
+        inference::rms_norm_into(&e, &m.enorm, self.rms_eps, self.norm_style, cat_e);
+        inference::rms_norm_into(hidden, &m.hnorm, self.rms_eps, self.norm_style, cat_h);
         let mut x = vec![0.0f32; self.hidden_size];
         m.eh_proj.matvec(&cat, &mut x, self.pool.as_deref());
 
         // One standard transformer block over the MTP's own cache.
         let lw = &m.layer;
-        let normed = inference::rms_norm(&x, &lw.input_norm, self.rms_eps, self.norm_style);
+        inference::rms_norm_into(&x, &lw.input_norm, self.rms_eps, self.norm_style, &mut self.ws.n1);
         let attn = match &lw.attn {
             AttnKind::Full {
                 wq,
@@ -729,7 +758,7 @@ impl Pipeline {
                 cfg.bias = bias
                     .as_ref()
                     .map(|(q, k, v)| (q.as_slice(), k.as_slice(), v.as_slice()));
-                attention::qwen_attention(&normed, wq, wk, wv, wo, &mut m.kv, &cfg)
+                attention::qwen_attention(&self.ws.n1, wq, wk, wv, wo, &mut m.kv, &cfg)
             }
             AttnKind::Linear(_) | AttnKind::LinearGdn(_) => {
                 unreachable!("MTP block is full attention")
@@ -738,14 +767,14 @@ impl Pipeline {
         for (i, &a) in attn.iter().enumerate() {
             x[i] += a;
         }
-        let post = inference::rms_norm(&x, &lw.post_norm, self.rms_eps, self.norm_style);
-        let ffn = ffn_forward(&lw.ffn, &post, self.pool.as_deref());
+        inference::rms_norm_into(&x, &lw.post_norm, self.rms_eps, self.norm_style, &mut self.ws.p1);
+        let ffn = ffn_forward(&lw.ffn, &self.ws.p1, self.pool.as_deref());
         for (i, &f) in ffn.iter().enumerate() {
             x[i] += f;
         }
 
-        let out = inference::rms_norm(&x, &m.final_norm, self.rms_eps, self.norm_style);
-        sampler::argmax(&self.lm_head_forward(&out))
+        inference::rms_norm_into(&x, &m.final_norm, self.rms_eps, self.norm_style, &mut self.ws.n1);
+        sampler::argmax(&self.lm_head_forward(&self.ws.n1))
     }
 
     /// Micro-benchmark: two single-position forwards vs one fused pair
@@ -797,21 +826,23 @@ impl Pipeline {
 
         for li in 0..self.num_layers {
             let lw = &self.weights.layers[li];
-            let n1 = inference::rms_norm(&h1, &lw.input_norm, self.rms_eps, self.norm_style);
-            let n2 = inference::rms_norm(&h2, &lw.input_norm, self.rms_eps, self.norm_style);
+            // Norms into pipeline scratch (4 allocs/layer on the MTP
+            // decode hot path before this).
+            inference::rms_norm_into(&h1, &lw.input_norm, self.rms_eps, self.norm_style, &mut self.ws.n1);
+            inference::rms_norm_into(&h2, &lw.input_norm, self.rms_eps, self.norm_style, &mut self.ws.n2);
 
             let (a1, a2) = match &lw.attn {
                 AttnKind::Linear(w) => {
                     let cfg = self.vmf_cfg.expect("linear layer without vmf_cfg");
                     let layer = &mut self.kv_cache.layers[li];
                     let (state, scratch) = (&mut layer.linear_state, &mut layer.linear_scratch);
-                    vmf_phase_pair(&n1, &n2, w, &cfg, state, scratch, self.pool.as_deref())
+                    vmf_phase_pair(&self.ws.n1, &self.ws.n2, w, &cfg, state, scratch, self.pool.as_deref())
                 }
                 AttnKind::LinearGdn(w) => {
                     let cfg = self.gdn_cfg.expect("gdn layer without gdn_cfg");
                     let layer = &mut self.kv_cache.layers[li];
                     let (state, scratch) = (&mut layer.linear_state, &mut layer.linear_scratch);
-                    gdn_pair(&n1, &n2, w, &cfg, state, scratch, self.pool.as_deref())
+                    gdn_pair(&self.ws.n1, &self.ws.n2, w, &cfg, state, scratch, self.pool.as_deref())
                 }
                 AttnKind::Full {
                     wq,
@@ -842,8 +873,8 @@ impl Pipeline {
                         pool: pool.as_deref(),
                     };
                     attention::qwen_attention_pair(
-                        &n1,
-                        &n2,
+                        &self.ws.n1,
+                        &self.ws.n2,
                         wq,
                         wk,
                         wv,
@@ -859,9 +890,10 @@ impl Pipeline {
             }
 
             let lw = &self.weights.layers[li];
-            let p1 = inference::rms_norm(&h1, &lw.post_norm, self.rms_eps, self.norm_style);
-            let p2 = inference::rms_norm(&h2, &lw.post_norm, self.rms_eps, self.norm_style);
-            let (f1, f2) = ffn_forward_pair(&lw.ffn, &p1, &p2, self.pool.as_deref());
+            inference::rms_norm_into(&h1, &lw.post_norm, self.rms_eps, self.norm_style, &mut self.ws.p1);
+            inference::rms_norm_into(&h2, &lw.post_norm, self.rms_eps, self.norm_style, &mut self.ws.p2);
+            let (f1, f2) =
+                ffn_forward_pair(&lw.ffn, &self.ws.p1, &self.ws.p2, self.pool.as_deref());
             for i in 0..self.hidden_size {
                 h1[i] += f1[i];
                 h2[i] += f2[i];
@@ -1380,13 +1412,15 @@ impl Pipeline {
             }
 
             let lw = &self.weights.layers[li];
-            let normed = inference::rms_norm(&h, &lw.input_norm, self.rms_eps, self.norm_style);
+            // Norm into the pipeline scratch — the returning rms_norm
+            // allocated twice per layer per token (roadmap §3 P0).
+            inference::rms_norm_into(&h, &lw.input_norm, self.rms_eps, self.norm_style, &mut self.ws.n1);
 
             let attn_out = match &lw.attn {
                 AttnKind::Linear(w) => {
                     let cfg = self.vmf_cfg.expect("linear layer without vmf_cfg");
                     vmf_phase_forward(
-                        &normed,
+                        &self.ws.n1,
                         w,
                         &cfg,
                         &mut self.kv_cache.layers[li].linear_state,
@@ -1396,7 +1430,7 @@ impl Pipeline {
                 AttnKind::LinearGdn(w) => {
                     let cfg = self.gdn_cfg.expect("gdn layer without gdn_cfg");
                     gdn_forward(
-                        &normed,
+                        &self.ws.n1,
                         w,
                         &cfg,
                         &mut self.kv_cache.layers[li].linear_state,
@@ -1434,7 +1468,7 @@ impl Pipeline {
                         pool: pool.as_deref(),
                     };
                     attention::qwen_attention_nystrom(
-                        &normed,
+                        &self.ws.n1,
                         wq,
                         wk,
                         wv,
@@ -1463,7 +1497,7 @@ impl Pipeline {
                         (true, (Some(q), Some(k), Some(v), Some(o))) => {
                             let active_heads = task_mask.unwrap().head_flags(li, self.num_heads);
                             attention::multi_head_attention(
-                                &normed,
+                                &self.ws.n1,
                                 q,
                                 k,
                                 v,
@@ -1504,7 +1538,7 @@ impl Pipeline {
                                 pool: pool.as_deref(),
                             };
                             attention::qwen_attention(
-                                &normed,
+                                &self.ws.n1,
                                 wq,
                                 wk,
                                 wv,
@@ -1521,7 +1555,8 @@ impl Pipeline {
             }
 
             let lw = &self.weights.layers[li];
-            let post_normed = inference::rms_norm(&h, &lw.post_norm, self.rms_eps, self.norm_style);
+            inference::rms_norm_into(&h, &lw.post_norm, self.rms_eps, self.norm_style, &mut self.ws.p1);
+            let post_normed = &self.ws.p1;
 
             let ffn_masked = task_mask
                 .map(|m| m.ffn_active_count(li) < self.intermediate_size)
@@ -1733,13 +1768,14 @@ impl Pipeline {
             let emb = self.embed_single(id);
             hidden = self.forward_layers(&emb, pos, task_mask);
         }
-        let normed = inference::rms_norm(
+        inference::rms_norm_into(
             &hidden,
             &self.weights.final_norm,
             self.rms_eps,
             self.norm_style,
+            &mut self.ws.n1,
         );
-        self.lm_head_forward(&normed)
+        self.lm_head_forward(&self.ws.n1)
     }
 }
 
@@ -1898,19 +1934,31 @@ fn moe_ffn_batch(m: &MoeFfn, xs: &[f32], b: usize, hidden: usize, pool: Option<&
     out
 }
 
+thread_local! {
+    /// gate/up activation scratch for the dense FFN paths (single uses
+    /// two slots, the fused pair all four) — these were fresh
+    /// intermediate-size Vecs on every layer of every token.
+    static FFN_SCRATCH: std::cell::RefCell<[Vec<f32>; 4]> =
+        const { std::cell::RefCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new()]) };
+}
+
 /// Dense SwiGLU FFN through QTensor matvecs (any storage).
 fn dense_ffn(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
     let inter = d.gate_proj.rows();
-    let mut g = vec![0.0f32; inter];
-    d.gate_proj.matvec(x, &mut g, pool);
-    let mut u = vec![0.0f32; inter];
-    d.up_proj.matvec(x, &mut u, pool);
-    for i in 0..inter {
-        g[i] = inference::silu(g[i]) * u[i];
-    }
-    let mut out = vec![0.0f32; d.down_proj.rows()];
-    d.down_proj.matvec(&g, &mut out, pool);
-    out
+    FFN_SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        let [g, u, ..] = &mut *s;
+        g.resize(inter, 0.0);
+        u.resize(inter, 0.0);
+        d.gate_proj.matvec(x, g, pool);
+        d.up_proj.matvec(x, u, pool);
+        for i in 0..inter {
+            g[i] = inference::silu(g[i]) * u[i];
+        }
+        let mut out = vec![0.0f32; d.down_proj.rows()];
+        d.down_proj.matvec(g, &mut out, pool);
+        out
+    })
 }
 
 /// Sparse dense-FFN directly on QUANTIZED weights (mask × mmap): reads
@@ -2096,6 +2144,7 @@ fn moe_ffn_gpu(
                 cols,
                 row_scale,
                 col_field,
+                ..
             } if !col_field.is_empty() => {
                 Some((model, *idx, *rows, *cols, row_scale, col_field))
             }
@@ -2165,20 +2214,24 @@ fn ffn_forward_pair(
         FfnKind::Moe(m) => return (moe_ffn(m, x1, pool), moe_ffn(m, x2, pool)),
     };
     let inter = d.gate_proj.rows();
-    let mut g1 = vec![0.0f32; inter];
-    let mut g2 = vec![0.0f32; inter];
-    d.gate_proj.matvec2(x1, x2, &mut g1, &mut g2, pool);
-    let mut u1 = vec![0.0f32; inter];
-    let mut u2 = vec![0.0f32; inter];
-    d.up_proj.matvec2(x1, x2, &mut u1, &mut u2, pool);
-    for i in 0..inter {
-        g1[i] = inference::silu(g1[i]) * u1[i];
-        g2[i] = inference::silu(g2[i]) * u2[i];
-    }
-    let mut o1 = vec![0.0f32; d.down_proj.rows()];
-    let mut o2 = vec![0.0f32; d.down_proj.rows()];
-    d.down_proj.matvec2(&g1, &g2, &mut o1, &mut o2, pool);
-    (o1, o2)
+    FFN_SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        let [g1, g2, u1, u2] = &mut *s;
+        g1.resize(inter, 0.0);
+        g2.resize(inter, 0.0);
+        u1.resize(inter, 0.0);
+        u2.resize(inter, 0.0);
+        d.gate_proj.matvec2(x1, x2, g1, g2, pool);
+        d.up_proj.matvec2(x1, x2, u1, u2, pool);
+        for i in 0..inter {
+            g1[i] = inference::silu(g1[i]) * u1[i];
+            g2[i] = inference::silu(g2[i]) * u2[i];
+        }
+        let mut o1 = vec![0.0f32; d.down_proj.rows()];
+        let mut o2 = vec![0.0f32; d.down_proj.rows()];
+        d.down_proj.matvec2(g1, g2, &mut o1, &mut o2, pool);
+        (o1, o2)
+    })
 }
 
 #[cfg(test)]
