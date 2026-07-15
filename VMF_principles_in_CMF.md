@@ -217,6 +217,32 @@ A "loud" expert gets more bits, a "quiet" one is pressed to the minimum floor (l
 
 ---
 
+## 13. From far away, an object is just a few numbers → constant-memory attention (Patent 19/738,763)
+
+### In physics (VMF)
+The field of a collapsed object does not, from outside, remember what it was made of. An arbitrarily complex history — the composition of the matter, the order in which it fell, every detail — is described for a distant observer by just a few quantities: mass, spin, charge. Two completely different objects that agree in those quantities produce the **same** field from far away, and telling them apart from outside is impossible in principle. This is the no-hair theorem. The detail does not vanish into nothing — it stops being distinguishable at a distance.
+
+Close in, everything is different: short of the horizon the field remains exact, there the detail is still distinguishable, and no short list of numbers replaces it.
+
+In the NVG framework the regular core (principle 2) removes the singularity inside, but changes nothing outside: the field is still exhausted by a finite number of quantities.
+
+### In the format (CMF)
+**Distant context is stored as a summary, not as tokens.** The `--o1` flag splits a layer's attention along exactly that boundary:
+
+- **anchors** — the first S=4 keys, exact forever: a boundary condition that never "melts" and never passes into the far field;
+- **the exact window** — the last W=128 tokens: this is "close in", where the detail is still distinguishable and is kept as-is;
+- **the far field** — everything older: compressed into m=32 landmarks. This is a short summary of the same kind (the landmarks themselves are not numbers but vectors of the model dimension), and how many of them there are **does not depend** on how many tokens went into it — a hundred or a hundred thousand.
+
+All three zones live under **one shared softmax denominator**: one field, not a sum of three different fields. A token enters the far field no earlier than it leaves the exact window — exactly once, with no gap and no double counting.
+
+Hence the main consequence: the attention state **stops growing with context length** — 124.1 MB at 543 tokens and at 4127 alike. The weights are byte-for-byte the same: conversion only records a hint in the header, retraining nothing.
+
+> **Principle:** From far away, an object is just a few numbers → distant context is just a few landmarks. A short summary instead of an unbounded history.
+
+**The boundary of transfer** (by the rule of principle 9): the loss of detail is paid for in quality, and the price is **measured, not declared** — perplexity rises by **1.13×** on Qwen3.5-4B and by **1.30×** on Qwen3-0.6B, measured through the real streaming kernel on the region least favorable to it. The more of the model is softmax attention, the more it costs: a hybrid has recurrent layers that carry the distant context themselves, while a pure-attention model has to rely on the summary alone. Checked with a single command: `cortiq ppl model.cmf --file wiki.txt --o1 all`.
+
+---
+
 ## Summary table
 
 | NVG/VMF principle | CMF element | Status |
@@ -233,6 +259,7 @@ A "loud" expert gets more bits, a "quiet" one is pressed to the minimum floor (l
 | Superposition of condensate states | Soft superposition of skills | ✅ Implemented (Patent 19/731,402, claim 14) |
 | Resonant vacuum excitations | Resonance routing (Patent 19/452,440) | ✅ Implemented |
 | Amplitude × frequency (B-field) | Variable-bit codec: bit allocation `b ∝ log₂(A·B)` | ✅ Implemented |
+| From far away, an object is just a few numbers | Constant-memory attention (`--o1`): distant context as a few landmarks | ✅ Implemented (Patent 19/738,763), cost measured: 1.13× / 1.30× |
 
 ---
 
@@ -254,7 +281,7 @@ This approach reflects the central scientific principle of NVG/VMF:
 
 ## Conclusion
 
-CMF is a rare case where an author's fundamental physical theory was not merely an inspiration but a **constructive foundation** for an engineering format. Twelve NVG/VMF principles were carried from cosmology and nuclear physics into the architecture of a binary container for language models:
+CMF is a rare case where an author's fundamental physical theory was not merely an inspiration but a **constructive foundation** for an engineering format. Thirteen NVG/VMF principles were carried from cosmology and nuclear physics into the architecture of a binary container for language models:
 
 - **Vacuum = the model backbone** (uniqueness)
 - **Core = a skill** (a local perturbation without a singularity)
@@ -268,5 +295,6 @@ CMF is a rare case where an author's fundamental physical theory was not merely 
 - **Superposition = soft blending** (of skills)
 - **Resonance = routing** (error minimization)
 - **A × B = the variable-bit codec** (amplitude × frequency)
+- **Far field = landmarks** (a short summary instead of the whole history)
 
-Each of these principles yielded a concrete, measurable engineering gain — from +37% quantization accuracy to zero memory cost for unused skills — confirming that the physics of the vacuum condensate turned out to be a fruitful foundation for designing data formats for artificial intelligence.
+Each of these principles yielded a concrete, measurable engineering gain — from +37% quantization accuracy and constant attention memory at any context length to zero memory cost for unused skills — confirming that the physics of the vacuum condensate turned out to be a fruitful foundation for designing data formats for artificial intelligence.
