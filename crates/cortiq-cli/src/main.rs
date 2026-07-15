@@ -265,7 +265,8 @@ enum Commands {
         #[arg(long)]
         hf_token: Option<String>,
     },
-    /// Interactive chat mode
+    /// Chat with a model (applies the file's chat template), or one-shot
+    /// with --prompt
     Run {
         /// Path to .cmf model file
         model: String,
@@ -285,6 +286,16 @@ enum Commands {
         /// Greedy decoding (temperature 0) — gates and base models
         #[arg(long)]
         greedy: bool,
+        /// Skip the model's chat template: feed the prompt to the model
+        /// verbatim (completion mode). Default is to apply the template
+        /// when the file carries one; base models without one always run raw.
+        #[arg(long)]
+        raw: bool,
+        /// Render the chat template with enable_thinking=false — reasoning
+        /// models (Qwen3/3.5) answer directly instead of emitting a <think>
+        /// block.
+        #[arg(long, conflicts_with = "raw")]
+        no_think: bool,
         /// Soft blend: "auto" (top-2 softmax(−E/T), T=0.4) or "id:w,id:w"
         #[arg(long)]
         blend: Option<String>,
@@ -563,17 +574,45 @@ enum Commands {
     },
 }
 
+/// Convert/import progress. `@PROGRESS <fraction>` is a marker for supervisors
+/// that capture stdout (they parse it for a progress bar); on a terminal those
+/// same hundreds of lines are noise, so paint one line in place instead.
+fn progress_reporter(what: &'static str) -> impl FnMut(f32) {
+    use std::io::IsTerminal;
+    let tty = std::io::stdout().is_terminal();
+    let mut done = false;
+    move |f: f32| {
+        use std::io::Write;
+        if !tty {
+            println!("@PROGRESS {f:.4}");
+            return;
+        }
+        print!("\r  {what}: {:>5.1}%", f * 100.0);
+        let _ = std::io::stdout().flush();
+        if f >= 1.0 && !done {
+            done = true;
+            println!();
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging
+    let cli = Cli::parse();
+
+    // `run` hands the screen to the model: the loader's INFO chatter is noise
+    // in front of an answer. Every other command keeps the informative
+    // default. RUST_LOG overrides either way.
+    let default_level = match &cli.command {
+        Commands::Run { .. } => "warn",
+        _ => "info",
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+                .unwrap_or_else(|_| default_level.into()),
         )
         .init();
-
-    let cli = Cli::parse();
 
     match cli.command {
         Commands::Serve {
@@ -618,16 +657,14 @@ async fn main() -> anyhow::Result<()> {
                     }))
                 }
             };
-            convert::run_convert(&model, &quant, &output, hf_token.as_deref(), defrag.as_deref(), o1_hint, |f| {
-                println!("@PROGRESS {f:.4}");
-            })?;
+            convert::run_convert(&model, &quant, &output, hf_token.as_deref(), defrag.as_deref(),
+                                 o1_hint, progress_reporter("converting"))?;
             println!("✓ wrote {output}");
             Ok(())
         }
         Commands::ImportGguf { gguf, output, quant, hf_token } => {
-            gguf::run_import_gguf(&gguf, &quant, &output, hf_token.as_deref(), |f| {
-                println!("@PROGRESS {f:.4}");
-            })?;
+            gguf::run_import_gguf(&gguf, &quant, &output, hf_token.as_deref(),
+                                  progress_reporter("importing"))?;
             println!("✓ wrote {output}");
             Ok(())
         }
@@ -638,6 +675,8 @@ async fn main() -> anyhow::Result<()> {
             max_tokens,
             skill,
             greedy,
+            raw,
+            no_think,
             blend,
             route_dynamic,
             confidence,
@@ -651,8 +690,8 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let o1 = O1Flags { spec: o1, m: o1_m, w: o1_window, sink: o1_sink, rect: None };
             cmd_run(&model, &task, prompt.as_deref(), max_tokens, skill.as_deref(), greedy,
-                    blend.as_deref(), route_dynamic, confidence, trace, trace_json,
-                    state.as_deref(), &o1)
+                    raw, no_think, blend.as_deref(), route_dynamic, confidence, trace,
+                    trace_json, state.as_deref(), &o1)
             .await
         }
         Commands::Freeze { model, prompt, out, skill } => {
@@ -1476,6 +1515,15 @@ fn render_trace(traces: &[cortiq_engine::TokenTrace], pipeline: &Pipeline, json:
     }
 }
 
+/// Whether `run` renders the chat template. The file decides: no template
+/// (base model) → completion, never the hardcoded ChatML fallback. `--raw`
+/// asks for completion outright, and `--state` carries a RAW frozen prefix
+/// (cmd_freeze encodes the context verbatim), so templating on top of it
+/// would strand a BOS mid-sequence and break bit-identical replay (B2).
+fn chat_mode(has_template: bool, raw: bool, resuming: bool) -> bool {
+    has_template && !raw && !resuming
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_run(
     model_path: &str,
@@ -1484,6 +1532,8 @@ async fn cmd_run(
     max_tokens: usize,
     skill: Option<&str>,
     greedy: bool,
+    raw: bool,
+    no_think: bool,
     blend: Option<&str>,
     route_dynamic: bool,
     confidence: bool,
@@ -1582,7 +1632,25 @@ async fn cmd_run(
         status.active_sparsity * 100.0
     );
 
-    let generate_and_print = |pipeline: &mut Pipeline, text: &str| -> anyhow::Result<()> {
+    // The FILE decides chat behaviour (spec §6.1): a container that carries a
+    // template is chatted with, one that doesn't is completed. Gate on the
+    // template itself — apply_chat_template_opts() falls back to hardcoded
+    // ChatML when there is none, which is NOT what a base model wants.
+    let has_tpl = pipeline.tokenizer.chat_template.is_some();
+    let use_template = chat_mode(has_tpl, raw, state.is_some());
+    // `None` leaves enable_thinking undefined → the template's own default,
+    // exactly as the server does (openai.rs: apply_chat_template_opts).
+    let thinking: Option<bool> = if no_think { Some(false) } else { None };
+    if state.is_some() && has_tpl && !raw {
+        eprintln!("note: --state resumes a raw token prefix — chat template not applied");
+    }
+    if !has_tpl && !raw {
+        tracing::info!("no chat template in this container — running completion mode");
+    }
+
+    let generate_and_print = |pipeline: &mut Pipeline,
+                              ids: &[u32]|
+     -> anyhow::Result<Option<String>> {
         use std::io::Write;
         // Stream silently when the confidence view will reprint coloured;
         // otherwise stream live as before.
@@ -1596,17 +1664,7 @@ async fn cmd_run(
             })
         };
         let started = std::time::Instant::now();
-        // B2: prepend the frozen prefix (empty when not resuming) so the
-        // continuation runs from the warm context. Token-level replay ==
-        // generate() on the concatenated ids.
-        let mut ids = resume_prefix.clone();
-        ids.extend(pipeline.tokenizer.encode(text));
-        let outcome = if resume_prefix.is_empty() {
-            pipeline.generate(text, max_tokens, mask.as_ref(), Some(cb))
-        } else {
-            pipeline.generate_from_ids(&ids, max_tokens, mask.as_ref(), Some(cb))
-        };
-        match outcome {
+        match pipeline.generate_from_ids(ids, max_tokens, mask.as_ref(), Some(cb)) {
             Ok(r) => {
                 let secs = started.elapsed().as_secs_f64();
                 // Confidence view: reprint token-by-token, coloured by the
@@ -1651,19 +1709,42 @@ async fn cmd_run(
                 if trace {
                     render_trace(&r.traces, pipeline, trace_json);
                 }
+                // `text` is the generated slice only (prompt excluded,
+                // specials stripped) — exactly the assistant turn to carry
+                // into the next render.
+                return Ok(Some(r.text));
             }
             Err(e) => println!("error: {e}"),
         }
-        Ok(())
+        Ok(None)
+    };
+
+    // B2: prepend the frozen prefix (empty when not resuming) so the
+    // continuation runs from the warm context. Token-level replay ==
+    // generate() on the concatenated ids.
+    let build_ids = |pipeline: &Pipeline, history: &[(String, String)], text: &str| -> Vec<u32> {
+        // An empty prompt stays empty: generate_from_ids answers it with
+        // "empty prompt: nothing to generate from" as it does today. The
+        // template would otherwise render its boilerplate and generate.
+        if use_template && !text.is_empty() {
+            pipeline.tokenizer.apply_chat_template_opts(history, thinking)
+        } else {
+            let mut ids = resume_prefix.clone();
+            ids.extend(pipeline.tokenizer.encode(text));
+            ids
+        }
     };
 
     if let Some(p) = prompt {
         println!("\nPrompt: {p}\n");
-        generate_and_print(&mut pipeline, p)?;
+        let history = vec![("user".to_string(), p.to_string())];
+        let ids = build_ids(&pipeline, &history, p);
+        generate_and_print(&mut pipeline, &ids)?;
     } else {
         println!("\nType your message (Ctrl+C to exit):\n");
         let stdin = std::io::stdin();
         let mut input = String::new();
+        let mut history: Vec<(String, String)> = Vec::new();
         loop {
             print!("> ");
             use std::io::Write;
@@ -1676,7 +1757,36 @@ async fn cmd_run(
             if text.is_empty() {
                 continue;
             }
-            generate_and_print(&mut pipeline, text)?;
+            history.push(("user".to_string(), text.to_string()));
+            let mut ids = build_ids(&pipeline, &history, text);
+            // The cache is cleared per turn and the prefill loop has no
+            // length check (eviction only fires while decoding), so a long
+            // chat would prefill past the RoPE range. Drop the oldest
+            // exchanges — never a system turn — leaving room to decode.
+            let budget = pipeline.kv_cache.max_seq_len / 2;
+            while use_template && ids.len() > budget && history.len() > 1 {
+                let Some(i) = history.iter().position(|(r, _)| r != "system") else {
+                    break;
+                };
+                history.remove(i);
+                // Drop the reply with its question, keeping user-first order.
+                if history.get(i).is_some_and(|(r, _)| r == "assistant") {
+                    history.remove(i);
+                }
+                eprintln!("note: context full — dropped the oldest exchange");
+                ids = build_ids(&pipeline, &history, text);
+            }
+            // The terminal already echoed the user's line after "> ".
+            if use_template {
+                println!();
+            }
+            match generate_and_print(&mut pipeline, &ids)? {
+                Some(reply) => history.push(("assistant".to_string(), reply)),
+                // A failed turn leaves no dangling user message.
+                None => {
+                    history.pop();
+                }
+            }
             println!();
         }
     }
@@ -2264,6 +2374,19 @@ mod tests {
         let b2 = SessionState::read(p).unwrap();
         std::fs::remove_file(p).ok();
         assert!(b2.seed.is_none() && b2.skill.is_none() && b2.tokens == vec![7]);
+    }
+
+    #[test]
+    fn chat_mode_lets_the_file_decide() {
+        // A container with a template is chatted with — the new default.
+        assert!(chat_mode(true, false, false));
+        // --raw opts out; a base model has nothing to opt out of.
+        assert!(!chat_mode(true, true, false));
+        assert!(!chat_mode(false, false, false));
+        assert!(!chat_mode(false, true, false));
+        // --state replays a raw prefix: raw whatever the file carries (B2).
+        assert!(!chat_mode(true, false, true));
+        assert!(!chat_mode(false, false, true));
     }
 
     #[test]

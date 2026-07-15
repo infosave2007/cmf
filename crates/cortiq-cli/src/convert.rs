@@ -8,8 +8,12 @@
 //! arch-agnostic — 1-D tensors are stored f16, 2-D weights are quantized — so
 //! it works by tensor presence without a hard-coded tensor set. Mixture-of-experts
 //! is supported (router + per-expert matrices), as is GatedDeltaNet linear
-//! attention in the Qwen3.5 hub layout (separate in_proj_qkv/z/a/b). Fused
-//! qwen3_next / AgentWorld checkpoints still use the Python path.
+//! attention in the Qwen3.5 hub layout (separate in_proj_qkv/z/a/b) and the
+//! fused qwen3_next / AgentWorld layout, whose group-interleaved `in_proj_qkvz`
+//! / `in_proj_ba` projections are split natively (`split_fused_gdn`).
+//!
+//! Not in scope: per-skill delta tensors and task masks — this writes backbones.
+//! Those come from the DTG-MA path in `converter/`.
 
 use crate::npy;
 use cortiq_core::format::{CmfHeader, CmfModel, TensorSpec, TokenizerBundle, CMF_VERSION};
