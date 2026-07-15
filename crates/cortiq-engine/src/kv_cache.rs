@@ -446,6 +446,160 @@ impl LayerKvCache {
         (acc, scores)
     }
 
+    /// Grouped GQA attention: all Q-heads of one KV group in a single
+    /// pass over the stored K rows and a single pass over the V rows
+    /// (per-head `attend` re-read the shared group storage
+    /// heads_per_kv times — roadmap §3 P1). Per-head score order,
+    /// softmax and V accumulation are IDENTICAL to `attend`, so each
+    /// head's output is bit-for-bit the same.
+    ///
+    /// `q_group`: `[n_heads_in_group × head_dim]` (global head order);
+    /// `out`: same shape; `imp_acc[0..stored]` accumulates the probs of
+    /// every head (Born importance), matching the caller's former loop.
+    pub fn attend_group(
+        &self,
+        q_group: &[f32],
+        kv_head: usize,
+        out: &mut [f32],
+        imp_acc: &mut [f32],
+    ) {
+        let hd = self.head_dim;
+        let nheads = q_group.len() / hd;
+        debug_assert_eq!(out.len(), nheads * hd);
+        let stored = if self.mode == KvMode::F32 {
+            self.k[kv_head].len() / hd
+        } else {
+            self.head_len(kv_head)
+        };
+        if stored == 0 {
+            out.fill(0.0);
+            return;
+        }
+        let scale = 1.0 / (hd as f32).sqrt();
+
+        thread_local! {
+            /// scores [nheads × stored] — reused across layers/tokens.
+            static GQA_SCORES: std::cell::RefCell<Vec<f32>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+            /// q ⊙ col_k per head (q8 K mode).
+            static GQA_QC: std::cell::RefCell<Vec<f32>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+
+        GQA_SCORES.with(|sc| {
+            let mut scores = sc.borrow_mut();
+            scores.resize(nheads * stored, 0.0);
+
+            // ── score pass: each stored K row is read ONCE for all heads.
+            if self.mode.quant_k() {
+                let (kq, ks) = (&self.kq[kv_head], &self.ks[kv_head]);
+                let kcol = &self.kcol[kv_head];
+                let ng = hd.div_ceil(KV_K_GROUP);
+                GQA_QC.with(|qc| {
+                    let mut qcb = qc.borrow_mut();
+                    qcb.resize(nheads * hd, 0.0);
+                    for h in 0..nheads {
+                        for d in 0..hd {
+                            let qv = q_group[h * hd + d];
+                            qcb[h * hd + d] = if kcol.is_empty() { qv } else { qv * kcol[d] };
+                        }
+                    }
+                    for p in 0..stored {
+                        let row = &kq[p * hd..(p + 1) * hd];
+                        // SAFETY: i8 and u8 share layout; dot_i8_f32 reads
+                        // the bytes back as i8.
+                        let row_u8 = unsafe {
+                            std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len())
+                        };
+                        for h in 0..nheads {
+                            let qch = &qcb[h * hd..(h + 1) * hd];
+                            let mut dot = 0.0f32;
+                            for g in 0..ng {
+                                let g0 = g * KV_K_GROUP;
+                                let g1 = (g0 + KV_K_GROUP).min(hd);
+                                dot += crate::qtensor::dot_i8_f32(&row_u8[g0..g1], &qch[g0..g1])
+                                    * ks[p * ng + g];
+                            }
+                            scores[h * stored + p] = dot * scale;
+                        }
+                    }
+                });
+            } else {
+                let k = &self.k[kv_head];
+                for p in 0..stored {
+                    let row = &k[p * hd..(p + 1) * hd];
+                    for h in 0..nheads {
+                        scores[h * stored + p] =
+                            crate::attention::dot_f32(&q_group[h * hd..(h + 1) * hd], row)
+                                * scale;
+                    }
+                }
+            }
+
+            // ── per-head softmax (identical to attend / attention_head).
+            for h in 0..nheads {
+                let s = &mut scores[h * stored..(h + 1) * stored];
+                let max_score = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for v in s.iter_mut() {
+                    *v = (*v - max_score).exp();
+                    sum += *v;
+                }
+                if sum > 0.0 {
+                    for v in s.iter_mut() {
+                        *v /= sum;
+                    }
+                }
+            }
+
+            // ── value pass: each stored V row is read ONCE for all heads.
+            out.fill(0.0);
+            if self.mode.quant_v() {
+                let (vq, vs) = (&self.vq[kv_head], &self.vs[kv_head]);
+                for p in 0..stored {
+                    let row = &vq[p * hd..(p + 1) * hd];
+                    for h in 0..nheads {
+                        let w = scores[h * stored + p] * vs[p];
+                        if w.abs() < 1e-12 {
+                            continue;
+                        }
+                        crate::qtensor::axpy_i8_f32(&mut out[h * hd..(h + 1) * hd], row, w);
+                    }
+                }
+                let vcol = &self.vcol[kv_head];
+                if !vcol.is_empty() {
+                    for h in 0..nheads {
+                        for d in 0..hd {
+                            out[h * hd + d] *= vcol[d];
+                        }
+                    }
+                }
+            } else {
+                let v = &self.v[kv_head];
+                for p in 0..stored {
+                    let row = &v[p * hd..(p + 1) * hd];
+                    for h in 0..nheads {
+                        let w = scores[h * stored + p];
+                        if w.abs() < 1e-12 {
+                            continue;
+                        }
+                        crate::attention::axpy_f32(&mut out[h * hd..(h + 1) * hd], row, w);
+                    }
+                }
+            }
+
+            // ── Born-importance accumulation (Σ probs over heads), same
+            // head order as the caller's former per-head loop.
+            let n = imp_acc.len().min(stored);
+            for h in 0..nheads {
+                let s = &scores[h * stored..(h + 1) * stored];
+                for (dst, &p) in imp_acc[..n].iter_mut().zip(s) {
+                    *dst += p;
+                }
+            }
+        });
+    }
+
     /// Roll back the last `n_drop` positions (speculative-decode reject).
     pub fn truncate_last(&mut self, n_drop: usize) {
         let d = n_drop.min(self.seq_len);
@@ -823,6 +977,49 @@ mod tests {
         assert!(o.iter().all(|x| x.is_finite()));
         // memory: q8 ≈ 1 byte/element + scale per row (vs 4 for f32)
         assert!(q8.memory_bytes() * 3 < f.memory_bytes());
+    }
+
+    /// Grouped GQA attend must be bit-identical to per-head attend in
+    /// every KV mode (it is the same math with rows streamed once).
+    #[test]
+    fn attend_group_equals_per_head_attend_bitexact() {
+        let (kv_heads, hd, hpk) = (2usize, 32usize, 3usize); // 6 Q-heads
+        for mode in [KvMode::F32, KvMode::Q8 { k: true, v: true }] {
+            let mut c = LayerKvCache::new(kv_heads, hd);
+            c.mode = mode;
+            for p in 0..70 {
+                let k: Vec<f32> = (0..kv_heads * hd)
+                    .map(|i| ((i * 31 + p * 17 + 3) % 97) as f32 / 97.0 - 0.5)
+                    .collect();
+                let v: Vec<f32> = (0..kv_heads * hd)
+                    .map(|i| ((i * 13 + p * 29 + 7) % 89) as f32 / 89.0 - 0.5)
+                    .collect();
+                c.append(&k, &v, &[true; 2]);
+            }
+            let q: Vec<f32> = (0..kv_heads * hpk * hd)
+                .map(|i| ((i * 11 + 5) % 83) as f32 / 83.0 - 0.5)
+                .collect();
+            for g in 0..kv_heads {
+                let span = g * hpk * hd..(g + 1) * hpk * hd;
+                let mut out = vec![0f32; hpk * hd];
+                let mut imp = vec![0f32; 70];
+                c.attend_group(&q[span.clone()], g, &mut out, &mut imp);
+                let mut imp_ref = vec![0f32; 70];
+                for h in 0..hpk {
+                    let qh = &q[span.start + h * hd..span.start + (h + 1) * hd];
+                    let (o, probs) = c.attend(qh, g);
+                    assert_eq!(
+                        &out[h * hd..(h + 1) * hd],
+                        &o[..],
+                        "mode {mode:?} g{g} h{h}: grouped attend must be bit-identical"
+                    );
+                    for (dst, &p) in imp_ref.iter_mut().zip(&probs) {
+                        *dst += p;
+                    }
+                }
+                assert_eq!(imp, imp_ref, "mode {mode:?} g{g}: Born mass must match");
+            }
+        }
     }
 
     /// Review regression: Born eviction in MIXED modes. q8v used to

@@ -423,11 +423,48 @@ pub struct QwenAttnCfg<'a> {
     pub pool: Option<&'a Pool>,
 }
 
+thread_local! {
+    /// Recycled projection/attention buffers: the dense attention path
+    /// consumed ~7 fresh Vecs per layer per token (roadmap §3 P0).
+    static PROJ_FREE: std::cell::RefCell<Vec<Vec<f32>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Take a zeroed buffer of length `n` from the freelist (or allocate).
+fn take_buf(n: usize) -> Vec<f32> {
+    let mut b = PROJ_FREE.with(|f| f.borrow_mut().pop()).unwrap_or_default();
+    b.clear();
+    b.resize(n, 0.0);
+    b
+}
+
+/// Return a buffer to the freelist (leaves an empty Vec behind).
+fn recycle_buf(b: &mut Vec<f32>) {
+    let b = std::mem::take(b);
+    if b.capacity() > 0 {
+        PROJ_FREE.with(|f| {
+            let mut f = f.borrow_mut();
+            if f.len() < 16 {
+                f.push(b);
+            }
+        });
+    }
+}
+
 struct Projected {
     q: Vec<f32>,
     gate: Vec<f32>,
     k: Vec<f32>,
     v: Vec<f32>,
+}
+
+impl Drop for Projected {
+    fn drop(&mut self) {
+        recycle_buf(&mut self.q);
+        recycle_buf(&mut self.gate);
+        recycle_buf(&mut self.k);
+        recycle_buf(&mut self.v);
+    }
 }
 
 /// Project + split gate + qk-norm + partial RoPE for one position.
@@ -440,11 +477,11 @@ fn project_position(
     position: usize,
 ) -> Projected {
     let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
-    let mut q_raw = vec![0.0f32; wq.rows()];
+    let mut q_raw = take_buf(wq.rows());
     wq.matvec(hidden, &mut q_raw, cfg.pool);
-    let mut k = vec![0.0f32; nkv * hd];
+    let mut k = take_buf(nkv * hd);
     wk.matvec(hidden, &mut k, cfg.pool);
-    let mut v = vec![0.0f32; nkv * hd];
+    let mut v = take_buf(nkv * hd);
     wv.matvec(hidden, &mut v, cfg.pool);
     if let Some((bq, bk, bv)) = cfg.bias {
         for (x, b) in q_raw.iter_mut().zip(bq) {
@@ -460,14 +497,15 @@ fn project_position(
 
     // Gate split: per-head [q(hd); gate(hd)] (vmfcore/HF convention).
     let (mut q, gate) = if cfg.output_gate {
-        let mut qn = vec![0.0f32; nh * hd];
-        let mut g = vec![0.0f32; nh * hd];
+        let mut qn = take_buf(nh * hd);
+        let mut g = take_buf(nh * hd);
         for h in 0..nh {
             let src = h * hd * 2;
             let dst = h * hd;
             qn[dst..dst + hd].copy_from_slice(&q_raw[src..src + hd]);
             g[dst..dst + hd].copy_from_slice(&q_raw[src + hd..src + 2 * hd]);
         }
+        recycle_buf(&mut q_raw);
         (qn, g)
     } else {
         (q_raw, Vec::new())
@@ -503,20 +541,18 @@ fn attend_all_heads(
     heads_per_kv: usize,
     hd: usize,
 ) -> (Vec<f32>, Vec<f32>) {
-    let mut attn_out = vec![0.0f32; nh * hd];
-    let mut imp = vec![0.0f32; cache.seq_len];
-    for h in 0..nh {
-        let g = h / heads_per_kv;
-        let stored = cache.head_len(g);
-        if stored == 0 {
+    let mut attn_out = take_buf(nh * hd);
+    let mut imp = take_buf(cache.seq_len);
+    // Grouped GQA kernel: the group's shared K/V storage is streamed
+    // once for all its Q-heads (per-head attend re-read it
+    // heads_per_kv times). Bit-identical per head — see attend_group.
+    let nkv = nh / heads_per_kv;
+    for g in 0..nkv {
+        if cache.head_len(g) == 0 {
             continue;
         }
-        let _ = stored;
-        let (out, probs) = cache.attend(&q[h * hd..(h + 1) * hd], g);
-        attn_out[h * hd..(h + 1) * hd].copy_from_slice(&out);
-        for (dst, &p) in imp.iter_mut().zip(&probs) {
-            *dst += p;
-        }
+        let span = g * heads_per_kv * hd..(g + 1) * heads_per_kv * hd;
+        cache.attend_group(&q[span.clone()], g, &mut attn_out[span], &mut imp);
     }
     (attn_out, imp)
 }
@@ -546,15 +582,19 @@ pub fn qwen_attention(
     // prompt pass also records this position's queries for the seal
     // (no-op on plain layers).
     cache.o1_push_q(&p.q);
-    cache.append(&p.k, &p.v, &vec![true; nkv]);
+    // Empty alive slice = every head alive (append's get().unwrap_or(true))
+    // — the vec![true; nkv] here was one allocation per layer per token.
+    cache.append(&p.k, &p.v, &[]);
 
-    let (mut ao, imp) = attend_all_heads(&p.q, cache, nh, heads_per_kv, hd);
+    let (mut ao, mut imp) = attend_all_heads(&p.q, cache, nh, heads_per_kv, hd);
     cache.accumulate_imp(&imp);
     if cfg.output_gate {
         apply_gate(&mut ao, &p.gate);
     }
     let mut out = vec![0.0f32; cfg.hidden_size];
     wo.matvec(&ao, &mut out, cfg.pool);
+    recycle_buf(&mut ao);
+    recycle_buf(&mut imp);
     out
 }
 
@@ -602,14 +642,14 @@ pub fn qwen_attention_pair(
     let heads_per_kv = nh / nkv;
 
     // Fused projections (one weight pass for both positions).
-    let mut q1r = vec![0.0f32; wq.rows()];
-    let mut q2r = vec![0.0f32; wq.rows()];
+    let mut q1r = take_buf(wq.rows());
+    let mut q2r = take_buf(wq.rows());
     wq.matvec2(h1, h2, &mut q1r, &mut q2r, cfg.pool);
-    let mut k1 = vec![0.0f32; nkv * hd];
-    let mut k2 = vec![0.0f32; nkv * hd];
+    let mut k1 = take_buf(nkv * hd);
+    let mut k2 = take_buf(nkv * hd);
     wk.matvec2(h1, h2, &mut k1, &mut k2, cfg.pool);
-    let mut v1 = vec![0.0f32; nkv * hd];
-    let mut v2 = vec![0.0f32; nkv * hd];
+    let mut v1 = take_buf(nkv * hd);
+    let mut v2 = take_buf(nkv * hd);
     wv.matvec2(h1, h2, &mut v1, &mut v2, cfg.pool);
     if let Some((bq, bk, bv)) = cfg.bias {
         for lane in [(&mut q1r, &mut k1, &mut v1), (&mut q2r, &mut k2, &mut v2)] {
@@ -625,17 +665,18 @@ pub fn qwen_attention_pair(
         }
     }
 
-    let finish = |q_raw: Vec<f32>, k: &mut [f32], pos: usize| -> (Vec<f32>, Vec<f32>) {
+    let finish = |mut q_raw: Vec<f32>, k: &mut [f32], pos: usize| -> (Vec<f32>, Vec<f32>) {
         // split + norms + rope, reusing the single-position logic shape
         let (mut q, mut gate) = if cfg.output_gate {
-            let mut qn = vec![0.0f32; nh * hd];
-            let mut g = vec![0.0f32; nh * hd];
+            let mut qn = take_buf(nh * hd);
+            let mut g = take_buf(nh * hd);
             for h in 0..nh {
                 let src = h * hd * 2;
                 let dst = h * hd;
                 qn[dst..dst + hd].copy_from_slice(&q_raw[src..src + hd]);
                 g[dst..dst + hd].copy_from_slice(&q_raw[src + hd..src + 2 * hd]);
             }
+            recycle_buf(&mut q_raw);
             (qn, g)
         } else {
             (q_raw, Vec::new())
@@ -661,20 +702,20 @@ pub fn qwen_attention_pair(
         (q, gate)
     };
 
-    let (qa, gate1) = finish(q1r, &mut k1, cfg.position);
-    let (qb, gate2) = finish(q2r, &mut k2, cfg.position + 1);
-    let alive = vec![true; nkv];
+    let (mut qa, mut gate1) = finish(q1r, &mut k1, cfg.position);
+    let (mut qb, mut gate2) = finish(q2r, &mut k2, cfg.position + 1);
 
     // O(1) prefill trace (see qwen_attention): lane order = position
     // order, so the collected buffer stays position-major.
     cache.o1_push_q(&qa);
     cache.o1_push_q(&qb);
-    cache.append(&k1, &v1, &alive);
-    let (mut a1, imp1) = attend_all_heads(&qa, cache, nh, heads_per_kv, hd);
+    // Empty alive slice = every head alive (see qwen_attention).
+    cache.append(&k1, &v1, &[]);
+    let (mut a1, mut imp1) = attend_all_heads(&qa, cache, nh, heads_per_kv, hd);
     cache.accumulate_imp(&imp1);
 
-    cache.append(&k2, &v2, &alive);
-    let (mut a2, imp2) = attend_all_heads(&qb, cache, nh, heads_per_kv, hd);
+    cache.append(&k2, &v2, &[]);
+    let (mut a2, mut imp2) = attend_all_heads(&qb, cache, nh, heads_per_kv, hd);
     cache.accumulate_imp(&imp2);
 
     if cfg.output_gate {
@@ -685,6 +726,12 @@ pub fn qwen_attention_pair(
     let mut o1 = vec![0.0f32; cfg.hidden_size];
     let mut o2 = vec![0.0f32; cfg.hidden_size];
     wo.matvec2(&a1, &a2, &mut o1, &mut o2, cfg.pool);
+    for b in [
+        &mut qa, &mut qb, &mut gate1, &mut gate2, &mut k1, &mut k2, &mut v1, &mut v2,
+        &mut a1, &mut a2, &mut imp1, &mut imp2,
+    ] {
+        recycle_buf(b);
+    }
     (o1, o2)
 }
 
