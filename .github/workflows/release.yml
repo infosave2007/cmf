@@ -6,6 +6,15 @@ name: Release binaries
 on:
   push:
     tags: ['v*']
+  # Manual re-run: attach binaries to an already-published release (e.g. after
+  # adding a target to the matrix). Dispatch from the branch that carries the
+  # matrix you want — GitHub takes the workflow file from the dispatched ref,
+  # not from the tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to attach the archives to'
+        required: true
 
 permissions:
   contents: write
@@ -66,6 +75,7 @@ jobs:
         if: runner.os != 'Windows'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
             cortiq-${{ matrix.target }}.tar.gz
             cortiq-${{ matrix.target }}.tar.gz.sha256
@@ -73,6 +83,7 @@ jobs:
         if: runner.os == 'Windows'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
             cortiq-${{ matrix.target }}.zip
             cortiq-${{ matrix.target }}.zip.sha256
