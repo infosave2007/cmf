@@ -497,7 +497,7 @@ thread_local! {
 }
 
 /// Take a zeroed buffer of length `n` from the freelist (or allocate).
-fn take_buf(n: usize) -> Vec<f32> {
+pub(crate) fn take_buf(n: usize) -> Vec<f32> {
     let mut b = PROJ_FREE.with(|f| f.borrow_mut().pop()).unwrap_or_default();
     b.clear();
     b.resize(n, 0.0);
@@ -505,7 +505,7 @@ fn take_buf(n: usize) -> Vec<f32> {
 }
 
 /// Return a buffer to the freelist (leaves an empty Vec behind).
-fn recycle_buf(b: &mut Vec<f32>) {
+pub(crate) fn recycle_buf(b: &mut Vec<f32>) {
     let b = std::mem::take(b);
     if b.capacity() > 0 {
         PROJ_FREE.with(|f| {
@@ -661,7 +661,7 @@ pub fn qwen_attention(
     if cfg.output_gate {
         apply_gate(&mut ao, &p.gate);
     }
-    let mut out = vec![0.0f32; cfg.hidden_size];
+    let mut out = take_buf(cfg.hidden_size);
     wo.matvec(&ao, &mut out, cfg.pool);
     recycle_buf(&mut ao);
     recycle_buf(&mut imp);
@@ -908,8 +908,8 @@ pub fn qwen_attention_pair(
         apply_gate(&mut a2, &gate2);
     }
 
-    let mut o1 = vec![0.0f32; cfg.hidden_size];
-    let mut o2 = vec![0.0f32; cfg.hidden_size];
+    let mut o1 = take_buf(cfg.hidden_size);
+    let mut o2 = take_buf(cfg.hidden_size);
     wo.matvec2(&a1, &a2, &mut o1, &mut o2, cfg.pool);
     for b in [
         &mut qa, &mut qb, &mut gate1, &mut gate2, &mut k1, &mut k2, &mut v1, &mut v2,

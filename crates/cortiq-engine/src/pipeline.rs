@@ -615,9 +615,10 @@ impl Pipeline {
                 self.norm_style,
                 &mut self.ws.n1,
             );
-            let logits = self.lm_head_forward(&self.ws.n1);
+            let mut logits = self.lm_head_forward(&self.ws.n1);
             let t_next = sampler::sample(&logits, &self.sampler_config, &all_ids, &mut self.rng);
             confidence.push(top1_prob_t(&logits, t_next, calib_temp));
+            attention::recycle_buf(&mut logits);
             if trace_on {
                 // active_skill = the overlay in force while this token was
                 // generated; recon/switched are filled after the post-emit
@@ -660,10 +661,11 @@ impl Pipeline {
                         self.norm_style,
                         &mut self.ws.n1,
                     );
-                    let logits1 = self.lm_head_forward(&self.ws.n1);
+                    let mut logits1 = self.lm_head_forward(&self.ws.n1);
                     let t_after =
                         sampler::sample(&logits1, &self.sampler_config, &all_ids, &mut self.rng);
                     confidence.push(top1_prob_t(&logits1, t_after, calib_temp));
+                    attention::recycle_buf(&mut logits1);
                     if trace_on {
                         // Speculative decode is mutually exclusive with
                         // dynamic routing (router is None here) — no skill.
@@ -801,7 +803,10 @@ impl Pipeline {
         }
 
         inference::rms_norm_into(&x, &m.final_norm, self.rms_eps, self.norm_style, &mut self.ws.n1);
-        sampler::argmax(&self.lm_head_forward(&self.ws.n1))
+        let mut lg = self.lm_head_forward(&self.ws.n1);
+        let draft = sampler::argmax(&lg);
+        attention::recycle_buf(&mut lg);
+        draft
     }
 
     /// Micro-benchmark: two single-position forwards vs one fused pair
@@ -915,6 +920,9 @@ impl Pipeline {
                 h1[i] += a1[i];
                 h2[i] += a2[i];
             }
+            let (mut a1, mut a2) = (a1, a2);
+            attention::recycle_buf(&mut a1);
+            attention::recycle_buf(&mut a2);
 
             let lw = &self.weights.layers[li];
             inference::rms_norm_into(&h1, &lw.post_norm, self.rms_eps, self.norm_style, &mut self.ws.p1);
@@ -925,6 +933,9 @@ impl Pipeline {
                 h1[i] += f1[i];
                 h2[i] += f2[i];
             }
+            let (mut f1, mut f2) = (f1, f2);
+            attention::recycle_buf(&mut f1);
+            attention::recycle_buf(&mut f2);
         }
         (h1, h2)
     }
@@ -1590,6 +1601,8 @@ impl Pipeline {
             for (i, &a) in attn_out.iter().enumerate() {
                 h[i] += a;
             }
+            let mut attn_out = attn_out;
+            attention::recycle_buf(&mut attn_out);
 
             let lw = &self.weights.layers[li];
             inference::rms_norm_into(&h, &lw.post_norm, self.rms_eps, self.norm_style, &mut self.ws.p1);
@@ -1663,6 +1676,8 @@ impl Pipeline {
             for (i, &f) in ffn_out.iter().enumerate() {
                 h[i] += f;
             }
+            let mut ffn_out = ffn_out;
+            attention::recycle_buf(&mut ffn_out);
 
             // Dynamic routing φ capture (on-policy, fireball-style): the
             // EMA of the post-residual hidden at the router's phi_layer,
@@ -1786,7 +1801,7 @@ impl Pipeline {
     /// every decode step — row-parallel on the worker pool.
     fn lm_head_forward(&self, hidden: &[f32]) -> Vec<f32> {
         let rows = self.weights.lm_head.rows();
-        let mut logits = vec![0.0f32; rows.min(self.vocab_size)];
+        let mut logits = attention::take_buf(rows.min(self.vocab_size));
         self.weights
             .lm_head
             .matvec(hidden, &mut logits, self.pool.as_deref());
@@ -1992,7 +2007,7 @@ fn dense_ffn(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
         for i in 0..inter {
             g[i] = inference::silu(g[i]) * u[i];
         }
-        let mut out = vec![0.0f32; d.down_proj.rows()];
+        let mut out = attention::take_buf(d.down_proj.rows());
         d.down_proj.matvec(g, &mut out, pool);
         out
     })
@@ -2134,22 +2149,24 @@ fn moe_ffn(m: &MoeFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
         }
     }
 
-    let mut out = vec![0.0f32; x.len()];
+    let mut out = attention::take_buf(x.len());
     for &e in &idx {
-        let eo = dense_ffn(&m.experts[e], x, pool);
+        let mut eo = dense_ffn(&m.experts[e], x, pool);
         let w = p[e] / wsum;
         for i in 0..out.len() {
             out[i] += w * eo[i];
         }
+        attention::recycle_buf(&mut eo);
     }
     if let Some((se, gate)) = &m.shared {
-        let so = dense_ffn(se, x, pool);
+        let mut so = dense_ffn(se, x, pool);
         let mut gl = vec![0.0f32; 1];
         gate.matvec(x, &mut gl, pool);
         let g = 1.0 / (1.0 + (-gl[0]).exp());
         for i in 0..out.len() {
             out[i] += g * so[i];
         }
+        attention::recycle_buf(&mut so);
     }
     out
 }
@@ -2272,8 +2289,8 @@ fn ffn_forward_pair(
             g1[i] = inference::silu(g1[i]) * u1[i];
             g2[i] = inference::silu(g2[i]) * u2[i];
         }
-        let mut o1 = vec![0.0f32; d.down_proj.rows()];
-        let mut o2 = vec![0.0f32; d.down_proj.rows()];
+        let mut o1 = attention::take_buf(d.down_proj.rows());
+        let mut o2 = attention::take_buf(d.down_proj.rows());
         d.down_proj.matvec2(g1, g2, &mut o1, &mut o2, pool);
         (o1, o2)
     })
