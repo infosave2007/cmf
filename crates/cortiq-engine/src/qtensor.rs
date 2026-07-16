@@ -549,8 +549,7 @@ impl QTensor {
         if uniform_q4 || uniform_vbit {
             let outs_addr: [SendMut; N] = std::array::from_fn(|i| SendMut(outs[i].as_mut_ptr()));
             // q4/vbit share one activation split — no per-tensor col field.
-            #[cfg(target_arch = "aarch64")]
-            if sdot_enabled() {
+            if a8w8_enabled() {
                 let act = split_act(x);
                 let act = &act;
                 if uniform_q4 {
@@ -560,7 +559,7 @@ impl QTensor {
                         let (gpr, cols, out) =
                             (ts[i].cols() / GROUP_SIZE, ts[i].cols(), outs_addr[i]);
                         move |s: usize, e: usize| {
-                            q4_range_sdot(packed, scales, gpr, cols, act, out, s, e)
+                            q4_range_a8w8(packed, scales, gpr, cols, act, out, s, e)
                         }
                     });
                     let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
@@ -572,7 +571,7 @@ impl QTensor {
                         let (bytes, rows, cols, out) =
                             (ts[i].quant_bytes(), ts[i].rows(), ts[i].cols(), outs_addr[i]);
                         move |s: usize, e: usize| {
-                            vbit_range_sdot(bytes, vbit_offsets, x, act, rows, cols, out, s, e)
+                            vbit_range_a8w8(bytes, vbit_offsets, x, act, rows, cols, out, s, e)
                         }
                     });
                     let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
@@ -733,8 +732,7 @@ impl QTensor {
             let p1: [SendMut; N] = std::array::from_fn(|i| SendMut(o1s[i].as_mut_ptr()));
             let p2: [SendMut; N] = std::array::from_fn(|i| SendMut(o2s[i].as_mut_ptr()));
             // q4/vbit share activation splits — no per-tensor col field.
-            #[cfg(target_arch = "aarch64")]
-            if sdot_enabled() {
+            if a8w8_enabled() {
                 let a1 = split_act(x1);
                 let a2 = split_act(x2);
                 let (a1, a2) = (&a1, &a2);
@@ -745,7 +743,7 @@ impl QTensor {
                         let (gpr, cols, o1, o2) =
                             (ts[i].cols() / GROUP_SIZE, ts[i].cols(), p1[i], p2[i]);
                         move |s: usize, e: usize| {
-                            q4_range2_sdot(packed, scales, gpr, cols, a1, a2, o1, o2, s, e)
+                            q4_range2_a8w8(packed, scales, gpr, cols, a1, a2, o1, o2, s, e)
                         }
                     });
                     let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
@@ -757,7 +755,7 @@ impl QTensor {
                         let (bytes, rows, cols, o1, o2) =
                             (ts[i].quant_bytes(), ts[i].rows(), ts[i].cols(), p1[i], p2[i]);
                         move |s: usize, e: usize| {
-                            vbit_range2_sdot(
+                            vbit_range2_a8w8(
                                 bytes, vbit_offsets, x1, x2, a1, a2, rows, cols, o1, o2, s, e,
                             )
                         }
@@ -986,12 +984,11 @@ fn vbitmatvec(
     // SDOT path: unpack the row to centered i8 once, then per-group
     // int8 dot against the quantized activations — same A8W8 contract
     // as q8 (bounded noise; CMF_SDOT=0 keeps the exact scalar path).
-    #[cfg(target_arch = "aarch64")]
-    if sdot_enabled() {
+    if a8w8_enabled() {
         let act = split_act(x);
         let out_addr = SendMut(out.as_mut_ptr());
         let run = move |start: usize, end: usize| {
-            vbit_range_sdot(bytes, offsets, x, &act, rows, cols, out_addr, start, end)
+            vbit_range_a8w8(bytes, offsets, x, &act, rows, cols, out_addr, start, end)
         };
         dispatch_rows(pool, rows, &run);
         return;
@@ -1004,12 +1001,11 @@ fn vbitmatvec(
     dispatch_rows(pool, rows, &run);
 }
 
-/// One vbit row range via SDOT — kernel body of `vbitmatvec`, extracted
-/// so multi-matrix jobs can drive it for several tensors in one
-/// dispatch (same A8W8 contract; b=8 rows go exact f32).
-#[cfg(target_arch = "aarch64")]
+/// One vbit row range via the A8W8 int8 path — kernel body of
+/// `vbitmatvec`, extracted so multi-matrix jobs can drive it for
+/// several tensors in one dispatch (b=8 rows go exact f32).
 #[allow(clippy::too_many_arguments)]
-fn vbit_range_sdot(
+fn vbit_range_a8w8(
     bytes: &[u8],
     offsets: &[usize],
     x: &[f32],
@@ -1088,12 +1084,10 @@ fn vbit_range_sdot(
                         bytes[sc_off + so],
                         bytes[sc_off + so + 1],
                     ]));
-                    let d = unsafe {
-                        dot_i8_sdot(
-                            &buf[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
-                            &act.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
-                        )
-                    } as f32
+                    let d = dot_i8_i8(
+                        &buf[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
+                        &act.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
+                    ) as f32
                         * act.sx;
                     dot += d * s;
                 }
@@ -1196,14 +1190,13 @@ fn vbitmatvec2(
     debug_assert_eq!(o1.len(), rows);
     debug_assert_eq!(o2.len(), rows);
 
-    #[cfg(target_arch = "aarch64")]
-    if sdot_enabled() {
+    if a8w8_enabled() {
         let a1 = split_act(x1);
         let a2 = split_act(x2);
         let p1 = SendMut(o1.as_mut_ptr());
         let p2 = SendMut(o2.as_mut_ptr());
         let run = move |start: usize, end: usize| {
-            vbit_range2_sdot(bytes, offsets, x1, x2, &a1, &a2, rows, cols, p1, p2, start, end)
+            vbit_range2_a8w8(bytes, offsets, x1, x2, &a1, &a2, rows, cols, p1, p2, start, end)
         };
         dispatch_rows(pool, rows, &run);
         return;
@@ -1217,12 +1210,11 @@ fn vbitmatvec2(
     dispatch_rows(pool, rows, &run);
 }
 
-/// Two-input vbit row range via SDOT — kernel body of `vbitmatvec2`,
-/// extracted for pair multi-matrix jobs (b=8 rows go exact f32 for
-/// both lanes, bits streamed once).
-#[cfg(target_arch = "aarch64")]
+/// Two-input vbit row range via the A8W8 int8 path — kernel body of
+/// `vbitmatvec2`, extracted for pair multi-matrix jobs (b=8 rows go
+/// exact f32 for both lanes, bits streamed once).
 #[allow(clippy::too_many_arguments)]
-fn vbit_range2_sdot(
+fn vbit_range2_a8w8(
     bytes: &[u8],
     offsets: &[usize],
     x1: &[f32],
@@ -1303,14 +1295,10 @@ fn vbit_range2_sdot(
                         bytes[sc_off + so + 1],
                     ]));
                     let wg = &buf[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
-                    let v1 = unsafe {
-                        dot_i8_sdot(wg, &a1.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE])
-                    } as f32
-                        * a1.sx;
-                    let v2 = unsafe {
-                        dot_i8_sdot(wg, &a2.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE])
-                    } as f32
-                        * a2.sx;
+                    let v1 =
+                        dot_i8_i8(wg, &a1.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE]) as f32 * a1.sx;
+                    let v2 =
+                        dot_i8_i8(wg, &a2.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE]) as f32 * a2.sx;
                     d1 += v1 * s;
                     d2 += v2 * s;
                 }
@@ -1425,11 +1413,10 @@ fn q4matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], 
     let gpr = cols / GROUP_SIZE;
     let out_addr = SendMut(out.as_mut_ptr());
 
-    #[cfg(target_arch = "aarch64")]
-    if sdot_enabled() {
+    if a8w8_enabled() {
         let act = split_act(x);
         let run = move |start: usize, end: usize| {
-            q4_range_sdot(packed, scales, gpr, cols, &act, out_addr, start, end)
+            q4_range_a8w8(packed, scales, gpr, cols, &act, out_addr, start, end)
         };
         dispatch_rows(pool, rows, &run);
         return;
@@ -1441,11 +1428,62 @@ fn q4matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], 
     dispatch_rows(pool, rows, &run);
 }
 
+/// One q4 row via the A8W8 int8 path — SDOT on ARM, AVX2 maddubs on
+/// x86 (scalar fallback is unreachable: callers gate on a8w8_enabled).
+#[inline]
+#[allow(unreachable_code)]
+fn dot_q4_row_i8(packed: &[u8], scales: &[u8], g0: usize, gpr: usize, xq: &[i8]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return dot_q4_row_sdot(packed, scales, g0, gpr, xq);
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return dot_q4_row_avx2(packed, scales, g0, gpr, xq);
+    }
+    let mut acc = 0f32;
+    for gi in 0..gpr {
+        let g = g0 + gi;
+        let s = f16_to_f32(u16::from_le_bytes([scales[g * 2], scales[g * 2 + 1]]));
+        let mut d = 0i32;
+        for (k, &b) in packed[g * 16..(g + 1) * 16].iter().enumerate() {
+            d += ((b & 0x0F) as i32 - 8) * xq[gi * GROUP_SIZE + k * 2] as i32
+                + (((b >> 4) & 0x0F) as i32 - 8) * xq[gi * GROUP_SIZE + k * 2 + 1] as i32;
+        }
+        acc += d as f32 * s;
+    }
+    acc
+}
+
+/// Two-activation q4 row via the A8W8 int8 path (see `dot_q4_row_i8`).
+#[inline]
+#[allow(unreachable_code)]
+fn dot_q4_row_i8_2(
+    packed: &[u8],
+    scales: &[u8],
+    g0: usize,
+    gpr: usize,
+    xq1: &[i8],
+    xq2: &[i8],
+) -> (f32, f32) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return dot_q4_row_sdot2(packed, scales, g0, gpr, xq1, xq2);
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return dot_q4_row_avx2_2(packed, scales, g0, gpr, xq1, xq2);
+    }
+    (
+        dot_q4_row_i8(packed, scales, g0, gpr, xq1),
+        dot_q4_row_i8(packed, scales, g0, gpr, xq2),
+    )
+}
+
 /// One q4 row range via SDOT (kernel body of `q4matvec`, extracted so
 /// multi-matrix jobs can drive it for several tensors in one dispatch).
-#[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
-fn q4_range_sdot(
+fn q4_range_a8w8(
     packed: &[u8],
     scales: &[u8],
     gpr: usize,
@@ -1456,7 +1494,7 @@ fn q4_range_sdot(
     end: usize,
 ) {
     for r in start..end {
-        let mut acc = unsafe { dot_q4_row_sdot(packed, scales, r * gpr, gpr, &act.xq) } * act.sx;
+        let mut acc = dot_q4_row_i8(packed, scales, r * gpr, gpr, &act.xq) * act.sx;
         // xq is zeroed at outlier slots — add the exact terms.
         for &(j, xv) in &act.outliers {
             let flat = r * cols + j;
@@ -1473,11 +1511,10 @@ fn q4_range_sdot(
     }
 }
 
-/// Two-input q4 row range via SDOT — kernel body of `q4matvec2`,
-/// extracted for pair multi-matrix jobs.
-#[cfg(target_arch = "aarch64")]
+/// Two-input q4 row range via the A8W8 int8 path — kernel body of
+/// `q4matvec2`, extracted for pair multi-matrix jobs.
 #[allow(clippy::too_many_arguments)]
-fn q4_range2_sdot(
+fn q4_range2_a8w8(
     packed: &[u8],
     scales: &[u8],
     gpr: usize,
@@ -1490,7 +1527,7 @@ fn q4_range2_sdot(
     end: usize,
 ) {
     for r in start..end {
-        let (s1, s2) = unsafe { dot_q4_row_sdot2(packed, scales, r * gpr, gpr, &a1.xq, &a2.xq) };
+        let (s1, s2) = dot_q4_row_i8_2(packed, scales, r * gpr, gpr, &a1.xq, &a2.xq);
         let mut acc1 = s1 * a1.sx;
         let mut acc2 = s2 * a2.sx;
         // xq is zeroed at outlier slots — add the exact terms.
@@ -1564,14 +1601,13 @@ fn q4matvec2(
     let (packed, scales) = q4_split(bytes, rows, cols);
     let gpr = cols / GROUP_SIZE;
 
-    #[cfg(target_arch = "aarch64")]
-    if sdot_enabled() {
+    if a8w8_enabled() {
         let a1 = split_act(x1);
         let a2 = split_act(x2);
         let p1 = SendMut(o1.as_mut_ptr());
         let p2 = SendMut(o2.as_mut_ptr());
         let run = move |start: usize, end: usize| {
-            q4_range2_sdot(packed, scales, gpr, cols, &a1, &a2, p1, p2, start, end)
+            q4_range2_a8w8(packed, scales, gpr, cols, &a1, &a2, p1, p2, start, end)
         };
         dispatch_rows(pool, rows, &run);
         return;
@@ -1652,8 +1688,7 @@ fn q4matmat(
     let gpr = cols / GROUP_SIZE;
     let gscale = |g: usize| f16_to_f32(u16::from_le_bytes([scales[g * 2], scales[g * 2 + 1]]));
 
-    #[cfg(target_arch = "aarch64")]
-    if sdot_enabled() {
+    if a8w8_enabled() {
         let acts: Vec<SplitAct> =
             (0..b).map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols])).collect();
         let acts = &acts;
@@ -1677,12 +1712,10 @@ fn q4matmat(
                     for (bi, act) in acts.iter().enumerate() {
                         let mut acc = 0f32;
                         for gi in 0..gpr {
-                            let d = unsafe {
-                                dot_i8_sdot(
-                                    &buf[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE],
-                                    &act.xq[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE],
-                                )
-                            };
+                            let d = dot_i8_i8(
+                                &buf[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE],
+                                &act.xq[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE],
+                            );
                             acc += d as f32 * gscale(r * gpr + gi);
                         }
                         acc *= act.sx;
@@ -1783,8 +1816,7 @@ fn vbitmatmat(
         }
     };
 
-    #[cfg(target_arch = "aarch64")]
-    if sdot_enabled() {
+    if a8w8_enabled() {
         let acts: Vec<SplitAct> =
             (0..b).map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols])).collect();
         let acts = &acts;
@@ -1839,12 +1871,10 @@ fn vbitmatmat(
                     for (bi, act) in acts.iter().enumerate() {
                         let mut dot = 0f32;
                         for g in 0..ng {
-                            let d = unsafe {
-                                dot_i8_sdot(
-                                    &buf[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
-                                    &act.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
-                                )
-                            } as f32
+                            let d = dot_i8_i8(
+                                &buf[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
+                                &act.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
+                            ) as f32
                                 * act.sx;
                             dot += d * gscale(r, g);
                         }
@@ -1930,6 +1960,41 @@ fn avx2_a8w8_enabled() -> bool {
     })
 }
 
+/// A8W8 quantized-activation path available on THIS machine? One
+/// switch across architectures: ARM dotprod (CMF_SDOT) or x86 AVX2
+/// (CMF_AVX2 + the same CMF_SDOT exact-contract override).
+#[inline]
+pub(crate) fn a8w8_enabled() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        sdot_enabled()
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        avx2_a8w8_enabled()
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+/// int8·int8 dot dispatch: SDOT on ARM, AVX2 maddubs on x86. Callers
+/// are gated by `a8w8_enabled()`.
+#[inline]
+#[allow(unreachable_code)]
+fn dot_i8_i8(w: &[u8], xq: &[i8]) -> i32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return dot_i8_sdot(w, xq);
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return dot_i8_i8_avx2(w, xq);
+    }
+    w.iter().zip(xq).map(|(&a, &b)| (a as i8) as i32 * b as i32).sum()
+}
+
 /// i8 row · f32 x via AVX2/FMA (x86 mirror of `dot_i8_f32_neon`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -2008,6 +2073,97 @@ fn row_dot_avx2(row: &[u8], act: &SplitAct) -> f32 {
         acc += (row[j] as i8) as f32 * xv;
     }
     acc
+}
+
+/// One q4 row via AVX2: nibbles → centered i8 (unpacklo/hi restores the
+/// writer's flat order, same as the NEON vzip pair), maddubs against
+/// the pre-quantized activation group, × the group's f16 scale. Pair
+/// saturation safe: |w|≤8, |x|≤127 → 2·8·127 ≪ 32767. Mirror of
+/// `dot_q4_row_sdot`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q4_row_avx2(packed: &[u8], scales: &[u8], g0: usize, gpr: usize, xq: &[i8]) -> f32 {
+    // SAFETY: callers uphold slice-length contracts (16 packed bytes and
+    // 2 scale bytes per group; xq.len() == gpr·GROUP_SIZE).
+    unsafe {
+        use core::arch::x86_64::*;
+        let lomask = _mm_set1_epi8(0x0F);
+        let eight = _mm256_set1_epi8(8);
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = 0f32;
+        for gi in 0..gpr {
+            let g = g0 + gi;
+            let s = f16_to_f32(u16::from_le_bytes([scales[g * 2], scales[g * 2 + 1]]));
+            let b = _mm_loadu_si128(packed.as_ptr().add(g * 16) as *const __m128i);
+            let lo = _mm_and_si128(b, lomask);
+            let hi = _mm_and_si128(_mm_srli_epi16::<4>(b), lomask);
+            let w = _mm256_sub_epi8(
+                _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi)),
+                eight,
+            );
+            let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+            let p16 = _mm256_maddubs_epi16(_mm256_abs_epi8(w), _mm256_sign_epi8(x, w));
+            let d = _mm256_madd_epi16(p16, ones);
+            let hi128 = _mm256_extracti128_si256::<1>(d);
+            let s128 = _mm_add_epi32(_mm256_castsi256_si128(d), hi128);
+            let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
+            let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
+            acc += _mm_cvtsi128_si32(s32) as f32 * s;
+        }
+        acc
+    }
+}
+
+/// Two-activation q4 row via AVX2: nibbles unpacked ONCE per group,
+/// both activations dotted against the same centered i8 register.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q4_row_avx2_2(
+    packed: &[u8],
+    scales: &[u8],
+    g0: usize,
+    gpr: usize,
+    xq1: &[i8],
+    xq2: &[i8],
+) -> (f32, f32) {
+    // SAFETY: callers uphold slice-length contracts (see dot_q4_row_avx2).
+    unsafe {
+        use core::arch::x86_64::*;
+        let lomask = _mm_set1_epi8(0x0F);
+        let eight = _mm256_set1_epi8(8);
+        let ones = _mm256_set1_epi16(1);
+        let (mut acc1, mut acc2) = (0f32, 0f32);
+        #[inline(always)]
+        unsafe fn hsum(d: core::arch::x86_64::__m256i) -> i32 {
+            unsafe {
+                use core::arch::x86_64::*;
+                let hi128 = _mm256_extracti128_si256::<1>(d);
+                let s128 = _mm_add_epi32(_mm256_castsi256_si128(d), hi128);
+                let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
+                let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
+                _mm_cvtsi128_si32(s32)
+            }
+        }
+        for gi in 0..gpr {
+            let g = g0 + gi;
+            let s = f16_to_f32(u16::from_le_bytes([scales[g * 2], scales[g * 2 + 1]]));
+            let b = _mm_loadu_si128(packed.as_ptr().add(g * 16) as *const __m128i);
+            let lo = _mm_and_si128(b, lomask);
+            let hi = _mm_and_si128(_mm_srli_epi16::<4>(b), lomask);
+            let w = _mm256_sub_epi8(
+                _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi)),
+                eight,
+            );
+            let aw = _mm256_abs_epi8(w);
+            let x1 = _mm256_loadu_si256(xq1.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+            let x2 = _mm256_loadu_si256(xq2.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+            let d1 = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, _mm256_sign_epi8(x1, w)), ones);
+            let d2 = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, _mm256_sign_epi8(x2, w)), ones);
+            acc1 += hsum(d1) as f32 * s;
+            acc2 += hsum(d2) as f32 * s;
+        }
+        (acc1, acc2)
+    }
 }
 
 /// One q8 row range via AVX2 (x86 mirror of `q8_range_sdot`).
@@ -2938,7 +3094,7 @@ mod tests {
         // SDOT path quantizes activations to i8 (A8W8): bounded noise,
         // same contract as q8 (exact path is pinned by CMF_SDOT=0 in
         // the golden-parity gate).
-        let tol = if sdot_enabled() { 6e-2 } else { 1e-4 };
+        let tol = if a8w8_enabled() { 6e-2 } else { 1e-4 };
         let scale = expect.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
         for r in 0..rows {
             assert!(
@@ -2983,7 +3139,7 @@ mod tests {
         // SDOT path quantizes activations to i8 (A8W8): bounded noise,
         // same contract as q8/vbit (exact path is pinned by CMF_SDOT=0
         // in the golden-parity gate).
-        let tol = if sdot_enabled() { 6e-2 } else { 1e-4 };
+        let tol = if a8w8_enabled() { 6e-2 } else { 1e-4 };
         let scale = expect.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
         for r in 0..rows {
             assert!(
