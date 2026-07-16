@@ -639,9 +639,14 @@ impl LayerKvCache {
         SCRATCH.with(|s| {
             let mut s = s.borrow_mut();
             let (qpanel, scores, aopanel) = &mut *s;
-            qpanel.resize(b * hd, 0.0);
-            scores.resize(b * n, 0.0);
-            aopanel.resize(b * hd, 0.0);
+            // The whole KV-group attends in one GEMM pair: the group's
+            // Q-heads stack head-major into one tall panel [hpk·b, hd]
+            // (row hl·b + bi), so each layer costs 2 sgemm calls per
+            // group instead of 2 per head — fat M keeps the AMX fed.
+            let m = heads_per_kv * b;
+            qpanel.resize(m * hd, 0.0);
+            scores.resize(m * n, 0.0);
+            aopanel.resize(m * hd, 0.0);
             for g in 0..self.num_kv_heads {
                 let kmat = &self.k[g];
                 let vmat = &self.v[g];
@@ -649,42 +654,42 @@ impl LayerKvCache {
                 for hl in 0..heads_per_kv {
                     let hh = g * heads_per_kv + hl;
                     for bi in 0..b {
-                        qpanel[bi * hd..(bi + 1) * hd]
+                        qpanel[(hl * b + bi) * hd..(hl * b + bi + 1) * hd]
                             .copy_from_slice(&q_all[bi * nh * hd + hh * hd..][..hd]);
                     }
-                    crate::qtensor::sgemm_rm(b, n, hd, scale, qpanel, hd, kmat, hd, true, scores, n);
-                    // Causal softmax, row-parallel (rows are disjoint).
-                    let sp = SendPtr(scores.as_mut_ptr());
-                    let run = |start: usize, end: usize| {
-                        for bi in start..end {
-                            let allowed = s0 + bi + 1;
-                            // SAFETY: workers cover disjoint bi ranges.
-                            let row =
-                                unsafe { std::slice::from_raw_parts_mut(sp.at(bi * n), n) };
-                            crate::attention::softmax_row(&mut row[..allowed]);
-                            row[allowed..].fill(0.0);
-                        }
-                    };
-                    match pool {
-                        Some(p) if b >= 64 => p.run_rows(b, &run),
-                        _ => run(0, b),
+                }
+                crate::qtensor::sgemm_rm(m, n, hd, scale, qpanel, hd, kmat, hd, true, scores, n);
+                // Causal softmax, row-parallel (rows are disjoint).
+                let sp = SendPtr(scores.as_mut_ptr());
+                let run = |start: usize, end: usize| {
+                    for r in start..end {
+                        let allowed = s0 + (r % b) + 1;
+                        // SAFETY: workers cover disjoint row ranges.
+                        let row = unsafe { std::slice::from_raw_parts_mut(sp.at(r * n), n) };
+                        crate::attention::softmax_row(&mut row[..allowed]);
+                        row[allowed..].fill(0.0);
                     }
-                    // Born importance: masked column sums (probs of the
-                    // zeroed tail contribute nothing, same as the CPU
-                    // per-position accumulate).
-                    let ni = self.imp.len().min(n);
-                    for bi in 0..b {
-                        let al = (s0 + bi + 1).min(ni);
-                        for (dst, &p) in
-                            self.imp[..al].iter_mut().zip(&scores[bi * n..bi * n + al])
-                        {
-                            *dst += p;
-                        }
+                };
+                match pool {
+                    Some(p) if m >= 64 => p.run_rows(m, &run),
+                    _ => run(0, m),
+                }
+                // Born importance: masked column sums (probs of the
+                // zeroed tail contribute nothing, same as the CPU
+                // per-position accumulate).
+                let ni = self.imp.len().min(n);
+                for r in 0..m {
+                    let al = (s0 + (r % b) + 1).min(ni);
+                    for (dst, &p) in self.imp[..al].iter_mut().zip(&scores[r * n..r * n + al]) {
+                        *dst += p;
                     }
-                    crate::qtensor::sgemm_rm(b, hd, n, 1.0, scores, n, vmat, hd, false, aopanel, hd);
+                }
+                crate::qtensor::sgemm_rm(m, hd, n, 1.0, scores, n, vmat, hd, false, aopanel, hd);
+                for hl in 0..heads_per_kv {
+                    let hh = g * heads_per_kv + hl;
                     for bi in 0..b {
                         out[bi * nh * hd + hh * hd..][..hd]
-                            .copy_from_slice(&aopanel[bi * hd..(bi + 1) * hd]);
+                            .copy_from_slice(&aopanel[(hl * b + bi) * hd..(hl * b + bi + 1) * hd]);
                     }
                 }
             }

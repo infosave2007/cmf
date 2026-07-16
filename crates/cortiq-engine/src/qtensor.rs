@@ -1300,6 +1300,10 @@ fn qmatmat_accel(
     out: &mut [f32],
     pool: Option<&Pool>,
 ) {
+    // NOTE: double-buffering the dequant against the sgemm (a scoped
+    // thread driving the pool on tile k+1 while the caller multiplies
+    // tile k) was tried and LOST ~6%: Accelerate's sgemm is itself
+    // multithreaded, and the dequant workers just steal its cores.
     const TR: usize = 2048;
     let b = pre.len();
     thread_local! {
@@ -1315,7 +1319,6 @@ fn qmatmat_accel(
             }
             let mut wtile = wt.borrow_mut();
             wtile.resize(TR * cols, 0.0);
-            let (rm, nt, tt) = (101i32, 111i32, 112i32); // RowMajor, NoTrans, Trans
             let mut r0 = 0usize;
             while r0 < rows {
                 let tr = TR.min(rows - r0);
@@ -1338,9 +1341,9 @@ fn qmatmat_accel(
                 // C[b, tr] (at column r0 of out[b, rows]) = X · Wtileᵀ
                 unsafe {
                     accel_blas::cblas_sgemm(
-                        rm,
-                        nt,
-                        tt,
+                        101, // RowMajor
+                        111, // NoTrans A
+                        112, // Trans B
                         b as i32,
                         tr as i32,
                         cols as i32,
