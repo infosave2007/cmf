@@ -57,10 +57,18 @@ impl TensorDtype {
     }
 
     /// Dtypes the current runtime can decode into f32.
+    /// (Vbit was missing here long after the fused kernels and
+    /// `dequant_vbit` shipped — roadmap §4.9.)
     pub fn is_supported(self) -> bool {
         matches!(
             self,
-            Self::F32 | Self::F16 | Self::Bf16 | Self::Q8Row | Self::Q4Block | Self::Q8_2f
+            Self::F32
+                | Self::F16
+                | Self::Bf16
+                | Self::Q8Row
+                | Self::Q4Block
+                | Self::Q8_2f
+                | Self::Vbit
         )
     }
 }

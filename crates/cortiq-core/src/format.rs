@@ -333,12 +333,26 @@ impl CmfModel {
                     )));
                 }
             }
+            // Payload-dependent lengths (vbit): exact check against the
+            // width header, bounds-before-slice (roadmap §4.9).
+            if t.dtype == TensorDtype::Vbit {
+                let payload = section(env.data.0 + t.off, t.nbytes);
+                crate::quant::validate_payload(t.dtype, &t.shape, payload)
+                    .map_err(|e| CmfError::Bounds(format!("tensor '{}': {e}", t.name)))?;
+            }
         }
-        let by_name = tensors
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.name.clone(), i))
-            .collect();
+        // Duplicate names would silently shadow each other in the
+        // HashMap (directory scan and by_name would disagree) — refuse
+        // the file instead (roadmap §4.9).
+        let mut by_name: HashMap<String, usize> = HashMap::with_capacity(tensors.len());
+        for (i, t) in tensors.iter().enumerate() {
+            if by_name.insert(t.name.clone(), i).is_some() {
+                return Err(CmfError::Parse(format!(
+                    "duplicate tensor name '{}' in directory",
+                    t.name
+                )));
+            }
+        }
 
         // Masks
         let masks = if env.masks.1 > 0 {
@@ -432,7 +446,16 @@ impl CmfModel {
             first.extra_shards.push((sh.backing, sh.envelope.data.0));
             for mut t in sh.tensors {
                 t.shard = shard_idx;
-                first.by_name.insert(t.name.clone(), first.tensors.len());
+                if first
+                    .by_name
+                    .insert(t.name.clone(), first.tensors.len())
+                    .is_some()
+                {
+                    return Err(CmfError::Parse(format!(
+                        "duplicate tensor name '{}' across shards",
+                        t.name
+                    )));
+                }
                 first.tensors.push(t);
             }
         }

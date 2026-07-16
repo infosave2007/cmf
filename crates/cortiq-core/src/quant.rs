@@ -211,6 +211,63 @@ pub fn expected_nbytes(dtype: TensorDtype, shape: &[usize]) -> Option<usize> {
     })
 }
 
+/// Validate a tensor payload against its directory entry (roadmap
+/// §4.9): every length is checked BEFORE any slice is taken, so a
+/// corrupted or truncated file fails loudly at `open()` instead of
+/// panicking in a kernel. For fixed-size dtypes this is the
+/// `expected_nbytes` equality; for vbit — whose payload length depends
+/// on the per-row bit widths stored in the payload itself — the exact
+/// length is computed from the (validated) width header.
+pub fn validate_payload(
+    dtype: TensorDtype,
+    shape: &[usize],
+    bytes: &[u8],
+) -> Result<(), String> {
+    if dtype == TensorDtype::Vbit {
+        if shape.len() != 2 {
+            return Err(format!("vbit tensor must be 2-D, got {shape:?}"));
+        }
+        let (rows, cols) = (shape[0], shape[1]);
+        if cols == 0 || cols % GROUP_SIZE != 0 {
+            return Err(format!(
+                "vbit cols {cols} not a positive multiple of {GROUP_SIZE}"
+            ));
+        }
+        // bits header: bounds BEFORE slicing.
+        if bytes.len() < rows {
+            return Err(format!(
+                "vbit payload {} bytes cannot hold the {rows}-byte width header",
+                bytes.len()
+            ));
+        }
+        let ng = cols / GROUP_SIZE;
+        let mut total = rows + rows * ng * 2;
+        for (r, &b) in bytes[..rows].iter().enumerate() {
+            if !matches!(b, 3..=6 | 8) {
+                return Err(format!("vbit row {r}: bit width {b} outside {{3,4,5,6,8}}"));
+            }
+            total += (cols * b as usize).div_ceil(8);
+        }
+        if total != bytes.len() {
+            return Err(format!(
+                "vbit payload length {} != computed {} (rows {rows}, cols {cols})",
+                bytes.len(),
+                total
+            ));
+        }
+        return Ok(());
+    }
+    if let Some(expect) = expected_nbytes(dtype, shape) {
+        if expect != bytes.len() {
+            return Err(format!(
+                "payload length {} != expected {expect} for {dtype:?}{shape:?}",
+                bytes.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Dequantize any supported tensor into f32.
 pub fn dequant_tensor(entry: &TensorEntry, bytes: &[u8], dst: &mut [f32]) -> Result<(), String> {
     let n: usize = entry.shape.iter().product();
@@ -282,7 +339,7 @@ pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
 
 #[cfg(test)]
 mod f16_tests {
-    use super::{f16_to_f32, f32_to_f16};
+    use super::{f16_to_f32, f32_to_f16, validate_payload, GROUP_SIZE};
 
     #[test]
     fn f16_subnormals_decode_correctly() {
@@ -304,4 +361,46 @@ mod f16_tests {
             assert!((back - v).abs() <= tol, "roundtrip {v} -> {back}");
         }
     }
+    /// §4.9: vbit payload validation — exact length from the width
+    /// header, bounds before any slice, width whitelist.
+    #[test]
+    fn validate_payload_vbit_contract() {
+        use crate::types::TensorDtype as D;
+        let (rows, cols) = (3usize, 64usize);
+        let ng = cols / GROUP_SIZE;
+        let bits = [4u8, 3, 8];
+        let mut good = bits.to_vec();
+        good.extend(std::iter::repeat(0u8).take(rows * ng * 2)); // scales
+        for &b in &bits {
+            good.extend(std::iter::repeat(0u8).take((cols * b as usize).div_ceil(8)));
+        }
+        assert!(validate_payload(D::Vbit, &[rows, cols], &good).is_ok());
+
+        // Truncated: shorter than the width header itself.
+        assert!(validate_payload(D::Vbit, &[rows, cols], &good[..2]).is_err());
+        // One byte short / one byte long.
+        assert!(validate_payload(D::Vbit, &[rows, cols], &good[..good.len() - 1]).is_err());
+        let mut long = good.clone();
+        long.push(0);
+        assert!(validate_payload(D::Vbit, &[rows, cols], &long).is_err());
+        // Forbidden width (7).
+        let mut bad = good.clone();
+        bad[0] = 7;
+        assert!(validate_payload(D::Vbit, &[rows, cols], &bad).is_err());
+        // Non-2D / non-multiple-of-group cols.
+        assert!(validate_payload(D::Vbit, &[rows * cols], &good).is_err());
+        assert!(validate_payload(D::Vbit, &[rows, 33], &good).is_err());
+
+        // Fixed-size dtype goes through expected_nbytes.
+        let q8 = vec![0u8; 2 * 8 + 2 * 2];
+        assert!(validate_payload(D::Q8Row, &[2, 8], &q8).is_ok());
+        assert!(validate_payload(D::Q8Row, &[2, 8], &q8[..q8.len() - 1]).is_err());
+    }
+
+    /// §4.9: vbit is a first-class supported dtype.
+    #[test]
+    fn vbit_is_supported() {
+        assert!(crate::types::TensorDtype::Vbit.is_supported());
+    }
+
 }
