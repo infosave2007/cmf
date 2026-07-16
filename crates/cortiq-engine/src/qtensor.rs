@@ -123,6 +123,28 @@ impl QTensor {
                 col_field: Vec::new(),
                 vbit_offsets: vbit_row_offsets(bytes, rows, cols),
             }),
+            // vbit_ro (§4.2): the offset table comes straight from the
+            // file — no load-time prefix scan; kernels are shared with
+            // legacy vbit (they consume absolute offsets either way).
+            TensorDtype::VbitRo if cols % GROUP_SIZE == 0 => {
+                let (_, off_off, packed_off) =
+                    cortiq_core::quant::vbit_ro_sections(rows, cols);
+                let offsets: Vec<usize> = (0..=rows)
+                    .map(|r| {
+                        packed_off + cortiq_core::quant::vbit_ro_offset(bytes, off_off, r)
+                    })
+                    .collect();
+                Ok(Self::Mapped {
+                    model: model.clone(),
+                    idx,
+                    dtype: entry.dtype,
+                    rows,
+                    cols,
+                    row_scale: Vec::new(),
+                    col_field: Vec::new(),
+                    vbit_offsets: offsets,
+                })
+            }
             // q4_block: fused kernel reads nibbles straight from mmap —
             // a 14B q4 file no longer explodes into ×8 f32 RAM.
             TensorDtype::Q4Block if cols % GROUP_SIZE == 0 => Ok(Self::Mapped {
@@ -198,7 +220,7 @@ impl QTensor {
                     }
                     return;
                 }
-                if *dtype == TensorDtype::Vbit {
+                if matches!(dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
                     let bytes = self.quant_bytes();
                     let rows = self.rows();
                     let ng = cols / GROUP_SIZE;
@@ -338,7 +360,7 @@ impl QTensor {
                     q4matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
                     return;
                 }
-                if *dtype == TensorDtype::Vbit {
+                if matches!(dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
                     vbitmatvec(self.quant_bytes(), vbit_offsets, x, *rows, *cols, out, pool);
                     return;
                 }
@@ -423,7 +445,7 @@ impl QTensor {
                     q4matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
                     return;
                 }
-                if *dtype == TensorDtype::Vbit {
+                if matches!(dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
                     vbitmatvec2(self.quant_bytes(), vbit_offsets, x1, x2, *rows, *cols, o1, o2, pool);
                     return;
                 }
@@ -474,7 +496,7 @@ impl QTensor {
                     q4matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
                     return;
                 }
-                if *dtype == TensorDtype::Vbit {
+                if matches!(dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
                     vbitmatmat(self.quant_bytes(), vbit_offsets, xs_all, b, rows, cols, out, pool);
                     return;
                 }
@@ -532,7 +554,10 @@ impl QTensor {
             .all(|t| matches!(t, Self::Mapped { dtype: TensorDtype::Q4Block, .. }));
         let uniform_vbit = ts
             .iter()
-            .all(|t| matches!(t, Self::Mapped { dtype: TensorDtype::Vbit, .. }));
+            .all(|t| matches!(
+                t,
+                Self::Mapped { dtype: TensorDtype::Vbit | TensorDtype::VbitRo, .. }
+            ));
         let Some(pool) = pool else {
             for (t, o) in ts.iter().zip(outs.iter_mut()) {
                 t.matvec(x, o, None);
@@ -716,7 +741,10 @@ impl QTensor {
             .all(|t| matches!(t, Self::Mapped { dtype: TensorDtype::Q4Block, .. }));
         let uniform_vbit = ts
             .iter()
-            .all(|t| matches!(t, Self::Mapped { dtype: TensorDtype::Vbit, .. }));
+            .all(|t| matches!(
+                t,
+                Self::Mapped { dtype: TensorDtype::Vbit | TensorDtype::VbitRo, .. }
+            ));
         let fusable = pool.is_some()
             && total_rows >= 256
             && (uniform_q8 || uniform_f32 || uniform_q4 || uniform_vbit);

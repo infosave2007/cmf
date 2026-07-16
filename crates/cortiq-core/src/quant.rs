@@ -188,6 +188,66 @@ pub fn dequant_vbit(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) -> 
 }
 
 
+/// Byte layout of a `vbit_ro` payload (roadmap §4.2):
+/// `[u8 bits: rows][f16 scales: rows·cols/32][u32 row_offsets: rows+1]
+///  [bit-packed rows]` — offsets are relative to the packed area, so
+/// `offsets[r]..offsets[r+1]` is row r without any prefix scan.
+/// Returns (scales_off, offsets_off, packed_off).
+pub fn vbit_ro_sections(rows: usize, cols: usize) -> (usize, usize, usize) {
+    let ng = cols / GROUP_SIZE;
+    let scales_off = rows;
+    let offsets_off = scales_off + rows * ng * 2;
+    let packed_off = offsets_off + (rows + 1) * 4;
+    (scales_off, offsets_off, packed_off)
+}
+
+/// Read one u32 row offset from a `vbit_ro` offsets table.
+#[inline]
+pub fn vbit_ro_offset(bytes: &[u8], offsets_off: usize, r: usize) -> usize {
+    let o = offsets_off + r * 4;
+    u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]) as usize
+}
+
+/// Dequantize a full `vbit_ro` tensor — same math as `dequant_vbit`,
+/// rows addressed through the stored offset table.
+pub fn dequant_vbit_ro(
+    bytes: &[u8],
+    rows: usize,
+    cols: usize,
+    dst: &mut [f32],
+) -> Result<(), String> {
+    if cols % GROUP_SIZE != 0 {
+        return Err(format!("vbit_ro: cols {cols} not a multiple of {GROUP_SIZE}"));
+    }
+    let ng = cols / GROUP_SIZE;
+    let (sc_off, off_off, packed_off) = vbit_ro_sections(rows, cols);
+    let bits = &bytes[..rows];
+    for r in 0..rows {
+        let b = bits[r] as usize;
+        if !matches!(b, 3..=6 | 8) {
+            return Err(format!("vbit_ro row {r}: bit width {b} outside {{3,4,5,6,8}}"));
+        }
+        let l = ((1usize << (b - 1)) - 1) as f32;
+        let start = packed_off + vbit_ro_offset(bytes, off_off, r);
+        let end = packed_off + vbit_ro_offset(bytes, off_off, r + 1);
+        let data = &bytes[start..end];
+        let (mut acc, mut nbits, mut idx) = (0u64, 0usize, 0usize);
+        for i in 0..cols {
+            while nbits < b {
+                acc = (acc << 8) | data[idx] as u64;
+                idx += 1;
+                nbits += 8;
+            }
+            let u = ((acc >> (nbits - b)) & ((1u64 << b) - 1)) as f32;
+            nbits -= b;
+            let so = (r * ng + i / GROUP_SIZE) * 2;
+            let sc = f16_to_f32(u16::from_le_bytes([bytes[sc_off + so], bytes[sc_off + so + 1]]));
+            dst[r * cols + i] = (u - l) * sc;
+        }
+    }
+    Ok(())
+}
+
 /// Expected byte length of a tensor given dtype and element count.
 pub fn expected_nbytes(dtype: TensorDtype, shape: &[usize]) -> Option<usize> {
     let n: usize = shape.iter().product();
@@ -223,6 +283,52 @@ pub fn validate_payload(
     shape: &[usize],
     bytes: &[u8],
 ) -> Result<(), String> {
+    if dtype == TensorDtype::VbitRo {
+        if shape.len() != 2 {
+            return Err(format!("vbit_ro tensor must be 2-D, got {shape:?}"));
+        }
+        let (rows, cols) = (shape[0], shape[1]);
+        if cols == 0 || cols % GROUP_SIZE != 0 {
+            return Err(format!(
+                "vbit_ro cols {cols} not a positive multiple of {GROUP_SIZE}"
+            ));
+        }
+        let (_, off_off, packed_off) = vbit_ro_sections(rows, cols);
+        if bytes.len() < packed_off {
+            return Err(format!(
+                "vbit_ro payload {} bytes cannot hold headers ({packed_off})",
+                bytes.len()
+            ));
+        }
+        if vbit_ro_offset(bytes, off_off, 0) != 0 {
+            return Err("vbit_ro offsets[0] must be 0".to_string());
+        }
+        for r in 0..rows {
+            let b = bytes[r];
+            if !matches!(b, 3..=6 | 8) {
+                return Err(format!(
+                    "vbit_ro row {r}: bit width {b} outside {{3,4,5,6,8}}"
+                ));
+            }
+            let want = (cols * b as usize).div_ceil(8);
+            let got = vbit_ro_offset(bytes, off_off, r + 1)
+                .checked_sub(vbit_ro_offset(bytes, off_off, r))
+                .ok_or_else(|| format!("vbit_ro offsets not monotonic at row {r}"))?;
+            if want != got {
+                return Err(format!(
+                    "vbit_ro row {r}: offset span {got} != {want} for width {b}"
+                ));
+            }
+        }
+        let total = packed_off + vbit_ro_offset(bytes, off_off, rows);
+        if total != bytes.len() {
+            return Err(format!(
+                "vbit_ro payload length {} != computed {total}",
+                bytes.len()
+            ));
+        }
+        return Ok(());
+    }
     if dtype == TensorDtype::Vbit {
         if shape.len() != 2 {
             return Err(format!("vbit tensor must be 2-D, got {shape:?}"));
@@ -308,6 +414,12 @@ pub fn dequant_tensor(entry: &TensorEntry, bytes: &[u8], dst: &mut [f32]) -> Res
             }
             dequant_vbit(bytes, entry.shape[0], entry.shape[1], dst)?;
         }
+        TensorDtype::VbitRo => {
+            if entry.shape.len() != 2 {
+                return Err(format!("vbit_ro tensor '{}' must be 2-D", entry.name));
+            }
+            dequant_vbit_ro(bytes, entry.shape[0], entry.shape[1], dst)?;
+        }
         TensorDtype::Q8_2f => {
             if entry.shape.len() != 2 {
                 return Err(format!("q8_2f tensor '{}' must be 2-D", entry.name));
@@ -332,7 +444,7 @@ pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
         TensorDtype::F16 | TensorDtype::Bf16 => 2.0,
         TensorDtype::Q8Row | TensorDtype::Q8_2f => 1.0,
         TensorDtype::Q4Block | TensorDtype::Q4Col | TensorDtype::Mix84 => 0.5625,
-        TensorDtype::Vbit => 0.5,
+        TensorDtype::Vbit | TensorDtype::VbitRo => 0.5,
         TensorDtype::U8 => 1.0,
     }
 }

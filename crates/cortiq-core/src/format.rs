@@ -335,7 +335,7 @@ impl CmfModel {
             }
             // Payload-dependent lengths (vbit): exact check against the
             // width header, bounds-before-slice (roadmap §4.9).
-            if t.dtype == TensorDtype::Vbit {
+            if matches!(t.dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
                 let payload = section(env.data.0 + t.off, t.nbytes);
                 crate::quant::validate_payload(t.dtype, &t.shape, payload)
                     .map_err(|e| CmfError::Bounds(format!("tensor '{}': {e}", t.name)))?;

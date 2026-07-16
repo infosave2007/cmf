@@ -30,7 +30,8 @@ GROUP_SIZE = 32
 KNOWN_FEATURES = 0b111  # tensor dir | binary masks | 2f quant
 
 DTYPE_NAME = {0: "f32", 1: "f16", 2: "bf16", 3: "q8_row", 4: "q4_block",
-              5: "mix8_4", 6: "u8", 7: "q4_col", 8: "vbit", 9: "q8_2f"}
+              5: "mix8_4", 6: "u8", 7: "q4_col", 8: "vbit", 9: "q8_2f",
+              10: "vbit_ro"}
 
 _SHARD_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.cmf$")
 
@@ -112,6 +113,30 @@ def _dq_vbit(raw: bytes, shape) -> np.ndarray:
     return w
 
 
+def _dq_vbit_ro(raw: bytes, shape) -> np.ndarray:
+    """vbit_ro (§4.2): vbit plus a u32 row-offset table between the
+    scales and the packed rows; reconstruction is identical to vbit."""
+    rows, cols = shape
+    ng = cols // GROUP_SIZE
+    bits = np.frombuffer(raw, np.uint8, rows)
+    sc = np.frombuffer(raw, np.float16, rows * ng, rows).astype(np.float32) \
+        .reshape(rows, ng)
+    off_off = rows + rows * ng * 2
+    offsets = np.frombuffer(raw, np.uint32, rows + 1, off_off)
+    packed_off = off_off + (rows + 1) * 4
+    w = np.empty((rows, cols), np.float32)
+    for r in range(rows):
+        b = int(bits[r])
+        start = packed_off + int(offsets[r])
+        nbytes = int(offsets[r + 1]) - int(offsets[r])
+        rb = np.frombuffer(raw, np.uint8, nbytes, start)
+        u = np.unpackbits(rb)[:cols * b].reshape(cols, b)
+        vals = u.astype(np.uint32) @ (1 << np.arange(b - 1, -1, -1, dtype=np.uint32))
+        L = float(2 ** (b - 1) - 1)
+        w[r] = (vals.astype(np.float32) - L) * sc[r, np.arange(cols) // GROUP_SIZE]
+    return w
+
+
 def dequant(raw: bytes, dtype: str, shape) -> np.ndarray:
     if dtype == "f32":
         return np.frombuffer(raw, np.float32, int(np.prod(shape))).reshape(shape).copy()
@@ -130,6 +155,8 @@ def dequant(raw: bytes, dtype: str, shape) -> np.ndarray:
         return _dq_q4_block(raw, shape)
     if dtype == "vbit":
         return _dq_vbit(raw, shape)
+    if dtype == "vbit_ro":
+        return _dq_vbit_ro(raw, shape)
     raise ValueError(f"dtype {dtype}: dequant not implemented in the reader")
 
 

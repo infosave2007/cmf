@@ -18,6 +18,13 @@ pub enum TensorDtype {
     Q4Col = 7,
     Vbit = 8,
     Q8_2f = 9,
+    /// Vbit with an explicit row-offset table (roadmap §4.2): same bit
+    /// packing and grouped f16 scales as `Vbit`, plus
+    /// `row_offsets[rows+1]` (u32, relative to the packed area) between
+    /// the scales and the packed rows — O(1) row access straight from
+    /// the file, no load-time prefix scan. New id on purpose: the byte
+    /// semantics of `Vbit = 8` must never change.
+    VbitRo = 10,
 }
 
 impl TensorDtype {
@@ -33,6 +40,7 @@ impl TensorDtype {
             7 => Self::Q4Col,
             8 => Self::Vbit,
             9 => Self::Q8_2f,
+            10 => Self::VbitRo,
             _ => return None,
         })
     }
@@ -53,6 +61,7 @@ impl TensorDtype {
             Self::Q4Col => "q4_col",
             Self::Vbit => "vbit",
             Self::Q8_2f => "q8_2f",
+            Self::VbitRo => "vbit_ro",
         }
     }
 
@@ -69,6 +78,7 @@ impl TensorDtype {
                 | Self::Q4Block
                 | Self::Q8_2f
                 | Self::Vbit
+                | Self::VbitRo
         )
     }
 }

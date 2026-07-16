@@ -85,7 +85,9 @@ pub(crate) fn quantize_2d(quant: Quant, vals: &[f32], out_dim: usize, in_dim: us
         Quant::F16 => (TensorDtype::F16, encode_f16(vals)),
         // v-bit needs the input dim to be a multiple of the group size; other
         // shapes fall back to the two-field q8_2f (best equal-size alternative).
-        Quant::Vbit if in_dim % GROUP_SIZE == 0 => (TensorDtype::Vbit, encode_vbit(vals, out_dim, in_dim)),
+        Quant::Vbit if in_dim % GROUP_SIZE == 0 => {
+            (TensorDtype::VbitRo, encode_vbit_ro(vals, out_dim, in_dim))
+        }
         Quant::Vbit => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
     }
 }
@@ -286,6 +288,30 @@ fn encode_vbit(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
         bw.flush_row();
     }
     out.extend_from_slice(&bw.buf);
+    out
+}
+
+/// `vbit_ro` (§4.2): the same bits/scales/packed encoding as
+/// `encode_vbit`, plus `u32 row_offsets[rows+1]` (relative to the
+/// packed area) between the scales and the packed rows — readers get
+/// O(1) row access without a prefix scan. New dtype id; the byte
+/// semantics of legacy `vbit` are untouched.
+fn encode_vbit_ro(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
+    let legacy = encode_vbit(vals, out_dim, in_dim);
+    let ng = in_dim / GROUP_SIZE;
+    let sc_len = out_dim * ng * 2;
+    let (head, packed) = legacy.split_at(out_dim + sc_len);
+    let bits = &head[..out_dim];
+    let mut out = Vec::with_capacity(legacy.len() + (out_dim + 1) * 4);
+    out.extend_from_slice(head);
+    let mut off = 0u32;
+    for &b in bits {
+        out.extend_from_slice(&off.to_le_bytes());
+        off += ((in_dim * b as usize).div_ceil(8)) as u32;
+    }
+    out.extend_from_slice(&off.to_le_bytes());
+    debug_assert_eq!(off as usize, packed.len());
+    out.extend_from_slice(packed);
     out
 }
 
@@ -1225,6 +1251,28 @@ mod tests {
                 assert!(e <= amp * 0.2, "row {o} col {i}: err {e} vs amp {amp} (bits {})", bits[o]);
             }
         }
+    }
+
+    #[test]
+    fn vbit_ro_roundtrip_and_validation() {
+        use cortiq_core::quant::{dequant_vbit_ro, validate_payload};
+        use cortiq_core::TensorDtype;
+        let (rows, cols) = (5usize, 64usize);
+        let mut vals = vec![0f32; rows * cols];
+        for o in 0..rows {
+            for i in 0..cols {
+                vals[o * cols + i] = (o as f32 + 1.0) * 0.13 * (i as f32 * 0.27).sin();
+            }
+        }
+        let enc = encode_vbit_ro(&vals, rows, cols);
+        validate_payload(TensorDtype::VbitRo, &[rows, cols], &enc).unwrap();
+        let mut dec = vec![0f32; rows * cols];
+        dequant_vbit_ro(&enc, rows, cols, &mut dec).unwrap();
+        // Must be BYTE-identical in reconstruction to the legacy layout.
+        let legacy = encode_vbit(&vals, rows, cols);
+        let mut dec_legacy = vec![0f32; rows * cols];
+        dequant_vbit(&legacy, rows, cols, &mut dec_legacy).unwrap();
+        assert_eq!(dec, dec_legacy, "vbit_ro must reconstruct exactly like vbit");
     }
 
     #[test]
