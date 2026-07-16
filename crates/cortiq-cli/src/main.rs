@@ -642,6 +642,9 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| default_level.into()),
         )
+        // Logs go to stderr: stdout carries the payload (generated text,
+        // `bench --json`) and must stay machine-parseable.
+        .with_writer(std::io::stderr)
         .init();
 
     match cli.command {
