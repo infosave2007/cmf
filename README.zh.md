@@ -198,8 +198,8 @@ cargo add cortiq-core                    # or use the format from your own Rust 
 
 预编译二进制在[最新发布](https://github.com/infosave2007/cmf/releases/latest)页面
 ——Linux x86-64、macOS（Apple Silicon 和 Intel）、Windows（x86-64 和 ARM64）；每个
-压缩包都附带 `.sha256`。它们**只支持 CPU**；要用 GPU 后端，请用 `--features gpu`
-从源码构建。
+压缩包都附带 `.sha256`。自 0.3.1 起内置 wgpu GPU 后端——设置 `CMF_GPU=1`
+即可启用（见 [GPU](#gpu)）。
 
 ## 命令
 
@@ -325,6 +325,25 @@ docs/             format specification and comparison
 ```
 
 欢迎贡献——见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## GPU
+
+```sh
+CMF_GPU=1 cortiq run model.cmf
+```
+
+后端自动选择：wgpu 在 Linux/Windows 上用 Vulkan，Windows 无 Vulkan 时用 DX12，
+macOS 上用 Metal——无需任何配置（`WGPU_BACKEND=vulkan|dx12|metal|gl` 可覆盖）。
+权重按预算驻留 VRAM（`CMF_GPU_VRAM_MB`，独立显卡默认 8192）；各层按首次访问
+顺序驻留，因此预算的行为等价于 llama.cpp 的 `-ngl`，但无需参数：前 N 层在
+GPU，其余在 CPU。
+
+开启 GPU 不会让你变慢。每次 GPU 操作都要付出固定的 submit+poll 延迟，而这个
+延迟在不同驱动栈之间相差一个数量级——所以引擎启动时不靠猜，而是*实测*：对每类
+操作（FFN 链、大 matvec、prefill GEMM、QKV 批量），最初几次调用在 GPU 与 CPU
+路径之间交替计时，之后这台机器上就一直走更快的那条路。用
+`RUST_LOG=cortiq_engine=info` 运行可以看到判定结果；`CMF_GPU_PROBE=0`
+跳过探测、无条件信任 GPU。
 
 ## 许可
 

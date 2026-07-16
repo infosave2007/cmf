@@ -222,8 +222,8 @@ cargo add cortiq-core                    # or use the format from your own Rust 
 
 Prebuilt binaries are on the [latest release](https://github.com/infosave2007/cmf/releases/latest)
 — Linux x86-64, macOS (Apple Silicon and Intel), Windows (x86-64 and ARM64); every
-archive ships a `.sha256`. They are **CPU-only**; for the GPU backend, build from
-source with `--features gpu`.
+archive ships a `.sha256`. Since 0.3.1 they include the wgpu GPU backend —
+set `CMF_GPU=1` to use it (see [GPU](#gpu)).
 
 ## Commands
 
@@ -356,6 +356,28 @@ docs/             format specification and comparison
 ```
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## GPU
+
+```sh
+CMF_GPU=1 cortiq run model.cmf
+```
+
+The backend is picked automatically: wgpu chooses Vulkan on Linux/Windows,
+DX12 on Windows if Vulkan is absent, Metal on macOS — nothing to configure
+(`WGPU_BACKEND=vulkan|dx12|metal|gl` overrides). Weights stay in VRAM up to
+a budget (`CMF_GPU_VRAM_MB`, default 8192 on discrete cards); layers are made
+resident in first-touch order, so the budget behaves like llama.cpp's `-ngl`
+without a flag: first N layers on the GPU, the rest on the CPU.
+
+Enabling the GPU never makes you slower. Per-op offload pays a fixed
+submit+poll latency that differs by an order of magnitude between driver
+stacks, so at startup the engine *measures* instead of guessing: for each op
+class (FFN chain, large matvec, prefill GEMM, QKV batch) the first calls
+alternate between the GPU and the CPU path, both timed, and the faster arm is
+kept for the rest of the run — per machine, per model. Run with
+`RUST_LOG=cortiq_engine=info` to see the verdicts; `CMF_GPU_PROBE=0` skips
+the probe and trusts the GPU unconditionally.
 
 ## License
 

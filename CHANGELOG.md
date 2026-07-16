@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-07-16
+
+The GPU release. Field report that triggered it: a 35B model (70 GB bf16 →
+35 GB CMF) decoding at 1.9 tok/s on an RTX 4090 — the weights were streaming
+through DDR on every token because `CMF_GPU` offload was effectively
+unreachable for layer-class matrices and the release binaries shipped
+without the backend. Both are fixed; the design principle that emerged is
+**measure, don't trust**: enabling the GPU must never make you slower.
+
+### Added
+
+- **Runtime GPU-vs-CPU probe**: per op class (FFN chain, large matvec,
+  prefill GEMM, QKV batch) the first calls alternate between the GPU arm
+  and the pure-CPU arm, both timed; cold GPU calls (weight upload, cache
+  fill) are discarded, and after six clean samples per arm the faster arm
+  wins for the rest of the process. Measured on a discrete Radeon Pro 560X,
+  where per-op submit+poll costs ~3–4 ms: the old always-GPU path lost 4×
+  on decode and 8× on prefill against CPU AVX2 — the probe settles on CPU
+  and keeps full speed; on stacks with cheap submissions the same probe
+  keeps the GPU. `CMF_GPU_PROBE=0` restores unconditional offload.
+- **VRAM-budget weight residency** (`CMF_GPU_VRAM_MB`, default 8192 on
+  discrete cards, unlimited on unified memory): tensors become resident in
+  first-touch order — decode touches layers in order, so the budget behaves
+  like llama.cpp's `-ngl` without a flag. Over budget → the honest CPU path.
+- **Device-class thresholds**: discrete cards take FFN/QKV-class matrices
+  (≥4096 rows), unified memory only lm_head-class (≥65536) —
+  `CMF_GPU_MIN_ROWS` overrides. `WGPU_BACKEND=vulkan|dx12|metal|gl` pins
+  the wgpu backend.
+- **Fewer polls per token**: Q/K/V projections in one device submission
+  (`matvec_batch`, one pooled staging buffer for all readbacks), the dense
+  FFN chain gate→silu·up→down in one command buffer with device-resident
+  intermediates (the MoE block path, now also covering `q8_row`), pooled
+  per-op scratch buffers, and per-tensor scale/col buffers cached across
+  tokens. Field path for a dense model: 7 → 3 submissions per layer.
+- **Pipeline slot pool in `cortiq serve`** (`CMF_SERVE_SLOTS`): N pipelines
+  over one shared mmap check out per request — concurrent requests no
+  longer serialize on a mutex.
+- **`vbit_ro` (dtype 10)**: v-bit with an in-file row-offset table — readers
+  index any row in O(1) instead of scanning bit-lengths; the native
+  converter writes it by default, legacy `vbit` (dtype 8) stays readable
+  forever, the Python reference reader handles both.
+- **`q4_tiled` (dtype 11, `--quant q4t`)**: 18-byte interleaved q4 tiles
+  (`[f16 scale][16B nibbles]`) — scale and payload land in one cache line.
+  Kernel A/B: ARM ×1.66, x86 ×1.13; end-to-end on Qwen2.5-0.5B: prefill
+  +24–32%, decode at parity, bit-identical to `q4_block` (parity-tested).
+  The `q4` default stays split-layout until the x86 end-to-end pass.
+
+### Hardened
+
+- `validate_payload` now checks exact payload lengths for every dtype
+  (v-bit included: exact bit-length sum, offsets monotonic, bounds before
+  slice), and duplicate tensor names are rejected at open and shard merge.
+
+### Fixed
+
+- Release binaries now build with `--features gpu` on every platform — the
+  0.3.0 artifacts shipped CPU-only, so `CMF_GPU=1` did nothing for binary
+  users (the root of the field report above).
+- The v0.3.0 release was missing `cortiq-aarch64-apple-darwin.tar.gz.sha256`
+  (upload interrupted); re-uploaded.
+- CLI logs now go to stderr — `bench --json` and piped generation output
+  stay machine-parseable under `RUST_LOG`.
+
 ## [0.3.0] — 2026-07-16
 
 The performance release: ten waves of engine work guided by the internal
