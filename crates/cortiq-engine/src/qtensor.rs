@@ -964,6 +964,77 @@ fn q4_split(bytes: &[u8], rows: usize, cols: usize) -> (&[u8], &[u8]) {
     bytes.split_at(groups * 16)
 }
 
+/// SIMD unpack for the dominant vbit width B=4 (94% of rows on the
+/// log2-shape calibration): 16 packed bytes -> 32 centered i8 values.
+/// vbit packs MSB-first, so the HIGH nibble is the even element
+/// (opposite of q4_block's lo-first interleave). Centering is u-7.
+#[inline]
+fn vbit_fill4(data: &[u8], buf: &mut [u8]) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return vbit_fill4_neon(data, buf);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if avx2_enabled() {
+        return unsafe { vbit_fill4_avx2(data, buf) };
+    }
+    #[allow(unreachable_code)]
+    for (blk, chunk) in buf.chunks_exact_mut(8).enumerate() {
+        let u = unpack8::<4>(&data[blk * 4..]);
+        for k in 0..8 {
+            chunk[k] = (u[k] - 7) as i8 as u8;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn vbit_fill4_neon(data: &[u8], buf: &mut [u8]) {
+    // SAFETY: buf.len() is a multiple of GROUP_SIZE=32; data holds
+    // buf.len()/2 packed bytes (validated at load).
+    unsafe {
+        use core::arch::aarch64::*;
+        let n = buf.len();
+        let mask = vdupq_n_u8(0x0F);
+        let seven = vdupq_n_s8(7);
+        let mut g = 0usize;
+        while g * 32 + 32 <= n {
+            let b = vld1q_u8(data.as_ptr().add(g * 16));
+            let hi = vshrq_n_u8::<4>(b);
+            let lo = vandq_u8(b, mask);
+            let z0 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(hi, lo)), seven);
+            let z1 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(hi, lo)), seven);
+            vst1q_u8(buf.as_mut_ptr().add(g * 32), vreinterpretq_u8_s8(z0));
+            vst1q_u8(buf.as_mut_ptr().add(g * 32 + 16), vreinterpretq_u8_s8(z1));
+            g += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vbit_fill4_avx2(data: &[u8], buf: &mut [u8]) {
+    // SAFETY: see vbit_fill4_neon.
+    unsafe {
+        use core::arch::x86_64::*;
+        let n = buf.len();
+        let mask = _mm_set1_epi8(0x0F);
+        let seven = _mm256_set1_epi8(7);
+        let mut g = 0usize;
+        while g * 32 + 32 <= n {
+            let b = _mm_loadu_si128(data.as_ptr().add(g * 16) as *const __m128i);
+            let hi = _mm_and_si128(_mm_srli_epi16::<4>(b), mask);
+            let lo = _mm_and_si128(b, mask);
+            let z = _mm256_sub_epi8(
+                _mm256_set_m128i(_mm_unpackhi_epi8(hi, lo), _mm_unpacklo_epi8(hi, lo)),
+                seven,
+            );
+            _mm256_storeu_si256(buf.as_mut_ptr().add(g * 32) as *mut __m256i, z);
+            g += 1;
+        }
+    }
+}
+
 /// Unpack 8 MSB-first B-bit values from exactly B bytes (fixed shifts —
 /// no serial bit-buffer, auto-vectorizable). Every 32-value group starts
 /// byte-aligned (32·B/8 is integral for B∈3..8), so groups decompose
@@ -1091,7 +1162,7 @@ fn vbit_range_a8w8(
                 buf.resize(cols, 0);
                 match b {
                     3 => fill::<3>(data, l, &mut buf),
-                    4 => fill::<4>(data, l, &mut buf),
+                    4 => vbit_fill4(data, &mut buf),
                     5 => fill::<5>(data, l, &mut buf),
                     6 => fill::<6>(data, l, &mut buf),
                     _ => unreachable!(),
@@ -1301,7 +1372,7 @@ fn vbit_range2_a8w8(
                 buf.resize(cols, 0);
                 match b {
                     3 => fill::<3>(data, l, &mut buf),
-                    4 => fill::<4>(data, l, &mut buf),
+                    4 => vbit_fill4(data, &mut buf),
                     5 => fill::<5>(data, l, &mut buf),
                     6 => fill::<6>(data, l, &mut buf),
                     _ => unreachable!(),
@@ -1882,7 +1953,7 @@ fn vbitmatmat(
                     }
                     match bw {
                         3 => fill::<3>(data, l, &mut buf),
-                        4 => fill::<4>(data, l, &mut buf),
+                        4 => vbit_fill4(data, &mut buf),
                         5 => fill::<5>(data, l, &mut buf),
                         6 => fill::<6>(data, l, &mut buf),
                         _ => unreachable!("vbit bit-width {bw} (validated at load)"),
