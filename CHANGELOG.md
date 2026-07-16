@@ -62,6 +62,14 @@ without the backend. Both are fixed; the design principle that emerged is
 
 ### Fixed
 
+- **Correction of the 0.3.0 performance claim.** The published
+  "+70% pp512 / +60% tg128 over llama.cpp" table had unknowingly
+  benchmarked an x86-64 build of `llama.cpp` under Rosetta 2 emulation
+  (no SIMD). Against native arm64 `llama.cpp` on the same machine, CMF is
+  currently **behind**: −67% pp512 / −38% tg128 on CPU (and llama.cpp's
+  Metal GPU path is ~9× ahead on prefill). The README table is corrected
+  and the correction is kept visible; the file-size (−26%) and
+  quant-quality (+0.38% PPL) rows were unaffected.
 - Release binaries now build with `--features gpu` on every platform — the
   0.3.0 artifacts shipped CPU-only, so `CMF_GPU=1` did nothing for binary
   users (the root of the field report above).
@@ -79,6 +87,11 @@ Qwen2.5-0.5B, CPU-only, 8 threads, exact attention both): **pp512 +70%,
 tg128 +60%, file −26%**, with quantization quality matched (CMF q8 vs own
 f16: +0.38% PPL over 12×512 windows). One model on one machine — the full
 matrix is still open; reproduce with `cortiq bench --json`.
+
+> **Correction (0.3.1):** the +70%/+60% figures above are wrong — that run
+> had benchmarked an x86-64 `llama.cpp` under Rosetta 2 emulation. See the
+> 0.3.1 "Fixed" section; the engine-work speedups over CMF's own baseline
+> and the file-size/quality rows stand.
 
 ### Added
 
