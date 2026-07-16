@@ -478,11 +478,15 @@ fn project_position(
 ) -> Projected {
     let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
     let mut q_raw = take_buf(wq.rows());
-    wq.matvec(hidden, &mut q_raw, cfg.pool);
     let mut k = take_buf(nkv * hd);
-    wk.matvec(hidden, &mut k, cfg.pool);
     let mut v = take_buf(nkv * hd);
-    wv.matvec(hidden, &mut v, cfg.pool);
+    // Multi-matrix job: Q, K and V projections under one pool dispatch.
+    QTensor::matvec_many(
+        [wq, wk, wv],
+        hidden,
+        [q_raw.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice()],
+        cfg.pool,
+    );
     if let Some((bq, bk, bv)) = cfg.bias {
         for (x, b) in q_raw.iter_mut().zip(bq) {
             *x += b;

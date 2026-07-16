@@ -1950,8 +1950,8 @@ fn dense_ffn(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
         let [g, u, ..] = &mut *s;
         g.resize(inter, 0.0);
         u.resize(inter, 0.0);
-        d.gate_proj.matvec(x, g, pool);
-        d.up_proj.matvec(x, u, pool);
+        // Multi-matrix job: gate+up under one pool dispatch.
+        QTensor::matvec_many([&d.gate_proj, &d.up_proj], x, [g, u], pool);
         for i in 0..inter {
             g[i] = inference::silu(g[i]) * u[i];
         }

@@ -506,6 +506,109 @@ impl QTensor {
     }
 }
 
+impl QTensor {
+    /// Multi-matrix job (roadmap §3 P0): N tensors sharing one input
+    /// run under a SINGLE pool dispatch — QKV or gate+up cost one
+    /// barrier instead of N. Per-row math is the exact same kernel as
+    /// `matvec` (bit-identical outputs); only the dispatch is fused.
+    /// Falls back to N sequential matvecs when the set is not a uniform
+    /// q8-family/F32 group or there is no pool.
+    pub fn matvec_many<const N: usize>(
+        ts: [&QTensor; N],
+        x: &[f32],
+        mut outs: [&mut [f32]; N],
+        pool: Option<&Pool>,
+    ) {
+        let total_rows: usize = ts.iter().map(|t| t.rows()).sum();
+        let uniform_q8 = ts.iter().all(|t| {
+            matches!(
+                t,
+                Self::Mapped { dtype: TensorDtype::Q8Row | TensorDtype::Q8_2f, .. }
+            )
+        });
+        let uniform_f32 = ts.iter().all(|t| matches!(t, Self::F32 { .. }));
+        let Some(pool) = pool else {
+            for (t, o) in ts.iter().zip(outs.iter_mut()) {
+                t.matvec(x, o, None);
+            }
+            return;
+        };
+        if total_rows < 256 || !(uniform_q8 || uniform_f32) {
+            for (t, o) in ts.iter().zip(outs.iter_mut()) {
+                t.matvec(x, o, Some(pool));
+            }
+            return;
+        }
+
+        if uniform_f32 {
+            let outs_addr: [SendMut; N] = std::array::from_fn(|i| SendMut(outs[i].as_mut_ptr()));
+            let closures: [_; N] = std::array::from_fn(|i| {
+                let Self::F32 { data, cols, .. } = ts[i] else { unreachable!() };
+                let out = outs_addr[i];
+                move |start: usize, end: usize| {
+                    for o in start..end {
+                        let row = &data[o * cols..(o + 1) * cols];
+                        let mut sum = 0.0f32;
+                        for j in 0..*cols {
+                            sum += row[j] * x[j];
+                        }
+                        // SAFETY: disjoint (tensor, row) cells per worker.
+                        unsafe { *out.at(o) = sum };
+                    }
+                }
+            });
+            let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
+                std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
+            pool.run_many(&parts);
+            return;
+        }
+
+        // Uniform q8-family: per-tensor prescale (q8_2f col fields
+        // differ per tensor) + the shared range kernels.
+        struct Ctx<'a> {
+            bytes: &'a [u8],
+            row_scale: &'a [f32],
+            cols: usize,
+            xs: std::borrow::Cow<'a, [f32]>,
+        }
+        let ctxs: [Ctx<'_>; N] = std::array::from_fn(|i| {
+            let Self::Mapped { dtype, cols, row_scale, col_field, .. } = ts[i] else {
+                unreachable!()
+            };
+            Ctx {
+                bytes: ts[i].quant_bytes(),
+                row_scale,
+                cols: *cols,
+                xs: prescale(x, col_field, *dtype),
+            }
+        });
+        let outs_addr: [SendMut; N] = std::array::from_fn(|i| SendMut(outs[i].as_mut_ptr()));
+        #[cfg(target_arch = "aarch64")]
+        if sdot_enabled() {
+            let acts: [SplitAct; N] = std::array::from_fn(|i| split_act(&ctxs[i].xs));
+            let closures: [_; N] = std::array::from_fn(|i| {
+                let (c, act, out) = (&ctxs[i], &acts[i], outs_addr[i]);
+                move |start: usize, end: usize| {
+                    q8_range_sdot(c.bytes, c.row_scale, act, c.cols, out, start, end)
+                }
+            });
+            let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
+                std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
+            pool.run_many(&parts);
+            return;
+        }
+        let closures: [_; N] = std::array::from_fn(|i| {
+            let (c, out) = (&ctxs[i], outs_addr[i]);
+            move |start: usize, end: usize| {
+                q8_range_f32(c.bytes, c.row_scale, &c.xs, c.cols, out, start, end)
+            }
+        });
+        let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
+            std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
+        pool.run_many(&parts);
+    }
+}
+
 /// Batched q8 kernel: same math as qmatvec, the row makes a single
 /// pass from memory for the whole batch.
 fn qmatmat(
@@ -1628,6 +1731,64 @@ unsafe fn dot_i8_sdot_4rows(w0: &[u8], w1: &[u8], w2: &[u8], w3: &[u8], xq: &[i8
 }
 }
 
+/// One q8 row range via SDOT (4-row blocks + tail) — the body of
+/// `qmatvec`'s hot loop, extracted so multi-matrix jobs can drive the
+/// SAME kernel for several tensors under one pool dispatch.
+#[cfg(target_arch = "aarch64")]
+fn q8_range_sdot(
+    q: &[u8],
+    row_scale: &[f32],
+    act: &SplitAct,
+    cols: usize,
+    out_addr: SendMut,
+    start: usize,
+    end: usize,
+) {
+    let mut o = start;
+    while o + 4 <= end {
+        let r = unsafe {
+            dot_i8_sdot_4rows(
+                &q[o * cols..(o + 1) * cols],
+                &q[(o + 1) * cols..(o + 2) * cols],
+                &q[(o + 2) * cols..(o + 3) * cols],
+                &q[(o + 3) * cols..(o + 4) * cols],
+                &act.xq,
+            )
+        };
+        for k in 0..4 {
+            let mut acc = r[k] as f32 * act.sx;
+            for &(j, xv) in &act.outliers {
+                acc += (q[(o + k) * cols + j] as i8) as f32 * xv;
+            }
+            // SAFETY: disjoint row ranges per worker.
+            unsafe { *out_addr.at(o + k) = acc * row_scale[o + k] };
+        }
+        o += 4;
+    }
+    while o < end {
+        let v = row_dot_sdot(&q[o * cols..(o + 1) * cols], act) * row_scale[o];
+        unsafe { *out_addr.at(o) = v };
+        o += 1;
+    }
+}
+
+/// Scalar/NEON-f32 q8 row range (non-SDOT platforms) — same extraction.
+fn q8_range_f32(
+    q: &[u8],
+    row_scale: &[f32],
+    xs: &[f32],
+    cols: usize,
+    out_addr: SendMut,
+    start: usize,
+    end: usize,
+) {
+    for o in start..end {
+        let v = dot_i8_f32(&q[o * cols..(o + 1) * cols], xs) * row_scale[o];
+        // SAFETY: disjoint row ranges per worker.
+        unsafe { *out_addr.at(o) = v };
+    }
+}
+
 /// SDOT row dot with exact outlier correction:
 /// `dot = sdot(w, xq)·sx + Σ_outl w[j]·x[j]` (then × row_scale by caller).
 #[cfg(target_arch = "aarch64")]
@@ -1910,34 +2071,8 @@ fn qmatvec(
     if sdot_enabled() {
         let act = split_act(xs);
         let out_addr = SendMut(out.as_mut_ptr());
-        let run_range = |start: usize, end: usize| {
-            let mut o = start;
-            while o + 4 <= end {
-                let r = unsafe {
-                    dot_i8_sdot_4rows(
-                        &q[o * cols..(o + 1) * cols],
-                        &q[(o + 1) * cols..(o + 2) * cols],
-                        &q[(o + 2) * cols..(o + 3) * cols],
-                        &q[(o + 3) * cols..(o + 4) * cols],
-                        &act.xq,
-                    )
-                };
-                for k in 0..4 {
-                    let mut acc = r[k] as f32 * act.sx;
-                    for &(j, xv) in &act.outliers {
-                        acc += (q[(o + k) * cols + j] as i8) as f32 * xv;
-                    }
-                    // SAFETY: disjoint row ranges per worker.
-                    unsafe { *out_addr.at(o + k) = acc * row_scale[o + k] };
-                }
-                o += 4;
-            }
-            while o < end {
-                let v = row_dot_sdot(&q[o * cols..(o + 1) * cols], &act) * row_scale[o];
-                unsafe { *out_addr.at(o) = v };
-                o += 1;
-            }
-        };
+        let run_range =
+            |start: usize, end: usize| q8_range_sdot(q, row_scale, &act, cols, out_addr, start, end);
         match pool {
             Some(pool) if rows >= 256 => pool.run_rows(rows, &run_range),
             _ => run_range(0, rows),
@@ -2319,6 +2454,32 @@ mod tests {
         q4matvec2(&bytes, &x1, &x2, rows, cols, &mut b1, &mut b2, None);
         assert_eq!(a1, b1, "fused q4 lane 1 must be bit-identical");
         assert_eq!(a2, b2, "fused q4 lane 2 must be bit-identical");
+    }
+
+    /// Multi-matrix job must equal separate matvecs exactly — same
+    /// kernels, only the dispatch is fused.
+    #[test]
+    fn matvec_many_equals_separate_matvecs() {
+        use crate::pool::Pool;
+        let (r1, r2, cols) = (300, 200, 64);
+        let mk = |salt: usize, rows: usize| {
+            QTensor::from_f32(
+                (0..rows * cols).map(|i| ((i * 7 + salt) % 97) as f32 / 97.0 - 0.5).collect(),
+                rows,
+                cols,
+            )
+        };
+        let (a, b) = (mk(1, r1), mk(5, r2));
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.11).sin()).collect();
+        let pool = Pool::new(3);
+
+        let (mut ea, mut eb) = (vec![0f32; r1], vec![0f32; r2]);
+        a.matvec(&x, &mut ea, Some(&pool));
+        b.matvec(&x, &mut eb, Some(&pool));
+        let (mut ga, mut gb) = (vec![0f32; r1], vec![0f32; r2]);
+        QTensor::matvec_many([&a, &b], &x, [&mut ga, &mut gb], Some(&pool));
+        assert_eq!(ea, ga, "fused multi-matrix lane 1 must be bit-identical");
+        assert_eq!(eb, gb, "fused multi-matrix lane 2 must be bit-identical");
     }
 
     /// Batched q4/vbit matmat must equal per-position matvec calls

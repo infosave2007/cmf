@@ -155,6 +155,41 @@ impl Pool {
         });
     }
 
+    /// Multi-matrix job: one dispatch serves SEVERAL row spaces
+    /// (roadmap §3 P0 — «одна внешняя публикация job на слой»). Parts
+    /// are laid out back-to-back in a virtual row space and pulled by
+    /// grain from one shared cursor, so QKV or gate+up cost a single
+    /// barrier instead of one each. Each part's `f(start, end)` sees its
+    /// OWN row indices — per-row math and outputs are bit-identical to
+    /// separate `run_rows` calls.
+    pub fn run_many(&self, parts: &[(usize, &(dyn Fn(usize, usize) + Sync))]) {
+        let total: usize = parts.iter().map(|p| p.0).sum();
+        if total == 0 {
+            return;
+        }
+        let grain = (total / ((self.threads.len() + 1) * 8)).max(32);
+        let next = AtomicUsize::new(0);
+        self.run(&|_w, _n| loop {
+            let s = next.fetch_add(grain, Ordering::Relaxed);
+            if s >= total {
+                break;
+            }
+            let e = (s + grain).min(total);
+            let mut base = 0usize;
+            for &(rows, f) in parts {
+                let a = s.max(base);
+                let b = e.min(base + rows);
+                if a < b {
+                    f(a - base, b - base);
+                }
+                base += rows;
+                if base >= e {
+                    break;
+                }
+            }
+        });
+    }
+
     /// Run `f(worker_idx, n_participants)` on every worker AND the
     /// calling thread (`worker_idx = n_workers()` for the caller);
     /// returns when all participants have finished.
