@@ -144,10 +144,16 @@ fresh processes):
 |---|---|---|---|
 | pp512, CPU 8 threads | 1156 ± 14 tok/s | 375–383 tok/s | **−67%** |
 | tg128, CPU 8 threads | 162.0 ± 1.3 tok/s | 95–101 tok/s | **−38%** |
-| pp512, GPU (Metal `-ngl 99`) | 3339 ± 50 tok/s | — | |
-| tg128, GPU (Metal `-ngl 99`) | 150.0 ± 0.4 tok/s | — | |
+| pp512, GPU (Metal `-ngl 99` / `CMF_GPU=1`) | 3339 ± 50 tok/s | 323–325 tok/s\* | **−90%** |
+| tg128, GPU (Metal `-ngl 99` / `CMF_GPU=1`) | 150.0 ± 0.4 tok/s | 100–101 tok/s\* | **−33%** |
 | Quant quality (PPL vs own f16, 12×512 windows) | near-lossless | +0.38% | matched |
 | File size | 644 MB | 479 MB | **−26%** |
+
+\* CMF has no on-device graph yet, so `CMF_GPU=1` means: the runtime probe
+measures per-op offload against the CPU path and keeps the winner — on
+Apple-silicon unified memory that is (correctly) the CPU. Decode therefore
+lands at CPU parity, and prefill pays a one-time ~15% probing tax on the
+first prompt of a process; later prompts run at full CPU speed.
 
 An earlier version of this table (0.3.0) claimed +70%/+60% over `llama.cpp`;
 that run had unknowingly benchmarked an x86-64 build of `llama.cpp` under

@@ -129,10 +129,15 @@ cortiq ppl model.cmf --file wiki.txt --o1 all
 |---|---|---|---|
 | pp512，CPU 8 线程 | 1156 ± 14 tok/s | 375–383 tok/s | **−67%** |
 | tg128，CPU 8 线程 | 162.0 ± 1.3 tok/s | 95–101 tok/s | **−38%** |
-| pp512，GPU（Metal `-ngl 99`） | 3339 ± 50 tok/s | — | |
-| tg128，GPU（Metal `-ngl 99`） | 150.0 ± 0.4 tok/s | — | |
+| pp512，GPU（Metal `-ngl 99` / `CMF_GPU=1`） | 3339 ± 50 tok/s | 323–325 tok/s\* | **−90%** |
+| tg128，GPU（Metal `-ngl 99` / `CMF_GPU=1`） | 150.0 ± 0.4 tok/s | 100–101 tok/s\* | **−33%** |
 | 量化质量（PPL 对各自 f16，12×512 窗口） | 近乎无损 | +0.38% | 已对齐 |
 | 文件大小 | 644 MB | 479 MB | **−26%** |
+
+\* CMF 还没有完整的设备端计算图，所以 `CMF_GPU=1` 的含义是：运行时探测把
+逐操作 offload 与 CPU 路径实测对比并保留胜者——在 Apple 统一内存上（正确地）
+是 CPU。因此 decode 与 CPU 持平，prefill 只在进程的第一个提示上付一次约 15%
+的探测税；之后的提示都是全速 CPU。
 
 这张表的早期版本（0.3.0）声称比 `llama.cpp` 快 +70%/+60%：后来查明，那次跑分
 在不知情的情况下测的是 Rosetta 2 仿真下的 x86-64 版 `llama.cpp`，仿真剥夺了它的
