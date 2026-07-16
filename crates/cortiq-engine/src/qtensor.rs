@@ -914,6 +914,25 @@ fn qmatmat(
         dispatch_rows(pool, rows, &run);
         return;
     }
+    // x86 A8W8 batch: each weight row streams once for the whole chunk
+    // through the AVX2/VNNI row dot (prefill q8 was the last
+    // aarch64-only batched path).
+    #[cfg(target_arch = "x86_64")]
+    if avx2_a8w8_enabled() {
+        let acts: Vec<SplitAct> = pre.iter().map(|x| split_act(x)).collect();
+        let out_addr = SendMut(out.as_mut_ptr());
+        let run = |start: usize, end: usize| {
+            for o in start..end {
+                let row = &q[o * cols..(o + 1) * cols];
+                for (bi, act) in acts.iter().enumerate() {
+                    let v = row_dot_avx2(row, act) * row_scale[o];
+                    unsafe { *out_addr.at(bi * rows + o) = v };
+                }
+            }
+        };
+        dispatch_rows(pool, rows, &run);
+        return;
+    }
     let out_addr = SendMut(out.as_mut_ptr());
     let run = |start: usize, end: usize| {
         for o in start..end {
