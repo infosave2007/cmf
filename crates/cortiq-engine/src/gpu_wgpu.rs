@@ -126,7 +126,7 @@ fn q8_matmat(@builtin(workgroup_id) wid: vec3<u32>,
 }
 
 // ── Element-wise kernels of the MoE block (silu·mul·col, axpy, zeroing) ──
-struct N1 { n: u32, _a: u32, _b: u32, _c: u32 };
+struct N1 { n: u32, f: u32, _b: u32, _c: u32 };
 
 @group(0) @binding(0) var<storage, read>       sg   : array<f32>;
 @group(0) @binding(1) var<storage, read>       su   : array<f32>;
@@ -138,7 +138,9 @@ fn silu_mul_pre(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= snp.n) { return; }
     let gv = sg[i];
-    sact[i] = (gv / (1.0 + exp(-gv))) * su[i] * scol[i];
+    var v = (gv / (1.0 + exp(-gv))) * su[i];
+    if (snp.f == 1u) { v = v * scol[i]; }
+    sact[i] = v;
 }
 
 struct AxpyP { w: f32, n: u32, _a: u32, _b: u32 };
@@ -262,8 +264,21 @@ fn ctx() -> Option<&'static Ctx> {
 }
 
 fn init() -> Result<Ctx, String> {
+    // Backend selection is automatic (wgpu picks the platform's best:
+    // DX12 on Windows, Vulkan on Linux, Metal on macOS), but the
+    // standard WGPU_BACKEND env (vulkan|dx12|metal|gl) forces one.
+    let backends = std::env::var("WGPU_BACKEND")
+        .ok()
+        .map(|v| match v.to_lowercase().as_str() {
+            "vulkan" | "vk" => wgpu::Backends::VULKAN,
+            "dx12" | "d3d12" => wgpu::Backends::DX12,
+            "metal" | "mtl" => wgpu::Backends::METAL,
+            "gl" | "gles" => wgpu::Backends::GL,
+            _ => wgpu::Backends::all(),
+        })
+        .unwrap_or(wgpu::Backends::all());
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::all(),
+        backends,
         flags: wgpu::InstanceFlags::default(),
         memory_budget_thresholds: Default::default(),
         backend_options: Default::default(),
@@ -882,7 +897,12 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         let grs_b = storage_bytes(c, bytemuck::cast_slice(grs));
         let urs_b = storage_bytes(c, bytemuck::cast_slice(urs));
         let drs_b = storage_bytes(c, bytemuck::cast_slice(drs));
-        let col_b = storage_bytes(c, bytemuck::cast_slice(j.down_col));
+        let has_col = !j.down_col.is_empty();
+        let col_b = if has_col {
+            storage_bytes(c, bytemuck::cast_slice(j.down_col))
+        } else {
+            storage_bytes(c, bytemuck::cast_slice(&[0f32])) // dummy, gated by f=0
+        };
         let xsg = storage_bytes(c, bytemuck::cast_slice(&j.xs_gate));
         let xsu = storage_bytes(c, bytemuck::cast_slice(&j.xs_up));
 
@@ -890,7 +910,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         encode_matvec(c, &mut enc, uw, &xsu, &urs_b, &u_buf, *ur, *uc);
         // act = silu(g)·u·col_down
         {
-            let np = uniform_u32x4(c, [inter as u32, 0, 0, 0]);
+            let np = uniform_u32x4(c, [inter as u32, has_col as u32, 0, 0]);
             let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &c.layout_silu,

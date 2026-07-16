@@ -1998,6 +1998,16 @@ thread_local! {
 
 /// Dense SwiGLU FFN through QTensor matvecs (any storage).
 fn dense_ffn(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
+    // Whole-FFN GPU submit (этап 4.2 increment): gate → silu·up → down
+    // chained in ONE command buffer with the intermediate activations
+    // resident on the device — 3 per-op polls become 1 per layer. The
+    // moe_block backend already implements exactly this chain; a dense
+    // FFN is one expert with weight 1.
+    if crate::gpu::enabled_here() {
+        if let Some(out) = dense_ffn_gpu(d, x, pool) {
+            return out;
+        }
+    }
     let inter = d.gate_proj.rows();
     FFN_SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
@@ -2013,6 +2023,83 @@ fn dense_ffn(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
         d.down_proj.matvec(g, &mut out, pool);
         out
     })
+}
+
+/// Dense FFN as one GPU submission via the MoE block path (single
+/// expert, weight 1.0): gate → silu·up → down chained in one command
+/// buffer, intermediate activations device-resident. None → weights
+/// not q8-mapped in the primary shard / over the VRAM budget / backend
+/// refusal → honest CPU path.
+fn dense_ffn_gpu(d: &DenseFfn, x: &[f32], _pool: Option<&Pool>) -> Option<Vec<f32>> {
+    // Threshold: tiny FFNs are not worth a submission.
+    if d.gate_proj.rows() < crate::gpu::min_rows() {
+        return None;
+    }
+    let mut jobs: Vec<crate::gpu::MoeJob> = Vec::with_capacity(1);
+    let mut model_ref = None;
+    moe_push_job(d, x, 1.0, &mut jobs, &mut model_ref)?;
+    let model = model_ref?;
+    let hidden = jobs[0].down.1;
+    let mut out = attention::take_buf(hidden);
+    if crate::gpu::moe_block(&model, &jobs, &mut out) {
+        Some(out)
+    } else {
+        let mut out = out;
+        attention::recycle_buf(&mut out);
+        None
+    }
+}
+
+/// q8-mapped primary-shard tensor parts for a GPU job: q8_2f carries
+/// its column field, q8_row runs with empty col slices (the backend
+/// skips the multiply). Shared by the MoE block and the dense-FFN
+/// single-job path.
+#[allow(clippy::type_complexity)]
+fn moe_parts(
+    t: &QTensor,
+) -> Option<(&std::sync::Arc<cortiq_core::CmfModel>, usize, usize, usize, &[f32], &[f32])> {
+    match t {
+        QTensor::Mapped {
+            model,
+            idx,
+            dtype: dt @ (cortiq_core::TensorDtype::Q8_2f | cortiq_core::TensorDtype::Q8Row),
+            rows,
+            cols,
+            row_scale,
+            col_field,
+            ..
+        } if (*dt == cortiq_core::TensorDtype::Q8Row) || !col_field.is_empty() => {
+            Some((model, *idx, *rows, *cols, row_scale, col_field))
+        }
+        _ => None,
+    }
+}
+
+/// Build one gate/up/down GPU job (see `moe_parts`).
+fn moe_push_job<'a>(
+    d: &'a DenseFfn,
+    x: &[f32],
+    w: f32,
+    jobs: &mut Vec<crate::gpu::MoeJob<'a>>,
+    model_ref: &mut Option<std::sync::Arc<cortiq_core::CmfModel>>,
+) -> Option<()> {
+    use crate::qtensor::prescale;
+    let (gm, gi, gr, gc, grs, gcf) = moe_parts(&d.gate_proj)?;
+    let (_, ui, ur, uc, urs, ucf) = moe_parts(&d.up_proj)?;
+    let (_, di, dr, dc, drs, dcf) = moe_parts(&d.down_proj)?;
+    model_ref.get_or_insert_with(|| gm.clone());
+    let gdt = if gcf.is_empty() { cortiq_core::TensorDtype::Q8Row } else { cortiq_core::TensorDtype::Q8_2f };
+    let udt = if ucf.is_empty() { cortiq_core::TensorDtype::Q8Row } else { cortiq_core::TensorDtype::Q8_2f };
+    jobs.push(crate::gpu::MoeJob {
+        gate: (gi, gr, gc, grs),
+        up: (ui, ur, uc, urs),
+        down: (di, dr, dc, drs),
+        xs_gate: prescale(x, gcf, gdt).into_owned(),
+        xs_up: prescale(x, ucf, udt).into_owned(),
+        down_col: dcf,
+        w,
+    });
+    Some(())
 }
 
 /// Sparse dense-FFN directly on QUANTIZED weights (mask × mmap): reads
@@ -2184,63 +2271,17 @@ fn moe_ffn_gpu(
     pool: Option<&Pool>,
 ) -> Option<Vec<f32>> {
     use crate::gpu::MoeJob;
-    use crate::qtensor::prescale;
-    use cortiq_core::TensorDtype;
-
-    fn parts(
-        t: &QTensor,
-    ) -> Option<(&std::sync::Arc<cortiq_core::CmfModel>, usize, usize, usize, &[f32], &[f32])>
-    {
-        match t {
-            QTensor::Mapped {
-                model,
-                idx,
-                dtype: TensorDtype::Q8_2f,
-                rows,
-                cols,
-                row_scale,
-                col_field,
-                ..
-            } if !col_field.is_empty() => {
-                Some((model, *idx, *rows, *cols, row_scale, col_field))
-            }
-            _ => None,
-        }
-    }
-
-    fn push<'a>(
-        d: &'a DenseFfn,
-        x: &[f32],
-        w: f32,
-        jobs: &mut Vec<MoeJob<'a>>,
-        model_ref: &mut Option<std::sync::Arc<cortiq_core::CmfModel>>,
-    ) -> Option<()> {
-        let (gm, gi, gr, gc, grs, gcf) = parts(&d.gate_proj)?;
-        let (_, ui, ur, uc, urs, ucf) = parts(&d.up_proj)?;
-        let (_, di, dr, dc, drs, dcf) = parts(&d.down_proj)?;
-        model_ref.get_or_insert_with(|| gm.clone());
-        jobs.push(MoeJob {
-            gate: (gi, gr, gc, grs),
-            up: (ui, ur, uc, urs),
-            down: (di, dr, dc, drs),
-            xs_gate: prescale(x, gcf, TensorDtype::Q8_2f).into_owned(),
-            xs_up: prescale(x, ucf, TensorDtype::Q8_2f).into_owned(),
-            down_col: dcf,
-            w,
-        });
-        Some(())
-    }
 
     let mut jobs: Vec<MoeJob> = Vec::with_capacity(idx.len() + 1);
     let mut model_ref = None;
     for &e in idx {
-        push(&m.experts[e], x, p[e] / wsum, &mut jobs, &mut model_ref)?;
+        moe_push_job(&m.experts[e], x, p[e] / wsum, &mut jobs, &mut model_ref)?;
     }
     if let Some((se, gate)) = &m.shared {
         let mut gl = vec![0.0f32; 1];
         gate.matvec(x, &mut gl, pool);
         let g = 1.0 / (1.0 + (-gl[0]).exp());
-        push(se, x, g, &mut jobs, &mut model_ref)?;
+        moe_push_job(se, x, g, &mut jobs, &mut model_ref)?;
     }
     let model = model_ref?;
     let hidden = jobs[0].down.1;

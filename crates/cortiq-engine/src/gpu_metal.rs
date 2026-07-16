@@ -454,6 +454,12 @@ pub fn q8_matmat(
 /// intermediate buffers are GPU-resident, one sync per layer. D5 design:
 /// amortizing the dispatch cost over ~25 MB of work instead of a single matvec.
 pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> bool {
+    // The MSL silu kernel multiplies by the down column field
+    // unconditionally — q8_row jobs (no col field) take the CPU path.
+    if jobs.iter().any(|j| j.down_col.is_empty()) {
+        return false;
+    }
+
     let Some(c) = ctx() else { return false };
     if jobs.is_empty() {
         return false;
