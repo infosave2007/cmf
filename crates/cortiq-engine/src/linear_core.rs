@@ -442,15 +442,10 @@ pub fn gdn_forward(
     let mut z = vec![0.0f32; vd];
     let mut a = vec![0.0f32; cfg.num_v_heads];
     let mut b = vec![0.0f32; cfg.num_v_heads];
-    // D5: two heavy projections (qkv+z ≈ 24MB q8 per 35B layer, ×30 layers
-    // = half the token's bytes) — in a single GPU submission; a/b are tiny
-    // and stay on CPU.
-    if gdn_projs_gpu(w, x, &mut qkv, &mut z) {
-        w.in_proj_a.matvec(x, &mut a, pool);
-        w.in_proj_b.matvec(x, &mut b, pool);
-    } else {
-        // All four projections under ONE pool dispatch (uniform-dtype
-        // multi-matrix job; falls back to per-tensor matvecs otherwise).
+    // D5: two heavy projections (the GDN mixer is ~half a hybrid layer's
+    // bytes) — one GPU submission; a/b are tiny and stay on CPU. The
+    // Batch probe arbitrates GPU vs the fused-CPU dispatch per machine.
+    let cpu_projs = |qkv: &mut Vec<f32>, z: &mut Vec<f32>, a: &mut Vec<f32>, b: &mut Vec<f32>| {
         QTensor::matvec_many(
             [&w.in_proj_qkv, &w.in_proj_z, &w.in_proj_a, &w.in_proj_b],
             x,
@@ -462,6 +457,33 @@ pub fn gdn_forward(
             ],
             pool,
         );
+    };
+    let mut done = false;
+    if crate::gpu::enabled_here() && gdn_projs_eligible(w) {
+        match crate::gpu::probe_arm(crate::gpu::OpClass::Batch) {
+            crate::gpu::ProbeArm::Gpu => {
+                let t0 = std::time::Instant::now();
+                if gdn_projs_gpu(w, x, &mut qkv, &mut z) {
+                    crate::gpu::probe_record(crate::gpu::OpClass::Batch, true, t0.elapsed());
+                    w.in_proj_a.matvec(x, &mut a, pool);
+                    w.in_proj_b.matvec(x, &mut b, pool);
+                    done = true;
+                }
+            }
+            crate::gpu::ProbeArm::CpuTimed => {
+                let t0 = std::time::Instant::now();
+                crate::gpu::cpu_scope(|| cpu_projs(&mut qkv, &mut z, &mut a, &mut b));
+                crate::gpu::probe_record(crate::gpu::OpClass::Batch, false, t0.elapsed());
+                done = true;
+            }
+            crate::gpu::ProbeArm::Cpu => {
+                crate::gpu::cpu_scope(|| cpu_projs(&mut qkv, &mut z, &mut a, &mut b));
+                done = true;
+            }
+        }
+    }
+    if !done {
+        cpu_projs(&mut qkv, &mut z, &mut a, &mut b);
     }
 
     let mut of = vec![0.0f32; vd];
@@ -518,16 +540,19 @@ pub fn gdn_forward_batch(
     out
 }
 
+/// GDN qkv+z GPU eligibility: q1 mixers offload by default (the CPU q1
+/// kernel is compute-bound); q8 stays opt-in via CMF_GPU_GDN=1 (measured
+/// neutral). The probe in `gdn_forward` still arbitrates either way.
+fn gdn_projs_eligible(w: &GdnWeights) -> bool {
+    w.in_proj_qkv.is_q1()
+        || std::env::var("CMF_GPU_GDN").map(|v| v == "1").unwrap_or(false)
+}
+
 /// GDN qkv+z on GPU in a single submission (independent matvecs of one input).
 fn gdn_projs_gpu(w: &GdnWeights, x: &[f32], qkv: &mut [f32], z: &mut [f32]) -> bool {
     use crate::gpu::matvec_batch;
     use crate::qtensor::QTensor;
-    // Measured (35B, alternating A/B): 2 matvecs per submission do NOT
-    // amortize the sync cost — neutral within the noise. Opt-in until
-    // attention/norms move into this same submission.
-    if !crate::gpu::enabled_here()
-        || !std::env::var("CMF_GPU_GDN").map(|v| v == "1").unwrap_or(false)
-    {
+    if !crate::gpu::enabled_here() {
         return false;
     }
     fn part<'a>(
@@ -555,6 +580,25 @@ fn gdn_projs_gpu(w: &GdnWeights, x: &[f32], qkv: &mut [f32], z: &mut [f32]) -> b
                 cols: *cols,
                 row_scale,
                 xs: prescale(x, col_field, *dt).into_owned(),
+                q1: false,
+            },
+        )),
+        QTensor::Mapped {
+            model,
+            idx,
+            dtype: TensorDtype::Q1,
+            rows,
+            cols,
+            ..
+        } => Some((
+            model.clone(),
+            BatchJob {
+                idx: *idx,
+                rows: *rows,
+                cols: *cols,
+                row_scale: &[],
+                xs: x.to_vec(),
+                q1: true,
             },
         )),
         _ => None,

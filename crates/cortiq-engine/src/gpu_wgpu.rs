@@ -870,6 +870,9 @@ fn encode_matvec(
 /// silu·mul·col_down → down-matvec → y += w·d. Intermediate buffers are
 /// GPU-resident, one sync per layer.
 pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> bool {
+    if jobs.iter().any(|j| j.q1) {
+        return false; // q1 WGSL kernel not implemented yet — honest CPU
+    }
     let Some(c) = ctx() else { return false };
     if jobs.is_empty() {
         return false;

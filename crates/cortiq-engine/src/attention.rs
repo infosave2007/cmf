@@ -552,7 +552,9 @@ fn project_position(
     // Runtime probe (Batch class): the batch either amortizes its
     // submit+poll on this driver stack or the fused CPU dispatch wins.
     let mut done = false;
-    if crate::gpu::enabled_here() && wq.rows() >= crate::gpu::min_rows() {
+    if crate::gpu::enabled_here()
+        && (wq.rows() >= crate::gpu::min_rows() || wq.is_q1())
+    {
         match crate::gpu::probe_arm(crate::gpu::OpClass::Batch) {
             crate::gpu::ProbeArm::Gpu => {
                 if let (Some((m, jq)), Some((_, jk)), Some((_, jv))) = (

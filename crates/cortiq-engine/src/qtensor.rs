@@ -249,6 +249,12 @@ impl QTensor {
         }
     }
 
+    /// q1-mapped tensor? (GPU gates: the q1 CPU kernel is
+    /// compute-bound, so offload pays at much smaller shapes than q8.)
+    pub(crate) fn is_q1(&self) -> bool {
+        matches!(self, Self::Mapped { dtype: TensorDtype::Q1, .. })
+    }
+
     pub fn rows(&self) -> usize {
         match self {
             Self::F32 { rows, .. } | Self::Mapped { rows, .. } => *rows,
@@ -478,6 +484,35 @@ impl QTensor {
                     return;
                 }
                 if *dtype == TensorDtype::Q1 {
+                    // GPU route for large q1 matvecs (out_proj / lm_head
+                    // class): the CPU q1 kernel is load-port-bound at
+                    // ~4 GB/s/core, the GPU one is bandwidth-bound — the
+                    // probe measures both arms and keeps the winner.
+                    if *rows * *cols >= 8_388_608 && crate::gpu::enabled_here() {
+                        let t0 = std::time::Instant::now();
+                        match crate::gpu::probe_arm(crate::gpu::OpClass::Matvec) {
+                            crate::gpu::ProbeArm::Gpu => {
+                                if crate::gpu::q1_matvec(model, *idx, x, *rows, *cols, out) {
+                                    crate::gpu::probe_record(
+                                        crate::gpu::OpClass::Matvec,
+                                        true,
+                                        t0.elapsed(),
+                                    );
+                                    return;
+                                }
+                            }
+                            crate::gpu::ProbeArm::CpuTimed => {
+                                q1_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
+                                crate::gpu::probe_record(
+                                    crate::gpu::OpClass::Matvec,
+                                    false,
+                                    t0.elapsed(),
+                                );
+                                return;
+                            }
+                            crate::gpu::ProbeArm::Cpu => {}
+                        }
+                    }
                     q1_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
                     return;
                 }
@@ -2865,6 +2900,26 @@ pub(crate) fn gpu_batch_job<'a>(
                 cols: *cols,
                 row_scale,
                 xs: prescale(x, col_field, *dt).into_owned(),
+                q1: false,
+            },
+        )),
+        // q1: raw f32 activations, tile-embedded scales.
+        QTensor::Mapped {
+            model,
+            idx,
+            dtype: TensorDtype::Q1,
+            rows,
+            cols,
+            ..
+        } => Some((
+            model.clone(),
+            crate::gpu::BatchJob {
+                idx: *idx,
+                rows: *rows,
+                cols: *cols,
+                row_scale: &[],
+                xs: x.to_vec(),
+                q1: true,
             },
         )),
         _ => None,

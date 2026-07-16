@@ -2005,7 +2005,12 @@ fn dense_ffn(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
     // FFN is one expert with weight 1. Runtime probe: the chain still
     // pays one submit+poll per layer — alternate it against the pure-CPU
     // FFN and keep whichever is faster on this machine.
-    if crate::gpu::enabled_here() && d.gate_proj.rows() >= crate::gpu::min_rows() {
+    // q1 FFNs offload at any practical size: the q1 CPU kernel is
+    // compute-bound, so the UMA threshold logic does not apply — the
+    // probe measures and decides either way.
+    if crate::gpu::enabled_here()
+        && (d.gate_proj.rows() >= crate::gpu::min_rows() || d.gate_proj.is_q1())
+    {
         match crate::gpu::probe_arm(crate::gpu::OpClass::Ffn) {
             crate::gpu::ProbeArm::Gpu => {
                 let t0 = std::time::Instant::now();
@@ -2053,8 +2058,9 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
 /// not q8-mapped in the primary shard / over the VRAM budget / backend
 /// refusal → honest CPU path.
 fn dense_ffn_gpu(d: &DenseFfn, x: &[f32], _pool: Option<&Pool>) -> Option<Vec<f32>> {
-    // Threshold: tiny FFNs are not worth a submission.
-    if d.gate_proj.rows() < crate::gpu::min_rows() {
+    // Threshold: tiny FFNs are not worth a submission (q1 excepted —
+    // see the caller's gate).
+    if d.gate_proj.rows() < crate::gpu::min_rows() && !d.gate_proj.is_q1() {
         return None;
     }
     let mut jobs: Vec<crate::gpu::MoeJob> = Vec::with_capacity(1);
@@ -2077,9 +2083,10 @@ fn dense_ffn_gpu(d: &DenseFfn, x: &[f32], _pool: Option<&Pool>) -> Option<Vec<f3
 /// skips the multiply). Shared by the MoE block and the dense-FFN
 /// single-job path.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity)]
 fn moe_parts(
     t: &QTensor,
-) -> Option<(&std::sync::Arc<cortiq_core::CmfModel>, usize, usize, usize, &[f32], &[f32])> {
+) -> Option<(&std::sync::Arc<cortiq_core::CmfModel>, usize, usize, usize, &[f32], &[f32], bool)> {
     match t {
         QTensor::Mapped {
             model,
@@ -2091,8 +2098,17 @@ fn moe_parts(
             col_field,
             ..
         } if (*dt == cortiq_core::TensorDtype::Q8Row) || !col_field.is_empty() => {
-            Some((model, *idx, *rows, *cols, row_scale, col_field))
+            Some((model, *idx, *rows, *cols, row_scale, col_field, false))
         }
+        // q1: tile-embedded scales — empty rs/col slices, raw xs.
+        QTensor::Mapped {
+            model,
+            idx,
+            dtype: cortiq_core::TensorDtype::Q1,
+            rows,
+            cols,
+            ..
+        } => Some((model, *idx, *rows, *cols, &[][..], &[][..], true)),
         _ => None,
     }
 }
@@ -2106,9 +2122,12 @@ fn moe_push_job<'a>(
     model_ref: &mut Option<std::sync::Arc<cortiq_core::CmfModel>>,
 ) -> Option<()> {
     use crate::qtensor::prescale;
-    let (gm, gi, gr, gc, grs, gcf) = moe_parts(&d.gate_proj)?;
-    let (_, ui, ur, uc, urs, ucf) = moe_parts(&d.up_proj)?;
-    let (_, di, dr, dc, drs, dcf) = moe_parts(&d.down_proj)?;
+    let (gm, gi, gr, gc, grs, gcf, gq1) = moe_parts(&d.gate_proj)?;
+    let (_, ui, ur, uc, urs, ucf, uq1) = moe_parts(&d.up_proj)?;
+    let (_, di, dr, dc, drs, dcf, dq1) = moe_parts(&d.down_proj)?;
+    if gq1 != uq1 || uq1 != dq1 {
+        return None; // mixed-dtype trio — honest CPU path
+    }
     model_ref.get_or_insert_with(|| gm.clone());
     let gdt = if gcf.is_empty() { cortiq_core::TensorDtype::Q8Row } else { cortiq_core::TensorDtype::Q8_2f };
     let udt = if ucf.is_empty() { cortiq_core::TensorDtype::Q8Row } else { cortiq_core::TensorDtype::Q8_2f };
@@ -2120,6 +2139,7 @@ fn moe_push_job<'a>(
         xs_up: prescale(x, ucf, udt).into_owned(),
         down_col: dcf,
         w,
+        q1: gq1,
     });
     Some(())
 }

@@ -351,6 +351,9 @@ pub struct MoeJob<'a> {
     pub xs_up: Vec<f32>,
     pub down_col: &'a [f32],
     pub w: f32,
+    /// q1 trio: scales live inside the 6-byte tiles (row_scale slices
+    /// empty, xs raw f32). Backends without a q1 kernel refuse the job.
+    pub q1: bool,
 }
 
 /// A single independent batch matvec (GDN projections of one input).
@@ -360,6 +363,8 @@ pub struct BatchJob<'a> {
     pub cols: usize,
     pub row_scale: &'a [f32],
     pub xs: Vec<f32>,
+    /// q1 tensor: tile-embedded scales, raw f32 xs (see `MoeJob::q1`).
+    pub q1: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -435,6 +440,26 @@ pub fn q8_matmat(
         Backend::Wgpu => {
             crate::gpu_wgpu::q8_matmat(model, idx, row_scale, pre, b, rows, cols, out)
         }
+        Backend::None => false,
+    }
+}
+
+/// q1 matvec: raw f32 activations, tile-embedded scales. Metal only
+/// for now (wgpu q1 WGSL is queued); false = CPU fallback.
+#[allow(unused_variables)]
+pub fn q1_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q1_matvec(model, idx, xs, rows, cols, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => false,
         Backend::None => false,
     }
 }
