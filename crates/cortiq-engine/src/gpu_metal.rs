@@ -81,14 +81,12 @@ kernel void q8_matmat(
 }
 
 // q1: 6-byte tiles [f16 scale][4B sign bits] per 32-group; w = s*(2b-1).
-// One SIMD group per row, each lane owns whole tiles; the scale lives
-// inside the tile, so there is no separate row-scale buffer at all.
-// One SIMD group per row, 8 rows per threadgroup; the activation is
-// staged через threadgroup memory in 4096-float chunks — without it
-// every row re-read the whole xs from L2 (rows × cols × 4B ≈ 350 MB of
-// L2 traffic per FFN matvec, the measured wall). Tile PAIRS are 12
-// bytes = three aligned u32 loads. gpr must be even (every real shape;
-// the CPU handles odd-gpr tensors).
+// One SIMD group per TWO rows: each activation float4 a lane loads is
+// used against both rows' tile pairs, with no threadgroup staging (no
+// barriers, xs hot in L1 across a core's simdgroups). Four rows per
+// simdgroup was tried and REVERTED: the cached-x register block spills
+// and occupancy drops (13.8 ms/block vs 8.8). Tile pairs are 12 bytes =
+// three aligned u32 loads; gpr must be even (CPU handles the rest).
 kernel void q1_matvec(
     device const uchar*  q    [[buffer(0)]],
     device const float4* xs   [[buffer(1)]],
@@ -97,55 +95,58 @@ kernel void q1_matvec(
     constant uint&       rows [[buffer(4)]],
     uint sg   [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
-    uint tid  [[thread_position_in_threadgroup]],
     uint tgpos [[threadgroup_position_in_grid]],
     uint sgs  [[simdgroups_per_threadgroup]])
 {
-    threadgroup float4 shx[1024]; // 16 KB chunk of xs
-    uint row = tgpos * sgs + sg;  // no early return: barriers below
-    uint cols4 = gpr * 8u;        // cols / 4
-    device const uint* qw =
-        (device const uint*)(q + (ulong)min(row, rows - 1u) * gpr * 6u);
-    float acc = 0.0f;
-    uint nch = (cols4 + 1023u) / 1024u;
-    for (uint ch = 0; ch < nch; ++ch) {
-        uint cb4 = ch * 1024u;                    // chunk base in float4
-        uint cl4 = min(1024u, cols4 - cb4);       // chunk length in float4
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = tid; i < cl4; i += sgs * 32u) {
-            shx[i] = xs[cb4 + i];
+    uint r0 = (tgpos * sgs + sg) * 2u;
+    if (r0 >= rows) return;
+    bool two = r0 + 1u < rows;
+    uint np = gpr >> 1;
+    device const uint* q0 = (device const uint*)(q + (ulong)r0 * gpr * 6u);
+    device const uint* q1p = (device const uint*)(q + (ulong)(r0 + (two ? 1u : 0u)) * gpr * 6u);
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint pidx = lane; pidx < np; pidx += 32u) {
+        uint a0 = q0[pidx * 3u];
+        uint a1 = q0[pidx * 3u + 1u];
+        uint a2 = q0[pidx * 3u + 2u];
+        uint b0 = q1p[pidx * 3u];
+        uint b1 = q1p[pidx * 3u + 1u];
+        uint b2 = q1p[pidx * 3u + 2u];
+        float sa0 = (float)as_type<half>((ushort)(a0 & 0xFFFFu));
+        float sa1 = (float)as_type<half>((ushort)(a1 >> 16));
+        uint bitsa0 = (a0 >> 16) | (a1 << 16);
+        uint bitsa1 = a2;
+        float sb0 = (float)as_type<half>((ushort)(b0 & 0xFFFFu));
+        float sb1 = (float)as_type<half>((ushort)(b1 >> 16));
+        uint bitsb0 = (b0 >> 16) | (b1 << 16);
+        uint bitsb1 = b2;
+        ulong g = (ulong)pidx * 2u;
+        float4 s0a = float4(0.0f), s1a = float4(0.0f);
+        float4 s0b = float4(0.0f), s1b = float4(0.0f);
+        for (uint j = 0; j < 8; ++j) {
+            float4 x0 = xs[g * 8u + j];
+            float4 x1 = xs[(g + 1u) * 8u + j];
+            uint na0 = bitsa0 >> (j * 4u);
+            uint na1 = bitsa1 >> (j * 4u);
+            uint nb0 = bitsb0 >> (j * 4u);
+            uint nb1 = bitsb1 >> (j * 4u);
+            s0a += select(-x0, x0, bool4(na0 & 1u, na0 & 2u, na0 & 4u, na0 & 8u));
+            s1a += select(-x1, x1, bool4(na1 & 1u, na1 & 2u, na1 & 4u, na1 & 8u));
+            s0b += select(-x0, x0, bool4(nb0 & 1u, nb0 & 2u, nb0 & 4u, nb0 & 8u));
+            s1b += select(-x1, x1, bool4(nb1 & 1u, nb1 & 2u, nb1 & 4u, nb1 & 8u));
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row < rows) {
-            uint p0 = cb4 / 16u;                  // first tile PAIR of the chunk
-            uint pn = cl4 / 16u;                  // pairs in the chunk
-            for (uint pi = lane; pi < pn; pi += 32u) {
-                uint pidx = p0 + pi;
-                uint u0 = qw[pidx * 3u];
-                uint u1 = qw[pidx * 3u + 1u];
-                uint u2 = qw[pidx * 3u + 2u];
-                float s0 = (float)as_type<half>((ushort)(u0 & 0xFFFFu));
-                uint bits0 = (u0 >> 16) | (u1 << 16);
-                float s1 = (float)as_type<half>((ushort)(u1 >> 16));
-                uint bits1 = u2;
-                uint xb = pi * 16u;               // pair base inside the chunk
-                float4 sum0 = float4(0.0f);
-                float4 sum1 = float4(0.0f);
-                for (uint j = 0; j < 8; ++j) {
-                    float4 x0 = shx[xb + j];
-                    float4 x1 = shx[xb + 8u + j];
-                    uint n0 = bits0 >> (j * 4u);
-                    uint n1 = bits1 >> (j * 4u);
-                    sum0 += select(-x0, x0, bool4(n0 & 1u, n0 & 2u, n0 & 4u, n0 & 8u));
-                    sum1 += select(-x1, x1, bool4(n1 & 1u, n1 & 2u, n1 & 4u, n1 & 8u));
-                }
-                acc += s0 * (sum0.x + sum0.y + sum0.z + sum0.w)
-                     + s1 * (sum1.x + sum1.y + sum1.z + sum1.w);
-            }
-        }
+        acc0 += sa0 * (s0a.x + s0a.y + s0a.z + s0a.w)
+              + sa1 * (s1a.x + s1a.y + s1a.z + s1a.w);
+        acc1 += sb0 * (s0b.x + s0b.y + s0b.z + s0b.w)
+              + sb1 * (s1b.x + s1b.y + s1b.z + s1b.w);
     }
-    acc = simd_sum(acc);
-    if (lane == 0 && row < rows) y[row] = acc;
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    if (lane == 0) {
+        y[r0] = acc0;
+        if (two) y[r0 + 1u] = acc1;
+    }
 }
 
 kernel void silu_mul_pre(
@@ -204,6 +205,192 @@ kernel void write_flag(
         atomic_store_explicit(f, v + bump, memory_order_relaxed);
     }
 }
+
+// ── Whole-block GDN kernels: an entire linear layer (norm → mixer →
+// conv → recurrence → out_proj → norm → FFN) runs inside ONE command
+// buffer, hidden state resident on device; the CPU sees one sync per
+// BLOCK of consecutive GDN layers instead of ~12 per layer. ──
+
+// Tiny f32 matvec (the GDN a/b gate projections live dequantized in
+// RAM; they are uploaded once through the small-vector cache).
+kernel void f32_matvec(
+    device const float*  q    [[buffer(0)]],
+    device const float*  xs   [[buffer(1)]],
+    device float*        y    [[buffer(2)]],
+    constant uint&       cols [[buffer(3)]],
+    constant uint&       rows [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint row = tgpos * sgs + sg;
+    if (row >= rows) return;
+    ulong base = (ulong)row * cols;
+    float acc = 0.0f;
+    for (uint i = lane; i < cols; i += 32u) {
+        acc += q[base + i] * xs[i];
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) y[row] = acc;
+}
+
+kernel void rmsnorm_k(
+    device const float* x [[buffer(0)]],
+    device const float* w [[buffer(1)]],
+    device float*       o [[buffer(2)]],
+    constant uint&      n [[buffer(3)]],
+    constant uint&  gemma [[buffer(4)]],
+    constant float&   eps [[buffer(5)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float part[8];
+    float acc = 0.0f;
+    for (uint i = tid; i < n; i += 256u) { float v = x[i]; acc += v * v; }
+    acc = simd_sum(acc);
+    if (lane == 0) part[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (uint k = 0; k < 8u; ++k) tot += part[k];
+    float inv = rsqrt(tot / (float)n + eps);
+    for (uint i = tid; i < n; i += 256u) {
+        float wv = gemma != 0u ? (1.0f + w[i]) : w[i];
+        o[i] = x[i] * inv * wv;
+    }
+}
+
+// cq = silu(depthwise causal conv over [ring…, current qkv])
+kernel void gdn_conv(
+    device const float* qkv  [[buffer(0)]],
+    device const float* ring [[buffer(1)]],
+    device const float* taps [[buffer(2)]],
+    device float*       cq   [[buffer(3)]],
+    constant uint&     c_dim [[buffer(4)]],
+    constant uint&        kk [[buffer(5)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= c_dim) return;
+    float acc = qkv[i] * taps[i * kk + kk - 1u];
+    for (uint j = 0; j + 1u < kk; ++j) acc += ring[j * c_dim + i] * taps[i * kk + j];
+    cq[i] = acc / (1.0f + exp(-acc));
+}
+
+// Ring shift: drop the oldest position, append the RAW current qkv.
+kernel void gdn_ring_shift(
+    device float*       ring [[buffer(0)]],
+    device const float* qkv  [[buffer(1)]],
+    constant uint&     c_dim [[buffer(2)]],
+    constant uint&        kk [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= c_dim) return;
+    for (uint j = 0; j + 2u < kk; ++j) ring[j * c_dim + i] = ring[(j + 1u) * c_dim + i];
+    ring[(kk - 2u) * c_dim + i] = qkv[i];
+}
+
+// Per-head decay g and write strength beta.
+kernel void gdn_gates(
+    device const float* a       [[buffer(0)]],
+    device const float* b       [[buffer(1)]],
+    device const float* a_log   [[buffer(2)]],
+    device const float* dt_bias [[buffer(3)]],
+    device float*       g       [[buffer(4)]],
+    device float*       beta    [[buffer(5)]],
+    constant uint&      nv      [[buffer(6)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= nv) return;
+    float x = a[i] + dt_bias[i];
+    float sp = x > 20.0f ? x : log(1.0f + exp(x));
+    g[i] = exp(-exp(a_log[i]) * sp);
+    beta[i] = 1.0f / (1.0f + exp(-b[i]));
+}
+
+// l2-norm inverses of q/k per K head (one simdgroup per head).
+kernel void gdn_qk_norms(
+    device const float* cq   [[buffer(0)]],
+    device float*       invq [[buffer(1)]],
+    device float*       invk [[buffer(2)]],
+    constant uint&      nk   [[buffer(3)]],
+    constant uint&      dk   [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint h = tg * sgs + sg;
+    if (h >= nk) return;
+    uint kd = nk * dk;
+    float nq = 0.0f, nkn = 0.0f;
+    for (uint d = lane; d < dk; d += 32u) {
+        float q = cq[h * dk + d];      nq  += q * q;
+        float k = cq[kd + h * dk + d]; nkn += k * k;
+    }
+    nq = simd_sum(nq); nkn = simd_sum(nkn);
+    if (lane == 0) {
+        invq[h] = 1.0f / (sqrt(nq + 1e-6f) * sqrt((float)dk));
+        invk[h] = 1.0f / sqrt(nkn + 1e-6f);
+    }
+}
+
+// The GatedDeltaNet recurrence + gated RMSNorm, one threadgroup per V
+// head (dv threads, thread dj owns one output column):
+//   kv = k'ᵀ S_old;  Δ = β(v − g·kv);  S = g·S_old + k' ⊗ Δ;  o = q'ᵀ S
+// S rows are read coalesced (threads span dj).
+kernel void gdn_state_update(
+    device float*       S     [[buffer(0)]],
+    device const float* cq    [[buffer(1)]],
+    device const float* z     [[buffer(2)]],
+    device const float* g     [[buffer(3)]],
+    device const float* beta  [[buffer(4)]],
+    device const float* invq  [[buffer(5)]],
+    device const float* invk  [[buffer(6)]],
+    device const float* gnorm [[buffer(7)]],
+    device float*       of    [[buffer(8)]],
+    constant uint&      nv    [[buffer(9)]],
+    constant uint&      nk    [[buffer(10)]],
+    constant uint&      dk    [[buffer(11)]],
+    constant uint&      dv    [[buffer(12)]],
+    constant float&     eps   [[buffer(13)]],
+    uint h    [[threadgroup_position_in_grid]],
+    uint dj   [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    uint rep = nv / nk;
+    uint ko = h / rep;
+    uint kd = nk * dk;
+    device float* s = S + (ulong)h * dk * dv;
+    float gh = g[h];
+    float bh = beta[h];
+    float iq = invq[ko];
+    float ik = invk[ko];
+    float vt = cq[2u * kd + h * dv + dj];
+    float kv = 0.0f;
+    for (uint di = 0; di < dk; ++di) {
+        kv += cq[kd + ko * dk + di] * ik * s[di * dv + dj];
+    }
+    float delta = (vt - gh * kv) * bh;
+    float o = 0.0f;
+    for (uint di = 0; di < dk; ++di) {
+        float kf = cq[kd + ko * dk + di] * ik;
+        float qf = cq[ko * dk + di] * iq;
+        float cell = gh * s[di * dv + dj] + kf * delta;
+        s[di * dv + dj] = cell;
+        o += qf * cell;
+    }
+    threadgroup float part[32];
+    float ss = simd_sum(o * o);
+    if (lane == 0) part[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (uint k2 = 0; k2 < (dv + 31u) / 32u; ++k2) tot += part[k2];
+    float inv = rsqrt(tot / (float)dv + eps);
+    float zz = z[h * dv + dj];
+    of[h * dv + dj] = o * inv * gnorm[dj] * (zz / (1.0f + exp(-zz)));
+}
 "#;
 
 struct Ctx {
@@ -213,6 +400,13 @@ struct Ctx {
     q8mm: ComputePipelineState,
     q1: ComputePipelineState,
     flag: ComputePipelineState,
+    rmsn: ComputePipelineState,
+    f16mv: ComputePipelineState,
+    conv: ComputePipelineState,
+    ring: ComputePipelineState,
+    gates: ComputePipelineState,
+    qkn: ComputePipelineState,
+    stateup: ComputePipelineState,
     silu: ComputePipelineState,
     axpy: ComputePipelineState,
     zero: ComputePipelineState,
@@ -281,6 +475,13 @@ fn init() -> Result<Ctx, String> {
     let q8mm = pso("q8_matmat")?;
     let q1 = pso("q1_matvec")?;
     let flag = pso("write_flag")?;
+    let rmsn = pso("rmsnorm_k")?;
+    let f16mv = pso("f32_matvec")?;
+    let conv = pso("gdn_conv")?;
+    let ring = pso("gdn_ring_shift")?;
+    let gates = pso("gdn_gates")?;
+    let qkn = pso("gdn_qk_norms")?;
+    let stateup = pso("gdn_state_update")?;
     let silu = pso("silu_mul_pre")?;
     let axpy = pso("axpy")?;
     let zero = pso("fill_zero")?;
@@ -294,6 +495,13 @@ fn init() -> Result<Ctx, String> {
         q8mm,
         q1,
         flag,
+        rmsn,
+        f16mv,
+        conv,
+        ring,
+        gates,
+        qkn,
+        stateup,
         silu,
         axpy,
         zero,
@@ -621,9 +829,9 @@ fn encode_q1_matvec(
     let rows_u = rows as u32;
     enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
-    let sgs = 8u64;
+    let sgs = 8u64; // × 2 rows per simdgroup
     enc.dispatch_thread_groups(
-        MTLSize::new((rows as u64).div_ceil(sgs), 1, 1),
+        MTLSize::new((rows as u64).div_ceil(sgs * 2), 1, 1),
         MTLSize::new(sgs * 32, 1, 1),
     );
 }
@@ -1029,6 +1237,353 @@ pub fn matvec_batch(
         }
     }
     true
+}
+
+
+/// One GDN layer's worth of tensors/vectors for the whole-block GPU
+/// path. Matvec tensors are (directory idx, rows, cols) of q1 weights.
+pub struct GdnGpuLayer<'a> {
+    pub attn_norm: &'a [f32],
+    pub post_norm: &'a [f32],
+    pub qkv: (usize, usize, usize),
+    pub z: (usize, usize, usize),
+    pub a: (&'a [f32], usize, usize),
+    pub b: (&'a [f32], usize, usize),
+    pub out: (usize, usize, usize),
+    pub gate: (usize, usize, usize),
+    pub up: (usize, usize, usize),
+    pub down: (usize, usize, usize),
+    pub conv1d: &'a [f32],
+    pub a_log: &'a [f32],
+    pub dt_bias: &'a [f32],
+    pub gnorm: &'a [f32],
+}
+
+/// Shared dims of the block (identical across GDN layers of a model).
+#[derive(Clone, Copy)]
+pub struct GdnGpuCfg {
+    pub nv: usize,
+    pub nk: usize,
+    pub dk: usize,
+    pub dv: usize,
+    pub kk: usize,
+    pub hidden: usize,
+    pub inter: usize,
+    pub c_dim: usize,
+    pub eps: f32,
+    /// Gemma-style norms: x̂·(1+w) (qwen3_5 family) vs Qwen x̂·w.
+    pub gemma: bool,
+}
+
+/// A BLOCK of consecutive GDN layers in one command buffer: hidden
+/// state stays device-resident across norm → mixer → conv → recurrence
+/// → out_proj → norm → FFN → residuals of every layer; per-layer
+/// recurrent states round-trip through shared memory (the CPU remains
+/// their owner, so every other path stays coherent for free). One sync
+/// per block instead of ~12 per layer.
+pub fn gdn_block(
+    model: &Arc<CmfModel>,
+    layers: &[GdnGpuLayer],
+    states: &mut [&mut [f32]],
+    cfg: &GdnGpuCfg,
+    h: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if layers.is_empty()
+        || layers.len() != states.len()
+        || cfg.kk < 2
+        || cfg.dv % 32 != 0
+        || cfg.dv > 1024
+        || h.len() != cfg.hidden
+    {
+        return false;
+    }
+    let bytes = model.primary_bytes();
+    let Some((fbuf, safe_len)) = file_buffer(c, bytes) else { return false };
+    let vd = cfg.nv * cfg.dv;
+    let _kd = cfg.nk * cfg.dk;
+    let ring_len = (cfg.kk - 1) * cfg.c_dim;
+    let s_len = cfg.nv * cfg.dk * cfg.dv;
+
+    // Resolve and validate every q1 tensor before encoding anything.
+    let mut abss: Vec<[usize; 6]> = Vec::with_capacity(layers.len());
+    for l in layers {
+        let mut a8 = [0usize; 6];
+        for (slot, t) in [l.qkv, l.z, l.out, l.gate, l.up, l.down].iter().enumerate() {
+            let (idx, rows, cols) = *t;
+            if cols % GROUP_SIZE != 0 || (cols / GROUP_SIZE) % 2 != 0 {
+                return false;
+            }
+            let entry = &model.tensors[idx];
+            let Some(abs) = model.entry_abs_offset(entry) else { return false };
+            if abs + rows * (cols / GROUP_SIZE) * Q1_TILE > safe_len {
+                return false;
+            }
+            a8[slot] = abs;
+        }
+        if l.a.0.len() != l.a.1 * l.a.2 || l.b.0.len() != l.b.1 * l.b.2 {
+            return false;
+        }
+        if states[abss.len()].len() != ring_len + s_len {
+            return false;
+        }
+        abss.push(a8);
+    }
+
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    // Small constant vectors cached by their (stable) data pointer.
+    let vec_buf = |data: &[f32]| -> Buffer {
+        let mut cache = c.rs_bufs.lock().unwrap();
+        cache
+            .entry((data.as_ptr() as usize, usize::MAX - 2))
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device.new_buffer_with_data(
+                    data.as_ptr() as *const std::ffi::c_void,
+                    (data.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            })
+            .clone()
+    };
+
+    let h_b = get_io(20_000_000_003 + cfg.hidden, cfg.hidden * 4);
+    let n_b = get_io(21_000_000_011 + cfg.hidden, cfg.hidden * 4);
+    let qkv_b = get_io(22_000_000_017 + cfg.c_dim, cfg.c_dim * 4);
+    let z_b = get_io(23_000_000_021 + vd, vd * 4);
+    let a_b = get_io(24_000_000_047 + cfg.nv, cfg.nv * 4);
+    let b_b = get_io(25_000_000_071 + cfg.nv, cfg.nv * 4);
+    let cq_b = get_io(26_000_000_081 + cfg.c_dim, cfg.c_dim * 4);
+    let g_b = get_io(27_000_000_093 + cfg.nv, cfg.nv * 4);
+    let bt_b = get_io(28_000_000_129 + cfg.nv, cfg.nv * 4);
+    let iq_b = get_io(29_000_000_131 + cfg.nk, cfg.nk * 4);
+    let ik_b = get_io(30_000_000_133 + cfg.nk, cfg.nk * 4);
+    let of_b = get_io(31_000_000_161 + vd, vd * 4);
+    let d_b = get_io(32_000_000_207 + cfg.hidden, cfg.hidden * 4);
+    let fg_b = get_io(33_000_000_209 + cfg.inter, cfg.inter * 4);
+    let fu_b = get_io(34_000_000_213 + cfg.inter, cfg.inter * 4);
+    let fa_b = get_io(35_000_000_221 + cfg.inter, cfg.inter * 4);
+    let st_bs: Vec<Buffer> = (0..layers.len())
+        .map(|i| get_io(36_000_000_223 + i * 613 + ring_len + s_len, (ring_len + s_len) * 4))
+        .collect();
+
+    // Upload hidden + states (UMA memcpy into shared buffers).
+    unsafe {
+        std::ptr::copy_nonoverlapping(h.as_ptr(), h_b.contents() as *mut f32, cfg.hidden);
+        for (st, sb) in states.iter().zip(&st_bs) {
+            std::ptr::copy_nonoverlapping(st.as_ptr(), sb.contents() as *mut f32, st.len());
+        }
+    }
+
+    let t_up = std::time::Instant::now();
+    let cmd = c.queue.new_command_buffer();
+    let enc_one = |pso: &ComputePipelineState,
+                   bufs: &[(&Buffer, u64)],
+                   words: &[u32],
+                   floats: &[f32],
+                   grid: (u64, u64)| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pso);
+        for (i, (b, off)) in bufs.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(b), *off);
+        }
+        let base = bufs.len() as u64;
+        for (i, w) in words.iter().enumerate() {
+            enc.set_bytes(base + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+        }
+        for (i, f) in floats.iter().enumerate() {
+            enc.set_bytes(
+                base + words.len() as u64 + i as u64,
+                4,
+                f as *const f32 as *const std::ffi::c_void,
+            );
+        }
+        enc.dispatch_threads(MTLSize::new(grid.0, 1, 1), MTLSize::new(grid.1, 1, 1));
+        enc.end_encoding();
+    };
+
+    for (l, (a8, sb)) in layers.iter().zip(abss.iter().zip(&st_bs)) {
+        let s_off = (ring_len * 4) as u64;
+        // 1. attn rmsnorm h → n
+        enc_one(
+            &c.rmsn,
+            &[(&h_b, 0), (&vec_buf(l.attn_norm), 0), (&n_b, 0)],
+            &[cfg.hidden as u32, cfg.gemma as u32],
+            &[cfg.eps],
+            (256, 256),
+        );
+        // 2. mixer: qkv, z, a, b (independent — one encoder)
+        {
+            let enc = cmd.new_compute_command_encoder();
+            encode_q1_matvec(c, enc, &fbuf, a8[0], &n_b, &qkv_b, l.qkv.1, l.qkv.2 / GROUP_SIZE);
+            encode_q1_matvec(c, enc, &fbuf, a8[1], &n_b, &z_b, l.z.1, l.z.2 / GROUP_SIZE);
+            for (t, y) in [(&l.a, &a_b), (&l.b, &b_b)] {
+                let (data, rows, cols) = *t;
+                let wb = vec_buf(data);
+                enc.set_compute_pipeline_state(&c.f16mv);
+                enc.set_buffer(0, Some(&wb), 0);
+                enc.set_buffer(1, Some(&n_b), 0);
+                enc.set_buffer(2, Some(y), 0);
+                let (cu, ru) = (cols as u32, rows as u32);
+                enc.set_bytes(3, 4, &cu as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &ru as *const u32 as *const std::ffi::c_void);
+                let sgs = 8u64;
+                enc.dispatch_thread_groups(
+                    MTLSize::new((rows as u64).div_ceil(sgs), 1, 1),
+                    MTLSize::new(sgs * 32, 1, 1),
+                );
+            }
+            enc.end_encoding();
+        }
+        // 3. conv + silu (reads ring BEFORE the shift)
+        enc_one(
+            &c.conv,
+            &[(&qkv_b, 0), (sb, 0), (&vec_buf(l.conv1d), 0), (&cq_b, 0)],
+            &[cfg.c_dim as u32, cfg.kk as u32],
+            &[],
+            (cfg.c_dim as u64, 256),
+        );
+        // 4. ring shift + gates + qk norms (one encoder, independent)
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.ring);
+            enc.set_buffer(0, Some(sb), 0);
+            enc.set_buffer(1, Some(&qkv_b), 0);
+            let (cd, kk) = (cfg.c_dim as u32, cfg.kk as u32);
+            enc.set_bytes(2, 4, &cd as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(3, 4, &kk as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new(cfg.c_dim as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.set_compute_pipeline_state(&c.gates);
+            enc.set_buffer(0, Some(&a_b), 0);
+            enc.set_buffer(1, Some(&b_b), 0);
+            enc.set_buffer(2, Some(&vec_buf(l.a_log)), 0);
+            enc.set_buffer(3, Some(&vec_buf(l.dt_bias)), 0);
+            enc.set_buffer(4, Some(&g_b), 0);
+            enc.set_buffer(5, Some(&bt_b), 0);
+            let nv = cfg.nv as u32;
+            enc.set_bytes(6, 4, &nv as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new(cfg.nv as u64, 1, 1), MTLSize::new(64, 1, 1));
+            enc.set_compute_pipeline_state(&c.qkn);
+            enc.set_buffer(0, Some(&cq_b), 0);
+            enc.set_buffer(1, Some(&iq_b), 0);
+            enc.set_buffer(2, Some(&ik_b), 0);
+            let (nk, dk) = (cfg.nk as u32, cfg.dk as u32);
+            enc.set_bytes(3, 4, &nk as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &dk as *const u32 as *const std::ffi::c_void);
+            let sgs = 8u64;
+            enc.dispatch_thread_groups(
+                MTLSize::new((cfg.nk as u64).div_ceil(sgs), 1, 1),
+                MTLSize::new(sgs * 32, 1, 1),
+            );
+            enc.end_encoding();
+        }
+        // 5. recurrence + gated norm → of
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.stateup);
+            enc.set_buffer(0, Some(sb), s_off);
+            enc.set_buffer(1, Some(&cq_b), 0);
+            enc.set_buffer(2, Some(&z_b), 0);
+            enc.set_buffer(3, Some(&g_b), 0);
+            enc.set_buffer(4, Some(&bt_b), 0);
+            enc.set_buffer(5, Some(&iq_b), 0);
+            enc.set_buffer(6, Some(&ik_b), 0);
+            enc.set_buffer(7, Some(&vec_buf(l.gnorm)), 0);
+            enc.set_buffer(8, Some(&of_b), 0);
+            let w4 = [cfg.nv as u32, cfg.nk as u32, cfg.dk as u32, cfg.dv as u32];
+            for (i, w) in w4.iter().enumerate() {
+                enc.set_bytes(9 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+            }
+            enc.set_bytes(13, 4, &cfg.eps as *const f32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(cfg.nv as u64, 1, 1),
+                MTLSize::new(cfg.dv as u64, 1, 1),
+            );
+            enc.end_encoding();
+        }
+        // 6. out_proj of → d;  7. h += d
+        {
+            let enc = cmd.new_compute_command_encoder();
+            encode_q1_matvec(c, enc, &fbuf, a8[2], &of_b, &d_b, l.out.1, l.out.2 / GROUP_SIZE);
+            enc.end_encoding();
+        }
+        enc_axpy(c, cmd, &d_b, &h_b, 1.0, cfg.hidden);
+        // 8. ffn rmsnorm h → n
+        enc_one(
+            &c.rmsn,
+            &[(&h_b, 0), (&vec_buf(l.post_norm), 0), (&n_b, 0)],
+            &[cfg.hidden as u32, cfg.gemma as u32],
+            &[cfg.eps],
+            (256, 256),
+        );
+        // 9. gate/up;  10. silu·mul;  11. down;  12. h += d
+        {
+            let enc = cmd.new_compute_command_encoder();
+            encode_q1_matvec(c, enc, &fbuf, a8[3], &n_b, &fg_b, l.gate.1, l.gate.2 / GROUP_SIZE);
+            encode_q1_matvec(c, enc, &fbuf, a8[4], &n_b, &fu_b, l.up.1, l.up.2 / GROUP_SIZE);
+            enc.end_encoding();
+        }
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.silu);
+            enc.set_buffer(0, Some(&fg_b), 0);
+            enc.set_buffer(1, Some(&fu_b), 0);
+            enc.set_buffer(2, Some(&fg_b), 0); // dummy col (has_col = 0)
+            enc.set_buffer(3, Some(&fa_b), 0);
+            let (n_u, hc) = (cfg.inter as u32, 0u32);
+            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new(cfg.inter as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.end_encoding();
+        }
+        {
+            let enc = cmd.new_compute_command_encoder();
+            encode_q1_matvec(c, enc, &fbuf, a8[5], &fa_b, &d_b, l.down.1, l.down.2 / GROUP_SIZE);
+            enc.end_encoding();
+        }
+        enc_axpy(c, cmd, &d_b, &h_b, 1.0, cfg.hidden);
+    }
+
+    let t_enc = t_up.elapsed();
+    submit_and_wait(c, cmd, &[&h_b]);
+    let t_gpu = t_up.elapsed();
+    unsafe {
+        std::ptr::copy_nonoverlapping(h_b.contents() as *const f32, h.as_mut_ptr(), cfg.hidden);
+        for (st, sb) in states.iter_mut().zip(&st_bs) {
+            std::ptr::copy_nonoverlapping(sb.contents() as *const f32, st.as_mut_ptr(), st.len());
+        }
+    }
+    tracing::debug!(
+        "gdn_block {} layers: encode {:.2} ms, +gpu {:.2} ms, +readback {:.2} ms",
+        layers.len(),
+        t_enc.as_secs_f64() * 1e3,
+        t_gpu.as_secs_f64() * 1e3,
+        t_up.elapsed().as_secs_f64() * 1e3
+    );
+    true
+}
+
+/// `y += w·d` as its own encoder.
+fn enc_axpy(c: &Ctx, cmd: &metal::CommandBufferRef, d: &Buffer, y: &Buffer, w: f32, n: usize) {
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.axpy);
+    enc.set_buffer(0, Some(d), 0);
+    enc.set_buffer(1, Some(y), 0);
+    let n_u = n as u32;
+    enc.set_bytes(2, 4, &w as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
+    enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
+    enc.end_encoding();
 }
 
 #[cfg(test)]

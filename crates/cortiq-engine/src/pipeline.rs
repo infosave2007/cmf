@@ -282,6 +282,103 @@ pub type TokenCallback = Box<dyn FnMut(&str) -> bool + Send>;
 impl Pipeline {
     /// Build a pipeline from parts (used by the loader and tests).
     #[allow(clippy::too_many_arguments)]
+
+    /// Whole-block GDN on the GPU (macOS/Metal, q1 models): run the run
+    /// of consecutive GatedDeltaNet layers starting at `start` in ONE
+    /// command buffer — hidden device-resident, one sync per block. The
+    /// recurrent states round-trip through shared memory, so the CPU
+    /// stays their owner and every other path remains coherent.
+    /// Returns the first layer index NOT covered (== `start` → refused,
+    /// caller falls through to the per-layer CPU path).
+    #[cfg(target_os = "macos")]
+    fn gdn_block_gpu(&mut self, start: usize, upto: Option<usize>, h: &mut [f32]) -> usize {
+        use crate::gpu::{GdnGpuCfg, GdnGpuLayer};
+        if !crate::gpu::enabled_here()
+            || std::env::var("CMF_GPU_BLOCK").map(|v| v == "0").unwrap_or(false)
+        {
+            return start;
+        }
+        let Some(cfg) = self.gdn_cfg else { return start };
+        let limit = upto.map(|u| u + 1).unwrap_or(self.num_layers).min(self.num_layers);
+        let mut layers: Vec<GdnGpuLayer> = Vec::new();
+        let mut model_ref: Option<std::sync::Arc<cortiq_core::CmfModel>> = None;
+        let mut inter = 0usize;
+        let mut end = start;
+        while end < limit {
+            let lw = &self.weights.layers[end];
+            let AttnKind::LinearGdn(w) = &lw.attn else { break };
+            let FfnKind::Dense(d) = &lw.ffn else { break };
+            let parts = (
+                w.in_proj_qkv.q1_parts(),
+                w.in_proj_z.q1_parts(),
+                w.in_proj_a.f32_parts(),
+                w.in_proj_b.f32_parts(),
+                w.out_proj.q1_parts(),
+                d.gate_proj.q1_parts(),
+                d.up_proj.q1_parts(),
+                d.down_proj.q1_parts(),
+            );
+            let (Some(qkv), Some(z), Some(a), Some(b), Some(out), Some(g), Some(u), Some(dn)) =
+                parts
+            else {
+                break;
+            };
+            if let QTensor::Mapped { model, .. } = &w.in_proj_qkv {
+                model_ref.get_or_insert_with(|| model.clone());
+            }
+            inter = g.1;
+            layers.push(GdnGpuLayer {
+                attn_norm: &lw.input_norm,
+                post_norm: &lw.post_norm,
+                qkv,
+                z,
+                a,
+                b,
+                out,
+                gate: g,
+                up: u,
+                down: dn,
+                conv1d: &w.conv1d,
+                a_log: &w.a_log,
+                dt_bias: &w.dt_bias,
+                gnorm: &w.norm,
+            });
+            end += 1;
+        }
+        if layers.is_empty() {
+            return start;
+        }
+        let Some(model) = model_ref else { return start };
+        let gcfg = GdnGpuCfg {
+            nv: cfg.num_v_heads,
+            nk: cfg.num_k_heads,
+            dk: cfg.key_head_dim,
+            dv: cfg.value_head_dim,
+            kk: cfg.conv_kernel,
+            hidden: self.hidden_size,
+            inter,
+            c_dim: cfg.conv_dim(),
+            eps: cfg.rms_eps as f32,
+            gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
+        };
+        // States: lazily sized like the CPU core, then mutably split.
+        let want = cfg.state_len();
+        for l in &mut self.kv_cache.layers[start..end] {
+            if l.linear_state.len() != want {
+                l.linear_state = vec![0f32; want];
+            }
+        }
+        let mut states: Vec<&mut [f32]> = self.kv_cache.layers[start..end]
+            .iter_mut()
+            .map(|l| l.linear_state.as_mut_slice())
+            .collect();
+        if crate::gpu::gdn_block(&model, &layers, &mut states, &gcfg, h) {
+            end
+        } else {
+            start
+        }
+    }
+
     pub fn new(
         tokenizer: Tokenizer,
         weights: PipelineWeights,
@@ -1448,6 +1545,8 @@ impl Pipeline {
         let inv_freq = self.inv_freq.clone();
         let pool = self.pool.clone();
 
+        #[cfg(target_os = "macos")]
+        let mut gdn_skip_until = 0usize;
         for li in 0..self.num_layers {
             crate::gpu::set_layer(li as i64); // layer-split GPU/CPU (CMF_GPU_LAYERS)
             if let Some(u) = upto {
@@ -1458,6 +1557,21 @@ impl Pipeline {
             if let Some(mask) = task_mask {
                 if !mask.layer_alive(li) {
                     continue; // dead layer: residual pass-through
+                }
+            }
+            // Whole-block GDN on the GPU: a run of consecutive q1 GDN
+            // layers executes in one command buffer (macOS/Metal).
+            #[cfg(target_os = "macos")]
+            {
+                if li < gdn_skip_until {
+                    continue;
+                }
+                if task_mask.is_none() {
+                    let end = self.gdn_block_gpu(li, upto, &mut h);
+                    if end > li {
+                        gdn_skip_until = end;
+                        continue;
+                    }
                 }
             }
 

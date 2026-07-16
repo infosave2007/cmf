@@ -464,6 +464,25 @@ pub fn q1_matvec(
     }
 }
 
+/// Whole-block GDN types re-exported from the Metal backend.
+#[cfg(target_os = "macos")]
+pub use crate::gpu_metal::{GdnGpuCfg, GdnGpuLayer};
+
+/// A BLOCK of consecutive q1 GDN layers in one submission (Metal only).
+#[cfg(target_os = "macos")]
+pub fn gdn_block(
+    model: &Arc<CmfModel>,
+    layers: &[GdnGpuLayer],
+    states: &mut [&mut [f32]],
+    cfg: &GdnGpuCfg,
+    h: &mut [f32],
+) -> bool {
+    match backend() {
+        Backend::Metal => crate::gpu_metal::gdn_block(model, layers, states, cfg, h),
+        _ => false,
+    }
+}
+
 /// A layer's MoE-FFN in one submission (amortizing the dispatch cost).
 #[allow(unused_variables)]
 pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> bool {

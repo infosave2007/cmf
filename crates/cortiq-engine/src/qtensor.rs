@@ -255,6 +255,26 @@ impl QTensor {
         matches!(self, Self::Mapped { dtype: TensorDtype::Q1, .. })
     }
 
+    /// Owned-f32 view (data, rows, cols) — the GDN a/b gate projections
+    /// arrive dequantized (force-f16 in the converter → F32 in RAM).
+    pub(crate) fn f32_parts(&self) -> Option<(&[f32], usize, usize)> {
+        match self {
+            Self::F32 { data, rows, cols } => Some((data, *rows, *cols)),
+            _ => None,
+        }
+    }
+
+    /// (directory idx, rows, cols) of a q1-mapped tensor — the
+    /// whole-block GPU path resolves offsets itself.
+    pub(crate) fn q1_parts(&self) -> Option<(usize, usize, usize)> {
+        match self {
+            Self::Mapped { idx, dtype: TensorDtype::Q1, rows, cols, .. } => {
+                Some((*idx, *rows, *cols))
+            }
+            _ => None,
+        }
+    }
+
     pub fn rows(&self) -> usize {
         match self {
             Self::F32 { rows, .. } | Self::Mapped { rows, .. } => *rows,
