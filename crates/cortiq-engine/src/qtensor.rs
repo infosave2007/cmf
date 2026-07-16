@@ -2014,8 +2014,11 @@ fn dot_q1_row_i8(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
 }
 
 /// SDOT q1 row: each tile's 4 sign bytes unpack to 32 ±1 lanes in
-/// registers (vtst against per-lane bit masks, (mask&2)−1), then the
-/// same per-tile sdot × f16 scale shape as `dot_q4t_row_sdot`.
+/// registers (vtst against per-lane bit masks, (mask&2)−1). Four tiles
+/// (128 weights) per iteration: their integer dots reduce through a
+/// vpaddq tree into ONE i32x4 and meet their four scales in a single
+/// fused f32 multiply-add — the naive per-tile shape spent more time in
+/// `vaddvq` + software f16 + scalar FMA serialization than in the dots.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon,dotprod")]
 unsafe fn dot_q1_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
@@ -2028,27 +2031,57 @@ unsafe fn dot_q1_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 
         let m = vld1q_u8(MASKS.as_ptr());
         let two = vdupq_n_u8(2);
         let one = vdupq_n_s8(1);
-        let mut acc = 0f32;
-        for gi in 0..gpr {
-            let t = bytes.as_ptr().add((r * gpr + gi) * Q1_TILE);
+        // One tile's integer dot as an UNREDUCED i32x4 (two sdots).
+        macro_rules! tile_dot {
+            ($t:expr, $x:expr) => {{
+                let v0 = vcombine_u8(vdup_n_u8(*$t.add(2)), vdup_n_u8(*$t.add(3)));
+                let v1 = vcombine_u8(vdup_n_u8(*$t.add(4)), vdup_n_u8(*$t.add(5)));
+                let w0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vtstq_u8(v0, m), two)), one);
+                let w1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vtstq_u8(v1, m), two)), one);
+                let x0 = vld1q_s8($x);
+                let x1 = vld1q_s8($x.add(16));
+                let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+                asm!(
+                    "sdot {a0:v}.4s, {w0:v}.16b, {x0:v}.16b",
+                    "sdot {a1:v}.4s, {w1:v}.16b, {x1:v}.16b",
+                    a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                    w0 = in(vreg) w0, x0 = in(vreg) x0, w1 = in(vreg) w1, x1 = in(vreg) x1,
+                    options(pure, nomem, nostack),
+                );
+                vaddq_s32(a0, a1)
+            }};
+        }
+        let base = bytes.as_ptr().add(r * gpr * Q1_TILE);
+        let xp = xq.as_ptr();
+        let mut accv = vdupq_n_f32(0.0);
+        let mut gi = 0;
+        while gi + 4 <= gpr {
+            let t0 = base.add(gi * Q1_TILE);
+            let t1 = base.add((gi + 1) * Q1_TILE);
+            let t2 = base.add((gi + 2) * Q1_TILE);
+            let t3 = base.add((gi + 3) * Q1_TILE);
+            let d0 = tile_dot!(t0, xp.add(gi * GROUP_SIZE));
+            let d1 = tile_dot!(t1, xp.add((gi + 1) * GROUP_SIZE));
+            let d2 = tile_dot!(t2, xp.add((gi + 2) * GROUP_SIZE));
+            let d3 = tile_dot!(t3, xp.add((gi + 3) * GROUP_SIZE));
+            // [Σd0, Σd1, Σd2, Σd3] without any horizontal-to-scalar hop.
+            let sums = vpaddq_s32(vpaddq_s32(d0, d1), vpaddq_s32(d2, d3));
+            let sc = [
+                f16_to_f32(u16::from_le_bytes([*t0, *t0.add(1)])),
+                f16_to_f32(u16::from_le_bytes([*t1, *t1.add(1)])),
+                f16_to_f32(u16::from_le_bytes([*t2, *t2.add(1)])),
+                f16_to_f32(u16::from_le_bytes([*t3, *t3.add(1)])),
+            ];
+            accv = vfmaq_f32(accv, vcvtq_f32_s32(sums), vld1q_f32(sc.as_ptr()));
+            gi += 4;
+        }
+        let mut acc = vaddvq_f32(accv);
+        while gi < gpr {
+            let t = base.add(gi * Q1_TILE);
             let s = f16_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
-            // sign bytes b0..b3 → lane blocks [b0×8, b1×8] and [b2×8, b3×8]
-            let v0 = vcombine_u8(vdup_n_u8(*t.add(2)), vdup_n_u8(*t.add(3)));
-            let v1 = vcombine_u8(vdup_n_u8(*t.add(4)), vdup_n_u8(*t.add(5)));
-            // bit set → 0xFF (vtst); ±1 = (0xFF & 2) − 1 / (0 & 2) − 1
-            let w0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vtstq_u8(v0, m), two)), one);
-            let w1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vtstq_u8(v1, m), two)), one);
-            let x0 = vld1q_s8(xq.as_ptr().add(gi * GROUP_SIZE));
-            let x1 = vld1q_s8(xq.as_ptr().add(gi * GROUP_SIZE + 16));
-            let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
-            asm!(
-                "sdot {a0:v}.4s, {w0:v}.16b, {x0:v}.16b",
-                "sdot {a1:v}.4s, {w1:v}.16b, {x1:v}.16b",
-                a0 = inout(vreg) a0, a1 = inout(vreg) a1,
-                w0 = in(vreg) w0, x0 = in(vreg) x0, w1 = in(vreg) w1, x1 = in(vreg) x1,
-                options(pure, nomem, nostack),
-            );
-            acc += vaddvq_s32(vaddq_s32(a0, a1)) as f32 * s;
+            let d = tile_dot!(t, xp.add(gi * GROUP_SIZE));
+            acc += vaddvq_s32(d) as f32 * s;
+            gi += 1;
         }
         acc
     }

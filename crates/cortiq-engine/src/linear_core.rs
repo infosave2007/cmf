@@ -20,7 +20,7 @@
 //! Both cores implement the same contract: `*_forward` (one position,
 //! advances the state) and `*_pair` (fused two positions; lane 1
 //! commits, lane 2 is tentative in `scratch` for speculative verify).
-//! State lives in the layer's `linear_state: Vec<f64>` and is resized
+//! State lives in the layer's `linear_state: Vec<f32>` and is resized
 //! lazily by the core itself.
 
 use crate::pool::Pool;
@@ -71,7 +71,8 @@ impl VmfPhaseCfg {
 }
 
 /// One recurrent step for one head-set given projected phases/values.
-/// `state` is S[nh][p2, dv] in f64 (condensate persists across tokens).
+/// `state` is S[nh][p2, dv] stored f32 (per-element math in f64 — the
+/// storage halves, each step's arithmetic keeps the old precision).
 fn phase_step(
     thq: &[f32],
     thk: &[f32],
@@ -79,7 +80,7 @@ fn phase_step(
     decay: &[f64],
     kap: Option<&[f32]>,
     cfg: &VmfPhaseCfg,
-    state: &mut [f64],
+    state: &mut [f32],
     out: &mut [f32],
 ) {
     let (nh, nph, dv) = (cfg.num_heads, cfg.nphase, cfg.value_head_dim);
@@ -109,8 +110,10 @@ fn phase_step(
             let row = &mut s[f * dv..(f + 1) * dv];
             let dcf = dec[f];
             for d in 0..dv {
-                row[d] = dcf * row[d] + fkw * vt[d] as f64; // S = decay·S + κ·φk⊗v
-                ot[d] += (fq * row[d]) as f32; // o = Σ φq·S
+                // S = decay·S + κ·φk⊗v (f64 math, f32 cell)
+                let cell = dcf * row[d] as f64 + fkw * vt[d] as f64;
+                row[d] = cell as f32;
+                ot[d] += (fq * cell) as f32; // o = Σ φq·S
             }
         }
     }
@@ -133,11 +136,11 @@ pub fn vmf_phase_forward(
     x: &[f32],
     w: &VmfPhaseWeights,
     cfg: &VmfPhaseCfg,
-    state: &mut Vec<f64>,
+    state: &mut Vec<f32>,
     pool: Option<&Pool>,
 ) -> Vec<f32> {
     if state.len() != cfg.state_len() {
-        *state = vec![0f64; cfg.state_len()];
+        *state = vec![0f32; cfg.state_len()];
     }
     let (nh, nph, dv) = (cfg.num_heads, cfg.nphase, cfg.value_head_dim);
 
@@ -167,12 +170,12 @@ pub fn vmf_phase_pair(
     x2: &[f32],
     w: &VmfPhaseWeights,
     cfg: &VmfPhaseCfg,
-    state: &mut Vec<f64>,
-    scratch: &mut Vec<f64>,
+    state: &mut Vec<f32>,
+    scratch: &mut Vec<f32>,
     pool: Option<&Pool>,
 ) -> (Vec<f32>, Vec<f32>) {
     if state.len() != cfg.state_len() {
-        *state = vec![0f64; cfg.state_len()];
+        *state = vec![0f32; cfg.state_len()];
     }
     let (nh, nph, dv) = (cfg.num_heads, cfg.nphase, cfg.value_head_dim);
 
@@ -269,11 +272,37 @@ fn silu(x: f64) -> f64 {
     x / (1.0 + (-x).exp())
 }
 
+/// `*mut f32` that may cross worker threads; safety comes from the
+/// disjoint (head, element) ranges each worker writes.
+#[derive(Clone, Copy)]
+struct SendMutF32(*mut f32);
+unsafe impl Send for SendMutF32 {}
+unsafe impl Sync for SendMutF32 {}
+
 /// One recurrent step given the raw (pre-conv) projections of this
 /// position. Advances the packed state (conv ring + S) and writes the
 /// gated per-head output into `of` [nv·dv].
+///
+/// The condensate math runs in f32 (the vendor operator's own dtype —
+/// `mamba_ssm_dtype: float32` in the source configs; the old f64 was
+/// over-precision at 4× the traffic and no SIMD). The two S passes are
+/// element-wise in `dj` with no cross-lane reduction, so LLVM
+/// auto-vectorizes them (fmla on NEON, FMA on AVX2). Heads are
+/// independent given the conv output and run across the pool — on a
+/// Qwen3.5-27B this loop is 48 heads × 128×128 × 48 layers per token,
+/// the single biggest serial block in the hybrid's decode.
 #[allow(clippy::too_many_arguments)]
-fn gdn_step(qkv: &[f32], z: &[f32], a: &[f32], b: &[f32], w: &GdnWeights, cfg: &GdnCfg, state: &mut [f64], of: &mut [f32]) {
+fn gdn_step(
+    qkv: &[f32],
+    z: &[f32],
+    a: &[f32],
+    b: &[f32],
+    w: &GdnWeights,
+    cfg: &GdnCfg,
+    state: &mut [f32],
+    of: &mut [f32],
+    pool: Option<&Pool>,
+) {
     let (nv, nk, dk, dv, kk) = (
         cfg.num_v_heads,
         cfg.num_k_heads,
@@ -287,68 +316,112 @@ fn gdn_step(qkv: &[f32], z: &[f32], a: &[f32], b: &[f32], w: &GdnWeights, cfg: &
 
     // Depthwise causal conv over [ring…, current] + SiLU. Taps are
     // ordered oldest→newest; tap kk−1 multiplies the current position.
-    let mut cq = vec![0f64; c_dim];
+    // (Tiny: c_dim × kk — f64 accumulation kept.)
+    let mut cq = vec![0f32; c_dim];
     for c in 0..c_dim {
         let taps = &w.conv1d[c * kk..(c + 1) * kk];
         let mut acc = qkv[c] as f64 * taps[kk - 1] as f64;
         for j in 0..kk - 1 {
-            acc += ring[j * c_dim + c] * taps[j] as f64;
+            acc += ring[j * c_dim + c] as f64 * taps[j] as f64;
         }
-        cq[c] = silu(acc);
+        cq[c] = silu(acc) as f32;
     }
     // Ring shift: drop the oldest position, append the raw current one.
     if kk > 1 {
         ring.copy_within(c_dim.., 0);
         let tail = (kk - 2) * c_dim;
-        for c in 0..c_dim {
-            ring[tail + c] = qkv[c] as f64;
-        }
+        ring[tail..tail + c_dim].copy_from_slice(&qkv[..c_dim]);
     }
 
-    for h in 0..nv {
-        let ko = h / rep; // source q/k head (GQA)
-        let (qs, ks) = (ko * dk, kd + ko * dk);
-        // l2-normalize q and k; q additionally scaled by 1/√dk.
-        let (mut nq, mut nkn) = (0f64, 0f64);
-        for d in 0..dk {
-            nq += cq[qs + d] * cq[qs + d];
-            nkn += cq[ks + d] * cq[ks + d];
-        }
-        let invq = 1.0 / ((nq + 1e-6).sqrt() * (dk as f64).sqrt());
-        let invk = 1.0 / (nkn + 1e-6).sqrt();
+    let cq = &cq;
+    let s_ptr = SendMutF32(s_all.as_mut_ptr());
+    let of_ptr = SendMutF32(of.as_mut_ptr());
+    let head_range = |h0: usize, h1: usize| {
+        // Rebind the Sync wrappers whole — edition-2021 disjoint capture
+        // would otherwise grab the raw `.0` fields and lose Send/Sync.
+        let (s_ptr, of_ptr) = (s_ptr, of_ptr);
+        // Per-worker scratch, recycled across calls (thread-local freelists).
+        let mut kv = crate::attention::take_buf(dv);
+        let mut delta = crate::attention::take_buf(dv);
+        let mut o = crate::attention::take_buf(dv);
+        let mut kf = crate::attention::take_buf(dk);
+        let mut qf = crate::attention::take_buf(dk);
+        for h in h0..h1 {
+            let ko = h / rep; // source q/k head (GQA)
+            let (qs, ks) = (ko * dk, kd + ko * dk);
+            // l2-normalize q and k; q additionally scaled by 1/√dk.
+            let (mut nq, mut nkn) = (0f64, 0f64);
+            for d in 0..dk {
+                nq += (cq[qs + d] as f64) * (cq[qs + d] as f64);
+                nkn += (cq[ks + d] as f64) * (cq[ks + d] as f64);
+            }
+            let invq = (1.0 / ((nq + 1e-6).sqrt() * (dk as f64).sqrt())) as f32;
+            let invk = (1.0 / (nkn + 1e-6).sqrt()) as f32;
+            for d in 0..dk {
+                qf[d] = cq[qs + d] * invq;
+                kf[d] = cq[ks + d] * invk;
+            }
 
-        let g = (-(w.a_log[h] as f64).exp() * softplus(a[h] as f64 + w.dt_bias[h] as f64)).exp();
-        let beta = sigmoid(b[h] as f64);
+            let g = (-(w.a_log[h] as f64).exp()
+                * softplus(a[h] as f64 + w.dt_bias[h] as f64))
+            .exp() as f32;
+            let beta = sigmoid(b[h] as f64) as f32;
 
-        let s = &mut s_all[h * dk * dv..(h + 1) * dk * dv];
-        let vt = &cq[2 * kd + h * dv..2 * kd + (h + 1) * dv];
-        // S ← g·S;  kv = kᵀS;  S += k ⊗ β(v − kv);  o = qᵀS
-        let mut kv = vec![0f64; dv];
-        for di in 0..dk {
-            let kf = cq[ks + di] * invk;
-            let row = &mut s[di * dv..(di + 1) * dv];
+            // SAFETY: disjoint per-head S and output slices per worker.
+            let s = unsafe { std::slice::from_raw_parts_mut(s_ptr.0.add(h * dk * dv), dk * dv) };
+            let oh =
+                unsafe { std::slice::from_raw_parts_mut(of_ptr.0.add(h * dv), dv) };
+            let vt = &cq[2 * kd + h * dv..2 * kd + (h + 1) * dv];
+
+            // S ← g·S;  kv = kᵀS;  S += k ⊗ β(v − kv);  o = qᵀS —
+            // algebraically regrouped so S is READ twice and WRITTEN
+            // once: kv over S_old (then ×g), one fused update+query pass.
+            kv[..dv].fill(0.0);
+            for di in 0..dk {
+                let kfd = kf[di];
+                let row = &s[di * dv..(di + 1) * dv];
+                for dj in 0..dv {
+                    kv[dj] += row[dj] * kfd; // elementwise in dj → SIMD
+                }
+            }
             for dj in 0..dv {
-                row[dj] *= g;
-                kv[dj] += row[dj] * kf;
+                delta[dj] = (vt[dj] - g * kv[dj]) * beta;
+            }
+            o[..dv].fill(0.0);
+            for di in 0..dk {
+                let kfd = kf[di];
+                let qfd = qf[di];
+                let row = &mut s[di * dv..(di + 1) * dv];
+                for dj in 0..dv {
+                    let cell = g * row[dj] + kfd * delta[dj];
+                    row[dj] = cell;
+                    o[dj] += qfd * cell; // elementwise in dj → SIMD
+                }
+            }
+            // Gated RMSNorm per head: x̂·w·silu(z) (oracle-validated form).
+            let ss: f64 = o[..dv].iter().map(|&v| (v as f64) * (v as f64)).sum();
+            let inv = 1.0 / (ss / dv as f64 + cfg.rms_eps).sqrt();
+            for dj in 0..dv {
+                oh[dj] =
+                    ((o[dj] as f64 * inv) * w.norm[dj] as f64 * silu(z[h * dv + dj] as f64)) as f32;
             }
         }
-        let mut o = vec![0f64; dv];
-        for di in 0..dk {
-            let kf = cq[ks + di] * invk;
-            let qf = cq[qs + di] * invq;
-            let row = &mut s[di * dv..(di + 1) * dv];
-            for dj in 0..dv {
-                row[dj] += kf * (vt[dj] - kv[dj]) * beta;
-                o[dj] += qf * row[dj];
+        crate::attention::recycle_buf(&mut kv);
+        crate::attention::recycle_buf(&mut delta);
+        crate::attention::recycle_buf(&mut o);
+        crate::attention::recycle_buf(&mut kf);
+        crate::attention::recycle_buf(&mut qf);
+    };
+    match pool {
+        Some(pool) if nv >= 4 => pool.run(&|widx, n| {
+            let chunk = nv.div_ceil(n);
+            let h0 = (widx * chunk).min(nv);
+            let h1 = (h0 + chunk).min(nv);
+            if h0 < h1 {
+                head_range(h0, h1);
             }
-        }
-        // Gated RMSNorm per head: x̂·w·silu(z) (oracle-validated form).
-        let ss: f64 = o.iter().map(|v| v * v).sum();
-        let inv = 1.0 / (ss / dv as f64 + cfg.rms_eps).sqrt();
-        for dj in 0..dv {
-            of[h * dv + dj] =
-                ((o[dj] * inv) * w.norm[dj] as f64 * silu(z[h * dv + dj] as f64)) as f32;
-        }
+        }),
+        _ => head_range(0, nv),
     }
 }
 
@@ -357,11 +430,11 @@ pub fn gdn_forward(
     x: &[f32],
     w: &GdnWeights,
     cfg: &GdnCfg,
-    state: &mut Vec<f64>,
+    state: &mut Vec<f32>,
     pool: Option<&Pool>,
 ) -> Vec<f32> {
     if state.len() != cfg.state_len() {
-        *state = vec![0f64; cfg.state_len()];
+        *state = vec![0f32; cfg.state_len()];
     }
     let (c_dim, vd) = (cfg.conv_dim(), cfg.num_v_heads * cfg.value_head_dim);
 
@@ -380,7 +453,7 @@ pub fn gdn_forward(
     w.in_proj_b.matvec(x, &mut b, pool);
 
     let mut of = vec![0.0f32; vd];
-    gdn_step(&qkv, &z, &a, &b, w, cfg, state, &mut of);
+    gdn_step(&qkv, &z, &a, &b, w, cfg, state, &mut of, pool);
 
     let mut out = vec![0.0f32; cfg.hidden_size];
     w.out_proj.matvec(&of, &mut out, pool);
@@ -396,11 +469,11 @@ pub fn gdn_forward_batch(
     b: usize,
     w: &GdnWeights,
     cfg: &GdnCfg,
-    state: &mut Vec<f64>,
+    state: &mut Vec<f32>,
     pool: Option<&Pool>,
 ) -> Vec<f32> {
     if state.len() != cfg.state_len() {
-        *state = vec![0f64; cfg.state_len()];
+        *state = vec![0f32; cfg.state_len()];
     }
     let (c_dim, vd) = (cfg.conv_dim(), cfg.num_v_heads * cfg.value_head_dim);
     let nv = cfg.num_v_heads;
@@ -425,6 +498,7 @@ pub fn gdn_forward_batch(
             cfg,
             state,
             &mut of[bi * vd..(bi + 1) * vd],
+            pool,
         );
     }
     let mut out = vec![0.0f32; b * cfg.hidden_size];
@@ -487,12 +561,12 @@ pub fn gdn_pair(
     x2: &[f32],
     w: &GdnWeights,
     cfg: &GdnCfg,
-    state: &mut Vec<f64>,
-    scratch: &mut Vec<f64>,
+    state: &mut Vec<f32>,
+    scratch: &mut Vec<f32>,
     pool: Option<&Pool>,
 ) -> (Vec<f32>, Vec<f32>) {
     if state.len() != cfg.state_len() {
-        *state = vec![0f64; cfg.state_len()];
+        *state = vec![0f32; cfg.state_len()];
     }
     let (c_dim, vd, nv) = (
         cfg.conv_dim(),
@@ -514,12 +588,12 @@ pub fn gdn_pair(
     w.in_proj_b.matvec2(x1, x2, &mut b1, &mut b2, pool);
 
     let mut of1 = vec![0.0f32; vd];
-    gdn_step(&qkv1, &z1, &a1, &b1, w, cfg, state, &mut of1);
+    gdn_step(&qkv1, &z1, &a1, &b1, w, cfg, state, &mut of1, pool);
 
     scratch.clear();
     scratch.extend_from_slice(state);
     let mut of2 = vec![0.0f32; vd];
-    gdn_step(&qkv2, &z2, &a2, &b2, w, cfg, scratch, &mut of2);
+    gdn_step(&qkv2, &z2, &a2, &b2, w, cfg, scratch, &mut of2, pool);
 
     let mut out1 = vec![0.0f32; cfg.hidden_size];
     let mut out2 = vec![0.0f32; cfg.hidden_size];

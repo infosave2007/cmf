@@ -97,9 +97,9 @@ pub struct LayerKvCache {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     /// Linear-core condensate S (vmf_phase), f64; empty on full layers.
-    pub linear_state: Vec<f64>,
+    pub linear_state: Vec<f32>,
     /// Tentative lane-2 state during speculative verify.
-    pub linear_scratch: Vec<f64>,
+    pub linear_scratch: Vec<f32>,
     /// O(1) Nyström override (None = plain cache attention).
     pub o1: Option<O1State>,
 }
@@ -681,7 +681,7 @@ impl LayerKvCache {
             // O(1) recurrent state of linear-core layers (vmf_phase/GDN):
             // constant in context, but real memory — the honest "KV+state"
             // line must count it (a pure-linear model reported 0 before).
-            + self.linear_state.len() * std::mem::size_of::<f64>()
+            + self.linear_state.len() * std::mem::size_of::<f32>()
             // O(1) Nyström state (window + sinks + skeleton) — same
             // discipline: constant in context, but real memory.
             + self.o1_memory_bytes()
