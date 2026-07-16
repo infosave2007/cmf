@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-07-16
+
+1-bit models get a real GPU: Bonsai-27B (q1) decode on an Apple M4 goes
+from 2.2 to 5.0–5.8 tok/s.
+
+### Added
+
+- **q1 on the native Metal backend**: a two-rows-per-simdgroup matvec
+  kernel over the 6-byte tiles (aligned u32 pair loads, activations hot
+  in L1), q1 trios in the FFN chain, q1 jobs in the batched matvec
+  (QKV / GDN mixers), and a single-matvec route for out_proj/lm_head —
+  all no-copy over the mmap (UMA), GPU math in plain f32 (no A8
+  activation quantization at all). wgpu refuses q1 jobs honestly until
+  its WGSL kernel lands.
+- **Whole-block GDN graph**: a run of consecutive GatedDeltaNet layers
+  executes in ONE command buffer — rmsnorm (Qwen/Gemma), mixer, causal
+  conv + silu, decay/β gates, per-head l2 norms, the delta-rule
+  recurrence with gated RMSNorm, out_proj, residuals and the FFN chain —
+  hidden state device-resident across the block, one sync per block of
+  ~3 layers instead of ~12 per layer. Recurrent states round-trip
+  through shared memory, so the CPU stays their owner and prefill / MTP /
+  probe paths remain coherent by construction. Anything ineligible
+  falls through to the per-layer path unchanged; `CMF_GPU_BLOCK=0`
+  opts out.
+- q1 ops skip the runtime probe on native Metal (`gpu::q1_force`): the
+  CPU q1 kernel is load-port-bound and probe alternation itself cooled
+  the device between samples. Other dtypes and backends keep probing.
+
+### Measured, for the record
+
+- A synchronous Metal command-buffer round trip costs ~1.3 ms while
+  back-to-back submits pipeline at 0.022 ms — the wall is completion
+  latency, which is why the block graph (fewer submissions) is the
+  design, not faster waits. A shared-buffer "fast flag" completion
+  trick was tried and reverted: flag visibility does not order other
+  buffers' write-backs (parity tests passed, real decode corrupted).
+
 ## [0.3.2] — 2026-07-16
 
 The 1-bit release: a 27B in 4.8 GB on a 24 GB MacBook.
