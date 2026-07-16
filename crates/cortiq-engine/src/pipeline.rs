@@ -293,6 +293,28 @@ impl Pipeline {
     /// every other path remains coherent). Returns the first layer
     /// index NOT covered (== `start` → refused, caller falls through
     /// to the per-layer CPU path).
+    /// Should prefill run position-by-position through the GPU token
+    /// graph instead of the batched CPU chunk-GEMM? True for q1 GDN
+    /// hybrids on native Metal: their chunk prefill is walled by the
+    /// sequential scalar recurrence, so the graph's decode rate wins.
+    #[cfg(target_os = "macos")]
+    fn graph_prefill_preferred(&self) -> bool {
+        if !crate::gpu::enabled_here()
+            || !crate::gpu::q1_force()
+            || std::env::var("CMF_GPU_BLOCK").map(|v| v == "0").unwrap_or(false)
+        {
+            return false;
+        }
+        self.weights.layers.iter().any(
+            |lw| matches!(&lw.attn, AttnKind::LinearGdn(w) if w.in_proj_qkv.is_q1()),
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn graph_prefill_preferred(&self) -> bool {
+        false
+    }
+
     #[cfg(target_os = "macos")]
     fn q1_graph_gpu(
         &mut self,
@@ -785,7 +807,18 @@ impl Pipeline {
         // fused-pair path skips the per-layer φ capture). o1 layers
         // collect their query trace in both the single and pair paths.
         let dyn_prefill = router.is_some();
-        if task_mask.is_none() && !dyn_prefill && prefill_batched() && input_ids.len() > 2 {
+        // q1 hybrids on Metal: the per-position GPU token graph beats
+        // the CPU chunk-GEMM (whose wall is the sequential scalar GDN
+        // recurrence), so prefill goes position-by-position through the
+        // same graph as decode. Pure-attention models keep the batched
+        // path — there the chunk-GEMM amortization wins.
+        let graph_prefill = self.graph_prefill_preferred();
+        if task_mask.is_none()
+            && !dyn_prefill
+            && !graph_prefill
+            && prefill_batched()
+            && input_ids.len() > 2
+        {
             // Production prefill = the same chunked prefill-GEMM that
             // bench/PPL measure (roadmap §3 P0: generation used to warm
             // the prompt with the slower pair path — the published
@@ -812,7 +845,7 @@ impl Pipeline {
                 pos = end;
             }
         }
-        if task_mask.is_none() && !dyn_prefill {
+        if task_mask.is_none() && !dyn_prefill && !graph_prefill {
             while pos + 1 < input_ids.len() {
                 let e1 = self.embed_single(input_ids[pos]);
                 let e2 = self.embed_single(input_ids[pos + 1]);

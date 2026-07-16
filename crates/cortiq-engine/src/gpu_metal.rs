@@ -81,12 +81,13 @@ kernel void q8_matmat(
 }
 
 // q1: 6-byte tiles [f16 scale][4B sign bits] per 32-group; w = s*(2b-1).
-// One SIMD group per TWO rows: each activation float4 a lane loads is
-// used against both rows' tile pairs, with no threadgroup staging (no
-// barriers, xs hot in L1 across a core's simdgroups). Four rows per
-// simdgroup was tried and REVERTED: the cached-x register block spills
-// and occupancy drops (13.8 ms/block vs 8.8). Tile pairs are 12 bytes =
-// three aligned u32 loads; gpr must be even (CPU handles the rest).
+// One SIMD group per FOUR rows, tiles of a pair processed one at a
+// time: each activation float4 a lane loads is used against four rows'
+// tiles, halving the L1 xs traffic per weight byte vs the former
+// two-row kernel (the earlier four-row attempt cached the whole x
+// block in registers and spilled; here only one float4 accumulator per
+// row is live inside the tile loop). Tile pairs are 12 bytes = three
+// aligned u32 loads; gpr must be even (CPU handles the rest).
 kernel void q1_matvec(
     device const uchar*  q    [[buffer(0)]],
     device const float4* xs   [[buffer(1)]],
@@ -98,54 +99,71 @@ kernel void q1_matvec(
     uint tgpos [[threadgroup_position_in_grid]],
     uint sgs  [[simdgroups_per_threadgroup]])
 {
-    uint r0 = (tgpos * sgs + sg) * 2u;
+    uint r0 = (tgpos * sgs + sg) * 4u;
     if (r0 >= rows) return;
-    bool two = r0 + 1u < rows;
+    uint nr = min(rows - r0, 4u);
     uint np = gpr >> 1;
     device const uint* q0 = (device const uint*)(q + (ulong)r0 * gpr * 6u);
-    device const uint* q1p = (device const uint*)(q + (ulong)(r0 + (two ? 1u : 0u)) * gpr * 6u);
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
+    device const uint* q1p = (device const uint*)(q + (ulong)(r0 + (nr > 1u ? 1u : 0u)) * gpr * 6u);
+    device const uint* q2p = (device const uint*)(q + (ulong)(r0 + (nr > 2u ? 2u : 0u)) * gpr * 6u);
+    device const uint* q3p = (device const uint*)(q + (ulong)(r0 + (nr > 3u ? 3u : 0u)) * gpr * 6u);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     for (uint pidx = lane; pidx < np; pidx += 32u) {
-        uint a0 = q0[pidx * 3u];
-        uint a1 = q0[pidx * 3u + 1u];
-        uint a2 = q0[pidx * 3u + 2u];
-        uint b0 = q1p[pidx * 3u];
-        uint b1 = q1p[pidx * 3u + 1u];
-        uint b2 = q1p[pidx * 3u + 2u];
-        float sa0 = (float)as_type<half>((ushort)(a0 & 0xFFFFu));
-        float sa1 = (float)as_type<half>((ushort)(a1 >> 16));
-        uint bitsa0 = (a0 >> 16) | (a1 << 16);
-        uint bitsa1 = a2;
-        float sb0 = (float)as_type<half>((ushort)(b0 & 0xFFFFu));
-        float sb1 = (float)as_type<half>((ushort)(b1 >> 16));
-        uint bitsb0 = (b0 >> 16) | (b1 << 16);
-        uint bitsb1 = b2;
+        uint a0 = q0[pidx * 3u], a1 = q0[pidx * 3u + 1u], a2 = q0[pidx * 3u + 2u];
+        uint b0 = q1p[pidx * 3u], b1 = q1p[pidx * 3u + 1u], b2 = q1p[pidx * 3u + 2u];
+        uint c0 = q2p[pidx * 3u], c1 = q2p[pidx * 3u + 1u], c2 = q2p[pidx * 3u + 2u];
+        uint d0 = q3p[pidx * 3u], d1 = q3p[pidx * 3u + 1u], d2 = q3p[pidx * 3u + 2u];
         ulong g = (ulong)pidx * 2u;
-        float4 s0a = float4(0.0f), s1a = float4(0.0f);
-        float4 s0b = float4(0.0f), s1b = float4(0.0f);
-        for (uint j = 0; j < 8; ++j) {
-            float4 x0 = xs[g * 8u + j];
-            float4 x1 = xs[(g + 1u) * 8u + j];
-            uint na0 = bitsa0 >> (j * 4u);
-            uint na1 = bitsa1 >> (j * 4u);
-            uint nb0 = bitsb0 >> (j * 4u);
-            uint nb1 = bitsb1 >> (j * 4u);
-            s0a += select(-x0, x0, bool4(na0 & 1u, na0 & 2u, na0 & 4u, na0 & 8u));
-            s1a += select(-x1, x1, bool4(na1 & 1u, na1 & 2u, na1 & 4u, na1 & 8u));
-            s0b += select(-x0, x0, bool4(nb0 & 1u, nb0 & 2u, nb0 & 4u, nb0 & 8u));
-            s1b += select(-x1, x1, bool4(nb1 & 1u, nb1 & 2u, nb1 & 4u, nb1 & 8u));
+        // First tile of the pair: bits live in the middle of word 0/1.
+        {
+            uint ba = (a0 >> 16) | (a1 << 16);
+            uint bb = (b0 >> 16) | (b1 << 16);
+            uint bc = (c0 >> 16) | (c1 << 16);
+            uint bd = (d0 >> 16) | (d1 << 16);
+            float4 sA = float4(0.0f), sB = float4(0.0f);
+            float4 sC = float4(0.0f), sD = float4(0.0f);
+            for (uint j = 0; j < 8; ++j) {
+                float4 x = xs[g * 8u + j];
+                uint na = ba >> (j * 4u), nb = bb >> (j * 4u);
+                uint nc = bc >> (j * 4u), nd = bd >> (j * 4u);
+                sA += select(-x, x, bool4(na & 1u, na & 2u, na & 4u, na & 8u));
+                sB += select(-x, x, bool4(nb & 1u, nb & 2u, nb & 4u, nb & 8u));
+                sC += select(-x, x, bool4(nc & 1u, nc & 2u, nc & 4u, nc & 8u));
+                sD += select(-x, x, bool4(nd & 1u, nd & 2u, nd & 4u, nd & 8u));
+            }
+            acc0 += (float)as_type<half>((ushort)(a0 & 0xFFFFu)) * (sA.x + sA.y + sA.z + sA.w);
+            acc1 += (float)as_type<half>((ushort)(b0 & 0xFFFFu)) * (sB.x + sB.y + sB.z + sB.w);
+            acc2 += (float)as_type<half>((ushort)(c0 & 0xFFFFu)) * (sC.x + sC.y + sC.z + sC.w);
+            acc3 += (float)as_type<half>((ushort)(d0 & 0xFFFFu)) * (sD.x + sD.y + sD.z + sD.w);
         }
-        acc0 += sa0 * (s0a.x + s0a.y + s0a.z + s0a.w)
-              + sa1 * (s1a.x + s1a.y + s1a.z + s1a.w);
-        acc1 += sb0 * (s0b.x + s0b.y + s0b.z + s0b.w)
-              + sb1 * (s1b.x + s1b.y + s1b.z + s1b.w);
+        // Second tile of the pair: bits are word 2, scale tops word 1.
+        {
+            float4 sA = float4(0.0f), sB = float4(0.0f);
+            float4 sC = float4(0.0f), sD = float4(0.0f);
+            for (uint j = 0; j < 8; ++j) {
+                float4 x = xs[(g + 1u) * 8u + j];
+                uint na = a2 >> (j * 4u), nb = b2 >> (j * 4u);
+                uint nc = c2 >> (j * 4u), nd = d2 >> (j * 4u);
+                sA += select(-x, x, bool4(na & 1u, na & 2u, na & 4u, na & 8u));
+                sB += select(-x, x, bool4(nb & 1u, nb & 2u, nb & 4u, nb & 8u));
+                sC += select(-x, x, bool4(nc & 1u, nc & 2u, nc & 4u, nc & 8u));
+                sD += select(-x, x, bool4(nd & 1u, nd & 2u, nd & 4u, nd & 8u));
+            }
+            acc0 += (float)as_type<half>((ushort)(a1 >> 16)) * (sA.x + sA.y + sA.z + sA.w);
+            acc1 += (float)as_type<half>((ushort)(b1 >> 16)) * (sB.x + sB.y + sB.z + sB.w);
+            acc2 += (float)as_type<half>((ushort)(c1 >> 16)) * (sC.x + sC.y + sC.z + sC.w);
+            acc3 += (float)as_type<half>((ushort)(d1 >> 16)) * (sD.x + sD.y + sD.z + sD.w);
+        }
     }
     acc0 = simd_sum(acc0);
     acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2);
+    acc3 = simd_sum(acc3);
     if (lane == 0) {
         y[r0] = acc0;
-        if (two) y[r0 + 1u] = acc1;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
     }
 }
 
@@ -829,9 +847,9 @@ fn encode_q1_matvec(
     let rows_u = rows as u32;
     enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
-    let sgs = 8u64; // × 2 rows per simdgroup
+    let sgs = 8u64; // × 4 rows per simdgroup
     enc.dispatch_thread_groups(
-        MTLSize::new((rows as u64).div_ceil(sgs * 2), 1, 1),
+        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
         MTLSize::new(sgs * 32, 1, 1),
     );
 }
