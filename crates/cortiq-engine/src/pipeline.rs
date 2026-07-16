@@ -526,6 +526,33 @@ impl Pipeline {
         // fused-pair path skips the per-layer φ capture). o1 layers
         // collect their query trace in both the single and pair paths.
         let dyn_prefill = router.is_some();
+        if task_mask.is_none() && !dyn_prefill && prefill_batched() && input_ids.len() > 2 {
+            // Production prefill = the same chunked prefill-GEMM that
+            // bench/PPL measure (roadmap §3 P0: generation used to warm
+            // the prompt with the slower pair path — the published
+            // prefill number didn't match real TTFT). MTP warm-up reads
+            // each position's hidden straight from the chunk result.
+            const CHUNK: usize = 48;
+            let hs = self.hidden_size;
+            while pos < input_ids.len() {
+                let end = (pos + CHUNK).min(input_ids.len());
+                let hb = self.prefill_batch(&input_ids[pos..end], pos);
+                if let Some(m) = &mut mtp {
+                    for p in pos..end {
+                        if p + 1 < input_ids.len() {
+                            let _ = self.mtp_step(
+                                m,
+                                &hb[(p - pos) * hs..(p - pos + 1) * hs],
+                                input_ids[p + 1],
+                                p,
+                            );
+                        }
+                    }
+                }
+                hidden.copy_from_slice(&hb[(end - pos - 1) * hs..]);
+                pos = end;
+            }
+        }
         if task_mask.is_none() && !dyn_prefill {
             while pos + 1 < input_ids.len() {
                 let e1 = self.embed_single(input_ids[pos]);
