@@ -609,6 +609,113 @@ impl QTensor {
     }
 }
 
+impl QTensor {
+    /// Pair-input multi-matrix job: N tensors × 2 shared inputs under a
+    /// single pool dispatch — the MTP/pair decode path publishes one job
+    /// for Q/K/V (and one for gate+up) instead of one per tensor.
+    /// Per-row math is exactly `matvec2`'s kernels; bit-identical.
+    #[allow(clippy::needless_range_loop)]
+    pub fn matvec2_many<const N: usize>(
+        ts: [&QTensor; N],
+        x1: &[f32],
+        x2: &[f32],
+        mut o1s: [&mut [f32]; N],
+        mut o2s: [&mut [f32]; N],
+        pool: Option<&Pool>,
+    ) {
+        let total_rows: usize = ts.iter().map(|t| t.rows()).sum();
+        let uniform_q8 = ts.iter().all(|t| {
+            matches!(
+                t,
+                Self::Mapped { dtype: TensorDtype::Q8Row | TensorDtype::Q8_2f, .. }
+            )
+        });
+        let uniform_f32 = ts.iter().all(|t| matches!(t, Self::F32 { .. }));
+        let fusable = pool.is_some() && total_rows >= 256 && (uniform_q8 || uniform_f32);
+        if !fusable {
+            for i in 0..N {
+                ts[i].matvec2(x1, x2, o1s[i], o2s[i], pool);
+            }
+            return;
+        }
+        let pool = pool.unwrap();
+
+        if uniform_f32 {
+            let p1: [SendMut; N] = std::array::from_fn(|i| SendMut(o1s[i].as_mut_ptr()));
+            let p2: [SendMut; N] = std::array::from_fn(|i| SendMut(o2s[i].as_mut_ptr()));
+            let closures: [_; N] = std::array::from_fn(|i| {
+                let Self::F32 { data, cols, .. } = ts[i] else { unreachable!() };
+                let (o1, o2) = (p1[i], p2[i]);
+                move |start: usize, end: usize| {
+                    for o in start..end {
+                        let row = &data[o * cols..(o + 1) * cols];
+                        let (mut s1, mut s2) = (0.0f32, 0.0f32);
+                        for j in 0..*cols {
+                            s1 += row[j] * x1[j];
+                            s2 += row[j] * x2[j];
+                        }
+                        // SAFETY: disjoint (tensor, row) cells per worker.
+                        unsafe {
+                            *o1.at(o) = s1;
+                            *o2.at(o) = s2;
+                        }
+                    }
+                }
+            });
+            let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
+                std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
+            pool.run_many(&parts);
+            return;
+        }
+
+        struct Ctx<'a> {
+            bytes: &'a [u8],
+            row_scale: &'a [f32],
+            cols: usize,
+            xs1: std::borrow::Cow<'a, [f32]>,
+            xs2: std::borrow::Cow<'a, [f32]>,
+        }
+        let ctxs: [Ctx<'_>; N] = std::array::from_fn(|i| {
+            let Self::Mapped { dtype, cols, row_scale, col_field, .. } = ts[i] else {
+                unreachable!()
+            };
+            Ctx {
+                bytes: ts[i].quant_bytes(),
+                row_scale,
+                cols: *cols,
+                xs1: prescale(x1, col_field, *dtype),
+                xs2: prescale(x2, col_field, *dtype),
+            }
+        });
+        let p1: [SendMut; N] = std::array::from_fn(|i| SendMut(o1s[i].as_mut_ptr()));
+        let p2: [SendMut; N] = std::array::from_fn(|i| SendMut(o2s[i].as_mut_ptr()));
+        #[cfg(target_arch = "aarch64")]
+        if sdot_enabled() {
+            let acts: [(SplitAct, SplitAct); N] =
+                std::array::from_fn(|i| (split_act(&ctxs[i].xs1), split_act(&ctxs[i].xs2)));
+            let closures: [_; N] = std::array::from_fn(|i| {
+                let (c, a, o1, o2) = (&ctxs[i], &acts[i], p1[i], p2[i]);
+                move |start: usize, end: usize| {
+                    q8_range2_sdot(c.bytes, c.row_scale, &a.0, &a.1, c.cols, o1, o2, start, end)
+                }
+            });
+            let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
+                std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
+            pool.run_many(&parts);
+            return;
+        }
+        let closures: [_; N] = std::array::from_fn(|i| {
+            let (c, o1, o2) = (&ctxs[i], p1[i], p2[i]);
+            move |start: usize, end: usize| {
+                q8_range2_f32(c.bytes, c.row_scale, &c.xs1, &c.xs2, c.cols, o1, o2, start, end)
+            }
+        });
+        let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
+            std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
+        pool.run_many(&parts);
+    }
+}
+
 /// Batched q8 kernel: same math as qmatvec, the row makes a single
 /// pass from memory for the whole batch.
 fn qmatmat(
@@ -1772,6 +1879,54 @@ fn q8_range_sdot(
     }
 }
 
+/// Two-input q8 row range via SDOT — `qmatvec2`'s hot loop, extracted
+/// for the fused pair multi-matrix job (`matvec2_many`).
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+fn q8_range2_sdot(
+    q: &[u8],
+    row_scale: &[f32],
+    a1: &SplitAct,
+    a2: &SplitAct,
+    cols: usize,
+    p1: SendMut,
+    p2: SendMut,
+    start: usize,
+    end: usize,
+) {
+    for o in start..end {
+        let row = &q[o * cols..(o + 1) * cols];
+        // SAFETY: disjoint row ranges per worker.
+        unsafe {
+            *p1.at(o) = row_dot_sdot(row, a1) * row_scale[o];
+            *p2.at(o) = row_dot_sdot(row, a2) * row_scale[o];
+        }
+    }
+}
+
+/// Two-input q8 row range, f32 kernel (non-SDOT) — same extraction.
+#[allow(clippy::too_many_arguments)]
+fn q8_range2_f32(
+    q: &[u8],
+    row_scale: &[f32],
+    x1: &[f32],
+    x2: &[f32],
+    cols: usize,
+    p1: SendMut,
+    p2: SendMut,
+    start: usize,
+    end: usize,
+) {
+    for o in start..end {
+        let row = &q[o * cols..(o + 1) * cols];
+        // SAFETY: disjoint row ranges per worker.
+        unsafe {
+            *p1.at(o) = dot_i8_f32(row, x1) * row_scale[o];
+            *p2.at(o) = dot_i8_f32(row, x2) * row_scale[o];
+        }
+    }
+}
+
 /// Scalar/NEON-f32 q8 row range (non-SDOT platforms) — same extraction.
 fn q8_range_f32(
     q: &[u8],
@@ -2121,23 +2276,10 @@ fn qmatvec2(
         let p1 = SendMut(o1.as_mut_ptr());
         let p2 = SendMut(o2.as_mut_ptr());
         let run_range = |start: usize, end: usize| {
-            for o in start..end {
-                let row = &q[o * cols..(o + 1) * cols];
-                // SAFETY: disjoint row ranges per worker.
-                unsafe {
-                    *p1.at(o) = row_dot_sdot(row, &a1s) * row_scale[o];
-                    *p2.at(o) = row_dot_sdot(row, &a2s) * row_scale[o];
-                }
-            }
+            q8_range2_sdot(q, row_scale, &a1s, &a2s, cols, p1, p2, start, end)
         };
         match pool {
-            Some(pool) if rows >= 256 => {
-                pool.run(&|widx, n| {
-                    let chunk = rows.div_ceil(n);
-                    let start = widx * chunk;
-                    run_range(start, (start + chunk).min(rows));
-                });
-            }
+            Some(pool) if rows >= 256 => pool.run_rows(rows, &run_range),
             _ => run_range(0, rows),
         }
         return;

@@ -2221,8 +2221,16 @@ fn ffn_forward_pair(
         g2.resize(inter, 0.0);
         u1.resize(inter, 0.0);
         u2.resize(inter, 0.0);
-        d.gate_proj.matvec2(x1, x2, g1, g2, pool);
-        d.up_proj.matvec2(x1, x2, u1, u2, pool);
+        // Multi-matrix pair job: gate+up under one pool dispatch
+        // (o1s = lane-1 outputs across tensors, o2s = lane-2).
+        QTensor::matvec2_many(
+            [&d.gate_proj, &d.up_proj],
+            x1,
+            x2,
+            [g1.as_mut_slice(), u1.as_mut_slice()],
+            [g2.as_mut_slice(), u2.as_mut_slice()],
+            pool,
+        );
         for i in 0..inter {
             g1[i] = inference::silu(g1[i]) * u1[i];
             g2[i] = inference::silu(g2[i]) * u2[i];

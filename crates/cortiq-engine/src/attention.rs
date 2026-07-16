@@ -645,16 +645,22 @@ pub fn qwen_attention_pair(
     let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
     let heads_per_kv = nh / nkv;
 
-    // Fused projections (one weight pass for both positions).
+    // Fused projections (one weight pass for both positions) — Q, K
+    // and V under a single pool dispatch (multi-matrix pair job).
     let mut q1r = take_buf(wq.rows());
     let mut q2r = take_buf(wq.rows());
-    wq.matvec2(h1, h2, &mut q1r, &mut q2r, cfg.pool);
     let mut k1 = take_buf(nkv * hd);
     let mut k2 = take_buf(nkv * hd);
-    wk.matvec2(h1, h2, &mut k1, &mut k2, cfg.pool);
     let mut v1 = take_buf(nkv * hd);
     let mut v2 = take_buf(nkv * hd);
-    wv.matvec2(h1, h2, &mut v1, &mut v2, cfg.pool);
+    QTensor::matvec2_many(
+        [wq, wk, wv],
+        h1,
+        h2,
+        [q1r.as_mut_slice(), k1.as_mut_slice(), v1.as_mut_slice()],
+        [q2r.as_mut_slice(), k2.as_mut_slice(), v2.as_mut_slice()],
+        cfg.pool,
+    );
     if let Some((bq, bk, bv)) = cfg.bias {
         for lane in [(&mut q1r, &mut k1, &mut v1), (&mut q2r, &mut k2, &mut v2)] {
             for (x, b) in lane.0.iter_mut().zip(bq) {
