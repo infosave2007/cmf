@@ -184,11 +184,52 @@ struct Ctx {
     vram_budget: u64,
     /// Bytes currently resident in `weight_bufs`.
     resident: std::sync::atomic::AtomicU64,
+    /// Pooled per-op scratch (grow-only): xs upload, y output, uniform
+    /// params, readback staging. Every op used to CREATE all four (plus
+    /// a bind group) and map_async-poll a fresh staging buffer — pure
+    /// allocator traffic on the hot path. The lock is held across the
+    /// whole op (encode → submit → poll): ops already serialize on the
+    /// single queue.
+    scratch: Mutex<Scratch>,
     /// Resident quant weights in VRAM — the WHOLE tensor is loaded once
     /// (key (base_ptr, idx)); ranges/batches address it by offset.
     weight_bufs: Mutex<HashMap<(usize, usize), wgpu::Buffer>>,
     /// row_scale buffer per (idx, row0) — small, cached.
     rs_bufs: Mutex<HashMap<(usize, usize), wgpu::Buffer>>,
+}
+
+#[derive(Default)]
+struct Scratch {
+    xs: Option<(wgpu::Buffer, u64)>,
+    y: Option<(wgpu::Buffer, u64)>,
+    stage: Option<(wgpu::Buffer, u64)>,
+    params: Option<wgpu::Buffer>,
+}
+
+impl Scratch {
+    /// Grow-only slot: reuse when big enough, else recreate.
+    fn ensure(
+        dev: &wgpu::Device,
+        slot: &mut Option<(wgpu::Buffer, u64)>,
+        need: u64,
+        usage: wgpu::BufferUsages,
+        label: &str,
+    ) -> wgpu::Buffer {
+        match slot {
+            Some((b, cap)) if *cap >= need => b.clone(),
+            _ => {
+                let cap = need.next_power_of_two().max(4096);
+                let b = dev.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: cap,
+                    usage,
+                    mapped_at_creation: false,
+                });
+                *slot = Some((b.clone(), cap));
+                b
+            }
+        }
+    }
 }
 
 static CTX: OnceLock<Option<Ctx>> = OnceLock::new();
@@ -309,6 +350,7 @@ fn init() -> Result<Ctx, String> {
         discrete,
         vram_budget,
         resident: std::sync::atomic::AtomicU64::new(0),
+        scratch: Mutex::new(Scratch::default()),
         weight_bufs: Mutex::new(HashMap::new()),
         rs_bufs: Mutex::new(HashMap::new()),
     })
@@ -429,24 +471,46 @@ fn dispatch_matvec(
         None => make_rs(),
     };
 
-    let xs_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("q8-xs"),
-        contents: bytemuck::cast_slice(&xs[..cols]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    // Pooled scratch for the whole op (encode → submit → poll).
+    let mut sc = c.scratch.lock().unwrap();
+    let xs_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.xs,
+        (cols * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "q8-xs",
+    );
+    c.queue.write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..cols]));
     let y_size = (rows * 4) as u64;
-    let y_buf = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("q8-y"),
-        size: y_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
+    let y_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.y,
+        y_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "q8-y",
+    );
     let params = [(cols / 4) as u32, rows as u32, (row0 * cols / 4) as u32, 0u32];
-    let p_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("q8-params"),
-        contents: bytemuck::cast_slice(&params),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let p_buf = match &sc.params {
+        Some(b) => b.clone(),
+        None => {
+            let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("q8-params"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            sc.params = Some(b.clone());
+            b
+        }
+    };
+    c.queue.write_buffer(&p_buf, 0, bytemuck::cast_slice(&params));
+    let stage_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        y_size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "q8-stage",
+    );
 
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("q8-bg"),
@@ -472,7 +536,9 @@ fn dispatch_matvec(
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1); // grid-stride over rows
     }
-    readback(c, enc, &y_buf, y_size, &mut out[..rows])
+    let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..rows]);
+    drop(sc);
+    ok
 }
 
 /// GEMM of the prefill batch: `pre` are prescaled inputs row-major [b, cols],
@@ -552,29 +618,67 @@ fn dispatch_matmat(
             usage: wgpu::BufferUsages::STORAGE,
         }),
     };
-    let rs_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("mm-rs"),
-        contents: bytemuck::cast_slice(&row_scale[..rows]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let xs_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("mm-xs"),
-        contents: bytemuck::cast_slice(&pre[..b * cols]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    // rs cached per tensor (row0 sentinel = full-tensor scales).
+    let rs_buf = match weight_key {
+        Some((base, idx)) => c
+            .rs_bufs
+            .lock()
+            .unwrap()
+            .entry((base ^ idx.wrapping_mul(1_000_003), usize::MAX))
+            .or_insert_with(|| {
+                c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("mm-rs"),
+                    contents: bytemuck::cast_slice(&row_scale[..rows]),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+            })
+            .clone(),
+        None => c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mm-rs"),
+            contents: bytemuck::cast_slice(&row_scale[..rows]),
+            usage: wgpu::BufferUsages::STORAGE,
+        }),
+    };
+    // Pooled scratch for the whole op (encode → submit → poll).
+    let mut sc = c.scratch.lock().unwrap();
+    let xs_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.xs,
+        (b * cols * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "mm-xs",
+    );
+    c.queue.write_buffer(&xs_buf, 0, bytemuck::cast_slice(&pre[..b * cols]));
     let y_size = (b * rows * 4) as u64;
-    let y_buf = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("mm-y"),
-        size: y_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
+    let y_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.y,
+        y_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "mm-y",
+    );
     let params = [(cols / 4) as u32, rows as u32, b as u32, 0u32];
-    let p_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("mm-params"),
-        contents: bytemuck::cast_slice(&params),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let p_buf = match &sc.params {
+        Some(bf) => bf.clone(),
+        None => {
+            let bf = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mm-params"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            sc.params = Some(bf.clone());
+            bf
+        }
+    };
+    c.queue.write_buffer(&p_buf, 0, bytemuck::cast_slice(&params));
+    let stage_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        y_size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "mm-stage",
+    );
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("mm-bg"),
         layout: &c.layout_mm,
@@ -598,7 +702,9 @@ fn dispatch_matmat(
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((rows as u32).min(MAX_WG), b as u32, 1);
     }
-    readback(c, enc, &y_buf, y_size, &mut out[..b * rows])
+    let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * rows]);
+    drop(sc);
+    ok
 }
 
 /// Copy the output buffer GPU→staging→CPU (map+poll). Single readback path
@@ -607,18 +713,13 @@ fn readback(
     c: &Ctx,
     mut enc: wgpu::CommandEncoder,
     y_buf: &wgpu::Buffer,
+    staging: &wgpu::Buffer,
     y_size: u64,
     out: &mut [f32],
 ) -> bool {
-    let staging = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("stg"),
-        size: y_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    enc.copy_buffer_to_buffer(y_buf, 0, &staging, 0, y_size);
+    enc.copy_buffer_to_buffer(y_buf, 0, staging, 0, y_size);
     c.queue.submit(Some(enc.finish()));
-    let slice = staging.slice(..);
+    let slice = staging.slice(..y_size);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
         return false;
@@ -827,7 +928,19 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
             pass.dispatch_workgroups((hidden as u32).div_ceil(256), 1, 1);
         }
     }
-    readback(c, enc, &y_buf, (hidden * 4) as u64, out)
+    // Hold the scratch lock across the readback: with concurrent server
+    // slots two ops must not share the staging buffer mid-flight.
+    let mut sc = c.scratch.lock().unwrap();
+    let stage_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        (hidden * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "moe-stage",
+    );
+    let ok = readback(c, enc, &y_buf, &stage_buf, (hidden * 4) as u64, out);
+    drop(sc);
+    ok
 }
 
 /// N independent q8-matvec (GDN projections of one input) in a single submission.
