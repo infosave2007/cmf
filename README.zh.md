@@ -239,6 +239,23 @@ cortiq import-gguf Qwen/Qwen2.5-0.5B-Instruct-GGUF --output model.cmf --quant q8
 
 GGUF 导入覆盖 `Q4_0/1`、`Q5_0/1`、`Q8_0`、`Q2_K`…`Q6_K`、`IQ4_NL/XS` 和 `BF16`。
 
+### 1 位模型（Bonsai / BitNet 一类）
+
+以二值权重**训练**出的检查点可无损转换为 `q1`（1.5 位/权重——每组权重本来
+就只有 ±s 两个取值，编码只是把它们找回来）。27B 变成一个 4.8 GB 的文件，
+在 24 GB 内存的 MacBook 上就能跑：
+
+```sh
+cortiq convert --model prism-ml/Bonsai-27B-unpacked --quant q1 --output bonsai27b-q1.cmf
+CMF_THREADS=10 cortiq run bonsai27b-q1.cmf -p "What is 84 * 3 / 2?"
+```
+
+注意：`--quant q1` 是显式选项，仅适用于按 1 位训练的模型——对普通检查点做
+PTQ 会毁掉质量。请从 `*-unpacked`（safetensors）仓库转换而不是 GGUF 仓库：
+混合架构（qwen3_5：GatedDeltaNet 线性层 + 每第 4 层全注意力）在原生转换器
+中直接支持；1 位解码计算量大，请把所有核心都给它（10 核机器用
+`CMF_THREADS=10`）。
+
 原生转换器写出的是**骨干**。上文说的那些按技能替换张量和任务掩码，目前仍由
 `converter/` 里的 Python 工具链产出；需要激活 Hessian 的 GPTQ 校准 v-bit 变体也是。
 仅按权重的 v-bit 路径已经是原生的。

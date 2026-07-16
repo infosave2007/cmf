@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-07-16
+
+The 1-bit release: a 27B in 4.8 GB on a 24 GB MacBook.
+
+### Added
+
+- **`q1` (dtype 12)** — 1-bit binary weights for 1-bit-TRAINED models
+  (Bonsai / BitNet class): 6-byte tiles `[f16 scale][4B sign bits]` per
+  32-group, 1.5 bits/weight; the scale is the group's mean |v| — the
+  L2-optimal binary level, which recovers a binary-trained checkpoint's
+  stored levels exactly. Explicit opt-in (`--quant q1`): as PTQ of a
+  normal model it destroys quality. Fused kernels on all paths; on ARM
+  the vtst mask feeds `sdot` directly (0xFF = −1) via
+  `dot = −(2·sdot(mask, x) + Σx_group)` — no ±1 expansion at all, with
+  per-group activation sums shared across every row. Verified
+  end-to-end on prism-ml Bonsai: 1.7B q1 = 334 MB (vs 1653 MB q8) with
+  greedy output token-identical to q8; 27B = 4.75 GB, ~3.2 tok/s on an
+  M4 with `CMF_THREADS=10`.
+- **qwen3_5 hybrid runs from safetensors**: GatedDeltaNet linear layers
+  + full attention every 4th (Bonsai-27B class), 248K vocab, MTP head —
+  the native converter maps it 1:1; hybrid GGUFs stay refused by
+  design (the mixer tensors would be lost).
+- Q1 joins `matvec_many` multi-matrix jobs (QKV / gate+up fuse again on
+  new-arch models) and the four GDN input projections run under one
+  pool dispatch — hybrid 27B: 449 → 353 dispatches/token.
+
+### Changed
+
+- **GDN/linear-core state is f32** (the vendor operator's own dtype —
+  `mamba_ssm_dtype: float32`): SIMD-able elementwise state passes
+  (read×2/write×1 instead of ×2/×2), heads fan out across the worker
+  pool, per-worker scratch from the shared freelists. State memory
+  halves; the GDN oracle stays green at 1e-3. `vmf_phase` keeps f64
+  math per cell at half the storage.
+- **Worker pool defaults to `CMF_POOL_SPIN=4000`** (was 0): at ~39
+  dispatches/token, park-immediately paid an unpark syscall per worker
+  per dispatch. Measured on M4: q8 decode +14%, q4t +27%, the 50M bench
+  model +74%. `CMF_POOL_SPIN=0` remains the share-the-box serving mode.
+- q8 4-row interleaved repack ships opt-in (`CMF_REPACK=1`): the
+  single-stream hypothesis lost on Apple Silicon (the prefetcher likes
+  four adjacent row streams more); kept for x86 experiments,
+  bit-identical either way.
+
 ## [0.3.1] — 2026-07-16
 
 The GPU release. Field report that triggered it: a 35B model (70 GB bf16 →

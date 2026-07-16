@@ -267,6 +267,25 @@ cortiq import-gguf Qwen/Qwen2.5-0.5B-Instruct-GGUF --output model.cmf --quant q8
 GGUF import covers `Q4_0/1`, `Q5_0/1`, `Q8_0`, `Q2_K`…`Q6_K`, `IQ4_NL/XS` and
 `BF16`.
 
+### 1-bit models (Bonsai / BitNet class)
+
+Checkpoints **trained** with binary weights convert losslessly into `q1`
+(1.5 bits/weight — per-group weights already sit on two levels ±s, so the
+encoding just recovers them). A 27B becomes a 4.8 GB file that runs on a
+24 GB MacBook:
+
+```sh
+cortiq convert --model prism-ml/Bonsai-27B-unpacked --quant q1 --output bonsai27b-q1.cmf
+CMF_THREADS=10 cortiq run bonsai27b-q1.cmf -p "What is 84 * 3 / 2?"
+```
+
+Notes: `--quant q1` is an explicit opt-in for 1-bit-trained models only —
+as post-training quantization of a normal checkpoint it destroys quality.
+Convert from the `*-unpacked` (safetensors) repo, not the GGUF one: hybrid
+architectures (qwen3_5: GatedDeltaNet linear layers + full attention every
+4th) are supported natively there, and 1-bit decode is compute-heavy, so
+give it every core (`CMF_THREADS=10` on a 10-core machine).
+
 The native converter writes **backbones**. The Python tooling in `converter/` is
 still what produces the per-skill replacement tensors and task masks described
 above, and the GPTQ-calibrated v-bit variant, which needs an activation Hessian.
