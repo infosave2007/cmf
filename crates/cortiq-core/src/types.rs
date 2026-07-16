@@ -32,6 +32,15 @@ pub enum TensorDtype {
     /// on AVX2. 2-D tensors with cols % 32 == 0 only. New id — the
     /// byte semantics of `Q4Block = 4` never change.
     Q4Tiled = 11,
+    /// 1-bit binary weights (roadmap: 1-bit-TRAINED models — Bonsai /
+    /// BitNet class; as post-training quantization of a normal model
+    /// this destroys quality, so converters expose it only as an
+    /// explicit opt-in). Tiled like `q4_tiled`: `repeat per 32-group
+    /// { f16 scale; 4B bits }` — 6 bytes per 32 weights (1.5 bits/w),
+    /// one sequential stream. Bit k of byte j (LSB-first) is weight
+    /// j·8+k of the group; value = scale · (2·bit − 1) ∈ {−s, +s}.
+    /// 2-D tensors with cols % 32 == 0 only.
+    Q1 = 12,
 }
 
 impl TensorDtype {
@@ -49,6 +58,7 @@ impl TensorDtype {
             9 => Self::Q8_2f,
             10 => Self::VbitRo,
             11 => Self::Q4Tiled,
+            12 => Self::Q1,
             _ => return None,
         })
     }
@@ -71,6 +81,7 @@ impl TensorDtype {
             Self::Q8_2f => "q8_2f",
             Self::VbitRo => "vbit_ro",
             Self::Q4Tiled => "q4_tiled",
+            Self::Q1 => "q1",
         }
     }
 
@@ -89,6 +100,7 @@ impl TensorDtype {
                 | Self::Vbit
                 | Self::VbitRo
                 | Self::Q4Tiled
+                | Self::Q1
         )
     }
 }

@@ -75,6 +75,11 @@ pub(crate) enum Quant {
     /// Grouped variable-bit (per-row 3–8 bit, water-filled by row amplitude).
     Vbit,
     Q4Tiled,
+    /// 1-bit binary (explicit opt-in): for 1-bit-TRAINED models
+    /// (Bonsai / BitNet class), where per-group weights already sit on
+    /// two levels ±s and the encoding is (near-)lossless. As PTQ of a
+    /// normal checkpoint this destroys quality — never a default.
+    Q1,
 }
 
 /// Quantize a 2-D matrix `[out_dim, in_dim]` per the chosen scheme.
@@ -94,6 +99,10 @@ pub(crate) fn quantize_2d(quant: Quant, vals: &[f32], out_dim: usize, in_dim: us
             (TensorDtype::VbitRo, encode_vbit_ro(vals, out_dim, in_dim))
         }
         Quant::Vbit => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
+        Quant::Q1 if in_dim % GROUP_SIZE == 0 => {
+            (TensorDtype::Q1, encode_q1(vals, out_dim, in_dim))
+        }
+        Quant::Q1 => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
     }
 }
 
@@ -105,7 +114,11 @@ pub(crate) fn parse_quant(s: &str) -> anyhow::Result<Quant> {
         "f16" | "fp16" => Quant::F16,
         "vbit" | "v_bit" => Quant::Vbit,
         "q4t" | "q4_tiled" => Quant::Q4Tiled,
-        other => anyhow::bail!("unknown quant '{other}' (use q8, q8_2f, q4, q4t, f16, or vbit)"),
+        "q1" => Quant::Q1,
+        other => anyhow::bail!(
+            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, f16, vbit, or q1 — \
+             q1 is for 1-bit-trained models only)"
+        ),
     })
 }
 
@@ -167,6 +180,34 @@ fn encode_q4_tiled(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
     for g in 0..n_groups {
         out.extend_from_slice(&scales[g * 2..g * 2 + 2]);
         out.extend_from_slice(&packed[g * 16..(g + 1) * 16]);
+    }
+    out
+}
+
+/// q1 (dtype 12): per 32-group tile `[f16 scale][4B sign bits]`,
+/// bit k of byte j (LSB-first) = weight j·8+k; value = s·(2·bit−1).
+/// Scale = group mean |v| — the L2-optimal binary level; for a
+/// 1-bit-TRAINED model whose group weights already sit on ±s this
+/// recovers the level exactly (encoding is lossless up to f16 range).
+fn encode_q1(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
+    debug_assert_eq!(vals.len(), out_dim * in_dim);
+    debug_assert_eq!(in_dim % GROUP_SIZE, 0);
+    let n_groups = vals.len() / GROUP_SIZE;
+    let mut out = Vec::with_capacity(n_groups * 6);
+    for g in 0..n_groups {
+        let grp = &vals[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+        let mean_abs = grp.iter().map(|v| v.abs()).sum::<f32>() / GROUP_SIZE as f32;
+        let s = f16_scale(mean_abs);
+        out.extend_from_slice(&f32_to_f16(s).to_le_bytes());
+        for j in 0..GROUP_SIZE / 8 {
+            let mut byte = 0u8;
+            for k in 0..8 {
+                if grp[j * 8 + k] >= 0.0 {
+                    byte |= 1 << k;
+                }
+            }
+            out.push(byte);
+        }
     }
     out
 }
@@ -1188,6 +1229,9 @@ pub fn run_convert(
         Quant::F16 => QuantType::F16,
         Quant::Vbit => QuantType::Vbit,
         Quant::Q4Tiled => QuantType::Q4Block,
+        // File-level label only (per-tensor truth is in the directory);
+        // Vbit is the closest existing informational bucket for q1.
+        Quant::Q1 => QuantType::Vbit,
     };
     let provenance = match &defrag_plan {
         Some(plan) => {

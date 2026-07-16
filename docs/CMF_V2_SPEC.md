@@ -238,6 +238,9 @@ Numbering shared with `.vmfc` (ids are never reused):
 | 7  | `q4_col`  | reserved |
 | 8  | `vbit`    | ✅ read/write (`QUANT_2F` bit), variable 3–8 bit |
 | 9  | `q8_2f`   | ✅ read/write (`QUANT_2F` bit), 𝒲×θ |
+| 10 | `vbit_ro` | ✅ read/write — `vbit` + in-file row-offset table (O(1) row access); converter default for `--quant vbit` |
+| 11 | `q4_tiled`| ✅ read/write — q4 in interleaved `[f16 scale][16B nibbles]` tiles (`--quant q4t`) |
+| 12 | `q1`      | ✅ read/write — 1-bit binary, for 1-bit-TRAINED models only (`--quant q1`) |
 
 ### 3.2 Quant layouts (canon = `.vmfc`: "quants first, then scales")
 
@@ -266,6 +269,26 @@ Numbering shared with `.vmfc` (ids are never reused):
   claim 12; gate `tests/moe_vbit.sh`). Optionally the allocation takes
   the product with a B-field — router selection frequencies collected
   at calibration (`b ∝ log2(A·B)`, truncated Fisher).
+- **`vbit_ro`** (2-D only, `in % 32 == 0`): the same bits/scales/packed
+  encoding as `vbit`, plus `u32 row_offsets[rows+1]` (relative to the
+  packed area) between the scales and the packed rows —
+  `[u8 bits: rows][f16 scales: rows·in/32][u32 offsets: rows+1][packed]`.
+  Readers get O(1) row access without a prefix scan over bit widths.
+  The byte semantics of `vbit = 8` are untouched; new id on purpose.
+- **`q4_tiled`** (2-D only, `in % 32 == 0`):
+  `repeat per 32-group { [f16 scale][16B nibbles] }` — 18-byte tiles,
+  one sequential memory stream instead of two distant ones. Values and
+  nibble order are identical to `q4_block`; only the placement of the
+  scale differs (kernel-measured ×1.66 ARM / ×1.13 AVX2 over split).
+- **`q1`** (2-D only, `in % 32 == 0`):
+  `repeat per 32-group { [f16 scale][4B sign bits] }` — 6-byte tiles,
+  1.5 bits/weight. Bit k of byte j (LSB-first) is weight j·8+k of the
+  group; `w = scale·(2·bit − 1) ∈ {−s, +s}`, `scale = mean|group|`
+  (the L2-optimal binary level). Intended for 1-bit-TRAINED models
+  (Bonsai / BitNet class), where per-group weights already sit on two
+  levels and the encoding is lossless up to f16; as post-training
+  quantization of a normal checkpoint it destroys quality, so
+  converters expose it only as an explicit opt-in.
 
 ## 4. Weight blob
 
