@@ -546,13 +546,32 @@ fn project_position(
     let mut q_raw = take_buf(wq.rows());
     let mut k = take_buf(nkv * hd);
     let mut v = take_buf(nkv * hd);
-    // Multi-matrix job: Q, K and V projections under one pool dispatch.
-    QTensor::matvec_many(
-        [wq, wk, wv],
-        hidden,
-        [q_raw.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice()],
-        cfg.pool,
-    );
+    // QKV in ONE device submission (этап 4): three matvecs, one poll —
+    // gated by the same discrete-card threshold as every GPU op. Any
+    // refusal (budget/dtype/shard) falls through to the CPU path.
+    let mut on_gpu = false;
+    if crate::gpu::enabled_here() && wq.rows() >= crate::gpu::min_rows() {
+        if let (Some((m, jq)), Some((_, jk)), Some((_, jv))) = (
+            crate::qtensor::gpu_batch_job(wq, hidden),
+            crate::qtensor::gpu_batch_job(wk, hidden),
+            crate::qtensor::gpu_batch_job(wv, hidden),
+        ) {
+            on_gpu = crate::gpu::matvec_batch(
+                &m,
+                &[jq, jk, jv],
+                &mut [q_raw.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice()],
+            );
+        }
+    }
+    if !on_gpu {
+        // Multi-matrix job: Q, K and V projections under one pool dispatch.
+        QTensor::matvec_many(
+            [wq, wk, wv],
+            hidden,
+            [q_raw.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice()],
+            cfg.pool,
+        );
+    }
     if let Some((bq, bk, bv)) = cfg.bias {
         for (x, b) in q_raw.iter_mut().zip(bq) {
             *x += b;

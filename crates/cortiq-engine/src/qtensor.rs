@@ -2331,6 +2331,37 @@ fn vbitmatmat(
     dispatch_rows(pool, rows, &run);
 }
 
+/// Build a GPU batch job for a q8-family mapped tensor (primary
+/// shard): prescaled input + directory coordinates. None → not
+/// GPU-eligible, caller stays on the CPU.
+pub(crate) fn gpu_batch_job<'a>(
+    t: &'a QTensor,
+    x: &[f32],
+) -> Option<(std::sync::Arc<CmfModel>, crate::gpu::BatchJob<'a>)> {
+    match t {
+        QTensor::Mapped {
+            model,
+            idx,
+            dtype: dt @ (TensorDtype::Q8Row | TensorDtype::Q8_2f),
+            rows,
+            cols,
+            row_scale,
+            col_field,
+            ..
+        } => Some((
+            model.clone(),
+            crate::gpu::BatchJob {
+                idx: *idx,
+                rows: *rows,
+                cols: *cols,
+                row_scale,
+                xs: prescale(x, col_field, *dt).into_owned(),
+            },
+        )),
+        _ => None,
+    }
+}
+
 /// θ col-field fold for q8_2f activations. Borrowed pass-through for
 /// every other dtype — the old unconditional `x.to_vec()` was a pure
 /// per-matvec allocation on the q8_row hot path.
