@@ -35,7 +35,6 @@ static GLOBAL_ALLOC: CountingAlloc = CountingAlloc;
 use cortiq_engine::{CortiqRuntime, Pipeline, SamplerConfig};
 use cortiq_server::{build_router, AppState};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 /// A frozen conversation state (B2, `.cmfstate`). v1 is LOGICAL: the token
 /// prefix + active skill + seed + a model fingerprint. Resume replays the
@@ -845,12 +844,37 @@ async fn cmd_serve(
     println!("    Quantization: {:?}", model.header.quant_type);
     println!("    Masks: {}", model.masks.masks.len());
 
-    let mut pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
-    o1.apply(&mut pipeline);
-    if pipeline.o1_active() {
+    // Slot pool (roadmap этап 5.1): N pipelines over ONE mmap — the
+    // weights are shared zero-copy, each slot owns KV/state/workspace,
+    // so up to N requests decode concurrently. CMF_SERVE_SLOTS
+    // overrides; the default keeps ~4 pool threads per slot.
+    let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let slots = std::env::var("CMF_SERVE_SLOTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| (avail / 4).clamp(1, 4));
+    if std::env::var("CMF_THREADS").is_err() {
+        // Split the cores between slots instead of oversubscribing
+        // N pools × (cores−1) workers. Explicit CMF_THREADS wins.
+        let per = (avail.saturating_sub(1) / slots).max(1);
+        // SAFETY: single-threaded startup, before any pipeline/pool spawn.
+        unsafe { std::env::set_var("CMF_THREADS", per.to_string()) };
+    }
+    let mut pipelines = Vec::with_capacity(slots);
+    for _ in 0..slots {
+        let mut pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
+        o1.apply(&mut pipeline);
+        pipelines.push(pipeline);
+    }
+    if pipelines[0].o1_active() {
         println!("    O(1) attention: nystrom (see load log for layers/params)");
     }
-    println!("    Pipeline: loaded ({:.2}B params)", model.total_param_count() as f64 / 1e9);
+    println!(
+        "    Pipeline: loaded ({:.2}B params) | {} slot(s) × {} thread(s)",
+        model.total_param_count() as f64 / 1e9,
+        slots,
+        std::env::var("CMF_THREADS").unwrap_or_default(),
+    );
     println!();
 
     // Create runtime
@@ -858,9 +882,11 @@ async fn cmd_serve(
     if runtime.masks().get(default_task).is_some() {
         let _ = runtime.switch_task(default_task).await;
     }
+    let tokenizer = pipelines[0].tokenizer.clone();
     let state = Arc::new(AppState {
         runtime,
-        pipeline: Mutex::new(pipeline),
+        tokenizer,
+        slots: cortiq_server::PipelinePool::new(pipelines),
     });
 
     // Build router

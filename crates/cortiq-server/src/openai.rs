@@ -119,8 +119,11 @@ async fn run_generation(
     let mask = state.runtime.active_mask().await;
     let started = std::time::Instant::now();
 
+    // Check a pipeline slot out for this generation: up to
+    // `slots` requests decode concurrently, the rest queue here.
+    let mut slot = state.slots.acquire().await;
     let outcome = tokio::task::spawn_blocking(move || {
-        let mut p = state.pipeline.blocking_lock();
+        let p = &mut *slot.pipe;
         if let Some(t) = temperature {
             p.sampler_config.temperature = t;
         }
@@ -223,13 +226,12 @@ async fn chat_completions(
 
     // Chat template → prompt ids (uses real special tokens).
     let prompt_ids = {
-        let p = state.pipeline.lock().await;
         let msgs: Vec<(String, String)> = req
             .messages
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))
             .collect();
-        p.tokenizer.apply_chat_template_opts(&msgs, req.thinking())
+        state.tokenizer.apply_chat_template_opts(&msgs, req.thinking())
     };
 
     let request_id = format!("cmf-{}", uuid::Uuid::new_v4());
@@ -392,10 +394,7 @@ async fn completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionsRequest>,
 ) -> Response {
-    let prompt_ids = {
-        let p = state.pipeline.lock().await;
-        p.tokenizer.encode(&req.prompt)
-    };
+    let prompt_ids = state.tokenizer.encode(&req.prompt);
 
     let (result, elapsed_ms) = match run_generation(
         state.clone(),

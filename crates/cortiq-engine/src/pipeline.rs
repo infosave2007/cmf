@@ -43,7 +43,9 @@ impl ForwardScratch {
 
 /// Complete inference pipeline state.
 pub struct Pipeline {
-    pub tokenizer: Tokenizer,
+    /// Arc: the server shares one tokenizer handle across request
+    /// handlers without borrowing a pipeline slot.
+    pub tokenizer: std::sync::Arc<Tokenizer>,
     pub kv_cache: KvCache,
     pub sampler_config: SamplerConfig,
     pub weights: PipelineWeights,
@@ -306,7 +308,7 @@ impl Pipeline {
             tracing::info!("worker pool: {} threads", p.n_workers());
         }
         Self {
-            tokenizer,
+            tokenizer: std::sync::Arc::new(tokenizer),
             kv_cache: KvCache::new(num_layers, num_kv_heads, head_dim, max_seq_len),
             sampler_config,
             weights,
