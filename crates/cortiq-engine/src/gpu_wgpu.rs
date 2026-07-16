@@ -409,9 +409,10 @@ pub fn enabled() -> bool {
 }
 
 /// Probe helper: true — tensor `idx`'s weights are already resident;
-/// false — not yet (the upload happens NOW within the budget, without a
-/// dispatch, so the next touch is warm) or the tensor can't be resolved.
-pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize) -> bool {
+/// false — not yet (with `may_upload`, the upload happens NOW within the
+/// budget, without a dispatch, so the next touch is warm) or the tensor
+/// can't be resolved.
+pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize, may_upload: bool) -> bool {
     let Some(c) = ctx() else { return false };
     let entry = &model.tensors[idx];
     let rows_total = entry.shape.first().copied().unwrap_or(0);
@@ -430,7 +431,9 @@ pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize) -> bool {
     if c.weight_bufs.lock().unwrap().contains_key(&key) {
         return true;
     }
-    let _ = weight_buffer(c, key, &bytes[abs..abs + rows_total * cols]);
+    if may_upload {
+        let _ = weight_buffer(c, key, &bytes[abs..abs + rows_total * cols]);
+    }
     false
 }
 

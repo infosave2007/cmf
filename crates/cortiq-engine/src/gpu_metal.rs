@@ -205,14 +205,16 @@ pub fn enabled() -> bool {
 
 /// Probe helper: weights are no-copy over the file mapping, so residency
 /// is per FILE — true once the file buffer exists; otherwise create it
-/// now (no dispatch) and report cold.
-pub fn q8_resident_or_upload(model: &Arc<CmfModel>, _idx: usize) -> bool {
+/// now (no dispatch, `may_upload` permitting) and report cold.
+pub fn q8_resident_or_upload(model: &Arc<CmfModel>, _idx: usize, may_upload: bool) -> bool {
     let Some(c) = ctx() else { return false };
     let bytes = model.primary_bytes();
     if c.file_bufs.lock().unwrap().contains_key(&(bytes.as_ptr() as usize)) {
         return true;
     }
-    let _ = file_buffer(c, bytes);
+    if may_upload {
+        let _ = file_buffer(c, bytes);
+    }
     false
 }
 

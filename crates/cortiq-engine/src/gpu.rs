@@ -235,16 +235,25 @@ pub fn probe_deciding(c: OpClass) -> bool {
 /// were not (the upload starts within the VRAM budget, so a later call
 /// finds them warm) or the tensor cannot go to the GPU at all. Keeps the
 /// probe from billing a full cold dispatch+readback to a sample it will
-/// discard anyway.
+/// discard anyway. The verdict needs only a couple of warm tensors, so
+/// probe-driven uploads are capped — the losing-GPU machine should not
+/// pay for uploading the whole layer stack it will never use; if the GPU
+/// wins, the rest uploads lazily on demand, in the same first-touch order.
 #[allow(unused_variables)]
 pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize) -> bool {
-    match backend() {
+    static PROBE_UPLOADS: AtomicU32 = AtomicU32::new(0);
+    let may_upload = PROBE_UPLOADS.load(Ordering::Relaxed) < 4;
+    let resident = match backend() {
         #[cfg(target_os = "macos")]
-        Backend::Metal => crate::gpu_metal::q8_resident_or_upload(model, idx),
+        Backend::Metal => crate::gpu_metal::q8_resident_or_upload(model, idx, may_upload),
         #[cfg(feature = "gpu")]
-        Backend::Wgpu => crate::gpu_wgpu::q8_resident_or_upload(model, idx),
+        Backend::Wgpu => crate::gpu_wgpu::q8_resident_or_upload(model, idx, may_upload),
         Backend::None => false,
+    };
+    if !resident && may_upload {
+        PROBE_UPLOADS.fetch_add(1, Ordering::Relaxed);
     }
+    resident
 }
 
 /// Test hook: reset all probes to the undecided state.
