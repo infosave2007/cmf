@@ -549,21 +549,55 @@ fn project_position(
     // QKV in ONE device submission (этап 4): three matvecs, one poll —
     // gated by the same discrete-card threshold as every GPU op. Any
     // refusal (budget/dtype/shard) falls through to the CPU path.
-    let mut on_gpu = false;
+    // Runtime probe (Batch class): the batch either amortizes its
+    // submit+poll on this driver stack or the fused CPU dispatch wins.
+    let mut done = false;
     if crate::gpu::enabled_here() && wq.rows() >= crate::gpu::min_rows() {
-        if let (Some((m, jq)), Some((_, jk)), Some((_, jv))) = (
-            crate::qtensor::gpu_batch_job(wq, hidden),
-            crate::qtensor::gpu_batch_job(wk, hidden),
-            crate::qtensor::gpu_batch_job(wv, hidden),
-        ) {
-            on_gpu = crate::gpu::matvec_batch(
-                &m,
-                &[jq, jk, jv],
-                &mut [q_raw.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice()],
-            );
+        match crate::gpu::probe_arm(crate::gpu::OpClass::Batch) {
+            crate::gpu::ProbeArm::Gpu => {
+                if let (Some((m, jq)), Some((_, jk)), Some((_, jv))) = (
+                    crate::qtensor::gpu_batch_job(wq, hidden),
+                    crate::qtensor::gpu_batch_job(wk, hidden),
+                    crate::qtensor::gpu_batch_job(wv, hidden),
+                ) {
+                    let t0 = std::time::Instant::now();
+                    done = crate::gpu::matvec_batch(
+                        &m,
+                        &[jq, jk, jv],
+                        &mut [q_raw.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice()],
+                    );
+                    if done {
+                        crate::gpu::probe_record(crate::gpu::OpClass::Batch, true, t0.elapsed());
+                    }
+                }
+            }
+            crate::gpu::ProbeArm::CpuTimed => {
+                let t0 = std::time::Instant::now();
+                crate::gpu::cpu_scope(|| {
+                    QTensor::matvec_many(
+                        [wq, wk, wv],
+                        hidden,
+                        [q_raw.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice()],
+                        cfg.pool,
+                    )
+                });
+                crate::gpu::probe_record(crate::gpu::OpClass::Batch, false, t0.elapsed());
+                done = true;
+            }
+            crate::gpu::ProbeArm::Cpu => {
+                crate::gpu::cpu_scope(|| {
+                    QTensor::matvec_many(
+                        [wq, wk, wv],
+                        hidden,
+                        [q_raw.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice()],
+                        cfg.pool,
+                    )
+                });
+                done = true;
+            }
         }
     }
-    if !on_gpu {
+    if !done {
         // Multi-matrix job: Q, K and V projections under one pool dispatch.
         QTensor::matvec_many(
             [wq, wk, wv],

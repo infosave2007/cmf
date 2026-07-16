@@ -404,6 +404,25 @@ impl QTensor {
                     && std::env::var("CMF_GPU_LMHEAD").map(|v| v != "0").unwrap_or(true)
                     && crate::gpu::enabled_here()
                 {
+                    // Runtime probe: alternate the hybrid against the
+                    // pure-CPU matvec, keep whichever is faster HERE.
+                    let t0 = std::time::Instant::now();
+                    match crate::gpu::probe_arm(crate::gpu::OpClass::Matvec) {
+                        crate::gpu::ProbeArm::Gpu => {}
+                        crate::gpu::ProbeArm::CpuTimed => {
+                            qmatvec(self.quant_bytes(), row_scale, &xs, *rows, *cols, out, pool);
+                            crate::gpu::probe_record(
+                                crate::gpu::OpClass::Matvec,
+                                false,
+                                t0.elapsed(),
+                            );
+                            return;
+                        }
+                        crate::gpu::ProbeArm::Cpu => {
+                            qmatvec(self.quant_bytes(), row_scale, &xs, *rows, *cols, out, pool);
+                            return;
+                        }
+                    }
                     let frac = std::env::var("CMF_GPU_SPLIT")
                         .ok()
                         .and_then(|v| v.parse::<f32>().ok())
@@ -439,6 +458,7 @@ impl QTensor {
                         g.join().unwrap_or(false)
                     });
                     if ok {
+                        crate::gpu::probe_record(crate::gpu::OpClass::Matvec, true, t0.elapsed());
                         return;
                     }
                     // GPU failed — CPU finishes its half.
@@ -545,17 +565,41 @@ impl QTensor {
                     .collect();
                 // D5: large prefill-batch GEMMs — on the GPU (threshold by
                 // work volume: submission carries b×rows×cols MACs).
+                // Runtime probe: the naive GEMM shader + sync readback
+                // lose to the CPU GEMM on slow driver stacks — alternate
+                // both arms and keep the winner.
                 if b >= 8
                     && b * rows * cols >= 128_000_000
                     && crate::gpu::enabled_here()
                 {
                     if let Self::Mapped { model, idx, .. } = self {
-                        let flat: Vec<f32> =
-                            pre.iter().flat_map(|v| v.iter().copied()).collect();
-                        if crate::gpu::q8_matmat(
-                            model, *idx, row_scale, &flat, b, rows, cols, out)
-                        {
-                            return;
+                        let t0 = std::time::Instant::now();
+                        match crate::gpu::probe_arm(crate::gpu::OpClass::Matmat) {
+                            crate::gpu::ProbeArm::Gpu => {
+                                let flat: Vec<f32> =
+                                    pre.iter().flat_map(|v| v.iter().copied()).collect();
+                                if crate::gpu::q8_matmat(
+                                    model, *idx, row_scale, &flat, b, rows, cols, out)
+                                {
+                                    crate::gpu::probe_record(
+                                        crate::gpu::OpClass::Matmat,
+                                        true,
+                                        t0.elapsed(),
+                                    );
+                                    return;
+                                }
+                            }
+                            crate::gpu::ProbeArm::CpuTimed => {
+                                let q = self.quant_bytes();
+                                qmatmat(q, row_scale, &pre, rows, cols, out, pool);
+                                crate::gpu::probe_record(
+                                    crate::gpu::OpClass::Matmat,
+                                    false,
+                                    t0.elapsed(),
+                                );
+                                return;
+                            }
+                            crate::gpu::ProbeArm::Cpu => {}
                         }
                     }
                 }

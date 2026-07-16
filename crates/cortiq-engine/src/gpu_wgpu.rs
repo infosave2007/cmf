@@ -220,6 +220,7 @@ impl Scratch {
         match slot {
             Some((b, cap)) if *cap >= need => b.clone(),
             _ => {
+                crate::gpu::probe_note_cold();
                 let cap = need.next_power_of_two().max(4096);
                 let b = dev.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(label),
@@ -391,6 +392,7 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
     if c.resident.load(Ordering::Relaxed) + len > c.vram_budget {
         return None; // budget spent — this tensor stays on the CPU
     }
+    crate::gpu::probe_note_cold(); // first touch = upload, not a steady sample
     let buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("q8-weights"),
         contents: full_quant,
@@ -481,7 +483,10 @@ fn dispatch_matvec(
             .lock()
             .unwrap()
             .entry((base ^ idx.wrapping_mul(1_000_003), row0))
-            .or_insert_with(make_rs)
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                make_rs()
+            })
             .clone(),
         None => make_rs(),
     };
@@ -641,6 +646,7 @@ fn dispatch_matmat(
             .unwrap()
             .entry((base ^ idx.wrapping_mul(1_000_003), usize::MAX))
             .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
                 c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("mm-rs"),
                     contents: bytemuck::cast_slice(&row_scale[..rows]),
@@ -900,7 +906,10 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         let mut cached = |tag: usize, idx: usize, data: &[f32]| -> wgpu::Buffer {
             rs_map
                 .entry((idx.wrapping_mul(1_000_003) ^ tag, usize::MAX - 1))
-                .or_insert_with(|| storage_bytes(c, bytemuck::cast_slice(data)))
+                .or_insert_with(|| {
+                    crate::gpu::probe_note_cold();
+                    storage_bytes(c, bytemuck::cast_slice(data))
+                })
                 .clone()
         };
         let grs_b = cached(1, j.gate.0, grs);

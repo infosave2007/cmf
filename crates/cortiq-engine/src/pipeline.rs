@@ -2002,12 +2002,34 @@ fn dense_ffn(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
     // chained in ONE command buffer with the intermediate activations
     // resident on the device — 3 per-op polls become 1 per layer. The
     // moe_block backend already implements exactly this chain; a dense
-    // FFN is one expert with weight 1.
-    if crate::gpu::enabled_here() {
-        if let Some(out) = dense_ffn_gpu(d, x, pool) {
-            return out;
+    // FFN is one expert with weight 1. Runtime probe: the chain still
+    // pays one submit+poll per layer — alternate it against the pure-CPU
+    // FFN and keep whichever is faster on this machine.
+    if crate::gpu::enabled_here() && d.gate_proj.rows() >= crate::gpu::min_rows() {
+        match crate::gpu::probe_arm(crate::gpu::OpClass::Ffn) {
+            crate::gpu::ProbeArm::Gpu => {
+                let t0 = std::time::Instant::now();
+                if let Some(out) = dense_ffn_gpu(d, x, pool) {
+                    crate::gpu::probe_record(crate::gpu::OpClass::Ffn, true, t0.elapsed());
+                    return out;
+                }
+            }
+            crate::gpu::ProbeArm::CpuTimed => {
+                let t0 = std::time::Instant::now();
+                let out = crate::gpu::cpu_scope(|| dense_ffn_cpu(d, x, pool));
+                crate::gpu::probe_record(crate::gpu::OpClass::Ffn, false, t0.elapsed());
+                return out;
+            }
+            crate::gpu::ProbeArm::Cpu => {
+                return crate::gpu::cpu_scope(|| dense_ffn_cpu(d, x, pool));
+            }
         }
     }
+    dense_ffn_cpu(d, x, pool)
+}
+
+/// The pure-CPU dense-FFN body (also the fallback of every GPU refusal).
+fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
     let inter = d.gate_proj.rows();
     FFN_SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
@@ -2232,14 +2254,42 @@ fn moe_ffn(m: &MoeFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
     }
     // D5: the whole layer MoE block in one GPU command buffer (experts — the
     // same mmap via a no-copy buffer; intermediate activations on the GPU).
+    // Same Ffn probe class as the dense chain: one submit per layer
+    // either wins on this driver stack or it doesn't.
     if crate::gpu::enabled_here() {
-        if let Some(out) = moe_ffn_gpu(m, x, &idx, &p, wsum, pool) {
-            return out;
+        match crate::gpu::probe_arm(crate::gpu::OpClass::Ffn) {
+            crate::gpu::ProbeArm::Gpu => {
+                let t0 = std::time::Instant::now();
+                if let Some(out) = moe_ffn_gpu(m, x, &idx, &p, wsum, pool) {
+                    crate::gpu::probe_record(crate::gpu::OpClass::Ffn, true, t0.elapsed());
+                    return out;
+                }
+            }
+            crate::gpu::ProbeArm::CpuTimed => {
+                let t0 = std::time::Instant::now();
+                let out = crate::gpu::cpu_scope(|| moe_ffn_cpu(m, x, &idx, &p, wsum, pool));
+                crate::gpu::probe_record(crate::gpu::OpClass::Ffn, false, t0.elapsed());
+                return out;
+            }
+            crate::gpu::ProbeArm::Cpu => {
+                return crate::gpu::cpu_scope(|| moe_ffn_cpu(m, x, &idx, &p, wsum, pool));
+            }
         }
     }
+    moe_ffn_cpu(m, x, &idx, &p, wsum, pool)
+}
 
+/// The pure-CPU MoE expert loop (also the fallback of every GPU refusal).
+fn moe_ffn_cpu(
+    m: &MoeFfn,
+    x: &[f32],
+    idx: &[usize],
+    p: &[f32],
+    wsum: f32,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
     let mut out = attention::take_buf(x.len());
-    for &e in &idx {
+    for &e in idx {
         let mut eo = dense_ffn(&m.experts[e], x, pool);
         let w = p[e] / wsum;
         for i in 0..out.len() {

@@ -12,6 +12,7 @@
 
 use cortiq_core::CmfModel;
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
 thread_local! {
@@ -19,6 +20,29 @@ thread_local! {
     /// lm_head/embed — always allowed). The pipeline sets it before
     /// each layer so that the GPU/CPU layer-split works.
     static CUR_LAYER: Cell<i64> = const { Cell::new(-1) };
+    /// Inside `cpu_scope` every GPU gate reports disabled: the timed CPU
+    /// arm of a probe (and a class that lost its probe) must run PURE
+    /// CPU, or inner per-op hooks would re-enter the GPU and poison the
+    /// comparison.
+    static CPU_ONLY: Cell<bool> = const { Cell::new(false) };
+    /// "This op paid a one-off cost" (weight upload / first pipeline
+    /// build): backends set it, `probe_record` discards the sample so
+    /// only steady-state timings compete.
+    static PROBE_COLD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` with the GPU gates off on this thread (pure-CPU arm).
+pub fn cpu_scope<R>(f: impl FnOnce() -> R) -> R {
+    CPU_ONLY.with(|c| c.set(true));
+    let r = f();
+    CPU_ONLY.with(|c| c.set(false));
+    r
+}
+
+/// Backends: note a one-off cost (weight upload, buffer-cache fill) so
+/// the probe discards this sample.
+pub(crate) fn probe_note_cold() {
+    PROBE_COLD.with(|c| c.set(true));
 }
 
 /// Pipeline: mark the current layer (or −1 outside layers) for layer-split.
@@ -58,9 +82,193 @@ fn layer_allowed() -> bool {
 }
 
 /// GPU allowed FOR THE CURRENT LAYER: backend is initialized AND the layer
-/// falls within `CMF_GPU_LAYERS` (GPU/CPU layer-split). Op gates call this.
+/// falls within `CMF_GPU_LAYERS` (GPU/CPU layer-split) AND we are not
+/// inside a `cpu_scope`. Op gates call this.
 pub fn enabled_here() -> bool {
-    enabled() && layer_allowed()
+    !CPU_ONLY.with(|c| c.get()) && enabled() && layer_allowed()
+}
+
+// ── Runtime GPU-vs-CPU probe ────────────────────────────────────────────
+// CMF_GPU=1 does not TRUST that the device wins — it MEASURES. For each
+// op class the first calls alternate arms: GPU timed vs pure-CPU timed
+// (under cpu_scope). Cold GPU calls (weight upload / cache fill) are
+// discarded; after PROBE_SAMPLES clean samples per arm the faster arm is
+// chosen for the rest of the process. Rationale: submit+poll latency
+// differs by an order of magnitude across driver stacks (Metal/PCIe
+// ~3-4 ms, Vulkan/4090 ~0.3 ms) — a static threshold cannot know whether
+// per-op offload pays off HERE. CMF_GPU_PROBE=0 → always trust the GPU.
+
+/// GPU-eligible op classes, each with an independent probe.
+#[derive(Clone, Copy)]
+pub enum OpClass {
+    /// Whole FFN chain in one submission (dense / MoE block).
+    Ffn = 0,
+    /// Large hybrid CPU∥GPU matvec (lm_head class).
+    Matvec = 1,
+    /// Prefill GEMM (matmat).
+    Matmat = 2,
+    /// Batched matvecs of one input (QKV).
+    Batch = 3,
+}
+
+/// Probe verdict for one call.
+pub enum ProbeArm {
+    /// Run the GPU path (during probing: timed, recorded).
+    Gpu,
+    /// Probing: run the CPU path under `cpu_scope`, timed, recorded.
+    CpuTimed,
+    /// Decided: CPU won — run the CPU path (under `cpu_scope`).
+    Cpu,
+}
+
+/// Clean samples per arm before a class decides.
+const PROBE_SAMPLES: u32 = 6;
+
+struct Probe {
+    /// 0 = probing, 1 = GPU won, 2 = CPU won.
+    state: AtomicU8,
+    flip: AtomicU32,
+    gpu_ns: AtomicU64,
+    gpu_n: AtomicU32,
+    cpu_ns: AtomicU64,
+    cpu_n: AtomicU32,
+}
+
+impl Probe {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            flip: AtomicU32::new(0),
+            gpu_ns: AtomicU64::new(0),
+            gpu_n: AtomicU32::new(0),
+            cpu_ns: AtomicU64::new(0),
+            cpu_n: AtomicU32::new(0),
+        }
+    }
+}
+
+static PROBES: [Probe; 4] = [Probe::new(), Probe::new(), Probe::new(), Probe::new()];
+
+fn probe_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CMF_GPU_PROBE")
+            .map(|v| v != "0" && v != "off")
+            .unwrap_or(true)
+    })
+}
+
+/// Which arm should this GPU-eligible call take? Consult AFTER the
+/// eligibility gates (`enabled_here` / `min_rows`) so only real
+/// candidates alternate.
+pub fn probe_arm(c: OpClass) -> ProbeArm {
+    if !probe_on() {
+        return ProbeArm::Gpu;
+    }
+    let p = &PROBES[c as usize];
+    match p.state.load(Ordering::Relaxed) {
+        1 => ProbeArm::Gpu,
+        2 => ProbeArm::Cpu,
+        _ => {
+            PROBE_COLD.with(|f| f.set(false));
+            if p.flip.fetch_add(1, Ordering::Relaxed) % 2 == 0 {
+                ProbeArm::Gpu
+            } else {
+                ProbeArm::CpuTimed
+            }
+        }
+    }
+}
+
+/// Record a timed arm sample; on the `PROBE_SAMPLES`-th clean sample of
+/// BOTH arms the class decides for the rest of the process.
+pub fn probe_record(c: OpClass, gpu: bool, dur: std::time::Duration) {
+    let p = &PROBES[c as usize];
+    if p.state.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    if gpu && PROBE_COLD.with(|f| f.replace(false)) {
+        return; // one-off cost in this call — not a steady-state sample
+    }
+    let ns = dur.as_nanos().min(u64::MAX as u128) as u64;
+    if gpu {
+        p.gpu_ns.fetch_add(ns, Ordering::Relaxed);
+        p.gpu_n.fetch_add(1, Ordering::Relaxed);
+    } else {
+        p.cpu_ns.fetch_add(ns, Ordering::Relaxed);
+        p.cpu_n.fetch_add(1, Ordering::Relaxed);
+    }
+    let (gn, cn) = (p.gpu_n.load(Ordering::Relaxed), p.cpu_n.load(Ordering::Relaxed));
+    if gn >= PROBE_SAMPLES && cn >= PROBE_SAMPLES {
+        let g = p.gpu_ns.load(Ordering::Relaxed) as f64 / gn as f64;
+        let cp = p.cpu_ns.load(Ordering::Relaxed) as f64 / cn as f64;
+        let winner = if g <= cp { 1 } else { 2 };
+        if p
+            .state
+            .compare_exchange(0, winner, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            tracing::info!(
+                "gpu probe [{}]: gpu {:.2} ms vs cpu {:.2} ms per op → {}",
+                ["ffn", "matvec", "matmat", "qkv-batch"][c as usize],
+                g / 1e6,
+                cp / 1e6,
+                if winner == 1 { "gpu" } else { "cpu" },
+            );
+        }
+    }
+}
+
+/// Test hook: reset all probes to the undecided state.
+#[cfg(test)]
+pub(crate) fn probe_reset() {
+    for p in &PROBES {
+        p.state.store(0, Ordering::Relaxed);
+        p.flip.store(0, Ordering::Relaxed);
+        p.gpu_ns.store(0, Ordering::Relaxed);
+        p.gpu_n.store(0, Ordering::Relaxed);
+        p.cpu_ns.store(0, Ordering::Relaxed);
+        p.cpu_n.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // One test fn: PROBES is process-global and probe_reset touches all
+    // classes — parallel test threads would race.
+    #[test]
+    fn probe_alternates_discards_cold_and_decides() {
+        probe_reset();
+        // Probing: arms alternate.
+        assert!(matches!(probe_arm(OpClass::Ffn), ProbeArm::Gpu));
+        assert!(matches!(probe_arm(OpClass::Ffn), ProbeArm::CpuTimed));
+
+        // A cold GPU sample (upload noted) must be discarded: feed a
+        // catastrophic cold sample, then clean fast-GPU samples — GPU
+        // wins only if the cold one did not count.
+        probe_note_cold();
+        probe_record(OpClass::Ffn, true, Duration::from_secs(1000));
+        for _ in 0..PROBE_SAMPLES {
+            probe_record(OpClass::Ffn, true, Duration::from_millis(1));
+            probe_record(OpClass::Ffn, false, Duration::from_millis(4));
+        }
+        assert!(matches!(probe_arm(OpClass::Ffn), ProbeArm::Gpu));
+
+        // The reverse: a class where the CPU arm is faster decides CPU.
+        for _ in 0..PROBE_SAMPLES {
+            probe_record(OpClass::Matmat, true, Duration::from_millis(4));
+            probe_record(OpClass::Matmat, false, Duration::from_millis(1));
+        }
+        assert!(matches!(probe_arm(OpClass::Matmat), ProbeArm::Cpu));
+
+        // cpu_scope: gates off inside, restored after.
+        cpu_scope(|| CPU_ONLY.with(|c| assert!(c.get())));
+        CPU_ONLY.with(|c| assert!(!c.get()));
+        probe_reset();
+    }
 }
 
 /// Default row threshold: the GPU takes only larger matrices (lm_head

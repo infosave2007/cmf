@@ -244,6 +244,7 @@ fn file_buffer(c: &Ctx, bytes: &[u8]) -> Option<(Buffer, usize)> {
     if let Some(b) = cache.get(&base) {
         return Some((b.clone(), len));
     }
+    crate::gpu::probe_note_cold();
     let buf = c._device.new_buffer_with_bytes_no_copy(
         bytes.as_ptr() as *const std::ffi::c_void,
         len as u64,
@@ -305,6 +306,7 @@ pub fn q8_matvec_range(
         cache
             .entry((base, idx + row0 * 1_000_003))
             .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
                 c._device.new_buffer_with_data(
                     row_scale.as_ptr() as *const std::ffi::c_void,
                     (row_scale.len() * 4) as u64,
@@ -318,6 +320,7 @@ pub fn q8_matvec_range(
         cache
             .entry(nbytes)
             .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
                 c._device
                     .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
             })
@@ -395,6 +398,7 @@ pub fn q8_matmat(
         cache
             .entry((base, idx))
             .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
                 c._device.new_buffer_with_data(
                     row_scale.as_ptr() as *const std::ffi::c_void,
                     (row_scale.len() * 4) as u64,
@@ -408,6 +412,7 @@ pub fn q8_matmat(
         cache
             .entry(key)
             .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
                 c._device
                     .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
             })
@@ -496,6 +501,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         cache
             .entry(key)
             .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
                 c._device
                     .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
             })
@@ -513,6 +519,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         cache
             .entry((base + salt, idx))
             .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
                 c._device.new_buffer_with_data(
                     data.as_ptr() as *const std::ffi::c_void,
                     (data.len() * 4) as u64,
@@ -639,6 +646,7 @@ pub fn matvec_batch(
         cache
             .entry(key)
             .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
                 c._device
                     .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
             })
@@ -649,6 +657,7 @@ pub fn matvec_batch(
         cache
             .entry((base, idx))
             .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
                 c._device.new_buffer_with_data(
                     data.as_ptr() as *const std::ffi::c_void,
                     (data.len() * 4) as u64,
