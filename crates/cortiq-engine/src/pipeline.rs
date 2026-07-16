@@ -301,7 +301,7 @@ fn prefill_chunk() -> usize {
         return n.max(1);
     }
     if cfg!(target_os = "macos") {
-        256
+        512
     } else {
         48
     }

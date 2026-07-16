@@ -159,6 +159,94 @@ unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
 }
 }
 
+/// exp(x) for one NEON vector — Cephes-style degree-6 polynomial,
+/// |rel err| < 2e-7 on the softmax range. The batched-attend softmax
+/// calls exp hundreds of millions of times per long prefill; libm's
+/// scalar expf there would eat the whole GEMM win.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn vexpq_f32(
+    x: core::arch::aarch64::float32x4_t,
+) -> core::arch::aarch64::float32x4_t {
+    // SAFETY: pure register math.
+    unsafe {
+        use core::arch::aarch64::*;
+        let x = vmaxq_f32(x, vdupq_n_f32(-87.0));
+        let x = vminq_f32(x, vdupq_n_f32(88.0));
+        let n = vrndnq_f32(vmulq_f32(x, vdupq_n_f32(std::f32::consts::LOG2_E)));
+        // r = x − n·ln2, split hi/lo for accuracy (Cephes).
+        let r = vfmsq_f32(x, n, vdupq_n_f32(0.693_359_4));
+        let r = vfmsq_f32(r, n, vdupq_n_f32(-2.121_944_4e-4));
+        let mut p = vdupq_n_f32(1.987_569_1e-4);
+        p = vfmaq_f32(vdupq_n_f32(1.398_2e-3), p, r);
+        p = vfmaq_f32(vdupq_n_f32(8.333_452e-3), p, r);
+        p = vfmaq_f32(vdupq_n_f32(4.166_579_6e-2), p, r);
+        p = vfmaq_f32(vdupq_n_f32(1.666_666_5e-1), p, r);
+        p = vfmaq_f32(vdupq_n_f32(5.000_000_3e-1), p, r);
+        let r2 = vmulq_f32(r, r);
+        let e = vaddq_f32(vaddq_f32(vdupq_n_f32(1.0), r), vmulq_f32(p, r2));
+        let pow2 = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(
+            vcvtq_s32_f32(n),
+            vdupq_n_s32(127),
+        )));
+        vmulq_f32(e, pow2)
+    }
+}
+
+/// Numerically stable in-place softmax of one score row — vectorized
+/// max / exp / sum on aarch64 (scalar exp only on the tail).
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn softmax_row(row: &mut [f32]) {
+    // SAFETY: slice reads/writes within bounds.
+    unsafe {
+        use core::arch::aarch64::*;
+        let nn = row.len();
+        let p = row.as_mut_ptr();
+        let mut j = 0usize;
+        let mut mv = vdupq_n_f32(f32::NEG_INFINITY);
+        while j + 4 <= nn {
+            mv = vmaxq_f32(mv, vld1q_f32(p.add(j)));
+            j += 4;
+        }
+        let mut maxs = vmaxvq_f32(mv);
+        while j < nn {
+            maxs = maxs.max(*p.add(j));
+            j += 1;
+        }
+        if maxs == f32::NEG_INFINITY {
+            return;
+        }
+        let mvv = vdupq_n_f32(maxs);
+        let mut sumv = vdupq_n_f32(0.0);
+        j = 0;
+        while j + 4 <= nn {
+            let e = vexpq_f32(vsubq_f32(vld1q_f32(p.add(j)), mvv));
+            vst1q_f32(p.add(j), e);
+            sumv = vaddq_f32(sumv, e);
+            j += 4;
+        }
+        let mut sum = vaddvq_f32(sumv);
+        while j < nn {
+            let e = (*p.add(j) - maxs).exp();
+            *p.add(j) = e;
+            sum += e;
+            j += 1;
+        }
+        if sum > 0.0 {
+            let inv = vdupq_n_f32(1.0 / sum);
+            j = 0;
+            while j + 4 <= nn {
+                vst1q_f32(p.add(j), vmulq_f32(vld1q_f32(p.add(j)), inv));
+                j += 4;
+            }
+            while j < nn {
+                *p.add(j) *= 1.0 / sum;
+                j += 1;
+            }
+        }
+    }
+}
+
 /// `acc += w · row` (f32 axpy) — NEON on aarch64, scalar elsewhere.
 #[inline]
 pub(crate) fn axpy_f32(acc: &mut [f32], row: &[f32], w: f32) {
@@ -800,9 +888,20 @@ pub fn qwen_attention_batch(
     wk.matmat(normed_all, b, &mut k_all, cfg.pool);
     wv.matmat(normed_all, b, &mut v_all, cfg.pool);
 
-    // ── per-position: bias, gate split, qk-norm, partial RoPE, causal
-    //    attention over the growing cache ──
+    // ── per-position: bias, gate split, qk-norm, partial RoPE, append;
+    //    the attend either runs per position (exact historical order)
+    //    or batched over the whole chunk after the appends ──
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let batched_attend = b >= 32
+        && cache.mode == crate::kv_cache::KvMode::F32
+        && crate::qtensor::accel_gemm_enabled();
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let batched_attend = false;
+    let s0 = cache.seq_len;
     let mut ao_all = take_buf(b * nh * hd);
+    let mut q_rope_all = if batched_attend { take_buf(b * nh * hd) } else { Vec::new() };
+    let mut gates_all =
+        if batched_attend && cfg.output_gate { take_buf(b * nh * hd) } else { Vec::new() };
     let rd = cfg.rotary_dim.min(hd);
     for bi in 0..b {
         let pos = cfg.position + bi;
@@ -856,17 +955,33 @@ pub fn qwen_attention_batch(
 
         cache.o1_push_q(&q);
         cache.append(k, v, &[]);
-        let (mut ao, mut imp) = attend_all_heads(&q, cache, nh, heads_per_kv, hd);
-        cache.accumulate_imp(&imp);
-        if cfg.output_gate {
-            apply_gate(&mut ao, &gate);
+        if batched_attend {
+            q_rope_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&q);
+            if cfg.output_gate {
+                gates_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&gate);
+            }
+        } else {
+            let (mut ao, mut imp) = attend_all_heads(&q, cache, nh, heads_per_kv, hd);
+            cache.accumulate_imp(&imp);
+            if cfg.output_gate {
+                apply_gate(&mut ao, &gate);
+            }
+            ao_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&ao);
+            recycle_buf(&mut ao);
+            recycle_buf(&mut imp);
         }
-        ao_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&ao);
-        recycle_buf(&mut ao);
-        recycle_buf(&mut imp);
         recycle_buf(&mut q);
         recycle_buf(&mut gate);
     }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if batched_attend {
+        cache.attend_chunk(&q_rope_all, b, s0, nh, heads_per_kv, hd, &mut ao_all, cfg.pool);
+        if cfg.output_gate {
+            apply_gate(&mut ao_all, &gates_all);
+        }
+    }
+    recycle_buf(&mut q_rope_all);
+    recycle_buf(&mut gates_all);
 
     // ── chunk-GEMM output projection ──
     let mut out = vec![0.0f32; b * cfg.hidden_size];

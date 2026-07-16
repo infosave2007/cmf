@@ -600,6 +600,97 @@ impl LayerKvCache {
         });
     }
 
+    /// Batched causal attend for a prefill chunk (macOS/AArch64): the
+    /// cache already holds every chunk row (`s0` old + `b` new). Per
+    /// Q-head the scores GEMM `Q·Kᵀ` rides the AMX, the causal softmax
+    /// zeroes the not-yet-visible tail so the `P·V` GEMM needs no
+    /// mask, and Born importance takes the masked column sums. Same
+    /// math as the per-position attend; summation order differs
+    /// (tolerance-class, like the projection GEMMs).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend_chunk(
+        &mut self,
+        q_all: &[f32],
+        b: usize,
+        s0: usize,
+        nh: usize,
+        heads_per_kv: usize,
+        hd: usize,
+        out: &mut [f32],
+        pool: Option<&crate::pool::Pool>,
+    ) {
+        let n = s0 + b;
+        let scale = 1.0 / (hd as f32).sqrt();
+        struct SendPtr(*mut f32);
+        unsafe impl Send for SendPtr {}
+        unsafe impl Sync for SendPtr {}
+        impl SendPtr {
+            fn at(&self, i: usize) -> *mut f32 {
+                // Method receiver keeps the closure capturing &SendPtr
+                // (2021 disjoint capture would grab the raw field).
+                unsafe { self.0.add(i) }
+            }
+        }
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>, Vec<f32>)> =
+                const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+        }
+        SCRATCH.with(|s| {
+            let mut s = s.borrow_mut();
+            let (qpanel, scores, aopanel) = &mut *s;
+            qpanel.resize(b * hd, 0.0);
+            scores.resize(b * n, 0.0);
+            aopanel.resize(b * hd, 0.0);
+            for g in 0..self.num_kv_heads {
+                let kmat = &self.k[g];
+                let vmat = &self.v[g];
+                debug_assert_eq!(kmat.len(), n * hd);
+                for hl in 0..heads_per_kv {
+                    let hh = g * heads_per_kv + hl;
+                    for bi in 0..b {
+                        qpanel[bi * hd..(bi + 1) * hd]
+                            .copy_from_slice(&q_all[bi * nh * hd + hh * hd..][..hd]);
+                    }
+                    crate::qtensor::sgemm_rm(b, n, hd, scale, qpanel, hd, kmat, hd, true, scores, n);
+                    // Causal softmax, row-parallel (rows are disjoint).
+                    let sp = SendPtr(scores.as_mut_ptr());
+                    let run = |start: usize, end: usize| {
+                        for bi in start..end {
+                            let allowed = s0 + bi + 1;
+                            // SAFETY: workers cover disjoint bi ranges.
+                            let row =
+                                unsafe { std::slice::from_raw_parts_mut(sp.at(bi * n), n) };
+                            crate::attention::softmax_row(&mut row[..allowed]);
+                            row[allowed..].fill(0.0);
+                        }
+                    };
+                    match pool {
+                        Some(p) if b >= 64 => p.run_rows(b, &run),
+                        _ => run(0, b),
+                    }
+                    // Born importance: masked column sums (probs of the
+                    // zeroed tail contribute nothing, same as the CPU
+                    // per-position accumulate).
+                    let ni = self.imp.len().min(n);
+                    for bi in 0..b {
+                        let al = (s0 + bi + 1).min(ni);
+                        for (dst, &p) in
+                            self.imp[..al].iter_mut().zip(&scores[bi * n..bi * n + al])
+                        {
+                            *dst += p;
+                        }
+                    }
+                    crate::qtensor::sgemm_rm(b, hd, n, 1.0, scores, n, vmat, hd, false, aopanel, hd);
+                    for bi in 0..b {
+                        out[bi * nh * hd + hh * hd..][..hd]
+                            .copy_from_slice(&aopanel[bi * hd..(bi + 1) * hd]);
+                    }
+                }
+            }
+        });
+    }
+
     /// Roll back the last `n_drop` positions (speculative-decode reject).
     pub fn truncate_last(&mut self, n_drop: usize) {
         let d = n_drop.min(self.seq_len);

@@ -1240,9 +1240,48 @@ mod accel_blas {
 }
 
 #[cfg(target_os = "macos")]
-fn accel_gemm_enabled() -> bool {
+pub(crate) fn accel_gemm_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CMF_ACCEL").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Row-major f32 GEMM on Accelerate: C[m,n] = alpha·A[m,k] × B(ᵀ).
+/// `b_rows_are_n` = true multiplies by Bᵀ where B is stored [n, k].
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sgemm_rm(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: &[f32],
+    lda: usize,
+    b_mat: &[f32],
+    ldb: usize,
+    b_rows_are_n: bool,
+    c: &mut [f32],
+    ldc: usize,
+) {
+    debug_assert!(a.len() >= (m - 1) * lda + k);
+    debug_assert!(c.len() >= (m - 1) * ldc + n);
+    unsafe {
+        accel_blas::cblas_sgemm(
+            101, // RowMajor
+            111, // NoTrans A
+            if b_rows_are_n { 112 } else { 111 },
+            m as i32,
+            n as i32,
+            k as i32,
+            alpha,
+            a.as_ptr(),
+            lda as i32,
+            b_mat.as_ptr(),
+            ldb as i32,
+            0.0,
+            c.as_mut_ptr(),
+            ldc as i32,
+        );
+    }
 }
 
 /// Prefill GEMM through Accelerate (macOS): dequantize q8 rows into
