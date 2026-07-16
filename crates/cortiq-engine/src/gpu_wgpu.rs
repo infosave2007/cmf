@@ -408,6 +408,32 @@ pub fn enabled() -> bool {
     ctx().is_some()
 }
 
+/// Probe helper: true — tensor `idx`'s weights are already resident;
+/// false — not yet (the upload happens NOW within the budget, without a
+/// dispatch, so the next touch is warm) or the tensor can't be resolved.
+pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    let entry = &model.tensors[idx];
+    let rows_total = entry.shape.first().copied().unwrap_or(0);
+    let cols = entry.shape.get(1).copied().unwrap_or(0);
+    if rows_total == 0 || cols == 0 {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let bytes = model.primary_bytes();
+    if abs + rows_total * cols > bytes.len() {
+        return false;
+    }
+    let key = (bytes.as_ptr() as usize, idx);
+    if c.weight_bufs.lock().unwrap().contains_key(&key) {
+        return true;
+    }
+    let _ = weight_buffer(c, key, &bytes[abs..abs + rows_total * cols]);
+    false
+}
+
 /// q8_row/q8_2f matvec on the GPU, rows [row0, row0+rows). `xs` are already
 /// prescaled activations. false = could not (the caller falls back to CPU).
 #[allow(clippy::too_many_arguments)]

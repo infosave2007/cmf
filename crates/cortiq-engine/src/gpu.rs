@@ -224,6 +224,29 @@ pub fn probe_record(c: OpClass, gpu: bool, dur: std::time::Duration) {
     }
 }
 
+/// Is the class still collecting samples? (Call sites use this to route
+/// cold-weight calls away from the GPU arm during probing.)
+pub fn probe_deciding(c: OpClass) -> bool {
+    probe_on() && PROBES[c as usize].state.load(Ordering::Relaxed) == 0
+}
+
+/// Probing helper: true — tensor `idx`'s quant weights are ALREADY
+/// device-resident (a clean GPU sample is possible now); false — they
+/// were not (the upload starts within the VRAM budget, so a later call
+/// finds them warm) or the tensor cannot go to the GPU at all. Keeps the
+/// probe from billing a full cold dispatch+readback to a sample it will
+/// discard anyway.
+#[allow(unused_variables)]
+pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q8_resident_or_upload(model, idx),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q8_resident_or_upload(model, idx),
+        Backend::None => false,
+    }
+}
+
 /// Test hook: reset all probes to the undecided state.
 #[cfg(test)]
 pub(crate) fn probe_reset() {

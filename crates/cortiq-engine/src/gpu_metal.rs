@@ -203,6 +203,19 @@ pub fn enabled() -> bool {
     ctx().is_some()
 }
 
+/// Probe helper: weights are no-copy over the file mapping, so residency
+/// is per FILE — true once the file buffer exists; otherwise create it
+/// now (no dispatch) and report cold.
+pub fn q8_resident_or_upload(model: &Arc<CmfModel>, _idx: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    let bytes = model.primary_bytes();
+    if c.file_bufs.lock().unwrap().contains_key(&(bytes.as_ptr() as usize)) {
+        return true;
+    }
+    let _ = file_buffer(c, bytes);
+    false
+}
+
 /// Latency-critical wait: spin-poll the status instead of
 /// waitUntilCompleted (sleeping/waking the thread costs ~1–3 ms —
 /// across 40 MoE layers/token this canceled out the kernel's gain).

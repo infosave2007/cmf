@@ -575,6 +575,17 @@ impl QTensor {
                     if let Self::Mapped { model, idx, .. } = self {
                         let t0 = std::time::Instant::now();
                         match crate::gpu::probe_arm(crate::gpu::OpClass::Matmat) {
+                            crate::gpu::ProbeArm::Gpu
+                                if crate::gpu::probe_deciding(crate::gpu::OpClass::Matmat)
+                                    && !crate::gpu::q8_resident_or_upload(model, *idx) =>
+                            {
+                                // Cold weights during probing: the upload
+                                // has started, the count runs on the CPU —
+                                // the GPU arm samples on the next touch.
+                                let q = self.quant_bytes();
+                                qmatmat(q, row_scale, &pre, rows, cols, out, pool);
+                                return;
+                            }
                             crate::gpu::ProbeArm::Gpu => {
                                 let flat: Vec<f32> =
                                     pre.iter().flat_map(|v| v.iter().copied()).collect();
