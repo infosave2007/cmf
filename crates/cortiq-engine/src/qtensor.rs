@@ -510,7 +510,12 @@ impl QTensor {
                     // probe measures both arms and keeps the winner.
                     if *rows * *cols >= 8_388_608 && crate::gpu::enabled_here() {
                         let t0 = std::time::Instant::now();
-                        match crate::gpu::probe_arm(crate::gpu::OpClass::Matvec) {
+                        let arm = if crate::gpu::q1_force() {
+                            crate::gpu::ProbeArm::Gpu
+                        } else {
+                            crate::gpu::probe_arm(crate::gpu::OpClass::Matvec)
+                        };
+                        match arm {
                             crate::gpu::ProbeArm::Gpu => {
                                 if crate::gpu::q1_matvec(model, *idx, x, *rows, *cols, out) {
                                     crate::gpu::probe_record(

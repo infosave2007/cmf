@@ -555,7 +555,12 @@ fn project_position(
     if crate::gpu::enabled_here()
         && (wq.rows() >= crate::gpu::min_rows() || wq.is_q1())
     {
-        match crate::gpu::probe_arm(crate::gpu::OpClass::Batch) {
+        let arm = if wq.is_q1() && crate::gpu::q1_force() {
+            crate::gpu::ProbeArm::Gpu
+        } else {
+            crate::gpu::probe_arm(crate::gpu::OpClass::Batch)
+        };
+        match arm {
             crate::gpu::ProbeArm::Gpu => {
                 if let (Some((m, jq)), Some((_, jk)), Some((_, jv))) = (
                     crate::qtensor::gpu_batch_job(wq, hidden),

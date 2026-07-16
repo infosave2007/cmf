@@ -2125,7 +2125,12 @@ fn dense_ffn(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
     if crate::gpu::enabled_here()
         && (d.gate_proj.rows() >= crate::gpu::min_rows() || d.gate_proj.is_q1())
     {
-        match crate::gpu::probe_arm(crate::gpu::OpClass::Ffn) {
+        let arm = if d.gate_proj.is_q1() && crate::gpu::q1_force() {
+            crate::gpu::ProbeArm::Gpu
+        } else {
+            crate::gpu::probe_arm(crate::gpu::OpClass::Ffn)
+        };
+        match arm {
             crate::gpu::ProbeArm::Gpu => {
                 let t0 = std::time::Instant::now();
                 if let Some(out) = dense_ffn_gpu(d, x, pool) {

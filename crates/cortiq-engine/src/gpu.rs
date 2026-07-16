@@ -158,6 +158,21 @@ fn probe_on() -> bool {
     })
 }
 
+/// q1 ops on the native Metal backend skip the probe entirely: the CPU
+/// q1 kernel is load-port-bound, the GPU one wins warm — and probe
+/// alternation itself cools the device between samples (measured: block
+/// times 5.8 ms warm vs 8.8 ms mixed). Other backends keep probing.
+pub fn q1_force() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        backend() == Backend::Metal
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// Which arm should this GPU-eligible call take? Consult AFTER the
 /// eligibility gates (`enabled_here` / `min_rows`) so only real
 /// candidates alternate.
