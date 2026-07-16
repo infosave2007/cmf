@@ -188,6 +188,33 @@ pub fn dequant_vbit(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) -> 
 }
 
 
+/// Bytes per q4_tiled group tile: 2 (f16 scale) + 16 (nibbles).
+pub const Q4_TILE: usize = 18;
+
+/// Dequantize a full `q4_tiled` tensor: per 32-group
+/// `[f16 scale][16B nibbles]`, nibbles low-first inside each byte —
+/// the same values/order as `q4_block`, only the placement of the
+/// scale differs.
+pub fn dequant_q4_tiled(bytes: &[u8], dst: &mut [f32]) {
+    let n_groups = (dst.len() + GROUP_SIZE - 1) / GROUP_SIZE;
+    debug_assert_eq!(bytes.len(), n_groups * Q4_TILE);
+    for g in 0..n_groups {
+        let tile = &bytes[g * Q4_TILE..(g + 1) * Q4_TILE];
+        let s = f16_to_f32(u16::from_le_bytes([tile[0], tile[1]]));
+        let base = g * GROUP_SIZE;
+        for (k, &byte) in tile[2..].iter().enumerate() {
+            let i0 = base + k * 2;
+            let i1 = i0 + 1;
+            if i0 < dst.len() {
+                dst[i0] = ((byte & 0x0F) as f32 - 8.0) * s;
+            }
+            if i1 < dst.len() {
+                dst[i1] = (((byte >> 4) & 0x0F) as f32 - 8.0) * s;
+            }
+        }
+    }
+}
+
 /// Byte layout of a `vbit_ro` payload (roadmap §4.2):
 /// `[u8 bits: rows][f16 scales: rows·cols/32][u32 row_offsets: rows+1]
 ///  [bit-packed rows]` — offsets are relative to the packed area, so
@@ -261,6 +288,11 @@ pub fn expected_nbytes(dtype: TensorDtype, shape: &[usize]) -> Option<usize> {
         TensorDtype::Q4Block => {
             let groups = (n + GROUP_SIZE - 1) / GROUP_SIZE;
             groups * 16 + groups * 2
+        }
+        TensorDtype::Q4Tiled => {
+            // Interleaved tiles: [f16 scale][16B nibbles] per 32-group.
+            let groups = (n + GROUP_SIZE - 1) / GROUP_SIZE;
+            groups * 18
         }
         TensorDtype::Q8_2f => {
             let out = *shape.first()?;
@@ -408,6 +440,7 @@ pub fn dequant_tensor(entry: &TensorEntry, bytes: &[u8], dst: &mut [f32]) -> Res
             dequant_q8_row(bytes, entry.shape[0], entry.shape[1], dst);
         }
         TensorDtype::Q4Block => dequant_q4_block(bytes, dst),
+        TensorDtype::Q4Tiled => dequant_q4_tiled(bytes, dst),
         TensorDtype::Vbit => {
             if entry.shape.len() != 2 {
                 return Err(format!("vbit tensor '{}' must be 2-D", entry.name));
@@ -443,7 +476,8 @@ pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
         TensorDtype::F32 => 4.0,
         TensorDtype::F16 | TensorDtype::Bf16 => 2.0,
         TensorDtype::Q8Row | TensorDtype::Q8_2f => 1.0,
-        TensorDtype::Q4Block | TensorDtype::Q4Col | TensorDtype::Mix84 => 0.5625,
+        TensorDtype::Q4Block | TensorDtype::Q4Col | TensorDtype::Mix84
+        | TensorDtype::Q4Tiled => 0.5625,
         TensorDtype::Vbit | TensorDtype::VbitRo => 0.5,
         TensorDtype::U8 => 1.0,
     }

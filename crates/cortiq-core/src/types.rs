@@ -25,6 +25,13 @@ pub enum TensorDtype {
     /// the file, no load-time prefix scan. New id on purpose: the byte
     /// semantics of `Vbit = 8` must never change.
     VbitRo = 10,
+    /// q4 with interleaved per-group tiles (roadmap §4.3):
+    /// `repeat per 32-group { f16 scale; 16B packed nibbles }` — one
+    /// sequential memory stream instead of two distant ones (nibbles…,
+    /// scales…). Measured kernel-level: ×1.66 on Apple Silicon, ×1.13
+    /// on AVX2. 2-D tensors with cols % 32 == 0 only. New id — the
+    /// byte semantics of `Q4Block = 4` never change.
+    Q4Tiled = 11,
 }
 
 impl TensorDtype {
@@ -41,6 +48,7 @@ impl TensorDtype {
             8 => Self::Vbit,
             9 => Self::Q8_2f,
             10 => Self::VbitRo,
+            11 => Self::Q4Tiled,
             _ => return None,
         })
     }
@@ -62,6 +70,7 @@ impl TensorDtype {
             Self::Vbit => "vbit",
             Self::Q8_2f => "q8_2f",
             Self::VbitRo => "vbit_ro",
+            Self::Q4Tiled => "q4_tiled",
         }
     }
 
@@ -79,6 +88,7 @@ impl TensorDtype {
                 | Self::Q8_2f
                 | Self::Vbit
                 | Self::VbitRo
+                | Self::Q4Tiled
         )
     }
 }

@@ -12,7 +12,7 @@
 //! Extension point: new dtypes = new match arm here, nothing else moves.
 
 use crate::pool::{matvec_rows, matvec_rows2, Pool};
-use cortiq_core::quant::{f16_to_f32, GROUP_SIZE};
+use cortiq_core::quant::{f16_to_f32, GROUP_SIZE, Q4_TILE};
 use cortiq_core::{CmfModel, TensorDtype};
 use std::sync::Arc;
 
@@ -147,6 +147,19 @@ impl QTensor {
             }
             // q4_block: fused kernel reads nibbles straight from mmap —
             // a 14B q4 file no longer explodes into ×8 f32 RAM.
+            // q4_tiled (§4.3): interleaved [scale][nibbles] tiles — one
+            // sequential memory stream (measured ×1.66 ARM / ×1.13 AVX2
+            // at kernel level over the split layout).
+            TensorDtype::Q4Tiled if cols % GROUP_SIZE == 0 => Ok(Self::Mapped {
+                model: model.clone(),
+                idx,
+                dtype: entry.dtype,
+                rows,
+                cols,
+                row_scale: Vec::new(),
+                col_field: Vec::new(),
+                vbit_offsets: Vec::new(),
+            }),
             TensorDtype::Q4Block if cols % GROUP_SIZE == 0 => Ok(Self::Mapped {
                 model: model.clone(),
                 idx,
@@ -207,6 +220,19 @@ impl QTensor {
                 vbit_offsets,
                 ..
             } => {
+                if *dtype == TensorDtype::Q4Tiled {
+                    let bytes = self.quant_bytes();
+                    let gpr = cols / GROUP_SIZE;
+                    for gi in 0..gpr {
+                        let tile = &bytes[(r * gpr + gi) * Q4_TILE..(r * gpr + gi + 1) * Q4_TILE];
+                        let s = f16_to_f32(u16::from_le_bytes([tile[0], tile[1]]));
+                        for (k, &b) in tile[2..].iter().enumerate() {
+                            dst[gi * GROUP_SIZE + k * 2] = ((b & 0x0F) as f32 - 8.0) * s;
+                            dst[gi * GROUP_SIZE + k * 2 + 1] = (((b >> 4) & 0x0F) as f32 - 8.0) * s;
+                        }
+                    }
+                    return;
+                }
                 if *dtype == TensorDtype::Q4Block {
                     let (packed, scales) = q4_split(self.quant_bytes(), self.rows(), cols);
                     let gpr = cols / GROUP_SIZE;
@@ -360,6 +386,10 @@ impl QTensor {
                     q4matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
                     return;
                 }
+                if *dtype == TensorDtype::Q4Tiled {
+                    q4t_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
+                    return;
+                }
                 if matches!(dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
                     vbitmatvec(self.quant_bytes(), vbit_offsets, x, *rows, *cols, out, pool);
                     return;
@@ -445,6 +475,10 @@ impl QTensor {
                     q4matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
                     return;
                 }
+                if *dtype == TensorDtype::Q4Tiled {
+                    q4t_matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
+                    return;
+                }
                 if matches!(dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
                     vbitmatvec2(self.quant_bytes(), vbit_offsets, x1, x2, *rows, *cols, o1, o2, pool);
                     return;
@@ -494,6 +528,10 @@ impl QTensor {
             } => {
                 if *dtype == TensorDtype::Q4Block {
                     q4matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
+                    return;
+                }
+                if *dtype == TensorDtype::Q4Tiled {
+                    q4t_matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
                     return;
                 }
                 if matches!(dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
@@ -1518,6 +1556,264 @@ fn vbit_range2_f32(
             *p2.at(r) = v2;
         }
     }
+}
+
+// ───────────────────── q4_tiled kernels (§4.3) ─────────────────────
+
+/// One q4_tiled row dot on the A8W8 int8 path: per 32-group the tile
+/// is ONE sequential read — [f16 scale][16B nibbles] — versus the two
+/// distant streams of the split layout. Values/order identical to the
+/// split kernels.
+#[inline]
+#[allow(unreachable_code)]
+fn dot_q4t_row_i8(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return dot_q4t_row_sdot(bytes, r, gpr, xq);
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return dot_q4t_row_avx2(bytes, r, gpr, xq);
+    }
+    let mut acc = 0f32;
+    for gi in 0..gpr {
+        let tile = &bytes[(r * gpr + gi) * Q4_TILE..(r * gpr + gi + 1) * Q4_TILE];
+        let s = f16_to_f32(u16::from_le_bytes([tile[0], tile[1]]));
+        let mut d = 0i32;
+        for (k, &b) in tile[2..].iter().enumerate() {
+            d += ((b & 0x0F) as i32 - 8) * xq[gi * GROUP_SIZE + k * 2] as i32
+                + (((b >> 4) & 0x0F) as i32 - 8) * xq[gi * GROUP_SIZE + k * 2 + 1] as i32;
+        }
+        acc += d as f32 * s;
+    }
+    acc
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn dot_q4t_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
+    // SAFETY: callers uphold slice-length contracts (18B tile per group,
+    // xq.len() == gpr·GROUP_SIZE).
+    unsafe {
+        use core::arch::aarch64::*;
+        use core::arch::asm;
+        let lomask = vdupq_n_u8(0x0F);
+        let eight = vdupq_n_s8(8);
+        let mut acc = 0f32;
+        for gi in 0..gpr {
+            let t = bytes.as_ptr().add((r * gpr + gi) * Q4_TILE);
+            let s = f16_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
+            let b = vld1q_u8(t.add(2));
+            let lo = vandq_u8(b, lomask);
+            let hi = vshrq_n_u8::<4>(b);
+            let e0 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(lo, hi)), eight);
+            let e1 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(lo, hi)), eight);
+            let x0 = vld1q_s8(xq.as_ptr().add(gi * GROUP_SIZE));
+            let x1 = vld1q_s8(xq.as_ptr().add(gi * GROUP_SIZE + 16));
+            let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+            asm!(
+                "sdot {a0:v}.4s, {e0:v}.16b, {x0:v}.16b",
+                "sdot {a1:v}.4s, {e1:v}.16b, {x1:v}.16b",
+                a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                e0 = in(vreg) e0, x0 = in(vreg) x0, e1 = in(vreg) e1, x1 = in(vreg) x1,
+                options(pure, nomem, nostack),
+            );
+            acc += vaddvq_s32(vaddq_s32(a0, a1)) as f32 * s;
+        }
+        acc
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q4t_row_avx2(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
+    // SAFETY: see dot_q4t_row_sdot.
+    unsafe {
+        use core::arch::x86_64::*;
+        let lomask = _mm_set1_epi8(0x0F);
+        let eight = _mm256_set1_epi8(8);
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = 0f32;
+        for gi in 0..gpr {
+            let t = bytes.as_ptr().add((r * gpr + gi) * Q4_TILE);
+            let s = f16_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
+            let b = _mm_loadu_si128(t.add(2) as *const __m128i);
+            let lo = _mm_and_si128(b, lomask);
+            let hi = _mm_and_si128(_mm_srli_epi16::<4>(b), lomask);
+            let w = _mm256_sub_epi8(
+                _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi)),
+                eight,
+            );
+            let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+            let p16 = _mm256_maddubs_epi16(_mm256_abs_epi8(w), _mm256_sign_epi8(x, w));
+            let d = _mm256_madd_epi16(p16, ones);
+            let hi128 = _mm256_extracti128_si256::<1>(d);
+            let s128 = _mm_add_epi32(_mm256_castsi256_si128(d), hi128);
+            let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
+            let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
+            acc += _mm_cvtsi128_si32(s32) as f32 * s;
+        }
+        acc
+    }
+}
+
+/// Exact-term correction for A8W8 outliers on a tiled row.
+#[inline]
+fn q4t_outlier(bytes: &[u8], r: usize, gpr: usize, j: usize) -> (f32, f32) {
+    let gi = j / GROUP_SIZE;
+    let k = j % GROUP_SIZE;
+    let tile = &bytes[(r * gpr + gi) * Q4_TILE..(r * gpr + gi + 1) * Q4_TILE];
+    let s = f16_to_f32(u16::from_le_bytes([tile[0], tile[1]]));
+    let byte = tile[2 + k / 2];
+    let nib = if k & 1 == 0 { byte & 0x0F } else { byte >> 4 };
+    ((nib as i32 - 8) as f32, s)
+}
+
+/// Exact scalar q4_tiled row (CMF_SDOT=0 contract) — same pairwise
+/// accumulation shape as `q4_range_f32`.
+#[inline]
+fn q4t_row_exact(bytes: &[u8], r: usize, gpr: usize, x: &[f32]) -> f32 {
+    let mut acc = 0f32;
+    for gi in 0..gpr {
+        let tile = &bytes[(r * gpr + gi) * Q4_TILE..(r * gpr + gi + 1) * Q4_TILE];
+        let s = f16_to_f32(u16::from_le_bytes([tile[0], tile[1]]));
+        let xg = &x[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE];
+        let mut ga = 0f32;
+        for (k, &b) in tile[2..].iter().enumerate() {
+            ga += ((b & 0x0F) as f32 - 8.0) * xg[k * 2]
+                + (((b >> 4) & 0x0F) as f32 - 8.0) * xg[k * 2 + 1];
+        }
+        acc += ga * s;
+    }
+    acc
+}
+
+/// Fused q4_tiled matvec (dispatch mirrors `q4matvec`).
+fn q4t_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
+    debug_assert_eq!(out.len(), rows);
+    let gpr = cols / GROUP_SIZE;
+    let out_addr = SendMut(out.as_mut_ptr());
+    if a8w8_enabled() {
+        let act = split_act(x);
+        let run = move |start: usize, end: usize| {
+            for r in start..end {
+                let mut acc = dot_q4t_row_i8(bytes, r, gpr, &act.xq) * act.sx;
+                for &(j, xv) in &act.outliers {
+                    let (w, s) = q4t_outlier(bytes, r, gpr, j);
+                    acc += w * s * xv;
+                }
+                // SAFETY: disjoint row ranges per worker.
+                unsafe { *out_addr.at(r) = acc };
+            }
+        };
+        dispatch_rows(pool, rows, &run);
+        return;
+    }
+    let run = move |start: usize, end: usize| {
+        for r in start..end {
+            // SAFETY: disjoint row ranges per worker.
+            unsafe { *out_addr.at(r) = q4t_row_exact(bytes, r, gpr, x) };
+        }
+    };
+    dispatch_rows(pool, rows, &run);
+}
+
+/// Fused two-input q4_tiled matvec (weights read once per pair).
+#[allow(clippy::too_many_arguments)]
+fn q4t_matvec2(
+    bytes: &[u8],
+    x1: &[f32],
+    x2: &[f32],
+    rows: usize,
+    cols: usize,
+    o1: &mut [f32],
+    o2: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    let gpr = cols / GROUP_SIZE;
+    let p1 = SendMut(o1.as_mut_ptr());
+    let p2 = SendMut(o2.as_mut_ptr());
+    if a8w8_enabled() {
+        let a1 = split_act(x1);
+        let a2 = split_act(x2);
+        let run = move |start: usize, end: usize| {
+            for r in start..end {
+                let mut v1 = dot_q4t_row_i8(bytes, r, gpr, &a1.xq) * a1.sx;
+                let mut v2 = dot_q4t_row_i8(bytes, r, gpr, &a2.xq) * a2.sx;
+                for &(j, xv) in &a1.outliers {
+                    let (w, s) = q4t_outlier(bytes, r, gpr, j);
+                    v1 += w * s * xv;
+                }
+                for &(j, xv) in &a2.outliers {
+                    let (w, s) = q4t_outlier(bytes, r, gpr, j);
+                    v2 += w * s * xv;
+                }
+                // SAFETY: disjoint row ranges per worker.
+                unsafe {
+                    *p1.at(r) = v1;
+                    *p2.at(r) = v2;
+                }
+            }
+        };
+        dispatch_rows(pool, rows, &run);
+        return;
+    }
+    let run = move |start: usize, end: usize| {
+        for r in start..end {
+            // SAFETY: disjoint row ranges per worker.
+            unsafe {
+                *p1.at(r) = q4t_row_exact(bytes, r, gpr, x1);
+                *p2.at(r) = q4t_row_exact(bytes, r, gpr, x2);
+            }
+        }
+    };
+    dispatch_rows(pool, rows, &run);
+}
+
+/// Batched q4_tiled matmat: each row's tiles stream once per microbatch.
+#[allow(clippy::too_many_arguments)]
+fn q4t_matmat(
+    bytes: &[u8],
+    xs_all: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    debug_assert_eq!(out.len(), b * rows);
+    let gpr = cols / GROUP_SIZE;
+    let out_addr = SendMut(out.as_mut_ptr());
+    if a8w8_enabled() {
+        let acts: Vec<SplitAct> =
+            (0..b).map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols])).collect();
+        let acts = &acts;
+        let run = move |start: usize, end: usize| {
+            for r in start..end {
+                for (bi, act) in acts.iter().enumerate() {
+                    let mut acc = dot_q4t_row_i8(bytes, r, gpr, &act.xq) * act.sx;
+                    for &(j, xv) in &act.outliers {
+                        let (w, s) = q4t_outlier(bytes, r, gpr, j);
+                        acc += w * s * xv;
+                    }
+                    // SAFETY: disjoint (bi, r) cells per worker range.
+                    unsafe { *out_addr.at(bi * rows + r) = acc };
+                }
+            }
+        };
+        dispatch_rows(pool, rows, &run);
+        return;
+    }
+    let run = move |start: usize, end: usize| {
+        for r in start..end {
+            for bi in 0..b {
+                let x = &xs_all[bi * cols..(bi + 1) * cols];
+                // SAFETY: disjoint (bi, r) cells per worker range.
+                unsafe { *out_addr.at(bi * rows + r) = q4t_row_exact(bytes, r, gpr, x) };
+            }
+        }
+    };
+    dispatch_rows(pool, rows, &run);
 }
 
 /// Fused q4_block matvec straight from the mapped bytes. SDOT path when
@@ -3597,6 +3893,53 @@ mod tests {
             );
             assert_eq!(&got[bi * rows..(bi + 1) * rows], &expect[..], "vbit batch pos {bi}");
         }
+    }
+
+    /// q4_tiled kernels must produce BIT-identical outputs to the q4
+    /// split kernels on the same values (same ints, same order — only
+    /// the byte placement differs).
+    #[test]
+    fn q4_tiled_matches_q4_block_bitexact() {
+        let (rows, cols, b) = (8usize, 128usize, 3usize);
+        let groups = rows * cols / GROUP_SIZE;
+        let mut split = Vec::with_capacity(groups * 18);
+        for i in 0..groups * 16 {
+            split.push((((i * 7 + 3) % 256) & 0xFF) as u8);
+        }
+        for g in 0..groups {
+            split.extend_from_slice(
+                &cortiq_core::quant::f32_to_f16(0.01 + 0.003 * g as f32).to_le_bytes(),
+            );
+        }
+        // Re-tile: [scale][nibbles] per group.
+        let (packed, scales) = split.split_at(groups * 16);
+        let mut tiled = Vec::with_capacity(groups * Q4_TILE);
+        for g in 0..groups {
+            tiled.extend_from_slice(&scales[g * 2..g * 2 + 2]);
+            tiled.extend_from_slice(&packed[g * 16..(g + 1) * 16]);
+        }
+
+        let mut x1: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.17).sin()).collect();
+        x1[9] = 250.0; // exercise the outlier path
+        let x2: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.23).cos()).collect();
+
+        let (mut a, mut t) = (vec![0f32; rows], vec![0f32; rows]);
+        q4matvec(&split, &x1, rows, cols, &mut a, None);
+        q4t_matvec(&tiled, &x1, rows, cols, &mut t, None);
+        assert_eq!(a, t, "q4t matvec must match q4 bit-for-bit");
+
+        let (mut a1, mut a2) = (vec![0f32; rows], vec![0f32; rows]);
+        let (mut t1, mut t2) = (vec![0f32; rows], vec![0f32; rows]);
+        q4matvec2(&split, &x1, &x2, rows, cols, &mut a1, &mut a2, None);
+        q4t_matvec2(&tiled, &x1, &x2, rows, cols, &mut t1, &mut t2, None);
+        assert_eq!(a1, t1);
+        assert_eq!(a2, t2);
+
+        let xs: Vec<f32> = (0..b * cols).map(|i| (i as f32 * 0.13).sin()).collect();
+        let (mut am, mut tm) = (vec![0f32; b * rows], vec![0f32; b * rows]);
+        q4matmat(&split, &xs, b, rows, cols, &mut am, None);
+        q4t_matmat(&tiled, &xs, b, rows, cols, &mut tm, None);
+        assert_eq!(am, tm, "q4t matmat must match q4 bit-for-bit");
     }
 
     /// q4 SDOT outlier correction: a single huge activation channel

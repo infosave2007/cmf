@@ -31,7 +31,7 @@ KNOWN_FEATURES = 0b111  # tensor dir | binary masks | 2f quant
 
 DTYPE_NAME = {0: "f32", 1: "f16", 2: "bf16", 3: "q8_row", 4: "q4_block",
               5: "mix8_4", 6: "u8", 7: "q4_col", 8: "vbit", 9: "q8_2f",
-              10: "vbit_ro"}
+              10: "vbit_ro", 11: "q4_tiled"}
 
 _SHARD_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.cmf$")
 
@@ -137,6 +137,23 @@ def _dq_vbit_ro(raw: bytes, shape) -> np.ndarray:
     return w
 
 
+def _dq_q4_tiled(raw: bytes, shape) -> np.ndarray:
+    """q4_tiled (§4.3): 18-byte tiles [f16 scale][16B nibbles] per
+    32-group; values identical to q4_block."""
+    n = int(np.prod(shape))
+    ng = n // GROUP_SIZE
+    tiles = np.frombuffer(raw, np.uint8, ng * 18).reshape(ng, 18)
+    sc = tiles[:, :2].copy().view(np.float16).astype(np.float32).reshape(ng)
+    pk = tiles[:, 2:]
+    lo = (pk & 0x0F).astype(np.int32) - 8
+    hi = ((pk >> 4) & 0x0F).astype(np.int32) - 8
+    vals = np.empty((ng, GROUP_SIZE), np.float32)
+    vals[:, 0::2] = lo
+    vals[:, 1::2] = hi
+    vals *= sc[:, None]
+    return vals.reshape(shape).copy()
+
+
 def dequant(raw: bytes, dtype: str, shape) -> np.ndarray:
     if dtype == "f32":
         return np.frombuffer(raw, np.float32, int(np.prod(shape))).reshape(shape).copy()
@@ -157,6 +174,8 @@ def dequant(raw: bytes, dtype: str, shape) -> np.ndarray:
         return _dq_vbit(raw, shape)
     if dtype == "vbit_ro":
         return _dq_vbit_ro(raw, shape)
+    if dtype == "q4_tiled":
+        return _dq_q4_tiled(raw, shape)
     raise ValueError(f"dtype {dtype}: dequant not implemented in the reader")
 
 
