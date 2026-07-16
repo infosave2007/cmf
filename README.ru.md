@@ -291,7 +291,7 @@ cortiq import-gguf Qwen/Qwen2.5-0.5B-Instruct-GGUF --output model.cmf --quant q8
 
 ```sh
 cortiq convert --model prism-ml/Bonsai-27B-unpacked --quant q1 --output bonsai27b-q1.cmf
-CMF_THREADS=10 cortiq run bonsai27b-q1.cmf -p "Сколько будет 84 * 3 / 2?"
+CMF_GPU=1 CMF_THREADS=10 cortiq run bonsai27b-q1.cmf -p "Сколько будет 84 * 3 / 2?"
 ```
 
 Замечания: `--quant q1` — явный opt-in только для 1-бит-обученных моделей;

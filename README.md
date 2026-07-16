@@ -281,7 +281,7 @@ one) or grab the [latest release](https://github.com/infosave2007/cmf/releases/l
 
 ```sh
 cortiq convert --model prism-ml/Bonsai-27B-unpacked --quant q1 --output bonsai27b-q1.cmf
-CMF_THREADS=10 cortiq run bonsai27b-q1.cmf -p "What is 84 * 3 / 2?"
+CMF_GPU=1 CMF_THREADS=10 cortiq run bonsai27b-q1.cmf -p "What is 84 * 3 / 2?"
 ```
 
 Notes: `--quant q1` is an explicit opt-in for 1-bit-trained models only —
