@@ -1385,6 +1385,8 @@ pub struct TokenGraph {
     safe_len: usize,
     dims: GraphDims,
     cmd: Option<metal::CommandBuffer>,
+    /// Committed-but-unawaited predecessor (see `commit`).
+    in_flight: Option<metal::CommandBuffer>,
     h_b: Buffer,
     n_b: Buffer,
     d_b: Buffer,
@@ -1416,6 +1418,7 @@ impl TokenGraph {
             safe_len,
             dims,
             cmd: None,
+            in_flight: None,
             h_b,
             n_b,
             d_b,
@@ -1467,10 +1470,25 @@ impl TokenGraph {
         self.cmd.as_ref().unwrap().clone()
     }
 
+    /// Commit the current command buffer WITHOUT waiting: the GPU
+    /// starts on it while the CPU keeps encoding the next one. Queue
+    /// order makes the eventual `sync` wait (on the last buffer) cover
+    /// every earlier commit.
+    pub fn commit(&mut self) {
+        if let Some(cmd) = self.cmd.take() {
+            cmd.commit();
+            self.in_flight = Some(cmd);
+        }
+    }
+
     /// Submit everything encoded so far and wait for completion.
     pub fn sync(&mut self) {
         if let Some(cmd) = self.cmd.take() {
-            submit_and_wait(self.c, &cmd, &[]);
+            cmd.commit();
+            self.in_flight = Some(cmd);
+        }
+        if let Some(cmd) = self.in_flight.take() {
+            wait_fast(&cmd);
         }
     }
 

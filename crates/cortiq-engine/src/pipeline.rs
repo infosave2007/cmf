@@ -545,6 +545,9 @@ impl Pipeline {
                         &cfg,
                     );
                     graph.encode_attn_suffix(l, &ao);
+                    // Early commit: the GPU starts O+FFN while the CPU
+                    // encodes the following GDN run / attention prefix.
+                    graph.commit();
                     attention::recycle_buf(&mut ao);
                 }
             }
