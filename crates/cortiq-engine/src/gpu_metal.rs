@@ -157,6 +157,16 @@ fn ctx() -> Option<&'static Ctx> {
 
 fn init() -> Result<Ctx, String> {
     let device = Device::system_default().ok_or("no Metal device")?;
+    // The zero-copy mmap buffers assume unified memory. On discrete-GPU
+    // Macs (Intel-era) `newBufferWithBytesNoCopy` silently yields stale
+    // data — measured max|Δ| ≈ 0.53 vs the f32 reference on a Radeon —
+    // so refuse the device instead of returning wrong numbers.
+    if !device.has_unified_memory() {
+        return Err(format!(
+            "device '{}' has no unified memory — no-copy mmap path needs UMA",
+            device.name()
+        ));
+    }
     let lib = device
         .new_library_with_source(MSL, &metal::CompileOptions::new())
         .map_err(|e| format!("MSL compile: {e}"))?;

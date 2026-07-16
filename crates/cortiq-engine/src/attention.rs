@@ -88,9 +88,47 @@ pub(crate) fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     unsafe {
         return dot_f32_neon(a, b);
     }
+    #[cfg(target_arch = "x86_64")]
+    if crate::qtensor::avx2_enabled() {
+        return unsafe { dot_f32_avx2(a, b) };
+    }
     #[allow(unreachable_code)]
     {
         a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+}
+
+/// f32 dot via AVX2/FMA (x86 mirror of `dot_f32_neon`; regrouped sums).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: callers pass equal-length slices.
+    unsafe {
+        use core::arch::x86_64::*;
+        let n = a.len().min(b.len());
+        let (ap, bp) = (a.as_ptr(), b.as_ptr());
+        let (mut s0, mut s1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+        let mut j = 0usize;
+        while j + 16 <= n {
+            s0 = _mm256_fmadd_ps(_mm256_loadu_ps(ap.add(j)), _mm256_loadu_ps(bp.add(j)), s0);
+            s1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(ap.add(j + 8)),
+                _mm256_loadu_ps(bp.add(j + 8)),
+                s1,
+            );
+            j += 16;
+        }
+        let acc = _mm256_add_ps(s0, s1);
+        let hi = _mm256_extractf128_ps::<1>(acc);
+        let q = _mm_add_ps(_mm256_castps256_ps128(acc), hi);
+        let d = _mm_add_ps(q, _mm_movehl_ps(q, q));
+        let s = _mm_add_ss(d, _mm_shuffle_ps::<1>(d, d));
+        let mut sum = _mm_cvtss_f32(s);
+        while j < n {
+            sum += *ap.add(j) * *bp.add(j);
+            j += 1;
+        }
+        sum
     }
 }
 
@@ -128,10 +166,38 @@ pub(crate) fn axpy_f32(acc: &mut [f32], row: &[f32], w: f32) {
     unsafe {
         return axpy_f32_neon(acc, row, w);
     }
+    #[cfg(target_arch = "x86_64")]
+    if crate::qtensor::avx2_enabled() {
+        return unsafe { axpy_f32_avx2(acc, row, w) };
+    }
     #[allow(unreachable_code)]
     {
         for (a, &r) in acc.iter_mut().zip(row) {
             *a += w * r;
+        }
+    }
+}
+
+/// f32 axpy via AVX2/FMA (x86 mirror of `axpy_f32_neon`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn axpy_f32_avx2(acc: &mut [f32], row: &[f32], w: f32) {
+    // SAFETY: callers pass equal-length slices (head_dim rows).
+    unsafe {
+        use core::arch::x86_64::*;
+        let n = acc.len().min(row.len());
+        let ap = acc.as_mut_ptr();
+        let rp = row.as_ptr();
+        let wv = _mm256_set1_ps(w);
+        let mut j = 0usize;
+        while j + 8 <= n {
+            let v = _mm256_fmadd_ps(wv, _mm256_loadu_ps(rp.add(j)), _mm256_loadu_ps(ap.add(j)));
+            _mm256_storeu_ps(ap.add(j), v);
+            j += 8;
+        }
+        while j < n {
+            *ap.add(j) += w * *rp.add(j);
+            j += 1;
         }
     }
 }

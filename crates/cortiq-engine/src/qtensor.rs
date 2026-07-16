@@ -664,6 +664,20 @@ impl QTensor {
             pool.run_many(&parts);
             return;
         }
+        #[cfg(target_arch = "x86_64")]
+        if avx2_a8w8_enabled() {
+            let acts: [SplitAct; N] = std::array::from_fn(|i| split_act(&ctxs[i].xs));
+            let closures: [_; N] = std::array::from_fn(|i| {
+                let (c, act, out) = (&ctxs[i], &acts[i], outs_addr[i]);
+                move |start: usize, end: usize| {
+                    q8_range_avx2(c.bytes, c.row_scale, act, c.cols, out, start, end)
+                }
+            });
+            let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
+                std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
+            pool.run_many(&parts);
+            return;
+        }
         let closures: [_; N] = std::array::from_fn(|i| {
             let (c, out) = (&ctxs[i], outs_addr[i]);
             move |start: usize, end: usize| {
@@ -839,6 +853,21 @@ impl QTensor {
                 let (c, a, o1, o2) = (&ctxs[i], &acts[i], p1[i], p2[i]);
                 move |start: usize, end: usize| {
                     q8_range2_sdot(c.bytes, c.row_scale, &a.0, &a.1, c.cols, o1, o2, start, end)
+                }
+            });
+            let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
+                std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
+            pool.run_many(&parts);
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if avx2_a8w8_enabled() {
+            let acts: [(SplitAct, SplitAct); N] =
+                std::array::from_fn(|i| (split_act(&ctxs[i].xs1), split_act(&ctxs[i].xs2)));
+            let closures: [_; N] = std::array::from_fn(|i| {
+                let (c, a, o1, o2) = (&ctxs[i], &acts[i], p1[i], p2[i]);
+                move |start: usize, end: usize| {
+                    q8_range2_avx2(c.bytes, c.row_scale, &a.0, &a.1, c.cols, o1, o2, start, end)
                 }
             });
             let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
@@ -1691,8 +1720,13 @@ fn q4matmat(
                     let mut acc = 0f32;
                     for gi in 0..gpr {
                         let mut ga = 0f32;
-                        for k in 0..GROUP_SIZE {
-                            ga += buf[gi * GROUP_SIZE + k] * x[gi * GROUP_SIZE + k];
+                        // Pairwise (lo + hi) addition, matching
+                        // q4matvec's `ga += lo·x + hi·x` shape exactly —
+                        // a flat one-per-element loop rounds differently
+                        // and broke bit-parity on the scalar (x86) path.
+                        for k in 0..GROUP_SIZE / 2 {
+                            let e = gi * GROUP_SIZE + k * 2;
+                            ga += buf[e] * x[e] + buf[e + 1] * x[e + 1];
                         }
                         acc += ga * gscale(r * gpr + gi);
                     }
@@ -1868,10 +1902,162 @@ pub(crate) fn prescale<'a>(
     }
 }
 
+// ───────────────────── x86-64 AVX2 kernels (roadmap этап 2) ─────────────────────
+
+/// AVX2+FMA available? Default ON when the CPU supports both;
+/// `CMF_AVX2=0` disables (falls back to the autovectorized loops).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn avx2_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CMF_AVX2").map(|v| v != "0").unwrap_or(true)
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+    })
+}
+
+/// AVX2 A8W8 allowed? The quantized-activation contract is switched by
+/// the SAME env as the ARM SDOT path: `CMF_SDOT=0` keeps exact kernels
+/// (the golden-parity exact gate relies on it) — AVX2 f32 kernels stay
+/// active either way, they are exact (regrouped sums only).
+#[cfg(target_arch = "x86_64")]
+fn avx2_a8w8_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        avx2_enabled() && std::env::var("CMF_SDOT").map(|v| v != "0").unwrap_or(true)
+    })
+}
+
+/// i8 row · f32 x via AVX2/FMA (x86 mirror of `dot_i8_f32_neon`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_i8_f32_avx2(w: &[u8], x: &[f32]) -> f32 {
+    // SAFETY: callers uphold slice-length contracts (see call sites).
+    unsafe {
+        use core::arch::x86_64::*;
+        let n = x.len();
+        let wp = w.as_ptr();
+        let xp = x.as_ptr();
+        let (mut a0, mut a1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+        let mut j = 0usize;
+        while j + 16 <= n {
+            let wb = _mm_loadu_si128(wp.add(j) as *const __m128i);
+            let lo = _mm256_cvtepi8_epi32(wb);
+            let hi = _mm256_cvtepi8_epi32(_mm_srli_si128::<8>(wb));
+            a0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(lo), _mm256_loadu_ps(xp.add(j)), a0);
+            a1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(hi), _mm256_loadu_ps(xp.add(j + 8)), a1);
+            j += 16;
+        }
+        let acc = _mm256_add_ps(a0, a1);
+        let hi128 = _mm256_extractf128_ps::<1>(acc);
+        let s128 = _mm_add_ps(_mm256_castps256_ps128(acc), hi128);
+        let s64 = _mm_add_ps(s128, _mm_movehl_ps(s128, s128));
+        let s32 = _mm_add_ss(s64, _mm_shuffle_ps::<1>(s64, s64));
+        let mut sum = _mm_cvtss_f32(s32);
+        while j < n {
+            sum += (*wp.add(j) as i8) as f32 * *xp.add(j);
+            j += 1;
+        }
+        sum
+    }
+}
+
+/// int8(weight)·int8(activation) → i32 via AVX2 maddubs — the x86
+/// analogue of the SDOT A8W8 path. `maddubs` takes u8×i8, so the
+/// standard sign trick applies: |w| × sign(x, w) ≡ w × x per lane.
+/// Pair saturation is safe: |w|≤128, |x|≤127 → 2·128·127 < 32767.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_i8_i8_avx2(w: &[u8], xq: &[i8]) -> i32 {
+    // SAFETY: callers uphold slice-length contracts (see call sites).
+    unsafe {
+        use core::arch::x86_64::*;
+        let n = w.len();
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = _mm256_setzero_si256();
+        let mut j = 0usize;
+        while j + 32 <= n {
+            let wv = _mm256_loadu_si256(w.as_ptr().add(j) as *const __m256i);
+            let xv = _mm256_loadu_si256(xq.as_ptr().add(j) as *const __m256i);
+            let p16 = _mm256_maddubs_epi16(_mm256_abs_epi8(wv), _mm256_sign_epi8(xv, wv));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, ones));
+            j += 32;
+        }
+        let hi128 = _mm256_extracti128_si256::<1>(acc);
+        let s128 = _mm_add_epi32(_mm256_castsi256_si128(acc), hi128);
+        let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
+        let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
+        let mut s = _mm_cvtsi128_si32(s32);
+        while j < n {
+            s += (w[j] as i8) as i32 * xq[j] as i32;
+            j += 1;
+        }
+        s
+    }
+}
+
+/// AVX2 q8 row dot with exact outlier correction (x86 mirror of
+/// `row_dot_sdot` — same A8W8 contract).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn row_dot_avx2(row: &[u8], act: &SplitAct) -> f32 {
+    let mut acc = unsafe { dot_i8_i8_avx2(row, &act.xq) } as f32 * act.sx;
+    for &(j, xv) in &act.outliers {
+        acc += (row[j] as i8) as f32 * xv;
+    }
+    acc
+}
+
+/// One q8 row range via AVX2 (x86 mirror of `q8_range_sdot`).
+#[cfg(target_arch = "x86_64")]
+fn q8_range_avx2(
+    q: &[u8],
+    row_scale: &[f32],
+    act: &SplitAct,
+    cols: usize,
+    out_addr: SendMut,
+    start: usize,
+    end: usize,
+) {
+    for o in start..end {
+        let v = row_dot_avx2(&q[o * cols..(o + 1) * cols], act) * row_scale[o];
+        // SAFETY: disjoint row ranges per worker.
+        unsafe { *out_addr.at(o) = v };
+    }
+}
+
+/// Two-input q8 row range via AVX2 (x86 mirror of `q8_range2_sdot`).
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+fn q8_range2_avx2(
+    q: &[u8],
+    row_scale: &[f32],
+    a1: &SplitAct,
+    a2: &SplitAct,
+    cols: usize,
+    p1: SendMut,
+    p2: SendMut,
+    start: usize,
+    end: usize,
+) {
+    for o in start..end {
+        let row = &q[o * cols..(o + 1) * cols];
+        // SAFETY: disjoint row ranges per worker.
+        unsafe {
+            *p1.at(o) = row_dot_avx2(row, a1) * row_scale[o];
+            *p2.at(o) = row_dot_avx2(row, a2) * row_scale[o];
+        }
+    }
+}
+
 // ───────────────────── A8W8 SDOT path (port of vmfcore, ×1.78 decode) ─────────────────────
 
 /// SDOT enabled? Default ON when the CPU has ARMv8.2 dotprod;
 /// `CMF_SDOT=0` disables (falls back to i8×f32 NEON).
+/// (On non-ARM release builds only the test tolerance switch calls it.)
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 fn sdot_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -2279,10 +2465,43 @@ pub(crate) fn axpy_i8_f32(acc: &mut [f32], row: &[i8], w: f32) {
     unsafe {
         return axpy_i8_f32_neon(acc, row, w);
     }
+    #[cfg(target_arch = "x86_64")]
+    if avx2_enabled() {
+        return unsafe { axpy_i8_f32_avx2(acc, row, w) };
+    }
     #[allow(unreachable_code)]
     {
         for (a, &b) in acc.iter_mut().zip(row) {
             *a += w * b as f32;
+        }
+    }
+}
+
+/// i8→f32 axpy via AVX2/FMA (x86 mirror of `axpy_i8_f32_neon`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn axpy_i8_f32_avx2(acc: &mut [f32], row: &[i8], w: f32) {
+    // SAFETY: callers uphold slice-length contracts (see call sites).
+    unsafe {
+        use core::arch::x86_64::*;
+        let n = acc.len().min(row.len());
+        let ap = acc.as_mut_ptr();
+        let rp = row.as_ptr();
+        let wv = _mm256_set1_ps(w);
+        let mut j = 0usize;
+        while j + 16 <= n {
+            let rb = _mm_loadu_si128(rp.add(j) as *const __m128i);
+            let lo = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(rb));
+            let hi = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(rb)));
+            let v0 = _mm256_fmadd_ps(wv, lo, _mm256_loadu_ps(ap.add(j)));
+            let v1 = _mm256_fmadd_ps(wv, hi, _mm256_loadu_ps(ap.add(j + 8)));
+            _mm256_storeu_ps(ap.add(j), v0);
+            _mm256_storeu_ps(ap.add(j + 8), v1);
+            j += 16;
+        }
+        while j < n {
+            *ap.add(j) += w * (*rp.add(j)) as f32;
+            j += 1;
         }
     }
 }
@@ -2325,6 +2544,10 @@ pub(crate) fn dot_i8_f32(w: &[u8], x: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         return dot_i8_f32_neon(w, x);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if avx2_enabled() {
+        return unsafe { dot_i8_f32_avx2(w, x) };
     }
     #[allow(unreachable_code)]
     {
@@ -2450,6 +2673,20 @@ fn qmatvec(
         }
         return;
     }
+    // x86 A8W8 via AVX2 maddubs — same quantized-activation contract as
+    // the SDOT path (CMF_AVX2=0 keeps the exact i8×f32 loop).
+    #[cfg(target_arch = "x86_64")]
+    if avx2_a8w8_enabled() {
+        let act = split_act(xs);
+        let out_addr = SendMut(out.as_mut_ptr());
+        let run_range =
+            |start: usize, end: usize| q8_range_avx2(q, row_scale, &act, cols, out_addr, start, end);
+        match pool {
+            Some(pool) if rows >= 256 => pool.run_rows(rows, &run_range),
+            _ => run_range(0, rows),
+        }
+        return;
+    }
 
     let row_dot = |o: usize| -> f32 { dot_i8_f32(&q[o * cols..(o + 1) * cols], xs) * row_scale[o] };
     match pool {
@@ -2493,6 +2730,21 @@ fn qmatvec2(
         let p2 = SendMut(o2.as_mut_ptr());
         let run_range = |start: usize, end: usize| {
             q8_range2_sdot(q, row_scale, &a1s, &a2s, cols, p1, p2, start, end)
+        };
+        match pool {
+            Some(pool) if rows >= 256 => pool.run_rows(rows, &run_range),
+            _ => run_range(0, rows),
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if avx2_a8w8_enabled() {
+        let a1s = split_act(x1);
+        let a2s = split_act(x2);
+        let p1 = SendMut(o1.as_mut_ptr());
+        let p2 = SendMut(o2.as_mut_ptr());
+        let run_range = |start: usize, end: usize| {
+            q8_range2_avx2(q, row_scale, &a1s, &a2s, cols, p1, p2, start, end)
         };
         match pool {
             Some(pool) if rows >= 256 => pool.run_rows(rows, &run_range),
