@@ -990,32 +990,38 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f
         encode_matvec(c, &mut enc, w, &xs_b, &rs_b, &y_b, j.rows, j.cols);
         y_bufs.push(y_b);
     }
-    // Copy all outputs into staging (one submit, one poll).
-    let stagings: Vec<wgpu::Buffer> = jobs
-        .iter()
-        .map(|j| {
-            c.device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: (j.rows * 4) as u64,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        })
-        .collect();
-    for ((y_b, j), st) in y_bufs.iter().zip(jobs).zip(&stagings) {
-        enc.copy_buffer_to_buffer(y_b, 0, st, 0, (j.rows * 4) as u64);
+    // ONE pooled staging buffer for all outputs (per-job offsets),
+    // one map — instead of N fresh MAP_READ allocations per call.
+    let total: u64 = jobs.iter().map(|j| (j.rows * 4) as u64).sum();
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        total,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "batch-stage",
+    );
+    let mut off = 0u64;
+    for (y_b, j) in y_bufs.iter().zip(jobs) {
+        enc.copy_buffer_to_buffer(y_b, 0, &stage, off, (j.rows * 4) as u64);
+        off += (j.rows * 4) as u64;
     }
     c.queue.submit(Some(enc.finish()));
-    for st in &stagings {
-        st.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    }
+    stage.slice(..total).map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
         return false;
     }
-    for ((st, j), o) in stagings.iter().zip(jobs).zip(out.iter_mut()) {
-        let Ok(data) = st.slice(..).get_mapped_range() else { return false };
-        o[..j.rows].copy_from_slice(bytemuck::cast_slice(&data[..j.rows * 4]));
+    {
+        let Ok(data) = stage.slice(..total).get_mapped_range() else { return false };
+        let mut off = 0usize;
+        for (j, o) in jobs.iter().zip(out.iter_mut()) {
+            o[..j.rows]
+                .copy_from_slice(bytemuck::cast_slice(&data[off..off + j.rows * 4]));
+            off += j.rows * 4;
+        }
     }
+    stage.unmap();
+    drop(sc);
     true
 }
 
