@@ -1214,6 +1214,113 @@ impl QTensor {
 
 /// Batched q8 kernel: same math as qmatvec, the row makes a single
 /// pass from memory for the whole batch.
+/// Accelerate CBLAS — the Apple AMX matrix units, the same engine
+/// llama.cpp's `-ngl 0` prefill rides via ggml-blas.
+#[cfg(target_os = "macos")]
+mod accel_blas {
+    #[link(name = "Accelerate", kind = "framework")]
+    unsafe extern "C" {
+        pub fn cblas_sgemm(
+            order: i32,
+            trans_a: i32,
+            trans_b: i32,
+            m: i32,
+            n: i32,
+            k: i32,
+            alpha: f32,
+            a: *const f32,
+            lda: i32,
+            b: *const f32,
+            ldb: i32,
+            beta: f32,
+            c: *mut f32,
+            ldc: i32,
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn accel_gemm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_ACCEL").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Prefill GEMM through Accelerate (macOS): dequantize q8 rows into
+/// f32 tiles (scale folded in, pool-parallel) and multiply each tile
+/// on the AMX with one row-major sgemm. Tiles live in cache, weights
+/// stream once. Numerics are f32-GEMM (not the int8 dot): prefill
+/// logits shift within f32 rounding — tolerance-class, like every
+/// reduction-order change; decode (M=1) never takes this path.
+#[cfg(target_os = "macos")]
+fn qmatmat_accel(
+    q: &[u8],
+    row_scale: &[f32],
+    pre: &[std::borrow::Cow<'_, [f32]>],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    const TR: usize = 2048;
+    let b = pre.len();
+    thread_local! {
+        static XPANEL: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+        static WTILE: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    XPANEL.with(|xp| {
+        WTILE.with(|wt| {
+            let mut xpanel = xp.borrow_mut();
+            xpanel.clear();
+            for x in pre {
+                xpanel.extend_from_slice(x);
+            }
+            let mut wtile = wt.borrow_mut();
+            wtile.resize(TR * cols, 0.0);
+            let (rm, nt, tt) = (101i32, 111i32, 112i32); // RowMajor, NoTrans, Trans
+            let mut r0 = 0usize;
+            while r0 < rows {
+                let tr = TR.min(rows - r0);
+                // Dequant the tile (scale folded) — pool-parallel.
+                let wt_addr = SendMut(wtile.as_mut_ptr());
+                let run = |start: usize, end: usize| {
+                    for r in start..end {
+                        let row = &q[(r0 + r) * cols..(r0 + r + 1) * cols];
+                        let s = row_scale[r0 + r];
+                        // SAFETY: workers cover disjoint r ranges.
+                        let dst = unsafe {
+                            std::slice::from_raw_parts_mut(wt_addr.at(r * cols), cols)
+                        };
+                        for (d, &v) in dst.iter_mut().zip(row) {
+                            *d = (v as i8) as f32 * s;
+                        }
+                    }
+                };
+                dispatch_rows(pool, tr, &run);
+                // C[b, tr] (at column r0 of out[b, rows]) = X · Wtileᵀ
+                unsafe {
+                    accel_blas::cblas_sgemm(
+                        rm,
+                        nt,
+                        tt,
+                        b as i32,
+                        tr as i32,
+                        cols as i32,
+                        1.0,
+                        xpanel.as_ptr(),
+                        cols as i32,
+                        wtile.as_ptr(),
+                        cols as i32,
+                        0.0,
+                        out.as_mut_ptr().add(r0),
+                        rows as i32,
+                    );
+                }
+                r0 += tr;
+            }
+        })
+    });
+}
+
 fn qmatmat(
     q: &[u8],
     row_scale: &[f32],
@@ -1225,6 +1332,15 @@ fn qmatmat(
 ) {
     let b = pre.len();
     debug_assert_eq!(out.len(), b * rows);
+    // Big prefill batches ride the AMX (roadmap PR3): the row×batch
+    // SDOT loop below peaks near the CPU's dot throughput, an order
+    // below the matrix units. Small tensors and tiny test models stay
+    // on the exact integer path.
+    #[cfg(target_os = "macos")]
+    if b >= 8 && rows * cols >= 500_000 && accel_gemm_enabled() {
+        qmatmat_accel(q, row_scale, pre, rows, cols, out, pool);
+        return;
+    }
     #[cfg(target_arch = "aarch64")]
     if sdot_enabled() {
         let acts: Vec<SplitAct> = pre.iter().map(|x| split_act(x)).collect();

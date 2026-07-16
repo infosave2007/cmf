@@ -290,6 +290,23 @@ fn prefill_batched() -> bool {
     std::env::var("CMF_PREFILL").map(|v| v != "seq").unwrap_or(true)
 }
 
+/// Prefill chunk (positions per batched pass). On macOS the AMX GEMM
+/// path wants tall panels — M=48 starves the matrix units (ggml uses
+/// ubatch 512); elsewhere the historical 48 stays. CMF_PREFILL_CHUNK
+/// overrides.
+fn prefill_chunk() -> usize {
+    if let Some(n) =
+        std::env::var("CMF_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok())
+    {
+        return n.max(1);
+    }
+    if cfg!(target_os = "macos") {
+        256
+    } else {
+        48
+    }
+}
+
 /// Callback for streaming tokens. Return `false` to cancel.
 pub type TokenCallback = Box<dyn FnMut(&str) -> bool + Send>;
 
@@ -946,10 +963,10 @@ impl Pipeline {
             // the prompt with the slower pair path — the published
             // prefill number didn't match real TTFT). MTP warm-up reads
             // each position's hidden straight from the chunk result.
-            const CHUNK: usize = 48;
+            let chunk = prefill_chunk();
             let hs = self.hidden_size;
             while pos < input_ids.len() {
-                let end = (pos + CHUNK).min(input_ids.len());
+                let end = (pos + chunk).min(input_ids.len());
                 let hb = self.prefill_batch(&input_ids[pos..end], pos);
                 if let Some(m) = &mut mtp {
                     for p in pos..end {
@@ -1386,10 +1403,10 @@ impl Pipeline {
             // prefill-GEMM in chunks; only the last position's hidden is
             // needed. (o1-compatible: the batch path attends per position
             // through qwen_attention, which carries the collection hook.)
-            const CHUNK: usize = 48;
+            let chunk = prefill_chunk();
             let hs = self.hidden_size;
             while pos < ids.len() {
-                let end = (pos + CHUNK).min(ids.len());
+                let end = (pos + chunk).min(ids.len());
                 let hb = self.prefill_batch(&ids[pos..end], pos);
                 hidden.copy_from_slice(&hb[(end - pos - 1) * hs..]);
                 pos = end;
