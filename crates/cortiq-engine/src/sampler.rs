@@ -78,6 +78,12 @@ pub fn sample(
     past_tokens: &[u32],
     rng: &mut SplitMix64,
 ) -> u32 {
+    // Greedy with no penalty needs no working copy: argmax straight
+    // over the borrowed logits (the full-vocab clone was ~600 KB per
+    // token on a 151K vocab — pure overhead in the decode hot loop).
+    if config.temperature < 1e-6 && config.repetition_penalty == 1.0 {
+        return argmax(logits);
+    }
     let mut probs = logits.to_vec();
 
     if config.repetition_penalty != 1.0 {

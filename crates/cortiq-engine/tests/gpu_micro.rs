@@ -53,6 +53,64 @@ fn q1_gpu_micro() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// q8_row twin of `q1_gpu_micro` — the whole-token q8 graph question
+/// is whether this kernel's warm GB/s clears the CPU decode rate.
+#[cfg(target_os = "macos")]
+#[test]
+fn q8_gpu_micro() {
+    unsafe { std::env::set_var("CMF_GPU", "1") };
+    use cortiq_core::quant::f32_to_f16;
+    use cortiq_core::*;
+    let (rows, cols) = (17408usize, 5120usize);
+    let mut payload = vec![0u8; rows * cols + rows * 2];
+    for (i, b) in payload[..rows * cols].iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    for r in 0..rows {
+        let s = f32_to_f16(0.01).to_le_bytes();
+        payload[rows * cols + r * 2..rows * cols + r * 2 + 2].copy_from_slice(&s);
+    }
+    let arch = ModelArch {
+        arch_name: "tiny".into(), hidden_size: cols, intermediate_size: cols * 2,
+        num_layers: 1, num_attention_heads: 2, num_kv_heads: 1, head_dim: 4,
+        vocab_size: rows, layer_types: vec![LayerType::FullAttention],
+        rms_norm_eps: 1e-6, norm_style: NormStyle::Qwen, rope_theta: 1e4,
+        tie_word_embeddings: false, partial_rotary_factor: 1.0, mtp: None,
+        moe: None, linear_core: None, max_position_embeddings: 8,
+        linear_conv_kernel_dim: None, linear_num_key_heads: None,
+        linear_num_value_heads: None, linear_key_head_dim: None, linear_value_head_dim: None,
+    };
+    let header = CmfHeader {
+        format: "cmf".into(), version: CMF_VERSION, arch, quant_type: QuantType::Q8Row,
+        provenance: None, tokenizer_config: None, section_hashes: None,
+        skills: Vec::new(), shard: None, calibration: None,
+    };
+    let spec =
+        TensorSpec { name: "w".into(), dtype: TensorDtype::Q8Row, shape: vec![rows, cols], data: payload };
+    let pad = TensorSpec { name: "pad".into(), dtype: TensorDtype::F32, shape: vec![8192, 2], data: vec![0u8; 8192 * 8] };
+    let dir = std::env::temp_dir().join(format!("cmf-q8micro-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("m.cmf");
+    CmfModel::write(&path, &header, &[spec, pad], None, None).unwrap();
+    let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
+    let idx = model.tensor_index("w").unwrap();
+    let rs = vec![0.01f32; rows];
+    let x = vec![0.1f32; cols];
+    let mut y = vec![0f32; rows];
+    for _ in 0..3 {
+        assert!(cortiq_engine::gpu_metal::q8_matvec(&model, idx, &rs, &x, rows, cols, &mut y));
+    }
+    let t0 = std::time::Instant::now();
+    let n = 20;
+    for _ in 0..n {
+        cortiq_engine::gpu_metal::q8_matvec(&model, idx, &rs, &x, rows, cols, &mut y);
+    }
+    let per = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+    let mb = (rows * cols) as f64 / 1e6;
+    println!("q8 single matvec {rows}x{cols} ({mb:.1} MB): {per:.3} ms/op → {:.1} GB/s", mb / per);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn empty_submit_cost() {

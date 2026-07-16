@@ -407,6 +407,11 @@ enum Commands {
         /// linear core (spec §2, vmf_phase)
         #[arg(long)]
         ctx: Option<usize>,
+        /// Core timing (llama-bench contract): greedy argmax without a
+        /// working copy, no repetition penalty, no per-token confidence
+        /// softmax. Default (off) measures the full production loop.
+        #[arg(long)]
+        core: bool,
         /// O(1) Nyström attention: replace KV-cache attention on the
         /// given layers (all | deepN | i,j,k | off). Overrides CMF_O1
         /// and the file's converter hint.
@@ -771,13 +776,14 @@ async fn main() -> anyhow::Result<()> {
             tokens,
             json,
             ctx,
+            core,
             o1,
             o1_m,
             o1_window,
             o1_sink,
         } => {
             let o1 = O1Flags { spec: o1, m: o1_m, w: o1_window, sink: o1_sink, rect: None };
-            cmd_bench(&model, &task, tokens, ctx, &o1, json).await
+            cmd_bench(&model, &task, tokens, ctx, &o1, json, core).await
         }
         Commands::Verify { model } => cmd_verify(&model).await,
         Commands::Fcd {
@@ -2249,6 +2255,7 @@ async fn cmd_bench(
     ctx: Option<usize>,
     o1: &O1Flags,
     json: bool,
+    core: bool,
 ) -> anyhow::Result<()> {
     if !json {
         println!("Benchmark: {} | task={} | tokens={}", model_path, task, tokens);
@@ -2268,9 +2275,17 @@ async fn cmd_bench(
         SamplerConfig {
             temperature: 0.0, // greedy: benchmark must be deterministic
             seed: Some(42),
+            // --core: no penalty pass → the sampler's clone-free argmax
+            repetition_penalty: if core { 1.0 } else { SamplerConfig::default().repetition_penalty },
             ..Default::default()
         },
     )?;
+    if core {
+        pipeline.set_confidence(false);
+        if !json {
+            println!("  Core timing: sampler/confidence excluded (llama-bench contract)");
+        }
+    }
     o1.apply(&mut pipeline);
     if pipeline.o1_active() {
         println!("  O(1):    nystrom attention on (KV replaced on flagged layers)");

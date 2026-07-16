@@ -124,6 +124,10 @@ pub struct Pipeline {
     /// Process-unique id keying this pipeline's device KV mirrors.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     graph_kv_id: u64,
+    /// Compute per-token Born confidence (a full-vocab softmax each
+    /// token). On by default; `bench --core` turns it off to match
+    /// llama-bench's core timing.
+    confidence_on: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -728,6 +732,7 @@ impl Pipeline {
             o1_flags: Vec::new(),
             trace: false,
             calib_temp: 1.0,
+            confidence_on: true,
             graph_kv_id: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -797,6 +802,14 @@ impl Pipeline {
     /// Enable/disable the structured per-token telemetry trace (B4).
     pub fn set_trace(&mut self, on: bool) {
         self.trace = on;
+    }
+
+    /// Toggle the per-token Born-confidence reduction (a full-vocab
+    /// softmax each token). `bench --core` turns it off so the timed
+    /// loop matches llama-bench's core contract; the result's
+    /// `confidence` vec is empty while off.
+    pub fn set_confidence(&mut self, on: bool) {
+        self.confidence_on = on;
     }
 
     /// Set the confidence-calibration temperature (B1). Values ≤0 are
@@ -1018,7 +1031,9 @@ impl Pipeline {
             );
             let mut logits = self.lm_head_forward(&self.ws.n1);
             let t_next = sampler::sample(&logits, &self.sampler_config, &all_ids, &mut self.rng);
-            confidence.push(top1_prob_t(&logits, t_next, calib_temp));
+            if self.confidence_on {
+                confidence.push(top1_prob_t(&logits, t_next, calib_temp));
+            }
             attention::recycle_buf(&mut logits);
             if trace_on {
                 // active_skill = the overlay in force while this token was
@@ -1028,7 +1043,7 @@ impl Pipeline {
                 traces.push(TokenTrace {
                     t: generated,
                     token_id: t_next,
-                    confidence: *confidence.last().unwrap(),
+                    confidence: confidence.last().copied().unwrap_or(0.0),
                     active_skill: skill,
                     recon: None,
                     switched: false,
@@ -1065,7 +1080,9 @@ impl Pipeline {
                     let mut logits1 = self.lm_head_forward(&self.ws.n1);
                     let t_after =
                         sampler::sample(&logits1, &self.sampler_config, &all_ids, &mut self.rng);
-                    confidence.push(top1_prob_t(&logits1, t_after, calib_temp));
+                    if self.confidence_on {
+                        confidence.push(top1_prob_t(&logits1, t_after, calib_temp));
+                    }
                     attention::recycle_buf(&mut logits1);
                     if trace_on {
                         // Speculative decode is mutually exclusive with
@@ -1073,7 +1090,7 @@ impl Pipeline {
                         traces.push(TokenTrace {
                             t: generated,
                             token_id: t_after,
-                            confidence: *confidence.last().unwrap(),
+                            confidence: confidence.last().copied().unwrap_or(0.0),
                             active_skill: None,
                             recon: None,
                             switched: false,
