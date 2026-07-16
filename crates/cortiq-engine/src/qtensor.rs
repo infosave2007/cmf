@@ -1979,8 +1979,8 @@ pub(crate) fn a8w8_enabled() -> bool {
     }
 }
 
-/// int8·int8 dot dispatch: SDOT on ARM, AVX2 maddubs on x86. Callers
-/// are gated by `a8w8_enabled()`.
+/// int8·int8 dot dispatch: SDOT on ARM; AVX-512 VNNI (vpdpbusd) or AVX2
+/// maddubs on x86. Callers are gated by `a8w8_enabled()`.
 #[inline]
 #[allow(unreachable_code)]
 fn dot_i8_i8(w: &[u8], xq: &[i8]) -> i32 {
@@ -1990,9 +1990,107 @@ fn dot_i8_i8(w: &[u8], xq: &[i8]) -> i32 {
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
+        if avx512vnni_enabled() {
+            return dot_i8_i8_vnni(w, xq);
+        }
         return dot_i8_i8_avx2(w, xq);
     }
     w.iter().zip(xq).map(|(&a, &b)| (a as i8) as i32 * b as i32).sum()
+}
+
+/// AVX-512 VNNI available? (F+BW+VL+VNNI; `CMF_AVX512=0` falls back to
+/// AVX2.) VL matters: short 32-byte groups (q4/vbit) ride the 256-bit
+/// `vpdpbusd` encoding.
+#[cfg(target_arch = "x86_64")]
+fn avx512vnni_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CMF_AVX512").map(|v| v != "0").unwrap_or(true)
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+    })
+}
+
+/// int8·int8 via AVX-512 VNNI: `vpdpbusd` fuses the maddubs+madd+add
+/// triple into one u8×i8 dot-accumulate. AVX-512 has no vpsignb, so the
+/// |w|·sign(x,w) trick becomes |w| × (x negated where w<0) via a mask
+/// subtract — w==0 lanes contribute 0 through |w|=0 either way.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn dot_i8_i8_vnni(w: &[u8], xq: &[i8]) -> i32 {
+    // SAFETY: callers uphold slice-length contracts (see call sites).
+    unsafe {
+        use core::arch::x86_64::*;
+        let n = w.len();
+        let mut j = 0usize;
+        let mut total: i32;
+        // 4 independent accumulators: vpdpbusd is its own loop-carried
+        // dependency (~5-cycle latency) — a single-acc loop runs
+        // latency-bound and LOSES to the AVX2 maddubs kernel, measured
+        // on Granite Rapids.
+        {
+            #[inline(always)]
+            unsafe fn step(
+                w: *const u8,
+                x: *const i8,
+                acc: core::arch::x86_64::__m512i,
+            ) -> core::arch::x86_64::__m512i {
+                unsafe {
+                    use core::arch::x86_64::*;
+                    let wv = _mm512_loadu_si512(w as *const _);
+                    let xv = _mm512_loadu_si512(x as *const _);
+                    let aw = _mm512_abs_epi8(wv);
+                    let neg = _mm512_movepi8_mask(wv);
+                    let sx = _mm512_mask_sub_epi8(xv, neg, _mm512_setzero_si512(), xv);
+                    _mm512_dpbusd_epi32(acc, aw, sx)
+                }
+            }
+            let (mut a0, mut a1, mut a2, mut a3) = (
+                _mm512_setzero_si512(),
+                _mm512_setzero_si512(),
+                _mm512_setzero_si512(),
+                _mm512_setzero_si512(),
+            );
+            while j + 256 <= n {
+                a0 = step(w.as_ptr().add(j), xq.as_ptr().add(j), a0);
+                a1 = step(w.as_ptr().add(j + 64), xq.as_ptr().add(j + 64), a1);
+                a2 = step(w.as_ptr().add(j + 128), xq.as_ptr().add(j + 128), a2);
+                a3 = step(w.as_ptr().add(j + 192), xq.as_ptr().add(j + 192), a3);
+                j += 256;
+            }
+            while j + 64 <= n {
+                a0 = step(w.as_ptr().add(j), xq.as_ptr().add(j), a0);
+                j += 64;
+            }
+            let s01 = _mm512_add_epi32(a0, a1);
+            let s23 = _mm512_add_epi32(a2, a3);
+            total = _mm512_reduce_add_epi32(_mm512_add_epi32(s01, s23));
+        }
+        // 32-wide (q4/vbit groups are exactly 32 bytes).
+        if j + 32 <= n {
+            let wv = _mm256_loadu_si256(w.as_ptr().add(j) as *const __m256i);
+            let xv = _mm256_loadu_si256(xq.as_ptr().add(j) as *const __m256i);
+            let d = _mm256_dpbusd_epi32(
+                _mm256_setzero_si256(),
+                _mm256_abs_epi8(wv),
+                _mm256_sign_epi8(xv, wv),
+            );
+            let hi128 = _mm256_extracti128_si256::<1>(d);
+            let s128 = _mm_add_epi32(_mm256_castsi256_si128(d), hi128);
+            let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
+            let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
+            total += _mm_cvtsi128_si32(s32);
+            j += 32;
+        }
+        while j < n {
+            total += (w[j] as i8) as i32 * xq[j] as i32;
+            j += 1;
+        }
+        total
+    }
 }
 
 /// i8 row · f32 x via AVX2/FMA (x86 mirror of `dot_i8_f32_neon`).
@@ -2063,16 +2161,78 @@ unsafe fn dot_i8_i8_avx2(w: &[u8], xq: &[i8]) -> i32 {
     }
 }
 
-/// AVX2 q8 row dot with exact outlier correction (x86 mirror of
-/// `row_dot_sdot` — same A8W8 contract).
+/// AVX2/VNNI q8 row dot with exact outlier correction (x86 mirror of
+/// `row_dot_sdot` — same A8W8 contract). With AVX-512 VNNI the row goes
+/// through the bias trick: Σ(w+128)·x via pure `vpdpbusd` (no per-lane
+/// sign fixups), corrected by −128·Σx with Σx precomputed per split.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn row_dot_avx2(row: &[u8], act: &SplitAct) -> f32 {
-    let mut acc = unsafe { dot_i8_i8_avx2(row, &act.xq) } as f32 * act.sx;
+    let dot = if avx512vnni_enabled() && row.len() >= 64 {
+        (unsafe { dot_u8p128_i8_vnni(row, &act.xq) }) - 128 * act.xsum
+    } else {
+        unsafe { dot_i8_i8_avx2(row, &act.xq) }
+    };
+    let mut acc = dot as f32 * act.sx;
     for &(j, xv) in &act.outliers {
         acc += (row[j] as i8) as f32 * xv;
     }
     acc
+}
+
+/// Σ (w[i]+128)·x[i] via pure `vpdpbusd` — the caller subtracts
+/// 128·Σx. Four independent accumulators (dpbusd is ~5-cycle latency;
+/// a single-acc loop runs latency-bound, measured on Granite Rapids).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn dot_u8p128_i8_vnni(w: &[u8], xq: &[i8]) -> i32 {
+    // SAFETY: callers uphold slice-length contracts (see call sites).
+    unsafe {
+        use core::arch::x86_64::*;
+        let n = w.len();
+        let flip = _mm512_set1_epi8(-128); // XOR 0x80: i8 w → u8 (w+128)
+        #[inline(always)]
+        unsafe fn step(
+            w: *const u8,
+            x: *const i8,
+            flip: core::arch::x86_64::__m512i,
+            acc: core::arch::x86_64::__m512i,
+        ) -> core::arch::x86_64::__m512i {
+            unsafe {
+                use core::arch::x86_64::*;
+                let wv = _mm512_xor_si512(_mm512_loadu_si512(w as *const _), flip);
+                _mm512_dpbusd_epi32(acc, wv, _mm512_loadu_si512(x as *const _))
+            }
+        }
+        let (mut a0, mut a1, mut a2, mut a3) = (
+            _mm512_setzero_si512(),
+            _mm512_setzero_si512(),
+            _mm512_setzero_si512(),
+            _mm512_setzero_si512(),
+        );
+        let mut j = 0usize;
+        while j + 256 <= n {
+            a0 = step(w.as_ptr().add(j), xq.as_ptr().add(j), flip, a0);
+            a1 = step(w.as_ptr().add(j + 64), xq.as_ptr().add(j + 64), flip, a1);
+            a2 = step(w.as_ptr().add(j + 128), xq.as_ptr().add(j + 128), flip, a2);
+            a3 = step(w.as_ptr().add(j + 192), xq.as_ptr().add(j + 192), flip, a3);
+            j += 256;
+        }
+        while j + 64 <= n {
+            a0 = step(w.as_ptr().add(j), xq.as_ptr().add(j), flip, a0);
+            j += 64;
+        }
+        let mut total = _mm512_reduce_add_epi32(_mm512_add_epi32(
+            _mm512_add_epi32(a0, a1),
+            _mm512_add_epi32(a2, a3),
+        ));
+        // Scalar tail: (w as i8) + 128 ≡ (w as u8) ^ 0x80.
+        while j < n {
+            total += ((w[j] ^ 0x80) as i32) * xq[j] as i32;
+            j += 1;
+        }
+        total
+    }
 }
 
 /// One q4 row via AVX2: nibbles → centered i8 (unpacklo/hi restores the
@@ -2239,6 +2399,10 @@ struct SplitAct {
     xq: Vec<i8>,
     sx: f32,
     outliers: Vec<(usize, f32)>,
+    /// Σ xq — the VNNI bias-trick correction (`(w+128)·x` sums need
+    /// `−128·Σx`); one i32 per split, computed once per matvec.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    xsum: i32,
 }
 
 thread_local! {
@@ -2296,7 +2460,8 @@ fn split_act(x: &[f32]) -> SplitAct {
             }
         }));
     }
-    SplitAct { xq, sx, outliers }
+    let xsum = xq.iter().map(|&v| v as i32).sum();
+    SplitAct { xq, sx, outliers, xsum }
 }
 
 /// int8(weight)·int8(activation) → i32 via `sdot` (inline asm — the
