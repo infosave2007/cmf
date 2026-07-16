@@ -284,6 +284,11 @@ cortiq import-gguf Qwen/Qwen2.5-0.5B-Instruct-GGUF --output model.cmf --quant q8
 кодирование просто восстанавливает их). 27B превращается в файл 4.8 ГБ и
 работает на MacBook с 24 ГБ памяти:
 
+Нужен **cortiq ≥ 0.3.2** — проверьте `cortiq --version`; старый бинарь
+ответит `unknown quant 'q1'`. Обновление: `cargo install cortiq-cli --force`
+(обычный `cargo install` оставит старую версию) или возьмите
+[последний релиз](https://github.com/infosave2007/cmf/releases/latest).
+
 ```sh
 cortiq convert --model prism-ml/Bonsai-27B-unpacked --quant q1 --output bonsai27b-q1.cmf
 CMF_THREADS=10 cortiq run bonsai27b-q1.cmf -p "Сколько будет 84 * 3 / 2?"

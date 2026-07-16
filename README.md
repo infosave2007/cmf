@@ -274,6 +274,11 @@ Checkpoints **trained** with binary weights convert losslessly into `q1`
 encoding just recovers them). A 27B becomes a 4.8 GB file that runs on a
 24 GB MacBook:
 
+Requires **cortiq ≥ 0.3.2** — check with `cortiq --version`; an older
+binary answers `unknown quant 'q1'`. Update with
+`cargo install cortiq-cli --force` (plain `cargo install` keeps the old
+one) or grab the [latest release](https://github.com/infosave2007/cmf/releases/latest).
+
 ```sh
 cortiq convert --model prism-ml/Bonsai-27B-unpacked --quant q1 --output bonsai27b-q1.cmf
 CMF_THREADS=10 cortiq run bonsai27b-q1.cmf -p "What is 84 * 3 / 2?"
