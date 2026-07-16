@@ -121,6 +121,16 @@ pub struct Pipeline {
     /// Confidence-calibration temperature (B1): reported Born mass is
     /// softmax(logits / calib_temp). 1.0 = raw. Set from header.calibration.
     calib_temp: f32,
+    /// Process-unique id keying this pipeline's device KV mirrors.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    graph_kv_id: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        crate::gpu::kv_mirror_drop(self.graph_kv_id);
+    }
 }
 
 /// Model weights. Matrices are `QTensor` (owned f32 for small models
@@ -344,8 +354,21 @@ impl Pipeline {
                 k_norm: Option<&'a [f32]>,
                 output_gate: bool,
                 bias: Option<(&'a [f32], &'a [f32], &'a [f32])>,
+                /// Attend on the device too (no sync): F32 KV, no
+                /// o1/bias, dims inside the kernels' contract.
+                full_gpu: bool,
             },
         }
+
+        // Device-attend eligibility shared by every Full layer.
+        let dev_attend = std::env::var("CMF_GPU_ATTEND").map(|v| v != "0").unwrap_or(true)
+            && self.head_dim % 4 == 0
+            && self.head_dim <= 128
+            && self.rotary_dim >= 2
+            && self.rotary_dim <= self.head_dim
+            && (self.rotary_dim / 2) % 32 == 0
+            && self.num_kv_heads > 0
+            && self.num_heads % self.num_kv_heads == 0;
 
         let mut plan: Vec<Item> = Vec::new();
         let mut model_ref: Option<std::sync::Arc<cortiq_core::CmfModel>> = None;
@@ -400,6 +423,15 @@ impl Pipeline {
                     if let QTensor::Mapped { model, .. } = wq {
                         model_ref.get_or_insert_with(|| model.clone());
                     }
+                    let cache = &self.kv_cache.layers[scan];
+                    let full_gpu = dev_attend
+                        && cache.mode == crate::kv_cache::KvMode::F32
+                        && cache.o1.is_none()
+                        && bias.is_none()
+                        && pq.1 == self.num_heads * self.head_dim * (1 + *output_gate as usize)
+                        && pk.1 == self.num_kv_heads * self.head_dim
+                        && pv.1 == self.num_kv_heads * self.head_dim
+                        && po.2 == self.num_heads * self.head_dim;
                     plan.push(Item::Attn {
                         l: AttnGpuLayer {
                             attn_norm: &lw.input_norm,
@@ -419,6 +451,7 @@ impl Pipeline {
                         bias: bias
                             .as_ref()
                             .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
+                        full_gpu,
                     });
                 }
                 _ => break,
@@ -485,9 +518,15 @@ impl Pipeline {
             self.rms_eps,
         );
         let norm_style = self.norm_style;
+        let gemma = norm_style == cortiq_core::NormStyle::Gemma;
         let want = self.gdn_cfg.map(|c| c.state_len()).unwrap_or(0);
-        // The GDN run whose states await readback after the next sync.
-        let mut pending: Option<(usize, usize)> = None;
+        let kv_id = self.graph_kv_id;
+        // GDN runs whose states await readback after the next sync
+        // (device-attended layers add no sync, so several may stack).
+        let mut pending: Vec<(usize, usize)> = Vec::new();
+        // Device-attended layers: their K/V/imp are pulled from the
+        // mirror after the final sync.
+        let mut dev_attn: Vec<usize> = Vec::new();
         for item in &plan {
             match item {
                 Item::Gdn { run, first } => {
@@ -505,15 +544,55 @@ impl Pipeline {
                         tracing::error!("q1 graph: GDN run refused after validation");
                         return start;
                     }
-                    pending = Some((*first, run.len()));
+                    // Early commit: the GPU starts the run while the
+                    // CPU encodes the next layer (nothing to wait on).
+                    graph.commit();
+                    pending.push((*first, run.len()));
                 }
-                Item::Attn { l, li, q_norm, k_norm, output_gate, bias } => {
+                Item::Attn { l, li, q_norm, k_norm, output_gate, bias, full_gpu } => {
+                    // ── Fully device-resident attention: no sync at all.
+                    if *full_gpu {
+                        let cache = &self.kv_cache.layers[*li];
+                        let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
+                        let cpu_v: Vec<&[f32]> = (0..nkv).map(|g| cache.head_values(g)).collect();
+                        let cpu_stored = cpu_k[0].len() / hd;
+                        let p = crate::gpu::AttnDeviceParams {
+                            kv_id,
+                            layer: *li,
+                            nh,
+                            nkv,
+                            hd,
+                            rd,
+                            position,
+                            eps: eps as f32,
+                            gemma,
+                            output_gate: *output_gate,
+                            q_norm: *q_norm,
+                            k_norm: *k_norm,
+                            inv_freq: &inv_freq,
+                            cpu_k,
+                            cpu_v,
+                            cpu_stored,
+                        };
+                        if graph.attn_device_ok(l, &p) && graph.encode_attn_device(l, &p) {
+                            graph.commit();
+                            dev_attn.push(*li);
+                            continue;
+                        }
+                        // Mirror refused (nothing encoded) → sandwich.
+                    }
                     graph.encode_attn_prefix(l);
                     graph.sync();
-                    if let Some((first, len)) = pending.take() {
-                        let mut outs: Vec<&mut [f32]> = self.kv_cache.layers[first..first + len]
+                    if !pending.is_empty() {
+                        let idxs: Vec<usize> =
+                            pending.drain(..).flat_map(|(f, n)| f..f + n).collect();
+                        let mut outs: Vec<&mut [f32]> = self
+                            .kv_cache
+                            .layers
                             .iter_mut()
-                            .map(|s| s.linear_state.as_mut_slice())
+                            .enumerate()
+                            .filter(|(i, _)| idxs.binary_search(i).is_ok())
+                            .map(|(_, s)| s.linear_state.as_mut_slice())
                             .collect();
                         graph.read_states(&mut outs);
                     }
@@ -553,14 +632,37 @@ impl Pipeline {
             }
         }
         graph.sync();
-        if let Some((first, len)) = pending.take() {
-            let mut outs: Vec<&mut [f32]> = self.kv_cache.layers[first..first + len]
+        if !pending.is_empty() {
+            let idxs: Vec<usize> = pending.drain(..).flat_map(|(f, n)| f..f + n).collect();
+            let mut outs: Vec<&mut [f32]> = self
+                .kv_cache
+                .layers
                 .iter_mut()
-                .map(|s| s.linear_state.as_mut_slice())
+                .enumerate()
+                .filter(|(i, _)| idxs.binary_search(i).is_ok())
+                .map(|(_, s)| s.linear_state.as_mut_slice())
                 .collect();
             graph.read_states(&mut outs);
         }
         graph.finish(h);
+        // Device-attended layers: replay the CPU bookkeeping — append
+        // the mirror's new K/V row (rope'd on the GPU) into the owner
+        // cache, then bank this token's Born-importance mass.
+        for li in dev_attn {
+            let mut krow = attention::take_buf(nkv * hd);
+            let mut vrow = attention::take_buf(nkv * hd);
+            if crate::gpu::kv_mirror_read_last(kv_id, li, nkv, hd, &mut krow, &mut vrow) {
+                let cache = &mut self.kv_cache.layers[li];
+                cache.append(&krow, &vrow, &[]);
+                let n = cache.seq_len;
+                let mut imp = attention::take_buf(n);
+                crate::gpu::kv_mirror_take_imp(kv_id, li, &mut imp);
+                cache.accumulate_imp(&imp);
+                attention::recycle_buf(&mut imp);
+            }
+            attention::recycle_buf(&mut krow);
+            attention::recycle_buf(&mut vrow);
+        }
         end
     }
 
@@ -626,6 +728,10 @@ impl Pipeline {
             o1_flags: Vec::new(),
             trace: false,
             calib_temp: 1.0,
+            graph_kv_id: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
         }
     }
 

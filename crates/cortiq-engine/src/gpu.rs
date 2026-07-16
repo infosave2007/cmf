@@ -481,7 +481,10 @@ pub fn q1_matvec(
 
 /// Whole-block token-graph types re-exported from the Metal backend.
 #[cfg(target_os = "macos")]
-pub use crate::gpu_metal::{AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GraphDims, TokenGraph};
+pub use crate::gpu_metal::{
+    kv_mirror_drop, kv_mirror_read_last, kv_mirror_take_imp, AttnDeviceParams, AttnGpuLayer,
+    GdnGpuCfg, GdnGpuLayer, GraphDims, TokenGraph,
+};
 
 /// A BLOCK of consecutive q1 GDN layers in one submission (Metal only).
 #[cfg(target_os = "macos")]

@@ -182,6 +182,193 @@ kernel void silu_mul_pre(
     act[i] = (gv / (1.0f + exp(-gv))) * u[i] * cv;
 }
 
+// Full attention on the device — one simdgroup per head throughout.
+// Dims contract (checked host-side): hd % 4 == 0, hd <= 128, and for
+// RoPE lane-local pairing (rd/2) % 32 == 0 with rd <= hd.
+
+// Per-head qk-norm + partial RoPE. Heads 0..nh are Q (optionally
+// [q(hd); gate(hd)] interleaved in qraw), heads nh..nh+nkv are K rows
+// normed+rotated in place. The gate half is copied out untouched
+// (it is applied after the attend, sigmoid-gated).
+kernel void attn_rope_qkn(
+    device const float* qraw [[buffer(0)]],
+    device float*       k    [[buffer(1)]],
+    device float*       qout [[buffer(2)]],
+    device float*       gout [[buffer(3)]],
+    device const float* qnw  [[buffer(4)]],
+    device const float* knw  [[buffer(5)]],
+    device const float* invf [[buffer(6)]],
+    constant uint&  nh    [[buffer(7)]],
+    constant uint&  nkv   [[buffer(8)]],
+    constant uint&  hd    [[buffer(9)]],
+    constant uint&  rd    [[buffer(10)]],
+    constant uint&  pos   [[buffer(11)]],
+    constant uint&  flags [[buffer(12)]], // 1=gate 2=qnorm 4=knorm 8=gemma
+    constant float& eps   [[buffer(13)]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sgs [[simdgroups_per_threadgroup]])
+{
+    uint head = tg * sgs + sg;
+    if (head >= nh + nkv) return;
+    bool isq = head < nh;
+    bool gate = (flags & 1u) != 0u;
+    device const float* src = isq
+        ? qraw + (ulong)head * (gate ? 2u : 1u) * hd
+        : k + (ulong)(head - nh) * hd;
+    uint nt = (hd + 31u) / 32u;
+    float xv[4];
+    float ss = 0.0f;
+    for (uint t = 0; t < nt; ++t) {
+        uint d = t * 32u + lane;
+        xv[t] = d < hd ? src[d] : 0.0f;
+        ss += xv[t] * xv[t];
+    }
+    ss = simd_sum(ss);
+    bool normed = isq ? (flags & 2u) != 0u : (flags & 4u) != 0u;
+    if (normed) {
+        float inv = 1.0f / sqrt(ss / (float)hd + eps);
+        device const float* w = isq ? qnw : knw;
+        bool gemma = (flags & 8u) != 0u;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) {
+                float wd = w[d];
+                xv[t] = xv[t] * inv * (gemma ? (1.0f + wd) : wd);
+            }
+        }
+    }
+    // Partial RoPE: pair (i, i + rd/2); with (rd/2) % 32 == 0 both
+    // halves live in the same lane, slots t and t + (rd/2)/32.
+    uint hlf = rd / 2u;
+    uint toff = hlf / 32u;
+    for (uint t = 0; t < toff; ++t) {
+        uint i = t * 32u + lane;
+        if (i < hlf) {
+            float angle = (float)pos * invf[i];
+            float c = cos(angle), s = sin(angle);
+            float x0 = xv[t], x1 = xv[t + toff];
+            xv[t] = x0 * c - x1 * s;
+            xv[t + toff] = x0 * s + x1 * c;
+        }
+    }
+    device float* dst = isq ? qout + (ulong)head * hd : k + (ulong)(head - nh) * hd;
+    for (uint t = 0; t < nt; ++t) {
+        uint d = t * 32u + lane;
+        if (d < hd) dst[d] = xv[t];
+    }
+    if (isq && gate) {
+        device const float* gsrc = qraw + (ulong)head * 2u * hd + hd;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) gout[(ulong)head * hd + d] = gsrc[d];
+        }
+    }
+}
+
+// Append this position's K/V rows into the device cache mirror
+// ([nkv, cap, hd] each) at index `stored`.
+kernel void kv_append(
+    device const float* k    [[buffer(0)]],
+    device const float* v    [[buffer(1)]],
+    device float*       kbuf [[buffer(2)]],
+    device float*       vbuf [[buffer(3)]],
+    constant uint& nkv    [[buffer(4)]],
+    constant uint& hd     [[buffer(5)]],
+    constant uint& cap    [[buffer(6)]],
+    constant uint& stored [[buffer(7)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= nkv * hd) return;
+    uint h = i / hd, d = i % hd;
+    ulong dst = ((ulong)h * cap + stored) * hd + d;
+    kbuf[dst] = k[i];
+    vbuf[dst] = v[i];
+}
+
+// Grouped decode attention, one simdgroup per Q-head: online softmax
+// over the n stored positions (lane-sliced dims, dim d lives in lane
+// d%32 slot d/32), plus a second pass that banks each position's
+// probability mass into the Born-importance accumulator (the default
+// eviction policy ranks by it). exp/order differ from the CPU attend
+// (tolerance-gated, like every GPU reduction here).
+kernel void gqa_attend(
+    device const float* q    [[buffer(0)]],
+    device const float* kbuf [[buffer(1)]],
+    device const float* vbuf [[buffer(2)]],
+    device float*       outb [[buffer(3)]],
+    device atomic_float* imp [[buffer(4)]],
+    constant uint& nh  [[buffer(5)]],
+    constant uint& hpk [[buffer(6)]],
+    constant uint& hd  [[buffer(7)]],
+    constant uint& cap [[buffer(8)]],
+    constant uint& n   [[buffer(9)]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sgs [[simdgroups_per_threadgroup]])
+{
+    uint h = tg * sgs + sg;
+    if (h >= nh) return;
+    uint kh = h / hpk;
+    device const float* kh0 = kbuf + (ulong)kh * cap * hd;
+    device const float* vh0 = vbuf + (ulong)kh * cap * hd;
+    float scale = 1.0f / sqrt((float)hd);
+    uint nt = (hd + 31u) / 32u;
+    float qv[4];
+    for (uint t = 0; t < nt; ++t) {
+        uint d = t * 32u + lane;
+        qv[t] = d < hd ? q[(ulong)h * hd + d] * scale : 0.0f;
+    }
+    float m = -INFINITY, l = 0.0f;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint p = 0; p < n; ++p) {
+        device const float* kr = kh0 + (ulong)p * hd;
+        float partial = 0.0f;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) partial += qv[t] * kr[d];
+        }
+        float s = simd_sum(partial);
+        float mp = max(m, s);
+        float f = exp(m - mp), w = exp(s - mp);
+        l = l * f + w;
+        device const float* vr = vh0 + (ulong)p * hd;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) acc[t] = acc[t] * f + w * vr[d];
+        }
+        m = mp;
+    }
+    float invl = l > 0.0f ? 1.0f / l : 0.0f;
+    for (uint t = 0; t < nt; ++t) {
+        uint d = t * 32u + lane;
+        if (d < hd) outb[(ulong)h * hd + d] = acc[t] * invl;
+    }
+    // Born-importance pass: prob_p = exp(s_p − m)/l summed over heads.
+    for (uint p = lane; p < n; p += 32u) {
+        device const float* kr = kh0 + (ulong)p * hd;
+        float dot = 0.0f;
+        for (uint d = 0; d < hd; ++d) {
+            dot += q[(ulong)h * hd + d] * kr[d];
+        }
+        float prob = exp(dot * scale - m) * invl;
+        atomic_fetch_add_explicit(&imp[p], prob, memory_order_relaxed);
+    }
+}
+
+// a *= sigmoid(g) — the Qwen3.5 attention output gate.
+kernel void sig_gate(
+    device float*       a [[buffer(0)]],
+    device const float* g [[buffer(1)]],
+    constant uint&      n [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n) return;
+    a[i] = a[i] / (1.0f + exp(-g[i]));
+}
+
 kernel void axpy(
     device const float* d [[buffer(0)]],
     device float*       y [[buffer(1)]],
@@ -428,6 +615,12 @@ struct Ctx {
     silu: ComputePipelineState,
     axpy: ComputePipelineState,
     zero: ComputePipelineState,
+    rqkn: ComputePipelineState,
+    kvapp: ComputePipelineState,
+    gqat: ComputePipelineState,
+    sgate: ComputePipelineState,
+    /// Device K/V cache mirrors keyed by (pipeline id, layer).
+    kv_mirrors: Mutex<HashMap<(u64, usize), KvMirror>>,
     /// no-copy buffer per file (key — the base address of the mapping).
     file_bufs: Mutex<HashMap<usize, Buffer>>,
     /// row_scale buffer per tensor (key — (base, idx)).
@@ -478,8 +671,12 @@ fn init() -> Result<Ctx, String> {
             device.name()
         ));
     }
+    let opts = metal::CompileOptions::new();
+    // atomic_float (Born-importance accumulation in gqa_attend) needs
+    // MSL 3.0 — macOS 13+, a subset of what the UMA gate already implies.
+    opts.set_language_version(metal::MTLLanguageVersion::V3_0);
     let lib = device
-        .new_library_with_source(MSL, &metal::CompileOptions::new())
+        .new_library_with_source(MSL, &opts)
         .map_err(|e| format!("MSL compile: {e}"))?;
     let pso = |name: &str| -> Result<ComputePipelineState, String> {
         let f = lib
@@ -503,6 +700,10 @@ fn init() -> Result<Ctx, String> {
     let silu = pso("silu_mul_pre")?;
     let axpy = pso("axpy")?;
     let zero = pso("fill_zero")?;
+    let rqkn = pso("attn_rope_qkn")?;
+    let kvapp = pso("kv_append")?;
+    let gqat = pso("gqa_attend")?;
+    let sgate = pso("sig_gate")?;
     let queue = device.new_command_queue();
     let flag_buf = device.new_buffer(64, MTLResourceOptions::StorageModeShared);
     unsafe { *(flag_buf.contents() as *mut u32) = 0 };
@@ -523,6 +724,11 @@ fn init() -> Result<Ctx, String> {
         silu,
         axpy,
         zero,
+        rqkn,
+        kvapp,
+        gqat,
+        sgate,
+        kv_mirrors: Mutex::new(HashMap::new()),
         file_bufs: Mutex::new(HashMap::new()),
         rs_bufs: Mutex::new(HashMap::new()),
         io_bufs: Mutex::new(HashMap::new()),
@@ -1372,6 +1578,22 @@ fn enc_simple(
     enc.end_encoding();
 }
 
+/// Device mirror of one layer's K/V cache: `[nkv, cap, hd]` each, plus
+/// the per-position Born-importance accumulator for this token. The
+/// CPU cache stays the owner of record — `stored` tracks how many CPU
+/// rows the mirror reflects, and any mismatch (eviction, rollback, a
+/// non-graph path having appended) triggers a full re-upload.
+pub struct KvMirror {
+    k: Buffer,
+    v: Buffer,
+    imp: Buffer,
+    cap: usize,
+    stored: usize,
+}
+
+// Buffers are retained ObjC pointers, guarded by the registry Mutex.
+unsafe impl Send for KvMirror {}
+
 /// A token's worth of layers as few command buffers: hidden lives in a
 /// device buffer across GDN runs AND full-attention layers; the only
 /// syncs are where the CPU genuinely needs data (q/k/v before the KV
@@ -1564,6 +1786,12 @@ impl TokenGraph {
         unsafe {
             std::ptr::copy_nonoverlapping(ao.as_ptr(), ao_b.contents() as *mut f32, ao.len());
         }
+        self.encode_o_ffn(&cmd, l, &ao_b);
+    }
+
+    /// O-projection from a device-resident attention output + residual
+    /// + post-norm + FFN + residual.
+    fn encode_o_ffn(&self, cmd: &metal::CommandBufferRef, l: &AttnGpuLayer, ao_b: &Buffer) {
         {
             let enc = cmd.new_compute_command_encoder();
             let abs = self.q1_abs(l.wo).unwrap();
@@ -1572,17 +1800,189 @@ impl TokenGraph {
                 enc,
                 &self.fbuf,
                 abs,
-                &ao_b,
+                ao_b,
                 &self.d_b,
                 l.wo.1,
                 l.wo.2 / GROUP_SIZE,
             );
             enc.end_encoding();
         }
-        enc_axpy(self.c, &cmd, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
-        self.encode_post_ffn(&cmd, l.post_norm, l.gate, l.up, l.down);
+        enc_axpy(self.c, cmd, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
+        self.encode_post_ffn(cmd, l.post_norm, l.gate, l.up, l.down);
     }
 
+    /// Dims contract of the device-attend kernels (host-side check).
+    pub fn attn_device_ok(&self, l: &AttnGpuLayer, p: &AttnDeviceParams) -> bool {
+        self.attn_ok(l)
+            && p.hd % 4 == 0
+            && p.hd <= 128
+            && p.rd <= p.hd
+            && p.rd >= 2
+            && (p.rd / 2) % 32 == 0
+            && p.nh % p.nkv == 0
+            && l.wq.1 == p.nh * p.hd * (1 + p.output_gate as usize)
+            && l.wk.1 == p.nkv * p.hd
+            && l.wv.1 == p.nkv * p.hd
+            && l.wo.2 == p.nh * p.hd
+            && p.cpu_k.len() == p.nkv
+            && p.cpu_v.len() == p.nkv
+            && p.inv_freq.len() >= p.rd / 2
+    }
+
+    /// One attention layer entirely on the device: norm → QKV →
+    /// qk-norm+RoPE → KV append → grouped attend (+Born importance) →
+    /// output gate → O → residual → FFN → residual. No sync — the KV
+    /// mirror is prepared host-side first (self-healing: any mismatch
+    /// with the CPU cache re-uploads it). Returns false without
+    /// encoding anything if the mirror could not be prepared.
+    pub fn encode_attn_device(&mut self, l: &AttnGpuLayer, p: &AttnDeviceParams) -> bool {
+        // ── KV mirror prep (CPU side; previous token already synced).
+        let (k_mb, v_mb, imp_mb, cap, stored) = {
+            let mut reg = self.c.kv_mirrors.lock().unwrap();
+            let need = p.cpu_stored + 1;
+            let entry = reg.entry((p.kv_id, p.layer)).or_insert_with(|| KvMirror {
+                k: self.c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
+                v: self.c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
+                imp: self.c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
+                cap: 0,
+                stored: usize::MAX, // force first-touch upload
+            });
+            if entry.cap < need {
+                let cap = need.next_power_of_two().max(1024);
+                let bytes = (p.nkv * cap * p.hd * 4) as u64;
+                entry.k = self.c._device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+                entry.v = self.c._device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+                entry.imp =
+                    self.c._device.new_buffer((cap * 4) as u64, MTLResourceOptions::StorageModeShared);
+                unsafe {
+                    std::ptr::write_bytes(entry.imp.contents() as *mut u8, 0, cap * 4);
+                }
+                entry.cap = cap;
+                entry.stored = usize::MAX;
+            }
+            if entry.stored != p.cpu_stored {
+                // Resync from the owner of record (eviction, rollback,
+                // a CPU-path append, or a fresh mirror).
+                for h in 0..p.nkv {
+                    if p.cpu_k[h].len() != p.cpu_stored * p.hd
+                        || p.cpu_v[h].len() != p.cpu_stored * p.hd
+                    {
+                        return false;
+                    }
+                    unsafe {
+                        let kd = (entry.k.contents() as *mut f32).add(h * entry.cap * p.hd);
+                        std::ptr::copy_nonoverlapping(p.cpu_k[h].as_ptr(), kd, p.cpu_k[h].len());
+                        let vd = (entry.v.contents() as *mut f32).add(h * entry.cap * p.hd);
+                        std::ptr::copy_nonoverlapping(p.cpu_v[h].as_ptr(), vd, p.cpu_v[h].len());
+                    }
+                }
+                entry.stored = p.cpu_stored;
+            }
+            let out =
+                (entry.k.clone(), entry.v.clone(), entry.imp.clone(), entry.cap, entry.stored);
+            entry.stored += 1; // this token's append
+            out
+        };
+
+        let cmd = self.ensure_cmd();
+        // 1. attn rmsnorm h → n
+        enc_simple(
+            &cmd,
+            &self.c.rmsn,
+            &[(&self.h_b, 0), (&const_buf(self.c, l.attn_norm), 0), (&self.n_b, 0)],
+            &[self.dims.hidden as u32, self.dims.gemma as u32],
+            &[self.dims.eps],
+            (256, 256),
+        );
+        // 2. QKV projections n → q_raw / k / v
+        let q_b = io_buf(self.c, 40_000_000_003 + l.wq.1, l.wq.1 * 4);
+        let k_b = io_buf(self.c, 41_000_000_019 + l.wk.1, l.wk.1 * 4);
+        let v_b = io_buf(self.c, 42_000_000_037 + l.wv.1, l.wv.1 * 4);
+        {
+            let enc = cmd.new_compute_command_encoder();
+            let (aq, ak, av) = (
+                self.q1_abs(l.wq).unwrap(),
+                self.q1_abs(l.wk).unwrap(),
+                self.q1_abs(l.wv).unwrap(),
+            );
+            encode_q1_matvec(self.c, enc, &self.fbuf, aq, &self.n_b, &q_b, l.wq.1, l.wq.2 / GROUP_SIZE);
+            encode_q1_matvec(self.c, enc, &self.fbuf, ak, &self.n_b, &k_b, l.wk.1, l.wk.2 / GROUP_SIZE);
+            encode_q1_matvec(self.c, enc, &self.fbuf, av, &self.n_b, &v_b, l.wv.1, l.wv.2 / GROUP_SIZE);
+            enc.end_encoding();
+        }
+        // 3. per-head qk-norm + RoPE (gate split into g_b)
+        let nhd = p.nh * p.hd;
+        let qr_b = io_buf(self.c, 44_000_000_007 + nhd, nhd * 4);
+        let g_b = io_buf(self.c, 45_000_000_039 + nhd, nhd * 4);
+        let flags = (p.output_gate as u32)
+            | ((p.q_norm.is_some() as u32) << 1)
+            | ((p.k_norm.is_some() as u32) << 2)
+            | ((p.gemma as u32) << 3);
+        let qn_b = p.q_norm.map(|w| const_buf(self.c, w)).unwrap_or_else(|| qr_b.clone());
+        let kn_b = p.k_norm.map(|w| const_buf(self.c, w)).unwrap_or_else(|| qr_b.clone());
+        enc_simple(
+            &cmd,
+            &self.c.rqkn,
+            &[
+                (&q_b, 0),
+                (&k_b, 0),
+                (&qr_b, 0),
+                (&g_b, 0),
+                (&qn_b, 0),
+                (&kn_b, 0),
+                (&const_buf(self.c, p.inv_freq), 0),
+            ],
+            &[
+                p.nh as u32,
+                p.nkv as u32,
+                p.hd as u32,
+                p.rd as u32,
+                p.position as u32,
+                flags,
+            ],
+            &[p.eps],
+            (((p.nh + p.nkv) * 32) as u64, 256),
+        );
+        // 4. append this position's K/V into the mirror
+        enc_simple(
+            &cmd,
+            &self.c.kvapp,
+            &[(&k_b, 0), (&v_b, 0), (&k_mb, 0), (&v_mb, 0)],
+            &[p.nkv as u32, p.hd as u32, cap as u32, stored as u32],
+            &[],
+            ((p.nkv * p.hd) as u64, 256),
+        );
+        // 5. grouped attend (+ Born importance into the mirror's imp)
+        let ao_b = io_buf(self.c, 43_000_000_057 + nhd, nhd * 4);
+        enc_simple(
+            &cmd,
+            &self.c.gqat,
+            &[(&qr_b, 0), (&k_mb, 0), (&v_mb, 0), (&ao_b, 0), (&imp_mb, 0)],
+            &[
+                p.nh as u32,
+                (p.nh / p.nkv) as u32,
+                p.hd as u32,
+                cap as u32,
+                (stored + 1) as u32,
+            ],
+            &[],
+            ((p.nh * 32) as u64, 256),
+        );
+        // 6. output gate
+        if p.output_gate {
+            enc_simple(
+                &cmd,
+                &self.c.sgate,
+                &[(&ao_b, 0), (&g_b, 0)],
+                &[nhd as u32],
+                &[],
+                (nhd as u64, 256),
+            );
+        }
+        // 7. O + residual + FFN + residual
+        self.encode_o_ffn(&cmd, l, &ao_b);
+        true
+    }
     /// post-norm(h) → n_b, gate/up, SiLU·mul, down, h += d — shared by
     /// the GDN layer tail and the attention suffix.
     fn encode_post_ffn(
@@ -1845,6 +2245,82 @@ impl TokenGraph {
             self.dirty.push((sb.clone(), st.len()));
         }
         true
+    }
+}
+
+
+/// Host-side inputs for a fully device-resident attention layer.
+pub struct AttnDeviceParams<'a> {
+    pub kv_id: u64,
+    pub layer: usize,
+    pub nh: usize,
+    pub nkv: usize,
+    pub hd: usize,
+    pub rd: usize,
+    pub position: usize,
+    pub eps: f32,
+    pub gemma: bool,
+    pub output_gate: bool,
+    pub q_norm: Option<&'a [f32]>,
+    pub k_norm: Option<&'a [f32]>,
+    pub inv_freq: &'a [f32],
+    /// CPU rows per head (`[stored × hd]` each) — the owner of record,
+    /// used to (re)build the mirror when it diverges.
+    pub cpu_k: Vec<&'a [f32]>,
+    pub cpu_v: Vec<&'a [f32]>,
+    pub cpu_stored: usize,
+}
+
+/// After the token's final sync: copy the row the graph appended for
+/// (kv_id, layer) out of the mirror (UMA memcpy). `k_out`/`v_out` are
+/// `[nkv × hd]`.
+pub fn kv_mirror_read_last(
+    kv_id: u64,
+    layer: usize,
+    nkv: usize,
+    hd: usize,
+    k_out: &mut [f32],
+    v_out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let reg = c.kv_mirrors.lock().unwrap();
+    let Some(m) = reg.get(&(kv_id, layer)) else { return false };
+    if m.stored == 0 || m.stored == usize::MAX || k_out.len() != nkv * hd {
+        return false;
+    }
+    let row = m.stored - 1;
+    unsafe {
+        let ks = m.k.contents() as *const f32;
+        let vs = m.v.contents() as *const f32;
+        for h in 0..nkv {
+            let off = (h * m.cap + row) * hd;
+            std::ptr::copy_nonoverlapping(ks.add(off), k_out[h * hd..].as_mut_ptr(), hd);
+            std::ptr::copy_nonoverlapping(vs.add(off), v_out[h * hd..].as_mut_ptr(), hd);
+        }
+    }
+    true
+}
+
+/// Add this token's Born-importance mass (mirror accumulator) into
+/// `imp_acc` and clear the accumulator. Call after the final sync.
+pub fn kv_mirror_take_imp(kv_id: u64, layer: usize, imp_acc: &mut [f32]) {
+    let Some(c) = ctx() else { return };
+    let reg = c.kv_mirrors.lock().unwrap();
+    let Some(m) = reg.get(&(kv_id, layer)) else { return };
+    let n = imp_acc.len().min(m.cap);
+    unsafe {
+        let src = m.imp.contents() as *mut f32;
+        for (i, dst) in imp_acc.iter_mut().take(n).enumerate() {
+            *dst += *src.add(i);
+            *src.add(i) = 0.0;
+        }
+    }
+}
+
+/// Drop every mirror belonging to a pipeline (its Drop calls this).
+pub fn kv_mirror_drop(kv_id: u64) {
+    if let Some(c) = ctx() {
+        c.kv_mirrors.lock().unwrap().retain(|(id, _), _| *id != kv_id);
     }
 }
 
