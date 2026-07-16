@@ -760,15 +760,49 @@ impl QTensor {
                 t,
                 Self::Mapped { dtype: TensorDtype::Vbit | TensorDtype::VbitRo, .. }
             ));
+        let uniform_q1 = ts
+            .iter()
+            .all(|t| matches!(t, Self::Mapped { dtype: TensorDtype::Q1, .. }));
         let Some(pool) = pool else {
             for (t, o) in ts.iter().zip(outs.iter_mut()) {
                 t.matvec(x, o, None);
             }
             return;
         };
-        if total_rows < 256 || !(uniform_q8 || uniform_f32 || uniform_q4 || uniform_vbit) {
+        if total_rows < 256
+            || !(uniform_q8 || uniform_f32 || uniform_q4 || uniform_vbit || uniform_q1)
+        {
             for (t, o) in ts.iter().zip(outs.iter_mut()) {
                 t.matvec(x, o, Some(pool));
+            }
+            return;
+        }
+
+        if uniform_q1 {
+            // One shared activation split + group sums (q1 has no col
+            // field; the same input feeds every tensor).
+            let outs_addr: [SendMut; N] = std::array::from_fn(|i| SendMut(outs[i].as_mut_ptr()));
+            if a8w8_enabled() {
+                let act = split_act(x);
+                let gsum = q1_group_sums(&act.xq, ts[0].cols() / GROUP_SIZE);
+                let (act, gsum) = (&act, &gsum);
+                let closures: [_; N] = std::array::from_fn(|i| {
+                    let (bytes, gpr, out) =
+                        (ts[i].quant_bytes(), ts[i].cols() / GROUP_SIZE, outs_addr[i]);
+                    move |s: usize, e: usize| q1_range_a8w8(bytes, gpr, act, gsum, out, s, e)
+                });
+                let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
+                    std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
+                pool.run_many(&parts);
+            } else {
+                let closures: [_; N] = std::array::from_fn(|i| {
+                    let (bytes, gpr, out) =
+                        (ts[i].quant_bytes(), ts[i].cols() / GROUP_SIZE, outs_addr[i]);
+                    move |s: usize, e: usize| q1_range_f32(bytes, gpr, x, out, s, e)
+                });
+                let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
+                    std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
+                pool.run_many(&parts);
             }
             return;
         }
@@ -1988,15 +2022,31 @@ fn q4t_matmat(
 // stream of 6-byte tiles, per-tile integer dot × scale, exact outlier
 // correction (A8W8 contract), exact scalar path under CMF_SDOT=0. ──
 
-/// One q1 row via the A8W8 int8 path — SDOT bit-unpack on ARM, scalar
-/// bit loop elsewhere (an AVX2 unpack is queued with the x86 pass).
+/// Per-32-group sums of the quantized activation — the ±1 identity's
+/// shared half: `dot = −2·sdot(mask, x) − gsum[g]`, computed ONCE per
+/// matvec and reused by every row.
+fn q1_group_sums(xq: &[i8], gpr: usize) -> Vec<i32> {
+    (0..gpr)
+        .map(|gi| {
+            xq[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE]
+                .iter()
+                .map(|&v| v as i32)
+                .sum()
+        })
+        .collect()
+}
+
+/// One q1 row via the A8W8 int8 path — mask-SDOT on ARM (no ±1
+/// expansion at all), scalar bit loop elsewhere (AVX2 queued with the
+/// x86 pass).
 #[inline]
 #[allow(unreachable_code)]
-fn dot_q1_row_i8(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
+fn dot_q1_row_i8(bytes: &[u8], r: usize, gpr: usize, xq: &[i8], gsum: &[i32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        return dot_q1_row_sdot(bytes, r, gpr, xq);
+        return dot_q1_row_sdot(bytes, r, gpr, xq, gsum);
     }
+    let _ = gsum;
     let mut acc = 0f32;
     for gi in 0..gpr {
         let tile = &bytes[(r * gpr + gi) * Q1_TILE..(r * gpr + gi + 1) * Q1_TILE];
@@ -2013,31 +2063,31 @@ fn dot_q1_row_i8(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
     acc
 }
 
-/// SDOT q1 row: each tile's 4 sign bytes unpack to 32 ±1 lanes in
-/// registers (vtst against per-lane bit masks, (mask&2)−1). Four tiles
-/// (128 weights) per iteration: their integer dots reduce through a
-/// vpaddq tree into ONE i32x4 and meet their four scales in a single
-/// fused f32 multiply-add — the naive per-tile shape spent more time in
-/// `vaddvq` + software f16 + scalar FMA serialization than in the dots.
+/// SDOT q1 row via the ±1 identity: the vtst mask (0xFF where the bit
+/// is set, i.e. −1 as i8) feeds `sdot` DIRECTLY — no expansion to ±1
+/// lanes at all — and `dot = −(2·sdot(mask, x) + Σx_group)`, with the
+/// per-group activation sums shared across every row of the matvec.
+/// Four tiles (128 weights) per iteration: integer dots reduce through
+/// a vpaddq tree into ONE i32x4 that meets its four scales in a single
+/// fused f32 multiply-add. Integer math throughout — bit-identical to
+/// the scalar ±1 reference.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon,dotprod")]
-unsafe fn dot_q1_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
+unsafe fn dot_q1_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8], gsum: &[i32]) -> f32 {
     // SAFETY: callers uphold slice-length contracts (6B tile per group,
-    // xq.len() == gpr·GROUP_SIZE).
+    // xq.len() == gpr·GROUP_SIZE, gsum.len() == gpr).
     unsafe {
         use core::arch::aarch64::*;
         use core::arch::asm;
         const MASKS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
         let m = vld1q_u8(MASKS.as_ptr());
-        let two = vdupq_n_u8(2);
-        let one = vdupq_n_s8(1);
-        // One tile's integer dot as an UNREDUCED i32x4 (two sdots).
+        // One tile's −Σ_set(x) as an UNREDUCED i32x4 (two mask-sdots).
         macro_rules! tile_dot {
             ($t:expr, $x:expr) => {{
                 let v0 = vcombine_u8(vdup_n_u8(*$t.add(2)), vdup_n_u8(*$t.add(3)));
                 let v1 = vcombine_u8(vdup_n_u8(*$t.add(4)), vdup_n_u8(*$t.add(5)));
-                let w0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vtstq_u8(v0, m), two)), one);
-                let w1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vtstq_u8(v1, m), two)), one);
+                let w0 = vreinterpretq_s8_u8(vtstq_u8(v0, m));
+                let w1 = vreinterpretq_s8_u8(vtstq_u8(v1, m));
                 let x0 = vld1q_s8($x);
                 let x1 = vld1q_s8($x.add(16));
                 let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
@@ -2053,6 +2103,7 @@ unsafe fn dot_q1_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 
         }
         let base = bytes.as_ptr().add(r * gpr * Q1_TILE);
         let xp = xq.as_ptr();
+        let gp = gsum.as_ptr();
         let mut accv = vdupq_n_f32(0.0);
         let mut gi = 0;
         while gi + 4 <= gpr {
@@ -2064,23 +2115,25 @@ unsafe fn dot_q1_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 
             let d1 = tile_dot!(t1, xp.add((gi + 1) * GROUP_SIZE));
             let d2 = tile_dot!(t2, xp.add((gi + 2) * GROUP_SIZE));
             let d3 = tile_dot!(t3, xp.add((gi + 3) * GROUP_SIZE));
-            // [Σd0, Σd1, Σd2, Σd3] without any horizontal-to-scalar hop.
-            let sums = vpaddq_s32(vpaddq_s32(d0, d1), vpaddq_s32(d2, d3));
+            // [−Σ0, −Σ1, −Σ2, −Σ3] → dots = −(2·Σset_neg + gsum)
+            let neg = vpaddq_s32(vpaddq_s32(d0, d1), vpaddq_s32(d2, d3));
+            let g = vld1q_s32(gp.add(gi));
+            let dots = vnegq_s32(vaddq_s32(vshlq_n_s32::<1>(neg), g));
             let sc = [
                 f16_to_f32(u16::from_le_bytes([*t0, *t0.add(1)])),
                 f16_to_f32(u16::from_le_bytes([*t1, *t1.add(1)])),
                 f16_to_f32(u16::from_le_bytes([*t2, *t2.add(1)])),
                 f16_to_f32(u16::from_le_bytes([*t3, *t3.add(1)])),
             ];
-            accv = vfmaq_f32(accv, vcvtq_f32_s32(sums), vld1q_f32(sc.as_ptr()));
+            accv = vfmaq_f32(accv, vcvtq_f32_s32(dots), vld1q_f32(sc.as_ptr()));
             gi += 4;
         }
         let mut acc = vaddvq_f32(accv);
         while gi < gpr {
             let t = base.add(gi * Q1_TILE);
             let s = f16_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
-            let d = tile_dot!(t, xp.add(gi * GROUP_SIZE));
-            acc += vaddvq_s32(d) as f32 * s;
+            let d = vaddvq_s32(tile_dot!(t, xp.add(gi * GROUP_SIZE)));
+            acc += (-(2 * d + *gp.add(gi))) as f32 * s;
             gi += 1;
         }
         acc
@@ -2117,6 +2170,37 @@ fn q1_row_exact(bytes: &[u8], r: usize, gpr: usize, x: &[f32]) -> f32 {
     acc
 }
 
+/// One q1 row range via A8W8 (the body of `q1_matvec`'s hot loop,
+/// extracted so multi-matrix jobs drive the same kernel).
+#[allow(clippy::too_many_arguments)]
+fn q1_range_a8w8(
+    bytes: &[u8],
+    gpr: usize,
+    act: &SplitAct,
+    gsum: &[i32],
+    out: SendMut,
+    start: usize,
+    end: usize,
+) {
+    for r in start..end {
+        let mut acc = dot_q1_row_i8(bytes, r, gpr, &act.xq, gsum) * act.sx;
+        for &(j, xv) in &act.outliers {
+            let (w, s) = q1_outlier(bytes, r, gpr, j);
+            acc += w * s * xv;
+        }
+        // SAFETY: disjoint row ranges per worker.
+        unsafe { *out.at(r) = acc };
+    }
+}
+
+/// Exact-scalar q1 row range (CMF_SDOT=0 contract).
+fn q1_range_f32(bytes: &[u8], gpr: usize, x: &[f32], out: SendMut, start: usize, end: usize) {
+    for r in start..end {
+        // SAFETY: disjoint row ranges per worker.
+        unsafe { *out.at(r) = q1_row_exact(bytes, r, gpr, x) };
+    }
+}
+
 /// Fused q1 matvec (dispatch mirrors `q4t_matvec`).
 fn q1_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
     debug_assert_eq!(out.len(), rows);
@@ -2124,26 +2208,14 @@ fn q1_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32],
     let out_addr = SendMut(out.as_mut_ptr());
     if a8w8_enabled() {
         let act = split_act(x);
-        let run = move |start: usize, end: usize| {
-            for r in start..end {
-                let mut acc = dot_q1_row_i8(bytes, r, gpr, &act.xq) * act.sx;
-                for &(j, xv) in &act.outliers {
-                    let (w, s) = q1_outlier(bytes, r, gpr, j);
-                    acc += w * s * xv;
-                }
-                // SAFETY: disjoint row ranges per worker.
-                unsafe { *out_addr.at(r) = acc };
-            }
-        };
+        let gsum = q1_group_sums(&act.xq, gpr);
+        let (act, gsum) = (&act, &gsum);
+        let run =
+            move |start: usize, end: usize| q1_range_a8w8(bytes, gpr, act, gsum, out_addr, start, end);
         dispatch_rows(pool, rows, &run);
         return;
     }
-    let run = move |start: usize, end: usize| {
-        for r in start..end {
-            // SAFETY: disjoint row ranges per worker.
-            unsafe { *out_addr.at(r) = q1_row_exact(bytes, r, gpr, x) };
-        }
-    };
+    let run = move |start: usize, end: usize| q1_range_f32(bytes, gpr, x, out_addr, start, end);
     dispatch_rows(pool, rows, &run);
 }
 
@@ -2165,10 +2237,13 @@ fn q1_matvec2(
     if a8w8_enabled() {
         let a1 = split_act(x1);
         let a2 = split_act(x2);
+        let g1 = q1_group_sums(&a1.xq, gpr);
+        let g2 = q1_group_sums(&a2.xq, gpr);
+        let (a1, a2, g1, g2) = (&a1, &a2, &g1, &g2);
         let run = move |start: usize, end: usize| {
             for r in start..end {
-                let mut v1 = dot_q1_row_i8(bytes, r, gpr, &a1.xq) * a1.sx;
-                let mut v2 = dot_q1_row_i8(bytes, r, gpr, &a2.xq) * a2.sx;
+                let mut v1 = dot_q1_row_i8(bytes, r, gpr, &a1.xq, g1) * a1.sx;
+                let mut v2 = dot_q1_row_i8(bytes, r, gpr, &a2.xq, g2) * a2.sx;
                 for &(j, xv) in &a1.outliers {
                     let (w, s) = q1_outlier(bytes, r, gpr, j);
                     v1 += w * s * xv;
@@ -2214,13 +2289,18 @@ fn q1_matmat(
     let gpr = cols / GROUP_SIZE;
     let out_addr = SendMut(out.as_mut_ptr());
     if a8w8_enabled() {
-        let acts: Vec<SplitAct> =
-            (0..b).map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols])).collect();
+        let acts: Vec<(SplitAct, Vec<i32>)> = (0..b)
+            .map(|bi| {
+                let act = split_act(&xs_all[bi * cols..(bi + 1) * cols]);
+                let gsum = q1_group_sums(&act.xq, gpr);
+                (act, gsum)
+            })
+            .collect();
         let acts = &acts;
         let run = move |start: usize, end: usize| {
             for r in start..end {
-                for (bi, act) in acts.iter().enumerate() {
-                    let mut acc = dot_q1_row_i8(bytes, r, gpr, &act.xq) * act.sx;
+                for (bi, (act, gsum)) in acts.iter().enumerate() {
+                    let mut acc = dot_q1_row_i8(bytes, r, gpr, &act.xq, gsum) * act.sx;
                     for &(j, xv) in &act.outliers {
                         let (w, s) = q1_outlier(bytes, r, gpr, j);
                         acc += w * s * xv;

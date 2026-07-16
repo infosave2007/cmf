@@ -440,17 +440,29 @@ pub fn gdn_forward(
 
     let mut qkv = vec![0.0f32; c_dim];
     let mut z = vec![0.0f32; vd];
+    let mut a = vec![0.0f32; cfg.num_v_heads];
+    let mut b = vec![0.0f32; cfg.num_v_heads];
     // D5: two heavy projections (qkv+z ≈ 24MB q8 per 35B layer, ×30 layers
     // = half the token's bytes) — in a single GPU submission; a/b are tiny
-    // f16 and stay on CPU.
-    if !gdn_projs_gpu(w, x, &mut qkv, &mut z) {
-        w.in_proj_qkv.matvec(x, &mut qkv, pool);
-        w.in_proj_z.matvec(x, &mut z, pool);
+    // and stay on CPU.
+    if gdn_projs_gpu(w, x, &mut qkv, &mut z) {
+        w.in_proj_a.matvec(x, &mut a, pool);
+        w.in_proj_b.matvec(x, &mut b, pool);
+    } else {
+        // All four projections under ONE pool dispatch (uniform-dtype
+        // multi-matrix job; falls back to per-tensor matvecs otherwise).
+        QTensor::matvec_many(
+            [&w.in_proj_qkv, &w.in_proj_z, &w.in_proj_a, &w.in_proj_b],
+            x,
+            [
+                qkv.as_mut_slice(),
+                z.as_mut_slice(),
+                a.as_mut_slice(),
+                b.as_mut_slice(),
+            ],
+            pool,
+        );
     }
-    let mut a = vec![0.0f32; cfg.num_v_heads];
-    w.in_proj_a.matvec(x, &mut a, pool);
-    let mut b = vec![0.0f32; cfg.num_v_heads];
-    w.in_proj_b.matvec(x, &mut b, pool);
 
     let mut of = vec![0.0f32; vd];
     gdn_step(&qkv, &z, &a, &b, w, cfg, state, &mut of, pool);
