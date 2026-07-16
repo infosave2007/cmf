@@ -13,11 +13,16 @@
 //! worker's mpsc channel for every matvec (~200 dispatches/token) —
 //! with decode-grade matvecs that synchronization was its own budget.
 //! Workers spin for `CMF_POOL_SPIN` iterations before parking.
-//! Default 0 (park immediately): on Apple Silicon unpark is cheap and
-//! measured A/B showed spinning workers stealing cycles from the
-//! caller's serial sections (q8 decode 299–345 tok/s at spin=6000 vs
-//! 406–412 at spin=0 on the 50M bench model). Set CMF_POOL_SPIN>0 to
-//! experiment on platforms with slower futex wakeups.
+//! Default 4000: at ~39 dispatches/token, park-immediately pays the
+//! unpark syscall on every worker for every dispatch — measured on an
+//! M4 (interleaved A/B, current epoch dispatch + parked-flag design):
+//! Qwen-0.5B q8 decode 101→115 tok/s, q4t 117→149, the 50M bench model
+//! 549→954 at spin=4000 vs spin=0. An early measurement that showed
+//! spinning LOSING (−25% on q8) predates the parked-flag skip and the
+//! multi-matrix dispatch cuts; it no longer reproduces. Over-spinning
+//! still hurts (200k: −15% vs 4k — spinners steal the caller's serial
+//! cycles), so the budget stays bounded. `CMF_POOL_SPIN=0` restores
+//! park-immediately for share-the-box serving.
 //!
 //! `CMF_THREADS` env: 0/1 = serial, N = worker count
 //! (default: available_parallelism − 1, capped at 8).
@@ -77,7 +82,7 @@ fn spin_budget_from_env() -> usize {
     std::env::var("CMF_POOL_SPIN")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0)
+        .unwrap_or(4000)
 }
 
 impl Pool {

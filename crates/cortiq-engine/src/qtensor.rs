@@ -37,7 +37,60 @@ pub enum QTensor {
         /// tensor blob (`[rows + 1]`, computed once at load — the per-
         /// matvec prefix scan over row bit-widths was O(rows) each call).
         vbit_offsets: Vec<usize>,
+        /// q8-family decode repack (load-time, optional): rows in groups
+        /// of 4, interleaved in 16-byte units — one 64-byte line per
+        /// iteration feeds all 4 sdot lanes, ONE sequential weight
+        /// stream per worker instead of four (this is where llama.cpp's
+        /// repacked Q8 kernels get their bandwidth). Empty = off
+        /// (CMF_REPACK=0, non-SDOT arch, or an ineligible shape). Trades
+        /// an anonymous copy of the quants for mmap pages that go cold.
+        repack: Vec<u8>,
     },
+}
+
+/// Load-time q8 repack gate (see `Mapped::repack`). OPT-IN
+/// (`CMF_REPACK=1`): the single-stream hypothesis LOST on Apple Silicon
+/// (M4, interleaved A/B: decode 101 vs 94 tok/s — four adjacent row
+/// streams per worker feed the prefetcher MORE memory-level parallelism
+/// than one); kept as an experiment flag for x86, where the tradeoff
+/// may land differently.
+fn repack_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CMF_REPACK").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+/// Interleave q8 rows for the decode kernel: group g holds rows
+/// 4g..4g+4 as [r0[c], r1[c], r2[c], r3[c]] per 16-byte chunk c. Only
+/// full groups are packed — tail rows keep reading the mmap layout.
+fn q8_repack(bytes: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    #[cfg(target_arch = "aarch64")]
+    let arch_ok = sdot_enabled();
+    #[cfg(not(target_arch = "aarch64"))]
+    let arch_ok = false;
+    if !arch_ok || !repack_enabled() || rows < 256 || cols % 16 != 0 {
+        return Vec::new();
+    }
+    q8_repack_layout(bytes, rows, cols)
+}
+
+/// The pure layout transform behind `q8_repack` (tested directly —
+/// the gate depends on arch and env).
+fn q8_repack_layout(bytes: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    let groups = rows / 4;
+    let mut rep = vec![0u8; groups * 4 * cols];
+    for g in 0..groups {
+        let dst = &mut rep[g * 4 * cols..(g + 1) * 4 * cols];
+        for c in 0..cols / 16 {
+            for lane in 0..4 {
+                let src = (g * 4 + lane) * cols + c * 16;
+                dst[c * 64 + lane * 16..c * 64 + lane * 16 + 16]
+                    .copy_from_slice(&bytes[src..src + 16]);
+            }
+        }
+    }
+    rep
 }
 
 /// Prefix-sum of vbit row payload offsets (absolute within the tensor
@@ -110,6 +163,7 @@ impl QTensor {
                     row_scale,
                     col_field,
                     vbit_offsets: Vec::new(),
+                    repack: q8_repack(bytes, rows, cols),
                 })
             }
             // vbit: fused kernel unpacks variable-bit rows from mmap.
@@ -122,6 +176,7 @@ impl QTensor {
                 row_scale: Vec::new(),
                 col_field: Vec::new(),
                 vbit_offsets: vbit_row_offsets(bytes, rows, cols),
+                repack: Vec::new(),
             }),
             // vbit_ro (§4.2): the offset table comes straight from the
             // file — no load-time prefix scan; kernels are shared with
@@ -143,6 +198,7 @@ impl QTensor {
                     row_scale: Vec::new(),
                     col_field: Vec::new(),
                     vbit_offsets: offsets,
+                    repack: Vec::new(),
                 })
             }
             // q4_block: fused kernel reads nibbles straight from mmap —
@@ -159,6 +215,7 @@ impl QTensor {
                 row_scale: Vec::new(),
                 col_field: Vec::new(),
                 vbit_offsets: Vec::new(),
+                repack: Vec::new(),
             }),
             TensorDtype::Q4Block if cols % GROUP_SIZE == 0 => Ok(Self::Mapped {
                 model: model.clone(),
@@ -169,6 +226,7 @@ impl QTensor {
                 row_scale: Vec::new(),
                 col_field: Vec::new(),
                 vbit_offsets: Vec::new(),
+                repack: Vec::new(),
             }),
             // No fused kernel yet → dequantize once (correct, more RAM).
             _ => {
@@ -380,6 +438,7 @@ impl QTensor {
                 row_scale,
                 col_field,
                 vbit_offsets,
+                repack,
             } => {
                 let _ = (model, idx);
                 if *dtype == TensorDtype::Q4Block {
@@ -410,7 +469,7 @@ impl QTensor {
                     match crate::gpu::probe_arm(crate::gpu::OpClass::Matvec) {
                         crate::gpu::ProbeArm::Gpu => {}
                         crate::gpu::ProbeArm::CpuTimed => {
-                            qmatvec(self.quant_bytes(), row_scale, &xs, *rows, *cols, out, pool);
+                            qmatvec(self.quant_bytes(), repack, row_scale, &xs, *rows, *cols, out, pool);
                             crate::gpu::probe_record(
                                 crate::gpu::OpClass::Matvec,
                                 false,
@@ -419,7 +478,7 @@ impl QTensor {
                             return;
                         }
                         crate::gpu::ProbeArm::Cpu => {
-                            qmatvec(self.quant_bytes(), row_scale, &xs, *rows, *cols, out, pool);
+                            qmatvec(self.quant_bytes(), repack, row_scale, &xs, *rows, *cols, out, pool);
                             return;
                         }
                     }
@@ -445,8 +504,16 @@ impl QTensor {
                             )
                         });
                         if cpu_rows > 0 {
+                            // Repack prefix covers the full groups of the
+                            // CPU half (the split starts at row 0).
+                            let rep_cpu = if repack.is_empty() {
+                                &[][..]
+                            } else {
+                                &repack[..(cpu_rows / 4) * 4 * *cols]
+                            };
                             qmatvec(
                                 &bytes[..cpu_rows * *cols],
+                                rep_cpu,
                                 &row_scale[..cpu_rows],
                                 &xs,
                                 cpu_rows,
@@ -461,9 +528,11 @@ impl QTensor {
                         crate::gpu::probe_record(crate::gpu::OpClass::Matvec, true, t0.elapsed());
                         return;
                     }
-                    // GPU failed — CPU finishes its half.
+                    // GPU failed — CPU finishes its half (rows rebased —
+                    // group offsets don't line up, mmap layout only).
                     qmatvec(
                         &bytes[cpu_rows * *cols..(*rows) * *cols],
+                        &[],
                         &row_scale[cpu_rows..],
                         &xs,
                         *rows - cpu_rows,
@@ -473,7 +542,7 @@ impl QTensor {
                     );
                     return;
                 }
-                qmatvec(self.quant_bytes(), row_scale, &xs, *rows, *cols, out, pool);
+                qmatvec(self.quant_bytes(), repack, row_scale, &xs, *rows, *cols, out, pool);
             }
         }
     }
@@ -751,16 +820,19 @@ impl QTensor {
         // differ per tensor) + the shared range kernels.
         struct Ctx<'a> {
             bytes: &'a [u8],
+            #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+            rep: &'a [u8],
             row_scale: &'a [f32],
             cols: usize,
             xs: std::borrow::Cow<'a, [f32]>,
         }
         let ctxs: [Ctx<'_>; N] = std::array::from_fn(|i| {
-            let Self::Mapped { dtype, cols, row_scale, col_field, .. } = ts[i] else {
+            let Self::Mapped { dtype, cols, row_scale, col_field, repack, .. } = ts[i] else {
                 unreachable!()
             };
             Ctx {
                 bytes: ts[i].quant_bytes(),
+                rep: repack,
                 row_scale,
                 cols: *cols,
                 xs: prescale(x, col_field, *dtype),
@@ -773,7 +845,7 @@ impl QTensor {
             let closures: [_; N] = std::array::from_fn(|i| {
                 let (c, act, out) = (&ctxs[i], &acts[i], outs_addr[i]);
                 move |start: usize, end: usize| {
-                    q8_range_sdot(c.bytes, c.row_scale, act, c.cols, out, start, end)
+                    q8_range_sdot(c.bytes, c.rep, c.row_scale, act, c.cols, out, start, end)
                 }
             });
             let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
@@ -3061,12 +3133,57 @@ unsafe fn dot_i8_sdot_4rows(w0: &[u8], w1: &[u8], w2: &[u8], w3: &[u8], xq: &[i8
 }
 }
 
+/// 4 interleaved rows in one pass: the repacked group is [r0[c], r1[c],
+/// r2[c], r3[c]] per 16-byte chunk, so each iteration reads ONE 64-byte
+/// line plus the shared activation chunk — a single sequential weight
+/// stream per worker. Per-row accumulation is the same one-accumulator
+/// scheme as `dot_i8_sdot_4rows`; integer sums are exact, so outputs
+/// are bit-identical to the mmap-layout kernel.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn dot_i8_sdot_4rows_il(g: &[u8], xq: &[i8]) -> [i32; 4] {
+    // SAFETY: callers uphold slice-length contracts (g.len() == 4·n,
+    // n % 16 == 0 — guaranteed by the repack gate).
+    unsafe {
+        use core::arch::aarch64::*;
+        use core::arch::asm;
+        let n = xq.len();
+        let px = xq.as_ptr();
+        let pg = g.as_ptr() as *const i8;
+        let (mut a0, mut a1, mut a2, mut a3) =
+            (vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0));
+        let mut i = 0;
+        while i + 16 <= n {
+            let x = vld1q_s8(px.add(i));
+            let base = pg.add(4 * i);
+            let v0 = vld1q_s8(base);
+            let v1 = vld1q_s8(base.add(16));
+            let v2 = vld1q_s8(base.add(32));
+            let v3 = vld1q_s8(base.add(48));
+            asm!(
+                "sdot {a0:v}.4s, {v0:v}.16b, {x:v}.16b",
+                "sdot {a1:v}.4s, {v1:v}.16b, {x:v}.16b",
+                "sdot {a2:v}.4s, {v2:v}.16b, {x:v}.16b",
+                "sdot {a3:v}.4s, {v3:v}.16b, {x:v}.16b",
+                a0 = inout(vreg) a0, a1 = inout(vreg) a1, a2 = inout(vreg) a2, a3 = inout(vreg) a3,
+                v0 = in(vreg) v0, v1 = in(vreg) v1, v2 = in(vreg) v2, v3 = in(vreg) v3, x = in(vreg) x,
+                options(pure, nomem, nostack),
+            );
+            i += 16;
+        }
+        [vaddvq_s32(a0), vaddvq_s32(a1), vaddvq_s32(a2), vaddvq_s32(a3)]
+    }
+}
+
 /// One q8 row range via SDOT (4-row blocks + tail) — the body of
 /// `qmatvec`'s hot loop, extracted so multi-matrix jobs can drive the
-/// SAME kernel for several tensors under one pool dispatch.
+/// SAME kernel for several tensors under one pool dispatch. `rep` — the
+/// load-time interleaved repack (empty = mmap layout only); rows outside
+/// full 4-row groups always come from the mmap layout.
 #[cfg(target_arch = "aarch64")]
 fn q8_range_sdot(
     q: &[u8],
+    rep: &[u8],
     row_scale: &[f32],
     act: &SplitAct,
     cols: usize,
@@ -3075,15 +3192,28 @@ fn q8_range_sdot(
     end: usize,
 ) {
     let mut o = start;
+    // Leading rows to the group boundary (repack path only): the pool
+    // splits row ranges arbitrarily, groups are absolute.
+    if !rep.is_empty() {
+        while o < end && o % 4 != 0 {
+            let v = row_dot_sdot(&q[o * cols..(o + 1) * cols], act) * row_scale[o];
+            unsafe { *out_addr.at(o) = v };
+            o += 1;
+        }
+    }
     while o + 4 <= end {
-        let r = unsafe {
-            dot_i8_sdot_4rows(
-                &q[o * cols..(o + 1) * cols],
-                &q[(o + 1) * cols..(o + 2) * cols],
-                &q[(o + 2) * cols..(o + 3) * cols],
-                &q[(o + 3) * cols..(o + 4) * cols],
-                &act.xq,
-            )
+        let r = if rep.is_empty() {
+            unsafe {
+                dot_i8_sdot_4rows(
+                    &q[o * cols..(o + 1) * cols],
+                    &q[(o + 1) * cols..(o + 2) * cols],
+                    &q[(o + 2) * cols..(o + 3) * cols],
+                    &q[(o + 3) * cols..(o + 4) * cols],
+                    &act.xq,
+                )
+            }
+        } else {
+            unsafe { dot_i8_sdot_4rows_il(&rep[o * cols..(o + 4) * cols], &act.xq) }
         };
         for k in 0..4 {
             let mut acc = r[k] as f32 * act.sx;
@@ -3473,6 +3603,7 @@ unsafe fn dot_i8_f32_neon(w: &[u8], x: &[f32]) -> f32 {
 #[allow(clippy::too_many_arguments)]
 fn qmatvec(
     q: &[u8],
+    rep: &[u8],
     row_scale: &[f32],
     xs: &[f32],
     rows: usize,
@@ -3481,13 +3612,16 @@ fn qmatvec(
     pool: Option<&Pool>,
 ) {
     debug_assert_eq!(out.len(), rows);
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = rep;
 
     #[cfg(target_arch = "aarch64")]
     if sdot_enabled() {
         let act = split_act(xs);
         let out_addr = SendMut(out.as_mut_ptr());
-        let run_range =
-            |start: usize, end: usize| q8_range_sdot(q, row_scale, &act, cols, out_addr, start, end);
+        let run_range = |start: usize, end: usize| {
+            q8_range_sdot(q, rep, row_scale, &act, cols, out_addr, start, end)
+        };
         match pool {
             Some(pool) if rows >= 256 => pool.run_rows(rows, &run_range),
             _ => run_range(0, rows),
@@ -3656,7 +3790,7 @@ mod tests {
             })
             .collect();
         let mut a = vec![0.0f32; rows];
-        qmatvec(&w, &scales, &x, rows, cols, &mut a, None);
+        qmatvec(&w, &[], &scales, &x, rows, cols, &mut a, None);
         for o in 0..rows {
             let mut acc = 0.0f32;
             for j in 0..cols {
@@ -3672,6 +3806,48 @@ mod tests {
     }
 
     #[test]
+    fn repack_is_bit_identical() {
+        // The interleaved-repack kernel must produce EXACTLY the same
+        // bits as the mmap-layout kernel: integer accumulation is order-
+        // exact, the f32 epilogue is identical. Odd rows exercise the
+        // tail; direct range calls exercise unaligned pool splits.
+        let (rows, cols) = (267, 96); // 66 groups + 3 tail rows, cols % 16 == 0
+        let w: Vec<u8> = (0..rows * cols)
+            .map(|i| (((i * 89) % 253) as i32 - 126) as i8 as u8)
+            .collect();
+        let scales: Vec<f32> = (0..rows).map(|o| 0.003 + o as f32 * 0.0007).collect();
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.37).sin() * 2.0).collect();
+        let rep = q8_repack_layout(&w, rows, cols);
+        // Group interleave round-trips.
+        for g in 0..rows / 4 {
+            for c in 0..cols / 16 {
+                for lane in 0..4 {
+                    assert_eq!(
+                        &rep[g * 4 * cols + c * 64 + lane * 16..g * 4 * cols + c * 64 + lane * 16 + 16],
+                        &w[(g * 4 + lane) * cols + c * 16..(g * 4 + lane) * cols + c * 16 + 16],
+                    );
+                }
+            }
+        }
+        let mut a = vec![0.0f32; rows];
+        qmatvec(&w, &[], &scales, &x, rows, cols, &mut a, None);
+        let mut b = vec![0.0f32; rows];
+        qmatvec(&w, &rep, &scales, &x, rows, cols, &mut b, None);
+        assert_eq!(a, b, "full-range repack output diverged");
+
+        #[cfg(target_arch = "aarch64")]
+        if sdot_enabled() {
+            // Unaligned range split (pool workers get arbitrary bounds).
+            let act = split_act(&x);
+            let mut c1 = vec![0.0f32; rows];
+            let mut c2 = vec![0.0f32; rows];
+            q8_range_sdot(&w, &[], &scales, &act, cols, SendMut(c1.as_mut_ptr()), 3, rows - 2);
+            q8_range_sdot(&w, &rep, &scales, &act, cols, SendMut(c2.as_mut_ptr()), 3, rows - 2);
+            assert_eq!(c1, c2, "unaligned-range repack output diverged");
+        }
+    }
+
+    #[test]
     fn sdot_a8w8_noise_is_bounded() {
         // Off-grid activations: A8 quantization noise must stay small in
         // relative L2 over the whole output (realistic accuracy contract;
@@ -3683,7 +3859,7 @@ mod tests {
         let scales = vec![0.01f32; rows];
         let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.21).sin()).collect();
         let mut a = vec![0.0f32; rows];
-        qmatvec(&w, &scales, &x, rows, cols, &mut a, None);
+        qmatvec(&w, &[], &scales, &x, rows, cols, &mut a, None);
         let (mut num, mut den) = (0f64, 0f64);
         for o in 0..rows {
             let mut acc = 0.0f32;
