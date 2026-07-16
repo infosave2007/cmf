@@ -894,15 +894,25 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         let (_, gr, gc, grs) = &j.gate;
         let (_, ur, uc, urs) = &j.up;
         let (_, dr, dc, drs) = &j.down;
-        let grs_b = storage_bytes(c, bytemuck::cast_slice(grs));
-        let urs_b = storage_bytes(c, bytemuck::cast_slice(urs));
-        let drs_b = storage_bytes(c, bytemuck::cast_slice(drs));
+        // Per-tensor scale/col buffers are stable across tokens — cache
+        // them like the matvec row-scales instead of re-uploading.
+        let mut rs_map = c.rs_bufs.lock().unwrap();
+        let mut cached = |tag: usize, idx: usize, data: &[f32]| -> wgpu::Buffer {
+            rs_map
+                .entry((idx.wrapping_mul(1_000_003) ^ tag, usize::MAX - 1))
+                .or_insert_with(|| storage_bytes(c, bytemuck::cast_slice(data)))
+                .clone()
+        };
+        let grs_b = cached(1, j.gate.0, grs);
+        let urs_b = cached(2, j.up.0, urs);
+        let drs_b = cached(3, j.down.0, drs);
         let has_col = !j.down_col.is_empty();
         let col_b = if has_col {
-            storage_bytes(c, bytemuck::cast_slice(j.down_col))
+            cached(4, j.down.0, j.down_col)
         } else {
-            storage_bytes(c, bytemuck::cast_slice(&[0f32])) // dummy, gated by f=0
+            cached(5, usize::MAX, &[0f32]) // dummy, gated by f=0
         };
+        drop(rs_map);
         let xsg = storage_bytes(c, bytemuck::cast_slice(&j.xs_gate));
         let xsu = storage_bytes(c, bytemuck::cast_slice(&j.xs_up));
 
