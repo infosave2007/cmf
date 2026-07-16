@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-16
+
+The performance release: ten waves of engine work guided by the internal
+performance roadmap, verified on three machines (Apple Silicon, Intel AVX2,
+Xeon Granite Rapids). First like-for-like run against `llama.cpp` (b9310,
+Qwen2.5-0.5B, CPU-only, 8 threads, exact attention both): **pp512 +70%,
+tg128 +60%, file −26%**, with quantization quality matched (CMF q8 vs own
+f16: +0.38% PPL over 12×512 windows). One model on one machine — the full
+matrix is still open; reproduce with `cortiq bench --json`.
+
+### Added
+
+- **x86 SIMD kernels** (the engine previously had explicit SIMD only on
+  AArch64): AVX2/FMA i8×f32 and f32 dots, `maddubs` A8W8 int8 path for q8,
+  register-level q4 nibble kernels, SIMD unpack for the dominant vbit width
+  (B=4), and an AVX-512 VNNI q8 path (bias-trick `vpdpbusd`, four
+  accumulators). Runtime-detected; `CMF_AVX2=0` / `CMF_AVX512=0` opt out,
+  `CMF_SDOT=0` keeps exact kernels on every architecture.
+- **Multi-matrix jobs**: Q/K/V and gate+up projections run under a single
+  worker-pool dispatch (`Pool::run_many`, `QTensor::matvec_many` /
+  `matvec2_many`) on all codecs, in both the single and the MTP-pair decode
+  paths.
+- **Fused multi-token q4/vbit kernels**: true `matvec2` (weights unpacked
+  once per activation pair) and batched `matmat` (weight row decoded once
+  per prefill microbatch) — bit-identical to the per-position kernels.
+- **Chunk-GEMM prefill attention**: Q/K/V and O projections run as
+  chunk-level GEMMs inside `prefill_batch`; generation now uses the same
+  batched prefill as `bench`/`ppl` (the pair path remains for
+  dynamic-routing prompts).
+- **Grouped exact-GQA attention**: all Q-heads of a KV group stream the
+  shared K/V storage once per position (bit-identical per head, covered by
+  parity tests in both f32 and q8 KV modes).
+- **`cortiq bench --json`** with steady-state counters: allocations/token
+  and pool dispatches/token are sampled per token over the same inter-token
+  window as the steady tok/s.
+
+### Changed
+
+- **Worker pool rewritten**: shared job slot + atomic epoch + park/unpark
+  instead of an `Arc<Latch>` and an mpsc message per worker per matvec; the
+  caller joins the work as an extra participant. Dispatch no longer
+  heap-allocates (`CMF_POOL_SPIN` tunes the spin budget, default 0).
+- **Steady-state allocations cut from hundreds to ~26 per token**: reusable
+  norm/projection/FFN buffers, a crate-wide buffer freelist (attention and
+  FFN outputs, vocab-sized lm_head logits), allocation-free activation
+  splitting, vbit row offsets precomputed at load, `select_nth_unstable`
+  sampler top-k with candidates-only top-p.
+- Release profile now builds with thin LTO and a single codegen unit.
+
+### Fixed
+
+- Metal no-copy buffers on Macs without unified memory (Intel-era discrete
+  GPUs) silently returned stale data — such devices are now refused at
+  init with a CPU fallback.
+- Batched q4 `matmat` on non-SDOT platforms rounded differently from the
+  per-position kernel (flat vs pairwise accumulation) — bit-parity restored.
+- `QTensor::from_model` no longer scans the tensor directory linearly
+  (O(N²) pipeline build on MoE/skills files).
+
 ## [0.2.2] — 2026-07-15
 
 ### Added

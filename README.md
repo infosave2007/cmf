@@ -134,12 +134,28 @@ If that cost is too high for your use case, `cortiq fcd` recovers part of it wit
 a bounded native training pass — see [O(1) in depth](#o1-in-depth). We haven't
 published a clean before/after figure for it yet.
 
-To be clear about the axis: CMF is not trying to beat `llama.cpp` on tokens per
-second, and today it doesn't. What it flattens is how cost grows with context —
-the memory column is one half of that, the decode column the other: exact
-attention decays from 15.7 to 8.2 tok/s as the context grows, while `--o1` holds
-at ~16.5. If single-stream throughput on a short prompt is your only constraint,
-use `llama.cpp`. Take this for the long-context tail.
+To be clear about the axis: `llama.cpp` is the yardstick we measure against —
+and as of 0.3.0 the CPU engine holds its own on the short single-stream case
+too. One full like-for-like run (2026-07-16: Qwen2.5-0.5B-Instruct, Apple
+Silicon, CPU-only, 8 threads for both, exact attention for both, `llama.cpp`
+b9310 vs CMF 0.3.0, 3+ series each from fresh processes):
+
+| CPU, 8 threads | `llama.cpp` (q8_0) | CMF (q8) | Δ |
+|---|---|---|---|
+| Prompt processing (pp512) | 220.6 ± 2.5 tok/s | 374–390 tok/s | **+70%** |
+| Generation (tg128) | 60.4 ± 1.1 tok/s | 95–101 tok/s | **+60%** |
+| Quant quality (PPL vs own f16, 12×512 windows) | near-lossless | +0.38% | matched |
+| File size | 644 MB | 479 MB | **−26%** |
+
+One model on one machine is a data point, not a leaderboard: the quantizations
+are the same class but not byte-identical (8.06 vs 8.5 bits/weight), and the
+full cross-engine matrix (models × sizes × CPUs, bootstrap CIs) is still open.
+The methodology travels with the tree — `cortiq bench --json` reports tok/s
+alongside allocations/token and scheduler dispatches/token — so reproduce it
+on your hardware rather than take our word. Beyond the short case, what CMF
+flattens is how cost grows with context: exact attention decays from 15.7 to
+8.2 tok/s as the context grows, while `--o1` holds at ~16.5. Take the table
+for the short case, `--o1` for the long-context tail.
 
 ### One file, nothing on the side
 
