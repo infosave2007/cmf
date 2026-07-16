@@ -668,6 +668,115 @@ pub fn qwen_attention(
     out
 }
 
+/// Batched-chunk exact attention (roadmap §3 P0 «prefill»): Q/K/V and O
+/// projections run as chunk-GEMMs — each weight row streams from memory
+/// ONCE per chunk instead of once per position — while the attention
+/// core stays per-position (causal append order). Per-position math is
+/// identical to `qwen_attention` (matmat ≡ per-position matvec by the
+/// existing parity tests), so the results match the sequential prefill.
+/// `cfg.position` is the chunk's FIRST absolute position.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen_attention_batch(
+    normed_all: &[f32],
+    b: usize,
+    wq: &QTensor,
+    wk: &QTensor,
+    wv: &QTensor,
+    wo: &QTensor,
+    cache: &mut LayerKvCache,
+    cfg: &QwenAttnCfg,
+) -> Vec<f32> {
+    let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
+    let heads_per_kv = nh / nkv;
+    let qrows = wq.rows();
+    debug_assert_eq!(normed_all.len(), b * cfg.hidden_size);
+
+    // ── chunk-GEMM projections ──
+    let mut q_all = take_buf(b * qrows);
+    let mut k_all = take_buf(b * nkv * hd);
+    let mut v_all = take_buf(b * nkv * hd);
+    wq.matmat(normed_all, b, &mut q_all, cfg.pool);
+    wk.matmat(normed_all, b, &mut k_all, cfg.pool);
+    wv.matmat(normed_all, b, &mut v_all, cfg.pool);
+
+    // ── per-position: bias, gate split, qk-norm, partial RoPE, causal
+    //    attention over the growing cache ──
+    let mut ao_all = take_buf(b * nh * hd);
+    let rd = cfg.rotary_dim.min(hd);
+    for bi in 0..b {
+        let pos = cfg.position + bi;
+        let q_raw = &mut q_all[bi * qrows..(bi + 1) * qrows];
+        let k = &mut k_all[bi * nkv * hd..(bi + 1) * nkv * hd];
+        let v = &mut v_all[bi * nkv * hd..(bi + 1) * nkv * hd];
+        if let Some((bq, bk, bv)) = cfg.bias {
+            for (x, bb) in q_raw.iter_mut().zip(bq) {
+                *x += bb;
+            }
+            for (x, bb) in k.iter_mut().zip(bk) {
+                *x += bb;
+            }
+            for (x, bb) in v.iter_mut().zip(bv) {
+                *x += bb;
+            }
+        }
+        // Gate split: per-head [q(hd); gate(hd)] (see project_position).
+        let (mut q, mut gate) = if cfg.output_gate {
+            let mut qn = take_buf(nh * hd);
+            let mut g = take_buf(nh * hd);
+            for hh in 0..nh {
+                let src = hh * hd * 2;
+                let dst = hh * hd;
+                qn[dst..dst + hd].copy_from_slice(&q_raw[src..src + hd]);
+                g[dst..dst + hd].copy_from_slice(&q_raw[src + hd..src + 2 * hd]);
+            }
+            (qn, g)
+        } else {
+            (take_buf(nh * hd), Vec::new())
+        };
+        if !cfg.output_gate {
+            q.copy_from_slice(&q_raw[..nh * hd]);
+        }
+        if let Some(qw) = cfg.q_norm {
+            for hh in 0..nh {
+                rmsnorm_head(&mut q[hh * hd..hh * hd + hd], qw, cfg.rms_eps, cfg.norm_style);
+            }
+        }
+        if let Some(kw) = cfg.k_norm {
+            for g in 0..nkv {
+                rmsnorm_head(&mut k[g * hd..g * hd + hd], kw, cfg.rms_eps, cfg.norm_style);
+            }
+        }
+        for hh in 0..nh {
+            rope_rotate(&mut q[hh * hd..hh * hd + rd], pos, cfg.inv_freq);
+        }
+        for g in 0..nkv {
+            rope_rotate(&mut k[g * hd..g * hd + rd], pos, cfg.inv_freq);
+        }
+
+        cache.o1_push_q(&q);
+        cache.append(k, v, &[]);
+        let (mut ao, mut imp) = attend_all_heads(&q, cache, nh, heads_per_kv, hd);
+        cache.accumulate_imp(&imp);
+        if cfg.output_gate {
+            apply_gate(&mut ao, &gate);
+        }
+        ao_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&ao);
+        recycle_buf(&mut ao);
+        recycle_buf(&mut imp);
+        recycle_buf(&mut q);
+        recycle_buf(&mut gate);
+    }
+
+    // ── chunk-GEMM output projection ──
+    let mut out = vec![0.0f32; b * cfg.hidden_size];
+    wo.matmat(&ao_all, b, &mut out, cfg.pool);
+    recycle_buf(&mut q_all);
+    recycle_buf(&mut k_all);
+    recycle_buf(&mut v_all);
+    recycle_buf(&mut ao_all);
+    out
+}
+
 /// Dense GQA attention for one DECODE position on a SEALED O(1) layer:
 /// projection / qk-norm / partial RoPE / output gate are identical to
 /// `qwen_attention`, but the KV cache is replaced by per-KV-group

@@ -1316,50 +1316,60 @@ impl Pipeline {
                         *dst += a;
                     }
                 }
-                _ => {
+                AttnKind::Full {
+                    wq, wk, wv, wo, q_norm, k_norm, output_gate, bias,
+                } => {
+                    // Chunk-GEMM QKV/O; per-position causal attention
+                    // inside (roadmap §3 P0 — full-attention prefill no
+                    // longer re-reads the projection weights b times).
+                    let mut normed = vec![0.0f32; b * hs];
+                    for bi in 0..b {
+                        inference::rms_norm_into(
+                            &h[bi * hs..(bi + 1) * hs],
+                            &lw.input_norm,
+                            eps,
+                            norm_style,
+                            &mut normed[bi * hs..(bi + 1) * hs],
+                        );
+                    }
+                    let cfg = QwenAttnCfg {
+                        num_heads: nh,
+                        num_kv_heads: nkv,
+                        head_dim: hd,
+                        hidden_size: hs,
+                        position: start_pos,
+                        inv_freq: &inv_freq,
+                        rotary_dim: rd,
+                        q_norm: q_norm.as_deref(),
+                        k_norm: k_norm.as_deref(),
+                        output_gate: *output_gate,
+                        bias: bias.as_ref().map(|(a, b, c)| {
+                            (a.as_slice(), b.as_slice(), c.as_slice())
+                        }),
+                        rms_eps: eps,
+                        norm_style,
+                        pool: pool.as_deref(),
+                    };
+                    let attn = attention::qwen_attention_batch(
+                        &normed, b, wq, wk, wv, wo,
+                        &mut self.kv_cache.layers[li], &cfg);
+                    for (dst, &a) in h.iter_mut().zip(&attn) {
+                        *dst += a;
+                    }
+                }
+                AttnKind::Linear(w) => {
                     for bi in 0..b {
                         let normed = inference::rms_norm(
                             &h[bi * hs..(bi + 1) * hs], &lw.input_norm, eps, norm_style);
-                        let position = start_pos + bi;
-                        let attn = match &lw.attn {
-                            AttnKind::Linear(w) => {
-                                let cfg = self.vmf_cfg.expect("linear layer without vmf_cfg");
-                                vmf_phase_forward(
-                                    &normed, w, &cfg,
-                                    &mut self.kv_cache.layers[li].linear_state,
-                                    pool.as_deref(),
-                                )
-                            }
-                            AttnKind::LinearGdn(_) => unreachable!(),
-                            AttnKind::Full {
-                                wq, wk, wv, wo, q_norm, k_norm, output_gate, bias,
-                            } => {
-                                let cfg = QwenAttnCfg {
-                                    num_heads: nh,
-                                    num_kv_heads: nkv,
-                                    head_dim: hd,
-                                    hidden_size: hs,
-                                    position,
-                                    inv_freq: &inv_freq,
-                                    rotary_dim: rd,
-                                    q_norm: q_norm.as_deref(),
-                                    k_norm: k_norm.as_deref(),
-                                    output_gate: *output_gate,
-                                    bias: bias.as_ref().map(|(a, b, c)| {
-                                        (a.as_slice(), b.as_slice(), c.as_slice())
-                                    }),
-                                    rms_eps: eps,
-                                    norm_style,
-                                    pool: pool.as_deref(),
-                                };
-                                attention::qwen_attention(
-                                    &normed, wq, wk, wv, wo,
-                                    &mut self.kv_cache.layers[li], &cfg)
-                            }
-                        };
-                        for (i, &a) in attn.iter().enumerate() {
-                            h[bi * hs + i] += a;
-                        }
+                        vmf_phase_forward(
+                            &normed, w,
+                            &self.vmf_cfg.expect("linear layer without vmf_cfg"),
+                            &mut self.kv_cache.layers[li].linear_state,
+                            pool.as_deref(),
+                        )
+                        .iter()
+                        .enumerate()
+                        .for_each(|(i, &a)| h[bi * hs + i] += a);
                     }
                 }
             }
