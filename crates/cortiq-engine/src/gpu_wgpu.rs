@@ -174,6 +174,16 @@ struct Ctx {
     layout_silu: wgpu::BindGroupLayout,
     layout_axpy: wgpu::BindGroupLayout,
     layout_zero: wgpu::BindGroupLayout,
+    /// Discrete card (PCIe VRAM) vs UMA — thresholds and budgets differ.
+    discrete: bool,
+    /// Weight-residency budget in bytes (CMF_GPU_VRAM_MB override). On a
+    /// 24 GB card holding a 35 GB model, the first-touched tensors (=
+    /// the first layers, decode touches them in order) stay resident and
+    /// the rest honestly fall back to CPU — ngl-style offload without an
+    /// explicit layer list, and no OOM.
+    vram_budget: u64,
+    /// Bytes currently resident in `weight_bufs`.
+    resident: std::sync::atomic::AtomicU64,
     /// Resident quant weights in VRAM — the WHOLE tensor is loaded once
     /// (key (base_ptr, idx)); ranges/batches address it by offset.
     weight_bufs: Mutex<HashMap<(usize, usize), wgpu::Buffer>>,
@@ -237,7 +247,25 @@ fn init() -> Result<Ctx, String> {
     .map_err(|e| format!("request_device: {e}"))?;
 
     let info = adapter.get_info();
-    tracing::info!("wgpu GPU path: on ({} / {:?})", info.name, info.backend);
+    let discrete = info.device_type == wgpu::DeviceType::DiscreteGpu;
+    let vram_budget = std::env::var("CMF_GPU_VRAM_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(if discrete {
+            // Conservative default for unknown cards; 4090-class users
+            // should set CMF_GPU_VRAM_MB=20000.
+            8 * 1024 * 1024 * 1024
+        } else {
+            u64::MAX // UMA: the OS pages shared memory
+        });
+    tracing::info!(
+        "wgpu GPU path: on ({} / {:?}, {}, weight budget {})",
+        info.name,
+        info.backend,
+        if discrete { "discrete" } else { "uma" },
+        if vram_budget == u64::MAX { "unlimited".to_string() } else { format!("{} MB", vram_budget / 1024 / 1024) },
+    );
 
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("q8"),
@@ -278,26 +306,42 @@ fn init() -> Result<Ctx, String> {
         layout_silu,
         layout_axpy,
         layout_zero,
+        discrete,
+        vram_budget,
+        resident: std::sync::atomic::AtomicU64::new(0),
         weight_bufs: Mutex::new(HashMap::new()),
         rs_bufs: Mutex::new(HashMap::new()),
     })
 }
 
+/// Is the active adapter a discrete card? (facade: threshold policy)
+pub fn is_discrete() -> bool {
+    ctx().map(|c| c.discrete).unwrap_or(false)
+}
+
 /// Resident quant weights of the WHOLE tensor in VRAM (loaded once per
-/// (file, idx)). Returns a clone of the buffer (Arc inside wgpu).
-fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> wgpu::Buffer {
-    c.weight_bufs
-        .lock()
-        .unwrap()
-        .entry(key)
-        .or_insert_with(|| {
-            c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("q8-weights"),
-                contents: full_quant,
-                usage: wgpu::BufferUsages::STORAGE,
-            })
-        })
-        .clone()
+/// (file, idx)), guarded by the VRAM budget: once the budget is spent,
+/// new tensors return None and their ops run on the CPU. Decode touches
+/// layers in order, so the resident set is deterministically the first
+/// layers — ngl-style offload without configuration.
+fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu::Buffer> {
+    use std::sync::atomic::Ordering;
+    let mut map = c.weight_bufs.lock().unwrap();
+    if let Some(b) = map.get(&key) {
+        return Some(b.clone());
+    }
+    let len = full_quant.len() as u64;
+    if c.resident.load(Ordering::Relaxed) + len > c.vram_budget {
+        return None; // budget spent — this tensor stays on the CPU
+    }
+    let buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("q8-weights"),
+        contents: full_quant,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    c.resident.fetch_add(len, Ordering::Relaxed);
+    map.insert(key, buf.clone());
+    Some(buf)
 }
 
 /// GPU enabled and initialized?
@@ -357,7 +401,10 @@ fn dispatch_matvec(
         return false;
     }
     let q_buf = match weight_key {
-        Some(k) => weight_buffer(c, k, full_quant),
+        Some(k) => match weight_buffer(c, k, full_quant) {
+            Some(b) => b,
+            None => return false, // over VRAM budget — honest CPU path
+        },
         None => c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("q8-weights"),
             contents: full_quant,
@@ -495,7 +542,10 @@ fn dispatch_matmat(
         return false;
     }
     let q_buf = match weight_key {
-        Some(k) => weight_buffer(c, k, full_quant),
+        Some(k) => match weight_buffer(c, k, full_quant) {
+            Some(b) => b,
+            None => return false, // over VRAM budget — honest CPU path
+        },
         None => c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mm-weights"),
             contents: full_quant,
@@ -629,7 +679,7 @@ fn tensor_weight(c: &Ctx, model: &Arc<CmfModel>, idx: usize, rows: usize, cols: 
     if abs + rows * cols > bytes.len() {
         return None;
     }
-    Some(weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + rows * cols]))
+    weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + rows * cols])
 }
 
 /// Encodes q8-matvec (row0=0) into the given encoder, writes to `y`. The bind

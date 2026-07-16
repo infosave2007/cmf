@@ -55,7 +55,12 @@ jobs:
           rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --release -p cortiq-cli --target ${{ matrix.target }}
+        # --features gpu: the wgpu (Vulkan/DX12) path ships in every
+        # artifact — field case: a 35B CMF on an RTX 4090 ran CPU-only at
+        # 1.9 tok/s because Linux/Windows builds carried no GPU backend
+        # at all. macOS keeps native Metal as the default; wgpu there
+        # remains opt-in via CMF_GPU=wgpu.
+        run: cargo build --release -p cortiq-cli --features gpu --target ${{ matrix.target }}
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |

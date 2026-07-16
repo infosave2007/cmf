@@ -67,14 +67,32 @@ pub fn enabled_here() -> bool {
 /// class). Below it, the dispatch/readback cost does not pay off on unified memory.
 pub const GPU_MIN_ROWS: usize = 65_536;
 
-/// Effective threshold: `CMF_GPU_MIN_ROWS` overrides the default — on a
-/// discrete card it is worth lowering it (VRAM bandwidth pays off even for FFN),
-/// on unified memory — raising it. A «squeeze out the maximum» tuning on the server.
+/// Effective threshold: `CMF_GPU_MIN_ROWS` overrides. Defaults differ
+/// by device class: on a DISCRETE card VRAM bandwidth pays off even for
+/// FFN/QKV-class matrices (4096), on unified memory only lm_head-class
+/// is worth the dispatch/readback (65536). Field case behind this: a
+/// 35B model on an RTX 4090 saw ~0 offload because every layer matrix
+/// sat below the old universal 65536.
 pub fn min_rows() -> usize {
-    std::env::var("CMF_GPU_MIN_ROWS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(GPU_MIN_ROWS)
+    if let Some(v) = std::env::var("CMF_GPU_MIN_ROWS").ok().and_then(|v| v.parse().ok()) {
+        return v;
+    }
+    if discrete() {
+        4096
+    } else {
+        GPU_MIN_ROWS
+    }
+}
+
+/// Is the active backend a discrete card (PCIe VRAM)?
+pub fn discrete() -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::is_discrete(),
+        #[cfg(target_os = "macos")]
+        Backend::Metal => false, // UMA by the init() guard
+        Backend::None => false,
+    }
 }
 
 /// A single MoE-FFN job (an expert with its own weight), executed in one
