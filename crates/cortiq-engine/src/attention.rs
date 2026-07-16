@@ -542,7 +542,19 @@ fn project_position(
     cfg: &QwenAttnCfg,
     position: usize,
 ) -> Projected {
-    let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
+    let (q_raw, k, v) = project_matvecs(hidden, wq, wk, wv, cfg);
+    finish_projection(q_raw, k, v, cfg, position)
+}
+
+/// The Q/K/V matvecs of one position (GPU batch or fused CPU dispatch).
+fn project_matvecs(
+    hidden: &[f32],
+    wq: &QTensor,
+    wk: &QTensor,
+    wv: &QTensor,
+    cfg: &QwenAttnCfg,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (_, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
     let mut q_raw = take_buf(wq.rows());
     let mut k = take_buf(nkv * hd);
     let mut v = take_buf(nkv * hd);
@@ -613,6 +625,19 @@ fn project_position(
             cfg.pool,
         );
     }
+    (q_raw, k, v)
+}
+
+/// Everything between the QKV matvecs and the attend: bias, gate
+/// split, qk-norm, partial RoPE (the shared tail of `project_position`).
+fn finish_projection(
+    mut q_raw: Vec<f32>,
+    mut k: Vec<f32>,
+    mut v: Vec<f32>,
+    cfg: &QwenAttnCfg,
+    position: usize,
+) -> Projected {
+    let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
     if let Some((bq, bk, bv)) = cfg.bias {
         for (x, b) in q_raw.iter_mut().zip(bq) {
             *x += b;
@@ -694,20 +719,20 @@ fn apply_gate(ao: &mut [f32], gate: &[f32]) {
     }
 }
 
-/// Dense GQA attention for one position (QTensor weights, Qwen3.5 extras).
-#[allow(clippy::too_many_arguments)]
-pub fn qwen_attention(
-    hidden: &[f32],
-    wq: &QTensor,
-    wk: &QTensor,
-    wv: &QTensor,
-    wo: &QTensor,
+/// The CPU middle of an attention layer whose QKV matvecs already ran
+/// (e.g. on the GPU token graph) and whose O projection runs after:
+/// bias, gate split, qk-norm, RoPE, KV append, grouped attend, output
+/// gate. Bit-identical to `qwen_attention` between its two matvecs.
+pub fn qwen_attention_core(
+    q_raw: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
     cache: &mut LayerKvCache,
     cfg: &QwenAttnCfg,
 ) -> Vec<f32> {
     let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
     let heads_per_kv = nh / nkv;
-    let p = project_position(hidden, wq, wk, wv, cfg, cfg.position);
+    let p = finish_projection(q_raw, k, v, cfg, cfg.position);
     // O(1) prefill trace: while a nystrom layer is collecting, the exact
     // prompt pass also records this position's queries for the seal
     // (no-op on plain layers).
@@ -721,10 +746,26 @@ pub fn qwen_attention(
     if cfg.output_gate {
         apply_gate(&mut ao, &p.gate);
     }
+    recycle_buf(&mut imp);
+    ao
+}
+
+/// Dense GQA attention for one position (QTensor weights, Qwen3.5 extras).
+#[allow(clippy::too_many_arguments)]
+pub fn qwen_attention(
+    hidden: &[f32],
+    wq: &QTensor,
+    wk: &QTensor,
+    wv: &QTensor,
+    wo: &QTensor,
+    cache: &mut LayerKvCache,
+    cfg: &QwenAttnCfg,
+) -> Vec<f32> {
+    let (q_raw, k, v) = project_matvecs(hidden, wq, wk, wv, cfg);
+    let mut ao = qwen_attention_core(q_raw, k, v, cache, cfg);
     let mut out = take_buf(cfg.hidden_size);
     wo.matvec(&ao, &mut out, cfg.pool);
     recycle_buf(&mut ao);
-    recycle_buf(&mut imp);
     out
 }
 

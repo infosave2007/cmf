@@ -283,100 +283,260 @@ impl Pipeline {
     /// Build a pipeline from parts (used by the loader and tests).
     #[allow(clippy::too_many_arguments)]
 
-    /// Whole-block GDN on the GPU (macOS/Metal, q1 models): run the run
-    /// of consecutive GatedDeltaNet layers starting at `start` in ONE
-    /// command buffer — hidden device-resident, one sync per block. The
-    /// recurrent states round-trip through shared memory, so the CPU
-    /// stays their owner and every other path remains coherent.
-    /// Returns the first layer index NOT covered (== `start` → refused,
-    /// caller falls through to the per-layer CPU path).
+    /// Whole-block q1 token graph on the GPU (macOS/Metal): the run of
+    /// consecutive q1 layers — GDN *and* full attention — starting at
+    /// `start` executes as few command buffers as the CPU truly needs.
+    /// Hidden stays device-resident across every layer; the only syncs
+    /// are before each CPU attend (it needs q/k/v and owns the KV
+    /// cache) and the final hidden readback. Recurrent states
+    /// round-trip through shared memory (the CPU stays their owner, so
+    /// every other path remains coherent). Returns the first layer
+    /// index NOT covered (== `start` → refused, caller falls through
+    /// to the per-layer CPU path).
     #[cfg(target_os = "macos")]
-    fn gdn_block_gpu(&mut self, start: usize, upto: Option<usize>, h: &mut [f32]) -> usize {
-        use crate::gpu::{GdnGpuCfg, GdnGpuLayer};
+    fn q1_graph_gpu(
+        &mut self,
+        start: usize,
+        upto: Option<usize>,
+        position: usize,
+        h: &mut [f32],
+    ) -> usize {
+        use crate::gpu::{AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GraphDims, TokenGraph};
         if !crate::gpu::enabled_here()
+            || !crate::gpu::q1_force()
             || std::env::var("CMF_GPU_BLOCK").map(|v| v == "0").unwrap_or(false)
         {
             return start;
         }
-        let Some(cfg) = self.gdn_cfg else { return start };
         let limit = upto.map(|u| u + 1).unwrap_or(self.num_layers).min(self.num_layers);
-        let mut layers: Vec<GdnGpuLayer> = Vec::new();
+
+        enum Item<'a> {
+            Gdn {
+                run: Vec<GdnGpuLayer<'a>>,
+                first: usize,
+            },
+            Attn {
+                l: AttnGpuLayer<'a>,
+                li: usize,
+                q_norm: Option<&'a [f32]>,
+                k_norm: Option<&'a [f32]>,
+                output_gate: bool,
+                bias: Option<(&'a [f32], &'a [f32], &'a [f32])>,
+            },
+        }
+
+        let mut plan: Vec<Item> = Vec::new();
         let mut model_ref: Option<std::sync::Arc<cortiq_core::CmfModel>> = None;
-        let mut inter = 0usize;
-        let mut end = start;
-        while end < limit {
-            let lw = &self.weights.layers[end];
-            let AttnKind::LinearGdn(w) = &lw.attn else { break };
+        let mut scan = start;
+        while scan < limit {
+            let lw = &self.weights.layers[scan];
             let FfnKind::Dense(d) = &lw.ffn else { break };
-            let parts = (
-                w.in_proj_qkv.q1_parts(),
-                w.in_proj_z.q1_parts(),
-                w.in_proj_a.f32_parts(),
-                w.in_proj_b.f32_parts(),
-                w.out_proj.q1_parts(),
-                d.gate_proj.q1_parts(),
-                d.up_proj.q1_parts(),
-                d.down_proj.q1_parts(),
-            );
-            let (Some(qkv), Some(z), Some(a), Some(b), Some(out), Some(g), Some(u), Some(dn)) =
-                parts
+            let (Some(g), Some(u), Some(dn)) =
+                (d.gate_proj.q1_parts(), d.up_proj.q1_parts(), d.down_proj.q1_parts())
             else {
                 break;
             };
-            if let QTensor::Mapped { model, .. } = &w.in_proj_qkv {
-                model_ref.get_or_insert_with(|| model.clone());
+            match &lw.attn {
+                AttnKind::LinearGdn(w) if self.gdn_cfg.is_some() => {
+                    let parts = (
+                        w.in_proj_qkv.q1_parts(),
+                        w.in_proj_z.q1_parts(),
+                        w.in_proj_a.f32_parts(),
+                        w.in_proj_b.f32_parts(),
+                        w.out_proj.q1_parts(),
+                    );
+                    let (Some(qkv), Some(z), Some(a), Some(b), Some(out)) = parts else { break };
+                    if let QTensor::Mapped { model, .. } = &w.in_proj_qkv {
+                        model_ref.get_or_insert_with(|| model.clone());
+                    }
+                    let gl = GdnGpuLayer {
+                        attn_norm: &lw.input_norm,
+                        post_norm: &lw.post_norm,
+                        qkv,
+                        z,
+                        a,
+                        b,
+                        out,
+                        gate: g,
+                        up: u,
+                        down: dn,
+                        conv1d: &w.conv1d,
+                        a_log: &w.a_log,
+                        dt_bias: &w.dt_bias,
+                        gnorm: &w.norm,
+                    };
+                    match plan.last_mut() {
+                        Some(Item::Gdn { run, .. }) => run.push(gl),
+                        _ => plan.push(Item::Gdn { run: vec![gl], first: scan }),
+                    }
+                }
+                AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, bias }
+                    if !self.kv_cache.layers[scan].o1_sealed() =>
+                {
+                    let parts = (wq.q1_parts(), wk.q1_parts(), wv.q1_parts(), wo.q1_parts());
+                    let (Some(pq), Some(pk), Some(pv), Some(po)) = parts else { break };
+                    if let QTensor::Mapped { model, .. } = wq {
+                        model_ref.get_or_insert_with(|| model.clone());
+                    }
+                    plan.push(Item::Attn {
+                        l: AttnGpuLayer {
+                            attn_norm: &lw.input_norm,
+                            post_norm: &lw.post_norm,
+                            wq: pq,
+                            wk: pk,
+                            wv: pv,
+                            wo: po,
+                            gate: g,
+                            up: u,
+                            down: dn,
+                        },
+                        li: scan,
+                        q_norm: q_norm.as_deref(),
+                        k_norm: k_norm.as_deref(),
+                        output_gate: *output_gate,
+                        bias: bias
+                            .as_ref()
+                            .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
+                    });
+                }
+                _ => break,
             }
-            inter = g.1;
-            layers.push(GdnGpuLayer {
-                attn_norm: &lw.input_norm,
-                post_norm: &lw.post_norm,
-                qkv,
-                z,
-                a,
-                b,
-                out,
-                gate: g,
-                up: u,
-                down: dn,
-                conv1d: &w.conv1d,
-                a_log: &w.a_log,
-                dt_bias: &w.dt_bias,
-                gnorm: &w.norm,
-            });
-            end += 1;
-        }
-        if layers.is_empty() {
-            return start;
+            scan += 1;
         }
         let Some(model) = model_ref else { return start };
-        let gcfg = GdnGpuCfg {
+        if plan.is_empty() {
+            return start;
+        }
+        let dims = GraphDims {
+            hidden: self.hidden_size,
+            eps: self.rms_eps as f32,
+            gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
+        };
+        let Some(mut graph) = TokenGraph::new(&model, dims, h) else { return start };
+        let gcfg = self.gdn_cfg.map(|cfg| GdnGpuCfg {
             nv: cfg.num_v_heads,
             nk: cfg.num_k_heads,
             dk: cfg.key_head_dim,
             dv: cfg.value_head_dim,
             kk: cfg.conv_kernel,
             hidden: self.hidden_size,
-            inter,
+            inter: self.intermediate_size,
             c_dim: cfg.conv_dim(),
             eps: cfg.rms_eps as f32,
             gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
-        };
-        // States: lazily sized like the CPU core, then mutably split.
-        let want = cfg.state_len();
-        for l in &mut self.kv_cache.layers[start..end] {
-            if l.linear_state.len() != want {
-                l.linear_state = vec![0f32; want];
+        });
+        // Validate the whole plan BEFORE encoding anything: after the
+        // first sync a refused layer would leave the token
+        // half-executed, so truncate to the provably encodable prefix.
+        let mut valid = 0usize;
+        let mut end = start;
+        for item in &plan {
+            let ok = match item {
+                Item::Gdn { run, .. } => gcfg
+                    .as_ref()
+                    .map(|gc| run.iter().all(|l| graph.gdn_ok(l, gc)))
+                    .unwrap_or(false),
+                Item::Attn { l, .. } => graph.attn_ok(l),
+            };
+            if !ok {
+                break;
+            }
+            valid += 1;
+            end += match item {
+                Item::Gdn { run, .. } => run.len(),
+                Item::Attn { .. } => 1,
+            };
+        }
+        plan.truncate(valid);
+        if plan.is_empty() {
+            return start;
+        }
+
+        let inv_freq = self.inv_freq.clone();
+        let pool = self.pool.clone();
+        let (nh, nkv, hd, hs, rd, eps) = (
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.hidden_size,
+            self.rotary_dim,
+            self.rms_eps,
+        );
+        let norm_style = self.norm_style;
+        let want = self.gdn_cfg.map(|c| c.state_len()).unwrap_or(0);
+        // The GDN run whose states await readback after the next sync.
+        let mut pending: Option<(usize, usize)> = None;
+        for item in &plan {
+            match item {
+                Item::Gdn { run, first } => {
+                    for l in &mut self.kv_cache.layers[*first..*first + run.len()] {
+                        if l.linear_state.len() != want {
+                            l.linear_state = vec![0f32; want];
+                        }
+                    }
+                    let ro: Vec<&[f32]> = self.kv_cache.layers[*first..*first + run.len()]
+                        .iter()
+                        .map(|l| l.linear_state.as_slice())
+                        .collect();
+                    if !graph.encode_gdn_run(run, &ro, gcfg.as_ref().unwrap()) {
+                        // Unreachable: the plan was validated above.
+                        tracing::error!("q1 graph: GDN run refused after validation");
+                        return start;
+                    }
+                    pending = Some((*first, run.len()));
+                }
+                Item::Attn { l, li, q_norm, k_norm, output_gate, bias } => {
+                    graph.encode_attn_prefix(l);
+                    graph.sync();
+                    if let Some((first, len)) = pending.take() {
+                        let mut outs: Vec<&mut [f32]> = self.kv_cache.layers[first..first + len]
+                            .iter_mut()
+                            .map(|s| s.linear_state.as_mut_slice())
+                            .collect();
+                        graph.read_states(&mut outs);
+                    }
+                    let mut q_raw = attention::take_buf(l.wq.1);
+                    let mut k = attention::take_buf(l.wk.1);
+                    let mut v = attention::take_buf(l.wv.1);
+                    graph.read_qkv(&mut q_raw, &mut k, &mut v);
+                    let cfg = QwenAttnCfg {
+                        num_heads: nh,
+                        num_kv_heads: nkv,
+                        head_dim: hd,
+                        hidden_size: hs,
+                        position,
+                        inv_freq: &inv_freq,
+                        rotary_dim: rd,
+                        q_norm: *q_norm,
+                        k_norm: *k_norm,
+                        output_gate: *output_gate,
+                        bias: *bias,
+                        rms_eps: eps,
+                        norm_style,
+                        pool: pool.as_deref(),
+                    };
+                    let mut ao = attention::qwen_attention_core(
+                        q_raw,
+                        k,
+                        v,
+                        &mut self.kv_cache.layers[*li],
+                        &cfg,
+                    );
+                    graph.encode_attn_suffix(l, &ao);
+                    attention::recycle_buf(&mut ao);
+                }
             }
         }
-        let mut states: Vec<&mut [f32]> = self.kv_cache.layers[start..end]
-            .iter_mut()
-            .map(|l| l.linear_state.as_mut_slice())
-            .collect();
-        if crate::gpu::gdn_block(&model, &layers, &mut states, &gcfg, h) {
-            end
-        } else {
-            start
+        graph.sync();
+        if let Some((first, len)) = pending.take() {
+            let mut outs: Vec<&mut [f32]> = self.kv_cache.layers[first..first + len]
+                .iter_mut()
+                .map(|s| s.linear_state.as_mut_slice())
+                .collect();
+            graph.read_states(&mut outs);
         }
+        graph.finish(h);
+        end
     }
 
     pub fn new(
@@ -1546,7 +1706,7 @@ impl Pipeline {
         let pool = self.pool.clone();
 
         #[cfg(target_os = "macos")]
-        let mut gdn_skip_until = 0usize;
+        let mut gpu_skip_until = 0usize;
         for li in 0..self.num_layers {
             crate::gpu::set_layer(li as i64); // layer-split GPU/CPU (CMF_GPU_LAYERS)
             if let Some(u) = upto {
@@ -1559,17 +1719,18 @@ impl Pipeline {
                     continue; // dead layer: residual pass-through
                 }
             }
-            // Whole-block GDN on the GPU: a run of consecutive q1 GDN
-            // layers executes in one command buffer (macOS/Metal).
+            // Whole-block q1 token graph: a run of consecutive q1
+            // layers — GDN and full attention — executes with one sync
+            // per CPU attend instead of per op (macOS/Metal).
             #[cfg(target_os = "macos")]
             {
-                if li < gdn_skip_until {
+                if li < gpu_skip_until {
                     continue;
                 }
                 if task_mask.is_none() {
-                    let end = self.gdn_block_gpu(li, upto, &mut h);
+                    let end = self.q1_graph_gpu(li, upto, position, &mut h);
                     if end > li {
-                        gdn_skip_until = end;
+                        gpu_skip_until = end;
                         continue;
                     }
                 }

@@ -1275,144 +1275,427 @@ pub struct GdnGpuCfg {
     pub gemma: bool,
 }
 
-/// A BLOCK of consecutive GDN layers in one command buffer: hidden
-/// state stays device-resident across norm → mixer → conv → recurrence
-/// → out_proj → norm → FFN → residuals of every layer; per-layer
-/// recurrent states round-trip through shared memory (the CPU remains
-/// their owner, so every other path stays coherent for free). One sync
-/// per block instead of ~12 per layer.
-pub fn gdn_block(
-    model: &Arc<CmfModel>,
-    layers: &[GdnGpuLayer],
-    states: &mut [&mut [f32]],
-    cfg: &GdnGpuCfg,
-    h: &mut [f32],
-) -> bool {
-    let Some(c) = ctx() else { return false };
-    if layers.is_empty()
-        || layers.len() != states.len()
-        || cfg.kk < 2
-        || cfg.dv % 32 != 0
-        || cfg.dv > 1024
-        || h.len() != cfg.hidden
-    {
-        return false;
-    }
-    let bytes = model.primary_bytes();
-    let Some((fbuf, safe_len)) = file_buffer(c, bytes) else { return false };
-    let vd = cfg.nv * cfg.dv;
-    let _kd = cfg.nk * cfg.dk;
-    let ring_len = (cfg.kk - 1) * cfg.c_dim;
-    let s_len = cfg.nv * cfg.dk * cfg.dv;
+/// Model-wide dims every token-graph layer agrees on.
+#[derive(Clone, Copy)]
+pub struct GraphDims {
+    pub hidden: usize,
+    pub eps: f32,
+    /// Gemma-style norms: x̂·(1+w) (qwen3_5 family) vs Qwen x̂·w.
+    pub gemma: bool,
+}
 
-    // Resolve and validate every q1 tensor before encoding anything.
-    let mut abss: Vec<[usize; 6]> = Vec::with_capacity(layers.len());
-    for l in layers {
-        let mut a8 = [0usize; 6];
-        for (slot, t) in [l.qkv, l.z, l.out, l.gate, l.up, l.down].iter().enumerate() {
-            let (idx, rows, cols) = *t;
-            if cols % GROUP_SIZE != 0 || (cols / GROUP_SIZE) % 2 != 0 {
-                return false;
-            }
-            let entry = &model.tensors[idx];
-            let Some(abs) = model.entry_abs_offset(entry) else { return false };
-            if abs + rows * (cols / GROUP_SIZE) * Q1_TILE > safe_len {
-                return false;
-            }
-            a8[slot] = abs;
+/// One full-attention layer's q1 graph inputs: (directory idx, rows,
+/// cols) triples; the qk-norms / RoPE / KV / attend stay on the CPU
+/// between the graph's QKV prefix and O+FFN suffix.
+pub struct AttnGpuLayer<'a> {
+    pub attn_norm: &'a [f32],
+    pub post_norm: &'a [f32],
+    pub wq: (usize, usize, usize),
+    pub wk: (usize, usize, usize),
+    pub wv: (usize, usize, usize),
+    pub wo: (usize, usize, usize),
+    pub gate: (usize, usize, usize),
+    pub up: (usize, usize, usize),
+    pub down: (usize, usize, usize),
+}
+
+fn io_buf(c: &Ctx, key: usize, nbytes: usize) -> Buffer {
+    let mut cache = c.io_bufs.lock().unwrap();
+    cache
+        .entry(key)
+        .or_insert_with(|| {
+            crate::gpu::probe_note_cold();
+            c._device.new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+        })
+        .clone()
+}
+
+/// Small constant vectors cached by their (stable) data pointer.
+fn const_buf(c: &Ctx, data: &[f32]) -> Buffer {
+    let mut cache = c.rs_bufs.lock().unwrap();
+    cache
+        .entry((data.as_ptr() as usize, usize::MAX - 2))
+        .or_insert_with(|| {
+            crate::gpu::probe_note_cold();
+            c._device.new_buffer_with_data(
+                data.as_ptr() as *const std::ffi::c_void,
+                (data.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        })
+        .clone()
+}
+
+fn enc_simple(
+    c_cmd: &metal::CommandBufferRef,
+    pso: &ComputePipelineState,
+    bufs: &[(&Buffer, u64)],
+    words: &[u32],
+    floats: &[f32],
+    grid: (u64, u64),
+) {
+    let enc = c_cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pso);
+    for (i, (b, off)) in bufs.iter().enumerate() {
+        enc.set_buffer(i as u64, Some(b), *off);
+    }
+    let base = bufs.len() as u64;
+    for (i, w) in words.iter().enumerate() {
+        enc.set_bytes(base + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+    }
+    for (i, f) in floats.iter().enumerate() {
+        enc.set_bytes(
+            base + words.len() as u64 + i as u64,
+            4,
+            f as *const f32 as *const std::ffi::c_void,
+        );
+    }
+    enc.dispatch_threads(MTLSize::new(grid.0, 1, 1), MTLSize::new(grid.1, 1, 1));
+    enc.end_encoding();
+}
+
+/// A token's worth of layers as few command buffers: hidden lives in a
+/// device buffer across GDN runs AND full-attention layers; the only
+/// syncs are where the CPU genuinely needs data (q/k/v before the KV
+/// attend, recurrent states, the final hidden). Contract: validate
+/// every layer (`gdn_ok`/`attn_ok`) BEFORE encoding — after the first
+/// `sync` a refused encode would leave the token half-executed.
+pub struct TokenGraph {
+    c: &'static Ctx,
+    model: Arc<CmfModel>,
+    fbuf: Buffer,
+    safe_len: usize,
+    dims: GraphDims,
+    cmd: Option<metal::CommandBuffer>,
+    h_b: Buffer,
+    n_b: Buffer,
+    d_b: Buffer,
+    /// Recurrent-state buffers awaiting readback (buffer, f32 len).
+    dirty: Vec<(Buffer, usize)>,
+    /// Next state-buffer cache slot (reset when `dirty` drains).
+    st_next: usize,
+    /// q/k/v buffers of the last encoded attention prefix.
+    qkv_bufs: Option<(Buffer, Buffer, Buffer)>,
+}
+
+impl TokenGraph {
+    pub fn new(model: &Arc<CmfModel>, dims: GraphDims, h: &[f32]) -> Option<TokenGraph> {
+        let c = ctx()?;
+        if h.len() != dims.hidden {
+            return None;
+        }
+        let (fbuf, safe_len) = file_buffer(c, model.primary_bytes())?;
+        let h_b = io_buf(c, 20_000_000_003 + dims.hidden, dims.hidden * 4);
+        let n_b = io_buf(c, 21_000_000_011 + dims.hidden, dims.hidden * 4);
+        let d_b = io_buf(c, 32_000_000_207 + dims.hidden, dims.hidden * 4);
+        unsafe {
+            std::ptr::copy_nonoverlapping(h.as_ptr(), h_b.contents() as *mut f32, dims.hidden);
+        }
+        Some(TokenGraph {
+            c,
+            model: model.clone(),
+            fbuf,
+            safe_len,
+            dims,
+            cmd: None,
+            h_b,
+            n_b,
+            d_b,
+            dirty: Vec::new(),
+            st_next: 0,
+            qkv_bufs: None,
+        })
+    }
+
+    /// Validate one q1 tensor and resolve its absolute payload offset.
+    fn q1_abs(&self, t: (usize, usize, usize)) -> Option<usize> {
+        let (idx, rows, cols) = t;
+        if cols % GROUP_SIZE != 0 || (cols / GROUP_SIZE) % 2 != 0 {
+            return None;
+        }
+        let entry = &self.model.tensors[idx];
+        let abs = self.model.entry_abs_offset(entry)?;
+        if abs + rows * (cols / GROUP_SIZE) * Q1_TILE > self.safe_len {
+            return None;
+        }
+        Some(abs)
+    }
+
+    /// Pre-flight check for a GDN layer (call before any encode).
+    pub fn gdn_ok(&self, l: &GdnGpuLayer, cfg: &GdnGpuCfg) -> bool {
+        if cfg.kk < 2 || cfg.dv % 32 != 0 || cfg.dv > 1024 || cfg.hidden != self.dims.hidden {
+            return false;
         }
         if l.a.0.len() != l.a.1 * l.a.2 || l.b.0.len() != l.b.1 * l.b.2 {
             return false;
         }
-        if states[abss.len()].len() != ring_len + s_len {
+        [l.qkv, l.z, l.out, l.gate, l.up, l.down].iter().all(|t| self.q1_abs(*t).is_some())
+    }
+
+    /// Pre-flight check for a full-attention layer.
+    pub fn attn_ok(&self, l: &AttnGpuLayer) -> bool {
+        // The suffix reads the attention output back through ao (wo
+        // cols) and writes hidden (wo rows) — both must match dims.
+        if l.wo.1 != self.dims.hidden || l.down.1 != self.dims.hidden {
             return false;
         }
-        abss.push(a8);
+        [l.wq, l.wk, l.wv, l.wo, l.gate, l.up, l.down].iter().all(|t| self.q1_abs(*t).is_some())
     }
 
-    let get_io = |key: usize, nbytes: usize| -> Buffer {
-        let mut cache = c.io_bufs.lock().unwrap();
-        cache
-            .entry(key)
-            .or_insert_with(|| {
-                crate::gpu::probe_note_cold();
-                c._device
-                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
-            })
-            .clone()
-    };
-    // Small constant vectors cached by their (stable) data pointer.
-    let vec_buf = |data: &[f32]| -> Buffer {
-        let mut cache = c.rs_bufs.lock().unwrap();
-        cache
-            .entry((data.as_ptr() as usize, usize::MAX - 2))
-            .or_insert_with(|| {
-                crate::gpu::probe_note_cold();
-                c._device.new_buffer_with_data(
-                    data.as_ptr() as *const std::ffi::c_void,
-                    (data.len() * 4) as u64,
-                    MTLResourceOptions::StorageModeShared,
-                )
-            })
-            .clone()
-    };
+    fn ensure_cmd(&mut self) -> metal::CommandBuffer {
+        if self.cmd.is_none() {
+            self.cmd = Some(self.c.queue.new_command_buffer().to_owned());
+        }
+        self.cmd.as_ref().unwrap().clone()
+    }
 
-    let h_b = get_io(20_000_000_003 + cfg.hidden, cfg.hidden * 4);
-    let n_b = get_io(21_000_000_011 + cfg.hidden, cfg.hidden * 4);
-    let qkv_b = get_io(22_000_000_017 + cfg.c_dim, cfg.c_dim * 4);
-    let z_b = get_io(23_000_000_021 + vd, vd * 4);
-    let a_b = get_io(24_000_000_047 + cfg.nv, cfg.nv * 4);
-    let b_b = get_io(25_000_000_071 + cfg.nv, cfg.nv * 4);
-    let cq_b = get_io(26_000_000_081 + cfg.c_dim, cfg.c_dim * 4);
-    let g_b = get_io(27_000_000_093 + cfg.nv, cfg.nv * 4);
-    let bt_b = get_io(28_000_000_129 + cfg.nv, cfg.nv * 4);
-    let iq_b = get_io(29_000_000_131 + cfg.nk, cfg.nk * 4);
-    let ik_b = get_io(30_000_000_133 + cfg.nk, cfg.nk * 4);
-    let of_b = get_io(31_000_000_161 + vd, vd * 4);
-    let d_b = get_io(32_000_000_207 + cfg.hidden, cfg.hidden * 4);
-    let fg_b = get_io(33_000_000_209 + cfg.inter, cfg.inter * 4);
-    let fu_b = get_io(34_000_000_213 + cfg.inter, cfg.inter * 4);
-    let fa_b = get_io(35_000_000_221 + cfg.inter, cfg.inter * 4);
-    let st_bs: Vec<Buffer> = (0..layers.len())
-        .map(|i| get_io(36_000_000_223 + i * 613 + ring_len + s_len, (ring_len + s_len) * 4))
-        .collect();
-
-    // Upload hidden + states (UMA memcpy into shared buffers).
-    unsafe {
-        std::ptr::copy_nonoverlapping(h.as_ptr(), h_b.contents() as *mut f32, cfg.hidden);
-        for (st, sb) in states.iter().zip(&st_bs) {
-            std::ptr::copy_nonoverlapping(st.as_ptr(), sb.contents() as *mut f32, st.len());
+    /// Submit everything encoded so far and wait for completion.
+    pub fn sync(&mut self) {
+        if let Some(cmd) = self.cmd.take() {
+            submit_and_wait(self.c, &cmd, &[]);
         }
     }
 
-    let t_up = std::time::Instant::now();
-    let cmd = c.queue.new_command_buffer();
-    let enc_one = |pso: &ComputePipelineState,
-                   bufs: &[(&Buffer, u64)],
-                   words: &[u32],
-                   floats: &[f32],
-                   grid: (u64, u64)| {
-        let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(pso);
-        for (i, (b, off)) in bufs.iter().enumerate() {
-            enc.set_buffer(i as u64, Some(b), *off);
+    /// Copy finished recurrent states back to their CPU owners (call
+    /// after `sync`; order matches the `encode_gdn_run` calls).
+    pub fn read_states(&mut self, outs: &mut [&mut [f32]]) {
+        debug_assert_eq!(outs.len(), self.dirty.len());
+        for ((buf, len), out) in self.dirty.drain(..).zip(outs.iter_mut()) {
+            debug_assert_eq!(len, out.len());
+            unsafe {
+                std::ptr::copy_nonoverlapping(buf.contents() as *const f32, out.as_mut_ptr(), len);
+            }
         }
-        let base = bufs.len() as u64;
-        for (i, w) in words.iter().enumerate() {
-            enc.set_bytes(base + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
-        }
-        for (i, f) in floats.iter().enumerate() {
-            enc.set_bytes(
-                base + words.len() as u64 + i as u64,
-                4,
-                f as *const f32 as *const std::ffi::c_void,
+        self.st_next = 0;
+    }
+
+    /// Final sync + hidden readback.
+    pub fn finish(mut self, h: &mut [f32]) {
+        self.sync();
+        debug_assert!(self.dirty.is_empty(), "unread recurrent states at finish");
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.h_b.contents() as *const f32,
+                h.as_mut_ptr(),
+                self.dims.hidden,
             );
         }
-        enc.dispatch_threads(MTLSize::new(grid.0, 1, 1), MTLSize::new(grid.1, 1, 1));
-        enc.end_encoding();
-    };
+    }
 
-    for (l, (a8, sb)) in layers.iter().zip(abss.iter().zip(&st_bs)) {
+    /// norm(h) → n_b, then QKV projections n_b → q/k/v buffers. The
+    /// caller must `sync` + `read_qkv` before using the values.
+    pub fn encode_attn_prefix(&mut self, l: &AttnGpuLayer) {
+        let cmd = self.ensure_cmd();
+        let (aq, ak, av) =
+            (self.q1_abs(l.wq).unwrap(), self.q1_abs(l.wk).unwrap(), self.q1_abs(l.wv).unwrap());
+        enc_simple(
+            &cmd,
+            &self.c.rmsn,
+            &[(&self.h_b, 0), (&const_buf(self.c, l.attn_norm), 0), (&self.n_b, 0)],
+            &[self.dims.hidden as u32, self.dims.gemma as u32],
+            &[self.dims.eps],
+            (256, 256),
+        );
+        let q_b = io_buf(self.c, 40_000_000_003 + l.wq.1, l.wq.1 * 4);
+        let k_b = io_buf(self.c, 41_000_000_019 + l.wk.1, l.wk.1 * 4);
+        let v_b = io_buf(self.c, 42_000_000_037 + l.wv.1, l.wv.1 * 4);
+        let enc = cmd.new_compute_command_encoder();
+        encode_q1_matvec(self.c, enc, &self.fbuf, aq, &self.n_b, &q_b, l.wq.1, l.wq.2 / GROUP_SIZE);
+        encode_q1_matvec(self.c, enc, &self.fbuf, ak, &self.n_b, &k_b, l.wk.1, l.wk.2 / GROUP_SIZE);
+        encode_q1_matvec(self.c, enc, &self.fbuf, av, &self.n_b, &v_b, l.wv.1, l.wv.2 / GROUP_SIZE);
+        enc.end_encoding();
+        self.qkv_bufs = Some((q_b, k_b, v_b));
+    }
+
+    /// Read the prefix's q/k/v after `sync` (UMA memcpy).
+    pub fn read_qkv(&mut self, q: &mut [f32], k: &mut [f32], v: &mut [f32]) {
+        let (q_b, k_b, v_b) = self.qkv_bufs.take().expect("read_qkv without prefix");
+        unsafe {
+            std::ptr::copy_nonoverlapping(q_b.contents() as *const f32, q.as_mut_ptr(), q.len());
+            std::ptr::copy_nonoverlapping(k_b.contents() as *const f32, k.as_mut_ptr(), k.len());
+            std::ptr::copy_nonoverlapping(v_b.contents() as *const f32, v.as_mut_ptr(), v.len());
+        }
+    }
+
+    /// Upload the CPU-attended output `ao`, then O-projection +
+    /// residual + post-norm + FFN + residual on the device.
+    pub fn encode_attn_suffix(&mut self, l: &AttnGpuLayer, ao: &[f32]) {
+        debug_assert_eq!(ao.len(), l.wo.2);
+        let cmd = self.ensure_cmd();
+        let ao_b = io_buf(self.c, 43_000_000_057 + ao.len(), ao.len() * 4);
+        // Safe to write: the previous command buffer completed at the
+        // prefix sync, and the new one has not been committed yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(ao.as_ptr(), ao_b.contents() as *mut f32, ao.len());
+        }
+        {
+            let enc = cmd.new_compute_command_encoder();
+            let abs = self.q1_abs(l.wo).unwrap();
+            encode_q1_matvec(
+                self.c,
+                enc,
+                &self.fbuf,
+                abs,
+                &ao_b,
+                &self.d_b,
+                l.wo.1,
+                l.wo.2 / GROUP_SIZE,
+            );
+            enc.end_encoding();
+        }
+        enc_axpy(self.c, &cmd, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
+        self.encode_post_ffn(&cmd, l.post_norm, l.gate, l.up, l.down);
+    }
+
+    /// post-norm(h) → n_b, gate/up, SiLU·mul, down, h += d — shared by
+    /// the GDN layer tail and the attention suffix.
+    fn encode_post_ffn(
+        &self,
+        cmd: &metal::CommandBufferRef,
+        post_norm: &[f32],
+        gate: (usize, usize, usize),
+        up: (usize, usize, usize),
+        down: (usize, usize, usize),
+    ) {
+        let inter = gate.1;
+        let fg_b = io_buf(self.c, 33_000_000_209 + inter, inter * 4);
+        let fu_b = io_buf(self.c, 34_000_000_213 + inter, inter * 4);
+        let fa_b = io_buf(self.c, 35_000_000_221 + inter, inter * 4);
+        enc_simple(
+            cmd,
+            &self.c.rmsn,
+            &[(&self.h_b, 0), (&const_buf(self.c, post_norm), 0), (&self.n_b, 0)],
+            &[self.dims.hidden as u32, self.dims.gemma as u32],
+            &[self.dims.eps],
+            (256, 256),
+        );
+        {
+            let enc = cmd.new_compute_command_encoder();
+            let (ag, au) = (self.q1_abs(gate).unwrap(), self.q1_abs(up).unwrap());
+            encode_q1_matvec(
+                self.c,
+                enc,
+                &self.fbuf,
+                ag,
+                &self.n_b,
+                &fg_b,
+                gate.1,
+                gate.2 / GROUP_SIZE,
+            );
+            encode_q1_matvec(
+                self.c,
+                enc,
+                &self.fbuf,
+                au,
+                &self.n_b,
+                &fu_b,
+                up.1,
+                up.2 / GROUP_SIZE,
+            );
+            enc.end_encoding();
+        }
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.c.silu);
+            enc.set_buffer(0, Some(&fg_b), 0);
+            enc.set_buffer(1, Some(&fu_b), 0);
+            enc.set_buffer(2, Some(&fg_b), 0); // dummy col (has_col = 0)
+            enc.set_buffer(3, Some(&fa_b), 0);
+            let (n_u, hc) = (inter as u32, 0u32);
+            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.end_encoding();
+        }
+        {
+            let enc = cmd.new_compute_command_encoder();
+            let ad = self.q1_abs(down).unwrap();
+            encode_q1_matvec(
+                self.c,
+                enc,
+                &self.fbuf,
+                ad,
+                &fa_b,
+                &self.d_b,
+                down.1,
+                down.2 / GROUP_SIZE,
+            );
+            enc.end_encoding();
+        }
+        enc_axpy(self.c, cmd, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
+    }
+
+    /// Encode a run of consecutive GDN layers; recurrent states upload
+    /// now and read back via `read_states` after the next `sync`.
+    pub fn encode_gdn_run(
+        &mut self,
+        layers: &[GdnGpuLayer],
+        states: &[&[f32]],
+        cfg: &GdnGpuCfg,
+    ) -> bool {
+        if layers.is_empty() || layers.len() != states.len() {
+            return false;
+        }
+        let c = self.c;
+        let vd = cfg.nv * cfg.dv;
+        let ring_len = (cfg.kk - 1) * cfg.c_dim;
+        let s_len = cfg.nv * cfg.dk * cfg.dv;
+
+        // Resolve and validate every q1 tensor before encoding anything.
+        let mut abss: Vec<[usize; 6]> = Vec::with_capacity(layers.len());
+        for (l, st) in layers.iter().zip(states) {
+            if !self.gdn_ok(l, cfg) || st.len() != ring_len + s_len {
+                return false;
+            }
+            let mut a8 = [0usize; 6];
+            for (slot, t) in [l.qkv, l.z, l.out, l.gate, l.up, l.down].iter().enumerate() {
+                a8[slot] = self.q1_abs(*t).unwrap();
+            }
+            abss.push(a8);
+        }
+
+        let qkv_b = io_buf(c, 22_000_000_017 + cfg.c_dim, cfg.c_dim * 4);
+        let z_b = io_buf(c, 23_000_000_021 + vd, vd * 4);
+        let a_b = io_buf(c, 24_000_000_047 + cfg.nv, cfg.nv * 4);
+        let b_b = io_buf(c, 25_000_000_071 + cfg.nv, cfg.nv * 4);
+        let cq_b = io_buf(c, 26_000_000_081 + cfg.c_dim, cfg.c_dim * 4);
+        let g_b = io_buf(c, 27_000_000_093 + cfg.nv, cfg.nv * 4);
+        let bt_b = io_buf(c, 28_000_000_129 + cfg.nv, cfg.nv * 4);
+        let iq_b = io_buf(c, 29_000_000_131 + cfg.nk, cfg.nk * 4);
+        let ik_b = io_buf(c, 30_000_000_133 + cfg.nk, cfg.nk * 4);
+        let of_b = io_buf(c, 31_000_000_161 + vd, vd * 4);
+        let st_bs: Vec<Buffer> = (0..layers.len())
+            .map(|i| {
+                io_buf(
+                    c,
+                    36_000_000_223 + (self.st_next + i) * 613 + ring_len + s_len,
+                    (ring_len + s_len) * 4,
+                )
+            })
+            .collect();
+        self.st_next += layers.len();
+
+        // Upload states (UMA memcpy into shared buffers) — safe: these
+        // slots were read back before the previous sync window closed.
+        unsafe {
+            for (st, sb) in states.iter().zip(&st_bs) {
+                std::ptr::copy_nonoverlapping(st.as_ptr(), sb.contents() as *mut f32, st.len());
+            }
+        }
+
+        let cmd = self.ensure_cmd();
+        let fbuf = self.fbuf.clone();
+        let (h_b, n_b, d_b) = (self.h_b.clone(), self.n_b.clone(), self.d_b.clone());
+        let enc_one = |pso: &ComputePipelineState,
+                       bufs: &[(&Buffer, u64)],
+                       words: &[u32],
+                       floats: &[f32],
+                       grid: (u64, u64)| {
+            enc_simple(&cmd, pso, bufs, words, floats, grid);
+        };
+        let vec_buf = |data: &[f32]| -> Buffer { const_buf(c, data) };
+
+        for (l, (a8, sb)) in layers.iter().zip(abss.iter().zip(&st_bs)) {
         let s_off = (ring_len * 4) as u64;
         // 1. attn rmsnorm h → n
         enc_one(
@@ -1517,59 +1800,40 @@ pub fn gdn_block(
             encode_q1_matvec(c, enc, &fbuf, a8[2], &of_b, &d_b, l.out.1, l.out.2 / GROUP_SIZE);
             enc.end_encoding();
         }
-        enc_axpy(c, cmd, &d_b, &h_b, 1.0, cfg.hidden);
-        // 8. ffn rmsnorm h → n
-        enc_one(
-            &c.rmsn,
-            &[(&h_b, 0), (&vec_buf(l.post_norm), 0), (&n_b, 0)],
-            &[cfg.hidden as u32, cfg.gemma as u32],
-            &[cfg.eps],
-            (256, 256),
-        );
-        // 9. gate/up;  10. silu·mul;  11. down;  12. h += d
-        {
-            let enc = cmd.new_compute_command_encoder();
-            encode_q1_matvec(c, enc, &fbuf, a8[3], &n_b, &fg_b, l.gate.1, l.gate.2 / GROUP_SIZE);
-            encode_q1_matvec(c, enc, &fbuf, a8[4], &n_b, &fu_b, l.up.1, l.up.2 / GROUP_SIZE);
-            enc.end_encoding();
+        enc_axpy(c, &cmd, &d_b, &h_b, 1.0, cfg.hidden);
+        // 8–12. post-norm + FFN + residual (shared with attn suffix)
+        self.encode_post_ffn(&cmd, l.post_norm, l.gate, l.up, l.down);
         }
-        {
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&c.silu);
-            enc.set_buffer(0, Some(&fg_b), 0);
-            enc.set_buffer(1, Some(&fu_b), 0);
-            enc.set_buffer(2, Some(&fg_b), 0); // dummy col (has_col = 0)
-            enc.set_buffer(3, Some(&fa_b), 0);
-            let (n_u, hc) = (cfg.inter as u32, 0u32);
-            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_threads(MTLSize::new(cfg.inter as u64, 1, 1), MTLSize::new(256, 1, 1));
-            enc.end_encoding();
-        }
-        {
-            let enc = cmd.new_compute_command_encoder();
-            encode_q1_matvec(c, enc, &fbuf, a8[5], &fa_b, &d_b, l.down.1, l.down.2 / GROUP_SIZE);
-            enc.end_encoding();
-        }
-        enc_axpy(c, cmd, &d_b, &h_b, 1.0, cfg.hidden);
-    }
 
-    let t_enc = t_up.elapsed();
-    submit_and_wait(c, cmd, &[&h_b]);
-    let t_gpu = t_up.elapsed();
-    unsafe {
-        std::ptr::copy_nonoverlapping(h_b.contents() as *const f32, h.as_mut_ptr(), cfg.hidden);
-        for (st, sb) in states.iter_mut().zip(&st_bs) {
-            std::ptr::copy_nonoverlapping(sb.contents() as *const f32, st.as_mut_ptr(), st.len());
+        for (sb, st) in st_bs.iter().zip(states) {
+            self.dirty.push((sb.clone(), st.len()));
         }
+        true
     }
-    tracing::debug!(
-        "gdn_block {} layers: encode {:.2} ms, +gpu {:.2} ms, +readback {:.2} ms",
-        layers.len(),
-        t_enc.as_secs_f64() * 1e3,
-        t_gpu.as_secs_f64() * 1e3,
-        t_up.elapsed().as_secs_f64() * 1e3
-    );
+}
+
+/// A BLOCK of consecutive GDN layers in one command buffer: hidden
+/// state stays device-resident across norm → mixer → conv → recurrence
+/// → out_proj → norm → FFN → residuals of every layer; per-layer
+/// recurrent states round-trip through shared memory (the CPU remains
+/// their owner, so every other path stays coherent for free). One sync
+/// per block instead of ~12 per layer.
+pub fn gdn_block(
+    model: &Arc<CmfModel>,
+    layers: &[GdnGpuLayer],
+    states: &mut [&mut [f32]],
+    cfg: &GdnGpuCfg,
+    h: &mut [f32],
+) -> bool {
+    let dims = GraphDims { hidden: cfg.hidden, eps: cfg.eps, gemma: cfg.gemma };
+    let Some(mut g) = TokenGraph::new(model, dims, h) else { return false };
+    let ro: Vec<&[f32]> = states.iter().map(|s| &**s).collect();
+    if !g.encode_gdn_run(layers, &ro, cfg) {
+        return false;
+    }
+    g.sync();
+    g.read_states(states);
+    g.finish(h);
     true
 }
 
