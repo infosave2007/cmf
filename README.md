@@ -142,7 +142,7 @@ published a clean before/after figure for it yet.
 
 To be clear about the axis: `llama.cpp` is the yardstick we measure against.
 One like-for-like run (2026-07-17: Qwen2.5-0.5B-Instruct, Apple Silicon M4,
-exact attention for both, native arm64 `llama.cpp` master vs CMF 0.3.4,
+exact attention for both, native arm64 `llama.cpp` master vs CMF 0.3.6,
 interleaved runs from fresh processes, each side at its best measured
 thread count — theirs is `-t 6`, ours the default; CMF timed with
 `cortiq bench --core`, which matches `llama-bench`'s core contract: no
@@ -153,8 +153,9 @@ sampler copy, no per-token confidence pass):
 | tg128, CPU, their best `-t 6` | 165.5 ± 0.3 tok/s | 151–158 tok/s | **−5%** |
 | tg128, CPU, their default `-t 4` | 129.4 ± 0.2 tok/s | 151–158 tok/s | **+18%** |
 | tg128, their GPU (Metal `-ngl 99`) | 150.9 ± 0.4 tok/s | 151–158 tok/s (CPU) | **CMF CPU ≥ their Metal** |
-| pp512, CPU | 1168 ± 5 tok/s | 1017–1037 tok/s | **−12%** |
-| pp1024, CPU | — | 976 tok/s | flat curve (was 390 in 0.3.3) |
+| pp512, CPU only | 1168 ± 5 tok/s | 1017–1051 tok/s | **−12%** |
+| pp512, GPU prefill graph (`CMF_GPU=1`) | 3339 ± 50 tok/s (Metal) | 1832–1990 tok/s | **+60% over their CPU; −43% to their Metal** |
+| pp1024 (`CMF_GPU=1`) | — | 1316–1343 tok/s | flat curve (was 390 in 0.3.3) |
 | Quant quality (PPL vs own f16, 12×512 windows) | near-lossless | +0.38% | matched |
 | File size | 644 MB | 479 MB | **−26%** |
 
@@ -162,7 +163,15 @@ Two releases ago this table read −38% tg128 and −67% pp512. What closed it:
 prefill rides Apple's AMX through Accelerate GEMM and attends the whole
 chunk as GEMMs with a causal masked softmax; decode drops the sampler copy
 and per-token confidence pass from the timed loop (`--core`; the default
-`bench` still times the full production loop).
+`bench` still times the full production loop). 0.3.6 adds the **GPU
+prefill chunk graph**: under `CMF_GPU=1`, whole runs of layers execute
+per chunk in one Metal submission — a ggml-layout simdgroup GEMM over the
+q8 weights in place, RoPE with the K/V append fused into the cache
+mirror, causal online-softmax attend — with one wait per chunk and the
+CPU cache remaining the owner of record. Perplexity stays in the
+half-GEMM tolerance class (+0.16%); deep chunks (past ~1k context) fall
+back to the CPU GEMM-attend, honestly. The Vulkan/DX12 (wgpu) path
+carries the same tiled GEMM, gated by the runtime probe per machine.
 
 Beyond the drag race: the file is 26% smaller at matched quality, attention
 memory can be O(1) (`--o1` holds ~16.5 tok/s at contexts where exact
