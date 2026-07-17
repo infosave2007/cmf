@@ -207,6 +207,13 @@ cortiq run model.cmf --prompt "SELECT ..." --skill sql
 Don't want to pick by hand? `cortiq route` chooses a skill from the prompt, and
 `cortiq explain` shows you why.
 
+**Try it in three commands**: [the skills guide](docs/SKILLS.md) bakes three
+real skills from public Hugging Face fine-tunes into one 0.5B file with
+`cortiq skill add` — a text-to-SQL assistant, a Russian assistant (−7.1%
+measured PPL on Russian prose) and a step-by-step verifier — then routes
+fresh prompts to the right one 6/6, blends them, and switches mid-stream.
+With commands, measurements, and the failure modes spelled out.
+
 Serving *N* task-specialists:
 
 | | N full fine-tunes | base + N external LoRAs | **CMF** |
@@ -247,6 +254,7 @@ set `CMF_GPU=1` to use it (see [GPU](#gpu)).
 | `cortiq fcd` | restoration trainer for `--o1` models (KL-anchored, generation-gated) |
 | `cortiq diff a.cmf b.cmf` | what changed between two model versions |
 | `cortiq route` · `explain` | which skill the router picks, and why |
+| `cortiq skill add` · `list` | bake a skill from a donor checkpoint ([guide](docs/SKILLS.md)); list a file's skills |
 
 `cortiq <command> --help` documents every flag.
 

@@ -1,0 +1,8 @@
+Write a SQL query that returns the top 10 customers by revenue.
+Given tables users(id, name) and orders(id, user_id, total), count orders per user.
+Write a query with a window function to rank products by sales within each category.
+How do I find duplicate emails in a users table?
+Write a CTE that computes monthly active users from an events table.
+Select employees hired in the last 90 days ordered by hire date.
+Write a LEFT JOIN that finds products that were never ordered.
+Aggregate daily revenue into a running total with a window function.

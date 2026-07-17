@@ -3,6 +3,7 @@
 mod convert;
 mod gguf;
 mod npy;
+mod skill;
 
 use clap::{Parser, Subcommand};
 use cortiq_core::CmfModel;
@@ -536,6 +537,12 @@ enum Commands {
         #[arg(long, default_value = "800")]
         tokens: usize,
     },
+    /// Swarm skills (spec §9): bake a skill from a real donor checkpoint,
+    /// list what a file carries
+    Skill {
+        #[command(subcommand)]
+        cmd: SkillCmd,
+    },
     /// Verify file integrity: envelope, sections, per-tensor hashes
     Verify {
         /// Path to .cmf model file
@@ -629,6 +636,58 @@ fn progress_reporter(what: &'static str) -> impl FnMut(f32) {
             println!();
         }
     }
+}
+
+
+#[derive(Subcommand)]
+enum SkillCmd {
+    /// Graft a skill from a donor HF checkpoint (same architecture):
+    /// replacement tensors + routing subspace + measured quality
+    Add {
+        /// Backbone .cmf to grow
+        model: String,
+        /// Donor: HF repo id (downloaded+cached) or a local safetensors dir
+        #[arg(long)]
+        from: String,
+        /// Skill id ([A-Za-z0-9_-])
+        #[arg(long)]
+        id: String,
+        /// Human-readable name for the registry
+        #[arg(long)]
+        name: Option<String>,
+        /// Layers to replace: `all`, `A-B`, or `i,j,k`
+        #[arg(long, default_value = "all")]
+        layers: String,
+        /// Tensor families: ffn | attn | all
+        #[arg(long, default_value = "ffn")]
+        tensors: String,
+        /// Example prompts (one per line) → recon-argmin routing subspace
+        #[arg(long)]
+        prompts: Option<String>,
+        /// φ layer for routing (default: 2/3 of depth)
+        #[arg(long)]
+        phi_layer: Option<usize>,
+        /// Routing subspace rank (clamped to prompts−1)
+        #[arg(long, default_value = "2")]
+        rank: usize,
+        /// Held-out text: measure backbone vs overlaid PPL, record in the registry
+        #[arg(long)]
+        quality: Option<String>,
+        /// Max tokens for the quality gate
+        #[arg(long, default_value = "1024")]
+        quality_tokens: usize,
+        /// Output path (default: rewrite the model in place)
+        #[arg(long)]
+        output: Option<String>,
+        /// Hugging Face token (gated/private donors)
+        #[arg(long)]
+        hf_token: Option<String>,
+    },
+    /// List a file's skills: tensors, size, layers, routing, quality
+    List {
+        /// Path to .cmf model file
+        model: String,
+    },
 }
 
 #[tokio::main]
@@ -785,6 +844,38 @@ async fn main() -> anyhow::Result<()> {
             let o1 = O1Flags { spec: o1, m: o1_m, w: o1_window, sink: o1_sink, rect: None };
             cmd_bench(&model, &task, tokens, ctx, &o1, json, core).await
         }
+        Commands::Skill { cmd } => match cmd {
+            SkillCmd::Add {
+                model,
+                from,
+                id,
+                name,
+                layers,
+                tensors,
+                prompts,
+                phi_layer,
+                rank,
+                quality,
+                quality_tokens,
+                output,
+                hf_token,
+            } => skill::run_skill_add(
+                &model,
+                &from,
+                &id,
+                name.as_deref(),
+                &layers,
+                skill::Families::parse(&tensors)?,
+                prompts.as_deref(),
+                phi_layer,
+                rank,
+                quality.as_deref(),
+                quality_tokens,
+                output.as_deref(),
+                hf_token.as_deref(),
+            ),
+            SkillCmd::List { model } => skill::run_skill_list(&model),
+        },
         Commands::Verify { model } => cmd_verify(&model).await,
         Commands::Fcd {
             model,

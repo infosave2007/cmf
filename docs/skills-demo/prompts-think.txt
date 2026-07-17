@@ -1,0 +1,8 @@
+Is 8191 a prime number? Verify carefully.
+Check whether this argument is logically valid: all cats are animals; some animals are black; therefore some cats are black.
+Prove that the sum of two odd numbers is always even.
+Verify: does 3 divide 111111? Show the check.
+A puzzle: I am thinking of a number; doubled plus 6 it equals 20. Reason it out step by step.
+Is the statement "every prime greater than 2 is odd" true? Justify.
+Two trains leave stations 300 km apart at 60 and 40 km/h toward each other. When do they meet? Think it through.
+Check this claim step by step: 0.999... equals 1.

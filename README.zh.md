@@ -184,6 +184,12 @@ cortiq run model.cmf --prompt "SELECT ..." --skill sql
 不想手动挑？`cortiq route` 会根据提示词选出技能，`cortiq explain` 会告诉你它为什么
 这么选。
 
+**三条命令即可上手**：[技能指南](docs/SKILLS.zh.md) 用 `cortiq skill add`
+把 Hugging Face 上三个公开微调烘焙成一个 0.5B 文件里的三个真实技能——
+text-to-SQL 助手、俄语助手（俄语散文 PPL 实测 −7.1%）和逐步验证器——
+然后把新鲜提示词 6/6 路由到正确的技能、软混合它们、并在流中切换。
+命令、测量与踩坑一应俱全。
+
 托管 *N* 个任务专家：
 
 | | N 个完整微调 | 基座 + N 个外部 LoRA | **CMF** |
@@ -223,6 +229,7 @@ cargo add cortiq-core                    # or use the format from your own Rust 
 | `cortiq fcd` | `--o1` 模型的修复训练器（以 KL 锚定，按生成结果把关） |
 | `cortiq diff a.cmf b.cmf` | 两个模型版本之间改了什么 |
 | `cortiq route` · `explain` | 路由器选了哪个技能，以及为什么 |
+| `cortiq skill add` · `list` | 从供体检查点烘焙技能（[指南](docs/SKILLS.zh.md)）；列出文件的技能 |
 
 `cortiq <command> --help` 里有每个参数的说明。
 

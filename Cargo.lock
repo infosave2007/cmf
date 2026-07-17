@@ -432,6 +432,7 @@ version = "0.3.4"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "clap",
  "cortiq-core",
  "cortiq-engine",

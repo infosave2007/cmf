@@ -44,7 +44,7 @@ fn f16_scale(raw: f32) -> f32 {
 /// `None` to skip it. Multimodal wrappers (Qwen3.5) nest the text model under
 /// `model.language_model.*`; vision (`*.visual.*`) and the MTP head (`mtp.*`) are
 /// dropped — plain greedy decoding is correct without MTP.
-fn canon_name(raw: &str) -> Option<String> {
+pub(crate) fn canon_name(raw: &str) -> Option<String> {
     if raw.contains(".visual.") || raw.starts_with("visual.") || raw.starts_with("mtp.") || raw.contains(".mtp.") {
         return None;
     }
@@ -390,7 +390,7 @@ pub(crate) fn encode_f16(vals: &[f32]) -> Vec<u8> {
 }
 
 /// Decode a safetensors dtype blob into f32 values.
-fn to_f32(dtype: &str, raw: &[u8]) -> anyhow::Result<Vec<f32>> {
+pub(crate) fn to_f32(dtype: &str, raw: &[u8]) -> anyhow::Result<Vec<f32>> {
     Ok(match dtype {
         "F32" => raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
         "F16" => raw.chunks_exact(2).map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]]))).collect(),
@@ -400,24 +400,24 @@ fn to_f32(dtype: &str, raw: &[u8]) -> anyhow::Result<Vec<f32>> {
 }
 
 /// A tensor's metadata within a safetensors file (bytes are read lazily from mmap).
-struct TensorMeta {
-    name: String,
-    dtype: String,
-    shape: Vec<usize>,
-    start: usize,
-    end: usize,
+pub(crate) struct TensorMeta {
+    pub(crate) name: String,
+    pub(crate) dtype: String,
+    pub(crate) shape: Vec<usize>,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 /// A memory-mapped safetensors file — tensor bytes are borrowed from the mmap, so
 /// the raw weights are never fully loaded into RAM (peak stays ~one tensor).
-struct SafeTensors {
+pub(crate) struct SafeTensors {
     mmap: memmap2::Mmap,
     data_start: usize,
-    tensors: Vec<TensorMeta>,
+    pub(crate) tensors: Vec<TensorMeta>,
 }
 
 impl SafeTensors {
-    fn bytes(&self, m: &TensorMeta) -> &[u8] {
+    pub(crate) fn bytes(&self, m: &TensorMeta) -> &[u8] {
         &self.mmap[self.data_start + m.start..self.data_start + m.end]
     }
 }
@@ -449,7 +449,7 @@ fn open_safetensors(path: &Path) -> anyhow::Result<SafeTensors> {
 }
 
 /// Memory-map a model dir's weights (single file or sharded index).
-fn open_model(dir: &Path) -> anyhow::Result<Vec<SafeTensors>> {
+pub(crate) fn open_model(dir: &Path) -> anyhow::Result<Vec<SafeTensors>> {
     let single = dir.join("model.safetensors");
     if single.exists() {
         return Ok(vec![open_safetensors(&single)?]);
@@ -788,7 +788,7 @@ fn repo_files(agent: &ureq::Agent, repo: &str, token: Option<&str>) -> Vec<Strin
 
 /// Fetch a HF repo's convertible files (config, tokenizer, weights) into the
 /// cache, with parallel chunked downloads for the weight shards.
-fn hf_download(repo: &str, token: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+pub(crate) fn hf_download(repo: &str, token: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
     let dir = hf_cache_dir(repo)?;
     let base = format!("https://huggingface.co/{repo}/resolve/main");
     let threads = hf_threads();
