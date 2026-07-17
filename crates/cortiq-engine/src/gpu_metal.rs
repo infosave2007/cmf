@@ -443,6 +443,17 @@ kernel void gqa_attend(
 // same Born-importance second pass accumulated atomically across every
 // query and head (matching the CPU chunk path's masked column sums).
 // The chunk's own K/V rows must already sit in the mirror.
+//
+// TWO MEASURED DEAD ENDS on M4 (kept away from):
+// - flash-TILED (8 queries sharing 16 KB staged K/V): pp512 1750→1680,
+//   pp2048 937→783 — a layer's K/V fits UMA L2, so per-query device
+//   reads were already cached and tiles only added barriers.
+// - split-K (8 simdgroups per query over row segments + flash-decoding
+//   combine): pp512 1800→1690, pp2048 949→825 — the softmax chain per
+//   query was NOT the wall either; the plain streaming loop with no
+//   barriers and no combine is simply the fastest form here.
+// The pp2048 depth wall therefore stands (deep chunks fall back to the
+// CPU GEMM-attend via the pos0 bound in the pipeline).
 kernel void chunk_attend(
     device const float* q    [[buffer(0)]],   // [nb, nh, hd] post-rope
     device const float* kbuf [[buffer(1)]],
@@ -1443,150 +1454,179 @@ pub struct ChunkLayer<'a> {
     pub eps: f32,
 }
 
-/// Run one prefill layer for the whole chunk in a single submission:
-/// norm → QKV GEMMs → bias+qk-norm+RoPE with fused mirror append →
-/// causal chunk attend (+Born importance) → O GEMM → residual → norm →
-/// gate/up GEMMs → silu·mul → down GEMM → residual. One wait; the
-/// chunk's K/V rows and the importance masses come back for the CPU
-/// cache (owner of record). Returns false (nothing encoded) on any
-/// eligibility miss — the caller keeps the CPU path.
-#[allow(clippy::too_many_arguments)]
-pub fn chunk_layer_gpu(
-    l: &ChunkLayer,
+/// Run a RUN of consecutive prefill layers for the whole chunk in a
+/// single submission: per layer — norm → QKV GEMMs → bias+qk-norm+RoPE
+/// with fused mirror append → causal chunk attend (+Born importance) →
+/// O GEMM → residual → norm → gate/up GEMMs → silu·mul → down GEMM →
+/// residual. The hidden buffer stays device-resident across the whole
+/// run; ONE wait at the end, then every layer's chunk K/V rows and
+/// importance masses come back for the CPU caches (owners of record).
+/// Validation is all-before-encoding; a layer that fails during mirror
+/// prep leaves at most an advanced `stored` counter behind, which the
+/// self-healing resync repairs on the next touch. Returns false with
+/// nothing encoded if ANY layer of the run is ineligible — the caller
+/// decides run boundaries.
+pub struct ChunkIo<'a> {
+    pub cpu_stored: usize,
+    pub cpu_k: Vec<&'a [f32]>,
+    pub cpu_v: Vec<&'a [f32]>,
+    pub out_k: &'a mut [f32],
+    pub out_v: &'a mut [f32],
+    pub imp: &'a mut [f32],
+}
+
+struct ChunkPrep {
+    abs: [usize; 7],
+    rs: [Buffer; 7],
+    k_mb: Buffer,
+    v_mb: Buffer,
+    imp_mb: Buffer,
+    cap: usize,
+    st0: usize,
+}
+
+pub fn chunk_run_gpu(
+    layers: &[ChunkLayer],
+    io: &mut [ChunkIo],
     h: &mut [f32],
     b: usize,
     pos0: usize,
-    cpu_stored: usize,
-    cpu_k: &[&[f32]],
-    cpu_v: &[&[f32]],
-    out_k: &mut [f32],
-    out_v: &mut [f32],
-    imp_out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
-    let (nh, nkv, hd, hs, inter) = (l.nh, l.nkv, l.hd, l.hs, l.inter);
+    let Some(first) = layers.first() else { return false };
+    if layers.len() != io.len() {
+        return false;
+    }
+    let (nh, nkv, hd, hs, inter) = (first.nh, first.nkv, first.hd, first.hs, first.inter);
     if b < 32
         || hd % 4 != 0
         || hd > 128
-        || l.rd < 2
-        || l.rd > hd
-        || (l.rd / 2) % 32 != 0
+        || first.rd < 2
+        || first.rd > hd
+        || (first.rd / 2) % 32 != 0
         || nh % nkv.max(1) != 0
         || hs % 4 != 0
         || inter % 4 != 0
-        || l.inv_freq.len() < l.rd / 2
         || h.len() < b * hs
-        || out_k.len() < b * nkv * hd
-        || out_v.len() < b * nkv * hd
-        || imp_out.len() < cpu_stored + b
     {
         return false;
     }
-    // Weight residency: every projection must resolve in the primary
-    // no-copy mapping.
-    let bytes = l.model.primary_bytes();
+    let bytes = first.model.primary_bytes();
     let Some((fbuf, safe_len)) = file_buffer(c, bytes) else { return false };
-    let abs_of = |t: &(usize, usize, usize, &[f32])| -> Option<usize> {
-        let entry = l.model.tensors.get(t.0)?;
-        let abs = l.model.entry_abs_offset(entry)?;
-        (abs + t.1 * t.2 <= safe_len).then_some(abs)
-    };
-    let (Some(aq), Some(ak), Some(av), Some(ao), Some(ag), Some(au), Some(ad)) = (
-        abs_of(&l.wq),
-        abs_of(&l.wk),
-        abs_of(&l.wv),
-        abs_of(&l.wo),
-        abs_of(&l.gate),
-        abs_of(&l.up),
-        abs_of(&l.down),
-    ) else {
-        return false;
-    };
-    // Shape contract with the kernels below.
-    if l.wq.1 != nh * hd
-        || l.wk.1 != nkv * hd
-        || l.wv.1 != nkv * hd
-        || l.wo.1 != hs
-        || l.wo.2 != nh * hd
-        || l.gate.1 != inter
-        || l.up.1 != inter
-        || l.down.1 != hs
-        || l.down.2 != inter
-    {
-        return false;
-    }
     let base = bytes.as_ptr() as usize;
-    let rs_of = |t: &(usize, usize, usize, &[f32])| -> Buffer {
-        let mut cache = c.rs_bufs.lock().unwrap();
-        cache
-            .entry((base, t.0))
-            .or_insert_with(|| {
-                crate::gpu::probe_note_cold();
-                c._device.new_buffer_with_data(
-                    t.3.as_ptr() as *const std::ffi::c_void,
-                    (t.3.len() * 4) as u64,
-                    MTLResourceOptions::StorageModeShared,
-                )
-            })
-            .clone()
-    };
-    let (rq, rk, rv, ro, rg, ru, rdn) = (
-        rs_of(&l.wq),
-        rs_of(&l.wk),
-        rs_of(&l.wv),
-        rs_of(&l.wo),
-        rs_of(&l.gate),
-        rs_of(&l.up),
-        rs_of(&l.down),
-    );
 
-    // ── KV mirror prep (same self-healing contract as the decode graph),
-    // reserving b new rows for the chunk.
-    let (k_mb, v_mb, imp_mb, cap, st0) = {
-        let mut reg = c.kv_mirrors.lock().unwrap();
-        let need = cpu_stored + b;
-        let entry = reg.entry((l.kv_id, l.layer)).or_insert_with(|| KvMirror {
-            k: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
-            v: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
-            imp: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
-            cap: 0,
-            stored: usize::MAX,
-        });
-        if entry.cap < need {
-            let cap = need.next_power_of_two().max(1024);
-            let nb = (nkv * cap * hd * 4) as u64;
-            entry.k = c._device.new_buffer(nb, MTLResourceOptions::StorageModeShared);
-            entry.v = c._device.new_buffer(nb, MTLResourceOptions::StorageModeShared);
-            entry.imp = c._device.new_buffer((cap * 4) as u64, MTLResourceOptions::StorageModeShared);
-            entry.cap = cap;
-            entry.stored = usize::MAX;
+    // ── Phase 1: validate every layer and build its prep (weights
+    // resident, shapes uniform, mirror ready).
+    let mut preps: Vec<ChunkPrep> = Vec::with_capacity(layers.len());
+    for (l, lio) in layers.iter().zip(io.iter()) {
+        if l.nh != nh || l.nkv != nkv || l.hd != hd || l.hs != hs || l.inter != inter {
+            return false;
         }
-        if entry.stored != cpu_stored {
-            if cpu_k.len() != nkv || cpu_v.len() != nkv {
-                return false;
+        let abs_of = |t: &(usize, usize, usize, &[f32])| -> Option<usize> {
+            let entry = l.model.tensors.get(t.0)?;
+            let abs = l.model.entry_abs_offset(entry)?;
+            (abs + t.1 * t.2 <= safe_len).then_some(abs)
+        };
+        let tens = [&l.wq, &l.wk, &l.wv, &l.wo, &l.gate, &l.up, &l.down];
+        let mut abs = [0usize; 7];
+        for (slot, t) in abs.iter_mut().zip(tens) {
+            match abs_of(t) {
+                Some(a) => *slot = a,
+                None => return false,
             }
-            for hh in 0..nkv {
-                if cpu_k[hh].len() != cpu_stored * hd || cpu_v[hh].len() != cpu_stored * hd {
+        }
+        if l.wq.1 != nh * hd
+            || l.wk.1 != nkv * hd
+            || l.wv.1 != nkv * hd
+            || l.wo.1 != hs
+            || l.wo.2 != nh * hd
+            || l.gate.1 != inter
+            || l.up.1 != inter
+            || l.down.1 != hs
+            || l.down.2 != inter
+            || l.inv_freq.len() < l.rd / 2
+            || lio.out_k.len() < b * nkv * hd
+            || lio.out_v.len() < b * nkv * hd
+            || lio.imp.len() < lio.cpu_stored + b
+        {
+            return false;
+        }
+        let rs_of = |t: &(usize, usize, usize, &[f32])| -> Buffer {
+            let mut cache = c.rs_bufs.lock().unwrap();
+            cache
+                .entry((base, t.0))
+                .or_insert_with(|| {
+                    crate::gpu::probe_note_cold();
+                    c._device.new_buffer_with_data(
+                        t.3.as_ptr() as *const std::ffi::c_void,
+                        (t.3.len() * 4) as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                })
+                .clone()
+        };
+        let rs = [
+            rs_of(&l.wq),
+            rs_of(&l.wk),
+            rs_of(&l.wv),
+            rs_of(&l.wo),
+            rs_of(&l.gate),
+            rs_of(&l.up),
+            rs_of(&l.down),
+        ];
+        // KV mirror prep (self-healing contract of the decode graph),
+        // reserving b rows for the chunk.
+        let (k_mb, v_mb, imp_mb, cap, st0) = {
+            let mut reg = c.kv_mirrors.lock().unwrap();
+            let need = lio.cpu_stored + b;
+            let entry = reg.entry((l.kv_id, l.layer)).or_insert_with(|| KvMirror {
+                k: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
+                v: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
+                imp: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
+                cap: 0,
+                stored: usize::MAX,
+            });
+            if entry.cap < need {
+                let cap = need.next_power_of_two().max(1024);
+                let nb = (nkv * cap * hd * 4) as u64;
+                entry.k = c._device.new_buffer(nb, MTLResourceOptions::StorageModeShared);
+                entry.v = c._device.new_buffer(nb, MTLResourceOptions::StorageModeShared);
+                entry.imp =
+                    c._device.new_buffer((cap * 4) as u64, MTLResourceOptions::StorageModeShared);
+                entry.cap = cap;
+                entry.stored = usize::MAX;
+            }
+            if entry.stored != lio.cpu_stored {
+                if lio.cpu_k.len() != nkv || lio.cpu_v.len() != nkv {
                     return false;
                 }
-                unsafe {
-                    let kd = (entry.k.contents() as *mut f32).add(hh * entry.cap * hd);
-                    std::ptr::copy_nonoverlapping(cpu_k[hh].as_ptr(), kd, cpu_k[hh].len());
-                    let vd = (entry.v.contents() as *mut f32).add(hh * entry.cap * hd);
-                    std::ptr::copy_nonoverlapping(cpu_v[hh].as_ptr(), vd, cpu_v[hh].len());
+                for hh in 0..nkv {
+                    if lio.cpu_k[hh].len() != lio.cpu_stored * hd
+                        || lio.cpu_v[hh].len() != lio.cpu_stored * hd
+                    {
+                        return false;
+                    }
+                    unsafe {
+                        let kd = (entry.k.contents() as *mut f32).add(hh * entry.cap * hd);
+                        std::ptr::copy_nonoverlapping(lio.cpu_k[hh].as_ptr(), kd, lio.cpu_k[hh].len());
+                        let vd = (entry.v.contents() as *mut f32).add(hh * entry.cap * hd);
+                        std::ptr::copy_nonoverlapping(lio.cpu_v[hh].as_ptr(), vd, lio.cpu_v[hh].len());
+                    }
                 }
+                entry.stored = lio.cpu_stored;
             }
-            entry.stored = cpu_stored;
-        }
-        unsafe {
-            std::ptr::write_bytes(entry.imp.contents() as *mut u8, 0, need * 4);
-        }
-        let out = (entry.k.clone(), entry.v.clone(), entry.imp.clone(), entry.cap, entry.stored);
-        entry.stored += b;
-        out
-    };
+            unsafe {
+                std::ptr::write_bytes(entry.imp.contents() as *mut u8, 0, need * 4);
+            }
+            let out = (entry.k.clone(), entry.v.clone(), entry.imp.clone(), entry.cap, entry.stored);
+            entry.stored += b;
+            out
+        };
+        preps.push(ChunkPrep { abs, rs, k_mb, v_mb, imp_mb, cap, st0 });
+    }
 
-    // ── device buffers (pooled by size)
+    // ── Shared per-run buffers (pooled by size, reused across layers —
+    // encoder ordering within one command buffer serializes access).
     let h_b = io_buf(c, 60_000_000_071 + b * hs, b * hs * 4);
     let n_b = io_buf(c, 61_000_000_091 + b * hs, b * hs * 4);
     let qraw = io_buf(c, 62_000_000_017 + b * nh * hd, b * nh * hd * 4);
@@ -1602,158 +1642,160 @@ pub fn chunk_layer_gpu(
     unsafe {
         std::ptr::copy_nonoverlapping(h.as_ptr(), h_b.contents() as *mut f32, b * hs);
     }
-    let inorm = const_buf(c, l.input_norm);
-    let pnorm = const_buf(c, l.post_norm);
-    let invf = const_buf(c, &l.inv_freq[..l.rd / 2]);
-    let (bqb, bkb, bvb, has_bias) = match l.bias {
-        Some((bq, bk, bv)) => (const_buf(c, bq), const_buf(c, bk), const_buf(c, bv), true),
-        None => (invf.clone(), invf.clone(), invf.clone(), false),
-    };
-    let qn_b = l.q_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| invf.clone());
-    let kn_b = l.k_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| invf.clone());
 
     let cmd = c.queue.new_command_buffer();
-    let rows_norm = |src: &Buffer, w: &Buffer, dst: &Buffer| {
-        let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&c.rmsrows);
-        enc.set_buffer(0, Some(src), 0);
-        enc.set_buffer(1, Some(w), 0);
-        enc.set_buffer(2, Some(dst), 0);
-        let n_u = hs as u32;
-        let g_u = l.gemma as u32;
-        enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(4, 4, &g_u as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(5, 4, &l.eps as *const f32 as *const std::ffi::c_void);
-        enc.dispatch_thread_groups(MTLSize::new(b as u64, 1, 1), MTLSize::new(256, 1, 1));
-        enc.end_encoding();
-    };
-    let axpy1 = |src: &Buffer, dst: &Buffer, n: usize| {
-        let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&c.axpy);
-        enc.set_buffer(0, Some(src), 0);
-        enc.set_buffer(1, Some(dst), 0);
-        let w1 = 1.0f32;
-        let n_u = n as u32;
-        enc.set_bytes(2, 4, &w1 as *const f32 as *const std::ffi::c_void);
-        enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
-        enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
-        enc.end_encoding();
-    };
+    for (l, prep) in layers.iter().zip(&preps) {
+        let inorm = const_buf(c, l.input_norm);
+        let pnorm = const_buf(c, l.post_norm);
+        let invf = const_buf(c, &l.inv_freq[..l.rd / 2]);
+        let (bqb, bkb, bvb, has_bias) = match l.bias {
+            Some((bq, bk, bv)) => (const_buf(c, bq), const_buf(c, bk), const_buf(c, bv), true),
+            None => (invf.clone(), invf.clone(), invf.clone(), false),
+        };
+        let qn_b = l.q_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| invf.clone());
+        let kn_b = l.k_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| invf.clone());
+        let rows_norm = |src: &Buffer, w: &Buffer, dst: &Buffer| {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.rmsrows);
+            enc.set_buffer(0, Some(src), 0);
+            enc.set_buffer(1, Some(w), 0);
+            enc.set_buffer(2, Some(dst), 0);
+            let n_u = hs as u32;
+            let g_u = l.gemma as u32;
+            enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &g_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &l.eps as *const f32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(MTLSize::new(b as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.end_encoding();
+        };
+        let axpy1 = |src: &Buffer, dst: &Buffer, n: usize| {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.axpy);
+            enc.set_buffer(0, Some(src), 0);
+            enc.set_buffer(1, Some(dst), 0);
+            let w1 = 1.0f32;
+            let n_u = n as u32;
+            enc.set_bytes(2, 4, &w1 as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.end_encoding();
+        };
 
-    // 1. attn norm
-    rows_norm(&h_b, &inorm, &n_b);
-    // 2. QKV GEMMs
-    encode_mul_mm(c, cmd, &fbuf, aq, &rq, &n_b, &qraw, b, l.wq.1, l.wq.2);
-    encode_mul_mm(c, cmd, &fbuf, ak, &rk, &n_b, &kraw, b, l.wk.1, l.wk.2);
-    encode_mul_mm(c, cmd, &fbuf, av, &rv, &n_b, &vraw, b, l.wv.1, l.wv.2);
-    // 3. bias + qk-norm + RoPE, K/V into the mirror
-    {
-        let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&c.cropekv);
-        for (i, buf) in [
-            &qraw, &kraw, &vraw, &qrope, &k_mb, &v_mb, &bqb, &bkb, &bvb, &qn_b, &kn_b, &invf,
-        ]
-        .iter()
-        .enumerate()
+        rows_norm(&h_b, &inorm, &n_b);
+        encode_mul_mm(c, cmd, &fbuf, prep.abs[0], &prep.rs[0], &n_b, &qraw, b, l.wq.1, l.wq.2);
+        encode_mul_mm(c, cmd, &fbuf, prep.abs[1], &prep.rs[1], &n_b, &kraw, b, l.wk.1, l.wk.2);
+        encode_mul_mm(c, cmd, &fbuf, prep.abs[2], &prep.rs[2], &n_b, &vraw, b, l.wv.1, l.wv.2);
         {
-            enc.set_buffer(i as u64, Some(buf), 0);
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.cropekv);
+            for (i, buf) in [
+                &qraw, &kraw, &vraw, &qrope, &prep.k_mb, &prep.v_mb, &bqb, &bkb, &bvb, &qn_b,
+                &kn_b, &invf,
+            ]
+            .iter()
+            .enumerate()
+            {
+                enc.set_buffer(i as u64, Some(buf), 0);
+            }
+            let flags = ((l.q_norm.is_some() as u32) << 1)
+                | ((l.k_norm.is_some() as u32) << 2)
+                | ((l.gemma as u32) << 3)
+                | ((has_bias as u32) << 4);
+            let words = [
+                nh as u32,
+                nkv as u32,
+                hd as u32,
+                l.rd as u32,
+                pos0 as u32,
+                prep.st0 as u32,
+                prep.cap as u32,
+                flags,
+            ];
+            for (i, w) in words.iter().enumerate() {
+                enc.set_bytes(12 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+            }
+            enc.set_bytes(20, 4, &l.eps as *const f32 as *const std::ffi::c_void);
+            let nb_u = b as u32;
+            enc.set_bytes(21, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+            let sgs = 8u64;
+            enc.dispatch_thread_groups(
+                MTLSize::new(((nh + 2 * nkv) as u64).div_ceil(sgs), b as u64, 1),
+                MTLSize::new(sgs * 32, 1, 1),
+            );
+            enc.end_encoding();
         }
-        let flags = ((l.q_norm.is_some() as u32) << 1)
-            | ((l.k_norm.is_some() as u32) << 2)
-            | ((l.gemma as u32) << 3)
-            | ((has_bias as u32) << 4);
-        let words = [
-            nh as u32,
-            nkv as u32,
-            hd as u32,
-            l.rd as u32,
-            pos0 as u32,
-            st0 as u32,
-            cap as u32,
-            flags,
-        ];
-        for (i, w) in words.iter().enumerate() {
-            enc.set_bytes(12 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.cattend);
+            for (i, buf) in [&qrope, &prep.k_mb, &prep.v_mb, &attn, &prep.imp_mb].iter().enumerate()
+            {
+                enc.set_buffer(i as u64, Some(buf), 0);
+            }
+            let words = [
+                nh as u32,
+                (nh / nkv.max(1)) as u32,
+                hd as u32,
+                prep.cap as u32,
+                prep.st0 as u32,
+                b as u32,
+            ];
+            for (i, w) in words.iter().enumerate() {
+                enc.set_bytes(5 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+            }
+            let sgs = 8u64;
+            enc.dispatch_thread_groups(
+                MTLSize::new((nh as u64).div_ceil(sgs), b as u64, 1),
+                MTLSize::new(sgs * 32, 1, 1),
+            );
+            enc.end_encoding();
         }
-        enc.set_bytes(20, 4, &l.eps as *const f32 as *const std::ffi::c_void);
-        let nb_u = b as u32;
-        enc.set_bytes(21, 4, &nb_u as *const u32 as *const std::ffi::c_void);
-        let sgs = 8u64;
-        enc.dispatch_thread_groups(
-            MTLSize::new(((nh + 2 * nkv) as u64).div_ceil(sgs), b as u64, 1),
-            MTLSize::new(sgs * 32, 1, 1),
-        );
-        enc.end_encoding();
+        encode_mul_mm(c, cmd, &fbuf, prep.abs[3], &prep.rs[3], &attn, &ob, b, l.wo.1, l.wo.2);
+        axpy1(&ob, &h_b, b * hs);
+        rows_norm(&h_b, &pnorm, &n_b);
+        encode_mul_mm(c, cmd, &fbuf, prep.abs[4], &prep.rs[4], &n_b, &gb, b, l.gate.1, l.gate.2);
+        encode_mul_mm(c, cmd, &fbuf, prep.abs[5], &prep.rs[5], &n_b, &ub, b, l.up.1, l.up.2);
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.silu);
+            for (i, buf) in [&gb, &ub, &gb, &act].iter().enumerate() {
+                enc.set_buffer(i as u64, Some(buf), 0);
+            }
+            let n_u = (b * inter) as u32;
+            let hc = 0u32;
+            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new((b * inter) as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.end_encoding();
+        }
+        encode_mul_mm(c, cmd, &fbuf, prep.abs[6], &prep.rs[6], &act, &db, b, l.down.1, l.down.2);
+        axpy1(&db, &h_b, b * hs);
     }
-    // 4. causal chunk attend
-    {
-        let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&c.cattend);
-        for (i, buf) in [&qrope, &k_mb, &v_mb, &attn, &imp_mb].iter().enumerate() {
-            enc.set_buffer(i as u64, Some(buf), 0);
-        }
-        let words = [
-            nh as u32,
-            (nh / nkv.max(1)) as u32,
-            hd as u32,
-            cap as u32,
-            st0 as u32,
-            b as u32,
-        ];
-        for (i, w) in words.iter().enumerate() {
-            enc.set_bytes(5 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
-        }
-        let sgs = 8u64;
-        enc.dispatch_thread_groups(
-            MTLSize::new((nh as u64).div_ceil(sgs), b as u64, 1),
-            MTLSize::new(sgs * 32, 1, 1),
-        );
-        enc.end_encoding();
-    }
-    // 5. O + residual
-    encode_mul_mm(c, cmd, &fbuf, ao, &ro, &attn, &ob, b, l.wo.1, l.wo.2);
-    axpy1(&ob, &h_b, b * hs);
-    // 6. FFN
-    rows_norm(&h_b, &pnorm, &n_b);
-    encode_mul_mm(c, cmd, &fbuf, ag, &rg, &n_b, &gb, b, l.gate.1, l.gate.2);
-    encode_mul_mm(c, cmd, &fbuf, au, &ru, &n_b, &ub, b, l.up.1, l.up.2);
-    {
-        let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&c.silu);
-        for (i, buf) in [&gb, &ub, &gb, &act].iter().enumerate() {
-            enc.set_buffer(i as u64, Some(buf), 0);
-        }
-        let n_u = (b * inter) as u32;
-        let hc = 0u32;
-        enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
-        enc.dispatch_threads(MTLSize::new((b * inter) as u64, 1, 1), MTLSize::new(256, 1, 1));
-        enc.end_encoding();
-    }
-    encode_mul_mm(c, cmd, &fbuf, ad, &rdn, &act, &db, b, l.down.1, l.down.2);
-    axpy1(&db, &h_b, b * hs);
 
     submit_and_wait(c, cmd, &[&h_b]);
 
-    // ── readback: hidden, the chunk's K/V rows, importance masses.
+    // ── readback: hidden once, K/V rows + importance per layer.
     unsafe {
         std::ptr::copy_nonoverlapping(h_b.contents() as *const f32, h.as_mut_ptr(), b * hs);
-        let kc = k_mb.contents() as *const f32;
-        let vc = v_mb.contents() as *const f32;
-        for hh in 0..nkv {
-            for bi in 0..b {
-                let srck = kc.add((hh * cap + st0 + bi) * hd);
-                let srcv = vc.add((hh * cap + st0 + bi) * hd);
-                let dst = (bi * nkv + hh) * hd;
-                std::ptr::copy_nonoverlapping(srck, out_k.as_mut_ptr().add(dst), hd);
-                std::ptr::copy_nonoverlapping(srcv, out_v.as_mut_ptr().add(dst), hd);
+    }
+    for (prep, lio) in preps.iter().zip(io.iter_mut()) {
+        unsafe {
+            let kc = prep.k_mb.contents() as *const f32;
+            let vc = prep.v_mb.contents() as *const f32;
+            for hh in 0..nkv {
+                for bi in 0..b {
+                    let srck = kc.add((hh * prep.cap + prep.st0 + bi) * hd);
+                    let srcv = vc.add((hh * prep.cap + prep.st0 + bi) * hd);
+                    let dst = (bi * nkv + hh) * hd;
+                    std::ptr::copy_nonoverlapping(srck, lio.out_k.as_mut_ptr().add(dst), hd);
+                    std::ptr::copy_nonoverlapping(srcv, lio.out_v.as_mut_ptr().add(dst), hd);
+                }
             }
+            std::ptr::copy_nonoverlapping(
+                prep.imp_mb.contents() as *const f32,
+                lio.imp.as_mut_ptr(),
+                lio.cpu_stored + b,
+            );
         }
-        std::ptr::copy_nonoverlapping(
-            imp_mb.contents() as *const f32,
-            imp_out.as_mut_ptr(),
-            cpu_stored + b,
-        );
     }
     true
 }
