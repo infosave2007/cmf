@@ -80,6 +80,85 @@ kernel void q8_matmat(
     if (lane == 0) y[(ulong)bi * rows + row] = acc * rs[row];
 }
 
+// True GEMM tile kernel for the prefill batch (roadmap: llama.cpp Metal
+// pp512 class): C[b,rows] = X·Wᵀ with W q8. A 64×64 C-tile per
+// threadgroup — 256 threads, 8 simdgroups, each owning a 64×8 strip as
+// 8 simdgroup_float8x8 accumulators. Operand tiles stage through
+// threadgroup memory with vectorized loads (float4 X, char4 W); W bytes
+// convert i8→half at tile load (exact: |w| ≤ 127), X rides as half
+// (mul_mm precision class), the per-row q8 scale lands at the epilogue.
+// Measured variants on M4 (4864×896, b=512): BK=32 loses to BK=16
+// (barrier cost < occupancy loss), double-buffered tiles lose (24KB
+// threadgroup halves residency), device-direct A fragments lose (16B of
+// every 128B line), device-direct C stores lose (strided writes) — this
+// shape is the measured optimum of the family, ~1.5 TFLOP/s effective
+// vs AMX's 1.6 on the same shape (min-of, interleaved), so per-op the
+// probe keeps M4 prefill on the CPU; weaker-CPU/wider-GPU Metal parts
+// get a real win. Padded tile strides also lose (+4 halfs: 1290 vs
+// 1496 — no bank-conflict win on Apple's simdgroup_load). The llama.cpp
+// Metal pp512=3339 class needs the whole prefill chunk resident on the
+// GPU (GEMM + attend + norms, one submit per chunk) — that is the next
+// milestone, not more per-op kernel tuning.
+kernel void q8_mul_mm(
+    device const char4*  q     [[buffer(0)]],
+    device const float4* xs    [[buffer(1)]],
+    device const float*  rs    [[buffer(2)]],
+    device float*        y     [[buffer(3)]],
+    constant uint&       cols  [[buffer(4)]],
+    constant uint&       rows  [[buffer(5)]],
+    constant uint&       nb    [[buffer(6)]],
+    uint tidx [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint2 tg  [[threadgroup_position_in_grid]])
+{
+    const uint BM = 64, BN = 64, BK = 16;
+    threadgroup half at[BM * BK];
+    threadgroup half wt[BN * BK];
+    threadgroup float cst[BM * BN];
+    uint m0 = tg.y * BM;
+    uint n0 = tg.x * BN;
+    uint cols4 = cols / 4;
+    simdgroup_float8x8 acc[8];
+    for (uint mi = 0; mi < 8; ++mi)
+        acc[mi] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    threadgroup half4* at4 = (threadgroup half4*)at;
+    threadgroup half4* wt4 = (threadgroup half4*)wt;
+    for (uint k0 = 0; k0 < cols; k0 += BK) {
+        uint k04 = k0 / 4;
+        for (uint i = tidx; i < BM * BK / 4; i += 256) {
+            uint m = i / (BK / 4), k4 = i % (BK / 4);
+            float4 v = (m0 + m < nb && k04 + k4 < cols4)
+                ? xs[(ulong)(m0 + m) * cols4 + k04 + k4] : float4(0.0f);
+            at4[m * (BK / 4) + k4] = half4(v);
+        }
+        for (uint i = tidx; i < BN * BK / 4; i += 256) {
+            uint n = i / (BK / 4), k4 = i % (BK / 4);
+            char4 wv = (n0 + n < rows && k04 + k4 < cols4)
+                ? q[(ulong)(n0 + n) * cols4 + k04 + k4] : char4(0);
+            wt4[n * (BK / 4) + k4] = half4(wv);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kk = 0; kk < BK; kk += 8) {
+            simdgroup_half8x8 wfrag;
+            simdgroup_load(wfrag, wt + sg * 8u * BK + kk, BK, ulong2(0, 0), true);
+            for (uint mi = 0; mi < 8; ++mi) {
+                simdgroup_half8x8 afrag;
+                simdgroup_load(afrag, at + mi * 8u * BK + kk, BK);
+                simdgroup_multiply_accumulate(acc[mi], afrag, wfrag, acc[mi]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint mi = 0; mi < 8; ++mi)
+        simdgroup_store(acc[mi], cst + mi * 8u * BN + sg * 8u, BN);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tidx; i < BM * BN; i += 256) {
+        uint m = i / BN, n = i % BN;
+        if (m0 + m < nb && n0 + n < rows)
+            y[(ulong)(m0 + m) * rows + n0 + n] = cst[i] * rs[n0 + n];
+    }
+}
+
 // q1: 6-byte tiles [f16 scale][4B sign bits] per 32-group; w = s*(2b-1).
 // One SIMD group per FOUR rows, tiles of a pair processed one at a
 // time: each activation float4 a lane loads is used against four rows'
@@ -603,6 +682,7 @@ struct Ctx {
     queue: CommandQueue,
     q8: ComputePipelineState,
     q8mm: ComputePipelineState,
+    q8mmm: ComputePipelineState,
     q1: ComputePipelineState,
     flag: ComputePipelineState,
     rmsn: ComputePipelineState,
@@ -688,6 +768,7 @@ fn init() -> Result<Ctx, String> {
     };
     let q8 = pso("q8_matvec")?;
     let q8mm = pso("q8_matmat")?;
+    let q8mmm = pso("q8_mul_mm")?;
     let q1 = pso("q1_matvec")?;
     let flag = pso("write_flag")?;
     let rmsn = pso("rmsnorm_k")?;
@@ -712,6 +793,7 @@ fn init() -> Result<Ctx, String> {
         queue,
         q8,
         q8mm,
+        q8mmm,
         q1,
         flag,
         rmsn,
@@ -1063,6 +1145,36 @@ fn encode_q1_matvec(
 /// GEMM prefill batch: pre — prescaled inputs row-major [b, cols],
 /// out — row-major [b, rows]. false = CPU path.
 #[allow(clippy::too_many_arguments)]
+/// f32 → f16 bulk convert into a raw destination (the mul_mm X upload).
+/// NEON vcvt on aarch64; scalar bit-twiddle elsewhere.
+fn f32_to_f16_into(src: &[f32], dst: *mut u16) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        let n = src.len();
+        let sp = src.as_ptr();
+        let mut i = 0usize;
+        while i + 4 <= n {
+            let v = vld1q_f32(sp.add(i));
+            let h = vcvt_f16_f32(v);
+            core::ptr::write_unaligned(dst.add(i) as *mut u64, core::mem::transmute::<
+                float16x4_t,
+                u64,
+            >(h));
+            i += 4;
+        }
+        while i < n {
+            *dst.add(i) = cortiq_core::quant::f32_to_f16(*sp.add(i));
+            i += 1;
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    for (i, &v) in src.iter().enumerate() {
+        unsafe { *dst.add(i) = cortiq_core::quant::f32_to_f16(v) };
+    }
+}
+
 pub fn q8_matmat(
     model: &Arc<CmfModel>,
     idx: usize,
@@ -1110,6 +1222,7 @@ pub fn q8_matmat(
             })
             .clone()
     };
+    let use_mm = b >= 32;
     let xs_buf = get_io(11_000_000_453 + pre.len(), pre.len() * 4);
     unsafe {
         std::ptr::copy_nonoverlapping(pre.as_ptr(), xs_buf.contents() as *mut f32, pre.len());
@@ -1118,22 +1231,31 @@ pub fn q8_matmat(
 
     let cmd = c.queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&c.q8mm);
+    // Batches wide enough to fill a C-tile take the simdgroup GEMM;
+    // narrow ones keep the row-streaming matvec-style kernel.
+    enc.set_compute_pipeline_state(if use_mm { &c.q8mmm } else { &c.q8mm });
     enc.set_buffer(0, Some(&fbuf), abs as u64);
     enc.set_buffer(1, Some(&xs_buf), 0);
     enc.set_buffer(2, Some(&rs_buf), 0);
     enc.set_buffer(3, Some(&y_buf), 0);
-    let cols4 = (cols / 4) as u32;
     let rows_u = rows as u32;
     let b_u = b as u32;
-    enc.set_bytes(4, 4, &cols4 as *const u32 as *const std::ffi::c_void);
+    let k_arg = if use_mm { cols as u32 } else { (cols / 4) as u32 };
+    enc.set_bytes(4, 4, &k_arg as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(5, 4, &rows_u as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(6, 4, &b_u as *const u32 as *const std::ffi::c_void);
-    let sgs = 8u64;
-    enc.dispatch_thread_groups(
-        MTLSize::new((rows as u64).div_ceil(sgs), b as u64, 1),
-        MTLSize::new(sgs * 32, 1, 1),
-    );
+    if use_mm {
+        enc.dispatch_thread_groups(
+            MTLSize::new((rows as u64).div_ceil(64), (b as u64).div_ceil(64), 1),
+            MTLSize::new(256, 1, 1),
+        );
+    } else {
+        let sgs = 8u64;
+        enc.dispatch_thread_groups(
+            MTLSize::new((rows as u64).div_ceil(sgs), b as u64, 1),
+            MTLSize::new(sgs * 32, 1, 1),
+        );
+    }
     enc.end_encoding();
     submit_and_wait(c, cmd, &[&y_buf]);
 

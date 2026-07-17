@@ -133,6 +133,108 @@ fn q8_gpu_micro() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// GEMM prefill micro: the simdgroup mul_mm against the CPU AMX path on
+/// the 0.5B FFN shape (4864×896, b=512) — the shape that dominates
+/// pp512. Prints ms/op and effective GFLOP/s for both, asserts parity.
+#[cfg(target_os = "macos")]
+#[test]
+fn q8_mul_mm_micro() {
+    unsafe { std::env::set_var("CMF_GPU", "1") };
+    use cortiq_core::quant::f32_to_f16;
+    use cortiq_core::*;
+    let (rows, cols, b) = (4864usize, 896usize, 512usize);
+    let mut payload = vec![0u8; rows * cols + rows * 2];
+    for (i, byte) in payload[..rows * cols].iter_mut().enumerate() {
+        *byte = ((i * 37 + 11) % 251) as u8;
+    }
+    for r in 0..rows {
+        let sc = f32_to_f16(0.01).to_le_bytes();
+        payload[rows * cols + r * 2..rows * cols + r * 2 + 2].copy_from_slice(&sc);
+    }
+    let arch = ModelArch {
+        arch_name: "tiny".into(), hidden_size: cols, intermediate_size: cols * 2,
+        num_layers: 1, num_attention_heads: 2, num_kv_heads: 1, head_dim: 4,
+        vocab_size: rows, layer_types: vec![LayerType::FullAttention],
+        rms_norm_eps: 1e-6, norm_style: NormStyle::Qwen, rope_theta: 1e4,
+        tie_word_embeddings: false, partial_rotary_factor: 1.0, mtp: None,
+        moe: None, linear_core: None, max_position_embeddings: 8,
+        linear_conv_kernel_dim: None, linear_num_key_heads: None,
+        linear_num_value_heads: None, linear_key_head_dim: None, linear_value_head_dim: None,
+        hidden_act: "silu".into(),
+        embed_multiplier: 1.0,
+        query_pre_attn_scalar: None,
+        sliding_window: None,
+        sliding_window_pattern: None,
+        rope_local_base_freq: None,
+        global_head_dim: None,
+        num_global_kv_heads: None,
+        global_partial_rotary_factor: None,
+        final_logit_softcapping: None,
+        attn_v_norm: false,
+    };
+    let header = CmfHeader {
+        format: "cmf".into(), version: CMF_VERSION, arch, quant_type: QuantType::Q8Row,
+        provenance: None, tokenizer_config: None, section_hashes: None,
+        skills: Vec::new(), shard: None, calibration: None,
+    };
+    let spec = TensorSpec {
+        name: "w".into(), dtype: TensorDtype::Q8Row, shape: vec![rows, cols], data: payload,
+    };
+    let pad = TensorSpec {
+        name: "pad".into(), dtype: TensorDtype::F32, shape: vec![8192, 2], data: vec![0u8; 8192 * 8],
+    };
+    let dir = std::env::temp_dir().join(format!("cmf-mmicro-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("m.cmf");
+    CmfModel::write(&path, &header, &[spec, pad], None, None).unwrap();
+    let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
+    let idx = model.tensor_index("w").unwrap();
+    let rs = vec![0.01f32; rows];
+    let x: Vec<f32> = (0..b * cols).map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5).collect();
+    let mut y_gpu = vec![0f32; b * rows];
+
+    // Interleaved A/B rounds, min per side — the machine's thermal
+    // drift otherwise biases whichever side runs second.
+    let qt = cortiq_engine::qtensor::QTensor::Mapped {
+        model: model.clone(), idx, dtype: TensorDtype::Q8Row, rows, cols,
+        row_scale: rs.clone(), col_field: Vec::new(), vbit_offsets: Vec::new(),
+        repack: Vec::new(),
+    };
+    let mut y_cpu = vec![0f32; b * rows];
+    for _ in 0..3 {
+        assert!(cortiq_engine::gpu_metal::q8_matmat(&model, idx, &rs, &x, b, rows, cols, &mut y_gpu));
+        qt.matmat(&x, b, &mut y_cpu, None);
+    }
+    let (mut gpu_ms, mut cpu_ms) = (f64::MAX, f64::MAX);
+    for _ in 0..8 {
+        let t0 = std::time::Instant::now();
+        for _ in 0..3 {
+            cortiq_engine::gpu_metal::q8_matmat(&model, idx, &rs, &x, b, rows, cols, &mut y_gpu);
+        }
+        gpu_ms = gpu_ms.min(t0.elapsed().as_secs_f64() * 1000.0 / 3.0);
+        let t1 = std::time::Instant::now();
+        for _ in 0..3 {
+            qt.matmat(&x, b, &mut y_cpu, None);
+        }
+        cpu_ms = cpu_ms.min(t1.elapsed().as_secs_f64() * 1000.0 / 3.0);
+    }
+
+    let gflop = 2.0 * (b * rows * cols) as f64 / 1e9;
+    println!(
+        "mul_mm {rows}x{cols} b={b}: gpu {gpu_ms:.2} ms ({:.0} GFLOP/s) | cpu {cpu_ms:.2} ms ({:.0} GFLOP/s)",
+        gflop / gpu_ms * 1e3, gflop / cpu_ms * 1e3
+    );
+
+    // Parity: half-activation GEMM vs f32 CPU — tolerance class.
+    let mut worst = 0f32;
+    for probe in [0usize, 1, 31, 63, b * rows / 2 + 17, b * rows - 1] {
+        let d = (y_gpu[probe] - y_cpu[probe]).abs() / y_cpu[probe].abs().max(1.0);
+        worst = worst.max(d);
+    }
+    assert!(worst < 5e-2, "mul_mm parity: rel err {worst}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn empty_submit_cost() {
