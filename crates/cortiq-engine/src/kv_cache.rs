@@ -456,12 +456,18 @@ impl LayerKvCache {
     /// `q_group`: `[n_heads_in_group × head_dim]` (global head order);
     /// `out`: same shape; `imp_acc[0..stored]` accumulates the probs of
     /// every head (Born importance), matching the caller's former loop.
+    /// `scale` is the score scale (1/√hd unless the arch overrides);
+    /// `first` is the earliest visible position — sliding-window layers
+    /// pass `stored − window` so older rows get zero probability.
+    #[allow(clippy::too_many_arguments)]
     pub fn attend_group(
         &self,
         q_group: &[f32],
         kv_head: usize,
         out: &mut [f32],
         imp_acc: &mut [f32],
+        scale: f32,
+        first: usize,
     ) {
         let hd = self.head_dim;
         let nheads = q_group.len() / hd;
@@ -475,7 +481,7 @@ impl LayerKvCache {
             out.fill(0.0);
             return;
         }
-        let scale = 1.0 / (hd as f32).sqrt();
+        let first = first.min(stored.saturating_sub(1));
 
         thread_local! {
             /// scores [nheads × stored] — reused across layers/tokens.
@@ -488,7 +494,14 @@ impl LayerKvCache {
 
         GQA_SCORES.with(|sc| {
             let mut scores = sc.borrow_mut();
-            scores.resize(nheads * stored, 0.0);
+            if first > 0 {
+                // Out-of-window rows stay at −inf → exp gives exactly 0,
+                // so softmax / V / importance need no special-casing.
+                scores.clear();
+                scores.resize(nheads * stored, f32::NEG_INFINITY);
+            } else {
+                scores.resize(nheads * stored, 0.0);
+            }
 
             // ── score pass: each stored K row is read ONCE for all heads.
             if self.mode.quant_k() {
@@ -504,7 +517,7 @@ impl LayerKvCache {
                             qcb[h * hd + d] = if kcol.is_empty() { qv } else { qv * kcol[d] };
                         }
                     }
-                    for p in 0..stored {
+                    for p in first..stored {
                         let row = &kq[p * hd..(p + 1) * hd];
                         // SAFETY: i8 and u8 share layout; dot_i8_f32 reads
                         // the bytes back as i8.
@@ -526,7 +539,7 @@ impl LayerKvCache {
                 });
             } else {
                 let k = &self.k[kv_head];
-                for p in 0..stored {
+                for p in first..stored {
                     let row = &k[p * hd..(p + 1) * hd];
                     for h in 0..nheads {
                         scores[h * stored + p] =
@@ -556,7 +569,7 @@ impl LayerKvCache {
             out.fill(0.0);
             if self.mode.quant_v() {
                 let (vq, vs) = (&self.vq[kv_head], &self.vs[kv_head]);
-                for p in 0..stored {
+                for p in first..stored {
                     let row = &vq[p * hd..(p + 1) * hd];
                     for h in 0..nheads {
                         let w = scores[h * stored + p] * vs[p];
@@ -576,7 +589,7 @@ impl LayerKvCache {
                 }
             } else {
                 let v = &self.v[kv_head];
-                for p in 0..stored {
+                for p in first..stored {
                     let row = &v[p * hd..(p + 1) * hd];
                     for h in 0..nheads {
                         let w = scores[h * stored + p];
@@ -619,9 +632,10 @@ impl LayerKvCache {
         hd: usize,
         out: &mut [f32],
         pool: Option<&crate::pool::Pool>,
+        scale: f32,
+        window: Option<usize>,
     ) {
         let n = s0 + b;
-        let scale = 1.0 / (hd as f32).sqrt();
         struct SendPtr(*mut f32);
         unsafe impl Send for SendPtr {}
         unsafe impl Sync for SendPtr {}
@@ -664,9 +678,14 @@ impl LayerKvCache {
                 let run = |start: usize, end: usize| {
                     for r in start..end {
                         let allowed = s0 + (r % b) + 1;
+                        // Sliding-window layers see only the last W of
+                        // the causal range; the zeroed head contributes
+                        // nothing to P·V or Born importance.
+                        let lo = window.map(|w| allowed.saturating_sub(w)).unwrap_or(0);
                         // SAFETY: workers cover disjoint row ranges.
                         let row = unsafe { std::slice::from_raw_parts_mut(sp.at(r * n), n) };
-                        crate::attention::softmax_row(&mut row[..allowed]);
+                        crate::attention::softmax_row(&mut row[lo..allowed]);
+                        row[..lo].fill(0.0);
                         row[allowed..].fill(0.0);
                     }
                 };
@@ -1099,7 +1118,14 @@ mod tests {
                 let span = g * hpk * hd..(g + 1) * hpk * hd;
                 let mut out = vec![0f32; hpk * hd];
                 let mut imp = vec![0f32; 70];
-                c.attend_group(&q[span.clone()], g, &mut out, &mut imp);
+                c.attend_group(
+                    &q[span.clone()],
+                    g,
+                    &mut out,
+                    &mut imp,
+                    1.0 / (hd as f32).sqrt(),
+                    0,
+                );
                 let mut imp_ref = vec![0f32; 70];
                 for h in 0..hpk {
                     let qh = &q[span.start + h * hd..span.start + (h + 1) * hd];

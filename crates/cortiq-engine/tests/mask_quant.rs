@@ -110,6 +110,12 @@ fn sparse_ffn_quant_agrees_with_dequant() {
         linear_num_value_heads: None,
         linear_key_head_dim: None,
         linear_value_head_dim: None,
+        hidden_act: "silu".into(),
+        embed_multiplier: 1.0,
+        query_pre_attn_scalar: None,
+        sliding_window: None,
+        sliding_window_pattern: None,
+        rope_local_base_freq: None,
     };
     let header = CmfHeader {
         format: "cmf".into(),
@@ -136,6 +142,7 @@ fn sparse_ffn_quant_agrees_with_dequant() {
 
     // Mapped (quantized, zero-copy) DenseFfn.
     let d_mapped = DenseFfn {
+        act: cortiq_engine::pipeline::Act::Silu,
         gate_proj: QTensor::from_model(&model, "g").unwrap(),
         up_proj: QTensor::from_model(&model, "u").unwrap(),
         down_proj: QTensor::from_model(&model, "d").unwrap(),
@@ -152,6 +159,7 @@ fn sparse_ffn_quant_agrees_with_dequant() {
         o
     };
     let d_f32 = DenseFfn {
+        act: cortiq_engine::pipeline::Act::Silu,
         gate_proj: QTensor::from_f32(deq(&d_mapped.gate_proj), inter, hidden),
         up_proj: QTensor::from_f32(deq(&d_mapped.up_proj), inter, hidden),
         down_proj: QTensor::from_f32(deq(&d_mapped.down_proj), hidden, inter),

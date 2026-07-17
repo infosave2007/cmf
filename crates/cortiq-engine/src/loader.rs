@@ -138,6 +138,7 @@ pub(crate) fn build_layer_ffn(
             gate_proj,
             up_proj,
             down_proj,
+            act: crate::pipeline::Act::from_arch(&arch.hidden_act),
         })
     };
     let router_name = format!("{prefix}mlp.gate.weight");
@@ -470,10 +471,35 @@ impl Pipeline {
                 Some(LayerType::LinearAttention) => load_linear_attn(&prefix)?,
                 _ => load_full_attn(&prefix)?,
             };
+            // Gemma-2/3 sandwich: `pre_feedforward_layernorm` present →
+            // it is the pre-FFN norm, and post_attention/post_feedforward
+            // норms apply to the branch OUTPUTS before their residuals.
+            let pre_ffn = format!("{prefix}pre_feedforward_layernorm.weight");
+            let sandwich = model.tensor(&pre_ffn).is_some();
             layers.push(LayerWeights {
                 input_norm: load_f32(model, &format!("{prefix}input_layernorm.weight"), ov).map_err(err)?,
-                post_norm: load_f32(model, &format!("{prefix}post_attention_layernorm.weight"), ov)
-                    .map_err(err)?,
+                post_norm: if sandwich {
+                    load_f32(model, &pre_ffn, ov).map_err(err)?
+                } else {
+                    load_f32(model, &format!("{prefix}post_attention_layernorm.weight"), ov)
+                        .map_err(err)?
+                },
+                attn_out_norm: if sandwich {
+                    Some(
+                        load_f32(model, &format!("{prefix}post_attention_layernorm.weight"), ov)
+                            .map_err(err)?,
+                    )
+                } else {
+                    None
+                },
+                ffn_out_norm: if sandwich {
+                    Some(
+                        load_f32(model, &format!("{prefix}post_feedforward_layernorm.weight"), ov)
+                            .map_err(err)?,
+                    )
+                } else {
+                    None
+                },
                 // FFN always quantized — masks run sparse on quant bytes.
                 ffn: build_layer_ffn(model, &arch, li, false, ov)?,
                 attn,
@@ -495,6 +521,8 @@ impl Pipeline {
                 hnorm: load_f32(model, &format!("{p}hnorm.weight"), ov).map_err(err)?,
                 eh_proj: load_matrix(model, &format!("{p}eh_proj.weight"), false, ov)?,
                 layer: LayerWeights {
+                    attn_out_norm: None,
+                    ffn_out_norm: None,
                     input_norm: load_f32(model, &format!("{p}layers.0.input_layernorm.weight"), ov)
                         .map_err(err)?,
                     post_norm: load_f32(
@@ -507,6 +535,7 @@ impl Pipeline {
                         gate_proj: load_matrix(model, &format!("{p}layers.0.mlp.gate_proj.weight"), false, ov)?,
                         up_proj: load_matrix(model, &format!("{p}layers.0.mlp.up_proj.weight"), false, ov)?,
                         down_proj: load_matrix(model, &format!("{p}layers.0.mlp.down_proj.weight"), false, ov)?,
+                        act: crate::pipeline::Act::from_arch(&arch.hidden_act),
                     }),
                     attn,
                 },
@@ -561,6 +590,21 @@ impl Pipeline {
         );
         let rotary = ((arch.head_dim as f32 * arch.partial_rotary_factor) as usize).max(2);
         pipeline.set_rotary(rotary, arch.rope_theta as f32);
+        // Gemma-family extras: embedding scale, attention-scale
+        // override, and (Gemma-3) sliding-window layers with their own
+        // local RoPE base.
+        pipeline.embed_multiplier = arch.embed_multiplier;
+        if let Some(qpas) = arch.query_pre_attn_scalar {
+            pipeline.attn_scale = 1.0 / (qpas as f32).sqrt();
+        }
+        if let (Some(w), Some(p)) = (arch.sliding_window, arch.sliding_window_pattern) {
+            pipeline.swa = Some((w, p));
+            if let Some(base) = arch.rope_local_base_freq {
+                pipeline.inv_freq_local = Some(std::sync::Arc::new(
+                    crate::attention::rope_inv_freq(rotary, base as f32),
+                ));
+            }
+        }
         pipeline.vmf_cfg = vmf_cfg;
         pipeline.gdn_cfg = gdn_cfg;
         pipeline.mtp = mtp;

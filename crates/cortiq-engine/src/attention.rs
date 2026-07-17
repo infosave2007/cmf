@@ -570,6 +570,11 @@ pub struct QwenAttnCfg<'a> {
     /// attention output is multiplied by sigmoid(gate) before o_proj.
     pub output_gate: bool,
     pub rms_eps: f64,
+    /// Attention score scale (1/√head_dim unless the arch overrides).
+    pub scale: f32,
+    /// Sliding-window width: attend only the last N positions (Gemma-3
+    /// local layers). None = full context.
+    pub window: Option<usize>,
     /// Norm-weight semantics for qk-norm (same as the layer norms).
     pub norm_style: cortiq_core::NormStyle,
     /// Qwen2-family q/k/v projection biases (added after the matvecs).
@@ -783,6 +788,8 @@ fn attend_all_heads(
     nh: usize,
     heads_per_kv: usize,
     hd: usize,
+    scale: f32,
+    window: Option<usize>,
 ) -> (Vec<f32>, Vec<f32>) {
     let mut attn_out = take_buf(nh * hd);
     let mut imp = take_buf(cache.seq_len);
@@ -791,11 +798,13 @@ fn attend_all_heads(
     // heads_per_kv times). Bit-identical per head — see attend_group.
     let nkv = nh / heads_per_kv;
     for g in 0..nkv {
-        if cache.head_len(g) == 0 {
+        let stored = cache.head_len(g);
+        if stored == 0 {
             continue;
         }
+        let first = window.map(|w| stored.saturating_sub(w)).unwrap_or(0);
         let span = g * heads_per_kv * hd..(g + 1) * heads_per_kv * hd;
-        cache.attend_group(&q[span.clone()], g, &mut attn_out[span], &mut imp);
+        cache.attend_group(&q[span.clone()], g, &mut attn_out[span], &mut imp, scale, first);
     }
     (attn_out, imp)
 }
@@ -829,7 +838,8 @@ pub fn qwen_attention_core(
     // — the vec![true; nkv] here was one allocation per layer per token.
     cache.append(&p.k, &p.v, &[]);
 
-    let (mut ao, mut imp) = attend_all_heads(&p.q, cache, nh, heads_per_kv, hd);
+    let (mut ao, mut imp) =
+        attend_all_heads(&p.q, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window);
     cache.accumulate_imp(&imp);
     if cfg.output_gate {
         apply_gate(&mut ao, &p.gate);
@@ -961,7 +971,8 @@ pub fn qwen_attention_batch(
                 gates_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&gate);
             }
         } else {
-            let (mut ao, mut imp) = attend_all_heads(&q, cache, nh, heads_per_kv, hd);
+            let (mut ao, mut imp) =
+                attend_all_heads(&q, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window);
             cache.accumulate_imp(&imp);
             if cfg.output_gate {
                 apply_gate(&mut ao, &gate);
@@ -975,7 +986,18 @@ pub fn qwen_attention_batch(
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if batched_attend {
-        cache.attend_chunk(&q_rope_all, b, s0, nh, heads_per_kv, hd, &mut ao_all, cfg.pool);
+        cache.attend_chunk(
+            &q_rope_all,
+            b,
+            s0,
+            nh,
+            heads_per_kv,
+            hd,
+            &mut ao_all,
+            cfg.pool,
+            cfg.scale,
+            cfg.window,
+        );
         if cfg.output_gate {
             apply_gate(&mut ao_all, &gates_all);
         }
@@ -1112,11 +1134,11 @@ pub fn qwen_attention_pair(
     cache.o1_push_q(&qb);
     // Empty alive slice = every head alive (see qwen_attention).
     cache.append(&k1, &v1, &[]);
-    let (mut a1, mut imp1) = attend_all_heads(&qa, cache, nh, heads_per_kv, hd);
+    let (mut a1, mut imp1) = attend_all_heads(&qa, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window);
     cache.accumulate_imp(&imp1);
 
     cache.append(&k2, &v2, &[]);
-    let (mut a2, mut imp2) = attend_all_heads(&qb, cache, nh, heads_per_kv, hd);
+    let (mut a2, mut imp2) = attend_all_heads(&qb, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window);
     cache.accumulate_imp(&imp2);
 
     if cfg.output_gate {
@@ -1173,6 +1195,8 @@ mod tests {
             position,
             inv_freq: &inv,
             rotary_dim: hd,
+            scale: 1.0 / (hd as f32).sqrt(),
+            window: None,
             q_norm: None,
             k_norm: None,
             output_gate: false,

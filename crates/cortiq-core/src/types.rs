@@ -217,6 +217,24 @@ pub struct ModelArch {
     /// Fraction of head_dim rotated by RoPE (Qwen3.5: 0.25)
     #[serde(default = "default_prf")]
     pub partial_rotary_factor: f32,
+    /// FFN activation: "silu" (default) or "gelu_tanh" (Gemma's GeGLU).
+    #[serde(default = "default_hidden_act", skip_serializing_if = "is_default_act")]
+    pub hidden_act: String,
+    /// Token embeddings are multiplied by this at input (Gemma: √hidden).
+    #[serde(default = "default_one", skip_serializing_if = "is_one")]
+    pub embed_multiplier: f32,
+    /// Attention scale = 1/√this (None → 1/√head_dim). Gemma family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_pre_attn_scalar: Option<f64>,
+    /// Sliding-window attention (Gemma-3): window width…
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sliding_window: Option<usize>,
+    /// …the every-Nth-layer-is-global pattern…
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sliding_window_pattern: Option<usize>,
+    /// …and the local layers' own RoPE base (global layers use rope_theta).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_local_base_freq: Option<f64>,
     /// Multi-token-prediction head (None = absent)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<MtpConfig>,
@@ -246,6 +264,24 @@ pub struct ModelArch {
 
 fn default_rope_theta() -> f64 {
     10_000.0
+}
+
+fn default_hidden_act() -> String {
+    "silu".into()
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_act(s: &String) -> bool {
+    s == "silu"
+}
+
+fn default_one() -> f32 {
+    1.0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_one(v: &f32) -> bool {
+    *v == 1.0
 }
 
 fn default_prf() -> f32 {

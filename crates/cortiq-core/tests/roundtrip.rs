@@ -36,6 +36,12 @@ fn tiny_arch() -> ModelArch {
         linear_num_value_heads: None,
         linear_key_head_dim: None,
         linear_value_head_dim: None,
+        hidden_act: "silu".into(),
+        embed_multiplier: 1.0,
+        query_pre_attn_scalar: None,
+        sliding_window: None,
+        sliding_window_pattern: None,
+        rope_local_base_freq: None,
     }
 }
 

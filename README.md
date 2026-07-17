@@ -56,8 +56,12 @@ selected they read `general` / `0%` — more on [skills](#many-specialists-one-b
 
 **Does it run your model?** Native conversion today: qwen2 · qwen3 · qwen3.5
 (including the fused qwen3_next / AgentWorld layout) · llama · mistral ·
-qwen-moe — dense, MoE and GatedDeltaNet. Not yet: gemma, phi, deepseek. Anything
-else, try `import-gguf` — and if it refuses, that is a bug worth filing.
+qwen-moe · gemma / gemma-3 (GeGLU, sandwich norms, 512-token sliding window
+with dual RoPE) · phi-3 / phi-4 (fused qkv/gate_up splits, longrope served at
+the native window) · DeepSeek-R1 distills (qwen2/llama layouts) — dense, MoE
+and GatedDeltaNet. Not yet: gemma-2 (attention softcapping) and DeepSeek
+V2/V3 (MLA). Anything else, try `import-gguf` — and if it refuses, that is a
+bug worth filing.
 
 ## Plug it into what you already use
 

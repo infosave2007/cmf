@@ -124,6 +124,17 @@ pub struct Pipeline {
     /// Process-unique id keying this pipeline's device KV mirrors.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     graph_kv_id: u64,
+    /// Token embeddings are multiplied by this at input (Gemma: √hidden).
+    pub embed_multiplier: f32,
+    /// Attention score scale (1/√head_dim unless the arch overrides —
+    /// Gemma's query_pre_attn_scalar).
+    pub attn_scale: f32,
+    /// Sliding-window attention: (window, every-Nth-layer-is-global
+    /// pattern) — Gemma-3.
+    pub swa: Option<(usize, usize)>,
+    /// RoPE table of the sliding (local) layers, when they use their
+    /// own base frequency (Gemma-3: 10k local vs 1M global).
+    pub inv_freq_local: Option<std::sync::Arc<Vec<f32>>>,
     /// Compute per-token Born confidence (a full-vocab softmax each
     /// token). On by default; `bench --core` turns it off to match
     /// llama-bench's core timing.
@@ -155,16 +166,53 @@ pub struct PipelineWeights {
 /// One transformer layer: shared norms + MLP, attention by kind.
 pub struct LayerWeights {
     pub input_norm: Vec<f32>,
+    /// The pre-FFN norm (`post_attention_layernorm` classically;
+    /// `pre_feedforward_layernorm` on Gemma-2/3 sandwich layers).
     pub post_norm: Vec<f32>,
+    /// Gemma-2/3 sandwich: norm applied to the ATTENTION OUTPUT before
+    /// its residual add (`post_attention_layernorm` there).
+    pub attn_out_norm: Option<Vec<f32>>,
+    /// Gemma-2/3 sandwich: norm applied to the FFN OUTPUT before its
+    /// residual add (`post_feedforward_layernorm`).
+    pub ffn_out_norm: Option<Vec<f32>>,
     pub ffn: FfnKind,
     pub attn: AttnKind,
 }
 
-/// Dense SwiGLU triple — the FFN of a dense layer or of one expert.
+/// FFN gate activation: SiLU (SwiGLU family) or tanh-GELU (Gemma's
+/// GeGLU). A property of the model, carried on every FFN triple.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Act {
+    #[default]
+    Silu,
+    GeluTanh,
+}
+
+impl Act {
+    pub fn from_arch(name: &str) -> Self {
+        if name == "gelu_tanh" {
+            Self::GeluTanh
+        } else {
+            Self::Silu
+        }
+    }
+
+    #[inline]
+    pub fn apply(self, x: f32) -> f32 {
+        match self {
+            Self::Silu => inference::silu(x),
+            Self::GeluTanh => inference::gelu_tanh(x),
+        }
+    }
+}
+
+/// Dense gated triple — the FFN of a dense layer or of one expert.
 pub struct DenseFfn {
     pub gate_proj: QTensor,
     pub up_proj: QTensor,
     pub down_proj: QTensor,
+    /// Gate activation (SiLU default; Gemma: tanh-GELU).
+    pub act: Act,
 }
 
 /// FFN operator of a layer, decided by tensor presence at load time
@@ -358,6 +406,20 @@ impl Pipeline {
         if !crate::gpu::enabled_here()
             || !crate::gpu::q1_force()
             || std::env::var("CMF_GPU_BLOCK").map(|v| v == "0").unwrap_or(false)
+        {
+            return start;
+        }
+        // The graph encodes SiLU FFN, 1/√hd attention scores and
+        // full-context attend with no branch norms — Gemma-style archs
+        // (sliding window, scale override, sandwich norms, GeLU) fall
+        // back to the CPU path.
+        if self.swa.is_some()
+            || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
+            || self.weights.layers.iter().any(|lw| {
+                lw.attn_out_norm.is_some()
+                    || lw.ffn_out_norm.is_some()
+                    || matches!(&lw.ffn, FfnKind::Dense(d) if d.act != Act::Silu)
+            })
         {
             return start;
         }
@@ -629,6 +691,8 @@ impl Pipeline {
                         position,
                         inv_freq: &inv_freq,
                         rotary_dim: rd,
+                        scale: self.attn_scale,
+                        window: None,
                         q_norm: *q_norm,
                         k_norm: *k_norm,
                         output_gate: *output_gate,
@@ -750,6 +814,10 @@ impl Pipeline {
             trace: false,
             calib_temp: 1.0,
             confidence_on: true,
+            embed_multiplier: 1.0,
+            attn_scale: 1.0 / (head_dim as f32).sqrt(),
+            swa: None,
+            inv_freq_local: None,
             graph_kv_id: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -856,6 +924,8 @@ impl Pipeline {
             position,
             inv_freq: &self.inv_freq,
             rotary_dim: self.rotary_dim,
+            scale: self.attn_scale,
+            window: None,
             q_norm: None,
             k_norm: None,
             output_gate: false,
@@ -1288,7 +1358,6 @@ impl Pipeline {
             self.rotary_dim,
             self.rms_eps,
         );
-        let inv_freq = self.inv_freq.clone();
         let pool = self.pool.clone();
 
         for li in 0..self.num_layers {
@@ -1321,14 +1390,17 @@ impl Pipeline {
                     output_gate,
                     bias,
                 } => {
+                    let inv_freq_l = self.layer_inv_freq(li);
                     let cfg = QwenAttnCfg {
                         num_heads: nh,
                         num_kv_heads: nkv,
                         head_dim: hd,
                         hidden_size: hs,
                         position,
-                        inv_freq: &inv_freq,
+                        inv_freq: &inv_freq_l,
                         rotary_dim: rd,
+                        scale: self.attn_scale,
+                        window: self.layer_window(li),
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
@@ -1351,6 +1423,13 @@ impl Pipeline {
                     )
                 }
             };
+            let (a1, a2) = match &self.weights.layers[li].attn_out_norm {
+                Some(w) => (
+                    inference::rms_norm(&a1, w, self.rms_eps, self.norm_style),
+                    inference::rms_norm(&a2, w, self.rms_eps, self.norm_style),
+                ),
+                None => (a1, a2),
+            };
             for i in 0..self.hidden_size {
                 h1[i] += a1[i];
                 h2[i] += a2[i];
@@ -1364,6 +1443,13 @@ impl Pipeline {
             inference::rms_norm_into(&h2, &lw.post_norm, self.rms_eps, self.norm_style, &mut self.ws.p2);
             let (f1, f2) =
                 ffn_forward_pair(&lw.ffn, &self.ws.p1, &self.ws.p2, self.pool.as_deref());
+            let (f1, f2) = match &self.weights.layers[li].ffn_out_norm {
+                Some(w) => (
+                    inference::rms_norm(&f1, w, self.rms_eps, self.norm_style),
+                    inference::rms_norm(&f2, w, self.rms_eps, self.norm_style),
+                ),
+                None => (f1, f2),
+            };
             for i in 0..self.hidden_size {
                 h1[i] += f1[i];
                 h2[i] += f2[i];
@@ -1787,7 +1873,6 @@ impl Pipeline {
             self.rotary_dim,
             self.rms_eps,
         );
-        let inv_freq = self.inv_freq.clone();
         let pool = self.pool.clone();
         let norm_style = self.norm_style;
 
@@ -1830,14 +1915,17 @@ impl Pipeline {
                             &mut normed[bi * hs..(bi + 1) * hs],
                         );
                     }
+                    let inv_freq_l = self.layer_inv_freq(li);
                     let cfg = QwenAttnCfg {
                         num_heads: nh,
                         num_kv_heads: nkv,
                         head_dim: hd,
                         hidden_size: hs,
                         position: start_pos,
-                        inv_freq: &inv_freq,
+                        inv_freq: &inv_freq_l,
                         rotary_dim: rd,
+                        scale: self.attn_scale,
+                        window: self.layer_window(li),
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
@@ -1848,9 +1936,17 @@ impl Pipeline {
                         norm_style,
                         pool: pool.as_deref(),
                     };
-                    let attn = attention::qwen_attention_batch(
+                    let mut attn = attention::qwen_attention_batch(
                         &normed, b, wq, wk, wv, wo,
                         &mut self.kv_cache.layers[li], &cfg);
+                    if let Some(w) = &lw.attn_out_norm {
+                        for bi in 0..b {
+                            inference::rms_norm_into(
+                                &attn[bi * hs..(bi + 1) * hs], w, eps, norm_style,
+                                &mut normed[bi * hs..(bi + 1) * hs]);
+                        }
+                        attn.copy_from_slice(&normed);
+                    }
                     for (dst, &a) in h.iter_mut().zip(&attn) {
                         *dst += a;
                     }
@@ -1880,10 +1976,18 @@ impl Pipeline {
                     &h[bi * hs..(bi + 1) * hs], &lw.post_norm, eps, norm_style);
                 post[bi * hs..(bi + 1) * hs].copy_from_slice(&r);
             }
-            let ffn = match &lw.ffn {
+            let mut ffn = match &lw.ffn {
                 FfnKind::Dense(d) => dense_ffn_batch(d, &post, b, pool.as_deref()),
                 FfnKind::Moe(m) => moe_ffn_batch(m, &post, b, hs, pool.as_deref()),
             };
+            if let Some(w) = &lw.ffn_out_norm {
+                for bi in 0..b {
+                    inference::rms_norm_into(
+                        &ffn[bi * hs..(bi + 1) * hs], w, eps, norm_style,
+                        &mut post[bi * hs..(bi + 1) * hs]);
+                }
+                ffn.copy_from_slice(&post);
+            }
             for (dst, &f) in h.iter_mut().zip(&ffn) {
                 *dst += f;
             }
@@ -1898,7 +2002,39 @@ impl Pipeline {
         if (id as usize) < self.weights.embed_tokens.rows() {
             self.weights.embed_tokens.row_f32(id as usize, &mut out);
         }
+        if self.embed_multiplier != 1.0 {
+            for v in out.iter_mut() {
+                *v *= self.embed_multiplier;
+            }
+        }
         out
+    }
+
+    /// Is layer `li` a sliding-window (local-RoPE) layer? Gemma-3:
+    /// every `pattern`-th layer is global, the rest are local.
+    fn layer_is_local(&self, li: usize) -> bool {
+        match self.swa {
+            Some((_, pattern)) => (li + 1) % pattern.max(1) != 0,
+            None => false,
+        }
+    }
+
+    /// The RoPE table for layer `li` (local layers may have their own).
+    fn layer_inv_freq(&self, li: usize) -> std::sync::Arc<Vec<f32>> {
+        if self.layer_is_local(li) {
+            if let Some(f) = &self.inv_freq_local {
+                return f.clone();
+            }
+        }
+        self.inv_freq.clone()
+    }
+
+    /// The attend window for layer `li` (None = full context).
+    fn layer_window(&self, li: usize) -> Option<usize> {
+        match self.swa {
+            Some((w, _)) if self.layer_is_local(li) => Some(w),
+            _ => None,
+        }
     }
 
     /// Forward one position through all layers (hybrid dispatch).
@@ -1930,7 +2066,6 @@ impl Pipeline {
             self.rotary_dim,
             self.rms_eps,
         );
-        let inv_freq = self.inv_freq.clone();
         let pool = self.pool.clone();
 
         #[cfg(target_os = "macos")]
@@ -2002,14 +2137,17 @@ impl Pipeline {
                 } if self.kv_cache.layers[li].o1_sealed() => {
                     // O(1) override: decode on the sealed Nyström state
                     // instead of the growing KV cache.
+                    let inv_freq_l = self.layer_inv_freq(li);
                     let cfg = QwenAttnCfg {
                         num_heads: nh,
                         num_kv_heads: nkv,
                         head_dim: hd,
                         hidden_size: hs,
                         position,
-                        inv_freq: &inv_freq,
+                        inv_freq: &inv_freq_l,
                         rotary_dim: rd,
+                        scale: self.attn_scale,
+                        window: None,
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
@@ -2072,14 +2210,17 @@ impl Pipeline {
                                      supported yet — executing dense"
                                 );
                             }
+                            let inv_freq_l = self.layer_inv_freq(li);
                             let cfg = QwenAttnCfg {
                                 num_heads: nh,
                                 num_kv_heads: nkv,
                                 head_dim: hd,
                                 hidden_size: hs,
                                 position,
-                                inv_freq: &inv_freq,
+                                inv_freq: &inv_freq_l,
                                 rotary_dim: rd,
+                                scale: self.attn_scale,
+                                window: self.layer_window(li),
                                 q_norm: q_norm.as_deref(),
                                 k_norm: k_norm.as_deref(),
                                 output_gate: *output_gate,
@@ -2102,6 +2243,12 @@ impl Pipeline {
                         }
                     }
                 }
+            };
+            // Gemma sandwich norm: normalize the attention branch before
+            // it joins the residual stream.
+            let attn_out = match &self.weights.layers[li].attn_out_norm {
+                Some(w) => inference::rms_norm(&attn_out, w, self.rms_eps, self.norm_style),
+                None => attn_out,
             };
             for (i, &a) in attn_out.iter().enumerate() {
                 h[i] += a;
@@ -2177,6 +2324,10 @@ impl Pipeline {
                     }
                 },
                 (false, _) => ffn_forward(&lw.ffn, &post_normed, self.pool.as_deref()),
+            };
+            let ffn_out = match &self.weights.layers[li].ffn_out_norm {
+                Some(w) => inference::rms_norm(&ffn_out, w, self.rms_eps, self.norm_style),
+                None => ffn_out,
             };
             for (i, &f) in ffn_out.iter().enumerate() {
                 h[i] += f;
@@ -2360,10 +2511,13 @@ pub fn create_test_pipeline(
         .map(|li| LayerWeights {
             input_norm: vec![1.0; hidden_size],
             post_norm: vec![1.0; hidden_size],
+            attn_out_norm: None,
+            ffn_out_norm: None,
             ffn: FfnKind::Dense(DenseFfn {
                 gate_proj: qt(intermediate_size, hidden_size, li * 10 + 5),
                 up_proj: qt(intermediate_size, hidden_size, li * 10 + 6),
                 down_proj: qt(hidden_size, intermediate_size, li * 10 + 7),
+                act: Act::Silu,
             }),
             attn: AttnKind::Full {
                 bias: None,
@@ -2414,7 +2568,7 @@ fn dense_ffn_batch(d: &DenseFfn, xs: &[f32], b: usize, pool: Option<&Pool>) -> V
     let mut u = vec![0.0f32; b * inter];
     d.up_proj.matmat(xs, b, &mut u, pool);
     for i in 0..b * inter {
-        g[i] = inference::silu(g[i]) * u[i];
+        g[i] = d.act.apply(g[i]) * u[i];
     }
     let mut out = vec![0.0f32; b * hidden];
     d.down_proj.matmat(&g, b, &mut out, pool);
@@ -2552,7 +2706,7 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
         // Multi-matrix job: gate+up under one pool dispatch.
         QTensor::matvec_many([&d.gate_proj, &d.up_proj], x, [g, u], pool);
         for i in 0..inter {
-            g[i] = inference::silu(g[i]) * u[i];
+            g[i] = d.act.apply(g[i]) * u[i];
         }
         // DTG-MA bake probe (Patent 2): accumulate this layer's
         // per-neuron activation mass while a probe pass is active.
@@ -2587,6 +2741,10 @@ thread_local! {
 /// not q8-mapped in the primary shard / over the VRAM budget / backend
 /// refusal → honest CPU path.
 fn dense_ffn_gpu(d: &DenseFfn, x: &[f32], _pool: Option<&Pool>) -> Option<Vec<f32>> {
+    // The GPU block hardcodes SiLU; GeLU FFNs (Gemma) stay on CPU.
+    if d.act != Act::Silu {
+        return None;
+    }
     // Threshold: tiny FFNs are not worth a submission (q1 excepted —
     // see the caller's gate).
     if d.gate_proj.rows() < crate::gpu::min_rows() && !d.gate_proj.is_q1() {
@@ -2651,6 +2809,9 @@ fn moe_push_job<'a>(
     model_ref: &mut Option<std::sync::Arc<cortiq_core::CmfModel>>,
 ) -> Option<()> {
     use crate::qtensor::prescale;
+    if d.act != Act::Silu {
+        return None; // GPU block hardcodes SiLU
+    }
     let (gm, gi, gr, gc, grs, gcf, gq1) = moe_parts(&d.gate_proj)?;
     let (_, ui, ur, uc, urs, ucf, uq1) = moe_parts(&d.up_proj)?;
     let (_, di, dr, dc, drs, dcf, dq1) = moe_parts(&d.down_proj)?;
@@ -2700,7 +2861,7 @@ fn sparse_ffn_quant(
         let mut s = if need_scratch { vec![0.0f32; hidden] } else { Vec::new() };
         let gate = d.gate_proj.row_dot(idx, x, &mut s);
         let up = d.up_proj.row_dot(idx, x, &mut s);
-        inference::silu(gate) * up
+        d.act.apply(gate) * up
     };
     match pool {
         Some(p) if n >= 256 => {
@@ -2928,8 +3089,8 @@ fn ffn_forward_pair(
             pool,
         );
         for i in 0..inter {
-            g1[i] = inference::silu(g1[i]) * u1[i];
-            g2[i] = inference::silu(g2[i]) * u2[i];
+            g1[i] = d.act.apply(g1[i]) * u1[i];
+            g2[i] = d.act.apply(g2[i]) * u2[i];
         }
         let mut o1 = attention::take_buf(d.down_proj.rows());
         let mut o2 = attention::take_buf(d.down_proj.rows());
@@ -2959,6 +3120,7 @@ mod tests {
             gate_proj: QTensor::from_f32(synth(inter * hidden, 1), inter, hidden),
             up_proj: QTensor::from_f32(synth(inter * hidden, 2), inter, hidden),
             down_proj: QTensor::from_f32(synth(hidden * inter, 3), hidden, inter),
+            act: Act::Silu,
         };
         let x = synth(hidden, 9);
         // Active = every 3rd neuron.
@@ -3014,10 +3176,13 @@ mod tests {
             layer: LayerWeights {
                 input_norm: vec![1.0; h],
                 post_norm: vec![1.0; h],
+                attn_out_norm: None,
+                ffn_out_norm: None,
                 ffn: FfnKind::Dense(DenseFfn {
                     gate_proj: qt(inter, h, 315),
                     up_proj: qt(inter, h, 316),
                     down_proj: qt(h, inter, 317),
+                    act: Act::Silu,
                 }),
                 attn: AttnKind::Full {
                 bias: None,

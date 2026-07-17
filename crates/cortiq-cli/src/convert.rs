@@ -542,6 +542,47 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     } else {
         NormStyle::Qwen
     };
+    // Gemma family: GeGLU FFN, √hidden embedding scale, an attention
+    // scale of its own, and (Gemma-3) interleaved sliding-window layers
+    // with a separate local RoPE base. Gemma-2's logit soft-capping is
+    // not implemented — refuse it loudly rather than emit a wrong file.
+    let is_gemma = mt.contains("gemma");
+    if tc.get("attn_logit_softcapping").and_then(|v| v.as_f64()).is_some()
+        || tc.get("final_logit_softcapping").and_then(|v| v.as_f64()).is_some()
+    {
+        anyhow::bail!(
+            "{model_type}: logit soft-capping (Gemma-2) is not supported yet — \
+             Gemma-1/Gemma-3 convert natively"
+        );
+    }
+    let hidden_act = match tc
+        .get("hidden_activation")
+        .or_else(|| tc.get("hidden_act"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("silu")
+    {
+        "gelu_pytorch_tanh" | "gelu_tanh" | "gelu_new" => "gelu_tanh".to_string(),
+        "silu" | "swish" => "silu".to_string(),
+        other => anyhow::bail!("unsupported hidden_act '{other}'"),
+    };
+    let embed_multiplier = if is_gemma { (hidden as f32).sqrt() } else { 1.0 };
+    // Phi-3 longrope: exact only within the ORIGINAL context — cap the
+    // declared max honestly instead of serving stretched positions.
+    let mut max_pos = cfg_usize(tc, "max_position_embeddings").unwrap_or(32768);
+    if let Some(rs) = tc.get("rope_scaling").filter(|v| !v.is_null()) {
+        let kind = rs.get("type").or_else(|| rs.get("rope_type")).and_then(|v| v.as_str());
+        match kind {
+            Some("longrope") | Some("su") => {
+                let orig = cfg_usize(tc, "original_max_position_embeddings").unwrap_or(4096);
+                eprintln!(
+                    "  note: longrope scaling — serving the exact {orig}-token native window"
+                );
+                max_pos = orig;
+            }
+            Some(other) => anyhow::bail!("rope_scaling '{other}' not supported yet"),
+            None => {}
+        }
+    }
     Ok(ModelArch {
         arch_name: model_type,
         hidden_size: hidden,
@@ -557,17 +598,28 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         rms_norm_eps: tc.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6),
         norm_style,
         rope_theta,
-        tie_word_embeddings: config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false),
+        // Gemma ties embeddings by default and its configs omit the key.
+        tie_word_embeddings: config
+            .get("tie_word_embeddings")
+            .and_then(|v| v.as_bool())
+            .unwrap_or_else(|| is_gemma),
         partial_rotary_factor: prf,
         mtp: None,
         moe,
         linear_core,
-        max_position_embeddings: cfg_usize(tc, "max_position_embeddings").unwrap_or(32_768),
+        max_position_embeddings: max_pos,
         linear_conv_kernel_dim: cfg_usize(tc, "linear_conv_kernel_dim"),
         linear_num_key_heads: cfg_usize(tc, "linear_num_key_heads"),
         linear_num_value_heads: lnv,
         linear_key_head_dim: cfg_usize(tc, "linear_key_head_dim"),
         linear_value_head_dim: lvd,
+        hidden_act,
+        embed_multiplier,
+        query_pre_attn_scalar: tc.get("query_pre_attn_scalar").and_then(|v| v.as_f64()),
+        sliding_window: cfg_usize(tc, "sliding_window")
+            .filter(|_| tc.get("sliding_window_pattern").is_some()),
+        sliding_window_pattern: cfg_usize(tc, "sliding_window_pattern"),
+        rope_local_base_freq: tc.get("rope_local_base_freq").and_then(|v| v.as_f64()),
     })
 }
 
@@ -1164,6 +1216,50 @@ pub fn run_convert(
                         (TensorDtype::F16, encode_f16(&out_vals))
                     };
                     tensors.push(TensorSpec { name: out_name, dtype: dt, shape: vec![out_rows, hid], data });
+                }
+                continue;
+            }
+            // Phi-3 family fuses QKV (`qkv_proj`) and gate/up
+            // (`gate_up_proj`): split into the canonical tensors — a
+            // pure row slice, no value changes.
+            if name.ends_with(".self_attn.qkv_proj.weight")
+                || name.ends_with(".mlp.gate_up_proj.weight")
+            {
+                anyhow::ensure!(m.shape.len() == 2, "fused '{name}': expected 2-D");
+                let w = to_f32(&m.dtype, file.bytes(m))?;
+                let (rows, cols) = (m.shape[0], m.shape[1]);
+                let parts: Vec<(String, usize, usize)> = if name.contains("qkv_proj") {
+                    let q = arch.num_attention_heads * arch.head_dim;
+                    let kv = arch.num_kv_heads * arch.head_dim;
+                    anyhow::ensure!(
+                        q + 2 * kv == rows,
+                        "'{name}': {rows} rows != q({q}) + 2·kv({kv})"
+                    );
+                    vec![
+                        (name.replace("qkv_proj", "q_proj"), 0, q),
+                        (name.replace("qkv_proj", "k_proj"), q, kv),
+                        (name.replace("qkv_proj", "v_proj"), q + kv, kv),
+                    ]
+                } else {
+                    anyhow::ensure!(rows % 2 == 0, "'{name}': odd row count {rows}");
+                    vec![
+                        (name.replace("gate_up_proj", "gate_proj"), 0, rows / 2),
+                        (name.replace("gate_up_proj", "up_proj"), rows / 2, rows / 2),
+                    ]
+                };
+                for (out_name, r0, nr) in parts {
+                    let vals = &w[r0 * cols..(r0 + nr) * cols];
+                    let (dt, data) = if nr * cols >= GROUP_SIZE && !force_f16(&out_name) {
+                        quantize_2d(quant, vals, nr, cols)
+                    } else {
+                        (TensorDtype::F16, encode_f16(vals))
+                    };
+                    tensors.push(TensorSpec {
+                        name: out_name,
+                        dtype: dt,
+                        shape: vec![nr, cols],
+                        data,
+                    });
                 }
                 continue;
             }

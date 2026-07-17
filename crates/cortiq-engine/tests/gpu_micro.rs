@@ -22,6 +22,12 @@ fn q1_gpu_micro() {
         moe: None, linear_core: None, max_position_embeddings: 8,
         linear_conv_kernel_dim: None, linear_num_key_heads: None,
         linear_num_value_heads: None, linear_key_head_dim: None, linear_value_head_dim: None,
+        hidden_act: "silu".into(),
+        embed_multiplier: 1.0,
+        query_pre_attn_scalar: None,
+        sliding_window: None,
+        sliding_window_pattern: None,
+        rope_local_base_freq: None,
     };
     let header = CmfHeader {
         format: "cmf".into(), version: CMF_VERSION, arch, quant_type: QuantType::Vbit,
@@ -79,6 +85,12 @@ fn q8_gpu_micro() {
         moe: None, linear_core: None, max_position_embeddings: 8,
         linear_conv_kernel_dim: None, linear_num_key_heads: None,
         linear_num_value_heads: None, linear_key_head_dim: None, linear_value_head_dim: None,
+        hidden_act: "silu".into(),
+        embed_multiplier: 1.0,
+        query_pre_attn_scalar: None,
+        sliding_window: None,
+        sliding_window_pattern: None,
+        rope_local_base_freq: None,
     };
     let header = CmfHeader {
         format: "cmf".into(), version: CMF_VERSION, arch, quant_type: QuantType::Q8Row,
@@ -173,6 +185,12 @@ fn q1_chain_and_batch_parity() {
         moe: None, linear_core: None, max_position_embeddings: 8,
         linear_conv_kernel_dim: None, linear_num_key_heads: None,
         linear_num_value_heads: None, linear_key_head_dim: None, linear_value_head_dim: None,
+        hidden_act: "silu".into(),
+        embed_multiplier: 1.0,
+        query_pre_attn_scalar: None,
+        sliding_window: None,
+        sliding_window_pattern: None,
+        rope_local_base_freq: None,
     };
     let header = CmfHeader {
         format: "cmf".into(), version: CMF_VERSION, arch, quant_type: QuantType::Vbit,

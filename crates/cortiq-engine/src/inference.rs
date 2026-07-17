@@ -5,6 +5,12 @@ use cortiq_core::types::NormStyle;
 
 /// SiLU activation function.
 #[inline(always)]
+/// tanh-approximated GELU (Gemma's GeGLU gate; HF `gelu_pytorch_tanh`).
+pub fn gelu_tanh(x: f32) -> f32 {
+    const C: f32 = 0.797_884_6; // √(2/π)
+    0.5 * x * (1.0 + (C * (x + 0.044_715 * x * x * x)).tanh())
+}
+
 pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }

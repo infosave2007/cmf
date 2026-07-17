@@ -265,6 +265,12 @@ impl FcdModel {
     /// the backward cannot honestly differentiate yet (loud, not silent).
     pub fn from_cmf(model: &CmfModel, o1: &O1Cfg) -> Result<Self, String> {
         let arch = model.arch().clone();
+        if arch.hidden_act != "silu" {
+            return Err(format!(
+                "fcd/skill-bake: hidden_act '{}' not supported yet (SiLU only)",
+                arch.hidden_act
+            ));
+        }
         let has_linear = arch
             .layer_types
             .iter()
@@ -1837,6 +1843,7 @@ fn apply_trainables(pipe: &mut Pipeline, fm: &FcdModel, ts: &TrainState) {
             gate_proj: QTensor::from_f32(ts.data[b + 2].clone(), inter, hidden),
             up_proj: QTensor::from_f32(ts.data[b + 3].clone(), inter, hidden),
             down_proj: QTensor::from_f32(ts.data[b + 4].clone(), hidden, inter),
+            act: crate::pipeline::Act::Silu,
         });
     }
 }
