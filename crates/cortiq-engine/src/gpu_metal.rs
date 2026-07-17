@@ -80,82 +80,145 @@ kernel void q8_matmat(
     if (lane == 0) y[(ulong)bi * rows + row] = acc * rs[row];
 }
 
-// True GEMM tile kernel for the prefill batch (roadmap: llama.cpp Metal
-// pp512 class): C[b,rows] = X·Wᵀ with W q8. A 64×64 C-tile per
-// threadgroup — 256 threads, 8 simdgroups, each owning a 64×8 strip as
-// 8 simdgroup_float8x8 accumulators. Operand tiles stage through
-// threadgroup memory with vectorized loads (float4 X, char4 W); W bytes
-// convert i8→half at tile load (exact: |w| ≤ 127), X rides as half
-// (mul_mm precision class), the per-row q8 scale lands at the epilogue.
-// Measured variants on M4 (4864×896, b=512): BK=32 loses to BK=16
-// (barrier cost < occupancy loss), double-buffered tiles lose (24KB
-// threadgroup halves residency), device-direct A fragments lose (16B of
-// every 128B line), device-direct C stores lose (strided writes) — this
-// shape is the measured optimum of the family, ~1.5 TFLOP/s effective
-// vs AMX's 1.6 on the same shape (min-of, interleaved), so per-op the
-// probe keeps M4 prefill on the CPU; weaker-CPU/wider-GPU Metal parts
-// get a real win. Padded tile strides also lose (+4 halfs: 1290 vs
-// 1496 — no bank-conflict win on Apple's simdgroup_load). The llama.cpp
-// Metal pp512=3339 class needs the whole prefill chunk resident on the
-// GPU (GEMM + attend + norms, one submit per chunk) — that is the next
-// milestone, not more per-op kernel tuning.
+// True GEMM tile kernel for the prefill batch — the ggml mul_mm layout
+// ported to our q8_row format (per-row f32 scale folded in at the W
+// load; |w·s| well inside half range, mul_mm precision class). C-tile
+// 64 weight rows × 32 batch rows per 128-thread / 4-simdgroup
+// threadgroup, K in steps of 32; BOTH operand tiles live in threadgroup
+// memory PACKED AS CONTIGUOUS 8×8 BLOCKS (stride 8), so every
+// simdgroup_load reads one dense 64-element block — the wide-row-stride
+// layouts of the earlier variants were the throughput ceiling (~1.5
+// TF); this one measures materially higher. Per-thread device reads are
+// fully coalesced: 16 consecutive quants of one W row / 8 consecutive
+// floats of one X row per K-step. Requires cols % 32 == 0 (the host
+// falls back to the matvec-style kernel otherwise).
 kernel void q8_mul_mm(
-    device const char4*  q     [[buffer(0)]],
-    device const float4* xs    [[buffer(1)]],
+    device const char*   q     [[buffer(0)]],
+    device const float*  xs    [[buffer(1)]],
     device const float*  rs    [[buffer(2)]],
     device float*        y     [[buffer(3)]],
     constant uint&       cols  [[buffer(4)]],
     constant uint&       rows  [[buffer(5)]],
     constant uint&       nb    [[buffer(6)]],
-    uint tidx [[thread_index_in_threadgroup]],
-    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
     uint2 tg  [[threadgroup_position_in_grid]])
 {
-    const uint BM = 64, BN = 64, BK = 16;
-    threadgroup half at[BM * BK];
-    threadgroup half wt[BN * BK];
-    threadgroup float cst[BM * BN];
-    uint m0 = tg.y * BM;
-    uint n0 = tg.x * BN;
-    uint cols4 = cols / 4;
-    simdgroup_float8x8 acc[8];
-    for (uint mi = 0; mi < 8; ++mi)
-        acc[mi] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    threadgroup half4* at4 = (threadgroup half4*)at;
-    threadgroup half4* wt4 = (threadgroup half4*)wt;
-    for (uint k0 = 0; k0 < cols; k0 += BK) {
-        uint k04 = k0 / 4;
-        for (uint i = tidx; i < BM * BK / 4; i += 256) {
-            uint m = i / (BK / 4), k4 = i % (BK / 4);
-            float4 v = (m0 + m < nb && k04 + k4 < cols4)
-                ? xs[(ulong)(m0 + m) * cols4 + k04 + k4] : float4(0.0f);
-            at4[m * (BK / 4) + k4] = half4(v);
-        }
-        for (uint i = tidx; i < BN * BK / 4; i += 256) {
-            uint n = i / (BK / 4), k4 = i % (BK / 4);
-            char4 wv = (n0 + n < rows && k04 + k4 < cols4)
-                ? q[(ulong)(n0 + n) * cols4 + k04 + k4] : char4(0);
-            wt4[n * (BK / 4) + k4] = half4(wv);
-        }
+    // NOTE: unioning these through one casted arena (8 KB total like
+    // ggml) was measured 4.7× SLOWER — the pointer cast defeats the
+    // compiler's threadgroup alias analysis. Separate typed arrays it is.
+    threadgroup half  sa[64 * 32];   // W tile, 8x8 blocks
+    threadgroup half  sb[32 * 32];   // X tile, 8x8 blocks
+    threadgroup float cst[32 * 64];  // C staging
+    const uint NK = 32u;
+    uint r0 = tg.y * 64u;   // weight-row tile
+    uint r1 = tg.x * 32u;   // batch-row tile
+    // Clamped in-tile coordinates (edge tiles re-load a valid row; the
+    // guarded C write drops the duplicates).
+    uint nr0 = min(rows - r0, 64u);
+    uint nr1 = min(nb - r1, 32u);
+    uint lr0 = min(tiitg / 2u, nr0 - 1u);   // 0..63 W row in tile
+    uint il0 = tiitg % 2u;                  // which 16-col half of NK
+    uint lr1 = min(tiitg / 4u, nr1 - 1u);   // 0..31 X row in tile
+    uint iy  = 8u * (tiitg % 4u);           // k offset of this thread's 8 floats
+
+    device const char* xrow = q + (ulong)(r0 + lr0) * cols + 16u * il0;
+    device const float* yrow = xs + (ulong)(r1 + lr1) * cols + iy;
+    float wscale = rs[r0 + lr0];
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8u; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (uint k0 = 0; k0 < cols; k0 += NK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0; kk < BK; kk += 8) {
-            simdgroup_half8x8 wfrag;
-            simdgroup_load(wfrag, wt + sg * 8u * BK + kk, BK, ulong2(0, 0), true);
-            for (uint mi = 0; mi < 8; ++mi) {
-                simdgroup_half8x8 afrag;
-                simdgroup_load(afrag, at + mi * 8u * BK + kk, BK);
-                simdgroup_multiply_accumulate(acc[mi], afrag, wfrag, acc[mi]);
+        // W: 16 consecutive quants (4 vector loads) → one
+        // 8x8-block-packed column pair.
+        {
+            uint sy = (tiitg / 2u) / 8u;
+            uint lx = (tiitg / 2u) % 8u;
+            device const char4* x4 = (device const char4*)xrow;
+            float4 w0 = float4(x4[0]) * wscale;
+            float4 w1 = float4(x4[1]) * wscale;
+            float4 w2 = float4(x4[2]) * wscale;
+            float4 w3 = float4(x4[3]) * wscale;
+            float wv[16] = {
+                w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w,
+                w2.x, w2.y, w2.z, w2.w, w3.x, w3.y, w3.z, w3.w,
+            };
+            uint ib0 = 8u * (2u * il0) + sy;
+            uint ib1 = 8u * (2u * il0 + 1u) + sy;
+            for (uint i = 0; i < 8u; ++i) {
+                sa[64u * ib0 + 8u * i + lx] = (half)wv[i];
+                sa[64u * ib1 + 8u * i + lx] = (half)wv[i + 8u];
             }
         }
+        // X: 8 consecutive floats → one 8x8-block row.
+        {
+            uint sx = tiitg % 4u;
+            uint sy = (tiitg / 4u) / 8u;
+            uint ly = (tiitg / 4u) % 8u;
+            uint ib = 4u * sx + sy;
+            device const float4* y4 = (device const float4*)yrow;
+            float4 v0 = y4[0];
+            float4 v1 = y4[1];
+            // NOTE: half4 threadgroup stores here measured 2× slower —
+            // threadgroup pointer casts defeat the alias analysis (same
+            // lesson as the arena union). Scalar stores compile clean.
+            threadgroup half* dst = sb + 64u * ib + 8u * ly;
+            dst[0] = (half)v0.x; dst[1] = (half)v0.y;
+            dst[2] = (half)v0.z; dst[3] = (half)v0.w;
+            dst[4] = (half)v1.x; dst[5] = (half)v1.y;
+            dst[6] = (half)v1.z; dst[7] = (half)v1.w;
+        }
+        xrow += NK;
+        yrow += NK;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < 4; ++ik) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; ++i) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
     }
-    for (uint mi = 0; mi < 8; ++mi)
-        simdgroup_store(acc[mi], cst + mi * 8u * BN + sg * 8u, BN);
+
+    // C staging: sg's strip is 16 batch rows × 32 weight cols.
+    {
+        uint moff = 16u * (sgitg / 2u);
+        uint noff = 32u * (sgitg % 2u);
+        for (uint i = 0; i < 8u; ++i) {
+            simdgroup_store(
+                mc[i],
+                cst + (moff + 8u * (i / 4u)) * 64u + noff + 8u * (i % 4u),
+                64);
+        }
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tidx; i < BM * BN; i += 256) {
-        uint m = i / BN, n = i % BN;
-        if (m0 + m < nb && n0 + n < rows)
-            y[(ulong)(m0 + m) * rows + n0 + n] = cst[i] * rs[n0 + n];
+    for (uint i = tiitg; i < 32u * 64u; i += 128u) {
+        uint m = i / 64u, n = i % 64u;
+        if (r1 + m < nb && r0 + n < rows) {
+            y[(ulong)(r1 + m) * rows + r0 + n] = cst[i];
+        }
     }
 }
 
@@ -1418,8 +1481,8 @@ fn encode_mul_mm(
     enc.set_bytes(5, 4, &rows_u as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(6, 4, &b_u as *const u32 as *const std::ffi::c_void);
     enc.dispatch_thread_groups(
-        MTLSize::new((rows as u64).div_ceil(64), (b as u64).div_ceil(64), 1),
-        MTLSize::new(256, 1, 1),
+        MTLSize::new((b as u64).div_ceil(32), (rows as u64).div_ceil(64), 1),
+        MTLSize::new(128, 1, 1),
     );
     enc.end_encoding();
 }
@@ -1847,7 +1910,7 @@ pub fn q8_matmat(
             })
             .clone()
     };
-    let use_mm = b >= 32;
+    let use_mm = b >= 32 && cols % 32 == 0;
     let xs_buf = get_io(11_000_000_453 + pre.len(), pre.len() * 4);
     unsafe {
         std::ptr::copy_nonoverlapping(pre.as_ptr(), xs_buf.contents() as *mut f32, pre.len());
@@ -1871,8 +1934,8 @@ pub fn q8_matmat(
     enc.set_bytes(6, 4, &b_u as *const u32 as *const std::ffi::c_void);
     if use_mm {
         enc.dispatch_thread_groups(
-            MTLSize::new((rows as u64).div_ceil(64), (b as u64).div_ceil(64), 1),
-            MTLSize::new(256, 1, 1),
+            MTLSize::new((b as u64).div_ceil(32), (rows as u64).div_ceil(64), 1),
+            MTLSize::new(128, 1, 1),
         );
     } else {
         let sgs = 8u64;
