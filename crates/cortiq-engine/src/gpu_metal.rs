@@ -2438,6 +2438,14 @@ pub fn chunk_run_gpu(
         cmd = prof.cut(c, cmd, "mm_down");
         axpy1(&cmd, &db, &h_b, b * hs);
         cmd = prof.cut(c, cmd, "axpy");
+        // Early commit (decode-graph lesson): hand this layer to the
+        // GPU now and encode the next one while it runs — the queue
+        // keeps ordering, only the last buffer is waited on. Without
+        // this the GPU sits idle through the whole chunk's encode.
+        if !prof.on {
+            cmd.commit();
+            cmd = c.queue.new_command_buffer().to_owned();
+        }
     }
 
     if prof.on {
@@ -2445,7 +2453,8 @@ pub fn chunk_run_gpu(
         cmd.wait_until_completed();
         prof.report();
     } else {
-        submit_and_wait(c, &cmd, &[&h_b]);
+        cmd.commit();
+        cmd.wait_until_completed();
     }
 
     // ── readback: hidden once, K/V rows + importance per layer.
