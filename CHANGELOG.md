@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-07-17
+
+The whole token on the GPU, and the prefill on the AMX. Bonsai-27B (q1)
+decode on an Apple M4 goes 5 → 10–11 tok/s with the first token 12.4 → 3.5 s;
+Bonsai-1.7B goes 28 → ~75–79. On q8 (Qwen2.5-0.5B, same M4, interleaved
+runs, both sides at their best measured configs) CMF now decodes faster
+than llama.cpp's Metal backend and its default CPU config, within 5% of
+its best CPU config, and prefills within 12% (pp512 377 → ~1030).
+
+### Added
+
+- **Whole-token Metal graph for q1** (macOS): full-attention layers join
+  the GDN block graph. First as a sandwich — norm+QKV on the GPU, one
+  sync, the CPU attends (it owns the KV cache), O+FFN encode into the
+  next buffer with the following GDN run (~17 syncs/token instead of
+  ~64) — and then all the way: new MSL kernels for per-head qk-norm +
+  partial RoPE with gate split, KV append into per-layer shared-memory
+  mirrors, grouped online-softmax attend with Born importance banked via
+  `atomic_float`, and the sigmoid output gate. One wait per token. The
+  CPU cache stays the owner of record — any divergence (eviction,
+  rollback, a CPU-path append) re-uploads the mirror, and after each
+  token the appended row replays through the normal `append` +
+  importance bookkeeping. Guards fall back per-layer to the sandwich
+  (`CMF_GPU_ATTEND=0` forces it; `CMF_GPU_BLOCK=0` disables the graph).
+- **Early commit**: the graph submits each command buffer as soon as it
+  is encoded, so the GPU crunches layer N while the CPU encodes N+1 —
+  continuous submission also keeps the Metal clocks warm (measured 5.8 ms
+  warm vs 8.8 ms mixed per block). The token's single `sync` waits only
+  on the last buffer (queue order covers the rest).
+- **Hybrid q1 prefill rides the token graph**: the chunked CPU
+  prefill-GEMM is walled by the sequential scalar GDN recurrence on q1
+  hybrids, so the prompt now runs position-by-position through the same
+  graph as decode (Bonsai-27B TTFT 12.4 → 3.5 s). Pure-attention models
+  keep the batched path, where chunk-GEMM amortization wins.
+- **Prefill on the Apple matrix units** (macOS): big prefill batches
+  route through Accelerate `cblas_sgemm` over dequantized f32 tiles
+  (scale folded in, pool-parallel dequant, tiles stay in cache) — the
+  same engine llama.cpp's `-ngl 0` prefill uses. The prefill chunk is
+  platform-adaptive (512 on macOS; `CMF_PREFILL_CHUNK` overrides), and
+  `CMF_ACCEL=0` opts out. Decode (M=1) never takes this path.
+- **Batched causal attention for prefill**: the chunk preps and appends
+  every position first, then attends per KV group in two fat GEMMs
+  (scores `Q·Kᵀ` with the group's Q-heads stacked into one panel, and
+  `P·V` after a causal masked softmax that zeroes the invisible tail),
+  with Born importance from the masked column sums. Softmax `exp` is a
+  NEON Cephes-style polynomial — scalar `expf` over a long prefill's
+  ~10⁸ calls would have eaten the GEMM win. The quadratic wall is gone:
+  pp1024 390 → 976 tok/s. Chunks under 32 positions and non-F32 KV
+  modes keep the exact per-position order.
+- **`cortiq bench --core`** — llama-bench-contract timing: greedy argmax
+  without the sampler's full-vocab working copy, no repetition-penalty
+  pass, no per-token confidence softmax (`Pipeline::set_confidence`).
+  The default `bench` still measures the full production loop. The
+  clone-free greedy argmax also lands in production for every
+  greedy-with-no-penalty caller.
+- q1 Metal matvec goes four rows per simdgroup with per-tile processing
+  (halves the L1 activation traffic per weight byte; the earlier
+  four-row attempt cached the whole x block and spilled).
+
+### Changed
+
+- **Numerics contract, stated plainly**: GPU-graph decode and GEMM-path
+  prefill are distribution-equivalent to the CPU path (first-token
+  probabilities match to ~0.3%, PPL matches) but not bit-identical on
+  every prompt — floating-point reductions run in a different order.
+  This was already true of every GPU offload since 0.3.3; now it is
+  documented instead of implied. CPU paths remain bit-exact (21 suites +
+  token-for-token golden parity).
+
+### Measured, for the record
+
+- llama.cpp head-to-head (Qwen2.5-0.5B q8, M4, interleaved, fresh
+  processes): tg128 — theirs 165.5 tok/s at its best `-t 6`, 129.4 at
+  its default `-t 4`, 150.9 on Metal; CMF `--core` 151–158. pp512 —
+  theirs 1168, CMF 1017–1037; pp1024 CMF 976.
+- Dead ends, measured and reverted: an XOR sign-flip in the q1 kernel
+  lost 23% to the `select` chain the Metal compiler already emits
+  optimally; double-buffering the prefill dequant against the sgemm
+  lost ~6% (Accelerate's own threads starve); a hybrid CPU∥GPU lm_head
+  split on UMA lost 15% (the runtime probe had it right all along).
+
 ## [0.3.3] — 2026-07-16
 
 1-bit models get a real GPU: Bonsai-27B (q1) decode on an Apple M4 goes

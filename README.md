@@ -134,42 +134,50 @@ If that cost is too high for your use case, `cortiq fcd` recovers part of it wit
 a bounded native training pass — see [O(1) in depth](#o1-in-depth). We haven't
 published a clean before/after figure for it yet.
 
-To be clear about the axis: `llama.cpp` is the yardstick we measure against,
-and today it is ahead on raw single-stream speed. One like-for-like run
-(2026-07-16: Qwen2.5-0.5B-Instruct, Apple Silicon M4, exact attention for
-both, native arm64 `llama.cpp` master vs CMF 0.3.1, 2+ series each from
-fresh processes):
+To be clear about the axis: `llama.cpp` is the yardstick we measure against.
+One like-for-like run (2026-07-17: Qwen2.5-0.5B-Instruct, Apple Silicon M4,
+exact attention for both, native arm64 `llama.cpp` master vs CMF 0.3.4,
+interleaved runs from fresh processes, each side at its best measured
+thread count — theirs is `-t 6`, ours the default; CMF timed with
+`cortiq bench --core`, which matches `llama-bench`'s core contract: no
+sampler copy, no per-token confidence pass):
 
 | Apple M4 | `llama.cpp` (q8_0) | CMF (q8) | Δ |
 |---|---|---|---|
-| pp512, CPU 8 threads | 1156 ± 14 tok/s | 375–383 tok/s | **−67%** |
-| tg128, CPU 8 threads | 162.0 ± 1.3 tok/s | 95–101 tok/s | **−38%** |
-| pp512, GPU (Metal `-ngl 99` / `CMF_GPU=1`) | 3339 ± 50 tok/s | 323–325 tok/s\* | **−90%** |
-| tg128, GPU (Metal `-ngl 99` / `CMF_GPU=1`) | 150.0 ± 0.4 tok/s | 100–101 tok/s\* | **−33%** |
+| tg128, CPU, their best `-t 6` | 165.5 ± 0.3 tok/s | 151–158 tok/s | **−5%** |
+| tg128, CPU, their default `-t 4` | 129.4 ± 0.2 tok/s | 151–158 tok/s | **+18%** |
+| tg128, their GPU (Metal `-ngl 99`) | 150.9 ± 0.4 tok/s | 151–158 tok/s (CPU) | **CMF CPU ≥ their Metal** |
+| pp512, CPU | 1168 ± 5 tok/s | 1017–1037 tok/s | **−12%** |
+| pp1024, CPU | — | 976 tok/s | flat curve (was 390 in 0.3.3) |
 | Quant quality (PPL vs own f16, 12×512 windows) | near-lossless | +0.38% | matched |
 | File size | 644 MB | 479 MB | **−26%** |
 
-\* CMF has no on-device graph yet, so `CMF_GPU=1` means: the runtime probe
-measures per-op offload against the CPU path and keeps the winner — on
-Apple-silicon unified memory that is (correctly) the CPU. Decode therefore
-lands at CPU parity, and prefill pays a one-time ~15% probing tax on the
-first prompt of a process; later prompts run at full CPU speed.
+Two releases ago this table read −38% tg128 and −67% pp512. What closed it:
+decode sheds the sampler's full-vocab copy and the per-token confidence
+softmax from the timed loop (they are real work, but work `llama-bench`
+does not measure — the default `cortiq bench` still measures the full
+production loop); prefill projections now ride Apple's AMX units through
+Accelerate GEMM over dequantized tiles, and the attention core attends the
+whole chunk as GEMMs with a causal masked softmax instead of walking
+positions one by one — which is exactly how `llama.cpp` gets its prefill
+number too.
 
 An earlier version of this table (0.3.0) claimed +70%/+60% over `llama.cpp`;
 that run had unknowingly benchmarked an x86-64 build of `llama.cpp` under
 Rosetta 2 emulation, which strips its SIMD. We keep the correction visible
 because the numbers only mean something if you can trust how they were taken.
 
-The honest gap decomposes cleanly: `llama.cpp` decode reaches ~85% of memory
-bandwidth through its repacked interleaved Q8 kernels (ours reach ~53% —
-row-repack on load is queued), its CPU prefill rides Apple's AMX units via
-Accelerate GEMM, and its Metal path is a full on-device graph, which the
-wgpu backend does not have yet. Where CMF stands apart is not the drag race:
-the file is 26% smaller at matched quality, attention memory can be O(1)
-(`--o1` holds ~16.5 tok/s at contexts where exact attention decays from 15.7
-to 8.2), and the whole engine is portable Rust with no BLAS or C++ toolchain.
-Reproduce everything with `cortiq bench --json` — it reports tok/s alongside
-allocations/token and scheduler dispatches/token.
+The remaining gap is kernel maturity: their repacked interleaved Q8 decode
+kernels still reach a few percent more of memory bandwidth than ours, and
+their BLAS prefill path is older than ours by years. Where CMF stands apart
+is not the drag race: the file is 26% smaller at matched quality, attention
+memory can be O(1) (`--o1` holds ~16.5 tok/s at contexts where exact
+attention decays from 15.7 to 8.2), 1-bit-trained models run on a GPU graph
+`llama.cpp` has no equivalent for (see [1-bit models](#1-bit-models-bonsai--bitnet-class)),
+and the whole engine is portable Rust with no C++ toolchain. Reproduce
+everything with `cortiq bench --json` (add `--core` for the llama-bench
+contract) — it reports tok/s alongside allocations/token and scheduler
+dispatches/token.
 
 ### One file, nothing on the side
 
@@ -272,7 +280,11 @@ GGUF import covers `Q4_0/1`, `Q5_0/1`, `Q8_0`, `Q2_K`…`Q6_K`, `IQ4_NL/XS` and
 Checkpoints **trained** with binary weights convert losslessly into `q1`
 (1.5 bits/weight — per-group weights already sit on two levels ±s, so the
 encoding just recovers them). A 27B becomes a 4.8 GB file that runs on a
-24 GB MacBook:
+24 GB MacBook — and on Apple silicon, `CMF_GPU=1` runs the whole token as
+a Metal graph (weights no-copy from the mmap, attention attends on the
+device, one sync per token): Bonsai-27B decodes at **10–11 tok/s** on an
+M4 with a ~3.5 s first token (0.3.3 did 5, CPU-only does 3.2);
+Bonsai-1.7B does ~75–79 tok/s.
 
 Requires **cortiq ≥ 0.3.2** — check with `cortiq --version`; an older
 binary answers `unknown quant 'q1'`. Update with
@@ -408,14 +420,29 @@ a budget (`CMF_GPU_VRAM_MB`, default 8192 on discrete cards); layers are made
 resident in first-touch order, so the budget behaves like llama.cpp's `-ngl`
 without a flag: first N layers on the GPU, the rest on the CPU.
 
-Enabling the GPU never makes you slower. Per-op offload pays a fixed
-submit+poll latency that differs by an order of magnitude between driver
-stacks, so at startup the engine *measures* instead of guessing: for each op
-class (FFN chain, large matvec, prefill GEMM, QKV batch) the first calls
-alternate between the GPU and the CPU path, both timed, and the faster arm is
-kept for the rest of the run — per machine, per model. Run with
-`RUST_LOG=cortiq_engine=info` to see the verdicts; `CMF_GPU_PROBE=0` skips
-the probe and trusts the GPU unconditionally.
+On macOS, `q1` models get more than per-op offload: the whole token runs
+as a Metal graph. Hidden state lives on the device across every layer,
+GatedDeltaNet blocks and full-attention layers share command buffers,
+attention attends **on the GPU** (rope, qk-norms, KV append into
+shared-memory mirrors, grouped online-softmax attend), and each command
+buffer is committed as soon as it is encoded so the GPU never idles —
+one wait per token. The CPU cache remains the owner of record: eviction,
+speculative rollback and serialization see exactly the state they would
+on the CPU path. Contract note: the GPU graph is distribution-equivalent
+to the CPU path (first-token probabilities match to ~0.3%; PPL matches),
+not bit-identical on every prompt — floating-point reductions run in a
+different order, as with any GPU offload. `CMF_GPU_ATTEND=0` keeps the
+attention core on the CPU, `CMF_GPU_BLOCK=0` disables the graph entirely.
+
+For everything else, enabling the GPU never makes you slower. Per-op
+offload pays a fixed submit+poll latency that differs by an order of
+magnitude between driver stacks, so at startup the engine *measures*
+instead of guessing: for each op class (FFN chain, large matvec, prefill
+GEMM, QKV batch) the first calls alternate between the GPU and the CPU
+path, both timed, and the faster arm is kept for the rest of the run —
+per machine, per model. Run with `RUST_LOG=cortiq_engine=info` to see the
+verdicts; `CMF_GPU_PROBE=0` skips the probe and trusts the GPU
+unconditionally.
 
 ## License
 
