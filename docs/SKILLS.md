@@ -32,8 +32,8 @@ is the backbone and domain text (a corpus, benchmark tasks), the engine
 finds the relevant neurons itself. This is exactly the imatrix-style
 "highlighting" intuition taken to its conclusion: run the corpus through
 the model and watch which FFN neurons carry the task — except instead of
-OR-ing the highlights the mask is *trained* (L1 regularization per the
-DTG-MA patent), because the honest measurement shows untrained top-K
+OR-ing the highlights the mask is *trained* (L1 regularization per
+DTG-MA — USPTO application 19/452,464, [PATENTS.md](../PATENTS.md)), because the honest measurement shows untrained top-K
 highlighting collapses quality (PPL 59 vs 11.9 — see below). The trained
 mask drops noise neurons — the model first gets *better* on the domain —
 then the last layers are polished against the exact teacher (FCD). No
@@ -183,6 +183,27 @@ explanation). Switching thresholds are hysteresis-guarded; tune with
 `CMF_ROUTE_EON` / `CMF_ROUTE_EOFF` (activation / abandonment E) if your
 skills sit closer together than these defaults.
 
+A real per-token trace with numbers (`--trace`, mixed prompt "Найди в
+базе всех клиентов без заказов: напиши SQL-запрос и объясни его
+по-русски", `CMF_ROUTE_EON=0.9 CMF_ROUTE_EOFF=1.0`):
+
+```
+  #  token        skill       E
+  0  Вот          —           —       first tokens: router builds φ-EMA
+  7  ,            —           0.857   E < EON(0.9) → switch on
+  8  который      thinker     0.857   thinker active
+ 23  sql          thinker     0.662   E floor — the SQL block
+ 31  c            thinker     0.834   Russian explanation: E climbs…
+ 47  ет           thinker     0.865   …but E < EOFF(1.0) — hysteresis holds
+```
+
+Read the numbers as margins: between switch-on (0.857 vs the 0.9
+threshold) and drop-out (0.865 vs 1.0) there is ~0.13 of slack — no
+flapping. The defaults (EON 0.62 / EOFF 0.74) are conservative: this
+swarm's E floor is 0.662, so an untuned file honestly stays on the
+backbone. Raise the thresholds when your skills' φ statistics sit
+further from live prompts than in this demo.
+
 ## Creating a skill: what actually matters
 
 `cortiq skill add` grafts tensors from a **donor** checkpoint into the
@@ -308,13 +329,14 @@ Three verdicts worth reading twice:
 ## Smaller than the original — and better: the DTG-MA bake
 
 The strongest form of a skill doesn't ride next to the backbone — it
-*replaces* it for one domain. The DTG-MA recipe (Patent 2) trains an
+*replaces* it for one domain. The DTG-MA recipe (USPTO application
+19/452,464 — legal context in [PATENTS.md](../PATENTS.md)) trains an
 L1-regularized mask over the FFN neurons on your task corpus, rides the
 *denoising bottom* (pruning noise neurons first IMPROVES the model
 before it starts to hurt), polishes the last layers against the exact
 teacher (FCD), and then `--defrag` bakes a standalone file where pruned
 neurons are physically absent — neither stored nor computed
-(claims 9/10):
+(claims 9/10 of application 19/452,464):
 
 ```sh
 # native, one command (see the previous section):
@@ -408,6 +430,27 @@ registry either way, so the file carries its own verdict.
 
 You can also restrict layers by hand (`--layers 12-23` halves the size);
 same rule — measure whether the behavior you care about survives.
+
+## A skill's passport — what to ship alongside
+
+The registry already carries almost everything needed for honest
+exchange; if you publish a skill (or prepare for a future skill-hub),
+the minimal passport is:
+
+| Field | Source | Why |
+|---|---|---|
+| `id`, `name` | `skill add --id/--name` | registry identity |
+| provenance | donor repo+revision, or the bake corpus file list | reproducibility |
+| donor license | the HF checkpoint's card | the right to redistribute delta weights |
+| `quality` | `--quality held-out.txt` — written into the registry | the measured verdict: backbone → overlaid, on what |
+| `--min-delta` threshold | the bake command | how many tensors were dropped as quant noise |
+| encoding | `--skill-quant`/`--mean-bits` | readers see whether the signal survived compression |
+| routing prompts | `--prompts file.txt` | the φ descriptor: how the file recognizes its prompts |
+
+Everything except the license and provenance travels inside the file
+(`skill list` shows it); state those two in the description next to it.
+Moving a skill between files of the same backbone is a catalog
+operation — no weight recomputation.
 
 ## How it works underneath
 

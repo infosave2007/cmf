@@ -523,14 +523,14 @@ file. Errors: opening a non-first shard directly, a missing sibling, a
 Gate (Qwen3.5-0.8B q8_2f, 5 shards ≤ 0.6 GB): sharded PPL == unsharded
 byte-exactly on the same binary; `verify` green on every shard alone.
 
-## 11. Defragmentation — physical pruning (Patent 2, claims 9/10)
+## 11. Defragmentation — physical pruning (USPTO App. 19/452,464, claims 9/10 — [PATENTS.md](../PATENTS.md))
 
 A mask (§5) is **virtual sparsity**: pruned neurons are flagged but still
 stored in full (all tasks share one backbone — you cannot physically cut
 it until you commit to ONE task). Defragmentation turns virtual sparsity
 into **physical compression**: pruned FFN neurons are dropped from the
 file — they are **neither stored nor computed**. This is Factory-Hard →
-defrag from Patent 2: "bake one mask into the weights" and emit a
+defrag from the DTG-MA application (19/452,464): "bake one mask into the weights" and emit a
 standalone compact `.cmf`.
 
 **Representation — no new feature bit, backward compatible.** Physical

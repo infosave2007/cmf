@@ -57,11 +57,14 @@ GGUF? `cortiq import-gguf <file-or-repo-id> --output model.cmf` читает и 
 **Запустится ли ваша модель?** Нативная конвертация на сегодня: qwen2 · qwen3 ·
 qwen3.5 (включая слитую раскладку qwen3_next / AgentWorld) · llama · mistral ·
 qwen-moe · gemma / gemma-3 (GeGLU, sandwich-нормы, скользящее окно 512 с
-двойным RoPE) · phi-3 / phi-4 (расщепление слитых qkv/gate_up, longrope на
-нативном окне) · дистилляты DeepSeek-R1 (раскладки qwen2/llama) — dense, MoE
-и GatedDeltaNet. Пока нет: gemma-2 (softcapping внимания) и DeepSeek V2/V3
-(MLA). Всё остальное — пробуйте `import-gguf`; и если он откажется, это
-ошибка, о которой стоит завести задачу.
+двойным RoPE) · gemma-4 dense 12B/31B (двухрежимное внимание: скользящий GQA
++ глобальный MQA с V=K, пропорциональный RoPE, послойные скаляры, софткап
+финальных логитов) · phi-3 / phi-4 (расщепление слитых qkv/gate_up, longrope
+на нативном окне) · дистилляты DeepSeek-R1 (раскладки qwen2/llama) — dense,
+MoE и GatedDeltaNet. Пока нет: gemma-2 (softcapping внимания), gemma-4
+MoE / E-серия и DeepSeek V2/V3 (MLA). Всё остальное — пробуйте
+`import-gguf`; и если он откажется, это ошибка, о которой стоит завести
+задачу.
 
 ## Встройте в то, чем уже пользуетесь
 
