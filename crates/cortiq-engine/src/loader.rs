@@ -311,6 +311,12 @@ impl Pipeline {
                 tc.eos_token_ids.len()
             );
         }
+        // Gemma's contract requires <bos> at sequence start, but its
+        // tokenizer.json post-processor does not add it (the chat
+        // template does). Raw prompts need it too — word salad without.
+        if arch.arch_name.to_lowercase().contains("gemma") && tokenizer.bos_token_id.is_some() {
+            tokenizer.add_bos = true;
+        }
 
         // ── Top-level weights (never masked → always quantized) ──
         let embed_tokens = load_matrix(model, "model.embed_tokens.weight", false, ov)?;
@@ -392,7 +398,10 @@ impl Pipeline {
             };
             let wq = t("self_attn.q_proj.weight")?;
             // Qwen3.5 output gate: q_proj rows = 2·nh·hd (per-head [q; gate]).
-            let output_gate = wq.rows() == 2 * arch.num_attention_heads * arch.head_dim;
+            // Gemma-4 global layers legitimately have nh·global_head_dim
+            // rows (which can equal 2·nh·hd) — never gated.
+            let output_gate = arch.global_head_dim.is_none()
+                && wq.rows() == 2 * arch.num_attention_heads * arch.head_dim;
             // Qwen2-family projection biases (by tensor presence).
             let bias = match (
                 n("self_attn.q_proj.bias"),
@@ -500,6 +509,14 @@ impl Pipeline {
                 } else {
                     None
                 },
+                // Gemma-4: learned scalar multiplying the layer output.
+                layer_scale: model
+                    .tensor(&format!("{prefix}layer_scalar"))
+                    .and_then(|_| {
+                        load_f32(model, &format!("{prefix}layer_scalar"), ov)
+                            .ok()
+                            .and_then(|v| v.first().copied())
+                    }),
                 // FFN always quantized — masks run sparse on quant bytes.
                 ffn: build_layer_ffn(model, &arch, li, false, ov)?,
                 attn,
@@ -523,6 +540,7 @@ impl Pipeline {
                 layer: LayerWeights {
                     attn_out_norm: None,
                     ffn_out_norm: None,
+                    layer_scale: None,
                     input_norm: load_f32(model, &format!("{p}layers.0.input_layernorm.weight"), ov)
                         .map_err(err)?,
                     post_norm: load_f32(
@@ -605,6 +623,31 @@ impl Pipeline {
                 ));
             }
         }
+        // Gemma-4: global layers run their own geometry (MQA at
+        // global_head_dim) with a proportional RoPE — the first
+        // factor·head_dim dims rotate, the zero-padded tail is identity.
+        if let (Some(ghd), Some(gkv)) = (arch.global_head_dim, arch.num_global_kv_heads) {
+            pipeline.global_attn = Some((ghd, gkv));
+            let prf = arch.global_partial_rotary_factor.unwrap_or(1.0);
+            let half = ghd / 2;
+            let ra = (((prf * ghd as f32) as usize) / 2).min(half);
+            let mut f = vec![0.0f32; half];
+            for (i, slot) in f.iter_mut().enumerate().take(ra) {
+                *slot = 1.0 / (arch.rope_theta as f32).powf(2.0 * i as f32 / ghd as f32);
+            }
+            pipeline.inv_freq_global = Some(std::sync::Arc::new(f));
+            // Re-shape the global layers' KV storage to their geometry.
+            if let Some((_, p)) = pipeline.swa {
+                for li in 0..arch.num_layers {
+                    if (li + 1) % p.max(1) == 0 {
+                        pipeline.kv_cache.layers[li] =
+                            crate::kv_cache::LayerKvCache::new(gkv, ghd);
+                    }
+                }
+            }
+        }
+        pipeline.attn_v_norm = arch.attn_v_norm;
+        pipeline.final_softcap = arch.final_logit_softcapping.map(|c| c as f32);
         pipeline.vmf_cfg = vmf_cfg;
         pipeline.gdn_cfg = gdn_cfg;
         pipeline.mtp = mtp;

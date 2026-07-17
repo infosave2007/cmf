@@ -35,6 +35,9 @@ pub struct Tokenizer {
     /// Pre-tokenizer split pattern (None = whitespace fallback for the
     /// synthetic `byte_level()` tokenizer)
     split_re: Option<fancy_regex::Regex>,
+    /// SentencePiece Prepend("▁") normalizer present (llama family).
+    /// Gemma replaces spaces with ▁ but does NOT prepend one.
+    sp_prepend: bool,
     /// SentencePiece family (TinyLlama/Llama-2/Mistral): metaspace ▁
     /// normalization + byte_fallback, no byte-level alphabet.
     metaspace: bool,
@@ -192,7 +195,10 @@ impl Tokenizer {
         let add_bos = hf
             .post_processor
             .as_ref()
-            .map(|p| p.to_string().contains("\"<s>\""))
+            .map(|p| {
+                let pp = p.to_string();
+                pp.contains("\"<s>\"") || pp.contains("\"<bos>\"")
+            })
             .unwrap_or(false);
         let nfc = hf
             .normalizer
@@ -205,6 +211,11 @@ impl Tokenizer {
                 .as_ref()
                 .map(|n| n.to_string().contains("\u{2581}") || n.to_string().contains("▁"))
                 .unwrap_or(false);
+        let sp_prepend = hf
+            .normalizer
+            .as_ref()
+            .map(|n| n.to_string().contains("Prepend"))
+            .unwrap_or(false);
         let split_re = if metaspace {
             None
         } else {
@@ -239,7 +250,7 @@ impl Tokenizer {
                 "<|endoftext|>" | "</s>" => eos_token_id = Some(at.id),
                 "<|im_start|>" => im_start_id = Some(at.id),
                 "<|im_end|>" => im_end_id = Some(at.id),
-                "<s>" => bos_token_id = Some(at.id),
+                "<s>" | "<bos>" => bos_token_id = Some(at.id),
                 "<pad>" => pad_token_id = Some(at.id),
                 _ => {}
             }
@@ -274,6 +285,7 @@ impl Tokenizer {
             special_ids,
             split_re,
             metaspace,
+            sp_prepend,
             nfc,
             byte_to_char,
             char_to_byte,
@@ -307,6 +319,7 @@ impl Tokenizer {
             special_ids: HashSet::new(),
             split_re: None,
             metaspace: false,
+            sp_prepend: false,
             nfc: false,
             byte_to_char,
             char_to_byte,
@@ -368,9 +381,14 @@ impl Tokenizer {
             segment.to_string()
         };
         if self.metaspace {
-            // SentencePiece: Prepend("▁") + Replace(" "→"▁"), BPE over
+            // SentencePiece: [Prepend("▁") +] Replace(" "→"▁"), BPE over
             // chars of the whole span (no pre-tokenizer, no byte map).
-            let sp = format!("\u{2581}{}", norm).replace(' ', "\u{2581}");
+            // Gemma's normalizer replaces only — no dummy prefix.
+            let sp = if self.sp_prepend {
+                format!("\u{2581}{}", norm).replace(' ', "\u{2581}")
+            } else {
+                norm.replace(' ', "\u{2581}")
+            };
             self.bpe_piece_sp(&sp, out);
             return;
         }
@@ -571,7 +589,7 @@ impl Tokenizer {
             }
         }
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        if self.metaspace {
+        if self.metaspace && self.sp_prepend {
             // SP decoder Strip(start=1): one leading space from Prepend.
             if let Some(stripped) = text.strip_prefix(' ') {
                 return stripped.to_string();

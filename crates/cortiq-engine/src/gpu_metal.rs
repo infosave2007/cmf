@@ -2434,6 +2434,11 @@ mod tests {
             sliding_window: None,
             sliding_window_pattern: None,
             rope_local_base_freq: None,
+            global_head_dim: None,
+            num_global_kv_heads: None,
+            global_partial_rotary_factor: None,
+            final_logit_softcapping: None,
+            attn_v_norm: false,
         };
         let header = CmfHeader {
             format: "cmf".into(),
@@ -2555,6 +2560,11 @@ mod tests {
             sliding_window: None,
             sliding_window_pattern: None,
             rope_local_base_freq: None,
+            global_head_dim: None,
+            num_global_kv_heads: None,
+            global_partial_rotary_factor: None,
+            final_logit_softcapping: None,
+            attn_v_norm: false,
         };
         let header = CmfHeader {
             format: "cmf".into(),

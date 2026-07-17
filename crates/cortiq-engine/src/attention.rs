@@ -12,6 +12,16 @@ use crate::kv_cache::LayerKvCache;
 use crate::pool::Pool;
 use crate::qtensor::QTensor;
 
+/// Scale-less RMS normalization of one V head (Gemma-4):
+/// x ← x / sqrt(mean(x²) + eps). No weight, no +1 — pure normalization.
+fn vnorm_head(x: &mut [f32], eps: f64) {
+    let ms = x.iter().map(|&a| (a as f64) * (a as f64)).sum::<f64>() / x.len().max(1) as f64;
+    let inv = 1.0 / (ms + eps).sqrt() as f32;
+    for a in x.iter_mut() {
+        *a *= inv;
+    }
+}
+
 /// Precompute RoPE inverse frequencies for a head dimension — powf is
 /// paid once per model, not per (head × position × dim) in the hot loop.
 pub fn rope_inv_freq(head_dim: usize, base: f32) -> Vec<f32> {
@@ -575,6 +585,9 @@ pub struct QwenAttnCfg<'a> {
     /// Sliding-window width: attend only the last N positions (Gemma-3
     /// local layers). None = full context.
     pub window: Option<usize>,
+    /// Scale-less RMS normalization of each V head before it enters
+    /// the cache (Gemma-4).
+    pub v_norm: bool,
     /// Norm-weight semantics for qk-norm (same as the layer norms).
     pub norm_style: cortiq_core::NormStyle,
     /// Qwen2-family q/k/v projection biases (added after the matvecs).
@@ -770,6 +783,11 @@ fn finish_projection(
             rmsnorm_head(&mut k[g * hd..g * hd + hd], kw, cfg.rms_eps, cfg.norm_style);
         }
     }
+    if cfg.v_norm {
+        for g in 0..nkv {
+            vnorm_head(&mut v[g * hd..g * hd + hd], cfg.rms_eps);
+        }
+    }
 
     // Partial RoPE: rotate only the first rotary_dim dims of each head.
     let rd = cfg.rotary_dim.min(hd);
@@ -954,6 +972,11 @@ pub fn qwen_attention_batch(
         if let Some(kw) = cfg.k_norm {
             for g in 0..nkv {
                 rmsnorm_head(&mut k[g * hd..g * hd + hd], kw, cfg.rms_eps, cfg.norm_style);
+            }
+        }
+        if cfg.v_norm {
+            for g in 0..nkv {
+                vnorm_head(&mut v[g * hd..g * hd + hd], cfg.rms_eps);
             }
         }
         for hh in 0..nh {
@@ -1197,6 +1220,7 @@ mod tests {
             rotary_dim: hd,
             scale: 1.0 / (hd as f32).sqrt(),
             window: None,
+            v_norm: false,
             q_norm: None,
             k_norm: None,
             output_gate: false,

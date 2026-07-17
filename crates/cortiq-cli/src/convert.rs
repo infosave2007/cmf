@@ -48,6 +48,12 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
     if raw.contains(".visual.") || raw.starts_with("visual.") || raw.starts_with("mtp.") || raw.contains(".mtp.") {
         return None;
     }
+    // Gemma-4 multimodal towers (text tower converts alone).
+    for pfx in ["model.vision_embedder.", "model.embed_audio.", "model.embed_vision."] {
+        if raw.starts_with(pfx) {
+            return None;
+        }
+    }
     for pfx in ["model.language_model.", "language_model.model.", "language_model."] {
         if let Some(rest) = raw.strip_prefix(pfx) {
             return Some(format!("model.{rest}"));
@@ -537,24 +543,93 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     let head_dim = cfg_usize(tc, "head_dim").unwrap_or(hidden / n_heads.max(1));
     // Zero-centered RMSNorm x̂·(1+w): Gemma family and Qwen3.5 / Qwen3-Next.
     let mt = model_type.to_lowercase();
-    let norm_style = if mt.contains("gemma") || mt.starts_with("qwen3_5") || mt.contains("qwen3_next") {
+    let norm_style = if (mt.contains("gemma") && !mt.contains("gemma4"))
+        || mt.starts_with("qwen3_5")
+        || mt.contains("qwen3_next")
+    {
         NormStyle::Gemma
     } else {
+        // Gemma-4 went back to plain x̂·w (Gemma3nRMSNorm lineage).
         NormStyle::Qwen
     };
     // Gemma family: GeGLU FFN, √hidden embedding scale, an attention
     // scale of its own, and (Gemma-3) interleaved sliding-window layers
-    // with a separate local RoPE base. Gemma-2's logit soft-capping is
-    // not implemented — refuse it loudly rather than emit a wrong file.
+    // with a separate local RoPE base. Gemma-2's ATTENTION soft-capping
+    // is not implemented — refuse it loudly rather than emit a wrong
+    // file. (Gemma-4's FINAL-logit capping is supported.)
     let is_gemma = mt.contains("gemma");
+    let is_gemma4 = mt.contains("gemma4");
     if tc.get("attn_logit_softcapping").and_then(|v| v.as_f64()).is_some()
-        || tc.get("final_logit_softcapping").and_then(|v| v.as_f64()).is_some()
+        || (!is_gemma4 && tc.get("final_logit_softcapping").and_then(|v| v.as_f64()).is_some())
     {
         anyhow::bail!(
-            "{model_type}: logit soft-capping (Gemma-2) is not supported yet — \
-             Gemma-1/Gemma-3 convert natively"
+            "{model_type}: attention logit soft-capping (Gemma-2) is not supported yet — \
+             Gemma-1/Gemma-3/Gemma-4 convert natively"
         );
     }
+    // Gemma-4 (text tower): plain x̂·w norms (unlike gemma-3), dual-geometry
+    // attention (sliding GQA at head_dim + global MQA at global_head_dim
+    // with proportional partial rotary), scale-less V-norm, per-layer
+    // output scalars and final-logit capping. The dense 12B/31B variants
+    // convert; the MoE / E-series machinery is refused honestly.
+    if is_gemma4 {
+        if tc.get("enable_moe_block").and_then(|v| v.as_bool()).unwrap_or(false) {
+            anyhow::bail!("{model_type}: gemma-4 MoE block (26B-A4B) is not supported yet");
+        }
+        if cfg_usize(tc, "hidden_size_per_layer_input").unwrap_or(0) > 0 {
+            anyhow::bail!(
+                "{model_type}: gemma-4 E-series per-layer inputs are not supported yet — \
+                 the dense 12B/31B variants convert natively"
+            );
+        }
+        if cfg_usize(tc, "num_kv_shared_layers").unwrap_or(0) > 0 {
+            anyhow::bail!("{model_type}: gemma-4 KV-shared layers are not supported yet");
+        }
+    }
+    // Gemma-4 keys rope_parameters by layer type: the global layers'
+    // theta is the model theta, the sliding layers' theta is the local
+    // base (same split gemma-3 spells with flat keys).
+    let (g4_rope_theta, g4_local_theta, g4_global_prf) = match rope {
+        Some(r) if is_gemma4 => {
+            let full = r.get("full_attention");
+            let slide = r.get("sliding_attention");
+            (
+                full.and_then(|f| f.get("rope_theta")).and_then(|v| v.as_f64()),
+                slide.and_then(|f| f.get("rope_theta")).and_then(|v| v.as_f64()),
+                full.and_then(|f| f.get("partial_rotary_factor"))
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32),
+            )
+        }
+        _ => (None, None, None),
+    };
+    let rope_theta = g4_rope_theta.unwrap_or(rope_theta);
+    // Sliding pattern from the explicit layer-type list: full layers must
+    // sit at every P-th position ((i+1) % P == 0), which is how the
+    // runtime models the cadence.
+    let g4_pattern: Option<usize> = if is_gemma4 {
+        let fulls: Vec<usize> = tc
+            .get("layer_types")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .enumerate()
+                    .filter(|(_, v)| v.as_str() == Some("full_attention"))
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let p = fulls.first().map(|f| f + 1).unwrap_or(0);
+        if p == 0
+            || fulls.iter().enumerate().any(|(k, &i)| i != p * (k + 1) - 1)
+            || (n_layers / p) != fulls.len()
+        {
+            anyhow::bail!("{model_type}: irregular full/sliding layer schedule not supported");
+        }
+        Some(p)
+    } else {
+        None
+    };
     let hidden_act = match tc
         .get("hidden_activation")
         .or_else(|| tc.get("hidden_act"))
@@ -615,11 +690,27 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         linear_value_head_dim: lvd,
         hidden_act,
         embed_multiplier,
-        query_pre_attn_scalar: tc.get("query_pre_attn_scalar").and_then(|v| v.as_f64()),
+        // Gemma-4 attends with scaling = 1.0 (q-norm carries the scale).
+        query_pre_attn_scalar: tc
+            .get("query_pre_attn_scalar")
+            .and_then(|v| v.as_f64())
+            .or(if is_gemma4 { Some(1.0) } else { None }),
         sliding_window: cfg_usize(tc, "sliding_window")
-            .filter(|_| tc.get("sliding_window_pattern").is_some()),
-        sliding_window_pattern: cfg_usize(tc, "sliding_window_pattern"),
-        rope_local_base_freq: tc.get("rope_local_base_freq").and_then(|v| v.as_f64()),
+            .filter(|_| tc.get("sliding_window_pattern").is_some() || g4_pattern.is_some()),
+        sliding_window_pattern: cfg_usize(tc, "sliding_window_pattern").or(g4_pattern),
+        rope_local_base_freq: tc
+            .get("rope_local_base_freq")
+            .and_then(|v| v.as_f64())
+            .or(g4_local_theta),
+        global_head_dim: cfg_usize(tc, "global_head_dim").filter(|_| is_gemma4),
+        num_global_kv_heads: cfg_usize(tc, "num_global_key_value_heads").filter(|_| is_gemma4),
+        global_partial_rotary_factor: g4_global_prf,
+        final_logit_softcapping: if is_gemma4 {
+            tc.get("final_logit_softcapping").and_then(|v| v.as_f64())
+        } else {
+            None
+        },
+        attn_v_norm: is_gemma4,
     })
 }
 
@@ -1262,6 +1353,40 @@ pub fn run_convert(
                     });
                 }
                 continue;
+            }
+            // Gemma-4 global (full-attention) layers carry no v_proj —
+            // V is the K projection, normalized separately at runtime
+            // (attention_k_eq_v). Materialize the duplicate so the
+            // runtime keeps its uniform Q/K/V/O contract; the overlay
+            // costs one MQA-sized tensor per global layer.
+            if arch.global_head_dim.is_some() && name.ends_with(".self_attn.k_proj.weight") {
+                let li: Option<usize> = name
+                    .split(".layers.")
+                    .nth(1)
+                    .and_then(|r| r.split('.').next())
+                    .and_then(|n| n.parse().ok());
+                let pat = arch.sliding_window_pattern.unwrap_or(usize::MAX);
+                if let Some(li) = li {
+                    if (li + 1) % pat == 0 {
+                        anyhow::ensure!(m.shape.len() == 2, "'{name}': expected 2-D");
+                        let w = to_f32(&m.dtype, file.bytes(m))?;
+                        let (rows, cols) = (m.shape[0], m.shape[1]);
+                        for out_name in [name.clone(), name.replace("k_proj", "v_proj")] {
+                            let (dt, data) = if rows * cols >= GROUP_SIZE && !force_f16(&out_name) {
+                                quantize_2d(quant, &w, rows, cols)
+                            } else {
+                                (TensorDtype::F16, encode_f16(&w))
+                            };
+                            tensors.push(TensorSpec {
+                                name: out_name,
+                                dtype: dt,
+                                shape: vec![rows, cols],
+                                data,
+                            });
+                        }
+                        continue;
+                    }
+                }
             }
             // Defrag: for an FFN weight of a pruned layer, take the baked
             // overlay (if any) else the backbone value, drop dead neurons

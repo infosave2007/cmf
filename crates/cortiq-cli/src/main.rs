@@ -1984,6 +1984,11 @@ async fn cmd_run(
         } else {
             let mut ids = resume_prefix.clone();
             ids.extend(pipeline.tokenizer.encode(text));
+            // Fresh raw context: honor the tokenizer's BOS contract
+            // (llama <s>, gemma <bos>) — word salad without it.
+            if resume_prefix.is_empty() {
+                ids = pipeline.tokenizer.with_bos(ids);
+            }
             ids
         }
     };

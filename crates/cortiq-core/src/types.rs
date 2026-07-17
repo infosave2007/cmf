@@ -235,6 +235,22 @@ pub struct ModelArch {
     /// …and the local layers' own RoPE base (global layers use rope_theta).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rope_local_base_freq: Option<f64>,
+    /// Gemma-4: global (full-attention) layers use their own head dim…
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_head_dim: Option<usize>,
+    /// …their own KV head count (1 = MQA)…
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_global_kv_heads: Option<usize>,
+    /// …and a proportional partial rotary: the first `factor·head_dim`
+    /// dims rotate, the rest ride at angle 0 (identity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_partial_rotary_factor: Option<f32>,
+    /// Final-logit soft-capping: logits = C·tanh(logits/C) (Gemma-4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_logit_softcapping: Option<f64>,
+    /// Scale-less RMS normalization of V heads before caching (Gemma-4).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attn_v_norm: bool,
     /// Multi-token-prediction head (None = absent)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<MtpConfig>,

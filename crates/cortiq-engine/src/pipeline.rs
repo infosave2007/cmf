@@ -135,6 +135,16 @@ pub struct Pipeline {
     /// RoPE table of the sliding (local) layers, when they use their
     /// own base frequency (Gemma-3: 10k local vs 1M global).
     pub inv_freq_local: Option<std::sync::Arc<Vec<f32>>>,
+    /// Gemma-4: global layers run their own geometry — (head_dim,
+    /// num_kv_heads); sliding layers keep the base fields.
+    pub global_attn: Option<(usize, usize)>,
+    /// Gemma-4: the global layers' proportional RoPE table (len
+    /// global_head_dim/2, zero-padded tail = identity rotation).
+    pub inv_freq_global: Option<std::sync::Arc<Vec<f32>>>,
+    /// Scale-less RMS normalization of V heads before caching (Gemma-4).
+    pub attn_v_norm: bool,
+    /// Final-logit soft-capping C: logits = C·tanh(logits/C) (Gemma-4).
+    pub final_softcap: Option<f32>,
     /// Compute per-token Born confidence (a full-vocab softmax each
     /// token). On by default; `bench --core` turns it off to match
     /// llama-bench's core timing.
@@ -172,6 +182,8 @@ pub struct LayerWeights {
     /// Gemma-2/3 sandwich: norm applied to the ATTENTION OUTPUT before
     /// its residual add (`post_attention_layernorm` there).
     pub attn_out_norm: Option<Vec<f32>>,
+    /// Gemma-4: the whole layer output is multiplied by this scalar.
+    pub layer_scale: Option<f32>,
     /// Gemma-2/3 sandwich: norm applied to the FFN OUTPUT before its
     /// residual add (`post_feedforward_layernorm`).
     pub ffn_out_norm: Option<Vec<f32>>,
@@ -414,10 +426,13 @@ impl Pipeline {
         // (sliding window, scale override, sandwich norms, GeLU) fall
         // back to the CPU path.
         if self.swa.is_some()
+            || self.global_attn.is_some()
+            || self.attn_v_norm
             || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
             || self.weights.layers.iter().any(|lw| {
                 lw.attn_out_norm.is_some()
                     || lw.ffn_out_norm.is_some()
+                    || lw.layer_scale.is_some()
                     || matches!(&lw.ffn, FfnKind::Dense(d) if d.act != Act::Silu)
             })
         {
@@ -693,6 +708,7 @@ impl Pipeline {
                         rotary_dim: rd,
                         scale: self.attn_scale,
                         window: None,
+                        v_norm: false,
                         q_norm: *q_norm,
                         k_norm: *k_norm,
                         output_gate: *output_gate,
@@ -818,6 +834,10 @@ impl Pipeline {
             attn_scale: 1.0 / (head_dim as f32).sqrt(),
             swa: None,
             inv_freq_local: None,
+            global_attn: None,
+            inv_freq_global: None,
+            attn_v_norm: false,
+            final_softcap: None,
             graph_kv_id: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -926,6 +946,7 @@ impl Pipeline {
             rotary_dim: self.rotary_dim,
             scale: self.attn_scale,
             window: None,
+            v_norm: false,
             q_norm: None,
             k_norm: None,
             output_gate: false,
@@ -944,7 +965,7 @@ impl Pipeline {
         task_mask: Option<&TaskMask>,
         on_token: Option<TokenCallback>,
     ) -> Result<GenerateResult, String> {
-        let input_ids = self.tokenizer.encode(prompt);
+        let input_ids = self.tokenizer.with_bos(self.tokenizer.encode(prompt));
         self.generate_from_ids(&input_ids, max_tokens, task_mask, on_token)
     }
 
@@ -962,6 +983,9 @@ impl Pipeline {
         task_mask: Option<&TaskMask>,
         mut on_token: Option<TokenCallback>,
     ) -> Result<GenerateResult, String> {
+        if std::env::var("CMF_TRACE_H").is_ok() {
+            eprintln!("input_ids: {input_ids:?}");
+        }
         if input_ids.is_empty() {
             return Err("empty prompt: nothing to generate from".to_string());
         }
@@ -1350,7 +1374,7 @@ impl Pipeline {
     fn forward_pair(&mut self, emb1: &[f32], emb2: &[f32], position: usize) -> (Vec<f32>, Vec<f32>) {
         let mut h1 = emb1.to_vec();
         let mut h2 = emb2.to_vec();
-        let (nh, nkv, hd, hs, rd, eps) = (
+        let (nh, _nkv, _hd, hs, _rd, eps) = (
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
@@ -1391,16 +1415,18 @@ impl Pipeline {
                     bias,
                 } => {
                     let inv_freq_l = self.layer_inv_freq(li);
+                    let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
                     let cfg = QwenAttnCfg {
                         num_heads: nh,
-                        num_kv_heads: nkv,
-                        head_dim: hd,
+                        num_kv_heads: nkv_l,
+                        head_dim: hd_l,
                         hidden_size: hs,
                         position,
                         inv_freq: &inv_freq_l,
-                        rotary_dim: rd,
+                        rotary_dim: rd_l,
                         scale: self.attn_scale,
                         window: self.layer_window(li),
+                        v_norm: self.attn_v_norm,
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
@@ -1457,6 +1483,12 @@ impl Pipeline {
             let (mut f1, mut f2) = (f1, f2);
             attention::recycle_buf(&mut f1);
             attention::recycle_buf(&mut f2);
+            if let Some(sc) = self.weights.layers[li].layer_scale {
+                for i in 0..self.hidden_size {
+                    h1[i] *= sc;
+                    h2[i] *= sc;
+                }
+            }
         }
         (h1, h2)
     }
@@ -1866,7 +1898,7 @@ impl Pipeline {
         for &id in ids {
             h.extend_from_slice(&self.embed_single(id));
         }
-        let (nh, nkv, hd, rd, eps) = (
+        let (nh, _nkv, _hd, _rd, eps) = (
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
@@ -1916,16 +1948,18 @@ impl Pipeline {
                         );
                     }
                     let inv_freq_l = self.layer_inv_freq(li);
+                    let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
                     let cfg = QwenAttnCfg {
                         num_heads: nh,
-                        num_kv_heads: nkv,
-                        head_dim: hd,
+                        num_kv_heads: nkv_l,
+                        head_dim: hd_l,
                         hidden_size: hs,
                         position: start_pos,
                         inv_freq: &inv_freq_l,
-                        rotary_dim: rd,
+                        rotary_dim: rd_l,
                         scale: self.attn_scale,
                         window: self.layer_window(li),
+                        v_norm: self.attn_v_norm,
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
@@ -1991,6 +2025,16 @@ impl Pipeline {
             for (dst, &f) in h.iter_mut().zip(&ffn) {
                 *dst += f;
             }
+            if let Some(sc) = lw.layer_scale {
+                for v in h.iter_mut() {
+                    *v *= sc;
+                }
+            }
+            if std::env::var("CMF_TRACE_H").is_ok() {
+                let n = h[..hs].iter().map(|v| v.abs()).sum::<f32>() / hs as f32;
+                let mx = h[..hs].iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                eprintln!("layer {li}: mean|h|={n:.4} max|h|={mx:.2} scale={:?}", lw.layer_scale);
+            }
         }
         crate::gpu::set_layer(-1); // lm_head/final ops outside layer-split
         h
@@ -2019,12 +2063,15 @@ impl Pipeline {
         }
     }
 
-    /// The RoPE table for layer `li` (local layers may have their own).
+    /// The RoPE table for layer `li` (local layers may have their own;
+    /// Gemma-4 global layers use the proportional padded table).
     fn layer_inv_freq(&self, li: usize) -> std::sync::Arc<Vec<f32>> {
         if self.layer_is_local(li) {
             if let Some(f) = &self.inv_freq_local {
                 return f.clone();
             }
+        } else if let Some(f) = &self.inv_freq_global {
+            return f.clone();
         }
         self.inv_freq.clone()
     }
@@ -2035,6 +2082,17 @@ impl Pipeline {
             Some((w, _)) if self.layer_is_local(li) => Some(w),
             _ => None,
         }
+    }
+
+    /// Attention geometry of layer `li`: (num_kv_heads, head_dim,
+    /// rotary_dim). Gemma-4 global layers override all three.
+    fn layer_geom(&self, li: usize) -> (usize, usize, usize) {
+        if !self.layer_is_local(li) {
+            if let Some((ghd, gkv)) = self.global_attn {
+                return (gkv, ghd, ghd);
+            }
+        }
+        (self.num_kv_heads, self.head_dim, self.rotary_dim)
     }
 
     /// Forward one position through all layers (hybrid dispatch).
@@ -2058,7 +2116,7 @@ impl Pipeline {
         let mut h = hidden.to_vec();
         // Split borrows: copy scalars / clone handles so the per-layer
         // cfg does not hold `&self` while the KV cache is `&mut`.
-        let (nh, nkv, hd, hs, rd, eps) = (
+        let (nh, _nkv, _hd, hs, _rd, eps) = (
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
@@ -2138,16 +2196,18 @@ impl Pipeline {
                     // O(1) override: decode on the sealed Nyström state
                     // instead of the growing KV cache.
                     let inv_freq_l = self.layer_inv_freq(li);
+                    let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
                     let cfg = QwenAttnCfg {
                         num_heads: nh,
-                        num_kv_heads: nkv,
-                        head_dim: hd,
+                        num_kv_heads: nkv_l,
+                        head_dim: hd_l,
                         hidden_size: hs,
                         position,
                         inv_freq: &inv_freq_l,
-                        rotary_dim: rd,
+                        rotary_dim: rd_l,
                         scale: self.attn_scale,
                         window: None,
+                        v_norm: self.attn_v_norm,
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
@@ -2211,16 +2271,18 @@ impl Pipeline {
                                 );
                             }
                             let inv_freq_l = self.layer_inv_freq(li);
+                            let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
                             let cfg = QwenAttnCfg {
                                 num_heads: nh,
-                                num_kv_heads: nkv,
-                                head_dim: hd,
+                                num_kv_heads: nkv_l,
+                                head_dim: hd_l,
                                 hidden_size: hs,
                                 position,
                                 inv_freq: &inv_freq_l,
-                                rotary_dim: rd,
+                                rotary_dim: rd_l,
                                 scale: self.attn_scale,
                                 window: self.layer_window(li),
+                                v_norm: self.attn_v_norm,
                                 q_norm: q_norm.as_deref(),
                                 k_norm: k_norm.as_deref(),
                                 output_gate: *output_gate,
@@ -2334,6 +2396,13 @@ impl Pipeline {
             }
             let mut ffn_out = ffn_out;
             attention::recycle_buf(&mut ffn_out);
+
+            // Gemma-4: the layer output is scaled by a learned scalar.
+            if let Some(sc) = self.weights.layers[li].layer_scale {
+                for v in h.iter_mut() {
+                    *v *= sc;
+                }
+            }
 
             // Dynamic routing φ capture (on-policy, fireball-style): the
             // EMA of the post-residual hidden at the router's phi_layer,
@@ -2462,6 +2531,11 @@ impl Pipeline {
             .lm_head
             .matvec(hidden, &mut logits, self.pool.as_deref());
         logits.resize(self.vocab_size, 0.0);
+        if let Some(c) = self.final_softcap {
+            for l in logits.iter_mut() {
+                *l = c * (*l / c).tanh();
+            }
+        }
         logits
     }
 
@@ -2513,6 +2587,7 @@ pub fn create_test_pipeline(
             post_norm: vec![1.0; hidden_size],
             attn_out_norm: None,
             ffn_out_norm: None,
+            layer_scale: None,
             ffn: FfnKind::Dense(DenseFfn {
                 gate_proj: qt(intermediate_size, hidden_size, li * 10 + 5),
                 up_proj: qt(intermediate_size, hidden_size, li * 10 + 6),
@@ -3178,6 +3253,7 @@ mod tests {
                 post_norm: vec![1.0; h],
                 attn_out_norm: None,
                 ffn_out_norm: None,
+                layer_scale: None,
                 ffn: FfnKind::Dense(DenseFfn {
                     gate_proj: qt(inter, h, 315),
                     up_proj: qt(inter, h, 316),
