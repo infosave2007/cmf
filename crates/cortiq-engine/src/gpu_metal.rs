@@ -437,6 +437,81 @@ kernel void gqa_attend(
     }
 }
 
+// Chunk (prefill) attend: gqa_attend batched over the chunk's query
+// positions with the causal bound — query bi sees cache rows
+// 0 .. s0+bi. One simdgroup per (query, head), online softmax, the
+// same Born-importance second pass accumulated atomically across every
+// query and head (matching the CPU chunk path's masked column sums).
+// The chunk's own K/V rows must already sit in the mirror.
+kernel void chunk_attend(
+    device const float* q    [[buffer(0)]],   // [nb, nh, hd] post-rope
+    device const float* kbuf [[buffer(1)]],
+    device const float* vbuf [[buffer(2)]],
+    device float*       outb [[buffer(3)]],   // [nb, nh, hd]
+    device atomic_float* imp [[buffer(4)]],
+    constant uint& nh  [[buffer(5)]],
+    constant uint& hpk [[buffer(6)]],
+    constant uint& hd  [[buffer(7)]],
+    constant uint& cap [[buffer(8)]],
+    constant uint& s0  [[buffer(9)]],
+    constant uint& nb  [[buffer(10)]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sgs [[simdgroups_per_threadgroup]])
+{
+    uint h = tg.x * sgs + sg;
+    uint bi = tg.y;
+    if (h >= nh || bi >= nb) return;
+    uint n = s0 + bi + 1u;
+    uint kh = h / hpk;
+    device const float* kh0 = kbuf + (ulong)kh * cap * hd;
+    device const float* vh0 = vbuf + (ulong)kh * cap * hd;
+    device const float* qh = q + ((ulong)bi * nh + h) * hd;
+    float scale = 1.0f / sqrt((float)hd);
+    uint nt = (hd + 31u) / 32u;
+    float qv[4];
+    for (uint t = 0; t < nt; ++t) {
+        uint d = t * 32u + lane;
+        qv[t] = d < hd ? qh[d] * scale : 0.0f;
+    }
+    float m = -INFINITY, l = 0.0f;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint p = 0; p < n; ++p) {
+        device const float* kr = kh0 + (ulong)p * hd;
+        float partial = 0.0f;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) partial += qv[t] * kr[d];
+        }
+        float sv = simd_sum(partial);
+        float mp = max(m, sv);
+        float f = exp(m - mp), w = exp(sv - mp);
+        l = l * f + w;
+        device const float* vr = vh0 + (ulong)p * hd;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) acc[t] = acc[t] * f + w * vr[d];
+        }
+        m = mp;
+    }
+    float invl = l > 0.0f ? 1.0f / l : 0.0f;
+    device float* oh = outb + ((ulong)bi * nh + h) * hd;
+    for (uint t = 0; t < nt; ++t) {
+        uint d = t * 32u + lane;
+        if (d < hd) oh[d] = acc[t] * invl;
+    }
+    for (uint p = lane; p < n; p += 32u) {
+        device const float* kr = kh0 + (ulong)p * hd;
+        float dotv = 0.0f;
+        for (uint d = 0; d < hd; ++d) {
+            dotv += qh[d] * kr[d];
+        }
+        float prob = exp(dotv * scale - m) * invl;
+        atomic_fetch_add_explicit(&imp[p], prob, memory_order_relaxed);
+    }
+}
+
 // a *= sigmoid(g) — the Qwen3.5 attention output gate.
 kernel void sig_gate(
     device float*       a [[buffer(0)]],
@@ -542,6 +617,128 @@ kernel void rmsnorm_k(
     for (uint i = tid; i < n; i += 256u) {
         float wv = gemma != 0u ? (1.0f + w[i]) : w[i];
         o[i] = x[i] * inv * wv;
+    }
+}
+
+// rmsnorm_k over a batch: one threadgroup per row.
+kernel void rmsnorm_rows(
+    device const float* x [[buffer(0)]],
+    device const float* w [[buffer(1)]],
+    device float*       o [[buffer(2)]],
+    constant uint&      n [[buffer(3)]],
+    constant uint&  gemma [[buffer(4)]],
+    constant float&   eps [[buffer(5)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint row  [[threadgroup_position_in_grid]])
+{
+    threadgroup float part[8];
+    device const float* xr = x + (ulong)row * n;
+    device float* orow = o + (ulong)row * n;
+    float acc = 0.0f;
+    for (uint i = tid; i < n; i += 256u) { float v = xr[i]; acc += v * v; }
+    acc = simd_sum(acc);
+    if (lane == 0) part[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (uint k = 0; k < 8u; ++k) tot += part[k];
+    float inv = rsqrt(tot / (float)n + eps);
+    for (uint i = tid; i < n; i += 256u) {
+        float wv = gemma != 0u ? (1.0f + w[i]) : w[i];
+        orow[i] = xr[i] * inv * wv;
+    }
+}
+
+// Chunk QKV finish: bias add + optional per-head qk-norm + RoPE at
+// pos0+bi, K/V written STRAIGHT into the cache mirror at stored0+bi
+// (fuses kv_append for the whole chunk). Head space: [0, nh) = Q,
+// [nh, nh+nkv) = K, [nh+nkv, nh+2·nkv) = V (bias only). One simdgroup
+// per (head, position). flags: 2=qnorm 4=knorm 8=gemma-norm 16=bias.
+kernel void chunk_rope_kv(
+    device const float* qraw [[buffer(0)]],   // [nb, nh·hd]
+    device const float* kraw [[buffer(1)]],   // [nb, nkv·hd]
+    device const float* vraw [[buffer(2)]],   // [nb, nkv·hd]
+    device float*       qout [[buffer(3)]],   // [nb, nh, hd]
+    device float*       kbuf [[buffer(4)]],
+    device float*       vbuf [[buffer(5)]],
+    device const float* bq   [[buffer(6)]],
+    device const float* bk   [[buffer(7)]],
+    device const float* bv   [[buffer(8)]],
+    device const float* qnw  [[buffer(9)]],
+    device const float* knw  [[buffer(10)]],
+    device const float* invf [[buffer(11)]],
+    constant uint&  nh    [[buffer(12)]],
+    constant uint&  nkv   [[buffer(13)]],
+    constant uint&  hd    [[buffer(14)]],
+    constant uint&  rd    [[buffer(15)]],
+    constant uint&  pos0  [[buffer(16)]],
+    constant uint&  st0   [[buffer(17)]],
+    constant uint&  cap   [[buffer(18)]],
+    constant uint&  flags [[buffer(19)]],
+    constant float& eps   [[buffer(20)]],
+    constant uint&  nb    [[buffer(21)]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sgs [[simdgroups_per_threadgroup]])
+{
+    uint head = tg.x * sgs + sg;
+    uint bi = tg.y;
+    if (head >= nh + 2u * nkv || bi >= nb) return;
+    bool isq = head < nh;
+    bool isv = head >= nh + nkv;
+    uint kvh = isv ? head - nh - nkv : head - nh;
+    bool bias = (flags & 16u) != 0u;
+    device const float* src = isq
+        ? qraw + (ulong)bi * nh * hd + (ulong)head * hd
+        : (isv ? vraw : kraw) + (ulong)bi * nkv * hd + (ulong)kvh * hd;
+    device const float* brow = isq ? bq : (isv ? bv : bk);
+    uint nt = (hd + 31u) / 32u;
+    float xv[4];
+    float ss = 0.0f;
+    for (uint t = 0; t < nt; ++t) {
+        uint d = t * 32u + lane;
+        float v = d < hd ? src[d] : 0.0f;
+        if (bias && d < hd) v += brow[(isq ? (ulong)head : (ulong)kvh) * hd + d];
+        xv[t] = v;
+        ss += v * v;
+    }
+    if (!isv) {
+        ss = simd_sum(ss);
+        bool normed = isq ? (flags & 2u) != 0u : (flags & 4u) != 0u;
+        if (normed) {
+            float inv = 1.0f / sqrt(ss / (float)hd + eps);
+            device const float* w = isq ? qnw : knw;
+            bool gm = (flags & 8u) != 0u;
+            for (uint t = 0; t < nt; ++t) {
+                uint d = t * 32u + lane;
+                if (d < hd) {
+                    float wd = w[d];
+                    xv[t] = xv[t] * inv * (gm ? (1.0f + wd) : wd);
+                }
+            }
+        }
+        uint hlf = rd / 2u;
+        uint toff = hlf / 32u;
+        uint pos = pos0 + bi;
+        for (uint t = 0; t < toff; ++t) {
+            uint i = t * 32u + lane;
+            if (i < hlf) {
+                float angle = (float)pos * invf[i];
+                float c = cos(angle), sn = sin(angle);
+                float x0 = xv[t], x1 = xv[t + toff];
+                xv[t] = x0 * c - x1 * sn;
+                xv[t + toff] = x0 * sn + x1 * c;
+            }
+        }
+    }
+    device float* dst = isq
+        ? qout + ((ulong)bi * nh + head) * hd
+        : (isv ? vbuf : kbuf) + ((ulong)kvh * cap + st0 + bi) * hd;
+    for (uint t = 0; t < nt; ++t) {
+        uint d = t * 32u + lane;
+        if (d < hd) dst[d] = xv[t];
     }
 }
 
@@ -698,6 +895,9 @@ struct Ctx {
     rqkn: ComputePipelineState,
     kvapp: ComputePipelineState,
     gqat: ComputePipelineState,
+    cattend: ComputePipelineState,
+    rmsrows: ComputePipelineState,
+    cropekv: ComputePipelineState,
     sgate: ComputePipelineState,
     /// Device K/V cache mirrors keyed by (pipeline id, layer).
     kv_mirrors: Mutex<HashMap<(u64, usize), KvMirror>>,
@@ -784,6 +984,9 @@ fn init() -> Result<Ctx, String> {
     let rqkn = pso("attn_rope_qkn")?;
     let kvapp = pso("kv_append")?;
     let gqat = pso("gqa_attend")?;
+    let cattend = pso("chunk_attend")?;
+    let rmsrows = pso("rmsnorm_rows")?;
+    let cropekv = pso("chunk_rope_kv")?;
     let sgate = pso("sig_gate")?;
     let queue = device.new_command_queue();
     let flag_buf = device.new_buffer(64, MTLResourceOptions::StorageModeShared);
@@ -809,6 +1012,9 @@ fn init() -> Result<Ctx, String> {
         rqkn,
         kvapp,
         gqat,
+        cattend,
+        rmsrows,
+        cropekv,
         sgate,
         kv_mirrors: Mutex::new(HashMap::new()),
         file_bufs: Mutex::new(HashMap::new()),
@@ -1173,6 +1379,383 @@ fn f32_to_f16_into(src: &[f32], dst: *mut u16) {
     for (i, &v) in src.iter().enumerate() {
         unsafe { *dst.add(i) = cortiq_core::quant::f32_to_f16(v) };
     }
+}
+
+/// Encode one tiled q8 GEMM into an open command buffer (device-resident
+/// X and Y). Caller guarantees b ≥ 32 and cols % 4 == 0.
+#[allow(clippy::too_many_arguments)]
+fn encode_mul_mm(
+    c: &Ctx,
+    cmd: &metal::CommandBufferRef,
+    fbuf: &Buffer,
+    abs: usize,
+    rs_buf: &Buffer,
+    xs: &Buffer,
+    y: &Buffer,
+    b: usize,
+    rows: usize,
+    cols: usize,
+) {
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.q8mmm);
+    enc.set_buffer(0, Some(fbuf), abs as u64);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(rs_buf), 0);
+    enc.set_buffer(3, Some(y), 0);
+    let (cols_u, rows_u, b_u) = (cols as u32, rows as u32, b as u32);
+    enc.set_bytes(4, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &b_u as *const u32 as *const std::ffi::c_void);
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(64), (b as u64).div_ceil(64), 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+}
+
+/// One full-attention prefill layer on q8_row weights, device-resident
+/// through the whole chunk (roadmap: the llama.cpp Metal pp512 class).
+pub struct ChunkLayer<'a> {
+    pub model: &'a Arc<CmfModel>,
+    pub kv_id: u64,
+    pub layer: usize,
+    /// (idx, rows, cols, row_scale) per projection — all q8_row.
+    pub wq: (usize, usize, usize, &'a [f32]),
+    pub wk: (usize, usize, usize, &'a [f32]),
+    pub wv: (usize, usize, usize, &'a [f32]),
+    pub wo: (usize, usize, usize, &'a [f32]),
+    pub gate: (usize, usize, usize, &'a [f32]),
+    pub up: (usize, usize, usize, &'a [f32]),
+    pub down: (usize, usize, usize, &'a [f32]),
+    pub input_norm: &'a [f32],
+    pub post_norm: &'a [f32],
+    pub bias: Option<(&'a [f32], &'a [f32], &'a [f32])>,
+    pub q_norm: Option<&'a [f32]>,
+    pub k_norm: Option<&'a [f32]>,
+    pub inv_freq: &'a [f32],
+    pub rd: usize,
+    pub nh: usize,
+    pub nkv: usize,
+    pub hd: usize,
+    pub hs: usize,
+    pub inter: usize,
+    pub gemma: bool,
+    pub eps: f32,
+}
+
+/// Run one prefill layer for the whole chunk in a single submission:
+/// norm → QKV GEMMs → bias+qk-norm+RoPE with fused mirror append →
+/// causal chunk attend (+Born importance) → O GEMM → residual → norm →
+/// gate/up GEMMs → silu·mul → down GEMM → residual. One wait; the
+/// chunk's K/V rows and the importance masses come back for the CPU
+/// cache (owner of record). Returns false (nothing encoded) on any
+/// eligibility miss — the caller keeps the CPU path.
+#[allow(clippy::too_many_arguments)]
+pub fn chunk_layer_gpu(
+    l: &ChunkLayer,
+    h: &mut [f32],
+    b: usize,
+    pos0: usize,
+    cpu_stored: usize,
+    cpu_k: &[&[f32]],
+    cpu_v: &[&[f32]],
+    out_k: &mut [f32],
+    out_v: &mut [f32],
+    imp_out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let (nh, nkv, hd, hs, inter) = (l.nh, l.nkv, l.hd, l.hs, l.inter);
+    if b < 32
+        || hd % 4 != 0
+        || hd > 128
+        || l.rd < 2
+        || l.rd > hd
+        || (l.rd / 2) % 32 != 0
+        || nh % nkv.max(1) != 0
+        || hs % 4 != 0
+        || inter % 4 != 0
+        || l.inv_freq.len() < l.rd / 2
+        || h.len() < b * hs
+        || out_k.len() < b * nkv * hd
+        || out_v.len() < b * nkv * hd
+        || imp_out.len() < cpu_stored + b
+    {
+        return false;
+    }
+    // Weight residency: every projection must resolve in the primary
+    // no-copy mapping.
+    let bytes = l.model.primary_bytes();
+    let Some((fbuf, safe_len)) = file_buffer(c, bytes) else { return false };
+    let abs_of = |t: &(usize, usize, usize, &[f32])| -> Option<usize> {
+        let entry = l.model.tensors.get(t.0)?;
+        let abs = l.model.entry_abs_offset(entry)?;
+        (abs + t.1 * t.2 <= safe_len).then_some(abs)
+    };
+    let (Some(aq), Some(ak), Some(av), Some(ao), Some(ag), Some(au), Some(ad)) = (
+        abs_of(&l.wq),
+        abs_of(&l.wk),
+        abs_of(&l.wv),
+        abs_of(&l.wo),
+        abs_of(&l.gate),
+        abs_of(&l.up),
+        abs_of(&l.down),
+    ) else {
+        return false;
+    };
+    // Shape contract with the kernels below.
+    if l.wq.1 != nh * hd
+        || l.wk.1 != nkv * hd
+        || l.wv.1 != nkv * hd
+        || l.wo.1 != hs
+        || l.wo.2 != nh * hd
+        || l.gate.1 != inter
+        || l.up.1 != inter
+        || l.down.1 != hs
+        || l.down.2 != inter
+    {
+        return false;
+    }
+    let base = bytes.as_ptr() as usize;
+    let rs_of = |t: &(usize, usize, usize, &[f32])| -> Buffer {
+        let mut cache = c.rs_bufs.lock().unwrap();
+        cache
+            .entry((base, t.0))
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device.new_buffer_with_data(
+                    t.3.as_ptr() as *const std::ffi::c_void,
+                    (t.3.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            })
+            .clone()
+    };
+    let (rq, rk, rv, ro, rg, ru, rdn) = (
+        rs_of(&l.wq),
+        rs_of(&l.wk),
+        rs_of(&l.wv),
+        rs_of(&l.wo),
+        rs_of(&l.gate),
+        rs_of(&l.up),
+        rs_of(&l.down),
+    );
+
+    // ── KV mirror prep (same self-healing contract as the decode graph),
+    // reserving b new rows for the chunk.
+    let (k_mb, v_mb, imp_mb, cap, st0) = {
+        let mut reg = c.kv_mirrors.lock().unwrap();
+        let need = cpu_stored + b;
+        let entry = reg.entry((l.kv_id, l.layer)).or_insert_with(|| KvMirror {
+            k: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
+            v: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
+            imp: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
+            cap: 0,
+            stored: usize::MAX,
+        });
+        if entry.cap < need {
+            let cap = need.next_power_of_two().max(1024);
+            let nb = (nkv * cap * hd * 4) as u64;
+            entry.k = c._device.new_buffer(nb, MTLResourceOptions::StorageModeShared);
+            entry.v = c._device.new_buffer(nb, MTLResourceOptions::StorageModeShared);
+            entry.imp = c._device.new_buffer((cap * 4) as u64, MTLResourceOptions::StorageModeShared);
+            entry.cap = cap;
+            entry.stored = usize::MAX;
+        }
+        if entry.stored != cpu_stored {
+            if cpu_k.len() != nkv || cpu_v.len() != nkv {
+                return false;
+            }
+            for hh in 0..nkv {
+                if cpu_k[hh].len() != cpu_stored * hd || cpu_v[hh].len() != cpu_stored * hd {
+                    return false;
+                }
+                unsafe {
+                    let kd = (entry.k.contents() as *mut f32).add(hh * entry.cap * hd);
+                    std::ptr::copy_nonoverlapping(cpu_k[hh].as_ptr(), kd, cpu_k[hh].len());
+                    let vd = (entry.v.contents() as *mut f32).add(hh * entry.cap * hd);
+                    std::ptr::copy_nonoverlapping(cpu_v[hh].as_ptr(), vd, cpu_v[hh].len());
+                }
+            }
+            entry.stored = cpu_stored;
+        }
+        unsafe {
+            std::ptr::write_bytes(entry.imp.contents() as *mut u8, 0, need * 4);
+        }
+        let out = (entry.k.clone(), entry.v.clone(), entry.imp.clone(), entry.cap, entry.stored);
+        entry.stored += b;
+        out
+    };
+
+    // ── device buffers (pooled by size)
+    let h_b = io_buf(c, 60_000_000_071 + b * hs, b * hs * 4);
+    let n_b = io_buf(c, 61_000_000_091 + b * hs, b * hs * 4);
+    let qraw = io_buf(c, 62_000_000_017 + b * nh * hd, b * nh * hd * 4);
+    let kraw = io_buf(c, 63_000_000_029 + b * nkv * hd, b * nkv * hd * 4);
+    let vraw = io_buf(c, 64_000_000_063 + b * nkv * hd, b * nkv * hd * 4);
+    let qrope = io_buf(c, 65_000_000_087 + b * nh * hd, b * nh * hd * 4);
+    let attn = io_buf(c, 66_000_000_103 + b * nh * hd, b * nh * hd * 4);
+    let ob = io_buf(c, 67_000_000_141 + b * hs, b * hs * 4);
+    let gb = io_buf(c, 68_000_000_169 + b * inter, b * inter * 4);
+    let ub = io_buf(c, 69_000_000_213 + b * inter, b * inter * 4);
+    let act = io_buf(c, 70_000_000_027 + b * inter, b * inter * 4);
+    let db = io_buf(c, 71_000_000_073 + b * hs, b * hs * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(h.as_ptr(), h_b.contents() as *mut f32, b * hs);
+    }
+    let inorm = const_buf(c, l.input_norm);
+    let pnorm = const_buf(c, l.post_norm);
+    let invf = const_buf(c, &l.inv_freq[..l.rd / 2]);
+    let (bqb, bkb, bvb, has_bias) = match l.bias {
+        Some((bq, bk, bv)) => (const_buf(c, bq), const_buf(c, bk), const_buf(c, bv), true),
+        None => (invf.clone(), invf.clone(), invf.clone(), false),
+    };
+    let qn_b = l.q_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| invf.clone());
+    let kn_b = l.k_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| invf.clone());
+
+    let cmd = c.queue.new_command_buffer();
+    let rows_norm = |src: &Buffer, w: &Buffer, dst: &Buffer| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.rmsrows);
+        enc.set_buffer(0, Some(src), 0);
+        enc.set_buffer(1, Some(w), 0);
+        enc.set_buffer(2, Some(dst), 0);
+        let n_u = hs as u32;
+        let g_u = l.gemma as u32;
+        enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &g_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &l.eps as *const f32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(MTLSize::new(b as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+    };
+    let axpy1 = |src: &Buffer, dst: &Buffer, n: usize| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.axpy);
+        enc.set_buffer(0, Some(src), 0);
+        enc.set_buffer(1, Some(dst), 0);
+        let w1 = 1.0f32;
+        let n_u = n as u32;
+        enc.set_bytes(2, 4, &w1 as *const f32 as *const std::ffi::c_void);
+        enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+    };
+
+    // 1. attn norm
+    rows_norm(&h_b, &inorm, &n_b);
+    // 2. QKV GEMMs
+    encode_mul_mm(c, cmd, &fbuf, aq, &rq, &n_b, &qraw, b, l.wq.1, l.wq.2);
+    encode_mul_mm(c, cmd, &fbuf, ak, &rk, &n_b, &kraw, b, l.wk.1, l.wk.2);
+    encode_mul_mm(c, cmd, &fbuf, av, &rv, &n_b, &vraw, b, l.wv.1, l.wv.2);
+    // 3. bias + qk-norm + RoPE, K/V into the mirror
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.cropekv);
+        for (i, buf) in [
+            &qraw, &kraw, &vraw, &qrope, &k_mb, &v_mb, &bqb, &bkb, &bvb, &qn_b, &kn_b, &invf,
+        ]
+        .iter()
+        .enumerate()
+        {
+            enc.set_buffer(i as u64, Some(buf), 0);
+        }
+        let flags = ((l.q_norm.is_some() as u32) << 1)
+            | ((l.k_norm.is_some() as u32) << 2)
+            | ((l.gemma as u32) << 3)
+            | ((has_bias as u32) << 4);
+        let words = [
+            nh as u32,
+            nkv as u32,
+            hd as u32,
+            l.rd as u32,
+            pos0 as u32,
+            st0 as u32,
+            cap as u32,
+            flags,
+        ];
+        for (i, w) in words.iter().enumerate() {
+            enc.set_bytes(12 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+        }
+        enc.set_bytes(20, 4, &l.eps as *const f32 as *const std::ffi::c_void);
+        let nb_u = b as u32;
+        enc.set_bytes(21, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+        let sgs = 8u64;
+        enc.dispatch_thread_groups(
+            MTLSize::new(((nh + 2 * nkv) as u64).div_ceil(sgs), b as u64, 1),
+            MTLSize::new(sgs * 32, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    // 4. causal chunk attend
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.cattend);
+        for (i, buf) in [&qrope, &k_mb, &v_mb, &attn, &imp_mb].iter().enumerate() {
+            enc.set_buffer(i as u64, Some(buf), 0);
+        }
+        let words = [
+            nh as u32,
+            (nh / nkv.max(1)) as u32,
+            hd as u32,
+            cap as u32,
+            st0 as u32,
+            b as u32,
+        ];
+        for (i, w) in words.iter().enumerate() {
+            enc.set_bytes(5 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+        }
+        let sgs = 8u64;
+        enc.dispatch_thread_groups(
+            MTLSize::new((nh as u64).div_ceil(sgs), b as u64, 1),
+            MTLSize::new(sgs * 32, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    // 5. O + residual
+    encode_mul_mm(c, cmd, &fbuf, ao, &ro, &attn, &ob, b, l.wo.1, l.wo.2);
+    axpy1(&ob, &h_b, b * hs);
+    // 6. FFN
+    rows_norm(&h_b, &pnorm, &n_b);
+    encode_mul_mm(c, cmd, &fbuf, ag, &rg, &n_b, &gb, b, l.gate.1, l.gate.2);
+    encode_mul_mm(c, cmd, &fbuf, au, &ru, &n_b, &ub, b, l.up.1, l.up.2);
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.silu);
+        for (i, buf) in [&gb, &ub, &gb, &act].iter().enumerate() {
+            enc.set_buffer(i as u64, Some(buf), 0);
+        }
+        let n_u = (b * inter) as u32;
+        let hc = 0u32;
+        enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_threads(MTLSize::new((b * inter) as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+    }
+    encode_mul_mm(c, cmd, &fbuf, ad, &rdn, &act, &db, b, l.down.1, l.down.2);
+    axpy1(&db, &h_b, b * hs);
+
+    submit_and_wait(c, cmd, &[&h_b]);
+
+    // ── readback: hidden, the chunk's K/V rows, importance masses.
+    unsafe {
+        std::ptr::copy_nonoverlapping(h_b.contents() as *const f32, h.as_mut_ptr(), b * hs);
+        let kc = k_mb.contents() as *const f32;
+        let vc = v_mb.contents() as *const f32;
+        for hh in 0..nkv {
+            for bi in 0..b {
+                let srck = kc.add((hh * cap + st0 + bi) * hd);
+                let srcv = vc.add((hh * cap + st0 + bi) * hd);
+                let dst = (bi * nkv + hh) * hd;
+                std::ptr::copy_nonoverlapping(srck, out_k.as_mut_ptr().add(dst), hd);
+                std::ptr::copy_nonoverlapping(srcv, out_v.as_mut_ptr().add(dst), hd);
+            }
+        }
+        std::ptr::copy_nonoverlapping(
+            imp_mb.contents() as *const f32,
+            imp_out.as_mut_ptr(),
+            cpu_stored + b,
+        );
+    }
+    true
 }
 
 pub fn q8_matmat(

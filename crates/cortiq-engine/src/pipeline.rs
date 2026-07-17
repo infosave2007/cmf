@@ -1910,6 +1910,14 @@ impl Pipeline {
 
         for li in 0..self.num_layers {
             crate::gpu::set_layer(li as i64); // layer-split GPU/CPU
+            // GPU chunk graph (opt-in CMF_GPU_CHUNK=1): the whole layer
+            // for the whole chunk in one Metal submission — norm, QKV,
+            // RoPE with fused mirror append, causal attend, O, FFN. Any
+            // refusal (dtype/shape/mode) falls through to the CPU path.
+            #[cfg(target_os = "macos")]
+            if self.chunk_layer_gpu(li, &mut h, b, start_pos) {
+                continue;
+            }
             let lw = &self.weights.layers[li];
             // ── attention ──
             match &lw.attn {
@@ -2052,6 +2060,106 @@ impl Pipeline {
             }
         }
         out
+    }
+
+    /// One prefill layer on the GPU for the whole chunk (opt-in
+    /// CMF_GPU_CHUNK=1; q8_row weights, plain full attention, F32 KV,
+    /// no o1/масks/gemma extras). Returns false without touching
+    /// anything on any eligibility miss.
+    #[cfg(target_os = "macos")]
+    fn chunk_layer_gpu(&mut self, li: usize, h: &mut [f32], b: usize, pos0: usize) -> bool {
+        // Depth bound: the chunk attend streams K/V per query, so past
+        // ~1k of context the CPU's GEMM-attend wins — deep chunks stay
+        // on the CPU (measured: +66% at 512, +38% at 1024, parity at
+        // 2048 unbounded). CMF_GPU_CHUNK=0 disables the graph.
+        if !crate::gpu::enabled_here()
+            || std::env::var("CMF_GPU_CHUNK").map(|v| v == "0").unwrap_or(false)
+            || pos0 > 1024
+            || b < 32
+            || self.swa.is_some()
+            || self.global_attn.is_some()
+            || self.attn_v_norm
+            || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
+        {
+            return false;
+        }
+        let Some(model) = self.model.clone() else { return false };
+        let lw = &self.weights.layers[li];
+        if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
+            return false;
+        }
+        let AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate: false, bias } = &lw.attn
+        else {
+            return false;
+        };
+        let FfnKind::Dense(d) = &lw.ffn else { return false };
+        if d.act != Act::Silu {
+            return false;
+        }
+        let parts = (
+            wq.q8_row_parts(),
+            wk.q8_row_parts(),
+            wv.q8_row_parts(),
+            wo.q8_row_parts(),
+            d.gate_proj.q8_row_parts(),
+            d.up_proj.q8_row_parts(),
+            d.down_proj.q8_row_parts(),
+        );
+        let (Some(pq), Some(pk), Some(pv), Some(po), Some(pg), Some(pu), Some(pd)) = parts else {
+            return false;
+        };
+        let layer = &self.kv_cache.layers[li];
+        if layer.mode != crate::kv_cache::KvMode::F32 || layer.o1.is_some() {
+            return false;
+        }
+        let nkv = self.num_kv_heads;
+        let stored = layer.head_len(0);
+        let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| layer.head_keys(g)).collect();
+        let cpu_v: Vec<&[f32]> = (0..nkv).map(|g| layer.head_values(g)).collect();
+        let inv_freq = self.inv_freq.clone();
+        let cl = crate::gpu_metal::ChunkLayer {
+            model: &model,
+            kv_id: self.graph_kv_id,
+            layer: li,
+            wq: pq,
+            wk: pk,
+            wv: pv,
+            wo: po,
+            gate: pg,
+            up: pu,
+            down: pd,
+            input_norm: &lw.input_norm,
+            post_norm: &lw.post_norm,
+            bias: bias.as_ref().map(|(a, bb, c)| (a.as_slice(), bb.as_slice(), c.as_slice())),
+            q_norm: q_norm.as_deref(),
+            k_norm: k_norm.as_deref(),
+            inv_freq: &inv_freq,
+            rd: self.rotary_dim,
+            nh: self.num_heads,
+            nkv,
+            hd: self.head_dim,
+            hs: self.hidden_size,
+            inter: d.gate_proj.rows(),
+            gemma: matches!(self.norm_style, cortiq_core::NormStyle::Gemma),
+            eps: self.rms_eps as f32,
+        };
+        let mut out_k = vec![0f32; b * nkv * self.head_dim];
+        let mut out_v = vec![0f32; b * nkv * self.head_dim];
+        let mut imp = vec![0f32; stored + b];
+        if !crate::gpu_metal::chunk_layer_gpu(
+            &cl, h, b, pos0, stored, &cpu_k, &cpu_v, &mut out_k, &mut out_v, &mut imp,
+        ) {
+            return false;
+        }
+        // CPU cache stays the owner of record: append the chunk's rows
+        // and bank the importance masses.
+        let row = nkv * self.head_dim;
+        let layer = &mut self.kv_cache.layers[li];
+        for bi in 0..b {
+            layer.append(&out_k[bi * row..(bi + 1) * row], &out_v[bi * row..(bi + 1) * row], &[]);
+        }
+        layer.accumulate_imp(&imp);
+        true
     }
 
     /// Is layer `li` a sliding-window (local-RoPE) layer? Gemma-3:

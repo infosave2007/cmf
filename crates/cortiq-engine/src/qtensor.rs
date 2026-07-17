@@ -275,6 +275,25 @@ impl QTensor {
         }
     }
 
+    /// (directory idx, rows, cols, row_scale) of a plain q8_row mapped
+    /// tensor — the chunk-prefill GPU graph resolves offsets itself.
+    /// q8_2f is excluded on purpose: its column field would need a
+    /// prescale stage on the device.
+    pub(crate) fn q8_row_parts(&self) -> Option<(usize, usize, usize, &[f32])> {
+        match self {
+            Self::Mapped {
+                idx,
+                dtype: TensorDtype::Q8Row,
+                rows,
+                cols,
+                row_scale,
+                col_field,
+                ..
+            } if col_field.is_empty() => Some((*idx, *rows, *cols, row_scale)),
+            _ => None,
+        }
+    }
+
     pub fn rows(&self) -> usize {
         match self {
             Self::F32 { rows, .. } | Self::Mapped { rows, .. } => *rows,
