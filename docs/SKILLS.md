@@ -97,8 +97,9 @@ into the registry; it never silently blesses a skill.
 ## Using the skills
 
 ```sh
-cortiq run swarm.cmf -p "..."                      # backbone
-cortiq run swarm.cmf -p "..." --skill thinker      # explicit overlay
+cortiq run swarm.cmf -p "..."                      # routes automatically: the file picks its specialist
+cortiq run swarm.cmf -p "..." --skill thinker      # pin one explicitly
+cortiq run swarm.cmf -p "..." --skill none         # force the backbone
 cortiq route swarm.cmf -p "..."                    # score all skills
 cortiq explain swarm.cmf --prompt "..."            # routing + first-token distribution
 cortiq run swarm.cmf -p "..." --blend auto         # soft superposition of the top-2
@@ -171,6 +172,53 @@ Skills that replace non-FFN tensors are excluded from *dynamic* routing
 | Runtime cost of a skill | zero when inactive; active skill = same speed as the backbone (identical shapes, identical kernels) |
 | Routing cost | one prefill pass over the prompt up to the φ layer |
 
+## One command, no Python: `cortiq skill bake`
+
+The whole DTG-MA recipe runs natively — mask training, FCD polish and
+the defrag bake in a single command on the CPU (the training GEMMs ride
+the same Accelerate path as prefill; attention is frozen, so the
+backward walks only the FFN chain):
+
+```sh
+cortiq skill bake backbone.cmf \
+  --files docs/CMF_V2_SPEC.ru.md README.ru.md docs/COMPARISON.ru.md \
+  --output rutech-specialist.cmf
+```
+
+A real run, step by step — Qwen2.5-0.5B-Instruct (q8) on this
+repository's own Russian docs, Apple M4, **8.8 minutes end to end**:
+
+```
+bake: 70 calib + 12 held chunks of 256 tokens | FCD last 4 layer(s)
+baseline (full): 24.157
+  [A] step  30: L1=0.015 pruned= 0% hard-PPL=23.648 (bottom 23.648@0%)
+  [A] step  60: L1=0.020 pruned= 2% hard-PPL=21.110 (bottom 21.110@2%)   <- the denoising bottom
+  [A] step  90: L1=0.025 pruned= 6% hard-PPL=22.778 (bottom 21.110@2%)
+  [A] step 120: L1=0.030 pruned=10% hard-PPL=25.610 (bottom 21.110@2%)
+  [A] step 180: L1=0.040 pruned=16% hard-PPL=49.659 (bottom 21.110@2%)   <- past the bottom quality collapses
+[A] 314s: masked-PPL 21.110                                              <- the bottom checkpoint is restored
+  [B] step  30: held-PPL 18.304
+  [B] step  60: held-PPL 17.840
+  [B] step  90: held-PPL 17.474
+  [B] step 120: held-PPL 17.423                                          <- FCD keeps digging
+=== bake: baseline 24.157 | mask 21.110 | mask+FCD 17.423 | pruned 2% -> SPECIALIST <= baseline
+runtime gate (held-out, real engine): backbone 24.173 -> specialist 19.039 (-21.2%)
+```
+
+Three verdicts worth reading twice:
+
+- The training replica and the real engine agree (baseline 24.157 vs
+  24.173) — what the bake optimizes is what the runtime serves. The gap
+  between 17.4 (the f32 replica) and 19.0 (the written file) is the q8
+  re-quantization of the trained FFN — measured, not hidden.
+- **Generalization**: on a Russian tech document that was never in the
+  corpus (`PERFORMANCE_ROADMAP.ru.md`) the specialist scores 22.56 vs
+  the backbone's 25.62 — **−12.0% on unseen text**.
+- The denoising bottom landed at 2% here (backbone PPL 24 — not that
+  weak on this domain), so the size win is small (479 → 472 MB); the
+  quality win is the story. On a weak domain (backbone PPL 70) the same
+  recipe prunes 11% and cuts PPL by a quarter — see the next section.
+
 ## Smaller than the original — and better: the DTG-MA bake
 
 The strongest form of a skill doesn't ride next to the backbone — it
@@ -183,11 +231,11 @@ neurons are physically absent — neither stored nor computed
 (claims 9/10):
 
 ```sh
-# Phase A+B: train the mask + FCD polish on your corpus (torch, ~25 min
-# for a 0.8B on an M4; needs: pip install torch numpy tokenizers)
-python3 converter/make_skill_l1fcd.py --model <hf_snapshot_dir>   --id ru --files corpus1.txt corpus2.txt --out skill-ru
+# native, one command (see the previous section):
+cortiq skill bake backbone.cmf --files corpus1.txt corpus2.txt --output specialist.cmf
 
-# bake the standalone specialist: pruned neurons physically dropped
+# or the original torch recipe (identical phases; useful on CUDA boxes):
+python3 converter/make_skill_l1fcd.py --model <hf_snapshot_dir>   --id ru --files corpus1.txt corpus2.txt --out skill-ru
 cortiq convert --model <hf_snapshot_dir> --defrag skill-ru   --quant q8_2f --output ru-specialist.cmf
 ```
 

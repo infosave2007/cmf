@@ -683,3 +683,200 @@ mod tests {
         assert_eq!(Families::All.suffixes().len(), 7);
     }
 }
+
+/// Split text files into fixed token chunks (the recipe's calibration
+/// format: 256-token windows, first `held` are the held-out gate).
+fn corpus_chunks(
+    tok: &cortiq_engine::tokenizer::Tokenizer,
+    files: &[String],
+    chunk: usize,
+    need: usize,
+) -> anyhow::Result<Vec<Vec<u32>>> {
+    let mut out = Vec::new();
+    for f in files {
+        let ids = tok.encode(&std::fs::read_to_string(f)?);
+        let mut i = 0usize;
+        while i + chunk < ids.len() {
+            out.push(ids[i..i + chunk].to_vec());
+            i += chunk;
+        }
+        if out.len() >= need {
+            break;
+        }
+    }
+    anyhow::ensure!(out.len() >= 24, "corpus too small: {} chunks of {chunk} tokens", out.len());
+    out.truncate(need.max(24));
+    Ok(out)
+}
+
+/// `cortiq skill bake` — the native DTG-MA recipe (Patent 2), no
+/// Python: train the L1 mask to its denoising bottom, FCD-polish the
+/// last layers, and write a standalone defragged specialist whose
+/// pruned neurons are neither stored nor computed (claims 9/10).
+#[allow(clippy::too_many_arguments)]
+pub fn run_skill_bake(
+    model_path: &str,
+    files: &[String],
+    output: &str,
+    steps_a: usize,
+    steps_b: usize,
+    fcd_layers: usize,
+    chunk: usize,
+    held: usize,
+) -> anyhow::Result<()> {
+    let model = Arc::new(CmfModel::open(model_path)?);
+    let vocab_bytes = model.vocab.clone().context("model has no embedded tokenizer")?;
+    let tok = cortiq_engine::tokenizer::Tokenizer::from_bytes(&vocab_bytes)
+        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let chunks = corpus_chunks(&tok, files, chunk, 112 + held)?;
+    println!(
+        "bake: {} calib + {held} held chunks of {chunk} tokens | FCD last {fcd_layers} layer(s)",
+        chunks.len().saturating_sub(held)
+    );
+    let hyper = cortiq_engine::skillbake::BakeHyper {
+        steps_a,
+        steps_b,
+        fcd_layers,
+        ..Default::default()
+    };
+    let (report, arts) =
+        cortiq_engine::skillbake::skill_bake(&model, &chunks, held, &hyper, |line| {
+            println!("{line}");
+        })
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let verdict = if report.overlaid <= report.backbone { "SPECIALIST ≤ baseline ✓" } else { "did not beat baseline" };
+    println!(
+        "=== bake: baseline {:.3} | mask {:.3} | mask+FCD {:.3} | pruned {:.0}% | {:.0}s → {verdict}",
+        report.backbone,
+        report.masked,
+        report.overlaid,
+        report.pruned_ratio * 100.0,
+        report.sec
+    );
+
+    // ── write the standalone defragged specialist ──
+    let hidden = model.arch().hidden_size;
+    let nl = model.arch().num_layers;
+    let orig_inter = model.arch().intermediate_size;
+    let mut tensors: Vec<TensorSpec> = Vec::new();
+    for t in &model.tensors {
+        // FFN tensors are rebuilt below; everything else copies raw.
+        if t.name.contains(".mlp.gate_proj.")
+            || t.name.contains(".mlp.up_proj.")
+            || t.name.contains(".mlp.down_proj.")
+        {
+            continue;
+        }
+        if t.name.starts_with("skill.") {
+            continue; // a defragged specialist is a standalone file
+        }
+        tensors.push(TensorSpec {
+            name: t.name.clone(),
+            dtype: t.dtype,
+            shape: t.shape.clone(),
+            data: model.tensor_bytes(&t.name)?.to_vec(),
+        });
+    }
+    let deq = |name: &str| -> anyhow::Result<Vec<f32>> {
+        let e = model.tensors.iter().find(|t| t.name == name).context("missing tensor")?;
+        let mut out = vec![0f32; e.shape.iter().product()];
+        cortiq_core::quant::dequant_tensor(e, model.tensor_bytes(name)?, &mut out)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(out)
+    };
+    let mut max_kept = 0usize;
+    for li in 0..nl {
+        let alive = &arts.keep[li];
+        let kept: Vec<usize> =
+            alive.iter().enumerate().filter(|(_, a)| **a).map(|(i, _)| i).collect();
+        anyhow::ensure!(!kept.is_empty(), "layer {li}: 0 live neurons");
+        max_kept = max_kept.max(kept.len());
+        let (gate_f, up_f) = match &arts.gate_up[li] {
+            Some((g, u)) => (g.clone(), u.clone()),
+            None => (
+                deq(&format!("model.layers.{li}.mlp.gate_proj.weight"))?,
+                deq(&format!("model.layers.{li}.mlp.up_proj.weight"))?,
+            ),
+        };
+        // gather live rows (gate/up) and live columns (down).
+        let mut gate_k = Vec::with_capacity(kept.len() * hidden);
+        let mut up_k = Vec::with_capacity(kept.len() * hidden);
+        for &r in &kept {
+            gate_k.extend_from_slice(&gate_f[r * hidden..(r + 1) * hidden]);
+            up_k.extend_from_slice(&up_f[r * hidden..(r + 1) * hidden]);
+        }
+        let down_f = &arts.down[li];
+        let mut down_k = Vec::with_capacity(hidden * kept.len());
+        for r in 0..hidden {
+            for &c in &kept {
+                down_k.push(down_f[r * orig_inter + c]);
+            }
+        }
+        let base_dtype = model
+            .tensors
+            .iter()
+            .find(|t| t.name == format!("model.layers.{li}.mlp.gate_proj.weight"))
+            .map(|t| t.dtype)
+            .context("gate tensor missing")?;
+        let q_rowsafe = dtype_to_quant(base_dtype).context("unsupported ffn dtype")?;
+        // down's IN dim shrinks: grouped codecs need in % 32 == 0.
+        let q_down = if kept.len() % 32 == 0 { q_rowsafe } else { Quant::Q8_2f };
+        for (suffix, vals, rows, cols, q) in [
+            ("gate_proj", &gate_k, kept.len(), hidden, q_rowsafe),
+            ("up_proj", &up_k, kept.len(), hidden, q_rowsafe),
+            ("down_proj", &down_k, hidden, kept.len(), q_down),
+        ] {
+            let (dtype, data) = quantize_2d(q, vals, rows, cols);
+            tensors.push(TensorSpec {
+                name: format!("model.layers.{li}.mlp.{suffix}.weight"),
+                dtype,
+                shape: vec![rows, cols],
+                data,
+            });
+        }
+    }
+    let mut header = model.header.clone();
+    header.skills.clear();
+    header.arch.intermediate_size = max_kept;
+    let mut prov = header.provenance.take().unwrap_or_else(|| serde_json::json!({}));
+    prov["defrag"] = serde_json::json!({
+        "recipe": "skill-bake L1+FCD (native)",
+        "pre_intermediate": orig_inter,
+        "post_intermediate_max": max_kept,
+        "kept_per_layer": report.kept_per_layer,
+        "pruned_ratio": (report.pruned_ratio * 10000.0).round() / 10000.0,
+        "quality": {"metric": "ppl", "backbone": (report.backbone * 1000.0).round() / 1000.0,
+                     "masked": (report.masked * 1000.0).round() / 1000.0,
+                     "overlaid": (report.overlaid * 1000.0).round() / 1000.0,
+                     "held_out_chunks": held},
+    });
+    header.provenance = Some(prov);
+    let tmp = format!("{output}.tmp");
+    CmfModel::write(&tmp, &header, &tensors, None, model.vocab.as_deref())?;
+
+    // ── end-to-end gate: held-out PPL through the REAL runtime ──
+    let held_ids: Vec<&Vec<u32>> = chunks[..held.min(chunks.len())].iter().collect();
+    let runtime_ppl = |path: &str| -> anyhow::Result<f64> {
+        let m = Arc::new(CmfModel::open(path)?);
+        let mut p = Pipeline::from_model(&m, SamplerConfig::default())
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let mut nll = 0f64;
+        let mut n = 0usize;
+        for c in &held_ids {
+            let (l, k) = p.nll_ids_from(c, 0);
+            nll += l;
+            n += k;
+        }
+        Ok((nll / n.max(1) as f64).exp())
+    };
+    let rt_base = runtime_ppl(model_path)?;
+    let rt_spec = runtime_ppl(&tmp)?;
+    println!(
+        "runtime gate (held-out, real engine): backbone {rt_base:.3} → specialist {rt_spec:.3} ({:+.1}%)",
+        (rt_spec / rt_base - 1.0) * 100.0
+    );
+    drop(model);
+    std::fs::rename(&tmp, output)?;
+    println!("✓ wrote {output}");
+    Ok(())
+}

@@ -169,10 +169,52 @@ impl<T> SendMut<T> {
 
 /// y[n,m] = x[n,k] · w[m,k]ᵀ — parallel over row blocks; bit-identical
 /// to `matmul_nt` (disjoint rows, same dot kernel regrouped by NEON).
+
+/// Accelerate CBLAS fast path for the training GEMMs (macOS): the
+/// naive pooled kernels below stay as the portable/reference path.
+#[cfg(target_os = "macos")]
+mod accel {
+    #[link(name = "Accelerate", kind = "framework")]
+    unsafe extern "C" {
+        pub fn cblas_sgemm(
+            order: i32,
+            ta: i32,
+            tb: i32,
+            m: i32,
+            n: i32,
+            k: i32,
+            alpha: f32,
+            a: *const f32,
+            lda: i32,
+            b: *const f32,
+            ldb: i32,
+            beta: f32,
+            c: *mut f32,
+            ldc: i32,
+        );
+    }
+
+    pub fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CMF_ACCEL").map(|v| v != "0").unwrap_or(true))
+    }
+}
+
 pub fn gemm_nt(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize, pool: Option<&Pool>) {
     debug_assert_eq!(x.len(), n * k);
     debug_assert_eq!(w.len(), m * k);
     debug_assert_eq!(y.len(), n * m);
+    #[cfg(target_os = "macos")]
+    if accel::on() && n * k * m >= 1 << 18 {
+        // Y = X · Wᵀ (row-major).
+        unsafe {
+            accel::cblas_sgemm(
+                101, 111, 112, n as i32, m as i32, k as i32, 1.0, x.as_ptr(), k as i32,
+                w.as_ptr(), k as i32, 0.0, y.as_mut_ptr(), m as i32,
+            );
+        }
+        return;
+    }
     let nb = n.div_ceil(GEMM_BLOCK);
     let block = |r0: usize, r1: usize, y: &mut [f32]| {
         for o in 0..m {
@@ -208,6 +250,17 @@ pub fn gemm_dx(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m: usi
     debug_assert_eq!(dy.len(), n * m);
     debug_assert_eq!(w.len(), m * k);
     debug_assert_eq!(dx.len(), n * k);
+    #[cfg(target_os = "macos")]
+    if accel::on() && n * k * m >= 1 << 18 {
+        // dX += dY · W (row-major, beta = 1 accumulates).
+        unsafe {
+            accel::cblas_sgemm(
+                101, 111, 111, n as i32, k as i32, m as i32, 1.0, dy.as_ptr(), m as i32,
+                w.as_ptr(), k as i32, 1.0, dx.as_mut_ptr(), k as i32,
+            );
+        }
+        return;
+    }
     let nb = n.div_ceil(GEMM_BLOCK);
     let block = |r0: usize, r1: usize, dxs: &mut [f32]| {
         for o in 0..m {
@@ -247,6 +300,17 @@ pub fn gemm_dw(dy: &[f32], x: &[f32], dw: &mut [f32], n: usize, k: usize, m: usi
     debug_assert_eq!(dy.len(), n * m);
     debug_assert_eq!(x.len(), n * k);
     debug_assert_eq!(dw.len(), m * k);
+    #[cfg(target_os = "macos")]
+    if accel::on() && n * k * m >= 1 << 18 {
+        // dW += dYᵀ · X (row-major, beta = 1 accumulates).
+        unsafe {
+            accel::cblas_sgemm(
+                101, 112, 111, m as i32, k as i32, n as i32, 1.0, dy.as_ptr(), m as i32,
+                x.as_ptr(), k as i32, 1.0, dw.as_mut_ptr(), k as i32,
+            );
+        }
+        return;
+    }
     let range = |o0: usize, o1: usize, dws: &mut [f32]| {
         // i-blocked so the X block stays in cache across the o loop.
         let nb = n.div_ceil(GEMM_BLOCK);

@@ -19,6 +19,7 @@ pub mod qtensor;
 pub mod router;
 pub mod runtime;
 pub mod sampler;
+pub mod skillbake;
 pub mod swarm;
 pub mod tokenizer;
 

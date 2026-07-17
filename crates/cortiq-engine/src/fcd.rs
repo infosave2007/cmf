@@ -196,15 +196,15 @@ enum FcdAttn {
     },
 }
 
-struct FcdLayer {
+pub(crate) struct FcdLayer {
     attn: FcdAttn,
-    inter: usize,
+    pub(crate) inter: usize,
     // Frozen originals: the teacher's LN/FFN and the student's init.
-    iln: Vec<f32>,
-    pln: Vec<f32>,
-    gate: Vec<f32>,
-    up: Vec<f32>,
-    down: Vec<f32>,
+    pub(crate) iln: Vec<f32>,
+    pub(crate) pln: Vec<f32>,
+    pub(crate) gate: Vec<f32>,
+    pub(crate) up: Vec<f32>,
+    pub(crate) down: Vec<f32>,
 }
 
 /// GDN geometry shared by every linear layer (arch.linear_* fields).
@@ -234,21 +234,21 @@ pub struct FcdModel {
     pub hd: usize,
     pub nl: usize,
     pub vocab: usize,
-    eps: f64,
-    gemma: bool,
+    pub(crate) eps: f64,
+    pub(crate) gemma: bool,
     rotary_dim: usize,
     inv_freq: Vec<f64>,
     /// [vocab, hidden]; also the tied head when `lm_head` is None.
-    embed: Vec<f32>,
-    lm_head: Option<Vec<f32>>,
-    final_norm: Vec<f32>,
-    layers: Vec<FcdLayer>,
+    pub(crate) embed: Vec<f32>,
+    pub(crate) lm_head: Option<Vec<f32>>,
+    pub(crate) final_norm: Vec<f32>,
+    pub(crate) layers: Vec<FcdLayer>,
     /// Which layers run the Nyström kernel in the student forward.
     o1_flags: Vec<bool>,
     nys: NysCfg,
     /// GDN geometry (present when the model has linear layers).
     gdn: Option<GdnDims>,
-    pool: Option<Arc<Pool>>,
+    pub(crate) pool: Option<Arc<Pool>>,
 }
 
 fn deq(model: &CmfModel, name: &str) -> Result<Vec<f32>, String> {
@@ -518,12 +518,12 @@ impl TrainState {
 /// LN/FFN weight view of one layer — frozen originals for the teacher
 /// (and non-converted student layers), master copies for trainables.
 #[derive(Clone, Copy)]
-struct LnFfn<'a> {
-    iln: &'a [f32],
-    pln: &'a [f32],
-    gate: &'a [f32],
-    up: &'a [f32],
-    down: &'a [f32],
+pub(crate) struct LnFfn<'a> {
+    pub(crate) iln: &'a [f32],
+    pub(crate) pln: &'a [f32],
+    pub(crate) gate: &'a [f32],
+    pub(crate) up: &'a [f32],
+    pub(crate) down: &'a [f32],
 }
 
 fn ln_ffn<'a>(fm: &'a FcdModel, ts: Option<&'a TrainState>, li: usize) -> LnFfn<'a> {
@@ -566,15 +566,15 @@ enum AttnActs {
     Gdn { qkv: Vec<f32>, z: Vec<f32>, a: Vec<f32>, b: Vec<f32> },
 }
 
-struct LayerActs {
+pub(crate) struct LayerActs {
     inv1: Vec<f32>,
     attn: AttnActs,
-    h1: Vec<f32>,
-    n2: Vec<f32>,
-    inv2: Vec<f32>,
-    gpre: Vec<f32>,
-    upre: Vec<f32>,
-    act: Vec<f32>,
+    pub(crate) h1: Vec<f32>,
+    pub(crate) n2: Vec<f32>,
+    pub(crate) inv2: Vec<f32>,
+    pub(crate) gpre: Vec<f32>,
+    pub(crate) upre: Vec<f32>,
+    pub(crate) act: Vec<f32>,
 }
 
 /// Disjoint-write pointer for pooled per-head scatter (pipeline pattern).
@@ -636,6 +636,24 @@ impl FcdModel {
         nystrom: bool,
         want_acts: bool,
     ) -> (Vec<f32>, Option<LayerActs>) {
+        self.layer_forward_scaled(li, h_in, b, t, wts, nystrom, want_acts, None)
+    }
+
+    /// `layer_forward` with an optional per-neuron FFN activation scale
+    /// (the DTG-MA mask σ(m), Patent 2): `act·scale` feeds down_proj.
+    /// `LayerActs.act` stays PRE-scale so the mask backward can read it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn layer_forward_scaled(
+        &self,
+        li: usize,
+        h_in: &[f32],
+        b: usize,
+        t: usize,
+        wts: &LnFfn,
+        nystrom: bool,
+        want_acts: bool,
+        ffn_scale: Option<&[f32]>,
+    ) -> (Vec<f32>, Option<LayerActs>) {
         let hsz = self.hidden;
         let n = b * t;
         let l = &self.layers[li];
@@ -669,7 +687,19 @@ impl FcdModel {
             act[i] = ops::silu(gpre[i]) * upre[i];
         }
         let mut ffn = vec![0f32; n * hsz];
-        ops::gemm_nt(&act, wts.down, &mut ffn, n, inter, hsz, pool);
+        match ffn_scale {
+            Some(g) => {
+                debug_assert_eq!(g.len(), inter);
+                let mut act2 = act.clone();
+                for r in 0..n {
+                    for (a, &gv) in act2[r * inter..(r + 1) * inter].iter_mut().zip(g) {
+                        *a *= gv;
+                    }
+                }
+                ops::gemm_nt(&act2, wts.down, &mut ffn, n, inter, hsz, pool);
+            }
+            None => ops::gemm_nt(&act, wts.down, &mut ffn, n, inter, hsz, pool),
+        }
         let mut h2 = h1.clone();
         for (a, &x) in h2.iter_mut().zip(&ffn) {
             *a += x;

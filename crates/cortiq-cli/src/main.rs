@@ -305,7 +305,9 @@ enum Commands {
         /// Maximum number of tokens to generate
         #[arg(short = 'n', long, default_value = "256")]
         max_tokens: usize,
-        /// Skill to overlay (spec §9): replacement tensors are read in
+        /// Skill to overlay (spec §9; a file with routable skills picks
+        /// one automatically — `none` forces the backbone, an id pins):
+        /// replacement tensors are read in
         /// place of backbone tensors
         #[arg(long)]
         skill: Option<String>,
@@ -710,6 +712,35 @@ enum SkillCmd {
         /// Path to .cmf model file
         model: String,
     },
+    /// Native DTG-MA bake (Patent 2), no Python: train the L1 neuron
+    /// mask to its denoising bottom on your corpus, FCD-polish the last
+    /// layers, and write a standalone defragged specialist — pruned
+    /// neurons are neither stored nor computed
+    Bake {
+        /// Backbone .cmf (the embedded tokenizer is used)
+        model: String,
+        /// Task corpus: one or more plain-text files
+        #[arg(long, num_args = 1.., required = true)]
+        files: Vec<String>,
+        /// Output .cmf (the standalone specialist)
+        #[arg(long)]
+        output: String,
+        /// Phase A steps (mask training)
+        #[arg(long, default_value = "240")]
+        steps_a: usize,
+        /// Phase B steps (FCD polish)
+        #[arg(long, default_value = "120")]
+        steps_b: usize,
+        /// How many of the last layers Phase B trains
+        #[arg(long, default_value = "4")]
+        fcd_layers: usize,
+        /// Calibration chunk length in tokens
+        #[arg(long, default_value = "256")]
+        chunk: usize,
+        /// Held-out chunks (the quality gate)
+        #[arg(long, default_value = "12")]
+        held: usize,
+    },
 }
 
 #[tokio::main]
@@ -905,6 +936,9 @@ async fn main() -> anyhow::Result<()> {
                 hf_token.as_deref(),
             ),
             SkillCmd::List { model } => skill::run_skill_list(&model),
+            SkillCmd::Bake { model, files, output, steps_a, steps_b, fcd_layers, chunk, held } => {
+                skill::run_skill_bake(&model, &files, &output, steps_a, steps_b, fcd_layers, chunk, held)
+            }
         },
         Commands::Verify { model } => cmd_verify(&model).await,
         Commands::Fcd {
@@ -1759,6 +1793,18 @@ async fn cmd_run(
             resume_prefix.len(),
             skill.as_deref().unwrap_or("—")
         );
+    }
+    // A file that carries routable skills routes by default (spec §9 —
+    // selection is a property of the file): the prompt picks its
+    // specialist with no flag at all. `--skill <id>` pins one,
+    // `--skill none` forces the backbone, `--blend`/`--route-dynamic`
+    // take their own paths.
+    let routable = model.header.skills.iter().any(|s| s.selection.is_some());
+    if skill.is_none() && blend.is_none() && !route_dynamic && routable && prompt.is_some() {
+        skill = Some("auto".to_string());
+    }
+    if matches!(skill.as_deref(), Some("none") | Some("backbone")) {
+        skill = None;
     }
     if skill.as_deref() == Some("auto") {
         let mut probe = Pipeline::from_model(&model, SamplerConfig::default())?;

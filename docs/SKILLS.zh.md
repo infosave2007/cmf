@@ -86,8 +86,9 @@ $ cortiq route swarm.cmf -p "Verify step by step whether 91 is divisible by 7 an
 ## 使用技能
 
 ```sh
-cortiq run swarm.cmf -p "..."                      # 主干
-cortiq run swarm.cmf -p "..." --skill thinker      # 显式叠加
+cortiq run swarm.cmf -p "..."                      # 自动路由：文件自己挑选专家
+cortiq run swarm.cmf -p "..." --skill thinker      # 显式固定某个技能
+cortiq run swarm.cmf -p "..." --skill none         # 强制主干
 cortiq route swarm.cmf -p "..."                    # 为所有技能打分
 cortiq explain swarm.cmf --prompt "..."            # 路由 + 首词元分布
 cortiq run swarm.cmf -p "..." --blend auto         # 前 2 名的软叠加
@@ -150,6 +151,49 @@ cortiq skill add <backbone.cmf> \
 | 技能的运行时开销 | 不激活时为零；激活的技能 = 主干同速（同形状、同内核） |
 | 路由开销 | 提示词到 φ 层的一次 prefill |
 
+## 一条命令，不用 Python：`cortiq skill bake`
+
+整个 DTG-MA 配方原生运行——掩码训练、FCD 精修和 defrag 烘焙，一条命令在
+CPU 上完成（训练 GEMM 走与 prefill 相同的 Accelerate 路径；注意力被冻结，
+反向传播只沿 FFN 链行进）：
+
+```sh
+cortiq skill bake backbone.cmf \
+  --files docs/CMF_V2_SPEC.ru.md README.ru.md docs/COMPARISON.ru.md \
+  --output rutech-specialist.cmf
+```
+
+一次真实的逐步运行——Qwen2.5-0.5B-Instruct（q8），语料就是本仓库的俄语
+文档，Apple M4，**端到端 8.8 分钟**：
+
+```
+bake: 70 calib + 12 held chunks of 256 tokens | FCD last 4 layer(s)
+baseline (full): 24.157
+  [A] step  30: L1=0.015 pruned= 0% hard-PPL=23.648 (bottom 23.648@0%)
+  [A] step  60: L1=0.020 pruned= 2% hard-PPL=21.110 (bottom 21.110@2%)   <- 去噪谷底
+  [A] step  90: L1=0.025 pruned= 6% hard-PPL=22.778 (bottom 21.110@2%)
+  [A] step 120: L1=0.030 pruned=10% hard-PPL=25.610 (bottom 21.110@2%)
+  [A] step 180: L1=0.040 pruned=16% hard-PPL=49.659 (bottom 21.110@2%)   <- 过了谷底质量崩塌
+[A] 314s: masked-PPL 21.110                                              <- 恢复谷底检查点
+  [B] step  30: held-PPL 18.304
+  [B] step  60: held-PPL 17.840
+  [B] step  90: held-PPL 17.474
+  [B] step 120: held-PPL 17.423                                          <- FCD 继续向下
+=== bake: baseline 24.157 | mask 21.110 | mask+FCD 17.423 | pruned 2% -> SPECIALIST <= baseline
+runtime gate (held-out, real engine): backbone 24.173 -> specialist 19.039 (-21.2%)
+```
+
+三个值得读两遍的结论：
+
+- 训练副本与真实引擎一致（baseline 24.157 对 24.173）——烘焙优化的就是
+  运行时供给的。17.4（f32 副本）与 19.0（写出的文件）之间的差距是训练后
+  FFN 的 q8 再量化——已测量，不隐藏。
+- **泛化**：在语料中从未出现的俄语技术文档（`PERFORMANCE_ROADMAP.ru.md`）
+  上，专家 22.56 对主干 25.62——**未见文本上 −12.0%**。
+- 此处去噪谷底落在 2%（主干 PPL 24——这个领域主干并不算弱），所以体积
+  收益小（479 → 472 MB）；故事在质量。在弱领域（主干 PPL 70）同一配方
+  剪枝 11% 并削掉四分之一困惑度——见下一节。
+
 ## 比原始模型更小——而且更好：DTG-MA 烘焙
 
 技能最强的形态不是伴随主干，而是在一个领域里*取代*它。DTG-MA 配方
@@ -159,11 +203,11 @@ cortiq skill add <backbone.cmf> \
 既不存储也不计算（claims 9/10）：
 
 ```sh
-# A+B 两阶段：在你的语料上训练掩码 + FCD 精修（torch，M4 上 0.8B 约
-# 25 分钟；需要：pip install torch numpy tokenizers）
-python3 converter/make_skill_l1fcd.py --model <hf_snapshot_dir>   --id ru --files corpus1.txt corpus2.txt --out skill-ru
+# 原生，一条命令（见上一节）：
+cortiq skill bake backbone.cmf --files corpus1.txt corpus2.txt --output specialist.cmf
 
-# 烘焙独立的专家文件：神经元被物理丢弃
+# 或原始 torch 配方（相同两阶段；在 CUDA 机器上有用）：
+python3 converter/make_skill_l1fcd.py --model <hf_snapshot_dir>   --id ru --files corpus1.txt corpus2.txt --out skill-ru
 cortiq convert --model <hf_snapshot_dir> --defrag skill-ru   --quant q8_2f --output ru-specialist.cmf
 ```
 
