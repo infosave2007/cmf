@@ -125,6 +125,91 @@ fn q8_matmat(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// Tiled GEMM for wide prefill batches (the WGSL cousin of Metal's
+// q8_mul_mm; WGSL has no subgroup matrices, so this is the classic
+// register-blocked form): a 64(b)×64(rows) C-tile per 16×16 workgroup,
+// each thread owning a 4×4 accumulator block; X and dequantized W stage
+// through 8 KB of workgroup memory in K-steps of 16. The naive kernel
+// above re-reads every W row per position — here W is read once per 64
+// positions. Perf is hardware-dependent by design: the runtime probe
+// decides per machine whether this beats the CPU, so a card where it
+// loses simply keeps the CPU path.
+var<workgroup> mm_at: array<f32, 64 * 16>;
+var<workgroup> mm_wt: array<f32, 64 * 16>;
+
+@compute @workgroup_size(16, 16)
+fn q8_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
+             @builtin(local_invocation_id) lid: vec3<u32>) {
+    let cols = pm.cols4 * 4u;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    let tid = lid.y * 16u + lid.x;
+    var acc: array<array<f32, 4>, 4>;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        for (var j = 0u; j < 4u; j = j + 1u) { acc[i][j] = 0.0; }
+    }
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        // Stage X tile [64×16] (4 f32 per thread) and W tile [64×16]
+        // (one u32 = 4 quants per thread per round).
+        for (var t = tid; t < 64u * 4u; t = t + 256u) {
+            let m = t / 4u;
+            let k4 = t % 4u;
+            var xv = vec4<f32>(0.0);
+            if (m0 + m < pm.nb && (k0 / 4u) + k4 < pm.cols4) {
+                let xi = (m0 + m) * cols + k0 + k4 * 4u;
+                xv = vec4<f32>(xsm[xi], xsm[xi + 1u], xsm[xi + 2u], xsm[xi + 3u]);
+            }
+            let dst = m * 16u + k4 * 4u;
+            mm_at[dst] = xv.x;
+            mm_at[dst + 1u] = xv.y;
+            mm_at[dst + 2u] = xv.z;
+            mm_at[dst + 3u] = xv.w;
+        }
+        for (var t = tid; t < 64u * 4u; t = t + 256u) {
+            let n = t / 4u;
+            let k4 = t % 4u;
+            var wv = vec4<f32>(0.0);
+            if (n0 + n < pm.rows && (k0 / 4u) + k4 < pm.cols4) {
+                wv = i8x4(qm[(n0 + n) * pm.cols4 + (k0 / 4u) + k4]);
+            }
+            let dst = n * 16u + k4 * 4u;
+            mm_wt[dst] = wv.x;
+            mm_wt[dst + 1u] = wv.y;
+            mm_wt[dst + 2u] = wv.z;
+            mm_wt[dst + 3u] = wv.w;
+        }
+        workgroupBarrier();
+        // 4×4 outer-product accumulation over the 16 staged K values.
+        for (var k = 0u; k < 16u; k = k + 1u) {
+            var av: array<f32, 4>;
+            var wv: array<f32, 4>;
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                av[i] = mm_at[(lid.y * 4u + i) * 16u + k];
+                wv[i] = mm_wt[(lid.x * 4u + i) * 16u + k];
+            }
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                for (var j = 0u; j < 4u; j = j + 1u) {
+                    acc[i][j] = acc[i][j] + av[i] * wv[j];
+                }
+            }
+        }
+        workgroupBarrier();
+        k0 = k0 + 16u;
+    }
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let m = m0 + lid.y * 4u + i;
+        if (m >= pm.nb) { continue; }
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            let n = n0 + lid.x * 4u + j;
+            if (n < pm.rows) {
+                ym[m * pm.rows + n] = acc[i][j] * rsm[n];
+            }
+        }
+    }
+}
+
 // ── Element-wise kernels of the MoE block (silu·mul·col, axpy, zeroing) ──
 struct N1 { n: u32, f: u32, _b: u32, _c: u32 };
 
@@ -168,11 +253,13 @@ struct Ctx {
     queue: wgpu::Queue,
     matvec: wgpu::ComputePipeline,
     matmat: wgpu::ComputePipeline,
+    mul_mm: wgpu::ComputePipeline,
     silu: wgpu::ComputePipeline,
     axpy: wgpu::ComputePipeline,
     zero: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     layout_mm: wgpu::BindGroupLayout,
+    layout_mmm: wgpu::BindGroupLayout,
     layout_silu: wgpu::BindGroupLayout,
     layout_axpy: wgpu::BindGroupLayout,
     layout_zero: wgpu::BindGroupLayout,
@@ -341,11 +428,13 @@ fn init() -> Result<Ctx, String> {
     };
     let matvec = pipe("q8_matvec");
     let matmat = pipe("q8_matmat");
+    let mul_mm = pipe("q8_mul_mm");
     let silu = pipe("silu_mul_pre");
     let axpy = pipe("axpy");
     let zero = pipe("fill_zero");
     let layout = matvec.get_bind_group_layout(0);
     let layout_mm = matmat.get_bind_group_layout(0);
+    let layout_mmm = mul_mm.get_bind_group_layout(0);
     let layout_silu = silu.get_bind_group_layout(0);
     let layout_axpy = axpy.get_bind_group_layout(0);
     let layout_zero = zero.get_bind_group_layout(0);
@@ -355,11 +444,13 @@ fn init() -> Result<Ctx, String> {
         queue,
         matvec,
         matmat,
+        mul_mm,
         silu,
         axpy,
         zero,
         layout,
         layout_mm,
+        layout_mmm,
         layout_silu,
         layout_axpy,
         layout_zero,
@@ -729,9 +820,12 @@ fn dispatch_matmat(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "mm-stage",
     );
+    let use_mm = b >= 32;
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("mm-bg"),
-        layout: &c.layout_mm,
+        // Auto bind-group layouts are pipeline-exclusive in wgpu — pick
+        // the layout of the pipeline this dispatch actually uses.
+        layout: if use_mm { &c.layout_mmm } else { &c.layout_mm },
         entries: &[
             bind_buf(0, &q_buf),
             bind_buf(1, &xs_buf),
@@ -748,9 +842,19 @@ fn dispatch_matmat(
             label: Some("mm"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&c.matmat);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups((rows as u32).min(MAX_WG), b as u32, 1);
+        if use_mm {
+            pass.set_pipeline(&c.mul_mm);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(
+                (rows as u32).div_ceil(64).min(MAX_WG),
+                (b as u32).div_ceil(64),
+                1,
+            );
+        } else {
+            pass.set_pipeline(&c.matmat);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups((rows as u32).min(MAX_WG), b as u32, 1);
+        }
     }
     let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * rows]);
     drop(sc);
@@ -1167,5 +1271,43 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_d < 1e-3, "wgpu q8_matmat ≠ CPU: max|Δ| = {max_d}");
+    }
+
+    /// The tiled kernel (b ≥ 32) on deliberately awkward shapes: rows
+    /// not a multiple of the 64-tile, cols not a multiple of the K-step
+    /// — every edge guard fires.
+    #[test]
+    fn wgpu_q8_mul_mm_matches_cpu_reference() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping mul_mm test");
+            return;
+        };
+        let (rows, cols, b) = (100usize, 52usize, 70usize);
+        let mut q = vec![0i8; rows * cols];
+        for (i, v) in q.iter_mut().enumerate() {
+            *v = (((i * 31 + 7) % 255) as i32 - 127) as i8;
+        }
+        let rs: Vec<f32> = (0..rows).map(|r| 0.01 + (r % 7) as f32 * 0.003).collect();
+        let pre: Vec<f32> = (0..b * cols).map(|i| ((i % 19) as f32 - 9.0) * 0.04).collect();
+        let mut want = vec![0f32; b * rows];
+        for bi in 0..b {
+            for o in 0..rows {
+                let mut acc = 0f32;
+                for i in 0..cols {
+                    acc += q[o * cols + i] as f32 * pre[bi * cols + i];
+                }
+                want[bi * rows + o] = acc * rs[o];
+            }
+        }
+        let qbytes: &[u8] = bytemuck::cast_slice(&q);
+        let mut got = vec![0f32; b * rows];
+        assert!(dispatch_matmat(c, None, qbytes, &rs, &pre, b, rows, cols, &mut got));
+        let max_d = want
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_d < 1e-3, "wgpu q8_mul_mm ≠ CPU: max|Δ| = {max_d}");
     }
 }
