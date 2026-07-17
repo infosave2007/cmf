@@ -10,7 +10,7 @@
 //! storage scales as |backbone| + Σ|deltas|.
 
 use crate::convert::{
-    canon_name, hf_download, looks_like_repo, open_model, quantize_2d, to_f32, Quant,
+    canon_name, hf_download, looks_like_repo, open_model, parse_quant, quantize_2d, to_f32, Quant,
 };
 use base64::Engine as _;
 use cortiq_core::quant::f32_to_f16;
@@ -201,6 +201,9 @@ pub fn run_skill_add(
     rank: usize,
     quality_file: Option<&str>,
     quality_tokens: usize,
+    min_delta: f32,
+    skill_quant: Option<&str>,
+    mean_bits: Option<f32>,
     output: Option<&str>,
     hf_token: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -208,6 +211,9 @@ pub fn run_skill_add(
         id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
         "skill id must be [A-Za-z0-9_-]"
     );
+    if let Some(b) = mean_bits {
+        crate::convert::set_vbit_mean_bits(b);
+    }
     let model = Arc::new(CmfModel::open(model_path)?);
     let num_layers = model.arch().num_layers;
     let layers = parse_layers(layers_spec, num_layers)?;
@@ -231,6 +237,9 @@ pub fn run_skill_add(
     }
     let mut new_tensors: Vec<TensorSpec> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    let mut unchanged = 0usize;
+    let mut unchanged_bytes = 0u64;
+    let mut deltas: Vec<(String, f32)> = Vec::new();
     for want in &wanted {
         let Some(entry) = model.tensors.iter().find(|t| &t.name == want) else {
             skipped.push(format!("{want} (not in backbone)"));
@@ -249,18 +258,58 @@ pub fn run_skill_add(
                     entry.shape
                 );
                 let vals = to_f32(&m.dtype, sh.bytes(m))?;
+                found = true;
+                // Delta gate: neurons the fine-tune never touched are
+                // not worth bytes. Compare the donor against the
+                // backbone through the reference decoder and drop
+                // tensors whose relative change is below --min-delta —
+                // the runtime reads the backbone entry for them, which
+                // is exactly what the donor holds there anyway.
+                if min_delta > 0.0 {
+                    let n: usize = entry.shape.iter().product();
+                    let mut base = vec![0f32; n];
+                    cortiq_core::quant::dequant_tensor(
+                        entry,
+                        model.tensor_bytes(want)?,
+                        &mut base,
+                    )
+                    .map_err(|e| anyhow::anyhow!("{want}: dequant: {e}"))?;
+                    let mut dd = 0f64;
+                    let mut bb = 0f64;
+                    for (d, b) in vals.iter().zip(&base) {
+                        let diff = (d - b) as f64;
+                        dd += diff * diff;
+                        bb += (*b as f64) * (*b as f64);
+                    }
+                    let rel = (dd / bb.max(1e-30)).sqrt() as f32;
+                    deltas.push((want.clone(), rel));
+                    if rel < min_delta {
+                        unchanged += 1;
+                        unchanged_bytes += entry.nbytes;
+                        break 'shards;
+                    }
+                }
                 let (out_dim, in_dim) = (entry.shape[0], entry.shape[1]);
-                let (dtype, data) = match dtype_to_quant(entry.dtype) {
-                    Some(q) => quantize_2d(q, &vals, out_dim, in_dim),
-                    None => anyhow::bail!("{want}: backbone dtype {:?} unsupported", entry.dtype),
+                // A skill may live in a cheaper encoding than the
+                // backbone (--skill-quant, spec §3 per-tensor dtypes):
+                // the overlay is small next to the backbone, so its
+                // bytes are often better spent halved.
+                let q = match skill_quant {
+                    Some(sq) => parse_quant(sq)?,
+                    None => match dtype_to_quant(entry.dtype) {
+                        Some(q) => q,
+                        None => {
+                            anyhow::bail!("{want}: backbone dtype {:?} unsupported", entry.dtype)
+                        }
+                    },
                 };
+                let (dtype, data) = quantize_2d(q, &vals, out_dim, in_dim);
                 new_tensors.push(TensorSpec {
                     name: format!("skill.{id}.{want}"),
                     dtype,
                     shape: entry.shape.clone(),
                     data,
                 });
-                found = true;
                 break 'shards;
             }
         }
@@ -268,12 +317,42 @@ pub fn run_skill_add(
             skipped.push(format!("{want} (not in donor)"));
         }
     }
-    anyhow::ensure!(!new_tensors.is_empty(), "no matching donor tensors — wrong --from?");
+    anyhow::ensure!(
+        !new_tensors.is_empty(),
+        "no matching donor tensors{} — wrong --from{}?",
+        if unchanged > 0 { " above --min-delta" } else { "" },
+        if unchanged > 0 { " or threshold too high" } else { "" }
+    );
     if !skipped.is_empty() {
         for s in &skipped {
             println!("  skipped: {s}");
         }
     }
+    if min_delta > 0.0 && !deltas.is_empty() {
+        let mut sorted: Vec<f32> = deltas.iter().map(|(_, d)| *d).collect();
+        sorted.sort_by(f32::total_cmp);
+        println!(
+            "delta gate ≥ {min_delta}: kept {} / dropped {} unchanged tensor(s) (−{:.1} MB); \
+             rel-delta min {:.4} / median {:.4} / max {:.4}",
+            new_tensors.len(),
+            unchanged,
+            unchanged_bytes as f64 / 1e6,
+            sorted.first().unwrap(),
+            sorted[sorted.len() / 2],
+            sorted.last().unwrap()
+        );
+    }
+    // The registry's layer list reflects what is actually stored.
+    let layers: Vec<usize> = layers
+        .into_iter()
+        .filter(|li| {
+            new_tensors.iter().any(|t| {
+                t.name
+                    .strip_prefix(&format!("skill.{id}.model.layers.{li}."))
+                    .is_some()
+            })
+        })
+        .collect();
     let delta_bytes: usize = new_tensors.iter().map(|t| t.data.len()).sum();
     println!(
         "skill '{id}': {} tensors over {} layer(s), +{:.1} MB",

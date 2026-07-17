@@ -676,6 +676,21 @@ enum SkillCmd {
         /// Max tokens for the quality gate
         #[arg(long, default_value = "1024")]
         quality_tokens: usize,
+        /// Skip donor tensors whose relative change vs the backbone is
+        /// below this (0 = keep everything): neurons the fine-tune
+        /// never touched are not stored, the skill shrinks to its real
+        /// delta. Try 0.02–0.05; verify with --quality
+        #[arg(long, default_value = "0.0")]
+        min_delta: f32,
+        /// Store the skill's tensors in a cheaper encoding than the
+        /// backbone (q8 | q8_2f | q4 | q4t | f16 | vbit): half the
+        /// bytes with q4 on a q8 backbone. Verify with --quality
+        #[arg(long)]
+        skill_quant: Option<String>,
+        /// Mean bits for --skill-quant vbit (3.0–8.0; small models
+        /// usually need 5.5–6 to keep the fine-tune's gains)
+        #[arg(long)]
+        mean_bits: Option<f32>,
         /// Output path (default: rewrite the model in place)
         #[arg(long)]
         output: Option<String>,
@@ -857,6 +872,9 @@ async fn main() -> anyhow::Result<()> {
                 rank,
                 quality,
                 quality_tokens,
+                min_delta,
+                skill_quant,
+                mean_bits,
                 output,
                 hf_token,
             } => skill::run_skill_add(
@@ -871,6 +889,9 @@ async fn main() -> anyhow::Result<()> {
                 rank,
                 quality.as_deref(),
                 quality_tokens,
+                min_delta,
+                skill_quant.as_deref(),
+                mean_bits,
                 output.as_deref(),
                 hf_token.as_deref(),
             ),

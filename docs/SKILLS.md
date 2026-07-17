@@ -128,6 +128,8 @@ cortiq skill add <backbone.cmf> \
   --tensors ffn|attn|all          # which families (default ffn)
   --prompts file.txt              # 8+ example prompts → routing subspace
   --quality held-out.txt          # PPL gate, recorded in the registry
+  --min-delta 0.02                # drop tensors the tune never touched
+  --skill-quant vbit --mean-bits 6  # cheaper encoding for the overlay
   --output out.cmf                # default: rewrite in place
 ```
 
@@ -169,9 +171,57 @@ Skills that replace non-FFN tensors are excluded from *dynamic* routing
 | Runtime cost of a skill | zero when inactive; active skill = same speed as the backbone (identical shapes, identical kernels) |
 | Routing cost | one prefill pass over the prompt up to the φ layer |
 
-For a smaller footprint, restrict layers (`--layers 12-23` halves the
-size) and measure with `--quality` whether the behavior you care about
-survives — the honest tradeoff is one flag away.
+## Shrinking a skill on disk
+
+A skill should cost what the fine-tune actually changed — untouched
+neurons are not worth bytes. Two flags control that, both measured, both
+gated by `--quality`:
+
+**`--min-delta <x>` — don't store what the tune never touched.** Every
+candidate tensor is compared against the backbone through the reference
+decoder; tensors whose relative change is below the threshold are
+dropped — the runtime reads the backbone entry there, which is exactly
+what the donor holds anyway. The gate prints the full delta
+distribution, so you see before you cut:
+
+```
+# the ru donor, measured:
+delta gate ≥ 0.0000001: kept 72 / dropped 0 unchanged tensor(s) (−0.0 MB);
+rel-delta min 0.0980 / median 0.2196 / max 0.3724
+```
+
+Calibrate the threshold against your backbone's *quantization noise
+floor*: bake a self-graft (`--from` = the backbone's own source
+checkpoint) with `--min-delta 0.0000001` and read the printed median —
+that is pure quant error (measured median 0.92% for our q8 backbone; a
+self-graft with `--min-delta 0.02` correctly drops all 72 tensors and
+refuses to bake). Deltas at that level are noise, not signal. Our three
+demo donors all sit above it everywhere (sql 0.9–2.6%, thinker
+1.8–3.5%, ru 9.8–37%), so the gate rightly kept them whole — it pays
+when the tune is localized (a LoRA merged into a few projections, a
+tune that only touched deep layers), and it never lies: it measures
+first.
+
+**`--skill-quant <enc> [--mean-bits N]` — a cheaper encoding for the
+overlay.** Per-tensor dtypes are native to CMF (spec §3), so a skill may
+live in fewer bits than the backbone. Measured on the `ru` skill over
+the q8 backbone (held-out Russian prose, backbone PPL 11.88):
+
+| encoding | size | skill PPL | verdict |
+|---|---:|---:|---|
+| q8 (same as backbone) | 314 MB | 11.03 (−7.1%) | full quality |
+| `--skill-quant vbit --mean-bits 6` | 257 MB (−18%) | 11.19 (−5.8%) | keeps most of the win |
+| `--skill-quant vbit` (4.25 bits) | 184 MB (−41%) | 12.17 (+2.5%) | **worse than backbone** |
+| `--skill-quant q4` | 176 MB (−44%) | 12.20 (+2.7%) | **worse than backbone** |
+
+The lesson is the same one quantization always teaches, one level down:
+the *fine-tune's signal* has to survive the extra noise. A 0.5B's SFT
+delta (here 10–37% relative) survives ~6 bits and drowns at 4. Always
+re-measure with `--quality` after shrinking — the number lands in the
+registry either way, so the file carries its own verdict.
+
+You can also restrict layers by hand (`--layers 12-23` halves the size);
+same rule — measure whether the behavior you care about survives.
 
 ## How it works underneath
 
