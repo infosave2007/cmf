@@ -43,6 +43,11 @@ The capital of France is **Paris**.
 [10 tokens, 40.1 tok/s, finish: stop]
 ```
 
+**Android**: the `aarch64-linux-android` release binary runs on-device in
+[Termux](https://termux.dev) or an `adb shell` — download, `chmod +x cortiq`,
+and the same `convert` / `run` / `serve` commands work (CPU path; wgpu
+Vulkan rides along and the runtime probe keeps whichever side wins).
+
 `convert` pulls the checkpoint from Hugging Face (shards in parallel), quantizes
 it and writes one self-contained file — native Rust, no torch, no numpy. Already
 have a GGUF? `cortiq import-gguf <file-or-repo-id> --output model.cmf` reads it

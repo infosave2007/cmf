@@ -42,6 +42,12 @@ The capital of France is **Paris**.
 [10 tokens, 40.1 tok/s, finish: stop]
 ```
 
+**Android**: релизный бинарь `aarch64-linux-android` работает прямо на
+устройстве в [Termux](https://termux.dev) или через `adb shell` — скачайте,
+`chmod +x cortiq`, и те же команды `convert` / `run` / `serve` работают
+(CPU-путь; wgpu-Vulkan едет в комплекте, рантайм-проба оставляет ту
+сторону, которая выигрывает).
+
 `convert` скачивает модель с Hugging Face (её куски — параллельно), квантует её и
 пишет один самодостаточный файл — нативный Rust, без torch, без numpy. Уже есть
 GGUF? `cortiq import-gguf <file-or-repo-id> --output model.cmf` читает и его,

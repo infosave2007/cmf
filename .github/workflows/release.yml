@@ -47,6 +47,12 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: windows-latest
             target: aarch64-pc-windows-msvc
+          # Android (arm64): runnable in Termux or via adb shell. Built
+          # with the runner's preinstalled NDK; CPU path (+ wgpu Vulkan
+          # from --features gpu — Android Vulkan loads where present,
+          # the runtime probe keeps CPU where it wins). API 24+.
+          - os: ubuntu-latest
+            target: aarch64-linux-android
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -54,6 +60,16 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - name: Android NDK toolchain env
+        if: matrix.target == 'aarch64-linux-android'
+        # The GitHub ubuntu image ships an NDK; point cargo/cc at its
+        # clang wrapper (API 24) so ring and friends cross-compile.
+        run: |
+          NDK="${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
+          TOOL="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOL/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "CC_aarch64_linux_android=$TOOL/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$TOOL/llvm-ar" >> "$GITHUB_ENV"
       - name: Build
         # --features gpu: the wgpu (Vulkan/DX12) path ships in every
         # artifact — field case: a 35B CMF on an RTX 4090 ran CPU-only at
