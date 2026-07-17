@@ -10,6 +10,73 @@ mmap, same RAM, different weights at the same addresses. A prompt can be
 routed to the right skill automatically — the file itself knows which of
 its specialists fits, with no trained gate and no external router.
 
+## Terms — the three words you need
+
+- **Backbone (base model)** — an ordinary LLM converted to CMF
+  (`cortiq convert`). It is the model's shared weights *without* skills;
+  skills live in the same file next to it and replace some of its
+  tensors when active.
+- **Skill** — a set of replacement tensors ("in these layers take the
+  specialist's FFN weights, everything else comes from the backbone")
+  plus a ~4 KB routing descriptor that lets the file recognize "this
+  prompt is mine".
+- **Donor** — a *fine-tuned checkpoint of the very same backbone* (SFT
+  or merged LoRA) a skill can be taken from ready-made. A donor is NOT
+  a different model (a "coder", a "philosopher"): grafting from a
+  continued-pretrain relative does not work, and that is measured below.
+
+## Where a skill comes from: two paths
+
+**Path 1 — a dataset, no donor: `cortiq skill bake`.** If all you have
+is the backbone and domain text (a corpus, benchmark tasks), the engine
+finds the relevant neurons itself. This is exactly the imatrix-style
+"highlighting" intuition taken to its conclusion: run the corpus through
+the model and watch which FFN neurons carry the task — except instead of
+OR-ing the highlights the mask is *trained* (L1 regularization per the
+DTG-MA patent), because the honest measurement shows untrained top-K
+highlighting collapses quality (PPL 59 vs 11.9 — see below). The trained
+mask drops noise neurons — the model first gets *better* on the domain —
+then the last layers are polished against the exact teacher (FCD). No
+second model is needed.
+
+**Path 2 — a ready donor: `cortiq skill add`.** If someone already
+fine-tuned your backbone (a text-to-SQL tune, a Russian SFT), no
+training is needed at all: the "highlighting" was already done by the
+donor's author — their fine-tune IS the training result. What remains is
+extracting the changed part: each donor tensor is compared against the
+backbone, tensors the tune never touched are dropped (`--min-delta`),
+the changed ones are grafted into the file as a skill. Minutes on a
+laptop, no GPU.
+
+Both paths end the same way: the file gains a skill with an id, a name
+and a routing descriptor; `skill list` shows it, `--quality` writes the
+measured verdict into the registry.
+
+### FAQ
+
+**Is the backbone the weights including masks/skills?** No. The backbone
+is the shared model weights. Skills and masks are separate directory
+entries in the same file; when a skill is active the runtime reads its
+tensors instead of the backbone's.
+
+**How do you extract just the relevant weights from a donor without
+training?** The training already happened — inside the donor. We do not
+search for "skill neurons" in it; we take the *difference*: the tensors
+the fine-tune changed (a reference decoder measures relative delta
+against the backbone), and store only those. The threshold is
+`--min-delta`.
+
+**And if there is no donor?** Then path 1: dataset → `skill bake` →
+trained mask + polish. That is precisely the "ran 50 benchmark tasks —
+got an swe-skill" scenario: `--files` takes your texts, the engine does
+the rest (a real step-by-step run log is below).
+
+**Can skills be shared between people?** Yes. A skill is a set of
+directory entries inside a `.cmf`; you can hand over the whole file with
+its swarm, and moving a single skill between files of the same backbone
+is a catalog operation (no weight recomputation). A skill-hub is exactly
+where this design points.
+
 Everything below is reproducible with three commands' worth of real
 checkpoints from Hugging Face; the prompt and eval files live in
 [`docs/skills-demo/`](skills-demo/). Measured on `cortiq` 0.3.4+ with
@@ -161,16 +228,35 @@ the header — ~4 KB per skill, and the file routes itself from then on.
 Skills that replace non-FFN tensors are excluded from *dynamic* routing
 (static `--skill` still works) — the runtime warns when that happens.
 
-## Resources
+## Resources: what you need, on what hardware
+
+**Path 2 (`skill add`) is light.** No GPU at all:
 
 | What | Cost |
 |---|---|
 | Donor download | one HF checkpoint (~1 GB bf16 for a 0.5B), cached in `~/.cache/cortiq/hf` |
-| Bake time | minutes on a laptop: quantize the grafted tensors + rewrite the file |
+| Time | minutes on a laptop: quantize the grafted tensors + rewrite the file |
+| RAM | ~backbone size + one donor tensor (donor is mmap-streamed) |
 | File growth | + the grafted tensors only: 314 MB per FFN-all-layers skill on a q8 0.5B (backbone stays byte-identical) |
-| RAM while baking | ~backbone size + one donor tensor (donor is mmap-streamed) |
 | Runtime cost of a skill | zero when inactive; active skill = same speed as the backbone (identical shapes, identical kernels) |
 | Routing cost | one prefill pass over the prompt up to the φ layer |
+
+**Path 1 (`skill bake`) is CPU training.** The bake holds an f32 replica
+of the model (4 bytes per parameter) plus optimizer state only for the
+polished layers, so plain RAM sets the ceiling:
+
+| Backbone | Bake RAM (estimate: 4 B/param + optimizer) | Time (M4, 240+120 steps) |
+|---|---:|---:|
+| 0.5B | ~3 GB | 8.8 min (measured) |
+| 1–2B | ~6–10 GB | ~20–40 min |
+| 4B | ~18 GB | ~1.5 h |
+| 7–8B | ~35 GB | ~3 h |
+| 27B | ~115 GB — a 128 GB+ Mac Studio, or the torch recipe on CUDA | overnight |
+
+Corpus: 100–200 KB of domain text is enough (the real run above used 82
+chunks of 256 tokens). For a "benchmark skill", collect the task
+statements and reference solutions into text files and pass them to
+`--files`.
 
 ## One command, no Python: `cortiq skill bake`
 
