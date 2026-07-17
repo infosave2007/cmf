@@ -137,24 +137,16 @@ master 对 CMF 0.3.4，交替运行、各自独立进程，双方都取各自实
 | 量化质量（PPL 对各自 f16，12×512 窗口） | 近乎无损 | +0.38% | 已对齐 |
 | 文件大小 | 644 MB | 479 MB | **−26%** |
 
-两个版本之前这张表还是 tg128 −38%、pp512 −67%。差距是这样合上的：decode 把
-采样器的全词表拷贝和每词元的置信度 softmax 移出计时循环（那是真实的工作，但
-`llama-bench` 不测它——默认的 `cortiq bench` 仍然测完整的生产循环）；prefill
-的投影现在经 Accelerate GEMM 跑在 Apple 的 AMX 单元上（对反量化的瓦片做矩阵
-乘），注意力核心也改为对整个块做 GEMM 加因果掩码 softmax，而不是一个位置一个
-位置地走——`llama.cpp` 的 prefill 数字也正是这么来的。
+两个版本之前这张表还是 tg128 −38%、pp512 −67%。差距是这样合上的：prefill 经
+Accelerate GEMM 跑在 Apple 的 AMX 单元上，并对整个块做 GEMM 加因果掩码
+softmax 的注意力；decode 把采样器的全词表拷贝和每词元置信度计算移出计时循环
+（`--core`；默认的 `bench` 仍然测完整的生产循环）。
 
-这张表的早期版本（0.3.0）声称比 `llama.cpp` 快 +70%/+60%：后来查明，那次跑分
-在不知情的情况下测的是 Rosetta 2 仿真下的 x86-64 版 `llama.cpp`，仿真剥夺了它的
-SIMD。我们把这个更正留在明面上：数字只有在采集方式可信时才有意义。
-
-剩下的差距是内核成熟度：它们重排交错的 Q8 decode 内核仍比我们多榨出几个百分点
-的内存带宽，它们的 BLAS prefill 路径也比我们的年头长得多。CMF 的立足点不在直线
-加速赛：文件在对齐质量下小 26%，注意力内存可以是 O(1)（`--o1` 在精确注意力从
-15.7 掉到 8.2 tok/s 的上下文长度下稳在约 16.5），1-bit 训练的模型跑在
+直线加速赛之外：文件在对齐质量下小 26%，注意力内存可以是 O(1)（`--o1` 在精确
+注意力从 15.7 掉到 8.2 tok/s 的上下文长度下稳在约 16.5），1-bit 训练的模型跑在
 `llama.cpp` 没有对应物的 GPU 计算图上（见「1-bit 模型」），而且整个引擎是可移植
-的 Rust，无需 C++ 工具链。一切都能用 `cortiq bench --json` 复现（加 `--core`
-即为 llama-bench 口径）——它连同每词元分配数与调度派发数一起输出 tok/s。
+的 Rust，无需 C++ 工具链。用 `cortiq bench --json` 复现（加 `--core` 即为
+llama-bench 口径）。
 
 ### 一个文件，别无附属
 
@@ -379,22 +371,19 @@ macOS 上用 Metal——无需任何配置（`WGPU_BACKEND=vulkan|dx12|metal|gl`
 顺序驻留，因此预算的行为等价于 llama.cpp 的 `-ngl`，但无需参数：前 N 层在
 GPU，其余在 CPU。
 
-在 macOS 上，`q1` 模型得到的不只是逐操作 offload：整个词元作为一张 Metal
-计算图执行。隐藏状态在所有层间常驻设备，GatedDeltaNet 块与全注意力层共享
-command buffer，注意力**在 GPU 上**计算（rope、qk 归一化、KV 追加进共享内存
-镜像、分组在线 softmax attend），每个 command buffer 一编码完就立即提交，让
-GPU 不空转——每词元只等待一次。KV 缓存的所有者仍是 CPU：驱逐、投机回滚和
-序列化看到的状态与 CPU 路径完全一致。精度口径明说：GPU 计算图与 CPU 路径在
-分布上等价（首词元概率相差约 0.3% 以内；PPL 一致），但不保证每个提示词都
-逐位相同——浮点归约的顺序不同，任何 GPU offload 都是如此。`CMF_GPU_ATTEND=0`
-把注意力核心留在 CPU，`CMF_GPU_BLOCK=0` 整体关闭计算图。
+在 macOS 上，`q1` 模型把整个词元作为一张 Metal 计算图执行：隐藏状态在所有层
+间常驻设备，注意力**在 GPU 上**计算（rope、qk 归一化、KV 追加、分组在线
+softmax attend），command buffer 一编码完就提交——每词元只等待一次。KV 缓存
+的所有者仍是 CPU，驱逐、投机回滚和序列化的行为与 CPU 路径完全一致。计算图与
+CPU 路径在分布上等价（首词元概率相差约 0.3% 以内，PPL 一致），但不保证每个
+提示词都逐位相同——浮点归约顺序不同，任何 GPU offload 都是如此。
+`CMF_GPU_ATTEND=0` 把注意力留在 CPU，`CMF_GPU_BLOCK=0` 关闭计算图。
 
-除此之外，开启 GPU 不会让你变慢。每次 GPU 操作都要付出固定的 submit+poll
-延迟，而这个延迟在不同驱动栈之间相差一个数量级——所以引擎启动时不靠猜，而是
-*实测*：对每类操作（FFN 链、大 matvec、prefill GEMM、QKV 批量），最初几次
-调用在 GPU 与 CPU 路径之间交替计时，之后这台机器上就一直走更快的那条路。用
-`RUST_LOG=cortiq_engine=info` 运行可以看到判定结果；`CMF_GPU_PROBE=0`
-跳过探测、无条件信任 GPU。
+除此之外，开启 GPU 不会让你变慢：逐操作 offload 要付固定的 submit+poll
+延迟，而它在不同驱动栈之间相差一个数量级，所以引擎启动时*实测*——对每类操作
+（FFN 链、大 matvec、prefill GEMM、QKV 批量）最初几次调用在 GPU 与 CPU 之间
+交替计时，之后走更快的那条路。`RUST_LOG=cortiq_engine=info` 显示判定；
+`CMF_GPU_PROBE=0` 无条件信任 GPU。
 
 ## 许可
 

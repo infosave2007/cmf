@@ -153,31 +153,17 @@ sampler copy, no per-token confidence pass):
 | File size | 644 MB | 479 MB | **−26%** |
 
 Two releases ago this table read −38% tg128 and −67% pp512. What closed it:
-decode sheds the sampler's full-vocab copy and the per-token confidence
-softmax from the timed loop (they are real work, but work `llama-bench`
-does not measure — the default `cortiq bench` still measures the full
-production loop); prefill projections now ride Apple's AMX units through
-Accelerate GEMM over dequantized tiles, and the attention core attends the
-whole chunk as GEMMs with a causal masked softmax instead of walking
-positions one by one — which is exactly how `llama.cpp` gets its prefill
-number too.
+prefill rides Apple's AMX through Accelerate GEMM and attends the whole
+chunk as GEMMs with a causal masked softmax; decode drops the sampler copy
+and per-token confidence pass from the timed loop (`--core`; the default
+`bench` still times the full production loop).
 
-An earlier version of this table (0.3.0) claimed +70%/+60% over `llama.cpp`;
-that run had unknowingly benchmarked an x86-64 build of `llama.cpp` under
-Rosetta 2 emulation, which strips its SIMD. We keep the correction visible
-because the numbers only mean something if you can trust how they were taken.
-
-The remaining gap is kernel maturity: their repacked interleaved Q8 decode
-kernels still reach a few percent more of memory bandwidth than ours, and
-their BLAS prefill path is older than ours by years. Where CMF stands apart
-is not the drag race: the file is 26% smaller at matched quality, attention
+Beyond the drag race: the file is 26% smaller at matched quality, attention
 memory can be O(1) (`--o1` holds ~16.5 tok/s at contexts where exact
 attention decays from 15.7 to 8.2), 1-bit-trained models run on a GPU graph
 `llama.cpp` has no equivalent for (see [1-bit models](#1-bit-models-bonsai--bitnet-class)),
-and the whole engine is portable Rust with no C++ toolchain. Reproduce
-everything with `cortiq bench --json` (add `--core` for the llama-bench
-contract) — it reports tok/s alongside allocations/token and scheduler
-dispatches/token.
+and the whole engine is portable Rust with no C++ toolchain. Reproduce with
+`cortiq bench --json` (add `--core` for the llama-bench contract).
 
 ### One file, nothing on the side
 
@@ -420,29 +406,25 @@ a budget (`CMF_GPU_VRAM_MB`, default 8192 on discrete cards); layers are made
 resident in first-touch order, so the budget behaves like llama.cpp's `-ngl`
 without a flag: first N layers on the GPU, the rest on the CPU.
 
-On macOS, `q1` models get more than per-op offload: the whole token runs
-as a Metal graph. Hidden state lives on the device across every layer,
-GatedDeltaNet blocks and full-attention layers share command buffers,
-attention attends **on the GPU** (rope, qk-norms, KV append into
-shared-memory mirrors, grouped online-softmax attend), and each command
-buffer is committed as soon as it is encoded so the GPU never idles —
-one wait per token. The CPU cache remains the owner of record: eviction,
-speculative rollback and serialization see exactly the state they would
-on the CPU path. Contract note: the GPU graph is distribution-equivalent
-to the CPU path (first-token probabilities match to ~0.3%; PPL matches),
-not bit-identical on every prompt — floating-point reductions run in a
-different order, as with any GPU offload. `CMF_GPU_ATTEND=0` keeps the
-attention core on the CPU, `CMF_GPU_BLOCK=0` disables the graph entirely.
+On macOS, `q1` models run the whole token as a Metal graph: hidden state
+lives on the device across every layer, attention attends **on the GPU**
+(rope, qk-norms, KV append, grouped online-softmax attend), and command
+buffers commit as they are encoded — one wait per token. The CPU cache
+remains the owner of record, so eviction, speculative rollback and
+serialization behave exactly as on the CPU path. The graph is
+distribution-equivalent to the CPU path (first-token probabilities within
+~0.3%, PPL matches), not bit-identical on every prompt — floating-point
+reductions run in a different order, as with any GPU offload.
+`CMF_GPU_ATTEND=0` keeps the attention core on the CPU, `CMF_GPU_BLOCK=0`
+disables the graph.
 
-For everything else, enabling the GPU never makes you slower. Per-op
+For everything else, enabling the GPU never makes you slower: per-op
 offload pays a fixed submit+poll latency that differs by an order of
-magnitude between driver stacks, so at startup the engine *measures*
-instead of guessing: for each op class (FFN chain, large matvec, prefill
-GEMM, QKV batch) the first calls alternate between the GPU and the CPU
-path, both timed, and the faster arm is kept for the rest of the run —
-per machine, per model. Run with `RUST_LOG=cortiq_engine=info` to see the
-verdicts; `CMF_GPU_PROBE=0` skips the probe and trusts the GPU
-unconditionally.
+magnitude between driver stacks, so at startup the engine *measures* — for
+each op class (FFN chain, large matvec, prefill GEMM, QKV batch) the first
+calls alternate between GPU and CPU, both timed, and the faster arm is
+kept. `RUST_LOG=cortiq_engine=info` shows the verdicts; `CMF_GPU_PROBE=0`
+trusts the GPU unconditionally.
 
 ## License
 
