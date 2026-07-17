@@ -238,6 +238,129 @@ kernel void q8_mul_mm(
     }
 }
 
+// q8_mul_mm with the FFN activation fused into the X-tile load:
+// x[i] = silu(g[i])·u[i] — the down GEMM consumes gate/up directly, no
+// separate silu dispatch, no act-buffer round trip (profiled at 8% of
+// the chunk as a standalone stage).
+kernel void q8_mul_mm_silu(
+    device const char*   q     [[buffer(0)]],
+    device const float*  gs    [[buffer(1)]],
+    device const float*  us    [[buffer(2)]],
+    device const float*  rs    [[buffer(3)]],
+    device float*        y     [[buffer(4)]],
+    constant uint&       cols  [[buffer(5)]],
+    constant uint&       rows  [[buffer(6)]],
+    constant uint&       nb    [[buffer(7)]],
+    uint tiitg [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint2 tg  [[threadgroup_position_in_grid]])
+{
+    threadgroup char shmem[8192];
+    threadgroup half* sa = (threadgroup half*)shmem;
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+    const uint NK = 32u;
+    uint r0 = tg.y * 64u;
+    uint r1 = tg.x * 32u;
+    uint nr0 = min(rows - r0, 64u);
+    uint nr1 = min(nb - r1, 32u);
+    uint lr0 = min(tiitg / 2u, nr0 - 1u);
+    uint il0 = tiitg % 2u;
+    uint lr1 = min(tiitg / 4u, nr1 - 1u);
+    uint iy  = 8u * (tiitg % 4u);
+    device const char* xrow = q + (ulong)(r0 + lr0) * cols + 16u * il0;
+    device const float* grow = gs + (ulong)(r1 + lr1) * cols + iy;
+    device const float* urow = us + (ulong)(r1 + lr1) * cols + iy;
+    float wscale = rs[r0 + lr0];
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8u; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    for (uint k0 = 0; k0 < cols; k0 += NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint sy = (tiitg / 2u) / 8u;
+            uint lx = (tiitg / 2u) % 8u;
+            device const char4* x4 = (device const char4*)xrow;
+            float4 w0 = float4(x4[0]) * wscale;
+            float4 w1 = float4(x4[1]) * wscale;
+            float4 w2 = float4(x4[2]) * wscale;
+            float4 w3 = float4(x4[3]) * wscale;
+            float wv[16] = {
+                w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w,
+                w2.x, w2.y, w2.z, w2.w, w3.x, w3.y, w3.z, w3.w,
+            };
+            uint ib0 = 8u * (2u * il0) + sy;
+            uint ib1 = 8u * (2u * il0 + 1u) + sy;
+            for (uint i = 0; i < 8u; ++i) {
+                sa[64u * ib0 + 8u * i + lx] = (half)wv[i];
+                sa[64u * ib1 + 8u * i + lx] = (half)wv[i + 8u];
+            }
+        }
+        {
+            uint sx = tiitg % 4u;
+            uint sy = (tiitg / 4u) / 8u;
+            uint ly = (tiitg / 4u) % 8u;
+            uint ib = 4u * sx + sy;
+            device const float4* g4 = (device const float4*)grow;
+            device const float4* u4 = (device const float4*)urow;
+            float4 g0 = g4[0];
+            float4 g1 = g4[1];
+            float4 u0 = u4[0];
+            float4 u1 = u4[1];
+            float4 a0 = (g0 / (1.0f + exp(-g0))) * u0;
+            float4 a1 = (g1 / (1.0f + exp(-g1))) * u1;
+            threadgroup half* dst = sb + 64u * ib + 8u * ly;
+            dst[0] = (half)a0.x; dst[1] = (half)a0.y;
+            dst[2] = (half)a0.z; dst[3] = (half)a0.w;
+            dst[4] = (half)a1.x; dst[5] = (half)a1.y;
+            dst[6] = (half)a1.z; dst[7] = (half)a1.w;
+        }
+        xrow += NK;
+        grow += NK;
+        urow += NK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < 4; ++ik) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; ++i) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* temp_str = ((threadgroup float*)shmem)
+        + 32u * (sgitg & 1u) + (16u * (sgitg >> 1u)) * 64u;
+    for (short i = 0; i < 8; ++i) {
+        simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * 64 * (i / 4),
+                        64, ulong2(0, 0), false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tiitg; i < 32u * 64u; i += 128u) {
+        uint m = i / 64u, n = i % 64u;
+        if (r1 + m < nb && r0 + n < rows) {
+            y[(ulong)(r1 + m) * rows + r0 + n] =
+                ((threadgroup float*)shmem)[m * 64u + n];
+        }
+    }
+}
+
 // f32 GEMM twins of q8_mul_mm for the chunk attention (profiled: the
 // streaming attend was 47% of the chunk — GEMM attention is the same
 // two-GEMM shape the CPU AMX path uses). Same 64×32 tile / 8x8-block
@@ -1285,6 +1408,7 @@ struct Ctx {
     rmsrows: ComputePipelineState,
     cropekv: ComputePipelineState,
     mmf32nt: ComputePipelineState,
+    q8mmsilu: ComputePipelineState,
     mmf32nn: ComputePipelineState,
     csmax: ComputePipelineState,
     impcol: ComputePipelineState,
@@ -1379,6 +1503,7 @@ fn init() -> Result<Ctx, String> {
     let rmsrows = pso("rmsnorm_rows")?;
     let cropekv = pso("chunk_rope_kv")?;
     let mmf32nt = pso("mul_mm_f32nt")?;
+    let q8mmsilu = pso("q8_mul_mm_silu")?;
     let mmf32nn = pso("mul_mm_f32nn")?;
     let csmax = pso("causal_softmax")?;
     let impcol = pso("imp_colsum")?;
@@ -1412,6 +1537,7 @@ fn init() -> Result<Ctx, String> {
         rmsrows,
         cropekv,
         mmf32nt,
+        q8mmsilu,
         mmf32nn,
         csmax,
         impcol,
@@ -2289,21 +2415,26 @@ pub fn chunk_run_gpu(
         encode_mul_mm(c, &cmd, &fbuf, prep.abs[4], &prep.rs[4], &n_b, &gb, b, l.gate.1, l.gate.2);
         encode_mul_mm(c, &cmd, &fbuf, prep.abs[5], &prep.rs[5], &n_b, &ub, b, l.up.1, l.up.2);
         cmd = prof.cut(c, cmd, "mm_gateup");
+        // down GEMM with silu(g)·u fused into the X-tile load — no
+        // standalone activation stage, no act-buffer round trip.
         {
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&c.silu);
-            for (i, buf) in [&gb, &ub, &gb, &act].iter().enumerate() {
-                enc.set_buffer(i as u64, Some(buf), 0);
-            }
-            let n_u = (b * inter) as u32;
-            let hc = 0u32;
-            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_threads(MTLSize::new((b * inter) as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.set_compute_pipeline_state(&c.q8mmsilu);
+            enc.set_buffer(0, Some(&fbuf), prep.abs[6] as u64);
+            enc.set_buffer(1, Some(&gb), 0);
+            enc.set_buffer(2, Some(&ub), 0);
+            enc.set_buffer(3, Some(&prep.rs[6]), 0);
+            enc.set_buffer(4, Some(&db), 0);
+            let (cols_u, rows_u, b_u) = (l.down.2 as u32, l.down.1 as u32, b as u32);
+            enc.set_bytes(5, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(6, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(7, 4, &b_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new((b as u64).div_ceil(32), (l.down.1 as u64).div_ceil(64), 1),
+                MTLSize::new(128, 1, 1),
+            );
             enc.end_encoding();
         }
-        cmd = prof.cut(c, cmd, "silu");
-        encode_mul_mm(c, &cmd, &fbuf, prep.abs[6], &prep.rs[6], &act, &db, b, l.down.1, l.down.2);
         cmd = prof.cut(c, cmd, "mm_down");
         axpy1(&cmd, &db, &h_b, b * hs);
         cmd = prof.cut(c, cmd, "axpy");
