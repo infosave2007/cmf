@@ -238,6 +238,300 @@ kernel void q8_mul_mm(
     }
 }
 
+// f32 GEMM twins of q8_mul_mm for the chunk attention (profiled: the
+// streaming attend was 47% of the chunk — GEMM attention is the same
+// two-GEMM shape the CPU AMX path uses). Same 64×32 tile / 8x8-block
+// shared layout; K-tails guarded (n is arbitrary).
+// C[m,n] = X[m,k] · W[n,k]ᵀ · scale   (scores: X=Q panel, W=K rows)
+kernel void mul_mm_f32nt(
+    device const float*  xw    [[buffer(0)]],   // W [rows × cols]
+    device const float*  xs    [[buffer(1)]],   // X [nb × cols]
+    device float*        y     [[buffer(2)]],   // C [nb × rows]
+    constant uint&       cols  [[buffer(3)]],
+    constant uint&       rows  [[buffer(4)]],
+    constant uint&       nb    [[buffer(5)]],
+    constant float&      scale [[buffer(6)]],
+    uint tiitg [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint2 tg  [[threadgroup_position_in_grid]])
+{
+    threadgroup char shmem[8192];
+    threadgroup half* sa = (threadgroup half*)shmem;
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+    const uint NK = 32u;
+    uint r0 = tg.y * 64u;
+    uint r1 = tg.x * 32u;
+    uint nr0 = min(rows - r0, 64u);
+    uint nr1 = min(nb - r1, 32u);
+    uint lr0 = min(tiitg / 2u, nr0 - 1u);
+    uint il0 = tiitg % 2u;
+    uint lr1 = min(tiitg / 4u, nr1 - 1u);
+    uint iy  = 8u * (tiitg % 4u);
+    device const float* wrow = xw + (ulong)(r0 + lr0) * cols + 16u * il0;
+    device const float* yrow = xs + (ulong)(r1 + lr1) * cols + iy;
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8u; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    for (uint k0 = 0; k0 < cols; k0 += NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint sy = (tiitg / 2u) / 8u;
+            uint lx = (tiitg / 2u) % 8u;
+            uint kb = k0 + 16u * il0;
+            float wv[16];
+            for (uint i = 0; i < 16u; ++i) {
+                wv[i] = kb + i < cols ? wrow[i] : 0.0f;
+            }
+            uint ib0 = 8u * (2u * il0) + sy;
+            uint ib1 = 8u * (2u * il0 + 1u) + sy;
+            for (uint i = 0; i < 8u; ++i) {
+                sa[64u * ib0 + 8u * i + lx] = (half)wv[i];
+                sa[64u * ib1 + 8u * i + lx] = (half)wv[i + 8u];
+            }
+        }
+        {
+            uint sx = tiitg % 4u;
+            uint sy = (tiitg / 4u) / 8u;
+            uint ly = (tiitg / 4u) % 8u;
+            uint ib = 4u * sx + sy;
+            threadgroup half* dst = sb + 64u * ib + 8u * ly;
+            for (uint i = 0; i < 8u; ++i) {
+                dst[i] = k0 + iy + i < cols ? (half)yrow[i] : (half)0.0f;
+            }
+        }
+        wrow += NK;
+        yrow += NK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < 4; ++ik) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; ++i) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* temp_str = ((threadgroup float*)shmem)
+        + 32u * (sgitg & 1u) + (16u * (sgitg >> 1u)) * 64u;
+    for (short i = 0; i < 8; ++i) {
+        simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * 64 * (i / 4),
+                        64, ulong2(0, 0), false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tiitg; i < 32u * 64u; i += 128u) {
+        uint m = i / 64u, n = i % 64u;
+        if (r1 + m < nb && r0 + n < rows) {
+            y[(ulong)(r1 + m) * rows + r0 + n] =
+                ((threadgroup float*)shmem)[m * 64u + n] * scale;
+        }
+    }
+}
+
+// C[m,d] = P[m,n] · V[n,d]   (attention P·V: W is NOT transposed)
+kernel void mul_mm_f32nn(
+    device const float*  vw    [[buffer(0)]],   // V [kdim × rows] row-major
+    device const float*  xs    [[buffer(1)]],   // P [nb × kdim]
+    device float*        y     [[buffer(2)]],   // C [nb × rows]
+    constant uint&       kdim  [[buffer(3)]],
+    constant uint&       rows  [[buffer(4)]],
+    constant uint&       nb    [[buffer(5)]],
+    uint tiitg [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint2 tg  [[threadgroup_position_in_grid]])
+{
+    threadgroup char shmem[8192];
+    threadgroup half* sa = (threadgroup half*)shmem;      // V tile [16k × 64d] packed
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096); // P tile [32m × 16k]
+    const uint NK = 16u;
+    uint r0 = tg.y * 64u;   // d tile
+    uint r1 = tg.x * 32u;   // m tile
+    uint nr1 = min(nb - r1, 32u);
+    uint lr1 = min(tiitg / 4u, nr1 - 1u);
+    // V tile loader coords: 128 threads cover 16×64 halfs, 8 per thread.
+    // Thread t loads row kv = t/8, col span 8*(t%8).
+    uint vk = tiitg / 8u;       // 0..15 k-row in tile
+    uint vd = 8u * (tiitg % 8u); // 0..56 d-col start
+    uint iyp = 4u * (tiitg % 4u); // P: 4 floats per thread per row
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8u; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    for (uint k0 = 0; k0 < kdim; k0 += NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // V tile: [k][d] 8x8-block packed: block ib = 8*(d_blk) + k_blk?
+        // Keep the SAME packing convention as sa in the nt kernel:
+        // ma fragment i covers d-range [8i, 8i+8) of the sg's 32-wide
+        // strip; blocks indexed ib = 8*dblk + kblk over [64d × 16k]…
+        // simpler: store [d][k] transposed so the fragment layout matches
+        // the nt kernel exactly (ma loads want [k][d(row-major 8x8)] via
+        // transpose=false on [d][k]? — no: multiply(mb[m,k], ma[k,d])
+        // needs ma fragment [k][d]. Store blocks as [k][d]:
+        // ib = 8*sxd + syk with row=k%8, col=d%8.
+        {
+            uint dblk = vd / 8u;        // 0..7
+            uint kblk = vk / 8u;        // 0..1
+            // Block index MUST be k-major (ib = 8·kblk + dblk): the
+            // compute loop advances k with lsma += 8·64 and picks the
+            // d-half with 4·64·(sgitg%2) — same convention as sa in nt.
+            uint ib = 8u * kblk + dblk;
+            uint krow = vk % 8u;
+            threadgroup half* dst = sa + 64u * ib + 8u * krow;
+            device const float* vr = vw + (ulong)(k0 + vk) * rows + r0 + vd;
+            bool kok = k0 + vk < kdim;
+            for (uint i = 0; i < 8u; ++i) {
+                bool ok = kok && r0 + vd + i < rows;
+                dst[i] = ok ? (half)vr[i] : (half)0.0f;
+            }
+        }
+        // P tile [32m × 16k]: blocks ib = 4*kblk… same as sb in nt:
+        // thread t: row m = t/4, 4 floats at 4*(t%4).
+        {
+            uint kb4 = iyp;
+            uint sx = kb4 / 8u;         // which 8-k block half? kb4 in {0,4,8,12}
+            uint off = kb4 % 8u;
+            uint sy = (tiitg / 4u) / 8u;
+            uint ly = (tiitg / 4u) % 8u;
+            uint ib = 4u * sx + sy;
+            device const float* pr = xs + (ulong)(r1 + lr1) * kdim + k0 + kb4;
+            threadgroup half* dst = sb + 64u * ib + 8u * ly + off;
+            for (uint i = 0; i < 4u; ++i) {
+                dst[i] = k0 + kb4 + i < kdim ? (half)pr[i] : (half)0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < 2; ++ik) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; ++i) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* temp_str = ((threadgroup float*)shmem)
+        + 32u * (sgitg & 1u) + (16u * (sgitg >> 1u)) * 64u;
+    for (short i = 0; i < 8; ++i) {
+        simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * 64 * (i / 4),
+                        64, ulong2(0, 0), false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tiitg; i < 32u * 64u; i += 128u) {
+        uint m = i / 64u, n = i % 64u;
+        if (r1 + m < nb && r0 + n < rows) {
+            y[(ulong)(r1 + m) * rows + r0 + n] =
+                ((threadgroup float*)shmem)[m * 64u + n];
+        }
+    }
+}
+
+// Causal softmax over score rows [m = hl·nb + bi], allowed = s0+bi+1;
+// one simdgroup per row (lane-strided max / exp-sum / scale).
+kernel void causal_softmax(
+    device float*  p    [[buffer(0)]],
+    constant uint& n    [[buffer(1)]],  // row length (stride)
+    constant uint& s0   [[buffer(2)]],
+    constant uint& nb   [[buffer(3)]],
+    constant uint& m    [[buffer(4)]],  // rows
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgp [[threadgroup_position_in_grid]],
+    uint sgs [[simdgroups_per_threadgroup]])
+{
+    uint row = tgp * sgs + sg;
+    if (row >= m) return;
+    uint allowed = s0 + (row % nb) + 1u;
+    device float* r = p + (ulong)row * n;
+    float mx = -INFINITY;
+    for (uint i = lane; i < allowed; i += 32u) mx = max(mx, r[i]);
+    mx = simd_max(mx);
+    float sum = 0.0f;
+    for (uint i = lane; i < allowed; i += 32u) {
+        float e = exp(r[i] - mx);
+        r[i] = e;
+        sum += e;
+    }
+    sum = simd_sum(sum);
+    float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+    for (uint i = lane; i < allowed; i += 32u) r[i] *= inv;
+    for (uint i = allowed + lane; i < n; i += 32u) r[i] = 0.0f;
+}
+
+// Born importance: imp[pos] += Σ over rows of P[row, pos] (masked
+// column sums — the zeroed tail contributes nothing).
+kernel void imp_colsum(
+    device const float* p   [[buffer(0)]],
+    device atomic_float* imp [[buffer(1)]],
+    constant uint& n   [[buffer(2)]],
+    constant uint& m   [[buffer(3)]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgp [[threadgroup_position_in_grid]],
+    uint sgs [[simdgroups_per_threadgroup]])
+{
+    uint pos = tgp * sgs + sg;
+    if (pos >= n) return;
+    float acc = 0.0f;
+    for (uint r = lane; r < m; r += 32u) {
+        acc += p[(ulong)r * n + pos];
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        atomic_fetch_add_explicit(&imp[pos], acc, memory_order_relaxed);
+    }
+}
+
+// Panel unstack: attn panel [head][bi][hd] → [bi][head·hd] for the O GEMM.
+kernel void panel_unstack(
+    device const float* src [[buffer(0)]],
+    device float*       dst [[buffer(1)]],
+    constant uint& nh [[buffer(2)]],
+    constant uint& nb [[buffer(3)]],
+    constant uint& hd [[buffer(4)]],
+    uint i [[thread_position_in_grid]])
+{
+    uint total = nh * nb * hd;
+    if (i >= total) return;
+    uint h = i / (nb * hd);
+    uint bi = (i / hd) % nb;
+    uint d = i % hd;
+    dst[((ulong)bi * nh + h) * hd + d] = src[i];
+}
+
 // q1: 6-byte tiles [f16 scale][4B sign bits] per 32-group; w = s*(2b-1).
 // One SIMD group per FOUR rows, tiles of a pair processed one at a
 // time: each activation float4 a lane loads is used against four rows'
@@ -823,8 +1117,10 @@ kernel void chunk_rope_kv(
             }
         }
     }
+    // Q lands head-major ([head][bi][hd]) — the group panel the scores
+    // GEMM consumes without a gather.
     device float* dst = isq
-        ? qout + ((ulong)bi * nh + head) * hd
+        ? qout + ((ulong)head * nb + bi) * hd
         : (isv ? vbuf : kbuf) + ((ulong)kvh * cap + st0 + bi) * hd;
     for (uint t = 0; t < nt; ++t) {
         uint d = t * 32u + lane;
@@ -988,6 +1284,11 @@ struct Ctx {
     cattend: ComputePipelineState,
     rmsrows: ComputePipelineState,
     cropekv: ComputePipelineState,
+    mmf32nt: ComputePipelineState,
+    mmf32nn: ComputePipelineState,
+    csmax: ComputePipelineState,
+    impcol: ComputePipelineState,
+    unstack: ComputePipelineState,
     sgate: ComputePipelineState,
     /// Device K/V cache mirrors keyed by (pipeline id, layer).
     kv_mirrors: Mutex<HashMap<(u64, usize), KvMirror>>,
@@ -1077,6 +1378,11 @@ fn init() -> Result<Ctx, String> {
     let cattend = pso("chunk_attend")?;
     let rmsrows = pso("rmsnorm_rows")?;
     let cropekv = pso("chunk_rope_kv")?;
+    let mmf32nt = pso("mul_mm_f32nt")?;
+    let mmf32nn = pso("mul_mm_f32nn")?;
+    let csmax = pso("causal_softmax")?;
+    let impcol = pso("imp_colsum")?;
+    let unstack = pso("panel_unstack")?;
     let sgate = pso("sig_gate")?;
     let queue = device.new_command_queue();
     let flag_buf = device.new_buffer(64, MTLResourceOptions::StorageModeShared);
@@ -1105,6 +1411,11 @@ fn init() -> Result<Ctx, String> {
         cattend,
         rmsrows,
         cropekv,
+        mmf32nt,
+        mmf32nn,
+        csmax,
+        impcol,
+        unstack,
         sgate,
         kv_mirrors: Mutex::new(HashMap::new()),
         file_bufs: Mutex::new(HashMap::new()),
@@ -1564,6 +1875,73 @@ struct ChunkPrep {
     st0: usize,
 }
 
+/// GPU time of a completed command buffer (GPUEndTime − GPUStartTime),
+/// in milliseconds — metal-rs does not surface the getters, raw objc
+/// does. Gaps BETWEEN buffers are not attributed to either side, which
+/// is exactly what per-stage attribution wants.
+fn cmd_gpu_ms(cmd: &metal::CommandBufferRef) -> f64 {
+    use metal::foreign_types::ForeignTypeRef;
+    use metal::objc::{msg_send, sel, sel_impl};
+    unsafe {
+        let p = cmd.as_ptr();
+        let s: f64 = msg_send![p, GPUStartTime];
+        let e: f64 = msg_send![p, GPUEndTime];
+        (e - s) * 1000.0
+    }
+}
+
+/// Stage-attribution mode for the chunk graph (CMF_CHUNK_PROF=1): each
+/// stage is committed as its OWN command buffer so its GPU time can be
+/// read back per stage. The queue keeps ordering; wall time inflates
+/// (submit per stage), the per-stage GPU times stay honest.
+struct ChunkProf {
+    on: bool,
+    log: Vec<(&'static str, metal::CommandBuffer)>,
+}
+
+impl ChunkProf {
+    fn new() -> Self {
+        Self {
+            on: std::env::var("CMF_CHUNK_PROF").map(|v| v == "1").unwrap_or(false),
+            log: Vec::new(),
+        }
+    }
+    /// Close the current buffer under `label` and open a fresh one.
+    fn cut(
+        &mut self,
+        c: &Ctx,
+        cmd: metal::CommandBuffer,
+        label: &'static str,
+    ) -> metal::CommandBuffer {
+        if !self.on {
+            return cmd;
+        }
+        cmd.commit();
+        self.log.push((label, cmd));
+        c.queue.new_command_buffer().to_owned()
+    }
+    fn report(&self) {
+        if !self.on || self.log.is_empty() {
+            return;
+        }
+        let mut agg: std::collections::HashMap<&'static str, (f64, usize)> =
+            std::collections::HashMap::new();
+        for (label, cmd) in &self.log {
+            let e = agg.entry(label).or_insert((0.0, 0));
+            e.0 += cmd_gpu_ms(cmd);
+            e.1 += 1;
+        }
+        let mut rows: Vec<_> = agg.into_iter().collect();
+        rows.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+        let total: f64 = rows.iter().map(|r| r.1.0).sum();
+        eprintln!("chunk prof (GPU ms per stage, one chunk):");
+        for (label, (ms, n)) in rows {
+            eprintln!("  {label:<12} {ms:8.2} ms  ({n:3}×)  {:4.1}%", ms / total * 100.0);
+        }
+        eprintln!("  total GPU    {total:8.2} ms");
+    }
+}
+
 pub fn chunk_run_gpu(
     layers: &[ChunkLayer],
     io: &mut [ChunkIo],
@@ -1713,6 +2091,7 @@ pub fn chunk_run_gpu(
     let vraw = io_buf(c, 64_000_000_063 + b * nkv * hd, b * nkv * hd * 4);
     let qrope = io_buf(c, 65_000_000_087 + b * nh * hd, b * nh * hd * 4);
     let attn = io_buf(c, 66_000_000_103 + b * nh * hd, b * nh * hd * 4);
+    let apanel = io_buf(c, 73_000_000_117 + b * nh * hd, b * nh * hd * 4);
     let ob = io_buf(c, 67_000_000_141 + b * hs, b * hs * 4);
     let gb = io_buf(c, 68_000_000_169 + b * inter, b * inter * 4);
     let ub = io_buf(c, 69_000_000_213 + b * inter, b * inter * 4);
@@ -1722,7 +2101,8 @@ pub fn chunk_run_gpu(
         std::ptr::copy_nonoverlapping(h.as_ptr(), h_b.contents() as *mut f32, b * hs);
     }
 
-    let cmd = c.queue.new_command_buffer();
+    let mut prof = ChunkProf::new();
+    let mut cmd = c.queue.new_command_buffer().to_owned();
     for (l, prep) in layers.iter().zip(&preps) {
         let inorm = const_buf(c, l.input_norm);
         let pnorm = const_buf(c, l.post_norm);
@@ -1733,7 +2113,7 @@ pub fn chunk_run_gpu(
         };
         let qn_b = l.q_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| invf.clone());
         let kn_b = l.k_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| invf.clone());
-        let rows_norm = |src: &Buffer, w: &Buffer, dst: &Buffer| {
+        let rows_norm = |cmd: &metal::CommandBufferRef, src: &Buffer, w: &Buffer, dst: &Buffer| {
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&c.rmsrows);
             enc.set_buffer(0, Some(src), 0);
@@ -1747,7 +2127,7 @@ pub fn chunk_run_gpu(
             enc.dispatch_thread_groups(MTLSize::new(b as u64, 1, 1), MTLSize::new(256, 1, 1));
             enc.end_encoding();
         };
-        let axpy1 = |src: &Buffer, dst: &Buffer, n: usize| {
+        let axpy1 = |cmd: &metal::CommandBufferRef, src: &Buffer, dst: &Buffer, n: usize| {
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&c.axpy);
             enc.set_buffer(0, Some(src), 0);
@@ -1760,10 +2140,12 @@ pub fn chunk_run_gpu(
             enc.end_encoding();
         };
 
-        rows_norm(&h_b, &inorm, &n_b);
-        encode_mul_mm(c, cmd, &fbuf, prep.abs[0], &prep.rs[0], &n_b, &qraw, b, l.wq.1, l.wq.2);
-        encode_mul_mm(c, cmd, &fbuf, prep.abs[1], &prep.rs[1], &n_b, &kraw, b, l.wk.1, l.wk.2);
-        encode_mul_mm(c, cmd, &fbuf, prep.abs[2], &prep.rs[2], &n_b, &vraw, b, l.wv.1, l.wv.2);
+        rows_norm(&cmd, &h_b, &inorm, &n_b);
+        cmd = prof.cut(c, cmd, "norm");
+        encode_mul_mm(c, &cmd, &fbuf, prep.abs[0], &prep.rs[0], &n_b, &qraw, b, l.wq.1, l.wq.2);
+        encode_mul_mm(c, &cmd, &fbuf, prep.abs[1], &prep.rs[1], &n_b, &kraw, b, l.wk.1, l.wk.2);
+        encode_mul_mm(c, &cmd, &fbuf, prep.abs[2], &prep.rs[2], &n_b, &vraw, b, l.wv.1, l.wv.2);
+        cmd = prof.cut(c, cmd, "mm_qkv");
         {
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&c.cropekv);
@@ -1803,36 +2185,110 @@ pub fn chunk_run_gpu(
             );
             enc.end_encoding();
         }
+        cmd = prof.cut(c, cmd, "rope_kv");
+        // GEMM attention (profiled: the streaming attend was 47% of the
+        // chunk): per KV group — scores = Qpanel·Kᵀ·scale, causal
+        // softmax rows, Born column sums, attn = P·V. Same two-GEMM
+        // shape the CPU AMX path uses.
         {
+            let hpk = nh / nkv.max(1);
+            let ncur = prep.st0 + b;
+            let m_rows = hpk * b;
+            let scores = io_buf(c, 72_000_000_089 + m_rows * ncur, m_rows * ncur * 4);
+            let scale = 1.0f32 / (hd as f32).sqrt();
+            for g in 0..nkv {
+                let koff = (g * prep.cap * hd * 4) as u64;
+                let qoff = (g * hpk * b * hd * 4) as u64;
+                {
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&c.mmf32nt);
+                    enc.set_buffer(0, Some(&prep.k_mb), koff);
+                    enc.set_buffer(1, Some(&qrope), qoff);
+                    enc.set_buffer(2, Some(&scores), 0);
+                    let (cols_u, rows_u, nb_u) = (hd as u32, ncur as u32, m_rows as u32);
+                    enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(5, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(6, 4, &scale as *const f32 as *const std::ffi::c_void);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new((m_rows as u64).div_ceil(32), (ncur as u64).div_ceil(64), 1),
+                        MTLSize::new(128, 1, 1),
+                    );
+                    enc.end_encoding();
+                }
+                {
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&c.csmax);
+                    enc.set_buffer(0, Some(&scores), 0);
+                    let words =
+                        [ncur as u32, prep.st0 as u32, b as u32, m_rows as u32];
+                    for (i, w) in words.iter().enumerate() {
+                        enc.set_bytes(1 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+                    }
+                    let sgs = 8u64;
+                    enc.dispatch_thread_groups(
+                        MTLSize::new((m_rows as u64).div_ceil(sgs), 1, 1),
+                        MTLSize::new(sgs * 32, 1, 1),
+                    );
+                    enc.end_encoding();
+                }
+                {
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&c.impcol);
+                    enc.set_buffer(0, Some(&scores), 0);
+                    enc.set_buffer(1, Some(&prep.imp_mb), 0);
+                    let words = [ncur as u32, m_rows as u32];
+                    for (i, w) in words.iter().enumerate() {
+                        enc.set_bytes(2 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+                    }
+                    let sgs = 8u64;
+                    enc.dispatch_thread_groups(
+                        MTLSize::new((ncur as u64).div_ceil(sgs), 1, 1),
+                        MTLSize::new(sgs * 32, 1, 1),
+                    );
+                    enc.end_encoding();
+                }
+                {
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&c.mmf32nn);
+                    enc.set_buffer(0, Some(&prep.v_mb), koff);
+                    enc.set_buffer(1, Some(&scores), 0);
+                    enc.set_buffer(2, Some(&apanel), qoff);
+                    let (k_u, rows_u, nb_u) = (ncur as u32, hd as u32, m_rows as u32);
+                    enc.set_bytes(3, 4, &k_u as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(5, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new((m_rows as u64).div_ceil(32), (hd as u64).div_ceil(64), 1),
+                        MTLSize::new(128, 1, 1),
+                    );
+                    enc.end_encoding();
+                }
+            }
+            // panel [head][bi][hd] → [bi][nh·hd] for the O GEMM.
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&c.cattend);
-            for (i, buf) in [&qrope, &prep.k_mb, &prep.v_mb, &attn, &prep.imp_mb].iter().enumerate()
-            {
-                enc.set_buffer(i as u64, Some(buf), 0);
-            }
-            let words = [
-                nh as u32,
-                (nh / nkv.max(1)) as u32,
-                hd as u32,
-                prep.cap as u32,
-                prep.st0 as u32,
-                b as u32,
-            ];
+            enc.set_compute_pipeline_state(&c.unstack);
+            enc.set_buffer(0, Some(&apanel), 0);
+            enc.set_buffer(1, Some(&attn), 0);
+            let words = [nh as u32, b as u32, hd as u32];
             for (i, w) in words.iter().enumerate() {
-                enc.set_bytes(5 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(2 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
             }
-            let sgs = 8u64;
-            enc.dispatch_thread_groups(
-                MTLSize::new((nh as u64).div_ceil(sgs), b as u64, 1),
-                MTLSize::new(sgs * 32, 1, 1),
+            enc.dispatch_threads(
+                MTLSize::new((nh * b * hd) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
             );
             enc.end_encoding();
         }
-        encode_mul_mm(c, cmd, &fbuf, prep.abs[3], &prep.rs[3], &attn, &ob, b, l.wo.1, l.wo.2);
-        axpy1(&ob, &h_b, b * hs);
-        rows_norm(&h_b, &pnorm, &n_b);
-        encode_mul_mm(c, cmd, &fbuf, prep.abs[4], &prep.rs[4], &n_b, &gb, b, l.gate.1, l.gate.2);
-        encode_mul_mm(c, cmd, &fbuf, prep.abs[5], &prep.rs[5], &n_b, &ub, b, l.up.1, l.up.2);
+        cmd = prof.cut(c, cmd, "attend");
+        encode_mul_mm(c, &cmd, &fbuf, prep.abs[3], &prep.rs[3], &attn, &ob, b, l.wo.1, l.wo.2);
+        cmd = prof.cut(c, cmd, "mm_o");
+        axpy1(&cmd, &ob, &h_b, b * hs);
+        rows_norm(&cmd, &h_b, &pnorm, &n_b);
+        cmd = prof.cut(c, cmd, "axpy+norm");
+        encode_mul_mm(c, &cmd, &fbuf, prep.abs[4], &prep.rs[4], &n_b, &gb, b, l.gate.1, l.gate.2);
+        encode_mul_mm(c, &cmd, &fbuf, prep.abs[5], &prep.rs[5], &n_b, &ub, b, l.up.1, l.up.2);
+        cmd = prof.cut(c, cmd, "mm_gateup");
         {
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&c.silu);
@@ -1846,11 +2302,20 @@ pub fn chunk_run_gpu(
             enc.dispatch_threads(MTLSize::new((b * inter) as u64, 1, 1), MTLSize::new(256, 1, 1));
             enc.end_encoding();
         }
-        encode_mul_mm(c, cmd, &fbuf, prep.abs[6], &prep.rs[6], &act, &db, b, l.down.1, l.down.2);
-        axpy1(&db, &h_b, b * hs);
+        cmd = prof.cut(c, cmd, "silu");
+        encode_mul_mm(c, &cmd, &fbuf, prep.abs[6], &prep.rs[6], &act, &db, b, l.down.1, l.down.2);
+        cmd = prof.cut(c, cmd, "mm_down");
+        axpy1(&cmd, &db, &h_b, b * hs);
+        cmd = prof.cut(c, cmd, "axpy");
     }
 
-    submit_and_wait(c, cmd, &[&h_b]);
+    if prof.on {
+        cmd.commit();
+        cmd.wait_until_completed();
+        prof.report();
+    } else {
+        submit_and_wait(c, &cmd, &[&h_b]);
+    }
 
     // ── readback: hidden once, K/V rows + importance per layer.
     unsafe {

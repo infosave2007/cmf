@@ -2079,13 +2079,11 @@ impl Pipeline {
     /// first layer index NOT processed (== `li0` when the run is empty).
     #[cfg(target_os = "macos")]
     fn chunk_run_gpu(&mut self, li0: usize, h: &mut [f32], b: usize, pos0: usize) -> usize {
-        // Depth bound: the chunk attend streams K/V per query, so past
-        // ~1k of context the CPU's GEMM-attend wins — deep chunks stay
-        // on the CPU (measured: +66% at 512, +38% at 1024, parity at
-        // 2048 unbounded). CMF_GPU_CHUNK=0 disables the graph.
+        // (The old streaming attend needed a depth bound at ~1k; the
+        // GEMM attention scales like the CPU path and lifted it.)
+        // CMF_GPU_CHUNK=0 disables the graph.
         if !crate::gpu::enabled_here()
             || std::env::var("CMF_GPU_CHUNK").map(|v| v == "0").unwrap_or(false)
-            || pos0 > 1024
             || b < 32
             || self.swa.is_some()
             || self.global_attn.is_some()
