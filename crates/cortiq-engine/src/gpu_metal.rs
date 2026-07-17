@@ -24,6 +24,15 @@ const MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
+// Shape-specialized pipeline variants (the llama.cpp trick): cols/rows
+// arrive as FUNCTION CONSTANTS so the K-loop trip count and address
+// strides are compile-time — fully unrolled, strength-reduced. Built
+// per weight shape by the chunk graph (cached); the generic pipelines
+// bind the buffer params instead (guarded by
+// is_function_constant_defined).
+constant uint FC_COLS [[function_constant(0)]];
+constant uint FC_ROWS [[function_constant(1)]];
+
 // y[o] = rs[o] * Σ_i q[o,i]·xs[i]; xs already prescaled by the col field (like CPU).
 // SIMD group (32 lanes) per row: adjacent lanes read adjacent
 // char4 → coalesced 128-byte reads; simd_sum reduction.
@@ -97,13 +106,15 @@ kernel void q8_mul_mm(
     device const float*  xs    [[buffer(1)]],
     device const float*  rs    [[buffer(2)]],
     device float*        y     [[buffer(3)]],
-    constant uint&       cols  [[buffer(4)]],
-    constant uint&       rows  [[buffer(5)]],
+    constant uint&       cols_b [[buffer(4)]],
+    constant uint&       rows_b [[buffer(5)]],
     constant uint&       nb    [[buffer(6)]],
     uint tiitg [[thread_index_in_threadgroup]],
     uint sgitg [[simdgroup_index_in_threadgroup]],
     uint2 tg  [[threadgroup_position_in_grid]])
 {
+    uint cols = is_function_constant_defined(FC_COLS) ? FC_COLS : cols_b;
+    uint rows = is_function_constant_defined(FC_ROWS) ? FC_ROWS : rows_b;
     // ggml's exact shmem shape: one 8 KB char arena, W/X tiles as
     // casted half views during the K loop, the same bytes re-cast to
     // float for EDGE-tile C staging only — interior tiles store straight
@@ -248,13 +259,15 @@ kernel void q8_mul_mm_silu(
     device const float*  us    [[buffer(2)]],
     device const float*  rs    [[buffer(3)]],
     device float*        y     [[buffer(4)]],
-    constant uint&       cols  [[buffer(5)]],
-    constant uint&       rows  [[buffer(6)]],
+    constant uint&       cols_b [[buffer(5)]],
+    constant uint&       rows_b [[buffer(6)]],
     constant uint&       nb    [[buffer(7)]],
     uint tiitg [[thread_index_in_threadgroup]],
     uint sgitg [[simdgroup_index_in_threadgroup]],
     uint2 tg  [[threadgroup_position_in_grid]])
 {
+    uint cols = is_function_constant_defined(FC_COLS) ? FC_COLS : cols_b;
+    uint rows = is_function_constant_defined(FC_ROWS) ? FC_ROWS : rows_b;
     threadgroup char shmem[8192];
     threadgroup half* sa = (threadgroup half*)shmem;
     threadgroup half* sb = (threadgroup half*)(shmem + 4096);
@@ -615,27 +628,31 @@ kernel void causal_softmax(
 }
 
 // Born importance: imp[pos] += Σ over rows of P[row, pos] (masked
-// column sums — the zeroed tail contributes nothing).
+// column sums — the zeroed tail contributes nothing). One THREAD per
+// position, rows walked inside: adjacent threads read adjacent
+// positions, so every row pass is coalesced (the lane-per-column form
+// read 4 of every 128 bytes and cost as much as the P·V GEMM). The
+// KV groups' encoders serialize on this buffer — plain read-add is
+// safe, no atomics.
 kernel void imp_colsum(
     device const float* p   [[buffer(0)]],
     device atomic_float* imp [[buffer(1)]],
     constant uint& n   [[buffer(2)]],
     constant uint& m   [[buffer(3)]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint tgp [[threadgroup_position_in_grid]],
-    uint sgs [[simdgroups_per_threadgroup]])
+    uint2 gid [[thread_position_in_grid]])
 {
-    uint pos = tgp * sgs + sg;
+    // x: position (adjacent threads → coalesced row reads); y: a chunk
+    // of 32 row-slices so the grid stays wide enough to hide latency.
+    uint pos = gid.x;
     if (pos >= n) return;
+    uint step = (m + 31u) / 32u;
+    uint r0 = gid.y * step;
+    uint r1 = min(m, r0 + step);
     float acc = 0.0f;
-    for (uint r = lane; r < m; r += 32u) {
+    for (uint r = r0; r < r1; ++r) {
         acc += p[(ulong)r * n + pos];
     }
-    acc = simd_sum(acc);
-    if (lane == 0) {
-        atomic_fetch_add_explicit(&imp[pos], acc, memory_order_relaxed);
-    }
+    atomic_fetch_add_explicit(&imp[pos], acc, memory_order_relaxed);
 }
 
 // Panel unstack: attn panel [head][bi][hd] → [bi][head·hd] for the O GEMM.
@@ -1414,6 +1431,11 @@ struct Ctx {
     impcol: ComputePipelineState,
     unstack: ComputePipelineState,
     sgate: ComputePipelineState,
+    /// Compiled MSL library — shape-specialized pipelines are built
+    /// from it lazily.
+    lib: metal::Library,
+    /// Shape-specialized mul_mm pipelines: (rows, cols, silu-fused).
+    mm_fc: Mutex<HashMap<(u32, u32, bool), ComputePipelineState>>,
     /// Device K/V cache mirrors keyed by (pipeline id, layer).
     kv_mirrors: Mutex<HashMap<(u64, usize), KvMirror>>,
     /// no-copy buffer per file (key — the base address of the mapping).
@@ -1483,7 +1505,19 @@ fn init() -> Result<Ctx, String> {
     };
     let q8 = pso("q8_matvec")?;
     let q8mm = pso("q8_matmat")?;
-    let q8mmm = pso("q8_mul_mm")?;
+    // Functions referencing function constants must be fetched through
+    // the constantValues API even for the generic (all-optional-unset)
+    // variant.
+    let pso_fc = |name: &str| -> Result<ComputePipelineState, String> {
+        let fcv = metal::FunctionConstantValues::new();
+        let f = lib
+            .get_function(name, Some(fcv))
+            .map_err(|e| format!("kernel {name}: {e}"))?;
+        device
+            .new_compute_pipeline_state_with_function(&f)
+            .map_err(|e| format!("pipeline {name}: {e}"))
+    };
+    let q8mmm = pso_fc("q8_mul_mm")?;
     let q1 = pso("q1_matvec")?;
     let flag = pso("write_flag")?;
     let rmsn = pso("rmsnorm_k")?;
@@ -1503,7 +1537,7 @@ fn init() -> Result<Ctx, String> {
     let rmsrows = pso("rmsnorm_rows")?;
     let cropekv = pso("chunk_rope_kv")?;
     let mmf32nt = pso("mul_mm_f32nt")?;
-    let q8mmsilu = pso("q8_mul_mm_silu")?;
+    let q8mmsilu = pso_fc("q8_mul_mm_silu")?;
     let mmf32nn = pso("mul_mm_f32nn")?;
     let csmax = pso("causal_softmax")?;
     let impcol = pso("imp_colsum")?;
@@ -1543,6 +1577,8 @@ fn init() -> Result<Ctx, String> {
         impcol,
         unstack,
         sgate,
+        lib,
+        mm_fc: Mutex::new(HashMap::new()),
         kv_mirrors: Mutex::new(HashMap::new()),
         file_bufs: Mutex::new(HashMap::new()),
         rs_bufs: Mutex::new(HashMap::new()),
@@ -1908,6 +1944,37 @@ fn f32_to_f16_into(src: &[f32], dst: *mut u16) {
     }
 }
 
+/// Shape-specialized mul_mm pipeline (cols/rows as function constants —
+/// fully unrolled K loop, strength-reduced addressing). Falls back to
+/// the generic pipeline if specialization fails.
+fn mm_pipeline(c: &Ctx, rows: usize, cols: usize, silu: bool) -> ComputePipelineState {
+    let mut cache = c.mm_fc.lock().unwrap();
+    cache
+        .entry((rows as u32, cols as u32, silu))
+        .or_insert_with(|| {
+            let fcv = metal::FunctionConstantValues::new();
+            let cols_u = cols as u32;
+            let rows_u = rows as u32;
+            fcv.set_constant_value_at_index(
+                &cols_u as *const u32 as *const std::ffi::c_void,
+                metal::MTLDataType::UInt,
+                0,
+            );
+            fcv.set_constant_value_at_index(
+                &rows_u as *const u32 as *const std::ffi::c_void,
+                metal::MTLDataType::UInt,
+                1,
+            );
+            let name = if silu { "q8_mul_mm_silu" } else { "q8_mul_mm" };
+            c.lib
+                .get_function(name, Some(fcv))
+                .ok()
+                .and_then(|f| c._device.new_compute_pipeline_state_with_function(&f).ok())
+                .unwrap_or_else(|| if silu { c.q8mmsilu.clone() } else { c.q8mmm.clone() })
+        })
+        .clone()
+}
+
 /// Encode one tiled q8 GEMM into an open command buffer (device-resident
 /// X and Y). Caller guarantees b ≥ 32 and cols % 4 == 0.
 #[allow(clippy::too_many_arguments)]
@@ -1924,7 +1991,8 @@ fn encode_mul_mm(
     cols: usize,
 ) {
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&c.q8mmm);
+    let pso = mm_pipeline(c, rows, cols, false);
+    enc.set_compute_pipeline_state(&pso);
     enc.set_buffer(0, Some(fbuf), abs as u64);
     enc.set_buffer(1, Some(xs), 0);
     enc.set_buffer(2, Some(rs_buf), 0);
@@ -2342,6 +2410,7 @@ pub fn chunk_run_gpu(
                     );
                     enc.end_encoding();
                 }
+                cmd = prof.cut(c, cmd, "att_qk");
                 {
                     let enc = cmd.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(&c.csmax);
@@ -2358,6 +2427,7 @@ pub fn chunk_run_gpu(
                     );
                     enc.end_encoding();
                 }
+                cmd = prof.cut(c, cmd, "att_sm");
                 {
                     let enc = cmd.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(&c.impcol);
@@ -2367,13 +2437,13 @@ pub fn chunk_run_gpu(
                     for (i, w) in words.iter().enumerate() {
                         enc.set_bytes(2 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
                     }
-                    let sgs = 8u64;
-                    enc.dispatch_thread_groups(
-                        MTLSize::new((ncur as u64).div_ceil(sgs), 1, 1),
-                        MTLSize::new(sgs * 32, 1, 1),
+                    enc.dispatch_threads(
+                        MTLSize::new(ncur as u64, 32, 1),
+                        MTLSize::new(64, 4, 1),
                     );
                     enc.end_encoding();
                 }
+                cmd = prof.cut(c, cmd, "att_imp");
                 {
                     let enc = cmd.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(&c.mmf32nn);
@@ -2390,6 +2460,7 @@ pub fn chunk_run_gpu(
                     );
                     enc.end_encoding();
                 }
+                cmd = prof.cut(c, cmd, "att_pv");
             }
             // panel [head][bi][hd] → [bi][nh·hd] for the O GEMM.
             let enc = cmd.new_compute_command_encoder();
@@ -2419,7 +2490,8 @@ pub fn chunk_run_gpu(
         // standalone activation stage, no act-buffer round trip.
         {
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&c.q8mmsilu);
+            let pso = mm_pipeline(c, l.down.1, l.down.2, true);
+            enc.set_compute_pipeline_state(&pso);
             enc.set_buffer(0, Some(&fbuf), prep.abs[6] as u64);
             enc.set_buffer(1, Some(&gb), 0);
             enc.set_buffer(2, Some(&ub), 0);
