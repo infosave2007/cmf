@@ -691,6 +691,13 @@ enum SkillCmd {
         /// usually need 5.5–6 to keep the fine-tune's gains)
         #[arg(long)]
         mean_bits: Option<f32>,
+        /// DTG-MA sparse bake (Patent 2): keep this fraction of FFN
+        /// neurons per layer, chosen by the task's own activation mass
+        /// over --prompts; dead neurons are zeroed in the stored skill
+        /// (vbit sinks them to its bit floor) and a task mask is baked
+        /// and linked — `run --skill` activates it automatically
+        #[arg(long)]
+        sparse: Option<f32>,
         /// Output path (default: rewrite the model in place)
         #[arg(long)]
         output: Option<String>,
@@ -875,6 +882,7 @@ async fn main() -> anyhow::Result<()> {
                 min_delta,
                 skill_quant,
                 mean_bits,
+                sparse,
                 output,
                 hf_token,
             } => skill::run_skill_add(
@@ -892,6 +900,7 @@ async fn main() -> anyhow::Result<()> {
                 min_delta,
                 skill_quant.as_deref(),
                 mean_bits,
+                sparse,
                 output.as_deref(),
                 hf_token.as_deref(),
             ),
@@ -1796,6 +1805,25 @@ async fn cmd_run(
     if trace {
         pipeline.set_trace(true);
     }
+    // Patent-2 link: a skill may carry its DTG-MA task mask
+    // (input_mask_task) — activate it with the skill unless the user
+    // pinned a task explicitly.
+    let mut task = task.to_string();
+    if task == "general" {
+        if let Some(sid) = skill.as_deref() {
+            if let Some(mt) = model
+                .header
+                .skills
+                .iter()
+                .find(|r| r.id == sid)
+                .and_then(|r| r.input_mask_task.clone())
+            {
+                println!("skill '{sid}' carries task mask '{mt}' — sparse execution on");
+                task = mt;
+            }
+        }
+    }
+    let task = task.as_str();
     let runtime = CortiqRuntime::new(model);
 
     if runtime.masks().get(task).is_some() {

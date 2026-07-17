@@ -171,6 +171,58 @@ Skills that replace non-FFN tensors are excluded from *dynamic* routing
 | Runtime cost of a skill | zero when inactive; active skill = same speed as the backbone (identical shapes, identical kernels) |
 | Routing cost | one prefill pass over the prompt up to the φ layer |
 
+## Smaller than the original — and better: the DTG-MA bake
+
+The strongest form of a skill doesn't ride next to the backbone — it
+*replaces* it for one domain. The DTG-MA recipe (Patent 2) trains an
+L1-regularized mask over the FFN neurons on your task corpus, rides the
+*denoising bottom* (pruning noise neurons first IMPROVES the model
+before it starts to hurt), polishes the last layers against the exact
+teacher (FCD), and then `--defrag` bakes a standalone file where pruned
+neurons are physically absent — neither stored nor computed
+(claims 9/10):
+
+```sh
+# Phase A+B: train the mask + FCD polish on your corpus (torch, ~25 min
+# for a 0.8B on an M4; needs: pip install torch numpy tokenizers)
+python3 converter/make_skill_l1fcd.py --model <hf_snapshot_dir>   --id ru --files corpus1.txt corpus2.txt --out skill-ru
+
+# bake the standalone specialist: pruned neurons physically dropped
+cortiq convert --model <hf_snapshot_dir> --defrag skill-ru   --quant q8_2f --output ru-specialist.cmf
+```
+
+Measured end-to-end through this repository's runtime on Qwen3.5-0.8B,
+scored on a held-out Russian technical document the recipe never
+trained on:
+
+| | size | PPL (ru tech, held-out) | decode |
+|---|---:|---:|---:|
+| original checkpoint (bf16) | 1.6 GB | — | — |
+| CMF q8_2f baseline | 733 MB | 13.97 | 86.0 tok/s |
+| **ru-specialist (mask 11% + FCD, defragged)** | **705 MB** | **11.92 (−14.7%)** | **89.7 tok/s** |
+
+Smaller than the original LLM by 2.3×, better on the domain, and faster
+— from one bake. The recipe's own report on its in-domain held-out went
+further still: masked bottom 70.5 → 54.2 PPL at 11% pruning, −38.7%
+after FCD, −19.4% on an independent unseen tech corpus.
+
+Two honest rules the measurements taught:
+
+- **The bake shines where the backbone is weak.** Russian tech text
+  (backbone PPL 70) responded with the full effect; the same recipe on
+  a domain the backbone already handles well (code, PPL 8.7) made
+  things *worse*. Check your backbone's PPL on the domain first.
+- **The denoising bottom is real and narrow.** The mask's held-out PPL
+  during training: 67.9 at 0% pruned → **54.2 at 11% (the bottom)** →
+  77.1 at 18%. The recipe stops at the bottom automatically; don't push
+  past it for size.
+
+`cortiq skill add --sparse <keep>` offers a quick *training-free*
+approximation of the mask (per-layer top-K by task activation mass) —
+useful for probing, but measured honestly: with an 8-prompt calibration
+it collapsed at keep 0.5 (PPL 59 vs 11.9). The trained mask is the real
+method; the flag is a scout.
+
 ## Shrinking a skill on disk
 
 A skill should cost what the fine-tune actually changed — untouched

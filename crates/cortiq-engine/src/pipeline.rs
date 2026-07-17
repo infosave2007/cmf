@@ -1450,6 +1450,58 @@ impl Pipeline {
         (nll / cnt.max(1) as f64).exp()
     }
 
+    /// DTG-MA calibration pass (Patent 2): run `ids` through the model
+    /// (CPU path, per position) and return each layer's per-neuron
+    /// activation mass Σ|silu(gate)·up| — the statistic the task-guided
+    /// FFN mask is derived from.
+    pub fn probe_ffn_mass(&mut self, ids: &[u32]) -> Vec<Vec<f64>> {
+        self.kv_cache.clear();
+        FFN_PROBE.with(|p| {
+            *p.borrow_mut() =
+                Some(vec![vec![0f64; self.intermediate_size]; self.num_layers]);
+        });
+        crate::gpu::cpu_scope(|| {
+            for (pos, &id) in ids.iter().enumerate() {
+                let emb = self.embed_single(id);
+                let _ = self.forward_layers(&emb, pos, None);
+            }
+        });
+        self.kv_cache.clear();
+        FFN_PROBE.with(|p| p.borrow_mut().take()).unwrap_or_default()
+    }
+
+    /// Teacher-forced PPL with a task mask active (sparse execution) —
+    /// the quality gate for a DTG-MA-masked skill. Sequential per
+    /// position: the batched prefill path is dense-only.
+    pub fn ppl_ids_masked(&mut self, ids: &[u32], mask: &TaskMask) -> f64 {
+        self.kv_cache.clear();
+        let mut nll = 0f64;
+        let mut cnt = 0usize;
+        let mut hidden = vec![0f32; self.hidden_size];
+        for (pos, &id) in ids.iter().enumerate() {
+            if pos > 0 {
+                inference::rms_norm_into(
+                    &hidden,
+                    &self.weights.final_norm,
+                    self.rms_eps,
+                    self.norm_style,
+                    &mut self.ws.n1,
+                );
+                let mut logits = self.lm_head_forward(&self.ws.n1);
+                let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f64 = logits.iter().map(|&v| ((v - max) as f64).exp()).sum();
+                let p = ((logits[id as usize] - max) as f64).exp() / sum.max(1e-300);
+                nll -= p.max(1e-300).ln();
+                cnt += 1;
+                attention::recycle_buf(&mut logits);
+            }
+            let emb = self.embed_single(id);
+            hidden = self.forward_layers(&emb, pos, Some(mask));
+        }
+        self.kv_cache.clear();
+        (nll / cnt.max(1) as f64).exp()
+    }
+
     /// Teacher-forced NLL sum + scored-token count over positions
     /// `start..len-1`, attention EXACT. Positions below `start` still
     /// run — they are the context — they are just not scored, so this
@@ -2502,10 +2554,31 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
         for i in 0..inter {
             g[i] = inference::silu(g[i]) * u[i];
         }
+        // DTG-MA bake probe (Patent 2): accumulate this layer's
+        // per-neuron activation mass while a probe pass is active.
+        FFN_PROBE.with(|pr| {
+            if let Some(acc) = pr.borrow_mut().as_mut() {
+                let li = crate::gpu::cur_layer();
+                if li >= 0 {
+                    if let Some(row) = acc.get_mut(li as usize) {
+                        for (a, &v) in row.iter_mut().zip(g.iter()) {
+                            *a += (v as f64).abs();
+                        }
+                    }
+                }
+            }
+        });
         let mut out = attention::take_buf(d.down_proj.rows());
         d.down_proj.matvec(g, &mut out, pool);
         out
     })
+}
+
+thread_local! {
+    /// DTG-MA activation probe: per-layer per-neuron Σ|silu(g)·u|
+    /// accumulator, alive only during `Pipeline::probe_ffn_mass`.
+    static FFN_PROBE: std::cell::RefCell<Option<Vec<Vec<f64>>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Dense FFN as one GPU submission via the MoE block path (single

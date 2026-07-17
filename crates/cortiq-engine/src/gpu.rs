@@ -50,6 +50,11 @@ pub fn set_layer(l: i64) {
     CUR_LAYER.with(|c| c.set(l));
 }
 
+/// The layer `set_layer` last marked on this thread (−1 outside layers).
+pub fn cur_layer() -> i64 {
+    CUR_LAYER.with(|c| c.get())
+}
+
 /// Parse `CMF_GPU_LAYERS` («0-19», «0,2,4», «0-9,30-39») once.
 /// None = no restriction (all layers on GPU). Garbage → also no restriction.
 fn layer_ranges() -> &'static Option<Vec<(i64, i64)>> {

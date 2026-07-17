@@ -14,10 +14,17 @@ use crate::convert::{
 };
 use base64::Engine as _;
 use cortiq_core::quant::f32_to_f16;
+use cortiq_core::mask::{MaskPriority, TaskMask};
 use cortiq_core::{CmfModel, SelectionDescriptor, SkillRecord, TensorDtype, TensorSpec};
 use cortiq_engine::{Pipeline, SamplerConfig};
+use anyhow::Context as _;
 use std::path::Path;
 use std::sync::Arc;
+
+/// Bitfield bytes for `n` attention heads.
+fn nh_bytes(n: usize) -> usize {
+    n.div_ceil(8)
+}
 
 /// Which tensor families a skill replaces.
 #[derive(Clone, Copy, PartialEq)]
@@ -204,6 +211,7 @@ pub fn run_skill_add(
     min_delta: f32,
     skill_quant: Option<&str>,
     mean_bits: Option<f32>,
+    sparse: Option<f32>,
     output: Option<&str>,
     hf_token: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -211,6 +219,16 @@ pub fn run_skill_add(
         id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
         "skill id must be [A-Za-z0-9_-]"
     );
+    if let Some(k) = sparse {
+        anyhow::ensure!(
+            (0.05..=0.95).contains(&k),
+            "--sparse {k}: keep fraction must be within 0.05..=0.95"
+        );
+        anyhow::ensure!(
+            prompts_file.is_some(),
+            "--sparse needs --prompts: the DTG-MA mask is derived from the task's activations"
+        );
+    }
     if let Some(b) = mean_bits {
         crate::convert::set_vbit_mean_bits(b);
     }
@@ -236,6 +254,7 @@ pub fn run_skill_add(
         }
     }
     let mut new_tensors: Vec<TensorSpec> = Vec::new();
+    let mut ffn_vals: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut unchanged = 0usize;
     let mut unchanged_bytes = 0u64;
@@ -259,6 +278,9 @@ pub fn run_skill_add(
                 );
                 let vals = to_f32(&m.dtype, sh.bytes(m))?;
                 found = true;
+                if sparse.is_some() && want.contains(".mlp.") {
+                    ffn_vals.push((want.clone(), entry.shape.clone(), vals.clone()));
+                }
                 // Delta gate: neurons the fine-tune never touched are
                 // not worth bytes. Compare the donor against the
                 // backbone through the reference decoder and drop
@@ -413,16 +435,161 @@ pub fn run_skill_add(
 
     let out_path = output.unwrap_or(model_path).to_string();
     let tmp = format!("{out_path}.tmp");
-    let masks = if model.masks.masks.is_empty() { None } else { Some(&model.masks) };
-    CmfModel::write(&tmp, &header, &tensors, masks, model.vocab.as_deref())?;
+    let mut catalog = model.masks.clone();
+    CmfModel::write(
+        &tmp,
+        &header,
+        &tensors,
+        if catalog.masks.is_empty() { None } else { Some(&catalog) },
+        model.vocab.as_deref(),
+    )?;
+
+    // ── DTG-MA sparse bake (Patent 2): derive the task-guided FFN mask
+    //    from the skill's own prompts run through the OVERLAID model,
+    //    zero the dead neurons in the stored skill tensors and let vbit
+    //    water-filling sink them to its bit floor. With the mask active
+    //    the zeroed neurons are never read — mathematically identical
+    //    to the donor (a dead neuron contributes act·0). ──
+    if let Some(keep) = sparse {
+        let prompts_text = std::fs::read_to_string(prompts_file.unwrap())?;
+        let prompts: Vec<String> = prompts_text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect();
+        let probe_model = Arc::new(CmfModel::open(&tmp)?);
+        let mut p =
+            Pipeline::from_model_with_skill(&probe_model, SamplerConfig::default(), Some(id))
+                .map_err(|e| anyhow::anyhow!(e))?;
+        let mut mass = vec![vec![0f64; model.arch().intermediate_size]; num_layers];
+        for prompt in &prompts {
+            let ids = p.tokenizer.encode(prompt);
+            for (li, row) in p.probe_ffn_mass(&ids).into_iter().enumerate() {
+                for (a, v) in mass[li].iter_mut().zip(row) {
+                    *a += v;
+                }
+            }
+        }
+        drop(p);
+        drop(probe_model);
+        let inter = model.arch().intermediate_size;
+        let keep_n = ((inter as f32 * keep).ceil() as usize).clamp(1, inter);
+        let mut ffn_bits: Vec<Vec<u8>> = Vec::with_capacity(num_layers);
+        let mut keep_sets: Vec<Vec<bool>> = Vec::with_capacity(num_layers);
+        for row in &mass {
+            let mut order: Vec<usize> = (0..inter).collect();
+            order.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
+            let mut alive = vec![false; inter];
+            for &n in order.iter().take(keep_n) {
+                alive[n] = true;
+            }
+            let mut bits = vec![0u8; inter.div_ceil(8)];
+            for (n, &a) in alive.iter().enumerate() {
+                if a {
+                    bits[n / 8] |= 1 << (n % 8);
+                }
+            }
+            keep_sets.push(alive);
+            ffn_bits.push(bits);
+        }
+        // Re-encode the skill's FFN tensors with dead neurons zeroed:
+        // gate/up rows and down columns. vbit gives zero rows its bit
+        // floor, so the dead neurons cost ~3 bits instead of 8.
+        let vq = match skill_quant {
+            Some(sq) => parse_quant(sq)?,
+            None => Quant::Vbit,
+        };
+        if skill_quant.is_none() && mean_bits.is_none() {
+            // Live rows deserve full precision; the mean budget is what
+            // water-filling needs so they float to ~8 bits while the
+            // zeroed rows sink to the floor.
+            crate::convert::set_vbit_mean_bits((3.0 + 5.0 * keep).clamp(3.0, 8.0));
+        }
+        let mut saved = 0usize;
+        for (name, shape, vals) in &ffn_vals {
+            let li: usize = name
+                .strip_prefix("model.layers.")
+                .and_then(|r| r.split('.').next())
+                .and_then(|n| n.parse().ok())
+                .context("ffn tensor without layer index")?;
+            let alive = &keep_sets[li];
+            let (rows, cols) = (shape[0], shape[1]);
+            let mut z = vals.clone();
+            if name.ends_with("down_proj.weight") {
+                // [hidden, inter]: the neuron axis is the columns.
+                for r in 0..rows {
+                    for (c, a) in alive.iter().enumerate() {
+                        if !a {
+                            z[r * cols + c] = 0.0;
+                        }
+                    }
+                }
+            } else {
+                // gate/up [inter, hidden]: the neuron axis is the rows.
+                for (r, a) in alive.iter().enumerate() {
+                    if !a {
+                        z[r * cols..(r + 1) * cols].fill(0.0);
+                    }
+                }
+            }
+            let (dtype, data) = quantize_2d(vq, &z, rows, cols);
+            let skill_name = format!("skill.{id}.{name}");
+            if let Some(t) = tensors.iter_mut().find(|t| t.name == skill_name) {
+                saved += t.data.len().saturating_sub(data.len());
+                t.dtype = dtype;
+                t.shape = shape.clone();
+                t.data = data;
+            }
+        }
+        let sparsity = 1.0 - keep_n as f32 / inter as f32;
+        println!(
+            "sparse bake: keep {keep_n}/{inter} neurons/layer (sparsity {:.0}%), −{:.1} MB",
+            sparsity * 100.0,
+            saved as f64 / 1e6
+        );
+        // The mask is an ordinary task in the catalog, linked to the
+        // skill via input_mask_task — `run --skill` activates it.
+        catalog.masks.retain(|m| m.name != id);
+        let task_id = catalog.masks.iter().map(|m| m.task_id + 1).max().unwrap_or(1);
+        catalog.masks.push(TaskMask {
+            task_id,
+            name: id.to_string(),
+            description: Some(format!("DTG-MA mask of skill '{id}' (keep {keep:.2})")),
+            sparsity,
+            quality: None,
+            ffn_masks: ffn_bits,
+            head_masks: vec![vec![0xffu8; nh_bytes(model.arch().num_attention_heads)]; num_layers],
+            layer_gates: vec![true; num_layers],
+            parent: None,
+            priority: MaskPriority::Normal,
+            has_hot_pack: false,
+        });
+        if let Some(rec) = header.skills.iter_mut().find(|s| s.id == id) {
+            rec.input_mask_task = Some(id.to_string());
+        }
+        CmfModel::write(&tmp, &header, &tensors, Some(&catalog), model.vocab.as_deref())?;
+    }
 
     // ── claim-16 quality gate: overlaid vs backbone on held-out text,
-    //    measured through the rebuilt file and recorded in the registry ──
+    //    measured through the rebuilt file and recorded in the registry.
+    //    A sparse skill is measured WITH its mask active — that is how
+    //    it runs. ──
     if let Some(qf) = quality_file {
         let text = std::fs::read_to_string(qf)?;
         let probe = Arc::new(CmfModel::open(&tmp)?);
         let backbone = ppl_of(&probe, None, &text, quality_tokens)?;
-        let overlaid = ppl_of(&probe, Some(id), &text, quality_tokens)?;
+        let overlaid = if sparse.is_some() {
+            let mask = probe.masks.get(id).context("sparse bake lost its mask")?.clone();
+            let mut p =
+                Pipeline::from_model_with_skill(&probe, SamplerConfig::default(), Some(id))
+                    .map_err(|e| anyhow::anyhow!(e))?;
+            let mut ids = p.tokenizer.with_bos(p.tokenizer.encode(&text));
+            ids.truncate(quality_tokens);
+            p.ppl_ids_masked(&ids, &mask)
+        } else {
+            ppl_of(&probe, Some(id), &text, quality_tokens)?
+        };
         println!(
             "quality ({qf}): backbone PPL {backbone:.3} → skill PPL {overlaid:.3} ({:+.1}%)",
             (overlaid / backbone - 1.0) * 100.0
@@ -436,9 +603,16 @@ pub fn run_skill_add(
                 "overlaid": (overlaid * 1000.0).round() / 1000.0,
                 "file": Path::new(qf).file_name().map(|f| f.to_string_lossy().into_owned()),
                 "tokens": quality_tokens,
+                "masked": sparse.is_some(),
             }));
         }
-        CmfModel::write(&tmp, &header2, &tensors, masks, model.vocab.as_deref())?;
+        CmfModel::write(
+            &tmp,
+            &header2,
+            &tensors,
+            if catalog.masks.is_empty() { None } else { Some(&catalog) },
+            model.vocab.as_deref(),
+        )?;
     }
 
     // Verify before replacing anything.

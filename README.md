@@ -212,7 +212,11 @@ real skills from public Hugging Face fine-tunes into one 0.5B file with
 `cortiq skill add` — a text-to-SQL assistant, a Russian assistant (−7.1%
 measured PPL on Russian prose) and a step-by-step verifier — then routes
 fresh prompts to the right one 6/6, blends them, and switches mid-stream.
-With commands, measurements, and the failure modes spelled out.
+The same guide covers the full DTG-MA bake: a trained task mask + FCD +
+physical defrag turned a 1.6 GB checkpoint into a **705 MB specialist
+that is 14.7% better on its domain and faster** — measured end-to-end
+through this runtime on held-out text. With commands, measurements, and
+the failure modes spelled out.
 
 Serving *N* task-specialists:
 
