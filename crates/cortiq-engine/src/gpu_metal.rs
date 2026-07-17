@@ -104,12 +104,15 @@ kernel void q8_mul_mm(
     uint sgitg [[simdgroup_index_in_threadgroup]],
     uint2 tg  [[threadgroup_position_in_grid]])
 {
-    // NOTE: unioning these through one casted arena (8 KB total like
-    // ggml) was measured 4.7× SLOWER — the pointer cast defeats the
-    // compiler's threadgroup alias analysis. Separate typed arrays it is.
-    threadgroup half  sa[64 * 32];   // W tile, 8x8 blocks
-    threadgroup half  sb[32 * 32];   // X tile, 8x8 blocks
-    threadgroup float cst[32 * 64];  // C staging
+    // ggml's exact shmem shape: one 8 KB char arena, W/X tiles as
+    // casted half views during the K loop, the same bytes re-cast to
+    // float for EDGE-tile C staging only — interior tiles store straight
+    // to device (their aligned fast path). An earlier float-typed arena
+    // measured 4.7× slower; the char base + ggml's access pattern does
+    // not trip that.
+    threadgroup char shmem[8192];
+    threadgroup half* sa = (threadgroup half*)shmem;
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
     const uint NK = 32u;
     uint r0 = tg.y * 64u;   // weight-row tile
     uint r1 = tg.x * 32u;   // batch-row tile
@@ -136,7 +139,10 @@ kernel void q8_mul_mm(
     for (uint k0 = 0; k0 < cols; k0 += NK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // W: 16 consecutive quants (4 vector loads) → one
-        // 8x8-block-packed column pair.
+        // 8x8-block-packed column pair. No bounds branches in here:
+        // cols % 32 == 0 is a host gate, and the row clamps above keep
+        // every pointer in range — ggml compiles its checks out with
+        // function constants, we simply don't emit them.
         {
             uint sy = (tiitg / 2u) / 8u;
             uint lx = (tiitg / 2u) % 8u;
@@ -202,22 +208,32 @@ kernel void q8_mul_mm(
         }
     }
 
-    // C staging: sg's strip is 16 batch rows × 32 weight cols.
-    {
-        uint moff = 16u * (sgitg / 2u);
-        uint noff = 32u * (sgitg % 2u);
-        for (uint i = 0; i < 8u; ++i) {
-            simdgroup_store(
-                mc[i],
-                cst + (moff + 8u * (i / 4u)) * 64u + noff + 8u * (i % 4u),
-                64);
+    if (r0 + 64u <= rows && r1 + 32u <= nb) {
+        // Interior tile: straight to device (ggml's aligned fast path).
+        device float* C = y + (r0 + 32u * (sgitg & 1u))
+            + (ulong)(r1 + 16u * (sgitg >> 1u)) * rows;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * (ulong)rows * (i / 4),
+                            rows, ulong2(0, 0), false);
         }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tiitg; i < 32u * 64u; i += 128u) {
-        uint m = i / 64u, n = i % 64u;
-        if (r1 + m < nb && r0 + n < rows) {
-            y[(ulong)(r1 + m) * rows + r0 + n] = cst[i];
+    } else {
+        // Edge tile: stage through the (re-cast) shmem, sg 0 writes out.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* temp_str = ((threadgroup float*)shmem)
+            + 32u * (sgitg & 1u) + (16u * (sgitg >> 1u)) * 64u;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * 64 * (i / 4),
+                            64, ulong2(0, 0), false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (uint j = tiitg; j < nr1; j += 128u) {
+                device float* D = y + r0 + (ulong)(r1 + j) * rows;
+                threadgroup const float* Cr = ((threadgroup float*)shmem) + j * 64u;
+                for (uint i = 0; i < nr0; ++i) {
+                    D[i] = Cr[i];
+                }
+            }
         }
     }
 }
