@@ -39,6 +39,11 @@ The capital of France is **Paris**.
 [10 tokens, 40.1 tok/s, finish: stop]
 ```
 
+**Android**：`aarch64-linux-android` 发布二进制可直接在设备上运行——
+[Termux](https://termux.dev) 或 `adb shell` 中下载后 `chmod +x cortiq`，
+同样的 `convert` / `run` / `serve` 命令即可使用（CPU 路径；wgpu Vulkan
+随附，运行时探针保留胜出的一侧）。
+
 `convert` 会从 Hugging Face 拉取 checkpoint（分片并行下载）、做量化，并写出一个
 自包含的文件——纯 Rust 实现，不用 torch，不用 numpy。已经有 GGUF 了？
 `cortiq import-gguf <file-or-repo-id> --output model.cmf` 同样能原生读取。
