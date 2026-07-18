@@ -2019,9 +2019,9 @@ fn mm_pipeline(c: &Ctx, rows: usize, cols: usize, kind: u8) -> ComputePipelineSt
 /// Encode one tiled q8 GEMM into an open command buffer (device-resident
 /// X and Y). Caller guarantees b ≥ 32 and cols % 4 == 0.
 #[allow(clippy::too_many_arguments)]
-fn encode_mul_mm(
+fn enc_mul_mm(
     c: &Ctx,
-    cmd: &metal::CommandBufferRef,
+    enc: &metal::ComputeCommandEncoderRef,
     fbuf: &Buffer,
     abs: usize,
     rs_buf: &Buffer,
@@ -2031,7 +2031,6 @@ fn encode_mul_mm(
     rows: usize,
     cols: usize,
 ) {
-    let enc = cmd.new_compute_command_encoder();
     let pso = mm_pipeline(c, rows, cols, 0);
     enc.set_compute_pipeline_state(&pso);
     enc.set_buffer(0, Some(fbuf), abs as u64);
@@ -2046,6 +2045,22 @@ fn encode_mul_mm(
         MTLSize::new((b as u64).div_ceil(32), (rows as u64).div_ceil(64), 1),
         MTLSize::new(128, 1, 1),
     );
+}
+
+fn encode_mul_mm(
+    c: &Ctx,
+    cmd: &metal::CommandBufferRef,
+    fbuf: &Buffer,
+    abs: usize,
+    rs_buf: &Buffer,
+    xs: &Buffer,
+    y: &Buffer,
+    b: usize,
+    rows: usize,
+    cols: usize,
+) {
+    let enc = cmd.new_compute_command_encoder();
+    enc_mul_mm(c, enc, fbuf, abs, rs_buf, xs, y, b, rows, cols);
     enc.end_encoding();
 }
 
@@ -2446,9 +2461,14 @@ pub fn chunk_run_gpu(
 
         rows_norm(&cmd, &h_b, &inorm, &n_b);
         cmd = prof.cut(c, cmd, "norm");
-        encode_mul_mm(c, &cmd, &fbuf, prep.abs[0], &prep.rs[0], &n_b, &qraw, b, l.wq.1, l.wq.2);
-        encode_mul_mm(c, &cmd, &fbuf, prep.abs[1], &prep.rs[1], &n_b, &kraw, b, l.wk.1, l.wk.2);
-        encode_mul_mm(c, &cmd, &fbuf, prep.abs[2], &prep.rs[2], &n_b, &vraw, b, l.wv.1, l.wv.2);
+        {
+            // Independent outputs — one encoder, three dispatches.
+            let enc = cmd.new_compute_command_encoder();
+            enc_mul_mm(c, enc, &fbuf, prep.abs[0], &prep.rs[0], &n_b, &qraw, b, l.wq.1, l.wq.2);
+            enc_mul_mm(c, enc, &fbuf, prep.abs[1], &prep.rs[1], &n_b, &kraw, b, l.wk.1, l.wk.2);
+            enc_mul_mm(c, enc, &fbuf, prep.abs[2], &prep.rs[2], &n_b, &vraw, b, l.wv.1, l.wv.2);
+            enc.end_encoding();
+        }
         cmd = prof.cut(c, cmd, "mm_qkv");
         {
             let enc = cmd.new_compute_command_encoder();
@@ -2491,25 +2511,29 @@ pub fn chunk_run_gpu(
         }
         cmd = prof.cut(c, cmd, "rope_kv");
         // GEMM attention (profiled: the streaming attend was 47% of the
-        // chunk): per KV group — scores = Qpanel·Kᵀ·scale, causal
-        // softmax rows, Born column sums, attn = P·V. Same two-GEMM
-        // shape the CPU AMX path uses.
+        // chunk): scores = Qpanel·Kᵀ·scale per KV group, causal softmax
+        // rows, Born column sums, attn = P·V. Groups get their own
+        // score REGIONS so same-stage dispatches of every group share
+        // one encoder and may overlap; the imp and P·V passes both only
+        // read the softmaxed scores and merge into one encoder too.
         {
             let hpk = nh / nkv.max(1);
             let ncur = prep.st0 + b;
             let m_rows = hpk * b;
-            let scores = io_buf(c, 72_000_000_089 + m_rows * ncur, m_rows * ncur * 4);
+            let g_stride = (m_rows * ncur * 4) as u64;
+            let scores =
+                io_buf(c, 72_000_000_089 + nkv * m_rows * ncur, nkv * m_rows * ncur * 4);
             let scale = 1.0f32 / (hd as f32).sqrt();
-            for g in 0..nkv {
-                let koff = (g * prep.cap * hd * 4) as u64;
-                let qoff = (g * hpk * b * hd * 4) as u64;
-                {
-                    let enc = cmd.new_compute_command_encoder();
-                    let pso = mm_pipeline(c, 0, hd, 2);
-                    enc.set_compute_pipeline_state(&pso);
+            {
+                let enc = cmd.new_compute_command_encoder();
+                let pso = mm_pipeline(c, 0, hd, 2);
+                enc.set_compute_pipeline_state(&pso);
+                for g in 0..nkv {
+                    let koff = (g * prep.cap * hd * 4) as u64;
+                    let qoff = (g * hpk * b * hd * 4) as u64;
                     enc.set_buffer(0, Some(&prep.k_mb), koff);
                     enc.set_buffer(1, Some(&qrope), qoff);
-                    enc.set_buffer(2, Some(&scores), 0);
+                    enc.set_buffer(2, Some(&scores), g as u64 * g_stride);
                     let (cols_u, rows_u, nb_u) = (hd as u32, ncur as u32, m_rows as u32);
                     enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
                     enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
@@ -2519,15 +2543,16 @@ pub fn chunk_run_gpu(
                         MTLSize::new((m_rows as u64).div_ceil(32), (ncur as u64).div_ceil(64), 1),
                         MTLSize::new(128, 1, 1),
                     );
-                    enc.end_encoding();
                 }
-                cmd = prof.cut(c, cmd, "att_qk");
-                {
-                    let enc = cmd.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(&c.csmax);
-                    enc.set_buffer(0, Some(&scores), 0);
-                    let words =
-                        [ncur as u32, prep.st0 as u32, b as u32, m_rows as u32];
+                enc.end_encoding();
+            }
+            cmd = prof.cut(c, cmd, "att_qk");
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&c.csmax);
+                for g in 0..nkv {
+                    enc.set_buffer(0, Some(&scores), g as u64 * g_stride);
+                    let words = [ncur as u32, prep.st0 as u32, b as u32, m_rows as u32];
                     for (i, w) in words.iter().enumerate() {
                         enc.set_bytes(1 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
                     }
@@ -2536,13 +2561,17 @@ pub fn chunk_run_gpu(
                         MTLSize::new((m_rows as u64).div_ceil(sgs), 1, 1),
                         MTLSize::new(sgs * 32, 1, 1),
                     );
-                    enc.end_encoding();
                 }
-                cmd = prof.cut(c, cmd, "att_sm");
-                {
-                    let enc = cmd.new_compute_command_encoder();
+                enc.end_encoding();
+            }
+            cmd = prof.cut(c, cmd, "att_sm");
+            {
+                // Born sums and P·V both only READ the softmaxed scores
+                // — one encoder, they may overlap.
+                let enc = cmd.new_compute_command_encoder();
+                for g in 0..nkv {
                     enc.set_compute_pipeline_state(&c.impcol);
-                    enc.set_buffer(0, Some(&scores), 0);
+                    enc.set_buffer(0, Some(&scores), g as u64 * g_stride);
                     enc.set_buffer(1, Some(&prep.imp_mb), 0);
                     let words = [ncur as u32, m_rows as u32];
                     for (i, w) in words.iter().enumerate() {
@@ -2552,15 +2581,12 @@ pub fn chunk_run_gpu(
                         MTLSize::new(ncur as u64, 32, 1),
                         MTLSize::new(64, 4, 1),
                     );
-                    enc.end_encoding();
-                }
-                cmd = prof.cut(c, cmd, "att_imp");
-                {
-                    let enc = cmd.new_compute_command_encoder();
                     let pso = mm_pipeline(c, hd, 0, 3);
                     enc.set_compute_pipeline_state(&pso);
+                    let koff = (g * prep.cap * hd * 4) as u64;
+                    let qoff = (g * hpk * b * hd * 4) as u64;
                     enc.set_buffer(0, Some(&prep.v_mb), koff);
-                    enc.set_buffer(1, Some(&scores), 0);
+                    enc.set_buffer(1, Some(&scores), g as u64 * g_stride);
                     enc.set_buffer(2, Some(&apanel), qoff);
                     let (k_u, rows_u, nb_u) = (ncur as u32, hd as u32, m_rows as u32);
                     enc.set_bytes(3, 4, &k_u as *const u32 as *const std::ffi::c_void);
@@ -2570,10 +2596,10 @@ pub fn chunk_run_gpu(
                         MTLSize::new((m_rows as u64).div_ceil(32), (hd as u64).div_ceil(64), 1),
                         MTLSize::new(128, 1, 1),
                     );
-                    enc.end_encoding();
                 }
-                cmd = prof.cut(c, cmd, "att_pv");
+                enc.end_encoding();
             }
+            cmd = prof.cut(c, cmd, "att_pv");
             // panel [head][bi][hd] → [bi][nh·hd] for the O GEMM.
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&c.unstack);
@@ -2595,8 +2621,12 @@ pub fn chunk_run_gpu(
         axpy1(&cmd, &ob, &h_b, b * hs);
         rows_norm(&cmd, &h_b, &pnorm, &n_b);
         cmd = prof.cut(c, cmd, "axpy+norm");
-        encode_mul_mm(c, &cmd, &fbuf, prep.abs[4], &prep.rs[4], &n_b, &gb, b, l.gate.1, l.gate.2);
-        encode_mul_mm(c, &cmd, &fbuf, prep.abs[5], &prep.rs[5], &n_b, &ub, b, l.up.1, l.up.2);
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc_mul_mm(c, enc, &fbuf, prep.abs[4], &prep.rs[4], &n_b, &gb, b, l.gate.1, l.gate.2);
+            enc_mul_mm(c, enc, &fbuf, prep.abs[5], &prep.rs[5], &n_b, &ub, b, l.up.1, l.up.2);
+            enc.end_encoding();
+        }
         cmd = prof.cut(c, cmd, "mm_gateup");
         // down GEMM with silu(g)·u fused into the X-tile load — no
         // standalone activation stage, no act-buffer round trip.
