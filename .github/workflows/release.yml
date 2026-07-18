@@ -77,6 +77,24 @@ jobs:
         # at all. macOS keeps native Metal as the default; wgpu there
         # remains opt-in via CMF_GPU=wgpu.
         run: cargo build --release -p cortiq-cli --features gpu --target ${{ matrix.target }}
+      - name: Build FFI library (android)
+        if: matrix.target == 'aarch64-linux-android'
+        # libcortiq_ffi.so for APK embedding (see crates/cortiq-ffi).
+        run: cargo build --release -p cortiq-ffi --target ${{ matrix.target }}
+      - name: Package FFI (android)
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          bindir="target/${{ matrix.target }}/release"
+          tar -C "$bindir" -czf "libcortiq-ffi-${{ matrix.target }}.tar.gz" libcortiq_ffi.so
+          shasum -a 256 "libcortiq-ffi-${{ matrix.target }}.tar.gz" > "libcortiq-ffi-${{ matrix.target }}.tar.gz.sha256"
+      - name: Attach FFI to release (android)
+        if: matrix.target == 'aarch64-linux-android'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            libcortiq-ffi-${{ matrix.target }}.tar.gz
+            libcortiq-ffi-${{ matrix.target }}.tar.gz.sha256
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
