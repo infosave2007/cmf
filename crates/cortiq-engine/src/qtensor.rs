@@ -2151,6 +2151,52 @@ unsafe fn dot_q4t_row_avx2(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32
     }
 }
 
+/// One q4_tiled row against FOUR activation streams: the nibble unpack
+/// and abs() happen once per group instead of once per (group,
+/// activation) — the unpack is the dominant per-element cost of the
+/// tiled format (roadmap P0 portable blocking, q4t leg).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q4t_row_1x4_avx2(
+    bytes: &[u8],
+    r: usize,
+    gpr: usize,
+    xs: [&[i8]; 4],
+) -> [f32; 4] {
+    // SAFETY: callers uphold the 18B-tile and xq-length contracts.
+    unsafe {
+        use core::arch::x86_64::*;
+        let lomask = _mm_set1_epi8(0x0F);
+        let eight = _mm256_set1_epi8(8);
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = [0f32; 4];
+        for gi in 0..gpr {
+            let t = bytes.as_ptr().add((r * gpr + gi) * Q4_TILE);
+            let s = f16_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
+            let bb = _mm_loadu_si128(t.add(2) as *const __m128i);
+            let lo = _mm_and_si128(bb, lomask);
+            let hi = _mm_and_si128(_mm_srli_epi16::<4>(bb), lomask);
+            let w = _mm256_sub_epi8(
+                _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi)),
+                eight,
+            );
+            let aw = _mm256_abs_epi8(w);
+            for (k, xq) in xs.iter().enumerate() {
+                let x =
+                    _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+                let p16 = _mm256_maddubs_epi16(aw, _mm256_sign_epi8(x, w));
+                let d = _mm256_madd_epi16(p16, ones);
+                let hi128 = _mm256_extracti128_si256::<1>(d);
+                let s128 = _mm_add_epi32(_mm256_castsi256_si128(d), hi128);
+                let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
+                let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
+                acc[k] += _mm_cvtsi128_si32(s32) as f32 * s;
+            }
+        }
+        acc
+    }
+}
+
 /// Exact-term correction for A8W8 outliers on a tiled row.
 #[inline]
 fn q4t_outlier(bytes: &[u8], r: usize, gpr: usize, j: usize) -> (f32, f32) {
@@ -2282,9 +2328,40 @@ fn q4t_matmat(
         let acts: Vec<SplitAct> =
             (0..b).map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols])).collect();
         let acts = &acts;
+        #[cfg(target_arch = "x86_64")]
+        let blocked_ok = avx2_enabled()
+            && std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true);
+        #[cfg(not(target_arch = "x86_64"))]
+        let blocked_ok = false;
         let run = move |start: usize, end: usize| {
             for r in start..end {
-                for (bi, act) in acts.iter().enumerate() {
+                let mut bi = 0usize;
+                #[cfg(target_arch = "x86_64")]
+                if blocked_ok {
+                    while bi + 4 <= acts.len() {
+                        let xs = [
+                            acts[bi].xq.as_slice(),
+                            acts[bi + 1].xq.as_slice(),
+                            acts[bi + 2].xq.as_slice(),
+                            acts[bi + 3].xq.as_slice(),
+                        ];
+                        let d = unsafe { dot_q4t_row_1x4_avx2(bytes, r, gpr, xs) };
+                        for k in 0..4 {
+                            let act = &acts[bi + k];
+                            let mut acc = d[k] * act.sx;
+                            for &(j, xv) in &act.outliers {
+                                let (w, sc) = q4t_outlier(bytes, r, gpr, j);
+                                acc += w * sc * xv;
+                            }
+                            // SAFETY: disjoint (bi, r) cells per worker.
+                            unsafe { *out_addr.at((bi + k) * rows + r) = acc };
+                        }
+                        bi += 4;
+                    }
+                }
+                let _ = blocked_ok;
+                while bi < acts.len() {
+                    let act = &acts[bi];
                     let mut acc = dot_q4t_row_i8(bytes, r, gpr, &act.xq) * act.sx;
                     for &(j, xv) in &act.outliers {
                         let (w, s) = q4t_outlier(bytes, r, gpr, j);
@@ -2292,6 +2369,7 @@ fn q4t_matmat(
                     }
                     // SAFETY: disjoint (bi, r) cells per worker range.
                     unsafe { *out_addr.at(bi * rows + r) = acc };
+                    bi += 1;
                 }
             }
         };
