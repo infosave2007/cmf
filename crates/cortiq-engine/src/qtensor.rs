@@ -2412,10 +2412,119 @@ fn q1_group_sums(xq: &[i8], gpr: usize) -> Vec<i32> {
 /// x86 pass).
 #[inline]
 #[allow(unreachable_code)]
+/// AVX2 q1 row via the same ±1 identity as the ARM sdot kernel: the
+/// sign bits expand to a {0, −1} byte mask through shuffle+cmpeq, the
+/// masked activation sums through maddubs(1, x&mask), and
+/// `dot = −(2·masked_sum + Σx_group)` — bit-identical integer math.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q1_row_avx2(
+    bytes: &[u8],
+    r: usize,
+    gpr: usize,
+    xq: &[i8],
+    gsum: &[i32],
+) -> f32 {
+    // SAFETY: callers uphold the 6B-tile and xq/gsum length contracts.
+    unsafe {
+        use core::arch::x86_64::*;
+        // Byte j of the mask must replicate bits-byte j/8.
+        let expand = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+            2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+        );
+        let bitsel = _mm256_setr_epi8(
+            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
+            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
+        );
+        let ones8 = _mm256_set1_epi8(1);
+        let ones16 = _mm256_set1_epi16(1);
+        let mut acc = 0f32;
+        for gi in 0..gpr {
+            let t = bytes.as_ptr().add((r * gpr + gi) * Q1_TILE);
+            let s = f16_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
+            let bits = u32::from_le_bytes([*t.add(2), *t.add(3), *t.add(4), *t.add(5)]);
+            let bc = _mm256_shuffle_epi8(_mm256_set1_epi32(bits as i32), expand);
+            let mask = _mm256_cmpeq_epi8(_mm256_and_si256(bc, bitsel), bitsel);
+            let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+            let sel = _mm256_and_si256(x, mask);
+            // Σ of selected i8 lanes: maddubs(1u8, sel_i8) pairs → madd.
+            let p16 = _mm256_maddubs_epi16(ones8, sel);
+            let d32 = _mm256_madd_epi16(p16, ones16);
+            let hi128 = _mm256_extracti128_si256::<1>(d32);
+            let s128 = _mm_add_epi32(_mm256_castsi256_si128(d32), hi128);
+            let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
+            let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
+            let msum = _mm_cvtsi128_si32(s32);
+            // The and-select keeps x UN-negated (unlike ARM's −1-mask
+            // sdot): d = Σ_set − Σ_unset = 2·Σ_set − Σ_all.
+            let d = 2 * msum - gsum[gi];
+            acc += d as f32 * s;
+        }
+        acc
+    }
+}
+
+/// The blocked 1×4 flavor: the expanded bit mask serves four activation
+/// streams per group (mask build once, four select+reduce chains).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q1_row_1x4_avx2(
+    bytes: &[u8],
+    r: usize,
+    gpr: usize,
+    xs: [&[i8]; 4],
+    gsums: [&[i32]; 4],
+) -> [f32; 4] {
+    // SAFETY: callers uphold the 6B-tile and xq/gsum length contracts.
+    unsafe {
+        use core::arch::x86_64::*;
+        let expand = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+            2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+        );
+        let bitsel = _mm256_setr_epi8(
+            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
+            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
+        );
+        let ones8 = _mm256_set1_epi8(1);
+        let ones16 = _mm256_set1_epi16(1);
+        let mut acc = [0f32; 4];
+        for gi in 0..gpr {
+            let t = bytes.as_ptr().add((r * gpr + gi) * Q1_TILE);
+            let s = f16_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
+            let bits = u32::from_le_bytes([*t.add(2), *t.add(3), *t.add(4), *t.add(5)]);
+            let bc = _mm256_shuffle_epi8(_mm256_set1_epi32(bits as i32), expand);
+            let mask = _mm256_cmpeq_epi8(_mm256_and_si256(bc, bitsel), bitsel);
+            for (k, xq) in xs.iter().enumerate() {
+                let x =
+                    _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+                let sel = _mm256_and_si256(x, mask);
+                let p16 = _mm256_maddubs_epi16(ones8, sel);
+                let d32 = _mm256_madd_epi16(p16, ones16);
+                let hi128 = _mm256_extracti128_si256::<1>(d32);
+                let s128 = _mm_add_epi32(_mm256_castsi256_si128(d32), hi128);
+                let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
+                let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
+                let msum = _mm_cvtsi128_si32(s32);
+                let d = 2 * msum - gsums[k][gi];
+                acc[k] += d as f32 * s;
+            }
+        }
+        acc
+    }
+}
+
 fn dot_q1_row_i8(bytes: &[u8], r: usize, gpr: usize, xq: &[i8], gsum: &[i32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         return dot_q1_row_sdot(bytes, r, gpr, xq, gsum);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if avx2_enabled() {
+        unsafe {
+            return dot_q1_row_avx2(bytes, r, gpr, xq, gsum);
+        }
     }
     let _ = gsum;
     let mut acc = 0f32;
@@ -2668,9 +2777,45 @@ fn q1_matmat(
             })
             .collect();
         let acts = &acts;
+        #[cfg(target_arch = "x86_64")]
+        let blocked_ok = avx2_enabled()
+            && std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true);
         let run = move |start: usize, end: usize| {
             for r in start..end {
-                for (bi, (act, gsum)) in acts.iter().enumerate() {
+                let mut bi = 0usize;
+                // Blocked 1×4: the expanded bit mask serves four
+                // activation streams per group.
+                #[cfg(target_arch = "x86_64")]
+                if blocked_ok {
+                    while bi + 4 <= acts.len() {
+                        let xs = [
+                            acts[bi].0.xq.as_slice(),
+                            acts[bi + 1].0.xq.as_slice(),
+                            acts[bi + 2].0.xq.as_slice(),
+                            acts[bi + 3].0.xq.as_slice(),
+                        ];
+                        let gs = [
+                            acts[bi].1.as_slice(),
+                            acts[bi + 1].1.as_slice(),
+                            acts[bi + 2].1.as_slice(),
+                            acts[bi + 3].1.as_slice(),
+                        ];
+                        let d = unsafe { dot_q1_row_1x4_avx2(bytes, r, gpr, xs, gs) };
+                        for k in 0..4 {
+                            let (act, _) = &acts[bi + k];
+                            let mut acc = d[k] * act.sx;
+                            for &(j, xv) in &act.outliers {
+                                let (w, sc) = q1_outlier(bytes, r, gpr, j);
+                                acc += w * sc * xv;
+                            }
+                            // SAFETY: disjoint (bi, r) cells per worker.
+                            unsafe { *out_addr.at((bi + k) * rows + r) = acc };
+                        }
+                        bi += 4;
+                    }
+                }
+                while bi < acts.len() {
+                    let (act, gsum) = &acts[bi];
                     let mut acc = dot_q1_row_i8(bytes, r, gpr, &act.xq, gsum) * act.sx;
                     for &(j, xv) in &act.outliers {
                         let (w, s) = q1_outlier(bytes, r, gpr, j);
@@ -2678,6 +2823,7 @@ fn q1_matmat(
                     }
                     // SAFETY: disjoint (bi, r) cells per worker range.
                     unsafe { *out_addr.at(bi * rows + r) = acc };
+                    bi += 1;
                 }
             }
         };
