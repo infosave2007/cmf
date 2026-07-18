@@ -1542,6 +1542,7 @@ fn qmatmat(
         // path IS the ARM prefill GEMM off Apple silicon).
         let blocked_ok =
             std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true);
+        let use_i8mm = i8mm_enabled();
         if blocked_ok {
             let run = |start: usize, end: usize| {
                 let mut o = start;
@@ -1557,7 +1558,11 @@ fn qmatmat(
                                 acts[bi + 2].xq.as_slice(),
                                 acts[bi + 3].xq.as_slice(),
                             ];
-                            let d = unsafe { dot_i8_sdot_2x4(r0, r1, xs) };
+                            let d = if use_i8mm {
+                                unsafe { dot_i8_smmla_2x4(r0, r1, xs) }
+                            } else {
+                                unsafe { dot_i8_sdot_2x4(r0, r1, xs) }
+                            };
                             for (r, row) in [r0, r1].into_iter().enumerate() {
                                 for k in 0..4 {
                                     let act = &acts[bi + k];
@@ -3994,6 +3999,62 @@ unsafe fn dot_i8_i8_avx2(w: &[u8], xq: &[i8]) -> i32 {
     }
 }
 
+/// smmla 2×4: one instruction covers a 2-row × 2-activation × 8-deep
+/// tile (32 MACs vs sdot's 16) — the weight pair loads once per 8-k
+/// slice as a combined 2×8 register and meets two activation pairs.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,i8mm")]
+unsafe fn dot_i8_smmla_2x4(w0: &[u8], w1: &[u8], xs: [&[i8]; 4]) -> [[i32; 4]; 2] {
+    // SAFETY: callers uphold slice-length contracts.
+    unsafe {
+        use core::arch::aarch64::*;
+        use core::arch::asm;
+        let n = w0.len();
+        let w0p = w0.as_ptr() as *const i8;
+        let w1p = w1.as_ptr() as *const i8;
+        // acc01 holds [c(r0,x0) c(r0,x1) c(r1,x0) c(r1,x1)]; acc23 the
+        // same for x2/x3.
+        let mut acc01 = vdupq_n_s32(0);
+        let mut acc23 = vdupq_n_s32(0);
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let wa = vcombine_s8(vld1_s8(w0p.add(i)), vld1_s8(w1p.add(i)));
+            let xb01 =
+                vcombine_s8(vld1_s8(xs[0].as_ptr().add(i)), vld1_s8(xs[1].as_ptr().add(i)));
+            let xb23 =
+                vcombine_s8(vld1_s8(xs[2].as_ptr().add(i)), vld1_s8(xs[3].as_ptr().add(i)));
+            asm!(
+                "smmla {a01:v}.4s, {w:v}.16b, {x01:v}.16b",
+                "smmla {a23:v}.4s, {w:v}.16b, {x23:v}.16b",
+                a01 = inout(vreg) acc01, a23 = inout(vreg) acc23,
+                w = in(vreg) wa, x01 = in(vreg) xb01, x23 = in(vreg) xb23,
+                options(pure, nomem, nostack),
+            );
+            i += 8;
+        }
+        let mut out = [[0i32; 4]; 2];
+        let a01: [i32; 4] = core::mem::transmute(acc01);
+        let a23: [i32; 4] = core::mem::transmute(acc23);
+        out[0][0] = a01[0];
+        out[0][1] = a01[1];
+        out[1][0] = a01[2];
+        out[1][1] = a01[3];
+        out[0][2] = a23[0];
+        out[0][3] = a23[1];
+        out[1][2] = a23[2];
+        out[1][3] = a23[3];
+        if i < n {
+            for (k, x) in xs.iter().enumerate() {
+                for j in i..n {
+                    out[0][k] += (w0[j] as i8) as i32 * x[j] as i32;
+                    out[1][k] += (w1[j] as i8) as i32 * x[j] as i32;
+                }
+            }
+        }
+        out
+    }
+}
+
 /// ARM twin of the x86 blocked prefill GEMM: two weight rows stay in
 /// registers across four activation streams, eight sdot accumulators.
 /// (The per-row form re-read each W row once per activation.)
@@ -4305,6 +4366,23 @@ fn q8_range2_avx2(
 }
 
 // ───────────────────── A8W8 SDOT path (port of vmfcore, ×1.78 decode) ─────────────────────
+
+/// ARMv8.6 i8mm (smmla): 32 int8 MACs per instruction vs sdot's 16 —
+/// yet MEASURED 2.4× SLOWER than the blocked sdot on Apple silicon
+/// (108 vs 264 GF/s): the on-the-fly vcombine packing and the two-
+/// accumulator dependency chain swamp the MAC advantage, and Apple's
+/// four SIMD pipes already keep sdot fed. OPT-IN (CMF_I8MM=1) for
+/// field trials on Cortex-A710/X-class parts with two pipes, where the
+/// balance may differ; a pre-interleaved weight layout (repack infra)
+/// is the known path if it ever earns its keep.
+#[cfg(target_arch = "aarch64")]
+fn i8mm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CMF_I8MM").map(|v| v == "1").unwrap_or(false)
+            && std::arch::is_aarch64_feature_detected!("i8mm")
+    })
+}
 
 /// SDOT enabled? Default ON when the CPU has ARMv8.2 dotprod;
 /// `CMF_SDOT=0` disables (falls back to i8×f32 NEON).
