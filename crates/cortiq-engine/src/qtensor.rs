@@ -2853,6 +2853,109 @@ unsafe fn dot_q1_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8], gsum: &
     }
 }
 
+/// Blocked q1 1×4: one TBL unpack of the tile pair serves FOUR
+/// activation streams (prefill amortization — the same idea as the
+/// AVX2 twin; per stream the group order, fma order and tail match the
+/// single-row kernel exactly, so batch == matvec bit-for-bit).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn dot_q1_row_1x4_sdot(
+    bytes: &[u8],
+    r: usize,
+    gpr: usize,
+    xs: [&[i8]; 4],
+    gs: [&[i32]; 4],
+) -> [f32; 4] {
+    // SAFETY: same slice-length contracts as `dot_q1_row_sdot`, ×4.
+    unsafe {
+        use core::arch::aarch64::*;
+        use core::arch::asm;
+        const MASKS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        const IW00: [u8; 16] = [2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3];
+        const IW01: [u8; 16] = [4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5];
+        const IW10: [u8; 16] = [8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9];
+        const IW11: [u8; 16] = [10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11];
+        const ISC: [u8; 8] = [0, 1, 6, 7, 16, 17, 22, 23];
+        let m = vld1q_u8(MASKS.as_ptr());
+        let (iw00, iw01) = (vld1q_u8(IW00.as_ptr()), vld1q_u8(IW01.as_ptr()));
+        let (iw10, iw11) = (vld1q_u8(IW10.as_ptr()), vld1q_u8(IW11.as_ptr()));
+        let isc = vld1_u8(ISC.as_ptr());
+        macro_rules! sdot2 {
+            ($w0:expr, $w1:expr, $x:expr) => {{
+                let x0 = vld1q_s8($x);
+                let x1 = vld1q_s8($x.add(16));
+                let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+                asm!(
+                    "sdot {a0:v}.4s, {w0:v}.16b, {x0:v}.16b",
+                    "sdot {a1:v}.4s, {w1:v}.16b, {x1:v}.16b",
+                    a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                    w0 = in(vreg) $w0, x0 = in(vreg) x0, w1 = in(vreg) $w1, x1 = in(vreg) x1,
+                    options(pure, nomem, nostack),
+                );
+                vaddq_s32(a0, a1)
+            }};
+        }
+        let base = bytes.as_ptr().add(r * gpr * Q1_TILE);
+        let row_base = r * gpr * Q1_TILE;
+        let abs_end = bytes.len();
+        let mut accv = [vdupq_n_f32(0.0); 4];
+        let mut gi = 0;
+        while gi + 4 <= gpr && row_base + (gi + 4) * Q1_TILE + 4 <= abs_end {
+            let t0 = base.add(gi * Q1_TILE);
+            let ld_a = vld1q_u8(t0);
+            let ld_b = vld1q_u8(t0.add(2 * Q1_TILE));
+            // Unpack ONCE — eight ±mask vectors serve all four streams.
+            let w00 = vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8(ld_a, iw00), m));
+            let w01 = vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8(ld_a, iw01), m));
+            let w10 = vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8(ld_a, iw10), m));
+            let w11 = vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8(ld_a, iw11), m));
+            let w20 = vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8(ld_b, iw00), m));
+            let w21 = vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8(ld_b, iw01), m));
+            let w30 = vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8(ld_b, iw10), m));
+            let w31 = vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8(ld_b, iw11), m));
+            let sc16 = vqtbl2_u8(uint8x16x2_t(ld_a, ld_b), isc);
+            let scf: float32x4_t;
+            asm!(
+                "fcvtl {o:v}.4s, {i:v}.4h",
+                o = out(vreg) scf, i = in(vreg) sc16,
+                options(pure, nomem, nostack),
+            );
+            for k in 0..4 {
+                let xp = xs[k].as_ptr();
+                let d0 = sdot2!(w00, w01, xp.add(gi * GROUP_SIZE));
+                let d1 = sdot2!(w10, w11, xp.add((gi + 1) * GROUP_SIZE));
+                let d2 = sdot2!(w20, w21, xp.add((gi + 2) * GROUP_SIZE));
+                let d3 = sdot2!(w30, w31, xp.add((gi + 3) * GROUP_SIZE));
+                let neg = vpaddq_s32(vpaddq_s32(d0, d1), vpaddq_s32(d2, d3));
+                let g = vld1q_s32(gs[k].as_ptr().add(gi));
+                let dots = vnegq_s32(vaddq_s32(vshlq_n_s32::<1>(neg), g));
+                accv[k] = vfmaq_f32(accv[k], vcvtq_f32_s32(dots), scf);
+            }
+            gi += 4;
+        }
+        let mut acc = [
+            vaddvq_f32(accv[0]),
+            vaddvq_f32(accv[1]),
+            vaddvq_f32(accv[2]),
+            vaddvq_f32(accv[3]),
+        ];
+        while gi < gpr {
+            let t = base.add(gi * Q1_TILE);
+            let sc = f16_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
+            let v0 = vcombine_u8(vdup_n_u8(*t.add(2)), vdup_n_u8(*t.add(3)));
+            let v1 = vcombine_u8(vdup_n_u8(*t.add(4)), vdup_n_u8(*t.add(5)));
+            let w0 = vreinterpretq_s8_u8(vtstq_u8(v0, m));
+            let w1 = vreinterpretq_s8_u8(vtstq_u8(v1, m));
+            for k in 0..4 {
+                let d = vaddvq_s32(sdot2!(w0, w1, xs[k].as_ptr().add(gi * GROUP_SIZE)));
+                acc[k] += (-(2 * d + *gs[k].as_ptr().add(gi))) as f32 * sc;
+            }
+            gi += 1;
+        }
+        acc
+    }
+}
+
 /// (weight ±1, scale) of one q1 element — the exact outlier term.
 #[inline]
 fn q1_outlier(bytes: &[u8], r: usize, gpr: usize, j: usize) -> (f32, f32) {
@@ -3013,11 +3116,43 @@ fn q1_matmat(
         #[cfg(target_arch = "x86_64")]
         let blocked_ok = avx2_enabled()
             && std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true);
+        #[cfg(target_arch = "aarch64")]
+        let blocked_ok = sdot_enabled()
+            && std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true);
         let run = move |start: usize, end: usize| {
             for r in start..end {
                 let mut bi = 0usize;
-                // Blocked 1×4: the expanded bit mask serves four
+                // Blocked 1×4: the unpacked bit mask serves four
                 // activation streams per group.
+                #[cfg(target_arch = "aarch64")]
+                if blocked_ok {
+                    while bi + 4 <= acts.len() {
+                        let xs = [
+                            acts[bi].0.xq.as_slice(),
+                            acts[bi + 1].0.xq.as_slice(),
+                            acts[bi + 2].0.xq.as_slice(),
+                            acts[bi + 3].0.xq.as_slice(),
+                        ];
+                        let gs = [
+                            acts[bi].1.as_slice(),
+                            acts[bi + 1].1.as_slice(),
+                            acts[bi + 2].1.as_slice(),
+                            acts[bi + 3].1.as_slice(),
+                        ];
+                        let d = unsafe { dot_q1_row_1x4_sdot(bytes, r, gpr, xs, gs) };
+                        for k in 0..4 {
+                            let (act, _) = &acts[bi + k];
+                            let mut acc = d[k] * act.sx;
+                            for &(j, xv) in &act.outliers {
+                                let (w, sc) = q1_outlier(bytes, r, gpr, j);
+                                acc += w * sc * xv;
+                            }
+                            // SAFETY: disjoint (bi, r) cells per worker.
+                            unsafe { *out_addr.at((bi + k) * rows + r) = acc };
+                        }
+                        bi += 4;
+                    }
+                }
                 #[cfg(target_arch = "x86_64")]
                 if blocked_ok {
                     while bi + 4 <= acts.len() {
@@ -5317,6 +5452,20 @@ mod tests {
                 "row {o}: {} vs {expect}",
                 got[o]
             );
+        }
+        // Blocked 1×4 batch (b=5: one quad + remainder) must equal the
+        // single-matvec path bit-for-bit.
+        let b = 5usize;
+        let mut xs_all = Vec::new();
+        for bi in 0..b {
+            xs_all.extend(x.iter().map(|v| if bi % 2 == 0 { *v } else { -*v }));
+        }
+        let mut mm = vec![0.0f32; b * rows];
+        q1_matmat(&bytes, &xs_all, b, rows, cols, &mut mm, None);
+        for bi in 0..b {
+            let mut single = vec![0.0f32; rows];
+            q1_matvec(&bytes, &xs_all[bi * cols..(bi + 1) * cols], rows, cols, &mut single, None);
+            assert_eq!(&mm[bi * rows..(bi + 1) * rows], &single[..], "stream {bi}");
         }
     }
 
