@@ -240,6 +240,20 @@ impl QTensor {
                 vbit_offsets: Vec::new(),
                 repack: Vec::new(),
             }),
+            // q1t (ternary + outlier overlay): fused per-row dequant kernel
+            // reads straight from mmap — a 12B q1t stays ~its file size in
+            // RAM instead of dequantizing to ~48 GB of f32.
+            TensorDtype::Q1T if cols % GROUP_SIZE == 0 => Ok(Self::Mapped {
+                model: model.clone(),
+                idx,
+                dtype: entry.dtype,
+                rows,
+                cols,
+                row_scale: Vec::new(),
+                col_field: Vec::new(),
+                vbit_offsets: Vec::new(),
+                repack: Vec::new(),
+            }),
             // No fused kernel yet → dequantize once (correct, more RAM).
             _ => {
                 let mut data = vec![0.0f32; rows * cols];
@@ -560,6 +574,10 @@ impl QTensor {
                     q1_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
                     return;
                 }
+                if *dtype == TensorDtype::Q1T {
+                    q1t_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
+                    return;
+                }
                 if matches!(dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
                     vbitmatvec(self.quant_bytes(), vbit_offsets, x, *rows, *cols, out, pool);
                     return;
@@ -748,6 +766,10 @@ impl QTensor {
                 }
                 if *dtype == TensorDtype::Q1 {
                     q1_matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
+                    return;
+                }
+                if *dtype == TensorDtype::Q1T {
+                    q1t_matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
                     return;
                 }
                 if matches!(dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
@@ -3026,6 +3048,124 @@ fn q1_range_f32(bytes: &[u8], gpr: usize, x: &[f32], out: SendMut, start: usize,
 }
 
 /// Fused q1 matvec (dispatch mirrors `q4t_matvec`).
+/// q1t overlay header: `[u32 count]` at `base_len`, then `count × (u32 idx,
+/// f16 val)` sorted by flat index. Returns `(entries_offset, count)`.
+fn q1t_overlay(bytes: &[u8], base_len: usize) -> (usize, usize) {
+    if base_len + 4 > bytes.len() {
+        return (base_len + 4, 0);
+    }
+    let count = u32::from_le_bytes([
+        bytes[base_len],
+        bytes[base_len + 1],
+        bytes[base_len + 2],
+        bytes[base_len + 3],
+    ]) as usize;
+    (base_len + 4, count)
+}
+
+/// Dequantize one q1t row into `buf[..cols]`: the ternary base
+/// (`[f16 scale][8B codes]` per group) then the row's outliers (the overlay
+/// range `[r·cols, (r+1)·cols)`, found by binary search since it is sorted).
+fn q1t_dequant_row(
+    bytes: &[u8],
+    r: usize,
+    gpr: usize,
+    cols: usize,
+    ov_start: usize,
+    ov_count: usize,
+    buf: &mut [f32],
+) {
+    for g in 0..gpr {
+        let off = (r * gpr + g) * 10;
+        let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+        let bc = g * GROUP_SIZE;
+        for k in 0..GROUP_SIZE {
+            let code = (bytes[off + 2 + k / 4] >> ((k % 4) * 2)) & 0x3;
+            buf[bc + k] = match code {
+                1 => s,
+                2 => -s,
+                _ => 0.0,
+            };
+        }
+    }
+    let (lo, hi) = (r * cols, r * cols + cols);
+    let idx_at = |p: usize| -> usize {
+        let e = ov_start + p * 6;
+        u32::from_le_bytes([bytes[e], bytes[e + 1], bytes[e + 2], bytes[e + 3]]) as usize
+    };
+    let (mut a, mut b) = (0usize, ov_count);
+    while a < b {
+        let m = (a + b) / 2;
+        if idx_at(m) < lo {
+            a = m + 1;
+        } else {
+            b = m;
+        }
+    }
+    let mut p = a;
+    while p < ov_count {
+        let idx = idx_at(p);
+        if idx >= hi {
+            break;
+        }
+        let e = ov_start + p * 6;
+        buf[idx - lo] = f16_to_f32(u16::from_le_bytes([bytes[e + 4], bytes[e + 5]]));
+        p += 1;
+    }
+}
+
+/// Ternary (q1t) matvec — per-row dequant + dot, straight from mmap.
+fn q1t_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
+    debug_assert_eq!(out.len(), rows);
+    let gpr = cols / GROUP_SIZE;
+    let (ov_start, ov_count) = q1t_overlay(bytes, rows * gpr * 10);
+    let out_addr = SendMut(out.as_mut_ptr());
+    let run = move |start: usize, end: usize| {
+        let mut buf = vec![0f32; cols];
+        for r in start..end {
+            q1t_dequant_row(bytes, r, gpr, cols, ov_start, ov_count, &mut buf);
+            let mut acc = 0f32;
+            for j in 0..cols {
+                acc += buf[j] * x[j];
+            }
+            unsafe { *out_addr.at(r) = acc };
+        }
+    };
+    dispatch_rows(pool, rows, &run);
+}
+
+/// Ternary (q1t) matmat (prefill) — dequant each row once, dot the whole
+/// batch against it (amortizes the per-row decode).
+fn q1t_matmat(
+    bytes: &[u8],
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    debug_assert_eq!(out.len(), b * rows);
+    let gpr = cols / GROUP_SIZE;
+    let (ov_start, ov_count) = q1t_overlay(bytes, rows * gpr * 10);
+    let out_addr = SendMut(out.as_mut_ptr());
+    let run = move |start: usize, end: usize| {
+        let mut buf = vec![0f32; cols];
+        for r in start..end {
+            q1t_dequant_row(bytes, r, gpr, cols, ov_start, ov_count, &mut buf);
+            for bi in 0..b {
+                let xr = &xs[bi * cols..(bi + 1) * cols];
+                let mut acc = 0f32;
+                for j in 0..cols {
+                    acc += buf[j] * xr[j];
+                }
+                unsafe { *out_addr.at(bi * rows + r) = acc };
+            }
+        }
+    };
+    dispatch_rows(pool, rows, &run);
+}
+
 fn q1_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
     debug_assert_eq!(out.len(), rows);
     let gpr = cols / GROUP_SIZE;
@@ -6016,6 +6156,61 @@ mod tests {
                 got[r],
                 expect[r]
             );
+        }
+    }
+
+    /// The fused q1t matvec must equal the reference (dequant_q1t → dot),
+    /// including the ternary zero level and the binary-searched outlier
+    /// overlay. Guards the mmap kernel that makes a 12B q1t runnable.
+    #[test]
+    fn q1t_matvec_matches_reference() {
+        use cortiq_core::quant::{dequant_q1t, f32_to_f16};
+        let (rows, cols) = (3usize, 64usize); // gpr = 2
+        let gpr = cols / GROUP_SIZE;
+        let scales = [0.5f32, 0.3, 0.7, 0.2, 0.6, 0.15];
+        let mut bytes = Vec::new();
+        for r in 0..rows {
+            for g in 0..gpr {
+                bytes.extend_from_slice(&f32_to_f16(scales[r * gpr + g]).to_le_bytes());
+                let mut c = [0u8; 8];
+                for k in 0..GROUP_SIZE {
+                    let code = ((k + r * 3 + g) % 3) as u8; // 0,1,2
+                    c[k / 4] |= code << ((k % 4) * 2);
+                }
+                bytes.extend_from_slice(&c);
+            }
+        }
+        // Overlay (must be sorted by flat index): a few spikes across rows.
+        let outliers: [(u32, f32); 3] = [(5, 9.0), (70, -4.5), (150, 3.25)];
+        bytes.extend_from_slice(&(outliers.len() as u32).to_le_bytes());
+        for &(idx, v) in &outliers {
+            bytes.extend_from_slice(&idx.to_le_bytes());
+            bytes.extend_from_slice(&f32_to_f16(v).to_le_bytes());
+        }
+
+        let mut refw = vec![0f32; rows * cols];
+        dequant_q1t(&bytes, &mut refw);
+        let x: Vec<f32> = (0..cols).map(|j| (j as f32 * 0.13).sin()).collect();
+        let mut expect = vec![0f32; rows];
+        for r in 0..rows {
+            let mut a = 0.0f32;
+            for j in 0..cols {
+                a += refw[r * cols + j] * x[j];
+            }
+            expect[r] = a;
+        }
+        let mut got = vec![0f32; rows];
+        q1t_matvec(&bytes, &x, rows, cols, &mut got, None);
+        for r in 0..rows {
+            assert!((got[r] - expect[r]).abs() < 1e-4, "row {r}: {} vs {}", got[r], expect[r]);
+        }
+        // matmat (b=2) must agree too.
+        let x2: Vec<f32> = x.iter().chain(x.iter().map(|v| v)).copied().collect();
+        let mut gm = vec![0f32; 2 * rows];
+        q1t_matmat(&bytes, &x2, 2, rows, cols, &mut gm, None);
+        for r in 0..rows {
+            assert!((gm[r] - expect[r]).abs() < 1e-4);
+            assert!((gm[rows + r] - expect[r]).abs() < 1e-4);
         }
     }
 }

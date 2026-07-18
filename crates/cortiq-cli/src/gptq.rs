@@ -122,9 +122,16 @@ pub fn run_quantize_gptq(
     let mut eligible: Vec<usize> = Vec::new();
     let mut n_copy = 0usize;
     for (slot, entry) in model.tensors.iter().enumerate() {
+        // Embedding and LM head are the most bit-sensitive tensors (a
+        // vocab-wide projection) — keep them at the input precision, as
+        // SpQR/AWQ do. `CMF_GPTQ_QUANT_HEAD=1` overrides for ablation.
+        let is_head = entry.name.contains("embed_tokens") || entry.name.contains("lm_head");
+        let keep_head_precise =
+            is_head && std::env::var("CMF_GPTQ_QUANT_HEAD").map(|v| v != "1").unwrap_or(true);
         let ok = entry.shape.len() == 2
             && entry.shape[1] % GROUP_SIZE == 0
             && entry.shape[1] <= max_col
+            && !keep_head_precise
             && hess
                 .get(&entry.name)
                 .map(|h| h.count > 0 && h.cols == entry.shape[1])
