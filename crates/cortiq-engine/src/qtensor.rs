@@ -1426,7 +1426,10 @@ fn qmatmat(
     if avx2_a8w8_enabled() {
         let acts: Vec<SplitAct> = pre.iter().map(|x| split_act(x)).collect();
         let out_addr = SendMut(out.as_mut_ptr());
-        if !avx512vnni_enabled() {
+        // CMF_X86_BLOCKED=0 forces the per-row path (paired in-process
+        // A/B on noisy shared-vCPU hosts).
+        let blocked_ok = std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true);
+        if !avx512vnni_enabled() && blocked_ok {
             let run = |start: usize, end: usize| {
                 let mut o = start;
                 while o < end {
