@@ -1411,7 +1411,9 @@ pub(crate) fn sgemm_rm(
     debug_assert!(c.len() >= (m - 1) * ldc + n);
     // Test hook: route the attention GEMMs through the portable NEON
     // micro-kernel ON APPLE SILICON — how the mobile batched attend is
-    // measured without a phone in the loop.
+    // measured without a phone in the loop. (Intel macOS has no NEON —
+    // the hook is a no-op there, Accelerate continues below.)
+    #[cfg(target_arch = "aarch64")]
     if std::env::var("CMF_FORCE_NEON_GEMM").map(|v| v == "1").unwrap_or(false) {
         return neon_gemm_rm(m, n, k, alpha, a, lda, b_mat, ldb, b_rows_are_n, c, ldc);
     }
