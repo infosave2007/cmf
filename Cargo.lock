@@ -482,6 +482,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortiq-ffi"
+version = "0.3.9"
+dependencies = [
+ "cortiq-core",
+ "cortiq-engine",
+]
+
+[[package]]
 name = "cortiq-server"
 version = "0.3.9"
 dependencies = [

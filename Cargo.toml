@@ -4,6 +4,7 @@ members = [
     "crates/cortiq-engine",
     "crates/cortiq-server",
     "crates/cortiq-cli",
+    "crates/cortiq-ffi",
 ]
 resolver = "2"
 

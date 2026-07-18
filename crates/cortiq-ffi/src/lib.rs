@@ -1,0 +1,222 @@
+//! C ABI over the CMF runtime — the embedding surface for mobile apps
+//! (Android JNI / iOS / desktop FFI). Design rules:
+//! - opaque handle, every call goes through a Mutex (the engine is
+//!   single-stream; callers may invoke from any thread, one at a time);
+//! - no panics across the boundary (catch_unwind on every entry);
+//! - errors are a thread-local UTF-8 string behind `cortiq_last_error`;
+//! - streaming via a C callback returning `true` to continue — early
+//!   stop is first-class, matching the engine's own TokenCallback.
+
+use std::ffi::{c_char, c_void, CStr, CString};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Arc, Mutex};
+
+use cortiq_core::CmfModel;
+use cortiq_engine::{Pipeline, SamplerConfig};
+
+struct Ctx {
+    pipeline: Mutex<Pipeline>,
+}
+
+thread_local! {
+    static LAST_ERROR: std::cell::RefCell<CString> =
+        std::cell::RefCell::new(CString::new("").unwrap());
+}
+
+fn set_error(msg: &str) {
+    let clean = msg.replace('\0', " ");
+    LAST_ERROR.with(|e| *e.borrow_mut() = CString::new(clean).unwrap());
+}
+
+/// UTF-8 description of the most recent failure ON THIS THREAD.
+/// Valid until the next failing call from the same thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_last_error() -> *const c_char {
+    LAST_ERROR.with(|e| e.borrow().as_ptr())
+}
+
+/// Engine version as a static UTF-8 string.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_version() -> *const c_char {
+    static V: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
+    V.as_ptr() as *const c_char
+}
+
+/// Open a `.cmf` file and build the pipeline. Returns an opaque handle,
+/// or NULL (see `cortiq_last_error`). The file is memory-mapped: keep it
+/// on storage for the handle's lifetime.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_load(path: *const c_char) -> *mut c_void {
+    let result = catch_unwind(|| {
+        if path.is_null() {
+            set_error("path is NULL");
+            return std::ptr::null_mut();
+        }
+        let path = match unsafe { CStr::from_ptr(path) }.to_str() {
+            Ok(p) => p,
+            Err(_) => {
+                set_error("path is not valid UTF-8");
+                return std::ptr::null_mut();
+            }
+        };
+        let model = match CmfModel::open_sharded(path) {
+            Ok(m) => Arc::new(m),
+            Err(e) => {
+                set_error(&format!("open: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
+        let pipeline = match Pipeline::from_model(&model, SamplerConfig::default()) {
+            Ok(p) => p,
+            Err(e) => {
+                set_error(&format!("pipeline: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
+        Box::into_raw(Box::new(Ctx { pipeline: Mutex::new(pipeline) })) as *mut c_void
+    });
+    result.unwrap_or_else(|_| {
+        set_error("panic during load");
+        std::ptr::null_mut()
+    })
+}
+
+/// Release the handle. NULL is a no-op. Do not use the handle afterwards.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_free(handle: *mut c_void) {
+    if handle.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        drop(unsafe { Box::from_raw(handle as *mut Ctx) });
+    }));
+}
+
+/// Streaming token callback: `token` is a NUL-terminated UTF-8 piece
+/// (valid only during the call); return `true` to continue generating.
+pub type CortiqTokenCb =
+    Option<extern "C" fn(token: *const c_char, user: *mut c_void) -> bool>;
+
+fn run_generate(
+    handle: *mut c_void,
+    prompt: *const c_char,
+    max_tokens: u32,
+    chat: bool,
+    cb: CortiqTokenCb,
+    user: *mut c_void,
+) -> i32 {
+    if handle.is_null() {
+        set_error("handle is NULL");
+        return -1;
+    }
+    if prompt.is_null() {
+        set_error("prompt is NULL");
+        return -1;
+    }
+    let prompt = match unsafe { CStr::from_ptr(prompt) }.to_str() {
+        Ok(p) => p.to_string(),
+        Err(_) => {
+            set_error("prompt is not valid UTF-8");
+            return -1;
+        }
+    };
+    let ctx = unsafe { &*(handle as *const Ctx) };
+    let mut pipeline = match ctx.pipeline.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_error("pipeline mutex poisoned");
+            return -1;
+        }
+    };
+    // The raw pointer travels into the engine callback; the callback
+    // contract (called synchronously on this thread) makes that sound.
+    struct UserPtr(*mut c_void);
+    unsafe impl Send for UserPtr {}
+    impl UserPtr {
+        // Accessor keeps the closure capturing &UserPtr — 2021 disjoint
+        // capture would otherwise grab the raw pointer field itself.
+        fn get(&self) -> *mut c_void {
+            self.0
+        }
+    }
+    let user = UserPtr(user);
+    let on_token: Option<cortiq_engine::TokenCallback> = cb.map(|f| {
+        Box::new(move |piece: &str| -> bool {
+            match CString::new(piece.replace('\0', " ")) {
+                Ok(c) => f(c.as_ptr(), user.get()),
+                Err(_) => true,
+            }
+        }) as cortiq_engine::TokenCallback
+    });
+    let ids = if chat {
+        let history = vec![("user".to_string(), prompt.clone())];
+        pipeline.tokenizer.apply_chat_template_opts(&history, None)
+    } else {
+        pipeline.tokenizer.with_bos(pipeline.tokenizer.encode(&prompt))
+    };
+    match pipeline.generate_from_ids(&ids, max_tokens as usize, None, on_token) {
+        Ok(res) => res.tokens_generated as i32,
+        Err(e) => {
+            set_error(&format!("generate: {e}"));
+            -1
+        }
+    }
+}
+
+/// One chat turn: the file's own chat template wraps the prompt (models
+/// without a template fall back to plain completion). Tokens stream
+/// through `cb`; returns the generated-token count, or −1
+/// (`cortiq_last_error`).
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_chat(
+    handle: *mut c_void,
+    prompt: *const c_char,
+    max_tokens: u32,
+    cb: CortiqTokenCb,
+    user: *mut c_void,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| run_generate(handle, prompt, max_tokens, true, cb, user)))
+        .unwrap_or_else(|_| {
+            set_error("panic during generate");
+            -1
+        })
+}
+
+/// Raw completion: the prompt goes to the model verbatim (plus the
+/// tokenizer's BOS contract). Same streaming/return contract as
+/// `cortiq_chat`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_complete(
+    handle: *mut c_void,
+    prompt: *const c_char,
+    max_tokens: u32,
+    cb: CortiqTokenCb,
+    user: *mut c_void,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| run_generate(handle, prompt, max_tokens, false, cb, user)))
+        .unwrap_or_else(|_| {
+            set_error("panic during generate");
+            -1
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ABI functions are plain Rust calls in-crate: exercise the
+    /// error paths without a model file.
+    #[test]
+    fn null_arguments_error_cleanly() {
+        assert!(cortiq_load(std::ptr::null()).is_null());
+        let err = unsafe { CStr::from_ptr(cortiq_last_error()) };
+        assert!(!err.to_bytes().is_empty());
+        assert_eq!(
+            cortiq_chat(std::ptr::null_mut(), std::ptr::null(), 8, None, std::ptr::null_mut()),
+            -1
+        );
+        cortiq_free(std::ptr::null_mut());
+        let v = unsafe { CStr::from_ptr(cortiq_version()) };
+        assert!(v.to_str().unwrap().starts_with("0."));
+    }
+}
