@@ -2,13 +2,16 @@
 //! the per-row path — same tensor, same activations, alternating env
 //! toggle, min-of timing (shared-vCPU hosts jitter ±60% across
 //! processes; a paired micro inside one process still ranks the two).
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 use cortiq_core::quant::f32_to_f16;
 use cortiq_core::*;
 
 #[test]
 fn blocked_vs_per_row() {
+    // On Apple silicon the AMX/Accelerate GEMM would intercept this
+    // shape — force the portable SDOT batch path (the mobile prefill).
+    unsafe { std::env::set_var("CMF_ACCEL", "0") };
     let (rows, cols, b) = (4864usize, 896usize, 256usize);
     let mut payload = vec![0u8; rows * cols + rows * 2];
     for (i, byte) in payload[..rows * cols].iter_mut().enumerate() {
@@ -95,6 +98,7 @@ fn blocked_vs_per_row() {
 /// SIMD: the sign bits expand to a byte mask once per group and serve
 /// four activation streams; per-row scalar was bit-by-bit).
 #[test]
+#[cfg(target_arch = "x86_64")]
 fn q1_blocked_vs_per_row() {
     let (rows, cols, b) = (4864usize, 896usize, 256usize);
     let gpr = cols / 32;
@@ -180,6 +184,7 @@ fn q1_blocked_vs_per_row() {
 /// unpacked once already; blocking removes the per-activation reload
 /// and reduce rounds.
 #[test]
+#[cfg(target_arch = "x86_64")]
 fn q4b_blocked_vs_per_row() {
     let (rows, cols, b) = (4864usize, 896usize, 256usize);
     let gpr = cols / 32;
@@ -264,6 +269,7 @@ fn q4b_blocked_vs_per_row() {
 /// Same paired A/B for the q4_tiled leg (unpack reuse across four
 /// activation streams).
 #[test]
+#[cfg(target_arch = "x86_64")]
 fn q4t_blocked_vs_per_row() {
     let (rows, cols, b) = (4864usize, 896usize, 256usize);
     let gpr = cols / 32;

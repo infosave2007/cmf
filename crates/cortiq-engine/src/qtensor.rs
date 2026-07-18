@@ -1406,6 +1406,62 @@ fn qmatmat(
     if sdot_enabled() {
         let acts: Vec<SplitAct> = pre.iter().map(|x| split_act(x)).collect();
         let out_addr = SendMut(out.as_mut_ptr());
+        // Blocked 2×4 (mobile prefill: no AMX to fall back on — this
+        // path IS the ARM prefill GEMM off Apple silicon).
+        let blocked_ok =
+            std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true);
+        if blocked_ok {
+            let run = |start: usize, end: usize| {
+                let mut o = start;
+                while o < end {
+                    if o + 2 <= end {
+                        let r0 = &q[o * cols..(o + 1) * cols];
+                        let r1 = &q[(o + 1) * cols..(o + 2) * cols];
+                        let mut bi = 0usize;
+                        while bi + 4 <= acts.len() {
+                            let xs = [
+                                acts[bi].xq.as_slice(),
+                                acts[bi + 1].xq.as_slice(),
+                                acts[bi + 2].xq.as_slice(),
+                                acts[bi + 3].xq.as_slice(),
+                            ];
+                            let d = unsafe { dot_i8_sdot_2x4(r0, r1, xs) };
+                            for (r, row) in [r0, r1].into_iter().enumerate() {
+                                for k in 0..4 {
+                                    let act = &acts[bi + k];
+                                    let mut v = d[r][k] as f32 * act.sx;
+                                    for &(j, xv) in &act.outliers {
+                                        v += (row[j] as i8) as f32 * xv;
+                                    }
+                                    unsafe {
+                                        *out_addr.at((bi + k) * rows + o + r) =
+                                            v * row_scale[o + r]
+                                    };
+                                }
+                            }
+                            bi += 4;
+                        }
+                        while bi < acts.len() {
+                            for (r, row) in [r0, r1].into_iter().enumerate() {
+                                let v = row_dot_sdot(row, &acts[bi]) * row_scale[o + r];
+                                unsafe { *out_addr.at(bi * rows + o + r) = v };
+                            }
+                            bi += 1;
+                        }
+                        o += 2;
+                    } else {
+                        let row = &q[o * cols..(o + 1) * cols];
+                        for (bi, act) in acts.iter().enumerate() {
+                            let v = row_dot_sdot(row, act) * row_scale[o];
+                            unsafe { *out_addr.at(bi * rows + o) = v };
+                        }
+                        o += 1;
+                    }
+                }
+            };
+            dispatch_rows(pool, rows, &run);
+            return;
+        }
         let run = |start: usize, end: usize| {
             for o in start..end {
                 let row = &q[o * cols..(o + 1) * cols];
@@ -3803,6 +3859,57 @@ unsafe fn dot_i8_i8_avx2(w: &[u8], xq: &[i8]) -> i32 {
             j += 1;
         }
         s
+    }
+}
+
+/// ARM twin of the x86 blocked prefill GEMM: two weight rows stay in
+/// registers across four activation streams, eight sdot accumulators.
+/// (The per-row form re-read each W row once per activation.)
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn dot_i8_sdot_2x4(w0: &[u8], w1: &[u8], xs: [&[i8]; 4]) -> [[i32; 4]; 2] {
+    // SAFETY: callers uphold slice-length contracts.
+    unsafe {
+        use core::arch::aarch64::*;
+        use core::arch::asm;
+        let n = w0.len();
+        let w0p = w0.as_ptr() as *const i8;
+        let w1p = w1.as_ptr() as *const i8;
+        let mut acc = [[vdupq_n_s32(0); 4]; 2];
+        let mut i = 0usize;
+        while i + 16 <= n {
+            let wv0 = vld1q_s8(w0p.add(i));
+            let wv1 = vld1q_s8(w1p.add(i));
+            for (k, x) in xs.iter().enumerate() {
+                let xv = vld1q_s8(x.as_ptr().add(i));
+                let (mut a0, mut a1) = (acc[0][k], acc[1][k]);
+                asm!(
+                    "sdot {a0:v}.4s, {w0:v}.16b, {x:v}.16b",
+                    "sdot {a1:v}.4s, {w1:v}.16b, {x:v}.16b",
+                    a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                    w0 = in(vreg) wv0, w1 = in(vreg) wv1, x = in(vreg) xv,
+                    options(pure, nomem, nostack),
+                );
+                acc[0][k] = a0;
+                acc[1][k] = a1;
+            }
+            i += 16;
+        }
+        let mut out = [[0i32; 4]; 2];
+        for r in 0..2 {
+            for k in 0..4 {
+                out[r][k] = vaddvq_s32(acc[r][k]);
+            }
+        }
+        if i < n {
+            for (k, x) in xs.iter().enumerate() {
+                for j in i..n {
+                    out[0][k] += (w0[j] as i8) as i32 * x[j] as i32;
+                    out[1][k] += (w1[j] as i8) as i32 * x[j] as i32;
+                }
+            }
+        }
+        out
     }
 }
 

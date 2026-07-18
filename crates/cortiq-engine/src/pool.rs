@@ -113,16 +113,48 @@ impl Pool {
         Self { inner, threads, joins }
     }
 
+    /// Big-core count on heterogeneous ARM (big.LITTLE): the kernel
+    /// exposes per-core capacity on Android and most ARM Linux; efficiency
+    /// cores in the pool DRAG the big ones on our row-parallel jobs (the
+    /// same cliff llama.cpp hits at -t 10 on an M4: 163 → 112 tok/s).
+    /// None = capacities absent or homogeneous.
+    #[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "android")))]
+    fn big_cores() -> Option<usize> {
+        let mut caps: Vec<u64> = Vec::new();
+        for cpu in 0.. {
+            let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity");
+            match std::fs::read_to_string(&path) {
+                Ok(v) => caps.push(v.trim().parse().ok()?),
+                Err(_) => break,
+            }
+        }
+        let max = *caps.iter().max()?;
+        let min = *caps.iter().min()?;
+        if caps.len() < 2 || max == min {
+            return None;
+        }
+        Some(caps.iter().filter(|&&c| c == max).count())
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", any(target_os = "linux", target_os = "android"))))]
+    fn big_cores() -> Option<usize> {
+        None
+    }
+
     /// Pool sized from `CMF_THREADS` (see module docs). `None` = serial.
+    /// Without the env, heterogeneous ARM defaults to its BIG cores.
     pub fn from_env() -> Option<Arc<Self>> {
         let n = match std::env::var("CMF_THREADS") {
             Ok(v) => v.parse::<usize>().unwrap_or(0),
-            Err(_) => {
-                let avail = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1);
-                avail.saturating_sub(1).min(8)
-            }
+            Err(_) => match Self::big_cores() {
+                Some(big) => big,
+                None => {
+                    let avail = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1);
+                    avail.saturating_sub(1).min(8)
+                }
+            },
         };
         if n <= 1 {
             None
