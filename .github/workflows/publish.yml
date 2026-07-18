@@ -21,7 +21,7 @@ jobs:
       - name: Publish (core → engine → server → cli)
         run: |
           set -e
-          for c in cortiq-core cortiq-engine cortiq-server cortiq-cli; do
+          for c in cortiq-core cortiq-engine cortiq-server cortiq-cli cortiq-ffi; do
             echo "── publishing $c ──"
             if cargo publish -p "$c" 2>err.log; then
               echo "$c published"
