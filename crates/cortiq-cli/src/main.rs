@@ -2,6 +2,7 @@
 
 mod convert;
 mod gguf;
+mod gptq;
 mod npy;
 mod skill;
 
@@ -290,6 +291,33 @@ enum Commands {
         /// Hugging Face token for gated/private GGUF repos
         #[arg(long)]
         hf_token: Option<String>,
+    },
+    /// 1-bit PTQ via the holographic transfer (GPTQ). Calibrates each
+    /// linear's input Hessian on a corpus, then quantizes it to `q1s`:
+    /// binarize with the rounding error folded into the kept weights
+    /// through H⁻¹ (`Σ_PS·Σ_SS⁻¹`) so the layer OUTPUT survives, plus a
+    /// two-field `|W|·RMS(x)` outlier mask. Norms/embeddings/lm_head (no
+    /// captured Hessian) are copied verbatim. Pair with `skill bake` (FCD)
+    /// on the tail layers to recover the last of the quality.
+    QuantizeGptq {
+        /// Input .cmf (f16 or q8 — higher precision ⇒ a better fold)
+        input: String,
+        /// Calibration corpus: a `.txt`, or a `.json` array of
+        /// `[prompt, text]` pairs (the DTG-MA cache) whose texts concatenate
+        #[arg(long)]
+        calib: String,
+        /// Output .cmf path
+        #[arg(long)]
+        output: String,
+        /// Outlier budget kept at f16 by the two-field mask (fraction)
+        #[arg(long, default_value = "0.01")]
+        keep: f32,
+        /// Calibration tokens folded into the Hessians
+        #[arg(long, default_value = "512")]
+        tokens: usize,
+        /// Relative Hessian damping λ (adds `λ·mean(diag)` to the diagonal)
+        #[arg(long, default_value = "0.01")]
+        lambda: f64,
     },
     /// Chat with a model (applies the file's chat template), or one-shot
     /// with --prompt
@@ -815,6 +843,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::ImportGguf { gguf, output, quant, hf_token } => {
             gguf::run_import_gguf(&gguf, &quant, &output, hf_token.as_deref(),
                                   progress_reporter("importing"))?;
+            println!("✓ wrote {output}");
+            Ok(())
+        }
+        Commands::QuantizeGptq { input, calib, output, keep, tokens, lambda } => {
+            gptq::run_quantize_gptq(&input, &calib, &output, keep, tokens, lambda)?;
             println!("✓ wrote {output}");
             Ok(())
         }

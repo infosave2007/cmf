@@ -216,6 +216,87 @@ pub fn dequant_q1(bytes: &[u8], dst: &mut [f32]) {
     }
 }
 
+/// Dequantize a full `q1s` tensor (1-bit + sparse outlier overlay): the
+/// leading `n_groups·6` bytes are a plain `q1` base, then `[u32 count]`
+/// and `count × [u32 flat-index][f16 value]` restore the salient weights
+/// the two-field mask kept at full precision (they overwrite the ±s base).
+pub fn dequant_q1s(bytes: &[u8], dst: &mut [f32]) {
+    let n_groups = (dst.len() + GROUP_SIZE - 1) / GROUP_SIZE;
+    let base_len = n_groups * Q1_TILE;
+    dequant_q1(&bytes[..base_len.min(bytes.len())], dst);
+    let mut off = base_len;
+    if off + 4 > bytes.len() {
+        return;
+    }
+    let count = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+        as usize;
+    off += 4;
+    for _ in 0..count {
+        if off + 6 > bytes.len() {
+            break;
+        }
+        let idx =
+            u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+                as usize;
+        let val = f16_to_f32(u16::from_le_bytes([bytes[off + 4], bytes[off + 5]]));
+        if idx < dst.len() {
+            dst[idx] = val;
+        }
+        off += 6;
+    }
+}
+
+/// Ternary tile: 2 (f16 scale) + 8 (2 bits × 32 weights) = 10 bytes.
+pub const Q1T_TILE: usize = 10;
+
+/// Dequantize a full `q1t` tensor (ternary + sparse outlier overlay): per
+/// 32-group `[f16 scale][8B codes]`, 2 bits per weight (code 0 → 0, 1 →
+/// +s, 2 → −s), then `[u32 count]` and `count × [u32 index][f16 value]`.
+pub fn dequant_q1t(bytes: &[u8], dst: &mut [f32]) {
+    let n_groups = (dst.len() + GROUP_SIZE - 1) / GROUP_SIZE;
+    let base_len = n_groups * Q1T_TILE;
+    for g in 0..n_groups {
+        let off = g * Q1T_TILE;
+        if off + Q1T_TILE > bytes.len() {
+            break;
+        }
+        let t = &bytes[off..off + Q1T_TILE];
+        let s = f16_to_f32(u16::from_le_bytes([t[0], t[1]]));
+        let base = g * GROUP_SIZE;
+        for k in 0..GROUP_SIZE {
+            let code = (t[2 + k / 4] >> ((k % 4) * 2)) & 0x3;
+            let i = base + k;
+            if i < dst.len() {
+                dst[i] = match code {
+                    1 => s,
+                    2 => -s,
+                    _ => 0.0,
+                };
+            }
+        }
+    }
+    let mut off = base_len;
+    if off + 4 > bytes.len() {
+        return;
+    }
+    let count = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+        as usize;
+    off += 4;
+    for _ in 0..count {
+        if off + 6 > bytes.len() {
+            break;
+        }
+        let idx =
+            u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+                as usize;
+        let val = f16_to_f32(u16::from_le_bytes([bytes[off + 4], bytes[off + 5]]));
+        if idx < dst.len() {
+            dst[idx] = val;
+        }
+        off += 6;
+    }
+}
+
 /// Dequantize a full `q4_tiled` tensor: per 32-group
 /// `[f16 scale][16B nibbles]`, nibbles low-first inside each byte —
 /// the same values/order as `q4_block`, only the placement of the
@@ -472,6 +553,8 @@ pub fn dequant_tensor(entry: &TensorEntry, bytes: &[u8], dst: &mut [f32]) -> Res
         TensorDtype::Q4Block => dequant_q4_block(bytes, dst),
         TensorDtype::Q4Tiled => dequant_q4_tiled(bytes, dst),
         TensorDtype::Q1 => dequant_q1(bytes, dst),
+        TensorDtype::Q1S => dequant_q1s(bytes, dst),
+        TensorDtype::Q1T => dequant_q1t(bytes, dst),
         TensorDtype::Vbit => {
             if entry.shape.len() != 2 {
                 return Err(format!("vbit tensor '{}' must be 2-D", entry.name));
@@ -511,6 +594,10 @@ pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
         | TensorDtype::Q4Tiled => 0.5625,
         TensorDtype::Vbit | TensorDtype::VbitRo => 0.5,
         TensorDtype::Q1 => 0.1875, // 6 bytes per 32 weights
+        // q1 base + a small sparse f16 overlay (informational; the true
+        // size is the stored span, which grows with the outlier budget).
+        TensorDtype::Q1S => 0.3125,
+        TensorDtype::Q1T => 0.3125, // 10 bytes per 32 weights (base)
         TensorDtype::U8 => 1.0,
     }
 }

@@ -136,6 +136,18 @@ pub(crate) enum Quant {
     /// two levels ±s and the encoding is (near-)lossless. As PTQ of a
     /// normal checkpoint this destroys quality — never a default.
     Q1,
+    /// 1-bit PTQ of a NORMAL checkpoint via error diffusion (перетекание):
+    /// same on-disk `Q1` tile, but the encoder carries each weight's sign
+    /// residual forward so the row sum survives binarization. Training-free;
+    /// pair with `cortiq skill bake` (FCD) on the tail layers to recover
+    /// quality. Bit-identical to `q1` on a genuinely 1-bit model.
+    Q1p,
+    /// 1-bit PTQ with an outlier mask (`Q1S` dtype): keeps the heavy tail
+    /// (`CMF_Q1S_KEEP` of weights by |value|, default 1%) at full f16 in a
+    /// sparse overlay, binarizes the rest with error diffusion. The mask
+    /// lever of the holographic-transfer path — what lets a NORMAL
+    /// checkpoint survive 1-bit.
+    Q1s,
 }
 
 /// Quantize a 2-D matrix `[out_dim, in_dim]` per the chosen scheme.
@@ -159,6 +171,14 @@ pub(crate) fn quantize_2d(quant: Quant, vals: &[f32], out_dim: usize, in_dim: us
             (TensorDtype::Q1, encode_q1(vals, out_dim, in_dim))
         }
         Quant::Q1 => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
+        Quant::Q1p if in_dim % GROUP_SIZE == 0 => {
+            (TensorDtype::Q1, encode_q1_ef(vals, out_dim, in_dim))
+        }
+        Quant::Q1p => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
+        Quant::Q1s if in_dim % GROUP_SIZE == 0 => {
+            (TensorDtype::Q1S, encode_q1s(vals, out_dim, in_dim, q1s_keep_frac()))
+        }
+        Quant::Q1s => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
     }
 }
 
@@ -171,9 +191,11 @@ pub(crate) fn parse_quant(s: &str) -> anyhow::Result<Quant> {
         "vbit" | "v_bit" => Quant::Vbit,
         "q4t" | "q4_tiled" => Quant::Q4Tiled,
         "q1" => Quant::Q1,
+        "q1p" | "q1_ptq" => Quant::Q1p,
+        "q1s" | "q1_mask" => Quant::Q1s,
         other => anyhow::bail!(
-            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, f16, vbit, or q1 — \
-             q1 is for 1-bit-trained models only)"
+            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, f16, vbit, q1, q1p, or q1s — \
+             q1 = 1-bit-trained, q1p = error-diffusion 1-bit PTQ, q1s = q1p + outlier mask)"
         ),
     })
 }
@@ -263,6 +285,140 @@ fn encode_q1(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
                 }
             }
             out.push(byte);
+        }
+    }
+    out
+}
+
+/// Error-diffusion ("перетекание") q1 encoder — the training-free PTQ path
+/// for a NON-1-bit-trained model. Naïve q1 throws away every weight's
+/// magnitude, keeping only its sign against a shared group scale; for a
+/// normal checkpoint that is catastrophic. Here the per-weight rounding
+/// residual `w − ŵ` is carried FORWARD along the row's input dimension and
+/// folded into the next sign decision (`sign(w + carry)`), so the row's
+/// running sum — hence its contribution to the dot product for the
+/// slowly-varying part of the activation — is preserved rather than
+/// discarded. Same on-disk `Q1` tile as `encode_q1` (reuses the kernel and
+/// GPU path unchanged), and bit-identical to it on a genuinely 1-bit model
+/// (near-constant |w| per group ⇒ `carry ≈ 0` ⇒ the sign never flips).
+/// The carry resets at each row start (each output is an independent sum).
+fn encode_q1_ef(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
+    debug_assert_eq!(vals.len(), out_dim * in_dim);
+    debug_assert_eq!(in_dim % GROUP_SIZE, 0);
+    let groups_per_row = in_dim / GROUP_SIZE;
+    let n_groups = vals.len() / GROUP_SIZE;
+    let mut out = Vec::with_capacity(n_groups * 6);
+    let mut carry = 0.0f32;
+    for g in 0..n_groups {
+        if g % groups_per_row == 0 {
+            carry = 0.0; // new output row: its dot product starts fresh
+        }
+        let grp = &vals[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+        let mean_abs = grp.iter().map(|v| v.abs()).sum::<f32>() / GROUP_SIZE as f32;
+        let s = f16_scale(mean_abs);
+        out.extend_from_slice(&f32_to_f16(s).to_le_bytes());
+        for j in 0..GROUP_SIZE / 8 {
+            let mut byte = 0u8;
+            for k in 0..8 {
+                let w = grp[j * 8 + k];
+                let v = w + carry;
+                let bit = v >= 0.0;
+                if bit {
+                    byte |= 1 << k;
+                }
+                carry = v - if bit { s } else { -s };
+            }
+            out.push(byte);
+        }
+    }
+    out
+}
+
+/// Fraction of weights the `q1s` mask keeps at full precision (the outlier
+/// budget). `CMF_Q1S_KEEP` overrides; default 1%. Clamped to [0, 25%].
+fn q1s_keep_frac() -> f32 {
+    std::env::var("CMF_Q1S_KEEP")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(0.01)
+        .clamp(0.0, 0.25)
+}
+
+/// 1-bit PTQ with an outlier mask (Stage 2a of the holographic-transfer
+/// path). Keeps the top `keep_frac` of weights by |value| — the heavy tail
+/// a normal checkpoint carries — at full f16 precision in a sparse overlay,
+/// and binarizes the rest with the error-diffusion base, EXCLUDING the
+/// outliers from each group's shared ±s scale (an outlier must not inflate
+/// the level the bulk is quantized against). This is the |W| field of the
+/// two-field mask; the activation field (`|W|·RMS(x)`) and the covariance
+/// fold `Σ_PS·Σ_SS⁻¹` come from the calibration path on top of this.
+fn encode_q1s(vals: &[f32], out_dim: usize, in_dim: usize, keep_frac: f32) -> Vec<u8> {
+    debug_assert_eq!(vals.len(), out_dim * in_dim);
+    debug_assert_eq!(in_dim % GROUP_SIZE, 0);
+    let n = vals.len();
+    let n_out = (((n as f32) * keep_frac).round() as usize).min(n);
+    // Outlier threshold via nth_element (O(n)): the (n − n_out)-th smallest
+    // |w| — weights at or above it are the kept heavy tail.
+    let threshold = if n_out == 0 {
+        f32::INFINITY
+    } else {
+        let mut absv: Vec<f32> = vals.iter().map(|v| v.abs()).collect();
+        let k = n - n_out;
+        absv.select_nth_unstable_by(k, |a, b| a.partial_cmp(b).unwrap());
+        absv[k]
+    };
+    let is_out: Vec<bool> =
+        (0..n).map(|i| n_out > 0 && vals[i].abs() >= threshold).collect();
+
+    let groups_per_row = in_dim / GROUP_SIZE;
+    let n_groups = n / GROUP_SIZE;
+    let n_out_actual = is_out.iter().filter(|&&o| o).count();
+    let mut out = Vec::with_capacity(n_groups * 6 + 4 + n_out_actual * 6);
+    let mut carry = 0.0f32;
+    for g in 0..n_groups {
+        if g % groups_per_row == 0 {
+            carry = 0.0;
+        }
+        let base = g * GROUP_SIZE;
+        // Scale = mean |w| over the NON-outlier weights of the group.
+        let mut sum = 0.0f32;
+        let mut cnt = 0usize;
+        for j in 0..GROUP_SIZE {
+            if !is_out[base + j] {
+                sum += vals[base + j].abs();
+                cnt += 1;
+            }
+        }
+        let s = f16_scale(if cnt > 0 { sum / cnt as f32 } else { 0.0 });
+        out.extend_from_slice(&f32_to_f16(s).to_le_bytes());
+        for jb in 0..GROUP_SIZE / 8 {
+            let mut byte = 0u8;
+            for k in 0..8 {
+                let i = base + jb * 8 + k;
+                if is_out[i] {
+                    // Outlier: bit is only a sign hint (the overlay restores
+                    // the exact value); it carries no error forward.
+                    if vals[i] >= 0.0 {
+                        byte |= 1 << k;
+                    }
+                } else {
+                    let v = vals[i] + carry;
+                    let bit = v >= 0.0;
+                    if bit {
+                        byte |= 1 << k;
+                    }
+                    carry = v - if bit { s } else { -s };
+                }
+            }
+            out.push(byte);
+        }
+    }
+    // Sparse outlier section: [u32 count][count × (u32 index, f16 value)].
+    out.extend_from_slice(&(n_out_actual as u32).to_le_bytes());
+    for (i, &o) in is_out.iter().enumerate() {
+        if o {
+            out.extend_from_slice(&(i as u32).to_le_bytes());
+            out.extend_from_slice(&f32_to_f16(vals[i]).to_le_bytes());
         }
     }
     out
@@ -1528,7 +1684,7 @@ pub fn run_convert(
         Quant::Q4Tiled => QuantType::Q4Block,
         // File-level label only (per-tensor truth is in the directory);
         // Vbit is the closest existing informational bucket for q1.
-        Quant::Q1 => QuantType::Vbit,
+        Quant::Q1 | Quant::Q1p | Quant::Q1s => QuantType::Vbit,
     };
     let provenance = match &defrag_plan {
         Some(plan) => {
@@ -1784,6 +1940,52 @@ mod tests {
         assert!(moe.norm_topk_prob);
         // Scale 1.0 stores as None (no-op).
         assert_eq!(moe.routed_scaling_factor, None);
+    }
+
+    /// The safety invariant that lets `q1p` be an unconditional replacement
+    /// for `q1` on models that ARE 1-bit-trained: when every group weight
+    /// already sits on ±s, the carry stays zero and no sign flips, so the
+    /// encoder is bit-identical to the plain sign quantizer. (For a NORMAL
+    /// checkpoint the two differ — that difference is the training-free PTQ,
+    /// judged by end-to-end PPL, not by any single closed-form proxy.)
+    #[test]
+    fn q1_ef_bit_identical_on_a_1bit_tensor() {
+        let (rows, cols) = (4usize, 96usize);
+        let onebit: Vec<f32> = (0..rows * cols)
+            .map(|i| if (i * 7 + 3) % 5 < 2 { 0.25 } else { -0.25 })
+            .collect();
+        assert_eq!(
+            encode_q1(&onebit, rows, cols),
+            encode_q1_ef(&onebit, rows, cols),
+            "error diffusion must be a no-op on a genuinely 1-bit tensor"
+        );
+    }
+
+    /// Q1S roundtrip: kept outliers come back at f16 precision and the bulk
+    /// decodes to the per-group ±s level. Guards the format the holographic
+    /// fold will populate.
+    #[test]
+    fn q1s_roundtrip_restores_outliers_and_binarizes_the_rest() {
+        use cortiq_core::quant::dequant_q1s;
+        let (rows, cols) = (2usize, 64usize);
+        let mut vals: Vec<f32> =
+            (0..rows * cols).map(|i| (i as f32 * 0.017).sin() * 0.1).collect();
+        let spikes = [5usize, 40, 70, 120];
+        for &i in &spikes {
+            vals[i] = if i % 2 == 0 { 3.0 } else { -3.0 };
+        }
+        let keep = spikes.len() as f32 / (rows * cols) as f32;
+        let bytes = encode_q1s(&vals, rows, cols, keep);
+        let mut dec = vec![0f32; rows * cols];
+        dequant_q1s(&bytes, &mut dec);
+        for &i in &spikes {
+            assert!((dec[i] - vals[i]).abs() < 0.02, "outlier {i}: {} vs {}", dec[i], vals[i]);
+        }
+        for i in 0..rows * cols {
+            if !spikes.contains(&i) {
+                assert!(dec[i].abs() < 2.0, "bulk {i} should be a small ±s, got {}", dec[i]);
+            }
+        }
     }
 
     #[test]

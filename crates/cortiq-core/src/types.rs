@@ -41,6 +41,21 @@ pub enum TensorDtype {
     /// j·8+k of the group; value = scale · (2·bit − 1) ∈ {−s, +s}.
     /// 2-D tensors with cols % 32 == 0 only.
     Q1 = 12,
+    /// 1-bit PTQ with a sparse high-precision outlier overlay (holographic
+    /// transfer / SpQR-style): a `Q1` base (per 32-group `[f16 scale][4B
+    /// bits]`, outliers excluded from the scale) followed by
+    /// `[u32 count]` then `count × [u32 flat-index][f16 value]` — the
+    /// salient weights the two-field mask kept at full precision, restored
+    /// verbatim at dequant. Variable length (the count self-describes), so
+    /// `expected_nbytes` returns None and the reader trusts the stored
+    /// span. Lets a NORMAL checkpoint survive 1-bit where plain `q1` cannot.
+    Q1S = 13,
+    /// Ternary (BitNet b1.58-style) `{−s, 0, +s}` with a sparse outlier
+    /// overlay. Per 32-group `[f16 scale][8B : 2 bits/weight]` (code 0 → 0,
+    /// 1 → +s, 2 → −s; ~2.5 bpw) then the same `[u32 count][count × (u32
+    /// index, f16 value)]` overlay as `Q1S`. Capturing the many near-zero
+    /// weights exactly is the decisive PTQ win over binary. Variable length.
+    Q1T = 14,
 }
 
 impl TensorDtype {
@@ -59,6 +74,8 @@ impl TensorDtype {
             10 => Self::VbitRo,
             11 => Self::Q4Tiled,
             12 => Self::Q1,
+            13 => Self::Q1S,
+            14 => Self::Q1T,
             _ => return None,
         })
     }
@@ -82,6 +99,8 @@ impl TensorDtype {
             Self::VbitRo => "vbit_ro",
             Self::Q4Tiled => "q4_tiled",
             Self::Q1 => "q1",
+            Self::Q1S => "q1s",
+            Self::Q1T => "q1t",
         }
     }
 
@@ -101,6 +120,8 @@ impl TensorDtype {
                 | Self::VbitRo
                 | Self::Q4Tiled
                 | Self::Q1
+                | Self::Q1S
+                | Self::Q1T
         )
     }
 }

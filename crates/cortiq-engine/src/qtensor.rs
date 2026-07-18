@@ -705,6 +705,14 @@ impl QTensor {
         let rows = self.rows();
         debug_assert_eq!(xs_all.len(), b * cols);
         debug_assert_eq!(out.len(), b * rows);
+        // GPTQ calibration: fold this layer's inputs into its Hessian. Only
+        // Mapped tensors carry a directory name; the check is a relaxed
+        // atomic load, free when not calibrating.
+        if crate::gptq_capture::capturing() {
+            if let Self::Mapped { model, idx, .. } = self {
+                crate::gptq_capture::accumulate(&model.tensors[*idx].name, xs_all, b, cols);
+            }
+        }
         match self {
             Self::F32 { data, .. } => {
                 let out_addr = SendMut(out.as_mut_ptr());
