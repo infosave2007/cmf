@@ -36,5 +36,33 @@ fn chat_through_the_abi() {
         CStr::from_ptr(cortiq_ffi::cortiq_last_error())
     });
     assert!(text.contains("Paris"), "unexpected answer: {text}");
+
+    // Options: greedy + fixed seed must be accepted and survive to the
+    // next generate; bad JSON must fail without touching the handle.
+    let opts = CString::new(r#"{"greedy": true, "seed": 7}"#).unwrap();
+    assert_eq!(cortiq_ffi::cortiq_set_options(h, opts.as_ptr()), 0);
+    let bad = CString::new("{nope").unwrap();
+    assert_eq!(cortiq_ffi::cortiq_set_options(h, bad.as_ptr()), -1);
+
+    // Multi-turn: the second user turn only makes sense if the template
+    // carried the first exchange.
+    let msgs = CString::new(
+        r#"[{"role": "user", "content": "My name is Oleg. Remember it."},
+            {"role": "assistant", "content": "Understood, Oleg!"},
+            {"role": "user", "content": "What is my name? Answer with just the name."}]"#,
+    )
+    .unwrap();
+    let mut text2 = String::new();
+    let n = cortiq_ffi::cortiq_chat_messages(
+        h,
+        msgs.as_ptr(),
+        16,
+        Some(collect),
+        &mut text2 as *mut String as *mut c_void,
+    );
+    assert!(n > 0, "multiturn failed: {:?}", unsafe {
+        CStr::from_ptr(cortiq_ffi::cortiq_last_error())
+    });
+    assert!(text2.contains("Oleg"), "history lost: {text2}");
     cortiq_ffi::cortiq_free(h);
 }

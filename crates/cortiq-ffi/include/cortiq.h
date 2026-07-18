@@ -43,6 +43,21 @@ int32_t cortiq_chat(void *handle, const char *prompt, uint32_t max_tokens,
 int32_t cortiq_complete(void *handle, const char *prompt,
                         uint32_t max_tokens, cortiq_token_cb cb, void *user);
 
+/* Multi-turn chat: messages_json is [{"role": "...", "content": "..."},
+ * ...] rendered through the file's own chat template (roles the
+ * template knows — typically system / user / assistant). Same
+ * streaming/return contract as cortiq_chat. */
+int32_t cortiq_chat_messages(void *handle, const char *messages_json,
+                             uint32_t max_tokens, cortiq_token_cb cb,
+                             void *user);
+
+/* Partial sampler options as JSON — absent keys keep their current
+ * values; applies to every later generate on this handle. Keys:
+ * temperature, top_p, top_k, repetition_penalty, min_p, seed,
+ * greedy (true = argmax). Defaults: 0.7 / 0.9 / 40 / 1.1 / 0.05 /
+ * random. Returns 0, or -1. */
+int32_t cortiq_set_options(void *handle, const char *options_json);
+
 #ifdef __cplusplus
 }
 #endif

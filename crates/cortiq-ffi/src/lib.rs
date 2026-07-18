@@ -97,6 +97,12 @@ pub extern "C" fn cortiq_free(handle: *mut c_void) {
 pub type CortiqTokenCb =
     Option<extern "C" fn(token: *const c_char, user: *mut c_void) -> bool>;
 
+enum GenInput {
+    Chat(String),
+    Raw(String),
+    History(Vec<(String, String)>),
+}
+
 fn run_generate(
     handle: *mut c_void,
     prompt: *const c_char,
@@ -120,6 +126,17 @@ fn run_generate(
             return -1;
         }
     };
+    let input = if chat { GenInput::Chat(prompt) } else { GenInput::Raw(prompt) };
+    run_generate_ids(handle, input, max_tokens, cb, user)
+}
+
+fn run_generate_ids(
+    handle: *mut c_void,
+    input: GenInput,
+    max_tokens: u32,
+    cb: CortiqTokenCb,
+    user: *mut c_void,
+) -> i32 {
     let ctx = unsafe { &*(handle as *const Ctx) };
     let mut pipeline = match ctx.pipeline.lock() {
         Ok(g) => g,
@@ -148,11 +165,17 @@ fn run_generate(
             }
         }) as cortiq_engine::TokenCallback
     });
-    let ids = if chat {
-        let history = vec![("user".to_string(), prompt.clone())];
-        pipeline.tokenizer.apply_chat_template_opts(&history, None)
-    } else {
-        pipeline.tokenizer.with_bos(pipeline.tokenizer.encode(&prompt))
+    let ids = match input {
+        GenInput::Chat(prompt) => {
+            let history = vec![("user".to_string(), prompt)];
+            pipeline.tokenizer.apply_chat_template_opts(&history, None)
+        }
+        GenInput::Raw(prompt) => {
+            pipeline.tokenizer.with_bos(pipeline.tokenizer.encode(&prompt))
+        }
+        GenInput::History(history) => {
+            pipeline.tokenizer.apply_chat_template_opts(&history, None)
+        }
     };
     match pipeline.generate_from_ids(&ids, max_tokens as usize, None, on_token) {
         Ok(res) => res.tokens_generated as i32,
@@ -161,6 +184,131 @@ fn run_generate(
             -1
         }
     }
+}
+
+/// Partial sampler options as JSON — absent fields keep their current
+/// values. Accepted keys: temperature, top_p, top_k,
+/// repetition_penalty, min_p, seed, greedy (true = argmax: temperature
+/// pinned to 0). Applies to every subsequent generate on this handle.
+/// Returns 0, or −1 (`cortiq_last_error`).
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_set_options(handle: *mut c_void, options_json: *const c_char) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() || options_json.is_null() {
+            set_error("handle or options is NULL");
+            return -1;
+        }
+        let json = match unsafe { CStr::from_ptr(options_json) }.to_str() {
+            Ok(j) => j,
+            Err(_) => {
+                set_error("options is not valid UTF-8");
+                return -1;
+            }
+        };
+        #[derive(serde::Deserialize)]
+        struct Opts {
+            temperature: Option<f32>,
+            top_p: Option<f32>,
+            top_k: Option<u32>,
+            repetition_penalty: Option<f32>,
+            min_p: Option<f32>,
+            seed: Option<u64>,
+            greedy: Option<bool>,
+        }
+        let opts: Opts = match serde_json::from_str(json) {
+            Ok(o) => o,
+            Err(e) => {
+                set_error(&format!("options: {e}"));
+                return -1;
+            }
+        };
+        let ctx = unsafe { &*(handle as *const Ctx) };
+        let mut pipeline = match ctx.pipeline.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                set_error("pipeline mutex poisoned");
+                return -1;
+            }
+        };
+        let sc = &mut pipeline.sampler_config;
+        if let Some(v) = opts.temperature {
+            sc.temperature = v;
+        }
+        if let Some(v) = opts.top_p {
+            sc.top_p = v;
+        }
+        if let Some(v) = opts.top_k {
+            sc.top_k = v;
+        }
+        if let Some(v) = opts.repetition_penalty {
+            sc.repetition_penalty = v;
+        }
+        if let Some(v) = opts.min_p {
+            sc.min_p = v;
+        }
+        if opts.seed.is_some() {
+            sc.seed = opts.seed;
+        }
+        if opts.greedy == Some(true) {
+            sc.temperature = 0.0;
+        }
+        0
+    }))
+    .unwrap_or_else(|_| {
+        set_error("panic during set_options");
+        -1
+    })
+}
+
+/// Multi-turn chat: `messages_json` is `[{"role": "...", "content":
+/// "..."}, ...]` rendered through the file's own chat template — the
+/// canonical way to carry a conversation (roles the template knows:
+/// typically system / user / assistant). Same streaming/return contract
+/// as `cortiq_chat`.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_chat_messages(
+    handle: *mut c_void,
+    messages_json: *const c_char,
+    max_tokens: u32,
+    cb: CortiqTokenCb,
+    user: *mut c_void,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() || messages_json.is_null() {
+            set_error("handle or messages is NULL");
+            return -1;
+        }
+        let json = match unsafe { CStr::from_ptr(messages_json) }.to_str() {
+            Ok(j) => j,
+            Err(_) => {
+                set_error("messages is not valid UTF-8");
+                return -1;
+            }
+        };
+        #[derive(serde::Deserialize)]
+        struct Msg {
+            role: String,
+            content: String,
+        }
+        let msgs: Vec<Msg> = match serde_json::from_str(json) {
+            Ok(m) => m,
+            Err(e) => {
+                set_error(&format!("messages: {e}"));
+                return -1;
+            }
+        };
+        if msgs.is_empty() {
+            set_error("messages is empty");
+            return -1;
+        }
+        let history: Vec<(String, String)> =
+            msgs.into_iter().map(|m| (m.role, m.content)).collect();
+        run_generate_ids(handle, GenInput::History(history), max_tokens, cb, user)
+    }))
+    .unwrap_or_else(|_| {
+        set_error("panic during generate");
+        -1
+    })
 }
 
 /// One chat turn: the file's own chat template wraps the prompt (models

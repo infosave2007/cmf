@@ -126,3 +126,63 @@ jobs:
           files: |
             cortiq-${{ matrix.target }}.zip
             cortiq-${{ matrix.target }}.zip.sha256
+
+  # FFI-only targets: no CLI is built for these — they exist so an app
+  # can drop the library straight into its bundle. Android ships .so per
+  # ABI (jniLibs/<abi>/), iOS ships the static .a (link it into the app
+  # binary; Dart reaches it via DynamicLibrary.process()). The arm64
+  # Android .so comes from the main matrix above.
+  ffi:
+    name: ffi ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 32-bit ARM phones. The NDK clang wrapper spells this target
+          # armv7a-…-eabi24 while rustc spells it armv7-…-eabi — the
+          # `clang` field carries the NDK spelling.
+          - os: ubuntu-latest
+            target: armv7-linux-androideabi
+            clang: armv7a-linux-androideabi24-clang
+            lib: libcortiq_ffi.so
+          # Android emulators on x86 hosts.
+          - os: ubuntu-latest
+            target: x86_64-linux-android
+            clang: x86_64-linux-android24-clang
+            lib: libcortiq_ffi.so
+          # iOS devices: static library, linked into the app binary.
+          - os: macos-latest
+            target: aarch64-apple-ios
+            lib: libcortiq_ffi.a
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Android NDK toolchain env
+        if: contains(matrix.target, 'android')
+        run: |
+          NDK="${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
+          TOOL="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          TRIPLE_ENV="$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')"
+          echo "CARGO_TARGET_${TRIPLE_ENV}_LINKER=$TOOL/${{ matrix.clang }}" >> "$GITHUB_ENV"
+          echo "CC_$(echo '${{ matrix.target }}' | tr '-' '_')=$TOOL/${{ matrix.clang }}" >> "$GITHUB_ENV"
+          echo "AR_$(echo '${{ matrix.target }}' | tr '-' '_')=$TOOL/llvm-ar" >> "$GITHUB_ENV"
+      - name: Build FFI library
+        run: cargo build --release -p cortiq-ffi --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          bindir="target/${{ matrix.target }}/release"
+          tar -C "$bindir" -czf "libcortiq-ffi-${{ matrix.target }}.tar.gz" ${{ matrix.lib }}
+          shasum -a 256 "libcortiq-ffi-${{ matrix.target }}.tar.gz" > "libcortiq-ffi-${{ matrix.target }}.tar.gz.sha256"
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            libcortiq-ffi-${{ matrix.target }}.tar.gz
+            libcortiq-ffi-${{ matrix.target }}.tar.gz.sha256

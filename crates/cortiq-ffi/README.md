@@ -4,7 +4,30 @@ A C ABI over the CMF engine: load a `.cmf` file, stream tokens through a
 callback, free. One call at a time per handle (internally serialized);
 no panics cross the boundary; errors are readable strings.
 
-The full surface is four functions — see [`include/cortiq.h`](include/cortiq.h).
+The surface — see [`include/cortiq.h`](include/cortiq.h):
+
+| function | what it does |
+|---|---|
+| `cortiq_load(path)` | open a `.cmf` (mmap), returns a handle |
+| `cortiq_chat(h, prompt, max, cb, user)` | one user turn through the chat template |
+| `cortiq_chat_messages(h, json, max, cb, user)` | multi-turn: `[{"role","content"},…]` through the template |
+| `cortiq_complete(h, prompt, max, cb, user)` | raw completion, no template |
+| `cortiq_set_options(h, json)` | sampler options, partial JSON: `temperature`, `top_p`, `top_k`, `repetition_penalty`, `min_p`, `seed`, `greedy` |
+| `cortiq_free(h)` | release |
+| `cortiq_last_error()` / `cortiq_version()` | diagnostics |
+
+```c
+cortiq_set_options(h, "{\"temperature\": 0.2, \"top_p\": 0.95}");   // sticky per handle
+cortiq_chat_messages(h,
+    "[{\"role\": \"system\", \"content\": \"Be brief.\"},"
+    " {\"role\": \"user\", \"content\": \"Hi!\"}]",
+    256, cb, user);
+```
+
+Absent option keys keep their current values (defaults: 0.7 / 0.9 / 40 /
+1.1 / 0.05 / random seed); `"greedy": true` pins temperature to 0.
+History for `cortiq_chat_messages` is the caller's: pass the full
+conversation each call — the engine is stateless between calls.
 
 ## Android (JNI)
 
@@ -12,10 +35,17 @@ Build the shared library with [cargo-ndk](https://github.com/bbqsrc/cargo-ndk):
 
 ```sh
 cargo install cargo-ndk
-rustup target add aarch64-linux-android
-cargo ndk -t arm64-v8a -o app/src/main/jniLibs build --release -p cortiq-ffi
-# → app/src/main/jniLibs/arm64-v8a/libcortiq_ffi.so
+rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
+    -o app/src/main/jniLibs build --release -p cortiq-ffi
+# → app/src/main/jniLibs/{arm64-v8a,armeabi-v7a,x86_64}/libcortiq_ffi.so
 ```
+
+Or skip the toolchain: every release attaches prebuilt
+`libcortiq-ffi-<target>.tar.gz` for all three ABIs — unpack into the
+matching `jniLibs/` directory. arm64-v8a is the fast path (NEON SDOT
+blocking, batched attention); armeabi-v7a and x86_64 run the portable
+kernels — fine for old phones and emulators, don't benchmark on them.
 
 Minimal JNI shim (`cortiq_jni.c`, compile into your app's native lib or
 a tiny CMake target linking `libcortiq_ffi.so`):
@@ -55,6 +85,29 @@ Java_com_example_Cortiq_chat(JNIEnv *env, jclass cls, jlong h,
     return n;
 }
 
+JNIEXPORT jint JNICALL
+Java_com_example_Cortiq_chatMessages(JNIEnv *env, jclass cls, jlong h,
+                                     jstring msgs, jint maxTokens, jobject cb) {
+    jclass cbCls = (*env)->GetObjectClass(env, cb);
+    jmethodID onToken =
+        (*env)->GetMethodID(env, cbCls, "onToken", "(Ljava/lang/String;)Z");
+    StreamCtx s = { env, cb, onToken };
+    const char *m = (*env)->GetStringUTFChars(env, msgs, NULL);
+    jint n = cortiq_chat_messages((void *)h, m, (uint32_t)maxTokens,
+                                  jni_token_cb, &s);
+    (*env)->ReleaseStringUTFChars(env, msgs, m);
+    return n;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_example_Cortiq_setOptions(JNIEnv *env, jclass cls, jlong h,
+                                   jstring opts) {
+    const char *o = (*env)->GetStringUTFChars(env, opts, NULL);
+    jint r = cortiq_set_options((void *)h, o);
+    (*env)->ReleaseStringUTFChars(env, opts, o);
+    return r;
+}
+
 JNIEXPORT void JNICALL
 Java_com_example_Cortiq_free(JNIEnv *env, jclass cls, jlong h) {
     cortiq_free((void *)h);
@@ -72,12 +125,18 @@ object Cortiq {
     @JvmStatic external fun load(path: String): Long
     @JvmStatic external fun chat(handle: Long, prompt: String,
                                  maxTokens: Int, cb: TokenListener): Int
+    @JvmStatic external fun chatMessages(handle: Long, messagesJson: String,
+                                         maxTokens: Int, cb: TokenListener): Int
+    @JvmStatic external fun setOptions(handle: Long, optionsJson: String): Int
     @JvmStatic external fun free(handle: Long)
 }
 
 // usage — run on a background thread, stream into your UI:
 val h = Cortiq.load(File(filesDir, "model.cmf").absolutePath)
+Cortiq.setOptions(h, """{"temperature": 0.2}""")
 Cortiq.chat(h, "Привет!", 256) { token -> appendToUi(token); true }
+// multi-turn: serialize the whole history each call
+Cortiq.chatMessages(h, gson.toJson(history), 256) { t -> appendToUi(t); true }
 Cortiq.free(h)
 ```
 
@@ -90,8 +149,22 @@ Notes for phones:
 - generation must not run on the main thread; the token callback fires
   on the calling thread.
 
-## Desktop / iOS
+## iOS
 
-The same four functions work anywhere: link the `staticlib`/`cdylib`
-and include `cortiq.h`. iOS builds with the usual
-`aarch64-apple-ios` target (staticlib + your Swift bridging header).
+Releases attach `libcortiq-ffi-aarch64-apple-ios.tar.gz` with the
+static `libcortiq_ffi.a` — link it into the app binary (Xcode: add to
+"Link Binary With Libraries", plus a bridging header including
+`cortiq.h`). Flutter/Dart then reaches the symbols with
+`DynamicLibrary.process()` — no separate .framework needed. To build it
+yourself:
+
+```sh
+rustup target add aarch64-apple-ios
+cargo build --release -p cortiq-ffi --target aarch64-apple-ios
+# → target/aarch64-apple-ios/release/libcortiq_ffi.a
+```
+
+## Desktop
+
+The same functions work anywhere: link the `staticlib`/`cdylib` and
+include `cortiq.h`.
