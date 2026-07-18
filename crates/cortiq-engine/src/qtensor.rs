@@ -1418,13 +1418,66 @@ fn qmatmat(
         dispatch_rows(pool, rows, &run);
         return;
     }
-    // x86 A8W8 batch: each weight row streams once for the whole chunk
-    // through the AVX2/VNNI row dot (prefill q8 was the last
-    // aarch64-only batched path).
+    // x86 A8W8 batch. Non-VNNI parts take the BLOCKED 2×4 kernel
+    // (roadmap P0: two weight rows' abs() stay in registers across four
+    // activation streams); VNNI machines keep the per-row bias-trick
+    // dot, which is already throughput-bound there.
     #[cfg(target_arch = "x86_64")]
     if avx2_a8w8_enabled() {
         let acts: Vec<SplitAct> = pre.iter().map(|x| split_act(x)).collect();
         let out_addr = SendMut(out.as_mut_ptr());
+        if !avx512vnni_enabled() {
+            let run = |start: usize, end: usize| {
+                let mut o = start;
+                while o < end {
+                    if o + 2 <= end {
+                        let r0 = &q[o * cols..(o + 1) * cols];
+                        let r1 = &q[(o + 1) * cols..(o + 2) * cols];
+                        let mut bi = 0usize;
+                        while bi + 4 <= acts.len() {
+                            let xs = [
+                                acts[bi].xq.as_slice(),
+                                acts[bi + 1].xq.as_slice(),
+                                acts[bi + 2].xq.as_slice(),
+                                acts[bi + 3].xq.as_slice(),
+                            ];
+                            let d = unsafe { dot_i8_i8_avx2_2x4(r0, r1, xs) };
+                            for (r, row) in [r0, r1].into_iter().enumerate() {
+                                for k in 0..4 {
+                                    let act = &acts[bi + k];
+                                    let mut v = d[r][k] as f32 * act.sx;
+                                    for &(j, xv) in &act.outliers {
+                                        v += (row[j] as i8) as f32 * xv;
+                                    }
+                                    unsafe {
+                                        *out_addr.at((bi + k) * rows + o + r) =
+                                            v * row_scale[o + r]
+                                    };
+                                }
+                            }
+                            bi += 4;
+                        }
+                        while bi < acts.len() {
+                            for (r, row) in [r0, r1].into_iter().enumerate() {
+                                let v = row_dot_avx2(row, &acts[bi]) * row_scale[o + r];
+                                unsafe { *out_addr.at(bi * rows + o + r) = v };
+                            }
+                            bi += 1;
+                        }
+                        o += 2;
+                    } else {
+                        let row = &q[o * cols..(o + 1) * cols];
+                        for (bi, act) in acts.iter().enumerate() {
+                            let v = row_dot_avx2(row, act) * row_scale[o];
+                            unsafe { *out_addr.at(bi * rows + o) = v };
+                        }
+                        o += 1;
+                    }
+                }
+            };
+            dispatch_rows(pool, rows, &run);
+            return;
+        }
         let run = |start: usize, end: usize| {
             for o in start..end {
                 let row = &q[o * cols..(o + 1) * cols];
@@ -3369,6 +3422,58 @@ unsafe fn dot_i8_i8_avx2(w: &[u8], xq: &[i8]) -> i32 {
             j += 1;
         }
         s
+    }
+}
+
+/// Blocked 2 weight rows × 4 activations for the prefill GEMM
+/// (roadmap P0: packed panels + multi-row accumulators). The two rows'
+/// abs() live in registers across all four activation streams; the
+/// sign-fixup is recomputed per pair (the price of the maddubs trick).
+/// Returns raw i8·i8 dots; the caller applies scales and outliers.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_i8_i8_avx2_2x4(w0: &[u8], w1: &[u8], xs: [&[i8]; 4]) -> [[i32; 4]; 2] {
+    // SAFETY: callers uphold slice-length contracts.
+    unsafe {
+        use core::arch::x86_64::*;
+        let n = w0.len();
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = [[_mm256_setzero_si256(); 4]; 2];
+        let mut j = 0usize;
+        while j + 32 <= n {
+            let wv0 = _mm256_loadu_si256(w0.as_ptr().add(j) as *const __m256i);
+            let wv1 = _mm256_loadu_si256(w1.as_ptr().add(j) as *const __m256i);
+            let aw0 = _mm256_abs_epi8(wv0);
+            let aw1 = _mm256_abs_epi8(wv1);
+            for (k, x) in xs.iter().enumerate() {
+                let xv = _mm256_loadu_si256(x.as_ptr().add(j) as *const __m256i);
+                let p0 = _mm256_maddubs_epi16(aw0, _mm256_sign_epi8(xv, wv0));
+                acc[0][k] = _mm256_add_epi32(acc[0][k], _mm256_madd_epi16(p0, ones));
+                let p1 = _mm256_maddubs_epi16(aw1, _mm256_sign_epi8(xv, wv1));
+                acc[1][k] = _mm256_add_epi32(acc[1][k], _mm256_madd_epi16(p1, ones));
+            }
+            j += 32;
+        }
+        let mut out = [[0i32; 4]; 2];
+        for r in 0..2 {
+            for k in 0..4 {
+                let a = acc[r][k];
+                let hi128 = _mm256_extracti128_si256::<1>(a);
+                let s128 = _mm_add_epi32(_mm256_castsi256_si128(a), hi128);
+                let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
+                let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
+                out[r][k] = _mm_cvtsi128_si32(s32);
+            }
+        }
+        if j < n {
+            for (k, x) in xs.iter().enumerate() {
+                for i in j..n {
+                    out[0][k] += (w0[i] as i8) as i32 * x[i] as i32;
+                    out[1][k] += (w1[i] as i8) as i32 * x[i] as i32;
+                }
+            }
+        }
+        out
     }
 }
 
