@@ -6,6 +6,10 @@
 //! - errors are a thread-local UTF-8 string behind `cortiq_last_error`;
 //! - streaming via a C callback returning `true` to continue — early
 //!   stop is first-class, matching the engine's own TokenCallback.
+// The entry points take raw pointers from a foreign caller by design;
+// each one NULL-checks before dereferencing. Marking them `unsafe`
+// would change nothing for C callers and only obscure the Rust tests.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};

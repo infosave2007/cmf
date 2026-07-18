@@ -3315,6 +3315,8 @@ pub struct TokenGraph {
     st_next: usize,
     /// q/k/v buffers of the last encoded attention prefix.
     qkv_bufs: Option<(Buffer, Buffer, Buffer)>,
+    /// Logits buffer of an encoded final-norm+lm_head tail (rows).
+    logits_b: Option<Buffer>,
 }
 
 impl TokenGraph {
@@ -3344,6 +3346,7 @@ impl TokenGraph {
             dirty: Vec::new(),
             st_next: 0,
             qkv_bufs: None,
+            logits_b: None,
         })
     }
 
@@ -3434,6 +3437,42 @@ impl TokenGraph {
                 h.as_mut_ptr(),
                 self.dims.hidden,
             );
+        }
+    }
+
+    /// Pre-flight for the final-norm + lm_head tail.
+    pub fn lm_head_ok(&self, lm: (usize, usize, usize)) -> bool {
+        lm.2 == self.dims.hidden && self.q1_abs(lm).is_some()
+    }
+
+    /// Final rmsnorm + lm_head matvec at the end of the last layer —
+    /// rides in the same command buffer, so the logits come out of the
+    /// sync this graph already pays instead of a separate per-op
+    /// submit+wait round trip. Read with `read_logits` after `sync`.
+    pub fn encode_lm_head(&mut self, norm: &[f32], lm: (usize, usize, usize)) {
+        let cmd = self.ensure_cmd();
+        enc_simple(
+            &cmd,
+            &self.c.rmsn,
+            &[(&self.h_b, 0), (&const_buf(self.c, norm), 0), (&self.n_b, 0)],
+            &[self.dims.hidden as u32, self.dims.gemma as u32],
+            &[self.dims.eps],
+            (256, 256),
+        );
+        let abs = self.q1_abs(lm).unwrap();
+        let lg_b = io_buf(self.c, 44_000_000_077 + lm.1, lm.1 * 4);
+        let enc = cmd.new_compute_command_encoder();
+        encode_q1_matvec(self.c, enc, &self.fbuf, abs, &self.n_b, &lg_b, lm.1, lm.2 / GROUP_SIZE);
+        enc.end_encoding();
+        self.logits_b = Some(lg_b);
+    }
+
+    /// Copy the finished logits (call after `sync`; out may be shorter
+    /// than the head's rows — trailing rows are padding vocab).
+    pub fn read_logits(&mut self, out: &mut [f32]) {
+        let lg_b = self.logits_b.take().expect("read_logits without encode_lm_head");
+        unsafe {
+            std::ptr::copy_nonoverlapping(lg_b.contents() as *const f32, out.as_mut_ptr(), out.len());
         }
     }
 

@@ -124,6 +124,13 @@ pub struct Pipeline {
     /// Process-unique id keying this pipeline's device KV mirrors.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     graph_kv_id: u64,
+    /// Decode asks the token graph to also run final-norm + lm_head on
+    /// the device (drops the separate per-op lm_head round trip).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    graph_want_logits: bool,
+    /// Logits the graph produced for the token just forwarded (taken by
+    /// the decode loop; None = compute on the CPU path).
+    graph_logits: Option<Vec<f32>>,
     /// Token embeddings are multiplied by this at input (Gemma: √hidden).
     pub embed_multiplier: f32,
     /// Attention score scale (1/√head_dim unless the arch overrides —
@@ -736,6 +743,23 @@ impl Pipeline {
                 }
             }
         }
+        // Ride the final norm + lm_head in the same command buffer when
+        // this run reaches the model's end and the caller wants logits:
+        // the separate per-op lm_head submit (a full round trip) folds
+        // into the sync that already happens here.
+        let mut lm_rows = None;
+        if self.graph_want_logits
+            && upto.is_none()
+            && end == self.num_layers
+            && std::env::var("CMF_GPU_LMHEAD").map(|v| v != "0").unwrap_or(true)
+        {
+            if let Some(lm) = self.weights.lm_head.q1_parts() {
+                if graph.lm_head_ok(lm) {
+                    graph.encode_lm_head(&self.weights.final_norm, lm);
+                    lm_rows = Some(lm.1);
+                }
+            }
+        }
         graph.sync();
         if !pending.is_empty() {
             let idxs: Vec<usize> = pending.drain(..).flat_map(|(f, n)| f..f + n).collect();
@@ -748,6 +772,17 @@ impl Pipeline {
                 .map(|(_, s)| s.linear_state.as_mut_slice())
                 .collect();
             graph.read_states(&mut outs);
+        }
+        if let Some(rows) = lm_rows {
+            let mut lg = attention::take_buf(rows.min(self.vocab_size));
+            graph.read_logits(&mut lg);
+            lg.resize(self.vocab_size, 0.0);
+            if let Some(c) = self.final_softcap {
+                for l in lg.iter_mut() {
+                    *l = c * (*l / c).tanh();
+                }
+            }
+            self.graph_logits = Some(lg);
         }
         graph.finish(h);
         // Device-attended layers: replay the CPU bookkeeping — append
@@ -842,6 +877,8 @@ impl Pipeline {
             inv_freq_global: None,
             attn_v_norm: false,
             final_softcap: None,
+            graph_want_logits: false,
+            graph_logits: None,
             graph_kv_id: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1039,6 +1076,12 @@ impl Pipeline {
         //    (hidden_p, token_{p+1}) pairs.
         let mut hidden = vec![0.0f32; self.hidden_size];
         let mut pos = 0usize;
+        // lm_head-in-graph is only sound when the very next logits
+        // consumer is this loop's own (MTP and skill routing interleave
+        // other forwards / can swap lm_head between forward and sample).
+        let fuse_lm = mtp.is_none() && router.is_none();
+        self.graph_logits = None;
+        self.graph_want_logits = false;
         // With dynamic routing, prefill sequentially so the φ hook fires
         // over the PROMPT — the router enters decode with a warm φ (the
         // fused-pair path skips the per-layer φ capture). o1 layers
@@ -1100,6 +1143,7 @@ impl Pipeline {
             }
         }
         while pos < input_ids.len() {
+            self.graph_want_logits = fuse_lm && pos + 1 == input_ids.len();
             hidden = self.forward_layers(&self.embed_single(input_ids[pos]), pos, task_mask);
             if let Some(m) = &mut mtp {
                 if pos + 1 < input_ids.len() {
@@ -1137,14 +1181,19 @@ impl Pipeline {
         // ── Decode ──
         let mut next_pos = input_ids.len();
         'decode: while generated < max_tokens {
-            inference::rms_norm_into(
-                &hidden,
-                &self.weights.final_norm,
-                self.rms_eps,
-                self.norm_style,
-                &mut self.ws.n1,
-            );
-            let mut logits = self.lm_head_forward(&self.ws.n1);
+            let mut logits = match self.graph_logits.take() {
+                Some(lg) => lg,
+                None => {
+                    inference::rms_norm_into(
+                        &hidden,
+                        &self.weights.final_norm,
+                        self.rms_eps,
+                        self.norm_style,
+                        &mut self.ws.n1,
+                    );
+                    self.lm_head_forward(&self.ws.n1)
+                }
+            };
             let t_next = sampler::sample(&logits, &self.sampler_config, &all_ids, &mut self.rng);
             if self.confidence_on {
                 confidence.push(top1_prob_t(&logits, t_next, calib_temp));
@@ -1237,6 +1286,7 @@ impl Pipeline {
                 }
                 // ── Vanilla: forward the sampled token ──
                 _ => {
+                    self.graph_want_logits = fuse_lm;
                     hidden = self.forward_layers(&self.embed_single(t_next), next_pos, task_mask);
                     next_pos += 1;
                     // Dynamic routing: the forward updated φ; ask the
@@ -1261,6 +1311,8 @@ impl Pipeline {
             }
         }
 
+        self.graph_want_logits = false;
+        self.graph_logits = None;
         // Restore backbone overlay and re-attach the router for reuse.
         if router.is_some() {
             let _ = self.set_active_skill(None);
