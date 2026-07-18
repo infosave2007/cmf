@@ -765,6 +765,91 @@ kernel void q1_matvec(
     }
 }
 
+// Half-accumulation twin of q1_matvec (default; CMF_Q1_HALF=0 reverts
+// to the f32 kernel): the select/add chains — this kernel's ALU wall —
+// run in half4 (double-rate on Apple GPUs); each 32-group's partial
+// sum converts to f32 exactly once, at the scale fma. The activation
+// float4 converts to half4 once per lane iteration and serves all four
+// rows. Not bit-stable vs the f32 kernel, but blessed by the gates:
+// PPL identical to 3 decimals on 1.7B (23.969) and 27B (14.985),
+// greedy text token-identical; decode +5% (1.7B), TTFT −5% (27B).
+kernel void q1_matvec_h(
+    device const uchar*  q    [[buffer(0)]],
+    device const float4* xs   [[buffer(1)]],
+    device float*        y    [[buffer(2)]],
+    constant uint&       gpr  [[buffer(3)]],
+    constant uint&       rows [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    if (r0 >= rows) return;
+    uint nr = min(rows - r0, 4u);
+    uint np = gpr >> 1;
+    device const uint* q0 = (device const uint*)(q + (ulong)r0 * gpr * 6u);
+    device const uint* q1p = (device const uint*)(q + (ulong)(r0 + (nr > 1u ? 1u : 0u)) * gpr * 6u);
+    device const uint* q2p = (device const uint*)(q + (ulong)(r0 + (nr > 2u ? 2u : 0u)) * gpr * 6u);
+    device const uint* q3p = (device const uint*)(q + (ulong)(r0 + (nr > 3u ? 3u : 0u)) * gpr * 6u);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint pidx = lane; pidx < np; pidx += 32u) {
+        uint a0 = q0[pidx * 3u], a1 = q0[pidx * 3u + 1u], a2 = q0[pidx * 3u + 2u];
+        uint b0 = q1p[pidx * 3u], b1 = q1p[pidx * 3u + 1u], b2 = q1p[pidx * 3u + 2u];
+        uint c0 = q2p[pidx * 3u], c1 = q2p[pidx * 3u + 1u], c2 = q2p[pidx * 3u + 2u];
+        uint d0 = q3p[pidx * 3u], d1 = q3p[pidx * 3u + 1u], d2 = q3p[pidx * 3u + 2u];
+        ulong g = (ulong)pidx * 2u;
+        {
+            uint ba = (a0 >> 16) | (a1 << 16);
+            uint bb = (b0 >> 16) | (b1 << 16);
+            uint bc = (c0 >> 16) | (c1 << 16);
+            uint bd = (d0 >> 16) | (d1 << 16);
+            half4 sA = half4(0.0h), sB = half4(0.0h);
+            half4 sC = half4(0.0h), sD = half4(0.0h);
+            for (uint j = 0; j < 8; ++j) {
+                half4 x = half4(xs[g * 8u + j]);
+                uint na = ba >> (j * 4u), nb = bb >> (j * 4u);
+                uint nc = bc >> (j * 4u), nd = bd >> (j * 4u);
+                sA += select(-x, x, bool4(na & 1u, na & 2u, na & 4u, na & 8u));
+                sB += select(-x, x, bool4(nb & 1u, nb & 2u, nb & 4u, nb & 8u));
+                sC += select(-x, x, bool4(nc & 1u, nc & 2u, nc & 4u, nc & 8u));
+                sD += select(-x, x, bool4(nd & 1u, nd & 2u, nd & 4u, nd & 8u));
+            }
+            acc0 += (float)as_type<half>((ushort)(a0 & 0xFFFFu)) * (float)(sA.x + sA.y + sA.z + sA.w);
+            acc1 += (float)as_type<half>((ushort)(b0 & 0xFFFFu)) * (float)(sB.x + sB.y + sB.z + sB.w);
+            acc2 += (float)as_type<half>((ushort)(c0 & 0xFFFFu)) * (float)(sC.x + sC.y + sC.z + sC.w);
+            acc3 += (float)as_type<half>((ushort)(d0 & 0xFFFFu)) * (float)(sD.x + sD.y + sD.z + sD.w);
+        }
+        {
+            half4 sA = half4(0.0h), sB = half4(0.0h);
+            half4 sC = half4(0.0h), sD = half4(0.0h);
+            for (uint j = 0; j < 8; ++j) {
+                half4 x = half4(xs[(g + 1u) * 8u + j]);
+                uint na = a2 >> (j * 4u), nb = b2 >> (j * 4u);
+                uint nc = c2 >> (j * 4u), nd = d2 >> (j * 4u);
+                sA += select(-x, x, bool4(na & 1u, na & 2u, na & 4u, na & 8u));
+                sB += select(-x, x, bool4(nb & 1u, nb & 2u, nb & 4u, nb & 8u));
+                sC += select(-x, x, bool4(nc & 1u, nc & 2u, nc & 4u, nc & 8u));
+                sD += select(-x, x, bool4(nd & 1u, nd & 2u, nd & 4u, nd & 8u));
+            }
+            acc0 += (float)as_type<half>((ushort)(a1 >> 16)) * (float)(sA.x + sA.y + sA.z + sA.w);
+            acc1 += (float)as_type<half>((ushort)(b1 >> 16)) * (float)(sB.x + sB.y + sB.z + sB.w);
+            acc2 += (float)as_type<half>((ushort)(c1 >> 16)) * (float)(sC.x + sC.y + sC.z + sC.w);
+            acc3 += (float)as_type<half>((ushort)(d1 >> 16)) * (float)(sD.x + sD.y + sD.z + sD.w);
+        }
+    }
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2);
+    acc3 = simd_sum(acc3);
+    if (lane == 0) {
+        y[r0] = acc0;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
+    }
+}
+
 kernel void silu_mul_pre(
     device const float* g   [[buffer(0)]],
     device const float* u   [[buffer(1)]],
@@ -1472,6 +1557,7 @@ struct Ctx {
     q8mm: ComputePipelineState,
     q8mmm: ComputePipelineState,
     q1: ComputePipelineState,
+    q1h: ComputePipelineState,
     flag: ComputePipelineState,
     rmsn: ComputePipelineState,
     f16mv: ComputePipelineState,
@@ -1587,6 +1673,7 @@ fn init() -> Result<Ctx, String> {
     };
     let q8mmm = pso_fc("q8_mul_mm")?;
     let q1 = pso("q1_matvec")?;
+    let q1h = pso("q1_matvec_h")?;
     let flag = pso("write_flag")?;
     let rmsn = pso("rmsnorm_k")?;
     let f16mv = pso("f32_matvec")?;
@@ -1623,6 +1710,7 @@ fn init() -> Result<Ctx, String> {
         q8mm,
         q8mmm,
         q1,
+        q1h,
         flag,
         rmsn,
         f16mv,
@@ -1958,6 +2046,25 @@ pub fn q1_matvec(
 /// Encode one q1 matvec dispatch (shared by the single, batch and
 /// MoE-chain paths).
 #[allow(clippy::too_many_arguments)]
+/// Kernel-pick test hook: 0 = env (default), 1 = force f32, 2 = force
+/// half — lets the parity test cover BOTH kernels in one process (the
+/// env choice is cached in a OnceLock and can't be toggled).
+static Q1_KERNEL_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Half-accumulation q1 kernel, default on (quality gates in the
+/// kernel header); CMF_Q1_HALF=0 reverts to the f32 twin.
+fn q1_half() -> bool {
+    match Q1_KERNEL_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            static HALF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *HALF
+                .get_or_init(|| std::env::var("CMF_Q1_HALF").map(|v| v != "0").unwrap_or(true))
+        }
+    }
+}
+
 fn encode_q1_matvec(
     c: &Ctx,
     enc: &metal::ComputeCommandEncoderRef,
@@ -1968,7 +2075,7 @@ fn encode_q1_matvec(
     rows: usize,
     gpr: usize,
 ) {
-    enc.set_compute_pipeline_state(&c.q1);
+    enc.set_compute_pipeline_state(if q1_half() { &c.q1h } else { &c.q1 });
     enc.set_buffer(0, Some(fbuf), abs as u64);
     enc.set_buffer(1, Some(xs), 0);
     enc.set_buffer(2, Some(y), 0);
@@ -4345,16 +4452,24 @@ mod tests {
         for o in 0..rows {
             cpu[o] = (0..cols).map(|i| w[o * cols + i] * x[i]).sum();
         }
-        let mut gpu = vec![0f32; rows];
-        assert!(
-            q1_matvec(&model, idx, &x, rows, cols, &mut gpu),
-            "metal q1_matvec refused"
-        );
-        let mut max_d = 0f32;
-        for o in 0..rows {
-            max_d = max_d.max((cpu[o] - gpu[o]).abs());
+        // Both kernels, each against its own bound: f32 is near-exact;
+        // the half twin accumulates 32-groups in f16 (~1e-3-class) —
+        // the loose bound still catches sign/order bugs (those are
+        // O(1) wrong, not O(1e-3)).
+        for (mode, tol) in [(1u8, 1e-4f32), (2u8, 1e-2f32)] {
+            Q1_KERNEL_OVERRIDE.store(mode, std::sync::atomic::Ordering::Relaxed);
+            let mut gpu = vec![0f32; rows];
+            assert!(
+                q1_matvec(&model, idx, &x, rows, cols, &mut gpu),
+                "metal q1_matvec refused (mode {mode})"
+            );
+            let mut max_d = 0f32;
+            for o in 0..rows {
+                max_d = max_d.max((cpu[o] - gpu[o]).abs());
+            }
+            assert!(max_d < tol, "GPU q1 vs f32 reference (mode {mode}): max|Δ| = {max_d}");
         }
-        assert!(max_d < 1e-4, "GPU q1 vs f32 reference: max|Δ| = {max_d}");
+        Q1_KERNEL_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
