@@ -479,7 +479,7 @@ pub fn q1_matvec(
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::q1_matvec(model, idx, xs, rows, cols, out),
         #[cfg(feature = "gpu")]
-        Backend::Wgpu => false,
+        Backend::Wgpu => crate::gpu_wgpu::q1_matvec(model, idx, xs, rows, cols, out),
         Backend::None => false,
     }
 }
