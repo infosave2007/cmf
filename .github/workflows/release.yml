@@ -80,7 +80,9 @@ jobs:
       - name: Build FFI library (android)
         if: matrix.target == 'aarch64-linux-android'
         # libcortiq_ffi.so for APK embedding (see crates/cortiq-ffi).
-        run: cargo build --release -p cortiq-ffi --target ${{ matrix.target }}
+        # --features gpu: Vulkan via wgpu so Mali/Adreno are reachable
+        # from the app; the probe keeps CPU where the GPU loses.
+        run: cargo build --release -p cortiq-ffi --features gpu --target ${{ matrix.target }}
       - name: Package FFI (android)
         if: matrix.target == 'aarch64-linux-android'
         run: |
@@ -143,6 +145,8 @@ jobs:
           # 32-bit ARM phones. The NDK clang wrapper spells this target
           # armv7a-…-eabi24 while rustc spells it armv7-…-eabi — the
           # `clang` field carries the NDK spelling.
+          # No gpu feature on 32-bit ARM: Vulkan-on-armv7 is rare in
+          # the field and wgpu there is untested — CPU-only, honestly.
           - os: ubuntu-latest
             target: armv7-linux-androideabi
             clang: armv7a-linux-androideabi24-clang
@@ -152,6 +156,7 @@ jobs:
             target: x86_64-linux-android
             clang: x86_64-linux-android24-clang
             lib: libcortiq_ffi.so
+            features: gpu
           # iOS devices: static library, linked into the app binary.
           - os: macos-latest
             target: aarch64-apple-ios
@@ -173,7 +178,7 @@ jobs:
           echo "CC_$(echo '${{ matrix.target }}' | tr '-' '_')=$TOOL/${{ matrix.clang }}" >> "$GITHUB_ENV"
           echo "AR_$(echo '${{ matrix.target }}' | tr '-' '_')=$TOOL/llvm-ar" >> "$GITHUB_ENV"
       - name: Build FFI library
-        run: cargo build --release -p cortiq-ffi --target ${{ matrix.target }}
+        run: cargo build --release -p cortiq-ffi ${{ matrix.features && format('--features {0}', matrix.features) || '' }} --target ${{ matrix.target }}
       - name: Package
         run: |
           bindir="target/${{ matrix.target }}/release"

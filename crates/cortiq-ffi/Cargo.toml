@@ -9,6 +9,11 @@ description = "C ABI for embedding the CMF runtime in native apps (Android/iOS/d
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+# Vulkan/DX12 via wgpu inside the embedded runtime (Mali/Adreno on
+# Android). The runtime probe still decides GPU-vs-CPU per op class.
+gpu = ["cortiq-engine/gpu"]
+
 [dependencies]
 cortiq-core = { path = "../cortiq-core", version = "0.3.11" }
 cortiq-engine = { path = "../cortiq-engine", version = "0.3.11" }

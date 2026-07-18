@@ -128,12 +128,26 @@ impl Pool {
                 Err(_) => break,
             }
         }
+        Self::cores_from_capacities(&caps)
+    }
+
+    /// How many cores the pool should use, from the kernel's per-core
+    /// capacity values. Capacity folds µarch × clock into one number,
+    /// and the two need different treatment: cores of ANOTHER µarch
+    /// (A5xx efficiency cluster next to A7xx/X: capacity ratio ≥ ~2)
+    /// drag row-parallel work down and are excluded; cores of the SAME
+    /// µarch merely clock-binned (JLQ JR510: 8×A55 as 4×2.0 + 4×1.5 GHz,
+    /// ratio 1.33) pull their weight and must ALL be used. The 1.6
+    /// threshold splits the two regimes: on a Snapdragon 8-class part
+    /// it keeps X + A7xx mid cores and drops A5xx.
+    #[cfg_attr(not(all(target_arch = "aarch64", any(target_os = "linux", target_os = "android"))), allow(dead_code))]
+    fn cores_from_capacities(caps: &[u64]) -> Option<usize> {
         let max = *caps.iter().max()?;
         let min = *caps.iter().min()?;
         if caps.len() < 2 || max == min {
             return None;
         }
-        Some(caps.iter().filter(|&&c| c == max).count())
+        Some(caps.iter().filter(|&&c| c * 8 >= max * 5).count())
     }
 
     #[cfg(not(all(target_arch = "aarch64", any(target_os = "linux", target_os = "android"))))]
@@ -436,6 +450,23 @@ impl SendMut {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capacity_split_clock_bins_vs_microarch() {
+        type P = super::Pool;
+        // JR510: all-A55, two clock bins — use every core.
+        assert_eq!(P::cores_from_capacities(&[1024, 1024, 1024, 1024, 768, 768, 768, 768]), Some(8));
+        // Classic big.LITTLE (A78 + A55) — big only.
+        assert_eq!(P::cores_from_capacities(&[1024, 1024, 1024, 1024, 350, 350, 350, 350]), Some(4));
+        // Three-tier flagship: X + A7xx mids stay, A5xx littles go.
+        assert_eq!(
+            P::cores_from_capacities(&[1024, 800, 800, 800, 800, 300, 300, 300]),
+            Some(5)
+        );
+        // Uniform: no signal, caller falls back.
+        assert_eq!(P::cores_from_capacities(&[1024; 8]), None);
+        assert_eq!(P::cores_from_capacities(&[]), None);
+    }
+
     use super::*;
 
     #[test]

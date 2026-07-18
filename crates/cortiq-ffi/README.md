@@ -144,10 +144,26 @@ Notes for phones:
 - keep the `.cmf` on storage — it is memory-mapped, RSS stays near the
   file size and load is instant;
 - q4_tiled is the best size/speed point for mobile;
-- the engine picks the big cores by itself on big.LITTLE (override with
-  the `CMF_THREADS` env if you experiment);
+- the engine picks its cores from the kernel's capacity table: on real
+  big.LITTLE it takes the big cluster, on clock-binned same-µarch parts
+  (JLQ JR510: 8×A55 as 4×2.0 + 4×1.5 GHz) it takes ALL of them —
+  override with `CMF_THREADS` if you experiment;
 - generation must not run on the main thread; the token callback fires
   on the calling thread.
+
+Sizing for low-RAM devices (4 GB class, e.g. JR510 tablets): the model
+file should stay well under free RAM or the page cache thrashes eMMC —
+comfortable is ≤1 GB: Bonsai-1.7B q1 (334 MB), a 0.5–1.5B q8/q4t. A
+27B q1 (4.8 GB) does NOT fit in 4 GB — it will run, at well under 1
+tok/s, from storage. On all-A55 silicon expect single-digit tok/s for
+a 1.7B: A55 is in-order with one 128-bit NEON pipe — measure on the
+device, don't extrapolate from a flagship.
+
+The arm64 and x86_64 `.so` ship with the Vulkan backend (Mali/Adreno).
+It is opt-in: set `CMF_GPU=1` in the process environment *before*
+`cortiq_load` (Kotlin: `android.system.Os.setenv("CMF_GPU", "1", true)`)
+— a runtime probe then measures GPU vs your CPU per op class and keeps
+whichever wins, so enabling it on a weak Mali is safe.
 
 ## iOS
 
