@@ -42,7 +42,10 @@ The capital of France is **Paris**.
 **Android**：`aarch64-linux-android` 发布二进制可直接在设备上运行——
 [Termux](https://termux.dev) 或 `adb shell` 中下载后 `chmod +x cortiq`，
 同样的 `convert` / `run` / `serve` 命令即可使用（CPU 路径；wgpu Vulkan
-随附，运行时探针保留胜出的一侧）。
+随附，运行时探针保留胜出的一侧）。0.3.9 带来移动端包：分块 SDOT prefill
+GEMM（便携路径 ×2.1）、Apple 芯片之外的批量因果注意力（池并行 NEON
+micro-GEMM——移动栈上 pp1024 +77%、pp2048 +82%），以及 big.LITTLE 感知的
+线程默认值（能效核不进池）。
 
 `convert` 会从 Hugging Face 拉取 checkpoint（分片并行下载）、做量化，并写出一个
 自包含的文件——纯 Rust 实现，不用 torch，不用 numpy。已经有 GGUF 了？
@@ -133,7 +136,7 @@ cortiq ppl model.cmf --file wiki.txt --o1 all
 
 把评价轴说清楚：`llama.cpp` 是我们对标的基准。一次同条件对比（2026-07-17：
 Qwen2.5-0.5B-Instruct，Apple M4，双方均为精确注意力，原生 arm64 `llama.cpp`
-master 对 CMF 0.3.8，交替运行、各自独立进程，双方都取各自实测最优线程数——
+master 对 CMF 0.3.9，交替运行、各自独立进程，双方都取各自实测最优线程数——
 它们是 `-t 6`，我们是默认值；CMF 用 `cortiq bench --core` 计时，对应
 `llama-bench` 的核心口径：不含采样器的全词表拷贝，也不含每词元置信度计算）：
 

@@ -47,6 +47,11 @@ The capital of France is **Paris**.
 [Termux](https://termux.dev) or an `adb shell` — download, `chmod +x cortiq`,
 and the same `convert` / `run` / `serve` commands work (CPU path; wgpu
 Vulkan rides along and the runtime probe keeps whichever side wins).
+0.3.9 ships the mobile package: a blocked SDOT prefill GEMM (×2.1 on the
+portable path), batched causal attention off Apple silicon (a
+pool-parallel NEON micro-GEMM — pp1024 +77%, pp2048 +82% on the
+mobile-sim stack), and a big.LITTLE-aware thread default that keeps
+efficiency cores out of the pool.
 
 `convert` pulls the checkpoint from Hugging Face (shards in parallel), quantizes
 it and writes one self-contained file — native Rust, no torch, no numpy. Already
@@ -147,7 +152,7 @@ published a clean before/after figure for it yet.
 
 To be clear about the axis: `llama.cpp` is the yardstick we measure against.
 One like-for-like run (2026-07-17: Qwen2.5-0.5B-Instruct, Apple Silicon M4,
-exact attention for both, native arm64 `llama.cpp` master vs CMF 0.3.8,
+exact attention for both, native arm64 `llama.cpp` master vs CMF 0.3.9,
 interleaved runs from fresh processes, each side at its best measured
 thread count — theirs is `-t 6`, ours the default; CMF timed with
 `cortiq bench --core`, which matches `llama-bench`'s core contract: no
