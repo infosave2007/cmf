@@ -1200,6 +1200,45 @@ kernel void rmsnorm_rows(
     }
 }
 
+// Fused residual add + row RMSNorm: h += delta (in place), then
+// o = rms(h)·w — one pass instead of an axpy encoder and a norm
+// encoder back-to-back over the same rows.
+kernel void add_rmsnorm_rows(
+    device float*       h [[buffer(0)]],
+    device const float* d [[buffer(1)]],
+    device const float* w [[buffer(2)]],
+    device float*       o [[buffer(3)]],
+    constant uint&      n [[buffer(4)]],
+    constant uint&  gemma [[buffer(5)]],
+    constant float&   eps [[buffer(6)]],
+    constant uint&  hasd  [[buffer(7)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint row  [[threadgroup_position_in_grid]])
+{
+    threadgroup float part[8];
+    device float* hr = h + (ulong)row * n;
+    device const float* dr = d + (ulong)row * n;
+    device float* orow = o + (ulong)row * n;
+    float acc = 0.0f;
+    for (uint i = tid; i < n; i += 256u) {
+        float v = hr[i] + (hasd != 0u ? dr[i] : 0.0f);
+        hr[i] = v;
+        acc += v * v;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) part[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (uint k = 0; k < 8u; ++k) tot += part[k];
+    float inv = rsqrt(tot / (float)n + eps);
+    for (uint i = tid; i < n; i += 256u) {
+        float wv = gemma != 0u ? (1.0f + w[i]) : w[i];
+        orow[i] = hr[i] * inv * wv;
+    }
+}
+
 // Chunk QKV finish: bias add + optional per-head qk-norm + RoPE at
 // pos0+bi, K/V written STRAIGHT into the cache mirror at stored0+bi
 // (fuses kv_append for the whole chunk). Head space: [0, nh) = Q,
@@ -1457,6 +1496,7 @@ struct Ctx {
     impcol: ComputePipelineState,
     unstack: ComputePipelineState,
     embedq8: ComputePipelineState,
+    addnorm: ComputePipelineState,
     sgate: ComputePipelineState,
     /// Compiled MSL library — shape-specialized pipelines are built
     /// from it lazily.
@@ -1571,6 +1611,7 @@ fn init() -> Result<Ctx, String> {
     let impcol = pso("imp_colsum")?;
     let unstack = pso("panel_unstack")?;
     let embedq8 = pso("embed_q8_rows")?;
+    let addnorm = pso("add_rmsnorm_rows")?;
     let sgate = pso("sig_gate")?;
     let queue = device.new_command_queue();
     let flag_buf = device.new_buffer(64, MTLResourceOptions::StorageModeShared);
@@ -1606,6 +1647,7 @@ fn init() -> Result<Ctx, String> {
         impcol,
         unstack,
         embedq8,
+        addnorm,
         sgate,
         lib,
         mm_fc: Mutex::new(HashMap::new()),
@@ -2358,7 +2400,6 @@ pub fn chunk_run_gpu(
     let ob = io_buf(c, 67_000_000_141 + b * hs, b * hs * 4);
     let gb = io_buf(c, 68_000_000_169 + b * inter, b * inter * 4);
     let ub = io_buf(c, 69_000_000_213 + b * inter, b * inter * 4);
-    let act = io_buf(c, 70_000_000_027 + b * inter, b * inter * 4);
     let db = io_buf(c, 71_000_000_073 + b * hs, b * hs * 4);
     // Embedding source: validated up front; refusal keeps the CPU h.
     let embed_prep: Option<(usize, Buffer, Buffer)> = embed.and_then(|e| {
@@ -2403,6 +2444,9 @@ pub fn chunk_run_gpu(
     }
 
     let mut prof = ChunkProf::new();
+    // The last layer's down-delta rides into the NEXT layer's fused
+    // add+norm; before the first layer there is nothing pending.
+    let mut pending_delta = false;
     let mut cmd = c.queue.new_command_buffer().to_owned();
     if let (Some((abs, rs_buf, ids_buf)), Some(e)) = (&embed_prep, embed) {
         let enc = cmd.new_compute_command_encoder();
@@ -2432,34 +2476,32 @@ pub fn chunk_run_gpu(
         };
         let qn_b = l.q_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| invf.clone());
         let kn_b = l.k_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| invf.clone());
-        let rows_norm = |cmd: &metal::CommandBufferRef, src: &Buffer, w: &Buffer, dst: &Buffer| {
+        let add_norm = |cmd: &metal::CommandBufferRef,
+                        delta: Option<&Buffer>,
+                        w: &Buffer,
+                        dst: &Buffer| {
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&c.rmsrows);
-            enc.set_buffer(0, Some(src), 0);
-            enc.set_buffer(1, Some(w), 0);
-            enc.set_buffer(2, Some(dst), 0);
+            enc.set_compute_pipeline_state(&c.addnorm);
+            enc.set_buffer(0, Some(&h_b), 0);
+            enc.set_buffer(1, Some(delta.unwrap_or(&h_b)), 0);
+            enc.set_buffer(2, Some(w), 0);
+            enc.set_buffer(3, Some(dst), 0);
             let n_u = hs as u32;
             let g_u = l.gemma as u32;
-            enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(4, 4, &g_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(5, 4, &l.eps as *const f32 as *const std::ffi::c_void);
+            let hd_u = delta.is_some() as u32;
+            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &g_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(6, 4, &l.eps as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(MTLSize::new(b as u64, 1, 1), MTLSize::new(256, 1, 1));
             enc.end_encoding();
         };
-        let axpy1 = |cmd: &metal::CommandBufferRef, src: &Buffer, dst: &Buffer, n: usize| {
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&c.axpy);
-            enc.set_buffer(0, Some(src), 0);
-            enc.set_buffer(1, Some(dst), 0);
-            let w1 = 1.0f32;
-            let n_u = n as u32;
-            enc.set_bytes(2, 4, &w1 as *const f32 as *const std::ffi::c_void);
-            enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
-            enc.end_encoding();
-        };
 
-        rows_norm(&cmd, &h_b, &inorm, &n_b);
+        // First stage folds the PREVIOUS layer's down-projection delta
+        // into the residual stream together with this layer's input
+        // norm — one pass, no standalone axpy encoder at layer end.
+        add_norm(&cmd, pending_delta.then_some(&db), &inorm, &n_b);
+        pending_delta = true;
         cmd = prof.cut(c, cmd, "norm");
         {
             // Independent outputs — one encoder, three dispatches.
@@ -2618,8 +2660,7 @@ pub fn chunk_run_gpu(
         cmd = prof.cut(c, cmd, "attend");
         encode_mul_mm(c, &cmd, &fbuf, prep.abs[3], &prep.rs[3], &attn, &ob, b, l.wo.1, l.wo.2);
         cmd = prof.cut(c, cmd, "mm_o");
-        axpy1(&cmd, &ob, &h_b, b * hs);
-        rows_norm(&cmd, &h_b, &pnorm, &n_b);
+        add_norm(&cmd, Some(&ob), &pnorm, &n_b);
         cmd = prof.cut(c, cmd, "axpy+norm");
         {
             let enc = cmd.new_compute_command_encoder();
@@ -2650,8 +2691,6 @@ pub fn chunk_run_gpu(
             enc.end_encoding();
         }
         cmd = prof.cut(c, cmd, "mm_down");
-        axpy1(&cmd, &db, &h_b, b * hs);
-        cmd = prof.cut(c, cmd, "axpy");
         // Early commit (decode-graph lesson): hand this layer to the
         // GPU now and encode the next one while it runs — the queue
         // keeps ordering, only the last buffer is waited on. Without
@@ -2662,6 +2701,19 @@ pub fn chunk_run_gpu(
         }
     }
 
+    // Flush the final layer's pending down-delta into the stream.
+    if pending_delta {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.axpy);
+        enc.set_buffer(0, Some(&db), 0);
+        enc.set_buffer(1, Some(&h_b), 0);
+        let w1 = 1.0f32;
+        let n_u = (b * hs) as u32;
+        enc.set_bytes(2, 4, &w1 as *const f32 as *const std::ffi::c_void);
+        enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_threads(MTLSize::new((b * hs) as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+    }
     if prof.on {
         cmd.commit();
         cmd.wait_until_completed();
