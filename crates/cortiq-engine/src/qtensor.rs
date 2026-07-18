@@ -2776,31 +2776,69 @@ unsafe fn dot_q1_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8], gsum: &
                 vaddq_s32(a0, a1)
             }};
         }
+        // TBL unpack over PAIR loads: one vld1q covers two 6B tiles
+        // ([s s b b b b][s s b b b b] + 4B slack), TBL replicates each
+        // bit-byte across 8 lanes for vtst, and the four scales gather
+        // through tbl2 into one fcvtl — the 16 ld1r broadcast loads and
+        // 4 branchy software f16 conversions per 128 weights (the
+        // measured load-port wall of this kernel) become 2 vector
+        // loads + 9 table lookups. Integer math order is unchanged —
+        // bit-identical results (FCVTL is exact on every f16).
+        const IW00: [u8; 16] = [2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3];
+        const IW01: [u8; 16] = [4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5];
+        const IW10: [u8; 16] = [8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9];
+        const IW11: [u8; 16] = [10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11];
+        const ISC: [u8; 8] = [0, 1, 6, 7, 16, 17, 22, 23];
+        let (iw00, iw01) = (vld1q_u8(IW00.as_ptr()), vld1q_u8(IW01.as_ptr()));
+        let (iw10, iw11) = (vld1q_u8(IW10.as_ptr()), vld1q_u8(IW11.as_ptr()));
+        let isc = vld1_u8(ISC.as_ptr());
+        // One tile's −Σ_set(x) from a TBL-unpacked pair load.
+        macro_rules! tile_dot_tbl {
+            ($ld:expr, $i0:expr, $i1:expr, $x:expr) => {{
+                let w0 = vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8($ld, $i0), m));
+                let w1 = vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8($ld, $i1), m));
+                let x0 = vld1q_s8($x);
+                let x1 = vld1q_s8($x.add(16));
+                let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+                asm!(
+                    "sdot {a0:v}.4s, {w0:v}.16b, {x0:v}.16b",
+                    "sdot {a1:v}.4s, {w1:v}.16b, {x1:v}.16b",
+                    a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                    w0 = in(vreg) w0, x0 = in(vreg) x0, w1 = in(vreg) w1, x1 = in(vreg) x1,
+                    options(pure, nomem, nostack),
+                );
+                vaddq_s32(a0, a1)
+            }};
+        }
         let base = bytes.as_ptr().add(r * gpr * Q1_TILE);
+        let row_base = r * gpr * Q1_TILE;
+        let abs_end = bytes.len();
         let xp = xq.as_ptr();
         let gp = gsum.as_ptr();
         let mut accv = vdupq_n_f32(0.0);
         let mut gi = 0;
-        while gi + 4 <= gpr {
+        // The second pair load reads 4B past tile gi+3 — stay inside
+        // the payload slice (only the file's final tiles fall back).
+        while gi + 4 <= gpr && row_base + (gi + 4) * Q1_TILE + 4 <= abs_end {
             let t0 = base.add(gi * Q1_TILE);
-            let t1 = base.add((gi + 1) * Q1_TILE);
-            let t2 = base.add((gi + 2) * Q1_TILE);
-            let t3 = base.add((gi + 3) * Q1_TILE);
-            let d0 = tile_dot!(t0, xp.add(gi * GROUP_SIZE));
-            let d1 = tile_dot!(t1, xp.add((gi + 1) * GROUP_SIZE));
-            let d2 = tile_dot!(t2, xp.add((gi + 2) * GROUP_SIZE));
-            let d3 = tile_dot!(t3, xp.add((gi + 3) * GROUP_SIZE));
+            let ld_a = vld1q_u8(t0);
+            let ld_b = vld1q_u8(t0.add(2 * Q1_TILE));
+            let d0 = tile_dot_tbl!(ld_a, iw00, iw01, xp.add(gi * GROUP_SIZE));
+            let d1 = tile_dot_tbl!(ld_a, iw10, iw11, xp.add((gi + 1) * GROUP_SIZE));
+            let d2 = tile_dot_tbl!(ld_b, iw00, iw01, xp.add((gi + 2) * GROUP_SIZE));
+            let d3 = tile_dot_tbl!(ld_b, iw10, iw11, xp.add((gi + 3) * GROUP_SIZE));
             // [−Σ0, −Σ1, −Σ2, −Σ3] → dots = −(2·Σset_neg + gsum)
             let neg = vpaddq_s32(vpaddq_s32(d0, d1), vpaddq_s32(d2, d3));
             let g = vld1q_s32(gp.add(gi));
             let dots = vnegq_s32(vaddq_s32(vshlq_n_s32::<1>(neg), g));
-            let sc = [
-                f16_to_f32(u16::from_le_bytes([*t0, *t0.add(1)])),
-                f16_to_f32(u16::from_le_bytes([*t1, *t1.add(1)])),
-                f16_to_f32(u16::from_le_bytes([*t2, *t2.add(1)])),
-                f16_to_f32(u16::from_le_bytes([*t3, *t3.add(1)])),
-            ];
-            accv = vfmaq_f32(accv, vcvtq_f32_s32(dots), vld1q_f32(sc.as_ptr()));
+            let sc16 = vqtbl2_u8(uint8x16x2_t(ld_a, ld_b), isc);
+            let scf: float32x4_t;
+            asm!(
+                "fcvtl {o:v}.4s, {i:v}.4h",
+                o = out(vreg) scf, i = in(vreg) sc16,
+                options(pure, nomem, nostack),
+            );
+            accv = vfmaq_f32(accv, vcvtq_f32_s32(dots), scf);
             gi += 4;
         }
         let mut acc = vaddvq_f32(accv);
@@ -5245,6 +5283,39 @@ mod tests {
                 (a[o] - expect).abs() < 1e-3 * expect.abs().max(1e-3),
                 "row {o}: {} vs {expect}",
                 a[o]
+            );
+        }
+    }
+
+    #[test]
+    fn q1_tbl_fast_path_matches_reference() {
+        // gpr = 8 exercises the TBL pair-load fast loop, and the LAST
+        // row's final 4-tile window trips the 4B-overread guard (the
+        // payload ends exactly at the last tile) — both paths must
+        // agree with the dequant reference.
+        let (rows, cols) = (5, 256);
+        let gpr = cols / GROUP_SIZE;
+        let mut bytes = Vec::new();
+        for t in 0..rows * gpr {
+            let s = 0.007 + (t % 11) as f32 * 0.004;
+            bytes.extend_from_slice(&cortiq_core::quant::f32_to_f16(s).to_le_bytes());
+            for j in 0..4 {
+                bytes.push(((t * 53 + j * 89 + 7) % 249) as u8);
+            }
+        }
+        let x: Vec<f32> = (0..cols)
+            .map(|i| if (i * 5) % 7 < 3 { 1.0 } else { -1.0 })
+            .collect();
+        let mut w = vec![0.0f32; rows * cols];
+        cortiq_core::quant::dequant_q1(&bytes, &mut w);
+        let mut got = vec![0.0f32; rows];
+        q1_matvec(&bytes, &x, rows, cols, &mut got, None);
+        for o in 0..rows {
+            let expect: f32 = (0..cols).map(|j| w[o * cols + j] * x[j]).sum();
+            assert!(
+                (got[o] - expect).abs() < 1e-3 * expect.abs().max(1e-3),
+                "row {o}: {} vs {expect}",
+                got[o]
             );
         }
     }
