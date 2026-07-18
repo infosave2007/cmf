@@ -289,7 +289,29 @@ impl CmfModel {
         let file_len = file.metadata()?.len();
 
         let backing = match unsafe { memmap2::MmapOptions::new().map(&file) } {
-            Ok(m) => Backing::Mmap(m),
+            Ok(m) => {
+                // Decode touches every weight page each token, so tell
+                // the kernel up front: WillNeed front-loads readahead
+                // (first-token page-fault storm becomes streaming I/O —
+                // this is TTFT on phones, where the file is a large
+                // share of RAM). Advisory only: a memory-pressured
+                // kernel is free to ignore it. CMF_MMAP_ADVISE=0 turns
+                // it off; CMF_MLOCK=1 additionally tries to pin the
+                // mapping (needs RLIMIT_MEMLOCK headroom — refusal is
+                // logged, not fatal).
+                #[cfg(unix)]
+                {
+                    if std::env::var("CMF_MMAP_ADVISE").map(|v| v != "0").unwrap_or(true) {
+                        let _ = m.advise(memmap2::Advice::WillNeed);
+                    }
+                    if std::env::var("CMF_MLOCK").map(|v| v == "1").unwrap_or(false) {
+                        if let Err(e) = m.lock() {
+                            tracing::warn!("CMF_MLOCK=1: mlock refused ({e}) — continuing unpinned");
+                        }
+                    }
+                }
+                Backing::Mmap(m)
+            }
             Err(e) => {
                 tracing::warn!("mmap failed ({e}), reading file into memory");
                 Backing::Owned(std::fs::read(&path)?)
