@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.12] — 2026-07-18
+
+LFM2-MoE support: the LiquidAI **LFM2.5-8B-A1B** hybrid — short-convolution
+mixers, a sparse Mixture-of-Experts FFN, and a handful of full-attention
+layers — converts and runs natively. Coherent generation verified
+end-to-end (q4, `<think>` reasoning + correct answers).
+
+### Added
+
+- **LFM2 / LFM2-MoE architecture** (`lfm2_moe`). A new `ShortConv` token
+  mixer (`AttnKind::ShortConv`, `LayerType::ShortConv`): the gated short
+  convolution `out_proj(C ⊙ conv1d(B ⊙ x))` with a causal depthwise
+  kernel and a per-channel ring state kept in the layer's linear state —
+  decode and chunked prefill share one path, verified bit-identical. The
+  full-attention layers reuse the existing per-head qk-norm → RoPE path
+  with no new code.
+- **Sigmoid MoE routing** (DeepSeek-V3 `noaux_tc` family): a shared
+  `moe_route` scores each expert with a sigmoid, adds an optional
+  per-expert selection bias (`mlp.expert_bias`) to the top-k *choice*
+  only (the gathered weights stay unbiased), then renormalizes with a
+  1e-6 floor and a routed scale. The Qwen softmax-over-all path is
+  unchanged, bit-identical.
+- **Converter** maps the LFM2 vendor tensor names onto CMF's canonical
+  layout (`operator_norm`→`input_layernorm`, `conv.*`→`short_conv.*`,
+  `feed_forward.wN`→`mlp.{gate,up,down}_proj`, `embedding_norm`→`norm`,
+  `self_attn.out_proj`→`o_proj`, …) and reads the `lfm2_moe` config
+  (`conv` → `ShortConv` layers, sigmoid routing, `conv_L_cache` kernel,
+  `norm_eps`).
+
+### Fixed
+
+- **Chat template not bundled** when a checkpoint ships it as a sidecar
+  `chat_template.jinja` (LFM2, newer Qwen3 releases) rather than
+  embedding it in `tokenizer_config.json`: the downloader now fetches the
+  file and the converter ignores an empty one. Without it, `run` fell
+  back to a generic ChatML default that did not match the model and
+  produced degenerate output.
+
+### Changed
+
+- `cortiq info` / `story` report conv-mixer layers distinctly (e.g.
+  `24 (6 full / 18 conv)`) instead of lumping them under "linear".
+
 ## [0.3.4] — 2026-07-17
 
 The whole token on the GPU, and the prefill on the AMX. Bonsai-27B (q1)

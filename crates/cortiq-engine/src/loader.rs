@@ -12,7 +12,9 @@
 //! loads the canonical core `vmf_attn.*` (folded at convert time).
 
 use crate::kv_cache::LayerKvCache;
-use crate::linear_core::{GdnCfg, GdnWeights, VmfPhaseCfg, VmfPhaseWeights};
+use crate::linear_core::{
+    GdnCfg, GdnWeights, ShortConvCfg, ShortConvWeights, VmfPhaseCfg, VmfPhaseWeights,
+};
 use crate::pipeline::{
     AttnKind, DenseFfn, FfnKind, LayerWeights, MoeFfn, MtpModule, Pipeline, PipelineWeights,
 };
@@ -162,11 +164,22 @@ pub(crate) fn build_layer_ffn(
     } else {
         None
     };
+    // LFM2-MoE selection bias (`mlp.expert_bias`): present iff the model
+    // routes with a bias; loaded by tensor presence.
+    let bias_name = format!("{prefix}mlp.expert_bias");
+    let expert_bias = if model.tensor(&bias_name).is_some() {
+        Some(load_f32(model, &bias_name, ov).map_err(CmfError::Parse)?)
+    } else {
+        None
+    };
     Ok(FfnKind::Moe(MoeFfn {
         router: load_matrix(model, &router_name, force_f32, ov)?,
         experts,
         top_k: cfg.top_k,
         norm_topk_prob: cfg.norm_topk_prob,
+        router_sigmoid: cfg.router_sigmoid,
+        expert_bias,
+        routed_scaling: cfg.routed_scaling_factor.unwrap_or(1.0),
         shared,
         stats: std::cell::RefCell::new(Vec::new()),
     }))
@@ -388,6 +401,24 @@ impl Pipeline {
             }
         }
 
+        // ── Short-convolution geometry (LFM2 conv mixer layers) ──
+        let has_short_conv =
+            arch.layer_types.iter().any(|t| matches!(t, LayerType::ShortConv));
+        let short_conv_cfg = if has_short_conv {
+            Some(ShortConvCfg {
+                hidden_size: arch.hidden_size,
+                kernel: arch.linear_conv_kernel_dim.ok_or_else(|| {
+                    CmfError::Parse(
+                        "model has ShortConv layers but no arch.linear_conv_kernel_dim — \
+                         reconvert with the current converter"
+                            .into(),
+                    )
+                })?,
+            })
+        } else {
+            None
+        };
+
         // ── Layers ──
         let load_full_attn = |prefix: &str| -> Result<AttnKind, CmfError> {
             let t = |suffix: &str| load_matrix(model, &format!("{prefix}{suffix}"), force_f32, ov);
@@ -473,11 +504,27 @@ impl Pipeline {
             }))
         };
 
+        // LFM2 short-conv mixer: in_proj [3·hidden, hidden], a depthwise
+        // conv (stored f16 as `[hidden, 1, kernel]` → flattened taps), and
+        // out_proj [hidden, hidden]. Names canonicalized at convert time.
+        let load_short_conv = |prefix: &str| -> Result<AttnKind, CmfError> {
+            let t = |suffix: &str| {
+                load_matrix(model, &format!("{prefix}short_conv.{suffix}"), force_f32, ov)
+            };
+            Ok(AttnKind::ShortConv(ShortConvWeights {
+                in_proj: t("in_proj.weight")?,
+                conv: load_f32(model, &format!("{prefix}short_conv.conv.weight"), ov)
+                    .map_err(err)?,
+                out_proj: t("out_proj.weight")?,
+            }))
+        };
+
         let mut layers = Vec::with_capacity(arch.num_layers);
         for li in 0..arch.num_layers {
             let prefix = format!("model.layers.{li}.");
             let attn = match arch.layer_types.get(li) {
                 Some(LayerType::LinearAttention) => load_linear_attn(&prefix)?,
+                Some(LayerType::ShortConv) => load_short_conv(&prefix)?,
                 _ => load_full_attn(&prefix)?,
             };
             // Gemma-2/3 sandwich: `pre_feedforward_layernorm` present →
@@ -650,6 +697,7 @@ impl Pipeline {
         pipeline.final_softcap = arch.final_logit_softcapping.map(|c| c as f32);
         pipeline.vmf_cfg = vmf_cfg;
         pipeline.gdn_cfg = gdn_cfg;
+        pipeline.short_conv_cfg = short_conv_cfg;
         pipeline.mtp = mtp;
         pipeline.install_dynamic_routing(model, false);
         // Record the load-time overlay so a later set_active_skill(None)

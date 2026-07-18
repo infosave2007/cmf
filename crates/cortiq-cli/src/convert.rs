@@ -56,10 +56,60 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
     }
     for pfx in ["model.language_model.", "language_model.model.", "language_model."] {
         if let Some(rest) = raw.strip_prefix(pfx) {
-            return Some(format!("model.{rest}"));
+            return Some(lfm2_canon(&format!("model.{rest}")));
         }
     }
-    Some(raw.to_string())
+    Some(lfm2_canon(raw))
+}
+
+/// Map LFM2 / LFM2-MoE vendor tensor names onto CMF's canonical (Qwen2)
+/// layout so the standard loader reads them unchanged. Every substring
+/// below is LFM2-exclusive among the supported architectures, so the
+/// rewrite never touches another model's tensors. Returns the name
+/// verbatim for non-LFM2 checkpoints.
+///
+///   operator_norm → input_layernorm      ffn_norm → post_attention_layernorm
+///   embedding_norm → norm                 self_attn.out_proj → self_attn.o_proj
+///   self_attn.{q,k}_layernorm → {q,k}_norm
+///   conv.{in_proj,conv,out_proj} → short_conv.*
+///   feed_forward.gate/expert_bias/experts.N → mlp.*
+///   feed_forward.w1/w3/w2 → mlp.{gate,up,down}_proj (dense + per expert)
+fn lfm2_canon(name: &str) -> String {
+    let is_lfm2 = name == "model.embedding_norm.weight"
+        || name.contains(".operator_norm")
+        || name.contains(".ffn_norm")
+        || name.contains(".feed_forward.")
+        || name.contains(".conv.")
+        || name.contains(".self_attn.out_proj")
+        || name.contains(".self_attn.q_layernorm")
+        || name.contains(".self_attn.k_layernorm");
+    if !is_lfm2 {
+        return name.to_string();
+    }
+    if name == "model.embedding_norm.weight" {
+        return "model.norm.weight".to_string();
+    }
+    let mut n = name.to_string();
+    n = n.replace(".operator_norm.", ".input_layernorm.");
+    n = n.replace(".ffn_norm.", ".post_attention_layernorm.");
+    n = n.replace(".self_attn.out_proj.", ".self_attn.o_proj.");
+    n = n.replace(".self_attn.q_layernorm.", ".self_attn.q_norm.");
+    n = n.replace(".self_attn.k_layernorm.", ".self_attn.k_norm.");
+    n = n.replace(".conv.in_proj.", ".short_conv.in_proj.");
+    n = n.replace(".conv.out_proj.", ".short_conv.out_proj.");
+    n = n.replace(".conv.conv.", ".short_conv.conv.");
+    // FFN: router/bias/experts first, then the dense fallback, then the
+    // w1/w3/w2 → gate/up/down rename (applies to both mlp.wK and
+    // mlp.experts.N.wK). Order matters — the experts substring carries
+    // `.feed_forward.` so it must run before the bare `.feed_forward.`.
+    n = n.replace(".feed_forward.gate.weight", ".mlp.gate.weight");
+    n = n.replace(".feed_forward.expert_bias", ".mlp.expert_bias");
+    n = n.replace(".feed_forward.experts.", ".mlp.experts.");
+    n = n.replace(".feed_forward.", ".mlp.");
+    n = n.replace(".w1.weight", ".gate_proj.weight");
+    n = n.replace(".w3.weight", ".up_proj.weight");
+    n = n.replace(".w2.weight", ".down_proj.weight");
+    n
 }
 
 /// Small, noise-sensitive 2-D projections the reference converter keeps at f16
@@ -490,12 +540,11 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     let layer_types: Vec<LayerType> = match tc.get("layer_types").and_then(|v| v.as_array()) {
         Some(a) => a
             .iter()
-            .map(|v| {
-                if v.as_str() == Some("linear_attention") {
-                    LayerType::LinearAttention
-                } else {
-                    LayerType::FullAttention
-                }
+            .map(|v| match v.as_str() {
+                Some("linear_attention") => LayerType::LinearAttention,
+                // LFM2 gated short convolution mixer.
+                Some("conv") | Some("short_conv") => LayerType::ShortConv,
+                _ => LayerType::FullAttention,
             })
             .collect(),
         None => vec![LayerType::FullAttention; n_layers],
@@ -532,12 +581,23 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     let moe = tc.get("num_experts").and_then(|v| v.as_u64()).filter(|&n| n > 0).map(|ne| {
         let mt = model_type.to_lowercase();
         let ntp_default = mt.starts_with("qwen3_5") || mt.contains("qwen3_next");
+        // LFM2-MoE routes with a sigmoid gate + selection bias (DeepSeek-V3
+        // noaux_tc); Qwen keeps the softmax-over-all default.
+        let is_lfm2 = mt.starts_with("lfm2");
         MoeConfig {
             num_experts: ne as usize,
             top_k: cfg_usize(tc, "num_experts_per_tok").unwrap_or(2),
             moe_intermediate_size: cfg_usize(tc, "moe_intermediate_size").unwrap_or(0),
             norm_topk_prob: tc.get("norm_topk_prob").and_then(|v| v.as_bool()).unwrap_or(ntp_default),
             shared_expert_intermediate_size: cfg_usize(tc, "shared_expert_intermediate_size"),
+            router_sigmoid: is_lfm2,
+            // A stored scale of 1.0 is the no-op default; only non-trivial
+            // scales need to ride in the header.
+            routed_scaling_factor: tc
+                .get("routed_scaling_factor")
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32)
+                .filter(|&v| (v - 1.0).abs() > 1e-9),
         }
     });
     let head_dim = cfg_usize(tc, "head_dim").unwrap_or(hidden / n_heads.max(1));
@@ -670,7 +730,12 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         head_dim,
         vocab_size: cfg_usize(tc, "vocab_size").ok_or_else(|| anyhow::anyhow!("config: missing vocab_size"))?,
         layer_types,
-        rms_norm_eps: tc.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6),
+        // LFM2 spells the RMSNorm epsilon `norm_eps`.
+        rms_norm_eps: tc
+            .get("rms_norm_eps")
+            .or_else(|| tc.get("norm_eps"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1e-6),
         norm_style,
         rope_theta,
         // Gemma ties embeddings by default and its configs omit the key.
@@ -683,7 +748,9 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         moe,
         linear_core,
         max_position_embeddings: max_pos,
-        linear_conv_kernel_dim: cfg_usize(tc, "linear_conv_kernel_dim"),
+        // GDN spells it `linear_conv_kernel_dim`; LFM2 spells it `conv_L_cache`.
+        linear_conv_kernel_dim: cfg_usize(tc, "linear_conv_kernel_dim")
+            .or_else(|| cfg_usize(tc, "conv_L_cache")),
         linear_num_key_heads: cfg_usize(tc, "linear_num_key_heads"),
         linear_num_value_heads: lnv,
         linear_key_head_dim: cfg_usize(tc, "linear_key_head_dim"),
@@ -967,6 +1034,11 @@ pub(crate) fn hf_download(repo: &str, token: Option<&str>) -> anyhow::Result<std
         ("tokenizer.json", true),
         ("tokenizer_config.json", false),
         ("generation_config.json", false),
+        // Newer HF checkpoints (LFM2, Qwen3, …) ship the chat template as a
+        // sidecar `chat_template.jinja` instead of embedding it in
+        // tokenizer_config.json — without it `run` falls back to a generic
+        // ChatML default that does not match the model's real format.
+        ("chat_template.jinja", false),
     ] {
         fetch(&agent, &format!("{base}/{f}"), &dir.join(f), token, required, threads)?;
     }
@@ -1434,7 +1506,11 @@ pub fn run_convert(
         fs::read(dir.join("tokenizer_config.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::Value::Null);
     let gen_cfg: serde_json::Value =
         fs::read(dir.join("generation_config.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::Value::Null);
-    let chat_template = fs::read_to_string(dir.join("chat_template.jinja")).ok()
+    // Sidecar `chat_template.jinja` first, then the tokenizer_config field;
+    // ignore an empty/blank file so we correctly fall through to the config.
+    let chat_template = fs::read_to_string(dir.join("chat_template.jinja"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
         .or_else(|| tok_cfg.get("chat_template").and_then(|v| v.as_str().map(String::from)));
     let bundle = TokenizerBundle {
         chat_template,
@@ -1602,6 +1678,112 @@ mod tests {
         // a = next r per group: g=0 -> 2,3 ; g=1 -> 6,7
         assert_eq!(outb[1].0, "m.linear_attn.in_proj_a.weight");
         assert_eq!(outb[1].1, [2.0, 3.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn lfm2_names_map_to_canonical_layout() {
+        // Conv (dense) layer 0.
+        let c = |s: &str| canon_name(s).unwrap();
+        assert_eq!(c("model.embedding_norm.weight"), "model.norm.weight");
+        assert_eq!(
+            c("model.layers.0.operator_norm.weight"),
+            "model.layers.0.input_layernorm.weight"
+        );
+        assert_eq!(
+            c("model.layers.0.ffn_norm.weight"),
+            "model.layers.0.post_attention_layernorm.weight"
+        );
+        assert_eq!(
+            c("model.layers.0.conv.in_proj.weight"),
+            "model.layers.0.short_conv.in_proj.weight"
+        );
+        assert_eq!(
+            c("model.layers.0.conv.conv.weight"),
+            "model.layers.0.short_conv.conv.weight"
+        );
+        assert_eq!(
+            c("model.layers.0.conv.out_proj.weight"),
+            "model.layers.0.short_conv.out_proj.weight"
+        );
+        // Dense FFN: w1/w3/w2 → gate/up/down.
+        assert_eq!(
+            c("model.layers.0.feed_forward.w1.weight"),
+            "model.layers.0.mlp.gate_proj.weight"
+        );
+        assert_eq!(
+            c("model.layers.0.feed_forward.w3.weight"),
+            "model.layers.0.mlp.up_proj.weight"
+        );
+        assert_eq!(
+            c("model.layers.0.feed_forward.w2.weight"),
+            "model.layers.0.mlp.down_proj.weight"
+        );
+        // Attention (full_attention layer 2): out_proj → o_proj, q/k layernorm.
+        assert_eq!(
+            c("model.layers.2.self_attn.out_proj.weight"),
+            "model.layers.2.self_attn.o_proj.weight"
+        );
+        assert_eq!(
+            c("model.layers.2.self_attn.q_layernorm.weight"),
+            "model.layers.2.self_attn.q_norm.weight"
+        );
+        assert_eq!(
+            c("model.layers.2.self_attn.k_layernorm.weight"),
+            "model.layers.2.self_attn.k_norm.weight"
+        );
+        // MoE router / bias / experts.
+        assert_eq!(
+            c("model.layers.2.feed_forward.gate.weight"),
+            "model.layers.2.mlp.gate.weight"
+        );
+        assert_eq!(
+            c("model.layers.2.feed_forward.expert_bias"),
+            "model.layers.2.mlp.expert_bias"
+        );
+        assert_eq!(
+            c("model.layers.2.feed_forward.experts.7.w1.weight"),
+            "model.layers.2.mlp.experts.7.gate_proj.weight"
+        );
+        assert_eq!(
+            c("model.layers.2.feed_forward.experts.7.w2.weight"),
+            "model.layers.2.mlp.experts.7.down_proj.weight"
+        );
+        // Q/K/V projections already canonical — must pass through untouched.
+        assert_eq!(
+            c("model.layers.2.self_attn.q_proj.weight"),
+            "model.layers.2.self_attn.q_proj.weight"
+        );
+        // A Qwen tensor must be untouched by the LFM2 rewrite.
+        assert_eq!(
+            c("model.layers.3.mlp.gate_proj.weight"),
+            "model.layers.3.mlp.gate_proj.weight"
+        );
+    }
+
+    #[test]
+    fn lfm2_moe_arch_routing_and_layers() {
+        let cfg: serde_json::Value = serde_json::from_str(
+            r#"{"model_type":"lfm2_moe","hidden_size":2048,"num_hidden_layers":4,
+                "num_attention_heads":32,"num_key_value_heads":8,"intermediate_size":7168,
+                "moe_intermediate_size":1792,"vocab_size":128000,"norm_eps":1e-5,
+                "conv_L_cache":3,"num_experts":32,"num_experts_per_tok":4,
+                "norm_topk_prob":true,"use_expert_bias":true,"routed_scaling_factor":1.0,
+                "tie_word_embeddings":true,"rope_parameters":{"rope_theta":5000000},
+                "layer_types":["conv","conv","full_attention","conv"]}"#,
+        )
+        .unwrap();
+        let arch = build_arch(&cfg).unwrap();
+        assert_eq!(arch.layer_types[0], LayerType::ShortConv);
+        assert_eq!(arch.layer_types[2], LayerType::FullAttention);
+        assert_eq!(arch.head_dim, 64);
+        assert_eq!(arch.linear_conv_kernel_dim, Some(3));
+        assert!((arch.rms_norm_eps - 1e-5).abs() < 1e-12);
+        let moe = arch.moe.as_ref().unwrap();
+        assert!(moe.router_sigmoid, "lfm2_moe must route with a sigmoid gate");
+        assert_eq!(moe.top_k, 4);
+        assert!(moe.norm_topk_prob);
+        // Scale 1.0 stores as None (no-op).
+        assert_eq!(moe.routed_scaling_factor, None);
     }
 
     #[test]

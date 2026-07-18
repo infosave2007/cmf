@@ -657,6 +657,165 @@ pub fn gdn_pair(
     (out1, out2)
 }
 
+// ───────────────────────── ShortConv (LFM2 gated short convolution) ─────────────────────────
+
+/// Weights of one LFM2 short-convolution mixer
+/// (`model.layers.{i}.short_conv.*`, renamed from the vendor `conv.*` at
+/// convert time). No recurrent condensate — the only state is the causal
+/// conv ring (the last `kernel−1` gated inputs per channel).
+pub struct ShortConvWeights {
+    /// [3·hidden, hidden] — fused (B, C, x) projection.
+    pub in_proj: QTensor,
+    /// [hidden · kernel] depthwise conv taps, flattened `[channel][tap]`
+    /// (the source `[hidden, 1, kernel]` with the singleton group axis
+    /// dropped). Tap `kernel−1` multiplies the current position.
+    pub conv: Vec<f32>,
+    /// [hidden, hidden] — output projection.
+    pub out_proj: QTensor,
+}
+
+#[derive(Clone, Copy)]
+pub struct ShortConvCfg {
+    pub hidden_size: usize,
+    /// Conv kernel width `L` (`conv_L_cache`; LFM2 uses 3).
+    pub kernel: usize,
+}
+
+impl ShortConvCfg {
+    /// Conv ring: the last `kernel−1` gated inputs per channel.
+    pub fn state_len(&self) -> usize {
+        (self.kernel - 1) * self.hidden_size
+    }
+}
+
+/// One position through the gated conv, given the fused projection
+/// `bcx = in_proj·x` [3·hidden] = [B | C | x]. Advances the conv ring and
+/// writes the gated conv output `y = C ⊙ conv(B ⊙ x)` [hidden] into `y`.
+///
+/// The conv is PyTorch's causal depthwise `Conv1d(padding=kernel−1)`
+/// truncated to the current length: for tap `k`, weight `w[c][k]` pairs
+/// with the input `kernel−1−k` steps in the past, so `w[c][kernel−1]` is
+/// the current position. The ring holds `in[t−1] … in[t−(kernel−1)]` at
+/// slots `0 … kernel−2`.
+fn short_conv_step(
+    bcx: &[f32],
+    conv: &[f32],
+    cfg: &ShortConvCfg,
+    ring_state: &mut [f32],
+    y: &mut [f32],
+) {
+    let (h, k) = (cfg.hidden_size, cfg.kernel);
+    let ring = k - 1;
+    let (bg, cg, xg) = (&bcx[0..h], &bcx[h..2 * h], &bcx[2 * h..3 * h]);
+    for c in 0..h {
+        let bx = bg[c] * xg[c];
+        let wc = &conv[c * k..(c + 1) * k];
+        // Current tap, then the past taps read from the channel's ring.
+        let mut acc = wc[k - 1] * bx;
+        let rc = &mut ring_state[c * ring..c * ring + ring];
+        for s in 0..ring {
+            acc += wc[k - 2 - s] * rc[s];
+        }
+        y[c] = cg[c] * acc;
+        // Shift newest-in-front: slot 0 becomes the just-seen input.
+        for s in (1..ring).rev() {
+            rc[s] = rc[s - 1];
+        }
+        if ring > 0 {
+            rc[0] = bx;
+        }
+    }
+}
+
+/// Forward one position through a short-conv layer, advancing `state`.
+pub fn short_conv_forward(
+    x: &[f32],
+    w: &ShortConvWeights,
+    cfg: &ShortConvCfg,
+    state: &mut Vec<f32>,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    if state.len() != cfg.state_len() {
+        *state = vec![0f32; cfg.state_len()];
+    }
+    let h = cfg.hidden_size;
+    let mut bcx = vec![0.0f32; 3 * h];
+    w.in_proj.matvec(x, &mut bcx, pool);
+    let mut y = vec![0.0f32; h];
+    short_conv_step(&bcx, &w.conv, cfg, state, &mut y);
+    let mut out = vec![0.0f32; h];
+    w.out_proj.matvec(&y, &mut out, pool);
+    out
+}
+
+/// Batched short-conv forward (prefill-GEMM): in_proj/out_proj are matmat
+/// over the chunk (a weight row streamed once), the conv walks the
+/// positions in order — the chunk is contiguous, so the ring state is
+/// exactly the sequential path's and the math is elementwise identical.
+pub fn short_conv_forward_batch(
+    xs: &[f32],
+    b: usize,
+    w: &ShortConvWeights,
+    cfg: &ShortConvCfg,
+    state: &mut Vec<f32>,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    if state.len() != cfg.state_len() {
+        *state = vec![0f32; cfg.state_len()];
+    }
+    let h = cfg.hidden_size;
+    let mut bcx = vec![0.0f32; b * 3 * h];
+    w.in_proj.matmat(xs, b, &mut bcx, pool);
+    let mut y = vec![0.0f32; b * h];
+    for bi in 0..b {
+        short_conv_step(
+            &bcx[bi * 3 * h..(bi + 1) * 3 * h],
+            &w.conv,
+            cfg,
+            state,
+            &mut y[bi * h..(bi + 1) * h],
+        );
+    }
+    let mut out = vec![0.0f32; b * h];
+    w.out_proj.matmat(&y, b, &mut out, pool);
+    out
+}
+
+/// Fused two-position forward (speculative verify). Lane 1 commits into
+/// `state`; lane 2's tentative ring goes into `scratch` — swapped in on
+/// draft acceptance, dropped on rejection. LFM2 ships no MTP head, so this
+/// is exercised only by the pair-fusion micro-benchmark; kept correct.
+#[allow(clippy::too_many_arguments)]
+pub fn short_conv_pair(
+    x1: &[f32],
+    x2: &[f32],
+    w: &ShortConvWeights,
+    cfg: &ShortConvCfg,
+    state: &mut Vec<f32>,
+    scratch: &mut Vec<f32>,
+    pool: Option<&Pool>,
+) -> (Vec<f32>, Vec<f32>) {
+    if state.len() != cfg.state_len() {
+        *state = vec![0f32; cfg.state_len()];
+    }
+    let h = cfg.hidden_size;
+    let mut bcx1 = vec![0.0f32; 3 * h];
+    let mut bcx2 = vec![0.0f32; 3 * h];
+    w.in_proj.matvec2(x1, x2, &mut bcx1, &mut bcx2, pool);
+
+    let mut y1 = vec![0.0f32; h];
+    short_conv_step(&bcx1, &w.conv, cfg, state, &mut y1);
+    scratch.clear();
+    scratch.extend_from_slice(state);
+    let mut y2 = vec![0.0f32; h];
+    short_conv_step(&bcx2, &w.conv, cfg, scratch, &mut y2);
+
+    let mut out1 = vec![0.0f32; h];
+    let mut out2 = vec![0.0f32; h];
+    w.out_proj.matvec2(&y1, &y2, &mut out1, &mut out2, pool);
+    (out1, out2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,5 +1071,75 @@ mod tests {
             }
             assert_eq!(inc, replay, "position {t}: ring must equal replay");
         }
+    }
+
+    fn tiny_short_conv() -> (ShortConvWeights, ShortConvCfg) {
+        let cfg = ShortConvCfg { hidden_size: 8, kernel: 3 };
+        let synth = |rows: usize, cols: usize, salt: usize| {
+            QTensor::from_f32(
+                (0..rows * cols)
+                    .map(|i| (((i * 11 + salt * 5) % 89) as f32 / 89.0 - 0.5) * 0.5)
+                    .collect(),
+                rows,
+                cols,
+            )
+        };
+        let w = ShortConvWeights {
+            in_proj: synth(3 * cfg.hidden_size, cfg.hidden_size, 1),
+            conv: (0..cfg.hidden_size * cfg.kernel)
+                .map(|i| ((i * 7 % 13) as f32 / 13.0 - 0.5) * 0.8)
+                .collect(),
+            out_proj: synth(cfg.hidden_size, cfg.hidden_size, 2),
+        };
+        (w, cfg)
+    }
+
+    /// The incremental conv ring must equal a from-scratch causal replay
+    /// of the prefix at every position — the decode/prefill contract.
+    #[test]
+    fn short_conv_ring_matches_explicit_causal_conv() {
+        let (w, cfg) = tiny_short_conv();
+        let seq: Vec<Vec<f32>> = (0..6)
+            .map(|t| (0..8).map(|i| ((t * 8 + i) as f32 * 0.19).cos()).collect())
+            .collect();
+        let mut s_inc = Vec::new();
+        for (t, x) in seq.iter().enumerate() {
+            let inc = short_conv_forward(x, &w, &cfg, &mut s_inc, None);
+            let mut s_replay = Vec::new();
+            let mut replay = Vec::new();
+            for xr in &seq[..=t] {
+                replay = short_conv_forward(xr, &w, &cfg, &mut s_replay, None);
+            }
+            assert_eq!(inc, replay, "position {t}: ring must equal replay");
+            assert_eq!(s_inc.len(), cfg.state_len());
+        }
+    }
+
+    /// The batched prefill path (matmat + sequential conv over the chunk)
+    /// must reproduce the position-by-position decode path exactly.
+    #[test]
+    fn short_conv_batch_matches_sequential() {
+        let (w, cfg) = tiny_short_conv();
+        let b = 5;
+        let xs: Vec<f32> =
+            (0..b * cfg.hidden_size).map(|i| (i as f32 * 0.13).sin() * 0.6).collect();
+
+        let mut s_seq = Vec::new();
+        let mut seq_out = vec![0.0f32; b * cfg.hidden_size];
+        for bi in 0..b {
+            let o = short_conv_forward(
+                &xs[bi * cfg.hidden_size..(bi + 1) * cfg.hidden_size],
+                &w,
+                &cfg,
+                &mut s_seq,
+                None,
+            );
+            seq_out[bi * cfg.hidden_size..(bi + 1) * cfg.hidden_size].copy_from_slice(&o);
+        }
+
+        let mut s_batch = Vec::new();
+        let batch_out = short_conv_forward_batch(&xs, b, &w, &cfg, &mut s_batch, None);
+        assert_eq!(seq_out, batch_out, "batch conv must match sequential decode");
+        assert_eq!(s_seq, s_batch, "ring state must match after the chunk");
     }
 }

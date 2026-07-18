@@ -2057,20 +2057,23 @@ async fn cmd_info(model_path: &str) -> anyhow::Result<()> {
     let model = CmfModel::open_sharded(model_path)?;
     let arch = model.arch();
 
-    let full = arch
-        .layer_types
-        .iter()
-        .filter(|t| matches!(t, cortiq_core::LayerType::FullAttention))
-        .count();
+    let count = |k: cortiq_core::LayerType| {
+        arch.layer_types.iter().filter(|&&t| t == k).count()
+    };
+    let full = count(cortiq_core::LayerType::FullAttention);
+    let conv = count(cortiq_core::LayerType::ShortConv);
+    let linear = arch.num_layers - full - conv;
     println!("Model: {}", model_path);
     println!("  Format:      CMF v{}", model.header.version);
     println!("  Arch:        {}", arch.arch_name);
-    println!(
-        "  Layers:      {} ({} full / {} linear)",
-        arch.num_layers,
-        full,
-        arch.num_layers - full
-    );
+    let mut mix = format!("{full} full");
+    if conv > 0 {
+        mix.push_str(&format!(" / {conv} conv"));
+    }
+    if linear > 0 {
+        mix.push_str(&format!(" / {linear} linear"));
+    }
+    println!("  Layers:      {} ({mix})", arch.num_layers);
     println!("  Hidden:      {}", arch.hidden_size);
     println!("  FFN:         {}", arch.intermediate_size);
     println!("  Heads:       {} (KV: {})", arch.num_attention_heads, arch.num_kv_heads);
@@ -2110,14 +2113,23 @@ fn cmd_story(model_path: &str) -> anyhow::Result<()> {
         .iter()
         .filter(|t| matches!(t, cortiq_core::LayerType::FullAttention))
         .count();
+    let conv = arch
+        .layer_types
+        .iter()
+        .filter(|t| matches!(t, cortiq_core::LayerType::ShortConv))
+        .count();
+    // "mixer" layers = everything that isn't full softmax attention
+    // (linear-attention cores and short-conv mixers alike).
     let linear = arch.num_layers - full;
+    // Prefer the precise word when the non-full layers are conv mixers.
+    let mixer = if conv > 0 { "conv" } else { "linear" };
     let body = match (&arch.moe, linear, full) {
         (Some(m), l, f) if l > 0 && f > 0 => format!(
-            "hybrid: {l} linear + {f} full-attention layers, MoE ({} experts, top-{})",
+            "hybrid: {l} {mixer} + {f} full-attention layers, MoE ({} experts, top-{})",
             m.num_experts, m.top_k
         ),
         (Some(m), _, _) => format!("MoE transformer ({} experts, top-{})", m.num_experts, m.top_k),
-        (None, l, f) if l > 0 && f > 0 => format!("hybrid: {l} linear + {f} full-attention layers"),
+        (None, l, f) if l > 0 && f > 0 => format!("hybrid: {l} {mixer} + {f} full-attention layers"),
         _ => "dense transformer".to_string(),
     };
     println!("\n\x1b[1m📖 Model story: {model_path}\x1b[0m");

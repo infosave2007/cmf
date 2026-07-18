@@ -140,6 +140,10 @@ pub enum LayerType {
     /// Linear attention (executed by the canonical linear core;
     /// original operator, e.g. GatedDeltaNet, is folded at convert time)
     LinearAttention,
+    /// Gated short convolution mixer (LFM2 / LFM2-MoE): in_proj → (B,C,x)
+    /// gates + a causal depthwise conv1d over recent tokens, no KV cache.
+    /// `linear_conv_kernel_dim` carries the kernel width.
+    ShortConv,
 }
 
 /// Multi-token-prediction head carried by the file (DeepSeek/Qwen-MTP
@@ -180,6 +184,17 @@ pub struct MoeConfig {
     /// Qwen2-MoE always-on shared expert (None = absent, Qwen3-MoE).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_expert_intermediate_size: Option<usize>,
+    /// Router scores each expert with a sigmoid instead of a softmax over
+    /// all experts (LFM2-MoE / DeepSeek-V3 `noaux_tc`). Selection may add a
+    /// per-expert bias (`mlp.expert_bias`) for the top-k choice while the
+    /// gathered weights come from the *unbiased* sigmoid scores. False =
+    /// classic Qwen softmax routing (bit-identical to the historical path).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub router_sigmoid: bool,
+    /// Top-k weights are multiplied by this after the optional renorm
+    /// (LFM2-MoE `routed_scaling_factor`). None = 1.0 (no scaling).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_scaling_factor: Option<f32>,
 }
 
 /// Model architecture descriptor.

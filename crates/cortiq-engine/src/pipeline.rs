@@ -10,8 +10,9 @@ use crate::attention::{self, QwenAttnCfg};
 use crate::inference;
 use crate::kv_cache::KvCache;
 use crate::linear_core::{
-    gdn_forward, gdn_pair, vmf_phase_forward, vmf_phase_pair, GdnCfg, GdnWeights, VmfPhaseCfg,
-    VmfPhaseWeights,
+    gdn_forward, gdn_pair, short_conv_forward, short_conv_forward_batch, short_conv_pair,
+    vmf_phase_forward, vmf_phase_pair, GdnCfg, GdnWeights, ShortConvCfg, ShortConvWeights,
+    VmfPhaseCfg, VmfPhaseWeights,
 };
 use crate::pool::Pool;
 use crate::qtensor::QTensor;
@@ -65,6 +66,9 @@ pub struct Pipeline {
     pub vmf_cfg: Option<VmfPhaseCfg>,
     /// GatedDeltaNet geometry (faithful vendor operator).
     pub gdn_cfg: Option<GdnCfg>,
+    /// LFM2 short-convolution geometry (present when the model has
+    /// `ShortConv` mixer layers).
+    pub short_conv_cfg: Option<ShortConvCfg>,
     /// Multi-token-prediction head (None = absent).
     pub mtp: Option<MtpModule>,
     /// Speculative decode via MTP (greedy only; `CMF_MTP=0` disables).
@@ -250,6 +254,16 @@ pub struct MoeFfn {
     pub experts: Vec<DenseFfn>,
     pub top_k: usize,
     pub norm_topk_prob: bool,
+    /// Router scores per-expert with a sigmoid (LFM2-MoE / DeepSeek-V3
+    /// `noaux_tc`) instead of a softmax over all experts (Qwen).
+    pub router_sigmoid: bool,
+    /// Per-expert selection bias `mlp.expert_bias` [num_experts]
+    /// (LFM2-MoE): added to the sigmoid scores for the top-k CHOICE only;
+    /// the gathered weights use the unbiased scores. None = no bias.
+    pub expert_bias: Option<Vec<f32>>,
+    /// Top-k weights are multiplied by this after the optional renorm
+    /// (LFM2-MoE `routed_scaling_factor`; 1.0 = off).
+    pub routed_scaling: f32,
     /// Qwen2-MoE always-on shared expert: (FFN, sigmoid-gate [1, hidden]).
     pub shared: Option<(DenseFfn, QTensor)>,
     /// Expert-selection counters (truncated Fisher B-field of claim 12:
@@ -277,6 +291,9 @@ pub enum AttnKind {
     Linear(VmfPhaseWeights),
     /// Faithful vendor linear operator (Qwen3.5 GatedDeltaNet).
     LinearGdn(GdnWeights),
+    /// LFM2 gated short-convolution mixer (no KV cache; conv ring state
+    /// lives in the layer's `linear_state`).
+    ShortConv(ShortConvWeights),
 }
 
 /// Multi-token-prediction head (DeepSeek/Qwen style, spec §2.1):
@@ -849,6 +866,7 @@ impl Pipeline {
             rotary_dim: head_dim,
             vmf_cfg: None,
             gdn_cfg: None,
+            short_conv_cfg: None,
             mtp: None,
             speculative: std::env::var("CMF_MTP").map(|v| v != "0").unwrap_or(true),
             rng,
@@ -1374,7 +1392,7 @@ impl Pipeline {
                     .map(|(q, k, v)| (q.as_slice(), k.as_slice(), v.as_slice()));
                 attention::qwen_attention(&self.ws.n1, wq, wk, wv, wo, &mut m.kv, &cfg)
             }
-            AttnKind::Linear(_) | AttnKind::LinearGdn(_) => {
+            AttnKind::Linear(_) | AttnKind::LinearGdn(_) | AttnKind::ShortConv(_) => {
                 unreachable!("MTP block is full attention")
             }
         };
@@ -1459,6 +1477,14 @@ impl Pipeline {
                     let layer = &mut self.kv_cache.layers[li];
                     let (state, scratch) = (&mut layer.linear_state, &mut layer.linear_scratch);
                     gdn_pair(&self.ws.n1, &self.ws.n2, w, &cfg, state, scratch, self.pool.as_deref())
+                }
+                AttnKind::ShortConv(w) => {
+                    let cfg = self.short_conv_cfg.expect("short-conv layer without short_conv_cfg");
+                    let layer = &mut self.kv_cache.layers[li];
+                    let (state, scratch) = (&mut layer.linear_state, &mut layer.linear_scratch);
+                    short_conv_pair(
+                        &self.ws.n1, &self.ws.n2, w, &cfg, state, scratch, self.pool.as_deref(),
+                    )
                 }
                 AttnKind::Full {
                     wq,
@@ -2017,6 +2043,30 @@ impl Pipeline {
                         *dst += a;
                     }
                 }
+                AttnKind::ShortConv(w) => {
+                    // Projections batched over the chunk; the conv walks the
+                    // contiguous positions in order (same ring as decode).
+                    let cfg =
+                        self.short_conv_cfg.expect("short-conv layer without short_conv_cfg");
+                    let mut normed = vec![0.0f32; b * hs];
+                    for bi in 0..b {
+                        inference::rms_norm_into(
+                            &h[bi * hs..(bi + 1) * hs],
+                            &lw.input_norm,
+                            eps,
+                            norm_style,
+                            &mut normed[bi * hs..(bi + 1) * hs],
+                        );
+                    }
+                    let attn = short_conv_forward_batch(
+                        &normed, b, w, &cfg,
+                        &mut self.kv_cache.layers[li].linear_state,
+                        pool.as_deref(),
+                    );
+                    for (dst, &a) in h.iter_mut().zip(&attn) {
+                        *dst += a;
+                    }
+                }
                 AttnKind::Full {
                     wq, wk, wv, wo, q_norm, k_norm, output_gate, bias,
                 } => {
@@ -2414,6 +2464,17 @@ impl Pipeline {
                 AttnKind::LinearGdn(w) => {
                     let cfg = self.gdn_cfg.expect("gdn layer without gdn_cfg");
                     gdn_forward(
+                        &self.ws.n1,
+                        w,
+                        &cfg,
+                        &mut self.kv_cache.layers[li].linear_state,
+                        self.pool.as_deref(),
+                    )
+                }
+                AttnKind::ShortConv(w) => {
+                    let cfg =
+                        self.short_conv_cfg.expect("short-conv layer without short_conv_cfg");
+                    short_conv_forward(
                         &self.ws.n1,
                         w,
                         &cfg,
@@ -2896,8 +2957,8 @@ fn moe_ffn_batch(m: &MoeFfn, xs: &[f32], b: usize, hidden: usize, pool: Option<&
     let mut logits = vec![0.0f32; b * ne];
     m.router.matmat(xs, b, &mut logits, pool);
 
-    // Assignments: expert → [(position, weight)] — the same top-k semantics
-    // as moe_ffn (softmax over all, torch.topk order, optional renorm).
+    // Assignments: expert → [(position, weight)] — same routing as
+    // moe_ffn, per position (see `moe_route`).
     let mut assign: Vec<Vec<(usize, f32)>> = vec![Vec::new(); ne];
     {
         let mut st = m.stats.borrow_mut();
@@ -2905,22 +2966,8 @@ fn moe_ffn_batch(m: &MoeFfn, xs: &[f32], b: usize, hidden: usize, pool: Option<&
             st.resize(ne, 0);
         }
         for bi in 0..b {
-            let lg = &logits[bi * ne..(bi + 1) * ne];
-            let mx = lg.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut p: Vec<f32> = lg.iter().map(|&l| (l - mx).exp()).collect();
-            let sum: f32 = p.iter().sum();
-            for v in &mut p {
-                *v /= sum;
-            }
-            let mut order: Vec<usize> = (0..ne).collect();
-            order.sort_unstable_by(|&x, &y| p[y].partial_cmp(&p[x]).unwrap().then(x.cmp(&y)));
-            order.truncate(m.top_k);
-            let wsum: f32 = if m.norm_topk_prob {
-                order.iter().map(|&e| p[e]).sum()
-            } else {
-                1.0
-            };
-            for &e in &order {
+            let (idx, p, wsum) = moe_route(&logits[bi * ne..(bi + 1) * ne], m);
+            for &e in &idx {
                 st[e] += 1;
                 assign[e].push((bi, p[e] / wsum));
             }
@@ -3244,28 +3291,55 @@ impl SendMut {
     }
 }
 
-/// MoE FFN: router softmax over ALL experts → top-k (HF Qwen2/3-MoE
-/// semantics: probabilities BEFORE selection; optional renorm of the
-/// selected k). Only selected experts' pages are touched in mmap.
+/// Router → (selected experts in torch.topk order, per-expert score
+/// vector, normalizer). The final weight of expert `e` is `p[e] / wsum`.
+///
+/// Two regimes share this. Qwen: softmax over ALL experts, top-k of the
+/// probabilities, optional renorm — `router_sigmoid=false`, no bias,
+/// scale 1 → bit-identical to the historical path. LFM2-MoE /
+/// DeepSeek-V3 `noaux_tc`: per-expert sigmoid scores, an optional
+/// selection bias (top-k CHOICE only; weights stay unbiased), a 1e-6 renorm
+/// floor and a routed scale.
+fn moe_route(logits: &[f32], m: &MoeFfn) -> (Vec<usize>, Vec<f32>, f32) {
+    let ne = logits.len();
+    let p: Vec<f32> = if m.router_sigmoid {
+        logits.iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect()
+    } else {
+        let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut e: Vec<f32> = logits.iter().map(|&l| (l - mx).exp()).collect();
+        let s: f32 = e.iter().sum();
+        for v in &mut e {
+            *v /= s;
+        }
+        e
+    };
+    let mut idx: Vec<usize> = (0..ne).collect();
+    // Descending by selection score, lower index wins ties (torch.topk).
+    match &m.expert_bias {
+        Some(b) => idx.sort_unstable_by(|&x, &y| {
+            (p[y] + b[y]).partial_cmp(&(p[x] + b[x])).unwrap().then(x.cmp(&y))
+        }),
+        None => idx.sort_unstable_by(|&x, &y| p[y].partial_cmp(&p[x]).unwrap().then(x.cmp(&y))),
+    }
+    idx.truncate(m.top_k);
+    let wsum: f32 = if m.norm_topk_prob {
+        let s: f32 = idx.iter().map(|&e| p[e]).sum();
+        // LFM2 floors the denom (matches HF `+ 1e-6`); the softmax path's
+        // probs already sum near 1, so it stays exactly as before.
+        (if m.router_sigmoid { s + 1e-6 } else { s }) / m.routed_scaling
+    } else {
+        1.0 / m.routed_scaling
+    };
+    (idx, p, wsum)
+}
+
+/// MoE FFN: router → top-k experts (see `moe_route`). Only selected
+/// experts' pages are touched in mmap.
 fn moe_ffn(m: &MoeFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
     let ne = m.experts.len();
     let mut logits = vec![0.0f32; ne];
     m.router.matvec(x, &mut logits, pool);
-    let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut p: Vec<f32> = logits.iter().map(|&l| (l - mx).exp()).collect();
-    let s: f32 = p.iter().sum();
-    for v in &mut p {
-        *v /= s;
-    }
-    let mut idx: Vec<usize> = (0..ne).collect();
-    // Descending by prob, lower index wins ties — torch.topk order.
-    idx.sort_unstable_by(|&a, &b| p[b].partial_cmp(&p[a]).unwrap().then(a.cmp(&b)));
-    idx.truncate(m.top_k);
-    let wsum: f32 = if m.norm_topk_prob {
-        idx.iter().map(|&e| p[e]).sum()
-    } else {
-        1.0
-    };
+    let (idx, p, wsum) = moe_route(&logits, m);
     {
         let mut st = m.stats.borrow_mut();
         if st.len() < ne {
