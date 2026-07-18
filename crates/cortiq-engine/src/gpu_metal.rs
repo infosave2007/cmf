@@ -383,7 +383,7 @@ kernel void mul_mm_f32nt(
     device const float*  xw    [[buffer(0)]],   // W [rows × cols]
     device const float*  xs    [[buffer(1)]],   // X [nb × cols]
     device float*        y     [[buffer(2)]],   // C [nb × rows]
-    constant uint&       cols  [[buffer(3)]],
+    constant uint&       cols_b [[buffer(3)]],
     constant uint&       rows  [[buffer(4)]],
     constant uint&       nb    [[buffer(5)]],
     constant float&      scale [[buffer(6)]],
@@ -391,6 +391,9 @@ kernel void mul_mm_f32nt(
     uint sgitg [[simdgroup_index_in_threadgroup]],
     uint2 tg  [[threadgroup_position_in_grid]])
 {
+    // cols = head_dim (64/128) is stable per model — specialized
+    // pipelines unroll the whole K loop for the scores GEMM.
+    uint cols = is_function_constant_defined(FC_COLS) ? FC_COLS : cols_b;
     threadgroup char shmem[8192];
     threadgroup half* sa = (threadgroup half*)shmem;
     threadgroup half* sb = (threadgroup half*)(shmem + 4096);
@@ -487,12 +490,15 @@ kernel void mul_mm_f32nn(
     device const float*  xs    [[buffer(1)]],   // P [nb × kdim]
     device float*        y     [[buffer(2)]],   // C [nb × rows]
     constant uint&       kdim  [[buffer(3)]],
-    constant uint&       rows  [[buffer(4)]],
+    constant uint&       rows_b [[buffer(4)]],
     constant uint&       nb    [[buffer(5)]],
     uint tiitg [[thread_index_in_threadgroup]],
     uint sgitg [[simdgroup_index_in_threadgroup]],
     uint2 tg  [[threadgroup_position_in_grid]])
 {
+    // rows = head_dim is stable; kdim (context) varies per chunk and
+    // stays a buffer param.
+    uint rows = is_function_constant_defined(FC_ROWS) ? FC_ROWS : rows_b;
     threadgroup char shmem[8192];
     threadgroup half* sa = (threadgroup half*)shmem;      // V tile [16k × 64d] packed
     threadgroup half* sb = (threadgroup half*)(shmem + 4096); // P tile [32m × 16k]
@@ -1434,8 +1440,9 @@ struct Ctx {
     /// Compiled MSL library — shape-specialized pipelines are built
     /// from it lazily.
     lib: metal::Library,
-    /// Shape-specialized mul_mm pipelines: (rows, cols, silu-fused).
-    mm_fc: Mutex<HashMap<(u32, u32, bool), ComputePipelineState>>,
+    /// Shape-specialized mul_mm pipelines: (rows, cols, kind) where
+    /// kind 0 = q8, 1 = q8+silu, 2 = f32nt, 3 = f32nn.
+    mm_fc: Mutex<HashMap<(u32, u32, u8), ComputePipelineState>>,
     /// Device K/V cache mirrors keyed by (pipeline id, layer).
     kv_mirrors: Mutex<HashMap<(u64, usize), KvMirror>>,
     /// no-copy buffer per file (key — the base address of the mapping).
@@ -1536,9 +1543,9 @@ fn init() -> Result<Ctx, String> {
     let cattend = pso("chunk_attend")?;
     let rmsrows = pso("rmsnorm_rows")?;
     let cropekv = pso("chunk_rope_kv")?;
-    let mmf32nt = pso("mul_mm_f32nt")?;
+    let mmf32nt = pso_fc("mul_mm_f32nt")?;
     let q8mmsilu = pso_fc("q8_mul_mm_silu")?;
-    let mmf32nn = pso("mul_mm_f32nn")?;
+    let mmf32nn = pso_fc("mul_mm_f32nn")?;
     let csmax = pso("causal_softmax")?;
     let impcol = pso("imp_colsum")?;
     let unstack = pso("panel_unstack")?;
@@ -1947,30 +1954,41 @@ fn f32_to_f16_into(src: &[f32], dst: *mut u16) {
 /// Shape-specialized mul_mm pipeline (cols/rows as function constants —
 /// fully unrolled K loop, strength-reduced addressing). Falls back to
 /// the generic pipeline if specialization fails.
-fn mm_pipeline(c: &Ctx, rows: usize, cols: usize, silu: bool) -> ComputePipelineState {
+fn mm_pipeline(c: &Ctx, rows: usize, cols: usize, kind: u8) -> ComputePipelineState {
     let mut cache = c.mm_fc.lock().unwrap();
     cache
-        .entry((rows as u32, cols as u32, silu))
+        .entry((rows as u32, cols as u32, kind))
         .or_insert_with(|| {
             let fcv = metal::FunctionConstantValues::new();
             let cols_u = cols as u32;
             let rows_u = rows as u32;
-            fcv.set_constant_value_at_index(
-                &cols_u as *const u32 as *const std::ffi::c_void,
-                metal::MTLDataType::UInt,
-                0,
-            );
-            fcv.set_constant_value_at_index(
-                &rows_u as *const u32 as *const std::ffi::c_void,
-                metal::MTLDataType::UInt,
-                1,
-            );
-            let name = if silu { "q8_mul_mm_silu" } else { "q8_mul_mm" };
+            // f32nt specializes cols only (rows = context, varies);
+            // f32nn specializes rows only (kdim varies).
+            if kind != 3 {
+                fcv.set_constant_value_at_index(
+                    &cols_u as *const u32 as *const std::ffi::c_void,
+                    metal::MTLDataType::UInt,
+                    0,
+                );
+            }
+            if kind != 2 {
+                fcv.set_constant_value_at_index(
+                    &rows_u as *const u32 as *const std::ffi::c_void,
+                    metal::MTLDataType::UInt,
+                    1,
+                );
+            }
+            let (name, generic) = match kind {
+                1 => ("q8_mul_mm_silu", &c.q8mmsilu),
+                2 => ("mul_mm_f32nt", &c.mmf32nt),
+                3 => ("mul_mm_f32nn", &c.mmf32nn),
+                _ => ("q8_mul_mm", &c.q8mmm),
+            };
             c.lib
                 .get_function(name, Some(fcv))
                 .ok()
                 .and_then(|f| c._device.new_compute_pipeline_state_with_function(&f).ok())
-                .unwrap_or_else(|| if silu { c.q8mmsilu.clone() } else { c.q8mmm.clone() })
+                .unwrap_or_else(|| generic.clone())
         })
         .clone()
 }
@@ -1991,7 +2009,7 @@ fn encode_mul_mm(
     cols: usize,
 ) {
     let enc = cmd.new_compute_command_encoder();
-    let pso = mm_pipeline(c, rows, cols, false);
+    let pso = mm_pipeline(c, rows, cols, 0);
     enc.set_compute_pipeline_state(&pso);
     enc.set_buffer(0, Some(fbuf), abs as u64);
     enc.set_buffer(1, Some(xs), 0);
@@ -2395,7 +2413,8 @@ pub fn chunk_run_gpu(
                 let qoff = (g * hpk * b * hd * 4) as u64;
                 {
                     let enc = cmd.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(&c.mmf32nt);
+                    let pso = mm_pipeline(c, 0, hd, 2);
+                    enc.set_compute_pipeline_state(&pso);
                     enc.set_buffer(0, Some(&prep.k_mb), koff);
                     enc.set_buffer(1, Some(&qrope), qoff);
                     enc.set_buffer(2, Some(&scores), 0);
@@ -2446,7 +2465,8 @@ pub fn chunk_run_gpu(
                 cmd = prof.cut(c, cmd, "att_imp");
                 {
                     let enc = cmd.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(&c.mmf32nn);
+                    let pso = mm_pipeline(c, hd, 0, 3);
+                    enc.set_compute_pipeline_state(&pso);
                     enc.set_buffer(0, Some(&prep.v_mb), koff);
                     enc.set_buffer(1, Some(&scores), 0);
                     enc.set_buffer(2, Some(&apanel), qoff);
@@ -2490,7 +2510,7 @@ pub fn chunk_run_gpu(
         // standalone activation stage, no act-buffer round trip.
         {
             let enc = cmd.new_compute_command_encoder();
-            let pso = mm_pipeline(c, l.down.1, l.down.2, true);
+            let pso = mm_pipeline(c, l.down.1, l.down.2, 1);
             enc.set_compute_pipeline_state(&pso);
             enc.set_buffer(0, Some(&fbuf), prep.abs[6] as u64);
             enc.set_buffer(1, Some(&gb), 0);
