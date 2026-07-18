@@ -133,7 +133,7 @@ cortiq ppl model.cmf --file wiki.txt --o1 all
 
 把评价轴说清楚：`llama.cpp` 是我们对标的基准。一次同条件对比（2026-07-17：
 Qwen2.5-0.5B-Instruct，Apple M4，双方均为精确注意力，原生 arm64 `llama.cpp`
-master 对 CMF 0.3.7，交替运行、各自独立进程，双方都取各自实测最优线程数——
+master 对 CMF 0.3.8，交替运行、各自独立进程，双方都取各自实测最优线程数——
 它们是 `-t 6`，我们是默认值；CMF 用 `cortiq bench --core` 计时，对应
 `llama-bench` 的核心口径：不含采样器的全词表拷贝，也不含每词元置信度计算）：
 
@@ -143,7 +143,7 @@ master 对 CMF 0.3.7，交替运行、各自独立进程，双方都取各自实
 | tg128，CPU，它们的默认 `-t 4` | 129.4 ± 0.2 tok/s | 151–158 tok/s | **+18%** |
 | tg128，它们的 GPU（Metal `-ngl 99`） | 150.9 ± 0.4 tok/s | 151–158 tok/s（CPU） | **CMF CPU ≥ 它们的 Metal** |
 | pp512，仅 CPU | 1168 ± 5 tok/s | 1017–1051 tok/s | **−12%** |
-| pp512，GPU prefill 计算图（`CMF_GPU=1`） | 3339 ± 50 tok/s（Metal） | 2331–2665 tok/s | **它们 CPU 的 2.0–2.3×；距它们的 Metal −20%** |
+| pp512，GPU prefill 计算图（`CMF_GPU=1`） | 3339 ± 50 tok/s（Metal） | 2843–3178 tok/s | **它们 CPU 的 2.4–2.7×；峰值距它们的 Metal −5%** |
 | pp1024（`CMF_GPU=1`） | — | 2432 tok/s | 曲线不再塌陷（0.3.3 是 390） |
 | pp2048 / pp4096（`CMF_GPU=1`） | — | 2109 / 1651 tok/s | GEMM 注意力随深度扩展 |
 | 量化质量（PPL 对各自 f16，12×512 窗口） | 近乎无损 | +0.38% | 已对齐 |
@@ -160,7 +160,10 @@ CPU AMX 路径同构）、FFN 激活融合进 down-GEMM 的操作数加载。每
 一次，CPU 缓存仍是权威记录。困惑度在 half-GEMM 容差级（+0.16%）。随附
 逐阶段 GPU 剖析器（`CMF_CHUNK_PROF=1`）——正是它发现注意力阶段吃掉块的
 47%，而独立内核基准一直把时间错记在 GEMM 上。Vulkan/DX12（wgpu）路径
-带有同样的分块 GEMM，由运行时探针按机器决定启用。
+带有同样的分块 GEMM，由运行时探针按机器决定启用。0.3.8 还对 x86
+prefill GEMM（q8 / q4 / q4_tiled / vbit）做了分块：权重瓦片与半字节解包
+在寄存器中跨四路激活流复用——EPYC AVX2 上 +37%（q8）到 ×4.4（q4_block），
+精确一致，`CMF_X86_BLOCKED=0` 可回退。
 
 直线加速赛之外：文件在对齐质量下小 26%，注意力内存可以是 O(1)（`--o1` 在精确
 注意力从 15.7 掉到 8.2 tok/s 的上下文长度下稳在约 16.5），1-bit 训练的模型跑在

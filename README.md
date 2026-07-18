@@ -147,7 +147,7 @@ published a clean before/after figure for it yet.
 
 To be clear about the axis: `llama.cpp` is the yardstick we measure against.
 One like-for-like run (2026-07-17: Qwen2.5-0.5B-Instruct, Apple Silicon M4,
-exact attention for both, native arm64 `llama.cpp` master vs CMF 0.3.7,
+exact attention for both, native arm64 `llama.cpp` master vs CMF 0.3.8,
 interleaved runs from fresh processes, each side at its best measured
 thread count — theirs is `-t 6`, ours the default; CMF timed with
 `cortiq bench --core`, which matches `llama-bench`'s core contract: no
@@ -159,7 +159,7 @@ sampler copy, no per-token confidence pass):
 | tg128, CPU, their default `-t 4` | 129.4 ± 0.2 tok/s | 151–158 tok/s | **+18%** |
 | tg128, their GPU (Metal `-ngl 99`) | 150.9 ± 0.4 tok/s | 151–158 tok/s (CPU) | **CMF CPU ≥ their Metal** |
 | pp512, CPU only | 1168 ± 5 tok/s | 1017–1051 tok/s | **−12%** |
-| pp512, GPU prefill graph (`CMF_GPU=1`) | 3339 ± 50 tok/s (Metal) | 2331–2665 tok/s | **2.0–2.3× their CPU; −20% to their Metal** |
+| pp512, GPU prefill graph (`CMF_GPU=1`) | 3339 ± 50 tok/s (Metal) | 2843–3178 tok/s | **2.4–2.7× their CPU; −5% to their Metal at peak** |
 | pp1024 (`CMF_GPU=1`) | — | 2432 tok/s | flat curve (was 390 in 0.3.3) |
 | pp2048 / pp4096 (`CMF_GPU=1`) | — | 2109 / 1651 tok/s | GEMM attention scales with depth |
 | Quant quality (PPL vs own f16, 12×512 windows) | near-lossless | +0.38% | matched |
@@ -181,7 +181,11 @@ tolerance class (+0.16%). A per-stage GPU profiler ships with it
 (`CMF_CHUNK_PROF=1`) — it is what found the attention stage eating 47%
 of the chunk while the standalone kernel benchmark was mis-crediting
 the GEMMs. The Vulkan/DX12 (wgpu) path carries the same tiled GEMM,
-gated by the runtime probe per machine.
+gated by the runtime probe per machine. 0.3.8 also blocks the x86
+prefill GEMMs (q8 / q4 / q4_tiled / vbit): weight tiles and nibble
+unpacks stay in registers across four activation streams — +37% (q8) to
+×4.4 (q4_block) on an EPYC AVX2 host, exact parity, `CMF_X86_BLOCKED=0`
+reverts.
 
 Beyond the drag race: the file is 26% smaller at matched quality, attention
 memory can be O(1) (`--o1` holds ~16.5 tok/s at contexts where exact
