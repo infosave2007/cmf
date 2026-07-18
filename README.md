@@ -314,9 +314,12 @@ Checkpoints **trained** with binary weights convert losslessly into `q1`
 encoding just recovers them). A 27B becomes a 4.8 GB file that runs on a
 24 GB MacBook — and on Apple silicon, `CMF_GPU=1` runs the whole token as
 a Metal graph (weights no-copy from the mmap, attention attends on the
-device, one sync per token): Bonsai-27B decodes at **10–11 tok/s** on an
-M4 with a ~3.5 s first token (0.3.3 did 5, CPU-only does 3.2);
-Bonsai-1.7B does ~75–79 tok/s.
+device, one sync per token): Bonsai-27B decodes at **11–12 tok/s** on an
+M4 with a ~3.2 s first token (0.3.3 did 5); Bonsai-1.7B does ~80–87 tok/s.
+CPU-only — the path phones run — does 5–6.6 tok/s on the same machine
+(the 0.3.10-era NEON kernel was load-port-bound at 2.5–3.2; a TBL
+unpack doubled it), which puts a mid-range phone (Snapdragon 778G
+class) at an estimated 2–3 tok/s, DRAM-capped around 5.
 
 Requires **cortiq ≥ 0.3.2** — check with `cortiq --version`; an older
 binary answers `unknown quant 'q1'`. Update with
