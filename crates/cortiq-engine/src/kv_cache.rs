@@ -620,7 +620,7 @@ impl LayerKvCache {
     /// mask, and Born importance takes the masked column sums. Same
     /// math as the per-position attend; summation order differs
     /// (tolerance-class, like the projection GEMMs).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_arch = "aarch64")]
     #[allow(clippy::too_many_arguments)]
     pub fn attend_chunk(
         &mut self,
@@ -647,12 +647,18 @@ impl LayerKvCache {
             }
         }
         thread_local! {
-            static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>, Vec<f32>)> =
-                const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+            static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> =
+                const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
         }
+        // The portable NEON GEMM pays dearly for the gathered Bᵀ loads
+        // of the scores multiply — pack Kᵀ once per (group, chunk) and
+        // hand it the sequential-B fast path instead. Accelerate keeps
+        // the no-copy transposed call.
+        let neon_gemm = cfg!(not(target_os = "macos"))
+            || std::env::var("CMF_FORCE_NEON_GEMM").map(|v| v == "1").unwrap_or(false);
         SCRATCH.with(|s| {
             let mut s = s.borrow_mut();
-            let (qpanel, scores, aopanel) = &mut *s;
+            let (qpanel, scores, aopanel, ktpack) = &mut *s;
             // The whole KV-group attends in one GEMM pair: the group's
             // Q-heads stack head-major into one tall panel [hpk·b, hd]
             // (row hl·b + bi), so each layer costs 2 sgemm calls per
@@ -672,7 +678,40 @@ impl LayerKvCache {
                             .copy_from_slice(&q_all[bi * nh * hd + hh * hd..][..hd]);
                     }
                 }
-                crate::qtensor::sgemm_rm(m, n, hd, scale, qpanel, hd, kmat, hd, true, scores, n);
+                if neon_gemm {
+                    ktpack.resize(hd * n, 0.0);
+                    for p in 0..n {
+                        let row = &kmat[p * hd..(p + 1) * hd];
+                        for (d, &v) in row.iter().enumerate() {
+                            ktpack[d * n + p] = v;
+                        }
+                    }
+                    // Accelerate threads its own GEMM; the NEON kernel
+                    // splits the m rows across the pool instead.
+                    let sp_q = SendPtr(qpanel.as_ptr() as *mut f32);
+                    let sp_s = SendPtr(scores.as_mut_ptr());
+                    let kt = &*ktpack;
+                    let run = |start: usize, end: usize| {
+                        if end > start {
+                            // SAFETY: workers write disjoint score rows.
+                            let a = unsafe {
+                                std::slice::from_raw_parts(sp_q.at(start * hd), (end - start) * hd)
+                            };
+                            let c = unsafe {
+                                std::slice::from_raw_parts_mut(sp_s.at(start * n), (end - start) * n)
+                            };
+                            crate::qtensor::neon_gemm_rm(
+                                end - start, n, hd, scale, a, hd, kt, n, false, c, n,
+                            );
+                        }
+                    };
+                    match pool {
+                        Some(p) if m >= 64 => p.run_rows(m, &run),
+                        _ => run(0, m),
+                    }
+                } else {
+                    crate::qtensor::sgemm_rm(m, n, hd, scale, qpanel, hd, kmat, hd, true, scores, n);
+                }
                 // Causal softmax, row-parallel (rows are disjoint).
                 let sp = SendPtr(scores.as_mut_ptr());
                 let run = |start: usize, end: usize| {
@@ -703,7 +742,33 @@ impl LayerKvCache {
                         *dst += p;
                     }
                 }
-                crate::qtensor::sgemm_rm(m, hd, n, 1.0, scores, n, vmat, hd, false, aopanel, hd);
+                if neon_gemm {
+                    let sp_s = SendPtr(scores.as_mut_ptr());
+                    let sp_o = SendPtr(aopanel.as_mut_ptr());
+                    let run = |start: usize, end: usize| {
+                        if end > start {
+                            // SAFETY: workers write disjoint output rows.
+                            let a = unsafe {
+                                std::slice::from_raw_parts(sp_s.at(start * n), (end - start) * n)
+                            };
+                            let c = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    sp_o.at(start * hd),
+                                    (end - start) * hd,
+                                )
+                            };
+                            crate::qtensor::neon_gemm_rm(
+                                end - start, hd, n, 1.0, a, n, vmat, hd, false, c, hd,
+                            );
+                        }
+                    };
+                    match pool {
+                        Some(p) if m >= 64 => p.run_rows(m, &run),
+                        _ => run(0, m),
+                    }
+                } else {
+                    crate::qtensor::sgemm_rm(m, hd, n, 1.0, scores, n, vmat, hd, false, aopanel, hd);
+                }
                 for hl in 0..heads_per_kv {
                     let hh = g * heads_per_kv + hl;
                     for bi in 0..b {

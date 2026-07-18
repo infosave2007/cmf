@@ -1264,6 +1264,132 @@ pub(crate) fn accel_gemm_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_ACCEL").map(|v| v != "0").unwrap_or(true))
 }
 
+/// Off macOS the "accel" GEMM is the portable NEON micro-kernel below —
+/// same entry point, so the batched-attention path opens on mobile.
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+pub(crate) fn accel_gemm_enabled() -> bool {
+    true
+}
+
+/// Portable NEON f32 GEMM (row-major, optional Bᵀ): a 4×8 fmla
+/// micro-kernel with A broadcast against B panels — the mobile stand-in
+/// for Accelerate in the batched causal attention (QKᵀ and P·V). Not a
+/// BLAS: shapes here are the attention panels (m ≤ heads·chunk,
+/// k = head_dim or context), and the goal is removing the per-position
+/// quadratic wall, not peak GEMM.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn neon_gemm_rm(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: &[f32],
+    lda: usize,
+    b_mat: &[f32],
+    ldb: usize,
+    b_rows_are_n: bool,
+    c: &mut [f32],
+    ldc: usize,
+) {
+    debug_assert!(a.len() >= (m - 1) * lda + k);
+    debug_assert!(c.len() >= (m - 1) * ldc + n);
+    // SAFETY: bounds asserted above; NEON is baseline on aarch64.
+    unsafe {
+        use core::arch::aarch64::*;
+        let mut i = 0usize;
+        while i < m {
+            let mi = (m - i).min(4);
+            let mut j = 0usize;
+            while j < n {
+                let nj = (n - j).min(8);
+                if mi == 4 && nj == 8 {
+                    let (mut c0a, mut c0b) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+                    let (mut c1a, mut c1b) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+                    let (mut c2a, mut c2b) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+                    let (mut c3a, mut c3b) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+                    for p in 0..k {
+                        let (b0, b1) = if b_rows_are_n {
+                            // B is [n, k]: column p of Bᵀ = element p of
+                            // eight consecutive B rows — gathered.
+                            let base = b_mat.as_ptr().add(j * ldb + p);
+                            let g = |o: usize| *base.add(o * ldb);
+                            (
+                                [g(0), g(1), g(2), g(3)],
+                                [g(4), g(5), g(6), g(7)],
+                            )
+                        } else {
+                            let base = b_mat.as_ptr().add(p * ldb + j);
+                            (
+                                [*base, *base.add(1), *base.add(2), *base.add(3)],
+                                [*base.add(4), *base.add(5), *base.add(6), *base.add(7)],
+                            )
+                        };
+                        let bv0 = vld1q_f32(b0.as_ptr());
+                        let bv1 = vld1q_f32(b1.as_ptr());
+                        let a0 = vdupq_n_f32(*a.as_ptr().add(i * lda + p));
+                        let a1 = vdupq_n_f32(*a.as_ptr().add((i + 1) * lda + p));
+                        let a2 = vdupq_n_f32(*a.as_ptr().add((i + 2) * lda + p));
+                        let a3 = vdupq_n_f32(*a.as_ptr().add((i + 3) * lda + p));
+                        c0a = vfmaq_f32(c0a, a0, bv0);
+                        c0b = vfmaq_f32(c0b, a0, bv1);
+                        c1a = vfmaq_f32(c1a, a1, bv0);
+                        c1b = vfmaq_f32(c1b, a1, bv1);
+                        c2a = vfmaq_f32(c2a, a2, bv0);
+                        c2b = vfmaq_f32(c2b, a2, bv1);
+                        c3a = vfmaq_f32(c3a, a3, bv0);
+                        c3b = vfmaq_f32(c3b, a3, bv1);
+                    }
+                    let al = vdupq_n_f32(alpha);
+                    for (r, (ca, cb)) in
+                        [(c0a, c0b), (c1a, c1b), (c2a, c2b), (c3a, c3b)].iter().enumerate()
+                    {
+                        let dst = c.as_mut_ptr().add((i + r) * ldc + j);
+                        vst1q_f32(dst, vmulq_f32(*ca, al));
+                        vst1q_f32(dst.add(4), vmulq_f32(*cb, al));
+                    }
+                } else {
+                    for r in 0..mi {
+                        for q in 0..nj {
+                            let mut acc = 0f32;
+                            for p in 0..k {
+                                let bv = if b_rows_are_n {
+                                    b_mat[(j + q) * ldb + p]
+                                } else {
+                                    b_mat[p * ldb + j + q]
+                                };
+                                acc += a[(i + r) * lda + p] * bv;
+                            }
+                            c[(i + r) * ldc + j + q] = acc * alpha;
+                        }
+                    }
+                }
+                j += nj;
+            }
+            i += mi;
+        }
+    }
+}
+
+/// Off-macOS aarch64: the batched attention rides the NEON micro-GEMM.
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sgemm_rm(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: &[f32],
+    lda: usize,
+    b_mat: &[f32],
+    ldb: usize,
+    b_rows_are_n: bool,
+    c: &mut [f32],
+    ldc: usize,
+) {
+    neon_gemm_rm(m, n, k, alpha, a, lda, b_mat, ldb, b_rows_are_n, c, ldc);
+}
+
 /// Row-major f32 GEMM on Accelerate: C[m,n] = alpha·A[m,k] × B(ᵀ).
 /// `b_rows_are_n` = true multiplies by Bᵀ where B is stored [n, k].
 #[cfg(target_os = "macos")]
@@ -1283,6 +1409,12 @@ pub(crate) fn sgemm_rm(
 ) {
     debug_assert!(a.len() >= (m - 1) * lda + k);
     debug_assert!(c.len() >= (m - 1) * ldc + n);
+    // Test hook: route the attention GEMMs through the portable NEON
+    // micro-kernel ON APPLE SILICON — how the mobile batched attend is
+    // measured without a phone in the loop.
+    if std::env::var("CMF_FORCE_NEON_GEMM").map(|v| v == "1").unwrap_or(false) {
+        return neon_gemm_rm(m, n, k, alpha, a, lda, b_mat, ldb, b_rows_are_n, c, ldc);
+    }
     unsafe {
         accel_blas::cblas_sgemm(
             101, // RowMajor

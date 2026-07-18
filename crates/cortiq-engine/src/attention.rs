@@ -919,11 +919,15 @@ pub fn qwen_attention_batch(
     // ── per-position: bias, gate split, qk-norm, partial RoPE, append;
     //    the attend either runs per position (exact historical order)
     //    or batched over the whole chunk after the appends ──
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    // Batched causal attend: Accelerate on macOS, the portable NEON
+    // micro-GEMM elsewhere on aarch64 (mobile prefill was per-position
+    // — the quadratic wall).
+    #[cfg(target_arch = "aarch64")]
     let batched_attend = b >= 32
         && cache.mode == crate::kv_cache::KvMode::F32
-        && crate::qtensor::accel_gemm_enabled();
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        && (crate::qtensor::accel_gemm_enabled()
+            || std::env::var("CMF_FORCE_NEON_GEMM").map(|v| v == "1").unwrap_or(false));
+    #[cfg(not(target_arch = "aarch64"))]
     let batched_attend = false;
     let s0 = cache.seq_len;
     let mut ao_all = take_buf(b * nh * hd);
@@ -1007,7 +1011,7 @@ pub fn qwen_attention_batch(
         recycle_buf(&mut q);
         recycle_buf(&mut gate);
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_arch = "aarch64")]
     if batched_attend {
         cache.attend_chunk(
             &q_rope_all,

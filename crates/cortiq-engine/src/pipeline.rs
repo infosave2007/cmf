@@ -362,6 +362,10 @@ fn prefill_chunk() -> usize {
     }
     if cfg!(target_os = "macos") {
         512
+    } else if cfg!(target_arch = "aarch64") {
+        // Mobile: big enough to feed the batched attend (gate b ≥ 32)
+        // and the blocked SDOT GEMM without the memory of 512.
+        256
     } else {
         48
     }
