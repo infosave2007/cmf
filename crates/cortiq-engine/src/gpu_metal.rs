@@ -1150,6 +1150,26 @@ kernel void rmsnorm_k(
     }
 }
 
+// Embedding gather for the chunk graph: h[bi] = dequant(embed[ids[bi]])
+// · multiplier — the 512 per-position CPU dequants and the h upload
+// disappear.
+kernel void embed_q8_rows(
+    device const char*  q    [[buffer(0)]],
+    device const float* rs   [[buffer(1)]],
+    device const uint*  ids  [[buffer(2)]],
+    device float*       h    [[buffer(3)]],
+    constant uint&      hs   [[buffer(4)]],
+    constant uint&      nb   [[buffer(5)]],
+    constant float&     mult [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint d = gid.x;
+    uint bi = gid.y;
+    if (d >= hs || bi >= nb) return;
+    uint id = ids[bi];
+    h[(ulong)bi * hs + d] = (float)q[(ulong)id * hs + d] * rs[id] * mult;
+}
+
 // rmsnorm_k over a batch: one threadgroup per row.
 kernel void rmsnorm_rows(
     device const float* x [[buffer(0)]],
@@ -1436,6 +1456,7 @@ struct Ctx {
     csmax: ComputePipelineState,
     impcol: ComputePipelineState,
     unstack: ComputePipelineState,
+    embedq8: ComputePipelineState,
     sgate: ComputePipelineState,
     /// Compiled MSL library — shape-specialized pipelines are built
     /// from it lazily.
@@ -1549,6 +1570,7 @@ fn init() -> Result<Ctx, String> {
     let csmax = pso("causal_softmax")?;
     let impcol = pso("imp_colsum")?;
     let unstack = pso("panel_unstack")?;
+    let embedq8 = pso("embed_q8_rows")?;
     let sgate = pso("sig_gate")?;
     let queue = device.new_command_queue();
     let flag_buf = device.new_buffer(64, MTLResourceOptions::StorageModeShared);
@@ -1583,6 +1605,7 @@ fn init() -> Result<Ctx, String> {
         csmax,
         impcol,
         unstack,
+        embedq8,
         sgate,
         lib,
         mm_fc: Mutex::new(HashMap::new()),
@@ -2154,12 +2177,25 @@ impl ChunkProf {
     }
 }
 
+/// Optional on-device embedding for the chunk: (tensor idx, vocab rows,
+/// row_scale, token ids, multiplier). q8_row only — anything else keeps
+/// the CPU embed.
+pub struct ChunkEmbed<'a> {
+    pub idx: usize,
+    pub rows: usize,
+    pub row_scale: &'a [f32],
+    pub ids: &'a [u32],
+    pub mult: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn chunk_run_gpu(
     layers: &[ChunkLayer],
     io: &mut [ChunkIo],
     h: &mut [f32],
     b: usize,
     pos0: usize,
+    embed: Option<&ChunkEmbed>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
     let Some(first) = layers.first() else { return false };
@@ -2309,12 +2345,68 @@ pub fn chunk_run_gpu(
     let ub = io_buf(c, 69_000_000_213 + b * inter, b * inter * 4);
     let act = io_buf(c, 70_000_000_027 + b * inter, b * inter * 4);
     let db = io_buf(c, 71_000_000_073 + b * hs, b * hs * 4);
-    unsafe {
-        std::ptr::copy_nonoverlapping(h.as_ptr(), h_b.contents() as *mut f32, b * hs);
+    // Embedding source: validated up front; refusal keeps the CPU h.
+    let embed_prep: Option<(usize, Buffer, Buffer)> = embed.and_then(|e| {
+        if e.ids.len() < b || e.row_scale.len() < e.rows {
+            return None;
+        }
+        let entry = layers[0].model.tensors.get(e.idx)?;
+        let abs = layers[0].model.entry_abs_offset(entry)?;
+        if abs + e.rows * hs > safe_len || e.ids.iter().any(|&id| id as usize >= e.rows) {
+            return None;
+        }
+        let rs_buf = {
+            let mut cache = c.rs_bufs.lock().unwrap();
+            cache
+                .entry((base, e.idx))
+                .or_insert_with(|| {
+                    crate::gpu::probe_note_cold();
+                    c._device.new_buffer_with_data(
+                        e.row_scale.as_ptr() as *const std::ffi::c_void,
+                        (e.row_scale.len() * 4) as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                })
+                .clone()
+        };
+        let ids_buf = io_buf(c, 74_000_000_177 + b, b * 4);
+        unsafe {
+            std::ptr::copy_nonoverlapping(e.ids.as_ptr(), ids_buf.contents() as *mut u32, b);
+        }
+        Some((abs, rs_buf, ids_buf))
+    });
+    if embed.is_some() && embed_prep.is_none() {
+        // The caller deferred the CPU embed expecting the device to do
+        // it — refuse the whole run (advanced mirror counters self-heal
+        // on the next touch) rather than silently prefill from zeros.
+        return false;
+    }
+    if embed_prep.is_none() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(h.as_ptr(), h_b.contents() as *mut f32, b * hs);
+        }
     }
 
     let mut prof = ChunkProf::new();
     let mut cmd = c.queue.new_command_buffer().to_owned();
+    if let (Some((abs, rs_buf, ids_buf)), Some(e)) = (&embed_prep, embed) {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.embedq8);
+        enc.set_buffer(0, Some(&fbuf), *abs as u64);
+        enc.set_buffer(1, Some(rs_buf), 0);
+        enc.set_buffer(2, Some(ids_buf), 0);
+        enc.set_buffer(3, Some(&h_b), 0);
+        let (hs_u, nb_u) = (hs as u32, b as u32);
+        enc.set_bytes(4, 4, &hs_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(6, 4, &e.mult as *const f32 as *const std::ffi::c_void);
+        enc.dispatch_threads(
+            MTLSize::new(hs as u64, b as u64, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+        cmd = prof.cut(c, cmd, "embed");
+    }
     for (l, prep) in layers.iter().zip(&preps) {
         let inorm = const_buf(c, l.input_norm);
         let pnorm = const_buf(c, l.post_norm);

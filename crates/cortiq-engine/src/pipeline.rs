@@ -1894,10 +1894,16 @@ impl Pipeline {
     fn prefill_batch(&mut self, ids: &[u32], start_pos: usize) -> Vec<f32> {
         let b = ids.len();
         let hs = self.hidden_size;
-        let mut h: Vec<f32> = Vec::with_capacity(b * hs);
-        for &id in ids {
-            h.extend_from_slice(&self.embed_single(id));
-        }
+        // The CPU embed is deferred: when the chunk graph takes the run
+        // from layer 0 it gathers the embeddings on the device instead.
+        let mut h: Vec<f32> = vec![0.0; b * hs];
+        let mut h_ready = false;
+        let mut fill_h = |h: &mut Vec<f32>, me: &Self| {
+            for (bi, &id) in ids.iter().enumerate() {
+                let e = me.embed_single(id);
+                h[bi * hs..(bi + 1) * hs].copy_from_slice(&e);
+            }
+        };
         let (nh, _nkv, _hd, _rd, eps) = (
             self.num_heads,
             self.num_kv_heads,
@@ -1922,11 +1928,17 @@ impl Pipeline {
                 if li < chunk_skip_until {
                     continue;
                 }
-                let end = self.chunk_run_gpu(li, &mut h, b, start_pos);
+                let ids_for_embed = (!h_ready && li == 0).then_some(ids);
+                let end = self.chunk_run_gpu(li, &mut h, b, start_pos, ids_for_embed);
                 if end > li {
+                    h_ready = true;
                     chunk_skip_until = end;
                     continue;
                 }
+            }
+            if !h_ready {
+                fill_h(&mut h, self);
+                h_ready = true;
             }
             let lw = &self.weights.layers[li];
             // ── attention ──
@@ -2078,7 +2090,14 @@ impl Pipeline {
     /// (no output gate), F32 KV, no o1/masks/gemma extras. Returns the
     /// first layer index NOT processed (== `li0` when the run is empty).
     #[cfg(target_os = "macos")]
-    fn chunk_run_gpu(&mut self, li0: usize, h: &mut [f32], b: usize, pos0: usize) -> usize {
+    fn chunk_run_gpu(
+        &mut self,
+        li0: usize,
+        h: &mut [f32],
+        b: usize,
+        pos0: usize,
+        embed_ids: Option<&[u32]>,
+    ) -> usize {
         // (The old streaming attend needed a depth bound at ~1k; the
         // GEMM attention scales like the CPU path and lifted it.)
         // CMF_GPU_CHUNK=0 disables the graph.
@@ -2183,7 +2202,23 @@ impl Pipeline {
         }
         let n_run = layers.len();
         let last = layers.last().map(|l| l.layer + 1).unwrap_or(li0);
-        if !crate::gpu_metal::chunk_run_gpu(&layers, &mut io, h, b, pos0) {
+        // Device-side embedding when the run starts the model and the
+        // embedding matrix is q8_row-mapped.
+        let ep = embed_ids.and_then(|ids| {
+            self.weights.embed_tokens.q8_row_parts().map(|(idx, rows, _c, rs)| {
+                crate::gpu_metal::ChunkEmbed {
+                    idx,
+                    rows,
+                    row_scale: rs,
+                    ids,
+                    mult: self.embed_multiplier,
+                }
+            })
+        });
+        if embed_ids.is_some() && ep.is_none() {
+            return li0;
+        }
+        if !crate::gpu_metal::chunk_run_gpu(&layers, &mut io, h, b, pos0, ep.as_ref()) {
             return li0;
         }
         drop(io);
