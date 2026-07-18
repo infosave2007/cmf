@@ -111,6 +111,12 @@ pub fn run_quantize_gptq(
     if ternary {
         eprintln!("bulk codec: ternary {{-s,0,+s}} (q1t)");
     }
+    // Extra outlier budget for the sensitive down_proj (1.0 = uniform).
+    let down_mult: f32 = std::env::var("CMF_GPTQ_DOWN_KEEP")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(1.0)
+        .max(1.0);
 
     // Copy-verbatim tensors are filled now; the eligible linears are handed
     // to a work-stealing pool that dequantizes ONE tensor per worker at a
@@ -119,19 +125,25 @@ pub fn run_quantize_gptq(
     // widest tensors (e.g. down_proj) at the input dtype for a size-smart
     // mixed model.
     let mut specs: Vec<Option<TensorSpec>> = (0..model.tensors.len()).map(|_| None).collect();
+    // Tensors kept at the input precision (not quantized). embed/lm_head are
+    // the vocab-wide, most bit-sensitive projections (SpQR/AWQ practice);
+    // adding `down_proj` (the gated-intermediate output — the next most
+    // sensitive) is more efficient than flooding it with sparse outliers.
+    // `CMF_GPTQ_SKIP` overrides the substring list.
+    let skip_names: Vec<String> = std::env::var("CMF_GPTQ_SKIP")
+        .unwrap_or_else(|_| "embed_tokens,lm_head".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     let mut eligible: Vec<usize> = Vec::new();
     let mut n_copy = 0usize;
     for (slot, entry) in model.tensors.iter().enumerate() {
-        // Embedding and LM head are the most bit-sensitive tensors (a
-        // vocab-wide projection) — keep them at the input precision, as
-        // SpQR/AWQ do. `CMF_GPTQ_QUANT_HEAD=1` overrides for ablation.
-        let is_head = entry.name.contains("embed_tokens") || entry.name.contains("lm_head");
-        let keep_head_precise =
-            is_head && std::env::var("CMF_GPTQ_QUANT_HEAD").map(|v| v != "1").unwrap_or(true);
+        let keep_precise = skip_names.iter().any(|s| entry.name.contains(s.as_str()));
         let ok = entry.shape.len() == 2
             && entry.shape[1] % GROUP_SIZE == 0
             && entry.shape[1] <= max_col
-            && !keep_head_precise
+            && !keep_precise
             && hess
                 .get(&entry.name)
                 .map(|h| h.count > 0 && h.cols == entry.shape[1])
@@ -175,10 +187,19 @@ pub fn run_quantize_gptq(
                             continue;
                         }
                         let h = &hess_ref[&entry.name];
-                        let bytes = if ternary {
-                            quantize_q1t(&w, rows, cols, &h.rms(), keep)
+                        // Per-tensor outlier budget: down_proj is the most
+                        // low-bit-sensitive FFN tensor (its input is the
+                        // gated intermediate), so give it a bigger mask when
+                        // CMF_GPTQ_DOWN_KEEP > 1 (default 1 = uniform).
+                        let tk = if entry.name.contains("down_proj") {
+                            (keep * down_mult).min(0.25)
                         } else {
-                            gptq_quantize_q1s(&w, rows, cols, h.h.clone(), &h.rms(), keep, lambda)
+                            keep
+                        };
+                        let bytes = if ternary {
+                            quantize_q1t(&w, rows, cols, &h.rms(), tk)
+                        } else {
+                            gptq_quantize_q1s(&w, rows, cols, h.h.clone(), &h.rms(), tk, lambda)
                         };
                         let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         eprint!("\r  quantized {n}/{n_gptq}   ");
