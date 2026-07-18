@@ -2726,6 +2726,47 @@ fn q4matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], 
 /// x86 (scalar fallback is unreachable: callers gate on a8w8_enabled).
 #[inline]
 #[allow(unreachable_code)]
+/// One UNPACKED q4 row (centered i8 in `buf`) against four activation
+/// streams: the 32-byte weight chunk and its abs() load once per group,
+/// the per-group f16 scale decodes once — four maddubs+reduce chains
+/// instead of four full (load, abs, dot) rounds.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q4b_row_1x4_avx2(
+    buf: &[u8],
+    scales: &[u8],
+    g0: usize,
+    gpr: usize,
+    xs: [&[i8]; 4],
+) -> [f32; 4] {
+    // SAFETY: callers uphold buffer contracts (buf.len() == gpr·32).
+    unsafe {
+        use core::arch::x86_64::*;
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = [0f32; 4];
+        for gi in 0..gpr {
+            let s = f16_to_f32(u16::from_le_bytes([
+                scales[(g0 + gi) * 2],
+                scales[(g0 + gi) * 2 + 1],
+            ]));
+            let w = _mm256_loadu_si256(buf.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+            let aw = _mm256_abs_epi8(w);
+            for (k, xq) in xs.iter().enumerate() {
+                let x =
+                    _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+                let p16 = _mm256_maddubs_epi16(aw, _mm256_sign_epi8(x, w));
+                let d = _mm256_madd_epi16(p16, ones);
+                let hi128 = _mm256_extracti128_si256::<1>(d);
+                let s128 = _mm_add_epi32(_mm256_castsi256_si128(d), hi128);
+                let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
+                let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
+                acc[k] += _mm_cvtsi128_si32(s32) as f32 * s;
+            }
+        }
+        acc
+    }
+}
+
 fn dot_q4_row_i8(packed: &[u8], scales: &[u8], g0: usize, gpr: usize, xq: &[i8]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -3003,7 +3044,37 @@ fn q4matmat(
                                 (((bt >> 4) & 0x0F) as i32 - 8) as i8 as u8;
                         }
                     }
-                    for (bi, act) in acts.iter().enumerate() {
+                    let mut bi = 0usize;
+                    #[cfg(target_arch = "x86_64")]
+                    if avx2_enabled()
+                        && std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true)
+                    {
+                        while bi + 4 <= acts.len() {
+                            let xs = [
+                                acts[bi].xq.as_slice(),
+                                acts[bi + 1].xq.as_slice(),
+                                acts[bi + 2].xq.as_slice(),
+                                acts[bi + 3].xq.as_slice(),
+                            ];
+                            let d = unsafe {
+                                dot_q4b_row_1x4_avx2(&buf, scales, r * gpr, gpr, xs)
+                            };
+                            for k in 0..4 {
+                                let act = &acts[bi + k];
+                                let mut acc = d[k] * act.sx;
+                                for &(j, xv) in &act.outliers {
+                                    acc += (buf[j] as i8) as f32
+                                        * gscale((r * cols + j) / GROUP_SIZE)
+                                        * xv;
+                                }
+                                // SAFETY: disjoint (bi, r) cells per worker.
+                                unsafe { *out_addr.at((bi + k) * rows + r) = acc };
+                            }
+                            bi += 4;
+                        }
+                    }
+                    while bi < acts.len() {
+                        let act = &acts[bi];
                         let mut acc = 0f32;
                         for gi in 0..gpr {
                             let d = dot_i8_i8(
@@ -3019,6 +3090,7 @@ fn q4matmat(
                         }
                         // SAFETY: disjoint (bi, r) cells per worker row range.
                         unsafe { *out_addr.at(bi * rows + r) = acc };
+                        bi += 1;
                     }
                 }
             })
