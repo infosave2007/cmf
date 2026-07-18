@@ -159,7 +159,7 @@ sampler copy, no per-token confidence pass):
 | tg128, CPU, their default `-t 4` | 129.4 ± 0.2 tok/s | 151–158 tok/s | **+18%** |
 | tg128, their GPU (Metal `-ngl 99`) | 150.9 ± 0.4 tok/s | 151–158 tok/s (CPU) | **CMF CPU ≥ their Metal** |
 | pp512, CPU only | 1168 ± 5 tok/s | 1017–1051 tok/s | **−12%** |
-| pp512, GPU prefill graph (`CMF_GPU=1`) | 3339 ± 50 tok/s (Metal) | 2843–3178 tok/s | **2.4–2.7× their CPU; −5% to their Metal at peak** |
+| pp512, GPU prefill graph (`CMF_GPU=1`) | 3333–3396 tok/s (Metal) | 2742–3215 tok/s | **2.3–2.8× their CPU; −5% best-vs-best, −18% steady (same-minute interleaved)** |
 | pp1024 (`CMF_GPU=1`) | — | 2432 tok/s | flat curve (was 390 in 0.3.3) |
 | pp2048 / pp4096 (`CMF_GPU=1`) | — | 2109 / 1651 tok/s | GEMM attention scales with depth |
 | Quant quality (PPL vs own f16, 12×512 windows) | near-lossless | +0.38% | matched |
