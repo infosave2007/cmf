@@ -3234,7 +3234,39 @@ fn vbitmatmat(
                         6 => fill::<6>(data, l, &mut buf),
                         _ => unreachable!("vbit bit-width {bw} (validated at load)"),
                     }
-                    for (bi, act) in acts.iter().enumerate() {
+                    let mut bi = 0usize;
+                    // The vbit scale table shares q4_block's layout
+                    // (contiguous f16 per (row·ng + g)), so the same
+                    // blocked 1×4 kernel serves the decoded row.
+                    #[cfg(target_arch = "x86_64")]
+                    if avx2_enabled()
+                        && std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true)
+                    {
+                        while bi + 4 <= acts.len() {
+                            let xs = [
+                                acts[bi].xq.as_slice(),
+                                acts[bi + 1].xq.as_slice(),
+                                acts[bi + 2].xq.as_slice(),
+                                acts[bi + 3].xq.as_slice(),
+                            ];
+                            let d = unsafe {
+                                dot_q4b_row_1x4_avx2(&buf, &bytes[sc_off..], r * ng, ng, xs)
+                            };
+                            for k in 0..4 {
+                                let act = &acts[bi + k];
+                                let mut dot = d[k] * act.sx;
+                                for &(j, xv) in &act.outliers {
+                                    dot +=
+                                        (buf[j] as i8) as f32 * gscale(r, j / GROUP_SIZE) * xv;
+                                }
+                                // SAFETY: disjoint (bi, r) cells per worker.
+                                unsafe { *out_addr.at((bi + k) * rows + r) = dot };
+                            }
+                            bi += 4;
+                        }
+                    }
+                    while bi < acts.len() {
+                        let act = &acts[bi];
                         let mut dot = 0f32;
                         for g in 0..ng {
                             let d = dot_i8_i8(
@@ -3249,6 +3281,7 @@ fn vbitmatmat(
                         }
                         // SAFETY: disjoint (bi, r) cells per worker range.
                         unsafe { *out_addr.at(bi * rows + r) = dot };
+                        bi += 1;
                     }
                 });
             }
@@ -4893,6 +4926,52 @@ mod tests {
 
     /// Fused q4 matvec must match the reference full-dequant + dense
     /// matvec bit-for-bit in structure (same f32 math, group order).
+    /// vbit matmat: the blocked 1×4 leg must match the per-row path
+    /// (paired env toggle; larger shape so both code paths engage).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn vbit_matmat_blocked_matches_per_row() {
+        let (rows, cols, b) = (64usize, 128usize, 9usize);
+        let ng = cols / GROUP_SIZE;
+        let bits: Vec<u8> = (0..rows).map(|r| [3u8, 4, 5, 6][r % 4]).collect();
+        let mut bytes = bits.clone();
+        for g in 0..rows * ng {
+            let sc = 0.02 + 0.0005 * g as f32;
+            bytes.extend_from_slice(&cortiq_core::quant::f32_to_f16(sc).to_le_bytes());
+        }
+        for r in 0..rows {
+            let bw = bits[r] as usize;
+            let (mut acc, mut nb) = (0u64, 0usize);
+            let mut rowbytes = Vec::new();
+            for i in 0..cols {
+                let v = ((i * 7 + r * 13) % (1 << bw)) as u64;
+                acc = (acc << bw) | v;
+                nb += bw;
+                while nb >= 8 {
+                    nb -= 8;
+                    rowbytes.push(((acc >> nb) & 0xFF) as u8);
+                }
+            }
+            if nb > 0 {
+                rowbytes.push(((acc << (8 - nb)) & 0xFF) as u8);
+            }
+            bytes.extend_from_slice(&rowbytes);
+        }
+        let x: Vec<f32> =
+            (0..b * cols).map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5).collect();
+        let offsets = vbit_row_offsets(&bytes, rows, cols);
+        let mut y_a = vec![0f32; b * rows];
+        let mut y_b = vec![0f32; b * rows];
+        unsafe { std::env::set_var("CMF_X86_BLOCKED", "1") };
+        vbitmatmat(&bytes, &offsets, &x, b, rows, cols, &mut y_a, None);
+        unsafe { std::env::set_var("CMF_X86_BLOCKED", "0") };
+        vbitmatmat(&bytes, &offsets, &x, b, rows, cols, &mut y_b, None);
+        unsafe { std::env::remove_var("CMF_X86_BLOCKED") };
+        let max_d =
+            y_a.iter().zip(&y_b).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+        assert!(max_d < 1e-4, "vbit blocked ≠ per-row: max|Δ| = {max_d}");
+    }
+
     #[test]
     fn q4matvec_matches_full_dequant() {
         let (rows, cols) = (8, 64);
