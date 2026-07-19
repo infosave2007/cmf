@@ -575,6 +575,35 @@ impl QTensor {
                     return;
                 }
                 if *dtype == TensorDtype::Q1T {
+                    // GPU route for large q1t matvecs: the ternary BASE dot runs
+                    // on the GPU (load-port-bound on CPU, like q1), then the
+                    // sparse overlay is added on the CPU. Probe keeps the winner.
+                    if *rows * *cols >= 8_388_608 && crate::gpu::enabled_here() {
+                        let t0 = std::time::Instant::now();
+                        match crate::gpu::probe_arm(crate::gpu::OpClass::Matvec) {
+                            crate::gpu::ProbeArm::Gpu => {
+                                if crate::gpu::q1t_matvec(model, *idx, x, *rows, *cols, out) {
+                                    q1t_add_overlay(self.quant_bytes(), x, *rows, *cols, out, pool);
+                                    crate::gpu::probe_record(
+                                        crate::gpu::OpClass::Matvec,
+                                        true,
+                                        t0.elapsed(),
+                                    );
+                                    return;
+                                }
+                            }
+                            crate::gpu::ProbeArm::CpuTimed => {
+                                q1t_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
+                                crate::gpu::probe_record(
+                                    crate::gpu::OpClass::Matvec,
+                                    false,
+                                    t0.elapsed(),
+                                );
+                                return;
+                            }
+                            crate::gpu::ProbeArm::Cpu => {}
+                        }
+                    }
                     q1t_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
                     return;
                 }
@@ -3393,6 +3422,27 @@ fn q1t_dequant_row(
         let col = u16::from_le_bytes([bytes[e], bytes[e + 1]]) as usize;
         buf[col] = f16_to_f32(u16::from_le_bytes([bytes[e + 2], bytes[e + 3]]));
     }
+}
+
+/// Add the sparse outlier overlay onto a base dot already in `out` (the GPU
+/// computes the ternary base; the overlay stays on the CPU — its entries are
+/// few and its per-row gather doesn't vectorize on the GPU). Row-parallel.
+fn q1t_add_overlay(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
+    const TILE: usize = cortiq_core::quant::Q1T_TILE;
+    let gpr = cols / GROUP_SIZE;
+    let (rp_off, ent_off, has_ov) = q1t_overlay(bytes, rows * gpr * TILE, rows);
+    if !has_ov {
+        return;
+    }
+    let out_addr = SendMut(out.as_mut_ptr());
+    let run = move |start: usize, end: usize| {
+        for r in start..end {
+            let corr = q1t_row_outlier_correction(bytes, r, rp_off, ent_off, has_ov, x);
+            // SAFETY: disjoint rows; add onto the base the GPU already wrote.
+            unsafe { *out_addr.at(r) += corr };
+        }
+    };
+    dispatch_rows(pool, rows, &run);
 }
 
 /// Ternary (q1t) matvec — decode+dot straight from mmap, one group at a time:

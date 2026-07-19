@@ -12,7 +12,7 @@
 //! the kernel is mathematically identical to the CPU path, the same prescale trick).
 
 use crate::gpu::{BatchJob, MoeJob};
-use cortiq_core::quant::{Q1_TILE, GROUP_SIZE};
+use cortiq_core::quant::{Q1_TILE, Q1T_TILE, GROUP_SIZE};
 use cortiq_core::CmfModel;
 use metal::{
     Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
@@ -1548,6 +1548,67 @@ kernel void gdn_state_update(
     float zz = z[h * dv + dj];
     of[h * dv + dj] = o * inv * gnorm[dj] * (zz / (1.0f + exp(-zz)));
 }
+
+// q1t: 9-byte tiles [f16 scale][7B base-3 codes, 5 ternary/byte] per 32-group;
+// code 0->0, 1->+s, 2->-s. This computes the BASE dot only (raw f32 x, full
+// precision); the sparse outlier overlay is added on the CPU (the base code at
+// every overlay position is 0, so there is no double count). 4 rows/simdgroup.
+kernel void q1t_matvec(
+    device const uchar* q    [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       y    [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    if (r0 >= rows) return;
+    uint nr = min(rows - r0, 4u);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint wbase = g * 32u;
+        for (uint ri = 0u; ri < nr; ++ri) {
+            ulong base = ((ulong)(r0 + ri) * gpr + (ulong)g) * 9u;
+            half scale = as_type<half>((ushort)((uint)q[base] | ((uint)q[base + 1u] << 8)));
+            float gsum = 0.0f;
+            // bytes 0..5 hold codes 0..29 (all in-group); decode 5 base-3 codes each.
+            for (uint bi = 0u; bi < 6u; ++bi) {
+                uint b = (uint)q[base + 2u + bi];
+                uint kb = wbase + bi * 5u;
+                for (uint i = 0u; i < 5u; ++i) {
+                    uint code = b % 3u;
+                    b = b / 3u;
+                    float sgn = code == 1u ? 1.0f : (code == 2u ? -1.0f : 0.0f);
+                    gsum += sgn * x[kb + i];
+                }
+            }
+            // byte 6 holds the last 2 codes (weights 30,31); the rest are 0-pad.
+            uint b6 = (uint)q[base + 8u];
+            uint c30 = b6 % 3u;
+            uint c31 = (b6 / 3u) % 3u;
+            gsum += (c30 == 1u ? 1.0f : (c30 == 2u ? -1.0f : 0.0f)) * x[wbase + 30u];
+            gsum += (c31 == 1u ? 1.0f : (c31 == 2u ? -1.0f : 0.0f)) * x[wbase + 31u];
+            float contrib = (float)scale * gsum;
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2);
+    acc3 = simd_sum(acc3);
+    if (lane == 0u) {
+        y[r0] = acc0;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
+    }
+}
 "#;
 
 struct Ctx {
@@ -1558,6 +1619,7 @@ struct Ctx {
     q8mmm: ComputePipelineState,
     q1: ComputePipelineState,
     q1h: ComputePipelineState,
+    q1t: ComputePipelineState,
     flag: ComputePipelineState,
     rmsn: ComputePipelineState,
     f16mv: ComputePipelineState,
@@ -1674,6 +1736,7 @@ fn init() -> Result<Ctx, String> {
     let q8mmm = pso_fc("q8_mul_mm")?;
     let q1 = pso("q1_matvec")?;
     let q1h = pso("q1_matvec_h")?;
+    let q1t = pso("q1t_matvec")?;
     let flag = pso("write_flag")?;
     let rmsn = pso("rmsnorm_k")?;
     let f16mv = pso("f32_matvec")?;
@@ -1711,6 +1774,7 @@ fn init() -> Result<Ctx, String> {
         q8mmm,
         q1,
         q1h,
+        q1t,
         flag,
         rmsn,
         f16mv,
@@ -2088,6 +2152,71 @@ fn encode_q1_matvec(
         MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
         MTLSize::new(sgs * 32, 1, 1),
     );
+}
+
+/// Ternary (q1t) BASE matvec on the GPU (full-precision raw-f32 x). Fills
+/// `out` with `Σ_group scale·Σ sign·x`; the caller adds the sparse outlier
+/// overlay on the CPU. Returns false (→ CPU fallback) on any shape/residency
+/// miss. Mirrors `q1_matvec` but reads 9-byte base-3 tiles.
+pub fn q1t_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % GROUP_SIZE != 0 {
+        return false;
+    }
+    let gpr = cols / GROUP_SIZE;
+    let entry = &model.tensors[idx];
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let bytes = model.primary_bytes();
+    let Some((fbuf, safe_len)) = file_buffer(c, bytes) else { return false };
+    if abs + rows * gpr * Q1T_TILE > safe_len {
+        return false;
+    }
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let xs_buf = get_io(13_000_000_559 + xs.len(), xs.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(xs.as_ptr(), xs_buf.contents() as *mut f32, xs.len());
+    }
+    let y_buf = get_io(14_000_000_573 + rows, rows * 4);
+    let cmd = c.queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&c.q1t);
+    enc.set_buffer(0, Some(&fbuf), abs as u64);
+    enc.set_buffer(1, Some(&xs_buf), 0);
+    enc.set_buffer(2, Some(&y_buf), 0);
+    let gpr_u = gpr as u32;
+    let rows_u = rows as u32;
+    enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    let sgs = 8u64; // × 4 rows per simdgroup
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
+    enc.end_encoding();
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), rows);
+    }
+    true
 }
 
 /// GEMM prefill batch: pre — prescaled inputs row-major [b, cols],

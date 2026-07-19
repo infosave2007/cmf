@@ -484,6 +484,26 @@ pub fn q1_matvec(
     }
 }
 
+/// Ternary (q1t) BASE matvec on the GPU — fills `out` with the base dot; the
+/// caller adds the sparse overlay on the CPU. Metal only for now (wgpu q1t not
+/// yet written → CPU fallback).
+pub fn q1t_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q1t_matvec(model, idx, xs, rows, cols, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => false,
+        Backend::None => false,
+    }
+}
+
 /// Whole-block token-graph types re-exported from the Metal backend.
 #[cfg(target_os = "macos")]
 pub use crate::gpu_metal::{
