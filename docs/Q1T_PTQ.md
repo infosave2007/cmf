@@ -111,6 +111,15 @@ the packing introduced) to **~38 tok/s decode / ~58 prefill at keep-10 %, ~60
 decode / ~120 prefill at keep-2 %** — a noisy-machine, fair-load read; the
 isolated kernel gains above are cleaner.
 
-**Follow-ups:** a cheaper overlay encoding (per-row indices) for higher
-keep; an int8-SDOT ternary kernel (signs as `{−1,0,+1}` i8) to close the
-remaining gap to dense `q8` decode.
+**Overlay encoding.** Per-row, not flat: `[u32 row_ptr[rows+1]]` then
+`[(u16 col, f16 val)]` grouped by row. **4 B/outlier** (was 6) and row `r`'s
+entries are the contiguous slice `[row_ptr[r], row_ptr[r+1])` — a direct
+index, no binary search. Lossless: 0.5B keep-10 % 471 → 422 MB (−10.5 %),
+PPL unchanged. The saving is the overlay fraction (grows with keep); at a
+fixed size budget it buys ~50 % more kept outliers → better quality-at-size.
+`col` is within-row, so a quantized tensor's `cols` must fit `u16` (true for
+attn/FFN; the vocab-sized `embed`/`lm_head` are skipped anyway).
+
+**Follow-ups:** an x86 AVX2 ternary SDOT path (x86 currently runs the f32
+kernel); validating the SDOT throughput on a large (12B) model, where q1t's
+smaller footprint should narrow the tok/s gap to `q8` further.
