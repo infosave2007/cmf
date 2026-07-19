@@ -3056,20 +3056,20 @@ fn q1_range_f32(bytes: &[u8], gpr: usize, x: &[f32], out: SendMut, start: usize,
     }
 }
 
-/// Fused q1 matvec (dispatch mirrors `q4t_matvec`).
-/// q1t overlay header: `[u32 count]` at `base_len`, then `count × (u32 idx,
-/// f16 val)` sorted by flat index. Returns `(entries_offset, count)`.
-fn q1t_overlay(bytes: &[u8], base_len: usize) -> (usize, usize) {
-    if base_len + 4 > bytes.len() {
-        return (base_len + 4, 0);
-    }
-    let count = u32::from_le_bytes([
-        bytes[base_len],
-        bytes[base_len + 1],
-        bytes[base_len + 2],
-        bytes[base_len + 3],
-    ]) as usize;
-    (base_len + 4, count)
+/// q1t per-row overlay locator. After the base (`base_len`) come
+/// `[u32 row_ptr[rows+1]]` then `[(u16 col, f16 val)]` grouped by row (row
+/// `r`'s entries are `[row_ptr[r], row_ptr[r+1])`). Returns
+/// `(row_ptr offset, entries offset, present)`.
+fn q1t_overlay(bytes: &[u8], base_len: usize, rows: usize) -> (usize, usize, bool) {
+    let entries = base_len + (rows + 1) * 4;
+    (base_len, entries, entries <= bytes.len())
+}
+
+/// Read `row_ptr[r]` from the overlay's prefix-sum table.
+#[inline]
+fn q1t_rowptr(bytes: &[u8], rp_off: usize, r: usize) -> usize {
+    let o = rp_off + r * 4;
+    u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]) as usize
 }
 
 /// Byte → the 5 ternary signs it packs `{−1,0,+1}` as f32, precomputed so
@@ -3200,56 +3200,40 @@ unsafe fn q1t_dot_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32
 /// overlay's exact weights on top of the base dot. INVARIANT: the encoder
 /// writes ternary code 0 at every outlier position (`quantize_q1t`), so the
 /// base contributes nothing there and this is a plain `value·x`, not
-/// `(value − base)·x` — no scattered per-outlier scale read. Outliers are
-/// few (the keep budget) and sorted, so the row range is a binary search.
+/// `(value − base)·x` — no scattered per-outlier scale read. Row `r`'s entries
+/// are the contiguous slice `[row_ptr[r], row_ptr[r+1])`, so no binary search.
 fn q1t_row_outlier_correction(
     bytes: &[u8],
     r: usize,
-    _gpr: usize,
-    cols: usize,
-    ov_start: usize,
-    ov_count: usize,
+    rp_off: usize,
+    entries_off: usize,
+    has_ov: bool,
     x: &[f32],
 ) -> f32 {
-    let (lo, hi) = (r * cols, r * cols + cols);
-    let idx_at = |p: usize| -> usize {
-        let e = ov_start + p * 6;
-        u32::from_le_bytes([bytes[e], bytes[e + 1], bytes[e + 2], bytes[e + 3]]) as usize
-    };
-    let (mut a, mut b) = (0usize, ov_count);
-    while a < b {
-        let m = (a + b) / 2;
-        if idx_at(m) < lo {
-            a = m + 1;
-        } else {
-            b = m;
-        }
+    if !has_ov {
+        return 0.0;
     }
+    let (c0, c1) = (q1t_rowptr(bytes, rp_off, r), q1t_rowptr(bytes, rp_off, r + 1));
     let mut corr = 0f32;
-    let mut p = a;
-    while p < ov_count {
-        let idx = idx_at(p);
-        if idx >= hi {
-            break;
-        }
-        let e = ov_start + p * 6;
-        let val = f16_to_f32(u16::from_le_bytes([bytes[e + 4], bytes[e + 5]]));
-        corr += val * x[idx - lo];
-        p += 1;
+    for p in c0..c1 {
+        let e = entries_off + p * 4;
+        let col = u16::from_le_bytes([bytes[e], bytes[e + 1]]) as usize;
+        let val = f16_to_f32(u16::from_le_bytes([bytes[e + 2], bytes[e + 3]]));
+        corr += val * x[col];
     }
     corr
 }
 
 /// Dequantize one q1t row into `buf[..cols]` via the sign LUT (no division),
-/// then apply the row's outliers. Used by the batched (prefill) path where
-/// the per-row decode is amortized over the whole batch.
+/// then apply the row's outliers (its `[row_ptr[r], row_ptr[r+1])` slice).
+/// Used by the batched (prefill) path where the decode amortizes over the batch.
 fn q1t_dequant_row(
     bytes: &[u8],
     r: usize,
     gpr: usize,
-    cols: usize,
-    ov_start: usize,
-    ov_count: usize,
+    rp_off: usize,
+    entries_off: usize,
+    has_ov: bool,
     buf: &mut [f32],
 ) {
     const TILE: usize = cortiq_core::quant::Q1T_TILE;
@@ -3270,29 +3254,14 @@ fn q1t_dequant_row(
         buf[bc + 30] = lut[0] * s;
         buf[bc + 31] = lut[1] * s;
     }
-    let (lo, hi) = (r * cols, r * cols + cols);
-    let idx_at = |p: usize| -> usize {
-        let e = ov_start + p * 6;
-        u32::from_le_bytes([bytes[e], bytes[e + 1], bytes[e + 2], bytes[e + 3]]) as usize
-    };
-    let (mut a, mut b) = (0usize, ov_count);
-    while a < b {
-        let m = (a + b) / 2;
-        if idx_at(m) < lo {
-            a = m + 1;
-        } else {
-            b = m;
-        }
+    if !has_ov {
+        return;
     }
-    let mut p = a;
-    while p < ov_count {
-        let idx = idx_at(p);
-        if idx >= hi {
-            break;
-        }
-        let e = ov_start + p * 6;
-        buf[idx - lo] = f16_to_f32(u16::from_le_bytes([bytes[e + 4], bytes[e + 5]]));
-        p += 1;
+    let (c0, c1) = (q1t_rowptr(bytes, rp_off, r), q1t_rowptr(bytes, rp_off, r + 1));
+    for p in c0..c1 {
+        let e = entries_off + p * 4;
+        let col = u16::from_le_bytes([bytes[e], bytes[e + 1]]) as usize;
+        buf[col] = f16_to_f32(u16::from_le_bytes([bytes[e + 2], bytes[e + 3]]));
     }
 }
 
@@ -3303,7 +3272,7 @@ fn q1t_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]
     debug_assert_eq!(out.len(), rows);
     const TILE: usize = cortiq_core::quant::Q1T_TILE;
     let gpr = cols / GROUP_SIZE;
-    let (ov_start, ov_count) = q1t_overlay(bytes, rows * gpr * TILE);
+    let (rp_off, ent_off, has_ov) = q1t_overlay(bytes, rows * gpr * TILE, rows);
     let out_addr = SendMut(out.as_mut_ptr());
     // int8 SDOT base dot (ARM dotprod): ~4× the f32 arithmetic. x → i8 once
     // (`split_act`), activation outliers added back exactly in f32, weight
@@ -3318,7 +3287,7 @@ fn q1t_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]
                 for &(j, xv) in &act.outliers {
                     acc += q1t_base_weight(bytes, r, gpr, j) * xv;
                 }
-                acc += q1t_row_outlier_correction(bytes, r, gpr, cols, ov_start, ov_count, x);
+                acc += q1t_row_outlier_correction(bytes, r, rp_off, ent_off, has_ov, x);
                 // SAFETY: disjoint row ranges per worker.
                 unsafe { *out_addr.at(r) = acc };
             }
@@ -3350,7 +3319,7 @@ fn q1t_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]
                 }
                 acc += s * gsum;
             }
-            acc += q1t_row_outlier_correction(bytes, r, gpr, cols, ov_start, ov_count, x);
+            acc += q1t_row_outlier_correction(bytes, r, rp_off, ent_off, has_ov, x);
             unsafe { *out_addr.at(r) = acc };
         }
     };
@@ -3371,7 +3340,7 @@ fn q1t_matmat(
     debug_assert_eq!(out.len(), b * rows);
     const TILE: usize = cortiq_core::quant::Q1T_TILE;
     let gpr = cols / GROUP_SIZE;
-    let (ov_start, ov_count) = q1t_overlay(bytes, rows * gpr * TILE);
+    let (rp_off, ent_off, has_ov) = q1t_overlay(bytes, rows * gpr * TILE, rows);
     let out_addr = SendMut(out.as_mut_ptr());
     // int8 SDOT prefill (ARM dotprod): quantize the B inputs once, unpack each
     // weight row's signs to i8 ONCE, then sdot against every input — the row
@@ -3405,7 +3374,7 @@ fn q1t_matmat(
                         acc += q1t_base_weight(bytes, r, gpr, j) * xv;
                     }
                     acc += q1t_row_outlier_correction(
-                        bytes, r, gpr, cols, ov_start, ov_count,
+                        bytes, r, rp_off, ent_off, has_ov,
                         &xs[bi * cols..(bi + 1) * cols],
                     );
                     unsafe { *out_addr.at(bi * rows + r) = acc };
@@ -3418,7 +3387,7 @@ fn q1t_matmat(
     let run = move |start: usize, end: usize| {
         let mut buf = vec![0f32; cols];
         for r in start..end {
-            q1t_dequant_row(bytes, r, gpr, cols, ov_start, ov_count, &mut buf);
+            q1t_dequant_row(bytes, r, gpr, rp_off, ent_off, has_ov, &mut buf);
             for bi in 0..b {
                 let xr = &xs[bi * cols..(bi + 1) * cols];
                 let mut acc = 0f32;
@@ -6454,14 +6423,25 @@ mod tests {
                 bytes.extend_from_slice(&c);
             }
         }
-        bytes.extend_from_slice(&(outliers.len() as u32).to_le_bytes());
+        // Per-row overlay: [u32 row_ptr[rows+1]] then [(u16 col, f16 val)] by
+        // row (outliers are sorted by flat index → already grouped by row).
+        let mut row_ptr = vec![0u32; rows + 1];
+        for &(idx, _) in &outliers {
+            row_ptr[idx as usize / cols + 1] += 1;
+        }
+        for r in 0..rows {
+            row_ptr[r + 1] += row_ptr[r];
+        }
+        for &p in &row_ptr {
+            bytes.extend_from_slice(&p.to_le_bytes());
+        }
         for &(idx, v) in &outliers {
-            bytes.extend_from_slice(&idx.to_le_bytes());
+            bytes.extend_from_slice(&((idx as usize % cols) as u16).to_le_bytes());
             bytes.extend_from_slice(&f32_to_f16(v).to_le_bytes());
         }
 
         let mut refw = vec![0f32; rows * cols];
-        dequant_q1t(&bytes, &mut refw);
+        dequant_q1t(&bytes, rows, cols, &mut refw);
         // On-grid activations (±1, amax 1) so the int8 SDOT path reconstructs
         // x exactly and matches the f32 reference (same trick as the q1 test).
         let x: Vec<f32> = (0..cols).map(|j| if j % 3 == 0 { 1.0 } else { -1.0 }).collect();
@@ -6521,16 +6501,29 @@ mod tests {
                 bytes.extend_from_slice(&c);
             }
         }
-        let (n, stride) = (rows * cols, 40usize); // ~2.5% outliers, sorted
-        bytes.extend_from_slice(&((n / stride) as u32).to_le_bytes());
+        let (n, stride) = (rows * cols, 40usize); // ~2.5% outliers, per-row overlay
+        let mut row_ptr = vec![0u32; rows + 1];
         let mut idx = 0usize;
         while idx < n {
-            bytes.extend_from_slice(&(idx as u32).to_le_bytes());
+            row_ptr[idx / cols + 1] += 1;
+            idx += stride;
+        }
+        for r in 0..rows {
+            row_ptr[r + 1] += row_ptr[r];
+        }
+        for &p in &row_ptr {
+            bytes.extend_from_slice(&p.to_le_bytes());
+        }
+        let mut idx = 0usize;
+        while idx < n {
+            bytes.extend_from_slice(&((idx % cols) as u16).to_le_bytes());
             bytes.extend_from_slice(&f32_to_f16((idx % 13) as f32 * 0.1 - 0.6).to_le_bytes());
             idx += stride;
         }
-        let x: Vec<f32> = (0..cols).map(|j| (j as f32 * 0.017).sin()).collect();
-        let (ov_start, ov_count) = q1t_overlay(&bytes, rows * gpr * Q1T_TILE);
+        // On-grid ±1 so the fast path's int8 SDOT is exact vs the f32 "slow"
+        // reference (the A/B is a timing check; values must still agree).
+        let x: Vec<f32> = (0..cols).map(|j| if j % 3 == 0 { 1.0 } else { -1.0 }).collect();
+        let (rp_off, ent_off, has_ov) = q1t_overlay(&bytes, rows * gpr * Q1T_TILE, rows);
 
         // "before": base-3 division decode into a buffer, then dot.
         let slow = |out: &mut [f32]| {
@@ -6548,7 +6541,7 @@ mod tests {
                         };
                     }
                 }
-                out[r] = q1t_row_outlier_correction(&bytes, r, gpr, cols, ov_start, ov_count, &x)
+                out[r] = q1t_row_outlier_correction(&bytes, r, rp_off, ent_off, has_ov, &x)
                     + (0..cols).map(|j| buf[j] * x[j]).sum::<f32>();
             }
         };

@@ -269,7 +269,9 @@ pub fn q1t_pack(codes: &mut [u8; 7], k: usize, code: u8) {
 /// Dequantize a full `q1t` tensor (ternary + sparse outlier overlay): per
 /// 32-group `[f16 scale][7B base-3 codes]` (0 → 0, 1 → +s, 2 → −s), then
 /// `[u32 count]` and `count × [u32 index][f16 value]`.
-pub fn dequant_q1t(bytes: &[u8], dst: &mut [f32]) {
+/// `rows`×`cols` shape is needed for the per-row overlay (`[u32 row_ptr[rows+1]]`
+/// then `[(u16 col, f16 val)]` grouped by row — 4 B/outlier, no flat index).
+pub fn dequant_q1t(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) {
     let n_groups = (dst.len() + GROUP_SIZE - 1) / GROUP_SIZE;
     let base_len = n_groups * Q1T_TILE;
     for g in 0..n_groups {
@@ -291,25 +293,28 @@ pub fn dequant_q1t(bytes: &[u8], dst: &mut [f32]) {
             }
         }
     }
-    let mut off = base_len;
-    if off + 4 > bytes.len() {
+    // Overlay: [u32 row_ptr[rows+1]] then entries grouped by row.
+    let entries = base_len + (rows + 1) * 4;
+    if entries > bytes.len() {
         return;
     }
-    let count = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
-        as usize;
-    off += 4;
-    for _ in 0..count {
-        if off + 6 > bytes.len() {
-            break;
+    let rp = |r: usize| -> usize {
+        let o = base_len + r * 4;
+        u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]) as usize
+    };
+    for r in 0..rows {
+        for p in rp(r)..rp(r + 1) {
+            let e = entries + p * 4;
+            if e + 4 > bytes.len() {
+                return;
+            }
+            let col = u16::from_le_bytes([bytes[e], bytes[e + 1]]) as usize;
+            let val = f16_to_f32(u16::from_le_bytes([bytes[e + 2], bytes[e + 3]]));
+            let i = r * cols + col;
+            if i < dst.len() {
+                dst[i] = val;
+            }
         }
-        let idx =
-            u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
-                as usize;
-        let val = f16_to_f32(u16::from_le_bytes([bytes[off + 4], bytes[off + 5]]));
-        if idx < dst.len() {
-            dst[idx] = val;
-        }
-        off += 6;
     }
 }
 
@@ -570,7 +575,12 @@ pub fn dequant_tensor(entry: &TensorEntry, bytes: &[u8], dst: &mut [f32]) -> Res
         TensorDtype::Q4Tiled => dequant_q4_tiled(bytes, dst),
         TensorDtype::Q1 => dequant_q1(bytes, dst),
         TensorDtype::Q1S => dequant_q1s(bytes, dst),
-        TensorDtype::Q1T => dequant_q1t(bytes, dst),
+        TensorDtype::Q1T => {
+            if entry.shape.len() != 2 {
+                return Err(format!("q1t tensor '{}' must be 2-D", entry.name));
+            }
+            dequant_q1t(bytes, entry.shape[0], entry.shape[1], dst);
+        }
         TensorDtype::Vbit => {
             if entry.shape.len() != 2 {
                 return Err(format!("vbit tensor '{}' must be 2-D", entry.name));

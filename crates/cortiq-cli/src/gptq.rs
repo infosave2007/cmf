@@ -476,18 +476,32 @@ pub fn quantize_q1t(
         }
     }
 
-    // Emit: [f16 scale][7B base-3 codes] per group, then the outlier overlay.
-    let n_out_actual = is_out.iter().filter(|&&o| o).count();
-    let mut out = Vec::with_capacity(n_groups * 9 + 4 + n_out_actual * 6);
+    // Emit: [f16 scale][7B base-3 codes] per group, then the per-row overlay
+    // — [u32 row_ptr[out_dim+1]] then [(u16 col, f16 val)] grouped by row.
+    // col is a within-row index, so in_dim must fit u16 (holds for all
+    // quantized attn/FFN tensors; the vocab-sized embed/lm_head are skipped).
+    assert!(in_dim <= u16::MAX as usize + 1, "q1t overlay: in_dim {in_dim} exceeds u16");
+    let mut row_ptr = vec![0u32; out_dim + 1];
+    for o in 0..out_dim {
+        let c = is_out[o * in_dim..(o + 1) * in_dim].iter().filter(|&&b| b).count();
+        row_ptr[o + 1] = row_ptr[o] + c as u32;
+    }
+    let n_out_actual = row_ptr[out_dim] as usize;
+    let mut out = Vec::with_capacity(n_groups * 9 + (out_dim + 1) * 4 + n_out_actual * 4);
     for g in 0..n_groups {
         out.extend_from_slice(&f32_to_f16(scale[g]).to_le_bytes());
         out.extend_from_slice(&codes[g * 7..g * 7 + 7]);
     }
-    out.extend_from_slice(&(n_out_actual as u32).to_le_bytes());
-    for (i, &o) in is_out.iter().enumerate() {
-        if o {
-            out.extend_from_slice(&(i as u32).to_le_bytes());
-            out.extend_from_slice(&f32_to_f16(w0[i]).to_le_bytes());
+    for &p in &row_ptr {
+        out.extend_from_slice(&p.to_le_bytes());
+    }
+    for o in 0..out_dim {
+        for j in 0..in_dim {
+            let i = o * in_dim + j;
+            if is_out[i] {
+                out.extend_from_slice(&(j as u16).to_le_bytes());
+                out.extend_from_slice(&f32_to_f16(w0[i]).to_le_bytes());
+            }
         }
     }
     out
@@ -635,7 +649,7 @@ mod tests {
         let rms = vec![1.0f32; cols];
         let bytes = quantize_q1t(&vals, rows, cols, &rms, 1.0 / (rows * cols) as f32);
         let mut dec = vec![0f32; rows * cols];
-        dequant_q1t(&bytes, &mut dec);
+        dequant_q1t(&bytes, rows, cols, &mut dec);
         // The spike is kept verbatim (f16).
         assert!((dec[70] - 5.0).abs() < 0.02, "outlier: {}", dec[70]);
         // Tiny weights collapse to exactly 0 (the ternary win).

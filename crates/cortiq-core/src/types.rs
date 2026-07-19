@@ -53,9 +53,12 @@ pub enum TensorDtype {
     /// Ternary (BitNet b1.58-style) `{−s, 0, +s}` with a sparse outlier
     /// overlay. Per 32-group `[f16 scale][7B : base-3 codes, 5 ternary
     /// values/byte since 3^5 = 243 ≤ 256]` (code 0 → 0, 1 → +s, 2 → −s;
-    /// ~2.25 bpw) then the same `[u32 count][count × (u32 index, f16 value)]`
-    /// overlay as `Q1S`. Capturing the many near-zero weights exactly is the
-    /// decisive PTQ win over binary. Variable length.
+    /// ~2.25 bpw) then a per-row overlay `[u32 row_ptr[rows+1]][(u16 col,
+    /// f16 value)]` grouped by row (row `r`'s outliers are
+    /// `[row_ptr[r], row_ptr[r+1])`; `col` is a within-row index, so `cols`
+    /// must fit `u16`) — 4 B/outlier, no binary search. Capturing the many
+    /// near-zero weights exactly is the decisive PTQ win over binary. Variable
+    /// length.
     Q1T = 14,
 }
 
