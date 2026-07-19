@@ -280,14 +280,15 @@ impl QTensor {
 
     /// (directory idx, rows, cols) of a q1-mapped tensor — the
     /// whole-block GPU path resolves offsets itself.
-    /// (idx, rows, cols) of a Q1 OR Q1T mapped tensor — the whole-token GPU
-    /// graph accepts both (it resolves the offset and picks the kernel by
-    /// dtype). Named `q1_parts` for historical reasons.
+    /// (idx, rows, cols) of a mapped tensor the whole-token GPU graph can drive
+    /// — Q1, Q1T or Q4-block (it resolves the offset and picks the kernel by
+    /// dtype). Q4-block lets a precise down_proj/lm_head stay on-device.
+    /// Named `q1_parts` for historical reasons.
     pub(crate) fn q1_parts(&self) -> Option<(usize, usize, usize)> {
         match self {
             Self::Mapped {
                 idx,
-                dtype: TensorDtype::Q1 | TensorDtype::Q1T,
+                dtype: TensorDtype::Q1 | TensorDtype::Q1T | TensorDtype::Q4Block,
                 rows,
                 cols,
                 ..

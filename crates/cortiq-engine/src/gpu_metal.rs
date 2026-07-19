@@ -1636,6 +1636,58 @@ kernel void q1t_overlay(
     }
     y[rid] += corr;
 }
+
+// q4_block: [packed nibbles: rows·gpr·16 B][f16 scales: rows·gpr·2 B]. Group
+// gi's nibbles at packed[gi·16], scale at scales[gi·2]; weight = (nib-8)·scale.
+// Lets the token graph keep a precise down_proj (or lm_head) on-device without
+// quantizing it to ternary. 4 rows/simdgroup, like q1t_matvec.
+kernel void q4b_matvec(
+    device const uchar* q    [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       y    [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    if (r0 >= rows) return;
+    uint nr = min(rows - r0, 4u);
+    uint scales_off = rows * gpr * 16u;
+    device const uchar* sc = q + scales_off;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint xb = g * 32u;
+        for (uint ri = 0u; ri < nr; ++ri) {
+            uint gi = (r0 + ri) * gpr + g;
+            half scale = as_type<half>((ushort)((uint)sc[gi * 2u] | ((uint)sc[gi * 2u + 1u] << 8)));
+            device const uchar* pk = q + (ulong)gi * 16u;
+            float gsum = 0.0f;
+            for (uint k = 0u; k < 16u; ++k) {
+                uint b = pk[k];
+                gsum += ((float)(b & 0xFu) - 8.0f) * x[xb + k * 2u]
+                      + ((float)((b >> 4) & 0xFu) - 8.0f) * x[xb + k * 2u + 1u];
+            }
+            float contrib = (float)scale * gsum;
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2);
+    acc3 = simd_sum(acc3);
+    if (lane == 0u) {
+        y[r0] = acc0;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
+    }
+}
 "#;
 
 struct Ctx {
@@ -1648,6 +1700,7 @@ struct Ctx {
     q1h: ComputePipelineState,
     q1t: ComputePipelineState,
     q1t_ov: ComputePipelineState,
+    q4b: ComputePipelineState,
     flag: ComputePipelineState,
     rmsn: ComputePipelineState,
     f16mv: ComputePipelineState,
@@ -1766,6 +1819,7 @@ fn init() -> Result<Ctx, String> {
     let q1h = pso("q1_matvec_h")?;
     let q1t = pso("q1t_matvec")?;
     let q1t_ov = pso("q1t_overlay")?;
+    let q4b = pso("q4b_matvec")?;
     let flag = pso("write_flag")?;
     let rmsn = pso("rmsnorm_k")?;
     let f16mv = pso("f32_matvec")?;
@@ -1805,6 +1859,7 @@ fn init() -> Result<Ctx, String> {
         q1h,
         q1t,
         q1t_ov,
+        q4b,
         flag,
         rmsn,
         f16mv,
@@ -2211,26 +2266,67 @@ fn encode_q1t_matvec(
     );
 }
 
-/// Encode a projection `in_buf → out_buf` for a Q1 or Q1T weight (auto). For
-/// Q1T the base matvec is followed by the on-device overlay add. Free fn so it
-/// works inside the graph encode loops (which capture `c`/`fbuf`, not `self`).
+/// Which GPU kernel a graph projection uses.
+#[derive(Clone, Copy, PartialEq)]
+enum ProjKind {
+    Q1,
+    Q1t,
+    Q4b,
+}
+
+/// Encode q4_block matvec (precise 4-bit, no overlay). Split layout: packed
+/// nibbles then scales — the shader locates the scales from rows·gpr.
+fn encode_q4b_matvec(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &Buffer,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    rows: usize,
+    gpr: usize,
+) {
+    enc.set_compute_pipeline_state(&c.q4b);
+    enc.set_buffer(0, Some(fbuf), abs as u64);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let gpr_u = gpr as u32;
+    let rows_u = rows as u32;
+    enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    let sgs = 8u64;
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
+}
+
+/// Encode a projection `in_buf → out_buf` for a Q1 / Q1T / Q4-block weight.
+/// For Q1T the base matvec is followed by the on-device overlay add. Free fn so
+/// it works inside the graph encode loops (which capture `c`/`fbuf`, not self).
 #[allow(clippy::too_many_arguments)]
 fn encode_proj(
     c: &Ctx,
     enc: &metal::ComputeCommandEncoderRef,
     fbuf: &Buffer,
     abs: usize,
-    is_q1t: bool,
+    kind: ProjKind,
     in_buf: &Buffer,
     out_buf: &Buffer,
     rows: usize,
     gpr: usize,
 ) {
-    if is_q1t {
-        encode_q1t_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
-        encode_q1t_overlay(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
-    } else {
-        encode_q1_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
+    match kind {
+        ProjKind::Q1t => {
+            encode_q1t_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
+            encode_q1t_overlay(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
+        }
+        ProjKind::Q4b => {
+            encode_q4b_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
+        }
+        ProjKind::Q1 => {
+            encode_q1_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
+        }
     }
 }
 
@@ -3724,11 +3820,28 @@ impl TokenGraph {
         Some(abs)
     }
 
-    /// Resolve a projection tensor accepting Q1 or Q1T. Returns (abs, is_q1t).
-    fn proj_abs(&self, t: (usize, usize, usize)) -> Option<(usize, bool)> {
+    /// Validate one q4_block tensor: `packed (rows·gpr·16) + scales
+    /// (rows·gpr·2)` must fit the safe mmap window.
+    fn q4b_abs(&self, t: (usize, usize, usize)) -> Option<usize> {
+        let (idx, rows, cols) = t;
+        if cols % GROUP_SIZE != 0 {
+            return None;
+        }
+        let entry = &self.model.tensors[idx];
+        let abs = self.model.entry_abs_offset(entry)?;
+        let n_groups = rows * (cols / GROUP_SIZE);
+        if abs + n_groups * 16 + n_groups * 2 > self.safe_len {
+            return None;
+        }
+        Some(abs)
+    }
+
+    /// Resolve a projection tensor accepting Q1 / Q1T / Q4-block.
+    fn proj_abs(&self, t: (usize, usize, usize)) -> Option<(usize, ProjKind)> {
         match self.model.tensors[t.0].dtype {
-            cortiq_core::TensorDtype::Q1 => self.q1_abs(t).map(|a| (a, false)),
-            cortiq_core::TensorDtype::Q1T => self.q1t_abs(t).map(|a| (a, true)),
+            cortiq_core::TensorDtype::Q1 => self.q1_abs(t).map(|a| (a, ProjKind::Q1)),
+            cortiq_core::TensorDtype::Q1T => self.q1t_abs(t).map(|a| (a, ProjKind::Q1t)),
+            cortiq_core::TensorDtype::Q4Block => self.q4b_abs(t).map(|a| (a, ProjKind::Q4b)),
             _ => None,
         }
     }
@@ -4147,12 +4260,12 @@ impl TokenGraph {
         let s_len = cfg.nv * cfg.dk * cfg.dv;
 
         // Resolve and validate every projection (Q1 or Q1T) before encoding.
-        let mut abss: Vec<[(usize, bool); 6]> = Vec::with_capacity(layers.len());
+        let mut abss: Vec<[(usize, ProjKind); 6]> = Vec::with_capacity(layers.len());
         for (l, st) in layers.iter().zip(states) {
             if !self.gdn_ok(l, cfg) || st.len() != ring_len + s_len {
                 return false;
             }
-            let mut a8 = [(0usize, false); 6];
+            let mut a8 = [(0usize, ProjKind::Q1); 6];
             for (slot, t) in [l.qkv, l.z, l.out, l.gate, l.up, l.down].iter().enumerate() {
                 a8[slot] = self.proj_abs(*t).unwrap();
             }
