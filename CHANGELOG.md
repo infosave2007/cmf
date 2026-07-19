@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-07-19
+
+### Added
+
+- **`cortiq_set_options` gains `enable_thinking`** (C FFI) — a sticky per-handle
+  flag for reasoning-model chat templates (Qwen3/3.5). `false` makes the model
+  answer directly with no `<think>` block; `null` resets to the template's own
+  default; absent leaves the current value untouched. Lets embedders (the CMF
+  Mobile app) expose a "disable thinking" toggle without a bespoke API. The
+  `cortiq_chat` / `cortiq_chat_messages` render path now honors it.
+
 ## [0.4.0] — 2026-07-19
 
 Training-free **q1t** ternary post-training quantization — take an ordinary

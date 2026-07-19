@@ -20,6 +20,11 @@ use cortiq_engine::{Pipeline, SamplerConfig};
 
 struct Ctx {
     pipeline: Mutex<Pipeline>,
+    /// Sticky `enable_thinking` for reasoning-model chat templates
+    /// (Qwen3/3.5): `None` leaves it undefined so the template picks its own
+    /// default; `Some(false)` makes the model answer directly instead of
+    /// emitting a `<think>` block. Set through `cortiq_set_options`.
+    enable_thinking: Mutex<Option<bool>>,
 }
 
 thread_local! {
@@ -77,7 +82,10 @@ pub extern "C" fn cortiq_load(path: *const c_char) -> *mut c_void {
                 return std::ptr::null_mut();
             }
         };
-        Box::into_raw(Box::new(Ctx { pipeline: Mutex::new(pipeline) })) as *mut c_void
+        Box::into_raw(Box::new(Ctx {
+            pipeline: Mutex::new(pipeline),
+            enable_thinking: Mutex::new(None),
+        })) as *mut c_void
     });
     result.unwrap_or_else(|_| {
         set_error("panic during load");
@@ -169,16 +177,20 @@ fn run_generate_ids(
             }
         }) as cortiq_engine::TokenCallback
     });
+    let thinking = match ctx.enable_thinking.lock() {
+        Ok(g) => *g,
+        Err(_) => None,
+    };
     let ids = match input {
         GenInput::Chat(prompt) => {
             let history = vec![("user".to_string(), prompt)];
-            pipeline.tokenizer.apply_chat_template_opts(&history, None)
+            pipeline.tokenizer.apply_chat_template_opts(&history, thinking)
         }
         GenInput::Raw(prompt) => {
             pipeline.tokenizer.with_bos(pipeline.tokenizer.encode(&prompt))
         }
         GenInput::History(history) => {
-            pipeline.tokenizer.apply_chat_template_opts(&history, None)
+            pipeline.tokenizer.apply_chat_template_opts(&history, thinking)
         }
     };
     match pipeline.generate_from_ids(&ids, max_tokens as usize, None, on_token) {
@@ -193,7 +205,9 @@ fn run_generate_ids(
 /// Partial sampler options as JSON — absent fields keep their current
 /// values. Accepted keys: temperature, top_p, top_k,
 /// repetition_penalty, min_p, seed, greedy (true = argmax: temperature
-/// pinned to 0). Applies to every subsequent generate on this handle.
+/// pinned to 0), enable_thinking (false makes reasoning models —
+/// Qwen3/3.5 — answer directly with no `<think>` block; null resets to the
+/// template default). Applies to every subsequent generate on this handle.
 /// Returns 0, or −1 (`cortiq_last_error`).
 #[unsafe(no_mangle)]
 pub extern "C" fn cortiq_set_options(handle: *mut c_void, options_json: *const c_char) -> i32 {
@@ -218,6 +232,9 @@ pub extern "C" fn cortiq_set_options(handle: *mut c_void, options_json: *const c
             min_p: Option<f32>,
             seed: Option<u64>,
             greedy: Option<bool>,
+            // Doubly-optional: absent leaves the sticky value untouched;
+            // `null` resets to the template default; `true`/`false` pins it.
+            enable_thinking: Option<Option<bool>>,
         }
         let opts: Opts = match serde_json::from_str(json) {
             Ok(o) => o,
@@ -255,6 +272,12 @@ pub extern "C" fn cortiq_set_options(handle: *mut c_void, options_json: *const c
         }
         if opts.greedy == Some(true) {
             sc.temperature = 0.0;
+        }
+        drop(pipeline);
+        if let Some(v) = opts.enable_thinking {
+            if let Ok(mut g) = ctx.enable_thinking.lock() {
+                *g = v;
+            }
         }
         0
     }))
