@@ -1957,6 +1957,118 @@ mod tests {
         assert!(max_d2 < 1e-3, "wgpu row0 offset ≠ CPU: max|Δ| = {max_d2}");
     }
 
+    /// Quantifies the whole-token-graph ceiling on THIS device: K chained
+    /// matvecs run as K separate submit+readback ops (today's per-op path)
+    /// vs the same K dispatches in ONE command buffer with a single readback
+    /// (intermediates stay on the GPU — what the graph does). The ratio is how
+    /// much the submit/PCIe-readback wall is costing per token.
+    /// Run: `CMF_GPU=wgpu cargo test -p cortiq-engine --release --features gpu
+    ///       --test-threads 1 wgpu_chain_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn wgpu_chain_probe() {
+        use std::time::Instant;
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let n: usize = std::env::var("CMF_CHAIN_N").ok().and_then(|v| v.parse().ok()).unwrap_or(896);
+        let k: usize = std::env::var("CMF_CHAIN_K").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+        assert!(n % 4 == 0);
+        // Resident n×n q8 weights + row scales (values irrelevant — timing only).
+        let q = vec![1i8; n * n];
+        let w = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("probe-w"),
+            contents: bytemuck::cast_slice(&q),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let rs = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("probe-rs"),
+            contents: bytemuck::cast_slice(&vec![1f32; n]),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let p = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("probe-p"),
+            contents: bytemuck::cast_slice(&[(n / 4) as u32, n as u32, 0u32, 0u32]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let mkbuf = |lbl| {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(lbl),
+                size: (n * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let a = mkbuf("probe-a");
+        let b = mkbuf("probe-b");
+        c.queue.write_buffer(&a, 0, bytemuck::cast_slice(&vec![0.01f32; n]));
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("probe-stage"),
+            size: (n * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bg = |xs: &wgpu::Buffer, y: &wgpu::Buffer| {
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("probe-bg"),
+                layout: &c.layout,
+                entries: &[bind_buf(0, &w), bind_buf(1, xs), bind_buf(2, &rs), bind_buf(3, y), bind_buf(4, &p)],
+            })
+        };
+        let bg_ab = bg(&a, &b);
+        let bg_ba = bg(&b, &a);
+        let wg = (n as u32).min(MAX_WG);
+        let readback = |buf: &wgpu::Buffer, enc: wgpu::CommandEncoder| {
+            let mut enc = enc;
+            enc.copy_buffer_to_buffer(buf, 0, &stage, 0, (n * 4) as u64);
+            c.queue.submit(Some(enc.finish()));
+            stage.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            let _ = stage.slice(..).get_mapped_range();
+            stage.unmap();
+        };
+        let dispatch = |enc: &mut wgpu::CommandEncoder, even: bool| {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            pass.set_pipeline(&c.matvec);
+            pass.set_bind_group(0, if even { &bg_ab } else { &bg_ba }, &[]);
+            pass.dispatch_workgroups(wg, 1, 1);
+        };
+        // Warm.
+        for _ in 0..3 {
+            let mut e = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            dispatch(&mut e, true);
+            readback(&b, e);
+        }
+        // Per-op: K submits + K readbacks.
+        let t = Instant::now();
+        for i in 0..k {
+            let mut e = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            dispatch(&mut e, i % 2 == 0);
+            readback(if i % 2 == 0 { &b } else { &a }, e);
+        }
+        let per_op = t.elapsed().as_secs_f64();
+        // Fused: K dispatches, ONE submit + ONE readback.
+        let t = Instant::now();
+        let mut e = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        for i in 0..k {
+            dispatch(&mut e, i % 2 == 0);
+        }
+        readback(if (k - 1) % 2 == 0 { &b } else { &a }, e);
+        let fused = t.elapsed().as_secs_f64();
+        eprintln!(
+            "CHAIN PROBE n={n} k={k}: per-op {:.2} ms ({:.3} ms/op) | fused {:.2} ms | speedup {:.2}× | submit+readback wall ≈ {:.3} ms/op",
+            per_op * 1e3,
+            per_op * 1e3 / k as f64,
+            fused * 1e3,
+            per_op / fused,
+            (per_op - fused) * 1e3 / (k - 1) as f64,
+        );
+    }
+
     #[test]
     fn wgpu_q1_matvec_matches_cpu_reference() {
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
