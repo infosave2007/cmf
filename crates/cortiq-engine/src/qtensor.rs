@@ -3120,6 +3120,36 @@ const SIGN5_I8: [[i8; 5]; 256] = {
     lut
 };
 
+/// The same 5 i8 signs packed into a u64 (`[s0 s1 s2 s3 s4 0 0 0]`, LE) so the
+/// group unpack is 7 unaligned u64 stores at offsets 0,5,10,…,30 instead of
+/// six 5-byte copies + LUT indexing — each store's trailing zeros are fixed by
+/// the next store, and the last one runs 6 B past the 32nd weight (the unpack
+/// buffer is padded to 40). This is the decode/prefill hot inner op.
+const SIGN5_U64: [u64; 256] = {
+    let mut lut = [0u64; 256];
+    let pow3 = [1u16, 3, 9, 27, 81];
+    let mut byte = 0usize;
+    while byte < 256 {
+        let mut v = 0u64;
+        let mut i = 0usize;
+        while i < 5 {
+            let code = (byte as u16 / pow3[i]) % 3;
+            let s: u8 = if code == 1 {
+                1
+            } else if code == 2 {
+                0xFF
+            } else {
+                0
+            };
+            v |= (s as u64) << (i * 8);
+            i += 1;
+        }
+        lut[byte] = v;
+        byte += 1;
+    }
+    lut
+};
+
 /// Ternary base weight at `(row r, col j)` = `sign(code)·s_group`. Used to add
 /// back activation-outlier columns, whose `x` was zeroed for the int8 bulk dot
 /// (`split_act`). At a weight-outlier position the code is 0, so this is 0 and
@@ -3180,18 +3210,23 @@ unsafe fn i8dot32_avx2(w: *const i8, x: *const i8) -> i32 {
     }
 }
 
-/// Unpack one q1t group's base-3 codes into 32 i8 signs (the packing isn't
-/// SIMD-unpackable, so a table gather into a stack buffer).
+/// Unpack one q1t group's base-3 codes into 32 i8 signs via 7 unaligned u64
+/// stores (see `SIGN5_U64`). `dst` MUST have ≥ 40 bytes: the 7th store writes
+/// `dst[30..38]`. Stores go in order so each one's trailing zeros are
+/// overwritten by the next; the final 6 padding bytes are unused by the dot.
 #[inline]
 fn q1t_unpack_group_i8(codes: *const u8, dst: &mut [i8]) {
-    // SAFETY: codes points at 7 readable bytes; dst.len() >= 32.
+    debug_assert!(dst.len() >= 40);
+    // SAFETY: codes points at 7 readable bytes; dst has ≥ 40 bytes so every
+    // 8-byte store at offset bi*5 (bi ≤ 6 → ≤ 30) stays in bounds.
     unsafe {
-        for bi in 0..6 {
-            dst[bi * 5..bi * 5 + 5].copy_from_slice(&SIGN5_I8[*codes.add(bi) as usize]);
+        let p = dst.as_mut_ptr();
+        for bi in 0..7 {
+            core::ptr::write_unaligned(
+                p.add(bi * 5) as *mut u64,
+                SIGN5_U64[*codes.add(bi) as usize],
+            );
         }
-        let lut = &SIGN5_I8[*codes.add(6) as usize];
-        dst[30] = lut[0];
-        dst[31] = lut[1];
     }
 }
 
@@ -3229,7 +3264,7 @@ unsafe fn q1t_dot_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32
     unsafe {
         const TILE: usize = cortiq_core::quant::Q1T_TILE;
         let mut acc = 0f32;
-        let mut sg = [0i8; GROUP_SIZE];
+        let mut sg = [0i8; GROUP_SIZE + 8]; // +8 slack for the u64-store unpack
         for gi in 0..gpr {
             let off = (r * gpr + gi) * TILE;
             let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
@@ -3248,7 +3283,7 @@ unsafe fn q1t_dot_row_avx2(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32
     unsafe {
         const TILE: usize = cortiq_core::quant::Q1T_TILE;
         let mut acc = 0f32;
-        let mut sg = [0i8; GROUP_SIZE];
+        let mut sg = [0i8; GROUP_SIZE + 8]; // +8 slack for the u64-store unpack
         for gi in 0..gpr {
             let off = (r * gpr + gi) * TILE;
             let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
@@ -3276,7 +3311,7 @@ fn q1t_dot_row_i8(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
     {
         const TILE: usize = cortiq_core::quant::Q1T_TILE;
         let mut acc = 0f32;
-        let mut sg = [0i8; GROUP_SIZE];
+        let mut sg = [0i8; GROUP_SIZE + 8]; // +8 slack for the u64-store unpack
         for gi in 0..gpr {
             let off = (r * gpr + gi) * TILE;
             let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
@@ -3445,8 +3480,9 @@ fn q1t_matmat(
             .collect();
         let acts = &acts;
         let run = move |start: usize, end: usize| {
-            let mut sg = vec![0i8; cols]; // row signs, i8
+            let mut sg = vec![0i8; cols + 8]; // row signs, i8 (+8 unpack slack)
             let mut sc = vec![0f32; gpr]; // per-group scales
+            let mut accs = vec![0f32; b]; // per-batch accumulators, reused per row
             for r in start..end {
                 for g in 0..gpr {
                     let off = (r * gpr + g) * TILE;
@@ -3467,11 +3503,25 @@ fn q1t_matmat(
                     for &(j, xv) in &act.outliers {
                         acc += q1t_base_weight(bytes, r, gpr, j) * xv;
                     }
-                    acc += q1t_row_outlier_correction(
-                        bytes, r, rp_off, ent_off, has_ov,
-                        &xs[bi * cols..(bi + 1) * cols],
-                    );
-                    unsafe { *out_addr.at(bi * rows + r) = acc };
+                    accs[bi] = acc;
+                }
+                // Overlay ONCE per row for the whole batch: read each (col, val)
+                // from mmap a single time (was b× — the re-read dominated prefill)
+                // and fan it out over the batch via the cached inputs.
+                if has_ov {
+                    let (c0, c1) =
+                        (q1t_rowptr(bytes, rp_off, r), q1t_rowptr(bytes, rp_off, r + 1));
+                    for p in c0..c1 {
+                        let e = ent_off + p * 4;
+                        let col = u16::from_le_bytes([bytes[e], bytes[e + 1]]) as usize;
+                        let val = f16_to_f32(u16::from_le_bytes([bytes[e + 2], bytes[e + 3]]));
+                        for bi in 0..b {
+                            accs[bi] += val * xs[bi * cols + col];
+                        }
+                    }
+                }
+                for bi in 0..b {
+                    unsafe { *out_addr.at(bi * rows + r) = accs[bi] };
                 }
             }
         };
