@@ -166,7 +166,12 @@ CPU AMX 路径同构）、FFN 激活融合进 down-GEMM 的操作数加载。每
 带有同样的分块 GEMM，由运行时探针按机器决定启用。0.3.8 还对 x86
 prefill GEMM（q8 / q4 / q4_tiled / vbit）做了分块：权重瓦片与半字节解包
 在寄存器中跨四路激活流复用——EPYC AVX2 上 +37%（q8）到 ×4.4（q4_block），
-精确一致，`CMF_X86_BLOCKED=0` 可回退。
+精确一致，`CMF_X86_BLOCKED=0` 可回退。**0.4.0** 将整 token 解码图（Metal）
+从 `q1` 扩展到免训练三值 `q1t` **以及** `q4_block` 投影——于是 14.8B 的
+q1t GDN 混合模型在图上解码快 2.7×，并在 CPU 上胜过同一模型的 `q4`；普通 q4
+模型现在也走这张图（M4 上 3.0 → 5.6 tok/s，此前 q4 没有 GPU 内核）。wgpu
+后端新增了 WGSL 的 `q1t`/`q4_block` matvec 以及 `q1t` prefill GEMM，因此这些
+量化在 NVIDIA / AMD / Intel 上也获得 GPU 加速（已对 CPU 参考实现做校验）。
 
 直线加速赛之外：文件在对齐质量下小 26%，注意力内存可以是 O(1)（`--o1` 在精确
 注意力从 15.7 掉到 8.2 tok/s 的上下文长度下稳在约 16.5），1-bit 训练的模型跑在
@@ -189,8 +194,11 @@ cortiq info   model.cmf     # arch, tensors, quantization, skills
 
 权重经内存映射后就地读取，因此启动是瞬时的，未使用的权重从不进入内存。量化是
 按张量来的，且可以混用——`q8`（1 byte/param）· `q8_2f`（int8，同时带每行和每列
-两个缩放因子——相同字节数下质量更好）· `q4`（0.5）· `f16` · `vbit`（可变 3–8 bit，
-均值约 4.25 ≈ 0.53）——所以你可以在同一个文件里把注意力保持在 q8，而把 FFN 压到 q4。
+两个缩放因子——相同字节数下质量更好）· `q4`（0.5）· `q1t`（**免训练三值**，
+`{−s,0,+s}` + 稀疏离群值叠加层，约 2.25–3.5 bit/param——低于 `q4`，用
+`quantize-gptq` 生成，在 Metal 与 wgpu 上均有 GPU 加速）· `q1`（1 位）· `f16` ·
+`vbit`（可变 3–8 bit，均值约 4.25 ≈ 0.53）——所以你可以在同一个文件里把注意力
+保持在 q8，而把 FFN 压到 q4/q1t。参见 [q1t PTQ](docs/Q1T_PTQ.md)。
 
 ### 多个专家，共用一个骨干
 
@@ -303,6 +311,27 @@ PTQ 会毁掉质量。请从 `*-unpacked`（safetensors）仓库转换而不是 
 `converter/` 里的 Python 工具链产出；需要激活 Hessian 的 GPTQ 校准 v-bit 变体也是。
 仅按权重的 v-bit 路径已经是原生的。
 
+### 免训练三值（`q1t`）
+
+`q1` 需要一个以二值*训练*出来的检查点，而 **`q1t` 是后训练路径**：它把一个普通
+的 f16/bf16 检查点压到三值 `{−s,0,+s}`，再加一个逐行的稀疏**离群值叠加层**
+（`(u16 col, f16 val)` 对），按你保留多少离群值落在约 2.25–3.5 bit/param。方法是
+GPTQ 风格的：双字段重要度掩码（`|W|·RMS(x)`）挑出哪些权重必须保持全精度，一个
+稳定输出的逐行重缩放修正残差，而 embed / `lm_head` / `down_proj` 默认保留得更重。
+不需要训练，也不需要激活 Hessian——对几百个 token 做一遍校准就够了。
+
+```sh
+CMF_GPTQ_TERNARY=1 CMF_GPTQ_SKIP=embed_tokens,lm_head,down_proj \
+cortiq quantize-gptq model-q8.cmf --calib corpus.txt --output model-q1t.cmf \
+    --keep 0.03 --tokens 1024
+CMF_GPU=1 cortiq run model-q1t.cmf -p "What is 84 * 3 / 2?"
+```
+
+它带有与内建量化相同的 GPU 加速：Metal 上的整 token 解码图，以及 wgpu 上的 WGSL
+matvec + prefill GEMM（Vulkan / DX12 → NVIDIA / AMD / Intel）。一个 14.8B 的 GDN
+混合模型在 `q1t` 下于 Metal 图上解码比逐算子快 2.7×，并在 CPU 上胜过同一模型的
+`q4`。完整方法、旋钮（`CMF_GPTQ_*`）和质量数字见 [docs/Q1T_PTQ.md](docs/Q1T_PTQ.md)。
+
 ## O(1) 深入解析
 
 可以在转换时把提示记进文件，也可以在加载时再决定——运行时会自动读取 header 里的
@@ -409,7 +438,8 @@ macOS 上用 Metal——无需任何配置（`WGPU_BACKEND=vulkan|dx12|metal|gl`
 顺序驻留，因此预算的行为等价于 llama.cpp 的 `-ngl`，但无需参数：前 N 层在
 GPU，其余在 CPU。
 
-在 macOS 上，`q1` 模型把整个词元作为一张 Metal 计算图执行：隐藏状态在所有层
+在 macOS 上，`q1`、`q1t` 和 `q4_block` 模型把整个词元作为一张 Metal 计算图执行
+（0.4.0 把它从 `q1` 扩展开，所以普通 q4 模型也能用）：隐藏状态在所有层
 间常驻设备，注意力**在 GPU 上**计算（rope、qk 归一化、KV 追加、分组在线
 softmax attend），command buffer 一编码完就提交——每词元只等待一次。KV 缓存
 的所有者仍是 CPU，驱逐、投机回滚和序列化的行为与 CPU 路径完全一致。计算图与

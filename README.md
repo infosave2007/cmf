@@ -190,7 +190,14 @@ gated by the runtime probe per machine. 0.3.8 also blocks the x86
 prefill GEMMs (q8 / q4 / q4_tiled / vbit): weight tiles and nibble
 unpacks stay in registers across four activation streams — +37% (q8) to
 ×4.4 (q4_block) on an EPYC AVX2 host, exact parity, `CMF_X86_BLOCKED=0`
-reverts.
+reverts. **0.4.0** extends the whole-token decode graph (Metal) to drive
+`q1`, the training-free ternary `q1t`, **and** `q4_block` projections — so a
+q1t 14.8B GDN-hybrid decodes 2.7× faster on the graph and beats the same model
+in `q4` on the CPU, and a plain q4 model now runs the graph too (3.0 → 5.6
+tok/s on an M4, where q4 had no GPU kernel before). The wgpu backend gained
+WGSL `q1t`/`q4_block` matvec plus a `q1t` prefill GEMM, so those quants
+GPU-accelerate on NVIDIA / AMD / Intel as well (validated against the CPU
+reference).
 
 Beyond the drag race: the file is 26% smaller at matched quality, attention
 memory can be O(1) (`--o1` holds ~16.5 tok/s at contexts where exact
@@ -216,9 +223,11 @@ cortiq info   model.cmf     # arch, tensors, quantization, skills
 Weights are memory-mapped and read in place, so startup is instant and unused
 weights never touch RAM. Quantization is per tensor and mixable — `q8`
 (1 byte/param) · `q8_2f` (int8 with both a per-row and a per-column scale — better
-quality at the same byte count) · `q4` (0.5) · `f16` · `vbit` (variable 3–8 bit,
-~4.25 avg ≈ 0.53) — so you can keep attention at q8 and push the FFN to q4 in the
-same file.
+quality at the same byte count) · `q4` (0.5) · `q1t` (**training-free ternary**,
+`{−s,0,+s}` + a sparse outlier overlay, ~2.25–3.5 bit/param — below `q4`, made by
+`quantize-gptq`, GPU-accelerated on Metal and wgpu) · `q1` (1-bit) · `f16` ·
+`vbit` (variable 3–8 bit, ~4.25 avg ≈ 0.53) — so you can keep attention at q8 and
+push the FFN to q4/q1t in the same file. See [q1t PTQ](docs/Q1T_PTQ.md).
 
 ### Many specialists, one backbone
 
@@ -343,6 +352,31 @@ still what produces the per-skill replacement tensors and task masks described
 above, and the GPTQ-calibrated v-bit variant, which needs an activation Hessian.
 The weight-only v-bit path is native.
 
+### Training-free ternary (`q1t`)
+
+Where `q1` needs a checkpoint that was *trained* binary, **`q1t` is the
+post-training path** — it takes a normal f16/bf16 checkpoint down to ternary
+`{−s,0,+s}` with a small per-row sparse **outlier overlay** (`(u16 col, f16 val)`
+pairs), landing at ~2.25–3.5 bit/param depending on how many outliers you keep.
+It is GPTQ-style: a two-field importance mask (`|W|·RMS(x)`) picks which weights
+must stay in full precision, an output-stabilizing per-row rescale corrects the
+residual, and embed / `lm_head` / `down_proj` stay heavier by default. No
+training, no activation Hessian required — a calibration pass over a few hundred
+tokens is enough.
+
+```sh
+CMF_GPTQ_TERNARY=1 CMF_GPTQ_SKIP=embed_tokens,lm_head,down_proj \
+cortiq quantize-gptq model-q8.cmf --calib corpus.txt --output model-q1t.cmf \
+    --keep 0.03 --tokens 1024
+CMF_GPU=1 cortiq run model-q1t.cmf -p "What is 84 * 3 / 2?"
+```
+
+It carries the same GPU acceleration as the built-in quants: the whole-token
+decode graph on Metal and WGSL matvec + prefill GEMM on wgpu (Vulkan / DX12 →
+NVIDIA / AMD / Intel). A 14.8B GDN-hybrid in `q1t` decodes 2.7× faster on the
+Metal graph than per-op and beats the same model in `q4` on the CPU. Full method,
+knobs (`CMF_GPTQ_*`), and quality numbers are in [docs/Q1T_PTQ.md](docs/Q1T_PTQ.md).
+
 ## O(1) in depth
 
 Record the hint at convert time, or decide at load time — the runtime picks the
@@ -455,8 +489,9 @@ a budget (`CMF_GPU_VRAM_MB`, default 8192 on discrete cards); layers are made
 resident in first-touch order, so the budget behaves like llama.cpp's `-ngl`
 without a flag: first N layers on the GPU, the rest on the CPU.
 
-On macOS, `q1` models run the whole token as a Metal graph: hidden state
-lives on the device across every layer, attention attends **on the GPU**
+On macOS, `q1`, `q1t`, and `q4_block` models run the whole token as a Metal
+graph (0.4.0 extended it past `q1`, so a plain q4 model gets it too): hidden
+state lives on the device across every layer, attention attends **on the GPU**
 (rope, qk-norms, KV append, grouped online-softmax attend), and command
 buffers commit as they are encoded — one wait per token. The CPU cache
 remains the owner of record, so eviction, speculative rollback and
