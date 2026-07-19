@@ -3133,43 +3133,64 @@ fn q1t_base_weight(bytes: &[u8], r: usize, gpr: usize, j: usize) -> f32 {
     SIGN5[bytes[off + 2 + within / 5] as usize][within % 5] * s
 }
 
+/// One 32-group int8 dot via two SDOTs. Bit-exact vs the scalar i8 sum
+/// (integer accumulation is order-independent).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+#[inline]
+unsafe fn sdot32_i8(w: *const i8, x: *const i8) -> i32 {
+    // SAFETY: caller guarantees 32 readable i8 at each pointer.
+    unsafe {
+        use core::arch::aarch64::*;
+        use core::arch::asm;
+        let w0 = vld1q_s8(w);
+        let w1 = vld1q_s8(w.add(16));
+        let x0 = vld1q_s8(x);
+        let x1 = vld1q_s8(x.add(16));
+        let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+        asm!(
+            "sdot {a0:v}.4s, {w0:v}.16b, {x0:v}.16b",
+            "sdot {a1:v}.4s, {w1:v}.16b, {x1:v}.16b",
+            a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+            w0 = in(vreg) w0, x0 = in(vreg) x0, w1 = in(vreg) w1, x1 = in(vreg) x1,
+            options(pure, nomem, nostack),
+        );
+        vaddvq_s32(vaddq_s32(a0, a1))
+    }
+}
+
+/// Unpack one q1t group's base-3 codes into 32 i8 signs (the packing isn't
+/// SIMD-unpackable, so a table gather into a stack buffer).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn q1t_unpack_group_i8(codes: *const u8, dst: &mut [i8]) {
+    // SAFETY: codes points at 7 readable bytes; dst.len() >= 32.
+    unsafe {
+        for bi in 0..6 {
+            dst[bi * 5..bi * 5 + 5].copy_from_slice(&SIGN5_I8[*codes.add(bi) as usize]);
+        }
+        let lut = &SIGN5_I8[*codes.add(6) as usize];
+        dst[30] = lut[0];
+        dst[31] = lut[1];
+    }
+}
+
 /// One q1t row's int8 base dot: `Σ_group s·SDOT(signs, xq)` (before the shared
-/// `sx`). Signs unpack from base-3 into a 32-i8 stack buffer (the packing
-/// isn't SIMD-unpackable), then two SDOTs per group. Bit-exact vs the scalar
-/// i8 sum (integer accumulation is order-independent).
+/// `sx`). Signs unpack from base-3 into a 32-i8 stack buffer, then two SDOTs
+/// per group.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon,dotprod")]
 unsafe fn q1t_dot_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
     // SAFETY: 9-byte tile per group, xq.len() == gpr·GROUP_SIZE.
     unsafe {
-        use core::arch::aarch64::*;
-        use core::arch::asm;
         const TILE: usize = cortiq_core::quant::Q1T_TILE;
         let mut acc = 0f32;
         let mut sg = [0i8; GROUP_SIZE];
         for gi in 0..gpr {
             let off = (r * gpr + gi) * TILE;
             let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
-            let codes = bytes.as_ptr().add(off + 2);
-            for bi in 0..6 {
-                sg[bi * 5..bi * 5 + 5].copy_from_slice(&SIGN5_I8[*codes.add(bi) as usize]);
-            }
-            let lut = &SIGN5_I8[*codes.add(6) as usize];
-            sg[30] = lut[0];
-            sg[31] = lut[1];
-            let w0 = vld1q_s8(sg.as_ptr());
-            let w1 = vld1q_s8(sg.as_ptr().add(16));
-            let x0 = vld1q_s8(xq.as_ptr().add(gi * GROUP_SIZE));
-            let x1 = vld1q_s8(xq.as_ptr().add(gi * GROUP_SIZE + 16));
-            let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
-            asm!(
-                "sdot {a0:v}.4s, {w0:v}.16b, {x0:v}.16b",
-                "sdot {a1:v}.4s, {w1:v}.16b, {x1:v}.16b",
-                a0 = inout(vreg) a0, a1 = inout(vreg) a1,
-                w0 = in(vreg) w0, x0 = in(vreg) x0, w1 = in(vreg) w1, x1 = in(vreg) x1,
-                options(pure, nomem, nostack),
-            );
-            acc += vaddvq_s32(vaddq_s32(a0, a1)) as f32 * s;
+            q1t_unpack_group_i8(bytes.as_ptr().add(off + 2), &mut sg);
+            acc += sdot32_i8(sg.as_ptr(), xq.as_ptr().add(gi * GROUP_SIZE)) as f32 * s;
         }
         acc
     }
@@ -3348,9 +3369,52 @@ fn q1t_matmat(
     pool: Option<&Pool>,
 ) {
     debug_assert_eq!(out.len(), b * rows);
+    const TILE: usize = cortiq_core::quant::Q1T_TILE;
     let gpr = cols / GROUP_SIZE;
-    let (ov_start, ov_count) = q1t_overlay(bytes, rows * gpr * cortiq_core::quant::Q1T_TILE);
+    let (ov_start, ov_count) = q1t_overlay(bytes, rows * gpr * TILE);
     let out_addr = SendMut(out.as_mut_ptr());
+    // int8 SDOT prefill (ARM dotprod): quantize the B inputs once, unpack each
+    // weight row's signs to i8 ONCE, then sdot against every input — the row
+    // sign-decode amortizes over the whole batch. CMF_SDOT=0 / x86 → f32 below.
+    #[cfg(target_arch = "aarch64")]
+    if sdot_enabled() {
+        let acts: Vec<SplitAct> = (0..b)
+            .map(|bi| split_act(&xs[bi * cols..(bi + 1) * cols]))
+            .collect();
+        let acts = &acts;
+        let run = move |start: usize, end: usize| {
+            let mut sg = vec![0i8; cols]; // row signs, i8
+            let mut sc = vec![0f32; gpr]; // per-group scales
+            for r in start..end {
+                for g in 0..gpr {
+                    let off = (r * gpr + g) * TILE;
+                    sc[g] = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+                    q1t_unpack_group_i8(bytes.as_ptr().wrapping_add(off + 2), &mut sg[g * GROUP_SIZE..]);
+                }
+                for bi in 0..b {
+                    let act = &acts[bi];
+                    let mut isum = 0f32;
+                    for g in 0..gpr {
+                        let d = unsafe {
+                            sdot32_i8(sg.as_ptr().add(g * GROUP_SIZE), act.xq.as_ptr().add(g * GROUP_SIZE))
+                        };
+                        isum += d as f32 * sc[g];
+                    }
+                    let mut acc = isum * act.sx;
+                    for &(j, xv) in &act.outliers {
+                        acc += q1t_base_weight(bytes, r, gpr, j) * xv;
+                    }
+                    acc += q1t_row_outlier_correction(
+                        bytes, r, gpr, cols, ov_start, ov_count,
+                        &xs[bi * cols..(bi + 1) * cols],
+                    );
+                    unsafe { *out_addr.at(bi * rows + r) = acc };
+                }
+            }
+        };
+        dispatch_rows(pool, rows, &run);
+        return;
+    }
     let run = move |start: usize, end: usize| {
         let mut buf = vec![0f32; cols];
         for r in start..end {
