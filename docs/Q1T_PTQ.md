@@ -87,14 +87,22 @@ keep-2%).
 `q4` cannot reach, with graceful degradation — valuable where size is the
 binding constraint (on-device / mobile).
 
-**Decode speed:** two levers. (1) The base matvec is a *fused* decode+dot
-straight from mmap — no f32 row buffer, and a 256-entry byte→signs LUT
-instead of the base-3 divide/modulo per weight (that divide, from the
-packing, was the base bottleneck) — **5.9×** over the division decode on an
-8192×4096 tensor. (2) The overlay dominates at high keep; since the encoder
-writes ternary code 0 at every outlier position, the correction is a plain
-`value·x` with **no scattered per-outlier scale read**. Together, 0.5B q1t
-decode went 2.5 → 35.6 tok/s at keep-10% (**14×**), 51 tok/s at keep-2%.
+**Decode speed** (three levers, on top of a slow per-row-dequant baseline):
+
+1. **Base matvec** — decode+dot per group straight from mmap (no per-row
+   buffer), a 256-entry byte→signs LUT instead of the base-3 divide/modulo
+   per weight, and each group's signs unpacked into a tiny stack buffer so
+   the 32-wide dot lowers to f32x4 FMAs. **6.9×** over the division decode on
+   an 8192×4096 tensor (single thread, 9.25 → 7.64 ms after the SIMD unpack).
+2. **Overlay** — dominates at high keep; since the encoder writes ternary
+   code 0 at every outlier position, the correction is a plain `value·x`
+   with **no scattered per-outlier scale read** (+45 % at keep-10 %).
+3. Both are bit-identical to `dequant_q1t` (the SDOT ternary kernel — signs
+   as i8 — is the remaining lever, a bigger win on large models).
+
+End to end, 0.5B q1t decode went from ~2.5 tok/s (the div-decode regression
+the packing introduced) to **~33 tok/s at keep-10 %, ~47 at keep-2 %** — a
+noisy-machine, fair-load read; the isolated kernel gains above are cleaner.
 
 **Follow-ups:** a cheaper overlay encoding (per-row indices) for higher
 keep; an int8-SDOT ternary kernel (signs as `{−1,0,+1}` i8) to close the
