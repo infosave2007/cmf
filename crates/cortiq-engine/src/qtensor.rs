@@ -3197,9 +3197,9 @@ fn q1t_dequant_row(
     }
 }
 
-/// Ternary (q1t) matvec — FUSED decode+dot straight from mmap: no f32 buffer
-/// materialization, no division (the sign LUT), one group at a time. This is
-/// the decode hot path.
+/// Ternary (q1t) matvec — decode+dot straight from mmap, one group at a time:
+/// no per-ROW buffer, no division (the sign LUT), and a tiny per-group sign
+/// buffer so the 32-wide dot vectorizes. This is the decode hot path.
 fn q1t_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
     debug_assert_eq!(out.len(), rows);
     const TILE: usize = cortiq_core::quant::Q1T_TILE;
@@ -3207,6 +3207,10 @@ fn q1t_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]
     let (ov_start, ov_count) = q1t_overlay(bytes, rows * gpr * TILE);
     let out_addr = SendMut(out.as_mut_ptr());
     let run = move |start: usize, end: usize| {
+        // Per-group signs, unpacked contiguously so the dot below is a clean
+        // 32-wide reduction the autovectorizer turns into f32x4 FMAs — the
+        // 5-values-per-byte base-3 layout won't SIMD in place.
+        let mut sg = [0f32; GROUP_SIZE];
         for r in start..end {
             let mut acc = 0f32;
             for g in 0..gpr {
@@ -3214,18 +3218,16 @@ fn q1t_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]
                 let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
                 let codes = &bytes[off + 2..off + TILE];
                 let xg = &x[g * GROUP_SIZE..g * GROUP_SIZE + GROUP_SIZE];
-                let mut gsum = 0f32;
                 for bi in 0..6 {
-                    let lut = &SIGN5[codes[bi] as usize];
-                    let xb = &xg[bi * 5..bi * 5 + 5];
-                    gsum += lut[0] * xb[0]
-                        + lut[1] * xb[1]
-                        + lut[2] * xb[2]
-                        + lut[3] * xb[3]
-                        + lut[4] * xb[4];
+                    sg[bi * 5..bi * 5 + 5].copy_from_slice(&SIGN5[codes[bi] as usize]);
                 }
                 let lut = &SIGN5[codes[6] as usize];
-                gsum += lut[0] * xg[30] + lut[1] * xg[31];
+                sg[30] = lut[0];
+                sg[31] = lut[1];
+                let mut gsum = 0f32;
+                for k in 0..GROUP_SIZE {
+                    gsum += sg[k] * xg[k];
+                }
                 acc += s * gsum;
             }
             acc += q1t_row_outlier_correction(bytes, r, gpr, cols, ov_start, ov_count, x);
