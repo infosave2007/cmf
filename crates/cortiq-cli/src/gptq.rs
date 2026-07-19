@@ -417,6 +417,9 @@ pub fn quantize_q1t(
         scale[g] = s;
         for k in 0..GROUP_SIZE {
             let i = base + k;
+            // Code 0 at outlier positions is a KERNEL INVARIANT: the q1t
+            // matvec adds `value·x` for each overlay entry without subtracting
+            // a base, so the base here must contribute nothing. Do not change.
             let code: u8 = if is_out[i] {
                 0
             } else {

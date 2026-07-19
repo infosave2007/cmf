@@ -3097,20 +3097,21 @@ const SIGN5: [[f32; 5]; 256] = {
     lut
 };
 
-/// Σ over a row's outliers of `(f16 value − ternary base value)·x[col]` — the
-/// correction that turns the base ternary dot into the masked one. Outliers
-/// are few (the keep budget) and sorted, so this is cheap; the per-outlier
-/// base-3 decode here is off the hot loop.
+/// Σ over a row's outliers of `value·x[col]` — the correction that adds the
+/// overlay's exact weights on top of the base dot. INVARIANT: the encoder
+/// writes ternary code 0 at every outlier position (`quantize_q1t`), so the
+/// base contributes nothing there and this is a plain `value·x`, not
+/// `(value − base)·x` — no scattered per-outlier scale read. Outliers are
+/// few (the keep budget) and sorted, so the row range is a binary search.
 fn q1t_row_outlier_correction(
     bytes: &[u8],
     r: usize,
-    gpr: usize,
+    _gpr: usize,
     cols: usize,
     ov_start: usize,
     ov_count: usize,
     x: &[f32],
 ) -> f32 {
-    const TILE: usize = cortiq_core::quant::Q1T_TILE;
     let (lo, hi) = (r * cols, r * cols + cols);
     let idx_at = |p: usize| -> usize {
         let e = ov_start + p * 6;
@@ -3132,18 +3133,9 @@ fn q1t_row_outlier_correction(
         if idx >= hi {
             break;
         }
-        let col = idx - lo;
         let e = ov_start + p * 6;
         let val = f16_to_f32(u16::from_le_bytes([bytes[e + 4], bytes[e + 5]]));
-        let off = (r * gpr + col / GROUP_SIZE) * TILE;
-        let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
-        let base_val = match cortiq_core::quant::q1t_code(&bytes[off + 2..off + TILE], col % GROUP_SIZE)
-        {
-            1 => s,
-            2 => -s,
-            _ => 0.0,
-        };
-        corr += (val - base_val) * x[col];
+        corr += val * x[idx - lo];
         p += 1;
     }
     corr
@@ -6277,20 +6269,26 @@ mod tests {
         let (rows, cols) = (3usize, 64usize); // gpr = 2
         let gpr = cols / GROUP_SIZE;
         let scales = [0.5f32, 0.3, 0.7, 0.2, 0.6, 0.15];
+        // Overlay (must be sorted by flat index): a few spikes across rows.
+        let outliers: [(u32, f32); 3] = [(5, 9.0), (70, -4.5), (150, 3.25)];
+        let is_out = |flat: usize| outliers.iter().any(|&(i, _)| i as usize == flat);
         let mut bytes = Vec::new();
         for r in 0..rows {
             for g in 0..gpr {
                 bytes.extend_from_slice(&f32_to_f16(scales[r * gpr + g]).to_le_bytes());
                 let mut c = [0u8; 7];
                 for k in 0..GROUP_SIZE {
-                    let code = ((k + r * 3 + g) % 3) as u8; // 0,1,2
+                    // Encoder invariant: code 0 at outlier positions.
+                    let code = if is_out(r * cols + g * GROUP_SIZE + k) {
+                        0
+                    } else {
+                        ((k + r * 3 + g) % 3) as u8 // 0,1,2
+                    };
                     cortiq_core::quant::q1t_pack(&mut c, k, code);
                 }
                 bytes.extend_from_slice(&c);
             }
         }
-        // Overlay (must be sorted by flat index): a few spikes across rows.
-        let outliers: [(u32, f32); 3] = [(5, 9.0), (70, -4.5), (150, 3.25)];
         bytes.extend_from_slice(&(outliers.len() as u32).to_le_bytes());
         for &(idx, v) in &outliers {
             bytes.extend_from_slice(&idx.to_le_bytes());
