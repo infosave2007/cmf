@@ -32,6 +32,19 @@ pub const ENVELOPE_LEN: usize = 128;
 pub const DATA_ALIGNMENT: u64 = 4096;
 /// Every tensor inside the blob is 64-byte aligned (SIMD / cache line).
 pub const TENSOR_ALIGNMENT: u64 = 64;
+/// Tensors at least this large are additionally page-aligned to
+/// [`LARGE_TENSOR_ALIGN`], so a cold skill / MoE-expert / mask weight sits on
+/// its own page(s): the "unused weights cost 0 RSS" guarantee then holds at
+/// page granularity (a lazily-paged tensor pulls exactly its own bytes, not a
+/// neighbour's), and per-layer `madvise(WILLNEED)` covers clean ranges. Small
+/// tensors (norms, biases, 1-D f16) keep the 64-byte SIMD alignment so the
+/// padding stays negligible.
+pub const LARGE_TENSOR_MIN: u64 = 16 * 1024;
+/// Page alignment applied to large tensors. 4096 is the common page size
+/// (x86, most ARM/Android); it is a multiple of [`TENSOR_ALIGNMENT`], so
+/// existing readers — which only require `off % 64 == 0` — accept these files
+/// unchanged. Purely a writer-side, backward-compatible layout choice.
+pub const LARGE_TENSOR_ALIGN: u64 = 4096;
 /// One directory record is 56 bytes (see `.vmfc` v2).
 pub const DIR_RECORD_LEN: usize = 56;
 pub const DIR_MAX_NDIM: usize = 6;
@@ -804,7 +817,12 @@ impl CmfModel {
                     )));
                 }
             }
-            data_cursor = align_to(data_cursor, TENSOR_ALIGNMENT);
+            let align = if t.data.len() as u64 >= LARGE_TENSOR_MIN {
+                LARGE_TENSOR_ALIGN
+            } else {
+                TENSOR_ALIGNMENT
+            };
+            data_cursor = align_to(data_cursor, align);
             entries.push(TensorEntry {
                 name: t.name.clone(),
                 dtype: t.dtype,

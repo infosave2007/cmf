@@ -297,6 +297,51 @@ fn full_file_roundtrip() {
     assert_eq!(model.total_param_count(), expect);
 }
 
+/// Large tensors get page-aligned so cold skill/MoE/mask weights don't share a
+/// page with the backbone; small tensors stay 64-aligned (no padding bloat).
+/// The file must still round-trip and verify, and — since 4096 % 64 == 0 —
+/// remain readable by the existing (64-aligned-only) contract.
+#[test]
+fn large_tensors_are_page_aligned() {
+    use cortiq_core::format::{LARGE_TENSOR_ALIGN, LARGE_TENSOR_MIN};
+    let dir = tempdir();
+    let path = dir.join("align.cmf");
+    let (rows, cols) = (512usize, 64usize); // q8_row = 512*64 + 512*2 = 33 792 B > 16 KB
+    let vals: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.01).sin()).collect();
+    let norm: Vec<f32> = (0..8).map(|i| 1.0 + i as f32).collect();
+    let tensors = vec![
+        TensorSpec {
+            name: "big.weight".into(),
+            dtype: TensorDtype::Q8Row,
+            shape: vec![rows, cols],
+            data: encode_q8_row(&vals, rows, cols),
+        },
+        TensorSpec {
+            name: "small.norm".into(),
+            dtype: TensorDtype::F16,
+            shape: vec![8],
+            data: norm.iter().flat_map(|v| f32_to_f16(*v).to_le_bytes()).collect(),
+        },
+    ];
+    CmfModel::write(&path, &tiny_header(), &tensors, None, None).unwrap();
+
+    let model = CmfModel::open(&path).unwrap();
+    let big = model.tensor("big.weight").unwrap();
+    assert!(big.nbytes >= LARGE_TENSOR_MIN);
+    assert_eq!(
+        big.off % LARGE_TENSOR_ALIGN,
+        0,
+        "large tensor must be page-aligned (off = {})",
+        big.off
+    );
+    // Every tensor still satisfies the legacy 64-alignment contract.
+    for e in &model.tensors {
+        assert_eq!(e.off % 64, 0);
+    }
+    assert_eq!(model.tensor_bytes("big.weight").unwrap(), &tensors[0].data[..]);
+    assert!(model.verify().is_empty());
+}
+
 // ───────────────────────── strict validation ─────────────────────────
 
 #[test]
