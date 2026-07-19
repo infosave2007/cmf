@@ -537,6 +537,34 @@ impl QTensor {
             } => {
                 let _ = (model, idx);
                 if *dtype == TensorDtype::Q4Block {
+                    // GPU route (wgpu q4b kernel) for large q4_block matvecs —
+                    // gives NVIDIA/AMD/Intel q4 models a GPU path. Probe keeps
+                    // the winner; Metal returns false → the CPU kernel below.
+                    if *rows * *cols >= 8_388_608 && crate::gpu::enabled_here() {
+                        let t0 = std::time::Instant::now();
+                        match crate::gpu::probe_arm(crate::gpu::OpClass::Matvec) {
+                            crate::gpu::ProbeArm::Gpu => {
+                                if crate::gpu::q4b_matvec(model, *idx, x, *rows, *cols, out) {
+                                    crate::gpu::probe_record(
+                                        crate::gpu::OpClass::Matvec,
+                                        true,
+                                        t0.elapsed(),
+                                    );
+                                    return;
+                                }
+                            }
+                            crate::gpu::ProbeArm::CpuTimed => {
+                                q4matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
+                                crate::gpu::probe_record(
+                                    crate::gpu::OpClass::Matvec,
+                                    false,
+                                    t0.elapsed(),
+                                );
+                                return;
+                            }
+                            crate::gpu::ProbeArm::Cpu => {}
+                        }
+                    }
                     q4matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
                     return;
                 }

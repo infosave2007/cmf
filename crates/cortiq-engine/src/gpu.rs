@@ -499,7 +499,27 @@ pub fn q1t_matvec(
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::q1t_matvec(model, idx, xs, rows, cols, out),
         #[cfg(feature = "gpu")]
-        Backend::Wgpu => false,
+        Backend::Wgpu => crate::gpu_wgpu::q1t_matvec(model, idx, xs, rows, cols, out),
+        Backend::None => false,
+    }
+}
+
+/// q4_block matvec on the GPU — wgpu only (Metal drives q4_block through the
+/// whole-token graph, not a standalone matvec).
+#[allow(unused_variables)]
+pub fn q4b_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => false,
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q4b_matvec(model, idx, xs, rows, cols, out),
         Backend::None => false,
     }
 }
