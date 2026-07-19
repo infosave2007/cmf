@@ -611,6 +611,60 @@ pub(crate) fn to_f32(dtype: &str, raw: &[u8]) -> anyhow::Result<Vec<f32>> {
     })
 }
 
+/// Blob-layout sort key that puts tensors in decode-traversal order:
+/// `(phase, layer, group, expert, projection)`. Phase orders embed → layers →
+/// final-norm → lm_head → MTP → tail; within a layer, attention precedes the
+/// FFN and MoE experts are grouped per expert (each expert's gate/up/down
+/// contiguous). A stable name tiebreak keeps it deterministic. Layout only —
+/// no effect on decoding (the directory is the offset authority).
+pub(crate) fn exec_order_key(name: &str) -> (u32, u32, u32, u32, u32) {
+    let num_after = |marker: &str| {
+        name.split(marker)
+            .nth(1)
+            .and_then(|s| s.split('.').next())
+            .and_then(|s| s.parse::<u32>().ok())
+    };
+    let expert = num_after(".experts.").unwrap_or(0);
+    // Projection order within a block: q/gate, k/up, v/down, o, else.
+    let proj = if name.contains("q_proj") || name.contains("gate_proj") {
+        0
+    } else if name.contains("k_proj") || name.contains("up_proj") {
+        1
+    } else if name.contains("v_proj") || name.contains("down_proj") {
+        2
+    } else if name.contains("o_proj") {
+        3
+    } else {
+        4
+    };
+    if name.contains("embed_tokens") {
+        (0, 0, 0, 0, 0)
+    } else if let Some(l) = num_after(".layers.") {
+        let group = if name.contains("input_layernorm") {
+            0
+        } else if name.contains("self_attn") || name.contains("linear_attn") || name.contains("short_conv") {
+            1
+        } else if name.contains("post_attention_layernorm") {
+            2
+        } else if name.ends_with("mlp.gate.weight") || name.contains("shared_expert") || name.contains("expert_bias") {
+            3 // MoE router / shared expert (before the routed experts)
+        } else if name.contains(".experts.") {
+            4
+        } else {
+            5 // dense FFN (gate/up/down_proj) and anything else in the layer
+        };
+        (1, l, group, expert, proj)
+    } else if name.contains("model.mtp") {
+        (4, 0, 0, 0, 0)
+    } else if name.contains("lm_head") {
+        (3, 0, 0, 0, 0)
+    } else if name.contains("model.norm") || name.ends_with("norm.weight") {
+        (2, 0, 0, 0, 0)
+    } else {
+        (5, 0, 0, 0, 0)
+    }
+}
+
 /// A tensor's metadata within a safetensors file (bytes are read lazily from mmap).
 pub(crate) struct TensorMeta {
     pub(crate) name: String,
@@ -1739,6 +1793,16 @@ pub fn run_convert(
         calibration: None,
     };
 
+    // Lay the blob out in EXECUTION order — embed, then each layer's tensors
+    // contiguously (attention, then FFN, with MoE experts grouped per expert),
+    // then final norm, lm_head, MTP, then any tail. HF safetensors are often
+    // alphabetical (`layers.10` before `layers.2`), which scatters the decode
+    // traversal across the file; sequential layer layout streams cold-start
+    // reads at disk rate and lets a per-layer `madvise(WILLNEED)` cover one
+    // contiguous range. Pure layout — the directory carries offsets, so the
+    // reader (which addresses tensors by name/offset) is unaffected.
+    tensors.sort_by(|a, b| exec_order_key(&a.name).cmp(&exec_order_key(&b.name)).then_with(|| a.name.cmp(&b.name)));
+
     CmfModel::write(output, &header, &tensors, None, vocab.as_deref())
         .map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;
     progress(1.0);
@@ -1749,6 +1813,42 @@ pub fn run_convert(
 mod tests {
     use super::*;
     use cortiq_core::quant::{dequant_q4_block, dequant_q8_2f, dequant_q8_row, dequant_vbit};
+
+    #[test]
+    fn exec_order_lays_out_by_layer_then_block() {
+        // Alphabetical order (the safetensors default) would put layer 10 before
+        // layer 2 and the router after the experts — the exec-order key fixes both.
+        let mut names: Vec<&str> = vec![
+            "lm_head.weight",
+            "model.layers.10.mlp.experts.1.up_proj.weight",
+            "model.embed_tokens.weight",
+            "model.layers.2.self_attn.q_proj.weight",
+            "model.norm.weight",
+            "model.layers.2.mlp.gate.weight", // MoE router
+            "model.layers.2.mlp.experts.0.down_proj.weight",
+            "model.layers.2.input_layernorm.weight",
+            "model.layers.2.mlp.experts.0.gate_proj.weight",
+            "model.layers.10.self_attn.o_proj.weight",
+        ];
+        names.sort_by(|a, b| {
+            exec_order_key(a).cmp(&exec_order_key(b)).then_with(|| a.cmp(b))
+        });
+        assert_eq!(
+            names,
+            vec![
+                "model.embed_tokens.weight",
+                "model.layers.2.input_layernorm.weight",
+                "model.layers.2.self_attn.q_proj.weight",
+                "model.layers.2.mlp.gate.weight",
+                "model.layers.2.mlp.experts.0.gate_proj.weight",
+                "model.layers.2.mlp.experts.0.down_proj.weight",
+                "model.layers.10.self_attn.o_proj.weight",
+                "model.layers.10.mlp.experts.1.up_proj.weight",
+                "model.norm.weight",
+                "lm_head.weight",
+            ]
+        );
+    }
 
     #[test]
     fn vbit_roundtrip_within_quant_error() {
