@@ -87,6 +87,12 @@ keep-2%).
 `q4` cannot reach, with graceful degradation — valuable where size is the
 binding constraint (on-device / mobile).
 
+**Decode speed:** the matvec is a *fused* decode+dot straight from mmap —
+no f32 row buffer, and a 256-entry byte→signs LUT instead of the base-3
+divide/modulo per weight (that divide, from the packing, was the decode
+bottleneck). Measured **5.9× faster** than the division decode on an
+8192×4096 tensor (single thread); 0.5B q1t decode 2.5 → 16 tok/s end-to-end.
+
 **Follow-ups:** a cheaper overlay encoding (per-row indices) for higher
-keep; a SIMD ternary matvec kernel (current per-row dequant makes large-model
-decode slow on CPU).
+keep; an int8-SDOT ternary kernel (signs as `{−1,0,+1}` i8) to close the
+remaining gap to dense `q8` decode.

@@ -701,6 +701,15 @@ impl QTensor {
                     q1_matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
                     return;
                 }
+                if *dtype == TensorDtype::Q1T {
+                    // No fused ternary pair kernel; the two passes are still
+                    // the fused decode+dot each. (Q1T lacks a row_scale array —
+                    // scales live inline in the tiles — so it must not fall
+                    // through to the q8 qmatvec2 below.)
+                    q1t_matvec(self.quant_bytes(), x1, *rows, *cols, o1, pool);
+                    q1t_matvec(self.quant_bytes(), x2, *rows, *cols, o2, pool);
+                    return;
+                }
                 if matches!(dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
                     vbitmatvec2(self.quant_bytes(), vbit_offsets, x1, x2, *rows, *cols, o1, o2, pool);
                     return;
@@ -3063,9 +3072,86 @@ fn q1t_overlay(bytes: &[u8], base_len: usize) -> (usize, usize) {
     (base_len + 4, count)
 }
 
-/// Dequantize one q1t row into `buf[..cols]`: the ternary base
-/// (`[f16 scale][8B codes]` per group) then the row's outliers (the overlay
-/// range `[r·cols, (r+1)·cols)`, found by binary search since it is sorted).
+/// Byte → the 5 ternary signs it packs `{−1,0,+1}` as f32, precomputed so
+/// decoding a q1t code is a table load, not the base-3 divide/modulo per
+/// weight (division is ~20–40× the cost of a load). Built at compile time.
+const SIGN5: [[f32; 5]; 256] = {
+    let mut lut = [[0.0f32; 5]; 256];
+    let pow3 = [1u16, 3, 9, 27, 81];
+    let mut byte = 0usize;
+    while byte < 256 {
+        let mut i = 0usize;
+        while i < 5 {
+            let code = (byte as u16 / pow3[i]) % 3;
+            lut[byte][i] = if code == 1 {
+                1.0
+            } else if code == 2 {
+                -1.0
+            } else {
+                0.0
+            };
+            i += 1;
+        }
+        byte += 1;
+    }
+    lut
+};
+
+/// Σ over a row's outliers of `(f16 value − ternary base value)·x[col]` — the
+/// correction that turns the base ternary dot into the masked one. Outliers
+/// are few (the keep budget) and sorted, so this is cheap; the per-outlier
+/// base-3 decode here is off the hot loop.
+fn q1t_row_outlier_correction(
+    bytes: &[u8],
+    r: usize,
+    gpr: usize,
+    cols: usize,
+    ov_start: usize,
+    ov_count: usize,
+    x: &[f32],
+) -> f32 {
+    const TILE: usize = cortiq_core::quant::Q1T_TILE;
+    let (lo, hi) = (r * cols, r * cols + cols);
+    let idx_at = |p: usize| -> usize {
+        let e = ov_start + p * 6;
+        u32::from_le_bytes([bytes[e], bytes[e + 1], bytes[e + 2], bytes[e + 3]]) as usize
+    };
+    let (mut a, mut b) = (0usize, ov_count);
+    while a < b {
+        let m = (a + b) / 2;
+        if idx_at(m) < lo {
+            a = m + 1;
+        } else {
+            b = m;
+        }
+    }
+    let mut corr = 0f32;
+    let mut p = a;
+    while p < ov_count {
+        let idx = idx_at(p);
+        if idx >= hi {
+            break;
+        }
+        let col = idx - lo;
+        let e = ov_start + p * 6;
+        let val = f16_to_f32(u16::from_le_bytes([bytes[e + 4], bytes[e + 5]]));
+        let off = (r * gpr + col / GROUP_SIZE) * TILE;
+        let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+        let base_val = match cortiq_core::quant::q1t_code(&bytes[off + 2..off + TILE], col % GROUP_SIZE)
+        {
+            1 => s,
+            2 => -s,
+            _ => 0.0,
+        };
+        corr += (val - base_val) * x[col];
+        p += 1;
+    }
+    corr
+}
+
+/// Dequantize one q1t row into `buf[..cols]` via the sign LUT (no division),
+/// then apply the row's outliers. Used by the batched (prefill) path where
+/// the per-row decode is amortized over the whole batch.
 fn q1t_dequant_row(
     bytes: &[u8],
     r: usize,
@@ -3081,13 +3167,17 @@ fn q1t_dequant_row(
         let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
         let codes = &bytes[off + 2..off + TILE];
         let bc = g * GROUP_SIZE;
-        for k in 0..GROUP_SIZE {
-            buf[bc + k] = match cortiq_core::quant::q1t_code(codes, k) {
-                1 => s,
-                2 => -s,
-                _ => 0.0,
-            };
+        // 6 full bytes (30 codes) + a 7th byte holding the last 2.
+        for bi in 0..6 {
+            let lut = &SIGN5[codes[bi] as usize];
+            let d = &mut buf[bc + bi * 5..bc + bi * 5 + 5];
+            for i in 0..5 {
+                d[i] = lut[i] * s;
+            }
         }
+        let lut = &SIGN5[codes[6] as usize];
+        buf[bc + 30] = lut[0] * s;
+        buf[bc + 31] = lut[1] * s;
     }
     let (lo, hi) = (r * cols, r * cols + cols);
     let idx_at = |p: usize| -> usize {
@@ -3115,20 +3205,38 @@ fn q1t_dequant_row(
     }
 }
 
-/// Ternary (q1t) matvec — per-row dequant + dot, straight from mmap.
+/// Ternary (q1t) matvec — FUSED decode+dot straight from mmap: no f32 buffer
+/// materialization, no division (the sign LUT), one group at a time. This is
+/// the decode hot path.
 fn q1t_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
     debug_assert_eq!(out.len(), rows);
+    const TILE: usize = cortiq_core::quant::Q1T_TILE;
     let gpr = cols / GROUP_SIZE;
-    let (ov_start, ov_count) = q1t_overlay(bytes, rows * gpr * cortiq_core::quant::Q1T_TILE);
+    let (ov_start, ov_count) = q1t_overlay(bytes, rows * gpr * TILE);
     let out_addr = SendMut(out.as_mut_ptr());
     let run = move |start: usize, end: usize| {
-        let mut buf = vec![0f32; cols];
         for r in start..end {
-            q1t_dequant_row(bytes, r, gpr, cols, ov_start, ov_count, &mut buf);
             let mut acc = 0f32;
-            for j in 0..cols {
-                acc += buf[j] * x[j];
+            for g in 0..gpr {
+                let off = (r * gpr + g) * TILE;
+                let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+                let codes = &bytes[off + 2..off + TILE];
+                let xg = &x[g * GROUP_SIZE..g * GROUP_SIZE + GROUP_SIZE];
+                let mut gsum = 0f32;
+                for bi in 0..6 {
+                    let lut = &SIGN5[codes[bi] as usize];
+                    let xb = &xg[bi * 5..bi * 5 + 5];
+                    gsum += lut[0] * xb[0]
+                        + lut[1] * xb[1]
+                        + lut[2] * xb[2]
+                        + lut[3] * xb[3]
+                        + lut[4] * xb[4];
+                }
+                let lut = &SIGN5[codes[6] as usize];
+                gsum += lut[0] * xg[30] + lut[1] * xg[31];
+                acc += s * gsum;
             }
+            acc += q1t_row_outlier_correction(bytes, r, gpr, cols, ov_start, ov_count, x);
             unsafe { *out_addr.at(r) = acc };
         }
     };
@@ -6213,5 +6321,94 @@ mod tests {
             assert!((gm[r] - expect[r]).abs() < 1e-4);
             assert!((gm[rows + r] - expect[r]).abs() < 1e-4);
         }
+        // The fused-pair dispatch (matvec2) for Q1T routes to two q1t_matvec
+        // passes — same kernel, so both outputs equal the single-vec result.
+        // (Dispatch is covered end-to-end by the mixed-dtype bench; here we
+        // confirm the two-pass composition is output-identical.)
+        let (mut p1, mut p2) = (vec![0f32; rows], vec![0f32; rows]);
+        q1t_matvec(&bytes, &x, rows, cols, &mut p1, None);
+        q1t_matvec(&bytes, &x, rows, cols, &mut p2, None);
+        for r in 0..rows {
+            assert!((p1[r] - expect[r]).abs() < 1e-4 && (p2[r] - expect[r]).abs() < 1e-4);
+        }
+    }
+
+    // Speed A/B: the base-3-division decode (what the packing commit left in
+    // place) vs the fused sign-LUT matvec. Both single-threaded, same bytes.
+    //   cargo test -p cortiq-engine q1t_matvec_speed -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn q1t_matvec_speed() {
+        use cortiq_core::quant::{f32_to_f16, q1t_code, q1t_pack, Q1T_TILE};
+        use std::time::Instant;
+        let (rows, cols) = (8192usize, 4096usize); // FFN-sized
+        let gpr = cols / GROUP_SIZE;
+        let mut bytes = Vec::with_capacity(rows * gpr * Q1T_TILE + 16);
+        for r in 0..rows {
+            for g in 0..gpr {
+                let s = 0.1 + ((r + g) % 7) as f32 * 0.01;
+                bytes.extend_from_slice(&f32_to_f16(s).to_le_bytes());
+                let mut c = [0u8; 7];
+                for k in 0..GROUP_SIZE {
+                    q1t_pack(&mut c, k, ((k * 7 + r + g) % 3) as u8);
+                }
+                bytes.extend_from_slice(&c);
+            }
+        }
+        let (n, stride) = (rows * cols, 40usize); // ~2.5% outliers, sorted
+        bytes.extend_from_slice(&((n / stride) as u32).to_le_bytes());
+        let mut idx = 0usize;
+        while idx < n {
+            bytes.extend_from_slice(&(idx as u32).to_le_bytes());
+            bytes.extend_from_slice(&f32_to_f16((idx % 13) as f32 * 0.1 - 0.6).to_le_bytes());
+            idx += stride;
+        }
+        let x: Vec<f32> = (0..cols).map(|j| (j as f32 * 0.017).sin()).collect();
+        let (ov_start, ov_count) = q1t_overlay(&bytes, rows * gpr * Q1T_TILE);
+
+        // "before": base-3 division decode into a buffer, then dot.
+        let slow = |out: &mut [f32]| {
+            let mut buf = vec![0f32; cols];
+            for r in 0..rows {
+                for g in 0..gpr {
+                    let off = (r * gpr + g) * Q1T_TILE;
+                    let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+                    let codes = &bytes[off + 2..off + Q1T_TILE];
+                    for k in 0..GROUP_SIZE {
+                        buf[g * GROUP_SIZE + k] = match q1t_code(codes, k) {
+                            1 => s,
+                            2 => -s,
+                            _ => 0.0,
+                        };
+                    }
+                }
+                out[r] = q1t_row_outlier_correction(&bytes, r, gpr, cols, ov_start, ov_count, &x)
+                    + (0..cols).map(|j| buf[j] * x[j]).sum::<f32>();
+            }
+        };
+        let iters = 5;
+        let mut a = vec![0f32; rows];
+        slow(&mut a); // warm
+        let t = Instant::now();
+        for _ in 0..iters {
+            slow(&mut a);
+        }
+        let slow_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+        let mut b = vec![0f32; rows];
+        q1t_matvec(&bytes, &x, rows, cols, &mut b, None); // warm
+        let t = Instant::now();
+        for _ in 0..iters {
+            q1t_matvec(&bytes, &x, rows, cols, &mut b, None);
+        }
+        let fast_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+        for r in 0..rows {
+            assert!((a[r] - b[r]).abs() < 1e-2, "mismatch row {r}");
+        }
+        println!(
+            "q1t matvec {rows}x{cols} (1 thread): div-decode {slow_ms:.2} ms  fused-LUT {fast_ms:.2} ms  => {:.2}x",
+            slow_ms / fast_ms
+        );
     }
 }
