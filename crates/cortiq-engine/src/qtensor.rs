@@ -3097,6 +3097,84 @@ const SIGN5: [[f32; 5]; 256] = {
     lut
 };
 
+/// Same table, as i8 signs — the operand for the int8 SDOT base kernel.
+const SIGN5_I8: [[i8; 5]; 256] = {
+    let mut lut = [[0i8; 5]; 256];
+    let pow3 = [1u16, 3, 9, 27, 81];
+    let mut byte = 0usize;
+    while byte < 256 {
+        let mut i = 0usize;
+        while i < 5 {
+            let code = (byte as u16 / pow3[i]) % 3;
+            lut[byte][i] = if code == 1 {
+                1
+            } else if code == 2 {
+                -1
+            } else {
+                0
+            };
+            i += 1;
+        }
+        byte += 1;
+    }
+    lut
+};
+
+/// Ternary base weight at `(row r, col j)` = `sign(code)·s_group`. Used to add
+/// back activation-outlier columns, whose `x` was zeroed for the int8 bulk dot
+/// (`split_act`). At a weight-outlier position the code is 0, so this is 0 and
+/// the overlay correction owns that column — no double counting.
+#[inline]
+fn q1t_base_weight(bytes: &[u8], r: usize, gpr: usize, j: usize) -> f32 {
+    const TILE: usize = cortiq_core::quant::Q1T_TILE;
+    let off = (r * gpr + j / GROUP_SIZE) * TILE;
+    let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+    let within = j % GROUP_SIZE;
+    SIGN5[bytes[off + 2 + within / 5] as usize][within % 5] * s
+}
+
+/// One q1t row's int8 base dot: `Σ_group s·SDOT(signs, xq)` (before the shared
+/// `sx`). Signs unpack from base-3 into a 32-i8 stack buffer (the packing
+/// isn't SIMD-unpackable), then two SDOTs per group. Bit-exact vs the scalar
+/// i8 sum (integer accumulation is order-independent).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn q1t_dot_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
+    // SAFETY: 9-byte tile per group, xq.len() == gpr·GROUP_SIZE.
+    unsafe {
+        use core::arch::aarch64::*;
+        use core::arch::asm;
+        const TILE: usize = cortiq_core::quant::Q1T_TILE;
+        let mut acc = 0f32;
+        let mut sg = [0i8; GROUP_SIZE];
+        for gi in 0..gpr {
+            let off = (r * gpr + gi) * TILE;
+            let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+            let codes = bytes.as_ptr().add(off + 2);
+            for bi in 0..6 {
+                sg[bi * 5..bi * 5 + 5].copy_from_slice(&SIGN5_I8[*codes.add(bi) as usize]);
+            }
+            let lut = &SIGN5_I8[*codes.add(6) as usize];
+            sg[30] = lut[0];
+            sg[31] = lut[1];
+            let w0 = vld1q_s8(sg.as_ptr());
+            let w1 = vld1q_s8(sg.as_ptr().add(16));
+            let x0 = vld1q_s8(xq.as_ptr().add(gi * GROUP_SIZE));
+            let x1 = vld1q_s8(xq.as_ptr().add(gi * GROUP_SIZE + 16));
+            let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+            asm!(
+                "sdot {a0:v}.4s, {w0:v}.16b, {x0:v}.16b",
+                "sdot {a1:v}.4s, {w1:v}.16b, {x1:v}.16b",
+                a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                w0 = in(vreg) w0, x0 = in(vreg) x0, w1 = in(vreg) w1, x1 = in(vreg) x1,
+                options(pure, nomem, nostack),
+            );
+            acc += vaddvq_s32(vaddq_s32(a0, a1)) as f32 * s;
+        }
+        acc
+    }
+}
+
 /// Σ over a row's outliers of `value·x[col]` — the correction that adds the
 /// overlay's exact weights on top of the base dot. INVARIANT: the encoder
 /// writes ternary code 0 at every outlier position (`quantize_q1t`), so the
@@ -3206,6 +3284,27 @@ fn q1t_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]
     let gpr = cols / GROUP_SIZE;
     let (ov_start, ov_count) = q1t_overlay(bytes, rows * gpr * TILE);
     let out_addr = SendMut(out.as_mut_ptr());
+    // int8 SDOT base dot (ARM dotprod): ~4× the f32 arithmetic. x → i8 once
+    // (`split_act`), activation outliers added back exactly in f32, weight
+    // overlay on top. CMF_SDOT=0 / x86 keep the exact f32 path below.
+    #[cfg(target_arch = "aarch64")]
+    if sdot_enabled() {
+        let act = split_act(x);
+        let act = &act;
+        let run = move |start: usize, end: usize| {
+            for r in start..end {
+                let mut acc = unsafe { q1t_dot_row_sdot(bytes, r, gpr, &act.xq) } * act.sx;
+                for &(j, xv) in &act.outliers {
+                    acc += q1t_base_weight(bytes, r, gpr, j) * xv;
+                }
+                acc += q1t_row_outlier_correction(bytes, r, gpr, cols, ov_start, ov_count, x);
+                // SAFETY: disjoint row ranges per worker.
+                unsafe { *out_addr.at(r) = acc };
+            }
+        };
+        dispatch_rows(pool, rows, &run);
+        return;
+    }
     let run = move |start: usize, end: usize| {
         // Per-group signs, unpacked contiguously so the dot below is a clean
         // 32-wide reduction the autovectorizer turns into f32x4 FMAs — the
@@ -6299,7 +6398,9 @@ mod tests {
 
         let mut refw = vec![0f32; rows * cols];
         dequant_q1t(&bytes, &mut refw);
-        let x: Vec<f32> = (0..cols).map(|j| (j as f32 * 0.13).sin()).collect();
+        // On-grid activations (±1, amax 1) so the int8 SDOT path reconstructs
+        // x exactly and matches the f32 reference (same trick as the q1 test).
+        let x: Vec<f32> = (0..cols).map(|j| if j % 3 == 0 { 1.0 } else { -1.0 }).collect();
         let mut expect = vec![0f32; rows];
         for r in 0..rows {
             let mut a = 0.0f32;
@@ -6308,18 +6409,19 @@ mod tests {
             }
             expect[r] = a;
         }
+        let tol = |e: f32| 1e-3 * e.abs().max(1e-3);
         let mut got = vec![0f32; rows];
         q1t_matvec(&bytes, &x, rows, cols, &mut got, None);
         for r in 0..rows {
-            assert!((got[r] - expect[r]).abs() < 1e-4, "row {r}: {} vs {}", got[r], expect[r]);
+            assert!((got[r] - expect[r]).abs() < tol(expect[r]), "row {r}: {} vs {}", got[r], expect[r]);
         }
-        // matmat (b=2) must agree too.
+        // matmat (b=2, f32 decode path) must agree too.
         let x2: Vec<f32> = x.iter().chain(x.iter().map(|v| v)).copied().collect();
         let mut gm = vec![0f32; 2 * rows];
         q1t_matmat(&bytes, &x2, 2, rows, cols, &mut gm, None);
         for r in 0..rows {
-            assert!((gm[r] - expect[r]).abs() < 1e-4);
-            assert!((gm[rows + r] - expect[r]).abs() < 1e-4);
+            assert!((gm[r] - expect[r]).abs() < tol(expect[r]));
+            assert!((gm[rows + r] - expect[r]).abs() < tol(expect[r]));
         }
         // The fused-pair dispatch (matvec2) for Q1T routes to two q1t_matvec
         // passes — same kernel, so both outputs equal the single-vec result.
@@ -6329,7 +6431,7 @@ mod tests {
         q1t_matvec(&bytes, &x, rows, cols, &mut p1, None);
         q1t_matvec(&bytes, &x, rows, cols, &mut p2, None);
         for r in 0..rows {
-            assert!((p1[r] - expect[r]).abs() < 1e-4 && (p2[r] - expect[r]).abs() < 1e-4);
+            assert!((p1[r] - expect[r]).abs() < tol(expect[r]) && (p2[r] - expect[r]).abs() < tol(expect[r]));
         }
     }
 
