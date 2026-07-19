@@ -97,14 +97,16 @@ binding constraint (on-device / mobile).
 2. **Overlay** — dominates at high keep; since the encoder writes ternary
    code 0 at every outlier position, the correction is a plain `value·x`
    with **no scattered per-outlier scale read** (+45 % at keep-10 %).
-3. **int8 SDOT** on ARM dotprod (default; `CMF_SDOT=0`/x86 keep the exact f32
-   path) for BOTH decode (`matvec`) and prefill (`matmat`): x → i8 once
-   (`split_act`, activation outliers stay f32), signs unpacked base-3 → i8,
-   two `sdot`s per 32-group; in matmat each row's signs decode once and sdot
-   against the whole batch. Decode **+30 % at keep-2 %**, prefill **2.6× at
-   keep-2 %** (TTFT 0.87 → 0.32 s). Cost: PPL 89.08 vs 88.66 exact (**+0.5 %**,
-   the standard a8w8 activation-quant tradeoff q8/q1/q4 also take by default).
-   Levers 1–2 stay bit-identical to `dequant_q1t`; only the i8 path perturbs.
+3. **int8 SIMD** — ARM dotprod (`sdot`) and x86 AVX2 (`maddubs`), default;
+   `CMF_SDOT=0` keeps the exact f32 path — for BOTH decode (`matvec`) and
+   prefill (`matmat`): x → i8 once (`split_act`, activation outliers stay
+   f32), signs unpacked base-3 → i8, an int8 dot per 32-group; in matmat each
+   row's signs decode once and dot against the whole batch. ARM: decode
+   **+30 %**, prefill **2.6×** at keep-2 % (TTFT 0.87 → 0.32 s). x86 (i9):
+   prefill **2.1×**, decode +31 %. Cost: PPL +0.2–0.5 % (89.08 vs 88.66 on
+   ARM; 88.42 vs 88.23 on x86) — the standard a8w8 activation-quant tradeoff
+   q8/q1/q4 also take by default. Levers 1–2 stay bit-identical to
+   `dequant_q1t`; only the i8 path perturbs.
 
 End to end, 0.5B q1t went from ~2.5 tok/s decode (the div-decode regression
 the packing introduced) to **~38 tok/s decode / ~58 prefill at keep-10 %, ~60
@@ -120,6 +122,5 @@ fixed size budget it buys ~50 % more kept outliers → better quality-at-size.
 `col` is within-row, so a quantized tensor's `cols` must fit `u16` (true for
 attn/FFN; the vocab-sized `embed`/`lm_head` are skipped anyway).
 
-**Follow-ups:** an x86 AVX2 ternary SDOT path (x86 currently runs the f32
-kernel); validating the SDOT throughput on a large (12B) model, where q1t's
-smaller footprint should narrow the tok/s gap to `q8` further.
+**Follow-ups:** validating the int8 throughput on a large (12B) model, where
+q1t's smaller footprint should narrow the tok/s gap to `q8` further.
