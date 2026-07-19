@@ -504,6 +504,25 @@ pub fn q1t_matvec(
     }
 }
 
+/// q1t batched GEMM (prefill) — base + overlay on-device. Metal only.
+pub fn q1t_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q1t_matmat(model, idx, xs, b, rows, cols, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => false,
+        Backend::None => false,
+    }
+}
+
 /// Whole-block token-graph types re-exported from the Metal backend.
 #[cfg(target_os = "macos")]
 pub use crate::gpu_metal::{

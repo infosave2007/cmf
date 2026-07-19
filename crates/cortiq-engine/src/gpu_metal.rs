@@ -249,6 +249,170 @@ kernel void q8_mul_mm(
     }
 }
 
+// q1t register-blocked GEMM (prefill): identical simdgroup-matrix machinery to
+// q8_mul_mm; only the weight staging decodes base-3 ternary tiles (per-group
+// f16 scale) instead of i8·row_scale. NK=32 == GROUP_SIZE so each K-step is one
+// group; no row_scale buffer. The sparse overlay is added by q1t_overlay_mm.
+kernel void q1t_mul_mm(
+    device const uchar*  q      [[buffer(0)]],
+    device const float*  xs     [[buffer(1)]],
+    device float*        y      [[buffer(2)]],
+    constant uint&       cols_b [[buffer(3)]],
+    constant uint&       rows_b [[buffer(4)]],
+    constant uint&       nb     [[buffer(5)]],
+    uint tiitg [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint2 tg  [[threadgroup_position_in_grid]])
+{
+    uint cols = cols_b;
+    uint rows = rows_b;
+    uint gpr = cols >> 5u;
+    const uint POW3[5] = {1u, 3u, 9u, 27u, 81u};
+    threadgroup char shmem[8192];
+    threadgroup half* sa = (threadgroup half*)shmem;
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+    const uint NK = 32u;
+    uint r0 = tg.y * 64u;
+    uint r1 = tg.x * 32u;
+    uint nr0 = min(rows - r0, 64u);
+    uint nr1 = min(nb - r1, 32u);
+    uint lr0 = min(tiitg / 2u, nr0 - 1u);
+    uint il0 = tiitg % 2u;
+    uint lr1 = min(tiitg / 4u, nr1 - 1u);
+    uint iy  = 8u * (tiitg % 4u);
+
+    device const float* yrow = xs + (ulong)(r1 + lr1) * cols + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8u; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (uint k0 = 0; k0 < cols; k0 += NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // W: decode this thread's 16 ternary weights (row r0+lr0, K-half il0).
+        {
+            uint g = k0 >> 5u;
+            device const uchar* tile = q + ((ulong)(r0 + lr0) * gpr + (ulong)g) * 9u;
+            half scale = as_type<half>((ushort)((uint)tile[0] | ((uint)tile[1] << 8)));
+            device const uchar* codes = tile + 2u;
+            uint sy = (tiitg / 2u) / 8u;
+            uint lx = (tiitg / 2u) % 8u;
+            float wv[16];
+            for (uint i = 0; i < 16u; ++i) {
+                uint p = 16u * il0 + i;
+                uint bb = (uint)codes[p / 5u];
+                uint code = (bb / POW3[p % 5u]) % 3u;
+                float sgn = code == 1u ? 1.0f : (code == 2u ? -1.0f : 0.0f);
+                wv[i] = sgn * (float)scale;
+            }
+            uint ib0 = 8u * (2u * il0) + sy;
+            uint ib1 = 8u * (2u * il0 + 1u) + sy;
+            for (uint i = 0; i < 8u; ++i) {
+                sa[64u * ib0 + 8u * i + lx] = (half)wv[i];
+                sa[64u * ib1 + 8u * i + lx] = (half)wv[i + 8u];
+            }
+        }
+        // X: 8 consecutive floats → one 8x8-block row (identical to q8).
+        {
+            uint sx = tiitg % 4u;
+            uint sy = (tiitg / 4u) / 8u;
+            uint ly = (tiitg / 4u) % 8u;
+            uint ib = 4u * sx + sy;
+            device const float4* y4 = (device const float4*)yrow;
+            float4 v0 = y4[0];
+            float4 v1 = y4[1];
+            threadgroup half* dst = sb + 64u * ib + 8u * ly;
+            dst[0] = (half)v0.x; dst[1] = (half)v0.y;
+            dst[2] = (half)v0.z; dst[3] = (half)v0.w;
+            dst[4] = (half)v1.x; dst[5] = (half)v1.y;
+            dst[6] = (half)v1.z; dst[7] = (half)v1.w;
+        }
+        yrow += NK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < 4; ++ik) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; ++i) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    if (r0 + 64u <= rows && r1 + 32u <= nb) {
+        device float* C = y + (r0 + 32u * (sgitg & 1u))
+            + (ulong)(r1 + 16u * (sgitg >> 1u)) * rows;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * (ulong)rows * (i / 4),
+                            rows, ulong2(0, 0), false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* temp_str = ((threadgroup float*)shmem)
+            + 32u * (sgitg & 1u) + (16u * (sgitg >> 1u)) * 64u;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * 64 * (i / 4),
+                            64, ulong2(0, 0), false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (uint j = tiitg; j < nr1; j += 128u) {
+                device float* D = y + r0 + (ulong)(r1 + j) * rows;
+                threadgroup const float* Cr = ((threadgroup float*)shmem) + j * 64u;
+                for (uint i = 0; i < nr0; ++i) {
+                    D[i] = Cr[i];
+                }
+            }
+        }
+    }
+}
+
+// Batched q1t overlay: adds the sparse outlier overlay onto the GEMM output
+// Y[bi*rows + r] for every batch column. One thread per row; byte-wise reads.
+kernel void q1t_overlay_mm(
+    device const uchar* q        [[buffer(0)]],
+    device const float* x        [[buffer(1)]],
+    device float*       y        [[buffer(2)]],
+    constant uint&      base_len [[buffer(3)]],
+    constant uint&      rows     [[buffer(4)]],
+    constant uint&      cols     [[buffer(5)]],
+    constant uint&      nb       [[buffer(6)]],
+    uint rid [[thread_position_in_grid]])
+{
+    if (rid >= rows) return;
+    uint rp0 = base_len + rid * 4u;
+    uint c0 = (uint)q[rp0] | ((uint)q[rp0 + 1u] << 8) | ((uint)q[rp0 + 2u] << 16) | ((uint)q[rp0 + 3u] << 24);
+    uint rp1 = base_len + (rid + 1u) * 4u;
+    uint c1 = (uint)q[rp1] | ((uint)q[rp1 + 1u] << 8) | ((uint)q[rp1 + 2u] << 16) | ((uint)q[rp1 + 3u] << 24);
+    uint ent = base_len + (rows + 1u) * 4u;
+    for (uint p = c0; p < c1; ++p) {
+        uint e = ent + p * 4u;
+        uint col = (uint)q[e] | ((uint)q[e + 1u] << 8);
+        float fv = (float)as_type<half>((ushort)((uint)q[e + 2u] | ((uint)q[e + 3u] << 8)));
+        for (uint bi = 0; bi < nb; ++bi) {
+            y[(ulong)bi * rows + rid] += fv * x[(ulong)bi * cols + col];
+        }
+    }
+}
+
 // q8_mul_mm with the FFN activation fused into the X-tile load:
 // x[i] = silu(g[i])·u[i] — the down GEMM consumes gate/up directly, no
 // separate silu dispatch, no act-buffer round trip (profiled at 8% of
@@ -1700,6 +1864,8 @@ struct Ctx {
     q1h: ComputePipelineState,
     q1t: ComputePipelineState,
     q1t_ov: ComputePipelineState,
+    q1t_mm: ComputePipelineState,
+    q1t_ovmm: ComputePipelineState,
     q4b: ComputePipelineState,
     flag: ComputePipelineState,
     rmsn: ComputePipelineState,
@@ -1819,6 +1985,8 @@ fn init() -> Result<Ctx, String> {
     let q1h = pso("q1_matvec_h")?;
     let q1t = pso("q1t_matvec")?;
     let q1t_ov = pso("q1t_overlay")?;
+    let q1t_mm = pso("q1t_mul_mm")?;
+    let q1t_ovmm = pso("q1t_overlay_mm")?;
     let q4b = pso("q4b_matvec")?;
     let flag = pso("write_flag")?;
     let rmsn = pso("rmsnorm_k")?;
@@ -1859,6 +2027,8 @@ fn init() -> Result<Ctx, String> {
         q1h,
         q1t,
         q1t_ov,
+        q1t_mm,
+        q1t_ovmm,
         q4b,
         flag,
         rmsn,
@@ -3278,6 +3448,91 @@ pub fn q8_matmat(
             y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
     }
     tracing::debug!("gpu matmat: {rows}x{cols} b={b}");
+    true
+}
+
+/// q1t batched GEMM (prefill): register-blocked base GEMM (q1t_mul_mm) then the
+/// sparse overlay (q1t_overlay_mm), both on-device in one command buffer. Raw
+/// f32 x, scales in the tiles. Only the wide path (b ≥ 32, cols % 32 == 0);
+/// narrower batches return false → CPU.
+pub fn q1t_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if b < 32 || cols % 32 != 0 {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    let Some(abs) = model.entry_abs_offset(entry) else { return false };
+    let bytes = model.primary_bytes();
+    let Some((fbuf, safe_len)) = file_buffer(c, bytes) else { return false };
+    if abs + entry.nbytes as usize > safe_len {
+        return false;
+    }
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let xs_buf = get_io(11_000_000_453 + xs.len(), xs.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(xs.as_ptr(), xs_buf.contents() as *mut f32, xs.len());
+    }
+    let y_buf = get_io(12_000_000_469 + b * rows, b * rows * 4);
+    let gpr = cols / GROUP_SIZE;
+    let (cols_u, rows_u, b_u) = (cols as u32, rows as u32, b as u32);
+
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.q1t_mm);
+        enc.set_buffer(0, Some(&fbuf), abs as u64);
+        enc.set_buffer(1, Some(&xs_buf), 0);
+        enc.set_buffer(2, Some(&y_buf), 0);
+        enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &b_u as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new((b as u64).div_ceil(32), (rows as u64).div_ceil(64), 1),
+            MTLSize::new(128, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    {
+        // Separate encoder → serialized after the GEMM (reads its y).
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.q1t_ovmm);
+        enc.set_buffer(0, Some(&fbuf), abs as u64);
+        enc.set_buffer(1, Some(&xs_buf), 0);
+        enc.set_buffer(2, Some(&y_buf), 0);
+        let base_len = (rows * gpr * Q1T_TILE) as u32;
+        enc.set_bytes(3, 4, &base_len as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(6, 4, &b_u as *const u32 as *const std::ffi::c_void);
+        let tpt = 64u64;
+        enc.dispatch_thread_groups(
+            MTLSize::new((rows as u64).div_ceil(tpt), 1, 1),
+            MTLSize::new(tpt, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
+    }
     true
 }
 

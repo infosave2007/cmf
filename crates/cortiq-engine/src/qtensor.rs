@@ -815,6 +815,38 @@ impl QTensor {
                     return;
                 }
                 if *dtype == TensorDtype::Q1T {
+                    // GPU batched GEMM for wide prefill (base + overlay on the
+                    // device); probe keeps the winner vs the CPU matmat.
+                    if b >= 32
+                        && b * rows * cols >= 128_000_000
+                        && crate::gpu::enabled_here()
+                    {
+                        if let Self::Mapped { model, idx, .. } = self {
+                            let t0 = std::time::Instant::now();
+                            match crate::gpu::probe_arm(crate::gpu::OpClass::Matmat) {
+                                crate::gpu::ProbeArm::Gpu => {
+                                    if crate::gpu::q1t_matmat(model, *idx, xs_all, b, rows, cols, out) {
+                                        crate::gpu::probe_record(
+                                            crate::gpu::OpClass::Matmat,
+                                            true,
+                                            t0.elapsed(),
+                                        );
+                                        return;
+                                    }
+                                }
+                                crate::gpu::ProbeArm::CpuTimed => {
+                                    q1t_matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
+                                    crate::gpu::probe_record(
+                                        crate::gpu::OpClass::Matmat,
+                                        false,
+                                        t0.elapsed(),
+                                    );
+                                    return;
+                                }
+                                crate::gpu::ProbeArm::Cpu => {}
+                            }
+                        }
+                    }
                     q1t_matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
                     return;
                 }
