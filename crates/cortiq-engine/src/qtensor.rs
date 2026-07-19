@@ -3159,9 +3159,29 @@ unsafe fn sdot32_i8(w: *const i8, x: *const i8) -> i32 {
     }
 }
 
+/// One 32-group int8 dot via AVX2: signed·signed as `maddubs(|w|, sign(x,w))`
+/// then `madd` and a horizontal reduce (the same idiom as `dot_q4t_row_avx2`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn i8dot32_avx2(w: *const i8, x: *const i8) -> i32 {
+    // SAFETY: caller guarantees 32 readable i8 at each pointer.
+    unsafe {
+        use core::arch::x86_64::*;
+        let wv = _mm256_loadu_si256(w as *const __m256i);
+        let xv = _mm256_loadu_si256(x as *const __m256i);
+        let p16 = _mm256_maddubs_epi16(_mm256_abs_epi8(wv), _mm256_sign_epi8(xv, wv));
+        let d = _mm256_madd_epi16(p16, _mm256_set1_epi16(1));
+        let hi128 = _mm256_extracti128_si256::<1>(d);
+        let s128 = _mm_add_epi32(_mm256_castsi256_si128(d), hi128);
+        let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
+        let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
+        _mm_cvtsi128_si32(s32)
+    }
+}
+
 /// Unpack one q1t group's base-3 codes into 32 i8 signs (the packing isn't
 /// SIMD-unpackable, so a table gather into a stack buffer).
-#[cfg(target_arch = "aarch64")]
 #[inline]
 fn q1t_unpack_group_i8(codes: *const u8, dst: &mut [i8]) {
     // SAFETY: codes points at 7 readable bytes; dst.len() >= 32.
@@ -3175,9 +3195,33 @@ fn q1t_unpack_group_i8(codes: *const u8, dst: &mut [i8]) {
     }
 }
 
-/// One q1t row's int8 base dot: `Σ_group s·SDOT(signs, xq)` (before the shared
-/// `sx`). Signs unpack from base-3 into a 32-i8 stack buffer, then two SDOTs
-/// per group.
+/// One 32-group int8 dot, arch-dispatched (the matmat inner loop, where the
+/// row's signs are unpacked once and dotted against every batch input).
+/// Callers are gated by `a8w8_enabled()`, so the target-feature arms are
+/// reachable; the scalar arm is a non-SIMD-arch fallback.
+#[inline]
+fn q1t_i8dot32(w: *const i8, x: *const i8) -> i32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return sdot32_i8(w, x);
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return i8dot32_avx2(w, x);
+    }
+    #[allow(unreachable_code)]
+    unsafe {
+        let mut s = 0i32;
+        for k in 0..GROUP_SIZE {
+            s += *w.add(k) as i32 * *x.add(k) as i32;
+        }
+        s
+    }
+}
+
+/// One q1t row's int8 base dot: `Σ_group s·dot(signs, xq)` (before the shared
+/// `sx`). Signs unpack base-3 → a 32-i8 stack buffer, then one int8 dot per
+/// group. ARM SDOT.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon,dotprod")]
 unsafe fn q1t_dot_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
@@ -3191,6 +3235,57 @@ unsafe fn q1t_dot_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32
             let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
             q1t_unpack_group_i8(bytes.as_ptr().add(off + 2), &mut sg);
             acc += sdot32_i8(sg.as_ptr(), xq.as_ptr().add(gi * GROUP_SIZE)) as f32 * s;
+        }
+        acc
+    }
+}
+
+/// x86 AVX2 mirror of `q1t_dot_row_sdot` (maddubs int8 dot per group).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q1t_dot_row_avx2(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
+    // SAFETY: as q1t_dot_row_sdot.
+    unsafe {
+        const TILE: usize = cortiq_core::quant::Q1T_TILE;
+        let mut acc = 0f32;
+        let mut sg = [0i8; GROUP_SIZE];
+        for gi in 0..gpr {
+            let off = (r * gpr + gi) * TILE;
+            let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+            q1t_unpack_group_i8(bytes.as_ptr().add(off + 2), &mut sg);
+            acc += i8dot32_avx2(sg.as_ptr(), xq.as_ptr().add(gi * GROUP_SIZE)) as f32 * s;
+        }
+        acc
+    }
+}
+
+/// Per-row int8 base dot, dispatched once per row (matvec decode hot path).
+/// Callers are gated by `a8w8_enabled()`, so the target-feature kernels are
+/// reachable.
+#[inline]
+fn q1t_dot_row_i8(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return q1t_dot_row_sdot(bytes, r, gpr, xq);
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        return q1t_dot_row_avx2(bytes, r, gpr, xq);
+    }
+    #[allow(unreachable_code)]
+    {
+        const TILE: usize = cortiq_core::quant::Q1T_TILE;
+        let mut acc = 0f32;
+        let mut sg = [0i8; GROUP_SIZE];
+        for gi in 0..gpr {
+            let off = (r * gpr + gi) * TILE;
+            let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+            q1t_unpack_group_i8(bytes.as_ptr().wrapping_add(off + 2), &mut sg);
+            let mut d = 0i32;
+            for k in 0..GROUP_SIZE {
+                d += sg[k] as i32 * xq[gi * GROUP_SIZE + k] as i32;
+            }
+            acc += d as f32 * s;
         }
         acc
     }
@@ -3276,14 +3371,13 @@ fn q1t_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]
     let out_addr = SendMut(out.as_mut_ptr());
     // int8 SDOT base dot (ARM dotprod): ~4× the f32 arithmetic. x → i8 once
     // (`split_act`), activation outliers added back exactly in f32, weight
-    // overlay on top. CMF_SDOT=0 / x86 keep the exact f32 path below.
-    #[cfg(target_arch = "aarch64")]
-    if sdot_enabled() {
+    // overlay on top. ARM SDOT / x86 AVX2; CMF_SDOT=0 keeps the exact f32 path.
+    if a8w8_enabled() {
         let act = split_act(x);
         let act = &act;
         let run = move |start: usize, end: usize| {
             for r in start..end {
-                let mut acc = unsafe { q1t_dot_row_sdot(bytes, r, gpr, &act.xq) } * act.sx;
+                let mut acc = q1t_dot_row_i8(bytes, r, gpr, &act.xq) * act.sx;
                 for &(j, xv) in &act.outliers {
                     acc += q1t_base_weight(bytes, r, gpr, j) * xv;
                 }
@@ -3342,11 +3436,10 @@ fn q1t_matmat(
     let gpr = cols / GROUP_SIZE;
     let (rp_off, ent_off, has_ov) = q1t_overlay(bytes, rows * gpr * TILE, rows);
     let out_addr = SendMut(out.as_mut_ptr());
-    // int8 SDOT prefill (ARM dotprod): quantize the B inputs once, unpack each
-    // weight row's signs to i8 ONCE, then sdot against every input — the row
-    // sign-decode amortizes over the whole batch. CMF_SDOT=0 / x86 → f32 below.
-    #[cfg(target_arch = "aarch64")]
-    if sdot_enabled() {
+    // int8 prefill (ARM SDOT / x86 AVX2): quantize the B inputs once, unpack
+    // each weight row's signs to i8 ONCE, then int8-dot against every input —
+    // the row sign-decode amortizes over the whole batch. CMF_SDOT=0 → f32.
+    if a8w8_enabled() {
         let acts: Vec<SplitAct> = (0..b)
             .map(|bi| split_act(&xs[bi * cols..(bi + 1) * cols]))
             .collect();
@@ -3364,9 +3457,10 @@ fn q1t_matmat(
                     let act = &acts[bi];
                     let mut isum = 0f32;
                     for g in 0..gpr {
-                        let d = unsafe {
-                            sdot32_i8(sg.as_ptr().add(g * GROUP_SIZE), act.xq.as_ptr().add(g * GROUP_SIZE))
-                        };
+                        let d = q1t_i8dot32(
+                            sg.as_ptr().wrapping_add(g * GROUP_SIZE),
+                            act.xq.as_ptr().wrapping_add(g * GROUP_SIZE),
+                        );
                         isum += d as f32 * sc[g];
                     }
                     let mut acc = isum * act.sx;
