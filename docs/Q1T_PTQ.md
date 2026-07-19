@@ -97,16 +97,19 @@ binding constraint (on-device / mobile).
 2. **Overlay** — dominates at high keep; since the encoder writes ternary
    code 0 at every outlier position, the correction is a plain `value·x`
    with **no scattered per-outlier scale read** (+45 % at keep-10 %).
-3. **int8 SDOT base** (ARM dotprod, default; `CMF_SDOT=0`/x86 keep the exact
-   f32 path) — x → i8 once (`split_act`, activation outliers in f32), signs
-   unpacked base-3 → i8, two `sdot`s per 32-group. **+30 % at keep-2 %**
-   (base-dominated), +21 % at keep-10 %, and **PPL-neutral** (bit-identical to
-   the f32 path: 88.66 both — the activation quant is negligible against the
-   coarse ternary weights). Levers 1–2 stay bit-identical to `dequant_q1t`.
+3. **int8 SDOT** on ARM dotprod (default; `CMF_SDOT=0`/x86 keep the exact f32
+   path) for BOTH decode (`matvec`) and prefill (`matmat`): x → i8 once
+   (`split_act`, activation outliers stay f32), signs unpacked base-3 → i8,
+   two `sdot`s per 32-group; in matmat each row's signs decode once and sdot
+   against the whole batch. Decode **+30 % at keep-2 %**, prefill **2.6× at
+   keep-2 %** (TTFT 0.87 → 0.32 s). Cost: PPL 89.08 vs 88.66 exact (**+0.5 %**,
+   the standard a8w8 activation-quant tradeoff q8/q1/q4 also take by default).
+   Levers 1–2 stay bit-identical to `dequant_q1t`; only the i8 path perturbs.
 
-End to end, 0.5B q1t decode went from ~2.5 tok/s (the div-decode regression
-the packing introduced) to **~38 tok/s at keep-10 %, ~59 at keep-2 %** — a
-noisy-machine, fair-load read; the isolated kernel gains above are cleaner.
+End to end, 0.5B q1t went from ~2.5 tok/s decode (the div-decode regression
+the packing introduced) to **~38 tok/s decode / ~58 prefill at keep-10 %, ~60
+decode / ~120 prefill at keep-2 %** — a noisy-machine, fair-load read; the
+isolated kernel gains above are cleaner.
 
 **Follow-ups:** a cheaper overlay encoding (per-row indices) for higher
 keep; an int8-SDOT ternary kernel (signs as `{−1,0,+1}` i8) to close the
