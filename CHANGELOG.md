@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Blob laid out in execution order.** The converter now writes tensors in the
+  order the engine touches them (embed → per-layer: norm/attn/norm/router/experts/
+  ffn → final norm → lm_head → mtp → tail), with each layer's — and each MoE
+  expert's — tensors contiguous. The kernel's up-front `madvise(WILLNEED)` readahead
+  now streams the file in the same order the forward pass consumes it, so page
+  faults are hidden behind compute instead of thrashing. Byte-for-byte identical
+  weights; only their on-disk position changed. Readers are unaffected.
+- **Large tensors are page-aligned.** Tensors ≥ 16 KB are aligned to 4096 in the
+  blob (was a uniform 64 B). Cold skill / MoE-expert / mask weights now sit on
+  their own page(s), so "unused weights cost 0 RSS" holds at page granularity.
+  Small tensors keep the 64 B packing (no size bloat). `4096 % 64 == 0`, so
+  existing readers accept the files unchanged.
+
+### Performance
+
+- **Model open touches less memory.** The in-memory tensor directory is now indexed
+  by a 64-bit hash of the tensor name (with a collision-safe overflow list) instead
+  of a `String`-keyed map, so opening a model no longer allocates a copy of every
+  tensor name. Lookups verify the full name on hit, so there are no false matches.
+
 ## [0.4.1] — 2026-07-19
 
 ### Added
