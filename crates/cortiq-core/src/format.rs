@@ -266,7 +266,14 @@ pub struct CmfModel {
     pub header: CmfHeader,
     pub required_features: u32,
     pub tensors: Vec<TensorEntry>,
-    by_name: HashMap<String, usize>,
+    /// name-hash → tensor index. Keying on the hash (not the name) avoids
+    /// cloning every tensor name into the map at `open()` — that halves the
+    /// open-time allocations and the map's footprint, which matters for large
+    /// MoE / skills files with tens of thousands of tensors. A genuine 64-bit
+    /// hash collision between two *distinct* names — astronomically unlikely —
+    /// lands in `name_overflow`, so lookups stay exact.
+    by_name: HashMap<u64, u32>,
+    name_overflow: Vec<u32>,
     pub masks: MaskCatalog,
     pub sparse_index: Vec<SparseIndexEntry>,
     /// Embedded tokenizer.json bytes, if present.
@@ -379,13 +386,21 @@ impl CmfModel {
         // Duplicate names would silently shadow each other in the
         // HashMap (directory scan and by_name would disagree) — refuse
         // the file instead (roadmap §4.9).
-        let mut by_name: HashMap<String, usize> = HashMap::with_capacity(tensors.len());
-        for (i, t) in tensors.iter().enumerate() {
-            if by_name.insert(t.name.clone(), i).is_some() {
-                return Err(CmfError::Parse(format!(
-                    "duplicate tensor name '{}' in directory",
-                    t.name
-                )));
+        let mut by_name: HashMap<u64, u32> = HashMap::with_capacity(tensors.len());
+        let mut name_overflow: Vec<u32> = Vec::new();
+        for i in 0..tensors.len() {
+            let h = hash64(tensors[i].name.as_bytes());
+            match by_name.get(&h) {
+                Some(&j) if tensors[j as usize].name == tensors[i].name => {
+                    return Err(CmfError::Parse(format!(
+                        "duplicate tensor name '{}' in directory",
+                        tensors[i].name
+                    )));
+                }
+                Some(_) => name_overflow.push(i as u32), // hash collision of distinct names
+                None => {
+                    by_name.insert(h, i as u32);
+                }
             }
         }
 
@@ -426,6 +441,7 @@ impl CmfModel {
             required_features: env.required_features,
             tensors,
             by_name,
+            name_overflow,
             masks,
             sparse_index,
             vocab,
@@ -481,15 +497,19 @@ impl CmfModel {
             first.extra_shards.push((sh.backing, sh.envelope.data.0));
             for mut t in sh.tensors {
                 t.shard = shard_idx;
-                if first
-                    .by_name
-                    .insert(t.name.clone(), first.tensors.len())
-                    .is_some()
-                {
-                    return Err(CmfError::Parse(format!(
-                        "duplicate tensor name '{}' across shards",
-                        t.name
-                    )));
+                let idx = first.tensors.len() as u32;
+                let h = hash64(t.name.as_bytes());
+                match first.by_name.get(&h) {
+                    Some(&j) if first.tensors[j as usize].name == t.name => {
+                        return Err(CmfError::Parse(format!(
+                            "duplicate tensor name '{}' across shards",
+                            t.name
+                        )));
+                    }
+                    Some(_) => first.name_overflow.push(idx),
+                    None => {
+                        first.by_name.insert(h, idx);
+                    }
                 }
                 first.tensors.push(t);
             }
@@ -626,13 +646,26 @@ impl CmfModel {
     }
 
     pub fn tensor(&self, name: &str) -> Option<&TensorEntry> {
-        self.by_name.get(name).map(|&i| &self.tensors[i])
+        self.tensor_index(name).map(|i| &self.tensors[i])
     }
 
     /// Directory index of a tensor by name (same resolution as
-    /// [`Self::tensor`] — engines must not re-scan the directory).
+    /// [`Self::tensor`] — engines must not re-scan the directory). O(1) via the
+    /// name-hash index; the name is verified against the entry so a hash
+    /// collision can never return the wrong tensor, and the rare distinct-name
+    /// collision falls back to the tiny overflow list.
     pub fn tensor_index(&self, name: &str) -> Option<usize> {
-        self.by_name.get(name).copied()
+        let h = hash64(name.as_bytes());
+        if let Some(&i) = self.by_name.get(&h) {
+            if self.tensors[i as usize].name == name {
+                return Some(i as usize);
+            }
+        }
+        self.name_overflow
+            .iter()
+            .copied()
+            .find(|&i| self.tensors[i as usize].name == name)
+            .map(|i| i as usize)
     }
 
     /// Tensor-source indirection (spec §9, Patent 15 fig3/302): the
