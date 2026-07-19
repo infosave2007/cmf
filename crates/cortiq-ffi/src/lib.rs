@@ -206,9 +206,9 @@ fn run_generate_ids(
 /// values. Accepted keys: temperature, top_p, top_k,
 /// repetition_penalty, min_p, seed, greedy (true = argmax: temperature
 /// pinned to 0), enable_thinking (false makes reasoning models —
-/// Qwen3/3.5 — answer directly with no `<think>` block; null resets to the
-/// template default). Applies to every subsequent generate on this handle.
-/// Returns 0, or −1 (`cortiq_last_error`).
+/// Qwen3/3.5 — answer directly with no `<think>` block; true re-enables it;
+/// absent/null keeps the current value). Applies to every subsequent generate
+/// on this handle. Returns 0, or −1 (`cortiq_last_error`).
 #[unsafe(no_mangle)]
 pub extern "C" fn cortiq_set_options(handle: *mut c_void, options_json: *const c_char) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
@@ -232,8 +232,9 @@ pub extern "C" fn cortiq_set_options(handle: *mut c_void, options_json: *const c
             min_p: Option<f32>,
             seed: Option<u64>,
             greedy: Option<bool>,
-            // Doubly-optional: absent leaves the sticky value untouched;
-            // `null` resets to the template default; `true`/`false` pins it.
+            // Absent or `null` leaves the sticky value untouched (serde folds a
+            // JSON `null` into the outer `None`); `true`/`false` pins it. To go
+            // back to the template default, reload the handle.
             enable_thinking: Option<Option<bool>>,
         }
         let opts: Opts = match serde_json::from_str(json) {
