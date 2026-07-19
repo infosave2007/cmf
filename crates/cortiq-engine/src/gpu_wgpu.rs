@@ -429,6 +429,123 @@ fn q4b_matvec(@builtin(workgroup_id) wid: vec3<u32>,
         row = row + nwg.x;
     }
 }
+
+// q1t register-blocked GEMM (prefill) — the WGSL cousin of the Metal q1t_mul_mm
+// and structurally identical to q8_mul_mm here; only the W staging decodes
+// base-3 ternary × per-group f16 scale (no row_scale; scale folds into the
+// staged weight). Own 4-slot bindings. The overlay is a second pass.
+struct Q1tMmP { cols4: u32, rows: u32, nb: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       qmm : array<u32>;
+@group(0) @binding(1) var<storage, read>       xmm : array<f32>;
+@group(0) @binding(2) var<storage, read_write> ymm : array<f32>;
+@group(0) @binding(3) var<uniform>             pmm : Q1tMmP;
+
+fn qmm_byte(off: u32) -> u32 {
+    return (qmm[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+var<workgroup> q1t_at: array<f32, 64 * 16>;
+var<workgroup> q1t_wt: array<f32, 64 * 16>;
+
+@compute @workgroup_size(16, 16)
+fn q1t_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let cols = pmm.cols4 * 4u;
+    let gpr = cols >> 5u;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    let tid = lid.y * 16u + lid.x;
+    var acc: array<array<f32, 4>, 4>;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        for (var j = 0u; j < 4u; j = j + 1u) { acc[i][j] = 0.0; }
+    }
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        for (var t = tid; t < 64u * 4u; t = t + 256u) {
+            let m = t / 4u;
+            let k4 = t % 4u;
+            var xv = vec4<f32>(0.0);
+            let col0 = k0 + k4 * 4u;
+            if (m0 + m < pmm.nb && col0 < cols) {
+                let xi = (m0 + m) * cols + col0;
+                xv = vec4<f32>(xmm[xi], xmm[xi + 1u], xmm[xi + 2u], xmm[xi + 3u]);
+            }
+            let dst = m * 16u + k4 * 4u;
+            q1t_at[dst] = xv.x; q1t_at[dst + 1u] = xv.y;
+            q1t_at[dst + 2u] = xv.z; q1t_at[dst + 3u] = xv.w;
+        }
+        for (var t = tid; t < 64u * 4u; t = t + 256u) {
+            let n = t / 4u;
+            let k4 = t % 4u;
+            var wv = vec4<f32>(0.0);
+            let col0 = k0 + k4 * 4u;
+            if (n0 + n < pmm.rows && col0 < cols) {
+                let g = col0 >> 5u;
+                let toff = ((n0 + n) * gpr + g) * 9u;
+                let sc16 = qmm_byte(toff) | (qmm_byte(toff + 1u) << 8u);
+                let scale = unpack2x16float(sc16).x;
+                let codes = toff + 2u;
+                for (var d = 0u; d < 4u; d = d + 1u) {
+                    let p = (col0 + d) - g * 32u;
+                    let b = qmm_byte(codes + p / 5u);
+                    let code = (b / pow3t(p % 5u)) % 3u;
+                    var sgn = 0.0;
+                    if (code == 1u) { sgn = 1.0; } else if (code == 2u) { sgn = -1.0; }
+                    wv[d] = sgn * scale;
+                }
+            }
+            let dst = n * 16u + k4 * 4u;
+            q1t_wt[dst] = wv.x; q1t_wt[dst + 1u] = wv.y;
+            q1t_wt[dst + 2u] = wv.z; q1t_wt[dst + 3u] = wv.w;
+        }
+        workgroupBarrier();
+        for (var k = 0u; k < 16u; k = k + 1u) {
+            var av: array<f32, 4>;
+            var wv: array<f32, 4>;
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                av[i] = q1t_at[(lid.y * 4u + i) * 16u + k];
+                wv[i] = q1t_wt[(lid.x * 4u + i) * 16u + k];
+            }
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                for (var j = 0u; j < 4u; j = j + 1u) {
+                    acc[i][j] = acc[i][j] + av[i] * wv[j];
+                }
+            }
+        }
+        workgroupBarrier();
+        k0 = k0 + 16u;
+    }
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let m = m0 + lid.y * 4u + i;
+        if (m >= pmm.nb) { continue; }
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            let n = n0 + lid.x * 4u + j;
+            if (n < pmm.rows) { ymm[m * pmm.rows + n] = acc[i][j]; }
+        }
+    }
+}
+
+@compute @workgroup_size(64)
+fn q1t_overlay_mm(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    if (row >= pmm.rows) { return; }
+    let cols = pmm.cols4 * 4u;
+    let gpr = cols >> 5u;
+    let base_len = pmm.rows * gpr * 9u;
+    let ent = base_len + (pmm.rows + 1u) * 4u;
+    let rp0 = base_len + row * 4u;
+    let c0 = qmm_byte(rp0) | (qmm_byte(rp0 + 1u) << 8u) | (qmm_byte(rp0 + 2u) << 16u) | (qmm_byte(rp0 + 3u) << 24u);
+    let rp1 = base_len + (row + 1u) * 4u;
+    let c1 = qmm_byte(rp1) | (qmm_byte(rp1 + 1u) << 8u) | (qmm_byte(rp1 + 2u) << 16u) | (qmm_byte(rp1 + 3u) << 24u);
+    for (var p = c0; p < c1; p = p + 1u) {
+        let e = ent + p * 4u;
+        let col = qmm_byte(e) | (qmm_byte(e + 1u) << 8u);
+        let val = unpack2x16float(qmm_byte(e + 2u) | (qmm_byte(e + 3u) << 8u)).x;
+        for (var bi = 0u; bi < pmm.nb; bi = bi + 1u) {
+            ymm[bi * pmm.rows + row] = ymm[bi * pmm.rows + row] + val * xmm[bi * cols + col];
+        }
+    }
+}
 "#;
 
 struct Ctx {
@@ -443,6 +560,8 @@ struct Ctx {
     q1: wgpu::ComputePipeline,
     q1t: wgpu::ComputePipeline,
     q4b: wgpu::ComputePipeline,
+    q1t_mm: wgpu::ComputePipeline,
+    q1t_ovmm: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     layout_mm: wgpu::BindGroupLayout,
     layout_mmm: wgpu::BindGroupLayout,
@@ -622,6 +741,8 @@ fn init() -> Result<Ctx, String> {
     let q1 = pipe("q1_matvec");
     let q1t = pipe("q1t_matvec");
     let q4b = pipe("q4b_matvec");
+    let q1t_mm = pipe("q1t_mul_mm");
+    let q1t_ovmm = pipe("q1t_overlay_mm");
     let layout = matvec.get_bind_group_layout(0);
     let layout_q1 = q1.get_bind_group_layout(0);
     let layout_mm = matmat.get_bind_group_layout(0);
@@ -642,6 +763,8 @@ fn init() -> Result<Ctx, String> {
         q1,
         q1t,
         q4b,
+        q1t_mm,
+        q1t_ovmm,
         layout,
         layout_mm,
         layout_mmm,
@@ -1321,6 +1444,143 @@ fn dispatch_matmat(
     ok
 }
 
+/// q1t batched GEMM (prefill) on wgpu — register-blocked base GEMM then the
+/// sparse overlay, two passes in one encoder. Raw f32 x, scales in the tiles.
+pub fn q1t_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let gpr = cols / 32;
+    if cols % 32 != 0 || rows == 0 || b == 0 {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    if entry.shape.first().copied().unwrap_or(0) < rows {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(entry) else { return false };
+    let bytes = model.primary_bytes();
+    let plen = entry.nbytes as usize;
+    if plen < rows * gpr * 9 || abs + plen > bytes.len() || xs.len() < b * cols || out.len() < b * rows {
+        return false;
+    }
+    dispatch_q1t_mm(c, Some((bytes.as_ptr() as usize, idx)), &bytes[abs..abs + plen], xs, b, rows, cols, out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_q1t_mm(
+    c: &Ctx,
+    weight_key: Option<(usize, usize)>,
+    payload: &[u8],
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let q_buf = match weight_key {
+        Some(k) => match weight_buffer(c, k, payload) {
+            Some(bf) => bf,
+            None => return false,
+        },
+        None => c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("q1tmm-weights"),
+            contents: payload,
+            usage: wgpu::BufferUsages::STORAGE,
+        }),
+    };
+    let mut sc = c.scratch.lock().unwrap();
+    let xs_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.xs,
+        (b * cols * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "q1tmm-xs",
+    );
+    c.queue.write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..b * cols]));
+    let y_size = (b * rows * 4) as u64;
+    let y_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.y,
+        y_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "q1tmm-y",
+    );
+    let params = [(cols / 4) as u32, rows as u32, b as u32, 0u32];
+    let p_buf = match &sc.params {
+        Some(bf) => bf.clone(),
+        None => {
+            let bf = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("q1tmm-params"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            sc.params = Some(bf.clone());
+            bf
+        }
+    };
+    c.queue.write_buffer(&p_buf, 0, bytemuck::cast_slice(&params));
+    let stage_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        y_size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "q1tmm-stage",
+    );
+    let entries = [
+        bind_buf(0, &q_buf),
+        bind_buf(1, &xs_buf),
+        bind_buf(2, &y_buf),
+        bind_buf(3, &p_buf),
+    ];
+    let bind_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q1tmm-bg"),
+        layout: &c.q1t_mm.get_bind_group_layout(0),
+        entries: &entries,
+    });
+    let bind_ov = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q1tov-bg"),
+        layout: &c.q1t_ovmm.get_bind_group_layout(0),
+        entries: &entries,
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("q1tmm") });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("q1tmm"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.q1t_mm);
+        pass.set_bind_group(0, &bind_mm, &[]);
+        pass.dispatch_workgroups(
+            (rows as u32).div_ceil(64).min(MAX_WG),
+            (b as u32).div_ceil(64),
+            1,
+        );
+    }
+    {
+        // Separate pass = a barrier, so the overlay reads the finished base.
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("q1tov"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.q1t_ovmm);
+        pass.set_bind_group(0, &bind_ov, &[]);
+        pass.dispatch_workgroups((rows as u32).div_ceil(64).min(MAX_WG), 1, 1);
+    }
+    let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * rows]);
+    drop(sc);
+    ok
+}
+
 /// Copy the output buffer GPU→staging→CPU (map+poll). Single readback path
 /// for matvec/matmat.
 fn readback(
@@ -1820,6 +2080,65 @@ mod tests {
         assert!(dispatch_q1t(c, &c.q4b, None, &payload, &xs, rows, cols, &mut got));
         let max_d = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         assert!(max_d < 1e-2, "wgpu q4b_matvec ≠ CPU: max|Δ| = {max_d}");
+    }
+
+    #[test]
+    fn wgpu_q1t_matmat_matches_cpu_reference() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping q1t GEMM parity test");
+            return;
+        };
+        use cortiq_core::quant::{f32_to_f16, q1t_pack, GROUP_SIZE};
+        let (b, rows, cols) = (40usize, 64usize, 256usize);
+        let gpr = cols / GROUP_SIZE;
+        let outliers: [(usize, f32); 4] = [(5, 3.0), (300, -2.0), (600, 1.5), (2000, -1.0)];
+        let is_out = |flat: usize| outliers.iter().any(|&(i, _)| i == flat);
+        let mut payload = Vec::new();
+        for r in 0..rows {
+            for g in 0..gpr {
+                let s = 0.02 + ((r + g) % 7) as f32 * 0.01;
+                payload.extend_from_slice(&f32_to_f16(s).to_le_bytes());
+                let mut cc = [0u8; 7];
+                for k in 0..GROUP_SIZE {
+                    let code = if is_out(r * cols + g * GROUP_SIZE + k) {
+                        0
+                    } else {
+                        ((k * 7 + r + g) % 3) as u8
+                    };
+                    q1t_pack(&mut cc, k, code);
+                }
+                payload.extend_from_slice(&cc);
+            }
+        }
+        let mut row_ptr = vec![0u32; rows + 1];
+        for &(idx, _) in &outliers {
+            row_ptr[idx / cols + 1] += 1;
+        }
+        for r in 0..rows {
+            row_ptr[r + 1] += row_ptr[r];
+        }
+        for &p in &row_ptr {
+            payload.extend_from_slice(&p.to_le_bytes());
+        }
+        for &(idx, v) in &outliers {
+            payload.extend_from_slice(&((idx % cols) as u16).to_le_bytes());
+            payload.extend_from_slice(&f32_to_f16(v).to_le_bytes());
+        }
+        let xs: Vec<f32> = (0..b * cols).map(|i| ((i * 13 + 7) % 31) as f32 / 31.0 - 0.5).collect();
+        let mut w = vec![0f32; rows * cols];
+        cortiq_core::quant::dequant_q1t(&payload, rows, cols, &mut w);
+        let mut want = vec![0f32; b * rows];
+        for bi in 0..b {
+            for o in 0..rows {
+                want[bi * rows + o] =
+                    (0..cols).map(|i| w[o * cols + i] * xs[bi * cols + i]).sum();
+            }
+        }
+        let mut got = vec![0f32; b * rows];
+        assert!(dispatch_q1t_mm(c, None, &payload, &xs, b, rows, cols, &mut got));
+        let max_d = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(max_d < 2e-2, "wgpu q1t_mul_mm ≠ CPU: max|Δ| = {max_d}");
     }
 
     #[test]

@@ -524,7 +524,8 @@ pub fn q4b_matvec(
     }
 }
 
-/// q1t batched GEMM (prefill) — base + overlay on-device. Metal only.
+/// q1t batched GEMM (prefill) — base + overlay on-device (Metal simdgroup or
+/// wgpu register-blocked).
 pub fn q1t_matmat(
     model: &Arc<CmfModel>,
     idx: usize,
@@ -538,7 +539,7 @@ pub fn q1t_matmat(
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::q1t_matmat(model, idx, xs, b, rows, cols, out),
         #[cfg(feature = "gpu")]
-        Backend::Wgpu => false,
+        Backend::Wgpu => crate::gpu_wgpu::q1t_matmat(model, idx, xs, b, rows, cols, out),
         Backend::None => false,
     }
 }
