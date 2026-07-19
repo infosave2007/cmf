@@ -1,9 +1,13 @@
 # q1t — training-free ternary post-training quantization
 
 An experimental, **training-free** compression path that quantizes an
-ordinary checkpoint to **~2.5–3.5 bits/weight** — below `q4` (4.5 bpw) —
+ordinary checkpoint to **~2.25–3.5 bits/weight** — below `q4` (4.5 bpw) —
 while staying coherent. Built on the *holographic transfer* idea (the CMF
 patents): preserve the layer **output** `W·x`, not the weights.
+
+The ternary base is packed **base-3, 5 values per byte** (`3^5 = 243 ≤ 256`),
+so a 32-weight group is `[f16 scale][7 B codes]` = **2.25 bpw** (vs a naïve
+2-bit 2.5 bpw) — a lossless size win, same reconstructed values.
 
 It is **not** wired into the default `--quant` flags; it is a separate
 calibration-driven command. The engine is untouched apart from the `Q1T`

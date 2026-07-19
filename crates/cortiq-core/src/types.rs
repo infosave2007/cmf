@@ -51,10 +51,11 @@ pub enum TensorDtype {
     /// span. Lets a NORMAL checkpoint survive 1-bit where plain `q1` cannot.
     Q1S = 13,
     /// Ternary (BitNet b1.58-style) `{−s, 0, +s}` with a sparse outlier
-    /// overlay. Per 32-group `[f16 scale][8B : 2 bits/weight]` (code 0 → 0,
-    /// 1 → +s, 2 → −s; ~2.5 bpw) then the same `[u32 count][count × (u32
-    /// index, f16 value)]` overlay as `Q1S`. Capturing the many near-zero
-    /// weights exactly is the decisive PTQ win over binary. Variable length.
+    /// overlay. Per 32-group `[f16 scale][7B : base-3 codes, 5 ternary
+    /// values/byte since 3^5 = 243 ≤ 256]` (code 0 → 0, 1 → +s, 2 → −s;
+    /// ~2.25 bpw) then the same `[u32 count][count × (u32 index, f16 value)]`
+    /// overlay as `Q1S`. Capturing the many near-zero weights exactly is the
+    /// decisive PTQ win over binary. Variable length.
     Q1T = 14,
 }
 

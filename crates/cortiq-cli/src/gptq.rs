@@ -398,9 +398,10 @@ pub fn quantize_q1t(
     let groups_per_row = in_dim / GROUP_SIZE;
     let n_groups = total / GROUP_SIZE;
 
-    // Pass 1: per-group abs-mean scale + ternary codes.
+    // Pass 1: per-group abs-mean scale + ternary codes (base-3, 5 per byte).
+    const POW3: [u8; 5] = [1, 3, 9, 27, 81];
     let mut scale = vec![0.0f32; out_dim * groups_per_row];
-    let mut codes = vec![0u8; n_groups * 8];
+    let mut codes = vec![0u8; n_groups * 7];
     for g in 0..n_groups {
         let base = g * GROUP_SIZE;
         let mut sum = 0.0f32;
@@ -428,7 +429,7 @@ pub fn quantize_q1t(
                     0
                 }
             };
-            codes[g * 8 + k / 4] |= code << ((k % 4) * 2);
+            codes[g * 7 + k / 5] += code * POW3[k % 5];
         }
     }
 
@@ -449,7 +450,7 @@ pub fn quantize_q1t(
                     if is_out[i] {
                         continue; // outliers are exact — not rescaled
                     }
-                    let code = (codes[g * 8 + k / 4] >> ((k % 4) * 2)) & 0x3;
+                    let code = cortiq_core::quant::q1t_code(&codes[g * 7..g * 7 + 7], k);
                     let q = match code {
                         1 => s,
                         2 => -s,
@@ -472,12 +473,12 @@ pub fn quantize_q1t(
         }
     }
 
-    // Emit: [f16 scale][8B codes] per group, then the outlier overlay.
+    // Emit: [f16 scale][7B base-3 codes] per group, then the outlier overlay.
     let n_out_actual = is_out.iter().filter(|&&o| o).count();
-    let mut out = Vec::with_capacity(n_groups * 10 + 4 + n_out_actual * 6);
+    let mut out = Vec::with_capacity(n_groups * 9 + 4 + n_out_actual * 6);
     for g in 0..n_groups {
         out.extend_from_slice(&f32_to_f16(scale[g]).to_le_bytes());
-        out.extend_from_slice(&codes[g * 8..g * 8 + 8]);
+        out.extend_from_slice(&codes[g * 7..g * 7 + 7]);
     }
     out.extend_from_slice(&(n_out_actual as u32).to_le_bytes());
     for (i, &o) in is_out.iter().enumerate() {

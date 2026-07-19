@@ -246,12 +246,29 @@ pub fn dequant_q1s(bytes: &[u8], dst: &mut [f32]) {
     }
 }
 
-/// Ternary tile: 2 (f16 scale) + 8 (2 bits × 32 weights) = 10 bytes.
-pub const Q1T_TILE: usize = 10;
+/// Ternary tile: 2 (f16 scale) + 7 (32 base-3 codes, 5 ternary values per
+/// byte, `3^5 = 243 ≤ 256`) = 9 bytes ⇒ ~2.25 bpw base (vs the old 2-bit
+/// 10-byte tile). The packed codes carry the same `{0,+s,−s}` values, so
+/// the reconstruction is bit-identical — this is pure size, no quality change.
+pub const Q1T_TILE: usize = 9;
+const Q1T_POW3: [u16; 5] = [1, 3, 9, 27, 81];
+
+/// Base-3 code (0/1/2) of ternary weight `k` from a group's packed 7 bytes.
+#[inline]
+pub fn q1t_code(codes: &[u8], k: usize) -> u8 {
+    ((codes[k / 5] as u16 / Q1T_POW3[k % 5]) % 3) as u8
+}
+
+/// Pack one base-3 code into the group's 7-byte code block (accumulative;
+/// start from a zeroed block, call for k = 0..32 in order).
+#[inline]
+pub fn q1t_pack(codes: &mut [u8; 7], k: usize, code: u8) {
+    codes[k / 5] += code * Q1T_POW3[k % 5] as u8;
+}
 
 /// Dequantize a full `q1t` tensor (ternary + sparse outlier overlay): per
-/// 32-group `[f16 scale][8B codes]`, 2 bits per weight (code 0 → 0, 1 →
-/// +s, 2 → −s), then `[u32 count]` and `count × [u32 index][f16 value]`.
+/// 32-group `[f16 scale][7B base-3 codes]` (0 → 0, 1 → +s, 2 → −s), then
+/// `[u32 count]` and `count × [u32 index][f16 value]`.
 pub fn dequant_q1t(bytes: &[u8], dst: &mut [f32]) {
     let n_groups = (dst.len() + GROUP_SIZE - 1) / GROUP_SIZE;
     let base_len = n_groups * Q1T_TILE;
@@ -260,14 +277,13 @@ pub fn dequant_q1t(bytes: &[u8], dst: &mut [f32]) {
         if off + Q1T_TILE > bytes.len() {
             break;
         }
-        let t = &bytes[off..off + Q1T_TILE];
-        let s = f16_to_f32(u16::from_le_bytes([t[0], t[1]]));
+        let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+        let codes = &bytes[off + 2..off + Q1T_TILE];
         let base = g * GROUP_SIZE;
         for k in 0..GROUP_SIZE {
-            let code = (t[2 + k / 4] >> ((k % 4) * 2)) & 0x3;
             let i = base + k;
             if i < dst.len() {
-                dst[i] = match code {
+                dst[i] = match q1t_code(codes, k) {
                     1 => s,
                     2 => -s,
                     _ => 0.0,
@@ -597,7 +613,7 @@ pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
         // q1 base + a small sparse f16 overlay (informational; the true
         // size is the stored span, which grows with the outlier budget).
         TensorDtype::Q1S => 0.3125,
-        TensorDtype::Q1T => 0.3125, // 10 bytes per 32 weights (base)
+        TensorDtype::Q1T => 0.281_25, // 9 bytes per 32 weights (base-3 packed)
         TensorDtype::U8 => 1.0,
     }
 }

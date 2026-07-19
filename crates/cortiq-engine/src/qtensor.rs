@@ -3075,13 +3075,14 @@ fn q1t_dequant_row(
     ov_count: usize,
     buf: &mut [f32],
 ) {
+    const TILE: usize = cortiq_core::quant::Q1T_TILE;
     for g in 0..gpr {
-        let off = (r * gpr + g) * 10;
+        let off = (r * gpr + g) * TILE;
         let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+        let codes = &bytes[off + 2..off + TILE];
         let bc = g * GROUP_SIZE;
         for k in 0..GROUP_SIZE {
-            let code = (bytes[off + 2 + k / 4] >> ((k % 4) * 2)) & 0x3;
-            buf[bc + k] = match code {
+            buf[bc + k] = match cortiq_core::quant::q1t_code(codes, k) {
                 1 => s,
                 2 => -s,
                 _ => 0.0,
@@ -3118,7 +3119,7 @@ fn q1t_dequant_row(
 fn q1t_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
     debug_assert_eq!(out.len(), rows);
     let gpr = cols / GROUP_SIZE;
-    let (ov_start, ov_count) = q1t_overlay(bytes, rows * gpr * 10);
+    let (ov_start, ov_count) = q1t_overlay(bytes, rows * gpr * cortiq_core::quant::Q1T_TILE);
     let out_addr = SendMut(out.as_mut_ptr());
     let run = move |start: usize, end: usize| {
         let mut buf = vec![0f32; cols];
@@ -3147,7 +3148,7 @@ fn q1t_matmat(
 ) {
     debug_assert_eq!(out.len(), b * rows);
     let gpr = cols / GROUP_SIZE;
-    let (ov_start, ov_count) = q1t_overlay(bytes, rows * gpr * 10);
+    let (ov_start, ov_count) = q1t_overlay(bytes, rows * gpr * cortiq_core::quant::Q1T_TILE);
     let out_addr = SendMut(out.as_mut_ptr());
     let run = move |start: usize, end: usize| {
         let mut buf = vec![0f32; cols];
@@ -6172,10 +6173,10 @@ mod tests {
         for r in 0..rows {
             for g in 0..gpr {
                 bytes.extend_from_slice(&f32_to_f16(scales[r * gpr + g]).to_le_bytes());
-                let mut c = [0u8; 8];
+                let mut c = [0u8; 7];
                 for k in 0..GROUP_SIZE {
                     let code = ((k + r * 3 + g) % 3) as u8; // 0,1,2
-                    c[k / 4] |= code << ((k % 4) * 2);
+                    cortiq_core::quant::q1t_pack(&mut c, k, code);
                 }
                 bytes.extend_from_slice(&c);
             }
