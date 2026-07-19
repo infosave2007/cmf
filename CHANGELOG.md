@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-07-19
+
+Training-free **q1t** ternary post-training quantization — take an ordinary
+checkpoint to ~2.25–3.5 bits/weight (below `q4`) with no retraining — and full
+GPU acceleration for it on **both** engine backends: native Metal and wgpu
+(Vulkan / DX12 / Intel). On a 14.8B GDN-hybrid the q1t model is 6.27 GB (−25 %
+vs `q4`) and, on the GPU, *faster* than the same model in `q4` on the CPU:
+decode 3.9 tok/s, TTFT 6.0 s, PPL identical to the CPU path.
+
+### Added
+
+- **q1t codec** (`TensorDtype::Q1T`) — per 32-group ternary `{−s,0,+s}` packed
+  base-3 (5 values/byte → ~2.25 bpw) with a sparse per-row outlier overlay
+  `[u32 row_ptr[rows+1]][(u16 col, f16 val)]` (4 B/outlier, no binary search).
+  Built on the holographic-transfer idea: preserve the layer output `W·x`.
+- **`quantize-gptq` command** — a calibration-driven, training-free path
+  (`CMF_GPTQ_TERNARY=1`): two-field outlier mask (`|W|·RMS(x)`), a closed-form
+  per-row output-stabilising rescale (*докрутка*), and a keep-precise skip-list
+  (`CMF_GPTQ_SKIP`, `CMF_GPTQ_DOWN_KEEP`). Streams one tensor per worker;
+  diagonal Hessian capture fits a 12B.
+- **q1t CPU kernels** — fused sign-LUT decode (no per-weight base-3 divide),
+  int8 SDOT on **ARM dotprod and x86 AVX2**, a u64-store group unpack, and a
+  `value·x` overlay correction. Decode + batched prefill both accelerated;
+  `CMF_SDOT=0` keeps the exact f32 path.
+- **q1t GPU (Metal)** — `q1t_matvec`/`q1t_overlay` (full-precision decode),
+  `q1t_mul_mm` register-blocked prefill GEMM, and integration into the
+  **whole-token GPU graph** so a q1t decode token runs entirely on-device.
+- **q1t GPU (wgpu)** — WGSL `q1t_matvec` + `q1t_overlay`, `q4b_matvec`, and the
+  `q1t_mul_mm` prefill GEMM + `q1t_overlay_mm`, with weights resident in VRAM.
+  q1t/q4 now GPU-accelerate on NVIDIA / AMD / Intel via Vulkan / DX12.
+- **`q4_block` GPU kernels** (Metal `q4b_matvec`, wgpu `q4b_matvec`) — a precise
+  4-bit weight (e.g. `down_proj`, `lm_head`) stays on the GPU without
+  ternarizing.
+
+### Changed
+
+- The whole-token GPU graph's projection dispatch (`proj_abs`/`encode_proj`)
+  now accepts **Q1, Q1T or Q4-block** (was Q1-only). Consequence: **q4 models
+  get the whole-token GPU decode path too** — 12B `q4` decode 3.0 → 5.6 tok/s
+  on an M4, where before `q4` had no GPU kernel at all.
+- `dequant_q1t` takes `(rows, cols)` (like `dequant_q8_row`/`vbit`) for the
+  per-row overlay.
+
 ## [0.3.12] — 2026-07-18
 
 LFM2-MoE support: the LiquidAI **LFM2.5-8B-A1B** hybrid — short-convolution

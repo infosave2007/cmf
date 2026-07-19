@@ -122,5 +122,47 @@ fixed size budget it buys ~50 % more kept outliers → better quality-at-size.
 `col` is within-row, so a quantized tensor's `cols` must fit `u16` (true for
 attn/FFN; the vocab-sized `embed`/`lm_head` are skipped anyway).
 
-**Follow-ups:** validating the int8 throughput on a large (12B) model, where
-q1t's smaller footprint should narrow the tok/s gap to `q8` further.
+## GPU
+
+q1t runs on the GPU on both engine backends — native **Metal** (Apple Silicon)
+and **wgpu** (Vulkan / DX12 / Metal → NVIDIA / AMD / Intel). Every kernel is
+gated by the runtime probe: the GPU is used only where it beats the CPU, so a
+machine where it loses silently keeps the CPU path.
+
+**Kernels (Metal MSL and WGSL):**
+
+- `q1t_matvec` — decode: per 32-group, decode the f16 scale + base-3 codes to
+  `{−1,0,+1}` and dot with the raw f32 activations (full precision — more
+  accurate than the CPU int8 path). `q1t_overlay` adds the sparse overlay
+  on-device (the base code is 0 at every overlay position, so no double count).
+- `q1t_mul_mm` — prefill: a register-blocked GEMM (Metal simdgroup-matrix;
+  WGSL 64×64 C-tile). It is the q8 GEMM with one change — the weight staging
+  decodes base-3 × per-group scale into the shared tile instead of `i8·scale`.
+  `q1t_overlay_mm` fans each `(col,val)` over the whole batch in a second pass.
+- `q4b_matvec` — a q4_block kernel added along the way so a *precise* weight
+  (e.g. `down_proj`, `lm_head`) can stay 4-bit on the GPU without ternarizing.
+
+**Whole-token graph (Metal).** The dtype dispatch (`proj_abs`/`encode_proj`)
+accepts **Q1, Q1T or Q4-block**, so a q1t model (with a q4-block `down_proj`)
+runs a whole decode token — all projections, GDN mixers, attention and FFN — in
+one pipelined submission, the way q1 does. This is where the real decode win is:
+on a 14.8B GDN-hybrid (Apple M4) decode goes **1.3 → 3.9 tok/s (2.7×)** and
+beats the same model in `q4` on the CPU (2.8–3.3), at 6.27 GB (−25 % vs q4);
+PPL is identical to the CPU path. The generalisation is free for other formats:
+a **pure q4 model now runs the same graph** (via `q4b`) — 12B q4 decode
+3.0 → 5.6 tok/s. Per-op GPU (a single-token matvec) does *not* win on Apple's
+UMA — the dispatch/upload overhead exceeds the tiny compute — which is exactly
+why the whole-token graph matters.
+
+**wgpu (cross-platform).** The token graph is Metal-only; on Vulkan/DX12 the
+path is per-op matvec + the prefill GEMM with the weights **resident in VRAM**,
+where per-op *does* win (a discrete GPU is not bandwidth-starved the way UMA is,
+and there is no per-call upload). All wgpu kernels are validated against the CPU
+dequant reference (`wgpu_q1t/q4b_matvec_matches_cpu`, `wgpu_q1t_matmat_matches_cpu`).
+
+**Prefill.** The GEMM reads each weight once and multiplies it against the whole
+prompt: 12B TTFT **9.4 → 6.0 s** (1.5× at 41 tokens, ~1.9× at ~350 — the win
+grows with prompt length as the 32-wide C-tiles fill).
+
+**Follow-ups:** an int8-SDOT ternary variant of the wgpu matvec; porting the
+whole-token graph to wgpu (large — the graph machinery is Metal-specific).
