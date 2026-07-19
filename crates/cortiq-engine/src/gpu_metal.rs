@@ -1609,6 +1609,33 @@ kernel void q1t_matvec(
         if (nr > 3u) y[r0 + 3u] = acc3;
     }
 }
+
+// q1t sparse overlay: adds Σ val·x[col] onto y (the base already there), one
+// thread per row over its [row_ptr[rid], row_ptr[rid+1]) entries. All reads are
+// byte-wise because base_len = rows·gpr·9 is not 4-aligned.
+kernel void q1t_overlay(
+    device const uchar* q        [[buffer(0)]],
+    device const float* x        [[buffer(1)]],
+    device float*       y        [[buffer(2)]],
+    constant uint&      base_len [[buffer(3)]],
+    constant uint&      rows     [[buffer(4)]],
+    uint rid [[thread_position_in_grid]])
+{
+    if (rid >= rows) return;
+    uint rp0 = base_len + rid * 4u;
+    uint c0 = (uint)q[rp0] | ((uint)q[rp0 + 1u] << 8) | ((uint)q[rp0 + 2u] << 16) | ((uint)q[rp0 + 3u] << 24);
+    uint rp1 = base_len + (rid + 1u) * 4u;
+    uint c1 = (uint)q[rp1] | ((uint)q[rp1 + 1u] << 8) | ((uint)q[rp1 + 2u] << 16) | ((uint)q[rp1 + 3u] << 24);
+    uint ent = base_len + (rows + 1u) * 4u;
+    float corr = 0.0f;
+    for (uint p = c0; p < c1; ++p) {
+        uint e = ent + p * 4u;
+        uint col = (uint)q[e] | ((uint)q[e + 1u] << 8);
+        half val = as_type<half>((ushort)((uint)q[e + 2u] | ((uint)q[e + 3u] << 8)));
+        corr += (float)val * x[col];
+    }
+    y[rid] += corr;
+}
 "#;
 
 struct Ctx {
@@ -1620,6 +1647,7 @@ struct Ctx {
     q1: ComputePipelineState,
     q1h: ComputePipelineState,
     q1t: ComputePipelineState,
+    q1t_ov: ComputePipelineState,
     flag: ComputePipelineState,
     rmsn: ComputePipelineState,
     f16mv: ComputePipelineState,
@@ -1737,6 +1765,7 @@ fn init() -> Result<Ctx, String> {
     let q1 = pso("q1_matvec")?;
     let q1h = pso("q1_matvec_h")?;
     let q1t = pso("q1t_matvec")?;
+    let q1t_ov = pso("q1t_overlay")?;
     let flag = pso("write_flag")?;
     let rmsn = pso("rmsnorm_k")?;
     let f16mv = pso("f32_matvec")?;
@@ -1775,6 +1804,7 @@ fn init() -> Result<Ctx, String> {
         q1,
         q1h,
         q1t,
+        q1t_ov,
         flag,
         rmsn,
         f16mv,
@@ -2151,6 +2181,83 @@ fn encode_q1_matvec(
     enc.dispatch_thread_groups(
         MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
         MTLSize::new(sgs * 32, 1, 1),
+    );
+}
+
+/// Encode a q1t BASE matvec (ternary, raw-f32 x). `abs` points at the tile
+/// base; the overlay follows and is applied by `encode_q1t_overlay`.
+fn encode_q1t_matvec(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &Buffer,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    rows: usize,
+    gpr: usize,
+) {
+    enc.set_compute_pipeline_state(&c.q1t);
+    enc.set_buffer(0, Some(fbuf), abs as u64);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let gpr_u = gpr as u32;
+    let rows_u = rows as u32;
+    enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    let sgs = 8u64; // × 4 rows per simdgroup
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
+}
+
+/// Encode a projection `in_buf → out_buf` for a Q1 or Q1T weight (auto). For
+/// Q1T the base matvec is followed by the on-device overlay add. Free fn so it
+/// works inside the graph encode loops (which capture `c`/`fbuf`, not `self`).
+#[allow(clippy::too_many_arguments)]
+fn encode_proj(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &Buffer,
+    abs: usize,
+    is_q1t: bool,
+    in_buf: &Buffer,
+    out_buf: &Buffer,
+    rows: usize,
+    gpr: usize,
+) {
+    if is_q1t {
+        encode_q1t_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
+        encode_q1t_overlay(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
+    } else {
+        encode_q1_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
+    }
+}
+
+/// Encode the q1t sparse-overlay add onto `y` (base already there). Reads the
+/// `[row_ptr][entries]` that follow the base at `abs`; one thread per row.
+fn encode_q1t_overlay(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &Buffer,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    rows: usize,
+    gpr: usize,
+) {
+    enc.set_compute_pipeline_state(&c.q1t_ov);
+    enc.set_buffer(0, Some(fbuf), abs as u64);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let base_len = (rows * gpr * Q1T_TILE) as u32;
+    let rows_u = rows as u32;
+    enc.set_bytes(3, 4, &base_len as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    let tpt = 64u64;
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(tpt), 1, 1),
+        MTLSize::new(tpt, 1, 1),
     );
 }
 
@@ -3600,6 +3707,32 @@ impl TokenGraph {
         Some(abs)
     }
 
+    /// Validate one q1t tensor: base (9-byte tiles) then the per-row overlay
+    /// must fit the safe mmap window. No gpr-parity constraint (the q1t kernel
+    /// doesn't pair tiles).
+    fn q1t_abs(&self, t: (usize, usize, usize)) -> Option<usize> {
+        let (idx, _rows, cols) = t;
+        if cols % GROUP_SIZE != 0 {
+            return None;
+        }
+        let entry = &self.model.tensors[idx];
+        let abs = self.model.entry_abs_offset(entry)?;
+        // Whole variable-length payload (base + overlay) sits within nbytes.
+        if abs + entry.nbytes as usize > self.safe_len {
+            return None;
+        }
+        Some(abs)
+    }
+
+    /// Resolve a projection tensor accepting Q1 or Q1T. Returns (abs, is_q1t).
+    fn proj_abs(&self, t: (usize, usize, usize)) -> Option<(usize, bool)> {
+        match self.model.tensors[t.0].dtype {
+            cortiq_core::TensorDtype::Q1 => self.q1_abs(t).map(|a| (a, false)),
+            cortiq_core::TensorDtype::Q1T => self.q1t_abs(t).map(|a| (a, true)),
+            _ => None,
+        }
+    }
+
     /// Pre-flight check for a GDN layer (call before any encode).
     pub fn gdn_ok(&self, l: &GdnGpuLayer, cfg: &GdnGpuCfg) -> bool {
         if cfg.kk < 2 || cfg.dv % 32 != 0 || cfg.dv > 1024 || cfg.hidden != self.dims.hidden {
@@ -3608,7 +3741,7 @@ impl TokenGraph {
         if l.a.0.len() != l.a.1 * l.a.2 || l.b.0.len() != l.b.1 * l.b.2 {
             return false;
         }
-        [l.qkv, l.z, l.out, l.gate, l.up, l.down].iter().all(|t| self.q1_abs(*t).is_some())
+        [l.qkv, l.z, l.out, l.gate, l.up, l.down].iter().all(|t| self.proj_abs(*t).is_some())
     }
 
     /// Pre-flight check for a full-attention layer.
@@ -3618,7 +3751,7 @@ impl TokenGraph {
         if l.wo.1 != self.dims.hidden || l.down.1 != self.dims.hidden {
             return false;
         }
-        [l.wq, l.wk, l.wv, l.wo, l.gate, l.up, l.down].iter().all(|t| self.q1_abs(*t).is_some())
+        [l.wq, l.wk, l.wv, l.wo, l.gate, l.up, l.down].iter().all(|t| self.proj_abs(*t).is_some())
     }
 
     fn ensure_cmd(&mut self) -> metal::CommandBuffer {
@@ -3678,7 +3811,7 @@ impl TokenGraph {
 
     /// Pre-flight for the final-norm + lm_head tail.
     pub fn lm_head_ok(&self, lm: (usize, usize, usize)) -> bool {
-        lm.2 == self.dims.hidden && self.q1_abs(lm).is_some()
+        lm.2 == self.dims.hidden && self.proj_abs(lm).is_some()
     }
 
     /// Final rmsnorm + lm_head matvec at the end of the last layer —
@@ -3695,10 +3828,10 @@ impl TokenGraph {
             &[self.dims.eps],
             (256, 256),
         );
-        let abs = self.q1_abs(lm).unwrap();
+        let (abs, q1t) = self.proj_abs(lm).unwrap();
         let lg_b = io_buf(self.c, 44_000_000_077 + lm.1, lm.1 * 4);
         let enc = cmd.new_compute_command_encoder();
-        encode_q1_matvec(self.c, enc, &self.fbuf, abs, &self.n_b, &lg_b, lm.1, lm.2 / GROUP_SIZE);
+        encode_proj(self.c, enc, &self.fbuf, abs, q1t, &self.n_b, &lg_b, lm.1, lm.2 / GROUP_SIZE);
         enc.end_encoding();
         self.logits_b = Some(lg_b);
     }
@@ -3717,7 +3850,7 @@ impl TokenGraph {
     pub fn encode_attn_prefix(&mut self, l: &AttnGpuLayer) {
         let cmd = self.ensure_cmd();
         let (aq, ak, av) =
-            (self.q1_abs(l.wq).unwrap(), self.q1_abs(l.wk).unwrap(), self.q1_abs(l.wv).unwrap());
+            (self.proj_abs(l.wq).unwrap(), self.proj_abs(l.wk).unwrap(), self.proj_abs(l.wv).unwrap());
         enc_simple(
             &cmd,
             &self.c.rmsn,
@@ -3730,9 +3863,9 @@ impl TokenGraph {
         let k_b = io_buf(self.c, 41_000_000_019 + l.wk.1, l.wk.1 * 4);
         let v_b = io_buf(self.c, 42_000_000_037 + l.wv.1, l.wv.1 * 4);
         let enc = cmd.new_compute_command_encoder();
-        encode_q1_matvec(self.c, enc, &self.fbuf, aq, &self.n_b, &q_b, l.wq.1, l.wq.2 / GROUP_SIZE);
-        encode_q1_matvec(self.c, enc, &self.fbuf, ak, &self.n_b, &k_b, l.wk.1, l.wk.2 / GROUP_SIZE);
-        encode_q1_matvec(self.c, enc, &self.fbuf, av, &self.n_b, &v_b, l.wv.1, l.wv.2 / GROUP_SIZE);
+        encode_proj(self.c, enc, &self.fbuf, aq.0, aq.1, &self.n_b, &q_b, l.wq.1, l.wq.2 / GROUP_SIZE);
+        encode_proj(self.c, enc, &self.fbuf, ak.0, ak.1, &self.n_b, &k_b, l.wk.1, l.wk.2 / GROUP_SIZE);
+        encode_proj(self.c, enc, &self.fbuf, av.0, av.1, &self.n_b, &v_b, l.wv.1, l.wv.2 / GROUP_SIZE);
         enc.end_encoding();
         self.qkv_bufs = Some((q_b, k_b, v_b));
     }
@@ -3766,17 +3899,8 @@ impl TokenGraph {
     fn encode_o_ffn(&self, cmd: &metal::CommandBufferRef, l: &AttnGpuLayer, ao_b: &Buffer) {
         {
             let enc = cmd.new_compute_command_encoder();
-            let abs = self.q1_abs(l.wo).unwrap();
-            encode_q1_matvec(
-                self.c,
-                enc,
-                &self.fbuf,
-                abs,
-                ao_b,
-                &self.d_b,
-                l.wo.1,
-                l.wo.2 / GROUP_SIZE,
-            );
+            let (abs, q1t) = self.proj_abs(l.wo).unwrap();
+            encode_proj(self.c, enc, &self.fbuf, abs, q1t, ao_b, &self.d_b, l.wo.1, l.wo.2 / GROUP_SIZE);
             enc.end_encoding();
         }
         enc_axpy(self.c, cmd, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
@@ -3873,13 +3997,13 @@ impl TokenGraph {
         {
             let enc = cmd.new_compute_command_encoder();
             let (aq, ak, av) = (
-                self.q1_abs(l.wq).unwrap(),
-                self.q1_abs(l.wk).unwrap(),
-                self.q1_abs(l.wv).unwrap(),
+                self.proj_abs(l.wq).unwrap(),
+                self.proj_abs(l.wk).unwrap(),
+                self.proj_abs(l.wv).unwrap(),
             );
-            encode_q1_matvec(self.c, enc, &self.fbuf, aq, &self.n_b, &q_b, l.wq.1, l.wq.2 / GROUP_SIZE);
-            encode_q1_matvec(self.c, enc, &self.fbuf, ak, &self.n_b, &k_b, l.wk.1, l.wk.2 / GROUP_SIZE);
-            encode_q1_matvec(self.c, enc, &self.fbuf, av, &self.n_b, &v_b, l.wv.1, l.wv.2 / GROUP_SIZE);
+            encode_proj(self.c, enc, &self.fbuf, aq.0, aq.1, &self.n_b, &q_b, l.wq.1, l.wq.2 / GROUP_SIZE);
+            encode_proj(self.c, enc, &self.fbuf, ak.0, ak.1, &self.n_b, &k_b, l.wk.1, l.wk.2 / GROUP_SIZE);
+            encode_proj(self.c, enc, &self.fbuf, av.0, av.1, &self.n_b, &v_b, l.wv.1, l.wv.2 / GROUP_SIZE);
             enc.end_encoding();
         }
         // 3. per-head qk-norm + RoPE (gate split into g_b)
@@ -3979,27 +4103,9 @@ impl TokenGraph {
         );
         {
             let enc = cmd.new_compute_command_encoder();
-            let (ag, au) = (self.q1_abs(gate).unwrap(), self.q1_abs(up).unwrap());
-            encode_q1_matvec(
-                self.c,
-                enc,
-                &self.fbuf,
-                ag,
-                &self.n_b,
-                &fg_b,
-                gate.1,
-                gate.2 / GROUP_SIZE,
-            );
-            encode_q1_matvec(
-                self.c,
-                enc,
-                &self.fbuf,
-                au,
-                &self.n_b,
-                &fu_b,
-                up.1,
-                up.2 / GROUP_SIZE,
-            );
+            let (ag, au) = (self.proj_abs(gate).unwrap(), self.proj_abs(up).unwrap());
+            encode_proj(self.c, enc, &self.fbuf, ag.0, ag.1, &self.n_b, &fg_b, gate.1, gate.2 / GROUP_SIZE);
+            encode_proj(self.c, enc, &self.fbuf, au.0, au.1, &self.n_b, &fu_b, up.1, up.2 / GROUP_SIZE);
             enc.end_encoding();
         }
         {
@@ -4017,17 +4123,8 @@ impl TokenGraph {
         }
         {
             let enc = cmd.new_compute_command_encoder();
-            let ad = self.q1_abs(down).unwrap();
-            encode_q1_matvec(
-                self.c,
-                enc,
-                &self.fbuf,
-                ad,
-                &fa_b,
-                &self.d_b,
-                down.1,
-                down.2 / GROUP_SIZE,
-            );
+            let ad = self.proj_abs(down).unwrap();
+            encode_proj(self.c, enc, &self.fbuf, ad.0, ad.1, &fa_b, &self.d_b, down.1, down.2 / GROUP_SIZE);
             enc.end_encoding();
         }
         enc_axpy(self.c, cmd, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
@@ -4049,15 +4146,15 @@ impl TokenGraph {
         let ring_len = (cfg.kk - 1) * cfg.c_dim;
         let s_len = cfg.nv * cfg.dk * cfg.dv;
 
-        // Resolve and validate every q1 tensor before encoding anything.
-        let mut abss: Vec<[usize; 6]> = Vec::with_capacity(layers.len());
+        // Resolve and validate every projection (Q1 or Q1T) before encoding.
+        let mut abss: Vec<[(usize, bool); 6]> = Vec::with_capacity(layers.len());
         for (l, st) in layers.iter().zip(states) {
             if !self.gdn_ok(l, cfg) || st.len() != ring_len + s_len {
                 return false;
             }
-            let mut a8 = [0usize; 6];
+            let mut a8 = [(0usize, false); 6];
             for (slot, t) in [l.qkv, l.z, l.out, l.gate, l.up, l.down].iter().enumerate() {
-                a8[slot] = self.q1_abs(*t).unwrap();
+                a8[slot] = self.proj_abs(*t).unwrap();
             }
             abss.push(a8);
         }
@@ -4116,8 +4213,8 @@ impl TokenGraph {
         // 2. mixer: qkv, z, a, b (independent — one encoder)
         {
             let enc = cmd.new_compute_command_encoder();
-            encode_q1_matvec(c, enc, &fbuf, a8[0], &n_b, &qkv_b, l.qkv.1, l.qkv.2 / GROUP_SIZE);
-            encode_q1_matvec(c, enc, &fbuf, a8[1], &n_b, &z_b, l.z.1, l.z.2 / GROUP_SIZE);
+            encode_proj(c, enc, &fbuf, a8[0].0, a8[0].1, &n_b, &qkv_b, l.qkv.1, l.qkv.2 / GROUP_SIZE);
+            encode_proj(c, enc, &fbuf, a8[1].0, a8[1].1, &n_b, &z_b, l.z.1, l.z.2 / GROUP_SIZE);
             for (t, y) in [(&l.a, &a_b), (&l.b, &b_b)] {
                 let (data, rows, cols) = *t;
                 let wb = vec_buf(data);
@@ -4205,7 +4302,7 @@ impl TokenGraph {
         // 6. out_proj of → d;  7. h += d
         {
             let enc = cmd.new_compute_command_encoder();
-            encode_q1_matvec(c, enc, &fbuf, a8[2], &of_b, &d_b, l.out.1, l.out.2 / GROUP_SIZE);
+            encode_proj(c, enc, &fbuf, a8[2].0, a8[2].1, &of_b, &d_b, l.out.1, l.out.2 / GROUP_SIZE);
             enc.end_encoding();
         }
         enc_axpy(c, &cmd, &d_b, &h_b, 1.0, cfg.hidden);
