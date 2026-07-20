@@ -2447,7 +2447,7 @@ impl Pipeline {
     /// Build the whole-token wgpu graph for a pure-attention q1 model (every
     /// layer Full q1 + dense q1 FFN, no gate/bias). Returns the post-stack
     /// hidden (caller does final norm + lm_head), or None to fall back.
-    fn try_token_graph_wgpu(&self, hidden: &[f32], position: usize) -> Option<Vec<f32>> {
+    fn try_token_graph_wgpu(&self, hidden: &[f32], position: usize, logits_out: &mut Vec<f32>) -> Option<Vec<f32>> {
         // O(1) Nyström decode runs off the sealed state, not the KV cache the
         // graph mirrors — never take the graph while o1 is active.
         if self.o1_active() {
@@ -2532,6 +2532,21 @@ impl Pipeline {
             });
         }
         let model = model?;
+        // Fold final-norm + lm_head into the graph when this call wants logits
+        // and the lm_head is a graphable (quantized) weight — the graph then
+        // reads back logits (into logits_out) instead of the hidden, dropping
+        // the separate CPU/GPU lm_head op + its sync. Never the f32 fallback:
+        // an unquantized lm_head is vocab·hidden and must not be uploaded.
+        let lm_gw = if self.graph_want_logits
+            && std::env::var("CMF_GPU_LMHEAD").map(|v| v != "0").unwrap_or(true)
+        {
+            self.weights.lm_head.graph_weight().map(|(_, i, kind, rs)| {
+                (crate::gpu::GraphW { idx: i, kind, row_scale: rs, data: &[] }, self.weights.lm_head.rows())
+            })
+        } else {
+            None
+        };
+        let lm = lm_gw.as_ref().map(|(gw, rows)| (gw, *rows));
         let mut h = hidden.to_vec();
         crate::gpu::forward_token_graph(
             &model,
@@ -2549,6 +2564,9 @@ impl Pipeline {
             self.kv_cache.max_seq_len,
             gemma,
             self.rms_eps as f32,
+            lm,
+            &self.weights.final_norm,
+            logits_out,
         )
         .then_some(h)
     }
@@ -2643,7 +2661,19 @@ impl Pipeline {
         // per token). Preferred over the per-layer drop-in when every layer is
         // pure-attention q1 with a dense q1 FFN.
         if graph_on && upto.is_none() && task_mask.is_none() {
-            if let Some(hh) = self.try_token_graph_wgpu(hidden, position) {
+            let mut lg = Vec::new();
+            if let Some(hh) = self.try_token_graph_wgpu(hidden, position, &mut lg) {
+                if !lg.is_empty() {
+                    // Graph produced logits (final-norm + lm_head folded in) —
+                    // pad/cap to vocab and hand them to the sampler directly.
+                    lg.resize(self.vocab_size, 0.0);
+                    if let Some(c) = self.final_softcap {
+                        for l in lg.iter_mut() {
+                            *l = c * (*l / c).tanh();
+                        }
+                    }
+                    self.graph_logits = Some(lg);
+                }
                 return hh;
             }
         }

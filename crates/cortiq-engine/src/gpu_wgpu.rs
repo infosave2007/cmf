@@ -2243,6 +2243,13 @@ pub fn forward_token_graph(
     cap: usize,
     gemma: bool,
     eps: f32,
+    // Optional final-norm + lm_head fold: (weight, rows). When Some and the
+    // weight resolves, the graph rides the final RMSNorm and lm_head in the
+    // same submit and reads back `logits` (rows) instead of the hidden — one
+    // fewer op + sync per token, and the lm_head stays on-device.
+    lm_head: Option<(&crate::gpu::GraphW, usize)>,
+    final_norm: &[f32],
+    logits: &mut Vec<f32>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
     if position >= cap {
@@ -2557,13 +2564,31 @@ pub fn forward_token_graph(
             go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&ob, &h_buf, &ax_u]), (hidden as u32).div_ceil(256));
         }
     }
-    let size = (hidden * 4) as u64;
     let t_enc = t_enc0.elapsed().as_secs_f64() * 1000.0;
     let t_sub0 = std::time::Instant::now();
-    let mut sc = c.scratch.lock().unwrap();
-    let stage = Scratch::ensure(&c.device, &mut sc.stage, size, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "g-stage");
-    let ok = readback(c, enc, &h_buf, &stage, size, &mut h[..hidden]);
-    drop(sc);
+    // h_buf now holds the final hidden. Either ride final-norm + lm_head and
+    // read back logits, or (no lm / unresolved weight) read back the hidden.
+    let lm_resolved = lm_head.and_then(|(gw, rows)| resolve(gw, rows, hidden).map(|m| (m, rows)));
+    let ok = if let Some((lm, lrows)) = lm_resolved {
+        let fnw = stor(bytemuck::cast_slice(final_norm));
+        go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &fnw, &n1, &rms_u]), 1);
+        let lsize = (lrows * 4) as u64;
+        let lbuf = c.device.create_buffer(&wgpu::BufferDescriptor { label: Some("g-logits"), size: lsize, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        emat(&mut enc, &lm, &n1, &lbuf, lrows, hidden);
+        logits.resize(lrows, 0.0);
+        let mut sc = c.scratch.lock().unwrap();
+        let stage = Scratch::ensure(&c.device, &mut sc.stage, lsize, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "g-stage");
+        let r = readback(c, enc, &lbuf, &stage, lsize, &mut logits[..lrows]);
+        drop(sc);
+        r
+    } else {
+        let size = (hidden * 4) as u64;
+        let mut sc = c.scratch.lock().unwrap();
+        let stage = Scratch::ensure(&c.device, &mut sc.stage, size, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "g-stage");
+        let r = readback(c, enc, &h_buf, &stage, size, &mut h[..hidden]);
+        drop(sc);
+        r
+    };
     if ok {
         // The append at `position` is now durable — advance each mirror.
         let mut kvm = c.attn_kv.lock().unwrap();

@@ -598,13 +598,20 @@ pub fn forward_token_graph(
     cap: usize,
     gemma: bool,
     eps: f32,
+    lm_head: Option<(&GraphW, usize)>,
+    final_norm: &[f32],
+    logits: &mut Vec<f32>,
 ) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::forward_token_graph(
             model, kv_id, layers, invf, h, nh, nkv, hd, rd, hidden, inter, position, cap, gemma, eps,
+            lm_head, final_norm, logits,
         ),
-        _ => false,
+        _ => {
+            let _ = (lm_head, final_norm, logits);
+            false
+        }
     }
 }
 
