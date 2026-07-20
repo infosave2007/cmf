@@ -310,6 +310,47 @@ fn fill_zero(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i < znp.n) { zy[i] = 0.0; }
 }
 
+// RMSNorm of one row (WGSL twin of Metal rmsnorm_k): o = x·rsqrt(mean(x²)+eps)·w',
+// w' = w or (1+w) for gemma. One workgroup, 256-thread tree reduction — the
+// building block that keeps the token graph's hidden resident across the norm.
+struct RmsP { n: u32, gemma: u32, eps: f32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       rn_x : array<f32>;
+@group(0) @binding(1) var<storage, read>       rn_w : array<f32>;
+@group(0) @binding(2) var<storage, read_write> rn_o : array<f32>;
+@group(0) @binding(3) var<uniform>             rn_p : RmsP;
+var<workgroup> rn_part: array<f32, 256>;
+@compute @workgroup_size(256)
+fn rmsnorm(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
+    let n = rn_p.n;
+    var acc = 0.0;
+    var i = tid;
+    loop {
+        if (i >= n) { break; }
+        let v = rn_x[i];
+        acc = acc + v * v;
+        i = i + 256u;
+    }
+    rn_part[tid] = acc;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) { rn_part[tid] = rn_part[tid] + rn_part[tid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let inv = inverseSqrt(rn_part[0] / f32(n) + rn_p.eps);
+    i = tid;
+    loop {
+        if (i >= n) { break; }
+        var wv = rn_w[i];
+        if (rn_p.gemma == 1u) { wv = 1.0 + wv; }
+        rn_o[i] = rn_x[i] * inv * wv;
+        i = i + 256u;
+    }
+}
+
 // q1t (ternary base-3) + q4_block matvec — reuse the q1 bindings (q1w/q1x/q1y/
 // q1p) and its 4-slot layout. Weights arrive as array<u32>, so bytes come out
 // with shift+mask (q1t_byte). q1p fields are reinterpreted: np=gpr, _p0=cols.
@@ -562,6 +603,7 @@ struct Ctx {
     q4b: wgpu::ComputePipeline,
     q1t_mm: wgpu::ComputePipeline,
     q1t_ovmm: wgpu::ComputePipeline,
+    rmsnorm: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     layout_mm: wgpu::BindGroupLayout,
     layout_mmm: wgpu::BindGroupLayout,
@@ -569,6 +611,7 @@ struct Ctx {
     layout_axpy: wgpu::BindGroupLayout,
     layout_zero: wgpu::BindGroupLayout,
     layout_q1: wgpu::BindGroupLayout,
+    layout_rmsnorm: wgpu::BindGroupLayout,
     /// Discrete card (PCIe VRAM) vs UMA — thresholds and budgets differ.
     discrete: bool,
     /// Weight-residency budget in bytes (CMF_GPU_VRAM_MB override). On a
@@ -743,8 +786,10 @@ fn init() -> Result<Ctx, String> {
     let q4b = pipe("q4b_matvec");
     let q1t_mm = pipe("q1t_mul_mm");
     let q1t_ovmm = pipe("q1t_overlay_mm");
+    let rmsnorm = pipe("rmsnorm");
     let layout = matvec.get_bind_group_layout(0);
     let layout_q1 = q1.get_bind_group_layout(0);
+    let layout_rmsnorm = rmsnorm.get_bind_group_layout(0);
     let layout_mm = matmat.get_bind_group_layout(0);
     let layout_mmm = mul_mm.get_bind_group_layout(0);
     let layout_silu = silu.get_bind_group_layout(0);
@@ -765,6 +810,7 @@ fn init() -> Result<Ctx, String> {
         q4b,
         q1t_mm,
         q1t_ovmm,
+        rmsnorm,
         layout,
         layout_mm,
         layout_mmm,
@@ -772,6 +818,7 @@ fn init() -> Result<Ctx, String> {
         layout_axpy,
         layout_zero,
         layout_q1,
+        layout_rmsnorm,
         discrete,
         vram_budget,
         resident: std::sync::atomic::AtomicU64::new(0),
@@ -1174,6 +1221,55 @@ pub fn q1_matvec(
         return false;
     }
     dispatch_q1(c, Some((bytes.as_ptr() as usize, idx)), &bytes[abs..abs + plen], xs, rows, cols, out)
+}
+
+/// GPU RMSNorm of one row — the token-graph building block that keeps the
+/// hidden state resident across the norm→matvec boundary. One workgroup,
+/// direct buffers (no residency cache). Returns false without a GPU context.
+pub fn rmsnorm_row(x: &[f32], w: &[f32], out: &mut [f32], gemma: bool, eps: f32) -> bool {
+    let Some(c) = ctx() else { return false };
+    let n = x.len();
+    if n == 0 || w.len() < n || out.len() < n {
+        return false;
+    }
+    let x_b = storage_bytes(c, bytemuck::cast_slice(x));
+    let w_b = storage_bytes(c, bytemuck::cast_slice(&w[..n]));
+    let o_b = rw_f32(c, n, true);
+    let p_buf = uniform_u32x4(c, [n as u32, gemma as u32, eps.to_bits(), 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("rms-bg"),
+        layout: &c.layout_rmsnorm,
+        entries: &[
+            bind_buf(0, &x_b),
+            bind_buf(1, &w_b),
+            bind_buf(2, &o_b),
+            bind_buf(3, &p_buf),
+        ],
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rms") });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("rms"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.rmsnorm);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    let size = (n * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "rms-stage",
+    );
+    let ok = readback(c, enc, &o_b, &stage, size, &mut out[..n]);
+    drop(sc);
+    ok
 }
 
 /// q1 kernel body (weight_key = None — no residency cache; test path).
@@ -2220,6 +2316,33 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_d < 1e-3, "wgpu q1_matvec ≠ CPU: max|Δ| = {max_d}");
+    }
+
+    #[test]
+    fn wgpu_rmsnorm_matches_cpu() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        if ctx().is_none() {
+            eprintln!("no wgpu adapter — skipping rmsnorm parity test");
+            return;
+        }
+        let n = 896usize;
+        let eps = 1e-6f32;
+        let x: Vec<f32> = (0..n).map(|i| ((i * 13 + 7) % 101) as f32 / 101.0 - 0.5).collect();
+        let w: Vec<f32> = (0..n).map(|i| 0.5 + ((i * 5 + 1) % 17) as f32 / 17.0).collect();
+        let ss: f32 = x.iter().map(|v| v * v).sum();
+        let inv = 1.0 / (ss / n as f32 + eps).sqrt();
+        // plain RMSNorm
+        let want: Vec<f32> = (0..n).map(|i| x[i] * inv * w[i]).collect();
+        let mut got = vec![0f32; n];
+        assert!(rmsnorm_row(&x, &w, &mut got, false, eps));
+        let md = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(md < 1e-4, "wgpu rmsnorm ≠ CPU: max|Δ| = {md}");
+        // gemma variant: w' = 1 + w
+        let wantg: Vec<f32> = (0..n).map(|i| x[i] * inv * (1.0 + w[i])).collect();
+        let mut gotg = vec![0f32; n];
+        assert!(rmsnorm_row(&x, &w, &mut gotg, true, eps));
+        let mdg = wantg.iter().zip(&gotg).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(mdg < 1e-4, "wgpu rmsnorm(gemma) ≠ CPU: max|Δ| = {mdg}");
     }
 
     #[test]
