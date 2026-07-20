@@ -1220,6 +1220,11 @@ struct Ctx {
     /// param buffers per token are token-invariant, so uploading them once
     /// keeps them off the per-token encode critical path.
     uniforms: Mutex<HashMap<[u32; 4], wgpu::Buffer>>,
+    /// Immutable norm/small weight buffers cached by (data ptr, len) — the
+    /// ~200 per-layer norm uploads per token are token-invariant. Sentinel
+    /// key (0, n) holds shared zero buffers. Assumes stable weight pointers
+    /// (mmap), same as `weight_bufs`.
+    const_bufs: Mutex<HashMap<(usize, usize), wgpu::Buffer>>,
 }
 
 struct KvMirror {
@@ -1461,6 +1466,7 @@ fn init() -> Result<Ctx, String> {
         scratch: Mutex::new(Scratch::default()),
         weight_bufs: Mutex::new(HashMap::new()),
         uniforms: Mutex::new(HashMap::new()),
+        const_bufs: Mutex::new(HashMap::new()),
         rs_bufs: Mutex::new(HashMap::new()),
         attn_kv: Mutex::new(HashMap::new()),
         gdn_state: Mutex::new(HashMap::new()),
@@ -2377,11 +2383,31 @@ pub fn forward_token_graph(
         };
         lws.push(LW { attn, gate, up, down });
     }
-    // DEVICE-LOCAL: create_buffer + write_buffer keeps norm weights in VRAM,
-    // not the HOST_VISIBLE heap create_buffer_init forces (see weight_buffer).
+    // DEVICE-LOCAL + content-cached: create_buffer + write_buffer keeps norm
+    // weights in VRAM (not the HOST_VISIBLE heap create_buffer_init forces);
+    // caching by (ptr,len) uploads each token-invariant norm buffer once.
     let stor = |data: &[u8]| {
+        let key = (data.as_ptr() as usize, data.len());
+        let mut cb = c.const_bufs.lock().unwrap();
+        if let Some(b) = cb.get(&key) {
+            return b.clone();
+        }
         let b = c.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: data.len() as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         c.queue.write_buffer(&b, 0, data);
+        cb.insert(key, b.clone());
+        b
+    };
+    // Shared zero buffer of `n` f32 (sentinel key (0,n)) — for absent q/k-norms
+    // and the silu bias slot, so no per-token zero Vec is allocated/uploaded.
+    let zeros = |n: usize| -> wgpu::Buffer {
+        let key = (0usize, n * 4);
+        let mut cb = c.const_bufs.lock().unwrap();
+        if let Some(b) = cb.get(&key) {
+            return b.clone();
+        }
+        let b = c.device.create_buffer(&wgpu::BufferDescriptor { label: Some("g-zero"), size: (n * 4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        c.queue.write_buffer(&b, 0, &vec![0u8; n * 4]);
+        cb.insert(key, b.clone());
         b
     };
     let unif = |d: &[u32]| c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(d), usage: wgpu::BufferUsages::UNIFORM });
@@ -2412,7 +2438,7 @@ pub fn forward_token_graph(
     let ubuf = rw_f32(c, inter, false);
     let abuf = rw_f32(c, inter, false);
     let invf_b = stor(bytemuck::cast_slice(invf));
-    let dummy_hd = stor(bytemuck::cast_slice(&vec![0f32; hd]));
+    let dummy_hd = zeros(hd);
     // GDN intermediates (sized to the model's GDN geometry; 1 if no GDN layer).
     let (gnv, _gnk, gdk, gdv, _gkk, gcdim) = gdn_dims.unwrap_or((1, 1, 1, 1, 1, 1));
     let qkv_b = rw_f32(c, gcdim, false);
@@ -2547,7 +2573,6 @@ pub fn forward_token_graph(
             emat(enc, m, xs, y, *r, *cc);
         }
     };
-    let dz = vec![0f32; hd];
     // Bootstrap the first layer's attention norm; thereafter each residual is
     // fused with the following norm (add_rmsnorm), saving two dispatches/layer.
     let inw0 = stor(bytemuck::cast_slice(layers[0].input_norm));
@@ -2559,8 +2584,8 @@ pub fn forward_token_graph(
         match (&lw.attn, &l.attn) {
             (LAttn::Full { wq, wk, wv, wo }, crate::gpu::GraphAttn::Full { q_norm, k_norm, bias, output_gate, .. }) => {
                 let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
-                let qnw = stor(bytemuck::cast_slice(q_norm.unwrap_or(&dz)));
-                let knw = stor(bytemuck::cast_slice(k_norm.unwrap_or(&dz)));
+                let qnw = q_norm.map(|q| stor(bytemuck::cast_slice(q))).unwrap_or_else(|| zeros(hd));
+                let knw = k_norm.map(|k| stor(bytemuck::cast_slice(k))).unwrap_or_else(|| zeros(hd));
                 let gate_flag = if *output_gate { 1u32 } else { 0 };
                 let rope_u = unif(&[nh as u32, nkv as u32, hd as u32, rd as u32, position as u32, flags(q_norm.is_some(), k_norm.is_some()) | gate_flag, eps.to_bits(), 0]);
                 // Gated wq emits 2·nh·hd (q||gate interleaved per head); the rope
