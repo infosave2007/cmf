@@ -351,6 +351,36 @@ fn rmsnorm(@builtin(local_invocation_id) lid: vec3<u32>) {
     }
 }
 
+// GDN depthwise causal conv + SiLU over the ring buffer of the last kk-1
+// positions plus the current qkv, then shift the ring (drop oldest, append
+// current). One thread per conv channel. WGSL twin of the Metal gdn_conv.
+struct GcP { cdim: u32, kk: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read>       gc_qkv  : array<f32>;
+@group(0) @binding(1) var<storage, read>       gc_taps : array<f32>;
+@group(0) @binding(2) var<storage, read_write> gc_ring : array<f32>;
+@group(0) @binding(3) var<storage, read_write> gc_cq   : array<f32>;
+@group(0) @binding(4) var<uniform>             gc_p    : GcP;
+@compute @workgroup_size(256)
+fn gdn_conv(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    let cdim = gc_p.cdim;
+    if (c >= cdim) { return; }
+    let kk = gc_p.kk;
+    let tb = c * kk;
+    var acc = gc_qkv[c] * gc_taps[tb + kk - 1u];
+    for (var j = 0u; j + 1u < kk; j = j + 1u) {
+        acc = acc + gc_ring[j * cdim + c] * gc_taps[tb + j];
+    }
+    gc_cq[c] = acc / (1.0 + exp(-acc));
+    // ring shift (columns are independent per thread c)
+    for (var j = 0u; j + 2u < kk; j = j + 1u) {
+        gc_ring[j * cdim + c] = gc_ring[(j + 1u) * cdim + c];
+    }
+    if (kk > 1u) {
+        gc_ring[(kk - 2u) * cdim + c] = gc_qkv[c];
+    }
+}
+
 // ── GDN (gated DeltaNet / linear attention) decode step ──────────────────
 // One workgroup per v-head. From the conv output cq it l2-norms q/k, forms the
 // decay g and gate β, runs the delta-rule state recurrence S ← g·S + kf⊗β(v −
@@ -925,6 +955,7 @@ struct Ctx {
     kv_append: wgpu::ComputePipeline,
     gqa_attend: wgpu::ComputePipeline,
     gdn_step: wgpu::ComputePipeline,
+    gdn_conv: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     layout_mm: wgpu::BindGroupLayout,
     layout_mmm: wgpu::BindGroupLayout,
@@ -938,6 +969,7 @@ struct Ctx {
     layout_kv: wgpu::BindGroupLayout,
     layout_attend: wgpu::BindGroupLayout,
     layout_gdn: wgpu::BindGroupLayout,
+    layout_gdn_conv: wgpu::BindGroupLayout,
     /// Discrete card (PCIe VRAM) vs UMA — thresholds and budgets differ.
     discrete: bool,
     /// Weight-residency budget in bytes (CMF_GPU_VRAM_MB override). On a
@@ -1128,6 +1160,7 @@ fn init() -> Result<Ctx, String> {
     let kv_append = pipe("kv_append");
     let gqa_attend = pipe("gqa_attend");
     let gdn_step = pipe("gdn_step");
+    let gdn_conv = pipe("gdn_conv");
     let layout = matvec.get_bind_group_layout(0);
     let layout_q1 = q1.get_bind_group_layout(0);
     let layout_rmsnorm = rmsnorm.get_bind_group_layout(0);
@@ -1136,6 +1169,7 @@ fn init() -> Result<Ctx, String> {
     let layout_kv = kv_append.get_bind_group_layout(0);
     let layout_attend = gqa_attend.get_bind_group_layout(0);
     let layout_gdn = gdn_step.get_bind_group_layout(0);
+    let layout_gdn_conv = gdn_conv.get_bind_group_layout(0);
     let layout_mm = matmat.get_bind_group_layout(0);
     let layout_mmm = mul_mm.get_bind_group_layout(0);
     let layout_silu = silu.get_bind_group_layout(0);
@@ -1162,6 +1196,7 @@ fn init() -> Result<Ctx, String> {
         kv_append,
         gqa_attend,
         gdn_step,
+        gdn_conv,
         layout,
         layout_mm,
         layout_mmm,
@@ -1175,6 +1210,7 @@ fn init() -> Result<Ctx, String> {
         layout_kv,
         layout_attend,
         layout_gdn,
+        layout_gdn_conv,
         discrete,
         vram_budget,
         resident: std::sync::atomic::AtomicU64::new(0),
@@ -2207,6 +2243,51 @@ pub fn kv_mirror_reset(kv_id: u64) {
     if let Some(c) = ctx() {
         c.attn_kv.lock().unwrap().retain(|(id, _), _| *id != kv_id);
     }
+}
+
+/// GDN depthwise conv step (bring-up / parity): updates cq [cdim] and shifts
+/// the ring [(kk-1)·cdim] in place.
+pub fn gdn_conv_gpu(qkv: &[f32], taps: &[f32], ring: &mut [f32], cdim: usize, kk: usize, cq: &mut [f32]) -> bool {
+    let Some(c) = ctx() else { return false };
+    let qb = storage_bytes(c, bytemuck::cast_slice(qkv));
+    let tb = storage_bytes(c, bytemuck::cast_slice(taps));
+    let rb = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: None,
+        contents: bytemuck::cast_slice(ring),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+    let cb = rw_f32(c, cdim, true);
+    let p = uniform_u32x4(c, [cdim as u32, kk as u32, 0, 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.layout_gdn_conv,
+        entries: &[bind_buf(0, &qb), bind_buf(1, &tb), bind_buf(2, &rb), bind_buf(3, &cb), bind_buf(4, &p)],
+    });
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        pass.set_pipeline(&c.gdn_conv);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((cdim as u32).div_ceil(256), 1, 1);
+    }
+    let rsz = (ring.len() * 4) as u64;
+    let csz = (cdim * 4) as u64;
+    let sr = c.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: rsz, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    let scq = c.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: csz, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    enc.copy_buffer_to_buffer(&rb, 0, &sr, 0, rsz);
+    enc.copy_buffer_to_buffer(&cb, 0, &scq, 0, csz);
+    c.queue.submit(Some(enc.finish()));
+    sr.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    scq.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return false;
+    }
+    let (Ok(dr), Ok(dc)) = (sr.slice(..).get_mapped_range(), scq.slice(..).get_mapped_range()) else {
+        return false;
+    };
+    ring.copy_from_slice(bytemuck::cast_slice(&dr[..ring.len() * 4]));
+    cq[..cdim].copy_from_slice(bytemuck::cast_slice(&dc[..cdim * 4]));
+    true
 }
 
 /// GDN decode step (bring-up / parity): one workgroup per v-head. `s` is the
@@ -3739,6 +3820,43 @@ mod tests {
         let msd = sc.iter().zip(&sg).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(mo < 2e-3, "wgpu gdn_step o ≠ CPU: max|Δ| = {mo}");
         assert!(msd < 2e-3, "wgpu gdn_step S ≠ CPU: max|Δ| = {msd}");
+    }
+
+    #[test]
+    fn wgpu_gdn_conv_matches_cpu() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        if ctx().is_none() {
+            eprintln!("no wgpu adapter — skipping gdn_conv test");
+            return;
+        }
+        let (cdim, kk) = (48usize, 4usize);
+        let jit = |a: usize, b: usize| ((a * 19 + b * 7 + 3) % 61) as f32 / 61.0 - 0.5;
+        let qkv: Vec<f32> = (0..cdim).map(|i| jit(i, 1)).collect();
+        let taps: Vec<f32> = (0..cdim * kk).map(|i| jit(i, 2)).collect();
+        let ring0: Vec<f32> = (0..(kk - 1) * cdim).map(|i| jit(i, 3)).collect();
+        let silu = |x: f32| x / (1.0 + (-x).exp());
+        // CPU reference
+        let mut rc = ring0.clone();
+        let mut want_cq = vec![0f32; cdim];
+        for c in 0..cdim {
+            let t = &taps[c * kk..(c + 1) * kk];
+            let mut acc = qkv[c] * t[kk - 1];
+            for j in 0..kk - 1 {
+                acc += rc[j * cdim + c] * t[j];
+            }
+            want_cq[c] = silu(acc);
+        }
+        rc.copy_within(cdim.., 0);
+        let tail = (kk - 2) * cdim;
+        rc[tail..tail + cdim].copy_from_slice(&qkv[..cdim]);
+        // GPU
+        let mut rg = ring0.clone();
+        let mut got_cq = vec![0f32; cdim];
+        assert!(gdn_conv_gpu(&qkv, &taps, &mut rg, cdim, kk, &mut got_cq));
+        let mc = want_cq.iter().zip(&got_cq).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let mr = rc.iter().zip(&rg).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(mc < 1e-5, "wgpu gdn_conv cq ≠ CPU: {mc}");
+        assert!(mr < 1e-6, "wgpu gdn_conv ring ≠ CPU: {mr}");
     }
 
     // Build a deterministic q1 payload for a [rows, cols] weight + its dequant.
