@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-20
+
+### Added
+
+- **Whole-token wgpu decode graph on discrete GPUs (Vulkan / DX12 / Metal).**
+  The entire layer stack for one decode token is encoded into a single command
+  buffer with the hidden state resident in VRAM and exactly one readback per
+  token — covering q1 / q8 / q4_tiled / q1t projections and Gated-DeltaNet
+  attention hybrids (Bonsai-27B, Qwen3.5), with the final RMSNorm + lm_head
+  folded into the same submit so the graph hands logits straight to the sampler.
+  Opt-in via `CMF_GPU_WGPU_GRAPH=1`; token-identical to the CPU f32-activation
+  path. Ships portable WGSL kernels (rmsnorm, RoPE + q/k-norm, flash-decode GQA
+  attention, GDN conv + delta-rule step, 1-bit and int8 matvecs).
+
 ### Changed
 
 - **Blob laid out in execution order.** The converter now writes tensors in the
@@ -24,6 +38,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **~2× faster GPU decode on 1-bit models (RTX 4090, Vulkan).** A 16-way
+  shared-memory bank conflict in the q1 matvec's activation tile was inflating
+  the FFN kernel ~8× (all 16 lanes of a row hit the same 4 banks). Padding each
+  32-column group to 33 slots spreads them across 16 distinct banks; identical
+  math and accumulation order, so still token-identical. Bonsai-27B q1 decode
+  ~18 → ~36 tok/s pure decode; the whole-token submit halved (51 → 25 ms).
+- **Token-invariant graph state cached across decode tokens.** Per-layer norm
+  weights, the GDN f32 in-projections (~63 MB re-uploaded every token), q8 row
+  scales, and matvec param uniforms are now uploaded once and reused, cutting
+  per-token host work from ~33 ms to ~1 ms and re-upload traffic to zero.
+- **Independent projections share one compute pass.** QKV, the GDN in-projection
+  (qkv/z/a/b), and FFN gate/up — all reading the same normed hidden — are issued
+  in a single compute pass so the GPU overlaps them instead of draining between
+  per-op barriers (+5–8%, token-identical).
 - **Model open touches less memory.** The in-memory tensor directory is now indexed
   by a 64-bit hash of the tensor name (with a collision-safe overflow list) instead
   of a `String`-keyed map, so opening a model no longer allocates a copy of every
