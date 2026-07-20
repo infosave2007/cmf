@@ -523,11 +523,11 @@ pub fn attn_dropin(
     }
 }
 
-/// One weight in the whole-token graph: the tensor idx (its dtype is read
-/// from the model) plus per-row scales — empty for q1 (tile-embedded), the
-/// dequantized row scales for q8_row.
+/// One weight in the whole-token graph: tensor idx + a codec tag (0=q8_row,
+/// 1=q1, 2=q4_tiled, 3=q1t) + per-row scales (q8_row only; empty otherwise).
 pub struct GraphW<'a> {
     pub idx: usize,
+    pub kind: u8,
     pub row_scale: &'a [f32],
 }
 

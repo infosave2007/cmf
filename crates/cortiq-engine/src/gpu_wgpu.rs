@@ -1873,11 +1873,12 @@ pub fn forward_token_graph(
     if position >= cap {
         return false;
     }
-    // A resolved matvec weight: the device-local buffer + (q8 only) its row
-    // scales. Empty GraphW.row_scale ⇒ q1 (tile-embedded scales, no rs bind).
+    // A resolved matvec weight: the device-local buffer, (q8 only) its row
+    // scales, and the codec kind (0=q8_row 1=q1 2=q4_tiled 3=q1t).
     struct GMat {
         buf: wgpu::Buffer,
         rs: Option<wgpu::Buffer>,
+        kind: u8,
     }
     struct LW {
         wq: GMat,
@@ -1891,25 +1892,46 @@ pub fn forward_token_graph(
     // Resolve + cache every layer's weights (q8_row or q1) up front; bail (CPU)
     // on any refusal (budget/shape/dtype).
     let resolve = |gw: &crate::gpu::GraphW, rows: usize, cols: usize| -> Option<GMat> {
-        if gw.row_scale.is_empty() {
-            let (b, r, cc) = q1_weight(c, model, gw.idx)?;
-            if r != rows || cc != cols {
-                return None;
+        match gw.kind {
+            0 => {
+                // q8_row: weight bytes = rows*cols, plus per-row scales.
+                if gw.row_scale.len() < rows {
+                    return None;
+                }
+                let b = tensor_weight(c, model, gw.idx, rows, cols)?; // device-local
+                let rsb = c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("g-rs"),
+                    size: (rows * 4) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                c.queue.write_buffer(&rsb, 0, bytemuck::cast_slice(&gw.row_scale[..rows]));
+                Some(GMat { buf: b, rs: Some(rsb), kind: 0 })
             }
-            Some(GMat { buf: b, rs: None })
-        } else {
-            if gw.row_scale.len() < rows {
-                return None;
+            1 => {
+                let (b, r, cc) = q1_weight(c, model, gw.idx)?;
+                if r != rows || cc != cols {
+                    return None;
+                }
+                Some(GMat { buf: b, rs: None, kind: 1 })
             }
-            let b = tensor_weight(c, model, gw.idx, rows, cols)?; // device-local (weight_buffer)
-            let rsb = c.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("g-rs"),
-                size: (rows * 4) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            c.queue.write_buffer(&rsb, 0, bytemuck::cast_slice(&gw.row_scale[..rows]));
-            Some(GMat { buf: b, rs: Some(rsb) })
+            2 | 3 => {
+                // q4_tiled / q1t: the tensor carries its own byte length (tiles
+                // + q1t's sparse overlay) — fetch it whole, device-local.
+                let entry = model.tensors.get(gw.idx)?;
+                if *entry.shape.first()? as usize != rows || *entry.shape.get(1)? as usize != cols {
+                    return None;
+                }
+                let abs = model.entry_abs_offset(entry)?;
+                let plen = entry.nbytes as usize;
+                let bytes = model.primary_bytes();
+                if abs + plen > bytes.len() {
+                    return None;
+                }
+                let b = weight_buffer(c, (bytes.as_ptr() as usize, gw.idx), &bytes[abs..abs + plen])?;
+                Some(GMat { buf: b, rs: None, kind: gw.kind })
+            }
+            _ => None,
         }
     };
     let mut lws = Vec::with_capacity(layers.len());
@@ -2007,9 +2029,11 @@ pub fn forward_token_graph(
     // or q1 (encode_matvec_q1). Each is its own pass — pass-grouping measured
     // as a no-op (the wall is per-dispatch, not per-barrier).
     let emat = |enc: &mut wgpu::CommandEncoder, m: &GMat, xs: &wgpu::Buffer, y: &wgpu::Buffer, rows: usize, cols: usize| {
-        match &m.rs {
-            Some(rs) => encode_matvec(c, enc, &m.buf, xs, rs, y, rows, cols),
-            None => encode_matvec_q1(c, enc, &m.buf, xs, y, rows, cols),
+        match m.kind {
+            0 => encode_matvec(c, enc, &m.buf, xs, m.rs.as_ref().unwrap(), y, rows, cols),
+            1 => encode_matvec_q1(c, enc, &m.buf, xs, y, rows, cols),
+            2 => encode_q1t_like(c, enc, &c.q4b, &m.buf, xs, y, rows, cols),
+            _ => encode_q1t_like(c, enc, &c.q1t, &m.buf, xs, y, rows, cols),
         }
     };
     let dz = vec![0f32; hd];
@@ -2739,6 +2763,35 @@ fn encode_matvec_q1(
         timestamp_writes: None,
     });
     pass.set_pipeline(&c.q1);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+}
+
+/// Encode a q4_tiled or q1t matvec into `enc` (same 4-slot layout as q1, but
+/// params are [gpr, rows, cols]; q1t reads its sparse overlay from the tail of
+/// the same buffer). `pipeline` is c.q4b or c.q1t.
+fn encode_q1t_like(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+) {
+    let gpr = cols / 32;
+    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.layout_q1,
+        entries: &[bind_buf(0, weight), bind_buf(1, xs), bind_buf(2, y), bind_buf(3, &p_buf)],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
 }

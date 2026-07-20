@@ -337,15 +337,17 @@ impl QTensor {
         }
     }
 
-    /// (model, idx, row_scale) for a graph-capable mapped weight: q1 (empty
-    /// scales — tile-embedded) or q8_row (dequantized per-row scales). None
-    /// for dtypes the token graph does not yet handle (q8_2f/q4/vbit/q1t).
-    pub fn graph_weight(&self) -> Option<(&std::sync::Arc<CmfModel>, usize, &[f32])> {
+    /// (model, idx, kind, row_scale) for a graph-capable mapped weight. kind:
+    /// 0=q8_row (per-row scales), 1=q1, 2=q4_tiled, 3=q1t (tile-embedded, no
+    /// rs). None for dtypes the token graph does not handle (q8_2f/q4_block/vbit).
+    pub fn graph_weight(&self) -> Option<(&std::sync::Arc<CmfModel>, usize, u8, &[f32])> {
         match self {
-            Self::Mapped { model, idx, dtype: TensorDtype::Q1, .. } => Some((model, *idx, &[])),
             Self::Mapped { model, idx, dtype: TensorDtype::Q8Row, row_scale, .. } => {
-                Some((model, *idx, row_scale.as_slice()))
+                Some((model, *idx, 0, row_scale.as_slice()))
             }
+            Self::Mapped { model, idx, dtype: TensorDtype::Q1, .. } => Some((model, *idx, 1, &[])),
+            Self::Mapped { model, idx, dtype: TensorDtype::Q4Tiled, .. } => Some((model, *idx, 2, &[])),
+            Self::Mapped { model, idx, dtype: TensorDtype::Q1T, .. } => Some((model, *idx, 3, &[])),
             _ => None,
         }
     }

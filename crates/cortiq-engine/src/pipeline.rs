@@ -2427,9 +2427,9 @@ impl Pipeline {
                 _ => return None,
             };
             fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
-                t.graph_weight().map(|(_, i, rs)| crate::gpu::GraphW { idx: i, row_scale: rs })
+                t.graph_weight().map(|(_, i, kind, rs)| crate::gpu::GraphW { idx: i, kind, row_scale: rs })
             }
-            let (m, _, _) = wq.graph_weight()?;
+            let (m, _, _, _) = wq.graph_weight()?;
             model = Some(m.clone());
             layers.push(crate::gpu::GraphLayer {
                 input_norm: &lw.input_norm,
