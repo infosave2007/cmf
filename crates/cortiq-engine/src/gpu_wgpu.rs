@@ -437,6 +437,83 @@ fn attn_rope_qkn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
     }
 }
 
+// Append this position's K/V rows into the device cache mirror ([nkv,cap,hd]
+// each) at row `stored`. WGSL twin of Metal kv_append.
+struct KvP { nkv: u32, hd: u32, cap: u32, stored: u32 };
+@group(0) @binding(0) var<storage, read>       kv_k  : array<f32>;
+@group(0) @binding(1) var<storage, read>       kv_v  : array<f32>;
+@group(0) @binding(2) var<storage, read_write> kv_kb : array<f32>;
+@group(0) @binding(3) var<storage, read_write> kv_vb : array<f32>;
+@group(0) @binding(4) var<uniform>             kv_p  : KvP;
+@compute @workgroup_size(256)
+fn kv_append(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= kv_p.nkv * kv_p.hd) { return; }
+    let h = i / kv_p.hd;
+    let d = i % kv_p.hd;
+    let dst = (h * kv_p.cap + kv_p.stored) * kv_p.hd + d;
+    kv_kb[dst] = kv_k[i];
+    kv_vb[dst] = kv_v[i];
+}
+
+// Grouped decode attention, one 32-thread workgroup per Q-head. Dims sliced
+// across lanes (dim d in lane d%32, slot d/32); online softmax over the n
+// cached positions with the per-position q·k dot reduced in workgroup memory
+// (portable — no subgroup ops). WGSL twin of Metal gqa_attend (output only;
+// Born-importance is handled on the CPU side when eviction is active).
+struct AtP { nh: u32, hpk: u32, hd: u32, cap: u32, n: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read>       at_q : array<f32>;
+@group(0) @binding(1) var<storage, read>       at_k : array<f32>;
+@group(0) @binding(2) var<storage, read>       at_v : array<f32>;
+@group(0) @binding(3) var<storage, read_write> at_o : array<f32>;
+@group(0) @binding(4) var<uniform>             at_p : AtP;
+var<workgroup> at_red: array<f32, 32>;
+@compute @workgroup_size(32)
+fn gqa_attend(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let lane = lid.x;
+    if (h >= at_p.nh) { return; }
+    let hd = at_p.hd;
+    let kbase = (h / at_p.hpk) * at_p.cap * hd;
+    let scale = 1.0 / sqrt(f32(hd));
+    let nt = (hd + 31u) / 32u;
+    var qv: array<f32, 4>;
+    for (var t = 0u; t < nt; t = t + 1u) {
+        let d = t * 32u + lane;
+        qv[t] = select(0.0, at_q[h * hd + d] * scale, d < hd);
+    }
+    var m = -1e30;
+    var l = 0.0;
+    var acc = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+    for (var p = 0u; p < at_p.n; p = p + 1u) {
+        let row = kbase + p * hd;
+        var partial = 0.0;
+        for (var t = 0u; t < nt; t = t + 1u) {
+            let d = t * 32u + lane;
+            if (d < hd) { partial = partial + qv[t] * at_k[row + d]; }
+        }
+        at_red[lane] = partial;
+        workgroupBarrier();
+        var s = 0.0;
+        for (var j = 0u; j < 32u; j = j + 1u) { s = s + at_red[j]; }
+        workgroupBarrier();
+        let mp = max(m, s);
+        let f = exp(m - mp);
+        let w = exp(s - mp);
+        l = l * f + w;
+        for (var t = 0u; t < nt; t = t + 1u) {
+            let d = t * 32u + lane;
+            if (d < hd) { acc[t] = acc[t] * f + w * at_v[row + d]; }
+        }
+        m = mp;
+    }
+    let invl = select(0.0, 1.0 / l, l > 0.0);
+    for (var t = 0u; t < nt; t = t + 1u) {
+        let d = t * 32u + lane;
+        if (d < hd) { at_o[h * hd + d] = acc[t] * invl; }
+    }
+}
+
 // q1t (ternary base-3) + q4_block matvec — reuse the q1 bindings (q1w/q1x/q1y/
 // q1p) and its 4-slot layout. Weights arrive as array<u32>, so bytes come out
 // with shift+mask (q1t_byte). q1p fields are reinterpreted: np=gpr, _p0=cols.
@@ -691,6 +768,8 @@ struct Ctx {
     q1t_ovmm: wgpu::ComputePipeline,
     rmsnorm: wgpu::ComputePipeline,
     attn_rope: wgpu::ComputePipeline,
+    kv_append: wgpu::ComputePipeline,
+    gqa_attend: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     layout_mm: wgpu::BindGroupLayout,
     layout_mmm: wgpu::BindGroupLayout,
@@ -700,6 +779,8 @@ struct Ctx {
     layout_q1: wgpu::BindGroupLayout,
     layout_rmsnorm: wgpu::BindGroupLayout,
     layout_attn_rope: wgpu::BindGroupLayout,
+    layout_kv: wgpu::BindGroupLayout,
+    layout_attend: wgpu::BindGroupLayout,
     /// Discrete card (PCIe VRAM) vs UMA — thresholds and budgets differ.
     discrete: bool,
     /// Weight-residency budget in bytes (CMF_GPU_VRAM_MB override). On a
@@ -876,10 +957,14 @@ fn init() -> Result<Ctx, String> {
     let q1t_ovmm = pipe("q1t_overlay_mm");
     let rmsnorm = pipe("rmsnorm");
     let attn_rope = pipe("attn_rope_qkn");
+    let kv_append = pipe("kv_append");
+    let gqa_attend = pipe("gqa_attend");
     let layout = matvec.get_bind_group_layout(0);
     let layout_q1 = q1.get_bind_group_layout(0);
     let layout_rmsnorm = rmsnorm.get_bind_group_layout(0);
     let layout_attn_rope = attn_rope.get_bind_group_layout(0);
+    let layout_kv = kv_append.get_bind_group_layout(0);
+    let layout_attend = gqa_attend.get_bind_group_layout(0);
     let layout_mm = matmat.get_bind_group_layout(0);
     let layout_mmm = mul_mm.get_bind_group_layout(0);
     let layout_silu = silu.get_bind_group_layout(0);
@@ -902,6 +987,8 @@ fn init() -> Result<Ctx, String> {
         q1t_ovmm,
         rmsnorm,
         attn_rope,
+        kv_append,
+        gqa_attend,
         layout,
         layout_mm,
         layout_mmm,
@@ -911,6 +998,8 @@ fn init() -> Result<Ctx, String> {
         layout_q1,
         layout_rmsnorm,
         layout_attn_rope,
+        layout_kv,
+        layout_attend,
         discrete,
         vram_budget,
         resident: std::sync::atomic::AtomicU64::new(0),
@@ -1463,6 +1552,69 @@ pub fn attn_rope_qkn_gpu(
     k_out[..nkv * hd].copy_from_slice(bytemuck::cast_slice(&dk[..nkv * hd * 4]));
     gout[..nh * hd].copy_from_slice(bytemuck::cast_slice(&dg[..nh * hd * 4]));
     true
+}
+
+/// GPU grouped decode attention (bring-up / parity). K/V caches are laid out
+/// [nkv, cap, hd]; attends q[nh·hd] over the first `n` rows, writes out[nh·hd].
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attend_gpu(
+    q: &[f32],
+    kcache: &[f32],
+    vcache: &[f32],
+    nh: usize,
+    hpk: usize,
+    hd: usize,
+    cap: usize,
+    n: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let q_b = storage_bytes(c, bytemuck::cast_slice(q));
+    let k_b = storage_bytes(c, bytemuck::cast_slice(kcache));
+    let v_b = storage_bytes(c, bytemuck::cast_slice(vcache));
+    let o_b = rw_f32(c, nh * hd, true);
+    let p_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("at-p"),
+        contents: bytemuck::cast_slice(&[
+            nh as u32, hpk as u32, hd as u32, cap as u32, n as u32, 0u32, 0u32, 0u32,
+        ]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("at-bg"),
+        layout: &c.layout_attend,
+        entries: &[
+            bind_buf(0, &q_b),
+            bind_buf(1, &k_b),
+            bind_buf(2, &v_b),
+            bind_buf(3, &o_b),
+            bind_buf(4, &p_buf),
+        ],
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("at") });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("at"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.gqa_attend);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(nh as u32, 1, 1);
+    }
+    let size = (nh * hd * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "at-stage",
+    );
+    let ok = readback(c, enc, &o_b, &stage, size, &mut out[..nh * hd]);
+    drop(sc);
+    ok
 }
 
 /// q1 kernel body (weight_key = None — no residency cache; test path).
@@ -2596,6 +2748,52 @@ mod tests {
         assert!(md(&want_q, &got_q) < 1e-4, "q mismatch: {}", md(&want_q, &got_q));
         assert!(md(&want_k, &got_k) < 1e-4, "k mismatch: {}", md(&want_k, &got_k));
         assert!(md(&want_g, &got_g) < 1e-4, "gate mismatch: {}", md(&want_g, &got_g));
+    }
+
+    #[test]
+    fn wgpu_gqa_attend_matches_cpu() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        if ctx().is_none() {
+            eprintln!("no wgpu adapter — skipping gqa_attend parity test");
+            return;
+        }
+        let (nh, hpk, hd, cap, n) = (4usize, 2usize, 64usize, 16usize, 5usize);
+        let nkv = nh / hpk;
+        let jit = |a: usize, b: usize| ((a * 29 + b * 13 + 5) % 89) as f32 / 89.0 - 0.5;
+        let q: Vec<f32> = (0..nh * hd).map(|i| jit(i, 1)).collect();
+        // caches laid out [nkv, cap, hd]; only first n rows are valid.
+        let mut kc = vec![0f32; nkv * cap * hd];
+        let mut vc = vec![0f32; nkv * cap * hd];
+        for kh in 0..nkv {
+            for p in 0..n {
+                for d in 0..hd {
+                    kc[(kh * cap + p) * hd + d] = jit(kh * 1000 + p * 10 + d, 2);
+                    vc[(kh * cap + p) * hd + d] = jit(kh * 1000 + p * 10 + d, 3);
+                }
+            }
+        }
+        // CPU reference: scaled softmax attention per head.
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut want = vec![0f32; nh * hd];
+        for h in 0..nh {
+            let kh = h / hpk;
+            let mut sc: Vec<f32> = (0..n)
+                .map(|p| (0..hd).map(|d| q[h * hd + d] * kc[(kh * cap + p) * hd + d]).sum::<f32>() * scale)
+                .collect();
+            let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+            let mut den = 0.0;
+            for s in sc.iter_mut() {
+                *s = (*s - mx).exp();
+                den += *s;
+            }
+            for d in 0..hd {
+                want[h * hd + d] = (0..n).map(|p| sc[p] * vc[(kh * cap + p) * hd + d]).sum::<f32>() / den;
+            }
+        }
+        let mut got = vec![0f32; nh * hd];
+        assert!(gqa_attend_gpu(&q, &kc, &vc, nh, hpk, hd, cap, n, &mut got));
+        let md = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(md < 1e-4, "wgpu gqa_attend ≠ CPU: max|Δ| = {md}");
     }
 
     #[test]
