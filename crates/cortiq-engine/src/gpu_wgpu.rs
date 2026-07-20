@@ -127,64 +127,92 @@ fn q8_matmat(@builtin(workgroup_id) wid: vec3<u32>,
 
 // q1: 6-byte tiles [f16 scale][4B sign bits] per 32-group; gpr is even,
 // so a row is whole 12-byte tile PAIRS = 3 u32 each (same layout walk
-// as the Metal kernel). Bit set → +x. Grid-stride over rows, 64
-// threads reduce a row; np = gpr/2.
+// as the Metal kernel). Bit set → +x; np = gpr/2 tile-pairs/row (64 cols each).
+//
+// FAST kernel (the FFN q1 matvecs are ~59% of a 27B decode token): one
+// workgroup owns 16 output ROWS, 16 lanes/row (256 threads). Activations are
+// staged into shared memory in 1024-col tiles and REUSED across the 16 rows
+// (16× fewer activation loads). Sign unpack is a branchless XOR sign-flip
+// (bit clear ⇒ flip the f32 sign bit) instead of 32 vec4 selects.
 struct Q1Params { np: u32, rows: u32, _p0: u32, _p1: u32 };
 @group(0) @binding(0) var<storage, read>       q1w : array<u32>;
 @group(0) @binding(1) var<storage, read>       q1x : array<f32>;   // raw f32 activations
 @group(0) @binding(2) var<storage, read_write> q1y : array<f32>;
 @group(0) @binding(3) var<uniform>             q1p : Q1Params;
 
-var<workgroup> partial_q1: array<f32, 64>;
+var<workgroup> partial_q1: array<f32, 256>;   // 16 rows × 16 lanes
+var<workgroup> q1xs: array<f32, 1024>;        // one 1024-col activation tile
 
+// Sum of ±x over one 32-weight group; x read from the shared tile at xbase.
+// bit=1 → +x, bit=0 → -x, done by XORing the f32 sign bit (no select chain).
 fn q1_tile_sum(bits: u32, xbase: u32) -> f32 {
     var s = vec4<f32>(0.0);
     for (var j = 0u; j < 8u; j = j + 1u) {
         let nib = bits >> (j * 4u);
-        let xi = xbase + j * 4u;
-        let x = vec4<f32>(q1x[xi], q1x[xi + 1u], q1x[xi + 2u], q1x[xi + 3u]);
-        s = s + select(-x, x,
-            vec4<bool>((nib & 1u) != 0u, (nib & 2u) != 0u, (nib & 4u) != 0u, (nib & 8u) != 0u));
+        let o = xbase + j * 4u;
+        let x = vec4<f32>(q1xs[o], q1xs[o + 1u], q1xs[o + 2u], q1xs[o + 3u]);
+        let m = vec4<u32>(
+            ((nib & 1u) ^ 1u) << 31u,
+            (((nib >> 1u) & 1u) ^ 1u) << 31u,
+            (((nib >> 2u) & 1u) ^ 1u) << 31u,
+            (((nib >> 3u) & 1u) ^ 1u) << 31u);
+        s = s + bitcast<vec4<f32>>(bitcast<vec4<u32>>(x) ^ m);
     }
     return s.x + s.y + s.z + s.w;
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn q1_matvec(@builtin(workgroup_id) wid: vec3<u32>,
              @builtin(num_workgroups) nwg: vec3<u32>,
              @builtin(local_invocation_index) lid: u32) {
-    var row = wid.x;
+    let cols = q1p.np * 64u;
+    let r = lid / 16u;      // which of the 16 rows this thread serves
+    let lane = lid % 16u;   // which tile-pair lane within a column tile
+    var row0 = wid.x * 16u;
     loop {
-        if (row >= q1p.rows) { break; }
-        let base = row * q1p.np * 3u;
+        if (row0 >= q1p.rows) { break; }
+        let row = row0 + r;
         var acc = 0.0;
-        var pi = lid;
+        var ti = 0u;                       // column tile start, in tile-pairs
         loop {
-            if (pi >= q1p.np) { break; }
-            let a0 = q1w[base + pi * 3u];
-            let a1 = q1w[base + pi * 3u + 1u];
-            let a2 = q1w[base + pi * 3u + 2u];
-            // pair words: [s0 | bits0.lo] [bits0.hi | s1] [bits1]
-            let s0 = unpack2x16float(a0).x;
-            let s1 = unpack2x16float(a1).y;
-            let bits0 = (a0 >> 16u) | (a1 << 16u);
-            let g = pi * 2u;
-            acc = acc + s0 * q1_tile_sum(bits0, g * 32u)
-                      + s1 * q1_tile_sum(a2, (g + 1u) * 32u);
-            pi = pi + 64u;
+            if (ti >= q1p.np) { break; }
+            // Cooperatively stage 1024 activations (16 tile-pairs) into shared.
+            let c0 = ti * 64u;
+            var k = lid;
+            loop {
+                if (k >= 1024u) { break; }
+                let c = c0 + k;
+                q1xs[k] = select(0.0, q1x[c], c < cols);
+                k = k + 256u;
+            }
+            workgroupBarrier();
+            let pi = ti + lane;            // this lane's tile-pair
+            if (row < q1p.rows && pi < q1p.np) {
+                let base = row * q1p.np * 3u + pi * 3u;
+                let a0 = q1w[base]; let a1 = q1w[base + 1u]; let a2 = q1w[base + 2u];
+                let s0 = unpack2x16float(a0).x;
+                let s1 = unpack2x16float(a1).y;
+                let bits0 = (a0 >> 16u) | (a1 << 16u);
+                let xb = lane * 64u;       // local offset of this pair in q1xs
+                acc = acc + s0 * q1_tile_sum(bits0, xb) + s1 * q1_tile_sum(a2, xb + 32u);
+            }
+            workgroupBarrier();
+            ti = ti + 16u;
         }
         partial_q1[lid] = acc;
         workgroupBarrier();
-        var stride = 32u;
-        loop {
-            if (stride == 0u) { break; }
-            if (lid < stride) { partial_q1[lid] = partial_q1[lid] + partial_q1[lid + stride]; }
-            workgroupBarrier();
-            stride = stride >> 1u;
-        }
-        if (lid == 0u) { q1y[row] = partial_q1[0]; }
+        // reduce the 16 lanes of each row (blocks of 16 in partial_q1)
+        if (lane < 8u) { partial_q1[lid] = partial_q1[lid] + partial_q1[lid + 8u]; }
         workgroupBarrier();
-        row = row + nwg.x;
+        if (lane < 4u) { partial_q1[lid] = partial_q1[lid] + partial_q1[lid + 4u]; }
+        workgroupBarrier();
+        if (lane < 2u) { partial_q1[lid] = partial_q1[lid] + partial_q1[lid + 2u]; }
+        workgroupBarrier();
+        if (lane < 1u) { partial_q1[lid] = partial_q1[lid] + partial_q1[lid + 1u]; }
+        workgroupBarrier();
+        if (lane == 0u && row < q1p.rows) { q1y[row] = partial_q1[lid]; }
+        workgroupBarrier();
+        row0 = row0 + nwg.x * 16u;
     }
 }
 
@@ -2747,7 +2775,7 @@ fn dispatch_q1(
         });
         pass.set_pipeline(&c.q1);
         pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+        pass.dispatch_workgroups((rows as u32).div_ceil(16).min(MAX_WG), 1, 1);
     }
     let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..rows]);
     drop(sc);
@@ -3210,7 +3238,7 @@ fn encode_matvec_q1(
     });
     pass.set_pipeline(&c.q1);
     pass.set_bind_group(0, &bind, &[]);
-    pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+    pass.dispatch_workgroups((rows as u32).div_ceil(16).min(MAX_WG), 1, 1);
 }
 
 /// Encode a plain f32 matvec (small unquantized projections) into `enc`.
