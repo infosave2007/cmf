@@ -1183,8 +1183,11 @@ impl Pipeline {
         // positions per submit — projections/FFN as GEMMs (weight once per K),
         // attention/GDN looped inside — instead of one whole-graph submit per
         // position. Falls through to the per-position graph on any refusal.
-        // CMF_BATCH_K=0 disables batching (per-position graph baseline for A/B).
-        let batch_k = std::env::var("CMF_BATCH_K").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256);
+        // Batched prefill is opt-in (CMF_BATCH_K>0): it uploads q1/q8 weights in
+        // GEMM layout, which evicts the decode graph's resident matvec weights
+        // and halves subsequent decode until that VRAM interaction is fixed.
+        // Default 0 = off (per-position graph prefill, decode untouched).
+        let batch_k = std::env::var("CMF_BATCH_K").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
         if batch_k > 0 && graph_prefill && task_mask.is_none() && mtp.is_none() && !dyn_prefill && pos + 1 < input_ids.len() {
             let hs = self.hidden_size;
             let chunk = batch_k;
