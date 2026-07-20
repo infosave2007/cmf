@@ -484,6 +484,53 @@ pub fn q1_matvec(
     }
 }
 
+/// Whole attention sub-block on the wgpu token graph (drop-in for
+/// `qwen_attention`): normed hidden in, O-projection out, resident device
+/// K/V mirror. false = refusal / not the wgpu backend → CPU path.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_dropin(
+    model: &Arc<CmfModel>,
+    kv_id: u64,
+    layer: usize,
+    normed: &[f32],
+    wq_idx: usize,
+    wk_idx: usize,
+    wv_idx: usize,
+    wo_idx: usize,
+    q_norm: Option<&[f32]>,
+    k_norm: Option<&[f32]>,
+    invf: &[f32],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rd: usize,
+    hidden: usize,
+    pos: usize,
+    cap: usize,
+    gemma: bool,
+    eps: f32,
+    cpu_k: &[Vec<f32>],
+    cpu_v: &[Vec<f32>],
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::attn_dropin_gpu(
+            model, kv_id, layer, normed, wq_idx, wk_idx, wv_idx, wo_idx, q_norm, k_norm, invf,
+            nh, nkv, hd, rd, hidden, pos, cap, gemma, eps, cpu_k, cpu_v, out,
+        ),
+        _ => false,
+    }
+}
+
+/// Drop the wgpu token graph's device K/V mirror for a pipeline.
+pub fn graph_kv_reset(_kv_id: u64) {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        crate::gpu_wgpu::kv_mirror_reset(_kv_id);
+    }
+}
+
 /// Ternary (q1t) BASE matvec on the GPU — fills `out` with the base dot; the
 /// caller adds the sparse overlay on the CPU. Metal only for now (wgpu q1t not
 /// yet written → CPU fallback).

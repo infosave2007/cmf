@@ -1051,6 +1051,7 @@ impl Pipeline {
 
         // Fresh sequence — the cache holds absolute positions.
         self.kv_cache.clear();
+        crate::gpu::graph_kv_reset(self.graph_kv_id);
         self.o1_begin();
 
         // Speculative decode is off under o1: a rejected draft can't be
@@ -2413,6 +2414,9 @@ impl Pipeline {
             self.rms_eps,
         );
         let pool = self.pool.clone();
+        // Opt-in wgpu token-graph attention (discrete Vulkan/DX12): the whole
+        // attention sub-block runs resident in one submit. Off by default.
+        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH").map(|v| v != "0").unwrap_or(false);
 
         #[cfg(target_os = "macos")]
         let mut gpu_skip_until = 0usize;
@@ -2536,7 +2540,29 @@ impl Pipeline {
                     k_norm,
                     output_gate,
                     bias,
-                } => {
+                } => 'attn: {
+                    // wgpu token-graph attention (opt-in): whole sub-block in
+                    // one submit, device K/V mirror. q1 only, no gate/bias/mask.
+                    if graph_on && !*output_gate && bias.is_none() && task_mask.is_none() {
+                        let inv_freq_l = self.layer_inv_freq(li);
+                        let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
+                        let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
+                        if let (Some((gm, qi)), Some((_, ki)), Some((_, vi)), Some((_, oi))) =
+                            (wq.mapped_q1(), wk.mapped_q1(), wv.mapped_q1(), wo.mapped_q1())
+                        {
+                            let gm = gm.clone();
+                            let mut out = vec![0f32; hs];
+                            let cache = &self.kv_cache.layers[li];
+                            if crate::gpu::attn_dropin(
+                                &gm, self.graph_kv_id, li, &self.ws.n1, qi, ki, vi, oi,
+                                q_norm.as_deref(), k_norm.as_deref(), &inv_freq_l, nh, nkv_l,
+                                hd_l, rd_l, hs, position, self.kv_cache.max_seq_len, gemma, eps as f32,
+                                cache.k_heads(), cache.v_heads(), &mut out,
+                            ) {
+                                break 'attn out;
+                            }
+                        }
+                    }
                     let masked = task_mask
                         .map(|m| m.head_flags(li, self.num_heads).iter().any(|&a| !a))
                         .unwrap_or(false);

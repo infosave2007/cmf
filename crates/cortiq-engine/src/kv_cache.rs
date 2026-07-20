@@ -126,6 +126,15 @@ impl LayerKvCache {
         }
     }
 
+    /// Per-KV-head stored keys `[seq_len × head_dim]` (GPU token graph sync).
+    pub fn k_heads(&self) -> &[Vec<f32>] {
+        &self.k
+    }
+    /// Per-KV-head stored values `[seq_len × head_dim]`.
+    pub fn v_heads(&self) -> &[Vec<f32>] {
+        &self.v
+    }
+
     // ── O(1) Nyström override ──
 
     /// Arm query collection for a fresh prompt pass (a cleared cache).

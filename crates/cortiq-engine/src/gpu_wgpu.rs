@@ -803,6 +803,16 @@ struct Ctx {
     weight_bufs: Mutex<HashMap<(usize, usize), wgpu::Buffer>>,
     /// row_scale buffer per (idx, row0) — small, cached.
     rs_bufs: Mutex<HashMap<(usize, usize), wgpu::Buffer>>,
+    /// Device K/V cache mirror per (kv_id, layer) for the token graph:
+    /// [nkv, cap, hd] each, persists across decode tokens. `synced` counts
+    /// the positions already resident (prefill sync + graph appends).
+    attn_kv: Mutex<HashMap<(u64, usize), KvMirror>>,
+}
+
+struct KvMirror {
+    k: wgpu::Buffer,
+    v: wgpu::Buffer,
+    synced: usize,
 }
 
 #[derive(Default)]
@@ -1006,6 +1016,7 @@ fn init() -> Result<Ctx, String> {
         scratch: Mutex::new(Scratch::default()),
         weight_bufs: Mutex::new(HashMap::new()),
         rs_bufs: Mutex::new(HashMap::new()),
+        attn_kv: Mutex::new(HashMap::new()),
     })
 }
 
@@ -1615,6 +1626,157 @@ pub fn gqa_attend_gpu(
     let ok = readback(c, enc, &o_b, &stage, size, &mut out[..nh * hd]);
     drop(sc);
     ok
+}
+
+/// Resident q1 weight for a model tensor (cached in VRAM by (ptr, idx)).
+/// Returns (buffer, rows, cols). None on budget/shape refusal.
+fn q1_weight(c: &Ctx, model: &Arc<CmfModel>, idx: usize) -> Option<(wgpu::Buffer, usize, usize)> {
+    let entry = model.tensors.get(idx)?;
+    let rows = *entry.shape.first()? as usize;
+    let cols = *entry.shape.get(1)? as usize;
+    if cols % 32 != 0 {
+        return None;
+    }
+    let abs = model.entry_abs_offset(entry)?;
+    let bytes = model.primary_bytes();
+    let plen = rows * (cols / 32) * 6;
+    if abs + plen > bytes.len() {
+        return None;
+    }
+    let buf = weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen])?;
+    Some((buf, rows, cols))
+}
+
+/// Production drop-in for the attention sub-block on the token graph: takes
+/// the already-normed hidden and returns the O-projection output (pre-
+/// residual) — exactly where `qwen_attention` slots in. QKV/O weights are
+/// resident (VRAM cache), the K/V cache is a persistent device mirror keyed
+/// by (kv_id, layer) that is synced once from the CPU cache (prefill) then
+/// appended to each token. Everything runs in ONE command encoder; only the
+/// attention output reads back. false = refusal (caller keeps the CPU path).
+#[allow(clippy::too_many_arguments)]
+pub fn attn_dropin_gpu(
+    model: &Arc<CmfModel>,
+    kv_id: u64,
+    layer: usize,
+    normed: &[f32],
+    wq_idx: usize,
+    wk_idx: usize,
+    wv_idx: usize,
+    wo_idx: usize,
+    q_norm: Option<&[f32]>,
+    k_norm: Option<&[f32]>,
+    invf: &[f32],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rd: usize,
+    hidden: usize,
+    pos: usize,
+    cap: usize,
+    gemma: bool,
+    eps: f32,
+    cpu_k: &[Vec<f32>],
+    cpu_v: &[Vec<f32>],
+    attn_out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if pos >= cap {
+        return false;
+    }
+    let (wq, rq, cq) = q1_weight(c, model, wq_idx).unwrap_or((c.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 4, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false }), 0, 0));
+    if rq != nh * hd || cq != hidden {
+        return false; // gated arch (e.g. output_gate doubles rows) → CPU path
+    }
+    let Some((wk, _, _)) = q1_weight(c, model, wk_idx) else { return false };
+    let Some((wv, _, _)) = q1_weight(c, model, wv_idx) else { return false };
+    let Some((wo, ro, co)) = q1_weight(c, model, wo_idx) else { return false };
+    if ro != hidden || co != nh * hd {
+        return false;
+    }
+    // Device K/V mirror (persist across tokens).
+    let mut kvm = c.attn_kv.lock().unwrap();
+    let entry = kvm.entry((kv_id, layer)).or_insert_with(|| {
+        let sz = (nkv * cap * hd * 4) as u64;
+        let mk = || c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kv-mirror"),
+            size: sz,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        KvMirror { k: mk(), v: mk(), synced: 0 }
+    });
+    // Sync prefill history 0..pos from the CPU cache (once).
+    if entry.synced < pos {
+        for h in 0..nkv {
+            let src_k = &cpu_k[h];
+            let src_v = &cpu_v[h];
+            let from = entry.synced;
+            let take = pos.min(src_k.len() / hd);
+            if take > from {
+                let off = ((h * cap + from) * hd * 4) as u64;
+                c.queue.write_buffer(&entry.k, off, bytemuck::cast_slice(&src_k[from * hd..take * hd]));
+                c.queue.write_buffer(&entry.v, off, bytemuck::cast_slice(&src_v[from * hd..take * hd]));
+            }
+        }
+        entry.synced = pos;
+    }
+    let kbuf = entry.k.clone();
+    let vbuf = entry.v.clone();
+    drop(kvm);
+
+    let stor = |data: &[u8]| c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: data, usage: wgpu::BufferUsages::STORAGE });
+    let dummy = vec![0f32; hd];
+    let qnw_b = stor(bytemuck::cast_slice(q_norm.unwrap_or(&dummy)));
+    let knw_b = stor(bytemuck::cast_slice(k_norm.unwrap_or(&dummy)));
+    let invf_b = stor(bytemuck::cast_slice(invf));
+    let normed_b = stor(bytemuck::cast_slice(&normed[..hidden]));
+    let qraw_b = rw_f32(c, nh * hd, false);
+    let k_b = rw_f32(c, nkv * hd, false);
+    let v_b = rw_f32(c, nkv * hd, false);
+    let qout_b = rw_f32(c, nh * hd, false);
+    let gout_b = rw_f32(c, nh * hd, false);
+    let attn_b = rw_f32(c, nh * hd, false);
+    let o_b = rw_f32(c, hidden, true);
+    let flags = if q_norm.is_some() { 2u32 } else { 0 } | if k_norm.is_some() { 4 } else { 0 } | if gemma { 8 } else { 0 };
+    let unif = |d: &[u32]| c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(d), usage: wgpu::BufferUsages::UNIFORM });
+    let bg = |layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| {
+        let e: Vec<_> = bufs.iter().enumerate().map(|(i, b)| bind_buf(i as u32, b)).collect();
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &e })
+    };
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("attn-dropin") });
+    let go = |enc: &mut wgpu::CommandEncoder, p: &wgpu::ComputePipeline, b: &wgpu::BindGroup, g: u32| {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        pass.set_pipeline(p);
+        pass.set_bind_group(0, b, &[]);
+        pass.dispatch_workgroups(g, 1, 1);
+    };
+    encode_matvec_q1(c, &mut enc, &wq, &normed_b, &qraw_b, nh * hd, hidden);
+    encode_matvec_q1(c, &mut enc, &wk, &normed_b, &k_b, nkv * hd, hidden);
+    encode_matvec_q1(c, &mut enc, &wv, &normed_b, &v_b, nkv * hd, hidden);
+    let rq_p = unif(&[nh as u32, nkv as u32, hd as u32, rd as u32, pos as u32, flags, eps.to_bits(), 0]);
+    go(&mut enc, &c.attn_rope, &bg(&c.layout_attn_rope, &[&qraw_b, &k_b, &qout_b, &gout_b, &qnw_b, &knw_b, &invf_b, &rq_p]), (nh + nkv) as u32);
+    let kv_p = unif(&[nkv as u32, hd as u32, cap as u32, pos as u32]);
+    go(&mut enc, &c.kv_append, &bg(&c.layout_kv, &[&k_b, &v_b, &kbuf, &vbuf, &kv_p]), ((nkv * hd) as u32).div_ceil(256));
+    let at_p = unif(&[nh as u32, (nh / nkv) as u32, hd as u32, cap as u32, (pos + 1) as u32, 0, 0, 0]);
+    go(&mut enc, &c.gqa_attend, &bg(&c.layout_attend, &[&qout_b, &kbuf, &vbuf, &attn_b, &at_p]), nh as u32);
+    encode_matvec_q1(c, &mut enc, &wo, &attn_b, &o_b, hidden, nh * hd);
+    let size = (hidden * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(&c.device, &mut sc.stage, size, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "dropin-stage");
+    let ok = readback(c, enc, &o_b, &stage, size, &mut attn_out[..hidden]);
+    drop(sc);
+    if ok {
+        c.attn_kv.lock().unwrap().get_mut(&(kv_id, layer)).map(|m| m.synced = pos + 1);
+    }
+    ok
+}
+
+/// Drop the device K/V mirror for a pipeline (called on cache clear).
+pub fn kv_mirror_reset(kv_id: u64) {
+    if let Some(c) = ctx() {
+        c.attn_kv.lock().unwrap().retain(|(id, _), _| *id != kv_id);
+    }
 }
 
 /// One full attention sub-block resident on the GPU in a SINGLE command

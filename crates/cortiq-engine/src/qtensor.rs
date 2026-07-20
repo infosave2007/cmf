@@ -328,6 +328,15 @@ impl QTensor {
         }
     }
 
+    /// (model, tensor idx) for a q1 mapped weight — the wgpu token graph
+    /// keys its resident VRAM cache by idx. None for any other dtype/kind.
+    pub fn mapped_q1(&self) -> Option<(&std::sync::Arc<CmfModel>, usize)> {
+        match self {
+            Self::Mapped { model, idx, dtype: TensorDtype::Q1, .. } => Some((model, *idx)),
+            _ => None,
+        }
+    }
+
     /// Dense f32 view — only for owned tensors. Masked/sparse execution
     /// paths require it; quantized weights don't support masks yet.
     pub fn as_f32(&self) -> Option<&[f32]> {
