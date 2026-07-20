@@ -2426,20 +2426,23 @@ impl Pipeline {
                 FfnKind::Dense(d) => (&d.gate_proj, &d.up_proj, &d.down_proj),
                 _ => return None,
             };
-            let (m, qi) = wq.mapped_q1()?;
+            fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
+                t.graph_weight().map(|(_, i, rs)| crate::gpu::GraphW { idx: i, row_scale: rs })
+            }
+            let (m, _, _) = wq.graph_weight()?;
             model = Some(m.clone());
             layers.push(crate::gpu::GraphLayer {
                 input_norm: &lw.input_norm,
-                wq: qi,
-                wk: wk.mapped_q1()?.1,
-                wv: wv.mapped_q1()?.1,
-                wo: wo.mapped_q1()?.1,
+                wq: gw(wq)?,
+                wk: gw(wk)?,
+                wv: gw(wv)?,
+                wo: gw(wo)?,
                 q_norm: q_norm.as_deref(),
                 k_norm: k_norm.as_deref(),
                 post_norm: &lw.post_norm,
-                gate: gate.mapped_q1()?.1,
-                up: up.mapped_q1()?.1,
-                down: down.mapped_q1()?.1,
+                gate: gw(gate)?,
+                up: gw(up)?,
+                down: gw(down)?,
                 cpu_k: self.kv_cache.layers[li].k_heads(),
                 cpu_v: self.kv_cache.layers[li].v_heads(),
             });

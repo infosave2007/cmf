@@ -1873,27 +1873,55 @@ pub fn forward_token_graph(
     if position >= cap {
         return false;
     }
-    // Resolve + cache every layer's q1 weights up front; bail (CPU) on refusal.
-    struct LW {
-        wq: wgpu::Buffer,
-        wk: wgpu::Buffer,
-        wv: wgpu::Buffer,
-        wo: wgpu::Buffer,
-        gate: wgpu::Buffer,
-        up: wgpu::Buffer,
-        down: wgpu::Buffer,
+    // A resolved matvec weight: the device-local buffer + (q8 only) its row
+    // scales. Empty GraphW.row_scale ⇒ q1 (tile-embedded scales, no rs bind).
+    struct GMat {
+        buf: wgpu::Buffer,
+        rs: Option<wgpu::Buffer>,
     }
+    struct LW {
+        wq: GMat,
+        wk: GMat,
+        wv: GMat,
+        wo: GMat,
+        gate: GMat,
+        up: GMat,
+        down: GMat,
+    }
+    // Resolve + cache every layer's weights (q8_row or q1) up front; bail (CPU)
+    // on any refusal (budget/shape/dtype).
+    let resolve = |gw: &crate::gpu::GraphW, rows: usize, cols: usize| -> Option<GMat> {
+        if gw.row_scale.is_empty() {
+            let (b, r, cc) = q1_weight(c, model, gw.idx)?;
+            if r != rows || cc != cols {
+                return None;
+            }
+            Some(GMat { buf: b, rs: None })
+        } else {
+            if gw.row_scale.len() < rows {
+                return None;
+            }
+            let b = tensor_weight(c, model, gw.idx, rows, cols)?; // device-local (weight_buffer)
+            let rsb = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("g-rs"),
+                size: (rows * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            c.queue.write_buffer(&rsb, 0, bytemuck::cast_slice(&gw.row_scale[..rows]));
+            Some(GMat { buf: b, rs: Some(rsb) })
+        }
+    };
     let mut lws = Vec::with_capacity(layers.len());
     for l in layers {
-        let w = |idx, r, cc| q1_weight(c, model, idx).filter(|(_, rr, ccc)| *rr == r && *ccc == cc).map(|(b, _, _)| b);
         let (Some(wq), Some(wk), Some(wv), Some(wo), Some(gate), Some(up), Some(down)) = (
-            w(l.wq, nh * hd, hidden),
-            w(l.wk, nkv * hd, hidden),
-            w(l.wv, nkv * hd, hidden),
-            w(l.wo, hidden, nh * hd),
-            w(l.gate, inter, hidden),
-            w(l.up, inter, hidden),
-            w(l.down, hidden, inter),
+            resolve(&l.wq, nh * hd, hidden),
+            resolve(&l.wk, nkv * hd, hidden),
+            resolve(&l.wv, nkv * hd, hidden),
+            resolve(&l.wo, hidden, nh * hd),
+            resolve(&l.gate, inter, hidden),
+            resolve(&l.up, inter, hidden),
+            resolve(&l.down, hidden, inter),
         ) else {
             return false;
         };
@@ -1975,19 +2003,13 @@ pub fn forward_token_graph(
     let silu_u = unif(&[inter as u32, 0, 0, 0]);
     let kv_u = unif(&[nkv as u32, hd as u32, cap as u32, position as u32]);
     let at_u = unif(&[nh as u32, (nh / nkv) as u32, hd as u32, cap as u32, (position + 1) as u32, 0, 0, 0]);
-    // q1 matvec bind group (params buffer kept alive by the bind group).
-    let q1b = |w: &wgpu::Buffer, xs: &wgpu::Buffer, y: &wgpu::Buffer, rows: usize, cols: usize| {
-        let p = unif(&[(cols / 64) as u32, rows as u32, 0, 0]);
-        (bg(&c.layout_q1, &[w, xs, y, &p]), (rows as u32).min(MAX_WG))
-    };
-    // Run several dispatches of one pipeline in ONE pass — independent ops
-    // (QKV; gate+up) skip the inter-op memory barrier.
-    let pass_run = |enc: &mut wgpu::CommandEncoder, pipe: &wgpu::ComputePipeline, items: Vec<(wgpu::BindGroup, u32)>| {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-        pass.set_pipeline(pipe);
-        for (b, g) in &items {
-            pass.set_bind_group(0, b, &[]);
-            pass.dispatch_workgroups(*g, 1, 1);
+    // Encode one matvec, dtype-dispatched: q8_row (encode_matvec + row scales)
+    // or q1 (encode_matvec_q1). Each is its own pass — pass-grouping measured
+    // as a no-op (the wall is per-dispatch, not per-barrier).
+    let emat = |enc: &mut wgpu::CommandEncoder, m: &GMat, xs: &wgpu::Buffer, y: &wgpu::Buffer, rows: usize, cols: usize| {
+        match &m.rs {
+            Some(rs) => encode_matvec(c, enc, &m.buf, xs, rs, y, rows, cols),
+            None => encode_matvec_q1(c, enc, &m.buf, xs, y, rows, cols),
         }
     };
     let dz = vec![0f32; hd];
@@ -2003,24 +2025,20 @@ pub fn forward_token_graph(
         let knw = stor(bytemuck::cast_slice(l.k_norm.unwrap_or(&dz)));
         let rope_u = unif(&[nh as u32, nkv as u32, hd as u32, rd as u32, position as u32, flags(l.q_norm.is_some(), l.k_norm.is_some()), eps.to_bits(), 0]);
         // attention (n1 already holds this layer's attn-normed hidden)
-        pass_run(&mut enc, &c.q1, vec![
-            q1b(&lw.wq, &n1, &qraw, nh * hd, hidden),
-            q1b(&lw.wk, &n1, &kb, nkv * hd, hidden),
-            q1b(&lw.wv, &n1, &vb, nkv * hd, hidden),
-        ]);
+        emat(&mut enc, &lw.wq, &n1, &qraw, nh * hd, hidden);
+        emat(&mut enc, &lw.wk, &n1, &kb, nkv * hd, hidden);
+        emat(&mut enc, &lw.wv, &n1, &vb, nkv * hd, hidden);
         go(&mut enc, &c.attn_rope, &bg(&c.layout_attn_rope, &[&qraw, &kb, &qout, &gout, &qnw, &knw, &invf_b, &rope_u]), (nh + nkv) as u32);
         go(&mut enc, &c.kv_append, &bg(&c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]), ((nkv * hd) as u32).div_ceil(256));
         go(&mut enc, &c.gqa_attend, &bg(&c.layout_attend, &[&qout, kbuf, vbuf, &attn, &at_u]), nh as u32);
-        pass_run(&mut enc, &c.q1, vec![q1b(&lw.wo, &attn, &ob, hidden, nh * hd)]);
+        emat(&mut enc, &lw.wo, &attn, &ob, hidden, nh * hd);
         // O-residual + FFN-norm fused: h += ob, n1 = rms(h, post_norm)
         go(&mut enc, &c.add_rmsnorm, &bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &pnw, &n1, &rms_u]), 1);
         // SiLU FFN
-        pass_run(&mut enc, &c.q1, vec![
-            q1b(&lw.gate, &n1, &gbuf, inter, hidden),
-            q1b(&lw.up, &n1, &ubuf, inter, hidden),
-        ]);
+        emat(&mut enc, &lw.gate, &n1, &gbuf, inter, hidden);
+        emat(&mut enc, &lw.up, &n1, &ubuf, inter, hidden);
         go(&mut enc, &c.silu, &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]), (inter as u32).div_ceil(256));
-        pass_run(&mut enc, &c.q1, vec![q1b(&lw.down, &abuf, &ob, hidden, inter)]);
+        emat(&mut enc, &lw.down, &abuf, &ob, hidden, inter);
         // FFN-residual + next layer's attn-norm fused (plain residual on the last)
         if li + 1 < layers.len() {
             let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));

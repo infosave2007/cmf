@@ -337,6 +337,19 @@ impl QTensor {
         }
     }
 
+    /// (model, idx, row_scale) for a graph-capable mapped weight: q1 (empty
+    /// scales — tile-embedded) or q8_row (dequantized per-row scales). None
+    /// for dtypes the token graph does not yet handle (q8_2f/q4/vbit/q1t).
+    pub fn graph_weight(&self) -> Option<(&std::sync::Arc<CmfModel>, usize, &[f32])> {
+        match self {
+            Self::Mapped { model, idx, dtype: TensorDtype::Q1, .. } => Some((model, *idx, &[])),
+            Self::Mapped { model, idx, dtype: TensorDtype::Q8Row, row_scale, .. } => {
+                Some((model, *idx, row_scale.as_slice()))
+            }
+            _ => None,
+        }
+    }
+
     /// Dense f32 view — only for owned tensors. Masked/sparse execution
     /// paths require it; quantized weights don't support masks yet.
     pub fn as_f32(&self) -> Option<&[f32]> {

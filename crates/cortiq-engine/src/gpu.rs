@@ -523,20 +523,28 @@ pub fn attn_dropin(
     }
 }
 
-/// Per-layer weights for the whole-token wgpu graph (q1 matmuls by tensor
-/// idx; small f32 norm weights borrowed from the pipeline).
+/// One weight in the whole-token graph: the tensor idx (its dtype is read
+/// from the model) plus per-row scales — empty for q1 (tile-embedded), the
+/// dequantized row scales for q8_row.
+pub struct GraphW<'a> {
+    pub idx: usize,
+    pub row_scale: &'a [f32],
+}
+
+/// Per-layer weights for the whole-token wgpu graph (q8_row / q1 matmuls;
+/// small f32 norm weights borrowed from the pipeline).
 pub struct GraphLayer<'a> {
     pub input_norm: &'a [f32],
-    pub wq: usize,
-    pub wk: usize,
-    pub wv: usize,
-    pub wo: usize,
+    pub wq: GraphW<'a>,
+    pub wk: GraphW<'a>,
+    pub wv: GraphW<'a>,
+    pub wo: GraphW<'a>,
     pub q_norm: Option<&'a [f32]>,
     pub k_norm: Option<&'a [f32]>,
     pub post_norm: &'a [f32],
-    pub gate: usize,
-    pub up: usize,
-    pub down: usize,
+    pub gate: GraphW<'a>,
+    pub up: GraphW<'a>,
+    pub down: GraphW<'a>,
     pub cpu_k: &'a [Vec<f32>],
     pub cpu_v: &'a [Vec<f32>],
 }
