@@ -673,6 +673,45 @@ fn add_rmsnorm(@builtin(local_invocation_id) lid: vec3<u32>) {
     }
 }
 
+// Batched RMSNorm for prefill: one workgroup per row (wid.x), row r reads/writes
+// rn_x[r*n..] → rn_o[r*n..]; the weight rn_w[n] is shared. K prompt positions
+// norm in one dispatch (twin of `rmsnorm`, strided by row).
+@compute @workgroup_size(256)
+fn rmsnorm_b(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
+    let n = rn_p.n;
+    let base = wid.x * n;
+    var acc = 0.0;
+    var i = tid;
+    loop { if (i >= n) { break; } let v = rn_x[base + i]; acc = acc + v * v; i = i + 256u; }
+    rn_part[tid] = acc;
+    workgroupBarrier();
+    var stride = 128u;
+    loop { if (stride == 0u) { break; } if (tid < stride) { rn_part[tid] = rn_part[tid] + rn_part[tid + stride]; } workgroupBarrier(); stride = stride / 2u; }
+    let inv = inverseSqrt(rn_part[0] / f32(n) + rn_p.eps);
+    i = tid;
+    loop { if (i >= n) { break; } var wv = rn_w[i]; if (rn_p.gemma == 1u) { wv = 1.0 + wv; } rn_o[base + i] = rn_x[base + i] * inv * wv; i = i + 256u; }
+}
+
+// Batched fused residual-add + RMSNorm (one workgroup per row): ar_h[r] += ar_d[r]
+// in place, then ar_o[r] = rms(ar_h[r])·w. Prefill twin of `add_rmsnorm`.
+@compute @workgroup_size(256)
+fn add_rmsnorm_b(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
+    let n = ar_p.n;
+    let base = wid.x * n;
+    var acc = 0.0;
+    var i = tid;
+    loop { if (i >= n) { break; } let v = ar_h[base + i] + ar_d[base + i]; ar_h[base + i] = v; acc = acc + v * v; i = i + 256u; }
+    ar_part[tid] = acc;
+    workgroupBarrier();
+    var stride = 128u;
+    loop { if (stride == 0u) { break; } if (tid < stride) { ar_part[tid] = ar_part[tid] + ar_part[tid + stride]; } workgroupBarrier(); stride = stride / 2u; }
+    let inv = inverseSqrt(ar_part[0] / f32(n) + ar_p.eps);
+    i = tid;
+    loop { if (i >= n) { break; } var wv = ar_w[i]; if (ar_p.gemma == 1u) { wv = 1.0 + wv; } ar_o[base + i] = ar_h[base + i] * inv * wv; i = i + 256u; }
+}
+
 // RoPE + optional qk-norm + gate-split, one 32-thread workgroup per head
 // (WGSL twin of Metal attn_rope_qkn; the qk-norm sum-of-squares reduces in
 // workgroup memory — no subgroup ops, portable). Heads [0,nh)=Q (2·hd each
@@ -1121,6 +1160,8 @@ struct Ctx {
     q1t_ovmm: wgpu::ComputePipeline,
     rmsnorm: wgpu::ComputePipeline,
     add_rmsnorm: wgpu::ComputePipeline,
+    rmsnorm_b: wgpu::ComputePipeline,
+    add_rmsnorm_b: wgpu::ComputePipeline,
     attn_rope: wgpu::ComputePipeline,
     kv_append: wgpu::ComputePipeline,
     gqa_attend: wgpu::ComputePipeline,
@@ -1138,6 +1179,8 @@ struct Ctx {
     layout_q1: wgpu::BindGroupLayout,
     layout_rmsnorm: wgpu::BindGroupLayout,
     layout_add_rmsnorm: wgpu::BindGroupLayout,
+    layout_rmsnorm_b: wgpu::BindGroupLayout,
+    layout_add_rmsnorm_b: wgpu::BindGroupLayout,
     layout_attn_rope: wgpu::BindGroupLayout,
     layout_kv: wgpu::BindGroupLayout,
     layout_attend: wgpu::BindGroupLayout,
@@ -1335,6 +1378,8 @@ fn init() -> Result<Ctx, String> {
     let q1t_ovmm = pipe("q1t_overlay_mm");
     let rmsnorm = pipe("rmsnorm");
     let add_rmsnorm = pipe("add_rmsnorm");
+    let rmsnorm_b = pipe("rmsnorm_b");
+    let add_rmsnorm_b = pipe("add_rmsnorm_b");
     let attn_rope = pipe("attn_rope_qkn");
     let kv_append = pipe("kv_append");
     let gqa_attend = pipe("gqa_attend");
@@ -1345,6 +1390,8 @@ fn init() -> Result<Ctx, String> {
     let layout_q1 = q1.get_bind_group_layout(0);
     let layout_rmsnorm = rmsnorm.get_bind_group_layout(0);
     let layout_add_rmsnorm = add_rmsnorm.get_bind_group_layout(0);
+    let layout_rmsnorm_b = rmsnorm_b.get_bind_group_layout(0);
+    let layout_add_rmsnorm_b = add_rmsnorm_b.get_bind_group_layout(0);
     let layout_attn_rope = attn_rope.get_bind_group_layout(0);
     let layout_kv = kv_append.get_bind_group_layout(0);
     let layout_attend = gqa_attend.get_bind_group_layout(0);
@@ -1377,6 +1424,8 @@ fn init() -> Result<Ctx, String> {
         q1t_ovmm,
         rmsnorm,
         add_rmsnorm,
+        rmsnorm_b,
+        add_rmsnorm_b,
         attn_rope,
         kv_append,
         gqa_attend,
@@ -1394,6 +1443,8 @@ fn init() -> Result<Ctx, String> {
         layout_q1,
         layout_rmsnorm,
         layout_add_rmsnorm,
+        layout_rmsnorm_b,
+        layout_add_rmsnorm_b,
         layout_attn_rope,
         layout_kv,
         layout_attend,
@@ -3385,6 +3436,35 @@ fn encode_matvec_q1(
     pass.set_pipeline(&c.q1);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((rows as u32).div_ceil(8).min(MAX_WG), 1, 1);
+}
+
+/// Encode a resident q1 GEMM (batched prefill): Y[k,rows] = X[k,cols] @ Wᵀ, all
+/// buffers already on the device. q1_mul_mm omits binding 2 (no row scale).
+#[allow(dead_code)] // wired by forward_batch_graph (batched prefill, in progress)
+fn encode_q1_mm(c: &Ctx, enc: &mut wgpu::CommandEncoder, weight: &wgpu::Buffer, xs: &wgpu::Buffer, y: &wgpu::Buffer, rows: usize, cols: usize, k: usize) {
+    let p_buf = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, k as u32, 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &c.layout_q1mm,
+        entries: &[bind_buf(0, weight), bind_buf(1, xs), bind_buf(3, y), bind_buf(4, &p_buf)],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+    pass.set_pipeline(&c.q1_mm);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((rows as u32).div_ceil(64).min(MAX_WG), (k as u32).div_ceil(64), 1);
+}
+
+/// Encode a resident q8 GEMM (int8 weight + per-row f32 scale) into `enc`.
+#[allow(dead_code)] // wired by forward_batch_graph (batched prefill, in progress)
+fn encode_q8_mm(c: &Ctx, enc: &mut wgpu::CommandEncoder, weight: &wgpu::Buffer, rs: &wgpu::Buffer, xs: &wgpu::Buffer, y: &wgpu::Buffer, rows: usize, cols: usize, k: usize) {
+    let p_buf = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, k as u32, 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &c.layout_mmm,
+        entries: &[bind_buf(0, weight), bind_buf(1, xs), bind_buf(2, rs), bind_buf(3, y), bind_buf(4, &p_buf)],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+    pass.set_pipeline(&c.mul_mm);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((rows as u32).div_ceil(64).min(MAX_WG), (k as u32).div_ceil(64), 1);
 }
 
 /// Encode a plain f32 matvec (small unquantized projections) into `enc`.
