@@ -1216,6 +1216,10 @@ struct Ctx {
     /// GDN recurrent state per (kv_id, layer): (conv ring, S), persists across
     /// decode tokens (created zeroed on first touch).
     gdn_state: Mutex<HashMap<(u64, usize), (wgpu::Buffer, wgpu::Buffer)>>,
+    /// Immutable [rows,cols,…] uniforms cached by content — the ~800 matvec
+    /// param buffers per token are token-invariant, so uploading them once
+    /// keeps them off the per-token encode critical path.
+    uniforms: Mutex<HashMap<[u32; 4], wgpu::Buffer>>,
 }
 
 struct KvMirror {
@@ -1456,6 +1460,7 @@ fn init() -> Result<Ctx, String> {
         resident: std::sync::atomic::AtomicU64::new(0),
         scratch: Mutex::new(Scratch::default()),
         weight_bufs: Mutex::new(HashMap::new()),
+        uniforms: Mutex::new(HashMap::new()),
         rs_bufs: Mutex::new(HashMap::new()),
         attn_kv: Mutex::new(HashMap::new()),
         gdn_state: Mutex::new(HashMap::new()),
@@ -3663,11 +3668,19 @@ fn storage_bytes(c: &Ctx, data: &[u8]) -> wgpu::Buffer {
 }
 
 fn uniform_u32x4(c: &Ctx, v: [u32; 4]) -> wgpu::Buffer {
-    c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    // Content-keyed cache: these params (rows/cols/flags) repeat every token,
+    // so build each once and clone the handle thereafter.
+    let mut u = c.uniforms.lock().unwrap();
+    if let Some(b) = u.get(&v) {
+        return b.clone();
+    }
+    let b = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
         contents: bytemuck::cast_slice(&v),
         usage: wgpu::BufferUsages::UNIFORM,
-    })
+    });
+    u.insert(v, b.clone());
+    b
 }
 
 fn rw_f32(c: &Ctx, n: usize, copy_src: bool) -> wgpu::Buffer {
