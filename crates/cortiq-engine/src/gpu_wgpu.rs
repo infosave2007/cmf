@@ -1885,35 +1885,55 @@ pub fn forward_token_graph(
         pass.dispatch_workgroups(g, 1, 1);
     };
     let flags = |qn: bool, kn: bool| (if qn { 2u32 } else { 0 }) | (if kn { 4 } else { 0 }) | (if gemma { 8 } else { 0 });
+    // Constant uniforms for the whole token (position is fixed for this call).
+    let rms_u = unif(&[hidden as u32, 0, eps.to_bits(), 0]);
+    let ax_u = unif(&[1.0f32.to_bits(), hidden as u32, 0, 0]);
+    let silu_u = unif(&[inter as u32, 0, 0, 0]);
+    let kv_u = unif(&[nkv as u32, hd as u32, cap as u32, position as u32]);
+    let at_u = unif(&[nh as u32, (nh / nkv) as u32, hd as u32, cap as u32, (position + 1) as u32, 0, 0, 0]);
+    // q1 matvec bind group (params buffer kept alive by the bind group).
+    let q1b = |w: &wgpu::Buffer, xs: &wgpu::Buffer, y: &wgpu::Buffer, rows: usize, cols: usize| {
+        let p = unif(&[(cols / 64) as u32, rows as u32, 0, 0]);
+        (bg(&c.layout_q1, &[w, xs, y, &p]), (rows as u32).min(MAX_WG))
+    };
+    // Run several dispatches of one pipeline in ONE pass — independent ops
+    // (QKV; gate+up) skip the inter-op memory barrier.
+    let pass_run = |enc: &mut wgpu::CommandEncoder, pipe: &wgpu::ComputePipeline, items: Vec<(wgpu::BindGroup, u32)>| {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        pass.set_pipeline(pipe);
+        for (b, g) in &items {
+            pass.set_bind_group(0, b, &[]);
+            pass.dispatch_workgroups(*g, 1, 1);
+        }
+    };
+    let dz = vec![0f32; hd];
     for (li, l) in layers.iter().enumerate() {
         let lw = &lws[li];
         let (kbuf, vbuf) = &kvbufs[li];
         let inw = stor(bytemuck::cast_slice(l.input_norm));
         let pnw = stor(bytemuck::cast_slice(l.post_norm));
-        let qnw = stor(bytemuck::cast_slice(l.q_norm.unwrap_or(&vec![0f32; hd])));
-        let knw = stor(bytemuck::cast_slice(l.k_norm.unwrap_or(&vec![0f32; hd])));
-        // 1. attn rmsnorm h -> n1
-        go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &inw, &n1, &unif(&[hidden as u32, 0, eps.to_bits(), 0])]), 1);
-        // 2. QKV
-        encode_matvec_q1(c, &mut enc, &lw.wq, &n1, &qraw, nh * hd, hidden);
-        encode_matvec_q1(c, &mut enc, &lw.wk, &n1, &kb, nkv * hd, hidden);
-        encode_matvec_q1(c, &mut enc, &lw.wv, &n1, &vb, nkv * hd, hidden);
-        // 3. rope + qk-norm
-        go(&mut enc, &c.attn_rope, &bg(&c.layout_attn_rope, &[&qraw, &kb, &qout, &gout, &qnw, &knw, &invf_b, &unif(&[nh as u32, nkv as u32, hd as u32, rd as u32, position as u32, flags(l.q_norm.is_some(), l.k_norm.is_some()), eps.to_bits(), 0])]), (nh + nkv) as u32);
-        // 4. kv_append + 5. attend
-        go(&mut enc, &c.kv_append, &bg(&c.layout_kv, &[&kb, &vb, kbuf, vbuf, &unif(&[nkv as u32, hd as u32, cap as u32, position as u32])]), ((nkv * hd) as u32).div_ceil(256));
-        go(&mut enc, &c.gqa_attend, &bg(&c.layout_attend, &[&qout, kbuf, vbuf, &attn, &unif(&[nh as u32, (nh / nkv) as u32, hd as u32, cap as u32, (position + 1) as u32, 0, 0, 0])]), nh as u32);
-        // 6. O + residual
-        encode_matvec_q1(c, &mut enc, &lw.wo, &attn, &ob, hidden, nh * hd);
-        go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&ob, &h_buf, &unif(&[1.0f32.to_bits(), hidden as u32, 0, 0])]), (hidden as u32).div_ceil(256));
-        // 7. FFN rmsnorm h -> n1
-        go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &pnw, &n1, &unif(&[hidden as u32, 0, eps.to_bits(), 0])]), 1);
-        // 8. gate/up -> silu·mul -> down + residual
-        encode_matvec_q1(c, &mut enc, &lw.gate, &n1, &gbuf, inter, hidden);
-        encode_matvec_q1(c, &mut enc, &lw.up, &n1, &ubuf, inter, hidden);
-        go(&mut enc, &c.silu, &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &unif(&[inter as u32, 0, 0, 0])]), (inter as u32).div_ceil(256));
-        encode_matvec_q1(c, &mut enc, &lw.down, &abuf, &ob, hidden, inter);
-        go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&ob, &h_buf, &unif(&[1.0f32.to_bits(), hidden as u32, 0, 0])]), (hidden as u32).div_ceil(256));
+        let qnw = stor(bytemuck::cast_slice(l.q_norm.unwrap_or(&dz)));
+        let knw = stor(bytemuck::cast_slice(l.k_norm.unwrap_or(&dz)));
+        let rope_u = unif(&[nh as u32, nkv as u32, hd as u32, rd as u32, position as u32, flags(l.q_norm.is_some(), l.k_norm.is_some()), eps.to_bits(), 0]);
+        go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &inw, &n1, &rms_u]), 1);
+        pass_run(&mut enc, &c.q1, vec![
+            q1b(&lw.wq, &n1, &qraw, nh * hd, hidden),
+            q1b(&lw.wk, &n1, &kb, nkv * hd, hidden),
+            q1b(&lw.wv, &n1, &vb, nkv * hd, hidden),
+        ]);
+        go(&mut enc, &c.attn_rope, &bg(&c.layout_attn_rope, &[&qraw, &kb, &qout, &gout, &qnw, &knw, &invf_b, &rope_u]), (nh + nkv) as u32);
+        go(&mut enc, &c.kv_append, &bg(&c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]), ((nkv * hd) as u32).div_ceil(256));
+        go(&mut enc, &c.gqa_attend, &bg(&c.layout_attend, &[&qout, kbuf, vbuf, &attn, &at_u]), nh as u32);
+        pass_run(&mut enc, &c.q1, vec![q1b(&lw.wo, &attn, &ob, hidden, nh * hd)]);
+        go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&ob, &h_buf, &ax_u]), (hidden as u32).div_ceil(256));
+        go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &pnw, &n1, &rms_u]), 1);
+        pass_run(&mut enc, &c.q1, vec![
+            q1b(&lw.gate, &n1, &gbuf, inter, hidden),
+            q1b(&lw.up, &n1, &ubuf, inter, hidden),
+        ]);
+        go(&mut enc, &c.silu, &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]), (inter as u32).div_ceil(256));
+        pass_run(&mut enc, &c.q1, vec![q1b(&lw.down, &abuf, &ob, hidden, inter)]);
+        go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&ob, &h_buf, &ax_u]), (hidden as u32).div_ceil(256));
     }
     let size = (hidden * 4) as u64;
     let t_enc = t_enc0.elapsed().as_secs_f64() * 1000.0;

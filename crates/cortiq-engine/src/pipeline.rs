@@ -1057,10 +1057,14 @@ impl Pipeline {
         // Speculative decode is off under o1: a rejected draft can't be
         // rolled back out of the far accumulators / ring window (the
         // Nyström insertion is irreversible by design).
+        // The wgpu token graph owns a device K/V mirror that speculative
+        // rollback would desync — the two are mutually exclusive.
+        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH").map(|v| v != "0").unwrap_or(false);
         let spec_active = self.speculative
             && self.mtp.is_some()
             && task_mask.is_none()
             && !self.o1_active()
+            && !graph_on
             && self.sampler_config.temperature < 1e-6;
         // The MTP module is detached during generation so its mutable
         // state does not fight the borrow on `self`.
@@ -2398,6 +2402,11 @@ impl Pipeline {
     /// layer Full q1 + dense q1 FFN, no gate/bias). Returns the post-stack
     /// hidden (caller does final norm + lm_head), or None to fall back.
     fn try_token_graph_wgpu(&self, hidden: &[f32], position: usize) -> Option<Vec<f32>> {
+        // O(1) Nyström decode runs off the sealed state, not the KV cache the
+        // graph mirrors — never take the graph while o1 is active.
+        if self.o1_active() {
+            return None;
+        }
         let nh = self.num_heads;
         let (nkv, hd, rd) = self.layer_geom(0);
         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
