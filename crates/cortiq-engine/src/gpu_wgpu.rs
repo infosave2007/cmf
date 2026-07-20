@@ -1690,6 +1690,115 @@ fn encode_matvec(
     pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
 }
 
+/// q1 cousin of `encode_matvec`: the q1 pipeline + `layout_q1` (4 bindings,
+/// no row-scale — q1 carries its scales inside the tiles). params = the
+/// `dispatch_q1` layout `[gpr/2, rows, 0, 0]`. Lets q1 QKV share one encoder.
+fn encode_matvec_q1(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+) {
+    let gpr = cols / 32;
+    let p_buf = uniform_u32x4(c, [(gpr / 2) as u32, rows as u32, 0, 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.layout_q1,
+        entries: &[
+            bind_buf(0, weight),
+            bind_buf(1, xs),
+            bind_buf(2, y),
+            bind_buf(3, &p_buf),
+        ],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.q1);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+}
+
+/// q1 batched matvec: N q1 projections (e.g. QKV) in ONE submit + one
+/// readback — the chain-fusion that `matvec_batch` does for q8, now for
+/// 1-bit weights. Bails to `false` (→ CPU) on any budget/shape refusal so
+/// the caller's fallback stays intact.
+fn matvec_batch_q1(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f32]]) -> bool {
+    let Some(c) = ctx() else { return false };
+    let bytes = model.primary_bytes();
+    // Resident weight per job (VRAM cache; over-budget/oob → honest CPU).
+    let mut weights = Vec::with_capacity(jobs.len());
+    for j in jobs {
+        let gpr = j.cols / 32;
+        if j.rows == 0 || j.cols % 32 != 0 || gpr % 2 != 0 || j.xs.len() < j.cols {
+            return false;
+        }
+        let entry = &model.tensors[j.idx];
+        if entry.shape.first().copied().unwrap_or(0) < j.rows {
+            return false;
+        }
+        let Some(abs) = model.entry_abs_offset(entry) else {
+            return false;
+        };
+        let plen = j.rows * gpr * 6;
+        if abs + plen > bytes.len() {
+            return false;
+        }
+        let Some(w) = weight_buffer(c, (bytes.as_ptr() as usize, j.idx), &bytes[abs..abs + plen])
+        else {
+            return false;
+        };
+        weights.push(w);
+    }
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("q1-batch") });
+    let mut y_bufs = Vec::with_capacity(jobs.len());
+    for (j, w) in jobs.iter().zip(&weights) {
+        let xs_b = storage_bytes(c, bytemuck::cast_slice(&j.xs[..j.cols]));
+        let y_b = rw_f32(c, j.rows, true);
+        encode_matvec_q1(c, &mut enc, w, &xs_b, &y_b, j.rows, j.cols);
+        y_bufs.push(y_b);
+    }
+    // ONE pooled staging buffer for all outputs, one map (mirror the q8 path).
+    let total: u64 = jobs.iter().map(|j| (j.rows * 4) as u64).sum();
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        total,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "q1-batch-stage",
+    );
+    let mut off = 0u64;
+    for (y_b, j) in y_bufs.iter().zip(jobs) {
+        enc.copy_buffer_to_buffer(y_b, 0, &stage, off, (j.rows * 4) as u64);
+        off += (j.rows * 4) as u64;
+    }
+    c.queue.submit(Some(enc.finish()));
+    stage.slice(..total).map_async(wgpu::MapMode::Read, |_| {});
+    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return false;
+    }
+    {
+        let Ok(data) = stage.slice(..total).get_mapped_range() else {
+            return false;
+        };
+        let mut off = 0usize;
+        for (j, o) in jobs.iter().zip(out.iter_mut()) {
+            o[..j.rows].copy_from_slice(bytemuck::cast_slice(&data[off..off + j.rows * 4]));
+            off += j.rows * 4;
+        }
+    }
+    stage.unmap();
+    drop(sc);
+    true
+}
+
 /// Layer MoE-FFN in a single submission: for each expert gate/up-matvec →
 /// silu·mul·col_down → down-matvec → y += w·d. Intermediate buffers are
 /// GPU-resident, one sync per layer.
@@ -1842,6 +1951,16 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
 pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f32]]) -> bool {
     let Some(c) = ctx() else { return false };
     if jobs.is_empty() || jobs.len() != out.len() {
+        return false;
+    }
+    // q1 jobs carry tile-embedded scales (empty row_scale) and need the q1
+    // pipeline — route the whole batch to the q1 encoder. Mixed batches
+    // (shouldn't happen: QKV share a dtype) fall to the CPU path.
+    let n_q1 = jobs.iter().filter(|j| j.q1).count();
+    if n_q1 == jobs.len() {
+        return matvec_batch_q1(model, jobs, out);
+    }
+    if n_q1 != 0 {
         return false;
     }
     let mut weights = Vec::with_capacity(jobs.len());
