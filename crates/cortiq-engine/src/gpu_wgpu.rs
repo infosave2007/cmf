@@ -1617,6 +1617,126 @@ pub fn gqa_attend_gpu(
     ok
 }
 
+/// One full attention sub-block resident on the GPU in a SINGLE command
+/// encoder: rmsnorm → QKV (q1) → rope/qk-norm → kv_append → attend → O (q1)
+/// → residual. The K/V cache lives on the device ([nkv,cap,hd]) and persists
+/// across tokens; only the updated hidden is read back. This is the token
+/// graph's attention half — it collapses ~6 per-op submits into one.
+/// `flags` follows attn_rope_qkn (2=qnorm 4=knorm 8=gemma; gate unsupported
+/// here). Weights are raw q1 payloads (bring-up path; production keys the
+/// resident VRAM cache). Returns false without a GPU context.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_block_gpu(
+    h_in: &[f32],
+    attn_norm_w: &[f32],
+    wq: &[u8],
+    wk: &[u8],
+    wv: &[u8],
+    wo: &[u8],
+    qnw: &[f32],
+    knw: &[f32],
+    invf: &[f32],
+    kbuf: &wgpu::Buffer,
+    vbuf: &wgpu::Buffer,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rd: usize,
+    hidden: usize,
+    cap: usize,
+    stored: usize,
+    flags: u32,
+    eps: f32,
+    h_out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let unif = |data: &[u32]| {
+        c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("blk-u"),
+            contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::UNIFORM,
+        })
+    };
+    let stor = |data: &[u8]| {
+        c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("blk-w"),
+            contents: data,
+            usage: wgpu::BufferUsages::STORAGE,
+        })
+    };
+    // Resident buffers.
+    let h_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("blk-h"),
+        contents: bytemuck::cast_slice(&h_in[..hidden]),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+    let normw_b = stor(bytemuck::cast_slice(&attn_norm_w[..hidden]));
+    let normed_b = rw_f32(c, hidden, false);
+    let wq_b = stor(wq);
+    let wk_b = stor(wk);
+    let wv_b = stor(wv);
+    let wo_b = stor(wo);
+    let qraw_b = rw_f32(c, nh * hd, false);
+    let k_b = rw_f32(c, nkv * hd, false);
+    let v_b = rw_f32(c, nkv * hd, false);
+    let qout_b = rw_f32(c, nh * hd, false);
+    let gout_b = rw_f32(c, nh * hd, false);
+    let qnw_b = stor(bytemuck::cast_slice(qnw));
+    let knw_b = stor(bytemuck::cast_slice(knw));
+    let invf_b = stor(bytemuck::cast_slice(invf));
+    let attn_b = rw_f32(c, nh * hd, false);
+    let o_b = rw_f32(c, hidden, false);
+    let bg = |layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| {
+        let entries: Vec<wgpu::BindGroupEntry> =
+            bufs.iter().enumerate().map(|(i, b)| bind_buf(i as u32, b)).collect();
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &entries })
+    };
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("attn-block") });
+    let dispatch = |enc: &mut wgpu::CommandEncoder, pipe: &wgpu::ComputePipeline, bind: &wgpu::BindGroup, groups: u32| {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, bind, &[]);
+        pass.dispatch_workgroups(groups, 1, 1);
+    };
+    // 1. rmsnorm(h) -> normed
+    let rms_p = unif(&[hidden as u32, 0, eps.to_bits(), 0]);
+    dispatch(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &normw_b, &normed_b, &rms_p]), 1);
+    // 2. QKV (q1) from normed
+    encode_matvec_q1(c, &mut enc, &wq_b, &normed_b, &qraw_b, nh * hd, hidden);
+    encode_matvec_q1(c, &mut enc, &wk_b, &normed_b, &k_b, nkv * hd, hidden);
+    encode_matvec_q1(c, &mut enc, &wv_b, &normed_b, &v_b, nkv * hd, hidden);
+    // 3. rope + qk-norm
+    let rq_p = unif(&[nh as u32, nkv as u32, hd as u32, rd as u32, stored as u32, flags, eps.to_bits(), 0]);
+    dispatch(&mut enc, &c.attn_rope, &bg(&c.layout_attn_rope, &[&qraw_b, &k_b, &qout_b, &gout_b, &qnw_b, &knw_b, &invf_b, &rq_p]), (nh + nkv) as u32);
+    // 4. kv_append
+    let kv_p = unif(&[nkv as u32, hd as u32, cap as u32, stored as u32]);
+    let kv_groups = ((nkv * hd) as u32).div_ceil(256);
+    dispatch(&mut enc, &c.kv_append, &bg(&c.layout_kv, &[&k_b, &v_b, kbuf, vbuf, &kv_p]), kv_groups);
+    // 5. attend
+    let at_p = unif(&[nh as u32, (nh / nkv) as u32, hd as u32, cap as u32, (stored + 1) as u32, 0, 0, 0]);
+    dispatch(&mut enc, &c.gqa_attend, &bg(&c.layout_attend, &[&qout_b, kbuf, vbuf, &attn_b, &at_p]), nh as u32);
+    // 6. O (q1)
+    encode_matvec_q1(c, &mut enc, &wo_b, &attn_b, &o_b, hidden, nh * hd);
+    // 7. residual h += o
+    let ax_p = unif(&[1.0f32.to_bits(), hidden as u32, 0, 0]);
+    dispatch(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&o_b, &h_buf, &ax_p]), (hidden as u32).div_ceil(256));
+    // readback updated hidden
+    let size = (hidden * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "blk-stage",
+    );
+    let ok = readback(c, enc, &h_buf, &stage, size, &mut h_out[..hidden]);
+    drop(sc);
+    ok
+}
+
 /// q1 kernel body (weight_key = None — no residency cache; test path).
 fn dispatch_q1(
     c: &Ctx,
@@ -2794,6 +2914,131 @@ mod tests {
         assert!(gqa_attend_gpu(&q, &kc, &vc, nh, hpk, hd, cap, n, &mut got));
         let md = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(md < 1e-4, "wgpu gqa_attend ≠ CPU: max|Δ| = {md}");
+    }
+
+    // Build a deterministic q1 payload for a [rows, cols] weight + its dequant.
+    #[cfg(test)]
+    fn mk_q1(rows: usize, cols: usize, seed: usize) -> (Vec<u8>, Vec<f32>) {
+        let gpr = cols / 32;
+        let mut payload = Vec::new();
+        for t in 0..rows * gpr {
+            let sc = 0.004 + ((t + seed) % 9) as f32 * 0.003;
+            payload.extend_from_slice(&cortiq_core::quant::f32_to_f16(sc).to_le_bytes());
+            for j in 0..4 {
+                payload.push(((t * 37 + j * 53 + seed * 7 + 11) % 251) as u8);
+            }
+        }
+        let mut w = vec![0f32; rows * cols];
+        cortiq_core::quant::dequant_q1(&payload, &mut w);
+        (payload, w)
+    }
+
+    #[test]
+    fn wgpu_attn_block_matches_cpu() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping attn_block test");
+            return;
+        };
+        let (nh, nkv, hd, rd, hidden, cap, stored) = (4usize, 2usize, 64usize, 64usize, 128usize, 8usize, 2usize);
+        let hpk = nh / nkv;
+        let eps = 1e-6f32;
+        let flags = 2u32 | 4u32; // qnorm + knorm, no gate
+        let jit = |a: usize, b: usize| ((a * 31 + b * 17 + 3) % 83) as f32 / 83.0 - 0.5;
+        let h_in: Vec<f32> = (0..hidden).map(|i| jit(i, 1)).collect();
+        let norm_w: Vec<f32> = (0..hidden).map(|i| 0.8 + jit(i, 2)).collect();
+        let (wq_p, wq) = mk_q1(nh * hd, hidden, 1);
+        let (wk_p, wk) = mk_q1(nkv * hd, hidden, 2);
+        let (wv_p, wv) = mk_q1(nkv * hd, hidden, 3);
+        let (wo_p, wo) = mk_q1(hidden, nh * hd, 4);
+        let qnw: Vec<f32> = (0..hd).map(|d| 0.7 + jit(d, 5)).collect();
+        let knw: Vec<f32> = (0..hd).map(|d| 0.7 + jit(d, 6)).collect();
+        let invf: Vec<f32> = (0..rd / 2).map(|i| 1.0 / (10000f32).powf(2.0 * i as f32 / rd as f32)).collect();
+        // Pre-filled device K/V caches [nkv, cap, hd] (first `stored` rows valid).
+        let mut kc = vec![0f32; nkv * cap * hd];
+        let mut vc = vec![0f32; nkv * cap * hd];
+        for kh in 0..nkv {
+            for p in 0..stored {
+                for d in 0..hd {
+                    kc[(kh * cap + p) * hd + d] = jit(kh * 900 + p * 30 + d, 7);
+                    vc[(kh * cap + p) * hd + d] = jit(kh * 900 + p * 30 + d, 8);
+                }
+            }
+        }
+        let mkcache = |data: &[f32]| {
+            c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("cache"),
+                contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let kbuf = mkcache(&kc);
+        let vbuf = mkcache(&vc);
+        // ---- CPU reference ----
+        let ss: f32 = h_in.iter().map(|x| x * x).sum();
+        let rinv = 1.0 / (ss / hidden as f32 + eps).sqrt();
+        let normed: Vec<f32> = (0..hidden).map(|i| h_in[i] * rinv * norm_w[i]).collect();
+        let matvec = |w: &[f32], rows: usize, cols: usize, x: &[f32]| -> Vec<f32> {
+            (0..rows).map(|o| (0..cols).map(|i| w[o * cols + i] * x[i]).sum()).collect()
+        };
+        let qraw = matvec(&wq, nh * hd, hidden, &normed);
+        let kv_k = matvec(&wk, nkv * hd, hidden, &normed);
+        let kv_v = matvec(&wv, nkv * hd, hidden, &normed);
+        let norm_rope = |v: &mut [f32], w: &[f32]| {
+            let s: f32 = v.iter().map(|x| x * x).sum();
+            let inv = 1.0 / (s / hd as f32 + eps).sqrt();
+            for d in 0..hd {
+                v[d] = v[d] * inv * w[d];
+            }
+            for i in 0..rd / 2 {
+                let ang = stored as f32 * invf[i];
+                let (co, si) = (ang.cos(), ang.sin());
+                let (x0, x1) = (v[i], v[i + rd / 2]);
+                v[i] = x0 * co - x1 * si;
+                v[i + rd / 2] = x0 * si + x1 * co;
+            }
+        };
+        let mut qout = vec![0f32; nh * hd];
+        for h in 0..nh {
+            let mut q = qraw[h * hd..(h + 1) * hd].to_vec();
+            norm_rope(&mut q, &qnw);
+            qout[h * hd..(h + 1) * hd].copy_from_slice(&q);
+        }
+        for kh in 0..nkv {
+            let mut kk = kv_k[kh * hd..(kh + 1) * hd].to_vec();
+            norm_rope(&mut kk, &knw);
+            kc[(kh * cap + stored) * hd..(kh * cap + stored) * hd + hd].copy_from_slice(&kk);
+            vc[(kh * cap + stored) * hd..(kh * cap + stored) * hd + hd]
+                .copy_from_slice(&kv_v[kh * hd..(kh + 1) * hd]);
+        }
+        let n = stored + 1;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut attn = vec![0f32; nh * hd];
+        for h in 0..nh {
+            let kh = h / hpk;
+            let mut sc: Vec<f32> = (0..n)
+                .map(|p| (0..hd).map(|d| qout[h * hd + d] * kc[(kh * cap + p) * hd + d]).sum::<f32>() * scale)
+                .collect();
+            let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+            let mut den = 0.0;
+            for s in sc.iter_mut() {
+                *s = (*s - mx).exp();
+                den += *s;
+            }
+            for d in 0..hd {
+                attn[h * hd + d] = (0..n).map(|p| sc[p] * vc[(kh * cap + p) * hd + d]).sum::<f32>() / den;
+            }
+        }
+        let o = matvec(&wo, hidden, nh * hd, &attn);
+        let want: Vec<f32> = (0..hidden).map(|i| h_in[i] + o[i]).collect();
+        // ---- GPU block ----
+        let mut got = vec![0f32; hidden];
+        assert!(attn_block_gpu(
+            &h_in, &norm_w, &wq_p, &wk_p, &wv_p, &wo_p, &qnw, &knw, &invf,
+            &kbuf, &vbuf, nh, nkv, hd, rd, hidden, cap, stored, flags, eps, &mut got,
+        ));
+        let md = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(md < 2e-3, "wgpu attn_block ≠ CPU: max|Δ| = {md}");
     }
 
     #[test]
