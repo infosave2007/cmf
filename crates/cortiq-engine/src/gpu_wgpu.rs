@@ -161,14 +161,14 @@ fn q1_tile_sum(bits: u32, xbase: u32) -> f32 {
     return s.x + s.y + s.z + s.w;
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(128)
 fn q1_matvec(@builtin(workgroup_id) wid: vec3<u32>,
              @builtin(num_workgroups) nwg: vec3<u32>,
              @builtin(local_invocation_index) lid: u32) {
     let cols = q1p.np * 64u;
-    let r = lid / 16u;      // which of the 16 rows this thread serves
+    let r = lid / 16u;      // which of the 8 rows this thread serves
     let lane = lid % 16u;   // which tile-pair lane within a column tile
-    var row0 = wid.x * 16u;
+    var row0 = wid.x * 8u;
     loop {
         if (row0 >= q1p.rows) { break; }
         let row = row0 + r;
@@ -183,7 +183,7 @@ fn q1_matvec(@builtin(workgroup_id) wid: vec3<u32>,
                 if (k >= 1024u) { break; }
                 let c = c0 + k;
                 q1xs[k] = select(0.0, q1x[c], c < cols);
-                k = k + 256u;
+                k = k + 128u;
             }
             workgroupBarrier();
             let pi = ti + lane;            // this lane's tile-pair
@@ -212,7 +212,7 @@ fn q1_matvec(@builtin(workgroup_id) wid: vec3<u32>,
         workgroupBarrier();
         if (lane == 0u && row < q1p.rows) { q1y[row] = partial_q1[lid]; }
         workgroupBarrier();
-        row0 = row0 + nwg.x * 16u;
+        row0 = row0 + nwg.x * 8u;
     }
 }
 
@@ -2775,7 +2775,7 @@ fn dispatch_q1(
         });
         pass.set_pipeline(&c.q1);
         pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups((rows as u32).div_ceil(16).min(MAX_WG), 1, 1);
+        pass.dispatch_workgroups((rows as u32).div_ceil(8).min(MAX_WG), 1, 1);
     }
     let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..rows]);
     drop(sc);
@@ -3238,7 +3238,7 @@ fn encode_matvec_q1(
     });
     pass.set_pipeline(&c.q1);
     pass.set_bind_group(0, &bind, &[]);
-    pass.dispatch_workgroups((rows as u32).div_ceil(16).min(MAX_WG), 1, 1);
+    pass.dispatch_workgroups((rows as u32).div_ceil(8).min(MAX_WG), 1, 1);
 }
 
 /// Encode a plain f32 matvec (small unquantized projections) into `enc`.
