@@ -1183,9 +1183,11 @@ impl Pipeline {
         // positions per submit — projections/FFN as GEMMs (weight once per K),
         // attention/GDN looped inside — instead of one whole-graph submit per
         // position. Falls through to the per-position graph on any refusal.
-        if graph_prefill && task_mask.is_none() && mtp.is_none() && !dyn_prefill && pos + 1 < input_ids.len() {
+        // CMF_BATCH_K=0 disables batching (per-position graph baseline for A/B).
+        let batch_k = std::env::var("CMF_BATCH_K").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256);
+        if batch_k > 0 && graph_prefill && task_mask.is_none() && mtp.is_none() && !dyn_prefill && pos + 1 < input_ids.len() {
             let hs = self.hidden_size;
-            let chunk = std::env::var("CMF_BATCH_K").ok().and_then(|v| v.parse().ok()).unwrap_or(32usize).max(1);
+            let chunk = batch_k;
             while pos < input_ids.len() {
                 let end = (pos + chunk).min(input_ids.len());
                 let bk = end - pos;
