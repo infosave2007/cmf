@@ -301,6 +301,92 @@ fn q8_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// Tiled q1 GEMM for wide batches (prefill / speculative K-token decode): the
+// q1 twin of q8_mul_mm. Reuses the mul_mm bindings (rsm is unused — q1's scale
+// is per-32-group and folded into the staged weight). Decode a 4-wide run of
+// weights for one output row: 4 cols in one 32-group share a bit-word + scale;
+// bit set → +scale, clear → −scale (XOR the sign bit). cols4 = cols/4, so the
+// row has np = cols4/16 six-byte tile-pairs (64 cols each, 2 groups of 32).
+fn q1_w4(n: u32, k: u32, np: u32) -> vec4<f32> {
+    let pi = k / 64u;
+    let off = k % 64u;                 // 4-aligned ⇒ never straddles a 32-group
+    let base = n * np * 3u + pi * 3u;
+    let a0 = qm[base]; let a1 = qm[base + 1u]; let a2 = qm[base + 2u];
+    var bits: u32;
+    var scale: f32;
+    if (off < 32u) { bits = (a0 >> 16u) | (a1 << 16u); scale = unpack2x16float(a0).x; }
+    else           { bits = a2;                        scale = unpack2x16float(a1).y; }
+    let bo = off & 31u;
+    let m = vec4<u32>(
+        (((bits >> bo)        & 1u) ^ 1u) << 31u,
+        (((bits >> (bo + 1u)) & 1u) ^ 1u) << 31u,
+        (((bits >> (bo + 2u)) & 1u) ^ 1u) << 31u,
+        (((bits >> (bo + 3u)) & 1u) ^ 1u) << 31u);
+    let sv = vec4<f32>(scale, scale, scale, scale);
+    return bitcast<vec4<f32>>(bitcast<vec4<u32>>(sv) ^ m);
+}
+
+@compute @workgroup_size(16, 16)
+fn q1_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
+             @builtin(local_invocation_id) lid: vec3<u32>) {
+    let cols = pm.cols4 * 4u;
+    let np = pm.cols4 / 16u;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    let tid = lid.y * 16u + lid.x;
+    var acc: array<array<f32, 4>, 4>;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        for (var j = 0u; j < 4u; j = j + 1u) { acc[i][j] = 0.0; }
+    }
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        for (var t = tid; t < 64u * 4u; t = t + 256u) {
+            let m = t / 4u;
+            let k4 = t % 4u;
+            var xv = vec4<f32>(0.0);
+            if (m0 + m < pm.nb && (k0 / 4u) + k4 < pm.cols4) {
+                let xi = (m0 + m) * cols + k0 + k4 * 4u;
+                xv = vec4<f32>(xsm[xi], xsm[xi + 1u], xsm[xi + 2u], xsm[xi + 3u]);
+            }
+            let dst = m * 16u + k4 * 4u;
+            mm_at[dst] = xv.x; mm_at[dst + 1u] = xv.y; mm_at[dst + 2u] = xv.z; mm_at[dst + 3u] = xv.w;
+        }
+        for (var t = tid; t < 64u * 4u; t = t + 256u) {
+            let n = t / 4u;
+            let k4 = t % 4u;
+            var wv = vec4<f32>(0.0);
+            if (n0 + n < pm.rows && (k0 / 4u) + k4 < pm.cols4) {
+                wv = q1_w4(n0 + n, k0 + k4 * 4u, np);
+            }
+            let dst = n * 16u + k4 * 4u;
+            mm_wt[dst] = wv.x; mm_wt[dst + 1u] = wv.y; mm_wt[dst + 2u] = wv.z; mm_wt[dst + 3u] = wv.w;
+        }
+        workgroupBarrier();
+        for (var k = 0u; k < 16u; k = k + 1u) {
+            var av: array<f32, 4>;
+            var wv: array<f32, 4>;
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                av[i] = mm_at[(lid.y * 4u + i) * 16u + k];
+                wv[i] = mm_wt[(lid.x * 4u + i) * 16u + k];
+            }
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                for (var j = 0u; j < 4u; j = j + 1u) { acc[i][j] = acc[i][j] + av[i] * wv[j]; }
+            }
+        }
+        workgroupBarrier();
+        k0 = k0 + 16u;
+    }
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let m = m0 + lid.y * 4u + i;
+        if (m >= pm.nb) { continue; }
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            let n = n0 + lid.x * 4u + j;
+            if (n < pm.rows) { ym[m * pm.rows + n] = acc[i][j]; }
+        }
+    }
+}
+
 // ── Element-wise kernels of the MoE block (silu·mul·col, axpy, zeroing) ──
 struct N1 { n: u32, f: u32, _b: u32, _c: u32 };
 
@@ -1023,6 +1109,7 @@ struct Ctx {
     matvec: wgpu::ComputePipeline,
     matmat: wgpu::ComputePipeline,
     mul_mm: wgpu::ComputePipeline,
+    q1_mm: wgpu::ComputePipeline,
     silu: wgpu::ComputePipeline,
     axpy: wgpu::ComputePipeline,
     gate_mul: wgpu::ComputePipeline,
@@ -1043,6 +1130,7 @@ struct Ctx {
     layout: wgpu::BindGroupLayout,
     layout_mm: wgpu::BindGroupLayout,
     layout_mmm: wgpu::BindGroupLayout,
+    layout_q1mm: wgpu::BindGroupLayout,
     layout_silu: wgpu::BindGroupLayout,
     layout_axpy: wgpu::BindGroupLayout,
     layout_gate_mul: wgpu::BindGroupLayout,
@@ -1235,6 +1323,7 @@ fn init() -> Result<Ctx, String> {
     let matvec = pipe("q8_matvec");
     let matmat = pipe("q8_matmat");
     let mul_mm = pipe("q8_mul_mm");
+    let q1_mm = pipe("q1_mul_mm");
     let silu = pipe("silu_mul_pre");
     let axpy = pipe("axpy");
     let gate_mul = pipe("gate_mul");
@@ -1264,6 +1353,7 @@ fn init() -> Result<Ctx, String> {
     let layout_f32 = f32_matvec.get_bind_group_layout(0);
     let layout_mm = matmat.get_bind_group_layout(0);
     let layout_mmm = mul_mm.get_bind_group_layout(0);
+    let layout_q1mm = q1_mm.get_bind_group_layout(0);
     let layout_silu = silu.get_bind_group_layout(0);
     let layout_axpy = axpy.get_bind_group_layout(0);
     let layout_gate_mul = gate_mul.get_bind_group_layout(0);
@@ -1275,6 +1365,7 @@ fn init() -> Result<Ctx, String> {
         matvec,
         matmat,
         mul_mm,
+        q1_mm,
         silu,
         axpy,
         gate_mul,
@@ -1295,6 +1386,7 @@ fn init() -> Result<Ctx, String> {
         layout,
         layout_mm,
         layout_mmm,
+        layout_q1mm,
         layout_silu,
         layout_axpy,
         layout_gate_mul,
@@ -4500,5 +4592,79 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_d < 1e-3, "wgpu q8_mul_mm ≠ CPU: max|Δ| = {max_d}");
+    }
+
+    // Tiled q1 GEMM on an awkward shape (rows/batch not 64-multiples, cols a
+    // 64-multiple as the format requires): the prefill / speculative-batch path.
+    #[test]
+    fn wgpu_q1_mul_mm_matches_cpu_reference() {
+        use cortiq_core::quant::{f16_to_f32, f32_to_f16};
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping q1_mul_mm test");
+            return;
+        };
+        let (rows, cols, b) = (100usize, 128usize, 70usize); // cols % 64 == 0
+        let np = cols / 64;
+        let jit = |a: usize| ((a * 2654435761usize) >> 13) as u32; // cheap hash → bits
+        // Build the q1 weight blob + a decoded f32 reference weight in lock-step.
+        let mut q1w = vec![0u32; rows * np * 3];
+        let mut wref = vec![0f32; rows * cols];
+        for o in 0..rows {
+            for pi in 0..np {
+                let s0 = 0.02 + ((o * 7 + pi) % 11) as f32 * 0.005;
+                let s1 = 0.03 + ((o * 3 + pi * 5) % 9) as f32 * 0.004;
+                let (h0, h1) = (f32_to_f16(s0), f32_to_f16(s1));
+                let (sf0, sf1) = (f16_to_f32(h0), f16_to_f32(h1));
+                let bits0 = jit(o * 131 + pi * 17 + 1);
+                let bits1 = jit(o * 131 + pi * 17 + 2);
+                let base = o * np * 3 + pi * 3;
+                q1w[base] = (h0 as u32) | ((bits0 & 0xFFFF) << 16);
+                q1w[base + 1] = (bits0 >> 16) | ((h1 as u32) << 16);
+                q1w[base + 2] = bits1;
+                for j in 0..32usize {
+                    let sgn0 = if (bits0 >> j) & 1 != 0 { sf0 } else { -sf0 };
+                    let sgn1 = if (bits1 >> j) & 1 != 0 { sf1 } else { -sf1 };
+                    wref[o * cols + pi * 64 + j] = sgn0;
+                    wref[o * cols + pi * 64 + 32 + j] = sgn1;
+                }
+            }
+        }
+        let x: Vec<f32> = (0..b * cols).map(|i| ((i % 23) as f32 - 11.0) * 0.03).collect();
+        let mut want = vec![0f32; b * rows];
+        for bi in 0..b {
+            for o in 0..rows {
+                let mut acc = 0f32;
+                for i in 0..cols {
+                    acc += wref[o * cols + i] * x[bi * cols + i];
+                }
+                want[bi * rows + o] = acc;
+            }
+        }
+        // GPU dispatch (inline — q1_mm is not yet wired into a public entry).
+        let qbuf = storage_bytes(c, bytemuck::cast_slice(&q1w));
+        let xbuf = storage_bytes(c, bytemuck::cast_slice(&x));
+        let ybuf = rw_f32(c, b * rows, true);
+        let pbuf = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, b as u32, 0]);
+        // q1_mul_mm never reads rs → its auto layout omits binding 2.
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.layout_q1mm,
+            entries: &[bind_buf(0, &qbuf), bind_buf(1, &xbuf), bind_buf(3, &ybuf), bind_buf(4, &pbuf)],
+        });
+        let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            pass.set_pipeline(&c.q1_mm);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups((rows as u32).div_ceil(64), (b as u32).div_ceil(64), 1);
+        }
+        let mut sc = c.scratch.lock().unwrap();
+        let stage = Scratch::ensure(&c.device, &mut sc.stage, (b * rows * 4) as u64, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "q1mm-stage");
+        let mut got = vec![0f32; b * rows];
+        assert!(readback(c, enc, &ybuf, &stage, (b * rows * 4) as u64, &mut got));
+        drop(sc);
+        let max_d = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_d < 1e-3, "wgpu q1_mul_mm ≠ CPU: max|Δ| = {max_d}");
     }
 }
