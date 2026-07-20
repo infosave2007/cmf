@@ -510,50 +510,68 @@ struct AtP { nh: u32, hpk: u32, hd: u32, cap: u32, n: u32, _a: u32, _b: u32, _c:
 @group(0) @binding(2) var<storage, read>       at_v : array<f32>;
 @group(0) @binding(3) var<storage, read_write> at_o : array<f32>;
 @group(0) @binding(4) var<uniform>             at_p : AtP;
-var<workgroup> at_red: array<f32, 32>;
+// Flash-decoding: split the n cached positions across the 32 lanes. Each lane
+// runs an INDEPENDENT online softmax over positions lane, lane+32, … with NO
+// barrier in the loop (the old kernel barriered twice PER position — O(ctx)
+// serial chain), then a 5-step 32-way log-sum-exp merge. Serial steps: n → n/32.
+var<workgroup> at_acc: array<f32, 4128>; // [lane*129 + d], stride 129 dodges 32-bank conflicts, hd ≤ 128
+var<workgroup> at_m: array<f32, 32>;
+var<workgroup> at_l: array<f32, 32>;
 @compute @workgroup_size(32)
 fn gqa_attend(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let h = wid.x;
     let lane = lid.x;
     if (h >= at_p.nh) { return; }
     let hd = at_p.hd;
+    let n = at_p.n;
     let kbase = (h / at_p.hpk) * at_p.cap * hd;
+    let qbase = h * hd;
     let scale = 1.0 / sqrt(f32(hd));
-    let nt = (hd + 31u) / 32u;
-    var qv: array<f32, 4>;
-    for (var t = 0u; t < nt; t = t + 1u) {
-        let d = t * 32u + lane;
-        qv[t] = select(0.0, at_q[h * hd + d] * scale, d < hd);
-    }
+    let base = lane * 129u;
+    for (var d = 0u; d < hd; d = d + 1u) { at_acc[base + d] = 0.0; }
     var m = -1e30;
     var l = 0.0;
-    var acc = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
-    for (var p = 0u; p < at_p.n; p = p + 1u) {
-        let row = kbase + p * hd;
-        var partial = 0.0;
-        for (var t = 0u; t < nt; t = t + 1u) {
-            let d = t * 32u + lane;
-            if (d < hd) { partial = partial + qv[t] * at_k[row + d]; }
-        }
-        at_red[lane] = partial;
-        workgroupBarrier();
-        var s = 0.0;
-        for (var j = 0u; j < 32u; j = j + 1u) { s = s + at_red[j]; }
-        workgroupBarrier();
-        let mp = max(m, s);
+    var p = lane;
+    loop {
+        if (p >= n) { break; }
+        let krow = kbase + p * hd;
+        var dot = 0.0;
+        for (var d = 0u; d < hd; d = d + 1u) { dot = dot + at_q[qbase + d] * at_k[krow + d]; }
+        dot = dot * scale;
+        let mp = max(m, dot);
         let f = exp(m - mp);
-        let w = exp(s - mp);
+        let w = exp(dot - mp);
         l = l * f + w;
-        for (var t = 0u; t < nt; t = t + 1u) {
-            let d = t * 32u + lane;
-            if (d < hd) { acc[t] = acc[t] * f + w * at_v[row + d]; }
-        }
+        for (var d = 0u; d < hd; d = d + 1u) { at_acc[base + d] = at_acc[base + d] * f + w * at_v[krow + d]; }
         m = mp;
+        p = p + 32u;
     }
-    let invl = select(0.0, 1.0 / l, l > 0.0);
-    for (var t = 0u; t < nt; t = t + 1u) {
-        let d = t * 32u + lane;
-        if (d < hd) { at_o[h * hd + d] = acc[t] * invl; }
+    at_m[lane] = m;
+    at_l[lane] = l;
+    workgroupBarrier();
+    var stride = 16u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lane < stride) {
+            let o = lane + stride;
+            let m1 = at_m[lane];
+            let m2 = at_m[o];
+            let mm = max(m1, m2);
+            let f1 = exp(m1 - mm);
+            let f2 = exp(m2 - mm);
+            at_l[lane] = at_l[lane] * f1 + at_l[o] * f2;
+            let bo = o * 129u;
+            for (var d = 0u; d < hd; d = d + 1u) {
+                at_acc[base + d] = at_acc[base + d] * f1 + at_acc[bo + d] * f2;
+            }
+            at_m[lane] = mm;
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let invl = select(0.0, 1.0 / at_l[0], at_l[0] > 0.0);
+    for (var d = lane; d < hd; d = d + 32u) {
+        at_o[h * hd + d] = at_acc[d] * invl;
     }
 }
 
