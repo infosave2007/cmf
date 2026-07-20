@@ -2272,6 +2272,7 @@ pub fn forward_token_graph(
     if position >= cap {
         return false;
     }
+    let t_start = std::time::Instant::now();
     // A resolved matvec weight: the device-local buffer, (q8 only) its row
     // scales, and the codec kind (0=q8_row 1=q1 2=q4_tiled 3=q1t).
     struct GMat {
@@ -2699,7 +2700,8 @@ pub fn forward_token_graph(
         }
     }
     if prof {
-        eprintln!("token-graph: encode {t_enc:.2} ms | submit+readback {:.2} ms", t_sub0.elapsed().as_secs_f64() * 1000.0);
+        let setup = t_enc0.duration_since(t_start).as_secs_f64() * 1000.0;
+        eprintln!("token-graph: setup {setup:.2} ms | encode {t_enc:.2} ms | submit+readback {:.2} ms", t_sub0.elapsed().as_secs_f64() * 1000.0);
     }
     ok
 }
