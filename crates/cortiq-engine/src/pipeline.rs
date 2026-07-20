@@ -431,7 +431,21 @@ impl Pipeline {
 
     #[cfg(not(target_os = "macos"))]
     fn graph_prefill_preferred(&self) -> bool {
-        false
+        // Discrete-GPU wgpu whole-token graph: GDN layers carry recurrent state
+        // (conv ring + delta-rule S) resident on the GPU. A batched CPU prefill
+        // builds that state on the CPU only, leaving the GPU buffers zeroed at
+        // decode → garbage. Route GDN-hybrid prefill through the graph one
+        // position at a time so the resident state is seeded exactly as decode
+        // will read it. Pure-attention models keep the batched CPU prefill (its
+        // KV mirror re-syncs from the CPU cache, so no seeding gap).
+        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH").map(|v| v != "0").unwrap_or(false);
+        if !graph_on || !crate::gpu::enabled_here() {
+            return false;
+        }
+        self.weights
+            .layers
+            .iter()
+            .any(|lw| matches!(&lw.attn, AttnKind::LinearGdn(_)))
     }
 
     #[cfg(target_os = "macos")]
@@ -2412,40 +2426,77 @@ impl Pipeline {
         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
         let mut layers = Vec::with_capacity(self.num_layers);
         let mut model = None;
+        let dbg = std::env::var("CMF_GRAPH_DEBUG").is_ok();
+        fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
+            if let Some((_, i, kind, rs)) = t.graph_weight() {
+                return Some(crate::gpu::GraphW { idx: i, kind, row_scale: rs, data: &[] });
+            }
+            // Small unquantized projections (GDN in_proj_a/b) stay f32.
+            t.as_f32().map(|d| crate::gpu::GraphW { idx: 0, kind: 4, row_scale: &[], data: d })
+        }
         for li in 0..self.num_layers {
             let lw = &self.weights.layers[li];
-            let (wq, wk, wv, wo, q_norm, k_norm, bias) = match &lw.attn {
-                AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, bias }
-                    if !*output_gate =>
-                {
-                    (wq, wk, wv, wo, q_norm, k_norm, bias)
-                }
-                _ => return None,
-            };
+            if dbg {
+                let ak = match &lw.attn {
+                    AttnKind::Full { output_gate, bias, .. } => format!("Full gate={output_gate} bias={}", bias.is_some()),
+                    AttnKind::LinearGdn(_) => "LinearGdn".into(),
+                    AttnKind::Linear(_) => "Linear".into(),
+                    AttnKind::ShortConv(_) => "ShortConv".into(),
+                };
+                let fk = match &lw.ffn { FfnKind::Dense(_) => "Dense", FfnKind::Moe(_) => "Moe" };
+                eprintln!("graph L{li}: attn={ak} ffn={fk}");
+            }
             let (gate, up, down) = match &lw.ffn {
                 FfnKind::Dense(d) => (&d.gate_proj, &d.up_proj, &d.down_proj),
                 _ => return None,
             };
-            fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
-                t.graph_weight().map(|(_, i, kind, rs)| crate::gpu::GraphW { idx: i, kind, row_scale: rs })
-            }
-            let (m, _, _, _) = wq.graph_weight()?;
-            model = Some(m.clone());
+            let attn = match &lw.attn {
+                AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, bias } => {
+                    let (m, _, _, _) = wq.graph_weight()?;
+                    model = Some(m.clone());
+                    crate::gpu::GraphAttn::Full {
+                        wq: gw(wq)?,
+                        wk: gw(wk)?,
+                        wv: gw(wv)?,
+                        wo: gw(wo)?,
+                        q_norm: q_norm.as_deref(),
+                        k_norm: k_norm.as_deref(),
+                        bias: bias.as_ref().map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
+                        output_gate: *output_gate,
+                        cpu_k: self.kv_cache.layers[li].k_heads(),
+                        cpu_v: self.kv_cache.layers[li].v_heads(),
+                    }
+                }
+                AttnKind::LinearGdn(w) => {
+                    let cfg = self.gdn_cfg?;
+                    let (m, _, _, _) = w.in_proj_qkv.graph_weight()?;
+                    model = Some(m.clone());
+                    crate::gpu::GraphAttn::Gdn {
+                        qkv: gw(&w.in_proj_qkv)?,
+                        z: gw(&w.in_proj_z)?,
+                        a: gw(&w.in_proj_a)?,
+                        b: gw(&w.in_proj_b)?,
+                        out: gw(&w.out_proj)?,
+                        conv1d: &w.conv1d,
+                        a_log: &w.a_log,
+                        dt_bias: &w.dt_bias,
+                        norm: &w.norm,
+                        nv: cfg.num_v_heads,
+                        nk: cfg.num_k_heads,
+                        dk: cfg.key_head_dim,
+                        dv: cfg.value_head_dim,
+                        kk: cfg.conv_kernel,
+                    }
+                }
+                _ => return None,
+            };
             layers.push(crate::gpu::GraphLayer {
                 input_norm: &lw.input_norm,
-                wq: gw(wq)?,
-                wk: gw(wk)?,
-                wv: gw(wv)?,
-                wo: gw(wo)?,
-                q_norm: q_norm.as_deref(),
-                k_norm: k_norm.as_deref(),
-                bias: bias.as_ref().map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
+                attn,
                 post_norm: &lw.post_norm,
                 gate: gw(gate)?,
                 up: gw(up)?,
                 down: gw(down)?,
-                cpu_k: self.kv_cache.layers[li].k_heads(),
-                cpu_v: self.kv_cache.layers[li].v_heads(),
             });
         }
         let model = model?;

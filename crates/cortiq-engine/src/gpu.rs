@@ -524,31 +524,59 @@ pub fn attn_dropin(
 }
 
 /// One weight in the whole-token graph: tensor idx + a codec tag (0=q8_row,
-/// 1=q1, 2=q4_tiled, 3=q1t) + per-row scales (q8_row only; empty otherwise).
+/// 1=q1, 2=q4_tiled, 3=q1t, 4=f32) + per-row scales (q8_row only) + the raw f32
+/// data (kind 4 only — small unquantized projections like GDN in_proj_a/b).
 pub struct GraphW<'a> {
     pub idx: usize,
     pub kind: u8,
     pub row_scale: &'a [f32],
+    pub data: &'a [f32],
 }
 
-/// Per-layer weights for the whole-token wgpu graph (q8_row / q1 matmuls;
-/// small f32 norm weights borrowed from the pipeline).
+/// A layer's token-mixing op: standard attention or a GDN (linear-attention)
+/// block. The surrounding norms + SwiGLU FFN are common to both.
+pub enum GraphAttn<'a> {
+    Full {
+        wq: GraphW<'a>,
+        wk: GraphW<'a>,
+        wv: GraphW<'a>,
+        wo: GraphW<'a>,
+        q_norm: Option<&'a [f32]>,
+        k_norm: Option<&'a [f32]>,
+        /// (bq, bk, bv) attention biases (Qwen2). None ⇒ no bias.
+        bias: Option<(&'a [f32], &'a [f32], &'a [f32])>,
+        /// Qwen3.5 gated attention: wq emits 2·nh·hd (q||gate per head), the
+        /// attention output is scaled by sigmoid(gate) before the O projection.
+        output_gate: bool,
+        cpu_k: &'a [Vec<f32>],
+        cpu_v: &'a [Vec<f32>],
+    },
+    Gdn {
+        qkv: GraphW<'a>,
+        z: GraphW<'a>,
+        a: GraphW<'a>,
+        b: GraphW<'a>,
+        out: GraphW<'a>,
+        conv1d: &'a [f32],
+        a_log: &'a [f32],
+        dt_bias: &'a [f32],
+        norm: &'a [f32],
+        nv: usize,
+        nk: usize,
+        dk: usize,
+        dv: usize,
+        kk: usize,
+    },
+}
+
+/// Per-layer weights for the whole-token wgpu graph.
 pub struct GraphLayer<'a> {
     pub input_norm: &'a [f32],
-    pub wq: GraphW<'a>,
-    pub wk: GraphW<'a>,
-    pub wv: GraphW<'a>,
-    pub wo: GraphW<'a>,
-    pub q_norm: Option<&'a [f32]>,
-    pub k_norm: Option<&'a [f32]>,
-    /// (bq, bk, bv) attention biases (Qwen2 family). None ⇒ no bias.
-    pub bias: Option<(&'a [f32], &'a [f32], &'a [f32])>,
+    pub attn: GraphAttn<'a>,
     pub post_norm: &'a [f32],
     pub gate: GraphW<'a>,
     pub up: GraphW<'a>,
     pub down: GraphW<'a>,
-    pub cpu_k: &'a [Vec<f32>],
-    pub cpu_v: &'a [Vec<f32>],
 }
 
 /// Whole-token decode graph on wgpu: the entire layer stack in ONE submit,
