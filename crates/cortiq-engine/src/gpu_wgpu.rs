@@ -3041,6 +3041,84 @@ mod tests {
         assert!(md < 2e-3, "wgpu attn_block ≠ CPU: max|Δ| = {md}");
     }
 
+    // Payoff microbench: the resident attention block (ONE submit) vs the same
+    // steps as separate submit+readback ops (today's per-op decode). Run with
+    //   cargo test -p cortiq-engine --release --features gpu attn_block_timing -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn wgpu_attn_block_timing() {
+        use std::time::Instant;
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        // 1.7B-ish attention geometry.
+        let (nh, nkv, hd, rd, hidden, cap, stored) = (16usize, 8usize, 128usize, 128usize, 2048usize, 256usize, 128usize);
+        let hpk = nh / nkv;
+        let eps = 1e-6f32;
+        let flags = 2u32 | 4u32;
+        let h_in = vec![0.01f32; hidden];
+        let norm_w = vec![1.0f32; hidden];
+        let (wq_p, _) = mk_q1(nh * hd, hidden, 1);
+        let (wk_p, _) = mk_q1(nkv * hd, hidden, 2);
+        let (wv_p, _) = mk_q1(nkv * hd, hidden, 3);
+        let (wo_p, _) = mk_q1(hidden, nh * hd, 4);
+        let qnw = vec![1.0f32; hd];
+        let knw = vec![1.0f32; hd];
+        let invf: Vec<f32> = (0..rd / 2).map(|i| 1.0 / (10000f32).powf(2.0 * i as f32 / rd as f32)).collect();
+        let kc = vec![0.01f32; nkv * cap * hd];
+        let vc = vec![0.01f32; nkv * cap * hd];
+        let mkc = |d: &[f32]| c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(d),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        });
+        let (kbuf, vbuf) = (mkc(&kc), mkc(&vc));
+        let iters = 200;
+        let mut hout = vec![0f32; hidden];
+        // FUSED: the resident block, one submit + one readback per call.
+        for _ in 0..20 {
+            attn_block_gpu(&h_in, &norm_w, &wq_p, &wk_p, &wv_p, &wo_p, &qnw, &knw, &invf, &kbuf, &vbuf, nh, nkv, hd, rd, hidden, cap, stored, flags, eps, &mut hout);
+        }
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            attn_block_gpu(&h_in, &norm_w, &wq_p, &wk_p, &wv_p, &wo_p, &qnw, &knw, &invf, &kbuf, &vbuf, nh, nkv, hd, rd, hidden, cap, stored, flags, eps, &mut hout);
+        }
+        let fused = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        // UNFUSED: each step its own submit+readback (rmsnorm, QKV×3, rope, attend, O).
+        let mut normed = vec![0f32; hidden];
+        let mut qraw = vec![0f32; nh * hd];
+        let mut kk = vec![0f32; nkv * hd];
+        let mut vv = vec![0f32; nkv * hd];
+        let mut qout = vec![0f32; nh * hd];
+        let mut kout = vec![0f32; nkv * hd];
+        let mut gout = vec![0f32; nh * hd];
+        let mut attn = vec![0f32; nh * hd];
+        let mut oout = vec![0f32; hidden];
+        let unfused_once = |normed: &mut [f32], qraw: &mut [f32], kk: &mut [f32], vv: &mut [f32], qout: &mut [f32], kout: &mut [f32], gout: &mut [f32], attn: &mut [f32], oout: &mut [f32]| {
+            rmsnorm_row(&h_in, &norm_w, normed, false, eps);
+            dispatch_q1(c, None, &wq_p, normed, nh * hd, hidden, qraw);
+            dispatch_q1(c, None, &wk_p, normed, nkv * hd, hidden, kk);
+            dispatch_q1(c, None, &wv_p, normed, nkv * hd, hidden, vv);
+            attn_rope_qkn_gpu(qraw, kk, &qnw, &knw, &invf, nh, nkv, hd, rd, stored, flags, eps, qout, kout, gout);
+            gqa_attend_gpu(qout, &kc, &vc, nh, hpk, hd, cap, stored + 1, attn);
+            dispatch_q1(c, None, &wo_p, attn, hidden, nh * hd, oout);
+        };
+        for _ in 0..20 {
+            unfused_once(&mut normed, &mut qraw, &mut kk, &mut vv, &mut qout, &mut kout, &mut gout, &mut attn, &mut oout);
+        }
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            unfused_once(&mut normed, &mut qraw, &mut kk, &mut vv, &mut qout, &mut kout, &mut gout, &mut attn, &mut oout);
+        }
+        let unfused = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        eprintln!(
+            "ATTN BLOCK 1.7B-dims: fused(1 submit) {fused:.3} ms/layer | unfused(per-op) {unfused:.3} ms/layer | speedup {:.2}×",
+            unfused / fused
+        );
+    }
+
     #[test]
     fn wgpu_q1t_matvec_matches_cpu_reference() {
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
