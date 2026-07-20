@@ -1875,6 +1875,8 @@ pub fn forward_token_graph(
             kvbufs.push((e.k.clone(), e.v.clone()));
         }
     }
+    let prof = std::env::var("CMF_GRAPH_PROF").is_ok();
+    let t_enc0 = std::time::Instant::now();
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("token-graph") });
     let go = |enc: &mut wgpu::CommandEncoder, p: &wgpu::ComputePipeline, b: &wgpu::BindGroup, g: u32| {
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
@@ -1914,10 +1916,15 @@ pub fn forward_token_graph(
         go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&ob, &h_buf, &unif(&[1.0f32.to_bits(), hidden as u32, 0, 0])]), (hidden as u32).div_ceil(256));
     }
     let size = (hidden * 4) as u64;
+    let t_enc = t_enc0.elapsed().as_secs_f64() * 1000.0;
+    let t_sub0 = std::time::Instant::now();
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(&c.device, &mut sc.stage, size, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "g-stage");
     let ok = readback(c, enc, &h_buf, &stage, size, &mut h[..hidden]);
     drop(sc);
+    if prof {
+        eprintln!("token-graph: encode {t_enc:.2} ms | submit+readback {:.2} ms", t_sub0.elapsed().as_secs_f64() * 1000.0);
+    }
     ok
 }
 
