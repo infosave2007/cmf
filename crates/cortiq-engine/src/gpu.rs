@@ -523,6 +523,53 @@ pub fn attn_dropin(
     }
 }
 
+/// Per-layer weights for the whole-token wgpu graph (q1 matmuls by tensor
+/// idx; small f32 norm weights borrowed from the pipeline).
+pub struct GraphLayer<'a> {
+    pub input_norm: &'a [f32],
+    pub wq: usize,
+    pub wk: usize,
+    pub wv: usize,
+    pub wo: usize,
+    pub q_norm: Option<&'a [f32]>,
+    pub k_norm: Option<&'a [f32]>,
+    pub post_norm: &'a [f32],
+    pub gate: usize,
+    pub up: usize,
+    pub down: usize,
+    pub cpu_k: &'a [Vec<f32>],
+    pub cpu_v: &'a [Vec<f32>],
+}
+
+/// Whole-token decode graph on wgpu: the entire layer stack in ONE submit,
+/// hidden resident, one readback. Updates `h` in place. false = refusal.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_token_graph(
+    model: &Arc<CmfModel>,
+    kv_id: u64,
+    layers: &[GraphLayer],
+    invf: &[f32],
+    h: &mut [f32],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rd: usize,
+    hidden: usize,
+    inter: usize,
+    position: usize,
+    cap: usize,
+    gemma: bool,
+    eps: f32,
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::forward_token_graph(
+            model, kv_id, layers, invf, h, nh, nkv, hd, rd, hidden, inter, position, cap, gemma, eps,
+        ),
+        _ => false,
+    }
+}
+
 /// Drop the wgpu token graph's device K/V mirror for a pipeline.
 pub fn graph_kv_reset(_kv_id: u64) {
     #[cfg(feature = "gpu")]

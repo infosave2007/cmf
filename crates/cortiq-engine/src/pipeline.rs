@@ -2394,6 +2394,69 @@ impl Pipeline {
         self.forward_layers_upto(hidden, position, task_mask, None)
     }
 
+    /// Build the whole-token wgpu graph for a pure-attention q1 model (every
+    /// layer Full q1 + dense q1 FFN, no gate/bias). Returns the post-stack
+    /// hidden (caller does final norm + lm_head), or None to fall back.
+    fn try_token_graph_wgpu(&self, hidden: &[f32], position: usize) -> Option<Vec<f32>> {
+        let nh = self.num_heads;
+        let (nkv, hd, rd) = self.layer_geom(0);
+        let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
+        let mut layers = Vec::with_capacity(self.num_layers);
+        let mut model = None;
+        for li in 0..self.num_layers {
+            let lw = &self.weights.layers[li];
+            let (wq, wk, wv, wo, q_norm, k_norm) = match &lw.attn {
+                AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, bias }
+                    if !*output_gate && bias.is_none() =>
+                {
+                    (wq, wk, wv, wo, q_norm, k_norm)
+                }
+                _ => return None,
+            };
+            let (gate, up, down) = match &lw.ffn {
+                FfnKind::Dense(d) => (&d.gate_proj, &d.up_proj, &d.down_proj),
+                _ => return None,
+            };
+            let (m, qi) = wq.mapped_q1()?;
+            model = Some(m.clone());
+            layers.push(crate::gpu::GraphLayer {
+                input_norm: &lw.input_norm,
+                wq: qi,
+                wk: wk.mapped_q1()?.1,
+                wv: wv.mapped_q1()?.1,
+                wo: wo.mapped_q1()?.1,
+                q_norm: q_norm.as_deref(),
+                k_norm: k_norm.as_deref(),
+                post_norm: &lw.post_norm,
+                gate: gate.mapped_q1()?.1,
+                up: up.mapped_q1()?.1,
+                down: down.mapped_q1()?.1,
+                cpu_k: self.kv_cache.layers[li].k_heads(),
+                cpu_v: self.kv_cache.layers[li].v_heads(),
+            });
+        }
+        let model = model?;
+        let mut h = hidden.to_vec();
+        crate::gpu::forward_token_graph(
+            &model,
+            self.graph_kv_id,
+            &layers,
+            &self.inv_freq,
+            &mut h,
+            nh,
+            nkv,
+            hd,
+            rd,
+            self.hidden_size,
+            self.intermediate_size,
+            position,
+            self.kv_cache.max_seq_len,
+            gemma,
+            self.rms_eps as f32,
+        )
+        .then_some(h)
+    }
+
     /// Same, stopping after layer `upto` inclusive (routing probe φ).
     fn forward_layers_upto(
         &mut self,
@@ -2417,6 +2480,14 @@ impl Pipeline {
         // Opt-in wgpu token-graph attention (discrete Vulkan/DX12): the whole
         // attention sub-block runs resident in one submit. Off by default.
         let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH").map(|v| v != "0").unwrap_or(false);
+        // Whole-token graph: the ENTIRE layer stack in one submit (one readback
+        // per token). Preferred over the per-layer drop-in when every layer is
+        // pure-attention q1 with a dense q1 FFN.
+        if graph_on && upto.is_none() && task_mask.is_none() {
+            if let Some(hh) = self.try_token_graph_wgpu(hidden, position) {
+                return hh;
+            }
+        }
 
         #[cfg(target_os = "macos")]
         let mut gpu_skip_until = 0usize;

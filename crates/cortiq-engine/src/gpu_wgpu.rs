@@ -1772,6 +1772,155 @@ pub fn attn_dropin_gpu(
     ok
 }
 
+/// WHOLE-TOKEN decode graph: the entire layer stack (rmsnorm → attention →
+/// residual → rmsnorm → SiLU-FFN → residual, every layer) encoded into ONE
+/// command buffer with the hidden RESIDENT on the GPU — only the final hidden
+/// reads back (one submit/token instead of ~2 per layer). This is what lifts
+/// the submit-latency wall. Returns false on any refusal (caller keeps CPU).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_token_graph(
+    model: &Arc<CmfModel>,
+    kv_id: u64,
+    layers: &[crate::gpu::GraphLayer],
+    invf: &[f32],
+    h: &mut [f32],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rd: usize,
+    hidden: usize,
+    inter: usize,
+    position: usize,
+    cap: usize,
+    gemma: bool,
+    eps: f32,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if position >= cap {
+        return false;
+    }
+    // Resolve + cache every layer's q1 weights up front; bail (CPU) on refusal.
+    struct LW {
+        wq: wgpu::Buffer,
+        wk: wgpu::Buffer,
+        wv: wgpu::Buffer,
+        wo: wgpu::Buffer,
+        gate: wgpu::Buffer,
+        up: wgpu::Buffer,
+        down: wgpu::Buffer,
+    }
+    let mut lws = Vec::with_capacity(layers.len());
+    for l in layers {
+        let w = |idx, r, cc| q1_weight(c, model, idx).filter(|(_, rr, ccc)| *rr == r && *ccc == cc).map(|(b, _, _)| b);
+        let (Some(wq), Some(wk), Some(wv), Some(wo), Some(gate), Some(up), Some(down)) = (
+            w(l.wq, nh * hd, hidden),
+            w(l.wk, nkv * hd, hidden),
+            w(l.wv, nkv * hd, hidden),
+            w(l.wo, hidden, nh * hd),
+            w(l.gate, inter, hidden),
+            w(l.up, inter, hidden),
+            w(l.down, hidden, inter),
+        ) else {
+            return false;
+        };
+        lws.push(LW { wq, wk, wv, wo, gate, up, down });
+    }
+    let stor = |data: &[u8]| c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: data, usage: wgpu::BufferUsages::STORAGE });
+    let unif = |d: &[u32]| c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(d), usage: wgpu::BufferUsages::UNIFORM });
+    let bg = |layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| {
+        let e: Vec<_> = bufs.iter().enumerate().map(|(i, b)| bind_buf(i as u32, b)).collect();
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &e })
+    };
+    // Resident hidden + reused intermediates (same shapes every layer).
+    let h_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("g-h"),
+        contents: bytemuck::cast_slice(&h[..hidden]),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+    let n1 = rw_f32(c, hidden, false);
+    let qraw = rw_f32(c, nh * hd, false);
+    let kb = rw_f32(c, nkv * hd, false);
+    let vb = rw_f32(c, nkv * hd, false);
+    let qout = rw_f32(c, nh * hd, false);
+    let gout = rw_f32(c, nh * hd, false);
+    let attn = rw_f32(c, nh * hd, false);
+    let ob = rw_f32(c, hidden, false);
+    let gbuf = rw_f32(c, inter, false);
+    let ubuf = rw_f32(c, inter, false);
+    let abuf = rw_f32(c, inter, false);
+    let invf_b = stor(bytemuck::cast_slice(invf));
+    let dummy_hd = stor(bytemuck::cast_slice(&vec![0f32; hd]));
+    // Sync each layer's device K/V mirror from the CPU cache (once).
+    let mut kvbufs = Vec::with_capacity(layers.len());
+    {
+        let mut kvm = c.attn_kv.lock().unwrap();
+        for (li, l) in layers.iter().enumerate() {
+            let e = kvm.entry((kv_id, li)).or_insert_with(|| {
+                let sz = (nkv * cap * hd * 4) as u64;
+                let mk = || c.device.create_buffer(&wgpu::BufferDescriptor { label: Some("kv"), size: sz, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+                KvMirror { k: mk(), v: mk(), synced: 0 }
+            });
+            if e.synced < position {
+                for hh in 0..nkv {
+                    let take = position.min(l.cpu_k[hh].len() / hd);
+                    if take > e.synced {
+                        let off = ((hh * cap + e.synced) * hd * 4) as u64;
+                        c.queue.write_buffer(&e.k, off, bytemuck::cast_slice(&l.cpu_k[hh][e.synced * hd..take * hd]));
+                        c.queue.write_buffer(&e.v, off, bytemuck::cast_slice(&l.cpu_v[hh][e.synced * hd..take * hd]));
+                    }
+                }
+                e.synced = position;
+            }
+            e.synced = position + 1;
+            kvbufs.push((e.k.clone(), e.v.clone()));
+        }
+    }
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("token-graph") });
+    let go = |enc: &mut wgpu::CommandEncoder, p: &wgpu::ComputePipeline, b: &wgpu::BindGroup, g: u32| {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        pass.set_pipeline(p);
+        pass.set_bind_group(0, b, &[]);
+        pass.dispatch_workgroups(g, 1, 1);
+    };
+    let flags = |qn: bool, kn: bool| (if qn { 2u32 } else { 0 }) | (if kn { 4 } else { 0 }) | (if gemma { 8 } else { 0 });
+    for (li, l) in layers.iter().enumerate() {
+        let lw = &lws[li];
+        let (kbuf, vbuf) = &kvbufs[li];
+        let inw = stor(bytemuck::cast_slice(l.input_norm));
+        let pnw = stor(bytemuck::cast_slice(l.post_norm));
+        let qnw = stor(bytemuck::cast_slice(l.q_norm.unwrap_or(&vec![0f32; hd])));
+        let knw = stor(bytemuck::cast_slice(l.k_norm.unwrap_or(&vec![0f32; hd])));
+        // 1. attn rmsnorm h -> n1
+        go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &inw, &n1, &unif(&[hidden as u32, 0, eps.to_bits(), 0])]), 1);
+        // 2. QKV
+        encode_matvec_q1(c, &mut enc, &lw.wq, &n1, &qraw, nh * hd, hidden);
+        encode_matvec_q1(c, &mut enc, &lw.wk, &n1, &kb, nkv * hd, hidden);
+        encode_matvec_q1(c, &mut enc, &lw.wv, &n1, &vb, nkv * hd, hidden);
+        // 3. rope + qk-norm
+        go(&mut enc, &c.attn_rope, &bg(&c.layout_attn_rope, &[&qraw, &kb, &qout, &gout, &qnw, &knw, &invf_b, &unif(&[nh as u32, nkv as u32, hd as u32, rd as u32, position as u32, flags(l.q_norm.is_some(), l.k_norm.is_some()), eps.to_bits(), 0])]), (nh + nkv) as u32);
+        // 4. kv_append + 5. attend
+        go(&mut enc, &c.kv_append, &bg(&c.layout_kv, &[&kb, &vb, kbuf, vbuf, &unif(&[nkv as u32, hd as u32, cap as u32, position as u32])]), ((nkv * hd) as u32).div_ceil(256));
+        go(&mut enc, &c.gqa_attend, &bg(&c.layout_attend, &[&qout, kbuf, vbuf, &attn, &unif(&[nh as u32, (nh / nkv) as u32, hd as u32, cap as u32, (position + 1) as u32, 0, 0, 0])]), nh as u32);
+        // 6. O + residual
+        encode_matvec_q1(c, &mut enc, &lw.wo, &attn, &ob, hidden, nh * hd);
+        go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&ob, &h_buf, &unif(&[1.0f32.to_bits(), hidden as u32, 0, 0])]), (hidden as u32).div_ceil(256));
+        // 7. FFN rmsnorm h -> n1
+        go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &pnw, &n1, &unif(&[hidden as u32, 0, eps.to_bits(), 0])]), 1);
+        // 8. gate/up -> silu·mul -> down + residual
+        encode_matvec_q1(c, &mut enc, &lw.gate, &n1, &gbuf, inter, hidden);
+        encode_matvec_q1(c, &mut enc, &lw.up, &n1, &ubuf, inter, hidden);
+        go(&mut enc, &c.silu, &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &unif(&[inter as u32, 0, 0, 0])]), (inter as u32).div_ceil(256));
+        encode_matvec_q1(c, &mut enc, &lw.down, &abuf, &ob, hidden, inter);
+        go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&ob, &h_buf, &unif(&[1.0f32.to_bits(), hidden as u32, 0, 0])]), (hidden as u32).div_ceil(256));
+    }
+    let size = (hidden * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(&c.device, &mut sc.stage, size, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "g-stage");
+    let ok = readback(c, enc, &h_buf, &stage, size, &mut h[..hidden]);
+    drop(sc);
+    ok
+}
+
 /// Drop the device K/V mirror for a pipeline (called on cache clear).
 pub fn kv_mirror_reset(kv_id: u64) {
     if let Some(c) = ctx() {
