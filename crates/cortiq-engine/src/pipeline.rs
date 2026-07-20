@@ -2414,11 +2414,11 @@ impl Pipeline {
         let mut model = None;
         for li in 0..self.num_layers {
             let lw = &self.weights.layers[li];
-            let (wq, wk, wv, wo, q_norm, k_norm) = match &lw.attn {
+            let (wq, wk, wv, wo, q_norm, k_norm, bias) = match &lw.attn {
                 AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, bias }
-                    if !*output_gate && bias.is_none() =>
+                    if !*output_gate =>
                 {
-                    (wq, wk, wv, wo, q_norm, k_norm)
+                    (wq, wk, wv, wo, q_norm, k_norm, bias)
                 }
                 _ => return None,
             };
@@ -2439,6 +2439,7 @@ impl Pipeline {
                 wo: gw(wo)?,
                 q_norm: q_norm.as_deref(),
                 k_norm: k_norm.as_deref(),
+                bias: bias.as_ref().map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
                 post_norm: &lw.post_norm,
                 gate: gw(gate)?,
                 up: gw(up)?,

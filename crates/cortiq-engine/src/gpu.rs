@@ -541,6 +541,8 @@ pub struct GraphLayer<'a> {
     pub wo: GraphW<'a>,
     pub q_norm: Option<&'a [f32]>,
     pub k_norm: Option<&'a [f32]>,
+    /// (bq, bk, bv) attention biases (Qwen2 family). None ⇒ no bias.
+    pub bias: Option<(&'a [f32], &'a [f32], &'a [f32])>,
     pub post_norm: &'a [f32],
     pub gate: GraphW<'a>,
     pub up: GraphW<'a>,

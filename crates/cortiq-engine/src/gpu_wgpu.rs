@@ -2052,6 +2052,17 @@ pub fn forward_token_graph(
         emat(&mut enc, &lw.wq, &n1, &qraw, nh * hd, hidden);
         emat(&mut enc, &lw.wk, &n1, &kb, nkv * hd, hidden);
         emat(&mut enc, &lw.wv, &n1, &vb, nkv * hd, hidden);
+        // Qwen2 attention bias: qraw+=bq, kb+=bk, vb+=bv (before rope/qk-norm).
+        if let Some((bq, bk, bv)) = l.bias {
+            let bqb = stor(bytemuck::cast_slice(bq));
+            let bkb = stor(bytemuck::cast_slice(bk));
+            let bvb = stor(bytemuck::cast_slice(bv));
+            let axq = unif(&[1.0f32.to_bits(), (nh * hd) as u32, 0, 0]);
+            let axkv = unif(&[1.0f32.to_bits(), (nkv * hd) as u32, 0, 0]);
+            go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&bqb, &qraw, &axq]), ((nh * hd) as u32).div_ceil(256));
+            go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&bkb, &kb, &axkv]), ((nkv * hd) as u32).div_ceil(256));
+            go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&bvb, &vb, &axkv]), ((nkv * hd) as u32).div_ceil(256));
+        }
         go(&mut enc, &c.attn_rope, &bg(&c.layout_attn_rope, &[&qraw, &kb, &qout, &gout, &qnw, &knw, &invf_b, &rope_u]), (nh + nkv) as u32);
         go(&mut enc, &c.kv_append, &bg(&c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]), ((nkv * hd) as u32).div_ceil(256));
         go(&mut enc, &c.gqa_attend, &bg(&c.layout_attend, &[&qout, kbuf, vbuf, &attn, &at_u]), nh as u32);
