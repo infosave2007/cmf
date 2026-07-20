@@ -351,6 +351,92 @@ fn rmsnorm(@builtin(local_invocation_id) lid: vec3<u32>) {
     }
 }
 
+// RoPE + optional qk-norm + gate-split, one 32-thread workgroup per head
+// (WGSL twin of Metal attn_rope_qkn; the qk-norm sum-of-squares reduces in
+// workgroup memory — no subgroup ops, portable). Heads [0,nh)=Q (2·hd each
+// when gated: q||gate), [nh,nh+nkv)=K. flags: 1=gate 2=qnorm 4=knorm 8=gemma.
+struct RqP { nh: u32, nkv: u32, hd: u32, rd: u32, pos: u32, flags: u32, eps: f32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       rq_qraw : array<f32>;
+@group(0) @binding(1) var<storage, read_write> rq_k    : array<f32>;
+@group(0) @binding(2) var<storage, read_write> rq_qout : array<f32>;
+@group(0) @binding(3) var<storage, read_write> rq_gout : array<f32>;
+@group(0) @binding(4) var<storage, read>       rq_qnw  : array<f32>;
+@group(0) @binding(5) var<storage, read>       rq_knw  : array<f32>;
+@group(0) @binding(6) var<storage, read>       rq_invf : array<f32>;
+@group(0) @binding(7) var<uniform>             rq_p    : RqP;
+var<workgroup> rq_red: array<f32, 32>;
+@compute @workgroup_size(32)
+fn attn_rope_qkn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let head = wid.x;
+    let lane = lid.x;
+    let nh = rq_p.nh;
+    let hd = rq_p.hd;
+    if (head >= nh + rq_p.nkv) { return; }
+    let isq = head < nh;
+    let gate = (rq_p.flags & 1u) != 0u;
+    let src_base = select((head - nh) * hd, head * select(1u, 2u, gate) * hd, isq);
+    let nt = (hd + 31u) / 32u;
+    var xv: array<f32, 4>;
+    var ss = 0.0;
+    for (var t = 0u; t < nt; t = t + 1u) {
+        let d = t * 32u + lane;
+        var val = 0.0;
+        if (d < hd) { val = select(rq_k[src_base + d], rq_qraw[src_base + d], isq); }
+        xv[t] = val;
+        ss = ss + val * val;
+    }
+    rq_red[lane] = ss;
+    workgroupBarrier();
+    var stride = 16u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lane < stride) { rq_red[lane] = rq_red[lane] + rq_red[lane + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let normed = select((rq_p.flags & 4u) != 0u, (rq_p.flags & 2u) != 0u, isq);
+    if (normed) {
+        let inv = 1.0 / sqrt(rq_red[0] / f32(hd) + rq_p.eps);
+        let gemma = (rq_p.flags & 8u) != 0u;
+        for (var t = 0u; t < nt; t = t + 1u) {
+            let d = t * 32u + lane;
+            if (d < hd) {
+                var wd = select(rq_knw[d], rq_qnw[d], isq);
+                if (gemma) { wd = 1.0 + wd; }
+                xv[t] = xv[t] * inv * wd;
+            }
+        }
+    }
+    let hlf = rq_p.rd / 2u;
+    let toff = hlf / 32u;
+    for (var t = 0u; t < toff; t = t + 1u) {
+        let i = t * 32u + lane;
+        if (i < hlf) {
+            let angle = f32(rq_p.pos) * rq_invf[i];
+            let cc = cos(angle);
+            let sfac = sin(angle);
+            let x0 = xv[t];
+            let x1 = xv[t + toff];
+            xv[t] = x0 * cc - x1 * sfac;
+            xv[t + toff] = x0 * sfac + x1 * cc;
+        }
+    }
+    let dst_base = select((head - nh) * hd, head * hd, isq);
+    for (var t = 0u; t < nt; t = t + 1u) {
+        let d = t * 32u + lane;
+        if (d < hd) {
+            if (isq) { rq_qout[dst_base + d] = xv[t]; } else { rq_k[dst_base + d] = xv[t]; }
+        }
+    }
+    if (isq && gate) {
+        let gbase = head * 2u * hd + hd;
+        for (var t = 0u; t < nt; t = t + 1u) {
+            let d = t * 32u + lane;
+            if (d < hd) { rq_gout[head * hd + d] = rq_qraw[gbase + d]; }
+        }
+    }
+}
+
 // q1t (ternary base-3) + q4_block matvec — reuse the q1 bindings (q1w/q1x/q1y/
 // q1p) and its 4-slot layout. Weights arrive as array<u32>, so bytes come out
 // with shift+mask (q1t_byte). q1p fields are reinterpreted: np=gpr, _p0=cols.
@@ -604,6 +690,7 @@ struct Ctx {
     q1t_mm: wgpu::ComputePipeline,
     q1t_ovmm: wgpu::ComputePipeline,
     rmsnorm: wgpu::ComputePipeline,
+    attn_rope: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     layout_mm: wgpu::BindGroupLayout,
     layout_mmm: wgpu::BindGroupLayout,
@@ -612,6 +699,7 @@ struct Ctx {
     layout_zero: wgpu::BindGroupLayout,
     layout_q1: wgpu::BindGroupLayout,
     layout_rmsnorm: wgpu::BindGroupLayout,
+    layout_attn_rope: wgpu::BindGroupLayout,
     /// Discrete card (PCIe VRAM) vs UMA — thresholds and budgets differ.
     discrete: bool,
     /// Weight-residency budget in bytes (CMF_GPU_VRAM_MB override). On a
@@ -787,9 +875,11 @@ fn init() -> Result<Ctx, String> {
     let q1t_mm = pipe("q1t_mul_mm");
     let q1t_ovmm = pipe("q1t_overlay_mm");
     let rmsnorm = pipe("rmsnorm");
+    let attn_rope = pipe("attn_rope_qkn");
     let layout = matvec.get_bind_group_layout(0);
     let layout_q1 = q1.get_bind_group_layout(0);
     let layout_rmsnorm = rmsnorm.get_bind_group_layout(0);
+    let layout_attn_rope = attn_rope.get_bind_group_layout(0);
     let layout_mm = matmat.get_bind_group_layout(0);
     let layout_mmm = mul_mm.get_bind_group_layout(0);
     let layout_silu = silu.get_bind_group_layout(0);
@@ -811,6 +901,7 @@ fn init() -> Result<Ctx, String> {
         q1t_mm,
         q1t_ovmm,
         rmsnorm,
+        attn_rope,
         layout,
         layout_mm,
         layout_mmm,
@@ -819,6 +910,7 @@ fn init() -> Result<Ctx, String> {
         layout_zero,
         layout_q1,
         layout_rmsnorm,
+        layout_attn_rope,
         discrete,
         vram_budget,
         resident: std::sync::atomic::AtomicU64::new(0),
@@ -1270,6 +1362,107 @@ pub fn rmsnorm_row(x: &[f32], w: &[f32], out: &mut [f32], gemma: bool, eps: f32)
     let ok = readback(c, enc, &o_b, &stage, size, &mut out[..n]);
     drop(sc);
     ok
+}
+
+/// GPU RoPE + qk-norm + gate-split building block (bring-up / parity). One
+/// workgroup per head; writes qout[nh·hd], k in place[nkv·hd], gout[nh·hd].
+/// qnw/knw must be hd-long (dummy ok if the norm flag is off), invf rd/2-long.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_rope_qkn_gpu(
+    qraw: &[f32],
+    k_in: &[f32],
+    qnw: &[f32],
+    knw: &[f32],
+    invf: &[f32],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rd: usize,
+    pos: usize,
+    flags: u32,
+    eps: f32,
+    qout: &mut [f32],
+    k_out: &mut [f32],
+    gout: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let qraw_b = storage_bytes(c, bytemuck::cast_slice(qraw));
+    let k_b = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("rq-k"),
+        contents: bytemuck::cast_slice(&k_in[..nkv * hd]),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+    let qout_b = rw_f32(c, nh * hd, true);
+    let gout_b = rw_f32(c, nh * hd, true);
+    let qnw_b = storage_bytes(c, bytemuck::cast_slice(qnw));
+    let knw_b = storage_bytes(c, bytemuck::cast_slice(knw));
+    let invf_b = storage_bytes(c, bytemuck::cast_slice(invf));
+    let p_data = [
+        nh as u32, nkv as u32, hd as u32, rd as u32, pos as u32, flags, eps.to_bits(), 0u32,
+    ];
+    let p_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("rq-p"),
+        contents: bytemuck::cast_slice(&p_data),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("rq-bg"),
+        layout: &c.layout_attn_rope,
+        entries: &[
+            bind_buf(0, &qraw_b),
+            bind_buf(1, &k_b),
+            bind_buf(2, &qout_b),
+            bind_buf(3, &gout_b),
+            bind_buf(4, &qnw_b),
+            bind_buf(5, &knw_b),
+            bind_buf(6, &invf_b),
+            bind_buf(7, &p_buf),
+        ],
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rq") });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("rq"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.attn_rope);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
+    }
+    let mk_stage = |n: usize| {
+        c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rq-stage"),
+            size: (n * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    };
+    let sq = mk_stage(nh * hd);
+    let sk = mk_stage(nkv * hd);
+    let sgt = mk_stage(nh * hd);
+    enc.copy_buffer_to_buffer(&qout_b, 0, &sq, 0, (nh * hd * 4) as u64);
+    enc.copy_buffer_to_buffer(&k_b, 0, &sk, 0, (nkv * hd * 4) as u64);
+    enc.copy_buffer_to_buffer(&gout_b, 0, &sgt, 0, (nh * hd * 4) as u64);
+    c.queue.submit(Some(enc.finish()));
+    for s in [&sq, &sk, &sgt] {
+        s.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    }
+    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return false;
+    }
+    let (Ok(dq), Ok(dk), Ok(dg)) = (
+        sq.slice(..).get_mapped_range(),
+        sk.slice(..).get_mapped_range(),
+        sgt.slice(..).get_mapped_range(),
+    ) else {
+        return false;
+    };
+    qout[..nh * hd].copy_from_slice(bytemuck::cast_slice(&dq[..nh * hd * 4]));
+    k_out[..nkv * hd].copy_from_slice(bytemuck::cast_slice(&dk[..nkv * hd * 4]));
+    gout[..nh * hd].copy_from_slice(bytemuck::cast_slice(&dg[..nh * hd * 4]));
+    true
 }
 
 /// q1 kernel body (weight_key = None — no residency cache; test path).
@@ -2343,6 +2536,66 @@ mod tests {
         assert!(rmsnorm_row(&x, &w, &mut gotg, true, eps));
         let mdg = wantg.iter().zip(&gotg).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(mdg < 1e-4, "wgpu rmsnorm(gemma) ≠ CPU: max|Δ| = {mdg}");
+    }
+
+    #[test]
+    fn wgpu_attn_rope_qkn_matches_cpu() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        if ctx().is_none() {
+            eprintln!("no wgpu adapter — skipping attn_rope parity test");
+            return;
+        }
+        let (nh, nkv, hd, rd, pos) = (4usize, 2usize, 64usize, 64usize, 5usize);
+        let eps = 1e-6f32;
+        let flags = 1u32 | 2u32 | 4u32; // gate + qnorm + knorm, non-gemma
+        let jitter = |a: usize, b: usize| ((a * 31 + b * 17 + 7) % 97) as f32 / 97.0 - 0.5;
+        // qraw: nh heads × 2·hd (q part || gate part); k: nkv × hd
+        let qraw: Vec<f32> = (0..nh * 2 * hd).map(|i| jitter(i, 1)).collect();
+        let k_in: Vec<f32> = (0..nkv * hd).map(|i| jitter(i, 2)).collect();
+        let qnw: Vec<f32> = (0..hd).map(|d| 0.7 + jitter(d, 3)).collect();
+        let knw: Vec<f32> = (0..hd).map(|d| 0.7 + jitter(d, 4)).collect();
+        let invf: Vec<f32> = (0..rd / 2).map(|i| 1.0 / (10000f32).powf(2.0 * i as f32 / rd as f32)).collect();
+        // CPU reference: qk-norm then half-split partial RoPE.
+        let norm_rope = |v: &mut [f32], w: &[f32]| {
+            let ss: f32 = v.iter().map(|x| x * x).sum();
+            let inv = 1.0 / (ss / hd as f32 + eps).sqrt();
+            for d in 0..hd {
+                v[d] = v[d] * inv * w[d];
+            }
+            let hlf = rd / 2;
+            for i in 0..hlf {
+                let ang = pos as f32 * invf[i];
+                let (c, s) = (ang.cos(), ang.sin());
+                let (x0, x1) = (v[i], v[i + hlf]);
+                v[i] = x0 * c - x1 * s;
+                v[i + hlf] = x0 * s + x1 * c;
+            }
+        };
+        let mut want_q = vec![0f32; nh * hd];
+        let mut want_g = vec![0f32; nh * hd];
+        for h in 0..nh {
+            let mut q: Vec<f32> = qraw[h * 2 * hd..h * 2 * hd + hd].to_vec();
+            norm_rope(&mut q, &qnw);
+            want_q[h * hd..(h + 1) * hd].copy_from_slice(&q);
+            want_g[h * hd..(h + 1) * hd].copy_from_slice(&qraw[h * 2 * hd + hd..h * 2 * hd + 2 * hd]);
+        }
+        let mut want_k = k_in.clone();
+        for kh in 0..nkv {
+            let mut kk = want_k[kh * hd..(kh + 1) * hd].to_vec();
+            norm_rope(&mut kk, &knw);
+            want_k[kh * hd..(kh + 1) * hd].copy_from_slice(&kk);
+        }
+        let mut got_q = vec![0f32; nh * hd];
+        let mut got_k = vec![0f32; nkv * hd];
+        let mut got_g = vec![0f32; nh * hd];
+        assert!(attn_rope_qkn_gpu(
+            &qraw, &k_in, &qnw, &knw, &invf, nh, nkv, hd, rd, pos, flags, eps,
+            &mut got_q, &mut got_k, &mut got_g,
+        ));
+        let md = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        assert!(md(&want_q, &got_q) < 1e-4, "q mismatch: {}", md(&want_q, &got_q));
+        assert!(md(&want_k, &got_k) < 1e-4, "k mismatch: {}", md(&want_k, &got_k));
+        assert!(md(&want_g, &got_g) < 1e-4, "gate mismatch: {}", md(&want_g, &got_g));
     }
 
     #[test]
