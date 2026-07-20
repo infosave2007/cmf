@@ -2463,6 +2463,11 @@ pub fn forward_token_graph(
         }
     }
     let prof = std::env::var("CMF_GRAPH_PROF").is_ok();
+    // Group mutually-independent projections (that all read the same normed
+    // hidden) into ONE compute pass — the GPU can overlap them, cutting the
+    // per-pass barrier bubbles that dominate single-token decode. Default on
+    // (measured +5-8% token-identical across q1/q8/GDN); CMF_GPU_GROUP=0 off.
+    let group = std::env::var("CMF_GPU_GROUP").map(|v| v != "0").unwrap_or(true);
     let t_enc0 = std::time::Instant::now();
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("token-graph") });
     let go = |enc: &mut wgpu::CommandEncoder, p: &wgpu::ComputePipeline, b: &wgpu::BindGroup, g: u32| {
@@ -2491,6 +2496,52 @@ pub fn forward_token_graph(
             _ => encode_f32matvec(c, enc, &m.buf, xs, y, rows, cols),
         }
     };
+    // Prep a matvec (pipeline, bind group, workgroups) WITHOUT opening a pass —
+    // so several independent ones can share a pass. None = a dtype we don't
+    // group (q4t/q1t) → caller falls back to per-op emat. The bind group keeps
+    // its uniform buffer alive, so returning it alone is enough.
+    let prep = |m: &GMat, xs: &wgpu::Buffer, y: &wgpu::Buffer, rows: usize, cols: usize| -> Option<(&wgpu::ComputePipeline, wgpu::BindGroup, u32)> {
+        match m.kind {
+            0 => {
+                let p_buf = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, 0, 0]);
+                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &c.layout, entries: &[bind_buf(0, &m.buf), bind_buf(1, xs), bind_buf(2, m.rs.as_ref().unwrap()), bind_buf(3, y), bind_buf(4, &p_buf)] });
+                Some((&c.matvec, bind, (rows as u32).min(MAX_WG)))
+            }
+            1 => {
+                let gpr = cols / 32;
+                let p_buf = uniform_u32x4(c, [(gpr / 2) as u32, rows as u32, 0, 0]);
+                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &c.layout_q1, entries: &[bind_buf(0, &m.buf), bind_buf(1, xs), bind_buf(2, y), bind_buf(3, &p_buf)] });
+                Some((&c.q1, bind, (rows as u32).div_ceil(8).min(MAX_WG)))
+            }
+            4 => {
+                let p_buf = uniform_u32x4(c, [cols as u32, rows as u32, 0, 0]);
+                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &c.layout_f32, entries: &[bind_buf(0, &m.buf), bind_buf(1, xs), bind_buf(2, y), bind_buf(3, &p_buf)] });
+                Some((&c.f32_matvec, bind, (rows as u32).min(MAX_WG)))
+            }
+            _ => None,
+        }
+    };
+    // Emit a set of mutually-INDEPENDENT matvecs. When grouping is on and every
+    // one preps, they share a single compute pass (no barrier between them);
+    // otherwise each goes through emat as its own pass. Correctness rests on the
+    // caller passing only matvecs with no read-after-write among them.
+    let group_mats = |enc: &mut wgpu::CommandEncoder, mats: &[(&GMat, &wgpu::Buffer, &wgpu::Buffer, usize, usize)]| {
+        if group {
+            let prepped: Vec<_> = mats.iter().filter_map(|(m, xs, y, r, cc)| prep(m, xs, y, *r, *cc)).collect();
+            if prepped.len() == mats.len() {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+                for (p, b, g) in &prepped {
+                    pass.set_pipeline(p);
+                    pass.set_bind_group(0, b, &[]);
+                    pass.dispatch_workgroups(*g, 1, 1);
+                }
+                return;
+            }
+        }
+        for (m, xs, y, r, cc) in mats {
+            emat(enc, m, xs, y, *r, *cc);
+        }
+    };
     let dz = vec![0f32; hd];
     // Bootstrap the first layer's attention norm; thereafter each residual is
     // fused with the following norm (add_rmsnorm), saving two dispatches/layer.
@@ -2510,9 +2561,7 @@ pub fn forward_token_graph(
                 // Gated wq emits 2·nh·hd (q||gate interleaved per head); the rope
                 // kernel splits it, roping q and passing gate through to `gout`.
                 let qrows = nh * hd * (1 + *output_gate as usize);
-                emat(&mut enc, wq, &n1, &qraw, qrows, hidden);
-                emat(&mut enc, wk, &n1, &kb, nkv * hd, hidden);
-                emat(&mut enc, wv, &n1, &vb, nkv * hd, hidden);
+                group_mats(&mut enc, &[(wq, &n1, &qraw, qrows, hidden), (wk, &n1, &kb, nkv * hd, hidden), (wv, &n1, &vb, nkv * hd, hidden)]);
                 if let Some((bq, bk, bv)) = bias {
                     let (bqb, bkb, bvb) = (stor(bytemuck::cast_slice(bq)), stor(bytemuck::cast_slice(bk)), stor(bytemuck::cast_slice(bv)));
                     let axq = unif(&[1.0f32.to_bits(), (nh * hd) as u32, 0, 0]);
@@ -2537,10 +2586,7 @@ pub fn forward_token_graph(
                 let alog = stor(bytemuck::cast_slice(a_log));
                 let dtb = stor(bytemuck::cast_slice(dt_bias));
                 let gnorm = stor(bytemuck::cast_slice(norm));
-                emat(&mut enc, qkv, &n1, &qkv_b, *cdim, hidden);
-                emat(&mut enc, z, &n1, &z_b, nv * dv, hidden);
-                emat(&mut enc, a, &n1, &a_b, *nv, hidden);
-                emat(&mut enc, b, &n1, &b_b, *nv, hidden);
+                group_mats(&mut enc, &[(qkv, &n1, &qkv_b, *cdim, hidden), (z, &n1, &z_b, nv * dv, hidden), (a, &n1, &a_b, *nv, hidden), (b, &n1, &b_b, *nv, hidden)]);
                 let gc_p = unif(&[*cdim as u32, *kk as u32, 0, 0]);
                 go(&mut enc, &c.gdn_conv, &bg(&c.layout_gdn_conv, &[&qkv_b, &taps, ring, &cq_b, &gc_p]), (*cdim as u32).div_ceil(256));
                 let gd_p = unif(&[*nv as u32, *dk as u32, *dv as u32, (nk * dk) as u32, (nv / nk) as u32, *cdim as u32, eps.to_bits(), 0]);
@@ -2552,8 +2598,7 @@ pub fn forward_token_graph(
         // token-mix residual + FFN-norm fused: h += ob, n1 = rms(h, post_norm)
         go(&mut enc, &c.add_rmsnorm, &bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &pnw, &n1, &rms_u]), 1);
         // SiLU FFN
-        emat(&mut enc, &lw.gate, &n1, &gbuf, inter, hidden);
-        emat(&mut enc, &lw.up, &n1, &ubuf, inter, hidden);
+        group_mats(&mut enc, &[(&lw.gate, &n1, &gbuf, inter, hidden), (&lw.up, &n1, &ubuf, inter, hidden)]);
         go(&mut enc, &c.silu, &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]), (inter as u32).div_ceil(256));
         emat(&mut enc, &lw.down, &abuf, &ob, hidden, inter);
         // FFN-residual + next layer's attn-norm fused (plain residual on the last)
