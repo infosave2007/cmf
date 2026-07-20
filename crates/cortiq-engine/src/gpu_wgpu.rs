@@ -2299,13 +2299,22 @@ pub fn forward_token_graph(
                     return None;
                 }
                 let b = tensor_weight(c, model, gw.idx, rows, cols)?; // device-local
-                let rsb = c.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("g-rs"),
-                    size: (rows * 4) as u64,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                c.queue.write_buffer(&rsb, 0, bytemuck::cast_slice(&gw.row_scale[..rows]));
+                // Row scales are token-invariant — cache by (ptr,rows).
+                let key = (gw.row_scale.as_ptr() as usize, rows);
+                let mut cb = c.const_bufs.lock().unwrap();
+                let rsb = if let Some(x) = cb.get(&key) {
+                    x.clone()
+                } else {
+                    let x = c.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("g-rs"),
+                        size: (rows * 4) as u64,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    c.queue.write_buffer(&x, 0, bytemuck::cast_slice(&gw.row_scale[..rows]));
+                    cb.insert(key, x.clone());
+                    x
+                };
                 Some(GMat { buf: b, rs: Some(rsb), kind: 0 })
             }
             1 => {
@@ -2332,17 +2341,27 @@ pub fn forward_token_graph(
                 Some(GMat { buf: b, rs: None, kind: gw.kind })
             }
             4 => {
-                // f32 weight (small unquantized projection) — upload device-local.
+                // f32 weight (small unquantized projection, e.g. GDN a/b) —
+                // token-invariant: cache device-local by (ptr, rows*cols)
+                // instead of re-uploading it every token.
                 if gw.data.len() < rows * cols {
                     return None;
                 }
-                let b = c.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("g-f32w"),
-                    size: (rows * cols * 4) as u64,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                c.queue.write_buffer(&b, 0, bytemuck::cast_slice(&gw.data[..rows * cols]));
+                let key = (gw.data.as_ptr() as usize, rows * cols);
+                let mut cb = c.const_bufs.lock().unwrap();
+                let b = if let Some(x) = cb.get(&key) {
+                    x.clone()
+                } else {
+                    let x = c.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("g-f32w"),
+                        size: (rows * cols * 4) as u64,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    c.queue.write_buffer(&x, 0, bytemuck::cast_slice(&gw.data[..rows * cols]));
+                    cb.insert(key, x.clone());
+                    x
+                };
                 Some(GMat { buf: b, rs: None, kind: 4 })
             }
             _ => None,
