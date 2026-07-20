@@ -141,15 +141,21 @@ struct Q1Params { np: u32, rows: u32, _p0: u32, _p1: u32 };
 @group(0) @binding(3) var<uniform>             q1p : Q1Params;
 
 var<workgroup> partial_q1: array<f32, 256>;   // 16 rows × 16 lanes
-var<workgroup> q1xs: array<f32, 1024>;        // one 1024-col activation tile
+// 1024-col activation tile, PADDED to 33 slots per 32-col group. The read
+// pattern is lane*64 + j*4 (all 16 lanes share bank (j*4) mod 32 with a flat
+// 1024 tile => 16-way bank conflict, ~8x LSU penalty on the dominant inner
+// loop). Padding to stride-33 spreads the lanes across 16 distinct banks
+// (66 mod 32 = 2). Same math/accumulation order => token-identical.
+var<workgroup> q1xs: array<f32, 1056>;        // 32 groups × 33
 
 // Sum of ±x over one 32-weight group; x read from the shared tile at xbase.
 // bit=1 → +x, bit=0 → -x, done by XORing the f32 sign bit (no select chain).
 fn q1_tile_sum(bits: u32, xbase: u32) -> f32 {
     var s = vec4<f32>(0.0);
+    let pb = (xbase >> 5u) * 33u;   // xbase is a multiple of 32 => padded group base
     for (var j = 0u; j < 8u; j = j + 1u) {
         let nib = bits >> (j * 4u);
-        let o = xbase + j * 4u;
+        let o = pb + j * 4u;         // j*4+{0..3} stays in [0,32) < 33: no group crossing
         let x = vec4<f32>(q1xs[o], q1xs[o + 1u], q1xs[o + 2u], q1xs[o + 3u]);
         let m = vec4<u32>(
             ((nib & 1u) ^ 1u) << 31u,
@@ -182,7 +188,7 @@ fn q1_matvec(@builtin(workgroup_id) wid: vec3<u32>,
             loop {
                 if (k >= 1024u) { break; }
                 let c = c0 + k;
-                q1xs[k] = select(0.0, q1x[c], c < cols);
+                q1xs[(k >> 5u) * 33u + (k & 31u)] = select(0.0, q1x[c], c < cols);
                 k = k + 128u;
             }
             workgroupBarrier();
