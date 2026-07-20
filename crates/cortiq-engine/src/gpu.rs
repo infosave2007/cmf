@@ -676,6 +676,23 @@ pub fn q1t_matmat(
     }
 }
 
+/// Batched q1 GEMM (prefill). wgpu only — Metal has its own block path.
+pub fn q1_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q1_matmat(model, idx, xs, b, rows, cols, out),
+        _ => false,
+    }
+}
+
 /// Whole-block token-graph types re-exported from the Metal backend.
 #[cfg(target_os = "macos")]
 pub use crate::gpu_metal::{

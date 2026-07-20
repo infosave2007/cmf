@@ -2920,6 +2920,60 @@ pub fn q8_matmat(
     )
 }
 
+/// Batched q1 GEMM (prefill): resident 1-bit weight, batch of raw-f32 inputs,
+/// one 2D dispatch of q1_mul_mm, one readback. cols must be a 64-multiple (the
+/// q1 format packs whole tile-pairs). Weights resident + cached; x through the
+/// pooled scratch.
+pub fn q1_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    pre: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % 64 != 0 || rows == 0 || b == 0 || pre.len() < b * cols || out.len() < b * rows {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    if entry.shape.first().copied().unwrap_or(0) < rows {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(entry) else { return false };
+    let bytes = model.primary_bytes();
+    let plen = entry.nbytes as usize;
+    if abs + plen > bytes.len() {
+        return false;
+    }
+    let Some(w) = weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen]) else {
+        return false; // over VRAM budget → CPU path
+    };
+    let mut sc = c.scratch.lock().unwrap();
+    let xs_buf = Scratch::ensure(&c.device, &mut sc.xs, (b * cols * 4) as u64, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, "q1mm-xs");
+    c.queue.write_buffer(&xs_buf, 0, bytemuck::cast_slice(&pre[..b * cols]));
+    let y_size = (b * rows * 4) as u64;
+    let y_buf = Scratch::ensure(&c.device, &mut sc.y, y_size, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, "q1mm-y");
+    let p_buf = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, b as u32, 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q1mm-bg"),
+        layout: &c.layout_q1mm, // q1_mul_mm omits binding 2 (no row-scale)
+        entries: &[bind_buf(0, &w), bind_buf(1, &xs_buf), bind_buf(3, &y_buf), bind_buf(4, &p_buf)],
+    });
+    let stage_buf = Scratch::ensure(&c.device, &mut sc.stage, y_size, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "q1mm-stage");
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("q1mm") });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("q1mm"), timestamp_writes: None });
+        pass.set_pipeline(&c.q1_mm);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((rows as u32).div_ceil(64).min(MAX_WG), (b as u32).div_ceil(64), 1);
+    }
+    let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * rows]);
+    drop(sc);
+    ok
+}
+
 /// matmat kernel: resident weights + rs + batch of inputs, 2D dispatch, readback.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_matmat(
