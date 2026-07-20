@@ -608,6 +608,37 @@ pub fn forward_token_graph(
     }
 }
 
+/// Batched prefill: k contiguous positions through the whole graph in one submit
+/// (projections/FFN as GEMMs, attention/GDN looped over scratch). `h` is
+/// [k·hidden] in/out; `positions` len k. wgpu only.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_graph(
+    model: &Arc<CmfModel>,
+    kv_id: u64,
+    layers: &[GraphLayer],
+    invf: &[f32],
+    h: &mut [f32],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rd: usize,
+    hidden: usize,
+    inter: usize,
+    positions: &[usize],
+    cap: usize,
+    gemma: bool,
+    eps: f32,
+    k: usize,
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::forward_batch_graph(
+            model, kv_id, layers, invf, h, nh, nkv, hd, rd, hidden, inter, positions, cap, gemma, eps, k,
+        ),
+        _ => false,
+    }
+}
+
 /// Drop the wgpu token graph's device K/V mirror for a pipeline.
 pub fn graph_kv_reset(_kv_id: u64) {
     #[cfg(feature = "gpu")]

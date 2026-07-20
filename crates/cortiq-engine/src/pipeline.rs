@@ -1179,6 +1179,29 @@ impl Pipeline {
                 pos += 2;
             }
         }
+        // Batched GPU prefill for the wgpu decode graph (GDN hybrids): K prompt
+        // positions per submit — projections/FFN as GEMMs (weight once per K),
+        // attention/GDN looped inside — instead of one whole-graph submit per
+        // position. Falls through to the per-position graph on any refusal.
+        if graph_prefill && task_mask.is_none() && mtp.is_none() && !dyn_prefill && pos + 1 < input_ids.len() {
+            let hs = self.hidden_size;
+            let chunk = std::env::var("CMF_BATCH_K").ok().and_then(|v| v.parse().ok()).unwrap_or(32usize).max(1);
+            while pos < input_ids.len() {
+                let end = (pos + chunk).min(input_ids.len());
+                let bk = end - pos;
+                let mut hiddens = vec![0f32; bk * hs];
+                for (j, &id) in input_ids[pos..end].iter().enumerate() {
+                    hiddens[j * hs..(j + 1) * hs].copy_from_slice(&self.embed_single(id));
+                }
+                let positions: Vec<usize> = (pos..end).collect();
+                if self.try_batch_graph_wgpu(&mut hiddens, &positions, bk) {
+                    hidden.copy_from_slice(&hiddens[(bk - 1) * hs..]);
+                    pos = end;
+                } else {
+                    break; // unsupported → per-position graph handles the rest
+                }
+            }
+        }
         while pos < input_ids.len() {
             self.graph_want_logits = fuse_lm && pos + 1 == input_ids.len();
             hidden = self.forward_layers(&self.embed_single(input_ids[pos]), pos, task_mask);
@@ -2519,6 +2542,69 @@ impl Pipeline {
             self.rms_eps as f32,
         )
         .then_some(h)
+    }
+
+    /// Batched prefill: k contiguous prompt positions through the whole wgpu
+    /// graph in ONE submit (projections/FFN as GEMMs). `hiddens` is [k·hidden]
+    /// in/out (embeddings in, layer output out); KV mirror / GDN state advance.
+    /// false ⇒ unsupported → caller keeps the per-position graph.
+    fn try_batch_graph_wgpu(&self, hiddens: &mut [f32], positions: &[usize], k: usize) -> bool {
+        if self.o1_active() {
+            return false;
+        }
+        let nh = self.num_heads;
+        let (nkv, hd, rd) = self.layer_geom(0);
+        let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
+        fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
+            if let Some((_, i, kind, rs)) = t.graph_weight() {
+                return Some(crate::gpu::GraphW { idx: i, kind, row_scale: rs, data: &[] });
+            }
+            t.as_f32().map(|d| crate::gpu::GraphW { idx: 0, kind: 4, row_scale: &[], data: d })
+        }
+        let built: Option<(Vec<crate::gpu::GraphLayer<'_>>, std::sync::Arc<cortiq_core::CmfModel>)> = (|| {
+            let mut layers = Vec::with_capacity(self.num_layers);
+            let mut model = None;
+            for li in 0..self.num_layers {
+                let lw = &self.weights.layers[li];
+                let (gate, up, down) = match &lw.ffn {
+                    FfnKind::Dense(d) => (&d.gate_proj, &d.up_proj, &d.down_proj),
+                    _ => return None,
+                };
+                let attn = match &lw.attn {
+                    AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, bias } => {
+                        let (m, _, _, _) = wq.graph_weight()?;
+                        model = Some(m.clone());
+                        crate::gpu::GraphAttn::Full {
+                            wq: gw(wq)?, wk: gw(wk)?, wv: gw(wv)?, wo: gw(wo)?,
+                            q_norm: q_norm.as_deref(), k_norm: k_norm.as_deref(),
+                            bias: bias.as_ref().map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
+                            output_gate: *output_gate,
+                            cpu_k: self.kv_cache.layers[li].k_heads(),
+                            cpu_v: self.kv_cache.layers[li].v_heads(),
+                        }
+                    }
+                    AttnKind::LinearGdn(w) => {
+                        let cfg = self.gdn_cfg?;
+                        let (m, _, _, _) = w.in_proj_qkv.graph_weight()?;
+                        model = Some(m.clone());
+                        crate::gpu::GraphAttn::Gdn {
+                            qkv: gw(&w.in_proj_qkv)?, z: gw(&w.in_proj_z)?, a: gw(&w.in_proj_a)?, b: gw(&w.in_proj_b)?, out: gw(&w.out_proj)?,
+                            conv1d: &w.conv1d, a_log: &w.a_log, dt_bias: &w.dt_bias, norm: &w.norm,
+                            nv: cfg.num_v_heads, nk: cfg.num_k_heads, dk: cfg.key_head_dim, dv: cfg.value_head_dim, kk: cfg.conv_kernel,
+                        }
+                    }
+                    _ => return None,
+                };
+                layers.push(crate::gpu::GraphLayer { input_norm: &lw.input_norm, attn, post_norm: &lw.post_norm, gate: gw(gate)?, up: gw(up)?, down: gw(down)? });
+            }
+            Some((layers, model?))
+        })();
+        let Some((layers, model)) = built else { return false };
+        crate::gpu::forward_batch_graph(
+            &model, self.graph_kv_id, &layers, &self.inv_freq, hiddens,
+            nh, nkv, hd, rd, self.hidden_size, self.intermediate_size,
+            positions, self.kv_cache.max_seq_len, gemma, self.rms_eps as f32, k,
+        )
     }
 
     /// Same, stopping after layer `upto` inclusive (routing probe φ).
