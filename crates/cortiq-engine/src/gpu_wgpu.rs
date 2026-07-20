@@ -351,6 +351,49 @@ fn rmsnorm(@builtin(local_invocation_id) lid: vec3<u32>) {
     }
 }
 
+// Fused residual-add + RMSNorm (WGSL twin of Metal add_rmsnorm_rows): h += d
+// in place, then o = rms(h)·w. Collapses an axpy + an rmsnorm dispatch into
+// one — cuts two launches per layer off the token graph.
+struct ArP { n: u32, gemma: u32, eps: f32, _p: u32 };
+@group(0) @binding(0) var<storage, read_write> ar_h : array<f32>;
+@group(0) @binding(1) var<storage, read>       ar_d : array<f32>;
+@group(0) @binding(2) var<storage, read>       ar_w : array<f32>;
+@group(0) @binding(3) var<storage, read_write> ar_o : array<f32>;
+@group(0) @binding(4) var<uniform>             ar_p : ArP;
+var<workgroup> ar_part: array<f32, 256>;
+@compute @workgroup_size(256)
+fn add_rmsnorm(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
+    let n = ar_p.n;
+    var acc = 0.0;
+    var i = tid;
+    loop {
+        if (i >= n) { break; }
+        let v = ar_h[i] + ar_d[i];
+        ar_h[i] = v;
+        acc = acc + v * v;
+        i = i + 256u;
+    }
+    ar_part[tid] = acc;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) { ar_part[tid] = ar_part[tid] + ar_part[tid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let inv = inverseSqrt(ar_part[0] / f32(n) + ar_p.eps);
+    i = tid;
+    loop {
+        if (i >= n) { break; }
+        var wv = ar_w[i];
+        if (ar_p.gemma == 1u) { wv = 1.0 + wv; }
+        ar_o[i] = ar_h[i] * inv * wv;
+        i = i + 256u;
+    }
+}
+
 // RoPE + optional qk-norm + gate-split, one 32-thread workgroup per head
 // (WGSL twin of Metal attn_rope_qkn; the qk-norm sum-of-squares reduces in
 // workgroup memory — no subgroup ops, portable). Heads [0,nh)=Q (2·hd each
@@ -767,6 +810,7 @@ struct Ctx {
     q1t_mm: wgpu::ComputePipeline,
     q1t_ovmm: wgpu::ComputePipeline,
     rmsnorm: wgpu::ComputePipeline,
+    add_rmsnorm: wgpu::ComputePipeline,
     attn_rope: wgpu::ComputePipeline,
     kv_append: wgpu::ComputePipeline,
     gqa_attend: wgpu::ComputePipeline,
@@ -778,6 +822,7 @@ struct Ctx {
     layout_zero: wgpu::BindGroupLayout,
     layout_q1: wgpu::BindGroupLayout,
     layout_rmsnorm: wgpu::BindGroupLayout,
+    layout_add_rmsnorm: wgpu::BindGroupLayout,
     layout_attn_rope: wgpu::BindGroupLayout,
     layout_kv: wgpu::BindGroupLayout,
     layout_attend: wgpu::BindGroupLayout,
@@ -966,12 +1011,14 @@ fn init() -> Result<Ctx, String> {
     let q1t_mm = pipe("q1t_mul_mm");
     let q1t_ovmm = pipe("q1t_overlay_mm");
     let rmsnorm = pipe("rmsnorm");
+    let add_rmsnorm = pipe("add_rmsnorm");
     let attn_rope = pipe("attn_rope_qkn");
     let kv_append = pipe("kv_append");
     let gqa_attend = pipe("gqa_attend");
     let layout = matvec.get_bind_group_layout(0);
     let layout_q1 = q1.get_bind_group_layout(0);
     let layout_rmsnorm = rmsnorm.get_bind_group_layout(0);
+    let layout_add_rmsnorm = add_rmsnorm.get_bind_group_layout(0);
     let layout_attn_rope = attn_rope.get_bind_group_layout(0);
     let layout_kv = kv_append.get_bind_group_layout(0);
     let layout_attend = gqa_attend.get_bind_group_layout(0);
@@ -996,6 +1043,7 @@ fn init() -> Result<Ctx, String> {
         q1t_mm,
         q1t_ovmm,
         rmsnorm,
+        add_rmsnorm,
         attn_rope,
         kv_append,
         gqa_attend,
@@ -1007,6 +1055,7 @@ fn init() -> Result<Ctx, String> {
         layout_zero,
         layout_q1,
         layout_rmsnorm,
+        layout_add_rmsnorm,
         layout_attn_rope,
         layout_kv,
         layout_attend,
@@ -1041,11 +1090,18 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
         return None; // budget spent — this tensor stays on the CPU
     }
     crate::gpu::probe_note_cold(); // first touch = upload, not a steady sample
-    let buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("q8-weights"),
-        contents: full_quant,
-        usage: wgpu::BufferUsages::STORAGE,
+    // DEVICE-LOCAL residency: create_buffer_init maps at creation → the buffer
+    // lands in a HOST_VISIBLE heap and every matvec streams its weights over
+    // PCIe (~25 GB/s) every token. A plain create_buffer + staged write_buffer
+    // lets the allocator pick DEVICE_LOCAL VRAM (~1 TB/s on a 4090). This is
+    // THE discrete-GPU decode fix; on UMA it's a wash.
+    let buf = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("q1-weights"),
+        size: len,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
     });
+    c.queue.write_buffer(&buf, 0, full_quant);
     c.resident.fetch_add(len, Ordering::Relaxed);
     map.insert(key, buf.clone());
     Some(buf)
@@ -1825,18 +1881,26 @@ pub fn forward_token_graph(
         };
         lws.push(LW { wq, wk, wv, wo, gate, up, down });
     }
-    let stor = |data: &[u8]| c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: data, usage: wgpu::BufferUsages::STORAGE });
+    // DEVICE-LOCAL: create_buffer + write_buffer keeps norm weights in VRAM,
+    // not the HOST_VISIBLE heap create_buffer_init forces (see weight_buffer).
+    let stor = |data: &[u8]| {
+        let b = c.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: data.len() as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        c.queue.write_buffer(&b, 0, data);
+        b
+    };
     let unif = |d: &[u32]| c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(d), usage: wgpu::BufferUsages::UNIFORM });
     let bg = |layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| {
         let e: Vec<_> = bufs.iter().enumerate().map(|(i, b)| bind_buf(i as u32, b)).collect();
         c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &e })
     };
-    // Resident hidden + reused intermediates (same shapes every layer).
-    let h_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    // Resident hidden (device-local; written once per token, read back once).
+    let h_buf = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("g-h"),
-        contents: bytemuck::cast_slice(&h[..hidden]),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        size: (hidden * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
     });
+    c.queue.write_buffer(&h_buf, 0, bytemuck::cast_slice(&h[..hidden]));
     let n1 = rw_f32(c, hidden, false);
     let qraw = rw_f32(c, nh * hd, false);
     let kb = rw_f32(c, nkv * hd, false);
@@ -1871,7 +1935,8 @@ pub fn forward_token_graph(
                 }
                 e.synced = position;
             }
-            e.synced = position + 1;
+            // NB: advance synced to position+1 only AFTER a successful submit
+            // (below) — a failed readback must not mark row `position` written.
             kvbufs.push((e.k.clone(), e.v.clone()));
         }
     }
@@ -1886,7 +1951,8 @@ pub fn forward_token_graph(
     };
     let flags = |qn: bool, kn: bool| (if qn { 2u32 } else { 0 }) | (if kn { 4 } else { 0 }) | (if gemma { 8 } else { 0 });
     // Constant uniforms for the whole token (position is fixed for this call).
-    let rms_u = unif(&[hidden as u32, 0, eps.to_bits(), 0]);
+    let g = if gemma { 1u32 } else { 0 };
+    let rms_u = unif(&[hidden as u32, g, eps.to_bits(), 0]);
     let ax_u = unif(&[1.0f32.to_bits(), hidden as u32, 0, 0]);
     let silu_u = unif(&[inter as u32, 0, 0, 0]);
     let kv_u = unif(&[nkv as u32, hd as u32, cap as u32, position as u32]);
@@ -1907,15 +1973,18 @@ pub fn forward_token_graph(
         }
     };
     let dz = vec![0f32; hd];
+    // Bootstrap the first layer's attention norm; thereafter each residual is
+    // fused with the following norm (add_rmsnorm), saving two dispatches/layer.
+    let inw0 = stor(bytemuck::cast_slice(layers[0].input_norm));
+    go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &inw0, &n1, &rms_u]), 1);
     for (li, l) in layers.iter().enumerate() {
         let lw = &lws[li];
         let (kbuf, vbuf) = &kvbufs[li];
-        let inw = stor(bytemuck::cast_slice(l.input_norm));
         let pnw = stor(bytemuck::cast_slice(l.post_norm));
         let qnw = stor(bytemuck::cast_slice(l.q_norm.unwrap_or(&dz)));
         let knw = stor(bytemuck::cast_slice(l.k_norm.unwrap_or(&dz)));
         let rope_u = unif(&[nh as u32, nkv as u32, hd as u32, rd as u32, position as u32, flags(l.q_norm.is_some(), l.k_norm.is_some()), eps.to_bits(), 0]);
-        go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &inw, &n1, &rms_u]), 1);
+        // attention (n1 already holds this layer's attn-normed hidden)
         pass_run(&mut enc, &c.q1, vec![
             q1b(&lw.wq, &n1, &qraw, nh * hd, hidden),
             q1b(&lw.wk, &n1, &kb, nkv * hd, hidden),
@@ -1925,15 +1994,22 @@ pub fn forward_token_graph(
         go(&mut enc, &c.kv_append, &bg(&c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]), ((nkv * hd) as u32).div_ceil(256));
         go(&mut enc, &c.gqa_attend, &bg(&c.layout_attend, &[&qout, kbuf, vbuf, &attn, &at_u]), nh as u32);
         pass_run(&mut enc, &c.q1, vec![q1b(&lw.wo, &attn, &ob, hidden, nh * hd)]);
-        go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&ob, &h_buf, &ax_u]), (hidden as u32).div_ceil(256));
-        go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &pnw, &n1, &rms_u]), 1);
+        // O-residual + FFN-norm fused: h += ob, n1 = rms(h, post_norm)
+        go(&mut enc, &c.add_rmsnorm, &bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &pnw, &n1, &rms_u]), 1);
+        // SiLU FFN
         pass_run(&mut enc, &c.q1, vec![
             q1b(&lw.gate, &n1, &gbuf, inter, hidden),
             q1b(&lw.up, &n1, &ubuf, inter, hidden),
         ]);
         go(&mut enc, &c.silu, &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]), (inter as u32).div_ceil(256));
         pass_run(&mut enc, &c.q1, vec![q1b(&lw.down, &abuf, &ob, hidden, inter)]);
-        go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&ob, &h_buf, &ax_u]), (hidden as u32).div_ceil(256));
+        // FFN-residual + next layer's attn-norm fused (plain residual on the last)
+        if li + 1 < layers.len() {
+            let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
+            go(&mut enc, &c.add_rmsnorm, &bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &inw_next, &n1, &rms_u]), 1);
+        } else {
+            go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&ob, &h_buf, &ax_u]), (hidden as u32).div_ceil(256));
+        }
     }
     let size = (hidden * 4) as u64;
     let t_enc = t_enc0.elapsed().as_secs_f64() * 1000.0;
@@ -1942,6 +2018,15 @@ pub fn forward_token_graph(
     let stage = Scratch::ensure(&c.device, &mut sc.stage, size, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "g-stage");
     let ok = readback(c, enc, &h_buf, &stage, size, &mut h[..hidden]);
     drop(sc);
+    if ok {
+        // The append at `position` is now durable — advance each mirror.
+        let mut kvm = c.attn_kv.lock().unwrap();
+        for li in 0..layers.len() {
+            if let Some(m) = kvm.get_mut(&(kv_id, li)) {
+                m.synced = position + 1;
+            }
+        }
+    }
     if prof {
         eprintln!("token-graph: encode {t_enc:.2} ms | submit+readback {:.2} ms", t_sub0.elapsed().as_secs_f64() * 1000.0);
     }
@@ -3146,6 +3231,55 @@ mod tests {
         assert!(rmsnorm_row(&x, &w, &mut gotg, true, eps));
         let mdg = wantg.iter().zip(&gotg).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(mdg < 1e-4, "wgpu rmsnorm(gemma) ≠ CPU: max|Δ| = {mdg}");
+    }
+
+    #[test]
+    fn wgpu_add_rmsnorm_matches_cpu() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let n = 896usize;
+        let eps = 1e-6f32;
+        let h: Vec<f32> = (0..n).map(|i| ((i * 13 + 7) % 101) as f32 / 101.0 - 0.5).collect();
+        let d: Vec<f32> = (0..n).map(|i| ((i * 7 + 3) % 61) as f32 / 61.0 - 0.5).collect();
+        let w: Vec<f32> = (0..n).map(|i| 0.5 + ((i * 5 + 1) % 17) as f32 / 17.0).collect();
+        // CPU reference: h += d, then rmsnorm(h, w)
+        let hd: Vec<f32> = (0..n).map(|i| h[i] + d[i]).collect();
+        let ss: f32 = hd.iter().map(|x| x * x).sum();
+        let inv = 1.0 / (ss / n as f32 + eps).sqrt();
+        let want: Vec<f32> = (0..n).map(|i| hd[i] * inv * w[i]).collect();
+        // GPU add_rmsnorm
+        let hb = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&h),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let db = storage_bytes(c, bytemuck::cast_slice(&d));
+        let wb = storage_bytes(c, bytemuck::cast_slice(&w));
+        let ob = rw_f32(c, n, true);
+        let pb = uniform_u32x4(c, [n as u32, 0, eps.to_bits(), 0]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.layout_add_rmsnorm,
+            entries: &[bind_buf(0, &hb), bind_buf(1, &db), bind_buf(2, &wb), bind_buf(3, &ob), bind_buf(4, &pb)],
+        });
+        let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            p.set_pipeline(&c.add_rmsnorm);
+            p.set_bind_group(0, &bind, &[]);
+            p.dispatch_workgroups(1, 1, 1);
+        }
+        let mut got = vec![0f32; n];
+        let sz = (n * 4) as u64;
+        let mut sc = c.scratch.lock().unwrap();
+        let stage = Scratch::ensure(&c.device, &mut sc.stage, sz, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "arn-stage");
+        assert!(readback(c, enc, &ob, &stage, sz, &mut got));
+        drop(sc);
+        let md = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(md < 1e-4, "wgpu add_rmsnorm ≠ CPU: max|Δ| = {md}");
     }
 
     #[test]
