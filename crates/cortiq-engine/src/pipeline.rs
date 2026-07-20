@@ -1183,10 +1183,11 @@ impl Pipeline {
         // positions per submit — projections/FFN as GEMMs (weight once per K),
         // attention/GDN looped inside — instead of one whole-graph submit per
         // position. Falls through to the per-position graph on any refusal.
-        // Batched prefill is opt-in (CMF_BATCH_K>0): it uploads q1/q8 weights in
-        // GEMM layout, which evicts the decode graph's resident matvec weights
-        // and halves subsequent decode until that VRAM interaction is fixed.
-        // Default 0 = off (per-position graph prefill, decode untouched).
+        // Batched prefill is opt-in (CMF_BATCH_K>0). Default 0 = per-position
+        // graph prefill. (Steady-state decode is provably identical either way —
+        // token-graph submit and lm_head both unchanged — so this only trades
+        // prefill wall.)
+        let _tpf = std::time::Instant::now();
         let batch_k = std::env::var("CMF_BATCH_K").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
         if batch_k > 0 && graph_prefill && task_mask.is_none() && mtp.is_none() && !dyn_prefill && pos + 1 < input_ids.len() {
             let hs = self.hidden_size;
@@ -1216,6 +1217,9 @@ impl Pipeline {
                 }
             }
             pos += 1;
+        }
+        if std::env::var("CMF_PREFILL_PROF").is_ok() {
+            eprintln!("prefill: {} tokens in {:.1} ms (batch_k={batch_k})", input_ids.len(), _tpf.elapsed().as_secs_f64() * 1000.0);
         }
         // Prompt absorbed → freeze the o1 layers' skeletons; from here
         // every decode step on those layers is O(W + m·dv + m²).
