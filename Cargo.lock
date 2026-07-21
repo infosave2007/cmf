@@ -468,6 +468,7 @@ dependencies = [
  "bytemuck",
  "cortiq-core",
  "fancy-regex",
+ "libc",
  "metal",
  "minijinja",
  "minijinja-contrib",

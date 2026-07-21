@@ -57,7 +57,7 @@ pub enum QTensor {
 fn repack_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("CMF_REPACK").map(|v| v == "1").unwrap_or(false)
+        std::env::var("CMF_REPACK").map(|v| v == "1").unwrap_or(cfg!(target_os = "android"))
     })
 }
 
@@ -687,7 +687,7 @@ impl QTensor {
                     match crate::gpu::probe_arm(crate::gpu::OpClass::Matvec) {
                         crate::gpu::ProbeArm::Gpu => {}
                         crate::gpu::ProbeArm::CpuTimed => {
-                            qmatvec(self.quant_bytes(), repack, row_scale, &xs, *rows, *cols, out, pool);
+                            qmatvec(self.quant_bytes(), repack, row_scale, x, col_field, *dtype, *rows, *cols, out, pool);
                             crate::gpu::probe_record(
                                 crate::gpu::OpClass::Matvec,
                                 false,
@@ -696,7 +696,7 @@ impl QTensor {
                             return;
                         }
                         crate::gpu::ProbeArm::Cpu => {
-                            qmatvec(self.quant_bytes(), repack, row_scale, &xs, *rows, *cols, out, pool);
+                            qmatvec(self.quant_bytes(), repack, row_scale, x, col_field, *dtype, *rows, *cols, out, pool);
                             return;
                         }
                     }
@@ -733,7 +733,9 @@ impl QTensor {
                                 &bytes[..cpu_rows * *cols],
                                 rep_cpu,
                                 &row_scale[..cpu_rows],
-                                &xs,
+                                x,
+                                col_field,
+                                *dtype,
                                 cpu_rows,
                                 *cols,
                                 out_cpu,
@@ -752,7 +754,9 @@ impl QTensor {
                         &bytes[cpu_rows * *cols..(*rows) * *cols],
                         &[],
                         &row_scale[cpu_rows..],
-                        &xs,
+                        x,
+                        col_field,
+                        *dtype,
                         *rows - cpu_rows,
                         *cols,
                         out_gpu,
@@ -760,7 +764,7 @@ impl QTensor {
                     );
                     return;
                 }
-                qmatvec(self.quant_bytes(), repack, row_scale, &xs, *rows, *cols, out, pool);
+                qmatvec(self.quant_bytes(), repack, row_scale, x, col_field, *dtype, *rows, *cols, out, pool);
             }
         }
     }
@@ -803,9 +807,7 @@ impl QTensor {
                     vbitmatvec2(self.quant_bytes(), vbit_offsets, x1, x2, *rows, *cols, o1, o2, pool);
                     return;
                 }
-                let x1s = prescale(x1, col_field, *dtype);
-                let x2s = prescale(x2, col_field, *dtype);
-                qmatvec2(self.quant_bytes(), row_scale, &x1s, &x2s, *rows, *cols, o1, o2, pool);
+                qmatvec2(self.quant_bytes(), row_scale, x1, x2, col_field, *dtype, *rows, *cols, o1, o2, pool);
             }
         }
     }
@@ -5270,13 +5272,25 @@ fn sdot_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         let want = std::env::var("CMF_SDOT").map(|v| v != "0").unwrap_or(true);
+        if !want { return false; }
+        
         #[cfg(target_arch = "aarch64")]
         {
-            want && std::arch::is_aarch64_feature_detected!("dotprod")
+            if std::arch::is_aarch64_feature_detected!("dotprod") {
+                return true;
+            }
+            #[cfg(target_os = "android")]
+            {
+                if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
+                    if cpuinfo.lines().any(|l| (l.starts_with("Features") || l.starts_with("features")) && l.contains("asimddp")) {
+                        return true;
+                    }
+                }
+            }
+            false
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
-            let _ = want;
             false
         }
     })
@@ -5349,6 +5363,41 @@ fn split_act(x: &[f32]) -> SplitAct {
             } else {
                 (v * inv).round().clamp(-127.0, 127.0) as i8
             }
+        }));
+    }
+    let xsum = xq.iter().map(|&v| v as i32).sum();
+    SplitAct { xq, sx, outliers, xsum }
+}
+
+fn split_act_q8_2f(x: &[f32], col: &[f32]) -> SplitAct {
+    let n = x.len();
+    let rms = (x.iter().zip(col).map(|(&a, &c)| { let v = a * c; (v * v) as f64 })
+        .sum::<f64>() / n.max(1) as f64).sqrt() as f32;
+    let thr = 8.0 * rms;
+    
+    let mut outliers = Vec::new();
+    let mut amax = 0f32;
+    for (j, (&a, &c)) in x.iter().zip(col).enumerate() {
+        let v = a * c;
+        let s = v.abs();
+        if s > thr {
+            outliers.push((j, v));
+        } else if s > amax {
+            amax = s;
+        }
+    }
+    
+    let sx = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+    let inv = 1.0 / sx;
+    let mut xq = XQ_FREE.with(|f| f.borrow_mut().pop()).unwrap_or_default();
+    xq.clear();
+    xq.reserve(n);
+    if outliers.is_empty() {
+        xq.extend(x.iter().zip(col).map(|(&a, &c)| ((a * c) * inv).round().clamp(-127.0, 127.0) as i8));
+    } else {
+        xq.extend(x.iter().zip(col).map(|(&a, &c)| {
+            let v = a * c;
+            if v.abs() > thr { 0 } else { (v * inv).round().clamp(-127.0, 127.0) as i8 }
         }));
     }
     let xsum = xq.iter().map(|&v| v as i32).sum();
@@ -5924,7 +5973,9 @@ fn qmatvec(
     q: &[u8],
     rep: &[u8],
     row_scale: &[f32],
-    xs: &[f32],
+    x: &[f32],
+    col_field: &[f32],
+    dtype: TensorDtype,
     rows: usize,
     cols: usize,
     out: &mut [f32],
@@ -5936,7 +5987,11 @@ fn qmatvec(
 
     #[cfg(target_arch = "aarch64")]
     if sdot_enabled() {
-        let act = split_act(xs);
+        let act = if dtype == TensorDtype::Q8_2f {
+            split_act_q8_2f(x, col_field)
+        } else {
+            split_act(x)
+        };
         let out_addr = SendMut(out.as_mut_ptr());
         let run_range = |start: usize, end: usize| {
             q8_range_sdot(q, rep, row_scale, &act, cols, out_addr, start, end)
@@ -5951,7 +6006,11 @@ fn qmatvec(
     // the SDOT path (CMF_AVX2=0 keeps the exact i8×f32 loop).
     #[cfg(target_arch = "x86_64")]
     if avx2_a8w8_enabled() {
-        let act = split_act(xs);
+        let act = if dtype == TensorDtype::Q8_2f {
+            split_act_q8_2f(x, col_field)
+        } else {
+            split_act(x)
+        };
         let out_addr = SendMut(out.as_mut_ptr());
         let run_range =
             |start: usize, end: usize| q8_range_avx2(q, row_scale, &act, cols, out_addr, start, end);
@@ -5962,25 +6021,18 @@ fn qmatvec(
         return;
     }
 
-    let row_dot = |o: usize| -> f32 { dot_i8_f32(&q[o * cols..(o + 1) * cols], xs) * row_scale[o] };
+    let xs = prescale(x, col_field, dtype);
+    let out_addr = SendMut(out.as_mut_ptr());
+    let run_range = move |start: usize, end: usize| {
+        for o in start..end {
+            let v = dot_i8_f32(&q[o * cols..(o + 1) * cols], &xs) * row_scale[o];
+            // SAFETY: disjoint row ranges per worker.
+            unsafe { *out_addr.at(o) = v };
+        }
+    };
     match pool {
-        Some(pool) if rows >= 256 => {
-            let out_addr = SendMut(out.as_mut_ptr());
-            pool.run(&move |widx, n| {
-                let chunk = rows.div_ceil(n);
-                let start = widx * chunk;
-                let end = (start + chunk).min(rows);
-                for o in start..end {
-                    // SAFETY: disjoint row ranges per worker.
-                    unsafe { *out_addr.at(o) = row_dot(o) };
-                }
-            });
-        }
-        _ => {
-            for (o, dst) in out.iter_mut().enumerate() {
-                *dst = row_dot(o);
-            }
-        }
+        Some(pool) if rows >= 256 => pool.run_rows(rows, &run_range),
+        _ => run_range(0, rows),
     }
 }
 
@@ -5990,6 +6042,8 @@ fn qmatvec2(
     row_scale: &[f32],
     x1: &[f32],
     x2: &[f32],
+    col_field: &[f32],
+    dtype: TensorDtype,
     rows: usize,
     cols: usize,
     o1: &mut [f32],
@@ -5998,8 +6052,8 @@ fn qmatvec2(
 ) {
     #[cfg(target_arch = "aarch64")]
     if sdot_enabled() {
-        let a1s = split_act(x1);
-        let a2s = split_act(x2);
+        let a1s = if dtype == TensorDtype::Q8_2f { split_act_q8_2f(x1, col_field) } else { split_act(x1) };
+        let a2s = if dtype == TensorDtype::Q8_2f { split_act_q8_2f(x2, col_field) } else { split_act(x2) };
         let p1 = SendMut(o1.as_mut_ptr());
         let p2 = SendMut(o2.as_mut_ptr());
         let run_range = |start: usize, end: usize| {
@@ -6013,8 +6067,8 @@ fn qmatvec2(
     }
     #[cfg(target_arch = "x86_64")]
     if avx2_a8w8_enabled() {
-        let a1s = split_act(x1);
-        let a2s = split_act(x2);
+        let a1s = if dtype == TensorDtype::Q8_2f { split_act_q8_2f(x1, col_field) } else { split_act(x1) };
+        let a2s = if dtype == TensorDtype::Q8_2f { split_act_q8_2f(x2, col_field) } else { split_act(x2) };
         let p1 = SendMut(o1.as_mut_ptr());
         let p2 = SendMut(o2.as_mut_ptr());
         let run_range = |start: usize, end: usize| {
@@ -6027,35 +6081,26 @@ fn qmatvec2(
         return;
     }
 
-    let row_dots = |o: usize| -> (f32, f32) {
-        let row = &q[o * cols..(o + 1) * cols];
-        (dot_i8_f32(row, x1) * row_scale[o], dot_i8_f32(row, x2) * row_scale[o])
-    };
-    match pool {
-        Some(pool) if rows >= 256 => {
-            let p1 = SendMut(o1.as_mut_ptr());
-            let p2 = SendMut(o2.as_mut_ptr());
-            pool.run(&move |widx, n| {
-                let chunk = rows.div_ceil(n);
-                let start = widx * chunk;
-                let end = (start + chunk).min(rows);
-                for o in start..end {
-                    let (s1, s2) = row_dots(o);
-                    // SAFETY: disjoint row ranges per worker.
-                    unsafe {
-                        *p1.at(o) = s1;
-                        *p2.at(o) = s2;
-                    }
-                }
-            });
-        }
-        _ => {
-            for o in 0..rows {
-                let (s1, s2) = row_dots(o);
-                o1[o] = s1;
-                o2[o] = s2;
+    let x1s = prescale(x1, col_field, dtype);
+    let x2s = prescale(x2, col_field, dtype);
+
+    let p1 = SendMut(o1.as_mut_ptr());
+    let p2 = SendMut(o2.as_mut_ptr());
+    let run_range = move |start: usize, end: usize| {
+        for o in start..end {
+            let row = &q[o * cols..(o + 1) * cols];
+            let s1 = dot_i8_f32(row, &x1s) * row_scale[o];
+            let s2 = dot_i8_f32(row, &x2s) * row_scale[o];
+            // SAFETY: disjoint row ranges per worker.
+            unsafe {
+                *p1.at(o) = s1;
+                *p2.at(o) = s2;
             }
         }
+    };
+    match pool {
+        Some(pool) if rows >= 256 => pool.run_rows(rows, &run_range),
+        _ => run_range(0, rows),
     }
 }
 
@@ -6109,7 +6154,7 @@ mod tests {
             })
             .collect();
         let mut a = vec![0.0f32; rows];
-        qmatvec(&w, &[], &scales, &x, rows, cols, &mut a, None);
+        qmatvec(&w, &[], &scales, &x, &[], TensorDtype::Q8Row, rows, cols, &mut a, None);
         for o in 0..rows {
             let mut acc = 0.0f32;
             for j in 0..cols {
@@ -6243,9 +6288,9 @@ mod tests {
             }
         }
         let mut a = vec![0.0f32; rows];
-        qmatvec(&w, &[], &scales, &x, rows, cols, &mut a, None);
+        qmatvec(&w, &[], &scales, &x, &[], TensorDtype::Q8Row, rows, cols, &mut a, None);
         let mut b = vec![0.0f32; rows];
-        qmatvec(&w, &rep, &scales, &x, rows, cols, &mut b, None);
+        qmatvec(&w, &rep, &scales, &x, &[], TensorDtype::Q8Row, rows, cols, &mut b, None);
         assert_eq!(a, b, "full-range repack output diverged");
 
         #[cfg(target_arch = "aarch64")]
@@ -6272,7 +6317,7 @@ mod tests {
         let scales = vec![0.01f32; rows];
         let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.21).sin()).collect();
         let mut a = vec![0.0f32; rows];
-        qmatvec(&w, &[], &scales, &x, rows, cols, &mut a, None);
+        qmatvec(&w, &[], &scales, &x, &[], TensorDtype::Q8Row, rows, cols, &mut a, None);
         let (mut num, mut den) = (0f64, 0f64);
         for o in 0..rows {
             let mut acc = 0.0f32;

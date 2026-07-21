@@ -293,7 +293,44 @@ impl Drop for Pool {
     }
 }
 
+#[cfg(target_os = "android")]
+fn pin_thread_to_big_cores() {
+    use std::mem;
+    let mut caps: Vec<u64> = Vec::new();
+    for cpu in 0.. {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity");
+        match std::fs::read_to_string(&path) {
+            Ok(v) => if let Ok(cap) = v.trim().parse() {
+                caps.push(cap);
+            } else {
+                break;
+            },
+            Err(_) => break,
+        }
+    }
+    let max = caps.iter().copied().max().unwrap_or(0);
+    let min = caps.iter().copied().min().unwrap_or(0);
+    
+    // Only pin if heterogeneous
+    if caps.len() < 2 || max == min {
+        return;
+    }
+    
+    unsafe {
+        let mut set: libc::cpu_set_t = mem::zeroed();
+        for (i, &c) in caps.iter().enumerate() {
+            if c * 8 >= max * 5 {
+                libc::CPU_SET(i, &mut set);
+            }
+        }
+        libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
 fn worker_loop(inner: &Inner, idx: usize) {
+    #[cfg(target_os = "android")]
+    pin_thread_to_big_cores();
+
     // The pool is created at epoch 0; baseline MUST be 0, not a fresh
     // epoch read — if the caller publishes a job before the OS actually
     // starts this thread, reading the live epoch would adopt that job's
@@ -356,18 +393,14 @@ pub fn matvec_rows(pool: Option<&Pool>, w: &[f32], x: &[f32], out: &mut [f32]) {
     };
 
     match pool {
-        // Small outputs are not worth the barrier round-trip.
         Some(pool) if out_dim >= 256 => {
             let out_addr = SendMut(out.as_mut_ptr());
-            pool.run(&move |widx, n| {
-                let chunk = out_dim.div_ceil(n);
-                let start = widx * chunk;
-                let end = (start + chunk).min(out_dim);
+            let run_range = move |start: usize, end: usize| {
                 for o in start..end {
-                    // SAFETY: workers write disjoint index ranges.
                     unsafe { *out_addr.at(o) = row_dot(o) };
                 }
-            });
+            };
+            pool.run_rows(out_dim, &run_range);
         }
         _ => {
             for (o, dst) in out.iter_mut().enumerate() {
@@ -410,19 +443,16 @@ pub fn matvec_rows2(
         Some(pool) if out_dim >= 256 => {
             let o1 = SendMut(out1.as_mut_ptr());
             let o2 = SendMut(out2.as_mut_ptr());
-            pool.run(&move |widx, n| {
-                let chunk = out_dim.div_ceil(n);
-                let start = widx * chunk;
-                let end = (start + chunk).min(out_dim);
+            let run_range = move |start: usize, end: usize| {
                 for o in start..end {
                     let (s1, s2) = row_dots(o);
-                    // SAFETY: workers write disjoint index ranges.
                     unsafe {
                         *o1.at(o) = s1;
                         *o2.at(o) = s2;
                     }
                 }
-            });
+            };
+            pool.run_rows(out_dim, &run_range);
         }
         _ => {
             for o in 0..out_dim {
