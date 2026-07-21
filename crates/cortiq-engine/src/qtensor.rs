@@ -288,7 +288,7 @@ impl QTensor {
         match self {
             Self::Mapped {
                 idx,
-                dtype: TensorDtype::Q1 | TensorDtype::Q1T | TensorDtype::Q4Block,
+                dtype: TensorDtype::Q1 | TensorDtype::Q1T | TensorDtype::Q4Block | TensorDtype::Q8Row,
                 rows,
                 cols,
                 ..

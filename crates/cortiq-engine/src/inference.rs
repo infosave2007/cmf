@@ -49,6 +49,42 @@ pub fn rms_norm_into(input: &[f32], weight: &[f32], eps: f64, style: NormStyle, 
     }
 }
 
+/// Fused residual addition and RMSNorm into a caller-owned buffer:
+/// `h += delta`, then `out = rms_norm(h, weight)`.
+/// This avoids a separate pass over `h` for the residual addition and sum of squares.
+pub fn add_rmsnorm_fused_into(
+    h: &mut [f32],
+    delta: &[f32],
+    weight: &[f32],
+    eps: f64,
+    style: NormStyle,
+    out: &mut [f32],
+) {
+    let n = h.len();
+    debug_assert_eq!(delta.len(), n);
+    debug_assert_eq!(out.len(), n);
+    let mut mean_sq = 0.0f64;
+    for (hv, &dv) in h.iter_mut().zip(delta) {
+        let val = *hv + dv;
+        *hv = val;
+        mean_sq += (val as f64) * (val as f64);
+    }
+    mean_sq /= n as f64;
+    let inv_rms = 1.0 / (mean_sq + eps).sqrt() as f32;
+    match style {
+        NormStyle::Qwen => {
+            for (o, (&x, &w)) in out.iter_mut().zip(h.iter().zip(weight)) {
+                *o = x * inv_rms * w;
+            }
+        }
+        NormStyle::Gemma => {
+            for (o, (&x, &w)) in out.iter_mut().zip(h.iter().zip(weight)) {
+                *o = x * inv_rms * (1.0 + w);
+            }
+        }
+    }
+}
+
 /// Sparse SwiGLU FFN: compute only `active_indices` neurons.
 ///
 /// `out = down_projᵀ[·, active] · (silu(gate_proj[active, ·]·h) ⊙ up_proj[active, ·]·h)`

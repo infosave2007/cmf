@@ -2437,11 +2437,12 @@ fn encode_q1t_matvec(
 }
 
 /// Which GPU kernel a graph projection uses.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone)]
 enum ProjKind {
     Q1,
     Q1t,
     Q4b,
+    Q8(Buffer),
 }
 
 /// Encode q4_block matvec (precise 4-bit, no overlay). Split layout: packed
@@ -2480,7 +2481,7 @@ fn encode_proj(
     enc: &metal::ComputeCommandEncoderRef,
     fbuf: &Buffer,
     abs: usize,
-    kind: ProjKind,
+    kind: &ProjKind,
     in_buf: &Buffer,
     out_buf: &Buffer,
     rows: usize,
@@ -2497,7 +2498,39 @@ fn encode_proj(
         ProjKind::Q1 => {
             encode_q1_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
         }
+        ProjKind::Q8(rs_buf) => {
+            encode_q8_matvec(c, enc, fbuf, abs, rs_buf, in_buf, out_buf, rows, gpr);
+        }
     }
+}
+
+/// Encode q8_row matvec.
+fn encode_q8_matvec(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &Buffer,
+    abs: usize,
+    rs_buf: &Buffer,
+    in_buf: &Buffer,
+    out_buf: &Buffer,
+    rows: usize,
+    gpr: usize,
+) {
+    enc.set_compute_pipeline_state(&c.q8);
+    enc.set_buffer(0, Some(fbuf), abs as u64);
+    enc.set_buffer(1, Some(in_buf), 0);
+    enc.set_buffer(2, Some(rs_buf), 0);
+    enc.set_buffer(3, Some(out_buf), 0);
+    let cols4 = (gpr * (GROUP_SIZE / 4)) as u32;
+    let rows_u = rows as u32;
+    enc.set_bytes(4, 4, &cols4 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    let sgs = 8u64;
+    let n_tg = (rows as u64).div_ceil(sgs);
+    enc.dispatch_thread_groups(
+        MTLSize::new(n_tg, 1, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
 }
 
 /// Encode the q1t sparse-overlay add onto `y` (base already there). Reads the
@@ -4097,8 +4130,43 @@ impl TokenGraph {
             cortiq_core::TensorDtype::Q1 => self.q1_abs(t).map(|a| (a, ProjKind::Q1)),
             cortiq_core::TensorDtype::Q1T => self.q1t_abs(t).map(|a| (a, ProjKind::Q1t)),
             cortiq_core::TensorDtype::Q4Block => self.q4b_abs(t).map(|a| (a, ProjKind::Q4b)),
+            cortiq_core::TensorDtype::Q8Row => self.q8_abs(t).map(|(a, rs)| (a, ProjKind::Q8(rs))),
             _ => None,
         }
+    }
+
+    /// Validate one q8_row tensor and cache its row_scale buffer.
+    fn q8_abs(&self, t: (usize, usize, usize)) -> Option<(usize, Buffer)> {
+        let (idx, rows, cols) = t;
+        if cols % 4 != 0 {
+            return None;
+        }
+        let entry = &self.model.tensors[idx];
+        let abs = self.model.entry_abs_offset(entry)?;
+        let qlen = rows * cols;
+        if abs + qlen + rows * 4 > self.safe_len {
+            return None;
+        }
+
+        let base = self.model.primary_bytes().as_ptr() as usize;
+        let c = self.c;
+        let rs_buf = {
+            let mut cache = c.rs_bufs.lock().unwrap();
+            cache
+                .entry((base, idx))
+                .or_insert_with(|| {
+                    crate::gpu::probe_note_cold();
+                    let bytes = self.model.entry_bytes(entry);
+                    let scales_bytes = &bytes[qlen..qlen + rows * 4];
+                    c._device.new_buffer_with_data(
+                        scales_bytes.as_ptr() as *const std::ffi::c_void,
+                        (rows * 4) as u64,
+                        metal::MTLResourceOptions::StorageModeShared,
+                    )
+                })
+                .clone()
+        };
+        Some((abs, rs_buf))
     }
 
     /// Pre-flight check for a GDN layer (call before any encode).
@@ -4199,7 +4267,7 @@ impl TokenGraph {
         let (abs, q1t) = self.proj_abs(lm).unwrap();
         let lg_b = io_buf(self.c, 44_000_000_077 + lm.1, lm.1 * 4);
         let enc = cmd.new_compute_command_encoder();
-        encode_proj(self.c, enc, &self.fbuf, abs, q1t, &self.n_b, &lg_b, lm.1, lm.2 / GROUP_SIZE);
+        encode_proj(self.c, enc, &self.fbuf, abs, &q1t, &self.n_b, &lg_b, lm.1, lm.2 / GROUP_SIZE);
         enc.end_encoding();
         self.logits_b = Some(lg_b);
     }
@@ -4217,8 +4285,9 @@ impl TokenGraph {
     /// caller must `sync` + `read_qkv` before using the values.
     pub fn encode_attn_prefix(&mut self, l: &AttnGpuLayer) {
         let cmd = self.ensure_cmd();
-        let (aq, ak, av) =
-            (self.proj_abs(l.wq).unwrap(), self.proj_abs(l.wk).unwrap(), self.proj_abs(l.wv).unwrap());
+        let aq = self.proj_abs(l.wq).unwrap();
+        let ak = self.proj_abs(l.wk).unwrap();
+        let av = self.proj_abs(l.wv).unwrap();
         enc_simple(
             &cmd,
             &self.c.rmsn,
@@ -4231,9 +4300,9 @@ impl TokenGraph {
         let k_b = io_buf(self.c, 41_000_000_019 + l.wk.1, l.wk.1 * 4);
         let v_b = io_buf(self.c, 42_000_000_037 + l.wv.1, l.wv.1 * 4);
         let enc = cmd.new_compute_command_encoder();
-        encode_proj(self.c, enc, &self.fbuf, aq.0, aq.1, &self.n_b, &q_b, l.wq.1, l.wq.2 / GROUP_SIZE);
-        encode_proj(self.c, enc, &self.fbuf, ak.0, ak.1, &self.n_b, &k_b, l.wk.1, l.wk.2 / GROUP_SIZE);
-        encode_proj(self.c, enc, &self.fbuf, av.0, av.1, &self.n_b, &v_b, l.wv.1, l.wv.2 / GROUP_SIZE);
+        encode_proj(self.c, enc, &self.fbuf, aq.0, &aq.1, &self.n_b, &q_b, l.wq.1, l.wq.2 / GROUP_SIZE);
+        encode_proj(self.c, enc, &self.fbuf, ak.0, &ak.1, &self.n_b, &k_b, l.wk.1, l.wk.2 / GROUP_SIZE);
+        encode_proj(self.c, enc, &self.fbuf, av.0, &av.1, &self.n_b, &v_b, l.wv.1, l.wv.2 / GROUP_SIZE);
         enc.end_encoding();
         self.qkv_bufs = Some((q_b, k_b, v_b));
     }
@@ -4268,11 +4337,12 @@ impl TokenGraph {
         {
             let enc = cmd.new_compute_command_encoder();
             let (abs, q1t) = self.proj_abs(l.wo).unwrap();
-            encode_proj(self.c, enc, &self.fbuf, abs, q1t, ao_b, &self.d_b, l.wo.1, l.wo.2 / GROUP_SIZE);
+            encode_proj(self.c, enc, &self.fbuf, abs, &q1t, ao_b, &self.d_b, l.wo.1, l.wo.2 / GROUP_SIZE);
             enc.end_encoding();
         }
-        enc_axpy(self.c, cmd, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
-        self.encode_post_ffn(cmd, l.post_norm, l.gate, l.up, l.down);
+        // Fused: h += d_b, n = rmsnorm(h, post_norm) — one dispatch
+        // instead of separate enc_axpy + rmsnorm.
+        self.encode_post_ffn(cmd, l.post_norm, l.gate, l.up, l.down, Some(&self.d_b));
     }
 
     /// Dims contract of the device-attend kernels (host-side check).
@@ -4369,9 +4439,9 @@ impl TokenGraph {
                 self.proj_abs(l.wk).unwrap(),
                 self.proj_abs(l.wv).unwrap(),
             );
-            encode_proj(self.c, enc, &self.fbuf, aq.0, aq.1, &self.n_b, &q_b, l.wq.1, l.wq.2 / GROUP_SIZE);
-            encode_proj(self.c, enc, &self.fbuf, ak.0, ak.1, &self.n_b, &k_b, l.wk.1, l.wk.2 / GROUP_SIZE);
-            encode_proj(self.c, enc, &self.fbuf, av.0, av.1, &self.n_b, &v_b, l.wv.1, l.wv.2 / GROUP_SIZE);
+            encode_proj(self.c, enc, &self.fbuf, aq.0, &aq.1, &self.n_b, &q_b, l.wq.1, l.wq.2 / GROUP_SIZE);
+            encode_proj(self.c, enc, &self.fbuf, ak.0, &ak.1, &self.n_b, &k_b, l.wk.1, l.wk.2 / GROUP_SIZE);
+            encode_proj(self.c, enc, &self.fbuf, av.0, &av.1, &self.n_b, &v_b, l.wv.1, l.wv.2 / GROUP_SIZE);
             enc.end_encoding();
         }
         // 3. per-head qk-norm + RoPE (gate split into g_b)
@@ -4448,7 +4518,10 @@ impl TokenGraph {
         true
     }
     /// post-norm(h) → n_b, gate/up, SiLU·mul, down, h += d — shared by
-    /// the GDN layer tail and the attention suffix.
+    /// the GDN layer tail and the attention suffix. When `delta` is
+    /// Some, fuses `h += delta` and `n = rmsnorm(h, post_norm)` into a
+    /// single `add_rmsnorm_rows` dispatch instead of separate axpy +
+    /// rmsnorm (saves one encoder round trip per call — 2/layer).
     fn encode_post_ffn(
         &self,
         cmd: &metal::CommandBufferRef,
@@ -4456,24 +4529,41 @@ impl TokenGraph {
         gate: (usize, usize, usize),
         up: (usize, usize, usize),
         down: (usize, usize, usize),
+        delta: Option<&Buffer>,
     ) {
         let inter = gate.1;
         let fg_b = io_buf(self.c, 33_000_000_209 + inter, inter * 4);
         let fu_b = io_buf(self.c, 34_000_000_213 + inter, inter * 4);
         let fa_b = io_buf(self.c, 35_000_000_221 + inter, inter * 4);
-        enc_simple(
-            cmd,
-            &self.c.rmsn,
-            &[(&self.h_b, 0), (&const_buf(self.c, post_norm), 0), (&self.n_b, 0)],
-            &[self.dims.hidden as u32, self.dims.gemma as u32],
-            &[self.dims.eps],
-            (256, 256),
-        );
+        // Fused residual-add + RMSNorm: h += delta (when present),
+        // n = rmsnorm(h, post_norm). Uses add_rmsnorm_rows which
+        // already handles the `hasd` flag.
+        {
+            let pn_buf = const_buf(self.c, post_norm);
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.c.addnorm);
+            enc.set_buffer(0, Some(&self.h_b), 0);
+            enc.set_buffer(1, Some(delta.unwrap_or(&self.h_b)), 0);
+            enc.set_buffer(2, Some(&pn_buf), 0);
+            enc.set_buffer(3, Some(&self.n_b), 0);
+            let n_u = self.dims.hidden as u32;
+            let g_u = self.dims.gemma as u32;
+            let hd_u = delta.is_some() as u32;
+            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &g_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(6, 4, &self.dims.eps as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(1, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+            enc.end_encoding();
+        }
         {
             let enc = cmd.new_compute_command_encoder();
             let (ag, au) = (self.proj_abs(gate).unwrap(), self.proj_abs(up).unwrap());
-            encode_proj(self.c, enc, &self.fbuf, ag.0, ag.1, &self.n_b, &fg_b, gate.1, gate.2 / GROUP_SIZE);
-            encode_proj(self.c, enc, &self.fbuf, au.0, au.1, &self.n_b, &fu_b, up.1, up.2 / GROUP_SIZE);
+            encode_proj(self.c, enc, &self.fbuf, ag.0, &ag.1, &self.n_b, &fg_b, gate.1, gate.2 / GROUP_SIZE);
+            encode_proj(self.c, enc, &self.fbuf, au.0, &au.1, &self.n_b, &fu_b, up.1, up.2 / GROUP_SIZE);
             enc.end_encoding();
         }
         {
@@ -4492,7 +4582,7 @@ impl TokenGraph {
         {
             let enc = cmd.new_compute_command_encoder();
             let ad = self.proj_abs(down).unwrap();
-            encode_proj(self.c, enc, &self.fbuf, ad.0, ad.1, &fa_b, &self.d_b, down.1, down.2 / GROUP_SIZE);
+            encode_proj(self.c, enc, &self.fbuf, ad.0, &ad.1, &fa_b, &self.d_b, down.1, down.2 / GROUP_SIZE);
             enc.end_encoding();
         }
         enc_axpy(self.c, cmd, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
@@ -4520,7 +4610,7 @@ impl TokenGraph {
             if !self.gdn_ok(l, cfg) || st.len() != ring_len + s_len {
                 return false;
             }
-            let mut a8 = [(0usize, ProjKind::Q1); 6];
+            let mut a8 = core::array::from_fn(|_| (0usize, ProjKind::Q1));
             for (slot, t) in [l.qkv, l.z, l.out, l.gate, l.up, l.down].iter().enumerate() {
                 a8[slot] = self.proj_abs(*t).unwrap();
             }
@@ -4581,8 +4671,8 @@ impl TokenGraph {
         // 2. mixer: qkv, z, a, b (independent — one encoder)
         {
             let enc = cmd.new_compute_command_encoder();
-            encode_proj(c, enc, &fbuf, a8[0].0, a8[0].1, &n_b, &qkv_b, l.qkv.1, l.qkv.2 / GROUP_SIZE);
-            encode_proj(c, enc, &fbuf, a8[1].0, a8[1].1, &n_b, &z_b, l.z.1, l.z.2 / GROUP_SIZE);
+            encode_proj(c, enc, &fbuf, a8[0].0, &a8[0].1, &n_b, &qkv_b, l.qkv.1, l.qkv.2 / GROUP_SIZE);
+            encode_proj(c, enc, &fbuf, a8[1].0, &a8[1].1, &n_b, &z_b, l.z.1, l.z.2 / GROUP_SIZE);
             for (t, y) in [(&l.a, &a_b), (&l.b, &b_b)] {
                 let (data, rows, cols) = *t;
                 let wb = vec_buf(data);
@@ -4670,12 +4760,12 @@ impl TokenGraph {
         // 6. out_proj of → d;  7. h += d
         {
             let enc = cmd.new_compute_command_encoder();
-            encode_proj(c, enc, &fbuf, a8[2].0, a8[2].1, &of_b, &d_b, l.out.1, l.out.2 / GROUP_SIZE);
+            encode_proj(c, enc, &fbuf, a8[2].0, &a8[2].1, &of_b, &d_b, l.out.1, l.out.2 / GROUP_SIZE);
             enc.end_encoding();
         }
-        enc_axpy(c, &cmd, &d_b, &h_b, 1.0, cfg.hidden);
         // 8–12. post-norm + FFN + residual (shared with attn suffix)
-        self.encode_post_ffn(&cmd, l.post_norm, l.gate, l.up, l.down);
+        // Fused: h += d, n = rmsnorm(h, post_norm) — one dispatch.
+        self.encode_post_ffn(&cmd, l.post_norm, l.gate, l.up, l.down, Some(&d_b));
         }
 
         for (sb, st) in st_bs.iter().zip(states) {

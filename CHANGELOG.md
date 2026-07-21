@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.0] — 2026-07-20
+## [0.5.1] — 2026-07-21
+
+### Added
+- **GPU Metal optimizations**: ported fused `add_rmsnorm` from Vulkan.
+- **Metal `TokenGraph` Q8 support**: `q8_row` tensors are now supported natively in the Metal decode graph, eliminating CPU fallback.
+- **CPU `add_rmsnorm` fusion**: integrated residual addition and RMSNorm into a single SIMD pass (`add_rmsnorm_fused_into`), reducing memory bandwidth overhead.
 
 ### Added
 

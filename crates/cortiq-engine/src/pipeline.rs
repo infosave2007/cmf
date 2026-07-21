@@ -2897,14 +2897,17 @@ impl Pipeline {
                 Some(w) => inference::rms_norm(&attn_out, w, self.rms_eps, self.norm_style),
                 None => attn_out,
             };
-            for (i, &a) in attn_out.iter().enumerate() {
-                h[i] += a;
-            }
+            let lw = &self.weights.layers[li];
+            inference::add_rmsnorm_fused_into(
+                &mut h,
+                &attn_out,
+                &lw.post_norm,
+                self.rms_eps,
+                self.norm_style,
+                &mut self.ws.p1,
+            );
             let mut attn_out = attn_out;
             attention::recycle_buf(&mut attn_out);
-
-            let lw = &self.weights.layers[li];
-            inference::rms_norm_into(&h, &lw.post_norm, self.rms_eps, self.norm_style, &mut self.ws.p1);
             let post_normed = &self.ws.p1;
 
             let ffn_masked = task_mask
