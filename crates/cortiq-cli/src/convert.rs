@@ -148,6 +148,7 @@ pub(crate) enum Quant {
     /// lever of the holographic-transfer path — what lets a NORMAL
     /// checkpoint survive 1-bit.
     Q1s,
+    Q1t,
 }
 
 /// Quantize a 2-D matrix `[out_dim, in_dim]` per the chosen scheme.
@@ -179,6 +180,10 @@ pub(crate) fn quantize_2d(quant: Quant, vals: &[f32], out_dim: usize, in_dim: us
             (TensorDtype::Q1S, encode_q1s(vals, out_dim, in_dim, q1s_keep_frac()))
         }
         Quant::Q1s => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
+        Quant::Q1t if in_dim % GROUP_SIZE == 0 => {
+            (TensorDtype::Q1T, crate::gptq::quantize_q1t(vals, out_dim, in_dim, &vec![1.0; in_dim], 0.0))
+        }
+        Quant::Q1t => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
     }
 }
 
@@ -193,9 +198,9 @@ pub(crate) fn parse_quant(s: &str) -> anyhow::Result<Quant> {
         "q1" => Quant::Q1,
         "q1p" | "q1_ptq" => Quant::Q1p,
         "q1s" | "q1_mask" => Quant::Q1s,
+        "q1t" | "q1_ternary" => Quant::Q1t,
         other => anyhow::bail!(
-            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, f16, vbit, q1, q1p, or q1s — \
-             q1 = 1-bit-trained, q1p = error-diffusion 1-bit PTQ, q1s = q1p + outlier mask)"
+            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, f16, vbit, q1, q1p, q1s, or q1t)"
         ),
     })
 }
@@ -611,6 +616,45 @@ pub(crate) fn to_f32(dtype: &str, raw: &[u8]) -> anyhow::Result<Vec<f32>> {
     })
 }
 
+pub(crate) fn unpack_mlx(
+    w_raw: &[u8],
+    s_raw: &[u8],
+    b_raw: Option<&[u8]>,
+    out_dim: usize,
+    in_dim: usize,
+    bits: usize,
+) -> anyhow::Result<Vec<f32>> {
+    let mut out = vec![0f32; out_dim * in_dim];
+    let num_groups = s_raw.len() / 2 / out_dim;
+    let group_size = in_dim / num_groups;
+    
+    let w_u32: Vec<u32> = w_raw.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let s_f16: Vec<u16> = s_raw.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+    let b_f16: Option<Vec<u16>> = b_raw.map(|r| r.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect());
+
+    let vals_per_u32 = 32 / bits;
+    let mask = (1 << bits) - 1;
+
+    for row in 0..out_dim {
+        for col in 0..in_dim {
+            let group = col / group_size;
+            let scale = f16_to_f32(s_f16[row * num_groups + group]);
+            let bias = b_f16.as_ref().map(|b| f16_to_f32(b[row * num_groups + group])).unwrap_or(0.0);
+            
+            let u32_idx = (row * in_dim + col) / vals_per_u32;
+            let shift = (col % vals_per_u32) * bits;
+            let val = (w_u32[u32_idx] >> shift) & mask;
+            
+            // For 1-bit, MLX might map 0->-1 and 1->1, but wait!
+            // In 2-bit, MLX maps 0,1,2,3 directly to value * scale + bias.
+            // If the model is 1-bit, is the value 0 and 1, or is it sign bits?
+            // Actually, bias handles the shift. If it's a 1-bit scale+bias model, `val * scale + bias` works.
+            out[row * in_dim + col] = (val as f32) * scale + bias;
+        }
+    }
+    Ok(out)
+}
+
 /// Blob-layout sort key that puts tensors in decode-traversal order:
 /// `(phase, layer, group, expert, projection)`. Phase orders embed → layers →
 /// final-norm → lm_head → MTP → tail; within a layer, attention precedes the
@@ -917,10 +961,11 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     if let Some(rs) = tc.get("rope_scaling").filter(|v| !v.is_null()) {
         let kind = rs.get("type").or_else(|| rs.get("rope_type")).and_then(|v| v.as_str());
         match kind {
-            Some("longrope") | Some("su") => {
+            Some("longrope") | Some("su") | Some("yarn") | Some("linear") | Some("dynamic") | Some("mrope") => {
                 let orig = cfg_usize(tc, "original_max_position_embeddings").unwrap_or(4096);
                 eprintln!(
-                    "  note: longrope scaling — serving the exact {orig}-token native window"
+                    "  note: rope scaling '{:?}' — serving the exact {orig}-token native window",
+                    kind.unwrap()
                 );
                 max_pos = orig;
             }
@@ -1566,16 +1611,61 @@ pub fn run_convert(
             done += 1;
             progress(done as f32 / total as f32);
             let Some(name) = canon_name(&m.name) else { continue };
+
+            // Skip MLX scales and biases as they are processed with the weight.
+            if m.dtype == "F16" && (name.ends_with(".scales") || name.ends_with(".biases")) {
+                continue;
+            }
+
+            let (m_shape, m_vals) = if m.dtype == "U32" && m.name.ends_with(".weight") {
+                let scales_name = m.name.replace(".weight", ".scales");
+                let biases_name = m.name.replace(".weight", ".biases");
+                let mut scales_blob = None;
+                let mut biases_blob = None;
+                for f in &files {
+                    if let Some(t) = f.tensors.iter().find(|t| t.name == scales_name) {
+                        scales_blob = Some(f.bytes(t));
+                    }
+                    if let Some(t) = f.tensors.iter().find(|t| t.name == biases_name) {
+                        biases_blob = Some(f.bytes(t));
+                    }
+                }
+                let scales = scales_blob.ok_or_else(|| anyhow::anyhow!("missing {} for MLX unpacking", scales_name))?;
+                let out_dim = m.shape[0];
+                let w_cols = m.shape[1];
+                let num_groups = scales.len() / 2 / out_dim;
+                
+                let mut bits = 0;
+                let mut in_dim = 0;
+                for b in [1, 2, 3, 4, 8] {
+                    let possible_in_dim = w_cols * 32 / b;
+                    if possible_in_dim % num_groups == 0 {
+                        let gs = possible_in_dim / num_groups;
+                        if gs == 32 || gs == 64 || gs == 128 {
+                            bits = b;
+                            in_dim = possible_in_dim;
+                            break;
+                        }
+                    }
+                }
+                if bits == 0 {
+                    anyhow::bail!("Could not deduce MLX bit width for shape {:?} and {} scale groups", m.shape, num_groups);
+                }
+                (vec![out_dim, in_dim], unpack_mlx(file.bytes(m), scales, biases_blob, out_dim, in_dim, bits)?)
+            } else {
+                (m.shape.clone(), to_f32(&m.dtype, file.bytes(m))?)
+            };
+
             // qwen3_next / AgentWorld fuse the GDN projections (in_proj_qkvz /
             // in_proj_ba) with a group-interleaved layout; split them natively
             // into the canonical hub tensors (in_proj_qkv/z/a/b). Pure row
             // permutation — no value is changed.
             if name.contains(".linear_attn.in_proj_qkvz") || name.contains(".linear_attn.in_proj_ba") {
-                if m.shape.len() != 2 {
-                    anyhow::bail!("fused GDN tensor '{name}': expected 2-D, got {:?}", m.shape);
+                if m_shape.len() != 2 {
+                    anyhow::bail!("fused GDN tensor '{name}': expected 2-D, got {:?}", m_shape);
                 }
-                let w = to_f32(&m.dtype, file.bytes(m))?;
-                let hid = m.shape[1];
+                let w = &m_vals;
+                let hid = m_shape[1];
                 let miss = |k: &str| anyhow::anyhow!("fused GDN needs {k} in config");
                 let nk = arch.linear_num_key_heads.ok_or_else(|| miss("linear_num_key_heads"))?;
                 let dk = arch.linear_key_head_dim.ok_or_else(|| miss("linear_key_head_dim"))?;
@@ -1598,9 +1688,9 @@ pub fn run_convert(
             if name.ends_with(".self_attn.qkv_proj.weight")
                 || name.ends_with(".mlp.gate_up_proj.weight")
             {
-                anyhow::ensure!(m.shape.len() == 2, "fused '{name}': expected 2-D");
-                let w = to_f32(&m.dtype, file.bytes(m))?;
-                let (rows, cols) = (m.shape[0], m.shape[1]);
+                anyhow::ensure!(m_shape.len() == 2, "fused '{name}': expected 2-D");
+                let w = &m_vals;
+                let (rows, cols) = (m_shape[0], m_shape[1]);
                 let parts: Vec<(String, usize, usize)> = if name.contains("qkv_proj") {
                     let q = arch.num_attention_heads * arch.head_dim;
                     let kv = arch.num_kv_heads * arch.head_dim;
@@ -1650,9 +1740,9 @@ pub fn run_convert(
                 let pat = arch.sliding_window_pattern.unwrap_or(usize::MAX);
                 if let Some(li) = li {
                     if (li + 1) % pat == 0 {
-                        anyhow::ensure!(m.shape.len() == 2, "'{name}': expected 2-D");
-                        let w = to_f32(&m.dtype, file.bytes(m))?;
-                        let (rows, cols) = (m.shape[0], m.shape[1]);
+                        anyhow::ensure!(m_shape.len() == 2, "'{name}': expected 2-D");
+                        let w = &m_vals;
+                        let (rows, cols) = (m_shape[0], m_shape[1]);
                         for out_name in [name.clone(), name.replace("k_proj", "v_proj")] {
                             let (dt, data) = if rows * cols >= GROUP_SIZE && !force_f16(&out_name) {
                                 quantize_2d(quant, &w, rows, cols)
@@ -1679,7 +1769,7 @@ pub fn run_convert(
                     if let Some(keep) = plan.keep.get(&li) {
                         let (shape, vals) = match plan.overlay.get(&name) {
                             Some((s, v)) => (s.clone(), v.clone()),
-                            None => (m.shape.clone(), to_f32(&m.dtype, file.bytes(m))?),
+                            None => (m_shape.clone(), m_vals.clone()),
                         };
                         let (out_shape, out_vals) = slice_ffn(&kind, &shape, &vals, keep)?;
                         let numel = out_shape[0] * out_shape[1];
@@ -1694,19 +1784,19 @@ pub fn run_convert(
                     }
                 }
             }
-            let vals = to_f32(&m.dtype, file.bytes(m))?;
-            let numel: usize = m.shape.iter().product();
+            let vals = m_vals;
+            let numel: usize = m_shape.iter().product();
             if numel != vals.len() {
-                anyhow::bail!("tensor '{name}': {} values for shape {:?}", vals.len(), m.shape);
+                anyhow::bail!("tensor '{name}': {} values for shape {:?}", vals.len(), m_shape);
             }
             // 1-D tensors, tiny tensors, non-2-D, and gate-critical projections go f16.
-            let two_d = m.shape.len() == 2 && numel >= GROUP_SIZE && !force_f16(&name);
+            let two_d = m_shape.len() == 2 && numel >= GROUP_SIZE && !force_f16(&name);
             let (dt, data) = if two_d {
-                quantize_2d(quant, &vals, m.shape[0], m.shape[1])
+                quantize_2d(quant, &vals, m_shape[0], m_shape[1])
             } else {
                 (TensorDtype::F16, encode_f16(&vals))
             };
-            tensors.push(TensorSpec { name, dtype: dt, shape: m.shape.clone(), data });
+            tensors.push(TensorSpec { name, dtype: dt, shape: m_shape.clone(), data });
         }
     }
 
@@ -1738,7 +1828,7 @@ pub fn run_convert(
         Quant::Q4Tiled => QuantType::Q4Block,
         // File-level label only (per-tensor truth is in the directory);
         // Vbit is the closest existing informational bucket for q1.
-        Quant::Q1 | Quant::Q1p | Quant::Q1s => QuantType::Vbit,
+        Quant::Q1 | Quant::Q1p | Quant::Q1s | Quant::Q1t => QuantType::Vbit,
     };
     let provenance = match &defrag_plan {
         Some(plan) => {

@@ -423,6 +423,41 @@ impl QTensor {
                     }
                     return;
                 }
+                if *dtype == TensorDtype::Q1T {
+                    let bytes = self.quant_bytes();
+                    let gpr = cols / GROUP_SIZE;
+                    let base_len = self.rows() * gpr * cortiq_core::quant::Q1T_TILE;
+                    for gi in 0..gpr {
+                        let off = (r * gpr + gi) * cortiq_core::quant::Q1T_TILE;
+                        let s = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+                        let codes = &bytes[off + 2..off + cortiq_core::quant::Q1T_TILE];
+                        for k in 0..GROUP_SIZE {
+                            dst[gi * GROUP_SIZE + k] = match cortiq_core::quant::q1t_code(codes, k) {
+                                1 => s,
+                                2 => -s,
+                                _ => 0.0,
+                            };
+                        }
+                    }
+                    // Overlay
+                    let rows = self.rows();
+                    let entries = base_len + (rows + 1) * 4;
+                    if entries <= bytes.len() {
+                        let ptrs = &bytes[base_len..base_len + (rows + 1) * 4];
+                        let r0 = u32::from_le_bytes([ptrs[r * 4], ptrs[r * 4 + 1], ptrs[r * 4 + 2], ptrs[r * 4 + 3]]) as usize;
+                        let r1 = u32::from_le_bytes([ptrs[(r + 1) * 4], ptrs[(r + 1) * 4 + 1], ptrs[(r + 1) * 4 + 2], ptrs[(r + 1) * 4 + 3]]) as usize;
+                        let off = entries + r0 * 4;
+                        for i in 0..r1 - r0 {
+                            let item = &bytes[off + i * 4..off + i * 4 + 4];
+                            let c = u16::from_le_bytes([item[0], item[1]]) as usize;
+                            let v = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([item[2], item[3]]));
+                            if c < cols {
+                                dst[c] = v;
+                            }
+                        }
+                    }
+                    return;
+                }
                 if matches!(dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
                     let bytes = self.quant_bytes();
                     let rows = self.rows();
