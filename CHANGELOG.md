@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-07-21
+
+### Added
+- **Mobile GPU Toggle**: Added `cortiq_set_gpu(bool)` to the FFI C ABI to allow mobile apps (e.g. Flutter) to enable/disable the discrete Vulkan/Metal graph dynamically at runtime before loading a model.
+
 ## [0.5.1] — 2026-07-21
 
 ### Added

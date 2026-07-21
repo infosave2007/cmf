@@ -21,6 +21,8 @@ use crate::tokenizer::Tokenizer;
 use cortiq_core::mask::TaskMask;
 use cortiq_core::types::NormStyle;
 
+pub static GLOBAL_USE_GPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Reusable per-pipeline forward scratch: the four norm outputs the
 /// decode paths recompute every layer (single: n1/p1; pair: all four).
 /// Plain buffers, resized once — steady-state decode reuses them.
@@ -438,7 +440,7 @@ impl Pipeline {
         // position at a time so the resident state is seeded exactly as decode
         // will read it. Pure-attention models keep the batched CPU prefill (its
         // KV mirror re-syncs from the CPU cache, so no seeding gap).
-        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH").map(|v| v != "0").unwrap_or(false);
+        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH").map(|v| v != "0").unwrap_or_else(|_| crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed));
         if !graph_on || !crate::gpu::enabled_here() {
             return false;
         }
@@ -1073,7 +1075,7 @@ impl Pipeline {
         // Nyström insertion is irreversible by design).
         // The wgpu token graph owns a device K/V mirror that speculative
         // rollback would desync — the two are mutually exclusive.
-        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH").map(|v| v != "0").unwrap_or(false);
+        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH").map(|v| v != "0").unwrap_or_else(|_| crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed));
         let spec_active = self.speculative
             && self.mtp.is_some()
             && task_mask.is_none()
@@ -2656,7 +2658,7 @@ impl Pipeline {
         let pool = self.pool.clone();
         // Opt-in wgpu token-graph attention (discrete Vulkan/DX12): the whole
         // attention sub-block runs resident in one submit. Off by default.
-        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH").map(|v| v != "0").unwrap_or(false);
+        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH").map(|v| v != "0").unwrap_or_else(|_| crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed));
         // Whole-token graph: the ENTIRE layer stack in one submit (one readback
         // per token). Preferred over the per-layer drop-in when every layer is
         // pure-attention q1 with a dense q1 FFN.

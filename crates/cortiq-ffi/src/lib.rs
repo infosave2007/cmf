@@ -93,6 +93,13 @@ pub extern "C" fn cortiq_load(path: *const c_char) -> *mut c_void {
     })
 }
 
+/// Globally enable or disable the discrete GPU (Vulkan/DX12/Metal) graph.
+/// Must be called before `cortiq_load` to take effect.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_set_gpu(enable: bool) {
+    cortiq_engine::pipeline::GLOBAL_USE_GPU.store(enable, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Release the handle. NULL is a no-op. Do not use the handle afterwards.
 #[unsafe(no_mangle)]
 pub extern "C" fn cortiq_free(handle: *mut c_void) {

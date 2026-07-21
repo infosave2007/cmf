@@ -25,6 +25,9 @@ const char *cortiq_last_error(void);
 /* Open a .cmf file (memory-mapped — keep it on storage). NULL on error. */
 void *cortiq_load(const char *path);
 
+/* Globally enable or disable the discrete GPU graph. Must be called before load. */
+void cortiq_set_gpu(bool enable);
+
 /* Release a handle. NULL is a no-op. */
 void cortiq_free(void *handle);
 
