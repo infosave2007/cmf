@@ -150,7 +150,40 @@ impl Pool {
         Some(caps.iter().filter(|&&c| c * 8 >= max * 5).count())
     }
 
-    #[cfg(not(all(target_arch = "aarch64", any(target_os = "linux", target_os = "android"))))]
+    #[cfg(target_os = "macos")]
+    fn big_cores() -> Option<usize> {
+        unsafe extern "C" {
+            fn sysctlbyname(
+                name: *const std::ffi::c_char,
+                oldp: *mut std::ffi::c_void,
+                oldlenp: *mut usize,
+                newp: *mut std::ffi::c_void,
+                newlen: usize,
+            ) -> std::ffi::c_int;
+        }
+        unsafe {
+            let name = std::ffi::CString::new("hw.perflevel0.physicalcpu").ok()?;
+            let mut count: i32 = 0;
+            let mut size = std::mem::size_of::<i32>();
+            let ret = sysctlbyname(
+                name.as_ptr(),
+                &mut count as *mut i32 as *mut std::ffi::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            );
+            if ret == 0 && count > 0 {
+                Some(count as usize)
+            } else {
+                None
+            }
+        }
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "android")),
+        target_os = "macos"
+    )))]
     fn big_cores() -> Option<usize> {
         None
     }

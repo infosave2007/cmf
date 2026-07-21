@@ -13,8 +13,8 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-cortiq-core = { path = "../cortiq-core", version = "0.5.6" }
-cortiq-engine = { path = "../cortiq-engine", version = "0.5.6" }
+cortiq-core = { path = "../cortiq-core", version = "0.5.7" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.5.7" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

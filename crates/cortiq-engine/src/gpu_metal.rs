@@ -51,12 +51,29 @@ kernel void q8_matvec(
     uint row = tgpos * sgs + sg;
     if (row >= rows) return;
     ulong base = (ulong)row * cols4;
-    float acc = 0.0f;
-    for (uint i = lane; i < cols4; i += 32) {
-        acc += dot(float4(q[base + i]), xs[i]);
+    float4 acc = float4(0.0f);
+    uint i = lane;
+    for (; i + 96 < cols4; i += 128) {
+        char4 q0 = q[base + i];
+        char4 q1 = q[base + i + 32];
+        char4 q2 = q[base + i + 64];
+        char4 q3 = q[base + i + 96];
+
+        float4 x0 = xs[i];
+        float4 x1 = xs[i + 32];
+        float4 x2 = xs[i + 64];
+        float4 x3 = xs[i + 96];
+
+        acc.x += dot(float4(q0), x0);
+        acc.y += dot(float4(q1), x1);
+        acc.z += dot(float4(q2), x2);
+        acc.w += dot(float4(q3), x3);
     }
-    acc = simd_sum(acc);
-    if (lane == 0) y[row] = acc * rs[row];
+    for (; i < cols4; i += 32) {
+        acc.x += dot(float4(q[base + i]), xs[i]);
+    }
+    float total = simd_sum(acc.x + acc.y + acc.z + acc.w);
+    if (lane == 0) y[row] = total * rs[row];
 }
 
 // act[i] = silu(g[i])·u[i]·col[i] — down_proj input with the col field already
@@ -81,12 +98,29 @@ kernel void q8_matmat(
     if (row >= rows || bi >= nb) return;
     ulong qb = (ulong)row * cols4;
     ulong xb = (ulong)bi * cols4;
-    float acc = 0.0f;
-    for (uint i = lane; i < cols4; i += 32) {
-        acc += dot(float4(q[qb + i]), xs[xb + i]);
+    float4 acc = float4(0.0f);
+    uint i = lane;
+    for (; i + 96 < cols4; i += 128) {
+        char4 q0 = q[qb + i];
+        char4 q1 = q[qb + i + 32];
+        char4 q2 = q[qb + i + 64];
+        char4 q3 = q[qb + i + 96];
+
+        float4 x0 = xs[xb + i];
+        float4 x1 = xs[xb + i + 32];
+        float4 x2 = xs[xb + i + 64];
+        float4 x3 = xs[xb + i + 96];
+
+        acc.x += dot(float4(q0), x0);
+        acc.y += dot(float4(q1), x1);
+        acc.z += dot(float4(q2), x2);
+        acc.w += dot(float4(q3), x3);
     }
-    acc = simd_sum(acc);
-    if (lane == 0) y[(ulong)bi * rows + row] = acc * rs[row];
+    for (; i < cols4; i += 32) {
+        acc.x += dot(float4(q[qb + i]), xs[xb + i]);
+    }
+    float total = simd_sum(acc.x + acc.y + acc.z + acc.w);
+    if (lane == 0) y[(ulong)bi * rows + row] = total * rs[row];
 }
 
 // True GEMM tile kernel for the prefill batch — the ggml mul_mm layout
@@ -1879,12 +1913,6 @@ kernel void q1t_matvec(
     uint tgpos [[threadgroup_position_in_grid]],
     uint sgs  [[simdgroups_per_threadgroup]])
 {
-    threadgroup half lut[1280];
-    for (uint i = lane; i < 1280u; i += 32u) {
-        lut[i] = Q1T_SIGN[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     uint r0 = (tgpos * sgs + sg) * 4u;
     if (r0 >= rows) return;
     uint nr = min(rows - r0, 4u);
@@ -1908,36 +1936,36 @@ kernel void q1t_matvec(
 
         for (uint ri = 0u; ri < nr; ++ri) {
             ulong base = ((ulong)(r0 + ri) * gpr + (ulong)g) * 9u;
-            ushort scale_bits = (ushort)q[base] | ((ushort)q[base+1u] << 8u);
-            half scale = as_type<half>(scale_bits);
+            device const uchar* p = q + base;
+            half scale = as_type<half>(*(device const ushort*)p);
             
-            uint b2_5 = (uint)q[base+2u] | ((uint)q[base+3u]<<8u) | ((uint)q[base+4u]<<16u) | ((uint)q[base+5u]<<24u);
-            ushort b6_7 = (ushort)q[base+6u] | ((ushort)q[base+7u]<<8u);
-            uchar b8 = q[base + 8u];
+            uint b2_5 = *(device const uint*)(p + 2u);
+            ushort b6_7 = *(device const ushort*)(p + 6u);
+            uchar b8 = p[8];
 
             half gsum = 0.0h;
-            threadgroup half* p;
+            constant half* pl;
 
-            p = &lut[(b2_5 & 0xFF) * 5u];
-            gsum += p[0] * xh[0] + p[1] * xh[1] + p[2] * xh[2] + p[3] * xh[3] + p[4] * xh[4];
+            pl = &Q1T_SIGN[(b2_5 & 0xFF) * 5u];
+            gsum += pl[0] * xh[0] + pl[1] * xh[1] + pl[2] * xh[2] + pl[3] * xh[3] + pl[4] * xh[4];
 
-            p = &lut[((b2_5 >> 8u) & 0xFF) * 5u];
-            gsum += p[0] * xh[5] + p[1] * xh[6] + p[2] * xh[7] + p[3] * xh[8] + p[4] * xh[9];
+            pl = &Q1T_SIGN[((b2_5 >> 8u) & 0xFF) * 5u];
+            gsum += pl[0] * xh[5] + pl[1] * xh[6] + pl[2] * xh[7] + pl[3] * xh[8] + pl[4] * xh[9];
 
-            p = &lut[((b2_5 >> 16u) & 0xFF) * 5u];
-            gsum += p[0] * xh[10] + p[1] * xh[11] + p[2] * xh[12] + p[3] * xh[13] + p[4] * xh[14];
+            pl = &Q1T_SIGN[((b2_5 >> 16u) & 0xFF) * 5u];
+            gsum += pl[0] * xh[10] + pl[1] * xh[11] + pl[2] * xh[12] + pl[3] * xh[13] + pl[4] * xh[14];
 
-            p = &lut[(b2_5 >> 24u) * 5u];
-            gsum += p[0] * xh[15] + p[1] * xh[16] + p[2] * xh[17] + p[3] * xh[18] + p[4] * xh[19];
+            pl = &Q1T_SIGN[(b2_5 >> 24u) * 5u];
+            gsum += pl[0] * xh[15] + pl[1] * xh[16] + pl[2] * xh[17] + pl[3] * xh[18] + pl[4] * xh[19];
 
-            p = &lut[(b6_7 & 0xFF) * 5u];
-            gsum += p[0] * xh[20] + p[1] * xh[21] + p[2] * xh[22] + p[3] * xh[23] + p[4] * xh[24];
+            pl = &Q1T_SIGN[(b6_7 & 0xFF) * 5u];
+            gsum += pl[0] * xh[20] + pl[1] * xh[21] + pl[2] * xh[22] + pl[3] * xh[23] + pl[4] * xh[24];
 
-            p = &lut[(b6_7 >> 8u) * 5u];
-            gsum += p[0] * xh[25] + p[1] * xh[26] + p[2] * xh[27] + p[3] * xh[28] + p[4] * xh[29];
+            pl = &Q1T_SIGN[(b6_7 >> 8u) * 5u];
+            gsum += pl[0] * xh[25] + pl[1] * xh[26] + pl[2] * xh[27] + pl[3] * xh[28] + pl[4] * xh[29];
 
-            p = &lut[b8 * 5u];
-            gsum += p[0] * xh[30] + p[1] * xh[31];
+            pl = &Q1T_SIGN[b8 * 5u];
+            gsum += pl[0] * xh[30] + pl[1] * xh[31];
 
             float contrib = (float)(scale * gsum);
             if (ri == 0u) acc0 += contrib;
@@ -1985,10 +2013,22 @@ kernel void q1t_overlay(
     y[rid] += corr;
 }
 
+inline float q4_dot8_fast(uint b, float4 x_lo, float4 x_hi) {
+    float4 w_lo = float4((float)(b & 0xFu) - 8.0f,
+                         (float)((b >> 8u) & 0xFu) - 8.0f,
+                         (float)((b >> 16u) & 0xFu) - 8.0f,
+                         (float)((b >> 24u) & 0xFu) - 8.0f);
+    float4 w_hi = float4((float)((b >> 4u) & 0xFu) - 8.0f,
+                          (float)((b >> 12u) & 0xFu) - 8.0f,
+                          (float)((b >> 20u) & 0xFu) - 8.0f,
+                          (float)(b >> 28u) - 8.0f);
+    return dot(w_lo, x_lo) + dot(w_hi, x_hi);
+}
+
 // q4_block: [packed nibbles: rows·gpr·16 B][f16 scales: rows·gpr·2 B]. Group
 // gi's nibbles at packed[gi·16], scale at scales[gi·2]; weight = (nib-8)·scale.
 // Lets the token graph keep a precise down_proj (or lm_head) on-device without
-// quantizing it to ternary. 4 rows/simdgroup, like q1t_matvec.
+// quantizing it to ternary. 4 rows/simdgroup, cached activations & hardware SIMD dot.
 kernel void q4b_matvec(
     device const uchar* q    [[buffer(0)]],
     device const float* x    [[buffer(1)]],
@@ -2008,16 +2048,20 @@ kernel void q4b_matvec(
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     for (uint g = lane; g < gpr; g += 32u) {
         uint xb = g * 32u;
+        device const float4* xv = (device const float4*)(x + xb);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+
         for (uint ri = 0u; ri < nr; ++ri) {
             uint gi = (r0 + ri) * gpr + g;
-            half scale = as_type<half>((ushort)((uint)sc[gi * 2u] | ((uint)sc[gi * 2u + 1u] << 8)));
-            device const uchar* pk = q + (ulong)gi * 16u;
-            float gsum = 0.0f;
-            for (uint k = 0u; k < 16u; ++k) {
-                uint b = pk[k];
-                gsum += ((float)(b & 0xFu) - 8.0f) * x[xb + k * 2u]
-                      + ((float)((b >> 4) & 0xFu) - 8.0f) * x[xb + k * 2u + 1u];
-            }
+            half scale = as_type<half>(*(device const ushort*)(sc + gi * 2u));
+            uint4 pk4 = *(device const uint4*)(q + (ulong)gi * 16u);
+
+            float gsum = q4_dot8_fast(pk4.x, x0, x1)
+                       + q4_dot8_fast(pk4.y, x2, x3)
+                       + q4_dot8_fast(pk4.z, x4, x5)
+                       + q4_dot8_fast(pk4.w, x6, x7);
+
             float contrib = (float)scale * gsum;
             if (ri == 0u) acc0 += contrib;
             else if (ri == 1u) acc1 += contrib;

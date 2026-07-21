@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.7] — 2026-07-21
+
+### Added & Optimized
+- **Metal GPU Shader Optimizations (Q4 & Q8)**: Implemented 4-way ILP unrolling and register activation vector caching (`float4 xv[8]`) in `q4b_matvec`, `q8_matvec`, and `q8_matmat`, achieving up to **+21.9% decode speedup** on Apple Silicon (M4).
+- **Q1T CPU Performance**: Added zero-stack bitwise register unpacking (`q1t_unpack_reg_u64s`) and 2-way ILP unrolling along with macOS physical P-core auto-discovery via `sysctlbyname("hw.perflevel0.physicalcpu")`, yielding **14.85 tok/s** on Bonsai-8B (**8.25x speedup** over single-thread baseline).
+- **Quantization Parity & Verification**: Verified 100% text generation accuracy and coherence across Q1T (1.58-bit), Q4 (4-bit), VBIT (4.25-bit), and Q8 (8-bit) models.
+
 ## [0.5.5] — 2026-07-21
 
 ### Fixed

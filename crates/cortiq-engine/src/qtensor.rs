@@ -3445,22 +3445,101 @@ fn q1t_i8dot32(w: *const i8, x: *const i8) -> i32 {
     }
 }
 
+#[inline]
+unsafe fn q1t_unpack_reg_u64s(codes: *const u8) -> (u64, u64, u64, u64) {
+    let (s0, s1, s2, s3, s4, s5, s6) = unsafe {
+        (
+            SIGN5_U64[*codes as usize],
+            SIGN5_U64[*codes.add(1) as usize],
+            SIGN5_U64[*codes.add(2) as usize],
+            SIGN5_U64[*codes.add(3) as usize],
+            SIGN5_U64[*codes.add(4) as usize],
+            SIGN5_U64[*codes.add(5) as usize],
+            SIGN5_U64[*codes.add(6) as usize],
+        )
+    };
+
+    let u0 = s0 | (s1 << 40);
+    let u1 = (s1 >> 24) | (s2 << 16) | (s3 << 56);
+    let u2 = (s3 >> 8) | (s4 << 32);
+    let u3 = (s4 >> 32) | (s5 << 8) | (s6 << 48);
+
+    (u0, u1, u2, u3)
+}
+
 /// One q1t row's int8 base dot: `Σ_group s·dot(signs, xq)` (before the shared
-/// `sx`). Signs unpack base-3 → a 32-i8 stack buffer, then one int8 dot per
-/// group. ARM SDOT.
+/// `sx`). Direct register unpacking (zero stack stores/loads, no STLF stalls).
+/// ARM SDOT.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon,dotprod")]
 unsafe fn q1t_dot_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
-    // SAFETY: 9-byte tile per group, xq.len() == gpr·GROUP_SIZE.
+    use core::arch::aarch64::*;
+    use core::arch::asm;
     unsafe {
         const TILE: usize = cortiq_core::quant::Q1T_TILE;
         let mut acc = 0f32;
-        let mut sg = [0i8; GROUP_SIZE + 8]; // +8 slack for the u64-store unpack
-        for gi in 0..gpr {
-            let off = (r * gpr + gi) * TILE;
-            let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
-            q1t_unpack_group_i8(bytes.as_ptr().add(off + 2), &mut sg);
-            acc += sdot32_i8(sg.as_ptr(), xq.as_ptr().add(gi * GROUP_SIZE)) as f32 * s;
+        let bytes_ptr = bytes.as_ptr();
+        let xq_ptr = xq.as_ptr();
+        let row_off = r * gpr * TILE;
+
+        let gpr2 = gpr & !1;
+        let mut gi = 0;
+        while gi < gpr2 {
+            let off0 = row_off + gi * TILE;
+            let off1 = off0 + TILE;
+            let s0 = f16_to_f32(u16::from_le_bytes([*bytes_ptr.add(off0), *bytes_ptr.add(off0 + 1)]));
+            let s1 = f16_to_f32(u16::from_le_bytes([*bytes_ptr.add(off1), *bytes_ptr.add(off1 + 1)]));
+
+            let (u0_0, u1_0, u2_0, u3_0) = q1t_unpack_reg_u64s(bytes_ptr.add(off0 + 2));
+            let (u0_1, u1_1, u2_1, u3_1) = q1t_unpack_reg_u64s(bytes_ptr.add(off1 + 2));
+
+            let w0_0 = vreinterpretq_s8_u64(vcombine_u64(vcreate_u64(u0_0), vcreate_u64(u1_0)));
+            let w1_0 = vreinterpretq_s8_u64(vcombine_u64(vcreate_u64(u2_0), vcreate_u64(u3_0)));
+            let w0_1 = vreinterpretq_s8_u64(vcombine_u64(vcreate_u64(u0_1), vcreate_u64(u1_1)));
+            let w1_1 = vreinterpretq_s8_u64(vcombine_u64(vcreate_u64(u2_1), vcreate_u64(u3_1)));
+
+            let x0_0 = vld1q_s8(xq_ptr.add(gi * GROUP_SIZE));
+            let x1_0 = vld1q_s8(xq_ptr.add(gi * GROUP_SIZE + 16));
+            let x0_1 = vld1q_s8(xq_ptr.add((gi + 1) * GROUP_SIZE));
+            let x1_1 = vld1q_s8(xq_ptr.add((gi + 1) * GROUP_SIZE + 16));
+
+            let (mut a0_0, mut a1_0) = (vdupq_n_s32(0), vdupq_n_s32(0));
+            let (mut a0_1, mut a1_1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+            asm!(
+                "sdot {a0_0:v}.4s, {w0_0:v}.16b, {x0_0:v}.16b",
+                "sdot {a1_0:v}.4s, {w1_0:v}.16b, {x1_0:v}.16b",
+                "sdot {a0_1:v}.4s, {w0_1:v}.16b, {x0_1:v}.16b",
+                "sdot {a1_1:v}.4s, {w1_1:v}.16b, {x1_1:v}.16b",
+                a0_0 = inout(vreg) a0_0, a1_0 = inout(vreg) a1_0,
+                a0_1 = inout(vreg) a0_1, a1_1 = inout(vreg) a1_1,
+                w0_0 = in(vreg) w0_0, x0_0 = in(vreg) x0_0, w1_0 = in(vreg) w1_0, x1_0 = in(vreg) x1_0,
+                w0_1 = in(vreg) w0_1, x0_1 = in(vreg) x0_1, w1_1 = in(vreg) w1_1, x1_1 = in(vreg) x1_1,
+                options(pure, nomem, nostack),
+            );
+            let d0 = vaddvq_s32(vaddq_s32(a0_0, a1_0));
+            let d1 = vaddvq_s32(vaddq_s32(a0_1, a1_1));
+            acc += d0 as f32 * s0 + d1 as f32 * s1;
+            gi += 2;
+        }
+
+        if gi < gpr {
+            let off = row_off + gi * TILE;
+            let s = f16_to_f32(u16::from_le_bytes([*bytes_ptr.add(off), *bytes_ptr.add(off + 1)]));
+            let (u0, u1, u2, u3) = q1t_unpack_reg_u64s(bytes_ptr.add(off + 2));
+            let w0 = vreinterpretq_s8_u64(vcombine_u64(vcreate_u64(u0), vcreate_u64(u1)));
+            let w1 = vreinterpretq_s8_u64(vcombine_u64(vcreate_u64(u2), vcreate_u64(u3)));
+            let x0 = vld1q_s8(xq_ptr.add(gi * GROUP_SIZE));
+            let x1 = vld1q_s8(xq_ptr.add(gi * GROUP_SIZE + 16));
+            let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+            asm!(
+                "sdot {a0:v}.4s, {w0:v}.16b, {x0:v}.16b",
+                "sdot {a1:v}.4s, {w1:v}.16b, {x1:v}.16b",
+                a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                w0 = in(vreg) w0, x0 = in(vreg) x0, w1 = in(vreg) w1, x1 = in(vreg) x1,
+                options(pure, nomem, nostack),
+            );
+            let d = vaddvq_s32(vaddq_s32(a0, a1));
+            acc += d as f32 * s;
         }
         acc
     }
@@ -3470,16 +3549,27 @@ unsafe fn q1t_dot_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn q1t_dot_row_avx2(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
-    // SAFETY: as q1t_dot_row_sdot.
+    use core::arch::x86_64::*;
     unsafe {
         const TILE: usize = cortiq_core::quant::Q1T_TILE;
         let mut acc = 0f32;
-        let mut sg = [0i8; GROUP_SIZE + 8]; // +8 slack for the u64-store unpack
+        let bytes_ptr = bytes.as_ptr();
+        let xq_ptr = xq.as_ptr();
+        let row_off = r * gpr * TILE;
+
+        let ones = _mm256_set1_epi16(1);
         for gi in 0..gpr {
-            let off = (r * gpr + gi) * TILE;
-            let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
-            q1t_unpack_group_i8(bytes.as_ptr().add(off + 2), &mut sg);
-            acc += i8dot32_avx2(sg.as_ptr(), xq.as_ptr().add(gi * GROUP_SIZE)) as f32 * s;
+            let off = row_off + gi * TILE;
+            let s = f16_to_f32(u16::from_le_bytes([*bytes_ptr.add(off), *bytes_ptr.add(off + 1)]));
+            let (u0, u1, u2, u3) = q1t_unpack_reg_u64s(bytes_ptr.add(off + 2));
+            let wv = _mm256_set_epi64x(u3 as i64, u2 as i64, u1 as i64, u0 as i64);
+            let xv = _mm256_loadu_si256(xq_ptr.add(gi * GROUP_SIZE) as *const __m256i);
+            let p16 = _mm256_maddubs_epi16(_mm256_abs_epi8(wv), _mm256_sign_epi8(xv, wv));
+            let d256 = _mm256_madd_epi16(p16, ones);
+            let d128 = _mm_add_epi32(_mm256_castsi256_si128(d256), _mm256_extracti128_si256(d256, 1));
+            let d64 = _mm_add_epi32(d128, _mm_shuffle_epi32(d128, 0xee));
+            let d32 = _mm_cvtsi128_si32(_mm_add_epi32(d64, _mm_shuffle_epi32(d64, 0x55)));
+            acc += d32 as f32 * s;
         }
         acc
     }
