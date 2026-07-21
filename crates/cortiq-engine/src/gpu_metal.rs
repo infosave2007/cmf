@@ -1739,7 +1739,7 @@ kernel void gdn_state_update(
 // every overlay position is 0, so there is no double count). 4 rows/simdgroup.
 kernel void q1t_matvec(
     device const uchar* q    [[buffer(0)]],
-    device const float* x    [[buffer(1)]],
+    device const float* xs   [[buffer(1)]],
     device float*       y    [[buffer(2)]],
     constant uint&      gpr  [[buffer(3)]],
     constant uint&      rows [[buffer(4)]],
@@ -1748,12 +1748,26 @@ kernel void q1t_matvec(
     uint tgpos [[threadgroup_position_in_grid]],
     uint sgs  [[simdgroups_per_threadgroup]])
 {
+    threadgroup ushort lut[256];
+    for (uint i = lane; i < 243u; i += 32u) {
+        lut[i] = Q1T_LUT[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     uint r0 = (tgpos * sgs + sg) * 4u;
     if (r0 >= rows) return;
     uint nr = min(rows - r0, 4u);
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    device const float4* xs4 = (device const float4*)xs;
+
     for (uint g = lane; g < gpr; g += 32u) {
         uint wbase = g * 32u;
+        uint wbase4 = wbase / 4u;
+        float4 xg[8];
+        for (uint i = 0; i < 8u; ++i) {
+            xg[i] = xs4[wbase4 + i];
+        }
+
         for (uint ri = 0u; ri < nr; ++ri) {
             ulong base = ((ulong)(r0 + ri) * gpr + (ulong)g) * 9u;
             ushort scale_bits = (ushort)q[base] | ((ushort)q[base+1u] << 8u);
@@ -1767,57 +1781,58 @@ kernel void q1t_matvec(
             ushort p;
 
             // Byte 2 (0..4)
-            p = Q1T_LUT[b2_5 & 0xFF];
-            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * x[wbase + 0u];
-            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * x[wbase + 1u];
-            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * x[wbase + 2u];
-            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * x[wbase + 3u];
-            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * x[wbase + 4u];
+            p = lut[b2_5 & 0xFF];
+            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * xg[0].x;
+            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * xg[0].y;
+            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * xg[0].z;
+            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * xg[0].w;
+            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * xg[1].x;
 
             // Byte 3 (5..9)
-            p = Q1T_LUT[(b2_5 >> 8u) & 0xFF];
-            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * x[wbase + 5u];
-            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * x[wbase + 6u];
-            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * x[wbase + 7u];
-            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * x[wbase + 8u];
-            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * x[wbase + 9u];
+            p = lut[(b2_5 >> 8u) & 0xFF];
+            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * xg[1].y;
+            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * xg[1].z;
+            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * xg[1].w;
+            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * xg[2].x;
+            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * xg[2].y;
 
             // Byte 4 (10..14)
-            p = Q1T_LUT[(b2_5 >> 16u) & 0xFF];
-            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * x[wbase + 10u];
-            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * x[wbase + 11u];
-            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * x[wbase + 12u];
-            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * x[wbase + 13u];
-            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * x[wbase + 14u];
+            p = lut[(b2_5 >> 16u) & 0xFF];
+            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * xg[2].z;
+            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * xg[2].w;
+            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * xg[3].x;
+            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * xg[3].y;
+            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * xg[3].z;
 
             // Byte 5 (15..19)
-            p = Q1T_LUT[b2_5 >> 24u];
-            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * x[wbase + 15u];
-            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * x[wbase + 16u];
-            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * x[wbase + 17u];
-            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * x[wbase + 18u];
-            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * x[wbase + 19u];
+            p = lut[b2_5 >> 24u];
+            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * xg[3].w;
+            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * xg[4].x;
+            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * xg[4].y;
+            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * xg[4].z;
+            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * xg[4].w;
 
             // Byte 6 (20..24)
-            p = Q1T_LUT[b6_7 & 0xFF];
-            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * x[wbase + 20u];
-            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * x[wbase + 21u];
-            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * x[wbase + 22u];
-            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * x[wbase + 23u];
-            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * x[wbase + 24u];
+            p = lut[b6_7 & 0xFF];
+            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * xg[5].x;
+            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * xg[5].y;
+            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * xg[5].z;
+            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * xg[5].w;
+            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * xg[6].x;
 
             // Byte 7 (25..29)
-            p = Q1T_LUT[b6_7 >> 8u];
-            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * x[wbase + 25u];
-            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * x[wbase + 26u];
-            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * x[wbase + 27u];
-            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * x[wbase + 28u];
-            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * x[wbase + 29u];
+            p = lut[b6_7 >> 8u];
+            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * xg[6].y;
+            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * xg[6].z;
+            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * xg[6].w;
+            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * xg[7].x;
+            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * xg[7].y;
 
             // Byte 8 (30..31)
-            p = Q1T_LUT[b8];
-            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * x[wbase + 30u];
-            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * x[wbase + 31u];
+            p = lut[b8];
+            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * xg[7].z;
+            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * xg[7].w;
+
             float contrib = (float)scale * gsum;
             if (ri == 0u) acc0 += contrib;
             else if (ri == 1u) acc1 += contrib;
