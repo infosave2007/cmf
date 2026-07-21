@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.5] — 2026-07-21
+
+### Fixed
+- **GPU Metal/WGSL**: Fixed MSL compilation crash caused by invalid `packed_uint` memory access in the `q1t_matvec` kernel which was forcing a silent fallback to CPU.
+- **WGSL Backend**: Replaced undefined `pow3t` usage with `Q1T_LUT` table in `q1t_matmat`.
+- **CPU Path**: Resolved vector allocation bottlenecks by reusing thread-local buffers (`PRESCALE_BUF`), dramatically improving inference speed.
+
 ## [0.5.3] — 2026-07-21
 
 ### Fixed

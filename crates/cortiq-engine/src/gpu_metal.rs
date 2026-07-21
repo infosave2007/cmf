@@ -249,6 +249,27 @@ kernel void q8_mul_mm(
     }
 }
 
+// Q1T Ternary Lookup Table: 243 entries. Packs 5 ternary signs into 10 bits.
+// Each code 0,1,2 maps to bits: 00, 01, 10.
+constant ushort Q1T_LUT[243] = {
+    0u, 1u, 2u, 4u, 5u, 6u, 8u, 9u, 10u, 16u, 17u, 18u, 20u, 21u, 22u, 24u,
+    25u, 26u, 32u, 33u, 34u, 36u, 37u, 38u, 40u, 41u, 42u, 64u, 65u, 66u, 68u, 69u,
+    70u, 72u, 73u, 74u, 80u, 81u, 82u, 84u, 85u, 86u, 88u, 89u, 90u, 96u, 97u, 98u,
+    100u, 101u, 102u, 104u, 105u, 106u, 128u, 129u, 130u, 132u, 133u, 134u, 136u, 137u, 138u, 144u,
+    145u, 146u, 148u, 149u, 150u, 152u, 153u, 154u, 160u, 161u, 162u, 164u, 165u, 166u, 168u, 169u,
+    170u, 256u, 257u, 258u, 260u, 261u, 262u, 264u, 265u, 266u, 272u, 273u, 274u, 276u, 277u, 278u,
+    280u, 281u, 282u, 288u, 289u, 290u, 292u, 293u, 294u, 296u, 297u, 298u, 320u, 321u, 322u, 324u,
+    325u, 326u, 328u, 329u, 330u, 336u, 337u, 338u, 340u, 341u, 342u, 344u, 345u, 346u, 352u, 353u,
+    354u, 356u, 357u, 358u, 360u, 361u, 362u, 384u, 385u, 386u, 388u, 389u, 390u, 392u, 393u, 394u,
+    400u, 401u, 402u, 404u, 405u, 406u, 408u, 409u, 410u, 416u, 417u, 418u, 420u, 421u, 422u, 424u,
+    425u, 426u, 512u, 513u, 514u, 516u, 517u, 518u, 520u, 521u, 522u, 528u, 529u, 530u, 532u, 533u,
+    534u, 536u, 537u, 538u, 544u, 545u, 546u, 548u, 549u, 550u, 552u, 553u, 554u, 576u, 577u, 578u,
+    580u, 581u, 582u, 584u, 585u, 586u, 592u, 593u, 594u, 596u, 597u, 598u, 600u, 601u, 602u, 608u,
+    609u, 610u, 612u, 613u, 614u, 616u, 617u, 618u, 640u, 641u, 642u, 644u, 645u, 646u, 648u, 649u,
+    650u, 656u, 657u, 658u, 660u, 661u, 662u, 664u, 665u, 666u, 672u, 673u, 674u, 676u, 677u, 678u,
+    680u, 681u, 682u,
+};
+
 // q1t register-blocked GEMM (prefill): identical simdgroup-matrix machinery to
 // q8_mul_mm; only the weight staging decodes base-3 ternary tiles (per-group
 // f16 scale) instead of i8·row_scale. NK=32 == GROUP_SIZE so each K-step is one
@@ -267,7 +288,6 @@ kernel void q1t_mul_mm(
     uint cols = cols_b;
     uint rows = rows_b;
     uint gpr = cols >> 5u;
-    const uint POW3[5] = {1u, 3u, 9u, 27u, 81u};
     threadgroup char shmem[8192];
     threadgroup half* sa = (threadgroup half*)shmem;
     threadgroup half* sb = (threadgroup half*)(shmem + 4096);
@@ -303,9 +323,9 @@ kernel void q1t_mul_mm(
             float wv[16];
             for (uint i = 0; i < 16u; ++i) {
                 uint p = 16u * il0 + i;
-                uint bb = (uint)codes[p / 5u];
-                uint code = (bb / POW3[p % 5u]) % 3u;
-                float sgn = code == 1u ? 1.0f : (code == 2u ? -1.0f : 0.0f);
+                ushort bb = Q1T_LUT[codes[p / 5u]];
+                uint code = (bb >> ((p % 5u) * 2u)) & 3u;
+                float sgn = (float)(code == 1u) - (float)(code == 2u);
                 wv[i] = sgn * (float)scale;
             }
             uint ib0 = 8u * (2u * il0) + sy;
@@ -398,15 +418,15 @@ kernel void q1t_overlay_mm(
     uint rid [[thread_position_in_grid]])
 {
     if (rid >= rows) return;
-    uint rp0 = base_len + rid * 4u;
-    uint c0 = (uint)q[rp0] | ((uint)q[rp0 + 1u] << 8) | ((uint)q[rp0 + 2u] << 16) | ((uint)q[rp0 + 3u] << 24);
-    uint rp1 = base_len + (rid + 1u) * 4u;
-    uint c1 = (uint)q[rp1] | ((uint)q[rp1 + 1u] << 8) | ((uint)q[rp1 + 2u] << 16) | ((uint)q[rp1 + 3u] << 24);
+    device const uint* rp_ptr = (device const uint*)(q + base_len + rid * 4u);
+    uint c0 = rp_ptr[0];
+    uint c1 = *(device const uint*)(q + base_len + (rid + 1u) * 4u);
     uint ent = base_len + (rows + 1u) * 4u;
     for (uint p = c0; p < c1; ++p) {
         uint e = ent + p * 4u;
-        uint col = (uint)q[e] | ((uint)q[e + 1u] << 8);
-        float fv = (float)as_type<half>((ushort)((uint)q[e + 2u] | ((uint)q[e + 3u] << 8)));
+        uint col_val = *(device const uint*)(q + e);
+        uint col = col_val & 0xFFFF;
+        float fv = (float)as_type<half>((ushort)(col_val >> 16));
         for (uint bi = 0; bi < nb; ++bi) {
             y[(ulong)bi * rows + rid] += fv * x[(ulong)bi * cols + col];
         }
@@ -1736,25 +1756,68 @@ kernel void q1t_matvec(
         uint wbase = g * 32u;
         for (uint ri = 0u; ri < nr; ++ri) {
             ulong base = ((ulong)(r0 + ri) * gpr + (ulong)g) * 9u;
-            half scale = as_type<half>((ushort)((uint)q[base] | ((uint)q[base + 1u] << 8)));
+            ushort scale_bits = (ushort)q[base] | ((ushort)q[base+1u] << 8u);
+            half scale = as_type<half>(scale_bits);
+            
+            uint b2_5 = (uint)q[base+2u] | ((uint)q[base+3u]<<8u) | ((uint)q[base+4u]<<16u) | ((uint)q[base+5u]<<24u);
+            ushort b6_7 = (ushort)q[base+6u] | ((ushort)q[base+7u]<<8u);
+            uchar b8 = q[base + 8u];
+
             float gsum = 0.0f;
-            // bytes 0..5 hold codes 0..29 (all in-group); decode 5 base-3 codes each.
-            for (uint bi = 0u; bi < 6u; ++bi) {
-                uint b = (uint)q[base + 2u + bi];
-                uint kb = wbase + bi * 5u;
-                for (uint i = 0u; i < 5u; ++i) {
-                    uint code = b % 3u;
-                    b = b / 3u;
-                    float sgn = code == 1u ? 1.0f : (code == 2u ? -1.0f : 0.0f);
-                    gsum += sgn * x[kb + i];
-                }
-            }
-            // byte 6 holds the last 2 codes (weights 30,31); the rest are 0-pad.
-            uint b6 = (uint)q[base + 8u];
-            uint c30 = b6 % 3u;
-            uint c31 = (b6 / 3u) % 3u;
-            gsum += (c30 == 1u ? 1.0f : (c30 == 2u ? -1.0f : 0.0f)) * x[wbase + 30u];
-            gsum += (c31 == 1u ? 1.0f : (c31 == 2u ? -1.0f : 0.0f)) * x[wbase + 31u];
+            ushort p;
+
+            // Byte 2 (0..4)
+            p = Q1T_LUT[b2_5 & 0xFF];
+            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * x[wbase + 0u];
+            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * x[wbase + 1u];
+            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * x[wbase + 2u];
+            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * x[wbase + 3u];
+            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * x[wbase + 4u];
+
+            // Byte 3 (5..9)
+            p = Q1T_LUT[(b2_5 >> 8u) & 0xFF];
+            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * x[wbase + 5u];
+            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * x[wbase + 6u];
+            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * x[wbase + 7u];
+            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * x[wbase + 8u];
+            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * x[wbase + 9u];
+
+            // Byte 4 (10..14)
+            p = Q1T_LUT[(b2_5 >> 16u) & 0xFF];
+            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * x[wbase + 10u];
+            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * x[wbase + 11u];
+            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * x[wbase + 12u];
+            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * x[wbase + 13u];
+            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * x[wbase + 14u];
+
+            // Byte 5 (15..19)
+            p = Q1T_LUT[b2_5 >> 24u];
+            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * x[wbase + 15u];
+            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * x[wbase + 16u];
+            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * x[wbase + 17u];
+            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * x[wbase + 18u];
+            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * x[wbase + 19u];
+
+            // Byte 6 (20..24)
+            p = Q1T_LUT[b6_7 & 0xFF];
+            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * x[wbase + 20u];
+            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * x[wbase + 21u];
+            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * x[wbase + 22u];
+            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * x[wbase + 23u];
+            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * x[wbase + 24u];
+
+            // Byte 7 (25..29)
+            p = Q1T_LUT[b6_7 >> 8u];
+            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * x[wbase + 25u];
+            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * x[wbase + 26u];
+            gsum += ((float)(((p >> 4u) & 3u) == 1u) - (float)(((p >> 4u) & 3u) == 2u)) * x[wbase + 27u];
+            gsum += ((float)(((p >> 6u) & 3u) == 1u) - (float)(((p >> 6u) & 3u) == 2u)) * x[wbase + 28u];
+            gsum += ((float)(((p >> 8u) & 3u) == 1u) - (float)(((p >> 8u) & 3u) == 2u)) * x[wbase + 29u];
+
+            // Byte 8 (30..31)
+            p = Q1T_LUT[b8];
+            gsum += ((float)((p & 3u) == 1u) - (float)((p & 3u) == 2u)) * x[wbase + 30u];
+            gsum += ((float)(((p >> 2u) & 3u) == 1u) - (float)(((p >> 2u) & 3u) == 2u)) * x[wbase + 31u];
             float contrib = (float)scale * gsum;
             if (ri == 0u) acc0 += contrib;
             else if (ri == 1u) acc1 += contrib;
@@ -1786,16 +1849,16 @@ kernel void q1t_overlay(
     uint rid [[thread_position_in_grid]])
 {
     if (rid >= rows) return;
-    uint rp0 = base_len + rid * 4u;
-    uint c0 = (uint)q[rp0] | ((uint)q[rp0 + 1u] << 8) | ((uint)q[rp0 + 2u] << 16) | ((uint)q[rp0 + 3u] << 24);
-    uint rp1 = base_len + (rid + 1u) * 4u;
-    uint c1 = (uint)q[rp1] | ((uint)q[rp1 + 1u] << 8) | ((uint)q[rp1 + 2u] << 16) | ((uint)q[rp1 + 3u] << 24);
+    device const uint* rp_ptr = (device const uint*)(q + base_len + rid * 4u);
+    uint c0 = rp_ptr[0];
+    uint c1 = *(device const uint*)(q + base_len + (rid + 1u) * 4u);
     uint ent = base_len + (rows + 1u) * 4u;
     float corr = 0.0f;
     for (uint p = c0; p < c1; ++p) {
         uint e = ent + p * 4u;
-        uint col = (uint)q[e] | ((uint)q[e + 1u] << 8);
-        half val = as_type<half>((ushort)((uint)q[e + 2u] | ((uint)q[e + 3u] << 8)));
+        uint col_val = *(device const uint*)(q + e);
+        uint col = col_val & 0xFFFF;
+        half val = as_type<half>((ushort)(col_val >> 16));
         corr += (float)val * x[col];
     }
     y[rid] += corr;

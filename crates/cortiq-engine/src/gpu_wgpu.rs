@@ -917,15 +917,24 @@ var<workgroup> partial_q1t: array<f32, 64>;
 fn q1t_byte(off: u32) -> u32 {
     return (q1w[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
 }
-fn pow3t(i: u32) -> u32 {
-    switch i {
-        case 0u: { return 1u; }
-        case 1u: { return 3u; }
-        case 2u: { return 9u; }
-        case 3u: { return 27u; }
-        default: { return 81u; }
-    }
-}
+const Q1T_LUT: array<u32, 243> = array<u32, 243>(
+    0u, 1u, 2u, 4u, 5u, 6u, 8u, 9u, 10u, 16u, 17u, 18u, 20u, 21u, 22u, 24u,
+    25u, 26u, 32u, 33u, 34u, 36u, 37u, 38u, 40u, 41u, 42u, 64u, 65u, 66u, 68u, 69u,
+    70u, 72u, 73u, 74u, 80u, 81u, 82u, 84u, 85u, 86u, 88u, 89u, 90u, 96u, 97u, 98u,
+    100u, 101u, 102u, 104u, 105u, 106u, 128u, 129u, 130u, 132u, 133u, 134u, 136u, 137u, 138u, 144u,
+    145u, 146u, 148u, 149u, 150u, 152u, 153u, 154u, 160u, 161u, 162u, 164u, 165u, 166u, 168u, 169u,
+    170u, 256u, 257u, 258u, 260u, 261u, 262u, 264u, 265u, 266u, 272u, 273u, 274u, 276u, 277u, 278u,
+    280u, 281u, 282u, 288u, 289u, 290u, 292u, 293u, 294u, 296u, 297u, 298u, 320u, 321u, 322u, 324u,
+    325u, 326u, 328u, 329u, 330u, 336u, 337u, 338u, 340u, 341u, 342u, 344u, 345u, 346u, 352u, 353u,
+    354u, 356u, 357u, 358u, 360u, 361u, 362u, 384u, 385u, 386u, 388u, 389u, 390u, 392u, 393u, 394u,
+    400u, 401u, 402u, 404u, 405u, 406u, 408u, 409u, 410u, 416u, 417u, 418u, 420u, 421u, 422u, 424u,
+    425u, 426u, 512u, 513u, 514u, 516u, 517u, 518u, 520u, 521u, 522u, 528u, 529u, 530u, 532u, 533u,
+    534u, 536u, 537u, 538u, 544u, 545u, 546u, 548u, 549u, 550u, 552u, 553u, 554u, 576u, 577u, 578u,
+    580u, 581u, 582u, 584u, 585u, 586u, 592u, 593u, 594u, 596u, 597u, 598u, 600u, 601u, 602u, 608u,
+    609u, 610u, 612u, 613u, 614u, 616u, 617u, 618u, 640u, 641u, 642u, 644u, 645u, 646u, 648u, 649u,
+    650u, 656u, 657u, 658u, 660u, 661u, 662u, 664u, 665u, 666u, 672u, 673u, 674u, 676u, 677u, 678u,
+    680u, 681u, 682u
+);
 
 @compute @workgroup_size(64)
 fn q1t_matvec(@builtin(workgroup_id) wid: vec3<u32>,
@@ -950,9 +959,9 @@ fn q1t_matvec(@builtin(workgroup_id) wid: vec3<u32>,
             var gsum = 0.0;
             for (var k = 0u; k < 32u; k = k + 1u) {
                 let b = q1t_byte(codes + k / 5u);
-                let code = (b / pow3t(k % 5u)) % 3u;
-                var sgn = 0.0;
-                if (code == 1u) { sgn = 1.0; } else if (code == 2u) { sgn = -1.0; }
+                let p = Q1T_LUT[b];
+                let code = (p >> ((k % 5u) * 2u)) & 3u;
+                let sgn = select(0.0, 1.0, code == 1u) - select(0.0, 1.0, code == 2u);
                 gsum = gsum + sgn * q1x[xb + k];
             }
             acc = acc + scale * gsum;
@@ -1088,7 +1097,7 @@ fn q1t_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
                 for (var d = 0u; d < 4u; d = d + 1u) {
                     let p = (col0 + d) - g * 32u;
                     let b = qmm_byte(codes + p / 5u);
-                    let code = (b / pow3t(p % 5u)) % 3u;
+                    let code = (Q1T_LUT[b] >> ((p % 5u) * 2u)) & 3u;
                     var sgn = 0.0;
                     if (code == 1u) { sgn = 1.0; } else if (code == 2u) { sgn = -1.0; }
                     wv[d] = sgn * scale;

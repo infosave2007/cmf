@@ -4669,9 +4669,11 @@ pub(crate) fn gpu_batch_job<'a>(
     }
 }
 
-/// θ col-field fold for q8_2f activations. Borrowed pass-through for
-/// every other dtype — the old unconditional `x.to_vec()` was a pure
-/// per-matvec allocation on the q8_row hot path.
+thread_local! {
+    static PRESCALE_BUF1: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+    static PRESCALE_BUF2: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+}
+
 pub(crate) fn prescale<'a>(
     x: &'a [f32],
     col_field: &[f32],
@@ -4681,6 +4683,36 @@ pub(crate) fn prescale<'a>(
         x.iter().zip(col_field).map(|(a, c)| a * c).collect()
     } else {
         std::borrow::Cow::Borrowed(x)
+    }
+}
+
+/// θ col-field fold for q8_2f activations. Borrowed pass-through for
+/// every other dtype, using thread-local buffers to eliminate per-matvec allocations.
+pub(crate) fn prescale_with<R, F: FnOnce(&[f32]) -> R>(
+    x: &[f32],
+    col_field: &[f32],
+    dtype: TensorDtype,
+    buf_id: u8,
+    f: F,
+) -> R {
+    if dtype == TensorDtype::Q8_2f {
+        if buf_id == 1 {
+            PRESCALE_BUF1.with(|b| {
+                let mut buf = b.borrow_mut();
+                buf.clear();
+                buf.extend(x.iter().zip(col_field).map(|(a, c)| a * c));
+                f(&buf)
+            })
+        } else {
+            PRESCALE_BUF2.with(|b| {
+                let mut buf = b.borrow_mut();
+                buf.clear();
+                buf.extend(x.iter().zip(col_field).map(|(a, c)| a * c));
+                f(&buf)
+            })
+        }
+    } else {
+        f(x)
     }
 }
 
@@ -6056,19 +6088,20 @@ fn qmatvec(
         return;
     }
 
-    let xs = prescale(x, col_field, dtype);
-    let out_addr = SendMut(out.as_mut_ptr());
-    let run_range = move |start: usize, end: usize| {
-        for o in start..end {
-            let v = dot_i8_f32(&q[o * cols..(o + 1) * cols], &xs) * row_scale[o];
-            // SAFETY: disjoint row ranges per worker.
-            unsafe { *out_addr.at(o) = v };
+    prescale_with(x, col_field, dtype, 1, |xs| {
+        let out_addr = SendMut(out.as_mut_ptr());
+        let run_range = move |start: usize, end: usize| {
+            for o in start..end {
+                let v = dot_i8_f32(&q[o * cols..(o + 1) * cols], xs) * row_scale[o];
+                // SAFETY: disjoint row ranges per worker.
+                unsafe { *out_addr.at(o) = v };
+            }
+        };
+        match pool {
+            Some(pool) if rows >= 256 => pool.run_rows(rows, &run_range),
+            _ => run_range(0, rows),
         }
-    };
-    match pool {
-        Some(pool) if rows >= 256 => pool.run_rows(rows, &run_range),
-        _ => run_range(0, rows),
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6116,27 +6149,28 @@ fn qmatvec2(
         return;
     }
 
-    let x1s = prescale(x1, col_field, dtype);
-    let x2s = prescale(x2, col_field, dtype);
-
-    let p1 = SendMut(o1.as_mut_ptr());
-    let p2 = SendMut(o2.as_mut_ptr());
-    let run_range = move |start: usize, end: usize| {
-        for o in start..end {
-            let row = &q[o * cols..(o + 1) * cols];
-            let s1 = dot_i8_f32(row, &x1s) * row_scale[o];
-            let s2 = dot_i8_f32(row, &x2s) * row_scale[o];
-            // SAFETY: disjoint row ranges per worker.
-            unsafe {
-                *p1.at(o) = s1;
-                *p2.at(o) = s2;
+    prescale_with(x1, col_field, dtype, 1, |x1s| {
+        prescale_with(x2, col_field, dtype, 2, |x2s| {
+            let p1 = SendMut(o1.as_mut_ptr());
+            let p2 = SendMut(o2.as_mut_ptr());
+            let run_range = move |start: usize, end: usize| {
+                for o in start..end {
+                    let row = &q[o * cols..(o + 1) * cols];
+                    let s1 = dot_i8_f32(row, x1s) * row_scale[o];
+                    let s2 = dot_i8_f32(row, x2s) * row_scale[o];
+                    // SAFETY: disjoint row ranges per worker.
+                    unsafe {
+                        *p1.at(o) = s1;
+                        *p2.at(o) = s2;
+                    }
+                }
+            };
+            match pool {
+                Some(pool) if rows >= 256 => pool.run_rows(rows, &run_range),
+                _ => run_range(0, rows),
             }
-        }
-    };
-    match pool {
-        Some(pool) if rows >= 256 => pool.run_rows(rows, &run_range),
-        _ => run_range(0, rows),
-    }
+        });
+    });
 }
 
 #[derive(Clone, Copy)]
