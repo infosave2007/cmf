@@ -1921,7 +1921,7 @@ static CTX: OnceLock<Option<Ctx>> = OnceLock::new();
 
 fn ctx() -> Option<&'static Ctx> {
     CTX.get_or_init(|| {
-        if std::env::var("CMF_GPU").map(|v| v != "0").unwrap_or(false) {
+        if std::env::var("CMF_GPU").map(|v| v != "0").unwrap_or_else(|_| crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)) {
             match init() {
                 Ok(c) => {
                     tracing::info!("Metal GPU path: on ({})", c._device.name());

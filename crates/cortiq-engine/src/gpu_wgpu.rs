@@ -1283,7 +1283,7 @@ pub fn selected() -> bool {
     match std::env::var("CMF_GPU") {
         Ok(v) if v == "wgpu" => true,
         Ok(v) if v != "0" => !cfg!(target_os = "macos"),
-        _ => false,
+        _ => crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed) && !cfg!(target_os = "macos"),
     }
 }
 

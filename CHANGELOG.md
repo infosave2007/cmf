@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] — 2026-07-21
+
+### Fixed
+- Fixed the global GPU toggle: `cortiq_set_gpu(bool)` now correctly enables/disables the `wgpu` and `metal` device initializers. Previously they ignored the toggle because the backend selection only checked `CMF_GPU`.
+
 ## [0.5.2] — 2026-07-21
 
 ### Added
