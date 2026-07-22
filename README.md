@@ -70,10 +70,7 @@ qwen-moe · gemma / gemma-3 (GeGLU, sandwich norms, 512-token sliding window
 with dual RoPE) · gemma-4 dense 12B/31B (dual-geometry attention: sliding GQA
 + global MQA with V=K, proportional RoPE, layer scalars, final-logit softcap)
 · phi-3 / phi-4 (fused qkv/gate_up splits, longrope served at the native
-window) · nanbeige (Looped Transformer: `num_loops` re-applies the layer stack
-N times with per-loop final norm — Nanbeige4.2-3B: 22 layers × 2 loops = 44
-virtual layers, 4.17B effective params from 2.1B weights) · DeepSeek-R1
-distills (qwen2/llama layouts) — dense, MoE and
+window) · DeepSeek-R1 distills (qwen2/llama layouts) — dense, MoE and
 GatedDeltaNet. Not yet: gemma-2 (attention softcapping), gemma-4 MoE /
 E-series, and DeepSeek V2/V3 (MLA). Anything else, try `import-gguf` — and if
 it refuses, that is a bug worth filing.

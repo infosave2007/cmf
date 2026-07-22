@@ -59,11 +59,6 @@ pub struct Pipeline {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub num_layers: usize,
-    /// Looped Transformer: the layer stack is applied this many times
-    /// per token (Nanbeige: 2). KV cache has num_layers*num_loops slots.
-    pub num_loops: usize,
-    /// Looped Transformer: apply final_norm after EACH loop iteration.
-    pub loop_final_norm: bool,
     pub vocab_size: usize,
     pub rms_eps: f64,
     pub rope_base: f32,
@@ -424,18 +419,6 @@ fn prefill_chunk() -> usize {
 pub type TokenCallback = Box<dyn FnMut(&str) -> bool + Send>;
 
 impl Pipeline {
-    /// Total virtual layers = num_layers * num_loops (Looped Transformer).
-    #[inline]
-    pub fn total_layers(&self) -> usize {
-        self.num_layers * self.num_loops
-    }
-
-    /// Physical layer index for a virtual layer (modulo for looped models).
-    #[inline]
-    fn phys_layer(&self, vli: usize) -> usize {
-        vli % self.num_layers
-    }
-
     /// Build a pipeline from parts (used by the loader and tests).
     #[allow(clippy::too_many_arguments)]
 
@@ -529,8 +512,8 @@ impl Pipeline {
         }
         let limit = upto
             .map(|u| u + 1)
-            .unwrap_or(self.total_layers())
-            .min(self.total_layers());
+            .unwrap_or(self.num_layers)
+            .min(self.num_layers);
 
         enum Item<'a> {
             Gdn {
@@ -554,11 +537,12 @@ impl Pipeline {
         let attend_mode = std::env::var("CMF_GPU_ATTEND").unwrap_or_else(|_| "auto".into());
         let dev_attend = attend_mode != "0"
             && attend_mode != "off"
-            // hd=256 Born-importance pass optimized (threadgroup score
-            // cache eliminates the 2nd K read); now competitive with CPU
-            // sandwich on M4 at decode depths.
-            && self.head_dim <= 256
+            // hd=256 is correct on the widened kernel but measured slower
+            // than the CPU sandwich on M4 at decode depths. Keep it as an
+            // explicit research lever without regressing Qwopus by default.
+            && (self.head_dim <= 128 || attend_mode == "force" || attend_mode == "256")
             && self.head_dim % 4 == 0
+            && self.head_dim <= 256
             && self.rotary_dim >= 2
             && self.rotary_dim <= self.head_dim
             && (self.rotary_dim / 2) % 32 == 0
@@ -569,7 +553,7 @@ impl Pipeline {
         let mut model_ref: Option<std::sync::Arc<cortiq_core::CmfModel>> = None;
         let mut scan = start;
         while scan < limit {
-            let lw = &self.weights.layers[self.phys_layer(scan)];
+            let lw = &self.weights.layers[scan];
             let FfnKind::Dense(d) = &lw.ffn else { break };
             let (Some(g), Some(u), Some(dn)) = (
                 d.gate_proj.q1_parts(),
@@ -865,7 +849,7 @@ impl Pipeline {
         let mut lm_rows = None;
         if self.graph_want_logits
             && upto.is_none()
-            && end == self.total_layers()
+            && end == self.num_layers
             && std::env::var("CMF_GPU_LMHEAD")
                 .map(|v| v != "0")
                 .unwrap_or(true)
@@ -959,8 +943,6 @@ impl Pipeline {
             num_kv_heads,
             head_dim,
             num_layers,
-            num_loops: 1,
-            loop_final_norm: false,
             vocab_size,
             rms_eps,
             rope_base,
@@ -1021,9 +1003,9 @@ impl Pipeline {
     pub fn set_o1(&mut self, cfg: Option<crate::nystrom::O1Cfg>) {
         self.o1_flags = match &cfg {
             Some(c) => {
-                let mut flags = c.layer_flags(self.total_layers());
+                let mut flags = c.layer_flags(self.num_layers);
                 for (li, f) in flags.iter_mut().enumerate() {
-                    if *f && !matches!(self.weights.layers[self.phys_layer(li)].attn, AttnKind::Full { .. }) {
+                    if *f && !matches!(self.weights.layers[li].attn, AttnKind::Full { .. }) {
                         *f = false;
                     }
                 }
@@ -1035,7 +1017,7 @@ impl Pipeline {
             let n = self.o1_flags.iter().filter(|&&f| f).count();
             tracing::info!(
                 "o1 nystrom attention: {n}/{} layer(s), m={} w={} sink={} rect={:?}",
-                self.total_layers(),
+                self.num_layers,
                 c.m,
                 c.w,
                 c.sink,
@@ -1068,7 +1050,7 @@ impl Pipeline {
         if self.o1_cfg.is_none() {
             return;
         }
-        for li in 0..self.total_layers() {
+        for li in 0..self.num_layers {
             if self.o1_flags.get(li).copied().unwrap_or(false) {
                 self.kv_cache.layers[li].o1_seal(self.num_heads);
             }
@@ -1686,8 +1668,8 @@ impl Pipeline {
         );
         let pool = self.pool.clone();
 
-        for li in 0..self.total_layers() {
-            let lw = &self.weights.layers[self.phys_layer(li)];
+        for li in 0..self.num_layers {
+            let lw = &self.weights.layers[li];
             // Norms into pipeline scratch (4 allocs/layer on the MTP
             // decode hot path before this).
             inference::rms_norm_into(
@@ -1800,7 +1782,7 @@ impl Pipeline {
                     )
                 }
             };
-            let (a1, a2) = match &self.weights.layers[self.phys_layer(li)].attn_out_norm {
+            let (a1, a2) = match &self.weights.layers[li].attn_out_norm {
                 Some(w) => (
                     inference::rms_norm(&a1, w, self.rms_eps, self.norm_style),
                     inference::rms_norm(&a2, w, self.rms_eps, self.norm_style),
@@ -1815,7 +1797,7 @@ impl Pipeline {
             attention::recycle_buf(&mut a1);
             attention::recycle_buf(&mut a2);
 
-            let lw = &self.weights.layers[self.phys_layer(li)];
+            let lw = &self.weights.layers[li];
             inference::rms_norm_into(
                 &h1,
                 &lw.post_norm,
@@ -1832,7 +1814,7 @@ impl Pipeline {
             );
             let (f1, f2) =
                 ffn_forward_pair(&lw.ffn, &self.ws.p1, &self.ws.p2, self.pool.as_deref());
-            let (f1, f2) = match &self.weights.layers[self.phys_layer(li)].ffn_out_norm {
+            let (f1, f2) = match &self.weights.layers[li].ffn_out_norm {
                 Some(w) => (
                     inference::rms_norm(&f1, w, self.rms_eps, self.norm_style),
                     inference::rms_norm(&f2, w, self.rms_eps, self.norm_style),
@@ -1846,17 +1828,11 @@ impl Pipeline {
             let (mut f1, mut f2) = (f1, f2);
             attention::recycle_buf(&mut f1);
             attention::recycle_buf(&mut f2);
-            if let Some(sc) = self.weights.layers[self.phys_layer(li)].layer_scale {
+            if let Some(sc) = self.weights.layers[li].layer_scale {
                 for i in 0..self.hidden_size {
                     h1[i] *= sc;
                     h2[i] *= sc;
                 }
-            }
-
-            // Looped Transformer: apply final_norm after each loop iteration.
-            if self.loop_final_norm && (li + 1) % self.num_layers == 0 && li + 1 < self.total_layers() {
-                h1 = inference::rms_norm(&h1, &self.weights.final_norm, self.rms_eps, self.norm_style);
-                h2 = inference::rms_norm(&h2, &self.weights.final_norm, self.rms_eps, self.norm_style);
             }
         }
         (h1, h2)
@@ -1944,7 +1920,7 @@ impl Pipeline {
     pub fn probe_ffn_mass(&mut self, ids: &[u32]) -> Vec<Vec<f64>> {
         self.kv_cache.clear();
         FFN_PROBE.with(|p| {
-            *p.borrow_mut() = Some(vec![vec![0f64; self.intermediate_size]; self.total_layers()]);
+            *p.borrow_mut() = Some(vec![vec![0f64; self.intermediate_size]; self.num_layers]);
         });
         crate::gpu::cpu_scope(|| {
             for (pos, &id) in ids.iter().enumerate() {
@@ -2297,7 +2273,7 @@ impl Pipeline {
 
         #[cfg(target_os = "macos")]
         let mut chunk_skip_until = 0usize;
-        for li in 0..self.total_layers() {
+        for li in 0..self.num_layers {
             crate::gpu::set_layer(li as i64); // layer-split GPU/CPU
             // GPU chunk graph (default-on under CMF_GPU=1): a run of
             // consecutive eligible layers for the whole chunk in ONE
@@ -2321,7 +2297,7 @@ impl Pipeline {
                 fill_h(&mut h, self);
                 h_ready = true;
             }
-            let lw = &self.weights.layers[self.phys_layer(li)];
+            let lw = &self.weights.layers[li];
             // ── attention ──
             match &lw.attn {
                 AttnKind::LinearGdn(w) => {
@@ -2477,7 +2453,7 @@ impl Pipeline {
             }
 
             // ── FFN batched ──
-            let lw = &self.weights.layers[self.phys_layer(li)];
+            let lw = &self.weights.layers[li];
             let mut post = vec![0.0f32; b * hs];
             for bi in 0..b {
                 let r =
@@ -2515,14 +2491,6 @@ impl Pipeline {
                     "layer {li}: mean|h|={n:.4} max|h|={mx:.2} scale={:?}",
                     lw.layer_scale
                 );
-            }
-
-            // Looped Transformer: apply final_norm after each loop iteration.
-            if self.loop_final_norm && (li + 1) % self.num_layers == 0 && li + 1 < self.total_layers() {
-                for bi in 0..b {
-                    let row = inference::rms_norm(&h[bi * hs..(bi + 1) * hs], &self.weights.final_norm, eps, norm_style);
-                    h[bi * hs..(bi + 1) * hs].copy_from_slice(&row);
-                }
             }
         }
         crate::gpu::set_layer(-1); // lm_head/final ops outside layer-split
@@ -2585,8 +2553,8 @@ impl Pipeline {
         // Collect the longest run of consecutive eligible layers.
         let mut layers: Vec<crate::gpu_metal::ChunkLayer> = Vec::new();
         let mut stored_at: Vec<usize> = Vec::new();
-        for li in li0..self.total_layers() {
-            let lw = &self.weights.layers[self.phys_layer(li)];
+        for li in li0..self.num_layers {
+            let lw = &self.weights.layers[li];
             if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
                 break;
             }
@@ -2809,7 +2777,7 @@ impl Pipeline {
         let nh = self.num_heads;
         let (nkv, hd, rd) = self.layer_geom(0);
         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
-        let mut layers = Vec::with_capacity(self.total_layers());
+        let mut layers = Vec::with_capacity(self.num_layers);
         let mut model = None;
         let dbg = std::env::var("CMF_GRAPH_DEBUG").is_ok();
         fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
@@ -2829,8 +2797,8 @@ impl Pipeline {
                 data: d,
             })
         }
-        for li in 0..self.total_layers() {
-            let lw = &self.weights.layers[self.phys_layer(li)];
+        for li in 0..self.num_layers {
+            let lw = &self.weights.layers[li];
             if dbg {
                 let ak = match &lw.attn {
                     AttnKind::Full {
@@ -2995,10 +2963,10 @@ impl Pipeline {
             Vec<crate::gpu::GraphLayer<'_>>,
             std::sync::Arc<cortiq_core::CmfModel>,
         )> = (|| {
-            let mut layers = Vec::with_capacity(self.total_layers());
+            let mut layers = Vec::with_capacity(self.num_layers);
             let mut model = None;
-            for li in 0..self.total_layers() {
-                let lw = &self.weights.layers[self.phys_layer(li)];
+            for li in 0..self.num_layers {
+                let lw = &self.weights.layers[li];
                 let (gate, up, down) = match &lw.ffn {
                     FfnKind::Dense(d) => (&d.gate_proj, &d.up_proj, &d.down_proj),
                     _ => return None,
@@ -3142,7 +3110,7 @@ impl Pipeline {
 
         #[cfg(target_os = "macos")]
         let mut gpu_skip_until = 0usize;
-        for li in 0..self.total_layers() {
+        for li in 0..self.num_layers {
             crate::gpu::set_layer(li as i64); // layer-split GPU/CPU (CMF_GPU_LAYERS)
             if let Some(u) = upto {
                 if li > u {
@@ -3171,7 +3139,7 @@ impl Pipeline {
                 }
             }
 
-            let lw = &self.weights.layers[self.phys_layer(li)];
+            let lw = &self.weights.layers[li];
             // Norm into the pipeline scratch — the returning rms_norm
             // allocated twice per layer per token (roadmap §3 P0).
             inference::rms_norm_into(
@@ -3400,11 +3368,11 @@ impl Pipeline {
             };
             // Gemma sandwich norm: normalize the attention branch before
             // it joins the residual stream.
-            let attn_out = match &self.weights.layers[self.phys_layer(li)].attn_out_norm {
+            let attn_out = match &self.weights.layers[li].attn_out_norm {
                 Some(w) => inference::rms_norm(&attn_out, w, self.rms_eps, self.norm_style),
                 None => attn_out,
             };
-            let lw = &self.weights.layers[self.phys_layer(li)];
+            let lw = &self.weights.layers[li];
             inference::add_rmsnorm_fused_into(
                 &mut h,
                 &attn_out,
@@ -3484,7 +3452,7 @@ impl Pipeline {
                 },
                 (false, _) => ffn_forward(&lw.ffn, &post_normed, self.pool.as_deref()),
             };
-            let ffn_out = match &self.weights.layers[self.phys_layer(li)].ffn_out_norm {
+            let ffn_out = match &self.weights.layers[li].ffn_out_norm {
                 Some(w) => inference::rms_norm(&ffn_out, w, self.rms_eps, self.norm_style),
                 None => ffn_out,
             };
@@ -3495,7 +3463,7 @@ impl Pipeline {
             attention::recycle_buf(&mut ffn_out);
 
             // Gemma-4: the layer output is scaled by a learned scalar.
-            if let Some(sc) = self.weights.layers[self.phys_layer(li)].layer_scale {
+            if let Some(sc) = self.weights.layers[li].layer_scale {
                 for v in h.iter_mut() {
                     *v *= sc;
                 }
@@ -3506,12 +3474,6 @@ impl Pipeline {
             // updated as the context evolves during decode.
             if self.dyn_phi_layer == Some(li) {
                 self.update_dyn_phi(&h);
-            }
-
-            // Looped Transformer: apply final_norm after each loop iteration
-            // (Nanbeige: skip_loop_final_norm=false).
-            if self.loop_final_norm && (li + 1) % self.num_layers == 0 && li + 1 < self.total_layers() {
-                h = inference::rms_norm(&h, &self.weights.final_norm, self.rms_eps, self.norm_style);
             }
         }
         crate::gpu::set_layer(-1); // layers done — lm_head outside layer-split

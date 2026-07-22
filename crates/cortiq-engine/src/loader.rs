@@ -11,7 +11,7 @@
 //! tensor presence, output gate by q_proj row count); LinearAttention
 //! loads the canonical core `vmf_attn.*` (folded at convert time).
 
-use crate::kv_cache::{KvCache, LayerKvCache};
+use crate::kv_cache::LayerKvCache;
 use crate::linear_core::{
     GdnCfg, GdnWeights, ShortConvCfg, ShortConvWeights, VmfPhaseCfg, VmfPhaseWeights,
 };
@@ -782,24 +782,6 @@ impl Pipeline {
         );
         let rotary = ((arch.head_dim as f32 * arch.partial_rotary_factor) as usize).max(2);
         pipeline.set_rotary(rotary, arch.rope_theta as f32);
-        // Looped Transformer (Nanbeige): the layer stack is applied
-        // num_loops times; KV cache needs num_layers*num_loops slots.
-        if arch.num_loops > 1 {
-            pipeline.num_loops = arch.num_loops;
-            pipeline.loop_final_norm = arch.loop_final_norm;
-            pipeline.kv_cache = KvCache::new(
-                arch.num_layers * arch.num_loops,
-                arch.num_kv_heads,
-                arch.head_dim,
-                max_seq_len,
-            );
-            tracing::info!(
-                "looped transformer: {} layers x {} loops = {} virtual layers",
-                arch.num_layers,
-                arch.num_loops,
-                arch.num_layers * arch.num_loops,
-            );
-        }
         pipeline.attention_heads_per_layer = arch.attention_heads_per_layer.clone();
         if let Some(yarn) = &arch.yarn {
             pipeline.inv_freq = std::sync::Arc::new(crate::attention::yarn_inv_freq(

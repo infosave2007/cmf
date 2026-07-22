@@ -61,9 +61,7 @@ qwen3_next / AgentWorld 布局）· llama · mistral · qwen-moe · gemma / gemm
 （GeGLU、sandwich 归一化、512 滑动窗口 + 双 RoPE）· gemma-4 dense 12B/31B
 （双几何注意力：滑动 GQA + 全局 MQA（V=K）、比例 RoPE、逐层标量、最终 logit
 软上限）· phi-3 / phi-4（拆分融合的 qkv/gate_up，longrope 按原生窗口提供）·
-nanbeige（Looped Transformer：`num_loops` 将层栈重复应用 N 次，每次循环后施加
-final norm——Nanbeige4.2-3B：22 层 × 2 循环 = 44 虚拟层，2.1B 权重实现 4.17B
-有效参数）· DeepSeek-R1 蒸馏版（qwen2/llama 布局）——涵盖 dense、MoE 和 GatedDeltaNet。
+DeepSeek-R1 蒸馏版（qwen2/llama 布局）——涵盖 dense、MoE 和 GatedDeltaNet。
 尚不支持：gemma-2（注意力 softcapping）、gemma-4 MoE / E 系列、以及
 DeepSeek V2/V3（MLA）。其它模型请试 `import-gguf`——如果它拒绝了，那就是一个
 值得提 issue 的 bug。

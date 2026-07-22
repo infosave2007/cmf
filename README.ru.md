@@ -70,10 +70,7 @@ qwen-moe · gemma / gemma-3 (GeGLU, sandwich-нормы, скользящее о
 двойным RoPE) · gemma-4 dense 12B/31B (двухрежимное внимание: скользящий GQA
 + глобальный MQA с V=K, пропорциональный RoPE, послойные скаляры, софткап
 финальных логитов) · phi-3 / phi-4 (расщепление слитых qkv/gate_up, longrope
-на нативном окне) · nanbeige (Looped Transformer: `num_loops` повторно применяет
-стек слоёв N раз с финальной нормой на каждом цикле — Nanbeige4.2-3B: 22 слоя ×
-2 цикла = 44 виртуальных слоя, 4.17B эффективных параметров из 2.1B весов) ·
-дистилляты DeepSeek-R1 (раскладки qwen2/llama) — dense,
+на нативном окне) · дистилляты DeepSeek-R1 (раскладки qwen2/llama) — dense,
 MoE и GatedDeltaNet. Пока нет: gemma-2 (softcapping внимания), gemma-4
 MoE / E-серия и DeepSeek V2/V3 (MLA). Всё остальное — пробуйте
 `import-gguf`; и если он откажется, это ошибка, о которой стоит завести

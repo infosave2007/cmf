@@ -24,8 +24,6 @@ fn arch() -> ModelArch {
         hidden_size: H,
         intermediate_size: FFN,
         num_layers: 2,
-        num_loops: 1,
-        loop_final_norm: false,
         num_attention_heads: NH,
         num_kv_heads: 1,
         head_dim: HD,
