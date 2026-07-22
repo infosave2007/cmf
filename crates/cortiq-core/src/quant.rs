@@ -179,14 +179,16 @@ pub fn dequant_vbit(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) -> 
             let u = ((acc >> (nbits - b)) & ((1u64 << b) - 1)) as f32;
             nbits -= b;
             let so = (r * ng + i / GROUP_SIZE) * 2;
-            let s = f16_to_f32(u16::from_le_bytes([bytes[sc_off + so], bytes[sc_off + so + 1]]));
+            let s = f16_to_f32(u16::from_le_bytes([
+                bytes[sc_off + so],
+                bytes[sc_off + so + 1],
+            ]));
             dst[r * cols + i] = (u - l) * s;
         }
         off += rowlen;
     }
     Ok(())
 }
-
 
 /// Bytes per q4_tiled group tile: 2 (f16 scale) + 16 (nibbles).
 pub const Q4_TILE: usize = 18;
@@ -228,16 +230,15 @@ pub fn dequant_q1s(bytes: &[u8], dst: &mut [f32]) {
     if off + 4 > bytes.len() {
         return;
     }
-    let count = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
-        as usize;
+    let count =
+        u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]) as usize;
     off += 4;
     for _ in 0..count {
         if off + 6 > bytes.len() {
             break;
         }
-        let idx =
-            u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
-                as usize;
+        let idx = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+            as usize;
         let val = f16_to_f32(u16::from_le_bytes([bytes[off + 4], bytes[off + 5]]));
         if idx < dst.len() {
             dst[idx] = val;
@@ -371,7 +372,9 @@ pub fn dequant_vbit_ro(
     dst: &mut [f32],
 ) -> Result<(), String> {
     if cols % GROUP_SIZE != 0 {
-        return Err(format!("vbit_ro: cols {cols} not a multiple of {GROUP_SIZE}"));
+        return Err(format!(
+            "vbit_ro: cols {cols} not a multiple of {GROUP_SIZE}"
+        ));
     }
     let ng = cols / GROUP_SIZE;
     let (sc_off, off_off, packed_off) = vbit_ro_sections(rows, cols);
@@ -379,7 +382,9 @@ pub fn dequant_vbit_ro(
     for r in 0..rows {
         let b = bits[r] as usize;
         if !matches!(b, 3..=6 | 8) {
-            return Err(format!("vbit_ro row {r}: bit width {b} outside {{3,4,5,6,8}}"));
+            return Err(format!(
+                "vbit_ro row {r}: bit width {b} outside {{3,4,5,6,8}}"
+            ));
         }
         let l = ((1usize << (b - 1)) - 1) as f32;
         let start = packed_off + vbit_ro_offset(bytes, off_off, r);
@@ -395,7 +400,10 @@ pub fn dequant_vbit_ro(
             let u = ((acc >> (nbits - b)) & ((1u64 << b) - 1)) as f32;
             nbits -= b;
             let so = (r * ng + i / GROUP_SIZE) * 2;
-            let sc = f16_to_f32(u16::from_le_bytes([bytes[sc_off + so], bytes[sc_off + so + 1]]));
+            let sc = f16_to_f32(u16::from_le_bytes([
+                bytes[sc_off + so],
+                bytes[sc_off + so + 1],
+            ]));
             dst[r * cols + i] = (u - l) * sc;
         }
     }
@@ -404,35 +412,50 @@ pub fn dequant_vbit_ro(
 
 /// Expected byte length of a tensor given dtype and element count.
 pub fn expected_nbytes(dtype: TensorDtype, shape: &[usize]) -> Option<usize> {
-    let n: usize = shape.iter().product();
-    Some(match dtype {
-        TensorDtype::F32 => n * 4,
-        TensorDtype::F16 | TensorDtype::Bf16 => n * 2,
+    let n = shape
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
+    match dtype {
+        TensorDtype::F32 => n.checked_mul(4),
+        TensorDtype::F16 | TensorDtype::Bf16 => n.checked_mul(2),
         TensorDtype::Q8Row => {
             let out = *shape.first()?;
-            n + out * 2
+            n.checked_add(out.checked_mul(2)?)
         }
         TensorDtype::Q4Block => {
-            let groups = (n + GROUP_SIZE - 1) / GROUP_SIZE;
-            groups * 16 + groups * 2
+            let groups = n.div_ceil(GROUP_SIZE);
+            groups.checked_mul(18)
         }
         TensorDtype::Q4Tiled => {
             // Interleaved tiles: [f16 scale][16B nibbles] per 32-group.
-            let groups = (n + GROUP_SIZE - 1) / GROUP_SIZE;
-            groups * 18
+            n.div_ceil(GROUP_SIZE).checked_mul(18)
         }
         TensorDtype::Q1 => {
             // Interleaved tiles: [f16 scale][4B bits] per 32-group.
-            let groups = (n + GROUP_SIZE - 1) / GROUP_SIZE;
-            groups * Q1_TILE
+            n.div_ceil(GROUP_SIZE).checked_mul(Q1_TILE)
         }
         TensorDtype::Q8_2f => {
             let out = *shape.first()?;
             let inn = n / out.max(1);
-            n + out * 2 + inn * 2
+            n.checked_add(out.checked_mul(2)?)?
+                .checked_add(inn.checked_mul(2)?)
         }
-        _ => return None, // reserved dtypes: size not defined by this reader
-    })
+        _ => None, // variable/reserved dtypes: size not defined by this reader
+    }
+}
+
+fn has_fixed_payload_size(dtype: TensorDtype) -> bool {
+    matches!(
+        dtype,
+        TensorDtype::F32
+            | TensorDtype::F16
+            | TensorDtype::Bf16
+            | TensorDtype::Q8Row
+            | TensorDtype::Q4Block
+            | TensorDtype::Q4Tiled
+            | TensorDtype::Q1
+            | TensorDtype::Q8_2f
+    )
 }
 
 /// Validate a tensor payload against its directory entry (roadmap
@@ -442,11 +465,7 @@ pub fn expected_nbytes(dtype: TensorDtype, shape: &[usize]) -> Option<usize> {
 /// `expected_nbytes` equality; for vbit — whose payload length depends
 /// on the per-row bit widths stored in the payload itself — the exact
 /// length is computed from the (validated) width header.
-pub fn validate_payload(
-    dtype: TensorDtype,
-    shape: &[usize],
-    bytes: &[u8],
-) -> Result<(), String> {
+pub fn validate_payload(dtype: TensorDtype, shape: &[usize], bytes: &[u8]) -> Result<(), String> {
     if dtype == TensorDtype::VbitRo {
         if shape.len() != 2 {
             return Err(format!("vbit_ro tensor must be 2-D, got {shape:?}"));
@@ -527,6 +546,11 @@ pub fn validate_payload(
         }
         return Ok(());
     }
+    if has_fixed_payload_size(dtype) && expected_nbytes(dtype, shape).is_none() {
+        return Err(format!(
+            "tensor size overflows usize for {dtype:?}{shape:?}"
+        ));
+    }
     if let Some(expect) = expected_nbytes(dtype, shape) {
         if expect != bytes.len() {
             return Err(format!(
@@ -604,7 +628,7 @@ pub fn dequant_tensor(entry: &TensorEntry, bytes: &[u8], dst: &mut [f32]) -> Res
                 "dtype {} of '{}' is reserved — not decodable by this runtime",
                 other.name(),
                 entry.name
-            ))
+            ));
         }
     }
     Ok(())
@@ -616,8 +640,9 @@ pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
         TensorDtype::F32 => 4.0,
         TensorDtype::F16 | TensorDtype::Bf16 => 2.0,
         TensorDtype::Q8Row | TensorDtype::Q8_2f => 1.0,
-        TensorDtype::Q4Block | TensorDtype::Q4Col | TensorDtype::Mix84
-        | TensorDtype::Q4Tiled => 0.5625,
+        TensorDtype::Q4Block | TensorDtype::Q4Col | TensorDtype::Mix84 | TensorDtype::Q4Tiled => {
+            0.5625
+        }
         TensorDtype::Vbit | TensorDtype::VbitRo => 0.5,
         TensorDtype::Q1 => 0.1875, // 6 bytes per 32 weights
         // q1 base + a small sparse f16 overlay (informational; the true
@@ -630,7 +655,7 @@ pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
 
 #[cfg(test)]
 mod f16_tests {
-    use super::{f16_to_f32, f32_to_f16, validate_payload, GROUP_SIZE};
+    use super::{GROUP_SIZE, f16_to_f32, f32_to_f16, validate_payload};
 
     #[test]
     fn f16_subnormals_decode_correctly() {
@@ -646,7 +671,9 @@ mod f16_tests {
 
     #[test]
     fn f16_roundtrip_including_subnormals() {
-        for &v in &[0.0f32, 1.0, -2.5, 6.097e-5, 3.0e-5, 5.96e-8, -1.782e-5, 65504.0] {
+        for &v in &[
+            0.0f32, 1.0, -2.5, 6.097e-5, 3.0e-5, 5.96e-8, -1.782e-5, 65504.0,
+        ] {
             let back = f16_to_f32(f32_to_f16(v));
             let tol = (v.abs() * 1e-3).max(1e-9);
             assert!((back - v).abs() <= tol, "roundtrip {v} -> {back}");
@@ -693,5 +720,4 @@ mod f16_tests {
     fn vbit_is_supported() {
         assert!(crate::types::TensorDtype::Vbit.is_supported());
     }
-
 }

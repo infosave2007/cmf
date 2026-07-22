@@ -5,7 +5,7 @@ pub mod dashboard;
 pub mod openai;
 pub mod streaming;
 
-use axum::{routing::get, Json, Router};
+use axum::{Json, Router, routing::get};
 use cortiq_engine::{CortiqRuntime, Pipeline};
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
@@ -27,16 +27,24 @@ pub struct PipelinePool {
 /// A checked-out slot: holds both the concurrency permit and the
 /// pipeline lock until dropped.
 pub struct SlotGuard {
-    _permit: OwnedSemaphorePermit,
     pub pipe: OwnedMutexGuard<Pipeline>,
+    // Keep the permit after the mutex guard so drop glue unlocks the
+    // pipeline before another waiter can acquire the permit.
+    _permit: OwnedSemaphorePermit,
 }
 
 impl PipelinePool {
     pub fn new(pipelines: Vec<Pipeline>) -> Self {
-        assert!(!pipelines.is_empty(), "pipeline pool needs at least one slot");
+        assert!(
+            !pipelines.is_empty(),
+            "pipeline pool needs at least one slot"
+        );
         let sem = Arc::new(Semaphore::new(pipelines.len()));
         Self {
-            slots: pipelines.into_iter().map(|p| Arc::new(Mutex::new(p))).collect(),
+            slots: pipelines
+                .into_iter()
+                .map(|p| Arc::new(Mutex::new(p)))
+                .collect(),
             sem,
         }
     }
@@ -56,7 +64,10 @@ impl PipelinePool {
             .expect("slot semaphore closed");
         for s in &self.slots {
             if let Ok(pipe) = s.clone().try_lock_owned() {
-                return SlotGuard { _permit: permit, pipe };
+                return SlotGuard {
+                    pipe,
+                    _permit: permit,
+                };
             }
         }
         unreachable!("semaphore permit held but every slot is locked")

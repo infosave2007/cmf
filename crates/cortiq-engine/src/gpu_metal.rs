@@ -12,17 +12,26 @@
 //! the kernel is mathematically identical to the CPU path, the same prescale trick).
 
 use crate::gpu::{BatchJob, MoeJob};
-use cortiq_core::quant::{Q1_TILE, Q1T_TILE, GROUP_SIZE};
 use cortiq_core::CmfModel;
-use metal::{
-    Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
-};
+use cortiq_core::quant::{f16_to_f32, GROUP_SIZE, Q1_TILE, Q1T_TILE};
+use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
+
+// CMF low-bit payloads are byte-packed. In particular Q1T uses a 9-byte
+// group tile, so typed ushort/uint pointer casts are unaligned on most groups
+// and therefore undefined in MSL. Assemble little-endian fields explicitly.
+inline ushort cmf_load_u16_le(device const uchar* p) {
+    return (ushort)p[0] | ((ushort)p[1] << 8u);
+}
+inline uint cmf_load_u32_le(device const uchar* p) {
+    return (uint)p[0] | ((uint)p[1] << 8u) |
+           ((uint)p[2] << 16u) | ((uint)p[3] << 24u);
+}
 
 // Shape-specialized pipeline variants (the llama.cpp trick): cols/rows
 // arrive as FUNCTION CONSTANTS so the K-loop trip count and address
@@ -71,6 +80,48 @@ kernel void q8_matvec(
     }
     for (; i < cols4; i += 32) {
         acc.x += dot(float4(q[base + i]), xs[i]);
+    }
+    float total = simd_sum(acc.x + acc.y + acc.z + acc.w);
+    if (lane == 0) y[row] = total * rs[row];
+}
+
+// q8_2f twin: the input-channel field is applied while x is read. Keeping
+// this inside the projection avoids a separate prescale dispatch/buffer for
+// every Q/K/V/Gate/Up/Down projection in the whole-token graph.
+kernel void q8f_matvec(
+    device const char4*  q     [[buffer(0)]],
+    device const float4* xs    [[buffer(1)]],
+    device const float*  rs    [[buffer(2)]],
+    device float*        y     [[buffer(3)]],
+    device const float4* col   [[buffer(4)]],
+    constant uint&       cols4 [[buffer(5)]],
+    constant uint&       rows  [[buffer(6)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint row = tgpos * sgs + sg;
+    if (row >= rows) return;
+    ulong base = (ulong)row * cols4;
+    float4 acc = float4(0.0f);
+    uint i = lane;
+    for (; i + 96 < cols4; i += 128) {
+        char4 q0 = q[base + i];
+        char4 q1 = q[base + i + 32];
+        char4 q2 = q[base + i + 64];
+        char4 q3 = q[base + i + 96];
+        float4 x0 = xs[i] * col[i];
+        float4 x1 = xs[i + 32] * col[i + 32];
+        float4 x2 = xs[i + 64] * col[i + 64];
+        float4 x3 = xs[i + 96] * col[i + 96];
+        acc.x += dot(float4(q0), x0);
+        acc.y += dot(float4(q1), x1);
+        acc.z += dot(float4(q2), x2);
+        acc.w += dot(float4(q3), x3);
+    }
+    for (; i < cols4; i += 32) {
+        acc.x += dot(float4(q[base + i]), xs[i] * col[i]);
     }
     float total = simd_sum(acc.x + acc.y + acc.z + acc.w);
     if (lane == 0) y[row] = total * rs[row];
@@ -452,13 +503,12 @@ kernel void q1t_overlay_mm(
     uint rid [[thread_position_in_grid]])
 {
     if (rid >= rows) return;
-    device const uint* rp_ptr = (device const uint*)(q + base_len + rid * 4u);
-    uint c0 = rp_ptr[0];
-    uint c1 = *(device const uint*)(q + base_len + (rid + 1u) * 4u);
+    uint c0 = cmf_load_u32_le(q + base_len + rid * 4u);
+    uint c1 = cmf_load_u32_le(q + base_len + (rid + 1u) * 4u);
     uint ent = base_len + (rows + 1u) * 4u;
     for (uint p = c0; p < c1; ++p) {
         uint e = ent + p * 4u;
-        uint col_val = *(device const uint*)(q + e);
+        uint col_val = cmf_load_u32_le(q + e);
         uint col = col_val & 0xFFFF;
         float fv = (float)as_type<half>((ushort)(col_val >> 16));
         for (uint bi = 0; bi < nb; ++bi) {
@@ -1084,7 +1134,7 @@ kernel void silu_mul_pre(
 }
 
 // Full attention on the device — one simdgroup per head throughout.
-// Dims contract (checked host-side): hd % 4 == 0, hd <= 128, and for
+// Dims contract (checked host-side): hd % 4 == 0, hd <= 256, and for
 // RoPE lane-local pairing (rd/2) % 32 == 0 with rd <= hd.
 
 // Per-head qk-norm + partial RoPE. Heads 0..nh are Q (optionally
@@ -1119,7 +1169,7 @@ kernel void attn_rope_qkn(
         ? qraw + (ulong)head * (gate ? 2u : 1u) * hd
         : k + (ulong)(head - nh) * hd;
     uint nt = (hd + 31u) / 32u;
-    float xv[4];
+    float xv[8];
     float ss = 0.0f;
     for (uint t = 0; t < nt; ++t) {
         uint d = t * 32u + lane;
@@ -1217,13 +1267,13 @@ kernel void gqa_attend(
     device const float* vh0 = vbuf + (ulong)kh * cap * hd;
     float scale = 1.0f / sqrt((float)hd);
     uint nt = (hd + 31u) / 32u;
-    float qv[4];
+    float qv[8];
     for (uint t = 0; t < nt; ++t) {
         uint d = t * 32u + lane;
         qv[t] = d < hd ? q[(ulong)h * hd + d] * scale : 0.0f;
     }
     float m = -INFINITY, l = 0.0f;
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (uint p = 0; p < n; ++p) {
         device const float* kr = kh0 + (ulong)p * hd;
         float partial = 0.0f;
@@ -1303,13 +1353,13 @@ kernel void chunk_attend(
     device const float* qh = q + ((ulong)bi * nh + h) * hd;
     float scale = 1.0f / sqrt((float)hd);
     uint nt = (hd + 31u) / 32u;
-    float qv[4];
+    float qv[8];
     for (uint t = 0; t < nt; ++t) {
         uint d = t * 32u + lane;
         qv[t] = d < hd ? qh[d] * scale : 0.0f;
     }
     float m = -INFINITY, l = 0.0f;
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (uint p = 0; p < n; ++p) {
         device const float* kr = kh0 + (ulong)p * hd;
         float partial = 0.0f;
@@ -1587,7 +1637,7 @@ kernel void chunk_rope_kv(
         : (isv ? vraw : kraw) + (ulong)bi * nkv * hd + (ulong)kvh * hd;
     device const float* brow = isq ? bq : (isv ? bv : bk);
     uint nt = (hd + 31u) / 32u;
-    float xv[4];
+    float xv[8];
     float ss = 0.0f;
     for (uint t = 0; t < nt; ++t) {
         uint d = t * 32u + lane;
@@ -1926,24 +1976,29 @@ kernel void q1t_matvec(
         for (uint i = 0; i < 8u; ++i) {
             xg[i] = xs4[wbase4 + i];
         }
-        half xh[32];
+        // Keep activations and the reduction in f32. Real GDN checkpoints can
+        // transiently exceed f16's finite range; converting x to half here
+        // produced NaN logits and greedy decode repeatedly selected the last
+        // vocabulary id. The ternary LUT may stay half (its values are only
+        // -1/0/+1), but every multiply is promoted before accumulation.
+        float xh[32];
         for (uint i = 0; i < 8u; ++i) {
-            xh[4*i+0] = (half)xg[i].x;
-            xh[4*i+1] = (half)xg[i].y;
-            xh[4*i+2] = (half)xg[i].z;
-            xh[4*i+3] = (half)xg[i].w;
+            xh[4*i+0] = xg[i].x;
+            xh[4*i+1] = xg[i].y;
+            xh[4*i+2] = xg[i].z;
+            xh[4*i+3] = xg[i].w;
         }
 
         for (uint ri = 0u; ri < nr; ++ri) {
             ulong base = ((ulong)(r0 + ri) * gpr + (ulong)g) * 9u;
             device const uchar* p = q + base;
-            half scale = as_type<half>(*(device const ushort*)p);
+            half scale = as_type<half>(cmf_load_u16_le(p));
             
-            uint b2_5 = *(device const uint*)(p + 2u);
-            ushort b6_7 = *(device const ushort*)(p + 6u);
+            uint b2_5 = cmf_load_u32_le(p + 2u);
+            ushort b6_7 = cmf_load_u16_le(p + 6u);
             uchar b8 = p[8];
 
-            half gsum = 0.0h;
+            float gsum = 0.0f;
             constant half* pl;
 
             pl = &Q1T_SIGN[(b2_5 & 0xFF) * 5u];
@@ -1967,7 +2022,7 @@ kernel void q1t_matvec(
             pl = &Q1T_SIGN[b8 * 5u];
             gsum += pl[0] * xh[30] + pl[1] * xh[31];
 
-            float contrib = (float)(scale * gsum);
+            float contrib = (float)scale * gsum;
             if (ri == 0u) acc0 += contrib;
             else if (ri == 1u) acc1 += contrib;
             else if (ri == 2u) acc2 += contrib;
@@ -1998,14 +2053,13 @@ kernel void q1t_overlay(
     uint rid [[thread_position_in_grid]])
 {
     if (rid >= rows) return;
-    device const uint* rp_ptr = (device const uint*)(q + base_len + rid * 4u);
-    uint c0 = rp_ptr[0];
-    uint c1 = *(device const uint*)(q + base_len + (rid + 1u) * 4u);
+    uint c0 = cmf_load_u32_le(q + base_len + rid * 4u);
+    uint c1 = cmf_load_u32_le(q + base_len + (rid + 1u) * 4u);
     uint ent = base_len + (rows + 1u) * 4u;
     float corr = 0.0f;
     for (uint p = c0; p < c1; ++p) {
         uint e = ent + p * 4u;
-        uint col_val = *(device const uint*)(q + e);
+        uint col_val = cmf_load_u32_le(q + e);
         uint col = col_val & 0xFFFF;
         half val = as_type<half>((ushort)(col_val >> 16));
         corr += (float)val * x[col];
@@ -2080,12 +2134,77 @@ kernel void q4b_matvec(
         if (nr > 3u) y[r0 + 3u] = acc3;
     }
 }
+
+inline half q4_dot8_half(uint b, half4 x_lo, half4 x_hi) {
+    half4 w_lo = half4((half)(b & 0xFu) - 8.0h,
+                       (half)((b >> 8u) & 0xFu) - 8.0h,
+                       (half)((b >> 16u) & 0xFu) - 8.0h,
+                       (half)((b >> 24u) & 0xFu) - 8.0h);
+    half4 w_hi = half4((half)((b >> 4u) & 0xFu) - 8.0h,
+                       (half)((b >> 12u) & 0xFu) - 8.0h,
+                       (half)((b >> 20u) & 0xFu) - 8.0h,
+                       (half)(b >> 28u) - 8.0h);
+    return dot(w_lo, x_lo) + dot(w_hi, x_hi);
+}
+
+// Half-ALU q4 twin. The per-group result converts back to f32 before the
+// long reduction, keeping accumulation stable while using Apple's higher
+// throughput half vector pipes for nibble×activation work.
+kernel void q4b_matvec_h(
+    device const uchar* q    [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       y    [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    if (r0 >= rows) return;
+    uint nr = min(rows - r0, 4u);
+    uint scales_off = rows * gpr * 16u;
+    device const uchar* sc = q + scales_off;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint xb = g * 32u;
+        device const float4* xv = (device const float4*)(x + xb);
+        half4 x0 = half4(xv[0]), x1 = half4(xv[1]);
+        half4 x2 = half4(xv[2]), x3 = half4(xv[3]);
+        half4 x4 = half4(xv[4]), x5 = half4(xv[5]);
+        half4 x6 = half4(xv[6]), x7 = half4(xv[7]);
+        for (uint ri = 0u; ri < nr; ++ri) {
+            uint gi = (r0 + ri) * gpr + g;
+            half scale = as_type<half>(*(device const ushort*)(sc + gi * 2u));
+            uint4 pk4 = *(device const uint4*)(q + (ulong)gi * 16u);
+            half gsum = q4_dot8_half(pk4.x, x0, x1)
+                       + q4_dot8_half(pk4.y, x2, x3)
+                       + q4_dot8_half(pk4.z, x4, x5)
+                       + q4_dot8_half(pk4.w, x6, x7);
+            float contrib = (float)(scale * gsum);
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    if (lane == 0u) {
+        y[r0] = acc0;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
+    }
+}
 "#;
 
 struct Ctx {
     _device: Device,
     queue: CommandQueue,
     q8: ComputePipelineState,
+    q8f: ComputePipelineState,
     q8mm: ComputePipelineState,
     q8mmm: ComputePipelineState,
     q1: ComputePipelineState,
@@ -2095,6 +2214,7 @@ struct Ctx {
     q1t_mm: ComputePipelineState,
     q1t_ovmm: ComputePipelineState,
     q4b: ComputePipelineState,
+    q4bh: ComputePipelineState,
     flag: ComputePipelineState,
     rmsn: ComputePipelineState,
     f16mv: ComputePipelineState,
@@ -2129,10 +2249,14 @@ struct Ctx {
     mm_fc: Mutex<HashMap<(u32, u32, u8), ComputePipelineState>>,
     /// Device K/V cache mirrors keyed by (pipeline id, layer).
     kv_mirrors: Mutex<HashMap<(u64, usize), KvMirror>>,
-    /// no-copy buffer per file (key — the base address of the mapping).
-    file_bufs: Mutex<HashMap<usize, Buffer>>,
-    /// row_scale buffer per tensor (key — (base, idx)).
+    /// No-copy buffer per model. Retaining the Arc is essential: a Metal
+    /// buffer does not own its mmap bytes, and pointer-only cache keys can be
+    /// reused after a model is dropped (cross-model data corruption).
+    file_bufs: Mutex<HashMap<usize, (Buffer, Arc<CmfModel>)>>,
+    /// row_scale buffer per tensor (key — (stable model identity, idx)).
     rs_bufs: Mutex<HashMap<(usize, usize), Buffer>>,
+    /// q8_2f input-channel field buffer per tensor.
+    cf_bufs: Mutex<HashMap<(usize, usize), Buffer>>,
     /// Reusable xs/y buffers by size (no per-token allocations).
     io_bufs: Mutex<HashMap<usize, Buffer>>,
     /// Shared completion-flag word + monotone ticket (fast wait).
@@ -2145,26 +2269,36 @@ struct Ctx {
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
 
-static CTX: OnceLock<Option<Ctx>> = OnceLock::new();
+static CTX: OnceLock<Result<Ctx, String>> = OnceLock::new();
 
 fn ctx() -> Option<&'static Ctx> {
-    CTX.get_or_init(|| {
-        if std::env::var("CMF_GPU").map(|v| v != "0").unwrap_or_else(|_| crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)) {
-            match init() {
-                Ok(c) => {
-                    tracing::info!("Metal GPU path: on ({})", c._device.name());
-                    Some(c)
-                }
-                Err(e) => {
-                    tracing::warn!("Metal init failed — CPU fallback: {e}");
-                    None
-                }
-            }
-        } else {
+    let requested = std::env::var("CMF_GPU")
+        .map(|v| v != "0")
+        .unwrap_or_else(|_| {
+            crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)
+        });
+    if !requested {
+        // Do not permanently cache the disabled state: callers may enable the
+        // backend after process start (the CLI and tests both do this).
+        return None;
+    }
+    match CTX.get_or_init(init) {
+        Ok(c) => {
+            tracing::info!("Metal GPU path: on ({})", c._device.name());
+            Some(c)
+        }
+        Err(e) => {
+            tracing::warn!("Metal init failed — CPU fallback: {e}");
             None
         }
-    })
-    .as_ref()
+    }
+}
+
+/// Returns the cached Metal initialization error, if initialization was tried.
+/// Primarily useful for diagnostics and hardware-specific integration tests.
+pub fn initialization_error() -> Option<&'static str> {
+    CTX.get()
+        .and_then(|result| result.as_ref().err().map(String::as_str))
 }
 
 fn init() -> Result<Ctx, String> {
@@ -2195,6 +2329,7 @@ fn init() -> Result<Ctx, String> {
             .map_err(|e| format!("pipeline {name}: {e}"))
     };
     let q8 = pso("q8_matvec")?;
+    let q8f = pso("q8f_matvec")?;
     let q8mm = pso("q8_matmat")?;
     // Functions referencing function constants must be fetched through
     // the constantValues API even for the generic (all-optional-unset)
@@ -2216,6 +2351,7 @@ fn init() -> Result<Ctx, String> {
     let q1t_mm = pso("q1t_mul_mm")?;
     let q1t_ovmm = pso("q1t_overlay_mm")?;
     let q4b = pso("q4b_matvec")?;
+    let q4bh = pso("q4b_matvec_h")?;
     let flag = pso("write_flag")?;
     let rmsn = pso("rmsnorm_k")?;
     let f16mv = pso("f32_matvec")?;
@@ -2249,6 +2385,7 @@ fn init() -> Result<Ctx, String> {
         _device: device,
         queue,
         q8,
+        q8f,
         q8mm,
         q8mmm,
         q1,
@@ -2258,6 +2395,7 @@ fn init() -> Result<Ctx, String> {
         q1t_mm,
         q1t_ovmm,
         q4b,
+        q4bh,
         flag,
         rmsn,
         f16mv,
@@ -2289,6 +2427,7 @@ fn init() -> Result<Ctx, String> {
         kv_mirrors: Mutex::new(HashMap::new()),
         file_bufs: Mutex::new(HashMap::new()),
         rs_bufs: Mutex::new(HashMap::new()),
+        cf_bufs: Mutex::new(HashMap::new()),
         io_bufs: Mutex::new(HashMap::new()),
         flag_buf,
         ticket: std::sync::atomic::AtomicU32::new(0),
@@ -2340,12 +2479,16 @@ pub fn pipelined_submit_bench(n: usize) -> f64 {
 /// now (no dispatch, `may_upload` permitting) and report cold.
 pub fn q8_resident_or_upload(model: &Arc<CmfModel>, _idx: usize, may_upload: bool) -> bool {
     let Some(c) = ctx() else { return false };
-    let bytes = model.primary_bytes();
-    if c.file_bufs.lock().unwrap().contains_key(&(bytes.as_ptr() as usize)) {
+    let key = model_key(model);
+    if c.file_bufs
+        .lock()
+        .unwrap()
+        .contains_key(&key)
+    {
         return true;
     }
     if may_upload {
-        let _ = file_buffer(c, bytes);
+        let _ = file_buffer(c, model);
     }
     false
 }
@@ -2399,16 +2542,25 @@ unsafe extern "C" {
     fn getpagesize() -> i32;
 }
 
-/// no-copy buffer over the file mapping (cached per file).
-fn file_buffer(c: &Ctx, bytes: &[u8]) -> Option<(Buffer, usize)> {
+#[inline]
+fn model_key(model: &Arc<CmfModel>) -> usize {
+    Arc::as_ptr(model) as usize
+}
+
+/// No-copy buffer over the file mapping. The cache retains the model Arc so
+/// the mmap cannot disappear underneath Metal and its identity cannot be
+/// recycled for another model in the same process.
+fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Buffer, usize)> {
+    let bytes = model.primary_bytes();
     let base = bytes.as_ptr() as usize;
+    let key = model_key(model);
     let page = page_size();
     if base % page != 0 {
         return None; // mmap is always aligned, but we check honestly
     }
     let len = bytes.len() / page * page; // down to the page
     let mut cache = c.file_bufs.lock().unwrap();
-    if let Some(b) = cache.get(&base) {
+    if let Some((b, _owner)) = cache.get(&key) {
         return Some((b.clone(), len));
     }
     crate::gpu::probe_note_cold();
@@ -2418,7 +2570,7 @@ fn file_buffer(c: &Ctx, bytes: &[u8]) -> Option<(Buffer, usize)> {
         MTLResourceOptions::StorageModeShared,
         None,
     );
-    cache.insert(base, buf.clone());
+    cache.insert(key, (buf.clone(), Arc::clone(model)));
     Some((buf, len))
 }
 
@@ -2450,6 +2602,50 @@ pub fn q8_matvec_range(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
+    q8_matvec_range_field(model, idx, row0, row_scale, None, xs, rows, cols, out)
+}
+
+/// Direct q8_2f projection for parity/microbench use. The whole-token graph
+/// uses the same kernel and cached field buffers.
+#[allow(clippy::too_many_arguments)]
+pub fn q8_2f_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    row_scale: &[f32],
+    col_field: &[f32],
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    if col_field.len() != cols {
+        return false;
+    }
+    q8_matvec_range_field(
+        model,
+        idx,
+        0,
+        row_scale,
+        Some(col_field),
+        xs,
+        rows,
+        cols,
+        out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q8_matvec_range_field(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    row0: usize,
+    row_scale: &[f32],
+    col_field: Option<&[f32]>,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
     let Some(c) = ctx() else { return false };
     if cols % 4 != 0 {
         return false;
@@ -2460,14 +2656,16 @@ pub fn q8_matvec_range(
     };
     abs += row0 * cols; // offset into the sub-range (the GPU does not need 64-alignment)
     let bytes = model.primary_bytes();
-    let Some((fbuf, safe_len)) = file_buffer(c, bytes) else { return false };
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
     let qlen = rows * cols; // the int8 part of the blob (quants before scales)
     if abs + qlen > safe_len {
         return false; // the tail is past the buffer's page boundary
     }
 
     // row_scale — cached; xs/y — per call (small).
-    let base = bytes.as_ptr() as usize;
+    let base = model_key(model);
     let rs_buf = {
         let mut cache = c.rs_bufs.lock().unwrap();
         cache
@@ -2495,41 +2693,37 @@ pub fn q8_matvec_range(
     };
     let xs_buf = get_io(xs.len() * 4);
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            xs.as_ptr(),
-            xs_buf.contents() as *mut f32,
-            xs.len(),
-        );
+        std::ptr::copy_nonoverlapping(xs.as_ptr(), xs_buf.contents() as *mut f32, xs.len());
     }
     let y_buf = get_io(rows * 4 + 4); // +4: does not share a key with xs of the same length
 
     let cmd = c.queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&c.q8);
+    enc.set_compute_pipeline_state(if col_field.is_some() { &c.q8f } else { &c.q8 });
     enc.set_buffer(0, Some(&fbuf), abs as u64);
     enc.set_buffer(1, Some(&xs_buf), 0);
     enc.set_buffer(2, Some(&rs_buf), 0);
     enc.set_buffer(3, Some(&y_buf), 0);
     let cols4 = (cols / 4) as u32;
     let rows_u = rows as u32;
-    enc.set_bytes(4, 4, &cols4 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(5, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    let base = if let Some(field) = col_field {
+        let field_buf = const_buf(c, field);
+        enc.set_buffer(4, Some(&field_buf), 0);
+        5
+    } else {
+        4
+    };
+    enc.set_bytes(base, 4, &cols4 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(base + 1, 4, &rows_u as *const u32 as *const std::ffi::c_void);
     // 256 threads = 8 SIMD groups per threadgroup → 8 rows per group.
     let sgs = 8u64;
     let n_tg = (rows as u64).div_ceil(sgs);
-    enc.dispatch_thread_groups(
-        MTLSize::new(n_tg, 1, 1),
-        MTLSize::new(sgs * 32, 1, 1),
-    );
+    enc.dispatch_thread_groups(MTLSize::new(n_tg, 1, 1), MTLSize::new(sgs * 32, 1, 1));
     enc.end_encoding();
     submit_and_wait(c, cmd, &[&y_buf]);
 
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            y_buf.contents() as *const f32,
-            out.as_mut_ptr(),
-            rows,
-        );
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), rows);
     }
     true
 }
@@ -2558,7 +2752,9 @@ pub fn q1_matvec(
         return false;
     };
     let bytes = model.primary_bytes();
-    let Some((fbuf, safe_len)) = file_buffer(c, bytes) else { return false };
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
     if abs + rows * gpr * Q1_TILE > safe_len {
         return false;
     }
@@ -2606,8 +2802,11 @@ fn q1_half() -> bool {
         2 => true,
         _ => {
             static HALF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *HALF
-                .get_or_init(|| std::env::var("CMF_Q1_HALF").map(|v| v != "0").unwrap_or(true))
+            *HALF.get_or_init(|| {
+                std::env::var("CMF_Q1_HALF")
+                    .map(|v| v != "0")
+                    .unwrap_or(true)
+            })
         }
     }
 }
@@ -2670,7 +2869,10 @@ enum ProjKind {
     Q1,
     Q1t,
     Q4b,
-    Q8(Buffer),
+    Q8 {
+        row_scale: Buffer,
+        col_field: Option<Buffer>,
+    },
 }
 
 /// Encode q4_block matvec (precise 4-bit, no overlay). Split layout: packed
@@ -2685,7 +2887,13 @@ fn encode_q4b_matvec(
     rows: usize,
     gpr: usize,
 ) {
-    enc.set_compute_pipeline_state(&c.q4b);
+    static HALF: OnceLock<bool> = OnceLock::new();
+    let half = *HALF.get_or_init(|| {
+        std::env::var("CMF_Q4_HALF")
+            .map(|v| v != "0" && v != "off")
+            .unwrap_or(false)
+    });
+    enc.set_compute_pipeline_state(if half { &c.q4bh } else { &c.q4b });
     enc.set_buffer(0, Some(fbuf), abs as u64);
     enc.set_buffer(1, Some(xs), 0);
     enc.set_buffer(2, Some(y), 0);
@@ -2726,8 +2934,22 @@ fn encode_proj(
         ProjKind::Q1 => {
             encode_q1_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
         }
-        ProjKind::Q8(rs_buf) => {
-            encode_q8_matvec(c, enc, fbuf, abs, rs_buf, in_buf, out_buf, rows, gpr);
+        ProjKind::Q8 {
+            row_scale,
+            col_field,
+        } => {
+            encode_q8_matvec(
+                c,
+                enc,
+                fbuf,
+                abs,
+                row_scale,
+                col_field.as_ref(),
+                in_buf,
+                out_buf,
+                rows,
+                gpr,
+            );
         }
     }
 }
@@ -2739,26 +2961,30 @@ fn encode_q8_matvec(
     fbuf: &Buffer,
     abs: usize,
     rs_buf: &Buffer,
+    col_buf: Option<&Buffer>,
     in_buf: &Buffer,
     out_buf: &Buffer,
     rows: usize,
     gpr: usize,
 ) {
-    enc.set_compute_pipeline_state(&c.q8);
+    enc.set_compute_pipeline_state(if col_buf.is_some() { &c.q8f } else { &c.q8 });
     enc.set_buffer(0, Some(fbuf), abs as u64);
     enc.set_buffer(1, Some(in_buf), 0);
     enc.set_buffer(2, Some(rs_buf), 0);
     enc.set_buffer(3, Some(out_buf), 0);
     let cols4 = (gpr * (GROUP_SIZE / 4)) as u32;
     let rows_u = rows as u32;
-    enc.set_bytes(4, 4, &cols4 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(5, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    let base = if let Some(col) = col_buf {
+        enc.set_buffer(4, Some(col), 0);
+        5
+    } else {
+        4
+    };
+    enc.set_bytes(base, 4, &cols4 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(base + 1, 4, &rows_u as *const u32 as *const std::ffi::c_void);
     let sgs = 8u64;
     let n_tg = (rows as u64).div_ceil(sgs);
-    enc.dispatch_thread_groups(
-        MTLSize::new(n_tg, 1, 1),
-        MTLSize::new(sgs * 32, 1, 1),
-    );
+    enc.dispatch_thread_groups(MTLSize::new(n_tg, 1, 1), MTLSize::new(sgs * 32, 1, 1));
 }
 
 /// Encode the q1t sparse-overlay add onto `y` (base already there). Reads the
@@ -2800,6 +3026,32 @@ pub fn q1t_matvec(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
+    q1t_matvec_impl(model, idx, xs, rows, cols, out, false)
+}
+
+/// Diagnostic entry point matching the whole-token graph's Q1T projection:
+/// base matvec and sparse overlay are encoded in the same command buffer.
+#[doc(hidden)]
+pub fn q1t_matvec_full_for_test(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    q1t_matvec_impl(model, idx, xs, rows, cols, out, true)
+}
+
+fn q1t_matvec_impl(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    full: bool,
+) -> bool {
     let Some(c) = ctx() else { return false };
     if cols % GROUP_SIZE != 0 {
         return false;
@@ -2810,8 +3062,15 @@ pub fn q1t_matvec(
         return false;
     };
     let bytes = model.primary_bytes();
-    let Some((fbuf, safe_len)) = file_buffer(c, bytes) else { return false };
-    if abs + rows * gpr * Q1T_TILE > safe_len {
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let need = if full {
+        entry.nbytes as usize
+    } else {
+        rows * gpr * Q1T_TILE
+    };
+    if abs + need > safe_len {
         return false;
     }
     let get_io = |key: usize, nbytes: usize| -> Buffer {
@@ -2832,19 +3091,10 @@ pub fn q1t_matvec(
     let y_buf = get_io(14_000_000_573 + rows, rows * 4);
     let cmd = c.queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&c.q1t);
-    enc.set_buffer(0, Some(&fbuf), abs as u64);
-    enc.set_buffer(1, Some(&xs_buf), 0);
-    enc.set_buffer(2, Some(&y_buf), 0);
-    let gpr_u = gpr as u32;
-    let rows_u = rows as u32;
-    enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
-    let sgs = 8u64; // × 4 rows per simdgroup
-    enc.dispatch_thread_groups(
-        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
-        MTLSize::new(sgs * 32, 1, 1),
-    );
+    encode_q1t_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
+    if full {
+        encode_q1t_overlay(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
+    }
     enc.end_encoding();
     submit_and_wait(c, cmd, &[&y_buf]);
     unsafe {
@@ -2868,10 +3118,10 @@ fn f32_to_f16_into(src: &[f32], dst: *mut u16) {
         while i + 4 <= n {
             let v = vld1q_f32(sp.add(i));
             let h = vcvt_f16_f32(v);
-            core::ptr::write_unaligned(dst.add(i) as *mut u64, core::mem::transmute::<
-                float16x4_t,
-                u64,
-            >(h));
+            core::ptr::write_unaligned(
+                dst.add(i) as *mut u64,
+                core::mem::transmute::<float16x4_t, u64>(h),
+            );
             i += 4;
         }
         while i < n {
@@ -3064,7 +3314,9 @@ struct ChunkProf {
 impl ChunkProf {
     fn new() -> Self {
         Self {
-            on: std::env::var("CMF_CHUNK_PROF").map(|v| v == "1").unwrap_or(false),
+            on: std::env::var("CMF_CHUNK_PROF")
+                .map(|v| v == "1")
+                .unwrap_or(false),
             log: Vec::new(),
         }
     }
@@ -3098,7 +3350,10 @@ impl ChunkProf {
         let total: f64 = rows.iter().map(|r| r.1.0).sum();
         eprintln!("chunk prof (GPU ms per stage, one chunk):");
         for (label, (ms, n)) in rows {
-            eprintln!("  {label:<12} {ms:8.2} ms  ({n:3}×)  {:4.1}%", ms / total * 100.0);
+            eprintln!(
+                "  {label:<12} {ms:8.2} ms  ({n:3}×)  {:4.1}%",
+                ms / total * 100.0
+            );
         }
         eprintln!("  total GPU    {total:8.2} ms");
     }
@@ -3125,14 +3380,16 @@ pub fn chunk_run_gpu(
     embed: Option<&ChunkEmbed>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
-    let Some(first) = layers.first() else { return false };
+    let Some(first) = layers.first() else {
+        return false;
+    };
     if layers.len() != io.len() {
         return false;
     }
     let (nh, nkv, hd, hs, inter) = (first.nh, first.nkv, first.hd, first.hs, first.inter);
     if b < 32
         || hd % 4 != 0
-        || hd > 128
+        || hd > 256
         || first.rd < 2
         || first.rd > hd
         || (first.rd / 2) % 32 != 0
@@ -3143,9 +3400,10 @@ pub fn chunk_run_gpu(
     {
         return false;
     }
-    let bytes = first.model.primary_bytes();
-    let Some((fbuf, safe_len)) = file_buffer(c, bytes) else { return false };
-    let base = bytes.as_ptr() as usize;
+    let Some((fbuf, safe_len)) = file_buffer(c, first.model) else {
+        return false;
+    };
+    let base = model_key(first.model);
 
     // ── Phase 1: validate every layer and build its prep (weights
     // resident, shapes uniform, mirror ready).
@@ -3212,19 +3470,28 @@ pub fn chunk_run_gpu(
             let mut reg = c.kv_mirrors.lock().unwrap();
             let need = lio.cpu_stored + b;
             let entry = reg.entry((l.kv_id, l.layer)).or_insert_with(|| KvMirror {
-                k: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
-                v: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
-                imp: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
+                k: c._device
+                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                v: c._device
+                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                imp: c
+                    ._device
+                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
                 cap: 0,
                 stored: usize::MAX,
             });
             if entry.cap < need {
                 let cap = need.next_power_of_two().max(1024);
                 let nb = (nkv * cap * hd * 4) as u64;
-                entry.k = c._device.new_buffer(nb, MTLResourceOptions::StorageModeShared);
-                entry.v = c._device.new_buffer(nb, MTLResourceOptions::StorageModeShared);
-                entry.imp =
-                    c._device.new_buffer((cap * 4) as u64, MTLResourceOptions::StorageModeShared);
+                entry.k = c
+                    ._device
+                    .new_buffer(nb, MTLResourceOptions::StorageModeShared);
+                entry.v = c
+                    ._device
+                    .new_buffer(nb, MTLResourceOptions::StorageModeShared);
+                entry.imp = c
+                    ._device
+                    .new_buffer((cap * 4) as u64, MTLResourceOptions::StorageModeShared);
                 entry.cap = cap;
                 entry.stored = usize::MAX;
             }
@@ -3240,9 +3507,17 @@ pub fn chunk_run_gpu(
                     }
                     unsafe {
                         let kd = (entry.k.contents() as *mut f32).add(hh * entry.cap * hd);
-                        std::ptr::copy_nonoverlapping(lio.cpu_k[hh].as_ptr(), kd, lio.cpu_k[hh].len());
+                        std::ptr::copy_nonoverlapping(
+                            lio.cpu_k[hh].as_ptr(),
+                            kd,
+                            lio.cpu_k[hh].len(),
+                        );
                         let vd = (entry.v.contents() as *mut f32).add(hh * entry.cap * hd);
-                        std::ptr::copy_nonoverlapping(lio.cpu_v[hh].as_ptr(), vd, lio.cpu_v[hh].len());
+                        std::ptr::copy_nonoverlapping(
+                            lio.cpu_v[hh].as_ptr(),
+                            vd,
+                            lio.cpu_v[hh].len(),
+                        );
                     }
                 }
                 entry.stored = lio.cpu_stored;
@@ -3250,11 +3525,25 @@ pub fn chunk_run_gpu(
             unsafe {
                 std::ptr::write_bytes(entry.imp.contents() as *mut u8, 0, need * 4);
             }
-            let out = (entry.k.clone(), entry.v.clone(), entry.imp.clone(), entry.cap, entry.stored);
+            let out = (
+                entry.k.clone(),
+                entry.v.clone(),
+                entry.imp.clone(),
+                entry.cap,
+                entry.stored,
+            );
             entry.stored += b;
             out
         };
-        preps.push(ChunkPrep { abs, rs, k_mb, v_mb, imp_mb, cap, st0 });
+        preps.push(ChunkPrep {
+            abs,
+            rs,
+            k_mb,
+            v_mb,
+            imp_mb,
+            cap,
+            st0,
+        });
     }
 
     // ── Shared per-run buffers (pooled by size, reused across layers —
@@ -3344,28 +3633,32 @@ pub fn chunk_run_gpu(
             Some((bq, bk, bv)) => (const_buf(c, bq), const_buf(c, bk), const_buf(c, bv), true),
             None => (invf.clone(), invf.clone(), invf.clone(), false),
         };
-        let qn_b = l.q_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| invf.clone());
-        let kn_b = l.k_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| invf.clone());
-        let add_norm = |cmd: &metal::CommandBufferRef,
-                        delta: Option<&Buffer>,
-                        w: &Buffer,
-                        dst: &Buffer| {
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&c.addnorm);
-            enc.set_buffer(0, Some(&h_b), 0);
-            enc.set_buffer(1, Some(delta.unwrap_or(&h_b)), 0);
-            enc.set_buffer(2, Some(w), 0);
-            enc.set_buffer(3, Some(dst), 0);
-            let n_u = hs as u32;
-            let g_u = l.gemma as u32;
-            let hd_u = delta.is_some() as u32;
-            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(5, 4, &g_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(6, 4, &l.eps as *const f32 as *const std::ffi::c_void);
-            enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_thread_groups(MTLSize::new(b as u64, 1, 1), MTLSize::new(256, 1, 1));
-            enc.end_encoding();
-        };
+        let qn_b = l
+            .q_norm
+            .map(|w| const_buf(c, w))
+            .unwrap_or_else(|| invf.clone());
+        let kn_b = l
+            .k_norm
+            .map(|w| const_buf(c, w))
+            .unwrap_or_else(|| invf.clone());
+        let add_norm =
+            |cmd: &metal::CommandBufferRef, delta: Option<&Buffer>, w: &Buffer, dst: &Buffer| {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&c.addnorm);
+                enc.set_buffer(0, Some(&h_b), 0);
+                enc.set_buffer(1, Some(delta.unwrap_or(&h_b)), 0);
+                enc.set_buffer(2, Some(w), 0);
+                enc.set_buffer(3, Some(dst), 0);
+                let n_u = hs as u32;
+                let g_u = l.gemma as u32;
+                let hd_u = delta.is_some() as u32;
+                enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(5, 4, &g_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &l.eps as *const f32 as *const std::ffi::c_void);
+                enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(MTLSize::new(b as u64, 1, 1), MTLSize::new(256, 1, 1));
+                enc.end_encoding();
+            };
 
         // First stage folds the PREVIOUS layer's down-projection delta
         // into the residual stream together with this layer's input
@@ -3376,9 +3669,42 @@ pub fn chunk_run_gpu(
         {
             // Independent outputs — one encoder, three dispatches.
             let enc = cmd.new_compute_command_encoder();
-            enc_mul_mm(c, enc, &fbuf, prep.abs[0], &prep.rs[0], &n_b, &qraw, b, l.wq.1, l.wq.2);
-            enc_mul_mm(c, enc, &fbuf, prep.abs[1], &prep.rs[1], &n_b, &kraw, b, l.wk.1, l.wk.2);
-            enc_mul_mm(c, enc, &fbuf, prep.abs[2], &prep.rs[2], &n_b, &vraw, b, l.wv.1, l.wv.2);
+            enc_mul_mm(
+                c,
+                enc,
+                &fbuf,
+                prep.abs[0],
+                &prep.rs[0],
+                &n_b,
+                &qraw,
+                b,
+                l.wq.1,
+                l.wq.2,
+            );
+            enc_mul_mm(
+                c,
+                enc,
+                &fbuf,
+                prep.abs[1],
+                &prep.rs[1],
+                &n_b,
+                &kraw,
+                b,
+                l.wk.1,
+                l.wk.2,
+            );
+            enc_mul_mm(
+                c,
+                enc,
+                &fbuf,
+                prep.abs[2],
+                &prep.rs[2],
+                &n_b,
+                &vraw,
+                b,
+                l.wv.1,
+                l.wv.2,
+            );
             enc.end_encoding();
         }
         cmd = prof.cut(c, cmd, "mm_qkv");
@@ -3433,8 +3759,11 @@ pub fn chunk_run_gpu(
             let ncur = prep.st0 + b;
             let m_rows = hpk * b;
             let g_stride = (m_rows * ncur * 4) as u64;
-            let scores =
-                io_buf(c, 72_000_000_089 + nkv * m_rows * ncur, nkv * m_rows * ncur * 4);
+            let scores = io_buf(
+                c,
+                72_000_000_089 + nkv * m_rows * ncur,
+                nkv * m_rows * ncur * 4,
+            );
             let scale = 1.0f32 / (hd as f32).sqrt();
             {
                 let enc = cmd.new_compute_command_encoder();
@@ -3489,10 +3818,7 @@ pub fn chunk_run_gpu(
                     for (i, w) in words.iter().enumerate() {
                         enc.set_bytes(2 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
                     }
-                    enc.dispatch_threads(
-                        MTLSize::new(ncur as u64, 32, 1),
-                        MTLSize::new(64, 4, 1),
-                    );
+                    enc.dispatch_threads(MTLSize::new(ncur as u64, 32, 1), MTLSize::new(64, 4, 1));
                     let pso = mm_pipeline(c, hd, 0, 3);
                     enc.set_compute_pipeline_state(&pso);
                     let koff = (g * prep.cap * hd * 4) as u64;
@@ -3528,14 +3854,47 @@ pub fn chunk_run_gpu(
             enc.end_encoding();
         }
         cmd = prof.cut(c, cmd, "attend");
-        encode_mul_mm(c, &cmd, &fbuf, prep.abs[3], &prep.rs[3], &attn, &ob, b, l.wo.1, l.wo.2);
+        encode_mul_mm(
+            c,
+            &cmd,
+            &fbuf,
+            prep.abs[3],
+            &prep.rs[3],
+            &attn,
+            &ob,
+            b,
+            l.wo.1,
+            l.wo.2,
+        );
         cmd = prof.cut(c, cmd, "mm_o");
         add_norm(&cmd, Some(&ob), &pnorm, &n_b);
         cmd = prof.cut(c, cmd, "axpy+norm");
         {
             let enc = cmd.new_compute_command_encoder();
-            enc_mul_mm(c, enc, &fbuf, prep.abs[4], &prep.rs[4], &n_b, &gb, b, l.gate.1, l.gate.2);
-            enc_mul_mm(c, enc, &fbuf, prep.abs[5], &prep.rs[5], &n_b, &ub, b, l.up.1, l.up.2);
+            enc_mul_mm(
+                c,
+                enc,
+                &fbuf,
+                prep.abs[4],
+                &prep.rs[4],
+                &n_b,
+                &gb,
+                b,
+                l.gate.1,
+                l.gate.2,
+            );
+            enc_mul_mm(
+                c,
+                enc,
+                &fbuf,
+                prep.abs[5],
+                &prep.rs[5],
+                &n_b,
+                &ub,
+                b,
+                l.up.1,
+                l.up.2,
+            );
             enc.end_encoding();
         }
         cmd = prof.cut(c, cmd, "mm_gateup");
@@ -3635,13 +3994,17 @@ pub fn q8_matmat(
         return false;
     }
     let entry = &model.tensors[idx];
-    let Some(abs) = model.entry_abs_offset(entry) else { return false };
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
     let bytes = model.primary_bytes();
-    let Some((fbuf, safe_len)) = file_buffer(c, bytes) else { return false };
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
     if abs + rows * cols > safe_len {
         return false;
     }
-    let base = bytes.as_ptr() as usize;
+    let base = model_key(model);
     let rs_buf = {
         let mut cache = c.rs_bufs.lock().unwrap();
         cache
@@ -3685,7 +4048,11 @@ pub fn q8_matmat(
     enc.set_buffer(3, Some(&y_buf), 0);
     let rows_u = rows as u32;
     let b_u = b as u32;
-    let k_arg = if use_mm { cols as u32 } else { (cols / 4) as u32 };
+    let k_arg = if use_mm {
+        cols as u32
+    } else {
+        (cols / 4) as u32
+    };
     enc.set_bytes(4, 4, &k_arg as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(5, 4, &rows_u as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(6, 4, &b_u as *const u32 as *const std::ffi::c_void);
@@ -3705,8 +4072,7 @@ pub fn q8_matmat(
     submit_and_wait(c, cmd, &[&y_buf]);
 
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
     }
     tracing::debug!("gpu matmat: {rows}x{cols} b={b}");
     true
@@ -3730,9 +4096,13 @@ pub fn q1t_matmat(
         return false;
     }
     let entry = &model.tensors[idx];
-    let Some(abs) = model.entry_abs_offset(entry) else { return false };
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
     let bytes = model.primary_bytes();
-    let Some((fbuf, safe_len)) = file_buffer(c, bytes) else { return false };
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
     if abs + entry.nbytes as usize > safe_len {
         return false;
     }
@@ -3807,18 +4177,20 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         return false;
     }
     let bytes = model.primary_bytes();
-    let Some((fbuf, safe_len)) = file_buffer(c, bytes) else { return false };
-    let base = bytes.as_ptr() as usize;
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let base = model_key(model);
 
     // Validate all tensors before encoding (fail → CPU without partial work).
     let mut abs3 = Vec::with_capacity(jobs.len());
     for j in jobs {
         let mut trio = [0usize; 3];
-        for (slot, (idx, rows, cols, _)) in
-            [(0, &j.gate), (1, &j.up), (2, &j.down)]
-        {
+        for (slot, (idx, rows, cols, _)) in [(0, &j.gate), (1, &j.up), (2, &j.down)] {
             let entry = &model.tensors[*idx];
-            let Some(abs) = model.entry_abs_offset(entry) else { return false };
+            let Some(abs) = model.entry_abs_offset(entry) else {
+                return false;
+            };
             let qlen = if j.q1 {
                 if cols % GROUP_SIZE != 0 || (cols / GROUP_SIZE) % 2 != 0 {
                     return false;
@@ -3883,12 +4255,11 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
     // GPUs is far cheaper than memory_barrier_with_resources inside one
     // encoder (measured: the barrier variant cost ~2 ms extra per FFN
     // chain — more than all three matvecs together).
-    let disp_elem = |enc: &metal::ComputeCommandEncoderRef,
-                     pso: &ComputePipelineState,
-                     n: usize| {
-        enc.set_compute_pipeline_state(pso);
-        enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
-    };
+    let disp_elem =
+        |enc: &metal::ComputeCommandEncoderRef, pso: &ComputePipelineState, n: usize| {
+            enc.set_compute_pipeline_state(pso);
+            enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
+        };
 
     // y = 0
     let hid_u = hidden as u32;
@@ -3901,8 +4272,12 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
     }
 
     let matvec = |enc: &metal::ComputeCommandEncoderRef,
-                  abs: usize, rows: usize, cols: usize, rs: Option<&Buffer>,
-                  xs: &Buffer, y: &Buffer| {
+                  abs: usize,
+                  rows: usize,
+                  cols: usize,
+                  rs: Option<&Buffer>,
+                  xs: &Buffer,
+                  y: &Buffer| {
         match rs {
             None => encode_q1_matvec(c, enc, &fbuf, abs, xs, y, rows, cols / GROUP_SIZE),
             Some(rs) => {
@@ -3949,9 +4324,15 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         let xsu = get_io(7_000_000_103 + j.xs_up.len(), j.xs_up.len() * 4);
         unsafe {
             std::ptr::copy_nonoverlapping(
-                j.xs_gate.as_ptr(), xsg.contents() as *mut f32, j.xs_gate.len());
+                j.xs_gate.as_ptr(),
+                xsg.contents() as *mut f32,
+                j.xs_gate.len(),
+            );
             std::ptr::copy_nonoverlapping(
-                j.xs_up.as_ptr(), xsu.contents() as *mut f32, j.xs_up.len());
+                j.xs_up.as_ptr(),
+                xsu.contents() as *mut f32,
+                j.xs_up.len(),
+            );
         }
 
         {
@@ -3976,7 +4357,15 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         }
         {
             let enc = cmd.new_compute_command_encoder();
-            matvec(enc, trio[2], *drows, *dcols, rs3[2].as_ref(), &a_buf, &d_buf);
+            matvec(
+                enc,
+                trio[2],
+                *drows,
+                *dcols,
+                rs3[2].as_ref(),
+                &a_buf,
+                &d_buf,
+            );
             enc.end_encoding();
         }
         {
@@ -3993,31 +4382,30 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
     submit_and_wait(c, cmd, &[&y_buf]);
 
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            y_buf.contents() as *const f32, out.as_mut_ptr(), hidden);
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), hidden);
     }
     true
 }
 
 /// Several independent q8-matvec in a single command buffer (one sync).
 /// outs[i].len() == jobs[i].rows.
-pub fn matvec_batch(
-    model: &Arc<CmfModel>,
-    jobs: &[BatchJob],
-    outs: &mut [&mut [f32]],
-) -> bool {
+pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], outs: &mut [&mut [f32]]) -> bool {
     let Some(c) = ctx() else { return false };
     if jobs.is_empty() || jobs.len() != outs.len() {
         return false;
     }
     let bytes = model.primary_bytes();
-    let Some((fbuf, safe_len)) = file_buffer(c, bytes) else { return false };
-    let base = bytes.as_ptr() as usize;
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let base = model_key(model);
 
     let mut abss = Vec::with_capacity(jobs.len());
     for j in jobs {
         let entry = &model.tensors[j.idx];
-        let Some(abs) = model.entry_abs_offset(entry) else { return false };
+        let Some(abs) = model.entry_abs_offset(entry) else {
+            return false;
+        };
         let qlen = if j.q1 {
             if j.cols % GROUP_SIZE != 0 || (j.cols / GROUP_SIZE) % 2 != 0 {
                 return false;
@@ -4067,17 +4455,22 @@ pub fn matvec_batch(
     let cmd = c.queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
     for (slot, (j, abs)) in jobs.iter().zip(&abss).enumerate() {
-        let xs_b = get_io(
-            8_000_000_209 + slot * 131 + j.xs.len(),
-            j.xs.len() * 4,
-        );
+        let xs_b = get_io(8_000_000_209 + slot * 131 + j.xs.len(), j.xs.len() * 4);
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                j.xs.as_ptr(), xs_b.contents() as *mut f32, j.xs.len());
+            std::ptr::copy_nonoverlapping(j.xs.as_ptr(), xs_b.contents() as *mut f32, j.xs.len());
         }
         let y_b = get_io(9_000_000_341 + slot * 137 + j.rows, j.rows * 4);
         if j.q1 {
-            encode_q1_matvec(c, enc, &fbuf, *abs, &xs_b, &y_b, j.rows, j.cols / GROUP_SIZE);
+            encode_q1_matvec(
+                c,
+                enc,
+                &fbuf,
+                *abs,
+                &xs_b,
+                &y_b,
+                j.rows,
+                j.cols / GROUP_SIZE,
+            );
         } else {
             let rs_b = rs_of(j.idx, j.row_scale);
             enc.set_compute_pipeline_state(&c.q8);
@@ -4108,13 +4501,11 @@ pub fn matvec_batch(
 
     for ((y_b, j), out) in y_bufs.iter().zip(jobs).zip(outs.iter_mut()) {
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                y_b.contents() as *const f32, out.as_mut_ptr(), j.rows);
+            std::ptr::copy_nonoverlapping(y_b.contents() as *const f32, out.as_mut_ptr(), j.rows);
         }
     }
     true
 }
-
 
 /// One GDN layer's worth of tensors/vectors for the whole-block GPU
 /// path. Matvec tensors are (directory idx, rows, cols) of q1 weights.
@@ -4181,7 +4572,8 @@ fn io_buf(c: &Ctx, key: usize, nbytes: usize) -> Buffer {
         .entry(key)
         .or_insert_with(|| {
             crate::gpu::probe_note_cold();
-            c._device.new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            c._device
+                .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
         })
         .clone()
 }
@@ -4217,7 +4609,11 @@ fn enc_simple(
     }
     let base = bufs.len() as u64;
     for (i, w) in words.iter().enumerate() {
-        enc.set_bytes(base + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(
+            base + i as u64,
+            4,
+            w as *const u32 as *const std::ffi::c_void,
+        );
     }
     for (i, f) in floats.iter().enumerate() {
         enc.set_bytes(
@@ -4280,7 +4676,7 @@ impl TokenGraph {
         if h.len() != dims.hidden {
             return None;
         }
-        let (fbuf, safe_len) = file_buffer(c, model.primary_bytes())?;
+        let (fbuf, safe_len) = file_buffer(c, model)?;
         let h_b = io_buf(c, 20_000_000_003 + dims.hidden, dims.hidden * 4);
         let n_b = io_buf(c, 21_000_000_011 + dims.hidden, dims.hidden * 4);
         let d_b = io_buf(c, 32_000_000_207 + dims.hidden, dims.hidden * 4);
@@ -4358,25 +4754,39 @@ impl TokenGraph {
             cortiq_core::TensorDtype::Q1 => self.q1_abs(t).map(|a| (a, ProjKind::Q1)),
             cortiq_core::TensorDtype::Q1T => self.q1t_abs(t).map(|a| (a, ProjKind::Q1t)),
             cortiq_core::TensorDtype::Q4Block => self.q4b_abs(t).map(|a| (a, ProjKind::Q4b)),
-            cortiq_core::TensorDtype::Q8Row => self.q8_abs(t).map(|(a, rs)| (a, ProjKind::Q8(rs))),
+            cortiq_core::TensorDtype::Q8Row | cortiq_core::TensorDtype::Q8_2f => {
+                self.q8_abs(t).map(|(a, row_scale, col_field)| {
+                    (
+                        a,
+                        ProjKind::Q8 {
+                            row_scale,
+                            col_field,
+                        },
+                    )
+                })
+            }
             _ => None,
         }
     }
 
-    /// Validate one q8_row tensor and cache its row_scale buffer.
-    fn q8_abs(&self, t: (usize, usize, usize)) -> Option<(usize, Buffer)> {
+    /// Validate q8_row/q8_2f and cache their f16-decoded fields as f32 Metal
+    /// constants. The payload keeps f16 on disk; treating its bytes as f32
+    /// here used to corrupt whole-token Q8 execution.
+    fn q8_abs(&self, t: (usize, usize, usize)) -> Option<(usize, Buffer, Option<Buffer>)> {
         let (idx, rows, cols) = t;
         if cols % 4 != 0 {
             return None;
         }
         let entry = &self.model.tensors[idx];
+        let has_col = entry.dtype == cortiq_core::TensorDtype::Q8_2f;
         let abs = self.model.entry_abs_offset(entry)?;
         let qlen = rows * cols;
-        if abs + qlen + rows * 4 > self.safe_len {
+        let need = qlen + rows * 2 + if has_col { cols * 2 } else { 0 };
+        if abs + need > self.safe_len || (entry.nbytes as usize) < need {
             return None;
         }
 
-        let base = self.model.primary_bytes().as_ptr() as usize;
+        let base = model_key(&self.model);
         let c = self.c;
         let rs_buf = {
             let mut cache = c.rs_bufs.lock().unwrap();
@@ -4385,16 +4795,43 @@ impl TokenGraph {
                 .or_insert_with(|| {
                     crate::gpu::probe_note_cold();
                     let bytes = self.model.entry_bytes(entry);
-                    let scales_bytes = &bytes[qlen..qlen + rows * 4];
+                    let scales: Vec<f32> = (0..rows)
+                        .map(|r| {
+                            let o = qlen + r * 2;
+                            f16_to_f32(u16::from_le_bytes([bytes[o], bytes[o + 1]]))
+                        })
+                        .collect();
                     c._device.new_buffer_with_data(
-                        scales_bytes.as_ptr() as *const std::ffi::c_void,
+                        scales.as_ptr() as *const std::ffi::c_void,
                         (rows * 4) as u64,
                         metal::MTLResourceOptions::StorageModeShared,
                     )
                 })
                 .clone()
         };
-        Some((abs, rs_buf))
+        let col_buf = has_col.then(|| {
+            let mut cache = c.cf_bufs.lock().unwrap();
+            cache
+                .entry((base, idx))
+                .or_insert_with(|| {
+                    crate::gpu::probe_note_cold();
+                    let bytes = self.model.entry_bytes(entry);
+                    let off = qlen + rows * 2;
+                    let field: Vec<f32> = (0..cols)
+                        .map(|i| {
+                            let o = off + i * 2;
+                            f16_to_f32(u16::from_le_bytes([bytes[o], bytes[o + 1]]))
+                        })
+                        .collect();
+                    c._device.new_buffer_with_data(
+                        field.as_ptr() as *const std::ffi::c_void,
+                        (cols * 4) as u64,
+                        metal::MTLResourceOptions::StorageModeShared,
+                    )
+                })
+                .clone()
+        });
+        Some((abs, rs_buf, col_buf))
     }
 
     /// Pre-flight check for a GDN layer (call before any encode).
@@ -4405,7 +4842,9 @@ impl TokenGraph {
         if l.a.0.len() != l.a.1 * l.a.2 || l.b.0.len() != l.b.1 * l.b.2 {
             return false;
         }
-        [l.qkv, l.z, l.out, l.gate, l.up, l.down].iter().all(|t| self.proj_abs(*t).is_some())
+        [l.qkv, l.z, l.out, l.gate, l.up, l.down]
+            .iter()
+            .all(|t| self.proj_abs(*t).is_some())
     }
 
     /// Pre-flight check for a full-attention layer.
@@ -4415,7 +4854,9 @@ impl TokenGraph {
         if l.wo.1 != self.dims.hidden || l.down.1 != self.dims.hidden {
             return false;
         }
-        [l.wq, l.wk, l.wv, l.wo, l.gate, l.up, l.down].iter().all(|t| self.proj_abs(*t).is_some())
+        [l.wq, l.wk, l.wv, l.wo, l.gate, l.up, l.down]
+            .iter()
+            .all(|t| self.proj_abs(*t).is_some())
     }
 
     fn ensure_cmd(&mut self) -> metal::CommandBuffer {
@@ -4487,7 +4928,11 @@ impl TokenGraph {
         enc_simple(
             &cmd,
             &self.c.rmsn,
-            &[(&self.h_b, 0), (&const_buf(self.c, norm), 0), (&self.n_b, 0)],
+            &[
+                (&self.h_b, 0),
+                (&const_buf(self.c, norm), 0),
+                (&self.n_b, 0),
+            ],
             &[self.dims.hidden as u32, self.dims.gemma as u32],
             &[self.dims.eps],
             (256, 256),
@@ -4495,7 +4940,17 @@ impl TokenGraph {
         let (abs, q1t) = self.proj_abs(lm).unwrap();
         let lg_b = io_buf(self.c, 44_000_000_077 + lm.1, lm.1 * 4);
         let enc = cmd.new_compute_command_encoder();
-        encode_proj(self.c, enc, &self.fbuf, abs, &q1t, &self.n_b, &lg_b, lm.1, lm.2 / GROUP_SIZE);
+        encode_proj(
+            self.c,
+            enc,
+            &self.fbuf,
+            abs,
+            &q1t,
+            &self.n_b,
+            &lg_b,
+            lm.1,
+            lm.2 / GROUP_SIZE,
+        );
         enc.end_encoding();
         self.logits_b = Some(lg_b);
     }
@@ -4503,9 +4958,16 @@ impl TokenGraph {
     /// Copy the finished logits (call after `sync`; out may be shorter
     /// than the head's rows — trailing rows are padding vocab).
     pub fn read_logits(&mut self, out: &mut [f32]) {
-        let lg_b = self.logits_b.take().expect("read_logits without encode_lm_head");
+        let lg_b = self
+            .logits_b
+            .take()
+            .expect("read_logits without encode_lm_head");
         unsafe {
-            std::ptr::copy_nonoverlapping(lg_b.contents() as *const f32, out.as_mut_ptr(), out.len());
+            std::ptr::copy_nonoverlapping(
+                lg_b.contents() as *const f32,
+                out.as_mut_ptr(),
+                out.len(),
+            );
         }
     }
 
@@ -4519,7 +4981,11 @@ impl TokenGraph {
         enc_simple(
             &cmd,
             &self.c.rmsn,
-            &[(&self.h_b, 0), (&const_buf(self.c, l.attn_norm), 0), (&self.n_b, 0)],
+            &[
+                (&self.h_b, 0),
+                (&const_buf(self.c, l.attn_norm), 0),
+                (&self.n_b, 0),
+            ],
             &[self.dims.hidden as u32, self.dims.gemma as u32],
             &[self.dims.eps],
             (256, 256),
@@ -4528,9 +4994,39 @@ impl TokenGraph {
         let k_b = io_buf(self.c, 41_000_000_019 + l.wk.1, l.wk.1 * 4);
         let v_b = io_buf(self.c, 42_000_000_037 + l.wv.1, l.wv.1 * 4);
         let enc = cmd.new_compute_command_encoder();
-        encode_proj(self.c, enc, &self.fbuf, aq.0, &aq.1, &self.n_b, &q_b, l.wq.1, l.wq.2 / GROUP_SIZE);
-        encode_proj(self.c, enc, &self.fbuf, ak.0, &ak.1, &self.n_b, &k_b, l.wk.1, l.wk.2 / GROUP_SIZE);
-        encode_proj(self.c, enc, &self.fbuf, av.0, &av.1, &self.n_b, &v_b, l.wv.1, l.wv.2 / GROUP_SIZE);
+        encode_proj(
+            self.c,
+            enc,
+            &self.fbuf,
+            aq.0,
+            &aq.1,
+            &self.n_b,
+            &q_b,
+            l.wq.1,
+            l.wq.2 / GROUP_SIZE,
+        );
+        encode_proj(
+            self.c,
+            enc,
+            &self.fbuf,
+            ak.0,
+            &ak.1,
+            &self.n_b,
+            &k_b,
+            l.wk.1,
+            l.wk.2 / GROUP_SIZE,
+        );
+        encode_proj(
+            self.c,
+            enc,
+            &self.fbuf,
+            av.0,
+            &av.1,
+            &self.n_b,
+            &v_b,
+            l.wv.1,
+            l.wv.2 / GROUP_SIZE,
+        );
         enc.end_encoding();
         self.qkv_bufs = Some((q_b, k_b, v_b));
     }
@@ -4565,7 +5061,17 @@ impl TokenGraph {
         {
             let enc = cmd.new_compute_command_encoder();
             let (abs, q1t) = self.proj_abs(l.wo).unwrap();
-            encode_proj(self.c, enc, &self.fbuf, abs, &q1t, ao_b, &self.d_b, l.wo.1, l.wo.2 / GROUP_SIZE);
+            encode_proj(
+                self.c,
+                enc,
+                &self.fbuf,
+                abs,
+                &q1t,
+                ao_b,
+                &self.d_b,
+                l.wo.1,
+                l.wo.2 / GROUP_SIZE,
+            );
             enc.end_encoding();
         }
         // Fused: h += d_b, n = rmsnorm(h, post_norm) — one dispatch
@@ -4577,7 +5083,7 @@ impl TokenGraph {
     pub fn attn_device_ok(&self, l: &AttnGpuLayer, p: &AttnDeviceParams) -> bool {
         self.attn_ok(l)
             && p.hd % 4 == 0
-            && p.hd <= 128
+            && p.hd <= 256
             && p.rd <= p.hd
             && p.rd >= 2
             && (p.rd / 2) % 32 == 0
@@ -4603,19 +5109,36 @@ impl TokenGraph {
             let mut reg = self.c.kv_mirrors.lock().unwrap();
             let need = p.cpu_stored + 1;
             let entry = reg.entry((p.kv_id, p.layer)).or_insert_with(|| KvMirror {
-                k: self.c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
-                v: self.c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
-                imp: self.c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
+                k: self
+                    .c
+                    ._device
+                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                v: self
+                    .c
+                    ._device
+                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                imp: self
+                    .c
+                    ._device
+                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
                 cap: 0,
                 stored: usize::MAX, // force first-touch upload
             });
             if entry.cap < need {
                 let cap = need.next_power_of_two().max(1024);
                 let bytes = (p.nkv * cap * p.hd * 4) as u64;
-                entry.k = self.c._device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
-                entry.v = self.c._device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
-                entry.imp =
-                    self.c._device.new_buffer((cap * 4) as u64, MTLResourceOptions::StorageModeShared);
+                entry.k = self
+                    .c
+                    ._device
+                    .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+                entry.v = self
+                    .c
+                    ._device
+                    .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+                entry.imp = self
+                    .c
+                    ._device
+                    .new_buffer((cap * 4) as u64, MTLResourceOptions::StorageModeShared);
                 unsafe {
                     std::ptr::write_bytes(entry.imp.contents() as *mut u8, 0, cap * 4);
                 }
@@ -4640,8 +5163,13 @@ impl TokenGraph {
                 }
                 entry.stored = p.cpu_stored;
             }
-            let out =
-                (entry.k.clone(), entry.v.clone(), entry.imp.clone(), entry.cap, entry.stored);
+            let out = (
+                entry.k.clone(),
+                entry.v.clone(),
+                entry.imp.clone(),
+                entry.cap,
+                entry.stored,
+            );
             entry.stored += 1; // this token's append
             out
         };
@@ -4651,7 +5179,11 @@ impl TokenGraph {
         enc_simple(
             &cmd,
             &self.c.rmsn,
-            &[(&self.h_b, 0), (&const_buf(self.c, l.attn_norm), 0), (&self.n_b, 0)],
+            &[
+                (&self.h_b, 0),
+                (&const_buf(self.c, l.attn_norm), 0),
+                (&self.n_b, 0),
+            ],
             &[self.dims.hidden as u32, self.dims.gemma as u32],
             &[self.dims.eps],
             (256, 256),
@@ -4667,9 +5199,39 @@ impl TokenGraph {
                 self.proj_abs(l.wk).unwrap(),
                 self.proj_abs(l.wv).unwrap(),
             );
-            encode_proj(self.c, enc, &self.fbuf, aq.0, &aq.1, &self.n_b, &q_b, l.wq.1, l.wq.2 / GROUP_SIZE);
-            encode_proj(self.c, enc, &self.fbuf, ak.0, &ak.1, &self.n_b, &k_b, l.wk.1, l.wk.2 / GROUP_SIZE);
-            encode_proj(self.c, enc, &self.fbuf, av.0, &av.1, &self.n_b, &v_b, l.wv.1, l.wv.2 / GROUP_SIZE);
+            encode_proj(
+                self.c,
+                enc,
+                &self.fbuf,
+                aq.0,
+                &aq.1,
+                &self.n_b,
+                &q_b,
+                l.wq.1,
+                l.wq.2 / GROUP_SIZE,
+            );
+            encode_proj(
+                self.c,
+                enc,
+                &self.fbuf,
+                ak.0,
+                &ak.1,
+                &self.n_b,
+                &k_b,
+                l.wk.1,
+                l.wk.2 / GROUP_SIZE,
+            );
+            encode_proj(
+                self.c,
+                enc,
+                &self.fbuf,
+                av.0,
+                &av.1,
+                &self.n_b,
+                &v_b,
+                l.wv.1,
+                l.wv.2 / GROUP_SIZE,
+            );
             enc.end_encoding();
         }
         // 3. per-head qk-norm + RoPE (gate split into g_b)
@@ -4680,8 +5242,14 @@ impl TokenGraph {
             | ((p.q_norm.is_some() as u32) << 1)
             | ((p.k_norm.is_some() as u32) << 2)
             | ((p.gemma as u32) << 3);
-        let qn_b = p.q_norm.map(|w| const_buf(self.c, w)).unwrap_or_else(|| qr_b.clone());
-        let kn_b = p.k_norm.map(|w| const_buf(self.c, w)).unwrap_or_else(|| qr_b.clone());
+        let qn_b = p
+            .q_norm
+            .map(|w| const_buf(self.c, w))
+            .unwrap_or_else(|| qr_b.clone());
+        let kn_b = p
+            .k_norm
+            .map(|w| const_buf(self.c, w))
+            .unwrap_or_else(|| qr_b.clone());
         enc_simple(
             &cmd,
             &self.c.rqkn,
@@ -4779,19 +5347,40 @@ impl TokenGraph {
             let hd_u = delta.is_some() as u32;
             enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(5, 4, &g_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(6, 4, &self.dims.eps as *const f32 as *const std::ffi::c_void);
-            enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_thread_groups(
-                MTLSize::new(1, 1, 1),
-                MTLSize::new(256, 1, 1),
+            enc.set_bytes(
+                6,
+                4,
+                &self.dims.eps as *const f32 as *const std::ffi::c_void,
             );
+            enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
             enc.end_encoding();
         }
         {
             let enc = cmd.new_compute_command_encoder();
             let (ag, au) = (self.proj_abs(gate).unwrap(), self.proj_abs(up).unwrap());
-            encode_proj(self.c, enc, &self.fbuf, ag.0, &ag.1, &self.n_b, &fg_b, gate.1, gate.2 / GROUP_SIZE);
-            encode_proj(self.c, enc, &self.fbuf, au.0, &au.1, &self.n_b, &fu_b, up.1, up.2 / GROUP_SIZE);
+            encode_proj(
+                self.c,
+                enc,
+                &self.fbuf,
+                ag.0,
+                &ag.1,
+                &self.n_b,
+                &fg_b,
+                gate.1,
+                gate.2 / GROUP_SIZE,
+            );
+            encode_proj(
+                self.c,
+                enc,
+                &self.fbuf,
+                au.0,
+                &au.1,
+                &self.n_b,
+                &fu_b,
+                up.1,
+                up.2 / GROUP_SIZE,
+            );
             enc.end_encoding();
         }
         {
@@ -4810,7 +5399,17 @@ impl TokenGraph {
         {
             let enc = cmd.new_compute_command_encoder();
             let ad = self.proj_abs(down).unwrap();
-            encode_proj(self.c, enc, &self.fbuf, ad.0, &ad.1, &fa_b, &self.d_b, down.1, down.2 / GROUP_SIZE);
+            encode_proj(
+                self.c,
+                enc,
+                &self.fbuf,
+                ad.0,
+                &ad.1,
+                &fa_b,
+                &self.d_b,
+                down.1,
+                down.2 / GROUP_SIZE,
+            );
             enc.end_encoding();
         }
         enc_axpy(self.c, cmd, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
@@ -4887,113 +5486,146 @@ impl TokenGraph {
         let vec_buf = |data: &[f32]| -> Buffer { const_buf(c, data) };
 
         for (l, (a8, sb)) in layers.iter().zip(abss.iter().zip(&st_bs)) {
-        let s_off = (ring_len * 4) as u64;
-        // 1. attn rmsnorm h → n
-        enc_one(
-            &c.rmsn,
-            &[(&h_b, 0), (&vec_buf(l.attn_norm), 0), (&n_b, 0)],
-            &[cfg.hidden as u32, cfg.gemma as u32],
-            &[cfg.eps],
-            (256, 256),
-        );
-        // 2. mixer: qkv, z, a, b (independent — one encoder)
-        {
-            let enc = cmd.new_compute_command_encoder();
-            encode_proj(c, enc, &fbuf, a8[0].0, &a8[0].1, &n_b, &qkv_b, l.qkv.1, l.qkv.2 / GROUP_SIZE);
-            encode_proj(c, enc, &fbuf, a8[1].0, &a8[1].1, &n_b, &z_b, l.z.1, l.z.2 / GROUP_SIZE);
-            for (t, y) in [(&l.a, &a_b), (&l.b, &b_b)] {
-                let (data, rows, cols) = *t;
-                let wb = vec_buf(data);
-                enc.set_compute_pipeline_state(&c.f16mv);
-                enc.set_buffer(0, Some(&wb), 0);
-                enc.set_buffer(1, Some(&n_b), 0);
-                enc.set_buffer(2, Some(y), 0);
-                let (cu, ru) = (cols as u32, rows as u32);
-                enc.set_bytes(3, 4, &cu as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(4, 4, &ru as *const u32 as *const std::ffi::c_void);
+            let s_off = (ring_len * 4) as u64;
+            // 1. attn rmsnorm h → n
+            enc_one(
+                &c.rmsn,
+                &[(&h_b, 0), (&vec_buf(l.attn_norm), 0), (&n_b, 0)],
+                &[cfg.hidden as u32, cfg.gemma as u32],
+                &[cfg.eps],
+                (256, 256),
+            );
+            // 2. mixer: qkv, z, a, b (independent — one encoder)
+            {
+                let enc = cmd.new_compute_command_encoder();
+                encode_proj(
+                    c,
+                    enc,
+                    &fbuf,
+                    a8[0].0,
+                    &a8[0].1,
+                    &n_b,
+                    &qkv_b,
+                    l.qkv.1,
+                    l.qkv.2 / GROUP_SIZE,
+                );
+                encode_proj(
+                    c,
+                    enc,
+                    &fbuf,
+                    a8[1].0,
+                    &a8[1].1,
+                    &n_b,
+                    &z_b,
+                    l.z.1,
+                    l.z.2 / GROUP_SIZE,
+                );
+                for (t, y) in [(&l.a, &a_b), (&l.b, &b_b)] {
+                    let (data, rows, cols) = *t;
+                    let wb = vec_buf(data);
+                    enc.set_compute_pipeline_state(&c.f16mv);
+                    enc.set_buffer(0, Some(&wb), 0);
+                    enc.set_buffer(1, Some(&n_b), 0);
+                    enc.set_buffer(2, Some(y), 0);
+                    let (cu, ru) = (cols as u32, rows as u32);
+                    enc.set_bytes(3, 4, &cu as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(4, 4, &ru as *const u32 as *const std::ffi::c_void);
+                    let sgs = 8u64;
+                    enc.dispatch_thread_groups(
+                        MTLSize::new((rows as u64).div_ceil(sgs), 1, 1),
+                        MTLSize::new(sgs * 32, 1, 1),
+                    );
+                }
+                enc.end_encoding();
+            }
+            // 3. conv + silu (reads ring BEFORE the shift)
+            enc_one(
+                &c.conv,
+                &[(&qkv_b, 0), (sb, 0), (&vec_buf(l.conv1d), 0), (&cq_b, 0)],
+                &[cfg.c_dim as u32, cfg.kk as u32],
+                &[],
+                (cfg.c_dim as u64, 256),
+            );
+            // 4. ring shift + gates + qk norms (one encoder, independent)
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&c.ring);
+                enc.set_buffer(0, Some(sb), 0);
+                enc.set_buffer(1, Some(&qkv_b), 0);
+                let (cd, kk) = (cfg.c_dim as u32, cfg.kk as u32);
+                enc.set_bytes(2, 4, &cd as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(3, 4, &kk as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_threads(
+                    MTLSize::new(cfg.c_dim as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                enc.set_compute_pipeline_state(&c.gates);
+                enc.set_buffer(0, Some(&a_b), 0);
+                enc.set_buffer(1, Some(&b_b), 0);
+                enc.set_buffer(2, Some(&vec_buf(l.a_log)), 0);
+                enc.set_buffer(3, Some(&vec_buf(l.dt_bias)), 0);
+                enc.set_buffer(4, Some(&g_b), 0);
+                enc.set_buffer(5, Some(&bt_b), 0);
+                let nv = cfg.nv as u32;
+                enc.set_bytes(6, 4, &nv as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_threads(MTLSize::new(cfg.nv as u64, 1, 1), MTLSize::new(64, 1, 1));
+                enc.set_compute_pipeline_state(&c.qkn);
+                enc.set_buffer(0, Some(&cq_b), 0);
+                enc.set_buffer(1, Some(&iq_b), 0);
+                enc.set_buffer(2, Some(&ik_b), 0);
+                let (nk, dk) = (cfg.nk as u32, cfg.dk as u32);
+                enc.set_bytes(3, 4, &nk as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &dk as *const u32 as *const std::ffi::c_void);
                 let sgs = 8u64;
                 enc.dispatch_thread_groups(
-                    MTLSize::new((rows as u64).div_ceil(sgs), 1, 1),
+                    MTLSize::new((cfg.nk as u64).div_ceil(sgs), 1, 1),
                     MTLSize::new(sgs * 32, 1, 1),
                 );
+                enc.end_encoding();
             }
-            enc.end_encoding();
-        }
-        // 3. conv + silu (reads ring BEFORE the shift)
-        enc_one(
-            &c.conv,
-            &[(&qkv_b, 0), (sb, 0), (&vec_buf(l.conv1d), 0), (&cq_b, 0)],
-            &[cfg.c_dim as u32, cfg.kk as u32],
-            &[],
-            (cfg.c_dim as u64, 256),
-        );
-        // 4. ring shift + gates + qk norms (one encoder, independent)
-        {
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&c.ring);
-            enc.set_buffer(0, Some(sb), 0);
-            enc.set_buffer(1, Some(&qkv_b), 0);
-            let (cd, kk) = (cfg.c_dim as u32, cfg.kk as u32);
-            enc.set_bytes(2, 4, &cd as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(3, 4, &kk as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_threads(MTLSize::new(cfg.c_dim as u64, 1, 1), MTLSize::new(256, 1, 1));
-            enc.set_compute_pipeline_state(&c.gates);
-            enc.set_buffer(0, Some(&a_b), 0);
-            enc.set_buffer(1, Some(&b_b), 0);
-            enc.set_buffer(2, Some(&vec_buf(l.a_log)), 0);
-            enc.set_buffer(3, Some(&vec_buf(l.dt_bias)), 0);
-            enc.set_buffer(4, Some(&g_b), 0);
-            enc.set_buffer(5, Some(&bt_b), 0);
-            let nv = cfg.nv as u32;
-            enc.set_bytes(6, 4, &nv as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_threads(MTLSize::new(cfg.nv as u64, 1, 1), MTLSize::new(64, 1, 1));
-            enc.set_compute_pipeline_state(&c.qkn);
-            enc.set_buffer(0, Some(&cq_b), 0);
-            enc.set_buffer(1, Some(&iq_b), 0);
-            enc.set_buffer(2, Some(&ik_b), 0);
-            let (nk, dk) = (cfg.nk as u32, cfg.dk as u32);
-            enc.set_bytes(3, 4, &nk as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(4, 4, &dk as *const u32 as *const std::ffi::c_void);
-            let sgs = 8u64;
-            enc.dispatch_thread_groups(
-                MTLSize::new((cfg.nk as u64).div_ceil(sgs), 1, 1),
-                MTLSize::new(sgs * 32, 1, 1),
-            );
-            enc.end_encoding();
-        }
-        // 5. recurrence + gated norm → of
-        {
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&c.stateup);
-            enc.set_buffer(0, Some(sb), s_off);
-            enc.set_buffer(1, Some(&cq_b), 0);
-            enc.set_buffer(2, Some(&z_b), 0);
-            enc.set_buffer(3, Some(&g_b), 0);
-            enc.set_buffer(4, Some(&bt_b), 0);
-            enc.set_buffer(5, Some(&iq_b), 0);
-            enc.set_buffer(6, Some(&ik_b), 0);
-            enc.set_buffer(7, Some(&vec_buf(l.gnorm)), 0);
-            enc.set_buffer(8, Some(&of_b), 0);
-            let w4 = [cfg.nv as u32, cfg.nk as u32, cfg.dk as u32, cfg.dv as u32];
-            for (i, w) in w4.iter().enumerate() {
-                enc.set_bytes(9 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+            // 5. recurrence + gated norm → of
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&c.stateup);
+                enc.set_buffer(0, Some(sb), s_off);
+                enc.set_buffer(1, Some(&cq_b), 0);
+                enc.set_buffer(2, Some(&z_b), 0);
+                enc.set_buffer(3, Some(&g_b), 0);
+                enc.set_buffer(4, Some(&bt_b), 0);
+                enc.set_buffer(5, Some(&iq_b), 0);
+                enc.set_buffer(6, Some(&ik_b), 0);
+                enc.set_buffer(7, Some(&vec_buf(l.gnorm)), 0);
+                enc.set_buffer(8, Some(&of_b), 0);
+                let w4 = [cfg.nv as u32, cfg.nk as u32, cfg.dk as u32, cfg.dv as u32];
+                for (i, w) in w4.iter().enumerate() {
+                    enc.set_bytes(9 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+                }
+                enc.set_bytes(13, 4, &cfg.eps as *const f32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(cfg.nv as u64, 1, 1),
+                    MTLSize::new(cfg.dv as u64, 1, 1),
+                );
+                enc.end_encoding();
             }
-            enc.set_bytes(13, 4, &cfg.eps as *const f32 as *const std::ffi::c_void);
-            enc.dispatch_thread_groups(
-                MTLSize::new(cfg.nv as u64, 1, 1),
-                MTLSize::new(cfg.dv as u64, 1, 1),
-            );
-            enc.end_encoding();
-        }
-        // 6. out_proj of → d;  7. h += d
-        {
-            let enc = cmd.new_compute_command_encoder();
-            encode_proj(c, enc, &fbuf, a8[2].0, &a8[2].1, &of_b, &d_b, l.out.1, l.out.2 / GROUP_SIZE);
-            enc.end_encoding();
-        }
-        // 8–12. post-norm + FFN + residual (shared with attn suffix)
-        // Fused: h += d, n = rmsnorm(h, post_norm) — one dispatch.
-        self.encode_post_ffn(&cmd, l.post_norm, l.gate, l.up, l.down, Some(&d_b));
+            // 6. out_proj of → d;  7. h += d
+            {
+                let enc = cmd.new_compute_command_encoder();
+                encode_proj(
+                    c,
+                    enc,
+                    &fbuf,
+                    a8[2].0,
+                    &a8[2].1,
+                    &of_b,
+                    &d_b,
+                    l.out.1,
+                    l.out.2 / GROUP_SIZE,
+                );
+                enc.end_encoding();
+            }
+            // 8–12. post-norm + FFN + residual (shared with attn suffix)
+            // Fused: h += d, n = rmsnorm(h, post_norm) — one dispatch.
+            self.encode_post_ffn(&cmd, l.post_norm, l.gate, l.up, l.down, Some(&d_b));
         }
 
         for (sb, st) in st_bs.iter().zip(states) {
@@ -5002,7 +5634,6 @@ impl TokenGraph {
         true
     }
 }
-
 
 /// Host-side inputs for a fully device-resident attention layer.
 pub struct AttnDeviceParams<'a> {
@@ -5039,7 +5670,9 @@ pub fn kv_mirror_read_last(
 ) -> bool {
     let Some(c) = ctx() else { return false };
     let reg = c.kv_mirrors.lock().unwrap();
-    let Some(m) = reg.get(&(kv_id, layer)) else { return false };
+    let Some(m) = reg.get(&(kv_id, layer)) else {
+        return false;
+    };
     if m.stored == 0 || m.stored == usize::MAX || k_out.len() != nkv * hd {
         return false;
     }
@@ -5061,7 +5694,9 @@ pub fn kv_mirror_read_last(
 pub fn kv_mirror_take_imp(kv_id: u64, layer: usize, imp_acc: &mut [f32]) {
     let Some(c) = ctx() else { return };
     let reg = c.kv_mirrors.lock().unwrap();
-    let Some(m) = reg.get(&(kv_id, layer)) else { return };
+    let Some(m) = reg.get(&(kv_id, layer)) else {
+        return;
+    };
     let n = imp_acc.len().min(m.cap);
     unsafe {
         let src = m.imp.contents() as *mut f32;
@@ -5075,7 +5710,10 @@ pub fn kv_mirror_take_imp(kv_id: u64, layer: usize, imp_acc: &mut [f32]) {
 /// Drop every mirror belonging to a pipeline (its Drop calls this).
 pub fn kv_mirror_drop(kv_id: u64) {
     if let Some(c) = ctx() {
-        c.kv_mirrors.lock().unwrap().retain(|(id, _), _| *id != kv_id);
+        c.kv_mirrors
+            .lock()
+            .unwrap()
+            .retain(|(id, _), _| *id != kv_id);
     }
 }
 
@@ -5092,8 +5730,14 @@ pub fn gdn_block(
     cfg: &GdnGpuCfg,
     h: &mut [f32],
 ) -> bool {
-    let dims = GraphDims { hidden: cfg.hidden, eps: cfg.eps, gemma: cfg.gemma };
-    let Some(mut g) = TokenGraph::new(model, dims, h) else { return false };
+    let dims = GraphDims {
+        hidden: cfg.hidden,
+        eps: cfg.eps,
+        gemma: cfg.gemma,
+    };
+    let Some(mut g) = TokenGraph::new(model, dims, h) else {
+        return false;
+    };
     let ro: Vec<&[f32]> = states.iter().map(|s| &**s).collect();
     if !g.encode_gdn_run(layers, &ro, cfg) {
         return false;
@@ -5120,11 +5764,11 @@ fn enc_axpy(c: &Ctx, cmd: &metal::CommandBufferRef, d: &Buffer, y: &Buffer, w: f
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cortiq_core::{
-        CmfHeader, CmfModel, LayerType, ModelArch, NormStyle, QuantType, TensorDtype,
-        TensorSpec, CMF_VERSION,
-    };
     use crate::qtensor::QTensor;
+    use cortiq_core::{
+        CMF_VERSION, CmfHeader, CmfModel, LayerType, ModelArch, NormStyle, QuantType, TensorDtype,
+        TensorSpec,
+    };
 
     /// GPU kernel == CPU path on an lm_head-class q8_row tensor over
     /// a REAL mmap (no-copy buffer). Skipped without a Metal device.
@@ -5154,8 +5798,7 @@ mod tests {
             for &v in row {
                 q.push((v / scale).round().clamp(-128.0, 127.0) as i8 as u8);
             }
-            scales.extend_from_slice(
-                &cortiq_core::quant::f32_to_f16(scale).to_le_bytes());
+            scales.extend_from_slice(&cortiq_core::quant::f32_to_f16(scale).to_le_bytes());
         }
         q.extend_from_slice(&scales);
 
@@ -5174,6 +5817,9 @@ mod tests {
             rope_theta: 1e4,
             tie_word_embeddings: false,
             partial_rotary_factor: 1.0,
+            yarn: None,
+            attention_heads_per_layer: None,
+            local_partial_rotary_factor: None,
             mtp: None,
             moe: None,
             linear_core: None,
@@ -5300,6 +5946,9 @@ mod tests {
             rope_theta: 1e4,
             tie_word_embeddings: false,
             partial_rotary_factor: 1.0,
+            yarn: None,
+            attention_heads_per_layer: None,
+            local_partial_rotary_factor: None,
             mtp: None,
             moe: None,
             linear_core: None,
@@ -5350,7 +5999,8 @@ mod tests {
             shape: vec![4096, 2],
             data: vec![0u8; 4096 * 2 * 4],
         };
-        let dir = std::env::temp_dir().join(format!("cmf-gpu-q1-{}-{rows}x{cols}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("cmf-gpu-q1-{}-{rows}x{cols}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("gpu.cmf");
         CmfModel::write(&path, &header, &[spec, pad], None, None).unwrap();
@@ -5379,7 +6029,10 @@ mod tests {
             for o in 0..rows {
                 max_d = max_d.max((cpu[o] - gpu[o]).abs());
             }
-            assert!(max_d < tol, "GPU q1 vs f32 reference (mode {mode}): max|Δ| = {max_d}");
+            assert!(
+                max_d < tol,
+                "GPU q1 vs f32 reference (mode {mode}): max|Δ| = {max_d}"
+            );
         }
         Q1_KERNEL_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
         std::fs::remove_dir_all(&dir).ok();

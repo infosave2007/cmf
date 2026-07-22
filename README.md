@@ -424,9 +424,10 @@ A `.cmf` is a fixed 128-byte envelope followed by sections that a reader address
 - **tokenizer** — the verbatim Hugging Face file
 - **sparse index** — precomputed
 
-Also supported: multi-token-prediction (MTP) heads, MoE FFN layers, append-only
-skill growth with compaction, and sharding a model across `N` standalone-valid
-files.
+Also supported: multi-token-prediction (MTP) heads, MoE FFN layers, Laguna's
+mixed global/sliding attention with per-layer head counts, dual RoPE/YaRN and
+softplus attention gates, append-only skill growth with compaction, and
+sharding a model across `N` standalone-valid files.
 
 **You are not locked in.** `python/cmf_reader.py` is a complete reader in ~300
 lines of stdlib + numpy that shares no code with the Rust runtime — it was written

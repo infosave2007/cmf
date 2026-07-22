@@ -4,10 +4,10 @@
 //! scales as backbone + Σ deltas, unknown skill refuses loudly.
 
 use base64::Engine as _;
+use cortiq_core::CMF_VERSION;
 use cortiq_core::format::{CmfHeader, CmfModel, SelectionDescriptor, SkillRecord, TensorSpec};
 use cortiq_core::quant::f32_to_f16;
 use cortiq_core::types::{LayerType, ModelArch, NormStyle, QuantType};
-use cortiq_core::CMF_VERSION;
 use cortiq_engine::pipeline::Pipeline;
 use cortiq_engine::sampler::SamplerConfig;
 use std::sync::Arc;
@@ -34,6 +34,9 @@ fn arch() -> ModelArch {
         rope_theta: 10_000.0,
         tie_word_embeddings: false,
         partial_rotary_factor: 1.0,
+        yarn: None,
+        attention_heads_per_layer: None,
+        local_partial_rotary_factor: None,
         mtp: None,
         moe: None,
         linear_core: None,
@@ -58,9 +61,7 @@ fn arch() -> ModelArch {
 }
 
 fn synth(rows: usize, cols: usize, salt: usize, scale: f32) -> Vec<f32> {
-    (0..rows * cols)
-        .map(|i| (((i * 13 + salt * 7) % 97) as f32 / 97.0 - 0.5) * scale)
-        .collect()
+    (0..rows * cols).map(|i| (((i * 13 + salt * 7) % 97) as f32 / 97.0 - 0.5) * scale).collect()
 }
 
 fn spec(name: &str, rows: usize, cols: usize, data: Vec<f32>) -> TensorSpec {
@@ -84,11 +85,7 @@ fn spec1d(name: &str, n: usize, v: f32) -> TensorSpec {
 /// Backbone + one skill ("boost") that replaces layer-0 gate_proj with
 /// a ×2 copy. Returns (path, backbone-only bytes) for the scaling check.
 fn write_swarm(path: &std::path::Path, with_skill: bool) -> u64 {
-    let mut tensors = vec![
-        spec("model.embed_tokens.weight", VOCAB, H, synth(VOCAB, H, 1, 0.4)),
-        spec("lm_head.weight", VOCAB, H, synth(VOCAB, H, 2, 0.4)),
-        spec1d("model.norm.weight", H, 1.0),
-    ];
+    let mut tensors = vec![spec("model.embed_tokens.weight", VOCAB, H, synth(VOCAB, H, 1, 0.4)), spec("lm_head.weight", VOCAB, H, synth(VOCAB, H, 2, 0.4)), spec1d("model.norm.weight", H, 1.0)];
     for li in 0..2 {
         let p = format!("model.layers.{li}.");
         tensors.push(spec1d(&format!("{p}input_layernorm.weight"), H, 1.0));
@@ -146,47 +143,30 @@ fn skill_replaces_in_place_and_scales_storage() {
     // Claim 15: storage = backbone + Σ deltas, not K × full model.
     let delta_bytes = (FFN * H * 4) as u64;
     let overhead = swarm_len - base_len;
-    assert!(
-        overhead >= delta_bytes && overhead < delta_bytes + 4096,
-        "skill must cost ~its tensor bytes (+dir/header), got {overhead} vs {delta_bytes}"
-    );
+    assert!(overhead >= delta_bytes && overhead < delta_bytes + 4096, "skill must cost ~its tensor bytes (+dir/header), got {overhead} vs {delta_bytes}");
 
     let model = Arc::new(CmfModel::open(&swarm_path).unwrap());
     assert!(model.verify().is_empty());
     assert_eq!(model.skill_tensors("boost").count(), 1);
 
     let ids = [3u32, 7, 11];
-    let mut backbone =
-        Pipeline::from_model(&model, SamplerConfig::default()).unwrap();
+    let mut backbone = Pipeline::from_model(&model, SamplerConfig::default()).unwrap();
     let logits_backbone = greedy_logit_argmax(&mut backbone, &ids);
     drop(backbone);
 
-    let mut overlaid =
-        Pipeline::from_model_with_skill(&model, SamplerConfig::default(), Some("boost"))
-            .unwrap();
+    let mut overlaid = Pipeline::from_model_with_skill(&model, SamplerConfig::default(), Some("boost")).unwrap();
     let logits_skill = greedy_logit_argmax(&mut overlaid, &ids);
 
     // Claim 1/3: the replacement is READ — the forward must change.
-    let diff: f32 = logits_backbone
-        .iter()
-        .zip(&logits_skill)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f32::max);
+    let diff: f32 = logits_backbone.iter().zip(&logits_skill).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
     assert!(diff > 1e-4, "skill overlay must change logits (max diff {diff})");
 
     // Unknown skill: loud refusal, no silent backbone fallback.
-    assert!(
-        Pipeline::from_model_with_skill(&model, SamplerConfig::default(), Some("nope"))
-            .is_err()
-    );
+    assert!(Pipeline::from_model_with_skill(&model, SamplerConfig::default(), Some("nope")).is_err());
 }
 
-
 fn b64f16(v: &[f32]) -> String {
-    let bytes: Vec<u8> = v
-        .iter()
-        .flat_map(|&x| f32_to_f16(x).to_le_bytes())
-        .collect();
+    let bytes: Vec<u8> = v.iter().flat_map(|&x| f32_to_f16(x).to_le_bytes()).collect();
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
@@ -272,20 +252,14 @@ fn dynamic_skill_switch_matches_static_overlay() {
     let path = dir.join("swarm.cmf");
     write_swarm(&path, true); // one skill "boost" replacing layer-0 gate
     let model = Arc::new(CmfModel::open(&path).unwrap());
-    let boost_idx = model
-        .header
-        .skills
-        .iter()
-        .position(|s| s.id == "boost")
-        .unwrap();
+    let boost_idx = model.header.skills.iter().position(|s| s.id == "boost").unwrap();
 
     let ids = [3u32, 7, 11, 5, 9];
 
     // Static references.
     let mut base = Pipeline::from_model(&model, SamplerConfig::default()).unwrap();
     let logits_base = greedy_logit_argmax(&mut base, &ids);
-    let mut stat =
-        Pipeline::from_model_with_skill(&model, SamplerConfig::default(), Some("boost")).unwrap();
+    let mut stat = Pipeline::from_model_with_skill(&model, SamplerConfig::default(), Some("boost")).unwrap();
     let logits_static = greedy_logit_argmax(&mut stat, &ids);
 
     // Dynamic: backbone → switch to boost → switch back.
@@ -297,10 +271,7 @@ fn dynamic_skill_switch_matches_static_overlay() {
     dyn_p.set_active_skill(Some(boost_idx)).unwrap();
     assert_eq!(dyn_p.active_skill(), Some(boost_idx));
     let d1 = greedy_logit_argmax(&mut dyn_p, &ids);
-    assert_eq!(
-        d1, logits_static,
-        "dynamic-overlaid logits must be BIT-IDENTICAL to static overlay"
-    );
+    assert_eq!(d1, logits_static, "dynamic-overlaid logits must be BIT-IDENTICAL to static overlay");
 
     dyn_p.set_active_skill(None).unwrap();
     let d2 = greedy_logit_argmax(&mut dyn_p, &ids);
@@ -308,10 +279,7 @@ fn dynamic_skill_switch_matches_static_overlay() {
 
     // boost is FFN-eligible → switchable, but has no selection descriptor
     // → NOT auto-routable. dynamic_skills() requires both (routing needs φ).
-    assert!(
-        dyn_p.dynamic_skills().is_empty(),
-        "no-selection skill must not be auto-routable"
-    );
+    assert!(dyn_p.dynamic_skills().is_empty(), "no-selection skill must not be auto-routable");
 
     // Idempotent no-op switch.
     dyn_p.set_active_skill(None).unwrap();
@@ -336,21 +304,13 @@ fn static_skill_load_reverts_to_backbone_on_switch() {
     let logits_base = greedy_logit_argmax(&mut base, &ids);
 
     // Load STATICALLY with the skill; the pipeline must record dyn_active.
-    let mut p =
-        Pipeline::from_model_with_skill(&model, SamplerConfig::default(), Some("boost")).unwrap();
-    assert_eq!(
-        p.active_skill(),
-        Some(boost_idx),
-        "static skill load must record dyn_active"
-    );
+    let mut p = Pipeline::from_model_with_skill(&model, SamplerConfig::default(), Some("boost")).unwrap();
+    assert_eq!(p.active_skill(), Some(boost_idx), "static skill load must record dyn_active");
     let logits_overlaid = greedy_logit_argmax(&mut p, &ids);
     assert_ne!(logits_overlaid, logits_base);
 
     // Switch to backbone — must be a REAL revert, bit-identical to base.
     p.set_active_skill(None).unwrap();
     let logits_reverted = greedy_logit_argmax(&mut p, &ids);
-    assert_eq!(
-        logits_reverted, logits_base,
-        "set_active_skill(None) after a static load must revert to true backbone"
-    );
+    assert_eq!(logits_reverted, logits_base, "set_active_skill(None) after a static load must revert to true backbone");
 }

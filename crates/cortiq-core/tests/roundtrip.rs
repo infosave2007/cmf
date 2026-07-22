@@ -3,10 +3,10 @@
 
 use cortiq_core::format::{build_sparse_index, decode_sparse_index, encode_sparse_index};
 use cortiq_core::mask::zero_tail_bits;
-use cortiq_core::quant::{dequant_q4_block, dequant_q8_row, f16_to_f32, f32_to_f16, GROUP_SIZE};
+use cortiq_core::quant::{GROUP_SIZE, dequant_q4_block, dequant_q8_row, f16_to_f32, f32_to_f16};
 use cortiq_core::{
-    hash64, CmfError, CmfHeader, CmfModel, LayerType, MaskCatalog, MaskPriority, ModelArch,
-    NormStyle, Quality, QuantType, TaskMask, TensorDtype, TensorSpec, CMF_VERSION,
+    CMF_VERSION, CmfError, CmfHeader, CmfModel, LayerType, MaskCatalog, MaskPriority, ModelArch,
+    NormStyle, Quality, QuantType, TaskMask, TensorDtype, TensorSpec, hash64,
 };
 
 // ───────────────────────── helpers ─────────────────────────
@@ -27,6 +27,9 @@ fn tiny_arch() -> ModelArch {
         rope_theta: 10_000.0,
         tie_word_embeddings: false,
         partial_rotary_factor: 1.0,
+        yarn: None,
+        attention_heads_per_layer: None,
+        local_partial_rotary_factor: None,
         mtp: None,
         moe: None,
         linear_core: None,
@@ -105,7 +108,12 @@ fn encode_q4_block(vals: &[f32]) -> Vec<u8> {
     packed
 }
 
-fn mask_with_bits(task_id: u32, name: &str, arch: &ModelArch, quality: Option<Quality>) -> TaskMask {
+fn mask_with_bits(
+    task_id: u32,
+    name: &str,
+    arch: &ModelArch,
+    quality: Option<Quality>,
+) -> TaskMask {
     let ffn_b = arch.ffn_mask_bytes();
     let head_b = arch.head_mask_bytes();
     // Layer 0: every even neuron active; layer 1: first half active.
@@ -144,7 +152,9 @@ fn write_tiny_file(path: &std::path::Path) -> (Vec<TensorSpec>, MaskCatalog, Vec
     let gate: Vec<f32> = (0..arch.intermediate_size * arch.hidden_size)
         .map(|i| (i as f32 * 0.07).cos())
         .collect();
-    let norm: Vec<f32> = (0..arch.hidden_size).map(|i| 1.0 + i as f32 * 0.01).collect();
+    let norm: Vec<f32> = (0..arch.hidden_size)
+        .map(|i| 1.0 + i as f32 * 0.01)
+        .collect();
 
     let tensors = vec![
         TensorSpec {
@@ -169,7 +179,10 @@ fn write_tiny_file(path: &std::path::Path) -> (Vec<TensorSpec>, MaskCatalog, Vec
             name: "model.norm.weight".into(),
             dtype: TensorDtype::F16,
             shape: vec![arch.hidden_size],
-            data: norm.iter().flat_map(|v| f32_to_f16(*v).to_le_bytes()).collect(),
+            data: norm
+                .iter()
+                .flat_map(|v| f32_to_f16(*v).to_le_bytes())
+                .collect(),
         },
     ];
 
@@ -278,7 +291,10 @@ fn full_file_roundtrip() {
     }
     let q = model.masks.masks[0].quality.as_ref().unwrap();
     assert_eq!(q.metric, "heldout_ppl_ratio");
-    assert!(model.masks.masks[1].quality.is_none(), "unmeasured stays None");
+    assert!(
+        model.masks.masks[1].quality.is_none(),
+        "unmeasured stays None"
+    );
 
     // Vocab embedded verbatim.
     assert_eq!(model.vocab.as_deref(), Some(&vocab[..]));
@@ -320,7 +336,10 @@ fn large_tensors_are_page_aligned() {
             name: "small.norm".into(),
             dtype: TensorDtype::F16,
             shape: vec![8],
-            data: norm.iter().flat_map(|v| f32_to_f16(*v).to_le_bytes()).collect(),
+            data: norm
+                .iter()
+                .flat_map(|v| f32_to_f16(*v).to_le_bytes())
+                .collect(),
         },
     ];
     CmfModel::write(&path, &tiny_header(), &tensors, None, None).unwrap();
@@ -338,7 +357,10 @@ fn large_tensors_are_page_aligned() {
     for e in &model.tensors {
         assert_eq!(e.off % 64, 0);
     }
-    assert_eq!(model.tensor_bytes("big.weight").unwrap(), &tensors[0].data[..]);
+    assert_eq!(
+        model.tensor_bytes("big.weight").unwrap(),
+        &tensors[0].data[..]
+    );
     assert!(model.verify().is_empty());
 }
 
@@ -401,6 +423,15 @@ fn open_rejects_garbage_and_corruption() {
         Err(CmfError::UnsupportedFeature(f)) if f == 1 << 7
     ));
 
+    // A hostile directory count must return an error, never overflow/panic.
+    let path = dir.join("dir-overflow.cmf");
+    write_tiny_file(&path);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let dir_off = u64::from_le_bytes(bytes[0x20..0x28].try_into().unwrap()) as usize;
+    bytes[dir_off..dir_off + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(matches!(CmfModel::open(&path), Err(CmfError::Parse(_))));
+
     // Truncated data section.
     let path = dir.join("t.cmf");
     write_tiny_file(&path);
@@ -442,7 +473,10 @@ fn mask_diff_is_bitwise() {
     zero_tail_bits(&mut b.ffn_masks[0], arch.intermediate_size);
 
     let diff = a.diff(&b);
-    assert!(diff.changed_layers.contains(&0), "equal counts must still diff");
+    assert!(
+        diff.changed_layers.contains(&0),
+        "equal counts must still diff"
+    );
     assert_eq!(diff.neurons_added, 8);
     assert_eq!(diff.neurons_removed, 8);
     assert!(diff.ffn_delta[0].iter().any(|&x| x != 0));
@@ -491,9 +525,15 @@ fn defrag_per_layer_ffn_shapes_roundtrip() {
     // Layer 0 keeps 12 neurons, layer 1 keeps 8 — both below the nominal
     // 16 and different from each other.
     let mk_triple = |li: usize, inter: usize| -> Vec<TensorSpec> {
-        let gate: Vec<f32> = (0..inter * hidden).map(|i| ((i + li) as f32 * 0.07).cos()).collect();
-        let up: Vec<f32> = (0..inter * hidden).map(|i| ((i + li) as f32 * 0.05).sin()).collect();
-        let down: Vec<f32> = (0..hidden * inter).map(|i| ((i + li) as f32 * 0.03).cos()).collect();
+        let gate: Vec<f32> = (0..inter * hidden)
+            .map(|i| ((i + li) as f32 * 0.07).cos())
+            .collect();
+        let up: Vec<f32> = (0..inter * hidden)
+            .map(|i| ((i + li) as f32 * 0.05).sin())
+            .collect();
+        let down: Vec<f32> = (0..hidden * inter)
+            .map(|i| ((i + li) as f32 * 0.03).cos())
+            .collect();
         vec![
             TensorSpec {
                 name: format!("model.layers.{li}.mlp.gate_proj.weight"),
@@ -522,7 +562,10 @@ fn defrag_per_layer_ffn_shapes_roundtrip() {
     CmfModel::write(&path, &tiny_header(), &tensors, None, None).unwrap();
 
     let model = CmfModel::open(&path).unwrap();
-    assert!(model.masks.masks.is_empty(), "defragged file carries no masks");
+    assert!(
+        model.masks.masks.is_empty(),
+        "defragged file carries no masks"
+    );
 
     let g0 = model.tensor("model.layers.0.mlp.gate_proj.weight").unwrap();
     let u0 = model.tensor("model.layers.0.mlp.up_proj.weight").unwrap();
@@ -532,7 +575,11 @@ fn defrag_per_layer_ffn_shapes_roundtrip() {
     assert_eq!(d0.shape, vec![hidden, 12], "down cols == inter'");
 
     let g1 = model.tensor("model.layers.1.mlp.gate_proj.weight").unwrap();
-    assert_eq!(g1.shape, vec![8, hidden], "layer 1 keeps its OWN smaller size");
+    assert_eq!(
+        g1.shape,
+        vec![8, hidden],
+        "layer 1 keeps its OWN smaller size"
+    );
 
     // The nominal arch scalar is untouched (per-layer truth is in shapes).
     assert!(model.arch().intermediate_size >= 12);

@@ -6,10 +6,10 @@
 
 use cortiq_core::quant::f32_to_f16;
 use cortiq_core::{
-    CmfHeader, CmfModel, LayerType, ModelArch, NormStyle, QuantType, TensorDtype, TensorSpec,
-    CMF_VERSION,
+    CMF_VERSION, CmfHeader, CmfModel, LayerType, ModelArch, NormStyle, QuantType, TensorDtype,
+    TensorSpec,
 };
-use cortiq_engine::pipeline::{sparse_ffn_quant_for_test, DenseFfn};
+use cortiq_engine::pipeline::{DenseFfn, sparse_ffn_quant_for_test};
 use cortiq_engine::qtensor::QTensor;
 use std::sync::Arc;
 
@@ -101,6 +101,9 @@ fn sparse_ffn_quant_agrees_with_dequant() {
         rope_theta: 1e4,
         tie_word_embeddings: false,
         partial_rotary_factor: 1.0,
+        yarn: None,
+        attention_heads_per_layer: None,
+        local_partial_rotary_factor: None,
         mtp: None,
         moe: None,
         linear_core: None,
@@ -152,7 +155,10 @@ fn sparse_ffn_quant_agrees_with_dequant() {
         up_proj: QTensor::from_model(&model, "u").unwrap(),
         down_proj: QTensor::from_model(&model, "d").unwrap(),
     };
-    assert!(d_mapped.down_proj.sparse_col_ok(), "q8_2f must allow col reads");
+    assert!(
+        d_mapped.down_proj.sparse_col_ok(),
+        "q8_2f must allow col reads"
+    );
 
     // Dequantized-to-f32 copy of the SAME weights.
     let deq = |t: &QTensor| {
@@ -182,6 +188,9 @@ fn sparse_ffn_quant_agrees_with_dequant() {
         .fold(0.0f32, f32::max);
     // Same underlying values (q8 branch vs dequant-then-f32) → only float
     // accumulation-order noise separates them.
-    assert!(max_d < 1e-4, "q8 sparse != dequant sparse: max|Δ| = {max_d}");
+    assert!(
+        max_d < 1e-4,
+        "q8 sparse != dequant sparse: max|Δ| = {max_d}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

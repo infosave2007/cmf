@@ -10,18 +10,19 @@ use crate::attention::{self, QwenAttnCfg};
 use crate::inference;
 use crate::kv_cache::KvCache;
 use crate::linear_core::{
-    gdn_forward, gdn_pair, short_conv_forward, short_conv_forward_batch, short_conv_pair,
-    vmf_phase_forward, vmf_phase_pair, GdnCfg, GdnWeights, ShortConvCfg, ShortConvWeights,
-    VmfPhaseCfg, VmfPhaseWeights,
+    GdnCfg, GdnWeights, ShortConvCfg, ShortConvWeights, VmfPhaseCfg, VmfPhaseWeights, gdn_forward,
+    gdn_pair, short_conv_forward, short_conv_forward_batch, short_conv_pair, vmf_phase_forward,
+    vmf_phase_pair,
 };
 use crate::pool::Pool;
 use crate::qtensor::QTensor;
-use crate::sampler::{self, SamplerConfig, SplitMix64};
+use crate::sampler::{self, SamplerConfig, SamplerScratch, SplitMix64};
 use crate::tokenizer::Tokenizer;
 use cortiq_core::mask::TaskMask;
 use cortiq_core::types::NormStyle;
 
-pub static GLOBAL_USE_GPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static GLOBAL_USE_GPU: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Reusable per-pipeline forward scratch: the four norm outputs the
 /// decode paths recompute every layer (single: n1/p1; pair: all four).
@@ -64,6 +65,8 @@ pub struct Pipeline {
     pub norm_style: NormStyle,
     /// RoPE dims actually rotated (≤ head_dim; Qwen3.5 uses head_dim/4).
     pub rotary_dim: usize,
+    /// Optional Q-head count override for each attention layer (Laguna).
+    pub attention_heads_per_layer: Option<Vec<usize>>,
     /// Linear-core geometry (present when the model has linear layers).
     pub vmf_cfg: Option<VmfPhaseCfg>,
     /// GatedDeltaNet geometry (faithful vendor operator).
@@ -76,10 +79,11 @@ pub struct Pipeline {
     /// Speculative decode via MTP (greedy only; `CMF_MTP=0` disables).
     pub speculative: bool,
     rng: SplitMix64,
+    sampler_scratch: SamplerScratch,
     /// Precomputed RoPE inverse frequencies [head_dim/2]. Arc: the
     /// forward path clones a handle to escape the &mut self borrow —
     /// cloning the table itself was a per-forward allocation.
-    inv_freq: std::sync::Arc<Vec<f32>>,
+    pub(crate) inv_freq: std::sync::Arc<Vec<f32>>,
     /// Reusable norm buffers for the decode hot path (roadmap §3 P0:
     /// steady-state forward should not heap-allocate). Disjoint field
     /// from `weights`/`kv_cache`, so split borrows keep working.
@@ -145,9 +149,15 @@ pub struct Pipeline {
     /// Sliding-window attention: (window, every-Nth-layer-is-global
     /// pattern) — Gemma-3.
     pub swa: Option<(usize, usize)>,
+    /// Explicit local/global schedule for architectures that cannot be
+    /// represented by Gemma's every-Nth-global convention.
+    pub sliding_layers: Option<Vec<bool>>,
     /// RoPE table of the sliding (local) layers, when they use their
     /// own base frequency (Gemma-3: 10k local vs 1M global).
     pub inv_freq_local: Option<std::sync::Arc<Vec<f32>>>,
+    pub rotary_dim_local: Option<usize>,
+    pub rope_scale: f32,
+    pub rope_scale_local: f32,
     /// Gemma-4: global layers run their own geometry — (head_dim,
     /// num_kv_heads); sliding layers keep the base fields.
     pub global_attn: Option<(usize, usize)>,
@@ -266,8 +276,9 @@ pub struct MoeFfn {
     /// Top-k weights are multiplied by this after the optional renorm
     /// (LFM2-MoE `routed_scaling_factor`; 1.0 = off).
     pub routed_scaling: f32,
-    /// Qwen2-MoE always-on shared expert: (FFN, sigmoid-gate [1, hidden]).
-    pub shared: Option<(DenseFfn, QTensor)>,
+    /// Always-on shared expert. Qwen2-MoE carries an additional sigmoid
+    /// gate; Laguna adds the shared expert unconditionally (`None`).
+    pub shared: Option<(DenseFfn, Option<QTensor>)>,
     /// Expert-selection counters (truncated Fisher B-field of claim 12:
     /// routing frequency during calibration). Filled by every forward,
     /// read by the CLI via CMF_MOE_STATS. RefCell: decode is single-threaded.
@@ -286,6 +297,10 @@ pub enum AttnKind {
         q_norm: Option<Vec<f32>>,
         k_norm: Option<Vec<f32>>,
         output_gate: bool,
+        /// Laguna: a separate softplus projection applied to the attention
+        /// output before O. The bool means one scalar per head (broadcast
+        /// across head_dim); false means one scalar per element.
+        softplus_gate: Option<(QTensor, bool)>,
         /// Qwen2-family projection biases (q, k, v).
         bias: Option<(Vec<f32>, Vec<f32>, Vec<f32>)>,
     },
@@ -373,7 +388,9 @@ fn top1_prob_t(logits: &[f32], id: u32, temp: f32) -> f32 {
 /// prefill-GEMM enabled? (CMF_PREFILL=seq — emergency fallback to the
 /// sequential path.)
 fn prefill_batched() -> bool {
-    std::env::var("CMF_PREFILL").map(|v| v != "seq").unwrap_or(true)
+    std::env::var("CMF_PREFILL")
+        .map(|v| v != "seq")
+        .unwrap_or(true)
 }
 
 /// Prefill chunk (positions per batched pass). On macOS the AMX GEMM
@@ -381,8 +398,9 @@ fn prefill_batched() -> bool {
 /// ubatch 512); elsewhere the historical 48 stays. CMF_PREFILL_CHUNK
 /// overrides.
 fn prefill_chunk() -> usize {
-    if let Some(n) =
-        std::env::var("CMF_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok())
+    if let Some(n) = std::env::var("CMF_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
     {
         return n.max(1);
     }
@@ -422,13 +440,16 @@ impl Pipeline {
     fn graph_prefill_preferred(&self) -> bool {
         if !crate::gpu::enabled_here()
             || !crate::gpu::q1_force()
-            || std::env::var("CMF_GPU_BLOCK").map(|v| v == "0").unwrap_or(false)
+            || std::env::var("CMF_GPU_BLOCK")
+                .map(|v| v == "0")
+                .unwrap_or(false)
         {
             return false;
         }
-        self.weights.layers.iter().any(
-            |lw| matches!(&lw.attn, AttnKind::LinearGdn(w) if w.in_proj_qkv.is_q1()),
-        )
+        self.weights
+            .layers
+            .iter()
+            .any(|lw| matches!(&lw.attn, AttnKind::LinearGdn(w) if w.in_proj_qkv.is_q1()))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -440,7 +461,11 @@ impl Pipeline {
         // position at a time so the resident state is seeded exactly as decode
         // will read it. Pure-attention models keep the batched CPU prefill (its
         // KV mirror re-syncs from the CPU cache, so no seeding gap).
-        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH").map(|v| v != "0").unwrap_or_else(|_| crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed));
+        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH")
+            .map(|v| v != "0")
+            .unwrap_or_else(|_| {
+                crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)
+            });
         if !graph_on || !crate::gpu::enabled_here() {
             return false;
         }
@@ -461,7 +486,9 @@ impl Pipeline {
         use crate::gpu::{AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GraphDims, TokenGraph};
         if !crate::gpu::enabled_here()
             || !crate::gpu::q1_force()
-            || std::env::var("CMF_GPU_BLOCK").map(|v| v == "0").unwrap_or(false)
+            || std::env::var("CMF_GPU_BLOCK")
+                .map(|v| v == "0")
+                .unwrap_or(false)
         {
             return start;
         }
@@ -471,6 +498,7 @@ impl Pipeline {
         // back to the CPU path.
         if self.swa.is_some()
             || self.global_attn.is_some()
+            || self.attention_heads_per_layer.is_some()
             || self.attn_v_norm
             || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
             || self.weights.layers.iter().any(|lw| {
@@ -482,7 +510,10 @@ impl Pipeline {
         {
             return start;
         }
-        let limit = upto.map(|u| u + 1).unwrap_or(self.num_layers).min(self.num_layers);
+        let limit = upto
+            .map(|u| u + 1)
+            .unwrap_or(self.num_layers)
+            .min(self.num_layers);
 
         enum Item<'a> {
             Gdn {
@@ -503,9 +534,15 @@ impl Pipeline {
         }
 
         // Device-attend eligibility shared by every Full layer.
-        let dev_attend = std::env::var("CMF_GPU_ATTEND").map(|v| v != "0").unwrap_or(true)
+        let attend_mode = std::env::var("CMF_GPU_ATTEND").unwrap_or_else(|_| "auto".into());
+        let dev_attend = attend_mode != "0"
+            && attend_mode != "off"
+            // hd=256 is correct on the widened kernel but measured slower
+            // than the CPU sandwich on M4 at decode depths. Keep it as an
+            // explicit research lever without regressing Qwopus by default.
+            && (self.head_dim <= 128 || attend_mode == "force" || attend_mode == "256")
             && self.head_dim % 4 == 0
-            && self.head_dim <= 128
+            && self.head_dim <= 256
             && self.rotary_dim >= 2
             && self.rotary_dim <= self.head_dim
             && (self.rotary_dim / 2) % 32 == 0
@@ -518,9 +555,11 @@ impl Pipeline {
         while scan < limit {
             let lw = &self.weights.layers[scan];
             let FfnKind::Dense(d) = &lw.ffn else { break };
-            let (Some(g), Some(u), Some(dn)) =
-                (d.gate_proj.q1_parts(), d.up_proj.q1_parts(), d.down_proj.q1_parts())
-            else {
+            let (Some(g), Some(u), Some(dn)) = (
+                d.gate_proj.q1_parts(),
+                d.up_proj.q1_parts(),
+                d.down_proj.q1_parts(),
+            ) else {
                 break;
             };
             match &lw.attn {
@@ -532,7 +571,9 @@ impl Pipeline {
                         w.in_proj_b.f32_parts(),
                         w.out_proj.q1_parts(),
                     );
-                    let (Some(qkv), Some(z), Some(a), Some(b), Some(out)) = parts else { break };
+                    let (Some(qkv), Some(z), Some(a), Some(b), Some(out)) = parts else {
+                        break;
+                    };
                     if let QTensor::Mapped { model, .. } = &w.in_proj_qkv {
                         model_ref.get_or_insert_with(|| model.clone());
                     }
@@ -554,14 +595,27 @@ impl Pipeline {
                     };
                     match plan.last_mut() {
                         Some(Item::Gdn { run, .. }) => run.push(gl),
-                        _ => plan.push(Item::Gdn { run: vec![gl], first: scan }),
+                        _ => plan.push(Item::Gdn {
+                            run: vec![gl],
+                            first: scan,
+                        }),
                     }
                 }
-                AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, bias }
-                    if !self.kv_cache.layers[scan].o1_sealed() =>
-                {
+                AttnKind::Full {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                    output_gate,
+                    softplus_gate: None,
+                    bias,
+                } if !self.kv_cache.layers[scan].o1_sealed() => {
                     let parts = (wq.q1_parts(), wk.q1_parts(), wv.q1_parts(), wo.q1_parts());
-                    let (Some(pq), Some(pk), Some(pv), Some(po)) = parts else { break };
+                    let (Some(pq), Some(pk), Some(pv), Some(po)) = parts else {
+                        break;
+                    };
                     if let QTensor::Mapped { model, .. } = wq {
                         model_ref.get_or_insert_with(|| model.clone());
                     }
@@ -609,7 +663,9 @@ impl Pipeline {
             eps: self.rms_eps as f32,
             gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
         };
-        let Some(mut graph) = TokenGraph::new(&model, dims, h) else { return start };
+        let Some(mut graph) = TokenGraph::new(&model, dims, h) else {
+            return start;
+        };
         let gcfg = self.gdn_cfg.map(|cfg| GdnGpuCfg {
             nv: cfg.num_v_heads,
             nk: cfg.num_k_heads,
@@ -691,7 +747,15 @@ impl Pipeline {
                     graph.commit();
                     pending.push((*first, run.len()));
                 }
-                Item::Attn { l, li, q_norm, k_norm, output_gate, bias, full_gpu } => {
+                Item::Attn {
+                    l,
+                    li,
+                    q_norm,
+                    k_norm,
+                    output_gate,
+                    bias,
+                    full_gpu,
+                } => {
                     // ── Fully device-resident attention: no sync at all.
                     if *full_gpu {
                         let cache = &self.kv_cache.layers[*li];
@@ -756,6 +820,8 @@ impl Pipeline {
                         q_norm: *q_norm,
                         k_norm: *k_norm,
                         output_gate: *output_gate,
+                        softplus_gate: None,
+                        rope_scale: 1.0,
                         bias: *bias,
                         rms_eps: eps,
                         norm_style,
@@ -784,7 +850,9 @@ impl Pipeline {
         if self.graph_want_logits
             && upto.is_none()
             && end == self.num_layers
-            && std::env::var("CMF_GPU_LMHEAD").map(|v| v != "0").unwrap_or(true)
+            && std::env::var("CMF_GPU_LMHEAD")
+                .map(|v| v != "0")
+                .unwrap_or(true)
         {
             if let Some(lm) = self.weights.lm_head.q1_parts() {
                 if graph.lm_head_ok(lm) {
@@ -880,12 +948,14 @@ impl Pipeline {
             rope_base,
             norm_style,
             rotary_dim: head_dim,
+            attention_heads_per_layer: None,
             vmf_cfg: None,
             gdn_cfg: None,
             short_conv_cfg: None,
             mtp: None,
             speculative: std::env::var("CMF_MTP").map(|v| v != "0").unwrap_or(true),
             rng,
+            sampler_scratch: SamplerScratch::default(),
             inv_freq,
             ws: ForwardScratch::new(hidden_size),
             pool,
@@ -906,7 +976,11 @@ impl Pipeline {
             embed_multiplier: 1.0,
             attn_scale: 1.0 / (head_dim as f32).sqrt(),
             swa: None,
+            sliding_layers: None,
             inv_freq_local: None,
+            rotary_dim_local: None,
+            rope_scale: 1.0,
+            rope_scale_local: 1.0,
             global_attn: None,
             inv_freq_global: None,
             attn_v_norm: false,
@@ -943,7 +1017,11 @@ impl Pipeline {
             let n = self.o1_flags.iter().filter(|&&f| f).count();
             tracing::info!(
                 "o1 nystrom attention: {n}/{} layer(s), m={} w={} sink={} rect={:?}",
-                self.num_layers, c.m, c.w, c.sink, c.rect
+                self.num_layers,
+                c.m,
+                c.w,
+                c.sink,
+                c.rect
             );
         }
         self.o1_cfg = cfg;
@@ -982,6 +1060,16 @@ impl Pipeline {
     /// Enable/disable the structured per-token telemetry trace (B4).
     pub fn set_trace(&mut self, on: bool) {
         self.trace = on;
+    }
+
+    /// Replace all request-scoped sampler options and reset the random stream.
+    /// This is required for deterministic `seed` semantics in pooled servers.
+    pub fn set_sampler_config(&mut self, config: SamplerConfig) {
+        self.rng = match config.seed {
+            Some(seed) => SplitMix64::new(seed),
+            None => SplitMix64::from_entropy(),
+        };
+        self.sampler_config = config;
     }
 
     /// Toggle the per-token Born-confidence reduction (a full-vocab
@@ -1025,6 +1113,8 @@ impl Pipeline {
             q_norm: None,
             k_norm: None,
             output_gate: false,
+            softplus_gate: None,
+            rope_scale: self.rope_scale,
             bias: None,
             rms_eps: self.rms_eps,
             norm_style: self.norm_style,
@@ -1075,7 +1165,11 @@ impl Pipeline {
         // Nyström insertion is irreversible by design).
         // The wgpu token graph owns a device K/V mirror that speculative
         // rollback would desync — the two are mutually exclusive.
-        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH").map(|v| v != "0").unwrap_or_else(|_| crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed));
+        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH")
+            .map(|v| v != "0")
+            .unwrap_or_else(|_| {
+                crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)
+            });
         let spec_active = self.speculative
             && self.mtp.is_some()
             && task_mask.is_none()
@@ -1091,7 +1185,11 @@ impl Pipeline {
         // Dynamic router detached during decode (same borrow trick as MTP).
         // Speculative decode and dynamic routing are mutually exclusive
         // for now — the fused-pair path doesn't carry per-token φ.
-        let mut router = if mtp.is_none() { self.dyn_router.take() } else { None };
+        let mut router = if mtp.is_none() {
+            self.dyn_router.take()
+        } else {
+            None
+        };
         if let Some(r) = &mut router {
             r.reset(); // active=backbone, matching a fresh overlay
             self.dyn_phi_seen = 0; // fresh φ EMA per generation
@@ -1190,8 +1288,17 @@ impl Pipeline {
         // token-graph submit and lm_head both unchanged — so this only trades
         // prefill wall.)
         let _tpf = std::time::Instant::now();
-        let batch_k = std::env::var("CMF_BATCH_K").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
-        if batch_k > 0 && graph_prefill && task_mask.is_none() && mtp.is_none() && !dyn_prefill && pos + 1 < input_ids.len() {
+        let batch_k = std::env::var("CMF_BATCH_K")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        if batch_k > 0
+            && graph_prefill
+            && task_mask.is_none()
+            && mtp.is_none()
+            && !dyn_prefill
+            && pos + 1 < input_ids.len()
+        {
             let hs = self.hidden_size;
             let chunk = batch_k;
             while pos < input_ids.len() {
@@ -1221,7 +1328,11 @@ impl Pipeline {
             pos += 1;
         }
         if std::env::var("CMF_PREFILL_PROF").is_ok() {
-            eprintln!("prefill: {} tokens in {:.1} ms (batch_k={batch_k})", input_ids.len(), _tpf.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "prefill: {} tokens in {:.1} ms (batch_k={batch_k})",
+                input_ids.len(),
+                _tpf.elapsed().as_secs_f64() * 1000.0
+            );
         }
         // Prompt absorbed → freeze the o1 layers' skeletons; from here
         // every decode step on those layers is O(W + m·dv + m²).
@@ -1265,7 +1376,13 @@ impl Pipeline {
                     self.lm_head_forward(&self.ws.n1)
                 }
             };
-            let t_next = sampler::sample(&logits, &self.sampler_config, &all_ids, &mut self.rng);
+            let t_next = sampler::sample_with_scratch(
+                &logits,
+                &self.sampler_config,
+                &all_ids,
+                &mut self.rng,
+                &mut self.sampler_scratch,
+            );
             if self.confidence_on {
                 confidence.push(top1_prob_t(&logits, t_next, calib_temp));
             }
@@ -1313,8 +1430,13 @@ impl Pipeline {
                         &mut self.ws.n1,
                     );
                     let mut logits1 = self.lm_head_forward(&self.ws.n1);
-                    let t_after =
-                        sampler::sample(&logits1, &self.sampler_config, &all_ids, &mut self.rng);
+                    let t_after = sampler::sample_with_scratch(
+                        &logits1,
+                        &self.sampler_config,
+                        &all_ids,
+                        &mut self.rng,
+                        &mut self.sampler_scratch,
+                    );
                     if self.confidence_on {
                         confidence.push(top1_prob_t(&logits1, t_after, calib_temp));
                     }
@@ -1346,8 +1468,11 @@ impl Pipeline {
                         }
                         if !stop {
                             let _ = self.mtp_step(m, &h1, t_after, next_pos);
-                            hidden = self
-                                .forward_layers(&self.embed_single(t_after), next_pos + 1, None);
+                            hidden = self.forward_layers(
+                                &self.embed_single(t_after),
+                                next_pos + 1,
+                                None,
+                            );
                         }
                         next_pos += 2;
                     }
@@ -1410,7 +1535,13 @@ impl Pipeline {
     /// One MTP step: feed `(hidden_p, token_{p+1})` into the draft head,
     /// advance its KV cache at position `p`, return the drafted token
     /// for position `p+2`.
-    fn mtp_step(&mut self, m: &mut MtpModule, hidden: &[f32], next_token: u32, position: usize) -> u32 {
+    fn mtp_step(
+        &mut self,
+        m: &mut MtpModule,
+        hidden: &[f32],
+        next_token: u32,
+        position: usize,
+    ) -> u32 {
         // fc concat order is [enorm(embed); hnorm(hidden)] — EMBEDDING
         // FIRST. Verified by the oracle (converter/mtp_oracle.py):
         // [emb;hid] → 45.8% acceptance, [hid;emb] → 0.00%.
@@ -1424,7 +1555,13 @@ impl Pipeline {
 
         // One standard transformer block over the MTP's own cache.
         let lw = &m.layer;
-        inference::rms_norm_into(&x, &lw.input_norm, self.rms_eps, self.norm_style, &mut self.ws.n1);
+        inference::rms_norm_into(
+            &x,
+            &lw.input_norm,
+            self.rms_eps,
+            self.norm_style,
+            &mut self.ws.n1,
+        );
         let attn = match &lw.attn {
             AttnKind::Full {
                 wq,
@@ -1434,12 +1571,16 @@ impl Pipeline {
                 q_norm,
                 k_norm,
                 output_gate,
+                softplus_gate,
                 bias,
             } => {
                 let mut cfg = self.attn_cfg(position);
                 cfg.q_norm = q_norm.as_deref();
                 cfg.k_norm = k_norm.as_deref();
                 cfg.output_gate = *output_gate;
+                cfg.softplus_gate = softplus_gate
+                    .as_ref()
+                    .map(|(gate, per_head)| (gate, *per_head));
                 cfg.bias = bias
                     .as_ref()
                     .map(|(q, k, v)| (q.as_slice(), k.as_slice(), v.as_slice()));
@@ -1452,13 +1593,25 @@ impl Pipeline {
         for (i, &a) in attn.iter().enumerate() {
             x[i] += a;
         }
-        inference::rms_norm_into(&x, &lw.post_norm, self.rms_eps, self.norm_style, &mut self.ws.p1);
+        inference::rms_norm_into(
+            &x,
+            &lw.post_norm,
+            self.rms_eps,
+            self.norm_style,
+            &mut self.ws.p1,
+        );
         let ffn = ffn_forward(&lw.ffn, &self.ws.p1, self.pool.as_deref());
         for (i, &f) in ffn.iter().enumerate() {
             x[i] += f;
         }
 
-        inference::rms_norm_into(&x, &m.final_norm, self.rms_eps, self.norm_style, &mut self.ws.n1);
+        inference::rms_norm_into(
+            &x,
+            &m.final_norm,
+            self.rms_eps,
+            self.norm_style,
+            &mut self.ws.n1,
+        );
         let mut lg = self.lm_head_forward(&self.ws.n1);
         let draft = sampler::argmax(&lg);
         attention::recycle_buf(&mut lg);
@@ -1498,11 +1651,15 @@ impl Pipeline {
     /// once per layer for both positions. Full layers → fused GQA pair;
     /// linear layers → vmf_phase pair (lane 2 state is tentative in the
     /// per-layer scratch until the draft is accepted).
-    fn forward_pair(&mut self, emb1: &[f32], emb2: &[f32], position: usize) -> (Vec<f32>, Vec<f32>) {
+    fn forward_pair(
+        &mut self,
+        emb1: &[f32],
+        emb2: &[f32],
+        position: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
         let mut h1 = emb1.to_vec();
         let mut h2 = emb2.to_vec();
-        let (nh, _nkv, _hd, hs, _rd, eps) = (
-            self.num_heads,
+        let (_nkv, _hd, hs, _rd, eps) = (
             self.num_kv_heads,
             self.head_dim,
             self.hidden_size,
@@ -1515,28 +1672,64 @@ impl Pipeline {
             let lw = &self.weights.layers[li];
             // Norms into pipeline scratch (4 allocs/layer on the MTP
             // decode hot path before this).
-            inference::rms_norm_into(&h1, &lw.input_norm, self.rms_eps, self.norm_style, &mut self.ws.n1);
-            inference::rms_norm_into(&h2, &lw.input_norm, self.rms_eps, self.norm_style, &mut self.ws.n2);
+            inference::rms_norm_into(
+                &h1,
+                &lw.input_norm,
+                self.rms_eps,
+                self.norm_style,
+                &mut self.ws.n1,
+            );
+            inference::rms_norm_into(
+                &h2,
+                &lw.input_norm,
+                self.rms_eps,
+                self.norm_style,
+                &mut self.ws.n2,
+            );
 
             let (a1, a2) = match &lw.attn {
                 AttnKind::Linear(w) => {
                     let cfg = self.vmf_cfg.expect("linear layer without vmf_cfg");
                     let layer = &mut self.kv_cache.layers[li];
                     let (state, scratch) = (&mut layer.linear_state, &mut layer.linear_scratch);
-                    vmf_phase_pair(&self.ws.n1, &self.ws.n2, w, &cfg, state, scratch, self.pool.as_deref())
+                    vmf_phase_pair(
+                        &self.ws.n1,
+                        &self.ws.n2,
+                        w,
+                        &cfg,
+                        state,
+                        scratch,
+                        self.pool.as_deref(),
+                    )
                 }
                 AttnKind::LinearGdn(w) => {
                     let cfg = self.gdn_cfg.expect("gdn layer without gdn_cfg");
                     let layer = &mut self.kv_cache.layers[li];
                     let (state, scratch) = (&mut layer.linear_state, &mut layer.linear_scratch);
-                    gdn_pair(&self.ws.n1, &self.ws.n2, w, &cfg, state, scratch, self.pool.as_deref())
+                    gdn_pair(
+                        &self.ws.n1,
+                        &self.ws.n2,
+                        w,
+                        &cfg,
+                        state,
+                        scratch,
+                        self.pool.as_deref(),
+                    )
                 }
                 AttnKind::ShortConv(w) => {
-                    let cfg = self.short_conv_cfg.expect("short-conv layer without short_conv_cfg");
+                    let cfg = self
+                        .short_conv_cfg
+                        .expect("short-conv layer without short_conv_cfg");
                     let layer = &mut self.kv_cache.layers[li];
                     let (state, scratch) = (&mut layer.linear_state, &mut layer.linear_scratch);
                     short_conv_pair(
-                        &self.ws.n1, &self.ws.n2, w, &cfg, state, scratch, self.pool.as_deref(),
+                        &self.ws.n1,
+                        &self.ws.n2,
+                        w,
+                        &cfg,
+                        state,
+                        scratch,
+                        self.pool.as_deref(),
                     )
                 }
                 AttnKind::Full {
@@ -1547,12 +1740,13 @@ impl Pipeline {
                     q_norm,
                     k_norm,
                     output_gate,
+                    softplus_gate,
                     bias,
                 } => {
                     let inv_freq_l = self.layer_inv_freq(li);
                     let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
                     let cfg = QwenAttnCfg {
-                        num_heads: nh,
+                        num_heads: self.layer_num_heads(li),
                         num_kv_heads: nkv_l,
                         head_dim: hd_l,
                         hidden_size: hs,
@@ -1565,6 +1759,10 @@ impl Pipeline {
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
+                        softplus_gate: softplus_gate
+                            .as_ref()
+                            .map(|(gate, per_head)| (gate, *per_head)),
+                        rope_scale: self.layer_rope_scale(li),
                         bias: bias
                             .as_ref()
                             .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
@@ -1600,8 +1798,20 @@ impl Pipeline {
             attention::recycle_buf(&mut a2);
 
             let lw = &self.weights.layers[li];
-            inference::rms_norm_into(&h1, &lw.post_norm, self.rms_eps, self.norm_style, &mut self.ws.p1);
-            inference::rms_norm_into(&h2, &lw.post_norm, self.rms_eps, self.norm_style, &mut self.ws.p2);
+            inference::rms_norm_into(
+                &h1,
+                &lw.post_norm,
+                self.rms_eps,
+                self.norm_style,
+                &mut self.ws.p1,
+            );
+            inference::rms_norm_into(
+                &h2,
+                &lw.post_norm,
+                self.rms_eps,
+                self.norm_style,
+                &mut self.ws.p2,
+            );
             let (f1, f2) =
                 ffn_forward_pair(&lw.ffn, &self.ws.p1, &self.ws.p2, self.pool.as_deref());
             let (f1, f2) = match &self.weights.layers[li].ffn_out_norm {
@@ -1710,8 +1920,7 @@ impl Pipeline {
     pub fn probe_ffn_mass(&mut self, ids: &[u32]) -> Vec<Vec<f64>> {
         self.kv_cache.clear();
         FFN_PROBE.with(|p| {
-            *p.borrow_mut() =
-                Some(vec![vec![0f64; self.intermediate_size]; self.num_layers]);
+            *p.borrow_mut() = Some(vec![vec![0f64; self.intermediate_size]; self.num_layers]);
         });
         crate::gpu::cpu_scope(|| {
             for (pos, &id) in ids.iter().enumerate() {
@@ -1720,7 +1929,9 @@ impl Pipeline {
             }
         });
         self.kv_cache.clear();
-        FFN_PROBE.with(|p| p.borrow_mut().take()).unwrap_or_default()
+        FFN_PROBE
+            .with(|p| p.borrow_mut().take())
+            .unwrap_or_default()
     }
 
     /// Teacher-forced PPL with a task mask active (sparse execution) —
@@ -1844,7 +2055,11 @@ impl Pipeline {
             let logits = self.lm_head_forward(&normed);
             let target = ids[pos + 1] as usize;
             let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
-            let lse: f64 = logits.iter().map(|&v| ((v - max) as f64).exp()).sum::<f64>().ln()
+            let lse: f64 = logits
+                .iter()
+                .map(|&v| ((v - max) as f64).exp())
+                .sum::<f64>()
+                .ln()
                 + max as f64;
             nll += lse - logits[target] as f64;
             cnt += 1;
@@ -1903,7 +2118,11 @@ impl Pipeline {
             let logits = self.lm_head_forward(&normed);
             let target = ids[pos + 1] as usize;
             let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
-            let lse: f64 = logits.iter().map(|&v| ((v - max) as f64).exp()).sum::<f64>().ln()
+            let lse: f64 = logits
+                .iter()
+                .map(|&v| ((v - max) as f64).exp())
+                .sum::<f64>()
+                .ln()
                 + max as f64;
             nll += lse - logits[target] as f64;
             cnt += 1;
@@ -1986,7 +2205,11 @@ impl Pipeline {
             let logits = self.lm_head_forward(&normed);
             let target = ids[pos + 1] as usize;
             let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
-            let lse: f64 = logits.iter().map(|&v| ((v - max) as f64).exp()).sum::<f64>().ln()
+            let lse: f64 = logits
+                .iter()
+                .map(|&v| ((v - max) as f64).exp())
+                .sum::<f64>()
+                .ln()
                 + max as f64;
             nll += lse - logits[target] as f64;
             cnt += 1;
@@ -2033,14 +2256,13 @@ impl Pipeline {
         // from layer 0 it gathers the embeddings on the device instead.
         let mut h: Vec<f32> = vec![0.0; b * hs];
         let mut h_ready = false;
-        let mut fill_h = |h: &mut Vec<f32>, me: &Self| {
+        let fill_h = |h: &mut Vec<f32>, me: &Self| {
             for (bi, &id) in ids.iter().enumerate() {
                 let e = me.embed_single(id);
                 h[bi * hs..(bi + 1) * hs].copy_from_slice(&e);
             }
         };
-        let (nh, _nkv, _hd, _rd, eps) = (
-            self.num_heads,
+        let (_nkv, _hd, _rd, eps) = (
             self.num_kv_heads,
             self.head_dim,
             self.rotary_dim,
@@ -2084,11 +2306,18 @@ impl Pipeline {
                     let mut normed = vec![0.0f32; b * hs];
                     for bi in 0..b {
                         let r = inference::rms_norm(
-                            &h[bi * hs..(bi + 1) * hs], &lw.input_norm, eps, norm_style);
+                            &h[bi * hs..(bi + 1) * hs],
+                            &lw.input_norm,
+                            eps,
+                            norm_style,
+                        );
                         normed[bi * hs..(bi + 1) * hs].copy_from_slice(&r);
                     }
                     let attn = crate::linear_core::gdn_forward_batch(
-                        &normed, b, w, &cfg,
+                        &normed,
+                        b,
+                        w,
+                        &cfg,
                         &mut self.kv_cache.layers[li].linear_state,
                         pool.as_deref(),
                     );
@@ -2099,8 +2328,9 @@ impl Pipeline {
                 AttnKind::ShortConv(w) => {
                     // Projections batched over the chunk; the conv walks the
                     // contiguous positions in order (same ring as decode).
-                    let cfg =
-                        self.short_conv_cfg.expect("short-conv layer without short_conv_cfg");
+                    let cfg = self
+                        .short_conv_cfg
+                        .expect("short-conv layer without short_conv_cfg");
                     let mut normed = vec![0.0f32; b * hs];
                     for bi in 0..b {
                         inference::rms_norm_into(
@@ -2112,7 +2342,10 @@ impl Pipeline {
                         );
                     }
                     let attn = short_conv_forward_batch(
-                        &normed, b, w, &cfg,
+                        &normed,
+                        b,
+                        w,
+                        &cfg,
                         &mut self.kv_cache.layers[li].linear_state,
                         pool.as_deref(),
                     );
@@ -2121,7 +2354,15 @@ impl Pipeline {
                     }
                 }
                 AttnKind::Full {
-                    wq, wk, wv, wo, q_norm, k_norm, output_gate, bias,
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                    output_gate,
+                    softplus_gate,
+                    bias,
                 } => {
                     // Chunk-GEMM QKV/O; per-position causal attention
                     // inside (roadmap §3 P0 — full-attention prefill no
@@ -2139,7 +2380,7 @@ impl Pipeline {
                     let inv_freq_l = self.layer_inv_freq(li);
                     let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
                     let cfg = QwenAttnCfg {
-                        num_heads: nh,
+                        num_heads: self.layer_num_heads(li),
                         num_kv_heads: nkv_l,
                         head_dim: hd_l,
                         hidden_size: hs,
@@ -2152,21 +2393,36 @@ impl Pipeline {
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
-                        bias: bias.as_ref().map(|(a, b, c)| {
-                            (a.as_slice(), b.as_slice(), c.as_slice())
-                        }),
+                        softplus_gate: softplus_gate
+                            .as_ref()
+                            .map(|(gate, per_head)| (gate, *per_head)),
+                        rope_scale: self.layer_rope_scale(li),
+                        bias: bias
+                            .as_ref()
+                            .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
                         rms_eps: eps,
                         norm_style,
                         pool: pool.as_deref(),
                     };
                     let mut attn = attention::qwen_attention_batch(
-                        &normed, b, wq, wk, wv, wo,
-                        &mut self.kv_cache.layers[li], &cfg);
+                        &normed,
+                        b,
+                        wq,
+                        wk,
+                        wv,
+                        wo,
+                        &mut self.kv_cache.layers[li],
+                        &cfg,
+                    );
                     if let Some(w) = &lw.attn_out_norm {
                         for bi in 0..b {
                             inference::rms_norm_into(
-                                &attn[bi * hs..(bi + 1) * hs], w, eps, norm_style,
-                                &mut normed[bi * hs..(bi + 1) * hs]);
+                                &attn[bi * hs..(bi + 1) * hs],
+                                w,
+                                eps,
+                                norm_style,
+                                &mut normed[bi * hs..(bi + 1) * hs],
+                            );
                         }
                         attn.copy_from_slice(&normed);
                     }
@@ -2177,9 +2433,14 @@ impl Pipeline {
                 AttnKind::Linear(w) => {
                     for bi in 0..b {
                         let normed = inference::rms_norm(
-                            &h[bi * hs..(bi + 1) * hs], &lw.input_norm, eps, norm_style);
+                            &h[bi * hs..(bi + 1) * hs],
+                            &lw.input_norm,
+                            eps,
+                            norm_style,
+                        );
                         vmf_phase_forward(
-                            &normed, w,
+                            &normed,
+                            w,
                             &self.vmf_cfg.expect("linear layer without vmf_cfg"),
                             &mut self.kv_cache.layers[li].linear_state,
                             pool.as_deref(),
@@ -2195,8 +2456,8 @@ impl Pipeline {
             let lw = &self.weights.layers[li];
             let mut post = vec![0.0f32; b * hs];
             for bi in 0..b {
-                let r = inference::rms_norm(
-                    &h[bi * hs..(bi + 1) * hs], &lw.post_norm, eps, norm_style);
+                let r =
+                    inference::rms_norm(&h[bi * hs..(bi + 1) * hs], &lw.post_norm, eps, norm_style);
                 post[bi * hs..(bi + 1) * hs].copy_from_slice(&r);
             }
             let mut ffn = match &lw.ffn {
@@ -2206,8 +2467,12 @@ impl Pipeline {
             if let Some(w) = &lw.ffn_out_norm {
                 for bi in 0..b {
                     inference::rms_norm_into(
-                        &ffn[bi * hs..(bi + 1) * hs], w, eps, norm_style,
-                        &mut post[bi * hs..(bi + 1) * hs]);
+                        &ffn[bi * hs..(bi + 1) * hs],
+                        w,
+                        eps,
+                        norm_style,
+                        &mut post[bi * hs..(bi + 1) * hs],
+                    );
                 }
                 ffn.copy_from_slice(&post);
             }
@@ -2222,7 +2487,10 @@ impl Pipeline {
             if std::env::var("CMF_TRACE_H").is_ok() {
                 let n = h[..hs].iter().map(|v| v.abs()).sum::<f32>() / hs as f32;
                 let mx = h[..hs].iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-                eprintln!("layer {li}: mean|h|={n:.4} max|h|={mx:.2} scale={:?}", lw.layer_scale);
+                eprintln!(
+                    "layer {li}: mean|h|={n:.4} max|h|={mx:.2} scale={:?}",
+                    lw.layer_scale
+                );
             }
         }
         crate::gpu::set_layer(-1); // lm_head/final ops outside layer-split
@@ -2261,7 +2529,9 @@ impl Pipeline {
         // GEMM attention scales like the CPU path and lifted it.)
         // CMF_GPU_CHUNK=0 disables the graph.
         if !crate::gpu::enabled_here()
-            || std::env::var("CMF_GPU_CHUNK").map(|v| v == "0").unwrap_or(false)
+            || std::env::var("CMF_GPU_CHUNK")
+                .map(|v| v == "0")
+                .unwrap_or(false)
             || b < 32
             || self.swa.is_some()
             || self.global_attn.is_some()
@@ -2270,20 +2540,35 @@ impl Pipeline {
         {
             return li0;
         }
-        let Some(model) = self.model.clone() else { return li0 };
+        let Some(model) = self.model.clone() else {
+            return li0;
+        };
         let inv_freq = self.inv_freq.clone();
-        let (nh, nkv, hd, hs) = (self.num_heads, self.num_kv_heads, self.head_dim, self.hidden_size);
+        let (nh, nkv, hd, hs) = (
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.hidden_size,
+        );
         // Collect the longest run of consecutive eligible layers.
         let mut layers: Vec<crate::gpu_metal::ChunkLayer> = Vec::new();
         let mut stored_at: Vec<usize> = Vec::new();
         for li in li0..self.num_layers {
             let lw = &self.weights.layers[li];
-            if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some()
-            {
+            if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
                 break;
             }
-            let AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate: false, bias } =
-                &lw.attn
+            let AttnKind::Full {
+                wq,
+                wk,
+                wv,
+                wo,
+                q_norm,
+                k_norm,
+                output_gate: false,
+                softplus_gate: None,
+                bias,
+            } = &lw.attn
             else {
                 break;
             };
@@ -2364,15 +2649,16 @@ impl Pipeline {
         // Device-side embedding when the run starts the model and the
         // embedding matrix is q8_row-mapped.
         let ep = embed_ids.and_then(|ids| {
-            self.weights.embed_tokens.q8_row_parts().map(|(idx, rows, _c, rs)| {
-                crate::gpu_metal::ChunkEmbed {
+            self.weights
+                .embed_tokens
+                .q8_row_parts()
+                .map(|(idx, rows, _c, rs)| crate::gpu_metal::ChunkEmbed {
                     idx,
                     rows,
                     row_scale: rs,
                     ids,
                     mult: self.embed_multiplier,
-                }
-            })
+                })
         });
         if embed_ids.is_some() && ep.is_none() {
             return li0;
@@ -2388,7 +2674,11 @@ impl Pipeline {
             let li = li0 + i;
             let layer = &mut self.kv_cache.layers[li];
             for bi in 0..b {
-                layer.append(&ok[bi * row..(bi + 1) * row], &ov[bi * row..(bi + 1) * row], &[]);
+                layer.append(
+                    &ok[bi * row..(bi + 1) * row],
+                    &ov[bi * row..(bi + 1) * row],
+                    &[],
+                );
             }
             layer.accumulate_imp(oi);
         }
@@ -2398,6 +2688,9 @@ impl Pipeline {
     /// Is layer `li` a sliding-window (local-RoPE) layer? Gemma-3:
     /// every `pattern`-th layer is global, the rest are local.
     fn layer_is_local(&self, li: usize) -> bool {
+        if let Some(layers) = &self.sliding_layers {
+            return layers.get(li).copied().unwrap_or(false);
+        }
         match self.swa {
             Some((_, pattern)) => (li + 1) % pattern.max(1) != 0,
             None => false,
@@ -2419,9 +2712,22 @@ impl Pipeline {
 
     /// The attend window for layer `li` (None = full context).
     fn layer_window(&self, li: usize) -> Option<usize> {
-        match self.swa {
-            Some((w, _)) if self.layer_is_local(li) => Some(w),
-            _ => None,
+        self.swa
+            .and_then(|(w, _)| self.layer_is_local(li).then_some(w))
+    }
+
+    fn layer_num_heads(&self, li: usize) -> usize {
+        self.attention_heads_per_layer
+            .as_ref()
+            .and_then(|v| v.get(li).copied())
+            .unwrap_or(self.num_heads)
+    }
+
+    fn layer_rope_scale(&self, li: usize) -> f32 {
+        if self.layer_is_local(li) {
+            self.rope_scale_local
+        } else {
+            self.rope_scale
         }
     }
 
@@ -2433,7 +2739,15 @@ impl Pipeline {
                 return (gkv, ghd, ghd);
             }
         }
-        (self.num_kv_heads, self.head_dim, self.rotary_dim)
+        (
+            self.num_kv_heads,
+            self.head_dim,
+            if self.layer_is_local(li) {
+                self.rotary_dim_local.unwrap_or(self.rotary_dim)
+            } else {
+                self.rotary_dim
+            },
+        )
     }
 
     /// Forward one position through all layers (hybrid dispatch).
@@ -2449,7 +2763,12 @@ impl Pipeline {
     /// Build the whole-token wgpu graph for a pure-attention q1 model (every
     /// layer Full q1 + dense q1 FFN, no gate/bias). Returns the post-stack
     /// hidden (caller does final norm + lm_head), or None to fall back.
-    fn try_token_graph_wgpu(&self, hidden: &[f32], position: usize, logits_out: &mut Vec<f32>) -> Option<Vec<f32>> {
+    fn try_token_graph_wgpu(
+        &self,
+        hidden: &[f32],
+        position: usize,
+        logits_out: &mut Vec<f32>,
+    ) -> Option<Vec<f32>> {
         // O(1) Nyström decode runs off the sealed state, not the KV cache the
         // graph mirrors — never take the graph while o1 is active.
         if self.o1_active() {
@@ -2463,21 +2782,36 @@ impl Pipeline {
         let dbg = std::env::var("CMF_GRAPH_DEBUG").is_ok();
         fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
             if let Some((_, i, kind, rs)) = t.graph_weight() {
-                return Some(crate::gpu::GraphW { idx: i, kind, row_scale: rs, data: &[] });
+                return Some(crate::gpu::GraphW {
+                    idx: i,
+                    kind,
+                    row_scale: rs,
+                    data: &[],
+                });
             }
             // Small unquantized projections (GDN in_proj_a/b) stay f32.
-            t.as_f32().map(|d| crate::gpu::GraphW { idx: 0, kind: 4, row_scale: &[], data: d })
+            t.as_f32().map(|d| crate::gpu::GraphW {
+                idx: 0,
+                kind: 4,
+                row_scale: &[],
+                data: d,
+            })
         }
         for li in 0..self.num_layers {
             let lw = &self.weights.layers[li];
             if dbg {
                 let ak = match &lw.attn {
-                    AttnKind::Full { output_gate, bias, .. } => format!("Full gate={output_gate} bias={}", bias.is_some()),
+                    AttnKind::Full {
+                        output_gate, bias, ..
+                    } => format!("Full gate={output_gate} bias={}", bias.is_some()),
                     AttnKind::LinearGdn(_) => "LinearGdn".into(),
                     AttnKind::Linear(_) => "Linear".into(),
                     AttnKind::ShortConv(_) => "ShortConv".into(),
                 };
-                let fk = match &lw.ffn { FfnKind::Dense(_) => "Dense", FfnKind::Moe(_) => "Moe" };
+                let fk = match &lw.ffn {
+                    FfnKind::Dense(_) => "Dense",
+                    FfnKind::Moe(_) => "Moe",
+                };
                 eprintln!("graph L{li}: attn={ak} ffn={fk}");
             }
             let (gate, up, down) = match &lw.ffn {
@@ -2485,7 +2819,20 @@ impl Pipeline {
                 _ => return None,
             };
             let attn = match &lw.attn {
-                AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, bias } => {
+                AttnKind::Full {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                    output_gate,
+                    softplus_gate,
+                    bias,
+                } => {
+                    if softplus_gate.is_some() || self.attention_heads_per_layer.is_some() {
+                        return None;
+                    }
                     let (m, _, _, _) = wq.graph_weight()?;
                     model = Some(m.clone());
                     crate::gpu::GraphAttn::Full {
@@ -2495,7 +2842,9 @@ impl Pipeline {
                         wo: gw(wo)?,
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
-                        bias: bias.as_ref().map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
+                        bias: bias
+                            .as_ref()
+                            .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
                         output_gate: *output_gate,
                         cpu_k: self.kv_cache.layers[li].k_heads(),
                         cpu_v: self.kv_cache.layers[li].v_heads(),
@@ -2540,10 +2889,20 @@ impl Pipeline {
         // the separate CPU/GPU lm_head op + its sync. Never the f32 fallback:
         // an unquantized lm_head is vocab·hidden and must not be uploaded.
         let lm_gw = if self.graph_want_logits
-            && std::env::var("CMF_GPU_LMHEAD").map(|v| v != "0").unwrap_or(true)
+            && std::env::var("CMF_GPU_LMHEAD")
+                .map(|v| v != "0")
+                .unwrap_or(true)
         {
             self.weights.lm_head.graph_weight().map(|(_, i, kind, rs)| {
-                (crate::gpu::GraphW { idx: i, kind, row_scale: rs, data: &[] }, self.weights.lm_head.rows())
+                (
+                    crate::gpu::GraphW {
+                        idx: i,
+                        kind,
+                        row_scale: rs,
+                        data: &[],
+                    },
+                    self.weights.lm_head.rows(),
+                )
             })
         } else {
             None
@@ -2586,11 +2945,24 @@ impl Pipeline {
         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
         fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
             if let Some((_, i, kind, rs)) = t.graph_weight() {
-                return Some(crate::gpu::GraphW { idx: i, kind, row_scale: rs, data: &[] });
+                return Some(crate::gpu::GraphW {
+                    idx: i,
+                    kind,
+                    row_scale: rs,
+                    data: &[],
+                });
             }
-            t.as_f32().map(|d| crate::gpu::GraphW { idx: 0, kind: 4, row_scale: &[], data: d })
+            t.as_f32().map(|d| crate::gpu::GraphW {
+                idx: 0,
+                kind: 4,
+                row_scale: &[],
+                data: d,
+            })
         }
-        let built: Option<(Vec<crate::gpu::GraphLayer<'_>>, std::sync::Arc<cortiq_core::CmfModel>)> = (|| {
+        let built: Option<(
+            Vec<crate::gpu::GraphLayer<'_>>,
+            std::sync::Arc<cortiq_core::CmfModel>,
+        )> = (|| {
             let mut layers = Vec::with_capacity(self.num_layers);
             let mut model = None;
             for li in 0..self.num_layers {
@@ -2600,13 +2972,32 @@ impl Pipeline {
                     _ => return None,
                 };
                 let attn = match &lw.attn {
-                    AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, bias } => {
+                    AttnKind::Full {
+                        wq,
+                        wk,
+                        wv,
+                        wo,
+                        q_norm,
+                        k_norm,
+                        output_gate,
+                        softplus_gate,
+                        bias,
+                    } => {
+                        if softplus_gate.is_some() || self.attention_heads_per_layer.is_some() {
+                            return None;
+                        }
                         let (m, _, _, _) = wq.graph_weight()?;
                         model = Some(m.clone());
                         crate::gpu::GraphAttn::Full {
-                            wq: gw(wq)?, wk: gw(wk)?, wv: gw(wv)?, wo: gw(wo)?,
-                            q_norm: q_norm.as_deref(), k_norm: k_norm.as_deref(),
-                            bias: bias.as_ref().map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
+                            wq: gw(wq)?,
+                            wk: gw(wk)?,
+                            wv: gw(wv)?,
+                            wo: gw(wo)?,
+                            q_norm: q_norm.as_deref(),
+                            k_norm: k_norm.as_deref(),
+                            bias: bias
+                                .as_ref()
+                                .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
                             output_gate: *output_gate,
                             cpu_k: self.kv_cache.layers[li].k_heads(),
                             cpu_v: self.kv_cache.layers[li].v_heads(),
@@ -2617,22 +3008,55 @@ impl Pipeline {
                         let (m, _, _, _) = w.in_proj_qkv.graph_weight()?;
                         model = Some(m.clone());
                         crate::gpu::GraphAttn::Gdn {
-                            qkv: gw(&w.in_proj_qkv)?, z: gw(&w.in_proj_z)?, a: gw(&w.in_proj_a)?, b: gw(&w.in_proj_b)?, out: gw(&w.out_proj)?,
-                            conv1d: &w.conv1d, a_log: &w.a_log, dt_bias: &w.dt_bias, norm: &w.norm,
-                            nv: cfg.num_v_heads, nk: cfg.num_k_heads, dk: cfg.key_head_dim, dv: cfg.value_head_dim, kk: cfg.conv_kernel,
+                            qkv: gw(&w.in_proj_qkv)?,
+                            z: gw(&w.in_proj_z)?,
+                            a: gw(&w.in_proj_a)?,
+                            b: gw(&w.in_proj_b)?,
+                            out: gw(&w.out_proj)?,
+                            conv1d: &w.conv1d,
+                            a_log: &w.a_log,
+                            dt_bias: &w.dt_bias,
+                            norm: &w.norm,
+                            nv: cfg.num_v_heads,
+                            nk: cfg.num_k_heads,
+                            dk: cfg.key_head_dim,
+                            dv: cfg.value_head_dim,
+                            kk: cfg.conv_kernel,
                         }
                     }
                     _ => return None,
                 };
-                layers.push(crate::gpu::GraphLayer { input_norm: &lw.input_norm, attn, post_norm: &lw.post_norm, gate: gw(gate)?, up: gw(up)?, down: gw(down)? });
+                layers.push(crate::gpu::GraphLayer {
+                    input_norm: &lw.input_norm,
+                    attn,
+                    post_norm: &lw.post_norm,
+                    gate: gw(gate)?,
+                    up: gw(up)?,
+                    down: gw(down)?,
+                });
             }
             Some((layers, model?))
         })();
-        let Some((layers, model)) = built else { return false };
+        let Some((layers, model)) = built else {
+            return false;
+        };
         crate::gpu::forward_batch_graph(
-            &model, self.graph_kv_id, &layers, &self.inv_freq, hiddens,
-            nh, nkv, hd, rd, self.hidden_size, self.intermediate_size,
-            positions, self.kv_cache.max_seq_len, gemma, self.rms_eps as f32, k,
+            &model,
+            self.graph_kv_id,
+            &layers,
+            &self.inv_freq,
+            hiddens,
+            nh,
+            nkv,
+            hd,
+            rd,
+            self.hidden_size,
+            self.intermediate_size,
+            positions,
+            self.kv_cache.max_seq_len,
+            gemma,
+            self.rms_eps as f32,
+            k,
         )
     }
 
@@ -2658,7 +3082,11 @@ impl Pipeline {
         let pool = self.pool.clone();
         // Opt-in wgpu token-graph attention (discrete Vulkan/DX12): the whole
         // attention sub-block runs resident in one submit. Off by default.
-        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH").map(|v| v != "0").unwrap_or_else(|_| crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed));
+        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH")
+            .map(|v| v != "0")
+            .unwrap_or_else(|_| {
+                crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)
+            });
         // Whole-token graph: the ENTIRE layer stack in one submit (one readback
         // per token). Preferred over the per-layer drop-in when every layer is
         // pure-attention q1 with a dense q1 FFN.
@@ -2714,7 +3142,13 @@ impl Pipeline {
             let lw = &self.weights.layers[li];
             // Norm into the pipeline scratch — the returning rms_norm
             // allocated twice per layer per token (roadmap §3 P0).
-            inference::rms_norm_into(&h, &lw.input_norm, self.rms_eps, self.norm_style, &mut self.ws.n1);
+            inference::rms_norm_into(
+                &h,
+                &lw.input_norm,
+                self.rms_eps,
+                self.norm_style,
+                &mut self.ws.n1,
+            );
 
             let attn_out = match &lw.attn {
                 AttnKind::Linear(w) => {
@@ -2738,8 +3172,9 @@ impl Pipeline {
                     )
                 }
                 AttnKind::ShortConv(w) => {
-                    let cfg =
-                        self.short_conv_cfg.expect("short-conv layer without short_conv_cfg");
+                    let cfg = self
+                        .short_conv_cfg
+                        .expect("short-conv layer without short_conv_cfg");
                     short_conv_forward(
                         &self.ws.n1,
                         w,
@@ -2756,6 +3191,7 @@ impl Pipeline {
                     q_norm,
                     k_norm,
                     output_gate,
+                    softplus_gate,
                     bias,
                 } if self.kv_cache.layers[li].o1_sealed() => {
                     // O(1) override: decode on the sealed Nyström state
@@ -2763,7 +3199,7 @@ impl Pipeline {
                     let inv_freq_l = self.layer_inv_freq(li);
                     let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
                     let cfg = QwenAttnCfg {
-                        num_heads: nh,
+                        num_heads: self.layer_num_heads(li),
                         num_kv_heads: nkv_l,
                         head_dim: hd_l,
                         hidden_size: hs,
@@ -2776,6 +3212,10 @@ impl Pipeline {
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
+                        softplus_gate: softplus_gate
+                            .as_ref()
+                            .map(|(gate, per_head)| (gate, *per_head)),
+                        rope_scale: self.layer_rope_scale(li),
                         bias: bias
                             .as_ref()
                             .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
@@ -2801,25 +3241,54 @@ impl Pipeline {
                     q_norm,
                     k_norm,
                     output_gate,
+                    softplus_gate,
                     bias,
                 } => 'attn: {
                     // wgpu token-graph attention (opt-in): whole sub-block in
                     // one submit, device K/V mirror. q1 only, no gate/bias/mask.
-                    if graph_on && !*output_gate && bias.is_none() && task_mask.is_none() {
+                    if graph_on
+                        && !*output_gate
+                        && softplus_gate.is_none()
+                        && self.attention_heads_per_layer.is_none()
+                        && bias.is_none()
+                        && task_mask.is_none()
+                    {
                         let inv_freq_l = self.layer_inv_freq(li);
                         let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
                         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
-                        if let (Some((gm, qi)), Some((_, ki)), Some((_, vi)), Some((_, oi))) =
-                            (wq.mapped_q1(), wk.mapped_q1(), wv.mapped_q1(), wo.mapped_q1())
-                        {
+                        if let (Some((gm, qi)), Some((_, ki)), Some((_, vi)), Some((_, oi))) = (
+                            wq.mapped_q1(),
+                            wk.mapped_q1(),
+                            wv.mapped_q1(),
+                            wo.mapped_q1(),
+                        ) {
                             let gm = gm.clone();
                             let mut out = vec![0f32; hs];
                             let cache = &self.kv_cache.layers[li];
                             if crate::gpu::attn_dropin(
-                                &gm, self.graph_kv_id, li, &self.ws.n1, qi, ki, vi, oi,
-                                q_norm.as_deref(), k_norm.as_deref(), &inv_freq_l, nh, nkv_l,
-                                hd_l, rd_l, hs, position, self.kv_cache.max_seq_len, gemma, eps as f32,
-                                cache.k_heads(), cache.v_heads(), &mut out,
+                                &gm,
+                                self.graph_kv_id,
+                                li,
+                                &self.ws.n1,
+                                qi,
+                                ki,
+                                vi,
+                                oi,
+                                q_norm.as_deref(),
+                                k_norm.as_deref(),
+                                &inv_freq_l,
+                                nh,
+                                nkv_l,
+                                hd_l,
+                                rd_l,
+                                hs,
+                                position,
+                                self.kv_cache.max_seq_len,
+                                gemma,
+                                eps as f32,
+                                cache.k_heads(),
+                                cache.v_heads(),
+                                &mut out,
                             ) {
                                 break 'attn out;
                             }
@@ -2860,7 +3329,7 @@ impl Pipeline {
                             let inv_freq_l = self.layer_inv_freq(li);
                             let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
                             let cfg = QwenAttnCfg {
-                                num_heads: nh,
+                                num_heads: self.layer_num_heads(li),
                                 num_kv_heads: nkv_l,
                                 head_dim: hd_l,
                                 hidden_size: hs,
@@ -2873,9 +3342,13 @@ impl Pipeline {
                                 q_norm: q_norm.as_deref(),
                                 k_norm: k_norm.as_deref(),
                                 output_gate: *output_gate,
-                        bias: bias
-                            .as_ref()
-                            .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
+                                softplus_gate: softplus_gate
+                                    .as_ref()
+                                    .map(|(gate, per_head)| (gate, *per_head)),
+                                rope_scale: self.layer_rope_scale(li),
+                                bias: bias
+                                    .as_ref()
+                                    .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
                                 rms_eps: eps,
                                 norm_style: self.norm_style,
                                 pool: pool.as_deref(),
@@ -2918,9 +3391,11 @@ impl Pipeline {
             // Sparse mask path applies to dense f32 FFN only; MoE
             // layers route through the normal dispatch below.
             let f32_ffn = match &lw.ffn {
-                FfnKind::Dense(d) => {
-                    (d.gate_proj.as_f32(), d.up_proj.as_f32(), d.down_proj.as_f32())
-                }
+                FfnKind::Dense(d) => (
+                    d.gate_proj.as_f32(),
+                    d.up_proj.as_f32(),
+                    d.down_proj.as_f32(),
+                ),
                 FfnKind::Moe(_) => (None, None, None),
             };
             let ffn_out = match (ffn_masked, f32_ffn) {
@@ -3038,7 +3513,9 @@ impl Pipeline {
 
     /// Skills eligible for dynamic switching: (index, id, phi_layer).
     pub fn dynamic_skills(&self) -> Vec<(usize, String, usize)> {
-        let Some(model) = &self.model else { return Vec::new() };
+        let Some(model) = &self.model else {
+            return Vec::new();
+        };
         model
             .header
             .skills
@@ -3063,7 +3540,9 @@ impl Pipeline {
     /// (0 = nothing to route; router stays off). Idempotent.
     pub fn enable_dynamic_routing(&mut self) -> usize {
         use crate::swarm::{DynRouter, RoutableSkill};
-        let Some(model) = self.model.clone() else { return 0 };
+        let Some(model) = self.model.clone() else {
+            return 0;
+        };
         // A blend materialized f32 working tensors into the layers; there
         // is no single skill index to revert from → refuse (honest).
         if self.dyn_blend_loaded {
@@ -3075,9 +3554,7 @@ impl Pipeline {
         // silently keep it overlaid.
         if let Some(a) = self.dyn_active {
             if !matches!(self.dyn_skill_layers.get(a), Some(Some(_))) {
-                tracing::warn!(
-                    "loaded skill is not FFN-eligible — dynamic routing unavailable"
-                );
+                tracing::warn!("loaded skill is not FFN-eligible — dynamic routing unavailable");
                 return 0;
             }
         }
@@ -3193,6 +3670,7 @@ pub fn create_test_pipeline(
                 q_norm: None,
                 k_norm: None,
                 output_gate: false,
+                softplus_gate: None,
             },
         })
         .collect();
@@ -3286,11 +3764,15 @@ fn moe_ffn_batch(m: &MoeFfn, xs: &[f32], b: usize, hidden: usize, pool: Option<&
         }
     }
     if let Some((se, gate)) = &m.shared {
-        let mut gl = vec![0.0f32; b];
-        gate.matmat(xs, b, &mut gl, pool);
-        let all: Vec<(usize, f32)> = (0..b)
-            .map(|bi| (bi, 1.0 / (1.0 + (-gl[bi]).exp())))
-            .collect();
+        let all: Vec<(usize, f32)> = if let Some(gate) = gate {
+            let mut gl = vec![0.0f32; b];
+            gate.matmat(xs, b, &mut gl, pool);
+            (0..b)
+                .map(|bi| (bi, 1.0 / (1.0 + (-gl[bi]).exp())))
+                .collect()
+        } else {
+            (0..b).map(|bi| (bi, 1.0)).collect()
+        };
         run_expert(se, &all);
     }
     out
@@ -3424,7 +3906,15 @@ fn dense_ffn_gpu(d: &DenseFfn, x: &[f32], _pool: Option<&Pool>) -> Option<Vec<f3
 #[allow(clippy::type_complexity)]
 fn moe_parts(
     t: &QTensor,
-) -> Option<(&std::sync::Arc<cortiq_core::CmfModel>, usize, usize, usize, &[f32], &[f32], bool)> {
+) -> Option<(
+    &std::sync::Arc<cortiq_core::CmfModel>,
+    usize,
+    usize,
+    usize,
+    &[f32],
+    &[f32],
+    bool,
+)> {
     match t {
         QTensor::Mapped {
             model,
@@ -3470,8 +3960,16 @@ fn moe_push_job<'a>(
         return None; // mixed-dtype trio — honest CPU path
     }
     model_ref.get_or_insert_with(|| gm.clone());
-    let gdt = if gcf.is_empty() { cortiq_core::TensorDtype::Q8Row } else { cortiq_core::TensorDtype::Q8_2f };
-    let udt = if ucf.is_empty() { cortiq_core::TensorDtype::Q8Row } else { cortiq_core::TensorDtype::Q8_2f };
+    let gdt = if gcf.is_empty() {
+        cortiq_core::TensorDtype::Q8Row
+    } else {
+        cortiq_core::TensorDtype::Q8_2f
+    };
+    let udt = if ucf.is_empty() {
+        cortiq_core::TensorDtype::Q8Row
+    } else {
+        cortiq_core::TensorDtype::Q8_2f
+    };
     jobs.push(crate::gpu::MoeJob {
         gate: (gi, gr, gc, grs),
         up: (ui, ur, uc, urs),
@@ -3509,7 +4007,11 @@ fn sparse_ffn_quant(
         if idx >= inter {
             return 0.0; // defensive parity with the f32 sparse path
         }
-        let mut s = if need_scratch { vec![0.0f32; hidden] } else { Vec::new() };
+        let mut s = if need_scratch {
+            vec![0.0f32; hidden]
+        } else {
+            Vec::new()
+        };
         let gate = d.gate_proj.row_dot(idx, x, &mut s);
         let up = d.up_proj.row_dot(idx, x, &mut s);
         d.act.apply(gate) * up
@@ -3608,7 +4110,10 @@ fn moe_route(logits: &[f32], m: &MoeFfn) -> (Vec<usize>, Vec<f32>, f32) {
     // Descending by selection score, lower index wins ties (torch.topk).
     match &m.expert_bias {
         Some(b) => idx.sort_unstable_by(|&x, &y| {
-            (p[y] + b[y]).partial_cmp(&(p[x] + b[x])).unwrap().then(x.cmp(&y))
+            (p[y] + b[y])
+                .partial_cmp(&(p[x] + b[x]))
+                .unwrap()
+                .then(x.cmp(&y))
         }),
         None => idx.sort_unstable_by(|&x, &y| p[y].partial_cmp(&p[x]).unwrap().then(x.cmp(&y))),
     }
@@ -3687,9 +4192,11 @@ fn moe_ffn_cpu(
     }
     if let Some((se, gate)) = &m.shared {
         let mut so = dense_ffn(se, x, pool);
-        let mut gl = vec![0.0f32; 1];
-        gate.matvec(x, &mut gl, pool);
-        let g = 1.0 / (1.0 + (-gl[0]).exp());
+        let g = gate.as_ref().map_or(1.0, |gate| {
+            let mut gl = [0.0f32; 1];
+            gate.matvec(x, &mut gl, pool);
+            1.0 / (1.0 + (-gl[0]).exp())
+        });
         for i in 0..out.len() {
             out[i] += g * so[i];
         }
@@ -3716,9 +4223,11 @@ fn moe_ffn_gpu(
         moe_push_job(&m.experts[e], x, p[e] / wsum, &mut jobs, &mut model_ref)?;
     }
     if let Some((se, gate)) = &m.shared {
-        let mut gl = vec![0.0f32; 1];
-        gate.matvec(x, &mut gl, pool);
-        let g = 1.0 / (1.0 + (-gl[0]).exp());
+        let g = gate.as_ref().map_or(1.0, |gate| {
+            let mut gl = [0.0f32; 1];
+            gate.matvec(x, &mut gl, pool);
+            1.0 / (1.0 + (-gl[0]).exp())
+        });
         moe_push_job(se, x, g, &mut jobs, &mut model_ref)?;
     }
     let model = model_ref?;
@@ -3864,7 +4373,7 @@ mod tests {
                     act: Act::Silu,
                 }),
                 attn: AttnKind::Full {
-                bias: None,
+                    bias: None,
                     wq: qt(heads * hd, h, 311),
                     wk: qt(kv * hd, h, 312),
                     wv: qt(kv * hd, h, 313),
@@ -3872,6 +4381,7 @@ mod tests {
                     q_norm: None,
                     k_norm: None,
                     output_gate: false,
+                    softplus_gate: None,
                 },
             },
             final_norm: vec![1.0; h],
@@ -3951,6 +4461,20 @@ mod tests {
             p.generate("hello", 8, None, None).unwrap().token_ids
         };
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn resetting_sampler_restarts_the_seeded_stream() {
+        let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
+        let config = SamplerConfig {
+            seed: Some(1234),
+            ..SamplerConfig::default()
+        };
+        p.set_sampler_config(config.clone());
+        let first = p.generate("hello", 8, None, None).unwrap().token_ids;
+        p.set_sampler_config(config);
+        let second = p.generate("hello", 8, None, None).unwrap().token_ids;
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -4037,6 +4561,44 @@ mod tests {
             .unwrap()
             .0 as u32;
         let r = p.generate("abcd", 1, None, None).unwrap();
-        assert_eq!(argmax, r.token_ids[0], "explain preview must match greedy emit");
+        assert_eq!(
+            argmax, r.token_ids[0],
+            "explain preview must match greedy emit"
+        );
+    }
+
+    #[test]
+    fn laguna_shared_expert_is_unconditionally_added() {
+        let matrix = |values: Vec<f32>| QTensor::from_f32(values, 2, 2);
+        let identity = || matrix(vec![1.0, 0.0, 0.0, 1.0]);
+        let zero_dense = || DenseFfn {
+            gate_proj: matrix(vec![0.0; 4]),
+            up_proj: matrix(vec![0.0; 4]),
+            down_proj: matrix(vec![0.0; 4]),
+            act: Act::Silu,
+        };
+        let shared = DenseFfn {
+            gate_proj: identity(),
+            up_proj: identity(),
+            down_proj: identity(),
+            act: Act::Silu,
+        };
+        let x = [1.0, 2.0];
+        let expected = dense_ffn(&shared, &x, None);
+        let moe = MoeFfn {
+            router: QTensor::from_f32(vec![0.0, 0.0], 1, 2),
+            experts: vec![zero_dense()],
+            top_k: 1,
+            norm_topk_prob: true,
+            router_sigmoid: true,
+            expert_bias: None,
+            routed_scaling: 1.0,
+            shared: Some((shared, None)),
+            stats: std::cell::RefCell::new(Vec::new()),
+        };
+        let actual = moe_ffn_cpu(&moe, &x, &[0], &[0.0], 1.0, None);
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
     }
 }

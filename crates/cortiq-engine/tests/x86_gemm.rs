@@ -22,14 +22,32 @@ fn blocked_vs_per_row() {
         payload[rows * cols + r * 2..rows * cols + r * 2 + 2].copy_from_slice(&sc);
     }
     let arch = ModelArch {
-        arch_name: "tiny".into(), hidden_size: cols, intermediate_size: cols * 2,
-        num_layers: 1, num_attention_heads: 2, num_kv_heads: 1, head_dim: 4,
-        vocab_size: rows, layer_types: vec![LayerType::FullAttention],
-        rms_norm_eps: 1e-6, norm_style: NormStyle::Qwen, rope_theta: 1e4,
-        tie_word_embeddings: false, partial_rotary_factor: 1.0, mtp: None,
-        moe: None, linear_core: None, max_position_embeddings: 8,
-        linear_conv_kernel_dim: None, linear_num_key_heads: None,
-        linear_num_value_heads: None, linear_key_head_dim: None, linear_value_head_dim: None,
+        arch_name: "tiny".into(),
+        hidden_size: cols,
+        intermediate_size: cols * 2,
+        num_layers: 1,
+        num_attention_heads: 2,
+        num_kv_heads: 1,
+        head_dim: 4,
+        vocab_size: rows,
+        layer_types: vec![LayerType::FullAttention],
+        rms_norm_eps: 1e-6,
+        norm_style: NormStyle::Qwen,
+        rope_theta: 1e4,
+        tie_word_embeddings: false,
+        partial_rotary_factor: 1.0,
+        yarn: None,
+        attention_heads_per_layer: None,
+        local_partial_rotary_factor: None,
+        mtp: None,
+        moe: None,
+        linear_core: None,
+        max_position_embeddings: 8,
+        linear_conv_kernel_dim: None,
+        linear_num_key_heads: None,
+        linear_num_value_heads: None,
+        linear_key_head_dim: None,
+        linear_value_head_dim: None,
         hidden_act: "silu".into(),
         embed_multiplier: 1.0,
         query_pre_attn_scalar: None,
@@ -43,12 +61,22 @@ fn blocked_vs_per_row() {
         attn_v_norm: false,
     };
     let header = CmfHeader {
-        format: "cmf".into(), version: CMF_VERSION, arch, quant_type: QuantType::Q8Row,
-        provenance: None, tokenizer_config: None, section_hashes: None,
-        skills: Vec::new(), shard: None, calibration: None,
+        format: "cmf".into(),
+        version: CMF_VERSION,
+        arch,
+        quant_type: QuantType::Q8Row,
+        provenance: None,
+        tokenizer_config: None,
+        section_hashes: None,
+        skills: Vec::new(),
+        shard: None,
+        calibration: None,
     };
     let spec = TensorSpec {
-        name: "w".into(), dtype: TensorDtype::Q8Row, shape: vec![rows, cols], data: payload,
+        name: "w".into(),
+        dtype: TensorDtype::Q8Row,
+        shape: vec![rows, cols],
+        data: payload,
     };
     let dir = std::env::temp_dir().join(format!("cmf-x86mm-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -59,8 +87,14 @@ fn blocked_vs_per_row() {
     let rs = vec![0.01f32; rows];
     let x: Vec<f32> = (0..b * cols).map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5).collect();
     let qt = cortiq_engine::qtensor::QTensor::Mapped {
-        model: model.clone(), idx, dtype: TensorDtype::Q8Row, rows, cols,
-        row_scale: rs, col_field: Vec::new(), vbit_offsets: Vec::new(),
+        model: model.clone(),
+        idx,
+        dtype: TensorDtype::Q8Row,
+        rows,
+        cols,
+        row_scale: rs,
+        col_field: Vec::new(),
+        vbit_offsets: Vec::new(),
         repack: Vec::new(),
     };
     let mut y_a = vec![0f32; b * rows];
@@ -87,10 +121,7 @@ fn blocked_vs_per_row() {
         t_row = t_row.min(t1.elapsed().as_secs_f64() * 1000.0);
     }
     let gflop = 2.0 * (b * rows * cols) as f64 / 1e9;
-    println!(
-        "x86 q8 matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row {t_row:.1} ms ({:.0} GF/s)",
-        gflop / t_blk * 1e3, gflop / t_row * 1e3
-    );
+    println!("x86 q8 matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row {t_row:.1} ms ({:.0} GF/s)", gflop / t_blk * 1e3, gflop / t_row * 1e3);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -111,14 +142,32 @@ fn q1_blocked_vs_per_row() {
         }
     }
     let arch = ModelArch {
-        arch_name: "tiny".into(), hidden_size: cols, intermediate_size: cols * 2,
-        num_layers: 1, num_attention_heads: 2, num_kv_heads: 1, head_dim: 4,
-        vocab_size: rows, layer_types: vec![LayerType::FullAttention],
-        rms_norm_eps: 1e-6, norm_style: NormStyle::Qwen, rope_theta: 1e4,
-        tie_word_embeddings: false, partial_rotary_factor: 1.0, mtp: None,
-        moe: None, linear_core: None, max_position_embeddings: 8,
-        linear_conv_kernel_dim: None, linear_num_key_heads: None,
-        linear_num_value_heads: None, linear_key_head_dim: None, linear_value_head_dim: None,
+        arch_name: "tiny".into(),
+        hidden_size: cols,
+        intermediate_size: cols * 2,
+        num_layers: 1,
+        num_attention_heads: 2,
+        num_kv_heads: 1,
+        head_dim: 4,
+        vocab_size: rows,
+        layer_types: vec![LayerType::FullAttention],
+        rms_norm_eps: 1e-6,
+        norm_style: NormStyle::Qwen,
+        rope_theta: 1e4,
+        tie_word_embeddings: false,
+        partial_rotary_factor: 1.0,
+        yarn: None,
+        attention_heads_per_layer: None,
+        local_partial_rotary_factor: None,
+        mtp: None,
+        moe: None,
+        linear_core: None,
+        max_position_embeddings: 8,
+        linear_conv_kernel_dim: None,
+        linear_num_key_heads: None,
+        linear_num_value_heads: None,
+        linear_key_head_dim: None,
+        linear_value_head_dim: None,
         hidden_act: "silu".into(),
         embed_multiplier: 1.0,
         query_pre_attn_scalar: None,
@@ -132,12 +181,22 @@ fn q1_blocked_vs_per_row() {
         attn_v_norm: false,
     };
     let header = CmfHeader {
-        format: "cmf".into(), version: CMF_VERSION, arch, quant_type: QuantType::Q8Row,
-        provenance: None, tokenizer_config: None, section_hashes: None,
-        skills: Vec::new(), shard: None, calibration: None,
+        format: "cmf".into(),
+        version: CMF_VERSION,
+        arch,
+        quant_type: QuantType::Q8Row,
+        provenance: None,
+        tokenizer_config: None,
+        section_hashes: None,
+        skills: Vec::new(),
+        shard: None,
+        calibration: None,
     };
     let spec = TensorSpec {
-        name: "w".into(), dtype: TensorDtype::Q1, shape: vec![rows, cols], data: payload,
+        name: "w".into(),
+        dtype: TensorDtype::Q1,
+        shape: vec![rows, cols],
+        data: payload,
     };
     let dir = std::env::temp_dir().join(format!("cmf-x86q1-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -147,8 +206,14 @@ fn q1_blocked_vs_per_row() {
     let idx = model.tensor_index("w").unwrap();
     let x: Vec<f32> = (0..b * cols).map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5).collect();
     let qt = cortiq_engine::qtensor::QTensor::Mapped {
-        model: model.clone(), idx, dtype: TensorDtype::Q1, rows, cols,
-        row_scale: Vec::new(), col_field: Vec::new(), vbit_offsets: Vec::new(),
+        model: model.clone(),
+        idx,
+        dtype: TensorDtype::Q1,
+        rows,
+        cols,
+        row_scale: Vec::new(),
+        col_field: Vec::new(),
+        vbit_offsets: Vec::new(),
         repack: Vec::new(),
     };
     let mut y_a = vec![0f32; b * rows];
@@ -173,10 +238,7 @@ fn q1_blocked_vs_per_row() {
     }
     unsafe { std::env::remove_var("CMF_X86_BLOCKED") };
     let gflop = 2.0 * (b * rows * cols) as f64 / 1e9;
-    println!(
-        "x86 q1 matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row-avx2 {t_row:.1} ms ({:.0} GF/s)",
-        gflop / t_blk * 1e3, gflop / t_row * 1e3
-    );
+    println!("x86 q1 matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row-avx2 {t_row:.1} ms ({:.0} GF/s)", gflop / t_blk * 1e3, gflop / t_row * 1e3);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -195,18 +257,35 @@ fn q4b_blocked_vs_per_row() {
         for k in 0..16 {
             payload[g * 16 + k] = ((g * 13 + k * 29 + 5) % 251) as u8;
         }
-        payload[groups * 16 + g * 2..groups * 16 + g * 2 + 2]
-            .copy_from_slice(&f32_to_f16(0.02).to_le_bytes());
+        payload[groups * 16 + g * 2..groups * 16 + g * 2 + 2].copy_from_slice(&f32_to_f16(0.02).to_le_bytes());
     }
     let arch = ModelArch {
-        arch_name: "tiny".into(), hidden_size: cols, intermediate_size: cols * 2,
-        num_layers: 1, num_attention_heads: 2, num_kv_heads: 1, head_dim: 4,
-        vocab_size: rows, layer_types: vec![LayerType::FullAttention],
-        rms_norm_eps: 1e-6, norm_style: NormStyle::Qwen, rope_theta: 1e4,
-        tie_word_embeddings: false, partial_rotary_factor: 1.0, mtp: None,
-        moe: None, linear_core: None, max_position_embeddings: 8,
-        linear_conv_kernel_dim: None, linear_num_key_heads: None,
-        linear_num_value_heads: None, linear_key_head_dim: None, linear_value_head_dim: None,
+        arch_name: "tiny".into(),
+        hidden_size: cols,
+        intermediate_size: cols * 2,
+        num_layers: 1,
+        num_attention_heads: 2,
+        num_kv_heads: 1,
+        head_dim: 4,
+        vocab_size: rows,
+        layer_types: vec![LayerType::FullAttention],
+        rms_norm_eps: 1e-6,
+        norm_style: NormStyle::Qwen,
+        rope_theta: 1e4,
+        tie_word_embeddings: false,
+        partial_rotary_factor: 1.0,
+        yarn: None,
+        attention_heads_per_layer: None,
+        local_partial_rotary_factor: None,
+        mtp: None,
+        moe: None,
+        linear_core: None,
+        max_position_embeddings: 8,
+        linear_conv_kernel_dim: None,
+        linear_num_key_heads: None,
+        linear_num_value_heads: None,
+        linear_key_head_dim: None,
+        linear_value_head_dim: None,
         hidden_act: "silu".into(),
         embed_multiplier: 1.0,
         query_pre_attn_scalar: None,
@@ -220,12 +299,22 @@ fn q4b_blocked_vs_per_row() {
         attn_v_norm: false,
     };
     let header = CmfHeader {
-        format: "cmf".into(), version: CMF_VERSION, arch, quant_type: QuantType::Q4Block,
-        provenance: None, tokenizer_config: None, section_hashes: None,
-        skills: Vec::new(), shard: None, calibration: None,
+        format: "cmf".into(),
+        version: CMF_VERSION,
+        arch,
+        quant_type: QuantType::Q4Block,
+        provenance: None,
+        tokenizer_config: None,
+        section_hashes: None,
+        skills: Vec::new(),
+        shard: None,
+        calibration: None,
     };
     let spec = TensorSpec {
-        name: "w".into(), dtype: TensorDtype::Q4Block, shape: vec![rows, cols], data: payload,
+        name: "w".into(),
+        dtype: TensorDtype::Q4Block,
+        shape: vec![rows, cols],
+        data: payload,
     };
     let dir = std::env::temp_dir().join(format!("cmf-x86q4b-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -235,8 +324,14 @@ fn q4b_blocked_vs_per_row() {
     let idx = model.tensor_index("w").unwrap();
     let x: Vec<f32> = (0..b * cols).map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5).collect();
     let qt = cortiq_engine::qtensor::QTensor::Mapped {
-        model: model.clone(), idx, dtype: TensorDtype::Q4Block, rows, cols,
-        row_scale: Vec::new(), col_field: Vec::new(), vbit_offsets: Vec::new(),
+        model: model.clone(),
+        idx,
+        dtype: TensorDtype::Q4Block,
+        rows,
+        cols,
+        row_scale: Vec::new(),
+        col_field: Vec::new(),
+        vbit_offsets: Vec::new(),
         repack: Vec::new(),
     };
     let mut y_a = vec![0f32; b * rows];
@@ -259,10 +354,7 @@ fn q4b_blocked_vs_per_row() {
         t_row = t_row.min(t1.elapsed().as_secs_f64() * 1000.0);
     }
     let gflop = 2.0 * (b * rows * cols) as f64 / 1e9;
-    println!(
-        "x86 q4b matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row {t_row:.1} ms ({:.0} GF/s)",
-        gflop / t_blk * 1e3, gflop / t_row * 1e3
-    );
+    println!("x86 q4b matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row {t_row:.1} ms ({:.0} GF/s)", gflop / t_blk * 1e3, gflop / t_row * 1e3);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -285,14 +377,32 @@ fn q4t_blocked_vs_per_row() {
         }
     }
     let arch = ModelArch {
-        arch_name: "tiny".into(), hidden_size: cols, intermediate_size: cols * 2,
-        num_layers: 1, num_attention_heads: 2, num_kv_heads: 1, head_dim: 4,
-        vocab_size: rows, layer_types: vec![LayerType::FullAttention],
-        rms_norm_eps: 1e-6, norm_style: NormStyle::Qwen, rope_theta: 1e4,
-        tie_word_embeddings: false, partial_rotary_factor: 1.0, mtp: None,
-        moe: None, linear_core: None, max_position_embeddings: 8,
-        linear_conv_kernel_dim: None, linear_num_key_heads: None,
-        linear_num_value_heads: None, linear_key_head_dim: None, linear_value_head_dim: None,
+        arch_name: "tiny".into(),
+        hidden_size: cols,
+        intermediate_size: cols * 2,
+        num_layers: 1,
+        num_attention_heads: 2,
+        num_kv_heads: 1,
+        head_dim: 4,
+        vocab_size: rows,
+        layer_types: vec![LayerType::FullAttention],
+        rms_norm_eps: 1e-6,
+        norm_style: NormStyle::Qwen,
+        rope_theta: 1e4,
+        tie_word_embeddings: false,
+        partial_rotary_factor: 1.0,
+        yarn: None,
+        attention_heads_per_layer: None,
+        local_partial_rotary_factor: None,
+        mtp: None,
+        moe: None,
+        linear_core: None,
+        max_position_embeddings: 8,
+        linear_conv_kernel_dim: None,
+        linear_num_key_heads: None,
+        linear_num_value_heads: None,
+        linear_key_head_dim: None,
+        linear_value_head_dim: None,
         hidden_act: "silu".into(),
         embed_multiplier: 1.0,
         query_pre_attn_scalar: None,
@@ -306,12 +416,22 @@ fn q4t_blocked_vs_per_row() {
         attn_v_norm: false,
     };
     let header = CmfHeader {
-        format: "cmf".into(), version: CMF_VERSION, arch, quant_type: QuantType::Q4Block,
-        provenance: None, tokenizer_config: None, section_hashes: None,
-        skills: Vec::new(), shard: None, calibration: None,
+        format: "cmf".into(),
+        version: CMF_VERSION,
+        arch,
+        quant_type: QuantType::Q4Block,
+        provenance: None,
+        tokenizer_config: None,
+        section_hashes: None,
+        skills: Vec::new(),
+        shard: None,
+        calibration: None,
     };
     let spec = TensorSpec {
-        name: "w".into(), dtype: TensorDtype::Q4Tiled, shape: vec![rows, cols], data: payload,
+        name: "w".into(),
+        dtype: TensorDtype::Q4Tiled,
+        shape: vec![rows, cols],
+        data: payload,
     };
     let dir = std::env::temp_dir().join(format!("cmf-x86q4t-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -321,8 +441,14 @@ fn q4t_blocked_vs_per_row() {
     let idx = model.tensor_index("w").unwrap();
     let x: Vec<f32> = (0..b * cols).map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5).collect();
     let qt = cortiq_engine::qtensor::QTensor::Mapped {
-        model: model.clone(), idx, dtype: TensorDtype::Q4Tiled, rows, cols,
-        row_scale: Vec::new(), col_field: Vec::new(), vbit_offsets: Vec::new(),
+        model: model.clone(),
+        idx,
+        dtype: TensorDtype::Q4Tiled,
+        rows,
+        cols,
+        row_scale: Vec::new(),
+        col_field: Vec::new(),
+        vbit_offsets: Vec::new(),
         repack: Vec::new(),
     };
     let mut y_a = vec![0f32; b * rows];
@@ -345,9 +471,6 @@ fn q4t_blocked_vs_per_row() {
         t_row = t_row.min(t1.elapsed().as_secs_f64() * 1000.0);
     }
     let gflop = 2.0 * (b * rows * cols) as f64 / 1e9;
-    println!(
-        "x86 q4t matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row {t_row:.1} ms ({:.0} GF/s)",
-        gflop / t_blk * 1e3, gflop / t_row * 1e3
-    );
+    println!("x86 q4t matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row {t_row:.1} ms ({:.0} GF/s)", gflop / t_blk * 1e3, gflop / t_row * 1e3);
     std::fs::remove_dir_all(&dir).ok();
 }

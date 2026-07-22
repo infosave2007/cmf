@@ -16,7 +16,7 @@
 //! Every validation failure is a hard error: no silent fallbacks.
 
 use crate::hash::hash64;
-use crate::mask::{decode_masks_section, encode_masks_section, MaskCatalog, TaskMask};
+use crate::mask::{MaskCatalog, TaskMask, decode_masks_section, encode_masks_section};
 use crate::quant::expected_nbytes;
 use crate::types::{ModelArch, QuantType, TensorDtype};
 use serde::{Deserialize, Serialize};
@@ -321,12 +321,20 @@ impl CmfModel {
                 // logged, not fatal).
                 #[cfg(unix)]
                 {
-                    if std::env::var("CMF_MMAP_ADVISE").map(|v| v != "0").unwrap_or(true) {
+                    if std::env::var("CMF_MMAP_ADVISE")
+                        .map(|v| v != "0")
+                        .unwrap_or(true)
+                    {
                         let _ = m.advise(memmap2::Advice::WillNeed);
                     }
-                    if std::env::var("CMF_MLOCK").map(|v| v == "1").unwrap_or(false) {
+                    if std::env::var("CMF_MLOCK")
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
+                    {
                         if let Err(e) = m.lock() {
-                            tracing::warn!("CMF_MLOCK=1: mlock refused ({e}) — continuing unpinned");
+                            tracing::warn!(
+                                "CMF_MLOCK=1: mlock refused ({e}) — continuing unpinned"
+                            );
                         }
                     }
                 }
@@ -341,9 +349,7 @@ impl CmfModel {
         let env = Self::parse_envelope(backing.bytes(), file_len)?;
 
         let bytes = backing.bytes();
-        let section = |off: u64, len: u64| -> &[u8] {
-            &bytes[off as usize..(off + len) as usize]
-        };
+        let section = |off: u64, len: u64| -> &[u8] { &bytes[off as usize..(off + len) as usize] };
 
         // Header JSON
         let header: CmfHeader = serde_json::from_slice(section(env.header.0, env.header.1))
@@ -358,15 +364,24 @@ impl CmfModel {
                     t.name, t.off
                 )));
             }
-            if t.off + t.nbytes > env.data.1 {
+            let tensor_end = t.off.checked_add(t.nbytes).ok_or_else(|| {
+                CmfError::Bounds(format!("tensor '{}': offset + length overflows", t.name))
+            })?;
+            if tensor_end > env.data.1 {
                 return Err(CmfError::Bounds(format!(
                     "tensor '{}': [{}, {}) exceeds data section ({} bytes)",
-                    t.name,
-                    t.off,
-                    t.off + t.nbytes,
-                    env.data.1
+                    t.name, t.off, tensor_end, env.data.1
                 )));
             }
+            t.shape
+                .iter()
+                .try_fold(1usize, |n, &dim| n.checked_mul(dim))
+                .ok_or_else(|| {
+                    CmfError::Bounds(format!(
+                        "tensor '{}': shape product overflows usize",
+                        t.name
+                    ))
+                })?;
             if let Some(expect) = expected_nbytes(t.dtype, &t.shape) {
                 if expect as u64 != t.nbytes {
                     return Err(CmfError::Bounds(format!(
@@ -479,10 +494,7 @@ impl CmfModel {
         }
         let stem = &name[..name.len() - tag1.len()];
         for no in 2..=info.count {
-            let sib = path.with_file_name(format!(
-                "{stem}-{:05}-of-{:05}.cmf",
-                no, info.count
-            ));
+            let sib = path.with_file_name(format!("{stem}-{:05}-of-{:05}.cmf", no, info.count));
             let sh = Self::open(&sib)?;
             match &sh.header.shard {
                 Some(si) if si.no == no && si.count == info.count => {}
@@ -569,10 +581,24 @@ impl CmfModel {
             if required && len == 0 {
                 return Err(CmfError::Bounds(format!("section '{name}' is required")));
             }
-            if len > 0 && off.checked_add(len).map(|end| end > file_len).unwrap_or(true) {
+            if len > 0
+                && off
+                    .checked_add(len)
+                    .map(|end| end > file_len)
+                    .unwrap_or(true)
+            {
                 return Err(CmfError::Bounds(format!(
                     "section '{name}' [{off}, {}) exceeds file ({file_len} bytes)",
                     off.saturating_add(len)
+                )));
+            }
+            if len > 0
+                && (usize::try_from(off).is_err()
+                    || usize::try_from(len).is_err()
+                    || usize::try_from(off + len).is_err())
+            {
+                return Err(CmfError::Bounds(format!(
+                    "section '{name}' cannot be addressed on this platform"
                 )));
             }
         }
@@ -591,7 +617,12 @@ impl CmfModel {
         }
         let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
         let pool_off = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
-        let records_end = 16 + count * DIR_RECORD_LEN;
+        let records_len = count
+            .checked_mul(DIR_RECORD_LEN)
+            .ok_or_else(|| CmfError::Parse("tensor directory record count overflows".into()))?;
+        let records_end = 16usize
+            .checked_add(records_len)
+            .ok_or_else(|| CmfError::Parse("tensor directory size overflows".into()))?;
         if records_end > bytes.len() || pool_off > bytes.len() || pool_off < records_end {
             return Err(CmfError::Parse(format!(
                 "tensor directory malformed: count={count}, pool_off={pool_off}, len={}",
@@ -612,16 +643,21 @@ impl CmfModel {
             }
             let mut shape = Vec::with_capacity(ndim);
             for d in 0..ndim {
-                shape.push(u32::from_le_bytes(r[8 + d * 4..12 + d * 4].try_into().unwrap()) as usize);
+                shape.push(
+                    u32::from_le_bytes(r[8 + d * 4..12 + d * 4].try_into().unwrap()) as usize,
+                );
             }
             let off = u64::from_le_bytes(r[32..40].try_into().unwrap());
             let nbytes = u64::from_le_bytes(r[40..48].try_into().unwrap());
             let hash = u64::from_le_bytes(r[48..56].try_into().unwrap());
 
-            if name_off + name_len > pool.len() {
+            let name_end = name_off
+                .checked_add(name_len)
+                .ok_or_else(|| CmfError::Parse(format!("tensor #{i}: name range overflows")))?;
+            if name_end > pool.len() {
                 return Err(CmfError::Parse(format!("tensor #{i}: name out of pool")));
             }
-            let name = std::str::from_utf8(&pool[name_off..name_off + name_len])
+            let name = std::str::from_utf8(&pool[name_off..name_end])
                 .map_err(|_| CmfError::Parse(format!("tensor #{i}: name is not UTF-8")))?
                 .to_string();
             let dtype = TensorDtype::from_id(dtype_id).ok_or(CmfError::UnknownDtype(dtype_id))?;
@@ -684,7 +720,9 @@ impl CmfModel {
     /// one skill — exactly the byte ranges lazy loading pages in.
     pub fn skill_tensors(&self, skill_id: &str) -> impl Iterator<Item = &TensorEntry> {
         let prefix = format!("skill.{skill_id}.");
-        self.tensors.iter().filter(move |t| t.name.starts_with(&prefix))
+        self.tensors
+            .iter()
+            .filter(move |t| t.name.starts_with(&prefix))
     }
 
     /// Zero-copy bytes of a tensor from the mmap'd data section.
@@ -768,9 +806,9 @@ impl CmfModel {
                 if let Some(hex) = hex {
                     match u64::from_str_radix(hex, 16) {
                         Ok(stored) => problems.extend(check(name, stored, span)),
-                        Err(_) => problems.push(format!(
-                            "section '{name}': malformed hash '{hex}'"
-                        )),
+                        Err(_) => {
+                            problems.push(format!("section '{name}': malformed hash '{hex}'"))
+                        }
                     }
                 }
             }
@@ -1043,7 +1081,11 @@ pub fn build_sparse_index(catalog: &MaskCatalog, arch: &ModelArch) -> Vec<Sparse
             let mut heads = Vec::new();
             if let Some(bits) = m.head_masks.get(li) {
                 for h in 0..arch.num_attention_heads {
-                    if bits.get(h / 8).map(|b| b & (1 << (h % 8)) != 0).unwrap_or(false) {
+                    if bits
+                        .get(h / 8)
+                        .map(|b| b & (1 << (h % 8)) != 0)
+                        .unwrap_or(false)
+                    {
                         heads.push(h as u8);
                     }
                 }
@@ -1103,7 +1145,9 @@ pub fn decode_sparse_index(bytes: &[u8]) -> Result<Vec<SparseIndexEntry>, CmfErr
         }
         let mut groups = Vec::with_capacity(n_groups);
         for g in 0..n_groups {
-            groups.push(u16::from_le_bytes(bytes[pos + g * 2..pos + g * 2 + 2].try_into().unwrap()));
+            groups.push(u16::from_le_bytes(
+                bytes[pos + g * 2..pos + g * 2 + 2].try_into().unwrap(),
+            ));
         }
         pos += n_groups * 2;
         let heads = bytes[pos..pos + n_heads].to_vec();

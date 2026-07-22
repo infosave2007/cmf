@@ -116,6 +116,14 @@ JSON carries architecture and provenance — the parts a human reads.
     "rms_norm_eps": 1e-6,
     "norm_style": "qwen",            // "qwen": x̂·w | "gemma": x̂·(1+w)
     "rope_theta": 1000000.0,
+    "yarn": {                         // optional global YaRN profile
+      "factor": 128.0, "original_max_position_embeddings": 8192,
+      "beta_fast": 32.0, "beta_slow": 1.0, "attention_factor": 1.485203
+    },
+    "attention_heads_per_layer": [48, 72, 72, 72], // optional; length = num_layers
+    "sliding_window": 512,
+    "rope_local_base_freq": 10000.0,
+    "local_partial_rotary_factor": 1.0,
     "tie_word_embeddings": false,
     "max_position_embeddings": 262144,
     "linear_conv_kernel_dim": 4,
@@ -135,6 +143,19 @@ per-layer operators by what exists in the directory (q/k biases,
 qk-norms, output gate by projection width, MoE router, GDN projections)
 — not by matching model names. New models of a known family load with
 zero engine changes.
+
+An explicit `SlidingAttention` layer tag selects causal windowed GQA even
+when the local/global schedule is irregular. Such layers use
+`sliding_window`, `rope_local_base_freq`, and
+`local_partial_rotary_factor`; global `FullAttention` layers use
+`rope_theta`, `partial_rotary_factor`, and optional `yarn`. The optional
+`attention_heads_per_layer` array overrides the base Q-head count for each
+layer. Attention projection gating is tensor-presence driven:
+`self_attn.g_proj.weight [num_heads, hidden]` means per-head
+`softplus(g_proj·x)` gating immediately before `o_proj` (a
+`[num_heads·head_dim, hidden]` projection means per-channel gating).
+These fields and tensor semantics cover Laguna without introducing a
+model-name-specific execution operator.
 
 ### 2.1 MTP — multi-token prediction (optional)
 
@@ -166,7 +187,9 @@ arch declares:
 "moe": {
   "num_experts": 256, "top_k": 8, "moe_intermediate_size": 512,
   "norm_topk_prob": true,                       // Qwen2-MoE: false
-  "shared_expert_intermediate_size": 512        // absent if no shared expert
+  "shared_expert_intermediate_size": 512,       // absent if no shared expert
+  "router_sigmoid": true,                       // optional; default = softmax
+  "routed_scaling_factor": 2.5                  // optional; default = 1
 }
 ```
 
@@ -175,8 +198,9 @@ Tensors are ordinary directory entries under HF names:
 ```
 model.layers.{i}.mlp.gate.weight                    [num_experts, hidden]  router
 model.layers.{i}.mlp.experts.{e}.{gate,up,down}_proj.weight
+model.layers.{i}.mlp.expert_bias                    [num_experts] selection only
 model.layers.{i}.mlp.shared_expert.{gate,up,down}_proj.weight
-model.layers.{i}.mlp.shared_expert_gate.weight      [1, hidden]
+model.layers.{i}.mlp.shared_expert_gate.weight      [1, hidden] optional
 ```
 
 Which layers are MoE is decided by the PRESENCE of the router in the
@@ -185,10 +209,13 @@ directory (per-layer, not per-model): Qwen2-MoE's
 layers keep ordinary `mlp.*_proj`.
 
 Execution semantics (HF parity, gated by `tests/moe_parity.sh` across
-four families including the fused AgentWorld layout): softmax over ALL
-router logits → top-k (ties: lower index, torch.topk order) → if
-`norm_topk_prob`, renormalize the selected k → Σwₑ·FFNₑ(x); the shared
-expert is always added with weight `sigmoid(shared_expert_gate·x)`.
+multiple families): by default, softmax over ALL router logits; when
+`router_sigmoid`, score each expert independently with sigmoid. An optional
+`expert_bias` affects top-k selection only, not the gathered weights. Select
+top-k (ties: lower index), optionally renormalize the selected weights, then
+apply `routed_scaling_factor` and compute Σwₑ·FFNₑ(x). The shared expert is
+always added: with weight `sigmoid(shared_expert_gate·x)` when that tensor is
+present, otherwise with weight 1 (Laguna).
 Experts stay quantized in mmap; per token only the pages of the selected
 k are touched — the same residency story as skills. Each expert is a
 separate directory entry with ITS OWN dtype: that is the carrier of

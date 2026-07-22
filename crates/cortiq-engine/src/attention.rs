@@ -30,16 +30,53 @@ pub fn rope_inv_freq(head_dim: usize, base: f32) -> Vec<f32> {
         .collect()
 }
 
+/// Hugging Face-compatible YaRN inverse frequencies. `head_dim` is the
+/// rotary dimension (after partial_rotary_factor), not the full head width.
+pub fn yarn_inv_freq(
+    head_dim: usize,
+    base: f32,
+    factor: f32,
+    original_max_position_embeddings: usize,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Vec<f32> {
+    let correction_dim = |rotations: f32| {
+        (head_dim as f32
+            * (original_max_position_embeddings as f32 / (rotations * 2.0 * std::f32::consts::PI))
+                .ln())
+            / (2.0 * base.ln())
+    };
+    let low = correction_dim(beta_fast).floor().max(0.0) as usize;
+    let high = correction_dim(beta_slow)
+        .ceil()
+        .clamp(0.0, (head_dim / 2).saturating_sub(1) as f32) as usize;
+    let denom = (high.saturating_sub(low)).max(1) as f32;
+    (0..head_dim / 2)
+        .map(|i| {
+            let extrap = 1.0 / base.powf(2.0 * i as f32 / head_dim as f32);
+            let interp = extrap / factor;
+            let ramp = ((i.saturating_sub(low)) as f32 / denom).clamp(0.0, 1.0);
+            let extrapolation = 1.0 - ramp;
+            interp * (1.0 - extrapolation) + extrap * extrapolation
+        })
+        .collect()
+}
+
 /// Rotate one vector in place (RoPE, half-split pairing as in Llama/Qwen).
 pub fn rope_rotate(x: &mut [f32], position: usize, inv_freq: &[f32]) {
+    rope_rotate_scaled(x, position, inv_freq, 1.0);
+}
+
+/// RoPE with an optional post-processing scale on both cos and sin (YaRN).
+pub fn rope_rotate_scaled(x: &mut [f32], position: usize, inv_freq: &[f32], scale: f32) {
     let half = inv_freq.len();
     for (i, &freq) in inv_freq.iter().enumerate() {
         let angle = position as f32 * freq;
         let (sin, cos) = angle.sin_cos();
         let x0 = x[i];
         let x1 = x[i + half];
-        x[i] = x0 * cos - x1 * sin;
-        x[i + half] = x0 * sin + x1 * cos;
+        x[i] = (x0 * cos - x1 * sin) * scale;
+        x[i + half] = (x0 * sin + x1 * cos) * scale;
     }
 }
 
@@ -150,8 +187,12 @@ unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
         use core::arch::aarch64::*;
         let n = a.len().min(b.len());
         let (ap, bp) = (a.as_ptr(), b.as_ptr());
-        let (mut a0, mut a1, mut a2, mut a3) =
-            (vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+        let (mut a0, mut a1, mut a2, mut a3) = (
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+        );
         let mut j = 0usize;
         while j + 16 <= n {
             a0 = vfmaq_f32(a0, vld1q_f32(ap.add(j)), vld1q_f32(bp.add(j)));
@@ -166,7 +207,7 @@ unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
             j += 1;
         }
         sum
-}
+    }
 }
 
 /// exp(x) for one NEON vector — Cephes-style degree-6 polynomial,
@@ -175,9 +216,7 @@ unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
 /// scalar expf there would eat the whole GEMM win.
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn vexpq_f32(
-    x: core::arch::aarch64::float32x4_t,
-) -> core::arch::aarch64::float32x4_t {
+unsafe fn vexpq_f32(x: core::arch::aarch64::float32x4_t) -> core::arch::aarch64::float32x4_t {
     // SAFETY: pure register math.
     unsafe {
         use core::arch::aarch64::*;
@@ -320,7 +359,7 @@ unsafe fn axpy_f32_neon(acc: &mut [f32], row: &[f32], w: f32) {
             *ap.add(j) += w * *rp.add(j);
             j += 1;
         }
-}
+    }
 }
 
 /// Multi-head GQA attention for one position.
@@ -349,8 +388,7 @@ pub fn multi_head_attention(
     inv_freq: &[f32],
 ) -> Vec<f32> {
     let heads_per_kv = num_heads / num_kv_heads;
-    let head_alive =
-        |h: usize| -> bool { active_heads.get(h).copied().unwrap_or(true) };
+    let head_alive = |h: usize| -> bool { active_heads.get(h).copied().unwrap_or(true) };
     // A KV group lives while at least one of its Q heads lives.
     let group_alive: Vec<bool> = (0..num_kv_heads)
         .map(|g| (0..heads_per_kv).any(|i| head_alive(g * heads_per_kv + i)))
@@ -370,7 +408,11 @@ pub fn multi_head_attention(
             }
             q_all[h * head_dim + d] = sum;
         }
-        rope_rotate(&mut q_all[h * head_dim..(h + 1) * head_dim], position, inv_freq);
+        rope_rotate(
+            &mut q_all[h * head_dim..(h + 1) * head_dim],
+            position,
+            inv_freq,
+        );
     }
 
     // ── K/V projection (live groups only) ──
@@ -390,7 +432,11 @@ pub fn multi_head_attention(
             k_new[g * head_dim + d] = ks;
             v_new[g * head_dim + d] = vs;
         }
-        rope_rotate(&mut k_new[g * head_dim..(g + 1) * head_dim], position, inv_freq);
+        rope_rotate(
+            &mut k_new[g * head_dim..(g + 1) * head_dim],
+            position,
+            inv_freq,
+        );
     }
 
     cache.append(&k_new, &v_new, &group_alive);
@@ -481,12 +527,28 @@ pub fn multi_head_attention_pair(
     proj2(wv, &mut v1, &mut v2);
 
     for h in 0..num_heads {
-        rope_rotate(&mut q1[h * head_dim..(h + 1) * head_dim], position, inv_freq);
-        rope_rotate(&mut q2[h * head_dim..(h + 1) * head_dim], position + 1, inv_freq);
+        rope_rotate(
+            &mut q1[h * head_dim..(h + 1) * head_dim],
+            position,
+            inv_freq,
+        );
+        rope_rotate(
+            &mut q2[h * head_dim..(h + 1) * head_dim],
+            position + 1,
+            inv_freq,
+        );
     }
     for g in 0..num_kv_heads {
-        rope_rotate(&mut k1[g * head_dim..(g + 1) * head_dim], position, inv_freq);
-        rope_rotate(&mut k2[g * head_dim..(g + 1) * head_dim], position + 1, inv_freq);
+        rope_rotate(
+            &mut k1[g * head_dim..(g + 1) * head_dim],
+            position,
+            inv_freq,
+        );
+        rope_rotate(
+            &mut k2[g * head_dim..(g + 1) * head_dim],
+            position + 1,
+            inv_freq,
+        );
     }
 
     // ── Sequential attention: p, then p+1 (causal dependency) ──
@@ -501,8 +563,7 @@ pub fn multi_head_attention_pair(
                 continue;
             }
             let _ = stored;
-            let (out, probs) =
-                cache.attend(&q_all[h * head_dim..(h + 1) * head_dim], g);
+            let (out, probs) = cache.attend(&q_all[h * head_dim..(h + 1) * head_dim], g);
             attn_out[h * head_dim..(h + 1) * head_dim].copy_from_slice(&out);
             for (dst, &p) in imp.iter_mut().zip(&probs) {
                 *dst += p;
@@ -579,6 +640,11 @@ pub struct QwenAttnCfg<'a> {
     /// Qwen3.5: wq rows = 2·nh·hd, per-head [q(hd); gate(hd)];
     /// attention output is multiplied by sigmoid(gate) before o_proj.
     pub output_gate: bool,
+    /// Laguna: separate projection followed by softplus. Bool = per-head
+    /// projection (broadcast across head_dim), false = per-element.
+    pub softplus_gate: Option<(&'a QTensor, bool)>,
+    /// Multiplier applied to both RoPE cos and sin (YaRN attention factor).
+    pub rope_scale: f32,
     pub rms_eps: f64,
     /// Attention score scale (1/√head_dim unless the arch overrides).
     pub scale: f32,
@@ -670,9 +736,7 @@ fn project_matvecs(
     // Runtime probe (Batch class): the batch either amortizes its
     // submit+poll on this driver stack or the fused CPU dispatch wins.
     let mut done = false;
-    if crate::gpu::enabled_here()
-        && (wq.rows() >= crate::gpu::min_rows() || wq.is_q1())
-    {
+    if crate::gpu::enabled_here() && (wq.rows() >= crate::gpu::min_rows() || wq.is_q1()) {
         let arm = if wq.is_q1() && crate::gpu::q1_force() {
             crate::gpu::ProbeArm::Gpu
         } else {
@@ -792,10 +856,20 @@ fn finish_projection(
     // Partial RoPE: rotate only the first rotary_dim dims of each head.
     let rd = cfg.rotary_dim.min(hd);
     for h in 0..nh {
-        rope_rotate(&mut q[h * hd..h * hd + rd], position, cfg.inv_freq);
+        rope_rotate_scaled(
+            &mut q[h * hd..h * hd + rd],
+            position,
+            cfg.inv_freq,
+            cfg.rope_scale,
+        );
     }
     for g in 0..nkv {
-        rope_rotate(&mut k[g * hd..g * hd + rd], position, cfg.inv_freq);
+        rope_rotate_scaled(
+            &mut k[g * hd..g * hd + rd],
+            position,
+            cfg.inv_freq,
+            cfg.rope_scale,
+        );
     }
     Projected { q, gate, k, v }
 }
@@ -822,7 +896,14 @@ fn attend_all_heads(
         }
         let first = window.map(|w| stored.saturating_sub(w)).unwrap_or(0);
         let span = g * heads_per_kv * hd..(g + 1) * heads_per_kv * hd;
-        cache.attend_group(&q[span.clone()], g, &mut attn_out[span], &mut imp, scale, first);
+        cache.attend_group(
+            &q[span.clone()],
+            g,
+            &mut attn_out[span],
+            &mut imp,
+            scale,
+            first,
+        );
     }
     (attn_out, imp)
 }
@@ -832,6 +913,34 @@ fn apply_gate(ao: &mut [f32], gate: &[f32]) {
     for (a, &g) in ao.iter_mut().zip(gate) {
         *a *= 1.0 / (1.0 + (-g).exp());
     }
+}
+
+#[inline]
+fn softplus(x: f32) -> f32 {
+    x.max(0.0) + (-x.abs()).exp().ln_1p()
+}
+
+fn apply_projected_gate(ao: &mut [f32], raw: &[f32], per_head: bool, head_dim: usize) {
+    if per_head {
+        for (h, &g) in raw.iter().enumerate() {
+            let gain = softplus(g);
+            for a in &mut ao[h * head_dim..(h + 1) * head_dim] {
+                *a *= gain;
+            }
+        }
+    } else {
+        for (a, &g) in ao.iter_mut().zip(raw) {
+            *a *= softplus(g);
+        }
+    }
+}
+
+fn projected_gate(hidden: &[f32], cfg: &QwenAttnCfg) -> Option<Vec<f32>> {
+    cfg.softplus_gate.map(|(proj, _)| {
+        let mut gate = take_buf(proj.rows());
+        proj.matvec(hidden, &mut gate, cfg.pool);
+        gate
+    })
 }
 
 /// The CPU middle of an attention layer whose QKV matvecs already ran
@@ -878,10 +987,17 @@ pub fn qwen_attention(
     cfg: &QwenAttnCfg,
 ) -> Vec<f32> {
     let (q_raw, k, v) = project_matvecs(hidden, wq, wk, wv, cfg);
+    let mut projected = projected_gate(hidden, cfg);
     let mut ao = qwen_attention_core(q_raw, k, v, cache, cfg);
+    if let (Some(raw), Some((_, per_head))) = (projected.as_deref(), cfg.softplus_gate) {
+        apply_projected_gate(&mut ao, raw, per_head, cfg.head_dim);
+    }
     let mut out = take_buf(cfg.hidden_size);
     wo.matvec(&ao, &mut out, cfg.pool);
     recycle_buf(&mut ao);
+    if let Some(mut gate) = projected.take() {
+        recycle_buf(&mut gate);
+    }
     out
 }
 
@@ -915,6 +1031,11 @@ pub fn qwen_attention_batch(
     wq.matmat(normed_all, b, &mut q_all, cfg.pool);
     wk.matmat(normed_all, b, &mut k_all, cfg.pool);
     wv.matmat(normed_all, b, &mut v_all, cfg.pool);
+    let mut projected_all = cfg.softplus_gate.map(|(proj, _)| {
+        let mut values = take_buf(b * proj.rows());
+        proj.matmat(normed_all, b, &mut values, cfg.pool);
+        values
+    });
 
     // ── per-position: bias, gate split, qk-norm, partial RoPE, append;
     //    the attend either runs per position (exact historical order)
@@ -926,14 +1047,23 @@ pub fn qwen_attention_batch(
     let batched_attend = b >= 32
         && cache.mode == crate::kv_cache::KvMode::F32
         && (crate::qtensor::accel_gemm_enabled()
-            || std::env::var("CMF_FORCE_NEON_GEMM").map(|v| v == "1").unwrap_or(false));
+            || std::env::var("CMF_FORCE_NEON_GEMM")
+                .map(|v| v == "1")
+                .unwrap_or(false));
     #[cfg(not(target_arch = "aarch64"))]
     let batched_attend = false;
     let s0 = cache.seq_len;
     let mut ao_all = take_buf(b * nh * hd);
-    let mut q_rope_all = if batched_attend { take_buf(b * nh * hd) } else { Vec::new() };
-    let mut gates_all =
-        if batched_attend && cfg.output_gate { take_buf(b * nh * hd) } else { Vec::new() };
+    let mut q_rope_all = if batched_attend {
+        take_buf(b * nh * hd)
+    } else {
+        Vec::new()
+    };
+    let mut gates_all = if batched_attend && cfg.output_gate {
+        take_buf(b * nh * hd)
+    } else {
+        Vec::new()
+    };
     let rd = cfg.rotary_dim.min(hd);
     for bi in 0..b {
         let pos = cfg.position + bi;
@@ -970,7 +1100,12 @@ pub fn qwen_attention_batch(
         }
         if let Some(qw) = cfg.q_norm {
             for hh in 0..nh {
-                rmsnorm_head(&mut q[hh * hd..hh * hd + hd], qw, cfg.rms_eps, cfg.norm_style);
+                rmsnorm_head(
+                    &mut q[hh * hd..hh * hd + hd],
+                    qw,
+                    cfg.rms_eps,
+                    cfg.norm_style,
+                );
             }
         }
         if let Some(kw) = cfg.k_norm {
@@ -984,10 +1119,20 @@ pub fn qwen_attention_batch(
             }
         }
         for hh in 0..nh {
-            rope_rotate(&mut q[hh * hd..hh * hd + rd], pos, cfg.inv_freq);
+            rope_rotate_scaled(
+                &mut q[hh * hd..hh * hd + rd],
+                pos,
+                cfg.inv_freq,
+                cfg.rope_scale,
+            );
         }
         for g in 0..nkv {
-            rope_rotate(&mut k[g * hd..g * hd + rd], pos, cfg.inv_freq);
+            rope_rotate_scaled(
+                &mut k[g * hd..g * hd + rd],
+                pos,
+                cfg.inv_freq,
+                cfg.rope_scale,
+            );
         }
 
         cache.o1_push_q(&q);
@@ -1003,6 +1148,12 @@ pub fn qwen_attention_batch(
             cache.accumulate_imp(&imp);
             if cfg.output_gate {
                 apply_gate(&mut ao, &gate);
+            }
+            if let (Some(all), Some((proj, per_head))) =
+                (projected_all.as_deref(), cfg.softplus_gate)
+            {
+                let raw = &all[bi * proj.rows()..(bi + 1) * proj.rows()];
+                apply_projected_gate(&mut ao, raw, per_head, hd);
             }
             ao_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&ao);
             recycle_buf(&mut ao);
@@ -1028,6 +1179,16 @@ pub fn qwen_attention_batch(
         if cfg.output_gate {
             apply_gate(&mut ao_all, &gates_all);
         }
+        if let (Some(all), Some((proj, per_head))) = (projected_all.as_deref(), cfg.softplus_gate) {
+            for bi in 0..b {
+                apply_projected_gate(
+                    &mut ao_all[bi * nh * hd..(bi + 1) * nh * hd],
+                    &all[bi * proj.rows()..(bi + 1) * proj.rows()],
+                    per_head,
+                    hd,
+                );
+            }
+        }
     }
     recycle_buf(&mut q_rope_all);
     recycle_buf(&mut gates_all);
@@ -1039,6 +1200,9 @@ pub fn qwen_attention_batch(
     recycle_buf(&mut k_all);
     recycle_buf(&mut v_all);
     recycle_buf(&mut ao_all);
+    if let Some(mut values) = projected_all.take() {
+        recycle_buf(&mut values);
+    }
     out
 }
 
@@ -1059,12 +1223,19 @@ pub fn qwen_attention_nystrom(
     cfg: &QwenAttnCfg,
 ) -> Vec<f32> {
     let p = project_position(hidden, wq, wk, wv, cfg, cfg.position);
+    let mut projected = projected_gate(hidden, cfg);
     let mut ao = cache.o1_step(&p.q, &p.k, &p.v, cfg.num_heads);
     if cfg.output_gate {
         apply_gate(&mut ao, &p.gate);
     }
+    if let (Some(raw), Some((_, per_head))) = (projected.as_deref(), cfg.softplus_gate) {
+        apply_projected_gate(&mut ao, raw, per_head, cfg.head_dim);
+    }
     let mut out = vec![0.0f32; cfg.hidden_size];
     wo.matvec(&ao, &mut out, cfg.pool);
+    if let Some(mut gate) = projected.take() {
+        recycle_buf(&mut gate);
+    }
     out
 }
 
@@ -1143,10 +1314,20 @@ pub fn qwen_attention_pair(
         }
         let rd = cfg.rotary_dim.min(hd);
         for h in 0..nh {
-            rope_rotate(&mut q[h * hd..h * hd + rd], pos, cfg.inv_freq);
+            rope_rotate_scaled(
+                &mut q[h * hd..h * hd + rd],
+                pos,
+                cfg.inv_freq,
+                cfg.rope_scale,
+            );
         }
         for g in 0..nkv {
-            rope_rotate(&mut k[g * hd..g * hd + rd], pos, cfg.inv_freq);
+            rope_rotate_scaled(
+                &mut k[g * hd..g * hd + rd],
+                pos,
+                cfg.inv_freq,
+                cfg.rope_scale,
+            );
         }
         let _ = &mut gate;
         (q, gate)
@@ -1161,24 +1342,35 @@ pub fn qwen_attention_pair(
     cache.o1_push_q(&qb);
     // Empty alive slice = every head alive (see qwen_attention).
     cache.append(&k1, &v1, &[]);
-    let (mut a1, mut imp1) = attend_all_heads(&qa, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window);
+    let (mut a1, mut imp1) =
+        attend_all_heads(&qa, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window);
     cache.accumulate_imp(&imp1);
 
     cache.append(&k2, &v2, &[]);
-    let (mut a2, mut imp2) = attend_all_heads(&qb, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window);
+    let (mut a2, mut imp2) =
+        attend_all_heads(&qb, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window);
     cache.accumulate_imp(&imp2);
 
     if cfg.output_gate {
         apply_gate(&mut a1, &gate1);
         apply_gate(&mut a2, &gate2);
     }
+    if let Some((proj, per_head)) = cfg.softplus_gate {
+        let mut g1 = take_buf(proj.rows());
+        let mut g2 = take_buf(proj.rows());
+        proj.matvec2(h1, h2, &mut g1, &mut g2, cfg.pool);
+        apply_projected_gate(&mut a1, &g1, per_head, hd);
+        apply_projected_gate(&mut a2, &g2, per_head, hd);
+        recycle_buf(&mut g1);
+        recycle_buf(&mut g2);
+    }
 
     let mut o1 = take_buf(cfg.hidden_size);
     let mut o2 = take_buf(cfg.hidden_size);
     wo.matvec2(&a1, &a2, &mut o1, &mut o2, cfg.pool);
     for b in [
-        &mut qa, &mut qb, &mut gate1, &mut gate2, &mut k1, &mut k2, &mut v1, &mut v2,
-        &mut a1, &mut a2, &mut imp1, &mut imp2,
+        &mut qa, &mut qb, &mut gate1, &mut gate2, &mut k1, &mut k2, &mut v1, &mut v2, &mut a1,
+        &mut a2, &mut imp1, &mut imp2,
     ] {
         recycle_buf(b);
     }
@@ -1228,6 +1420,8 @@ mod tests {
             q_norm: None,
             k_norm: None,
             output_gate: false,
+            softplus_gate: None,
+            rope_scale: 1.0,
             bias: Some((&bq, &bk, &bv)),
             rms_eps: 1e-6,
             norm_style: cortiq_core::NormStyle::Qwen,
@@ -1248,6 +1442,61 @@ mod tests {
         for (a, b) in r2.iter().zip(&p2) {
             assert!((a - b).abs() < 1e-5, "lane2 {a} vs {b}");
         }
+    }
+
+    #[test]
+    fn laguna_per_head_softplus_gate_matches_reference() {
+        let (nh, nkv, hd, hs) = (2usize, 1usize, 2usize, 4usize);
+        let zeros = |rows, cols| QTensor::from_f32(vec![0.0; rows * cols], rows, cols);
+        let wq = zeros(nh * hd, hs);
+        let wk = zeros(nkv * hd, hs);
+        let wv = QTensor::from_f32(vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], nkv * hd, hs);
+        let wo = QTensor::from_f32(
+            vec![
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+            hs,
+            nh * hd,
+        );
+        let gate = QTensor::from_f32(vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], nh, hs);
+        let inv = rope_inv_freq(hd, 10_000.0);
+        let cfg = QwenAttnCfg {
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: hd,
+            hidden_size: hs,
+            position: 0,
+            inv_freq: &inv,
+            rotary_dim: hd,
+            q_norm: None,
+            k_norm: None,
+            output_gate: false,
+            softplus_gate: Some((&gate, true)),
+            rope_scale: 1.0,
+            rms_eps: 1e-6,
+            scale: 1.0 / (hd as f32).sqrt(),
+            window: None,
+            v_norm: false,
+            norm_style: cortiq_core::NormStyle::Qwen,
+            bias: None,
+            pool: None,
+        };
+        let hidden = vec![0.0, 1.0, 2.0, 3.0];
+        let mut cache = LayerKvCache::new(nkv, hd);
+        let out = qwen_attention(&hidden, &wq, &wk, &wv, &wo, &mut cache, &cfg);
+        let expected = [0.0, softplus(0.0), 0.0, softplus(1.0)];
+        for (actual, expected) in out.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn yarn_frequency_endpoints_match_interpolation_contract() {
+        let freq = yarn_inv_freq(64, 500_000.0, 128.0, 8192, 32.0, 1.0);
+        let base = rope_inv_freq(64, 500_000.0);
+        assert_eq!(freq.len(), 32);
+        assert!((freq[0] - base[0]).abs() < 1e-7);
+        assert!((freq[31] - base[31] / 128.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1306,14 +1555,19 @@ mod tests {
         );
         assert_eq!(cache.head_len(0), 1, "live group cached");
         assert_eq!(cache.head_len(1), 0, "dead group must not be cached");
-        assert!(out.iter().any(|&x| x.abs() > 1e-9), "live heads still produce output");
+        assert!(
+            out.iter().any(|&x| x.abs() > 1e-9),
+            "live heads still produce output"
+        );
     }
 
     #[test]
     fn attention_pair_equals_two_sequential_calls() {
         let (heads, kv, hd, hidden) = (4usize, 2usize, 4usize, 8usize);
         let mk = |salt: usize, n: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i * 7 + salt * 13) % 89) as f32 / 89.0 - 0.5).collect()
+            (0..n)
+                .map(|i| ((i * 7 + salt * 13) % 89) as f32 / 89.0 - 0.5)
+                .collect()
         };
         let h1 = mk(1, hidden);
         let h2 = mk(2, hidden);
@@ -1335,7 +1589,19 @@ mod tests {
         // Fused pair.
         let mut c_pair = LayerKvCache::new(kv, hd);
         let (p1, p2) = multi_head_attention_pair(
-            &h1, &h2, &wq, &wk, &wv, &wo, &mut c_pair, heads, kv, hd, hidden, 5, &inv_freq,
+            &h1,
+            &h2,
+            &wq,
+            &wk,
+            &wv,
+            &wo,
+            &mut c_pair,
+            heads,
+            kv,
+            hd,
+            hidden,
+            5,
+            &inv_freq,
         );
 
         assert_eq!(r1, p1, "pair lane 1 must be bit-identical");
@@ -1348,16 +1614,36 @@ mod tests {
     fn masked_equals_dense_when_all_heads_alive() {
         let (heads, kv, hd, hidden) = (2usize, 1usize, 4usize, 8usize);
         let h_in: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.3).sin()).collect();
-        let wq: Vec<f32> = (0..heads * hd * hidden).map(|i| (i as f32 * 0.01).cos() * 0.1).collect();
-        let wk: Vec<f32> = (0..kv * hd * hidden).map(|i| (i as f32 * 0.02).sin() * 0.1).collect();
-        let wv: Vec<f32> = (0..kv * hd * hidden).map(|i| (i as f32 * 0.03).cos() * 0.1).collect();
-        let wo: Vec<f32> = (0..hidden * heads * hd).map(|i| (i as f32 * 0.04).sin() * 0.1).collect();
+        let wq: Vec<f32> = (0..heads * hd * hidden)
+            .map(|i| (i as f32 * 0.01).cos() * 0.1)
+            .collect();
+        let wk: Vec<f32> = (0..kv * hd * hidden)
+            .map(|i| (i as f32 * 0.02).sin() * 0.1)
+            .collect();
+        let wv: Vec<f32> = (0..kv * hd * hidden)
+            .map(|i| (i as f32 * 0.03).cos() * 0.1)
+            .collect();
+        let wo: Vec<f32> = (0..hidden * heads * hd)
+            .map(|i| (i as f32 * 0.04).sin() * 0.1)
+            .collect();
 
         let mut c1 = LayerKvCache::new(kv, hd);
         let mut c2 = LayerKvCache::new(kv, hd);
         let inv_freq = rope_inv_freq(hd, 1e4);
         let dense = multi_head_attention(
-            &h_in, &wq, &wk, &wv, &wo, &mut c1, heads, kv, hd, hidden, 0, &[true, true], &inv_freq,
+            &h_in,
+            &wq,
+            &wk,
+            &wv,
+            &wo,
+            &mut c1,
+            heads,
+            kv,
+            hd,
+            hidden,
+            0,
+            &[true, true],
+            &inv_freq,
         );
         let masked = multi_head_attention(
             &h_in, &wq, &wk, &wv, &wo, &mut c2, heads, kv, hd, hidden, 0, &[true; 2], &inv_freq,

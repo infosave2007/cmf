@@ -60,7 +60,11 @@ fn blend_f32(model: &CmfModel, name: &str, list: &[(String, f32)]) -> Result<Vec
     let mut acc: Option<Vec<f32>> = None;
     for (sid, w) in list {
         let sname = format!("skill.{sid}.{name}");
-        let src = if model.tensor(&sname).is_some() { &sname } else { name };
+        let src = if model.tensor(&sname).is_some() {
+            &sname
+        } else {
+            name
+        };
         let t = dequant_by_name(model, src)?;
         match &mut acc {
             None => {
@@ -148,7 +152,9 @@ pub(crate) fn build_layer_ffn(
         return Ok(FfnKind::Dense(load_dense(&format!("{prefix}mlp."))?));
     }
     let cfg = arch.moe.as_ref().ok_or_else(|| {
-        CmfError::Parse(format!("{router_name} present but header has no arch.moe block"))
+        CmfError::Parse(format!(
+            "{router_name} present but header has no arch.moe block"
+        ))
     })?;
     let experts = (0..cfg.num_experts)
         .map(|e| load_dense(&format!("{prefix}mlp.experts.{e}.")))
@@ -157,9 +163,14 @@ pub(crate) fn build_layer_ffn(
         .tensor(&format!("{prefix}mlp.shared_expert.gate_proj.weight"))
         .is_some()
     {
+        let gate_name = format!("{prefix}mlp.shared_expert_gate.weight");
         Some((
             load_dense(&format!("{prefix}mlp.shared_expert."))?,
-            load_matrix(model, &format!("{prefix}mlp.shared_expert_gate.weight"), force_f32, ov)?,
+            if model.tensor(&gate_name).is_some() {
+                Some(load_matrix(model, &gate_name, force_f32, ov)?)
+            } else {
+                None
+            },
         ))
     } else {
         None
@@ -199,8 +210,8 @@ fn load_matrix(
             let entry = model
                 .tensor(name)
                 .ok_or_else(|| CmfError::MissingTensor(name.to_string()))?;
-            let data = blend_f32(model, name, list)
-                .map_err(|e| CmfError::Parse(format!("blend: {e}")))?;
+            let data =
+                blend_f32(model, name, list).map_err(|e| CmfError::Parse(format!("blend: {e}")))?;
             return Ok(QTensor::from_f32(data, entry.shape[0], entry.shape[1]));
         }
     }
@@ -233,7 +244,10 @@ fn load_matrix(
 
 impl Pipeline {
     /// Build a runnable pipeline from an opened CMF model.
-    pub fn from_model(model: &Arc<CmfModel>, sampler_config: SamplerConfig) -> Result<Self, CmfError> {
+    pub fn from_model(
+        model: &Arc<CmfModel>,
+        sampler_config: SamplerConfig,
+    ) -> Result<Self, CmfError> {
         Self::from_model_with_skill(model, sampler_config, None)
     }
 
@@ -278,7 +292,12 @@ impl Pipeline {
             if !known {
                 return Err(CmfError::Parse(format!(
                     "skill '{sid}' not in this container (header.skills: {:?})",
-                    model.header.skills.iter().map(|s| &s.id).collect::<Vec<_>>()
+                    model
+                        .header
+                        .skills
+                        .iter()
+                        .map(|s| &s.id)
+                        .collect::<Vec<_>>()
                 )));
             }
             tracing::info!(
@@ -288,6 +307,35 @@ impl Pipeline {
         }
         let arch = model.arch().clone();
         let err = |e: String| CmfError::Parse(format!("weight loading: {e}"));
+        if let Some(heads) = &arch.attention_heads_per_layer {
+            if heads.len() != arch.num_layers {
+                return Err(CmfError::Parse(format!(
+                    "arch.attention_heads_per_layer has {} entries, expected {}",
+                    heads.len(),
+                    arch.num_layers
+                )));
+            }
+            if let Some((li, &nh)) = heads
+                .iter()
+                .enumerate()
+                .find(|(_, nh)| **nh == 0 || **nh % arch.num_kv_heads != 0)
+            {
+                return Err(CmfError::Parse(format!(
+                    "layer {li} has {nh} Q heads, which must be nonzero and divisible by {} KV heads",
+                    arch.num_kv_heads
+                )));
+            }
+        }
+        if arch
+            .layer_types
+            .iter()
+            .any(|t| matches!(t, LayerType::SlidingAttention))
+            && arch.sliding_window.is_none()
+        {
+            return Err(CmfError::Parse(
+                "model has SlidingAttention layers but no arch.sliding_window".into(),
+            ));
+        }
 
         // Masks × quantized mmap: only ATTENTION keeps f32 (the head-mask
         // path needs f32 slices). FFN masks now run sparse directly on the
@@ -384,10 +432,7 @@ impl Pipeline {
                         num_k_heads: need(arch.linear_num_key_heads, "linear_num_key_heads")?,
                         key_head_dim: need(arch.linear_key_head_dim, "linear_key_head_dim")?,
                         value_head_dim: lc.value_head_dim,
-                        conv_kernel: need(
-                            arch.linear_conv_kernel_dim,
-                            "linear_conv_kernel_dim",
-                        )?,
+                        conv_kernel: need(arch.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
                         hidden_size: arch.hidden_size,
                         rms_eps: arch.rms_norm_eps as f64,
                     });
@@ -402,8 +447,10 @@ impl Pipeline {
         }
 
         // ── Short-convolution geometry (LFM2 conv mixer layers) ──
-        let has_short_conv =
-            arch.layer_types.iter().any(|t| matches!(t, LayerType::ShortConv));
+        let has_short_conv = arch
+            .layer_types
+            .iter()
+            .any(|t| matches!(t, LayerType::ShortConv));
         let short_conv_cfg = if has_short_conv {
             Some(ShortConvCfg {
                 hidden_size: arch.hidden_size,
@@ -420,7 +467,7 @@ impl Pipeline {
         };
 
         // ── Layers ──
-        let load_full_attn = |prefix: &str| -> Result<AttnKind, CmfError> {
+        let load_full_attn = |prefix: &str, layer: Option<usize>| -> Result<AttnKind, CmfError> {
             let t = |suffix: &str| load_matrix(model, &format!("{prefix}{suffix}"), force_f32, ov);
             let n = |suffix: &str| -> Option<Vec<f32>> {
                 model
@@ -428,11 +475,49 @@ impl Pipeline {
                     .and_then(|_| load_f32(model, &format!("{prefix}{suffix}"), ov).ok())
             };
             let wq = t("self_attn.q_proj.weight")?;
+            let nh = layer
+                .and_then(|li| {
+                    arch.attention_heads_per_layer
+                        .as_ref()
+                        .and_then(|v| v.get(li).copied())
+                })
+                .unwrap_or(arch.num_attention_heads);
             // Qwen3.5 output gate: q_proj rows = 2·nh·hd (per-head [q; gate]).
             // Gemma-4 global layers legitimately have nh·global_head_dim
             // rows (which can equal 2·nh·hd) — never gated.
-            let output_gate = arch.global_head_dim.is_none()
-                && wq.rows() == 2 * arch.num_attention_heads * arch.head_dim;
+            let output_gate = arch.global_head_dim.is_none() && wq.rows() == 2 * nh * arch.head_dim;
+            if !output_gate && wq.rows() != nh * arch.head_dim {
+                return Err(CmfError::Parse(format!(
+                    "{prefix}self_attn.q_proj.weight rows={} != heads({nh}) * head_dim({})",
+                    wq.rows(),
+                    arch.head_dim
+                )));
+            }
+            let gate_name = format!("{prefix}self_attn.g_proj.weight");
+            let softplus_gate = if model.tensor(&gate_name).is_some() {
+                let gate = load_matrix(model, &gate_name, force_f32, ov)?;
+                if gate.cols() != arch.hidden_size {
+                    return Err(CmfError::Parse(format!(
+                        "{gate_name} cols={} != hidden_size ({})",
+                        gate.cols(),
+                        arch.hidden_size
+                    )));
+                }
+                let per_head = if gate.rows() == nh {
+                    true
+                } else if gate.rows() == nh * arch.head_dim {
+                    false
+                } else {
+                    return Err(CmfError::Parse(format!(
+                        "{gate_name} rows={} must equal heads ({nh}) or heads*head_dim ({})",
+                        gate.rows(),
+                        nh * arch.head_dim
+                    )));
+                };
+                Some((gate, per_head))
+            } else {
+                None
+            };
             // Qwen2-family projection biases (by tensor presence).
             let bias = match (
                 n("self_attn.q_proj.bias"),
@@ -450,6 +535,7 @@ impl Pipeline {
                 q_norm: n("self_attn.q_norm.weight"),
                 k_norm: n("self_attn.k_norm.weight"),
                 output_gate,
+                softplus_gate,
                 bias,
             })
         };
@@ -458,7 +544,12 @@ impl Pipeline {
             if gdn_cfg.is_some() {
                 // Faithful vendor operator: tensor names 1:1 with the source.
                 let t = |suffix: &str| {
-                    load_matrix(model, &format!("{prefix}linear_attn.{suffix}"), force_f32, ov)
+                    load_matrix(
+                        model,
+                        &format!("{prefix}linear_attn.{suffix}"),
+                        force_f32,
+                        ov,
+                    )
                 };
                 let f = |suffix: &str| {
                     load_f32(model, &format!("{prefix}linear_attn.{suffix}"), ov).map_err(err)
@@ -475,7 +566,9 @@ impl Pipeline {
                     out_proj: t("out_proj.weight")?,
                 }));
             }
-            let t = |suffix: &str| load_matrix(model, &format!("{prefix}vmf_attn.{suffix}"), force_f32, ov);
+            let t = |suffix: &str| {
+                load_matrix(model, &format!("{prefix}vmf_attn.{suffix}"), force_f32, ov)
+            };
             let a_log = load_f32(model, &format!("{prefix}vmf_attn.A_log"), ov).map_err(err)?;
             // Selective-write gate κ (hybrid_k core): optional by tensor
             // presence — files without it run the classic phase kernel
@@ -496,10 +589,7 @@ impl Pipeline {
                 thk: t("thk.weight")?,
                 v_proj: t("v_proj.weight")?,
                 out_proj: t("out_proj.weight")?,
-                decay: a_log
-                    .iter()
-                    .map(|&a| (-(a as f64).exp()).exp())
-                    .collect(),
+                decay: a_log.iter().map(|&a| (-(a as f64).exp()).exp()).collect(),
                 k_gate,
             }))
         };
@@ -509,7 +599,12 @@ impl Pipeline {
         // out_proj [hidden, hidden]. Names canonicalized at convert time.
         let load_short_conv = |prefix: &str| -> Result<AttnKind, CmfError> {
             let t = |suffix: &str| {
-                load_matrix(model, &format!("{prefix}short_conv.{suffix}"), force_f32, ov)
+                load_matrix(
+                    model,
+                    &format!("{prefix}short_conv.{suffix}"),
+                    force_f32,
+                    ov,
+                )
             };
             Ok(AttnKind::ShortConv(ShortConvWeights {
                 in_proj: t("in_proj.weight")?,
@@ -525,7 +620,7 @@ impl Pipeline {
             let attn = match arch.layer_types.get(li) {
                 Some(LayerType::LinearAttention) => load_linear_attn(&prefix)?,
                 Some(LayerType::ShortConv) => load_short_conv(&prefix)?,
-                _ => load_full_attn(&prefix)?,
+                _ => load_full_attn(&prefix, Some(li))?,
             };
             // Gemma-2/3 sandwich: `pre_feedforward_layernorm` present →
             // it is the pre-FFN norm, and post_attention/post_feedforward
@@ -533,25 +628,38 @@ impl Pipeline {
             let pre_ffn = format!("{prefix}pre_feedforward_layernorm.weight");
             let sandwich = model.tensor(&pre_ffn).is_some();
             layers.push(LayerWeights {
-                input_norm: load_f32(model, &format!("{prefix}input_layernorm.weight"), ov).map_err(err)?,
+                input_norm: load_f32(model, &format!("{prefix}input_layernorm.weight"), ov)
+                    .map_err(err)?,
                 post_norm: if sandwich {
                     load_f32(model, &pre_ffn, ov).map_err(err)?
                 } else {
-                    load_f32(model, &format!("{prefix}post_attention_layernorm.weight"), ov)
-                        .map_err(err)?
+                    load_f32(
+                        model,
+                        &format!("{prefix}post_attention_layernorm.weight"),
+                        ov,
+                    )
+                    .map_err(err)?
                 },
                 attn_out_norm: if sandwich {
                     Some(
-                        load_f32(model, &format!("{prefix}post_attention_layernorm.weight"), ov)
-                            .map_err(err)?,
+                        load_f32(
+                            model,
+                            &format!("{prefix}post_attention_layernorm.weight"),
+                            ov,
+                        )
+                        .map_err(err)?,
                     )
                 } else {
                     None
                 },
                 ffn_out_norm: if sandwich {
                     Some(
-                        load_f32(model, &format!("{prefix}post_feedforward_layernorm.weight"), ov)
-                            .map_err(err)?,
+                        load_f32(
+                            model,
+                            &format!("{prefix}post_feedforward_layernorm.weight"),
+                            ov,
+                        )
+                        .map_err(err)?,
                     )
                 } else {
                     None
@@ -579,7 +687,7 @@ impl Pipeline {
                 )));
             }
             let p = "model.mtp.";
-            let attn = load_full_attn("model.mtp.layers.0.")?;
+            let attn = load_full_attn("model.mtp.layers.0.", None)?;
             Some(MtpModule {
                 enorm: load_f32(model, &format!("{p}enorm.weight"), ov).map_err(err)?,
                 hnorm: load_f32(model, &format!("{p}hnorm.weight"), ov).map_err(err)?,
@@ -597,9 +705,24 @@ impl Pipeline {
                     )
                     .map_err(err)?,
                     ffn: FfnKind::Dense(DenseFfn {
-                        gate_proj: load_matrix(model, &format!("{p}layers.0.mlp.gate_proj.weight"), false, ov)?,
-                        up_proj: load_matrix(model, &format!("{p}layers.0.mlp.up_proj.weight"), false, ov)?,
-                        down_proj: load_matrix(model, &format!("{p}layers.0.mlp.down_proj.weight"), false, ov)?,
+                        gate_proj: load_matrix(
+                            model,
+                            &format!("{p}layers.0.mlp.gate_proj.weight"),
+                            false,
+                            ov,
+                        )?,
+                        up_proj: load_matrix(
+                            model,
+                            &format!("{p}layers.0.mlp.up_proj.weight"),
+                            false,
+                            ov,
+                        )?,
+                        down_proj: load_matrix(
+                            model,
+                            &format!("{p}layers.0.mlp.down_proj.weight"),
+                            false,
+                            ov,
+                        )?,
                         act: crate::pipeline::Act::from_arch(&arch.hidden_act),
                     }),
                     attn,
@@ -620,7 +743,11 @@ impl Pipeline {
                 .filter(|t| matches!(t, LayerType::LinearAttention))
                 .count(),
             model.total_param_count() as f64 / 1e9,
-            if force_f32 { "f32 (masked)" } else { "quantized mmap" },
+            if force_f32 {
+                "f32 (masked)"
+            } else {
+                "quantized mmap"
+            },
             if mtp.is_some() { "yes" } else { "no" }
         );
 
@@ -655,6 +782,18 @@ impl Pipeline {
         );
         let rotary = ((arch.head_dim as f32 * arch.partial_rotary_factor) as usize).max(2);
         pipeline.set_rotary(rotary, arch.rope_theta as f32);
+        pipeline.attention_heads_per_layer = arch.attention_heads_per_layer.clone();
+        if let Some(yarn) = &arch.yarn {
+            pipeline.inv_freq = std::sync::Arc::new(crate::attention::yarn_inv_freq(
+                rotary,
+                arch.rope_theta as f32,
+                yarn.factor,
+                yarn.original_max_position_embeddings,
+                yarn.beta_fast,
+                yarn.beta_slow,
+            ));
+            pipeline.rope_scale = yarn.attention_factor;
+        }
         // Gemma-family extras: embedding scale, attention-scale
         // override, and (Gemma-3) sliding-window layers with their own
         // local RoPE base.
@@ -667,6 +806,29 @@ impl Pipeline {
             if let Some(base) = arch.rope_local_base_freq {
                 pipeline.inv_freq_local = Some(std::sync::Arc::new(
                     crate::attention::rope_inv_freq(rotary, base as f32),
+                ));
+            }
+        }
+        let explicit_sliding: Vec<bool> = arch
+            .layer_types
+            .iter()
+            .map(|t| matches!(t, cortiq_core::LayerType::SlidingAttention))
+            .collect();
+        if explicit_sliding.iter().any(|&v| v) {
+            pipeline.sliding_layers = Some(explicit_sliding);
+            if let Some(w) = arch.sliding_window {
+                pipeline.swa = Some((w, usize::MAX));
+            }
+            let local_rotary = ((arch.head_dim as f32
+                * arch
+                    .local_partial_rotary_factor
+                    .unwrap_or(arch.partial_rotary_factor))
+                as usize)
+                .max(2);
+            pipeline.rotary_dim_local = Some(local_rotary);
+            if let Some(base) = arch.rope_local_base_freq {
+                pipeline.inv_freq_local = Some(std::sync::Arc::new(
+                    crate::attention::rope_inv_freq(local_rotary, base as f32),
                 ));
             }
         }
@@ -687,8 +849,7 @@ impl Pipeline {
             if let Some((_, p)) = pipeline.swa {
                 for li in 0..arch.num_layers {
                     if (li + 1) % p.max(1) == 0 {
-                        pipeline.kv_cache.layers[li] =
-                            crate::kv_cache::LayerKvCache::new(gkv, ghd);
+                        pipeline.kv_cache.layers[li] = crate::kv_cache::LayerKvCache::new(gkv, ghd);
                     }
                 }
             }
@@ -740,11 +901,7 @@ impl Pipeline {
     /// skill actually replaces (derived from the tensors present, not
     /// the meta `layers` field), and whether the skill is eligible for
     /// cheap dynamic switching (FFN-only). Called once at load.
-    pub(crate) fn install_dynamic_routing(
-        &mut self,
-        model: &Arc<CmfModel>,
-        force_f32: bool,
-    ) {
+    pub(crate) fn install_dynamic_routing(&mut self, model: &Arc<CmfModel>, force_f32: bool) {
         self.model = Some(model.clone());
         self.dyn_force_f32 = force_f32;
         let mut per_skill = Vec::with_capacity(model.header.skills.len());
@@ -755,10 +912,7 @@ impl Pipeline {
             for t in model.skill_tensors(&sk.id) {
                 let rel = &t.name[prefix.len()..]; // e.g. model.layers.20.mlp.down_proj.weight
                 let toks: Vec<&str> = rel.split('.').collect();
-                if toks.len() >= 5
-                    && toks[0] == "model"
-                    && toks[1] == "layers"
-                    && toks[3] == "mlp"
+                if toks.len() >= 5 && toks[0] == "model" && toks[1] == "layers" && toks[3] == "mlp"
                 {
                     if let Ok(li) = toks[2].parse::<usize>() {
                         ffn_layers.insert(li);
@@ -791,10 +945,9 @@ impl Pipeline {
         if self.dyn_active == idx {
             return Ok(());
         }
-        let model = self
-            .model
-            .clone()
-            .ok_or_else(|| CmfError::Parse("dynamic routing needs a model-backed pipeline".into()))?;
+        let model = self.model.clone().ok_or_else(|| {
+            CmfError::Parse("dynamic routing needs a model-backed pipeline".into())
+        })?;
         let mut union: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         if let Some(old) = self.dyn_active {
             if let Some(Some(ls)) = self.dyn_skill_layers.get(old) {
@@ -810,7 +963,7 @@ impl Pipeline {
                 _ => {
                     return Err(CmfError::Parse(format!(
                         "skill index {n} not dynamic-eligible"
-                    )))
+                    )));
                 }
             },
             None => None,

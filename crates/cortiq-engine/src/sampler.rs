@@ -12,6 +12,29 @@ pub struct SplitMix64 {
     state: u64,
 }
 
+/// Reusable per-pipeline sampling workspace. The epoch table lets the
+/// repetition penalty visit each token id once without allocating a HashSet
+/// or clearing a vocab-sized boolean vector on every decode step.
+#[derive(Debug, Default)]
+pub struct SamplerScratch {
+    seen_epoch: Vec<u32>,
+    epoch: u32,
+}
+
+impl SamplerScratch {
+    fn begin_seen(&mut self, vocab_size: usize) -> u32 {
+        if self.seen_epoch.len() < vocab_size {
+            self.seen_epoch.resize(vocab_size, 0);
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.seen_epoch.fill(0);
+            self.epoch = 1;
+        }
+        self.epoch
+    }
+}
+
 impl SplitMix64 {
     pub fn new(seed: u64) -> Self {
         Self { state: seed }
@@ -78,6 +101,18 @@ pub fn sample(
     past_tokens: &[u32],
     rng: &mut SplitMix64,
 ) -> u32 {
+    let mut scratch = SamplerScratch::default();
+    sample_with_scratch(logits, config, past_tokens, rng, &mut scratch)
+}
+
+/// Sampling entry point for hot decode loops with reusable scratch storage.
+pub fn sample_with_scratch(
+    logits: &[f32],
+    config: &SamplerConfig,
+    past_tokens: &[u32],
+    rng: &mut SplitMix64,
+    scratch: &mut SamplerScratch,
+) -> u32 {
     // Greedy with no penalty needs no working copy: argmax straight
     // over the borrowed logits (the full-vocab clone was ~600 KB per
     // token on a 151K vocab — pure overhead in the decode hot loop).
@@ -87,7 +122,7 @@ pub fn sample(
     let mut probs = logits.to_vec();
 
     if config.repetition_penalty != 1.0 {
-        apply_repetition_penalty(&mut probs, past_tokens, config.repetition_penalty);
+        apply_repetition_penalty(&mut probs, past_tokens, config.repetition_penalty, scratch);
     }
 
     if config.temperature < 1e-6 {
@@ -156,10 +191,17 @@ fn softmax_inplace(logits: &mut [f32]) {
     }
 }
 
-fn apply_repetition_penalty(logits: &mut [f32], past_tokens: &[u32], penalty: f32) {
+fn apply_repetition_penalty(
+    logits: &mut [f32],
+    past_tokens: &[u32],
+    penalty: f32,
+    scratch: &mut SamplerScratch,
+) {
+    let epoch = scratch.begin_seen(logits.len());
     for &tok in past_tokens {
         let idx = tok as usize;
-        if idx < logits.len() {
+        if idx < logits.len() && scratch.seen_epoch[idx] != epoch {
+            scratch.seen_epoch[idx] = epoch;
             if logits[idx] > 0.0 {
                 logits[idx] /= penalty;
             } else {
@@ -264,8 +306,17 @@ mod tests {
     #[test]
     fn test_repetition_penalty() {
         let mut logits = vec![1.0, 2.0, 3.0, 4.0];
-        apply_repetition_penalty(&mut logits, &[1, 3], 2.0);
+        let mut scratch = SamplerScratch::default();
+        apply_repetition_penalty(&mut logits, &[1, 3], 2.0, &mut scratch);
         assert_eq!(logits, vec![1.0, 1.0, 3.0, 2.0]);
+    }
+
+    #[test]
+    fn repetition_penalty_applies_once_per_unique_token() {
+        let mut logits = vec![1.0, 4.0, -6.0];
+        let mut scratch = SamplerScratch::default();
+        apply_repetition_penalty(&mut logits, &[1, 1, 2, 1, 2], 2.0, &mut scratch);
+        assert_eq!(logits, vec![1.0, 2.0, -12.0]);
     }
 
     #[test]
@@ -303,7 +354,9 @@ mod tests {
         };
         let run = |seed: u64| -> Vec<u32> {
             let mut rng = SplitMix64::new(seed);
-            (0..16).map(|_| sample(&logits, &config, &[], &mut rng)).collect()
+            (0..16)
+                .map(|_| sample(&logits, &config, &[], &mut rng))
+                .collect()
         };
         assert_eq!(run(7), run(7), "same seed must reproduce");
         assert_ne!(run(7), run(8), "different seed must differ");

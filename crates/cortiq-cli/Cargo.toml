@@ -22,9 +22,9 @@ gpu = ["cortiq-engine/gpu"]
 
 [dependencies]
 base64 = { workspace = true }
-cortiq-core = { path = "../cortiq-core", version = "0.5.7" }
-cortiq-engine = { path = "../cortiq-engine", version = "0.5.7" }
-cortiq-server = { path = "../cortiq-server", version = "0.5.7" }
+cortiq-core = { path = "../cortiq-core", version = "0.5.8" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.5.8" }
+cortiq-server = { path = "../cortiq-server", version = "0.5.8" }
 clap = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }

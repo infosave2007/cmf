@@ -286,9 +286,18 @@ impl QTensor {
     /// Named `q1_parts` for historical reasons.
     pub(crate) fn q1_parts(&self) -> Option<(usize, usize, usize)> {
         match self {
+            #[cfg(target_os = "macos")]
+            Self::Mapped {
+                dtype: TensorDtype::Q1T,
+                ..
+            } if !crate::gpu::metal_q1t_enabled() => None,
             Self::Mapped {
                 idx,
-                dtype: TensorDtype::Q1 | TensorDtype::Q1T | TensorDtype::Q4Block | TensorDtype::Q8Row,
+                dtype: TensorDtype::Q1
+                    | TensorDtype::Q1T
+                    | TensorDtype::Q4Block
+                    | TensorDtype::Q8Row
+                    | TensorDtype::Q8_2f,
                 rows,
                 cols,
                 ..

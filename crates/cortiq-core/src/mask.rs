@@ -451,8 +451,13 @@ pub fn decode_masks_section(bytes: &[u8], arch: &ModelArch) -> Result<MaskCatalo
                 mm.name, mm.blob_len, expected_blob
             ));
         }
-        let start = mm.blob_off as usize;
-        let end = start + mm.blob_len as usize;
+        let start = usize::try_from(mm.blob_off)
+            .map_err(|_| format!("mask '{}': blob offset does not fit usize", mm.name))?;
+        let blob_len = usize::try_from(mm.blob_len)
+            .map_err(|_| format!("mask '{}': blob length does not fit usize", mm.name))?;
+        let end = start
+            .checked_add(blob_len)
+            .ok_or_else(|| format!("mask '{}': blob range overflows", mm.name))?;
         if end > bytes.len() {
             return Err(format!("mask '{}': blob out of bounds", mm.name));
         }
@@ -465,7 +470,8 @@ pub fn decode_masks_section(bytes: &[u8], arch: &ModelArch) -> Result<MaskCatalo
         let heads_base = arch.num_layers * ffn_b;
         let mut head_masks = Vec::with_capacity(arch.num_layers);
         for li in 0..arch.num_layers {
-            head_masks.push(blob[heads_base + li * head_b..heads_base + (li + 1) * head_b].to_vec());
+            head_masks
+                .push(blob[heads_base + li * head_b..heads_base + (li + 1) * head_b].to_vec());
         }
         let gates_base = heads_base + arch.num_layers * head_b;
         let gates = &blob[gates_base..];

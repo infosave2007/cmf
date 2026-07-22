@@ -12,7 +12,7 @@
 
 use cortiq_core::CmfModel;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 thread_local! {
@@ -33,10 +33,15 @@ thread_local! {
 
 /// Run `f` with the GPU gates off on this thread (pure-CPU arm).
 pub fn cpu_scope<R>(f: impl FnOnce() -> R) -> R {
-    CPU_ONLY.with(|c| c.set(true));
-    let r = f();
-    CPU_ONLY.with(|c| c.set(false));
-    r
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CPU_ONLY.with(|c| c.set(self.0));
+        }
+    }
+    let previous = CPU_ONLY.with(|c| c.replace(true));
+    let _restore = Restore(previous);
+    f()
 }
 
 /// Backends: note a one-off cost (weight upload, buffer-cache fill) so
@@ -218,7 +223,10 @@ pub fn probe_record(c: OpClass, gpu: bool, dur: std::time::Duration) {
         p.cpu_ns.fetch_add(ns, Ordering::Relaxed);
         p.cpu_n.fetch_add(1, Ordering::Relaxed);
     }
-    let (gn, cn) = (p.gpu_n.load(Ordering::Relaxed), p.cpu_n.load(Ordering::Relaxed));
+    let (gn, cn) = (
+        p.gpu_n.load(Ordering::Relaxed),
+        p.cpu_n.load(Ordering::Relaxed),
+    );
     if gn >= 2 && cn >= 2 {
         let g = p.gpu_ns.load(Ordering::Relaxed) as f64 / gn as f64;
         let cp = p.cpu_ns.load(Ordering::Relaxed) as f64 / cn as f64;
@@ -228,8 +236,7 @@ pub fn probe_record(c: OpClass, gpu: bool, dur: std::time::Duration) {
             return;
         }
         let winner = if g <= cp { 1 } else { 2 };
-        if p
-            .state
+        if p.state
             .compare_exchange(0, winner, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
@@ -324,6 +331,12 @@ mod probe_tests {
         // cpu_scope: gates off inside, restored after.
         cpu_scope(|| CPU_ONLY.with(|c| assert!(c.get())));
         CPU_ONLY.with(|c| assert!(!c.get()));
+        cpu_scope(|| {
+            cpu_scope(|| CPU_ONLY.with(|c| assert!(c.get())));
+            CPU_ONLY.with(|c| assert!(c.get()));
+        });
+        let _ = std::panic::catch_unwind(|| cpu_scope(|| panic!("scope test")));
+        CPU_ONLY.with(|c| assert!(!c.get()));
         probe_reset();
     }
 }
@@ -339,14 +352,13 @@ pub const GPU_MIN_ROWS: usize = 65_536;
 /// 35B model on an RTX 4090 saw ~0 offload because every layer matrix
 /// sat below the old universal 65536.
 pub fn min_rows() -> usize {
-    if let Some(v) = std::env::var("CMF_GPU_MIN_ROWS").ok().and_then(|v| v.parse().ok()) {
+    if let Some(v) = std::env::var("CMF_GPU_MIN_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         return v;
     }
-    if discrete() {
-        4096
-    } else {
-        GPU_MIN_ROWS
-    }
+    if discrete() { 4096 } else { GPU_MIN_ROWS }
 }
 
 /// Is the active backend a discrete card (PCIe VRAM)?
@@ -399,7 +411,11 @@ enum Backend {
 fn backend() -> Backend {
     #[cfg(feature = "gpu")]
     if crate::gpu_wgpu::selected() {
-        return if crate::gpu_wgpu::enabled() { Backend::Wgpu } else { Backend::None };
+        return if crate::gpu_wgpu::enabled() {
+            Backend::Wgpu
+        } else {
+            Backend::None
+        };
     }
     #[cfg(target_os = "macos")]
     if crate::gpu_metal::enabled() {
@@ -457,9 +473,7 @@ pub fn q8_matmat(
             crate::gpu_metal::q8_matmat(model, idx, row_scale, pre, b, rows, cols, out)
         }
         #[cfg(feature = "gpu")]
-        Backend::Wgpu => {
-            crate::gpu_wgpu::q8_matmat(model, idx, row_scale, pre, b, rows, cols, out)
-        }
+        Backend::Wgpu => crate::gpu_wgpu::q8_matmat(model, idx, row_scale, pre, b, rows, cols, out),
         Backend::None => false,
     }
 }
@@ -516,8 +530,8 @@ pub fn attn_dropin(
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::attn_dropin_gpu(
-            model, kv_id, layer, normed, wq_idx, wk_idx, wv_idx, wo_idx, q_norm, k_norm, invf,
-            nh, nkv, hd, rd, hidden, pos, cap, gemma, eps, cpu_k, cpu_v, out,
+            model, kv_id, layer, normed, wq_idx, wk_idx, wv_idx, wo_idx, q_norm, k_norm, invf, nh,
+            nkv, hd, rd, hidden, pos, cap, gemma, eps, cpu_k, cpu_v, out,
         ),
         _ => false,
     }
@@ -605,8 +619,8 @@ pub fn forward_token_graph(
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::forward_token_graph(
-            model, kv_id, layers, invf, h, nh, nkv, hd, rd, hidden, inter, position, cap, gemma, eps,
-            lm_head, final_norm, logits,
+            model, kv_id, layers, invf, h, nh, nkv, hd, rd, hidden, inter, position, cap, gemma,
+            eps, lm_head, final_norm, logits,
         ),
         _ => {
             let _ = (lm_head, final_norm, logits);
@@ -640,7 +654,8 @@ pub fn forward_batch_graph(
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::forward_batch_graph(
-            model, kv_id, layers, invf, h, nh, nkv, hd, rd, hidden, inter, positions, cap, gemma, eps, k,
+            model, kv_id, layers, invf, h, nh, nkv, hd, rd, hidden, inter, positions, cap, gemma,
+            eps, k,
         ),
         _ => false,
     }
@@ -667,7 +682,13 @@ pub fn q1t_matvec(
 ) -> bool {
     match backend() {
         #[cfg(target_os = "macos")]
-        Backend::Metal => crate::gpu_metal::q1t_matvec(model, idx, xs, rows, cols, out),
+        Backend::Metal => {
+            if metal_q1t_enabled() {
+                crate::gpu_metal::q1t_matvec(model, idx, xs, rows, cols, out)
+            } else {
+                false
+            }
+        }
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q1t_matvec(model, idx, xs, rows, cols, out),
         Backend::None => false,
@@ -707,11 +728,24 @@ pub fn q1t_matmat(
 ) -> bool {
     match backend() {
         #[cfg(target_os = "macos")]
+        // Batched prefill and single-token decode are both enabled. On the
+        // real 14.8B Q1T model prefill PPL was within 0.3% of CPU (7.942 vs
+        // 7.966), and the alignment-safe decode kernel reached 3.52e-6 max_rel.
         Backend::Metal => crate::gpu_metal::q1t_matmat(model, idx, xs, b, rows, cols, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q1t_matmat(model, idx, xs, b, rows, cols, out),
         Backend::None => false,
     }
+}
+
+/// Native Metal Q1T switch. Enabled by default after the byte-packed Q1T
+/// fields were changed to alignment-safe loads; keep an explicit emergency
+/// fallback for device/driver diagnostics.
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_q1t_enabled() -> bool {
+    std::env::var("CMF_METAL_Q1T")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("off"))
+        .unwrap_or(true)
 }
 
 /// Batched q1 GEMM (prefill). wgpu only — Metal has its own block path.
@@ -734,8 +768,8 @@ pub fn q1_matmat(
 /// Whole-block token-graph types re-exported from the Metal backend.
 #[cfg(target_os = "macos")]
 pub use crate::gpu_metal::{
-    kv_mirror_drop, kv_mirror_read_last, kv_mirror_take_imp, AttnDeviceParams, AttnGpuLayer,
-    GdnGpuCfg, GdnGpuLayer, GraphDims, TokenGraph,
+    AttnDeviceParams, AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GraphDims, TokenGraph, kv_mirror_drop,
+    kv_mirror_read_last, kv_mirror_take_imp,
 };
 
 /// A BLOCK of consecutive q1 GDN layers in one submission (Metal only).

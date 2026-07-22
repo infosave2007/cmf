@@ -11,8 +11,8 @@
 // would change nothing for C callers and only obscure the Rust tests.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::ffi::{c_char, c_void, CStr, CString};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::ffi::{CStr, CString, c_char, c_void};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 use cortiq_core::CmfModel;
@@ -113,8 +113,7 @@ pub extern "C" fn cortiq_free(handle: *mut c_void) {
 
 /// Streaming token callback: `token` is a NUL-terminated UTF-8 piece
 /// (valid only during the call); return `true` to continue generating.
-pub type CortiqTokenCb =
-    Option<extern "C" fn(token: *const c_char, user: *mut c_void) -> bool>;
+pub type CortiqTokenCb = Option<extern "C" fn(token: *const c_char, user: *mut c_void) -> bool>;
 
 enum GenInput {
     Chat(String),
@@ -145,7 +144,11 @@ fn run_generate(
             return -1;
         }
     };
-    let input = if chat { GenInput::Chat(prompt) } else { GenInput::Raw(prompt) };
+    let input = if chat {
+        GenInput::Chat(prompt)
+    } else {
+        GenInput::Raw(prompt)
+    };
     run_generate_ids(handle, input, max_tokens, cb, user)
 }
 
@@ -191,14 +194,16 @@ fn run_generate_ids(
     let ids = match input {
         GenInput::Chat(prompt) => {
             let history = vec![("user".to_string(), prompt)];
-            pipeline.tokenizer.apply_chat_template_opts(&history, thinking)
+            pipeline
+                .tokenizer
+                .apply_chat_template_opts(&history, thinking)
         }
-        GenInput::Raw(prompt) => {
-            pipeline.tokenizer.with_bos(pipeline.tokenizer.encode(&prompt))
-        }
-        GenInput::History(history) => {
-            pipeline.tokenizer.apply_chat_template_opts(&history, thinking)
-        }
+        GenInput::Raw(prompt) => pipeline
+            .tokenizer
+            .with_bos(pipeline.tokenizer.encode(&prompt)),
+        GenInput::History(history) => pipeline
+            .tokenizer
+            .apply_chat_template_opts(&history, thinking),
     };
     match pipeline.generate_from_ids(&ids, max_tokens as usize, None, on_token) {
         Ok(res) => res.tokens_generated as i32,
@@ -259,28 +264,45 @@ pub extern "C" fn cortiq_set_options(handle: *mut c_void, options_json: *const c
                 return -1;
             }
         };
-        let sc = &mut pipeline.sampler_config;
+        let mut next = pipeline.sampler_config.clone();
         if let Some(v) = opts.temperature {
-            sc.temperature = v;
+            if !v.is_finite() || v < 0.0 {
+                set_error("temperature must be finite and >= 0");
+                return -1;
+            }
+            next.temperature = v;
         }
         if let Some(v) = opts.top_p {
-            sc.top_p = v;
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                set_error("top_p must be finite and between 0 and 1");
+                return -1;
+            }
+            next.top_p = v;
         }
         if let Some(v) = opts.top_k {
-            sc.top_k = v;
+            next.top_k = v;
         }
         if let Some(v) = opts.repetition_penalty {
-            sc.repetition_penalty = v;
+            if !v.is_finite() || v <= 0.0 {
+                set_error("repetition_penalty must be finite and > 0");
+                return -1;
+            }
+            next.repetition_penalty = v;
         }
         if let Some(v) = opts.min_p {
-            sc.min_p = v;
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                set_error("min_p must be finite and between 0 and 1");
+                return -1;
+            }
+            next.min_p = v;
         }
         if opts.seed.is_some() {
-            sc.seed = opts.seed;
+            next.seed = opts.seed;
         }
         if opts.greedy == Some(true) {
-            sc.temperature = 0.0;
+            next.temperature = 0.0;
         }
+        pipeline.set_sampler_config(next);
         drop(pipeline);
         if let Some(v) = opts.enable_thinking {
             if let Ok(mut g) = ctx.enable_thinking.lock() {
@@ -358,11 +380,13 @@ pub extern "C" fn cortiq_chat(
     cb: CortiqTokenCb,
     user: *mut c_void,
 ) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| run_generate(handle, prompt, max_tokens, true, cb, user)))
-        .unwrap_or_else(|_| {
-            set_error("panic during generate");
-            -1
-        })
+    catch_unwind(AssertUnwindSafe(|| {
+        run_generate(handle, prompt, max_tokens, true, cb, user)
+    }))
+    .unwrap_or_else(|_| {
+        set_error("panic during generate");
+        -1
+    })
 }
 
 /// Raw completion: the prompt goes to the model verbatim (plus the
@@ -376,11 +400,13 @@ pub extern "C" fn cortiq_complete(
     cb: CortiqTokenCb,
     user: *mut c_void,
 ) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| run_generate(handle, prompt, max_tokens, false, cb, user)))
-        .unwrap_or_else(|_| {
-            set_error("panic during generate");
-            -1
-        })
+    catch_unwind(AssertUnwindSafe(|| {
+        run_generate(handle, prompt, max_tokens, false, cb, user)
+    }))
+    .unwrap_or_else(|_| {
+        set_error("panic during generate");
+        -1
+    })
 }
 
 #[cfg(test)]
@@ -395,7 +421,13 @@ mod tests {
         let err = unsafe { CStr::from_ptr(cortiq_last_error()) };
         assert!(!err.to_bytes().is_empty());
         assert_eq!(
-            cortiq_chat(std::ptr::null_mut(), std::ptr::null(), 8, None, std::ptr::null_mut()),
+            cortiq_chat(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                8,
+                None,
+                std::ptr::null_mut()
+            ),
             -1
         );
         cortiq_free(std::ptr::null_mut());

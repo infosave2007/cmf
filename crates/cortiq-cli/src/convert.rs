@@ -16,15 +16,15 @@
 //! Those come from the DTG-MA path in `converter/`.
 
 use crate::npy;
-use cortiq_core::format::{CmfHeader, CmfModel, TensorSpec, TokenizerBundle, CMF_VERSION};
+use cortiq_core::format::{CMF_VERSION, CmfHeader, CmfModel, TensorSpec, TokenizerBundle};
 use cortiq_core::quant::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use cortiq_core::types::{LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle, QuantType, TensorDtype};
+use cortiq_core::types::{LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle, QuantType, TensorDtype, YarnConfig};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 const GROUP_SIZE: usize = 32;
@@ -59,6 +59,12 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
             return Some(lfm2_canon(&format!("model.{rest}")));
         }
     }
+    // Laguna stores the router's auxiliary-loss-free selection bias under
+    // `experts`, although it belongs to the router mathematically. CMF keeps
+    // the canonical bias beside `mlp.gate.weight`.
+    if raw.ends_with(".mlp.experts.e_score_correction_bias") {
+        return Some(raw.replace(".mlp.experts.e_score_correction_bias", ".mlp.expert_bias"));
+    }
     Some(lfm2_canon(raw))
 }
 
@@ -75,14 +81,8 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
 ///   feed_forward.gate/expert_bias/experts.N → mlp.*
 ///   feed_forward.w1/w3/w2 → mlp.{gate,up,down}_proj (dense + per expert)
 fn lfm2_canon(name: &str) -> String {
-    let is_lfm2 = name == "model.embedding_norm.weight"
-        || name.contains(".operator_norm")
-        || name.contains(".ffn_norm")
-        || name.contains(".feed_forward.")
-        || name.contains(".conv.")
-        || name.contains(".self_attn.out_proj")
-        || name.contains(".self_attn.q_layernorm")
-        || name.contains(".self_attn.k_layernorm");
+    let is_lfm2 =
+        name == "model.embedding_norm.weight" || name.contains(".operator_norm") || name.contains(".ffn_norm") || name.contains(".feed_forward.") || name.contains(".conv.") || name.contains(".self_attn.out_proj") || name.contains(".self_attn.q_layernorm") || name.contains(".self_attn.k_layernorm");
     if !is_lfm2 {
         return name.to_string();
     }
@@ -115,10 +115,7 @@ fn lfm2_canon(name: &str) -> String {
 /// Small, noise-sensitive 2-D projections the reference converter keeps at f16
 /// (a bit-flip there is costly): the GDN a/b gate projections and MoE routers.
 fn force_f16(name: &str) -> bool {
-    name.ends_with("linear_attn.in_proj_a.weight")
-        || name.ends_with("linear_attn.in_proj_b.weight")
-        || name.ends_with("mlp.gate.weight")
-        || name.ends_with("shared_expert_gate.weight")
+    name.ends_with("linear_attn.in_proj_a.weight") || name.ends_with("linear_attn.in_proj_b.weight") || name.ends_with("mlp.gate.weight") || name.ends_with("shared_expert_gate.weight") || name.ends_with("self_attn.g_proj.weight")
 }
 
 /// Quantization choice for 2-D weight matrices.
@@ -160,29 +157,17 @@ pub(crate) fn quantize_2d(quant: Quant, vals: &[f32], out_dim: usize, in_dim: us
         Quant::F16 => (TensorDtype::F16, encode_f16(vals)),
         // v-bit needs the input dim to be a multiple of the group size; other
         // shapes fall back to the two-field q8_2f (best equal-size alternative).
-        Quant::Q4Tiled if in_dim % GROUP_SIZE == 0 => {
-            (TensorDtype::Q4Tiled, encode_q4_tiled(vals, out_dim, in_dim))
-        }
+        Quant::Q4Tiled if in_dim % GROUP_SIZE == 0 => (TensorDtype::Q4Tiled, encode_q4_tiled(vals, out_dim, in_dim)),
         Quant::Q4Tiled => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
-        Quant::Vbit if in_dim % GROUP_SIZE == 0 => {
-            (TensorDtype::VbitRo, encode_vbit_ro(vals, out_dim, in_dim))
-        }
+        Quant::Vbit if in_dim % GROUP_SIZE == 0 => (TensorDtype::VbitRo, encode_vbit_ro(vals, out_dim, in_dim)),
         Quant::Vbit => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
-        Quant::Q1 if in_dim % GROUP_SIZE == 0 => {
-            (TensorDtype::Q1, encode_q1(vals, out_dim, in_dim))
-        }
+        Quant::Q1 if in_dim % GROUP_SIZE == 0 => (TensorDtype::Q1, encode_q1(vals, out_dim, in_dim)),
         Quant::Q1 => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
-        Quant::Q1p if in_dim % GROUP_SIZE == 0 => {
-            (TensorDtype::Q1, encode_q1_ef(vals, out_dim, in_dim))
-        }
+        Quant::Q1p if in_dim % GROUP_SIZE == 0 => (TensorDtype::Q1, encode_q1_ef(vals, out_dim, in_dim)),
         Quant::Q1p => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
-        Quant::Q1s if in_dim % GROUP_SIZE == 0 => {
-            (TensorDtype::Q1S, encode_q1s(vals, out_dim, in_dim, q1s_keep_frac()))
-        }
+        Quant::Q1s if in_dim % GROUP_SIZE == 0 => (TensorDtype::Q1S, encode_q1s(vals, out_dim, in_dim, q1s_keep_frac())),
         Quant::Q1s => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
-        Quant::Q1t if in_dim % GROUP_SIZE == 0 => {
-            (TensorDtype::Q1T, crate::gptq::quantize_q1t(vals, out_dim, in_dim, &vec![1.0; in_dim], 0.0))
-        }
+        Quant::Q1t if in_dim % GROUP_SIZE == 0 => (TensorDtype::Q1T, crate::gptq::quantize_q1t(vals, out_dim, in_dim, &vec![1.0; in_dim], 0.0)),
         Quant::Q1t => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
     }
 }
@@ -199,9 +184,7 @@ pub(crate) fn parse_quant(s: &str) -> anyhow::Result<Quant> {
         "q1p" | "q1_ptq" => Quant::Q1p,
         "q1s" | "q1_mask" => Quant::Q1s,
         "q1t" | "q1_ternary" => Quant::Q1t,
-        other => anyhow::bail!(
-            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, f16, vbit, q1, q1p, q1s, or q1t)"
-        ),
+        other => anyhow::bail!("unknown quant '{other}' (use q8, q8_2f, q4, q4t, f16, vbit, q1, q1p, q1s, or q1t)"),
     })
 }
 
@@ -342,11 +325,7 @@ fn encode_q1_ef(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
 /// Fraction of weights the `q1s` mask keeps at full precision (the outlier
 /// budget). `CMF_Q1S_KEEP` overrides; default 1%. Clamped to [0, 25%].
 fn q1s_keep_frac() -> f32 {
-    std::env::var("CMF_Q1S_KEEP")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(0.01)
-        .clamp(0.0, 0.25)
+    std::env::var("CMF_Q1S_KEEP").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.01).clamp(0.0, 0.25)
 }
 
 /// 1-bit PTQ with an outlier mask (Stage 2a of the holographic-transfer
@@ -372,8 +351,7 @@ fn encode_q1s(vals: &[f32], out_dim: usize, in_dim: usize, keep_frac: f32) -> Ve
         absv.select_nth_unstable_by(k, |a, b| a.partial_cmp(b).unwrap());
         absv[k]
     };
-    let is_out: Vec<bool> =
-        (0..n).map(|i| n_out > 0 && vals[i].abs() >= threshold).collect();
+    let is_out: Vec<bool> = (0..n).map(|i| n_out > 0 && vals[i].abs() >= threshold).collect();
 
     let groups_per_row = in_dim / GROUP_SIZE;
     let n_groups = n / GROUP_SIZE;
@@ -616,18 +594,11 @@ pub(crate) fn to_f32(dtype: &str, raw: &[u8]) -> anyhow::Result<Vec<f32>> {
     })
 }
 
-pub(crate) fn unpack_mlx(
-    w_raw: &[u8],
-    s_raw: &[u8],
-    b_raw: Option<&[u8]>,
-    out_dim: usize,
-    in_dim: usize,
-    bits: usize,
-) -> anyhow::Result<Vec<f32>> {
+pub(crate) fn unpack_mlx(w_raw: &[u8], s_raw: &[u8], b_raw: Option<&[u8]>, out_dim: usize, in_dim: usize, bits: usize) -> anyhow::Result<Vec<f32>> {
     let mut out = vec![0f32; out_dim * in_dim];
     let num_groups = s_raw.len() / 2 / out_dim;
     let group_size = in_dim / num_groups;
-    
+
     let w_u32: Vec<u32> = w_raw.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
     let s_f16: Vec<u16> = s_raw.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
     let b_f16: Option<Vec<u16>> = b_raw.map(|r| r.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect());
@@ -640,11 +611,11 @@ pub(crate) fn unpack_mlx(
             let group = col / group_size;
             let scale = f16_to_f32(s_f16[row * num_groups + group]);
             let bias = b_f16.as_ref().map(|b| f16_to_f32(b[row * num_groups + group])).unwrap_or(0.0);
-            
+
             let u32_idx = (row * in_dim + col) / vals_per_u32;
             let shift = (col % vals_per_u32) * bits;
             let val = (w_u32[u32_idx] >> shift) & mask;
-            
+
             // For 1-bit, MLX might map 0->-1 and 1->1, but wait!
             // In 2-bit, MLX maps 0,1,2,3 directly to value * scale + bias.
             // If the model is 1-bit, is the value 0 and 1, or is it sign bits?
@@ -662,12 +633,7 @@ pub(crate) fn unpack_mlx(
 /// contiguous). A stable name tiebreak keeps it deterministic. Layout only —
 /// no effect on decoding (the directory is the offset authority).
 pub(crate) fn exec_order_key(name: &str) -> (u32, u32, u32, u32, u32) {
-    let num_after = |marker: &str| {
-        name.split(marker)
-            .nth(1)
-            .and_then(|s| s.split('.').next())
-            .and_then(|s| s.parse::<u32>().ok())
-    };
+    let num_after = |marker: &str| name.split(marker).nth(1).and_then(|s| s.split('.').next()).and_then(|s| s.parse::<u32>().ok());
     let expert = num_after(".experts.").unwrap_or(0);
     // Projection order within a block: q/gate, k/up, v/down, o, else.
     let proj = if name.contains("q_proj") || name.contains("gate_proj") {
@@ -748,8 +714,7 @@ fn open_safetensors(path: &Path) -> anyhow::Result<SafeTensors> {
             continue;
         }
         let dtype = v["dtype"].as_str().unwrap_or("").to_string();
-        let shape: Vec<usize> =
-            v["shape"].as_array().map(|a| a.iter().map(|x| x.as_u64().unwrap_or(0) as usize).collect()).unwrap_or_default();
+        let shape: Vec<usize> = v["shape"].as_array().map(|a| a.iter().map(|x| x.as_u64().unwrap_or(0) as usize).collect()).unwrap_or_default();
         let offs = v["data_offsets"].as_array().ok_or_else(|| anyhow::anyhow!("tensor '{name}': no data_offsets"))?;
         let start = offs[0].as_u64().unwrap_or(0) as usize;
         let end = offs[1].as_u64().unwrap_or(0) as usize;
@@ -798,6 +763,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                 Some("linear_attention") => LayerType::LinearAttention,
                 // LFM2 gated short convolution mixer.
                 Some("conv") | Some("short_conv") => LayerType::ShortConv,
+                Some("sliding_attention") => LayerType::SlidingAttention,
                 _ => LayerType::FullAttention,
             })
             .collect(),
@@ -816,18 +782,25 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     } else {
         None
     };
-    // Qwen3.5 nests rope params under `rope_parameters`.
-    let rope = tc.get("rope_parameters");
-    let rope_theta = tc
-        .get("rope_theta")
-        .and_then(|v| v.as_f64())
-        .or_else(|| rope.and_then(|r| r.get("rope_theta")).and_then(|v| v.as_f64()))
-        .unwrap_or(10_000.0);
-    let prf = tc
-        .get("partial_rotary_factor")
-        .and_then(|v| v.as_f64())
-        .or_else(|| rope.and_then(|r| r.get("partial_rotary_factor")).and_then(|v| v.as_f64()))
-        .unwrap_or(1.0) as f32;
+    // Qwen3.5 nests rope params under `rope_parameters`. Laguna goes one
+    // level deeper and carries independent full/sliding profiles.
+    let rope_root = tc.get("rope_parameters");
+    let is_laguna_config = model_type.eq_ignore_ascii_case("laguna");
+    let rope = if is_laguna_config { rope_root.and_then(|r| r.get("full_attention")) } else { rope_root };
+    let local_rope = if is_laguna_config { rope_root.and_then(|r| r.get("sliding_attention")) } else { None };
+    let rope_theta = tc.get("rope_theta").and_then(|v| v.as_f64()).or_else(|| rope.and_then(|r| r.get("rope_theta")).and_then(|v| v.as_f64())).unwrap_or(10_000.0);
+    let prf = tc.get("partial_rotary_factor").and_then(|v| v.as_f64()).or_else(|| rope.and_then(|r| r.get("partial_rotary_factor")).and_then(|v| v.as_f64())).unwrap_or(1.0) as f32;
+    let local_prf = local_rope.and_then(|r| r.get("partial_rotary_factor")).and_then(|v| v.as_f64()).map(|v| v as f32);
+    let attention_heads_per_layer = tc
+        .get("num_attention_heads_per_layer")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|v| v.as_u64().map(|n| n as usize).ok_or_else(|| anyhow::anyhow!("num_attention_heads_per_layer must contain integers"))).collect::<anyhow::Result<Vec<_>>>())
+        .transpose()?;
+    if let Some(heads) = &attention_heads_per_layer {
+        anyhow::ensure!(heads.len() == n_layers, "num_attention_heads_per_layer has {} entries, expected {n_layers}", heads.len());
+        let nkv = cfg_usize(tc, "num_key_value_heads").unwrap_or(n_heads);
+        anyhow::ensure!(heads.iter().all(|&nh| nh > 0 && nh % nkv == 0), "every per-layer attention head count must be positive and divisible by num_key_value_heads={nkv}");
+    }
     // Mixture-of-experts: the FFN becomes a router + per-expert matrices. Tensor
     // handling is unchanged (experts are ordinary 2-D matrices); we just declare
     // the MoE config so the runtime dispatches it. Router presence per layer
@@ -838,29 +811,29 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         // LFM2-MoE routes with a sigmoid gate + selection bias (DeepSeek-V3
         // noaux_tc); Qwen keeps the softmax-over-all default.
         let is_lfm2 = mt.starts_with("lfm2");
+        let is_laguna = mt == "laguna";
         MoeConfig {
             num_experts: ne as usize,
             top_k: cfg_usize(tc, "num_experts_per_tok").unwrap_or(2),
             moe_intermediate_size: cfg_usize(tc, "moe_intermediate_size").unwrap_or(0),
             norm_topk_prob: tc.get("norm_topk_prob").and_then(|v| v.as_bool()).unwrap_or(ntp_default),
             shared_expert_intermediate_size: cfg_usize(tc, "shared_expert_intermediate_size"),
-            router_sigmoid: is_lfm2,
+            router_sigmoid: is_lfm2 || is_laguna,
             // A stored scale of 1.0 is the no-op default; only non-trivial
             // scales need to ride in the header.
-            routed_scaling_factor: tc
-                .get("routed_scaling_factor")
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32)
-                .filter(|&v| (v - 1.0).abs() > 1e-9),
+            routed_scaling_factor: tc.get("routed_scaling_factor").or_else(|| tc.get("moe_routed_scaling_factor")).and_then(|v| v.as_f64()).map(|v| v as f32).filter(|&v| (v - 1.0).abs() > 1e-9),
         }
     });
     let head_dim = cfg_usize(tc, "head_dim").unwrap_or(hidden / n_heads.max(1));
     // Zero-centered RMSNorm x̂·(1+w): Gemma family and Qwen3.5 / Qwen3-Next.
     let mt = model_type.to_lowercase();
-    let norm_style = if (mt.contains("gemma") && !mt.contains("gemma4"))
-        || mt.starts_with("qwen3_5")
-        || mt.contains("qwen3_next")
-    {
+    let is_laguna = mt == "laguna";
+    if is_laguna {
+        anyhow::ensure!(!tc.get("swa_attention_sink_enabled").and_then(|v| v.as_bool()).unwrap_or(false), "laguna: learned SWA attention sinks are not supported yet");
+        anyhow::ensure!(tc.get("moe_router_logit_softcapping").and_then(|v| v.as_f64()).unwrap_or(0.0) == 0.0, "laguna: non-zero MoE router logit soft-capping is not supported");
+        anyhow::ensure!(!tc.get("moe_apply_router_weight_on_input").and_then(|v| v.as_bool()).unwrap_or(false), "laguna: moe_apply_router_weight_on_input=true is not supported");
+    }
+    let norm_style = if (mt.contains("gemma") && !mt.contains("gemma4")) || mt.starts_with("qwen3_5") || mt.contains("qwen3_next") {
         NormStyle::Gemma
     } else {
         // Gemma-4 went back to plain x̂·w (Gemma3nRMSNorm lineage).
@@ -873,9 +846,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     // file. (Gemma-4's FINAL-logit capping is supported.)
     let is_gemma = mt.contains("gemma");
     let is_gemma4 = mt.contains("gemma4");
-    if tc.get("attn_logit_softcapping").and_then(|v| v.as_f64()).is_some()
-        || (!is_gemma4 && tc.get("final_logit_softcapping").and_then(|v| v.as_f64()).is_some())
-    {
+    if tc.get("attn_logit_softcapping").and_then(|v| v.as_f64()).is_some() || (!is_gemma4 && tc.get("final_logit_softcapping").and_then(|v| v.as_f64()).is_some()) {
         anyhow::bail!(
             "{model_type}: attention logit soft-capping (Gemma-2) is not supported yet — \
              Gemma-1/Gemma-3/Gemma-4 convert natively"
@@ -910,46 +881,41 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             (
                 full.and_then(|f| f.get("rope_theta")).and_then(|v| v.as_f64()),
                 slide.and_then(|f| f.get("rope_theta")).and_then(|v| v.as_f64()),
-                full.and_then(|f| f.get("partial_rotary_factor"))
-                    .and_then(|v| v.as_f64())
-                    .map(|v| v as f32),
+                full.and_then(|f| f.get("partial_rotary_factor")).and_then(|v| v.as_f64()).map(|v| v as f32),
             )
         }
         _ => (None, None, None),
     };
     let rope_theta = g4_rope_theta.unwrap_or(rope_theta);
+    let yarn = rope
+        .filter(|r| r.get("rope_type").and_then(|v| v.as_str()) == Some("yarn"))
+        .map(|r| {
+            Ok::<YarnConfig, anyhow::Error>(YarnConfig {
+                factor: r.get("factor").and_then(|v| v.as_f64()).ok_or_else(|| anyhow::anyhow!("YaRN rope profile is missing factor"))? as f32,
+                original_max_position_embeddings: r.get("original_max_position_embeddings").and_then(|v| v.as_u64()).ok_or_else(|| anyhow::anyhow!("YaRN rope profile is missing original_max_position_embeddings"))? as usize,
+                beta_fast: r.get("beta_fast").and_then(|v| v.as_f64()).unwrap_or(32.0) as f32,
+                beta_slow: r.get("beta_slow").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                attention_factor: r.get("attention_factor").and_then(|v| v.as_f64()).unwrap_or_else(|| {
+                    let factor = r.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                    0.1 * factor.ln() + 1.0
+                }) as f32,
+            })
+        })
+        .transpose()?;
     // Sliding pattern from the explicit layer-type list: full layers must
     // sit at every P-th position ((i+1) % P == 0), which is how the
     // runtime models the cadence.
     let g4_pattern: Option<usize> = if is_gemma4 {
-        let fulls: Vec<usize> = tc
-            .get("layer_types")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .enumerate()
-                    .filter(|(_, v)| v.as_str() == Some("full_attention"))
-                    .map(|(i, _)| i)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let fulls: Vec<usize> = tc.get("layer_types").and_then(|v| v.as_array()).map(|a| a.iter().enumerate().filter(|(_, v)| v.as_str() == Some("full_attention")).map(|(i, _)| i).collect()).unwrap_or_default();
         let p = fulls.first().map(|f| f + 1).unwrap_or(0);
-        if p == 0
-            || fulls.iter().enumerate().any(|(k, &i)| i != p * (k + 1) - 1)
-            || (n_layers / p) != fulls.len()
-        {
+        if p == 0 || fulls.iter().enumerate().any(|(k, &i)| i != p * (k + 1) - 1) || (n_layers / p) != fulls.len() {
             anyhow::bail!("{model_type}: irregular full/sliding layer schedule not supported");
         }
         Some(p)
     } else {
         None
     };
-    let hidden_act = match tc
-        .get("hidden_activation")
-        .or_else(|| tc.get("hidden_act"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("silu")
-    {
+    let hidden_act = match tc.get("hidden_activation").or_else(|| tc.get("hidden_act")).and_then(|v| v.as_str()).unwrap_or("silu") {
         "gelu_pytorch_tanh" | "gelu_tanh" | "gelu_new" => "gelu_tanh".to_string(),
         "silu" | "swish" => "silu".to_string(),
         other => anyhow::bail!("unsupported hidden_act '{other}'"),
@@ -963,10 +929,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         match kind {
             Some("longrope") | Some("su") | Some("yarn") | Some("linear") | Some("dynamic") | Some("mrope") => {
                 let orig = cfg_usize(tc, "original_max_position_embeddings").unwrap_or(4096);
-                eprintln!(
-                    "  note: rope scaling '{:?}' — serving the exact {orig}-token native window",
-                    kind.unwrap()
-                );
+                eprintln!("  note: rope scaling '{:?}' — serving the exact {orig}-token native window", kind.unwrap());
                 max_pos = orig;
             }
             Some(other) => anyhow::bail!("rope_scaling '{other}' not supported yet"),
@@ -976,9 +939,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     Ok(ModelArch {
         arch_name: model_type,
         hidden_size: hidden,
-        intermediate_size: cfg_usize(tc, "intermediate_size")
-            .or_else(|| cfg_usize(tc, "moe_intermediate_size"))
-            .ok_or_else(|| anyhow::anyhow!("config: missing intermediate_size"))?,
+        intermediate_size: cfg_usize(tc, "intermediate_size").or_else(|| cfg_usize(tc, "moe_intermediate_size")).ok_or_else(|| anyhow::anyhow!("config: missing intermediate_size"))?,
         num_layers: n_layers,
         num_attention_heads: n_heads,
         num_kv_heads: cfg_usize(tc, "num_key_value_heads").unwrap_or(n_heads),
@@ -986,26 +947,20 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         vocab_size: cfg_usize(tc, "vocab_size").ok_or_else(|| anyhow::anyhow!("config: missing vocab_size"))?,
         layer_types,
         // LFM2 spells the RMSNorm epsilon `norm_eps`.
-        rms_norm_eps: tc
-            .get("rms_norm_eps")
-            .or_else(|| tc.get("norm_eps"))
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1e-6),
+        rms_norm_eps: tc.get("rms_norm_eps").or_else(|| tc.get("norm_eps")).and_then(|v| v.as_f64()).unwrap_or(1e-6),
         norm_style,
         rope_theta,
         // Gemma ties embeddings by default and its configs omit the key.
-        tie_word_embeddings: config
-            .get("tie_word_embeddings")
-            .and_then(|v| v.as_bool())
-            .unwrap_or_else(|| is_gemma),
+        tie_word_embeddings: config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or_else(|| is_gemma),
         partial_rotary_factor: prf,
+        yarn,
+        attention_heads_per_layer,
         mtp: None,
         moe,
         linear_core,
         max_position_embeddings: max_pos,
         // GDN spells it `linear_conv_kernel_dim`; LFM2 spells it `conv_L_cache`.
-        linear_conv_kernel_dim: cfg_usize(tc, "linear_conv_kernel_dim")
-            .or_else(|| cfg_usize(tc, "conv_L_cache")),
+        linear_conv_kernel_dim: cfg_usize(tc, "linear_conv_kernel_dim").or_else(|| cfg_usize(tc, "conv_L_cache")),
         linear_num_key_heads: cfg_usize(tc, "linear_num_key_heads"),
         linear_num_value_heads: lnv,
         linear_key_head_dim: cfg_usize(tc, "linear_key_head_dim"),
@@ -1013,25 +968,15 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         hidden_act,
         embed_multiplier,
         // Gemma-4 attends with scaling = 1.0 (q-norm carries the scale).
-        query_pre_attn_scalar: tc
-            .get("query_pre_attn_scalar")
-            .and_then(|v| v.as_f64())
-            .or(if is_gemma4 { Some(1.0) } else { None }),
-        sliding_window: cfg_usize(tc, "sliding_window")
-            .filter(|_| tc.get("sliding_window_pattern").is_some() || g4_pattern.is_some()),
+        query_pre_attn_scalar: tc.get("query_pre_attn_scalar").and_then(|v| v.as_f64()).or(if is_gemma4 { Some(1.0) } else { None }),
+        sliding_window: cfg_usize(tc, "sliding_window").filter(|_| is_laguna || tc.get("sliding_window_pattern").is_some() || g4_pattern.is_some()),
         sliding_window_pattern: cfg_usize(tc, "sliding_window_pattern").or(g4_pattern),
-        rope_local_base_freq: tc
-            .get("rope_local_base_freq")
-            .and_then(|v| v.as_f64())
-            .or(g4_local_theta),
+        rope_local_base_freq: tc.get("rope_local_base_freq").and_then(|v| v.as_f64()).or(g4_local_theta).or_else(|| local_rope.and_then(|r| r.get("rope_theta")).and_then(|v| v.as_f64())),
+        local_partial_rotary_factor: local_prf,
         global_head_dim: cfg_usize(tc, "global_head_dim").filter(|_| is_gemma4),
         num_global_kv_heads: cfg_usize(tc, "num_global_key_value_heads").filter(|_| is_gemma4),
         global_partial_rotary_factor: g4_global_prf,
-        final_logit_softcapping: if is_gemma4 {
-            tc.get("final_logit_softcapping").and_then(|v| v.as_f64())
-        } else {
-            None
-        },
+        final_logit_softcapping: if is_gemma4 { tc.get("final_logit_softcapping").and_then(|v| v.as_f64()) } else { None },
         attn_v_norm: is_gemma4,
     })
 }
@@ -1059,10 +1004,7 @@ pub(crate) fn looks_like_repo(s: &str) -> bool {
 
 /// A fresh ureq agent with the same timeouts the downloader uses.
 fn hf_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(20))
-        .timeout_read(Duration::from_secs(300))
-        .build()
+    ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(20)).timeout_read(Duration::from_secs(300)).build()
 }
 
 /// List a repo's files via the HF API (best-effort; empty on failure). Reused by
@@ -1073,11 +1015,7 @@ pub(crate) fn hf_repo_files(repo: &str, token: Option<&str>) -> Vec<String> {
 
 /// Download a single named file from an HF repo into the cache (parallel chunks
 /// for large files); returns its local path. Used to fetch one `.gguf`.
-pub(crate) fn hf_fetch_file(
-    repo: &str,
-    filename: &str,
-    token: Option<&str>,
-) -> anyhow::Result<std::path::PathBuf> {
+pub(crate) fn hf_fetch_file(repo: &str, filename: &str, token: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
     let dir = hf_cache_dir(repo)?;
     let dest = dir.join(filename.replace('/', "__"));
     let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
@@ -1087,9 +1025,7 @@ pub(crate) fn hf_fetch_file(
 
 /// Local cache dir for a downloaded HF repo (`~/.cache/cortiq/hf/owner--name`).
 fn hf_cache_dir(repo: &str) -> anyhow::Result<std::path::PathBuf> {
-    let base = std::env::var_os("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".cache/cortiq/hf"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".cortiq-hf"));
+    let base = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/cortiq/hf")).unwrap_or_else(|| std::path::PathBuf::from(".cortiq-hf"));
     let dir = base.join(repo.replace('/', "--"));
     fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -1099,12 +1035,7 @@ fn hf_cache_dir(repo: &str) -> anyhow::Result<std::path::PathBuf> {
 const HF_CHUNK: u64 = 32 * 1024 * 1024;
 
 fn hf_threads() -> usize {
-    std::env::var("CORTIQ_HF_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(8)
-        .min(16)
+    std::env::var("CORTIQ_HF_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 1).unwrap_or(8).min(16)
 }
 
 fn cached(dest: &Path) -> bool {
@@ -1127,9 +1058,7 @@ fn probe_size(agent: &ureq::Agent, url: &str, token: Option<&str>) -> Option<u64
 }
 
 fn get_range(agent: &ureq::Agent, url: &str, token: Option<&str>, start: u64, end: u64) -> anyhow::Result<Vec<u8>> {
-    let resp = auth(agent.get(url).set("Range", &format!("bytes={}-{}", start, end - 1)), token)
-        .call()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let resp = auth(agent.get(url).set("Range", &format!("bytes={}-{}", start, end - 1)), token).call().map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut buf = Vec::with_capacity((end - start) as usize);
     resp.into_reader().read_to_end(&mut buf)?;
     Ok(buf)
@@ -1176,30 +1105,32 @@ fn fetch(agent: &ureq::Agent, url: &str, dest: &Path, token: Option<&str>, requi
                 let f = fs::File::create(&tmp)?;
                 f.set_len(sz)?;
             }
-            let chunks: Vec<(u64, u64)> =
-                (0..sz).step_by(HF_CHUNK as usize).map(|s| (s, (s + HF_CHUNK).min(sz))).collect();
+            let chunks: Vec<(u64, u64)> = (0..sz).step_by(HF_CHUNK as usize).map(|s| (s, (s + HF_CHUNK).min(sz))).collect();
             let total = chunks.len();
             let queue = Mutex::new(chunks);
             let err: Mutex<Option<String>> = Mutex::new(None);
             let done = std::sync::atomic::AtomicUsize::new(0);
             std::thread::scope(|scope| {
                 for _ in 0..threads {
-                    scope.spawn(|| loop {
-                        if err.lock().unwrap().is_some() {
-                            break;
-                        }
-                        let Some((start, end)) = queue.lock().unwrap().pop() else { break };
-                        // Each chunk retries on a transient failure before aborting.
-                        let r = with_retry(4, || get_range(agent, url, token, start, end))
-                            .and_then(|buf| write_at(&tmp, start, &buf).map_err(Into::into));
-                        match r {
-                            Ok(()) => {
-                                let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                                eprint!("\r    downloading: {:>3}% ({d}/{total} chunks)", d * 100 / total);
-                            }
-                            Err(e) => {
-                                *err.lock().unwrap() = Some(e.to_string());
+                    scope.spawn(|| {
+                        loop {
+                            if err.lock().unwrap().is_some() {
                                 break;
+                            }
+                            let Some((start, end)) = queue.lock().unwrap().pop() else {
+                                break;
+                            };
+                            // Each chunk retries on a transient failure before aborting.
+                            let r = with_retry(4, || get_range(agent, url, token, start, end)).and_then(|buf| write_at(&tmp, start, &buf).map_err(Into::into));
+                            match r {
+                                Ok(()) => {
+                                    let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                    eprint!("\r    downloading: {:>3}% ({d}/{total} chunks)", d * 100 / total);
+                                }
+                                Err(e) => {
+                                    *err.lock().unwrap() = Some(e.to_string());
+                                    break;
+                                }
                             }
                         }
                     });
@@ -1241,11 +1172,7 @@ fn repo_files(agent: &ureq::Agent, repo: &str, token: Option<&str>) -> Vec<Strin
         Ok(resp) => resp
             .into_json::<serde_json::Value>()
             .ok()
-            .and_then(|j| {
-                j["siblings"].as_array().map(|a| {
-                    a.iter().filter_map(|s| s["rfilename"].as_str().map(String::from)).collect()
-                })
-            })
+            .and_then(|j| j["siblings"].as_array().map(|a| a.iter().filter_map(|s| s["rfilename"].as_str().map(String::from)).collect()))
             .unwrap_or_default(),
         Err(_) => Vec::new(),
     }
@@ -1257,10 +1184,7 @@ pub(crate) fn hf_download(repo: &str, token: Option<&str>) -> anyhow::Result<std
     let dir = hf_cache_dir(repo)?;
     let base = format!("https://huggingface.co/{repo}/resolve/main");
     let threads = hf_threads();
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(20))
-        .timeout_read(Duration::from_secs(300))
-        .build();
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(20)).timeout_read(Duration::from_secs(300)).build();
     // config.json is mandatory for the safetensors path. If it is absent, give an
     // actionable message rather than a raw 404 — most often the repo is a GGUF-only
     // distribution (has `*.gguf`, no `config.json`), which needs a different tool.
@@ -1268,10 +1192,7 @@ pub(crate) fn hf_download(repo: &str, token: Option<&str>) -> anyhow::Result<std
         let files = repo_files(&agent, repo, token);
         let ggufs = files.iter().filter(|f| f.to_lowercase().ends_with(".gguf")).count();
         if ggufs > 0 {
-            let src = repo
-                .strip_suffix("-GGUF")
-                .or_else(|| repo.strip_suffix("-gguf"))
-                .filter(|s| !s.is_empty());
+            let src = repo.strip_suffix("-GGUF").or_else(|| repo.strip_suffix("-gguf")).filter(|s| !s.is_empty());
             anyhow::bail!(
                 "'{repo}' is a GGUF repository ({ggufs} .gguf file(s), no config.json); \
                  `cortiq convert` needs a safetensors checkpoint. Either import a GGUF file \
@@ -1320,15 +1241,7 @@ pub(crate) fn hf_download(repo: &str, token: Option<&str>) -> anyhow::Result<std
 /// are grouped by k-head. This mirrors transformers' `fix_query_key_value_ordering`
 /// inverse — a pure row permutation, no value changes. Returns `(name, values,
 /// out_rows)` for each produced tensor.
-fn split_fused_gdn(
-    name: &str,
-    w: &[f32],
-    hid: usize,
-    nk: usize,
-    dk: usize,
-    nv: usize,
-    dv: usize,
-) -> anyhow::Result<Vec<(String, Vec<f32>, usize)>> {
+fn split_fused_gdn(name: &str, w: &[f32], hid: usize, nk: usize, dk: usize, nv: usize, dv: usize) -> anyhow::Result<Vec<(String, Vec<f32>, usize)>> {
     if nk == 0 || nv % nk != 0 {
         anyhow::bail!("fused GDN: bad head config nk={nk} nv={nv}");
     }
@@ -1369,10 +1282,7 @@ fn split_fused_gdn(
             }
         }
         let p = name.strip_suffix("in_proj_qkvz.weight").unwrap_or(name);
-        Ok(vec![
-            (format!("{p}in_proj_qkv.weight"), qkv, 2 * nk * dk + nv * dv),
-            (format!("{p}in_proj_z.weight"), z, nv * dv),
-        ])
+        Ok(vec![(format!("{p}in_proj_qkv.weight"), qkv, 2 * nk * dk + nv * dv), (format!("{p}in_proj_z.weight"), z, nv * dv)])
     } else {
         // in_proj_ba: group width 2·r → b (first r per group), a (next r) → nv rows each.
         let gw = 2 * r;
@@ -1392,10 +1302,7 @@ fn split_fused_gdn(
             }
         }
         let p = name.strip_suffix("in_proj_ba.weight").unwrap_or(name);
-        Ok(vec![
-            (format!("{p}in_proj_b.weight"), b, nv),
-            (format!("{p}in_proj_a.weight"), a, nv),
-        ])
+        Ok(vec![(format!("{p}in_proj_b.weight"), b, nv), (format!("{p}in_proj_a.weight"), a, nv)])
     }
 }
 
@@ -1462,11 +1369,7 @@ fn slice_ffn(kind: &FfnKind, shape: &[usize], vals: &[f32], keep: &[bool]) -> an
 
 /// Effective f32 for a canonical tensor: the baked overlay if present,
 /// otherwise the backbone tensor from the safetensors files.
-fn effective_tensor(
-    overlay: &HashMap<String, (Vec<usize>, Vec<f32>)>,
-    files: &[SafeTensors],
-    name: &str,
-) -> anyhow::Result<(Vec<usize>, Vec<f32>)> {
+fn effective_tensor(overlay: &HashMap<String, (Vec<usize>, Vec<f32>)>, files: &[SafeTensors], name: &str) -> anyhow::Result<(Vec<usize>, Vec<f32>)> {
     if let Some((s, v)) = overlay.get(name) {
         return Ok((s.clone(), v.clone()));
     }
@@ -1504,7 +1407,9 @@ fn build_defrag_plan(dir: &Path, arch: &ModelArch, files: &[SafeTensors]) -> any
             let a = npy::read(&p)?;
             let vals = match a.data {
                 npy::NpyData::F32(v) => v,
-                npy::NpyData::Bool(_) => anyhow::bail!("defrag overlay {stem}: expected float, got bool"),
+                npy::NpyData::Bool(_) => {
+                    anyhow::bail!("defrag overlay {stem}: expected float, got bool")
+                }
             };
             overlay.insert(stem, (a.shape, vals));
         }
@@ -1580,8 +1485,7 @@ pub fn run_convert(
         anyhow::bail!("'{model}': not a local model dir (no config.json) and not an HF repo id (owner/name)");
     };
 
-    let config: serde_json::Value = serde_json::from_slice(&fs::read(dir.join("config.json"))
-        .map_err(|e| anyhow::anyhow!("read config.json: {e}"))?)?;
+    let config: serde_json::Value = serde_json::from_slice(&fs::read(dir.join("config.json")).map_err(|e| anyhow::anyhow!("read config.json: {e}"))?)?;
     let mut arch = build_arch(&config)?;
 
     // Memory-map the weights and process one tensor at a time — the raw model is
@@ -1597,10 +1501,7 @@ pub fn run_convert(
         None => None,
     };
     if let Some(plan) = &defrag_plan {
-        let max_kept = (0..arch.num_layers)
-            .filter_map(|li| plan.keep.get(&li).map(|k| k.iter().filter(|&&b| b).count()))
-            .max()
-            .unwrap_or(orig_inter);
+        let max_kept = (0..arch.num_layers).filter_map(|li| plan.keep.get(&li).map(|k| k.iter().filter(|&&b| b).count())).max().unwrap_or(orig_inter);
         arch.intermediate_size = max_kept;
     }
     let total: usize = files.iter().map(|f| f.tensors.len()).sum::<usize>().max(1);
@@ -1610,7 +1511,9 @@ pub fn run_convert(
         for m in &file.tensors {
             done += 1;
             progress(done as f32 / total as f32);
-            let Some(name) = canon_name(&m.name) else { continue };
+            let Some(name) = canon_name(&m.name) else {
+                continue;
+            };
 
             // Skip MLX scales and biases as they are processed with the weight.
             if m.dtype == "F16" && (name.ends_with(".scales") || name.ends_with(".biases")) {
@@ -1634,7 +1537,7 @@ pub fn run_convert(
                 let out_dim = m.shape[0];
                 let w_cols = m.shape[1];
                 let num_groups = scales.len() / 2 / out_dim;
-                
+
                 let mut bits = 0;
                 let mut in_dim = 0;
                 for b in [1, 2, 3, 4, 8] {
@@ -1673,56 +1576,36 @@ pub fn run_convert(
                 let dv = arch.linear_value_head_dim.ok_or_else(|| miss("linear_value_head_dim"))?;
                 for (out_name, out_vals, out_rows) in split_fused_gdn(&name, &w, hid, nk, dk, nv, dv)? {
                     let two_d = out_rows * hid >= GROUP_SIZE && !force_f16(&out_name);
-                    let (dt, data) = if two_d {
-                        quantize_2d(quant, &out_vals, out_rows, hid)
-                    } else {
-                        (TensorDtype::F16, encode_f16(&out_vals))
-                    };
-                    tensors.push(TensorSpec { name: out_name, dtype: dt, shape: vec![out_rows, hid], data });
+                    let (dt, data) = if two_d { quantize_2d(quant, &out_vals, out_rows, hid) } else { (TensorDtype::F16, encode_f16(&out_vals)) };
+                    tensors.push(TensorSpec {
+                        name: out_name,
+                        dtype: dt,
+                        shape: vec![out_rows, hid],
+                        data,
+                    });
                 }
                 continue;
             }
             // Phi-3 family fuses QKV (`qkv_proj`) and gate/up
             // (`gate_up_proj`): split into the canonical tensors — a
             // pure row slice, no value changes.
-            if name.ends_with(".self_attn.qkv_proj.weight")
-                || name.ends_with(".mlp.gate_up_proj.weight")
-            {
+            if name.ends_with(".self_attn.qkv_proj.weight") || name.ends_with(".mlp.gate_up_proj.weight") {
                 anyhow::ensure!(m_shape.len() == 2, "fused '{name}': expected 2-D");
                 let w = &m_vals;
                 let (rows, cols) = (m_shape[0], m_shape[1]);
                 let parts: Vec<(String, usize, usize)> = if name.contains("qkv_proj") {
                     let q = arch.num_attention_heads * arch.head_dim;
                     let kv = arch.num_kv_heads * arch.head_dim;
-                    anyhow::ensure!(
-                        q + 2 * kv == rows,
-                        "'{name}': {rows} rows != q({q}) + 2·kv({kv})"
-                    );
-                    vec![
-                        (name.replace("qkv_proj", "q_proj"), 0, q),
-                        (name.replace("qkv_proj", "k_proj"), q, kv),
-                        (name.replace("qkv_proj", "v_proj"), q + kv, kv),
-                    ]
+                    anyhow::ensure!(q + 2 * kv == rows, "'{name}': {rows} rows != q({q}) + 2·kv({kv})");
+                    vec![(name.replace("qkv_proj", "q_proj"), 0, q), (name.replace("qkv_proj", "k_proj"), q, kv), (name.replace("qkv_proj", "v_proj"), q + kv, kv)]
                 } else {
                     anyhow::ensure!(rows % 2 == 0, "'{name}': odd row count {rows}");
-                    vec![
-                        (name.replace("gate_up_proj", "gate_proj"), 0, rows / 2),
-                        (name.replace("gate_up_proj", "up_proj"), rows / 2, rows / 2),
-                    ]
+                    vec![(name.replace("gate_up_proj", "gate_proj"), 0, rows / 2), (name.replace("gate_up_proj", "up_proj"), rows / 2, rows / 2)]
                 };
                 for (out_name, r0, nr) in parts {
                     let vals = &w[r0 * cols..(r0 + nr) * cols];
-                    let (dt, data) = if nr * cols >= GROUP_SIZE && !force_f16(&out_name) {
-                        quantize_2d(quant, vals, nr, cols)
-                    } else {
-                        (TensorDtype::F16, encode_f16(vals))
-                    };
-                    tensors.push(TensorSpec {
-                        name: out_name,
-                        dtype: dt,
-                        shape: vec![nr, cols],
-                        data,
-                    });
+                    let (dt, data) = if nr * cols >= GROUP_SIZE && !force_f16(&out_name) { quantize_2d(quant, vals, nr, cols) } else { (TensorDtype::F16, encode_f16(vals)) };
+                    tensors.push(TensorSpec { name: out_name, dtype: dt, shape: vec![nr, cols], data });
                 }
                 continue;
             }
@@ -1732,11 +1615,7 @@ pub fn run_convert(
             // runtime keeps its uniform Q/K/V/O contract; the overlay
             // costs one MQA-sized tensor per global layer.
             if arch.global_head_dim.is_some() && name.ends_with(".self_attn.k_proj.weight") {
-                let li: Option<usize> = name
-                    .split(".layers.")
-                    .nth(1)
-                    .and_then(|r| r.split('.').next())
-                    .and_then(|n| n.parse().ok());
+                let li: Option<usize> = name.split(".layers.").nth(1).and_then(|r| r.split('.').next()).and_then(|n| n.parse().ok());
                 let pat = arch.sliding_window_pattern.unwrap_or(usize::MAX);
                 if let Some(li) = li {
                     if (li + 1) % pat == 0 {
@@ -1744,11 +1623,7 @@ pub fn run_convert(
                         let w = &m_vals;
                         let (rows, cols) = (m_shape[0], m_shape[1]);
                         for out_name in [name.clone(), name.replace("k_proj", "v_proj")] {
-                            let (dt, data) = if rows * cols >= GROUP_SIZE && !force_f16(&out_name) {
-                                quantize_2d(quant, &w, rows, cols)
-                            } else {
-                                (TensorDtype::F16, encode_f16(&w))
-                            };
+                            let (dt, data) = if rows * cols >= GROUP_SIZE && !force_f16(&out_name) { quantize_2d(quant, &w, rows, cols) } else { (TensorDtype::F16, encode_f16(&w)) };
                             tensors.push(TensorSpec {
                                 name: out_name,
                                 dtype: dt,
@@ -1774,11 +1649,7 @@ pub fn run_convert(
                         let (out_shape, out_vals) = slice_ffn(&kind, &shape, &vals, keep)?;
                         let numel = out_shape[0] * out_shape[1];
                         let two_d = numel >= GROUP_SIZE && !force_f16(&name);
-                        let (dt, data) = if two_d {
-                            quantize_2d(quant, &out_vals, out_shape[0], out_shape[1])
-                        } else {
-                            (TensorDtype::F16, encode_f16(&out_vals))
-                        };
+                        let (dt, data) = if two_d { quantize_2d(quant, &out_vals, out_shape[0], out_shape[1]) } else { (TensorDtype::F16, encode_f16(&out_vals)) };
                         tensors.push(TensorSpec { name, dtype: dt, shape: out_shape, data });
                         continue;
                     }
@@ -1791,27 +1662,18 @@ pub fn run_convert(
             }
             // 1-D tensors, tiny tensors, non-2-D, and gate-critical projections go f16.
             let two_d = m_shape.len() == 2 && numel >= GROUP_SIZE && !force_f16(&name);
-            let (dt, data) = if two_d {
-                quantize_2d(quant, &vals, m_shape[0], m_shape[1])
-            } else {
-                (TensorDtype::F16, encode_f16(&vals))
-            };
+            let (dt, data) = if two_d { quantize_2d(quant, &vals, m_shape[0], m_shape[1]) } else { (TensorDtype::F16, encode_f16(&vals)) };
             tensors.push(TensorSpec { name, dtype: dt, shape: m_shape.clone(), data });
         }
     }
 
     // Tokenizer + chat bundle (optional but recommended).
     let vocab = fs::read(dir.join("tokenizer.json")).ok();
-    let tok_cfg: serde_json::Value =
-        fs::read(dir.join("tokenizer_config.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::Value::Null);
-    let gen_cfg: serde_json::Value =
-        fs::read(dir.join("generation_config.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::Value::Null);
+    let tok_cfg: serde_json::Value = fs::read(dir.join("tokenizer_config.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::Value::Null);
+    let gen_cfg: serde_json::Value = fs::read(dir.join("generation_config.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::Value::Null);
     // Sidecar `chat_template.jinja` first, then the tokenizer_config field;
     // ignore an empty/blank file so we correctly fall through to the config.
-    let chat_template = fs::read_to_string(dir.join("chat_template.jinja"))
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| tok_cfg.get("chat_template").and_then(|v| v.as_str().map(String::from)));
+    let chat_template = fs::read_to_string(dir.join("chat_template.jinja")).ok().filter(|s| !s.trim().is_empty()).or_else(|| tok_cfg.get("chat_template").and_then(|v| v.as_str().map(String::from)));
     let bundle = TokenizerBundle {
         chat_template,
         eos_token_ids: eos_ids(&gen_cfg, &config),
@@ -1832,14 +1694,7 @@ pub fn run_convert(
     };
     let provenance = match &defrag_plan {
         Some(plan) => {
-            let kept: Vec<usize> = (0..arch.num_layers)
-                .map(|li| {
-                    plan.keep
-                        .get(&li)
-                        .map(|k| k.iter().filter(|&&b| b).count())
-                        .unwrap_or(orig_inter)
-                })
-                .collect();
+            let kept: Vec<usize> = (0..arch.num_layers).map(|li| plan.keep.get(&li).map(|k| k.iter().filter(|&&b| b).count()).unwrap_or(orig_inter)).collect();
             let live: usize = kept.iter().sum();
             let ratio = 1.0 - live as f64 / (arch.num_layers as f64 * orig_inter as f64);
             eprintln!(
@@ -1893,8 +1748,7 @@ pub fn run_convert(
     // reader (which addresses tensors by name/offset) is unaffected.
     tensors.sort_by(|a, b| exec_order_key(&a.name).cmp(&exec_order_key(&b.name)).then_with(|| a.name.cmp(&b.name)));
 
-    CmfModel::write(output, &header, &tensors, None, vocab.as_deref())
-        .map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;
+    CmfModel::write(output, &header, &tensors, None, vocab.as_deref()).map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;
     progress(1.0);
     Ok(())
 }
@@ -1903,6 +1757,57 @@ pub fn run_convert(
 mod tests {
     use super::*;
     use cortiq_core::quant::{dequant_q4_block, dequant_q8_2f, dequant_q8_row, dequant_vbit};
+
+    #[test]
+    fn laguna_config_maps_to_exact_cmf_contract() {
+        let config = serde_json::json!({
+            "model_type": "laguna",
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_attention_heads_per_layer": [4, 6, 6, 6],
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "vocab_size": 100,
+            "max_position_embeddings": 1048576,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 16,
+            "shared_expert_intermediate_size": 16,
+            "norm_topk_prob": true,
+            "moe_routed_scaling_factor": 2.5,
+            "sliding_window": 512,
+            "layer_types": ["full_attention", "sliding_attention", "sliding_attention", "sliding_attention"],
+            "rope_parameters": {
+                "full_attention": {
+                    "rope_type": "yarn", "rope_theta": 500000.0,
+                    "factor": 128.0, "original_max_position_embeddings": 8192,
+                    "beta_fast": 32.0, "beta_slow": 1.0,
+                    "attention_factor": 1.485203, "partial_rotary_factor": 0.5
+                },
+                "sliding_attention": {
+                    "rope_type": "default", "rope_theta": 10000.0,
+                    "partial_rotary_factor": 1.0
+                }
+            }
+        });
+        let arch = build_arch(&config).unwrap();
+        assert_eq!(arch.arch_name, "laguna");
+        assert_eq!(arch.attention_heads_per_layer, Some(vec![4, 6, 6, 6]));
+        assert_eq!(arch.layer_types, vec![LayerType::FullAttention, LayerType::SlidingAttention, LayerType::SlidingAttention, LayerType::SlidingAttention,]);
+        assert_eq!(arch.sliding_window, Some(512));
+        assert_eq!(arch.rope_theta, 500000.0);
+        assert_eq!(arch.rope_local_base_freq, Some(10000.0));
+        assert_eq!(arch.partial_rotary_factor, 0.5);
+        assert_eq!(arch.local_partial_rotary_factor, Some(1.0));
+        let yarn = arch.yarn.unwrap();
+        assert_eq!(yarn.factor, 128.0);
+        let moe = arch.moe.unwrap();
+        assert!(moe.router_sigmoid);
+        assert_eq!(moe.routed_scaling_factor, Some(2.5));
+        assert_eq!(canon_name("model.layers.1.mlp.experts.e_score_correction_bias").as_deref(), Some("model.layers.1.mlp.expert_bias"));
+    }
 
     #[test]
     fn exec_order_lays_out_by_layer_then_block() {
@@ -1920,9 +1825,7 @@ mod tests {
             "model.layers.2.mlp.experts.0.gate_proj.weight",
             "model.layers.10.self_attn.o_proj.weight",
         ];
-        names.sort_by(|a, b| {
-            exec_order_key(a).cmp(&exec_order_key(b)).then_with(|| a.cmp(b))
-        });
+        names.sort_by(|a, b| exec_order_key(a).cmp(&exec_order_key(b)).then_with(|| a.cmp(b)));
         assert_eq!(
             names,
             vec![
@@ -1967,8 +1870,8 @@ mod tests {
 
     #[test]
     fn vbit_ro_roundtrip_and_validation() {
-        use cortiq_core::quant::{dequant_vbit_ro, validate_payload};
         use cortiq_core::TensorDtype;
+        use cortiq_core::quant::{dequant_vbit_ro, validate_payload};
         let (rows, cols) = (5usize, 64usize);
         let mut vals = vec![0f32; rows * cols];
         for o in 0..rows {
@@ -2031,79 +1934,28 @@ mod tests {
         // Conv (dense) layer 0.
         let c = |s: &str| canon_name(s).unwrap();
         assert_eq!(c("model.embedding_norm.weight"), "model.norm.weight");
-        assert_eq!(
-            c("model.layers.0.operator_norm.weight"),
-            "model.layers.0.input_layernorm.weight"
-        );
-        assert_eq!(
-            c("model.layers.0.ffn_norm.weight"),
-            "model.layers.0.post_attention_layernorm.weight"
-        );
-        assert_eq!(
-            c("model.layers.0.conv.in_proj.weight"),
-            "model.layers.0.short_conv.in_proj.weight"
-        );
-        assert_eq!(
-            c("model.layers.0.conv.conv.weight"),
-            "model.layers.0.short_conv.conv.weight"
-        );
-        assert_eq!(
-            c("model.layers.0.conv.out_proj.weight"),
-            "model.layers.0.short_conv.out_proj.weight"
-        );
+        assert_eq!(c("model.layers.0.operator_norm.weight"), "model.layers.0.input_layernorm.weight");
+        assert_eq!(c("model.layers.0.ffn_norm.weight"), "model.layers.0.post_attention_layernorm.weight");
+        assert_eq!(c("model.layers.0.conv.in_proj.weight"), "model.layers.0.short_conv.in_proj.weight");
+        assert_eq!(c("model.layers.0.conv.conv.weight"), "model.layers.0.short_conv.conv.weight");
+        assert_eq!(c("model.layers.0.conv.out_proj.weight"), "model.layers.0.short_conv.out_proj.weight");
         // Dense FFN: w1/w3/w2 → gate/up/down.
-        assert_eq!(
-            c("model.layers.0.feed_forward.w1.weight"),
-            "model.layers.0.mlp.gate_proj.weight"
-        );
-        assert_eq!(
-            c("model.layers.0.feed_forward.w3.weight"),
-            "model.layers.0.mlp.up_proj.weight"
-        );
-        assert_eq!(
-            c("model.layers.0.feed_forward.w2.weight"),
-            "model.layers.0.mlp.down_proj.weight"
-        );
+        assert_eq!(c("model.layers.0.feed_forward.w1.weight"), "model.layers.0.mlp.gate_proj.weight");
+        assert_eq!(c("model.layers.0.feed_forward.w3.weight"), "model.layers.0.mlp.up_proj.weight");
+        assert_eq!(c("model.layers.0.feed_forward.w2.weight"), "model.layers.0.mlp.down_proj.weight");
         // Attention (full_attention layer 2): out_proj → o_proj, q/k layernorm.
-        assert_eq!(
-            c("model.layers.2.self_attn.out_proj.weight"),
-            "model.layers.2.self_attn.o_proj.weight"
-        );
-        assert_eq!(
-            c("model.layers.2.self_attn.q_layernorm.weight"),
-            "model.layers.2.self_attn.q_norm.weight"
-        );
-        assert_eq!(
-            c("model.layers.2.self_attn.k_layernorm.weight"),
-            "model.layers.2.self_attn.k_norm.weight"
-        );
+        assert_eq!(c("model.layers.2.self_attn.out_proj.weight"), "model.layers.2.self_attn.o_proj.weight");
+        assert_eq!(c("model.layers.2.self_attn.q_layernorm.weight"), "model.layers.2.self_attn.q_norm.weight");
+        assert_eq!(c("model.layers.2.self_attn.k_layernorm.weight"), "model.layers.2.self_attn.k_norm.weight");
         // MoE router / bias / experts.
-        assert_eq!(
-            c("model.layers.2.feed_forward.gate.weight"),
-            "model.layers.2.mlp.gate.weight"
-        );
-        assert_eq!(
-            c("model.layers.2.feed_forward.expert_bias"),
-            "model.layers.2.mlp.expert_bias"
-        );
-        assert_eq!(
-            c("model.layers.2.feed_forward.experts.7.w1.weight"),
-            "model.layers.2.mlp.experts.7.gate_proj.weight"
-        );
-        assert_eq!(
-            c("model.layers.2.feed_forward.experts.7.w2.weight"),
-            "model.layers.2.mlp.experts.7.down_proj.weight"
-        );
+        assert_eq!(c("model.layers.2.feed_forward.gate.weight"), "model.layers.2.mlp.gate.weight");
+        assert_eq!(c("model.layers.2.feed_forward.expert_bias"), "model.layers.2.mlp.expert_bias");
+        assert_eq!(c("model.layers.2.feed_forward.experts.7.w1.weight"), "model.layers.2.mlp.experts.7.gate_proj.weight");
+        assert_eq!(c("model.layers.2.feed_forward.experts.7.w2.weight"), "model.layers.2.mlp.experts.7.down_proj.weight");
         // Q/K/V projections already canonical — must pass through untouched.
-        assert_eq!(
-            c("model.layers.2.self_attn.q_proj.weight"),
-            "model.layers.2.self_attn.q_proj.weight"
-        );
+        assert_eq!(c("model.layers.2.self_attn.q_proj.weight"), "model.layers.2.self_attn.q_proj.weight");
         // A Qwen tensor must be untouched by the LFM2 rewrite.
-        assert_eq!(
-            c("model.layers.3.mlp.gate_proj.weight"),
-            "model.layers.3.mlp.gate_proj.weight"
-        );
+        assert_eq!(c("model.layers.3.mlp.gate_proj.weight"), "model.layers.3.mlp.gate_proj.weight");
     }
 
     #[test]
@@ -2141,14 +1993,8 @@ mod tests {
     #[test]
     fn q1_ef_bit_identical_on_a_1bit_tensor() {
         let (rows, cols) = (4usize, 96usize);
-        let onebit: Vec<f32> = (0..rows * cols)
-            .map(|i| if (i * 7 + 3) % 5 < 2 { 0.25 } else { -0.25 })
-            .collect();
-        assert_eq!(
-            encode_q1(&onebit, rows, cols),
-            encode_q1_ef(&onebit, rows, cols),
-            "error diffusion must be a no-op on a genuinely 1-bit tensor"
-        );
+        let onebit: Vec<f32> = (0..rows * cols).map(|i| if (i * 7 + 3) % 5 < 2 { 0.25 } else { -0.25 }).collect();
+        assert_eq!(encode_q1(&onebit, rows, cols), encode_q1_ef(&onebit, rows, cols), "error diffusion must be a no-op on a genuinely 1-bit tensor");
     }
 
     /// Q1S roundtrip: kept outliers come back at f16 precision and the bulk
@@ -2158,8 +2004,7 @@ mod tests {
     fn q1s_roundtrip_restores_outliers_and_binarizes_the_rest() {
         use cortiq_core::quant::dequant_q1s;
         let (rows, cols) = (2usize, 64usize);
-        let mut vals: Vec<f32> =
-            (0..rows * cols).map(|i| (i as f32 * 0.017).sin() * 0.1).collect();
+        let mut vals: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.017).sin() * 0.1).collect();
         let spikes = [5usize, 40, 70, 120];
         for &i in &spikes {
             vals[i] = if i % 2 == 0 { 3.0 } else { -3.0 };
@@ -2232,10 +2077,7 @@ mod tests {
             for &v in vals {
                 data.extend_from_slice(&v.to_le_bytes());
             }
-            header.insert(
-                name.to_string(),
-                serde_json::json!({"dtype":"F32","shape":shape,"data_offsets":[start, data.len()]}),
-            );
+            header.insert(name.to_string(), serde_json::json!({"dtype":"F32","shape":shape,"data_offsets":[start, data.len()]}));
         }
         let hjson = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
         let mut out = (hjson.len() as u64).to_le_bytes().to_vec();
@@ -2255,10 +2097,7 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
-        let st = tiny_safetensors(&[
-            ("model.embed_tokens.weight", vec![32, 64], (0..32 * 64).map(|k| (k as f32 * 0.01).sin()).collect()),
-            ("model.norm.weight", vec![64], vec![1.0f32; 64]),
-        ]);
+        let st = tiny_safetensors(&[("model.embed_tokens.weight", vec![32, 64], (0..32 * 64).map(|k| (k as f32 * 0.01).sin()).collect()), ("model.norm.weight", vec![64], vec![1.0f32; 64])]);
         fs::write(dir.join("model.safetensors"), &st).unwrap();
         let out = dir.join("m.cmf");
         run_convert(dir.to_str().unwrap(), "q8", out.to_str().unwrap(), None, None, None, |_| {}).unwrap();

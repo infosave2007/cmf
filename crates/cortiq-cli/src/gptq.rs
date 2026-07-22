@@ -380,9 +380,97 @@ fn two_field_mask(w0: &[f32], in_dim: usize, act_rms: &[f32], n_out: usize) -> V
 /// Ternary (BitNet b1.58) quantization with the two-field outlier mask —
 /// NO fold (the holographic fold backfires at extreme low-bit with a noisy
 /// single-pass Hessian; ternary's zero level is the real win). Each group's
-/// scale is the abs-mean of its non-outlier weights; a weight rounds to
-/// {−1,0,+1}·s (|w| < 0.5·s ⇒ 0, capturing the near-zero mass exactly).
+/// scale/support are selected between the historical abs-mean rounding and
+/// an activation-weighted least-squares candidate. The lower-error candidate
+/// wins independently in each group, preserving the near-zero mass exactly.
 /// Emits `Q1T` bytes.
+fn q1t_group_candidate(
+    w: &[f32],
+    outlier: &[bool],
+    act_rms: &[f32],
+    col0: usize,
+) -> (f32, [u8; GROUP_SIZE]) {
+    debug_assert_eq!(w.len(), GROUP_SIZE);
+    debug_assert_eq!(outlier.len(), GROUP_SIZE);
+    let mut sum = 0.0f32;
+    let mut cnt = 0usize;
+    for k in 0..GROUP_SIZE {
+        if !outlier[k] {
+            sum += w[k].abs();
+            cnt += 1;
+        }
+    }
+    let mean = if cnt > 0 { sum / cnt as f32 } else { 0.0 };
+    let legacy_scale = f16_to_f32(f32_to_f16(mean)).max(6.103_515_625e-5);
+
+    // A sparse-support candidate. Its level is the exact diagonal-Hessian
+    // least-squares solution over the selected support:
+    //   s = Σ d_i |w_i| / Σ d_i, d_i = RMS(x_i)^2.
+    // 0.7·mean_abs is only a cheap proposal; the error comparison below
+    // retains the historical candidate whenever it is better.
+    let threshold = 0.7 * mean;
+    let (mut num, mut den, mut legacy_err) = (0.0f64, 0.0f64, 0.0f64);
+    for k in 0..GROUP_SIZE {
+        if outlier[k] {
+            continue;
+        }
+        let rms = act_rms.get(col0 + k).copied().unwrap_or(1.0) as f64;
+        let d = rms * rms;
+        let a = w[k].abs() as f64;
+        if w[k].abs() >= threshold {
+            num += d * a;
+            den += d;
+        }
+        let q = if w[k] >= 0.5 * legacy_scale {
+            legacy_scale
+        } else if w[k] <= -0.5 * legacy_scale {
+            -legacy_scale
+        } else {
+            0.0
+        } as f64;
+        let e = w[k] as f64 - q;
+        legacy_err += d * e * e;
+    }
+    let adaptive_scale = if den > 0.0 {
+        f16_to_f32(f32_to_f16((num / den) as f32)).max(6.103_515_625e-5)
+    } else {
+        legacy_scale
+    };
+    let mut adaptive_err = 0.0f64;
+    for k in 0..GROUP_SIZE {
+        if outlier[k] {
+            continue;
+        }
+        let rms = act_rms.get(col0 + k).copied().unwrap_or(1.0) as f64;
+        let d = rms * rms;
+        let q = if w[k].abs() >= threshold {
+            adaptive_scale.copysign(w[k])
+        } else {
+            0.0
+        } as f64;
+        let e = w[k] as f64 - q;
+        adaptive_err += d * e * e;
+    }
+
+    let adaptive = adaptive_err < legacy_err;
+    let scale = if adaptive { adaptive_scale } else { legacy_scale };
+    let mut code = [0u8; GROUP_SIZE];
+    for k in 0..GROUP_SIZE {
+        if outlier[k] {
+            continue;
+        }
+        let nonzero = if adaptive {
+            w[k].abs() >= threshold
+        } else {
+            w[k].abs() >= 0.5 * legacy_scale
+        };
+        if nonzero {
+            code[k] = if w[k] >= 0.0 { 1 } else { 2 };
+        }
+    }
+    (scale, code)
+}
+
 pub fn quantize_q1t(
     w0: &[f32],
     out_dim: usize,
@@ -404,35 +492,19 @@ pub fn quantize_q1t(
     let mut codes = vec![0u8; n_groups * 7];
     for g in 0..n_groups {
         let base = g * GROUP_SIZE;
-        let mut sum = 0.0f32;
-        let mut cnt = 0usize;
-        for k in 0..GROUP_SIZE {
-            if !is_out[base + k] {
-                sum += w0[base + k].abs();
-                cnt += 1;
-            }
-        }
-        let s = f16_to_f32(f32_to_f16(if cnt > 0 { sum / cnt as f32 } else { 0.0 }))
-            .max(6.103_515_625e-5);
+        let col0 = base % in_dim;
+        let (s, group_codes) = q1t_group_candidate(
+            &w0[base..base + GROUP_SIZE],
+            &is_out[base..base + GROUP_SIZE],
+            act_rms,
+            col0,
+        );
         scale[g] = s;
         for k in 0..GROUP_SIZE {
-            let i = base + k;
             // Code 0 at outlier positions is a KERNEL INVARIANT: the q1t
             // matvec adds `value·x` for each overlay entry without subtracting
             // a base, so the base here must contribute nothing. Do not change.
-            let code: u8 = if is_out[i] {
-                0
-            } else {
-                let r = w0[i] / s;
-                if r >= 0.5 {
-                    1
-                } else if r <= -0.5 {
-                    2
-                } else {
-                    0
-                }
-            };
-            codes[g * 7 + k / 5] += code * POW3[k % 5];
+            codes[g * 7 + k / 5] += group_codes[k] * POW3[k % 5];
         }
     }
 
@@ -634,6 +706,36 @@ pub fn gptq_quantize_q1s(
 mod tests {
     use super::*;
     use cortiq_core::quant::{dequant_q1s, dequant_q1t};
+
+    #[test]
+    fn adaptive_ternary_group_never_worsens_weighted_proxy() {
+        let w: Vec<f32> = (0..GROUP_SIZE)
+            .map(|i| {
+                let a = ((i * 17 + 5) % 31) as f32 / 31.0;
+                if i % 3 == 0 { a * 0.08 } else { (a + 0.15) * if i % 2 == 0 { 1.0 } else { -1.0 } }
+            })
+            .collect();
+        let rms: Vec<f32> = (0..GROUP_SIZE).map(|i| 0.3 + (i % 7) as f32 * 0.4).collect();
+        let outlier = vec![false; GROUP_SIZE];
+        let (scale, codes) = q1t_group_candidate(&w, &outlier, &rms, 0);
+
+        let legacy_scale = f16_to_f32(f32_to_f16(w.iter().map(|x| x.abs()).sum::<f32>() / GROUP_SIZE as f32))
+            .max(6.103_515_625e-5);
+        let err = |s: f32, c: &[u8]| -> f64 {
+            (0..GROUP_SIZE)
+                .map(|i| {
+                    let q = match c[i] { 1 => s, 2 => -s, _ => 0.0 };
+                    let e = (w[i] - q) as f64;
+                    e * e * (rms[i] * rms[i]) as f64
+                })
+                .sum()
+        };
+        let legacy_codes: Vec<u8> = w
+            .iter()
+            .map(|&x| if x >= 0.5 * legacy_scale { 1 } else if x <= -0.5 * legacy_scale { 2 } else { 0 })
+            .collect();
+        assert!(err(scale, &codes) < err(legacy_scale, &legacy_codes));
+    }
 
     /// Ternary roundtrip: near-zero weights decode to exactly 0, the rest to
     /// ±s, and kept outliers to their f16 value. The zero level is the whole

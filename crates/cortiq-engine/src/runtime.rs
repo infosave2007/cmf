@@ -1,10 +1,10 @@
 //! Runtime state management — model, active task, metrics.
 
+use cortiq_core::CmfModel;
 use cortiq_core::mask::{MaskCatalog, MaskDiff, TaskMask};
 #[cfg(not(target_os = "macos"))]
 use cortiq_core::types::SimdType;
 use cortiq_core::types::{ExecutionMode, LayerStats, PerformanceMetrics};
-use cortiq_core::CmfModel;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
@@ -230,6 +230,13 @@ impl CortiqRuntime {
     /// Snapshot of the currently active task mask (None = dense).
     pub async fn active_mask(&self) -> Option<TaskMask> {
         self.state.read().await.active_mask.clone()
+    }
+
+    /// Atomically snapshot the active task name and its mask. Request paths
+    /// must use one snapshot rather than reading these fields separately.
+    pub async fn active_selection(&self) -> (String, Option<TaskMask>) {
+        let state = self.state.read().await;
+        (state.active_task.clone(), state.active_mask.clone())
     }
 
     /// Record a finished generation into the performance metrics.

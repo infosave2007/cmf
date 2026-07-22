@@ -8,7 +8,7 @@
 //! IQ1/IQ2/IQ3 grid-codebook types are the only ggml types not yet supported.
 
 use crate::convert::{self, Quant};
-use cortiq_core::format::{CmfHeader, CmfModel, TensorSpec, TokenizerBundle, CMF_VERSION};
+use cortiq_core::format::{CMF_VERSION, CmfHeader, CmfModel, TensorSpec, TokenizerBundle};
 use cortiq_core::quant::f16_to_f32;
 use cortiq_core::types::{LayerType, ModelArch, NormStyle, QuantType, TensorDtype};
 use std::collections::BTreeMap;
@@ -48,8 +48,7 @@ const GGML_IQ4_XS: u32 = 23;
 const GGML_BF16: u32 = 30;
 
 /// Non-linear 4-bit codebook shared by IQ4_NL and IQ4_XS.
-const KVALUES_IQ4NL: [i8; 16] =
-    [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+const KVALUES_IQ4NL: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
 
 /// A parsed GGUF metadata value (only the parts we need are typed richly).
 #[derive(Clone)]
@@ -644,8 +643,7 @@ fn dequant_iq4_xs(raw: &[u8], n: usize) -> Vec<f32> {
         let scales_l = &raw[base + 4..base + 8];
         let qs = &raw[base + 8..base + 136];
         for ib in 0..QK_K / 32 {
-            let ls = (((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) as i32)
-                | ((((scales_h >> (2 * ib)) & 3) as i32) << 4);
+            let ls = (((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) as i32) | ((((scales_h >> (2 * ib)) & 3) as i32) << 4);
             let dl = d * (ls - 32) as f32;
             let q_off = ib * 16;
             let y_off = i * QK_K + ib * 32;
@@ -696,10 +694,7 @@ fn arch_from_md(md: &BTreeMap<String, Val>) -> anyhow::Result<ModelArch> {
     let n_layers = gu("block_count").ok_or_else(|| anyhow::anyhow!("gguf: no block_count"))?;
     let hidden = gu("embedding_length").ok_or_else(|| anyhow::anyhow!("gguf: no embedding_length"))?;
     let n_heads = gu("attention.head_count").ok_or_else(|| anyhow::anyhow!("gguf: no head_count"))?;
-    let vocab = md
-        .get("tokenizer.ggml.tokens")
-        .and_then(|v| if let Val::StrArr(a) = v { Some(a.len()) } else { None })
-        .unwrap_or(0);
+    let vocab = md.get("tokenizer.ggml.tokens").and_then(|v| if let Val::StrArr(a) = v { Some(a.len()) } else { None }).unwrap_or(0);
     let norm_style = if arch.contains("gemma") { NormStyle::Gemma } else { NormStyle::Qwen };
     Ok(ModelArch {
         arch_name: arch.clone(),
@@ -716,6 +711,8 @@ fn arch_from_md(md: &BTreeMap<String, Val>) -> anyhow::Result<ModelArch> {
         rope_theta: g("rope.freq_base").and_then(|v| v.as_f64()).unwrap_or(10_000.0),
         tie_word_embeddings: false,
         partial_rotary_factor: 1.0,
+        yarn: None,
+        attention_heads_per_layer: None,
         mtp: None,
         moe: None,
         linear_core: None,
@@ -731,6 +728,7 @@ fn arch_from_md(md: &BTreeMap<String, Val>) -> anyhow::Result<ModelArch> {
         sliding_window: None,
         sliding_window_pattern: None,
         rope_local_base_freq: None,
+        local_partial_rotary_factor: None,
         global_head_dim: None,
         num_global_kv_heads: None,
         global_partial_rotary_factor: None,
@@ -741,7 +739,12 @@ fn arch_from_md(md: &BTreeMap<String, Val>) -> anyhow::Result<ModelArch> {
 
 /// Reconstruct a HF byte-level-BPE tokenizer.json + chat bundle from ggml metadata.
 fn tokenizer(md: &BTreeMap<String, Val>) -> (Option<Vec<u8>>, TokenizerBundle) {
-    let empty = TokenizerBundle { chat_template: None, eos_token_ids: Vec::new(), bos_token_id: None, pad_token_id: None };
+    let empty = TokenizerBundle {
+        chat_template: None,
+        eos_token_ids: Vec::new(),
+        bos_token_id: None,
+        pad_token_id: None,
+    };
     let tokens = match md.get("tokenizer.ggml.tokens") {
         Some(Val::StrArr(a)) => a,
         _ => return (None, empty),
@@ -755,8 +758,7 @@ fn tokenizer(md: &BTreeMap<String, Val>) -> (Option<Vec<u8>>, TokenizerBundle) {
         _ => Vec::new(),
     };
     // vocab: token -> id
-    let vocab: serde_json::Map<String, serde_json::Value> =
-        tokens.iter().enumerate().map(|(i, t)| (t.clone(), serde_json::json!(i))).collect();
+    let vocab: serde_json::Map<String, serde_json::Value> = tokens.iter().enumerate().map(|(i, t)| (t.clone(), serde_json::json!(i))).collect();
     // added/special tokens: ggml token_type CONTROL(3) / USER_DEFINED(4).
     let added: Vec<serde_json::Value> = tokens
         .iter()
@@ -813,8 +815,7 @@ fn resolve_gguf_source(spec: &str, token: Option<&str>) -> anyhow::Result<std::p
     }
     if convert::looks_like_repo(spec) {
         let files = convert::hf_repo_files(spec, token);
-        let ggufs: Vec<&String> =
-            files.iter().filter(|f| f.to_lowercase().ends_with(".gguf")).collect();
+        let ggufs: Vec<&String> = files.iter().filter(|f| f.to_lowercase().ends_with(".gguf")).collect();
         if ggufs.is_empty() {
             anyhow::bail!("'{spec}': the HF repo has no .gguf files");
         }
@@ -822,40 +823,23 @@ fn resolve_gguf_source(spec: &str, token: Option<&str>) -> anyhow::Result<std::p
         eprintln!("selected {pick} from {spec} ({} .gguf files available)", ggufs.len());
         return convert::hf_fetch_file(spec, pick, token);
     }
-    anyhow::bail!(
-        "'{spec}': not a local .gguf file, an HF repo id (owner/name), or owner/name/file.gguf"
-    )
+    anyhow::bail!("'{spec}': not a local .gguf file, an HF repo id (owner/name), or owner/name/file.gguf")
 }
 
 /// Pick the highest-fidelity natively-supported `.gguf` from a repo's file list.
 /// (IQ* codebook types are skipped — the importer does not decode them.)
 fn pick_gguf<'a>(files: &[&'a String]) -> &'a str {
-    const PREF: &[&str] = &[
-        "q8_0", "bf16", "f16", "fp16", "q6_k", "q5_k", "q5_1", "q5_0", "q4_k", "q4_1",
-        "q4_0", "q3_k", "q2_k",
-    ];
+    const PREF: &[&str] = &["q8_0", "bf16", "f16", "fp16", "q6_k", "q5_k", "q5_1", "q5_0", "q4_k", "q4_1", "q4_0", "q3_k", "q2_k"];
     for key in PREF {
-        if let Some(f) =
-            files.iter().find(|f| f.to_lowercase().contains(key) && !f.to_lowercase().contains("iq"))
-        {
+        if let Some(f) = files.iter().find(|f| f.to_lowercase().contains(key) && !f.to_lowercase().contains("iq")) {
             return f.as_str();
         }
     }
     // Fall back to the first non-IQ file, else the very first.
-    files
-        .iter()
-        .find(|f| !f.to_lowercase().contains("iq"))
-        .unwrap_or(&files[0])
-        .as_str()
+    files.iter().find(|f| !f.to_lowercase().contains("iq")).unwrap_or(&files[0]).as_str()
 }
 
-pub fn run_import_gguf(
-    gguf: &str,
-    quant: &str,
-    output: &str,
-    hf_token: Option<&str>,
-    mut progress: impl FnMut(f32),
-) -> anyhow::Result<()> {
+pub fn run_import_gguf(gguf: &str, quant: &str, output: &str, hf_token: Option<&str>, mut progress: impl FnMut(f32)) -> anyhow::Result<()> {
     let quant = convert::parse_quant(quant)?;
     // Source: a local .gguf, an HF repo id (auto-pick a .gguf), or owner/repo/file.gguf.
     let path = resolve_gguf_source(gguf, hf_token)?;
@@ -884,7 +868,9 @@ pub fn run_import_gguf(
     let mut tensors: Vec<TensorSpec> = Vec::with_capacity(total);
     for (idx, t) in g.tensors.iter().enumerate() {
         progress((idx + 1) as f32 / total as f32);
-        let Some(name) = map_name(&t.name) else { continue };
+        let Some(name) = map_name(&t.name) else {
+            continue;
+        };
         let numel: usize = t.dims.iter().map(|&d| d as usize).product();
         let nb = nbytes(t.ggml_type, numel)?;
         let raw = &g.bytes[g.data_start + t.offset as usize..g.data_start + t.offset as usize + nb];
@@ -902,11 +888,7 @@ pub fn run_import_gguf(
         }
 
         let two_d = shape.len() == 2 && numel >= 32;
-        let (dt, data) = if two_d {
-            convert::quantize_2d(quant, &vals, shape[0], shape[1])
-        } else {
-            (TensorDtype::F16, convert::encode_f16(&vals))
-        };
+        let (dt, data) = if two_d { convert::quantize_2d(quant, &vals, shape[0], shape[1]) } else { (TensorDtype::F16, convert::encode_f16(&vals)) };
         tensors.push(TensorSpec { name, dtype: dt, shape, data });
     }
 
@@ -932,8 +914,7 @@ pub fn run_import_gguf(
         shard: None,
         calibration: None,
     };
-    CmfModel::write(output, &header, &tensors, None, vocab.as_deref())
-        .map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;
+    CmfModel::write(output, &header, &tensors, None, vocab.as_deref()).map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;
     progress(1.0);
     Ok(())
 }
@@ -970,13 +951,24 @@ mod dequant_tests {
     #[test]
     fn q6k_matches_ggml_reference() {
         // A real blk.0.ffn_down block from Qwen2.5-0.5B-Instruct q6_k.gguf.
-        let raw = unhex("277930fb06d815ad9bed79c397dd1c7a10f175bd78508d65a71ebb10484afc7187ec41365560eff0fc04dee1790a59b6168bb16da04dc9126a1092d41793bbe4fef1c110260a98efde182bc43d8ba932f61201521b56897d1d6f33265ea1f9afd84a1093dd31cbecfbb73ac8397e4a084eab57fe90da90d431fdce0b6ff67e07aa61a8896a964b59611565505695a6ac865b67a46da544ad4961b94322a25c4049d69204276592554aa96a56599296299ac66b964ad651e9e9b415a6a628d52531dabc1b91ce6c4b503bd580adaaca262b81");
+        let raw = unhex(
+            "277930fb06d815ad9bed79c397dd1c7a10f175bd78508d65a71ebb10484afc7187ec41365560eff0fc04dee1790a59b6168bb16da04dc9126a1092d41793bbe4fef1c110260a98efde182bc43d8ba932f61201521b56897d1d6f33265ea1f9afd84a1093dd31cbecfbb73ac8397e4a084eab57fe90da90d431fdce0b6ff67e07aa61a8896a964b59611565505695a6ac865b67a46da544ad4961b94322a25c4049d69204276592554aa96a56599296299ac66b964ad651e9e9b415a6a628d52531dabc1b91ce6c4b503bd580adaaca262b81",
+        );
         assert_eq!(raw.len(), 210);
         let out = dequant_q6_k(&raw, 256);
         let expect: &[(usize, f32)] = &[
-            (0, -0.006113), (1, 0.006113), (2, 0.027945), (3, 0.004366),
-            (4, -0.00524), (5, -0.006986), (6, -0.018339), (7, 0.00262),
-            (32, 0.008483), (64, 0.003956), (96, -0.015398), (127, 0.002673),
+            (0, -0.006113),
+            (1, 0.006113),
+            (2, 0.027945),
+            (3, 0.004366),
+            (4, -0.00524),
+            (5, -0.006986),
+            (6, -0.018339),
+            (7, 0.00262),
+            (32, 0.008483),
+            (64, 0.003956),
+            (96, -0.015398),
+            (127, 0.002673),
         ];
         for &(i, e) in expect {
             assert!((out[i] - e).abs() < 2e-4, "idx {i}: got {} want {}", out[i], e);
@@ -986,11 +978,12 @@ mod dequant_tests {
     #[test]
     fn q4k_matches_ggml_reference() {
         // Real blk.11.ffn_down block from Qwen2.5-0.5B q4_k_m.gguf (max err vs fp16 = 7e-4).
-        let raw = unhex("72016409bafff4f3beffe2f58d5554628a96507978a697c576bb2d98d59693c0a756bf48ed5889a9e6ac0996cc74db3841c402c583f596c7865b6495dc90c7628442475e3b6570a44396e922b0e1b87083f6499396d2844a747f596892629433c95b593770fd9196846b850159d3b3b8cb87d56697488005d44bf48ff9dbf5c8b795d877680ca876ca5981a742a139a8");
+        let raw = unhex(
+            "72016409bafff4f3beffe2f58d5554628a96507978a697c576bb2d98d59693c0a756bf48ed5889a9e6ac0996cc74db3841c402c583f596c7865b6495dc90c7628442475e3b6570a44396e922b0e1b87083f6499396d2844a747f596892629433c95b593770fd9196846b850159d3b3b8cb87d56697488005d44bf48ff9dbf5c8b795d877680ca876ca5981a742a139a8",
+        );
         assert_eq!(raw.len(), 144);
         let out = dequant_q4_k(&raw, 256);
-        for &(i, e) in &[(0usize, 0.002592f32), (1, -0.002525), (2, -0.0102), (31, 3.3e-5),
-            (32, 0.000751), (64, -0.004447), (128, -0.003603), (200, -0.004132), (255, 0.002143)] {
+        for &(i, e) in &[(0usize, 0.002592f32), (1, -0.002525), (2, -0.0102), (31, 3.3e-5), (32, 0.000751), (64, -0.004447), (128, -0.003603), (200, -0.004132), (255, 0.002143)] {
             assert!((out[i] - e).abs() < 2e-4, "q4k idx {i}: got {} want {}", out[i], e);
         }
     }
@@ -998,11 +991,12 @@ mod dequant_tests {
     #[test]
     fn q5k_matches_ggml_reference() {
         // Real blk.11.ffn_down block from Qwen2.5-0.5B q5_k_m.gguf (max err vs fp16 = 3e-4).
-        let raw = unhex("ab008d09bdfff4f7bffee2f26f482846e3aa902ba12aaa1e885791dbeecaaac2ba90d7054771a32be25bad821baa6ff1164cc104f16e3eacfe974c41db3e47906fbe8fa1ebb22363fd5a025ea908c8718278058bf6fc2d700ca8b92baa218fb4097580af68bae14a762db43460b261e127fd93253bb32784f8ffb2d123d3295781b6a17ee0fb322d08c70a02b2a67670760d99cb3d7f001a9886f71ee2a5ea806e19a0fdc0075fec83a1015e74525140");
+        let raw = unhex(
+            "ab008d09bdfff4f7bffee2f26f482846e3aa902ba12aaa1e885791dbeecaaac2ba90d7054771a32be25bad821baa6ff1164cc104f16e3eacfe974c41db3e47906fbe8fa1ebb22363fd5a025ea908c8718278058bf6fc2d700ca8b92baa218fb4097580af68bae14a762db43460b261e127fd93253bb32784f8ffb2d123d3295781b6a17ee0fb322d08c70a02b2a67670760d99cb3d7f001a9886f71ee2a5ea806e19a0fdc0075fec83a1015e74525140",
+        );
         assert_eq!(raw.len(), 176);
         let out = dequant_q5_k(&raw, 256);
-        for &(i, e) in &[(0usize, 0.003006f32), (1, -0.003211), (2, -0.01005), (31, -0.000102),
-            (32, 0.000413), (64, -0.004699), (128, -0.003084), (200, -0.003904), (255, 0.002199)] {
+        for &(i, e) in &[(0usize, 0.003006f32), (1, -0.003211), (2, -0.01005), (31, -0.000102), (32, 0.000413), (64, -0.004699), (128, -0.003084), (200, -0.003904), (255, 0.002199)] {
             assert!((out[i] - e).abs() < 2e-4, "q5k idx {i}: got {} want {}", out[i], e);
         }
     }

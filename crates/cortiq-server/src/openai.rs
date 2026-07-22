@@ -2,15 +2,17 @@
 //! pipeline. Generation runs in `spawn_blocking` behind a Mutex — a
 //! panic inside the pipeline becomes a 500, never a dead process.
 
-use crate::streaming::{self, ChatStream};
 use crate::AppState;
+use crate::streaming::{self, ChatStream};
 use axum::{
+    Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Json, Response},
     routing::{get, post},
-    Router,
 };
+use cortiq_core::TaskMask;
+use cortiq_engine::SamplerConfig;
 use cortiq_engine::pipeline::GenerateResult;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -111,12 +113,10 @@ async fn run_generation(
     state: Arc<AppState>,
     prompt_ids: Vec<u32>,
     max_tokens: usize,
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    seed: Option<u64>,
+    mask: Option<TaskMask>,
+    sampler_config: SamplerConfig,
     on_token: Option<cortiq_engine::TokenCallback>,
 ) -> Result<(GenerateResult, f64), Response> {
-    let mask = state.runtime.active_mask().await;
     let started = std::time::Instant::now();
 
     // Check a pipeline slot out for this generation: up to
@@ -124,15 +124,9 @@ async fn run_generation(
     let mut slot = state.slots.acquire().await;
     let outcome = tokio::task::spawn_blocking(move || {
         let p = &mut *slot.pipe;
-        if let Some(t) = temperature {
-            p.sampler_config.temperature = t;
-        }
-        if let Some(tp) = top_p {
-            p.sampler_config.top_p = tp;
-        }
-        if seed.is_some() {
-            p.sampler_config.seed = seed;
-        }
+        // A pooled pipeline must not inherit sampling state or RNG position
+        // from the request that previously occupied this slot.
+        p.set_sampler_config(sampler_config);
         p.generate_from_ids(&prompt_ids, max_tokens, mask.as_ref(), on_token)
     })
     .await;
@@ -149,6 +143,34 @@ async fn run_generation(
             ))
         }
     }
+}
+
+fn request_sampler(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
+) -> Result<SamplerConfig, Response> {
+    if temperature.is_some_and(|v| !v.is_finite() || v < 0.0) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "temperature must be finite and >= 0",
+        ));
+    }
+    if top_p.is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v)) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "top_p must be finite and between 0 and 1",
+        ));
+    }
+    let mut config = SamplerConfig::default();
+    if let Some(v) = temperature {
+        config.temperature = v;
+    }
+    if let Some(v) = top_p {
+        config.top_p = v;
+    }
+    config.seed = seed;
+    Ok(config)
 }
 
 // ─── Chat Completions ────────────────────────────────────
@@ -213,16 +235,28 @@ async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionsRequest>,
 ) -> Response {
-    // Task routing: an unknown task is the caller's error, said loudly.
-    if let Some(task) = req.cortiq.as_ref().and_then(|c| c.task.as_deref()) {
-        if let Err(e) = state.runtime.switch_task(task).await {
-            return error_response(StatusCode::NOT_FOUND, e.to_string());
-        }
-    }
-
     if req.messages.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "messages must not be empty");
     }
+
+    // Resolve task selection into request-local state. Mutating the runtime's
+    // global active task here made concurrent requests use each other's mask.
+    let (task_used, request_mask) =
+        if let Some(task) = req.cortiq.as_ref().and_then(|c| c.task.as_deref()) {
+            let Some(mask) = state.runtime.masks().get(task).cloned() else {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Task mask '{task}' not found"),
+                );
+            };
+            (task.to_string(), Some(mask))
+        } else {
+            state.runtime.active_selection().await
+        };
+    let sampler_config = match request_sampler(req.temperature, req.top_p, req.seed) {
+        Ok(config) => config,
+        Err(response) => return response,
+    };
 
     // Chat template → prompt ids (uses real special tokens).
     let prompt_ids = {
@@ -231,7 +265,9 @@ async fn chat_completions(
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))
             .collect();
-        state.tokenizer.apply_chat_template_opts(&msgs, req.thinking())
+        state
+            .tokenizer
+            .apply_chat_template_opts(&msgs, req.thinking())
     };
 
     let request_id = format!("cmf-{}", uuid::Uuid::new_v4());
@@ -277,9 +313,8 @@ async fn chat_completions(
                 state2.clone(),
                 prompt_ids,
                 max_tokens,
-                req.temperature,
-                req.top_p,
-                req.seed,
+                request_mask,
+                sampler_config,
                 Some(callback),
             )
             .await;
@@ -313,9 +348,8 @@ async fn chat_completions(
             state.clone(),
             prompt_ids,
             max_tokens,
-            req.temperature,
-            req.top_p,
-            req.seed,
+            request_mask,
+            sampler_config,
             None,
         )
         .await
@@ -329,11 +363,14 @@ async fn chat_completions(
             .record_generation(result.tokens_generated, elapsed_ms, elapsed_ms)
             .await;
         let status = state.runtime.status().await;
+        let task_mask = state.runtime.masks().get(&task_used);
 
         let cortiq_meta = req.cortiq.as_ref().map(|_| CortiqResponseMeta {
-            task_used: status.active_task.clone(),
-            sparsity: status.active_sparsity,
-            active_layers: status.active_layers,
+            task_used,
+            sparsity: task_mask.map(|m| m.sparsity).unwrap_or(0.0),
+            active_layers: task_mask
+                .map(|m| m.active_layer_count())
+                .unwrap_or(state.runtime.model().arch().num_layers),
             execution_mode: format!("{:?}", status.execution_mode),
             tokens_per_second: result.tokens_generated as f64 / (elapsed_ms / 1000.0).max(1e-9),
         });
@@ -396,13 +433,18 @@ async fn completions(
 ) -> Response {
     let prompt_ids = state.tokenizer.encode(&req.prompt);
 
+    let sampler_config = match request_sampler(req.temperature, None, None) {
+        Ok(config) => config,
+        Err(response) => return response,
+    };
+    let (_, request_mask) = state.runtime.active_selection().await;
+
     let (result, elapsed_ms) = match run_generation(
         state.clone(),
         prompt_ids,
         req.max_tokens as usize,
-        req.temperature,
-        None,
-        None,
+        request_mask,
+        sampler_config,
         None,
     )
     .await
@@ -437,4 +479,26 @@ async fn completions(
 
 fn default_max_tokens() -> u32 {
     256
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sampler_options_start_from_defaults_and_validate_ranges() {
+        let changed = request_sampler(Some(0.2), Some(0.5), Some(7)).unwrap();
+        assert_eq!(changed.temperature, 0.2);
+        assert_eq!(changed.top_p, 0.5);
+        assert_eq!(changed.seed, Some(7));
+
+        let fresh = request_sampler(None, None, None).unwrap();
+        let defaults = SamplerConfig::default();
+        assert_eq!(fresh.temperature, defaults.temperature);
+        assert_eq!(fresh.top_p, defaults.top_p);
+        assert_eq!(fresh.seed, None);
+
+        assert!(request_sampler(Some(-1.0), None, None).is_err());
+        assert!(request_sampler(None, Some(1.1), None).is_err());
+    }
 }

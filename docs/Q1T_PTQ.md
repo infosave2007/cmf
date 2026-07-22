@@ -18,9 +18,13 @@ codec + its fused kernel.
 For each linear layer, given calibration statistics of its input:
 
 1. **Ternary bulk (`Q1T`, BitNet b1.58).** Each 32-weight group →
-   `{−s, 0, +s}` with `s = abs-mean` of the group. Capturing the many
-   near-zero weights *exactly* (the zero level) is the decisive win over
-   1-bit binary — measured ×7 better at matched budget.
+   `{−s, 0, +s}`. The converter compares the historical abs-mean rounding
+   with a sparse-support, activation-weighted least-squares candidate and
+   keeps whichever has lower diagonal-Hessian reconstruction error. This is
+   training-free, adds no bytes to the format, and cannot worsen that local
+   proxy (real held-out PPL still has to be measured after conversion).
+   Capturing the many near-zero weights *exactly* (the zero level) is the
+   decisive win over 1-bit binary — measured ×7 better at matched budget.
 2. **Two-field outlier mask.** Keep the top `--keep` fraction of weights by
    `|W|·RMS(x)` (amplitude × activation) at f16 in a sparse overlay. This
    is the SpQR/AWQ salience idea; a *weight* mask beats a *column* mask
@@ -128,6 +132,15 @@ q1t runs on the GPU on both engine backends — native **Metal** (Apple Silicon)
 and **wgpu** (Vulkan / DX12 / Metal → NVIDIA / AMD / Intel). Every kernel is
 gated by the runtime probe: the GPU is used only where it beats the CPU, so a
 machine where it loses silently keeps the CPU path.
+
+> **Metal alignment fix (July 2026):** a real 14.8B GDN model exposed that
+> typed `ushort`/`uint` loads from Q1T's 9-byte tiles were unaligned, producing
+> NaN logits after the first generated token. All Q1T base/overlay fields now
+> use explicit little-endian byte loads. Real-tensor Metal/CPU parity reaches
+> `max_rel=3.52e-6`; `CMF_METAL_Q1T=0` remains as an emergency CPU fallback.
+> The shared no-copy Metal cache now also retains its `CmfModel` owner and is
+> keyed by model identity, preventing a released mmap address from being
+> recycled across Q1/Q4/Q8/Q8_2f/Q1T models in a long-lived process.
 
 **Kernels (Metal MSL and WGSL):**
 

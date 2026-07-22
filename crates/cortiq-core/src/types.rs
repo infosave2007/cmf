@@ -162,6 +162,10 @@ pub enum NormStyle {
 pub enum LayerType {
     /// Standard multi-head attention (Q/K/V/O projections)
     FullAttention,
+    /// Standard GQA restricted to a causal sliding window. It remains a
+    /// full-attention operator; the distinct tag preserves an explicit,
+    /// potentially irregular per-layer schedule (Laguna).
+    SlidingAttention,
     /// Linear attention (executed by the canonical linear core;
     /// original operator, e.g. GatedDeltaNet, is folded at convert time)
     LinearAttention,
@@ -222,6 +226,27 @@ pub struct MoeConfig {
     pub routed_scaling_factor: Option<f32>,
 }
 
+/// Optional YaRN parameters for the model's global RoPE profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct YarnConfig {
+    pub factor: f32,
+    pub original_max_position_embeddings: usize,
+    #[serde(default = "default_yarn_beta_fast")]
+    pub beta_fast: f32,
+    #[serde(default = "default_yarn_beta_slow")]
+    pub beta_slow: f32,
+    #[serde(default = "default_one")]
+    pub attention_factor: f32,
+}
+
+fn default_yarn_beta_fast() -> f32 {
+    32.0
+}
+
+fn default_yarn_beta_slow() -> f32 {
+    1.0
+}
+
 /// Model architecture descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelArch {
@@ -257,6 +282,12 @@ pub struct ModelArch {
     /// Fraction of head_dim rotated by RoPE (Qwen3.5: 0.25)
     #[serde(default = "default_prf")]
     pub partial_rotary_factor: f32,
+    /// Optional YaRN frequency interpolation for the global RoPE profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yarn: Option<YarnConfig>,
+    /// Per-layer Q-head counts for architectures whose attention width varies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_heads_per_layer: Option<Vec<usize>>,
     /// FFN activation: "silu" (default) or "gelu_tanh" (Gemma's GeGLU).
     #[serde(default = "default_hidden_act", skip_serializing_if = "is_default_act")]
     pub hidden_act: String,
@@ -275,6 +306,9 @@ pub struct ModelArch {
     /// …and the local layers' own RoPE base (global layers use rope_theta).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rope_local_base_freq: Option<f64>,
+    /// Local/SWA layers may rotate a different fraction of each head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_partial_rotary_factor: Option<f32>,
     /// Gemma-4: global (full-attention) layers use their own head dim…
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_head_dim: Option<usize>,
