@@ -701,6 +701,8 @@ fn arch_from_md(md: &BTreeMap<String, Val>) -> anyhow::Result<ModelArch> {
         hidden_size: hidden,
         intermediate_size: gu("feed_forward_length").unwrap_or(0),
         num_layers: n_layers,
+        num_loops: 1,
+        loop_final_norm: false,
         num_attention_heads: n_heads,
         num_kv_heads: gu("attention.head_count_kv").unwrap_or(n_heads),
         head_dim: gu("attention.key_length").unwrap_or(hidden / n_heads.max(1)),

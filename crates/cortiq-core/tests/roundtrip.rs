@@ -17,6 +17,8 @@ fn tiny_arch() -> ModelArch {
         hidden_size: 8,
         intermediate_size: 16,
         num_layers: 2,
+        num_loops: 1,
+        loop_final_norm: false,
         num_attention_heads: 2,
         num_kv_heads: 1,
         head_dim: 4,

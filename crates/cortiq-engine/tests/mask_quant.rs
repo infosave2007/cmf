@@ -91,6 +91,8 @@ fn sparse_ffn_quant_agrees_with_dequant() {
         hidden_size: hidden,
         intermediate_size: inter,
         num_layers: 1,
+        num_loops: 1,
+        loop_final_norm: false,
         num_attention_heads: 2,
         num_kv_heads: 1,
         head_dim: 8,

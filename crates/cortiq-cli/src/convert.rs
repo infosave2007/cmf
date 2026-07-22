@@ -941,6 +941,9 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         hidden_size: hidden,
         intermediate_size: cfg_usize(tc, "intermediate_size").or_else(|| cfg_usize(tc, "moe_intermediate_size")).ok_or_else(|| anyhow::anyhow!("config: missing intermediate_size"))?,
         num_layers: n_layers,
+        num_loops: cfg_usize(tc, "num_loops").unwrap_or(1),
+        // Nanbeige: skip_loop_final_norm=false → apply norm after each loop.
+        loop_final_norm: !tc.get("skip_loop_final_norm").and_then(|v| v.as_bool()).unwrap_or(true),
         num_attention_heads: n_heads,
         num_kv_heads: cfg_usize(tc, "num_key_value_heads").unwrap_or(n_heads),
         head_dim,

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.9] — 2026-07-22
+
+### Added
+- **Looped Transformer support (Nanbeige 4.2)**: Native `num_loops` + `loop_final_norm`
+  architecture fields. The 22-layer Nanbeige4.2-3B re-applies its layer stack twice
+  (44 virtual layers) with per-loop final normalization — 4.17B effective parameters
+  from 2.1B physical weights. Conversion, inference (CPU + Metal GPU), and O(1)
+  Nyström attention all work with looped models.
+- **Metal GPU whole-token graph for looped models**: `q1_graph_gpu` iterates
+  `total_layers()` (num_layers × num_loops) with per-loop final-norm insertion,
+  device-attend KV mirror handles the growing cache across loops.
+
+### Performance (Nanbeige4.2-3B, Apple M4, CMF_GPU=1)
+- Q8 decode: **13.2 tok/s** (92% of theoretical bandwidth limit)
+- Q4 decode: **20.4 tok/s** (best throughput, 2.4 GB model)
+- O(1) mode: **10.2 tok/s constant** at any context (vs 2.8 tok/s exact at ctx=2048 — ×3.7 speedup)
+- Q8 GPU prefill: **211 tok/s** (chunk graph)
+
 ## [0.5.7] — 2026-07-21
 
 ### Added & Optimized

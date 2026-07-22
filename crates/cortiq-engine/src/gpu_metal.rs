@@ -1274,6 +1274,11 @@ kernel void gqa_attend(
     }
     float m = -INFINITY, l = 0.0f;
     float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    // Cache attention scores in threadgroup for Born (avoids 2nd K read).
+    // 8 simdgroups × 512 positions × 4B = 16 KB.
+    threadgroup float tg_scores[8 * 512];
+    threadgroup float* sc = tg_scores + sg * 512u;
+    bool cache_scores = (n <= 512u);
     for (uint p = 0; p < n; ++p) {
         device const float* kr = kh0 + (ulong)p * hd;
         float partial = 0.0f;
@@ -1282,6 +1287,7 @@ kernel void gqa_attend(
             if (d < hd) partial += qv[t] * kr[d];
         }
         float s = simd_sum(partial);
+        if (cache_scores && lane == 0u) sc[p] = s;
         float mp = max(m, s);
         float f = exp(m - mp), w = exp(s - mp);
         l = l * f + w;
@@ -1297,15 +1303,26 @@ kernel void gqa_attend(
         uint d = t * 32u + lane;
         if (d < hd) outb[(ulong)h * hd + d] = acc[t] * invl;
     }
-    // Born-importance pass: prob_p = exp(s_p − m)/l summed over heads.
-    for (uint p = lane; p < n; p += 32u) {
-        device const float* kr = kh0 + (ulong)p * hd;
-        float dot = 0.0f;
-        for (uint d = 0; d < hd; ++d) {
-            dot += q[(ulong)h * hd + d] * kr[d];
+    // Born-importance: reuse cached scores or cooperative re-compute.
+    if (cache_scores) {
+        for (uint p = lane; p < n; p += 32u) {
+            float prob = exp(sc[p] - m) * invl;
+            atomic_fetch_add_explicit(&imp[p], prob, memory_order_relaxed);
         }
-        float prob = exp(dot * scale - m) * invl;
-        atomic_fetch_add_explicit(&imp[p], prob, memory_order_relaxed);
+    } else {
+        for (uint p = 0; p < n; ++p) {
+            device const float* kr = kh0 + (ulong)p * hd;
+            float partial = 0.0f;
+            for (uint t = 0; t < nt; ++t) {
+                uint d = t * 32u + lane;
+                if (d < hd) partial += qv[t] * kr[d];
+            }
+            float s = simd_sum(partial);
+            if (lane == 0u) {
+                float prob = exp(s - m) * invl;
+                atomic_fetch_add_explicit(&imp[p], prob, memory_order_relaxed);
+            }
+        }
     }
 }
 
@@ -1817,6 +1834,43 @@ kernel void gdn_state_update(
     of[h * dv + dj] = o * inv * gnorm[dj] * (zz / (1.0f + exp(-zz)));
 }
 
+// Fused GDN pre-recurrence: conv+silu, ring shift, and gates in ONE dispatch.
+// Each of the first c_dim threads handles its column: (1) conv over the OLD
+// ring, (2) ring shift, (3) if tid < nv also compute gates. Eliminates 2
+// kernel launches + 1 encoder per GDN layer.
+kernel void gdn_conv_ring_gates(
+    device const float* qkv     [[buffer(0)]],
+    device float*       ring    [[buffer(1)]],
+    device const float* taps    [[buffer(2)]],
+    device float*       cq      [[buffer(3)]],
+    device const float* a_in    [[buffer(4)]],
+    device const float* b_in    [[buffer(5)]],
+    device const float* a_log   [[buffer(6)]],
+    device const float* dt_bias [[buffer(7)]],
+    device float*       g_out   [[buffer(8)]],
+    device float*       beta    [[buffer(9)]],
+    constant uint&      c_dim   [[buffer(10)]],
+    constant uint&      kk      [[buffer(11)]],
+    constant uint&      nv      [[buffer(12)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= c_dim) return;
+    // --- conv + silu ---
+    float acc = qkv[i] * taps[i * kk + kk - 1u];
+    for (uint j = 0; j + 1u < kk; ++j) acc += ring[j * c_dim + i] * taps[i * kk + j];
+    cq[i] = acc / (1.0f + exp(-acc));
+    // --- ring shift ---
+    for (uint j = 0; j + 2u < kk; ++j) ring[j * c_dim + i] = ring[(j + 1u) * c_dim + i];
+    ring[(kk - 2u) * c_dim + i] = qkv[i];
+    // --- gates (first nv threads only) ---
+    if (i < nv) {
+        float x = a_in[i] + dt_bias[i];
+        float sp = x > 20.0f ? x : log(1.0f + exp(x));
+        g_out[i] = exp(-exp(a_log[i]) * sp);
+        beta[i] = 1.0f / (1.0f + exp(-b_in[i]));
+    }
+}
+
 // q1t: 9-byte tiles [f16 scale][7B base-3 codes, 5 ternary/byte] per 32-group;
 // code 0->0, 1->+s, 2->-s. This computes the BASE dot only (raw f32 x, full
 // precision); the sparse outlier overlay is added on the CPU (the base code at
@@ -1976,11 +2030,6 @@ kernel void q1t_matvec(
         for (uint i = 0; i < 8u; ++i) {
             xg[i] = xs4[wbase4 + i];
         }
-        // Keep activations and the reduction in f32. Real GDN checkpoints can
-        // transiently exceed f16's finite range; converting x to half here
-        // produced NaN logits and greedy decode repeatedly selected the last
-        // vocabulary id. The ternary LUT may stay half (its values are only
-        // -1/0/+1), but every multiply is promoted before accumulation.
         float xh[32];
         for (uint i = 0; i < 8u; ++i) {
             xh[4*i+0] = xg[i].x;
@@ -2065,6 +2114,108 @@ kernel void q1t_overlay(
         corr += (float)val * x[col];
     }
     y[rid] += corr;
+}
+
+// Fused q1t matvec + overlay: computes the base ternary dot-product AND the
+// sparse CSR overlay in a single dispatch, eliminating the second kernel launch
+// and the intermediate y read-modify-write round-trip.
+kernel void q1t_matvec_fused(
+    device const uchar* q    [[buffer(0)]],
+    device const float* xs   [[buffer(1)]],
+    device float*       y    [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    if (r0 >= rows) return;
+    uint nr = min(rows - r0, 4u);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    device const float4* xs4 = (device const float4*)xs;
+
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint wbase = g * 32u;
+        uint wbase4 = wbase / 4u;
+        float4 xg[8];
+        for (uint i = 0; i < 8u; ++i) {
+            xg[i] = xs4[wbase4 + i];
+        }
+        float xh[32];
+        for (uint i = 0; i < 8u; ++i) {
+            xh[4*i+0] = xg[i].x;
+            xh[4*i+1] = xg[i].y;
+            xh[4*i+2] = xg[i].z;
+            xh[4*i+3] = xg[i].w;
+        }
+
+        for (uint ri = 0u; ri < nr; ++ri) {
+            ulong base = ((ulong)(r0 + ri) * gpr + (ulong)g) * 9u;
+            device const uchar* p = q + base;
+            half scale = as_type<half>(cmf_load_u16_le(p));
+
+            uint b2_5 = cmf_load_u32_le(p + 2u);
+            ushort b6_7 = cmf_load_u16_le(p + 6u);
+            uchar b8 = p[8];
+
+            float gsum = 0.0f;
+            constant half* pl;
+
+            pl = &Q1T_SIGN[(b2_5 & 0xFF) * 5u];
+            gsum += pl[0] * xh[0] + pl[1] * xh[1] + pl[2] * xh[2] + pl[3] * xh[3] + pl[4] * xh[4];
+
+            pl = &Q1T_SIGN[((b2_5 >> 8u) & 0xFF) * 5u];
+            gsum += pl[0] * xh[5] + pl[1] * xh[6] + pl[2] * xh[7] + pl[3] * xh[8] + pl[4] * xh[9];
+
+            pl = &Q1T_SIGN[((b2_5 >> 16u) & 0xFF) * 5u];
+            gsum += pl[0] * xh[10] + pl[1] * xh[11] + pl[2] * xh[12] + pl[3] * xh[13] + pl[4] * xh[14];
+
+            pl = &Q1T_SIGN[(b2_5 >> 24u) * 5u];
+            gsum += pl[0] * xh[15] + pl[1] * xh[16] + pl[2] * xh[17] + pl[3] * xh[18] + pl[4] * xh[19];
+
+            pl = &Q1T_SIGN[(b6_7 & 0xFF) * 5u];
+            gsum += pl[0] * xh[20] + pl[1] * xh[21] + pl[2] * xh[22] + pl[3] * xh[23] + pl[4] * xh[24];
+
+            pl = &Q1T_SIGN[(b6_7 >> 8u) * 5u];
+            gsum += pl[0] * xh[25] + pl[1] * xh[26] + pl[2] * xh[27] + pl[3] * xh[28] + pl[4] * xh[29];
+
+            pl = &Q1T_SIGN[b8 * 5u];
+            gsum += pl[0] * xh[30] + pl[1] * xh[31];
+
+            float contrib = (float)scale * gsum;
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2);
+    acc3 = simd_sum(acc3);
+
+    // --- sparse overlay (CSR) fused into the same dispatch ---
+    if (lane == 0u) {
+        uint base_len = rows * gpr * 9u;
+        uint ent_off = base_len + (rows + 1u) * 4u;
+        for (uint ri = 0u; ri < nr; ++ri) {
+            uint rid = r0 + ri;
+            uint c0 = cmf_load_u32_le(q + base_len + rid * 4u);
+            uint c1 = cmf_load_u32_le(q + base_len + (rid + 1u) * 4u);
+            float corr = 0.0f;
+            for (uint p = c0; p < c1; ++p) {
+                uint e = ent_off + p * 4u;
+                uint col_val = cmf_load_u32_le(q + e);
+                uint col = col_val & 0xFFFF;
+                half val = as_type<half>((ushort)(col_val >> 16));
+                corr += (float)val * xs[col];
+            }
+            float base_val = (ri == 0u) ? acc0 : (ri == 1u) ? acc1 : (ri == 2u) ? acc2 : acc3;
+            y[rid] = base_val + corr;
+        }
+    }
 }
 
 inline float q4_dot8_fast(uint b, float4 x_lo, float4 x_hi) {
@@ -2211,6 +2362,7 @@ struct Ctx {
     q1h: ComputePipelineState,
     q1t: ComputePipelineState,
     q1t_ov: ComputePipelineState,
+    q1t_fused: ComputePipelineState,
     q1t_mm: ComputePipelineState,
     q1t_ovmm: ComputePipelineState,
     q4b: ComputePipelineState,
@@ -2219,6 +2371,7 @@ struct Ctx {
     rmsn: ComputePipelineState,
     f16mv: ComputePipelineState,
     conv: ComputePipelineState,
+    crg: ComputePipelineState,
     ring: ComputePipelineState,
     gates: ComputePipelineState,
     qkn: ComputePipelineState,
@@ -2348,6 +2501,7 @@ fn init() -> Result<Ctx, String> {
     let q1h = pso("q1_matvec_h")?;
     let q1t = pso("q1t_matvec")?;
     let q1t_ov = pso("q1t_overlay")?;
+    let q1t_fused = pso("q1t_matvec_fused")?;
     let q1t_mm = pso("q1t_mul_mm")?;
     let q1t_ovmm = pso("q1t_overlay_mm")?;
     let q4b = pso("q4b_matvec")?;
@@ -2356,6 +2510,7 @@ fn init() -> Result<Ctx, String> {
     let rmsn = pso("rmsnorm_k")?;
     let f16mv = pso("f32_matvec")?;
     let conv = pso("gdn_conv")?;
+    let crg = pso("gdn_conv_ring_gates")?;
     let ring = pso("gdn_ring_shift")?;
     let gates = pso("gdn_gates")?;
     let qkn = pso("gdn_qk_norms")?;
@@ -2392,6 +2547,7 @@ fn init() -> Result<Ctx, String> {
         q1h,
         q1t,
         q1t_ov,
+        q1t_fused,
         q1t_mm,
         q1t_ovmm,
         q4b,
@@ -2400,6 +2556,7 @@ fn init() -> Result<Ctx, String> {
         rmsn,
         f16mv,
         conv,
+        crg,
         ring,
         gates,
         qkn,
@@ -2891,7 +3048,7 @@ fn encode_q4b_matvec(
     let half = *HALF.get_or_init(|| {
         std::env::var("CMF_Q4_HALF")
             .map(|v| v != "0" && v != "off")
-            .unwrap_or(false)
+            .unwrap_or(true)
     });
     enc.set_compute_pipeline_state(if half { &c.q4bh } else { &c.q4b });
     enc.set_buffer(0, Some(fbuf), abs as u64);
@@ -2925,8 +3082,7 @@ fn encode_proj(
 ) {
     match kind {
         ProjKind::Q1t => {
-            encode_q1t_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
-            encode_q1t_overlay(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
+            encode_q1t_fused(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
         }
         ProjKind::Q4b => {
             encode_q4b_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
@@ -3014,6 +3170,33 @@ fn encode_q1t_overlay(
     );
 }
 
+/// Encode the fused q1t matvec+overlay (single dispatch, no intermediate
+/// y round-trip). Same buffer layout as `encode_q1t_matvec`.
+fn encode_q1t_fused(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &Buffer,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    rows: usize,
+    gpr: usize,
+) {
+    enc.set_compute_pipeline_state(&c.q1t_fused);
+    enc.set_buffer(0, Some(fbuf), abs as u64);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let gpr_u = gpr as u32;
+    let rows_u = rows as u32;
+    enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    let sgs = 8u64; // × 4 rows per simdgroup
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
+}
+
 /// Ternary (q1t) BASE matvec on the GPU (full-precision raw-f32 x). Fills
 /// `out` with `Σ_group scale·Σ sign·x`; the caller adds the sparse outlier
 /// overlay on the CPU. Returns false (→ CPU fallback) on any shape/residency
@@ -3091,9 +3274,10 @@ fn q1t_matvec_impl(
     let y_buf = get_io(14_000_000_573 + rows, rows * 4);
     let cmd = c.queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
-    encode_q1t_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
     if full {
-        encode_q1t_overlay(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
+        encode_q1t_fused(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
+    } else {
+        encode_q1t_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
     }
     enc.end_encoding();
     submit_and_wait(c, cmd, &[&y_buf]);
@@ -5538,37 +5722,32 @@ impl TokenGraph {
                 }
                 enc.end_encoding();
             }
-            // 3. conv + silu (reads ring BEFORE the shift)
-            enc_one(
-                &c.conv,
-                &[(&qkv_b, 0), (sb, 0), (&vec_buf(l.conv1d), 0), (&cq_b, 0)],
-                &[cfg.c_dim as u32, cfg.kk as u32],
-                &[],
-                (cfg.c_dim as u64, 256),
-            );
-            // 4. ring shift + gates + qk norms (one encoder, independent)
+            // 3+4. fused conv+ring+gates, then qk norms (one encoder)
             {
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&c.ring);
-                enc.set_buffer(0, Some(sb), 0);
-                enc.set_buffer(1, Some(&qkv_b), 0);
-                let (cd, kk) = (cfg.c_dim as u32, cfg.kk as u32);
-                enc.set_bytes(2, 4, &cd as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(3, 4, &kk as *const u32 as *const std::ffi::c_void);
+                enc.set_compute_pipeline_state(&c.crg);
+                enc.set_buffer(0, Some(&qkv_b), 0);
+                enc.set_buffer(1, Some(sb), 0);
+                let taps_b = vec_buf(l.conv1d);
+                enc.set_buffer(2, Some(&taps_b), 0);
+                enc.set_buffer(3, Some(&cq_b), 0);
+                enc.set_buffer(4, Some(&a_b), 0);
+                enc.set_buffer(5, Some(&b_b), 0);
+                let alog_b = vec_buf(l.a_log);
+                let dtb_b = vec_buf(l.dt_bias);
+                enc.set_buffer(6, Some(&alog_b), 0);
+                enc.set_buffer(7, Some(&dtb_b), 0);
+                enc.set_buffer(8, Some(&g_b), 0);
+                enc.set_buffer(9, Some(&bt_b), 0);
+                let (cd, kk, nv) = (cfg.c_dim as u32, cfg.kk as u32, cfg.nv as u32);
+                enc.set_bytes(10, 4, &cd as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(11, 4, &kk as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(12, 4, &nv as *const u32 as *const std::ffi::c_void);
                 enc.dispatch_threads(
                     MTLSize::new(cfg.c_dim as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
                 );
-                enc.set_compute_pipeline_state(&c.gates);
-                enc.set_buffer(0, Some(&a_b), 0);
-                enc.set_buffer(1, Some(&b_b), 0);
-                enc.set_buffer(2, Some(&vec_buf(l.a_log)), 0);
-                enc.set_buffer(3, Some(&vec_buf(l.dt_bias)), 0);
-                enc.set_buffer(4, Some(&g_b), 0);
-                enc.set_buffer(5, Some(&bt_b), 0);
-                let nv = cfg.nv as u32;
-                enc.set_bytes(6, 4, &nv as *const u32 as *const std::ffi::c_void);
-                enc.dispatch_threads(MTLSize::new(cfg.nv as u64, 1, 1), MTLSize::new(64, 1, 1));
+                // qk norms (depends on cq written above)
                 enc.set_compute_pipeline_state(&c.qkn);
                 enc.set_buffer(0, Some(&cq_b), 0);
                 enc.set_buffer(1, Some(&iq_b), 0);
@@ -5807,6 +5986,8 @@ mod tests {
             hidden_size: cols,
             intermediate_size: cols * 2,
             num_layers: 1,
+            num_loops: 1,
+            loop_final_norm: false,
             num_attention_heads: 2,
             num_kv_heads: 1,
             head_dim: 4,
@@ -5936,6 +6117,8 @@ mod tests {
             hidden_size: cols,
             intermediate_size: cols * 2,
             num_layers: 1,
+            num_loops: 1,
+            loop_final_norm: false,
             num_attention_heads: 2,
             num_kv_heads: 1,
             head_dim: 4,

@@ -258,6 +258,14 @@ pub struct ModelArch {
     pub intermediate_size: usize,
     /// Number of transformer layers
     pub num_layers: usize,
+    /// Looped Transformer: how many times the layer stack is re-applied
+    /// (Nanbeige: 2). Default 1 = standard single-pass.
+    #[serde(default = "default_num_loops", skip_serializing_if = "is_one_usize")]
+    pub num_loops: usize,
+    /// Looped Transformer: apply final_norm after EACH loop iteration
+    /// (Nanbeige: true). Default false = norm only at the very end.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loop_final_norm: bool,
     /// Number of attention heads (for full_attention layers)
     pub num_attention_heads: usize,
     /// Number of KV heads (GQA)
@@ -350,6 +358,15 @@ pub struct ModelArch {
     /// Value head dim in linear attention
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_value_head_dim: Option<usize>,
+}
+
+fn default_num_loops() -> usize {
+    1
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_one_usize(v: &usize) -> bool {
+    *v == 1
 }
 
 fn default_rope_theta() -> f64 {
