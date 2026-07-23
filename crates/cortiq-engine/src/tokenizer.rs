@@ -717,13 +717,13 @@ impl Tokenizer {
         };
         // Templates that ignore `enable_thinking` (e.g. Nanbeige/Qwen-legacy)
         // always emit a generation prompt. When thinking is explicitly disabled,
-        // prefill an empty </think> block so the model answers directly.
+        // prefill an empty <think>…</think> block so the model answers directly.
         if enable_thinking == Some(false) && !rendered.contains("</think>") {
             if let Some(pos) = rendered.rfind("assistant\n") {
                 let insert_at = pos + "assistant\n".len();
-                let mut out = String::with_capacity(rendered.len() + 16);
+                let mut out = String::with_capacity(rendered.len() + 24);
                 out.push_str(&rendered[..insert_at]);
-                out.push_str("</think>\n\n");
+                out.push_str("<think>\n\n</think>\n\n");
                 out.push_str(&rendered[insert_at..]);
                 return Ok(out);
             }
