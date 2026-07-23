@@ -128,7 +128,7 @@ pub fn dequant_q8_2f(bytes: &[u8], out_dim: usize, in_dim: usize, dst: &mut [f32
 /// Dequantize a full `q4_block` tensor into `dst` (`dst.len()` = real
 /// element count; the trailing pad group elements are discarded).
 pub fn dequant_q4_block(bytes: &[u8], dst: &mut [f32]) {
-    let n_groups = (dst.len() + GROUP_SIZE - 1) / GROUP_SIZE;
+    let n_groups = dst.len().div_ceil(GROUP_SIZE);
     let packed_len = n_groups * GROUP_SIZE / 2;
     debug_assert_eq!(bytes.len(), packed_len + n_groups * 2);
     let (packed, scales) = bytes.split_at(packed_len);
@@ -167,7 +167,7 @@ pub fn dequant_vbit(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) -> 
     for r in 0..rows {
         let b = bits[r] as usize;
         let l = ((1usize << (b - 1)) - 1) as f32;
-        let rowlen = (cols * b + 7) / 8;
+        let rowlen = (cols * b).div_ceil(8);
         let data = &bytes[off..off + rowlen];
         let (mut acc, mut nbits, mut idx) = (0u64, 0usize, 0usize);
         for i in 0..cols {
@@ -201,7 +201,7 @@ pub const Q1_TILE: usize = 6;
 /// value = scale · (2·bit − 1) ∈ {−s, +s}. 1-bit-TRAINED models only —
 /// see the dtype doc.
 pub fn dequant_q1(bytes: &[u8], dst: &mut [f32]) {
-    let n_groups = (dst.len() + GROUP_SIZE - 1) / GROUP_SIZE;
+    let n_groups = dst.len().div_ceil(GROUP_SIZE);
     debug_assert_eq!(bytes.len(), n_groups * Q1_TILE);
     for g in 0..n_groups {
         let tile = &bytes[g * Q1_TILE..(g + 1) * Q1_TILE];
@@ -223,7 +223,7 @@ pub fn dequant_q1(bytes: &[u8], dst: &mut [f32]) {
 /// and `count × [u32 flat-index][f16 value]` restore the salient weights
 /// the two-field mask kept at full precision (they overwrite the ±s base).
 pub fn dequant_q1s(bytes: &[u8], dst: &mut [f32]) {
-    let n_groups = (dst.len() + GROUP_SIZE - 1) / GROUP_SIZE;
+    let n_groups = dst.len().div_ceil(GROUP_SIZE);
     let base_len = n_groups * Q1_TILE;
     dequant_q1(&bytes[..base_len.min(bytes.len())], dst);
     let mut off = base_len;
@@ -273,7 +273,7 @@ pub fn q1t_pack(codes: &mut [u8; 7], k: usize, code: u8) {
 /// `rows`×`cols` shape is needed for the per-row overlay (`[u32 row_ptr[rows+1]]`
 /// then `[(u16 col, f16 val)]` grouped by row — 4 B/outlier, no flat index).
 pub fn dequant_q1t(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) {
-    let n_groups = (dst.len() + GROUP_SIZE - 1) / GROUP_SIZE;
+    let n_groups = dst.len().div_ceil(GROUP_SIZE);
     let base_len = n_groups * Q1T_TILE;
     for g in 0..n_groups {
         let off = g * Q1T_TILE;
@@ -324,7 +324,7 @@ pub fn dequant_q1t(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) {
 /// the same values/order as `q4_block`, only the placement of the
 /// scale differs.
 pub fn dequant_q4_tiled(bytes: &[u8], dst: &mut [f32]) {
-    let n_groups = (dst.len() + GROUP_SIZE - 1) / GROUP_SIZE;
+    let n_groups = dst.len().div_ceil(GROUP_SIZE);
     debug_assert_eq!(bytes.len(), n_groups * Q4_TILE);
     for g in 0..n_groups {
         let tile = &bytes[g * Q4_TILE..(g + 1) * Q4_TILE];

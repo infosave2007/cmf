@@ -456,6 +456,10 @@ impl Pipeline {
     /// graph instead of the batched CPU chunk-GEMM? True for q1 GDN
     /// hybrids on native Metal: their chunk prefill is walled by the
     /// sequential scalar recurrence, so the graph's decode rate wins.
+    /// Looped Transformers also prefer the graph: the CPU batched prefill
+    /// pays the loop_final_norm sync per chunk boundary, and the graph's
+    /// device-attend rate (≈18 tok/s) beats the CPU's ≈9 tok/s for
+    /// typical chat-length prompts.
     #[cfg(target_os = "macos")]
     fn graph_prefill_preferred(&self) -> bool {
         if !crate::gpu::enabled_here()
@@ -465,6 +469,9 @@ impl Pipeline {
                 .unwrap_or(false)
         {
             return false;
+        }
+        if self.loop_final_norm {
+            return true;
         }
         self.weights
             .layers
@@ -515,13 +522,11 @@ impl Pipeline {
         // The graph encodes SiLU FFN, 1/√hd attention scores and
         // full-context attend with no branch norms — Gemma-style archs
         // (sliding window, scale override, sandwich norms, GeLU) fall
-        // back to the CPU path. Looped Transformer (Nanbeige 4.2) needs
-        // a mid-stack final norm the graph cannot express.
+        // back to the CPU path.
         if self.swa.is_some()
             || self.global_attn.is_some()
             || self.attention_heads_per_layer.is_some()
             || self.attn_v_norm
-            || self.loop_final_norm
             || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
             || self.weights.layers.iter().any(|lw| {
                 lw.attn_out_norm.is_some()
@@ -532,6 +537,8 @@ impl Pipeline {
         {
             return start;
         }
+        // Looped Transformer: the graph covers ALL loop iterations;
+        // encode_loop_norm is inserted on-device at each boundary.
         let limit = upto
             .map(|u| u + 1)
             .unwrap_or(self.num_layers)
@@ -748,6 +755,16 @@ impl Pipeline {
         // mirror after the final sync.
         let mut dev_attn: Vec<usize> = Vec::new();
         for item in &plan {
+            // Looped Transformer: insert on-device norm at loop boundaries.
+            if self.loop_final_norm {
+                let item_start = match item {
+                    Item::Gdn { first, .. } => *first,
+                    Item::Attn { li, .. } => *li,
+                };
+                if item_start > start && self.is_loop_end(item_start - 1) {
+                    graph.encode_loop_norm(&self.weights.final_norm);
+                }
+            }
             match item {
                 Item::Gdn { run, first } => {
                     for l in &mut self.kv_cache.layers[*first..*first + run.len()] {
@@ -2321,6 +2338,19 @@ impl Pipeline {
                 if end > li {
                     h_ready = true;
                     chunk_skip_until = end;
+                    // Looped Transformer: the graph stopped at a loop
+                    // boundary — apply final norm before the next iteration.
+                    if self.is_loop_end(end - 1) && end < self.num_layers {
+                        for bi in 0..b {
+                            let normed = inference::rms_norm(
+                                &h[bi * hs..(bi + 1) * hs],
+                                &self.weights.final_norm,
+                                eps,
+                                norm_style,
+                            );
+                            h[bi * hs..(bi + 1) * hs].copy_from_slice(&normed);
+                        }
+                    }
                     continue;
                 }
             }
@@ -2579,7 +2609,6 @@ impl Pipeline {
             || self.swa.is_some()
             || self.global_attn.is_some()
             || self.attn_v_norm
-            || self.loop_final_norm
             || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
         {
             return li0;
@@ -2595,9 +2624,16 @@ impl Pipeline {
             self.hidden_size,
         );
         // Collect the longest run of consecutive eligible layers.
+        // Looped Transformer: stop at the loop boundary so the CPU can
+        // apply loop_final_norm between iterations.
+        let loop_end = if self.loop_final_norm {
+            ((li0 / self.physical_layers) + 1) * self.physical_layers
+        } else {
+            self.num_layers
+        };
         let mut layers: Vec<crate::gpu_metal::ChunkLayer> = Vec::new();
         let mut stored_at: Vec<usize> = Vec::new();
-        for li in li0..self.num_layers {
+        for li in li0..self.num_layers.min(loop_end) {
             let lw = &self.weights.layers[self.phys_layer(li)];
             if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
                 break;
@@ -3182,6 +3218,11 @@ impl Pipeline {
                     let end = self.q1_graph_gpu(li, upto, position, &mut h);
                     if end > li {
                         gpu_skip_until = end;
+                        // Looped Transformer: the graph stopped at a loop
+                        // boundary — apply final norm before the next iteration.
+                        if self.is_loop_end(end - 1) && end < self.num_layers {
+                            h = inference::rms_norm(&h, &self.weights.final_norm, self.rms_eps, self.norm_style);
+                        }
                         continue;
                     }
                 }
@@ -3450,7 +3491,7 @@ impl Pipeline {
                 (true, (Some(g), Some(u), Some(d))) => {
                     let active = task_mask.unwrap().ffn_active_indices(li);
                     inference::sparse_ffn_forward(
-                        &post_normed,
+                        post_normed,
                         g,
                         u,
                         d,
@@ -3468,7 +3509,7 @@ impl Pipeline {
                         let active = task_mask.unwrap().ffn_active_indices(li);
                         sparse_ffn_quant(
                             d,
-                            &post_normed,
+                            post_normed,
                             &active,
                             self.hidden_size,
                             self.pool.as_deref(),
@@ -3482,7 +3523,7 @@ impl Pipeline {
                         let active = task_mask.unwrap().ffn_active_indices(li);
                         let (gf, uf, df) = dequant_dense_f32(d);
                         inference::sparse_ffn_forward(
-                            &post_normed,
+                            post_normed,
                             &gf,
                             &uf,
                             &df,
@@ -3495,10 +3536,10 @@ impl Pipeline {
                     FfnKind::Moe(_) => {
                         // MoE is already sparse by expert selection; masks
                         // don't apply to routed experts.
-                        ffn_forward(&lw.ffn, &post_normed, self.pool.as_deref())
+                        ffn_forward(&lw.ffn, post_normed, self.pool.as_deref())
                     }
                 },
-                (false, _) => ffn_forward(&lw.ffn, &post_normed, self.pool.as_deref()),
+                (false, _) => ffn_forward(&lw.ffn, post_normed, self.pool.as_deref()),
             };
             let ffn_out = match &self.weights.layers[self.phys_layer(li)].ffn_out_norm {
                 Some(w) => inference::rms_norm(&ffn_out, w, self.rms_eps, self.norm_style),
@@ -3814,9 +3855,9 @@ fn moe_ffn_batch(m: &MoeFfn, xs: &[f32], b: usize, hidden: usize, pool: Option<&
             }
         }
     };
-    for e in 0..ne {
-        if !assign[e].is_empty() {
-            run_expert(&m.experts[e], &assign[e]);
+    for (e, a) in assign.iter().enumerate().take(ne) {
+        if !a.is_empty() {
+            run_expert(&m.experts[e], a);
         }
     }
     if let Some((se, gate)) = &m.shared {

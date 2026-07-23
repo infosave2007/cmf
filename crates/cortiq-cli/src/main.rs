@@ -1799,7 +1799,7 @@ async fn cmd_run(model_path: &str, task: &str, prompt: Option<&str>, max_tokens:
                 // Confidence view: reprint token-by-token, coloured by the
                 // model's Born mass on each emitted token.
                 if confidence && !r.token_confidence.is_empty() {
-                    print!("\n");
+                    println!();
                     let mut lo = 1.0f32;
                     let mut sum = 0.0f32;
                     for (id, &c) in r.token_ids.iter().zip(&r.token_confidence) {

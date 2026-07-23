@@ -102,7 +102,7 @@ fn vbit_row_offsets(bytes: &[u8], rows: usize, cols: usize) -> Vec<usize> {
     let mut off = rows + rows * ng * 2;
     for r in 0..rows {
         offsets.push(off);
-        off += (cols * bits[r] as usize + 7) / 8;
+        off += (cols * bits[r] as usize).div_ceil(8);
     }
     offsets.push(off);
     offsets
@@ -2105,7 +2105,7 @@ fn vbit_range_a8w8(
     let sc_off = rows;
     let row_dot = |r: usize| -> f32 {
             let b = bits[r] as usize;
-            let l = ((1i32 << (b - 1)) - 1) as i32;
+            let l = ((1i32 << (b - 1)) - 1);
             let mask = (1u64 << b) - 1;
             let data = &bytes[offsets[r]..offsets[r + 1]];
             if b == 8 {
@@ -4769,8 +4769,8 @@ pub(crate) fn gpu_batch_job<'a>(
 }
 
 thread_local! {
-    static PRESCALE_BUF1: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
-    static PRESCALE_BUF2: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+    static PRESCALE_BUF1: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PRESCALE_BUF2: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 pub(crate) fn prescale<'a>(

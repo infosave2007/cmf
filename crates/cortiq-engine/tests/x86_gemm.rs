@@ -59,6 +59,8 @@ fn blocked_vs_per_row() {
         global_partial_rotary_factor: None,
         final_logit_softcapping: None,
         attn_v_norm: false,
+        num_loops: 1,
+        loop_final_norm: false,
     };
     let header = CmfHeader {
         format: "cmf".into(),
@@ -179,6 +181,8 @@ fn q1_blocked_vs_per_row() {
         global_partial_rotary_factor: None,
         final_logit_softcapping: None,
         attn_v_norm: false,
+        num_loops: 1,
+        loop_final_norm: false,
     };
     let header = CmfHeader {
         format: "cmf".into(),
@@ -297,6 +301,8 @@ fn q4b_blocked_vs_per_row() {
         global_partial_rotary_factor: None,
         final_logit_softcapping: None,
         attn_v_norm: false,
+        num_loops: 1,
+        loop_final_norm: false,
     };
     let header = CmfHeader {
         format: "cmf".into(),
@@ -414,6 +420,8 @@ fn q4t_blocked_vs_per_row() {
         global_partial_rotary_factor: None,
         final_logit_softcapping: None,
         attn_v_norm: false,
+        num_loops: 1,
+        loop_final_norm: false,
     };
     let header = CmfHeader {
         format: "cmf".into(),

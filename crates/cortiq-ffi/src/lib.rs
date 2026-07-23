@@ -304,11 +304,10 @@ pub extern "C" fn cortiq_set_options(handle: *mut c_void, options_json: *const c
         }
         pipeline.set_sampler_config(next);
         drop(pipeline);
-        if let Some(v) = opts.enable_thinking {
-            if let Ok(mut g) = ctx.enable_thinking.lock() {
+        if let Some(v) = opts.enable_thinking
+            && let Ok(mut g) = ctx.enable_thinking.lock() {
                 *g = v;
             }
-        }
         0
     }))
     .unwrap_or_else(|_| {

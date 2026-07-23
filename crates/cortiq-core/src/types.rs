@@ -413,17 +413,17 @@ pub struct LinearCoreConfig {
 impl ModelArch {
     /// Bytes per FFN bitfield row (one layer).
     pub fn ffn_mask_bytes(&self) -> usize {
-        (self.intermediate_size + 7) / 8
+        self.intermediate_size.div_ceil(8)
     }
 
     /// Bytes per head bitfield row (one layer).
     pub fn head_mask_bytes(&self) -> usize {
-        (self.num_attention_heads + 7) / 8
+        self.num_attention_heads.div_ceil(8)
     }
 
     /// Bytes for the layer-gates bitfield.
     pub fn gates_mask_bytes(&self) -> usize {
-        (self.num_layers + 7) / 8
+        self.num_layers.div_ceil(8)
     }
 
     /// Size of one mask blob in the binary masks section.

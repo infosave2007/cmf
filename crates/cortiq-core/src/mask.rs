@@ -185,11 +185,11 @@ impl TaskMask {
             let mut delta = vec![0u8; len];
             let mut layer_changed = self.layer_alive(li) != other.layer_alive(li);
 
-            for bi in 0..len {
+            for (bi, d) in delta.iter_mut().enumerate() {
                 let av = a.get(bi).copied().unwrap_or(0);
                 let bv = b.get(bi).copied().unwrap_or(0);
                 let x = av ^ bv;
-                delta[bi] = x;
+                *d = x;
                 if x != 0 {
                     layer_changed = true;
                     neurons_added += (bv & !av).count_ones() as usize;
@@ -370,7 +370,7 @@ pub fn encode_masks_section(catalog: &MaskCatalog, arch: &ModelArch) -> Result<V
         let mut metas = Vec::with_capacity(catalog.masks.len());
         let mut off = blobs_start;
         for m in &catalog.masks {
-            off = (off + 7) / 8 * 8; // 8-align each blob
+            off = off.div_ceil(8) * 8; // 8-align each blob
             metas.push(MaskMeta {
                 task_id: m.task_id,
                 name: m.name.clone(),

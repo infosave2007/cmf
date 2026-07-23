@@ -50,6 +50,8 @@ fn tiny_arch() -> ModelArch {
         global_partial_rotary_factor: None,
         final_logit_softcapping: None,
         attn_v_norm: false,
+        num_loops: 1,
+        loop_final_norm: false,
     }
 }
 
@@ -88,7 +90,7 @@ fn encode_q8_row(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
 
 /// Reference q4_block encoder.
 fn encode_q4_block(vals: &[f32]) -> Vec<u8> {
-    let n_groups = (vals.len() + GROUP_SIZE - 1) / GROUP_SIZE;
+    let n_groups = vals.len().div_ceil(GROUP_SIZE);
     let mut padded = vals.to_vec();
     padded.resize(n_groups * GROUP_SIZE, 0.0);
     let mut packed = Vec::with_capacity(n_groups * 16);

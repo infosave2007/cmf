@@ -30,7 +30,7 @@ use std::time::Duration;
 const GROUP_SIZE: usize = 32;
 /// Smallest normal f16 — floor for degenerate (all-zero) rows so the stored
 /// scale never underflows to a subnormal the reader would read back as 0.
-const F16_TINY: f32 = 6.103_515_625e-5;
+const F16_TINY: f32 = 6.103_515_6e-5;
 
 /// Round a scale to f16 precision (the reader stores/uses it as f16), so the
 /// quantized values are computed against the *same* scale the reader dequantizes
@@ -951,7 +951,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         norm_style,
         rope_theta,
         // Gemma ties embeddings by default and its configs omit the key.
-        tie_word_embeddings: config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or_else(|| is_gemma),
+        tie_word_embeddings: config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(is_gemma),
         partial_rotary_factor: prf,
         yarn,
         attention_heads_per_layer,
@@ -987,14 +987,12 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
 
 /// Collect eos ids from generation_config.json / config.json (int or array).
 fn eos_ids(gen_cfg: &serde_json::Value, config: &serde_json::Value) -> Vec<u32> {
-    for src in [gen_cfg.get("eos_token_id"), config.get("eos_token_id")] {
-        if let Some(v) = src {
-            if let Some(n) = v.as_u64() {
-                return vec![n as u32];
-            }
-            if let Some(a) = v.as_array() {
-                return a.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect();
-            }
+    for v in [gen_cfg.get("eos_token_id"), config.get("eos_token_id")].into_iter().flatten() {
+        if let Some(n) = v.as_u64() {
+            return vec![n as u32];
+        }
+        if let Some(a) = v.as_array() {
+            return a.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect();
         }
     }
     Vec::new()
@@ -1046,7 +1044,7 @@ fn cached(dest: &Path) -> bool {
     dest.exists() && fs::metadata(dest).map(|m| m.len() > 0).unwrap_or(false)
 }
 
-fn auth<'a>(mut req: ureq::Request, token: Option<&'a str>) -> ureq::Request {
+fn auth(mut req: ureq::Request, token: Option<&str>) -> ureq::Request {
     req = req.set("User-Agent", "cortiq-convert");
     if let Some(t) = token {
         req = req.set("Authorization", &format!("Bearer {t}"));
@@ -1578,7 +1576,7 @@ pub fn run_convert(
                 let dk = arch.linear_key_head_dim.ok_or_else(|| miss("linear_key_head_dim"))?;
                 let nv = arch.linear_num_value_heads.ok_or_else(|| miss("linear_num_value_heads"))?;
                 let dv = arch.linear_value_head_dim.ok_or_else(|| miss("linear_value_head_dim"))?;
-                for (out_name, out_vals, out_rows) in split_fused_gdn(&name, &w, hid, nk, dk, nv, dv)? {
+                for (out_name, out_vals, out_rows) in split_fused_gdn(&name, w, hid, nk, dk, nv, dv)? {
                     let two_d = out_rows * hid >= GROUP_SIZE && !force_f16(&out_name);
                     let (dt, data) = if two_d { quantize_2d(quant, &out_vals, out_rows, hid) } else { (TensorDtype::F16, encode_f16(&out_vals)) };
                     tensors.push(TensorSpec {
@@ -1627,7 +1625,7 @@ pub fn run_convert(
                         let w = &m_vals;
                         let (rows, cols) = (m_shape[0], m_shape[1]);
                         for out_name in [name.clone(), name.replace("k_proj", "v_proj")] {
-                            let (dt, data) = if rows * cols >= GROUP_SIZE && !force_f16(&out_name) { quantize_2d(quant, &w, rows, cols) } else { (TensorDtype::F16, encode_f16(&w)) };
+                            let (dt, data) = if rows * cols >= GROUP_SIZE && !force_f16(&out_name) { quantize_2d(quant, w, rows, cols) } else { (TensorDtype::F16, encode_f16(w)) };
                             tensors.push(TensorSpec {
                                 name: out_name,
                                 dtype: dt,

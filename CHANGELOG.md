@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.12] — 2026-07-23
+
+### Added
+- **Looped Transformer GPU acceleration** (Metal, Apple Silicon): both loop
+  iterations now execute in a single Metal graph submission with the
+  `loop_final_norm` applied on-device via `encode_loop_norm` (RMS norm + blit).
+  Eliminates the CPU round-trip at loop boundaries. Nanbeige4.2-3B Q4: 5.6 →
+  18.6 tok/s steady decode (3.3×), TTFT 5.2 → 1.8 s (2.9×).
+- **GPU graph prefill for looped models**: `graph_prefill_preferred()` returns
+  true for `loop_final_norm` models on macOS — each prompt token goes through
+  the same device-attend graph as decode, doubling prefill throughput.
+
+### Fixed
+- **GPU loop_final_norm insertion**: the `continue` after `q1_graph_gpu` /
+  `chunk_run_gpu` returns no longer skips the per-loop norm — the norm is
+  applied either on-device (fused graph) or on CPU (fallback) before the
+  next loop iteration.
+- **Clippy**: resolved all CI errors — `div_ceil`, `needless_borrow`,
+  `needless_range_loop`, missing struct fields in tests.
+
 ## [0.5.11] — 2026-07-23
 
 ### Fixed

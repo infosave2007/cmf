@@ -434,7 +434,7 @@ impl Pipeline {
                         value_head_dim: lc.value_head_dim,
                         conv_kernel: need(arch.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
                         hidden_size: arch.hidden_size,
-                        rms_eps: arch.rms_norm_eps as f64,
+                        rms_eps: arch.rms_norm_eps,
                     });
                 }
                 other => {

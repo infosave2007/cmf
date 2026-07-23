@@ -102,13 +102,11 @@ fn parse_shape(h: &str) -> Option<Vec<usize>> {
     let after = &h[h.find("'shape':")? + "'shape':".len()..];
     let lp = after.find('(')?;
     let rp = after[lp..].find(')')? + lp;
-    Some(
-        after[lp + 1..rp]
+    after[lp + 1..rp]
             .split(',')
             .filter_map(|p| {
                 let t = p.trim();
                 (!t.is_empty()).then(|| t.parse::<usize>().ok())
             })
-            .collect::<Option<Vec<usize>>>()?,
-    )
+            .collect::<Option<Vec<usize>>>()
 }

@@ -401,7 +401,7 @@ fn q1t_group_candidate(
         }
     }
     let mean = if cnt > 0 { sum / cnt as f32 } else { 0.0 };
-    let legacy_scale = f16_to_f32(f32_to_f16(mean)).max(6.103_515_625e-5);
+    let legacy_scale = f16_to_f32(f32_to_f16(mean)).max(6.103_515_6e-5);
 
     // A sparse-support candidate. Its level is the exact diagonal-Hessian
     // least-squares solution over the selected support:
@@ -432,7 +432,7 @@ fn q1t_group_candidate(
         legacy_err += d * e * e;
     }
     let adaptive_scale = if den > 0.0 {
-        f16_to_f32(f32_to_f16((num / den) as f32)).max(6.103_515_625e-5)
+        f16_to_f32(f32_to_f16((num / den) as f32)).max(6.103_515_6e-5)
     } else {
         legacy_scale
     };
@@ -636,7 +636,7 @@ pub fn gptq_quantize_q1s(
             }
             let s = if cnt > 0 { sum / cnt as f32 } else { 0.0 };
             scale[o * groups_per_row + gi] =
-                f16_to_f32(f32_to_f16(s)).max(6.103_515_625e-5);
+                f16_to_f32(f32_to_f16(s)).max(6.103_515_6e-5);
         }
         // Column-by-column quant + holographic fold into the remaining ones.
         for c in c0..c0 + GROUP_SIZE {

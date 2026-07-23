@@ -2659,7 +2659,7 @@ fn q8_matvec_range_field(
         return false; // a neighboring shard — a different mapping; MVP: CPU
     };
     abs += row0 * cols; // offset into the sub-range (the GPU does not need 64-alignment)
-    let bytes = model.primary_bytes();
+    let _bytes = model.primary_bytes();
     let Some((fbuf, safe_len)) = file_buffer(c, model) else {
         return false;
     };
@@ -2755,7 +2755,7 @@ pub fn q1_matvec(
     let Some(abs) = model.entry_abs_offset(entry) else {
         return false;
     };
-    let bytes = model.primary_bytes();
+    let _bytes = model.primary_bytes();
     let Some((fbuf, safe_len)) = file_buffer(c, model) else {
         return false;
     };
@@ -3065,7 +3065,7 @@ fn q1t_matvec_impl(
     let Some(abs) = model.entry_abs_offset(entry) else {
         return false;
     };
-    let bytes = model.primary_bytes();
+    let _bytes = model.primary_bytes();
     let Some((fbuf, safe_len)) = file_buffer(c, model) else {
         return false;
     };
@@ -4001,7 +4001,7 @@ pub fn q8_matmat(
     let Some(abs) = model.entry_abs_offset(entry) else {
         return false;
     };
-    let bytes = model.primary_bytes();
+    let _bytes = model.primary_bytes();
     let Some((fbuf, safe_len)) = file_buffer(c, model) else {
         return false;
     };
@@ -4103,7 +4103,7 @@ pub fn q1t_matmat(
     let Some(abs) = model.entry_abs_offset(entry) else {
         return false;
     };
-    let bytes = model.primary_bytes();
+    let _bytes = model.primary_bytes();
     let Some((fbuf, safe_len)) = file_buffer(c, model) else {
         return false;
     };
@@ -4180,7 +4180,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
     if jobs.is_empty() {
         return false;
     }
-    let bytes = model.primary_bytes();
+    let _bytes = model.primary_bytes();
     let Some((fbuf, safe_len)) = file_buffer(c, model) else {
         return false;
     };
@@ -4398,7 +4398,7 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], outs: &mut [&mut [
     if jobs.is_empty() || jobs.len() != outs.len() {
         return false;
     }
-    let bytes = model.primary_bytes();
+    let _bytes = model.primary_bytes();
     let Some((fbuf, safe_len)) = file_buffer(c, model) else {
         return false;
     };
@@ -4916,6 +4916,28 @@ impl TokenGraph {
                 self.dims.hidden,
             );
         }
+    }
+
+    /// Looped Transformer: apply RMS norm to the hidden state on-device
+    /// between loop iterations — avoids a CPU round-trip at the boundary.
+    /// h_b → rmsn → n_b → blit back → h_b.
+    pub fn encode_loop_norm(&mut self, norm: &[f32]) {
+        let cmd = self.ensure_cmd();
+        enc_simple(
+            &cmd,
+            &self.c.rmsn,
+            &[
+                (&self.h_b, 0),
+                (&const_buf(self.c, norm), 0),
+                (&self.n_b, 0),
+            ],
+            &[self.dims.hidden as u32, self.dims.gemma as u32],
+            &[self.dims.eps],
+            (256, 256),
+        );
+        let blit = cmd.new_blit_command_encoder();
+        blit.copy_from_buffer(&self.n_b, 0, &self.h_b, 0, (self.dims.hidden * 4) as u64);
+        blit.end_encoding();
     }
 
     /// Pre-flight for the final-norm + lm_head tail.
@@ -5844,6 +5866,8 @@ mod tests {
             global_partial_rotary_factor: None,
             final_logit_softcapping: None,
             attn_v_norm: false,
+            num_loops: 1,
+            loop_final_norm: false,
         };
         let header = CmfHeader {
             format: "cmf".into(),
@@ -5973,6 +5997,8 @@ mod tests {
             global_partial_rotary_factor: None,
             final_logit_softcapping: None,
             attn_v_norm: false,
+            num_loops: 1,
+            loop_final_norm: false,
         };
         let header = CmfHeader {
             format: "cmf".into(),

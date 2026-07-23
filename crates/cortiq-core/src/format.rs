@@ -1047,7 +1047,7 @@ impl CmfModel {
 }
 
 fn align_to(x: u64, a: u64) -> u64 {
-    (x + a - 1) / a * a
+    x.div_ceil(a) * a
 }
 
 fn zeros(n: usize) -> Vec<u8> {
@@ -1067,7 +1067,7 @@ pub fn build_sparse_index(catalog: &MaskCatalog, arch: &ModelArch) -> Vec<Sparse
             }
             let mut groups = Vec::new();
             if let Some(bits) = m.ffn_masks.get(li) {
-                let n_groups = (arch.intermediate_size + 31) / 32;
+                let n_groups = arch.intermediate_size.div_ceil(32);
                 for g in 0..n_groups {
                     // Group g covers bits [g*32, g*32+32) = bytes [g*4, g*4+4).
                     let active = bits[g * 4..(g * 4 + 4).min(bits.len())]
@@ -1152,7 +1152,7 @@ pub fn decode_sparse_index(bytes: &[u8]) -> Result<Vec<SparseIndexEntry>, CmfErr
         pos += n_groups * 2;
         let heads = bytes[pos..pos + n_heads].to_vec();
         pos += n_heads;
-        pos = (pos + 3) / 4 * 4;
+        pos = pos.div_ceil(4) * 4;
         out.push(SparseIndexEntry {
             task_id,
             layer_idx,
