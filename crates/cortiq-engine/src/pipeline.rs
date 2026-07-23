@@ -2854,10 +2854,6 @@ impl Pipeline {
         if self.o1_active() {
             return None;
         }
-        // Looped Transformer needs a mid-stack final norm the graph cannot express.
-        if self.loop_final_norm {
-            return None;
-        }
         let nh = self.num_heads;
         let (nkv, hd, rd) = self.layer_geom(0);
         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
@@ -2992,6 +2988,15 @@ impl Pipeline {
             None
         };
         let lm = lm_gw.as_ref().map(|(gw, rows)| (gw, *rows));
+        // Loop boundaries: virtual layer indices after which final_norm is applied
+        // (mid-stack only; the last layer's norm folds into lm_head).
+        let loop_norm_at: Vec<usize> = if self.loop_final_norm {
+            (0..self.num_layers - 1)
+                .filter(|&li| (li + 1) % self.physical_layers == 0)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut h = hidden.to_vec();
         crate::gpu::forward_token_graph(
             &model,
@@ -3012,6 +3017,7 @@ impl Pipeline {
             lm,
             &self.weights.final_norm,
             logits_out,
+            &loop_norm_at,
         )
         .then_some(h)
     }

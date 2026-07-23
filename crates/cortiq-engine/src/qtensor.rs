@@ -356,6 +356,7 @@ impl QTensor {
             }
             Self::Mapped { model, idx, dtype: TensorDtype::Q1, .. } => Some((model, *idx, 1, &[])),
             Self::Mapped { model, idx, dtype: TensorDtype::Q4Tiled, .. } => Some((model, *idx, 2, &[])),
+            Self::Mapped { model, idx, dtype: TensorDtype::Q4Block, .. } => Some((model, *idx, 2, &[])),
             Self::Mapped { model, idx, dtype: TensorDtype::Q1T, .. } => Some((model, *idx, 3, &[])),
             _ => None,
         }
@@ -2105,7 +2106,7 @@ fn vbit_range_a8w8(
     let sc_off = rows;
     let row_dot = |r: usize| -> f32 {
             let b = bits[r] as usize;
-            let l = ((1i32 << (b - 1)) - 1);
+            let l = (1i32 << (b - 1)) - 1;
             let mask = (1u64 << b) - 1;
             let data = &bytes[offsets[r]..offsets[r + 1]];
             if b == 8 {
@@ -2949,6 +2950,7 @@ unsafe fn dot_q1_row_1x4_avx2(
     }
 }
 
+#[allow(unreachable_code)]
 fn dot_q1_row_i8(bytes: &[u8], r: usize, gpr: usize, xq: &[i8], gsum: &[i32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -4162,6 +4164,7 @@ unsafe fn dot_q4b_row_1x4_sx_avx2(
     }
 }
 
+#[allow(unreachable_code)]
 fn dot_q4_row_i8(packed: &[u8], scales: &[u8], g0: usize, gpr: usize, xq: &[i8]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     unsafe {

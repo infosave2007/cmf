@@ -995,6 +995,18 @@ fn q1t_matvec(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// 8 nibbles from one u32 word dot 8 activations (fully unrolled FMA chain).
+fn q4b_dot8(w: u32, xi: u32) -> f32 {
+    return (f32(w & 0xFu) - 8.0) * q1x[xi]
+         + (f32((w >> 4u) & 0xFu) - 8.0) * q1x[xi + 1u]
+         + (f32((w >> 8u) & 0xFu) - 8.0) * q1x[xi + 2u]
+         + (f32((w >> 12u) & 0xFu) - 8.0) * q1x[xi + 3u]
+         + (f32((w >> 16u) & 0xFu) - 8.0) * q1x[xi + 4u]
+         + (f32((w >> 20u) & 0xFu) - 8.0) * q1x[xi + 5u]
+         + (f32((w >> 24u) & 0xFu) - 8.0) * q1x[xi + 6u]
+         + (f32((w >> 28u) & 0xFu) - 8.0) * q1x[xi + 7u];
+}
+
 @compute @workgroup_size(64)
 fn q4b_matvec(@builtin(workgroup_id) wid: vec3<u32>,
               @builtin(num_workgroups) nwg: vec3<u32>,
@@ -1010,17 +1022,18 @@ fn q4b_matvec(@builtin(workgroup_id) wid: vec3<u32>,
         loop {
             if (g >= gpr) { break; }
             let gi = row * gpr + g;
-            let sc_off = scales_off + gi * 2u;
-            let sc16 = q1t_byte(sc_off) | (q1t_byte(sc_off + 1u) << 8u);
+            // Scale: one u32 read instead of two byte reads.
+            let sc_byte = scales_off + gi * 2u;
+            let sc16 = (q1w[sc_byte >> 2u] >> ((sc_byte & 3u) * 8u)) & 0xFFFFu;
             let scale = unpack2x16float(sc16).x;
-            let pk = gi * 16u;
+            // 4 u32 reads = 16 bytes = 32 weights (4× fewer array accesses
+            // than the per-byte path, ~40% fewer ALU per group).
+            let pk4 = gi * 4u;
             let xb = g * 32u;
-            var gsum = 0.0;
-            for (var k = 0u; k < 16u; k = k + 1u) {
-                let b = q1t_byte(pk + k);
-                gsum = gsum + (f32(b & 0xFu) - 8.0) * q1x[xb + k * 2u]
-                            + (f32((b >> 4u) & 0xFu) - 8.0) * q1x[xb + k * 2u + 1u];
-            }
+            let gsum = q4b_dot8(q1w[pk4], xb)
+                     + q4b_dot8(q1w[pk4 + 1u], xb + 8u)
+                     + q4b_dot8(q1w[pk4 + 2u], xb + 16u)
+                     + q4b_dot8(q1w[pk4 + 3u], xb + 24u);
             acc = acc + scale * gsum;
             g = g + 64u;
         }
@@ -1034,6 +1047,73 @@ fn q4b_matvec(@builtin(workgroup_id) wid: vec3<u32>,
             stride = stride >> 1u;
         }
         if (lid == 0u) { q1y[row] = partial_q1t[0]; }
+        workgroupBarrier();
+        row = row + nwg.x;
+    }
+}
+
+// Fused SiLU(gate)·up → Q4Block down-proj matvec: eliminates the standalone
+// silu dispatch (saves one inter-pass pipeline flush per layer).
+@group(0) @binding(0) var<storage, read>       sd_w : array<u32>;
+@group(0) @binding(1) var<storage, read>       sd_gate : array<f32>;
+@group(0) @binding(2) var<storage, read>       sd_up : array<f32>;
+@group(0) @binding(3) var<storage, read_write> sd_y : array<f32>;
+@group(0) @binding(4) var<uniform>             sd_p : Q1Params;
+
+var<workgroup> partial_sd: array<f32, 64>;
+
+fn sd_dot8(w: u32, xi: u32) -> f32 {
+    let g0 = sd_gate[xi];     let g1 = sd_gate[xi + 1u];
+    let g2 = sd_gate[xi + 2u]; let g3 = sd_gate[xi + 3u];
+    let g4 = sd_gate[xi + 4u]; let g5 = sd_gate[xi + 5u];
+    let g6 = sd_gate[xi + 6u]; let g7 = sd_gate[xi + 7u];
+    return (f32(w & 0xFu) - 8.0) * (g0 / (1.0 + exp(-g0)) * sd_up[xi])
+         + (f32((w >> 4u) & 0xFu) - 8.0) * (g1 / (1.0 + exp(-g1)) * sd_up[xi + 1u])
+         + (f32((w >> 8u) & 0xFu) - 8.0) * (g2 / (1.0 + exp(-g2)) * sd_up[xi + 2u])
+         + (f32((w >> 12u) & 0xFu) - 8.0) * (g3 / (1.0 + exp(-g3)) * sd_up[xi + 3u])
+         + (f32((w >> 16u) & 0xFu) - 8.0) * (g4 / (1.0 + exp(-g4)) * sd_up[xi + 4u])
+         + (f32((w >> 20u) & 0xFu) - 8.0) * (g5 / (1.0 + exp(-g5)) * sd_up[xi + 5u])
+         + (f32((w >> 24u) & 0xFu) - 8.0) * (g6 / (1.0 + exp(-g6)) * sd_up[xi + 6u])
+         + (f32((w >> 28u) & 0xFu) - 8.0) * (g7 / (1.0 + exp(-g7)) * sd_up[xi + 7u]);
+}
+
+@compute @workgroup_size(64)
+fn silu_down_matvec(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(num_workgroups) nwg: vec3<u32>,
+                    @builtin(local_invocation_index) lid: u32) {
+    let gpr = sd_p.np;
+    let rows = sd_p.rows;
+    let scales_off = rows * gpr * 16u;
+    var row = wid.x;
+    loop {
+        if (row >= rows) { break; }
+        var acc = 0.0;
+        var g = lid;
+        loop {
+            if (g >= gpr) { break; }
+            let gi = row * gpr + g;
+            let sc_byte = scales_off + gi * 2u;
+            let sc16 = (sd_w[sc_byte >> 2u] >> ((sc_byte & 3u) * 8u)) & 0xFFFFu;
+            let scale = unpack2x16float(sc16).x;
+            let pk4 = gi * 4u;
+            let xb = g * 32u;
+            let gsum = sd_dot8(sd_w[pk4], xb)
+                     + sd_dot8(sd_w[pk4 + 1u], xb + 8u)
+                     + sd_dot8(sd_w[pk4 + 2u], xb + 16u)
+                     + sd_dot8(sd_w[pk4 + 3u], xb + 24u);
+            acc = acc + scale * gsum;
+            g = g + 64u;
+        }
+        partial_sd[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid < stride) { partial_sd[lid] = partial_sd[lid] + partial_sd[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lid == 0u) { sd_y[row] = partial_sd[0]; }
         workgroupBarrier();
         row = row + nwg.x;
     }
@@ -1171,6 +1251,7 @@ struct Ctx {
     q1: wgpu::ComputePipeline,
     q1t: wgpu::ComputePipeline,
     q4b: wgpu::ComputePipeline,
+    silu_down: wgpu::ComputePipeline,
     q1t_mm: wgpu::ComputePipeline,
     q1t_ovmm: wgpu::ComputePipeline,
     rmsnorm: wgpu::ComputePipeline,
@@ -1202,6 +1283,7 @@ struct Ctx {
     layout_gdn: wgpu::BindGroupLayout,
     layout_gdn_conv: wgpu::BindGroupLayout,
     layout_f32: wgpu::BindGroupLayout,
+    layout_silu_down: wgpu::BindGroupLayout,
     /// Discrete card (PCIe VRAM) vs UMA — thresholds and budgets differ.
     discrete: bool,
     /// Weight-residency budget in bytes (CMF_GPU_VRAM_MB override). On a
@@ -1240,6 +1322,9 @@ struct Ctx {
     /// key (0, n) holds shared zero buffers. Assumes stable weight pointers
     /// (mmap), same as `weight_bufs`.
     const_bufs: Mutex<HashMap<(usize, usize), wgpu::Buffer>>,
+    /// Pooled graph scratch: eliminates per-token buffer allocations in the
+    /// whole-token graph path (the dominant decode cost on Vulkan/DX12).
+    graph_scratch: Mutex<GraphScratch>,
 }
 
 struct KvMirror {
@@ -1277,6 +1362,80 @@ impl Scratch {
                     mapped_at_creation: false,
                 });
                 *slot = Some((b.clone(), cap));
+                b
+            }
+        }
+    }
+}
+
+/// Pooled scratch for the whole-token graph path. Grow-only: each slot is
+/// allocated once (or grown) and reused across tokens — eliminates the ~20
+/// Vulkan buffer allocations per token that dominated decode latency.
+#[derive(Default)]
+struct GraphScratch {
+    h: Option<(wgpu::Buffer, u64)>,
+    n1: Option<(wgpu::Buffer, u64)>,
+    qraw: Option<(wgpu::Buffer, u64)>,
+    kb: Option<(wgpu::Buffer, u64)>,
+    vb: Option<(wgpu::Buffer, u64)>,
+    qout: Option<(wgpu::Buffer, u64)>,
+    gout: Option<(wgpu::Buffer, u64)>,
+    attn: Option<(wgpu::Buffer, u64)>,
+    ob: Option<(wgpu::Buffer, u64)>,
+    gbuf: Option<(wgpu::Buffer, u64)>,
+    ubuf: Option<(wgpu::Buffer, u64)>,
+    abuf: Option<(wgpu::Buffer, u64)>,
+    // GDN intermediates
+    qkv_b: Option<(wgpu::Buffer, u64)>,
+    cq_b: Option<(wgpu::Buffer, u64)>,
+    z_b: Option<(wgpu::Buffer, u64)>,
+    a_b: Option<(wgpu::Buffer, u64)>,
+    b_b: Option<(wgpu::Buffer, u64)>,
+    gdo_b: Option<(wgpu::Buffer, u64)>,
+    // Logits output + readback staging
+    logits: Option<(wgpu::Buffer, u64)>,
+    stage: Option<(wgpu::Buffer, u64)>,
+    // Position-dependent uniforms (fixed size, write_buffer each token)
+    kv_u: Option<wgpu::Buffer>,    // 16 bytes: [nkv, hd, cap, position]
+    at_u: Option<wgpu::Buffer>,    // 32 bytes: [nh, nh/nkv, hd, cap, pos+1, 0, 0, 0]
+    rope_u: Option<wgpu::Buffer>,  // 32 bytes: [nh, nkv, hd, rd, pos, flags, eps, 0]
+}
+
+impl GraphScratch {
+    fn ensure(
+        dev: &wgpu::Device,
+        slot: &mut Option<(wgpu::Buffer, u64)>,
+        need: u64,
+        usage: wgpu::BufferUsages,
+        label: &str,
+    ) -> wgpu::Buffer {
+        match slot {
+            Some((b, cap)) if *cap >= need => b.clone(),
+            _ => {
+                let cap = need.next_power_of_two().max(256);
+                let b = dev.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: cap,
+                    usage,
+                    mapped_at_creation: false,
+                });
+                *slot = Some((b.clone(), cap));
+                b
+            }
+        }
+    }
+    /// Pooled uniform buffer of `size` bytes (created once, write_buffer'd each token).
+    fn ensure_uniform(dev: &wgpu::Device, slot: &mut Option<wgpu::Buffer>, size: u64) -> wgpu::Buffer {
+        match slot {
+            Some(b) => b.clone(),
+            None => {
+                let b = dev.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("g-unif"),
+                    size,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                *slot = Some(b.clone());
                 b
             }
         }
@@ -1398,6 +1557,7 @@ fn init() -> Result<Ctx, String> {
     let q1 = pipe("q1_matvec");
     let q1t = pipe("q1t_matvec");
     let q4b = pipe("q4b_matvec");
+    let silu_down = pipe("silu_down_matvec");
     let q1t_mm = pipe("q1t_mul_mm");
     let q1t_ovmm = pipe("q1t_overlay_mm");
     let rmsnorm = pipe("rmsnorm");
@@ -1422,6 +1582,7 @@ fn init() -> Result<Ctx, String> {
     let layout_gdn = gdn_step.get_bind_group_layout(0);
     let layout_gdn_conv = gdn_conv.get_bind_group_layout(0);
     let layout_f32 = f32_matvec.get_bind_group_layout(0);
+    let layout_silu_down = silu_down.get_bind_group_layout(0);
     let layout_mm = matmat.get_bind_group_layout(0);
     let layout_mmm = mul_mm.get_bind_group_layout(0);
     let layout_q1mm = q1_mm.get_bind_group_layout(0);
@@ -1444,6 +1605,7 @@ fn init() -> Result<Ctx, String> {
         q1,
         q1t,
         q4b,
+        silu_down,
         q1t_mm,
         q1t_ovmm,
         rmsnorm,
@@ -1475,6 +1637,7 @@ fn init() -> Result<Ctx, String> {
         layout_gdn,
         layout_gdn_conv,
         layout_f32,
+        layout_silu_down,
         discrete,
         vram_budget,
         resident: std::sync::atomic::AtomicU64::new(0),
@@ -1485,6 +1648,7 @@ fn init() -> Result<Ctx, String> {
         rs_bufs: Mutex::new(HashMap::new()),
         attn_kv: Mutex::new(HashMap::new()),
         gdn_state: Mutex::new(HashMap::new()),
+        graph_scratch: Mutex::new(GraphScratch::default()),
     })
 }
 
@@ -2276,6 +2440,7 @@ pub fn forward_token_graph(
     lm_head: Option<(&crate::gpu::GraphW, usize)>,
     final_norm: &[f32],
     logits: &mut Vec<f32>,
+    loop_norm_at: &[usize],
 ) -> bool {
     let Some(c) = ctx() else { return false };
     if position >= cap {
@@ -2450,38 +2615,35 @@ pub fn forward_token_graph(
         let e: Vec<_> = bufs.iter().enumerate().map(|(i, b)| bind_buf(i as u32, b)).collect();
         c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &e })
     };
-    // Resident hidden (device-local; written once per token, read back once).
-    let h_buf = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("g-h"),
-        size: (hidden * 4) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    // ── Pooled scratch: all intermediate buffers are reused across tokens ──
+    let mut gs = c.graph_scratch.lock().unwrap();
+    let st = wgpu::BufferUsages::STORAGE;
+    let h_buf = GraphScratch::ensure(&c.device, &mut gs.h, (hidden * 4) as u64, st | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, "g-h");
     c.queue.write_buffer(&h_buf, 0, bytemuck::cast_slice(&h[..hidden]));
-    let n1 = rw_f32(c, hidden, false);
+    let n1 = GraphScratch::ensure(&c.device, &mut gs.n1, (hidden * 4) as u64, st | wgpu::BufferUsages::COPY_SRC, "g-n1");
     // Gated attention (Qwen3.5) makes wq emit 2·nh·hd (q||gate per head), so the
     // raw-QKV scratch must hold the widened q output for any gated layer.
     let any_gate = layers.iter().any(|l| matches!(&l.attn, crate::gpu::GraphAttn::Full { output_gate: true, .. }));
-    let qraw = rw_f32(c, nh * hd * (1 + any_gate as usize), false);
-    let kb = rw_f32(c, nkv * hd, false);
-    let vb = rw_f32(c, nkv * hd, false);
-    let qout = rw_f32(c, nh * hd, false);
-    let gout = rw_f32(c, nh * hd, false);
-    let attn = rw_f32(c, nh * hd, false);
-    let ob = rw_f32(c, hidden, false);
-    let gbuf = rw_f32(c, inter, false);
-    let ubuf = rw_f32(c, inter, false);
-    let abuf = rw_f32(c, inter, false);
+    let qraw = GraphScratch::ensure(&c.device, &mut gs.qraw, (nh * hd * (1 + any_gate as usize) * 4) as u64, st, "g-qraw");
+    let kb = GraphScratch::ensure(&c.device, &mut gs.kb, (nkv * hd * 4) as u64, st, "g-kb");
+    let vb = GraphScratch::ensure(&c.device, &mut gs.vb, (nkv * hd * 4) as u64, st, "g-vb");
+    let qout = GraphScratch::ensure(&c.device, &mut gs.qout, (nh * hd * 4) as u64, st, "g-qout");
+    let gout = GraphScratch::ensure(&c.device, &mut gs.gout, (nh * hd * 4) as u64, st, "g-gout");
+    let attn = GraphScratch::ensure(&c.device, &mut gs.attn, (nh * hd * 4) as u64, st, "g-attn");
+    let ob = GraphScratch::ensure(&c.device, &mut gs.ob, (hidden * 4) as u64, st, "g-ob");
+    let gbuf = GraphScratch::ensure(&c.device, &mut gs.gbuf, (inter * 4) as u64, st, "g-gbuf");
+    let ubuf = GraphScratch::ensure(&c.device, &mut gs.ubuf, (inter * 4) as u64, st, "g-ubuf");
+    let abuf = GraphScratch::ensure(&c.device, &mut gs.abuf, (inter * 4) as u64, st, "g-abuf");
     let invf_b = stor(bytemuck::cast_slice(invf));
     let dummy_hd = zeros(hd);
     // GDN intermediates (sized to the model's GDN geometry; 1 if no GDN layer).
     let (gnv, _gnk, gdk, gdv, _gkk, gcdim) = gdn_dims.unwrap_or((1, 1, 1, 1, 1, 1));
-    let qkv_b = rw_f32(c, gcdim, false);
-    let cq_b = rw_f32(c, gcdim, false);
-    let z_b = rw_f32(c, gnv * gdv, false);
-    let a_b = rw_f32(c, gnv, false);
-    let b_b = rw_f32(c, gnv, false);
-    let gdo_b = rw_f32(c, gnv * gdv, false);
+    let qkv_b = GraphScratch::ensure(&c.device, &mut gs.qkv_b, (gcdim * 4) as u64, st, "g-qkv");
+    let cq_b = GraphScratch::ensure(&c.device, &mut gs.cq_b, (gcdim * 4) as u64, st, "g-cq");
+    let z_b = GraphScratch::ensure(&c.device, &mut gs.z_b, (gnv * gdv * 4) as u64, st, "g-z");
+    let a_b = GraphScratch::ensure(&c.device, &mut gs.a_b, (gnv * 4) as u64, st, "g-a");
+    let b_b = GraphScratch::ensure(&c.device, &mut gs.b_b, (gnv * 4) as u64, st, "g-b");
+    let gdo_b = GraphScratch::ensure(&c.device, &mut gs.gdo_b, (gnv * gdv * 4) as u64, st, "g-gdo");
     // Sync each Full layer's device K/V mirror from the CPU cache (once);
     // GDN layers carry a persistent (ring, S) recurrent state instead.
     let mut kvbufs: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>> = Vec::with_capacity(layers.len());
@@ -2544,12 +2706,17 @@ pub fn forward_token_graph(
     };
     let flags = |qn: bool, kn: bool| (if qn { 2u32 } else { 0 }) | (if kn { 4 } else { 0 }) | (if gemma { 8 } else { 0 });
     // Constant uniforms for the whole token (position is fixed for this call).
+    // Token-invariant ones use the content-keyed cache; position-dependent ones
+    // use pooled buffers updated via write_buffer (no allocation after first token).
     let g = if gemma { 1u32 } else { 0 };
-    let rms_u = unif(&[hidden as u32, g, eps.to_bits(), 0]);
-    let ax_u = unif(&[1.0f32.to_bits(), hidden as u32, 0, 0]);
-    let silu_u = unif(&[inter as u32, 0, 0, 0]);
-    let kv_u = unif(&[nkv as u32, hd as u32, cap as u32, position as u32]);
-    let at_u = unif(&[nh as u32, (nh / nkv) as u32, hd as u32, cap as u32, (position + 1) as u32, 0, 0, 0]);
+    let rms_u = uniform_u32x4(c, [hidden as u32, g, eps.to_bits(), 0]);
+    let ax_u = uniform_u32x4(c, [1.0f32.to_bits(), hidden as u32, 0, 0]);
+    let silu_u = uniform_u32x4(c, [inter as u32, 0, 0, 0]);
+    let kv_u = GraphScratch::ensure_uniform(&c.device, &mut gs.kv_u, 16);
+    c.queue.write_buffer(&kv_u, 0, bytemuck::cast_slice(&[nkv as u32, hd as u32, cap as u32, position as u32]));
+    let at_u = GraphScratch::ensure_uniform(&c.device, &mut gs.at_u, 32);
+    c.queue.write_buffer(&at_u, 0, bytemuck::cast_slice(&[nh as u32, (nh / nkv) as u32, hd as u32, cap as u32, (position + 1) as u32, 0, 0, 0]));
+    let rope_u = GraphScratch::ensure_uniform(&c.device, &mut gs.rope_u, 32);
     // Encode one matvec, dtype-dispatched: q8_row (encode_matvec + row scales)
     // or q1 (encode_matvec_q1). Each is its own pass — pass-grouping measured
     // as a no-op (the wall is per-dispatch, not per-barrier).
@@ -2583,6 +2750,20 @@ pub fn forward_token_graph(
                 let p_buf = uniform_u32x4(c, [cols as u32, rows as u32, 0, 0]);
                 let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &c.layout_f32, entries: &[bind_buf(0, &m.buf), bind_buf(1, xs), bind_buf(2, y), bind_buf(3, &p_buf)] });
                 Some((&c.f32_matvec, bind, (rows as u32).min(MAX_WG)))
+            }
+            2 => {
+                let gpr = cols / 32;
+                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+                let layout = c.q4b.get_bind_group_layout(0);
+                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &[bind_buf(0, &m.buf), bind_buf(1, xs), bind_buf(2, y), bind_buf(3, &p_buf)] });
+                Some((&c.q4b, bind, (rows as u32).min(MAX_WG)))
+            }
+            3 => {
+                let gpr = cols / 32;
+                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+                let layout = c.q1t.get_bind_group_layout(0);
+                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &[bind_buf(0, &m.buf), bind_buf(1, xs), bind_buf(2, y), bind_buf(3, &p_buf)] });
+                Some((&c.q1t, bind, (rows as u32).min(MAX_WG)))
             }
             _ => None,
         }
@@ -2622,25 +2803,37 @@ pub fn forward_token_graph(
                 let qnw = q_norm.map(|q| stor(bytemuck::cast_slice(q))).unwrap_or_else(|| zeros(hd));
                 let knw = k_norm.map(|k| stor(bytemuck::cast_slice(k))).unwrap_or_else(|| zeros(hd));
                 let gate_flag = if *output_gate { 1u32 } else { 0 };
-                let rope_u = unif(&[nh as u32, nkv as u32, hd as u32, rd as u32, position as u32, flags(q_norm.is_some(), k_norm.is_some()) | gate_flag, eps.to_bits(), 0]);
+                c.queue.write_buffer(&rope_u, 0, bytemuck::cast_slice(&[nh as u32, nkv as u32, hd as u32, rd as u32, position as u32, flags(q_norm.is_some(), k_norm.is_some()) | gate_flag, eps.to_bits(), 0]));
                 // Gated wq emits 2·nh·hd (q||gate interleaved per head); the rope
                 // kernel splits it, roping q and passing gate through to `gout`.
                 let qrows = nh * hd * (1 + *output_gate as usize);
                 group_mats(&mut enc, &[(wq, &n1, &qraw, qrows, hidden), (wk, &n1, &kb, nkv * hd, hidden), (wv, &n1, &vb, nkv * hd, hidden)]);
                 if let Some((bq, bk, bv)) = bias {
                     let (bqb, bkb, bvb) = (stor(bytemuck::cast_slice(bq)), stor(bytemuck::cast_slice(bk)), stor(bytemuck::cast_slice(bv)));
-                    let axq = unif(&[1.0f32.to_bits(), (nh * hd) as u32, 0, 0]);
-                    let axkv = unif(&[1.0f32.to_bits(), (nkv * hd) as u32, 0, 0]);
+                    let axq = uniform_u32x4(c, [1.0f32.to_bits(), (nh * hd) as u32, 0, 0]);
+                    let axkv = uniform_u32x4(c, [1.0f32.to_bits(), (nkv * hd) as u32, 0, 0]);
                     go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&bqb, &qraw, &axq]), ((nh * hd) as u32).div_ceil(256));
                     go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&bkb, &kb, &axkv]), ((nkv * hd) as u32).div_ceil(256));
                     go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&bvb, &vb, &axkv]), ((nkv * hd) as u32).div_ceil(256));
                 }
-                go(&mut enc, &c.attn_rope, &bg(&c.layout_attn_rope, &[&qraw, &kb, &qout, &gout, &qnw, &knw, &invf_b, &rope_u]), (nh + nkv) as u32);
-                go(&mut enc, &c.kv_append, &bg(&c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]), ((nkv * hd) as u32).div_ceil(256));
+                // rope + kv_append are independent (both read kb, neither
+                // writes it) — share ONE compute pass to avoid the inter-pass
+                // pipeline flush (~78 μs on NVIDIA Vulkan).
+                {
+                    let bg_rope = bg(&c.layout_attn_rope, &[&qraw, &kb, &qout, &gout, &qnw, &knw, &invf_b, &rope_u]);
+                    let bg_kv = bg(&c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]);
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+                    pass.set_pipeline(&c.attn_rope);
+                    pass.set_bind_group(0, &bg_rope, &[]);
+                    pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
+                    pass.set_pipeline(&c.kv_append);
+                    pass.set_bind_group(0, &bg_kv, &[]);
+                    pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
+                }
                 go(&mut enc, &c.gqa_attend, &bg(&c.layout_attend, &[&qout, kbuf, vbuf, &attn, &at_u]), nh as u32);
                 // attn_out *= sigmoid(gate) before the O projection.
                 if *output_gate {
-                    let gm_u = unif(&[(nh * hd) as u32, 0, 0, 0]);
+                    let gm_u = uniform_u32x4(c, [(nh * hd) as u32, 0, 0, 0]);
                     go(&mut enc, &c.gate_mul, &bg(&c.layout_gate_mul, &[&gout, &attn, &gm_u]), ((nh * hd) as u32).div_ceil(256));
                 }
                 emat(&mut enc, wo, &attn, &ob, hidden, nh * hd);
@@ -2652,7 +2845,7 @@ pub fn forward_token_graph(
                 let dtb = stor(bytemuck::cast_slice(dt_bias));
                 let gnorm = stor(bytemuck::cast_slice(norm));
                 group_mats(&mut enc, &[(qkv, &n1, &qkv_b, *cdim, hidden), (z, &n1, &z_b, nv * dv, hidden), (a, &n1, &a_b, *nv, hidden), (b, &n1, &b_b, *nv, hidden)]);
-                let gc_p = unif(&[*cdim as u32, *kk as u32, 0, 0]);
+                let gc_p = uniform_u32x4(c, [*cdim as u32, *kk as u32, 0, 0]);
                 go(&mut enc, &c.gdn_conv, &bg(&c.layout_gdn_conv, &[&qkv_b, &taps, ring, &cq_b, &gc_p]), (*cdim as u32).div_ceil(256));
                 let gd_p = unif(&[*nv as u32, *dk as u32, *dv as u32, (nk * dk) as u32, (nv / nk) as u32, *cdim as u32, eps.to_bits(), 0]);
                 go(&mut enc, &c.gdn_step, &bg(&c.layout_gdn, &[&cq_b, &z_b, &a_b, &b_b, &alog, &dtb, &gnorm, s, &gdo_b, &gd_p]), *nv as u32);
@@ -2662,14 +2855,44 @@ pub fn forward_token_graph(
         }
         // token-mix residual + FFN-norm fused: h += ob, n1 = rms(h, post_norm)
         go(&mut enc, &c.add_rmsnorm, &bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &pnw, &n1, &rms_u]), 1);
-        // SiLU FFN
-        group_mats(&mut enc, &[(&lw.gate, &n1, &gbuf, inter, hidden), (&lw.up, &n1, &ubuf, inter, hidden)]);
-        go(&mut enc, &c.silu, &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]), (inter as u32).div_ceil(256));
+        // SiLU FFN: gate+up matvecs + silu fused in ONE compute pass
+        // (dispatches within a pass are serialized — silu safely reads gate/up output).
+        {
+            let pg = prep(&lw.gate, &n1, &gbuf, inter, hidden);
+            let pu = prep(&lw.up, &n1, &ubuf, inter, hidden);
+            if let (Some((pgp, bg_g, wg)), Some((pup, bg_u, wu))) = (pg, pu) {
+                let bg_silu = bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]);
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+                pass.set_pipeline(pgp);
+                pass.set_bind_group(0, &bg_g, &[]);
+                pass.dispatch_workgroups(wg, 1, 1);
+                pass.set_pipeline(pup);
+                pass.set_bind_group(0, &bg_u, &[]);
+                pass.dispatch_workgroups(wu, 1, 1);
+                pass.set_pipeline(&c.silu);
+                pass.set_bind_group(0, &bg_silu, &[]);
+                pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
+            } else {
+                group_mats(&mut enc, &[(&lw.gate, &n1, &gbuf, inter, hidden), (&lw.up, &n1, &ubuf, inter, hidden)]);
+                go(&mut enc, &c.silu, &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]), (inter as u32).div_ceil(256));
+            }
+        }
         emat(&mut enc, &lw.down, &abuf, &ob, hidden, inter);
-        // FFN-residual + next layer's attn-norm fused (plain residual on the last)
+        // FFN-residual + next layer's attn-norm fused (plain residual on the last).
+        // At loop boundaries (Looped Transformer), insert final_norm between the
+        // residual and the next iteration's input norm.
         if li + 1 < layers.len() {
-            let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
-            go(&mut enc, &c.add_rmsnorm, &bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &inw_next, &n1, &rms_u]), 1);
+            if loop_norm_at.contains(&li) {
+                // h += ob; n1 = rms(h, final_norm); copy n1→h; n1 = rms(h, next_input_norm)
+                let fnw = stor(bytemuck::cast_slice(final_norm));
+                let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
+                go(&mut enc, &c.add_rmsnorm, &bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &fnw, &n1, &rms_u]), 1);
+                enc.copy_buffer_to_buffer(&n1, 0, &h_buf, 0, (hidden * 4) as u64);
+                go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &inw_next, &n1, &rms_u]), 1);
+            } else {
+                let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
+                go(&mut enc, &c.add_rmsnorm, &bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &inw_next, &n1, &rms_u]), 1);
+            }
         } else {
             go(&mut enc, &c.axpy, &bg(&c.layout_axpy, &[&ob, &h_buf, &ax_u]), (hidden as u32).div_ceil(256));
         }
@@ -2683,20 +2906,18 @@ pub fn forward_token_graph(
         let fnw = stor(bytemuck::cast_slice(final_norm));
         go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &fnw, &n1, &rms_u]), 1);
         let lsize = (lrows * 4) as u64;
-        let lbuf = c.device.create_buffer(&wgpu::BufferDescriptor { label: Some("g-logits"), size: lsize, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let lbuf = GraphScratch::ensure(&c.device, &mut gs.logits, lsize, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, "g-logits");
         emat(&mut enc, &lm, &n1, &lbuf, lrows, hidden);
         logits.resize(lrows, 0.0);
-        let mut sc = c.scratch.lock().unwrap();
-        let stage = Scratch::ensure(&c.device, &mut sc.stage, lsize, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "g-stage");
+        let stage = GraphScratch::ensure(&c.device, &mut gs.stage, lsize, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "g-stage");
         let r = readback(c, enc, &lbuf, &stage, lsize, &mut logits[..lrows]);
-        drop(sc);
+        drop(gs);
         r
     } else {
         let size = (hidden * 4) as u64;
-        let mut sc = c.scratch.lock().unwrap();
-        let stage = Scratch::ensure(&c.device, &mut sc.stage, size, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "g-stage");
+        let stage = GraphScratch::ensure(&c.device, &mut gs.stage, size, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "g-stage");
         let r = readback(c, enc, &h_buf, &stage, size, &mut h[..hidden]);
-        drop(sc);
+        drop(gs);
         r
     };
     if ok {
@@ -3896,9 +4117,10 @@ fn encode_q1t_like(
 ) {
     let gpr = cols / 32;
     let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+    let layout = pipeline.get_bind_group_layout(0);
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
-        layout: &c.layout_q1,
+        layout: &layout,
         entries: &[bind_buf(0, weight), bind_buf(1, xs), bind_buf(2, y), bind_buf(3, &p_buf)],
     });
     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3906,6 +4128,33 @@ fn encode_q1t_like(
         timestamp_writes: None,
     });
     pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+}
+
+/// Fused SiLU(gate)·up → Q4Block down-proj: one dispatch instead of silu + matvec.
+fn encode_silu_down(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    gate: &wgpu::Buffer,
+    up: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+) {
+    let gpr = cols / 32;
+    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.layout_silu_down,
+        entries: &[bind_buf(0, weight), bind_buf(1, gate), bind_buf(2, up), bind_buf(3, y), bind_buf(4, &p_buf)],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.silu_down);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
 }

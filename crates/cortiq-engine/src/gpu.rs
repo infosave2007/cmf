@@ -596,6 +596,8 @@ pub struct GraphLayer<'a> {
 
 /// Whole-token decode graph on wgpu: the entire layer stack in ONE submit,
 /// hidden resident, one readback. Updates `h` in place. false = refusal.
+/// `loop_norm_at`: virtual layer indices after which `final_norm` is applied
+/// (Looped Transformer mid-stack norm). Empty for standard models.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_token_graph(
     model: &Arc<CmfModel>,
@@ -616,16 +618,17 @@ pub fn forward_token_graph(
     lm_head: Option<(&GraphW, usize)>,
     final_norm: &[f32],
     logits: &mut Vec<f32>,
+    loop_norm_at: &[usize],
 ) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::forward_token_graph(
             model, kv_id, layers, invf, h, nh, nkv, hd, rd, hidden, inter, position, cap, gemma,
-            eps, lm_head, final_norm, logits,
+            eps, lm_head, final_norm, logits, loop_norm_at,
         ),
         #[allow(unused_variables)]
         _ => {
-            let _ = (lm_head, final_norm, logits);
+            let _ = (lm_head, final_norm, logits, loop_norm_at);
             false
         }
     }
