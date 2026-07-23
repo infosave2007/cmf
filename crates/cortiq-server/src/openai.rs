@@ -253,10 +253,14 @@ async fn chat_completions(
         } else {
             state.runtime.active_selection().await
         };
-    let sampler_config = match request_sampler(req.temperature, req.top_p, req.seed) {
+    let mut sampler_config = match request_sampler(req.temperature, req.top_p, req.seed) {
         Ok(config) => config,
         Err(response) => return response,
     };
+    if req.thinking() == Some(false) {
+        let think_tokens = state.tokenizer.encode("<think>");
+        sampler_config.suppress_tokens.extend(think_tokens);
+    }
 
     // Chat template → prompt ids (uses real special tokens).
     let prompt_ids = {
@@ -321,9 +325,33 @@ async fn chat_completions(
             let tx_tokens = tx.clone();
             let id2 = id.clone();
             let model2 = model.clone();
+            let mut filter_buf = String::new();
+            let mut filter_passthrough = req.thinking() != Some(false);
+
             let callback: cortiq_engine::TokenCallback = Box::new(move |token: &str| {
-                let chunk = streaming::token_chunk(&id2, &model2, token, created);
-                tx_tokens.blocking_send(chunk).is_ok()
+                if filter_passthrough {
+                    let chunk = streaming::token_chunk(&id2, &model2, token, created);
+                    return tx_tokens.blocking_send(chunk).is_ok();
+                }
+                filter_buf.push_str(token);
+                if let Some(pos) = filter_buf.find("</think>") {
+                    let tail = filter_buf[pos + "</think>".len()..].to_string();
+                    filter_buf.clear();
+                    filter_passthrough = true;
+                    let tail_trimmed = tail.trim_start_matches('\n');
+                    if !tail_trimmed.is_empty() {
+                        let chunk = streaming::token_chunk(&id2, &model2, tail_trimmed, created);
+                        return tx_tokens.blocking_send(chunk).is_ok();
+                    }
+                    return true;
+                }
+                if filter_buf.len() > 100 && !filter_buf.contains("<think>") {
+                    let b = std::mem::take(&mut filter_buf);
+                    filter_passthrough = true;
+                    let chunk = streaming::token_chunk(&id2, &model2, &b, created);
+                    return tx_tokens.blocking_send(chunk).is_ok();
+                }
+                true
             });
 
             let outcome = run_generation(
@@ -392,6 +420,12 @@ async fn chat_completions(
             tokens_per_second: result.tokens_generated as f64 / (elapsed_ms / 1000.0).max(1e-9),
         });
 
+        let content = if req.thinking() == Some(false) {
+            strip_think_block(&result.text)
+        } else {
+            result.text.clone()
+        };
+
         Json(ChatCompletionsResponse {
             id: request_id,
             object: "chat.completion".to_string(),
@@ -401,7 +435,7 @@ async fn chat_completions(
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    content: result.text.clone(),
+                    content,
                 },
                 finish_reason: result.finish_reason.clone(),
             }],
@@ -414,6 +448,16 @@ async fn chat_completions(
         })
         .into_response()
     }
+}
+
+fn strip_think_block(s: &str) -> String {
+    let mut rest = s;
+    if let Some(pos) = rest.find("</think>") {
+        rest = &rest[pos + "</think>".len()..];
+    } else if rest.starts_with("<think>") {
+        return String::new();
+    }
+    rest.trim_start_matches('\n').to_string()
 }
 
 // ─── Completions (legacy) ────────────────────────────────

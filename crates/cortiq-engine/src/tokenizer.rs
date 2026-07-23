@@ -654,7 +654,7 @@ impl Tokenizer {
                 }
             }
         }
-        self.with_bos(self.chatml_fallback(messages))
+        self.with_bos(self.chatml_fallback_opts(messages, enable_thinking))
     }
 
     /// Prepend BOS when the tokenizer declares it (llama family).
@@ -671,8 +671,17 @@ impl Tokenizer {
 
     /// Render the carried template to text (parity-testable surface).
     pub fn render_chat(&self, messages: &[(String, String)]) -> Option<String> {
+        self.render_chat_opts(messages, None)
+    }
+
+    /// Render the carried template to text with explicit thinking mode.
+    pub fn render_chat_opts(
+        &self,
+        messages: &[(String, String)],
+        enable_thinking: Option<bool>,
+    ) -> Option<String> {
         let tpl = self.chat_template.as_ref()?;
-        match self.render_template(tpl, messages, None) {
+        match self.render_template(tpl, messages, enable_thinking) {
             Ok(t) => Some(t),
             Err(e) => {
                 tracing::error!("chat template render: {e:#}");
@@ -736,6 +745,15 @@ impl Tokenizer {
 
     /// Hardcoded Qwen ChatML (pre-§6.1 files).
     fn chatml_fallback(&self, messages: &[(String, String)]) -> Vec<u32> {
+        self.chatml_fallback_opts(messages, None)
+    }
+
+    /// Hardcoded Qwen ChatML (pre-§6.1 files) with optional thinking suppression.
+    fn chatml_fallback_opts(
+        &self,
+        messages: &[(String, String)],
+        enable_thinking: Option<bool>,
+    ) -> Vec<u32> {
         let mut tokens = Vec::new();
 
         for (role, content) in messages {
@@ -755,6 +773,9 @@ impl Tokenizer {
             tokens.push(start_id);
         }
         tokens.extend(self.encode("assistant\n"));
+        if enable_thinking == Some(false) {
+            tokens.extend(self.encode("<think>\n\n</think>\n\n"));
+        }
 
         tokens
     }

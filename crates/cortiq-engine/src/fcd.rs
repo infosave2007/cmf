@@ -1852,6 +1852,7 @@ pub fn run_polish(
                 repetition_penalty: 1.0,
                 min_p: 0.0,
                 seed: Some(0),
+                suppress_tokens: Vec::new(),
             };
             let mut pipe = Pipeline::from_model(model, greedy)
                 .map_err(|e| format!("gen-gate pipeline: {e}"))?;

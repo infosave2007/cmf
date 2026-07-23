@@ -78,6 +78,9 @@ pub struct SamplerConfig {
     /// Fixed seed for reproducible generation (None = entropy).
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Token IDs to suppress (force logit to -inf).
+    #[serde(default)]
+    pub suppress_tokens: Vec<u32>,
 }
 
 impl Default for SamplerConfig {
@@ -89,6 +92,7 @@ impl Default for SamplerConfig {
             repetition_penalty: 1.1,
             min_p: 0.05,
             seed: None,
+            suppress_tokens: Vec::new(),
         }
     }
 }
@@ -113,13 +117,19 @@ pub fn sample_with_scratch(
     rng: &mut SplitMix64,
     scratch: &mut SamplerScratch,
 ) -> u32 {
-    // Greedy with no penalty needs no working copy: argmax straight
-    // over the borrowed logits (the full-vocab clone was ~600 KB per
-    // token on a 151K vocab — pure overhead in the decode hot loop).
-    if config.temperature < 1e-6 && config.repetition_penalty == 1.0 {
+    if config.temperature < 1e-6
+        && config.repetition_penalty == 1.0
+        && config.suppress_tokens.is_empty()
+    {
         return argmax(logits);
     }
     let mut probs = logits.to_vec();
+
+    for &tok in &config.suppress_tokens {
+        if (tok as usize) < probs.len() {
+            probs[tok as usize] = f32::NEG_INFINITY;
+        }
+    }
 
     if config.repetition_penalty != 1.0 {
         apply_repetition_penalty(&mut probs, past_tokens, config.repetition_penalty, scratch);

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.17] — 2026-07-23
+
+### Added
+- **Sampler-Level Token Suppression (`suppress_tokens`)**: Added `suppress_tokens: Vec<u32>` field to `SamplerConfig`. Suppressed tokens have their logits set to `-infinity` prior to sampling, preventing models from generating banned initial tokens (e.g. `<think>`) on CPU/GPU.
+
+### Fixed
+- **Reasoning / Thinking Suppression**:
+  - Implemented token logit suppression for reasoning tokens (`<think>`) in `cortiq-server` when `enable_thinking=false` or `think_budget=0`, forcing immediate direct answer generation in 0.1s without wasting completion tokens on thinking.
+  - Added stream and non-stream `<think>...</think>` block filtering fallback in `cortiq-server`.
+  - Added `chatml_fallback_opts` thinking suppression support to `Tokenizer` when no custom Jinja template is embedded.
+
 ## [0.5.16] — 2026-07-23
 
 ### Fixed

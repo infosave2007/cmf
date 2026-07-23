@@ -1269,6 +1269,7 @@ fn fcd_gen_check(
         repetition_penalty: 1.0,
         min_p: 0.0,
         seed: Some(0),
+        ..Default::default()
     };
     let mut pipeline = Pipeline::from_model(model, greedy)?;
     pipeline.set_o1(Some(o1.clone()));
