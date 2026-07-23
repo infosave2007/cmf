@@ -759,6 +759,9 @@ impl Pipeline {
             .unwrap_or(8192);
         let max_seq_len = arch.max_position_embeddings.min(cap);
 
+        // Looped Transformer: total virtual layers = physical × num_loops.
+        let total_layers = arch.num_layers * arch.num_loops;
+
         let mut pipeline = Pipeline::new(
             tokenizer,
             PipelineWeights {
@@ -772,7 +775,9 @@ impl Pipeline {
             arch.num_attention_heads,
             arch.num_kv_heads,
             arch.head_dim,
-            arch.num_layers,
+            total_layers,
+            arch.num_layers, // physical layers in weights
+            arch.loop_final_norm,
             arch.vocab_size,
             arch.rms_norm_eps,
             arch.rope_theta as f32,

@@ -704,17 +704,31 @@ impl Tokenizer {
             .collect();
         // `enable_thinking` stays UNDEFINED when None — reasoning templates
         // check `enable_thinking is defined` and fall back to their default.
-        match enable_thinking {
+        let rendered = match enable_thinking {
             Some(v) => env.get_template("chat")?.render(minijinja::context! {
                 messages => msgs,
                 add_generation_prompt => true,
                 enable_thinking => v,
-            }),
+            })?,
             None => env.get_template("chat")?.render(minijinja::context! {
                 messages => msgs,
                 add_generation_prompt => true,
-            }),
+            })?,
+        };
+        // Templates that ignore `enable_thinking` (e.g. Nanbeige/Qwen-legacy)
+        // always emit a generation prompt. When thinking is explicitly disabled,
+        // prefill an empty </think> block so the model answers directly.
+        if enable_thinking == Some(false) && !rendered.contains("</think>") {
+            if let Some(pos) = rendered.rfind("assistant\n") {
+                let insert_at = pos + "assistant\n".len();
+                let mut out = String::with_capacity(rendered.len() + 16);
+                out.push_str(&rendered[..insert_at]);
+                out.push_str("</think>\n\n");
+                out.push_str(&rendered[insert_at..]);
+                return Ok(out);
+            }
         }
+        Ok(rendered)
     }
 
     /// Hardcoded Qwen ChatML (pre-§6.1 files).

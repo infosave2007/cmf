@@ -978,6 +978,10 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         global_partial_rotary_factor: g4_global_prf,
         final_logit_softcapping: if is_gemma4 { tc.get("final_logit_softcapping").and_then(|v| v.as_f64()) } else { None },
         attn_v_norm: is_gemma4,
+        // Looped Transformer (Nanbeige 4.2): re-apply the layer stack num_loops times.
+        num_loops: cfg_usize(tc, "num_loops").unwrap_or(1),
+        // skip_loop_final_norm=false means loop_final_norm=true (apply norm after each loop).
+        loop_final_norm: !tc.get("skip_loop_final_norm").and_then(|v| v.as_bool()).unwrap_or(true),
     })
 }
 

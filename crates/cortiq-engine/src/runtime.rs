@@ -211,7 +211,7 @@ impl CortiqRuntime {
             active_sparsity,
             active_params: self.estimate_active_params(&state),
             active_layers,
-            total_layers: self.model.arch().num_layers,
+            total_layers: self.model.arch().num_layers * self.model.arch().num_loops,
             performance: metrics,
             layer_stats: state.layer_stats.clone(),
         }

@@ -350,6 +350,14 @@ pub struct ModelArch {
     /// Value head dim in linear attention
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_value_head_dim: Option<usize>,
+    /// Looped Transformer: number of times the layer stack is re-applied
+    /// (Nanbeige 4.2: 22 physical layers × 2 loops = 44 virtual layers).
+    /// Default 1 = standard non-looped architecture.
+    #[serde(default = "default_one_usize", skip_serializing_if = "is_one_usize")]
+    pub num_loops: usize,
+    /// Apply final normalization after each loop iteration (Nanbeige 4.2).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loop_final_norm: bool,
 }
 
 fn default_rope_theta() -> f64 {
@@ -376,6 +384,15 @@ fn is_one(v: &f32) -> bool {
 
 fn default_prf() -> f32 {
     1.0
+}
+
+fn default_one_usize() -> usize {
+    1
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_one_usize(v: &usize) -> bool {
+    *v == 1
 }
 
 /// Linear-core selector: the runtime picks the linear-attention

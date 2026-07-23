@@ -58,7 +58,12 @@ pub struct Pipeline {
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
+    /// Total virtual layers (num_layers × num_loops for looped models).
     pub num_layers: usize,
+    /// Physical layers in weights.layers (≤ num_layers for looped models).
+    pub physical_layers: usize,
+    /// Looped Transformer: apply final norm after each loop iteration.
+    pub loop_final_norm: bool,
     pub vocab_size: usize,
     pub rms_eps: f64,
     pub rope_base: f32,
@@ -419,6 +424,21 @@ fn prefill_chunk() -> usize {
 pub type TokenCallback = Box<dyn FnMut(&str) -> bool + Send>;
 
 impl Pipeline {
+    /// Map a virtual layer index to its physical weight index.
+    /// Looped Transformer (Nanbeige 4.2): 22 physical layers × 2 loops = 44 virtual;
+    /// virtual layer 23 maps back to physical layer 1 (23 % 22 = 1).
+    #[inline]
+    pub fn phys_layer(&self, virtual_idx: usize) -> usize {
+        virtual_idx % self.physical_layers
+    }
+
+    /// True when `virtual_idx` is the last layer of a loop iteration
+    /// (used for loop_final_norm insertion).
+    #[inline]
+    pub fn is_loop_end(&self, virtual_idx: usize) -> bool {
+        self.loop_final_norm && (virtual_idx + 1) % self.physical_layers == 0
+    }
+
     /// Build a pipeline from parts (used by the loader and tests).
     #[allow(clippy::too_many_arguments)]
 
@@ -495,11 +515,13 @@ impl Pipeline {
         // The graph encodes SiLU FFN, 1/√hd attention scores and
         // full-context attend with no branch norms — Gemma-style archs
         // (sliding window, scale override, sandwich norms, GeLU) fall
-        // back to the CPU path.
+        // back to the CPU path. Looped Transformer (Nanbeige 4.2) needs
+        // a mid-stack final norm the graph cannot express.
         if self.swa.is_some()
             || self.global_attn.is_some()
             || self.attention_heads_per_layer.is_some()
             || self.attn_v_norm
+            || self.loop_final_norm
             || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
             || self.weights.layers.iter().any(|lw| {
                 lw.attn_out_norm.is_some()
@@ -553,7 +575,7 @@ impl Pipeline {
         let mut model_ref: Option<std::sync::Arc<cortiq_core::CmfModel>> = None;
         let mut scan = start;
         while scan < limit {
-            let lw = &self.weights.layers[scan];
+            let lw = &self.weights.layers[self.phys_layer(scan)];
             let FfnKind::Dense(d) = &lw.ffn else { break };
             let (Some(g), Some(u), Some(dn)) = (
                 d.gate_proj.q1_parts(),
@@ -916,6 +938,8 @@ impl Pipeline {
         num_kv_heads: usize,
         head_dim: usize,
         num_layers: usize,
+        physical_layers: usize,
+        loop_final_norm: bool,
         vocab_size: usize,
         rms_eps: f64,
         rope_base: f32,
@@ -943,6 +967,8 @@ impl Pipeline {
             num_kv_heads,
             head_dim,
             num_layers,
+            physical_layers,
+            loop_final_norm,
             vocab_size,
             rms_eps,
             rope_base,
@@ -1005,7 +1031,7 @@ impl Pipeline {
             Some(c) => {
                 let mut flags = c.layer_flags(self.num_layers);
                 for (li, f) in flags.iter_mut().enumerate() {
-                    if *f && !matches!(self.weights.layers[li].attn, AttnKind::Full { .. }) {
+                    if *f && !matches!(self.weights.layers[self.phys_layer(li)].attn, AttnKind::Full { .. }) {
                         *f = false;
                     }
                 }
@@ -1669,7 +1695,7 @@ impl Pipeline {
         let pool = self.pool.clone();
 
         for li in 0..self.num_layers {
-            let lw = &self.weights.layers[li];
+            let lw = &self.weights.layers[self.phys_layer(li)];
             // Norms into pipeline scratch (4 allocs/layer on the MTP
             // decode hot path before this).
             inference::rms_norm_into(
@@ -1782,7 +1808,7 @@ impl Pipeline {
                     )
                 }
             };
-            let (a1, a2) = match &self.weights.layers[li].attn_out_norm {
+            let (a1, a2) = match &self.weights.layers[self.phys_layer(li)].attn_out_norm {
                 Some(w) => (
                     inference::rms_norm(&a1, w, self.rms_eps, self.norm_style),
                     inference::rms_norm(&a2, w, self.rms_eps, self.norm_style),
@@ -1797,7 +1823,7 @@ impl Pipeline {
             attention::recycle_buf(&mut a1);
             attention::recycle_buf(&mut a2);
 
-            let lw = &self.weights.layers[li];
+            let lw = &self.weights.layers[self.phys_layer(li)];
             inference::rms_norm_into(
                 &h1,
                 &lw.post_norm,
@@ -1814,7 +1840,7 @@ impl Pipeline {
             );
             let (f1, f2) =
                 ffn_forward_pair(&lw.ffn, &self.ws.p1, &self.ws.p2, self.pool.as_deref());
-            let (f1, f2) = match &self.weights.layers[li].ffn_out_norm {
+            let (f1, f2) = match &self.weights.layers[self.phys_layer(li)].ffn_out_norm {
                 Some(w) => (
                     inference::rms_norm(&f1, w, self.rms_eps, self.norm_style),
                     inference::rms_norm(&f2, w, self.rms_eps, self.norm_style),
@@ -1828,11 +1854,16 @@ impl Pipeline {
             let (mut f1, mut f2) = (f1, f2);
             attention::recycle_buf(&mut f1);
             attention::recycle_buf(&mut f2);
-            if let Some(sc) = self.weights.layers[li].layer_scale {
+            if let Some(sc) = self.weights.layers[self.phys_layer(li)].layer_scale {
                 for i in 0..self.hidden_size {
                     h1[i] *= sc;
                     h2[i] *= sc;
                 }
+            }
+            // Looped Transformer: apply final norm at the end of each loop iteration.
+            if self.is_loop_end(li) && li + 1 < self.num_layers {
+                h1 = inference::rms_norm(&h1, &self.weights.final_norm, self.rms_eps, self.norm_style);
+                h2 = inference::rms_norm(&h2, &self.weights.final_norm, self.rms_eps, self.norm_style);
             }
         }
         (h1, h2)
@@ -2297,7 +2328,7 @@ impl Pipeline {
                 fill_h(&mut h, self);
                 h_ready = true;
             }
-            let lw = &self.weights.layers[li];
+            let lw = &self.weights.layers[self.phys_layer(li)];
             // ── attention ──
             match &lw.attn {
                 AttnKind::LinearGdn(w) => {
@@ -2453,7 +2484,7 @@ impl Pipeline {
             }
 
             // ── FFN batched ──
-            let lw = &self.weights.layers[li];
+            let lw = &self.weights.layers[self.phys_layer(li)];
             let mut post = vec![0.0f32; b * hs];
             for bi in 0..b {
                 let r =
@@ -2482,6 +2513,18 @@ impl Pipeline {
             if let Some(sc) = lw.layer_scale {
                 for v in h.iter_mut() {
                     *v *= sc;
+                }
+            }
+            // Looped Transformer: apply final norm at the end of each loop iteration.
+            if self.is_loop_end(li) && li + 1 < self.num_layers {
+                for bi in 0..b {
+                    let normed = inference::rms_norm(
+                        &h[bi * hs..(bi + 1) * hs],
+                        &self.weights.final_norm,
+                        eps,
+                        norm_style,
+                    );
+                    h[bi * hs..(bi + 1) * hs].copy_from_slice(&normed);
                 }
             }
             if std::env::var("CMF_TRACE_H").is_ok() {
@@ -2536,6 +2579,7 @@ impl Pipeline {
             || self.swa.is_some()
             || self.global_attn.is_some()
             || self.attn_v_norm
+            || self.loop_final_norm
             || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
         {
             return li0;
@@ -2554,7 +2598,7 @@ impl Pipeline {
         let mut layers: Vec<crate::gpu_metal::ChunkLayer> = Vec::new();
         let mut stored_at: Vec<usize> = Vec::new();
         for li in li0..self.num_layers {
-            let lw = &self.weights.layers[li];
+            let lw = &self.weights.layers[self.phys_layer(li)];
             if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
                 break;
             }
@@ -2774,6 +2818,10 @@ impl Pipeline {
         if self.o1_active() {
             return None;
         }
+        // Looped Transformer needs a mid-stack final norm the graph cannot express.
+        if self.loop_final_norm {
+            return None;
+        }
         let nh = self.num_heads;
         let (nkv, hd, rd) = self.layer_geom(0);
         let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
@@ -2798,7 +2846,7 @@ impl Pipeline {
             })
         }
         for li in 0..self.num_layers {
-            let lw = &self.weights.layers[li];
+            let lw = &self.weights.layers[self.phys_layer(li)];
             if dbg {
                 let ak = match &lw.attn {
                     AttnKind::Full {
@@ -2966,7 +3014,7 @@ impl Pipeline {
             let mut layers = Vec::with_capacity(self.num_layers);
             let mut model = None;
             for li in 0..self.num_layers {
-                let lw = &self.weights.layers[li];
+                let lw = &self.weights.layers[self.phys_layer(li)];
                 let (gate, up, down) = match &lw.ffn {
                     FfnKind::Dense(d) => (&d.gate_proj, &d.up_proj, &d.down_proj),
                     _ => return None,
@@ -3139,7 +3187,7 @@ impl Pipeline {
                 }
             }
 
-            let lw = &self.weights.layers[li];
+            let lw = &self.weights.layers[self.phys_layer(li)];
             // Norm into the pipeline scratch — the returning rms_norm
             // allocated twice per layer per token (roadmap §3 P0).
             inference::rms_norm_into(
@@ -3368,11 +3416,11 @@ impl Pipeline {
             };
             // Gemma sandwich norm: normalize the attention branch before
             // it joins the residual stream.
-            let attn_out = match &self.weights.layers[li].attn_out_norm {
+            let attn_out = match &self.weights.layers[self.phys_layer(li)].attn_out_norm {
                 Some(w) => inference::rms_norm(&attn_out, w, self.rms_eps, self.norm_style),
                 None => attn_out,
             };
-            let lw = &self.weights.layers[li];
+            let lw = &self.weights.layers[self.phys_layer(li)];
             inference::add_rmsnorm_fused_into(
                 &mut h,
                 &attn_out,
@@ -3452,7 +3500,7 @@ impl Pipeline {
                 },
                 (false, _) => ffn_forward(&lw.ffn, &post_normed, self.pool.as_deref()),
             };
-            let ffn_out = match &self.weights.layers[li].ffn_out_norm {
+            let ffn_out = match &self.weights.layers[self.phys_layer(li)].ffn_out_norm {
                 Some(w) => inference::rms_norm(&ffn_out, w, self.rms_eps, self.norm_style),
                 None => ffn_out,
             };
@@ -3463,10 +3511,16 @@ impl Pipeline {
             attention::recycle_buf(&mut ffn_out);
 
             // Gemma-4: the layer output is scaled by a learned scalar.
-            if let Some(sc) = self.weights.layers[li].layer_scale {
+            if let Some(sc) = self.weights.layers[self.phys_layer(li)].layer_scale {
                 for v in h.iter_mut() {
                     *v *= sc;
                 }
+            }
+
+            // Looped Transformer: apply final norm at the end of each loop iteration.
+            // Nanbeige 4.2: after layer 21 (virtual), apply norm before looping back to layer 0.
+            if self.is_loop_end(li) && li + 1 < self.num_layers {
+                h = inference::rms_norm(&h, &self.weights.final_norm, self.rms_eps, self.norm_style);
             }
 
             // Dynamic routing φ capture (on-policy, fireball-style): the
@@ -3689,6 +3743,8 @@ pub fn create_test_pipeline(
         num_kv_heads,
         head_dim,
         num_layers,
+        num_layers, // physical_layers = num_layers (non-looped)
+        false,      // loop_final_norm
         vocab_size,
         1e-6,
         10_000.0,

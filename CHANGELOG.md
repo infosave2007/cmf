@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.11] — 2026-07-23
+
+### Fixed
+- **Looped Transformer prefill**: `loop_final_norm` was only applied in the decode
+  path (`forward_layers_upto`) but missing from `prefill_batch` and `forward_pair`
+  (MTP speculative). This corrupted the KV cache at loop boundaries during prompt
+  processing, producing garbage output for Nanbeige4.2-3B. Now all forward paths
+  apply the per-loop final norm correctly.
+- **GPU graph guards**: `q1_graph_gpu`, `chunk_run_gpu`, and `try_token_graph_wgpu`
+  now refuse looped models (`loop_final_norm=true`) — the flat layer graph cannot
+  express mid-stack norm insertion. Falls through to the correct CPU path.
+
+### Added
+- **`enable_thinking` fallback**: Templates that ignore `enable_thinking` (e.g.
+  Nanbeige/Qwen-legacy) get `</think>\n\n` injected after `assistant\n` when
+  thinking is explicitly disabled — the model answers directly without reasoning.
+
 ## [0.5.10] — 2026-07-22
 
 ### Fixed
