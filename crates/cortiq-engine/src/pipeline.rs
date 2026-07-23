@@ -3938,11 +3938,19 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
         let mut s = s.borrow_mut();
         let [g, u, ..] = &mut *s;
         g.resize(inter, 0.0);
-        u.resize(inter, 0.0);
-        // Multi-matrix job: gate+up under one pool dispatch.
-        QTensor::matvec_many([&d.gate_proj, &d.up_proj], x, [g, u], pool);
-        for i in 0..inter {
-            g[i] = d.act.apply(g[i]) * u[i];
+        // Fused gate+up+silu: one dispatch, no separate silu pass.
+        // Falls back to matvec_many + silu loop for unsupported dtypes.
+        if d.act == Act::Silu
+            && QTensor::matvec_silu_mul(&d.gate_proj, &d.up_proj, x, g, pool)
+        {
+            // g now holds silu(gate)·up directly.
+        } else {
+            u.resize(inter, 0.0);
+            // Multi-matrix job: gate+up under one pool dispatch.
+            QTensor::matvec_many([&d.gate_proj, &d.up_proj], x, [g, u], pool);
+            for i in 0..inter {
+                g[i] = d.act.apply(g[i]) * u[i];
+            }
         }
         // DTG-MA bake probe (Patent 2): accumulate this layer's
         // per-neuron activation mass while a probe pass is active.

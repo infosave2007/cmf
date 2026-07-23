@@ -1082,6 +1082,9 @@ impl QTensor {
         let uniform_q1 = ts
             .iter()
             .all(|t| matches!(t, Self::Mapped { dtype: TensorDtype::Q1, .. }));
+        let uniform_q1t = ts
+            .iter()
+            .all(|t| matches!(t, Self::Mapped { dtype: TensorDtype::Q1T, .. }));
         let Some(pool) = pool else {
             for (t, o) in ts.iter().zip(outs.iter_mut()) {
                 t.matvec(x, o, None);
@@ -1089,7 +1092,7 @@ impl QTensor {
             return;
         };
         if total_rows < 256
-            || !(uniform_q8 || uniform_f32 || uniform_q4 || uniform_vbit || uniform_q1)
+            || !(uniform_q8 || uniform_f32 || uniform_q4 || uniform_vbit || uniform_q1 || uniform_q1t)
         {
             for (t, o) in ts.iter().zip(outs.iter_mut()) {
                 t.matvec(x, o, Some(pool));
@@ -1118,6 +1121,48 @@ impl QTensor {
                     let (bytes, gpr, out) =
                         (ts[i].quant_bytes(), ts[i].cols() / GROUP_SIZE, outs_addr[i]);
                     move |s: usize, e: usize| q1_range_f32(bytes, gpr, x, out, s, e)
+                });
+                let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
+                    std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
+                pool.run_many(&parts);
+            }
+            return;
+        }
+
+        if uniform_q1t {
+            // Q1T batched: one shared activation split + overlay decode,
+            // all tensors' rows in ONE pool dispatch (saves N−1 dispatches
+            // and N−1 redundant split_act calls per layer).
+            let outs_addr: [SendMut; N] = std::array::from_fn(|i| SendMut(outs[i].as_mut_ptr()));
+            const TILE: usize = cortiq_core::quant::Q1T_TILE;
+            if a8w8_enabled() {
+                let act = split_act(x);
+                let act = &act;
+                let x_ref = x;
+                let closures: [_; N] = std::array::from_fn(|i| {
+                    let bytes = ts[i].quant_bytes();
+                    let (rows, cols) = (ts[i].rows(), ts[i].cols());
+                    let gpr = cols / GROUP_SIZE;
+                    let (rp_off, ent_off, has_ov) = q1t_overlay(bytes, rows * gpr * TILE, rows);
+                    let out = outs_addr[i];
+                    move |s: usize, e: usize| {
+                        q1t_range_a8w8(bytes, gpr, rp_off, ent_off, has_ov, act, x_ref, out, s, e)
+                    }
+                });
+                let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
+                    std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
+                pool.run_many(&parts);
+            } else {
+                let x_ref = x;
+                let closures: [_; N] = std::array::from_fn(|i| {
+                    let bytes = ts[i].quant_bytes();
+                    let (rows, cols) = (ts[i].rows(), ts[i].cols());
+                    let gpr = cols / GROUP_SIZE;
+                    let (rp_off, ent_off, has_ov) = q1t_overlay(bytes, rows * gpr * TILE, rows);
+                    let out = outs_addr[i];
+                    move |s: usize, e: usize| {
+                        q1t_range_f32_batch(bytes, gpr, rp_off, ent_off, has_ov, x_ref, out, s, e)
+                    }
                 });
                 let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
                     std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
@@ -1468,6 +1513,101 @@ impl QTensor {
         let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
             std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
         pool.run_many(&parts);
+    }
+
+    /// Fused gate+up matvec with SiLU·mul: for each row r, computes
+    /// `silu(gate·x) * (up·x)` and writes to `out[r]`. ONE pool dispatch,
+    /// no intermediate g/u buffers, no separate silu pass. Falls back
+    /// (returns false) for unsupported dtype combos.
+    pub fn matvec_silu_mul(
+        gate: &QTensor,
+        up: &QTensor,
+        x: &[f32],
+        out: &mut [f32],
+        pool: Option<&Pool>,
+    ) -> bool {
+        let inter = gate.rows();
+        debug_assert_eq!(up.rows(), inter);
+        debug_assert_eq!(out.len(), inter);
+        debug_assert_eq!(gate.cols(), up.cols());
+        if !a8w8_enabled() {
+            return false;
+        }
+        let act = split_act(x);
+        let act = &act;
+        let x_ref = x;
+        let out_addr = SendMut(out.as_mut_ptr());
+
+        match (gate, up) {
+            // Q4Block gate + Q4Block up (most common mobile q4 models)
+            (
+                Self::Mapped { dtype: TensorDtype::Q4Block, .. },
+                Self::Mapped { dtype: TensorDtype::Q4Block, .. },
+            ) => {
+                let (gp, gs) = q4_split(gate.quant_bytes(), gate.rows(), gate.cols());
+                let (up_p, up_s) = q4_split(up.quant_bytes(), up.rows(), up.cols());
+                let gpr = gate.cols() / GROUP_SIZE;
+                let cols = gate.cols();
+                let run = move |start: usize, end: usize| {
+                    for r in start..end {
+                        let mut gv = dot_q4_row_i8(gp, gs, r * gpr, gpr, &act.xq) * act.sx;
+                        let mut uv = dot_q4_row_i8(up_p, up_s, r * gpr, gpr, &act.xq) * act.sx;
+                        for &(j, xv) in &act.outliers {
+                            let flat = r * cols + j;
+                            let gb = gp[flat / 2];
+                            let gn = if flat & 1 == 0 { gb & 0x0F } else { gb >> 4 };
+                            let gsc = f16_to_f32(u16::from_le_bytes([
+                                gs[(flat / GROUP_SIZE) * 2],
+                                gs[(flat / GROUP_SIZE) * 2 + 1],
+                            ]));
+                            gv += ((gn as i32 - 8) as f32) * gsc * xv;
+                            let ub = up_p[flat / 2];
+                            let un = if flat & 1 == 0 { ub & 0x0F } else { ub >> 4 };
+                            let usc = f16_to_f32(u16::from_le_bytes([
+                                up_s[(flat / GROUP_SIZE) * 2],
+                                up_s[(flat / GROUP_SIZE) * 2 + 1],
+                            ]));
+                            uv += ((un as i32 - 8) as f32) * usc * xv;
+                        }
+                        let silu_g = gv / (1.0 + (-gv).exp());
+                        // SAFETY: disjoint row ranges per worker.
+                        unsafe { *out_addr.at(r) = silu_g * uv };
+                    }
+                };
+                dispatch_rows(pool, inter, &run);
+                true
+            }
+            // Q1T gate + Q1T up
+            (
+                Self::Mapped { dtype: TensorDtype::Q1T, .. },
+                Self::Mapped { dtype: TensorDtype::Q1T, .. },
+            ) => {
+                const TILE: usize = cortiq_core::quant::Q1T_TILE;
+                let g_bytes = gate.quant_bytes();
+                let u_bytes = up.quant_bytes();
+                let gpr = gate.cols() / GROUP_SIZE;
+                let (g_rp, g_ent, g_ov) = q1t_overlay(g_bytes, inter * gpr * TILE, inter);
+                let (u_rp, u_ent, u_ov) = q1t_overlay(u_bytes, inter * gpr * TILE, inter);
+                let run = move |start: usize, end: usize| {
+                    for r in start..end {
+                        let mut gv = q1t_dot_row_i8(g_bytes, r, gpr, &act.xq) * act.sx;
+                        let mut uv = q1t_dot_row_i8(u_bytes, r, gpr, &act.xq) * act.sx;
+                        for &(j, xv) in &act.outliers {
+                            gv += q1t_base_weight(g_bytes, r, gpr, j) * xv;
+                            uv += q1t_base_weight(u_bytes, r, gpr, j) * xv;
+                        }
+                        gv += q1t_row_outlier_correction(g_bytes, r, g_rp, g_ent, g_ov, x_ref);
+                        uv += q1t_row_outlier_correction(u_bytes, r, u_rp, u_ent, u_ov, x_ref);
+                        let silu_g = gv / (1.0 + (-gv).exp());
+                        // SAFETY: disjoint row ranges per worker.
+                        unsafe { *out_addr.at(r) = silu_g * uv };
+                    }
+                };
+                dispatch_rows(pool, inter, &run);
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -3706,6 +3846,73 @@ fn q1t_add_overlay(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut 
         }
     };
     dispatch_rows(pool, rows, &run);
+}
+
+/// Q1T row range via the A8W8 int8 path — shared activation split,
+/// per-row: base SDOT dot + outlier correction + overlay.
+#[allow(clippy::too_many_arguments)]
+fn q1t_range_a8w8(
+    bytes: &[u8],
+    gpr: usize,
+    rp_off: usize,
+    ent_off: usize,
+    has_ov: bool,
+    act: &SplitAct,
+    x: &[f32],
+    out: SendMut,
+    start: usize,
+    end: usize,
+) {
+    for r in start..end {
+        let mut acc = q1t_dot_row_i8(bytes, r, gpr, &act.xq) * act.sx;
+        for &(j, xv) in &act.outliers {
+            acc += q1t_base_weight(bytes, r, gpr, j) * xv;
+        }
+        acc += q1t_row_outlier_correction(bytes, r, rp_off, ent_off, has_ov, x);
+        // SAFETY: disjoint row ranges per worker.
+        unsafe { *out.at(r) = acc };
+    }
+}
+
+/// Q1T row range via the f32 path (no SDOT) — for matvec_many batched
+/// dispatch when a8w8 is unavailable.
+#[allow(clippy::too_many_arguments)]
+fn q1t_range_f32_batch(
+    bytes: &[u8],
+    gpr: usize,
+    rp_off: usize,
+    ent_off: usize,
+    has_ov: bool,
+    x: &[f32],
+    out: SendMut,
+    start: usize,
+    end: usize,
+) {
+    const TILE: usize = cortiq_core::quant::Q1T_TILE;
+    let mut sg = [0f32; GROUP_SIZE];
+    for r in start..end {
+        let mut acc = 0f32;
+        for g in 0..gpr {
+            let off = (r * gpr + g) * TILE;
+            let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+            let codes = &bytes[off + 2..off + TILE];
+            let xg = &x[g * GROUP_SIZE..g * GROUP_SIZE + GROUP_SIZE];
+            for bi in 0..6 {
+                sg[bi * 5..bi * 5 + 5].copy_from_slice(&SIGN5[codes[bi] as usize]);
+            }
+            let lut = &SIGN5[codes[6] as usize];
+            sg[30] = lut[0];
+            sg[31] = lut[1];
+            let mut gsum = 0f32;
+            for k in 0..GROUP_SIZE {
+                gsum += sg[k] * xg[k];
+            }
+            acc += s * gsum;
+        }
+        acc += q1t_row_outlier_correction(bytes, r, rp_off, ent_off, has_ov, x);
+        // SAFETY: disjoint row ranges per worker.
+        unsafe { *out.at(r) = acc };
+    }
 }
 
 /// Ternary (q1t) matvec — decode+dot straight from mmap, one group at a time:
