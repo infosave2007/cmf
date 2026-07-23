@@ -10,14 +10,14 @@
 //! storage scales as |backbone| + Σ|deltas|.
 
 use crate::convert::{
-    canon_name, hf_download, looks_like_repo, open_model, parse_quant, quantize_2d, to_f32, Quant,
+    Quant, canon_name, hf_download, looks_like_repo, open_model, parse_quant, quantize_2d, to_f32,
 };
+use anyhow::Context as _;
 use base64::Engine as _;
-use cortiq_core::quant::f32_to_f16;
 use cortiq_core::mask::{MaskPriority, TaskMask};
+use cortiq_core::quant::f32_to_f16;
 use cortiq_core::{CmfModel, SelectionDescriptor, SkillRecord, TensorDtype, TensorSpec};
 use cortiq_engine::{Pipeline, SamplerConfig};
-use anyhow::Context as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -80,13 +80,19 @@ pub fn parse_layers(spec: &str, num_layers: usize) -> anyhow::Result<Vec<usize>>
     }
     if let Some((a, b)) = spec.split_once('-') {
         let (a, b): (usize, usize) = (a.trim().parse()?, b.trim().parse()?);
-        anyhow::ensure!(a <= b && b < num_layers, "--layers {spec}: out of 0..{num_layers}");
+        anyhow::ensure!(
+            a <= b && b < num_layers,
+            "--layers {spec}: out of 0..{num_layers}"
+        );
         return Ok((a..=b).collect());
     }
     let mut v = Vec::new();
     for part in spec.split(',') {
         let i: usize = part.trim().parse()?;
-        anyhow::ensure!(i < num_layers, "--layers {spec}: layer {i} out of 0..{num_layers}");
+        anyhow::ensure!(
+            i < num_layers,
+            "--layers {spec}: layer {i} out of 0..{num_layers}"
+        );
         v.push(i);
     }
     anyhow::ensure!(!v.is_empty(), "--layers {spec}: empty");
@@ -216,7 +222,8 @@ pub fn run_skill_add(
     hf_token: Option<&str>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+        id.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
         "skill id must be [A-Za-z0-9_-]"
     );
     if let Some(k) = sparse {
@@ -290,12 +297,8 @@ pub fn run_skill_add(
                 if min_delta > 0.0 {
                     let n: usize = entry.shape.iter().product();
                     let mut base = vec![0f32; n];
-                    cortiq_core::quant::dequant_tensor(
-                        entry,
-                        model.tensor_bytes(want)?,
-                        &mut base,
-                    )
-                    .map_err(|e| anyhow::anyhow!("{want}: dequant: {e}"))?;
+                    cortiq_core::quant::dequant_tensor(entry, model.tensor_bytes(want)?, &mut base)
+                        .map_err(|e| anyhow::anyhow!("{want}: dequant: {e}"))?;
                     let mut dd = 0f64;
                     let mut bb = 0f64;
                     for (d, b) in vals.iter().zip(&base) {
@@ -342,8 +345,16 @@ pub fn run_skill_add(
     anyhow::ensure!(
         !new_tensors.is_empty(),
         "no matching donor tensors{} — wrong --from{}?",
-        if unchanged > 0 { " above --min-delta" } else { "" },
-        if unchanged > 0 { " or threshold too high" } else { "" }
+        if unchanged > 0 {
+            " above --min-delta"
+        } else {
+            ""
+        },
+        if unchanged > 0 {
+            " or threshold too high"
+        } else {
+            ""
+        }
     );
     if !skipped.is_empty() {
         for s in &skipped {
@@ -387,8 +398,12 @@ pub fn run_skill_add(
     let selection = match prompts_file {
         Some(pf) => {
             let text = std::fs::read_to_string(pf)?;
-            let prompts: Vec<String> =
-                text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+            let prompts: Vec<String> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect();
             anyhow::ensure!(!prompts.is_empty(), "--prompts {pf}: no prompts");
             let phi_layer = phi_layer.unwrap_or(num_layers * 2 / 3);
             let mut p = Pipeline::from_model(&model, SamplerConfig::default())
@@ -402,7 +417,9 @@ pub fn run_skill_add(
             Some(sel)
         }
         None => {
-            println!("selection: none (no --prompts) — `route`/`--route-dynamic` will skip this skill");
+            println!(
+                "selection: none (no --prompts) — `route`/`--route-dynamic` will skip this skill"
+            );
             None
         }
     };
@@ -440,7 +457,11 @@ pub fn run_skill_add(
         &tmp,
         &header,
         &tensors,
-        if catalog.masks.is_empty() { None } else { Some(&catalog) },
+        if catalog.masks.is_empty() {
+            None
+        } else {
+            Some(&catalog)
+        },
         model.vocab.as_deref(),
     )?;
 
@@ -551,7 +572,12 @@ pub fn run_skill_add(
         // The mask is an ordinary task in the catalog, linked to the
         // skill via input_mask_task — `run --skill` activates it.
         catalog.masks.retain(|m| m.name != id);
-        let task_id = catalog.masks.iter().map(|m| m.task_id + 1).max().unwrap_or(1);
+        let task_id = catalog
+            .masks
+            .iter()
+            .map(|m| m.task_id + 1)
+            .max()
+            .unwrap_or(1);
         catalog.masks.push(TaskMask {
             task_id,
             name: id.to_string(),
@@ -568,7 +594,13 @@ pub fn run_skill_add(
         if let Some(rec) = header.skills.iter_mut().find(|s| s.id == id) {
             rec.input_mask_task = Some(id.to_string());
         }
-        CmfModel::write(&tmp, &header, &tensors, Some(&catalog), model.vocab.as_deref())?;
+        CmfModel::write(
+            &tmp,
+            &header,
+            &tensors,
+            Some(&catalog),
+            model.vocab.as_deref(),
+        )?;
     }
 
     // ── claim-16 quality gate: overlaid vs backbone on held-out text,
@@ -580,10 +612,13 @@ pub fn run_skill_add(
         let probe = Arc::new(CmfModel::open(&tmp)?);
         let backbone = ppl_of(&probe, None, &text, quality_tokens)?;
         let overlaid = if sparse.is_some() {
-            let mask = probe.masks.get(id).context("sparse bake lost its mask")?.clone();
-            let mut p =
-                Pipeline::from_model_with_skill(&probe, SamplerConfig::default(), Some(id))
-                    .map_err(|e| anyhow::anyhow!(e))?;
+            let mask = probe
+                .masks
+                .get(id)
+                .context("sparse bake lost its mask")?
+                .clone();
+            let mut p = Pipeline::from_model_with_skill(&probe, SamplerConfig::default(), Some(id))
+                .map_err(|e| anyhow::anyhow!(e))?;
             let mut ids = p.tokenizer.with_bos(p.tokenizer.encode(&text));
             ids.truncate(quality_tokens);
             p.ppl_ids_masked(&ids, &mask)
@@ -610,7 +645,11 @@ pub fn run_skill_add(
             &tmp,
             &header2,
             &tensors,
-            if catalog.masks.is_empty() { None } else { Some(&catalog) },
+            if catalog.masks.is_empty() {
+                None
+            } else {
+                Some(&catalog)
+            },
             model.vocab.as_deref(),
         )?;
     }
@@ -642,7 +681,11 @@ pub fn run_skill_list(model_path: &str) -> anyhow::Result<()> {
             .filter(|t| t.name.starts_with(&format!("skill.{}.", s.id)))
             .map(|t| t.nbytes)
             .sum();
-        let routable = if s.selection.is_some() { "routable" } else { "no selection" };
+        let routable = if s.selection.is_some() {
+            "routable"
+        } else {
+            "no selection"
+        };
         println!(
             "  {:<10} {:<24} {} tensor(s), {:.1} MB, layers {:?}, {}",
             s.id,
@@ -704,7 +747,11 @@ fn corpus_chunks(
             break;
         }
     }
-    anyhow::ensure!(out.len() >= 24, "corpus too small: {} chunks of {chunk} tokens", out.len());
+    anyhow::ensure!(
+        out.len() >= 24,
+        "corpus too small: {} chunks of {chunk} tokens",
+        out.len()
+    );
     out.truncate(need.max(24));
     Ok(out)
 }
@@ -725,7 +772,10 @@ pub fn run_skill_bake(
     held: usize,
 ) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open(model_path)?);
-    let vocab_bytes = model.vocab.clone().context("model has no embedded tokenizer")?;
+    let vocab_bytes = model
+        .vocab
+        .clone()
+        .context("model has no embedded tokenizer")?;
     let tok = cortiq_engine::tokenizer::Tokenizer::from_bytes(&vocab_bytes)
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
     let chunks = corpus_chunks(&tok, files, chunk, 112 + held)?;
@@ -744,7 +794,11 @@ pub fn run_skill_bake(
             println!("{line}");
         })
         .map_err(|e| anyhow::anyhow!(e))?;
-    let verdict = if report.overlaid <= report.backbone { "SPECIALIST ≤ baseline ✓" } else { "did not beat baseline" };
+    let verdict = if report.overlaid <= report.backbone {
+        "SPECIALIST ≤ baseline ✓"
+    } else {
+        "did not beat baseline"
+    };
     println!(
         "=== bake: baseline {:.3} | mask {:.3} | mask+FCD {:.3} | pruned {:.0}% | {:.0}s → {verdict}",
         report.backbone,
@@ -778,7 +832,11 @@ pub fn run_skill_bake(
         });
     }
     let deq = |name: &str| -> anyhow::Result<Vec<f32>> {
-        let e = model.tensors.iter().find(|t| t.name == name).context("missing tensor")?;
+        let e = model
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .context("missing tensor")?;
         let mut out = vec![0f32; e.shape.iter().product()];
         cortiq_core::quant::dequant_tensor(e, model.tensor_bytes(name)?, &mut out)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -787,8 +845,12 @@ pub fn run_skill_bake(
     let mut max_kept = 0usize;
     for li in 0..nl {
         let alive = &arts.keep[li];
-        let kept: Vec<usize> =
-            alive.iter().enumerate().filter(|(_, a)| **a).map(|(i, _)| i).collect();
+        let kept: Vec<usize> = alive
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| **a)
+            .map(|(i, _)| i)
+            .collect();
         anyhow::ensure!(!kept.is_empty(), "layer {li}: 0 live neurons");
         max_kept = max_kept.max(kept.len());
         let (gate_f, up_f) = match &arts.gate_up[li] {
@@ -820,7 +882,11 @@ pub fn run_skill_bake(
             .context("gate tensor missing")?;
         let q_rowsafe = dtype_to_quant(base_dtype).context("unsupported ffn dtype")?;
         // down's IN dim shrinks: grouped codecs need in % 32 == 0.
-        let q_down = if kept.len() % 32 == 0 { q_rowsafe } else { Quant::Q8_2f };
+        let q_down = if kept.len() % 32 == 0 {
+            q_rowsafe
+        } else {
+            Quant::Q8_2f
+        };
         for (suffix, vals, rows, cols, q) in [
             ("gate_proj", &gate_k, kept.len(), hidden, q_rowsafe),
             ("up_proj", &up_k, kept.len(), hidden, q_rowsafe),
@@ -838,7 +904,10 @@ pub fn run_skill_bake(
     let mut header = model.header.clone();
     header.skills.clear();
     header.arch.intermediate_size = max_kept;
-    let mut prov = header.provenance.take().unwrap_or_else(|| serde_json::json!({}));
+    let mut prov = header
+        .provenance
+        .take()
+        .unwrap_or_else(|| serde_json::json!({}));
     prov["defrag"] = serde_json::json!({
         "recipe": "skill-bake L1+FCD (native)",
         "pre_intermediate": orig_inter,
@@ -858,8 +927,8 @@ pub fn run_skill_bake(
     let held_ids: Vec<&Vec<u32>> = chunks[..held.min(chunks.len())].iter().collect();
     let runtime_ppl = |path: &str| -> anyhow::Result<f64> {
         let m = Arc::new(CmfModel::open(path)?);
-        let mut p = Pipeline::from_model(&m, SamplerConfig::default())
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let mut p =
+            Pipeline::from_model(&m, SamplerConfig::default()).map_err(|e| anyhow::anyhow!(e))?;
         let mut nll = 0f64;
         let mut n = 0usize;
         for c in &held_ids {

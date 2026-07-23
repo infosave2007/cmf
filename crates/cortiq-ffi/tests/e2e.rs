@@ -1,10 +1,12 @@
 //! End-to-end through the C ABI against a real model. Skips (honestly,
 //! with a message) when the local model file is absent — CI stays
 //! hermetic, developer machines exercise the full path.
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_void};
 
 extern "C" fn collect(token: *const c_char, user: *mut c_void) -> bool {
-    let s = unsafe { CStr::from_ptr(token) }.to_string_lossy().into_owned();
+    let s = unsafe { CStr::from_ptr(token) }
+        .to_string_lossy()
+        .into_owned();
     let out = unsafe { &mut *(user as *mut String) };
     out.push_str(&s);
     true

@@ -6,12 +6,18 @@
 //! pipeline, the short-prompt guard, and the memory accounting.
 
 use cortiq_engine::nystrom::{
-    O1Cfg, O1Layers, O1Rect, O1_DEFAULT_M, O1_DEFAULT_RECT, O1_DEFAULT_SINK, O1_DEFAULT_W,
+    O1_DEFAULT_M, O1_DEFAULT_RECT, O1_DEFAULT_SINK, O1_DEFAULT_W, O1Cfg, O1Layers, O1Rect,
 };
 use cortiq_engine::pipeline::create_test_pipeline;
 
 fn o1(layers: O1Layers, m: usize, w: usize, sink: usize) -> Option<O1Cfg> {
-    Some(O1Cfg { layers, m, w, sink, rect: O1_DEFAULT_RECT })
+    Some(O1Cfg {
+        layers,
+        m,
+        w,
+        sink,
+        rect: O1_DEFAULT_RECT,
+    })
 }
 
 #[test]
@@ -37,8 +43,8 @@ fn config_spec_parsing() {
     assert_eq!(cfg.layer_flags(4), vec![false, false, true, true]);
     assert_eq!((cfg.m, cfg.w, cfg.sink), defaults, "validated defaults");
     assert_eq!(cfg.rect, O1_DEFAULT_RECT);
-    let cfg = O1Cfg::from_spec("1,99", Some(8), Some(16), Some(0), Some(O1Rect::Aggregate))
-        .unwrap();
+    let cfg =
+        O1Cfg::from_spec("1,99", Some(8), Some(16), Some(0), Some(O1Rect::Aggregate)).unwrap();
     assert_eq!(cfg.layer_flags(3), vec![false, true, false]);
     assert_eq!((cfg.m, cfg.w, cfg.sink), (8, 16, 0));
     assert_eq!(cfg.rect, O1Rect::Aggregate, "explicit rect wins");

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.16] — 2026-07-23
+
+### Fixed
+- **Reasoning / Thinking Suppression**: Improved chat template `enable_thinking=false` prefill handling in `cortiq-engine` tokenizer to match `assistant` markers without requiring a trailing newline. Fixes reasoning mode suppression for ChatML models like Nanbeige 4.2 / Qwen 3.5.
+
 ## [0.5.12] — 2026-07-23
 
 ### Added

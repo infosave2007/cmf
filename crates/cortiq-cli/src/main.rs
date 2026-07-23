@@ -57,7 +57,11 @@ struct SessionState {
 
 impl SessionState {
     fn fingerprint(arch: &cortiq_core::ModelArch) -> (u32, u32, u32) {
-        (arch.num_layers as u32, arch.hidden_size as u32, arch.vocab_size as u32)
+        (
+            arch.num_layers as u32,
+            arch.hidden_size as u32,
+            arch.vocab_size as u32,
+        )
     }
 
     fn write(&self, path: &str) -> anyhow::Result<()> {
@@ -97,14 +101,20 @@ impl SessionState {
             *p += n;
             Ok(s)
         };
-        let u32at = |p: &mut usize| -> anyhow::Result<u32> { Ok(u32::from_le_bytes(take(p, 4)?.try_into().unwrap())) };
+        let u32at = |p: &mut usize| -> anyhow::Result<u32> {
+            Ok(u32::from_le_bytes(take(p, 4)?.try_into().unwrap()))
+        };
         if take(&mut p, 4)? != STATE_MAGIC {
             anyhow::bail!("not a .cmfstate file (bad magic)");
         }
         let _version = u32at(&mut p)?;
         let kind = u32at(&mut p)?;
         let fp = (u32at(&mut p)?, u32at(&mut p)?, u32at(&mut p)?);
-        let seed = if take(&mut p, 1)?[0] == 1 { Some(u64::from_le_bytes(take(&mut p, 8)?.try_into().unwrap())) } else { None };
+        let seed = if take(&mut p, 1)?[0] == 1 {
+            Some(u64::from_le_bytes(take(&mut p, 8)?.try_into().unwrap()))
+        } else {
+            None
+        };
         let sl = u32at(&mut p)? as usize;
         let skill = {
             let s = std::str::from_utf8(take(&mut p, sl)?)?.to_string();
@@ -115,7 +125,13 @@ impl SessionState {
         for _ in 0..n {
             tokens.push(u32at(&mut p)?);
         }
-        Ok(SessionState { kind, fp, seed, skill, tokens })
+        Ok(SessionState {
+            kind,
+            fp,
+            seed,
+            skill,
+            tokens,
+        })
     }
 }
 
@@ -135,20 +151,26 @@ impl O1Flags {
     fn rect(&self) -> anyhow::Result<Option<cortiq_engine::nystrom::O1Rect>> {
         match self.rect.as_deref() {
             None => Ok(None),
-            Some(s) => cortiq_engine::nystrom::O1Cfg::parse_rect(s).map(Some).ok_or_else(|| anyhow::anyhow!("--o1-rect '{s}' is not one of: agg | fm")),
+            Some(s) => cortiq_engine::nystrom::O1Cfg::parse_rect(s)
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("--o1-rect '{s}' is not one of: agg | fm")),
         }
     }
 
     /// The config this flag set resolves to, or None for `off`/absent.
     fn cfg(&self) -> anyhow::Result<Option<cortiq_engine::nystrom::O1Cfg>> {
         let rect = self.rect()?;
-        Ok(self.spec.as_deref().and_then(|spec| cortiq_engine::nystrom::O1Cfg::from_spec(spec, self.m, self.w, self.sink, rect)))
+        Ok(self.spec.as_deref().and_then(|spec| {
+            cortiq_engine::nystrom::O1Cfg::from_spec(spec, self.m, self.w, self.sink, rect)
+        }))
     }
 
     fn apply(&self, pipeline: &mut Pipeline) {
         if let Some(spec) = self.spec.as_deref() {
             let rect = self.rect().unwrap_or(None);
-            pipeline.set_o1(cortiq_engine::nystrom::O1Cfg::from_spec(spec, self.m, self.w, self.sink, rect));
+            pipeline.set_o1(cortiq_engine::nystrom::O1Cfg::from_spec(
+                spec, self.m, self.w, self.sink, rect,
+            ));
         }
     }
 }
@@ -169,9 +191,17 @@ impl PplWindows {
         let Some(w) = self.windows.filter(|&w| w > 0) else {
             return Ok(None);
         };
-        anyhow::ensure!(n > self.window_len + 1, "corpus has {n} tokens < window_len+2 = {}", self.window_len + 2);
+        anyhow::ensure!(
+            n > self.window_len + 1,
+            "corpus has {n} tokens < window_len+2 = {}",
+            self.window_len + 2
+        );
         let stride = (n - self.window_len - 1) / w;
-        anyhow::ensure!(stride > 0, "{w} windows of {} do not fit in {n} tokens", self.window_len);
+        anyhow::ensure!(
+            stride > 0,
+            "{w} windows of {} do not fit in {n} tokens",
+            self.window_len
+        );
         Ok(Some((0..w).map(|k| k * stride).collect()))
     }
 }
@@ -766,7 +796,10 @@ async fn main() -> anyhow::Result<()> {
         _ => "info",
     };
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| default_level.into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| default_level.into()),
+        )
         // Logs go to stderr: stdout carries the payload (generated text,
         // `bench --json`) and must stay machine-parseable.
         .with_writer(std::io::stderr)
@@ -813,7 +846,10 @@ async fn main() -> anyhow::Result<()> {
                 Some(spec) => {
                     // The rectifier is a runtime knob, not a property of
                     // the weights — a file hint never pins it.
-                    let cfg = cortiq_engine::nystrom::O1Cfg::from_spec(spec, o1_m, o1_window, o1_sink, None).ok_or_else(|| anyhow::anyhow!("--o1 {spec}: expected all | deepN | i,j,k"))?;
+                    let cfg = cortiq_engine::nystrom::O1Cfg::from_spec(
+                        spec, o1_m, o1_window, o1_sink, None,
+                    )
+                    .ok_or_else(|| anyhow::anyhow!("--o1 {spec}: expected all | deepN | i,j,k"))?;
                     println!(
                         "o1 hint: layers {spec}, m={} w={} sink={} — weights unchanged; \
                          serve/run/bench read the hint automatically (disable with --o1 off)",
@@ -824,16 +860,42 @@ async fn main() -> anyhow::Result<()> {
                     }))
                 }
             };
-            convert::run_convert(&model, &quant, &output, hf_token.as_deref(), defrag.as_deref(), o1_hint, progress_reporter("converting"))?;
+            convert::run_convert(
+                &model,
+                &quant,
+                &output,
+                hf_token.as_deref(),
+                defrag.as_deref(),
+                o1_hint,
+                progress_reporter("converting"),
+            )?;
             println!("✓ wrote {output}");
             Ok(())
         }
-        Commands::ImportGguf { gguf, output, quant, hf_token } => {
-            gguf::run_import_gguf(&gguf, &quant, &output, hf_token.as_deref(), progress_reporter("importing"))?;
+        Commands::ImportGguf {
+            gguf,
+            output,
+            quant,
+            hf_token,
+        } => {
+            gguf::run_import_gguf(
+                &gguf,
+                &quant,
+                &output,
+                hf_token.as_deref(),
+                progress_reporter("importing"),
+            )?;
             println!("✓ wrote {output}");
             Ok(())
         }
-        Commands::QuantizeGptq { input, calib, output, keep, tokens, lambda } => {
+        Commands::QuantizeGptq {
+            input,
+            calib,
+            output,
+            keep,
+            tokens,
+            lambda,
+        } => {
             gptq::run_quantize_gptq(&input, &calib, &output, keep, tokens, lambda)?;
             println!("✓ wrote {output}");
             Ok(())
@@ -865,9 +927,31 @@ async fn main() -> anyhow::Result<()> {
                 sink: o1_sink,
                 rect: None,
             };
-            cmd_run(&model, &task, prompt.as_deref(), max_tokens, skill.as_deref(), greedy, raw, no_think, blend.as_deref(), route_dynamic, confidence, trace, trace_json, state.as_deref(), &o1).await
+            cmd_run(
+                &model,
+                &task,
+                prompt.as_deref(),
+                max_tokens,
+                skill.as_deref(),
+                greedy,
+                raw,
+                no_think,
+                blend.as_deref(),
+                route_dynamic,
+                confidence,
+                trace,
+                trace_json,
+                state.as_deref(),
+                &o1,
+            )
+            .await
         }
-        Commands::Freeze { model, prompt, out, skill } => cmd_freeze(&model, &prompt, &out, skill.as_deref()),
+        Commands::Freeze {
+            model,
+            prompt,
+            out,
+            skill,
+        } => cmd_freeze(&model, &prompt, &out, skill.as_deref()),
         Commands::Route { model, prompt } => cmd_route(&model, &prompt),
         Commands::Ppl {
             model,
@@ -891,7 +975,10 @@ async fn main() -> anyhow::Result<()> {
             skill.as_deref(),
             blend.as_deref(),
             route_dynamic,
-            PplWindows { windows, window_len },
+            PplWindows {
+                windows,
+                window_len,
+            },
             &O1Flags {
                 spec: o1,
                 m: o1_m,
@@ -905,7 +992,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Story { model } => cmd_story(&model),
         Commands::Diff { a, b } => cmd_diff(&a, &b),
         Commands::Explain { model, prompt, top } => cmd_explain(&model, &prompt, top),
-        Commands::Calibrate { model, file, skill, tokens } => cmd_calibrate(&model, &file, skill.as_deref(), tokens),
+        Commands::Calibrate {
+            model,
+            file,
+            skill,
+            tokens,
+        } => cmd_calibrate(&model, &file, skill.as_deref(), tokens),
         Commands::Masks { model } => cmd_masks(&model).await,
         Commands::Bench {
             model,
@@ -976,7 +1068,9 @@ async fn main() -> anyhow::Result<()> {
                 fcd_layers,
                 chunk,
                 held,
-            } => skill::run_skill_bake(&model, &files, &output, steps_a, steps_b, fcd_layers, chunk, held),
+            } => skill::run_skill_bake(
+                &model, &files, &output, steps_a, steps_b, fcd_layers, chunk, held,
+            ),
         },
         Commands::Verify { model } => cmd_verify(&model).await,
         Commands::Fcd {
@@ -998,11 +1092,37 @@ async fn main() -> anyhow::Result<()> {
             gen_gate,
             gate_threshold,
             gate_slack,
-        } => cmd_fcd(&model, &corpus, val_corpus.as_deref(), o1.as_deref(), o1_m, o1_window, o1_sink, steps, lr, kl, eval_every, bs, seq, out.as_deref(), gen_check, gen_gate, gate_threshold, gate_slack),
+        } => cmd_fcd(
+            &model,
+            &corpus,
+            val_corpus.as_deref(),
+            o1.as_deref(),
+            o1_m,
+            o1_window,
+            o1_sink,
+            steps,
+            lr,
+            kl,
+            eval_every,
+            bs,
+            seq,
+            out.as_deref(),
+            gen_check,
+            gen_gate,
+            gate_threshold,
+            gate_slack,
+        ),
     }
 }
 
-async fn cmd_serve(model_path: &str, host: &str, port: u16, default_task: &str, _compat_port: Option<u16>, o1: &O1Flags) -> anyhow::Result<()> {
+async fn cmd_serve(
+    model_path: &str,
+    host: &str,
+    port: u16,
+    default_task: &str,
+    _compat_port: Option<u16>,
+    o1: &O1Flags,
+) -> anyhow::Result<()> {
     println!();
     println!("  ╔═══════════════════════════════════════╗");
     println!("  ║     Cortiq — Sparse Inference Engine   ║");
@@ -1013,7 +1133,10 @@ async fn cmd_serve(model_path: &str, host: &str, port: u16, default_task: &str, 
     println!("  Loading model: {}", model_path);
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     let arch = model.arch();
-    println!("    Architecture: {} | {}L | hidden={} | FFN={}", arch.arch_name, arch.num_layers, arch.hidden_size, arch.intermediate_size);
+    println!(
+        "    Architecture: {} | {}L | hidden={} | FFN={}",
+        arch.arch_name, arch.num_layers, arch.hidden_size, arch.intermediate_size
+    );
     println!("    Quantization: {:?}", model.header.quant_type);
     println!("    Masks: {}", model.masks.masks.len());
 
@@ -1021,8 +1144,13 @@ async fn cmd_serve(model_path: &str, host: &str, port: u16, default_task: &str, 
     // weights are shared zero-copy, each slot owns KV/state/workspace,
     // so up to N requests decode concurrently. CMF_SERVE_SLOTS
     // overrides; the default keeps ~4 pool threads per slot.
-    let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    let slots = std::env::var("CMF_SERVE_SLOTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(|| (avail / 4).clamp(1, 4));
+    let avail = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let slots = std::env::var("CMF_SERVE_SLOTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| (avail / 4).clamp(1, 4));
     if std::env::var("CMF_THREADS").is_err() {
         // Split the cores between slots instead of oversubscribing
         // N pools × (cores−1) workers. Explicit CMF_THREADS wins.
@@ -1039,7 +1167,12 @@ async fn cmd_serve(model_path: &str, host: &str, port: u16, default_task: &str, 
     if pipelines[0].o1_active() {
         println!("    O(1) attention: nystrom (see load log for layers/params)");
     }
-    println!("    Pipeline: loaded ({:.2}B params) | {} slot(s) × {} thread(s)", model.total_param_count() as f64 / 1e9, slots, std::env::var("CMF_THREADS").unwrap_or_default(),);
+    println!(
+        "    Pipeline: loaded ({:.2}B params) | {} slot(s) × {} thread(s)",
+        model.total_param_count() as f64 / 1e9,
+        slots,
+        std::env::var("CMF_THREADS").unwrap_or_default(),
+    );
     println!();
 
     // Create runtime
@@ -1059,9 +1192,15 @@ async fn cmd_serve(model_path: &str, host: &str, port: u16, default_task: &str, 
 
     // Start server
     let addr = format!("{}:{}", host, port);
-    println!("  ✓ API server:     http://{}:{}/v1/chat/completions", host, port);
+    println!(
+        "  ✓ API server:     http://{}:{}/v1/chat/completions",
+        host, port
+    );
     println!("  ✓ Web dashboard:  http://localhost:{}/", port);
-    println!("  ✓ Status:         http://localhost:{}/v1/cortiq/status", port);
+    println!(
+        "  ✓ Status:         http://localhost:{}/v1/cortiq/status",
+        port
+    );
     println!();
     println!("  Press Ctrl+C to stop.");
     println!();
@@ -1088,13 +1227,18 @@ fn auto_blend(model: &Arc<CmfModel>, text: &str) -> anyhow::Result<Vec<(String, 
     let mx = -m[0].error / t;
     let ws: Vec<f32> = m.iter().map(|r| (-r.error / t - mx).exp()).collect();
     let sum: f32 = ws.iter().sum();
-    Ok(m.iter().zip(&ws).map(|(r, w)| (r.id.clone(), w / sum)).collect())
+    Ok(m.iter()
+        .zip(&ws)
+        .map(|(r, w)| (r.id.clone(), w / sum))
+        .collect())
 }
 
 fn parse_blend(spec: &str) -> anyhow::Result<Vec<(String, f32)>> {
     let mut out = Vec::new();
     for part in spec.split(',') {
-        let (id, w) = part.split_once(':').ok_or_else(|| anyhow::anyhow!("blend format: id:w,id:w"))?;
+        let (id, w) = part
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("blend format: id:w,id:w"))?;
         out.push((id.trim().to_string(), w.trim().parse::<f32>()?));
     }
     let sum: f32 = out.iter().map(|(_, w)| w).sum();
@@ -1112,7 +1256,12 @@ const FCD_VAL_CHARS: usize = 200_000;
 /// Three greedy generations from 400-token val prompts through the
 /// REAL streaming O(1) runtime (the loop gate of the torch reference:
 /// offsets L/10, L/2, 8L/10 of the val stream).
-fn fcd_gen_check(model: &Arc<CmfModel>, o1: &cortiq_engine::nystrom::O1Cfg, va: &[u32], tag: &str) -> anyhow::Result<()> {
+fn fcd_gen_check(
+    model: &Arc<CmfModel>,
+    o1: &cortiq_engine::nystrom::O1Cfg,
+    va: &[u32],
+    tag: &str,
+) -> anyhow::Result<()> {
     let greedy = SamplerConfig {
         temperature: 0.0,
         top_p: 1.0,
@@ -1130,8 +1279,14 @@ fn fcd_gen_check(model: &Arc<CmfModel>, o1: &cortiq_engine::nystrom::O1Cfg, va: 
     }
     for off in [l / 10, l / 2, 8 * l / 10] {
         let prompt = &va[off..off + 400];
-        let r = pipeline.generate_from_ids(prompt, 60, None, None).map_err(|e| anyhow::anyhow!("generation: {e}"))?;
-        println!("GEN {tag} (off {off}, loop-score {:.2}): {}", cortiq_engine::fcd::loop_score(&r.token_ids), r.text.replace('\n', "\\n"));
+        let r = pipeline
+            .generate_from_ids(prompt, 60, None, None)
+            .map_err(|e| anyhow::anyhow!("generation: {e}"))?;
+        println!(
+            "GEN {tag} (off {off}, loop-score {:.2}): {}",
+            cortiq_engine::fcd::loop_score(&r.token_ids),
+            r.text.replace('\n', "\\n")
+        );
     }
     Ok(())
 }
@@ -1163,7 +1318,9 @@ fn cmd_fcd(
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     // Layer set: explicit flag > file converter hint > all.
     let cfg = match o1 {
-        Some(spec) => O1Cfg::from_spec(spec, o1_m, o1_w, o1_sink, None).ok_or_else(|| anyhow::anyhow!("--o1 '{spec}' is off or malformed — nothing to polish"))?,
+        Some(spec) => O1Cfg::from_spec(spec, o1_m, o1_w, o1_sink, None).ok_or_else(|| {
+            anyhow::anyhow!("--o1 '{spec}' is off or malformed — nothing to polish")
+        })?,
         None => model
             .header
             .provenance
@@ -1177,11 +1334,16 @@ fn cmd_fcd(
     // Tokenizer: embedded → sidecar. No byte-level fallback here — the
     // polish must train on the model's true token ids.
     let tokenizer = if let Some(vb) = &model.vocab {
-        cortiq_engine::tokenizer::Tokenizer::from_bytes(vb).map_err(|e| anyhow::anyhow!("embedded tokenizer: {e}"))?
+        cortiq_engine::tokenizer::Tokenizer::from_bytes(vb)
+            .map_err(|e| anyhow::anyhow!("embedded tokenizer: {e}"))?
     } else {
         let sidecar = std::path::Path::new(model_path).with_file_name("tokenizer.json");
-        anyhow::ensure!(sidecar.exists(), "no tokenizer in the file or beside it — cannot tokenize the corpus");
-        cortiq_engine::tokenizer::Tokenizer::from_file(&sidecar).map_err(|e| anyhow::anyhow!("sidecar tokenizer: {e}"))?
+        anyhow::ensure!(
+            sidecar.exists(),
+            "no tokenizer in the file or beside it — cannot tokenize the corpus"
+        );
+        cortiq_engine::tokenizer::Tokenizer::from_file(&sidecar)
+            .map_err(|e| anyhow::anyhow!("sidecar tokenizer: {e}"))?
     };
 
     let cap = |s: String, n: usize| -> String {
@@ -1216,26 +1378,52 @@ fn cmd_fcd(
         fcd_gen_check(&model, &cfg, &va, "before")?;
     }
 
-    let hp = FcdHyper { steps, lr, kl_w: kl, eval_every, bs, seq, seed: 0 };
-    let out_path = out.map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from(format!("{model_path}.fcd.cmf")));
+    let hp = FcdHyper {
+        steps,
+        lr,
+        kl_w: kl,
+        eval_every,
+        bs,
+        seq,
+        seed: 0,
+    };
+    let out_path = out
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("{model_path}.fcd.cmf")));
     // Gate default: on whenever --gen-check is on (claim 13 discipline).
-    let gate_cfg = (gen_gate || gen_check).then(|| GenGateCfg::standard(&va)).flatten().map(|mut g| {
-        g.threshold = gate_threshold;
-        g.baseline_slack = gate_slack;
-        g
-    });
-    let report = run_polish(&model, &cfg, &hp, &tr, &va, &out_path, gate_cfg.as_ref()).map_err(|e| anyhow::anyhow!("fcd polish: {e}"))?;
+    let gate_cfg = (gen_gate || gen_check)
+        .then(|| GenGateCfg::standard(&va))
+        .flatten()
+        .map(|mut g| {
+            g.threshold = gate_threshold;
+            g.baseline_slack = gate_slack;
+            g
+        });
+    let report = run_polish(&model, &cfg, &hp, &tr, &va, &out_path, gate_cfg.as_ref())
+        .map_err(|e| anyhow::anyhow!("fcd polish: {e}"))?;
 
     println!("── FCD polish report ──");
     println!("converted layers : {:?}", report.converted);
     println!("teacher val-ppl  : {:.2}", report.teacher_ppl);
-    println!("student ppl start: {:.2} (zero-shot O(1))", report.ppl_start);
-    println!("student ppl best : {:.2} (step {}), final {:.2}", report.ppl_best, report.best_step, report.ppl_final);
-    println!("steps            : {} ({:.1}s/step)", report.steps_run, report.sec_per_step);
+    println!(
+        "student ppl start: {:.2} (zero-shot O(1))",
+        report.ppl_start
+    );
+    println!(
+        "student ppl best : {:.2} (step {}), final {:.2}",
+        report.ppl_best, report.best_step, report.ppl_final
+    );
+    println!(
+        "steps            : {} ({:.1}s/step)",
+        report.steps_run, report.sec_per_step
+    );
     if let Some(gr) = &report.gate {
         println!("gen-gate baseline: {:?}", gr.baseline);
         for (st, ppl, scores, pass) in &gr.evals {
-            println!("gen-gate step {st}: ppl {ppl:.2} scores {scores:?} → {}", if *pass { "PASS" } else { "FAIL" });
+            println!(
+                "gen-gate step {st}: ppl {ppl:.2} scores {scores:?} → {}",
+                if *pass { "PASS" } else { "FAIL" }
+            );
         }
         match gr.chosen {
             Some(st) => println!("gen-gate chose   : step {st}"),
@@ -1246,14 +1434,26 @@ fn cmd_fcd(
 
     if gen_check {
         println!("── gen-check AFTER polish (streaming O(1) runtime) ──");
-        let polished = Arc::new(CmfModel::open_sharded(out_path.to_str().unwrap_or_default())?);
+        let polished = Arc::new(CmfModel::open_sharded(
+            out_path.to_str().unwrap_or_default(),
+        )?);
         fcd_gen_check(&polished, &cfg, &va, "after")?;
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cmd_ppl(model_path: &str, file: &str, max_tokens: usize, skill: Option<&str>, blend: Option<&str>, route_dynamic: bool, win: PplWindows, o1: &O1Flags, o1_prefill: Option<usize>) -> anyhow::Result<()> {
+fn cmd_ppl(
+    model_path: &str,
+    file: &str,
+    max_tokens: usize,
+    skill: Option<&str>,
+    blend: Option<&str>,
+    route_dynamic: bool,
+    win: PplWindows,
+    o1: &O1Flags,
+    o1_prefill: Option<usize>,
+) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     let text = std::fs::read_to_string(file)?;
     let mut pipeline = match blend {
@@ -1275,20 +1475,31 @@ fn cmd_ppl(model_path: &str, file: &str, max_tokens: usize, skill: Option<&str>,
     let windowed = win.offsets(pipeline.tokenizer.encode(&text).len())?;
     let mut ids = match &windowed {
         Some(_) => pipeline.tokenizer.encode(&text),
-        None => pipeline.tokenizer.with_bos(pipeline.tokenizer.encode(&text)),
+        None => pipeline
+            .tokenizer
+            .with_bos(pipeline.tokenizer.encode(&text)),
     };
     if windowed.is_none() {
         ids.truncate(max_tokens);
     }
 
     if let Some(offsets) = windowed {
-        return ppl_windows(&mut pipeline, &ids, &offsets, win.window_len, o1, o1_prefill);
+        return ppl_windows(
+            &mut pipeline,
+            &ids,
+            &offsets,
+            win.window_len,
+            o1,
+            o1_prefill,
+        );
     }
     if let Some(cfg) = o1.cfg()? {
         // Single-prefix o1 scoring: seal after --o1-prefill (default:
         // half the sequence), score the rest through the O(1) kernel.
         pipeline.set_o1(Some(cfg));
-        let prefill = o1_prefill.unwrap_or(ids.len() / 2).min(ids.len().saturating_sub(1));
+        let prefill = o1_prefill
+            .unwrap_or(ids.len() / 2)
+            .min(ids.len().saturating_sub(1));
         let (n_o1, c) = pipeline.nll_ids_o1(&ids, prefill);
         pipeline.set_o1(None);
         let (n_ex, _) = pipeline.nll_ids_from(&ids, prefill);
@@ -1299,7 +1510,10 @@ fn cmd_ppl(model_path: &str, file: &str, max_tokens: usize, skill: Option<&str>,
     if route_dynamic {
         let n = pipeline.enable_dynamic_routing();
         let (ppl, switches) = pipeline.ppl_ids_dynamic(&ids);
-        println!("PPL = {ppl:.3} over {} tokens | dynamic routing: {n} skills, {switches} switch(es)", ids.len());
+        println!(
+            "PPL = {ppl:.3} over {} tokens | dynamic routing: {n} skills, {switches} switch(es)",
+            ids.len()
+        );
         dump_moe_stats(&pipeline)?;
         return Ok(());
     }
@@ -1332,7 +1546,14 @@ fn report_o1_ppl(nll_o1: f64, nll_exact: f64, cnt: usize, prefill: usize, len: u
 /// windows BEFORE the exp (val_ppl discipline). With `--o1`, each window
 /// is prefilled exactly, sealed, and its tail scored through the O(1)
 /// kernel, next to the exact baseline over the identical tokens.
-fn ppl_windows(pipeline: &mut Pipeline, ids: &[u32], offsets: &[usize], wlen: usize, o1: &O1Flags, o1_prefill: Option<usize>) -> anyhow::Result<()> {
+fn ppl_windows(
+    pipeline: &mut Pipeline,
+    ids: &[u32],
+    offsets: &[usize],
+    wlen: usize,
+    o1: &O1Flags,
+    o1_prefill: Option<usize>,
+) -> anyhow::Result<()> {
     let cfg = o1.cfg()?;
     let prefill = match &cfg {
         Some(_) => o1_prefill.unwrap_or(wlen / 2).min(wlen.saturating_sub(1)),
@@ -1356,13 +1577,24 @@ fn ppl_windows(pipeline: &mut Pipeline, ids: &[u32], offsets: &[usize], wlen: us
             cnt += k;
         }
     }
-    println!("windows: {} x {wlen} tokens at stride {} ({} scored)", offsets.len(), offsets.get(1).copied().unwrap_or(0), cnt);
+    println!(
+        "windows: {} x {wlen} tokens at stride {} ({} scored)",
+        offsets.len(),
+        offsets.get(1).copied().unwrap_or(0),
+        cnt
+    );
     match &cfg {
         Some(c) => {
-            println!("o1: layers {:?}, m={} w={} sink={} rect={:?}, prefill={prefill}", c.layers, c.m, c.w, c.sink, c.rect);
+            println!(
+                "o1: layers {:?}, m={} w={} sink={} rect={:?}, prefill={prefill}",
+                c.layers, c.m, c.w, c.sink, c.rect
+            );
             report_o1_ppl(nll_o1, nll_ex, cnt, prefill, wlen);
         }
-        None => println!("PPL = {:.3} (exact attention)", (nll_ex / cnt.max(1) as f64).exp()),
+        None => println!(
+            "PPL = {:.3} (exact attention)",
+            (nll_ex / cnt.max(1) as f64).exp()
+        ),
     }
     dump_moe_stats(pipeline)?;
     Ok(())
@@ -1424,13 +1656,23 @@ fn cmd_explain(model_path: &str, prompt: &str, top: usize) -> anyhow::Result<()>
         println!("\nSwarm: none (flat model) — no routing needed, the backbone answers.");
         None
     } else {
-        println!("\n\x1b[1mRouting (recon-argmin, E=‖r−BBᵀr‖²/‖φ‖², lower = more coherent):\x1b[0m");
-        let emax = routes.iter().map(|r| r.error).fold(0.0f32, f32::max).max(1e-6);
+        println!(
+            "\n\x1b[1mRouting (recon-argmin, E=‖r−BBᵀr‖²/‖φ‖², lower = more coherent):\x1b[0m"
+        );
+        let emax = routes
+            .iter()
+            .map(|r| r.error)
+            .fold(0.0f32, f32::max)
+            .max(1e-6);
         for (i, r) in routes.iter().enumerate() {
             // Bar: shorter = lower E = more coherent (inverse scale).
             let fill = ((1.0 - r.error / emax) * 20.0).round() as usize;
             let bar = "█".repeat(fill);
-            let mark = if i == 0 { "  \x1b[1m← chosen\x1b[0m" } else { "" };
+            let mark = if i == 0 {
+                "  \x1b[1m← chosen\x1b[0m"
+            } else {
+                ""
+            };
             println!("  {:<12} E = {:.4}  {}{}", r.id, r.error, bar, mark);
         }
         Some(routes[0].id.clone())
@@ -1446,18 +1688,33 @@ fn cmd_explain(model_path: &str, prompt: &str, top: usize) -> anyhow::Result<()>
     let t = pipeline.calib_temp(); // B1: calibrated confidence if the file carries it
     let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
     let sum: f32 = logits.iter().map(|&v| ((v - max) / t).exp()).sum();
-    let mut probs: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, ((v - max) / t).exp() / sum)).collect();
+    let mut probs: Vec<(usize, f32)> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i, ((v - max) / t).exp() / sum))
+        .collect();
     probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
     let via = winner.as_deref().unwrap_or("backbone");
     println!("\n\x1b[1mFirst token (how it would start answering, via «{via}»):\x1b[0m");
     for (id, p) in probs.iter().take(top) {
-        let piece = pipeline.tokenizer.decode_token(*id as u32).replace('\n', "⏎");
+        let piece = pipeline
+            .tokenizer
+            .decode_token(*id as u32)
+            .replace('\n', "⏎");
         let fill = (p * 30.0).round() as usize;
-        println!("  {}  {:>5.1}%  {:?}", "█".repeat(fill.max(1)), p * 100.0, piece);
+        println!(
+            "  {}  {:>5.1}%  {:?}",
+            "█".repeat(fill.max(1)),
+            p * 100.0,
+            piece
+        );
     }
     let top1 = probs[0].1;
-    println!("Confidence on the 1st token: {} (Born mass top-1)", conf_colour(&format!("{:.0}%", top1 * 100.0), top1));
+    println!(
+        "Confidence on the 1st token: {} (Born mass top-1)",
+        conf_colour(&format!("{:.0}%", top1 * 100.0), top1)
+    );
     Ok(())
 }
 
@@ -1465,10 +1722,16 @@ fn cmd_explain(model_path: &str, prompt: &str, top: usize) -> anyhow::Result<()>
 /// context exactly as generation would (no BOS — matches `generate`), and
 /// store it with the active skill, seed, and a model fingerprint. Resume
 /// via `run --state` replays these tokens (bit-identical warm state).
-fn cmd_freeze(model_path: &str, prompt: &str, out: &str, skill: Option<&str>) -> anyhow::Result<()> {
+fn cmd_freeze(
+    model_path: &str,
+    prompt: &str,
+    out: &str,
+    skill: Option<&str>,
+) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     if let Some(s) = skill {
-        let known = model.header.skills.iter().any(|k| k.id == s) || model.skill_tensors(s).next().is_some();
+        let known = model.header.skills.iter().any(|k| k.id == s)
+            || model.skill_tensors(s).next().is_some();
         if !known {
             anyhow::bail!("skill '{s}' not in this container");
         }
@@ -1483,7 +1746,11 @@ fn cmd_freeze(model_path: &str, prompt: &str, out: &str, skill: Option<&str>) ->
         tokens,
     };
     st.write(out)?;
-    println!("frozen: {} tokens, skill {}, → {out}  (resume: cortiq run {model_path} --state {out} -p \"…\")", st.tokens.len(), skill.unwrap_or("—"));
+    println!(
+        "frozen: {} tokens, skill {}, → {out}  (resume: cortiq run {model_path} --state {out} -p \"…\")",
+        st.tokens.len(),
+        skill.unwrap_or("—")
+    );
     Ok(())
 }
 
@@ -1521,17 +1788,28 @@ fn ece_bins(conf: &[f32], correct: &[bool]) -> (f32, Vec<(f32, f32, usize)>) {
 /// the real next token, over a temperature grid — reliability diagram +
 /// ECE + the temperature that best calibrates. Honest: if already
 /// calibrated, says so (no bytes needed).
-fn cmd_calibrate(model_path: &str, file: &str, skill: Option<&str>, max_tokens: usize) -> anyhow::Result<()> {
+fn cmd_calibrate(
+    model_path: &str,
+    file: &str,
+    skill: Option<&str>,
+    max_tokens: usize,
+) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     let text = std::fs::read_to_string(file)?;
     let mut pipeline = Pipeline::from_model_with_skill(&model, SamplerConfig::default(), skill)?;
-    let mut ids = pipeline.tokenizer.with_bos(pipeline.tokenizer.encode(&text));
+    let mut ids = pipeline
+        .tokenizer
+        .with_bos(pipeline.tokenizer.encode(&text));
     ids.truncate(max_tokens);
     let temps: Vec<f32> = vec![0.5, 0.65, 0.8, 0.9, 1.0, 1.15, 1.3, 1.5, 1.8, 2.2];
     let t1 = temps.iter().position(|&t| (t - 1.0).abs() < 1e-6).unwrap();
 
     println!("\n\x1b[1m🎯 Confidence calibration: {model_path}\x1b[0m");
-    println!("Held-out: {file}  ({} tokens){}", ids.len(), skill.map(|s| format!(", skill {s}")).unwrap_or_default());
+    println!(
+        "Held-out: {file}  ({} tokens){}",
+        ids.len(),
+        skill.map(|s| format!(", skill {s}")).unwrap_or_default()
+    );
     let (correct, pmax) = pipeline.calib_ids(&ids, &temps);
     if correct.is_empty() {
         anyhow::bail!("too few tokens to calibrate");
@@ -1552,7 +1830,11 @@ fn cmd_calibrate(model_path: &str, file: &str, skill: Option<&str>, max_tokens: 
     let (ece_raw, diag_raw) = ece_bins(&col(t1), &correct);
     let conf_raw: f32 = col(t1).iter().sum::<f32>() / correct.len() as f32;
 
-    println!("\nArgmax accuracy (top-1 == actual): {:.1}%   mean confidence (T=1): {:.1}%", acc * 100.0, conf_raw * 100.0);
+    println!(
+        "\nArgmax accuracy (top-1 == actual): {:.1}%   mean confidence (T=1): {:.1}%",
+        acc * 100.0,
+        conf_raw * 100.0
+    );
     let verdict = if conf_raw > acc + 0.02 {
         "overconfident"
     } else if conf_raw + 0.02 < acc {
@@ -1560,7 +1842,10 @@ fn cmd_calibrate(model_path: &str, file: &str, skill: Option<&str>, max_tokens: 
     } else {
         "well calibrated"
     };
-    println!("Raw Born mass: \x1b[1m{verdict}\x1b[0m (ECE = {:.3})", ece_raw);
+    println!(
+        "Raw Born mass: \x1b[1m{verdict}\x1b[0m (ECE = {:.3})",
+        ece_raw
+    );
 
     // Reliability diagram at T=1: conf-bin vs actual accuracy.
     println!("\n  reliability diagram (T=1):  bin  conf   acc    n");
@@ -1576,13 +1861,25 @@ fn cmd_calibrate(model_path: &str, file: &str, skill: Option<&str>, max_tokens: 
         } else {
             "·"
         };
-        println!("   {:>2}0%   {:>4.0}%  {:>4.0}%  {:>4}  {} {}", b, mc * 100.0, ac * 100.0, nb, bar, sign);
+        println!(
+            "   {:>2}0%   {:>4.0}%  {:>4.0}%  {:>4}  {} {}",
+            b,
+            mc * 100.0,
+            ac * 100.0,
+            nb,
+            bar,
+            sign
+        );
     }
 
     let (bt, bece) = (temps[best.0], best.1);
     println!("\n  ECE by temperature:");
     for (t, e) in &eces {
-        let mark = if (*t - bt).abs() < 1e-6 { "  ← best" } else { "" };
+        let mark = if (*t - bt).abs() < 1e-6 {
+            "  ← best"
+        } else {
+            ""
+        };
         println!("   T={:<4} ECE {:.3}{}", t, e, mark);
     }
     if (bt - 1.0).abs() < 1e-6 || bece + 0.005 > ece_raw {
@@ -1591,9 +1888,18 @@ fn cmd_calibrate(model_path: &str, file: &str, skill: Option<&str>, max_tokens: 
                   Born mass is itself the honest confidence."
         );
     } else {
-        println!("\n\x1b[1mVerdict: temperature T={bt} lowers ECE {:.3}→{:.3}\x1b[0m ({:.0}% of calibration error removed).", ece_raw, bece, (1.0 - bece / ece_raw.max(1e-6)) * 100.0);
-        println!("Write into header (additive): \x1b[2mpython converter/set_calibration.py {model_path} --temperature {bt}\x1b[0m");
-        println!("The runtime will apply it to --confidence/--trace/explain (calibrated Born mass).");
+        println!(
+            "\n\x1b[1mVerdict: temperature T={bt} lowers ECE {:.3}→{:.3}\x1b[0m ({:.0}% of calibration error removed).",
+            ece_raw,
+            bece,
+            (1.0 - bece / ece_raw.max(1e-6)) * 100.0
+        );
+        println!(
+            "Write into header (additive): \x1b[2mpython converter/set_calibration.py {model_path} --temperature {bt}\x1b[0m"
+        );
+        println!(
+            "The runtime will apply it to --confidence/--trace/explain (calibrated Born mass)."
+        );
     }
     Ok(())
 }
@@ -1624,29 +1930,54 @@ fn render_trace(traces: &[cortiq_engine::TokenTrace], pipeline: &Pipeline, json:
     if traces.is_empty() {
         return;
     }
-    let has_routing = traces.iter().any(|t| t.active_skill.is_some() || t.recon.is_some());
+    let has_routing = traces
+        .iter()
+        .any(|t| t.active_skill.is_some() || t.recon.is_some());
     println!("\n\x1b[1mtrace ({} tokens):\x1b[0m", traces.len());
     if has_routing {
-        println!("  {:>4}  {:<12}  {:>5}  {:<10}  {:>7}", "#", "token", "conf", "skill", "E");
+        println!(
+            "  {:>4}  {:<12}  {:>5}  {:<10}  {:>7}",
+            "#", "token", "conf", "skill", "E"
+        );
     } else {
         println!("  {:>4}  {:<12}  {:>5}", "#", "token", "conf");
     }
     for tr in traces {
         let piece = pipeline.tokenizer.decode_token(tr.token_id);
-        let shown: String = piece.chars().take(12).collect::<String>().replace('\n', "⏎");
+        let shown: String = piece
+            .chars()
+            .take(12)
+            .collect::<String>()
+            .replace('\n', "⏎");
         let conf = conf_colour(&format!("{:>4.0}%", tr.confidence * 100.0), tr.confidence);
         if has_routing {
             let skill = tr.active_skill.as_deref().unwrap_or("—");
             let sw = if tr.switched { " ▸" } else { "" };
-            let e = tr.recon.map(|e| format!("{e:.4}")).unwrap_or_else(|| "—".into());
-            println!("  {:>4}  {:<12}  {}  {:<10}  {:>7}{sw}", tr.t, shown, conf, skill, e);
+            let e = tr
+                .recon
+                .map(|e| format!("{e:.4}"))
+                .unwrap_or_else(|| "—".into());
+            println!(
+                "  {:>4}  {:<12}  {}  {:<10}  {:>7}{sw}",
+                tr.t, shown, conf, skill, e
+            );
         } else {
             println!("  {:>4}  {:<12}  {}", tr.t, shown, conf);
         }
         if json {
-            let sk = tr.active_skill.as_deref().map(|s| format!("\"{s}\"")).unwrap_or_else(|| "null".into());
-            let rc = tr.recon.map(|e| format!("{e:.6}")).unwrap_or_else(|| "null".into());
-            eprintln!("{{\"t\":{},\"token_id\":{},\"confidence\":{:.6},\"active_skill\":{},\"recon\":{},\"switched\":{}}}", tr.t, tr.token_id, tr.confidence, sk, rc, tr.switched);
+            let sk = tr
+                .active_skill
+                .as_deref()
+                .map(|s| format!("\"{s}\""))
+                .unwrap_or_else(|| "null".into());
+            let rc = tr
+                .recon
+                .map(|e| format!("{e:.6}"))
+                .unwrap_or_else(|| "null".into());
+            eprintln!(
+                "{{\"t\":{},\"token_id\":{},\"confidence\":{:.6},\"active_skill\":{},\"recon\":{},\"switched\":{}}}",
+                tr.t, tr.token_id, tr.confidence, sk, rc, tr.switched
+            );
         }
     }
 }
@@ -1661,7 +1992,23 @@ fn chat_mode(has_template: bool, raw: bool, resuming: bool) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn cmd_run(model_path: &str, task: &str, prompt: Option<&str>, max_tokens: usize, skill: Option<&str>, greedy: bool, raw: bool, no_think: bool, blend: Option<&str>, route_dynamic: bool, confidence: bool, trace: bool, trace_json: bool, state: Option<&str>, o1: &O1Flags) -> anyhow::Result<()> {
+async fn cmd_run(
+    model_path: &str,
+    task: &str,
+    prompt: Option<&str>,
+    max_tokens: usize,
+    skill: Option<&str>,
+    greedy: bool,
+    raw: bool,
+    no_think: bool,
+    blend: Option<&str>,
+    route_dynamic: bool,
+    confidence: bool,
+    trace: bool,
+    trace_json: bool,
+    state: Option<&str>,
+    o1: &O1Flags,
+) -> anyhow::Result<()> {
     println!("Loading model: {}", model_path);
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     let mut skill = skill.map(str::to_string);
@@ -1673,17 +2020,28 @@ async fn cmd_run(model_path: &str, task: &str, prompt: Option<&str>, max_tokens:
     if let Some(sp) = state {
         let st = SessionState::read(sp)?;
         if st.kind != STATE_KIND_LOGICAL {
-            anyhow::bail!("unsupported .cmfstate kind {} (this build reads logical only)", st.kind);
+            anyhow::bail!(
+                "unsupported .cmfstate kind {} (this build reads logical only)",
+                st.kind
+            );
         }
         if st.fp != SessionState::fingerprint(model.arch()) {
-            anyhow::bail!("state was frozen from a different model (fingerprint {:?} ≠ {:?})", st.fp, SessionState::fingerprint(model.arch()));
+            anyhow::bail!(
+                "state was frozen from a different model (fingerprint {:?} ≠ {:?})",
+                st.fp,
+                SessionState::fingerprint(model.arch())
+            );
         }
         if skill.is_none() {
             skill = st.skill.clone();
         }
         resume_seed = st.seed;
         resume_prefix = st.tokens;
-        println!("resume: {} frozen tokens, skill {}", resume_prefix.len(), skill.as_deref().unwrap_or("—"));
+        println!(
+            "resume: {} frozen tokens, skill {}",
+            resume_prefix.len(),
+            skill.as_deref().unwrap_or("—")
+        );
     }
     // A file that carries routable skills routes by default (spec §9 —
     // selection is a property of the file): the prompt picks its
@@ -1728,7 +2086,9 @@ async fn cmd_run(model_path: &str, task: &str, prompt: Option<&str>, max_tokens:
     o1.apply(&mut pipeline);
     if route_dynamic {
         if skill.is_some() || blend.is_some() {
-            println!("note: --route-dynamic overrides --skill/--blend (routing starts from backbone)");
+            println!(
+                "note: --route-dynamic overrides --skill/--blend (routing starts from backbone)"
+            );
         }
         let n = pipeline.enable_dynamic_routing();
         if n == 0 {
@@ -1746,7 +2106,13 @@ async fn cmd_run(model_path: &str, task: &str, prompt: Option<&str>, max_tokens:
     let mut task = task.to_string();
     if task == "general" {
         if let Some(sid) = skill.as_deref() {
-            if let Some(mt) = model.header.skills.iter().find(|r| r.id == sid).and_then(|r| r.input_mask_task.clone()) {
+            if let Some(mt) = model
+                .header
+                .skills
+                .iter()
+                .find(|r| r.id == sid)
+                .and_then(|r| r.input_mask_task.clone())
+            {
                 println!("skill '{sid}' carries task mask '{mt}' — sparse execution on");
                 task = mt;
             }
@@ -1761,7 +2127,12 @@ async fn cmd_run(model_path: &str, task: &str, prompt: Option<&str>, max_tokens:
     let mask = runtime.active_mask().await;
 
     let status = runtime.status().await;
-    println!("Ready: {} | Task: {} | Sparsity: {:.0}%", status.model_name, status.active_task, status.active_sparsity * 100.0);
+    println!(
+        "Ready: {} | Task: {} | Sparsity: {:.0}%",
+        status.model_name,
+        status.active_task,
+        status.active_sparsity * 100.0
+    );
 
     // The FILE decides chat behaviour (spec §6.1): a container that carries a
     // template is chatted with, one that doesn't is completed. Gate on the
@@ -1779,65 +2150,75 @@ async fn cmd_run(model_path: &str, task: &str, prompt: Option<&str>, max_tokens:
         tracing::info!("no chat template in this container — running completion mode");
     }
 
-    let generate_and_print = |pipeline: &mut Pipeline, ids: &[u32]| -> anyhow::Result<Option<String>> {
-        use std::io::Write;
-        // Stream silently when the confidence view will reprint coloured;
-        // otherwise stream live as before.
-        let cb: cortiq_engine::TokenCallback = if confidence {
-            Box::new(|_tok: &str| true)
-        } else {
-            Box::new(|tok: &str| {
-                print!("{tok}");
-                let _ = std::io::stdout().flush();
-                true
-            })
-        };
-        let started = std::time::Instant::now();
-        match pipeline.generate_from_ids(ids, max_tokens, mask.as_ref(), Some(cb)) {
-            Ok(r) => {
-                let secs = started.elapsed().as_secs_f64();
-                // Confidence view: reprint token-by-token, coloured by the
-                // model's Born mass on each emitted token.
-                if confidence && !r.token_confidence.is_empty() {
-                    println!();
-                    let mut lo = 1.0f32;
-                    let mut sum = 0.0f32;
-                    for (id, &c) in r.token_ids.iter().zip(&r.token_confidence) {
-                        let piece = pipeline.tokenizer.decode_token(*id);
-                        print!("{}", conf_colour(&piece, c));
-                        lo = lo.min(c);
-                        sum += c;
-                    }
+    let generate_and_print =
+        |pipeline: &mut Pipeline, ids: &[u32]| -> anyhow::Result<Option<String>> {
+            use std::io::Write;
+            // Stream silently when the confidence view will reprint coloured;
+            // otherwise stream live as before.
+            let cb: cortiq_engine::TokenCallback = if confidence {
+                Box::new(|_tok: &str| true)
+            } else {
+                Box::new(|tok: &str| {
+                    print!("{tok}");
                     let _ = std::io::stdout().flush();
-                    let avg = sum / r.token_confidence.len() as f32;
-                    println!(
-                        "\n\nconfidence: mean {:.0}% · min {:.0}%  \
+                    true
+                })
+            };
+            let started = std::time::Instant::now();
+            match pipeline.generate_from_ids(ids, max_tokens, mask.as_ref(), Some(cb)) {
+                Ok(r) => {
+                    let secs = started.elapsed().as_secs_f64();
+                    // Confidence view: reprint token-by-token, coloured by the
+                    // model's Born mass on each emitted token.
+                    if confidence && !r.token_confidence.is_empty() {
+                        println!();
+                        let mut lo = 1.0f32;
+                        let mut sum = 0.0f32;
+                        for (id, &c) in r.token_ids.iter().zip(&r.token_confidence) {
+                            let piece = pipeline.tokenizer.decode_token(*id);
+                            print!("{}", conf_colour(&piece, c));
+                            lo = lo.min(c);
+                            sum += c;
+                        }
+                        let _ = std::io::stdout().flush();
+                        let avg = sum / r.token_confidence.len() as f32;
+                        println!(
+                            "\n\nconfidence: mean {:.0}% · min {:.0}%  \
                          (\x1b[38;2;80;220;100mknow\x1b[0m→\
                          \x1b[38;2;230;90;80mguess\x1b[0m)",
-                        avg * 100.0,
-                        lo * 100.0
-                    );
-                }
-                println!("\n[{} tokens, {:.1} tok/s, finish: {}]", r.tokens_generated, r.tokens_generated as f64 / secs.max(1e-9), r.finish_reason);
-                let sw = pipeline.route_switches();
-                if !sw.is_empty() {
-                    println!("route: {} skill switch(es):", sw.len());
-                    for (tok, from, to) in &sw {
-                        println!("  @tok{tok}: {} → {}", from.as_deref().unwrap_or("backbone"), to.as_deref().unwrap_or("backbone"));
+                            avg * 100.0,
+                            lo * 100.0
+                        );
                     }
+                    println!(
+                        "\n[{} tokens, {:.1} tok/s, finish: {}]",
+                        r.tokens_generated,
+                        r.tokens_generated as f64 / secs.max(1e-9),
+                        r.finish_reason
+                    );
+                    let sw = pipeline.route_switches();
+                    if !sw.is_empty() {
+                        println!("route: {} skill switch(es):", sw.len());
+                        for (tok, from, to) in &sw {
+                            println!(
+                                "  @tok{tok}: {} → {}",
+                                from.as_deref().unwrap_or("backbone"),
+                                to.as_deref().unwrap_or("backbone")
+                            );
+                        }
+                    }
+                    if trace {
+                        render_trace(&r.traces, pipeline, trace_json);
+                    }
+                    // `text` is the generated slice only (prompt excluded,
+                    // specials stripped) — exactly the assistant turn to carry
+                    // into the next render.
+                    return Ok(Some(r.text));
                 }
-                if trace {
-                    render_trace(&r.traces, pipeline, trace_json);
-                }
-                // `text` is the generated slice only (prompt excluded,
-                // specials stripped) — exactly the assistant turn to carry
-                // into the next render.
-                return Ok(Some(r.text));
+                Err(e) => println!("error: {e}"),
             }
-            Err(e) => println!("error: {e}"),
-        }
-        Ok(None)
-    };
+            Ok(None)
+        };
 
     // B2: prepend the frozen prefix (empty when not resuming) so the
     // continuation runs from the warm context. Token-level replay ==
@@ -1847,7 +2228,9 @@ async fn cmd_run(model_path: &str, task: &str, prompt: Option<&str>, max_tokens:
         // "empty prompt: nothing to generate from" as it does today. The
         // template would otherwise render its boilerplate and generate.
         if use_template && !text.is_empty() {
-            pipeline.tokenizer.apply_chat_template_opts(history, thinking)
+            pipeline
+                .tokenizer
+                .apply_chat_template_opts(history, thinking)
         } else {
             let mut ids = resume_prefix.clone();
             ids.extend(pipeline.tokenizer.encode(text));
@@ -1945,13 +2328,29 @@ async fn cmd_info(model_path: &str) -> anyhow::Result<()> {
     println!("  Layers:      {} ({mix})", arch.num_layers);
     println!("  Hidden:      {}", arch.hidden_size);
     println!("  FFN:         {}", arch.intermediate_size);
-    println!("  Heads:       {} (KV: {})", arch.num_attention_heads, arch.num_kv_heads);
+    println!(
+        "  Heads:       {} (KV: {})",
+        arch.num_attention_heads, arch.num_kv_heads
+    );
     println!("  Vocab:       {}", arch.vocab_size);
-    println!("  Quant:       {:?} (default; per-tensor in directory)", model.header.quant_type);
+    println!(
+        "  Quant:       {:?} (default; per-tensor in directory)",
+        model.header.quant_type
+    );
     println!("  Tensors:     {}", model.tensors.len());
-    println!("  Params:      {:.2}B", model.total_param_count() as f64 / 1e9);
+    println!(
+        "  Params:      {:.2}B",
+        model.total_param_count() as f64 / 1e9
+    );
     println!("  Masks:       {}", model.masks.masks.len());
-    println!("  Tokenizer:   {}", if model.vocab.is_some() { "embedded" } else { "sidecar required" });
+    println!(
+        "  Tokenizer:   {}",
+        if model.vocab.is_some() {
+            "embedded"
+        } else {
+            "sidecar required"
+        }
+    );
     println!(
         "  MTP:         {}",
         match &arch.mtp {
@@ -1974,16 +2373,35 @@ fn cmd_story(model_path: &str) -> anyhow::Result<()> {
     let sect = "─".repeat(60);
 
     // ── Who I am ──
-    let full = arch.layer_types.iter().filter(|t| matches!(t, cortiq_core::LayerType::FullAttention | cortiq_core::LayerType::SlidingAttention)).count();
-    let conv = arch.layer_types.iter().filter(|t| matches!(t, cortiq_core::LayerType::ShortConv)).count();
+    let full = arch
+        .layer_types
+        .iter()
+        .filter(|t| {
+            matches!(
+                t,
+                cortiq_core::LayerType::FullAttention | cortiq_core::LayerType::SlidingAttention
+            )
+        })
+        .count();
+    let conv = arch
+        .layer_types
+        .iter()
+        .filter(|t| matches!(t, cortiq_core::LayerType::ShortConv))
+        .count();
     // "mixer" layers = everything that isn't full softmax attention
     // (linear-attention cores and short-conv mixers alike).
     let linear = arch.num_layers - full;
     // Prefer the precise word when the non-full layers are conv mixers.
     let mixer = if conv > 0 { "conv" } else { "linear" };
     let body = match (&arch.moe, linear, full) {
-        (Some(m), l, f) if l > 0 && f > 0 => format!("hybrid: {l} {mixer} + {f} full-attention layers, MoE ({} experts, top-{})", m.num_experts, m.top_k),
-        (Some(m), _, _) => format!("MoE transformer ({} experts, top-{})", m.num_experts, m.top_k),
+        (Some(m), l, f) if l > 0 && f > 0 => format!(
+            "hybrid: {l} {mixer} + {f} full-attention layers, MoE ({} experts, top-{})",
+            m.num_experts, m.top_k
+        ),
+        (Some(m), _, _) => format!(
+            "MoE transformer ({} experts, top-{})",
+            m.num_experts, m.top_k
+        ),
         (None, l, f) if l > 0 && f > 0 => {
             format!("hybrid: {l} {mixer} + {f} full-attention layers")
         }
@@ -1991,8 +2409,16 @@ fn cmd_story(model_path: &str) -> anyhow::Result<()> {
     };
     println!("\n\x1b[1m📖 Model story: {model_path}\x1b[0m");
     println!("{sect}");
-    println!("I am \x1b[1m{}\x1b[0m, a {} with {:.2} billion parameters.", arch.arch_name, body, model.total_param_count() as f64 / 1e9);
-    println!("Body: {} layers, hidden {}, {} attention heads, vocab {}.", arch.num_layers, arch.hidden_size, arch.num_attention_heads, arch.vocab_size);
+    println!(
+        "I am \x1b[1m{}\x1b[0m, a {} with {:.2} billion parameters.",
+        arch.arch_name,
+        body,
+        model.total_param_count() as f64 / 1e9
+    );
+    println!(
+        "Body: {} layers, hidden {}, {} attention heads, vocab {}.",
+        arch.num_layers, arch.hidden_size, arch.num_attention_heads, arch.vocab_size
+    );
 
     // ── Where I come from ──
     if let Some(p) = prov {
@@ -2013,8 +2439,14 @@ fn cmd_story(model_path: &str) -> anyhow::Result<()> {
         }
     }
     if let Some(lc) = &arch.linear_core {
-        let extra = lc.nphase.map(|n| format!(", {n} phases/head")).unwrap_or_default();
-        println!("Linear attention = «{}» ({} heads{extra}).", lc.kind, lc.num_heads);
+        let extra = lc
+            .nphase
+            .map(|n| format!(", {n} phases/head"))
+            .unwrap_or_default();
+        println!(
+            "Linear attention = «{}» ({} heads{extra}).",
+            lc.kind, lc.num_heads
+        );
     }
 
     // ── What the body is made of (dtype histogram) ──
@@ -2025,26 +2457,46 @@ fn cmd_story(model_path: &str) -> anyhow::Result<()> {
         e.1 += t.nbytes;
     }
     print!("\nBody assembled from {} tensors: ", model.tensors.len());
-    let parts: Vec<String> = dtypes.iter().map(|(d, (n, b))| format!("{d} ×{n} ({:.1} GB)", *b as f64 / 1e9)).collect();
+    let parts: Vec<String> = dtypes
+        .iter()
+        .map(|(d, (n, b))| format!("{d} ×{n} ({:.1} GB)", *b as f64 / 1e9))
+        .collect();
     println!("{}.", parts.join(", "));
     if let Some(mtp) = &arch.mtp {
-        println!("I carry an MTP head ({} block) — I can speculatively speed up.", mtp.num_layers);
+        println!(
+            "I carry an MTP head ({} block) — I can speculatively speed up.",
+            mtp.num_layers
+        );
     }
 
     // ── Which skills I carry (swarm) ──
     if !model.header.skills.is_empty() {
         let total: u64 = model.tensors.iter().map(|t| t.nbytes).sum();
-        println!("\n\x1b[1mMy skill swarm ({}):\x1b[0m", model.header.skills.len());
+        println!(
+            "\n\x1b[1mMy skill swarm ({}):\x1b[0m",
+            model.header.skills.len()
+        );
         for sk in &model.header.skills {
             let sbytes: u64 = model.skill_tensors(&sk.id).map(|t| t.nbytes).sum();
             let name = sk.name.as_deref().unwrap_or(&sk.id);
-            print!("  • \x1b[1m{}\x1b[0m ({name}) — {:.0} MB, {:.1}% of the file, layers {:?}", sk.id, sbytes as f64 / 1e6, sbytes as f64 / total as f64 * 100.0, sk.layers);
+            print!(
+                "  • \x1b[1m{}\x1b[0m ({name}) — {:.0} MB, {:.1}% of the file, layers {:?}",
+                sk.id,
+                sbytes as f64 / 1e6,
+                sbytes as f64 / total as f64 * 100.0,
+                sk.layers
+            );
             // Honest quality contract (claim 16).
             if let Some(q) = &sk.quality {
                 let g = |k: &str| q.get(k).and_then(|v| v.as_f64());
                 if let (Some(bb), Some(ov)) = (g("backbone"), g("overlaid").or(g("masked"))) {
                     let d = (ov - bb) / bb * 100.0;
-                    print!("  | {} {bb:.2}→{ov:.2} ({d:+.1}%)", q.get("metric").and_then(|v| v.as_str()).unwrap_or("quality"));
+                    print!(
+                        "  | {} {bb:.2}→{ov:.2} ({d:+.1}%)",
+                        q.get("metric")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("quality")
+                    );
                 }
             } else {
                 print!("  | quality NOT measured");
@@ -2067,7 +2519,10 @@ fn cmd_story(model_path: &str) -> anyhow::Result<()> {
     if let Some(tc) = &model.header.tokenizer_config {
         let n = tc.chat_template.as_deref().map(str::len).unwrap_or(0);
         if n > 0 {
-            print!("; chat template {n} chars, {} stop token(s)", tc.eos_token_ids.len());
+            print!(
+                "; chat template {n} chars, {} stop token(s)",
+                tc.eos_token_ids.len()
+            );
         }
     }
     println!(".");
@@ -2083,16 +2538,25 @@ fn cmd_story(model_path: &str) -> anyhow::Result<()> {
 
     // ── Am I part of a whole ──
     if let Some(sh) = &model.header.shard {
-        println!("I am shard {} of {} (the full model is in the neighbors).", sh.no, sh.count);
+        println!(
+            "I am shard {} of {} (the full model is in the neighbors).",
+            sh.no, sh.count
+        );
     }
 
     // ── Am I intact (verifiable) ──
     print!("\nIntegrity: ");
     let problems = model.verify();
     if problems.is_empty() {
-        println!("\x1b[38;2;80;220;100mall {} hashes matched — I am not corrupted or tampered with.\x1b[0m", model.tensors.len());
+        println!(
+            "\x1b[38;2;80;220;100mall {} hashes matched — I am not corrupted or tampered with.\x1b[0m",
+            model.tensors.len()
+        );
     } else {
-        println!("\x1b[38;2;230;90;80m{} problem(s) — the file is corrupted:\x1b[0m", problems.len());
+        println!(
+            "\x1b[38;2;230;90;80m{} problem(s) — the file is corrupted:\x1b[0m",
+            problems.len()
+        );
         for p in problems.iter().take(5) {
             println!("  ✗ {p}");
         }
@@ -2123,14 +2587,42 @@ fn cmd_diff(a_path: &str, b_path: &str) -> anyhow::Result<()> {
             hdr.push(format!("  {label:<12} {x}  →  {y}"));
         }
     };
-    row("format", format!("v{}", a.header.version), format!("v{}", b.header.version));
+    row(
+        "format",
+        format!("v{}", a.header.version),
+        format!("v{}", b.header.version),
+    );
     row("arch", aa.arch_name.clone(), ba.arch_name.clone());
-    row("layers", aa.num_layers.to_string(), ba.num_layers.to_string());
-    row("hidden", aa.hidden_size.to_string(), ba.hidden_size.to_string());
-    row("ffn", aa.intermediate_size.to_string(), ba.intermediate_size.to_string());
-    row("vocab", aa.vocab_size.to_string(), ba.vocab_size.to_string());
-    row("quant", format!("{:?}", a.header.quant_type), format!("{:?}", b.header.quant_type));
-    row("params", format!("{:.3}B", a.total_param_count() as f64 / 1e9), format!("{:.3}B", b.total_param_count() as f64 / 1e9));
+    row(
+        "layers",
+        aa.num_layers.to_string(),
+        ba.num_layers.to_string(),
+    );
+    row(
+        "hidden",
+        aa.hidden_size.to_string(),
+        ba.hidden_size.to_string(),
+    );
+    row(
+        "ffn",
+        aa.intermediate_size.to_string(),
+        ba.intermediate_size.to_string(),
+    );
+    row(
+        "vocab",
+        aa.vocab_size.to_string(),
+        ba.vocab_size.to_string(),
+    );
+    row(
+        "quant",
+        format!("{:?}", a.header.quant_type),
+        format!("{:?}", b.header.quant_type),
+    );
+    row(
+        "params",
+        format!("{:.3}B", a.total_param_count() as f64 / 1e9),
+        format!("{:.3}B", b.total_param_count() as f64 / 1e9),
+    );
     if hdr.is_empty() {
         println!("Header/arch: identical.");
     } else {
@@ -2142,9 +2634,15 @@ fn cmd_diff(a_path: &str, b_path: &str) -> anyhow::Result<()> {
 
     // ── Tensors (identity = name + hash64) ──
     use std::collections::BTreeMap;
-    let map = |m: &CmfModel| -> BTreeMap<String, (u64, String, u64)> { m.tensors.iter().map(|t| (t.name.clone(), (t.hash, format!("{:?}", t.dtype), t.nbytes))).collect() };
+    let map = |m: &CmfModel| -> BTreeMap<String, (u64, String, u64)> {
+        m.tensors
+            .iter()
+            .map(|t| (t.name.clone(), (t.hash, format!("{:?}", t.dtype), t.nbytes)))
+            .collect()
+    };
     let (ma, mb) = (map(&a), map(&b));
-    let (mut added, mut removed, mut changed, mut same) = (Vec::new(), Vec::new(), Vec::new(), 0u64);
+    let (mut added, mut removed, mut changed, mut same) =
+        (Vec::new(), Vec::new(), Vec::new(), 0u64);
     for (name, (hb, db, nb)) in &mb {
         match ma.get(name) {
             None => added.push((name.clone(), db.clone(), *nb)),
@@ -2184,26 +2682,60 @@ fn cmd_diff(a_path: &str, b_path: &str) -> anyhow::Result<()> {
             println!("    … {} more", rows.len() - 20);
         }
     };
-    show("  \x1b[38;2;80;220;100m+ new:\x1b[0m", &added.iter().map(|(n, d, b)| format!("{n}  [{d}, {:.1} MB]", *b as f64 / 1e6)).collect::<Vec<_>>());
-    show("  \x1b[38;2;230;90;80m− removed:\x1b[0m", &removed.iter().map(|(n, d, b)| format!("{n}  [{d}, {:.1} MB]", *b as f64 / 1e6)).collect::<Vec<_>>());
+    show(
+        "  \x1b[38;2;80;220;100m+ new:\x1b[0m",
+        &added
+            .iter()
+            .map(|(n, d, b)| format!("{n}  [{d}, {:.1} MB]", *b as f64 / 1e6))
+            .collect::<Vec<_>>(),
+    );
+    show(
+        "  \x1b[38;2;230;90;80m− removed:\x1b[0m",
+        &removed
+            .iter()
+            .map(|(n, d, b)| format!("{n}  [{d}, {:.1} MB]", *b as f64 / 1e6))
+            .collect::<Vec<_>>(),
+    );
     show(
         "  \x1b[38;2;230;190;80m~ changed:\x1b[0m",
         &changed
             .iter()
             .map(|(n, da, db, na, nb)| {
-                let dt = if da == db { da.clone() } else { format!("{da}→{db}") };
-                let sz = if na == nb { format!("{:.1} MB", *nb as f64 / 1e6) } else { format!("{:.1}→{:.1} MB", *na as f64 / 1e6, *nb as f64 / 1e6) };
+                let dt = if da == db {
+                    da.clone()
+                } else {
+                    format!("{da}→{db}")
+                };
+                let sz = if na == nb {
+                    format!("{:.1} MB", *nb as f64 / 1e6)
+                } else {
+                    format!("{:.1}→{:.1} MB", *na as f64 / 1e6, *nb as f64 / 1e6)
+                };
                 format!("{n}  [{dt}, {sz}]")
             })
             .collect::<Vec<_>>(),
     );
 
     // ── Skills (swarm, Patent 15) ──
-    let sid = |m: &CmfModel| -> BTreeMap<String, Vec<usize>> { m.header.skills.iter().map(|s| (s.id.clone(), s.layers.clone())).collect() };
+    let sid = |m: &CmfModel| -> BTreeMap<String, Vec<usize>> {
+        m.header
+            .skills
+            .iter()
+            .map(|s| (s.id.clone(), s.layers.clone()))
+            .collect()
+    };
     let (sa, sb) = (sid(&a), sid(&b));
     if !sa.is_empty() || !sb.is_empty() {
-        let new_sk: Vec<_> = sb.keys().filter(|k| !sa.contains_key(*k)).cloned().collect();
-        let del_sk: Vec<_> = sa.keys().filter(|k| !sb.contains_key(*k)).cloned().collect();
+        let new_sk: Vec<_> = sb
+            .keys()
+            .filter(|k| !sa.contains_key(*k))
+            .cloned()
+            .collect();
+        let del_sk: Vec<_> = sa
+            .keys()
+            .filter(|k| !sb.contains_key(*k))
+            .cloned()
+            .collect();
         let kept: Vec<_> = sb.keys().filter(|k| sa.contains_key(*k)).cloned().collect();
         print!("\nSwarm: {} shared", kept.len());
         if !new_sk.is_empty() {
@@ -2224,7 +2756,10 @@ async fn cmd_verify(model_path: &str) -> anyhow::Result<()> {
     // Each shard is a self-contained valid .cmf (spec §10), so
     // verify opens the file as is, without merging neighbors.
     let model = CmfModel::open(model_path)?;
-    println!("  ✓ envelope, sections, tensor directory ({} tensors)", model.tensors.len());
+    println!(
+        "  ✓ envelope, sections, tensor directory ({} tensors)",
+        model.tensors.len()
+    );
 
     let problems = model.verify();
     if problems.is_empty() {
@@ -2248,22 +2783,43 @@ async fn cmd_masks(model_path: &str) -> anyhow::Result<()> {
     }
 
     println!("Masks in {}:", model_path);
-    println!("  {:<15} {:>8} {:>12} {:>6} {:>8}", "Name", "Sparsity", "Quality", "Layers", "Hot");
+    println!(
+        "  {:<15} {:>8} {:>12} {:>6} {:>8}",
+        "Name", "Sparsity", "Quality", "Layers", "Hot"
+    );
     println!("  {}", "-".repeat(56));
     for m in &model.masks.masks {
         let quality = match &m.quality {
             Some(q) => format!("{:.3} ({})", q.value, q.metric),
             None => "unmeasured".to_string(),
         };
-        println!("  {:<15} {:>7.0}% {:>12} {:>6} {:>8}", m.name, m.sparsity * 100.0, quality, m.active_layer_count(), if m.has_hot_pack { "hot" } else { "—" });
+        println!(
+            "  {:<15} {:>7.0}% {:>12} {:>6} {:>8}",
+            m.name,
+            m.sparsity * 100.0,
+            quality,
+            m.active_layer_count(),
+            if m.has_hot_pack { "hot" } else { "—" }
+        );
     }
 
     Ok(())
 }
 
-async fn cmd_bench(model_path: &str, task: &str, tokens: u32, ctx: Option<usize>, o1: &O1Flags, json: bool, core: bool) -> anyhow::Result<()> {
+async fn cmd_bench(
+    model_path: &str,
+    task: &str,
+    tokens: u32,
+    ctx: Option<usize>,
+    o1: &O1Flags,
+    json: bool,
+    core: bool,
+) -> anyhow::Result<()> {
     if !json {
-        println!("Benchmark: {} | task={} | tokens={}", model_path, task, tokens);
+        println!(
+            "Benchmark: {} | task={} | tokens={}",
+            model_path, task, tokens
+        );
     }
     if let Some(n) = ctx {
         // Long-context mode must not silently evict mid-measurement:
@@ -2281,7 +2837,11 @@ async fn cmd_bench(model_path: &str, task: &str, tokens: u32, ctx: Option<usize>
             temperature: 0.0, // greedy: benchmark must be deterministic
             seed: Some(42),
             // --core: no penalty pass → the sampler's clone-free argmax
-            repetition_penalty: if core { 1.0 } else { SamplerConfig::default().repetition_penalty },
+            repetition_penalty: if core {
+                1.0
+            } else {
+                SamplerConfig::default().repetition_penalty
+            },
             ..Default::default()
         },
     )?;
@@ -2301,7 +2861,11 @@ async fn cmd_bench(model_path: &str, task: &str, tokens: u32, ctx: Option<usize>
     }
     // "general" benches the dense path (enables MTP speculation);
     // named tasks bench masked sparse execution.
-    let mask = if task == "general" { None } else { runtime.active_mask().await };
+    let mask = if task == "general" {
+        None
+    } else {
+        runtime.active_mask().await
+    };
 
     // Warmup: touch every weight page once so the numbers below are
     // steady-state (a cold 14 GB mmap otherwise bills its first pass
@@ -2316,20 +2880,31 @@ async fn cmd_bench(model_path: &str, task: &str, tokens: u32, ctx: Option<usize>
     if let Some(n) = ctx {
         prompt_ids.truncate(n);
         if prompt_ids.len() < n {
-            anyhow::bail!("ctx {n}: synthetic prompt tokenized to only {} tokens", prompt_ids.len());
+            anyhow::bail!(
+                "ctx {n}: synthetic prompt tokenized to only {} tokens",
+                prompt_ids.len()
+            );
         }
     }
-    let _ = pipeline.forward_ids(&prompt_ids[..2.min(prompt_ids.len())], mask.as_ref()).map_err(|e| anyhow::anyhow!(e))?;
+    let _ = pipeline
+        .forward_ids(&prompt_ids[..2.min(prompt_ids.len())], mask.as_ref())
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // Prefill benchmark.
     let t0 = std::time::Instant::now();
-    let _ = pipeline.forward_ids(&prompt_ids, mask.as_ref()).map_err(|e| anyhow::anyhow!(e))?;
+    let _ = pipeline
+        .forward_ids(&prompt_ids, mask.as_ref())
+        .map_err(|e| anyhow::anyhow!(e))?;
     let prefill_s = t0.elapsed().as_secs_f64();
 
     // Pair-fusion micro-bench: the memory-traffic win MTP verify rides
     // on. Skipped under o1 — forward_pair appends into the (sealed,
     // emptied) cache, so its numbers would be meaningless there.
-    let (singles_ms, pair_ms) = if pipeline.o1_active() { (0.0, 0.0) } else { pipeline.measure_pair_fusion(8) };
+    let (singles_ms, pair_ms) = if pipeline.o1_active() {
+        (0.0, 0.0)
+    } else {
+        pipeline.measure_pair_fusion(8)
+    };
 
     // Decode benchmark. Steady-state decode speed comes from the
     // inter-token timestamps: generation's own prefill (fused pairs; +
@@ -2343,35 +2918,60 @@ async fn cmd_bench(model_path: &str, task: &str, tokens: u32, ctx: Option<usize>
     let stamps: Arc<std::sync::Mutex<Vec<Stamp>>> = Arc::default();
     let st = stamps.clone();
     let cb: cortiq_engine::TokenCallback = Box::new(move |_tok| {
-        st.lock().unwrap().push((std::time::Instant::now(), ALLOCS.load(AtomicOrdering::Relaxed), cortiq_engine::pool::dispatch_count()));
+        st.lock().unwrap().push((
+            std::time::Instant::now(),
+            ALLOCS.load(AtomicOrdering::Relaxed),
+            cortiq_engine::pool::dispatch_count(),
+        ));
         true
     });
     let t1 = std::time::Instant::now();
-    let result = pipeline.generate_from_ids(&prompt_ids, tokens as usize, mask.as_ref(), Some(cb)).map_err(|e| anyhow::anyhow!(e))?;
+    let result = pipeline
+        .generate_from_ids(&prompt_ids, tokens as usize, mask.as_ref(), Some(cb))
+        .map_err(|e| anyhow::anyhow!(e))?;
     let total_s = t1.elapsed().as_secs_f64();
 
     if !json {
-        println!("  Prompt:  {} tokens | prefill {:.1} tok/s", prompt_ids.len(), prompt_ids.len() as f64 / prefill_s.max(1e-9));
+        println!(
+            "  Prompt:  {} tokens | prefill {:.1} tok/s",
+            prompt_ids.len(),
+            prompt_ids.len() as f64 / prefill_s.max(1e-9)
+        );
     }
     let stamps = stamps.lock().unwrap();
     // stamp[0] fires right after generation's prefill (the first token
     // is sampled from the prefill hidden, no decode forward yet).
     let n_st = stamps.len();
-    let decode_tps = if n_st >= 2 { (n_st - 1) as f64 / (stamps[n_st - 1].0 - stamps[0].0).as_secs_f64().max(1e-9) } else { 0.0 };
+    let decode_tps = if n_st >= 2 {
+        (n_st - 1) as f64 / (stamps[n_st - 1].0 - stamps[0].0).as_secs_f64().max(1e-9)
+    } else {
+        0.0
+    };
     // Steady-state counters over the same inter-token window as tok/s.
     let (allocs_per_token, dispatches_per_token) = if n_st >= 2 {
         let steps = (n_st - 1) as f64;
-        ((stamps[n_st - 1].1 - stamps[0].1) as f64 / steps, (stamps[n_st - 1].2 - stamps[0].2) as f64 / steps)
+        (
+            (stamps[n_st - 1].1 - stamps[0].1) as f64 / steps,
+            (stamps[n_st - 1].2 - stamps[0].2) as f64 / steps,
+        )
     } else {
         (0.0, 0.0)
     };
-    let ttft_s = stamps.first().map(|s| s.0.duration_since(t1).as_secs_f64()).unwrap_or(0.0);
+    let ttft_s = stamps
+        .first()
+        .map(|s| s.0.duration_since(t1).as_secs_f64())
+        .unwrap_or(0.0);
     // KV/state residency at the end of the run: full-attention layers
     // grow O(context); the linear core (vmf_phase/GDN) and the nystrom
     // override hold O(1) state — this line is the long-context memory
     // claim, measured.
     let total_mem = pipeline.kv_cache.total_memory_bytes();
-    let nystrom_mem: usize = pipeline.kv_cache.layers.iter().map(|l| l.o1_memory_bytes()).sum();
+    let nystrom_mem: usize = pipeline
+        .kv_cache
+        .layers
+        .iter()
+        .map(|l| l.o1_memory_bytes())
+        .sum();
     if json {
         // llama-bench-compatible spirit: one flat JSON object, raw
         // numbers only — joinable without parsing human text.
@@ -2401,10 +3001,24 @@ async fn cmd_bench(model_path: &str, task: &str, tokens: u32, ctx: Option<usize>
         println!("{}", serde_json::to_string_pretty(&obj)?);
         return Ok(());
     }
-    println!("  Decode:  {} tokens | {:.1} tok/s steady (TTFT {:.2}s, {:.1} incl. prefill)", result.tokens_generated, decode_tps, ttft_s, result.tokens_generated as f64 / total_s.max(1e-9));
-    println!("  Steady:  {:.1} allocs/token | {:.1} pool dispatches/token", allocs_per_token, dispatches_per_token);
+    println!(
+        "  Decode:  {} tokens | {:.1} tok/s steady (TTFT {:.2}s, {:.1} incl. prefill)",
+        result.tokens_generated,
+        decode_tps,
+        ttft_s,
+        result.tokens_generated as f64 / total_s.max(1e-9)
+    );
+    println!(
+        "  Steady:  {:.1} allocs/token | {:.1} pool dispatches/token",
+        allocs_per_token, dispatches_per_token
+    );
     if pair_ms > 0.0 {
-        println!("  Pair:    2 singles {:.2} ms vs fused {:.2} ms (×{:.2} cheaper second lane)", singles_ms, pair_ms, singles_ms / pair_ms.max(1e-9));
+        println!(
+            "  Pair:    2 singles {:.2} ms vs fused {:.2} ms (×{:.2} cheaper second lane)",
+            singles_ms,
+            pair_ms,
+            singles_ms / pair_ms.max(1e-9)
+        );
     }
     if nystrom_mem > 0 {
         println!(
@@ -2415,10 +3029,19 @@ async fn cmd_bench(model_path: &str, task: &str, tokens: u32, ctx: Option<usize>
             pipeline.kv_cache.seq_len()
         );
     } else {
-        println!("  Memory:  KV+state {:.1} MB at seq_len {}", total_mem as f64 / 1e6, pipeline.kv_cache.seq_len());
+        println!(
+            "  Memory:  KV+state {:.1} MB at seq_len {}",
+            total_mem as f64 / 1e6,
+            pipeline.kv_cache.seq_len()
+        );
     }
     if result.mtp_drafted > 0 {
-        println!("  MTP:     drafted {} | accepted {} ({:.0}%)", result.mtp_drafted, result.mtp_accepted, result.mtp_accepted as f64 / result.mtp_drafted as f64 * 100.0);
+        println!(
+            "  MTP:     drafted {} | accepted {} ({:.0}%)",
+            result.mtp_drafted,
+            result.mtp_accepted,
+            result.mtp_accepted as f64 / result.mtp_drafted as f64 * 100.0
+        );
     }
     println!("  Finish:  {}", result.finish_reason);
     Ok(())

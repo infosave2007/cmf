@@ -1048,7 +1048,12 @@ impl Pipeline {
             Some(c) => {
                 let mut flags = c.layer_flags(self.num_layers);
                 for (li, f) in flags.iter_mut().enumerate() {
-                    if *f && !matches!(self.weights.layers[self.phys_layer(li)].attn, AttnKind::Full { .. }) {
+                    if *f
+                        && !matches!(
+                            self.weights.layers[self.phys_layer(li)].attn,
+                            AttnKind::Full { .. }
+                        )
+                    {
                         *f = false;
                     }
                 }
@@ -1879,8 +1884,18 @@ impl Pipeline {
             }
             // Looped Transformer: apply final norm at the end of each loop iteration.
             if self.is_loop_end(li) && li + 1 < self.num_layers {
-                h1 = inference::rms_norm(&h1, &self.weights.final_norm, self.rms_eps, self.norm_style);
-                h2 = inference::rms_norm(&h2, &self.weights.final_norm, self.rms_eps, self.norm_style);
+                h1 = inference::rms_norm(
+                    &h1,
+                    &self.weights.final_norm,
+                    self.rms_eps,
+                    self.norm_style,
+                );
+                h2 = inference::rms_norm(
+                    &h2,
+                    &self.weights.final_norm,
+                    self.rms_eps,
+                    self.norm_style,
+                );
             }
         }
         (h1, h2)
@@ -3227,7 +3242,12 @@ impl Pipeline {
                         // Looped Transformer: the graph stopped at a loop
                         // boundary — apply final norm before the next iteration.
                         if self.is_loop_end(end - 1) && end < self.num_layers {
-                            h = inference::rms_norm(&h, &self.weights.final_norm, self.rms_eps, self.norm_style);
+                            h = inference::rms_norm(
+                                &h,
+                                &self.weights.final_norm,
+                                self.rms_eps,
+                                self.norm_style,
+                            );
                         }
                         continue;
                     }
@@ -3567,7 +3587,12 @@ impl Pipeline {
             // Looped Transformer: apply final norm at the end of each loop iteration.
             // Nanbeige 4.2: after layer 21 (virtual), apply norm before looping back to layer 0.
             if self.is_loop_end(li) && li + 1 < self.num_layers {
-                h = inference::rms_norm(&h, &self.weights.final_norm, self.rms_eps, self.norm_style);
+                h = inference::rms_norm(
+                    &h,
+                    &self.weights.final_norm,
+                    self.rms_eps,
+                    self.norm_style,
+                );
             }
 
             // Dynamic routing φ capture (on-policy, fireball-style): the
@@ -3940,9 +3965,7 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
         g.resize(inter, 0.0);
         // Fused gate+up+silu: one dispatch, no separate silu pass.
         // Falls back to matvec_many + silu loop for unsupported dtypes.
-        if d.act == Act::Silu
-            && QTensor::matvec_silu_mul(&d.gate_proj, &d.up_proj, x, g, pool)
-        {
+        if d.act == Act::Silu && QTensor::matvec_silu_mul(&d.gate_proj, &d.up_proj, x, g, pool) {
             // g now holds silu(gate)·up directly.
         } else {
             u.resize(inter, 0.0);

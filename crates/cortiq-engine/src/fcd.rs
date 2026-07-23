@@ -54,7 +54,15 @@ pub struct FcdHyper {
 
 impl Default for FcdHyper {
     fn default() -> Self {
-        Self { steps: 300, lr: 5e-5, kl_w: 0.7, eval_every: 25, bs: 2, seq: 512, seed: 0 }
+        Self {
+            steps: 300,
+            lr: 5e-5,
+            kl_w: 0.7,
+            eval_every: 25,
+            bs: 2,
+            seq: 512,
+            seed: 0,
+        }
     }
 }
 
@@ -131,7 +139,12 @@ impl GenGateCfg {
             .iter()
             .map(|&off| va[off..off + 400].to_vec())
             .collect();
-        Some(Self { prompts, gen_tokens: 60, threshold: 0.35, baseline_slack: 0.10 })
+        Some(Self {
+            prompts,
+            gen_tokens: 60,
+            threshold: 0.35,
+            baseline_slack: 0.10,
+        })
     }
 }
 
@@ -139,7 +152,10 @@ impl GenGateCfg {
 /// no prompt's loop score exceeds `threshold` AND none exceeds its
 /// zero-shot baseline by more than `slack` — boundary values pass.
 pub fn gate_pass(scores: &[f64], baseline: &[f64], threshold: f64, slack: f64) -> bool {
-    scores.iter().zip(baseline).all(|(&s, &b)| s <= threshold && s <= b + slack)
+    scores
+        .iter()
+        .zip(baseline)
+        .all(|(&s, &b)| s <= threshold && s <= b + slack)
 }
 
 /// Checkpoint selection: lowest val ppl AMONG GATE-PASSING checkpoints
@@ -276,9 +292,10 @@ impl FcdModel {
             .iter()
             .any(|t| matches!(t, LayerType::LinearAttention));
         let gdn = if has_linear {
-            let lc = arch.linear_core.as_ref().ok_or_else(|| {
-                "model has linear layers but no arch.linear_core".to_string()
-            })?;
+            let lc = arch
+                .linear_core
+                .as_ref()
+                .ok_or_else(|| "model has linear layers but no arch.linear_core".to_string())?;
             if lc.kind != "gated_delta_net" {
                 return Err(format!(
                     "linear core '{}' has no FCD backward (only gated_delta_net)",
@@ -348,11 +365,7 @@ impl FcdModel {
                             .tensor(&format!("{p}self_attn.{n}"))
                             .and_then(|_| deq(model, &format!("{p}self_attn.{n}")).ok())
                     };
-                    let bias = match (
-                        opt("q_proj.bias"),
-                        opt("k_proj.bias"),
-                        opt("v_proj.bias"),
-                    ) {
+                    let bias = match (opt("q_proj.bias"), opt("k_proj.bias"), opt("v_proj.bias")) {
                         (Some(a), Some(b), Some(c)) => Some((a, b, c)),
                         _ => None,
                     };
@@ -381,7 +394,9 @@ impl FcdModel {
             });
         }
 
-        let rotary_dim = ((hd as f32 * arch.partial_rotary_factor) as usize).max(2).min(hd);
+        let rotary_dim = ((hd as f32 * arch.partial_rotary_factor) as usize)
+            .max(2)
+            .min(hd);
         let base = arch.rope_theta;
         let inv_freq: Vec<f64> = (0..rotary_dim / 2)
             .map(|i| 1.0 / base.powf(2.0 * i as f64 / rotary_dim as f64))
@@ -413,7 +428,12 @@ impl FcdModel {
             o1_flags: flags,
             // prefill: None = half the window, the same seal point
             // `cortiq ppl --o1` defaults to (see NysCfg::prefill).
-            nys: NysCfg { m: o1.m, w: o1.w, sink: o1.sink, prefill: None },
+            nys: NysCfg {
+                m: o1.m,
+                w: o1.w,
+                sink: o1.sink,
+                prefill: None,
+            },
             gdn,
             pool: Pool::from_env(),
         })
@@ -546,7 +566,13 @@ fn ln_ffn<'a>(fm: &'a FcdModel, ts: Option<&'a TrainState>, li: usize) -> LnFfn<
         }
     }
     let l = &fm.layers[li];
-    LnFfn { iln: &l.iln, pln: &l.pln, gate: &l.gate, up: &l.up, down: &l.down }
+    LnFfn {
+        iln: &l.iln,
+        pln: &l.pln,
+        gate: &l.gate,
+        up: &l.up,
+        down: &l.down,
+    }
 }
 
 // ───────────────────── layer forward (+ recompute) ─────────────────────
@@ -569,7 +595,12 @@ enum AttnActs {
     },
     /// Raw projection streams — the GDN backward replays conv + the
     /// recurrence from these.
-    Gdn { qkv: Vec<f32>, z: Vec<f32>, a: Vec<f32>, b: Vec<f32> },
+    Gdn {
+        qkv: Vec<f32>,
+        z: Vec<f32>,
+        a: Vec<f32>,
+        b: Vec<f32>,
+    },
 }
 
 pub(crate) struct LayerActs {
@@ -735,7 +766,17 @@ impl FcdModel {
         t: usize,
         nystrom: bool,
     ) -> (Vec<f32>, AttnActs) {
-        let FcdAttn::Full { wq, wk, wv, wo, q_norm, k_norm, bias, output_gate } = attn else {
+        let FcdAttn::Full {
+            wq,
+            wk,
+            wv,
+            wo,
+            q_norm,
+            k_norm,
+            bias,
+            output_gate,
+        } = attn
+        else {
             unreachable!("full_attn_fwd on a non-Full layer");
         };
         let (hsz, nh, nkv, hd) = (self.hidden, self.nh, self.nkv, self.hd);
@@ -878,7 +919,17 @@ impl FcdModel {
         ops::gemm_nt(&ao_eff, wo, &mut attn_out, n, qdim, hsz, pool);
         (
             attn_out,
-            AttnActs::Full { qpre, kpre, vproj, qrot, krot, qinv, kinv, ao, gate_pre },
+            AttnActs::Full {
+                qpre,
+                kpre,
+                vproj,
+                qrot,
+                krot,
+                qinv,
+                kinv,
+                ao,
+                gate_pre,
+            },
         )
     }
 
@@ -886,14 +937,19 @@ impl FcdModel {
     /// projections → f64 conv+SiLU per sequence → pooled per-(seq,
     /// k-head) delta-rule recurrence → out_proj. Matches the runtime
     /// `gdn_forward` (parity-tested in fcd_gradcheck).
-    fn gdn_attn_fwd(
-        &self,
-        attn: &FcdAttn,
-        n1: &[f32],
-        b: usize,
-        t: usize,
-    ) -> (Vec<f32>, AttnActs) {
-        let FcdAttn::Gdn { wqkv, wz, wa, wb, conv, a_log, dt_bias, norm, wout } = attn else {
+    fn gdn_attn_fwd(&self, attn: &FcdAttn, n1: &[f32], b: usize, t: usize) -> (Vec<f32>, AttnActs) {
+        let FcdAttn::Gdn {
+            wqkv,
+            wz,
+            wa,
+            wb,
+            conv,
+            a_log,
+            dt_bias,
+            norm,
+            wout,
+        } = attn
+        else {
             unreachable!("gdn_attn_fwd on a non-GDN layer");
         };
         let d = self.gdn.expect("gdn layer without gdn dims");
@@ -1047,9 +1103,7 @@ impl FcdModel {
 
         // ── attention backward (dispatch) → dn1 ──
         let dn1 = match &l.attn {
-            FcdAttn::Full { .. } => {
-                self.full_attn_bwd(&l.attn, &acts.attn, &dh1, b, t, nystrom)
-            }
+            FcdAttn::Full { .. } => self.full_attn_bwd(&l.attn, &acts.attn, &dh1, b, t, nystrom),
             FcdAttn::Gdn { .. } => self.gdn_attn_bwd(&l.attn, &acts.attn, &dh1, b, t),
         };
 
@@ -1078,10 +1132,30 @@ impl FcdModel {
         t: usize,
         nystrom: bool,
     ) -> Vec<f32> {
-        let FcdAttn::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, .. } = attn else {
+        let FcdAttn::Full {
+            wq,
+            wk,
+            wv,
+            wo,
+            q_norm,
+            k_norm,
+            output_gate,
+            ..
+        } = attn
+        else {
             unreachable!("full_attn_bwd on a non-Full layer");
         };
-        let AttnActs::Full { qpre, kpre, vproj, qrot, krot, qinv, kinv, ao, gate_pre } = acts
+        let AttnActs::Full {
+            qpre,
+            kpre,
+            vproj,
+            qrot,
+            krot,
+            qinv,
+            kinv,
+            ao,
+            gate_pre,
+        } = acts
         else {
             unreachable!("acts mismatch");
         };
@@ -1269,7 +1343,18 @@ impl FcdModel {
         b: usize,
         t: usize,
     ) -> Vec<f32> {
-        let FcdAttn::Gdn { wqkv, wz, wa, wb, conv, a_log, dt_bias, norm, wout } = attn else {
+        let FcdAttn::Gdn {
+            wqkv,
+            wz,
+            wa,
+            wb,
+            conv,
+            a_log,
+            dt_bias,
+            norm,
+            wout,
+        } = attn
+        else {
             unreachable!("gdn_attn_bwd on a non-GDN layer");
         };
         let AttnActs::Gdn { qkv, z, a, b: bstr } = acts else {
@@ -1463,10 +1548,24 @@ impl FcdModel {
 
         let mut ns = vec![0f32; n * hsz];
         let mut invs = vec![0f32; n];
-        ops::rmsnorm_fwd(hs, &self.final_norm, self.eps, self.gemma, &mut ns, &mut invs);
+        ops::rmsnorm_fwd(
+            hs,
+            &self.final_norm,
+            self.eps,
+            self.gemma,
+            &mut ns,
+            &mut invs,
+        );
         let mut nt = vec![0f32; n * hsz];
         let mut invt = vec![0f32; n];
-        ops::rmsnorm_fwd(ht, &self.final_norm, self.eps, self.gemma, &mut nt, &mut invt);
+        ops::rmsnorm_fwd(
+            ht,
+            &self.final_norm,
+            self.eps,
+            self.gemma,
+            &mut nt,
+            &mut invt,
+        );
 
         let inv_n = 1.0 / n as f64;
         let mut ce_sum = 0f64;
@@ -1479,8 +1578,24 @@ impl FcdModel {
         while r0 < n {
             let r1 = (r0 + LM_CHUNK).min(n);
             let c = r1 - r0;
-            ops::gemm_nt(&ns[r0 * hsz..r1 * hsz], wh, &mut ls[..c * vs], c, hsz, vs, pool);
-            ops::gemm_nt(&nt[r0 * hsz..r1 * hsz], wh, &mut lt[..c * vs], c, hsz, vs, pool);
+            ops::gemm_nt(
+                &ns[r0 * hsz..r1 * hsz],
+                wh,
+                &mut ls[..c * vs],
+                c,
+                hsz,
+                vs,
+                pool,
+            );
+            ops::gemm_nt(
+                &nt[r0 * hsz..r1 * hsz],
+                wh,
+                &mut lt[..c * vs],
+                c,
+                hsz,
+                vs,
+                pool,
+            );
             for r in 0..c {
                 let (ce, kl) = ops::ce_kl_position(
                     &ls[r * vs..(r + 1) * vs],
@@ -1506,7 +1621,15 @@ impl FcdModel {
         }
 
         let mut dhs = vec![0f32; n * hsz];
-        ops::rmsnorm_bwd(hs, &self.final_norm, &invs, &dns, self.gemma, &mut dhs, None);
+        ops::rmsnorm_bwd(
+            hs,
+            &self.final_norm,
+            &invs,
+            &dns,
+            self.gemma,
+            &mut dhs,
+            None,
+        );
         (ce_sum * inv_n, kl_sum * inv_n, dhs)
     }
 
@@ -1522,7 +1645,9 @@ impl FcdModel {
     ) {
         // Split-borrow: the weight view reads `data`, the grads write
         // `grad` — disjoint fields of TrainState.
-        let TrainState { layers, data, grad, .. } = ts;
+        let TrainState {
+            layers, data, grad, ..
+        } = ts;
         let mut dh = dh_last;
         for li in (0..self.nl).rev() {
             let h_in = &keep[li];
@@ -1541,7 +1666,13 @@ impl FcdModel {
                 }
                 None => {
                     let l = &self.layers[li];
-                    LnFfn { iln: &l.iln, pln: &l.pln, gate: &l.gate, up: &l.up, down: &l.down }
+                    LnFfn {
+                        iln: &l.iln,
+                        pln: &l.pln,
+                        gate: &l.gate,
+                        up: &l.up,
+                        down: &l.down,
+                    }
                 }
             };
             let (_, acts) = self.layer_forward(li, h_in, b, t, &wts, nys, true);
@@ -1617,13 +1748,28 @@ impl FcdModel {
             let n = bs * seq;
             let mut ns = vec![0f32; n * hsz];
             let mut inv = vec![0f32; n];
-            ops::rmsnorm_fwd(&h, &self.final_norm, self.eps, self.gemma, &mut ns, &mut inv);
+            ops::rmsnorm_fwd(
+                &h,
+                &self.final_norm,
+                self.eps,
+                self.gemma,
+                &mut ns,
+                &mut inv,
+            );
             let mut lg = vec![0f32; LM_CHUNK * vs];
             let mut r0 = 0usize;
             while r0 < n {
                 let r1 = (r0 + LM_CHUNK).min(n);
                 let c = r1 - r0;
-                ops::gemm_nt(&ns[r0 * hsz..r1 * hsz], wh, &mut lg[..c * vs], c, hsz, vs, pool);
+                ops::gemm_nt(
+                    &ns[r0 * hsz..r1 * hsz],
+                    wh,
+                    &mut lg[..c * vs],
+                    c,
+                    hsz,
+                    vs,
+                    pool,
+                );
                 for r in 0..c {
                     let row = &lg[r * vs..(r + 1) * vs];
                     let target = tgt[r0 + r] as usize;
@@ -1722,8 +1868,7 @@ pub fn run_polish(
         None => None,
     };
     // Identity fallback: the pre-training master copies.
-    let init_snapshot: Option<Vec<Vec<f32>>> =
-        gate_state.is_some().then(|| ts.data.clone());
+    let init_snapshot: Option<Vec<Vec<f32>>> = gate_state.is_some().then(|| ts.data.clone());
     let mut gate_evals: Vec<(usize, f64, Vec<f64>, bool)> = Vec::new();
 
     let mut rng = SplitMix64::new(hp.seed);
@@ -1988,13 +2133,13 @@ mod tests {
     fn gate_boundaries_and_tie_break() {
         let base = vec![0.25];
         assert!(gate_pass(&[0.35], &base, 0.35, 0.10), "== threshold passes");
-        assert!(gate_pass(&[0.35], &[0.25], 0.35, 0.10), "== base+slack passes");
+        assert!(
+            gate_pass(&[0.35], &[0.25], 0.35, 0.10),
+            "== base+slack passes"
+        );
         assert!(!gate_pass(&[0.351], &base, 0.35, 0.10));
         assert!(!gate_pass(&[0.30], &[0.10], 0.35, 0.10), "0.30 > 0.10+0.10");
-        let evals = vec![
-            (25usize, 20.0, vec![0.10]),
-            (50, 20.0, vec![0.10]),
-        ];
+        let evals = vec![(25usize, 20.0, vec![0.10]), (50, 20.0, vec![0.10])];
         assert_eq!(
             select_checkpoint(&evals, &base, 0.35, 0.10),
             Some(0),

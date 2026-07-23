@@ -200,7 +200,15 @@ mod accel {
     }
 }
 
-pub fn gemm_nt(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize, pool: Option<&Pool>) {
+pub fn gemm_nt(
+    x: &[f32],
+    w: &[f32],
+    y: &mut [f32],
+    n: usize,
+    k: usize,
+    m: usize,
+    pool: Option<&Pool>,
+) {
     debug_assert_eq!(x.len(), n * k);
     debug_assert_eq!(w.len(), m * k);
     debug_assert_eq!(y.len(), n * m);
@@ -209,8 +217,20 @@ pub fn gemm_nt(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize
         // Y = X · Wᵀ (row-major).
         unsafe {
             accel::cblas_sgemm(
-                101, 111, 112, n as i32, m as i32, k as i32, 1.0, x.as_ptr(), k as i32,
-                w.as_ptr(), k as i32, 0.0, y.as_mut_ptr(), m as i32,
+                101,
+                111,
+                112,
+                n as i32,
+                m as i32,
+                k as i32,
+                1.0,
+                x.as_ptr(),
+                k as i32,
+                w.as_ptr(),
+                k as i32,
+                0.0,
+                y.as_mut_ptr(),
+                m as i32,
             );
         }
         return;
@@ -246,7 +266,15 @@ pub fn gemm_nt(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize
 }
 
 /// dX += dY[n,m] · W[m,k] — parallel over row blocks (disjoint dX rows).
-pub fn gemm_dx(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m: usize, pool: Option<&Pool>) {
+pub fn gemm_dx(
+    dy: &[f32],
+    w: &[f32],
+    dx: &mut [f32],
+    n: usize,
+    k: usize,
+    m: usize,
+    pool: Option<&Pool>,
+) {
     debug_assert_eq!(dy.len(), n * m);
     debug_assert_eq!(w.len(), m * k);
     debug_assert_eq!(dx.len(), n * k);
@@ -255,8 +283,20 @@ pub fn gemm_dx(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m: usi
         // dX += dY · W (row-major, beta = 1 accumulates).
         unsafe {
             accel::cblas_sgemm(
-                101, 111, 111, n as i32, k as i32, m as i32, 1.0, dy.as_ptr(), m as i32,
-                w.as_ptr(), k as i32, 1.0, dx.as_mut_ptr(), k as i32,
+                101,
+                111,
+                111,
+                n as i32,
+                k as i32,
+                m as i32,
+                1.0,
+                dy.as_ptr(),
+                m as i32,
+                w.as_ptr(),
+                k as i32,
+                1.0,
+                dx.as_mut_ptr(),
+                k as i32,
             );
         }
         return;
@@ -296,7 +336,15 @@ pub fn gemm_dx(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m: usi
 
 /// dW += dYᵀ · X — parallel over dW ROW ranges (each worker owns a
 /// disjoint slice of output neurons; X is shared read-only).
-pub fn gemm_dw(dy: &[f32], x: &[f32], dw: &mut [f32], n: usize, k: usize, m: usize, pool: Option<&Pool>) {
+pub fn gemm_dw(
+    dy: &[f32],
+    x: &[f32],
+    dw: &mut [f32],
+    n: usize,
+    k: usize,
+    m: usize,
+    pool: Option<&Pool>,
+) {
     debug_assert_eq!(dy.len(), n * m);
     debug_assert_eq!(x.len(), n * k);
     debug_assert_eq!(dw.len(), m * k);
@@ -305,8 +353,20 @@ pub fn gemm_dw(dy: &[f32], x: &[f32], dw: &mut [f32], n: usize, k: usize, m: usi
         // dW += dYᵀ · X (row-major, beta = 1 accumulates).
         unsafe {
             accel::cblas_sgemm(
-                101, 112, 111, m as i32, k as i32, n as i32, 1.0, dy.as_ptr(), m as i32,
-                x.as_ptr(), k as i32, 1.0, dw.as_mut_ptr(), k as i32,
+                101,
+                112,
+                111,
+                m as i32,
+                k as i32,
+                n as i32,
+                1.0,
+                dy.as_ptr(),
+                m as i32,
+                x.as_ptr(),
+                k as i32,
+                1.0,
+                dw.as_mut_ptr(),
+                k as i32,
             );
         }
         return;
@@ -494,7 +554,15 @@ pub fn seg_means_bwd<F: Fp>(dl: &[F], t: usize, d: usize, m: usize, dx: &mut [F]
 /// Exact per-head causal attention: out[t] = softmax(q_t·Kᵀ/√d)·V over
 /// j ≤ t. `q`,`k` are `[t,d]`, `v` is `[t,dv]`, `out` is `[t,dv]`.
 #[allow(clippy::needless_range_loop)] // row[j] pairs with k-row j — indices are the clearer form
-pub fn attn_head_fwd<F: Fp>(q: &[F], k: &[F], v: &[F], t: usize, d: usize, dv: usize, out: &mut [F]) {
+pub fn attn_head_fwd<F: Fp>(
+    q: &[F],
+    k: &[F],
+    v: &[F],
+    t: usize,
+    d: usize,
+    dv: usize,
+    out: &mut [F],
+) {
     let scale = F::fromf(1.0 / (d as f64).sqrt());
     let mut row = vec![F::ZERO; t];
     for ti in 0..t {
@@ -722,8 +790,7 @@ fn nys_graph<F: Fp>(
     let mut e = vec![F::ZERO; m_eff * t];
     for i in 0..m_eff {
         for j in 0..t {
-            e[i * t + j] =
-                (dot(&q_l[i * d..(i + 1) * d], &k[j * d..(j + 1) * d]) * fscale).exp();
+            e[i * t + j] = (dot(&q_l[i * d..(i + 1) * d], &k[j * d..(j + 1) * d]) * fscale).exp();
         }
     }
     let mut fumu = vec![F::ZERO; t * m_eff];
@@ -812,7 +879,20 @@ fn nys_graph<F: Fp>(
         }
         den[ti] = dsum.maxf(F::fromf(NYS_DEN_EPS));
     }
-    NysGraph { m_eff, tp, q_l, k_l, mu, fu, e, fumu, far_keep, wmat, c_row, den }
+    NysGraph {
+        m_eff,
+        tp,
+        q_l,
+        k_l,
+        mu,
+        fu,
+        e,
+        fumu,
+        far_keep,
+        wmat,
+        c_row,
+        den,
+    }
 }
 
 fn transpose<F: Fp>(x: &[F], rows: usize, cols: usize) -> Vec<F> {
@@ -1358,8 +1438,7 @@ pub fn gdn_group_fwd<F: Fp>(
             let inv = F::fromf(1.0 / (ss / dv as f64 + cfg.rms_eps).sqrt());
             for dj in 0..dv {
                 let zv = z[ti * vd + h * dv + dj];
-                out[ti * vd + h * dv + dj] =
-                    o[dj] * inv * F::fromf(cfg.norm[dj] as f64) * silu(zv);
+                out[ti * vd + h * dv + dj] = o[dj] * inv * F::fromf(cfg.norm[dj] as f64) * silu(zv);
             }
         }
     }
@@ -1555,8 +1634,7 @@ pub fn gdn_group_bwd<F: Fp>(
                 kdot += dkh[di] * krow[di];
             }
             for di in 0..dk {
-                dcq[ti * c_dim + ko * dk + di] +=
-                    invq * dqh[di] - qrow[di] * qdot * invq / nq2;
+                dcq[ti * c_dim + ko * dk + di] += invq * dqh[di] - qrow[di] * qdot * invq / nq2;
                 dcq[ti * c_dim + kd + ko * dk + di] +=
                     invk * dkh[di] - krow[di] * kdot * invk / nk2;
             }

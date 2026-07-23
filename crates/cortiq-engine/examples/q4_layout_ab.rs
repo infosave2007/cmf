@@ -50,7 +50,9 @@ fn synth(rows: usize, cols: usize) -> (Split, Tiles, Vec<i8>) {
     let mut tiles = vec![0u8; groups * 18];
     let mut seed = 0x9E3779B97F4A7C15u64;
     let mut rnd = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (seed >> 33) as u32
     };
     for g in 0..groups {
@@ -64,7 +66,9 @@ fn synth(rows: usize, cols: usize) -> (Split, Tiles, Vec<i8>) {
             tiles[g * 18 + 2 + k] = byte;
         }
     }
-    let xq: Vec<i8> = (0..cols).map(|_| ((rnd() % 255) as i32 - 127) as i8).collect();
+    let xq: Vec<i8> = (0..cols)
+        .map(|_| ((rnd() % 255) as i32 - 127) as i8)
+        .collect();
     (Split { packed, scales }, Tiles { tiles }, xq)
 }
 
@@ -156,7 +160,10 @@ fn matvec_split(s: &Split, rows: usize, cols: usize, xq: &[i8], out: &mut [f32])
         for gi in 0..gpr {
             let g = r * gpr + gi;
             let sc = f16_val(u16::from_le_bytes([s.scales[g * 2], s.scales[g * 2 + 1]]));
-            let d = dot_group(&s.packed[g * 16..g * 16 + 16], &xq[gi * GROUP..gi * GROUP + GROUP]);
+            let d = dot_group(
+                &s.packed[g * 16..g * 16 + 16],
+                &xq[gi * GROUP..gi * GROUP + GROUP],
+            );
             acc += d as f32 * sc;
         }
         out[r] = acc;
@@ -206,7 +213,15 @@ fn main() {
 
     let gbs = |secs: f64| bytes_per_pass as f64 * reps as f64 / secs / 1e9;
     println!("q4 layout A/B  ({rows}x{cols}, {reps} reps, single thread)");
-    println!("  split (nibbles.., scales..): {:7.2} ms/pass  {:5.2} GB/s", split_s * 1e3 / reps as f64, gbs(split_s));
-    println!("  tiles (scale+nibbles, 18B):  {:7.2} ms/pass  {:5.2} GB/s", tiles_s * 1e3 / reps as f64, gbs(tiles_s));
+    println!(
+        "  split (nibbles.., scales..): {:7.2} ms/pass  {:5.2} GB/s",
+        split_s * 1e3 / reps as f64,
+        gbs(split_s)
+    );
+    println!(
+        "  tiles (scale+nibbles, 18B):  {:7.2} ms/pass  {:5.2} GB/s",
+        tiles_s * 1e3 / reps as f64,
+        gbs(tiles_s)
+    );
     println!("  tiles/split speed ratio: {:.3}x", split_s / tiles_s);
 }

@@ -107,7 +107,11 @@ impl Adam {
 
     /// Global-norm clip + Adam step. `params[i].len() == grads[i].len()`.
     fn step(&mut self, params: &mut [&mut [f32]], grads: &[Vec<f64>], lr_scale: f64) {
-        let gn: f64 = grads.iter().flat_map(|g| g.iter().map(|x| x * x)).sum::<f64>().sqrt();
+        let gn: f64 = grads
+            .iter()
+            .flat_map(|g| g.iter().map(|x| x * x))
+            .sum::<f64>()
+            .sqrt();
         let clip = if gn > CLIP { CLIP / gn } else { 1.0 };
         self.t += 1;
         let (bc1, bc2) = (1.0 - B1.powi(self.t), 1.0 - B2.powi(self.t));
@@ -148,11 +152,7 @@ impl Pass<'_> {
             .map(|&l| {
                 let s = sigmoid(l);
                 if self.hard {
-                    if s > self.tau {
-                        1.0
-                    } else {
-                        0.0
-                    }
+                    if s > self.tau { 1.0 } else { 0.0 }
                 } else {
                     s
                 }
@@ -163,8 +163,20 @@ impl Pass<'_> {
     fn wts<'b>(&'b self, li: usize) -> LnFfn<'b> {
         let l = &self.fm.layers[li];
         match &self.ffn[li] {
-            Some((g, u, d)) => LnFfn { iln: &l.iln, pln: &l.pln, gate: g, up: u, down: d },
-            None => LnFfn { iln: &l.iln, pln: &l.pln, gate: &l.gate, up: &l.up, down: &l.down },
+            Some((g, u, d)) => LnFfn {
+                iln: &l.iln,
+                pln: &l.pln,
+                gate: g,
+                up: u,
+                down: d,
+            },
+            None => LnFfn {
+                iln: &l.iln,
+                pln: &l.pln,
+                gate: &l.gate,
+                up: &l.up,
+                down: &l.down,
+            },
         }
     }
 
@@ -175,7 +187,10 @@ impl Pass<'_> {
     fn chunk(
         &self,
         ids: &[u32],
-        grad: Option<(&mut [Vec<f64>], &mut [Option<(Vec<f64>, Vec<f64>, Vec<f64>)>])>,
+        grad: Option<(
+            &mut [Vec<f64>],
+            &mut [Option<(Vec<f64>, Vec<f64>, Vec<f64>)>],
+        )>,
     ) -> (f64, usize) {
         let fm = self.fm;
         let (t, hsz) = (ids.len(), fm.hidden);
@@ -216,7 +231,15 @@ impl Pass<'_> {
         while p0 < scored {
             let pc = POS_CHUNK.min(scored - p0);
             let mut logits = vec![0f32; pc * vocab];
-            ops::gemm_nt(&hn[p0 * hsz..(p0 + pc) * hsz], lm, &mut logits, pc, hsz, vocab, pool);
+            ops::gemm_nt(
+                &hn[p0 * hsz..(p0 + pc) * hsz],
+                lm,
+                &mut logits,
+                pc,
+                hsz,
+                vocab,
+                pool,
+            );
             for r in 0..pc {
                 let target = ids[p0 + r + 1] as usize;
                 let row = &mut logits[r * vocab..(r + 1) * vocab];
@@ -236,7 +259,15 @@ impl Pass<'_> {
                 }
             }
             if grad.is_some() {
-                ops::gemm_dx(&logits, lm, &mut dh_n[p0 * hsz..(p0 + pc) * hsz], pc, hsz, vocab, pool);
+                ops::gemm_dx(
+                    &logits,
+                    lm,
+                    &mut dh_n[p0 * hsz..(p0 + pc) * hsz],
+                    pc,
+                    hsz,
+                    vocab,
+                    pool,
+                );
             }
             p0 += pc;
         }
@@ -298,9 +329,25 @@ impl Pass<'_> {
             }
             // dn2 = dg_pre @ gate + du_pre @ up.
             let mut dn2 = vec![0f32; t * hsz];
-            ops::gemm_dx(&dg_pre, wts.gate, &mut dn2, t, hsz, inter, fm.pool.as_deref());
+            ops::gemm_dx(
+                &dg_pre,
+                wts.gate,
+                &mut dn2,
+                t,
+                hsz,
+                inter,
+                fm.pool.as_deref(),
+            );
             let mut dn2b = vec![0f32; t * hsz];
-            ops::gemm_dx(&du_pre, wts.up, &mut dn2b, t, hsz, inter, fm.pool.as_deref());
+            ops::gemm_dx(
+                &du_pre,
+                wts.up,
+                &mut dn2b,
+                t,
+                hsz,
+                inter,
+                fm.pool.as_deref(),
+            );
             for (x, &y) in dn2.iter_mut().zip(&dn2b) {
                 *x += y;
             }
@@ -364,7 +411,10 @@ pub fn skill_bake(
     let held: Vec<Vec<u32>> = chunks[..held_n.min(chunks.len())].to_vec();
     let calib: Vec<Vec<u32>> = chunks[held_n.min(chunks.len())..].to_vec();
     if calib.len() < 12 {
-        return Err(format!("skill bake: corpus too small ({} calib chunks)", calib.len()));
+        return Err(format!(
+            "skill bake: corpus too small ({} calib chunks)",
+            calib.len()
+        ));
     }
     let fcd: Vec<usize> = (nl.saturating_sub(hy.fcd_layers)..nl).collect();
     let _rng = SplitMix64::new(hy.seed);
@@ -376,7 +426,13 @@ pub fn skill_bake(
     // Baseline (no mask): σ(2.0)≈0.88 is NOT identity, so measure with
     // gates forced open via hard mask over +∞… simplest: logits +50.
     let open: Vec<Vec<f32>> = vec![vec![50.0; inter]; nl];
-    let base_pass = Pass { fm: &fm, tau: hy.tau, logits: &open, hard: true, ffn: &ffn };
+    let base_pass = Pass {
+        fm: &fm,
+        tau: hy.tau,
+        logits: &open,
+        hard: true,
+        ffn: &ffn,
+    };
     let backbone = held_ppl(&base_pass, &held);
     log(&format!("baseline (full): {backbone:.3}"));
 
@@ -388,7 +444,13 @@ pub fn skill_bake(
         let chunk = &calib[step % calib.len()];
         let mut dmask: Vec<Vec<f64>> = vec![vec![0.0; inter]; nl];
         let mut dffn: Vec<Option<(Vec<f64>, Vec<f64>, Vec<f64>)>> = vec![None; nl];
-        let pass = Pass { fm: &fm, tau: hy.tau, logits: &logits, hard: false, ffn: &ffn };
+        let pass = Pass {
+            fm: &fm,
+            tau: hy.tau,
+            logits: &logits,
+            hard: false,
+            ffn: &ffn,
+        };
         let _ = pass.chunk(chunk, Some((&mut dmask, &mut dffn)));
         // Fold σ'(m) into the mask grads + add the L1 term.
         let l1_per = l1 / (inter as f64 * nl as f64);
@@ -402,7 +464,13 @@ pub fn skill_bake(
         adam_a.step(&mut params, &dmask, 1.0);
         if (step + 1) % hy.eval_every == 0 {
             l1 += hy.l1_step;
-            let pass = Pass { fm: &fm, tau: hy.tau, logits: &logits, hard: true, ffn: &ffn };
+            let pass = Pass {
+                fm: &fm,
+                tau: hy.tau,
+                logits: &logits,
+                hard: true,
+                ffn: &ffn,
+            };
             let hp = held_ppl(&pass, &held);
             let alive: usize = logits
                 .iter()
@@ -424,9 +492,18 @@ pub fn skill_bake(
     if let Some(b) = best.1.take() {
         logits = b;
     }
-    let pass = Pass { fm: &fm, tau: hy.tau, logits: &logits, hard: true, ffn: &ffn };
+    let pass = Pass {
+        fm: &fm,
+        tau: hy.tau,
+        logits: &logits,
+        hard: true,
+        ffn: &ffn,
+    };
     let masked = held_ppl(&pass, &held);
-    log(&format!("[A] {:.0}s: masked-PPL {masked:.3}", t0.elapsed().as_secs_f64()));
+    log(&format!(
+        "[A] {:.0}s: masked-PPL {masked:.3}",
+        t0.elapsed().as_secs_f64()
+    ));
 
     // ── Phase B: FCD of the last N layers' FFN (hard mask active) ──
     for &li in &fcd {
@@ -447,12 +524,18 @@ pub fn skill_bake(
         let mut dmask: Vec<Vec<f64>> = vec![vec![0.0; inter]; nl];
         let mut dffn: Vec<Option<(Vec<f64>, Vec<f64>, Vec<f64>)>> = (0..nl)
             .map(|li| {
-                ffn[li].as_ref().map(|(g, u, d)| {
-                    (vec![0.0; g.len()], vec![0.0; u.len()], vec![0.0; d.len()])
-                })
+                ffn[li]
+                    .as_ref()
+                    .map(|(g, u, d)| (vec![0.0; g.len()], vec![0.0; u.len()], vec![0.0; d.len()]))
             })
             .collect();
-        let pass = Pass { fm: &fm, tau: hy.tau, logits: &logits, hard: true, ffn: &ffn };
+        let pass = Pass {
+            fm: &fm,
+            tau: hy.tau,
+            logits: &logits,
+            hard: true,
+            ffn: &ffn,
+        };
         let _ = pass.chunk(chunk, Some((&mut dmask, &mut dffn)));
         // Cosine LR.
         let lr_scale = 0.5 * (1.0 + (std::f64::consts::PI * step as f64 / hy.steps_b as f64).cos());
@@ -461,7 +544,9 @@ pub fn skill_bake(
         let mut grads: Vec<Vec<f64>> = Vec::new();
         for (off, slot) in ffn[first_fcd..].iter_mut().enumerate() {
             let li = first_fcd + off;
-            let Some((g, u, d)) = slot.as_mut() else { continue };
+            let Some((g, u, d)) = slot.as_mut() else {
+                continue;
+            };
             let (dg, du, dd) = dffn[li].take().unwrap();
             params.push(g.as_mut_slice());
             grads.push(dg);
@@ -472,12 +557,22 @@ pub fn skill_bake(
         }
         adam_b.step(&mut params, &grads, lr_scale);
         if (step + 1) % hy.eval_every == 0 {
-            let pass = Pass { fm: &fm, tau: hy.tau, logits: &logits, hard: true, ffn: &ffn };
+            let pass = Pass {
+                fm: &fm,
+                tau: hy.tau,
+                logits: &logits,
+                hard: true,
+                ffn: &ffn,
+            };
             let cur = held_ppl(&pass, &held);
             if cur < best_b.0 {
                 best_b = (cur, Some(ffn.clone()));
             }
-            log(&format!("  [B] step {}: held-PPL {cur:.3} (best {:.3})", step + 1, best_b.0));
+            log(&format!(
+                "  [B] step {}: held-PPL {cur:.3} (best {:.3})",
+                step + 1,
+                best_b.0
+            ));
         }
     }
     if let Some(b) = best_b.1.take() {
@@ -519,6 +614,11 @@ pub fn skill_bake(
         kept_per_layer,
         sec: t0.elapsed().as_secs_f64(),
     };
-    let arts = BakeArtifacts { keep, down: down_out, gate_up, fcd_layers: fcd };
+    let arts = BakeArtifacts {
+        keep,
+        down: down_out,
+        gate_up,
+        fcd_layers: fcd,
+    };
     Ok((report, arts))
 }

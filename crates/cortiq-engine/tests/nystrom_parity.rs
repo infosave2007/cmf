@@ -88,7 +88,10 @@ fn nystrom_sink0_matches_legacy_golden() {
 struct Lcg(u64);
 impl Lcg {
     fn next_f32(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         // >> 32 keeps 32 bits, so the ratio spans [0, 2) and the result
         // is centred. (A >> 33 here yields [-1, 0): every component
         // negative, hence q·k a large positive sum and near-rank-1 data
@@ -135,15 +138,20 @@ fn softmax_row(q: &[f32], ks: &[Vec<f32>], vs: &[Vec<f32>], upto: usize, dv: usi
 /// that separates the two operators.
 #[test]
 fn fm_rect_is_nonnegative_far_mass() {
-    let (d, dv, m, w, sink, t, p) =
-        (16usize, 4usize, 32usize, 16usize, 4usize, 320usize, 256usize);
+    let (d, dv, m, w, sink, t, p) = (
+        16usize, 4usize, 32usize, 16usize, 4usize, 320usize, 256usize,
+    );
     let mut rng = Lcg(777);
     // Scale 3 puts the landmark logits at the magnitude real post-RoPE
     // heads reach; exp(Q̃K̃ᵀ/√d) is then violently ill-conditioned, M is
     // strongly indefinite, and the skeleton estimates negative weights —
     // the regime the whole rectifier question lives in.
-    let q: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(d).iter().map(|x| x * 3.0).collect()).collect();
-    let k: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(d).iter().map(|x| x * 3.0).collect()).collect();
+    let q: Vec<Vec<f32>> = (0..t)
+        .map(|_| rng.vec(d).iter().map(|x| x * 3.0).collect())
+        .collect();
+    let k: Vec<Vec<f32>> = (0..t)
+        .map(|_| rng.vec(d).iter().map(|x| x * 3.0).collect())
+        .collect();
     // Values in [0, 2): a negative output component is then proof of
     // negative weight mass, no bookkeeping needed.
     let v: Vec<Vec<f32>> = (0..t)
@@ -160,9 +168,10 @@ fn fm_rect_is_nonnegative_far_mass() {
     // keeps the sum positive while a negative far key inflates the
     // complementary keys' share), so measure the worst excursion out of
     // [min v, max v] rather than only the sign.
-    let (vlo, vhi) = v.iter().flatten().fold((f32::MAX, f32::MIN), |(a, b), &x| {
-        (a.min(x), b.max(x))
-    });
+    let (vlo, vhi) = v
+        .iter()
+        .flatten()
+        .fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
     let run = |rect: O1Rect| -> f32 {
         let mut st = NystromState::new(m, w, sink).with_rect(rect);
         st.prefill(&fl(&q, p), &fl(&k, p), &fl(&v, p), p, d, dv);
@@ -178,11 +187,12 @@ fn fm_rect_is_nonnegative_far_mass() {
     };
     let fm = run(O1Rect::Fm);
     let agg = run(O1Rect::Aggregate);
-    println!(
-        "worst excursion outside v∈[{vlo:.3}, {vhi:.3}]: fm={fm:.4e} aggregate={agg:.4e}"
-    );
+    println!("worst excursion outside v∈[{vlo:.3}, {vhi:.3}]: fm={fm:.4e} aggregate={agg:.4e}");
     // FM: every weight ≥ 0 ⇒ the row cannot leave the value hull.
-    assert!(fm < 1e-3, "FM rect left the value hull by {fm:.3e} — negative far mass");
+    assert!(
+        fm < 1e-3,
+        "FM rect left the value hull by {fm:.3e} — negative far mass"
+    );
     // …and the aggregate guard gives no such guarantee: it only inspects
     // the row SUM, so per-key negative mass survives whenever the sum
     // stays positive. If this ever stops holding, the fixture drifted out
@@ -202,15 +212,22 @@ fn fm_rect_is_nonnegative_far_mass() {
 /// on `to_bits()`, not on a tolerance.
 #[test]
 fn group_output_is_bit_identical_to_independent_heads() {
-    let (d, dv, m, w, sink, t, p, hpk) =
-        (16usize, 8usize, 8usize, 16usize, 4usize, 200usize, 120usize, 4usize);
+    let (d, dv, m, w, sink, t, p, hpk) = (
+        16usize, 8usize, 8usize, 16usize, 4usize, 200usize, 120usize, 4usize,
+    );
     let mut rng = Lcg(4242);
     // One k/v stream (the KV head), hpk DIFFERENT query streams — the
     // real GQA shape. Identical queries would hide a head-indexing bug.
-    let k: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(d).iter().map(|x| x * 2.0).collect()).collect();
+    let k: Vec<Vec<f32>> = (0..t)
+        .map(|_| rng.vec(d).iter().map(|x| x * 2.0).collect())
+        .collect();
     let v: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(dv)).collect();
     let q: Vec<Vec<Vec<f32>>> = (0..hpk)
-        .map(|_| (0..t).map(|_| rng.vec(d).iter().map(|x| x * 2.0).collect()).collect())
+        .map(|_| {
+            (0..t)
+                .map(|_| rng.vec(d).iter().map(|x| x * 2.0).collect())
+                .collect()
+        })
         .collect();
 
     let fl = |rows: &[Vec<f32>], hi: usize| -> Vec<f32> {
@@ -261,7 +278,10 @@ fn group_output_is_bit_identical_to_independent_heads() {
         solo_bytes,
         solo_bytes as f64 / grp.memory_bytes() as f64
     );
-    assert!(grp.memory_bytes() < solo_bytes, "shared group must be smaller");
+    assert!(
+        grp.memory_bytes() < solo_bytes,
+        "shared group must be smaller"
+    );
 }
 
 /// Delayed insertion stays EXACTLY once per position per head after the
@@ -273,13 +293,15 @@ fn group_output_is_bit_identical_to_independent_heads() {
 /// head (the window would advance hpk positions per token — a hole).
 #[test]
 fn group_far_insert_runs_once_per_evicted_position_per_head() {
-    let (d, dv, m, w, sink, t, p, hpk) =
-        (8usize, 4usize, 4usize, 16usize, 4usize, 90usize, 64usize, 3usize);
+    let (d, dv, m, w, sink, t, p, hpk) = (
+        8usize, 4usize, 4usize, 16usize, 4usize, 90usize, 64usize, 3usize,
+    );
     let mut rng = Lcg(99);
     let k: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(d)).collect();
     let v: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(dv)).collect();
-    let q: Vec<Vec<Vec<f32>>> =
-        (0..hpk).map(|_| (0..t).map(|_| rng.vec(d)).collect()).collect();
+    let q: Vec<Vec<Vec<f32>>> = (0..hpk)
+        .map(|_| (0..t).map(|_| rng.vec(d)).collect())
+        .collect();
     let fl = |rows: &[Vec<f32>], hi: usize| -> Vec<f32> {
         rows[..hi].iter().flatten().copied().collect()
     };
@@ -324,8 +346,7 @@ fn nystrom_short_prompt_is_exact_softmax() {
     // still covers every position, so the kernel must equal plain
     // causal softmax attention (sink setting is irrelevant here — every
     // key is already permanent-exact).
-    let (d, dv, m, w, sink, t, p) =
-        (16usize, 8usize, 4usize, 32usize, 4usize, 20usize, 12usize);
+    let (d, dv, m, w, sink, t, p) = (16usize, 8usize, 4usize, 32usize, 4usize, 20usize, 12usize);
     let mut rng = Lcg(20260712);
     let q: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(d)).collect();
     let k: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(d)).collect();
@@ -347,5 +368,8 @@ fn nystrom_short_prompt_is_exact_softmax() {
         }
     }
     println!("nystrom exact-only parity: max_abs={max_abs:.3e}");
-    assert!(max_abs < 1e-5, "exact-only max abs error {max_abs:.3e} >= 1e-5");
+    assert!(
+        max_abs < 1e-5,
+        "exact-only max abs error {max_abs:.3e} >= 1e-5"
+    );
 }

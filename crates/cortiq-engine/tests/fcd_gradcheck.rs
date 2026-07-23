@@ -88,7 +88,11 @@ fn gradcheck_silu() {
     }
     let r = synth(64, 5);
     let loss = |x: &[f64]| -> f64 { x.iter().zip(&r).map(|(&v, b)| ops::silu(v) * b).sum() };
-    let dx: Vec<f64> = x.iter().zip(&r).map(|(&v, b)| ops::silu_bwd(v) * b).collect();
+    let dx: Vec<f64> = x
+        .iter()
+        .zip(&r)
+        .map(|(&v, b)| ops::silu_bwd(v) * b)
+        .collect();
     let fx = fd_grad(&mut x, loss);
     let e = rel_err(&dx, &fx);
     println!("gradcheck silu: rel err {e:.2e}");
@@ -102,9 +106,8 @@ fn gradcheck_swiglu_mul() {
     let mut g = synth(n, 6);
     let mut u = synth(n, 7);
     let r = synth(n, 8);
-    let loss = |g: &[f64], u: &[f64]| -> f64 {
-        (0..n).map(|i| ops::silu(g[i]) * u[i] * r[i]).sum()
-    };
+    let loss =
+        |g: &[f64], u: &[f64]| -> f64 { (0..n).map(|i| ops::silu(g[i]) * u[i] * r[i]).sum() };
     let dg: Vec<f64> = (0..n).map(|i| r[i] * u[i] * ops::silu_bwd(g[i])).collect();
     let du: Vec<f64> = (0..n).map(|i| r[i] * ops::silu(g[i])).collect();
     let uc = u.clone();
@@ -237,7 +240,12 @@ fn gradcheck_nystrom_joint_head_frozen_mu() {
     // prefill=20 is the default (t/2) written out: it must stay above
     // w+sink+8=18 or the kernel degenerates to exact attention and this
     // test would silently stop covering the skeleton.
-    let cfg = ops::NysCfg { m: 4, w: 8, sink: 2, prefill: Some(20) };
+    let cfg = ops::NysCfg {
+        m: 4,
+        w: 8,
+        sink: 2,
+        prefill: Some(20),
+    };
     let mut q = synth(t * d, 20);
     let mut k = synth(t * d, 21);
     let mut v = synth(t * dv, 22);
@@ -255,7 +263,18 @@ fn gradcheck_nystrom_joint_head_frozen_mu() {
     let mut dk = vec![0f64; t * d];
     let mut dv_ = vec![0f64; t * dv];
     ops::nystrom_head_bwd_mu(
-        &q, &k, &v, &r, t, d, dv, &cfg, Some(&mu), &mut dq, &mut dk, &mut dv_,
+        &q,
+        &k,
+        &v,
+        &r,
+        t,
+        d,
+        dv,
+        &cfg,
+        Some(&mu),
+        &mut dq,
+        &mut dk,
+        &mut dv_,
     );
     let (kc, vc) = (k.clone(), v.clone());
     let fq = fd_grad(&mut q, |q| loss(q, &kc, &vc));
@@ -265,7 +284,10 @@ fn gradcheck_nystrom_joint_head_frozen_mu() {
     let fv = fd_grad(&mut v, |v| loss(&qc, &kc, v));
     let (eq, ek, ev) = (rel_err(&dq, &fq), rel_err(&dk, &fk), rel_err(&dv_, &fv));
     println!("gradcheck nystrom joint (frozen M): dQ {eq:.2e}, dK {ek:.2e}, dV {ev:.2e}");
-    assert!(eq < TOL && ek < TOL && ev < TOL, "dQ {eq:.2e} dK {ek:.2e} dV {ev:.2e}");
+    assert!(
+        eq < TOL && ek < TOL && ev < TOL,
+        "dQ {eq:.2e} dK {ek:.2e} dV {ev:.2e}"
+    );
 }
 
 #[test]
@@ -276,7 +298,12 @@ fn gradcheck_nystrom_joint_head_full_functional() {
     // check documents the size of that intentional gap — it must be
     // moderate (the convention is workable), not tiny.
     let (t, d, dv) = (40usize, 6usize, 5usize);
-    let cfg = ops::NysCfg { m: 4, w: 8, sink: 2, prefill: Some(20) };
+    let cfg = ops::NysCfg {
+        m: 4,
+        w: 8,
+        sink: 2,
+        prefill: Some(20),
+    };
     let mut q = synth(t * d, 20);
     let mut k = synth(t * d, 21);
     let v = synth(t * dv, 22);
@@ -315,7 +342,12 @@ fn gradcheck_nystrom_near_only_tight() {
     let (t, d, dv) = (40usize, 6usize, 5usize);
     // w ≥ t → every key is near → joint == exact softmax path but still
     // goes through the skeleton-free branch of the SAME kernel code.
-    let cfg = ops::NysCfg { m: 4, w: 64, sink: 0, prefill: Some(20) };
+    let cfg = ops::NysCfg {
+        m: 4,
+        w: 64,
+        sink: 0,
+        prefill: Some(20),
+    };
     let mut q = synth(t * d, 24);
     let mut k = synth(t * d, 25);
     let v = synth(t * dv, 26);
@@ -479,7 +511,11 @@ impl GdnFix {
             conv: synth(c_dim * kk, 50).iter().map(|&v| v as f32).collect(),
             a_log: synth(nv, 51).iter().map(|&v| v as f32).collect(),
             dt_bias: synth(nv, 52).iter().map(|&v| v as f32).collect(),
-            norm: synth(nv.max(dv), 53).iter().take(dv).map(|&v| 1.0 + v as f32).collect(),
+            norm: synth(nv.max(dv), 53)
+                .iter()
+                .take(dv)
+                .map(|&v| 1.0 + v as f32)
+                .collect(),
         }
     }
     fn cfg(&self) -> ops::GdnSeqCfg<'_> {
@@ -523,7 +559,9 @@ fn gradcheck_gdn_bptt_all_streams() {
     let mut dz = vec![0f64; t * vd];
     let mut da = vec![0f64; t * nv];
     let mut db = vec![0f64; t * nv];
-    ops::gdn_seq_bwd(&qkv, &z, &a, &b, t, &cfg, &r, &mut dqkv, &mut dz, &mut da, &mut db);
+    ops::gdn_seq_bwd(
+        &qkv, &z, &a, &b, t, &cfg, &r, &mut dqkv, &mut dz, &mut da, &mut db,
+    );
 
     let (zc, ac, bc) = (z.clone(), a.clone(), b.clone());
     let qc0 = qkv.clone();
@@ -546,7 +584,7 @@ fn gradcheck_gdn_bptt_all_streams() {
 /// only honest if it computes the same function the runtime serves.
 #[test]
 fn gdn_seq_fwd_matches_runtime_operator() {
-    use cortiq_engine::linear_core::{gdn_forward, GdnCfg, GdnWeights};
+    use cortiq_engine::linear_core::{GdnCfg, GdnWeights, gdn_forward};
     use cortiq_engine::qtensor::QTensor;
     let f = GdnFix::new();
     let cfg = f.cfg();
@@ -554,7 +592,10 @@ fn gdn_seq_fwd_matches_runtime_operator() {
     let (t, nv, dv) = (f.t, f.nv, f.dv);
     let c_dim = cfg.c_dim();
     let vd = nv * dv;
-    let wqkv: Vec<f32> = synth(c_dim * hidden, 60).iter().map(|&v| v as f32).collect();
+    let wqkv: Vec<f32> = synth(c_dim * hidden, 60)
+        .iter()
+        .map(|&v| v as f32)
+        .collect();
     let wz: Vec<f32> = synth(vd * hidden, 61).iter().map(|&v| v as f32).collect();
     let wa: Vec<f32> = synth(nv * hidden, 62).iter().map(|&v| v as f32).collect();
     let wb: Vec<f32> = synth(nv * hidden, 63).iter().map(|&v| v as f32).collect();
@@ -585,7 +626,13 @@ fn gdn_seq_fwd_matches_runtime_operator() {
     let mut state = Vec::new();
     let mut runtime_out = Vec::new();
     for p in 0..t {
-        let o = gdn_forward(&xs[p * hidden..(p + 1) * hidden], &gw, &gc, &mut state, None);
+        let o = gdn_forward(
+            &xs[p * hidden..(p + 1) * hidden],
+            &gw,
+            &gc,
+            &mut state,
+            None,
+        );
         runtime_out.extend_from_slice(&o);
     }
 
@@ -603,7 +650,12 @@ fn gdn_seq_fwd_matches_runtime_operator() {
         }
         y
     };
-    let (qkv, z, a, b) = (proj(&wqkv, c_dim), proj(&wz, vd), proj(&wa, nv), proj(&wb, nv));
+    let (qkv, z, a, b) = (
+        proj(&wqkv, c_dim),
+        proj(&wz, vd),
+        proj(&wa, nv),
+        proj(&wb, nv),
+    );
     let mut of = vec![0f64; t * vd];
     ops::gdn_seq_fwd(&qkv, &z, &a, &b, t, &cfg, &mut of);
     let mut fcd_out = vec![0f64; t * hidden];

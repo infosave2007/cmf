@@ -28,8 +28,8 @@
 //! (default: available_parallelism − 1, capped at 8).
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A `*const dyn Fn` that may cross a thread boundary. Safety is
 /// provided by `Pool::run`: the caller blocks until every worker has
@@ -110,7 +110,11 @@ impl Pool {
             joins.push(h);
         }
         let threads = joins.iter().map(|h| h.thread().clone()).collect();
-        Self { inner, threads, joins }
+        Self {
+            inner,
+            threads,
+            joins,
+        }
     }
 
     /// Big-core count on heterogeneous ARM (big.LITTLE): the kernel
@@ -118,7 +122,10 @@ impl Pool {
     /// cores in the pool DRAG the big ones on our row-parallel jobs (the
     /// same cliff llama.cpp hits at -t 10 on an M4: 163 → 112 tok/s).
     /// None = capacities absent or homogeneous.
-    #[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "android")))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "linux", target_os = "android")
+    ))]
     fn big_cores() -> Option<usize> {
         let mut caps: Vec<u64> = Vec::new();
         for cpu in 0.. {
@@ -140,7 +147,13 @@ impl Pool {
     /// ratio 1.33) pull their weight and must ALL be used. The 1.6
     /// threshold splits the two regimes: on a Snapdragon 8-class part
     /// it keeps X + A7xx mid cores and drops A5xx.
-    #[cfg_attr(not(all(target_arch = "aarch64", any(target_os = "linux", target_os = "android"))), allow(dead_code))]
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "linux", target_os = "android")
+        )),
+        allow(dead_code)
+    )]
     fn cores_from_capacities(caps: &[u64]) -> Option<usize> {
         let max = *caps.iter().max()?;
         let min = *caps.iter().min()?;
@@ -181,7 +194,10 @@ impl Pool {
     }
 
     #[cfg(not(any(
-        all(target_arch = "aarch64", any(target_os = "linux", target_os = "android")),
+        all(
+            target_arch = "aarch64",
+            any(target_os = "linux", target_os = "android")
+        ),
         target_os = "macos"
     )))]
     fn big_cores() -> Option<usize> {
@@ -333,22 +349,24 @@ fn pin_thread_to_big_cores() {
     for cpu in 0.. {
         let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity");
         match std::fs::read_to_string(&path) {
-            Ok(v) => if let Ok(cap) = v.trim().parse() {
-                caps.push(cap);
-            } else {
-                break;
-            },
+            Ok(v) => {
+                if let Ok(cap) = v.trim().parse() {
+                    caps.push(cap);
+                } else {
+                    break;
+                }
+            }
             Err(_) => break,
         }
     }
     let max = caps.iter().copied().max().unwrap_or(0);
     let min = caps.iter().copied().min().unwrap_or(0);
-    
+
     // Only pin if heterogeneous
     if caps.len() < 2 || max == min {
         return;
     }
-    
+
     unsafe {
         let mut set: libc::cpu_set_t = mem::zeroed();
         for (i, &c) in caps.iter().enumerate() {
@@ -517,9 +535,15 @@ mod tests {
     fn capacity_split_clock_bins_vs_microarch() {
         type P = super::Pool;
         // JR510: all-A55, two clock bins — use every core.
-        assert_eq!(P::cores_from_capacities(&[1024, 1024, 1024, 1024, 768, 768, 768, 768]), Some(8));
+        assert_eq!(
+            P::cores_from_capacities(&[1024, 1024, 1024, 1024, 768, 768, 768, 768]),
+            Some(8)
+        );
         // Classic big.LITTLE (A78 + A55) — big only.
-        assert_eq!(P::cores_from_capacities(&[1024, 1024, 1024, 1024, 350, 350, 350, 350]), Some(4));
+        assert_eq!(
+            P::cores_from_capacities(&[1024, 1024, 1024, 1024, 350, 350, 350, 350]),
+            Some(4)
+        );
         // Three-tier flagship: X + A7xx mids stay, A5xx littles go.
         assert_eq!(
             P::cores_from_capacities(&[1024, 800, 800, 800, 800, 300, 300, 300]),
@@ -535,7 +559,9 @@ mod tests {
     #[test]
     fn parallel_matvec_equals_serial_bitexact() {
         let (out_dim, in_dim) = (512, 64);
-        let w: Vec<f32> = (0..out_dim * in_dim).map(|i| (i as f32 * 0.013).sin()).collect();
+        let w: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| (i as f32 * 0.013).sin())
+            .collect();
         let x: Vec<f32> = (0..in_dim).map(|i| (i as f32 * 0.07).cos()).collect();
 
         let mut serial = vec![0.0f32; out_dim];
@@ -551,7 +577,9 @@ mod tests {
     #[test]
     fn fused_pair_equals_two_singles_bitexact() {
         let (out_dim, in_dim) = (300, 48);
-        let w: Vec<f32> = (0..out_dim * in_dim).map(|i| (i as f32 * 0.011).sin()).collect();
+        let w: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| (i as f32 * 0.011).sin())
+            .collect();
         let x1: Vec<f32> = (0..in_dim).map(|i| (i as f32 * 0.03).cos()).collect();
         let x2: Vec<f32> = (0..in_dim).map(|i| (i as f32 * 0.09).sin()).collect();
 

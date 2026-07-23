@@ -16,8 +16,7 @@ pub struct Npy {
 }
 
 pub fn read(path: &Path) -> anyhow::Result<Npy> {
-    let buf =
-        std::fs::read(path).map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+    let buf = std::fs::read(path).map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
     if buf.len() < 12 || &buf[0..6] != b"\x93NUMPY" {
         anyhow::bail!("{}: not a .npy file", path.display());
     }
@@ -52,9 +51,7 @@ pub fn read(path: &Path) -> anyhow::Result<Npy> {
             need(raw, numel * 8, path)?;
             NpyData::F32(
                 (0..numel)
-                    .map(|i| {
-                        f64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap()) as f32
-                    })
+                    .map(|i| f64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap()) as f32)
                     .collect(),
             )
         }
@@ -69,7 +66,11 @@ pub fn read(path: &Path) -> anyhow::Result<Npy> {
 
 fn need(raw: &[u8], n: usize, path: &Path) -> anyhow::Result<()> {
     if raw.len() < n {
-        anyhow::bail!("{}: truncated npy data ({} < {n})", path.display(), raw.len());
+        anyhow::bail!(
+            "{}: truncated npy data ({} < {n})",
+            path.display(),
+            raw.len()
+        );
     }
     Ok(())
 }
@@ -103,10 +104,10 @@ fn parse_shape(h: &str) -> Option<Vec<usize>> {
     let lp = after.find('(')?;
     let rp = after[lp..].find(')')? + lp;
     after[lp + 1..rp]
-            .split(',')
-            .filter_map(|p| {
-                let t = p.trim();
-                (!t.is_empty()).then(|| t.parse::<usize>().ok())
-            })
-            .collect::<Option<Vec<usize>>>()
+        .split(',')
+        .filter_map(|p| {
+            let t = p.trim();
+            (!t.is_empty()).then(|| t.parse::<usize>().ok())
+        })
+        .collect::<Option<Vec<usize>>>()
 }

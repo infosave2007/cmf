@@ -6,9 +6,10 @@ use cortiq_engine::tokenizer::Tokenizer;
 
 #[test]
 fn tokenizer_matches_hf_reference() {
-    let (Ok(tok_path), Ok(cases_path)) =
-        (std::env::var("CMF_TOK_JSON"), std::env::var("CMF_TOK_CASES"))
-    else {
+    let (Ok(tok_path), Ok(cases_path)) = (
+        std::env::var("CMF_TOK_JSON"),
+        std::env::var("CMF_TOK_CASES"),
+    ) else {
         eprintln!("skipped: set CMF_TOK_JSON and CMF_TOK_CASES");
         return;
     };
@@ -36,9 +37,7 @@ fn tokenizer_matches_hf_reference() {
         let want_decoded = case["decoded"].as_str().unwrap();
         if decoded != want_decoded {
             failures += 1;
-            eprintln!(
-                "case {i} DECODE mismatch\n  want: {want_decoded:?}\n  got:  {decoded:?}"
-            );
+            eprintln!("case {i} DECODE mismatch\n  want: {want_decoded:?}\n  got:  {decoded:?}");
         }
     }
     assert_eq!(failures, 0, "{failures} tokenizer parity failures");

@@ -87,7 +87,9 @@ fn blocked_vs_per_row() {
     let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
     let idx = model.tensor_index("w").unwrap();
     let rs = vec![0.01f32; rows];
-    let x: Vec<f32> = (0..b * cols).map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5).collect();
+    let x: Vec<f32> = (0..b * cols)
+        .map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5)
+        .collect();
     let qt = cortiq_engine::qtensor::QTensor::Mapped {
         model: model.clone(),
         idx,
@@ -107,7 +109,11 @@ fn blocked_vs_per_row() {
     qt.matmat(&x, b, &mut y_a, None);
     unsafe { std::env::set_var("CMF_X86_BLOCKED", "0") };
     qt.matmat(&x, b, &mut y_b, None);
-    let max_d = y_a.iter().zip(&y_b).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+    let max_d = y_a
+        .iter()
+        .zip(&y_b)
+        .map(|(p, q)| (p - q).abs())
+        .fold(0.0f32, f32::max);
     assert!(max_d < 1e-3, "blocked ≠ per-row: max|Δ| = {max_d}");
 
     // Paired timing, min-of interleaved rounds.
@@ -123,7 +129,11 @@ fn blocked_vs_per_row() {
         t_row = t_row.min(t1.elapsed().as_secs_f64() * 1000.0);
     }
     let gflop = 2.0 * (b * rows * cols) as f64 / 1e9;
-    println!("x86 q8 matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row {t_row:.1} ms ({:.0} GF/s)", gflop / t_blk * 1e3, gflop / t_row * 1e3);
+    println!(
+        "x86 q8 matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row {t_row:.1} ms ({:.0} GF/s)",
+        gflop / t_blk * 1e3,
+        gflop / t_row * 1e3
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -208,7 +218,9 @@ fn q1_blocked_vs_per_row() {
     CmfModel::write(&path, &header, &[spec], None, None).unwrap();
     let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
     let idx = model.tensor_index("w").unwrap();
-    let x: Vec<f32> = (0..b * cols).map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5).collect();
+    let x: Vec<f32> = (0..b * cols)
+        .map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5)
+        .collect();
     let qt = cortiq_engine::qtensor::QTensor::Mapped {
         model: model.clone(),
         idx,
@@ -227,7 +239,11 @@ fn q1_blocked_vs_per_row() {
     unsafe { std::env::set_var("CMF_X86_BLOCKED", "0") };
     qt.matmat(&x, b, &mut y_b, None);
     unsafe { std::env::remove_var("CMF_X86_BLOCKED") };
-    let max_d = y_a.iter().zip(&y_b).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+    let max_d = y_a
+        .iter()
+        .zip(&y_b)
+        .map(|(p, q)| (p - q).abs())
+        .fold(0.0f32, f32::max);
     assert!(max_d < 1e-3, "q1 blocked ≠ per-row: max|Δ| = {max_d}");
     let (mut t_blk, mut t_row) = (f64::MAX, f64::MAX);
     for _ in 0..6 {
@@ -242,7 +258,11 @@ fn q1_blocked_vs_per_row() {
     }
     unsafe { std::env::remove_var("CMF_X86_BLOCKED") };
     let gflop = 2.0 * (b * rows * cols) as f64 / 1e9;
-    println!("x86 q1 matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row-avx2 {t_row:.1} ms ({:.0} GF/s)", gflop / t_blk * 1e3, gflop / t_row * 1e3);
+    println!(
+        "x86 q1 matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row-avx2 {t_row:.1} ms ({:.0} GF/s)",
+        gflop / t_blk * 1e3,
+        gflop / t_row * 1e3
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -261,7 +281,8 @@ fn q4b_blocked_vs_per_row() {
         for k in 0..16 {
             payload[g * 16 + k] = ((g * 13 + k * 29 + 5) % 251) as u8;
         }
-        payload[groups * 16 + g * 2..groups * 16 + g * 2 + 2].copy_from_slice(&f32_to_f16(0.02).to_le_bytes());
+        payload[groups * 16 + g * 2..groups * 16 + g * 2 + 2]
+            .copy_from_slice(&f32_to_f16(0.02).to_le_bytes());
     }
     let arch = ModelArch {
         arch_name: "tiny".into(),
@@ -328,7 +349,9 @@ fn q4b_blocked_vs_per_row() {
     CmfModel::write(&path, &header, &[spec], None, None).unwrap();
     let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
     let idx = model.tensor_index("w").unwrap();
-    let x: Vec<f32> = (0..b * cols).map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5).collect();
+    let x: Vec<f32> = (0..b * cols)
+        .map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5)
+        .collect();
     let qt = cortiq_engine::qtensor::QTensor::Mapped {
         model: model.clone(),
         idx,
@@ -346,7 +369,11 @@ fn q4b_blocked_vs_per_row() {
     qt.matmat(&x, b, &mut y_a, None);
     unsafe { std::env::set_var("CMF_X86_BLOCKED", "0") };
     qt.matmat(&x, b, &mut y_b, None);
-    let max_d = y_a.iter().zip(&y_b).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+    let max_d = y_a
+        .iter()
+        .zip(&y_b)
+        .map(|(p, q)| (p - q).abs())
+        .fold(0.0f32, f32::max);
     assert!(max_d < 1e-3, "q4b blocked ≠ per-row: max|Δ| = {max_d}");
     let (mut t_blk, mut t_row) = (f64::MAX, f64::MAX);
     for _ in 0..6 {
@@ -360,7 +387,11 @@ fn q4b_blocked_vs_per_row() {
         t_row = t_row.min(t1.elapsed().as_secs_f64() * 1000.0);
     }
     let gflop = 2.0 * (b * rows * cols) as f64 / 1e9;
-    println!("x86 q4b matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row {t_row:.1} ms ({:.0} GF/s)", gflop / t_blk * 1e3, gflop / t_row * 1e3);
+    println!(
+        "x86 q4b matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row {t_row:.1} ms ({:.0} GF/s)",
+        gflop / t_blk * 1e3,
+        gflop / t_row * 1e3
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -447,7 +478,9 @@ fn q4t_blocked_vs_per_row() {
     CmfModel::write(&path, &header, &[spec], None, None).unwrap();
     let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
     let idx = model.tensor_index("w").unwrap();
-    let x: Vec<f32> = (0..b * cols).map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5).collect();
+    let x: Vec<f32> = (0..b * cols)
+        .map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5)
+        .collect();
     let qt = cortiq_engine::qtensor::QTensor::Mapped {
         model: model.clone(),
         idx,
@@ -465,7 +498,11 @@ fn q4t_blocked_vs_per_row() {
     qt.matmat(&x, b, &mut y_a, None);
     unsafe { std::env::set_var("CMF_X86_BLOCKED", "0") };
     qt.matmat(&x, b, &mut y_b, None);
-    let max_d = y_a.iter().zip(&y_b).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+    let max_d = y_a
+        .iter()
+        .zip(&y_b)
+        .map(|(p, q)| (p - q).abs())
+        .fold(0.0f32, f32::max);
     assert!(max_d < 1e-3, "q4t blocked ≠ per-row: max|Δ| = {max_d}");
     let (mut t_blk, mut t_row) = (f64::MAX, f64::MAX);
     for _ in 0..6 {
@@ -479,6 +516,10 @@ fn q4t_blocked_vs_per_row() {
         t_row = t_row.min(t1.elapsed().as_secs_f64() * 1000.0);
     }
     let gflop = 2.0 * (b * rows * cols) as f64 / 1e9;
-    println!("x86 q4t matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row {t_row:.1} ms ({:.0} GF/s)", gflop / t_blk * 1e3, gflop / t_row * 1e3);
+    println!(
+        "x86 q4t matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row {t_row:.1} ms ({:.0} GF/s)",
+        gflop / t_blk * 1e3,
+        gflop / t_row * 1e3
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

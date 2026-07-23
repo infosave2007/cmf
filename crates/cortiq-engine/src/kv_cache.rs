@@ -13,7 +13,10 @@
 pub enum KvMode {
     F32,
     /// Quantized components: (K, V) — sensitivity diagnostics.
-    Q8 { k: bool, v: bool },
+    Q8 {
+        k: bool,
+        v: bool,
+    },
 }
 
 impl KvMode {
@@ -70,7 +73,9 @@ pub enum O1State {
     /// of the group reads the same k/v rows); only the far field, Q̃ and
     /// M — the query-dependent pieces — stay per Q head. See
     /// `NystromState` for which piece is which and why.
-    Sealed { groups: Vec<crate::nystrom::NystromState> },
+    Sealed {
+        groups: Vec<crate::nystrom::NystromState>,
+    },
 }
 
 /// KV cache for a single layer, head-major.
@@ -139,7 +144,13 @@ impl LayerKvCache {
 
     /// Arm query collection for a fresh prompt pass (a cleared cache).
     pub fn o1_begin(&mut self, m: usize, w: usize, sink: usize, rect: crate::nystrom::O1Rect) {
-        self.o1 = Some(O1State::Collecting { m, w, sink, rect, q_buf: Vec::new() });
+        self.o1 = Some(O1State::Collecting {
+            m,
+            w,
+            sink,
+            rect,
+            q_buf: Vec::new(),
+        });
     }
 
     /// Record one position's rotated queries (`[num_heads × head_dim]`)
@@ -167,7 +178,14 @@ impl LayerKvCache {
         if !matches!(self.o1, Some(O1State::Collecting { .. })) {
             return self.o1_sealed();
         }
-        let Some(O1State::Collecting { m, w, sink, rect, q_buf }) = self.o1.take() else {
+        let Some(O1State::Collecting {
+            m,
+            w,
+            sink,
+            rect,
+            q_buf,
+        }) = self.o1.take()
+        else {
             unreachable!("checked above");
         };
         let (hd, t) = (self.head_dim, self.seq_len);
@@ -199,7 +217,9 @@ impl LayerKvCache {
                     qh[dst..dst + hd].copy_from_slice(&q_buf[src..src + hd]);
                 }
             }
-            let qs: Vec<&[f32]> = (0..hpk).map(|hh| &qh[hh * t * hd..(hh + 1) * t * hd]).collect();
+            let qs: Vec<&[f32]> = (0..hpk)
+                .map(|hh| &qh[hh * t * hd..(hh + 1) * t * hd])
+                .collect();
             let mut st = crate::nystrom::NystromState::new_group(m, w, sink, hpk).with_rect(rect);
             st.prefill_group(&qs, &self.k[g], &self.v[g], t, hd, hd);
             groups.push(st);
@@ -253,20 +273,15 @@ impl LayerKvCache {
     /// per-KV-group states once sealed).
     pub fn o1_memory_bytes(&self) -> usize {
         match &self.o1 {
-            Some(O1State::Collecting { q_buf, .. }) => {
-                q_buf.len() * std::mem::size_of::<f32>()
-            }
-            Some(O1State::Sealed { groups }) => {
-                groups.iter().map(|s| s.memory_bytes()).sum()
-            }
+            Some(O1State::Collecting { q_buf, .. }) => q_buf.len() * std::mem::size_of::<f32>(),
+            Some(O1State::Sealed { groups }) => groups.iter().map(|s| s.memory_bytes()).sum(),
             None => 0,
         }
     }
 
     /// Quantize one row against the per-channel field (empty col = 1);
     /// `group` — elements per scale (the whole row or KV_K_GROUP).
-    fn quant_row(row: &[f32], col: &[f32], q: &mut Vec<i8>, sc: &mut Vec<f32>,
-                 group: usize) {
+    fn quant_row(row: &[f32], col: &[f32], q: &mut Vec<i8>, sc: &mut Vec<f32>, group: usize) {
         let mut resid = vec![0.0f32; row.len()];
         for (d, &x) in row.iter().enumerate() {
             resid[d] = if col.is_empty() { x } else { x / col[d] };
@@ -292,7 +307,12 @@ impl LayerKvCache {
         let ngk = hd.div_ceil(KV_K_GROUP);
         for h in 0..self.num_kv_heads {
             for (qv, sv, colv, group) in [
-                (&mut self.kq[h], &mut self.ks[h], &mut self.kcol[h], KV_K_GROUP),
+                (
+                    &mut self.kq[h],
+                    &mut self.ks[h],
+                    &mut self.kcol[h],
+                    KV_K_GROUP,
+                ),
                 (&mut self.vq[h], &mut self.vs[h], &mut self.vcol[h], hd),
             ] {
                 let spp = if group == hd { 1 } else { ngk }; // scales per position
@@ -304,8 +324,7 @@ impl LayerKvCache {
                 let mut rows = vec![0.0f32; n * hd];
                 for p in 0..n {
                     for d in 0..hd {
-                        rows[p * hd + d] =
-                            qv[p * hd + d] as f32 * sv[p * spp + d / group];
+                        rows[p * hd + d] = qv[p * hd + d] as f32 * sv[p * spp + d / group];
                     }
                 }
                 let mut col = vec![0.0f32; hd];
@@ -351,16 +370,24 @@ impl LayerKvCache {
             }
             let s = h * self.head_dim;
             if self.mode.quant_k() {
-                Self::quant_row(&k_new[s..s + self.head_dim],
-                                &self.kcol[h], &mut self.kq[h], &mut self.ks[h],
-                                KV_K_GROUP);
+                Self::quant_row(
+                    &k_new[s..s + self.head_dim],
+                    &self.kcol[h],
+                    &mut self.kq[h],
+                    &mut self.ks[h],
+                    KV_K_GROUP,
+                );
             } else {
                 self.k[h].extend_from_slice(&k_new[s..s + self.head_dim]);
             }
             if self.mode.quant_v() {
-                Self::quant_row(&v_new[s..s + self.head_dim],
-                                &self.vcol[h], &mut self.vq[h], &mut self.vs[h],
-                                self.head_dim);
+                Self::quant_row(
+                    &v_new[s..s + self.head_dim],
+                    &self.vcol[h],
+                    &mut self.vq[h],
+                    &mut self.vs[h],
+                    self.head_dim,
+                );
             } else {
                 self.v[h].extend_from_slice(&v_new[s..s + self.head_dim]);
             }
@@ -378,7 +405,12 @@ impl LayerKvCache {
         if self.mode == KvMode::F32 {
             let stored = self.k[kv_head].len() / hd;
             return crate::attention::attention_head(
-                q, &self.k[kv_head], &self.v[kv_head], hd, stored);
+                q,
+                &self.k[kv_head],
+                &self.v[kv_head],
+                hd,
+                stored,
+            );
         }
         let stored = self.head_len(kv_head);
         let scale = 1.0 / (hd as f32).sqrt();
@@ -389,22 +421,25 @@ impl LayerKvCache {
             let kcol = &self.kcol[kv_head];
             let mut qc = vec![0.0f32; hd];
             for d in 0..hd {
-                qc[d] = if kcol.is_empty() { q[d] } else { q[d] * kcol[d] };
+                qc[d] = if kcol.is_empty() {
+                    q[d]
+                } else {
+                    q[d] * kcol[d]
+                };
             }
             let ng = hd.div_ceil(KV_K_GROUP);
             for p in 0..stored {
                 let row = &kq[p * hd..(p + 1) * hd];
                 // SAFETY: i8 and u8 share layout; dot_i8_f32 reads the
                 // bytes back as i8.
-                let row_u8 = unsafe {
-                    std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len())
-                };
+                let row_u8 =
+                    unsafe { std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len()) };
                 let mut dot = 0.0f32;
                 for g in 0..ng {
                     let g0 = g * KV_K_GROUP;
                     let g1 = (g0 + KV_K_GROUP).min(hd);
-                    dot += crate::qtensor::dot_i8_f32(&row_u8[g0..g1], &qc[g0..g1])
-                        * ks[p * ng + g];
+                    dot +=
+                        crate::qtensor::dot_i8_f32(&row_u8[g0..g1], &qc[g0..g1]) * ks[p * ng + g];
                 }
                 scores[p] = dot * scale;
             }
@@ -552,8 +587,7 @@ impl LayerKvCache {
                     let row = &k[p * hd..(p + 1) * hd];
                     for h in 0..nheads {
                         scores[h * stored + p] =
-                            crate::attention::dot_f32(&q_group[h * hd..(h + 1) * hd], row)
-                                * scale;
+                            crate::attention::dot_f32(&q_group[h * hd..(h + 1) * hd], row) * scale;
                     }
                 }
             }
@@ -664,7 +698,9 @@ impl LayerKvCache {
         // hand it the sequential-B fast path instead. Accelerate keeps
         // the no-copy transposed call.
         let neon_gemm = cfg!(not(target_os = "macos"))
-            || std::env::var("CMF_FORCE_NEON_GEMM").map(|v| v == "1").unwrap_or(false);
+            || std::env::var("CMF_FORCE_NEON_GEMM")
+                .map(|v| v == "1")
+                .unwrap_or(false);
         SCRATCH.with(|s| {
             let mut s = s.borrow_mut();
             let (qpanel, scores, aopanel, ktpack) = &mut *s;
@@ -707,10 +743,23 @@ impl LayerKvCache {
                                 std::slice::from_raw_parts(sp_q.at(start * hd), (end - start) * hd)
                             };
                             let c = unsafe {
-                                std::slice::from_raw_parts_mut(sp_s.at(start * n), (end - start) * n)
+                                std::slice::from_raw_parts_mut(
+                                    sp_s.at(start * n),
+                                    (end - start) * n,
+                                )
                             };
                             crate::qtensor::neon_gemm_rm(
-                                end - start, n, hd, scale, a, hd, kt, n, false, c, n,
+                                end - start,
+                                n,
+                                hd,
+                                scale,
+                                a,
+                                hd,
+                                kt,
+                                n,
+                                false,
+                                c,
+                                n,
                             );
                         }
                     };
@@ -719,7 +768,9 @@ impl LayerKvCache {
                         _ => run(0, m),
                     }
                 } else {
-                    crate::qtensor::sgemm_rm(m, n, hd, scale, qpanel, hd, kmat, hd, true, scores, n);
+                    crate::qtensor::sgemm_rm(
+                        m, n, hd, scale, qpanel, hd, kmat, hd, true, scores, n,
+                    );
                 }
                 // Causal softmax, row-parallel (rows are disjoint).
                 let sp = SendPtr(scores.as_mut_ptr());
@@ -767,7 +818,17 @@ impl LayerKvCache {
                                 )
                             };
                             crate::qtensor::neon_gemm_rm(
-                                end - start, hd, n, 1.0, a, n, vmat, hd, false, c, hd,
+                                end - start,
+                                hd,
+                                n,
+                                1.0,
+                                a,
+                                n,
+                                vmat,
+                                hd,
+                                false,
+                                c,
+                                hd,
                             );
                         }
                     };
@@ -776,7 +837,9 @@ impl LayerKvCache {
                         _ => run(0, m),
                     }
                 } else {
-                    crate::qtensor::sgemm_rm(m, hd, n, 1.0, scores, n, vmat, hd, false, aopanel, hd);
+                    crate::qtensor::sgemm_rm(
+                        m, hd, n, 1.0, scores, n, vmat, hd, false, aopanel, hd,
+                    );
                 }
                 for hl in 0..heads_per_kv {
                     let hh = g * heads_per_kv + hl;
@@ -933,7 +996,9 @@ impl LayerKvCache {
         // Highest accumulated mass first among the middle positions.
         let mut order: Vec<usize> = (0..stored).filter(|&i| !keep[i]).collect();
         order.sort_by(|&a, &b| {
-            self.imp[b].partial_cmp(&self.imp[a]).unwrap_or(std::cmp::Ordering::Equal)
+            self.imp[b]
+                .partial_cmp(&self.imp[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         for i in order {
             if budget == 0 {
@@ -995,7 +1060,12 @@ pub struct KvCache {
 }
 
 impl KvCache {
-    pub fn new(num_layers: usize, num_kv_heads: usize, head_dim: usize, max_seq_len: usize) -> Self {
+    pub fn new(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> Self {
         let layers = (0..num_layers)
             .map(|_| LayerKvCache::new(num_kv_heads, head_dim))
             .collect();
@@ -1083,7 +1153,9 @@ mod tests {
     fn eviction_keeps_recent() {
         let mut cache = KvCache::new(2, 4, 8, 10);
         cache.policy = EvictionPolicy::Recent;
-        for l in &mut cache.layers { l.mode = KvMode::F32; }
+        for l in &mut cache.layers {
+            l.mode = KvMode::F32;
+        }
         let k = vec![1.0f32; 32];
         let v = vec![2.0f32; 32];
         for _ in 0..8 {
@@ -1140,7 +1212,9 @@ mod tests {
             f.append(&k, &v, &[true; 2]);
             q8.append(&k, &v, &[true; 2]);
         }
-        let q: Vec<f32> = (0..hd).map(|i| ((i * 13 + 5) % 89) as f32 / 89.0 - 0.5).collect();
+        let q: Vec<f32> = (0..hd)
+            .map(|i| ((i * 13 + 5) % 89) as f32 / 89.0 - 0.5)
+            .collect();
         for g in 0..heads {
             let (of, pf) = f.attend(&q, g);
             let (o8, p8) = q8.attend(&q, g);
@@ -1148,7 +1222,9 @@ mod tests {
             for d in 0..hd {
                 assert!(
                     (of[d] - o8[d]).abs() <= scale * 0.03 + 1e-3,
-                    "g{g} d{d}: f32 {} vs q8 {}", of[d], o8[d]
+                    "g{g} d{d}: f32 {} vs q8 {}",
+                    of[d],
+                    o8[d]
                 );
             }
             for p in 0..100 {
@@ -1236,14 +1312,18 @@ mod tests {
             let before = c.memory_bytes();
             c.evict_born(20, 4, 8); // q8v: used to panic here
             assert_eq!(c.head_len(0), 20, "k={mk} v={mv}");
-            assert!(c.memory_bytes() < before / 2,
-                    "memory must shrink (k={mk} v={mv})");
+            assert!(
+                c.memory_bytes() < before / 2,
+                "memory must shrink (k={mk} v={mv})"
+            );
             // V rows match the kept set: the heaviest positions
             // (tail 60..79) must be present in the attend output.
             let (out, _) = c.attend(&[1.0, 1.0, 1.0, 1.0], 0);
-            assert!(out[0] > 30.0,
-                    "V from the kept tail, not the stale head (k={mk} v={mv}, out {})",
-                    out[0]);
+            assert!(
+                out[0] > 30.0,
+                "V from the kept tail, not the stale head (k={mk} v={mv}, out {})",
+                out[0]
+            );
         }
     }
 
@@ -1251,7 +1331,9 @@ mod tests {
     fn born_eviction_keeps_high_mass_position() {
         let mut cache = KvCache::new(1, 1, 2, 16);
         cache.policy = EvictionPolicy::Born { sink: 1 };
-        for l in &mut cache.layers { l.mode = KvMode::F32; }
+        for l in &mut cache.layers {
+            l.mode = KvMode::F32;
+        }
         let layer = &mut cache.layers[0];
         // 8 positions; keys carry the position index so we can verify
         // exactly which positions survive the gather.

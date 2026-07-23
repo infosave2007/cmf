@@ -12,21 +12,26 @@
 //!
 //! Usage: cargo run --release --example matvec_bw -- <model.cmf> [sweep|one <tensor>]
 
+use cortiq_core::TensorDtype;
 use cortiq_engine::pool::Pool;
 use cortiq_engine::qtensor::QTensor;
-use cortiq_core::TensorDtype;
 use std::sync::Arc;
 use std::time::Instant;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: matvec_bw <model.cmf> [sweep|one <tensor>]");
+    let path = args
+        .next()
+        .expect("usage: matvec_bw <model.cmf> [sweep|one <tensor>]");
     let mode = args.next().unwrap_or_else(|| "sweep".to_string());
     let model = Arc::new(cortiq_core::CmfModel::open(&path).expect("open model"));
 
     // Real LM activations carry a few heavy channels (>8·rms); measured
     // mean on this model is ~3.7. NOUT models that distribution.
-    let nout: usize = std::env::var("NOUT").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let nout: usize = std::env::var("NOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
     let mk_x = |cols: usize| -> Vec<f32> {
         let mut x: Vec<f32> = (0..cols).map(|i| ((i % 17) as f32 - 8.0) / 8.0).collect();
         for k in 0..nout {
@@ -36,11 +41,17 @@ fn main() {
     };
 
     if mode == "one" {
-        let name = args.next().unwrap_or_else(|| "model.embed_tokens.weight".to_string());
+        let name = args
+            .next()
+            .unwrap_or_else(|| "model.embed_tokens.weight".to_string());
         let entry = model.tensor(&name).expect("tensor not found");
         let (rows, cols) = (entry.shape[0], entry.shape[1]);
         let nbytes = entry.nbytes as f64;
-        println!("tensor {name}: {rows}x{cols} {:?} = {:.1} MB, NOUT={nout}", entry.dtype, nbytes / 1e6);
+        println!(
+            "tensor {name}: {rows}x{cols} {:?} = {:.1} MB, NOUT={nout}",
+            entry.dtype,
+            nbytes / 1e6
+        );
         let t = QTensor::from_model(&model, &name).expect("wrap");
         let x = mk_x(cols);
         let mut out = vec![0f32; rows];
@@ -54,8 +65,12 @@ fn main() {
                 t.matvec(&x, &mut out, pool.as_ref());
             }
             let el = t0.elapsed().as_secs_f64();
-            println!("threads={nt:2}  {:6.2} ms/matvec  {:6.1} GB/s (sink {:.3})",
-                el / iters as f64 * 1e3, nbytes * iters as f64 / el / 1e9, out[0]);
+            println!(
+                "threads={nt:2}  {:6.2} ms/matvec  {:6.1} GB/s (sink {:.3})",
+                el / iters as f64 * 1e3,
+                nbytes * iters as f64 / el / 1e9,
+                out[0]
+            );
         }
         return;
     }
@@ -84,7 +99,11 @@ fn main() {
         .map(|n| {
             let e = model.tensor(n).unwrap();
             let (rows, cols) = (e.shape[0], e.shape[1]);
-            (QTensor::from_model(&model, n).expect("wrap"), mk_x(cols), vec![0f32; rows])
+            (
+                QTensor::from_model(&model, n).expect("wrap"),
+                mk_x(cols),
+                vec![0f32; rows],
+            )
         })
         .collect();
     let mut tensors = tensors;

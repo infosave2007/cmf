@@ -26,7 +26,9 @@ const SEQ: usize = 16; // > w + sink + 8 = 13 → skeleton active
 fn synth_f32(n: usize, salt: u64, scale: f32) -> Vec<f32> {
     (0..n)
         .map(|i| {
-            let x = (i as u64).wrapping_mul(6364136223846793005).wrapping_add(salt.wrapping_mul(1442695040888963407) ^ 0x9E3779B97F4A7C15);
+            let x = (i as u64)
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(salt.wrapping_mul(1442695040888963407) ^ 0x9E3779B97F4A7C15);
             let x = (x ^ (x >> 31)).wrapping_mul(0xBF58476D1CE4E5B9);
             (((x >> 11) as f64 / (1u64 << 53) as f64 - 0.5) as f32) * scale
         })
@@ -95,7 +97,12 @@ const G_KK: usize = 3;
 /// Write a tiny all-f32 model (with per-head qk-norms — that path must
 /// be exercised) and return its path. `gate` adds the Qwen3.5 output
 /// gate (q_proj rows = 2·nh·hd); `hybrid` makes layer 1 GatedDeltaNet.
-fn write_tiny_model_variant(dir: &std::path::Path, name: &str, gate: bool, hybrid: bool) -> std::path::PathBuf {
+fn write_tiny_model_variant(
+    dir: &std::path::Path,
+    name: &str,
+    gate: bool,
+    hybrid: bool,
+) -> std::path::PathBuf {
     let mut specs: Vec<TensorSpec> = Vec::new();
     let mut push = |name: &str, shape: Vec<usize>, data: Vec<f32>| {
         specs.push(TensorSpec {
@@ -105,43 +112,141 @@ fn write_tiny_model_variant(dir: &std::path::Path, name: &str, gate: bool, hybri
             data: f32_bytes(&data),
         });
     };
-    push("model.embed_tokens.weight", vec![VOCAB, H], synth_f32(VOCAB * H, 100, 0.6));
-    let norm1 = |n: usize, salt: u64| -> Vec<f32> { synth_f32(n, salt, 0.2).iter().map(|v| 1.0 + v).collect() };
+    push(
+        "model.embed_tokens.weight",
+        vec![VOCAB, H],
+        synth_f32(VOCAB * H, 100, 0.6),
+    );
+    let norm1 = |n: usize, salt: u64| -> Vec<f32> {
+        synth_f32(n, salt, 0.2).iter().map(|v| 1.0 + v).collect()
+    };
     push("model.norm.weight", vec![H], norm1(H, 101));
     for li in 0..NL {
         let p = format!("model.layers.{li}.");
         let s = li as u64 * 20;
-        push(&format!("{p}input_layernorm.weight"), vec![H], norm1(H, 102 + s));
-        push(&format!("{p}post_attention_layernorm.weight"), vec![H], norm1(H, 103 + s));
+        push(
+            &format!("{p}input_layernorm.weight"),
+            vec![H],
+            norm1(H, 102 + s),
+        );
+        push(
+            &format!("{p}post_attention_layernorm.weight"),
+            vec![H],
+            norm1(H, 103 + s),
+        );
         if hybrid && li == 1 {
             // GatedDeltaNet layer (frozen in FCD; through-backward only).
             let c_dim = 2 * G_NK * G_DK + G_NV * G_DV;
             let vd = G_NV * G_DV;
             let la = format!("{p}linear_attn.");
-            push(&format!("{la}in_proj_qkv.weight"), vec![c_dim, H], synth_f32(c_dim * H, 130 + s, 0.5));
-            push(&format!("{la}in_proj_z.weight"), vec![vd, H], synth_f32(vd * H, 131 + s, 0.5));
-            push(&format!("{la}in_proj_a.weight"), vec![G_NV, H], synth_f32(G_NV * H, 132 + s, 0.5));
-            push(&format!("{la}in_proj_b.weight"), vec![G_NV, H], synth_f32(G_NV * H, 133 + s, 0.5));
-            push(&format!("{la}conv1d.weight"), vec![c_dim, G_KK], synth_f32(c_dim * G_KK, 134 + s, 0.6));
-            push(&format!("{la}A_log"), vec![G_NV], synth_f32(G_NV, 135 + s, 0.8));
-            push(&format!("{la}dt_bias"), vec![G_NV], synth_f32(G_NV, 136 + s, 0.8));
-            push(&format!("{la}norm.weight"), vec![G_DV], norm1(G_DV, 137 + s));
-            push(&format!("{la}out_proj.weight"), vec![H, vd], synth_f32(H * vd, 138 + s, 0.5));
-            push(&format!("{p}mlp.gate_proj.weight"), vec![INTER, H], synth_f32(INTER * H, 110 + s, 0.5));
-            push(&format!("{p}mlp.up_proj.weight"), vec![INTER, H], synth_f32(INTER * H, 111 + s, 0.5));
-            push(&format!("{p}mlp.down_proj.weight"), vec![H, INTER], synth_f32(H * INTER, 112 + s, 0.5));
+            push(
+                &format!("{la}in_proj_qkv.weight"),
+                vec![c_dim, H],
+                synth_f32(c_dim * H, 130 + s, 0.5),
+            );
+            push(
+                &format!("{la}in_proj_z.weight"),
+                vec![vd, H],
+                synth_f32(vd * H, 131 + s, 0.5),
+            );
+            push(
+                &format!("{la}in_proj_a.weight"),
+                vec![G_NV, H],
+                synth_f32(G_NV * H, 132 + s, 0.5),
+            );
+            push(
+                &format!("{la}in_proj_b.weight"),
+                vec![G_NV, H],
+                synth_f32(G_NV * H, 133 + s, 0.5),
+            );
+            push(
+                &format!("{la}conv1d.weight"),
+                vec![c_dim, G_KK],
+                synth_f32(c_dim * G_KK, 134 + s, 0.6),
+            );
+            push(
+                &format!("{la}A_log"),
+                vec![G_NV],
+                synth_f32(G_NV, 135 + s, 0.8),
+            );
+            push(
+                &format!("{la}dt_bias"),
+                vec![G_NV],
+                synth_f32(G_NV, 136 + s, 0.8),
+            );
+            push(
+                &format!("{la}norm.weight"),
+                vec![G_DV],
+                norm1(G_DV, 137 + s),
+            );
+            push(
+                &format!("{la}out_proj.weight"),
+                vec![H, vd],
+                synth_f32(H * vd, 138 + s, 0.5),
+            );
+            push(
+                &format!("{p}mlp.gate_proj.weight"),
+                vec![INTER, H],
+                synth_f32(INTER * H, 110 + s, 0.5),
+            );
+            push(
+                &format!("{p}mlp.up_proj.weight"),
+                vec![INTER, H],
+                synth_f32(INTER * H, 111 + s, 0.5),
+            );
+            push(
+                &format!("{p}mlp.down_proj.weight"),
+                vec![H, INTER],
+                synth_f32(H * INTER, 112 + s, 0.5),
+            );
             continue;
         }
         let q_rows = if gate { 2 * NH * HD } else { NH * HD };
-        push(&format!("{p}self_attn.q_proj.weight"), vec![q_rows, H], synth_f32(q_rows * H, 104 + s, 0.5));
-        push(&format!("{p}self_attn.k_proj.weight"), vec![NKV * HD, H], synth_f32(NKV * HD * H, 105 + s, 0.5));
-        push(&format!("{p}self_attn.v_proj.weight"), vec![NKV * HD, H], synth_f32(NKV * HD * H, 106 + s, 0.5));
-        push(&format!("{p}self_attn.o_proj.weight"), vec![H, NH * HD], synth_f32(H * NH * HD, 107 + s, 0.5));
-        push(&format!("{p}self_attn.q_norm.weight"), vec![HD], norm1(HD, 108 + s));
-        push(&format!("{p}self_attn.k_norm.weight"), vec![HD], norm1(HD, 109 + s));
-        push(&format!("{p}mlp.gate_proj.weight"), vec![INTER, H], synth_f32(INTER * H, 110 + s, 0.5));
-        push(&format!("{p}mlp.up_proj.weight"), vec![INTER, H], synth_f32(INTER * H, 111 + s, 0.5));
-        push(&format!("{p}mlp.down_proj.weight"), vec![H, INTER], synth_f32(H * INTER, 112 + s, 0.5));
+        push(
+            &format!("{p}self_attn.q_proj.weight"),
+            vec![q_rows, H],
+            synth_f32(q_rows * H, 104 + s, 0.5),
+        );
+        push(
+            &format!("{p}self_attn.k_proj.weight"),
+            vec![NKV * HD, H],
+            synth_f32(NKV * HD * H, 105 + s, 0.5),
+        );
+        push(
+            &format!("{p}self_attn.v_proj.weight"),
+            vec![NKV * HD, H],
+            synth_f32(NKV * HD * H, 106 + s, 0.5),
+        );
+        push(
+            &format!("{p}self_attn.o_proj.weight"),
+            vec![H, NH * HD],
+            synth_f32(H * NH * HD, 107 + s, 0.5),
+        );
+        push(
+            &format!("{p}self_attn.q_norm.weight"),
+            vec![HD],
+            norm1(HD, 108 + s),
+        );
+        push(
+            &format!("{p}self_attn.k_norm.weight"),
+            vec![HD],
+            norm1(HD, 109 + s),
+        );
+        push(
+            &format!("{p}mlp.gate_proj.weight"),
+            vec![INTER, H],
+            synth_f32(INTER * H, 110 + s, 0.5),
+        );
+        push(
+            &format!("{p}mlp.up_proj.weight"),
+            vec![INTER, H],
+            synth_f32(INTER * H, 111 + s, 0.5),
+        );
+        push(
+            &format!("{p}mlp.down_proj.weight"),
+            vec![H, INTER],
+            synth_f32(H * INTER, 112 + s, 0.5),
+        );
     }
     let mut arch = tiny_arch();
     if hybrid {
@@ -183,13 +288,24 @@ fn tiny_o1() -> O1Cfg {
 }
 
 fn rand_ids(n: usize, salt: u64) -> Vec<u32> {
-    synth_f32(n, salt, 1.0).iter().map(|v| (((v + 0.5) * VOCAB as f32) as u32).min(VOCAB as u32 - 1)).collect()
+    synth_f32(n, salt, 1.0)
+        .iter()
+        .map(|v| (((v + 0.5) * VOCAB as f32) as u32).min(VOCAB as u32 - 1))
+        .collect()
 }
 
 /// FD over top-|g| trainable weights through the whole training graph.
 /// Returns (per-tensor worst rel err). `only` filters which tensor
 /// slots are asserted; the rest are printed.
-fn block_fd(fm: &FcdModel, ts: &mut TrainState, ids: &[u32], tgt: &[u32], t: usize, tol: f64, only: &dyn Fn(usize) -> bool) -> f64 {
+fn block_fd(
+    fm: &FcdModel,
+    ts: &mut TrainState,
+    ids: &[u32],
+    tgt: &[u32],
+    t: usize,
+    tol: f64,
+    only: &dyn Fn(usize) -> bool,
+) -> f64 {
     let kl_w = 0.7;
     let l0 = fm.loss_and_grads_for_test(ids, tgt, 1, t, ts, kl_w);
     assert!(l0.is_finite());
@@ -211,7 +327,10 @@ fn block_fd(fm: &FcdModel, ts: &mut TrainState, ids: &[u32], tgt: &[u32], t: usi
             let rel = (ga - fd).abs() / ga.abs().max(fd.abs()).max(1e-8);
             if only(pi) {
                 worst = worst.max(rel);
-                assert!(rel < tol, "tensor {pi} idx {i}: analytic {ga:.5e} vs fd {fd:.5e} (rel {rel:.2e})");
+                assert!(
+                    rel < tol,
+                    "tensor {pi} idx {i}: analytic {ga:.5e} vs fd {fd:.5e} (rel {rel:.2e})"
+                );
             } else {
                 println!("  (unasserted, M-gap zone) tensor {pi} idx {i}: rel {rel:.2e}");
             }
@@ -258,8 +377,18 @@ fn block_gradcheck_skeleton_active_last_layer_tight() {
     // Trainable slots: layer-major, 5 per layer; the last layer's
     // pln/gate/up/down are slots (NL-1)*5 + 1..5.
     let base = (NL - 1) * 5;
-    let worst = block_fd(&fm, &mut ts, &seqs[..SEQ], &seqs[1..], SEQ, 3e-2, &move |pi| pi > base);
-    println!("block gradcheck skeleton-active (last layer post-attn tight): worst rel err {worst:.2e}");
+    let worst = block_fd(
+        &fm,
+        &mut ts,
+        &seqs[..SEQ],
+        &seqs[1..],
+        SEQ,
+        3e-2,
+        &move |pi| pi > base,
+    );
+    println!(
+        "block gradcheck skeleton-active (last layer post-attn tight): worst rel err {worst:.2e}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -294,8 +423,14 @@ fn training_smoke_loss_decreases_and_output_loads() {
          | best step {}",
         report.ppl_start, report.ppl_final, report.best_step
     );
-    assert!(last < first, "loss must decrease over 20 steps ({first:.4} → {last:.4})");
-    assert!(report.best_step > 0 && report.best_step % 5 == 0, "best from an eval point");
+    assert!(
+        last < first,
+        "loss must decrease over 20 steps ({first:.4} → {last:.4})"
+    );
+    assert!(
+        report.best_step > 0 && report.best_step % 5 == 0,
+        "best from an eval point"
+    );
     assert!(report.ppl_final.is_finite() && report.ppl_start.is_finite());
 
     // The polished container: intact, trainables replaced as F32, o1 +
@@ -304,19 +439,31 @@ fn training_smoke_loss_decreases_and_output_loads() {
     assert!(polished.verify().is_empty(), "hashes intact");
     let prov = polished.header.provenance.as_ref().expect("provenance");
     assert!(prov.get("o1_attn").is_some() && prov.get("fcd").is_some());
-    let t0 = polished.tensor("model.layers.0.mlp.gate_proj.weight").unwrap();
+    let t0 = polished
+        .tensor("model.layers.0.mlp.gate_proj.weight")
+        .unwrap();
     assert_eq!(t0.dtype, TensorDtype::F32);
     // Weights actually moved.
-    let orig = model.tensor_bytes("model.layers.0.mlp.gate_proj.weight").unwrap();
-    let new = polished.tensor_bytes("model.layers.0.mlp.gate_proj.weight").unwrap();
+    let orig = model
+        .tensor_bytes("model.layers.0.mlp.gate_proj.weight")
+        .unwrap();
+    let new = polished
+        .tensor_bytes("model.layers.0.mlp.gate_proj.weight")
+        .unwrap();
     assert_ne!(orig, new, "polish must change the trained tensors");
     // Untouched tensors byte-identical.
-    assert_eq!(model.tensor_bytes("model.embed_tokens.weight").unwrap(), polished.tensor_bytes("model.embed_tokens.weight").unwrap());
+    assert_eq!(
+        model.tensor_bytes("model.embed_tokens.weight").unwrap(),
+        polished.tensor_bytes("model.embed_tokens.weight").unwrap()
+    );
 
     let polished = Arc::new(polished);
     let mut p = Pipeline::from_model(&polished, SamplerConfig::default()).expect("pipeline");
     let logits = p.forward_ids(&va[..32], None).expect("forward");
-    assert!(logits.iter().all(|v| v.is_finite()), "finite logits from the polished file");
+    assert!(
+        logits.iter().all(|v| v.is_finite()),
+        "finite logits from the polished file"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

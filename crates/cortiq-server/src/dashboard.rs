@@ -1,11 +1,7 @@
 //! Web management dashboard — served as embedded static content.
 
 use crate::AppState;
-use axum::{
-    response::Html,
-    routing::get,
-    Router,
-};
+use axum::{Router, response::Html, routing::get};
 use std::sync::Arc;
 
 /// Register dashboard routes.

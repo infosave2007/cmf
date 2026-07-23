@@ -11,8 +11,8 @@
 //!
 //! Extension point: new dtypes = new match arm here, nothing else moves.
 
-use crate::pool::{matvec_rows, matvec_rows2, Pool};
-use cortiq_core::quant::{f16_to_f32, GROUP_SIZE, Q1_TILE, Q4_TILE};
+use crate::pool::{Pool, matvec_rows, matvec_rows2};
+use cortiq_core::quant::{GROUP_SIZE, Q1_TILE, Q4_TILE, f16_to_f32};
 use cortiq_core::{CmfModel, TensorDtype};
 use std::sync::Arc;
 
@@ -57,7 +57,9 @@ pub enum QTensor {
 fn repack_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("CMF_REPACK").map(|v| v == "1").unwrap_or(cfg!(target_os = "android"))
+        std::env::var("CMF_REPACK")
+            .map(|v| v == "1")
+            .unwrap_or(cfg!(target_os = "android"))
     })
 }
 
@@ -182,12 +184,9 @@ impl QTensor {
             // file — no load-time prefix scan; kernels are shared with
             // legacy vbit (they consume absolute offsets either way).
             TensorDtype::VbitRo if cols % GROUP_SIZE == 0 => {
-                let (_, off_off, packed_off) =
-                    cortiq_core::quant::vbit_ro_sections(rows, cols);
+                let (_, off_off, packed_off) = cortiq_core::quant::vbit_ro_sections(rows, cols);
                 let offsets: Vec<usize> = (0..=rows)
-                    .map(|r| {
-                        packed_off + cortiq_core::quant::vbit_ro_offset(bytes, off_off, r)
-                    })
+                    .map(|r| packed_off + cortiq_core::quant::vbit_ro_offset(bytes, off_off, r))
                     .collect();
                 Ok(Self::Mapped {
                     model: model.clone(),
@@ -266,7 +265,13 @@ impl QTensor {
     /// q1-mapped tensor? (GPU gates: the q1 CPU kernel is
     /// compute-bound, so offload pays at much smaller shapes than q8.)
     pub(crate) fn is_q1(&self) -> bool {
-        matches!(self, Self::Mapped { dtype: TensorDtype::Q1, .. })
+        matches!(
+            self,
+            Self::Mapped {
+                dtype: TensorDtype::Q1,
+                ..
+            }
+        )
     }
 
     /// Owned-f32 view (data, rows, cols) — the GDN a/b gate projections
@@ -293,7 +298,8 @@ impl QTensor {
             } if !crate::gpu::metal_q1t_enabled() => None,
             Self::Mapped {
                 idx,
-                dtype: TensorDtype::Q1
+                dtype:
+                    TensorDtype::Q1
                     | TensorDtype::Q1T
                     | TensorDtype::Q4Block
                     | TensorDtype::Q8Row
@@ -341,7 +347,12 @@ impl QTensor {
     /// keys its resident VRAM cache by idx. None for any other dtype/kind.
     pub fn mapped_q1(&self) -> Option<(&std::sync::Arc<CmfModel>, usize)> {
         match self {
-            Self::Mapped { model, idx, dtype: TensorDtype::Q1, .. } => Some((model, *idx)),
+            Self::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q1,
+                ..
+            } => Some((model, *idx)),
             _ => None,
         }
     }
@@ -351,13 +362,37 @@ impl QTensor {
     /// rs). None for dtypes the token graph does not handle (q8_2f/q4_block/vbit).
     pub fn graph_weight(&self) -> Option<(&std::sync::Arc<CmfModel>, usize, u8, &[f32])> {
         match self {
-            Self::Mapped { model, idx, dtype: TensorDtype::Q8Row, row_scale, .. } => {
-                Some((model, *idx, 0, row_scale.as_slice()))
-            }
-            Self::Mapped { model, idx, dtype: TensorDtype::Q1, .. } => Some((model, *idx, 1, &[])),
-            Self::Mapped { model, idx, dtype: TensorDtype::Q4Tiled, .. } => Some((model, *idx, 2, &[])),
-            Self::Mapped { model, idx, dtype: TensorDtype::Q4Block, .. } => Some((model, *idx, 2, &[])),
-            Self::Mapped { model, idx, dtype: TensorDtype::Q1T, .. } => Some((model, *idx, 3, &[])),
+            Self::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q8Row,
+                row_scale,
+                ..
+            } => Some((model, *idx, 0, row_scale.as_slice())),
+            Self::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q1,
+                ..
+            } => Some((model, *idx, 1, &[])),
+            Self::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q4Tiled,
+                ..
+            } => Some((model, *idx, 2, &[])),
+            Self::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q4Block,
+                ..
+            } => Some((model, *idx, 2, &[])),
+            Self::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q1T,
+                ..
+            } => Some((model, *idx, 3, &[])),
             _ => None,
         }
     }
@@ -421,8 +456,7 @@ impl QTensor {
                     let bytes = self.quant_bytes();
                     let gpr = cols / GROUP_SIZE;
                     for gi in 0..gpr {
-                        let tile =
-                            &bytes[(r * gpr + gi) * Q1_TILE..(r * gpr + gi + 1) * Q1_TILE];
+                        let tile = &bytes[(r * gpr + gi) * Q1_TILE..(r * gpr + gi + 1) * Q1_TILE];
                         let s = f16_to_f32(u16::from_le_bytes([tile[0], tile[1]]));
                         for (j, &b) in tile[2..].iter().enumerate() {
                             for k in 0..8 {
@@ -439,10 +473,14 @@ impl QTensor {
                     let base_len = self.rows() * gpr * cortiq_core::quant::Q1T_TILE;
                     for gi in 0..gpr {
                         let off = (r * gpr + gi) * cortiq_core::quant::Q1T_TILE;
-                        let s = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+                        let s = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([
+                            bytes[off],
+                            bytes[off + 1],
+                        ]));
                         let codes = &bytes[off + 2..off + cortiq_core::quant::Q1T_TILE];
                         for k in 0..GROUP_SIZE {
-                            dst[gi * GROUP_SIZE + k] = match cortiq_core::quant::q1t_code(codes, k) {
+                            dst[gi * GROUP_SIZE + k] = match cortiq_core::quant::q1t_code(codes, k)
+                            {
                                 1 => s,
                                 2 => -s,
                                 _ => 0.0,
@@ -454,13 +492,25 @@ impl QTensor {
                     let entries = base_len + (rows + 1) * 4;
                     if entries <= bytes.len() {
                         let ptrs = &bytes[base_len..base_len + (rows + 1) * 4];
-                        let r0 = u32::from_le_bytes([ptrs[r * 4], ptrs[r * 4 + 1], ptrs[r * 4 + 2], ptrs[r * 4 + 3]]) as usize;
-                        let r1 = u32::from_le_bytes([ptrs[(r + 1) * 4], ptrs[(r + 1) * 4 + 1], ptrs[(r + 1) * 4 + 2], ptrs[(r + 1) * 4 + 3]]) as usize;
+                        let r0 = u32::from_le_bytes([
+                            ptrs[r * 4],
+                            ptrs[r * 4 + 1],
+                            ptrs[r * 4 + 2],
+                            ptrs[r * 4 + 3],
+                        ]) as usize;
+                        let r1 = u32::from_le_bytes([
+                            ptrs[(r + 1) * 4],
+                            ptrs[(r + 1) * 4 + 1],
+                            ptrs[(r + 1) * 4 + 2],
+                            ptrs[(r + 1) * 4 + 3],
+                        ]) as usize;
                         let off = entries + r0 * 4;
                         for i in 0..r1 - r0 {
                             let item = &bytes[off + i * 4..off + i * 4 + 4];
                             let c = u16::from_le_bytes([item[0], item[1]]) as usize;
-                            let v = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([item[2], item[3]]));
+                            let v = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([
+                                item[2], item[3],
+                            ]));
                             if c < cols {
                                 dst[c] = v;
                             }
@@ -544,7 +594,10 @@ impl QTensor {
                 }
             }
             Self::Mapped {
-                dtype, row_scale, col_field, ..
+                dtype,
+                row_scale,
+                col_field,
+                ..
             } => {
                 let q = self.quant_bytes();
                 let colf = if *dtype == TensorDtype::Q8_2f {
@@ -571,7 +624,12 @@ impl QTensor {
                 let row = &data[r * cols..(r + 1) * cols];
                 row.iter().zip(x).map(|(w, v)| w * v).sum()
             }
-            Self::Mapped { dtype, row_scale, col_field, .. } => match dtype {
+            Self::Mapped {
+                dtype,
+                row_scale,
+                col_field,
+                ..
+            } => match dtype {
                 TensorDtype::Q8Row => {
                     let q = &self.quant_bytes()[r * cols..(r + 1) * cols];
                     dot_i8_f32(q, x) * row_scale[r]
@@ -723,7 +781,9 @@ impl QTensor {
                 // GPU share: CMF_GPU_SPLIT (0..1, default 0.5).
                 if *rows >= crate::gpu::min_rows()
                     && matches!(dtype, TensorDtype::Q8Row | TensorDtype::Q8_2f)
-                    && std::env::var("CMF_GPU_LMHEAD").map(|v| v != "0").unwrap_or(true)
+                    && std::env::var("CMF_GPU_LMHEAD")
+                        .map(|v| v != "0")
+                        .unwrap_or(true)
                     && crate::gpu::enabled_here()
                 {
                     // Runtime probe: alternate the hybrid against the
@@ -732,7 +792,18 @@ impl QTensor {
                     match crate::gpu::probe_arm(crate::gpu::OpClass::Matvec) {
                         crate::gpu::ProbeArm::Gpu => {}
                         crate::gpu::ProbeArm::CpuTimed => {
-                            qmatvec(self.quant_bytes(), repack, row_scale, x, col_field, *dtype, *rows, *cols, out, pool);
+                            qmatvec(
+                                self.quant_bytes(),
+                                repack,
+                                row_scale,
+                                x,
+                                col_field,
+                                *dtype,
+                                *rows,
+                                *cols,
+                                out,
+                                pool,
+                            );
                             crate::gpu::probe_record(
                                 crate::gpu::OpClass::Matvec,
                                 false,
@@ -741,7 +812,18 @@ impl QTensor {
                             return;
                         }
                         crate::gpu::ProbeArm::Cpu => {
-                            qmatvec(self.quant_bytes(), repack, row_scale, x, col_field, *dtype, *rows, *cols, out, pool);
+                            qmatvec(
+                                self.quant_bytes(),
+                                repack,
+                                row_scale,
+                                x,
+                                col_field,
+                                *dtype,
+                                *rows,
+                                *cols,
+                                out,
+                                pool,
+                            );
                             return;
                         }
                     }
@@ -809,13 +891,31 @@ impl QTensor {
                     );
                     return;
                 }
-                qmatvec(self.quant_bytes(), repack, row_scale, x, col_field, *dtype, *rows, *cols, out, pool);
+                qmatvec(
+                    self.quant_bytes(),
+                    repack,
+                    row_scale,
+                    x,
+                    col_field,
+                    *dtype,
+                    *rows,
+                    *cols,
+                    out,
+                    pool,
+                );
             }
         }
     }
 
     /// Fused two-input matvec (MTP verify pair): weights streamed once.
-    pub fn matvec2(&self, x1: &[f32], x2: &[f32], o1: &mut [f32], o2: &mut [f32], pool: Option<&Pool>) {
+    pub fn matvec2(
+        &self,
+        x1: &[f32],
+        x2: &[f32],
+        o1: &mut [f32],
+        o2: &mut [f32],
+        pool: Option<&Pool>,
+    ) {
         match self {
             Self::F32 { data, .. } => matvec_rows2(pool, data, x1, x2, o1, o2),
             Self::Mapped {
@@ -849,10 +949,32 @@ impl QTensor {
                     return;
                 }
                 if matches!(dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
-                    vbitmatvec2(self.quant_bytes(), vbit_offsets, x1, x2, *rows, *cols, o1, o2, pool);
+                    vbitmatvec2(
+                        self.quant_bytes(),
+                        vbit_offsets,
+                        x1,
+                        x2,
+                        *rows,
+                        *cols,
+                        o1,
+                        o2,
+                        pool,
+                    );
                     return;
                 }
-                qmatvec2(self.quant_bytes(), row_scale, x1, x2, col_field, *dtype, *rows, *cols, o1, o2, pool);
+                qmatvec2(
+                    self.quant_bytes(),
+                    row_scale,
+                    x1,
+                    x2,
+                    col_field,
+                    *dtype,
+                    *rows,
+                    *cols,
+                    o1,
+                    o2,
+                    pool,
+                );
             }
         }
     }
@@ -921,7 +1043,9 @@ impl QTensor {
                             let t0 = std::time::Instant::now();
                             match crate::gpu::probe_arm(crate::gpu::OpClass::Matmat) {
                                 crate::gpu::ProbeArm::Gpu => {
-                                    if crate::gpu::q1_matmat(model, *idx, xs_all, b, rows, cols, out) {
+                                    if crate::gpu::q1_matmat(
+                                        model, *idx, xs_all, b, rows, cols, out,
+                                    ) {
                                         crate::gpu::probe_record(
                                             crate::gpu::OpClass::Matmat,
                                             true,
@@ -949,15 +1073,14 @@ impl QTensor {
                 if *dtype == TensorDtype::Q1T {
                     // GPU batched GEMM for wide prefill (base + overlay on the
                     // device); probe keeps the winner vs the CPU matmat.
-                    if b >= 32
-                        && b * rows * cols >= 128_000_000
-                        && crate::gpu::enabled_here()
-                    {
+                    if b >= 32 && b * rows * cols >= 128_000_000 && crate::gpu::enabled_here() {
                         if let Self::Mapped { model, idx, .. } = self {
                             let t0 = std::time::Instant::now();
                             match crate::gpu::probe_arm(crate::gpu::OpClass::Matmat) {
                                 crate::gpu::ProbeArm::Gpu => {
-                                    if crate::gpu::q1t_matmat(model, *idx, xs_all, b, rows, cols, out) {
+                                    if crate::gpu::q1t_matmat(
+                                        model, *idx, xs_all, b, rows, cols, out,
+                                    ) {
                                         crate::gpu::probe_record(
                                             crate::gpu::OpClass::Matmat,
                                             true,
@@ -967,7 +1090,15 @@ impl QTensor {
                                     }
                                 }
                                 crate::gpu::ProbeArm::CpuTimed => {
-                                    q1t_matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
+                                    q1t_matmat(
+                                        self.quant_bytes(),
+                                        xs_all,
+                                        b,
+                                        rows,
+                                        cols,
+                                        out,
+                                        pool,
+                                    );
                                     crate::gpu::probe_record(
                                         crate::gpu::OpClass::Matmat,
                                         false,
@@ -983,23 +1114,27 @@ impl QTensor {
                     return;
                 }
                 if matches!(dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
-                    vbitmatmat(self.quant_bytes(), vbit_offsets, xs_all, b, rows, cols, out, pool);
+                    vbitmatmat(
+                        self.quant_bytes(),
+                        vbit_offsets,
+                        xs_all,
+                        b,
+                        rows,
+                        cols,
+                        out,
+                        pool,
+                    );
                     return;
                 }
                 let pre: Vec<std::borrow::Cow<'_, [f32]>> = (0..b)
-                    .map(|bi| {
-                        prescale(&xs_all[bi * cols..(bi + 1) * cols], col_field, *dtype)
-                    })
+                    .map(|bi| prescale(&xs_all[bi * cols..(bi + 1) * cols], col_field, *dtype))
                     .collect();
                 // D5: large prefill-batch GEMMs — on the GPU (threshold by
                 // work volume: submission carries b×rows×cols MACs).
                 // Runtime probe: the naive GEMM shader + sync readback
                 // lose to the CPU GEMM on slow driver stacks — alternate
                 // both arms and keep the winner.
-                if b >= 8
-                    && b * rows * cols >= 128_000_000
-                    && crate::gpu::enabled_here()
-                {
+                if b >= 8 && b * rows * cols >= 128_000_000 && crate::gpu::enabled_here() {
                     if let Self::Mapped { model, idx, .. } = self {
                         let t0 = std::time::Instant::now();
                         match crate::gpu::probe_arm(crate::gpu::OpClass::Matmat) {
@@ -1018,8 +1153,8 @@ impl QTensor {
                                 let flat: Vec<f32> =
                                     pre.iter().flat_map(|v| v.iter().copied()).collect();
                                 if crate::gpu::q8_matmat(
-                                    model, *idx, row_scale, &flat, b, rows, cols, out)
-                                {
+                                    model, *idx, row_scale, &flat, b, rows, cols, out,
+                                ) {
                                     crate::gpu::probe_record(
                                         crate::gpu::OpClass::Matmat,
                                         true,
@@ -1066,25 +1201,49 @@ impl QTensor {
         let uniform_q8 = ts.iter().all(|t| {
             matches!(
                 t,
-                Self::Mapped { dtype: TensorDtype::Q8Row | TensorDtype::Q8_2f, .. }
+                Self::Mapped {
+                    dtype: TensorDtype::Q8Row | TensorDtype::Q8_2f,
+                    ..
+                }
             )
         });
         let uniform_f32 = ts.iter().all(|t| matches!(t, Self::F32 { .. }));
-        let uniform_q4 = ts
-            .iter()
-            .all(|t| matches!(t, Self::Mapped { dtype: TensorDtype::Q4Block, .. }));
-        let uniform_vbit = ts
-            .iter()
-            .all(|t| matches!(
+        let uniform_q4 = ts.iter().all(|t| {
+            matches!(
                 t,
-                Self::Mapped { dtype: TensorDtype::Vbit | TensorDtype::VbitRo, .. }
-            ));
-        let uniform_q1 = ts
-            .iter()
-            .all(|t| matches!(t, Self::Mapped { dtype: TensorDtype::Q1, .. }));
-        let uniform_q1t = ts
-            .iter()
-            .all(|t| matches!(t, Self::Mapped { dtype: TensorDtype::Q1T, .. }));
+                Self::Mapped {
+                    dtype: TensorDtype::Q4Block,
+                    ..
+                }
+            )
+        });
+        let uniform_vbit = ts.iter().all(|t| {
+            matches!(
+                t,
+                Self::Mapped {
+                    dtype: TensorDtype::Vbit | TensorDtype::VbitRo,
+                    ..
+                }
+            )
+        });
+        let uniform_q1 = ts.iter().all(|t| {
+            matches!(
+                t,
+                Self::Mapped {
+                    dtype: TensorDtype::Q1,
+                    ..
+                }
+            )
+        });
+        let uniform_q1t = ts.iter().all(|t| {
+            matches!(
+                t,
+                Self::Mapped {
+                    dtype: TensorDtype::Q1T,
+                    ..
+                }
+            )
+        });
         let Some(pool) = pool else {
             for (t, o) in ts.iter().zip(outs.iter_mut()) {
                 t.matvec(x, o, None);
@@ -1092,7 +1251,12 @@ impl QTensor {
             return;
         };
         if total_rows < 256
-            || !(uniform_q8 || uniform_f32 || uniform_q4 || uniform_vbit || uniform_q1 || uniform_q1t)
+            || !(uniform_q8
+                || uniform_f32
+                || uniform_q4
+                || uniform_vbit
+                || uniform_q1
+                || uniform_q1t)
         {
             for (t, o) in ts.iter().zip(outs.iter_mut()) {
                 t.matvec(x, o, Some(pool));
@@ -1192,9 +1356,15 @@ impl QTensor {
                     pool.run_many(&parts);
                 } else {
                     let closures: [_; N] = std::array::from_fn(|i| {
-                        let Self::Mapped { vbit_offsets, .. } = ts[i] else { unreachable!() };
-                        let (bytes, rows, cols, out) =
-                            (ts[i].quant_bytes(), ts[i].rows(), ts[i].cols(), outs_addr[i]);
+                        let Self::Mapped { vbit_offsets, .. } = ts[i] else {
+                            unreachable!()
+                        };
+                        let (bytes, rows, cols, out) = (
+                            ts[i].quant_bytes(),
+                            ts[i].rows(),
+                            ts[i].cols(),
+                            outs_addr[i],
+                        );
                         move |s: usize, e: usize| {
                             vbit_range_a8w8(bytes, vbit_offsets, x, act, rows, cols, out, s, e)
                         }
@@ -1217,9 +1387,15 @@ impl QTensor {
                 pool.run_many(&parts);
             } else {
                 let closures: [_; N] = std::array::from_fn(|i| {
-                    let Self::Mapped { vbit_offsets, .. } = ts[i] else { unreachable!() };
-                    let (bytes, rows, cols, out) =
-                        (ts[i].quant_bytes(), ts[i].rows(), ts[i].cols(), outs_addr[i]);
+                    let Self::Mapped { vbit_offsets, .. } = ts[i] else {
+                        unreachable!()
+                    };
+                    let (bytes, rows, cols, out) = (
+                        ts[i].quant_bytes(),
+                        ts[i].rows(),
+                        ts[i].cols(),
+                        outs_addr[i],
+                    );
                     move |s: usize, e: usize| {
                         vbit_range_f32(bytes, vbit_offsets, x, rows, cols, out, s, e)
                     }
@@ -1234,7 +1410,9 @@ impl QTensor {
         if uniform_f32 {
             let outs_addr: [SendMut; N] = std::array::from_fn(|i| SendMut(outs[i].as_mut_ptr()));
             let closures: [_; N] = std::array::from_fn(|i| {
-                let Self::F32 { data, cols, .. } = ts[i] else { unreachable!() };
+                let Self::F32 { data, cols, .. } = ts[i] else {
+                    unreachable!()
+                };
                 let out = outs_addr[i];
                 move |start: usize, end: usize| {
                     for o in start..end {
@@ -1265,7 +1443,15 @@ impl QTensor {
             xs: std::borrow::Cow<'a, [f32]>,
         }
         let ctxs: [Ctx<'_>; N] = std::array::from_fn(|i| {
-            let Self::Mapped { dtype, cols, row_scale, col_field, repack, .. } = ts[i] else {
+            let Self::Mapped {
+                dtype,
+                cols,
+                row_scale,
+                col_field,
+                repack,
+                ..
+            } = ts[i]
+            else {
                 unreachable!()
             };
             Ctx {
@@ -1335,19 +1521,31 @@ impl QTensor {
         let uniform_q8 = ts.iter().all(|t| {
             matches!(
                 t,
-                Self::Mapped { dtype: TensorDtype::Q8Row | TensorDtype::Q8_2f, .. }
+                Self::Mapped {
+                    dtype: TensorDtype::Q8Row | TensorDtype::Q8_2f,
+                    ..
+                }
             )
         });
         let uniform_f32 = ts.iter().all(|t| matches!(t, Self::F32 { .. }));
-        let uniform_q4 = ts
-            .iter()
-            .all(|t| matches!(t, Self::Mapped { dtype: TensorDtype::Q4Block, .. }));
-        let uniform_vbit = ts
-            .iter()
-            .all(|t| matches!(
+        let uniform_q4 = ts.iter().all(|t| {
+            matches!(
                 t,
-                Self::Mapped { dtype: TensorDtype::Vbit | TensorDtype::VbitRo, .. }
-            ));
+                Self::Mapped {
+                    dtype: TensorDtype::Q4Block,
+                    ..
+                }
+            )
+        });
+        let uniform_vbit = ts.iter().all(|t| {
+            matches!(
+                t,
+                Self::Mapped {
+                    dtype: TensorDtype::Vbit | TensorDtype::VbitRo,
+                    ..
+                }
+            )
+        });
         let fusable = pool.is_some()
             && total_rows >= 256
             && (uniform_q8 || uniform_f32 || uniform_q4 || uniform_vbit);
@@ -1382,12 +1580,30 @@ impl QTensor {
                     pool.run_many(&parts);
                 } else {
                     let closures: [_; N] = std::array::from_fn(|i| {
-                        let Self::Mapped { vbit_offsets, .. } = ts[i] else { unreachable!() };
-                        let (bytes, rows, cols, o1, o2) =
-                            (ts[i].quant_bytes(), ts[i].rows(), ts[i].cols(), p1[i], p2[i]);
+                        let Self::Mapped { vbit_offsets, .. } = ts[i] else {
+                            unreachable!()
+                        };
+                        let (bytes, rows, cols, o1, o2) = (
+                            ts[i].quant_bytes(),
+                            ts[i].rows(),
+                            ts[i].cols(),
+                            p1[i],
+                            p2[i],
+                        );
                         move |s: usize, e: usize| {
                             vbit_range2_a8w8(
-                                bytes, vbit_offsets, x1, x2, a1, a2, rows, cols, o1, o2, s, e,
+                                bytes,
+                                vbit_offsets,
+                                x1,
+                                x2,
+                                a1,
+                                a2,
+                                rows,
+                                cols,
+                                o1,
+                                o2,
+                                s,
+                                e,
                             )
                         }
                     });
@@ -1411,9 +1627,16 @@ impl QTensor {
                 pool.run_many(&parts);
             } else {
                 let closures: [_; N] = std::array::from_fn(|i| {
-                    let Self::Mapped { vbit_offsets, .. } = ts[i] else { unreachable!() };
-                    let (bytes, rows, cols, o1, o2) =
-                        (ts[i].quant_bytes(), ts[i].rows(), ts[i].cols(), p1[i], p2[i]);
+                    let Self::Mapped { vbit_offsets, .. } = ts[i] else {
+                        unreachable!()
+                    };
+                    let (bytes, rows, cols, o1, o2) = (
+                        ts[i].quant_bytes(),
+                        ts[i].rows(),
+                        ts[i].cols(),
+                        p1[i],
+                        p2[i],
+                    );
                     move |s: usize, e: usize| {
                         vbit_range2_f32(bytes, vbit_offsets, x1, x2, rows, cols, o1, o2, s, e)
                     }
@@ -1429,7 +1652,9 @@ impl QTensor {
             let p1: [SendMut; N] = std::array::from_fn(|i| SendMut(o1s[i].as_mut_ptr()));
             let p2: [SendMut; N] = std::array::from_fn(|i| SendMut(o2s[i].as_mut_ptr()));
             let closures: [_; N] = std::array::from_fn(|i| {
-                let Self::F32 { data, cols, .. } = ts[i] else { unreachable!() };
+                let Self::F32 { data, cols, .. } = ts[i] else {
+                    unreachable!()
+                };
                 let (o1, o2) = (p1[i], p2[i]);
                 move |start: usize, end: usize| {
                     for o in start..end {
@@ -1461,7 +1686,14 @@ impl QTensor {
             xs2: std::borrow::Cow<'a, [f32]>,
         }
         let ctxs: [Ctx<'_>; N] = std::array::from_fn(|i| {
-            let Self::Mapped { dtype, cols, row_scale, col_field, .. } = ts[i] else {
+            let Self::Mapped {
+                dtype,
+                cols,
+                row_scale,
+                col_field,
+                ..
+            } = ts[i]
+            else {
                 unreachable!()
             };
             Ctx {
@@ -1507,7 +1739,17 @@ impl QTensor {
         let closures: [_; N] = std::array::from_fn(|i| {
             let (c, o1, o2) = (&ctxs[i], p1[i], p2[i]);
             move |start: usize, end: usize| {
-                q8_range2_f32(c.bytes, c.row_scale, &c.xs1, &c.xs2, c.cols, o1, o2, start, end)
+                q8_range2_f32(
+                    c.bytes,
+                    c.row_scale,
+                    &c.xs1,
+                    &c.xs2,
+                    c.cols,
+                    o1,
+                    o2,
+                    start,
+                    end,
+                )
             }
         });
         let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
@@ -1541,8 +1783,14 @@ impl QTensor {
         match (gate, up) {
             // Q4Block gate + Q4Block up (most common mobile q4 models)
             (
-                Self::Mapped { dtype: TensorDtype::Q4Block, .. },
-                Self::Mapped { dtype: TensorDtype::Q4Block, .. },
+                Self::Mapped {
+                    dtype: TensorDtype::Q4Block,
+                    ..
+                },
+                Self::Mapped {
+                    dtype: TensorDtype::Q4Block,
+                    ..
+                },
             ) => {
                 let (gp, gs) = q4_split(gate.quant_bytes(), gate.rows(), gate.cols());
                 let (up_p, up_s) = q4_split(up.quant_bytes(), up.rows(), up.cols());
@@ -1579,8 +1827,14 @@ impl QTensor {
             }
             // Q1T gate + Q1T up
             (
-                Self::Mapped { dtype: TensorDtype::Q1T, .. },
-                Self::Mapped { dtype: TensorDtype::Q1T, .. },
+                Self::Mapped {
+                    dtype: TensorDtype::Q1T,
+                    ..
+                },
+                Self::Mapped {
+                    dtype: TensorDtype::Q1T,
+                    ..
+                },
             ) => {
                 const TILE: usize = cortiq_core::quant::Q1T_TILE;
                 let g_bytes = gate.quant_bytes();
@@ -1694,10 +1948,7 @@ pub(crate) fn neon_gemm_rm(
                             // eight consecutive B rows — gathered.
                             let base = b_mat.as_ptr().add(j * ldb + p);
                             let g = |o: usize| *base.add(o * ldb);
-                            (
-                                [g(0), g(1), g(2), g(3)],
-                                [g(4), g(5), g(6), g(7)],
-                            )
+                            ([g(0), g(1), g(2), g(3)], [g(4), g(5), g(6), g(7)])
                         } else {
                             let base = b_mat.as_ptr().add(p * ldb + j);
                             (
@@ -1721,8 +1972,9 @@ pub(crate) fn neon_gemm_rm(
                         c3b = vfmaq_f32(c3b, a3, bv1);
                     }
                     let al = vdupq_n_f32(alpha);
-                    for (r, (ca, cb)) in
-                        [(c0a, c0b), (c1a, c1b), (c2a, c2b), (c3a, c3b)].iter().enumerate()
+                    for (r, (ca, cb)) in [(c0a, c0b), (c1a, c1b), (c2a, c2b), (c3a, c3b)]
+                        .iter()
+                        .enumerate()
                     {
                         let dst = c.as_mut_ptr().add((i + r) * ldc + j);
                         vst1q_f32(dst, vmulq_f32(*ca, al));
@@ -1794,7 +2046,10 @@ pub(crate) fn sgemm_rm(
     // measured without a phone in the loop. (Intel macOS has no NEON —
     // the hook is a no-op there, Accelerate continues below.)
     #[cfg(target_arch = "aarch64")]
-    if std::env::var("CMF_FORCE_NEON_GEMM").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("CMF_FORCE_NEON_GEMM")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         return neon_gemm_rm(m, n, k, alpha, a, lda, b_mat, ldb, b_rows_are_n, c, ldc);
     }
     unsafe {
@@ -1862,9 +2117,8 @@ fn qmatmat_accel(
                         let row = &q[(r0 + r) * cols..(r0 + r + 1) * cols];
                         let s = row_scale[r0 + r];
                         // SAFETY: workers cover disjoint r ranges.
-                        let dst = unsafe {
-                            std::slice::from_raw_parts_mut(wt_addr.at(r * cols), cols)
-                        };
+                        let dst =
+                            unsafe { std::slice::from_raw_parts_mut(wt_addr.at(r * cols), cols) };
                         for (d, &v) in dst.iter_mut().zip(row) {
                             *d = (v as i8) as f32 * s;
                         }
@@ -1922,8 +2176,9 @@ fn qmatmat(
         let out_addr = SendMut(out.as_mut_ptr());
         // Blocked 2×4 (mobile prefill: no AMX to fall back on — this
         // path IS the ARM prefill GEMM off Apple silicon).
-        let blocked_ok =
-            std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true);
+        let blocked_ok = std::env::var("CMF_X86_BLOCKED")
+            .map(|v| v != "0")
+            .unwrap_or(true);
         let use_i8mm = i8mm_enabled();
         if blocked_ok {
             let run = |start: usize, end: usize| {
@@ -1953,8 +2208,7 @@ fn qmatmat(
                                         v += (row[j] as i8) as f32 * xv;
                                     }
                                     unsafe {
-                                        *out_addr.at((bi + k) * rows + o + r) =
-                                            v * row_scale[o + r]
+                                        *out_addr.at((bi + k) * rows + o + r) = v * row_scale[o + r]
                                     };
                                 }
                             }
@@ -2003,7 +2257,9 @@ fn qmatmat(
         let out_addr = SendMut(out.as_mut_ptr());
         // CMF_X86_BLOCKED=0 forces the per-row path (paired in-process
         // A/B on noisy shared-vCPU hosts).
-        let blocked_ok = std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true);
+        let blocked_ok = std::env::var("CMF_X86_BLOCKED")
+            .map(|v| v != "0")
+            .unwrap_or(true);
         if !avx512vnni_enabled() && blocked_ok {
             let run = |start: usize, end: usize| {
                 let mut o = start;
@@ -2028,8 +2284,7 @@ fn qmatmat(
                                         v += (row[j] as i8) as f32 * xv;
                                     }
                                     unsafe {
-                                        *out_addr.at((bi + k) * rows + o + r) =
-                                            v * row_scale[o + r]
+                                        *out_addr.at((bi + k) * rows + o + r) = v * row_scale[o + r]
                                     };
                                 }
                             }
@@ -2245,88 +2500,88 @@ fn vbit_range_a8w8(
     let bits = &bytes[..rows];
     let sc_off = rows;
     let row_dot = |r: usize| -> f32 {
-            let b = bits[r] as usize;
-            let l = (1i32 << (b - 1)) - 1;
-            let mask = (1u64 << b) - 1;
-            let data = &bytes[offsets[r]..offsets[r + 1]];
-            if b == 8 {
-                // u−L reaches 128 → does not fit i8; exact f32 path.
-                let (mut acc, mut nbits, mut idx) = (0u64, 0usize, 0usize);
-                let mut dot = 0f32;
-                for g in 0..ng {
-                    let so = (r * ng + g) * 2;
-                    let sgf = f16_to_f32(u16::from_le_bytes([
-                        bytes[sc_off + so],
-                        bytes[sc_off + so + 1],
-                    ]));
-                    let xg = &x[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
-                    let mut gd = 0f32;
-                    for &xv in xg.iter() {
-                        if nbits < 8 {
-                            acc = (acc << 8) | data[idx] as u64;
-                            idx += 1;
-                            nbits += 8;
-                        }
-                        let u = ((acc >> (nbits - 8)) & 0xFF) as i32;
-                        nbits -= 8;
-                        gd += (u - l) as f32 * xv;
+        let b = bits[r] as usize;
+        let l = (1i32 << (b - 1)) - 1;
+        let mask = (1u64 << b) - 1;
+        let data = &bytes[offsets[r]..offsets[r + 1]];
+        if b == 8 {
+            // u−L reaches 128 → does not fit i8; exact f32 path.
+            let (mut acc, mut nbits, mut idx) = (0u64, 0usize, 0usize);
+            let mut dot = 0f32;
+            for g in 0..ng {
+                let so = (r * ng + g) * 2;
+                let sgf = f16_to_f32(u16::from_le_bytes([
+                    bytes[sc_off + so],
+                    bytes[sc_off + so + 1],
+                ]));
+                let xg = &x[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+                let mut gd = 0f32;
+                for &xv in xg.iter() {
+                    if nbits < 8 {
+                        acc = (acc << 8) | data[idx] as u64;
+                        idx += 1;
+                        nbits += 8;
                     }
-                    dot += gd * sgf;
+                    let u = ((acc >> (nbits - 8)) & 0xFF) as i32;
+                    nbits -= 8;
+                    gd += (u - l) as f32 * xv;
                 }
-                return dot;
+                dot += gd * sgf;
             }
-            // Per-worker scratch: this closure runs for every row of the
-            // tensor (lm_head ≈ 150k rows/token) — a heap allocation per
-            // row was measurable pure overhead.
-            thread_local! {
-                static VBIT_SCRATCH: std::cell::RefCell<Vec<u8>> =
-                    const { std::cell::RefCell::new(Vec::new()) };
-            }
-            #[inline(always)]
-            fn fill<const B: usize>(data: &[u8], l: i32, buf: &mut [u8]) {
-                for (blk, chunk) in buf.chunks_exact_mut(8).enumerate() {
-                    let u = unpack8::<B>(&data[blk * B..]);
-                    for k in 0..8 {
-                        chunk[k] = (u[k] - l) as i8 as u8;
-                    }
+            return dot;
+        }
+        // Per-worker scratch: this closure runs for every row of the
+        // tensor (lm_head ≈ 150k rows/token) — a heap allocation per
+        // row was measurable pure overhead.
+        thread_local! {
+            static VBIT_SCRATCH: std::cell::RefCell<Vec<u8>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        #[inline(always)]
+        fn fill<const B: usize>(data: &[u8], l: i32, buf: &mut [u8]) {
+            for (blk, chunk) in buf.chunks_exact_mut(8).enumerate() {
+                let u = unpack8::<B>(&data[blk * B..]);
+                for k in 0..8 {
+                    chunk[k] = (u[k] - l) as i8 as u8;
                 }
             }
-            let _ = mask;
-            VBIT_SCRATCH.with(|scratch| {
-                let mut buf = scratch.borrow_mut();
-                buf.resize(cols, 0);
-                match b {
-                    3 => fill::<3>(data, l, &mut buf),
-                    4 => vbit_fill4(data, &mut buf),
-                    5 => fill::<5>(data, l, &mut buf),
-                    6 => fill::<6>(data, l, &mut buf),
-                    _ => unreachable!(),
-                }
-                let mut dot = 0f32;
-                for g in 0..ng {
-                    let so = (r * ng + g) * 2;
-                    let s = f16_to_f32(u16::from_le_bytes([
-                        bytes[sc_off + so],
-                        bytes[sc_off + so + 1],
-                    ]));
-                    let d = dot_i8_i8(
-                        &buf[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
-                        &act.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
-                    ) as f32
-                        * act.sx;
-                    dot += d * s;
-                }
-                for &(j, xv) in &act.outliers {
-                    let so = (r * ng + j / GROUP_SIZE) * 2;
-                    let s = f16_to_f32(u16::from_le_bytes([
-                        bytes[sc_off + so],
-                        bytes[sc_off + so + 1],
-                    ]));
-                    // xq is zeroed at outlier slots — add the exact term.
-                    dot += (buf[j] as i8) as f32 * s * xv;
-                }
-                dot
-            })
+        }
+        let _ = mask;
+        VBIT_SCRATCH.with(|scratch| {
+            let mut buf = scratch.borrow_mut();
+            buf.resize(cols, 0);
+            match b {
+                3 => fill::<3>(data, l, &mut buf),
+                4 => vbit_fill4(data, &mut buf),
+                5 => fill::<5>(data, l, &mut buf),
+                6 => fill::<6>(data, l, &mut buf),
+                _ => unreachable!(),
+            }
+            let mut dot = 0f32;
+            for g in 0..ng {
+                let so = (r * ng + g) * 2;
+                let s = f16_to_f32(u16::from_le_bytes([
+                    bytes[sc_off + so],
+                    bytes[sc_off + so + 1],
+                ]));
+                let d = dot_i8_i8(
+                    &buf[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
+                    &act.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE],
+                ) as f32
+                    * act.sx;
+                dot += d * s;
+            }
+            for &(j, xv) in &act.outliers {
+                let so = (r * ng + j / GROUP_SIZE) * 2;
+                let s = f16_to_f32(u16::from_le_bytes([
+                    bytes[sc_off + so],
+                    bytes[sc_off + so + 1],
+                ]));
+                // xq is zeroed at outlier slots — add the exact term.
+                dot += (buf[j] as i8) as f32 * s * xv;
+            }
+            dot
+        })
     };
     for r in start..end {
         // SAFETY: disjoint row ranges per worker.
@@ -2366,7 +2621,10 @@ fn vbit_range_f32(
         let mut dot = 0f32;
         for g in 0..ng {
             let so = (r * ng + g) * 2;
-            let s = f16_to_f32(u16::from_le_bytes([bytes[sc_off + so], bytes[sc_off + so + 1]]));
+            let s = f16_to_f32(u16::from_le_bytes([
+                bytes[sc_off + so],
+                bytes[sc_off + so + 1],
+            ]));
             let xg = &x[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
             let gd0 = &data[g * gbytes..(g + 1) * gbytes];
             let mut gd = 0f32;
@@ -2421,7 +2679,9 @@ fn vbitmatvec2(
         let p1 = SendMut(o1.as_mut_ptr());
         let p2 = SendMut(o2.as_mut_ptr());
         let run = move |start: usize, end: usize| {
-            vbit_range2_a8w8(bytes, offsets, x1, x2, &a1, &a2, rows, cols, p1, p2, start, end)
+            vbit_range2_a8w8(
+                bytes, offsets, x1, x2, &a1, &a2, rows, cols, p1, p2, start, end,
+            )
         };
         dispatch_rows(pool, rows, &run);
         return;
@@ -2457,94 +2717,92 @@ fn vbit_range2_a8w8(
     let bits = &bytes[..rows];
     let sc_off = rows;
     let row_dots = |r: usize| -> (f32, f32) {
-            let b = bits[r] as usize;
-            let l = (1i32 << (b - 1)) - 1;
-            let data = &bytes[offsets[r]..offsets[r + 1]];
-            if b == 8 {
-                // u−L reaches 128 → does not fit i8; exact f32 path,
-                // bits still streamed once for both lanes.
-                let (mut acc, mut nbits, mut idx) = (0u64, 0usize, 0usize);
-                let (mut d1, mut d2) = (0f32, 0f32);
-                for g in 0..ng {
-                    let so = (r * ng + g) * 2;
-                    let sgf = f16_to_f32(u16::from_le_bytes([
-                        bytes[sc_off + so],
-                        bytes[sc_off + so + 1],
-                    ]));
-                    let (mut g1, mut g2) = (0f32, 0f32);
-                    for k in 0..GROUP_SIZE {
-                        if nbits < 8 {
-                            acc = (acc << 8) | data[idx] as u64;
-                            idx += 1;
-                            nbits += 8;
-                        }
-                        let u = ((acc >> (nbits - 8)) & 0xFF) as i32;
-                        nbits -= 8;
-                        let w = (u - l) as f32;
-                        g1 += w * x1[g * GROUP_SIZE + k];
-                        g2 += w * x2[g * GROUP_SIZE + k];
+        let b = bits[r] as usize;
+        let l = (1i32 << (b - 1)) - 1;
+        let data = &bytes[offsets[r]..offsets[r + 1]];
+        if b == 8 {
+            // u−L reaches 128 → does not fit i8; exact f32 path,
+            // bits still streamed once for both lanes.
+            let (mut acc, mut nbits, mut idx) = (0u64, 0usize, 0usize);
+            let (mut d1, mut d2) = (0f32, 0f32);
+            for g in 0..ng {
+                let so = (r * ng + g) * 2;
+                let sgf = f16_to_f32(u16::from_le_bytes([
+                    bytes[sc_off + so],
+                    bytes[sc_off + so + 1],
+                ]));
+                let (mut g1, mut g2) = (0f32, 0f32);
+                for k in 0..GROUP_SIZE {
+                    if nbits < 8 {
+                        acc = (acc << 8) | data[idx] as u64;
+                        idx += 1;
+                        nbits += 8;
                     }
-                    d1 += g1 * sgf;
-                    d2 += g2 * sgf;
+                    let u = ((acc >> (nbits - 8)) & 0xFF) as i32;
+                    nbits -= 8;
+                    let w = (u - l) as f32;
+                    g1 += w * x1[g * GROUP_SIZE + k];
+                    g2 += w * x2[g * GROUP_SIZE + k];
                 }
-                return (d1, d2);
+                d1 += g1 * sgf;
+                d2 += g2 * sgf;
             }
-            thread_local! {
-                static VBIT_SCRATCH2: std::cell::RefCell<Vec<u8>> =
-                    const { std::cell::RefCell::new(Vec::new()) };
-            }
-            #[inline(always)]
-            fn fill<const B: usize>(data: &[u8], l: i32, buf: &mut [u8]) {
-                for (blk, chunk) in buf.chunks_exact_mut(8).enumerate() {
-                    let u = unpack8::<B>(&data[blk * B..]);
-                    for k in 0..8 {
-                        chunk[k] = (u[k] - l) as i8 as u8;
-                    }
+            return (d1, d2);
+        }
+        thread_local! {
+            static VBIT_SCRATCH2: std::cell::RefCell<Vec<u8>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        #[inline(always)]
+        fn fill<const B: usize>(data: &[u8], l: i32, buf: &mut [u8]) {
+            for (blk, chunk) in buf.chunks_exact_mut(8).enumerate() {
+                let u = unpack8::<B>(&data[blk * B..]);
+                for k in 0..8 {
+                    chunk[k] = (u[k] - l) as i8 as u8;
                 }
             }
-            VBIT_SCRATCH2.with(|scratch| {
-                let mut buf = scratch.borrow_mut();
-                buf.resize(cols, 0);
-                match b {
-                    3 => fill::<3>(data, l, &mut buf),
-                    4 => vbit_fill4(data, &mut buf),
-                    5 => fill::<5>(data, l, &mut buf),
-                    6 => fill::<6>(data, l, &mut buf),
-                    _ => unreachable!(),
-                }
-                let (mut d1, mut d2) = (0f32, 0f32);
-                for g in 0..ng {
-                    let so = (r * ng + g) * 2;
-                    let s = f16_to_f32(u16::from_le_bytes([
-                        bytes[sc_off + so],
-                        bytes[sc_off + so + 1],
-                    ]));
-                    let wg = &buf[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
-                    let v1 =
-                        dot_i8_i8(wg, &a1.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE]) as f32 * a1.sx;
-                    let v2 =
-                        dot_i8_i8(wg, &a2.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE]) as f32 * a2.sx;
-                    d1 += v1 * s;
-                    d2 += v2 * s;
-                }
-                for &(j, xv) in &a1.outliers {
-                    let so = (r * ng + j / GROUP_SIZE) * 2;
-                    let s = f16_to_f32(u16::from_le_bytes([
-                        bytes[sc_off + so],
-                        bytes[sc_off + so + 1],
-                    ]));
-                    d1 += (buf[j] as i8) as f32 * s * xv;
-                }
-                for &(j, xv) in &a2.outliers {
-                    let so = (r * ng + j / GROUP_SIZE) * 2;
-                    let s = f16_to_f32(u16::from_le_bytes([
-                        bytes[sc_off + so],
-                        bytes[sc_off + so + 1],
-                    ]));
-                    d2 += (buf[j] as i8) as f32 * s * xv;
-                }
-                (d1, d2)
-            })
+        }
+        VBIT_SCRATCH2.with(|scratch| {
+            let mut buf = scratch.borrow_mut();
+            buf.resize(cols, 0);
+            match b {
+                3 => fill::<3>(data, l, &mut buf),
+                4 => vbit_fill4(data, &mut buf),
+                5 => fill::<5>(data, l, &mut buf),
+                6 => fill::<6>(data, l, &mut buf),
+                _ => unreachable!(),
+            }
+            let (mut d1, mut d2) = (0f32, 0f32);
+            for g in 0..ng {
+                let so = (r * ng + g) * 2;
+                let s = f16_to_f32(u16::from_le_bytes([
+                    bytes[sc_off + so],
+                    bytes[sc_off + so + 1],
+                ]));
+                let wg = &buf[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+                let v1 = dot_i8_i8(wg, &a1.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE]) as f32 * a1.sx;
+                let v2 = dot_i8_i8(wg, &a2.xq[g * GROUP_SIZE..(g + 1) * GROUP_SIZE]) as f32 * a2.sx;
+                d1 += v1 * s;
+                d2 += v2 * s;
+            }
+            for &(j, xv) in &a1.outliers {
+                let so = (r * ng + j / GROUP_SIZE) * 2;
+                let s = f16_to_f32(u16::from_le_bytes([
+                    bytes[sc_off + so],
+                    bytes[sc_off + so + 1],
+                ]));
+                d1 += (buf[j] as i8) as f32 * s * xv;
+            }
+            for &(j, xv) in &a2.outliers {
+                let so = (r * ng + j / GROUP_SIZE) * 2;
+                let s = f16_to_f32(u16::from_le_bytes([
+                    bytes[sc_off + so],
+                    bytes[sc_off + so + 1],
+                ]));
+                d2 += (buf[j] as i8) as f32 * s * xv;
+            }
+            (d1, d2)
+        })
     };
     for r in start..end {
         let (v1, v2) = row_dots(r);
@@ -2591,7 +2849,10 @@ fn vbit_range2_f32(
         let (mut d1, mut d2) = (0f32, 0f32);
         for g in 0..ng {
             let so = (r * ng + g) * 2;
-            let s = f16_to_f32(u16::from_le_bytes([bytes[sc_off + so], bytes[sc_off + so + 1]]));
+            let s = f16_to_f32(u16::from_le_bytes([
+                bytes[sc_off + so],
+                bytes[sc_off + so + 1],
+            ]));
             let x1g = &x1[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
             let x2g = &x2[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
             let gd0 = &data[g * gbytes..(g + 1) * gbytes];
@@ -2732,12 +2993,7 @@ unsafe fn dot_q4t_row_avx2(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32
 /// tiled format (roadmap P0 portable blocking, q4t leg).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn dot_q4t_row_1x4_avx2(
-    bytes: &[u8],
-    r: usize,
-    gpr: usize,
-    xs: [&[i8]; 4],
-) -> [f32; 4] {
+unsafe fn dot_q4t_row_1x4_avx2(bytes: &[u8], r: usize, gpr: usize, xs: [&[i8]; 4]) -> [f32; 4] {
     // SAFETY: callers uphold the 18B-tile and xq-length contracts.
     unsafe {
         use core::arch::x86_64::*;
@@ -2757,8 +3013,7 @@ unsafe fn dot_q4t_row_1x4_avx2(
             );
             let aw = _mm256_abs_epi8(w);
             for (k, xq) in xs.iter().enumerate() {
-                let x =
-                    _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+                let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
                 let p16 = _mm256_maddubs_epi16(aw, _mm256_sign_epi8(x, w));
                 let d = _mm256_madd_epi16(p16, ones);
                 let hi128 = _mm256_extracti128_si256::<1>(d);
@@ -2804,7 +3059,14 @@ fn q4t_row_exact(bytes: &[u8], r: usize, gpr: usize, x: &[f32]) -> f32 {
 }
 
 /// Fused q4_tiled matvec (dispatch mirrors `q4matvec`).
-fn q4t_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
+fn q4t_matvec(
+    bytes: &[u8],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
     debug_assert_eq!(out.len(), rows);
     let gpr = cols / GROUP_SIZE;
     let out_addr = SendMut(out.as_mut_ptr());
@@ -2900,12 +3162,15 @@ fn q4t_matmat(
     let gpr = cols / GROUP_SIZE;
     let out_addr = SendMut(out.as_mut_ptr());
     if a8w8_enabled() {
-        let acts: Vec<SplitAct> =
-            (0..b).map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols])).collect();
+        let acts: Vec<SplitAct> = (0..b)
+            .map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols]))
+            .collect();
         let acts = &acts;
         #[cfg(target_arch = "x86_64")]
         let blocked_ok = avx2_enabled()
-            && std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true);
+            && std::env::var("CMF_X86_BLOCKED")
+                .map(|v| v != "0")
+                .unwrap_or(true);
         #[cfg(not(target_arch = "x86_64"))]
         let blocked_ok = false;
         let run = move |start: usize, end: usize| {
@@ -2993,24 +3258,18 @@ fn q1_group_sums(xq: &[i8], gpr: usize) -> Vec<i32> {
 /// `dot = −(2·masked_sum + Σx_group)` — bit-identical integer math.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn dot_q1_row_avx2(
-    bytes: &[u8],
-    r: usize,
-    gpr: usize,
-    xq: &[i8],
-    gsum: &[i32],
-) -> f32 {
+unsafe fn dot_q1_row_avx2(bytes: &[u8], r: usize, gpr: usize, xq: &[i8], gsum: &[i32]) -> f32 {
     // SAFETY: callers uphold the 6B-tile and xq/gsum length contracts.
     unsafe {
         use core::arch::x86_64::*;
         // Byte j of the mask must replicate bits-byte j/8.
         let expand = _mm256_setr_epi8(
-            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
-            2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
         );
         let bitsel = _mm256_setr_epi8(
-            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
-            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
+            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64,
+            -128, 1, 2, 4, 8, 16, 32, 64, -128,
         );
         let ones8 = _mm256_set1_epi8(1);
         let ones16 = _mm256_set1_epi16(1);
@@ -3055,12 +3314,12 @@ unsafe fn dot_q1_row_1x4_avx2(
     unsafe {
         use core::arch::x86_64::*;
         let expand = _mm256_setr_epi8(
-            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
-            2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
         );
         let bitsel = _mm256_setr_epi8(
-            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
-            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
+            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64,
+            -128, 1, 2, 4, 8, 16, 32, 64, -128,
         );
         let ones8 = _mm256_set1_epi8(1);
         let ones16 = _mm256_set1_epi16(1);
@@ -3072,8 +3331,7 @@ unsafe fn dot_q1_row_1x4_avx2(
             let bc = _mm256_shuffle_epi8(_mm256_set1_epi32(bits as i32), expand);
             let mask = _mm256_cmpeq_epi8(_mm256_and_si256(bc, bitsel), bitsel);
             for (k, xq) in xs.iter().enumerate() {
-                let x =
-                    _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+                let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
                 let sel = _mm256_and_si256(x, mask);
                 let p16 = _mm256_maddubs_epi16(ones8, sel);
                 let d32 = _mm256_madd_epi16(p16, ones16);
@@ -3168,7 +3426,9 @@ unsafe fn dot_q1_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8], gsum: &
         const IW00: [u8; 16] = [2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3];
         const IW01: [u8; 16] = [4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5];
         const IW10: [u8; 16] = [8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9];
-        const IW11: [u8; 16] = [10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11];
+        const IW11: [u8; 16] = [
+            10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+        ];
         const ISC: [u8; 8] = [0, 1, 6, 7, 16, 17, 22, 23];
         let (iw00, iw01) = (vld1q_u8(IW00.as_ptr()), vld1q_u8(IW01.as_ptr()));
         let (iw10, iw11) = (vld1q_u8(IW10.as_ptr()), vld1q_u8(IW11.as_ptr()));
@@ -3255,7 +3515,9 @@ unsafe fn dot_q1_row_1x4_sdot(
         const IW00: [u8; 16] = [2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3];
         const IW01: [u8; 16] = [4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5];
         const IW10: [u8; 16] = [8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9];
-        const IW11: [u8; 16] = [10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11];
+        const IW11: [u8; 16] = [
+            10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+        ];
         const ISC: [u8; 8] = [0, 1, 6, 7, 16, 17, 22, 23];
         let m = vld1q_u8(MASKS.as_ptr());
         let (iw00, iw01) = (vld1q_u8(IW00.as_ptr()), vld1q_u8(IW01.as_ptr()));
@@ -3638,8 +3900,14 @@ unsafe fn q1t_dot_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32
         while gi < gpr2 {
             let off0 = row_off + gi * TILE;
             let off1 = off0 + TILE;
-            let s0 = f16_to_f32(u16::from_le_bytes([*bytes_ptr.add(off0), *bytes_ptr.add(off0 + 1)]));
-            let s1 = f16_to_f32(u16::from_le_bytes([*bytes_ptr.add(off1), *bytes_ptr.add(off1 + 1)]));
+            let s0 = f16_to_f32(u16::from_le_bytes([
+                *bytes_ptr.add(off0),
+                *bytes_ptr.add(off0 + 1),
+            ]));
+            let s1 = f16_to_f32(u16::from_le_bytes([
+                *bytes_ptr.add(off1),
+                *bytes_ptr.add(off1 + 1),
+            ]));
 
             let (u0_0, u1_0, u2_0, u3_0) = q1t_unpack_reg_u64s(bytes_ptr.add(off0 + 2));
             let (u0_1, u1_1, u2_1, u3_1) = q1t_unpack_reg_u64s(bytes_ptr.add(off1 + 2));
@@ -3675,7 +3943,10 @@ unsafe fn q1t_dot_row_sdot(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32
 
         if gi < gpr {
             let off = row_off + gi * TILE;
-            let s = f16_to_f32(u16::from_le_bytes([*bytes_ptr.add(off), *bytes_ptr.add(off + 1)]));
+            let s = f16_to_f32(u16::from_le_bytes([
+                *bytes_ptr.add(off),
+                *bytes_ptr.add(off + 1),
+            ]));
             let (u0, u1, u2, u3) = q1t_unpack_reg_u64s(bytes_ptr.add(off + 2));
             let w0 = vreinterpretq_s8_u64(vcombine_u64(vcreate_u64(u0), vcreate_u64(u1)));
             let w1 = vreinterpretq_s8_u64(vcombine_u64(vcreate_u64(u2), vcreate_u64(u3)));
@@ -3711,13 +3982,19 @@ unsafe fn q1t_dot_row_avx2(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32
         let ones = _mm256_set1_epi16(1);
         for gi in 0..gpr {
             let off = row_off + gi * TILE;
-            let s = f16_to_f32(u16::from_le_bytes([*bytes_ptr.add(off), *bytes_ptr.add(off + 1)]));
+            let s = f16_to_f32(u16::from_le_bytes([
+                *bytes_ptr.add(off),
+                *bytes_ptr.add(off + 1),
+            ]));
             let (u0, u1, u2, u3) = q1t_unpack_reg_u64s(bytes_ptr.add(off + 2));
             let wv = _mm256_set_epi64x(u3 as i64, u2 as i64, u1 as i64, u0 as i64);
             let xv = _mm256_loadu_si256(xq_ptr.add(gi * GROUP_SIZE) as *const __m256i);
             let p16 = _mm256_maddubs_epi16(_mm256_abs_epi8(wv), _mm256_sign_epi8(xv, wv));
             let d256 = _mm256_madd_epi16(p16, ones);
-            let d128 = _mm_add_epi32(_mm256_castsi256_si128(d256), _mm256_extracti128_si256(d256, 1));
+            let d128 = _mm_add_epi32(
+                _mm256_castsi256_si128(d256),
+                _mm256_extracti128_si256(d256, 1),
+            );
             let d64 = _mm_add_epi32(d128, _mm_shuffle_epi32(d128, 0xee));
             let d32 = _mm_cvtsi128_si32(_mm_add_epi32(d64, _mm_shuffle_epi32(d64, 0x55)));
             acc += d32 as f32 * s;
@@ -3775,7 +4052,10 @@ fn q1t_row_outlier_correction(
     if !has_ov {
         return 0.0;
     }
-    let (c0, c1) = (q1t_rowptr(bytes, rp_off, r), q1t_rowptr(bytes, rp_off, r + 1));
+    let (c0, c1) = (
+        q1t_rowptr(bytes, rp_off, r),
+        q1t_rowptr(bytes, rp_off, r + 1),
+    );
     let mut corr = 0f32;
     for p in c0..c1 {
         let e = entries_off + p * 4;
@@ -3819,7 +4099,10 @@ fn q1t_dequant_row(
     if !has_ov {
         return;
     }
-    let (c0, c1) = (q1t_rowptr(bytes, rp_off, r), q1t_rowptr(bytes, rp_off, r + 1));
+    let (c0, c1) = (
+        q1t_rowptr(bytes, rp_off, r),
+        q1t_rowptr(bytes, rp_off, r + 1),
+    );
     for p in c0..c1 {
         let e = entries_off + p * 4;
         let col = u16::from_le_bytes([bytes[e], bytes[e + 1]]) as usize;
@@ -3830,7 +4113,14 @@ fn q1t_dequant_row(
 /// Add the sparse outlier overlay onto a base dot already in `out` (the GPU
 /// computes the ternary base; the overlay stays on the CPU — its entries are
 /// few and its per-row gather doesn't vectorize on the GPU). Row-parallel.
-fn q1t_add_overlay(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
+fn q1t_add_overlay(
+    bytes: &[u8],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
     const TILE: usize = cortiq_core::quant::Q1T_TILE;
     let gpr = cols / GROUP_SIZE;
     let (rp_off, ent_off, has_ov) = q1t_overlay(bytes, rows * gpr * TILE, rows);
@@ -3918,7 +4208,14 @@ fn q1t_range_f32_batch(
 /// Ternary (q1t) matvec — decode+dot straight from mmap, one group at a time:
 /// no per-ROW buffer, no division (the sign LUT), and a tiny per-group sign
 /// buffer so the 32-wide dot vectorizes. This is the decode hot path.
-fn q1t_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
+fn q1t_matvec(
+    bytes: &[u8],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
     debug_assert_eq!(out.len(), rows);
     const TILE: usize = cortiq_core::quant::Q1T_TILE;
     let gpr = cols / GROUP_SIZE;
@@ -4007,7 +4304,10 @@ fn q1t_matmat(
                 for g in 0..gpr {
                     let off = (r * gpr + g) * TILE;
                     sc[g] = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
-                    q1t_unpack_group_i8(bytes.as_ptr().wrapping_add(off + 2), &mut sg[g * GROUP_SIZE..]);
+                    q1t_unpack_group_i8(
+                        bytes.as_ptr().wrapping_add(off + 2),
+                        &mut sg[g * GROUP_SIZE..],
+                    );
                 }
                 for bi in 0..b {
                     let act = &acts[bi];
@@ -4029,8 +4329,10 @@ fn q1t_matmat(
                 // from mmap a single time (was b× — the re-read dominated prefill)
                 // and fan it out over the batch via the cached inputs.
                 if has_ov {
-                    let (c0, c1) =
-                        (q1t_rowptr(bytes, rp_off, r), q1t_rowptr(bytes, rp_off, r + 1));
+                    let (c0, c1) = (
+                        q1t_rowptr(bytes, rp_off, r),
+                        q1t_rowptr(bytes, rp_off, r + 1),
+                    );
                     for p in c0..c1 {
                         let e = ent_off + p * 4;
                         let col = u16::from_le_bytes([bytes[e], bytes[e + 1]]) as usize;
@@ -4065,7 +4367,14 @@ fn q1t_matmat(
     dispatch_rows(pool, rows, &run);
 }
 
-fn q1_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
+fn q1_matvec(
+    bytes: &[u8],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
     debug_assert_eq!(out.len(), rows);
     let gpr = cols / GROUP_SIZE;
     let out_addr = SendMut(out.as_mut_ptr());
@@ -4073,8 +4382,9 @@ fn q1_matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32],
         let act = split_act(x);
         let gsum = q1_group_sums(&act.xq, gpr);
         let (act, gsum) = (&act, &gsum);
-        let run =
-            move |start: usize, end: usize| q1_range_a8w8(bytes, gpr, act, gsum, out_addr, start, end);
+        let run = move |start: usize, end: usize| {
+            q1_range_a8w8(bytes, gpr, act, gsum, out_addr, start, end)
+        };
         dispatch_rows(pool, rows, &run);
         return;
     }
@@ -4162,10 +4472,14 @@ fn q1_matmat(
         let acts = &acts;
         #[cfg(target_arch = "x86_64")]
         let blocked_ok = avx2_enabled()
-            && std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true);
+            && std::env::var("CMF_X86_BLOCKED")
+                .map(|v| v != "0")
+                .unwrap_or(true);
         #[cfg(target_arch = "aarch64")]
         let blocked_ok = sdot_enabled()
-            && std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true);
+            && std::env::var("CMF_X86_BLOCKED")
+                .map(|v| v != "0")
+                .unwrap_or(true);
         let run = move |start: usize, end: usize| {
             for r in start..end {
                 let mut bi = 0usize;
@@ -4262,7 +4576,14 @@ fn q1_matmat(
 /// +23% on q4 decode): nibbles → centered i8, int8×int8 `sdot` per
 /// 32-group, exact outlier correction — the same A8W8 contract as q8.
 /// `CMF_SDOT=0` keeps the exact scalar path.
-fn q4matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
+fn q4matvec(
+    bytes: &[u8],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
     debug_assert_eq!(out.len(), rows);
     let (packed, scales) = q4_split(bytes, rows, cols);
     let gpr = cols / GROUP_SIZE;
@@ -4277,9 +4598,8 @@ fn q4matvec(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32], 
         return;
     }
 
-    let run = move |start: usize, end: usize| {
-        q4_range_f32(packed, scales, gpr, x, out_addr, start, end)
-    };
+    let run =
+        move |start: usize, end: usize| q4_range_f32(packed, scales, gpr, x, out_addr, start, end);
     dispatch_rows(pool, rows, &run);
 }
 
@@ -4313,8 +4633,7 @@ unsafe fn dot_q4b_row_1x4_avx2(
             let w = _mm256_loadu_si256(buf.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
             let aw = _mm256_abs_epi8(w);
             for (k, xq) in xs.iter().enumerate() {
-                let x =
-                    _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+                let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
                 let p16 = _mm256_maddubs_epi16(aw, _mm256_sign_epi8(x, w));
                 let d = _mm256_madd_epi16(p16, ones);
                 let hi128 = _mm256_extracti128_si256::<1>(d);
@@ -4356,8 +4675,7 @@ unsafe fn dot_q4b_row_1x4_sx_avx2(
             let w = _mm256_loadu_si256(buf.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
             let aw = _mm256_abs_epi8(w);
             for (k, xq) in xs.iter().enumerate() {
-                let x =
-                    _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+                let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
                 let p16 = _mm256_maddubs_epi16(aw, _mm256_sign_epi8(x, w));
                 let d = _mm256_madd_epi16(p16, ones);
                 let hi128 = _mm256_extracti128_si256::<1>(d);
@@ -4439,7 +4757,11 @@ fn q4_range_a8w8(
         for &(j, xv) in &act.outliers {
             let flat = r * cols + j;
             let byte = packed[flat / 2];
-            let nib = if flat & 1 == 0 { byte & 0x0F } else { byte >> 4 };
+            let nib = if flat & 1 == 0 {
+                byte & 0x0F
+            } else {
+                byte >> 4
+            };
             let s = f16_to_f32(u16::from_le_bytes([
                 scales[(flat / GROUP_SIZE) * 2],
                 scales[(flat / GROUP_SIZE) * 2 + 1],
@@ -4475,7 +4797,11 @@ fn q4_range2_a8w8(
             for &(j, xv) in outliers {
                 let flat = r * cols + j;
                 let byte = packed[flat / 2];
-                let nib = if flat & 1 == 0 { byte & 0x0F } else { byte >> 4 };
+                let nib = if flat & 1 == 0 {
+                    byte & 0x0F
+                } else {
+                    byte >> 4
+                };
                 let s = f16_to_f32(u16::from_le_bytes([
                     scales[(flat / GROUP_SIZE) * 2],
                     scales[(flat / GROUP_SIZE) * 2 + 1],
@@ -4629,8 +4955,9 @@ fn q4matmat(
     let gscale = |g: usize| f16_to_f32(u16::from_le_bytes([scales[g * 2], scales[g * 2 + 1]]));
 
     if a8w8_enabled() {
-        let acts: Vec<SplitAct> =
-            (0..b).map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols])).collect();
+        let acts: Vec<SplitAct> = (0..b)
+            .map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols]))
+            .collect();
         let acts = &acts;
         let out_addr = SendMut(out.as_mut_ptr());
         let run = move |start: usize, end: usize| {
@@ -4652,7 +4979,9 @@ fn q4matmat(
                     let mut bi = 0usize;
                     #[cfg(target_arch = "x86_64")]
                     if avx2_enabled()
-                        && std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true)
+                        && std::env::var("CMF_X86_BLOCKED")
+                            .map(|v| v != "0")
+                            .unwrap_or(true)
                     {
                         while bi + 4 <= acts.len() {
                             let xs = [
@@ -4661,9 +4990,7 @@ fn q4matmat(
                                 acts[bi + 2].xq.as_slice(),
                                 acts[bi + 3].xq.as_slice(),
                             ];
-                            let d = unsafe {
-                                dot_q4b_row_1x4_avx2(&buf, scales, r * gpr, gpr, xs)
-                            };
+                            let d = unsafe { dot_q4b_row_1x4_avx2(&buf, scales, r * gpr, gpr, xs) };
                             for k in 0..4 {
                                 let act = &acts[bi + k];
                                 let mut acc = d[k] * act.sx;
@@ -4766,7 +5093,10 @@ fn vbitmatmat(
     let sc_off = rows;
     let gscale = |r: usize, g: usize| {
         let so = (r * ng + g) * 2;
-        f16_to_f32(u16::from_le_bytes([bytes[sc_off + so], bytes[sc_off + so + 1]]))
+        f16_to_f32(u16::from_le_bytes([
+            bytes[sc_off + so],
+            bytes[sc_off + so + 1],
+        ]))
     };
 
     // Decode row r's raw (u − L) values into `dst` (f32, unscaled).
@@ -4788,8 +5118,9 @@ fn vbitmatmat(
     };
 
     if a8w8_enabled() {
-        let acts: Vec<SplitAct> =
-            (0..b).map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols])).collect();
+        let acts: Vec<SplitAct> = (0..b)
+            .map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols]))
+            .collect();
         let acts = &acts;
         let out_addr = SendMut(out.as_mut_ptr());
         let run = move |start: usize, end: usize| {
@@ -4845,7 +5176,9 @@ fn vbitmatmat(
                     // blocked 1×4 kernel serves the decoded row.
                     #[cfg(target_arch = "x86_64")]
                     if avx2_enabled()
-                        && std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true)
+                        && std::env::var("CMF_X86_BLOCKED")
+                            .map(|v| v != "0")
+                            .unwrap_or(true)
                     {
                         while bi + 4 <= acts.len() {
                             let xs = [
@@ -4867,8 +5200,7 @@ fn vbitmatmat(
                                 let act = &acts[bi + k];
                                 let mut dot = d[k];
                                 for &(j, xv) in &act.outliers {
-                                    dot +=
-                                        (buf[j] as i8) as f32 * gscale(r, j / GROUP_SIZE) * xv;
+                                    dot += (buf[j] as i8) as f32 * gscale(r, j / GROUP_SIZE) * xv;
                                 }
                                 // SAFETY: disjoint (bi, r) cells per worker.
                                 unsafe { *out_addr.at((bi + k) * rows + r) = dot };
@@ -5088,7 +5420,10 @@ fn dot_i8_i8(w: &[u8], xq: &[i8]) -> i32 {
         }
         return dot_i8_i8_avx2(w, xq);
     }
-    w.iter().zip(xq).map(|(&a, &b)| (a as i8) as i32 * b as i32).sum()
+    w.iter()
+        .zip(xq)
+        .map(|(&a, &b)| (a as i8) as i32 * b as i32)
+        .sum()
 }
 
 /// AVX-512 VNNI available? (F+BW+VL+VNNI; `CMF_AVX512=0` falls back to
@@ -5099,7 +5434,9 @@ fn avx512vnni_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("CMF_AVX512").map(|v| v != "0").unwrap_or(true)
+        std::env::var("CMF_AVX512")
+            .map(|v| v != "0")
+            .unwrap_or(true)
             && std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx512bw")
             && std::arch::is_x86_feature_detected!("avx512vl")
@@ -5274,10 +5611,14 @@ unsafe fn dot_i8_smmla_2x4(w0: &[u8], w1: &[u8], xs: [&[i8]; 4]) -> [[i32; 4]; 2
         let mut i = 0usize;
         while i + 8 <= n {
             let wa = vcombine_s8(vld1_s8(w0p.add(i)), vld1_s8(w1p.add(i)));
-            let xb01 =
-                vcombine_s8(vld1_s8(xs[0].as_ptr().add(i)), vld1_s8(xs[1].as_ptr().add(i)));
-            let xb23 =
-                vcombine_s8(vld1_s8(xs[2].as_ptr().add(i)), vld1_s8(xs[3].as_ptr().add(i)));
+            let xb01 = vcombine_s8(
+                vld1_s8(xs[0].as_ptr().add(i)),
+                vld1_s8(xs[1].as_ptr().add(i)),
+            );
+            let xb23 = vcombine_s8(
+                vld1_s8(xs[2].as_ptr().add(i)),
+                vld1_s8(xs[3].as_ptr().add(i)),
+            );
             asm!(
                 "smmla {a01:v}.4s, {w:v}.16b, {x01:v}.16b",
                 "smmla {a23:v}.4s, {w:v}.16b, {x23:v}.16b",
@@ -5648,8 +5989,10 @@ fn sdot_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         let want = std::env::var("CMF_SDOT").map(|v| v != "0").unwrap_or(true);
-        if !want { return false; }
-        
+        if !want {
+            return false;
+        }
+
         #[cfg(target_arch = "aarch64")]
         {
             if std::arch::is_aarch64_feature_detected!("dotprod") {
@@ -5658,7 +6001,10 @@ fn sdot_enabled() -> bool {
             #[cfg(target_os = "android")]
             {
                 if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
-                    if cpuinfo.lines().any(|l| (l.starts_with("Features") || l.starts_with("features")) && l.contains("asimddp")) {
+                    if cpuinfo.lines().any(|l| {
+                        (l.starts_with("Features") || l.starts_with("features"))
+                            && l.contains("asimddp")
+                    }) {
                         return true;
                     }
                 }
@@ -5730,7 +6076,10 @@ fn split_act(x: &[f32]) -> SplitAct {
     xq.clear();
     xq.reserve(n);
     if outliers.is_empty() {
-        xq.extend(x.iter().map(|&v| (v * inv).round().clamp(-127.0, 127.0) as i8));
+        xq.extend(
+            x.iter()
+                .map(|&v| (v * inv).round().clamp(-127.0, 127.0) as i8),
+        );
     } else {
         // Outlier slots quantize to 0 (their exact term is added later).
         xq.extend(x.iter().map(|&v| {
@@ -5742,15 +6091,28 @@ fn split_act(x: &[f32]) -> SplitAct {
         }));
     }
     let xsum = xq.iter().map(|&v| v as i32).sum();
-    SplitAct { xq, sx, outliers, xsum }
+    SplitAct {
+        xq,
+        sx,
+        outliers,
+        xsum,
+    }
 }
 
 fn split_act_q8_2f(x: &[f32], col: &[f32]) -> SplitAct {
     let n = x.len();
-    let rms = (x.iter().zip(col).map(|(&a, &c)| { let v = a * c; (v * v) as f64 })
-        .sum::<f64>() / n.max(1) as f64).sqrt() as f32;
+    let rms = (x
+        .iter()
+        .zip(col)
+        .map(|(&a, &c)| {
+            let v = a * c;
+            (v * v) as f64
+        })
+        .sum::<f64>()
+        / n.max(1) as f64)
+        .sqrt() as f32;
     let thr = 8.0 * rms;
-    
+
     let mut outliers = Vec::new();
     let mut amax = 0f32;
     for (j, (&a, &c)) in x.iter().zip(col).enumerate() {
@@ -5762,22 +6124,35 @@ fn split_act_q8_2f(x: &[f32], col: &[f32]) -> SplitAct {
             amax = s;
         }
     }
-    
+
     let sx = if amax > 0.0 { amax / 127.0 } else { 1.0 };
     let inv = 1.0 / sx;
     let mut xq = XQ_FREE.with(|f| f.borrow_mut().pop()).unwrap_or_default();
     xq.clear();
     xq.reserve(n);
     if outliers.is_empty() {
-        xq.extend(x.iter().zip(col).map(|(&a, &c)| ((a * c) * inv).round().clamp(-127.0, 127.0) as i8));
+        xq.extend(
+            x.iter()
+                .zip(col)
+                .map(|(&a, &c)| ((a * c) * inv).round().clamp(-127.0, 127.0) as i8),
+        );
     } else {
         xq.extend(x.iter().zip(col).map(|(&a, &c)| {
             let v = a * c;
-            if v.abs() > thr { 0 } else { (v * inv).round().clamp(-127.0, 127.0) as i8 }
+            if v.abs() > thr {
+                0
+            } else {
+                (v * inv).round().clamp(-127.0, 127.0) as i8
+            }
         }));
     }
     let xsum = xq.iter().map(|&v| v as i32).sum();
-    SplitAct { xq, sx, outliers, xsum }
+    SplitAct {
+        xq,
+        sx,
+        outliers,
+        xsum,
+    }
 }
 
 /// int8(weight)·int8(activation) → i32 via `sdot` (inline asm — the
@@ -5791,8 +6166,12 @@ unsafe fn dot_i8_sdot(w: &[u8], xq: &[i8]) -> i32 {
         use core::arch::asm;
         let wp = w.as_ptr() as *const i8;
         let n = w.len();
-        let (mut a0, mut a1, mut a2, mut a3) =
-            (vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0));
+        let (mut a0, mut a1, mut a2, mut a3) = (
+            vdupq_n_s32(0),
+            vdupq_n_s32(0),
+            vdupq_n_s32(0),
+            vdupq_n_s32(0),
+        );
         let mut i = 0;
         while i + 64 <= n {
             let (w0, x0) = (vld1q_s8(wp.add(i)), vld1q_s8(xq.as_ptr().add(i)));
@@ -5823,7 +6202,7 @@ unsafe fn dot_i8_sdot(w: &[u8], xq: &[i8]) -> i32 {
             i += 1;
         }
         s
-}
+    }
 }
 
 /// Row-blocked SDOT: 4 output rows per pass — the activation chunk is
@@ -5844,8 +6223,12 @@ unsafe fn dot_i8_sdot_4rows(w0: &[u8], w1: &[u8], w2: &[u8], w3: &[u8], xq: &[i8
             w2.as_ptr() as *const i8,
             w3.as_ptr() as *const i8,
         );
-        let (mut a0, mut a1, mut a2, mut a3) =
-            (vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0));
+        let (mut a0, mut a1, mut a2, mut a3) = (
+            vdupq_n_s32(0),
+            vdupq_n_s32(0),
+            vdupq_n_s32(0),
+            vdupq_n_s32(0),
+        );
         let mut i = 0;
         while i + 16 <= n {
             let x = vld1q_s8(px.add(i));
@@ -5864,7 +6247,12 @@ unsafe fn dot_i8_sdot_4rows(w0: &[u8], w1: &[u8], w2: &[u8], w3: &[u8], xq: &[i8
             );
             i += 16;
         }
-        let mut r = [vaddvq_s32(a0), vaddvq_s32(a1), vaddvq_s32(a2), vaddvq_s32(a3)];
+        let mut r = [
+            vaddvq_s32(a0),
+            vaddvq_s32(a1),
+            vaddvq_s32(a2),
+            vaddvq_s32(a3),
+        ];
         while i < n {
             let xi = *px.add(i) as i32;
             r[0] += (*p0.add(i)) as i32 * xi;
@@ -5874,7 +6262,7 @@ unsafe fn dot_i8_sdot_4rows(w0: &[u8], w1: &[u8], w2: &[u8], w3: &[u8], xq: &[i8
             i += 1;
         }
         r
-}
+    }
 }
 
 /// 4 interleaved rows in one pass: the repacked group is [r0[c], r1[c],
@@ -5894,8 +6282,12 @@ unsafe fn dot_i8_sdot_4rows_il(g: &[u8], xq: &[i8]) -> [i32; 4] {
         let n = xq.len();
         let px = xq.as_ptr();
         let pg = g.as_ptr() as *const i8;
-        let (mut a0, mut a1, mut a2, mut a3) =
-            (vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0));
+        let (mut a0, mut a1, mut a2, mut a3) = (
+            vdupq_n_s32(0),
+            vdupq_n_s32(0),
+            vdupq_n_s32(0),
+            vdupq_n_s32(0),
+        );
         let mut i = 0;
         while i + 16 <= n {
             let x = vld1q_s8(px.add(i));
@@ -5915,7 +6307,12 @@ unsafe fn dot_i8_sdot_4rows_il(g: &[u8], xq: &[i8]) -> [i32; 4] {
             );
             i += 16;
         }
-        [vaddvq_s32(a0), vaddvq_s32(a1), vaddvq_s32(a2), vaddvq_s32(a3)]
+        [
+            vaddvq_s32(a0),
+            vaddvq_s32(a1),
+            vaddvq_s32(a2),
+            vaddvq_s32(a3),
+        ]
     }
 }
 
@@ -6129,8 +6526,12 @@ unsafe fn dot_q4_row_sdot2(
             let x11 = vld1q_s8(xq1.as_ptr().add(gi * GROUP_SIZE + 16));
             let x20 = vld1q_s8(xq2.as_ptr().add(gi * GROUP_SIZE));
             let x21 = vld1q_s8(xq2.as_ptr().add(gi * GROUP_SIZE + 16));
-            let (mut a0, mut a1, mut b0, mut b1) =
-                (vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0));
+            let (mut a0, mut a1, mut b0, mut b1) = (
+                vdupq_n_s32(0),
+                vdupq_n_s32(0),
+                vdupq_n_s32(0),
+                vdupq_n_s32(0),
+            );
             asm!(
                 "sdot {a0:v}.4s, {e0:v}.16b, {x10:v}.16b",
                 "sdot {a1:v}.4s, {e1:v}.16b, {x11:v}.16b",
@@ -6229,7 +6630,7 @@ unsafe fn axpy_i8_f32_neon(acc: &mut [f32], row: &[i8], w: f32) {
             *ap.add(j) += w * (*rp.add(j)) as f32;
             j += 1;
         }
-}
+    }
 }
 
 /// i8 row · f32 x. NEON on aarch64 (ported from vmfcore `dot_i8_f32_neon`,
@@ -6283,8 +6684,12 @@ unsafe fn dot_i8_col_f32_neon(w: &[u8], x: &[f32], col: &[f32]) -> f32 {
         let wp = w.as_ptr() as *const i8;
         let xp = x.as_ptr();
         let cp = col.as_ptr();
-        let (mut a0, mut a1, mut a2, mut a3) =
-            (vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+        let (mut a0, mut a1, mut a2, mut a3) = (
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+        );
         let mut j = 0usize;
         while j + 16 <= n {
             let wb = vld1q_s8(wp.add(j));
@@ -6294,10 +6699,26 @@ unsafe fn dot_i8_col_f32_neon(w: &[u8], x: &[f32], col: &[f32]) -> f32 {
             let w1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo)));
             let w2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi)));
             let w3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi)));
-            a0 = vfmaq_f32(a0, w0, vmulq_f32(vld1q_f32(xp.add(j)), vld1q_f32(cp.add(j))));
-            a1 = vfmaq_f32(a1, w1, vmulq_f32(vld1q_f32(xp.add(j + 4)), vld1q_f32(cp.add(j + 4))));
-            a2 = vfmaq_f32(a2, w2, vmulq_f32(vld1q_f32(xp.add(j + 8)), vld1q_f32(cp.add(j + 8))));
-            a3 = vfmaq_f32(a3, w3, vmulq_f32(vld1q_f32(xp.add(j + 12)), vld1q_f32(cp.add(j + 12))));
+            a0 = vfmaq_f32(
+                a0,
+                w0,
+                vmulq_f32(vld1q_f32(xp.add(j)), vld1q_f32(cp.add(j))),
+            );
+            a1 = vfmaq_f32(
+                a1,
+                w1,
+                vmulq_f32(vld1q_f32(xp.add(j + 4)), vld1q_f32(cp.add(j + 4))),
+            );
+            a2 = vfmaq_f32(
+                a2,
+                w2,
+                vmulq_f32(vld1q_f32(xp.add(j + 8)), vld1q_f32(cp.add(j + 8))),
+            );
+            a3 = vfmaq_f32(
+                a3,
+                w3,
+                vmulq_f32(vld1q_f32(xp.add(j + 12)), vld1q_f32(cp.add(j + 12))),
+            );
             j += 16;
         }
         let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
@@ -6306,7 +6727,7 @@ unsafe fn dot_i8_col_f32_neon(w: &[u8], x: &[f32], col: &[f32]) -> f32 {
             j += 1;
         }
         sum
-}
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -6318,8 +6739,12 @@ unsafe fn dot_i8_f32_neon(w: &[u8], x: &[f32]) -> f32 {
         let n = x.len();
         let wp = w.as_ptr() as *const i8;
         let xp = x.as_ptr();
-        let (mut a0, mut a1, mut a2, mut a3) =
-            (vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+        let (mut a0, mut a1, mut a2, mut a3) = (
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+        );
         let mut j = 0usize;
         while j + 16 <= n {
             let wb = vld1q_s8(wp.add(j));
@@ -6341,7 +6766,7 @@ unsafe fn dot_i8_f32_neon(w: &[u8], x: &[f32]) -> f32 {
             j += 1;
         }
         sum
-}
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6388,8 +6813,9 @@ fn qmatvec(
             split_act(x)
         };
         let out_addr = SendMut(out.as_mut_ptr());
-        let run_range =
-            |start: usize, end: usize| q8_range_avx2(q, row_scale, &act, cols, out_addr, start, end);
+        let run_range = |start: usize, end: usize| {
+            q8_range_avx2(q, row_scale, &act, cols, out_addr, start, end)
+        };
         match pool {
             Some(pool) if rows >= 256 => pool.run_rows(rows, &run_range),
             _ => run_range(0, rows),
@@ -6429,8 +6855,16 @@ fn qmatvec2(
 ) {
     #[cfg(target_arch = "aarch64")]
     if sdot_enabled() {
-        let a1s = if dtype == TensorDtype::Q8_2f { split_act_q8_2f(x1, col_field) } else { split_act(x1) };
-        let a2s = if dtype == TensorDtype::Q8_2f { split_act_q8_2f(x2, col_field) } else { split_act(x2) };
+        let a1s = if dtype == TensorDtype::Q8_2f {
+            split_act_q8_2f(x1, col_field)
+        } else {
+            split_act(x1)
+        };
+        let a2s = if dtype == TensorDtype::Q8_2f {
+            split_act_q8_2f(x2, col_field)
+        } else {
+            split_act(x2)
+        };
         let p1 = SendMut(o1.as_mut_ptr());
         let p2 = SendMut(o2.as_mut_ptr());
         let run_range = |start: usize, end: usize| {
@@ -6444,8 +6878,16 @@ fn qmatvec2(
     }
     #[cfg(target_arch = "x86_64")]
     if avx2_a8w8_enabled() {
-        let a1s = if dtype == TensorDtype::Q8_2f { split_act_q8_2f(x1, col_field) } else { split_act(x1) };
-        let a2s = if dtype == TensorDtype::Q8_2f { split_act_q8_2f(x2, col_field) } else { split_act(x2) };
+        let a1s = if dtype == TensorDtype::Q8_2f {
+            split_act_q8_2f(x1, col_field)
+        } else {
+            split_act(x1)
+        };
+        let a2s = if dtype == TensorDtype::Q8_2f {
+            split_act_q8_2f(x2, col_field)
+        } else {
+            split_act(x2)
+        };
         let p1 = SendMut(o1.as_mut_ptr());
         let p2 = SendMut(o2.as_mut_ptr());
         let run_range = |start: usize, end: usize| {
@@ -6532,7 +6974,18 @@ mod tests {
             })
             .collect();
         let mut a = vec![0.0f32; rows];
-        qmatvec(&w, &[], &scales, &x, &[], TensorDtype::Q8Row, rows, cols, &mut a, None);
+        qmatvec(
+            &w,
+            &[],
+            &scales,
+            &x,
+            &[],
+            TensorDtype::Q8Row,
+            rows,
+            cols,
+            &mut a,
+            None,
+        );
         for o in 0..rows {
             let mut acc = 0.0f32;
             for j in 0..cols {
@@ -6589,7 +7042,14 @@ mod tests {
         q1_matmat(&bytes, &xs_all, b, rows, cols, &mut mm, None);
         for bi in 0..b {
             let mut single = vec![0.0f32; rows];
-            q1_matvec(&bytes, &xs_all[bi * cols..(bi + 1) * cols], rows, cols, &mut single, None);
+            q1_matvec(
+                &bytes,
+                &xs_all[bi * cols..(bi + 1) * cols],
+                rows,
+                cols,
+                &mut single,
+                None,
+            );
             assert_eq!(&mm[bi * rows..(bi + 1) * rows], &single[..], "stream {bi}");
         }
     }
@@ -6659,16 +7119,39 @@ mod tests {
             for c in 0..cols / 16 {
                 for lane in 0..4 {
                     assert_eq!(
-                        &rep[g * 4 * cols + c * 64 + lane * 16..g * 4 * cols + c * 64 + lane * 16 + 16],
+                        &rep[g * 4 * cols + c * 64 + lane * 16
+                            ..g * 4 * cols + c * 64 + lane * 16 + 16],
                         &w[(g * 4 + lane) * cols + c * 16..(g * 4 + lane) * cols + c * 16 + 16],
                     );
                 }
             }
         }
         let mut a = vec![0.0f32; rows];
-        qmatvec(&w, &[], &scales, &x, &[], TensorDtype::Q8Row, rows, cols, &mut a, None);
+        qmatvec(
+            &w,
+            &[],
+            &scales,
+            &x,
+            &[],
+            TensorDtype::Q8Row,
+            rows,
+            cols,
+            &mut a,
+            None,
+        );
         let mut b = vec![0.0f32; rows];
-        qmatvec(&w, &rep, &scales, &x, &[], TensorDtype::Q8Row, rows, cols, &mut b, None);
+        qmatvec(
+            &w,
+            &rep,
+            &scales,
+            &x,
+            &[],
+            TensorDtype::Q8Row,
+            rows,
+            cols,
+            &mut b,
+            None,
+        );
         assert_eq!(a, b, "full-range repack output diverged");
 
         #[cfg(target_arch = "aarch64")]
@@ -6677,8 +7160,26 @@ mod tests {
             let act = split_act(&x);
             let mut c1 = vec![0.0f32; rows];
             let mut c2 = vec![0.0f32; rows];
-            q8_range_sdot(&w, &[], &scales, &act, cols, SendMut(c1.as_mut_ptr()), 3, rows - 2);
-            q8_range_sdot(&w, &rep, &scales, &act, cols, SendMut(c2.as_mut_ptr()), 3, rows - 2);
+            q8_range_sdot(
+                &w,
+                &[],
+                &scales,
+                &act,
+                cols,
+                SendMut(c1.as_mut_ptr()),
+                3,
+                rows - 2,
+            );
+            q8_range_sdot(
+                &w,
+                &rep,
+                &scales,
+                &act,
+                cols,
+                SendMut(c2.as_mut_ptr()),
+                3,
+                rows - 2,
+            );
             assert_eq!(c1, c2, "unaligned-range repack output diverged");
         }
     }
@@ -6695,7 +7196,18 @@ mod tests {
         let scales = vec![0.01f32; rows];
         let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.21).sin()).collect();
         let mut a = vec![0.0f32; rows];
-        qmatvec(&w, &[], &scales, &x, &[], TensorDtype::Q8Row, rows, cols, &mut a, None);
+        qmatvec(
+            &w,
+            &[],
+            &scales,
+            &x,
+            &[],
+            TensorDtype::Q8Row,
+            rows,
+            cols,
+            &mut a,
+            None,
+        );
         let (mut num, mut den) = (0f64, 0f64);
         for o in 0..rows {
             let mut acc = 0.0f32;
@@ -6816,8 +7328,9 @@ mod tests {
             }
             bytes.extend_from_slice(&rowbytes);
         }
-        let x: Vec<f32> =
-            (0..b * cols).map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5).collect();
+        let x: Vec<f32> = (0..b * cols)
+            .map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5)
+            .collect();
         let offsets = vbit_row_offsets(&bytes, rows, cols);
         let mut y_a = vec![0f32; b * rows];
         let mut y_b = vec![0f32; b * rows];
@@ -6826,8 +7339,11 @@ mod tests {
         unsafe { std::env::set_var("CMF_X86_BLOCKED", "0") };
         vbitmatmat(&bytes, &offsets, &x, b, rows, cols, &mut y_b, None);
         unsafe { std::env::remove_var("CMF_X86_BLOCKED") };
-        let max_d =
-            y_a.iter().zip(&y_b).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+        let max_d = y_a
+            .iter()
+            .zip(&y_b)
+            .map(|(p, q)| (p - q).abs())
+            .fold(0.0f32, f32::max);
         assert!(max_d < 1e-4, "vbit blocked ≠ per-row: max|Δ| = {max_d}");
     }
 
@@ -6912,7 +7428,9 @@ mod tests {
         vbitmatvec(&bytes, &offsets, &x1, rows, cols, &mut a1, None);
         vbitmatvec(&bytes, &offsets, &x2, rows, cols, &mut a2, None);
         let (mut b1, mut b2) = (vec![0f32; rows], vec![0f32; rows]);
-        vbitmatvec2(&bytes, &offsets, &x1, &x2, rows, cols, &mut b1, &mut b2, None);
+        vbitmatvec2(
+            &bytes, &offsets, &x1, &x2, rows, cols, &mut b1, &mut b2, None,
+        );
         assert_eq!(a1, b1, "fused vbit lane 1 must be bit-identical");
         assert_eq!(a2, b2, "fused vbit lane 2 must be bit-identical");
     }
@@ -6953,7 +7471,9 @@ mod tests {
         let (r1, r2, cols) = (300, 200, 64);
         let mk = |salt: usize, rows: usize| {
             QTensor::from_f32(
-                (0..rows * cols).map(|i| ((i * 7 + salt) % 97) as f32 / 97.0 - 0.5).collect(),
+                (0..rows * cols)
+                    .map(|i| ((i * 7 + salt) % 97) as f32 / 97.0 - 0.5)
+                    .collect(),
                 rows,
                 cols,
             )
@@ -7023,8 +7543,19 @@ mod tests {
         q4matmat(&q4, &xs, b, rows, cols, &mut got, None);
         for bi in 0..b {
             let mut expect = vec![0f32; rows];
-            q4matvec(&q4, &xs[bi * cols..(bi + 1) * cols], rows, cols, &mut expect, None);
-            assert_eq!(&got[bi * rows..(bi + 1) * rows], &expect[..], "q4 batch pos {bi}");
+            q4matvec(
+                &q4,
+                &xs[bi * cols..(bi + 1) * cols],
+                rows,
+                cols,
+                &mut expect,
+                None,
+            );
+            assert_eq!(
+                &got[bi * rows..(bi + 1) * rows],
+                &expect[..],
+                "q4 batch pos {bi}"
+            );
         }
 
         // vbit: batch vs singles.
@@ -7033,9 +7564,19 @@ mod tests {
         for bi in 0..b {
             let mut expect = vec![0f32; rows];
             vbitmatvec(
-                &vb, &offsets, &xs[bi * cols..(bi + 1) * cols], rows, cols, &mut expect, None,
+                &vb,
+                &offsets,
+                &xs[bi * cols..(bi + 1) * cols],
+                rows,
+                cols,
+                &mut expect,
+                None,
             );
-            assert_eq!(&got[bi * rows..(bi + 1) * rows], &expect[..], "vbit batch pos {bi}");
+            assert_eq!(
+                &got[bi * rows..(bi + 1) * rows],
+                &expect[..],
+                "vbit batch pos {bi}"
+            );
         }
     }
 
@@ -7186,7 +7727,9 @@ mod tests {
         dequant_q1t(&bytes, rows, cols, &mut refw);
         // On-grid activations (±1, amax 1) so the int8 SDOT path reconstructs
         // x exactly and matches the f32 reference (same trick as the q1 test).
-        let x: Vec<f32> = (0..cols).map(|j| if j % 3 == 0 { 1.0 } else { -1.0 }).collect();
+        let x: Vec<f32> = (0..cols)
+            .map(|j| if j % 3 == 0 { 1.0 } else { -1.0 })
+            .collect();
         let mut expect = vec![0f32; rows];
         for r in 0..rows {
             let mut a = 0.0f32;
@@ -7199,7 +7742,12 @@ mod tests {
         let mut got = vec![0f32; rows];
         q1t_matvec(&bytes, &x, rows, cols, &mut got, None);
         for r in 0..rows {
-            assert!((got[r] - expect[r]).abs() < tol(expect[r]), "row {r}: {} vs {}", got[r], expect[r]);
+            assert!(
+                (got[r] - expect[r]).abs() < tol(expect[r]),
+                "row {r}: {} vs {}",
+                got[r],
+                expect[r]
+            );
         }
         // matmat (b=2, f32 decode path) must agree too.
         let x2: Vec<f32> = x.iter().chain(x.iter().map(|v| v)).copied().collect();
@@ -7217,7 +7765,10 @@ mod tests {
         q1t_matvec(&bytes, &x, rows, cols, &mut p1, None);
         q1t_matvec(&bytes, &x, rows, cols, &mut p2, None);
         for r in 0..rows {
-            assert!((p1[r] - expect[r]).abs() < tol(expect[r]) && (p2[r] - expect[r]).abs() < tol(expect[r]));
+            assert!(
+                (p1[r] - expect[r]).abs() < tol(expect[r])
+                    && (p2[r] - expect[r]).abs() < tol(expect[r])
+            );
         }
     }
 
@@ -7227,7 +7778,7 @@ mod tests {
     #[test]
     #[ignore]
     fn q1t_matvec_speed() {
-        use cortiq_core::quant::{f32_to_f16, q1t_code, q1t_pack, Q1T_TILE};
+        use cortiq_core::quant::{Q1T_TILE, f32_to_f16, q1t_code, q1t_pack};
         use std::time::Instant;
         let (rows, cols) = (8192usize, 4096usize); // FFN-sized
         let gpr = cols / GROUP_SIZE;
@@ -7264,7 +7815,9 @@ mod tests {
         }
         // On-grid ±1 so the fast path's int8 SDOT is exact vs the f32 "slow"
         // reference (the A/B is a timing check; values must still agree).
-        let x: Vec<f32> = (0..cols).map(|j| if j % 3 == 0 { 1.0 } else { -1.0 }).collect();
+        let x: Vec<f32> = (0..cols)
+            .map(|j| if j % 3 == 0 { 1.0 } else { -1.0 })
+            .collect();
         let (rp_off, ent_off, has_ov) = q1t_overlay(&bytes, rows * gpr * Q1T_TILE, rows);
 
         // "before": base-3 division decode into a buffer, then dot.

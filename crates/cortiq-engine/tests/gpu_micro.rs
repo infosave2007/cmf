@@ -175,7 +175,11 @@ fn q1t_real_gpu_parity() {
         assert!(got[r].is_finite(), "non-finite Metal output at row {r}");
         let rel = (got[r] - expect).abs() / expect.abs().max(1.0);
         max_rel = max_rel.max(rel);
-        assert!(rel < 2e-4, "row {r}: metal={} cpu={expect} rel={rel}", got[r]);
+        assert!(
+            rel < 2e-4,
+            "row {r}: metal={} cpu={expect} rel={rel}",
+            got[r]
+        );
     }
 
     let mut full = vec![0.0f32; rows];
@@ -198,9 +202,15 @@ fn q1t_real_gpu_parity() {
         }
         let delta = full[r] - got[r];
         let rel = (delta - overlay).abs() / overlay.abs().max(1.0);
-        assert!(rel < 2e-5, "overlay row {r}: metal delta={delta} cpu={overlay} rel={rel}");
+        assert!(
+            rel < 2e-5,
+            "overlay row {r}: metal delta={delta} cpu={overlay} rel={rel}"
+        );
     }
-    println!("Q1T real parity: {} {}x{}, max_rel={max_rel:.3e}", entry.name, rows, cols);
+    println!(
+        "Q1T real parity: {} {}x{}, max_rel={max_rel:.3e}",
+        entry.name, rows, cols
+    );
 }
 
 /// q8_row twin of `q1_gpu_micro` — the whole-token q8 graph question

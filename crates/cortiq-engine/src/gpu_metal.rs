@@ -13,7 +13,7 @@
 
 use crate::gpu::{BatchJob, MoeJob};
 use cortiq_core::CmfModel;
-use cortiq_core::quant::{f16_to_f32, GROUP_SIZE, Q1_TILE, Q1T_TILE};
+use cortiq_core::quant::{GROUP_SIZE, Q1_TILE, Q1T_TILE, f16_to_f32};
 use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -2484,11 +2484,7 @@ pub fn pipelined_submit_bench(n: usize) -> f64 {
 pub fn q8_resident_or_upload(model: &Arc<CmfModel>, _idx: usize, may_upload: bool) -> bool {
     let Some(c) = ctx() else { return false };
     let key = model_key(model);
-    if c.file_bufs
-        .lock()
-        .unwrap()
-        .contains_key(&key)
-    {
+    if c.file_bufs.lock().unwrap().contains_key(&key) {
         return true;
     }
     if may_upload {
@@ -2718,7 +2714,11 @@ fn q8_matvec_range_field(
         4
     };
     enc.set_bytes(base, 4, &cols4 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(base + 1, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(
+        base + 1,
+        4,
+        &rows_u as *const u32 as *const std::ffi::c_void,
+    );
     // 256 threads = 8 SIMD groups per threadgroup → 8 rows per group.
     let sgs = 8u64;
     let n_tg = (rows as u64).div_ceil(sgs);
@@ -2985,7 +2985,11 @@ fn encode_q8_matvec(
         4
     };
     enc.set_bytes(base, 4, &cols4 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(base + 1, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(
+        base + 1,
+        4,
+        &rows_u as *const u32 as *const std::ffi::c_void,
+    );
     let sgs = 8u64;
     let n_tg = (rows as u64).div_ceil(sgs);
     enc.dispatch_thread_groups(MTLSize::new(n_tg, 1, 1), MTLSize::new(sgs * 32, 1, 1));

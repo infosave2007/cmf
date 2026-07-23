@@ -99,7 +99,10 @@ fn phase_step(
         for f in 0..p2 {
             // φ(θ) = [cos·nph, sin·nph], θ scaled by the mass factor.
             let (fk, fq) = if f < nph {
-                ((thk_h[f] as f64 * mscale).cos(), (thq_h[f] as f64 * mscale).cos())
+                (
+                    (thk_h[f] as f64 * mscale).cos(),
+                    (thq_h[f] as f64 * mscale).cos(),
+                )
             } else {
                 (
                     (thk_h[f - nph] as f64 * mscale).sin(),
@@ -192,14 +195,32 @@ pub fn vmf_phase_pair(
     // Lane 1 commits into the real state.
     let kap1 = kappa_of(x1, w, nh, pool);
     let mut o1 = vec![0.0f32; nh * dv];
-    phase_step(&thq1, &thk1, &v1, &w.decay, kap1.as_deref(), cfg, state, &mut o1);
+    phase_step(
+        &thq1,
+        &thk1,
+        &v1,
+        &w.decay,
+        kap1.as_deref(),
+        cfg,
+        state,
+        &mut o1,
+    );
 
     // Lane 2 runs on a copy — tentative until the draft is verified.
     let kap2 = kappa_of(x2, w, nh, pool);
     scratch.clear();
     scratch.extend_from_slice(state);
     let mut o2 = vec![0.0f32; nh * dv];
-    phase_step(&thq2, &thk2, &v2, &w.decay, kap2.as_deref(), cfg, scratch, &mut o2);
+    phase_step(
+        &thq2,
+        &thk2,
+        &v2,
+        &w.decay,
+        kap2.as_deref(),
+        cfg,
+        scratch,
+        &mut o2,
+    );
 
     let mut out1 = vec![0.0f32; cfg.hidden_size];
     let mut out2 = vec![0.0f32; cfg.hidden_size];
@@ -257,11 +278,7 @@ impl GdnCfg {
 }
 
 fn softplus(x: f64) -> f64 {
-    if x > 20.0 {
-        x
-    } else {
-        x.exp().ln_1p()
-    }
+    if x > 20.0 { x } else { x.exp().ln_1p() }
 }
 
 fn sigmoid(x: f64) -> f64 {
@@ -362,15 +379,13 @@ fn gdn_step(
                 kf[d] = cq[ks + d] * invk;
             }
 
-            let g = (-(w.a_log[h] as f64).exp()
-                * softplus(a[h] as f64 + w.dt_bias[h] as f64))
-            .exp() as f32;
+            let g = (-(w.a_log[h] as f64).exp() * softplus(a[h] as f64 + w.dt_bias[h] as f64)).exp()
+                as f32;
             let beta = sigmoid(b[h] as f64) as f32;
 
             // SAFETY: disjoint per-head S and output slices per worker.
             let s = unsafe { std::slice::from_raw_parts_mut(s_ptr.0.add(h * dk * dv), dk * dv) };
-            let oh =
-                unsafe { std::slice::from_raw_parts_mut(of_ptr.0.add(h * dv), dv) };
+            let oh = unsafe { std::slice::from_raw_parts_mut(of_ptr.0.add(h * dv), dv) };
             let vt = &cq[2 * kd + h * dv..2 * kd + (h + 1) * dv];
 
             // S ← g·S;  kv = kᵀS;  S += k ⊗ β(v − kv);  o = qᵀS —
@@ -545,7 +560,9 @@ pub fn gdn_forward_batch(
 /// neutral). The probe in `gdn_forward` still arbitrates either way.
 fn gdn_projs_eligible(w: &GdnWeights) -> bool {
     w.in_proj_qkv.is_q1()
-        || std::env::var("CMF_GPU_GDN").map(|v| v == "1").unwrap_or(false)
+        || std::env::var("CMF_GPU_GDN")
+            .map(|v| v == "1")
+            .unwrap_or(false)
 }
 
 /// GDN qkv+z on GPU in a single submission (independent matvecs of one input).
@@ -558,54 +575,61 @@ fn gdn_projs_gpu(w: &GdnWeights, x: &[f32], qkv: &mut [f32], z: &mut [f32]) -> b
     fn part<'a>(
         t: &'a QTensor,
         x: &[f32],
-    ) -> Option<(std::sync::Arc<cortiq_core::CmfModel>, crate::gpu::BatchJob<'a>)> {
+    ) -> Option<(
+        std::sync::Arc<cortiq_core::CmfModel>,
+        crate::gpu::BatchJob<'a>,
+    )> {
         use crate::gpu::BatchJob;
         use crate::qtensor::prescale;
         use cortiq_core::TensorDtype;
         match t {
-        QTensor::Mapped {
-            model,
-            idx,
-            dtype: dt @ (TensorDtype::Q8Row | TensorDtype::Q8_2f),
-            rows,
-            cols,
-            row_scale,
-            col_field,
-            ..
-        } => Some((
-            model.clone(),
-            BatchJob {
-                idx: *idx,
-                rows: *rows,
-                cols: *cols,
+            QTensor::Mapped {
+                model,
+                idx,
+                dtype: dt @ (TensorDtype::Q8Row | TensorDtype::Q8_2f),
+                rows,
+                cols,
                 row_scale,
-                xs: prescale(x, col_field, *dt).into_owned(),
-                q1: false,
-            },
-        )),
-        QTensor::Mapped {
-            model,
-            idx,
-            dtype: TensorDtype::Q1,
-            rows,
-            cols,
-            ..
-        } => Some((
-            model.clone(),
-            BatchJob {
-                idx: *idx,
-                rows: *rows,
-                cols: *cols,
-                row_scale: &[],
-                xs: x.to_vec(),
-                q1: true,
-            },
-        )),
-        _ => None,
+                col_field,
+                ..
+            } => Some((
+                model.clone(),
+                BatchJob {
+                    idx: *idx,
+                    rows: *rows,
+                    cols: *cols,
+                    row_scale,
+                    xs: prescale(x, col_field, *dt).into_owned(),
+                    q1: false,
+                },
+            )),
+            QTensor::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q1,
+                rows,
+                cols,
+                ..
+            } => Some((
+                model.clone(),
+                BatchJob {
+                    idx: *idx,
+                    rows: *rows,
+                    cols: *cols,
+                    row_scale: &[],
+                    xs: x.to_vec(),
+                    q1: true,
+                },
+            )),
+            _ => None,
         }
     }
-    let Some((model, jq)) = part(&w.in_proj_qkv, x) else { return false };
-    let Some((_, jz)) = part(&w.in_proj_z, x) else { return false };
+    let Some((model, jq)) = part(&w.in_proj_qkv, x) else {
+        return false;
+    };
+    let Some((_, jz)) = part(&w.in_proj_z, x) else {
+        return false;
+    };
     matvec_batch(&model, &[jq, jz], &mut [qkv, z])
 }
 
@@ -903,25 +927,42 @@ mod tests {
 
         // Open gate: W=0, bias=+20 → κ = σ(20) ≈ 1 − 2e−9.
         w.k_gate = Some((
-            QTensor::from_f32(vec![0.0; cfg.num_heads * cfg.hidden_size], cfg.num_heads, cfg.hidden_size),
+            QTensor::from_f32(
+                vec![0.0; cfg.num_heads * cfg.hidden_size],
+                cfg.num_heads,
+                cfg.hidden_size,
+            ),
             vec![20.0; cfg.num_heads],
         ));
         let mut s_open = Vec::new();
         let o1 = vmf_phase_forward(&x, &w, &cfg, &mut s_open, None);
         let o2 = vmf_phase_forward(&x, &w, &cfg, &mut s_open, None);
         for (a, b) in base1.iter().zip(&o1).chain(base2.iter().zip(&o2)) {
-            assert!((a - b).abs() < 1e-5, "open κ must match gateless: {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-5,
+                "open κ must match gateless: {a} vs {b}"
+            );
         }
 
         // Closed gate: bias=−20 → κ ≈ 0 → nothing is written.
         w.k_gate = Some((
-            QTensor::from_f32(vec![0.0; cfg.num_heads * cfg.hidden_size], cfg.num_heads, cfg.hidden_size),
+            QTensor::from_f32(
+                vec![0.0; cfg.num_heads * cfg.hidden_size],
+                cfg.num_heads,
+                cfg.hidden_size,
+            ),
             vec![-20.0; cfg.num_heads],
         ));
         let mut s_closed = Vec::new();
         let oc = vmf_phase_forward(&x, &w, &cfg, &mut s_closed, None);
-        assert!(s_closed.iter().all(|&v| v.abs() < 1e-7), "closed κ: state must stay empty");
-        assert!(oc.iter().all(|&v| v.abs() < 1e-6), "closed κ: empty-condensate readout");
+        assert!(
+            s_closed.iter().all(|&v| v.abs() < 1e-7),
+            "closed κ: state must stay empty"
+        );
+        assert!(
+            oc.iter().all(|&v| v.abs() < 1e-6),
+            "closed κ: empty-condensate readout"
+        );
     }
 
     #[test]
@@ -1074,7 +1115,10 @@ mod tests {
     }
 
     fn tiny_short_conv() -> (ShortConvWeights, ShortConvCfg) {
-        let cfg = ShortConvCfg { hidden_size: 8, kernel: 3 };
+        let cfg = ShortConvCfg {
+            hidden_size: 8,
+            kernel: 3,
+        };
         let synth = |rows: usize, cols: usize, salt: usize| {
             QTensor::from_f32(
                 (0..rows * cols)
@@ -1121,8 +1165,9 @@ mod tests {
     fn short_conv_batch_matches_sequential() {
         let (w, cfg) = tiny_short_conv();
         let b = 5;
-        let xs: Vec<f32> =
-            (0..b * cfg.hidden_size).map(|i| (i as f32 * 0.13).sin() * 0.6).collect();
+        let xs: Vec<f32> = (0..b * cfg.hidden_size)
+            .map(|i| (i as f32 * 0.13).sin() * 0.6)
+            .collect();
 
         let mut s_seq = Vec::new();
         let mut seq_out = vec![0.0f32; b * cfg.hidden_size];
@@ -1139,7 +1184,10 @@ mod tests {
 
         let mut s_batch = Vec::new();
         let batch_out = short_conv_forward_batch(&xs, b, &w, &cfg, &mut s_batch, None);
-        assert_eq!(seq_out, batch_out, "batch conv must match sequential decode");
+        assert_eq!(
+            seq_out, batch_out,
+            "batch conv must match sequential decode"
+        );
         assert_eq!(s_seq, s_batch, "ring state must match after the chunk");
     }
 }

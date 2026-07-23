@@ -90,7 +90,9 @@ pub fn run_quantize_gptq(
     // The dense Hessian is only needed for the GPTQ fold (binary + λ<1e5).
     // Ternary and the fold-off mask path need only the diagonal (Σx²),
     // which is the only thing that fits for a 12B.
-    let is_ternary = std::env::var("CMF_GPTQ_TERNARY").map(|v| v == "1").unwrap_or(false);
+    let is_ternary = std::env::var("CMF_GPTQ_TERNARY")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let need_full_h = !is_ternary && lambda < 1e5;
     cortiq_engine::gptq_capture::begin(need_full_h);
     let _ = pipe.ppl_ids(&ids);
@@ -107,7 +109,9 @@ pub fn run_quantize_gptq(
         .unwrap_or(usize::MAX);
     // Ternary bulk (BitNet b1.58) instead of binary — no Hessian inverse,
     // so it ignores the column cap and runs on every linear.
-    let ternary = std::env::var("CMF_GPTQ_TERNARY").map(|v| v == "1").unwrap_or(false);
+    let ternary = std::env::var("CMF_GPTQ_TERNARY")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     if ternary {
         eprintln!("bulk codec: ternary {{-s,0,+s}} (q1t)");
     }
@@ -162,13 +166,19 @@ pub fn run_quantize_gptq(
     }
     let n_gptq = eligible.len();
     eprintln!("  quantizing {n_gptq} linears (streamed, parallel), copying {n_copy} verbatim …");
-    let out_dtype = if ternary { TensorDtype::Q1T } else { TensorDtype::Q1S };
+    let out_dtype = if ternary {
+        TensorDtype::Q1T
+    } else {
+        TensorDtype::Q1S
+    };
     let next = std::sync::atomic::AtomicUsize::new(0);
     let done = std::sync::atomic::AtomicUsize::new(0);
     let model_ref = &model;
     let hess_ref = &hess;
     let elig_ref = &eligible;
-    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let results: Vec<(usize, Vec<u8>)> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..nthreads)
             .map(|_| {
@@ -209,7 +219,10 @@ pub fn run_quantize_gptq(
                 })
             })
             .collect();
-        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
     });
     for (slot, data) in results {
         let entry = &model.tensors[slot];
@@ -356,7 +369,10 @@ fn column_mask(w0: &[f32], in_dim: usize, act_rms: &[f32], n_out: usize) -> Vec<
 /// `|W| · RMS(x_col)` (amplitude 𝒲 × activation θ) at full precision.
 /// `CMF_GPTQ_COLMASK=1` spends the same budget on whole channels instead.
 fn two_field_mask(w0: &[f32], in_dim: usize, act_rms: &[f32], n_out: usize) -> Vec<bool> {
-    if std::env::var("CMF_GPTQ_COLMASK").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("CMF_GPTQ_COLMASK")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         return column_mask(w0, in_dim, act_rms, n_out);
     }
     let total = w0.len();
@@ -365,7 +381,10 @@ fn two_field_mask(w0: &[f32], in_dim: usize, act_rms: &[f32], n_out: usize) -> V
         let mut score: Vec<(f32, usize)> = (0..total)
             .map(|idx| {
                 let col = idx % in_dim;
-                (w0[idx].abs() * act_rms.get(col).copied().unwrap_or(1.0), idx)
+                (
+                    w0[idx].abs() * act_rms.get(col).copied().unwrap_or(1.0),
+                    idx,
+                )
             })
             .collect();
         let k = total - n_out;
@@ -453,7 +472,11 @@ fn q1t_group_candidate(
     }
 
     let adaptive = adaptive_err < legacy_err;
-    let scale = if adaptive { adaptive_scale } else { legacy_scale };
+    let scale = if adaptive {
+        adaptive_scale
+    } else {
+        legacy_scale
+    };
     let mut code = [0u8; GROUP_SIZE];
     for k in 0..GROUP_SIZE {
         if outlier[k] {
@@ -513,7 +536,10 @@ pub fn quantize_q1t(
     // ‖α·Q(x) − W(x)‖²_d (d = per-channel activation power = RMS²). One
     // scalar per row, folded into that row's group scales — zero extra
     // storage. Disabled by CMF_GPTQ_NOCORRECT=1 for ablation.
-    if !std::env::var("CMF_GPTQ_NOCORRECT").map(|v| v == "1").unwrap_or(false) {
+    if !std::env::var("CMF_GPTQ_NOCORRECT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         for o in 0..out_dim {
             let (mut num, mut den) = (0.0f64, 0.0f64);
             for gg in 0..groups_per_row {
@@ -552,10 +578,16 @@ pub fn quantize_q1t(
     // — [u32 row_ptr[out_dim+1]] then [(u16 col, f16 val)] grouped by row.
     // col is a within-row index, so in_dim must fit u16 (holds for all
     // quantized attn/FFN tensors; the vocab-sized embed/lm_head are skipped).
-    assert!(in_dim <= u16::MAX as usize + 1, "q1t overlay: in_dim {in_dim} exceeds u16");
+    assert!(
+        in_dim <= u16::MAX as usize + 1,
+        "q1t overlay: in_dim {in_dim} exceeds u16"
+    );
     let mut row_ptr = vec![0u32; out_dim + 1];
     for o in 0..out_dim {
-        let c = is_out[o * in_dim..(o + 1) * in_dim].iter().filter(|&&b| b).count();
+        let c = is_out[o * in_dim..(o + 1) * in_dim]
+            .iter()
+            .filter(|&&b| b)
+            .count();
         row_ptr[o + 1] = row_ptr[o] + c as u32;
     }
     let n_out_actual = row_ptr[out_dim] as usize;
@@ -605,7 +637,11 @@ pub fn gptq_quantize_q1s(
     if fold {
         assert_eq!(h.len(), in_dim * in_dim);
     }
-    let hinv = if fold { inverse_symmetric(h, n, lambda) } else { Vec::new() };
+    let hinv = if fold {
+        inverse_symmetric(h, n, lambda)
+    } else {
+        Vec::new()
+    };
 
     // Working copy (mutated by the error fold) and the two-field outlier
     // mask (chosen once, from the ORIGINAL weights × activation field).
@@ -635,8 +671,7 @@ pub fn gptq_quantize_q1s(
                 }
             }
             let s = if cnt > 0 { sum / cnt as f32 } else { 0.0 };
-            scale[o * groups_per_row + gi] =
-                f16_to_f32(f32_to_f16(s)).max(6.103_515_6e-5);
+            scale[o * groups_per_row + gi] = f16_to_f32(f32_to_f16(s)).max(6.103_515_6e-5);
         }
         // Column-by-column quant + holographic fold into the remaining ones.
         for c in c0..c0 + GROUP_SIZE {
@@ -712,19 +747,31 @@ mod tests {
         let w: Vec<f32> = (0..GROUP_SIZE)
             .map(|i| {
                 let a = ((i * 17 + 5) % 31) as f32 / 31.0;
-                if i % 3 == 0 { a * 0.08 } else { (a + 0.15) * if i % 2 == 0 { 1.0 } else { -1.0 } }
+                if i % 3 == 0 {
+                    a * 0.08
+                } else {
+                    (a + 0.15) * if i % 2 == 0 { 1.0 } else { -1.0 }
+                }
             })
             .collect();
-        let rms: Vec<f32> = (0..GROUP_SIZE).map(|i| 0.3 + (i % 7) as f32 * 0.4).collect();
+        let rms: Vec<f32> = (0..GROUP_SIZE)
+            .map(|i| 0.3 + (i % 7) as f32 * 0.4)
+            .collect();
         let outlier = vec![false; GROUP_SIZE];
         let (scale, codes) = q1t_group_candidate(&w, &outlier, &rms, 0);
 
-        let legacy_scale = f16_to_f32(f32_to_f16(w.iter().map(|x| x.abs()).sum::<f32>() / GROUP_SIZE as f32))
-            .max(6.103_515_625e-5);
+        let legacy_scale = f16_to_f32(f32_to_f16(
+            w.iter().map(|x| x.abs()).sum::<f32>() / GROUP_SIZE as f32,
+        ))
+        .max(6.103_515_625e-5);
         let err = |s: f32, c: &[u8]| -> f64 {
             (0..GROUP_SIZE)
                 .map(|i| {
-                    let q = match c[i] { 1 => s, 2 => -s, _ => 0.0 };
+                    let q = match c[i] {
+                        1 => s,
+                        2 => -s,
+                        _ => 0.0,
+                    };
                     let e = (w[i] - q) as f64;
                     e * e * (rms[i] * rms[i]) as f64
                 })
@@ -732,7 +779,15 @@ mod tests {
         };
         let legacy_codes: Vec<u8> = w
             .iter()
-            .map(|&x| if x >= 0.5 * legacy_scale { 1 } else if x <= -0.5 * legacy_scale { 2 } else { 0 })
+            .map(|&x| {
+                if x >= 0.5 * legacy_scale {
+                    1
+                } else if x <= -0.5 * legacy_scale {
+                    2
+                } else {
+                    0
+                }
+            })
             .collect();
         assert!(err(scale, &codes) < err(legacy_scale, &legacy_codes));
     }
@@ -744,7 +799,9 @@ mod tests {
     fn q1t_ternary_roundtrip_zeros_and_levels() {
         let (rows, cols) = (2usize, 64usize);
         // Mostly tiny (→ 0), a few clearly ±, one spike outlier.
-        let mut vals: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.31).sin() * 0.02).collect();
+        let mut vals: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.31).sin() * 0.02)
+            .collect();
         vals[10] = 0.9;
         vals[11] = -0.85;
         vals[70] = 5.0; // outlier
@@ -756,9 +813,17 @@ mod tests {
         assert!((dec[70] - 5.0).abs() < 0.02, "outlier: {}", dec[70]);
         // Tiny weights collapse to exactly 0 (the ternary win).
         let zeros = dec.iter().filter(|&&v| v == 0.0).count();
-        assert!(zeros > rows * cols / 3, "ternary must zero many weights, got {zeros}");
+        assert!(
+            zeros > rows * cols / 3,
+            "ternary must zero many weights, got {zeros}"
+        );
         // Clear ± weights keep their sign.
-        assert!(dec[10] > 0.0 && dec[11] < 0.0, "signs: {} {}", dec[10], dec[11]);
+        assert!(
+            dec[10] > 0.0 && dec[11] < 0.0,
+            "signs: {} {}",
+            dec[10],
+            dec[11]
+        );
     }
 
     /// The core claim: on a layer with CORRELATED input activations, the
@@ -819,7 +884,8 @@ mod tests {
                 for ti in 0..t {
                     let mut d = 0.0f64;
                     for i in 0..in_dim {
-                        d += ((w[o * in_dim + i] - wh[o * in_dim + i]) as f64) * (x[i * t + ti] as f64);
+                        d += ((w[o * in_dim + i] - wh[o * in_dim + i]) as f64)
+                            * (x[i * t + ti] as f64);
                     }
                     e += d * d;
                 }

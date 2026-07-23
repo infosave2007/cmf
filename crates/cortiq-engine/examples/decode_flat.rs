@@ -56,16 +56,27 @@ fn main() {
     let stamps = stamps.lock().unwrap();
     // stamps[0] fires after generation's prefill + the one-off o1 seal:
     // that gap is TTFT, not a decode step.
-    println!("ctx={ctx} o1={o1spec} ttft_s={:.3}", stamps[0].duration_since(t0).as_secs_f64());
+    println!(
+        "ctx={ctx} o1={o1spec} ttft_s={:.3}",
+        stamps[0].duration_since(t0).as_secs_f64()
+    );
     println!("# idx  ms");
     for i in 1..stamps.len() {
-        println!("{:4}  {:7.2}", i, (stamps[i] - stamps[i - 1]).as_secs_f64() * 1e3);
+        println!(
+            "{:4}  {:7.2}",
+            i,
+            (stamps[i] - stamps[i - 1]).as_secs_f64() * 1e3
+        );
     }
     // Mean of the last half — past any startup transient.
     let half = stamps.len() / 2;
     if stamps.len() > 2 && half >= 1 {
         let dt = (stamps[stamps.len() - 1] - stamps[half]).as_secs_f64();
         let n = (stamps.len() - 1 - half) as f64;
-        println!("last-half: {:.2} ms/tok = {:.2} tok/s", dt / n * 1e3, n / dt);
+        println!(
+            "last-half: {:.2} ms/tok = {:.2} tok/s",
+            dt / n * 1e3,
+            n / dt
+        );
     }
 }

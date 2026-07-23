@@ -14,9 +14,9 @@
 //! The barrier `e_off − e_on` is exactly what suppresses thrashing at
 //! domain boundaries (the very effect a single threshold cannot give).
 
-use cortiq_core::quant::f16_to_f32;
-use cortiq_core::SelectionDescriptor;
 use base64::Engine as _;
+use cortiq_core::SelectionDescriptor;
+use cortiq_core::quant::f16_to_f32;
 
 /// One routable skill's precomputed subspace (decoded once).
 pub struct RoutableSkill {
@@ -107,10 +107,23 @@ pub struct DynRouter {
 
 impl DynRouter {
     pub fn new(skills: Vec<RoutableSkill>) -> Self {
-        let e_on = std::env::var("CMF_ROUTE_EON").ok().and_then(|v| v.parse().ok()).unwrap_or(0.62);
-        let e_off = std::env::var("CMF_ROUTE_EOFF").ok().and_then(|v| v.parse().ok()).unwrap_or(0.74);
-        let margin = std::env::var("CMF_ROUTE_MARGIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.03);
-        let period = std::env::var("CMF_ROUTE_PERIOD").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize).max(1);
+        let e_on = std::env::var("CMF_ROUTE_EON")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.62);
+        let e_off = std::env::var("CMF_ROUTE_EOFF")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.74);
+        let margin = std::env::var("CMF_ROUTE_MARGIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.03);
+        let period = std::env::var("CMF_ROUTE_PERIOD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8usize)
+            .max(1);
         Self {
             skills,
             e_on,
@@ -157,12 +170,23 @@ impl DynRouter {
         self.last_best_e = best_e; // telemetry: coherence at this eval
 
         let next = decide(
-            self.active, active_e, best_idx, best_e, self.e_on, self.e_off, self.margin,
+            self.active,
+            active_e,
+            best_idx,
+            best_e,
+            self.e_on,
+            self.e_off,
+            self.margin,
         );
 
         if next != self.active {
-            let from = self.active.and_then(|i| self.skills.iter().find(|s| s.idx == i)).map(|s| s.id.clone());
-            let to = next.and_then(|i| self.skills.iter().find(|s| s.idx == i)).map(|s| s.id.clone());
+            let from = self
+                .active
+                .and_then(|i| self.skills.iter().find(|s| s.idx == i))
+                .map(|s| s.id.clone());
+            let to = next
+                .and_then(|i| self.skills.iter().find(|s| s.idx == i))
+                .map(|s| s.id.clone());
             self.switches.push((token_no, from, to));
             self.active = next;
             return Some(next);
@@ -221,11 +245,7 @@ pub fn decide(
         Some(cur) => {
             if active_e > e_off {
                 // Melted: re-nucleate, else fall back to backbone.
-                if best_e < e_on {
-                    best_idx
-                } else {
-                    None
-                }
+                if best_e < e_on { best_idx } else { None }
             } else if best_idx != Some(cur) && best_e + margin < active_e {
                 // Rival decisively better while active still holds.
                 best_idx
@@ -245,19 +265,37 @@ mod tests {
         let (e_on, e_off, m) = (0.60, 0.75, 0.03);
 
         // From backbone: does NOT activate in the barrier band [e_on,e_off).
-        assert_eq!(decide(None, f32::INFINITY, Some(0), 0.70, e_on, e_off, m), None);
+        assert_eq!(
+            decide(None, f32::INFINITY, Some(0), 0.70, e_on, e_off, m),
+            None
+        );
         // From backbone: activates below e_on (nucleation).
-        assert_eq!(decide(None, f32::INFINITY, Some(0), 0.55, e_on, e_off, m), Some(0));
+        assert_eq!(
+            decide(None, f32::INFINITY, Some(0), 0.55, e_on, e_off, m),
+            Some(0)
+        );
 
         // Active skill 0 at E=0.70 (in the band) STAYS — this is the whole
         // point: a single threshold at 0.62 would have flip-flopped here.
-        assert_eq!(decide(Some(0), 0.70, Some(1), 0.68, e_on, e_off, m), Some(0));
+        assert_eq!(
+            decide(Some(0), 0.70, Some(1), 0.68, e_on, e_off, m),
+            Some(0)
+        );
         // Active melts above e_off → re-nucleate to the qualifying rival.
-        assert_eq!(decide(Some(0), 0.80, Some(1), 0.55, e_on, e_off, m), Some(1));
+        assert_eq!(
+            decide(Some(0), 0.80, Some(1), 0.55, e_on, e_off, m),
+            Some(1)
+        );
         // Active melts but no rival clears e_on → back to backbone.
         assert_eq!(decide(Some(0), 0.80, Some(1), 0.70, e_on, e_off, m), None);
         // Rival must beat active by `margin`, not merely be lower.
-        assert_eq!(decide(Some(0), 0.70, Some(1), 0.69, e_on, e_off, m), Some(0));
-        assert_eq!(decide(Some(0), 0.70, Some(1), 0.66, e_on, e_off, m), Some(1));
+        assert_eq!(
+            decide(Some(0), 0.70, Some(1), 0.69, e_on, e_off, m),
+            Some(0)
+        );
+        assert_eq!(
+            decide(Some(0), 0.70, Some(1), 0.66, e_on, e_off, m),
+            Some(1)
+        );
     }
 }

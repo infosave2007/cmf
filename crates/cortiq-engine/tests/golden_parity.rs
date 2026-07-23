@@ -7,9 +7,9 @@
 //! Without the env vars the test is skipped (unit runs stay hermetic).
 
 use cortiq_core::CmfModel;
-use std::sync::Arc;
 use cortiq_engine::pipeline::Pipeline;
 use cortiq_engine::sampler::SamplerConfig;
+use std::sync::Arc;
 
 #[derive(serde::Deserialize)]
 struct Reference {
@@ -21,9 +21,10 @@ struct Reference {
 
 #[test]
 fn engine_matches_numpy_reference() {
-    let (Ok(model_path), Ok(ref_path)) =
-        (std::env::var("CMF_GOLDEN_FILE"), std::env::var("CMF_GOLDEN_REF"))
-    else {
+    let (Ok(model_path), Ok(ref_path)) = (
+        std::env::var("CMF_GOLDEN_FILE"),
+        std::env::var("CMF_GOLDEN_REF"),
+    ) else {
         eprintln!("golden parity skipped: CMF_GOLDEN_FILE/CMF_GOLDEN_REF not set");
         return;
     };
@@ -44,7 +45,11 @@ fn engine_matches_numpy_reference() {
     }
     // CMF_GOLDEN_LOOSE=1: A8W8 SDOT pass — activation quantization noise
     // is expected (bounded); the greedy sequence below stays strict.
-    let tol = if std::env::var("CMF_GOLDEN_LOOSE").is_ok() { 0.05 } else { 1e-3 };
+    let tol = if std::env::var("CMF_GOLDEN_LOOSE").is_ok() {
+        0.05
+    } else {
+        1e-3
+    };
     assert!(
         max_diff < tol,
         "[{}] first-step logits diverge: max|Δ| = {max_diff} (tol {tol})",

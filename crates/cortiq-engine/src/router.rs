@@ -5,8 +5,8 @@
 
 use crate::pipeline::Pipeline;
 use base64::Engine as _;
-use cortiq_core::quant::f16_to_f32;
 use cortiq_core::CmfModel;
+use cortiq_core::quant::f16_to_f32;
 
 #[derive(Debug, Clone)]
 pub struct SkillRoute {
@@ -33,7 +33,9 @@ pub fn route(model: &CmfModel, pipeline: &mut Pipeline, ids: &[u32]) -> Vec<Skil
     let mut out = Vec::new();
 
     for skill in &model.header.skills {
-        let Some(sel) = &skill.selection else { continue };
+        let Some(sel) = &skill.selection else {
+            continue;
+        };
         if sel.metric != "mse" {
             tracing::warn!("skill '{}': unknown metric '{}'", skill.id, sel.metric);
             continue;

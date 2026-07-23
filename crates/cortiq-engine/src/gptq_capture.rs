@@ -10,8 +10,8 @@
 //! matmat that follows.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static ON: AtomicBool = AtomicBool::new(false);
 /// Accumulate the full `H = X·Xᵀ` (needed only for the GPTQ fold). Off ⇒
@@ -68,7 +68,11 @@ pub fn accumulate(name: &str, xs: &[f32], b: usize, cols: usize) {
     let full = FULL_H.load(Ordering::Relaxed);
     let acc = map.entry(name.to_string()).or_insert_with(|| HessianAcc {
         cols,
-        h: if full { vec![0.0; cols * cols] } else { Vec::new() },
+        h: if full {
+            vec![0.0; cols * cols]
+        } else {
+            Vec::new()
+        },
         sumsq: vec![0.0; cols],
         count: 0,
     });

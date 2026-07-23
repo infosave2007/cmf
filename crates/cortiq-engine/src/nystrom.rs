@@ -359,7 +359,11 @@ impl NystromState {
     /// `linear_state` for the linear core.
     pub fn memory_bytes(&self) -> usize {
         self.group.memory_bytes()
-            + self.heads.iter().map(NystromHead::memory_bytes).sum::<usize>()
+            + self
+                .heads
+                .iter()
+                .map(NystromHead::memory_bytes)
+                .sum::<usize>()
     }
 
     /// Push the group's (k, v) into the shared window.  In skeleton mode
@@ -574,7 +578,11 @@ impl NystromHead {
                 // The row shift e^{-f} and the flash factors below are
                 // strictly positive, so clamping here or after the
                 // rescale is the same predicate.
-                self.scr_u[b] = if self.rect == O1Rect::Fm { s.max(0.0) } else { s };
+                self.scr_u[b] = if self.rect == O1Rect::Fm {
+                    s.max(0.0)
+                } else {
+                    s
+                };
             }
             // Joint scale: the far term b carries e^{f + m_max[b]}, the
             // near term e^{c}; take the max so every factor is ≤ 1.
@@ -828,7 +836,11 @@ impl O1Cfg {
             "all" => Some(O1Layers::All),
             _ => {
                 if let Some(n) = s.strip_prefix("deep") {
-                    return n.parse::<usize>().ok().filter(|&n| n > 0).map(O1Layers::Deep);
+                    return n
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|&n| n > 0)
+                        .map(O1Layers::Deep);
                 }
                 let idx: Result<Vec<usize>, _> =
                     s.split(',').map(|p| p.trim().parse::<usize>()).collect();
@@ -850,8 +862,13 @@ impl O1Cfg {
     /// Rectifier from an explicit value, else `CMF_O1_RECT`, else the
     /// default.
     fn rect_or_env(rect: Option<O1Rect>) -> O1Rect {
-        rect.or_else(|| std::env::var("CMF_O1_RECT").ok().as_deref().and_then(Self::parse_rect))
-            .unwrap_or(O1_DEFAULT_RECT)
+        rect.or_else(|| {
+            std::env::var("CMF_O1_RECT")
+                .ok()
+                .as_deref()
+                .and_then(Self::parse_rect)
+        })
+        .unwrap_or(O1_DEFAULT_RECT)
     }
 
     /// Build from an explicit spec (CLI path). None = `off` or malformed.
@@ -870,8 +887,12 @@ impl O1Cfg {
             // NystromState asserts m ≥ 4 and w ≥ 1 — clamp rather than
             // panic deep in the first prefill.
             m: m.or_else(|| env("CMF_O1_M")).unwrap_or(O1_DEFAULT_M).max(4),
-            w: w.or_else(|| env("CMF_O1_WINDOW")).unwrap_or(O1_DEFAULT_W).max(1),
-            sink: sink.or_else(|| env("CMF_O1_SINK")).unwrap_or(O1_DEFAULT_SINK),
+            w: w.or_else(|| env("CMF_O1_WINDOW"))
+                .unwrap_or(O1_DEFAULT_W)
+                .max(1),
+            sink: sink
+                .or_else(|| env("CMF_O1_SINK"))
+                .unwrap_or(O1_DEFAULT_SINK),
             rect: Self::rect_or_env(rect),
         })
     }
@@ -883,7 +904,9 @@ impl O1Cfg {
         let layers = match v.get("layers") {
             Some(serde_json::Value::String(s)) => Self::parse_layers(s)?,
             Some(serde_json::Value::Array(a)) => O1Layers::List(
-                a.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect(),
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as usize))
+                    .collect(),
             ),
             _ => return None,
         };
@@ -891,9 +914,17 @@ impl O1Cfg {
         let env = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<usize>().ok());
         Some(O1Cfg {
             layers,
-            m: env("CMF_O1_M").or_else(|| f("m")).unwrap_or(O1_DEFAULT_M).max(4),
-            w: env("CMF_O1_WINDOW").or_else(|| f("w")).unwrap_or(O1_DEFAULT_W).max(1),
-            sink: env("CMF_O1_SINK").or_else(|| f("sink")).unwrap_or(O1_DEFAULT_SINK),
+            m: env("CMF_O1_M")
+                .or_else(|| f("m"))
+                .unwrap_or(O1_DEFAULT_M)
+                .max(4),
+            w: env("CMF_O1_WINDOW")
+                .or_else(|| f("w"))
+                .unwrap_or(O1_DEFAULT_W)
+                .max(1),
+            sink: env("CMF_O1_SINK")
+                .or_else(|| f("sink"))
+                .unwrap_or(O1_DEFAULT_SINK),
             // The rectifier is a runtime property of the kernel, not a
             // property of the weights — a file hint cannot pin it.
             rect: Self::rect_or_env(None),

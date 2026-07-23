@@ -48,7 +48,9 @@ const GGML_IQ4_XS: u32 = 23;
 const GGML_BF16: u32 = 30;
 
 /// Non-linear 4-bit codebook shared by IQ4_NL and IQ4_XS.
-const KVALUES_IQ4NL: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+const KVALUES_IQ4NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
 
 /// A parsed GGUF metadata value (only the parts we need are typed richly).
 #[derive(Clone)]
@@ -139,7 +141,10 @@ impl<'a> Cursor<'a> {
                 v.push(self.gstr()?);
             }
             Ok(Val::StrArr(v))
-        } else if matches!(et, T_U8 | T_I8 | T_U16 | T_I16 | T_U32 | T_I32 | T_U64 | T_I64 | T_BOOL) {
+        } else if matches!(
+            et,
+            T_U8 | T_I8 | T_U16 | T_I16 | T_U32 | T_I32 | T_U64 | T_I64 | T_BOOL
+        ) {
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
                 v.push(self.scalar(et)?.as_u64().map(|x| x as i64).unwrap_or(0));
@@ -198,11 +203,24 @@ fn parse(path: &std::path::Path) -> anyhow::Result<Gguf> {
         }
         let ggml_type = c.u32()?;
         let offset = c.u64()?;
-        tensors.push(GgufTensor { name, dims, ggml_type, offset });
+        tensors.push(GgufTensor {
+            name,
+            dims,
+            ggml_type,
+            offset,
+        });
     }
-    let align = md.get("general.alignment").and_then(|v| v.as_u64()).unwrap_or(32) as usize;
+    let align = md
+        .get("general.alignment")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(32) as usize;
     let data_start = align_up(c.p, align.max(1));
-    Ok(Gguf { md, tensors, bytes, data_start })
+    Ok(Gguf {
+        md,
+        tensors,
+        bytes,
+        data_start,
+    })
 }
 
 /// Dequantize `n` elements of a ggml tensor into f32. Every codec below is a
@@ -210,8 +228,16 @@ fn parse(path: &std::path::Path) -> anyhow::Result<Gguf> {
 /// scale packing match byte-for-byte.
 fn dequant(ggml_type: u32, raw: &[u8], n: usize) -> anyhow::Result<Vec<f32>> {
     Ok(match ggml_type {
-        GGML_F32 => raw.chunks_exact(4).take(n).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
-        GGML_F16 => raw.chunks_exact(2).take(n).map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]]))).collect(),
+        GGML_F32 => raw
+            .chunks_exact(4)
+            .take(n)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        GGML_F16 => raw
+            .chunks_exact(2)
+            .take(n)
+            .map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+            .collect(),
         GGML_BF16 => dequant_bf16(raw, n),
         GGML_Q4_0 => dequant_q4_0(raw, n),
         GGML_Q4_1 => dequant_q4_1(raw, n),
@@ -643,7 +669,8 @@ fn dequant_iq4_xs(raw: &[u8], n: usize) -> Vec<f32> {
         let scales_l = &raw[base + 4..base + 8];
         let qs = &raw[base + 8..base + 136];
         for ib in 0..QK_K / 32 {
-            let ls = (((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) as i32) | ((((scales_h >> (2 * ib)) & 3) as i32) << 4);
+            let ls = (((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) as i32)
+                | ((((scales_h >> (2 * ib)) & 3) as i32) << 4);
             let dl = d * (ls - 32) as f32;
             let q_off = ib * 16;
             let y_off = i * QK_K + ib * 32;
@@ -688,14 +715,33 @@ fn map_name(g: &str) -> Option<String> {
 }
 
 fn arch_from_md(md: &BTreeMap<String, Val>) -> anyhow::Result<ModelArch> {
-    let arch = md.get("general.architecture").and_then(|v| v.as_str()).unwrap_or("qwen2").to_string();
+    let arch = md
+        .get("general.architecture")
+        .and_then(|v| v.as_str())
+        .unwrap_or("qwen2")
+        .to_string();
     let g = |k: &str| md.get(&format!("{arch}.{k}"));
     let gu = |k: &str| g(k).and_then(|v| v.as_u64()).map(|x| x as usize);
     let n_layers = gu("block_count").ok_or_else(|| anyhow::anyhow!("gguf: no block_count"))?;
-    let hidden = gu("embedding_length").ok_or_else(|| anyhow::anyhow!("gguf: no embedding_length"))?;
-    let n_heads = gu("attention.head_count").ok_or_else(|| anyhow::anyhow!("gguf: no head_count"))?;
-    let vocab = md.get("tokenizer.ggml.tokens").and_then(|v| if let Val::StrArr(a) = v { Some(a.len()) } else { None }).unwrap_or(0);
-    let norm_style = if arch.contains("gemma") { NormStyle::Gemma } else { NormStyle::Qwen };
+    let hidden =
+        gu("embedding_length").ok_or_else(|| anyhow::anyhow!("gguf: no embedding_length"))?;
+    let n_heads =
+        gu("attention.head_count").ok_or_else(|| anyhow::anyhow!("gguf: no head_count"))?;
+    let vocab = md
+        .get("tokenizer.ggml.tokens")
+        .and_then(|v| {
+            if let Val::StrArr(a) = v {
+                Some(a.len())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let norm_style = if arch.contains("gemma") {
+        NormStyle::Gemma
+    } else {
+        NormStyle::Qwen
+    };
     Ok(ModelArch {
         arch_name: arch.clone(),
         hidden_size: hidden,
@@ -706,9 +752,13 @@ fn arch_from_md(md: &BTreeMap<String, Val>) -> anyhow::Result<ModelArch> {
         head_dim: gu("attention.key_length").unwrap_or(hidden / n_heads.max(1)),
         vocab_size: vocab,
         layer_types: vec![LayerType::FullAttention; n_layers],
-        rms_norm_eps: g("attention.layer_norm_rms_epsilon").and_then(|v| v.as_f64()).unwrap_or(1e-6),
+        rms_norm_eps: g("attention.layer_norm_rms_epsilon")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1e-6),
         norm_style,
-        rope_theta: g("rope.freq_base").and_then(|v| v.as_f64()).unwrap_or(10_000.0),
+        rope_theta: g("rope.freq_base")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(10_000.0),
         tie_word_embeddings: false,
         partial_rotary_factor: 1.0,
         yarn: None,
@@ -760,7 +810,11 @@ fn tokenizer(md: &BTreeMap<String, Val>) -> (Option<Vec<u8>>, TokenizerBundle) {
         _ => Vec::new(),
     };
     // vocab: token -> id
-    let vocab: serde_json::Map<String, serde_json::Value> = tokens.iter().enumerate().map(|(i, t)| (t.clone(), serde_json::json!(i))).collect();
+    let vocab: serde_json::Map<String, serde_json::Value> = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.clone(), serde_json::json!(i)))
+        .collect();
     // added/special tokens: ggml token_type CONTROL(3) / USER_DEFINED(4).
     let added: Vec<serde_json::Value> = tokens
         .iter()
@@ -787,11 +841,22 @@ fn tokenizer(md: &BTreeMap<String, Val>) -> (Option<Vec<u8>>, TokenizerBundle) {
             "vocab": vocab, "merges": merges
         }
     });
-    let eos = md.get("tokenizer.ggml.eos_token_id").and_then(|v| v.as_u64()).map(|x| x as u32);
-    let bos = md.get("tokenizer.ggml.bos_token_id").and_then(|v| v.as_u64()).map(|x| x as u32);
-    let pad = md.get("tokenizer.ggml.padding_token_id").and_then(|v| v.as_u64()).map(|x| x as u32);
+    let eos = md
+        .get("tokenizer.ggml.eos_token_id")
+        .and_then(|v| v.as_u64())
+        .map(|x| x as u32);
+    let bos = md
+        .get("tokenizer.ggml.bos_token_id")
+        .and_then(|v| v.as_u64())
+        .map(|x| x as u32);
+    let pad = md
+        .get("tokenizer.ggml.padding_token_id")
+        .and_then(|v| v.as_u64())
+        .map(|x| x as u32);
     let bundle = TokenizerBundle {
-        chat_template: md.get("tokenizer.chat_template").and_then(|v| v.as_str().map(String::from)),
+        chat_template: md
+            .get("tokenizer.chat_template")
+            .and_then(|v| v.as_str().map(String::from)),
         eos_token_ids: eos.into_iter().collect(),
         bos_token_id: bos,
         pad_token_id: pad,
@@ -817,31 +882,55 @@ fn resolve_gguf_source(spec: &str, token: Option<&str>) -> anyhow::Result<std::p
     }
     if convert::looks_like_repo(spec) {
         let files = convert::hf_repo_files(spec, token);
-        let ggufs: Vec<&String> = files.iter().filter(|f| f.to_lowercase().ends_with(".gguf")).collect();
+        let ggufs: Vec<&String> = files
+            .iter()
+            .filter(|f| f.to_lowercase().ends_with(".gguf"))
+            .collect();
         if ggufs.is_empty() {
             anyhow::bail!("'{spec}': the HF repo has no .gguf files");
         }
         let pick = pick_gguf(&ggufs);
-        eprintln!("selected {pick} from {spec} ({} .gguf files available)", ggufs.len());
+        eprintln!(
+            "selected {pick} from {spec} ({} .gguf files available)",
+            ggufs.len()
+        );
         return convert::hf_fetch_file(spec, pick, token);
     }
-    anyhow::bail!("'{spec}': not a local .gguf file, an HF repo id (owner/name), or owner/name/file.gguf")
+    anyhow::bail!(
+        "'{spec}': not a local .gguf file, an HF repo id (owner/name), or owner/name/file.gguf"
+    )
 }
 
 /// Pick the highest-fidelity natively-supported `.gguf` from a repo's file list.
 /// (IQ* codebook types are skipped — the importer does not decode them.)
 fn pick_gguf<'a>(files: &[&'a String]) -> &'a str {
-    const PREF: &[&str] = &["q8_0", "bf16", "f16", "fp16", "q6_k", "q5_k", "q5_1", "q5_0", "q4_k", "q4_1", "q4_0", "q3_k", "q2_k"];
+    const PREF: &[&str] = &[
+        "q8_0", "bf16", "f16", "fp16", "q6_k", "q5_k", "q5_1", "q5_0", "q4_k", "q4_1", "q4_0",
+        "q3_k", "q2_k",
+    ];
     for key in PREF {
-        if let Some(f) = files.iter().find(|f| f.to_lowercase().contains(key) && !f.to_lowercase().contains("iq")) {
+        if let Some(f) = files
+            .iter()
+            .find(|f| f.to_lowercase().contains(key) && !f.to_lowercase().contains("iq"))
+        {
             return f.as_str();
         }
     }
     // Fall back to the first non-IQ file, else the very first.
-    files.iter().find(|f| !f.to_lowercase().contains("iq")).unwrap_or(&files[0]).as_str()
+    files
+        .iter()
+        .find(|f| !f.to_lowercase().contains("iq"))
+        .unwrap_or(&files[0])
+        .as_str()
 }
 
-pub fn run_import_gguf(gguf: &str, quant: &str, output: &str, hf_token: Option<&str>, mut progress: impl FnMut(f32)) -> anyhow::Result<()> {
+pub fn run_import_gguf(
+    gguf: &str,
+    quant: &str,
+    output: &str,
+    hf_token: Option<&str>,
+    mut progress: impl FnMut(f32),
+) -> anyhow::Result<()> {
     let quant = convert::parse_quant(quant)?;
     // Source: a local .gguf, an HF repo id (auto-pick a .gguf), or owner/repo/file.gguf.
     let path = resolve_gguf_source(gguf, hf_token)?;
@@ -890,8 +979,17 @@ pub fn run_import_gguf(gguf: &str, quant: &str, output: &str, hf_token: Option<&
         }
 
         let two_d = shape.len() == 2 && numel >= 32;
-        let (dt, data) = if two_d { convert::quantize_2d(quant, &vals, shape[0], shape[1]) } else { (TensorDtype::F16, convert::encode_f16(&vals)) };
-        tensors.push(TensorSpec { name, dtype: dt, shape, data });
+        let (dt, data) = if two_d {
+            convert::quantize_2d(quant, &vals, shape[0], shape[1])
+        } else {
+            (TensorDtype::F16, convert::encode_f16(&vals))
+        };
+        tensors.push(TensorSpec {
+            name,
+            dtype: dt,
+            shape,
+            data,
+        });
     }
 
     let (vocab, bundle) = tokenizer(&g.md);
@@ -916,7 +1014,8 @@ pub fn run_import_gguf(gguf: &str, quant: &str, output: &str, hf_token: Option<&
         shard: None,
         calibration: None,
     };
-    CmfModel::write(output, &header, &tensors, None, vocab.as_deref()).map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;
+    CmfModel::write(output, &header, &tensors, None, vocab.as_deref())
+        .map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;
     progress(1.0);
     Ok(())
 }
@@ -948,7 +1047,10 @@ fn unpermute(vals: &[f32], out_dim: usize, in_dim: usize, n_heads: usize) -> Vec
 mod dequant_tests {
     use super::*;
     fn unhex(h: &str) -> Vec<u8> {
-        (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
+        (0..h.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
+            .collect()
     }
     #[test]
     fn q6k_matches_ggml_reference() {
@@ -973,7 +1075,12 @@ mod dequant_tests {
             (127, 0.002673),
         ];
         for &(i, e) in expect {
-            assert!((out[i] - e).abs() < 2e-4, "idx {i}: got {} want {}", out[i], e);
+            assert!(
+                (out[i] - e).abs() < 2e-4,
+                "idx {i}: got {} want {}",
+                out[i],
+                e
+            );
         }
     }
 
@@ -985,8 +1092,23 @@ mod dequant_tests {
         );
         assert_eq!(raw.len(), 144);
         let out = dequant_q4_k(&raw, 256);
-        for &(i, e) in &[(0usize, 0.002592f32), (1, -0.002525), (2, -0.0102), (31, 3.3e-5), (32, 0.000751), (64, -0.004447), (128, -0.003603), (200, -0.004132), (255, 0.002143)] {
-            assert!((out[i] - e).abs() < 2e-4, "q4k idx {i}: got {} want {}", out[i], e);
+        for &(i, e) in &[
+            (0usize, 0.002592f32),
+            (1, -0.002525),
+            (2, -0.0102),
+            (31, 3.3e-5),
+            (32, 0.000751),
+            (64, -0.004447),
+            (128, -0.003603),
+            (200, -0.004132),
+            (255, 0.002143),
+        ] {
+            assert!(
+                (out[i] - e).abs() < 2e-4,
+                "q4k idx {i}: got {} want {}",
+                out[i],
+                e
+            );
         }
     }
 
@@ -998,8 +1120,23 @@ mod dequant_tests {
         );
         assert_eq!(raw.len(), 176);
         let out = dequant_q5_k(&raw, 256);
-        for &(i, e) in &[(0usize, 0.003006f32), (1, -0.003211), (2, -0.01005), (31, -0.000102), (32, 0.000413), (64, -0.004699), (128, -0.003084), (200, -0.003904), (255, 0.002199)] {
-            assert!((out[i] - e).abs() < 2e-4, "q5k idx {i}: got {} want {}", out[i], e);
+        for &(i, e) in &[
+            (0usize, 0.003006f32),
+            (1, -0.003211),
+            (2, -0.01005),
+            (31, -0.000102),
+            (32, 0.000413),
+            (64, -0.004699),
+            (128, -0.003084),
+            (200, -0.003904),
+            (255, 0.002199),
+        ] {
+            assert!(
+                (out[i] - e).abs() < 2e-4,
+                "q5k idx {i}: got {} want {}",
+                out[i],
+                e
+            );
         }
     }
 }

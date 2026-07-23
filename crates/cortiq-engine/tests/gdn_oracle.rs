@@ -1,7 +1,7 @@
 //! GatedDeltaNet golden parity: the Rust core vs the validated numpy
 //! oracle (vmfcore/gdn_layer.py). Fixture: tests/gen_gdn_golden.py.
 
-use cortiq_engine::linear_core::{gdn_forward, GdnCfg, GdnWeights};
+use cortiq_engine::linear_core::{GdnCfg, GdnWeights, gdn_forward};
 use cortiq_engine::qtensor::QTensor;
 
 fn f32s(v: &serde_json::Value) -> Vec<f32> {

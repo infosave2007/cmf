@@ -40,7 +40,12 @@ fn synth(n: usize, salt: u64) -> Vec<f64> {
 /// Trainer forward (f64 matrix form) vs runtime kernel (f32 streaming),
 /// over the SERVED rows. Returns (max_abs_diff, max_abs_out).
 fn compare(t: usize, d: usize, dv: usize, p: usize, m: usize, w: usize, sink: usize) -> (f64, f64) {
-    let cfg = ops::NysCfg { m, w, sink, prefill: Some(p) };
+    let cfg = ops::NysCfg {
+        m,
+        w,
+        sink,
+        prefill: Some(p),
+    };
     // Logit spread ×2 so the far field carries real (and, for a healthy
     // minority of keys, NEGATIVE) mass — a flat-logit fixture would let
     // a broken rectifier pass.
@@ -93,9 +98,9 @@ fn compare(t: usize, d: usize, dv: usize, p: usize, m: usize, w: usize, sink: us
 fn trainer_forward_matches_runtime_kernel() {
     for &(t, p, m, w, sink) in &[
         (160usize, 80usize, 8usize, 32usize, 4usize),
-        (160, 80, 16, 32, 0),  // sink-free kernel
-        (200, 100, 8, 48, 4),  // wider window
-        (120, 60, 4, 16, 2),   // minimum landmark budget
+        (160, 80, 16, 32, 0), // sink-free kernel
+        (200, 100, 8, 48, 4), // wider window
+        (120, 60, 4, 16, 2),  // minimum landmark budget
     ] {
         let (d, dv) = (6usize, 5usize);
         assert!(p > w + sink + 8, "fixture must seal a real skeleton");
@@ -123,7 +128,12 @@ fn trainer_forward_matches_runtime_kernel() {
 #[test]
 fn aggregate_guard_differs_from_per_key_clamp() {
     let (t, d, dv, p, m, w, sink) = (160usize, 6usize, 5usize, 80usize, 8usize, 32usize, 4usize);
-    let cfg = ops::NysCfg { m, w, sink, prefill: Some(p) };
+    let cfg = ops::NysCfg {
+        m,
+        w,
+        sink,
+        prefill: Some(p),
+    };
     let mut q = synth(t * d, 20);
     let mut k = synth(t * d, 21);
     let v = synth(t * dv, 22);
@@ -168,8 +178,16 @@ fn aggregate_guard_differs_from_per_key_clamp() {
 #[test]
 fn short_prompt_falls_back_to_exact_both_sides() {
     let (t, d, dv, p, m, w, sink) = (160usize, 6usize, 5usize, 20usize, 8usize, 32usize, 4usize);
-    assert!(p <= w + sink + 8, "fixture must be in the degenerate regime");
-    let cfg = ops::NysCfg { m, w, sink, prefill: Some(p) };
+    assert!(
+        p <= w + sink + 8,
+        "fixture must be in the degenerate regime"
+    );
+    let cfg = ops::NysCfg {
+        m,
+        w,
+        sink,
+        prefill: Some(p),
+    };
     let q = synth(t * d, 30);
     let k = synth(t * d, 31);
     let v = synth(t * dv, 32);

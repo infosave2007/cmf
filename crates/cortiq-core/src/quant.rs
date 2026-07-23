@@ -662,7 +662,7 @@ mod f16_tests {
         // Smallest positive subnormal: 2^-24.
         assert!((f16_to_f32(0x0001) - 5.9604645e-8).abs() < 1e-12);
         // Largest subnormal: 1023 * 2^-24.
-        assert!((f16_to_f32(0x03FF) - 6.0975552e-5).abs() < 1e-9);
+        assert!((f16_to_f32(0x03FF) - 6.097_555e-5).abs() < 1e-9);
         // The value that exposed the halving bug (mant=299, subnormal).
         assert!((f16_to_f32(0x812b) - -1.7821789e-5).abs() < 1e-9);
         // Smallest normal (boundary) still correct: 2^-14.
@@ -688,9 +688,9 @@ mod f16_tests {
         let ng = cols / GROUP_SIZE;
         let bits = [4u8, 3, 8];
         let mut good = bits.to_vec();
-        good.extend(std::iter::repeat(0u8).take(rows * ng * 2)); // scales
+        good.extend(std::iter::repeat_n(0u8, rows * ng * 2)); // scales
         for &b in &bits {
-            good.extend(std::iter::repeat(0u8).take((cols * b as usize).div_ceil(8)));
+            good.extend(std::iter::repeat_n(0u8, (cols * b as usize).div_ceil(8)));
         }
         assert!(validate_payload(D::Vbit, &[rows, cols], &good).is_ok());
 

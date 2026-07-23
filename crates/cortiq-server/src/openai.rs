@@ -260,11 +260,28 @@ async fn chat_completions(
 
     // Chat template → prompt ids (uses real special tokens).
     let prompt_ids = {
-        let msgs: Vec<(String, String)> = req
+        let mut msgs: Vec<(String, String)> = req
             .messages
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))
             .collect();
+        // Hard thinking suppression: when enable_thinking=false, inject a
+        // system-level directive so even models that ignore the empty
+        //  block still produce direct answers.
+        eprintln!("[serve] thinking={:?}", req.thinking());
+        if req.thinking() == Some(false) {
+            let has_system = msgs.iter().any(|(r, _)| r == "system");
+            let directive = "Answer directly and concisely. Do NOT reason, think step-by-step, or explain your process. Output ONLY the final answer.";
+            if has_system {
+                // Prepend to existing system message
+                if let Some((_, content)) = msgs.iter_mut().find(|(r, _)| r == "system") {
+                    *content = format!("{directive}\n\n{content}");
+                }
+            } else {
+                msgs.insert(0, ("system".to_string(), directive.to_string()));
+            }
+        }
+        eprintln!("[serve] msgs[0]={:?}", msgs.get(0));
         state
             .tokenizer
             .apply_chat_template_opts(&msgs, req.thinking())

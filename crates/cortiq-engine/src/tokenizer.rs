@@ -81,9 +81,8 @@ fn bytes_to_unicode() -> ([char; 256], HashMap<char, u8>) {
     let mut c2b = HashMap::with_capacity(256);
     let mut n = 0u32;
     for b in 0..=255u16 {
-        let printable = (0x21..=0x7E).contains(&b)
-            || (0xA1..=0xAC).contains(&b)
-            || (0xAE..=0xFF).contains(&b);
+        let printable =
+            (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b);
         let c = if printable {
             char::from_u32(b as u32).unwrap()
         } else {
@@ -224,9 +223,10 @@ impl Tokenizer {
                 .as_ref()
                 .and_then(find_split_pattern)
                 .unwrap_or_else(|| DEFAULT_SPLIT.to_string());
-            Some(fancy_regex::Regex::new(&pattern).map_err(|e| {
-                TokenizerError::Parse(format!("pre-tokenizer regex: {e}"))
-            })?)
+            Some(
+                fancy_regex::Regex::new(&pattern)
+                    .map_err(|e| TokenizerError::Parse(format!("pre-tokenizer regex: {e}")))?,
+            )
         };
 
         // Added tokens: longest-first so overlapping contents match right.
@@ -491,10 +491,7 @@ impl Tokenizer {
         loop {
             let mut best: Option<(u32, usize)> = None;
             for i in 0..sym.len().saturating_sub(1) {
-                if let Some(&r) = self
-                    .ranks
-                    .get(&(sym[i].clone(), sym[i + 1].clone()))
-                {
+                if let Some(&r) = self.ranks.get(&(sym[i].clone(), sym[i + 1].clone())) {
                     if best.map(|(br, _)| r < br).unwrap_or(true) {
                         best = Some((r, i));
                     }
@@ -719,10 +716,16 @@ impl Tokenizer {
         // always emit a generation prompt. When thinking is explicitly disabled,
         // prefill an empty <think>…</think> block so the model answers directly.
         if enable_thinking == Some(false) && !rendered.contains("</think>") {
-            if let Some(pos) = rendered.rfind("assistant\n") {
-                let insert_at = pos + "assistant\n".len();
+            if let Some(pos) = rendered.rfind("assistant") {
+                let mut insert_at = pos + "assistant".len();
+                if let Some(idx) = rendered[insert_at..].find('\n') {
+                    insert_at += idx + 1;
+                }
                 let mut out = String::with_capacity(rendered.len() + 24);
                 out.push_str(&rendered[..insert_at]);
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
                 out.push_str("<think>\n\n</think>\n\n");
                 out.push_str(&rendered[insert_at..]);
                 return Ok(out);
@@ -763,9 +766,7 @@ impl Tokenizer {
 
     /// Check if token ID is EOS.
     pub fn is_eos(&self, id: u32) -> bool {
-        self.eos_token_id == Some(id)
-            || self.im_end_id == Some(id)
-            || self.extra_eos.contains(&id)
+        self.eos_token_id == Some(id) || self.im_end_id == Some(id) || self.extra_eos.contains(&id)
     }
 }
 

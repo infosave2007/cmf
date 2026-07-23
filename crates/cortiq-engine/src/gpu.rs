@@ -623,8 +623,25 @@ pub fn forward_token_graph(
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::forward_token_graph(
-            model, kv_id, layers, invf, h, nh, nkv, hd, rd, hidden, inter, position, cap, gemma,
-            eps, lm_head, final_norm, logits, loop_norm_at,
+            model,
+            kv_id,
+            layers,
+            invf,
+            h,
+            nh,
+            nkv,
+            hd,
+            rd,
+            hidden,
+            inter,
+            position,
+            cap,
+            gemma,
+            eps,
+            lm_head,
+            final_norm,
+            logits,
+            loop_norm_at,
         ),
         #[allow(unused_variables)]
         _ => {
