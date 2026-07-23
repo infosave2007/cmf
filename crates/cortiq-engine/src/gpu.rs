@@ -503,29 +503,29 @@ pub fn q1_matvec(
 /// K/V mirror. false = refusal / not the wgpu backend → CPU path.
 #[allow(clippy::too_many_arguments)]
 pub fn attn_dropin(
-    _model: &Arc<CmfModel>,
-    _kv_id: u64,
-    _layer: usize,
-    _normed: &[f32],
-    _wq_idx: usize,
-    _wk_idx: usize,
-    _wv_idx: usize,
-    _wo_idx: usize,
-    _q_norm: Option<&[f32]>,
-    _k_norm: Option<&[f32]>,
-    _invf: &[f32],
-    _nh: usize,
-    _nkv: usize,
-    _hd: usize,
-    _rd: usize,
-    _hidden: usize,
-    _pos: usize,
-    _cap: usize,
-    _gemma: bool,
-    _eps: f32,
-    _cpu_k: &[Vec<f32>],
-    _cpu_v: &[Vec<f32>],
-    _out: &mut [f32],
+    model: &Arc<CmfModel>,
+    kv_id: u64,
+    layer: usize,
+    normed: &[f32],
+    wq_idx: usize,
+    wk_idx: usize,
+    wv_idx: usize,
+    wo_idx: usize,
+    q_norm: Option<&[f32]>,
+    k_norm: Option<&[f32]>,
+    invf: &[f32],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rd: usize,
+    hidden: usize,
+    pos: usize,
+    cap: usize,
+    gemma: bool,
+    eps: f32,
+    cpu_k: &[Vec<f32>],
+    cpu_v: &[Vec<f32>],
+    out: &mut [f32],
 ) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
@@ -533,6 +533,7 @@ pub fn attn_dropin(
             model, kv_id, layer, normed, wq_idx, wk_idx, wv_idx, wo_idx, q_norm, k_norm, invf, nh,
             nkv, hd, rd, hidden, pos, cap, gemma, eps, cpu_k, cpu_v, out,
         ),
+        #[allow(unused_variables)]
         _ => false,
     }
 }
@@ -597,21 +598,21 @@ pub struct GraphLayer<'a> {
 /// hidden resident, one readback. Updates `h` in place. false = refusal.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_token_graph(
-    _model: &Arc<CmfModel>,
-    _kv_id: u64,
-    _layers: &[GraphLayer],
-    _invf: &[f32],
-    _h: &mut [f32],
-    _nh: usize,
-    _nkv: usize,
-    _hd: usize,
-    _rd: usize,
-    _hidden: usize,
-    _inter: usize,
-    _position: usize,
-    _cap: usize,
-    _gemma: bool,
-    _eps: f32,
+    model: &Arc<CmfModel>,
+    kv_id: u64,
+    layers: &[GraphLayer],
+    invf: &[f32],
+    h: &mut [f32],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rd: usize,
+    hidden: usize,
+    inter: usize,
+    position: usize,
+    cap: usize,
+    gemma: bool,
+    eps: f32,
     lm_head: Option<(&GraphW, usize)>,
     final_norm: &[f32],
     logits: &mut Vec<f32>,
@@ -622,6 +623,7 @@ pub fn forward_token_graph(
             model, kv_id, layers, invf, h, nh, nkv, hd, rd, hidden, inter, position, cap, gemma,
             eps, lm_head, final_norm, logits,
         ),
+        #[allow(unused_variables)]
         _ => {
             let _ = (lm_head, final_norm, logits);
             false
@@ -634,22 +636,22 @@ pub fn forward_token_graph(
 /// [k·hidden] in/out; `positions` len k. wgpu only.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_graph(
-    _model: &Arc<CmfModel>,
-    _kv_id: u64,
-    _layers: &[GraphLayer],
-    _invf: &[f32],
-    _h: &mut [f32],
-    _nh: usize,
-    _nkv: usize,
-    _hd: usize,
-    _rd: usize,
-    _hidden: usize,
-    _inter: usize,
-    _positions: &[usize],
-    _cap: usize,
-    _gemma: bool,
-    _eps: f32,
-    _k: usize,
+    model: &Arc<CmfModel>,
+    kv_id: u64,
+    layers: &[GraphLayer],
+    invf: &[f32],
+    h: &mut [f32],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rd: usize,
+    hidden: usize,
+    inter: usize,
+    positions: &[usize],
+    cap: usize,
+    gemma: bool,
+    eps: f32,
+    k: usize,
 ) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
@@ -750,17 +752,18 @@ pub(crate) fn metal_q1t_enabled() -> bool {
 
 /// Batched q1 GEMM (prefill). wgpu only — Metal has its own block path.
 pub fn q1_matmat(
-    _model: &Arc<CmfModel>,
-    _idx: usize,
-    _xs: &[f32],
-    _b: usize,
-    _rows: usize,
-    _cols: usize,
-    _out: &mut [f32],
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
 ) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q1_matmat(model, idx, xs, b, rows, cols, out),
+        #[allow(unused_variables)]
         _ => false,
     }
 }
