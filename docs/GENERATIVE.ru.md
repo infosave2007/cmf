@@ -73,9 +73,17 @@ Gemma-2-2B (декодер-онли LLM — наш стек), FLUX-VAE (Apache �
   LayerNorm 1e-6); паритет с numpy-референсом
   (`python/nextdit_ref.py`, `tests/dit_parity.rs`) на реальных
   весах: max|Δ| = 2.1e-5 (rel 1.5e-5).
-- [ ] Flow-matching цикл (FlowMatchEuler shift=6, CFG) + e2e
-  текст → картинка (Gemma → DiT → VAE)
-- [ ] Конвертер: три компонента → один .cmf
+- [x] **Flow-matching цикл + e2e текст → картинка** (`imagegen.rs`,
+  CLI `cortiq imagine`): шаблон промпта с `<Prompt Start>`, Gemma
+  hidden_states[-2], сигмы linspace(1,1/N,N) через сдвиг
+  σ'=6σ/(1+5σ), модель на t=1−σ, CFG с норм-рескейлом по строкам и
+  сменой знака перед Euler-шагом; компоненты грузятся стадийно
+  (пик RSS = один компонент, не сумма). Попутно фикс токенизатора:
+  BOS берётся из post_processor-шаблона (у Gemma в vocab и `<bos>`,
+  и `<s>` — порядок added_tokens выбирал не тот); golden-тест 40 id
+  против HF tokenizers + e2e-смоук (`tests/imagegen_smoke.rs`).
+- [ ] Конвертер: три компонента → один .cmf (f32-пейдж-ин ~20 ГБ на
+  прогон — главная боль, квантованная упаковка решает)
 - [ ] Скорость: conv через наши GEMM, GPU-графы для DiT-шага
 
 ## Прочие кандидаты (справочно, было «Фаза 2»)

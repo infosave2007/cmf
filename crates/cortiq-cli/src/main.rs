@@ -658,6 +658,31 @@ enum Commands {
         #[arg(long, default_value_t = 0.10)]
         gate_slack: f64,
     },
+    /// Generate an image from text — Lumina-Image 2.0 diffusers
+    /// directory (tokenizer/ text_encoder/ transformer/ vae/), CPU f32
+    /// (experimental; CMF packaging comes later)
+    Imagine {
+        /// Model root directory
+        model_dir: String,
+        /// Text prompt
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value_t = 512)]
+        height: usize,
+        #[arg(long, default_value_t = 512)]
+        width: usize,
+        /// Denoising steps
+        #[arg(long, default_value_t = 30)]
+        steps: usize,
+        /// Guidance scale (≤1 disables CFG and halves the work)
+        #[arg(long, default_value_t = 4.0)]
+        cfg: f32,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Output image path (.ppm, P6)
+        #[arg(long, default_value = "out.ppm")]
+        out: String,
+    },
 }
 
 /// Convert/import progress. `@PROGRESS <fraction>` is a marker for supervisors
@@ -1009,6 +1034,16 @@ async fn main() -> anyhow::Result<()> {
         Commands::Info { model } => cmd_info(&model).await,
         Commands::Story { model } => cmd_story(&model),
         Commands::Diff { a, b } => cmd_diff(&a, &b),
+        Commands::Imagine {
+            model_dir,
+            prompt,
+            height,
+            width,
+            steps,
+            cfg,
+            seed,
+            out,
+        } => cmd_imagine(&model_dir, &prompt, height, width, steps, cfg, seed, &out),
         Commands::Explain { model, prompt, top } => cmd_explain(&model, &prompt, top),
         Commands::Calibrate {
             model,
@@ -2400,6 +2435,51 @@ async fn cmd_info(model_path: &str) -> anyhow::Result<()> {
 /// The file's verifiable autobiography — narrated from its own header
 /// (spec §2/§9) and directory. Everything here is IN the file; nothing
 /// is inferred. "Opening someone else's .cmf, I am no longer blind."
+#[allow(clippy::too_many_arguments)]
+fn cmd_imagine(
+    model_dir: &str,
+    prompt: &str,
+    height: usize,
+    width: usize,
+    steps: usize,
+    cfg: f32,
+    seed: u64,
+    out: &str,
+) -> anyhow::Result<()> {
+    let params = cortiq_engine::imagegen::GenParams {
+        height,
+        width,
+        steps,
+        guidance_scale: cfg,
+        seed,
+        ..Default::default()
+    };
+    let t0 = std::time::Instant::now();
+    let img = cortiq_engine::imagegen::generate(
+        std::path::Path::new(model_dir),
+        prompt,
+        &params,
+        |i, n| {
+            eprintln!("step {i}/{n} ({:.1}s)", t0.elapsed().as_secs_f64());
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // P6 PPM: header + interleaved u8 RGB.
+    let mut buf = format!("P6\n{width} {height}\n255\n").into_bytes();
+    let plane = height * width;
+    for p in 0..plane {
+        for ch in 0..3 {
+            buf.push((img[ch * plane + p] * 255.0 + 0.5) as u8);
+        }
+    }
+    std::fs::write(out, &buf)?;
+    println!(
+        "{out}: {width}x{height}, {steps} steps in {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 fn cmd_story(model_path: &str) -> anyhow::Result<()> {
     let model = CmfModel::open_sharded(model_path)?;
     let arch = model.arch();

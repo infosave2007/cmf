@@ -10,6 +10,7 @@ pub mod gpu;
 pub mod gpu_metal;
 #[cfg(feature = "gpu")]
 pub mod gpu_wgpu;
+pub mod imagegen;
 pub mod inference;
 pub mod kv_cache;
 pub mod linear_core;

@@ -257,6 +257,21 @@ impl Tokenizer {
         }
         added.sort_by_key(|(c, _)| std::cmp::Reverse(c.len()));
 
+        // The post_processor template names the exact BOS content
+        // (llama "<s>", gemma "<bos>" — gemma's vocab carries BOTH, so
+        // added-token scan order must not decide).
+        if let Some(pp) = hf.post_processor.as_ref() {
+            let pp = pp.to_string();
+            for name in ["<bos>", "<s>"] {
+                if pp.contains(&format!("\"{name}\"")) {
+                    if let Some(&id) = vocab.get(name) {
+                        bos_token_id = Some(id);
+                    }
+                    break;
+                }
+            }
+        }
+
         // Build reverse map
         let max_id = vocab.values().copied().max().unwrap_or(0) as usize;
         let mut id_to_token = vec![String::new(); max_id + 1];
