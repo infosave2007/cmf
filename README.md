@@ -302,6 +302,8 @@ set `CMF_GPU=1` to use it (see [GPU](#gpu)).
 | `cortiq diff a.cmf b.cmf` | what changed between two model versions |
 | `cortiq route` · `explain` | which skill the router picks, and why |
 | `cortiq skill add` · `list` | bake a skill from a donor checkpoint ([guide](docs/SKILLS.md)); list a file's skills |
+| `cortiq imagine model.cmf --prompt "…"` | text → image (Lumina-Image 2.0), native Rust, CPU or Metal |
+| `cortiq imagine-pack <diffusers-dir>` | pack text encoder + DiT + VAE + tokenizer into one quantized `.cmf` |
 
 `cortiq <command> --help` documents every flag.
 
@@ -376,6 +378,31 @@ decode graph on Metal and WGSL matvec + prefill GEMM on wgpu (Vulkan / DX12 →
 NVIDIA / AMD / Intel). A 14.8B GDN-hybrid in `q1t` decodes 2.7× faster on the
 Metal graph than per-op and beats the same model in `q4` on the CPU. Full method,
 knobs (`CMF_GPTQ_*`), and quality numbers are in [docs/Q1T_PTQ.md](docs/Q1T_PTQ.md).
+
+### Text to image (Lumina-Image 2.0)
+
+The same format and engine also run a diffusion pipeline — Gemma-2-2B
+encodes the prompt, a Next-DiT denoiser runs the flow-matching loop, the
+FLUX VAE decodes the latent — all native Rust, no Python at inference.
+`imagine-pack` folds the 19 GB [Lumina-Image 2.0](https://huggingface.co/Alpha-VLLM/Lumina-Image-2.0)
+diffusers tree into one **3.2 GB** `.cmf` (projections q4t, VAE f16,
+tokenizer embedded) that `imagine` runs straight off the mmap:
+
+```sh
+cortiq imagine-pack ./Lumina-Image-2.0 --quant q4t --out lumina-q4t.cmf
+CMF_GPU=1 cortiq imagine lumina-q4t.cmf \
+    --prompt "a red fox in a snowy forest, photo" \
+    --height 512 --width 512 --out fox.ppm
+```
+
+On macOS every modulated DiT block executes as a single Metal command
+buffer — quantized GEMMs decode their tiles in the K loop, attention
+softmax and the SwiGLU FFN stay on the device, only the hidden state
+crosses the CPU boundary. An M4 renders 512×512 / 30 steps in
+**~2.7 min** and 256×256 in ~48 s; CPU-only takes about twice as long,
+and 1024×1024 is practical on the block graph. The GPU arm is probed
+against the CPU exactly like LLM inference — enabling it never makes
+you slower — and GPU renders stay visually identical to the CPU path.
 
 ## O(1) in depth
 

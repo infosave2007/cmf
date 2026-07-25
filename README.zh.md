@@ -266,6 +266,8 @@ cargo add cortiq-core                    # or use the format from your own Rust 
 | `cortiq diff a.cmf b.cmf` | 两个模型版本之间改了什么 |
 | `cortiq route` · `explain` | 路由器选了哪个技能，以及为什么 |
 | `cortiq skill add` · `list` | 从供体检查点烘焙技能（[指南](docs/SKILLS.zh.md)）；列出文件的技能 |
+| `cortiq imagine model.cmf --prompt "…"` | 文本 → 图片（Lumina-Image 2.0），纯 Rust，CPU 或 Metal |
+| `cortiq imagine-pack <diffusers-dir>` | 把文本编码器 + DiT + VAE + 分词器打包成一个量化 `.cmf` |
 
 `cortiq <command> --help` 里有每个参数的说明。
 
@@ -331,6 +333,29 @@ CMF_GPU=1 cortiq run model-q1t.cmf -p "What is 84 * 3 / 2?"
 matvec + prefill GEMM（Vulkan / DX12 → NVIDIA / AMD / Intel）。一个 14.8B 的 GDN
 混合模型在 `q1t` 下于 Metal 图上解码比逐算子快 2.7×，并在 CPU 上胜过同一模型的
 `q4`。完整方法、旋钮（`CMF_GPTQ_*`）和质量数字见 [docs/Q1T_PTQ.md](docs/Q1T_PTQ.md)。
+
+### 文本生成图片（Lumina-Image 2.0）
+
+同一个格式、同一个引擎也能跑扩散管线：Gemma-2-2B 编码提示词，Next-DiT
+去噪器跑 flow-matching 循环，FLUX VAE 解码潜变量——全部是原生 Rust，推理
+时没有 Python。`imagine-pack` 把 19 GB 的
+[Lumina-Image 2.0](https://huggingface.co/Alpha-VLLM/Lumina-Image-2.0)
+diffusers 目录折叠成一个 **3.2 GB** 的 `.cmf`（投影用 q4t，VAE 用 f16，
+分词器内嵌），`imagine` 直接在 mmap 上运行它：
+
+```sh
+cortiq imagine-pack ./Lumina-Image-2.0 --quant q4t --out lumina-q4t.cmf
+CMF_GPU=1 cortiq imagine lumina-q4t.cmf \
+    --prompt "a red fox in a snowy forest, photo" \
+    --height 512 --width 512 --out fox.ppm
+```
+
+在 macOS 上，每个带调制的 DiT 块作为单个 Metal command buffer 执行——量化
+GEMM 在 K 循环内解码自己的 tile，注意力 softmax 和 SwiGLU FFN 都留在设备
+上，跨越 CPU 边界的只有 hidden state。M4 渲染 512×512 / 30 步约 **2.7 分
+钟**，256×256 约 48 秒；纯 CPU 大约慢一倍，1024×1024 在块图上也变得实用。
+GPU 路径与 CPU 的对比探测方式和 LLM 推理完全相同——开启 GPU 永远不会让你
+更慢——GPU 渲染与 CPU 路径在视觉上完全一致。
 
 ## O(1) 深入解析
 

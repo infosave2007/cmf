@@ -313,6 +313,8 @@ Linux x86-64, macOS (Apple Silicon и Intel), Windows (x86-64 и ARM64); к ка
 | `cortiq diff a.cmf b.cmf` | что изменилось между двумя версиями модели |
 | `cortiq route` · `explain` | какой навык выбирает маршрутизатор и почему |
 | `cortiq skill add` · `list` | запечь навык из донорского чекпойнта ([гайд](docs/SKILLS.ru.md)); показать навыки файла |
+| `cortiq imagine model.cmf --prompt "…"` | текст → картинка (Lumina-Image 2.0), нативный Rust, CPU или Metal |
+| `cortiq imagine-pack <diffusers-dir>` | упаковать текст-энкодер + DiT + VAE + токенизатор в один квантованный `.cmf` |
 
 `cortiq <command> --help` документирует каждый флаг.
 
@@ -387,6 +389,32 @@ CMF_GPU=1 cortiq run model-q1t.cmf -p "Сколько будет 84 * 3 / 2?"
 NVIDIA / AMD / Intel). GDN-гибрид на 14.8B в `q1t` декодит в 2.7× быстрее на
 Metal-графе, чем поэлементно, и обгоняет ту же модель в `q4` на CPU. Полный
 метод, ручки (`CMF_GPTQ_*`) и цифры качества — в [docs/Q1T_PTQ.md](docs/Q1T_PTQ.md).
+
+### Текст → картинка (Lumina-Image 2.0)
+
+Тот же формат и тот же движок гоняют и диффузионный пайплайн: Gemma-2-2B
+кодирует промпт, Next-DiT-денойзер крутит flow-matching-цикл, FLUX-VAE
+декодирует латент — всё нативно на Rust, без Python на инференсе.
+`imagine-pack` сворачивает 19-ГБ diffusers-дерево
+[Lumina-Image 2.0](https://huggingface.co/Alpha-VLLM/Lumina-Image-2.0)
+в один **3.2-ГБ** `.cmf` (проекции q4t, VAE f16, токенизатор внутри),
+который `imagine` запускает прямо с mmap:
+
+```sh
+cortiq imagine-pack ./Lumina-Image-2.0 --quant q4t --out lumina-q4t.cmf
+CMF_GPU=1 cortiq imagine lumina-q4t.cmf \
+    --prompt "рыжая лиса в заснеженном лесу, фото" \
+    --height 512 --width 512 --out fox.ppm
+```
+
+На macOS каждый модулированный DiT-блок исполняется одним Metal
+command buffer: квантованные GEMM декодируют свои тайлы прямо в K-цикле,
+softmax внимания и SwiGLU-FFN остаются на устройстве, через CPU-границу
+ходит только hidden state. M4 рендерит 512×512 / 30 шагов за **~2.7 мин**,
+256×256 — за ~48 с; чистый CPU — примерно вдвое дольше, а 1024×1024 на
+блочном графе стал практичным. GPU-плечо пробуется против CPU так же,
+как в LLM-инференсе — включение GPU никогда не замедляет, — и GPU-рендеры
+визуально идентичны CPU-пути.
 
 ## O(1) в деталях
 

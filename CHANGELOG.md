@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.21] — 2026-07-25
+
+### Added
+- **Text → image, end to end** (`cortiq imagine`): a native Rust
+  pipeline for **Lumina-Image 2.0 (2.6B)** — Gemma-2-2B prompt encoder,
+  Next-DiT flow-matching denoiser, FLUX VAE decoder — each with a numpy
+  parity reference on the real weights (rel/abs max|Δ| 1.4e-4 / 2.1e-5 /
+  6.6e-6). CFG with per-row norm rescale, σ′=6σ/(1+5σ) shift schedule,
+  P6 PPM output.
+- **`cortiq imagine-pack`**: folds a diffusers tree into ONE quantized
+  `.cmf` (text encoder + DiT + VAE + tokenizer + configs) — 19 GB →
+  **3.2 GB**. Projections q4t (default) or q8; AdaLN modulation and
+  embeddings stay q8, VAE f16, norms f32. The runtime runs the
+  quantized projections straight off the mmap.
+- **DiT on the Metal GPU**: every modulated DiT block executes as one
+  command buffer — norms/modulation, q4t GEMMs, qk-norm + 3-axis RoPE,
+  all-heads attention (scores → row softmax → P·V), and the SwiGLU FFN
+  all device-resident; only the hidden state crosses the CPU boundary
+  (~10 MB/block instead of ~100 MB over ~7 roundtrips). The new
+  `q4t_mul_mm` kernel decodes the 18-byte tiles inside the GEMM's
+  K loop — the two-pass dequant variant was bandwidth-bound on ~2.8 GB
+  of scratch re-reads per FFN-shaped op. The CPU/GPU probe gained a
+  wide-batch class (prompt-encode and DiT batches have opposite
+  winners in the same process), and a work-proportional contention
+  kill-switch (cold PSO builds exempt) drops to CPU when another
+  process owns the device.
+- `CMF_DIT_PROF=1` — per-stage wall-time profile of the denoiser,
+  dumped when the model unloads.
+
+### Performance
+M4, 30 steps, CFG 4, the one 3.2 GB q4t file; CPU/GPU renders visually
+identical (pixel drift ≤ 10/255 at 512px):
+- 256×256: **48 s** GPU / 79 s CPU-only
+- 512×512: **161 s** GPU / 322 s CPU-only
+- 1024×1024 is now practical: the DiT forward takes 13.6 s at 4136
+  tokens on the block graph.
+The CPU DiT path is pool-parallel end to end (bit-exact — same-seed
+renders are byte-identical to the serial code).
+
+### Fixed
+- Gemma tokenizer picked `<s>` (id 204) as BOS instead of `<bos>`
+  (id 2) — both live in added_tokens and the scan order chose the
+  wrong one. BOS now comes from the post_processor template; golden
+  test against HF tokenizers.
+- A stale probe cold-flag could permanently disarm the GPU contention
+  kill-switch on a thread, and a first-use pipeline compile counted as
+  device contention — cold one-off costs are now exempt everywhere.
+
 ## [0.5.20] — 2026-07-25
 
 ### Fixed
