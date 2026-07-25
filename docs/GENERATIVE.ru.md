@@ -40,7 +40,28 @@ Snapdragon 778G (4–8 ГБ RAM) — флагманы получают «бол�
 4. Замер: частота токенов кодека vs tok/s на 778G/8G3 — реалтайм или
    офлайн-рендер по устройству.
 
-## Фаза 2 — картинки: заметный проект (порядок месяца+)
+## Фаза 2 — картинки: основная цель — Lumina-Image 2.0 (в работе)
+
+РЕШЕНИЕ (25.07.2026): Sana/Sana-Sprint отпали — лицензия research-only
+(NVIDIA NSCL). Основной кандидат — **Lumina-Image 2.0 (2.6B)**:
+Apache 2.0 целиком, Next-DiT (обычные трансформер-блоки), текст-энкодер
+Gemma-2-2B (декодер-онли LLM — наш стек), FLUX-VAE (Apache от schnell).
+В q4: DiT ~1.4 ГБ + Gemma ~1.4 ГБ + VAE ~0.2 ≈ 3 ГБ — флагманы 12 ГБ+
+и десктоп. Десктоп-топ вторым этапом: FLUX.1-schnell (Apache, 12B) на
+той же диффузионной базе.
+
+Прогресс:
+- [x] **FLUX-VAE-декодер на Rust** (`cortiq-engine/src/vae.rs`):
+  conv2d/GroupNorm/SiLU/spatial-attention/upsample, загрузка из
+  diffusers `vae/`; паритет с numpy-референсом (`python/vae_ref.py`,
+  `tests/vae_parity.rs`) на реальных весах: max|Δ| = 6.6e-6.
+  Ядра пока наивные (8×8 латент → 64×64 за 4.3 с) — im2col+GEMM позже.
+- [ ] Gemma-2-2B forward (encoder-режим, hidden states промпта)
+- [ ] Next-DiT блок + flow-matching цикл (timestep, AdaLN)
+- [ ] Конвертер: три компонента → один .cmf
+- [ ] Скорость: conv через наши GEMM, GPU-графы для DiT-шага
+
+## Прочие кандидаты (справочно, было «Фаза 2»)
 
 Кандидаты, влезающие в телефон:
 

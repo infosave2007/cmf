@@ -23,6 +23,7 @@ pub mod sampler;
 pub mod skillbake;
 pub mod swarm;
 pub mod tokenizer;
+pub mod vae;
 
 pub use nystrom::NystromState;
 pub use pipeline::{GenerateResult, Pipeline, TokenCallback, TokenTrace};
