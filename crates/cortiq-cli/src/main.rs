@@ -781,6 +781,24 @@ enum SkillCmd {
         /// Held-out chunks (the quality gate)
         #[arg(long, default_value = "12")]
         held: usize,
+        /// Target sparsity (0.0–1.0): force at least this fraction of
+        /// FFN neurons to be pruned. 0 = auto (denoising bottom)
+        #[arg(long, default_value = "0.0")]
+        target_sparsity: f64,
+        /// L1 aggression multiplier: >1.0 = harder pruning push,
+        /// <1.0 = softer (scales the L1 penalty schedule)
+        #[arg(long, default_value = "1.0")]
+        l1_aggression: f64,
+        /// Round each layer's kept-neuron count up to a multiple of
+        /// this (keeps grouped codecs + SIMD kernels on the fast
+        /// path; 1 = off)
+        #[arg(long, default_value = "32")]
+        ffn_align: usize,
+        /// Force one FFN width across all layers — required by the
+        /// whole-token GPU graphs (Metal/Vulkan); costs some sparsity
+        /// on uneven layers
+        #[arg(long)]
+        uniform_inter: bool,
     },
 }
 
@@ -1068,8 +1086,23 @@ async fn main() -> anyhow::Result<()> {
                 fcd_layers,
                 chunk,
                 held,
+                target_sparsity,
+                l1_aggression,
+                ffn_align,
+                uniform_inter,
             } => skill::run_skill_bake(
-                &model, &files, &output, steps_a, steps_b, fcd_layers, chunk, held,
+                &model,
+                &files,
+                &output,
+                steps_a,
+                steps_b,
+                fcd_layers,
+                chunk,
+                held,
+                target_sparsity,
+                l1_aggression,
+                ffn_align,
+                uniform_inter,
             ),
         },
         Commands::Verify { model } => cmd_verify(&model).await,

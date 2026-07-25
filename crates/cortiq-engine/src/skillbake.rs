@@ -37,6 +37,20 @@ pub struct BakeHyper {
     pub tau: f32,
     pub fcd_layers: usize,
     pub seed: u64,
+    /// Target sparsity (0..1). When >0, the best checkpoint must have
+    /// at least this fraction of neurons pruned; if none qualifies the
+    /// highest-sparsity checkpoint is used.
+    pub target_sparsity: f64,
+    /// L1 aggression multiplier: scales both l1_init and l1_step.
+    /// >1.0 = harder pruning push, <1.0 = softer.
+    pub l1_mult: f64,
+    /// Round each layer's kept-neuron count UP to a multiple of this
+    /// (0/1 = off). 32 keeps the defragged FFN on grouped codecs
+    /// (in % 32 == 0) and SIMD kernels off their scalar tails.
+    pub align: usize,
+    /// Force one FFN width across all layers (the max aligned count) —
+    /// the whole-token GPU graphs require a uniform intermediate size.
+    pub uniform_inter: bool,
 }
 
 impl Default for BakeHyper {
@@ -52,6 +66,10 @@ impl Default for BakeHyper {
             tau: 0.5,
             fcd_layers: 4,
             seed: 0,
+            target_sparsity: 0.0,
+            l1_mult: 1.0,
+            align: 32,
+            uniform_inter: false,
         }
     }
 }
@@ -438,8 +456,12 @@ pub fn skill_bake(
 
     // ── Phase A: mask training ──
     let mut adam_a = Adam::new(&vec![inter; nl], hy.lr_a);
-    let mut l1 = hy.l1_init;
-    let mut best: (f64, Option<Vec<Vec<f32>>>, f64) = (backbone, None, 0.0);
+    let mut l1 = hy.l1_init * hy.l1_mult;
+    let l1_step_eff = hy.l1_step * hy.l1_mult;
+    // best = (ppl, logits_snapshot, sparsity)
+    let mut best: (f64, Option<Vec<Vec<f32>>>, f64) = (f64::MAX, None, 0.0);
+    // Track the highest-sparsity checkpoint as fallback.
+    let mut max_sp: (f64, Option<Vec<Vec<f32>>>, f64) = (f64::MAX, None, 0.0);
     for step in 0..hy.steps_a {
         let chunk = &calib[step % calib.len()];
         let mut dmask: Vec<Vec<f64>> = vec![vec![0.0; inter]; nl];
@@ -463,7 +485,7 @@ pub fn skill_bake(
         let mut params: Vec<&mut [f32]> = logits.iter_mut().map(|v| v.as_mut_slice()).collect();
         adam_a.step(&mut params, &dmask, 1.0);
         if (step + 1) % hy.eval_every == 0 {
-            l1 += hy.l1_step;
+            l1 += l1_step_eff;
             let pass = Pass {
                 fm: &fm,
                 tau: hy.tau,
@@ -477,17 +499,40 @@ pub fn skill_bake(
                 .map(|l| l.iter().filter(|&&x| sigmoid(x) > hy.tau).count())
                 .sum();
             let sp = 1.0 - alive as f64 / (nl * inter) as f64;
-            if hp < best.0 {
+            // Track highest-sparsity checkpoint.
+            if sp > max_sp.2 {
+                max_sp = (hp, Some(logits.clone()), sp);
+            }
+            // Best checkpoint selection: respect target_sparsity.
+            if hy.target_sparsity > 0.0 {
+                if sp >= hy.target_sparsity && hp < best.0 {
+                    best = (hp, Some(logits.clone()), sp);
+                }
+            } else if hp < best.0 {
                 best = (hp, Some(logits.clone()), sp);
             }
             log(&format!(
-                "  [A] step {}: L1={l1:.3} pruned={:.0}% hard-PPL={hp:.3} (bottom {:.3}@{:.0}%)",
+                "  [A] step {}: L1={l1:.3} pruned={:.0}% hard-PPL={hp:.3} (bottom {}@{:.0}%)",
                 step + 1,
                 sp * 100.0,
-                best.0,
+                if best.0 == f64::MAX {
+                    "—".to_string()
+                } else {
+                    format!("{:.3}", best.0)
+                },
                 best.2 * 100.0
             ));
         }
+    }
+    // If target_sparsity was set but no checkpoint qualified, fall back
+    // to the highest-sparsity checkpoint.
+    if hy.target_sparsity > 0.0 && best.1.is_none() {
+        log(&format!(
+            "[A] target sparsity {:.0}% not reached; using max-sparsity checkpoint ({:.0}%)",
+            hy.target_sparsity * 100.0,
+            max_sp.2 * 100.0
+        ));
+        best = max_sp;
     }
     if let Some(b) = best.1.take() {
         logits = b;
@@ -581,12 +626,27 @@ pub fn skill_bake(
     let overlaid = best_b.0;
 
     // ── Export artifacts ──
-    let mut keep = Vec::with_capacity(nl);
+    let keep = keep_masks(&logits, hy.tau, hy.align, hy.uniform_inter);
+    if hy.align > 1 || hy.uniform_inter {
+        let raw: usize = logits
+            .iter()
+            .map(|l| l.iter().filter(|&&x| sigmoid(x) > hy.tau).count())
+            .sum();
+        let padded: usize = keep
+            .iter()
+            .map(|a| a.iter().filter(|&&x| x).count())
+            .sum::<usize>()
+            - raw;
+        log(&format!(
+            "align: +{padded} neurons resurrected (align {}, uniform {})",
+            hy.align, hy.uniform_inter
+        ));
+    }
     let mut down_out = Vec::with_capacity(nl);
     let mut gate_up = Vec::with_capacity(nl);
     let mut kept_per_layer = Vec::with_capacity(nl);
     for li in 0..nl {
-        let alive: Vec<bool> = logits[li].iter().map(|&x| sigmoid(x) > hy.tau).collect();
+        let alive = &keep[li];
         kept_per_layer.push(alive.iter().filter(|&&a| a).count());
         let l = &fm.layers[li];
         let mut down = match &ffn[li] {
@@ -603,7 +663,6 @@ pub fn skill_bake(
         }
         gate_up.push(ffn[li].as_ref().map(|(g, u, _)| (g.clone(), u.clone())));
         down_out.push(down);
-        keep.push(alive);
     }
     let total: usize = kept_per_layer.iter().sum();
     let report = BakeReport {
@@ -621,4 +680,113 @@ pub fn skill_bake(
         fcd_layers: fcd,
     };
     Ok((report, arts))
+}
+
+/// Hard-threshold keep masks from the trained logits, then resurrect
+/// the highest-logit pruned neurons until each layer's kept count is a
+/// multiple of `align` (rounding UP — the resurrected neurons are the
+/// ones the mask ranked closest to the threshold, so this only moves
+/// toward the full backbone). `uniform` additionally raises every layer
+/// to the max layer's aligned count. A layer with 0 live neurons gets
+/// `align.max(1)` — the defrag writer rejects empty layers.
+fn keep_masks(logits: &[Vec<f32>], tau: f32, align: usize, uniform: bool) -> Vec<Vec<bool>> {
+    let inter = logits[0].len();
+    let round = |n: usize| -> usize {
+        let n = n.max(1);
+        if align <= 1 {
+            n.min(inter)
+        } else {
+            (n.div_ceil(align) * align).min(inter)
+        }
+    };
+    let mut want: Vec<usize> = logits
+        .iter()
+        .map(|l| round(l.iter().filter(|&&x| sigmoid(x) > tau).count()))
+        .collect();
+    if uniform {
+        let k = want.iter().copied().max().unwrap_or(inter);
+        want = vec![k; logits.len()];
+    }
+    logits
+        .iter()
+        .zip(&want)
+        .map(|(l, &k)| {
+            let mut idx: Vec<usize> = (0..inter).collect();
+            idx.sort_unstable_by(|&a, &b| l[b].total_cmp(&l[a]));
+            let mut alive = vec![false; inter];
+            for &i in idx.iter().take(k) {
+                alive[i] = true;
+            }
+            alive
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kept(masks: &[Vec<bool>]) -> Vec<usize> {
+        masks
+            .iter()
+            .map(|m| m.iter().filter(|&&a| a).count())
+            .collect()
+    }
+
+    /// align=32 rounds each layer UP by resurrecting the largest
+    /// pruned logits; the originally-alive set stays alive.
+    #[test]
+    fn keep_masks_aligns_up_and_preserves_alive() {
+        let inter = 96;
+        // Layer 0: 40 alive (logits > 0 → σ > 0.5), the rest ramp
+        // below threshold so resurrection order is deterministic.
+        let l0: Vec<f32> = (0..inter)
+            .map(|i| if i < 40 { 1.0 } else { -1.0 - i as f32 * 0.01 })
+            .collect();
+        // Layer 1: 64 alive — already aligned, must stay exactly 64.
+        let l1: Vec<f32> = (0..inter)
+            .map(|i| if i < 64 { 2.0 } else { -3.0 })
+            .collect();
+        let masks = keep_masks(&[l0.clone(), l1], 0.5, 32, false);
+        assert_eq!(kept(&masks), vec![64, 64]);
+        // The 40 originally-alive stay; resurrected are the top pruned
+        // logits (indices 40..64 — the least-negative of the ramp).
+        for i in 0..64 {
+            assert!(masks[0][i], "neuron {i} should be kept");
+        }
+        for i in 64..inter {
+            assert!(!masks[0][i], "neuron {i} should stay pruned");
+        }
+    }
+
+    /// uniform=true raises every layer to the max aligned count.
+    #[test]
+    fn keep_masks_uniform_takes_max() {
+        let inter = 96;
+        let l0: Vec<f32> = (0..inter)
+            .map(|i| if i < 10 { 1.0 } else { -2.0 })
+            .collect();
+        let l1: Vec<f32> = (0..inter)
+            .map(|i| if i < 70 { 1.0 } else { -2.0 })
+            .collect();
+        let masks = keep_masks(&[l0, l1], 0.5, 32, true);
+        assert_eq!(kept(&masks), vec![96, 96]);
+    }
+
+    /// align capped at inter; align=1 (off) keeps the raw threshold
+    /// count; an all-pruned layer still keeps at least one neuron.
+    #[test]
+    fn keep_masks_edges() {
+        let inter = 48;
+        let l: Vec<f32> = (0..inter)
+            .map(|i| if i < 47 { 1.0 } else { -2.0 })
+            .collect();
+        let masks = keep_masks(&[l.clone()], 0.5, 32, false);
+        assert_eq!(kept(&masks), vec![48]); // 47 → 64 capped to 48
+        let masks = keep_masks(&[l], 0.5, 1, false);
+        assert_eq!(kept(&masks), vec![47]);
+        let dead: Vec<f32> = vec![-5.0; inter];
+        let masks = keep_masks(&[dead], 0.5, 32, false);
+        assert_eq!(kept(&masks), vec![32]); // max(1) → rounded to 32
+    }
 }

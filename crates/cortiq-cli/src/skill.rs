@@ -770,6 +770,10 @@ pub fn run_skill_bake(
     fcd_layers: usize,
     chunk: usize,
     held: usize,
+    target_sparsity: f64,
+    l1_aggression: f64,
+    ffn_align: usize,
+    uniform_inter: bool,
 ) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open(model_path)?);
     let vocab_bytes = model
@@ -787,6 +791,10 @@ pub fn run_skill_bake(
         steps_a,
         steps_b,
         fcd_layers,
+        target_sparsity,
+        l1_mult: l1_aggression,
+        align: ffn_align,
+        uniform_inter,
         ..Default::default()
     };
     let (report, arts) =
