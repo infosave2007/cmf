@@ -107,53 +107,67 @@ impl Conv2d {
         }
     }
 
-    /// `x`: [ic, h, w] → [oc, h, w].
+    /// `x`: [ic, h, w] → [oc, h, w]. Banded im2col + GEMM: bands of
+    /// output rows are lowered to a [rows·w, ic·k²] patch matrix and hit
+    /// `fcd_ops::gemm_nt` (Accelerate/AMX on macOS, the portable blocked
+    /// kernel elsewhere) — the band cap keeps the patch matrix ≤ ~128 MB
+    /// at any image size.
     pub fn apply(&self, x: &[f32], h: usize, w: usize) -> Vec<f32> {
         debug_assert_eq!(x.len(), self.ic * h * w);
         let pad = self.k / 2;
+        let ick2 = self.ic * self.k * self.k;
         let mut out = vec![0f32; self.oc * h * w];
-        let nthreads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(self.oc);
-        let chunk = self.oc.div_ceil(nthreads);
-        std::thread::scope(|s| {
-            for (ti, slice) in out.chunks_mut(chunk * h * w).enumerate() {
-                let o0 = ti * chunk;
-                s.spawn(move || {
-                    for (oi, oimg) in slice.chunks_mut(h * w).enumerate() {
-                        let o = o0 + oi;
-                        let wbase = o * self.ic * self.k * self.k;
-                        for y in 0..h {
-                            for xx in 0..w {
-                                let mut acc = self.b[o];
-                                for c in 0..self.ic {
-                                    let img = &x[c * h * w..(c + 1) * h * w];
-                                    let wk =
-                                        &self.w[wbase + c * self.k * self.k..][..self.k * self.k];
-                                    for ky in 0..self.k {
-                                        let sy = y as isize + ky as isize - pad as isize;
-                                        if sy < 0 || sy >= h as isize {
-                                            continue;
-                                        }
-                                        let row = &img[sy as usize * w..sy as usize * w + w];
-                                        let wrow = &wk[ky * self.k..ky * self.k + self.k];
-                                        for kx in 0..self.k {
-                                            let sx = xx as isize + kx as isize - pad as isize;
-                                            if sx < 0 || sx >= w as isize {
-                                                continue;
-                                            }
-                                            acc += wrow[kx] * row[sx as usize];
-                                        }
-                                    }
-                                }
-                                oimg[y * w + xx] = acc;
+        let band = (128 << 20) / (ick2 * w * 4).max(1);
+        let band = band.clamp(1, h);
+        let mut cols = vec![0f32; band * w * ick2];
+        let mut yt = vec![0f32; band * w * self.oc];
+        let mut y0 = 0usize;
+        while y0 < h {
+            let rows = band.min(h - y0);
+            let hw_band = rows * w;
+            // im2col: row p of `cols` = the receptive field of output
+            // position p (zero-padded at the borders).
+            for (dy, colrow) in cols[..hw_band * ick2].chunks_mut(w * ick2).enumerate() {
+                let y = y0 + dy;
+                for (xx, patch) in colrow.chunks_mut(ick2).enumerate() {
+                    let mut i = 0;
+                    for c in 0..self.ic {
+                        let img = &x[c * h * w..(c + 1) * h * w];
+                        for ky in 0..self.k {
+                            let sy = y as isize + ky as isize - pad as isize;
+                            for kx in 0..self.k {
+                                let sx = xx as isize + kx as isize - pad as isize;
+                                patch[i] =
+                                    if sy >= 0 && sy < h as isize && sx >= 0 && sx < w as isize {
+                                        img[sy as usize * w + sx as usize]
+                                    } else {
+                                        0.0
+                                    };
+                                i += 1;
                             }
                         }
                     }
-                });
+                }
             }
-        });
+            crate::fcd_ops::gemm_nt(
+                &cols[..hw_band * ick2],
+                &self.w,
+                &mut yt[..hw_band * self.oc],
+                hw_band,
+                ick2,
+                self.oc,
+                None,
+            );
+            // [hw, oc] → NCHW [oc, hw] + bias.
+            for o in 0..self.oc {
+                let b = self.b[o];
+                let dst = &mut out[o * h * w + y0 * w..][..hw_band];
+                for (p, d) in dst.iter_mut().enumerate() {
+                    *d = yt[p * self.oc + o] + b;
+                }
+            }
+            y0 += rows;
+        }
         out
     }
 }
@@ -178,27 +192,43 @@ impl GroupNorm {
         let c = self.w.len();
         let per = c / self.g;
         let hw = h * w;
-        for gi in 0..self.g {
-            let span = &mut x[gi * per * hw..(gi + 1) * per * hw];
-            let n = span.len() as f64;
-            let mean = span.iter().map(|&v| v as f64).sum::<f64>() / n;
-            let var = span.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
-            let inv = 1.0 / (var + 1e-6).sqrt();
-            for (ci, ch) in span.chunks_mut(hw).enumerate() {
-                let cc = gi * per + ci;
-                let (sw, sb) = (self.w[cc], self.b[cc]);
-                for v in ch.iter_mut() {
-                    *v = ((*v as f64 - mean) * inv) as f32 * sw + sb;
-                }
+        // One thread per group (32 groups saturate the cores; the pass
+        // is memory-bound, f64 accumulation kept for parity).
+        std::thread::scope(|s| {
+            for (gi, span) in x.chunks_mut(per * hw).enumerate() {
+                let (wref, bref) = (&self.w, &self.b);
+                s.spawn(move || {
+                    let n = span.len() as f64;
+                    let mean = span.iter().map(|&v| v as f64).sum::<f64>() / n;
+                    let var = span.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
+                    let inv = 1.0 / (var + 1e-6).sqrt();
+                    for (ci, ch) in span.chunks_mut(hw).enumerate() {
+                        let cc = gi * per + ci;
+                        let (sw, sb) = (wref[cc], bref[cc]);
+                        for v in ch.iter_mut() {
+                            *v = ((*v as f64 - mean) * inv) as f32 * sw + sb;
+                        }
+                    }
+                });
             }
-        }
+        });
     }
 }
 
 fn silu(x: &mut [f32]) {
-    for v in x.iter_mut() {
-        *v /= 1.0 + (-*v).exp();
-    }
+    let nt = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let chunk = x.len().div_ceil(nt).max(1 << 14);
+    std::thread::scope(|s| {
+        for part in x.chunks_mut(chunk) {
+            s.spawn(move || {
+                for v in part.iter_mut() {
+                    *v /= 1.0 + (-*v).exp();
+                }
+            });
+        }
+    });
 }
 
 /// Nearest-neighbour ×2 upsample, NCHW.
@@ -252,46 +282,41 @@ struct AttnBlock {
 }
 
 impl AttnBlock {
-    /// Dense projection over channels for every spatial position:
-    /// `x` [c, hw] channel-major → [c, hw].
-    fn proj(w: &[f32], b: &[f32], x: &[f32], c: usize, hw: usize) -> Vec<f32> {
-        let mut out = vec![0f32; c * hw];
-        for o in 0..c {
-            let wrow = &w[o * c..(o + 1) * c];
-            let dst = &mut out[o * hw..(o + 1) * hw];
-            dst.iter_mut().for_each(|v| *v = b[o]);
-            for (ci, &wv) in wrow.iter().enumerate() {
-                if wv == 0.0 {
-                    continue;
-                }
-                let src = &x[ci * hw..(ci + 1) * hw];
-                for (d, s) in dst.iter_mut().zip(src) {
-                    *d += wv * s;
-                }
+    /// Token-major dense projection: `x` [hw, c] → [hw, c] via one
+    /// `gemm_nt` (weight rows are output channels), bias fused after.
+    fn proj(w: &[f32], b: &[f32], x: &[f32], hw: usize, c: usize) -> Vec<f32> {
+        let mut y = vec![0f32; hw * c];
+        crate::fcd_ops::gemm_nt(x, w, &mut y, hw, c, c, None);
+        for row in y.chunks_mut(c) {
+            for (v, bb) in row.iter_mut().zip(b) {
+                *v += bb;
             }
         }
-        out
+        y
     }
 
     fn apply(&self, x: &[f32], h: usize, w: usize) -> Vec<f32> {
         let (c, hw) = (self.c, h * w);
         let mut n = x.to_vec();
         self.norm.apply(&mut n, h, w);
-        let q = Self::proj(&self.q.0, &self.q.1, &n, c, hw);
-        let k = Self::proj(&self.k.0, &self.k.1, &n, c, hw);
-        let v = Self::proj(&self.v.0, &self.v.1, &n, c, hw);
-        let scale = 1.0 / (c as f32).sqrt();
-        // attn[i, j] = softmax_j(q_i · k_j); out_i = Σ_j attn · v_j.
-        let mut o = vec![0f32; c * hw];
-        let mut row = vec![0f32; hw];
-        for i in 0..hw {
-            for (j, r) in row.iter_mut().enumerate() {
-                let mut d = 0f32;
-                for ci in 0..c {
-                    d += q[ci * hw + i] * k[ci * hw + j];
-                }
-                *r = d * scale;
+        // Channel-major → token-major once; everything below is GEMM.
+        let mut nt = vec![0f32; hw * c];
+        for ci in 0..c {
+            for p in 0..hw {
+                nt[p * c + ci] = n[ci * hw + p];
             }
+        }
+        let mut q = Self::proj(&self.q.0, &self.q.1, &nt, hw, c);
+        let k = Self::proj(&self.k.0, &self.k.1, &nt, hw, c);
+        let v = Self::proj(&self.v.0, &self.v.1, &nt, hw, c);
+        let scale = 1.0 / (c as f32).sqrt();
+        for qv in q.iter_mut() {
+            *qv *= scale;
+        }
+        // scores[i, j] = q_i · k_j; row softmax; out = attn · v.
+        let mut scores = vec![0f32; hw * hw];
+        crate::fcd_ops::gemm_nt(&q, &k, &mut scores, hw, c, hw, None);
+        for row in scores.chunks_mut(hw) {
             let mx = row.iter().cloned().fold(f32::MIN, f32::max);
             let mut den = 0f32;
             for r in row.iter_mut() {
@@ -299,17 +324,28 @@ impl AttnBlock {
                 den += *r;
             }
             let inv = 1.0 / den;
-            for ci in 0..c {
-                let vch = &v[ci * hw..(ci + 1) * hw];
-                let mut acc = 0f32;
-                for (r, s) in row.iter().zip(vch) {
-                    acc += r * s;
-                }
-                o[ci * hw + i] = acc * inv;
+            for r in row.iter_mut() {
+                *r *= inv;
             }
         }
-        let o = Self::proj(&self.out.0, &self.out.1, &o, c, hw);
-        x.iter().zip(&o).map(|(a, b)| a + b).collect()
+        // gemm_nt wants the right operand transposed: v as [c, hw].
+        let mut vt = vec![0f32; c * hw];
+        for p in 0..hw {
+            for ci in 0..c {
+                vt[ci * hw + p] = v[p * c + ci];
+            }
+        }
+        let mut ot = vec![0f32; hw * c];
+        crate::fcd_ops::gemm_nt(&scores, &vt, &mut ot, hw, hw, c, None);
+        let o = Self::proj(&self.out.0, &self.out.1, &ot, hw, c);
+        // Token-major → channel-major + residual.
+        let mut y = x.to_vec();
+        for p in 0..hw {
+            for ci in 0..c {
+                y[ci * hw + p] += o[p * c + ci];
+            }
+        }
+        y
     }
 }
 
@@ -428,30 +464,41 @@ impl VaeDecoder {
     /// Decode latents `[latent_channels, h, w]` (model scale, i.e. as
     /// produced by the diffusion loop) into RGB `[3, 8h, 8w]` in [-1, 1].
     pub fn decode(&self, z: &[f32], h: usize, w: usize) -> Vec<f32> {
+        let prof = std::env::var("CMF_VAE_PROF").is_ok();
+        macro_rules! stage {
+            ($name:expr, $e:expr) => {{
+                let t = std::time::Instant::now();
+                let r = $e;
+                if prof {
+                    eprintln!("vae {}: {:.2}s", $name, t.elapsed().as_secs_f64());
+                }
+                r
+            }};
+        }
         let z: Vec<f32> = z
             .iter()
             .map(|&v| v / self.scaling_factor + self.shift_factor)
             .collect();
-        let mut x = self.conv_in.apply(&z, h, w);
-        x = self.mid_res1.apply(&x, h, w);
-        x = self.mid_attn.apply(&x, h, w);
-        x = self.mid_res2.apply(&x, h, w);
+        let mut x = stage!("conv_in", self.conv_in.apply(&z, h, w));
+        x = stage!("mid_res1", self.mid_res1.apply(&x, h, w));
+        x = stage!("mid_attn", self.mid_attn.apply(&x, h, w));
+        x = stage!("mid_res2", self.mid_res2.apply(&x, h, w));
         let (mut h, mut w) = (h, w);
-        for up in &self.ups {
-            for r in &up.resnets {
-                x = r.apply(&x, h, w);
+        for (ui, up) in self.ups.iter().enumerate() {
+            for (ri, r) in up.resnets.iter().enumerate() {
+                x = stage!(format!("up{ui}.res{ri} ({h}x{w})"), r.apply(&x, h, w));
             }
             if let Some(upc) = &up.upsample {
                 let c = upc.ic;
                 x = upsample2x(&x, c, h, w);
                 h *= 2;
                 w *= 2;
-                x = upc.apply(&x, h, w);
+                x = stage!(format!("up{ui}.conv ({h}x{w})"), upc.apply(&x, h, w));
             }
         }
         self.norm_out.apply(&mut x, h, w);
         silu(&mut x);
-        self.conv_out.apply(&x, h, w)
+        stage!("conv_out", self.conv_out.apply(&x, h, w))
     }
 }
 

@@ -22,6 +22,7 @@ pub mod runtime;
 pub mod sampler;
 pub mod skillbake;
 pub mod swarm;
+pub mod textenc;
 pub mod tokenizer;
 pub mod vae;
 

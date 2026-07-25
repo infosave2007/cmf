@@ -44,3 +44,30 @@ fn vae_decoder_matches_numpy_reference() {
         "VAE decoder ≠ numpy reference: max|Δ| = {max_d}"
     );
 }
+
+/// Speed at real sizes (no reference — timing + range sanity).
+///     CMF_VAE_DIR=... cargo test --release --test vae_parity vae_decode_speed -- --ignored --nocapture
+#[test]
+#[ignore]
+fn vae_decode_speed() {
+    let Ok(dir) = std::env::var("CMF_VAE_DIR") else {
+        eprintln!("CMF_VAE_DIR not set");
+        return;
+    };
+    let dec = cortiq_engine::vae::VaeDecoder::load_dir(Path::new(&dir)).expect("load VAE");
+    for hw in [64usize, 128] {
+        let z: Vec<f32> = (0..dec.latent_channels * hw * hw)
+            .map(|i| ((i * 2654435761usize) as f32 / usize::MAX as f32 - 0.5) * 2.0)
+            .collect();
+        let t0 = std::time::Instant::now();
+        let img = dec.decode(&z, hw, hw);
+        let (mn, mx) = img
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+        println!(
+            "decode {hw}x{hw} -> {}px: {:.2}s (range [{mn:.2}, {mx:.2}])",
+            hw * 8,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+}

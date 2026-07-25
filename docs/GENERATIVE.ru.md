@@ -56,7 +56,16 @@ Gemma-2-2B (декодер-онли LLM — наш стек), FLUX-VAE (Apache �
   diffusers `vae/`; паритет с numpy-референсом (`python/vae_ref.py`,
   `tests/vae_parity.rs`) на реальных весах: max|Δ| = 6.6e-6.
   Ядра пока наивные (8×8 латент → 64×64 за 4.3 с) — im2col+GEMM позже.
-- [ ] Gemma-2-2B forward (encoder-режим, hidden states промпта)
+- [x] **Gemma-2-2B forward** (`textenc.rs`): полный форвард энкодера
+  (embed·√h, (1+w)-RMSNorm, сэндвич-нормы, GQA + softcapping, GeGLU),
+  проекции батчами через GEMM; паритет с numpy-референсом
+  (`python/gemma_ref.py`) на весах Lumina: rel max|Δ| = 1.4e-4;
+  тёплый encode 8 токенов — 0.29 с (холодный 15 с = пейдж-ин 10.4 ГБ
+  f32 — решается квантованной упаковкой в CMF).
+- [x] Скорость VAE, раунд 1: conv → полосный im2col + gemm_nt
+  (Accelerate/AMX), attention mid-блока на GEMM: крошечный декод ×29
+  (4.3 → 0.15 с); 512px — 8.1 с, 1024px — 36 с на CPU M4 (стены — формы
+  GEMM и поэлементные проходы; следующий большой шаг — Metal).
 - [ ] Next-DiT блок + flow-matching цикл (timestep, AdaLN)
 - [ ] Конвертер: три компонента → один .cmf
 - [ ] Скорость: conv через наши GEMM, GPU-графы для DiT-шага
