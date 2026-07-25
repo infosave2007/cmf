@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.20] — 2026-07-25
+
+### Fixed
+- **Mobile GPU ~75× slower than the CPU**: 0.5.19 made the wgpu
+  whole-token graph both correct and default-on everywhere, but tiled
+  mobile GPUs (Adreno/Mali) drain their pipeline at every barrier and
+  the ~300-dispatch graph collapsed to ~0.2 tok/s. The graph now **races
+  the normal path** on integrated adapters at generation granularity:
+  generations alternate arms, per-token wall times accumulate, and the
+  faster side wins for the process — a fast phone GPU keeps the graph, a
+  slow one costs a single discarded token (the first graph token bails
+  immediately when it is already >4× the measured CPU pace). Discrete
+  adapters and GDN hybrids trust the graph as before;
+  `CMF_GPU_WGPU_GRAPH=1/0` still forces either way.
+
 ## [0.5.19] — 2026-07-25
 
 ### Fixed
