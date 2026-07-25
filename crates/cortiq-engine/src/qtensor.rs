@@ -302,6 +302,7 @@ impl QTensor {
                     TensorDtype::Q1
                     | TensorDtype::Q1T
                     | TensorDtype::Q4Block
+                    | TensorDtype::Q4Tiled
                     | TensorDtype::Q8Row
                     | TensorDtype::Q8_2f,
                 rows,
@@ -375,12 +376,16 @@ impl QTensor {
                 dtype: TensorDtype::Q1,
                 ..
             } => Some((model, *idx, 1, &[])),
+            // Q4Tiled is kind 5, NOT 2: both carried 2 historically, and
+            // the wgpu token graph fed 18B interleaved tiles to the
+            // split-layout q4b kernel — garbage output on q4t models
+            // (caught by an end-to-end answer check on real Vulkan).
             Self::Mapped {
                 model,
                 idx,
                 dtype: TensorDtype::Q4Tiled,
                 ..
-            } => Some((model, *idx, 2, &[])),
+            } => Some((model, *idx, 5, &[])),
             Self::Mapped {
                 model,
                 idx,
@@ -940,12 +945,12 @@ impl QTensor {
                     return;
                 }
                 if *dtype == TensorDtype::Q1T {
-                    // No fused ternary pair kernel; the two passes are still
-                    // the fused decode+dot each. (Q1T lacks a row_scale array —
-                    // scales live inline in the tiles — so it must not fall
-                    // through to the q8 qmatvec2 below.)
-                    q1t_matvec(self.quant_bytes(), x1, *rows, *cols, o1, pool);
-                    q1t_matvec(self.quant_bytes(), x2, *rows, *cols, o2, pool);
+                    // Fused ternary pair: one row pass, the register
+                    // unpack shared across both streams on ARM. (Q1T
+                    // lacks a row_scale array — scales live inline in
+                    // the tiles — so it must not fall through to the
+                    // q8 qmatvec2 below.)
+                    q1t_matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
                     return;
                 }
                 if matches!(dtype, TensorDtype::Vbit | TensorDtype::VbitRo) {
@@ -1816,6 +1821,40 @@ impl QTensor {
                                 up_s[(flat / GROUP_SIZE) * 2 + 1],
                             ]));
                             uv += ((un as i32 - 8) as f32) * usc * xv;
+                        }
+                        let silu_g = gv / (1.0 + (-gv).exp());
+                        // SAFETY: disjoint row ranges per worker.
+                        unsafe { *out_addr.at(r) = silu_g * uv };
+                    }
+                };
+                dispatch_rows(pool, inter, &run);
+                true
+            }
+            // Q4Tiled gate + Q4Tiled up — one row pass, both tile
+            // streams sequential, silu·mul fused (same per-row math as
+            // `q4t_matvec`).
+            (
+                Self::Mapped {
+                    dtype: TensorDtype::Q4Tiled,
+                    ..
+                },
+                Self::Mapped {
+                    dtype: TensorDtype::Q4Tiled,
+                    ..
+                },
+            ) => {
+                let g_bytes = gate.quant_bytes();
+                let u_bytes = up.quant_bytes();
+                let gpr = gate.cols() / GROUP_SIZE;
+                let run = move |start: usize, end: usize| {
+                    for r in start..end {
+                        let mut gv = dot_q4t_row_i8(g_bytes, r, gpr, &act.xq) * act.sx;
+                        let mut uv = dot_q4t_row_i8(u_bytes, r, gpr, &act.xq) * act.sx;
+                        for &(j, xv) in &act.outliers {
+                            let (w, s) = q4t_outlier(g_bytes, r, gpr, j);
+                            gv += w * s * xv;
+                            let (w, s) = q4t_outlier(u_bytes, r, gpr, j);
+                            uv += w * s * xv;
                         }
                         let silu_g = gv / (1.0 + (-gv).exp());
                         // SAFETY: disjoint row ranges per worker.
@@ -2903,6 +2942,9 @@ fn dot_q4t_row_i8(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
+        if vnni_tiles_enabled() {
+            return dot_q4t_row_vnni(bytes, r, gpr, xq);
+        }
         return dot_q4t_row_avx2(bytes, r, gpr, xq);
     }
     let mut acc = 0f32;
@@ -2987,6 +3029,36 @@ unsafe fn dot_q4t_row_avx2(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32
     }
 }
 
+/// VNNI twin of `dot_q4t_row_avx2`: same unpack, `vpdpbusd` replaces
+/// the maddubs+madd pair (see `dpbusd_hsum` — sums are bit-identical).
+/// 256-bit VL encoding, so the VEX `vpsignb` stays usable.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn dot_q4t_row_vnni(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
+    // SAFETY: see dot_q4t_row_sdot.
+    unsafe {
+        use core::arch::x86_64::*;
+        let lomask = _mm_set1_epi8(0x0F);
+        let eight = _mm256_set1_epi8(8);
+        let mut acc = 0f32;
+        for gi in 0..gpr {
+            let t = bytes.as_ptr().add((r * gpr + gi) * Q4_TILE);
+            let s = f16_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
+            let b = _mm_loadu_si128(t.add(2) as *const __m128i);
+            let lo = _mm_and_si128(b, lomask);
+            let hi = _mm_and_si128(_mm_srli_epi16::<4>(b), lomask);
+            let w = _mm256_sub_epi8(
+                _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi)),
+                eight,
+            );
+            let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+            let d = dpbusd_hsum(_mm256_abs_epi8(w), _mm256_sign_epi8(x, w));
+            acc += d as f32 * s;
+        }
+        acc
+    }
+}
+
 /// One q4_tiled row against FOUR activation streams: the nibble unpack
 /// and abs() happen once per group instead of once per (group,
 /// activation) — the unpack is the dominant per-element cost of the
@@ -3021,6 +3093,77 @@ unsafe fn dot_q4t_row_1x4_avx2(bytes: &[u8], r: usize, gpr: usize, xs: [&[i8]; 4
                 let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
                 let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
                 acc[k] += _mm_cvtsi128_si32(s32) as f32 * s;
+            }
+        }
+        acc
+    }
+}
+
+/// VNNI twin of `dot_q4t_row_1x4_avx2` (see `dpbusd_hsum`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn dot_q4t_row_1x4_vnni(bytes: &[u8], r: usize, gpr: usize, xs: [&[i8]; 4]) -> [f32; 4] {
+    // SAFETY: callers uphold the 18B-tile and xq-length contracts.
+    unsafe {
+        use core::arch::x86_64::*;
+        let lomask = _mm_set1_epi8(0x0F);
+        let eight = _mm256_set1_epi8(8);
+        let mut acc = [0f32; 4];
+        for gi in 0..gpr {
+            let t = bytes.as_ptr().add((r * gpr + gi) * Q4_TILE);
+            let s = f16_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
+            let bb = _mm_loadu_si128(t.add(2) as *const __m128i);
+            let lo = _mm_and_si128(bb, lomask);
+            let hi = _mm_and_si128(_mm_srli_epi16::<4>(bb), lomask);
+            let w = _mm256_sub_epi8(
+                _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi)),
+                eight,
+            );
+            let aw = _mm256_abs_epi8(w);
+            for (k, xq) in xs.iter().enumerate() {
+                let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+                let d = dpbusd_hsum(aw, _mm256_sign_epi8(x, w));
+                acc[k] += d as f32 * s;
+            }
+        }
+        acc
+    }
+}
+
+/// ARM twin of `dot_q4t_row_1x4_avx2`: one nibble unpack per group
+/// serves FOUR activation streams. Per stream the group order and f32
+/// accumulation match `dot_q4t_row_sdot` exactly — batch == matvec
+/// bit-for-bit.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn dot_q4t_row_1x4_sdot(bytes: &[u8], r: usize, gpr: usize, xs: [&[i8]; 4]) -> [f32; 4] {
+    // SAFETY: callers uphold the 18B-tile and xq-length contracts.
+    unsafe {
+        use core::arch::aarch64::*;
+        use core::arch::asm;
+        let lomask = vdupq_n_u8(0x0F);
+        let eight = vdupq_n_s8(8);
+        let mut acc = [0f32; 4];
+        for gi in 0..gpr {
+            let t = bytes.as_ptr().add((r * gpr + gi) * Q4_TILE);
+            let s = f16_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
+            let b = vld1q_u8(t.add(2));
+            let lo = vandq_u8(b, lomask);
+            let hi = vshrq_n_u8::<4>(b);
+            let e0 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(lo, hi)), eight);
+            let e1 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(lo, hi)), eight);
+            for (k, xq) in xs.iter().enumerate() {
+                let x0 = vld1q_s8(xq.as_ptr().add(gi * GROUP_SIZE));
+                let x1 = vld1q_s8(xq.as_ptr().add(gi * GROUP_SIZE + 16));
+                let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+                asm!(
+                    "sdot {a0:v}.4s, {e0:v}.16b, {x0:v}.16b",
+                    "sdot {a1:v}.4s, {e1:v}.16b, {x1:v}.16b",
+                    a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                    e0 = in(vreg) e0, x0 = in(vreg) x0, e1 = in(vreg) e1, x1 = in(vreg) x1,
+                    options(pure, nomem, nostack),
+                );
+                acc[k] += vaddvq_s32(vaddq_s32(a0, a1)) as f32 * s;
             }
         }
         acc
@@ -3171,11 +3314,39 @@ fn q4t_matmat(
             && std::env::var("CMF_X86_BLOCKED")
                 .map(|v| v != "0")
                 .unwrap_or(true);
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        let blocked_ok = sdot_enabled()
+            && std::env::var("CMF_X86_BLOCKED")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let blocked_ok = false;
         let run = move |start: usize, end: usize| {
             for r in start..end {
                 let mut bi = 0usize;
+                #[cfg(target_arch = "aarch64")]
+                if blocked_ok {
+                    while bi + 4 <= acts.len() {
+                        let xs = [
+                            acts[bi].xq.as_slice(),
+                            acts[bi + 1].xq.as_slice(),
+                            acts[bi + 2].xq.as_slice(),
+                            acts[bi + 3].xq.as_slice(),
+                        ];
+                        let d = unsafe { dot_q4t_row_1x4_sdot(bytes, r, gpr, xs) };
+                        for k in 0..4 {
+                            let act = &acts[bi + k];
+                            let mut acc = d[k] * act.sx;
+                            for &(j, xv) in &act.outliers {
+                                let (w, sc) = q4t_outlier(bytes, r, gpr, j);
+                                acc += w * sc * xv;
+                            }
+                            // SAFETY: disjoint (bi, r) cells per worker.
+                            unsafe { *out_addr.at((bi + k) * rows + r) = acc };
+                        }
+                        bi += 4;
+                    }
+                }
                 #[cfg(target_arch = "x86_64")]
                 if blocked_ok {
                     while bi + 4 <= acts.len() {
@@ -3185,7 +3356,13 @@ fn q4t_matmat(
                             acts[bi + 2].xq.as_slice(),
                             acts[bi + 3].xq.as_slice(),
                         ];
-                        let d = unsafe { dot_q4t_row_1x4_avx2(bytes, r, gpr, xs) };
+                        let d = unsafe {
+                            if vnni_tiles_enabled() {
+                                dot_q4t_row_1x4_vnni(bytes, r, gpr, xs)
+                            } else {
+                                dot_q4t_row_1x4_avx2(bytes, r, gpr, xs)
+                            }
+                        };
                         for k in 0..4 {
                             let act = &acts[bi + k];
                             let mut acc = d[k] * act.sx;
@@ -3299,6 +3476,79 @@ unsafe fn dot_q1_row_avx2(bytes: &[u8], r: usize, gpr: usize, xq: &[i8], gsum: &
     }
 }
 
+/// VNNI twin of `dot_q1_row_avx2`: the masked-select sum goes through
+/// one `vpdpbusd(1u8, sel)` (see `dpbusd_hsum` — bit-identical).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn dot_q1_row_vnni(bytes: &[u8], r: usize, gpr: usize, xq: &[i8], gsum: &[i32]) -> f32 {
+    // SAFETY: callers uphold the 6B-tile and xq/gsum length contracts.
+    unsafe {
+        use core::arch::x86_64::*;
+        let expand = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
+        );
+        let bitsel = _mm256_setr_epi8(
+            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64,
+            -128, 1, 2, 4, 8, 16, 32, 64, -128,
+        );
+        let ones8 = _mm256_set1_epi8(1);
+        let mut acc = 0f32;
+        for gi in 0..gpr {
+            let t = bytes.as_ptr().add((r * gpr + gi) * Q1_TILE);
+            let s = f16_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
+            let bits = u32::from_le_bytes([*t.add(2), *t.add(3), *t.add(4), *t.add(5)]);
+            let bc = _mm256_shuffle_epi8(_mm256_set1_epi32(bits as i32), expand);
+            let mask = _mm256_cmpeq_epi8(_mm256_and_si256(bc, bitsel), bitsel);
+            let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+            let msum = dpbusd_hsum(ones8, _mm256_and_si256(x, mask));
+            let d = 2 * msum - gsum[gi];
+            acc += d as f32 * s;
+        }
+        acc
+    }
+}
+
+/// VNNI twin of `dot_q1_row_1x4_avx2` (see `dpbusd_hsum`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn dot_q1_row_1x4_vnni(
+    bytes: &[u8],
+    r: usize,
+    gpr: usize,
+    xs: [&[i8]; 4],
+    gsums: [&[i32]; 4],
+) -> [f32; 4] {
+    // SAFETY: callers uphold the 6B-tile and xq/gsum length contracts.
+    unsafe {
+        use core::arch::x86_64::*;
+        let expand = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
+        );
+        let bitsel = _mm256_setr_epi8(
+            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64,
+            -128, 1, 2, 4, 8, 16, 32, 64, -128,
+        );
+        let ones8 = _mm256_set1_epi8(1);
+        let mut acc = [0f32; 4];
+        for gi in 0..gpr {
+            let t = bytes.as_ptr().add((r * gpr + gi) * Q1_TILE);
+            let s = f16_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
+            let bits = u32::from_le_bytes([*t.add(2), *t.add(3), *t.add(4), *t.add(5)]);
+            let bc = _mm256_shuffle_epi8(_mm256_set1_epi32(bits as i32), expand);
+            let mask = _mm256_cmpeq_epi8(_mm256_and_si256(bc, bitsel), bitsel);
+            for (k, xq) in xs.iter().enumerate() {
+                let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+                let msum = dpbusd_hsum(ones8, _mm256_and_si256(x, mask));
+                let d = 2 * msum - gsums[k][gi];
+                acc[k] += d as f32 * s;
+            }
+        }
+        acc
+    }
+}
+
 /// The blocked 1×4 flavor: the expanded bit mask serves four activation
 /// streams per group (mask build once, four select+reduce chains).
 #[cfg(target_arch = "x86_64")]
@@ -3357,6 +3607,9 @@ fn dot_q1_row_i8(bytes: &[u8], r: usize, gpr: usize, xq: &[i8], gsum: &[i32]) ->
     #[cfg(target_arch = "x86_64")]
     if avx2_enabled() {
         unsafe {
+            if vnni_tiles_enabled() {
+                return dot_q1_row_vnni(bytes, r, gpr, xq, gsum);
+            }
             return dot_q1_row_avx2(bytes, r, gpr, xq, gsum);
         }
     }
@@ -4003,6 +4256,34 @@ unsafe fn q1t_dot_row_avx2(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32
     }
 }
 
+/// VNNI twin of `q1t_dot_row_avx2` (see `dpbusd_hsum`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn q1t_dot_row_vnni(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
+    use core::arch::x86_64::*;
+    // SAFETY: same tile/xq contracts as `q1t_dot_row_avx2`.
+    unsafe {
+        const TILE: usize = cortiq_core::quant::Q1T_TILE;
+        let mut acc = 0f32;
+        let bytes_ptr = bytes.as_ptr();
+        let xq_ptr = xq.as_ptr();
+        let row_off = r * gpr * TILE;
+        for gi in 0..gpr {
+            let off = row_off + gi * TILE;
+            let s = f16_to_f32(u16::from_le_bytes([
+                *bytes_ptr.add(off),
+                *bytes_ptr.add(off + 1),
+            ]));
+            let (u0, u1, u2, u3) = q1t_unpack_reg_u64s(bytes_ptr.add(off + 2));
+            let wv = _mm256_set_epi64x(u3 as i64, u2 as i64, u1 as i64, u0 as i64);
+            let xv = _mm256_loadu_si256(xq_ptr.add(gi * GROUP_SIZE) as *const __m256i);
+            let d = dpbusd_hsum(_mm256_abs_epi8(wv), _mm256_sign_epi8(xv, wv));
+            acc += d as f32 * s;
+        }
+        acc
+    }
+}
+
 /// Per-row int8 base dot, dispatched once per row (matvec decode hot path).
 /// Callers are gated by `a8w8_enabled()`, so the target-feature kernels are
 /// reachable.
@@ -4014,6 +4295,9 @@ fn q1t_dot_row_i8(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32 {
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
+        if vnni_tiles_enabled() {
+            return q1t_dot_row_vnni(bytes, r, gpr, xq);
+        }
         return q1t_dot_row_avx2(bytes, r, gpr, xq);
     }
     #[allow(unreachable_code)]
@@ -4267,6 +4551,181 @@ fn q1t_matvec(
             }
             acc += q1t_row_outlier_correction(bytes, r, rp_off, ent_off, has_ov, x);
             unsafe { *out_addr.at(r) = acc };
+        }
+    };
+    dispatch_rows(pool, rows, &run);
+}
+
+/// Fused-pair twin of `q1t_dot_row_sdot`: ONE register unpack of the
+/// ternary codes serves BOTH activation streams (the unpack chain is
+/// the dominant per-row cost — MTP verify pairs paid it twice). Per
+/// stream the group order and f32 accumulation match the single-row
+/// kernel exactly, so pair == 2×matvec bit-for-bit.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn q1t_dot_row_sdot2(bytes: &[u8], r: usize, gpr: usize, xa: &[i8], xb: &[i8]) -> [f32; 2] {
+    use core::arch::aarch64::*;
+    use core::arch::asm;
+    // SAFETY: same slice-length contracts as `q1t_dot_row_sdot`, ×2.
+    unsafe {
+        const TILE: usize = cortiq_core::quant::Q1T_TILE;
+        let bytes_ptr = bytes.as_ptr();
+        let row_off = r * gpr * TILE;
+        let xp = [xa.as_ptr(), xb.as_ptr()];
+        let mut acc = [0f32; 2];
+        macro_rules! sdot2 {
+            ($w0:expr, $w1:expr, $x:expr) => {{
+                let x0 = vld1q_s8($x);
+                let x1 = vld1q_s8($x.add(16));
+                let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+                asm!(
+                    "sdot {a0:v}.4s, {w0:v}.16b, {x0:v}.16b",
+                    "sdot {a1:v}.4s, {w1:v}.16b, {x1:v}.16b",
+                    a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                    w0 = in(vreg) $w0, x0 = in(vreg) x0, w1 = in(vreg) $w1, x1 = in(vreg) x1,
+                    options(pure, nomem, nostack),
+                );
+                vaddvq_s32(vaddq_s32(a0, a1))
+            }};
+        }
+        let gpr2 = gpr & !1;
+        let mut gi = 0;
+        while gi < gpr2 {
+            let off0 = row_off + gi * TILE;
+            let off1 = off0 + TILE;
+            let s0 = f16_to_f32(u16::from_le_bytes([
+                *bytes_ptr.add(off0),
+                *bytes_ptr.add(off0 + 1),
+            ]));
+            let s1 = f16_to_f32(u16::from_le_bytes([
+                *bytes_ptr.add(off1),
+                *bytes_ptr.add(off1 + 1),
+            ]));
+            let (u0_0, u1_0, u2_0, u3_0) = q1t_unpack_reg_u64s(bytes_ptr.add(off0 + 2));
+            let (u0_1, u1_1, u2_1, u3_1) = q1t_unpack_reg_u64s(bytes_ptr.add(off1 + 2));
+            let w0_0 = vreinterpretq_s8_u64(vcombine_u64(vcreate_u64(u0_0), vcreate_u64(u1_0)));
+            let w1_0 = vreinterpretq_s8_u64(vcombine_u64(vcreate_u64(u2_0), vcreate_u64(u3_0)));
+            let w0_1 = vreinterpretq_s8_u64(vcombine_u64(vcreate_u64(u0_1), vcreate_u64(u1_1)));
+            let w1_1 = vreinterpretq_s8_u64(vcombine_u64(vcreate_u64(u2_1), vcreate_u64(u3_1)));
+            for k in 0..2 {
+                let d0 = sdot2!(w0_0, w1_0, xp[k].add(gi * GROUP_SIZE));
+                let d1 = sdot2!(w0_1, w1_1, xp[k].add((gi + 1) * GROUP_SIZE));
+                acc[k] += d0 as f32 * s0 + d1 as f32 * s1;
+            }
+            gi += 2;
+        }
+        if gi < gpr {
+            let off = row_off + gi * TILE;
+            let s = f16_to_f32(u16::from_le_bytes([
+                *bytes_ptr.add(off),
+                *bytes_ptr.add(off + 1),
+            ]));
+            let (u0, u1, u2, u3) = q1t_unpack_reg_u64s(bytes_ptr.add(off + 2));
+            let w0 = vreinterpretq_s8_u64(vcombine_u64(vcreate_u64(u0), vcreate_u64(u1)));
+            let w1 = vreinterpretq_s8_u64(vcombine_u64(vcreate_u64(u2), vcreate_u64(u3)));
+            for k in 0..2 {
+                let d = sdot2!(w0, w1, xp[k].add(gi * GROUP_SIZE));
+                acc[k] += d as f32 * s;
+            }
+        }
+        acc
+    }
+}
+
+/// Fused Q1T pair matvec: ONE pass over the rows serves both
+/// activation streams — on ARM the ternary register unpack happens
+/// once per tile pair (`q1t_dot_row_sdot2`); elsewhere the second dot
+/// rides the row's L1-warm tile bytes. Per stream the math matches
+/// `q1t_matvec` exactly.
+fn q1t_matvec2(
+    bytes: &[u8],
+    x1: &[f32],
+    x2: &[f32],
+    rows: usize,
+    cols: usize,
+    o1: &mut [f32],
+    o2: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    debug_assert_eq!(o1.len(), rows);
+    debug_assert_eq!(o2.len(), rows);
+    const TILE: usize = cortiq_core::quant::Q1T_TILE;
+    let gpr = cols / GROUP_SIZE;
+    let (rp_off, ent_off, has_ov) = q1t_overlay(bytes, rows * gpr * TILE, rows);
+    let out1 = SendMut(o1.as_mut_ptr());
+    let out2 = SendMut(o2.as_mut_ptr());
+    if a8w8_enabled() {
+        let a1 = split_act(x1);
+        let a2 = split_act(x2);
+        let (a1, a2) = (&a1, &a2);
+        let run = move |start: usize, end: usize| {
+            for r in start..end {
+                #[cfg(target_arch = "aarch64")]
+                // a8w8 on aarch64 ⇔ sdot_enabled(), so the kernel's
+                // target features are present.
+                let ds = unsafe { q1t_dot_row_sdot2(bytes, r, gpr, &a1.xq, &a2.xq) };
+                #[cfg(not(target_arch = "aarch64"))]
+                let ds = [
+                    q1t_dot_row_i8(bytes, r, gpr, &a1.xq),
+                    q1t_dot_row_i8(bytes, r, gpr, &a2.xq),
+                ];
+                let mut acc1 = ds[0] * a1.sx;
+                for &(j, xv) in &a1.outliers {
+                    acc1 += q1t_base_weight(bytes, r, gpr, j) * xv;
+                }
+                acc1 += q1t_row_outlier_correction(bytes, r, rp_off, ent_off, has_ov, x1);
+                let mut acc2 = ds[1] * a2.sx;
+                for &(j, xv) in &a2.outliers {
+                    acc2 += q1t_base_weight(bytes, r, gpr, j) * xv;
+                }
+                acc2 += q1t_row_outlier_correction(bytes, r, rp_off, ent_off, has_ov, x2);
+                // SAFETY: disjoint row ranges per worker.
+                unsafe {
+                    *out1.at(r) = acc1;
+                    *out2.at(r) = acc2;
+                }
+            }
+        };
+        dispatch_rows(pool, rows, &run);
+        return;
+    }
+    let run = move |start: usize, end: usize| {
+        // Exact path (CMF_SDOT=0): unpack the sign LUT once per group,
+        // dot both streams — same op order per stream as `q1t_matvec`.
+        let mut sg = [0f32; GROUP_SIZE];
+        for r in start..end {
+            let mut acc1 = 0f32;
+            let mut acc2 = 0f32;
+            for g in 0..gpr {
+                let off = (r * gpr + g) * TILE;
+                let s = f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+                let codes = &bytes[off + 2..off + TILE];
+                for bi in 0..6 {
+                    sg[bi * 5..bi * 5 + 5].copy_from_slice(&SIGN5[codes[bi] as usize]);
+                }
+                let lut = &SIGN5[codes[6] as usize];
+                sg[30] = lut[0];
+                sg[31] = lut[1];
+                let xg1 = &x1[g * GROUP_SIZE..g * GROUP_SIZE + GROUP_SIZE];
+                let xg2 = &x2[g * GROUP_SIZE..g * GROUP_SIZE + GROUP_SIZE];
+                let mut gsum1 = 0f32;
+                for k in 0..GROUP_SIZE {
+                    gsum1 += sg[k] * xg1[k];
+                }
+                acc1 += s * gsum1;
+                let mut gsum2 = 0f32;
+                for k in 0..GROUP_SIZE {
+                    gsum2 += sg[k] * xg2[k];
+                }
+                acc2 += s * gsum2;
+            }
+            acc1 += q1t_row_outlier_correction(bytes, r, rp_off, ent_off, has_ov, x1);
+            acc2 += q1t_row_outlier_correction(bytes, r, rp_off, ent_off, has_ov, x2);
+            // SAFETY: disjoint row ranges per worker.
+            unsafe {
+                *out1.at(r) = acc1;
+                *out2.at(r) = acc2;
+            }
         }
     };
     dispatch_rows(pool, rows, &run);
@@ -4529,7 +4988,13 @@ fn q1_matmat(
                             acts[bi + 2].1.as_slice(),
                             acts[bi + 3].1.as_slice(),
                         ];
-                        let d = unsafe { dot_q1_row_1x4_avx2(bytes, r, gpr, xs, gs) };
+                        let d = unsafe {
+                            if vnni_tiles_enabled() {
+                                dot_q1_row_1x4_vnni(bytes, r, gpr, xs, gs)
+                            } else {
+                                dot_q1_row_1x4_avx2(bytes, r, gpr, xs, gs)
+                            }
+                        };
                         for k in 0..4 {
                             let (act, _) = &acts[bi + k];
                             let mut acc = d[k] * act.sx;
@@ -4647,6 +5112,37 @@ unsafe fn dot_q4b_row_1x4_avx2(
     }
 }
 
+/// VNNI twin of `dot_q4b_row_1x4_avx2` (see `dpbusd_hsum`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn dot_q4b_row_1x4_vnni(
+    buf: &[u8],
+    scales: &[u8],
+    g0: usize,
+    gpr: usize,
+    xs: [&[i8]; 4],
+) -> [f32; 4] {
+    // SAFETY: callers uphold buffer contracts (buf.len() == gpr·32).
+    unsafe {
+        use core::arch::x86_64::*;
+        let mut acc = [0f32; 4];
+        for gi in 0..gpr {
+            let s = f16_to_f32(u16::from_le_bytes([
+                scales[(g0 + gi) * 2],
+                scales[(g0 + gi) * 2 + 1],
+            ]));
+            let w = _mm256_loadu_si256(buf.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+            let aw = _mm256_abs_epi8(w);
+            for (k, xq) in xs.iter().enumerate() {
+                let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+                let d = dpbusd_hsum(aw, _mm256_sign_epi8(x, w));
+                acc[k] += d as f32 * s;
+            }
+        }
+        acc
+    }
+}
+
 /// The vbit flavor of the blocked 1×4: the per-activation A8W8 scale
 /// folds in PER GROUP as `(d·sx)·s` — bit-matching the single-matvec
 /// accumulation order (the q4_block flavor applies sx once at the end,
@@ -4683,6 +5179,39 @@ unsafe fn dot_q4b_row_1x4_sx_avx2(
                 let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
                 let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
                 acc[k] += (_mm_cvtsi128_si32(s32) as f32 * sxs[k]) * s;
+            }
+        }
+        acc
+    }
+}
+
+/// VNNI twin of `dot_q4b_row_1x4_sx_avx2` (see `dpbusd_hsum`; the
+/// per-group `(d·sx)·s` fold mirrors the vbit single path).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn dot_q4b_row_1x4_sx_vnni(
+    buf: &[u8],
+    scales: &[u8],
+    g0: usize,
+    gpr: usize,
+    xs: [&[i8]; 4],
+    sxs: [f32; 4],
+) -> [f32; 4] {
+    // SAFETY: callers uphold buffer contracts (buf.len() == gpr·32).
+    unsafe {
+        use core::arch::x86_64::*;
+        let mut acc = [0f32; 4];
+        for gi in 0..gpr {
+            let s = f16_to_f32(u16::from_le_bytes([
+                scales[(g0 + gi) * 2],
+                scales[(g0 + gi) * 2 + 1],
+            ]));
+            let w = _mm256_loadu_si256(buf.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+            let aw = _mm256_abs_epi8(w);
+            for (k, xq) in xs.iter().enumerate() {
+                let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+                let d = dpbusd_hsum(aw, _mm256_sign_epi8(x, w));
+                acc[k] += (d as f32 * sxs[k]) * s;
             }
         }
         acc
@@ -4990,7 +5519,13 @@ fn q4matmat(
                                 acts[bi + 2].xq.as_slice(),
                                 acts[bi + 3].xq.as_slice(),
                             ];
-                            let d = unsafe { dot_q4b_row_1x4_avx2(&buf, scales, r * gpr, gpr, xs) };
+                            let d = unsafe {
+                                if vnni_tiles_enabled() {
+                                    dot_q4b_row_1x4_vnni(&buf, scales, r * gpr, gpr, xs)
+                                } else {
+                                    dot_q4b_row_1x4_avx2(&buf, scales, r * gpr, gpr, xs)
+                                }
+                            };
                             for k in 0..4 {
                                 let act = &acts[bi + k];
                                 let mut acc = d[k] * act.sx;
@@ -5194,7 +5729,25 @@ fn vbitmatmat(
                                 acts[bi + 3].sx,
                             ];
                             let d = unsafe {
-                                dot_q4b_row_1x4_sx_avx2(&buf, &bytes[sc_off..], r * ng, ng, xs, sxs)
+                                if vnni_tiles_enabled() {
+                                    dot_q4b_row_1x4_sx_vnni(
+                                        &buf,
+                                        &bytes[sc_off..],
+                                        r * ng,
+                                        ng,
+                                        xs,
+                                        sxs,
+                                    )
+                                } else {
+                                    dot_q4b_row_1x4_sx_avx2(
+                                        &buf,
+                                        &bytes[sc_off..],
+                                        r * ng,
+                                        ng,
+                                        xs,
+                                        sxs,
+                                    )
+                                }
                             };
                             for k in 0..4 {
                                 let act = &acts[bi + k];
@@ -5442,6 +5995,45 @@ fn avx512vnni_enabled() -> bool {
             && std::arch::is_x86_feature_detected!("avx512vl")
             && std::arch::is_x86_feature_detected!("avx512vnni")
     })
+}
+
+/// Grouped-codec VNNI arms (the q4t/q4b/q1/q1t tile kernels): default
+/// ON where AVX-512 VNNI exists (`CMF_VNNI_TILES=0` opt-out). Measured
+/// on Ryzen 7950X (Zen4, 3 alternating process pairs, blocked GEMM
+/// 4864×896 b=256): q4t 63→68 GF/s (+8%), q1 53→56 (+6%), q4b 72→75
+/// (+4%) — consistent, no leg regressed. The tile kernels keep a
+/// horizontal reduce per 32-weight group, so the `vpdpbusd` saving is
+/// smaller than the long-dot q8 win (+13%), but it is real and free.
+#[cfg(target_arch = "x86_64")]
+fn vnni_tiles_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CMF_VNNI_TILES")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+            && avx512vnni_enabled()
+    })
+}
+
+/// One 256-bit u8×i8 dot → i32 via `vpdpbusd` into a fresh accumulator
+/// plus the same horizontal reduce the AVX2 kernels use. Products are
+/// bounded (|w| ≤ 8 or ≤ 1), so maddubs never saturated — the i32 sum
+/// is bit-identical to the maddubs+madd pair it replaces.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+#[inline]
+unsafe fn dpbusd_hsum(aw: core::arch::x86_64::__m256i, xs: core::arch::x86_64::__m256i) -> i32 {
+    // SAFETY: pure register math.
+    unsafe {
+        use core::arch::x86_64::*;
+        let d = _mm256_dpbusd_epi32(_mm256_setzero_si256(), aw, xs);
+        let hi128 = _mm256_extracti128_si256::<1>(d);
+        let s128 = _mm_add_epi32(_mm256_castsi256_si128(d), hi128);
+        let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
+        let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
+        _mm_cvtsi128_si32(s32)
+    }
 }
 
 /// int8·int8 via AVX-512 VNNI: `vpdpbusd` fuses the maddubs+madd+add
@@ -7347,6 +7939,41 @@ mod tests {
         assert!(max_d < 1e-4, "vbit blocked ≠ per-row: max|Δ| = {max_d}");
     }
 
+    /// q4t blocked 1×4 (SDOT on ARM, AVX2 on x86) must equal the
+    /// per-row path exactly: same nibble unpack, same group order,
+    /// same f32 accumulation — batch == matvec bit-for-bit. b=9 covers
+    /// two full 1×4 blocks plus a remainder through the single-row
+    /// kernel. (Both paths produce identical output, so the shared
+    /// CMF_X86_BLOCKED env var racing with other tests cannot flip
+    /// the verdict — worst case both sides take the same path.)
+    #[test]
+    fn q4t_matmat_blocked_matches_per_row() {
+        let (rows, cols, b) = (16usize, 64usize, 9usize);
+        let gpr = cols / GROUP_SIZE;
+        let mut bytes = vec![0u8; rows * gpr * Q4_TILE];
+        for r in 0..rows {
+            for g in 0..gpr {
+                let t = (r * gpr + g) * Q4_TILE;
+                let sc = 0.02 + 0.001 * (r * gpr + g) as f32;
+                bytes[t..t + 2].copy_from_slice(&cortiq_core::quant::f32_to_f16(sc).to_le_bytes());
+                for k in 0..16 {
+                    bytes[t + 2 + k] = ((r * 31 + g * 7 + k * 13) % 251) as u8;
+                }
+            }
+        }
+        let x: Vec<f32> = (0..b * cols)
+            .map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5)
+            .collect();
+        let mut y_blk = vec![0f32; b * rows];
+        let mut y_row = vec![0f32; b * rows];
+        unsafe { std::env::set_var("CMF_X86_BLOCKED", "1") };
+        q4t_matmat(&bytes, &x, b, rows, cols, &mut y_blk, None);
+        unsafe { std::env::set_var("CMF_X86_BLOCKED", "0") };
+        q4t_matmat(&bytes, &x, b, rows, cols, &mut y_row, None);
+        unsafe { std::env::remove_var("CMF_X86_BLOCKED") };
+        assert_eq!(y_blk, y_row, "q4t blocked 1x4 ≠ per-row");
+    }
+
     #[test]
     fn q4matvec_matches_full_dequant() {
         let (rows, cols) = (8, 64);
@@ -7757,19 +8384,92 @@ mod tests {
             assert!((gm[r] - expect[r]).abs() < tol(expect[r]));
             assert!((gm[rows + r] - expect[r]).abs() < tol(expect[r]));
         }
-        // The fused-pair dispatch (matvec2) for Q1T routes to two q1t_matvec
-        // passes — same kernel, so both outputs equal the single-vec result.
-        // (Dispatch is covered end-to-end by the mixed-dtype bench; here we
-        // confirm the two-pass composition is output-identical.)
+        // Fused pair (q1t_matvec2) must equal two single matvecs
+        // bit-for-bit: same unpack, same group order, same f32
+        // accumulation per stream. Distinct x2 exercises both lanes.
+        let xb: Vec<f32> = (0..cols)
+            .map(|j| if j % 5 == 0 { -1.0 } else { 1.0 })
+            .collect();
+        let (mut s1, mut s2) = (vec![0f32; rows], vec![0f32; rows]);
+        q1t_matvec(&bytes, &x, rows, cols, &mut s1, None);
+        q1t_matvec(&bytes, &xb, rows, cols, &mut s2, None);
         let (mut p1, mut p2) = (vec![0f32; rows], vec![0f32; rows]);
-        q1t_matvec(&bytes, &x, rows, cols, &mut p1, None);
-        q1t_matvec(&bytes, &x, rows, cols, &mut p2, None);
+        q1t_matvec2(&bytes, &x, &xb, rows, cols, &mut p1, &mut p2, None);
+        assert_eq!(p1, s1, "q1t pair lane 1 ≠ single matvec");
+        assert_eq!(p2, s2, "q1t pair lane 2 ≠ single matvec");
+    }
+
+    /// Pair == 2×matvec with an ODD group count (the kernel's tail
+    /// group) and no overlay section.
+    #[test]
+    fn q1t_matvec2_odd_gpr_matches_singles() {
+        use cortiq_core::quant::{Q1T_TILE, f32_to_f16, q1t_pack};
+        let (rows, cols) = (5usize, 96usize); // gpr = 3 → paired + tail
+        let gpr = cols / GROUP_SIZE;
+        let mut bytes = Vec::with_capacity(rows * gpr * Q1T_TILE);
         for r in 0..rows {
-            assert!(
-                (p1[r] - expect[r]).abs() < tol(expect[r])
-                    && (p2[r] - expect[r]).abs() < tol(expect[r])
-            );
+            for g in 0..gpr {
+                bytes.extend_from_slice(&f32_to_f16(0.1 + 0.05 * (r + g) as f32).to_le_bytes());
+                let mut c = [0u8; 7];
+                for k in 0..GROUP_SIZE {
+                    q1t_pack(&mut c, k, ((k * 7 + r * 5 + g * 3) % 3) as u8);
+                }
+                bytes.extend_from_slice(&c);
+            }
         }
+        let x1: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.31).sin()).collect();
+        let x2: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.17).cos()).collect();
+        let (mut s1, mut s2) = (vec![0f32; rows], vec![0f32; rows]);
+        q1t_matvec(&bytes, &x1, rows, cols, &mut s1, None);
+        q1t_matvec(&bytes, &x2, rows, cols, &mut s2, None);
+        let (mut p1, mut p2) = (vec![0f32; rows], vec![0f32; rows]);
+        q1t_matvec2(&bytes, &x1, &x2, rows, cols, &mut p1, &mut p2, None);
+        assert_eq!(p1, s1, "odd-gpr pair lane 1 ≠ single");
+        assert_eq!(p2, s2, "odd-gpr pair lane 2 ≠ single");
+    }
+
+    // Speed A/B: fused pair (one unpack, two streams) vs two single
+    // matvecs. Single-threaded, FFN-sized, min-of paired in-process.
+    //   cargo test -p cortiq-engine --release q1t_matvec2_speed -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn q1t_matvec2_speed() {
+        use cortiq_core::quant::{Q1T_TILE, f32_to_f16, q1t_pack};
+        use std::time::Instant;
+        let (rows, cols) = (8192usize, 4096usize);
+        let gpr = cols / GROUP_SIZE;
+        let mut bytes = Vec::with_capacity(rows * gpr * Q1T_TILE);
+        for r in 0..rows {
+            for g in 0..gpr {
+                let s = 0.1 + ((r + g) % 7) as f32 * 0.01;
+                bytes.extend_from_slice(&f32_to_f16(s).to_le_bytes());
+                let mut c = [0u8; 7];
+                for k in 0..GROUP_SIZE {
+                    q1t_pack(&mut c, k, ((k * 7 + r + g) % 3) as u8);
+                }
+                bytes.extend_from_slice(&c);
+            }
+        }
+        let x1: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.31).sin()).collect();
+        let x2: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.17).cos()).collect();
+        let (mut s1, mut s2) = (vec![0f32; rows], vec![0f32; rows]);
+        let (mut p1, mut p2) = (vec![0f32; rows], vec![0f32; rows]);
+        // Warm both paths once.
+        q1t_matvec(&bytes, &x1, rows, cols, &mut s1, None);
+        q1t_matvec2(&bytes, &x1, &x2, rows, cols, &mut p1, &mut p2, None);
+        let (mut t_pair, mut t_two) = (f64::MAX, f64::MAX);
+        for _ in 0..8 {
+            let t0 = Instant::now();
+            q1t_matvec2(&bytes, &x1, &x2, rows, cols, &mut p1, &mut p2, None);
+            t_pair = t_pair.min(t0.elapsed().as_secs_f64() * 1000.0);
+            let t1 = Instant::now();
+            q1t_matvec(&bytes, &x1, rows, cols, &mut s1, None);
+            q1t_matvec(&bytes, &x2, rows, cols, &mut s2, None);
+            t_two = t_two.min(t1.elapsed().as_secs_f64() * 1000.0);
+        }
+        assert_eq!(p1, s1);
+        assert_eq!(p2, s2);
+        println!("q1t pair {rows}x{cols}: fused {t_pair:.2} ms | two singles {t_two:.2} ms");
     }
 
     // Speed A/B: the base-3-division decode (what the packing commit left in

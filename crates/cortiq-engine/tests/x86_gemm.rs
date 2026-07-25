@@ -396,9 +396,10 @@ fn q4b_blocked_vs_per_row() {
 }
 
 /// Same paired A/B for the q4_tiled leg (unpack reuse across four
-/// activation streams).
+/// activation streams). Cross-arch since the ARM 1×4 SDOT twin: on
+/// aarch64 the blocked leg goes through `dot_q4t_row_1x4_sdot`.
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn q4t_blocked_vs_per_row() {
     let (rows, cols, b) = (4864usize, 896usize, 256usize);
     let gpr = cols / 32;
@@ -521,5 +522,144 @@ fn q4t_blocked_vs_per_row() {
         gflop / t_blk * 1e3,
         gflop / t_row * 1e3
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Fused q4t FFN mid (`matvec_silu_mul`) == composed
+/// silu(gate·x)·(up·x) through the same single-matvec kernels — plus a
+/// paired speed A/B (one row pass + no intermediate buffers vs two
+/// matvecs + a silu pass).
+#[test]
+fn q4t_silu_mul_fused_matches_composed() {
+    let (inter, cols) = (4864usize, 896usize);
+    let gpr = cols / 32;
+    let mk_payload = |seed: usize| -> Vec<u8> {
+        let mut p = vec![0u8; inter * gpr * 18];
+        for r in 0..inter {
+            for g in 0..gpr {
+                let t = (r * gpr + g) * 18;
+                p[t..t + 2].copy_from_slice(&f32_to_f16(0.02).to_le_bytes());
+                for k in 0..16 {
+                    p[t + 2 + k] = ((r * 31 + g * 7 + k * 13 + seed) % 251) as u8;
+                }
+            }
+        }
+        p
+    };
+    let arch = ModelArch {
+        arch_name: "tiny".into(),
+        hidden_size: cols,
+        intermediate_size: inter,
+        num_layers: 1,
+        num_attention_heads: 2,
+        num_kv_heads: 1,
+        head_dim: 4,
+        vocab_size: inter,
+        layer_types: vec![LayerType::FullAttention],
+        rms_norm_eps: 1e-6,
+        norm_style: NormStyle::Qwen,
+        rope_theta: 1e4,
+        tie_word_embeddings: false,
+        partial_rotary_factor: 1.0,
+        yarn: None,
+        attention_heads_per_layer: None,
+        local_partial_rotary_factor: None,
+        mtp: None,
+        moe: None,
+        linear_core: None,
+        max_position_embeddings: 8,
+        linear_conv_kernel_dim: None,
+        linear_num_key_heads: None,
+        linear_num_value_heads: None,
+        linear_key_head_dim: None,
+        linear_value_head_dim: None,
+        hidden_act: "silu".into(),
+        embed_multiplier: 1.0,
+        query_pre_attn_scalar: None,
+        sliding_window: None,
+        sliding_window_pattern: None,
+        rope_local_base_freq: None,
+        global_head_dim: None,
+        num_global_kv_heads: None,
+        global_partial_rotary_factor: None,
+        final_logit_softcapping: None,
+        attn_v_norm: false,
+        num_loops: 1,
+        loop_final_norm: false,
+    };
+    let header = CmfHeader {
+        format: "cmf".into(),
+        version: CMF_VERSION,
+        arch,
+        quant_type: QuantType::Q4Block,
+        provenance: None,
+        tokenizer_config: None,
+        section_hashes: None,
+        skills: Vec::new(),
+        shard: None,
+        calibration: None,
+    };
+    let specs = [
+        TensorSpec {
+            name: "g".into(),
+            dtype: TensorDtype::Q4Tiled,
+            shape: vec![inter, cols],
+            data: mk_payload(0),
+        },
+        TensorSpec {
+            name: "u".into(),
+            dtype: TensorDtype::Q4Tiled,
+            shape: vec![inter, cols],
+            data: mk_payload(97),
+        },
+    ];
+    let dir = std::env::temp_dir().join(format!("cmf-q4tsilu-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("m.cmf");
+    CmfModel::write(&path, &header, &specs, None, None).unwrap();
+    let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
+    let wrap = |name: &str| cortiq_engine::qtensor::QTensor::Mapped {
+        model: model.clone(),
+        idx: model.tensor_index(name).unwrap(),
+        dtype: TensorDtype::Q4Tiled,
+        rows: inter,
+        cols,
+        row_scale: Vec::new(),
+        col_field: Vec::new(),
+        vbit_offsets: Vec::new(),
+        repack: Vec::new(),
+    };
+    let (gate, up) = (wrap("g"), wrap("u"));
+    let x: Vec<f32> = (0..cols)
+        .map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5)
+        .collect();
+    let mut fused = vec![0f32; inter];
+    if !cortiq_engine::qtensor::QTensor::matvec_silu_mul(&gate, &up, &x, &mut fused, None) {
+        eprintln!("q4t silu fusion skipped: no A8W8 SIMD on this arch");
+        return;
+    }
+    let (mut gv, mut uv) = (vec![0f32; inter], vec![0f32; inter]);
+    gate.matvec(&x, &mut gv, None);
+    up.matvec(&x, &mut uv, None);
+    let composed: Vec<f32> = gv
+        .iter()
+        .zip(&uv)
+        .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
+        .collect();
+    assert_eq!(fused, composed, "fused q4t silu·mul ≠ composed");
+    let (mut t_f, mut t_c) = (f64::MAX, f64::MAX);
+    for _ in 0..6 {
+        let t0 = std::time::Instant::now();
+        let _ = cortiq_engine::qtensor::QTensor::matvec_silu_mul(&gate, &up, &x, &mut fused, None);
+        t_f = t_f.min(t0.elapsed().as_secs_f64() * 1000.0);
+        let t1 = std::time::Instant::now();
+        gate.matvec(&x, &mut gv, None);
+        up.matvec(&x, &mut uv, None);
+        for i in 0..inter {
+            fused[i] = gv[i] / (1.0 + (-gv[i]).exp()) * uv[i];
+        }
+        t_c = t_c.min(t1.elapsed().as_secs_f64() * 1000.0);
+    }
+    println!("q4t silu fusion {inter}x{cols}: fused {t_f:.2} ms | composed {t_c:.2} ms");
     std::fs::remove_dir_all(&dir).ok();
 }
