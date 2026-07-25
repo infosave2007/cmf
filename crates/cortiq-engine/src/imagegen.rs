@@ -89,9 +89,102 @@ fn gauss_latent(n: usize, seed: u64) -> Vec<f32> {
     out
 }
 
-/// Generate an RGB image `[3, height, width]` in [0, 1] from `root`
-/// (a diffusers Lumina-Image 2.0 directory: tokenizer/ text_encoder/
-/// transformer/ vae/). `progress` is called after every denoise step.
+/// (features, token count) of the conditional prompt plus the same
+/// pair for the "" uncond prompt when CFG runs.
+type CapFeats = (Vec<f32>, usize, Option<(Vec<f32>, usize)>);
+
+/// Prompt → caption features (cond + optional uncond) through Gemma;
+/// the encoder is dropped on return.
+fn encode_prompt(
+    tok: &Tokenizer,
+    enc: &GemmaEncoder,
+    prompt: &str,
+    p: &GenParams,
+    want_uncond: bool,
+) -> CapFeats {
+    let sys = p.system_prompt.as_deref().unwrap_or(DEFAULT_SYSTEM_PROMPT);
+    let full = format!("{sys} <Prompt Start> {prompt}");
+    let mut ids = tok.with_bos(tok.encode(&full));
+    ids.truncate(p.max_tokens);
+    // diffusers takes hidden_states[-2] — the stream entering the
+    // last layer.
+    let (_, streams) = enc.encode(&ids, true);
+    let cap = streams[streams.len() - 2].clone();
+    let cap_u = if want_uncond {
+        let uncond_ids = tok.with_bos(tok.encode(""));
+        let (_, s) = enc.encode(&uncond_ids, true);
+        Some((s[s.len() - 2].clone(), uncond_ids.len()))
+    } else {
+        None
+    };
+    (cap, ids.len(), cap_u)
+}
+
+/// The flow-matching Euler loop over the Next-DiT.
+#[allow(clippy::too_many_arguments)]
+fn denoise(
+    dit: &NextDit,
+    cap: &[f32],
+    cap_n: usize,
+    cap_u: Option<&(Vec<f32>, usize)>,
+    lh: usize,
+    lw: usize,
+    p: &GenParams,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Vec<f32> {
+    let mut latents = gauss_latent(dit.in_channels * lh * lw, p.seed);
+    let sg = sigmas(p.steps, 6.0);
+    for i in 0..p.steps {
+        let t = (1.0 - sg[i]) as f32;
+        let mut pred = dit.forward(&latents, lh, lw, cap, cap_n, t);
+        if let Some((cu, un)) = cap_u {
+            // CFG truncation: past the ratio only cond runs.
+            if (i + 1) as f32 / p.steps as f32 <= p.cfg_trunc_ratio {
+                let uncond = dit.forward(&latents, lh, lw, cu, *un, t);
+                let gs = p.guidance_scale;
+                let mut comb: Vec<f32> = uncond
+                    .iter()
+                    .zip(&pred)
+                    .map(|(&u, &c)| u + gs * (c - u))
+                    .collect();
+                if p.cfg_normalization {
+                    // ‖cond‖/‖comb‖ per row (last dim), as diffusers.
+                    for (cr, gr) in pred.chunks_exact(lw).zip(comb.chunks_exact_mut(lw)) {
+                        let cn = cr.iter().map(|&v| v * v).sum::<f32>().sqrt();
+                        let gn = gr.iter().map(|&v| v * v).sum::<f32>().sqrt();
+                        if gn > 0.0 {
+                            let f = cn / gn;
+                            for v in gr.iter_mut() {
+                                *v *= f;
+                            }
+                        }
+                    }
+                }
+                pred = comb;
+            }
+        }
+        // Lumina predicts toward the image (t=1); the scheduler
+        // steps σ→0, hence the sign flip: x += (σ₊ − σ)·(−pred).
+        let d = (sg[i + 1] - sg[i]) as f32;
+        for (x, &v) in latents.iter_mut().zip(&pred) {
+            *x -= d * v;
+        }
+        progress(i + 1, p.steps);
+    }
+    latents
+}
+
+fn to_rgb01(img: Vec<f32>) -> Vec<f32> {
+    img.iter()
+        .map(|&v| (v / 2.0 + 0.5).clamp(0.0, 1.0))
+        .collect()
+}
+
+/// Generate an RGB image `[3, height, width]` in [0, 1] from `root`:
+/// either a diffusers Lumina-Image 2.0 directory (tokenizer/
+/// text_encoder/ transformer/ vae/, exact f32) or a packaged .cmf
+/// file (`cortiq imagine-pack`, quantized + mmap). `progress` is
+/// called after every denoise step.
 pub fn generate(
     root: &Path,
     prompt: &str,
@@ -102,81 +195,41 @@ pub fn generate(
         return Err("height/width must be multiples of 16".into());
     }
     let (lh, lw) = (p.height / 8, p.width / 8);
-    let cfg = p.guidance_scale > 1.0;
+    let want_uncond = p.guidance_scale > 1.0;
 
-    // ── stage 1: prompt → caption features (Gemma dropped after) ──
+    if root.is_file() {
+        // ── packaged .cmf: one mmap, components stay quantized ──
+        let model = std::sync::Arc::new(
+            cortiq_core::CmfModel::open(root).map_err(|e| format!("{}: {e}", root.display()))?,
+        );
+        let vocab = model
+            .vocab
+            .as_deref()
+            .ok_or("packaged .cmf has no embedded tokenizer")?;
+        let tok = Tokenizer::from_bytes(vocab).map_err(|e| format!("tokenizer: {e}"))?;
+        let (cap, cap_n, cap_u) = {
+            let enc = GemmaEncoder::from_cmf(&model)?;
+            encode_prompt(&tok, &enc, prompt, p, want_uncond)
+        };
+        let latents = {
+            let dit = NextDit::from_cmf(&model)?;
+            denoise(&dit, &cap, cap_n, cap_u.as_ref(), lh, lw, p, &mut progress)
+        };
+        let vae = VaeDecoder::from_cmf(&model)?;
+        return Ok(to_rgb01(vae.decode(&latents, lh, lw)));
+    }
+
+    // ── diffusers directory: exact f32, stages load-and-drop ──
     let tok = Tokenizer::from_file(root.join("tokenizer").join("tokenizer.json"))
         .map_err(|e| format!("tokenizer: {e}"))?;
-    let sys = p.system_prompt.as_deref().unwrap_or(DEFAULT_SYSTEM_PROMPT);
-    let full = format!("{sys} <Prompt Start> {prompt}");
-    let mut ids = tok.with_bos(tok.encode(&full));
-    ids.truncate(p.max_tokens);
-    let (cap, cap_u) = {
+    let (cap, cap_n, cap_u) = {
         let enc = GemmaEncoder::load_dir(&root.join("text_encoder"))?;
-        // diffusers takes hidden_states[-2] — the stream entering the
-        // last layer.
-        let (_, streams) = enc.encode(&ids, true);
-        let cap = streams[streams.len() - 2].clone();
-        let cap_u = if cfg {
-            let uncond_ids = tok.with_bos(tok.encode(""));
-            let (_, s) = enc.encode(&uncond_ids, true);
-            Some((s[s.len() - 2].clone(), uncond_ids.len()))
-        } else {
-            None
-        };
-        (cap, cap_u)
+        encode_prompt(&tok, &enc, prompt, p, want_uncond)
     };
-
-    // ── stage 2: flow-matching Next-DiT loop ──
     let latents = {
         let dit = NextDit::load_dir(&root.join("transformer"))?;
-        let mut latents = gauss_latent(dit.in_channels * lh * lw, p.seed);
-        let sg = sigmas(p.steps, 6.0);
-        for i in 0..p.steps {
-            let t = (1.0 - sg[i]) as f32;
-            let mut pred = dit.forward(&latents, lh, lw, &cap, ids.len(), t);
-            if let Some((cu, un)) = &cap_u {
-                // CFG truncation: past the ratio only cond runs.
-                if (i + 1) as f32 / p.steps as f32 <= p.cfg_trunc_ratio {
-                    let uncond = dit.forward(&latents, lh, lw, cu, *un, t);
-                    let gs = p.guidance_scale;
-                    let mut comb: Vec<f32> = uncond
-                        .iter()
-                        .zip(&pred)
-                        .map(|(&u, &c)| u + gs * (c - u))
-                        .collect();
-                    if p.cfg_normalization {
-                        // ‖cond‖/‖comb‖ per row (last dim), as diffusers.
-                        for (cr, gr) in pred.chunks_exact(lw).zip(comb.chunks_exact_mut(lw)) {
-                            let cn = cr.iter().map(|&v| v * v).sum::<f32>().sqrt();
-                            let gn = gr.iter().map(|&v| v * v).sum::<f32>().sqrt();
-                            if gn > 0.0 {
-                                let f = cn / gn;
-                                for v in gr.iter_mut() {
-                                    *v *= f;
-                                }
-                            }
-                        }
-                    }
-                    pred = comb;
-                }
-            }
-            // Lumina predicts toward the image (t=1); the scheduler
-            // steps σ→0, hence the sign flip: x += (σ₊ − σ)·(−pred).
-            let d = (sg[i + 1] - sg[i]) as f32;
-            for (x, &v) in latents.iter_mut().zip(&pred) {
-                *x -= d * v;
-            }
-            progress(i + 1, p.steps);
-        }
-        latents
+        denoise(&dit, &cap, cap_n, cap_u.as_ref(), lh, lw, p, &mut progress)
     };
-
-    // ── stage 3: VAE decode (de-normalization happens inside) ──
     let vae = VaeDecoder::load_dir(&root.join("vae"))?;
-    let img = vae.decode(&latents, lh, lw);
-    Ok(img
-        .iter()
-        .map(|&v| (v / 2.0 + 0.5).clamp(0.0, 1.0))
-        .collect())
+    Ok(to_rgb01(vae.decode(&latents, lh, lw)))
 }

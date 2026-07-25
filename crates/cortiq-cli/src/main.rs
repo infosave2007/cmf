@@ -3,6 +3,7 @@
 mod convert;
 mod gguf;
 mod gptq;
+mod imagepack;
 mod npy;
 mod skill;
 
@@ -683,6 +684,20 @@ enum Commands {
         #[arg(long, default_value = "out.ppm")]
         out: String,
     },
+    /// Pack a Lumina-Image 2.0 diffusers directory into ONE quantized
+    /// .cmf (te.* + dit.* + vae.* + tokenizer) that `imagine` runs
+    /// straight off the mmap
+    ImaginePack {
+        /// Diffusers root (tokenizer/ text_encoder/ transformer/ vae/)
+        root: String,
+        /// Projection codec: q4t | q8 (modulation/embeddings stay q8,
+        /// VAE f16, norms f32)
+        #[arg(long, default_value = "q4t")]
+        quant: String,
+        /// Output .cmf path
+        #[arg(long)]
+        out: String,
+    },
 }
 
 /// Convert/import progress. `@PROGRESS <fraction>` is a marker for supervisors
@@ -1044,6 +1059,9 @@ async fn main() -> anyhow::Result<()> {
             seed,
             out,
         } => cmd_imagine(&model_dir, &prompt, height, width, steps, cfg, seed, &out),
+        Commands::ImaginePack { root, quant, out } => {
+            imagepack::cmd_imagine_pack(&root, &quant, &out)
+        }
         Commands::Explain { model, prompt, top } => cmd_explain(&model, &prompt, top),
         Commands::Calibrate {
             model,

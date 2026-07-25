@@ -3292,6 +3292,63 @@ fn q4t_matvec2(
 
 /// Batched q4_tiled matmat: each row's tiles stream once per microbatch.
 #[allow(clippy::too_many_arguments)]
+/// Prefill GEMM through Accelerate for group-quantized codecs: a
+/// caller-supplied row dequantizer fills f32 tiles (pool-parallel) and
+/// each tile rides the AMX with one sgemm — the generic sibling of
+/// `qmatmat_accel` (q8). Numerics are f32-GEMM (tolerance class);
+/// decode (b=1) never takes this path.
+#[cfg(target_os = "macos")]
+fn dequant_matmat_accel(
+    dequant_row: &(dyn Fn(usize, &mut [f32]) + Sync),
+    xs_all: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    const TR: usize = 2048;
+    thread_local! {
+        static WTILE: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    WTILE.with(|wt| {
+        let mut wtile = wt.borrow_mut();
+        wtile.resize(TR * cols, 0.0);
+        let mut r0 = 0usize;
+        while r0 < rows {
+            let tr = TR.min(rows - r0);
+            let wt_addr = SendMut(wtile.as_mut_ptr());
+            let run = |start: usize, end: usize| {
+                for r in start..end {
+                    // SAFETY: workers cover disjoint r ranges.
+                    let dst = unsafe { std::slice::from_raw_parts_mut(wt_addr.at(r * cols), cols) };
+                    dequant_row(r0 + r, dst);
+                }
+            };
+            dispatch_rows(pool, tr, &run);
+            unsafe {
+                accel_blas::cblas_sgemm(
+                    101, // RowMajor
+                    111, // NoTrans A
+                    112, // Trans B
+                    b as i32,
+                    tr as i32,
+                    cols as i32,
+                    1.0,
+                    xs_all.as_ptr(),
+                    cols as i32,
+                    wtile.as_ptr(),
+                    cols as i32,
+                    0.0,
+                    out.as_mut_ptr().add(r0),
+                    rows as i32,
+                );
+            }
+            r0 += tr;
+        }
+    });
+}
+
 fn q4t_matmat(
     bytes: &[u8],
     xs_all: &[f32],
@@ -3303,6 +3360,31 @@ fn q4t_matmat(
 ) {
     debug_assert_eq!(out.len(), b * rows);
     let gpr = cols / GROUP_SIZE;
+    // Wide batches ride the AMX like q8's qmatmat: on Apple silicon
+    // the dequant-tile sgemm is an order above the SDOT row loop for
+    // prefill shapes (imagegen DiT forwards are exactly this).
+    #[cfg(target_os = "macos")]
+    if b >= 8 && rows * cols >= 500_000 && accel_gemm_enabled() {
+        dequant_matmat_accel(
+            &|r, dst| {
+                for gi in 0..gpr {
+                    let tile = &bytes[(r * gpr + gi) * Q4_TILE..(r * gpr + gi + 1) * Q4_TILE];
+                    let s = f16_to_f32(u16::from_le_bytes([tile[0], tile[1]]));
+                    for (k, &bb) in tile[2..].iter().enumerate() {
+                        dst[gi * GROUP_SIZE + k * 2] = ((bb & 0x0F) as f32 - 8.0) * s;
+                        dst[gi * GROUP_SIZE + k * 2 + 1] = (((bb >> 4) & 0x0F) as f32 - 8.0) * s;
+                    }
+                }
+            },
+            xs_all,
+            b,
+            rows,
+            cols,
+            out,
+            pool,
+        );
+        return;
+    }
     let out_addr = SendMut(out.as_mut_ptr());
     if a8w8_enabled() {
         let acts: Vec<SplitAct> = (0..b)
@@ -7972,6 +8054,59 @@ mod tests {
         q4t_matmat(&bytes, &x, b, rows, cols, &mut y_row, None);
         unsafe { std::env::remove_var("CMF_X86_BLOCKED") };
         assert_eq!(y_blk, y_row, "q4t blocked 1x4 ≠ per-row");
+    }
+
+    /// The wide-batch Accelerate arm of q4t_matmat vs a brute-force
+    /// f32 dequant matmul: both are f32 GEMMs, so only reduction
+    /// order differs — tight tolerance.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn q4t_matmat_accel_matches_dequant_reference() {
+        if !accel_gemm_enabled() {
+            return; // CMF_ACCEL=0
+        }
+        let (rows, cols, b) = (512usize, 1024usize, 8usize); // ≥500K → accel arm
+        let gpr = cols / GROUP_SIZE;
+        let mut bytes = vec![0u8; rows * gpr * Q4_TILE];
+        for r in 0..rows {
+            for g in 0..gpr {
+                let t = (r * gpr + g) * Q4_TILE;
+                let sc = 0.02 + 0.0005 * ((r * gpr + g) % 64) as f32;
+                bytes[t..t + 2].copy_from_slice(&cortiq_core::quant::f32_to_f16(sc).to_le_bytes());
+                for k in 0..16 {
+                    bytes[t + 2 + k] = ((r * 31 + g * 7 + k * 13) % 251) as u8;
+                }
+            }
+        }
+        let x: Vec<f32> = (0..b * cols)
+            .map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5)
+            .collect();
+        let mut got = vec![0f32; b * rows];
+        q4t_matmat(&bytes, &x, b, rows, cols, &mut got, None);
+        // Brute-force reference off the same tiles.
+        let mut w = vec![0f32; rows * cols];
+        for r in 0..rows {
+            for g in 0..gpr {
+                let t = (r * gpr + g) * Q4_TILE;
+                let s = f16_to_f32(u16::from_le_bytes([bytes[t], bytes[t + 1]]));
+                for (k, &bb) in bytes[t + 2..t + Q4_TILE].iter().enumerate() {
+                    w[r * cols + g * GROUP_SIZE + k * 2] = ((bb & 0x0F) as f32 - 8.0) * s;
+                    w[r * cols + g * GROUP_SIZE + k * 2 + 1] =
+                        (((bb >> 4) & 0x0F) as f32 - 8.0) * s;
+                }
+            }
+        }
+        for bi in 0..b {
+            for r in 0..rows {
+                let want: f32 = (0..cols).map(|j| x[bi * cols + j] * w[r * cols + j]).sum();
+                let d = (got[bi * rows + r] - want).abs();
+                assert!(
+                    d <= want.abs().max(1.0) * 1e-4,
+                    "accel q4t GEMM diverged at ({bi},{r}): {} vs {want}",
+                    got[bi * rows + r]
+                );
+            }
+        }
     }
 
     #[test]

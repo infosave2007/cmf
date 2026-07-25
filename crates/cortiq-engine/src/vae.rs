@@ -22,10 +22,13 @@ pub struct StTensor {
     pub data: Vec<f32>,
 }
 
-/// All tensors of one .safetensors file, keyed by name.
-pub fn read_safetensors(
+/// Stream every tensor of one .safetensors file through `f` as f32,
+/// one at a time — a 9 GB shard costs one raw blob plus the single
+/// tensor in flight, not a second full-file f32 copy.
+pub fn read_safetensors_each(
     path: &Path,
-) -> Result<std::collections::HashMap<String, StTensor>, String> {
+    f: &mut dyn FnMut(&str, Vec<usize>, Vec<f32>) -> Result<(), String>,
+) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if bytes.len() < 8 {
         return Err("safetensors: truncated header".into());
@@ -34,7 +37,6 @@ pub fn read_safetensors(
     let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + hlen])
         .map_err(|e| format!("safetensors header: {e}"))?;
     let base = 8 + hlen;
-    let mut out = std::collections::HashMap::new();
     let obj = header
         .as_object()
         .ok_or("safetensors: header not an object")?;
@@ -78,8 +80,20 @@ pub fn read_safetensors(
             }
             other => return Err(format!("safetensors: unsupported dtype {other}")),
         }
-        out.insert(name.clone(), StTensor { shape, data });
+        f(name, shape, data)?;
     }
+    Ok(())
+}
+
+/// All tensors of one .safetensors file, keyed by name.
+pub fn read_safetensors(
+    path: &Path,
+) -> Result<std::collections::HashMap<String, StTensor>, String> {
+    let mut out = std::collections::HashMap::new();
+    read_safetensors_each(path, &mut |name, shape, data| {
+        out.insert(name.to_string(), StTensor { shape, data });
+        Ok(())
+    })?;
     Ok(out)
 }
 
@@ -378,8 +392,42 @@ impl VaeDecoder {
             &std::fs::read(dir.join("config.json")).map_err(|e| format!("config.json: {e}"))?,
         )
         .map_err(|e| format!("config.json: {e}"))?;
-        let groups = cfg["norm_num_groups"].as_u64().unwrap_or(32) as usize;
         let t = read_safetensors(&dir.join("diffusion_pytorch_model.safetensors"))?;
+        Self::from_tensors(t, &cfg)
+    }
+
+    /// Load from a packaged imagegen .cmf (`vae.*` tensors, stored
+    /// f16/f32, + `vae.config_json`).
+    pub fn from_cmf(model: &cortiq_core::CmfModel) -> Result<Self, String> {
+        let cfg: serde_json::Value = serde_json::from_slice(
+            model
+                .tensor_bytes("vae.config_json")
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("vae.config_json: {e}"))?;
+        let mut t = std::collections::HashMap::new();
+        for entry in model
+            .tensors
+            .iter()
+            .filter(|e| e.name.starts_with("vae.") && e.name != "vae.config_json")
+        {
+            let data = crate::dit::cmf_f32(model, &entry.name)?;
+            t.insert(
+                entry.name["vae.".len()..].to_string(),
+                StTensor {
+                    shape: entry.shape.clone(),
+                    data,
+                },
+            );
+        }
+        Self::from_tensors(t, &cfg)
+    }
+
+    fn from_tensors(
+        t: std::collections::HashMap<String, StTensor>,
+        cfg: &serde_json::Value,
+    ) -> Result<Self, String> {
+        let groups = cfg["norm_num_groups"].as_u64().unwrap_or(32) as usize;
         let get = |n: &str| -> Result<&StTensor, String> {
             t.get(n).ok_or_else(|| format!("missing tensor {n}"))
         };

@@ -15,30 +15,37 @@
 //! Parity: `python/gemma_ref.py` + `tests/textenc_parity.rs` on the
 //! real Lumina text-encoder weights.
 
+use crate::dit::Proj;
+use crate::pool::Pool;
+use crate::qtensor::QTensor;
 use crate::vae::{StTensor, read_safetensors};
+use cortiq_core::CmfModel;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 struct Layer {
     input_norm: Vec<f32>,
-    q: Vec<f32>, // [nh·hd, hidden]
-    k: Vec<f32>, // [nkv·hd, hidden]
-    v: Vec<f32>,
-    o: Vec<f32>, // [hidden, nh·hd]
+    q: Proj, // [nh·hd, hidden]
+    k: Proj, // [nkv·hd, hidden]
+    v: Proj,
+    o: Proj, // [hidden, nh·hd]
     post_attn_norm: Vec<f32>,
     pre_ffn_norm: Vec<f32>,
-    gate: Vec<f32>, // [inter, hidden]
-    up: Vec<f32>,
-    down: Vec<f32>, // [hidden, inter]
+    gate: Proj, // [inter, hidden]
+    up: Proj,
+    down: Proj, // [hidden, inter]
     post_ffn_norm: Vec<f32>,
 }
 
-/// Gemma-2 encoder: all weights resident f32 (the Lumina prompt is a
-/// one-shot forward; quantized tiers come with the CMF packaging).
+/// Gemma-2 encoder: exact f32 from a diffusers directory, or
+/// CMF-quantized (mmap-resident, per-token embed dequant) from a
+/// packaged file.
 pub struct GemmaEncoder {
-    embed: Vec<f32>, // [vocab, hidden]
+    embed: QTensor, // [vocab, hidden]
     layers: Vec<Layer>,
     final_norm: Vec<f32>,
+    pool: Option<Arc<Pool>>,
     pub hidden: usize,
     nh: usize,
     nkv: usize,
@@ -96,27 +103,81 @@ impl GemmaEncoder {
                 .ok_or_else(|| format!("missing tensor {n}"))
         };
         let nl = cfg["num_hidden_layers"].as_u64().ok_or("layers")? as usize;
+        let hidden = cfg["hidden_size"].as_u64().ok_or("hidden")? as usize;
         let mut layers = Vec::with_capacity(nl);
         for l in 0..nl {
             let p = format!("model.layers.{l}");
+            let o = take(&format!("{p}.self_attn.o_proj.weight"))?;
+            let o_cols = o.len() / hidden;
+            let down = take(&format!("{p}.mlp.down_proj.weight"))?;
+            let inter = down.len() / hidden;
             layers.push(Layer {
                 input_norm: take(&format!("{p}.input_layernorm.weight"))?,
-                q: take(&format!("{p}.self_attn.q_proj.weight"))?,
-                k: take(&format!("{p}.self_attn.k_proj.weight"))?,
-                v: take(&format!("{p}.self_attn.v_proj.weight"))?,
-                o: take(&format!("{p}.self_attn.o_proj.weight"))?,
+                q: Proj::f32(take(&format!("{p}.self_attn.q_proj.weight"))?, hidden),
+                k: Proj::f32(take(&format!("{p}.self_attn.k_proj.weight"))?, hidden),
+                v: Proj::f32(take(&format!("{p}.self_attn.v_proj.weight"))?, hidden),
+                o: Proj::f32(o, o_cols),
                 post_attn_norm: take(&format!("{p}.post_attention_layernorm.weight"))?,
                 pre_ffn_norm: take(&format!("{p}.pre_feedforward_layernorm.weight"))?,
-                gate: take(&format!("{p}.mlp.gate_proj.weight"))?,
-                up: take(&format!("{p}.mlp.up_proj.weight"))?,
-                down: take(&format!("{p}.mlp.down_proj.weight"))?,
+                gate: Proj::f32(take(&format!("{p}.mlp.gate_proj.weight"))?, hidden),
+                up: Proj::f32(take(&format!("{p}.mlp.up_proj.weight"))?, hidden),
+                down: Proj::f32(down, inter),
                 post_ffn_norm: take(&format!("{p}.post_feedforward_layernorm.weight"))?,
             });
         }
+        let embed = take("model.embed_tokens.weight")?;
+        let vocab = embed.len() / hidden;
         Ok(Self {
-            embed: take("model.embed_tokens.weight")?,
+            embed: QTensor::from_f32(embed, vocab, hidden),
             layers,
             final_norm: take("model.norm.weight")?,
+            pool: Pool::from_env(),
+            hidden,
+            nh: cfg["num_attention_heads"].as_u64().ok_or("nh")? as usize,
+            nkv: cfg["num_key_value_heads"].as_u64().ok_or("nkv")? as usize,
+            hd: cfg["head_dim"].as_u64().ok_or("hd")? as usize,
+            scale: 1.0 / (cfg["query_pre_attn_scalar"].as_f64().unwrap_or(256.0) as f32).sqrt(),
+            softcap: cfg["attn_logit_softcapping"].as_f64().unwrap_or(0.0) as f32,
+            theta: cfg["rope_theta"].as_f64().unwrap_or(10000.0) as f32,
+            eps: cfg["rms_norm_eps"].as_f64().unwrap_or(1e-6),
+            window: cfg["sliding_window"].as_u64().unwrap_or(4096) as usize,
+        })
+    }
+
+    /// Load from a packaged imagegen .cmf (`te.*` tensors +
+    /// `te.config_json`). Quantized projections stay mmap-resident;
+    /// embeddings dequantize per token.
+    pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
+        let cfg: serde_json::Value = serde_json::from_slice(
+            model
+                .tensor_bytes("te.config_json")
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("te.config_json: {e}"))?;
+        let f32v = |n: &str| -> Result<Vec<f32>, String> { crate::dit::cmf_f32(model, n) };
+        let nl = cfg["num_hidden_layers"].as_u64().ok_or("layers")? as usize;
+        let mut layers = Vec::with_capacity(nl);
+        for l in 0..nl {
+            let p = format!("te.layers.{l}");
+            layers.push(Layer {
+                input_norm: f32v(&format!("{p}.input_layernorm.weight"))?,
+                q: Proj::from_model(model, &format!("{p}.self_attn.q_proj.weight"))?,
+                k: Proj::from_model(model, &format!("{p}.self_attn.k_proj.weight"))?,
+                v: Proj::from_model(model, &format!("{p}.self_attn.v_proj.weight"))?,
+                o: Proj::from_model(model, &format!("{p}.self_attn.o_proj.weight"))?,
+                post_attn_norm: f32v(&format!("{p}.post_attention_layernorm.weight"))?,
+                pre_ffn_norm: f32v(&format!("{p}.pre_feedforward_layernorm.weight"))?,
+                gate: Proj::from_model(model, &format!("{p}.mlp.gate_proj.weight"))?,
+                up: Proj::from_model(model, &format!("{p}.mlp.up_proj.weight"))?,
+                down: Proj::from_model(model, &format!("{p}.mlp.down_proj.weight"))?,
+                post_ffn_norm: f32v(&format!("{p}.post_feedforward_layernorm.weight"))?,
+            });
+        }
+        Ok(Self {
+            embed: QTensor::from_model(model, "te.embed_tokens.weight")?,
+            layers,
+            final_norm: f32v("te.norm.weight")?,
+            pool: Pool::from_env(),
             hidden: cfg["hidden_size"].as_u64().ok_or("hidden")? as usize,
             nh: cfg["num_attention_heads"].as_u64().ok_or("nh")? as usize,
             nkv: cfg["num_key_value_heads"].as_u64().ok_or("nkv")? as usize,
@@ -141,11 +202,15 @@ impl GemmaEncoder {
             self.window
         );
         let hs = self.hidden;
+        let pool = self.pool.as_deref();
         let emb_scale = (hs as f32).sqrt();
-        let mut h: Vec<f32> = Vec::with_capacity(n * hs);
-        for &id in ids {
-            let row = &self.embed[id as usize * hs..(id as usize + 1) * hs];
-            h.extend(row.iter().map(|&v| v * emb_scale));
+        let mut h = vec![0f32; n * hs];
+        for (i, &id) in ids.iter().enumerate() {
+            let row = &mut h[i * hs..(i + 1) * hs];
+            self.embed.row_f32(id as usize, row);
+            for v in row.iter_mut() {
+                *v *= emb_scale;
+            }
         }
         let mut streams = Vec::new();
         let (nh, nkv, hd) = (self.nh, self.nkv, self.hd);
@@ -166,9 +231,9 @@ impl GemmaEncoder {
                     self.eps,
                 ));
             }
-            crate::fcd_ops::gemm_nt(&xn_all, &layer.q, &mut q_all, n, hs, nh * hd, None);
-            crate::fcd_ops::gemm_nt(&xn_all, &layer.k, &mut k_all, n, hs, nkv * hd, None);
-            crate::fcd_ops::gemm_nt(&xn_all, &layer.v, &mut v_all, n, hs, nkv * hd, None);
+            layer.q.matmat(&xn_all, n, &mut q_all, pool);
+            layer.k.matmat(&xn_all, n, &mut k_all, pool);
+            layer.v.matmat(&xn_all, n, &mut v_all, pool);
             // RoPE over the first hd dims of every head (full-dim rope).
             for (all, heads) in [(&mut q_all, nh), (&mut k_all, nkv)] {
                 for p in 0..n {
@@ -219,7 +284,7 @@ impl GemmaEncoder {
                 }
             }
             let mut proj_all = vec![0f32; n * hs];
-            crate::fcd_ops::gemm_nt(&attn_out, &layer.o, &mut proj_all, n, nh * hd, hs, None);
+            layer.o.matmat(&attn_out, n, &mut proj_all, pool);
             for p in 0..n {
                 let post = rms_norm_gemma(
                     &proj_all[p * hs..(p + 1) * hs],
@@ -231,7 +296,7 @@ impl GemmaEncoder {
                 }
             }
             // ── GeGLU MLP (pre-norm, sandwich post-norm) ──
-            let inter = layer.gate.len() / hs;
+            let inter = layer.gate.rows();
             for p in 0..n {
                 xn_all[p * hs..(p + 1) * hs].copy_from_slice(&rms_norm_gemma(
                     &h[p * hs..(p + 1) * hs],
@@ -241,13 +306,13 @@ impl GemmaEncoder {
             }
             let mut g_all = vec![0f32; n * inter];
             let mut u_all = vec![0f32; n * inter];
-            crate::fcd_ops::gemm_nt(&xn_all, &layer.gate, &mut g_all, n, hs, inter, None);
-            crate::fcd_ops::gemm_nt(&xn_all, &layer.up, &mut u_all, n, hs, inter, None);
+            layer.gate.matmat(&xn_all, n, &mut g_all, pool);
+            layer.up.matmat(&xn_all, n, &mut u_all, pool);
             for (g, u) in g_all.iter_mut().zip(&u_all) {
                 *g = gelu_tanh(*g) * u;
             }
             let mut d_all = vec![0f32; n * hs];
-            crate::fcd_ops::gemm_nt(&g_all, &layer.down, &mut d_all, n, inter, hs, None);
+            layer.down.matmat(&g_all, n, &mut d_all, pool);
             for p in 0..n {
                 let post =
                     rms_norm_gemma(&d_all[p * hs..(p + 1) * hs], &layer.post_ffn_norm, self.eps);

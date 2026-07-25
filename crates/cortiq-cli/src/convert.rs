@@ -235,7 +235,7 @@ pub(crate) fn parse_quant(s: &str) -> anyhow::Result<Quant> {
 }
 
 /// q8_row: `[int8 : out·in][f16 : out]` (validated layout, matches the reader).
-fn encode_q8_row(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
+pub(crate) fn encode_q8_row(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
     let mut q = Vec::with_capacity(out_dim * in_dim);
     let mut scales = Vec::with_capacity(out_dim * 2);
     for o in 0..out_dim {
@@ -285,7 +285,7 @@ fn encode_q4_block(vals: &[f32]) -> Vec<u8> {
 /// out as one sequential stream of 18-byte tiles
 /// `[f16 scale][16B nibbles]` per 32-group — measured x1.66 (ARM) /
 /// x1.13 (AVX2) at kernel level over the split layout.
-fn encode_q4_tiled(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
+pub(crate) fn encode_q4_tiled(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
     debug_assert_eq!(vals.len(), out_dim * in_dim);
     debug_assert_eq!(in_dim % GROUP_SIZE, 0);
     let legacy = encode_q4_block(vals);

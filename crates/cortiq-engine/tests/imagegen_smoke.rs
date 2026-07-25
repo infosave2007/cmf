@@ -67,3 +67,36 @@ fn lumina_end_to_end_generates_finite_image() {
         t0.elapsed().as_secs_f64()
     );
 }
+
+#[test]
+fn lumina_packaged_cmf_generates() {
+    // CMF_LUMINA_CMF = a `cortiq imagine-pack` output file.
+    let Ok(cmf) = std::env::var("CMF_LUMINA_CMF") else {
+        eprintln!("CMF_LUMINA_CMF not set — skipping");
+        return;
+    };
+    let params = cortiq_engine::imagegen::GenParams {
+        height: 128,
+        width: 128,
+        steps: 2,
+        guidance_scale: 0.0,
+        seed: 7,
+        ..Default::default()
+    };
+    let t0 = std::time::Instant::now();
+    let img = cortiq_engine::imagegen::generate(
+        Path::new(&cmf),
+        "a red square on a white background",
+        &params,
+        |i, n| eprintln!("step {i}/{n} ({:.1}s)", t0.elapsed().as_secs_f64()),
+    )
+    .expect("generate from .cmf");
+    assert_eq!(img.len(), 3 * 128 * 128);
+    assert!(img.iter().all(|v| v.is_finite()));
+    let mean = img.iter().sum::<f32>() / img.len() as f32;
+    assert!(mean > 0.02 && mean < 0.98, "degenerate image, mean {mean}");
+    println!(
+        "packaged smoke: 128x128 in {:.1}s, mean {mean:.3}",
+        t0.elapsed().as_secs_f64()
+    );
+}

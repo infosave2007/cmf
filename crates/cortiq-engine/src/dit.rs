@@ -15,48 +15,102 @@
 //! Parity: `python/nextdit_ref.py` + `tests/dit_parity.rs` on the
 //! real Lumina transformer weights.
 
-use crate::fcd_ops::gemm_nt;
+use crate::pool::Pool;
+use crate::qtensor::QTensor;
 use crate::vae::{StTensor, read_safetensors};
+use cortiq_core::CmfModel;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+
+/// A projection weight: exact f32 (diffusers load — Accelerate GEMM)
+/// or a CMF-quantized tensor on the engine's batched dot kernels.
+pub(crate) enum Proj {
+    F32 {
+        w: Vec<f32>,
+        rows: usize,
+        cols: usize,
+    },
+    Q(QTensor),
+}
+
+impl Proj {
+    /// f32 weight `[?, cols]`; rows derived from the data length.
+    pub(crate) fn f32(w: Vec<f32>, cols: usize) -> Self {
+        let rows = w.len() / cols;
+        debug_assert_eq!(w.len(), rows * cols);
+        Proj::F32 { w, rows, cols }
+    }
+
+    /// Load from a CMF directory entry (mmap-resident when quantized;
+    /// an F32 entry dequantizes into the exact-GEMM arm).
+    pub(crate) fn from_model(model: &Arc<CmfModel>, name: &str) -> Result<Self, String> {
+        Ok(match QTensor::from_model(model, name)? {
+            QTensor::F32 { data, rows, cols } => Proj::F32 {
+                w: data,
+                rows,
+                cols,
+            },
+            q => Proj::Q(q),
+        })
+    }
+
+    pub(crate) fn rows(&self) -> usize {
+        match self {
+            Proj::F32 { rows, .. } => *rows,
+            Proj::Q(q) => q.rows(),
+        }
+    }
+
+    /// y[b, rows] = x[b, cols] · Wᵀ.
+    pub(crate) fn matmat(&self, xs: &[f32], b: usize, out: &mut [f32], pool: Option<&Pool>) {
+        match self {
+            Proj::F32 { w, rows, cols } => {
+                crate::fcd_ops::gemm_nt(xs, w, out, b, *cols, *rows, pool)
+            }
+            Proj::Q(q) => q.matmat(xs, b, out, pool),
+        }
+    }
+}
 
 struct Block {
     /// AdaLN: (linear [4·hidden, 1024], bias [4·hidden]); None = plain norm1.
-    modulation: Option<(Vec<f32>, Vec<f32>)>,
+    modulation: Option<(Proj, Vec<f32>)>,
     norm1: Vec<f32>,
-    q: Vec<f32>, // [nh·hd, hidden]
-    k: Vec<f32>, // [nkv·hd, hidden]
-    v: Vec<f32>,
-    o: Vec<f32>,      // [hidden, nh·hd]
+    q: Proj, // [nh·hd, hidden]
+    k: Proj, // [nkv·hd, hidden]
+    v: Proj,
+    o: Proj,          // [hidden, nh·hd]
     norm_q: Vec<f32>, // [hd]
     norm_k: Vec<f32>,
     norm2: Vec<f32>,
     ffn_norm1: Vec<f32>,
-    w1: Vec<f32>, // gate [inter, hidden]
-    w3: Vec<f32>, // up
-    w2: Vec<f32>, // down [hidden, inter]
+    w1: Proj, // gate [inter, hidden]
+    w3: Proj, // up
+    w2: Proj, // down [hidden, inter]
     ffn_norm2: Vec<f32>,
 }
 
-/// Next-DiT: all weights resident f32 (quantized tiers come with the
-/// CMF packaging).
+/// Next-DiT: exact f32 from a diffusers directory, or CMF-quantized
+/// (mmap-resident) from a packaged file.
 pub struct NextDit {
-    x_emb_w: Vec<f32>, // [hidden, p·p·c]
+    x_emb: Proj, // [hidden, p·p·c]
     x_emb_b: Vec<f32>,
     t_lin1_w: Vec<f32>, // [temb, 256]
     t_lin1_b: Vec<f32>,
     t_lin2_w: Vec<f32>, // [temb, temb]
     t_lin2_b: Vec<f32>,
     cap_norm: Vec<f32>, // [cap_feat]
-    cap_w: Vec<f32>,    // [hidden, cap_feat]
+    cap_w: Proj,        // [hidden, cap_feat]
     cap_b: Vec<f32>,
     context_refiner: Vec<Block>,
     noise_refiner: Vec<Block>,
     layers: Vec<Block>,
     out_lin1_w: Vec<f32>, // [hidden, temb]
     out_lin1_b: Vec<f32>,
-    out_lin2_w: Vec<f32>, // [p·p·c, hidden]
+    out_lin2: Proj, // [p·p·c, hidden]
     out_lin2_b: Vec<f32>,
+    pool: Option<Arc<Pool>>,
     pub hidden: usize,
     pub in_channels: usize,
     pub patch: usize,
@@ -91,6 +145,17 @@ fn linear(x: &[f32], w: &[f32], b: &[f32]) -> Vec<f32> {
             bias + row.iter().zip(x).map(|(&a, &c)| a * c).sum::<f32>()
         })
         .collect()
+}
+
+/// Any CMF directory entry → f32 (norms, biases, f16 conv kernels).
+pub(crate) fn cmf_f32(model: &CmfModel, name: &str) -> Result<Vec<f32>, String> {
+    let entry = model
+        .tensor(name)
+        .ok_or_else(|| format!("missing tensor {name}"))?;
+    let bytes = model.entry_bytes(entry);
+    let mut out = vec![0f32; entry.shape.iter().product()];
+    cortiq_core::quant::dequant_tensor(entry, bytes, &mut out)?;
+    Ok(out)
 }
 
 /// Per-token RoPE table: interleaved-pair rotation angles, f64.
@@ -140,16 +205,18 @@ impl NextDit {
                 .map(|v| v.data)
                 .ok_or_else(|| format!("missing tensor {n}"))
         };
+        let hidden = cfg["hidden_size"].as_u64().ok_or("hidden")? as usize;
         let mut blocks = |pfx: &str, count: usize, modulated: bool| -> Result<Vec<Block>, String> {
             (0..count)
                 .map(|l| {
                     let p = format!("{pfx}.{l}");
+                    let w1 = take(format!("{p}.feed_forward.linear_1.weight"))?;
+                    let inter = w1.len() / hidden;
                     Ok(Block {
                         modulation: if modulated {
-                            Some((
-                                take(format!("{p}.norm1.linear.weight"))?,
-                                take(format!("{p}.norm1.linear.bias"))?,
-                            ))
+                            let mw = take(format!("{p}.norm1.linear.weight"))?;
+                            let cols = mw.len() / (4 * hidden);
+                            Some((Proj::f32(mw, cols), take(format!("{p}.norm1.linear.bias"))?))
                         } else {
                             None
                         },
@@ -158,17 +225,21 @@ impl NextDit {
                         } else {
                             take(format!("{p}.norm1.weight"))?
                         },
-                        q: take(format!("{p}.attn.to_q.weight"))?,
-                        k: take(format!("{p}.attn.to_k.weight"))?,
-                        v: take(format!("{p}.attn.to_v.weight"))?,
-                        o: take(format!("{p}.attn.to_out.0.weight"))?,
+                        q: Proj::f32(take(format!("{p}.attn.to_q.weight"))?, hidden),
+                        k: Proj::f32(take(format!("{p}.attn.to_k.weight"))?, hidden),
+                        v: Proj::f32(take(format!("{p}.attn.to_v.weight"))?, hidden),
+                        o: {
+                            let o = take(format!("{p}.attn.to_out.0.weight"))?;
+                            let cols = o.len() / hidden;
+                            Proj::f32(o, cols)
+                        },
                         norm_q: take(format!("{p}.attn.norm_q.weight"))?,
                         norm_k: take(format!("{p}.attn.norm_k.weight"))?,
                         norm2: take(format!("{p}.norm2.weight"))?,
                         ffn_norm1: take(format!("{p}.ffn_norm1.weight"))?,
-                        w1: take(format!("{p}.feed_forward.linear_1.weight"))?,
-                        w3: take(format!("{p}.feed_forward.linear_3.weight"))?,
-                        w2: take(format!("{p}.feed_forward.linear_2.weight"))?,
+                        w1: Proj::f32(w1, hidden),
+                        w3: Proj::f32(take(format!("{p}.feed_forward.linear_3.weight"))?, hidden),
+                        w2: Proj::f32(take(format!("{p}.feed_forward.linear_2.weight"))?, inter),
                         ffn_norm2: take(format!("{p}.ffn_norm2.weight"))?,
                     })
                 })
@@ -179,7 +250,99 @@ impl NextDit {
         let context_refiner = blocks("context_refiner", nr, false)?;
         let noise_refiner = blocks("noise_refiner", nr, true)?;
         let layers = blocks("layers", nl, true)?;
+        let nh = cfg["num_attention_heads"].as_u64().ok_or("nh")? as usize;
+        let in_channels = cfg["in_channels"].as_u64().ok_or("in_channels")? as usize;
+        let patch = cfg["patch_size"].as_u64().unwrap_or(2) as usize;
+        let axes_dim: Vec<usize> = cfg["axes_dim_rope"]
+            .as_array()
+            .ok_or("axes_dim_rope")?
+            .iter()
+            .map(|v| v.as_u64().unwrap_or(0) as usize)
+            .collect();
+        let cap_norm = take("time_caption_embed.caption_embedder.0.weight".into())?;
+        let cap_feat = cap_norm.len();
+        Ok(Self {
+            x_emb: Proj::f32(
+                take("x_embedder.weight".into())?,
+                patch * patch * in_channels,
+            ),
+            x_emb_b: take("x_embedder.bias".into())?,
+            t_lin1_w: take("time_caption_embed.timestep_embedder.linear_1.weight".into())?,
+            t_lin1_b: take("time_caption_embed.timestep_embedder.linear_1.bias".into())?,
+            t_lin2_w: take("time_caption_embed.timestep_embedder.linear_2.weight".into())?,
+            t_lin2_b: take("time_caption_embed.timestep_embedder.linear_2.bias".into())?,
+            cap_norm,
+            cap_w: Proj::f32(
+                take("time_caption_embed.caption_embedder.1.weight".into())?,
+                cap_feat,
+            ),
+            cap_b: take("time_caption_embed.caption_embedder.1.bias".into())?,
+            context_refiner,
+            noise_refiner,
+            layers,
+            out_lin1_w: take("norm_out.linear_1.weight".into())?,
+            out_lin1_b: take("norm_out.linear_1.bias".into())?,
+            out_lin2: Proj::f32(take("norm_out.linear_2.weight".into())?, hidden),
+            out_lin2_b: take("norm_out.linear_2.bias".into())?,
+            pool: Pool::from_env(),
+            hidden,
+            in_channels,
+            patch,
+            nh,
+            nkv: cfg["num_kv_heads"].as_u64().unwrap_or(nh as u64) as usize,
+            hd: hidden / nh,
+            axes_dim,
+            eps: cfg["norm_eps"].as_f64().unwrap_or(1e-5),
+        })
+    }
+
+    /// Load from a packaged imagegen .cmf (`dit.*` tensors +
+    /// `dit.config_json`). Quantized projections stay mmap-resident.
+    pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
+        let cfg: serde_json::Value = serde_json::from_slice(
+            model
+                .tensor_bytes("dit.config_json")
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("dit.config_json: {e}"))?;
+        let f32v = |n: &str| -> Result<Vec<f32>, String> { cmf_f32(model, n) };
         let hidden = cfg["hidden_size"].as_u64().ok_or("hidden")? as usize;
+        let blocks = |pfx: &str, count: usize, modulated: bool| -> Result<Vec<Block>, String> {
+            (0..count)
+                .map(|l| {
+                    let p = format!("dit.{pfx}.{l}");
+                    Ok(Block {
+                        modulation: if modulated {
+                            Some((
+                                Proj::from_model(model, &format!("{p}.norm1.linear.weight"))?,
+                                f32v(&format!("{p}.norm1.linear.bias"))?,
+                            ))
+                        } else {
+                            None
+                        },
+                        norm1: if modulated {
+                            f32v(&format!("{p}.norm1.norm.weight"))?
+                        } else {
+                            f32v(&format!("{p}.norm1.weight"))?
+                        },
+                        q: Proj::from_model(model, &format!("{p}.attn.to_q.weight"))?,
+                        k: Proj::from_model(model, &format!("{p}.attn.to_k.weight"))?,
+                        v: Proj::from_model(model, &format!("{p}.attn.to_v.weight"))?,
+                        o: Proj::from_model(model, &format!("{p}.attn.to_out.0.weight"))?,
+                        norm_q: f32v(&format!("{p}.attn.norm_q.weight"))?,
+                        norm_k: f32v(&format!("{p}.attn.norm_k.weight"))?,
+                        norm2: f32v(&format!("{p}.norm2.weight"))?,
+                        ffn_norm1: f32v(&format!("{p}.ffn_norm1.weight"))?,
+                        w1: Proj::from_model(model, &format!("{p}.feed_forward.linear_1.weight"))?,
+                        w3: Proj::from_model(model, &format!("{p}.feed_forward.linear_3.weight"))?,
+                        w2: Proj::from_model(model, &format!("{p}.feed_forward.linear_2.weight"))?,
+                        ffn_norm2: f32v(&format!("{p}.ffn_norm2.weight"))?,
+                    })
+                })
+                .collect()
+        };
+        let nl = cfg["num_layers"].as_u64().ok_or("num_layers")? as usize;
+        let nr = cfg["num_refiner_layers"].as_u64().unwrap_or(2) as usize;
         let nh = cfg["num_attention_heads"].as_u64().ok_or("nh")? as usize;
         let axes_dim: Vec<usize> = cfg["axes_dim_rope"]
             .as_array()
@@ -188,22 +351,23 @@ impl NextDit {
             .map(|v| v.as_u64().unwrap_or(0) as usize)
             .collect();
         Ok(Self {
-            x_emb_w: take("x_embedder.weight".into())?,
-            x_emb_b: take("x_embedder.bias".into())?,
-            t_lin1_w: take("time_caption_embed.timestep_embedder.linear_1.weight".into())?,
-            t_lin1_b: take("time_caption_embed.timestep_embedder.linear_1.bias".into())?,
-            t_lin2_w: take("time_caption_embed.timestep_embedder.linear_2.weight".into())?,
-            t_lin2_b: take("time_caption_embed.timestep_embedder.linear_2.bias".into())?,
-            cap_norm: take("time_caption_embed.caption_embedder.0.weight".into())?,
-            cap_w: take("time_caption_embed.caption_embedder.1.weight".into())?,
-            cap_b: take("time_caption_embed.caption_embedder.1.bias".into())?,
-            context_refiner,
-            noise_refiner,
-            layers,
-            out_lin1_w: take("norm_out.linear_1.weight".into())?,
-            out_lin1_b: take("norm_out.linear_1.bias".into())?,
-            out_lin2_w: take("norm_out.linear_2.weight".into())?,
-            out_lin2_b: take("norm_out.linear_2.bias".into())?,
+            x_emb: Proj::from_model(model, "dit.x_embedder.weight")?,
+            x_emb_b: f32v("dit.x_embedder.bias")?,
+            t_lin1_w: f32v("dit.time_caption_embed.timestep_embedder.linear_1.weight")?,
+            t_lin1_b: f32v("dit.time_caption_embed.timestep_embedder.linear_1.bias")?,
+            t_lin2_w: f32v("dit.time_caption_embed.timestep_embedder.linear_2.weight")?,
+            t_lin2_b: f32v("dit.time_caption_embed.timestep_embedder.linear_2.bias")?,
+            cap_norm: f32v("dit.time_caption_embed.caption_embedder.0.weight")?,
+            cap_w: Proj::from_model(model, "dit.time_caption_embed.caption_embedder.1.weight")?,
+            cap_b: f32v("dit.time_caption_embed.caption_embedder.1.bias")?,
+            context_refiner: blocks("context_refiner", nr, false)?,
+            noise_refiner: blocks("noise_refiner", nr, true)?,
+            layers: blocks("layers", nl, true)?,
+            out_lin1_w: f32v("dit.norm_out.linear_1.weight")?,
+            out_lin1_b: f32v("dit.norm_out.linear_1.bias")?,
+            out_lin2: Proj::from_model(model, "dit.norm_out.linear_2.weight")?,
+            out_lin2_b: f32v("dit.norm_out.linear_2.bias")?,
+            pool: Pool::from_env(),
             hidden,
             in_channels: cfg["in_channels"].as_u64().ok_or("in_channels")? as usize,
             patch: cfg["patch_size"].as_u64().unwrap_or(2) as usize,
@@ -239,10 +403,16 @@ impl NextDit {
         temb: Option<&[f32]>,
     ) {
         let (hs, nh, nkv, hd) = (self.hidden, self.nh, self.nkv, self.hd);
+        let pool = self.pool.as_deref();
         let n = x.len() / hs;
         let modv = blk.modulation.as_ref().zip(temb).map(|((w, b), t)| {
             let s: Vec<f32> = t.iter().map(|&v| silu(v)).collect();
-            linear(&s, w, b)
+            let mut m = vec![0f32; w.rows()];
+            w.matmat(&s, 1, &mut m, pool);
+            for (v, &bias) in m.iter_mut().zip(b) {
+                *v += bias;
+            }
+            m
         });
         let (s_msa, g_msa, s_mlp, g_mlp) = match &modv {
             Some(m) => (
@@ -267,9 +437,9 @@ impl NextDit {
         let mut q_all = vec![0f32; n * nh * hd];
         let mut k_all = vec![0f32; n * nkv * hd];
         let mut v_all = vec![0f32; n * nkv * hd];
-        gemm_nt(&xn, &blk.q, &mut q_all, n, hs, nh * hd, None);
-        gemm_nt(&xn, &blk.k, &mut k_all, n, hs, nkv * hd, None);
-        gemm_nt(&xn, &blk.v, &mut v_all, n, hs, nkv * hd, None);
+        blk.q.matmat(&xn, n, &mut q_all, pool);
+        blk.k.matmat(&xn, n, &mut k_all, pool);
+        blk.v.matmat(&xn, n, &mut v_all, pool);
         // per-head qk-norm, then interleaved-pair RoPE
         let (cos, sin) = rope;
         let pairs = hd / 2;
@@ -320,7 +490,7 @@ impl NextDit {
             }
         }
         let mut proj = vec![0f32; n * hs];
-        gemm_nt(&attn, &blk.o, &mut proj, n, nh * hd, hs, None);
+        blk.o.matmat(&attn, n, &mut proj, pool);
         for p in 0..n {
             let post = rms_norm(&proj[p * hs..(p + 1) * hs], &blk.norm2, self.eps);
             let dst = &mut x[p * hs..(p + 1) * hs];
@@ -347,16 +517,16 @@ impl NextDit {
             }
             xn[p * hs..(p + 1) * hs].copy_from_slice(&row);
         }
-        let inter = blk.w1.len() / hs;
+        let inter = blk.w1.rows();
         let mut g_all = vec![0f32; n * inter];
         let mut u_all = vec![0f32; n * inter];
-        gemm_nt(&xn, &blk.w1, &mut g_all, n, hs, inter, None);
-        gemm_nt(&xn, &blk.w3, &mut u_all, n, hs, inter, None);
+        blk.w1.matmat(&xn, n, &mut g_all, pool);
+        blk.w3.matmat(&xn, n, &mut u_all, pool);
         for (g, u) in g_all.iter_mut().zip(&u_all) {
             *g = silu(*g) * u;
         }
         let mut d_all = vec![0f32; n * hs];
-        gemm_nt(&g_all, &blk.w2, &mut d_all, n, inter, hs, None);
+        blk.w2.matmat(&g_all, n, &mut d_all, pool);
         for p in 0..n {
             let post = rms_norm(&d_all[p * hs..(p + 1) * hs], &blk.ffn_norm2, self.eps);
             let dst = &mut x[p * hs..(p + 1) * hs];
@@ -404,15 +574,8 @@ impl NextDit {
             ));
         }
         let mut cap_e = vec![0f32; cap_n * hs];
-        gemm_nt(
-            &cap_n_all,
-            &self.cap_w,
-            &mut cap_e,
-            cap_n,
-            cap_feat,
-            hs,
-            None,
-        );
+        self.cap_w
+            .matmat(&cap_n_all, cap_n, &mut cap_e, self.pool.as_deref());
         for i in 0..cap_n {
             for (v, &b) in cap_e[i * hs..(i + 1) * hs].iter_mut().zip(&self.cap_b) {
                 *v += b;
@@ -436,7 +599,8 @@ impl NextDit {
             }
         }
         let mut img = vec![0f32; n_img * hs];
-        gemm_nt(&tok, &self.x_emb_w, &mut img, n_img, pv, hs, None);
+        self.x_emb
+            .matmat(&tok, n_img, &mut img, self.pool.as_deref());
         for i in 0..n_img {
             for (v, &b) in img[i * hs..(i + 1) * hs].iter_mut().zip(&self.x_emb_b) {
                 *v += b;
@@ -486,7 +650,7 @@ impl NextDit {
             }
         }
         let mut out = vec![0f32; n * pv];
-        gemm_nt(&x, &self.out_lin2_w, &mut out, n, hs, pv, None);
+        self.out_lin2.matmat(&x, n, &mut out, self.pool.as_deref());
         for i in 0..n {
             for (v, &b) in out[i * pv..(i + 1) * pv].iter_mut().zip(&self.out_lin2_b) {
                 *v += b;
