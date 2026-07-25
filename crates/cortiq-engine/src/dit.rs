@@ -147,6 +147,43 @@ fn linear(x: &[f32], w: &[f32], b: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+/// Row handout for pool workers over one flat buffer (Rust-2021
+/// closures capture the raw pointer field, not the wrapper — hence
+/// the accessor method).
+struct SendRows(*mut f32);
+unsafe impl Send for SendRows {}
+unsafe impl Sync for SendRows {}
+impl SendRows {
+    /// SAFETY: caller guarantees disjoint `[off, off+len)` per worker.
+    unsafe fn row(&self, off: usize, len: usize) -> &mut [f32] {
+        unsafe { std::slice::from_raw_parts_mut(self.0.add(off), len) }
+    }
+}
+
+/// Numerically stable in-place softmax of one full row (NEON exp on
+/// aarch64, scalar elsewhere).
+fn softmax_inplace(row: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::attention::softmax_row(row);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mx = row.iter().cloned().fold(f32::MIN, f32::max);
+        let mut den = 0f32;
+        for r in row.iter_mut() {
+            *r = (*r - mx).exp();
+            den += *r;
+        }
+        if den > 0.0 {
+            let inv = 1.0 / den;
+            for r in row.iter_mut() {
+                *r *= inv;
+            }
+        }
+    }
+}
+
 /// Any CMF directory entry → f32 (norms, biases, f16 conv kernels).
 pub(crate) fn cmf_f32(model: &CmfModel, name: &str) -> Result<Vec<f32>, String> {
     let entry = model
@@ -460,33 +497,49 @@ impl NextDit {
                 }
             }
         }
-        // full (bidirectional) softmax attention, GQA
+        // full (bidirectional) softmax attention, GQA — per head:
+        // scores = (Q·s)·Kᵀ and P·V as GEMMs (Accelerate/blocked),
+        // pool-parallel row softmax between them. The naive
+        // per-position loop was the depth wall: at 512px (1064
+        // tokens) attention alone cost hundreds of serial GFLOP.
         let scale = 1.0 / (hd as f32).sqrt();
         let hpk = nh / nkv;
         let mut attn = vec![0f32; n * nh * hd];
-        let mut row = vec![0f32; n];
+        let mut qh = vec![0f32; n * hd];
+        let mut kh = vec![0f32; n * hd];
+        let mut vt = vec![0f32; hd * n]; // V transposed: gemm_nt's W layout
+        let mut scores = vec![0f32; n * n];
+        let mut oh = vec![0f32; n * hd];
         for hh in 0..nh {
             let kv = hh / hpk;
             for p in 0..n {
-                let qv = &q_all[(p * nh + hh) * hd..(p * nh + hh + 1) * hd];
-                for (j, r) in row.iter_mut().enumerate() {
-                    let kvv = &k_all[(j * nkv + kv) * hd..(j * nkv + kv + 1) * hd];
-                    *r = qv.iter().zip(kvv).map(|(&a, &b)| a * b).sum::<f32>() * scale;
+                let qsrc = &q_all[(p * nh + hh) * hd..(p * nh + hh + 1) * hd];
+                for (d, &v) in qsrc.iter().enumerate() {
+                    qh[p * hd + d] = v * scale;
                 }
-                let mx = row.iter().cloned().fold(f32::MIN, f32::max);
-                let mut den = 0f32;
-                for r in row.iter_mut() {
-                    *r = (*r - mx).exp();
-                    den += *r;
+                kh[p * hd..(p + 1) * hd]
+                    .copy_from_slice(&k_all[(p * nkv + kv) * hd..(p * nkv + kv + 1) * hd]);
+                let vv = &v_all[(p * nkv + kv) * hd..(p * nkv + kv + 1) * hd];
+                for (d, &val) in vv.iter().enumerate() {
+                    vt[d * n + p] = val;
                 }
-                let inv = 1.0 / den;
-                let out = &mut attn[(p * nh + hh) * hd..(p * nh + hh + 1) * hd];
-                for (j, &rw) in row.iter().enumerate() {
-                    let vv = &v_all[(j * nkv + kv) * hd..(j * nkv + kv + 1) * hd];
-                    for (o, s) in out.iter_mut().zip(vv) {
-                        *o += rw * inv * s;
-                    }
+            }
+            crate::fcd_ops::gemm_nt(&qh, &kh, &mut scores, n, hd, n, pool);
+            let sp = SendRows(scores.as_mut_ptr());
+            let soft = |start: usize, end: usize| {
+                for r in start..end {
+                    // SAFETY: workers cover disjoint row ranges.
+                    softmax_inplace(unsafe { sp.row(r * n, n) });
                 }
+            };
+            match pool {
+                Some(p) => p.run_rows(n, &soft),
+                None => soft(0, n),
+            }
+            crate::fcd_ops::gemm_nt(&scores, &vt, &mut oh, n, n, hd, pool);
+            for p in 0..n {
+                attn[(p * nh + hh) * hd..(p * nh + hh + 1) * hd]
+                    .copy_from_slice(&oh[p * hd..(p + 1) * hd]);
             }
         }
         let mut proj = vec![0f32; n * hs];
