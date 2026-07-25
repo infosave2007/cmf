@@ -925,6 +925,79 @@ fn gqa_attend(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
     }
 }
 
+// hd <= 128 twin of gqa_attend at stride 129 — 16.5 KB of workgroup
+// memory instead of 33 KB. Mobile GPUs (Adreno/Mali) and wgpu-Metal cap
+// maxComputeWorkgroupStorageSize at 32768 B, where the 257-stride kernel
+// cannot even be created: the invalid pipeline turned every dispatch
+// into a no-op and the graph decoded garbage on phones. (lane*129 + d)
+// mod 32 == (lane + d) mod 32 — still bank-conflict-free.
+var<workgroup> at_acc_s: array<f32, 4128>;
+@compute @workgroup_size(32)
+fn gqa_attend_s(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let lane = lid.x;
+    if (h >= at_p.nh) { return; }
+    let hd = at_p.hd;
+    let hd4 = hd / 4u;
+    let n = at_p.n;
+    let kbase = (h / at_p.hpk) * at_p.cap * hd4;
+    let qbase = h * hd4;
+    let scale = 1.0 / sqrt(f32(hd));
+    let base = lane * 129u;
+    for (var d = 0u; d < hd; d = d + 1u) { at_acc_s[base + d] = 0.0; }
+    var m = -1e30;
+    var l = 0.0;
+    var p = lane;
+    loop {
+        if (p >= n) { break; }
+        let krow = kbase + p * hd4;
+        var dot4 = vec4<f32>(0.0);
+        for (var d = 0u; d < hd4; d = d + 1u) { dot4 = dot4 + at_q[qbase + d] * at_k[krow + d]; }
+        let dot = (dot4.x + dot4.y + dot4.z + dot4.w) * scale;
+        let mp = max(m, dot);
+        let f = exp(m - mp);
+        let w = exp(dot - mp);
+        l = l * f + w;
+        for (var d = 0u; d < hd4; d = d + 1u) {
+            let vv = at_v[krow + d] * w;
+            let a = base + d * 4u;
+            at_acc_s[a]      = at_acc_s[a]      * f + vv.x;
+            at_acc_s[a + 1u] = at_acc_s[a + 1u] * f + vv.y;
+            at_acc_s[a + 2u] = at_acc_s[a + 2u] * f + vv.z;
+            at_acc_s[a + 3u] = at_acc_s[a + 3u] * f + vv.w;
+        }
+        m = mp;
+        p = p + 32u;
+    }
+    at_m[lane] = m;
+    at_l[lane] = l;
+    workgroupBarrier();
+    var stride = 16u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lane < stride) {
+            let o = lane + stride;
+            let m1 = at_m[lane];
+            let m2 = at_m[o];
+            let mm = max(m1, m2);
+            let f1 = exp(m1 - mm);
+            let f2 = exp(m2 - mm);
+            at_l[lane] = at_l[lane] * f1 + at_l[o] * f2;
+            let bo = o * 129u;
+            for (var d = 0u; d < hd; d = d + 1u) {
+                at_acc_s[base + d] = at_acc_s[base + d] * f1 + at_acc_s[bo + d] * f2;
+            }
+            at_m[lane] = mm;
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let invl = select(0.0, 1.0 / at_l[0], at_l[0] > 0.0);
+    for (var d = lane; d < hd; d = d + 32u) {
+        at_o[h * hd + d] = at_acc_s[d] * invl;
+    }
+}
+
 // q1t (ternary base-3) + q4_block matvec — reuse the q1 bindings (q1w/q1x/q1y/
 // q1p) and its 4-slot layout. Weights arrive as array<u32>, so bytes come out
 // with shift+mask (q1t_byte). q1p fields are reinterpreted: np=gpr, _p0=cols.
@@ -1389,6 +1462,79 @@ fn gqa_attend_part(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocat
         ap_ml[idx] = vec2<f32>(app_m[0], app_l[0]);
     }
 }
+// hd <= 128 twin of gqa_attend_part at stride 129 (16.5 KB workgroup
+// memory — fits the 32 KB mobile/Metal limit; see gqa_attend_s).
+var<workgroup> app_acc_s: array<f32, 4128>;
+@compute @workgroup_size(32)
+fn gqa_attend_part_s(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let ch = wid.y;
+    let lane = lid.x;
+    if (h >= ap_p.nh) { return; }
+    let hd = ap_p.hd;
+    let hd4 = hd / 4u;
+    let p0 = ch * ap_p.ck;
+    let pend = min(ap_p.n, p0 + ap_p.ck);
+    let kbase = (h / ap_p.hpk) * ap_p.cap * hd4;
+    let qbase = h * hd4;
+    let scale = 1.0 / sqrt(f32(hd));
+    let base = lane * 129u;
+    for (var d = 0u; d < hd; d = d + 1u) { app_acc_s[base + d] = 0.0; }
+    var m = -1e30;
+    var l = 0.0;
+    var p = p0 + lane;
+    loop {
+        if (p >= pend) { break; }
+        let krow = kbase + p * hd4;
+        var dot4 = vec4<f32>(0.0);
+        for (var d = 0u; d < hd4; d = d + 1u) { dot4 = dot4 + ap_q[qbase + d] * ap_k[krow + d]; }
+        let dot = (dot4.x + dot4.y + dot4.z + dot4.w) * scale;
+        let mp = max(m, dot);
+        let f = exp(m - mp);
+        let w = exp(dot - mp);
+        l = l * f + w;
+        for (var d = 0u; d < hd4; d = d + 1u) {
+            let vv = ap_v[krow + d] * w;
+            let a = base + d * 4u;
+            app_acc_s[a]      = app_acc_s[a]      * f + vv.x;
+            app_acc_s[a + 1u] = app_acc_s[a + 1u] * f + vv.y;
+            app_acc_s[a + 2u] = app_acc_s[a + 2u] * f + vv.z;
+            app_acc_s[a + 3u] = app_acc_s[a + 3u] * f + vv.w;
+        }
+        m = mp;
+        p = p + 32u;
+    }
+    app_m[lane] = m;
+    app_l[lane] = l;
+    workgroupBarrier();
+    var stride = 16u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lane < stride) {
+            let o = lane + stride;
+            let m1 = app_m[lane];
+            let m2 = app_m[o];
+            let mm = max(m1, m2);
+            let f1 = exp(m1 - mm);
+            let f2 = exp(m2 - mm);
+            app_l[lane] = app_l[lane] * f1 + app_l[o] * f2;
+            let bo = o * 129u;
+            for (var d = 0u; d < hd; d = d + 1u) {
+                app_acc_s[base + d] = app_acc_s[base + d] * f1 + app_acc_s[bo + d] * f2;
+            }
+            app_m[lane] = mm;
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let idx = h * ap_p.nc + ch;
+    for (var d = lane; d < hd; d = d + 32u) {
+        ap_acc[idx * hd + d] = app_acc_s[d];
+    }
+    if (lane == 0u) {
+        ap_ml[idx] = vec2<f32>(app_m[0], app_l[0]);
+    }
+}
 @compute @workgroup_size(32)
 fn gqa_attend_merge(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let h = wid.x;
@@ -1446,8 +1592,15 @@ struct Ctx {
     attn_rope: wgpu::ComputePipeline,
     kv_append: wgpu::ComputePipeline,
     gqa_attend: wgpu::ComputePipeline,
+    gqa_attend_s: wgpu::ComputePipeline,
     attend_part: wgpu::ComputePipeline,
+    attend_part_s: wgpu::ComputePipeline,
     attend_merge: wgpu::ComputePipeline,
+    /// Max head_dim the attend kernels can serve on this device: 256
+    /// when 33 KB of workgroup storage fits (desktop), 128 on 32 KB
+    /// devices (Adreno/Mali/wgpu-Metal) where only the stride-129
+    /// kernels exist.
+    hd_cap: usize,
     gdn_step: wgpu::ComputePipeline,
     gdn_conv: wgpu::ComputePipeline,
     f32_matvec: wgpu::ComputePipeline,
@@ -1467,7 +1620,9 @@ struct Ctx {
     layout_attn_rope: wgpu::BindGroupLayout,
     layout_kv: wgpu::BindGroupLayout,
     layout_attend: wgpu::BindGroupLayout,
+    layout_attend_s: wgpu::BindGroupLayout,
     layout_attend_part: wgpu::BindGroupLayout,
+    layout_attend_part_s: wgpu::BindGroupLayout,
     layout_attend_merge: wgpu::BindGroupLayout,
     layout_gdn: wgpu::BindGroupLayout,
     layout_gdn_conv: wgpu::BindGroupLayout,
@@ -1702,12 +1857,21 @@ fn init() -> Result<Ctx, String> {
     // Take the card's maximum limits — large tensors (lm_head ≈ 254 MB
     // int8) require a raised storage buffer; a discrete card handles GB.
     let limits = adapter.limits();
+    // 33 152 B = the stride-257 attend kernels' workgroup footprint.
+    // Adreno/Mali/wgpu-Metal report 32 768 — there only the stride-129
+    // (hd <= 128) kernels are created.
+    let big_attend = limits.max_compute_workgroup_storage_size >= 33_152;
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cortiq-wgpu"),
         required_limits: limits,
         ..Default::default()
     }))
     .map_err(|e| format!("request_device: {e}"))?;
+    // Every shader-module and pipeline validation error below must fail
+    // init: an invalid pipeline silently turns its dispatches into
+    // no-ops and the graph decodes garbage (seen on phones before this
+    // scope existed). Err here = clean CPU fallback.
+    let vscope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
     let info = adapter.get_info();
     let discrete = info.device_type == wgpu::DeviceType::DiscreteGpu;
@@ -1770,7 +1934,12 @@ fn init() -> Result<Ctx, String> {
     let add_rmsnorm_b = pipe("add_rmsnorm_b");
     let attn_rope = pipe("attn_rope_qkn");
     let kv_append = pipe("kv_append");
-    let gqa_attend = pipe("gqa_attend");
+    let gqa_attend_s = pipe("gqa_attend_s");
+    let gqa_attend = if big_attend {
+        pipe("gqa_attend")
+    } else {
+        gqa_attend_s.clone()
+    };
     let gdn_step = pipe("gdn_step");
     let gdn_conv = pipe("gdn_conv");
     let f32_matvec = pipe("f32_matvec");
@@ -1783,6 +1952,7 @@ fn init() -> Result<Ctx, String> {
     let layout_attn_rope = attn_rope.get_bind_group_layout(0);
     let layout_kv = kv_append.get_bind_group_layout(0);
     let layout_attend = gqa_attend.get_bind_group_layout(0);
+    let layout_attend_s = gqa_attend_s.get_bind_group_layout(0);
     let split_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("cmf-attend-split"),
         source: wgpu::ShaderSource::Wgsl(ATTEND_SPLIT_SRC.into()),
@@ -1797,9 +1967,15 @@ fn init() -> Result<Ctx, String> {
             cache: None,
         })
     };
-    let attend_part = pipe_split("gqa_attend_part");
+    let attend_part_s = pipe_split("gqa_attend_part_s");
+    let attend_part = if big_attend {
+        pipe_split("gqa_attend_part")
+    } else {
+        attend_part_s.clone()
+    };
     let attend_merge = pipe_split("gqa_attend_merge");
     let layout_attend_part = attend_part.get_bind_group_layout(0);
+    let layout_attend_part_s = attend_part_s.get_bind_group_layout(0);
     let layout_attend_merge = attend_merge.get_bind_group_layout(0);
     let layout_gdn = gdn_step.get_bind_group_layout(0);
     let layout_gdn_conv = gdn_conv.get_bind_group_layout(0);
@@ -1812,6 +1988,10 @@ fn init() -> Result<Ctx, String> {
     let layout_axpy = axpy.get_bind_group_layout(0);
     let layout_gate_mul = gate_mul.get_bind_group_layout(0);
     let layout_zero = zero.get_bind_group_layout(0);
+
+    if let Some(e) = pollster::block_on(vscope.pop()) {
+        return Err(format!("wgpu pipeline validation: {e}"));
+    }
 
     Ok(Ctx {
         device,
@@ -1838,8 +2018,11 @@ fn init() -> Result<Ctx, String> {
         attn_rope,
         kv_append,
         gqa_attend,
+        gqa_attend_s,
         attend_part,
+        attend_part_s,
         attend_merge,
+        hd_cap: if big_attend { 256 } else { 128 },
         gdn_step,
         gdn_conv,
         f32_matvec,
@@ -1859,7 +2042,9 @@ fn init() -> Result<Ctx, String> {
         layout_attn_rope,
         layout_kv,
         layout_attend,
+        layout_attend_s,
         layout_attend_part,
+        layout_attend_part_s,
         layout_attend_merge,
         layout_gdn,
         layout_gdn_conv,
@@ -2500,8 +2685,8 @@ pub fn gqa_attend_gpu(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
-    if hd % 4 != 0 {
-        return false; // the attend kernel reads K/V as vec4
+    if hd % 4 != 0 || hd > c.hd_cap {
+        return false; // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
     let q_b = storage_bytes(c, bytemuck::cast_slice(q));
     let k_b = storage_bytes(c, bytemuck::cast_slice(kcache));
@@ -2518,7 +2703,7 @@ pub fn gqa_attend_gpu(
         });
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("at-bg"),
-        layout: &c.layout_attend,
+        layout: attend_pipes(c, hd).1,
         entries: &[
             bind_buf(0, &q_b),
             bind_buf(1, &k_b),
@@ -2535,7 +2720,7 @@ pub fn gqa_attend_gpu(
             label: Some("at"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&c.gqa_attend);
+        pass.set_pipeline(attend_pipes(c, hd).0);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(nh as u32, 1, 1);
     }
@@ -2606,8 +2791,8 @@ pub fn attn_dropin_gpu(
     attn_out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
-    if pos >= cap || hd % 4 != 0 {
-        return false; // hd % 4: the attend kernel reads K/V as vec4
+    if pos >= cap || hd % 4 != 0 || hd > c.hd_cap {
+        return false; // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
     let (wq, rq, cq) = q1_weight(c, model, wq_idx).unwrap_or((
         c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2780,12 +2965,15 @@ pub fn attn_dropin_gpu(
         0,
         0,
     ]);
-    go(
-        &mut enc,
-        &c.gqa_attend,
-        &bg(&c.layout_attend, &[&qout_b, &kbuf, &vbuf, &attn_b, &at_p]),
-        nh as u32,
-    );
+    {
+        let (ap, al) = attend_pipes(c, hd);
+        go(
+            &mut enc,
+            ap,
+            &bg(al, &[&qout_b, &kbuf, &vbuf, &attn_b, &at_p]),
+            nh as u32,
+        );
+    }
     encode_matvec_q1(c, &mut enc, &wo, &attn_b, &o_b, hidden, nh * hd);
     let size = (hidden * 4) as u64;
     let mut sc = c.scratch.lock().unwrap();
@@ -2840,8 +3028,8 @@ pub fn forward_token_graph(
     loop_norm_at: &[usize],
 ) -> bool {
     let Some(c) = ctx() else { return false };
-    if position >= cap || hd % 4 != 0 {
-        return false; // hd % 4: the attend kernel reads K/V as vec4
+    if position >= cap || hd % 4 != 0 || hd > c.hd_cap {
+        return false; // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
     let t_start = std::time::Instant::now();
     // A resolved matvec weight: the device-local buffer, (q8 only) its row
@@ -3579,10 +3767,8 @@ pub fn forward_token_graph(
                         nc as u32,
                         0,
                     ]);
-                    let bg_part = bg(
-                        &c.layout_attend_part,
-                        &[&qout, kbuf, vbuf, &pacc, &pml, &ap_u],
-                    );
+                    let (pp, pl) = attend_part_pipes(c, hd);
+                    let bg_part = bg(pl, &[&qout, kbuf, vbuf, &pacc, &pml, &ap_u]);
                     let bg_merge = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
                         layout: &c.layout_attend_merge,
@@ -3597,17 +3783,18 @@ pub fn forward_token_graph(
                         label: None,
                         timestamp_writes: None,
                     });
-                    pass.set_pipeline(&c.attend_part);
+                    pass.set_pipeline(pp);
                     pass.set_bind_group(0, &bg_part, &[]);
                     pass.dispatch_workgroups(nh as u32, nc_used as u32, 1);
                     pass.set_pipeline(&c.attend_merge);
                     pass.set_bind_group(0, &bg_merge, &[]);
                     pass.dispatch_workgroups(nh as u32, 1, 1);
                 } else {
+                    let (ap, al) = attend_pipes(c, hd);
                     go(
                         &mut enc,
-                        &c.gqa_attend,
-                        &bg(&c.layout_attend, &[&qout, kbuf, vbuf, &attn, &at_u]),
+                        ap,
+                        &bg(al, &[&qout, kbuf, vbuf, &attn, &at_u]),
                         nh as u32,
                     );
                 }
@@ -3874,8 +4061,8 @@ pub fn forward_batch_graph(
         return false;
     }
     let pos0 = positions[0];
-    if pos0 + k > cap || hd % 4 != 0 {
-        return false; // hd % 4: the attend kernel reads K/V as vec4
+    if pos0 + k > cap || hd % 4 != 0 || hd > c.hd_cap {
+        return false; // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
     struct GMat {
         buf: wgpu::Buffer,
@@ -4308,10 +4495,11 @@ pub fn forward_batch_graph(
                         &bg(&c.layout_kv, &[&kb_s, &vb_s, kbuf, vbuf, &kv_u]),
                         ((nkv * hd) as u32).div_ceil(256),
                     );
+                    let (ap, al) = attend_pipes(c, hd);
                     go(
                         &mut enc,
-                        &c.gqa_attend,
-                        &bg(&c.layout_attend, &[&qout_s, kbuf, vbuf, &attn_s, &at_u]),
+                        ap,
+                        &bg(al, &[&qout_s, kbuf, vbuf, &attn_s, &at_u]),
                         nh as u32,
                     );
                     if *output_gate {
@@ -4805,12 +4993,15 @@ pub fn attn_block_gpu(
         0,
         0,
     ]);
-    dispatch(
-        &mut enc,
-        &c.gqa_attend,
-        &bg(&c.layout_attend, &[&qout_b, kbuf, vbuf, &attn_b, &at_p]),
-        nh as u32,
-    );
+    {
+        let (ap, al) = attend_pipes(c, hd);
+        dispatch(
+            &mut enc,
+            ap,
+            &bg(al, &[&qout_b, kbuf, vbuf, &attn_b, &at_p]),
+            nh as u32,
+        );
+    }
     // 6. O (q1)
     encode_matvec_q1(c, &mut enc, &wo_b, &attn_b, &o_b, hidden, nh * hd);
     // 7. residual h += o
@@ -5637,6 +5828,25 @@ fn encode_f32matvec(
 /// Encode a q4_tiled or q1t matvec into `enc` (same 4-slot layout as q1, but
 /// params are [gpr, rows, cols]; q1t reads its sparse overlay from the tail of
 /// the same buffer). `pipeline` is c.q4b or c.q1t.
+/// Attend kernel flavor by head_dim: stride-129 (16.5 KB of workgroup
+/// memory, exists on every device) for hd <= 128, stride-257 for larger
+/// heads (desktop-only — see Ctx::hd_cap).
+fn attend_pipes(c: &Ctx, hd: usize) -> (&wgpu::ComputePipeline, &wgpu::BindGroupLayout) {
+    if hd <= 128 {
+        (&c.gqa_attend_s, &c.layout_attend_s)
+    } else {
+        (&c.gqa_attend, &c.layout_attend)
+    }
+}
+
+fn attend_part_pipes(c: &Ctx, hd: usize) -> (&wgpu::ComputePipeline, &wgpu::BindGroupLayout) {
+    if hd <= 128 {
+        (&c.attend_part_s, &c.layout_attend_part_s)
+    } else {
+        (&c.attend_part, &c.layout_attend_part)
+    }
+}
+
 fn encode_q1t_like(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
@@ -6448,12 +6658,24 @@ mod tests {
     #[test]
     fn wgpu_gqa_attend_matches_cpu() {
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
-        if ctx().is_none() {
+        let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping gqa_attend parity test");
             return;
+        };
+        // hd=128 exercises the stride-129 kernel (exists everywhere);
+        // hd=256 exercises stride-257 where the device's workgroup
+        // storage allows it (32 KB devices — Adreno/Mali/wgpu-Metal —
+        // honestly refuse: hd_cap gates them to the small kernel).
+        attend_case(128);
+        if c.hd_cap >= 256 {
+            attend_case(256);
+        } else {
+            eprintln!("hd_cap {} — skipping hd=256 attend case", c.hd_cap);
         }
-        // head_dim 256 (Qwen3.5): exercises the at_acc stride-257 accumulator.
-        let (nh, hpk, hd, cap, n) = (4usize, 2usize, 256usize, 16usize, 5usize);
+    }
+
+    fn attend_case(hd: usize) {
+        let (nh, hpk, cap, n) = (4usize, 2usize, 16usize, 5usize);
         let nkv = nh / hpk;
         let jit = |a: usize, b: usize| ((a * 29 + b * 13 + 5) % 89) as f32 / 89.0 - 0.5;
         let q: Vec<f32> = (0..nh * hd).map(|i| jit(i, 1)).collect();
@@ -6501,7 +6723,7 @@ mod tests {
             .zip(&got)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(md < 1e-4, "wgpu gqa_attend ≠ CPU: max|Δ| = {md}");
+        assert!(md < 1e-4, "wgpu gqa_attend hd={hd} ≠ CPU: max|Δ| = {md}");
     }
 
     #[test]
