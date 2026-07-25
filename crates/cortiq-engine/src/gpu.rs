@@ -429,6 +429,21 @@ pub fn enabled() -> bool {
     backend() != Backend::None
 }
 
+/// Is the active backend wgpu (discrete Vulkan/DX12)? The wgpu
+/// whole-token graph defaults on this — NOT on plain `enabled()`, so
+/// macOS/Metal decode does not pay a per-token layer-scan for a graph
+/// that its backend will refuse anyway.
+pub fn wgpu_active() -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        matches!(backend(), Backend::Wgpu)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        false
+    }
+}
+
 /// q8_row/q8_2f matvec, rows [row0, row0+rows). `xs` — prescaled by the θ-field.
 #[allow(clippy::too_many_arguments, unused_variables)]
 pub fn q8_matvec_range(

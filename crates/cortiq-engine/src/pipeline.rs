@@ -491,7 +491,13 @@ impl Pipeline {
         let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH")
             .map(|v| v != "0")
             .unwrap_or_else(|_| {
+                // Default ON whenever the GPU is on — via the FFI toggle
+                // (GLOBAL_USE_GPU) or the CMF_GPU env (gpu::enabled()).
+                // The env leg was missing, so the whole-token wgpu graph
+                // never engaged from the CLI (4090: decode 76 -> 137
+                // tok/s once it does).
                 crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)
+                    || crate::gpu::wgpu_active()
             });
         if !graph_on || !crate::gpu::enabled_here() {
             return false;
@@ -1216,7 +1222,13 @@ impl Pipeline {
         let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH")
             .map(|v| v != "0")
             .unwrap_or_else(|_| {
+                // Default ON whenever the GPU is on — via the FFI toggle
+                // (GLOBAL_USE_GPU) or the CMF_GPU env (gpu::enabled()).
+                // The env leg was missing, so the whole-token wgpu graph
+                // never engaged from the CLI (4090: decode 76 -> 137
+                // tok/s once it does).
                 crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)
+                    || crate::gpu::wgpu_active()
             });
         let spec_active = self.speculative
             && self.mtp.is_some()
@@ -3190,7 +3202,13 @@ impl Pipeline {
         let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH")
             .map(|v| v != "0")
             .unwrap_or_else(|_| {
+                // Default ON whenever the GPU is on — via the FFI toggle
+                // (GLOBAL_USE_GPU) or the CMF_GPU env (gpu::enabled()).
+                // The env leg was missing, so the whole-token wgpu graph
+                // never engaged from the CLI (4090: decode 76 -> 137
+                // tok/s once it does).
                 crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)
+                    || crate::gpu::wgpu_active()
             });
         // Whole-token graph: the ENTIRE layer stack in one submit (one readback
         // per token). Preferred over the per-layer drop-in when every layer is
@@ -4525,6 +4543,10 @@ mod tests {
 
     #[test]
     fn speculative_equals_vanilla_greedy() {
+        // Speculative decode and the wgpu token graph are mutually
+        // exclusive; a leaked CMF_GPU=wgpu from a parallel gpu test
+        // would silently disable drafting. Pin the graph off.
+        unsafe { std::env::set_var("CMF_GPU_WGPU_GRAPH", "0") };
         let run = |spec: bool| {
             let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
             p.sampler_config.temperature = 0.0;
@@ -4545,6 +4567,8 @@ mod tests {
 
     #[test]
     fn speculative_accepts_constant_oracle() {
+        // See speculative_equals_vanilla_greedy: pin the wgpu graph off.
+        unsafe { std::env::set_var("CMF_GPU_WGPU_GRAPH", "0") };
         let mut p = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
         p.sampler_config.temperature = 0.0;
         p.sampler_config.repetition_penalty = 1.0;
