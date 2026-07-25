@@ -2202,6 +2202,63 @@ kernel void q4b_matvec_h(
         if (nr > 3u) y[r0 + 3u] = acc3;
     }
 }
+
+// q4_tiled: 18-byte tiles [f16 scale][16B nibbles] per 32-group — ONE
+// sequential stream per row (the split q4b layout reads nibbles and
+// scales from two distant regions). Nibble order and values match q4b
+// (lo nibble = even element, hi = odd, value = nibble − 8), so
+// q4_dot8_fast is reused as-is. 18B tiles are only 2-aligned → the
+// nibble words go through the unaligned byte loaders.
+kernel void q4t_matvec(
+    device const uchar* q    [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       y    [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    if (r0 >= rows) return;
+    uint nr = min(rows - r0, 4u);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint xb = g * 32u;
+        device const float4* xv = (device const float4*)(x + xb);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        for (uint ri = 0u; ri < nr; ++ri) {
+            ulong t = ((ulong)(r0 + ri) * gpr + (ulong)g) * 18u;
+            // 18B tiles are always 2-aligned (tensor blobs are 64-aligned,
+            // 18 is even) → nine ushort loads, not sixteen byte loads.
+            device const ushort* p16 = (device const ushort*)(q + t);
+            half scale = as_type<half>(p16[0]);
+            uint b0 = (uint)p16[1] | ((uint)p16[2] << 16);
+            uint b1 = (uint)p16[3] | ((uint)p16[4] << 16);
+            uint b2 = (uint)p16[5] | ((uint)p16[6] << 16);
+            uint b3 = (uint)p16[7] | ((uint)p16[8] << 16);
+            float gsum = q4_dot8_fast(b0, x0, x1)
+                       + q4_dot8_fast(b1, x2, x3)
+                       + q4_dot8_fast(b2, x4, x5)
+                       + q4_dot8_fast(b3, x6, x7);
+            float contrib = (float)scale * gsum;
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    if (lane == 0u) {
+        y[r0] = acc0;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
+    }
+}
 "#;
 
 struct Ctx {
@@ -2219,6 +2276,7 @@ struct Ctx {
     q1t_ovmm: ComputePipelineState,
     q4b: ComputePipelineState,
     q4bh: ComputePipelineState,
+    q4t: ComputePipelineState,
     flag: ComputePipelineState,
     rmsn: ComputePipelineState,
     f16mv: ComputePipelineState,
@@ -2356,6 +2414,7 @@ fn init() -> Result<Ctx, String> {
     let q1t_ovmm = pso("q1t_overlay_mm")?;
     let q4b = pso("q4b_matvec")?;
     let q4bh = pso("q4b_matvec_h")?;
+    let q4t = pso("q4t_matvec")?;
     let flag = pso("write_flag")?;
     let rmsn = pso("rmsnorm_k")?;
     let f16mv = pso("f32_matvec")?;
@@ -2400,6 +2459,7 @@ fn init() -> Result<Ctx, String> {
         q1t_ovmm,
         q4b,
         q4bh,
+        q4t,
         flag,
         rmsn,
         f16mv,
@@ -2873,6 +2933,7 @@ enum ProjKind {
     Q1,
     Q1t,
     Q4b,
+    Q4t,
     Q8 {
         row_scale: Buffer,
         col_field: Option<Buffer>,
@@ -2912,6 +2973,34 @@ fn encode_q4b_matvec(
     );
 }
 
+/// Encode q4_tiled matvec: 18B interleaved tiles, one buffer, no
+/// separate scale region.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4t_matvec(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &Buffer,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    rows: usize,
+    gpr: usize,
+) {
+    enc.set_compute_pipeline_state(&c.q4t);
+    enc.set_buffer(0, Some(fbuf), abs as u64);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let gpr_u = gpr as u32;
+    let rows_u = rows as u32;
+    enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    let sgs = 8u64;
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
+}
+
 /// Encode a projection `in_buf → out_buf` for a Q1 / Q1T / Q4-block weight.
 /// For Q1T the base matvec is followed by the on-device overlay add. Free fn so
 /// it works inside the graph encode loops (which capture `c`/`fbuf`, not self).
@@ -2934,6 +3023,9 @@ fn encode_proj(
         }
         ProjKind::Q4b => {
             encode_q4b_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
+        }
+        ProjKind::Q4t => {
+            encode_q4t_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
         }
         ProjKind::Q1 => {
             encode_q1_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
@@ -3103,6 +3195,60 @@ fn q1t_matvec_impl(
     if full {
         encode_q1t_overlay(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
     }
+    enc.end_encoding();
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), rows);
+    }
+    true
+}
+
+/// Diagnostic entry point matching the whole-token graph's Q4Tiled
+/// projection encode (no overlay — q4t is a fixed-length codec).
+#[doc(hidden)]
+pub fn q4t_matvec_for_test(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % GROUP_SIZE != 0 {
+        return false;
+    }
+    let gpr = cols / GROUP_SIZE;
+    let entry = &model.tensors[idx];
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let _bytes = model.primary_bytes();
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    if abs + rows * gpr * (2 + GROUP_SIZE / 2) > safe_len {
+        return false;
+    }
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let xs_buf = get_io(13_000_000_559 + xs.len(), xs.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(xs.as_ptr(), xs_buf.contents() as *mut f32, xs.len());
+    }
+    let y_buf = get_io(14_000_000_573 + rows, rows * 4);
+    let cmd = c.queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    encode_q4t_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
     enc.end_encoding();
     submit_and_wait(c, cmd, &[&y_buf]);
     unsafe {
@@ -4756,12 +4902,29 @@ impl TokenGraph {
         Some(abs)
     }
 
-    /// Resolve a projection tensor accepting Q1 / Q1T / Q4-block.
+    /// Validate one q4_tiled tensor: `rows·gpr·18` interleaved tile
+    /// bytes must fit the safe mmap window.
+    fn q4t_abs(&self, t: (usize, usize, usize)) -> Option<usize> {
+        let (idx, rows, cols) = t;
+        if cols % GROUP_SIZE != 0 {
+            return None;
+        }
+        let entry = &self.model.tensors[idx];
+        let abs = self.model.entry_abs_offset(entry)?;
+        let n_groups = rows * (cols / GROUP_SIZE);
+        if abs + n_groups * (2 + GROUP_SIZE / 2) > self.safe_len {
+            return None;
+        }
+        Some(abs)
+    }
+
+    /// Resolve a projection tensor accepting Q1 / Q1T / Q4-block/tiled.
     fn proj_abs(&self, t: (usize, usize, usize)) -> Option<(usize, ProjKind)> {
         match self.model.tensors[t.0].dtype {
             cortiq_core::TensorDtype::Q1 => self.q1_abs(t).map(|a| (a, ProjKind::Q1)),
             cortiq_core::TensorDtype::Q1T => self.q1t_abs(t).map(|a| (a, ProjKind::Q1t)),
             cortiq_core::TensorDtype::Q4Block => self.q4b_abs(t).map(|a| (a, ProjKind::Q4b)),
+            cortiq_core::TensorDtype::Q4Tiled => self.q4t_abs(t).map(|a| (a, ProjKind::Q4t)),
             cortiq_core::TensorDtype::Q8Row | cortiq_core::TensorDtype::Q8_2f => {
                 self.q8_abs(t).map(|(a, row_scale, col_field)| {
                     (
@@ -5919,6 +6082,140 @@ mod tests {
         }
         // q8 grid tolerance: |w|≤0.15, step ≈ absmax/127, dot over 64.
         assert!(max_d < 2e-2, "GPU vs f32 reference: max|Δ| = {max_d}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// GPU q4_tiled kernel == exact f32 reference over a real mmap.
+    /// cols=96 (gpr=3) puts tiles at both u32 parities — the unaligned
+    /// byte-loader path. Skipped without a Metal device.
+    #[test]
+    fn gpu_q4t_matvec_matches_reference() {
+        unsafe { std::env::set_var("CMF_GPU", "1") };
+        if !enabled() {
+            eprintln!("gpu test skipped: no Metal device");
+            return;
+        }
+        // Big enough that the file spans several pages (file_buffer
+        // rounds the no-copy window DOWN to a page); the trailing pad
+        // tensor keeps `w` clear of the truncated last page.
+        let (rows, cols) = (1024usize, 96usize);
+        let gpr = cols / GROUP_SIZE;
+        const TILE: usize = 18;
+        let mut payload = vec![0u8; rows * gpr * TILE];
+        for r in 0..rows {
+            for g in 0..gpr {
+                let t = (r * gpr + g) * TILE;
+                let sc = 0.02 + 0.001 * ((r + g) % 11) as f32;
+                payload[t..t + 2]
+                    .copy_from_slice(&cortiq_core::quant::f32_to_f16(sc).to_le_bytes());
+                for k in 0..16 {
+                    payload[t + 2 + k] = ((r * 37 + g * 11 + k * 13) % 251) as u8;
+                }
+            }
+        }
+        let arch = ModelArch {
+            arch_name: "tiny".into(),
+            hidden_size: cols,
+            intermediate_size: cols * 2,
+            num_layers: 1,
+            num_attention_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 4,
+            vocab_size: rows,
+            layer_types: vec![LayerType::FullAttention],
+            rms_norm_eps: 1e-6,
+            norm_style: NormStyle::Qwen,
+            rope_theta: 1e4,
+            tie_word_embeddings: false,
+            partial_rotary_factor: 1.0,
+            yarn: None,
+            attention_heads_per_layer: None,
+            local_partial_rotary_factor: None,
+            mtp: None,
+            moe: None,
+            linear_core: None,
+            max_position_embeddings: 8,
+            linear_conv_kernel_dim: None,
+            linear_num_key_heads: None,
+            linear_num_value_heads: None,
+            linear_key_head_dim: None,
+            linear_value_head_dim: None,
+            hidden_act: "silu".into(),
+            embed_multiplier: 1.0,
+            query_pre_attn_scalar: None,
+            sliding_window: None,
+            sliding_window_pattern: None,
+            rope_local_base_freq: None,
+            global_head_dim: None,
+            num_global_kv_heads: None,
+            global_partial_rotary_factor: None,
+            final_logit_softcapping: None,
+            attn_v_norm: false,
+            num_loops: 1,
+            loop_final_norm: false,
+        };
+        let header = CmfHeader {
+            format: "cmf".into(),
+            version: CMF_VERSION,
+            arch,
+            quant_type: QuantType::Q4Block,
+            provenance: None,
+            tokenizer_config: None,
+            section_hashes: None,
+            skills: Vec::new(),
+            shard: None,
+            calibration: None,
+        };
+        let spec = TensorSpec {
+            name: "w".into(),
+            dtype: TensorDtype::Q4Tiled,
+            shape: vec![rows, cols],
+            data: payload.clone(),
+        };
+        let pad = TensorSpec {
+            name: "pad".into(),
+            dtype: TensorDtype::F32,
+            shape: vec![page_size() / 4, 8],
+            data: vec![0u8; page_size() * 8],
+        };
+        let dir = std::env::temp_dir().join(format!("cmf-gpu-q4t-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("q4t.cmf");
+        CmfModel::write(&path, &header, &[spec, pad], None, None).unwrap();
+        let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
+        let idx = model.tensor_index("w").unwrap();
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i * 13 + 3) % 89) as f32 / 89.0 - 0.5)
+            .collect();
+        // Exact f32 reference from the tile bytes: lo nibble → even
+        // element, hi → odd, value = (nibble − 8)·scale.
+        let mut expect = vec![0f32; rows];
+        for r in 0..rows {
+            let mut acc = 0f32;
+            for g in 0..gpr {
+                let t = (r * gpr + g) * 18;
+                let s = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([
+                    payload[t],
+                    payload[t + 1],
+                ]));
+                for k in 0..16 {
+                    let b = payload[t + 2 + k];
+                    acc += ((b & 0x0F) as f32 - 8.0) * s * x[g * 32 + 2 * k]
+                        + (((b >> 4) & 0x0F) as f32 - 8.0) * s * x[g * 32 + 2 * k + 1];
+                }
+            }
+            expect[r] = acc;
+        }
+        let mut gpu = vec![0f32; rows];
+        assert!(
+            q4t_matvec_for_test(&model, idx, &x, rows, cols, &mut gpu),
+            "q4t GPU path refused"
+        );
+        let mut max_d = 0f32;
+        for r in 0..rows {
+            max_d = max_d.max((expect[r] - gpu[r]).abs());
+        }
+        assert!(max_d < 1e-3, "GPU q4t vs f32 reference: max|Δ| = {max_d}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
