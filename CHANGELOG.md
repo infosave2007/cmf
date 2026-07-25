@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.18] — 2026-07-25
+
+### Fixed
+- **wgpu whole-token graph never engaged from the CLI**: the gate's default
+  read only the FFI toggle (`cortiq_set_gpu`), so `CMF_GPU=1` on discrete
+  Vulkan/DX12 cards silently ran the slow per-op path. The graph now
+  defaults ON whenever the wgpu backend is active. RTX 4090 decode:
+  Bonsai-27B q1 (GDN hybrid) **5.2 → 40.2 tok/s (×7.7)**, Bonsai-1.7B q1
+  65 → 154 tok/s, Nanbeige4.2-3B (Looped Transformer) 10.6 → 30.8 tok/s —
+  greedy output token-identical to the CPU path on all three.
+- **q4_tiled on the wgpu graph produced garbage**: `Q4Tiled` and `Q4Block`
+  shared graph codec kind 2, so 18-byte interleaved tiles were fed to the
+  split-layout `q4b_matvec` shader. `Q4Tiled` is now kind 5 with its own
+  `q4t_matvec` WGSL kernel (u16-assembled tile reads).
+- clippy `erasing_op` in the wgpu GDN ring-size expression
+  (compiled only under `--features gpu`).
+
+### Added
+- **wgpu attend depth work**: vec4 K/V/Q loads (+12% short-context decode)
+  and split-K flash-decoding past 256 cached positions — one 128-position
+  chunk per workgroup plus a log-sum-exp merge in the same compute pass.
+  4090, 1.7B q1: ctx1024 47 → 99.5 tok/s (×2.1), ctx2048 94.9 vs CPU ~40.
+- **Metal whole-token graph: Q4Tiled** — new `q4t_matvec` MSL kernel
+  (ushort tile reads, parity with the q4b kernel); q4t models used to
+  silently fall off the graph.
+- **CPU kernels**: ARM 1×4 SDOT blocking for q4_tiled (prefill GEMM ×2.1
+  on Apple Silicon, mirroring the ×2.1 EPYC result), fused ternary pair
+  `q1t_matvec2` (×1.83 on the MTP verify path), fused `silu(gate)·up` for
+  q4_tiled pairs (+7% on AVX2).
+- **AVX-512 VNNI tile kernels** for q4t/q4b/q1/q1t (`vpdpbusd`, 256-bit VL,
+  bit-identical sums), default ON where VNNI exists — measured on Zen 4
+  (7950X): q4t +8%, q1 +6%, q4b +4%. `CMF_VNNI_TILES=0` opts out.
+- **`skill bake`**: `--target-sparsity`, `--l1-aggression`, `--ffn-align`
+  (default 32 — keeps the defragged FFN on grouped codecs and SIMD fast
+  paths) and `--uniform-inter` (one FFN width across layers, required by
+  the whole-token GPU graphs).
+
 ## [0.5.17] — 2026-07-23
 
 ### Added

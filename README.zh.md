@@ -447,6 +447,15 @@ CPU 路径在分布上等价（首词元概率相差约 0.3% 以内，PPL 一致
 提示词都逐位相同——浮点归约顺序不同，任何 GPU offload 都是如此。
 `CMF_GPU_ATTEND=0` 把注意力留在 CPU，`CMF_GPU_BLOCK=0` 关闭计算图。
 
+在独立显卡上（通过 wgpu 的 Vulkan/DX12），0.5.18 默认运行同样的整词元
+计算图：所有层——包括混合模型的 GDN 递归和 Looped Transformer 的循环
+边界——在一次 submit 中执行，每词元只回读一次；注意力采用 split-K
+flash-decoding，深上下文下吞吐不塌。RTX 4090 实测：Bonsai-27B q1 解码
+**40 tok/s**（CPU 路径的 7.7 倍，4K 上下文仍有 38），Bonsai-1.7B q1
+154 tok/s（到 ctx 2048 仍有 95+），Nanbeige4.2-3B 31 tok/s。输出与 CPU
+路径分布等价，与 Metal 计算图相同。`CMF_GPU_WGPU_GRAPH=0` 回退到逐操作
+offload。
+
 除此之外，开启 GPU 不会让你变慢：逐操作 offload 要付固定的 submit+poll
 延迟，而它在不同驱动栈之间相差一个数量级，所以引擎启动时*实测*——对每类操作
 （FFN 链、大 matvec、prefill GEMM、QKV 批量）最初几次调用在 GPU 与 CPU 之间

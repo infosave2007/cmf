@@ -503,6 +503,17 @@ reductions run in a different order, as with any GPU offload.
 `CMF_GPU_ATTEND=0` keeps the attention core on the CPU, `CMF_GPU_BLOCK=0`
 disables the graph.
 
+On discrete cards (Vulkan/DX12 via wgpu), 0.5.18 runs the same
+whole-token graph by default: every layer — including the GDN recurrence
+of hybrid models and the loop boundaries of Looped Transformers — executes
+in one submit with one readback per token, and attention uses split-K
+flash-decoding so throughput holds at depth. Measured on an RTX 4090:
+Bonsai-27B q1 decodes at **40 tok/s** (7.7× the CPU path, still 38 at a
+4K-token context), Bonsai-1.7B q1 at 154 tok/s (95+ out to ctx 2048),
+Nanbeige4.2-3B at 31 tok/s. Output is distribution-equivalent to the CPU
+path, same as the Metal graph. `CMF_GPU_WGPU_GRAPH=0` reverts to per-op
+offload.
+
 For everything else, enabling the GPU never makes you slower: per-op
 offload pays a fixed submit+poll latency that differs by an order of
 magnitude between driver stacks, so at startup the engine *measures* — for
