@@ -840,15 +840,22 @@ fn kv_append(@builtin(global_invocation_id) gid: vec3<u32>) {
 // (portable — no subgroup ops). WGSL twin of Metal gqa_attend (output only;
 // Born-importance is handled on the CPU side when eviction is active).
 struct AtP { nh: u32, hpk: u32, hd: u32, cap: u32, n: u32, _a: u32, _b: u32, _c: u32 };
-@group(0) @binding(0) var<storage, read>       at_q : array<f32>;
-@group(0) @binding(1) var<storage, read>       at_k : array<f32>;
-@group(0) @binding(2) var<storage, read>       at_v : array<f32>;
+@group(0) @binding(0) var<storage, read>       at_q : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       at_k : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>       at_v : array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> at_o : array<f32>;
 @group(0) @binding(4) var<uniform>             at_p : AtP;
 // Flash-decoding: split the n cached positions across the 32 lanes. Each lane
 // runs an INDEPENDENT online softmax over positions lane, lane+32, … with NO
 // barrier in the loop (the old kernel barriered twice PER position — O(ctx)
 // serial chain), then a 5-step 32-way log-sum-exp merge. Serial steps: n → n/32.
+// K/V/Q are vec4 bindings (hd % 4 == 0, gated by the Rust callers): each lane
+// reads a DIFFERENT cache row, so f32 loads were 4B-used-per-32B-sector — the
+// depth wall of the decode graph (4090, 1.7B q1 @ctx512: attend dominated the
+// 15 ms/token submit). vec4 quarters the wasted sectors. The workgroup
+// accumulator stays SCALAR at stride 257 — (lane·257 + d) mod 32 is unique per
+// lane, bank-conflict-free; a vec4 accumulator array cannot be (stride must be
+// ≡1 mod 32 AND a multiple of 4 — impossible).
 var<workgroup> at_acc: array<f32, 8224>; // [lane*257 + d], stride 257 dodges 32-bank conflicts, hd ≤ 256 (Qwen3.5=256)
 var<workgroup> at_m: array<f32, 32>;
 var<workgroup> at_l: array<f32, 32>;
@@ -858,9 +865,10 @@ fn gqa_attend(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
     let lane = lid.x;
     if (h >= at_p.nh) { return; }
     let hd = at_p.hd;
+    let hd4 = hd / 4u;
     let n = at_p.n;
-    let kbase = (h / at_p.hpk) * at_p.cap * hd;
-    let qbase = h * hd;
+    let kbase = (h / at_p.hpk) * at_p.cap * hd4;
+    let qbase = h * hd4;
     let scale = 1.0 / sqrt(f32(hd));
     let base = lane * 257u;
     for (var d = 0u; d < hd; d = d + 1u) { at_acc[base + d] = 0.0; }
@@ -869,15 +877,22 @@ fn gqa_attend(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
     var p = lane;
     loop {
         if (p >= n) { break; }
-        let krow = kbase + p * hd;
-        var dot = 0.0;
-        for (var d = 0u; d < hd; d = d + 1u) { dot = dot + at_q[qbase + d] * at_k[krow + d]; }
-        dot = dot * scale;
+        let krow = kbase + p * hd4;
+        var dot4 = vec4<f32>(0.0);
+        for (var d = 0u; d < hd4; d = d + 1u) { dot4 = dot4 + at_q[qbase + d] * at_k[krow + d]; }
+        let dot = (dot4.x + dot4.y + dot4.z + dot4.w) * scale;
         let mp = max(m, dot);
         let f = exp(m - mp);
         let w = exp(dot - mp);
         l = l * f + w;
-        for (var d = 0u; d < hd; d = d + 1u) { at_acc[base + d] = at_acc[base + d] * f + w * at_v[krow + d]; }
+        for (var d = 0u; d < hd4; d = d + 1u) {
+            let vv = at_v[krow + d] * w;
+            let a = base + d * 4u;
+            at_acc[a]      = at_acc[a]      * f + vv.x;
+            at_acc[a + 1u] = at_acc[a + 1u] * f + vv.y;
+            at_acc[a + 2u] = at_acc[a + 2u] * f + vv.z;
+            at_acc[a + 3u] = at_acc[a + 3u] * f + vv.w;
+        }
         m = mp;
         p = p + 32u;
     }
@@ -1034,6 +1049,53 @@ fn q4b_matvec(@builtin(workgroup_id) wid: vec3<u32>,
                      + q4b_dot8(q1w[pk4 + 1u], xb + 8u)
                      + q4b_dot8(q1w[pk4 + 2u], xb + 16u)
                      + q4b_dot8(q1w[pk4 + 3u], xb + 24u);
+            acc = acc + scale * gsum;
+            g = g + 64u;
+        }
+        partial_q1t[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid < stride) { partial_q1t[lid] = partial_q1t[lid] + partial_q1t[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lid == 0u) { q1y[row] = partial_q1t[0]; }
+        workgroupBarrier();
+        row = row + nwg.x;
+    }
+}
+
+// q4_tiled matvec: 18-byte interleaved tiles [f16 scale][16B nibbles] — ONE
+// stream per row (the split q4b layout above reads nibbles and scales from
+// two distant regions; feeding TILED bytes to it produced garbage — caught by
+// an end-to-end answer check on real Vulkan). Tiles are 2-aligned, so words
+// assemble from u16 halves of the u32 weight array.
+fn q4t_u16(off16: u32) -> u32 {
+    return (q1w[off16 >> 1u] >> ((off16 & 1u) * 16u)) & 0xFFFFu;
+}
+@compute @workgroup_size(64)
+fn q4t_matvec(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(num_workgroups) nwg: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    var row = wid.x;
+    loop {
+        if (row >= rows) { break; }
+        var acc = 0.0;
+        var g = lid;
+        loop {
+            if (g >= gpr) { break; }
+            let t16 = (row * gpr + g) * 9u;
+            let scale = unpack2x16float(q4t_u16(t16)).x;
+            let xb = g * 32u;
+            var gsum = 0.0;
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                let w = q4t_u16(t16 + 1u + 2u * k) | (q4t_u16(t16 + 2u + 2u * k) << 16u);
+                gsum = gsum + q4b_dot8(w, xb + 8u * k);
+            }
             acc = acc + scale * gsum;
             g = g + 64u;
         }
@@ -1237,6 +1299,128 @@ fn q1t_overlay_mm(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+// Split-K decode attention (its own module: the main module's at_* binding
+// slots are taken, and WGSL forbids two resource vars on one binding).
+// `gqa_attend_part` runs the flash-decoding loop over ONE ck-position chunk
+// per workgroup — grid (nh, nchunks) instead of nh, which left a discrete GPU
+// at 16 resident workgroups and latency-bound at depth — and stores each
+// chunk's unnormalized accumulator plus its (m, l) softmax frame.
+// `gqa_attend_merge` (grid nh) rescales the chunk frames into the global max
+// and normalizes. Same math as `gqa_attend` up to one extra merge rounding.
+const ATTEND_SPLIT_SRC: &str = r#"
+struct ApP { nh: u32, hpk: u32, hd: u32, cap: u32, n: u32, ck: u32, nc: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       ap_q  : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       ap_k  : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>       ap_v  : array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> ap_acc: array<f32>;
+@group(0) @binding(4) var<storage, read_write> ap_ml : array<vec2<f32>>;
+@group(0) @binding(5) var<uniform>             ap_p  : ApP;
+@group(0) @binding(6) var<storage, read_write> ap_o  : array<f32>;
+var<workgroup> app_acc: array<f32, 8224>;
+var<workgroup> app_m: array<f32, 32>;
+var<workgroup> app_l: array<f32, 32>;
+@compute @workgroup_size(32)
+fn gqa_attend_part(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let ch = wid.y;
+    let lane = lid.x;
+    if (h >= ap_p.nh) { return; }
+    let hd = ap_p.hd;
+    let hd4 = hd / 4u;
+    let p0 = ch * ap_p.ck;
+    let pend = min(ap_p.n, p0 + ap_p.ck);
+    let kbase = (h / ap_p.hpk) * ap_p.cap * hd4;
+    let qbase = h * hd4;
+    let scale = 1.0 / sqrt(f32(hd));
+    let base = lane * 257u;
+    for (var d = 0u; d < hd; d = d + 1u) { app_acc[base + d] = 0.0; }
+    var m = -1e30;
+    var l = 0.0;
+    var p = p0 + lane;
+    loop {
+        if (p >= pend) { break; }
+        let krow = kbase + p * hd4;
+        var dot4 = vec4<f32>(0.0);
+        for (var d = 0u; d < hd4; d = d + 1u) { dot4 = dot4 + ap_q[qbase + d] * ap_k[krow + d]; }
+        let dot = (dot4.x + dot4.y + dot4.z + dot4.w) * scale;
+        let mp = max(m, dot);
+        let f = exp(m - mp);
+        let w = exp(dot - mp);
+        l = l * f + w;
+        for (var d = 0u; d < hd4; d = d + 1u) {
+            let vv = ap_v[krow + d] * w;
+            let a = base + d * 4u;
+            app_acc[a]      = app_acc[a]      * f + vv.x;
+            app_acc[a + 1u] = app_acc[a + 1u] * f + vv.y;
+            app_acc[a + 2u] = app_acc[a + 2u] * f + vv.z;
+            app_acc[a + 3u] = app_acc[a + 3u] * f + vv.w;
+        }
+        m = mp;
+        p = p + 32u;
+    }
+    app_m[lane] = m;
+    app_l[lane] = l;
+    workgroupBarrier();
+    var stride = 16u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lane < stride) {
+            let o = lane + stride;
+            let m1 = app_m[lane];
+            let m2 = app_m[o];
+            let mm = max(m1, m2);
+            let f1 = exp(m1 - mm);
+            let f2 = exp(m2 - mm);
+            app_l[lane] = app_l[lane] * f1 + app_l[o] * f2;
+            let bo = o * 257u;
+            for (var d = 0u; d < hd; d = d + 1u) {
+                app_acc[base + d] = app_acc[base + d] * f1 + app_acc[bo + d] * f2;
+            }
+            app_m[lane] = mm;
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let idx = h * ap_p.nc + ch;
+    for (var d = lane; d < hd; d = d + 32u) {
+        ap_acc[idx * hd + d] = app_acc[d];
+    }
+    if (lane == 0u) {
+        ap_ml[idx] = vec2<f32>(app_m[0], app_l[0]);
+    }
+}
+@compute @workgroup_size(32)
+fn gqa_attend_merge(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let lane = lid.x;
+    if (h >= ap_p.nh) { return; }
+    let hd = ap_p.hd;
+    let nc = (ap_p.n + ap_p.ck - 1u) / ap_p.ck;
+    var mg = -1e30;
+    for (var ci = 0u; ci < nc; ci = ci + 1u) { mg = max(mg, ap_ml[h * ap_p.nc + ci].x); }
+    var lg = 0.0;
+    for (var ci = 0u; ci < nc; ci = ci + 1u) {
+        let ml = ap_ml[h * ap_p.nc + ci];
+        lg = lg + ml.y * exp(ml.x - mg);
+    }
+    let invl = select(0.0, 1.0 / lg, lg > 0.0);
+    for (var d = lane; d < hd; d = d + 32u) {
+        var a = 0.0;
+        for (var ci = 0u; ci < nc; ci = ci + 1u) {
+            let idx = h * ap_p.nc + ci;
+            a = a + ap_acc[idx * hd + d] * exp(ap_ml[idx].x - mg);
+        }
+        ap_o[h * hd + d] = a * invl;
+    }
+}
+"#;
+
+/// Positions per split-K attend chunk; the split path engages past
+/// `ATTEND_SPLIT_MIN` cached positions (below it the single-workgroup
+/// kernel's one dispatch wins).
+const ATTEND_CK: usize = 128;
+const ATTEND_SPLIT_MIN: usize = 256;
+
 struct Ctx {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -1251,6 +1435,7 @@ struct Ctx {
     q1: wgpu::ComputePipeline,
     q1t: wgpu::ComputePipeline,
     q4b: wgpu::ComputePipeline,
+    q4t_mv: wgpu::ComputePipeline,
     silu_down: wgpu::ComputePipeline,
     q1t_mm: wgpu::ComputePipeline,
     q1t_ovmm: wgpu::ComputePipeline,
@@ -1261,6 +1446,8 @@ struct Ctx {
     attn_rope: wgpu::ComputePipeline,
     kv_append: wgpu::ComputePipeline,
     gqa_attend: wgpu::ComputePipeline,
+    attend_part: wgpu::ComputePipeline,
+    attend_merge: wgpu::ComputePipeline,
     gdn_step: wgpu::ComputePipeline,
     gdn_conv: wgpu::ComputePipeline,
     f32_matvec: wgpu::ComputePipeline,
@@ -1280,6 +1467,8 @@ struct Ctx {
     layout_attn_rope: wgpu::BindGroupLayout,
     layout_kv: wgpu::BindGroupLayout,
     layout_attend: wgpu::BindGroupLayout,
+    layout_attend_part: wgpu::BindGroupLayout,
+    layout_attend_merge: wgpu::BindGroupLayout,
     layout_gdn: wgpu::BindGroupLayout,
     layout_gdn_conv: wgpu::BindGroupLayout,
     layout_f32: wgpu::BindGroupLayout,
@@ -1392,6 +1581,9 @@ struct GraphScratch {
     a_b: Option<(wgpu::Buffer, u64)>,
     b_b: Option<(wgpu::Buffer, u64)>,
     gdo_b: Option<(wgpu::Buffer, u64)>,
+    // Split-K attend partials: [nh·nchunks·hd] accumulators + [nh·nchunks] (m,l)
+    apacc: Option<(wgpu::Buffer, u64)>,
+    apml: Option<(wgpu::Buffer, u64)>,
     // Logits output + readback staging
     logits: Option<(wgpu::Buffer, u64)>,
     stage: Option<(wgpu::Buffer, u64)>,
@@ -1568,6 +1760,7 @@ fn init() -> Result<Ctx, String> {
     let q1 = pipe("q1_matvec");
     let q1t = pipe("q1t_matvec");
     let q4b = pipe("q4b_matvec");
+    let q4t_mv = pipe("q4t_matvec");
     let silu_down = pipe("silu_down_matvec");
     let q1t_mm = pipe("q1t_mul_mm");
     let q1t_ovmm = pipe("q1t_overlay_mm");
@@ -1590,6 +1783,24 @@ fn init() -> Result<Ctx, String> {
     let layout_attn_rope = attn_rope.get_bind_group_layout(0);
     let layout_kv = kv_append.get_bind_group_layout(0);
     let layout_attend = gqa_attend.get_bind_group_layout(0);
+    let split_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cmf-attend-split"),
+        source: wgpu::ShaderSource::Wgsl(ATTEND_SPLIT_SRC.into()),
+    });
+    let pipe_split = |ep: &str| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(ep),
+            layout: None,
+            module: &split_module,
+            entry_point: Some(ep),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+    let attend_part = pipe_split("gqa_attend_part");
+    let attend_merge = pipe_split("gqa_attend_merge");
+    let layout_attend_part = attend_part.get_bind_group_layout(0);
+    let layout_attend_merge = attend_merge.get_bind_group_layout(0);
     let layout_gdn = gdn_step.get_bind_group_layout(0);
     let layout_gdn_conv = gdn_conv.get_bind_group_layout(0);
     let layout_f32 = f32_matvec.get_bind_group_layout(0);
@@ -1616,6 +1827,7 @@ fn init() -> Result<Ctx, String> {
         q1,
         q1t,
         q4b,
+        q4t_mv,
         silu_down,
         q1t_mm,
         q1t_ovmm,
@@ -1626,6 +1838,8 @@ fn init() -> Result<Ctx, String> {
         attn_rope,
         kv_append,
         gqa_attend,
+        attend_part,
+        attend_merge,
         gdn_step,
         gdn_conv,
         f32_matvec,
@@ -1645,6 +1859,8 @@ fn init() -> Result<Ctx, String> {
         layout_attn_rope,
         layout_kv,
         layout_attend,
+        layout_attend_part,
+        layout_attend_merge,
         layout_gdn,
         layout_gdn_conv,
         layout_f32,
@@ -2284,6 +2500,9 @@ pub fn gqa_attend_gpu(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    if hd % 4 != 0 {
+        return false; // the attend kernel reads K/V as vec4
+    }
     let q_b = storage_bytes(c, bytemuck::cast_slice(q));
     let k_b = storage_bytes(c, bytemuck::cast_slice(kcache));
     let v_b = storage_bytes(c, bytemuck::cast_slice(vcache));
@@ -2387,8 +2606,8 @@ pub fn attn_dropin_gpu(
     attn_out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
-    if pos >= cap {
-        return false;
+    if pos >= cap || hd % 4 != 0 {
+        return false; // hd % 4: the attend kernel reads K/V as vec4
     }
     let (wq, rq, cq) = q1_weight(c, model, wq_idx).unwrap_or((
         c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2621,12 +2840,12 @@ pub fn forward_token_graph(
     loop_norm_at: &[usize],
 ) -> bool {
     let Some(c) = ctx() else { return false };
-    if position >= cap {
-        return false;
+    if position >= cap || hd % 4 != 0 {
+        return false; // hd % 4: the attend kernel reads K/V as vec4
     }
     let t_start = std::time::Instant::now();
     // A resolved matvec weight: the device-local buffer, (q8 only) its row
-    // scales, and the codec kind (0=q8_row 1=q1 2=q4_tiled 3=q1t).
+    // scales, and the codec kind (0=q8_row 1=q1 2=q4_block 3=q1t 4=f32 5=q4_tiled).
     struct GMat {
         buf: wgpu::Buffer,
         rs: Option<wgpu::Buffer>,
@@ -2703,9 +2922,10 @@ pub fn forward_token_graph(
                     kind: 1,
                 })
             }
-            2 | 3 => {
-                // q4_tiled / q1t: the tensor carries its own byte length (tiles
-                // + q1t's sparse overlay) — fetch it whole, device-local.
+            2 | 3 | 5 => {
+                // q4_block / q1t / q4_tiled: the tensor carries its own byte
+                // length (tiles + q1t's sparse overlay) — fetch whole,
+                // device-local.
                 let entry = model.tensors.get(gw.idx)?;
                 if *entry.shape.first()? as usize != rows || *entry.shape.get(1)? as usize != cols {
                     return None;
@@ -3007,9 +3227,7 @@ pub fn forward_token_graph(
                 }
                 crate::gpu::GraphAttn::Gdn { .. } => {
                     let e = gsm.entry((kv_id, li)).or_insert_with(|| {
-                        let ring_sz = ((_gkk.max(1) - 0) * 0
-                            + (gcdim * (_gkk.max(1).saturating_sub(1))) * 4)
-                            as u64;
+                        let ring_sz = ((gcdim * (_gkk.max(1).saturating_sub(1))) * 4) as u64;
                         let s_sz = (gnv * gdk * gdv * 4) as u64;
                         let mk = |sz: u64| {
                             let bf = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -3101,6 +3319,7 @@ pub fn forward_token_graph(
             1 => encode_matvec_q1(c, enc, &m.buf, xs, y, rows, cols),
             2 => encode_q1t_like(c, enc, &c.q4b, &m.buf, xs, y, rows, cols),
             3 => encode_q1t_like(c, enc, &c.q1t, &m.buf, xs, y, rows, cols),
+            5 => encode_q1t_like(c, enc, &c.q4t_mv, &m.buf, xs, y, rows, cols),
             _ => encode_f32matvec(c, enc, &m.buf, xs, y, rows, cols),
         }
     };
@@ -3159,10 +3378,11 @@ pub fn forward_token_graph(
                 });
                 Some((&c.f32_matvec, bind, (rows as u32).min(MAX_WG)))
             }
-            2 => {
+            2 | 5 => {
                 let gpr = cols / 32;
                 let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
-                let layout = c.q4b.get_bind_group_layout(0);
+                let pl = if m.kind == 5 { &c.q4t_mv } else { &c.q4b };
+                let layout = pl.get_bind_group_layout(0);
                 let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &layout,
@@ -3173,7 +3393,7 @@ pub fn forward_token_graph(
                         bind_buf(3, &p_buf),
                     ],
                 });
-                Some((&c.q4b, bind, (rows as u32).min(MAX_WG)))
+                Some((pl, bind, (rows as u32).min(MAX_WG)))
             }
             3 => {
                 let gpr = cols / 32;
@@ -3327,12 +3547,70 @@ pub fn forward_token_graph(
                     pass.set_bind_group(0, &bg_kv, &[]);
                     pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
                 }
-                go(
-                    &mut enc,
-                    &c.gqa_attend,
-                    &bg(&c.layout_attend, &[&qout, kbuf, vbuf, &attn, &at_u]),
-                    nh as u32,
-                );
+                let n_ctx = position + 1;
+                if n_ctx > ATTEND_SPLIT_MIN {
+                    // Split-K attend: (nh × chunks) part workgroups + a
+                    // per-head merge, both in ONE pass (WebGPU orders
+                    // dispatches within a pass, so the merge sees the
+                    // partials without an inter-pass flush).
+                    let nc = cap.div_ceil(ATTEND_CK);
+                    let nc_used = n_ctx.div_ceil(ATTEND_CK);
+                    let pacc = GraphScratch::ensure(
+                        &c.device,
+                        &mut gs.apacc,
+                        (nh * nc * hd * 4) as u64,
+                        st,
+                        "g-apacc",
+                    );
+                    let pml = GraphScratch::ensure(
+                        &c.device,
+                        &mut gs.apml,
+                        (nh * nc * 8) as u64,
+                        st,
+                        "g-apml",
+                    );
+                    let ap_u = unif(&[
+                        nh as u32,
+                        (nh / nkv) as u32,
+                        hd as u32,
+                        cap as u32,
+                        n_ctx as u32,
+                        ATTEND_CK as u32,
+                        nc as u32,
+                        0,
+                    ]);
+                    let bg_part = bg(
+                        &c.layout_attend_part,
+                        &[&qout, kbuf, vbuf, &pacc, &pml, &ap_u],
+                    );
+                    let bg_merge = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &c.layout_attend_merge,
+                        entries: &[
+                            bind_buf(3, &pacc),
+                            bind_buf(4, &pml),
+                            bind_buf(5, &ap_u),
+                            bind_buf(6, &attn),
+                        ],
+                    });
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&c.attend_part);
+                    pass.set_bind_group(0, &bg_part, &[]);
+                    pass.dispatch_workgroups(nh as u32, nc_used as u32, 1);
+                    pass.set_pipeline(&c.attend_merge);
+                    pass.set_bind_group(0, &bg_merge, &[]);
+                    pass.dispatch_workgroups(nh as u32, 1, 1);
+                } else {
+                    go(
+                        &mut enc,
+                        &c.gqa_attend,
+                        &bg(&c.layout_attend, &[&qout, kbuf, vbuf, &attn, &at_u]),
+                        nh as u32,
+                    );
+                }
                 // attn_out *= sigmoid(gate) before the O projection.
                 if *output_gate {
                     let gm_u = uniform_u32x4(c, [(nh * hd) as u32, 0, 0, 0]);
@@ -3596,8 +3874,8 @@ pub fn forward_batch_graph(
         return false;
     }
     let pos0 = positions[0];
-    if pos0 + k > cap {
-        return false;
+    if pos0 + k > cap || hd % 4 != 0 {
+        return false; // hd % 4: the attend kernel reads K/V as vec4
     }
     struct GMat {
         buf: wgpu::Buffer,
