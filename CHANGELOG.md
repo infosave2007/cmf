@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.19] — 2026-07-25
+
+### Fixed
+- **Mobile GPU decoded garbage**: the wgpu attend kernels need 33 KB of
+  workgroup memory, but phone GPUs (Adreno/Mali) and wgpu-on-Metal cap it
+  at 32 KB — the invalid pipeline silently turned attention into a no-op
+  (slow AND wrong). Stride-129 kernel twins (16.5 KB) now serve
+  `head_dim ≤ 128` on every device; `head_dim > 128` models fall back to
+  the CPU cleanly on 32 KB devices; and pipeline validation errors now
+  fail GPU init into an honest CPU fallback instead of corrupting output.
+
 ## [0.5.18] — 2026-07-25
 
 ### Fixed
