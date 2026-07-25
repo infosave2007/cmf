@@ -429,14 +429,34 @@ pub fn enabled() -> bool {
     backend() != Backend::None
 }
 
-/// Is the active backend wgpu (discrete Vulkan/DX12)? The wgpu
-/// whole-token graph defaults on this — NOT on plain `enabled()`, so
-/// macOS/Metal decode does not pay a per-token layer-scan for a graph
-/// that its backend will refuse anyway.
+/// Default-on condition for the wgpu whole-token graph: the wgpu
+/// backend on a DISCRETE adapter. NOT plain `enabled()` (macOS/Metal
+/// must not pay a per-token layer scan for a graph its backend
+/// refuses), and NOT integrated adapters: the graph's ~300 barriered
+/// dispatches per token are cheap on desktop immediate-mode GPUs but
+/// tiled mobile GPUs (Adreno/Mali) drain the pipeline at every barrier
+/// — field report: 0.2 tok/s on-graph vs 15 tok/s on the CPU. On
+/// integrated adapters the per-op probe path arbitrates each op class
+/// against the CPU instead; CMF_GPU_WGPU_GRAPH=1 still forces the
+/// graph anywhere.
+/// Is the wgpu backend active at all (any adapter)? Eligibility gate
+/// for the whole-token graph — whether it actually RUNS is decided by
+/// `wgpu_graph_default` (trusted on discrete) or the generation race.
 pub fn wgpu_active() -> bool {
     #[cfg(feature = "gpu")]
     {
         matches!(backend(), Backend::Wgpu)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        false
+    }
+}
+
+pub fn wgpu_graph_default() -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        matches!(backend(), Backend::Wgpu) && crate::gpu_wgpu::discrete_active()
     }
     #[cfg(not(feature = "gpu"))]
     {
@@ -847,4 +867,113 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f
         Backend::Wgpu => crate::gpu_wgpu::matvec_batch(model, jobs, out),
         Backend::None => false,
     }
+}
+
+// ── Whole-token wgpu graph race (generation granularity) ─────────────
+// On integrated/mobile adapters the graph is neither trusted nor banned
+// a priori — it RACES the normal path: generations alternate arms (the
+// normal path first — known-good UX — then the graph), per-token wall
+// times accumulate per arm, and once both arms have enough steady
+// samples the faster one wins for the process. Arm switches happen ONLY
+// at generation boundaries (`kv_cache.clear()` resets state), so the
+// device KV mirror and the CPU cache never diverge mid-sequence. The
+// single exception is the first-token bail: the very first decode token
+// of a graph generation may be discarded and recomputed on the CPU
+// path (the prompt KV is CPU-owned at that point, so this is safe) —
+// a tiled mobile GPU that drains its pipeline at every barrier turns
+// the ~300-dispatch graph into seconds per token (field report: 0.2
+// tok/s vs 15 on the CPU), and one token is all it takes to see that.
+static GRAPH_RACE_STATE: AtomicU8 = AtomicU8::new(0); // 0 racing, 1 graph won, 2 normal won
+static GRAPH_RACE_FLIP: AtomicU32 = AtomicU32::new(0);
+static GRAPH_RACE_ARM_GRAPH: AtomicU8 = AtomicU8::new(0); // this generation's arm
+static GRAPH_RACE_TOK: AtomicU32 = AtomicU32::new(0); // token index within the generation
+static GRAPH_NS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)]; // [normal, graph]
+static GRAPH_N: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+
+/// Steady per-token samples per arm before the race decides.
+const GRAPH_RACE_SAMPLES: u32 = 4;
+
+/// Called at every generation start (fresh KV). Applies a pending
+/// verdict and picks this generation's arm while racing.
+pub fn graph_race_begin_generation() {
+    GRAPH_RACE_TOK.store(0, Ordering::Relaxed);
+    if GRAPH_RACE_STATE.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let (gn, cn) = (
+        GRAPH_N[1].load(Ordering::Relaxed),
+        GRAPH_N[0].load(Ordering::Relaxed),
+    );
+    if gn >= GRAPH_RACE_SAMPLES && cn >= GRAPH_RACE_SAMPLES {
+        let g_avg = GRAPH_NS[1].load(Ordering::Relaxed) / gn as u64;
+        let c_avg = GRAPH_NS[0].load(Ordering::Relaxed) / cn as u64;
+        let verdict = if g_avg < c_avg { 1 } else { 2 };
+        GRAPH_RACE_STATE.store(verdict, Ordering::Relaxed);
+        tracing::info!(
+            "wgpu graph race: graph {:.2} ms/tok vs normal {:.2} ms/tok -> {}",
+            g_avg as f64 / 1e6,
+            c_avg as f64 / 1e6,
+            if verdict == 1 { "graph" } else { "normal path" }
+        );
+        return;
+    }
+    let flip = GRAPH_RACE_FLIP.fetch_add(1, Ordering::Relaxed);
+    GRAPH_RACE_ARM_GRAPH.store((flip % 2 == 1) as u8, Ordering::Relaxed);
+}
+
+/// Should this decode token try the graph? `trusted` (discrete adapter,
+/// explicit env, or a GDN hybrid whose state lives on the device) skips
+/// the race entirely.
+pub fn graph_race_use_graph(trusted: bool) -> bool {
+    if trusted {
+        return true;
+    }
+    match GRAPH_RACE_STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => GRAPH_RACE_ARM_GRAPH.load(Ordering::Relaxed) == 1,
+    }
+}
+
+/// First decode token of a racing graph generation: hopeless already?
+/// (>4x the normal path's per-token average AND over a second.) Settles
+/// the race immediately; the caller discards the graph result and
+/// recomputes this token on the normal path.
+pub fn graph_race_first_token_hopeless(dur: std::time::Duration) -> bool {
+    if GRAPH_RACE_STATE.load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+    let first = GRAPH_RACE_TOK.load(Ordering::Relaxed) == 0;
+    let cn = GRAPH_N[0].load(Ordering::Relaxed);
+    if !first || cn == 0 {
+        return false;
+    }
+    let c_avg = GRAPH_NS[0].load(Ordering::Relaxed) / cn as u64;
+    let ns = dur.as_nanos() as u64;
+    if ns > 1_000_000_000 && ns > 4 * c_avg {
+        GRAPH_RACE_STATE.store(2, Ordering::Relaxed);
+        tracing::info!(
+            "wgpu graph race: first graph token {:.0} ms vs normal {:.2} ms/tok — hopeless, normal path wins",
+            ns as f64 / 1e6,
+            c_avg as f64 / 1e6
+        );
+        return true;
+    }
+    false
+}
+
+/// Record one decode-token wall time for the racing arm. The first
+/// token of each generation is discarded (KV-mirror upload / cold
+/// caches on the graph arm; cold mmap on the normal arm).
+pub fn graph_race_record(used_graph: bool, dur: std::time::Duration) {
+    if GRAPH_RACE_STATE.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let tok = GRAPH_RACE_TOK.fetch_add(1, Ordering::Relaxed);
+    if tok == 0 {
+        return;
+    }
+    let i = used_graph as usize;
+    GRAPH_NS[i].fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
+    GRAPH_N[i].fetch_add(1, Ordering::Relaxed);
 }

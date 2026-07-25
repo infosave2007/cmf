@@ -2740,6 +2740,12 @@ pub fn gqa_attend_gpu(
 
 /// Resident q1 weight for a model tensor (cached in VRAM by (ptr, idx)).
 /// Returns (buffer, rows, cols). None on budget/shape refusal.
+/// Is wgpu initialized on a DISCRETE adapter? Gates the whole-token
+/// graph default (see gpu::wgpu_graph_default).
+pub(crate) fn discrete_active() -> bool {
+    ctx().map(|c| c.discrete).unwrap_or(false)
+}
+
 fn q1_weight(c: &Ctx, model: &Arc<CmfModel>, idx: usize) -> Option<(wgpu::Buffer, usize, usize)> {
     let entry = model.tensors.get(idx)?;
     let rows = *entry.shape.first()? as usize;

@@ -491,13 +491,10 @@ impl Pipeline {
         let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH")
             .map(|v| v != "0")
             .unwrap_or_else(|_| {
-                // Default ON whenever the GPU is on — via the FFI toggle
-                // (GLOBAL_USE_GPU) or the CMF_GPU env (gpu::enabled()).
-                // The env leg was missing, so the whole-token wgpu graph
-                // never engaged from the CLI (4090: decode 76 -> 137
-                // tok/s once it does).
-                crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)
-                    || crate::gpu::wgpu_active()
+                // Default ON for wgpu on DISCRETE adapters (4090:
+                // decode 76 -> 137 tok/s); integrated/mobile GPUs keep
+                // the per-op probe path — see gpu::wgpu_graph_default.
+                crate::gpu::wgpu_graph_default()
             });
         if !graph_on || !crate::gpu::enabled_here() {
             return false;
@@ -1212,6 +1209,7 @@ impl Pipeline {
         // Fresh sequence — the cache holds absolute positions.
         self.kv_cache.clear();
         crate::gpu::graph_kv_reset(self.graph_kv_id);
+        crate::gpu::graph_race_begin_generation();
         self.o1_begin();
 
         // Speculative decode is off under o1: a rejected draft can't be
@@ -1222,13 +1220,10 @@ impl Pipeline {
         let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH")
             .map(|v| v != "0")
             .unwrap_or_else(|_| {
-                // Default ON whenever the GPU is on — via the FFI toggle
-                // (GLOBAL_USE_GPU) or the CMF_GPU env (gpu::enabled()).
-                // The env leg was missing, so the whole-token wgpu graph
-                // never engaged from the CLI (4090: decode 76 -> 137
-                // tok/s once it does).
-                crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)
-                    || crate::gpu::wgpu_active()
+                // Default ON for wgpu on DISCRETE adapters (4090:
+                // decode 76 -> 137 tok/s); integrated/mobile GPUs keep
+                // the per-op probe path — see gpu::wgpu_graph_default.
+                crate::gpu::wgpu_graph_default()
             });
         let spec_active = self.speculative
             && self.mtp.is_some()
@@ -3199,37 +3194,57 @@ impl Pipeline {
         let pool = self.pool.clone();
         // Opt-in wgpu token-graph attention (discrete Vulkan/DX12): the whole
         // attention sub-block runs resident in one submit. Off by default.
-        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH")
-            .map(|v| v != "0")
-            .unwrap_or_else(|_| {
-                // Default ON whenever the GPU is on — via the FFI toggle
-                // (GLOBAL_USE_GPU) or the CMF_GPU env (gpu::enabled()).
-                // The env leg was missing, so the whole-token wgpu graph
-                // never engaged from the CLI (4090: decode 76 -> 137
-                // tok/s once it does).
+        // Whole-token wgpu graph: eligibility + arbitration.
+        //  - explicit CMF_GPU_WGPU_GRAPH forces it on/off;
+        //  - discrete adapters (4090: decode 76 -> 137 tok/s) and GDN
+        //    hybrids (recurrent state device-resident, no CPU twin to
+        //    race) TRUST it;
+        //  - integrated/mobile adapters RACE it against the normal path
+        //    at generation granularity (gpu::graph_race_*) — tiled
+        //    mobile GPUs can turn the ~300-dispatch graph into seconds
+        //    per token, while a fast phone GPU keeps its win.
+        let graph_env = std::env::var("CMF_GPU_WGPU_GRAPH").ok();
+        let graph_on = match graph_env.as_deref() {
+            Some("0") => false,
+            Some(_) => true,
+            None => {
                 crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)
                     || crate::gpu::wgpu_active()
-            });
-        // Whole-token graph: the ENTIRE layer stack in one submit (one readback
-        // per token). Preferred over the per-layer drop-in when every layer is
-        // pure-attention q1 with a dense q1 FFN.
-        if graph_on && upto.is_none() && task_mask.is_none() {
+            }
+        };
+        let graph_trusted =
+            graph_env.is_some() || crate::gpu::wgpu_graph_default() || self.gdn_cfg.is_some();
+        let race_eligible = graph_on && upto.is_none() && task_mask.is_none();
+        if race_eligible && crate::gpu::graph_race_use_graph(graph_trusted) {
+            let t_graph = std::time::Instant::now();
             let mut lg = Vec::new();
             if let Some(hh) = self.try_token_graph_wgpu(hidden, position, &mut lg) {
-                if !lg.is_empty() {
-                    // Graph produced logits (final-norm + lm_head folded in) —
-                    // pad/cap to vocab and hand them to the sampler directly.
-                    lg.resize(self.vocab_size, 0.0);
-                    if let Some(c) = self.final_softcap {
-                        for l in lg.iter_mut() {
-                            *l = c * (*l / c).tanh();
-                        }
+                let dur = t_graph.elapsed();
+                if graph_trusted || !crate::gpu::graph_race_first_token_hopeless(dur) {
+                    if !graph_trusted {
+                        crate::gpu::graph_race_record(true, dur);
                     }
-                    self.graph_logits = Some(lg);
+                    if !lg.is_empty() {
+                        // Graph produced logits (final-norm + lm_head folded in) —
+                        // pad/cap to vocab and hand them to the sampler directly.
+                        lg.resize(self.vocab_size, 0.0);
+                        if let Some(c) = self.final_softcap {
+                            for l in lg.iter_mut() {
+                                *l = c * (*l / c).tanh();
+                            }
+                        }
+                        self.graph_logits = Some(lg);
+                    }
+                    return hh;
                 }
-                return hh;
+                // Hopeless first graph token: discard it and fall through
+                // to the normal path. Safe exactly here — the prompt KV is
+                // still CPU-owned (chunked prefill), so recomputing this
+                // position is exact; the mirror's extra row is never read
+                // (the race just settled on the normal path).
             }
         }
+        let t_race_cpu = (race_eligible && !graph_trusted).then(std::time::Instant::now);
 
         #[cfg(target_os = "macos")]
         let mut gpu_skip_until = 0usize;
@@ -3621,6 +3636,9 @@ impl Pipeline {
             }
         }
         crate::gpu::set_layer(-1); // layers done — lm_head outside layer-split
+        if let Some(t) = t_race_cpu {
+            crate::gpu::graph_race_record(false, t.elapsed());
+        }
 
         h
     }
