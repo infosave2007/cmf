@@ -1,6 +1,6 @@
-//! Metal batched q4t GEMM (dequant pass + f32nt simdgroup GEMM) vs an
-//! exact f64 dequant reference. Half shared-memory tiles inside the
-//! GEMM make it tolerance-class — the bound here is loose but honest.
+//! Metal batched q4t GEMM (q4t_mul_mm — tiles decoded in the K loop)
+//! vs an exact f64 dequant reference. Half shared-memory tiles inside
+//! the GEMM make it tolerance-class — the bound is loose but honest.
 //!
 //!     cargo test -p cortiq-engine --release --test gpu_q4t_mm -- --nocapture
 #![cfg(target_os = "macos")]

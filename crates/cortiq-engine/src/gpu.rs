@@ -847,8 +847,8 @@ pub fn q1_matmat(
 }
 
 /// Batched q4t GEMM on the device (imagegen DiT prefill shapes).
-/// Metal only for now: a dequant pass + the simdgroup f32nt GEMM in
-/// one command buffer; a wgpu twin is a follow-up.
+/// Metal only for now: q4t_mul_mm decodes the mmap-resident tiles
+/// inside the GEMM's K loop; a wgpu twin is a follow-up.
 #[allow(unused_variables)]
 pub fn q4t_matmat(
     model: &Arc<CmfModel>,
