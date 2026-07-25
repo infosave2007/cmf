@@ -66,7 +66,15 @@ Gemma-2-2B (декодер-онли LLM — наш стек), FLUX-VAE (Apache �
   (Accelerate/AMX), attention mid-блока на GEMM: крошечный декод ×29
   (4.3 → 0.15 с); 512px — 8.1 с, 1024px — 36 с на CPU M4 (стены — формы
   GEMM и поэлементные проходы; следующий большой шаг — Metal).
-- [ ] Next-DiT блок + flow-matching цикл (timestep, AdaLN)
+- [x] **Next-DiT forward** (`dit.rs`): полный форвард денойзера
+  (patchify + x_embedder, timestep-MLP, caption-embedder,
+  context/noise-refiner, 26 AdaLN-слоёв с tanh-гейтами, 3-осевой
+  комплексный RoPE, qk-нормы per-head, SwiGLU 9216, norm_out
+  LayerNorm 1e-6); паритет с numpy-референсом
+  (`python/nextdit_ref.py`, `tests/dit_parity.rs`) на реальных
+  весах: max|Δ| = 2.1e-5 (rel 1.5e-5).
+- [ ] Flow-matching цикл (FlowMatchEuler shift=6, CFG) + e2e
+  текст → картинка (Gemma → DiT → VAE)
 - [ ] Конвертер: три компонента → один .cmf
 - [ ] Скорость: conv через наши GEMM, GPU-графы для DiT-шага
 
