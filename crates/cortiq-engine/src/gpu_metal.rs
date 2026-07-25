@@ -2259,6 +2259,30 @@ kernel void q4t_matvec(
         if (nr > 3u) y[r0 + 3u] = acc3;
     }
 }
+
+// One thread per 18-byte q4t tile: decode 32 weights into the f32
+// scratch that mul_mm_f32nt multiplies next (batched q4t GEMM =
+// dequant pass + the existing simdgroup GEMM in one command buffer).
+kernel void q4t_dequant(
+    device const uchar* q     [[buffer(0)]],
+    device float*       w     [[buffer(1)]],
+    constant uint&      tiles [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= tiles) return;
+    device const ushort* p16 = (device const ushort*)(q + (ulong)gid * 18u);
+    float scale = (float)as_type<half>(p16[0]);
+    device float* dst = w + (ulong)gid * 32u;
+    for (uint i = 0; i < 8u; ++i) {
+        uint hw = (uint)p16[1u + i];
+        uint b0 = hw & 0xFFu;         // byte 2i   -> weights 4i, 4i+1
+        uint b1 = (hw >> 8u) & 0xFFu; // byte 2i+1 -> weights 4i+2, 4i+3
+        dst[i * 4u]      = ((float)(b0 & 0xFu) - 8.0f) * scale;
+        dst[i * 4u + 1u] = ((float)(b0 >> 4u) - 8.0f) * scale;
+        dst[i * 4u + 2u] = ((float)(b1 & 0xFu) - 8.0f) * scale;
+        dst[i * 4u + 3u] = ((float)(b1 >> 4u) - 8.0f) * scale;
+    }
+}
 "#;
 
 struct Ctx {
@@ -2277,6 +2301,7 @@ struct Ctx {
     q4b: ComputePipelineState,
     q4bh: ComputePipelineState,
     q4t: ComputePipelineState,
+    q4tdq: ComputePipelineState,
     flag: ComputePipelineState,
     rmsn: ComputePipelineState,
     f16mv: ComputePipelineState,
@@ -2415,6 +2440,7 @@ fn init() -> Result<Ctx, String> {
     let q4b = pso("q4b_matvec")?;
     let q4bh = pso("q4b_matvec_h")?;
     let q4t = pso("q4t_matvec")?;
+    let q4tdq = pso("q4t_dequant")?;
     let flag = pso("write_flag")?;
     let rmsn = pso("rmsnorm_k")?;
     let f16mv = pso("f32_matvec")?;
@@ -2460,6 +2486,7 @@ fn init() -> Result<Ctx, String> {
         q4b,
         q4bh,
         q4t,
+        q4tdq,
         flag,
         rmsn,
         f16mv,
@@ -3298,6 +3325,7 @@ fn mm_pipeline(c: &Ctx, rows: usize, cols: usize, kind: u8) -> ComputePipelineSt
     cache
         .entry((rows as u32, cols as u32, kind))
         .or_insert_with(|| {
+            crate::gpu::probe_note_cold();
             let fcv = metal::FunctionConstantValues::new();
             let cols_u = cols as u32;
             let rows_u = rows as u32;
@@ -4229,6 +4257,98 @@ pub fn q8_matmat(
         std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
     }
     tracing::debug!("gpu matmat: {rows}x{cols} b={b}");
+    true
+}
+
+/// q4t batched GEMM (imagegen DiT prefill shapes): a dequant pass
+/// (q4t_dequant, thread per 18-byte tile) fills an f32 scratch, then
+/// the existing mul_mm_f32nt simdgroup GEMM multiplies it — two
+/// encoders, one command buffer, no CPU round-trip between. Half
+/// shared-memory tiles inside the GEMM make this tolerance-class
+/// (like the LLM prefill graph); the probe arbitrates vs the CPU AMX
+/// arm per process.
+pub fn q4t_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    pre: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % 32 != 0 {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let tiles = rows * (cols / 32);
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    if abs + tiles * 18 > safe_len {
+        return false;
+    }
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let w_buf = get_io(13_000_000_501 + rows * cols, rows * cols * 4);
+    let xs_buf = get_io(11_000_000_453 + pre.len(), pre.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(pre.as_ptr(), xs_buf.contents() as *mut f32, pre.len());
+    }
+    let y_buf = get_io(12_000_000_469 + b * rows, b * rows * 4);
+
+    let cmd = c.queue.new_command_buffer();
+    {
+        // Encoder 1: tile decode. end_encoding() orders it before the GEMM.
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.q4tdq);
+        enc.set_buffer(0, Some(&fbuf), abs as u64);
+        enc.set_buffer(1, Some(&w_buf), 0);
+        let tiles_u = tiles as u32;
+        enc.set_bytes(2, 4, &tiles_u as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new((tiles as u64).div_ceil(256), 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    {
+        // Encoder 2: C[b, rows] = X · Wᵀ on the simdgroup GEMM.
+        let enc = cmd.new_compute_command_encoder();
+        let pso = mm_pipeline(c, 0, cols, 2);
+        enc.set_compute_pipeline_state(&pso);
+        enc.set_buffer(0, Some(&w_buf), 0);
+        enc.set_buffer(1, Some(&xs_buf), 0);
+        enc.set_buffer(2, Some(&y_buf), 0);
+        let (cols_u, rows_u, nb_u) = (cols as u32, rows as u32, b as u32);
+        let scale = 1.0f32;
+        enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(6, 4, &scale as *const f32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new((b as u64).div_ceil(32), (rows as u64).div_ceil(64), 1),
+            MTLSize::new(128, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
+    }
+    tracing::debug!("gpu q4t matmat: {rows}x{cols} b={b}");
     true
 }
 

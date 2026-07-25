@@ -50,6 +50,13 @@ pub(crate) fn probe_note_cold() {
     PROBE_COLD.with(|c| c.set(true));
 }
 
+/// Peek the cold flag without consuming it (`probe_record` consumes).
+/// Contention heuristics use this: a slow COLD op is a one-off build
+/// cost, not evidence the device is busy.
+pub(crate) fn probe_was_cold() -> bool {
+    PROBE_COLD.with(|c| c.get())
+}
+
 /// Pipeline: mark the current layer (or −1 outside layers) for layer-split.
 pub fn set_layer(l: i64) {
     CUR_LAYER.with(|c| c.set(l));
@@ -119,6 +126,12 @@ pub enum OpClass {
     Matmat = 2,
     /// Batched matvecs of one input (QKV).
     Batch = 3,
+    /// Prefill GEMM at image-diffusion widths (b ≥ 128). Probed apart
+    /// from `Matmat`: one imagegen process runs BOTH populations
+    /// (prompt encode b≈40 where the GPU wins big, DiT b≥256 where
+    /// the CPU AMX arm is competitive) — a single shared verdict locks
+    /// the wrong arm for whichever population samples second.
+    MatmatWide = 4,
 }
 
 /// Probe verdict for one call.
@@ -157,7 +170,13 @@ impl Probe {
     }
 }
 
-static PROBES: [Probe; 4] = [Probe::new(), Probe::new(), Probe::new(), Probe::new()];
+static PROBES: [Probe; 5] = [
+    Probe::new(),
+    Probe::new(),
+    Probe::new(),
+    Probe::new(),
+    Probe::new(),
+];
 
 fn probe_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -187,6 +206,11 @@ pub fn q1_force() -> bool {
 /// eligibility gates (`enabled_here` / `min_rows`) so only real
 /// candidates alternate.
 pub fn probe_arm(c: OpClass) -> ProbeArm {
+    // Every arbitrated call starts with a clean cold flag: both the
+    // sample discard in `probe_record` and the contention kill-switch
+    // read it AFTER the op, so a stale note from a previous call on
+    // this thread must not leak in.
+    PROBE_COLD.with(|f| f.set(false));
     if !probe_on() {
         return ProbeArm::Gpu;
     }
@@ -195,7 +219,6 @@ pub fn probe_arm(c: OpClass) -> ProbeArm {
         1 => ProbeArm::Gpu,
         2 => ProbeArm::Cpu,
         _ => {
-            PROBE_COLD.with(|f| f.set(false));
             if p.flip.fetch_add(1, Ordering::Relaxed) % 2 == 0 {
                 ProbeArm::Gpu
             } else {
@@ -242,7 +265,7 @@ pub fn probe_record(c: OpClass, gpu: bool, dur: std::time::Duration) {
         {
             tracing::info!(
                 "gpu probe [{}]: gpu {:.2} ms vs cpu {:.2} ms per op → {}",
-                ["ffn", "matvec", "matmat", "qkv-batch"][c as usize],
+                ["ffn", "matvec", "matmat", "qkv-batch", "matmat-wide"][c as usize],
                 g / 1e6,
                 cp / 1e6,
                 if winner == 1 { "gpu" } else { "cpu" },
@@ -819,6 +842,26 @@ pub fn q1_matmat(
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q1_matmat(model, idx, xs, b, rows, cols, out),
         #[allow(unused_variables)]
+        _ => false,
+    }
+}
+
+/// Batched q4t GEMM on the device (imagegen DiT prefill shapes).
+/// Metal only for now: a dequant pass + the simdgroup f32nt GEMM in
+/// one command buffer; a wgpu twin is a follow-up.
+#[allow(unused_variables)]
+pub fn q4t_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q4t_matmat(model, idx, xs, b, rows, cols, out),
         _ => false,
     }
 }
