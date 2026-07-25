@@ -140,11 +140,12 @@ mod prof {
     pub const FFN: usize = 8;
     pub const FFNEL: usize = 9;
     pub const HEADTAIL: usize = 10;
-    const NAMES: [&str; 11] = [
+    pub const GPUBLK: usize = 11;
+    const NAMES: [&str; 12] = [
         "mod+norms", "qkv-proj", "qknorm+rope", "attn-pack", "attn-qk", "softmax", "attn-pv",
-        "o-proj", "ffn-mm", "ffn-silu", "head+tail",
+        "o-proj", "ffn-mm", "ffn-silu", "head+tail", "gpu-block",
     ];
-    static NS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+    static NS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 
     pub fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
@@ -647,26 +648,139 @@ impl NextDit {
         true
     }
 
+    /// One whole block on the device (norms → qkv → RoPE → attention
+    /// → O → residual → FFN → residual, single command buffer). Same
+    /// gating and contention tripwire as the per-stage GPU arms.
+    fn gpu_block(
+        &self,
+        blk: &Block,
+        x: &mut [f32],
+        n: usize,
+        rope32: &(Vec<f32>, Vec<f32>),
+        m: &[f32],
+    ) -> bool {
+        use crate::gpu;
+        let (hs, nh, nkv, hd) = (self.hidden, self.nh, self.nkv, self.hd);
+        if n < 128 || !gpu::enabled_here() || gpu::mm_killed() {
+            return false;
+        }
+        if gpu::probe_deciding(gpu::OpClass::MatmatWide)
+            || !matches!(gpu::probe_arm(gpu::OpClass::MatmatWide), gpu::ProbeArm::Gpu)
+        {
+            return false;
+        }
+        // The pack kernel assumes the rope table covers the full head
+        // dim (axes_dim sums to hd — true for Lumina; bail otherwise).
+        if rope32.0.len() != n * hd / 2 {
+            return false;
+        }
+        fn q(p: &Proj) -> Option<(&Arc<CmfModel>, usize)> {
+            match p {
+                Proj::Q(q) => q.mapped_q4t(),
+                Proj::F32 { .. } => None,
+            }
+        }
+        let (
+            Some((model, wq)),
+            Some((_, wk)),
+            Some((_, wv)),
+            Some((_, wo)),
+            Some((_, w1)),
+            Some((_, w3)),
+            Some((_, w2)),
+        ) = (
+            q(&blk.q),
+            q(&blk.k),
+            q(&blk.v),
+            q(&blk.o),
+            q(&blk.w1),
+            q(&blk.w3),
+            q(&blk.w2),
+        )
+        else {
+            return false;
+        };
+        let inter = blk.w1.rows();
+        let gate_msa: Vec<f32> = m[hs..2 * hs].iter().map(|&v| v.tanh()).collect();
+        let gate_mlp: Vec<f32> = m[3 * hs..].iter().map(|&v| v.tanh()).collect();
+        let args = gpu::DitBlockArgs {
+            n,
+            hidden: hs,
+            inter,
+            nh,
+            nkv,
+            hd,
+            eps: self.eps as f32,
+            rope_cos: &rope32.0,
+            rope_sin: &rope32.1,
+            norm1: &blk.norm1,
+            norm2: &blk.norm2,
+            ffn_norm1: &blk.ffn_norm1,
+            ffn_norm2: &blk.ffn_norm2,
+            norm_q: &blk.norm_q,
+            norm_k: &blk.norm_k,
+            s_msa: &m[..hs],
+            gate_msa: &gate_msa,
+            s_mlp: &m[2 * hs..3 * hs],
+            gate_mlp: &gate_mlp,
+            wq,
+            wk,
+            wv,
+            wo,
+            w1,
+            w3,
+            w2,
+        };
+        let t0 = std::time::Instant::now();
+        if !gpu::dit_block(model, &args, x) {
+            return false;
+        }
+        let flops = 2.0 * n as f64 * hs as f64 * ((nh + 2 * nkv) * hd) as f64
+            + 4.0 * nh as f64 * (n as f64) * (n as f64) * hd as f64
+            + 2.0 * n as f64 * hs as f64 * (nh * hd) as f64
+            + 6.0 * n as f64 * hs as f64 * inter as f64;
+        let budget = std::time::Duration::from_secs_f64(flops / 1.5e12 * 8.0 + 0.030);
+        let el = t0.elapsed();
+        if el > budget && !gpu::probe_was_cold() {
+            tracing::warn!(
+                "gpu dit block took {el:?} (budget {budget:?}) — device contended, \
+                 CPU for the rest of the process"
+            );
+            gpu::mm_kill();
+        }
+        true
+    }
+
     fn block_forward(
         &self,
         blk: &Block,
         x: &mut [f32],
         rope: &(Vec<f64>, Vec<f64>),
+        rope32: Option<&(Vec<f32>, Vec<f32>)>,
         temb: Option<&[f32]>,
     ) {
         let (hs, nh, nkv, hd) = (self.hidden, self.nh, self.nkv, self.hd);
         let pool = self.pool.as_deref();
         let n = x.len() / hs;
-        let modnorm = prof::span(prof::MODNORM);
-        let modv = blk.modulation.as_ref().zip(temb).map(|((w, b), t)| {
-            let s: Vec<f32> = t.iter().map(|&v| silu(v)).collect();
-            let mut m = vec![0f32; w.rows()];
-            w.matmat(&s, 1, &mut m, pool);
-            for (v, &bias) in m.iter_mut().zip(b) {
-                *v += bias;
+        let modv = {
+            let _s = prof::span(prof::MODNORM);
+            blk.modulation.as_ref().zip(temb).map(|((w, b), t)| {
+                let s: Vec<f32> = t.iter().map(|&v| silu(v)).collect();
+                let mut m = vec![0f32; w.rows()];
+                w.matmat(&s, 1, &mut m, pool);
+                for (v, &bias) in m.iter_mut().zip(b) {
+                    *v += bias;
+                }
+                m
+            })
+        };
+        if let (Some(m), Some(r32)) = (&modv, rope32) {
+            let _s = prof::span(prof::GPUBLK);
+            if self.gpu_block(blk, x, n, r32, m) {
+                return;
             }
-            m
-        });
+        }
+        let modnorm = prof::span(prof::MODNORM);
         let (s_msa, g_msa, s_mlp, g_mlp) = match &modv {
             Some(m) => (
                 Some(&m[..hs]),
@@ -953,13 +1067,21 @@ impl NextDit {
             .collect();
         let cap_rope = rope_table(&cap_ids, &self.axes_dim);
         let img_rope = rope_table(&img_ids, &self.axes_dim);
+        // f32 twins for the on-device block (values stay f64-derived).
+        let to32 = |r: &(Vec<f64>, Vec<f64>)| {
+            (
+                r.0.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+                r.1.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+            )
+        };
+        let img_rope32 = to32(&img_rope);
         drop(head);
 
         for blk in &self.context_refiner {
-            self.block_forward(blk, &mut cap_e, &cap_rope, None);
+            self.block_forward(blk, &mut cap_e, &cap_rope, None, None);
         }
         for blk in &self.noise_refiner {
-            self.block_forward(blk, &mut img, &img_rope, Some(&temb));
+            self.block_forward(blk, &mut img, &img_rope, Some(&img_rope32), Some(&temb));
         }
 
         // joint sequence: caption first
@@ -970,8 +1092,9 @@ impl NextDit {
             [cap_rope.0, img_rope.0].concat(),
             [cap_rope.1, img_rope.1].concat(),
         );
+        let joint_rope32 = to32(&joint_rope);
         for blk in &self.layers {
-            self.block_forward(blk, &mut x, &joint_rope, Some(&temb));
+            self.block_forward(blk, &mut x, &joint_rope, Some(&joint_rope32), Some(&temb));
         }
 
         // norm_out: LayerNorm(eps 1e-6, no affine) · (1+scale), project

@@ -879,6 +879,51 @@ pub fn q4t_ffn(
     }
 }
 
+/// One whole modulated DiT block for `dit_block`: geometry, norm
+/// weights, AdaLN scale/gate vectors (gates pre-tanh'd), a per-token
+/// f32 RoPE cos/sin table, and the directory indices of the seven
+/// q4t projections. `x` is in-out `[n, hidden]`.
+pub struct DitBlockArgs<'a> {
+    pub n: usize,
+    pub hidden: usize,
+    pub inter: usize,
+    pub nh: usize,
+    pub nkv: usize,
+    pub hd: usize,
+    pub eps: f32,
+    pub rope_cos: &'a [f32],
+    pub rope_sin: &'a [f32],
+    pub norm1: &'a [f32],
+    pub norm2: &'a [f32],
+    pub ffn_norm1: &'a [f32],
+    pub ffn_norm2: &'a [f32],
+    pub norm_q: &'a [f32],
+    pub norm_k: &'a [f32],
+    pub s_msa: &'a [f32],
+    pub gate_msa: &'a [f32],
+    pub s_mlp: &'a [f32],
+    pub gate_mlp: &'a [f32],
+    pub wq: usize,
+    pub wk: usize,
+    pub wv: usize,
+    pub wo: usize,
+    pub w1: usize,
+    pub w3: usize,
+    pub w2: usize,
+}
+
+/// One whole modulated DiT block on the device — norms, qkv, RoPE,
+/// attention, residuals and the SwiGLU FFN in a single command
+/// buffer; only `x` crosses the CPU boundary (in and out).
+#[allow(unused_variables)]
+pub fn dit_block(model: &Arc<CmfModel>, a: &DitBlockArgs, x: &mut [f32]) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::dit_block(model, a, x),
+        _ => false,
+    }
+}
+
 /// DiT full bidirectional attention on the device (all heads:
 /// scores GEMM → row softmax → P·V → panel unstack, one command
 /// buffer). Head-major inputs; out is [n, nh·hd].
