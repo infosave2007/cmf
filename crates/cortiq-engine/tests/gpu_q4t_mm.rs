@@ -118,3 +118,202 @@ fn gpu_q4t_matmat_matches_dequant_reference() {
     assert!(max_rel < 2e-2, "gpu q4t GEMM diverged: {max_rel}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// q4t payload: f16 scale + 16 nibble bytes per 32-weight group,
+/// deterministic per (seed, tile).
+fn q4t_payload(rows: usize, cols: usize, seed: usize) -> Vec<u8> {
+    const TILE: usize = 18;
+    let gpr = cols / GROUP_SIZE;
+    let mut p = vec![0u8; rows * gpr * TILE];
+    for t in 0..rows * gpr {
+        let sc = 0.02 + 0.0004 * ((t * 7 + seed) % 64) as f32;
+        p[t * TILE..t * TILE + 2].copy_from_slice(&f32_to_f16(sc).to_le_bytes());
+        for k in 0..16 {
+            p[t * TILE + 2 + k] = ((t * 31 + k * 13 + seed * 97) % 251) as u8;
+        }
+    }
+    p
+}
+
+/// Exact f64 y[b, rows] = X · dequant(W)ᵀ over a q4t payload.
+fn ref_matmat(payload: &[u8], x: &[f64], b: usize, rows: usize, cols: usize) -> Vec<f64> {
+    const TILE: usize = 18;
+    let gpr = cols / GROUP_SIZE;
+    let mut y = vec![0f64; b * rows];
+    for bi in 0..b {
+        for r in 0..rows {
+            let mut acc = 0f64;
+            for g in 0..gpr {
+                let t = (r * gpr + g) * TILE;
+                let s = f16_to_f32(u16::from_le_bytes([payload[t], payload[t + 1]])) as f64;
+                for (k, &bb) in payload[t + 2..t + TILE].iter().enumerate() {
+                    let w0 = ((bb & 0x0F) as f64 - 8.0) * s;
+                    let w1 = (((bb >> 4) & 0x0F) as f64 - 8.0) * s;
+                    acc += w0 * x[bi * cols + g * GROUP_SIZE + 2 * k];
+                    acc += w1 * x[bi * cols + g * GROUP_SIZE + 2 * k + 1];
+                }
+            }
+            y[bi * rows + r] = acc;
+        }
+    }
+    y
+}
+
+#[test]
+fn gpu_q4t_ffn_matches_dequant_reference() {
+    if !require_metal() {
+        return;
+    }
+    let (hidden, inter, b) = (256usize, 512usize, 48usize);
+    let p1 = q4t_payload(inter, hidden, 1);
+    let p3 = q4t_payload(inter, hidden, 3);
+    let p2 = q4t_payload(hidden, inter, 2);
+    let arch: ModelArch = serde_json::from_value(serde_json::json!({
+        "arch_name": "tiny",
+        "hidden_size": hidden,
+        "intermediate_size": inter,
+        "num_layers": 1,
+        "num_attention_heads": 2,
+        "num_kv_heads": 1,
+        "head_dim": 4,
+        "vocab_size": inter,
+        "layer_types": ["FullAttention"],
+        "rms_norm_eps": 1e-6,
+        "max_position_embeddings": 8,
+        "linear_conv_kernel_dim": 0,
+        "linear_num_key_heads": 0,
+        "linear_num_value_heads": 0,
+    }))
+    .unwrap();
+    let header = CmfHeader {
+        format: "cmf".into(),
+        version: CMF_VERSION,
+        arch,
+        quant_type: QuantType::Q4Block,
+        provenance: None,
+        tokenizer_config: None,
+        section_hashes: None,
+        skills: Vec::new(),
+        shard: None,
+        calibration: None,
+    };
+    let spec = |name: &str, rows: usize, cols: usize, data: &[u8]| TensorSpec {
+        name: name.into(),
+        dtype: TensorDtype::Q4Tiled,
+        shape: vec![rows, cols],
+        data: data.to_vec(),
+    };
+    let pad = TensorSpec {
+        name: "pad".into(),
+        dtype: TensorDtype::F32,
+        shape: vec![8192, 2],
+        data: vec![0u8; 8192 * 8],
+    };
+    let dir = std::env::temp_dir().join(format!("cmf-q4tffn-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("m.cmf");
+    CmfModel::write(
+        &path,
+        &header,
+        &[
+            spec("w1", inter, hidden, &p1),
+            spec("w3", inter, hidden, &p3),
+            spec("w2", hidden, inter, &p2),
+            pad,
+        ],
+        None,
+        None,
+    )
+    .unwrap();
+    let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
+    let (i1, i3, i2) = (
+        model.tensor_index("w1").unwrap(),
+        model.tensor_index("w3").unwrap(),
+        model.tensor_index("w2").unwrap(),
+    );
+
+    let x: Vec<f32> = (0..b * hidden)
+        .map(|i| ((i * 17 + 5) % 89) as f32 / 89.0 - 0.5)
+        .collect();
+    let mut got = vec![0f32; b * hidden];
+    assert!(
+        cortiq_engine::gpu::q4t_ffn(&model, i1, i3, i2, &x, b, hidden, inter, &mut got),
+        "gpu q4t_ffn refused"
+    );
+
+    let xf: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+    let g = ref_matmat(&p1, &xf, b, inter, hidden);
+    let u = ref_matmat(&p3, &xf, b, inter, hidden);
+    let act: Vec<f64> = g
+        .iter()
+        .zip(&u)
+        .map(|(&gv, &uv)| gv / (1.0 + (-gv).exp()) * uv)
+        .collect();
+    let want = ref_matmat(&p2, &act, b, hidden, inter);
+    let mut max_rel = 0f64;
+    for (i, &w) in want.iter().enumerate() {
+        let d = (got[i] as f64 - w).abs();
+        max_rel = max_rel.max(d / w.abs().max(1.0));
+    }
+    println!("gpu q4t FFN max rel dev {max_rel:.2e}");
+    assert!(max_rel < 3e-2, "gpu q4t FFN diverged: {max_rel}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gpu_dit_attention_matches_reference() {
+    if !require_metal() {
+        return;
+    }
+    // Odd n exercises the edge tiles of both GEMMs; GQA via nkv < nh.
+    let (nh, nkv, n, hd) = (4usize, 2usize, 100usize, 32usize);
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mk = |seed: usize, len: usize| -> Vec<f32> {
+        (0..len)
+            .map(|i| ((i * 29 + seed * 31 + 7) % 83) as f32 / 83.0 - 0.5)
+            .collect()
+    };
+    let qh = mk(1, nh * n * hd);
+    let kh = mk(2, nkv * n * hd);
+    let vh = mk(3, nkv * n * hd);
+    let mut got = vec![0f32; n * nh * hd];
+    assert!(
+        cortiq_engine::gpu::dit_attention(&qh, &kh, &vh, nh, nkv, n, hd, scale, &mut got),
+        "gpu dit_attention refused"
+    );
+
+    let hpk = nh / nkv;
+    let mut max_abs = 0f64;
+    for h in 0..nh {
+        let kv = h / hpk;
+        for p in 0..n {
+            let q = &qh[(h * n + p) * hd..(h * n + p + 1) * hd];
+            let mut sc: Vec<f64> = (0..n)
+                .map(|j| {
+                    let k = &kh[(kv * n + j) * hd..(kv * n + j + 1) * hd];
+                    q.iter()
+                        .zip(k)
+                        .map(|(&a, &b)| a as f64 * b as f64)
+                        .sum::<f64>()
+                        * scale as f64
+                })
+                .collect();
+            let mx = sc.iter().cloned().fold(f64::MIN, f64::max);
+            let mut den = 0f64;
+            for v in sc.iter_mut() {
+                *v = (*v - mx).exp();
+                den += *v;
+            }
+            for d in 0..hd {
+                let want = (0..n)
+                    .map(|j| sc[j] * vh[(kv * n + j) * hd + d] as f64)
+                    .sum::<f64>()
+                    / den;
+                let g = got[(p * nh + h) * hd + d] as f64;
+                max_abs = max_abs.max((g - want).abs());
+            }
+        }
+    }
+    println!("gpu dit attention max abs dev {max_abs:.2e}");
+    assert!(max_abs < 5e-3, "gpu dit attention diverged: {max_abs}");
+}

@@ -12,7 +12,7 @@
 
 use cortiq_core::CmfModel;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 thread_local! {
@@ -842,6 +842,61 @@ pub fn q1_matmat(
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q1_matmat(model, idx, xs, b, rows, cols, out),
         #[allow(unused_variables)]
+        _ => false,
+    }
+}
+
+/// Contention kill for the wide imagegen GEMM/FFN paths: one grossly
+/// slow op under a work-proportional budget (fair-device ops are
+/// ≤~100 ms even at 1024px) means another process owns the device —
+/// verdicts are per-process, so CPU for the rest of this one.
+static MM_KILL: AtomicBool = AtomicBool::new(false);
+pub(crate) fn mm_killed() -> bool {
+    MM_KILL.load(Ordering::Relaxed)
+}
+pub(crate) fn mm_kill() {
+    MM_KILL.store(true, Ordering::Relaxed);
+}
+
+/// Fused DiT SwiGLU FFN on the device: g=X·W1ᵀ, u=X·W3ᵀ, silu(g)·u,
+/// y=·W2ᵀ — one command buffer, only X and Y cross the CPU boundary.
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn q4t_ffn(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w3: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q4t_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
+        _ => false,
+    }
+}
+
+/// DiT full bidirectional attention on the device (all heads:
+/// scores GEMM → row softmax → P·V → panel unstack, one command
+/// buffer). Head-major inputs; out is [n, nh·hd].
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn dit_attention(
+    qh: &[f32],
+    kh: &[f32],
+    vh: &[f32],
+    nh: usize,
+    nkv: usize,
+    n: usize,
+    hd: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::dit_attention(qh, kh, vh, nh, nkv, n, hd, scale, out),
         _ => false,
     }
 }

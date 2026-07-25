@@ -338,6 +338,20 @@ impl QTensor {
         }
     }
 
+    /// Mapped q4t handle (model + directory index) — the fused GPU FFN
+    /// needs the raw file coordinates of its three projections.
+    pub(crate) fn mapped_q4t(&self) -> Option<(&Arc<CmfModel>, usize)> {
+        match self {
+            Self::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q4Tiled,
+                ..
+            } => Some((model, *idx)),
+            _ => None,
+        }
+    }
+
     pub fn cols(&self) -> usize {
         match self {
             Self::F32 { cols, .. } | Self::Mapped { cols, .. } => *cols,
@@ -1038,17 +1052,16 @@ impl QTensor {
                     // Narrow (prompt-encode) and wide (DiT) batches probe
                     // as separate classes — the regimes have opposite
                     // winners and one shared verdict locked the wrong arm.
-                    // Kill switch: one grossly slow GPU op (a fair-condition
-                    // op is ≤~100 ms even at 1024px) means the device is
-                    // contended by another process (e.g. a simulator) —
-                    // verdicts are per-process, so without the bail the
-                    // whole render crawls behind someone else's queue.
-                    static GPU_MM_KILL: std::sync::atomic::AtomicBool =
-                        std::sync::atomic::AtomicBool::new(false);
+                    // Kill switch (gpu::mm_kill): one grossly slow GPU op
+                    // (a fair-condition op is ≤~100 ms even at 1024px)
+                    // means the device is contended by another process
+                    // (e.g. a simulator) — verdicts are per-process, so
+                    // without the bail the whole render crawls behind
+                    // someone else's queue.
                     if b >= 32
                         && b * rows * cols >= 128_000_000
                         && cols % 32 == 0
-                        && !GPU_MM_KILL.load(std::sync::atomic::Ordering::Relaxed)
+                        && !crate::gpu::mm_killed()
                         && crate::gpu::enabled_here()
                     {
                         let class = if b >= 128 {
@@ -1082,8 +1095,7 @@ impl QTensor {
                                                 "gpu q4t matmat took {el:?} (budget {budget:?}) — \
                                                  device contended, CPU for the rest of the process"
                                             );
-                                            GPU_MM_KILL
-                                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                                            crate::gpu::mm_kill();
                                         }
                                         crate::gpu::probe_record(class, true, el);
                                         return;

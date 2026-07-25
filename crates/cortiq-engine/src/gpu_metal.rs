@@ -946,6 +946,45 @@ kernel void panel_unstack(
     dst[((ulong)bi * nh + h) * hd + d] = src[i];
 }
 
+// Full-row softmax for the DiT's bidirectional attention: one
+// 256-thread threadgroup per row, strided max/exp-sum reductions, in
+// place. exp/order differ from the CPU softmax (tolerance-gated,
+// like every GPU reduction here).
+kernel void softmax_rows(
+    device float*  s [[buffer(0)]],
+    constant uint& n [[buffer(1)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    const uint TPT = 256u;
+    device float* row = s + (ulong)tg * n;
+    threadgroup float red[256];
+    float mx = -INFINITY;
+    for (uint i = tid; i < n; i += TPT) mx = max(mx, row[i]);
+    red[tid] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = TPT >> 1u; off > 0u; off >>= 1u) {
+        if (tid < off) red[tid] = max(red[tid], red[tid + off]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    mx = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = 0.0f;
+    for (uint i = tid; i < n; i += TPT) {
+        float e = exp(row[i] - mx);
+        row[i] = e;
+        sum += e;
+    }
+    red[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = TPT >> 1u; off > 0u; off >>= 1u) {
+        if (tid < off) red[tid] += red[tid + off];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
+    for (uint i = tid; i < n; i += TPT) row[i] *= inv;
+}
+
 // q1: 6-byte tiles [f16 scale][4B sign bits] per 32-group; w = s*(2b-1).
 // One SIMD group per FOUR rows, tiles of a pair processed one at a
 // time: each activation float4 a lane loads is used against four rows'
@@ -2414,6 +2453,7 @@ struct Ctx {
     q4bh: ComputePipelineState,
     q4t: ComputePipelineState,
     q4tmm: ComputePipelineState,
+    smaxrows: ComputePipelineState,
     flag: ComputePipelineState,
     rmsn: ComputePipelineState,
     f16mv: ComputePipelineState,
@@ -2553,6 +2593,7 @@ fn init() -> Result<Ctx, String> {
     let q4bh = pso("q4b_matvec_h")?;
     let q4t = pso("q4t_matvec")?;
     let q4tmm = pso("q4t_mul_mm")?;
+    let smaxrows = pso("softmax_rows")?;
     let flag = pso("write_flag")?;
     let rmsn = pso("rmsnorm_k")?;
     let f16mv = pso("f32_matvec")?;
@@ -2599,6 +2640,7 @@ fn init() -> Result<Ctx, String> {
         q4bh,
         q4t,
         q4tmm,
+        smaxrows,
         flag,
         rmsn,
         f16mv,
@@ -4443,6 +4485,221 @@ pub fn q4t_matmat(
         std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
     }
     tracing::debug!("gpu q4t matmat: {rows}x{cols} b={b}");
+    true
+}
+
+/// Fused DiT SwiGLU FFN, all on-device: g = X·W1ᵀ, u = X·W3ᵀ,
+/// g = silu(g)·u (in place — thread-local read→write), y = g·W2ᵀ.
+/// Four encoders in one command buffer; encoder order is the
+/// dependency chain. The unfused path shipped the [b, inter]
+/// intermediates across the CPU boundary twice per layer (~78 MB at
+/// 512px) and ran the silu·u loop CPU-side between submits.
+#[allow(clippy::too_many_arguments)]
+pub fn q4t_ffn(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w3: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if hidden % 32 != 0 || inter % 32 != 0 {
+        return false;
+    }
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let abs_ok = |idx: usize, rows: usize, cols: usize| -> Option<usize> {
+        let abs = model.entry_abs_offset(&model.tensors[idx])?;
+        (abs + rows * (cols / 32) * 18 <= safe_len).then_some(abs)
+    };
+    let (Some(a1), Some(a3), Some(a2)) = (
+        abs_ok(w1, inter, hidden),
+        abs_ok(w3, inter, hidden),
+        abs_ok(w2, hidden, inter),
+    ) else {
+        return false;
+    };
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let xs_buf = get_io(11_000_000_453 + xs.len(), xs.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(xs.as_ptr(), xs_buf.contents() as *mut f32, xs.len());
+    }
+    let g_buf = get_io(14_000_000_071 + b * inter, b * inter * 4);
+    let u_buf = get_io(15_000_000_083 + b * inter, b * inter * 4);
+    let y_buf = get_io(12_000_000_469 + b * hidden, b * hidden * 4);
+
+    let cmd = c.queue.new_command_buffer();
+    let mm = |abs: usize, xb: &Buffer, yb: &Buffer, rows: usize, cols: usize| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.q4tmm);
+        enc.set_buffer(0, Some(&fbuf), abs as u64);
+        enc.set_buffer(1, Some(xb), 0);
+        enc.set_buffer(2, Some(yb), 0);
+        let (cu, ru, nbu) = (cols as u32, rows as u32, b as u32);
+        enc.set_bytes(3, 4, &cu as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &ru as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &nbu as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new((b as u64).div_ceil(32), (rows as u64).div_ceil(64), 1),
+            MTLSize::new(128, 1, 1),
+        );
+        enc.end_encoding();
+    };
+    mm(a1, &xs_buf, &g_buf, inter, hidden);
+    mm(a3, &xs_buf, &u_buf, inter, hidden);
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.silu);
+        enc.set_buffer(0, Some(&g_buf), 0);
+        enc.set_buffer(1, Some(&u_buf), 0);
+        enc.set_buffer(2, Some(&u_buf), 0); // col slot: unused (has_col=0)
+        enc.set_buffer(3, Some(&g_buf), 0);
+        let n_u = (b * inter) as u32;
+        let has = 0u32;
+        enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &has as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new(((b * inter) as u64).div_ceil(256), 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    mm(a2, &g_buf, &y_buf, hidden, inter);
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * hidden);
+    }
+    tracing::debug!("gpu q4t ffn: {hidden}x{inter} b={b}");
+    true
+}
+
+/// DiT full bidirectional attention, all heads on the device: per
+/// head scores = (Q·scale)·Kᵀ (f32nt), full-row softmax, P·V (f32nn)
+/// into an [nh][n][hd] panel, then panel_unstack → [n][nh·hd]. One
+/// command buffer; the n×n scores scratch is shared across heads
+/// (encoder order serializes — each per-head GEMM is wide enough to
+/// fill the device on its own). Inputs are head-major packs; GQA
+/// picks kv = h/(nh/nkv).
+#[allow(clippy::too_many_arguments)]
+pub fn dit_attention(
+    qh: &[f32],
+    kh: &[f32],
+    vh: &[f32],
+    nh: usize,
+    nkv: usize,
+    n: usize,
+    hd: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let qb = get_io(16_000_000_123 + qh.len(), qh.len() * 4);
+    let kb = get_io(17_000_000_137 + kh.len(), kh.len() * 4);
+    let vb = get_io(18_000_000_149 + vh.len(), vh.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(qh.as_ptr(), qb.contents() as *mut f32, qh.len());
+        std::ptr::copy_nonoverlapping(kh.as_ptr(), kb.contents() as *mut f32, kh.len());
+        std::ptr::copy_nonoverlapping(vh.as_ptr(), vb.contents() as *mut f32, vh.len());
+    }
+    let sc = get_io(19_000_000_151 + n * n, n * n * 4);
+    let pb = get_io(20_000_000_167 + nh * n * hd, nh * n * hd * 4);
+    let ab = get_io(21_000_000_179 + nh * n * hd, nh * n * hd * 4);
+    let hpk = nh / nkv.max(1);
+
+    let cmd = c.queue.new_command_buffer();
+    for h in 0..nh {
+        let kv = h / hpk;
+        {
+            let enc = cmd.new_compute_command_encoder();
+            let pso = mm_pipeline(c, 0, hd, 2);
+            enc.set_compute_pipeline_state(&pso);
+            enc.set_buffer(0, Some(&kb), (kv * n * hd * 4) as u64);
+            enc.set_buffer(1, Some(&qb), (h * n * hd * 4) as u64);
+            enc.set_buffer(2, Some(&sc), 0);
+            let (cols_u, rows_u, nb_u) = (hd as u32, n as u32, n as u32);
+            enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(6, 4, &scale as *const f32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new((n as u64).div_ceil(32), (n as u64).div_ceil(64), 1),
+                MTLSize::new(128, 1, 1),
+            );
+            enc.end_encoding();
+        }
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.smaxrows);
+            enc.set_buffer(0, Some(&sc), 0);
+            let n_u = n as u32;
+            enc.set_bytes(1, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.end_encoding();
+        }
+        {
+            let enc = cmd.new_compute_command_encoder();
+            let pso = mm_pipeline(c, hd, 0, 3);
+            enc.set_compute_pipeline_state(&pso);
+            enc.set_buffer(0, Some(&vb), (kv * n * hd * 4) as u64);
+            enc.set_buffer(1, Some(&sc), 0);
+            enc.set_buffer(2, Some(&pb), (h * n * hd * 4) as u64);
+            let (k_u, rows_u, nb_u) = (n as u32, hd as u32, n as u32);
+            enc.set_bytes(3, 4, &k_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new((n as u64).div_ceil(32), (hd as u64).div_ceil(64), 1),
+                MTLSize::new(128, 1, 1),
+            );
+            enc.end_encoding();
+        }
+    }
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.unstack);
+        enc.set_buffer(0, Some(&pb), 0);
+        enc.set_buffer(1, Some(&ab), 0);
+        let words = [nh as u32, n as u32, hd as u32];
+        for (i, w) in words.iter().enumerate() {
+            enc.set_bytes(2 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+        }
+        enc.dispatch_threads(
+            MTLSize::new((nh * n * hd) as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&ab]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(ab.contents() as *const f32, out.as_mut_ptr(), n * nh * hd);
+    }
+    tracing::debug!("gpu dit attention: nh={nh} n={n} hd={hd}");
     true
 }
 

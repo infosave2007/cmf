@@ -533,6 +533,120 @@ impl NextDit {
         linear(&h, &self.t_lin2_w, &self.t_lin2_b)
     }
 
+    /// Fused on-device SwiGLU FFN (Metal). Taken only once the wide
+    /// GEMM probe has settled on the GPU arm: during probing the
+    /// per-op path feeds the samples, after a CPU verdict (or a
+    /// contention kill) the CPU path is the right one anyway. Carries
+    /// the same work-proportional contention tripwire as the per-op
+    /// route (cold ops exempt).
+    fn gpu_ffn(&self, blk: &Block, xn: &[f32], n: usize, out: &mut [f32]) -> bool {
+        use crate::gpu;
+        if n < 128 || !gpu::enabled_here() || gpu::mm_killed() {
+            return false;
+        }
+        if gpu::probe_deciding(gpu::OpClass::MatmatWide)
+            || !matches!(
+                gpu::probe_arm(gpu::OpClass::MatmatWide),
+                gpu::ProbeArm::Gpu
+            )
+        {
+            return false;
+        }
+        let (Proj::Q(q1), Proj::Q(q3), Proj::Q(q2)) = (&blk.w1, &blk.w3, &blk.w2) else {
+            return false;
+        };
+        let (Some((m, i1)), Some((_, i3)), Some((_, i2))) =
+            (q1.mapped_q4t(), q3.mapped_q4t(), q2.mapped_q4t())
+        else {
+            return false;
+        };
+        let inter = q1.rows();
+        let t0 = std::time::Instant::now();
+        if !gpu::q4t_ffn(m, i1, i3, i2, xn, n, self.hidden, inter, out) {
+            return false;
+        }
+        let flops = 6.0 * n as f64 * self.hidden as f64 * inter as f64;
+        let budget = std::time::Duration::from_secs_f64(flops / 1.5e12 * 8.0 + 0.020);
+        let el = t0.elapsed();
+        if el > budget && !gpu::probe_was_cold() {
+            tracing::warn!(
+                "gpu ffn took {el:?} (budget {budget:?}) — device contended, \
+                 CPU for the rest of the process"
+            );
+            gpu::mm_kill();
+        }
+        true
+    }
+
+    /// All-heads attention on the device (same probe/kill gating as
+    /// the fused FFN). Packs q/k/v head-major (pool-parallel), runs
+    /// scores→softmax→P·V→unstack in one command buffer, and writes
+    /// straight into the [n][nh·hd] attn layout the O-projection
+    /// consumes. Returns false → caller runs the CPU per-head loop.
+    fn gpu_attention(
+        &self,
+        q_all: &[f32],
+        k_all: &[f32],
+        v_all: &[f32],
+        n: usize,
+        scale: f32,
+        attn: &mut [f32],
+    ) -> bool {
+        use crate::gpu;
+        let (nh, nkv, hd) = (self.nh, self.nkv, self.hd);
+        if n < 128 || !gpu::enabled_here() || gpu::mm_killed() {
+            return false;
+        }
+        if gpu::probe_deciding(gpu::OpClass::MatmatWide)
+            || !matches!(gpu::probe_arm(gpu::OpClass::MatmatWide), gpu::ProbeArm::Gpu)
+        {
+            return false;
+        }
+        let pool = self.pool.as_deref();
+        let mut qh = vec![0f32; nh * n * hd];
+        let mut kh = vec![0f32; nkv * n * hd];
+        let mut vh = vec![0f32; nkv * n * hd];
+        {
+            let _s = prof::span(prof::APACK);
+            let (sq, sk, sv) = (
+                SendRows(qh.as_mut_ptr()),
+                SendRows(kh.as_mut_ptr()),
+                SendRows(vh.as_mut_ptr()),
+            );
+            pool_rows(pool, n, &|start, end| {
+                for p in start..end {
+                    for h in 0..nh {
+                        // SAFETY: workers cover disjoint token ranges.
+                        unsafe { sq.row((h * n + p) * hd, hd) }
+                            .copy_from_slice(&q_all[(p * nh + h) * hd..(p * nh + h + 1) * hd]);
+                    }
+                    for h in 0..nkv {
+                        unsafe { sk.row((h * n + p) * hd, hd) }
+                            .copy_from_slice(&k_all[(p * nkv + h) * hd..(p * nkv + h + 1) * hd]);
+                        unsafe { sv.row((h * n + p) * hd, hd) }
+                            .copy_from_slice(&v_all[(p * nkv + h) * hd..(p * nkv + h + 1) * hd]);
+                    }
+                }
+            });
+        }
+        let _s = prof::span(prof::AQK);
+        let t0 = std::time::Instant::now();
+        if !gpu::dit_attention(&qh, &kh, &vh, nh, nkv, n, hd, scale, attn) {
+            return false;
+        }
+        let flops = 4.0 * nh as f64 * (n as f64) * (n as f64) * hd as f64;
+        let budget = std::time::Duration::from_secs_f64(flops / 1.5e12 * 8.0 + 0.020);
+        let el = t0.elapsed();
+        if el > budget && !gpu::probe_was_cold() {
+            tracing::warn!(
+                "gpu attention took {el:?} (budget {budget:?}) — device contended, \
+                 CPU for the rest of the process"
+            );
+            gpu::mm_kill();
+        }
+        true
+    }
+
     fn block_forward(
         &self,
         blk: &Block,
@@ -656,69 +770,72 @@ impl NextDit {
         let scale = 1.0 / (hd as f32).sqrt();
         let hpk = nh / nkv;
         let mut attn = vec![0f32; n * nh * hd];
-        let mut qh = vec![0f32; n * hd];
-        let mut kh = vec![0f32; n * hd];
-        let mut vt = vec![0f32; hd * n]; // V transposed: gemm_nt's W layout
-        let mut scores = vec![0f32; n * n];
-        let mut oh = vec![0f32; n * hd];
-        for hh in 0..nh {
-            let kv = hh / hpk;
-            {
+        if !self.gpu_attention(&q_all, &k_all, &v_all, n, scale, &mut attn) {
+            let mut qh = vec![0f32; n * hd];
+            let mut kh = vec![0f32; n * hd];
+            let mut vt = vec![0f32; hd * n]; // V transposed: gemm_nt's W layout
+            let mut scores = vec![0f32; n * n];
+            let mut oh = vec![0f32; n * hd];
+            for hh in 0..nh {
+                let kv = hh / hpk;
+                {
+                    let _s = prof::span(prof::APACK);
+                    let (sq, sk, sv) = (
+                        SendRows(qh.as_mut_ptr()),
+                        SendRows(kh.as_mut_ptr()),
+                        SendRows(vt.as_mut_ptr()),
+                    );
+                    pool_rows(pool, n, &|start, end| {
+                        for p in start..end {
+                            let qsrc = &q_all[(p * nh + hh) * hd..(p * nh + hh + 1) * hd];
+                            // SAFETY: workers cover disjoint token ranges
+                            // (`vt` columns are indexed by token too).
+                            let qd = unsafe { sq.row(p * hd, hd) };
+                            for (d, &v) in qsrc.iter().enumerate() {
+                                qd[d] = v * scale;
+                            }
+                            unsafe { sk.row(p * hd, hd) }.copy_from_slice(
+                                &k_all[(p * nkv + kv) * hd..(p * nkv + kv + 1) * hd],
+                            );
+                            let vv = &v_all[(p * nkv + kv) * hd..(p * nkv + kv + 1) * hd];
+                            for (d, &val) in vv.iter().enumerate() {
+                                unsafe { sv.set(d * n + p, val) };
+                            }
+                        }
+                    });
+                }
+                {
+                    let _s = prof::span(prof::AQK);
+                    crate::fcd_ops::gemm_nt(&qh, &kh, &mut scores, n, hd, n, pool);
+                }
+                {
+                    let _s = prof::span(prof::SOFTMAX);
+                    let sp = SendRows(scores.as_mut_ptr());
+                    let soft = |start: usize, end: usize| {
+                        for r in start..end {
+                            // SAFETY: workers cover disjoint row ranges.
+                            softmax_inplace(unsafe { sp.row(r * n, n) });
+                        }
+                    };
+                    match pool {
+                        Some(p) => p.run_rows(n, &soft),
+                        None => soft(0, n),
+                    }
+                }
+                {
+                    let _s = prof::span(prof::APV);
+                    crate::fcd_ops::gemm_nt(&scores, &vt, &mut oh, n, n, hd, pool);
+                }
                 let _s = prof::span(prof::APACK);
-                let (sq, sk, sv) = (
-                    SendRows(qh.as_mut_ptr()),
-                    SendRows(kh.as_mut_ptr()),
-                    SendRows(vt.as_mut_ptr()),
-                );
+                let sa = SendRows(attn.as_mut_ptr());
                 pool_rows(pool, n, &|start, end| {
                     for p in start..end {
-                        let qsrc = &q_all[(p * nh + hh) * hd..(p * nh + hh + 1) * hd];
-                        // SAFETY: workers cover disjoint token ranges
-                        // (`vt` columns are indexed by token too).
-                        let qd = unsafe { sq.row(p * hd, hd) };
-                        for (d, &v) in qsrc.iter().enumerate() {
-                            qd[d] = v * scale;
-                        }
-                        unsafe { sk.row(p * hd, hd) }
-                            .copy_from_slice(&k_all[(p * nkv + kv) * hd..(p * nkv + kv + 1) * hd]);
-                        let vv = &v_all[(p * nkv + kv) * hd..(p * nkv + kv + 1) * hd];
-                        for (d, &val) in vv.iter().enumerate() {
-                            unsafe { sv.set(d * n + p, val) };
-                        }
+                        // SAFETY: workers cover disjoint token ranges.
+                        unsafe { sa.row((p * nh + hh) * hd, hd) }
+                            .copy_from_slice(&oh[p * hd..(p + 1) * hd]);
                     }
                 });
             }
-            {
-                let _s = prof::span(prof::AQK);
-                crate::fcd_ops::gemm_nt(&qh, &kh, &mut scores, n, hd, n, pool);
-            }
-            {
-                let _s = prof::span(prof::SOFTMAX);
-                let sp = SendRows(scores.as_mut_ptr());
-                let soft = |start: usize, end: usize| {
-                    for r in start..end {
-                        // SAFETY: workers cover disjoint row ranges.
-                        softmax_inplace(unsafe { sp.row(r * n, n) });
-                    }
-                };
-                match pool {
-                    Some(p) => p.run_rows(n, &soft),
-                    None => soft(0, n),
-                }
-            }
-            {
-                let _s = prof::span(prof::APV);
-                crate::fcd_ops::gemm_nt(&scores, &vt, &mut oh, n, n, hd, pool);
-            }
-            let _s = prof::span(prof::APACK);
-            let sa = SendRows(attn.as_mut_ptr());
-            pool_rows(pool, n, &|start, end| {
-                for p in start..end {
-                    // SAFETY: workers cover disjoint token ranges.
-                    unsafe { sa.row((p * nh + hh) * hd, hd) }
-                        .copy_from_slice(&oh[p * hd..(p + 1) * hd]);
-                }
-            });
         }
         let mut proj = vec![0f32; n * hs];
         {
@@ -730,31 +847,37 @@ impl NextDit {
         // ── SwiGLU FFN ──
         norm_scaled(x, &blk.ffn_norm1, s_mlp, &mut xn);
         drop(modnorm);
-        let inter = blk.w1.rows();
-        let mut g_all = vec![0f32; n * inter];
-        let mut u_all = vec![0f32; n * inter];
-        {
-            let _s = prof::span(prof::FFN);
-            blk.w1.matmat(&xn, n, &mut g_all, pool);
-            blk.w3.matmat(&xn, n, &mut u_all, pool);
-        }
-        {
-            let _s = prof::span(prof::FFNEL);
-            let sg = SendRows(g_all.as_mut_ptr());
-            pool_rows(pool, n, &|start, end| {
-                for p in start..end {
-                    // SAFETY: workers cover disjoint token ranges.
-                    let g = unsafe { sg.row(p * inter, inter) };
-                    for (gv, &uv) in g.iter_mut().zip(&u_all[p * inter..(p + 1) * inter]) {
-                        *gv = silu(*gv) * uv;
-                    }
-                }
-            });
-        }
         let mut d_all = vec![0f32; n * hs];
-        {
+        let fused = {
             let _s = prof::span(prof::FFN);
-            blk.w2.matmat(&g_all, n, &mut d_all, pool);
+            self.gpu_ffn(blk, &xn, n, &mut d_all)
+        };
+        if !fused {
+            let inter = blk.w1.rows();
+            let mut g_all = vec![0f32; n * inter];
+            let mut u_all = vec![0f32; n * inter];
+            {
+                let _s = prof::span(prof::FFN);
+                blk.w1.matmat(&xn, n, &mut g_all, pool);
+                blk.w3.matmat(&xn, n, &mut u_all, pool);
+            }
+            {
+                let _s = prof::span(prof::FFNEL);
+                let sg = SendRows(g_all.as_mut_ptr());
+                pool_rows(pool, n, &|start, end| {
+                    for p in start..end {
+                        // SAFETY: workers cover disjoint token ranges.
+                        let g = unsafe { sg.row(p * inter, inter) };
+                        for (gv, &uv) in g.iter_mut().zip(&u_all[p * inter..(p + 1) * inter]) {
+                            *gv = silu(*gv) * uv;
+                        }
+                    }
+                });
+            }
+            {
+                let _s = prof::span(prof::FFN);
+                blk.w2.matmat(&g_all, n, &mut d_all, pool);
+            }
         }
         let _modnorm = prof::span(prof::MODNORM);
         residual(&d_all, &blk.ffn_norm2, gate_mlp.as_deref(), x);
