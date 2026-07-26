@@ -830,7 +830,8 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         rope_theta: g("rope.freq_base")
             .and_then(|v| v.as_f64())
             .unwrap_or(10_000.0),
-        tie_word_embeddings: false,
+        // No separate output head in the file = tied embeddings.
+        tie_word_embeddings: !tensors.iter().any(|t| t.name == "output.weight"),
         partial_rotary_factor: match gu("rope.dimension_count") {
             Some(rd) if head_dim > 0 && rd < head_dim => rd as f32 / head_dim as f32,
             _ => 1.0,
@@ -1143,10 +1144,13 @@ pub fn run_import_gguf(
             // llama.cpp bakes the zero-centered (1+w) shift into the RMS
             // norm weights of gemma-style models; the engine adds the 1
             // itself. Detect by magnitude (shifted weights sit near 1,
-            // raw near 0) so either convention imports right.
+            // raw near 0) so either convention imports right. The GDN
+            // gated norm (linear_attn.norm) is EXCLUDED on both sides:
+            // llama.cpp stores it raw, and its weights initialize at 1 —
+            // the magnitude heuristic would mangle them (found the hard
+            // way: it was the one broken tensor in the layer diff).
             if name.ends_with("layernorm.weight")
                 || name.ends_with("_norm.weight")
-                || name.ends_with("linear_attn.norm.weight")
                 || name == "model.norm.weight"
             {
                 let mean = vals.iter().sum::<f32>() / vals.len().max(1) as f32;
