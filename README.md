@@ -402,9 +402,17 @@ crosses the CPU boundary — and the VAE decoder runs on the GPU too
 (conv2d as implicit GEMM, whole resnet blocks per command buffer). An
 M4 renders 256×256 / 30 steps in **~37 s** and 512×512 in ~2.5 min;
 CPU-only takes about twice as long, and 1024×1024 is practical on the
-block graph. The GPU arm is probed against the CPU exactly like LLM
-inference — enabling it never makes you slower — and GPU renders stay
-visually identical to the CPU path.
+block graph.
+
+On everything else, `CMF_GPU=1` runs the quantized GEMMs and the fused
+FFN through wgpu (Vulkan / DX12 → NVIDIA / AMD / Intel, and Adreno /
+Mali on phones): an RTX 4090 renders 512×512 in ~7.5 min vs ~16 min on
+its host's 32 CPU cores. The GPU arm is probed against the CPU exactly
+like LLM inference — a device that loses keeps the CPU path, so
+enabling the GPU never makes you slower — and GPU renders stay
+visually identical. For apps, the C ABI exports `cortiq_imagine`
+(text → RGB8 with a per-step progress callback); `--cfg 1` disables
+guidance and halves the work — the right default on phones.
 
 ## O(1) in depth
 

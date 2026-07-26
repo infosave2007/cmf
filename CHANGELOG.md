@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.23] — 2026-07-26
+
+### Added
+- **Text-to-image on Vulkan / DX12 (wgpu)** — the DiT's quantized
+  GEMMs now run on every wgpu adapter (NVIDIA / AMD / Intel desktop
+  cards, Adreno / Mali phone GPUs), not just Apple Metal. The WGSL
+  `q4t_mul_mm` is the register-blocked cousin of the Metal kernel
+  (18-byte tile decode in the W staging; parity on an RTX 4090:
+  5.2e-6 vs an exact f64 reference), and the SwiGLU FFN runs fused —
+  w1/w3/silu·u/w2 as four passes in ONE submission with one readback,
+  because on discrete cards the per-op submits and the PCIe round
+  trips of the intermediates dominate the GEMM itself. Weights stay
+  cached in VRAM. The same per-process CPU-vs-GPU probe and
+  contention kill-switch gate the path everywhere: a phone GPU that
+  loses simply keeps the CPU arm — enabling the GPU never makes
+  generation slower.
+- **`cortiq_imagine` in the C FFI** (cortiq-ffi): text → interleaved
+  RGB8 into a caller buffer, with a per-step progress callback — the
+  entry point mobile apps need. `guidance ≤ 1` disables CFG and
+  halves the work (the right default on phones); weights stream from
+  the mmap, so peak RSS stays far below the model size.
+
+### Performance
+RunPod RTX 4090 (Vulkan) vs the same pod's 32-core CPU, 30 steps,
+CFG 4, the one 3.2 GB q4t file:
+- 512×512: **454 s** fused GPU / ~700 s per-op GPU / ~960 s CPU
+- 256×256: **147 s** GPU / 222 s CPU
+Renders are visually identical to the CPU path. The remaining wall on
+discrete cards is CPU-side attention and the portable f32 GEMM — the
+next port targets.
+
 ## [0.5.22] — 2026-07-26
 
 ### Added

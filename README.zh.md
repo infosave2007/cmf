@@ -355,9 +355,15 @@ GEMM 在 K 循环内解码自己的 tile，注意力 softmax 和 SwiGLU FFN 都�
 上，跨越 CPU 边界的只有 hidden state——VAE 解码器同样跑在 GPU 上（conv2d
 作为 implicit GEMM，整个 resnet 块共用一个 command buffer）。M4 渲染
 256×256 / 30 步约 **37 秒**，512×512 约 2.5 分钟；纯 CPU 大约慢一倍，
-1024×1024 在块图上也变得实用。GPU 路径与 CPU 的对比探测方式和 LLM 推理
-完全相同——开启 GPU 永远不会让你更慢——GPU 渲染与 CPU 路径在视觉上完全
-一致。
+1024×1024 在块图上也变得实用。
+
+在其它平台上，`CMF_GPU=1` 通过 wgpu 运行量化 GEMM 和融合 FFN
+（Vulkan / DX12 → NVIDIA / AMD / Intel，手机上是 Adreno / Mali）：
+RTX 4090 渲染 512×512 约 7.5 分钟，同主机 32 个 CPU 核心要 16 分钟。
+GPU 路径与 CPU 的对比探测方式和 LLM 推理完全相同——探测输掉的设备会留在
+CPU 路径上，开启 GPU 永远不会让你更慢——GPU 渲染在视觉上完全一致。面向
+应用，C ABI 导出 `cortiq_imagine`（文本 → RGB8，带每步进度回调）；
+`--cfg 1` 关闭 guidance、工作量减半——是手机上的正确默认值。
 
 ## O(1) 深入解析
 
