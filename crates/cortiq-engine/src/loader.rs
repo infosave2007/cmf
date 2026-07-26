@@ -183,10 +183,28 @@ pub(crate) fn build_layer_ffn(
     } else {
         None
     };
+    // CMF_MOE_TOPK=N (opt-in): route to fewer experts than the header
+    // asks. MoE decode is memory-bound — every selected expert streams
+    // its three matrices per token — so halving k halves that traffic;
+    // the renormalized top-k keeps the mixture a proper average.
+    // Quality is the experiment — measure ppl before trusting.
+    let top_k = std::env::var("CMF_MOE_TOPK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&k| k >= 1 && k <= cfg.top_k)
+        .inspect(|k| tracing::info!("MoE top_k override: {} (header {})", k, cfg.top_k))
+        .unwrap_or(cfg.top_k);
+    // CMF_MOE_TAU=0.x (opt-in): adaptive routing — see MoeFfn::route_tau.
+    let route_tau = std::env::var("CMF_MOE_TAU")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|&t| t > 0.0 && t < 1.0)
+        .inspect(|t| tracing::info!("MoE adaptive routing: tau {t}"));
     Ok(FfnKind::Moe(MoeFfn {
         router: load_matrix(model, &router_name, force_f32, ov)?,
         experts,
-        top_k: cfg.top_k,
+        top_k,
+        route_tau,
         norm_topk_prob: cfg.norm_topk_prob,
         router_sigmoid: cfg.router_sigmoid,
         expert_bias,

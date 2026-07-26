@@ -281,6 +281,12 @@ pub struct MoeFfn {
     /// Top-k weights are multiplied by this after the optional renorm
     /// (LFM2-MoE `routed_scaling_factor`; 1.0 = off).
     pub routed_scaling: f32,
+    /// Adaptive routing (CMF_MOE_TAU, opt-in): keep the smallest
+    /// prefix of the top-k whose renormalized mass reaches τ —
+    /// confident tokens touch 1–2 experts, flat ones keep all k.
+    /// MoE decode is memory-bound, so skipped experts are skipped
+    /// weight traffic. None = classic fixed top-k (bit-identical).
+    pub route_tau: Option<f32>,
     /// Always-on shared expert. Qwen2-MoE carries an additional sigmoid
     /// gate; Laguna adds the shared expert unconditionally (`None`).
     pub shared: Option<(DenseFfn, Option<QTensor>)>,
@@ -4310,6 +4316,24 @@ fn moe_route(logits: &[f32], m: &MoeFfn) -> (Vec<usize>, Vec<f32>, f32) {
         None => idx.sort_unstable_by(|&x, &y| p[y].partial_cmp(&p[x]).unwrap().then(x.cmp(&y))),
     }
     idx.truncate(m.top_k);
+    // Adaptive τ-routing: trim the tail experts once the kept mass is
+    // enough. wsum below renormalizes over the KEPT set, so the output
+    // stays a proper weighted average.
+    if let Some(tau) = m.route_tau {
+        let total: f32 = idx.iter().map(|&e| p[e]).sum();
+        if total > 0.0 {
+            let mut acc = 0.0f32;
+            let mut keep = idx.len();
+            for (i, &e) in idx.iter().enumerate() {
+                acc += p[e];
+                if acc >= tau * total {
+                    keep = i + 1;
+                    break;
+                }
+            }
+            idx.truncate(keep);
+        }
+    }
     let wsum: f32 = if m.norm_topk_prob {
         let s: f32 = idx.iter().map(|&e| p[e]).sum();
         // LFM2 floors the denom (matches HF `+ 1e-6`); the softmax path's
