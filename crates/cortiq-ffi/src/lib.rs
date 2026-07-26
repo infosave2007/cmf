@@ -409,6 +409,81 @@ pub extern "C" fn cortiq_complete(
     })
 }
 
+/// Text → image (Lumina-Image 2.0 packed `.cmf`). Renders `prompt` at
+/// `width`×`height` (multiples of 16) with `steps` denoising steps and
+/// CFG `guidance` (≤1 disables CFG and halves the work — the right
+/// default on phones), writing `height·width·3` interleaved RGB8 bytes
+/// into caller-allocated `out_rgb`. `progress` (nullable) fires after
+/// each denoising step with (step, total, user). The model file is
+/// opened per call (mmap — cheap); weights stream from the map, so
+/// peak RSS stays far below the file size. GPU (Metal / Vulkan via
+/// `cortiq_set_gpu`) is probed against the CPU per process — enabling
+/// it never makes generation slower. Returns 0 on success, -1 on
+/// error (`cortiq_last_error` has the message).
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_imagine(
+    model_path: *const c_char,
+    prompt: *const c_char,
+    width: u32,
+    height: u32,
+    steps: u32,
+    guidance: f32,
+    seed: u64,
+    out_rgb: *mut u8,
+    progress: Option<extern "C" fn(step: u32, total: u32, user: *mut c_void)>,
+    user: *mut c_void,
+) -> i32 {
+    if model_path.is_null() || prompt.is_null() || out_rgb.is_null() {
+        set_error("null argument");
+        return -1;
+    }
+    let (path, prompt) = unsafe {
+        let Ok(p) = CStr::from_ptr(model_path).to_str() else {
+            set_error("model_path is not UTF-8");
+            return -1;
+        };
+        let Ok(t) = CStr::from_ptr(prompt).to_str() else {
+            set_error("prompt is not UTF-8");
+            return -1;
+        };
+        (p.to_string(), t.to_string())
+    };
+    let params = cortiq_engine::imagegen::GenParams {
+        height: height as usize,
+        width: width as usize,
+        steps: steps.max(1) as usize,
+        guidance_scale: guidance,
+        seed,
+        ..Default::default()
+    };
+    let user_addr = user as usize; // callbacks may hop pool threads
+    let img = match cortiq_engine::imagegen::generate(
+        std::path::Path::new(&path),
+        &prompt,
+        &params,
+        |i, n| {
+            if let Some(cb) = progress {
+                cb(i as u32, n as u32, user_addr as *mut c_void);
+            }
+        },
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(&e);
+            return -1;
+        }
+    };
+    // [3, h, w] planar f32 in [0,1] → interleaved RGB8.
+    let plane = (height as usize) * (width as usize);
+    let dst = unsafe { std::slice::from_raw_parts_mut(out_rgb, plane * 3) };
+    for p in 0..plane {
+        for ch in 0..3 {
+            dst[p * 3 + ch] = (img[ch * plane + p].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

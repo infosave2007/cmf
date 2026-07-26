@@ -875,6 +875,9 @@ pub fn q4t_ffn(
     match backend() {
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::q4t_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q4t_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
+        #[allow(unreachable_patterns)]
         _ => false,
     }
 }
@@ -1022,8 +1025,9 @@ pub fn dit_attention(
 }
 
 /// Batched q4t GEMM on the device (imagegen DiT prefill shapes).
-/// Metal only for now: q4t_mul_mm decodes the mmap-resident tiles
-/// inside the GEMM's K loop; a wgpu twin is a follow-up.
+/// Metal: q4t_mul_mm decodes the mmap-resident tiles inside the
+/// GEMM's K loop. wgpu (Vulkan/DX12 → NVIDIA/AMD/Intel/Adreno/Mali):
+/// the register-blocked WGSL twin, weights cached in VRAM.
 #[allow(unused_variables)]
 pub fn q4t_matmat(
     model: &Arc<CmfModel>,
@@ -1037,6 +1041,9 @@ pub fn q4t_matmat(
     match backend() {
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::q4t_matmat(model, idx, xs, b, rows, cols, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q4t_matmat(model, idx, xs, b, rows, cols, out),
+        #[allow(unreachable_patterns)]
         _ => false,
     }
 }

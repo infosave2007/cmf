@@ -441,6 +441,19 @@ fn fill_zero(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i < znp.n) { zy[i] = 0.0; }
 }
 
+// silu(g)·u in place on g — the glue pass of the fused imagegen FFN
+// (w1/w3/silu/w2 in one submission, one readback).
+@group(0) @binding(0) var<storage, read_write> fsg : array<f32>;
+@group(0) @binding(1) var<storage, read>       fsu : array<f32>;
+@group(0) @binding(2) var<uniform>             fsp : N1;
+@compute @workgroup_size(256)
+fn ffn_silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= fsp.n) { return; }
+    let g = fsg[i];
+    fsg[i] = (g / (1.0 + exp(-g))) * fsu[i];
+}
+
 // Plain f32 matvec (for small unquantized projections like GDN in_proj_a/b):
 // y[o] = Σ_i W[o,i]·x[i]. One workgroup per output row.
 struct F32P { cols: u32, rows: u32, _a: u32, _b: u32 };
@@ -1349,6 +1362,92 @@ fn q1t_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// q4t register-blocked GEMM (imagegen DiT prefill / any wide q4t
+// batch) — the WGSL cousin of the Metal q4t_mul_mm and structurally
+// identical to q1t_mul_mm above; only the W staging decodes 18-byte
+// q4t tiles (f16 scale + 16 nibble bytes per 32-weight group).
+// Shares the 4-slot qmm/xmm/ymm/pmm bindings.
+var<workgroup> q4t_at: array<f32, 64 * 16>;
+var<workgroup> q4t_wt: array<f32, 64 * 16>;
+
+@compute @workgroup_size(16, 16)
+fn q4t_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let cols = pmm.cols4 * 4u;
+    let gpr = cols >> 5u;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    let tid = lid.y * 16u + lid.x;
+    var acc: array<array<f32, 4>, 4>;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        for (var j = 0u; j < 4u; j = j + 1u) { acc[i][j] = 0.0; }
+    }
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        for (var t = tid; t < 64u * 4u; t = t + 256u) {
+            let m = t / 4u;
+            let k4 = t % 4u;
+            var xv = vec4<f32>(0.0);
+            let col0 = k0 + k4 * 4u;
+            if (m0 + m < pmm.nb && col0 < cols) {
+                let xi = (m0 + m) * cols + col0;
+                xv = vec4<f32>(xmm[xi], xmm[xi + 1u], xmm[xi + 2u], xmm[xi + 3u]);
+            }
+            let dst = m * 16u + k4 * 4u;
+            q4t_at[dst] = xv.x; q4t_at[dst + 1u] = xv.y;
+            q4t_at[dst + 2u] = xv.z; q4t_at[dst + 3u] = xv.w;
+        }
+        for (var t = tid; t < 64u * 4u; t = t + 256u) {
+            let n = t / 4u;
+            let k4 = t % 4u;
+            var wv = vec4<f32>(0.0);
+            let col0 = k0 + k4 * 4u;
+            if (n0 + n < pmm.rows && col0 < cols) {
+                let g = col0 >> 5u;
+                let toff = ((n0 + n) * gpr + g) * 18u;
+                let sc16 = qmm_byte(toff) | (qmm_byte(toff + 1u) << 8u);
+                let scale = unpack2x16float(sc16).x;
+                // 4 consecutive weights = 2 nibble bytes (col0 is even).
+                let p = col0 - g * 32u;
+                let b0 = qmm_byte(toff + 2u + p / 2u);
+                let b1 = qmm_byte(toff + 3u + p / 2u);
+                wv[0u] = (f32(b0 & 0xFu) - 8.0) * scale;
+                wv[1u] = (f32(b0 >> 4u) - 8.0) * scale;
+                wv[2u] = (f32(b1 & 0xFu) - 8.0) * scale;
+                wv[3u] = (f32(b1 >> 4u) - 8.0) * scale;
+            }
+            let dst = n * 16u + k4 * 4u;
+            q4t_wt[dst] = wv.x; q4t_wt[dst + 1u] = wv.y;
+            q4t_wt[dst + 2u] = wv.z; q4t_wt[dst + 3u] = wv.w;
+        }
+        workgroupBarrier();
+        for (var k = 0u; k < 16u; k = k + 1u) {
+            var av: array<f32, 4>;
+            var wv: array<f32, 4>;
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                av[i] = q4t_at[(lid.y * 4u + i) * 16u + k];
+                wv[i] = q4t_wt[(lid.x * 4u + i) * 16u + k];
+            }
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                for (var j = 0u; j < 4u; j = j + 1u) {
+                    acc[i][j] = acc[i][j] + av[i] * wv[j];
+                }
+            }
+        }
+        workgroupBarrier();
+        k0 = k0 + 16u;
+    }
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let m = m0 + lid.y * 4u + i;
+        if (m >= pmm.nb) { continue; }
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            let n = n0 + lid.x * 4u + j;
+            if (n < pmm.rows) { ymm[m * pmm.rows + n] = acc[i][j]; }
+        }
+    }
+}
+
 @compute @workgroup_size(64)
 fn q1t_overlay_mm(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.x;
@@ -1584,6 +1683,8 @@ struct Ctx {
     q4t_mv: wgpu::ComputePipeline,
     silu_down: wgpu::ComputePipeline,
     q1t_mm: wgpu::ComputePipeline,
+    q4t_mm: wgpu::ComputePipeline,
+    ffn_silu: wgpu::ComputePipeline,
     q1t_ovmm: wgpu::ComputePipeline,
     rmsnorm: wgpu::ComputePipeline,
     add_rmsnorm: wgpu::ComputePipeline,
@@ -1683,6 +1784,9 @@ struct Scratch {
     y: Option<(wgpu::Buffer, u64)>,
     stage: Option<(wgpu::Buffer, u64)>,
     params: Option<wgpu::Buffer>,
+    /// Fused-FFN intermediates (gate / up panels).
+    g: Option<(wgpu::Buffer, u64)>,
+    u: Option<(wgpu::Buffer, u64)>,
 }
 
 impl Scratch {
@@ -1927,6 +2031,8 @@ fn init() -> Result<Ctx, String> {
     let q4t_mv = pipe("q4t_matvec");
     let silu_down = pipe("silu_down_matvec");
     let q1t_mm = pipe("q1t_mul_mm");
+    let q4t_mm = pipe("q4t_mul_mm");
+    let ffn_silu = pipe("ffn_silu_mul");
     let q1t_ovmm = pipe("q1t_overlay_mm");
     let rmsnorm = pipe("rmsnorm");
     let add_rmsnorm = pipe("add_rmsnorm");
@@ -2010,6 +2116,8 @@ fn init() -> Result<Ctx, String> {
         q4t_mv,
         silu_down,
         q1t_mm,
+        q4t_mm,
+        ffn_silu,
         q1t_ovmm,
         rmsnorm,
         add_rmsnorm,
@@ -5405,6 +5513,257 @@ fn dispatch_matmat(
 
 /// q1t batched GEMM (prefill) on wgpu — register-blocked base GEMM then the
 /// sparse overlay, two passes in one encoder. Raw f32 x, scales in the tiles.
+/// Batched q4t GEMM (imagegen DiT prefill shapes) — the wgpu twin of
+/// the Metal q4t_matmat: one q4t_mul_mm dispatch reading the 18-byte
+/// tiles from the cached weight buffer. The CPU/GPU probe arbitrates
+/// per process exactly as on Metal.
+pub fn q4t_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let gpr = cols / 32;
+    if cols % 32 != 0 || rows == 0 || b == 0 {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    if entry.shape.first().copied().unwrap_or(0) < rows {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let bytes = model.primary_bytes();
+    let plen = entry.nbytes as usize;
+    if plen < rows * gpr * 18
+        || abs + plen > bytes.len()
+        || xs.len() < b * cols
+        || out.len() < b * rows
+    {
+        return false;
+    }
+    let q_buf = match weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen]) {
+        Some(bf) => bf,
+        None => return false,
+    };
+    let mut sc = c.scratch.lock().unwrap();
+    let xs_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.xs,
+        (b * cols * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "q4tmm-xs",
+    );
+    c.queue
+        .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..b * cols]));
+    let y_size = (b * rows * 4) as u64;
+    let y_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.y,
+        y_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "q4tmm-y",
+    );
+    let params = [(cols / 4) as u32, rows as u32, b as u32, 0u32];
+    let p_buf = match &sc.params {
+        Some(bf) => bf.clone(),
+        None => {
+            let bf = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("q4tmm-params"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            sc.params = Some(bf.clone());
+            bf
+        }
+    };
+    c.queue
+        .write_buffer(&p_buf, 0, bytemuck::cast_slice(&params));
+    let stage_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        y_size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "q4tmm-stage",
+    );
+    let entries = [
+        bind_buf(0, &q_buf),
+        bind_buf(1, &xs_buf),
+        bind_buf(2, &y_buf),
+        bind_buf(3, &p_buf),
+    ];
+    let bind_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q4tmm-bg"),
+        layout: &c.q4t_mm.get_bind_group_layout(0),
+        entries: &entries,
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("q4tmm"),
+        });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("q4tmm"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.q4t_mm);
+        pass.set_bind_group(0, &bind_mm, &[]);
+        pass.dispatch_workgroups(
+            (rows as u32).div_ceil(64).min(MAX_WG),
+            (b as u32).div_ceil(64),
+            1,
+        );
+    }
+    readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * rows])
+}
+
+/// Fused DiT SwiGLU FFN on wgpu: g=X·W1ᵀ, u=X·W3ᵀ, silu(g)·u,
+/// y=·W2ᵀ — four passes, ONE submission, one readback. The unfused
+/// per-op route pays 3 submits and ships the [b, inter] intermediates
+/// across PCIe twice; on discrete cards that overhead dominates the
+/// GEMM itself. Weights stay cached in VRAM.
+#[allow(clippy::too_many_arguments)]
+pub fn q4t_ffn(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w3: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if hidden % 32 != 0 || inter % 32 != 0 || b == 0 {
+        return false;
+    }
+    let bytes = model.primary_bytes();
+    let wbuf = |idx: usize, rows: usize, cols: usize| -> Option<wgpu::Buffer> {
+        let entry = &model.tensors[idx];
+        let abs = model.entry_abs_offset(entry)?;
+        let plen = entry.nbytes as usize;
+        if plen < rows * (cols / 32) * 18 || abs + plen > bytes.len() {
+            return None;
+        }
+        weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen])
+    };
+    let (Some(q1), Some(q3), Some(q2)) = (
+        wbuf(w1, inter, hidden),
+        wbuf(w3, inter, hidden),
+        wbuf(w2, hidden, inter),
+    ) else {
+        return false;
+    };
+    if xs.len() < b * hidden || out.len() < b * hidden {
+        return false;
+    }
+    let mut sc = c.scratch.lock().unwrap();
+    let xs_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.xs,
+        (b * hidden * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "q4tffn-xs",
+    );
+    c.queue
+        .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..b * hidden]));
+    let panel = (b * inter * 4) as u64;
+    let g_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.g,
+        panel,
+        wgpu::BufferUsages::STORAGE,
+        "q4tffn-g",
+    );
+    let u_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.u,
+        panel,
+        wgpu::BufferUsages::STORAGE,
+        "q4tffn-u",
+    );
+    let y_size = (b * hidden * 4) as u64;
+    let y_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.y,
+        y_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "q4tffn-y",
+    );
+    let stage_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        y_size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "q4tffn-stage",
+    );
+    // Content-keyed uniforms: three shapes live in one submission, so
+    // one rewritable buffer cannot serve them.
+    let p13 = uniform_u32x4(c, [(hidden / 4) as u32, inter as u32, b as u32, 0]);
+    let p2 = uniform_u32x4(c, [(inter / 4) as u32, hidden as u32, b as u32, 0]);
+    let psilu = uniform_u32x4(c, [(b * inter) as u32, 0, 0, 0]);
+    let mm_layout = c.q4t_mm.get_bind_group_layout(0);
+    let bind_mm = |q: &wgpu::Buffer, x: &wgpu::Buffer, y: &wgpu::Buffer, p: &wgpu::Buffer| {
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("q4tffn-bg"),
+            layout: &mm_layout,
+            entries: &[
+                bind_buf(0, q),
+                bind_buf(1, x),
+                bind_buf(2, y),
+                bind_buf(3, p),
+            ],
+        })
+    };
+    let bg1 = bind_mm(&q1, &xs_buf, &g_buf, &p13);
+    let bg3 = bind_mm(&q3, &xs_buf, &u_buf, &p13);
+    let bg2 = bind_mm(&q2, &g_buf, &y_buf, &p2);
+    let bg_silu = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q4tffn-silu-bg"),
+        layout: &c.ffn_silu.get_bind_group_layout(0),
+        entries: &[bind_buf(0, &g_buf), bind_buf(1, &u_buf), bind_buf(2, &psilu)],
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("q4tffn"),
+        });
+    let mm_pass = |enc: &mut wgpu::CommandEncoder, bg: &wgpu::BindGroup, rows: usize| {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("q4tffn-mm"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.q4t_mm);
+        pass.set_bind_group(0, bg, &[]);
+        pass.dispatch_workgroups(
+            (rows as u32).div_ceil(64).min(MAX_WG),
+            (b as u32).div_ceil(64),
+            1,
+        );
+    };
+    mm_pass(&mut enc, &bg1, inter);
+    mm_pass(&mut enc, &bg3, inter);
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("q4tffn-silu"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.ffn_silu);
+        pass.set_bind_group(0, &bg_silu, &[]);
+        pass.dispatch_workgroups(((b * inter) as u32).div_ceil(256).min(MAX_WG), 1, 1);
+    }
+    mm_pass(&mut enc, &bg2, hidden);
+    readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * hidden])
+}
+
 pub fn q1t_matmat(
     model: &Arc<CmfModel>,
     idx: usize,
