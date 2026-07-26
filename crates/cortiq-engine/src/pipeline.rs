@@ -2567,6 +2567,28 @@ impl Pipeline {
                     *v *= sc;
                 }
             }
+            // CMF_DEBUG_LAYERS=1: per-layer hidden-state health of the
+            // LAST prompt position — the knife for "which layer type
+            // breaks first" on a new architecture.
+            if std::env::var("CMF_DEBUG_LAYERS").is_ok() {
+                let row = &h[(b - 1) * hs..b * hs];
+                let rms =
+                    (row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / hs as f64).sqrt();
+                let mx = row.iter().fold(0f32, |m, &v| m.max(v.abs()));
+                eprintln!(
+                    "layer {li:>3} {:>10} ffn={:<5} rms={rms:>12.4} max={mx:>12.4}",
+                    match &self.weights.layers[self.phys_layer(li)].attn {
+                        AttnKind::LinearGdn(_) => "gdn",
+                        AttnKind::Linear(_) => "vmf",
+                        AttnKind::ShortConv(_) => "conv",
+                        _ => "attn",
+                    },
+                    match &lw.ffn {
+                        FfnKind::Moe(_) => "moe",
+                        FfnKind::Dense(_) => "dense",
+                    },
+                );
+            }
             // Looped Transformer: apply final norm at the end of each loop iteration.
             if self.is_loop_end(li) && li + 1 < self.num_layers {
                 for bi in 0..b {
