@@ -10,7 +10,7 @@
 use crate::convert::{self, Quant};
 use cortiq_core::format::{CMF_VERSION, CmfHeader, CmfModel, TensorSpec, TokenizerBundle};
 use cortiq_core::quant::f16_to_f32;
-use cortiq_core::types::{LayerType, ModelArch, NormStyle, QuantType, TensorDtype};
+use cortiq_core::types::{LayerType, ModelArch, MoeConfig, NormStyle, QuantType, TensorDtype};
 use std::collections::BTreeMap;
 use std::fs;
 
@@ -170,7 +170,9 @@ struct GgufTensor {
 struct Gguf {
     md: BTreeMap<String, Val>,
     tensors: Vec<GgufTensor>,
-    bytes: Vec<u8>,
+    /// The whole file, memory-mapped — a 20 GB+ MoE GGUF must not be
+    /// slurped into RAM on a 24 GB machine.
+    bytes: memmap2::Mmap,
     data_start: usize,
 }
 
@@ -179,7 +181,9 @@ fn align_up(x: usize, a: usize) -> usize {
 }
 
 fn parse(path: &std::path::Path) -> anyhow::Result<Gguf> {
-    let bytes = fs::read(path)?;
+    let file = fs::File::open(path)?;
+    // SAFETY: read-only map of a file we just opened.
+    let bytes = unsafe { memmap2::Mmap::map(&file)? };
     let mut c = Cursor { b: &bytes, p: 0 };
     if c.take(4)? != b"GGUF" {
         anyhow::bail!("not a GGUF file");
@@ -709,12 +713,31 @@ fn map_name(g: &str) -> Option<String> {
         "ffn_gate.weight" => "mlp.gate_proj.weight",
         "ffn_up.weight" => "mlp.up_proj.weight",
         "ffn_down.weight" => "mlp.down_proj.weight",
+        // ── qwen35moe (KAT-Coder / Qwen3.6-MoE class): GDN hybrid ──
+        // llama.cpp pre-splits the fused HF projections; names map 1:1
+        // onto the engine's linear_attn.* / mlp.* layout. The routed
+        // expert tensors (ffn_*_exps) are 3-D and handled separately.
+        "post_attention_norm.weight" => "post_attention_layernorm.weight",
+        "attn_qkv.weight" => "linear_attn.in_proj_qkv.weight",
+        "attn_gate.weight" => "linear_attn.in_proj_z.weight",
+        "ssm_alpha.weight" => "linear_attn.in_proj_a.weight",
+        "ssm_beta.weight" => "linear_attn.in_proj_b.weight",
+        "ssm_a" => "linear_attn.A_log",
+        "ssm_dt.bias" => "linear_attn.dt_bias",
+        "ssm_conv1d.weight" => "linear_attn.conv1d.weight",
+        "ssm_norm.weight" => "linear_attn.norm.weight",
+        "ssm_out.weight" => "linear_attn.out_proj.weight",
+        "ffn_gate_inp.weight" => "mlp.gate.weight",
+        "ffn_gate_inp_shexp.weight" => "mlp.shared_expert_gate.weight",
+        "ffn_gate_shexp.weight" => "mlp.shared_expert.gate_proj.weight",
+        "ffn_up_shexp.weight" => "mlp.shared_expert.up_proj.weight",
+        "ffn_down_shexp.weight" => "mlp.shared_expert.down_proj.weight",
         _ => return None,
     };
     Some(format!("model.layers.{idx}.{mapped}"))
 }
 
-fn arch_from_md(md: &BTreeMap<String, Val>) -> anyhow::Result<ModelArch> {
+fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::Result<ModelArch> {
     let arch = md
         .get("general.architecture")
         .and_then(|v| v.as_str())
@@ -737,21 +760,69 @@ fn arch_from_md(md: &BTreeMap<String, Val>) -> anyhow::Result<ModelArch> {
             }
         })
         .unwrap_or(0);
-    let norm_style = if arch.contains("gemma") {
+    let is_q35 = arch.starts_with("qwen35");
+    let norm_style = if arch.contains("gemma") || is_q35 {
+        // qwen3.5 / qwen3.6 use zero-centered x̂·(1+w) norms.
         NormStyle::Gemma
     } else {
         NormStyle::Qwen
     };
+    // qwen35moe (GDN hybrid + MoE): the attention/linear schedule comes
+    // from tensor PRESENCE (full-attention layers carry attn_q, GDN
+    // layers carry attn_qkv + ssm_*) — more robust than trusting the
+    // full_attention_interval semantics.
+    let layer_types = if is_q35 {
+        (0..n_layers)
+            .map(|i| {
+                if tensors
+                    .iter()
+                    .any(|t| t.name == format!("blk.{i}.attn_q.weight"))
+                {
+                    LayerType::FullAttention
+                } else {
+                    LayerType::LinearAttention
+                }
+            })
+            .collect()
+    } else {
+        vec![LayerType::FullAttention; n_layers]
+    };
+    let head_dim = gu("attention.key_length").unwrap_or(hidden / n_heads.max(1));
+    let moe = if is_q35 {
+        gu("expert_count").filter(|&n| n > 0).map(|ne| MoeConfig {
+            num_experts: ne,
+            top_k: gu("expert_used_count").unwrap_or(8),
+            moe_intermediate_size: gu("expert_feed_forward_length").unwrap_or(0),
+            // Qwen3.5/3.6 renormalize the top-k softmax weights.
+            norm_topk_prob: true,
+            shared_expert_intermediate_size: gu("expert_shared_feed_forward_length"),
+            router_sigmoid: false,
+            routed_scaling_factor: None,
+        })
+    } else {
+        None
+    };
+    // GDN geometry (qwen35moe): key heads = ssm.group_count at
+    // state_size dims each; value heads = inner_size / state_size.
+    let ssm_state = gu("ssm.state_size");
+    let ssm_vheads = match (gu("ssm.inner_size"), ssm_state) {
+        (Some(inner), Some(st)) if st > 0 => Some(inner / st),
+        _ => None,
+    };
     Ok(ModelArch {
-        arch_name: arch.clone(),
+        arch_name: if is_q35 {
+            "qwen3_5_moe".into()
+        } else {
+            arch.clone()
+        },
         hidden_size: hidden,
         intermediate_size: gu("feed_forward_length").unwrap_or(0),
         num_layers: n_layers,
         num_attention_heads: n_heads,
         num_kv_heads: gu("attention.head_count_kv").unwrap_or(n_heads),
-        head_dim: gu("attention.key_length").unwrap_or(hidden / n_heads.max(1)),
+        head_dim,
         vocab_size: vocab,
-        layer_types: vec![LayerType::FullAttention; n_layers],
+        layer_types,
         rms_norm_eps: g("attention.layer_norm_rms_epsilon")
             .and_then(|v| v.as_f64())
             .unwrap_or(1e-6),
@@ -760,18 +831,30 @@ fn arch_from_md(md: &BTreeMap<String, Val>) -> anyhow::Result<ModelArch> {
             .and_then(|v| v.as_f64())
             .unwrap_or(10_000.0),
         tie_word_embeddings: false,
-        partial_rotary_factor: 1.0,
+        partial_rotary_factor: match gu("rope.dimension_count") {
+            Some(rd) if head_dim > 0 && rd < head_dim => rd as f32 / head_dim as f32,
+            _ => 1.0,
+        },
         yarn: None,
         attention_heads_per_layer: None,
         mtp: None,
-        moe: None,
-        linear_core: None,
+        moe,
+        linear_core: if is_q35 {
+            Some(cortiq_core::types::LinearCoreConfig {
+                kind: "gated_delta_net".into(),
+                num_heads: ssm_vheads.unwrap_or(0),
+                nphase: None,
+                value_head_dim: ssm_state.unwrap_or(0),
+            })
+        } else {
+            None
+        },
         max_position_embeddings: gu("context_length").unwrap_or(32_768),
-        linear_conv_kernel_dim: None,
-        linear_num_key_heads: None,
-        linear_num_value_heads: None,
-        linear_key_head_dim: None,
-        linear_value_head_dim: None,
+        linear_conv_kernel_dim: gu("ssm.conv_kernel"),
+        linear_num_key_heads: gu("ssm.group_count"),
+        linear_num_value_heads: ssm_vheads,
+        linear_key_head_dim: ssm_state,
+        linear_value_head_dim: ssm_state,
         hidden_act: "silu".into(),
         embed_multiplier: 1.0,
         query_pre_attn_scalar: None,
@@ -936,22 +1019,27 @@ pub fn run_import_gguf(
     let path = resolve_gguf_source(gguf, hf_token)?;
     let g = parse(&path)?;
 
+    let arch = arch_from_md(&g.md, &g.tensors)?;
+    let is_llama = arch.arch_name == "llama";
+    let is_q35 = arch.arch_name == "qwen3_5_moe";
+
     // Honest guard: the native GGUF importer maps standard transformer tensors
-    // only. A linear-attention / GatedDeltaNet (SSM) hybrid — llama.cpp `qwen35`
-    // / `qwen3_next`, or Mamba — would silently lose every mixer tensor. Refuse
-    // it clearly instead of writing a broken model; the safetensors path works.
-    if let Some(t) = g.tensors.iter().find(|t| t.name.contains("ssm")) {
-        anyhow::bail!(
-            "GGUF '{}' is a linear-attention / SSM hybrid (e.g. tensor '{}') — the native \
-             GGUF importer handles standard transformer layouts only. Convert the model's \
-             safetensors repo with `cortiq convert` instead (GatedDeltaNet is supported there).",
-            path.display(),
-            t.name
-        );
+    // plus the qwen35moe GDN-hybrid layout. Any OTHER SSM family (Mamba,
+    // plain qwen3_next) would silently lose its mixer tensors — refuse it
+    // clearly instead of writing a broken model; the safetensors path works.
+    if !is_q35 {
+        if let Some(t) = g.tensors.iter().find(|t| t.name.contains("ssm")) {
+            anyhow::bail!(
+                "GGUF '{}' is a linear-attention / SSM hybrid (e.g. tensor '{}') — the native \
+                 GGUF importer handles standard transformer layouts and qwen35moe only. Convert \
+                 the model's safetensors repo with `cortiq convert` instead (GatedDeltaNet is \
+                 supported there).",
+                path.display(),
+                t.name
+            );
+        }
     }
 
-    let arch = arch_from_md(&g.md)?;
-    let is_llama = arch.arch_name == "llama";
     let n_heads = arch.num_attention_heads;
     let n_kv = arch.num_kv_heads;
 
@@ -959,6 +1047,46 @@ pub fn run_import_gguf(
     let mut tensors: Vec<TensorSpec> = Vec::with_capacity(total);
     for (idx, t) in g.tensors.iter().enumerate() {
         progress((idx + 1) as f32 / total as f32);
+        // qwen35moe routed experts: one 3-D [n_exp, out, in] tensor per
+        // projection — split into the per-expert 2-D matrices the engine
+        // loads (`mlp.experts.E.{gate,up,down}_proj`).
+        if is_q35 && t.dims.len() == 3 {
+            let proj = if t.name.ends_with("ffn_gate_exps.weight") {
+                Some("gate_proj")
+            } else if t.name.ends_with("ffn_up_exps.weight") {
+                Some("up_proj")
+            } else if t.name.ends_with("ffn_down_exps.weight") {
+                Some("down_proj")
+            } else {
+                None
+            };
+            if let (Some(proj), Some(layer)) = (
+                proj,
+                t.name
+                    .strip_prefix("blk.")
+                    .and_then(|r| r.split('.').next())
+                    .map(String::from),
+            ) {
+                let numel: usize = t.dims.iter().map(|&d| d as usize).product();
+                let nb = nbytes(t.ggml_type, numel)?;
+                let raw = &g.bytes
+                    [g.data_start + t.offset as usize..g.data_start + t.offset as usize + nb];
+                let vals = dequant(t.ggml_type, raw, numel)?;
+                let shape: Vec<usize> = t.dims.iter().rev().map(|&d| d as usize).collect();
+                let (nexp, out, inn) = (shape[0], shape[1], shape[2]);
+                for e in 0..nexp {
+                    let sl = &vals[e * out * inn..(e + 1) * out * inn];
+                    let (dt, data) = convert::quantize_2d(quant, sl, out, inn);
+                    tensors.push(TensorSpec {
+                        name: format!("model.layers.{layer}.mlp.experts.{e}.{proj}.weight"),
+                        dtype: dt,
+                        shape: vec![out, inn],
+                        data,
+                    });
+                }
+                continue;
+            }
+        }
         let Some(name) = map_name(&t.name) else {
             continue;
         };
@@ -978,9 +1106,91 @@ pub fn run_import_gguf(
             }
         }
 
-        let two_d = shape.len() == 2 && numel >= 32;
+        if is_q35 {
+            // Undo llama.cpp's tiled V-head order on every V-indexed
+            // tensor (see v_head_untile). Geometry from the arch: nk
+            // K groups, nv V heads of dv dims, dk key dims.
+            let nk = arch.linear_num_key_heads.unwrap_or(0);
+            let nv = arch.linear_num_value_heads.unwrap_or(0);
+            let dk = arch.linear_key_head_dim.unwrap_or(0);
+            let dv = arch.linear_value_head_dim.unwrap_or(0);
+            if nk > 0 && nv > nk {
+                let hid = *shape.last().unwrap_or(&0);
+                if name.ends_with("linear_attn.in_proj_qkv.weight") {
+                    let voff = 2 * nk * dk * hid;
+                    v_head_untile(&mut vals[voff..], nv, dv * hid, nk);
+                } else if name.ends_with("linear_attn.in_proj_z.weight") {
+                    v_head_untile(&mut vals, nv, dv * hid, nk);
+                } else if name.ends_with("linear_attn.in_proj_a.weight")
+                    || name.ends_with("linear_attn.in_proj_b.weight")
+                {
+                    v_head_untile(&mut vals, nv, hid, nk);
+                } else if name.ends_with("linear_attn.A_log")
+                    || name.ends_with("linear_attn.dt_bias")
+                {
+                    v_head_untile(&mut vals, nv, 1, nk);
+                } else if name.ends_with("linear_attn.conv1d.weight") {
+                    // channels [2·nk·dk | nv·dv], k taps each — untile
+                    // the V channel blocks.
+                    let k = *shape.last().unwrap_or(&1);
+                    let coff = 2 * nk * dk * k;
+                    v_head_untile(&mut vals[coff..], nv, dv * k, nk);
+                } else if name.ends_with("linear_attn.out_proj.weight") {
+                    // input columns are V-head-indexed.
+                    v_head_untile_cols(&mut vals, shape[0], nv, dv, nk);
+                }
+            }
+            // llama.cpp bakes the zero-centered (1+w) shift into the RMS
+            // norm weights of gemma-style models; the engine adds the 1
+            // itself. Detect by magnitude (shifted weights sit near 1,
+            // raw near 0) so either convention imports right.
+            if name.ends_with("layernorm.weight")
+                || name.ends_with("_norm.weight")
+                || name.ends_with("linear_attn.norm.weight")
+                || name == "model.norm.weight"
+            {
+                let mean = vals.iter().sum::<f32>() / vals.len().max(1) as f32;
+                if mean > 0.5 {
+                    for v in vals.iter_mut() {
+                        *v -= 1.0;
+                    }
+                }
+            }
+            // llama.cpp stores GDN decay as -exp(A_log) (the Mamba
+            // convention); the engine wants raw A_log. All-negative
+            // values mean the transform was applied.
+            if name.ends_with("linear_attn.A_log") && vals.iter().all(|&v| v < 0.0) {
+                for v in vals.iter_mut() {
+                    *v = (-*v).ln();
+                }
+            }
+        }
+
+        // Precision-critical small tensors ride as raw f32: the GDN a/b
+        // projections, the depthwise conv taps and the MoE routers (a
+        // bit-flip there is costly — same policy as the safetensors
+        // converter).
+        let keep_f32 = is_q35
+            && (name.ends_with("mlp.gate.weight")
+                || name.contains("linear_attn.in_proj_a")
+                || name.contains("linear_attn.in_proj_b")
+                || name.contains("conv1d")
+                || name.ends_with("shared_expert_gate.weight"));
+        // The shared-expert sigmoid gate is a 1-output Linear — the
+        // engine loads it as a matrix, so carry it as [1, hidden].
+        let shape = if name.ends_with("shared_expert_gate.weight") && shape.len() == 1 {
+            vec![1, shape[0]]
+        } else {
+            shape
+        };
+        let two_d = shape.len() == 2 && numel >= 32 && !keep_f32;
         let (dt, data) = if two_d {
             convert::quantize_2d(quant, &vals, shape[0], shape[1])
+        } else if keep_f32 {
+            (
+                TensorDtype::F32,
+                vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            )
         } else {
             (TensorDtype::F16, convert::encode_f16(&vals))
         };
@@ -1020,6 +1230,44 @@ pub fn run_import_gguf(
     Ok(())
 }
 
+/// llama.cpp stores qwen35moe V-head-indexed blocks in "tiled" order
+/// (v-within-group major: block v·nk + g); the HF layout the engine
+/// runs is grouped by K head (block g·r + v). Pure block permutation.
+fn v_head_untile(vals: &mut [f32], nblk: usize, blk: usize, nk: usize) {
+    if nk == 0 || nblk % nk != 0 || vals.len() != nblk * blk {
+        return;
+    }
+    let r = nblk / nk;
+    let src = vals.to_vec();
+    for g in 0..nk {
+        for v in 0..r {
+            let dst = (g * r + v) * blk;
+            let s = (v * nk + g) * blk;
+            vals[dst..dst + blk].copy_from_slice(&src[s..s + blk]);
+        }
+    }
+}
+
+/// The same untile applied to COLUMN blocks of every row (out_proj's
+/// input dimension is V-head-indexed).
+fn v_head_untile_cols(vals: &mut [f32], rows: usize, nblk: usize, blk: usize, nk: usize) {
+    if nk == 0 || nblk % nk != 0 || vals.len() != rows * nblk * blk {
+        return;
+    }
+    let r = nblk / nk;
+    let stride = nblk * blk;
+    let src = vals.to_vec();
+    for row in 0..rows {
+        for g in 0..nk {
+            for v in 0..r {
+                let dst = row * stride + (g * r + v) * blk;
+                let s = row * stride + (v * nk + g) * blk;
+                vals[dst..dst + blk].copy_from_slice(&src[s..s + blk]);
+            }
+        }
+    }
+}
+
 /// Undo llama.cpp's q/k rope permutation: rows are interleaved (d/2, 2) → (2, d/2).
 fn unpermute(vals: &[f32], out_dim: usize, in_dim: usize, n_heads: usize) -> Vec<f32> {
     if n_heads == 0 || out_dim % n_heads != 0 {
@@ -1046,6 +1294,39 @@ fn unpermute(vals: &[f32], out_dim: usize, in_dim: usize, n_heads: usize) -> Vec
 #[cfg(test)]
 mod dequant_tests {
     use super::*;
+
+    /// tiled block v·nk+g → grouped g·r+v, and the column variant.
+    #[test]
+    fn v_head_untile_roundtrip() {
+        let (nk, r, blk) = (3usize, 2usize, 4usize);
+        let nv = nk * r;
+        // grouped ground truth: block id = g·r+v encoded in the values
+        let grouped: Vec<f32> = (0..nv * blk).map(|i| (i / blk) as f32).collect();
+        // build the tiled layout llama.cpp stores
+        let mut tiled = vec![0f32; nv * blk];
+        for g in 0..nk {
+            for v in 0..r {
+                let t = (v * nk + g) * blk;
+                let s = (g * r + v) * blk;
+                tiled[t..t + blk].copy_from_slice(&grouped[s..s + blk]);
+            }
+        }
+        let mut got = tiled.clone();
+        v_head_untile(&mut got, nv, blk, nk);
+        assert_eq!(got, grouped);
+
+        // column variant: 2 rows of the same block structure
+        let rows = 2usize;
+        let mut tiled2 = Vec::new();
+        for _ in 0..rows {
+            tiled2.extend_from_slice(&tiled);
+        }
+        let mut got2 = tiled2.clone();
+        v_head_untile_cols(&mut got2, rows, nv, blk, nk);
+        for row in 0..rows {
+            assert_eq!(&got2[row * nv * blk..(row + 1) * nv * blk], &grouped[..]);
+        }
+    }
     fn unhex(h: &str) -> Vec<u8> {
         (0..h.len())
             .step_by(2)
