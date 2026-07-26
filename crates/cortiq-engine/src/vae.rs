@@ -121,13 +121,27 @@ impl Conv2d {
         }
     }
 
-    /// `x`: [ic, h, w] → [oc, h, w]. Banded im2col + GEMM: bands of
+    /// `x`: [ic, h, w] → [oc, h, w]. GPU first (implicit-GEMM Metal
+    /// kernel — no im2col matrix at all), gated to shapes where the
+    /// transfer is amortized; otherwise banded im2col + GEMM: bands of
     /// output rows are lowered to a [rows·w, ic·k²] patch matrix and hit
     /// `fcd_ops::gemm_nt` (Accelerate/AMX on macOS, the portable blocked
     /// kernel elsewhere) — the band cap keeps the patch matrix ≤ ~128 MB
     /// at any image size.
     pub fn apply(&self, x: &[f32], h: usize, w: usize) -> Vec<f32> {
         debug_assert_eq!(x.len(), self.ic * h * w);
+        // The im2col matrix the CPU path materializes is h·w·ic·k²·4
+        // bytes — at 512×512 that is ≥2 GB per conv and IS the VAE
+        // wall. Threshold: only ship to the GPU when the implicit
+        // GEMM has real work (small early convs stay on the CPU).
+        if h * w * self.ic * self.oc >= 1 << 26 && crate::gpu::enabled_here() {
+            let mut out = vec![0f32; self.oc * h * w];
+            if crate::gpu::vae_conv2d(
+                &self.w, &self.b, x, self.ic, self.oc, h, w, self.k, &mut out,
+            ) {
+                return out;
+            }
+        }
         let pad = self.k / 2;
         let ick2 = self.ic * self.k * self.k;
         let mut out = vec![0f32; self.oc * h * w];

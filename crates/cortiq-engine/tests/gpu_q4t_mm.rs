@@ -261,6 +261,43 @@ fn gpu_q4t_ffn_matches_dequant_reference() {
 }
 
 #[test]
+fn gpu_vae_conv2d_matches_cpu() {
+    if !require_metal() {
+        return;
+    }
+    // Odd everything: K-tail (ic·k² % 32 ≠ 0), edge oc/position tiles,
+    // borders. k=3 and the 1×1 shortcut case.
+    for (ic, oc, h, w, k) in [(20usize, 70usize, 13usize, 17usize, 3usize), (24, 40, 9, 11, 1)] {
+        let mk = |seed: usize, len: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i * 37 + seed * 11 + 3) % 101) as f32 / 101.0 - 0.5)
+                .collect()
+        };
+        let conv = cortiq_engine::vae::Conv2d {
+            w: mk(1, oc * ic * k * k),
+            b: mk(2, oc),
+            oc,
+            ic,
+            k,
+        };
+        let x = mk(3, ic * h * w);
+        let want = conv.apply(&x, h, w); // small shape → CPU path
+        let mut got = vec![0f32; oc * h * w];
+        assert!(
+            cortiq_engine::gpu::vae_conv2d(&conv.w, &conv.b, &x, ic, oc, h, w, k, &mut got),
+            "gpu vae_conv2d refused (k={k})"
+        );
+        let mut max_rel = 0f64;
+        for (g, wv) in got.iter().zip(&want) {
+            let d = (*g as f64 - *wv as f64).abs();
+            max_rel = max_rel.max(d / (*wv as f64).abs().max(1.0));
+        }
+        println!("gpu vae conv k={k} max rel dev {max_rel:.2e}");
+        assert!(max_rel < 2e-2, "gpu vae conv k={k} diverged: {max_rel}");
+    }
+}
+
+#[test]
 fn gpu_dit_attention_matches_reference() {
     if !require_metal() {
         return;

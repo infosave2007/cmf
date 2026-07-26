@@ -1165,6 +1165,166 @@ kernel void dit_flash_attend(
     }
 }
 
+// VAE conv2d as implicit GEMM: the q8_mul_mm tile machinery, but the
+// X staging gathers the 3×3 (or 1×1) receptive field straight from
+// the NCHW image — the CPU path materializes a ≥2 GB im2col patch
+// matrix per high-res conv, which is the VAE's real wall. W is dense
+// f32 [oc, ic·k²]; K-tails zero-fill (ic·k² need not divide 32).
+// Output is a [hw, oc] panel; panel_to_nchw adds bias and transposes.
+kernel void conv_mul_mm(
+    device const float* wt    [[buffer(0)]],   // [oc, ic·k²]
+    device const float* img   [[buffer(1)]],   // [ic, h, w]
+    device float*       y     [[buffer(2)]],   // [hw, oc] panel
+    constant uint&      ick2  [[buffer(3)]],
+    constant uint&      oc    [[buffer(4)]],
+    constant uint&      hw    [[buffer(5)]],
+    constant uint&      ih    [[buffer(6)]],
+    constant uint&      iw    [[buffer(7)]],
+    constant uint&      kk    [[buffer(8)]],   // kernel size k
+    uint tiitg [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint2 tg  [[threadgroup_position_in_grid]])
+{
+    threadgroup char shmem[8192];
+    threadgroup half* sa = (threadgroup half*)shmem;
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+    const uint NK = 32u;
+    uint rows = oc;
+    uint nb = hw;
+    uint r0 = tg.y * 64u;   // oc tile
+    uint r1 = tg.x * 32u;   // output-position tile
+    uint nr0 = min(rows - r0, 64u);
+    uint nr1 = min(nb - r1, 32u);
+    uint lr0 = min(tiitg / 2u, nr0 - 1u);
+    uint il0 = tiitg % 2u;
+    uint lr1 = min(tiitg / 4u, nr1 - 1u);
+    uint iy  = 8u * (tiitg % 4u);
+    uint pad = kk / 2u;
+    uint k2 = kk * kk;
+    // This thread's output position (clamped like the row clamps).
+    uint pos = r1 + lr1;
+    uint py = pos / iw;
+    uint px = pos % iw;
+
+    device const float* wrow = wt + (ulong)(r0 + lr0) * ick2 + 16u * il0;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8u; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (uint k0 = 0; k0 < ick2; k0 += NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // W: 16 dense f32 → half, K-tail zero-filled.
+        {
+            uint sy = (tiitg / 2u) / 8u;
+            uint lx = (tiitg / 2u) % 8u;
+            uint kb = k0 + 16u * il0;
+            float wv[16];
+            for (uint i = 0; i < 16u; ++i) {
+                wv[i] = kb + i < ick2 ? wrow[i] : 0.0f;
+            }
+            uint ib0 = 8u * (2u * il0) + sy;
+            uint ib1 = 8u * (2u * il0 + 1u) + sy;
+            for (uint i = 0; i < 8u; ++i) {
+                sa[64u * ib0 + 8u * i + lx] = (half)wv[i];
+                sa[64u * ib1 + 8u * i + lx] = (half)wv[i + 8u];
+            }
+        }
+        // X: gather 8 receptive-field taps for this position.
+        {
+            uint sx = tiitg % 4u;
+            uint sy = (tiitg / 4u) / 8u;
+            uint ly = (tiitg / 4u) % 8u;
+            uint ib = 4u * sx + sy;
+            threadgroup half* dst = sb + 64u * ib + 8u * ly;
+            for (uint i = 0; i < 8u; ++i) {
+                uint kki = k0 + iy + i;
+                float v = 0.0f;
+                if (kki < ick2) {
+                    uint c = kki / k2;
+                    uint r = kki % k2;
+                    int sy2 = (int)py + (int)(r / kk) - (int)pad;
+                    int sx2 = (int)px + (int)(r % kk) - (int)pad;
+                    if (sy2 >= 0 && sy2 < (int)ih && sx2 >= 0 && sx2 < (int)iw) {
+                        v = img[(ulong)c * ih * iw + (ulong)sy2 * iw + (ulong)sx2];
+                    }
+                }
+                dst[i] = (half)v;
+            }
+        }
+        wrow += NK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < 4; ++ik) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; ++i) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    if (r0 + 64u <= rows && r1 + 32u <= nb) {
+        device float* C = y + (r0 + 32u * (sgitg & 1u))
+            + (ulong)(r1 + 16u * (sgitg >> 1u)) * rows;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * (ulong)rows * (i / 4),
+                            rows, ulong2(0, 0), false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* temp_str = ((threadgroup float*)shmem)
+            + 32u * (sgitg & 1u) + (16u * (sgitg >> 1u)) * 64u;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * 64 * (i / 4),
+                            64, ulong2(0, 0), false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (uint j = tiitg; j < nr1; j += 128u) {
+                device float* D = y + r0 + (ulong)(r1 + j) * rows;
+                threadgroup const float* Cr = ((threadgroup float*)shmem) + j * 64u;
+                for (uint i = 0; i < nr0; ++i) {
+                    D[i] = Cr[i];
+                }
+            }
+        }
+    }
+}
+
+// [hw, oc] panel → NCHW [oc, hw] + bias.
+kernel void panel_to_nchw(
+    device const float* y    [[buffer(0)]],
+    device float*       out  [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    constant uint& hw [[buffer(3)]],
+    constant uint& oc [[buffer(4)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= hw * oc) return;
+    uint o = i / hw;
+    uint p = i % hw;
+    out[i] = y[(ulong)p * oc + o] + bias[o];
+}
+
 // ── whole-DiT-block kernels: the norm/modulation/residual glue that
 // kept every stage bouncing back to the CPU between GEMMs. All
 // f32-reduction tolerance-class vs the CPU's f64 accumulation. ──
@@ -2756,6 +2916,8 @@ struct Ctx {
     q4tmm: ComputePipelineState,
     smaxrows: ComputePipelineState,
     flashatt: ComputePipelineState,
+    convmm: ComputePipelineState,
+    p2nchw: ComputePipelineState,
     rmsmod: ComputePipelineState,
     rmsres: ComputePipelineState,
     ropepack: ComputePipelineState,
@@ -2901,6 +3063,8 @@ fn init() -> Result<Ctx, String> {
     let q4tmm = pso("q4t_mul_mm")?;
     let smaxrows = pso("softmax_rows")?;
     let flashatt = pso("dit_flash_attend")?;
+    let convmm = pso("conv_mul_mm")?;
+    let p2nchw = pso("panel_to_nchw")?;
     let rmsmod = pso("rms_mod_rows")?;
     let rmsres = pso("rms_residual_rows")?;
     let ropepack = pso("dit_rope_pack")?;
@@ -2953,6 +3117,8 @@ fn init() -> Result<Ctx, String> {
         q4tmm,
         smaxrows,
         flashatt,
+        convmm,
+        p2nchw,
         rmsmod,
         rmsres,
         ropepack,
@@ -4901,6 +5067,122 @@ pub fn q4t_ffn(
         std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * hidden);
     }
     tracing::debug!("gpu q4t ffn: {hidden}x{inter} b={b}");
+    true
+}
+
+/// VAE conv2d on the device (implicit GEMM — no im2col matrix). The
+/// weight buffer is cached by (pointer, len) so each conv uploads its
+/// weights once per process; the image and result cross per call.
+#[allow(clippy::too_many_arguments)]
+pub fn vae_conv2d(
+    w: &[f32],
+    bias: &[f32],
+    x: &[f32],
+    ic: usize,
+    oc: usize,
+    h: usize,
+    w_img: usize,
+    k: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let ick2 = ic * k * k;
+    let hw = h * w_img;
+    if w.len() != oc * ick2 || x.len() != ic * hw || out.len() != oc * hw {
+        return false;
+    }
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    // Weights/bias keyed by heap address — stable for the decoder's
+    // lifetime, so each conv layer uploads them once per process.
+    let cached_upload = |base: usize, data: &[f32]| -> Buffer {
+        let key = base
+            .wrapping_add(data.as_ptr() as usize)
+            .wrapping_add(data.len());
+        let mut cache = c.io_bufs.lock().unwrap();
+        let mut fresh = false;
+        let buf = cache
+            .entry(key)
+            .or_insert_with(|| {
+                fresh = true;
+                c._device
+                    .new_buffer((data.len() * 4) as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone();
+        if fresh {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    buf.contents() as *mut f32,
+                    data.len(),
+                );
+            }
+        }
+        buf
+    };
+    let w_buf = cached_upload(30_000_000_101, w);
+    let b_buf = cached_upload(31_000_000_103, bias);
+    let x_buf = get_io(32_000_000_119 + x.len(), x.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(x.as_ptr(), x_buf.contents() as *mut f32, x.len());
+    }
+    let panel = get_io(33_000_000_127 + hw * oc, hw * oc * 4);
+    let o_buf = get_io(34_000_000_131 + hw * oc, hw * oc * 4);
+
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.convmm);
+        enc.set_buffer(0, Some(&w_buf), 0);
+        enc.set_buffer(1, Some(&x_buf), 0);
+        enc.set_buffer(2, Some(&panel), 0);
+        let words = [
+            ick2 as u32,
+            oc as u32,
+            hw as u32,
+            h as u32,
+            w_img as u32,
+            k as u32,
+        ];
+        for (i, wv) in words.iter().enumerate() {
+            enc.set_bytes(3 + i as u64, 4, wv as *const u32 as *const std::ffi::c_void);
+        }
+        enc.dispatch_thread_groups(
+            MTLSize::new((hw as u64).div_ceil(32), (oc as u64).div_ceil(64), 1),
+            MTLSize::new(128, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.p2nchw);
+        enc.set_buffer(0, Some(&panel), 0);
+        enc.set_buffer(1, Some(&o_buf), 0);
+        enc.set_buffer(2, Some(&b_buf), 0);
+        let words = [hw as u32, oc as u32];
+        for (i, wv) in words.iter().enumerate() {
+            enc.set_bytes(3 + i as u64, 4, wv as *const u32 as *const std::ffi::c_void);
+        }
+        enc.dispatch_threads(
+            MTLSize::new((hw * oc) as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&o_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(o_buf.contents() as *const f32, out.as_mut_ptr(), oc * hw);
+    }
+    tracing::debug!("gpu vae conv: {ic}x{oc} k={k} {h}x{w_img}");
     true
 }
 

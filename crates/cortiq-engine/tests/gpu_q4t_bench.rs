@@ -102,6 +102,41 @@ fn bench_q4t_matmat_ffn_shape() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// VAE decode at 512px from the packed Lumina file (set CMF_VAE_PROF=1
+/// for the per-stage split). Needs the user's model file; skips
+/// without it.
+#[test]
+fn bench_vae_decode() {
+    if std::env::var("CMF_BENCH").is_err() {
+        eprintln!("bench skipped: set CMF_BENCH=1");
+        return;
+    }
+    let path = std::env::var("CMF_LUMINA")
+        .unwrap_or_else(|_| "/Users/oleg/Documents/cortiq-bot/lumina-q4t.cmf".into());
+    let Ok(model) = CmfModel::open(&path) else {
+        eprintln!("bench skipped: no model at {path}");
+        return;
+    };
+    let vae = cortiq_engine::vae::VaeDecoder::from_cmf(&model).unwrap();
+    // 64 → 512px out; CMF_VAE_BENCH_HW=128 → 1024px.
+    let hw_lat: usize = std::env::var("CMF_VAE_BENCH_HW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let (h, w) = (hw_lat, hw_lat);
+    let z: Vec<f32> = (0..vae.latent_channels * h * w)
+        .map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5)
+        .collect();
+    let t0 = std::time::Instant::now();
+    let img = vae.decode(&z, h, w);
+    println!(
+        "vae decode {}px: {:.2}s ({} px out)",
+        h * 8,
+        t0.elapsed().as_secs_f64(),
+        img.len() / 3
+    );
+}
+
 #[test]
 fn bench_dit_attention_shapes() {
     if std::env::var("CMF_BENCH").is_err() {

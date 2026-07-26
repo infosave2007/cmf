@@ -924,6 +924,27 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &DitBlockArgs, x: &mut [f32]) -> bool
     }
 }
 
+/// VAE conv2d on the device (implicit GEMM — the CPU path pays for a
+/// multi-GB im2col matrix at high resolutions).
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn vae_conv2d(
+    w: &[f32],
+    bias: &[f32],
+    x: &[f32],
+    ic: usize,
+    oc: usize,
+    h: usize,
+    w_img: usize,
+    k: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::vae_conv2d(w, bias, x, ic, oc, h, w_img, k, out),
+        _ => false,
+    }
+}
+
 /// DiT full bidirectional attention on the device (all heads:
 /// scores GEMM → row softmax → P·V → panel unstack, one command
 /// buffer). Head-major inputs; out is [n, nh·hd].
