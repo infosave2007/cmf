@@ -985,27 +985,34 @@ kernel void softmax_rows(
     for (uint i = tid; i < n; i += TPT) row[i] *= inv;
 }
 
-// DiT flash attention: bidirectional, online softmax, no n×n scores
-// in device memory (the 3-encoder chain moved ~3.3 GB of scores per
-// block at 1024px and ran at ~1 TFLOP/s because K-dim is only 96).
-// One threadgroup per (32-query tile, head); 4 simdgroups, each owns
-// 8 query rows. S = Q·Kᵀ on simdgroup half MACs; the per-row rescale
-// of the f32 O accumulators uses a diagonal float8x8 multiply
-// (simdgroup matrices have no per-row scalar op), skipped whenever a
-// KV tile raises no row max. GQA: the K/V head is h / hpk. Output is
-// written straight in the [n][nh·hd] layout the O projection reads —
-// no panel, no unstack. Host gates: hd ≤ 128, hd % 8 == 0.
+// DiT flash attention V2: bidirectional, online softmax, no n×n
+// scores in device memory. V1 staged Q/K/V through a 31 KB
+// threadgroup arena — occupancy collapsed to one group per core and
+// every per-tile threadgroup barrier drained the pipeline. V2 loads
+// the 8×8 operand blocks with simdgroup_load STRAIGHT from device
+// memory (K transposed by the load), so the only threadgroup state
+// is a per-simdgroup S/P tile + stats (~5.5 KB total) and the KV
+// loop has NO threadgroup barriers at all — each simdgroup runs its
+// 8 query rows independently; L1/SLC serve the K/V block reuse.
+// f32 MACs throughout (same rate as half on Apple GPUs). The
+// per-row rescale of the O accumulators multiplies by a diagonal
+// float8x8 (simdgroup matrices have no per-row scalar op), skipped
+// whenever a KV tile raises no row max. GQA: the K/V head is
+// h / hpk. Buffers are padded to n32 = ceil(n/32)·32 rows per head
+// with ZEROED tails (host contract) — tail keys mask to p = 0 in
+// the scalar phase. Output goes straight into the [n][nh·hd] layout
+// the O projection reads. Host gates: hd ≤ 128, hd % 8 == 0.
 kernel void dit_flash_attend(
-    device const float* qh  [[buffer(0)]],   // [nh][n][hd] head-major
-    device const float* kh  [[buffer(1)]],   // [nkv][n][hd]
-    device const float* vh  [[buffer(2)]],   // [nkv][n][hd]
+    device const float* qh  [[buffer(0)]],   // [nh][n32][hd] head-major
+    device const float* kh  [[buffer(1)]],   // [nkv][n32][hd]
+    device const float* vh  [[buffer(2)]],   // [nkv][n32][hd]
     device float*       out [[buffer(3)]],   // [n][nh·hd]
     constant uint&  n     [[buffer(4)]],
     constant uint&  hd    [[buffer(5)]],
     constant uint&  nh    [[buffer(6)]],
     constant uint&  hpk   [[buffer(7)]],
     constant float& scale [[buffer(8)]],
-    uint tiitg [[thread_index_in_threadgroup]],
+    constant uint&  n32   [[buffer(9)]],
     uint sgitg [[simdgroup_index_in_threadgroup]],
     uint lane  [[thread_index_in_simdgroup]],
     uint2 tg   [[threadgroup_position_in_grid]])
@@ -1015,83 +1022,62 @@ kernel void dit_flash_attend(
     uint qbase = tg.x * QT;
     uint h = tg.y;
     uint kv = h / hpk;
-    device const float* qsrc = qh + (ulong)h * n * hd;
-    device const float* ksrc = kh + (ulong)kv * n * hd;
-    device const float* vsrc = vh + (ulong)kv * n * hd;
+    device const float* qsrc = qh + (ulong)h * n32 * hd;
+    device const float* ksrc = kh + (ulong)kv * n32 * hd;
+    device const float* vsrc = vh + (ulong)kv * n32 * hd;
 
-    // Arena (hd ≤ 128): everything static-size, offsets in bytes.
-    threadgroup char arena[32000];
-    threadgroup half* sq = (threadgroup half*)arena;             //  8 KB Q  [32][hd]
-    threadgroup half* sk = (threadgroup half*)(arena + 8192);    //  8 KB Kᵀ [hd][32]
-    threadgroup half* sv = (threadgroup half*)(arena + 16384);   //  8 KB V  [32][hd]
-    threadgroup half* sp = (threadgroup half*)(arena + 24576);   //  2 KB P  per-sg [8][32]
-    threadgroup float* ss = (threadgroup float*)(arena + 26624); //  4 KB S  per-sg [8][32]
-    threadgroup float* sm = (threadgroup float*)(arena + 30720); // m [32]
-    threadgroup float* sl = (threadgroup float*)(arena + 30848); // l [32]
-    threadgroup float* sd = (threadgroup float*)(arena + 30976); // diag per-sg [8][8]
+    // Per-simdgroup shmem only — nothing crosses simdgroups.
+    threadgroup float ssm[4 * 8 * 32];   // S then P, per sg
+    threadgroup float sdm[4 * 64];       // diagonal per sg
+    threadgroup float smm[4 * 8];        // running row max per sg
+    threadgroup float slm[4 * 8];        // running row sum per sg
+    threadgroup float* ss = ssm + sgitg * (8 * 32);
+    threadgroup float* sd = sdm + sgitg * 64;
+    threadgroup float* sm = smm + sgitg * 8;
+    threadgroup float* sl = slm + sgitg * 8;
 
-    // Q tile staged once, pre-scaled. Rows past n clamp (stores skip).
-    for (uint i = tiitg; i < QT * hd; i += 128u) {
-        uint r = i / hd, d = i % hd;
-        uint src = min(qbase + r, n - 1u);
-        sq[i] = (half)(qsrc[(ulong)src * hd + d] * scale);
+    device const float* qrow = qsrc + (ulong)(qbase + 8u * sgitg) * hd;
+    uint srow = lane / 4u;               // scalar phase: 4 lanes per row
+    uint schunk = lane % 4u;
+
+    if (lane < 8u) {
+        sm[lane] = -1e30f;
+        sl[lane] = 0.0f;
     }
-    if (tiitg < QT) {
-        sm[tiitg] = -1e30f;
-        sl[tiitg] = 0.0f;
-    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
 
-    simdgroup_half8x8 a8, b8;
+    simdgroup_float8x8 a8, b8;
     simdgroup_float8x8 o8[16];           // 8 rows × hd cols, hd/8 ≤ 16 blocks
     uint nob = hd / 8u;
     for (uint i = 0; i < nob; ++i) {
         o8[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
-    threadgroup half* sp_sg = sp + sgitg * (8u * KT);
-    threadgroup float* ss_sg = ss + sgitg * (8u * KT);
-    threadgroup float* sd_sg = sd + sgitg * 64u;
-    // Scalar phase mapping: lane → (row, 8-col chunk); 4 lanes per row.
-    uint srow = lane / 4u;               // 0..7 within this sg
-    uint schunk = lane % 4u;
-    uint arow = 8u * sgitg + srow;       // absolute row in the Q tile
 
     for (uint kb0 = 0; kb0 < n; kb0 += KT) {
-        // sk/sv are shared across simdgroups — fence the previous
-        // tile's P·V reads before restaging.
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = tiitg; i < KT * hd; i += 128u) {
-            uint key = i % KT;
-            uint d = i / KT;
-            uint srck = min(kb0 + key, n - 1u);
-            sk[d * KT + key] = (half)ksrc[(ulong)srck * hd + d];
-        }
-        for (uint i = tiitg; i < KT * hd; i += 128u) {
-            uint key = i / hd, d = i % hd;
-            uint srcv = min(kb0 + key, n - 1u);
-            sv[i] = (half)vsrc[(ulong)srcv * hd + d];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // S[8×32] = Q(8 rows)·Kᵀ for this sg, f32 accumulate.
+        // S[8×32] = Q·Kᵀ, operands straight from device (K blocks
+        // load transposed — measured FASTER than a pre-transposed K
+        // whose n32-strided block rows lose cache locality; padded
+        // tail rows are zero).
         for (uint cb = 0; cb < KT / 8u; ++cb) {
             simdgroup_float8x8 s8 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-            for (uint kb = 0; kb < hd / 8u; ++kb) {
-                simdgroup_load(a8, sq + (8u * sgitg) * hd + kb * 8u, hd, ulong2(0, 0), false);
-                simdgroup_load(b8, sk + (kb * 8u) * KT + cb * 8u, KT, ulong2(0, 0), false);
+            device const float* krow = ksrc + (ulong)(kb0 + cb * 8u) * hd;
+            for (uint kb = 0; kb < nob; ++kb) {
+                simdgroup_load(a8, qrow + kb * 8u, hd, ulong2(0, 0), false);
+                simdgroup_load(b8, krow + kb * 8u, hd, ulong2(0, 0), true);
                 simdgroup_multiply_accumulate(s8, a8, b8, s8);
             }
-            simdgroup_store(s8, ss_sg + cb * 8u, KT, ulong2(0, 0), false);
+            simdgroup_store(s8, ss + cb * 8u, KT, ulong2(0, 0), false);
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Online softmax, 4 lanes per row over 8 cols each.
-        float mprev = sm[arow];
-        float lprev = sl[arow];
+        // Online softmax (scale folded here), P overwrites S in ss.
+        float mprev = sm[srow];
+        float lprev = sl[srow];
         float lmax = -1e30f;
         for (uint j = 0; j < 8u; ++j) {
             uint col = schunk * 8u + j;
             if (kb0 + col < n) {
-                lmax = max(lmax, ss_sg[srow * KT + col]);
+                lmax = max(lmax, ss[srow * KT + col] * scale);
             }
         }
         lmax = max(lmax, simd_shuffle_xor(lmax, 1u));
@@ -1101,24 +1087,25 @@ kernel void dit_flash_attend(
         float psum = 0.0f;
         for (uint j = 0; j < 8u; ++j) {
             uint col = schunk * 8u + j;
-            float p = (kb0 + col < n) ? exp(ss_sg[srow * KT + col] - mnew) : 0.0f;
-            sp_sg[srow * KT + col] = (half)p;
+            float p =
+                (kb0 + col < n) ? exp(ss[srow * KT + col] * scale - mnew) : 0.0f;
+            ss[srow * KT + col] = p;
             psum += p;
         }
         psum += simd_shuffle_xor(psum, 1u);
         psum += simd_shuffle_xor(psum, 2u);
         if (schunk == 0u) {
-            sm[arow] = mnew;
-            sl[arow] = alpha * lprev + psum;
+            sm[srow] = mnew;
+            sl[srow] = alpha * lprev + psum;
         }
         // Rescale O by diag(alpha) only when some row max moved.
         if (simd_any(alpha != 1.0f)) {
-            for (uint i = lane; i < 64u; i += 32u) sd_sg[i] = 0.0f;
+            for (uint i = lane; i < 64u; i += 32u) sd[i] = 0.0f;
             simdgroup_barrier(mem_flags::mem_threadgroup);
-            if (schunk == 0u) sd_sg[srow * 8u + srow] = alpha;
+            if (schunk == 0u) sd[srow * 8u + srow] = alpha;
             simdgroup_barrier(mem_flags::mem_threadgroup);
             simdgroup_float8x8 d8;
-            simdgroup_load(d8, sd_sg, 8u, ulong2(0, 0), false);
+            simdgroup_load(d8, sd, 8u, ulong2(0, 0), false);
             for (uint i = 0; i < nob; ++i) {
                 simdgroup_float8x8 t8;
                 simdgroup_multiply(t8, d8, o8[i]);
@@ -1126,41 +1113,49 @@ kernel void dit_flash_attend(
             }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
-        // O += P·V.
-        for (uint i = 0; i < nob; ++i) {
-            for (uint kb = 0; kb < KT / 8u; ++kb) {
-                simdgroup_load(a8, sp_sg + kb * 8u, KT, ulong2(0, 0), false);
-                simdgroup_load(b8, sv + (kb * 8u) * hd + i * 8u, hd, ulong2(0, 0), false);
+        // O += P·V, V blocks straight from device (padded tails zero,
+        // and their P is zero anyway).
+        for (uint kb = 0; kb < KT / 8u; ++kb) {
+            simdgroup_load(a8, ss + kb * 8u, KT, ulong2(0, 0), false);
+            device const float* vrow = vsrc + (ulong)(kb0 + kb * 8u) * hd;
+            for (uint i = 0; i < nob; ++i) {
+                simdgroup_load(b8, vrow + i * 8u, hd, ulong2(0, 0), false);
                 simdgroup_multiply_accumulate(o8[i], a8, b8, o8[i]);
             }
         }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // O /= l (diagonal), stage per-sg rows, then one masked copy out.
+    // O /= l (diagonal), then store. Full tiles go straight to device
+    // (row stride nh·hd IS the output layout); the edge q-tile stages
+    // each 8×8 block through sd and copies the valid rows.
     {
-        float linv = 1.0f / max(sl[arow], 1e-30f);
-        for (uint i = lane; i < 64u; i += 32u) sd_sg[i] = 0.0f;
+        float linv = 1.0f / max(sl[srow], 1e-30f);
+        for (uint i = lane; i < 64u; i += 32u) sd[i] = 0.0f;
         simdgroup_barrier(mem_flags::mem_threadgroup);
-        if (schunk == 0u) sd_sg[srow * 8u + srow] = linv;
+        if (schunk == 0u) sd[srow * 8u + srow] = linv;
         simdgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_float8x8 d8;
-        simdgroup_load(d8, sd_sg, 8u, ulong2(0, 0), false);
+        simdgroup_load(d8, sd, 8u, ulong2(0, 0), false);
+        uint row0 = qbase + 8u * sgitg;
         for (uint i = 0; i < nob; ++i) {
             simdgroup_float8x8 t8;
             simdgroup_multiply(t8, d8, o8[i]);
-            o8[i] = t8;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    threadgroup float* stage = (threadgroup float*)arena; // 32×hd f32 ≤ 16 KB
-    for (uint i = 0; i < nob; ++i) {
-        simdgroup_store(o8[i], stage + (8u * sgitg) * hd + i * 8u, hd, ulong2(0, 0), false);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tiitg; i < QT * hd; i += 128u) {
-        uint r = i / hd, d = i % hd;
-        if (qbase + r < n) {
-            out[((ulong)(qbase + r) * nh + h) * hd + d] = stage[r * hd + d];
+            if (row0 + 8u <= n) {
+                simdgroup_store(t8, out + ((ulong)row0 * nh + h) * hd + i * 8u,
+                                (ulong)nh * hd, ulong2(0, 0), false);
+            } else {
+                simdgroup_store(t8, sd, 8u, ulong2(0, 0), false);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint e = lane; e < 64u; e += 32u) {
+                    uint r = e / 8u;
+                    if (row0 + r < n) {
+                        out[((ulong)(row0 + r) * nh + h) * hd + i * 8u + e % 8u] =
+                            sd[e];
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
     }
 }
@@ -1480,7 +1475,7 @@ kernel void rms_residual_rows(
 // One simdgroup per (token, head) row of hd.
 kernel void dit_rope_pack(
     device const float* src [[buffer(0)]],  // [n][heads][hd] token-major
-    device float*       dst [[buffer(1)]],  // [heads][n][hd]
+    device float*       dst [[buffer(1)]],  // [heads][nst][hd]
     device const float* w   [[buffer(2)]],  // [hd] rms weight
     device const float* cs  [[buffer(3)]],  // cos [n][hd/2]
     device const float* sn  [[buffer(4)]],  // sin [n][hd/2]
@@ -1488,6 +1483,7 @@ kernel void dit_rope_pack(
     constant uint&  heads [[buffer(6)]],
     constant uint&  hd    [[buffer(7)]],
     constant float& eps   [[buffer(8)]],
+    constant uint&  nst   [[buffer(9)]],    // dst row stride (padded n)
     uint tg   [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
@@ -1499,7 +1495,7 @@ kernel void dit_rope_pack(
     ss = simd_sum(ss);
     float inv = rsqrt(ss / (float)hd + eps);
     uint pairs = hd >> 1u;
-    device float* d = dst + ((ulong)hh * n + p) * hd;
+    device float* d = dst + ((ulong)hh * nst + p) * hd;
     for (uint j = lane; j < pairs; j += 32u) {
         float a = v[2u * j] * inv * w[2u * j];
         float b = v[2u * j + 1u] * inv * w[2u * j + 1u];
@@ -1513,10 +1509,11 @@ kernel void dit_rope_pack(
 // Plain token-major → head-major permute (V has no norm/rope).
 kernel void pack_heads(
     device const float* src [[buffer(0)]],  // [n][heads][hd]
-    device float*       dst [[buffer(1)]],  // [heads][n][hd]
+    device float*       dst [[buffer(1)]],  // [heads][nst][hd]
     constant uint& n     [[buffer(2)]],
     constant uint& heads [[buffer(3)]],
     constant uint& hd    [[buffer(4)]],
+    constant uint& nst   [[buffer(5)]],     // dst row stride (padded n)
     uint i [[thread_position_in_grid]])
 {
     uint total = n * heads * hd;
@@ -1524,7 +1521,7 @@ kernel void pack_heads(
     uint p = i / (heads * hd);
     uint h = (i / hd) % heads;
     uint d = i % hd;
-    dst[((ulong)h * n + p) * hd + d] = src[i];
+    dst[((ulong)h * nst + p) * hd + d] = src[i];
 }
 
 // q1: 6-byte tiles [f16 scale][4B sign bits] per 32-group; w = s*(2b-1).
@@ -5511,13 +5508,16 @@ pub fn vae_upsample_conv(
 }
 
 /// dit_flash_attend gate — EXPERIMENTAL, opt-in via `CMF_DIT_FLASH=1`.
-/// V1 is parity-correct (2.7e-5 vs the f64 reference) but 2–3× slower
-/// than the GEMM chain on M4: the 31 KB arena caps occupancy at one
-/// threadgroup per core, so every per-KV-tile barrier drains the
-/// pipeline with nothing to hide the staging latency behind. The next
-/// iteration needs simdgroup_async_copy double-buffering (Apple9+)
-/// or a ≤16 KB arena before it can win; until then the default stays
-/// on the 3-encoder GEMM chain.
+/// V2 (device-direct simdgroup loads, per-simdgroup-only shmem, zero
+/// threadgroup barriers in the KV loop) is 1.5× faster than V1 and
+/// essentially exact (3.4e-8 vs the f64 reference — f32 MACs end to
+/// end), but still trails the GEMM chain on M4 (15.5 vs 12 ms at
+/// n=1064, 270 vs 124 ms at n=4136): one 8×8 MAC per two device
+/// loads cannot match mul_mm's staged-tile arithmetic intensity, and
+/// a pre-transposed K measured WORSE (n32-strided block rows lose
+/// locality). Beating the chain needs the full flash_attn_ext-class
+/// design — 64–128-row Q tiles, half operands, pipelined staging.
+/// Until then the default stays on the 3-encoder GEMM chain.
 fn flash_ok(hd: usize) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CMF_DIT_FLASH").is_ok_and(|v| v == "1"))
@@ -5526,6 +5526,7 @@ fn flash_ok(hd: usize) -> bool {
 }
 
 /// Encode one all-heads flash-attend dispatch (out = [n][nh·hd]).
+/// Inputs are head-major with row stride `n32` (padded, zeroed tails).
 #[allow(clippy::too_many_arguments)]
 fn encode_flash_attend(
     c: &Ctx,
@@ -5537,6 +5538,7 @@ fn encode_flash_attend(
     nh: usize,
     nkv: usize,
     n: usize,
+    n32: usize,
     hd: usize,
     scale: f32,
 ) {
@@ -5552,6 +5554,8 @@ fn encode_flash_attend(
         enc.set_bytes(4 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
     }
     enc.set_bytes(8, 4, &scale as *const f32 as *const std::ffi::c_void);
+    let n32_u = n32 as u32;
+    enc.set_bytes(9, 4, &n32_u as *const u32 as *const std::ffi::c_void);
     enc.dispatch_thread_groups(
         MTLSize::new((n as u64).div_ceil(32), nh as u64, 1),
         MTLSize::new(128, 1, 1),
@@ -5590,19 +5594,35 @@ pub fn dit_attention(
             })
             .clone()
     };
-    let qb = get_io(16_000_000_123 + qh.len(), qh.len() * 4);
-    let kb = get_io(17_000_000_137 + kh.len(), kh.len() * 4);
-    let vb = get_io(18_000_000_149 + vh.len(), vh.len() * 4);
-    unsafe {
-        std::ptr::copy_nonoverlapping(qh.as_ptr(), qb.contents() as *mut f32, qh.len());
-        std::ptr::copy_nonoverlapping(kh.as_ptr(), kb.contents() as *mut f32, kh.len());
-        std::ptr::copy_nonoverlapping(vh.as_ptr(), vb.contents() as *mut f32, vh.len());
-    }
     let ab = get_io(21_000_000_179 + nh * n * hd, nh * n * hd * 4);
 
     if flash_ok(hd) {
+        // Padded uploads: row stride n32, zeroed tails (kernel contract).
+        let n32 = n.div_ceil(32) * 32;
+        let pad_up = |base: usize, src: &[f32], heads: usize| -> Buffer {
+            let buf = get_io(base + heads * n32 * hd, heads * n32 * hd * 4);
+            let dst = buf.contents() as *mut f32;
+            for hh in 0..heads {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        src.as_ptr().add(hh * n * hd),
+                        dst.add(hh * n32 * hd),
+                        n * hd,
+                    );
+                    std::ptr::write_bytes(
+                        dst.add(hh * n32 * hd + n * hd),
+                        0,
+                        (n32 - n) * hd,
+                    );
+                }
+            }
+            buf
+        };
+        let qb = pad_up(16_000_000_123, qh, nh);
+        let kb = pad_up(17_000_000_137, kh, nkv);
+        let vb = pad_up(18_000_000_149, vh, nkv);
         let cmd = c.queue.new_command_buffer();
-        encode_flash_attend(c, cmd, &qb, &kb, &vb, &ab, nh, nkv, n, hd, scale);
+        encode_flash_attend(c, cmd, &qb, &kb, &vb, &ab, nh, nkv, n, n32, hd, scale);
         submit_and_wait(c, cmd, &[&ab]);
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -5613,6 +5633,14 @@ pub fn dit_attention(
         }
         tracing::debug!("gpu dit flash attention: nh={nh} n={n} hd={hd}");
         return true;
+    }
+    let qb = get_io(16_000_000_123 + qh.len(), qh.len() * 4);
+    let kb = get_io(17_000_000_137 + kh.len(), kh.len() * 4);
+    let vb = get_io(18_000_000_149 + vh.len(), vh.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(qh.as_ptr(), qb.contents() as *mut f32, qh.len());
+        std::ptr::copy_nonoverlapping(kh.as_ptr(), kb.contents() as *mut f32, kh.len());
+        std::ptr::copy_nonoverlapping(vh.as_ptr(), vb.contents() as *mut f32, vh.len());
     }
 
     let sc = get_io(19_000_000_151 + n * n, n * n * 4);
@@ -5768,9 +5796,12 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
     let qtok = get_io(25_000_000_039 + n * nh * hd, n * nh * hd * 4);
     let ktok = get_io(26_000_000_047 + n * nkv * hd, n * nkv * hd * 4);
     let vtok = get_io(27_000_000_059 + n * nkv * hd, n * nkv * hd * 4);
-    let qhm = get_io(16_000_000_123 + n * nh * hd, n * nh * hd * 4);
-    let khm = get_io(17_000_000_137 + n * nkv * hd, n * nkv * hd * 4);
-    let vhm = get_io(18_000_000_149 + n * nkv * hd, n * nkv * hd * 4);
+    // Head-major packs use a 32-padded row stride (flash contract:
+    // zeroed tails; the GEMM fallback just reads the first n rows).
+    let n32 = n.div_ceil(32) * 32;
+    let qhm = get_io(16_000_000_123 + n32 * nh * hd, n32 * nh * hd * 4);
+    let khm = get_io(17_000_000_137 + n32 * nkv * hd, n32 * nkv * hd * 4);
+    let vhm = get_io(18_000_000_149 + n32 * nkv * hd, n32 * nkv * hd * 4);
     let attnb = get_io(21_000_000_179 + n * nh * hd, n * nh * hd * 4);
     let projb = get_io(28_000_000_067 + n * h, n * h * 4);
     let gb = get_io(14_000_000_071 + n * inter, n * inter * 4);
@@ -5829,9 +5860,25 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
         mm(enc, av, &xnb, &vtok, nkv * hd, h);
         enc.end_encoding();
     }
-    // E3: qk-norm + RoPE + head-major packs (independent)
+    // E3: qk-norm + RoPE + head-major packs (independent). When the
+    // flash path is on, the padded tail rows are zeroed first (same
+    // encoder — disjoint regions).
     {
         let enc = cmd.new_compute_command_encoder();
+        if flash_ok(hd) && n32 > n {
+            enc.set_compute_pipeline_state(&c.zero);
+            for (buf, heads) in [(&qhm, nh), (&khm, nkv), (&vhm, nkv)] {
+                for hh in 0..heads {
+                    enc.set_buffer(0, Some(buf), ((hh * n32 + n) * hd * 4) as u64);
+                    let cnt = ((n32 - n) * hd) as u32;
+                    enc.set_bytes(1, 4, &cnt as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_threads(
+                        MTLSize::new(cnt as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                }
+            }
+        }
         for (src, dst, heads, w_off) in
             [(&qtok, &qhm, nh, o_nq), (&ktok, &khm, nkv, o_nk)]
         {
@@ -5847,6 +5894,8 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
             enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
             let qk_eps = 1e-5f32;
             enc.set_bytes(8, 4, &qk_eps as *const f32 as *const std::ffi::c_void);
+            let nst_u = u32c(n32);
+            enc.set_bytes(9, 4, &nst_u as *const u32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new((n * heads) as u64, 1, 1),
                 MTLSize::new(32, 1, 1),
@@ -5855,7 +5904,7 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
         enc.set_compute_pipeline_state(&c.packh);
         enc.set_buffer(0, Some(&vtok), 0);
         enc.set_buffer(1, Some(&vhm), 0);
-        let words = [u32c(n), u32c(nkv), u32c(hd)];
+        let words = [u32c(n), u32c(nkv), u32c(hd), u32c(n32)];
         for (i, w) in words.iter().enumerate() {
             enc.set_bytes(2 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
         }
@@ -5870,7 +5919,9 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
     // with the shared n×n scratch stays as the fallback.
     let scale = 1.0f32 / (hd as f32).sqrt();
     if flash_ok(hd) {
-        encode_flash_attend(c, cmd, &qhm, &khm, &vhm, &attnb, nh, nkv, n, hd, scale);
+        encode_flash_attend(
+            c, cmd, &qhm, &khm, &vhm, &attnb, nh, nkv, n, n32, hd, scale,
+        );
     } else {
         let sc = get_io(19_000_000_151 + n * n, n * n * 4);
         let pb = get_io(20_000_000_167 + nh * n * hd, nh * n * hd * 4);
@@ -5881,8 +5932,8 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
                 let enc = cmd.new_compute_command_encoder();
                 let pso = mm_pipeline(c, 0, hd, 2);
                 enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&khm), (kv * n * hd * 4) as u64);
-                enc.set_buffer(1, Some(&qhm), (hh * n * hd * 4) as u64);
+                enc.set_buffer(0, Some(&khm), (kv * n32 * hd * 4) as u64);
+                enc.set_buffer(1, Some(&qhm), (hh * n32 * hd * 4) as u64);
                 enc.set_buffer(2, Some(&sc), 0);
                 let (cols_u, rows_u, nb_u) = (u32c(hd), u32c(n), u32c(n));
                 enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
@@ -5911,7 +5962,7 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
                 let enc = cmd.new_compute_command_encoder();
                 let pso = mm_pipeline(c, hd, 0, 3);
                 enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&vhm), (kv * n * hd * 4) as u64);
+                enc.set_buffer(0, Some(&vhm), (kv * n32 * hd * 4) as u64);
                 enc.set_buffer(1, Some(&sc), 0);
                 enc.set_buffer(2, Some(&pb), (hh * n * hd * 4) as u64);
                 let (k_u, rows_u, nb_u) = (u32c(n), u32c(hd), u32c(n));
