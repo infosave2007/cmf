@@ -4815,6 +4815,7 @@ mod tests {
             router_sigmoid: true,
             expert_bias: None,
             routed_scaling: 1.0,
+            route_tau: None,
             shared: Some((shared, None)),
             stats: std::cell::RefCell::new(Vec::new()),
         };
