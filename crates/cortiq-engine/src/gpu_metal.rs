@@ -1310,6 +1310,87 @@ kernel void conv_mul_mm(
     }
 }
 
+// GroupNorm pass 1: per-group mean and 1/σ. One 256-thread group per
+// channel group, grid-stride partial sums (f32 partials —
+// tolerance-class vs the CPU's f64, like every GPU reduction here).
+kernel void gn_reduce(
+    device const float* x  [[buffer(0)]],
+    device float*       st [[buffer(1)]],   // [groups][2]: mean, inv
+    constant uint& per_g [[buffer(2)]],
+    constant uint& hw    [[buffer(3)]],
+    constant float& eps  [[buffer(4)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    const uint TPT = 256u;
+    ulong base = (ulong)tg * per_g * hw;
+    ulong count = (ulong)per_g * hw;
+    threadgroup float rs[256];
+    threadgroup float rq[256];
+    float s = 0.0f, q = 0.0f;
+    for (ulong i = tid; i < count; i += TPT) {
+        float v = x[base + i];
+        s += v;
+        q += v * v;
+    }
+    rs[tid] = s;
+    rq[tid] = q;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = TPT >> 1u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            rs[tid] += rs[tid + off];
+            rq[tid] += rq[tid + off];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        float mean = rs[0] / (float)count;
+        float var = rq[0] / (float)count - mean * mean;
+        st[2u * tg] = mean;
+        st[2u * tg + 1u] = rsqrt(max(var, 0.0f) + eps);
+    }
+}
+
+// GroupNorm pass 2: normalize + affine, SiLU optionally fused (the
+// decoder always follows norm with silu).
+kernel void gn_apply(
+    device const float* x  [[buffer(0)]],
+    device float*       y  [[buffer(1)]],
+    device const float* st [[buffer(2)]],
+    device const float* wa [[buffer(3)]],
+    device const float* ba [[buffer(4)]],
+    constant uint& per_g   [[buffer(5)]],
+    constant uint& hw      [[buffer(6)]],
+    constant uint& total   [[buffer(7)]],
+    constant uint& do_silu [[buffer(8)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= total) return;
+    uint c = i / hw;
+    uint g = c / per_g;
+    float v = (x[i] - st[2u * g]) * st[2u * g + 1u] * wa[c] + ba[c];
+    if (do_silu != 0u) v = v / (1.0f + exp(-v));
+    y[i] = v;
+}
+
+// Nearest-neighbour ×2 upsample, NCHW.
+kernel void upsample2x_k(
+    device const float* x [[buffer(0)]],   // [c, h, w]
+    device float*       y [[buffer(1)]],   // [c, 2h, 2w]
+    constant uint& hw_in [[buffer(2)]],    // h·w
+    constant uint& w_in  [[buffer(3)]],
+    constant uint& total [[buffer(4)]],    // c·4·h·w
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= total) return;
+    uint ci = i / (4u * hw_in);
+    uint rem = i % (4u * hw_in);
+    uint w2 = 2u * w_in;
+    uint yy = rem / w2;
+    uint xx = rem % w2;
+    y[i] = x[(ulong)ci * hw_in + (ulong)(yy / 2u) * w_in + xx / 2u];
+}
+
 // [hw, oc] panel → NCHW [oc, hw] + bias.
 kernel void panel_to_nchw(
     device const float* y    [[buffer(0)]],
@@ -2918,6 +2999,9 @@ struct Ctx {
     flashatt: ComputePipelineState,
     convmm: ComputePipelineState,
     p2nchw: ComputePipelineState,
+    gnred: ComputePipelineState,
+    gnapp: ComputePipelineState,
+    ups2x: ComputePipelineState,
     rmsmod: ComputePipelineState,
     rmsres: ComputePipelineState,
     ropepack: ComputePipelineState,
@@ -3065,6 +3149,9 @@ fn init() -> Result<Ctx, String> {
     let flashatt = pso("dit_flash_attend")?;
     let convmm = pso("conv_mul_mm")?;
     let p2nchw = pso("panel_to_nchw")?;
+    let gnred = pso("gn_reduce")?;
+    let gnapp = pso("gn_apply")?;
+    let ups2x = pso("upsample2x_k")?;
     let rmsmod = pso("rms_mod_rows")?;
     let rmsres = pso("rms_residual_rows")?;
     let ropepack = pso("dit_rope_pack")?;
@@ -3119,6 +3206,9 @@ fn init() -> Result<Ctx, String> {
         flashatt,
         convmm,
         p2nchw,
+        gnred,
+        gnapp,
+        ups2x,
         rmsmod,
         rmsres,
         ropepack,
@@ -5070,6 +5160,150 @@ pub fn q4t_ffn(
     true
 }
 
+/// Shared-mode io buffer from the per-context cache.
+fn io_shared(c: &Ctx, key: usize, nbytes: usize) -> Buffer {
+    let mut cache = c.io_bufs.lock().unwrap();
+    cache
+        .entry(key)
+        .or_insert_with(|| {
+            crate::gpu::probe_note_cold();
+            c._device
+                .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+        })
+        .clone()
+}
+
+/// Weight/bias buffer keyed by heap address — stable for the owner's
+/// lifetime, so each layer uploads its constants once per process.
+fn cached_weight_buf(c: &Ctx, base: usize, data: &[f32]) -> Buffer {
+    let key = base
+        .wrapping_add(data.as_ptr() as usize)
+        .wrapping_add(data.len());
+    let mut cache = c.io_bufs.lock().unwrap();
+    let mut fresh = false;
+    let buf = cache
+        .entry(key)
+        .or_insert_with(|| {
+            fresh = true;
+            c._device
+                .new_buffer((data.len() * 4) as u64, MTLResourceOptions::StorageModeShared)
+        })
+        .clone();
+    if fresh {
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents() as *mut f32, data.len());
+        }
+    }
+    buf
+}
+
+/// conv_mul_mm + panel_to_nchw as two encoders on an open command
+/// buffer: img [ic,h,w] → out [oc,h,w] (+bias).
+#[allow(clippy::too_many_arguments)]
+fn encode_conv(
+    c: &Ctx,
+    cmd: &metal::CommandBufferRef,
+    w_buf: &Buffer,
+    b_buf: &Buffer,
+    img: &Buffer,
+    panel: &Buffer,
+    out: &Buffer,
+    ick2: usize,
+    oc: usize,
+    h: usize,
+    w_img: usize,
+    k: usize,
+) {
+    let hw = h * w_img;
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.convmm);
+        enc.set_buffer(0, Some(w_buf), 0);
+        enc.set_buffer(1, Some(img), 0);
+        enc.set_buffer(2, Some(panel), 0);
+        let words = [
+            ick2 as u32,
+            oc as u32,
+            hw as u32,
+            h as u32,
+            w_img as u32,
+            k as u32,
+        ];
+        for (i, wv) in words.iter().enumerate() {
+            enc.set_bytes(3 + i as u64, 4, wv as *const u32 as *const std::ffi::c_void);
+        }
+        enc.dispatch_thread_groups(
+            MTLSize::new((hw as u64).div_ceil(32), (oc as u64).div_ceil(64), 1),
+            MTLSize::new(128, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.p2nchw);
+        enc.set_buffer(0, Some(panel), 0);
+        enc.set_buffer(1, Some(out), 0);
+        enc.set_buffer(2, Some(b_buf), 0);
+        let words = [hw as u32, oc as u32];
+        for (i, wv) in words.iter().enumerate() {
+            enc.set_bytes(3 + i as u64, 4, wv as *const u32 as *const std::ffi::c_void);
+        }
+        enc.dispatch_threads(MTLSize::new((hw * oc) as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+    }
+}
+
+/// GroupNorm (+fused SiLU) as two encoders: reduce → apply.
+#[allow(clippy::too_many_arguments)]
+fn encode_groupnorm(
+    c: &Ctx,
+    cmd: &metal::CommandBufferRef,
+    x: &Buffer,
+    y: &Buffer,
+    st: &Buffer,
+    wa: &Buffer,
+    ba: &Buffer,
+    groups: usize,
+    ch: usize,
+    hw: usize,
+    do_silu: bool,
+) {
+    let per_g = ch / groups;
+    let eps = 1e-6f32;
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.gnred);
+        enc.set_buffer(0, Some(x), 0);
+        enc.set_buffer(1, Some(st), 0);
+        let (pg, hw_u) = (per_g as u32, hw as u32);
+        enc.set_bytes(2, 4, &pg as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(3, 4, &hw_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(MTLSize::new(groups as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+    }
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.gnapp);
+        enc.set_buffer(0, Some(x), 0);
+        enc.set_buffer(1, Some(y), 0);
+        enc.set_buffer(2, Some(st), 0);
+        enc.set_buffer(3, Some(wa), 0);
+        enc.set_buffer(4, Some(ba), 0);
+        let words = [
+            per_g as u32,
+            hw as u32,
+            (ch * hw) as u32,
+            do_silu as u32,
+        ];
+        for (i, wv) in words.iter().enumerate() {
+            enc.set_bytes(5 + i as u64, 4, wv as *const u32 as *const std::ffi::c_void);
+        }
+        enc.dispatch_threads(MTLSize::new((ch * hw) as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+    }
+}
+
 /// VAE conv2d on the device (implicit GEMM — no im2col matrix). The
 /// weight buffer is cached by (pointer, len) so each conv uploads its
 /// weights once per process; the image and result cross per call.
@@ -5091,98 +5325,188 @@ pub fn vae_conv2d(
     if w.len() != oc * ick2 || x.len() != ic * hw || out.len() != oc * hw {
         return false;
     }
-    let get_io = |key: usize, nbytes: usize| -> Buffer {
-        let mut cache = c.io_bufs.lock().unwrap();
-        cache
-            .entry(key)
-            .or_insert_with(|| {
-                crate::gpu::probe_note_cold();
-                c._device
-                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
-            })
-            .clone()
-    };
-    // Weights/bias keyed by heap address — stable for the decoder's
-    // lifetime, so each conv layer uploads them once per process.
-    let cached_upload = |base: usize, data: &[f32]| -> Buffer {
-        let key = base
-            .wrapping_add(data.as_ptr() as usize)
-            .wrapping_add(data.len());
-        let mut cache = c.io_bufs.lock().unwrap();
-        let mut fresh = false;
-        let buf = cache
-            .entry(key)
-            .or_insert_with(|| {
-                fresh = true;
-                c._device
-                    .new_buffer((data.len() * 4) as u64, MTLResourceOptions::StorageModeShared)
-            })
-            .clone();
-        if fresh {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    buf.contents() as *mut f32,
-                    data.len(),
-                );
-            }
-        }
-        buf
-    };
-    let w_buf = cached_upload(30_000_000_101, w);
-    let b_buf = cached_upload(31_000_000_103, bias);
-    let x_buf = get_io(32_000_000_119 + x.len(), x.len() * 4);
+    let w_buf = cached_weight_buf(c, 30_000_000_101, w);
+    let b_buf = cached_weight_buf(c, 31_000_000_103, bias);
+    let x_buf = io_shared(c, 32_000_000_119 + x.len(), x.len() * 4);
     unsafe {
         std::ptr::copy_nonoverlapping(x.as_ptr(), x_buf.contents() as *mut f32, x.len());
     }
-    let panel = get_io(33_000_000_127 + hw * oc, hw * oc * 4);
-    let o_buf = get_io(34_000_000_131 + hw * oc, hw * oc * 4);
+    let panel = io_shared(c, 33_000_000_127 + hw * oc, hw * oc * 4);
+    let o_buf = io_shared(c, 34_000_000_131 + hw * oc, hw * oc * 4);
 
     let cmd = c.queue.new_command_buffer();
-    {
-        let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&c.convmm);
-        enc.set_buffer(0, Some(&w_buf), 0);
-        enc.set_buffer(1, Some(&x_buf), 0);
-        enc.set_buffer(2, Some(&panel), 0);
-        let words = [
-            ick2 as u32,
-            oc as u32,
-            hw as u32,
-            h as u32,
-            w_img as u32,
-            k as u32,
-        ];
-        for (i, wv) in words.iter().enumerate() {
-            enc.set_bytes(3 + i as u64, 4, wv as *const u32 as *const std::ffi::c_void);
-        }
-        enc.dispatch_thread_groups(
-            MTLSize::new((hw as u64).div_ceil(32), (oc as u64).div_ceil(64), 1),
-            MTLSize::new(128, 1, 1),
-        );
-        enc.end_encoding();
-    }
-    {
-        let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&c.p2nchw);
-        enc.set_buffer(0, Some(&panel), 0);
-        enc.set_buffer(1, Some(&o_buf), 0);
-        enc.set_buffer(2, Some(&b_buf), 0);
-        let words = [hw as u32, oc as u32];
-        for (i, wv) in words.iter().enumerate() {
-            enc.set_bytes(3 + i as u64, 4, wv as *const u32 as *const std::ffi::c_void);
-        }
-        enc.dispatch_threads(
-            MTLSize::new((hw * oc) as u64, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
-        enc.end_encoding();
-    }
+    encode_conv(
+        c, cmd, &w_buf, &b_buf, &x_buf, &panel, &o_buf, ick2, oc, h, w_img, k,
+    );
     submit_and_wait(c, cmd, &[&o_buf]);
     unsafe {
         std::ptr::copy_nonoverlapping(o_buf.contents() as *const f32, out.as_mut_ptr(), oc * hw);
     }
     tracing::debug!("gpu vae conv: {ic}x{oc} k={k} {h}x{w_img}");
+    true
+}
+
+/// One whole VAE resnet block on the device: norm1+silu → conv1 →
+/// norm2+silu → conv2 → (+1×1 shortcut) → residual add, a single
+/// command buffer — the image crosses the CPU boundary once each way
+/// instead of 2–3 times per conv.
+pub fn vae_resnet(a: &crate::gpu::VaeResnetArgs, x: &[f32], out: &mut [f32]) -> bool {
+    let Some(c) = ctx() else { return false };
+    let (ic, oc, h, w) = (a.ic, a.oc, a.h, a.w);
+    let hw = h * w;
+    if x.len() != ic * hw || out.len() != oc * hw || ic % a.groups != 0 || oc % a.groups != 0 {
+        return false;
+    }
+    if a.shortcut.is_none() && ic != oc {
+        return false;
+    }
+    let n1w = cached_weight_buf(c, 35_000_000_107, a.n1w);
+    let n1b = cached_weight_buf(c, 35_000_000_107, a.n1b);
+    let n2w = cached_weight_buf(c, 35_000_000_107, a.n2w);
+    let n2b = cached_weight_buf(c, 35_000_000_107, a.n2b);
+    let c1w = cached_weight_buf(c, 30_000_000_101, a.c1w);
+    let c1b = cached_weight_buf(c, 31_000_000_103, a.c1b);
+    let c2w = cached_weight_buf(c, 30_000_000_101, a.c2w);
+    let c2b = cached_weight_buf(c, 31_000_000_103, a.c2b);
+
+    let xb = io_shared(c, 32_000_000_119 + ic * hw, ic * hw * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(x.as_ptr(), xb.contents() as *mut f32, x.len());
+    }
+    let st = io_shared(c, 36_000_000_137 + a.groups, a.groups * 2 * 4);
+    let t1 = io_shared(c, 37_000_000_139 + ic * hw, ic * hw * 4);
+    let panel = io_shared(c, 33_000_000_127 + hw * oc, hw * oc * 4);
+    let h1 = io_shared(c, 38_000_000_149 + oc * hw, oc * hw * 4);
+    let t2 = io_shared(c, 39_000_000_157 + oc * hw, oc * hw * 4);
+    let h2 = io_shared(c, 34_000_000_131 + hw * oc, hw * oc * 4);
+
+    let cmd = c.queue.new_command_buffer();
+    encode_groupnorm(c, cmd, &xb, &t1, &st, &n1w, &n1b, a.groups, ic, hw, true);
+    encode_conv(
+        c,
+        cmd,
+        &c1w,
+        &c1b,
+        &t1,
+        &panel,
+        &h1,
+        ic * a.c1k * a.c1k,
+        oc,
+        h,
+        w,
+        a.c1k,
+    );
+    encode_groupnorm(c, cmd, &h1, &t2, &st, &n2w, &n2b, a.groups, oc, hw, true);
+    encode_conv(
+        c,
+        cmd,
+        &c2w,
+        &c2b,
+        &t2,
+        &panel,
+        &h2,
+        oc * a.c2k * a.c2k,
+        oc,
+        h,
+        w,
+        a.c2k,
+    );
+    // Residual: h2 += shortcut(x) (1×1 conv through t2 as scratch) or
+    // h2 += x directly.
+    let skip: Buffer = match a.shortcut {
+        Some((sw, sb, sk)) => {
+            let sw_buf = cached_weight_buf(c, 30_000_000_101, sw);
+            let sb_buf = cached_weight_buf(c, 31_000_000_103, sb);
+            encode_conv(
+                c,
+                cmd,
+                &sw_buf,
+                &sb_buf,
+                &xb,
+                &panel,
+                &t2,
+                ic * sk * sk,
+                oc,
+                h,
+                w,
+                sk,
+            );
+            t2.clone()
+        }
+        None => xb.clone(),
+    };
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.axpy);
+        enc.set_buffer(0, Some(&skip), 0);
+        enc.set_buffer(1, Some(&h2), 0);
+        let one = 1.0f32;
+        let n_u = (oc * hw) as u32;
+        enc.set_bytes(2, 4, &one as *const f32 as *const std::ffi::c_void);
+        enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_threads(MTLSize::new((oc * hw) as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&h2]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(h2.contents() as *const f32, out.as_mut_ptr(), oc * hw);
+    }
+    tracing::debug!("gpu vae resnet: {ic}->{oc} {h}x{w}");
+    true
+}
+
+/// Nearest-2× upsample fused with the following conv — only the small
+/// pre-upsample image is uploaded; the ×4 tensor lives on the device.
+#[allow(clippy::too_many_arguments)]
+pub fn vae_upsample_conv(
+    w: &[f32],
+    bias: &[f32],
+    x: &[f32],
+    ic: usize,
+    oc: usize,
+    h: usize,
+    w_img: usize,
+    k: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let ick2 = ic * k * k;
+    let (h2, w2) = (2 * h, 2 * w_img);
+    let hw2 = h2 * w2;
+    if w.len() != oc * ick2 || x.len() != ic * h * w_img || out.len() != oc * hw2 {
+        return false;
+    }
+    let w_buf = cached_weight_buf(c, 30_000_000_101, w);
+    let b_buf = cached_weight_buf(c, 31_000_000_103, bias);
+    let x_buf = io_shared(c, 32_000_000_119 + x.len(), x.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(x.as_ptr(), x_buf.contents() as *mut f32, x.len());
+    }
+    let up = io_shared(c, 40_000_000_163 + ic * hw2, ic * hw2 * 4);
+    let panel = io_shared(c, 33_000_000_127 + hw2 * oc, hw2 * oc * 4);
+    let o_buf = io_shared(c, 34_000_000_131 + hw2 * oc, hw2 * oc * 4);
+
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.ups2x);
+        enc.set_buffer(0, Some(&x_buf), 0);
+        enc.set_buffer(1, Some(&up), 0);
+        let words = [(h * w_img) as u32, w_img as u32, (ic * hw2) as u32];
+        for (i, wv) in words.iter().enumerate() {
+            enc.set_bytes(2 + i as u64, 4, wv as *const u32 as *const std::ffi::c_void);
+        }
+        enc.dispatch_threads(MTLSize::new((ic * hw2) as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+    }
+    encode_conv(
+        c, cmd, &w_buf, &b_buf, &up, &panel, &o_buf, ick2, oc, h2, w2, k,
+    );
+    submit_and_wait(c, cmd, &[&o_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(o_buf.contents() as *const f32, out.as_mut_ptr(), oc * hw2);
+    }
+    tracing::debug!("gpu vae upsample+conv: {ic}x{oc} {h}x{w_img} -> {h2}x{w2}");
     true
 }
 

@@ -298,6 +298,108 @@ fn gpu_vae_conv2d_matches_cpu() {
 }
 
 #[test]
+fn gpu_vae_resnet_matches_cpu() {
+    if !require_metal() {
+        return;
+    }
+    let (ic, oc, h, w, groups) = (32usize, 64usize, 9usize, 7usize, 8usize);
+    let mk = |seed: usize, len: usize| -> Vec<f32> {
+        (0..len)
+            .map(|i| ((i * 41 + seed * 13 + 5) % 89) as f32 / 89.0 - 0.5)
+            .collect()
+    };
+    let conv = |seed: usize, ic: usize, oc: usize, k: usize| cortiq_engine::vae::Conv2d {
+        w: mk(seed, oc * ic * k * k),
+        b: mk(seed + 1, oc),
+        oc,
+        ic,
+        k,
+    };
+    let gn = |seed: usize, c: usize| cortiq_engine::vae::GroupNorm {
+        g: groups,
+        w: mk(seed, c).iter().map(|v| v + 1.0).collect(),
+        b: mk(seed + 1, c),
+    };
+    let (n1, c1) = (gn(10, ic), conv(20, ic, oc, 3));
+    let (n2, c2) = (gn(30, oc), conv(40, oc, oc, 3));
+    let sc = conv(50, ic, oc, 1);
+    let x = mk(60, ic * h * w);
+
+    // CPU reference: norm+silu → conv ×2 → shortcut → add.
+    let silu_v = |t: &mut Vec<f32>| {
+        for v in t.iter_mut() {
+            *v /= 1.0 + (-*v).exp();
+        }
+    };
+    let mut t = x.clone();
+    n1.apply(&mut t, h, w);
+    silu_v(&mut t);
+    let mut t = c1.apply(&t, h, w);
+    n2.apply(&mut t, h, w);
+    silu_v(&mut t);
+    let t = c2.apply(&t, h, w);
+    let skip = sc.apply(&x, h, w);
+    let want: Vec<f32> = skip.iter().zip(&t).map(|(a, b)| a + b).collect();
+
+    let args = cortiq_engine::gpu::VaeResnetArgs {
+        groups,
+        ic,
+        oc,
+        h,
+        w,
+        n1w: &n1.w,
+        n1b: &n1.b,
+        c1w: &c1.w,
+        c1b: &c1.b,
+        c1k: 3,
+        n2w: &n2.w,
+        n2b: &n2.b,
+        c2w: &c2.w,
+        c2b: &c2.b,
+        c2k: 3,
+        shortcut: Some((&sc.w, &sc.b, 1)),
+    };
+    let mut got = vec![0f32; oc * h * w];
+    assert!(
+        cortiq_engine::gpu::vae_resnet(&args, &x, &mut got),
+        "gpu vae_resnet refused"
+    );
+    let mut max_rel = 0f64;
+    for (g, wv) in got.iter().zip(&want) {
+        let d = (*g as f64 - *wv as f64).abs();
+        max_rel = max_rel.max(d / (*wv as f64).abs().max(1.0));
+    }
+    println!("gpu vae resnet max rel dev {max_rel:.2e}");
+    assert!(max_rel < 2e-2, "gpu vae resnet diverged: {max_rel}");
+
+    // Upsample+conv fusion vs CPU (nearest 2× then conv).
+    let upc = conv(70, ic, ic, 3);
+    let mut got_up = vec![0f32; ic * 4 * h * w];
+    assert!(
+        cortiq_engine::gpu::vae_upsample_conv(
+            &upc.w, &upc.b, &x, ic, ic, h, w, 3, &mut got_up
+        ),
+        "gpu vae_upsample_conv refused"
+    );
+    let mut xu = vec![0f32; ic * 4 * h * w];
+    for ci in 0..ic {
+        for yy in 0..2 * h {
+            for xx in 0..2 * w {
+                xu[ci * 4 * h * w + yy * 2 * w + xx] = x[ci * h * w + (yy / 2) * w + xx / 2];
+            }
+        }
+    }
+    let want_up = upc.apply(&xu, 2 * h, 2 * w);
+    let mut max_rel = 0f64;
+    for (g, wv) in got_up.iter().zip(&want_up) {
+        let d = (*g as f64 - *wv as f64).abs();
+        max_rel = max_rel.max(d / (*wv as f64).abs().max(1.0));
+    }
+    println!("gpu vae upsample+conv max rel dev {max_rel:.2e}");
+    assert!(max_rel < 2e-2, "gpu vae upsample+conv diverged: {max_rel}");
+}
+
+#[test]
 fn gpu_dit_attention_matches_reference() {
     if !require_metal() {
         return;

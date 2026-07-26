@@ -284,6 +284,37 @@ struct ResnetBlock {
 
 impl ResnetBlock {
     fn apply(&self, x: &[f32], h: usize, w: usize) -> Vec<f32> {
+        let (ic, oc) = (self.conv1.ic, self.conv1.oc);
+        // Whole block on the device when the convs have real work —
+        // one upload/download instead of 2–3 per conv, and the
+        // norm/silu glue never touches the CPU.
+        if h * w * ic * oc >= 1 << 26 && crate::gpu::enabled_here() {
+            let mut out = vec![0f32; oc * h * w];
+            let args = crate::gpu::VaeResnetArgs {
+                groups: self.norm1.g,
+                ic,
+                oc,
+                h,
+                w,
+                n1w: &self.norm1.w,
+                n1b: &self.norm1.b,
+                c1w: &self.conv1.w,
+                c1b: &self.conv1.b,
+                c1k: self.conv1.k,
+                n2w: &self.norm2.w,
+                n2b: &self.norm2.b,
+                c2w: &self.conv2.w,
+                c2b: &self.conv2.b,
+                c2k: self.conv2.k,
+                shortcut: self
+                    .shortcut
+                    .as_ref()
+                    .map(|s| (s.w.as_slice(), s.b.as_slice(), s.k)),
+            };
+            if crate::gpu::vae_resnet(&args, x, &mut out) {
+                return out;
+            }
+        }
         let mut t = x.to_vec();
         self.norm1.apply(&mut t, h, w);
         silu(&mut t);
@@ -552,10 +583,29 @@ impl VaeDecoder {
             }
             if let Some(upc) = &up.upsample {
                 let c = upc.ic;
-                x = upsample2x(&x, c, h, w);
-                h *= 2;
-                w *= 2;
-                x = stage!(format!("up{ui}.conv ({h}x{w})"), upc.apply(&x, h, w));
+                let (h2, w2) = (h * 2, w * 2);
+                x = stage!(format!("up{ui}.conv ({h2}x{w2})"), {
+                    // Fused device path: only the small pre-upsample
+                    // image is uploaded.
+                    let mut fused = None;
+                    if h2 * w2 * upc.ic * upc.oc >= 1 << 26 && crate::gpu::enabled_here() {
+                        let mut o = vec![0f32; upc.oc * h2 * w2];
+                        if crate::gpu::vae_upsample_conv(
+                            &upc.w, &upc.b, &x, upc.ic, upc.oc, h, w, upc.k, &mut o,
+                        ) {
+                            fused = Some(o);
+                        }
+                    }
+                    match fused {
+                        Some(o) => o,
+                        None => {
+                            let xu = upsample2x(&x, c, h, w);
+                            upc.apply(&xu, h2, w2)
+                        }
+                    }
+                });
+                h = h2;
+                w = w2;
             }
         }
         self.norm_out.apply(&mut x, h, w);

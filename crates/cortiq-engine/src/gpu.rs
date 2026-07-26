@@ -924,6 +924,60 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &DitBlockArgs, x: &mut [f32]) -> bool
     }
 }
 
+/// One VAE resnet block for `vae_resnet`: norm/conv weights and the
+/// channel/shape geometry. `shortcut` is the 1×1 projection (w, b, k)
+/// when in/out channels differ.
+pub struct VaeResnetArgs<'a> {
+    pub groups: usize,
+    pub ic: usize,
+    pub oc: usize,
+    pub h: usize,
+    pub w: usize,
+    pub n1w: &'a [f32],
+    pub n1b: &'a [f32],
+    pub c1w: &'a [f32],
+    pub c1b: &'a [f32],
+    pub c1k: usize,
+    pub n2w: &'a [f32],
+    pub n2b: &'a [f32],
+    pub c2w: &'a [f32],
+    pub c2b: &'a [f32],
+    pub c2k: usize,
+    pub shortcut: Option<(&'a [f32], &'a [f32], usize)>,
+}
+
+/// One whole VAE resnet block on the device (norm+silu → conv ×2 →
+/// shortcut → add, one command buffer).
+#[allow(unused_variables)]
+pub fn vae_resnet(a: &VaeResnetArgs, x: &[f32], out: &mut [f32]) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::vae_resnet(a, x, out),
+        _ => false,
+    }
+}
+
+/// Nearest-2× upsample fused with the following conv — the small
+/// pre-upsample image is what crosses the CPU boundary.
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn vae_upsample_conv(
+    w: &[f32],
+    bias: &[f32],
+    x: &[f32],
+    ic: usize,
+    oc: usize,
+    h: usize,
+    w_img: usize,
+    k: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::vae_upsample_conv(w, bias, x, ic, oc, h, w_img, k, out),
+        _ => false,
+    }
+}
+
 /// VAE conv2d on the device (implicit GEMM — the CPU path pays for a
 /// multi-GB im2col matrix at high resolutions).
 #[allow(unused_variables, clippy::too_many_arguments)]
