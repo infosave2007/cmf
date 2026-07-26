@@ -398,11 +398,13 @@ CMF_GPU=1 cortiq imagine lumina-q4t.cmf \
 On macOS every modulated DiT block executes as a single Metal command
 buffer — quantized GEMMs decode their tiles in the K loop, attention
 softmax and the SwiGLU FFN stay on the device, only the hidden state
-crosses the CPU boundary. An M4 renders 512×512 / 30 steps in
-**~2.7 min** and 256×256 in ~48 s; CPU-only takes about twice as long,
-and 1024×1024 is practical on the block graph. The GPU arm is probed
-against the CPU exactly like LLM inference — enabling it never makes
-you slower — and GPU renders stay visually identical to the CPU path.
+crosses the CPU boundary — and the VAE decoder runs on the GPU too
+(conv2d as implicit GEMM, whole resnet blocks per command buffer). An
+M4 renders 256×256 / 30 steps in **~37 s** and 512×512 in ~2.5 min;
+CPU-only takes about twice as long, and 1024×1024 is practical on the
+block graph. The GPU arm is probed against the CPU exactly like LLM
+inference — enabling it never makes you slower — and GPU renders stay
+visually identical to the CPU path.
 
 ## O(1) in depth
 

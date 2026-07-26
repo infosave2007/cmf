@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.22] — 2026-07-26
+
+### Added
+- **VAE decoder on the Metal GPU**. conv2d runs as an implicit GEMM —
+  the receptive field is gathered straight from the NCHW image inside
+  the kernel's staging, where the CPU path materializes a ≥2 GB im2col
+  patch matrix per high-resolution conv (that matrix, not the GEMM,
+  was the VAE's wall). Whole resnet blocks execute in one command
+  buffer (new GroupNorm reduce/apply kernels with SiLU fused, residual
+  add on-device), and the nearest-2× upsample is fused with its
+  following conv so only the small pre-upsample image is uploaded.
+  Conv/norm weights upload once per process. VAE decode on an M4:
+  512px **7.8 → 2.9 s**, 1024px **33.4 → 14.7 s**; renders visually
+  identical (parity 9.3e-4 vs the CPU conv, pixel drift unchanged).
+- **Flash attention for the DiT** — experimental, opt-in
+  (`CMF_DIT_FLASH=1`): online softmax, no n×n scores in device
+  memory, essentially exact (3.4e-8 vs an f64 reference). The V2
+  kernel loads operand blocks straight from device memory and runs
+  its KV loop with zero threadgroup barriers, but still trails the
+  default GEMM attention chain on M4 (15.5 vs 12 ms at 512px shapes,
+  270 vs 124 ms at 1024px) — the measured dead ends are documented in
+  the gate comment, and the default path is unchanged.
+- **GPU micro-bench harness** (`CMF_BENCH=1 cargo test --test
+  gpu_q4t_bench`): the q4t GEMM at the Lumina FFN shape, the
+  attention chain at 512px/1024px sequence lengths, and the VAE
+  decode (`CMF_VAE_BENCH_HW` picks the resolution). Written for a
+  noisy machine: alternate A/B runs, trust medians.
+
+### Performance
+- 256×256 / 30 steps / CFG 4 now renders in **~37 s** end to end on
+  an M4 (0.5.20 CPU baseline: 164 s). The 512px render is VAE-bound
+  no longer; the remaining wall is the q4t GEMM itself, measured at
+  ~75% of the device's practical fp32 peak (a grid swizzle and a
+  pre-transposed K both landed inside noise — the X panel already
+  lives in the SLC).
+
 ## [0.5.21] — 2026-07-25
 
 ### Added

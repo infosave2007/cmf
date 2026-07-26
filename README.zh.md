@@ -352,10 +352,12 @@ CMF_GPU=1 cortiq imagine lumina-q4t.cmf \
 
 在 macOS 上，每个带调制的 DiT 块作为单个 Metal command buffer 执行——量化
 GEMM 在 K 循环内解码自己的 tile，注意力 softmax 和 SwiGLU FFN 都留在设备
-上，跨越 CPU 边界的只有 hidden state。M4 渲染 512×512 / 30 步约 **2.7 分
-钟**，256×256 约 48 秒；纯 CPU 大约慢一倍，1024×1024 在块图上也变得实用。
-GPU 路径与 CPU 的对比探测方式和 LLM 推理完全相同——开启 GPU 永远不会让你
-更慢——GPU 渲染与 CPU 路径在视觉上完全一致。
+上，跨越 CPU 边界的只有 hidden state——VAE 解码器同样跑在 GPU 上（conv2d
+作为 implicit GEMM，整个 resnet 块共用一个 command buffer）。M4 渲染
+256×256 / 30 步约 **37 秒**，512×512 约 2.5 分钟；纯 CPU 大约慢一倍，
+1024×1024 在块图上也变得实用。GPU 路径与 CPU 的对比探测方式和 LLM 推理
+完全相同——开启 GPU 永远不会让你更慢——GPU 渲染与 CPU 路径在视觉上完全
+一致。
 
 ## O(1) 深入解析
 
