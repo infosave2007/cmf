@@ -72,8 +72,10 @@ with dual RoPE) · gemma-4 dense 12B/31B (dual-geometry attention: sliding GQA
 · phi-3 / phi-4 (fused qkv/gate_up splits, longrope served at the native
 window) · gemma-2 (attention + final-logit soft-capping, alternating
 sliding/global layers) · DeepSeek-R1 distills (qwen2/llama layouts) —
-dense, MoE and GatedDeltaNet. Not yet: gemma-4 MoE / E-series, and
-DeepSeek V2/V3 (MLA). Anything else, try `import-gguf` — and if
+dense, MoE and GatedDeltaNet · DeepSeek-V2 MLA (V2-Lite: latent
+attention expanded to MHA, interleaved-rope undone at convert; gated
+end-to-end — Paris, ppl 8.8). Not yet: gemma-4 MoE / E-series
+(machinery merged, gate pending disk) and compressed-q V2/V3. Anything else, try `import-gguf` — and if
 it refuses, that is a bug worth filing.
 
 ## Plug it into what you already use

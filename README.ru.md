@@ -72,8 +72,10 @@ qwen-moe · gemma / gemma-3 (GeGLU, sandwich-нормы, скользящее о
 финальных логитов) · phi-3 / phi-4 (расщепление слитых qkv/gate_up, longrope
 на нативном окне) · gemma-2 (softcapping внимания и финальных логитов, чередующиеся
 sliding/global слои) · дистилляты DeepSeek-R1 (раскладки qwen2/llama) —
-dense, MoE и GatedDeltaNet. Пока нет: gemma-4 MoE / E-серия и
-DeepSeek V2/V3 (MLA). Всё остальное — пробуйте
+dense, MoE и GatedDeltaNet · DeepSeek-V2 MLA (V2-Lite: латентное
+внимание разворачивается в MHA, интерлив rope откатывается при
+конвертации; прогнано E2E — Paris, ppl 8.8). Пока нет: gemma-4 MoE /
+E-серия (код в master, гейт ждёт диска) и compressed-q V2/V3. Всё остальное — пробуйте
 `import-gguf`; и если он откажется, это ошибка, о которой стоит завести
 задачу.
 
