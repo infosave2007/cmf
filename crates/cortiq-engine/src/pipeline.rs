@@ -3289,6 +3289,9 @@ impl Pipeline {
             let mut lg = Vec::new();
             if let Some(hh) = self.try_token_graph_wgpu(hidden, position, &mut lg) {
                 let dur = t_graph.elapsed();
+                if std::env::var("CMF_GRAPH_PROF").is_ok() {
+                    eprintln!("graph-call: {:.2} ms total", dur.as_secs_f64() * 1000.0);
+                }
                 if graph_trusted || !crate::gpu::graph_race_first_token_hopeless(dur) {
                     if !graph_trusted {
                         crate::gpu::graph_race_record(true, dur);
