@@ -648,6 +648,9 @@ pub struct QwenAttnCfg<'a> {
     pub rms_eps: f64,
     /// Attention score scale (1/√head_dim unless the arch overrides).
     pub scale: f32,
+    /// Gemma-2 attention-logit soft-capping: scores pass tanh(s/c)·c
+    /// before the softmax. 0.0 = off.
+    pub softcap: f32,
     /// Sliding-window width: attend only the last N positions (Gemma-3
     /// local layers). None = full context.
     pub window: Option<usize>,
@@ -882,6 +885,7 @@ fn attend_all_heads(
     hd: usize,
     scale: f32,
     window: Option<usize>,
+    softcap: f32,
 ) -> (Vec<f32>, Vec<f32>) {
     let mut attn_out = take_buf(nh * hd);
     let mut imp = take_buf(cache.seq_len);
@@ -903,6 +907,7 @@ fn attend_all_heads(
             &mut imp,
             scale,
             first,
+            softcap,
         );
     }
     (attn_out, imp)
@@ -966,7 +971,7 @@ pub fn qwen_attention_core(
     cache.append(&p.k, &p.v, &[]);
 
     let (mut ao, mut imp) =
-        attend_all_heads(&p.q, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window);
+        attend_all_heads(&p.q, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window, cfg.softcap);
     cache.accumulate_imp(&imp);
     if cfg.output_gate {
         apply_gate(&mut ao, &p.gate);
@@ -1046,6 +1051,7 @@ pub fn qwen_attention_batch(
     #[cfg(target_arch = "aarch64")]
     let batched_attend = b >= 32
         && cache.mode == crate::kv_cache::KvMode::F32
+        && cfg.softcap == 0.0 // capped scores: per-position attend (correctness first)
         && (crate::qtensor::accel_gemm_enabled()
             || std::env::var("CMF_FORCE_NEON_GEMM")
                 .map(|v| v == "1")
@@ -1144,7 +1150,7 @@ pub fn qwen_attention_batch(
             }
         } else {
             let (mut ao, mut imp) =
-                attend_all_heads(&q, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window);
+                attend_all_heads(&q, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window, cfg.softcap);
             cache.accumulate_imp(&imp);
             if cfg.output_gate {
                 apply_gate(&mut ao, &gate);
@@ -1343,12 +1349,12 @@ pub fn qwen_attention_pair(
     // Empty alive slice = every head alive (see qwen_attention).
     cache.append(&k1, &v1, &[]);
     let (mut a1, mut imp1) =
-        attend_all_heads(&qa, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window);
+        attend_all_heads(&qa, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window, cfg.softcap);
     cache.accumulate_imp(&imp1);
 
     cache.append(&k2, &v2, &[]);
     let (mut a2, mut imp2) =
-        attend_all_heads(&qb, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window);
+        attend_all_heads(&qb, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window, cfg.softcap);
     cache.accumulate_imp(&imp2);
 
     if cfg.output_gate {
@@ -1415,6 +1421,7 @@ mod tests {
             inv_freq: &inv,
             rotary_dim: hd,
             scale: 1.0 / (hd as f32).sqrt(),
+            softcap: 0.0,
             window: None,
             v_norm: false,
             q_norm: None,
@@ -1475,6 +1482,7 @@ mod tests {
             rope_scale: 1.0,
             rms_eps: 1e-6,
             scale: 1.0 / (hd as f32).sqrt(),
+            softcap: 0.0,
             window: None,
             v_norm: false,
             norm_style: cortiq_core::NormStyle::Qwen,

@@ -322,6 +322,10 @@ pub struct ModelArch {
     /// Final-logit soft-capping: logits = C·tanh(logits/C) (Gemma-4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_logit_softcapping: Option<f64>,
+    /// Gemma-2: attention scores pass tanh(s/c)·c before the causal
+    /// softmax (attn_logit_softcapping). None = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attn_logit_softcapping: Option<f64>,
     /// Scale-less RMS normalization of V heads before caching (Gemma-4).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub attn_v_norm: bool,

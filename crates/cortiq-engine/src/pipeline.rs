@@ -173,6 +173,8 @@ pub struct Pipeline {
     pub attn_v_norm: bool,
     /// Final-logit soft-capping C: logits = C·tanh(logits/C) (Gemma-4).
     pub final_softcap: Option<f32>,
+    /// Gemma-2 attention-logit soft-capping (0.0 = off).
+    pub attn_softcap: f32,
     /// Compute per-token Born confidence (a full-vocab softmax each
     /// token). On by default; `bench --core` turns it off to match
     /// llama-bench's core timing.
@@ -525,7 +527,8 @@ impl Pipeline {
         h: &mut [f32],
     ) -> usize {
         use crate::gpu::{AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GraphDims, TokenGraph};
-        if !crate::gpu::enabled_here()
+        if self.attn_softcap > 0.0 // capped scores: no graph kernel — CPU path
+            || !crate::gpu::enabled_here()
             || !crate::gpu::q1_force()
             || std::env::var("CMF_GPU_BLOCK")
                 .map(|v| v == "0")
@@ -868,6 +871,7 @@ impl Pipeline {
                         inv_freq: &inv_freq,
                         rotary_dim: rd,
                         scale: self.attn_scale,
+            softcap: self.attn_softcap,
                         window: None,
                         v_norm: false,
                         q_norm: *q_norm,
@@ -1042,6 +1046,7 @@ impl Pipeline {
             inv_freq_global: None,
             attn_v_norm: false,
             final_softcap: None,
+            attn_softcap: 0.0,
             graph_want_logits: false,
             graph_logits: None,
             graph_kv_id: {
@@ -1170,6 +1175,7 @@ impl Pipeline {
             inv_freq: &self.inv_freq,
             rotary_dim: self.rotary_dim,
             scale: self.attn_scale,
+            softcap: self.attn_softcap,
             window: None,
             v_norm: false,
             q_norm: None,
@@ -1820,6 +1826,7 @@ impl Pipeline {
                         inv_freq: &inv_freq_l,
                         rotary_dim: rd_l,
                         scale: self.attn_scale,
+            softcap: self.attn_softcap,
                         window: self.layer_window(li),
                         v_norm: self.attn_v_norm,
                         q_norm: q_norm.as_deref(),
@@ -2482,6 +2489,7 @@ impl Pipeline {
                         inv_freq: &inv_freq_l,
                         rotary_dim: rd_l,
                         scale: self.attn_scale,
+            softcap: self.attn_softcap,
                         window: self.layer_window(li),
                         v_norm: self.attn_v_norm,
                         q_norm: q_norm.as_deref(),
@@ -2906,7 +2914,8 @@ impl Pipeline {
     ) -> Option<Vec<f32>> {
         // O(1) Nyström decode runs off the sealed state, not the KV cache the
         // graph mirrors — never take the graph while o1 is active.
-        if self.o1_active() {
+        if self.o1_active() || self.attn_softcap > 0.0 {
+            // Softcapped scores have no graph kernel yet — CPU owns them.
             return None;
         }
         let nh = self.num_heads;
@@ -3123,6 +3132,9 @@ impl Pipeline {
     /// in/out (embeddings in, layer output out); KV mirror / GDN state advance.
     /// false ⇒ unsupported → caller keeps the per-position graph.
     fn try_batch_graph_wgpu(&self, hiddens: &mut [f32], positions: &[usize], k: usize) -> bool {
+        if self.attn_softcap > 0.0 {
+            return false; // capped scores: no graph kernel — CPU path
+        }
         if self.o1_active() {
             return false;
         }
@@ -3436,6 +3448,7 @@ impl Pipeline {
                         inv_freq: &inv_freq_l,
                         rotary_dim: rd_l,
                         scale: self.attn_scale,
+            softcap: self.attn_softcap,
                         window: None,
                         v_norm: self.attn_v_norm,
                         q_norm: q_norm.as_deref(),
@@ -3566,6 +3579,7 @@ impl Pipeline {
                                 inv_freq: &inv_freq_l,
                                 rotary_dim: rd_l,
                                 scale: self.attn_scale,
+            softcap: self.attn_softcap,
                                 window: self.layer_window(li),
                                 v_norm: self.attn_v_norm,
                                 q_norm: q_norm.as_deref(),

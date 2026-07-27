@@ -70,9 +70,10 @@ qwen-moe · gemma / gemma-3 (GeGLU, sandwich norms, 512-token sliding window
 with dual RoPE) · gemma-4 dense 12B/31B (dual-geometry attention: sliding GQA
 + global MQA with V=K, proportional RoPE, layer scalars, final-logit softcap)
 · phi-3 / phi-4 (fused qkv/gate_up splits, longrope served at the native
-window) · DeepSeek-R1 distills (qwen2/llama layouts) — dense, MoE and
-GatedDeltaNet. Not yet: gemma-2 (attention softcapping), gemma-4 MoE /
-E-series, and DeepSeek V2/V3 (MLA). Anything else, try `import-gguf` — and if
+window) · gemma-2 (attention + final-logit soft-capping, alternating
+sliding/global layers) · DeepSeek-R1 distills (qwen2/llama layouts) —
+dense, MoE and GatedDeltaNet. Not yet: gemma-4 MoE / E-series, and
+DeepSeek V2/V3 (MLA). Anything else, try `import-gguf` — and if
 it refuses, that is a bug worth filing.
 
 ## Plug it into what you already use

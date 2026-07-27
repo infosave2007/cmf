@@ -123,6 +123,7 @@ fn sparse_ffn_quant_agrees_with_dequant() {
         num_global_kv_heads: None,
         global_partial_rotary_factor: None,
         final_logit_softcapping: None,
+        attn_logit_softcapping: None,
         attn_v_norm: false,
         num_loops: 1,
         loop_final_norm: false,

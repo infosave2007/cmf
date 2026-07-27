@@ -512,6 +512,7 @@ impl LayerKvCache {
         imp_acc: &mut [f32],
         scale: f32,
         first: usize,
+        softcap: f32,
     ) {
         let hd = self.head_dim;
         let nheads = q_group.len() / hd;
@@ -588,6 +589,18 @@ impl LayerKvCache {
                     for h in 0..nheads {
                         scores[h * stored + p] =
                             crate::attention::dot_f32(&q_group[h * hd..(h + 1) * hd], row) * scale;
+                    }
+                }
+            }
+
+            // Gemma-2 attention-logit soft-capping: tanh-squash the
+            // COMPUTED scores before the softmax. Out-of-window rows sit
+            // at −inf and must stay there (tanh would resurrect them at
+            // −cap), hence the finiteness guard.
+            if softcap > 0.0 {
+                for v in scores.iter_mut() {
+                    if v.is_finite() {
+                        *v = softcap * (*v / softcap).tanh();
                     }
                 }
             }
@@ -1275,6 +1288,7 @@ mod tests {
                     &mut imp,
                     1.0 / (hd as f32).sqrt(),
                     0,
+                    0.0,
                 );
                 let mut imp_ref = vec![0f32; 70];
                 for h in 0..hpk {

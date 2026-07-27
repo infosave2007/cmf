@@ -1059,21 +1059,11 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     // file. (Gemma-4's FINAL-logit capping is supported.)
     let is_gemma = mt.contains("gemma");
     let is_gemma4 = mt.contains("gemma4");
-    if tc
-        .get("attn_logit_softcapping")
-        .and_then(|v| v.as_f64())
-        .is_some()
-        || (!is_gemma4
-            && tc
-                .get("final_logit_softcapping")
-                .and_then(|v| v.as_f64())
-                .is_some())
-    {
-        anyhow::bail!(
-            "{model_type}: attention logit soft-capping (Gemma-2) is not supported yet — \
-             Gemma-1/Gemma-3/Gemma-4 convert natively"
-        );
-    }
+    // Gemma-2: attention-logit soft-capping is a supported operator
+    // (tanh(s/c)·c before the causal softmax); its every-other-layer
+    // sliding schedule maps onto sliding_window_pattern = 2 (full
+    // attention at odd indices), same machinery as gemma-3/Laguna.
+    let is_gemma2 = mt.contains("gemma2");
     // Gemma-4 (text tower): plain x̂·w norms (unlike gemma-3), dual-geometry
     // attention (sliding GQA at head_dim + global MQA at global_head_dim
     // with proportional partial rotary), scale-less V-norm, per-layer
@@ -1258,9 +1248,14 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             .and_then(|v| v.as_f64())
             .or(if is_gemma4 { Some(1.0) } else { None }),
         sliding_window: cfg_usize(tc, "sliding_window").filter(|_| {
-            is_laguna || tc.get("sliding_window_pattern").is_some() || g4_pattern.is_some()
+            is_laguna
+                || is_gemma2
+                || tc.get("sliding_window_pattern").is_some()
+                || g4_pattern.is_some()
         }),
-        sliding_window_pattern: cfg_usize(tc, "sliding_window_pattern").or(g4_pattern),
+        sliding_window_pattern: cfg_usize(tc, "sliding_window_pattern")
+            .or(g4_pattern)
+            .or(if is_gemma2 { Some(2) } else { None }),
         rope_local_base_freq: tc
             .get("rope_local_base_freq")
             .and_then(|v| v.as_f64())
@@ -1274,11 +1269,8 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         global_head_dim: cfg_usize(tc, "global_head_dim").filter(|_| is_gemma4),
         num_global_kv_heads: cfg_usize(tc, "num_global_key_value_heads").filter(|_| is_gemma4),
         global_partial_rotary_factor: g4_global_prf,
-        final_logit_softcapping: if is_gemma4 {
-            tc.get("final_logit_softcapping").and_then(|v| v.as_f64())
-        } else {
-            None
-        },
+        final_logit_softcapping: tc.get("final_logit_softcapping").and_then(|v| v.as_f64()),
+        attn_logit_softcapping: tc.get("attn_logit_softcapping").and_then(|v| v.as_f64()),
         attn_v_norm: is_gemma4,
         // Looped Transformer (Nanbeige 4.2): re-apply the layer stack num_loops times.
         num_loops: cfg_usize(tc, "num_loops").unwrap_or(1),

@@ -745,6 +745,7 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         .to_string();
     let g = |k: &str| md.get(&format!("{arch}.{k}"));
     let gu = |k: &str| g(k).and_then(|v| v.as_u64()).map(|x| x as usize);
+    let gf = |k: &str| g(k).and_then(|v| v.as_f64());
     let n_layers = gu("block_count").ok_or_else(|| anyhow::anyhow!("gguf: no block_count"))?;
     let hidden =
         gu("embedding_length").ok_or_else(|| anyhow::anyhow!("gguf: no embedding_length"))?;
@@ -761,6 +762,7 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         })
         .unwrap_or(0);
     let is_q35 = arch.starts_with("qwen35");
+    let is_gemma2 = arch == "gemma2";
     let norm_style = if arch.contains("gemma") || is_q35 {
         // qwen3.5 / qwen3.6 use zero-centered x̂·(1+w) norms.
         NormStyle::Gemma
@@ -859,14 +861,19 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         hidden_act: "silu".into(),
         embed_multiplier: 1.0,
         query_pre_attn_scalar: None,
-        sliding_window: None,
-        sliding_window_pattern: None,
+        sliding_window: if is_gemma2 { gu("attention.sliding_window") } else { None },
+        sliding_window_pattern: if is_gemma2 { Some(2) } else { None },
         rope_local_base_freq: None,
         local_partial_rotary_factor: None,
         global_head_dim: None,
         num_global_kv_heads: None,
         global_partial_rotary_factor: None,
-        final_logit_softcapping: None,
+        final_logit_softcapping: gf("attn_logit_softcapping")
+            .is_some()
+            .then(|| gf("final_logit_softcapping"))
+            .flatten()
+            .map(|v| v as f64),
+        attn_logit_softcapping: gf("attn_logit_softcapping").map(|v| v as f64),
         attn_v_norm: false,
         num_loops: 1,
         loop_final_norm: false,

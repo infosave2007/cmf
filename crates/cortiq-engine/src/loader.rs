@@ -974,6 +974,7 @@ impl Pipeline {
         }
         pipeline.attn_v_norm = arch.attn_v_norm;
         pipeline.final_softcap = arch.final_logit_softcapping.map(|c| c as f32);
+        pipeline.attn_softcap = arch.attn_logit_softcapping.unwrap_or(0.0) as f32;
         pipeline.vmf_cfg = vmf_cfg;
         pipeline.gdn_cfg = gdn_cfg;
         pipeline.short_conv_cfg = short_conv_cfg;
@@ -1010,6 +1011,13 @@ impl Pipeline {
                 .and_then(crate::nystrom::O1Cfg::from_json),
         };
         if o1.is_some() {
+            if pipeline.attn_softcap > 0.0 {
+                return Err(CmfError::Parse(
+                    "--o1 with attention-logit soft-capping (Gemma-2) is not supported: \
+                     the streaming operator has no capped-score form"
+                        .into(),
+                ));
+            }
             pipeline.set_o1(o1);
         }
         Ok(pipeline)

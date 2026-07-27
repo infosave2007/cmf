@@ -70,9 +70,10 @@ qwen-moe · gemma / gemma-3 (GeGLU, sandwich-нормы, скользящее о
 двойным RoPE) · gemma-4 dense 12B/31B (двухрежимное внимание: скользящий GQA
 + глобальный MQA с V=K, пропорциональный RoPE, послойные скаляры, софткап
 финальных логитов) · phi-3 / phi-4 (расщепление слитых qkv/gate_up, longrope
-на нативном окне) · дистилляты DeepSeek-R1 (раскладки qwen2/llama) — dense,
-MoE и GatedDeltaNet. Пока нет: gemma-2 (softcapping внимания), gemma-4
-MoE / E-серия и DeepSeek V2/V3 (MLA). Всё остальное — пробуйте
+на нативном окне) · gemma-2 (softcapping внимания и финальных логитов, чередующиеся
+sliding/global слои) · дистилляты DeepSeek-R1 (раскладки qwen2/llama) —
+dense, MoE и GatedDeltaNet. Пока нет: gemma-4 MoE / E-серия и
+DeepSeek V2/V3 (MLA). Всё остальное — пробуйте
 `import-gguf`; и если он откажется, это ошибка, о которой стоит завести
 задачу.
 
