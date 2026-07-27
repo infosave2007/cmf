@@ -674,11 +674,23 @@ impl Pipeline {
             // Gemma-4 global layers legitimately have nh·global_head_dim
             // rows (which can equal 2·nh·hd) — never gated.
             let output_gate = arch.global_head_dim.is_none() && wq.rows() == 2 * nh * arch.head_dim;
-            if !output_gate && wq.rows() != nh * arch.head_dim {
+            // Gemma-4 global layers run MQA at global_head_dim — their
+            // q_proj legitimately carries nh·ghd rows.
+            let is_global_layer = arch.global_head_dim.is_some()
+                && layer.is_some_and(|li| {
+                    arch.sliding_window_pattern
+                        .is_some_and(|p| p > 0 && (li + 1) % p == 0)
+                });
+            let expect = if is_global_layer {
+                nh * arch.global_head_dim.unwrap_or(arch.head_dim)
+            } else {
+                nh * arch.head_dim
+            };
+            if !output_gate && wq.rows() != expect {
                 return Err(CmfError::Parse(format!(
                     "{prefix}self_attn.q_proj.weight rows={} != heads({nh}) * head_dim({})",
                     wq.rows(),
-                    arch.head_dim
+                    expect / nh.max(1)
                 )));
             }
             let gate_name = format!("{prefix}self_attn.g_proj.weight");
@@ -1039,11 +1051,21 @@ impl Pipeline {
             }
             pipeline.inv_freq_global = Some(std::sync::Arc::new(f));
             // Re-shape the global layers' KV storage to their geometry.
-            if let Some((_, p)) = pipeline.swa {
-                for li in 0..arch.num_layers {
-                    if (li + 1) % p.max(1) == 0 {
-                        pipeline.kv_cache.layers[li] = crate::kv_cache::LayerKvCache::new(gkv, ghd);
-                    }
+            // An explicit layer_types map wins over the numeric pattern
+            // (explicit tags set swa's pattern to usize::MAX, which
+            // would otherwise leave every global cache mis-shaped).
+            let global_at = |li: usize| -> bool {
+                match &pipeline.sliding_layers {
+                    Some(map) => !map.get(li).copied().unwrap_or(false),
+                    None => pipeline
+                        .swa
+                        .map(|(_, p)| p > 0 && p != usize::MAX && (li + 1) % p == 0)
+                        .unwrap_or(false),
+                }
+            };
+            for li in 0..arch.num_layers {
+                if global_at(li) {
+                    pipeline.kv_cache.layers[li] = crate::kv_cache::LayerKvCache::new(gkv, ghd);
                 }
             }
         }
