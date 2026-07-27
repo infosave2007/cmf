@@ -368,9 +368,14 @@ pub enum AttnKind {
 
 /// DeepSeek-V2 MLA projections (see `AttnKind::Mla`).
 pub struct MlaWeights {
-    /// `[nh·(rope+nope), hidden]` — the converter permutes each head to
-    /// rope-first so rotary_dim = qk_rope works unchanged.
+    /// `[nh·(rope+nope), hidden]` (or `[…, q_lora]` when compressed) —
+    /// the converter permutes each head rope-first so rotary_dim =
+    /// qk_rope works unchanged.
     pub q_proj: QTensor,
+    /// Compressed q (K3/V3 class): x → q_a `[q_lora, hidden]` →
+    /// rms(q_a_norm) → q_proj (= q_b). None = direct q (V2-Lite).
+    pub q_a: Option<QTensor>,
+    pub q_a_norm: Option<Vec<f32>>,
     /// `kv_a_proj_with_mqa` `[lora + rope, hidden]` (latent first).
     pub kv_a: QTensor,
     /// RMS-norm weights over the latent (`kv_a_layernorm`, [lora]).
@@ -4692,7 +4697,15 @@ fn mla_attention(
     let (nh, dr, dn, dv, lora) = (w.nh, w.qk_rope, w.qk_nope, w.v_dim, w.lora);
     let hd = dr + dn;
     let mut q = vec![0.0f32; nh * hd];
-    w.q_proj.matvec(normed, &mut q, pool);
+    match (&w.q_a, &w.q_a_norm) {
+        (Some(qa), Some(qn)) => {
+            let mut t = vec![0.0f32; qa.rows()];
+            qa.matvec(normed, &mut t, pool);
+            let tn = inference::rms_norm(&t, qn, eps, NormStyle::Qwen);
+            w.q_proj.matvec(&tn, &mut q, pool);
+        }
+        _ => w.q_proj.matvec(normed, &mut q, pool),
+    }
     let mut ca = vec![0.0f32; lora + dr];
     w.kv_a.matvec(normed, &mut ca, pool);
     let (c_lat, k_rope) = ca.split_at_mut(lora);

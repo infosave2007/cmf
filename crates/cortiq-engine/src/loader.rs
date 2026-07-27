@@ -621,14 +621,18 @@ impl Pipeline {
             };
             // DeepSeek-V2 MLA: the latent projections replace the k/v pair.
             if let Some(mla) = arch.mla.as_ref() {
-                if mla.q_lora_rank.is_some() {
-                    return Err(CmfError::Parse(
-                        "MLA with compressed q (q_lora_rank) is not supported yet — \
-                         DeepSeek-V2-Lite converts natively"
-                            .into(),
-                    ));
-                }
-                let q_proj = t("self_attn.q_proj.weight")?;
+                // Compressed q (K3/V3): q_a → rms → q_b; direct otherwise.
+                let (q_proj, q_a, q_a_norm) = if mla.q_lora_rank.is_some() {
+                    (
+                        t("self_attn.q_b_proj.weight")?,
+                        Some(t("self_attn.q_a_proj.weight")?),
+                        Some(n("self_attn.q_a_layernorm.weight").ok_or_else(|| {
+                            CmfError::Parse(format!("{prefix}: MLA needs q_a_layernorm"))
+                        })?),
+                    )
+                } else {
+                    (t("self_attn.q_proj.weight")?, None, None)
+                };
                 let hd = mla.qk_rope_head_dim + mla.qk_nope_head_dim;
                 let nh = q_proj.rows() / hd;
                 // YaRN mscale²: DeepSeek corrects the softmax scale by
@@ -642,6 +646,8 @@ impl Pipeline {
                 }
                 return Ok(AttnKind::Mla(Box::new(crate::pipeline::MlaWeights {
                     q_proj,
+                    q_a,
+                    q_a_norm,
                     kv_a: t("self_attn.kv_a_proj_with_mqa.weight")?,
                     kv_a_norm: n("self_attn.kv_a_layernorm.weight").ok_or_else(|| {
                         CmfError::Parse(format!("{prefix}: MLA needs kv_a_layernorm"))
