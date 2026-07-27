@@ -144,7 +144,7 @@ pub(crate) fn build_layer_ffn(
             gate_proj,
             up_proj,
             down_proj,
-            act: crate::pipeline::Act::from_arch(&arch.hidden_act),
+            act: crate::pipeline::Act::from_arch_full(arch),
         })
     };
     let router_name = format!("{prefix}mlp.gate.weight");
@@ -911,7 +911,7 @@ impl Pipeline {
                             false,
                             ov,
                         )?,
-                        act: crate::pipeline::Act::from_arch(&arch.hidden_act),
+                        act: crate::pipeline::Act::from_arch_full(&arch),
                     }),
                     attn,
                 },

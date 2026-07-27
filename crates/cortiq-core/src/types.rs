@@ -343,6 +343,11 @@ pub struct ModelArch {
     /// DeepSeek-V2 MLA block; None for every other family.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mla: Option<MlaConfig>,
+    /// Kimi-K3 situ activation betas (hidden_act == "situ").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_situ_beta: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_situ_linear_beta: Option<f64>,
     /// Gemma-2: attention scores pass tanh(s/c)·c before the causal
     /// softmax (attn_logit_softcapping). None = off.
     #[serde(default, skip_serializing_if = "Option::is_none")]

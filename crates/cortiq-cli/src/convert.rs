@@ -1292,6 +1292,10 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         final_logit_softcapping: tc.get("final_logit_softcapping").and_then(|v| v.as_f64()),
         attn_logit_softcapping: tc.get("attn_logit_softcapping").and_then(|v| v.as_f64()),
         mla,
+        activation_situ_beta: tc.get("activation_situ_beta").and_then(|v| v.as_f64()),
+        activation_situ_linear_beta: tc
+            .get("activation_situ_linear_beta")
+            .and_then(|v| v.as_f64()),
         attn_v_norm: is_gemma4,
         // Looped Transformer (Nanbeige 4.2): re-apply the layer stack num_loops times.
         num_loops: cfg_usize(tc, "num_loops").unwrap_or(1),

@@ -58,6 +58,8 @@ fn arch() -> ModelArch {
         final_logit_softcapping: None,
         attn_logit_softcapping: None,
         mla: None,
+        activation_situ_beta: None,
+        activation_situ_linear_beta: None,
         attn_v_norm: false,
         num_loops: 1,
         loop_final_norm: false,

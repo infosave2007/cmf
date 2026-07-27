@@ -223,11 +223,14 @@ pub struct LayerWeights {
 
 /// FFN gate activation: SiLU (SwiGLU family) or tanh-GELU (Gemma's
 /// GeGLU). A property of the model, carried on every FFN triple.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum Act {
     #[default]
     Silu,
     GeluTanh,
+    /// Kimi-K3 SituAndMul: BOTH halves transform —
+    /// a = β·tanh(g/β)·σ(g), up' = linβ·tanh(u/linβ) (linβ>0), out = a·up'.
+    Situ { beta: f32, linear_beta: f32 },
 }
 
 impl Act {
@@ -239,11 +242,35 @@ impl Act {
         }
     }
 
+    /// Arch-driven constructor (activation name + situ betas).
+    pub fn from_arch_full(arch: &cortiq_core::ModelArch) -> Self {
+        match arch.hidden_act.as_str() {
+            "situ" => Self::Situ {
+                beta: arch.activation_situ_beta.unwrap_or(1.0) as f32,
+                linear_beta: arch.activation_situ_linear_beta.unwrap_or(0.0) as f32,
+            },
+            other => Self::from_arch(other),
+        }
+    }
+
     #[inline]
     pub fn apply(self, x: f32) -> f32 {
         match self {
             Self::Silu => inference::silu(x),
             Self::GeluTanh => inference::gelu_tanh(x),
+            Self::Situ { beta, .. } => beta * (x / beta).tanh() * (1.0 / (1.0 + (-x).exp())),
+        }
+    }
+
+    /// Gated combine — the FFN contract. Situ transforms the UP half
+    /// too, so callers must use this instead of apply(g)·u.
+    #[inline]
+    pub fn combine(self, g: f32, u: f32) -> f32 {
+        match self {
+            Self::Situ { linear_beta, .. } if linear_beta > 0.0 => {
+                self.apply(g) * (linear_beta * (u / linear_beta).tanh())
+            }
+            _ => self.apply(g) * u,
         }
     }
 }
@@ -4128,7 +4155,7 @@ fn dense_ffn_batch(d: &DenseFfn, xs: &[f32], b: usize, pool: Option<&Pool>) -> V
     let mut u = vec![0.0f32; b * inter];
     d.up_proj.matmat(xs, b, &mut u, pool);
     for i in 0..b * inter {
-        g[i] = d.act.apply(g[i]) * u[i];
+        g[i] = d.act.combine(g[i], u[i]);
     }
     let mut out = vec![0.0f32; b * hidden];
     d.down_proj.matmat(&g, b, &mut out, pool);
@@ -4268,7 +4295,7 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
             // Multi-matrix job: gate+up under one pool dispatch.
             QTensor::matvec_many([&d.gate_proj, &d.up_proj], x, [g, u], pool);
             for i in 0..inter {
-                g[i] = d.act.apply(g[i]) * u[i];
+                g[i] = d.act.combine(g[i], u[i]);
             }
         }
         // DTG-MA bake probe (Patent 2): accumulate this layer's
@@ -4455,7 +4482,7 @@ fn sparse_ffn_quant(
         };
         let gate = d.gate_proj.row_dot(idx, x, &mut s);
         let up = d.up_proj.row_dot(idx, x, &mut s);
-        d.act.apply(gate) * up
+        d.act.combine(gate, up)
     };
     match pool {
         Some(p) if n >= 256 => {
@@ -4868,8 +4895,8 @@ fn ffn_forward_pair(
             pool,
         );
         for i in 0..inter {
-            g1[i] = d.act.apply(g1[i]) * u1[i];
-            g2[i] = d.act.apply(g2[i]) * u2[i];
+            g1[i] = d.act.combine(g1[i], u1[i]);
+            g2[i] = d.act.combine(g2[i], u2[i]);
         }
         let mut o1 = attention::take_buf(d.down_proj.rows());
         let mut o2 = attention::take_buf(d.down_proj.rows());
