@@ -364,11 +364,25 @@ One mask blob (sizes derived from arch, no internal headers):
 [n_layers × ffn_bytes]   FFN bitfields      ffn_bytes  = ceil(intermediate_size / 8)
 [n_layers × head_bytes]  head bitfields     head_bytes = ceil(num_attention_heads / 8)
 [gates_bytes]            layer_gates        gates_bytes = ceil(num_layers / 8)
+[n_layers × expert_bytes] expert bitfields  OPTIONAL — only when the mask's meta
+                                            sets "has_expert_fields": true;
+                                            expert_bytes = ceil(moe.num_experts / 8)
 ```
 
 Bit order is LSB-first: neuron `i` = bit `i % 8` of byte `i / 8`; bit
 set → active. **Tail bits beyond the dimension MUST be zero** (or
 popcount sees phantom neurons/heads).
+
+The optional expert area (additive: old readers never look past the
+gates, and each mask's `blob_len` is explicit) makes a task mask narrow
+MoE ROUTING: bit `e` of layer `l`'s row set → expert `e` is routable
+for this task; selection then happens over the routable set only, the
+router softmax renormalizing over it. This is the runtime-switchable
+twin of §11.1's physical expert defrag — one file with the full expert
+set serves many specialists (`cortiq moe-mask` writes such masks,
+`run --task <name>` activates one; verified token-identical to the
+equivalent runtime restriction). A layer whose row is all-ones is
+unrestricted; a mask without the area restricts nothing.
 
 ### 5.1 Mask JSON meta
 

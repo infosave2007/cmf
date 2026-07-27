@@ -587,6 +587,7 @@ pub fn run_skill_add(
             ffn_masks: ffn_bits,
             head_masks: vec![vec![0xffu8; nh_bytes(model.arch().num_attention_heads)]; num_layers],
             layer_gates: vec![true; num_layers],
+            expert_masks: Vec::new(),
             parent: None,
             priority: MaskPriority::Normal,
             has_hot_pack: false,

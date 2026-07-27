@@ -430,6 +430,19 @@ impl ModelArch {
     pub fn mask_blob_len(&self) -> usize {
         self.num_layers * (self.ffn_mask_bytes() + self.head_mask_bytes()) + self.gates_mask_bytes()
     }
+
+    /// Bytes per MoE-expert bitfield row (one layer); 0 for dense models.
+    pub fn expert_mask_bytes(&self) -> usize {
+        self.moe
+            .as_ref()
+            .map(|m| m.num_experts.div_ceil(8))
+            .unwrap_or(0)
+    }
+
+    /// Blob size when the optional expert area (spec §5) is present.
+    pub fn mask_blob_len_with_experts(&self) -> usize {
+        self.mask_blob_len() + self.num_layers * self.expert_mask_bytes()
+    }
 }
 
 /// Execution mode determined at runtime. Only implemented modes exist

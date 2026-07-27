@@ -303,6 +303,25 @@ enum Commands {
         #[arg(long)]
         output: String,
     },
+    /// Bake a task's expert restriction as a switchable task mask
+    /// (spec §5 expert fields): the full expert set stays, `run --task`
+    /// narrows routing at inference — one file, many specialists.
+    MoeMask {
+        /// Source .cmf model
+        model: String,
+        /// Expert-selection stats JSON (CMF_MOE_STATS dump)
+        #[arg(long)]
+        stats: String,
+        /// Per-layer routing-mass fraction to keep (0–1]
+        #[arg(long, default_value = "0.95")]
+        cover: f64,
+        /// Task name for the mask (activate with `run --task <name>`)
+        #[arg(long)]
+        name: String,
+        /// Output .cmf path
+        #[arg(long)]
+        output: String,
+    },
     /// Drop the MoE experts a task never routes to (physical defrag: kept
     /// experts renumbered, router rows sliced). Stats from CMF_MOE_STATS
     /// over a task-representative run; gate the result on `cortiq ppl`.
@@ -958,6 +977,13 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Compact { model, output } => moedefrag::cmd_compact(&model, &output),
+        Commands::MoeMask {
+            model,
+            stats,
+            cover,
+            name,
+            output,
+        } => moedefrag::cmd_moe_mask(&model, &stats, cover, &name, &output),
         Commands::MoeDefrag {
             model,
             stats,

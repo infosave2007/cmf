@@ -291,11 +291,22 @@ k 个的页面 —— 与技能相同的驻留机制。每个专家是一个
 [n_layers × ffn_bytes]   FFN bitfields      ffn_bytes  = ceil(intermediate_size / 8)
 [n_layers × head_bytes]  head bitfields     head_bytes = ceil(num_attention_heads / 8)
 [gates_bytes]            layer_gates        gates_bytes = ceil(num_layers / 8)
+[n_layers × expert_bytes] expert bitfields  可选——仅当该掩码的 meta 设置
+                                            "has_expert_fields": true；
+                                            expert_bytes = ceil(moe.num_experts / 8)
 ```
 
 位序为 LSB 优先：神经元 `i` = 字节 `i / 8` 的第 `i % 8` 位；置位
 → 活跃。**超出维度的尾部位必须为零**（否则
 popcount 会看到幻影神经元/头）。
+
+可选的专家区域（增量式：旧读取器从不读 gates 之后的内容，且每个掩码
+的 `blob_len` 是显式的）让任务掩码收窄 MoE **路由**：第 `l` 层行的第
+`e` 位置位 → 专家 `e` 对该任务可路由；选择只在可路由集合上进行，
+路由器 softmax 在其上重新归一化。这是 §11.1 物理专家碎片整理的运行时
+可切换孪生——一个携带完整专家集的文件服务多个专才（`cortiq moe-mask`
+写入此类掩码，`run --task <名称>` 激活；已验证与等价的运行时限制逐
+词元一致）。整行为 1 的层不受限制；不带该区域的掩码不做任何收窄。
 
 ### 5.1 掩码 JSON meta
 

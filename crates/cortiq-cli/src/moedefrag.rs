@@ -62,6 +62,112 @@ pub fn cmd_compact(model_path: &str, output: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Bake a task's expert restriction as a FIRST-CLASS task mask (spec
+/// §5 expert fields) instead of cutting the file: the full expert set
+/// stays on disk, `run --task <name>` narrows routing to the mask's
+/// experts at inference — one MoE file, many switchable specialists.
+pub fn cmd_moe_mask(
+    model_path: &str,
+    stats_path: &str,
+    cover: f64,
+    name: &str,
+    output: &str,
+) -> anyhow::Result<()> {
+    if !(cover > 0.0 && cover <= 1.0) {
+        bail!("--cover must be in (0, 1]");
+    }
+    let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    let arch = model.arch().clone();
+    let Some(moe) = arch.moe.as_ref() else {
+        bail!("{model_path}: not a MoE model (no arch.moe block)");
+    };
+    let ne = moe.num_experts;
+    let stats: HashMap<String, Vec<u64>> = serde_json::from_str(
+        &std::fs::read_to_string(stats_path).with_context(|| format!("reading {stats_path}"))?,
+    )
+    .with_context(|| format!("parsing {stats_path}"))?;
+
+    let expert_b = ne.div_ceil(8);
+    let mut expert_masks: Vec<Vec<u8>> = vec![Vec::new(); arch.num_layers];
+    let mut kept_total = 0usize;
+    let mut masked_layers = 0usize;
+    for (k, counts) in &stats {
+        let Ok(li) = k.parse::<usize>() else { continue };
+        if li >= arch.num_layers || counts.len() != ne {
+            continue;
+        }
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            continue;
+        }
+        let mut order: Vec<usize> = (0..ne).collect();
+        order.sort_unstable_by_key(|&e| std::cmp::Reverse(counts[e]));
+        let mut bits = vec![0u8; expert_b];
+        let mut acc = 0u64;
+        for &e in &order {
+            bits[e / 8] |= 1 << (e % 8);
+            kept_total += 1;
+            acc += counts[e];
+            if (acc as f64) >= cover * (total as f64) {
+                break;
+            }
+        }
+        expert_masks[li] = bits;
+        masked_layers += 1;
+    }
+    if masked_layers == 0 {
+        bail!("no usable layer stats in {stats_path}");
+    }
+
+    let mut catalog = model.masks.clone();
+    if catalog.masks.iter().any(|m| m.name == name) {
+        bail!("mask '{name}' already exists in {model_path}");
+    }
+    let task_id = catalog.masks.iter().map(|m| m.task_id + 1).max().unwrap_or(1);
+    let sparsity = 1.0 - kept_total as f32 / (masked_layers * ne) as f32;
+    catalog.masks.push(cortiq_core::TaskMask {
+        task_id,
+        name: name.to_string(),
+        description: Some(format!(
+            "MoE expert mask (cover {:.0}%, {} layers)",
+            cover * 100.0,
+            masked_layers
+        )),
+        sparsity,
+        quality: None, // measure with `cortiq ppl --task` before trusting
+        ffn_masks: vec![vec![0xFF; arch.ffn_mask_bytes()]; arch.num_layers],
+        head_masks: vec![vec![0xFF; arch.head_mask_bytes()]; arch.num_layers],
+        layer_gates: vec![true; arch.num_layers],
+        expert_masks,
+        parent: None,
+        has_hot_pack: false,
+        priority: cortiq_core::MaskPriority::Normal,
+    });
+
+    let specs: Vec<TensorSpecRef> = model
+        .tensors
+        .iter()
+        .map(|entry| TensorSpecRef {
+            name: entry.name.clone(),
+            dtype: entry.dtype,
+            shape: entry.shape.iter().map(|&d| d as usize).collect(),
+            data: model.entry_bytes(entry),
+        })
+        .collect();
+    CmfModel::write_ref(
+        output,
+        &model.header,
+        &specs,
+        Some(&catalog),
+        model.vocab.as_deref(),
+    )?;
+    println!(
+        "moe-mask: '{name}' added ({masked_layers} layers, expert sparsity {:.0}%)\nactivate with: cortiq run {output} --task {name} …",
+        sparsity * 100.0
+    );
+    Ok(())
+}
+
 pub fn cmd_moe_defrag(
     model_path: &str,
     stats_path: Option<&str>,

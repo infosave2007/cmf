@@ -1666,7 +1666,7 @@ impl Pipeline {
             self.norm_style,
             &mut self.ws.p1,
         );
-        let ffn = ffn_forward(&lw.ffn, &self.ws.p1, self.pool.as_deref());
+        let ffn = ffn_forward(&lw.ffn, &self.ws.p1, self.pool.as_deref(), None);
         for (i, &f) in ffn.iter().enumerate() {
             x[i] += f;
         }
@@ -1879,7 +1879,7 @@ impl Pipeline {
                 &mut self.ws.p2,
             );
             let (f1, f2) =
-                ffn_forward_pair(&lw.ffn, &self.ws.p1, &self.ws.p2, self.pool.as_deref());
+                ffn_forward_pair(&lw.ffn, &self.ws.p1, &self.ws.p2, self.pool.as_deref(), None);
             let (f1, f2) = match &self.weights.layers[self.phys_layer(li)].ffn_out_norm {
                 Some(w) => (
                     inference::rms_norm(&f1, w, self.rms_eps, self.norm_style),
@@ -2556,7 +2556,7 @@ impl Pipeline {
             }
             let mut ffn = match &lw.ffn {
                 FfnKind::Dense(d) => dense_ffn_batch(d, &post, b, pool.as_deref()),
-                FfnKind::Moe(m) => moe_ffn_batch(m, &post, b, hs, pool.as_deref()),
+                FfnKind::Moe(m) => moe_ffn_batch(m, &post, b, hs, pool.as_deref(), None),
             };
             if let Some(w) = &lw.ffn_out_norm {
                 for bi in 0..b {
@@ -3673,13 +3673,22 @@ impl Pipeline {
                             self.pool.as_deref(),
                         )
                     }
-                    FfnKind::Moe(_) => {
-                        // MoE is already sparse by expert selection; masks
-                        // don't apply to routed experts.
-                        ffn_forward(&lw.ffn, post_normed, self.pool.as_deref())
+                    FfnKind::Moe(m) => {
+                        // MoE is sparse by expert selection; a task mask
+                        // narrows the ROUTABLE set via its expert fields
+                        // (spec §5) when it carries them.
+                        let allowed = task_mask
+                            .and_then(|tm| tm.expert_flags(li, m.experts.len()));
+                        ffn_forward(&lw.ffn, post_normed, self.pool.as_deref(), allowed.as_deref())
                     }
                 },
-                (false, _) => ffn_forward(&lw.ffn, post_normed, self.pool.as_deref()),
+                (false, _) => {
+                    let allowed = match (&lw.ffn, task_mask) {
+                        (FfnKind::Moe(m), Some(tm)) => tm.expert_flags(li, m.experts.len()),
+                        _ => None,
+                    };
+                    ffn_forward(&lw.ffn, post_normed, self.pool.as_deref(), allowed.as_deref())
+                }
             };
             let ffn_out = match &self.weights.layers[self.phys_layer(li)].ffn_out_norm {
                 Some(w) => inference::rms_norm(&ffn_out, w, self.rms_eps, self.norm_style),
@@ -3966,7 +3975,14 @@ fn dense_ffn_batch(d: &DenseFfn, xs: &[f32], b: usize, pool: Option<&Pool>) -> V
 /// Batched MoE-FFN: router batched, positions are GROUPED by expert —
 /// an expert's weights are read once for all its positions in the chunk
 /// (the main prefill-GEMM win on MoE: 960MB/token of 35B experts).
-fn moe_ffn_batch(m: &MoeFfn, xs: &[f32], b: usize, hidden: usize, pool: Option<&Pool>) -> Vec<f32> {
+fn moe_ffn_batch(
+    m: &MoeFfn,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    pool: Option<&Pool>,
+    allowed: Option<&[bool]>,
+) -> Vec<f32> {
     let ne = m.experts.len();
     let mut logits = vec![0.0f32; b * ne];
     m.router.matmat(xs, b, &mut logits, pool);
@@ -3980,7 +3996,7 @@ fn moe_ffn_batch(m: &MoeFfn, xs: &[f32], b: usize, hidden: usize, pool: Option<&
             st.resize(ne, 0);
         }
         for bi in 0..b {
-            let (idx, p, wsum) = moe_route(&logits[bi * ne..(bi + 1) * ne], m);
+            let (idx, p, wsum) = moe_route(&logits[bi * ne..(bi + 1) * ne], m, allowed);
             for &e in &idx {
                 st[e] += 1;
                 assign[e].push((bi, p[e] / wsum));
@@ -4355,7 +4371,11 @@ impl SendMut {
 /// DeepSeek-V3 `noaux_tc`: per-expert sigmoid scores, an optional
 /// selection bias (top-k CHOICE only; weights stay unbiased), a 1e-6 renorm
 /// floor and a routed scale.
-fn moe_route(logits: &[f32], m: &MoeFfn) -> (Vec<usize>, Vec<f32>, f32) {
+fn moe_route(
+    logits: &[f32],
+    m: &MoeFfn,
+    allowed: Option<&[bool]>,
+) -> (Vec<usize>, Vec<f32>, f32) {
     let ne = logits.len();
     let p: Vec<f32> = if m.router_sigmoid {
         logits.iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect()
@@ -4368,14 +4388,15 @@ fn moe_route(logits: &[f32], m: &MoeFfn) -> (Vec<usize>, Vec<f32>, f32) {
         }
         e
     };
-    let mut idx: Vec<usize> = match &m.mask {
-        // Task mask: selection happens over the allowed set only. With
-        // norm_topk the kept weights renormalize below; without it the
-        // masked mass is honestly dropped (experimental feature — gate
-        // any use on a ppl A/B).
-        Some(mask) => (0..ne).filter(|&e| mask[e]).collect(),
-        None => (0..ne).collect(),
+    // Expert restriction: the static env mask (CMF_MOE_MASK) AND the
+    // active task mask's expert fields (spec §5) both narrow the
+    // candidate set; selection happens over the admitted experts only.
+    // With norm_topk the kept weights renormalize below; without it
+    // the excluded mass is honestly dropped.
+    let admit = |e: usize| {
+        m.mask.as_ref().is_none_or(|mk| mk[e]) && allowed.is_none_or(|a| a.get(e).copied().unwrap_or(false))
     };
+    let mut idx: Vec<usize> = (0..ne).filter(|&e| admit(e)).collect();
     // Descending by selection score, lower index wins ties (torch.topk).
     match &m.expert_bias {
         Some(b) => idx.sort_unstable_by(|&x, &y| {
@@ -4418,11 +4439,11 @@ fn moe_route(logits: &[f32], m: &MoeFfn) -> (Vec<usize>, Vec<f32>, f32) {
 
 /// MoE FFN: router → top-k experts (see `moe_route`). Only selected
 /// experts' pages are touched in mmap.
-fn moe_ffn(m: &MoeFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
+fn moe_ffn(m: &MoeFfn, x: &[f32], pool: Option<&Pool>, allowed: Option<&[bool]>) -> Vec<f32> {
     let ne = m.experts.len();
     let mut logits = vec![0.0f32; ne];
     m.router.matvec(x, &mut logits, pool);
-    let (idx, p, wsum) = moe_route(&logits, m);
+    let (idx, p, wsum) = moe_route(&logits, m, allowed);
     {
         let mut st = m.stats.borrow_mut();
         if st.len() < ne {
@@ -4524,10 +4545,15 @@ fn moe_ffn_gpu(
 }
 
 /// Single-position FFN dispatch.
-fn ffn_forward(ffn: &FfnKind, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
+fn ffn_forward(
+    ffn: &FfnKind,
+    x: &[f32],
+    pool: Option<&Pool>,
+    experts_allowed: Option<&[bool]>,
+) -> Vec<f32> {
     match ffn {
         FfnKind::Dense(d) => dense_ffn(d, x, pool),
-        FfnKind::Moe(m) => moe_ffn(m, x, pool),
+        FfnKind::Moe(m) => moe_ffn(m, x, pool, experts_allowed),
     }
 }
 
@@ -4539,10 +4565,16 @@ fn ffn_forward_pair(
     x1: &[f32],
     x2: &[f32],
     pool: Option<&Pool>,
+    experts_allowed: Option<&[bool]>,
 ) -> (Vec<f32>, Vec<f32>) {
     let d = match ffn {
         FfnKind::Dense(d) => d,
-        FfnKind::Moe(m) => return (moe_ffn(m, x1, pool), moe_ffn(m, x2, pool)),
+        FfnKind::Moe(m) => {
+            return (
+                moe_ffn(m, x1, pool, experts_allowed),
+                moe_ffn(m, x2, pool, experts_allowed),
+            );
+        }
     };
     let inter = d.gate_proj.rows();
     FFN_SCRATCH.with(|s| {

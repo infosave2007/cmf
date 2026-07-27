@@ -136,6 +136,7 @@ fn mask_with_bits(
         ffn_masks: vec![ffn0, ffn1],
         head_masks: vec![head.clone(), head],
         layer_gates: vec![true, true],
+        expert_masks: Vec::new(),
         parent: None,
         has_hot_pack: false,
         priority: if task_id == 0 {

@@ -44,6 +44,12 @@ pub struct TaskMask {
     pub head_masks: Vec<Vec<u8>>,
     /// Per-layer alive flags
     pub layer_gates: Vec<bool>,
+    /// Per-layer MoE expert masks (bitfield: 1 = routable). Empty =
+    /// no expert restriction (all experts routable) — the state of
+    /// every pre-expert-mask file. Spec §5: an optional area after
+    /// the layer gates, present when the meta flag is set.
+    #[serde(default)]
+    pub expert_masks: Vec<Vec<u8>>,
     /// Parent mask name (for delta-coded masks)
     pub parent: Option<String>,
     /// Whether this mask has a precompiled hot-pack
@@ -102,6 +108,20 @@ impl TaskMask {
             .unwrap_or(0)
     }
 
+    /// Expert routability flags for a layer (true = routable), or None
+    /// when the mask carries no expert restriction.
+    pub fn expert_flags(&self, layer_idx: usize, num_experts: usize) -> Option<Vec<bool>> {
+        let mask = self.expert_masks.get(layer_idx)?;
+        if mask.is_empty() {
+            return None;
+        }
+        Some(
+            (0..num_experts)
+                .map(|e| mask.get(e / 8).map(|b| b & (1 << (e % 8)) != 0).unwrap_or(false))
+                .collect(),
+        )
+    }
+
     /// Active head flags for a layer (true = head is alive).
     pub fn head_flags(&self, layer_idx: usize, num_heads: usize) -> Vec<bool> {
         let mut flags = vec![true; num_heads];
@@ -153,6 +173,23 @@ impl TaskMask {
             if let Some(om) = other.head_masks.get(li) {
                 for (byte, &ob) in mask.iter_mut().zip(om) {
                     *byte |= ob;
+                }
+            }
+        }
+
+        // Expert fields: empty = unrestricted, and unrestricted wins a
+        // union; otherwise OR the routable sets.
+        if result.expert_masks.is_empty() || other.expert_masks.is_empty() {
+            result.expert_masks = Vec::new();
+        } else {
+            for (li, mask) in result.expert_masks.iter_mut().enumerate() {
+                match other.expert_masks.get(li) {
+                    Some(om) if !om.is_empty() && !mask.is_empty() => {
+                        for (byte, &ob) in mask.iter_mut().zip(om) {
+                            *byte |= ob;
+                        }
+                    }
+                    _ => mask.clear(),
                 }
             }
         }
@@ -315,6 +352,11 @@ struct MaskMeta {
     priority: MaskPriority,
     #[serde(default)]
     has_hot_pack: bool,
+    /// Spec §5: the blob carries the optional per-layer MoE-expert
+    /// bitfield area after the layer gates. Old readers that ignore
+    /// this flag simply never look past the gates — additive.
+    #[serde(default)]
+    has_expert_fields: bool,
     /// Blob offset relative to the start of the masks section.
     blob_off: u64,
     blob_len: u64,
@@ -327,12 +369,19 @@ pub fn encode_masks_section(catalog: &MaskCatalog, arch: &ModelArch) -> Result<V
     let ffn_b = arch.ffn_mask_bytes();
     let head_b = arch.head_mask_bytes();
     let gates_b = arch.gates_mask_bytes();
+    let expert_b = arch.expert_mask_bytes();
     let blob_len = arch.mask_blob_len();
 
-    // Build blobs first to know sizes (all blobs are equal-length by arch).
+    // Build blobs first to know sizes. Blob lengths are per-mask now:
+    // base, or base + the optional expert area (spec §5).
     let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(catalog.masks.len());
     for m in &catalog.masks {
-        let mut blob = Vec::with_capacity(blob_len);
+        let has_experts = expert_b > 0 && m.expert_masks.iter().any(|e| !e.is_empty());
+        let mut blob = Vec::with_capacity(if has_experts {
+            arch.mask_blob_len_with_experts()
+        } else {
+            blob_len
+        });
         for li in 0..arch.num_layers {
             let mut row = vec![0u8; ffn_b];
             if let Some(src) = m.ffn_masks.get(li) {
@@ -358,7 +407,27 @@ pub fn encode_masks_section(catalog: &MaskCatalog, arch: &ModelArch) -> Result<V
             }
         }
         blob.extend_from_slice(&gates);
-        debug_assert_eq!(blob.len(), blob_len);
+        if has_experts {
+            let ne = arch.moe.as_ref().map(|c| c.num_experts).unwrap_or(0);
+            for li in 0..arch.num_layers {
+                let mut row = vec![0u8; expert_b];
+                match m.expert_masks.get(li) {
+                    Some(src) if !src.is_empty() => {
+                        let n = src.len().min(expert_b);
+                        row[..n].copy_from_slice(&src[..n]);
+                        zero_tail_bits(&mut row, ne);
+                    }
+                    // A layer with no restriction inside a masked file:
+                    // all experts routable (all-ones up to num_experts).
+                    _ => {
+                        for e in 0..ne {
+                            row[e / 8] |= 1 << (e % 8);
+                        }
+                    }
+                }
+                blob.extend_from_slice(&row);
+            }
+        }
         blobs.push(blob);
     }
 
@@ -369,7 +438,7 @@ pub fn encode_masks_section(catalog: &MaskCatalog, arch: &ModelArch) -> Result<V
     let build_meta = |blobs_start: u64| -> MasksMeta {
         let mut metas = Vec::with_capacity(catalog.masks.len());
         let mut off = blobs_start;
-        for m in &catalog.masks {
+        for (m, blob) in catalog.masks.iter().zip(&blobs) {
             off = off.div_ceil(8) * 8; // 8-align each blob
             metas.push(MaskMeta {
                 task_id: m.task_id,
@@ -380,10 +449,11 @@ pub fn encode_masks_section(catalog: &MaskCatalog, arch: &ModelArch) -> Result<V
                 parent: m.parent.clone(),
                 priority: m.priority,
                 has_hot_pack: m.has_hot_pack,
+                has_expert_fields: expert_b > 0 && blob.len() > blob_len,
                 blob_off: off,
-                blob_len: blob_len as u64,
+                blob_len: blob.len() as u64,
             });
-            off += blob_len as u64;
+            off += blob.len() as u64;
         }
         MasksMeta {
             default_task: catalog.default_task.clone(),
@@ -441,14 +511,27 @@ pub fn decode_masks_section(bytes: &[u8], arch: &ModelArch) -> Result<MaskCatalo
 
     let ffn_b = arch.ffn_mask_bytes();
     let head_b = arch.head_mask_bytes();
+    let expert_b = arch.expert_mask_bytes();
     let expected_blob = arch.mask_blob_len() as u64;
+    let expected_with_experts = arch.mask_blob_len_with_experts() as u64;
 
     let mut masks = Vec::with_capacity(n_masks);
     for mm in &meta.masks {
-        if mm.blob_len != expected_blob {
+        let expected = if mm.has_expert_fields {
+            expected_with_experts
+        } else {
+            expected_blob
+        };
+        if mm.has_expert_fields && expert_b == 0 {
+            return Err(format!(
+                "mask '{}': expert fields flagged but the arch has no MoE block",
+                mm.name
+            ));
+        }
+        if mm.blob_len != expected {
             return Err(format!(
                 "mask '{}': blob_len {} != expected {} for arch",
-                mm.name, mm.blob_len, expected_blob
+                mm.name, mm.blob_len, expected
             ));
         }
         let start = usize::try_from(mm.blob_off)
@@ -478,6 +561,14 @@ pub fn decode_masks_section(bytes: &[u8], arch: &ModelArch) -> Result<MaskCatalo
         let layer_gates: Vec<bool> = (0..arch.num_layers)
             .map(|li| gates[li / 8] & (1 << (li % 8)) != 0)
             .collect();
+        let expert_masks: Vec<Vec<u8>> = if mm.has_expert_fields {
+            let base = gates_base + arch.gates_mask_bytes();
+            (0..arch.num_layers)
+                .map(|li| blob[base + li * expert_b..base + (li + 1) * expert_b].to_vec())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         masks.push(TaskMask {
             task_id: mm.task_id,
@@ -488,6 +579,7 @@ pub fn decode_masks_section(bytes: &[u8], arch: &ModelArch) -> Result<MaskCatalo
             ffn_masks,
             head_masks,
             layer_gates,
+            expert_masks,
             parent: mm.parent.clone(),
             has_hot_pack: mm.has_hot_pack,
             priority: mm.priority,
