@@ -877,7 +877,7 @@ fn finish_projection(
     Projected { q, gate, k, v }
 }
 
-fn attend_all_heads(
+pub(crate) fn attend_all_heads(
     q: &[f32],
     cache: &LayerKvCache,
     nh: usize,

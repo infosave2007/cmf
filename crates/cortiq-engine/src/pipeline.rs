@@ -356,6 +356,36 @@ pub enum AttnKind {
     /// LFM2 gated short-convolution mixer (no KV cache; conv ring state
     /// lives in the layer's `linear_state`).
     ShortConv(ShortConvWeights),
+    /// DeepSeek-V2 Multi-head Latent Attention. v1 executes it as
+    /// expand-to-MHA: the latent is projected per token, K/V expand to
+    /// every head and live in the ordinary cache (K head layout
+    /// [rope | nope] so the standard partial rotary covers the shared
+    /// rope key; V rows are zero-padded to the K head_dim and the pad
+    /// is sliced off before O). Latent-resident cache is a later
+    /// optimization, not a semantic change.
+    Mla(Box<MlaWeights>),
+}
+
+/// DeepSeek-V2 MLA projections (see `AttnKind::Mla`).
+pub struct MlaWeights {
+    /// `[nh·(rope+nope), hidden]` — the converter permutes each head to
+    /// rope-first so rotary_dim = qk_rope works unchanged.
+    pub q_proj: QTensor,
+    /// `kv_a_proj_with_mqa` `[lora + rope, hidden]` (latent first).
+    pub kv_a: QTensor,
+    /// RMS-norm weights over the latent (`kv_a_layernorm`, [lora]).
+    pub kv_a_norm: Vec<f32>,
+    /// `[nh·(nope+v), lora]` — per head [k_nope | v].
+    pub kv_b: QTensor,
+    /// `[hidden, nh·v]`.
+    pub o_proj: QTensor,
+    pub nh: usize,
+    pub qk_rope: usize,
+    pub qk_nope: usize,
+    pub v_dim: usize,
+    pub lora: usize,
+    /// Softmax scale (1/√(rope+nope), YaRN-mscale-corrected at load).
+    pub scale: f32,
 }
 
 /// Multi-token-prediction head (DeepSeek/Qwen style, spec §2.1):
@@ -1662,6 +1692,8 @@ impl Pipeline {
             &mut self.ws.n1,
         );
         let attn = match &lw.attn {
+            // MLA models carry no MTP head; this path cannot see them.
+            AttnKind::Mla(_) => unreachable!("MLA has no MTP/pair path"),
             AttnKind::Full {
                 wq,
                 wk,
@@ -1787,6 +1819,7 @@ impl Pipeline {
             );
 
             let (a1, a2) = match &lw.attn {
+                AttnKind::Mla(_) => unreachable!("MLA has no MTP/pair path"),
                 AttnKind::Linear(w) => {
                     let cfg = self.vmf_cfg.expect("linear layer without vmf_cfg");
                     let layer = &mut self.kv_cache.layers[li];
@@ -2481,6 +2514,35 @@ impl Pipeline {
                         *dst += a;
                     }
                 }
+                AttnKind::Mla(w) => {
+                    // Per-position prefill (correctness first; latent
+                    // batching is a later optimization).
+                    let inv_freq_l = self.layer_inv_freq(li);
+                    let rs = self.layer_rope_scale(li);
+                    let mut normed = vec![0.0f32; hs];
+                    for bi in 0..b {
+                        inference::rms_norm_into(
+                            &h[bi * hs..(bi + 1) * hs],
+                            &lw.input_norm,
+                            eps,
+                            norm_style,
+                            &mut normed,
+                        );
+                        let ao = mla_attention(
+                            w,
+                            &normed,
+                            &mut self.kv_cache.layers[li],
+                            start_pos + bi,
+                            &inv_freq_l,
+                            rs,
+                            eps,
+                            pool.as_deref(),
+                        );
+                        for (dst, &a) in h[bi * hs..(bi + 1) * hs].iter_mut().zip(&ao) {
+                            *dst += a;
+                        }
+                    }
+                }
                 AttnKind::Full {
                     wq,
                     wk,
@@ -2990,6 +3052,7 @@ impl Pipeline {
             let lw = &self.weights.layers[self.phys_layer(li)];
             if dbg {
                 let ak = match &lw.attn {
+                    AttnKind::Mla(_) => "Mla".into(),
                     AttnKind::Full {
                         output_gate, bias, ..
                     } => format!("Full gate={output_gate} bias={}", bias.is_some()),
@@ -3439,6 +3502,22 @@ impl Pipeline {
             );
 
             let attn_out = match &lw.attn {
+                AttnKind::Mla(w) => {
+                    let inv_freq_l = self.layer_inv_freq(li);
+                    let rs = self.layer_rope_scale(li);
+                    let eps = self.rms_eps;
+                    let pool = self.pool.clone();
+                    mla_attention(
+                        w,
+                        &self.ws.n1,
+                        &mut self.kv_cache.layers[li],
+                        position,
+                        &inv_freq_l,
+                        rs,
+                        eps,
+                        pool.as_deref(),
+                    )
+                }
                 AttnKind::Linear(w) => {
                     let cfg = self.vmf_cfg.expect("linear layer without vmf_cfg");
                     vmf_phase_forward(
@@ -4589,6 +4668,57 @@ fn moe_ffn_cpu(
         }
         attention::recycle_buf(&mut so);
     }
+    out
+}
+
+/// DeepSeek-V2 MLA forward, expand-to-MHA form (see `AttnKind::Mla`):
+/// per token the latent expands to every head's K/V and the ordinary
+/// cache + grouped attend do the rest. K head layout is [rope | nope]
+/// (rotary_dim = qk_rope rotates the shared rope key and each q head's
+/// prefix); V rows are zero-padded to the K head_dim inside the cache
+/// and the pad is sliced off before O. Born importance is not
+/// accumulated for MLA yet (no eviction interplay).
+#[allow(clippy::too_many_arguments)]
+fn mla_attention(
+    w: &MlaWeights,
+    normed: &[f32],
+    cache: &mut crate::kv_cache::LayerKvCache,
+    position: usize,
+    inv_freq: &[f32],
+    rope_scale: f32,
+    eps: f64,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let (nh, dr, dn, dv, lora) = (w.nh, w.qk_rope, w.qk_nope, w.v_dim, w.lora);
+    let hd = dr + dn;
+    let mut q = vec![0.0f32; nh * hd];
+    w.q_proj.matvec(normed, &mut q, pool);
+    let mut ca = vec![0.0f32; lora + dr];
+    w.kv_a.matvec(normed, &mut ca, pool);
+    let (c_lat, k_rope) = ca.split_at_mut(lora);
+    let latn = inference::rms_norm(c_lat, &w.kv_a_norm, eps, NormStyle::Qwen);
+    let mut kvb = vec![0.0f32; nh * (dn + dv)];
+    w.kv_b.matvec(&latn, &mut kvb, pool);
+    attention::rope_rotate_scaled(k_rope, position, inv_freq, rope_scale);
+    for h in 0..nh {
+        attention::rope_rotate_scaled(&mut q[h * hd..h * hd + dr], position, inv_freq, rope_scale);
+    }
+    let mut k = vec![0.0f32; nh * hd];
+    let mut v = vec![0.0f32; nh * hd];
+    for h in 0..nh {
+        k[h * hd..h * hd + dr].copy_from_slice(k_rope);
+        k[h * hd + dr..(h + 1) * hd].copy_from_slice(&kvb[h * (dn + dv)..h * (dn + dv) + dn]);
+        v[h * hd..h * hd + dv].copy_from_slice(&kvb[h * (dn + dv) + dn..(h + 1) * (dn + dv)]);
+    }
+    cache.append(&k, &v, &vec![true; nh]);
+    let (ao, mut imp) = attention::attend_all_heads(&q, cache, nh, 1, hd, w.scale, None, 0.0);
+    attention::recycle_buf(&mut imp);
+    let mut ov = vec![0.0f32; nh * dv];
+    for h in 0..nh {
+        ov[h * dv..(h + 1) * dv].copy_from_slice(&ao[h * hd..h * hd + dv]);
+    }
+    let mut out = vec![0.0f32; w.o_proj.rows()];
+    w.o_proj.matvec(&ov, &mut out, pool);
     out
 }
 
