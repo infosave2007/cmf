@@ -1562,6 +1562,17 @@ fn repo_files(agent: &ureq::Agent, repo: &str, token: Option<&str>) -> Vec<Strin
 /// Fetch a HF repo's convertible files (config, tokenizer, weights) into the
 /// cache, with parallel chunked downloads for the weight shards.
 pub(crate) fn hf_download(repo: &str, token: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+    Ok(hf_download_opts(repo, token, true)?.0)
+}
+
+/// `weights=false`: fetch only config/tokenizer/index and RETURN the
+/// weight-shard names without downloading them — the streaming convert
+/// pulls them one at a time (peak disk = one shard + the output).
+pub(crate) fn hf_download_opts(
+    repo: &str,
+    token: Option<&str>,
+    weights: bool,
+) -> anyhow::Result<(std::path::PathBuf, Vec<String>)> {
     let dir = hf_cache_dir(repo)?;
     let base = format!("https://huggingface.co/{repo}/resolve/main");
     let threads = hf_threads();
@@ -1641,22 +1652,25 @@ pub(crate) fn hf_download(repo: &str, token: Option<&str>) -> anyhow::Result<std
             .collect();
         shards.sort();
         shards.dedup();
-        for (i, s) in shards.iter().enumerate() {
-            eprintln!(
-                "  shard {}/{} ({threads}× parallel): {s}",
-                i + 1,
-                shards.len()
-            );
-            fetch(
-                &agent,
-                &format!("{base}/{s}"),
-                &dir.join(s),
-                token,
-                true,
-                threads,
-            )?;
+        if weights {
+            for (i, s) in shards.iter().enumerate() {
+                eprintln!(
+                    "  shard {}/{} ({threads}× parallel): {s}",
+                    i + 1,
+                    shards.len()
+                );
+                fetch(
+                    &agent,
+                    &format!("{base}/{s}"),
+                    &dir.join(s),
+                    token,
+                    true,
+                    threads,
+                )?;
+            }
         }
-    } else {
+        return Ok((dir, shards));
+    } else if weights {
         eprintln!("  model.safetensors ({threads}× parallel)");
         fetch(
             &agent,
@@ -1667,7 +1681,7 @@ pub(crate) fn hf_download(repo: &str, token: Option<&str>) -> anyhow::Result<std
             threads,
         )?;
     }
-    Ok(dir)
+    Ok((dir, vec!["model.safetensors".to_string()]))
 }
 
 /// Split a fused GDN projection (`in_proj_qkvz` or `in_proj_ba`) into the
@@ -1950,13 +1964,19 @@ pub fn run_convert(
 ) -> anyhow::Result<()> {
     let quant = parse_quant(quant)?;
 
-    // Source: a local HF directory, or an HF repo id to download.
+    // Source: a local HF directory, or an HF repo id — hub checkpoints
+    // convert STREAMED: one weight shard on disk at a time.
     let downloaded;
+    let mut stream_shards: Vec<String> = Vec::new();
+    let mut stream_repo: Option<String> = None;
     let dir: &Path = if Path::new(model).join("config.json").exists() {
         Path::new(model)
     } else if looks_like_repo(model) {
-        eprintln!("downloading {model} from Hugging Face…");
-        downloaded = hf_download(model, hf_token)?;
+        eprintln!("downloading {model} from Hugging Face (streamed)…");
+        let (d, shards) = hf_download_opts(model, hf_token, false)?;
+        stream_shards = shards;
+        stream_repo = Some(model.to_string());
+        downloaded = d;
         downloaded.as_path()
     } else {
         anyhow::bail!(
@@ -1971,7 +1991,14 @@ pub fn run_convert(
 
     // Memory-map the weights and process one tensor at a time — the raw model is
     // never fully loaded into RAM (peak ≈ the .cmf output + one tensor).
-    let files = open_model(dir)?;
+    let files = if stream_repo.is_some() {
+        Vec::new() // shards arrive one at a time below
+    } else {
+        open_model(dir)?
+    };
+    if stream_repo.is_some() && defrag.is_some() {
+        anyhow::bail!("--defrag needs a local checkpoint dir (streaming hub convert)");
+    }
 
     // Physical defragmentation plan (spec §11): drop pruned FFN neurons so
     // they are neither stored nor computed. arch.intermediate_size becomes
@@ -1991,10 +2018,29 @@ pub fn run_convert(
     let total: usize = files.iter().map(|f| f.tensors.len()).sum::<usize>().max(1);
     let mut tensors: Vec<TensorSpec> = Vec::with_capacity(total);
     let mut done = 0usize;
-    for file in &files {
+    // Tiny cross-shard tensors (gemma-4 router.scale, ~128 f32 each):
+    // stashed as shards stream by, so a projection in shard 2 can fold
+    // a scale that lived in the already-deleted shard 1.
+    let mut small_stash: std::collections::HashMap<String, Vec<f32>> =
+        std::collections::HashMap::new();
+    // Per-file conversion body, shared by the resident local path and
+    // the streaming hub path (shard downloaded → converted → DELETED;
+    // peak disk = one shard + the growing output).
+    let mut process_file = |file: &SafeTensors,
+                            files: &[SafeTensors],
+                            tensors: &mut Vec<TensorSpec>,
+                            done: &mut usize,
+                            total: usize,
+                            progress: &mut dyn FnMut(f32)|
+     -> anyhow::Result<()> {
         for m in &file.tensors {
-            done += 1;
-            progress(done as f32 / total as f32);
+            if m.name.ends_with(".router.scale") {
+                small_stash.insert(m.name.clone(), to_f32(&m.dtype, file.bytes(m))?);
+            }
+        }
+        for m in &file.tensors {
+            *done += 1;
+            progress(*done as f32 / total as f32);
             let Some(name) = canon_name(&m.name) else {
                 continue;
             };
@@ -2009,7 +2055,7 @@ pub fn run_convert(
                 let biases_name = m.name.replace(".weight", ".biases");
                 let mut scales_blob = None;
                 let mut biases_blob = None;
-                for f in &files {
+                for f in files {
                     if let Some(t) = f.tensors.iter().find(|t| t.name == scales_name) {
                         scales_blob = Some(f.bytes(t));
                     }
@@ -2133,8 +2179,28 @@ pub fn run_convert(
                     .strip_suffix(".experts.gate_up_proj")
                     .or_else(|| name.strip_suffix(".experts.down_proj"))
                     .unwrap();
+                let moe = arch.moe.as_ref().ok_or_else(|| anyhow::anyhow!("no moe cfg"))?;
+                let (mi, hid) = (moe.moe_intermediate_size, arch.hidden_size);
                 let (ne, d1, d2) = (m_shape[0], m_shape[1], m_shape[2]);
                 let is_gu = name.ends_with("gate_up_proj");
+                // Both orientations occur in the wild: standard per-expert
+                // nn.Linear [out, in] rows (gemma-4 QAT) or the packed
+                // [in, out] (Mixtral lineage). Detect by dims.
+                let row_major = if is_gu {
+                    if (d1, d2) == (2 * mi, hid) {
+                        true
+                    } else if (d1, d2) == (hid, 2 * mi) {
+                        false
+                    } else {
+                        anyhow::bail!("{name}: dims {:?} match neither orientation", m_shape)
+                    }
+                } else if (d1, d2) == (hid, mi) {
+                    true
+                } else if (d1, d2) == (mi, hid) {
+                    false
+                } else {
+                    anyhow::bail!("{name}: dims {:?} match neither orientation", m_shape)
+                };
                 for e in 0..ne {
                     let ev = &m_vals[e * d1 * d2..(e + 1) * d1 * d2];
                     let emit = |tensors: &mut Vec<TensorSpec>,
@@ -2155,44 +2221,50 @@ pub fn run_convert(
                         });
                     };
                     if is_gu {
-                        // [hidden=d1, 2·mi=d2] → gate/up each [mi, hidden].
-                        let mi = d2 / 2;
-                        let mut gate = vec![0.0f32; mi * d1];
-                        let mut up = vec![0.0f32; mi * d1];
-                        for h in 0..d1 {
-                            for r in 0..mi {
-                                gate[r * d1 + h] = ev[h * d2 + r];
-                                up[r * d1 + h] = ev[h * d2 + mi + r];
+                        let mut gate = vec![0.0f32; mi * hid];
+                        let mut up = vec![0.0f32; mi * hid];
+                        if row_major {
+                            gate.copy_from_slice(&ev[..mi * hid]);
+                            up.copy_from_slice(&ev[mi * hid..]);
+                        } else {
+                            for h in 0..hid {
+                                for r in 0..mi {
+                                    gate[r * hid + h] = ev[h * d2 + r];
+                                    up[r * hid + h] = ev[h * d2 + mi + r];
+                                }
                             }
                         }
                         emit(
-                            &mut tensors,
+                            &mut *tensors,
                             format!("{base}.mlp.experts.{e}.gate_proj.weight"),
                             &gate,
                             mi,
-                            d1,
+                            hid,
                         );
                         emit(
-                            &mut tensors,
+                            &mut *tensors,
                             format!("{base}.mlp.experts.{e}.up_proj.weight"),
                             &up,
                             mi,
-                            d1,
+                            hid,
                         );
                     } else {
-                        // [mi=d1, hidden=d2] → down [hidden, mi].
-                        let mut down = vec![0.0f32; d2 * d1];
-                        for r in 0..d1 {
-                            for h in 0..d2 {
-                                down[h * d1 + r] = ev[r * d2 + h];
+                        let mut down = vec![0.0f32; hid * mi];
+                        if row_major {
+                            down.copy_from_slice(ev);
+                        } else {
+                            for r in 0..mi {
+                                for h in 0..hid {
+                                    down[h * mi + r] = ev[r * d2 + h];
+                                }
                             }
                         }
                         emit(
-                            &mut tensors,
+                            &mut *tensors,
                             format!("{base}.mlp.experts.{e}.down_proj.weight"),
                             &down,
-                            d2,
-                            d1,
+                            hid,
+                            mi,
                         );
                     }
                 }
@@ -2203,10 +2275,12 @@ pub fn run_convert(
                 let (ne, hid) = (m_shape[0], m_shape[1]);
                 // Fold router.scale ⊙ hidden^-1/2 into the columns.
                 let scale_name = m.name.replace(".proj.weight", ".scale");
-                let mut scale_blob = None;
-                for f in &files {
-                    if let Some(t) = f.tensors.iter().find(|t| t.name == scale_name) {
-                        scale_blob = Some(to_f32(&t.dtype, f.bytes(t))?);
+                let mut scale_blob = small_stash.get(&scale_name).cloned();
+                if scale_blob.is_none() {
+                    for f in files {
+                        if let Some(t) = f.tensors.iter().find(|t| t.name == scale_name) {
+                            scale_blob = Some(to_f32(&t.dtype, f.bytes(t))?);
+                        }
                     }
                 }
                 let scale =
@@ -2414,6 +2488,40 @@ pub fn run_convert(
                 shape: m_shape.clone(),
                 data,
             });
+        }
+    
+        Ok(())
+    };
+    if let Some(repo) = stream_repo.clone() {
+        let base = format!("https://huggingface.co/{repo}/resolve/main");
+        let threads = hf_threads();
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(20))
+            .timeout_read(Duration::from_secs(300))
+            .build();
+        let ns = stream_shards.len().max(1);
+        for (si, sname) in stream_shards.iter().enumerate() {
+            eprintln!("  [stream {}/{}] {sname}", si + 1, ns);
+            fetch(
+                &agent,
+                &format!("{base}/{sname}"),
+                &dir.join(sname),
+                hf_token,
+                true,
+                threads,
+            )?;
+            let f = open_safetensors(&dir.join(sname))?;
+            let one = [f];
+            let ft = one[0].tensors.len().max(1);
+            let mut fd = 0usize;
+            let mut sub = |p: f32| progress((si as f32 + p) / ns as f32);
+            process_file(&one[0], &one, &mut tensors, &mut fd, ft, &mut sub)?;
+            drop(one);
+            let _ = fs::remove_file(dir.join(sname));
+        }
+    } else {
+        for file in &files {
+            process_file(file, &files, &mut tensors, &mut done, total, &mut progress)?;
         }
     }
 
