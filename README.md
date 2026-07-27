@@ -14,7 +14,7 @@ A `.cmf` file carries the weights, the tokenizer and the chat template together,
 checks its own integrity, and memory-maps straight off disk. The runtime is a
 small Rust core with no ML framework under it — no torch, no BLAS, no ONNX, no
 CUDA install, no C++ toolchain — running on CPU everywhere, and on GPU via wgpu
-(Vulkan / DX12 / Metal) in a source build. Converting a model takes one command
+(Vulkan / DX12 / Metal) out of the box. Converting a model takes one command
 and no Python.
 
 What makes it different: **you can convert a model's attention into a
@@ -507,8 +507,8 @@ A model that won't convert is a bug report, not a user error.
 ## Build from source
 
 ```sh
-cargo build --release --workspace
-cargo build --release --workspace --features gpu   # + wgpu → Vulkan / DX12 / Metal
+cargo build --release --workspace   # the CLI's wgpu backend (Vulkan / DX12 / Metal) is on by default
+cargo build --release -p cortiq-cli --no-default-features   # CPU-only build
 ```
 
 ```

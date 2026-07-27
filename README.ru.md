@@ -14,7 +14,7 @@ English: [README.md](README.md) · 中文: [README.zh.md](README.zh.md)
 свою целостность и отображается в память прямо с диска. Движок — небольшое ядро
 на Rust, под которым нет никакого ML-фреймворка: ни torch, ни BLAS, ни ONNX, ни
 установленной CUDA, ни компилятора C++. На CPU он работает везде, на GPU — через
-wgpu (Vulkan / DX12 / Metal) при сборке из исходников. Конвертация модели — одна
+wgpu (Vulkan / DX12 / Metal) из коробки. Конвертация модели — одна
 команда и ни строчки Python.
 
 Чем он отличается: **одним флагом внимание модели превращается в потоковый
@@ -522,8 +522,8 @@ CMF — это **0.2.x**, проект молодой: первый публич
 ## Сборка из исходников
 
 ```sh
-cargo build --release --workspace
-cargo build --release --workspace --features gpu   # + wgpu → Vulkan / DX12 / Metal
+cargo build --release --workspace   # wgpu-бэкенд CLI (Vulkan / DX12 / Metal) включён по умолчанию
+cargo build --release -p cortiq-cli --no-default-features   # CPU-only сборка
 ```
 
 ```

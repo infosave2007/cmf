@@ -12,7 +12,7 @@ English: [README.md](README.md) · Русский: [README.ru.md](README.ru.md)
 
 一个 `.cmf` 文件把权重、分词器和聊天模板装在一起，能自校验完整性，并直接从磁盘
 内存映射。运行时是一个小巧的 Rust 核心，底下没有任何 ML 框架——不用 torch、不用
-BLAS、不用 ONNX、不用装 CUDA、不用 C++ 工具链——在所有平台上跑 CPU，源码构建时还
+BLAS、不用 ONNX、不用装 CUDA、不用 C++ 工具链——在所有平台上跑 CPU，并开箱即用地
 能通过 wgpu（Vulkan / DX12 / Metal）跑 GPU。转换一个模型只需一条命令，无需 Python。
 
 它的不同之处在于：**只用一个开关，你就能把模型的注意力转换成常量内存的流式
@@ -450,8 +450,8 @@ Bug 和功能请求：[提一个 issue](https://github.com/infosave2007/cmf/issu
 ## 从源码构建
 
 ```sh
-cargo build --release --workspace
-cargo build --release --workspace --features gpu   # + wgpu → Vulkan / DX12 / Metal
+cargo build --release --workspace   # CLI 的 wgpu 后端（Vulkan / DX12 / Metal）默认开启
+cargo build --release -p cortiq-cli --no-default-features   # 纯 CPU 构建
 ```
 
 ```

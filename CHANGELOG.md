@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.26] — 2026-07-27
+
+### Changed
+- **`cargo install cortiq-cli` now includes the GPU backend by
+  default.** The `gpu` feature (wgpu → Vulkan / DX12) is on by default
+  for the CLI crate — a bare install from crates.io previously built
+  CPU-only and silently missed Vulkan, while the release binaries had
+  always shipped with it. `--no-default-features` restores the
+  CPU-only build; native Metal on macOS was and remains always in.
+
 ## [0.5.25] — 2026-07-27
 
 ### Added

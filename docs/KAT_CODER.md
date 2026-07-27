@@ -35,14 +35,13 @@ The simplest route is crates.io (Rust installs with one command from
 [rustup.rs](https://rustup.rs)):
 
 ```sh
-# macOS — Metal is always built in, nothing more to enable
 cargo install cortiq-cli
-
-# Linux / Windows — add the wgpu backend (Vulkan / DX12) for step 4a
-cargo install cortiq-cli --features gpu
 ```
 
-Already installed once? Add `--force` to upgrade in place.
+That is the whole install, on every platform: since 0.5.26 the wgpu
+backend (Vulkan / DX12) is on by default, and native Metal on macOS was
+always built in. Already installed once? Add `--force` to upgrade in
+place.
 
 Alternatively, release binaries ship with both GPU backends built in:
 
@@ -60,10 +59,10 @@ Or build from a source checkout (for hacking on cortiq itself):
 
 ```sh
 git clone https://github.com/infosave2007/cmf && cd cmf
-cargo build --release -p cortiq-cli --features gpu   # gpu = wgpu (Vulkan/DX12); Metal is always in on macOS
+cargo build --release -p cortiq-cli
 ```
 
-Check: `cortiq --version` → 0.5.25 or newer.
+Check: `cortiq --version` → 0.5.26 or newer.
 
 ## 2. Convert: GGUF → .cmf (identical on both platforms)
 

@@ -36,14 +36,13 @@ Hugging Face до GPU-декода — каждая команда в том в�
 [rustup.rs](https://rustup.rs)):
 
 ```sh
-# macOS — Metal вкомпилен всегда, ничего включать не нужно
 cargo install cortiq-cli
-
-# Linux / Windows — добавьте wgpu-бэкенд (Vulkan / DX12) для шага 4a
-cargo install cortiq-cli --features gpu
 ```
 
-Уже стоит старая версия? Добавьте `--force` для обновления на месте.
+Это вся установка, на любой платформе: с 0.5.26 wgpu-бэкенд
+(Vulkan / DX12) включён по умолчанию, а нативный Metal на macOS был
+вкомпилен всегда. Уже стоит старая версия? Добавьте `--force` для
+обновления на месте.
 
 Альтернатива — релизные бинарники, они идут сразу с обоими GPU-бэкендами:
 
@@ -61,10 +60,10 @@ tar xzf cortiq-aarch64-apple-darwin.tar.gz && sudo mv cortiq /usr/local/bin/
 
 ```sh
 git clone https://github.com/infosave2007/cmf && cd cmf
-cargo build --release -p cortiq-cli --features gpu   # gpu = wgpu (Vulkan/DX12); Metal на macOS встроен всегда
+cargo build --release -p cortiq-cli
 ```
 
-Проверка: `cortiq --version` → 0.5.25 или новее.
+Проверка: `cortiq --version` → 0.5.26 или новее.
 
 ## 2. Конвертация: GGUF → .cmf (одинаково на обеих платформах)
 
