@@ -1469,6 +1469,226 @@ fn q1t_overlay_mm(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 }
+
+// ── MoE inside the whole-token graph ────────────────────────────────────────
+// Router logits/shared-gate logit arrive from ordinary matvecs; these three
+// kernels keep the routing DECISION and every selected expert on-device, so
+// a MoE layer costs one extra pass over a dense one instead of a CPU sync.
+// Expert weights live in three per-layer concat buffers (q4t tiles, expert e
+// at u16 offset e·mat16); the SHARED expert is the last block, pinned by the
+// select kernel at slot top_k with a sigmoid weight.
+
+struct MoeSelP { n_exp: u32, top_k: u32, norm: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       ms_logit : array<f32>;
+@group(0) @binding(1) var<storage, read>       ms_slog  : array<f32>;
+@group(0) @binding(2) var<storage, read_write> ms_sel   : array<u32>;
+@group(0) @binding(3) var<storage, read_write> ms_w     : array<f32>;
+@group(0) @binding(4) var<uniform>             ms_p     : MoeSelP;
+var<workgroup> ms_lg:  array<f32, 256>;
+var<workgroup> ms_red: array<f32, 256>;
+var<workgroup> ms_ri:  array<u32, 256>;
+var<workgroup> ms_pick: u32;
+
+// One workgroup, ALL-parallel: softmax reductions, then k rounds of an
+// argmax reduce (the selected logit is neutralized between rounds). A
+// serial one-thread top-k here measured ~270 ns per L2-latency-bound
+// probe — 22 ms/token across 40 layers at k=8, the whole decode wall.
+// Ties pick the LOWEST index, matching the CPU scan. n_exp ≤ 256.
+@compute @workgroup_size(256)
+fn moe_select(@builtin(local_invocation_index) lid: u32) {
+    let n = ms_p.n_exp;
+    var v = -3.0e38;
+    if (lid < n) { v = ms_logit[lid]; }
+    ms_lg[lid] = v;
+    ms_red[lid] = v;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { ms_red[lid] = max(ms_red[lid], ms_red[lid + stride]); }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let mx = ms_red[0];
+    workgroupBarrier();
+    ms_red[lid] = select(0.0, exp(v - mx), lid < n);
+    workgroupBarrier();
+    stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { ms_red[lid] = ms_red[lid] + ms_red[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let denom = ms_red[0];
+    workgroupBarrier();
+    let k = ms_p.top_k;
+    var wsum = 0.0;
+    for (var slot = 0u; slot < k; slot = slot + 1u) {
+        ms_red[lid] = ms_lg[lid];
+        ms_ri[lid] = lid;
+        workgroupBarrier();
+        stride = 128u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid < stride) {
+                let a = ms_red[lid];
+                let b = ms_red[lid + stride];
+                let ia = ms_ri[lid];
+                let ib = ms_ri[lid + stride];
+                if (b > a || (b == a && ib < ia)) {
+                    ms_red[lid] = b;
+                    ms_ri[lid] = ib;
+                }
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lid == 0u) {
+            let bi = ms_ri[0];
+            ms_sel[slot] = bi;
+            ms_w[slot] = exp(ms_red[0] - mx) / denom;
+            ms_pick = bi;
+        }
+        workgroupBarrier();
+        wsum = wsum + exp(ms_red[0] - mx) / denom;
+        if (lid == ms_pick) { ms_lg[lid] = -3.0e38; }
+        workgroupBarrier();
+    }
+    if (lid == 0u) {
+        if (ms_p.norm != 0u) {
+            for (var slot = 0u; slot < k; slot = slot + 1u) { ms_w[slot] = ms_w[slot] / wsum; }
+        }
+        ms_sel[k] = n;
+        ms_w[k] = 1.0 / (1.0 + exp(-ms_slog[0]));
+    }
+}
+
+// gate+up+SiLU for every selected expert: workgroup (row, slot) does BOTH q4t
+// row dots (they share the activation reads) and writes act = silu(g)·u.
+struct MoeGuP { gpr: u32, inter: u32, slots: u32, mat16: u32 };
+@group(0) @binding(0) var<storage, read>       mg_gw  : array<u32>;
+@group(0) @binding(1) var<storage, read>       mg_uw  : array<u32>;
+@group(0) @binding(2) var<storage, read>       mg_x   : array<f32>;
+@group(0) @binding(3) var<storage, read>       mg_sel : array<u32>;
+@group(0) @binding(4) var<storage, read_write> mg_act : array<f32>;
+@group(0) @binding(5) var<uniform>             mg_p   : MoeGuP;
+var<workgroup> mg_pg: array<f32, 64>;
+var<workgroup> mg_pu: array<f32, 64>;
+
+fn mg_g16(o: u32) -> u32 { return (mg_gw[o >> 1u] >> ((o & 1u) * 16u)) & 0xFFFFu; }
+fn mg_u16f(o: u32) -> u32 { return (mg_uw[o >> 1u] >> ((o & 1u) * 16u)) & 0xFFFFu; }
+fn mg_dot8(w: u32, xi: u32) -> f32 {
+    return (f32(w & 0xFu) - 8.0) * mg_x[xi]
+         + (f32((w >> 4u) & 0xFu) - 8.0) * mg_x[xi + 1u]
+         + (f32((w >> 8u) & 0xFu) - 8.0) * mg_x[xi + 2u]
+         + (f32((w >> 12u) & 0xFu) - 8.0) * mg_x[xi + 3u]
+         + (f32((w >> 16u) & 0xFu) - 8.0) * mg_x[xi + 4u]
+         + (f32((w >> 20u) & 0xFu) - 8.0) * mg_x[xi + 5u]
+         + (f32((w >> 24u) & 0xFu) - 8.0) * mg_x[xi + 6u]
+         + (f32((w >> 28u) & 0xFu) - 8.0) * mg_x[xi + 7u];
+}
+
+@compute @workgroup_size(64)
+fn moe_gate_up(@builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let slot = wid.y;
+    let gpr = mg_p.gpr;
+    let base = mg_sel[slot] * mg_p.mat16 + row * gpr * 9u;
+    var ag = 0.0;
+    var au = 0.0;
+    for (var g = lid; g < gpr; g = g + 64u) {
+        let t16 = base + g * 9u;
+        let sg = unpack2x16float(mg_g16(t16)).x;
+        let su = unpack2x16float(mg_u16f(t16)).x;
+        let xb = g * 32u;
+        var dg = 0.0;
+        var du = 0.0;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            let wg = mg_g16(t16 + 1u + 2u * k) | (mg_g16(t16 + 2u + 2u * k) << 16u);
+            let wu = mg_u16f(t16 + 1u + 2u * k) | (mg_u16f(t16 + 2u + 2u * k) << 16u);
+            dg = dg + mg_dot8(wg, xb + 8u * k);
+            du = du + mg_dot8(wu, xb + 8u * k);
+        }
+        ag = ag + sg * dg;
+        au = au + su * du;
+    }
+    mg_pg[lid] = ag;
+    mg_pu[lid] = au;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) {
+            mg_pg[lid] = mg_pg[lid] + mg_pg[lid + stride];
+            mg_pu[lid] = mg_pu[lid] + mg_pu[lid + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) {
+        let g = mg_pg[0];
+        mg_act[slot * mg_p.inter + row] = (g / (1.0 + exp(-g))) * mg_pu[0];
+    }
+}
+
+// Weighted down-projection: one workgroup per hidden row accumulates
+// Σ_slot w[slot]·(down[sel[slot]] row · act[slot]) over the flattened
+// (slot, group) space, then overwrites y[row] (the graph's usual FFN
+// output slot — the existing fused residual add consumes it).
+struct MoeDnP { gpr: u32, hidden: u32, slots: u32, mat16: u32 };
+@group(0) @binding(0) var<storage, read>       md_w   : array<u32>;
+@group(0) @binding(1) var<storage, read>       md_act : array<f32>;
+@group(0) @binding(2) var<storage, read>       md_sel : array<u32>;
+@group(0) @binding(3) var<storage, read>       md_wt  : array<f32>;
+@group(0) @binding(4) var<storage, read_write> md_y   : array<f32>;
+@group(0) @binding(5) var<uniform>             md_p   : MoeDnP;
+var<workgroup> md_pt: array<f32, 64>;
+
+fn md_u16(o: u32) -> u32 { return (md_w[o >> 1u] >> ((o & 1u) * 16u)) & 0xFFFFu; }
+fn md_dot8(w: u32, xi: u32) -> f32 {
+    return (f32(w & 0xFu) - 8.0) * md_act[xi]
+         + (f32((w >> 4u) & 0xFu) - 8.0) * md_act[xi + 1u]
+         + (f32((w >> 8u) & 0xFu) - 8.0) * md_act[xi + 2u]
+         + (f32((w >> 12u) & 0xFu) - 8.0) * md_act[xi + 3u]
+         + (f32((w >> 16u) & 0xFu) - 8.0) * md_act[xi + 4u]
+         + (f32((w >> 20u) & 0xFu) - 8.0) * md_act[xi + 5u]
+         + (f32((w >> 24u) & 0xFu) - 8.0) * md_act[xi + 6u]
+         + (f32((w >> 28u) & 0xFu) - 8.0) * md_act[xi + 7u];
+}
+
+@compute @workgroup_size(64)
+fn moe_down(@builtin(workgroup_id) wid: vec3<u32>,
+            @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let gpr = md_p.gpr;
+    let total = md_p.slots * gpr;
+    var acc = 0.0;
+    for (var i = lid; i < total; i = i + 64u) {
+        let slot = i / gpr;
+        let g = i % gpr;
+        let t16 = md_sel[slot] * md_p.mat16 + (row * gpr + g) * 9u;
+        let scale = unpack2x16float(md_u16(t16)).x;
+        let xb = (slot * gpr + g) * 32u;
+        var d = 0.0;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            let w = md_u16(t16 + 1u + 2u * k) | (md_u16(t16 + 2u + 2u * k) << 16u);
+            d = d + md_dot8(w, xb + 8u * k);
+        }
+        acc = acc + md_wt[slot] * scale * d;
+    }
+    md_pt[lid] = acc;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { md_pt[lid] = md_pt[lid] + md_pt[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) { md_y[row] = md_pt[0]; }
+}
 "#;
 
 // Split-K decode attention (its own module: the main module's at_* binding
@@ -1705,6 +1925,9 @@ struct Ctx {
     gdn_step: wgpu::ComputePipeline,
     gdn_conv: wgpu::ComputePipeline,
     f32_matvec: wgpu::ComputePipeline,
+    moe_select: wgpu::ComputePipeline,
+    moe_gate_up: wgpu::ComputePipeline,
+    moe_down: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     layout_mm: wgpu::BindGroupLayout,
     layout_mmm: wgpu::BindGroupLayout,
@@ -1729,6 +1952,9 @@ struct Ctx {
     layout_gdn_conv: wgpu::BindGroupLayout,
     layout_f32: wgpu::BindGroupLayout,
     layout_silu_down: wgpu::BindGroupLayout,
+    layout_moe_sel: wgpu::BindGroupLayout,
+    layout_moe_gu: wgpu::BindGroupLayout,
+    layout_moe_dn: wgpu::BindGroupLayout,
     /// Discrete card (PCIe VRAM) vs UMA — thresholds and budgets differ.
     discrete: bool,
     /// Weight-residency budget in bytes (CMF_GPU_VRAM_MB override). On a
@@ -1758,6 +1984,11 @@ struct Ctx {
     /// GDN recurrent state per (kv_id, layer): (conv ring, S), persists across
     /// decode tokens (created zeroed on first touch).
     gdn_state: Mutex<HashMap<(u64, usize), (wgpu::Buffer, wgpu::Buffer)>>,
+    /// Per-layer concatenated MoE expert weights (gate_all, up_all, down_all)
+    /// keyed by (file base ptr, first gate idx) — every routed expert plus the
+    /// shared one as the trailing block, uploaded once, addressed by expert id
+    /// inside the kernels. Counted against `resident` like any weight.
+    moe_expw: Mutex<HashMap<(usize, usize), (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)>>,
     /// Immutable [rows,cols,…] uniforms cached by content — the ~800 matvec
     /// param buffers per token are token-invariant, so uploading them once
     /// keeps them off the per-token encode critical path.
@@ -1843,6 +2074,13 @@ struct GraphScratch {
     // Split-K attend partials: [nh·nchunks·hd] accumulators + [nh·nchunks] (m,l)
     apacc: Option<(wgpu::Buffer, u64)>,
     apml: Option<(wgpu::Buffer, u64)>,
+    // MoE routing intermediates: router logits, shared-gate logit, selected
+    // expert ids + weights, per-slot activations
+    m_logit: Option<(wgpu::Buffer, u64)>,
+    m_slog: Option<(wgpu::Buffer, u64)>,
+    m_sel: Option<(wgpu::Buffer, u64)>,
+    m_wt: Option<(wgpu::Buffer, u64)>,
+    m_act: Option<(wgpu::Buffer, u64)>,
     // Logits output + readback staging
     logits: Option<(wgpu::Buffer, u64)>,
     stage: Option<(wgpu::Buffer, u64)>,
@@ -2049,6 +2287,12 @@ fn init() -> Result<Ctx, String> {
     let gdn_step = pipe("gdn_step");
     let gdn_conv = pipe("gdn_conv");
     let f32_matvec = pipe("f32_matvec");
+    let moe_select = pipe("moe_select");
+    let moe_gate_up = pipe("moe_gate_up");
+    let moe_down = pipe("moe_down");
+    let layout_moe_sel = moe_select.get_bind_group_layout(0);
+    let layout_moe_gu = moe_gate_up.get_bind_group_layout(0);
+    let layout_moe_dn = moe_down.get_bind_group_layout(0);
     let layout = matvec.get_bind_group_layout(0);
     let layout_q1 = q1.get_bind_group_layout(0);
     let layout_rmsnorm = rmsnorm.get_bind_group_layout(0);
@@ -2134,6 +2378,9 @@ fn init() -> Result<Ctx, String> {
         gdn_step,
         gdn_conv,
         f32_matvec,
+        moe_select,
+        moe_gate_up,
+        moe_down,
         layout,
         layout_mm,
         layout_mmm,
@@ -2158,6 +2405,9 @@ fn init() -> Result<Ctx, String> {
         layout_gdn_conv,
         layout_f32,
         layout_silu_down,
+        layout_moe_sel,
+        layout_moe_gu,
+        layout_moe_dn,
         discrete,
         vram_budget,
         resident: std::sync::atomic::AtomicU64::new(0),
@@ -2168,6 +2418,7 @@ fn init() -> Result<Ctx, String> {
         rs_bufs: Mutex::new(HashMap::new()),
         attn_kv: Mutex::new(HashMap::new()),
         gdn_state: Mutex::new(HashMap::new()),
+        moe_expw: Mutex::new(HashMap::new()),
         graph_scratch: Mutex::new(GraphScratch::default()),
     })
 }
@@ -2208,6 +2459,79 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
     c.resident.fetch_add(len, Ordering::Relaxed);
     map.insert(key, buf.clone());
     Some(buf)
+}
+
+/// One MoE layer's expert weights as three concatenated device buffers
+/// (gate_all, up_all, down_all), q4t payloads back to back in `experts`
+/// order (routed experts then the shared one) — the kernels address
+/// expert e at u16 offset e·mat16. Uploaded once per layer (keyed by the
+/// first gate idx), budget-guarded like every resident weight; the copy
+/// walks the per-tensor directory, so no file-order contiguity is assumed.
+fn moe_expert_bufs(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    experts: &[(usize, usize, usize)],
+    inter: usize,
+    hidden: usize,
+) -> Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)> {
+    use std::sync::atomic::Ordering;
+    if hidden % 32 != 0 || inter % 32 != 0 {
+        return None;
+    }
+    let bytes = model.primary_bytes();
+    let key = (bytes.as_ptr() as usize, experts.first()?.0);
+    if let Some(t) = c.moe_expw.lock().unwrap().get(&key) {
+        return Some(t.clone());
+    }
+    let gu_len = inter * (hidden / 32) * 18;
+    let d_len = hidden * (inter / 32) * 18;
+    let total = (experts.len() * (2 * gu_len + d_len)) as u64;
+    if c.resident.load(Ordering::Relaxed) + total > c.vram_budget {
+        return None; // over budget — the whole graph honestly falls to CPU
+    }
+    crate::gpu::probe_note_cold();
+    let mk = |role: &dyn Fn(&(usize, usize, usize)) -> usize,
+              rows: usize,
+              cols: usize,
+              plen: usize|
+     -> Option<wgpu::Buffer> {
+        let mut v: Vec<u8> = Vec::with_capacity(experts.len() * plen);
+        for t in experts {
+            let e = model.tensors.get(role(t))?;
+            if *e.shape.first()? as usize != rows
+                || *e.shape.get(1)? as usize != cols
+                || e.nbytes as usize != plen
+            {
+                return None;
+            }
+            let abs = model.entry_abs_offset(e)?;
+            v.extend_from_slice(bytes.get(abs..abs + plen)?);
+        }
+        let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("moe-experts"),
+            size: v.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        c.queue.write_buffer(&b, 0, &v);
+        Some(b)
+    };
+    let g = mk(&|t| t.0, inter, hidden, gu_len)?;
+    let u = mk(&|t| t.1, inter, hidden, gu_len)?;
+    let d = mk(&|t| t.2, hidden, inter, d_len)?;
+    // Flush the write_buffer staging belt NOW: with 40 MoE layers the
+    // pending uploads (~17 GB) would otherwise coexist with their device
+    // copies until the graph's first submit — twice the expert weights in
+    // memory = device OOM on discrete cards. One submit+wait per layer
+    // bounds transient staging to this layer's three buffers.
+    c.queue.submit(std::iter::empty());
+    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    c.resident.fetch_add(total, Ordering::Relaxed);
+    c.moe_expw
+        .lock()
+        .unwrap()
+        .insert(key, (g.clone(), u.clone(), d.clone()));
+    Some((g, u, d))
 }
 
 /// GPU enabled and initialized?
@@ -3174,11 +3498,27 @@ pub fn forward_token_graph(
             cdim: usize,
         },
     }
+    enum LFfn {
+        Dense {
+            gate: GMat,
+            up: GMat,
+            down: GMat,
+        },
+        Moe {
+            router: GMat,
+            sgate: GMat,
+            gate_all: wgpu::Buffer,
+            up_all: wgpu::Buffer,
+            down_all: wgpu::Buffer,
+            n_exp: usize,
+            top_k: usize,
+            inter: usize,
+            norm_topk: bool,
+        },
+    }
     struct LW {
         attn: LAttn,
-        gate: GMat,
-        up: GMat,
-        down: GMat,
+        ffn: LFfn,
     }
     // Resolve + cache every layer's weights (q8_row or q1) up front; bail (CPU)
     // on any refusal (budget/shape/dtype).
@@ -3344,19 +3684,56 @@ pub fn forward_token_graph(
                 }
             }
         };
-        let (Some(gate), Some(up), Some(down)) = (
-            resolve(&l.gate, inter, hidden),
-            resolve(&l.up, inter, hidden),
-            resolve(&l.down, hidden, inter),
-        ) else {
-            return false;
+        let ffn = match &l.ffn {
+            crate::gpu::GraphFfn::Dense { gate, up, down } => {
+                let (Some(gate), Some(up), Some(down)) = (
+                    resolve(gate, inter, hidden),
+                    resolve(up, inter, hidden),
+                    resolve(down, hidden, inter),
+                ) else {
+                    return false;
+                };
+                LFfn::Dense { gate, up, down }
+            }
+            crate::gpu::GraphFfn::Moe {
+                router,
+                shared_gate,
+                experts,
+                n_exp,
+                top_k,
+                inter: mi,
+                norm_topk,
+            } => {
+                // Select kernel: logits live in a 256-slot workgroup array;
+                // slot top_k+1 holds the shared expert.
+                if *top_k >= 16 || *n_exp > 256 || experts.len() != n_exp + 1 {
+                    return false;
+                }
+                let (Some(router), Some(sgate)) = (
+                    resolve(router, *n_exp, hidden),
+                    resolve(shared_gate, 1, hidden),
+                ) else {
+                    return false;
+                };
+                let Some((gate_all, up_all, down_all)) =
+                    moe_expert_bufs(c, model, experts, *mi, hidden)
+                else {
+                    return false;
+                };
+                LFfn::Moe {
+                    router,
+                    sgate,
+                    gate_all,
+                    up_all,
+                    down_all,
+                    n_exp: *n_exp,
+                    top_k: *top_k,
+                    inter: *mi,
+                    norm_topk: *norm_topk,
+                }
+            }
         };
-        lws.push(LW {
-            attn,
-            gate,
-            up,
-            down,
-        });
+        lws.push(LW { attn, ffn });
     }
     // DEVICE-LOCAL + content-cached: create_buffer + write_buffer keeps norm
     // weights in VRAM (not the HOST_VISIBLE heap create_buffer_init forces);
@@ -3461,6 +3838,28 @@ pub fn forward_token_graph(
     let gbuf = GraphScratch::ensure(&c.device, &mut gs.gbuf, (inter * 4) as u64, st, "g-gbuf");
     let ubuf = GraphScratch::ensure(&c.device, &mut gs.ubuf, (inter * 4) as u64, st, "g-ubuf");
     let abuf = GraphScratch::ensure(&c.device, &mut gs.abuf, (inter * 4) as u64, st, "g-abuf");
+    // MoE routing scratch, sized to the largest MoE layer (absent → skipped).
+    let moe_geom = lws
+        .iter()
+        .filter_map(|lw| match &lw.ffn {
+            LFfn::Moe {
+                n_exp,
+                top_k,
+                inter,
+                ..
+            } => Some((*n_exp, *top_k + 1, *inter)),
+            _ => None,
+        })
+        .reduce(|a, b| (a.0.max(b.0), a.1.max(b.1), a.2.max(b.2)));
+    let moe_bufs = moe_geom.map(|(mn, ms, mi)| {
+        (
+            GraphScratch::ensure(&c.device, &mut gs.m_logit, (mn * 4) as u64, st, "g-mlogit"),
+            GraphScratch::ensure(&c.device, &mut gs.m_slog, 4, st, "g-mslog"),
+            GraphScratch::ensure(&c.device, &mut gs.m_sel, (ms * 4) as u64, st, "g-msel"),
+            GraphScratch::ensure(&c.device, &mut gs.m_wt, (ms * 4) as u64, st, "g-mwt"),
+            GraphScratch::ensure(&c.device, &mut gs.m_act, (ms * mi * 4) as u64, st, "g-mact"),
+        )
+    });
     let invf_b = stor(bytemuck::cast_slice(invf));
     let dummy_hd = zeros(hd);
     // GDN intermediates (sized to the model's GDN geometry; 1 if no GDN layer).
@@ -4001,41 +4400,133 @@ pub fn forward_token_graph(
         );
         // SiLU FFN: gate+up matvecs + silu fused in ONE compute pass
         // (dispatches within a pass are serialized — silu safely reads gate/up output).
-        {
-            let pg = prep(&lw.gate, &n1, &gbuf, inter, hidden);
-            let pu = prep(&lw.up, &n1, &ubuf, inter, hidden);
-            if let (Some((pgp, bg_g, wg)), Some((pup, bg_u, wu))) = (pg, pu) {
-                let bg_silu = bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]);
-                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: None,
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(pgp);
-                pass.set_bind_group(0, &bg_g, &[]);
-                pass.dispatch_workgroups(wg, 1, 1);
-                pass.set_pipeline(pup);
-                pass.set_bind_group(0, &bg_u, &[]);
-                pass.dispatch_workgroups(wu, 1, 1);
-                pass.set_pipeline(&c.silu);
-                pass.set_bind_group(0, &bg_silu, &[]);
-                pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
-            } else {
-                group_mats(
-                    &mut enc,
-                    &[
-                        (&lw.gate, &n1, &gbuf, inter, hidden),
-                        (&lw.up, &n1, &ubuf, inter, hidden),
+        match &lw.ffn {
+            LFfn::Dense { gate, up, down } => {
+                let pg = prep(gate, &n1, &gbuf, inter, hidden);
+                let pu = prep(up, &n1, &ubuf, inter, hidden);
+                if let (Some((pgp, bg_g, wg)), Some((pup, bg_u, wu))) = (pg, pu) {
+                    let bg_silu = bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]);
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(pgp);
+                    pass.set_bind_group(0, &bg_g, &[]);
+                    pass.dispatch_workgroups(wg, 1, 1);
+                    pass.set_pipeline(pup);
+                    pass.set_bind_group(0, &bg_u, &[]);
+                    pass.dispatch_workgroups(wu, 1, 1);
+                    pass.set_pipeline(&c.silu);
+                    pass.set_bind_group(0, &bg_silu, &[]);
+                    pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
+                } else {
+                    group_mats(
+                        &mut enc,
+                        &[
+                            (gate, &n1, &gbuf, inter, hidden),
+                            (up, &n1, &ubuf, inter, hidden),
+                        ],
+                    );
+                    go(
+                        &mut enc,
+                        &c.silu,
+                        &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]),
+                        (inter as u32).div_ceil(256),
+                    );
+                }
+                emat(&mut enc, down, &abuf, &ob, hidden, inter);
+            }
+            LFfn::Moe {
+                router,
+                sgate,
+                gate_all,
+                up_all,
+                down_all,
+                n_exp,
+                top_k,
+                inter: mi,
+                norm_topk,
+            } => {
+                // The WHOLE MoE FFN — router + shared-gate matvecs, top-k
+                // select, fused gate+up+SiLU over the selected experts, and
+                // the weighted down accumulation into ob — rides in ONE
+                // compute pass: dispatches within a pass serialize with
+                // memory visibility (same guarantee the dense fused FFN
+                // uses), and the inter-pass pipeline flush (~78 µs on
+                // NVIDIA Vulkan) is what dominates a 40-layer decode.
+                let (mlogit, mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
+                let slots = *top_k + 1;
+                let sel_u =
+                    uniform_u32x4(c, [*n_exp as u32, *top_k as u32, *norm_topk as u32, 0]);
+                let gu_u = uniform_u32x4(
+                    c,
+                    [
+                        (hidden / 32) as u32,
+                        *mi as u32,
+                        slots as u32,
+                        (*mi * (hidden / 32) * 9) as u32,
                     ],
                 );
-                go(
-                    &mut enc,
-                    &c.silu,
-                    &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]),
-                    (inter as u32).div_ceil(256),
+                let dn_u = uniform_u32x4(
+                    c,
+                    [
+                        (*mi / 32) as u32,
+                        hidden as u32,
+                        slots as u32,
+                        (hidden * (*mi / 32) * 9) as u32,
+                    ],
                 );
+                let bg_sel = bg(&c.layout_moe_sel, &[mlogit, mslog, msel, mwt, &sel_u]);
+                let bg_gu = bg(
+                    &c.layout_moe_gu,
+                    &[gate_all, up_all, &n1, msel, mact, &gu_u],
+                );
+                let bg_dn = bg(&c.layout_moe_dn, &[down_all, mact, msel, mwt, &ob, &dn_u]);
+                let pr = prep(router, &n1, mlogit, *n_exp, hidden);
+                let ps = prep(sgate, &n1, mslog, 1, hidden);
+                if let (Some((prp, bgr, wr)), Some((psp, bgs, ws))) = (pr, ps) {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(prp);
+                    pass.set_bind_group(0, &bgr, &[]);
+                    pass.dispatch_workgroups(wr, 1, 1);
+                    pass.set_pipeline(psp);
+                    pass.set_bind_group(0, &bgs, &[]);
+                    pass.dispatch_workgroups(ws, 1, 1);
+                    pass.set_pipeline(&c.moe_select);
+                    pass.set_bind_group(0, &bg_sel, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                    pass.set_pipeline(&c.moe_gate_up);
+                    pass.set_bind_group(0, &bg_gu, &[]);
+                    pass.dispatch_workgroups(*mi as u32, slots as u32, 1);
+                    pass.set_pipeline(&c.moe_down);
+                    pass.set_bind_group(0, &bg_dn, &[]);
+                    pass.dispatch_workgroups(hidden as u32, 1, 1);
+                } else {
+                    // Un-preppable router dtype: per-op passes (correct, rare).
+                    group_mats(
+                        &mut enc,
+                        &[
+                            (router, &n1, mlogit, *n_exp, hidden),
+                            (sgate, &n1, mslog, 1, hidden),
+                        ],
+                    );
+                    go(&mut enc, &c.moe_select, &bg_sel, 1);
+                    {
+                        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: None,
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&c.moe_gate_up);
+                        pass.set_bind_group(0, &bg_gu, &[]);
+                        pass.dispatch_workgroups(*mi as u32, slots as u32, 1);
+                    }
+                    go(&mut enc, &c.moe_down, &bg_dn, hidden as u32);
+                }
             }
         }
-        emat(&mut enc, &lw.down, &abuf, &ob, hidden, inter);
         // FFN-residual + next layer's attn-norm fused (plain residual on the last).
         // At loop boundaries (Looped Transformer), insert final_norm between the
         // residual and the next iteration's input norm.
@@ -4338,10 +4829,20 @@ pub fn forward_batch_graph(
                 }
             }
         };
+        // The batch-graph builder only admits dense FFNs (MoE prefill
+        // routes per-token and stays on the per-position path).
+        let crate::gpu::GraphFfn::Dense {
+            gate: lg,
+            up: lu,
+            down: ld,
+        } = &l.ffn
+        else {
+            return false;
+        };
         let (Some(gate), Some(up), Some(down)) = (
-            resolve(&l.gate, inter, hidden),
-            resolve(&l.up, inter, hidden),
-            resolve(&l.down, hidden, inter),
+            resolve(lg, inter, hidden),
+            resolve(lu, inter, hidden),
+            resolve(ld, hidden, inter),
         ) else {
             return false;
         };

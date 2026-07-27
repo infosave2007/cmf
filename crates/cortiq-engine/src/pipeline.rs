@@ -2944,9 +2944,48 @@ impl Pipeline {
                 };
                 eprintln!("graph L{li}: attn={ak} ffn={fk}");
             }
-            let (gate, up, down) = match &lw.ffn {
-                FfnKind::Dense(d) => (&d.gate_proj, &d.up_proj, &d.down_proj),
-                _ => return None,
+            let gffn = match &lw.ffn {
+                FfnKind::Dense(d) => crate::gpu::GraphFfn::Dense {
+                    gate: gw(&d.gate_proj)?,
+                    up: gw(&d.up_proj)?,
+                    down: gw(&d.down_proj)?,
+                },
+                FfnKind::Moe(m) => {
+                    // v1 scope: softmax router + shared expert + uniform
+                    // q4t expert trios (the MoE-hybrid coder class). The
+                    // biased/sigmoid routers and adaptive τ keep the CPU
+                    // path, where they are implemented.
+                    if m.router_sigmoid || m.expert_bias.is_some() || m.route_tau.is_some() {
+                        return None;
+                    }
+                    let (se, sg) = m.shared.as_ref()?;
+                    let sgate = gw(sg.as_ref()?)?;
+                    let router = gw(&m.router)?;
+                    let inter = m.experts.first()?.gate_proj.rows();
+                    let mut experts = Vec::with_capacity(m.experts.len() + 1);
+                    for e in m.experts.iter().chain(std::iter::once(se)) {
+                        if !matches!(e.act, Act::Silu)
+                            || e.gate_proj.rows() != inter
+                            || e.up_proj.rows() != inter
+                        {
+                            return None;
+                        }
+                        let (mm, gi) = e.gate_proj.mapped_q4t()?;
+                        let (_, ui) = e.up_proj.mapped_q4t()?;
+                        let (_, di) = e.down_proj.mapped_q4t()?;
+                        model.get_or_insert_with(|| mm.clone());
+                        experts.push((gi, ui, di));
+                    }
+                    crate::gpu::GraphFfn::Moe {
+                        router,
+                        shared_gate: sgate,
+                        experts,
+                        n_exp: m.experts.len(),
+                        top_k: m.top_k,
+                        inter,
+                        norm_topk: m.norm_topk_prob,
+                    }
+                }
             };
             let attn = match &lw.attn {
                 AttnKind::Full {
@@ -3007,9 +3046,7 @@ impl Pipeline {
                 input_norm: &lw.input_norm,
                 attn,
                 post_norm: &lw.post_norm,
-                gate: gw(gate)?,
-                up: gw(up)?,
-                down: gw(down)?,
+                ffn: gffn,
             });
         }
         let model = model?;
@@ -3107,8 +3144,14 @@ impl Pipeline {
             let mut model = None;
             for li in 0..self.num_layers {
                 let lw = &self.weights.layers[self.phys_layer(li)];
-                let (gate, up, down) = match &lw.ffn {
-                    FfnKind::Dense(d) => (&d.gate_proj, &d.up_proj, &d.down_proj),
+                // Prefill batches stay dense-only: MoE routing is per-token,
+                // so a batched expert pass needs a different kernel shape.
+                let gffn = match &lw.ffn {
+                    FfnKind::Dense(d) => crate::gpu::GraphFfn::Dense {
+                        gate: gw(&d.gate_proj)?,
+                        up: gw(&d.up_proj)?,
+                        down: gw(&d.down_proj)?,
+                    },
                     _ => return None,
                 };
                 let attn = match &lw.attn {
@@ -3170,9 +3213,7 @@ impl Pipeline {
                     input_norm: &lw.input_norm,
                     attn,
                     post_norm: &lw.post_norm,
-                    gate: gw(gate)?,
-                    up: gw(up)?,
-                    down: gw(down)?,
+                    ffn: gffn,
                 });
             }
             Some((layers, model?))

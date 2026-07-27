@@ -665,9 +665,34 @@ pub struct GraphLayer<'a> {
     pub input_norm: &'a [f32],
     pub attn: GraphAttn<'a>,
     pub post_norm: &'a [f32],
-    pub gate: GraphW<'a>,
-    pub up: GraphW<'a>,
-    pub down: GraphW<'a>,
+    pub ffn: GraphFfn<'a>,
+}
+
+/// The FFN of one graph layer: a dense SwiGLU trio, or a routed MoE —
+/// router + top-k selection + all selected experts run ON DEVICE (the
+/// routing decision depends on the resident hidden state, so a CPU
+/// round-trip per layer would forfeit the one-submit design).
+pub enum GraphFfn<'a> {
+    Dense {
+        gate: GraphW<'a>,
+        up: GraphW<'a>,
+        down: GraphW<'a>,
+    },
+    Moe {
+        /// Router logits weight (f32, kind 4) `[n_exp, hidden]`.
+        router: GraphW<'a>,
+        /// Shared-expert sigmoid gate (f32) `[1, hidden]`.
+        shared_gate: GraphW<'a>,
+        /// Per-expert q4_tiled directory indices `(gate, up, down)`;
+        /// the SHARED expert rides as the LAST entry — the select
+        /// kernel pins it with the sigmoid weight.
+        experts: Vec<(usize, usize, usize)>,
+        /// Routed experts (shared excluded).
+        n_exp: usize,
+        top_k: usize,
+        inter: usize,
+        norm_topk: bool,
+    },
 }
 
 /// Whole-token decode graph on wgpu: the entire layer stack in ONE submit,
