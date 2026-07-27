@@ -294,6 +294,15 @@ enum Commands {
         #[arg(long)]
         o1_sink: Option<usize>,
     },
+    /// Rewrite a container tightly: reclaim dead directory/header tails
+    /// left by append-only skill growth (spec §9). Streams from mmap.
+    Compact {
+        /// Source .cmf model
+        model: String,
+        /// Output .cmf path
+        #[arg(long)]
+        output: String,
+    },
     /// Drop the MoE experts a task never routes to (physical defrag: kept
     /// experts renumbered, router rows sliced). Stats from CMF_MOE_STATS
     /// over a task-representative run; gate the result on `cortiq ppl`.
@@ -947,6 +956,7 @@ async fn main() -> anyhow::Result<()> {
             println!("✓ wrote {output}");
             Ok(())
         }
+        Commands::Compact { model, output } => moedefrag::cmd_compact(&model, &output),
         Commands::MoeDefrag {
             model,
             stats,

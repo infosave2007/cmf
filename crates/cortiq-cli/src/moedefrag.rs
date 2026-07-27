@@ -29,6 +29,39 @@ fn router_layer(name: &str) -> Option<usize> {
     (t == "mlp.gate.weight").then(|| li.parse().ok())?
 }
 
+/// Plain container rewrite: reclaims the dead directory/header tails
+/// left by append-only skill growth (spec §9) and re-packs tensors
+/// tightly in directory order. Payloads stream from the source mmap
+/// (write_ref), so a 19 GB file compacts without RAM spikes.
+pub fn cmd_compact(model_path: &str, output: &str) -> anyhow::Result<()> {
+    let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    let specs: Vec<TensorSpecRef> = model
+        .tensors
+        .iter()
+        .map(|entry| TensorSpecRef {
+            name: entry.name.clone(),
+            dtype: entry.dtype,
+            shape: entry.shape.iter().map(|&d| d as usize).collect(),
+            data: model.entry_bytes(entry),
+        })
+        .collect();
+    CmfModel::write_ref(
+        output,
+        &model.header,
+        &specs,
+        Some(&model.masks),
+        model.vocab.as_deref(),
+    )?;
+    let in_sz = std::fs::metadata(model_path)?.len() as f64 / 1e9;
+    let out_sz = std::fs::metadata(output)?.len() as f64 / 1e9;
+    println!(
+        "compact: {} tensors\n{model_path} {in_sz:.2} GB -> {output} {out_sz:.2} GB ({:+.1}%)",
+        specs.len(),
+        (out_sz / in_sz - 1.0) * 100.0
+    );
+    Ok(())
+}
+
 pub fn cmd_moe_defrag(
     model_path: &str,
     stats_path: &str,
@@ -147,9 +180,40 @@ pub fn cmd_moe_defrag(
         bail!("nothing to drop — check the stats file / --cover");
     }
 
+    // Honest provenance contract (spec §11.1, mirroring §11's defrag
+    // block): what was cut, from what evidence, at what cover.
+    let mut header = model.header.clone();
+    let mut kept_per_layer: Vec<(usize, usize)> =
+        remap.iter().map(|(&li, m)| (li, m.len())).collect();
+    kept_per_layer.sort_unstable();
+    let stats_bytes = std::fs::read(stats_path)?;
+    let prov = serde_json::json!({
+        "tool": format!("cortiq moe-defrag {}", env!("CARGO_PKG_VERSION")),
+        "cover": cover,
+        "stats_hash64": format!("{:016x}", cortiq_core::hash64(&stats_bytes)),
+        "num_experts_pre": header
+            .arch
+            .moe
+            .as_ref()
+            .map(|m| m.num_experts)
+            .unwrap_or(0),
+        "kept_per_layer": kept_per_layer
+            .iter()
+            .map(|&(_, k)| k)
+            .collect::<Vec<_>>(),
+    });
+    match header.provenance.as_mut() {
+        Some(serde_json::Value::Object(map)) => {
+            map.insert("moe_defrag".into(), prov);
+        }
+        _ => {
+            header.provenance = Some(serde_json::json!({ "moe_defrag": prov }));
+        }
+    }
+
     CmfModel::write_ref(
         output,
-        &model.header,
+        &header,
         &specs,
         Some(&model.masks),
         model.vocab.as_deref(),
