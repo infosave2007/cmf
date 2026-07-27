@@ -6161,6 +6161,11 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
                     return false;
                 }
                 rows * (cols / GROUP_SIZE) * Q1_TILE
+            } else if j.q4t {
+                if cols % GROUP_SIZE != 0 {
+                    return false;
+                }
+                rows * (cols / GROUP_SIZE) * 18
             } else {
                 if cols % 4 != 0 {
                     return false;
@@ -6241,9 +6246,11 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
                   rows: usize,
                   cols: usize,
                   rs: Option<&Buffer>,
+                  q4t: bool,
                   xs: &Buffer,
                   y: &Buffer| {
         match rs {
+            None if q4t => encode_q4t_matvec(c, enc, &fbuf, abs, xs, y, rows, cols / GROUP_SIZE),
             None => encode_q1_matvec(c, enc, &fbuf, abs, xs, y, rows, cols / GROUP_SIZE),
             Some(rs) => {
                 enc.set_compute_pipeline_state(&c.q8);
@@ -6268,8 +6275,8 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         let (gi, grows, gcols, grs) = &j.gate;
         let (ui, urows, ucols, urs) = &j.up;
         let (di, drows, dcols, drs) = &j.down;
-        // q1: scales live in the tiles — no rs buffers at all.
-        let rs3 = if j.q1 {
+        // q1/q4t: scales live in the tiles — no rs buffers at all.
+        let rs3 = if j.q1 || j.q4t {
             [None, None, None]
         } else {
             [
@@ -6302,8 +6309,8 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
 
         {
             let enc = cmd.new_compute_command_encoder();
-            matvec(enc, trio[0], *grows, *gcols, rs3[0].as_ref(), &xsg, &g_buf);
-            matvec(enc, trio[1], *urows, *ucols, rs3[1].as_ref(), &xsu, &u_buf);
+            matvec(enc, trio[0], *grows, *gcols, rs3[0].as_ref(), j.q4t, &xsg, &g_buf);
+            matvec(enc, trio[1], *urows, *ucols, rs3[1].as_ref(), j.q4t, &xsu, &u_buf);
             enc.end_encoding();
         }
         {
@@ -6328,6 +6335,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
                 *drows,
                 *dcols,
                 rs3[2].as_ref(),
+                j.q4t,
                 &a_buf,
                 &d_buf,
             );

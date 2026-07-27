@@ -4112,6 +4112,7 @@ fn moe_parts(
     &[f32],
     &[f32],
     bool,
+    bool,
 )> {
     match t {
         QTensor::Mapped {
@@ -4124,7 +4125,7 @@ fn moe_parts(
             col_field,
             ..
         } if (*dt == cortiq_core::TensorDtype::Q8Row) || !col_field.is_empty() => {
-            Some((model, *idx, *rows, *cols, row_scale, col_field, false))
+            Some((model, *idx, *rows, *cols, row_scale, col_field, false, false))
         }
         // q1: tile-embedded scales — empty rs/col slices, raw xs.
         QTensor::Mapped {
@@ -4134,7 +4135,16 @@ fn moe_parts(
             rows,
             cols,
             ..
-        } => Some((model, *idx, *rows, *cols, &[][..], &[][..], true)),
+        } => Some((model, *idx, *rows, *cols, &[][..], &[][..], true, false)),
+        // q4_tiled: 18-byte tiles with embedded f16 scales — raw xs.
+        QTensor::Mapped {
+            model,
+            idx,
+            dtype: cortiq_core::TensorDtype::Q4Tiled,
+            rows,
+            cols,
+            ..
+        } => Some((model, *idx, *rows, *cols, &[][..], &[][..], false, true)),
         _ => None,
     }
 }
@@ -4151,10 +4161,10 @@ fn moe_push_job<'a>(
     if d.act != Act::Silu {
         return None; // GPU block hardcodes SiLU
     }
-    let (gm, gi, gr, gc, grs, gcf, gq1) = moe_parts(&d.gate_proj)?;
-    let (_, ui, ur, uc, urs, ucf, uq1) = moe_parts(&d.up_proj)?;
-    let (_, di, dr, dc, drs, dcf, dq1) = moe_parts(&d.down_proj)?;
-    if gq1 != uq1 || uq1 != dq1 {
+    let (gm, gi, gr, gc, grs, gcf, gq1, gq4) = moe_parts(&d.gate_proj)?;
+    let (_, ui, ur, uc, urs, ucf, uq1, uq4) = moe_parts(&d.up_proj)?;
+    let (_, di, dr, dc, drs, dcf, dq1, dq4) = moe_parts(&d.down_proj)?;
+    if gq1 != uq1 || uq1 != dq1 || gq4 != uq4 || uq4 != dq4 {
         return None; // mixed-dtype trio — honest CPU path
     }
     model_ref.get_or_insert_with(|| gm.clone());
@@ -4177,6 +4187,7 @@ fn moe_push_job<'a>(
         down_col: dcf,
         w,
         q1: gq1,
+        q4t: gq4,
     });
     Some(())
 }

@@ -155,6 +155,14 @@ struct Probe {
     gpu_n: AtomicU32,
     cpu_ns: AtomicU64,
     cpu_n: AtomicU32,
+    /// Best (minimum) sample per arm. The DECISION compares these:
+    /// means are poisoned by one-off cold costs the cold-flag cannot
+    /// see — e.g. the CPU arm's first mmap-cold expert matvec page
+    /// faults its weights in and reads 3× its steady state, which
+    /// locked the GPU arm on a 35B MoE at a 4× real-world loss. The
+    /// minimum is each arm's honest steady-state pace.
+    gpu_min: AtomicU64,
+    cpu_min: AtomicU64,
 }
 
 impl Probe {
@@ -166,6 +174,8 @@ impl Probe {
             gpu_n: AtomicU32::new(0),
             cpu_ns: AtomicU64::new(0),
             cpu_n: AtomicU32::new(0),
+            gpu_min: AtomicU64::new(u64::MAX),
+            cpu_min: AtomicU64::new(u64::MAX),
         }
     }
 }
@@ -242,17 +252,22 @@ pub fn probe_record(c: OpClass, gpu: bool, dur: std::time::Duration) {
     if gpu {
         p.gpu_ns.fetch_add(ns, Ordering::Relaxed);
         p.gpu_n.fetch_add(1, Ordering::Relaxed);
+        p.gpu_min.fetch_min(ns, Ordering::Relaxed);
     } else {
         p.cpu_ns.fetch_add(ns, Ordering::Relaxed);
         p.cpu_n.fetch_add(1, Ordering::Relaxed);
+        p.cpu_min.fetch_min(ns, Ordering::Relaxed);
     }
     let (gn, cn) = (
         p.gpu_n.load(Ordering::Relaxed),
         p.cpu_n.load(Ordering::Relaxed),
     );
     if gn >= 2 && cn >= 2 {
-        let g = p.gpu_ns.load(Ordering::Relaxed) as f64 / gn as f64;
-        let cp = p.cpu_ns.load(Ordering::Relaxed) as f64 / cn as f64;
+        // Decide on each arm's BEST sample — the steady-state pace.
+        // Means carry one-off cold costs (mmap page-in on the CPU arm)
+        // that the cold-flag machinery cannot see.
+        let g = p.gpu_min.load(Ordering::Relaxed) as f64;
+        let cp = p.cpu_min.load(Ordering::Relaxed) as f64;
         // Early verdict on a ≥3× gap — no reason to keep feeding the
         // losing arm; close races take the full sample count.
         if (gn < PROBE_SAMPLES || cn < PROBE_SAMPLES) && g < cp * 3.0 && cp < g * 3.0 {
@@ -409,6 +424,9 @@ pub struct MoeJob<'a> {
     /// q1 trio: scales live inside the 6-byte tiles (row_scale slices
     /// empty, xs raw f32). Backends without a q1 kernel refuse the job.
     pub q1: bool,
+    /// q4_tiled trio: scales inside the 18-byte tiles (row_scale
+    /// slices empty, xs raw f32) — the MoE-hybrid coder class.
+    pub q4t: bool,
 }
 
 /// A single independent batch matvec (GDN projections of one input).

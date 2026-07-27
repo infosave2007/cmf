@@ -6019,6 +6019,27 @@ fn tensor_weight(
     )
 }
 
+/// `tensor_weight` for tile-packed dtypes whose payload length differs
+/// from rows·cols (q4_tiled: 18 B per 32-weight group).
+fn tensor_weight_sized(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    idx: usize,
+    rows: usize,
+    payload: usize,
+) -> Option<wgpu::Buffer> {
+    let entry = &model.tensors[idx];
+    if entry.shape.first().copied().unwrap_or(0) < rows {
+        return None;
+    }
+    let abs = model.entry_abs_offset(entry)?;
+    let bytes = model.primary_bytes();
+    if abs + payload > bytes.len() {
+        return None;
+    }
+    weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + payload])
+}
+
 /// Encodes q8-matvec (row0=0) into the given encoder, writes to `y`. The bind
 /// group and uniform are ref-counted by the command buffer until submit.
 fn encode_matvec(
@@ -6366,24 +6387,36 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
     if jobs.is_empty() {
         return false;
     }
+    let q4t = jobs[0].q4t;
+    if jobs.iter().any(|j| j.q4t != q4t) {
+        return false; // mixed job kinds — honest CPU
+    }
     let inter = jobs[0].gate.1;
     let hidden = jobs[0].down.1;
     if out.len() != hidden {
         return false;
     }
     // Resident weights of all triples — validate first (fail → CPU entirely).
+    let fetch = |idx: usize, rows: usize, cols: usize| -> Option<wgpu::Buffer> {
+        if q4t {
+            tensor_weight_sized(c, model, idx, rows, rows * (cols / 32) * 18)
+        } else {
+            tensor_weight(c, model, idx, rows, cols)
+        }
+    };
     let mut w3 = Vec::with_capacity(jobs.len());
     for j in jobs {
         let (gi, gr, gc, _) = j.gate;
         let (ui, ur, uc, _) = j.up;
         let (di, dr, dc, _) = j.down;
-        if gc % 4 != 0 || uc % 4 != 0 || dc % 4 != 0 {
+        let align = if q4t { 32 } else { 4 };
+        if gc % align != 0 || uc % align != 0 || dc % align != 0 {
             return false;
         }
         let (Some(gw), Some(uw), Some(dw)) = (
-            tensor_weight(c, model, gi, gr, gc),
-            tensor_weight(c, model, ui, ur, uc),
-            tensor_weight(c, model, di, dr, dc),
+            fetch(gi, gr, gc),
+            fetch(ui, ur, uc),
+            fetch(di, dr, dc),
         ) else {
             return false;
         };
@@ -6446,8 +6479,13 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         let xsg = storage_bytes(c, bytemuck::cast_slice(&j.xs_gate));
         let xsu = storage_bytes(c, bytemuck::cast_slice(&j.xs_up));
 
-        encode_matvec(c, &mut enc, gw, &xsg, &grs_b, &g_buf, *gr, *gc);
-        encode_matvec(c, &mut enc, uw, &xsu, &urs_b, &u_buf, *ur, *uc);
+        if q4t {
+            encode_q1t_like(c, &mut enc, &c.q4t_mv, gw, &xsg, &g_buf, *gr, *gc);
+            encode_q1t_like(c, &mut enc, &c.q4t_mv, uw, &xsu, &u_buf, *ur, *uc);
+        } else {
+            encode_matvec(c, &mut enc, gw, &xsg, &grs_b, &g_buf, *gr, *gc);
+            encode_matvec(c, &mut enc, uw, &xsu, &urs_b, &u_buf, *ur, *uc);
+        }
         // act = silu(g)·u·col_down
         {
             let np = uniform_u32x4(c, [inter as u32, has_col as u32, 0, 0]);
@@ -6470,7 +6508,11 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
         }
-        encode_matvec(c, &mut enc, dw, &a_buf, &drs_b, &d_buf, *dr, *dc);
+        if q4t {
+            encode_q1t_like(c, &mut enc, &c.q4t_mv, dw, &a_buf, &d_buf, *dr, *dc);
+        } else {
+            encode_matvec(c, &mut enc, dw, &a_buf, &drs_b, &d_buf, *dr, *dc);
+        }
         // y += w·d
         {
             let wp = uniform_u32x4(c, [j.w.to_bits(), hidden as u32, 0, 0]);
