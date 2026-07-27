@@ -2202,6 +2202,15 @@ impl Pipeline {
                         if pos + k0 + k < start {
                             continue;
                         }
+                        let lg = &mut logits[k * rows..k * rows + self.vocab_size.min(rows)];
+                        // Gemma-class final-logit soft-capping: the
+                        // decode paths apply it; scoring must too, or
+                        // the uncapped softmax misprices every token.
+                        if let Some(c) = self.final_softcap {
+                            for v in lg.iter_mut() {
+                                *v = c * (*v / c).tanh();
+                            }
+                        }
                         let lg = &logits[k * rows..k * rows + self.vocab_size.min(rows)];
                         let target = ids[pos + k0 + k + 1] as usize;
                         let max = lg.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
@@ -2232,7 +2241,12 @@ impl Pipeline {
                 self.rms_eps,
                 self.norm_style,
             );
-            let logits = self.lm_head_forward(&normed);
+            let mut logits = self.lm_head_forward(&normed);
+            if let Some(c) = self.final_softcap {
+                for v in logits.iter_mut() {
+                    *v = c * (*v / c).tanh();
+                }
+            }
             let target = ids[pos + 1] as usize;
             let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
             let lse: f64 = logits
@@ -2295,7 +2309,12 @@ impl Pipeline {
                 self.rms_eps,
                 self.norm_style,
             );
-            let logits = self.lm_head_forward(&normed);
+            let mut logits = self.lm_head_forward(&normed);
+            if let Some(c) = self.final_softcap {
+                for v in logits.iter_mut() {
+                    *v = c * (*v / c).tanh();
+                }
+            }
             let target = ids[pos + 1] as usize;
             let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
             let lse: f64 = logits
@@ -2332,7 +2351,12 @@ impl Pipeline {
                 self.rms_eps,
                 self.norm_style,
             );
-            let logits = self.lm_head_forward(&normed);
+            let mut logits = self.lm_head_forward(&normed);
+            if let Some(c) = self.final_softcap {
+                for v in logits.iter_mut() {
+                    *v = c * (*v / c).tanh();
+                }
+            }
             let target = ids[pos + 1] as usize;
             let (mut amax, mut mval) = (0usize, f32::NEG_INFINITY);
             for (i, &v) in logits.iter().enumerate() {
@@ -2382,7 +2406,12 @@ impl Pipeline {
                 self.rms_eps,
                 self.norm_style,
             );
-            let logits = self.lm_head_forward(&normed);
+            let mut logits = self.lm_head_forward(&normed);
+            if let Some(c) = self.final_softcap {
+                for v in logits.iter_mut() {
+                    *v = c * (*v / c).tanh();
+                }
+            }
             let target = ids[pos + 1] as usize;
             let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
             let lse: f64 = logits
