@@ -294,6 +294,11 @@ pub struct MoeFfn {
     /// routing frequency during calibration). Filled by every forward,
     /// read by the CLI via CMF_MOE_STATS. RefCell: decode is single-threaded.
     pub stats: std::cell::RefCell<Vec<u64>>,
+    /// Task mask over routed experts (DTG-MA over MoE, claim-12 B-field
+    /// applied): `false` experts are excluded from selection, the
+    /// softmax renormalizes over the allowed set. Built by the loader
+    /// from CMF_MOE_MASK=<stats.json> + CMF_MOE_MASK_COVER. None = all.
+    pub mask: Option<Vec<bool>>,
 }
 
 /// Attention operator of a layer. Extension point: new operators are
@@ -2955,7 +2960,11 @@ impl Pipeline {
                     // q4t expert trios (the MoE-hybrid coder class). The
                     // biased/sigmoid routers and adaptive τ keep the CPU
                     // path, where they are implemented.
-                    if m.router_sigmoid || m.expert_bias.is_some() || m.route_tau.is_some() {
+                    if m.router_sigmoid
+                        || m.expert_bias.is_some()
+                        || m.route_tau.is_some()
+                        || m.mask.is_some()
+                    {
                         return None;
                     }
                     let (se, sg) = m.shared.as_ref()?;
@@ -4359,7 +4368,14 @@ fn moe_route(logits: &[f32], m: &MoeFfn) -> (Vec<usize>, Vec<f32>, f32) {
         }
         e
     };
-    let mut idx: Vec<usize> = (0..ne).collect();
+    let mut idx: Vec<usize> = match &m.mask {
+        // Task mask: selection happens over the allowed set only. With
+        // norm_topk the kept weights renormalize below; without it the
+        // masked mass is honestly dropped (experimental feature — gate
+        // any use on a ppl A/B).
+        Some(mask) => (0..ne).filter(|&e| mask[e]).collect(),
+        None => (0..ne).collect(),
+    };
     // Descending by selection score, lower index wins ties (torch.topk).
     match &m.expert_bias {
         Some(b) => idx.sort_unstable_by(|&x, &y| {
@@ -4873,6 +4889,7 @@ mod tests {
             route_tau: None,
             shared: Some((shared, None)),
             stats: std::cell::RefCell::new(Vec::new()),
+            mask: None,
         };
         let actual = moe_ffn_cpu(&moe, &x, &[0], &[0.0], 1.0, None);
         for (actual, expected) in actual.iter().zip(expected) {

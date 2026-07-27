@@ -200,6 +200,7 @@ pub(crate) fn build_layer_ffn(
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|&t| t > 0.0 && t < 1.0)
         .inspect(|t| tracing::info!("MoE adaptive routing: tau {t}"));
+    let mask = moe_task_mask(&prefix, experts.len());
     Ok(FfnKind::Moe(MoeFfn {
         router: load_matrix(model, &router_name, force_f32, ov)?,
         experts,
@@ -211,7 +212,76 @@ pub(crate) fn build_layer_ffn(
         routed_scaling: cfg.routed_scaling_factor.unwrap_or(1.0),
         shared,
         stats: std::cell::RefCell::new(Vec::new()),
+        mask,
     }))
+}
+
+/// Task mask over routed experts (opt-in, experimental): DTG-MA applied
+/// to MoE. `CMF_MOE_MASK=<stats.json>` points at a claim-12 B-field dump
+/// (`CMF_MOE_STATS` output — per-layer expert-selection counts from a
+/// task-representative run); `CMF_MOE_MASK_COVER` (default 0.9) keeps,
+/// per layer, the smallest top set of experts reaching that fraction of
+/// the recorded routing mass. Selection then happens over the allowed
+/// set only (softmax renormalizes). Gate any real use on a ppl A/B.
+fn moe_task_mask(prefix: &str, ne: usize) -> Option<Vec<bool>> {
+    use std::sync::OnceLock;
+    static CFG: OnceLock<Option<(std::collections::HashMap<usize, Vec<u64>>, f64)>> =
+        OnceLock::new();
+    let cfg = CFG.get_or_init(|| {
+        let path = std::env::var("CMF_MOE_MASK").ok()?;
+        let cover = std::env::var("CMF_MOE_MASK_COVER")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|&c| c > 0.0 && c <= 1.0)
+            .unwrap_or(0.9);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| tracing::warn!("CMF_MOE_MASK: cannot read {path}: {e}"))
+            .ok()?;
+        let map: std::collections::HashMap<String, Vec<u64>> =
+            serde_json::from_str(&text)
+                .map_err(|e| tracing::warn!("CMF_MOE_MASK: bad JSON in {path}: {e}"))
+                .ok()?;
+        tracing::info!("MoE task mask: {path}, cover {cover}");
+        Some((
+            map.into_iter()
+                .filter_map(|(k, v)| Some((k.parse::<usize>().ok()?, v)))
+                .collect(),
+            cover,
+        ))
+    });
+    let (stats, cover) = cfg.as_ref()?;
+    // The layer index rides in the tensor prefix ("model.layers.N.").
+    let li: usize = prefix
+        .split("layers.")
+        .nth(1)?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()?;
+    let counts = stats.get(&li)?;
+    if counts.len() != ne {
+        tracing::warn!("CMF_MOE_MASK: layer {li} has {} counts, model has {ne} experts — skipped", counts.len());
+        return None;
+    }
+    let total: u64 = counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..ne).collect();
+    order.sort_unstable_by_key(|&e| std::cmp::Reverse(counts[e]));
+    let mut mask = vec![false; ne];
+    let mut acc = 0u64;
+    let mut kept = 0usize;
+    for &e in &order {
+        mask[e] = true;
+        acc += counts[e];
+        kept += 1;
+        if (acc as f64) >= cover * (total as f64) {
+            break;
+        }
+    }
+    tracing::info!("MoE task mask L{li}: {kept}/{ne} experts for {:.0}% mass", cover * 100.0);
+    Some(mask)
 }
 
 fn load_matrix(
