@@ -4,6 +4,7 @@ mod convert;
 mod gguf;
 mod gptq;
 mod imagepack;
+mod moedefrag;
 mod npy;
 mod skill;
 
@@ -292,6 +293,22 @@ enum Commands {
         /// Permanent exact sink keys for the --o1 hint (validated default 4)
         #[arg(long)]
         o1_sink: Option<usize>,
+    },
+    /// Drop the MoE experts a task never routes to (physical defrag: kept
+    /// experts renumbered, router rows sliced). Stats from CMF_MOE_STATS
+    /// over a task-representative run; gate the result on `cortiq ppl`.
+    MoeDefrag {
+        /// Source .cmf model
+        model: String,
+        /// Expert-selection stats JSON (CMF_MOE_STATS dump)
+        #[arg(long)]
+        stats: String,
+        /// Per-layer routing-mass fraction to keep (0–1]
+        #[arg(long, default_value = "0.95")]
+        cover: f64,
+        /// Output .cmf path
+        #[arg(long)]
+        output: String,
     },
     /// Import a GGUF model to .cmf — native Rust (F32/F16/BF16/Q4_0..Q6_K + K-quants; llama/qwen2/qwen3)
     ImportGguf {
@@ -930,6 +947,12 @@ async fn main() -> anyhow::Result<()> {
             println!("✓ wrote {output}");
             Ok(())
         }
+        Commands::MoeDefrag {
+            model,
+            stats,
+            cover,
+            output,
+        } => moedefrag::cmd_moe_defrag(&model, &stats, cover, &output),
         Commands::ImportGguf {
             gguf,
             output,

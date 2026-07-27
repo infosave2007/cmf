@@ -10,7 +10,7 @@ pub mod types;
 
 pub use format::{
     CMF_MAGIC, CMF_VERSION, CmfError, CmfHeader, CmfModel, SelectionDescriptor, SkillRecord,
-    SparseIndexEntry, TensorEntry, TensorSpec, build_sparse_index,
+    SparseIndexEntry, TensorEntry, TensorSpec, TensorSpecRef, build_sparse_index,
 };
 pub use hash::hash64;
 pub use mask::{MaskCatalog, MaskDiff, MaskPriority, Quality, TaskMask};

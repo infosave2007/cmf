@@ -219,6 +219,14 @@ pub struct TensorSpec {
     pub data: Vec<u8>,
 }
 
+/// `TensorSpec` with a borrowed payload — see [`CmfModel::write_ref`].
+pub struct TensorSpecRef<'a> {
+    pub name: String,
+    pub dtype: TensorDtype,
+    pub shape: Vec<usize>,
+    pub data: &'a [u8],
+}
+
 /// Sparse index entry — precomputed per-task per-layer active group IDs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparseIndexEntry {
@@ -860,6 +868,28 @@ impl CmfModel {
         path: impl AsRef<Path>,
         header: &CmfHeader,
         tensors: &[TensorSpec],
+        masks: Option<&MaskCatalog>,
+        vocab: Option<&[u8]>,
+    ) -> Result<(), CmfError> {
+        let refs: Vec<TensorSpecRef> = tensors
+            .iter()
+            .map(|t| TensorSpecRef {
+                name: t.name.clone(),
+                dtype: t.dtype,
+                shape: t.shape.clone(),
+                data: &t.data,
+            })
+            .collect();
+        Self::write_ref(path, header, &refs, masks, vocab)
+    }
+
+    /// `write` with BORROWED tensor payloads — repack tools slice the
+    /// source file's mmap directly, so a 19 GB container rewrites without
+    /// materializing its tensors in RAM (the OS streams pages through).
+    pub fn write_ref(
+        path: impl AsRef<Path>,
+        header: &CmfHeader,
+        tensors: &[TensorSpecRef],
         masks: Option<&MaskCatalog>,
         vocab: Option<&[u8]>,
     ) -> Result<(), CmfError> {

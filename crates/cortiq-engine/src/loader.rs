@@ -156,9 +156,25 @@ pub(crate) fn build_layer_ffn(
             "{router_name} present but header has no arch.moe block"
         ))
     })?;
-    let experts = (0..cfg.num_experts)
-        .map(|e| load_dense(&format!("{prefix}mlp.experts.{e}.")))
-        .collect::<Result<Vec<_>, _>>()?;
+    // Experts enumerate by TENSOR PRESENCE up to the header count — a
+    // moe-defrag'd specialist keeps a per-layer contiguous prefix of
+    // renumbered experts (fewer than arch.moe.num_experts), with the
+    // router rows sliced to match.
+    let mut experts = Vec::new();
+    for e in 0..cfg.num_experts {
+        if model
+            .tensor(&format!("{prefix}mlp.experts.{e}.gate_proj.weight"))
+            .is_none()
+        {
+            break;
+        }
+        experts.push(load_dense(&format!("{prefix}mlp.experts.{e}."))?);
+    }
+    if experts.is_empty() {
+        return Err(CmfError::Parse(format!(
+            "{prefix}: router present but no expert tensors"
+        )));
+    }
     let shared = if model
         .tensor(&format!("{prefix}mlp.shared_expert.gate_proj.weight"))
         .is_some()
@@ -201,8 +217,17 @@ pub(crate) fn build_layer_ffn(
         .filter(|&t| t > 0.0 && t < 1.0)
         .inspect(|t| tracing::info!("MoE adaptive routing: tau {t}"));
     let mask = moe_task_mask(&prefix, experts.len());
+    let router = load_matrix(model, &router_name, force_f32, ov)?;
+    if router.rows() != experts.len() {
+        return Err(CmfError::Parse(format!(
+            "{router_name}: {} rows != {} experts",
+            router.rows(),
+            experts.len()
+        )));
+    }
+    let top_k = top_k.min(experts.len());
     Ok(FfnKind::Moe(MoeFfn {
-        router: load_matrix(model, &router_name, force_f32, ov)?,
+        router,
         experts,
         top_k,
         route_tau,
