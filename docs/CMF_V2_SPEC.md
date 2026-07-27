@@ -268,6 +268,8 @@ Numbering shared with `.vmfc` (ids are never reused):
 | 10 | `vbit_ro` | ✅ read/write — `vbit` + in-file row-offset table (O(1) row access); converter default for `--quant vbit` |
 | 11 | `q4_tiled`| ✅ read/write — q4 in interleaved `[f16 scale][16B nibbles]` tiles (`--quant q4t`) |
 | 12 | `q1`      | ✅ read/write — 1-bit binary, for 1-bit-TRAINED models only (`--quant q1`) |
+| 13 | `q1s`     | ✅ read/write — `q1` base + sparse high-precision outlier overlay (1-bit PTQ of normal checkpoints) |
+| 14 | `q1t`     | ✅ read/write — ternary `{−s, 0, +s}` base-3 tiles + per-row outlier overlay (~2.25 bpw + overlay) |
 
 ### 3.2 Quant layouts (canon = `.vmfc`: "quants first, then scales")
 
@@ -316,6 +318,25 @@ Numbering shared with `.vmfc` (ids are never reused):
   levels and the encoding is lossless up to f16; as post-training
   quantization of a normal checkpoint it destroys quality, so
   converters expose it only as an explicit opt-in.
+- **`q1s`** (2-D only, `in % 32 == 0`): a `q1` base (identical 6-byte
+  tiles; outliers are EXCLUDED from the group scale) followed by a
+  sparse high-precision overlay: `[u32 count]` then
+  `count × { [u32 flat-index][f16 value] }` — the salient weights kept
+  at full precision (holographic transfer / SpQR-style) and restored
+  verbatim at dequant. Variable length: `expected_nbytes` is
+  undefined, the reader trusts the directory's stored span. Lets a
+  NORMAL checkpoint survive 1-bit where plain `q1` cannot.
+- **`q1t`** (2-D only, `in % 32 == 0`, `in` must fit `u16`): ternary
+  BitNet-b1.58-style `{−s, 0, +s}`. Base:
+  `repeat per 32-group { [f16 scale][7B base-3 codes] }` — 9-byte
+  tiles, 5 ternary values per byte (3⁵ = 243 ≤ 256; code 0 → 0,
+  1 → +s, 2 → −s), ~2.25 bits/weight. Then a per-row outlier overlay:
+  `[u32 row_ptr[rows+1]]` followed by `{ [u16 col][f16 value] }`
+  entries grouped by row (row `r`'s outliers are
+  `[row_ptr[r], row_ptr[r+1])`; `col` is a within-row index) — 4
+  bytes per outlier, no binary search. Capturing the many near-zero
+  weights exactly is the decisive PTQ win over binary. Variable
+  length, same span rule as `q1s`.
 
 ## 4. Weight blob
 
@@ -402,10 +423,11 @@ jinja2 byte-for-byte. Files without the block get a ChatML fallback.
 A precomputed bridge "mask → computation skip": active FFN quant groups
 (32 neurons each) and heads, per (task, layer) pair.
 
-> Honest status: the engine currently takes active indices directly from
-> the mask bitfields; the index is read and displayed by the CLI but not
-> used in execution yet. It becomes mandatory on the
-> "masks × quantized mmap" path.
+> Honest status: the engine takes active indices directly from the mask
+> bitfields; the index is read and displayed by the CLI but has never
+> been used in execution. **Deprecation-pending**: writers SHOULD stop
+> emitting it (readers keep parsing existing files); it is revived only
+> if the "masks × quantized mmap" path materializes with a measured win.
 
 ```
 [0 : 4]  n_entries : u32
@@ -617,8 +639,47 @@ masked output before quantization (a dead neuron contributes `act·0`
 under a mask and is simply absent after defrag); after quantization the
 only difference comes from quantizing the smaller matrices.
 
-**Scope:** FFN neurons only (dense). Attention-head pruning (the head
-count is a global runtime scalar) and MoE-expert pruning are out of scope.
+**Scope:** dense FFN neurons here; MoE experts in §11.1. Attention-head
+pruning (the head count is a global runtime scalar) is out of scope.
+
+### 11.1 MoE expert defrag (`cortiq moe-defrag`)
+
+The MoE twin of §11, driven by the routing B-field instead of a neuron
+mask: expert usage is strongly task-conditional (measured on a 34.7B
+coder: the top-64 expert sets for code vs prose overlap with Jaccard
+0.25), so a one-task file can drop the experts that task never routes
+to. From a `CMF_MOE_STATS` dump (per-layer expert-selection counts over
+a task-representative run), keep per layer the smallest top expert set
+reaching `--cover` of the recorded routing mass; drop the rest.
+
+**Representation — same philosophy as §11, no feature bit.**
+
+- Kept experts are renumbered into a CONTIGUOUS per-layer prefix
+  `mlp.experts.0 … mlp.experts.{k−1}` preserving relative order; a
+  reader enumerates a layer's experts by tensor PRESENCE up to
+  `arch.moe.num_experts`, which becomes nominal (= the original
+  count) — mirroring §11's rule for `intermediate_size`.
+- The router tensor's rows are gathered to match, in the same order:
+  `mlp.gate.weight` becomes `[kept_l, hidden]`, and
+  `router.rows() == (number of expert entries present)` is a load-time
+  invariant. `top_k` clamps to the per-layer expert count.
+- Selection semantics are unchanged (§2.2): the softmax simply
+  renormalizes over the kept set. The identical restriction can be
+  applied at RUNTIME without rewriting the file
+  (`CMF_MOE_MASK=<stats.json>` + `CMF_MOE_MASK_COVER`) — the two are
+  mathematically equal, which is how a cover level is perplexity-gated
+  before committing to the cut.
+- Expert payloads are copied verbatim (no requant — the expert axis is
+  whole tensors, not quant groups), so the surviving weights are
+  byte-identical to the source and the rewrite streams from the source
+  mmap.
+
+Measured reference (KAT-Coder 34.7B-A3B, code-calibrated, cover 0.95):
+19.6 → 12.7 GB (−35%), held-out code perplexity +2.8%, and on a 24 GB
+machine — where the full model paged — decode ×1.8, prefill ×3.3.
+
+Off-task quality degrades by design; like §11, one defragged file bakes
+one task. Multi-task serving stays on the full expert set.
 
 **Producing it (native Rust):**
 
@@ -633,6 +694,32 @@ True = live) from the pruning pipeline. Without `ffn_keep.npy` the
 keep-set is autodetected from all-zero `down_proj` columns (the
 Factory-Hard bake). The mask-training / bake step lives in the private
 research pipeline; the public tool only consumes its artifacts.
+
+## 12. Pipeline containers — text-to-image in one file
+
+The same envelope/directory/blob machinery carries non-LLM pipelines.
+The only differences are the `arch_name` tag and namespaced tensor
+names; no new sections, no feature bit (a reader that does not execute
+the pipeline still validates and inspects the file).
+
+Current instance — `arch_name: "lumina2-image"` (Lumina-Image 2.0,
+`cortiq imagine-pack` / `cortiq imagine`): one file packs the whole
+text-to-image stack.
+
+- **Namespaces**: `te.*` — the text-encoder transformer (a Gemma-2
+  class LLM; the header's `arch` block describes THIS component, so
+  generic tooling reads meaningful dimensions), `dit.*` — the Next-DiT
+  denoiser, `vae.*` — the VAE decoder. Component config JSONs ride as
+  `{prefix}.config_json` u8 tensors — the file is self-sufficient.
+- **Quantization**: per-tensor as always (§3 directory is the truth) —
+  typically q4t/q8 matrices for te/dit, f16 for VAE convolutions and
+  norms.
+- **Tokenizer section** (§6) carries the text encoder's tokenizer;
+  `provenance.pipeline` + `provenance.components` name the recipe.
+
+The measured reference lives in the README (512 px on CPU in minutes,
+Metal whole-DiT-block graph on Apple silicon; the wgpu path serves
+discrete cards and phones).
 
 ---
 
