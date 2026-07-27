@@ -191,7 +191,8 @@ impl Tokenizer {
         // Prepend("▁") normalizer; byte-level BPE carries a Split regex.
         // Llama-family post_processor prepends <s> at add_special_tokens
         // time; generation must honor it (word salad without BOS).
-        let add_bos = hf
+        let mut saw_gemma_bos = false;
+        let add_bos_detected = hf
             .post_processor
             .as_ref()
             .map(|p| {
@@ -250,12 +251,29 @@ impl Tokenizer {
                 "<|endoftext|>" | "</s>" => eos_token_id = Some(at.id),
                 "<|im_start|>" => im_start_id = Some(at.id),
                 "<|im_end|>" => im_end_id = Some(at.id),
-                "<s>" | "<bos>" => bos_token_id = Some(at.id),
+                "<s>" => bos_token_id = Some(at.id),
+                // Gemma spells BOS as literal "<bos>" — the family
+                // REQUIRES it on every sequence, and newer tokenizers
+                // (gemma-4) no longer say so in a post_processor.
+                "<bos>" => {
+                    bos_token_id = Some(at.id);
+                    saw_gemma_bos = true;
+                }
                 "<pad>" => pad_token_id = Some(at.id),
                 _ => {}
             }
         }
         added.sort_by_key(|(c, _)| std::cmp::Reverse(c.len()));
+
+        // Gemma REQUIRES a leading <bos> on every sequence, but newer
+        // tokenizers (gemma-4, 262k vocab) no longer spell it in a
+        // post_processor template — the family marker <start_of_turn>
+        // is the reliable tell. Without this, raw-text scoring runs
+        // unanchored and the first ~30 positions read worse than
+        // uniform (the chat path masked it: the template carries <bos>).
+        let gemma_family = saw_gemma_bos
+            || vocab.contains_key("<start_of_turn>")
+            || added.iter().any(|(c, _)| c == "<start_of_turn>");
 
         // The post_processor template names the exact BOS content
         // (llama "<s>", gemma "<bos>" — gemma's vocab carries BOTH, so
@@ -311,7 +329,7 @@ impl Tokenizer {
             im_end_id,
             chat_template: None,
             extra_eos: HashSet::new(),
-            add_bos,
+            add_bos: add_bos_detected || gemma_family,
         })
     }
 

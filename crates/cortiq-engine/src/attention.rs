@@ -1341,6 +1341,14 @@ pub fn qwen_attention_pair(
 
     let (mut qa, mut gate1) = finish(q1r, &mut k1, cfg.position);
     let (mut qb, mut gate2) = finish(q2r, &mut k2, cfg.position + 1);
+    // V-norm (gemma-4): the closure covers q/k; V is normalized here or
+    // the pair prefill caches raw V while singles cache normalized.
+    if cfg.v_norm {
+        for g in 0..nkv {
+            vnorm_head(&mut v1[g * hd..g * hd + hd], cfg.rms_eps);
+            vnorm_head(&mut v2[g * hd..g * hd + hd], cfg.rms_eps);
+        }
+    }
 
     // O(1) prefill trace (see qwen_attention): lane order = position
     // order, so the collected buffer stays position-major.
@@ -1436,6 +1444,55 @@ mod tests {
         };
         let h1: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.3).sin()).collect();
         let h2: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.7).cos()).collect();
+
+        let mut c_ref = LayerKvCache::new(nkv, hd);
+        let r1 = qwen_attention(&h1, &wq, &wk, &wv, &wo, &mut c_ref, &cfg(0));
+        let r2 = qwen_attention(&h2, &wq, &wk, &wv, &wo, &mut c_ref, &cfg(1));
+
+        let mut c = LayerKvCache::new(nkv, hd);
+        let (p1, p2) = qwen_attention_pair(&h1, &h2, &wq, &wk, &wv, &wo, &mut c, &cfg(0));
+        for (a, b) in r1.iter().zip(&p1) {
+            assert!((a - b).abs() < 1e-5, "lane1 {a} vs {b}");
+        }
+        for (a, b) in r2.iter().zip(&p2) {
+            assert!((a - b).abs() < 1e-5, "lane2 {a} vs {b}");
+        }
+    }
+
+    /// gemma-4 V-norm: the pair path once normalized q/k but cached RAW
+    /// V — healthy singles, diverging pair prefill.
+    #[test]
+    fn pair_with_v_norm_matches_two_singles() {
+        let (nh, nkv, hd, hs) = (2usize, 1usize, 4usize, 8usize);
+        let wq = synth(nh * hd, hs, 5);
+        let wk = synth(nkv * hd, hs, 6);
+        let wv = synth(nkv * hd, hs, 7);
+        let wo = synth(hs, nh * hd, 8);
+        let inv = rope_inv_freq(hd, 10_000.0);
+        let cfg = |position| QwenAttnCfg {
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: hd,
+            hidden_size: hs,
+            position,
+            inv_freq: &inv,
+            rotary_dim: hd,
+            scale: 1.0 / (hd as f32).sqrt(),
+            softcap: 0.0,
+            window: None,
+            v_norm: true,
+            q_norm: None,
+            k_norm: None,
+            output_gate: false,
+            softplus_gate: None,
+            rope_scale: 1.0,
+            bias: None,
+            rms_eps: 1e-6,
+            norm_style: cortiq_core::NormStyle::Qwen,
+            pool: None,
+        };
+        let h1: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.4).sin()).collect();
+        let h2: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.9).cos()).collect();
 
         let mut c_ref = LayerKvCache::new(nkv, hd);
         let r1 = qwen_attention(&h1, &wq, &wk, &wv, &wo, &mut c_ref, &cfg(0));

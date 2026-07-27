@@ -1423,7 +1423,8 @@ impl Pipeline {
                 pos = end;
             }
         }
-        if task_mask.is_none() && !dyn_prefill && !graph_prefill {
+        let pair_off = std::env::var("CMF_PAIR").is_ok_and(|v| v == "0");
+        if task_mask.is_none() && !dyn_prefill && !graph_prefill && !pair_off {
             while pos + 1 < input_ids.len() {
                 let e1 = self.embed_single(input_ids[pos]);
                 let e2 = self.embed_single(input_ids[pos + 1]);
@@ -1977,8 +1978,29 @@ impl Pipeline {
                 self.norm_style,
                 &mut self.ws.p2,
             );
-            let (f1, f2) =
-                ffn_forward_pair(&lw.ffn, &self.ws.p1, &self.ws.p2, self.pool.as_deref(), None);
+            let (f1, f2) = match &lw.ffn {
+                // Dual-branch layers need the raw residuals — run the
+                // two positions through the same fn decode uses.
+                FfnKind::DenseMoe(dm) => (
+                    dense_moe_ffn(
+                        dm,
+                        &self.ws.p1,
+                        &h1,
+                        self.rms_eps,
+                        self.norm_style,
+                        self.pool.as_deref(),
+                    ),
+                    dense_moe_ffn(
+                        dm,
+                        &self.ws.p2,
+                        &h2,
+                        self.rms_eps,
+                        self.norm_style,
+                        self.pool.as_deref(),
+                    ),
+                ),
+                _ => ffn_forward_pair(&lw.ffn, &self.ws.p1, &self.ws.p2, self.pool.as_deref(), None),
+            };
             let (f1, f2) = match &self.weights.layers[self.phys_layer(li)].ffn_out_norm {
                 Some(w) => (
                     inference::rms_norm(&f1, w, self.rms_eps, self.norm_style),
@@ -2222,6 +2244,18 @@ impl Pipeline {
                             + max as f64;
                         nll += lse - lg[target] as f64;
                         cnt += 1;
+                        if std::env::var("CMF_PPL_TRACE").is_ok() {
+                            let top = lg
+                                .iter()
+                                .enumerate()
+                                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            eprintln!(
+                                "BTRACE pos {} target {} nll {:.4} top {} lg_t {:.3} lg_top {:.3}",
+                                pos + k0 + k, target, lse - lg[target] as f64, top, lg[target], lg[top]
+                            );
+                        }
                     }
                     k0 = k1;
                 }
@@ -2241,12 +2275,10 @@ impl Pipeline {
                 self.rms_eps,
                 self.norm_style,
             );
-            let mut logits = self.lm_head_forward(&normed);
-            if let Some(c) = self.final_softcap {
-                for v in logits.iter_mut() {
-                    *v = c * (*v / c).tanh();
-                }
-            }
+            // lm_head_forward applies the final-logit softcap itself —
+            // capping again here double-squashed gemma-class logits
+            // (tanh∘tanh) and reported a flattered ppl.
+            let logits = self.lm_head_forward(&normed);
             let target = ids[pos + 1] as usize;
             let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
             let lse: f64 = logits
@@ -2255,7 +2287,20 @@ impl Pipeline {
                 .sum::<f64>()
                 .ln()
                 + max as f64;
-            nll += lse - logits[target] as f64;
+            let tok_nll = lse - logits[target] as f64;
+            if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
+                let top = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                eprintln!(
+                    "pos {pos:3} tgt {target:6} nll {tok_nll:7.3} | top1 {top:6} lg[t]={:.2} lg[top]={:.2}",
+                    logits[target], logits[top]
+                );
+            }
+            nll += tok_nll;
             cnt += 1;
         }
         self.kv_cache.clear();
@@ -2309,12 +2354,10 @@ impl Pipeline {
                 self.rms_eps,
                 self.norm_style,
             );
-            let mut logits = self.lm_head_forward(&normed);
-            if let Some(c) = self.final_softcap {
-                for v in logits.iter_mut() {
-                    *v = c * (*v / c).tanh();
-                }
-            }
+            // lm_head_forward applies the final-logit softcap itself —
+            // capping again here double-squashed gemma-class logits
+            // (tanh∘tanh) and reported a flattered ppl.
+            let logits = self.lm_head_forward(&normed);
             let target = ids[pos + 1] as usize;
             let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
             let lse: f64 = logits
@@ -2323,7 +2366,20 @@ impl Pipeline {
                 .sum::<f64>()
                 .ln()
                 + max as f64;
-            nll += lse - logits[target] as f64;
+            let tok_nll = lse - logits[target] as f64;
+            if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
+                let top = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                eprintln!(
+                    "pos {pos:3} tgt {target:6} nll {tok_nll:7.3} | top1 {top:6} lg[t]={:.2} lg[top]={:.2}",
+                    logits[target], logits[top]
+                );
+            }
+            nll += tok_nll;
             cnt += 1;
         }
         self.kv_cache.clear();
@@ -2351,12 +2407,10 @@ impl Pipeline {
                 self.rms_eps,
                 self.norm_style,
             );
-            let mut logits = self.lm_head_forward(&normed);
-            if let Some(c) = self.final_softcap {
-                for v in logits.iter_mut() {
-                    *v = c * (*v / c).tanh();
-                }
-            }
+            // lm_head_forward applies the final-logit softcap itself —
+            // capping again here double-squashed gemma-class logits
+            // (tanh∘tanh) and reported a flattered ppl.
+            let logits = self.lm_head_forward(&normed);
             let target = ids[pos + 1] as usize;
             let (mut amax, mut mval) = (0usize, f32::NEG_INFINITY);
             for (i, &v) in logits.iter().enumerate() {
@@ -2406,12 +2460,10 @@ impl Pipeline {
                 self.rms_eps,
                 self.norm_style,
             );
-            let mut logits = self.lm_head_forward(&normed);
-            if let Some(c) = self.final_softcap {
-                for v in logits.iter_mut() {
-                    *v = c * (*v / c).tanh();
-                }
-            }
+            // lm_head_forward applies the final-logit softcap itself —
+            // capping again here double-squashed gemma-class logits
+            // (tanh∘tanh) and reported a flattered ppl.
+            let logits = self.lm_head_forward(&normed);
             let target = ids[pos + 1] as usize;
             let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
             let lse: f64 = logits
@@ -2420,7 +2472,20 @@ impl Pipeline {
                 .sum::<f64>()
                 .ln()
                 + max as f64;
-            nll += lse - logits[target] as f64;
+            let tok_nll = lse - logits[target] as f64;
+            if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
+                let top = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                eprintln!(
+                    "pos {pos:3} tgt {target:6} nll {tok_nll:7.3} | top1 {top:6} lg[t]={:.2} lg[top]={:.2}",
+                    logits[target], logits[top]
+                );
+            }
+            nll += tok_nll;
             cnt += 1;
             // Route on the evolving φ (drives the NEXT token's skill).
             let phi = self.dyn_phi_ema.clone();
@@ -2751,6 +2816,19 @@ impl Pipeline {
             if let Some(sc) = lw.layer_scale {
                 for v in h.iter_mut() {
                     *v *= sc;
+                }
+            }
+            if let Ok(tp) = std::env::var("CMF_TRACE_POS") {
+                if let Some(t) = tp.parse::<usize>().ok() {
+                    if t >= start_pos && t < start_pos + b {
+                        let bi = t - start_pos;
+                        let row = &h[bi * hs..(bi + 1) * hs];
+                        let n: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        eprintln!(
+                            "BATCH pos {t} after layer {li}: |h| = {n:.6} h0 {:.6} h1 {:.6}",
+                            row[0], row[1]
+                        );
+                    }
                 }
             }
             // CMF_DEBUG_LAYERS=1: per-layer hidden-state health of the
@@ -3552,6 +3630,15 @@ impl Pipeline {
             }
 
             let lw = &self.weights.layers[self.phys_layer(li)];
+            if let Ok(tp) = std::env::var("CMF_TRACE_POS") {
+                if tp.parse::<usize>().ok() == Some(position) {
+                    let n: f32 = h.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    eprintln!(
+                        "TRACE pos {position} layer {li}: |h| = {n:.6} h0 {:.6} h1 {:.6}",
+                        h[0], h[1]
+                    );
+                }
+            }
             // Norm into the pipeline scratch — the returning rms_norm
             // allocated twice per layer per token (roadmap §3 P0).
             inference::rms_norm_into(
