@@ -226,7 +226,17 @@ pub(crate) fn build_layer_ffn(
         )));
     }
     let top_k = top_k.min(experts.len());
-    Ok(FfnKind::Moe(MoeFfn {
+    // Gemma-4: per-expert weight scale after the top-k renorm; its
+    // presence also marks the scale-less-rms router input (the folded
+    // router gain — see the converter).
+    let pes_name = format!("{prefix}mlp.per_expert_scale");
+    let per_expert_scale = if model.tensor(&pes_name).is_some() {
+        Some(load_f32(model, &pes_name, ov).map_err(CmfError::Parse)?)
+    } else {
+        None
+    };
+    let router_input_norm = per_expert_scale.is_some();
+    let moe = MoeFfn {
         router,
         experts,
         top_k,
@@ -238,7 +248,29 @@ pub(crate) fn build_layer_ffn(
         shared,
         stats: std::cell::RefCell::new(Vec::new()),
         mask,
-    }))
+        per_expert_scale,
+        router_input_norm,
+    };
+    // Gemma-4 dual-branch layer: a dense MLP coexists with the routed
+    // experts, each branch inside its own norm sandwich.
+    if model
+        .tensor(&format!("{prefix}mlp.gate_proj.weight"))
+        .is_some()
+    {
+        let norm = |suffix: &str| -> Result<Vec<f32>, CmfError> {
+            load_f32(model, &format!("{prefix}{suffix}.weight"), ov).map_err(CmfError::Parse)
+        };
+        return Ok(FfnKind::DenseMoe(Box::new(
+            crate::pipeline::DenseMoeFfn {
+                dense: load_dense(&format!("{prefix}mlp."))?,
+                moe,
+                post_norm_1: norm("post_feedforward_layernorm_1")?,
+                pre_norm_2: norm("pre_feedforward_layernorm_2")?,
+                post_norm_2: norm("post_feedforward_layernorm_2")?,
+            },
+        )));
+    }
+    Ok(FfnKind::Moe(moe))
 }
 
 /// Task mask over routed experts (opt-in, experimental): DTG-MA applied

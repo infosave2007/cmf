@@ -265,6 +265,26 @@ pub enum FfnKind {
     /// expert logits → top-k, optional renorm; experts stay quantized
     /// in mmap — only the selected ones are touched per token.
     Moe(MoeFfn),
+    /// Gemma-4 MoE: a dense MLP branch AND a routed-expert branch in
+    /// the SAME layer, each with its own norm sandwich. The dense
+    /// branch reads the pre-FFN-normed input; the expert branch (and
+    /// the router) read the RAW residual through `pre_norm_2`:
+    ///   d = post_norm_1(dense(x̂));  m = post_norm_2(Σwₑ·FFNₑ(pre_norm_2(h)))
+    ///   ffn_out = d + m   (the caller's ffn_out_norm + residual follow)
+    DenseMoe(Box<DenseMoeFfn>),
+}
+
+/// Gemma-4 dual-branch FFN (see `FfnKind::DenseMoe`).
+pub struct DenseMoeFfn {
+    pub dense: DenseFfn,
+    pub moe: MoeFfn,
+    /// post_feedforward_layernorm_1 — dense-branch output norm.
+    pub post_norm_1: Vec<f32>,
+    /// pre_feedforward_layernorm_2 — expert-branch input norm (applied
+    /// to the RAW residual, not the pre-FFN-normed activation).
+    pub pre_norm_2: Vec<f32>,
+    /// post_feedforward_layernorm_2 — expert-branch output norm.
+    pub post_norm_2: Vec<f32>,
 }
 
 pub struct MoeFfn {
@@ -301,6 +321,13 @@ pub struct MoeFfn {
     /// softmax renormalizes over the allowed set. Built by the loader
     /// from CMF_MOE_MASK=<stats.json> + CMF_MOE_MASK_COVER. None = all.
     pub mask: Option<Vec<bool>>,
+    /// Gemma-4: per-expert weight scale applied AFTER the top-k renorm
+    /// (`router.per_expert_scale`). None = 1.0 everywhere.
+    pub per_expert_scale: Option<Vec<f32>>,
+    /// Gemma-4: the router reads a SCALE-LESS rms-norm of its input
+    /// (the constant gain router.scale·√hidden is folded into the
+    /// router weights at convert time).
+    pub router_input_norm: bool,
 }
 
 /// Attention operator of a layer. Extension point: new operators are
@@ -2565,6 +2592,23 @@ impl Pipeline {
             let mut ffn = match &lw.ffn {
                 FfnKind::Dense(d) => dense_ffn_batch(d, &post, b, pool.as_deref()),
                 FfnKind::Moe(m) => moe_ffn_batch(m, &post, b, hs, pool.as_deref(), None),
+                // Dual-branch layers run per position (the expert branch
+                // reads the raw residual — nothing to batch yet).
+                FfnKind::DenseMoe(dm) => {
+                    let mut out = vec![0.0f32; b * hs];
+                    for bi in 0..b {
+                        let r = dense_moe_ffn(
+                            dm,
+                            &post[bi * hs..(bi + 1) * hs],
+                            &h[bi * hs..(bi + 1) * hs],
+                            eps,
+                            norm_style,
+                            pool.as_deref(),
+                        );
+                        out[bi * hs..(bi + 1) * hs].copy_from_slice(&r);
+                    }
+                    out
+                }
             };
             if let Some(w) = &lw.ffn_out_norm {
                 for bi in 0..b {
@@ -2605,6 +2649,7 @@ impl Pipeline {
                     match &lw.ffn {
                         FfnKind::Moe(_) => "moe",
                         FfnKind::Dense(_) => "dense",
+                        FfnKind::DenseMoe(_) => "dense+moe",
                     },
                 );
             }
@@ -2955,10 +3000,12 @@ impl Pipeline {
                 let fk = match &lw.ffn {
                     FfnKind::Dense(_) => "Dense",
                     FfnKind::Moe(_) => "Moe",
+                    FfnKind::DenseMoe(_) => "DenseMoe",
                 };
                 eprintln!("graph L{li}: attn={ak} ffn={fk}");
             }
             let gffn = match &lw.ffn {
+                FfnKind::DenseMoe(_) => return None, // dual branch: CPU path
                 FfnKind::Dense(d) => crate::gpu::GraphFfn::Dense {
                     gate: gw(&d.gate_proj)?,
                     up: gw(&d.up_proj)?,
@@ -3639,7 +3686,7 @@ impl Pipeline {
                     d.up_proj.as_f32(),
                     d.down_proj.as_f32(),
                 ),
-                FfnKind::Moe(_) => (None, None, None),
+                FfnKind::Moe(_) | FfnKind::DenseMoe(_) => (None, None, None),
             };
             let ffn_out = match (ffn_masked, f32_ffn) {
                 (true, (Some(g), Some(u), Some(d))) => {
@@ -3695,14 +3742,32 @@ impl Pipeline {
                             .and_then(|tm| tm.expert_flags(li, m.experts.len()));
                         ffn_forward(&lw.ffn, post_normed, self.pool.as_deref(), allowed.as_deref())
                     }
+                    FfnKind::DenseMoe(dm) => dense_moe_ffn(
+                        dm,
+                        post_normed,
+                        &h,
+                        self.rms_eps,
+                        self.norm_style,
+                        self.pool.as_deref(),
+                    ),
                 },
-                (false, _) => {
-                    let allowed = match (&lw.ffn, task_mask) {
-                        (FfnKind::Moe(m), Some(tm)) => tm.expert_flags(li, m.experts.len()),
-                        _ => None,
-                    };
-                    ffn_forward(&lw.ffn, post_normed, self.pool.as_deref(), allowed.as_deref())
-                }
+                (false, _) => match &lw.ffn {
+                    FfnKind::DenseMoe(dm) => dense_moe_ffn(
+                        dm,
+                        post_normed,
+                        &h,
+                        self.rms_eps,
+                        self.norm_style,
+                        self.pool.as_deref(),
+                    ),
+                    _ => {
+                        let allowed = match (&lw.ffn, task_mask) {
+                            (FfnKind::Moe(m), Some(tm)) => tm.expert_flags(li, m.experts.len()),
+                            _ => None,
+                        };
+                        ffn_forward(&lw.ffn, post_normed, self.pool.as_deref(), allowed.as_deref())
+                    }
+                },
             };
             let ffn_out = match &self.weights.layers[self.phys_layer(li)].ffn_out_norm {
                 Some(w) => inference::rms_norm(&ffn_out, w, self.rms_eps, self.norm_style),
@@ -4506,7 +4571,7 @@ fn moe_ffn_cpu(
     let mut out = attention::take_buf(x.len());
     for &e in idx {
         let mut eo = dense_ffn(&m.experts[e], x, pool);
-        let w = p[e] / wsum;
+        let w = p[e] / wsum * m.per_expert_scale.as_ref().map_or(1.0, |v| v[e]);
         for i in 0..out.len() {
             out[i] += w * eo[i];
         }
@@ -4525,6 +4590,52 @@ fn moe_ffn_cpu(
         attention::recycle_buf(&mut so);
     }
     out
+}
+
+/// Gemma-4 dual-branch FFN (spec: see `FfnKind::DenseMoe`). The dense
+/// branch reads the pre-FFN-normed activation; the router and the
+/// expert branch read the RAW residual — the router through a
+/// scale-less rms norm (its constant gain is folded into the weights),
+/// the experts through `pre_norm_2`. CPU path; GPU graphs refuse the
+/// layer kind honestly.
+fn dense_moe_ffn(
+    dm: &DenseMoeFfn,
+    x_normed: &[f32],
+    h_raw: &[f32],
+    eps: f64,
+    norm_style: NormStyle,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let mut d = dense_ffn(&dm.dense, x_normed, pool);
+    d = inference::rms_norm(&d, &dm.post_norm_1, eps, norm_style);
+    let m = &dm.moe;
+    let ne = m.experts.len();
+    let mut logits = vec![0.0f32; ne];
+    if m.router_input_norm {
+        let ss: f32 = h_raw.iter().map(|v| v * v).sum::<f32>() / h_raw.len() as f32;
+        let inv = 1.0 / (ss + eps as f32).sqrt();
+        let xr: Vec<f32> = h_raw.iter().map(|v| v * inv).collect();
+        m.router.matvec(&xr, &mut logits, pool);
+    } else {
+        m.router.matvec(h_raw, &mut logits, pool);
+    }
+    let (idx, p, wsum) = moe_route(&logits, m, None);
+    {
+        let mut st = m.stats.borrow_mut();
+        if st.len() < ne {
+            st.resize(ne, 0);
+        }
+        for &e in &idx {
+            st[e] += 1;
+        }
+    }
+    let x2 = inference::rms_norm(h_raw, &dm.pre_norm_2, eps, norm_style);
+    let mo = moe_ffn_cpu(m, &x2, &idx, &p, wsum, pool);
+    let mo = inference::rms_norm(&mo, &dm.post_norm_2, eps, norm_style);
+    for (di, mi) in d.iter_mut().zip(&mo) {
+        *di += mi;
+    }
+    d
 }
 
 /// Building the MoE-layer GPU jobs: all selected experts (+shared) must
@@ -4568,6 +4679,10 @@ fn ffn_forward(
     match ffn {
         FfnKind::Dense(d) => dense_ffn(d, x, pool),
         FfnKind::Moe(m) => moe_ffn(m, x, pool, experts_allowed),
+        // Dual-branch layers need the raw residual — their callers
+        // dispatch dense_moe_ffn directly; the auxiliary paths that land
+        // here (MTP draft, o1 replay) do not co-occur with gemma-4 MoE.
+        FfnKind::DenseMoe(_) => unreachable!("DenseMoe dispatches via dense_moe_ffn"),
     }
 }
 
@@ -4589,6 +4704,7 @@ fn ffn_forward_pair(
                 moe_ffn(m, x2, pool, experts_allowed),
             );
         }
+        FfnKind::DenseMoe(_) => unreachable!("DenseMoe dispatches via dense_moe_ffn"),
     };
     let inter = d.gate_proj.rows();
     FFN_SCRATCH.with(|s| {
@@ -4936,6 +5052,8 @@ mod tests {
             shared: Some((shared, None)),
             stats: std::cell::RefCell::new(Vec::new()),
             mask: None,
+            per_expert_scale: None,
+            router_input_norm: false,
         };
         let actual = moe_ffn_cpu(&moe, &x, &[0], &[0.0], 1.0, None);
         for (actual, expected) in actual.iter().zip(expected) {

@@ -993,14 +993,17 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         .filter(|&n| n > 0)
         .map(|ne| {
             let mt = model_type.to_lowercase();
-            let ntp_default = mt.starts_with("qwen3_5") || mt.contains("qwen3_next");
+            let ntp_default =
+                mt.starts_with("qwen3_5") || mt.contains("qwen3_next") || mt.contains("gemma4");
             // LFM2-MoE routes with a sigmoid gate + selection bias (DeepSeek-V3
             // noaux_tc); Qwen keeps the softmax-over-all default.
             let is_lfm2 = mt.starts_with("lfm2");
             let is_laguna = mt == "laguna";
             MoeConfig {
                 num_experts: ne as usize,
-                top_k: cfg_usize(tc, "num_experts_per_tok").unwrap_or(2),
+                top_k: cfg_usize(tc, "num_experts_per_tok")
+                    .or_else(|| cfg_usize(tc, "top_k_experts"))
+                    .unwrap_or(2),
                 moe_intermediate_size: cfg_usize(tc, "moe_intermediate_size").unwrap_or(0),
                 norm_topk_prob: tc
                     .get("norm_topk_prob")
@@ -1070,13 +1073,6 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     // output scalars and final-logit capping. The dense 12B/31B variants
     // convert; the MoE / E-series machinery is refused honestly.
     if is_gemma4 {
-        if tc
-            .get("enable_moe_block")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            anyhow::bail!("{model_type}: gemma-4 MoE block (26B-A4B) is not supported yet");
-        }
         if cfg_usize(tc, "hidden_size_per_layer_input").unwrap_or(0) > 0 {
             anyhow::bail!(
                 "{model_type}: gemma-4 E-series per-layer inputs are not supported yet — \
@@ -2029,6 +2025,126 @@ pub fn run_convert(
             } else {
                 (m.shape.clone(), to_f32(&m.dtype, file.bytes(m))?)
             };
+
+            // Gemma-4 MoE: packed 3-D expert tensors + a router whose
+            // input gain (scale-less rms ⊙ router.scale · hidden^-1/2)
+            // folds entirely into the projection columns. Experts split
+            // into the canonical per-expert 2-D matrices; the fused
+            // gate_up halves are [gate | up] along the last axis.
+            if name.ends_with(".experts.gate_up_proj") || name.ends_with(".experts.down_proj") {
+                anyhow::ensure!(m_shape.len() == 3, "{name}: expected 3-D, got {:?}", m_shape);
+                let base = name
+                    .strip_suffix(".experts.gate_up_proj")
+                    .or_else(|| name.strip_suffix(".experts.down_proj"))
+                    .unwrap();
+                let (ne, d1, d2) = (m_shape[0], m_shape[1], m_shape[2]);
+                let is_gu = name.ends_with("gate_up_proj");
+                for e in 0..ne {
+                    let ev = &m_vals[e * d1 * d2..(e + 1) * d1 * d2];
+                    let emit = |tensors: &mut Vec<TensorSpec>,
+                                nm: String,
+                                vals: &[f32],
+                                rows: usize,
+                                cols: usize| {
+                        let (dt, data) = if rows * cols >= GROUP_SIZE && !force_f16(&nm) {
+                            quantize_2d(quant, vals, rows, cols)
+                        } else {
+                            (TensorDtype::F16, encode_f16(vals))
+                        };
+                        tensors.push(TensorSpec {
+                            name: nm,
+                            dtype: dt,
+                            shape: vec![rows, cols],
+                            data,
+                        });
+                    };
+                    if is_gu {
+                        // [hidden=d1, 2·mi=d2] → gate/up each [mi, hidden].
+                        let mi = d2 / 2;
+                        let mut gate = vec![0.0f32; mi * d1];
+                        let mut up = vec![0.0f32; mi * d1];
+                        for h in 0..d1 {
+                            for r in 0..mi {
+                                gate[r * d1 + h] = ev[h * d2 + r];
+                                up[r * d1 + h] = ev[h * d2 + mi + r];
+                            }
+                        }
+                        emit(
+                            &mut tensors,
+                            format!("{base}.mlp.experts.{e}.gate_proj.weight"),
+                            &gate,
+                            mi,
+                            d1,
+                        );
+                        emit(
+                            &mut tensors,
+                            format!("{base}.mlp.experts.{e}.up_proj.weight"),
+                            &up,
+                            mi,
+                            d1,
+                        );
+                    } else {
+                        // [mi=d1, hidden=d2] → down [hidden, mi].
+                        let mut down = vec![0.0f32; d2 * d1];
+                        for r in 0..d1 {
+                            for h in 0..d2 {
+                                down[h * d1 + r] = ev[r * d2 + h];
+                            }
+                        }
+                        emit(
+                            &mut tensors,
+                            format!("{base}.mlp.experts.{e}.down_proj.weight"),
+                            &down,
+                            d2,
+                            d1,
+                        );
+                    }
+                }
+                continue;
+            }
+            if name.ends_with(".router.proj.weight") {
+                anyhow::ensure!(m_shape.len() == 2, "{name}: expected 2-D, got {:?}", m_shape);
+                let (ne, hid) = (m_shape[0], m_shape[1]);
+                // Fold router.scale ⊙ hidden^-1/2 into the columns.
+                let scale_name = m.name.replace(".proj.weight", ".scale");
+                let mut scale_blob = None;
+                for f in &files {
+                    if let Some(t) = f.tensors.iter().find(|t| t.name == scale_name) {
+                        scale_blob = Some(to_f32(&t.dtype, f.bytes(t))?);
+                    }
+                }
+                let scale =
+                    scale_blob.ok_or_else(|| anyhow::anyhow!("missing {scale_name} for fold"))?;
+                anyhow::ensure!(scale.len() == hid, "{scale_name}: len != hidden");
+                let c = 1.0 / (hid as f32).sqrt();
+                let mut w = m_vals.clone();
+                for r in 0..ne {
+                    for j in 0..hid {
+                        w[r * hid + j] *= scale[j] * c;
+                    }
+                }
+                let base = name.strip_suffix(".router.proj.weight").unwrap();
+                tensors.push(TensorSpec {
+                    name: format!("{base}.mlp.gate.weight"),
+                    dtype: TensorDtype::F16,
+                    shape: vec![ne, hid],
+                    data: encode_f16(&w),
+                });
+                continue;
+            }
+            if name.ends_with(".router.scale") {
+                continue; // folded into the router projection above
+            }
+            if name.ends_with(".router.per_expert_scale") {
+                let base = name.strip_suffix(".router.per_expert_scale").unwrap();
+                tensors.push(TensorSpec {
+                    name: format!("{base}.mlp.per_expert_scale"),
+                    dtype: TensorDtype::F16,
+                    shape: vec![m_vals.len()],
+                    data: encode_f16(&m_vals),
+                });
+                continue;
+            }
 
             // qwen3_next / AgentWorld fuse the GDN projections (in_proj_qkvz /
             // in_proj_ba) with a group-interleaved layout; split them natively
