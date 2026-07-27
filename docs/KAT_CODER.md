@@ -31,7 +31,20 @@ Verified end-to-end on:
 
 ## 1. Install cortiq
 
-Release binaries ship with both GPU backends built in:
+The simplest route is crates.io (Rust installs with one command from
+[rustup.rs](https://rustup.rs)):
+
+```sh
+# macOS — Metal is always built in, nothing more to enable
+cargo install cortiq-cli
+
+# Linux / Windows — add the wgpu backend (Vulkan / DX12) for step 4a
+cargo install cortiq-cli --features gpu
+```
+
+Already installed once? Add `--force` to upgrade in place.
+
+Alternatively, release binaries ship with both GPU backends built in:
 
 ```sh
 # Linux x86_64
@@ -43,7 +56,7 @@ curl -LO https://github.com/infosave2007/cmf/releases/latest/download/cortiq-aar
 tar xzf cortiq-aarch64-apple-darwin.tar.gz && sudo mv cortiq /usr/local/bin/
 ```
 
-Or build from source (Rust via [rustup.rs](https://rustup.rs), one command):
+Or build from a source checkout (for hacking on cortiq itself):
 
 ```sh
 git clone https://github.com/infosave2007/cmf && cd cmf

@@ -32,7 +32,20 @@ Hugging Face до GPU-декода — каждая команда в том в�
 
 ## 1. Установить cortiq
 
-Релизные бинарники идут сразу с обоими GPU-бэкендами:
+Проще всего — через crates.io (Rust ставится одной командой с
+[rustup.rs](https://rustup.rs)):
+
+```sh
+# macOS — Metal вкомпилен всегда, ничего включать не нужно
+cargo install cortiq-cli
+
+# Linux / Windows — добавьте wgpu-бэкенд (Vulkan / DX12) для шага 4a
+cargo install cortiq-cli --features gpu
+```
+
+Уже стоит старая версия? Добавьте `--force` для обновления на месте.
+
+Альтернатива — релизные бинарники, они идут сразу с обоими GPU-бэкендами:
 
 ```sh
 # Linux x86_64
@@ -44,7 +57,7 @@ curl -LO https://github.com/infosave2007/cmf/releases/latest/download/cortiq-aar
 tar xzf cortiq-aarch64-apple-darwin.tar.gz && sudo mv cortiq /usr/local/bin/
 ```
 
-Либо сборка из исходников (Rust ставится с [rustup.rs](https://rustup.rs)):
+Либо сборка из чекаута исходников (если хочется править сам cortiq):
 
 ```sh
 git clone https://github.com/infosave2007/cmf && cd cmf
