@@ -77,6 +77,9 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
     // Laguna stores the router's auxiliary-loss-free selection bias under
     // `experts`, although it belongs to the router mathematically. CMF keeps
     // the canonical bias beside `mlp.gate.weight`.
+    if raw.contains(".mlp.shared_experts.") {
+        return Some(raw.replace(".mlp.shared_experts.", ".mlp.shared_expert."));
+    }
     if raw.ends_with(".mlp.experts.e_score_correction_bias") {
         return Some(raw.replace(".mlp.experts.e_score_correction_bias", ".mlp.expert_bias"));
     }
@@ -987,9 +990,18 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     // handling is unchanged (experts are ordinary 2-D matrices); we just declare
     // the MoE config so the runtime dispatches it. Router presence per layer
     // (in the directory) decides which layers are sparse.
+    // DeepSeek-V2 MLA geometry (kv_lora_rank marks the family).
+    let mla = cfg_usize(tc, "kv_lora_rank").map(|lora| cortiq_core::MlaConfig {
+        kv_lora_rank: lora,
+        qk_rope_head_dim: cfg_usize(tc, "qk_rope_head_dim").unwrap_or(64),
+        qk_nope_head_dim: cfg_usize(tc, "qk_nope_head_dim").unwrap_or(128),
+        v_head_dim: cfg_usize(tc, "v_head_dim").unwrap_or(128),
+        q_lora_rank: cfg_usize(tc, "q_lora_rank"),
+    });
     let moe = tc
         .get("num_experts")
         .and_then(|v| v.as_u64())
+        .or_else(|| tc.get("n_routed_experts").and_then(|v| v.as_u64()))
         .filter(|&n| n > 0)
         .map(|ne| {
             let mt = model_type.to_lowercase();
@@ -1009,7 +1021,15 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                     .get("norm_topk_prob")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(ntp_default),
-                shared_expert_intermediate_size: cfg_usize(tc, "shared_expert_intermediate_size"),
+                shared_expert_intermediate_size: cfg_usize(tc, "shared_expert_intermediate_size")
+                    .or_else(|| {
+                        // DeepSeek fuses its n shared experts into one
+                        // MLP of n·moe_intermediate_size.
+                        Some(
+                            cfg_usize(tc, "n_shared_experts")?
+                                * cfg_usize(tc, "moe_intermediate_size")?,
+                        )
+                    }),
                 router_sigmoid: is_lfm2 || is_laguna,
                 // A stored scale of 1.0 is the no-op default; only non-trivial
                 // scales need to ride in the header.
@@ -1123,6 +1143,10 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                     })? as usize,
                 beta_fast: r.get("beta_fast").and_then(|v| v.as_f64()).unwrap_or(32.0) as f32,
                 beta_slow: r.get("beta_slow").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                mscale_all_dim: r
+                    .get("mscale_all_dim")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32),
                 attention_factor: r
                     .get("attention_factor")
                     .and_then(|v| v.as_f64())
@@ -1267,6 +1291,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         global_partial_rotary_factor: g4_global_prf,
         final_logit_softcapping: tc.get("final_logit_softcapping").and_then(|v| v.as_f64()),
         attn_logit_softcapping: tc.get("attn_logit_softcapping").and_then(|v| v.as_f64()),
+        mla,
         attn_v_norm: is_gemma4,
         // Looped Transformer (Nanbeige 4.2): re-apply the layer stack num_loops times.
         num_loops: cfg_usize(tc, "num_loops").unwrap_or(1),
@@ -2025,6 +2050,46 @@ pub fn run_convert(
             } else {
                 (m.shape.clone(), to_f32(&m.dtype, file.bytes(m))?)
             };
+
+            // DeepSeek-V2 MLA: permute each q head to rope-first
+            // ([nope|rope] → [rope|nope]) so the runtime's standard
+            // partial rotary (first rotary_dim dims) covers it.
+            if arch.mla.is_some()
+                && (name.ends_with("self_attn.q_proj.weight")
+                    || name.ends_with("self_attn.q_b_proj.weight"))
+            {
+                let mla = arch.mla.as_ref().unwrap();
+                let (dr, dn) = (mla.qk_rope_head_dim, mla.qk_nope_head_dim);
+                let hd = dr + dn;
+                anyhow::ensure!(
+                    m_shape.len() == 2 && m_shape[0] % hd == 0,
+                    "{name}: rows {:?} not a multiple of qk head dim {hd}",
+                    m_shape
+                );
+                let cols = m_shape[1];
+                let nh = m_shape[0] / hd;
+                let mut w = vec![0.0f32; m_vals.len()];
+                for h in 0..nh {
+                    for r in 0..dr {
+                        w[(h * hd + r) * cols..(h * hd + r + 1) * cols].copy_from_slice(
+                            &m_vals[(h * hd + dn + r) * cols..(h * hd + dn + r + 1) * cols],
+                        );
+                    }
+                    for r in 0..dn {
+                        w[(h * hd + dr + r) * cols..(h * hd + dr + r + 1) * cols].copy_from_slice(
+                            &m_vals[(h * hd + r) * cols..(h * hd + r + 1) * cols],
+                        );
+                    }
+                }
+                let (dt, data) = quantize_2d(quant, &w, m_shape[0], cols);
+                tensors.push(TensorSpec {
+                    name,
+                    dtype: dt,
+                    shape: m_shape.clone(),
+                    data,
+                });
+                continue;
+            }
 
             // Gemma-4 MoE: packed 3-D expert tensors + a router whose
             // input gain (scale-less rms ⊙ router.scale · hidden^-1/2)

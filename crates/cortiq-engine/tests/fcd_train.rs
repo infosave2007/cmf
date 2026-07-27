@@ -82,6 +82,7 @@ fn tiny_arch() -> ModelArch {
         global_partial_rotary_factor: None,
         final_logit_softcapping: None,
         attn_logit_softcapping: None,
+        mla: None,
         attn_v_norm: false,
         num_loops: 1,
         loop_final_norm: false,

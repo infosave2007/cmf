@@ -237,6 +237,24 @@ pub struct YarnConfig {
     pub beta_slow: f32,
     #[serde(default = "default_one")]
     pub attention_factor: f32,
+    /// DeepSeek-V2 YaRN: softmax-scale correction exponent base
+    /// (`mscale_all_dim`); the loader folds
+    /// (0.1·m·ln(factor)+1)² into the attention scale. 0 = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mscale_all_dim: Option<f32>,
+}
+
+/// DeepSeek-V2 Multi-head Latent Attention geometry (spec: additive
+/// header block; tensors ride under their HF names).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MlaConfig {
+    pub kv_lora_rank: usize,
+    pub qk_rope_head_dim: usize,
+    pub qk_nope_head_dim: usize,
+    pub v_head_dim: usize,
+    /// Present on the big V2/V3 (compressed q); Lite projects q directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_lora_rank: Option<usize>,
 }
 
 fn default_yarn_beta_fast() -> f32 {
@@ -322,6 +340,9 @@ pub struct ModelArch {
     /// Final-logit soft-capping: logits = C·tanh(logits/C) (Gemma-4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_logit_softcapping: Option<f64>,
+    /// DeepSeek-V2 MLA block; None for every other family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mla: Option<MlaConfig>,
     /// Gemma-2: attention scores pass tanh(s/c)·c before the causal
     /// softmax (attn_logit_softcapping). None = off.
     #[serde(default, skip_serializing_if = "Option::is_none")]

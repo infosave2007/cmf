@@ -619,6 +619,43 @@ impl Pipeline {
                     .tensor(&format!("{prefix}{suffix}"))
                     .and_then(|_| load_f32(model, &format!("{prefix}{suffix}"), ov).ok())
             };
+            // DeepSeek-V2 MLA: the latent projections replace the k/v pair.
+            if let Some(mla) = arch.mla.as_ref() {
+                if mla.q_lora_rank.is_some() {
+                    return Err(CmfError::Parse(
+                        "MLA with compressed q (q_lora_rank) is not supported yet — \
+                         DeepSeek-V2-Lite converts natively"
+                            .into(),
+                    ));
+                }
+                let q_proj = t("self_attn.q_proj.weight")?;
+                let hd = mla.qk_rope_head_dim + mla.qk_nope_head_dim;
+                let nh = q_proj.rows() / hd;
+                // YaRN mscale²: DeepSeek corrects the softmax scale by
+                // (0.1·mscale_all_dim·ln(factor)+1)².
+                let mut scale = 1.0 / (hd as f32).sqrt();
+                if let Some(y) = arch.yarn.as_ref() {
+                    if let Some(m) = y.mscale_all_dim.filter(|&m| m > 0.0) {
+                        let ms = 0.1 * m * y.factor.ln() + 1.0;
+                        scale *= ms * ms;
+                    }
+                }
+                return Ok(AttnKind::Mla(Box::new(crate::pipeline::MlaWeights {
+                    q_proj,
+                    kv_a: t("self_attn.kv_a_proj_with_mqa.weight")?,
+                    kv_a_norm: n("self_attn.kv_a_layernorm.weight").ok_or_else(|| {
+                        CmfError::Parse(format!("{prefix}: MLA needs kv_a_layernorm"))
+                    })?,
+                    kv_b: t("self_attn.kv_b_proj.weight")?,
+                    o_proj: t("self_attn.o_proj.weight")?,
+                    nh,
+                    qk_rope: mla.qk_rope_head_dim,
+                    qk_nope: mla.qk_nope_head_dim,
+                    v_dim: mla.v_head_dim,
+                    lora: mla.kv_lora_rank,
+                    scale,
+                })));
+            }
             let wq = t("self_attn.q_proj.weight")?;
             let nh = layer
                 .and_then(|li| {
@@ -1002,6 +1039,26 @@ impl Pipeline {
                         pipeline.kv_cache.layers[li] = crate::kv_cache::LayerKvCache::new(gkv, ghd);
                     }
                 }
+            }
+        }
+        // MLA (DeepSeek-V2): the expand-to-MHA cache holds nh heads of
+        // rope+nope dims; rotary covers the rope prefix.
+        if let Some(mla) = arch.mla.as_ref() {
+            let hd = mla.qk_rope_head_dim + mla.qk_nope_head_dim;
+            pipeline.head_dim = hd;
+            pipeline.num_kv_heads = arch.num_attention_heads;
+            pipeline.rotary_dim = mla.qk_rope_head_dim;
+            let half = mla.qk_rope_head_dim / 2;
+            let mut f = vec![0.0f32; half];
+            for (i, slot) in f.iter_mut().enumerate() {
+                *slot = 1.0
+                    / (arch.rope_theta as f32)
+                        .powf(2.0 * i as f32 / mla.qk_rope_head_dim as f32);
+            }
+            pipeline.inv_freq = std::sync::Arc::new(f);
+            for li in 0..arch.num_layers {
+                pipeline.kv_cache.layers[li] =
+                    crate::kv_cache::LayerKvCache::new(arch.num_attention_heads, hd);
             }
         }
         pipeline.attn_v_norm = arch.attn_v_norm;
