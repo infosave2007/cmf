@@ -309,9 +309,10 @@ enum Commands {
     MoeDefrag {
         /// Source .cmf model
         model: String,
-        /// Expert-selection stats JSON (CMF_MOE_STATS dump)
+        /// Expert-selection stats JSON (CMF_MOE_STATS dump); omit to
+        /// reuse the routing counts embedded by a previous moe-defrag
         #[arg(long)]
-        stats: String,
+        stats: Option<String>,
         /// Per-layer routing-mass fraction to keep (0–1]
         #[arg(long, default_value = "0.95")]
         cover: f64,
@@ -962,7 +963,7 @@ async fn main() -> anyhow::Result<()> {
             stats,
             cover,
             output,
-        } => moedefrag::cmd_moe_defrag(&model, &stats, cover, &output),
+        } => moedefrag::cmd_moe_defrag(&model, stats.as_deref(), cover, &output),
         Commands::ImportGguf {
             gguf,
             output,

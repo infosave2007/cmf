@@ -64,7 +64,7 @@ pub fn cmd_compact(model_path: &str, output: &str) -> anyhow::Result<()> {
 
 pub fn cmd_moe_defrag(
     model_path: &str,
-    stats_path: &str,
+    stats_path: Option<&str>,
     cover: f64,
     output: &str,
 ) -> anyhow::Result<()> {
@@ -72,10 +72,32 @@ pub fn cmd_moe_defrag(
         bail!("--cover must be in (0, 1]");
     }
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
-    let stats: HashMap<String, Vec<u64>> = serde_json::from_str(
-        &std::fs::read_to_string(stats_path).with_context(|| format!("reading {stats_path}"))?,
-    )
-    .with_context(|| format!("parsing {stats_path}"))?;
+    // Stats: an explicit CMF_MOE_STATS dump, or — for re-defragging an
+    // already-cut specialist tighter — the routing counts embedded in
+    // the source file's provenance by a previous moe-defrag.
+    let (stats_text, stats_origin): (String, String) = match stats_path {
+        Some(p) => (
+            std::fs::read_to_string(p).with_context(|| format!("reading {p}"))?,
+            p.to_string(),
+        ),
+        None => {
+            let counts = model
+                .header
+                .provenance
+                .as_ref()
+                .and_then(|p| p.get("moe_defrag"))
+                .and_then(|d| d.get("routing_counts"))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--stats not given and the file carries no embedded \
+                         routing counts (provenance.moe_defrag.routing_counts)"
+                    )
+                })?;
+            (counts.to_string(), "embedded provenance".to_string())
+        }
+    };
+    let stats: HashMap<String, Vec<u64>> =
+        serde_json::from_str(&stats_text).with_context(|| format!("parsing {stats_origin}"))?;
 
     // Per-layer plan: kept old indices (ascending — renumbering keeps
     // relative order) and old → new contiguous index.
@@ -107,7 +129,7 @@ pub fn cmd_moe_defrag(
         );
     }
     if remap.is_empty() {
-        bail!("no usable layer stats in {stats_path}");
+        bail!("no usable layer stats in {stats_origin}");
     }
 
     // Pass 1: gather each masked layer's router rows into owned buffers
@@ -186,11 +208,23 @@ pub fn cmd_moe_defrag(
     let mut kept_per_layer: Vec<(usize, usize)> =
         remap.iter().map(|(&li, m)| (li, m.len())).collect();
     kept_per_layer.sort_unstable();
-    let stats_bytes = std::fs::read(stats_path)?;
+    // The claim-12 B-field rides INSIDE the specialist, remapped to the
+    // new expert numbering — the file explains its own cut, and a later
+    // `moe-defrag` without --stats can tighten it further.
+    let mut routing_counts = serde_json::Map::new();
+    for (k, counts) in &stats {
+        let Ok(li) = k.parse::<usize>() else { continue };
+        let Some(map) = remap.get(&li) else { continue };
+        let mut remapped = vec![0u64; map.len()];
+        for (&old, &new) in map {
+            remapped[new] = counts[old];
+        }
+        routing_counts.insert(k.clone(), serde_json::json!(remapped));
+    }
     let prov = serde_json::json!({
         "tool": format!("cortiq moe-defrag {}", env!("CARGO_PKG_VERSION")),
         "cover": cover,
-        "stats_hash64": format!("{:016x}", cortiq_core::hash64(&stats_bytes)),
+        "stats_hash64": format!("{:016x}", cortiq_core::hash64(stats_text.as_bytes())),
         "num_experts_pre": header
             .arch
             .moe
@@ -201,6 +235,7 @@ pub fn cmd_moe_defrag(
             .iter()
             .map(|&(_, k)| k)
             .collect::<Vec<_>>(),
+        "routing_counts": serde_json::Value::Object(routing_counts),
     });
     match header.provenance.as_mut() {
         Some(serde_json::Value::Object(map)) => {
