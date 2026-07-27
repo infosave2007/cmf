@@ -319,9 +319,14 @@ GGUF import covers `Q4_0/1`, `Q5_0/1`, `Q8_0`, `Q2_K`…`Q6_K`, `IQ4_NL/XS` and
 `BF16` — including the Qwen3.6-MoE / KAT-Coder class (`qwen35moe`:
 GatedDeltaNet hybrid + routed experts), where every llama.cpp storage
 convention is undone on import. A 34.7B-A3B coder decodes at 16.6 tok/s
-on a 32-core CPU where llama.cpp does 4.7 on the same file, and
-`CMF_MOE_TAU=0.9` (confidence-adaptive expert routing) adds ~12% on
-top at equal-or-better perplexity than the model's own fixed top-k.
+on a 32-core CPU where llama.cpp does 4.7 on the same file — and at
+**32.8 tok/s on an RTX 5090**, where the router, the top-k expert
+selection and every selected expert run inside the single-submit GPU
+graph (0.5.25). `CMF_MOE_TAU=0.9` (confidence-adaptive expert routing)
+adds ~12% on the CPU path at equal-or-better perplexity than the
+model's own fixed top-k. A step-by-step walkthrough — download,
+convert, run on Vulkan and Metal — is in
+[docs/KAT_CODER.md](docs/KAT_CODER.md).
 
 ### 1-bit models (Bonsai / BitNet class)
 
@@ -552,9 +557,14 @@ in one submit with one readback per token, and attention uses split-K
 flash-decoding so throughput holds at depth. Measured on an RTX 4090:
 Bonsai-27B q1 decodes at **40 tok/s** (7.7× the CPU path, still 38 at a
 4K-token context), Bonsai-1.7B q1 at 154 tok/s (95+ out to ctx 2048),
-Nanbeige4.2-3B at 31 tok/s. Output is distribution-equivalent to the CPU
-path, same as the Metal graph. `CMF_GPU_WGPU_GRAPH=0` reverts to per-op
-offload.
+Nanbeige4.2-3B at 31 tok/s. Since 0.5.25 routed MoE rides the same
+graph: the router matvec, the on-device top-k selection and every
+selected expert (plus the shared expert) execute in the same one submit
+per token — KAT-Coder 34.7B-A3B decodes at **32.8 tok/s on an RTX 5090**
+vs 14.4 on its 32-core host CPU
+([step-by-step guide](docs/KAT_CODER.md)). Output is
+distribution-equivalent to the CPU path, same as the Metal graph.
+`CMF_GPU_WGPU_GRAPH=0` reverts to per-op offload.
 
 For everything else, enabling the GPU never makes you slower: per-op
 offload pays a fixed submit+poll latency that differs by an order of

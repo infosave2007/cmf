@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.25] — 2026-07-27
+
+### Added
+- **Routed MoE inside the whole-token GPU graph** (wgpu / Vulkan &
+  DX12). A MoE layer no longer breaks the one-submit-per-token decode
+  graph: the router matvec, the shared-expert gate, the top-k
+  selection, the fused gate+up+SiLU over every selected expert and the
+  weighted down-projection all execute on-device, in one compute pass
+  per layer. Expert weights live in per-layer concatenated buffers
+  (the always-on shared expert rides as the trailing block, pinned by
+  the select kernel with its sigmoid weight), counted against the
+  usual VRAM budget. The select kernel is fully parallel — k rounds of
+  an argmax reduction with lowest-index tie-breaking that matches the
+  CPU scan on routing decisions; the serial one-thread top-k it
+  replaces cost 22 ms/token at k=8 across 40 layers. Scope: softmax
+  routers with a shared expert and q4t expert weights, ≤256 routed
+  experts, top-k <16 (the KAT-Coder / Qwen3.6-MoE class);
+  sigmoid/biased routers and `CMF_MOE_TAU` keep the CPU path.
+  Measured on KAT-Coder-V2.5-Dev (34.7B-A3B) on an RTX 5090: decode
+  **32.8 tok/s steady vs 14.4 on the host's 32-core CPU (2.3×)**,
+  15.6 ms/token forward, output token-coherent. A step-by-step
+  walkthrough from GGUF download to GPU decode on both Vulkan and
+  Metal is in [docs/KAT_CODER.md](docs/KAT_CODER.md).
+- **q4_tiled MoE expert blocks on both per-op GPU backends** (Metal +
+  wgpu) — MoE models whose experts quantize to q4t now qualify for the
+  per-op expert offload path (previously q1-only), with the runtime
+  probe arbitrating as usual.
+- `CMF_GRAPH_PROF=1` now also prints the caller-side total per token,
+  so graph-build cost is visible next to encode and submit+readback.
+
+### Fixed
+- **GPU-vs-CPU probe verdicts now compare per-arm minima** instead of
+  means. A first CPU op measured mmap-cold (page-fault storm, ~3×
+  steady state) could poison the CPU arm's mean and lock a losing GPU
+  path for the whole process; minima measure honest steady state.
+- Uploading many large weight buffers before the first submit no
+  longer transiently doubles memory (the staging belt is flushed per
+  MoE layer) — fixes a device OOM on discrete cards when a 17 GB
+  expert set was staged all at once.
+- `import-gguf --quant` help text now lists the full codec set
+  (`q4t`, `q1` were accepted but undocumented).
+
 ## [0.5.24] — 2026-07-27
 
 ### Added

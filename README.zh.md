@@ -283,8 +283,11 @@ GGUF 导入覆盖 `Q4_0/1`、`Q5_0/1`、`Q8_0`、`Q2_K`…`Q6_K`、`IQ4_NL/XS` �
 包括 Qwen3.6-MoE / KAT-Coder 一类（`qwen35moe`：GatedDeltaNet 混合 +
 路由专家），llama.cpp 的所有存储约定在导入时都会被还原。一个 34.7B-A3B
 代码模型在 32 核 CPU 上解码 16.6 tok/s，而 llama.cpp 在同一文件上是
-4.7；`CMF_MOE_TAU=0.9`（按置信度自适应的专家路由）再加约 12%，困惑度
-不逊于模型自带的固定 top-k。
+4.7；在 RTX 5090 上达到 **32.8 tok/s**——路由器、top-k 专家选择和所有
+被选中的专家都在单次 submit 的 GPU 计算图内执行（0.5.25）。
+`CMF_MOE_TAU=0.9`（按置信度自适应的专家路由）在 CPU 路径上再加约 12%，
+困惑度不逊于模型自带的固定 top-k。从下载、转换到 Vulkan 与 Metal 上
+运行的分步指南见 [docs/KAT_CODER.md](docs/KAT_CODER.md)。
 
 ### 1 位模型（Bonsai / BitNet 一类）
 
@@ -490,7 +493,11 @@ CPU 路径在分布上等价（首词元概率相差约 0.3% 以内，PPL 一致
 边界——在一次 submit 中执行，每词元只回读一次；注意力采用 split-K
 flash-decoding，深上下文下吞吐不塌。RTX 4090 实测：Bonsai-27B q1 解码
 **40 tok/s**（CPU 路径的 7.7 倍，4K 上下文仍有 38），Bonsai-1.7B q1
-154 tok/s（到 ctx 2048 仍有 95+），Nanbeige4.2-3B 31 tok/s。输出与 CPU
+154 tok/s（到 ctx 2048 仍有 95+），Nanbeige4.2-3B 31 tok/s。自 0.5.25
+起，路由 MoE 也在同一计算图内：路由器 matvec、设备端 top-k 选择和每个
+被选中的专家（含共享专家）都在同一次 submit 中执行——KAT-Coder
+34.7B-A3B 在 RTX 5090 上解码 **32.8 tok/s**，同机 32 核 CPU 为 14.4
+（[分步指南](docs/KAT_CODER.md)）。输出与 CPU
 路径分布等价，与 Metal 计算图相同。`CMF_GPU_WGPU_GRAPH=0` 回退到逐操作
 offload。
 
