@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.27] — 2026-07-27
+
+### Added
+- **`cortiq moe-defrag` — carve a task specialist out of a MoE model.**
+  MoE expert usage turns out to be strongly task-conditional (measured
+  on KAT-Coder 34.7B-A3B: the top-64 expert sets for code vs prose
+  overlap with Jaccard 0.25 — near-disjoint), so a model serving ONE
+  task carries hundreds of experts it never routes to. The pipeline:
+  run the task's representative corpus once with `CMF_MOE_STATS=f.json`
+  (per-layer expert-selection counts), then
+  `cortiq moe-defrag model.cmf --stats f.json --cover 0.95 --output
+  specialist.cmf` keeps, per layer, the smallest top expert set
+  reaching that fraction of the routing mass, renumbers the kept
+  experts into a contiguous prefix, slices the router's rows to match
+  and drops the rest from the file. Softmax renormalizes over the kept
+  set. Measured on KAT-Coder, code-calibrated at 95% cover, on an M4
+  24 GB: **19.6 → 12.7 GB (−35%)**, held-out code perplexity 5.058 →
+  5.198 (+2.8%) — and because the specialist now fits the machine's
+  memory where the full model paged, decode goes **7.6 → 13.7 tok/s
+  (×1.8)** and prefill **6.1 → 20.0 tok/s (×3.3)**.
+- **`CMF_MOE_MASK=<stats.json>`** (+ `CMF_MOE_MASK_COVER`, default
+  0.9): the same expert restriction applied at RUNTIME, no file
+  rewrite — selection happens over the allowed set only. Use it to
+  ppl-gate a mask before committing to the physical defrag (the two
+  are semantically identical; measured ppl matches to 3 digits).
+- `CmfModel::write_ref` (+ `TensorSpecRef`): container rewrite with
+  borrowed payloads sliced from the source mmap — a 19.6 GB model
+  repacks in 94 s without materializing its tensors in RAM.
+
+### Changed
+- MoE expert lists now enumerate by tensor presence up to the header
+  count (a defrag'd layer keeps fewer than `arch.moe.num_experts`);
+  the router's row count must match the expert count, and `top_k`
+  clamps to it. Files with the full expert set load exactly as before.
+
 ## [0.5.26] — 2026-07-27
 
 ### Changed

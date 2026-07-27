@@ -62,7 +62,7 @@ git clone https://github.com/infosave2007/cmf && cd cmf
 cargo build --release -p cortiq-cli
 ```
 
-Check: `cortiq --version` → 0.5.26 or newer.
+Check: `cortiq --version` → 0.5.27 or newer.
 
 ## 2. Convert: GGUF → .cmf (identical on both platforms)
 
@@ -151,7 +151,34 @@ bandwidth, and the probe correctly refuses losing offloads. Dense and q1
 models get the full Metal graph (a 27B q1 decodes at 11–12 tok/s on the
 same M4); porting the MoE graph to Metal is on the roadmap.
 
-## 5. Optional levers (both platforms)
+## 5. Carve a coder specialist (optional, both platforms)
+
+Expert usage in a MoE is strongly task-conditional — on KAT, code and
+prose route to near-disjoint expert sets (top-64 Jaccard 0.25). If the
+model will serve ONE task, it carries hundreds of experts it never
+routes to. Two commands remove them:
+
+```sh
+# 1. Record which experts your task actually uses (any representative
+#    corpus; here: source files of a codebase, ~5 min on an M4)
+CMF_MOE_STATS=code_stats.json cortiq ppl kat-q4t.cmf --file my_code.txt --tokens 3072
+
+# 2. Drop everything outside 95% of the recorded routing mass
+cortiq moe-defrag kat-q4t.cmf --stats code_stats.json --cover 0.95 --output kat-coder.cmf
+```
+
+Measured (code-calibrated, scored on held-out code, M4 24 GB):
+**19.6 → 12.7 GB (−35%)** at +2.8% perplexity — and because 12.7 GB
+fits the machine's memory where the full model paged, decode goes
+**7.6 → 13.7 tok/s (×1.8)** and prefill **6.1 → 20.0 (×3.3)**. The
+specialist is a normal `.cmf` — every command above works on it
+unchanged. Preview a cover level without rewriting the file:
+`CMF_MOE_MASK=code_stats.json CMF_MOE_MASK_COVER=0.95 cortiq ppl …`
+applies the same restriction at runtime (identical math), so you can
+ppl-gate before committing. Off-task quality degrades by design —
+the code mask covers only ~39% of prose routing mass.
+
+## 6. Optional levers (both platforms)
 
 ```sh
 CMF_MOE_TAU=0.9  cortiq run kat-q4t.cmf ...   # confidence-adaptive routing: ~+12% decode,

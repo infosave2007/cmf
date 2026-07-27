@@ -266,6 +266,7 @@ cargo add cortiq-core                    # or use the format from your own Rust 
 | `cortiq diff a.cmf b.cmf` | 两个模型版本之间改了什么 |
 | `cortiq route` · `explain` | 路由器选了哪个技能，以及为什么 |
 | `cortiq skill add` · `list` | 从供体检查点烘焙技能（[指南](docs/SKILLS.zh.md)）；列出文件的技能 |
+| `cortiq moe-defrag` | 丢弃任务从不路由到的 MoE 专家——得到更小更快的专才模型 |
 | `cortiq imagine model.cmf --prompt "…"` | 文本 → 图片（Lumina-Image 2.0），纯 Rust，CPU 或 Metal |
 | `cortiq imagine-pack <diffusers-dir>` | 把文本编码器 + DiT + VAE + 分词器打包成一个量化 `.cmf` |
 
@@ -286,8 +287,14 @@ GGUF 导入覆盖 `Q4_0/1`、`Q5_0/1`、`Q8_0`、`Q2_K`…`Q6_K`、`IQ4_NL/XS` �
 4.7；在 RTX 5090 上达到 **32.8 tok/s**——路由器、top-k 专家选择和所有
 被选中的专家都在单次 submit 的 GPU 计算图内执行（0.5.25）。
 `CMF_MOE_TAU=0.9`（按置信度自适应的专家路由）在 CPU 路径上再加约 12%，
-困惑度不逊于模型自带的固定 top-k。从下载、转换到 Vulkan 与 Metal 上
-运行的分步指南见 [docs/KAT_CODER.md](docs/KAT_CODER.md)。
+困惑度不逊于模型自带的固定 top-k。而且专家使用高度依赖任务（代码与散文
+路由到几乎不相交的专家集合——top-64 Jaccard 仅 0.25），`cortiq
+moe-defrag`（0.5.27）会物理丢弃任务从不使用的专家：按代码校准保留 95%
+路由质量后，同一代码模型缩至 **19.6 → 12.7 GB（−35%）**，代码困惑度仅
++2.8%——在 24 GB 的 MacBook 上，完整模型需要换页，而专才模型完全装进
+内存，解码快 **1.8 倍**（prefill 3.3 倍）。从下载、转换、在 Vulkan 与
+Metal 上运行到裁出专才模型的分步指南见
+[docs/KAT_CODER.md](docs/KAT_CODER.md)。
 
 ### 1 位模型（Bonsai / BitNet 一类）
 

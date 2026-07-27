@@ -302,6 +302,7 @@ set `CMF_GPU=1` to use it (see [GPU](#gpu)).
 | `cortiq diff a.cmf b.cmf` | what changed between two model versions |
 | `cortiq route` · `explain` | which skill the router picks, and why |
 | `cortiq skill add` · `list` | bake a skill from a donor checkpoint ([guide](docs/SKILLS.md)); list a file's skills |
+| `cortiq moe-defrag` | drop the MoE experts a task never routes to — a smaller, faster specialist |
 | `cortiq imagine model.cmf --prompt "…"` | text → image (Lumina-Image 2.0), native Rust, CPU or Metal |
 | `cortiq imagine-pack <diffusers-dir>` | pack text encoder + DiT + VAE + tokenizer into one quantized `.cmf` |
 
@@ -324,8 +325,15 @@ on a 32-core CPU where llama.cpp does 4.7 on the same file — and at
 selection and every selected expert run inside the single-submit GPU
 graph (0.5.25). `CMF_MOE_TAU=0.9` (confidence-adaptive expert routing)
 adds ~12% on the CPU path at equal-or-better perplexity than the
-model's own fixed top-k. A step-by-step walkthrough — download,
-convert, run on Vulkan and Metal — is in
+model's own fixed top-k. And since expert usage is strongly
+task-conditional (code and prose route to near-disjoint expert sets —
+top-64 Jaccard 0.25), `cortiq moe-defrag` (0.5.27) physically drops
+the experts a task never uses: code-calibrated at 95% routing mass,
+the same coder shrinks **19.6 → 12.7 GB (−35%)** at +2.8% code
+perplexity — and on a 24 GB MacBook, where the full model paged,
+the specialist fits in memory and decodes **×1.8 faster** (prefill
+×3.3). A step-by-step walkthrough — download, convert, run on Vulkan
+and Metal, carve a specialist — is in
 [docs/KAT_CODER.md](docs/KAT_CODER.md).
 
 ### 1-bit models (Bonsai / BitNet class)
