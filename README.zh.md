@@ -267,6 +267,9 @@ cargo add cortiq-core                    # or use the format from your own Rust 
 | `cortiq route` · `explain` | 路由器选了哪个技能，以及为什么 |
 | `cortiq skill add` · `list` | 从供体检查点烘焙技能（[指南](docs/SKILLS.zh.md)）；列出文件的技能 |
 | `cortiq moe-defrag` | 丢弃任务从不路由到的 MoE 专家——得到更小更快的专才模型 |
+| `cortiq moe-mask` | 可切换的孪生：把专家限制烘焙为任务掩码——一个文件、多个专才（`run --task`） |
+| `cortiq sign` · `verify` | 对文件 SHA-256 的分离式 Ed25519 签名；verify 同时校验完整性与真实性 |
+| `cortiq compact` | append-only 技能增长后的紧致容器重写 |
 | `cortiq imagine model.cmf --prompt "…"` | 文本 → 图片（Lumina-Image 2.0），纯 Rust，CPU 或 Metal |
 | `cortiq imagine-pack <diffusers-dir>` | 把文本编码器 + DiT + VAE + 分词器打包成一个量化 `.cmf` |
 
@@ -292,9 +295,11 @@ GGUF 导入覆盖 `Q4_0/1`、`Q5_0/1`、`Q8_0`、`Q2_K`…`Q6_K`、`IQ4_NL/XS` �
 moe-defrag`（0.5.27）会物理丢弃任务从不使用的专家：按代码校准保留 95%
 路由质量后，同一代码模型缩至 **19.6 → 12.7 GB（−35%）**，代码困惑度仅
 +2.8%——在 24 GB 的 MacBook 上，完整模型需要换页，而专才模型完全装进
-内存，解码快 **1.8 倍**（prefill 3.3 倍）。从下载、转换、在 Vulkan 与
-Metal 上运行到裁出专才模型的分步指南见
-[docs/KAT_CODER.md](docs/KAT_CODER.md)。
+内存，解码快 **1.8 倍**（prefill 3.3 倍）。想要一个文件装多个可切换
+专才？`cortiq moe-mask`（0.5.28）把同样的限制烘焙为命名任务掩码——
+完整专家集保留，`run --task coder` 在推理时收窄路由，与物理切除逐
+词元一致。从下载、转换、在 Vulkan 与 Metal 上运行到裁出专才模型的
+分步指南见 [docs/KAT_CODER.md](docs/KAT_CODER.md)。
 
 ### 1 位模型（Bonsai / BitNet 一类）
 

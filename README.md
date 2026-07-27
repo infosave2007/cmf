@@ -303,6 +303,9 @@ set `CMF_GPU=1` to use it (see [GPU](#gpu)).
 | `cortiq route` · `explain` | which skill the router picks, and why |
 | `cortiq skill add` · `list` | bake a skill from a donor checkpoint ([guide](docs/SKILLS.md)); list a file's skills |
 | `cortiq moe-defrag` | drop the MoE experts a task never routes to — a smaller, faster specialist |
+| `cortiq moe-mask` | the switchable twin: bake expert restrictions as task masks — one file, many specialists (`run --task`) |
+| `cortiq sign` · `verify` | detached Ed25519 signature over the file's SHA-256; verify checks integrity + authenticity |
+| `cortiq compact` | tight container rewrite after append-only skill growth |
 | `cortiq imagine model.cmf --prompt "…"` | text → image (Lumina-Image 2.0), native Rust, CPU or Metal |
 | `cortiq imagine-pack <diffusers-dir>` | pack text encoder + DiT + VAE + tokenizer into one quantized `.cmf` |
 
@@ -332,8 +335,11 @@ the experts a task never uses: code-calibrated at 95% routing mass,
 the same coder shrinks **19.6 → 12.7 GB (−35%)** at +2.8% code
 perplexity — and on a 24 GB MacBook, where the full model paged,
 the specialist fits in memory and decodes **×1.8 faster** (prefill
-×3.3). A step-by-step walkthrough — download, convert, run on Vulkan
-and Metal, carve a specialist — is in
+×3.3). Prefer one file with SWITCHABLE specialists? `cortiq moe-mask`
+(0.5.28) bakes the same restriction as a named task mask — the full
+expert set stays, `run --task coder` narrows routing at inference,
+token-identical to the physical cut. A step-by-step walkthrough —
+download, convert, run on Vulkan and Metal, carve a specialist — is in
 [docs/KAT_CODER.md](docs/KAT_CODER.md).
 
 ### 1-bit models (Bonsai / BitNet class)

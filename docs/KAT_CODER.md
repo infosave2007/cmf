@@ -175,8 +175,12 @@ specialist is a normal `.cmf` — every command above works on it
 unchanged. Preview a cover level without rewriting the file:
 `CMF_MOE_MASK=code_stats.json CMF_MOE_MASK_COVER=0.95 cortiq ppl …`
 applies the same restriction at runtime (identical math), so you can
-ppl-gate before committing. Off-task quality degrades by design —
-the code mask covers only ~39% of prose routing mass.
+ppl-gate before committing. And if you'd rather keep ONE file with
+switchable specialists, `cortiq moe-mask … --name coder` bakes the
+restriction as a named task mask instead of cutting — activate with
+`run --task coder`, token-identical to the physical cut (no size or
+paging win, but nothing is dropped). Off-task quality degrades by
+design — the code mask covers only ~39% of prose routing mass.
 
 ## 6. Optional levers (both platforms)
 
