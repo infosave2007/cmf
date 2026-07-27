@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`cortiq moe-mask`** — the runtime-switchable twin of `moe-defrag`:
+  bakes a task's expert restriction as a first-class task mask (new
+  optional expert-bitfield area in the masks section, spec §5) instead
+  of cutting the file. The full expert set stays on disk; `run --task
+  <name>` narrows MoE routing to the mask's experts — one file, many
+  specialists. Gated: decode through a baked mask is token-identical
+  to the equivalent `CMF_MOE_MASK` runtime restriction.
+- **`cortiq sign`** — detached model signing: Ed25519 over the file's
+  SHA-256 written to `<model>.sig` (spec §8.2); `cortiq verify` checks
+  it automatically when present. Authenticity on top of the format's
+  integrity hash chain, no container rewrite.
+- **`cortiq compact`** — native-Rust port of the container compactor:
+  reclaims dead directory/header tails left by append-only skill
+  growth, streaming payloads from the source mmap.
+- `moe-defrag` writes an honest provenance block
+  (`provenance.moe_defrag`: tool, cover, stats hash, kept_per_layer)
+  and embeds the routing B-field remapped to the new expert numbering —
+  `--stats` becomes optional when re-defragging a specialist tighter.
+
+### Changed
+- Spec synchronized with the implementation: dtypes 13 (`q1s`) / 14
+  (`q1t`) fully specified, MoE expert defrag contract (§11.1), pipeline
+  containers (§12), expert role-contiguity SHOULD (§2.2), sparse index
+  marked deprecation-pending (§7); the RU/ZH specs — a whole section
+  behind — brought level with EN.
+
 ## [0.5.27] — 2026-07-27
 
 ### Added
