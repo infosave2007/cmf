@@ -43,6 +43,155 @@ fn f16_scale(raw: f32) -> f32 {
     f16_to_f32(f32_to_f16(raw)).max(F16_TINY)
 }
 
+/// tiktoken pre-tokenization pattern (Kimi family, o200k lineage) —
+/// verbatim from tokenization_kimi.py; tiktoken itself compiles this
+/// with fancy-regex, the same engine the runtime tokenizer uses.
+const TIKTOKEN_KIMI_PAT: &str = concat!(
+    r"[\p{Han}]+",
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*",
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+",
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    r"|\p{N}{1,3}",
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*",
+    r"|\s*[\r\n]+",
+    r"|\s+(?!\S)",
+    r"|\s+",
+);
+
+/// GPT-2 byte-level alphabet: raw byte → printable char (identity for
+/// the printable ranges, 256+n in first-free order for the rest).
+fn byte_level_table() -> [char; 256] {
+    let mut table = ['\0'; 256];
+    let mut n = 0u32;
+    for b in 0..=255u32 {
+        let printable = (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b);
+        table[b as usize] = if printable {
+            char::from_u32(b).unwrap()
+        } else {
+            let c = char::from_u32(256 + n).unwrap();
+            n += 1;
+            c
+        };
+    }
+    table
+}
+
+/// Build an HF tokenizer.json from a tiktoken rank table (Kimi family).
+///
+/// tiktoken stores `base64(token_bytes) rank` per line and no merge
+/// list — the merges ARE the ranks. Recovery (transformers' tiktoken
+/// converter): BPE-split every multi-byte token using only merges of
+/// strictly lower rank; the two parts it stops at are that token's
+/// merge rule. Specials come from tokenizer_config.added_tokens_decoder.
+fn tiktoken_to_tokenizer_json(
+    model: &str,
+    tok_cfg: &serde_json::Value,
+) -> anyhow::Result<String> {
+    use base64::Engine as _;
+    use std::collections::HashMap;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut ranks: HashMap<Vec<u8>, u32> = HashMap::new();
+    let mut ordered: Vec<(Vec<u8>, u32)> = Vec::new();
+    for line in model.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (tok, rank) = line
+            .rsplit_once(' ')
+            .ok_or_else(|| anyhow::anyhow!("tiktoken: bad line {line:?}"))?;
+        let bytes = b64
+            .decode(tok)
+            .map_err(|e| anyhow::anyhow!("tiktoken: bad base64 {tok:?}: {e}"))?;
+        let rank: u32 = rank.parse()?;
+        ranks.insert(bytes.clone(), rank);
+        ordered.push((bytes, rank));
+    }
+    anyhow::ensure!(!ordered.is_empty(), "tiktoken: empty rank table");
+    ordered.sort_by_key(|(_, r)| *r);
+
+    let table = byte_level_table();
+    let to_bl = |bytes: &[u8]| -> String { bytes.iter().map(|&b| table[b as usize]).collect() };
+
+    // Merge recovery: split `token` greedily by lowest-rank pair, using
+    // only merges of rank < the token's own.
+    let bpe_parts = |token: &[u8], max_rank: u32| -> Vec<Vec<u8>> {
+        let mut parts: Vec<Vec<u8>> = token.iter().map(|&b| vec![b]).collect();
+        loop {
+            let mut best: Option<(usize, u32)> = None;
+            for i in 0..parts.len() - 1 {
+                let cat = [parts[i].as_slice(), parts[i + 1].as_slice()].concat();
+                if let Some(&r) = ranks.get(cat.as_slice()) {
+                    if r < max_rank && best.map(|(_, br)| r < br).unwrap_or(true) {
+                        best = Some((i, r));
+                    }
+                }
+            }
+            match best {
+                Some((i, _)) => {
+                    let b = parts.remove(i + 1);
+                    parts[i].extend(b);
+                }
+                None => break,
+            }
+        }
+        parts
+    };
+
+    let mut vocab = serde_json::Map::new();
+    let mut merges: Vec<serde_json::Value> = Vec::new();
+    let mut skipped = 0usize;
+    for (bytes, rank) in &ordered {
+        vocab.insert(to_bl(bytes), serde_json::json!(rank));
+        if bytes.len() > 1 {
+            let parts = bpe_parts(bytes, *rank);
+            if parts.len() == 2 {
+                merges.push(serde_json::json!([to_bl(&parts[0]), to_bl(&parts[1])]));
+            } else {
+                // Unreachable-by-merges token (rare): encodable only as
+                // a whole pre-token piece; keep it in the vocab.
+                skipped += 1;
+            }
+        }
+    }
+    if skipped > 0 {
+        tracing::warn!("tiktoken: {skipped} tokens yielded no merge rule (kept vocab-only)");
+    }
+
+    let mut added: Vec<serde_json::Value> = Vec::new();
+    if let Some(atd) = tok_cfg.get("added_tokens_decoder").and_then(|v| v.as_object()) {
+        for (id, tok) in atd {
+            if let (Ok(id), Some(content)) = (
+                id.parse::<u32>(),
+                tok.get("content").and_then(|c| c.as_str()),
+            ) {
+                added.push(serde_json::json!({
+                    "id": id, "content": content, "special": true
+                }));
+            }
+        }
+    }
+
+    let json = serde_json::json!({
+        "version": "1.0",
+        "added_tokens": added,
+        "pre_tokenizer": {
+            "type": "Split",
+            "pattern": { "Regex": TIKTOKEN_KIMI_PAT },
+            "behavior": "Isolated",
+            "invert": false
+        },
+        "decoder": { "type": "ByteLevel" },
+        "model": {
+            "type": "BPE",
+            "vocab": serde_json::Value::Object(vocab),
+            "merges": merges
+        }
+    });
+    Ok(serde_json::to_string(&json)?)
+}
+
 /// Canonicalize a source tensor name to the CMF layout the runtime expects, or
 /// `None` to skip it. Multimodal wrappers (Qwen3.5) nest the text model under
 /// `model.language_model.*`; vision (`*.visual.*`) and the MTP head (`mtp.*`) are
@@ -1734,7 +1883,10 @@ pub(crate) fn hf_download_opts(
         anyhow::bail!("'{repo}': no config.json — not a Hugging Face safetensors checkpoint");
     }
     for (f, required) in [
-        ("tokenizer.json", true),
+        // Kimi ships tiktoken.model instead of tokenizer.json — either
+        // satisfies the bundle (checked after conversion).
+        ("tokenizer.json", false),
+        ("tiktoken.model", false),
         ("tokenizer_config.json", false),
         ("generation_config.json", false),
         // Newer HF checkpoints (LFM2, Qwen3, …) ship the chat template as a
@@ -2686,11 +2838,25 @@ pub fn run_convert(
     }
 
     // Tokenizer + chat bundle (optional but recommended).
-    let vocab = fs::read(dir.join("tokenizer.json")).ok();
     let tok_cfg: serde_json::Value = fs::read(dir.join("tokenizer_config.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(serde_json::Value::Null);
+    let vocab = fs::read(dir.join("tokenizer.json")).ok().or_else(|| {
+        // Kimi (tiktoken): synthesize a standard tokenizer.json from the
+        // rank table so the runtime tokenizer stays unchanged.
+        let tk = fs::read_to_string(dir.join("tiktoken.model")).ok()?;
+        match tiktoken_to_tokenizer_json(&tk, &tok_cfg) {
+            Ok(j) => {
+                tracing::info!("tiktoken.model → tokenizer.json ({} bytes)", j.len());
+                Some(j.into_bytes())
+            }
+            Err(e) => {
+                eprintln!("  tiktoken.model found but conversion failed: {e}");
+                None
+            }
+        }
+    });
     let gen_cfg: serde_json::Value = fs::read(dir.join("generation_config.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -2962,6 +3128,76 @@ mod tests {
             dec, dec_legacy,
             "vbit_ro must reconstruct exactly like vbit"
         );
+    }
+
+    #[test]
+    fn tiktoken_roundtrip_synthetic() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        // Mini rank table: single bytes first, then pairs — exactly the
+        // shape tiktoken ships (ranks are the merge order).
+        let toks: Vec<&[u8]> = vec![
+            b"h", b"e", b"l", b"o", b" ", b"w", b"r", b"d", b"he", b"ll", b"lo",
+            b"hell", b"hello", b" w", b"or", b" wor", b" world",
+        ];
+        let model: String = toks
+            .iter()
+            .enumerate()
+            .map(|(r, t)| format!("{} {}\n", b64.encode(t), r))
+            .collect();
+        let cfg = serde_json::json!({
+            "added_tokens_decoder": {
+                "100": {"content": "[BOS]"},
+                "101": {"content": "[EOS]"}
+            }
+        });
+        let json = tiktoken_to_tokenizer_json(&model, &cfg).unwrap();
+        let tok = cortiq_engine::tokenizer::Tokenizer::from_json(&json).unwrap();
+        let ids = tok.encode("hello world");
+        // "hello" merges to one token (rank 12). " world"(16) is BPE-
+        // UNREACHABLE with this table (merge path stops at " wor"+l+d) —
+        // real tiktoken tokenizes it identically, which is exactly the
+        // semantics the recovered merge list must reproduce.
+        let strip: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|&i| i != 100)
+            .collect(); // drop a possible auto-BOS
+        assert_eq!(strip, vec![12, 15, 2, 7], "ids: {ids:?}");
+        assert_eq!(tok.decode(&strip), "hello world");
+    }
+
+    #[test]
+    fn tiktoken_real_model_roundtrip() {
+        // Gated: point CMF_TIKTOKEN at a real tiktoken.model (+ optional
+        // CMF_TIKTOKEN_CFG tokenizer_config.json) to validate against the
+        // shipped table. Skipped otherwise.
+        let Ok(path) = std::env::var("CMF_TIKTOKEN") else {
+            return;
+        };
+        let model = std::fs::read_to_string(&path).unwrap();
+        let cfg: serde_json::Value = std::env::var("CMF_TIKTOKEN_CFG")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let t0 = std::time::Instant::now();
+        let json = tiktoken_to_tokenizer_json(&model, &cfg).unwrap();
+        eprintln!("converted in {:?}, json {} MB", t0.elapsed(), json.len() / 1_000_000);
+        let tok = cortiq_engine::tokenizer::Tokenizer::from_json(&json).unwrap();
+        for text in [
+            "Hello, world!",
+            "Kimi Linear is a hybrid attention architecture.",
+            "Пример текста на русском языке 123",
+            "你好，世界！混合注意力架构。",
+            "def main():\n    print(\"ok\")  # comment\n",
+            "   spaces    and\ttabs\n\n",
+        ] {
+            let ids = tok.encode(text);
+            let back = tok.decode(&ids.iter().copied().filter(|&i| Some(i) != tok.bos_token_id).collect::<Vec<_>>());
+            assert_eq!(back, text, "roundtrip failed for {text:?} → {ids:?}");
+            eprintln!("{:3} toks | {text:?}", ids.len());
+        }
     }
 
     #[test]

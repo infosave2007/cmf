@@ -248,10 +248,10 @@ impl Tokenizer {
                 special_ids.insert(at.id);
             }
             match at.content.as_str() {
-                "<|endoftext|>" | "</s>" => eos_token_id = Some(at.id),
+                "<|endoftext|>" | "</s>" | "[EOS]" => eos_token_id = Some(at.id),
                 "<|im_start|>" => im_start_id = Some(at.id),
                 "<|im_end|>" => im_end_id = Some(at.id),
-                "<s>" => bos_token_id = Some(at.id),
+                "<s>" | "[BOS]" => bos_token_id = Some(at.id),
                 // Gemma spells BOS as literal "<bos>" — the family
                 // REQUIRES it on every sequence, and newer tokenizers
                 // (gemma-4) no longer say so in a post_processor.
