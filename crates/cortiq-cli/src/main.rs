@@ -349,7 +349,7 @@ enum Commands {
         #[arg(long, default_value = "cortiq-signing.key")]
         key: String,
     },
-    /// Import a GGUF model to .cmf — native Rust (F32/F16/BF16/Q4_0..Q6_K + K-quants; llama/qwen2/qwen3)
+    /// Import a GGUF model to .cmf — native Rust (F32/F16/BF16/Q4_0..Q6_K + K-quants; llama/mistral/qwen2/qwen3/qwen3.5 incl. the qwen35moe GDN+MoE hybrids, gemma-3, phi-3/4, DeepSeek-R1 distills)
     ImportGguf {
         /// A local .gguf file, an HF repo id (owner/name — best .gguf auto-picked), or owner/name/file.gguf
         gguf: String,
