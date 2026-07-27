@@ -60,6 +60,9 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
         "model.vision_embedder.",
         "model.embed_audio.",
         "model.embed_vision.",
+        // Kimi-K3 vision tower + projector (text tower converts alone).
+        "vision_tower.",
+        "mm_projector.",
     ] {
         if raw.starts_with(pfx) {
             return None;
@@ -71,8 +74,30 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
         "language_model.",
     ] {
         if let Some(rest) = raw.strip_prefix(pfx) {
-            return Some(lfm2_canon(&format!("model.{rest}")));
+            // Re-enter with the wrapper stripped so every later rewrite
+            // (Kimi block_sparse_moe, shared_experts, expert_bias) still
+            // applies to nested checkpoints.
+            return canon_name(&format!("model.{rest}"));
         }
+    }
+    // Kimi (Kimi Linear / Kimi-K3) MoE block: mixtral-style w1/w3/w2
+    // experts and a router with the noaux_tc selection bias.
+    // `block_sparse_moe` is Kimi-exclusive among supported archs.
+    if raw.contains(".block_sparse_moe.") {
+        let mut n = raw
+            .replace(
+                ".block_sparse_moe.gate.e_score_correction_bias",
+                ".mlp.expert_bias",
+            )
+            .replace(".block_sparse_moe.shared_experts.", ".mlp.shared_expert.")
+            .replace(".block_sparse_moe.", ".mlp.");
+        if n.contains(".mlp.experts.") || n.contains(".mlp.shared_expert.") {
+            n = n
+                .replace(".w1.weight", ".gate_proj.weight")
+                .replace(".w3.weight", ".up_proj.weight")
+                .replace(".w2.weight", ".down_proj.weight");
+        }
+        return Some(n);
     }
     // Laguna stores the router's auxiliary-loss-free selection bias under
     // `experts`, although it belongs to the router mathematically. CMF keeps
@@ -141,6 +166,14 @@ fn lfm2_canon(name: &str) -> String {
 fn force_f16(name: &str) -> bool {
     name.ends_with("linear_attn.in_proj_a.weight")
         || name.ends_with("linear_attn.in_proj_b.weight")
+        // KDA (Kimi): decay/β/gate low-rank stages and conv taps are tiny
+        // and sit on exp/σ paths — keep them exact.
+        || name.ends_with("kda_attn.f_a_proj.weight")
+        || name.ends_with("kda_attn.f_b_proj.weight")
+        || name.ends_with("kda_attn.b_proj.weight")
+        || name.ends_with("kda_attn.g_a_proj.weight")
+        || name.ends_with("kda_attn.g_b_proj.weight")
+        || name.ends_with("_conv1d.weight")
         || name.ends_with("mlp.gate.weight")
         || name.ends_with("shared_expert_gate.weight")
         || name.ends_with("self_attn.g_proj.weight")
@@ -912,6 +945,60 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             .collect(),
         None => vec![LayerType::FullAttention; n_layers],
     };
+    // Kimi Linear / Kimi-K3: the per-layer schedule lives in
+    // linear_attn_config.full_attn_layers (1-BASED layer numbers);
+    // everything else is a KDA layer.
+    let tc_model_type = tc.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
+    let is_kimi = model_type == "kimi_linear"
+        || model_type == "kimi_k3"
+        || tc_model_type == "kimi_linear";
+    let layer_types = if let Some(lac) = tc.get("linear_attn_config").filter(|_| is_kimi) {
+        let quant_fmt = config
+            .get("quantization_config")
+            .or_else(|| tc.get("quantization_config"))
+            .map(|q| q.to_string())
+            .unwrap_or_default();
+        anyhow::ensure!(
+            !quant_fmt.contains("mxfp4"),
+            "kimi: mxfp4-packed checkpoints are not supported yet — convert the bf16 release"
+        );
+        anyhow::ensure!(
+            tc.get("attn_res_block_size")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "kimi: attn_res_block_size residual streams (Kimi-K3) are not supported yet"
+        );
+        anyhow::ensure!(
+            !tc.get("latent_moe_use_norm")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "kimi: latent MoE (routed_expert_up/down_proj, Kimi-K3) is not supported yet"
+        );
+        anyhow::ensure!(
+            !tc.get("mla_use_output_gate")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "kimi: MLA output gate (Kimi-K3) is not supported yet"
+        );
+        let full: std::collections::HashSet<usize> = lac
+            .get("full_attn_layers")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect())
+            .unwrap_or_default();
+        anyhow::ensure!(!full.is_empty(), "kimi: linear_attn_config.full_attn_layers is empty");
+        (1..=n_layers)
+            .map(|i| {
+                if full.contains(&i) {
+                    LayerType::FullAttention
+                } else {
+                    LayerType::Kda
+                }
+            })
+            .collect()
+    } else {
+        layer_types
+    };
+    let kimi_lac = tc.get("linear_attn_config").filter(|_| is_kimi);
     let has_linear = layer_types
         .iter()
         .any(|t| matches!(t, LayerType::LinearAttention));
@@ -997,6 +1084,12 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         qk_nope_head_dim: cfg_usize(tc, "qk_nope_head_dim").unwrap_or(128),
         v_head_dim: cfg_usize(tc, "v_head_dim").unwrap_or(128),
         q_lora_rank: cfg_usize(tc, "q_lora_rank"),
+        // Kimi Linear: full-attention layers run NoPE (KDA carries
+        // position) — the rotation is skipped, the layout is kept.
+        nope: tc
+            .get("mla_use_nope")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     });
     let moe = tc
         .get("num_experts")
@@ -1015,22 +1108,33 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                 num_experts: ne as usize,
                 top_k: cfg_usize(tc, "num_experts_per_tok")
                     .or_else(|| cfg_usize(tc, "top_k_experts"))
+                    // Kimi spells it with the full word.
+                    .or_else(|| cfg_usize(tc, "num_experts_per_token"))
                     .unwrap_or(2),
                 moe_intermediate_size: cfg_usize(tc, "moe_intermediate_size").unwrap_or(0),
                 norm_topk_prob: tc
                     .get("norm_topk_prob")
                     .and_then(|v| v.as_bool())
+                    // Kimi: moe_renormalize is the same switch.
+                    .or_else(|| tc.get("moe_renormalize").and_then(|v| v.as_bool()))
                     .unwrap_or(ntp_default),
                 shared_expert_intermediate_size: cfg_usize(tc, "shared_expert_intermediate_size")
                     .or_else(|| {
                         // DeepSeek fuses its n shared experts into one
-                        // MLP of n·moe_intermediate_size.
+                        // MLP of n·moe_intermediate_size (Kimi spells the
+                        // count num_shared_experts).
                         Some(
-                            cfg_usize(tc, "n_shared_experts")?
+                            cfg_usize(tc, "n_shared_experts")
+                                .or_else(|| cfg_usize(tc, "num_shared_experts"))?
                                 * cfg_usize(tc, "moe_intermediate_size")?,
                         )
                     }),
-                router_sigmoid: is_lfm2 || is_laguna,
+                router_sigmoid: is_lfm2
+                    || is_laguna
+                    || tc
+                        .get("moe_router_activation_func")
+                        .and_then(|v| v.as_str())
+                        == Some("sigmoid"),
                 // A stored scale of 1.0 is the no-op default; only non-trivial
                 // scales need to ride in the header.
                 routed_scaling_factor: tc
@@ -1200,7 +1304,8 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     };
     // Phi-3 longrope: exact only within the ORIGINAL context — cap the
     // declared max honestly instead of serving stretched positions.
-    let mut max_pos = cfg_usize(tc, "max_position_embeddings").unwrap_or(32768);
+    let mut max_pos = cfg_usize(tc, "max_position_embeddings")
+        .unwrap_or(if is_kimi { 1_048_576 } else { 32768 });
     if let Some(rs) = tc.get("rope_scaling").filter(|v| !v.is_null()) {
         let kind = rs
             .get("type")
@@ -1253,13 +1358,18 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         moe,
         linear_core,
         max_position_embeddings: max_pos,
-        // GDN spells it `linear_conv_kernel_dim`; LFM2 spells it `conv_L_cache`.
+        // GDN spells it `linear_conv_kernel_dim`; LFM2 spells it
+        // `conv_L_cache`; Kimi nests KDA geometry in linear_attn_config.
         linear_conv_kernel_dim: cfg_usize(tc, "linear_conv_kernel_dim")
-            .or_else(|| cfg_usize(tc, "conv_L_cache")),
-        linear_num_key_heads: cfg_usize(tc, "linear_num_key_heads"),
+            .or_else(|| cfg_usize(tc, "conv_L_cache"))
+            .or_else(|| kimi_lac.and_then(|l| cfg_usize(l, "short_conv_kernel_size"))),
+        linear_num_key_heads: cfg_usize(tc, "linear_num_key_heads")
+            .or_else(|| kimi_lac.and_then(|l| cfg_usize(l, "num_heads"))),
         linear_num_value_heads: lnv,
-        linear_key_head_dim: cfg_usize(tc, "linear_key_head_dim"),
-        linear_value_head_dim: lvd,
+        linear_key_head_dim: cfg_usize(tc, "linear_key_head_dim")
+            .or_else(|| kimi_lac.and_then(|l| cfg_usize(l, "head_dim"))),
+        linear_value_head_dim: lvd
+            .or_else(|| kimi_lac.and_then(|l| cfg_usize(l, "head_dim"))),
         hidden_act,
         embed_multiplier,
         // Gemma-4 attends with scaling = 1.0 (q-norm carries the scale).
@@ -1297,6 +1407,11 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             .get("activation_situ_linear_beta")
             .and_then(|v| v.as_f64()),
         attn_v_norm: is_gemma4,
+        // KDA (Kimi-K3): lower-bound decay-gate variant; absent = standard.
+        kda_gate_lower_bound: tc
+            .get("linear_attn_config")
+            .and_then(|c| c.get("gate_lower_bound"))
+            .and_then(|v| v.as_f64()),
         // Looped Transformer (Nanbeige 4.2): re-apply the layer stack num_loops times.
         num_loops: cfg_usize(tc, "num_loops").unwrap_or(1),
         // skip_loop_final_norm=false means loop_final_norm=true (apply norm after each loop).
@@ -2030,6 +2145,15 @@ pub fn run_convert(
     // Per-file conversion body, shared by the resident local path and
     // the streaming hub path (shard downloaded → converted → DELETED;
     // peak disk = one shard + the growing output).
+    // Kimi: which layer indices are KDA (canon retag inside the loop).
+    let kda_layers: std::collections::HashSet<usize> = arch
+        .layer_types
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| matches!(t, cortiq_core::LayerType::Kda))
+        .map(|(i, _)| i)
+        .collect();
+
     let mut process_file = |file: &SafeTensors,
                             files: &[SafeTensors],
                             tensors: &mut Vec<TensorSpec>,
@@ -2047,6 +2171,26 @@ pub fn run_convert(
             progress(*done as f32 / total as f32);
             let Some(name) = canon_name(&m.name) else {
                 continue;
+            };
+            // Kimi: KDA layers share the `self_attn.` vendor prefix with
+            // the MLA full-attention layers — retag them by the layer
+            // schedule so the loader dispatches unambiguously.
+            let name = if kda_layers.is_empty() {
+                name
+            } else {
+                match name
+                    .strip_prefix("model.layers.")
+                    .and_then(|r| r.split_once('.'))
+                    .and_then(|(li, rest)| Some((li.parse::<usize>().ok()?, rest)))
+                {
+                    Some((li, rest)) if kda_layers.contains(&li) && rest.starts_with("self_attn.") => {
+                        format!(
+                            "model.layers.{li}.kda_attn.{}",
+                            &rest["self_attn.".len()..]
+                        )
+                    }
+                    _ => name,
+                }
             };
 
             // Skip MLX scales and biases as they are processed with the weight.
@@ -2124,7 +2268,15 @@ pub fn run_convert(
                         // DeepSeek rotary interleaves pairs (view d/2,2 →
                         // transpose): store rope dims even-first so our
                         // half-split rotation reproduces their math.
-                        let src = if r < dr / 2 { 2 * r } else { 2 * (r - dr / 2) + 1 };
+                        // Kimi NoPE: no rotation → keep the rope block
+                        // order, only move it in front of nope.
+                        let src = if mla.nope {
+                            r
+                        } else if r < dr / 2 {
+                            2 * r
+                        } else {
+                            2 * (r - dr / 2) + 1
+                        };
                         w[(h * hd + r) * cols..(h * hd + r + 1) * cols].copy_from_slice(
                             &m_vals[(h * hd + dn + src) * cols..(h * hd + dn + src + 1) * cols],
                         );
@@ -2146,8 +2298,12 @@ pub fn run_convert(
             }
 
             // DeepSeek MLA: the shared rope key rows (tail of kv_a) get
-            // the same even-first interleave fix.
-            if arch.mla.is_some() && name.ends_with("self_attn.kv_a_proj_with_mqa.weight") {
+            // the same even-first interleave fix. Kimi NoPE skips it —
+            // no rotation, the tail rows are already where the loader
+            // expects them.
+            if arch.mla.as_ref().is_some_and(|m| !m.nope)
+                && name.ends_with("self_attn.kv_a_proj_with_mqa.weight")
+            {
                 let mla = arch.mla.as_ref().unwrap();
                 let (lora, dr) = (mla.kv_lora_rank, mla.qk_rope_head_dim);
                 anyhow::ensure!(
@@ -2806,6 +2962,126 @@ mod tests {
             dec, dec_legacy,
             "vbit_ro must reconstruct exactly like vbit"
         );
+    }
+
+    #[test]
+    fn kimi_canon_names() {
+        let c = |s: &str| canon_name(s).unwrap();
+        // K3 wrapper prefix + mixtral-style expert names → canonical MoE.
+        assert_eq!(
+            c("language_model.model.layers.3.block_sparse_moe.experts.5.w1.weight"),
+            "model.layers.3.mlp.experts.5.gate_proj.weight"
+        );
+        assert_eq!(
+            c("model.layers.2.block_sparse_moe.experts.0.w2.weight"),
+            "model.layers.2.mlp.experts.0.down_proj.weight"
+        );
+        assert_eq!(
+            c("model.layers.2.block_sparse_moe.experts.0.w3.weight"),
+            "model.layers.2.mlp.experts.0.up_proj.weight"
+        );
+        assert_eq!(
+            c("model.layers.2.block_sparse_moe.gate.weight"),
+            "model.layers.2.mlp.gate.weight"
+        );
+        assert_eq!(
+            c("model.layers.2.block_sparse_moe.gate.e_score_correction_bias"),
+            "model.layers.2.mlp.expert_bias"
+        );
+        assert_eq!(
+            c("model.layers.2.block_sparse_moe.shared_experts.gate_proj.weight"),
+            "model.layers.2.mlp.shared_expert.gate_proj.weight"
+        );
+        // Vision tower dropped (text tower converts alone).
+        assert_eq!(canon_name("vision_tower.encoder.blocks.0.wqkv.weight"), None);
+        assert_eq!(canon_name("mm_projector.proj.0.weight"), None);
+    }
+
+    #[test]
+    fn kimi_linear_arch_layers_and_geometry() {
+        // Kimi-Linear-48B shape in miniature: 8 layers, full attention on
+        // the 1-BASED layers [4, 8], KDA elsewhere; MLA NoPE; sigmoid MoE.
+        let cfg: serde_json::Value = serde_json::from_str(
+            r#"{
+            "model_type": "kimi_linear",
+            "hidden_size": 2304, "num_hidden_layers": 8,
+            "num_attention_heads": 32, "num_key_value_heads": 32,
+            "intermediate_size": 9216, "vocab_size": 1000,
+            "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+            "kv_lora_rank": 512, "qk_rope_head_dim": 64,
+            "qk_nope_head_dim": 128, "v_head_dim": 128,
+            "mla_use_nope": true,
+            "hidden_act": "silu",
+            "num_experts": 256, "num_experts_per_token": 8,
+            "moe_intermediate_size": 1024, "num_shared_experts": 1,
+            "moe_renormalize": true, "moe_router_activation_func": "sigmoid",
+            "first_k_dense_replace": 1,
+            "linear_attn_config": {
+                "full_attn_layers": [4, 8],
+                "kda_layers": [1, 2, 3, 5, 6, 7],
+                "head_dim": 128, "num_heads": 32,
+                "short_conv_kernel_size": 4
+            }
+        }"#,
+        )
+        .unwrap();
+        let arch = build_arch(&cfg).unwrap();
+        assert_eq!(arch.num_layers, 8);
+        // 1-based full_attn_layers [4,8] → 0-based indices 3 and 7.
+        for (i, t) in arch.layer_types.iter().enumerate() {
+            let want_full = i == 3 || i == 7;
+            assert_eq!(
+                matches!(t, cortiq_core::LayerType::FullAttention),
+                want_full,
+                "layer {i}"
+            );
+            assert_eq!(
+                matches!(t, cortiq_core::LayerType::Kda),
+                !want_full,
+                "layer {i}"
+            );
+        }
+        assert_eq!(arch.linear_num_key_heads, Some(32));
+        assert_eq!(arch.linear_key_head_dim, Some(128));
+        assert_eq!(arch.linear_value_head_dim, Some(128));
+        assert_eq!(arch.linear_conv_kernel_dim, Some(4));
+        let mla = arch.mla.as_ref().expect("kv_lora_rank → MLA");
+        assert!(mla.nope, "mla_use_nope must carry into the header");
+        assert_eq!(mla.q_lora_rank, None);
+        let moe = arch.moe.as_ref().expect("num_experts → MoE");
+        assert_eq!(moe.num_experts, 256);
+        assert_eq!(moe.top_k, 8);
+        assert!(moe.router_sigmoid, "sigmoid router");
+        assert!(moe.norm_topk_prob, "moe_renormalize");
+        assert_eq!(moe.shared_expert_intermediate_size, Some(1024));
+        assert!(arch.kda_gate_lower_bound.is_none());
+    }
+
+    #[test]
+    fn kimi_k3_unsupported_features_bail_honestly() {
+        let cfg: serde_json::Value = serde_json::from_str(
+            r#"{
+            "model_type": "kimi_k3",
+            "text_config": {
+                "model_type": "kimi_linear",
+                "hidden_size": 7168, "num_hidden_layers": 4,
+                "num_attention_heads": 96, "intermediate_size": 33792,
+                "vocab_size": 1000, "rms_norm_eps": 1e-5,
+                "kv_lora_rank": 512, "qk_rope_head_dim": 64,
+                "qk_nope_head_dim": 128, "v_head_dim": 128,
+                "attn_res_block_size": 12,
+                "linear_attn_config": {
+                    "full_attn_layers": [4],
+                    "head_dim": 128, "num_heads": 96,
+                    "short_conv_kernel_size": 4,
+                    "gate_lower_bound": -5.0
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+        let err = build_arch(&cfg).unwrap_err().to_string();
+        assert!(err.contains("attn_res_block_size"), "got: {err}");
     }
 
     #[test]

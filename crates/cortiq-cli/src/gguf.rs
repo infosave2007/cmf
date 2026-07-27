@@ -879,6 +879,7 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         activation_situ_linear_beta: None,
         attn_v_norm: false,
         num_loops: 1,
+        kda_gate_lower_bound: None,
         loop_final_norm: false,
     })
 }

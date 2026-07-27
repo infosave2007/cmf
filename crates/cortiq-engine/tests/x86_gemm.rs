@@ -64,6 +64,7 @@ fn blocked_vs_per_row() {
         activation_situ_linear_beta: None,
         attn_v_norm: false,
         num_loops: 1,
+        kda_gate_lower_bound: None,
         loop_final_norm: false,
     };
     let header = CmfHeader {
@@ -200,6 +201,7 @@ fn q1_blocked_vs_per_row() {
         activation_situ_linear_beta: None,
         attn_v_norm: false,
         num_loops: 1,
+        kda_gate_lower_bound: None,
         loop_final_norm: false,
     };
     let header = CmfHeader {
@@ -335,6 +337,7 @@ fn q4b_blocked_vs_per_row() {
         activation_situ_linear_beta: None,
         attn_v_norm: false,
         num_loops: 1,
+        kda_gate_lower_bound: None,
         loop_final_norm: false,
     };
     let header = CmfHeader {
@@ -469,6 +472,7 @@ fn q4t_blocked_vs_per_row() {
         activation_situ_linear_beta: None,
         attn_v_norm: false,
         num_loops: 1,
+        kda_gate_lower_bound: None,
         loop_final_norm: false,
     };
     let header = CmfHeader {
@@ -605,6 +609,7 @@ fn q4t_silu_mul_fused_matches_composed() {
         activation_situ_linear_beta: None,
         attn_v_norm: false,
         num_loops: 1,
+        kda_gate_lower_bound: None,
         loop_final_norm: false,
     };
     let header = CmfHeader {

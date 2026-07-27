@@ -173,6 +173,12 @@ pub enum LayerType {
     /// gates + a causal depthwise conv1d over recent tokens, no KV cache.
     /// `linear_conv_kernel_dim` carries the kernel width.
     ShortConv,
+    /// Kimi Delta Attention (Kimi Linear / Kimi-K3): delta rule with a
+    /// PER-CHANNEL log decay (diagonal, vs GDN's per-head scalar),
+    /// separate q/k/v projections each behind its own causal short
+    /// convolution, and a sigmoid-gated output RMSNorm. Geometry rides
+    /// the `linear_*` fields; state = 3 conv rings + S[h·dk·dv].
+    Kda,
 }
 
 /// Multi-token-prediction head carried by the file (DeepSeek/Qwen-MTP
@@ -255,6 +261,11 @@ pub struct MlaConfig {
     /// Present on the big V2/V3 (compressed q); Lite projects q directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub q_lora_rank: Option<usize>,
+    /// Kimi Linear NoPE: full-attention layers apply NO rotary at all
+    /// (the KDA layers carry position). The [rope|nope] head layout is
+    /// kept; only the rotation is skipped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nope: bool,
 }
 
 fn default_yarn_beta_fast() -> f32 {
@@ -380,6 +391,11 @@ pub struct ModelArch {
     /// Value head dim in linear attention
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_value_head_dim: Option<usize>,
+    /// KDA lower-bound decay gate (Kimi-K3): log-decay =
+    /// `lb·σ(exp(A_log)·(f+dt_bias))` instead of the standard
+    /// `−exp(A_log)·softplus(f+dt_bias)`. None = standard formula.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kda_gate_lower_bound: Option<f64>,
     /// Looped Transformer: number of times the layer stack is re-applied
     /// (Nanbeige 4.2: 22 physical layers × 2 loops = 44 virtual layers).
     /// Default 1 = standard non-looped architecture.

@@ -76,6 +76,8 @@ pub struct Pipeline {
     pub vmf_cfg: Option<VmfPhaseCfg>,
     /// GatedDeltaNet geometry (faithful vendor operator).
     pub gdn_cfg: Option<GdnCfg>,
+    /// KDA geometry (Kimi Linear / Kimi-K3) — shared by every Kda layer.
+    pub kda_cfg: Option<crate::linear_core::KdaCfg>,
     /// LFM2 short-convolution geometry (present when the model has
     /// `ShortConv` mixer layers).
     pub short_conv_cfg: Option<ShortConvCfg>,
@@ -391,6 +393,10 @@ pub enum AttnKind {
     /// is sliced off before O). Latent-resident cache is a later
     /// optimization, not a semantic change.
     Mla(Box<MlaWeights>),
+    /// Kimi Delta Attention (Kimi Linear / Kimi-K3): per-channel decayed
+    /// delta rule, separate q/k/v short convs, sigmoid-gated output norm.
+    /// State lives in the layer's `linear_state` (no KV cache).
+    Kda(Box<crate::linear_core::KdaWeights>),
 }
 
 /// DeepSeek-V2 MLA projections (see `AttnKind::Mla`).
@@ -418,6 +424,8 @@ pub struct MlaWeights {
     pub lora: usize,
     /// Softmax scale (1/√(rope+nope), YaRN-mscale-corrected at load).
     pub scale: f32,
+    /// Kimi Linear NoPE: skip the rotary entirely (layout unchanged).
+    pub nope: bool,
 }
 
 /// Multi-token-prediction head (DeepSeek/Qwen style, spec §2.1):
@@ -1101,6 +1109,7 @@ impl Pipeline {
             attention_heads_per_layer: None,
             vmf_cfg: None,
             gdn_cfg: None,
+            kda_cfg: None,
             short_conv_cfg: None,
             mtp: None,
             speculative: std::env::var("CMF_MTP").map(|v| v != "0").unwrap_or(true),
@@ -1424,7 +1433,8 @@ impl Pipeline {
             }
         }
         let pair_off = std::env::var("CMF_PAIR").is_ok_and(|v| v == "0");
-        if task_mask.is_none() && !dyn_prefill && !graph_prefill && !pair_off {
+        if task_mask.is_none() && !dyn_prefill && !graph_prefill && !pair_off && self.pair_supported()
+        {
             while pos + 1 < input_ids.len() {
                 let e1 = self.embed_single(input_ids[pos]);
                 let e2 = self.embed_single(input_ids[pos + 1]);
@@ -1727,6 +1737,7 @@ impl Pipeline {
         let attn = match &lw.attn {
             // MLA models carry no MTP head; this path cannot see them.
             AttnKind::Mla(_) => unreachable!("MLA has no MTP/pair path"),
+            AttnKind::Kda(_) => unreachable!("KDA has no MTP/pair path"),
             AttnKind::Full {
                 wq,
                 wk,
@@ -1815,6 +1826,17 @@ impl Pipeline {
     /// once per layer for both positions. Full layers → fused GQA pair;
     /// linear layers → vmf_phase pair (lane 2 state is tentative in the
     /// per-layer scratch until the draft is accepted).
+    /// Whether the fused two-position path covers every layer kind in
+    /// this model. MLA and KDA run per position (their pair arms are
+    /// unreachable); the seq prefill falls back to singles for them.
+    fn pair_supported(&self) -> bool {
+        !self
+            .weights
+            .layers
+            .iter()
+            .any(|lw| matches!(&lw.attn, AttnKind::Mla(_) | AttnKind::Kda(_)))
+    }
+
     fn forward_pair(
         &mut self,
         emb1: &[f32],
@@ -1853,6 +1875,8 @@ impl Pipeline {
 
             let (a1, a2) = match &lw.attn {
                 AttnKind::Mla(_) => unreachable!("MLA has no MTP/pair path"),
+                AttnKind::Kda(_) => unreachable!("KDA has no MTP/pair path"),
+            AttnKind::Kda(_) => unreachable!("KDA has no MTP/pair path"),
                 AttnKind::Linear(w) => {
                     let cfg = self.vmf_cfg.expect("linear layer without vmf_cfg");
                     let layer = &mut self.kv_cache.layers[li];
@@ -2587,6 +2611,31 @@ impl Pipeline {
             let lw = &self.weights.layers[self.phys_layer(li)];
             // ── attention ──
             match &lw.attn {
+                AttnKind::Kda(w) => {
+                    // Projections batched, recurrence sequential.
+                    let cfg = self.kda_cfg.expect("kda layer without kda_cfg");
+                    let mut normed = vec![0.0f32; b * hs];
+                    for bi in 0..b {
+                        inference::rms_norm_into(
+                            &h[bi * hs..(bi + 1) * hs],
+                            &lw.input_norm,
+                            eps,
+                            norm_style,
+                            &mut normed[bi * hs..(bi + 1) * hs],
+                        );
+                    }
+                    let attn = crate::linear_core::kda_forward_batch(
+                        &normed,
+                        b,
+                        w,
+                        &cfg,
+                        &mut self.kv_cache.layers[li].linear_state,
+                        pool.as_deref(),
+                    );
+                    for (dst, &a) in h.iter_mut().zip(&attn) {
+                        *dst += a;
+                    }
+                }
                 AttnKind::LinearGdn(w) => {
                     // Projections batched, recurrence sequential.
                     let cfg = self.gdn_cfg.expect("gdn layer without gdn_cfg");
@@ -3196,6 +3245,7 @@ impl Pipeline {
                         output_gate, bias, ..
                     } => format!("Full gate={output_gate} bias={}", bias.is_some()),
                     AttnKind::LinearGdn(_) => "LinearGdn".into(),
+                    AttnKind::Kda(_) => "Kda".into(),
                     AttnKind::Linear(_) => "Linear".into(),
                     AttnKind::ShortConv(_) => "ShortConv".into(),
                 };
@@ -3669,6 +3719,16 @@ impl Pipeline {
                 AttnKind::Linear(w) => {
                     let cfg = self.vmf_cfg.expect("linear layer without vmf_cfg");
                     vmf_phase_forward(
+                        &self.ws.n1,
+                        w,
+                        &cfg,
+                        &mut self.kv_cache.layers[li].linear_state,
+                        self.pool.as_deref(),
+                    )
+                }
+                AttnKind::Kda(w) => {
+                    let cfg = self.kda_cfg.expect("kda layer without kda_cfg");
+                    crate::linear_core::kda_forward(
                         &self.ws.n1,
                         w,
                         &cfg,
@@ -4855,9 +4915,18 @@ fn mla_attention(
     let latn = inference::rms_norm(c_lat, &w.kv_a_norm, eps, NormStyle::Qwen);
     let mut kvb = vec![0.0f32; nh * (dn + dv)];
     w.kv_b.matvec(&latn, &mut kvb, pool);
-    attention::rope_rotate_scaled(k_rope, position, inv_freq, rope_scale);
+    if !w.nope {
+        attention::rope_rotate_scaled(k_rope, position, inv_freq, rope_scale);
+    }
     for h in 0..nh {
-        attention::rope_rotate_scaled(&mut q[h * hd..h * hd + dr], position, inv_freq, rope_scale);
+        if !w.nope {
+            attention::rope_rotate_scaled(
+                &mut q[h * hd..h * hd + dr],
+                position,
+                inv_freq,
+                rope_scale,
+            );
+        }
     }
     let mut k = vec![0.0f32; nh * hd];
     let mut v = vec![0.0f32; nh * hd];

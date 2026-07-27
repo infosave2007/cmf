@@ -591,6 +591,27 @@ impl Pipeline {
             }
         }
 
+        // ── KDA geometry (Kimi Linear / Kimi-K3 delta-attention layers) ──
+        let has_kda = arch
+            .layer_types
+            .iter()
+            .any(|t| matches!(t, LayerType::Kda));
+        let kda_cfg = if has_kda {
+            let need = |v: Option<usize>, name: &str| {
+                v.ok_or_else(|| CmfError::Parse(format!("KDA core needs arch.{name}")))
+            };
+            Some(crate::linear_core::KdaCfg {
+                num_heads: need(arch.linear_num_key_heads, "linear_num_key_heads")?,
+                head_k_dim: need(arch.linear_key_head_dim, "linear_key_head_dim")?,
+                head_v_dim: need(arch.linear_value_head_dim, "linear_value_head_dim")?,
+                conv_kernel: need(arch.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
+                hidden_size: arch.hidden_size,
+                rms_eps: arch.rms_norm_eps,
+            })
+        } else {
+            None
+        };
+
         // ── Short-convolution geometry (LFM2 conv mixer layers) ──
         let has_short_conv = arch
             .layer_types
@@ -660,6 +681,7 @@ impl Pipeline {
                     v_dim: mla.v_head_dim,
                     lora: mla.kv_lora_rank,
                     scale,
+                    nope: mla.nope,
                 })));
             }
             let wq = t("self_attn.q_proj.weight")?;
@@ -814,11 +836,52 @@ impl Pipeline {
             }))
         };
 
+        // KDA layer (Kimi Linear / Kimi-K3): faithful vendor tensors under
+        // the `kda_attn.` canonical prefix. The output gate is full-rank
+        // (g_proj, K3) or low-rank (g_a/g_b, Kimi-Linear-48B) by presence.
+        let load_kda = |prefix: &str| -> Result<AttnKind, CmfError> {
+            let t = |suffix: &str| {
+                load_matrix(model, &format!("{prefix}kda_attn.{suffix}"), force_f32, ov)
+            };
+            let f = |suffix: &str| {
+                load_f32(model, &format!("{prefix}kda_attn.{suffix}"), ov).map_err(err)
+            };
+            let gate = if model
+                .tensor(&format!("{prefix}kda_attn.g_proj.weight"))
+                .is_some()
+            {
+                crate::linear_core::KdaOutGate::Full(t("g_proj.weight")?)
+            } else {
+                crate::linear_core::KdaOutGate::LowRank(
+                    t("g_a_proj.weight")?,
+                    t("g_b_proj.weight")?,
+                )
+            };
+            Ok(AttnKind::Kda(Box::new(crate::linear_core::KdaWeights {
+                q_proj: t("q_proj.weight")?,
+                k_proj: t("k_proj.weight")?,
+                v_proj: t("v_proj.weight")?,
+                conv_q: f("q_conv1d.weight")?,
+                conv_k: f("k_conv1d.weight")?,
+                conv_v: f("v_conv1d.weight")?,
+                f_a: t("f_a_proj.weight")?,
+                f_b: t("f_b_proj.weight")?,
+                dt_bias: f("dt_bias")?,
+                a_log: f("A_log")?,
+                b_proj: t("b_proj.weight")?,
+                gate,
+                o_norm: f("o_norm.weight")?,
+                o_proj: t("o_proj.weight")?,
+                gate_lower_bound: arch.kda_gate_lower_bound.map(|v| v as f32),
+            })))
+        };
+
         let mut layers = Vec::with_capacity(arch.num_layers);
         for li in 0..arch.num_layers {
             let prefix = format!("model.layers.{li}.");
             let attn = match arch.layer_types.get(li) {
                 Some(LayerType::LinearAttention) => load_linear_attn(&prefix)?,
+                Some(LayerType::Kda) => load_kda(&prefix)?,
                 Some(LayerType::ShortConv) => load_short_conv(&prefix)?,
                 _ => load_full_attn(&prefix, Some(li))?,
             };
@@ -1094,6 +1157,7 @@ impl Pipeline {
         pipeline.attn_softcap = arch.attn_logit_softcapping.unwrap_or(0.0) as f32;
         pipeline.vmf_cfg = vmf_cfg;
         pipeline.gdn_cfg = gdn_cfg;
+        pipeline.kda_cfg = kda_cfg;
         pipeline.short_conv_cfg = short_conv_cfg;
         pipeline.mtp = mtp;
         pipeline.install_dynamic_routing(model, false);

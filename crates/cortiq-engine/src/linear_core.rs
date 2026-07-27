@@ -840,8 +840,597 @@ pub fn short_conv_pair(
     (out1, out2)
 }
 
+
+// ─── Kimi Delta Attention (KDA) ─────────────────────────────────────────
+//
+// Kimi Linear / Kimi-K3 linear mixer (reference: FLA naive_recurrent_kda
+// + moonshotai modeling_kimi.py). Differences from GatedDeltaNet above:
+// separate q/k/v projections each behind its OWN causal depthwise short
+// convolution; the delta-rule decay is a PER-CHANNEL vector (diagonal)
+// instead of a per-head scalar; the decay pre-activation comes from a
+// low-rank projection f_b(f_a(x)); and the output gate norm uses
+// sigmoid, not SiLU.
+
+pub struct KdaWeights {
+    /// [nh·dk, hidden]
+    pub q_proj: QTensor,
+    /// [nh·dk, hidden]
+    pub k_proj: QTensor,
+    /// [nh·dv, hidden]
+    pub v_proj: QTensor,
+    /// [nh·dk × kk] — depthwise taps, oldest→newest (see GdnWeights.conv1d)
+    pub conv_q: Vec<f32>,
+    pub conv_k: Vec<f32>,
+    /// [nh·dv × kk]
+    pub conv_v: Vec<f32>,
+    /// [rank, hidden] — low-rank decay projection, stage 1
+    pub f_a: QTensor,
+    /// [nh·dk, rank] — stage 2
+    pub f_b: QTensor,
+    /// [nh·dk]
+    pub dt_bias: Vec<f32>,
+    /// [nh] per-head (Kimi-Linear-48B) | [dk] per-dim (Kimi-K3) |
+    /// [nh·dk] full — broadcast resolved by length.
+    pub a_log: Vec<f32>,
+    /// [nh, hidden] — β = σ(b_proj·x) per head
+    pub b_proj: QTensor,
+    /// Output gate: full-rank g_proj (K3) or low-rank g_b(g_a(x)) (48B).
+    pub gate: KdaOutGate,
+    /// [dv] — gated RMSNorm weight (per head over head_v_dim)
+    pub o_norm: Vec<f32>,
+    /// [hidden, nh·dv]
+    pub o_proj: QTensor,
+    /// Some(lb): log-decay = lb·σ(exp(A)·(f+bias)) (K3, lb=−5);
+    /// None: −exp(A)·softplus(f+bias) (Kimi-Linear-48B).
+    pub gate_lower_bound: Option<f32>,
+}
+
+pub enum KdaOutGate {
+    /// [nh·dv, hidden]
+    Full(QTensor),
+    /// g_a [rank, hidden], g_b [nh·dv, rank]
+    LowRank(QTensor, QTensor),
+}
+
+#[derive(Clone, Copy)]
+pub struct KdaCfg {
+    pub num_heads: usize,
+    pub head_k_dim: usize,
+    pub head_v_dim: usize,
+    pub conv_kernel: usize,
+    pub hidden_size: usize,
+    pub rms_eps: f64,
+}
+
+impl KdaCfg {
+    /// Packed state: [q ring | k ring | v ring | S nh·dk·dv], one Vec —
+    /// same single-buffer convention as GdnCfg::state_len.
+    pub fn state_len(&self) -> usize {
+        let (nh, dk, dv, kk) = (
+            self.num_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+            self.conv_kernel,
+        );
+        (kk - 1) * (2 * nh * dk + nh * dv) + nh * dk * dv
+    }
+}
+
+/// Depthwise causal conv over [ring…, current] + SiLU, then ring shift.
+/// Taps oldest→newest, tap kk−1 multiplies the current position.
+fn kda_conv(raw: &[f32], taps: &[f32], ring: &mut [f32], kk: usize, out: &mut [f32]) {
+    let c_dim = raw.len();
+    for c in 0..c_dim {
+        let t = &taps[c * kk..(c + 1) * kk];
+        let mut acc = raw[c] as f64 * t[kk - 1] as f64;
+        for j in 0..kk - 1 {
+            acc += ring[j * c_dim + c] as f64 * t[j] as f64;
+        }
+        out[c] = silu(acc) as f32;
+    }
+    if kk > 1 {
+        ring.copy_within(c_dim.., 0);
+        let tail = (kk - 2) * c_dim;
+        ring[tail..tail + c_dim].copy_from_slice(raw);
+    }
+}
+
+/// Per-channel log-decay for head-channel (h, d): resolves the A_log
+/// broadcast by length and applies the configured gate formula.
+#[inline]
+fn kda_log_decay(w: &KdaWeights, cfg: &KdaCfg, h: usize, d: usize, f: f32) -> f64 {
+    let (nh, dk) = (cfg.num_heads, cfg.head_k_dim);
+    let a = if w.a_log.len() == nh {
+        w.a_log[h] as f64
+    } else if w.a_log.len() == dk {
+        w.a_log[d] as f64
+    } else {
+        w.a_log[h * dk + d] as f64
+    };
+    let raw = f as f64 + w.dt_bias[h * dk + d] as f64;
+    match w.gate_lower_bound {
+        Some(lb) => lb as f64 * sigmoid(a.exp() * raw),
+        None => -a.exp() * softplus(raw),
+    }
+}
+
+/// One recurrent step given this position's raw (pre-conv) projections.
+/// Advances the packed state and writes the gated per-head output into
+/// `of` [nh·dv]. Recurrence (FLA naive_recurrent_kda):
+///   S ← Diag(exp(g))·S;  S += β·k ⊗ (v − kᵀS);  o = qᵀS
+/// with q,k L2-normalized per head and q additionally scaled by 1/√dk —
+/// regrouped into two S passes like gdn_step (per-channel decay folds
+/// into the k readout of the first pass).
+#[allow(clippy::too_many_arguments)]
+fn kda_step(
+    xq: &[f32],
+    xk: &[f32],
+    xv: &[f32],
+    f: &[f32],
+    b: &[f32],
+    gate_out: &[f32],
+    w: &KdaWeights,
+    cfg: &KdaCfg,
+    state: &mut [f32],
+    of: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    let (nh, dk, dv, kk) = (
+        cfg.num_heads,
+        cfg.head_k_dim,
+        cfg.head_v_dim,
+        cfg.conv_kernel,
+    );
+    let (kd, vd) = (nh * dk, nh * dv);
+    let ring_q_len = (kk - 1) * kd;
+    let ring_v_len = (kk - 1) * vd;
+    let (ring_q, rest) = state.split_at_mut(ring_q_len);
+    let (ring_k, rest) = rest.split_at_mut(ring_q_len);
+    let (ring_v, s_all) = rest.split_at_mut(ring_v_len);
+
+    let mut cq = vec![0f32; kd];
+    let mut ck = vec![0f32; kd];
+    let mut cv = vec![0f32; vd];
+    kda_conv(xq, &w.conv_q, ring_q, kk, &mut cq);
+    kda_conv(xk, &w.conv_k, ring_k, kk, &mut ck);
+    kda_conv(xv, &w.conv_v, ring_v, kk, &mut cv);
+
+    let (cq, ck, cv) = (&cq, &ck, &cv);
+    let s_ptr = SendMutF32(s_all.as_mut_ptr());
+    let of_ptr = SendMutF32(of.as_mut_ptr());
+    let head_range = |h0: usize, h1: usize| {
+        let (s_ptr, of_ptr) = (s_ptr, of_ptr);
+        let mut kv = crate::attention::take_buf(dv);
+        let mut delta = crate::attention::take_buf(dv);
+        let mut o = crate::attention::take_buf(dv);
+        let mut kf = crate::attention::take_buf(dk);
+        let mut qf = crate::attention::take_buf(dk);
+        let mut gd = crate::attention::take_buf(dk);
+        for h in h0..h1 {
+            let qs = h * dk;
+            // l2-normalize q and k; q additionally scaled by 1/√dk.
+            let (mut nq, mut nkn) = (0f64, 0f64);
+            for d in 0..dk {
+                nq += (cq[qs + d] as f64) * (cq[qs + d] as f64);
+                nkn += (ck[qs + d] as f64) * (ck[qs + d] as f64);
+            }
+            let invq = (1.0 / ((nq + 1e-6).sqrt() * (dk as f64).sqrt())) as f32;
+            let invk = (1.0 / (nkn + 1e-6).sqrt()) as f32;
+            for d in 0..dk {
+                qf[d] = cq[qs + d] * invq;
+                kf[d] = ck[qs + d] * invk;
+                gd[d] = kda_log_decay(w, cfg, h, d, f[qs + d]).exp() as f32;
+            }
+            let beta = sigmoid(b[h] as f64) as f32;
+
+            // SAFETY: disjoint per-head S and output slices per worker.
+            let s = unsafe { std::slice::from_raw_parts_mut(s_ptr.0.add(h * dk * dv), dk * dv) };
+            let oh = unsafe { std::slice::from_raw_parts_mut(of_ptr.0.add(h * dv), dv) };
+            let vt = &cv[h * dv..(h + 1) * dv];
+
+            // Pass 1: kv = kᵀ(Diag(gd)·S_old) — decay folded into k.
+            kv[..dv].fill(0.0);
+            for di in 0..dk {
+                let kg = kf[di] * gd[di];
+                let row = &s[di * dv..(di + 1) * dv];
+                for dj in 0..dv {
+                    kv[dj] += row[dj] * kg;
+                }
+            }
+            for dj in 0..dv {
+                delta[dj] = (vt[dj] - kv[dj]) * beta;
+            }
+            // Pass 2: S[di,:] = gd[di]·row + k[di]·delta;  o += q[di]·row.
+            o[..dv].fill(0.0);
+            for di in 0..dk {
+                let (kfd, qfd, gdd) = (kf[di], qf[di], gd[di]);
+                let row = &mut s[di * dv..(di + 1) * dv];
+                for dj in 0..dv {
+                    let cell = gdd * row[dj] + kfd * delta[dj];
+                    row[dj] = cell;
+                    o[dj] += qfd * cell;
+                }
+            }
+            // Gated RMSNorm per head: x̂·w·σ(gate) — sigmoid, not SiLU.
+            let ss: f64 = o[..dv].iter().map(|&v| (v as f64) * (v as f64)).sum();
+            let inv = 1.0 / (ss / dv as f64 + cfg.rms_eps).sqrt();
+            for dj in 0..dv {
+                oh[dj] = ((o[dj] as f64 * inv)
+                    * w.o_norm[dj] as f64
+                    * sigmoid(gate_out[h * dv + dj] as f64)) as f32;
+            }
+        }
+        crate::attention::recycle_buf(&mut kv);
+        crate::attention::recycle_buf(&mut delta);
+        crate::attention::recycle_buf(&mut o);
+        crate::attention::recycle_buf(&mut kf);
+        crate::attention::recycle_buf(&mut qf);
+        crate::attention::recycle_buf(&mut gd);
+    };
+    match pool {
+        Some(pool) if nh >= 4 => pool.run(&|widx, n| {
+            let chunk = nh.div_ceil(n);
+            let h0 = (widx * chunk).min(nh);
+            let h1 = (h0 + chunk).min(nh);
+            if h0 < h1 {
+                head_range(h0, h1);
+            }
+        }),
+        _ => head_range(0, nh),
+    }
+}
+
+/// Project one position's raw q/k/v/f/β/gate inputs (shared by the
+/// single and batched forwards; `bi` selects the row when batched).
+fn kda_gate_out(w: &KdaWeights, x: &[f32], vd: usize, pool: Option<&Pool>) -> Vec<f32> {
+    let mut g = vec![0.0f32; vd];
+    match &w.gate {
+        KdaOutGate::Full(gp) => gp.matvec(x, &mut g, pool),
+        KdaOutGate::LowRank(ga, gb) => {
+            let mut low = vec![0.0f32; ga.rows()];
+            ga.matvec(x, &mut low, pool);
+            gb.matvec(&low, &mut g, pool);
+        }
+    }
+    g
+}
+
+/// Forward one position through a KDA layer, advancing `state`.
+pub fn kda_forward(
+    x: &[f32],
+    w: &KdaWeights,
+    cfg: &KdaCfg,
+    state: &mut Vec<f32>,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    if state.len() != cfg.state_len() {
+        *state = vec![0f32; cfg.state_len()];
+    }
+    let (nh, dk, dv) = (cfg.num_heads, cfg.head_k_dim, cfg.head_v_dim);
+    let (kd, vd) = (nh * dk, nh * dv);
+
+    let mut xq = vec![0.0f32; kd];
+    let mut xk = vec![0.0f32; kd];
+    let mut xv = vec![0.0f32; vd];
+    let mut fl = vec![0.0f32; w.f_a.rows()];
+    let mut b = vec![0.0f32; nh];
+    QTensor::matvec_many(
+        [&w.q_proj, &w.k_proj, &w.v_proj, &w.f_a],
+        x,
+        [
+            xq.as_mut_slice(),
+            xk.as_mut_slice(),
+            xv.as_mut_slice(),
+            fl.as_mut_slice(),
+        ],
+        pool,
+    );
+    w.b_proj.matvec(x, &mut b, pool);
+    let mut f = vec![0.0f32; kd];
+    w.f_b.matvec(&fl, &mut f, pool);
+    let gate_out = kda_gate_out(w, x, vd, pool);
+
+    let mut of = vec![0.0f32; vd];
+    kda_step(&xq, &xk, &xv, &f, &b, &gate_out, w, cfg, state, &mut of, pool);
+
+    let mut out = vec![0.0f32; cfg.hidden_size];
+    w.o_proj.matvec(&of, &mut out, pool);
+    out
+}
+
+/// Batched KDA forward (prefill-GEMM): projections as matmat over the
+/// chunk, the recurrence sequential per position — elementwise identical
+/// to the single-position path.
+pub fn kda_forward_batch(
+    xs: &[f32],
+    bsz: usize,
+    w: &KdaWeights,
+    cfg: &KdaCfg,
+    state: &mut Vec<f32>,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    if state.len() != cfg.state_len() {
+        *state = vec![0f32; cfg.state_len()];
+    }
+    let (nh, dk, dv, hs) = (
+        cfg.num_heads,
+        cfg.head_k_dim,
+        cfg.head_v_dim,
+        cfg.hidden_size,
+    );
+    let (kd, vd) = (nh * dk, nh * dv);
+
+    let mut xq = vec![0.0f32; bsz * kd];
+    w.q_proj.matmat(xs, bsz, &mut xq, pool);
+    let mut xk = vec![0.0f32; bsz * kd];
+    w.k_proj.matmat(xs, bsz, &mut xk, pool);
+    let mut xv = vec![0.0f32; bsz * vd];
+    w.v_proj.matmat(xs, bsz, &mut xv, pool);
+    let rank = w.f_a.rows();
+    let mut fl = vec![0.0f32; bsz * rank];
+    w.f_a.matmat(xs, bsz, &mut fl, pool);
+    let mut f = vec![0.0f32; bsz * kd];
+    w.f_b.matmat(&fl, bsz, &mut f, pool);
+    let mut b = vec![0.0f32; bsz * nh];
+    w.b_proj.matmat(xs, bsz, &mut b, pool);
+    let mut gate_out = vec![0.0f32; bsz * vd];
+    match &w.gate {
+        KdaOutGate::Full(gp) => gp.matmat(xs, bsz, &mut gate_out, pool),
+        KdaOutGate::LowRank(ga, gb) => {
+            let mut low = vec![0.0f32; bsz * ga.rows()];
+            ga.matmat(xs, bsz, &mut low, pool);
+            gb.matmat(&low, bsz, &mut gate_out, pool);
+        }
+    }
+
+    let mut of = vec![0.0f32; bsz * vd];
+    for bi in 0..bsz {
+        let mut oh = vec![0.0f32; vd];
+        kda_step(
+            &xq[bi * kd..(bi + 1) * kd],
+            &xk[bi * kd..(bi + 1) * kd],
+            &xv[bi * vd..(bi + 1) * vd],
+            &f[bi * kd..(bi + 1) * kd],
+            &b[bi * nh..(bi + 1) * nh],
+            &gate_out[bi * vd..(bi + 1) * vd],
+            w,
+            cfg,
+            state,
+            &mut oh,
+            pool,
+        );
+        of[bi * vd..(bi + 1) * vd].copy_from_slice(&oh);
+    }
+
+    let mut out = vec![0.0f32; bsz * hs];
+    w.o_proj.matmat(&of, bsz, &mut out, pool);
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn kda_forward_matches_naive_reference() {
+        // Small deterministic KDA layer; the oracle is a literal port of
+        // FLA naive_recurrent_kda + naive_kda_gate + the modeling glue
+        // (conv→silu, low-rank decay, sigmoid-gated output norm), coded
+        // straight from the reference — a different shape from the fused
+        // two-pass production kernel.
+        let (nh, dk, dv, kk, hs, rank) = (2usize, 4usize, 4usize, 3usize, 6usize, 3usize);
+        let synth = |rows: usize, cols: usize, salt: usize| -> QTensor {
+            QTensor::from_f32(
+                (0..rows * cols)
+                    .map(|i| (((i * 31 + salt * 17) % 101) as f32 / 101.0 - 0.5) * 0.6)
+                    .collect(),
+                rows,
+                cols,
+            )
+        };
+        let vecf = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 13 + salt * 7) % 89) as f32 / 89.0 - 0.5) * 0.8)
+                .collect()
+        };
+        for (label, a_log, lb) in [
+            ("per-head standard", vecf(nh, 40), None),
+            ("per-dim lower-bound", vecf(dk, 41), Some(-5.0f32)),
+        ] {
+            let w = KdaWeights {
+                q_proj: synth(nh * dk, hs, 1),
+                k_proj: synth(nh * dk, hs, 2),
+                v_proj: synth(nh * dv, hs, 3),
+                conv_q: vecf(nh * dk * kk, 4),
+                conv_k: vecf(nh * dk * kk, 5),
+                conv_v: vecf(nh * dv * kk, 6),
+                f_a: synth(rank, hs, 7),
+                f_b: synth(nh * dk, rank, 8),
+                dt_bias: vecf(nh * dk, 9),
+                a_log: a_log.clone(),
+                b_proj: synth(nh, hs, 10),
+                gate: KdaOutGate::LowRank(synth(rank, hs, 11), synth(nh * dv, rank, 12)),
+                o_norm: (0..dv).map(|i| 1.0 + 0.1 * i as f32).collect(),
+                o_proj: synth(hs, nh * dv, 13),
+                gate_lower_bound: lb,
+            };
+            let cfg = KdaCfg {
+                num_heads: nh,
+                head_k_dim: dk,
+                head_v_dim: dv,
+                conv_kernel: kk,
+                hidden_size: hs,
+                rms_eps: 1e-6,
+            };
+            let xs: Vec<Vec<f32>> = (0..6)
+                .map(|t| (0..hs).map(|i| ((t * hs + i) as f32 * 0.37).sin() * 0.5).collect())
+                .collect();
+
+            // Production path.
+            let mut state = Vec::new();
+            let got: Vec<Vec<f32>> = xs
+                .iter()
+                .map(|x| kda_forward(x, &w, &cfg, &mut state, None))
+                .collect();
+
+            // Oracle.
+            let mv = |t: &QTensor, x: &[f32]| -> Vec<f32> {
+                let mut o = vec![0.0f32; t.rows()];
+                t.matvec(x, &mut o, None);
+                o
+            };
+            let mut hist: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::new(); // raw xq/xk/xv
+            let mut s_state = vec![0f64; nh * dk * dv];
+            let mut want: Vec<Vec<f32>> = Vec::new();
+            for x in &xs {
+                let (xq, xk, xv) = (mv(&w.q_proj, x), mv(&w.k_proj, x), mv(&w.v_proj, x));
+                hist.push((xq, xk, xv));
+                // conv over the raw history, taps oldest→newest.
+                let conv = |sel: fn(&(Vec<f32>, Vec<f32>, Vec<f32>)) -> &Vec<f32>,
+                            taps: &[f32],
+                            n: usize|
+                 -> Vec<f32> {
+                    (0..n)
+                        .map(|c| {
+                            let t = &taps[c * kk..(c + 1) * kk];
+                            let mut acc = 0f64;
+                            for j in 0..kk {
+                                let idx = hist.len() as i64 - (kk as i64 - j as i64);
+                                if idx >= 0 {
+                                    acc += sel(&hist[idx as usize])[c] as f64 * t[j] as f64;
+                                }
+                            }
+                            silu(acc)
+                        })
+                        .map(|v| v as f32)
+                        .collect()
+                };
+                let cq = conv(|h| &h.0, &w.conv_q, nh * dk);
+                let ck = conv(|h| &h.1, &w.conv_k, nh * dk);
+                let cv = conv(|h| &h.2, &w.conv_v, nh * dv);
+                let f = mv(&w.f_b, &mv(&w.f_a, x));
+                let bb = mv(&w.b_proj, x);
+                let gate_out = match &w.gate {
+                    KdaOutGate::LowRank(ga, gb) => mv(gb, &mv(ga, x)),
+                    KdaOutGate::Full(g) => mv(g, x),
+                };
+                let mut of = vec![0f32; nh * dv];
+                for h in 0..nh {
+                    // l2norm + scale.
+                    let q: Vec<f64> = {
+                        let sl = &cq[h * dk..(h + 1) * dk];
+                        let n: f64 = sl.iter().map(|&v| (v as f64) * (v as f64)).sum();
+                        let inv = 1.0 / ((n + 1e-6).sqrt() * (dk as f64).sqrt());
+                        sl.iter().map(|&v| v as f64 * inv).collect()
+                    };
+                    let k: Vec<f64> = {
+                        let sl = &ck[h * dk..(h + 1) * dk];
+                        let n: f64 = sl.iter().map(|&v| (v as f64) * (v as f64)).sum();
+                        let inv = 1.0 / (n + 1e-6).sqrt();
+                        sl.iter().map(|&v| v as f64 * inv).collect()
+                    };
+                    let v: Vec<f64> = cv[h * dv..(h + 1) * dv].iter().map(|&v| v as f64).collect();
+                    // gate: g = −exp(A)·softplus(f+bias) | lb·σ(exp(A)·(f+bias))
+                    let g: Vec<f64> = (0..dk)
+                        .map(|d| {
+                            let a = if w.a_log.len() == nh {
+                                w.a_log[h] as f64
+                            } else {
+                                w.a_log[d] as f64
+                            };
+                            let raw = f[h * dk + d] as f64 + w.dt_bias[h * dk + d] as f64;
+                            match w.gate_lower_bound {
+                                Some(lb) => lb as f64 * sigmoid(a.exp() * raw),
+                                None => -a.exp() * softplus(raw),
+                            }
+                        })
+                        .collect();
+                    let beta = sigmoid(bb[h] as f64);
+                    let s = &mut s_state[h * dk * dv..(h + 1) * dk * dv];
+                    // S = Diag(exp(g))·S
+                    for di in 0..dk {
+                        for dj in 0..dv {
+                            s[di * dv + dj] *= g[di].exp();
+                        }
+                    }
+                    // kv = kᵀS; S += β·k⊗(v−kv); o = qᵀS
+                    let mut kv = vec![0f64; dv];
+                    for di in 0..dk {
+                        for dj in 0..dv {
+                            kv[dj] += k[di] * s[di * dv + dj];
+                        }
+                    }
+                    for di in 0..dk {
+                        for dj in 0..dv {
+                            s[di * dv + dj] += beta * k[di] * (v[dj] - kv[dj]);
+                        }
+                    }
+                    let mut o = vec![0f64; dv];
+                    for di in 0..dk {
+                        for dj in 0..dv {
+                            o[dj] += q[di] * s[di * dv + dj];
+                        }
+                    }
+                    // sigmoid-gated RMSNorm
+                    let ss: f64 = o.iter().map(|&v| v * v).sum();
+                    let inv = 1.0 / (ss / dv as f64 + cfg.rms_eps).sqrt();
+                    for dj in 0..dv {
+                        of[h * dv + dj] = (o[dj] * inv
+                            * w.o_norm[dj] as f64
+                            * sigmoid(gate_out[h * dv + dj] as f64))
+                            as f32;
+                    }
+                }
+                want.push(mv(&w.o_proj, &of));
+            }
+
+            for (t, (g, e)) in got.iter().zip(&want).enumerate() {
+                for (i, (a, b)) in g.iter().zip(e.iter()).enumerate() {
+                    assert!(
+                        (a - b).abs() < 2e-4,
+                        "{label}: t={t} i={i}: {a} vs {b}"
+                    );
+                }
+            }
+        }
+
+        // Batched prefill must equal the sequential singles bit-close.
+        let w = KdaWeights {
+            q_proj: synth(nh * dk, hs, 1),
+            k_proj: synth(nh * dk, hs, 2),
+            v_proj: synth(nh * dv, hs, 3),
+            conv_q: vecf(nh * dk * kk, 4),
+            conv_k: vecf(nh * dk * kk, 5),
+            conv_v: vecf(nh * dv * kk, 6),
+            f_a: synth(rank, hs, 7),
+            f_b: synth(nh * dk, rank, 8),
+            dt_bias: vecf(nh * dk, 9),
+            a_log: vecf(nh, 40),
+            b_proj: synth(nh, hs, 10),
+            gate: KdaOutGate::LowRank(synth(rank, hs, 11), synth(nh * dv, rank, 12)),
+            o_norm: (0..dv).map(|i| 1.0 + 0.1 * i as f32).collect(),
+            o_proj: synth(hs, nh * dv, 13),
+            gate_lower_bound: None,
+        };
+        let cfg = KdaCfg {
+            num_heads: nh,
+            head_k_dim: dk,
+            head_v_dim: dv,
+            conv_kernel: kk,
+            hidden_size: hs,
+            rms_eps: 1e-6,
+        };
+        let xs: Vec<f32> = (0..5 * hs).map(|i| (i as f32 * 0.29).cos() * 0.4).collect();
+        let mut st1 = Vec::new();
+        let seq: Vec<f32> = (0..5)
+            .flat_map(|t| kda_forward(&xs[t * hs..(t + 1) * hs], &w, &cfg, &mut st1, None))
+            .collect();
+        let mut st2 = Vec::new();
+        let bat = kda_forward_batch(&xs, 5, &w, &cfg, &mut st2, None);
+        for (i, (a, b)) in seq.iter().zip(&bat).enumerate() {
+            assert!((a - b).abs() < 1e-5, "batch i={i}: {a} vs {b}");
+        }
+        assert_eq!(st1, st2, "state must match after the chunk");
+    }
+
     use super::*;
 
     fn tiny() -> (VmfPhaseWeights, VmfPhaseCfg) {
