@@ -489,6 +489,16 @@ Metadata integrity (not just tensors):
 - `cortiq verify` checks the whole chain; a single flipped header byte
   is an error.
 
+### 8.2 Detached signature (authenticity, opt-in)
+
+The hash chain proves integrity, not authorship. `cortiq sign` writes a
+detached `<model>.sig` — JSON `{alg: "ed25519-sha256", pubkey, sha256,
+sig}`, Ed25519 over the file's SHA-256 — so the container itself is
+never rewritten and old tooling is untouched. `cortiq verify` checks
+the signature automatically when the `.sig` sits next to the model;
+absence is not an error. Key = a 32-byte hex seed file the signer
+keeps private.
+
 ## Anti-features — what the format deliberately does NOT have
 
 - **A computable weight layout** — bug class #1 of v1 (writer and reader

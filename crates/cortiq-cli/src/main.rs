@@ -6,6 +6,7 @@ mod gptq;
 mod imagepack;
 mod moedefrag;
 mod npy;
+mod sign;
 mod skill;
 
 use clap::{Parser, Subcommand};
@@ -338,6 +339,15 @@ enum Commands {
         /// Output .cmf path
         #[arg(long)]
         output: String,
+    },
+    /// Sign a model: detached <model>.sig (Ed25519 over the file's
+    /// SHA-256). `cortiq verify` checks it automatically when present.
+    Sign {
+        /// Path to .cmf model file
+        model: String,
+        /// Signing-key file (32-byte hex seed; created on first use)
+        #[arg(long, default_value = "cortiq-signing.key")]
+        key: String,
     },
     /// Import a GGUF model to .cmf — native Rust (F32/F16/BF16/Q4_0..Q6_K + K-quants; llama/qwen2/qwen3)
     ImportGguf {
@@ -1219,6 +1229,7 @@ async fn main() -> anyhow::Result<()> {
             ),
         },
         Commands::Verify { model } => cmd_verify(&model).await,
+        Commands::Sign { model, key } => sign::cmd_sign(&model, &key),
         Commands::Fcd {
             model,
             corpus,
@@ -2956,6 +2967,12 @@ async fn cmd_verify(model_path: &str) -> anyhow::Result<()> {
     let problems = model.verify();
     if problems.is_empty() {
         println!("  ✓ all tensor hashes match");
+        // Authenticity on top of integrity: a detached <model>.sig
+        // (cortiq sign) is verified when present — absence is not an
+        // error, signing is opt-in.
+        if sign::verify_detached(model_path, None)? {
+            println!("  ✓ detached signature valid");
+        }
         println!("OK");
         Ok(())
     } else {
