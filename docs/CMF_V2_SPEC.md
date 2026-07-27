@@ -217,7 +217,12 @@ apply `routed_scaling_factor` and compute Σwₑ·FFNₑ(x). The shared expert i
 always added: with weight `sigmoid(shared_expert_gate·x)` when that tensor is
 present, otherwise with weight 1 (Laguna).
 Experts stay quantized in mmap; per token only the pages of the selected
-k are touched — the same residency story as skills. Each expert is a
+k are touched — the same residency story as skills. Writers SHOULD lay
+a layer's expert tensors out role-contiguously (all `gate_proj` of
+experts 0…N−1 back to back, then all `up_proj`, then all `down_proj`)
+— GPU backends can then treat a layer's expert bank as one region
+instead of gathering hundreds of slices; the native importer and
+`moe-defrag` both emit this order. Each expert is a
 separate directory entry with ITS OWN dtype: that is the carrier of
 per-expert bit allocation (P15 claim 12) — implemented, gated by
 `tests/moe_vbit.sh`; the B-field (router selection frequencies via

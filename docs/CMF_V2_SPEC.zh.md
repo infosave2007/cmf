@@ -186,7 +186,10 @@ model.layers.{i}.mlp.shared_expert_gate.weight      [1, hidden]
 `norm_topk_prob`，对所选的 k 个重归一化 → Σwₑ·FFNₑ(x)；共享
 专家总是以权重 `sigmoid(shared_expert_gate·x)` 加入。
 专家在 mmap 中保持量化状态；每个 token 只触及所选
-k 个的页面 —— 与技能相同的驻留机制。每个专家是一个
+k 个的页面 —— 与技能相同的驻留机制。写入器应当把一层的专家张量按角色
+连续排布（专家 0…N−1 的全部 `gate_proj` 相邻，然后全部 `up_proj`，再
+全部 `down_proj`）——GPU 后端便可把一层的专家库当作一个区域处理，而
+不是收集数百个切片；原生导入器与 `moe-defrag` 都按此顺序写出。每个专家是一个
 单独的目录条目，各有**自己的** dtype：这正是
 逐专家位宽分配的载体（P15 claim 12）—— 已实现，由
 `tests/moe_vbit.sh` 把关；B 场（通过 `--route-stats` 得到的路由器选择频率）
