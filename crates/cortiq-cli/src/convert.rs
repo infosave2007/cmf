@@ -2071,8 +2071,12 @@ pub fn run_convert(
                 let mut w = vec![0.0f32; m_vals.len()];
                 for h in 0..nh {
                     for r in 0..dr {
+                        // DeepSeek rotary interleaves pairs (view d/2,2 →
+                        // transpose): store rope dims even-first so our
+                        // half-split rotation reproduces their math.
+                        let src = if r < dr / 2 { 2 * r } else { 2 * (r - dr / 2) + 1 };
                         w[(h * hd + r) * cols..(h * hd + r + 1) * cols].copy_from_slice(
-                            &m_vals[(h * hd + dn + r) * cols..(h * hd + dn + r + 1) * cols],
+                            &m_vals[(h * hd + dn + src) * cols..(h * hd + dn + src + 1) * cols],
                         );
                     }
                     for r in 0..dn {
@@ -2080,6 +2084,33 @@ pub fn run_convert(
                             &m_vals[(h * hd + r) * cols..(h * hd + r + 1) * cols],
                         );
                     }
+                }
+                let (dt, data) = quantize_2d(quant, &w, m_shape[0], cols);
+                tensors.push(TensorSpec {
+                    name,
+                    dtype: dt,
+                    shape: m_shape.clone(),
+                    data,
+                });
+                continue;
+            }
+
+            // DeepSeek MLA: the shared rope key rows (tail of kv_a) get
+            // the same even-first interleave fix.
+            if arch.mla.is_some() && name.ends_with("self_attn.kv_a_proj_with_mqa.weight") {
+                let mla = arch.mla.as_ref().unwrap();
+                let (lora, dr) = (mla.kv_lora_rank, mla.qk_rope_head_dim);
+                anyhow::ensure!(
+                    m_shape.len() == 2 && m_shape[0] == lora + dr,
+                    "{name}: rows {:?} != lora+rope",
+                    m_shape
+                );
+                let cols = m_shape[1];
+                let mut w = m_vals.clone();
+                for r in 0..dr {
+                    let src = if r < dr / 2 { 2 * r } else { 2 * (r - dr / 2) + 1 };
+                    w[(lora + r) * cols..(lora + r + 1) * cols]
+                        .copy_from_slice(&m_vals[(lora + src) * cols..(lora + src + 1) * cols]);
                 }
                 let (dt, data) = quantize_2d(quant, &w, m_shape[0], cols);
                 tensors.push(TensorSpec {
