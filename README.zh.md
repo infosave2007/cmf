@@ -279,7 +279,12 @@ cortiq convert --model ./my-hf-checkpoint         --quant q8_2f --output model.c
 cortiq import-gguf Qwen/Qwen2.5-0.5B-Instruct-GGUF --output model.cmf --quant q8
 ```
 
-GGUF 导入覆盖 `Q4_0/1`、`Q5_0/1`、`Q8_0`、`Q2_K`…`Q6_K`、`IQ4_NL/XS` 和 `BF16`。
+GGUF 导入覆盖 `Q4_0/1`、`Q5_0/1`、`Q8_0`、`Q2_K`…`Q6_K`、`IQ4_NL/XS` 和 `BF16`——
+包括 Qwen3.6-MoE / KAT-Coder 一类（`qwen35moe`：GatedDeltaNet 混合 +
+路由专家），llama.cpp 的所有存储约定在导入时都会被还原。一个 34.7B-A3B
+代码模型在 32 核 CPU 上解码 16.6 tok/s，而 llama.cpp 在同一文件上是
+4.7；`CMF_MOE_TAU=0.9`（按置信度自适应的专家路由）再加约 12%，困惑度
+不逊于模型自带的固定 top-k。
 
 ### 1 位模型（Bonsai / BitNet 一类）
 

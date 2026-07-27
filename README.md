@@ -316,7 +316,12 @@ cortiq import-gguf Qwen/Qwen2.5-0.5B-Instruct-GGUF --output model.cmf --quant q8
 ```
 
 GGUF import covers `Q4_0/1`, `Q5_0/1`, `Q8_0`, `Q2_K`…`Q6_K`, `IQ4_NL/XS` and
-`BF16`.
+`BF16` — including the Qwen3.6-MoE / KAT-Coder class (`qwen35moe`:
+GatedDeltaNet hybrid + routed experts), where every llama.cpp storage
+convention is undone on import. A 34.7B-A3B coder decodes at 16.6 tok/s
+on a 32-core CPU where llama.cpp does 4.7 on the same file, and
+`CMF_MOE_TAU=0.9` (confidence-adaptive expert routing) adds ~12% on
+top at equal-or-better perplexity than the model's own fixed top-k.
 
 ### 1-bit models (Bonsai / BitNet class)
 

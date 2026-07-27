@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.24] — 2026-07-27
+
+### Added
+- **qwen35moe GGUF import** — `cortiq import-gguf` now handles the
+  Qwen3.6-MoE / KAT-Coder class (GDN linear-attention hybrid +
+  256-expert MoE + shared expert) natively in Rust, instead of
+  refusing all SSM hybrids. The layer schedule is derived from tensor
+  presence; the 3-D routed-expert tensors split into per-expert
+  matrices; and every llama.cpp storage convention is undone on
+  import (the baked +1 in RMS norm weights — except the GDN gated
+  norm, whose weights live near 1 naturally; `ssm_a` stored as
+  −exp(A_log); the tiled V-head order on every V-indexed tensor,
+  including the out_proj columns). GGUF files are memory-mapped (a
+  21 GB MoE file imports on a 24 GB machine) and tied-embedding
+  GGUFs work. Measured on KAT-Coder-V2.5-Dev (34.7B-A3B, Q4_K_M →
+  q4t): a 32-core EPYC-class CPU decodes at **16.6 tok/s where
+  llama.cpp does 4.7 on the same file — 3.5× faster**; `--o1 all`
+  runs the whole model O(1)-in-context (30 of 40 layers are already
+  linear) and cuts KV+state at 4K context from 238 MB to **83 MB**.
+- **Adaptive MoE routing** (`CMF_MOE_TAU=0.x`, opt-in): keep the
+  smallest prefix of the router's top-k whose renormalized mass
+  reaches τ — confident tokens touch 1–2 experts, flat ones keep all
+  k. MoE decode is memory-bound (every routed expert streams its
+  three matrices per token), so skipped experts are skipped weight
+  traffic. Preliminary numbers on KAT (M4): τ=0.9 decodes **12%
+  faster at better perplexity than the model's own fixed top-8**
+  (trailing near-zero experts contribute mostly noise); τ=0.8 is
+  +58% at a modest quality cost and beats fixed k=4 on both axes.
+  `CMF_MOE_TOPK=N` provides the fixed-k variant. Defaults untouched.
+- **Bring-up diagnostics**: `CMF_DEBUG_LAYERS=1` prints per-layer
+  hidden-state rms/max with layer kinds, and the `cmpcmf` example
+  numerically diffs two `.cmf` files worst-cosine-first — together
+  they turned a "healthy dynamics, garbage output" import bug into a
+  one-tensor pinpoint.
+
 ## [0.5.23] — 2026-07-26
 
 ### Added
