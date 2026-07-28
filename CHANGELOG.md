@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.31] — 2026-07-28
+
+### Added
+- **Cross-turn KV reuse**: chat apps resend the whole conversation
+  every turn — the engine now remembers which ids the KV cache holds
+  and, when the new turn strictly EXTENDS them, prefills only the new
+  tail. Turn latency becomes proportional to the new text instead of
+  the whole session (previously linear per turn, quadratic per
+  conversation). Extension-only — no rollback — so it is exact for
+  every layer kind including recurrent state (GDN/KDA/conv rings) and
+  sliding windows; an edited turn, a new chat, a skill swap or any
+  scorer run falls back to the fresh-sequence path. Gated off under
+  MTP, O(1) attention and task masks; `CMF_KV_REUSE=0` disables;
+  `CMF_PREFILL_PROF` logs the cache hit. Gate: a reused second turn
+  is token-identical to a fresh prefill of the same ids.
+
+### Fixed
+- Release pipeline: every Android artifact links with 16 KB
+  max-page-size (Android 15+ rejects 4 KB-aligned .so) and a readelf
+  verify step FAILS the release on a regression; the iOS static
+  library ships the wgpu-Metal backend so `cortiq_gpu_available()`
+  can turn true on an iPhone.
+
 ## [0.5.30] — 2026-07-28
 
 ### Added
