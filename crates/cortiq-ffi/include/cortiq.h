@@ -49,6 +49,12 @@ int32_t cortiq_worker_tids(int32_t *out, int32_t cap);
  * The run finishes with finish_reason "cancelled". */
 void cortiq_cancel(void *handle);
 
+/* Execution summary JSON for status/About surfaces:
+ * {"simd":"neon","threads":4,"gpu_backend":true}. threads is the real
+ * worker-pool resolution (forced > CMF_THREADS > topology). Process-
+ * lifetime string; do not free. */
+const char *cortiq_execution_info(void);
+
 /* Release a handle. NULL is a no-op. */
 void cortiq_free(void *handle);
 

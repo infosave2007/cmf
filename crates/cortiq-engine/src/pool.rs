@@ -129,6 +129,16 @@ impl Pool {
                 .expect("spawn pool worker");
             joins.push(h);
         }
+        // Registration barrier: `spawn` returns before the closure runs,
+        // and the embedder reads `cortiq_worker_tids` right after load —
+        // on a phone only the first worker had registered by then (the
+        // '· 1 threads' About line that misled the cmfmobile device
+        // investigation twice). Thread start is milliseconds; wait for
+        // every tid before construction returns.
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        while WORKER_TIDS.lock().map(|t| t.len()).unwrap_or(n_workers) < n_workers {
+            std::thread::yield_now();
+        }
         let threads = joins.iter().map(|h| h.thread().clone()).collect();
         Self {
             inner,
@@ -573,6 +583,17 @@ impl SendMut {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    fn worker_tids_registered_before_new_returns() {
+        let _p = super::Pool::new(3);
+        assert_eq!(
+            super::WORKER_TIDS.lock().unwrap().len(),
+            3,
+            "all worker tids must be visible the moment the pool exists"
+        );
+    }
+
     #[test]
     fn forced_threads_overrides_env_and_topology() {
         use std::sync::atomic::Ordering;

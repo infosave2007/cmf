@@ -155,6 +155,32 @@ pub extern "C" fn cortiq_cancel(handle: *mut c_void) {
     ctx.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// One-line execution summary as JSON, for status/About surfaces:
+/// `{"simd":"neon","threads":4,"gpu_backend":true}`. `threads` is the
+/// REAL worker-pool resolution (forced > CMF_THREADS > topology) —
+/// the number the pool will actually spawn, valid before AND after
+/// load. The returned pointer is a process-lifetime C string.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_execution_info() -> *const c_char {
+    use std::sync::OnceLock;
+    static INFO: OnceLock<std::ffi::CString> = OnceLock::new();
+    INFO.get_or_init(|| {
+        #[cfg(target_arch = "aarch64")]
+        let simd = "neon";
+        #[cfg(target_arch = "x86_64")]
+        let simd = "avx2";
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let simd = "none";
+        let threads = cortiq_engine::pool::Pool::effective_threads().max(1);
+        let gpu = cortiq_engine::gpu::backend_available();
+        std::ffi::CString::new(format!(
+            "{{\"simd\":\"{simd}\",\"threads\":{threads},\"gpu_backend\":{gpu}}}"
+        ))
+        .expect("no interior NUL")
+    })
+    .as_ptr()
+}
+
 /// Release the handle. NULL is a no-op. Do not use the handle afterwards.
 #[unsafe(no_mangle)]
 pub extern "C" fn cortiq_free(handle: *mut c_void) {
