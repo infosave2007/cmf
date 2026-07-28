@@ -70,6 +70,9 @@ jobs:
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOL/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
           echo "CC_aarch64_linux_android=$TOOL/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
           echo "AR_aarch64_linux_android=$TOOL/llvm-ar" >> "$GITHUB_ENV"
+          # Android 15+ (16 KB kernel pages) rejects 4 KB-aligned .so —
+          # every android artifact links with 16 KB max-page-size.
+          echo "RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384" >> "$GITHUB_ENV"
       - name: Build
         # --features gpu: the wgpu (Vulkan/DX12) path ships in every
         # artifact — field case: a 35B CMF on an RTX 4090 ran CPU-only at
@@ -83,6 +86,15 @@ jobs:
         # --features gpu: Vulkan via wgpu so Mali/Adreno are reachable
         # from the app; the probe keeps CPU where the GPU loses.
         run: cargo build --release -p cortiq-ffi --features gpu --target ${{ matrix.target }}
+      - name: Verify 16 KB page alignment (android)
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          NDK="${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
+          READELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          SO="target/${{ matrix.target }}/release/libcortiq_ffi.so"
+          if "$READELF" -l "$SO" | grep -E '^\s*LOAD' | grep -q '0x1000$'; then
+            echo "::error::$SO is 4 KB-aligned — Android 15+ rejects it"; exit 1
+          fi
       - name: Package FFI (android)
         if: matrix.target == 'aarch64-linux-android'
         run: |
@@ -158,9 +170,12 @@ jobs:
             lib: libcortiq_ffi.so
             features: gpu
           # iOS devices: static library, linked into the app binary.
+          # gpu = the wgpu Metal backend; the app adds `-framework Metal`
+          # (cmfmobile TUNING.md) and cortiq_gpu_available() turns true.
           - os: macos-latest
             target: aarch64-apple-ios
             lib: libcortiq_ffi.a
+            features: gpu
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -177,8 +192,19 @@ jobs:
           echo "CARGO_TARGET_${TRIPLE_ENV}_LINKER=$TOOL/${{ matrix.clang }}" >> "$GITHUB_ENV"
           echo "CC_$(echo '${{ matrix.target }}' | tr '-' '_')=$TOOL/${{ matrix.clang }}" >> "$GITHUB_ENV"
           echo "AR_$(echo '${{ matrix.target }}' | tr '-' '_')=$TOOL/llvm-ar" >> "$GITHUB_ENV"
+          # Android 15+ (16 KB kernel pages) rejects 4 KB-aligned .so.
+          echo "RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384" >> "$GITHUB_ENV"
       - name: Build FFI library
         run: cargo build --release -p cortiq-ffi ${{ matrix.features && format('--features {0}', matrix.features) || '' }} --target ${{ matrix.target }}
+      - name: Verify 16 KB page alignment (android)
+        if: contains(matrix.target, 'android')
+        run: |
+          NDK="${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
+          READELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          SO="target/${{ matrix.target }}/release/${{ matrix.lib }}"
+          if "$READELF" -l "$SO" | grep -E '^\s*LOAD' | grep -q '0x1000$'; then
+            echo "::error::$SO is 4 KB-aligned — Android 15+ rejects it"; exit 1
+          fi
       - name: Package
         run: |
           bindir="target/${{ matrix.target }}/release"
