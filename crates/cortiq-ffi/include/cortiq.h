@@ -44,6 +44,11 @@ void cortiq_set_threads(int32_t n);
  * returns the total count; 0 before a load or on other platforms. */
 int32_t cortiq_worker_tids(int32_t *out, int32_t cap);
 
+/* Cancel the generation currently running on this handle (thread-safe;
+ * cortiq_chat* blocks its caller, so call this from another thread).
+ * The run finishes with finish_reason "cancelled". */
+void cortiq_cancel(void *handle);
+
 /* Release a handle. NULL is a no-op. */
 void cortiq_free(void *handle);
 

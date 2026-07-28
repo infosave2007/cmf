@@ -20,6 +20,9 @@ use cortiq_engine::{Pipeline, SamplerConfig};
 
 struct Ctx {
     pipeline: Mutex<Pipeline>,
+    /// Clone of the pipeline's cancel flag — reachable while the
+    /// pipeline mutex is held by a running generation.
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Sticky `enable_thinking` for reasoning-model chat templates
     /// (Qwen3/3.5): `None` leaves it undefined so the template picks its own
     /// default; `Some(false)` makes the model answer directly instead of
@@ -83,6 +86,7 @@ pub extern "C" fn cortiq_load(path: *const c_char) -> *mut c_void {
             }
         };
         Box::into_raw(Box::new(Ctx {
+            cancel: pipeline.cancel.clone(),
             pipeline: Mutex::new(pipeline),
             enable_thinking: Mutex::new(None),
         })) as *mut c_void
@@ -135,6 +139,20 @@ pub extern "C" fn cortiq_worker_tids(out: *mut i32, cap: i32) -> i32 {
         unsafe { std::ptr::copy_nonoverlapping(tids.as_ptr(), out, n) };
     }
     tids.len() as i32
+}
+
+/// Cancel the generation currently running on this handle (safe from
+/// any thread — this is the point: `cortiq_chat*` blocks its caller).
+/// The engine checks the flag at every prefill chunk and decode step
+/// and finishes with `finish_reason: "cancelled"`. No-op when nothing
+/// runs; the flag clears itself once honoured.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_cancel(handle: *mut c_void) {
+    if handle.is_null() {
+        return;
+    }
+    let ctx = unsafe { &*(handle as *const Ctx) };
+    ctx.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Release the handle. NULL is a no-op. Do not use the handle afterwards.

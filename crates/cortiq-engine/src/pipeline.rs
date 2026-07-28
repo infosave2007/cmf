@@ -78,6 +78,11 @@ pub struct Pipeline {
     pub gdn_cfg: Option<GdnCfg>,
     /// MiniCPM-class logit scale (tied lm_head → cannot fold into weights).
     pub logit_multiplier: Option<f32>,
+    /// Cooperative cancel: set from any thread (FFI `cortiq_cancel`,
+    /// a dropped server connection); the generate loop checks it at
+    /// every prefill chunk and decode step and finishes with
+    /// `finish_reason: "cancelled"`. Auto-cleared when honoured.
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Token ids currently materialized in the KV cache (the forwarded
     /// prompt + all generated tokens except the last, which is sampled
     /// but not yet forwarded). Lets the next generate call prefill only
@@ -1118,6 +1123,7 @@ impl Pipeline {
             gdn_cfg: None,
             kda_cfg: None,
             logit_multiplier: None,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             kv_history: Vec::new(),
             short_conv_cfg: None,
             mtp: None,
@@ -1454,7 +1460,9 @@ impl Pipeline {
             // each position's hidden straight from the chunk result.
             let chunk = prefill_chunk();
             let hs = self.hidden_size;
-            while pos < input_ids.len() {
+            while pos < input_ids.len()
+                && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+            {
                 let end = (pos + chunk).min(input_ids.len());
                 let hb = self.prefill_batch(&input_ids[pos..end], pos);
                 if let Some(m) = &mut mtp {
@@ -1476,7 +1484,9 @@ impl Pipeline {
         let pair_off = std::env::var("CMF_PAIR").is_ok_and(|v| v == "0");
         if task_mask.is_none() && !dyn_prefill && !graph_prefill && !pair_off && self.pair_supported()
         {
-            while pos + 1 < input_ids.len() {
+            while pos + 1 < input_ids.len()
+                && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+            {
                 let e1 = self.embed_single(input_ids[pos]);
                 let e2 = self.embed_single(input_ids[pos + 1]);
                 let (h1, h2) = self.forward_pair(&e1, &e2, pos);
@@ -1530,7 +1540,9 @@ impl Pipeline {
                 }
             }
         }
-        while pos < input_ids.len() {
+        while pos < input_ids.len()
+            && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+        {
             self.graph_want_logits = fuse_lm && pos + 1 == input_ids.len();
             hidden = self.forward_layers(&self.embed_single(input_ids[pos]), pos, task_mask);
             if let Some(m) = &mut mtp {
@@ -1547,6 +1559,26 @@ impl Pipeline {
                 _tpf.elapsed().as_secs_f64() * 1000.0
             );
         }
+        // Cancelled mid-prefill: the cache holds a partial prompt —
+        // drop the reuse history and return an empty generation.
+        if self.cancel.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.kv_history.clear();
+            if let Some(m) = mtp {
+                self.mtp = Some(m);
+            }
+            return Ok(GenerateResult {
+                text: String::new(),
+                token_ids: Vec::new(),
+                prompt_tokens: input_ids.len(),
+                tokens_generated: 0,
+                finish_reason: "cancelled".to_string(),
+                mtp_drafted: 0,
+                mtp_accepted: 0,
+                token_confidence: Vec::new(),
+                traces: Vec::new(),
+            });
+        }
+
         // Prompt absorbed → freeze the o1 layers' skeletons; from here
         // every decode step on those layers is O(W + m·dv + m²).
         self.o1_seal();
@@ -1576,6 +1608,10 @@ impl Pipeline {
         // ── Decode ──
         let mut next_pos = input_ids.len();
         'decode: while generated < max_tokens {
+            if self.cancel.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                finish_reason = "cancelled".to_string();
+                break 'decode;
+            }
             let mut logits = match self.graph_logits.take() {
                 Some(lg) => lg,
                 None => {
@@ -3664,10 +3700,12 @@ impl Pipeline {
         let graph_on = match graph_env.as_deref() {
             Some("0") => false,
             Some(_) => true,
-            None => {
-                crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)
-                    || crate::gpu::wgpu_active()
-            }
+            // Unset: same discrete-only default as every other graph
+            // site. "Is the GPU on" used to stand in here — which made
+            // the 0.2 tok/s whole-token graph race-eligible on mobile
+            // adapters and cost 12-14× on first tokens (cmfmobile
+            // TUNING.md); integrated GPUs keep the per-op probe path.
+            None => crate::gpu::wgpu_graph_default(),
         };
         let graph_trusted =
             graph_env.is_some() || crate::gpu::wgpu_graph_default() || self.gdn_cfg.is_some();
@@ -5166,6 +5204,20 @@ fn ffn_forward_pair(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cancel_flag_stops_generation() {
+        let mut p = create_test_pipeline(16, 32, 2, 2, 8, 2, 32);
+        // Set before the call: the prefill loops honour it, the run
+        // returns immediately with the cancelled reason and no tokens.
+        p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let r = p.generate_from_ids(&[1, 2, 3], 8, None, None).unwrap();
+        assert_eq!(r.finish_reason, "cancelled");
+        assert!(r.token_ids.is_empty(), "no tokens after cancel: {:?}", r.token_ids);
+        // Flag auto-cleared: the next call generates normally.
+        let r2 = p.generate_from_ids(&[1, 2, 3], 4, None, None).unwrap();
+        assert_ne!(r2.finish_reason, "cancelled");
+    }
     use super::*;
 
     /// sparse_ffn_quant must equal a dense FFN where inactive neurons are

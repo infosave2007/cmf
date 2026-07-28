@@ -107,9 +107,14 @@ impl CortiqRuntime {
         }
     }
 
-    /// Detect optimal execution mode for current hardware.
+    /// Execution mode as it actually runs: the thread count is the
+    /// REAL worker-pool size (forced > CMF_THREADS > big-core
+    /// topology — the same resolution Pool::from_env applies), not
+    /// available_parallelism; SIMD follows the target arch. The old
+    /// stub reported `Avx2 · num_cpus` even on a phone and sent a
+    /// device investigation down two wrong paths (cmfmobile
+    /// TUNING.md finding 2).
     fn detect_execution_mode() -> ExecutionMode {
-        // TODO: actual hardware detection (CUDA, Metal, CPU caps)
         #[cfg(target_os = "macos")]
         {
             ExecutionMode::AppleUnified {
@@ -118,9 +123,15 @@ impl CortiqRuntime {
         }
         #[cfg(not(target_os = "macos"))]
         {
+            #[cfg(target_arch = "aarch64")]
+            let simd_type = SimdType::Neon;
+            #[cfg(target_arch = "x86_64")]
+            let simd_type = SimdType::Avx2;
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+            let simd_type = SimdType::None;
             ExecutionMode::CpuOnly {
-                simd_type: SimdType::Avx2,
-                threads: num_cpus(),
+                simd_type,
+                threads: crate::pool::Pool::effective_threads(),
             }
         }
     }

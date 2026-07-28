@@ -216,18 +216,17 @@ impl Pool {
         None
     }
 
-    /// Pool sized from `CMF_THREADS` (see module docs). `None` = serial.
-    /// Without the env, heterogeneous ARM defaults to its BIG cores.
-    pub fn from_env() -> Option<Arc<Self>> {
+    /// The thread count `from_env` would use RIGHT NOW: forced (C ABI)
+    /// > CMF_THREADS > big-core topology > available_parallelism−1.
+    /// ≤1 means the model runs serial (no pool). Introspection
+    /// (`execution_mode`, status endpoints) must report THIS, not
+    /// available_parallelism.
+    pub fn effective_threads() -> usize {
         let forced = FORCED_THREADS.load(std::sync::atomic::Ordering::Relaxed);
         if forced > 0 {
-            return if forced <= 1 {
-                None
-            } else {
-                Some(Arc::new(Self::new(forced)))
-            };
+            return forced;
         }
-        let n = match std::env::var("CMF_THREADS") {
+        match std::env::var("CMF_THREADS") {
             Ok(v) => v.parse::<usize>().unwrap_or(0),
             Err(_) => match Self::big_cores() {
                 Some(big) => big,
@@ -238,7 +237,13 @@ impl Pool {
                     avail.saturating_sub(1).min(8)
                 }
             },
-        };
+        }
+    }
+
+    /// Pool sized from `CMF_THREADS` (see module docs). `None` = serial.
+    /// Without the env, heterogeneous ARM defaults to its BIG cores.
+    pub fn from_env() -> Option<Arc<Self>> {
+        let n = Self::effective_threads();
         if n <= 1 {
             None
         } else {
