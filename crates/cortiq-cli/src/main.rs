@@ -715,9 +715,11 @@ enum Commands {
         #[arg(long, default_value_t = 0.10)]
         gate_slack: f64,
     },
-    /// Generate an image from text — Lumina-Image 2.0 diffusers
-    /// directory (tokenizer/ text_encoder/ transformer/ vae/), CPU f32
-    /// (experimental; CMF packaging comes later)
+    /// Generate an image from text (Lumina-Image 2.0). Takes a packed
+    /// `.cmf` from `imagine-pack` — one mmap for text encoder, DiT and
+    /// VAE — or a raw diffusers directory (tokenizer/ text_encoder/
+    /// transformer/ vae/) for the exact f32 path. `CMF_GPU=1` runs the
+    /// DiT on the device (Metal); output is P6 PPM
     Imagine {
         /// Model root directory
         model_dir: String,
