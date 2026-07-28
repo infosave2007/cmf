@@ -22,6 +22,14 @@ fn expert_parts(name: &str) -> Option<(usize, usize, &str)> {
     Some((li.parse().ok()?, e.parse().ok()?, rest))
 }
 
+/// "model.layers.L.mlp.expert_bias" → L (noaux_tc selection bias —
+/// one scalar per expert, sliced with the experts it scores).
+fn expert_bias_layer(name: &str) -> Option<usize> {
+    let t = name.strip_prefix("model.layers.")?;
+    let (li, t) = t.split_once('.')?;
+    (t == "mlp.expert_bias").then(|| li.parse().ok())?
+}
+
 /// "model.layers.L.mlp.gate.weight" → L.
 fn router_layer(name: &str) -> Option<usize> {
     let t = name.strip_prefix("model.layers.")?;
@@ -242,17 +250,25 @@ pub fn cmd_moe_defrag(
     // (small: kept×hidden f32); experts borrow the source mmap directly.
     let mut routers: HashMap<usize, (Vec<u8>, Vec<usize>)> = HashMap::new(); // tensor idx → (data, shape)
     for (ti, entry) in model.tensors.iter().enumerate() {
-        let Some(li) = router_layer(&entry.name) else {
+        // Router rows [ne, hidden] and the noaux_tc selection bias
+        // [ne] (Kimi/DeepSeek-V3/LFM2) slice by the same kept set —
+        // a renumbered expert must keep ITS bias or selection breaks.
+        let (li, hidden) = if let Some(li) = router_layer(&entry.name) {
+            (li, Some(entry.shape[1] as usize))
+        } else if let Some(li) = expert_bias_layer(&entry.name) {
+            (li, None)
+        } else {
             continue;
         };
         let Some(map) = remap.get(&li) else { continue };
-        if entry.dtype != TensorDtype::F32 {
-            bail!("{}: router dtype {:?} != F32", entry.name, entry.dtype);
-        }
+        let elem = match entry.dtype {
+            TensorDtype::F32 => 4,
+            TensorDtype::F16 => 2,
+            other => bail!("{}: dtype {other:?} — expected F32/F16", entry.name),
+        };
         let ne = entry.shape[0] as usize;
-        let hidden = entry.shape[1] as usize;
         let src = model.entry_bytes(entry);
-        let row = hidden * 4;
+        let row = hidden.unwrap_or(1) * elem;
         let mut kept: Vec<usize> = map.keys().copied().collect();
         kept.sort_unstable();
         let mut data = Vec::with_capacity(kept.len() * row);
@@ -262,7 +278,11 @@ pub fn cmd_moe_defrag(
             }
             data.extend_from_slice(&src[old * row..(old + 1) * row]);
         }
-        routers.insert(ti, (data, vec![kept.len(), hidden]));
+        let shape = match hidden {
+            Some(h) => vec![kept.len(), h],
+            None => vec![kept.len()],
+        };
+        routers.insert(ti, (data, shape));
     }
 
     // Pass 2: the spec list — dropped experts skipped, kept ones
