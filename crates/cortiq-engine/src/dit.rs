@@ -545,11 +545,13 @@ impl NextDit {
         if n < 128 || !gpu::enabled_here() || gpu::mm_killed() {
             return false;
         }
-        if gpu::probe_deciding(gpu::OpClass::MatmatWide)
-            || !matches!(
-                gpu::probe_arm(gpu::OpClass::MatmatWide),
-                gpu::ProbeArm::Gpu
-            )
+        // A fused block is not a wide matmat: see `fused_block_trusted`.
+        if !gpu::fused_block_trusted()
+            && (gpu::probe_deciding(gpu::OpClass::MatmatWide)
+                || !matches!(
+                    gpu::probe_arm(gpu::OpClass::MatmatWide),
+                    gpu::ProbeArm::Gpu
+                ))
         {
             return false;
         }
@@ -598,8 +600,10 @@ impl NextDit {
         if n < 128 || !gpu::enabled_here() || gpu::mm_killed() {
             return false;
         }
-        if gpu::probe_deciding(gpu::OpClass::MatmatWide)
-            || !matches!(gpu::probe_arm(gpu::OpClass::MatmatWide), gpu::ProbeArm::Gpu)
+        // A fused block is not a wide matmat: see `fused_block_trusted`.
+        if !gpu::fused_block_trusted()
+            && (gpu::probe_deciding(gpu::OpClass::MatmatWide)
+                || !matches!(gpu::probe_arm(gpu::OpClass::MatmatWide), gpu::ProbeArm::Gpu))
         {
             return false;
         }
@@ -664,8 +668,10 @@ impl NextDit {
         if n < 128 || !gpu::enabled_here() || gpu::mm_killed() {
             return false;
         }
-        if gpu::probe_deciding(gpu::OpClass::MatmatWide)
-            || !matches!(gpu::probe_arm(gpu::OpClass::MatmatWide), gpu::ProbeArm::Gpu)
+        // A fused block is not a wide matmat: see `fused_block_trusted`.
+        if !gpu::fused_block_trusted()
+            && (gpu::probe_deciding(gpu::OpClass::MatmatWide)
+                || !matches!(gpu::probe_arm(gpu::OpClass::MatmatWide), gpu::ProbeArm::Gpu))
         {
             return false;
         }
@@ -1009,14 +1015,18 @@ impl NextDit {
         cap_n: usize,
         t: f32,
     ) -> Vec<f32> {
-        let (c, p, hs) = (self.in_channels, self.patch, self.hidden);
-        assert_eq!(latent.len(), c * h * w);
-        let (hp, wp) = (h / p, w / p);
-        let n_img = hp * wp;
-        let head = prof::span(prof::HEADTAIL);
-        let temb = self.time_embed(t);
+        self.forward_with_cap(latent, h, w, &self.refine_caption(cap, cap_n), cap_n, t)
+    }
 
-        // caption features → hidden
+    /// Caption features → hidden, through the context refiner. Depends on
+    /// NOTHING that moves during denoising — not the timestep, not the
+    /// latents — so the whole thing is a constant of the prompt. The
+    /// denoise loop hoists it out and hands the result to
+    /// `forward_with_cap`; it used to be recomputed on every model call,
+    /// which for 30 steps under CFG meant 60 evaluations of a value with
+    /// two distinct instances.
+    pub fn refine_caption(&self, cap: &[f32], cap_n: usize) -> Vec<f32> {
+        let hs = self.hidden;
         let cap_feat = self.cap_norm.len();
         let mut cap_n_all = vec![0f32; cap_n * cap_feat];
         for i in 0..cap_n {
@@ -1034,6 +1044,31 @@ impl NextDit {
                 *v += b;
             }
         }
+        let cap_ids: Vec<[u32; 3]> = (0..cap_n).map(|i| [i as u32, 0, 0]).collect();
+        let cap_rope = rope_table(&cap_ids, &self.axes_dim);
+        for blk in &self.context_refiner {
+            self.block_forward(blk, &mut cap_e, &cap_rope, None, None);
+        }
+        cap_e
+    }
+
+    /// The rest of the forward, from an already-refined caption.
+    pub fn forward_with_cap(
+        &self,
+        latent: &[f32],
+        h: usize,
+        w: usize,
+        cap_e_in: &[f32],
+        cap_n: usize,
+        t: f32,
+    ) -> Vec<f32> {
+        let (c, p, hs) = (self.in_channels, self.patch, self.hidden);
+        assert_eq!(latent.len(), c * h * w);
+        let (hp, wp) = (h / p, w / p);
+        let n_img = hp * wp;
+        let head = prof::span(prof::HEADTAIL);
+        let temb = self.time_embed(t);
+        let mut cap_e = cap_e_in.to_vec();
 
         // patchify (dy, dx, ch inner order) + x_embedder
         let pv = p * p * c;
@@ -1077,9 +1112,8 @@ impl NextDit {
         let img_rope32 = to32(&img_rope);
         drop(head);
 
-        for blk in &self.context_refiner {
-            self.block_forward(blk, &mut cap_e, &cap_rope, None, None);
-        }
+        // The context refiner already ran in `refine_caption` — it is a
+        // constant of the prompt, not of this call.
         for blk in &self.noise_refiner {
             self.block_forward(blk, &mut img, &img_rope, Some(&img_rope32), Some(&temb));
         }

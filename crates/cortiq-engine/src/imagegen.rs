@@ -134,13 +134,19 @@ fn denoise(
 ) -> Vec<f32> {
     let mut latents = gauss_latent(dit.in_channels * lh * lw, p.seed);
     let sg = sigmas(p.steps, 6.0);
+    // The caption embedding and its refiner blocks depend on the prompt
+    // alone — not on the timestep, not on the latents. Refined once here
+    // instead of inside every model call: at 30 steps under CFG that is
+    // 2 evaluations where the loop used to do 60.
+    let cap_r = dit.refine_caption(cap, cap_n);
+    let cap_u_r = cap_u.map(|(cu, un)| (dit.refine_caption(cu, *un), *un));
     for i in 0..p.steps {
         let t = (1.0 - sg[i]) as f32;
-        let mut pred = dit.forward(&latents, lh, lw, cap, cap_n, t);
-        if let Some((cu, un)) = cap_u {
+        let mut pred = dit.forward_with_cap(&latents, lh, lw, &cap_r, cap_n, t);
+        if let Some((cu, un)) = &cap_u_r {
             // CFG truncation: past the ratio only cond runs.
             if (i + 1) as f32 / p.steps as f32 <= p.cfg_trunc_ratio {
-                let uncond = dit.forward(&latents, lh, lw, cu, *un, t);
+                let uncond = dit.forward_with_cap(&latents, lh, lw, cu, *un, t);
                 let gs = p.guidance_scale;
                 let mut comb: Vec<f32> = uncond
                     .iter()

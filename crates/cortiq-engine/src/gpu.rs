@@ -212,6 +212,29 @@ pub fn q1_force() -> bool {
     }
 }
 
+/// Should a FUSED whole-block path trust the device instead of asking
+/// the per-op probe? True on native Metal.
+///
+/// The probe answers "is one wide matmat faster on the GPU", and for the
+/// DiT that is a coin flip — measured 2.62 ms GPU vs 2.56 ms CPU, a 2%
+/// spread that lands on either arm run to run. But the fused block's
+/// advantage is not per-op speed, it is that the hidden state, the
+/// packs and the attention panels never leave the device: end to end
+/// the whole-block path renders a 512² Lumina step in ~5.4 s against
+/// ~8.4 s when the probe happens to pick the CPU. Gating a fusion win
+/// on a per-op tie made every second render half-speed at random.
+/// Other backends keep probing — there the submit latency is real.
+pub fn fused_block_trusted() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        backend() == Backend::Metal
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// Which arm should this GPU-eligible call take? Consult AFTER the
 /// eligibility gates (`enabled_here` / `min_rows`) so only real
 /// candidates alternate.

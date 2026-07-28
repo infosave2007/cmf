@@ -2951,6 +2951,13 @@ kernel void q4t_matvec(
     }
 }
 
+// MEASURED NEUTRAL (M4, Lumina DiT 512² and the Nanbeige chunk prefill):
+// giving these two kernels q8_mul_mm's cols/rows function-constant
+// specialization changed nothing — paired runs at matched thermal state
+// landed between −4% and +3%. The K loop is already tile-shaped (NK=32
+// == one 18 B group per step), so a compile-time `cols` buys no unroll
+// the shape does not already imply. Not worth the extra pipeline cache.
+//
 // q4t register-blocked GEMM: q8_mul_mm's simdgroup machinery, weight
 // staging decodes 18-byte q4t tiles (f16 scale + 32 nibbles) in the
 // K loop. NK=32 == GROUP_SIZE so each K-step is exactly one tile per

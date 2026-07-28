@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A coin flip decided whether image generation ran at half speed.**
+  The fused DiT paths (whole block, all-heads attention, SwiGLU FFN)
+  gated themselves on the wide-GEMM probe, which asks "is ONE wide
+  matmat faster on the GPU" — and for Lumina that is a tie: 2.62 ms GPU
+  against 2.56 ms CPU, landing on either arm run to run. But a fused
+  block's advantage is not per-op speed, it is that the hidden state,
+  the packs and the attention panels never leave the device. Measured
+  on a fanless MacBook Air M4, 512² Lumina-Image 2.0: a step takes
+  ~4.5–5.8 s when the probe picks the GPU and **7.7–9.0 s when it picks
+  the CPU**, and it picked the CPU in a third to two thirds of runs. On
+  native Metal the fused paths now trust the device
+  (`gpu::fused_block_trusted`); other backends keep probing, where the
+  submit latency is real. Renders are bit-identical, just no longer
+  randomly half-speed.
+
+### Changed
+- Lumina's caption embedding and its context-refiner blocks are hoisted
+  out of the denoise loop. They depend on the prompt alone — not the
+  timestep, not the latents — so 30 CFG steps evaluated 60 times what
+  has two distinct values. Output is bit-identical; the saving is small
+  (~0.25% of a step: the caption is ~60 tokens against 1024 image
+  tokens), this is about not recomputing a constant.
+
 ## [0.5.35] — 2026-07-28
 
 ### Added
