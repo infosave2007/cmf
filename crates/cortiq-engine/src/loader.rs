@@ -876,8 +876,12 @@ impl Pipeline {
             })))
         };
 
+        fn anyhow_like(ok: bool) -> Result<(), ()> {
+            if ok { Ok(()) } else { Err(()) }
+        }
         let mut layers = Vec::with_capacity(arch.num_layers);
-        for li in 0..arch.num_layers {
+        let is_g3n = arch.g3n.is_some();
+        for li in 0..(if is_g3n { 0 } else { arch.num_layers }) {
             let prefix = format!("model.layers.{li}.");
             let attn = match arch.layer_types.get(li) {
                 Some(LayerType::LinearAttention) => load_linear_attn(&prefix)?,
@@ -1171,6 +1175,111 @@ impl Pipeline {
         pipeline.vmf_cfg = vmf_cfg;
         pipeline.gdn_cfg = gdn_cfg;
         pipeline.kda_cfg = kda_cfg;
+        if let Some(gc) = arch.g3n.as_ref() {
+            use crate::g3n::{G3nAltUp, G3nGlobals, G3nLaurel, G3nLayer};
+            anyhow_like(gc.altup_num_inputs == crate::g3n::ALTUP_N).map_err(|_| {
+                CmfError::Parse(format!(
+                    "g3n: altup_num_inputs {} != supported {}",
+                    gc.altup_num_inputs,
+                    crate::g3n::ALTUP_N
+                ))
+            })?;
+            let t = |name: &str| load_matrix(model, name, force_f32, ov);
+            let f = |name: &str| load_f32(model, name, ov).map_err(err);
+            let mut altup_proj = Vec::new();
+            let mut altup_unembed = Vec::new();
+            for i in 0..crate::g3n::ALTUP_N - 1 {
+                altup_proj.push(t(&format!("model.altup_projections.{i}.weight"))?);
+                altup_unembed.push(t(&format!("model.altup_unembed_projections.{i}.weight"))?);
+            }
+            let first_shared = arch.num_layers.saturating_sub(gc.num_kv_shared_layers);
+            let sliding_of = |li: usize| {
+                matches!(
+                    arch.layer_types.get(li),
+                    Some(cortiq_core::LayerType::SlidingAttention)
+                )
+            };
+            let mut g3n_layers = Vec::with_capacity(arch.num_layers);
+            for li in 0..arch.num_layers {
+                let pfx = format!("model.layers.{li}.");
+                let shared = li >= first_shared && first_shared > 0;
+                let share_src = if shared {
+                    let want = sliding_of(li);
+                    (0..first_shared).rev().find(|&j| sliding_of(j) == want)
+                } else {
+                    None
+                };
+                g3n_layers.push(G3nLayer {
+                    altup: G3nAltUp {
+                        router_norm: f(&format!("{pfx}altup.router_norm.weight"))?,
+                        modality_router: t(&format!("{pfx}altup.modality_router.weight"))?,
+                        prediction_coefs: t(&format!("{pfx}altup.prediction_coefs.weight"))?,
+                        correction_coefs: t(&format!("{pfx}altup.correction_coefs.weight"))?,
+                        correct_output_scale: f(&format!("{pfx}altup.correct_output_scale"))?,
+                    },
+                    laurel: G3nLaurel {
+                        left: t(&format!("{pfx}laurel.linear_left.weight"))?,
+                        right: t(&format!("{pfx}laurel.linear_right.weight"))?,
+                        post_norm: f(&format!("{pfx}laurel.post_laurel_norm.weight"))?,
+                    },
+                    input_norm: f(&format!("{pfx}input_layernorm.weight"))?,
+                    post_attn_norm: f(&format!("{pfx}post_attention_layernorm.weight"))?,
+                    pre_ffw_norm: f(&format!("{pfx}pre_feedforward_layernorm.weight"))?,
+                    post_ffw_norm: f(&format!("{pfx}post_feedforward_layernorm.weight"))?,
+                    wq: t(&format!("{pfx}self_attn.q_proj.weight"))?,
+                    wk: if shared {
+                        None
+                    } else {
+                        Some(t(&format!("{pfx}self_attn.k_proj.weight"))?)
+                    },
+                    wv: if shared {
+                        None
+                    } else {
+                        Some(t(&format!("{pfx}self_attn.v_proj.weight"))?)
+                    },
+                    wo: t(&format!("{pfx}self_attn.o_proj.weight"))?,
+                    q_norm: f(&format!("{pfx}self_attn.q_norm.weight"))?,
+                    k_norm: if shared {
+                        None
+                    } else {
+                        Some(f(&format!("{pfx}self_attn.k_norm.weight"))?)
+                    },
+                    kv_share_src: share_src,
+                    sliding: sliding_of(li),
+                    gate: t(&format!("{pfx}mlp.gate_proj.weight"))?,
+                    up: t(&format!("{pfx}mlp.up_proj.weight"))?,
+                    down: t(&format!("{pfx}mlp.down_proj.weight"))?,
+                    sparsity: gc
+                        .activation_sparsity
+                        .get(li)
+                        .copied()
+                        .unwrap_or(0.0),
+                    ple_gate: t(&format!("{pfx}per_layer_input_gate.weight"))?,
+                    ple_proj: t(&format!("{pfx}per_layer_projection.weight"))?,
+                    post_ple_norm: f(&format!("{pfx}post_per_layer_input_norm.weight"))?,
+                });
+            }
+            let hd = arch.head_dim;
+            let globals = G3nGlobals {
+                altup_proj,
+                altup_unembed,
+                ple_embed: t("model.embed_tokens_per_layer.weight")?,
+                ple_model_proj: t("model.per_layer_model_projection.weight")?,
+                ple_norm: f("model.per_layer_projection_norm.weight")?,
+                ple_vocab: gc.ple_vocab,
+                ple_dim: gc.ple_dim,
+                num_layers: arch.num_layers,
+                hidden: arch.hidden_size,
+                rms_eps: arch.rms_norm_eps,
+                inv_freq_local: crate::attention::rope_inv_freq(
+                    hd,
+                    arch.rope_local_base_freq.unwrap_or(10_000.0) as f32,
+                ),
+                inv_freq_global: crate::attention::rope_inv_freq(hd, arch.rope_theta as f32),
+                window: arch.sliding_window.unwrap_or(512),
+            };
+            pipeline.g3n = Some(Box::new((globals, g3n_layers)));
+        }
         pipeline.short_conv_cfg = short_conv_cfg;
         pipeline.mtp = mtp;
         pipeline.install_dynamic_routing(model, false);

@@ -276,6 +276,25 @@ fn default_yarn_beta_slow() -> f32 {
     1.0
 }
 
+/// Gemma-3n (E-series) stack geometry: AltUp replicas, LAuReL rank,
+/// per-layer embeddings, KV sharing and the activation-sparsity
+/// schedule. Presence of this block switches the runtime to the
+/// dedicated gemma-3n forward.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct G3nConfig {
+    pub altup_num_inputs: usize,
+    pub laurel_rank: usize,
+    /// hidden_size_per_layer_input (PLE width per layer).
+    pub ple_dim: usize,
+    /// vocab_size_per_layer_input — ids past it contribute zero PLE.
+    pub ple_vocab: usize,
+    /// The LAST n layers reuse the KV of the last non-shared layer of
+    /// their own attention type.
+    pub num_kv_shared_layers: usize,
+    /// Per-layer gaussian-top-k sparsity (0 = dense).
+    pub activation_sparsity: Vec<f32>,
+}
+
 /// Model architecture descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelArch {
@@ -400,6 +419,9 @@ pub struct ModelArch {
     /// baked into the shared tensor).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logit_multiplier: Option<f32>,
+    /// Gemma-3n stack (AltUp/LAuReL/PLE/KV-sharing/sparsity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub g3n: Option<G3nConfig>,
     /// KDA lower-bound decay gate (Kimi-K3): log-decay =
     /// `lb·σ(exp(A_log)·(f+dt_bias))` instead of the standard
     /// `−exp(A_log)·softplus(f+dt_bias)`. None = standard formula.

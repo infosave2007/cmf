@@ -90,6 +90,9 @@ pub struct Pipeline {
     pub kv_history: Vec<u32>,
     /// KDA geometry (Kimi Linear / Kimi-K3) — shared by every Kda layer.
     pub kda_cfg: Option<crate::linear_core::KdaCfg>,
+    /// Gemma-3n stack (AltUp/LAuReL/PLE/KV-sharing): its own forward —
+    /// weights.layers stays empty, the KV caches are the shared ones.
+    pub g3n: Option<Box<(crate::g3n::G3nGlobals, Vec<crate::g3n::G3nLayer>)>>,
     /// LFM2 short-convolution geometry (present when the model has
     /// `ShortConv` mixer layers).
     pub short_conv_cfg: Option<ShortConvCfg>,
@@ -1122,6 +1125,7 @@ impl Pipeline {
             vmf_cfg: None,
             gdn_cfg: None,
             kda_cfg: None,
+            g3n: None,
             logit_multiplier: None,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             kv_history: Vec::new(),
@@ -1451,6 +1455,7 @@ impl Pipeline {
             && !dyn_prefill
             && !graph_prefill
             && prefill_batched()
+            && self.g3n.is_none()
             && input_ids.len() > 2
         {
             // Production prefill = the same chunked prefill-GEMM that
@@ -1912,11 +1917,12 @@ impl Pipeline {
     /// this model. MLA and KDA run per position (their pair arms are
     /// unreachable); the seq prefill falls back to singles for them.
     fn pair_supported(&self) -> bool {
-        !self
-            .weights
-            .layers
-            .iter()
-            .any(|lw| matches!(&lw.attn, AttnKind::Mla(_) | AttnKind::Kda(_)))
+        self.g3n.is_none()
+            && !self
+                .weights
+                .layers
+                .iter()
+                .any(|lw| matches!(&lw.attn, AttnKind::Mla(_) | AttnKind::Kda(_)))
     }
 
     fn forward_pair(
@@ -2292,7 +2298,7 @@ impl Pipeline {
         self.kv_history.clear();
         let mut nll = 0f64;
         let mut cnt = 0usize;
-        if prefill_batched() {
+        if prefill_batched() && self.g3n.is_none() {
             // prefill-GEMM: layer-major position chunks, lm_head batched
             // (254MB lm_head read once per chunk, not per position).
             // The layer chunk is large (grouping positions by MoE experts
@@ -3043,6 +3049,11 @@ impl Pipeline {
                 *v *= self.embed_multiplier;
             }
         }
+        // Gemma-3n: the per-layer-embedding half needs the token ID, so
+        // it rides appended to the embedding; the g3n forward splits it.
+        if let Some(b) = &self.g3n {
+            return b.0.extend_embedding(id, &out, self.pool.as_deref());
+        }
         out
     }
 
@@ -3673,6 +3684,22 @@ impl Pipeline {
         task_mask: Option<&TaskMask>,
         upto: Option<usize>,
     ) -> Vec<f32> {
+        // Gemma-3n runs its own stack (4 AltUp replicas don't fit this
+        // loop); `hidden` is the extended embedding from embed_single.
+        if let Some(b) = &self.g3n {
+            let _ = (task_mask, upto);
+            return crate::g3n::g3n_forward(
+                &b.0,
+                &b.1,
+                hidden,
+                position,
+                &mut self.kv_cache.layers,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.pool.as_deref(),
+            );
+        }
         let mut h = hidden.to_vec();
         // Split borrows: copy scalars / clone handles so the per-layer
         // cfg does not hold `&self` while the KV cache is `&mut`.

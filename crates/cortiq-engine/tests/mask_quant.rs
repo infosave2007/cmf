@@ -130,6 +130,7 @@ fn sparse_ffn_quant_agrees_with_dequant() {
         attn_v_norm: false,
         num_loops: 1,
         kda_gate_lower_bound: None,
+        g3n: None,
         rope_freq_factors: None,
         logit_multiplier: None,
         loop_final_norm: false,

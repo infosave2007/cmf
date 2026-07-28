@@ -56,6 +56,7 @@ fn tiny_arch() -> ModelArch {
         attn_v_norm: false,
         num_loops: 1,
         kda_gate_lower_bound: None,
+        g3n: None,
         rope_freq_factors: None,
         logit_multiplier: None,
         loop_final_norm: false,

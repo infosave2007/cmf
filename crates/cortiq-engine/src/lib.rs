@@ -5,6 +5,7 @@ pub mod dit;
 pub mod fcd;
 pub mod fcd_ops;
 pub mod gptq_capture;
+pub mod g3n;
 pub mod gpu;
 #[cfg(target_os = "macos")]
 pub mod gpu_metal;

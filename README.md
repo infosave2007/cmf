@@ -85,9 +85,13 @@ a standard tokenizer.json at convert — gated end-to-end, streamed
 (q_a→rms→q_b) gated end-to-end; MiniCPM's scale_emb / scale_depth /
 dim_model_base fold into the weights and header, longrope's per-dim
 short factors divide inv_freq at load). MXFP4-packed checkpoints (Kimi-K3
-experts) decode natively at convert. Not yet: gemma-4 E-series and
-the Kimi-K3-only extras (residual streams, latent MoE, MLA output
-gate — named refusals until the modeling code is public). Anything else, try `import-gguf` — and if
+experts) decode natively at convert. Gemma-3n E4B (the E-series:
+AltUp's four hidden replicas with predict/correct, LAuReL low-rank
+residuals, per-layer embeddings, KV sharing across the last 15
+layers, gaussian-top-k activation sparsity — gated end-to-end on
+E4B-it). Not yet: the Kimi-K3-only extras (residual streams, latent
+MoE, MLA output gate — named refusals until the modeling code is
+public). Anything else, try `import-gguf` — and if
 it refuses, that is a bug worth filing.
 
 ## Plug it into what you already use

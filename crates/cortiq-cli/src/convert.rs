@@ -212,6 +212,9 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
         // Kimi-K3 vision tower + projector (text tower converts alone).
         "vision_tower.",
         "mm_projector.",
+        // Gemma-3n multimodal towers.
+        "model.audio_tower.",
+        "model.vision_tower.",
     ] {
         if raw.starts_with(pfx) {
             return None;
@@ -323,6 +326,15 @@ fn force_f16(name: &str) -> bool {
         || name.ends_with("kda_attn.g_a_proj.weight")
         || name.ends_with("kda_attn.g_b_proj.weight")
         || name.ends_with("_conv1d.weight")
+        // Gemma-3n: 4-wide AltUp coefficient mats and the low-rank /
+        // per-layer-input projections sit on tanh/gelu gates.
+        || name.ends_with("altup.correction_coefs.weight")
+        || name.ends_with("altup.prediction_coefs.weight")
+        || name.ends_with("altup.modality_router.weight")
+        || name.ends_with("laurel.linear_left.weight")
+        || name.ends_with("laurel.linear_right.weight")
+        || name.ends_with("per_layer_input_gate.weight")
+        || name.ends_with(".per_layer_projection.weight")
         || name.ends_with("mlp.gate.weight")
         || name.ends_with("shared_expert_gate.weight")
         || name.ends_with("self_attn.g_proj.weight")
@@ -1350,7 +1362,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             "laguna: moe_apply_router_weight_on_input=true is not supported"
         );
     }
-    let norm_style = if (mt.contains("gemma") && !mt.contains("gemma4"))
+    let norm_style = if (mt.contains("gemma") && !mt.contains("gemma4") && !mt.contains("gemma3n"))
         || mt.starts_with("qwen3_5")
         || mt.contains("qwen3_next")
     {
@@ -1493,6 +1505,29 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     } else {
         None
     };
+    // Gemma-3n (E-series): AltUp/LAuReL/PLE/KV-sharing geometry rides
+    // in the header; the runtime switches to the dedicated stack.
+    let is_gemma3n =
+        model_type.starts_with("gemma3n") || tc_model_type.starts_with("gemma3n");
+    let g3n_cfg: Option<cortiq_core::G3nConfig> = if is_gemma3n {
+        let need = |k: &str| {
+            cfg_usize(tc, k).ok_or_else(|| anyhow::anyhow!("gemma3n: config missing {k}"))
+        };
+        Some(cortiq_core::G3nConfig {
+            altup_num_inputs: need("altup_num_inputs")?,
+            laurel_rank: need("laurel_rank")?,
+            ple_dim: need("hidden_size_per_layer_input")?,
+            ple_vocab: need("vocab_size_per_layer_input")?,
+            num_kv_shared_layers: need("num_kv_shared_layers")?,
+            activation_sparsity: tc
+                .get("activation_sparsity_pattern")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect())
+                .unwrap_or_default(),
+        })
+    } else {
+        None
+    };
     let mut rope_freq_factors: Option<Vec<f64>> = None;
     // Phi-3 longrope: exact only within the ORIGINAL context — cap the
     // declared max honestly instead of serving stretched positions.
@@ -1536,6 +1571,14 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         arch_name: model_type,
         hidden_size: hidden,
         intermediate_size: cfg_usize(tc, "intermediate_size")
+            .or_else(|| {
+                // Gemma-3n stores a per-layer LIST; E-models keep it
+                // uniform — take the head and insist on uniformity.
+                tc.get("intermediate_size").and_then(|v| v.as_array()).and_then(|a| {
+                    let first = a.first()?.as_u64()?;
+                    a.iter().all(|v| v.as_u64() == Some(first)).then_some(first as usize)
+                })
+            })
             .or_else(|| cfg_usize(tc, "moe_intermediate_size"))
             .ok_or_else(|| anyhow::anyhow!("config: missing intermediate_size"))?,
         num_layers: n_layers,
@@ -1584,10 +1627,12 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         query_pre_attn_scalar: tc
             .get("query_pre_attn_scalar")
             .and_then(|v| v.as_f64())
-            .or(if is_gemma4 { Some(1.0) } else { None }),
+            // Gemma-4 and Gemma-3n attend with scale 1.0 (q-norm carries it).
+            .or(if is_gemma4 || is_gemma3n { Some(1.0) } else { None }),
         sliding_window: cfg_usize(tc, "sliding_window").filter(|_| {
             is_laguna
                 || is_gemma2
+                || is_gemma3n
                 || tc.get("sliding_window_pattern").is_some()
                 || g4_pattern.is_some()
         }),
@@ -1617,6 +1662,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         attn_v_norm: is_gemma4,
         rope_freq_factors,
         logit_multiplier,
+        g3n: g3n_cfg,
         // KDA (Kimi-K3): lower-bound decay-gate variant; absent = standard.
         kda_gate_lower_bound: tc
             .get("linear_attn_config")

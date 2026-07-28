@@ -584,7 +584,13 @@ impl Tokenizer {
             }
             let tok = &self.id_to_token[idx];
             if self.added_ids.contains(&id) {
-                bytes.extend_from_slice(tok.as_bytes());
+                // Gemma-3n declares its multi-space ▁-runs as ADDED
+                // tokens — verbatim passthrough leaked ▁ into output.
+                if self.metaspace && tok.contains('\u{2581}') {
+                    bytes.extend_from_slice(tok.replace('\u{2581}', " ").as_bytes());
+                } else {
+                    bytes.extend_from_slice(tok.as_bytes());
+                }
                 continue;
             }
             // Byte-fallback / legacy byte tokens
@@ -640,6 +646,9 @@ impl Tokenizer {
         }
         let tok = &self.id_to_token[idx];
         if self.added_ids.contains(&id) {
+            if self.metaspace && tok.contains('\u{2581}') {
+                return tok.replace('\u{2581}', " ");
+            }
             return tok.clone();
         }
         if tok.starts_with("<0x") && tok.ends_with('>') && tok.len() == 6 {
