@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.34] — 2026-07-28
+
+### Added
+- **Gemma-3n E-series** (E4B/E2B): the dedicated stack — AltUp's four
+  hidden replicas with tanh-router predict/correct, LAuReL low-rank
+  residuals, per-layer embeddings, KV sharing across the last 15
+  layers (shared layers attend over the source layer's cache and
+  never append), and gaussian-top-k activation sparsity (population
+  std + Acklam's inverse normal CDF). Formulas 1:1 from transformers'
+  reference; the coefficient transpose is oracle-tested against a
+  literal index port. Gated end-to-end on E4B-it (7.9 GB streamed →
+  3.96 GB q4t): factual answer + clean stop, correct code generation
+  at 11.7 tok/s on M4. v1 runs the sequential path (batched/pair
+  prefill and GPU graphs stay off for this arch).
+
+### Fixed
+- Gemma-3n declares its multi-space ▁-runs as ADDED tokens — decode
+  passed them through verbatim and leaked ▁ into generated code.
+  Added non-special tokens now de-metaspace like vocabulary ones in
+  both the full and the streaming decoder.
+
 ## [0.5.33] — 2026-07-28
 
 ### Added
