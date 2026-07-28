@@ -67,8 +67,12 @@ DeepSeek-R1 蒸馏版（qwen2/llama 布局）——涵盖 dense、MoE 和 GatedD
 转换时还原；端到端验证——Paris，ppl 8.8）· gemma-4 MoE 26B-A4B
 （dense+专家双分支 FFN 读取原始 residual，专家尺度在转换时折叠；
 验证门为评分器/解码器一致性——评分器 40/40 复现模型自身的 greedy
-token）。尚不支持：gemma-4 E 系列以及 compressed-q V2/V3
-（代码已合入，验证待硬件）。其它模型请试 `import-gguf`——如果它拒绝了，那就是一个
+token）· Kimi Linear 48B-A3B（KDA：逐通道衰减的 delta 规则、每投影
+短卷积、sigmoid 门控输出归一化；全注意力层为 NoPE-MLA；tiktoken
+排名表在转换时生成标准 tokenizer.json——端到端验证，98 GB 流式转换
+为 27.7 GB q4t，在 MacBook 上完成）。尚不支持：gemma-4 E 系列、
+compressed-q V2/V3，以及 Kimi-K3 独有机制（mxfp4 打包、残差流、
+latent MoE——在 modeling 代码公开前明确拒绝）。其它模型请试 `import-gguf`——如果它拒绝了，那就是一个
 值得提 issue 的 bug。
 
 ## 接入你现有的工具链

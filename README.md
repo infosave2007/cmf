@@ -77,8 +77,14 @@ attention expanded to MHA, interleaved-rope undone at convert; gated
 end-to-end — Paris, ppl 8.8) · gemma-4 MoE 26B-A4B (dual-branch
 dense+expert FFN off the raw residual, per-expert scales folded at
 convert; gated by scorer/decoder parity — the scorer reproduces the
-model's own greedy tokens 40/40). Not yet: gemma-4 E-series and
-compressed-q V2/V3 (machinery merged, gates pending hardware). Anything else, try `import-gguf` — and if
+model's own greedy tokens 40/40) · Kimi Linear 48B-A3B (KDA: delta
+rule with per-channel decay, per-projection short convs, sigmoid-gated
+output norm; NoPE full-attention MLA; the tiktoken rank table becomes
+a standard tokenizer.json at convert — gated end-to-end, streamed
+98 GB → 27.7 GB q4t on a MacBook). Not yet: gemma-4 E-series,
+compressed-q V2/V3, and the Kimi-K3-only extras (mxfp4 packing,
+residual streams, latent MoE — named refusals until the modeling code
+is public). Anything else, try `import-gguf` — and if
 it refuses, that is a bug worth filing.
 
 ## Plug it into what you already use
