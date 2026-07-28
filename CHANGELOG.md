@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.32] — 2026-07-28
+
+### Added
+- **`cortiq_cancel(handle)`** in the C ABI: thread-safe cooperative
+  cancellation — the engine honours it at every prefill chunk AND
+  decode step (a 50-second mobile prefill is exactly where it
+  matters), finishes with `finish_reason: "cancelled"`, clears the
+  flag itself, and invalidates the KV-reuse history on a mid-prefill
+  abort. A server can now honour a dropped connection.
+
+### Fixed
+- The forward-layers GPU-graph gate's unset branch read "is the GPU
+  on" instead of the discrete-only `wgpu_graph_default()` — the one
+  site of three that skipped the rule. `cortiq_set_gpu(true)` alone
+  made the 0.2 tok/s whole-token graph race-eligible on mobile
+  adapters (a measured 12–14× first-token cost on Adreno). Unset now
+  means the same everywhere: discrete adapters only — the app-side
+  `CMF_GPU_WGPU_GRAPH=0` workaround can be deleted.
+- `execution_mode` reported a stub ("Avx2 · available_parallelism"
+  even on an ARM phone with a 4-worker pool). It now reports the REAL
+  pool size (the same forced > `CMF_THREADS` > big-core-topology
+  resolution the pool itself uses, via `Pool::effective_threads`) and
+  the target's actual SIMD.
+
 ## [0.5.31] — 2026-07-28
 
 ### Added
