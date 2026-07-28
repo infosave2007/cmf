@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Metaspace `prepend_scheme` in the PRE-tokenizer was ignored.** The
+  leading `▁` was read only off a `Prepend` normalizer (the llama
+  shape), so tokenizers that carry Metaspace in the pre-tokenizer with
+  a null normalizer — Nanbeige 4.2 — lost it: every raw prompt encoded
+  `'Hello'` where HF encodes `'▁Hello'`, and `decode` kept the leading
+  space the decoder's `Strip` removes. Chat prompts hid it (they open
+  with an added token, so no section is at offset 0 and neither side
+  prepends). Nanbeige perplexity over the same text: 10.13 → 9.81.
+  `tokenizer_parity` is green on Nanbeige 4.2, gemma-3n-E4B(-it),
+  gemma-4-26B and MiniCPM3.
+
 ## [0.5.34] — 2026-07-28
 
 ### Added

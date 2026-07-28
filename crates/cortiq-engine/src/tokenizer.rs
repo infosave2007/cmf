@@ -38,6 +38,12 @@ pub struct Tokenizer {
     /// SentencePiece Prepend("▁") normalizer present (llama family).
     /// Gemma replaces spaces with ▁ but does NOT prepend one.
     sp_prepend: bool,
+    /// Metaspace `prepend_scheme: "first"` in the PRE-tokenizer (no
+    /// Prepend normalizer): the ▁ goes on the very first section of the
+    /// input only, so text after an added token gets none. Nanbeige 4.2
+    /// is this shape — reading only the normalizer left every raw prompt
+    /// short one leading ▁ ("Hello" instead of "▁Hello").
+    sp_prepend_first: bool,
     /// SentencePiece family (TinyLlama/Llama-2/Mistral): metaspace ▁
     /// normalization + byte_fallback, no byte-level alphabet.
     metaspace: bool,
@@ -151,6 +157,21 @@ fn find_split_pattern(pt: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// `prepend_scheme` of a Metaspace pre-tokenizer ("always" | "first" |
+/// "never"), searched through a Sequence.
+fn find_prepend_scheme(pt: &serde_json::Value) -> Option<String> {
+    if pt.get("type").and_then(|t| t.as_str()) == Some("Metaspace") {
+        return pt
+            .get("prepend_scheme")
+            .and_then(|p| p.as_str())
+            .map(String::from);
+    }
+    if let Some(list) = pt.get("pretokenizers").and_then(|l| l.as_array()) {
+        return list.iter().find_map(find_prepend_scheme);
+    }
+    None
+}
+
 impl Tokenizer {
     /// Load tokenizer from HuggingFace tokenizer.json file.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, TokenizerError> {
@@ -216,6 +237,18 @@ impl Tokenizer {
             .as_ref()
             .map(|n| n.to_string().contains("Prepend"))
             .unwrap_or(false);
+        // Metaspace can also live in the pre-tokenizer, carrying its own
+        // prepend_scheme: "always" behaves like the llama normalizer,
+        // "first" only marks the head of the input (see `sp_prepend_first`).
+        let (sp_prepend, sp_prepend_first) = if sp_prepend {
+            (true, false)
+        } else {
+            match hf.pre_tokenizer.as_ref().and_then(find_prepend_scheme) {
+                Some(s) if s == "always" => (true, false),
+                Some(s) if s == "first" => (false, true),
+                _ => (false, false),
+            }
+        };
         let split_re = if metaspace {
             None
         } else {
@@ -319,6 +352,7 @@ impl Tokenizer {
             split_re,
             metaspace,
             sp_prepend,
+            sp_prepend_first,
             nfc,
             byte_to_char,
             char_to_byte,
@@ -353,6 +387,7 @@ impl Tokenizer {
             split_re: None,
             metaspace: false,
             sp_prepend: false,
+            sp_prepend_first: false,
             nfc: false,
             byte_to_char,
             char_to_byte,
@@ -372,6 +407,11 @@ impl Tokenizer {
         let mut ids = Vec::new();
         // Added tokens match on raw text (normalized: false), longest first.
         let mut rest = text;
+        // `prepend_scheme: "first"` marks only the section that starts at
+        // offset 0 — HF drops the ▁ for everything after an added token,
+        // which is why a chat prompt opening with <|im_start|> tokenizes
+        // the same either way and only raw prompts were wrong.
+        let mut head = true;
         'outer: while !rest.is_empty() {
             let mut best: Option<(usize, usize, u32)> = None; // (pos, len, id)
             for (content, id) in &self.added {
@@ -390,12 +430,13 @@ impl Tokenizer {
             }
             match best {
                 Some((pos, len, id)) => {
-                    self.encode_segment(&rest[..pos], &mut ids);
+                    self.encode_segment_at(&rest[..pos], head, &mut ids);
                     ids.push(id);
                     rest = &rest[pos + len..];
+                    head = false;
                 }
                 None => {
-                    self.encode_segment(rest, &mut ids);
+                    self.encode_segment_at(rest, head, &mut ids);
                     break 'outer;
                 }
             }
@@ -403,8 +444,10 @@ impl Tokenizer {
         ids
     }
 
-    /// Encode one added-token-free segment: NFC → split → byte-map → BPE.
-    fn encode_segment(&self, segment: &str, out: &mut Vec<u32>) {
+    /// Encode one added-token-free segment: NFC → split → byte-map →
+    /// BPE. `head` says whether this section starts at offset 0 of the
+    /// input — only that one takes a `prepend_scheme: "first"` ▁.
+    fn encode_segment_at(&self, segment: &str, head: bool, out: &mut Vec<u32>) {
         if segment.is_empty() {
             return;
         }
@@ -418,9 +461,19 @@ impl Tokenizer {
             // chars of the whole span (no pre-tokenizer, no byte map).
             // Gemma's normalizer replaces only — no dummy prefix.
             let sp = if self.sp_prepend {
+                // Normalizer order: Prepend THEN Replace, unguarded — so
+                // " hello" really does become ▁▁hello on llama.
                 format!("\u{2581}{}", norm).replace(' ', "\u{2581}")
             } else {
-                norm.replace(' ', "\u{2581}")
+                // Pre-tokenizer Metaspace: Replace, then prepend only if
+                // the span does not already start with ▁ (HF's guard, so
+                // " hello" stays one ▁, not two).
+                let replaced = norm.replace(' ', "\u{2581}");
+                if self.sp_prepend_first && head && !replaced.starts_with('\u{2581}') {
+                    format!("\u{2581}{replaced}")
+                } else {
+                    replaced
+                }
             };
             self.bpe_piece_sp(&sp, out);
             return;
@@ -625,7 +678,7 @@ impl Tokenizer {
             }
         }
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        if self.metaspace && self.sp_prepend {
+        if self.metaspace && (self.sp_prepend || self.sp_prepend_first) {
             // SP decoder Strip(start=1): one leading space from Prepend.
             if let Some(stripped) = text.strip_prefix(' ') {
                 return stripped.to_string();
