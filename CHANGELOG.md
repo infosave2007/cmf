@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.30] — 2026-07-28
+
+### Added
+- **Mobile GPU support in the C ABI** (cmfmobile TUNING.md engine
+  items): `cortiq_gpu_available()` — true when the build carries a
+  GPU backend AND the device brings an adapter up (Vulkan on Android,
+  Metal on iOS/macOS), so an app can tell "GPU off" from "GPU
+  impossible"; `cortiq_set_threads(n)` — worker-pool size from the
+  embedder instead of the process-wide `CMF_THREADS`;
+  `cortiq_worker_tids(out, cap)` — kernel tids of the pool workers
+  for ADPF work-duration reporting. Verified on real cross builds
+  (NDK 28, 16 KB pages): arm64-v8a `--features gpu` imports dlopen
+  and carries the wgpu Vulkan backend; armeabi-v7a and x86_64 build
+  too; the aarch64-apple-ios staticlib carries wgpu-Metal.
+- **Native MXFP4 decode** (OCP Microscaling FP4,
+  compressed-tensors "mxfp4-pack-quantized" — Kimi-K3 experts): E2M1
+  nibbles + per-32-group E8M0 scales decode straight into the normal
+  quantize path; E8M0 NaN refuses loudly. Validated on a real Kimi-K3
+  expert fetched by HTTP Range and by an exact synthetic roundtrip.
+- **Big-core detection on EAS-less kernels**: when
+  `cpu_capacity` is absent, the pool sizing AND the worker affinity
+  pin fall back to `cpufreq/cpuinfo_max_freq` — same cluster
+  ordering, so the 62.5% big-core rule keeps working.
+
+### Fixed
+- `moe-defrag` now slices the noaux_tc selection bias
+  (`mlp.expert_bias`) with its experts and accepts F16 router rows —
+  a renumbered expert used to read another expert's bias on
+  Kimi/DeepSeek-V3/LFM2-class routers. Gated on Kimi-Linear-48B:
+  27.7 → 17.7 GB (−36%), held-out code ppl +2.7%, decode ×2.3 on a
+  24 GB MacBook (the specialist fits the page cache).
+
 ## [0.5.29] — 2026-07-28
 
 ### Added
