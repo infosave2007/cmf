@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.36] — 2026-07-28
+
 ### Fixed
 - **A coin flip decided whether image generation ran at half speed.**
   The fused DiT paths (whole block, all-heads attention, SwiGLU FFN)
