@@ -78,6 +78,11 @@ pub struct Pipeline {
     pub gdn_cfg: Option<GdnCfg>,
     /// MiniCPM-class logit scale (tied lm_head → cannot fold into weights).
     pub logit_multiplier: Option<f32>,
+    /// Token ids currently materialized in the KV cache (the forwarded
+    /// prompt + all generated tokens except the last, which is sampled
+    /// but not yet forwarded). Lets the next generate call prefill only
+    /// the suffix when a chat app resends the whole history.
+    pub kv_history: Vec<u32>,
     /// KDA geometry (Kimi Linear / Kimi-K3) — shared by every Kda layer.
     pub kda_cfg: Option<crate::linear_core::KdaCfg>,
     /// LFM2 short-convolution geometry (present when the model has
@@ -1113,6 +1118,7 @@ impl Pipeline {
             gdn_cfg: None,
             kda_cfg: None,
             logit_multiplier: None,
+            kv_history: Vec::new(),
             short_conv_cfg: None,
             mtp: None,
             speculative: std::env::var("CMF_MTP").map(|v| v != "0").unwrap_or(true),
@@ -1324,9 +1330,41 @@ impl Pipeline {
             return Err("empty prompt: nothing to generate from".to_string());
         }
 
-        // Fresh sequence — the cache holds absolute positions.
-        self.kv_cache.clear();
-        crate::gpu::graph_kv_reset(self.graph_kv_id);
+        // Cross-turn KV reuse: a chat app resends the whole history
+        // every turn; when the new ids strictly EXTEND what the cache
+        // already holds, prefill only the tail — turn latency stays
+        // proportional to the new text instead of the whole session.
+        // Extension-only (no rollback), so it is exact for every layer
+        // kind including recurrent state; MTP/o1/task-mask runs keep
+        // the fresh-sequence path. CMF_KV_REUSE=0 disables.
+        let reuse_from = {
+            let on = !std::env::var("CMF_KV_REUSE").is_ok_and(|v| v == "0");
+            let h = &self.kv_history;
+            if on
+                && task_mask.is_none()
+                && self.mtp.is_none()
+                && self.o1_cfg.is_none()
+                && !h.is_empty()
+                && h.len() < input_ids.len()
+                && input_ids[..h.len()] == h[..]
+            {
+                h.len()
+            } else {
+                0
+            }
+        };
+        if reuse_from == 0 {
+            // Fresh sequence — the cache holds absolute positions.
+            self.kv_cache.clear();
+            self.kv_history.clear();
+            crate::gpu::graph_kv_reset(self.graph_kv_id);
+        } else if std::env::var("CMF_PREFILL_PROF").is_ok() {
+            eprintln!(
+                "kv-reuse: {} of {} prompt positions already cached",
+                reuse_from,
+                input_ids.len()
+            );
+        }
         crate::gpu::graph_race_begin_generation();
         self.o1_begin();
 
@@ -1385,7 +1423,7 @@ impl Pipeline {
         //    pair tests). With MTP: warm the draft head on
         //    (hidden_p, token_{p+1}) pairs.
         let mut hidden = vec![0.0f32; self.hidden_size];
-        let mut pos = 0usize;
+        let mut pos = reuse_from;
         // lm_head-in-graph is only sound when the very next logits
         // consumer is this loop's own (MTP and skill routing interleave
         // other forwards / can swap lm_head between forward and sample).
@@ -1692,6 +1730,11 @@ impl Pipeline {
         self.mtp = mtp.or(self.mtp.take());
 
         let output_ids = &all_ids[input_ids.len()..];
+        // Forwarded = prompt + all generated but the LAST sampled token
+        // (emitted without being fed back). Exact only without MTP —
+        // reuse is gated off when MTP is active.
+        let forwarded = input_ids.len() + output_ids.len().saturating_sub(1);
+        self.kv_history = all_ids[..forwarded.min(all_ids.len())].to_vec();
         confidence.truncate(output_ids.len()); // guard against any overshoot
         traces.truncate(output_ids.len());
         Ok(GenerateResult {
@@ -2088,6 +2131,7 @@ impl Pipeline {
             return Err("empty id sequence".to_string());
         }
         self.kv_cache.clear();
+        self.kv_history.clear();
         self.o1_begin();
         let mut hidden = vec![0.0f32; self.hidden_size];
         let mut pos = 0usize;
@@ -2148,6 +2192,7 @@ impl Pipeline {
     /// FFN mask is derived from.
     pub fn probe_ffn_mass(&mut self, ids: &[u32]) -> Vec<Vec<f64>> {
         self.kv_cache.clear();
+        self.kv_history.clear();
         FFN_PROBE.with(|p| {
             *p.borrow_mut() = Some(vec![vec![0f64; self.intermediate_size]; self.num_layers]);
         });
@@ -2158,6 +2203,7 @@ impl Pipeline {
             }
         });
         self.kv_cache.clear();
+        self.kv_history.clear();
         FFN_PROBE
             .with(|p| p.borrow_mut().take())
             .unwrap_or_default()
@@ -2168,6 +2214,7 @@ impl Pipeline {
     /// position: the batched prefill path is dense-only.
     pub fn ppl_ids_masked(&mut self, ids: &[u32], mask: &TaskMask) -> f64 {
         self.kv_cache.clear();
+        self.kv_history.clear();
         let mut nll = 0f64;
         let mut cnt = 0usize;
         let mut hidden = vec![0f32; self.hidden_size];
@@ -2192,6 +2239,7 @@ impl Pipeline {
             hidden = self.forward_layers(&emb, pos, Some(mask));
         }
         self.kv_cache.clear();
+        self.kv_history.clear();
         (nll / cnt.max(1) as f64).exp()
     }
 
@@ -2205,6 +2253,7 @@ impl Pipeline {
     /// weighs the same regardless of how the windows are cut.
     pub fn nll_ids_from(&mut self, ids: &[u32], start: usize) -> (f64, usize) {
         self.kv_cache.clear();
+        self.kv_history.clear();
         let mut nll = 0f64;
         let mut cnt = 0usize;
         if prefill_batched() {
@@ -2294,6 +2343,7 @@ impl Pipeline {
                 pos = end;
             }
             self.kv_cache.clear();
+            self.kv_history.clear();
             return (nll, cnt);
         }
         for pos in 0..ids.len().saturating_sub(1) {
@@ -2336,6 +2386,7 @@ impl Pipeline {
             cnt += 1;
         }
         self.kv_cache.clear();
+        self.kv_history.clear();
         (nll, cnt)
     }
 
@@ -2356,6 +2407,7 @@ impl Pipeline {
     /// over the identical token set — that ratio is the honest one.
     pub fn nll_ids_o1(&mut self, ids: &[u32], prefill: usize) -> (f64, usize) {
         self.kv_cache.clear();
+        self.kv_history.clear();
         self.o1_begin();
         let n = ids.len().saturating_sub(1);
         let p = prefill.min(n);
@@ -2415,6 +2467,7 @@ impl Pipeline {
             cnt += 1;
         }
         self.kv_cache.clear();
+        self.kv_history.clear();
         (nll, cnt)
     }
 
@@ -2427,6 +2480,7 @@ impl Pipeline {
     /// measured scaling?
     pub fn calib_ids(&mut self, ids: &[u32], temps: &[f32]) -> (Vec<bool>, Vec<Vec<f32>>) {
         self.kv_cache.clear();
+        self.kv_history.clear();
         let n = ids.len().saturating_sub(1);
         let mut correct = Vec::with_capacity(n);
         let mut pmax = Vec::with_capacity(n);
@@ -2463,6 +2517,7 @@ impl Pipeline {
             pmax.push(row);
         }
         self.kv_cache.clear();
+        self.kv_history.clear();
         (correct, pmax)
     }
 
@@ -2482,6 +2537,8 @@ impl Pipeline {
         let _ = self.set_active_skill(None);
 
         self.kv_cache.clear();
+
+        self.kv_history.clear();
         let mut nll = 0f64;
         let mut cnt = 0usize;
         for pos in 0..ids.len().saturating_sub(1) {
@@ -2529,12 +2586,14 @@ impl Pipeline {
         let _ = self.set_active_skill(None);
         self.dyn_router = Some(router);
         self.kv_cache.clear();
+        self.kv_history.clear();
         ((nll / cnt.max(1) as f64).exp(), switches)
     }
 
     /// Routing probe φ (spec §9): mean-pooled hidden after `layer`.
     pub fn probe_phi(&mut self, ids: &[u32], layer: usize) -> Vec<f32> {
         self.kv_cache.clear();
+        self.kv_history.clear();
         let mut acc = vec![0f32; self.hidden_size];
         for (pos, &id) in ids.iter().enumerate() {
             let h = self.forward_layers_upto(&self.embed_single(id), pos, None, Some(layer));
@@ -2547,6 +2606,7 @@ impl Pipeline {
             *a /= n;
         }
         self.kv_cache.clear();
+        self.kv_history.clear();
         acc
     }
 
@@ -4243,6 +4303,7 @@ impl Pipeline {
     /// the active overlay untouched.
     pub fn prefill_next_logits(&mut self, ids: &[u32], task_mask: Option<&TaskMask>) -> Vec<f32> {
         self.kv_cache.clear();
+        self.kv_history.clear();
         let mut hidden = vec![0.0f32; self.hidden_size];
         for (pos, &id) in ids.iter().enumerate() {
             let emb = self.embed_single(id);

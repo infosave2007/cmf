@@ -1262,6 +1262,9 @@ impl Pipeline {
     /// dynamic. Cheap: Mapped tensors are re-resolved mmap pointers.
     /// Result is bit-identical to loading the pipeline with that skill.
     pub fn set_active_skill(&mut self, idx: Option<usize>) -> Result<(), CmfError> {
+        // Overlay swap changes weights → every cached K/V is stale.
+        self.kv_cache.clear();
+        self.kv_history.clear();
         if self.dyn_active == idx {
             return Ok(());
         }
