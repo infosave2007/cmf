@@ -76,6 +76,8 @@ pub struct Pipeline {
     pub vmf_cfg: Option<VmfPhaseCfg>,
     /// GatedDeltaNet geometry (faithful vendor operator).
     pub gdn_cfg: Option<GdnCfg>,
+    /// MiniCPM-class logit scale (tied lm_head → cannot fold into weights).
+    pub logit_multiplier: Option<f32>,
     /// KDA geometry (Kimi Linear / Kimi-K3) — shared by every Kda layer.
     pub kda_cfg: Option<crate::linear_core::KdaCfg>,
     /// LFM2 short-convolution geometry (present when the model has
@@ -1110,6 +1112,7 @@ impl Pipeline {
             vmf_cfg: None,
             gdn_cfg: None,
             kda_cfg: None,
+            logit_multiplier: None,
             short_conv_cfg: None,
             mtp: None,
             speculative: std::env::var("CMF_MTP").map(|v| v != "0").unwrap_or(true),
@@ -2249,6 +2252,11 @@ impl Pipeline {
                             continue;
                         }
                         let lg = &mut logits[k * rows..k * rows + self.vocab_size.min(rows)];
+                        if let Some(mu) = self.logit_multiplier {
+                            for v in lg.iter_mut() {
+                                *v *= mu;
+                            }
+                        }
                         // Gemma-class final-logit soft-capping: the
                         // decode paths apply it; scoring must too, or
                         // the uncapped softmax misprices every token.
@@ -4216,6 +4224,11 @@ impl Pipeline {
             .lm_head
             .matvec(hidden, &mut logits, self.pool.as_deref());
         logits.resize(self.vocab_size, 0.0);
+        if let Some(m) = self.logit_multiplier {
+            for l in logits.iter_mut() {
+                *l *= m;
+            }
+        }
         if let Some(c) = self.final_softcap {
             for l in logits.iter_mut() {
                 *l = c * (*l / c).tanh();

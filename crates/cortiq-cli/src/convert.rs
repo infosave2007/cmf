@@ -1446,11 +1446,23 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         "silu" | "swish" => "silu".to_string(),
         other => anyhow::bail!("unsupported hidden_act '{other}'"),
     };
+    let is_minicpm3 = model_type == "minicpm3";
     let embed_multiplier = if is_gemma {
         (hidden as f32).sqrt()
+    } else if is_minicpm3 {
+        // MiniCPM: embeddings enter the stack ×scale_emb.
+        tc.get("scale_emb").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32
     } else {
         1.0
     };
+    // MiniCPM: logits = lm_head(h) · dim_model_base/hidden; the head is
+    // tied to the embedding, so the divisor rides in the header.
+    let logit_multiplier = if is_minicpm3 {
+        cfg_usize(tc, "dim_model_base").map(|d| d as f32 / hidden as f32)
+    } else {
+        None
+    };
+    let mut rope_freq_factors: Option<Vec<f64>> = None;
     // Phi-3 longrope: exact only within the ORIGINAL context — cap the
     // declared max honestly instead of serving stretched positions.
     let mut max_pos = cfg_usize(tc, "max_position_embeddings")
@@ -1463,12 +1475,27 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         match kind {
             Some("longrope") | Some("su") | Some("yarn") | Some("linear") | Some("dynamic")
             | Some("mrope") => {
-                let orig = cfg_usize(tc, "original_max_position_embeddings").unwrap_or(4096);
+                let orig = cfg_usize(tc, "original_max_position_embeddings")
+                    .or_else(|| {
+                        rs.get("original_max_position_embeddings")
+                            .and_then(|v| v.as_u64().map(|v| v as usize))
+                    })
+                    .unwrap_or(4096);
                 eprintln!(
                     "  note: rope scaling '{:?}' — serving the exact {orig}-token native window",
                     kind.unwrap()
                 );
                 max_pos = orig;
+                // MiniCPM3: the short factors are the TRAINED rope inside
+                // the native window (1.06–16.9 per dim — not ≈1 like phi);
+                // carry them so inv_freq divides per frequency at load.
+                if is_minicpm3 {
+                    if let Some(f) = rs.get("short_factor").and_then(|v| v.as_array()) {
+                        let fac: Vec<f64> = f.iter().filter_map(|v| v.as_f64()).collect();
+                        anyhow::ensure!(!fac.is_empty(), "minicpm3: empty longrope short_factor");
+                        rope_freq_factors = Some(fac);
+                    }
+                }
             }
             Some(other) => anyhow::bail!("rope_scaling '{other}' not supported yet"),
             None => {}
@@ -1499,7 +1526,8 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         tie_word_embeddings: config
             .get("tie_word_embeddings")
             .and_then(|v| v.as_bool())
-            .unwrap_or(is_gemma),
+            // MiniCPM3 ships no lm_head tensor — the head is the embedding.
+            .unwrap_or(is_gemma || is_minicpm3),
         partial_rotary_factor: prf,
         yarn,
         attention_heads_per_layer,
@@ -1556,6 +1584,8 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             .get("activation_situ_linear_beta")
             .and_then(|v| v.as_f64()),
         attn_v_norm: is_gemma4,
+        rope_freq_factors,
+        logit_multiplier,
         // KDA (Kimi-K3): lower-bound decay-gate variant; absent = standard.
         kda_gate_lower_bound: tc
             .get("linear_attn_config")
@@ -2297,6 +2327,15 @@ pub fn run_convert(
     // Per-file conversion body, shared by the resident local path and
     // the streaming hub path (shard downloaded → converted → DELETED;
     // peak disk = one shard + the growing output).
+    // MiniCPM residual-branch scale (folded at write).
+    let resid_fold: Option<f32> = if arch.arch_name == "minicpm3" {
+        let tcv = config.get("text_config").unwrap_or(&config);
+        let sd = tcv.get("scale_depth").and_then(|v| v.as_f64()).unwrap_or(1.0);
+        Some((sd / (arch.num_layers as f64).sqrt()) as f32)
+    } else {
+        None
+    };
+    // Kimi: which layer indices are KDA (canon retag inside the loop).
     // Kimi: which layer indices are KDA (canon retag inside the loop).
     let kda_layers: std::collections::HashSet<usize> = arch
         .layer_types
@@ -2397,6 +2436,20 @@ pub fn run_convert(
                 (m.shape.clone(), to_f32(&m.dtype, file.bytes(m))?)
             };
 
+            let mut m_vals = m_vals;
+            // MiniCPM: every residual add is h += branch·(scale_depth/√L)
+            // — fold the factor into the branch output rows (o_proj and
+            // the dense FFN down_proj) so the runtime stays standard.
+            if let Some(fs) = resid_fold {
+                if name.ends_with("self_attn.o_proj.weight")
+                    || name.ends_with(".mlp.down_proj.weight")
+                {
+                    for v in m_vals.iter_mut() {
+                        *v *= fs;
+                    }
+                }
+            }
+
             // DeepSeek-V2 MLA: permute each q head to rope-first
             // ([nope|rope] → [rope|nope]) so the runtime's standard
             // partial rotary (first rotary_dim dims) covers it.
@@ -2420,9 +2473,11 @@ pub fn run_convert(
                         // DeepSeek rotary interleaves pairs (view d/2,2 →
                         // transpose): store rope dims even-first so our
                         // half-split rotation reproduces their math.
-                        // Kimi NoPE: no rotation → keep the rope block
-                        // order, only move it in front of nope.
-                        let src = if mla.nope {
+                        // Kimi NoPE (no rotation) and MiniCPM3 (plain
+                        // half-split rotate_half) keep the rope block
+                        // order — only the move in front of nope.
+                        let interleaved = !mla.nope && arch.arch_name.contains("deepseek");
+                        let src = if !interleaved {
                             r
                         } else if r < dr / 2 {
                             2 * r
@@ -2454,6 +2509,7 @@ pub fn run_convert(
             // no rotation, the tail rows are already where the loader
             // expects them.
             if arch.mla.as_ref().is_some_and(|m| !m.nope)
+                && arch.arch_name.contains("deepseek")
                 && name.ends_with("self_attn.kv_a_proj_with_mqa.weight")
             {
                 let mla = arch.mla.as_ref().unwrap();
@@ -3198,6 +3254,43 @@ mod tests {
             assert_eq!(back, text, "roundtrip failed for {text:?} → {ids:?}");
             eprintln!("{:3} toks | {text:?}", ids.len());
         }
+    }
+
+    #[test]
+    fn minicpm3_arch_scales_and_factors() {
+        let cfg: serde_json::Value = serde_json::from_str(
+            r#"{
+            "model_type": "minicpm3",
+            "hidden_size": 2560, "num_hidden_layers": 62,
+            "num_attention_heads": 40, "intermediate_size": 6400,
+            "vocab_size": 73448, "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+            "q_lora_rank": 768, "kv_lora_rank": 256,
+            "qk_rope_head_dim": 32, "qk_nope_head_dim": 64, "v_head_dim": 64,
+            "scale_emb": 12, "scale_depth": 1.4, "dim_model_base": 256,
+            "hidden_act": "silu",
+            "max_position_embeddings": 32768,
+            "rope_scaling": {
+                "type": "longrope",
+                "short_factor": [1.05, 1.12, 1.25, 1.53, 2.09, 3.14, 4.93, 7.52,
+                                 10.47, 13.06, 14.85, 15.90, 16.46, 16.74, 16.87, 16.94],
+                "long_factor":  [1.05, 1.12, 1.25, 1.53, 2.09, 3.14, 4.93, 7.52,
+                                 10.47, 13.06, 14.85, 15.90, 16.46, 16.74, 16.87, 16.94],
+                "original_max_position_embeddings": 32768
+            }
+        }"#,
+        )
+        .unwrap();
+        let arch = build_arch(&cfg).unwrap();
+        assert_eq!(arch.embed_multiplier, 12.0, "scale_emb");
+        assert_eq!(arch.logit_multiplier, Some(0.1), "dim_model_base/hidden");
+        let fac = arch.rope_freq_factors.as_ref().expect("short factors carried");
+        assert_eq!(fac.len(), 16);
+        assert!((fac[15] - 16.94).abs() < 1e-9);
+        assert!(arch.tie_word_embeddings, "no lm_head tensor — tied");
+        let mla = arch.mla.as_ref().expect("MLA");
+        assert_eq!(mla.q_lora_rank, Some(768), "compressed q");
+        assert!(!mla.nope);
+        assert_eq!(arch.max_position_embeddings, 32768, "native window");
     }
 
     #[test]

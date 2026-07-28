@@ -70,9 +70,11 @@ DeepSeek-R1 蒸馏版（qwen2/llama 布局）——涵盖 dense、MoE 和 GatedD
 token）· Kimi Linear 48B-A3B（KDA：逐通道衰减的 delta 规则、每投影
 短卷积、sigmoid 门控输出归一化；全注意力层为 NoPE-MLA；tiktoken
 排名表在转换时生成标准 tokenizer.json——端到端验证，98 GB 流式转换
-为 27.7 GB q4t，在 MacBook 上完成）。尚不支持：gemma-4 E 系列、
-compressed-q V2/V3，以及 Kimi-K3 独有机制（mxfp4 打包、残差流、
-latent MoE——在 modeling 代码公开前明确拒绝）。其它模型请试 `import-gguf`——如果它拒绝了，那就是一个
+为 27.7 GB q4t，在 MacBook 上完成）· MiniCPM3（compressed-q MLA
+（q_a→rms→q_b）端到端验证；scale_emb / scale_depth / dim_model_base
+折叠进权重与文件头，longrope 的逐维 short 因子在加载时除入
+inv_freq）。尚不支持：gemma-4 E 系列，以及 Kimi-K3 独有机制
+（mxfp4 打包、残差流、latent MoE——在 modeling 代码公开前明确拒绝）。其它模型请试 `import-gguf`——如果它拒绝了，那就是一个
 值得提 issue 的 bug。
 
 ## 接入你现有的工具链

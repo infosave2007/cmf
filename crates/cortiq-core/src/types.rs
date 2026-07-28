@@ -391,6 +391,15 @@ pub struct ModelArch {
     /// Value head dim in linear attention
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_value_head_dim: Option<usize>,
+    /// Per-frequency rope divisors (MiniCPM3 longrope short_factor):
+    /// inv_freq[i] /= factors[i], served at the native window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_freq_factors: Option<Vec<f64>>,
+    /// Logit scale folded at load (MiniCPM: dim_model_base/hidden —
+    /// the lm_head is tied to the embedding, so the divisor cannot be
+    /// baked into the shared tensor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logit_multiplier: Option<f32>,
     /// KDA lower-bound decay gate (Kimi-K3): log-decay =
     /// `lb·σ(exp(A_log)·(f+dt_bias))` instead of the standard
     /// `−exp(A_log)·softplus(f+dt_bias)`. None = standard formula.

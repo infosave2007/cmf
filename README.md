@@ -81,10 +81,12 @@ model's own greedy tokens 40/40) · Kimi Linear 48B-A3B (KDA: delta
 rule with per-channel decay, per-projection short convs, sigmoid-gated
 output norm; NoPE full-attention MLA; the tiktoken rank table becomes
 a standard tokenizer.json at convert — gated end-to-end, streamed
-98 GB → 27.7 GB q4t on a MacBook). Not yet: gemma-4 E-series,
-compressed-q V2/V3, and the Kimi-K3-only extras (mxfp4 packing,
-residual streams, latent MoE — named refusals until the modeling code
-is public). Anything else, try `import-gguf` — and if
+98 GB → 27.7 GB q4t on a MacBook) · MiniCPM3 (compressed-q MLA
+(q_a→rms→q_b) gated end-to-end; MiniCPM's scale_emb / scale_depth /
+dim_model_base fold into the weights and header, longrope's per-dim
+short factors divide inv_freq at load). Not yet: gemma-4 E-series and
+the Kimi-K3-only extras (mxfp4 packing, residual streams, latent MoE —
+named refusals until the modeling code is public). Anything else, try `import-gguf` — and if
 it refuses, that is a bug worth filing.
 
 ## Plug it into what you already use

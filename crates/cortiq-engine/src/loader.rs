@@ -1066,6 +1066,7 @@ impl Pipeline {
         // override, and (Gemma-3) sliding-window layers with their own
         // local RoPE base.
         pipeline.embed_multiplier = arch.embed_multiplier;
+        pipeline.logit_multiplier = arch.logit_multiplier;
         if let Some(qpas) = arch.query_pre_attn_scalar {
             pipeline.attn_scale = 1.0 / (qpas as f32).sqrt();
         }
@@ -1151,6 +1152,18 @@ impl Pipeline {
                 pipeline.kv_cache.layers[li] =
                     crate::kv_cache::LayerKvCache::new(arch.num_attention_heads, hd);
             }
+        }
+        // Per-frequency rope divisors (MiniCPM3 longrope short_factor):
+        // served at the native window with the trained per-dim factors.
+        // Applied after every inv_freq build (plain, YaRN, MLA).
+        if let Some(fac) = &arch.rope_freq_factors {
+            let mut f = pipeline.inv_freq.as_ref().clone();
+            for (i, v) in f.iter_mut().enumerate() {
+                if let Some(&d) = fac.get(i) {
+                    *v /= d as f32;
+                }
+            }
+            pipeline.inv_freq = std::sync::Arc::new(f);
         }
         pipeline.attn_v_norm = arch.attn_v_norm;
         pipeline.final_softcap = arch.final_logit_softcapping.map(|c| c as f32);
