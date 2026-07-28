@@ -313,6 +313,24 @@ impl QTensor {
         }
     }
 
+    /// (directory idx, rows, cols) of a q4_tiled mapped tensor. The
+    /// chunk-prefill graph takes it in the same 4-tuple slot as
+    /// `q8_row_parts` with an EMPTY row_scale — q4t carries its scales
+    /// inside the 18-byte tiles, and the empty slice is what tells the
+    /// encoder to reach for the q4t kernels.
+    pub(crate) fn q4t_parts(&self) -> Option<(usize, usize, usize)> {
+        match self {
+            Self::Mapped {
+                idx,
+                dtype: TensorDtype::Q4Tiled,
+                rows,
+                cols,
+                ..
+            } => Some((*idx, *rows, *cols)),
+            _ => None,
+        }
+    }
+
     /// (directory idx, rows, cols, row_scale) of a plain q8_row mapped
     /// tensor — the chunk-prefill GPU graph resolves offsets itself.
     /// q8_2f is excluded on purpose: its column field would need a

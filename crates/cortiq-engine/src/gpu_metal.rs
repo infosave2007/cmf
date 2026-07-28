@@ -13,7 +13,7 @@
 
 use crate::gpu::{BatchJob, MoeJob};
 use cortiq_core::CmfModel;
-use cortiq_core::quant::{GROUP_SIZE, Q1_TILE, Q1T_TILE, f16_to_f32};
+use cortiq_core::quant::{GROUP_SIZE, Q1_TILE, Q1T_TILE, Q4_TILE, f16_to_f32};
 use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1816,12 +1816,18 @@ kernel void kv_append(
     vbuf[dst] = v[i];
 }
 
-// Grouped decode attention, one simdgroup per Q-head: online softmax
-// over the n stored positions (lane-sliced dims, dim d lives in lane
-// d%32 slot d/32), plus a second pass that banks each position's
-// probability mass into the Born-importance accumulator (the default
-// eviction policy ranks by it). exp/order differ from the CPU attend
-// (tolerance-gated, like every GPU reduction here).
+// Grouped decode attention, flash-decoding shape: the threadgroup owns
+// ONE Q-head and its `sgs` simdgroups split the stored positions between
+// them, each running an online softmax over its own slice (lane-sliced
+// dims, dim d lives in lane d%32 slot d/32); the partials are then
+// combined through threadgroup memory. One simdgroup per head — the
+// shape this replaced — put only nh simdgroups on the whole device (48
+// for Nanbeige 4.2), nowhere near enough to hide the per-position
+// simd_sum latency chain, so decode fell off a cliff with context depth.
+// A second pass banks each position's probability mass into the
+// Born-importance accumulator (the default eviction policy ranks by it).
+// exp/order differ from the CPU attend (tolerance-gated, like every GPU
+// reduction here).
 kernel void gqa_attend(
     device const float* q    [[buffer(0)]],
     device const float* kbuf [[buffer(1)]],
@@ -1833,12 +1839,13 @@ kernel void gqa_attend(
     constant uint& hd  [[buffer(7)]],
     constant uint& cap [[buffer(8)]],
     constant uint& n   [[buffer(9)]],
+    threadgroup float* sh [[threadgroup(0)]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint tg [[threadgroup_position_in_grid]],
     uint sgs [[simdgroups_per_threadgroup]])
 {
-    uint h = tg * sgs + sg;
+    uint h = tg;
     if (h >= nh) return;
     uint kh = h / hpk;
     device const float* kh0 = kbuf + (ulong)kh * cap * hd;
@@ -1850,9 +1857,14 @@ kernel void gqa_attend(
         uint d = t * 32u + lane;
         qv[t] = d < hd ? q[(ulong)h * hd + d] * scale : 0.0f;
     }
+    // This simdgroup's slice of the stored positions. Contiguous, so
+    // the K/V walk stays sequential inside each slice.
+    uint per = (n + sgs - 1u) / sgs;
+    uint p0 = min(sg * per, n);
+    uint p1 = min(p0 + per, n);
     float m = -INFINITY, l = 0.0f;
     float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    for (uint p = 0; p < n; ++p) {
+    for (uint p = p0; p < p1; ++p) {
         device const float* kr = kh0 + (ulong)p * hd;
         float partial = 0.0f;
         for (uint t = 0; t < nt; ++t) {
@@ -1870,20 +1882,84 @@ kernel void gqa_attend(
         }
         m = mp;
     }
-    float invl = l > 0.0f ? 1.0f / l : 0.0f;
+    // Combine the slices: sh = [sgs × hd accumulators | sgs m | sgs l].
+    // An empty slice contributes m = -INF, l = 0, acc = 0 — exp(-INF −
+    // gm) = 0 kills it in both sums, and n ≥ 1 keeps gm finite.
+    threadgroup float* sacc = sh;
+    threadgroup float* sm = sh + sgs * hd;
+    threadgroup float* sl = sm + sgs;
     for (uint t = 0; t < nt; ++t) {
         uint d = t * 32u + lane;
-        if (d < hd) outb[(ulong)h * hd + d] = acc[t] * invl;
+        if (d < hd) sacc[sg * hd + d] = acc[t];
     }
-    // Born-importance pass: prob_p = exp(s_p − m)/l summed over heads.
-    for (uint p = lane; p < n; p += 32u) {
-        device const float* kr = kh0 + (ulong)p * hd;
-        float dot = 0.0f;
-        for (uint d = 0; d < hd; ++d) {
-            dot += q[(ulong)h * hd + d] * kr[d];
+    if (lane == 0) {
+        sm[sg] = m;
+        sl[sg] = l;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float gm = -INFINITY;
+    for (uint s = 0; s < sgs; ++s) gm = max(gm, sm[s]);
+    float gl = 0.0f;
+    for (uint s = 0; s < sgs; ++s) gl += sl[s] * exp(sm[s] - gm);
+    float invl = gl > 0.0f ? 1.0f / gl : 0.0f;
+    if (sg == 0) {
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) {
+                float a = 0.0f;
+                for (uint s = 0; s < sgs; ++s) a += sacc[s * hd + d] * exp(sm[s] - gm);
+                outb[(ulong)h * hd + d] = a * invl;
+            }
         }
-        float prob = exp(dot * scale - m) * invl;
-        atomic_fetch_add_explicit(&imp[p], prob, memory_order_relaxed);
+    }
+    m = gm; // the importance pass below wants the head's final max
+    // Born-importance pass: prob_p = exp(s_p − m)/l summed over heads.
+    // The score is recomputed in the SAME lane-sliced layout as the main
+    // loop. The obvious form — one position per lane, each lane walking
+    // a whole K row — makes every lane touch a different 512 B row, so
+    // the reads never coalesce: it cost more than the whole rest of the
+    // kernel at decode depth (M4, 44 virtual layers: 0.145 ms/position
+    // of context vs 0.003 ms bandwidth-bound). Four positions per step
+    // so the simd_sum chains overlap; `qv` already carries `scale`.
+    // Each simdgroup re-walks its own slice, now with the head's final
+    // m/l — the slices tile [0, n), so every position is banked once.
+    uint p = p0;
+    for (; p + 4u <= p1; p += 4u) {
+        device const float* r0 = kh0 + (ulong)p * hd;
+        device const float* r1 = r0 + hd;
+        device const float* r2 = r1 + hd;
+        device const float* r3 = r2 + hd;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) {
+                float qd = qv[t];
+                a0 += qd * r0[d];
+                a1 += qd * r1[d];
+                a2 += qd * r2[d];
+                a3 += qd * r3[d];
+            }
+        }
+        float s0 = simd_sum(a0), s1 = simd_sum(a1);
+        float s2 = simd_sum(a2), s3 = simd_sum(a3);
+        if (lane == 0) {
+            atomic_fetch_add_explicit(&imp[p], exp(s0 - m) * invl, memory_order_relaxed);
+            atomic_fetch_add_explicit(&imp[p + 1u], exp(s1 - m) * invl, memory_order_relaxed);
+            atomic_fetch_add_explicit(&imp[p + 2u], exp(s2 - m) * invl, memory_order_relaxed);
+            atomic_fetch_add_explicit(&imp[p + 3u], exp(s3 - m) * invl, memory_order_relaxed);
+        }
+    }
+    for (; p < p1; ++p) {
+        device const float* kr = kh0 + (ulong)p * hd;
+        float a = 0.0f;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) a += qv[t] * kr[d];
+        }
+        float s = simd_sum(a);
+        if (lane == 0) {
+            atomic_fetch_add_explicit(&imp[p], exp(s - m) * invl, memory_order_relaxed);
+        }
     }
 }
 
@@ -1962,14 +2038,46 @@ kernel void chunk_attend(
         uint d = t * 32u + lane;
         if (d < hd) oh[d] = acc[t] * invl;
     }
-    for (uint p = lane; p < n; p += 32u) {
-        device const float* kr = kh0 + (ulong)p * hd;
-        float dotv = 0.0f;
-        for (uint d = 0; d < hd; ++d) {
-            dotv += qh[d] * kr[d];
+    // Born importance, lane-sliced like the main loop (see gqa_attend:
+    // the per-lane serial dot reads the mirror uncoalesced and dominated
+    // the whole chunk). Four positions per step for reduction ILP.
+    uint p = 0;
+    for (; p + 4u <= n; p += 4u) {
+        device const float* r0 = kh0 + (ulong)p * hd;
+        device const float* r1 = r0 + hd;
+        device const float* r2 = r1 + hd;
+        device const float* r3 = r2 + hd;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) {
+                float qd = qv[t];
+                a0 += qd * r0[d];
+                a1 += qd * r1[d];
+                a2 += qd * r2[d];
+                a3 += qd * r3[d];
+            }
         }
-        float prob = exp(dotv * scale - m) * invl;
-        atomic_fetch_add_explicit(&imp[p], prob, memory_order_relaxed);
+        float s0 = simd_sum(a0), s1 = simd_sum(a1);
+        float s2 = simd_sum(a2), s3 = simd_sum(a3);
+        if (lane == 0) {
+            atomic_fetch_add_explicit(&imp[p], exp(s0 - m) * invl, memory_order_relaxed);
+            atomic_fetch_add_explicit(&imp[p + 1u], exp(s1 - m) * invl, memory_order_relaxed);
+            atomic_fetch_add_explicit(&imp[p + 2u], exp(s2 - m) * invl, memory_order_relaxed);
+            atomic_fetch_add_explicit(&imp[p + 3u], exp(s3 - m) * invl, memory_order_relaxed);
+        }
+    }
+    for (; p < n; ++p) {
+        device const float* kr = kh0 + (ulong)p * hd;
+        float a = 0.0f;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) a += qv[t] * kr[d];
+        }
+        float s = simd_sum(a);
+        if (lane == 0) {
+            atomic_fetch_add_explicit(&imp[p], exp(s - m) * invl, memory_order_relaxed);
+        }
     }
 }
 
@@ -2802,6 +2910,11 @@ kernel void q4t_matvec(
     if (r0 >= rows) return;
     uint nr = min(rows - r0, 4u);
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    // MEASURED DEAD END (M4, Nanbeige 4.2 decode): hoisting the four
+    // rows' tile loads into one unrolled block so their misses overlap
+    // cost 19.0 → 14.0 tok/s. 16 packed uints + 8 float4 of x + the
+    // accumulators overflow the register budget and the occupancy loss
+    // beats the latency win. Keep the one-row-at-a-time inner loop.
     for (uint g = lane; g < gpr; g += 32u) {
         uint xb = g * 32u;
         device const float4* xv = (device const float4*)(x + xb);
@@ -2973,6 +3086,151 @@ kernel void q4t_mul_mm(
         }
     }
 }
+
+// q4t_mul_mm with the FFN activation fused into the X-tile load:
+// C = silu(gate)·up · dequant(down)ᵀ. The q8 twin (q8_mul_mm_silu) is
+// what lets the chunk prefill skip an act buffer and its round trip;
+// q4t models had no such kernel, which is why the whole chunk graph
+// bailed to the CPU for them.
+kernel void q4t_mul_mm_silu(
+    device const uchar*  q      [[buffer(0)]],
+    device const float*  gs     [[buffer(1)]],
+    device const float*  us     [[buffer(2)]],
+    device float*        y      [[buffer(3)]],
+    constant uint&       cols_b [[buffer(4)]],
+    constant uint&       rows_b [[buffer(5)]],
+    constant uint&       nb     [[buffer(6)]],
+    uint tiitg [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint2 tg  [[threadgroup_position_in_grid]])
+{
+    uint cols = cols_b;
+    uint rows = rows_b;
+    uint gpr = cols >> 5u;
+    threadgroup char shmem[8192];
+    threadgroup half* sa = (threadgroup half*)shmem;
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+    const uint NK = 32u;
+    uint r0 = tg.y * 64u;
+    uint r1 = tg.x * 32u;
+    uint nr0 = min(rows - r0, 64u);
+    uint nr1 = min(nb - r1, 32u);
+    uint lr0 = min(tiitg / 2u, nr0 - 1u);
+    uint il0 = tiitg % 2u;
+    uint lr1 = min(tiitg / 4u, nr1 - 1u);
+    uint iy  = 8u * (tiitg % 4u);
+
+    device const float* grow = gs + (ulong)(r1 + lr1) * cols + iy;
+    device const float* urow = us + (ulong)(r1 + lr1) * cols + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8u; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (uint k0 = 0; k0 < cols; k0 += NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // W: this thread's 16 weights (row r0+lr0, K-half il0) — 8
+        // nibble bytes of one tile, low nibble first.
+        {
+            uint g = k0 >> 5u;
+            device const uchar* tile = q + ((ulong)(r0 + lr0) * gpr + (ulong)g) * 18u;
+            float scale = (float)as_type<half>((ushort)((uint)tile[0] | ((uint)tile[1] << 8)));
+            device const uchar* nib = tile + 2u + 8u * il0;
+            uint sy = (tiitg / 2u) / 8u;
+            uint lx = (tiitg / 2u) % 8u;
+            float wv[16];
+            for (uint i = 0; i < 8u; ++i) {
+                uint bb = nib[i];
+                wv[2u * i]      = ((float)(bb & 0xFu) - 8.0f) * scale;
+                wv[2u * i + 1u] = ((float)(bb >> 4u) - 8.0f) * scale;
+            }
+            uint ib0 = 8u * (2u * il0) + sy;
+            uint ib1 = 8u * (2u * il0 + 1u) + sy;
+            for (uint i = 0; i < 8u; ++i) {
+                sa[64u * ib0 + 8u * i + lx] = (half)wv[i];
+                sa[64u * ib1 + 8u * i + lx] = (half)wv[i + 8u];
+            }
+        }
+        // X: silu(gate)·up staged straight into the tile — no act
+        // buffer, exactly as q8_mul_mm_silu does it.
+        {
+            uint sx = tiitg % 4u;
+            uint sy = (tiitg / 4u) / 8u;
+            uint ly = (tiitg / 4u) % 8u;
+            uint ib = 4u * sx + sy;
+            device const float4* g4 = (device const float4*)grow;
+            device const float4* u4 = (device const float4*)urow;
+            float4 g0 = g4[0];
+            float4 g1 = g4[1];
+            float4 u0 = u4[0];
+            float4 u1 = u4[1];
+            float4 a0 = (g0 / (1.0f + exp(-g0))) * u0;
+            float4 a1 = (g1 / (1.0f + exp(-g1))) * u1;
+            threadgroup half* dst = sb + 64u * ib + 8u * ly;
+            dst[0] = (half)a0.x; dst[1] = (half)a0.y;
+            dst[2] = (half)a0.z; dst[3] = (half)a0.w;
+            dst[4] = (half)a1.x; dst[5] = (half)a1.y;
+            dst[6] = (half)a1.z; dst[7] = (half)a1.w;
+        }
+        grow += NK;
+        urow += NK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < 4; ++ik) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; ++i) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    if (r0 + 64u <= rows && r1 + 32u <= nb) {
+        device float* C = y + (r0 + 32u * (sgitg & 1u))
+            + (ulong)(r1 + 16u * (sgitg >> 1u)) * rows;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * (ulong)rows * (i / 4),
+                            rows, ulong2(0, 0), false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* temp_str = ((threadgroup float*)shmem)
+            + 32u * (sgitg & 1u) + (16u * (sgitg >> 1u)) * 64u;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * 64 * (i / 4),
+                            64, ulong2(0, 0), false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (uint j = tiitg; j < nr1; j += 128u) {
+                device float* D = y + r0 + (ulong)(r1 + j) * rows;
+                threadgroup const float* Cr = ((threadgroup float*)shmem) + j * 64u;
+                for (uint i = 0; i < nr0; ++i) {
+                    D[i] = Cr[i];
+                }
+            }
+        }
+    }
+}
+
 "#;
 
 struct Ctx {
@@ -2992,6 +3250,7 @@ struct Ctx {
     q4bh: ComputePipelineState,
     q4t: ComputePipelineState,
     q4tmm: ComputePipelineState,
+    q4tmmsilu: ComputePipelineState,
     smaxrows: ComputePipelineState,
     flashatt: ComputePipelineState,
     convmm: ComputePipelineState,
@@ -3142,6 +3401,7 @@ fn init() -> Result<Ctx, String> {
     let q4bh = pso("q4b_matvec_h")?;
     let q4t = pso("q4t_matvec")?;
     let q4tmm = pso("q4t_mul_mm")?;
+    let q4tmmsilu = pso("q4t_mul_mm_silu")?;
     let smaxrows = pso("softmax_rows")?;
     let flashatt = pso("dit_flash_attend")?;
     let convmm = pso("conv_mul_mm")?;
@@ -3199,6 +3459,7 @@ fn init() -> Result<Ctx, String> {
         q4bh,
         q4t,
         q4tmm,
+        q4tmmsilu,
         smaxrows,
         flashatt,
         convmm,
@@ -4083,8 +4344,10 @@ fn mm_pipeline(c: &Ctx, rows: usize, cols: usize, kind: u8) -> ComputePipelineSt
         .clone()
 }
 
-/// Encode one tiled q8 GEMM into an open command buffer (device-resident
-/// X and Y). Caller guarantees b ≥ 32 and cols % 4 == 0.
+/// Encode one tiled GEMM into an open command buffer (device-resident X
+/// and Y). `q4t` picks the 18-byte-tile kernel, which reads its scales
+/// from the tiles and ignores `rs_buf`; otherwise q8_row with row
+/// scales. Caller guarantees b ≥ 32 and cols % 4 == 0.
 #[allow(clippy::too_many_arguments)]
 fn enc_mul_mm(
     c: &Ctx,
@@ -4092,34 +4355,50 @@ fn enc_mul_mm(
     fbuf: &Buffer,
     abs: usize,
     rs_buf: &Buffer,
+    q4t: bool,
     xs: &Buffer,
     y: &Buffer,
     b: usize,
     rows: usize,
     cols: usize,
 ) {
-    let pso = mm_pipeline(c, rows, cols, 0);
-    enc.set_compute_pipeline_state(&pso);
-    enc.set_buffer(0, Some(fbuf), abs as u64);
-    enc.set_buffer(1, Some(xs), 0);
-    enc.set_buffer(2, Some(rs_buf), 0);
-    enc.set_buffer(3, Some(y), 0);
+    // q4t has no function-constant twin (its K loop is already tile-shaped
+    // and fully unrolled over the 18 B group), so it takes the generic
+    // pipeline; q8 keeps the cols/rows-specialized one.
     let (cols_u, rows_u, b_u) = (cols as u32, rows as u32, b as u32);
-    enc.set_bytes(4, 4, &cols_u as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(5, 4, &rows_u as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(6, 4, &b_u as *const u32 as *const std::ffi::c_void);
+    if q4t {
+        enc.set_compute_pipeline_state(&c.q4tmm);
+        enc.set_buffer(0, Some(fbuf), abs as u64);
+        enc.set_buffer(1, Some(xs), 0);
+        enc.set_buffer(2, Some(y), 0);
+        enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &b_u as *const u32 as *const std::ffi::c_void);
+    } else {
+        let pso = mm_pipeline(c, rows, cols, 0);
+        enc.set_compute_pipeline_state(&pso);
+        enc.set_buffer(0, Some(fbuf), abs as u64);
+        enc.set_buffer(1, Some(xs), 0);
+        enc.set_buffer(2, Some(rs_buf), 0);
+        enc.set_buffer(3, Some(y), 0);
+        enc.set_bytes(4, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(6, 4, &b_u as *const u32 as *const std::ffi::c_void);
+    }
     enc.dispatch_thread_groups(
         MTLSize::new((b as u64).div_ceil(32), (rows as u64).div_ceil(64), 1),
         MTLSize::new(128, 1, 1),
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_mul_mm(
     c: &Ctx,
     cmd: &metal::CommandBufferRef,
     fbuf: &Buffer,
     abs: usize,
     rs_buf: &Buffer,
+    q4t: bool,
     xs: &Buffer,
     y: &Buffer,
     b: usize,
@@ -4127,7 +4406,7 @@ fn encode_mul_mm(
     cols: usize,
 ) {
     let enc = cmd.new_compute_command_encoder();
-    enc_mul_mm(c, enc, fbuf, abs, rs_buf, xs, y, b, rows, cols);
+    enc_mul_mm(c, enc, fbuf, abs, rs_buf, q4t, xs, y, b, rows, cols);
     enc.end_encoding();
 }
 
@@ -4185,6 +4464,9 @@ pub struct ChunkIo<'a> {
 struct ChunkPrep {
     abs: [usize; 7],
     rs: [Buffer; 7],
+    /// Per-projection weight layout: true = q4_tiled (18 B tiles, scale
+    /// inline), false = q8_row (`rs` carries the row scales).
+    q4t: [bool; 7],
     k_mb: Buffer,
     v_mb: Buffer,
     imp_mb: Buffer,
@@ -4317,10 +4599,21 @@ pub fn chunk_run_gpu(
         if l.nh != nh || l.nkv != nkv || l.hd != hd || l.hs != hs || l.inter != inter {
             return false;
         }
+        // An empty row_scale marks q4_tiled (scales inside the tiles);
+        // its payload is 18 B per 32-weight group, not one byte per
+        // weight, so the bounds check differs.
         let abs_of = |t: &(usize, usize, usize, &[f32])| -> Option<usize> {
             let entry = l.model.tensors.get(t.0)?;
             let abs = l.model.entry_abs_offset(entry)?;
-            (abs + t.1 * t.2 <= safe_len).then_some(abs)
+            let bytes = if t.3.is_empty() {
+                if t.2 % GROUP_SIZE != 0 {
+                    return None;
+                }
+                t.1 * (t.2 / GROUP_SIZE) * Q4_TILE
+            } else {
+                t.1 * t.2
+            };
+            (abs + bytes <= safe_len).then_some(abs)
         };
         let tens = [&l.wq, &l.wk, &l.wv, &l.wo, &l.gate, &l.up, &l.down];
         let mut abs = [0usize; 7];
@@ -4352,6 +4645,12 @@ pub fn chunk_run_gpu(
                 .entry((base, t.0))
                 .or_insert_with(|| {
                     crate::gpu::probe_note_cold();
+                    // q4t carries no row scales; a zero-length Metal
+                    // buffer is invalid, so bind a 4-byte placeholder the
+                    // q4t kernels never read.
+                    if t.3.is_empty() {
+                        return c._device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+                    }
                     c._device.new_buffer_with_data(
                         t.3.as_ptr() as *const std::ffi::c_void,
                         (t.3.len() * 4) as u64,
@@ -4368,6 +4667,15 @@ pub fn chunk_run_gpu(
             rs_of(&l.gate),
             rs_of(&l.up),
             rs_of(&l.down),
+        ];
+        let q4t = [
+            l.wq.3.is_empty(),
+            l.wk.3.is_empty(),
+            l.wv.3.is_empty(),
+            l.wo.3.is_empty(),
+            l.gate.3.is_empty(),
+            l.up.3.is_empty(),
+            l.down.3.is_empty(),
         ];
         // KV mirror prep (self-healing contract of the decode graph),
         // reserving b rows for the chunk.
@@ -4443,6 +4751,7 @@ pub fn chunk_run_gpu(
         preps.push(ChunkPrep {
             abs,
             rs,
+            q4t,
             k_mb,
             v_mb,
             imp_mb,
@@ -4580,6 +4889,7 @@ pub fn chunk_run_gpu(
                 &fbuf,
                 prep.abs[0],
                 &prep.rs[0],
+                prep.q4t[0],
                 &n_b,
                 &qraw,
                 b,
@@ -4592,6 +4902,7 @@ pub fn chunk_run_gpu(
                 &fbuf,
                 prep.abs[1],
                 &prep.rs[1],
+                prep.q4t[1],
                 &n_b,
                 &kraw,
                 b,
@@ -4604,6 +4915,7 @@ pub fn chunk_run_gpu(
                 &fbuf,
                 prep.abs[2],
                 &prep.rs[2],
+                prep.q4t[2],
                 &n_b,
                 &vraw,
                 b,
@@ -4765,6 +5077,7 @@ pub fn chunk_run_gpu(
             &fbuf,
             prep.abs[3],
             &prep.rs[3],
+            prep.q4t[3],
             &attn,
             &ob,
             b,
@@ -4782,6 +5095,7 @@ pub fn chunk_run_gpu(
                 &fbuf,
                 prep.abs[4],
                 &prep.rs[4],
+                prep.q4t[4],
                 &n_b,
                 &gb,
                 b,
@@ -4794,6 +5108,7 @@ pub fn chunk_run_gpu(
                 &fbuf,
                 prep.abs[5],
                 &prep.rs[5],
+                prep.q4t[5],
                 &n_b,
                 &ub,
                 b,
@@ -4807,17 +5122,29 @@ pub fn chunk_run_gpu(
         // standalone activation stage, no act-buffer round trip.
         {
             let enc = cmd.new_compute_command_encoder();
-            let pso = mm_pipeline(c, l.down.1, l.down.2, 1);
-            enc.set_compute_pipeline_state(&pso);
-            enc.set_buffer(0, Some(&fbuf), prep.abs[6] as u64);
-            enc.set_buffer(1, Some(&gb), 0);
-            enc.set_buffer(2, Some(&ub), 0);
-            enc.set_buffer(3, Some(&prep.rs[6]), 0);
-            enc.set_buffer(4, Some(&db), 0);
             let (cols_u, rows_u, b_u) = (l.down.2 as u32, l.down.1 as u32, b as u32);
-            enc.set_bytes(5, 4, &cols_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(6, 4, &rows_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(7, 4, &b_u as *const u32 as *const std::ffi::c_void);
+            // q4t drops the row-scale buffer, so every constant after it
+            // shifts down one slot.
+            let base = if prep.q4t[6] {
+                enc.set_compute_pipeline_state(&c.q4tmmsilu);
+                enc.set_buffer(0, Some(&fbuf), prep.abs[6] as u64);
+                enc.set_buffer(1, Some(&gb), 0);
+                enc.set_buffer(2, Some(&ub), 0);
+                enc.set_buffer(3, Some(&db), 0);
+                4
+            } else {
+                let pso = mm_pipeline(c, l.down.1, l.down.2, 1);
+                enc.set_compute_pipeline_state(&pso);
+                enc.set_buffer(0, Some(&fbuf), prep.abs[6] as u64);
+                enc.set_buffer(1, Some(&gb), 0);
+                enc.set_buffer(2, Some(&ub), 0);
+                enc.set_buffer(3, Some(&prep.rs[6]), 0);
+                enc.set_buffer(4, Some(&db), 0);
+                5
+            };
+            enc.set_bytes(base, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(base + 1, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(base + 2, 4, &b_u as *const u32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new((b as u64).div_ceil(32), (l.down.1 as u64).div_ceil(64), 1),
                 MTLSize::new(128, 1, 1),
@@ -6576,6 +6903,25 @@ fn enc_simple(
     grid: (u64, u64),
 ) {
     let enc = c_cmd.new_compute_command_encoder();
+    disp(enc, pso, bufs, words, floats, grid);
+    enc.end_encoding();
+}
+
+/// One dispatch into an ALREADY OPEN compute encoder. Dispatches inside
+/// a single encoder are serial on Apple Silicon (the default
+/// MTLDispatchTypeSerial: each waits on the previous and sees its
+/// writes), so a chain of data-dependent steps belongs in ONE encoder.
+/// A new encoder is a new GPU pass with its own kick and flush — at 11
+/// passes per layer × 44 virtual layers, that overhead was a large
+/// slice of Nanbeige's per-token wall.
+fn disp(
+    enc: &metal::ComputeCommandEncoderRef,
+    pso: &ComputePipelineState,
+    bufs: &[(&Buffer, u64)],
+    words: &[u32],
+    floats: &[f32],
+    grid: (u64, u64),
+) {
     enc.set_compute_pipeline_state(pso);
     for (i, (b, off)) in bufs.iter().enumerate() {
         enc.set_buffer(i as u64, Some(b), *off);
@@ -6596,7 +6942,25 @@ fn enc_simple(
         );
     }
     enc.dispatch_threads(MTLSize::new(grid.0, 1, 1), MTLSize::new(grid.1, 1, 1));
-    enc.end_encoding();
+}
+
+/// `disp` plus a threadgroup-memory allocation at index 0 — for kernels
+/// whose simdgroups combine partials through shared memory
+/// (`gqa_attend`'s flash-decoding split). The length is encoder state,
+/// so it is cleared again for the dispatches that follow.
+#[allow(clippy::too_many_arguments)]
+fn disp_tg(
+    enc: &metal::ComputeCommandEncoderRef,
+    pso: &ComputePipelineState,
+    bufs: &[(&Buffer, u64)],
+    words: &[u32],
+    floats: &[f32],
+    grid: (u64, u64),
+    tg_bytes: u64,
+) {
+    enc.set_threadgroup_memory_length(0, tg_bytes);
+    disp(enc, pso, bufs, words, floats, grid);
+    enc.set_threadgroup_memory_length(0, 0);
 }
 
 /// Device mirror of one layer's K/V cache: `[nkv, cap, hd]` each, plus
@@ -7064,31 +7428,34 @@ impl TokenGraph {
         unsafe {
             std::ptr::copy_nonoverlapping(ao.as_ptr(), ao_b.contents() as *mut f32, ao.len());
         }
-        self.encode_o_ffn(&cmd, l, &ao_b);
+        let enc = cmd.new_compute_command_encoder();
+        self.encode_o_ffn(enc, l, &ao_b);
+        enc.end_encoding();
     }
 
     /// O-projection from a device-resident attention output + residual
     /// + post-norm + FFN + residual.
-    fn encode_o_ffn(&self, cmd: &metal::CommandBufferRef, l: &AttnGpuLayer, ao_b: &Buffer) {
-        {
-            let enc = cmd.new_compute_command_encoder();
-            let (abs, q1t) = self.proj_abs(l.wo).unwrap();
-            encode_proj(
-                self.c,
-                enc,
-                &self.fbuf,
-                abs,
-                &q1t,
-                ao_b,
-                &self.d_b,
-                l.wo.1,
-                l.wo.2 / GROUP_SIZE,
-            );
-            enc.end_encoding();
-        }
+    fn encode_o_ffn(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        l: &AttnGpuLayer,
+        ao_b: &Buffer,
+    ) {
+        let (abs, q1t) = self.proj_abs(l.wo).unwrap();
+        encode_proj(
+            self.c,
+            enc,
+            &self.fbuf,
+            abs,
+            &q1t,
+            ao_b,
+            &self.d_b,
+            l.wo.1,
+            l.wo.2 / GROUP_SIZE,
+        );
         // Fused: h += d_b, n = rmsnorm(h, post_norm) — one dispatch
         // instead of separate enc_axpy + rmsnorm.
-        self.encode_post_ffn(cmd, l.post_norm, l.gate, l.up, l.down, Some(&self.d_b));
+        self.encode_post_ffn(enc, l.post_norm, l.gate, l.up, l.down, Some(&self.d_b));
     }
 
     /// Dims contract of the device-attend kernels (host-side check).
@@ -7187,9 +7554,14 @@ impl TokenGraph {
         };
 
         let cmd = self.ensure_cmd();
+        // The whole layer — norm, QKV, RoPE, append, attend, O, FFN,
+        // both residuals — is ONE encoder: every step reads the step
+        // before it, which serial dispatch already guarantees, so the
+        // per-pass kick was pure overhead (see `disp`).
+        let enc = cmd.new_compute_command_encoder();
         // 1. attn rmsnorm h → n
-        enc_simple(
-            &cmd,
+        disp(
+            enc,
             &self.c.rmsn,
             &[
                 (&self.h_b, 0),
@@ -7205,7 +7577,6 @@ impl TokenGraph {
         let k_b = io_buf(self.c, 41_000_000_019 + l.wk.1, l.wk.1 * 4);
         let v_b = io_buf(self.c, 42_000_000_037 + l.wv.1, l.wv.1 * 4);
         {
-            let enc = cmd.new_compute_command_encoder();
             let (aq, ak, av) = (
                 self.proj_abs(l.wq).unwrap(),
                 self.proj_abs(l.wk).unwrap(),
@@ -7244,7 +7615,6 @@ impl TokenGraph {
                 l.wv.1,
                 l.wv.2 / GROUP_SIZE,
             );
-            enc.end_encoding();
         }
         // 3. per-head qk-norm + RoPE (gate split into g_b)
         let nhd = p.nh * p.hd;
@@ -7262,8 +7632,8 @@ impl TokenGraph {
             .k_norm
             .map(|w| const_buf(self.c, w))
             .unwrap_or_else(|| qr_b.clone());
-        enc_simple(
-            &cmd,
+        disp(
+            enc,
             &self.c.rqkn,
             &[
                 (&q_b, 0),
@@ -7286,18 +7656,26 @@ impl TokenGraph {
             (((p.nh + p.nkv) * 32) as u64, 256),
         );
         // 4. append this position's K/V into the mirror
-        enc_simple(
-            &cmd,
+        disp(
+            enc,
             &self.c.kvapp,
             &[(&k_b, 0), (&v_b, 0), (&k_mb, 0), (&v_mb, 0)],
             &[p.nkv as u32, p.hd as u32, cap as u32, stored as u32],
             &[],
             ((p.nkv * p.hd) as u64, 256),
         );
-        // 5. grouped attend (+ Born importance into the mirror's imp)
+        // 5. grouped attend (+ Born importance into the mirror's imp).
+        //    Flash-decoding: one threadgroup per Q-head, its simdgroups
+        //    splitting the stored positions. ~32 positions per simdgroup
+        //    is the point where the split stops paying for itself.
         let ao_b = io_buf(self.c, 43_000_000_057 + nhd, nhd * 4);
-        enc_simple(
-            &cmd,
+        let n_pos = stored + 1;
+        let cap_sgs = (self.c.gqat.max_total_threads_per_threadgroup() as usize / 32)
+            .clamp(1, gqa_split_max());
+        let sgs = n_pos.div_ceil(32).clamp(1, cap_sgs);
+        let tg_threads = 32 * sgs;
+        disp_tg(
+            enc,
             &self.c.gqat,
             &[(&qr_b, 0), (&k_mb, 0), (&v_mb, 0), (&ao_b, 0), (&imp_mb, 0)],
             &[
@@ -7305,15 +7683,16 @@ impl TokenGraph {
                 (p.nh / p.nkv) as u32,
                 p.hd as u32,
                 cap as u32,
-                (stored + 1) as u32,
+                n_pos as u32,
             ],
             &[],
-            ((p.nh * 32) as u64, 256),
+            ((p.nh * tg_threads) as u64, tg_threads as u64),
+            ((sgs * p.hd + 2 * sgs) * 4) as u64,
         );
         // 6. output gate
         if p.output_gate {
-            enc_simple(
-                &cmd,
+            disp(
+                enc,
                 &self.c.sgate,
                 &[(&ao_b, 0), (&g_b, 0)],
                 &[nhd as u32],
@@ -7322,7 +7701,8 @@ impl TokenGraph {
             );
         }
         // 7. O + residual + FFN + residual
-        self.encode_o_ffn(&cmd, l, &ao_b);
+        self.encode_o_ffn(enc, l, &ao_b);
+        enc.end_encoding();
         true
     }
     /// post-norm(h) → n_b, gate/up, SiLU·mul, down, h += d — shared by
@@ -7332,7 +7712,7 @@ impl TokenGraph {
     /// rmsnorm (saves one encoder round trip per call — 2/layer).
     fn encode_post_ffn(
         &self,
-        cmd: &metal::CommandBufferRef,
+        enc: &metal::ComputeCommandEncoderRef,
         post_norm: &[f32],
         gate: (usize, usize, usize),
         up: (usize, usize, usize),
@@ -7348,7 +7728,6 @@ impl TokenGraph {
         // already handles the `hasd` flag.
         {
             let pn_buf = const_buf(self.c, post_norm);
-            let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.c.addnorm);
             enc.set_buffer(0, Some(&self.h_b), 0);
             enc.set_buffer(1, Some(delta.unwrap_or(&self.h_b)), 0);
@@ -7366,10 +7745,8 @@ impl TokenGraph {
             );
             enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
-            enc.end_encoding();
         }
         {
-            let enc = cmd.new_compute_command_encoder();
             let (ag, au) = (self.proj_abs(gate).unwrap(), self.proj_abs(up).unwrap());
             encode_proj(
                 self.c,
@@ -7393,10 +7770,8 @@ impl TokenGraph {
                 up.1,
                 up.2 / GROUP_SIZE,
             );
-            enc.end_encoding();
         }
         {
-            let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.c.silu);
             enc.set_buffer(0, Some(&fg_b), 0);
             enc.set_buffer(1, Some(&fu_b), 0);
@@ -7406,10 +7781,8 @@ impl TokenGraph {
             enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
             enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
-            enc.end_encoding();
         }
         {
-            let enc = cmd.new_compute_command_encoder();
             let ad = self.proj_abs(down).unwrap();
             encode_proj(
                 self.c,
@@ -7422,9 +7795,8 @@ impl TokenGraph {
                 down.1,
                 down.2 / GROUP_SIZE,
             );
-            enc.end_encoding();
         }
-        enc_axpy(self.c, cmd, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
+        disp_axpy(self.c, enc, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
     }
 
     /// Encode a run of consecutive GDN layers; recurrent states upload
@@ -7637,7 +8009,11 @@ impl TokenGraph {
             }
             // 8–12. post-norm + FFN + residual (shared with attn suffix)
             // Fused: h += d, n = rmsnorm(h, post_norm) — one dispatch.
-            self.encode_post_ffn(&cmd, l.post_norm, l.gate, l.up, l.down, Some(&d_b));
+            {
+                let enc = cmd.new_compute_command_encoder();
+                self.encode_post_ffn(enc, l.post_norm, l.gate, l.up, l.down, Some(&d_b));
+                enc.end_encoding();
+            }
         }
 
         for (sb, st) in st_bs.iter().zip(states) {
@@ -7761,8 +8137,30 @@ pub fn gdn_block(
 }
 
 /// `y += w·d` as its own encoder.
-fn enc_axpy(c: &Ctx, cmd: &metal::CommandBufferRef, d: &Buffer, y: &Buffer, w: f32, n: usize) {
-    let enc = cmd.new_compute_command_encoder();
+/// How many simdgroups may split one Q-head's positions in the decode
+/// attend (`CMF_GQA_SPLIT`, default 8). More splitting buys parallelism
+/// at depth and costs a wider threadgroup-memory combine.
+fn gqa_split_max() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CMF_GQA_SPLIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(1, 32))
+            .unwrap_or(8)
+    })
+}
+
+/// `enc_axpy` into an already-open encoder.
+fn disp_axpy(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    d: &Buffer,
+    y: &Buffer,
+    w: f32,
+    n: usize,
+) {
     enc.set_compute_pipeline_state(&c.axpy);
     enc.set_buffer(0, Some(d), 0);
     enc.set_buffer(1, Some(y), 0);
@@ -7770,7 +8168,6 @@ fn enc_axpy(c: &Ctx, cmd: &metal::CommandBufferRef, d: &Buffer, y: &Buffer, w: f
     enc.set_bytes(2, 4, &w as *const f32 as *const std::ffi::c_void);
     enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
     enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
-    enc.end_encoding();
 }
 
 #[cfg(test)]

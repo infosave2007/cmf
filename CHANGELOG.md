@@ -7,7 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **q4_tiled weights in the Metal chunk-prefill graph.** The graph
+  required `q8_row` on all seven projections of a layer, so every q4t
+  model — the whole Nanbeige/Bonsai class — silently fell back to the
+  CPU prefill. An empty `row_scale` now marks q4t per weight, and the
+  new `q4t_mul_mm_silu` kernel gives the fused down-GEMM its q4t twin.
+  A non-`q8_row` embedding matrix no longer refuses the whole run
+  either: the CPU fills the hidden and the graph starts from it.
+  Nanbeige 4.2 on M4: 512-token prefill 6.1 s → 2.8 s (≈185 tok/s),
+  1024-token 13.1 s → 6.6 s.
+- `CMF_GQA_SPLIT` — how many simdgroups may split one Q-head's
+  positions in the Metal decode attend (default 8).
+
 ### Fixed
+- **Decode collapsed with context depth on Metal.** Two causes, both in
+  `gqa_attend`: its Born-importance pass recomputed the QK dot with one
+  position per lane, so each lane walked a whole K row and the reads
+  never coalesced; and the kernel ran one simdgroup per Q-head, putting
+  only `num_heads` simdgroups on the device — nowhere near enough to
+  hide the per-position `simd_sum` latency. The importance pass now
+  reuses the main loop's lane-sliced layout, and the attend is
+  flash-decoding shaped (one threadgroup per head, its simdgroups
+  splitting the positions, partials combined through threadgroup
+  memory). Nanbeige 4.2 on M4, decode: 9.1 → 13.8 tok/s at ctx 512,
+  6.0 → 11.6 at ctx 1024. `chunk_attend` got the same importance fix.
+- **Looped Transformers prefilled one position at a time.**
+  `graph_prefill_preferred()` sent them through the decode graph on the
+  grounds that it beat the CPU *pair* path; the real competitor is the
+  batched chunk-GEMM, which amortizes each weight over the whole chunk
+  (512-token prompt: 85 tok/s chunked vs 14 through the graph). TTFT at
+  ctx 1024 fell from 107 s to 7.9 s.
 - **Metaspace `prepend_scheme` in the PRE-tokenizer was ignored.** The
   leading `▁` was read only off a `Prepend` normalizer (the llama
   shape), so tokenizers that carry Metaspace in the pre-tokenizer with
@@ -18,6 +48,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prepends). Nanbeige perplexity over the same text: 10.13 → 9.81.
   `tokenizer_parity` is green on Nanbeige 4.2, gemma-3n-E4B(-it),
   gemma-4-26B and MiniCPM3.
+
+### Added
+- **q4_tiled weights in the Metal chunk-prefill graph.** The graph
+  required `q8_row` on all seven projections of a layer, so every q4t
+  model — the whole Nanbeige/Bonsai class — silently fell back to the
+  CPU prefill. An empty `row_scale` now marks q4t per weight, and the
+  new `q4t_mul_mm_silu` kernel gives the fused down-GEMM its q4t twin.
+  A non-`q8_row` embedding matrix no longer refuses the whole run
+  either: the CPU fills the hidden and the graph starts from it.
+  Nanbeige 4.2 on M4: 512-token prefill 6.1 s → 2.8 s (≈181 tok/s),
+  1024-token 13.1 s → 6.6 s.
+- `CMF_GQA_SPLIT` — how many simdgroups may split one Q-head's
+  positions in the Metal decode attend (default 8).
+
+### Fixed
+- **Decode collapsed with context depth on Metal.** Two causes, both in
+  `gqa_attend`: its Born-importance pass recomputed the QK dot with one
+  position per lane, so each lane walked a whole K row and the reads
+  never coalesced; and the kernel ran one simdgroup per Q-head, putting
+  only `num_heads` simdgroups on the device — nowhere near enough to
+  hide the per-position `simd_sum` latency. The importance pass now
+  reuses the main loop's lane-sliced layout, and the attend is
+  flash-decoding shaped (one threadgroup per head, its simdgroups
+  splitting the positions, partials combined through threadgroup
+  memory). Nanbeige 4.2 on a fanless MacBook Air M4: decode 9.1 → 17.6
+  tok/s at ctx 512, 6.0 → 14.2 at ctx 1024. `chunk_attend` got the same
+  importance fix.
+- **Looped Transformers prefilled one position at a time.**
+  `graph_prefill_preferred()` sent them through the decode graph on the
+  grounds that it beat the CPU *pair* path; the real competitor is the
+  batched chunk-GEMM, which amortizes each weight over the whole chunk
+  (512-token prompt: 85 tok/s chunked vs 14 through the graph). Time to
+  first token at ctx 1024 fell from 107 s to 7.9 s.
+
+### Changed
+- One Metal compute encoder per attention layer instead of eleven.
+  Dispatches inside an encoder are serial on Apple Silicon and already
+  see the previous dispatch's writes, so the per-step encoder was a
+  GPU pass with nothing to show for it (44 virtual layers × 11 = 484
+  passes per token on Nanbeige 4.2).
 
 ## [0.5.34] — 2026-07-28
 

@@ -581,10 +581,10 @@ impl Pipeline {
     /// graph instead of the batched CPU chunk-GEMM? True for q1 GDN
     /// hybrids on native Metal: their chunk prefill is walled by the
     /// sequential scalar recurrence, so the graph's decode rate wins.
-    /// Looped Transformers also prefer the graph: the CPU batched prefill
-    /// pays the loop_final_norm sync per chunk boundary, and the graph's
-    /// device-attend rate (≈18 tok/s) beats the CPU's ≈9 tok/s for
-    /// typical chat-length prompts.
+    /// NOT for Looped Transformers, despite the per-chunk loop_final_norm
+    /// sync: the chunk-GEMM amortizes each weight over the whole chunk,
+    /// which the per-position graph cannot (Nanbeige 4.2 on M4, 512-token
+    /// prompt: 85 tok/s chunked vs 14 through the graph).
     #[cfg(target_os = "macos")]
     fn graph_prefill_preferred(&self) -> bool {
         if !crate::gpu::enabled_here()
@@ -594,9 +594,6 @@ impl Pipeline {
                 .unwrap_or(false)
         {
             return false;
-        }
-        if self.loop_final_norm {
-            return true;
         }
         self.weights
             .layers
@@ -2693,6 +2690,15 @@ impl Pipeline {
                 if li < chunk_skip_until {
                     continue;
                 }
+                // Device-side embedding needs a q8_row embedding matrix;
+                // with any other layout the CPU fills `h` first and the
+                // graph starts from a ready hidden (refusing the whole
+                // run over the embedding alone kept q4t models — the
+                // whole Nanbeige/Bonsai class — on the CPU prefill).
+                if !h_ready && li == 0 && self.weights.embed_tokens.q8_row_parts().is_none() {
+                    fill_h(&mut h, self);
+                    h_ready = true;
+                }
                 let ids_for_embed = (!h_ready && li == 0).then_some(ids);
                 let end = self.chunk_run_gpu(li, &mut h, b, start_pos, ids_for_embed);
                 if end > li {
@@ -3129,14 +3135,22 @@ impl Pipeline {
             if d.act != Act::Silu {
                 break;
             }
+            // q8_row (row_scale populated) or q4_tiled (row_scale empty
+            // — its scales live in the tiles). Mixing across the seven
+            // projections of one layer is fine; the encoder branches per
+            // weight. Anything else refuses the run.
+            fn cw(t: &QTensor) -> Option<(usize, usize, usize, &[f32])> {
+                t.q8_row_parts()
+                    .or_else(|| t.q4t_parts().map(|(i, r, c)| (i, r, c, &[][..])))
+            }
             let parts = (
-                wq.q8_row_parts(),
-                wk.q8_row_parts(),
-                wv.q8_row_parts(),
-                wo.q8_row_parts(),
-                d.gate_proj.q8_row_parts(),
-                d.up_proj.q8_row_parts(),
-                d.down_proj.q8_row_parts(),
+                cw(wq),
+                cw(wk),
+                cw(wv),
+                cw(wo),
+                cw(&d.gate_proj),
+                cw(&d.up_proj),
+                cw(&d.down_proj),
             );
             let (Some(pq), Some(pk), Some(pv), Some(po), Some(pg), Some(pu), Some(pd)) = parts
             else {
