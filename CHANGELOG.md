@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.29] — 2026-07-28
+
+### Added
+- **DeepSeek-V2 MLA** (E12): latent attention executed as
+  expand-to-MHA — per-token latent projection, K heads laid out
+  [rope|nope] with the DeepSeek pair-interleave undone at convert, V
+  zero-padded to the K head dim and sliced before O; YaRN mscale²
+  softmax-scale correction. Gated on DeepSeek-V2-Lite (ppl 8.78).
+- **gemma-4 MoE 26B-A4B** (E13b): dual-branch `DenseMoe` FFN — dense
+  branch from the normed input plus expert branch from the RAW
+  residual through its own norm sandwich; softmax→top-8→renorm router
+  with per-expert scales, its scale-less input gain folded into the
+  projection columns at convert; dual-geometry attention (sliding GQA
+  hd=256 + every-6th global MQA hd=512). Gated by scorer/decoder
+  parity: the scorer reproduces the model's own greedy tokens 40/40.
+- **Kimi Delta Attention (KDA)** — Kimi Linear / Kimi-K3 linear mixer:
+  delta rule with a PER-CHANNEL log decay (diagonal, vs GDN's
+  per-head scalar), separate q/k/v projections each behind its own
+  causal short conv, low-rank decay stage, sigmoid-gated output
+  RMSNorm; both decay-gate formulas (standard softplus and the K3
+  lower-bound sigmoid). Validated against a literal port of the FLA
+  reference kernels; **Kimi-Linear-48B-A3B gated end-to-end** (98 GB
+  streamed → 27.7 GB q4t on a MacBook, coherent generation).
+- **Kimi-K3 machinery**: compressed-q MLA (q_a→rms→q_b), the `situ`
+  activation, MLA NoPE (full-attention layers apply no rotary — the
+  KDA layers carry position). K3-only pieces with no public modeling
+  reference (mxfp4 packing, `attn_res_block_size` residual streams,
+  latent MoE, MLA output gate) refuse with named errors.
+- **tiktoken → tokenizer.json in Rust**: Kimi ships a tiktoken rank
+  table instead of tokenizer.json; the converter synthesizes a
+  standard one — byte-level BPE vocab plus the merge list RECOVERED
+  from the ranks (transformers' algorithm), specials from
+  `added_tokens_decoder`. 163k-entry table converts in ~320 ms.
+- **MiniCPM3** — the compressed-q gate carrier: `scale_depth`/√L
+  residual scaling folded into o_proj/down_proj at convert,
+  `scale_emb` via the embedding multiplier, `dim_model_base` logit
+  scale as a new `logit_multiplier` header field (the head is tied to
+  the embedding — the divisor cannot be baked into the shared
+  tensor), and longrope's per-dim short factors as
+  `rope_freq_factors` dividing inv_freq at load (they are the TRAINED
+  rope inside the native window — nothing like phi's ≈1 factors).
+- **Streaming hub convert**: hub checkpoints convert one shard on
+  disk at a time (fetch → process → delete) — a 98 GB release
+  converts on a laptop whose free disk only fits the output plus one
+  shard.
+
+### Fixed
+- Teacher-forced scorers double-applied the gemma final-logit softcap
+  in the sequential branches (`lm_head_forward` already caps) —
+  tanh∘tanh flattered every reported gemma-class ppl; branches now
+  agree within int8-activation noise.
+- The fused-pair prefill cached RAW V on v-norm architectures
+  (gemma-4): q/k were normalized, V was not — pair prefill diverged
+  from singles (argmax parity 28/40 → 40/40). Regression-tested
+  against two singles.
+- Pair prefill dispatched dual-branch FFNs into an `unreachable!`;
+  models whose layers have no pair arm (MLA, KDA) now fall back to
+  the single-position path instead of panicking.
+- gemma tokenizer.json declares `<bos>` only as an added token —
+  detect it there and set add_bos, or scoring ran bos-less.
+- DeepSeek MLA rope pairs are interleaved in the checkpoint (view
+  d/2,2 → transpose): the converter stores rope dims even-first so
+  the runtime's half-split rotation reproduces their math; the
+  interleave is correctly SKIPPED for half-split (MiniCPM3) and NoPE
+  (Kimi) families.
+
 ## [0.5.28] — 2026-07-27
 
 ### Added
