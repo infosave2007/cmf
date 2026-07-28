@@ -853,6 +853,46 @@ pub(crate) fn to_f32(dtype: &str, raw: &[u8]) -> anyhow::Result<Vec<f32>> {
     })
 }
 
+/// OCP MXFP4 (compressed-tensors "mxfp4-pack-quantized", Kimi-K3):
+/// two FP4-E2M1 values per byte (LOW nibble = even element), groups of
+/// 32 along the last axis, one E8M0 scale byte (2^(k−127)) per group.
+pub(crate) fn unpack_mxfp4(
+    packed: &[u8],
+    scales: &[u8],
+    rows: usize,
+    cols_packed: usize,
+) -> anyhow::Result<Vec<f32>> {
+    // E2M1, bias 1: e=0 subnormal m·0.5; e≥1 normal (1+m/2)·2^(e−1).
+    const LUT: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let cols = cols_packed * 2;
+    anyhow::ensure!(cols % 32 == 0, "mxfp4: cols {cols} not a multiple of 32");
+    let gpr = cols / 32;
+    anyhow::ensure!(
+        packed.len() == rows * cols_packed && scales.len() == rows * gpr,
+        "mxfp4: packed {} / scales {} vs rows {rows} cols {cols}",
+        packed.len(),
+        scales.len()
+    );
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for g in 0..gpr {
+            let k = scales[r * gpr + g];
+            // E8M0: value = 2^(k−127); 255 = NaN per OCP — refuse loudly.
+            anyhow::ensure!(k != 255, "mxfp4: NaN scale at row {r} group {g}");
+            let scale = (k as f32 - 127.0).exp2();
+            for b in 0..16 {
+                let byte = packed[r * cols_packed + g * 16 + b];
+                for (half, nib) in [(0usize, byte & 0x0F), (1usize, byte >> 4)] {
+                    let mag = LUT[(nib & 0x7) as usize];
+                    let v = if nib & 0x8 != 0 { -mag } else { mag };
+                    out[r * cols + g * 32 + b * 2 + half] = v * scale;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn unpack_mlx(
     w_raw: &[u8],
     s_raw: &[u8],
@@ -1102,15 +1142,6 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         || model_type == "kimi_k3"
         || tc_model_type == "kimi_linear";
     let layer_types = if let Some(lac) = tc.get("linear_attn_config").filter(|_| is_kimi) {
-        let quant_fmt = config
-            .get("quantization_config")
-            .or_else(|| tc.get("quantization_config"))
-            .map(|q| q.to_string())
-            .unwrap_or_default();
-        anyhow::ensure!(
-            !quant_fmt.contains("mxfp4"),
-            "kimi: mxfp4-packed checkpoints are not supported yet — convert the bf16 release"
-        );
         anyhow::ensure!(
             tc.get("attn_res_block_size")
                 .map(|v| v.is_null())
@@ -2388,8 +2419,37 @@ pub fn run_convert(
             if m.dtype == "F16" && (name.ends_with(".scales") || name.ends_with(".biases")) {
                 continue;
             }
+            // MXFP4 group scales ride with their .weight_packed twin.
+            if m.dtype == "U8" && name.ends_with(".weight_scale") {
+                continue;
+            }
 
-            let (m_shape, m_vals) = if m.dtype == "U32" && m.name.ends_with(".weight") {
+            let mxfp4 = if m.dtype == "U8" && m.name.ends_with(".weight_packed") {
+                // MXFP4 (Kimi-K3 experts): decode to f32 and continue the
+                // normal path under the plain `.weight` name.
+                let scale_name = m.name.replace(".weight_packed", ".weight_scale");
+                let mut scales_blob = None;
+                for f in files {
+                    if let Some(t) = f.tensors.iter().find(|t| t.name == scale_name) {
+                        scales_blob = Some(f.bytes(t));
+                    }
+                }
+                let scales = scales_blob
+                    .ok_or_else(|| anyhow::anyhow!("missing {scale_name} for mxfp4 unpacking"))?;
+                anyhow::ensure!(m.shape.len() == 2, "{name}: mxfp4 expects 2-D");
+                let (rows, cp) = (m.shape[0], m.shape[1]);
+                Some((vec![rows, cp * 2], unpack_mxfp4(file.bytes(m), scales, rows, cp)?))
+            } else {
+                None
+            };
+            let name = if mxfp4.is_some() {
+                name.strip_suffix("_packed").expect("suffix checked").to_string()
+            } else {
+                name
+            };
+            let (m_shape, m_vals) = if let Some(v) = mxfp4 {
+                v
+            } else if m.dtype == "U32" && m.name.ends_with(".weight") {
                 let scales_name = m.name.replace(".weight", ".scales");
                 let biases_name = m.name.replace(".weight", ".biases");
                 let mut scales_blob = None;
@@ -3254,6 +3314,44 @@ mod tests {
             assert_eq!(back, text, "roundtrip failed for {text:?} → {ids:?}");
             eprintln!("{:3} toks | {text:?}", ids.len());
         }
+    }
+
+    #[test]
+    fn mxfp4_unpack_roundtrip() {
+        // Values ON the E2M1 grid times power-of-two scales roundtrip
+        // exactly; low nibble = even element (compressed-tensors pack).
+        let grid = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        let rows = 2usize;
+        let cols = 64usize; // two groups of 32 per row
+        let scales_exp = [[127u8, 130u8], [124u8, 127u8]]; // ×1, ×8, ×0.125, ×1
+        let mut want = vec![0.0f32; rows * cols];
+        let mut packed = vec![0u8; rows * cols / 2];
+        let mut scales = vec![0u8; rows * 2];
+        for r in 0..rows {
+            for g in 0..2 {
+                let k = scales_exp[r][g];
+                scales[r * 2 + g] = k;
+                let sc = (k as f32 - 127.0).exp2();
+                for i in 0..32 {
+                    let nib = ((r * 31 + g * 7 + i * 3) % 16) as u8;
+                    let mag = grid[(nib & 7) as usize];
+                    let v = if nib & 8 != 0 { -mag } else { mag };
+                    want[r * cols + g * 32 + i] = v * sc;
+                    let byte = &mut packed[r * cols / 2 + g * 16 + i / 2];
+                    if i % 2 == 0 {
+                        *byte |= nib;
+                    } else {
+                        *byte |= nib << 4;
+                    }
+                }
+            }
+        }
+        let got = unpack_mxfp4(&packed, &scales, rows, cols / 2).unwrap();
+        assert_eq!(got, want);
+        // NaN scale (E8M0 255) must refuse, not propagate.
+        let mut bad = scales.clone();
+        bad[0] = 255;
+        assert!(unpack_mxfp4(&packed, &bad, rows, cols / 2).is_err());
     }
 
     #[test]

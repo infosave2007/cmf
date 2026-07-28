@@ -73,8 +73,9 @@ token）· Kimi Linear 48B-A3B（KDA：逐通道衰减的 delta 规则、每投�
 为 27.7 GB q4t，在 MacBook 上完成）· MiniCPM3（compressed-q MLA
 （q_a→rms→q_b）端到端验证；scale_emb / scale_depth / dim_model_base
 折叠进权重与文件头，longrope 的逐维 short 因子在加载时除入
-inv_freq）。尚不支持：gemma-4 E 系列，以及 Kimi-K3 独有机制
-（mxfp4 打包、残差流、latent MoE——在 modeling 代码公开前明确拒绝）。其它模型请试 `import-gguf`——如果它拒绝了，那就是一个
+inv_freq）。MXFP4 打包的检查点（Kimi-K3 专家）在转换时原生解码。尚不支持：
+gemma-4 E 系列，以及 Kimi-K3 独有机制（残差流、latent MoE、MLA
+输出门——在 modeling 代码公开前明确拒绝）。其它模型请试 `import-gguf`——如果它拒绝了，那就是一个
 值得提 issue 的 bug。
 
 ## 接入你现有的工具链

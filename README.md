@@ -84,9 +84,10 @@ a standard tokenizer.json at convert — gated end-to-end, streamed
 98 GB → 27.7 GB q4t on a MacBook) · MiniCPM3 (compressed-q MLA
 (q_a→rms→q_b) gated end-to-end; MiniCPM's scale_emb / scale_depth /
 dim_model_base fold into the weights and header, longrope's per-dim
-short factors divide inv_freq at load). Not yet: gemma-4 E-series and
-the Kimi-K3-only extras (mxfp4 packing, residual streams, latent MoE —
-named refusals until the modeling code is public). Anything else, try `import-gguf` — and if
+short factors divide inv_freq at load). MXFP4-packed checkpoints (Kimi-K3
+experts) decode natively at convert. Not yet: gemma-4 E-series and
+the Kimi-K3-only extras (residual streams, latent MoE, MLA output
+gate — named refusals until the modeling code is public). Anything else, try `import-gguf` — and if
 it refuses, that is a bug worth filing.
 
 ## Plug it into what you already use
