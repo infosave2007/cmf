@@ -581,7 +581,23 @@ distribution-equivalent to the CPU path (first-token probabilities within
 ~0.3%, PPL matches), not bit-identical on every prompt — floating-point
 reductions run in a different order, as with any GPU offload.
 `CMF_GPU_ATTEND=0` keeps the attention core on the CPU, `CMF_GPU_BLOCK=0`
-disables the graph.
+disables the graph. `q4_tiled` joined the list in 0.5.35, on both the
+decode graph and the batched prefill.
+
+Since 0.5.35 the Metal decode attend is flash-decoding shaped — the
+simdgroups of one threadgroup split a head's positions and combine their
+partials in threadgroup memory (`CMF_GQA_SPLIT`, default 8) — so
+throughput holds at depth instead of falling off a cliff, and the whole
+attention layer rides in ONE compute encoder. Prompt ingest for Looped
+Transformers goes through the batched chunk-GEMM rather than the
+per-position graph. On a **fanless MacBook Air (M4, 10-core GPU, 24 GB)**
+the looped Nanbeige4.2-3B — 22 physical layers run twice, so every token
+pays for 44 layer passes and 3.9 GB of weight reads — decodes at
+**22.4 tok/s** at short context, 17.6 at ctx 512, 14.2 at ctx 1024, and
+ingests a prompt at **181 tok/s** (2.7 s to first token on 512 tokens).
+That is ~72% of what the machine's 120 GB/s of memory bandwidth allows at
+all; before 0.5.35 the same file did 9 tok/s at ctx 512 and took 40 s to
+absorb the prompt.
 
 On discrete cards (Vulkan/DX12 via wgpu), 0.5.18 runs the same
 whole-token graph by default: every layer — including the GDN recurrence

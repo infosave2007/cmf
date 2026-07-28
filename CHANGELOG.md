@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.35] — 2026-07-28
+
 ### Added
 - **q4_tiled weights in the Metal chunk-prefill graph.** The graph
   required `q8_row` on all seven projections of a layer, so every q4t

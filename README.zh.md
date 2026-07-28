@@ -513,6 +513,18 @@ softmax attend），command buffer 一编码完就提交——每词元只等待
 CPU 路径在分布上等价（首词元概率相差约 0.3% 以内，PPL 一致），但不保证每个
 提示词都逐位相同——浮点归约顺序不同，任何 GPU offload 都是如此。
 `CMF_GPU_ATTEND=0` 把注意力留在 CPU，`CMF_GPU_BLOCK=0` 关闭计算图。
+0.5.35 起 `q4_tiled` 也进入该列表——解码计算图和批量预填充都支持。
+
+0.5.35 起，Metal 解码注意力改为 flash-decoding 形态：同一 threadgroup 的
+各 simdgroup 分摊一个头的位置，再通过 threadgroup 内存合并部分结果
+（`CMF_GQA_SPLIT`，默认 8），因此深上下文下吞吐不再崩塌；整个注意力层在
+**一个** compute encoder 内完成。Looped Transformer 的提示词摄入改走批量
+chunk-GEMM，而不是逐位置计算图。在**无风扇的 MacBook Air（M4，10 核 GPU，
+24 GB）** 上，循环式 Nanbeige4.2-3B——22 个物理层跑两遍，即每词元 44 次层
+计算、3.9 GB 权重读取——短上下文解码 **22.4 tok/s**，ctx 512 为 17.6，
+ctx 1024 为 14.2，提示词摄入 **181 tok/s**（512 词元提示 2.7 秒出首字）。
+这已是该机 120 GB/s 内存带宽理论上限的约 72%；0.5.35 之前同一文件在
+ctx 512 只有 9 tok/s，摄入提示需要 40 秒。
 
 在独立显卡上（通过 wgpu 的 Vulkan/DX12），0.5.18 默认运行同样的整词元
 计算图：所有层——包括混合模型的 GDN 递归和 Looped Transformer 的循环
