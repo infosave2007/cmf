@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.33] — 2026-07-28
+
+### Added
+- **`cortiq_execution_info()`**: one JSON line for status/About
+  surfaces — `{"simd":"neon","threads":4,"gpu_backend":true}` — with
+  the thread count from the pool's own resolution (forced >
+  `CMF_THREADS` > big-core topology), valid before and after load.
+
+### Fixed
+- `cortiq_worker_tids` raced pool startup: tid registration ran on
+  the worker threads while the embedder reads the registry right
+  after `cortiq_load` — a phone saw "· 1 threads" with four workers
+  alive. Pool construction now waits for every registration (thread
+  start is milliseconds); the registry is complete the moment the
+  pool exists.
+
 ## [0.5.32] — 2026-07-28
 
 ### Added
