@@ -466,6 +466,27 @@ fn backend() -> Backend {
 }
 
 /// GPU enabled and initialized on the selected backend?
+/// Whether THIS build can bring a GPU up on THIS device: a compiled-in
+/// backend plus a live adapter. The mobile FFI exposes it so an app can
+/// tell "GPU off" from "GPU impossible" (a CPU-only .so ships no
+/// backend at all). Cached after the first call.
+pub fn backend_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // The Metal path is always compiled on macOS.
+        true
+    }
+    #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+    {
+        static AVAIL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAIL.get_or_init(crate::gpu_wgpu::adapter_probe)
+    }
+    #[cfg(all(not(feature = "gpu"), not(target_os = "macos")))]
+    {
+        false
+    }
+}
+
 pub fn enabled() -> bool {
     backend() != Backend::None
 }

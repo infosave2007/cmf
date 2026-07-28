@@ -31,6 +31,17 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+/// Embedder override for the pool size (C ABI `cortiq_set_threads`):
+/// 0 = unset, consult CMF_THREADS / topology as before. Read once at
+/// pool construction, so set it before the load.
+pub static FORCED_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Kernel thread ids of the CURRENT pool's workers (Android/Linux) —
+/// what ADPF's PerformanceHintManager needs to attribute work to the
+/// governor. Refilled on every pool construction; empty elsewhere.
+pub static WORKER_TIDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+
 /// A `*const dyn Fn` that may cross a thread boundary. Safety is
 /// provided by `Pool::run`: the caller blocks until every worker has
 /// finished, so the borrow outlives all uses.
@@ -101,11 +112,20 @@ impl Pool {
             parked: (0..n_workers).map(|_| AtomicBool::new(false)).collect(),
         });
         let mut joins = Vec::with_capacity(n_workers);
+        if let Ok(mut tids) = WORKER_TIDS.lock() {
+            tids.clear();
+        }
         for w in 0..n_workers {
             let inner = inner.clone();
             let h = std::thread::Builder::new()
                 .name(format!("cmf-pool-{w}"))
-                .spawn(move || worker_loop(&inner, w))
+                .spawn(move || {
+                    #[cfg(any(target_os = "android", target_os = "linux"))]
+                    if let Ok(mut tids) = WORKER_TIDS.lock() {
+                        tids.push(unsafe { libc::gettid() } as i32);
+                    }
+                    worker_loop(&inner, w)
+                })
                 .expect("spawn pool worker");
             joins.push(h);
         }
@@ -127,15 +147,7 @@ impl Pool {
         any(target_os = "linux", target_os = "android")
     ))]
     fn big_cores() -> Option<usize> {
-        let mut caps: Vec<u64> = Vec::new();
-        for cpu in 0.. {
-            let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity");
-            match std::fs::read_to_string(&path) {
-                Ok(v) => caps.push(v.trim().parse().ok()?),
-                Err(_) => break,
-            }
-        }
-        Self::cores_from_capacities(&caps)
+        Self::cores_from_capacities(&core_capacities())
     }
 
     /// How many cores the pool should use, from the kernel's per-core
@@ -207,6 +219,14 @@ impl Pool {
     /// Pool sized from `CMF_THREADS` (see module docs). `None` = serial.
     /// Without the env, heterogeneous ARM defaults to its BIG cores.
     pub fn from_env() -> Option<Arc<Self>> {
+        let forced = FORCED_THREADS.load(std::sync::atomic::Ordering::Relaxed);
+        if forced > 0 {
+            return if forced <= 1 {
+                None
+            } else {
+                Some(Arc::new(Self::new(forced)))
+            };
+        }
         let n = match std::env::var("CMF_THREADS") {
             Ok(v) => v.parse::<usize>().unwrap_or(0),
             Err(_) => match Self::big_cores() {
@@ -342,23 +362,40 @@ impl Drop for Pool {
     }
 }
 
+/// Per-core capacity: the kernel's `cpu_capacity` (µarch × clock) when
+/// EAS exposes it, else `cpufreq/cpuinfo_max_freq` — same cluster
+/// ordering, so the 62.5% big-core rule keeps working on EAS-less
+/// kernels (TUNING.md open item: pinning silently did nothing there).
+#[cfg(any(
+    target_os = "android",
+    all(target_arch = "aarch64", target_os = "linux")
+))]
+fn core_capacities() -> Vec<u64> {
+    let read_all = |leaf: &str| -> Vec<u64> {
+        let mut vals = Vec::new();
+        for cpu in 0.. {
+            let path = format!("/sys/devices/system/cpu/cpu{cpu}/{leaf}");
+            match std::fs::read_to_string(&path) {
+                Ok(v) => match v.trim().parse() {
+                    Ok(x) => vals.push(x),
+                    Err(_) => break,
+                },
+                Err(_) => break,
+            }
+        }
+        vals
+    };
+    let caps = read_all("cpu_capacity");
+    if caps.len() >= 2 {
+        return caps;
+    }
+    read_all("cpufreq/cpuinfo_max_freq")
+}
+
 #[cfg(target_os = "android")]
 fn pin_thread_to_big_cores() {
     use std::mem;
-    let mut caps: Vec<u64> = Vec::new();
-    for cpu in 0.. {
-        let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity");
-        match std::fs::read_to_string(&path) {
-            Ok(v) => {
-                if let Ok(cap) = v.trim().parse() {
-                    caps.push(cap);
-                } else {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
+    let caps = core_capacities();
     let max = caps.iter().copied().max().unwrap_or(0);
     let min = caps.iter().copied().min().unwrap_or(0);
 
@@ -531,6 +568,17 @@ impl SendMut {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn forced_threads_overrides_env_and_topology() {
+        use std::sync::atomic::Ordering;
+        super::FORCED_THREADS.store(3, Ordering::Relaxed);
+        let pool = super::Pool::from_env().expect("forced 3 → pool");
+        assert_eq!(pool.n_workers(), 3);
+        super::FORCED_THREADS.store(1, Ordering::Relaxed);
+        assert!(super::Pool::from_env().is_none(), "forced 1 → serial");
+        super::FORCED_THREADS.store(0, Ordering::Relaxed);
+    }
+
     #[test]
     fn capacity_split_clock_bins_vs_microarch() {
         type P = super::Pool;

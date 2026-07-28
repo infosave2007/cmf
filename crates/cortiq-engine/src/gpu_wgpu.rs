@@ -8385,3 +8385,23 @@ mod tests {
         assert!(max_d < 1e-3, "wgpu q1_mul_mm ≠ CPU: max|Δ| = {max_d}");
     }
 }
+
+/// Cheap device probe for `gpu::backend_available`: can wgpu bring an
+/// adapter up here at all? One instance, no device/queue, no caching —
+/// the caller caches.
+pub fn adapter_probe() -> bool {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        flags: wgpu::InstanceFlags::default(),
+        memory_budget_thresholds: Default::default(),
+        backend_options: Default::default(),
+        display: None,
+    });
+    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+        apply_limit_buckets: false,
+    }))
+    .is_ok()
+}

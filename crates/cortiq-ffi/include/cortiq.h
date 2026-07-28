@@ -28,6 +28,22 @@ void *cortiq_load(const char *path);
 /* Globally enable or disable the discrete GPU graph. Must be called before load. */
 void cortiq_set_gpu(bool enable);
 
+/* True when this build has a working GPU backend and the device can
+ * bring an adapter up (Vulkan on Android, Metal on iOS/macOS). A
+ * CPU-only library returns false while cortiq_set_gpu still accepts
+ * the flag. */
+bool cortiq_gpu_available(void);
+
+/* Worker-pool size from the embedder (instead of the process-wide
+ * CMF_THREADS environment variable). 0 = automatic. Call before
+ * cortiq_load. */
+void cortiq_set_threads(int32_t n);
+
+/* Kernel thread ids of the current worker pool (Android/Linux; for
+ * ADPF work-duration reporting). Copies up to cap ids into out and
+ * returns the total count; 0 before a load or on other platforms. */
+int32_t cortiq_worker_tids(int32_t *out, int32_t cap);
+
 /* Release a handle. NULL is a no-op. */
 void cortiq_free(void *handle);
 

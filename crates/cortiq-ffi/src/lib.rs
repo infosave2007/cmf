@@ -100,6 +100,43 @@ pub extern "C" fn cortiq_set_gpu(enable: bool) {
     cortiq_engine::pipeline::GLOBAL_USE_GPU.store(enable, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// True when this build carries a working GPU backend AND the device
+/// can bring an adapter up (Vulkan on Android, Metal on iOS/macOS).
+/// Distinguishes "GPU off" from "GPU impossible": a CPU-only library
+/// returns false here while `cortiq_set_gpu` still accepts the flag.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_gpu_available() -> bool {
+    cortiq_engine::gpu::backend_available()
+}
+
+/// Pin the worker-pool size from the embedder instead of the
+/// process-wide `CMF_THREADS` environment variable. 0 restores the
+/// automatic choice (env, then big-core topology). Call before
+/// `cortiq_load` — the pool is sized once per load.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_set_threads(n: i32) {
+    cortiq_engine::pool::FORCED_THREADS
+        .store(n.max(0) as usize, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Kernel thread ids of the current worker pool (Android/Linux) — what
+/// ADPF's PerformanceHintManager needs to report work durations to the
+/// scheduler. Copies up to `cap` ids into `out`, returns the total
+/// worker count (call again with a larger buffer if it exceeds `cap`).
+/// Returns 0 on platforms without stable kernel tids or before a load.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_worker_tids(out: *mut i32, cap: i32) -> i32 {
+    let tids = match cortiq_engine::pool::WORKER_TIDS.lock() {
+        Ok(t) => t.clone(),
+        Err(_) => return 0,
+    };
+    if !out.is_null() && cap > 0 {
+        let n = tids.len().min(cap as usize);
+        unsafe { std::ptr::copy_nonoverlapping(tids.as_ptr(), out, n) };
+    }
+    tids.len() as i32
+}
+
 /// Release the handle. NULL is a no-op. Do not use the handle afterwards.
 #[unsafe(no_mangle)]
 pub extern "C" fn cortiq_free(handle: *mut c_void) {
