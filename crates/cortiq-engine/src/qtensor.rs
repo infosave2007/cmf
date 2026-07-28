@@ -3167,7 +3167,11 @@ unsafe fn dot_q4t_row_vnni(bytes: &[u8], r: usize, gpr: usize, xq: &[i8]) -> f32
 /// activation) — the unpack is the dominant per-element cost of the
 /// tiled format (roadmap P0 portable blocking, q4t leg).
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+// `fma` is NOT implied by `avx2`: without it LLVM lowers _mm256_fmadd_ps
+// to a libm call per lane — measured 2x slower than the reduction this
+// kernel replaces. The runtime gate (`avx2_enabled`) already requires
+// both features, so declaring it here is safe.
+#[target_feature(enable = "avx2,fma")]
 unsafe fn dot_q4t_row_1x4_avx2(bytes: &[u8], r: usize, gpr: usize, xs: [&[i8]; 4]) -> [f32; 4] {
     // SAFETY: callers uphold the 18B-tile and xq-length contracts.
     unsafe {
@@ -3175,10 +3179,26 @@ unsafe fn dot_q4t_row_1x4_avx2(bytes: &[u8], r: usize, gpr: usize, xs: [&[i8]; 4
         let lomask = _mm_set1_epi8(0x0F);
         let eight = _mm256_set1_epi8(8);
         let ones = _mm256_set1_epi16(1);
-        let mut acc = [0f32; 4];
+        // One f32 accumulator VECTOR per activation, reduced once at the
+        // end. Folding each group's i32 lanes to a scalar inside the loop
+        // costs an extracti128 + three shift/add + a movd — a cross-lane
+        // dependency chain per (group, activation), 288 of them per row at
+        // cols=2304. The per-group scale is what forces a float
+        // accumulator; it does not force a horizontal sum.
+        //
+        // The four accumulators are NAMED, not an array: as `[__m256; 4]`
+        // indexed by a loop variable LLVM keeps them in memory and every
+        // group pays four 32-byte loads and stores. That alone made this
+        // kernel 2x SLOWER than the per-group reduction it replaces
+        // (measured on the EPYC box: 150 s vs 71 s for two 256² steps).
+        let mut f0 = _mm256_setzero_ps();
+        let mut f1 = _mm256_setzero_ps();
+        let mut f2 = _mm256_setzero_ps();
+        let mut f3 = _mm256_setzero_ps();
         for gi in 0..gpr {
             let t = bytes.as_ptr().add((r * gpr + gi) * Q4_TILE);
             let s = f16_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
+            let sv = _mm256_set1_ps(s);
             let bb = _mm_loadu_si128(t.add(2) as *const __m128i);
             let lo = _mm_and_si128(bb, lomask);
             let hi = _mm_and_si128(_mm_srli_epi16::<4>(bb), lomask);
@@ -3187,34 +3207,62 @@ unsafe fn dot_q4t_row_1x4_avx2(bytes: &[u8], r: usize, gpr: usize, xs: [&[i8]; 4
                 eight,
             );
             let aw = _mm256_abs_epi8(w);
-            for (k, xq) in xs.iter().enumerate() {
-                let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+            let off = gi * GROUP_SIZE;
+            let dot = |xq: &[i8]| {
+                let x = _mm256_loadu_si256(xq.as_ptr().add(off) as *const __m256i);
                 let p16 = _mm256_maddubs_epi16(aw, _mm256_sign_epi8(x, w));
-                let d = _mm256_madd_epi16(p16, ones);
-                let hi128 = _mm256_extracti128_si256::<1>(d);
-                let s128 = _mm_add_epi32(_mm256_castsi256_si128(d), hi128);
-                let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
-                let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
-                acc[k] += _mm_cvtsi128_si32(s32) as f32 * s;
-            }
+                _mm256_cvtepi32_ps(_mm256_madd_epi16(p16, ones))
+            };
+            f0 = _mm256_fmadd_ps(dot(xs[0]), sv, f0);
+            f1 = _mm256_fmadd_ps(dot(xs[1]), sv, f1);
+            f2 = _mm256_fmadd_ps(dot(xs[2]), sv, f2);
+            f3 = _mm256_fmadd_ps(dot(xs[3]), sv, f3);
         }
-        acc
+        [
+            hsum256_ps(f0),
+            hsum256_ps(f1),
+            hsum256_ps(f2),
+            hsum256_ps(f3),
+        ]
+    }
+}
+
+/// Horizontal sum of eight f32 lanes — the one cross-lane reduction the
+/// blocked kernels pay, once per row instead of once per group.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum256_ps(v: core::arch::x86_64::__m256) -> f32 {
+    // SAFETY: pure register arithmetic on the caller's vector.
+    unsafe {
+        use core::arch::x86_64::*;
+        let hi = _mm256_extractf128_ps::<1>(v);
+        let s = _mm_add_ps(_mm256_castps256_ps128(v), hi);
+        let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        let s = _mm_add_ss(s, _mm_shuffle_ps::<0x55>(s, s));
+        _mm_cvtss_f32(s)
     }
 }
 
 /// VNNI twin of `dot_q4t_row_1x4_avx2` (see `dpbusd_hsum`).
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+#[target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vl,avx512vnni")]
 unsafe fn dot_q4t_row_1x4_vnni(bytes: &[u8], r: usize, gpr: usize, xs: [&[i8]; 4]) -> [f32; 4] {
     // SAFETY: callers uphold the 18B-tile and xq-length contracts.
     unsafe {
         use core::arch::x86_64::*;
         let lomask = _mm_set1_epi8(0x0F);
         let eight = _mm256_set1_epi8(8);
-        let mut acc = [0f32; 4];
+        // Same shape as the AVX2 twin: accumulate in f32 vectors and pay
+        // one cross-lane reduction per row, not per (group, activation).
+        let mut f0 = _mm256_setzero_ps();
+        let mut f1 = _mm256_setzero_ps();
+        let mut f2 = _mm256_setzero_ps();
+        let mut f3 = _mm256_setzero_ps();
         for gi in 0..gpr {
             let t = bytes.as_ptr().add((r * gpr + gi) * Q4_TILE);
             let s = f16_to_f32(u16::from_le_bytes([*t, *t.add(1)]));
+            let sv = _mm256_set1_ps(s);
             let bb = _mm_loadu_si128(t.add(2) as *const __m128i);
             let lo = _mm_and_si128(bb, lomask);
             let hi = _mm_and_si128(_mm_srli_epi16::<4>(bb), lomask);
@@ -3223,12 +3271,26 @@ unsafe fn dot_q4t_row_1x4_vnni(bytes: &[u8], r: usize, gpr: usize, xs: [&[i8]; 4
                 eight,
             );
             let aw = _mm256_abs_epi8(w);
-            for (k, xq) in xs.iter().enumerate() {
-                let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
-                let d = dpbusd_hsum(aw, _mm256_sign_epi8(x, w));
-                acc[k] += d as f32 * s;
-            }
+            let off = gi * GROUP_SIZE;
+            let dot = |xq: &[i8]| {
+                let x = _mm256_loadu_si256(xq.as_ptr().add(off) as *const __m256i);
+                _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(
+                    _mm256_setzero_si256(),
+                    aw,
+                    _mm256_sign_epi8(x, w),
+                ))
+            };
+            f0 = _mm256_fmadd_ps(dot(xs[0]), sv, f0);
+            f1 = _mm256_fmadd_ps(dot(xs[1]), sv, f1);
+            f2 = _mm256_fmadd_ps(dot(xs[2]), sv, f2);
+            f3 = _mm256_fmadd_ps(dot(xs[3]), sv, f3);
         }
+        let acc = [
+            hsum256_ps(f0),
+            hsum256_ps(f1),
+            hsum256_ps(f2),
+            hsum256_ps(f3),
+        ];
         acc
     }
 }
