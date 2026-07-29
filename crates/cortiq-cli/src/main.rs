@@ -5,6 +5,7 @@ mod gguf;
 mod gptq;
 mod imagepack;
 mod moedefrag;
+mod requant;
 mod npy;
 mod sign;
 mod skill;
@@ -303,6 +304,19 @@ enum Commands {
         /// Output .cmf path
         #[arg(long)]
         output: String,
+    },
+    /// Recode an existing .cmf into a denser layout without the original
+    /// checkpoint. `--quant q4tp` re-expresses q4_tiled/q4_block per-tile
+    /// scales as rungs on a per-row ladder: same 4-bit grid, ~7% fewer bytes.
+    Requant {
+        /// Source .cmf model
+        model: String,
+        /// Output .cmf path
+        #[arg(long)]
+        output: String,
+        /// Target layout (currently: q4tp)
+        #[arg(long, default_value = "q4tp")]
+        quant: String,
     },
     /// Bake a task's expert restriction as a switchable task mask
     /// (spec §5 expert fields): the full expert set stays, `run --task`
@@ -989,6 +1003,11 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Compact { model, output } => moedefrag::cmd_compact(&model, &output),
+        Commands::Requant {
+            model,
+            output,
+            quant,
+        } => requant::cmd_requant(&model, &output, &quant),
         Commands::MoeMask {
             model,
             stats,

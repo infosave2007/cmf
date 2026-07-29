@@ -1227,7 +1227,7 @@ pub fn run_import_gguf(
         Quant::Q4Block => QuantType::Q4Block,
         Quant::F16 => QuantType::F16,
         Quant::Vbit => QuantType::Vbit,
-        Quant::Q4Tiled => QuantType::Q4Block,
+        Quant::Q4Tiled | Quant::Q4TiledP => QuantType::Q4Block,
         Quant::Q1 | Quant::Q1p | Quant::Q1s | Quant::Q1t => QuantType::Vbit,
     };
     let header = CmfHeader {

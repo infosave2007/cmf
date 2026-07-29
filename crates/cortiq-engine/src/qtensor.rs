@@ -12,7 +12,9 @@
 //! Extension point: new dtypes = new match arm here, nothing else moves.
 
 use crate::pool::{Pool, matvec_rows, matvec_rows2};
-use cortiq_core::quant::{GROUP_SIZE, Q1_TILE, Q4_TILE, f16_to_f32};
+use cortiq_core::quant::{
+    GROUP_SIZE, Q1_TILE, Q4_TILE, Q4TP_NIB, f16_to_f32, q4tp_code, q4tp_ladder, q4tp_sections,
+};
 use cortiq_core::{CmfModel, TensorDtype};
 use std::sync::Arc;
 
@@ -206,6 +208,19 @@ impl QTensor {
             // sequential memory stream (measured ×1.66 ARM / ×1.13 AVX2
             // at kernel level over the split layout).
             TensorDtype::Q4Tiled if cols % GROUP_SIZE == 0 => Ok(Self::Mapped {
+                model: model.clone(),
+                idx,
+                dtype: entry.dtype,
+                rows,
+                cols,
+                row_scale: Vec::new(),
+                col_field: Vec::new(),
+                vbit_offsets: Vec::new(),
+                repack: Vec::new(),
+            }),
+            // q4tp (§4.10): nibbles from mmap, scale from the row ladder —
+            // 7.3% less file than q4t at the same 4-bit grid.
+            TensorDtype::Q4TiledP if cols % GROUP_SIZE == 0 => Ok(Self::Mapped {
                 model: model.clone(),
                 idx,
                 dtype: entry.dtype,
@@ -476,6 +491,22 @@ impl QTensor {
                     }
                     return;
                 }
+                if *dtype == TensorDtype::Q4TiledP {
+                    let bytes = self.quant_bytes();
+                    let gpr = cols / GROUP_SIZE;
+                    let v = Q4tpView::new(bytes, self.rows(), cols);
+                    let mut sc = vec![0f32; gpr];
+                    v.scales_into(r, gpr, &mut sc);
+                    for gi in 0..gpr {
+                        let tile = &v.nib[(r * gpr + gi) * Q4TP_NIB..(r * gpr + gi + 1) * Q4TP_NIB];
+                        let s = sc[gi];
+                        for (k, &b) in tile.iter().enumerate() {
+                            dst[gi * GROUP_SIZE + k * 2] = ((b & 0x0F) as f32 - 8.0) * s;
+                            dst[gi * GROUP_SIZE + k * 2 + 1] = (((b >> 4) & 0x0F) as f32 - 8.0) * s;
+                        }
+                    }
+                    return;
+                }
                 if *dtype == TensorDtype::Q4Block {
                     let (packed, scales) = q4_split(self.quant_bytes(), self.rows(), cols);
                     let gpr = cols / GROUP_SIZE;
@@ -736,6 +767,10 @@ impl QTensor {
                     q4t_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
                     return;
                 }
+                if *dtype == TensorDtype::Q4TiledP {
+                    q4tp_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
+                    return;
+                }
                 if *dtype == TensorDtype::Q1 {
                     // GPU route for large q1 matvecs (out_proj / lm_head
                     // class): the CPU q1 kernel is load-port-bound at
@@ -972,6 +1007,10 @@ impl QTensor {
                     q4t_matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
                     return;
                 }
+                if *dtype == TensorDtype::Q4TiledP {
+                    q4tp_matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
+                    return;
+                }
                 if *dtype == TensorDtype::Q1 {
                     q1_matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
                     return;
@@ -1062,6 +1101,10 @@ impl QTensor {
             } => {
                 if *dtype == TensorDtype::Q4Block {
                     q4matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
+                    return;
+                }
+                if *dtype == TensorDtype::Q4TiledP {
+                    q4tp_matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
                     return;
                 }
                 if *dtype == TensorDtype::Q4Tiled {
@@ -1957,6 +2000,45 @@ impl QTensor {
                             let (w, s) = q4t_outlier(g_bytes, r, gpr, j);
                             gv += w * s * xv;
                             let (w, s) = q4t_outlier(u_bytes, r, gpr, j);
+                            uv += w * s * xv;
+                        }
+                        let silu_g = gv / (1.0 + (-gv).exp());
+                        // SAFETY: disjoint row ranges per worker.
+                        unsafe { *out_addr.at(r) = silu_g * uv };
+                    }
+                };
+                dispatch_rows(pool, inter, &run);
+                true
+            }
+            // Q4TiledP gate + Q4TiledP up — the same fused row pass, with
+            // each row's two ladders built once and spent on both streams.
+            (
+                Self::Mapped {
+                    dtype: TensorDtype::Q4TiledP,
+                    ..
+                },
+                Self::Mapped {
+                    dtype: TensorDtype::Q4TiledP,
+                    ..
+                },
+            ) => {
+                let cols = gate.cols();
+                let gpr = cols / GROUP_SIZE;
+                let gv_view = Q4tpView::new(gate.quant_bytes(), inter, cols);
+                let uv_view = Q4tpView::new(up.quant_bytes(), inter, cols);
+                let run = |start: usize, end: usize| {
+                    let (mut gsc, mut usc) = (vec![0f32; gpr], vec![0f32; gpr]);
+                    for r in start..end {
+                        gv_view.scales_into(r, gpr, &mut gsc);
+                        uv_view.scales_into(r, gpr, &mut usc);
+                        let mut gv =
+                            dot_q4tp_row_i8(gv_view.nib, r, gpr, &act.xq, &gsc) * act.sx;
+                        let mut uv =
+                            dot_q4tp_row_i8(uv_view.nib, r, gpr, &act.xq, &usc) * act.sx;
+                        for &(j, xv) in &act.outliers {
+                            let (w, s) = q4tp_outlier(gv_view.nib, r, gpr, j, &gsc);
+                            gv += w * s * xv;
+                            let (w, s) = q4tp_outlier(uv_view.nib, r, gpr, j, &usc);
                             uv += w * s * xv;
                         }
                         let silu_g = gv / (1.0 + (-gv).exp());
@@ -3364,6 +3446,476 @@ fn q4t_row_exact(bytes: &[u8], r: usize, gpr: usize, x: &[f32]) -> f32 {
         acc += ga * s;
     }
     acc
+}
+
+/// Split view of a `q4tp` payload. The three planes are resolved once per
+/// matvec instead of per row — `q4tp_sections` is cheap, but doing it inside
+/// the row loop would put a division on the hot path for nothing.
+struct Q4tpView<'a> {
+    nib: &'a [u8],
+    params: &'a [u8],
+    codes: &'a [u8],
+    stride: usize,
+}
+
+impl<'a> Q4tpView<'a> {
+    fn new(bytes: &'a [u8], rows: usize, cols: usize) -> Self {
+        let (params_off, codes_off, stride) = q4tp_sections(rows, cols);
+        Self {
+            nib: &bytes[..params_off],
+            params: &bytes[params_off..codes_off],
+            codes: &bytes[codes_off..],
+            stride,
+        }
+    }
+
+    /// Expand row `r`'s per-tile scales into `out` (length `gpr`).
+    ///
+    /// Doing this once per row — rather than decoding a 5-bit code inside the
+    /// tile loop — is what makes the format free at runtime. Random access to
+    /// a packed 5-bit field costs a division, two bounds checks and a branch;
+    /// the tile's actual work is two `sdot`s, so per-tile decoding dominated
+    /// the kernel and cost 5x (measured: 1.4 vs 6.9 tok/s on Nanbeige-3B).
+    /// Walking the plane sequentially with a bit accumulator is ~3 ops.
+    #[inline]
+    fn scales_into(&self, r: usize, gpr: usize, out: &mut [f32]) {
+        let tab = q4tp_ladder(self.params, r);
+        let codes = &self.codes[r * self.stride..(r + 1) * self.stride];
+        let (mut acc, mut have, mut bi) = (0u64, 0u32, 0usize);
+        for o in out.iter_mut().take(gpr) {
+            while have < 5 {
+                acc |= (codes[bi] as u64) << have;
+                bi += 1;
+                have += 8;
+            }
+            *o = tab[(acc & 31) as usize];
+            acc >>= 5;
+            have -= 5;
+        }
+    }
+}
+
+#[inline]
+fn dot_q4tp_row_i8(nib: &[u8], r: usize, gpr: usize, xq: &[i8], scales: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return dot_q4tp_row_sdot(nib, r, gpr, xq, scales);
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if vnni_tiles_enabled() {
+            return dot_q4tp_row_vnni(nib, r, gpr, xq, scales);
+        }
+        return dot_q4tp_row_avx2(nib, r, gpr, xq, scales);
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut acc = 0f32;
+        for gi in 0..gpr {
+            let tile = &nib[(r * gpr + gi) * Q4TP_NIB..(r * gpr + gi + 1) * Q4TP_NIB];
+            let s = scales[gi];
+            let mut d = 0i32;
+            for (k, &b) in tile.iter().enumerate() {
+                d += ((b & 0x0F) as i32 - 8) * xq[gi * GROUP_SIZE + k * 2] as i32
+                    + (((b >> 4) & 0x0F) as i32 - 8) * xq[gi * GROUP_SIZE + k * 2 + 1] as i32;
+            }
+            acc += d as f32 * s;
+        }
+        acc
+    }
+}
+
+/// q4tp twin of `dot_q4t_row_sdot`: identical nibble math, but the tile
+/// stride is 16 B (no inline scale) and the scale is a ladder lookup.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn dot_q4tp_row_sdot(
+    nib: &[u8],
+    r: usize,
+    gpr: usize,
+    xq: &[i8],
+    scales: &[f32],
+) -> f32 {
+    // SAFETY: callers uphold slice-length contracts (16B tile per group,
+    // xq.len() == gpr·GROUP_SIZE, codes covering gpr 5-bit fields).
+    unsafe {
+        use core::arch::aarch64::*;
+        use core::arch::asm;
+        let lomask = vdupq_n_u8(0x0F);
+        let eight = vdupq_n_s8(8);
+        let mut acc = 0f32;
+        for gi in 0..gpr {
+            let t = nib.as_ptr().add((r * gpr + gi) * Q4TP_NIB);
+            let s = *scales.get_unchecked(gi);
+            let b = vld1q_u8(t);
+            let lo = vandq_u8(b, lomask);
+            let hi = vshrq_n_u8::<4>(b);
+            let e0 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(lo, hi)), eight);
+            let e1 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(lo, hi)), eight);
+            let x0 = vld1q_s8(xq.as_ptr().add(gi * GROUP_SIZE));
+            let x1 = vld1q_s8(xq.as_ptr().add(gi * GROUP_SIZE + 16));
+            let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+            asm!(
+                "sdot {a0:v}.4s, {e0:v}.16b, {x0:v}.16b",
+                "sdot {a1:v}.4s, {e1:v}.16b, {x1:v}.16b",
+                a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                e0 = in(vreg) e0, x0 = in(vreg) x0, e1 = in(vreg) e1, x1 = in(vreg) x1,
+                options(pure, nomem, nostack),
+            );
+            acc += vaddvq_s32(vaddq_s32(a0, a1)) as f32 * s;
+        }
+        acc
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q4tp_row_avx2(
+    nib: &[u8],
+    r: usize,
+    gpr: usize,
+    xq: &[i8],
+    scales: &[f32],
+) -> f32 {
+    // SAFETY: see dot_q4tp_row_sdot.
+    unsafe {
+        use core::arch::x86_64::*;
+        let lomask = _mm_set1_epi8(0x0F);
+        let eight = _mm256_set1_epi8(8);
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = 0f32;
+        for gi in 0..gpr {
+            let t = nib.as_ptr().add((r * gpr + gi) * Q4TP_NIB);
+            let s = *scales.get_unchecked(gi);
+            let b = _mm_loadu_si128(t as *const __m128i);
+            let lo = _mm_and_si128(b, lomask);
+            let hi = _mm_and_si128(_mm_srli_epi16::<4>(b), lomask);
+            let w = _mm256_sub_epi8(
+                _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi)),
+                eight,
+            );
+            let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+            let p16 = _mm256_maddubs_epi16(_mm256_abs_epi8(w), _mm256_sign_epi8(x, w));
+            let d = _mm256_madd_epi16(p16, ones);
+            let hi128 = _mm256_extracti128_si256::<1>(d);
+            let s128 = _mm_add_epi32(_mm256_castsi256_si128(d), hi128);
+            let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
+            let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
+            acc += _mm_cvtsi128_si32(s32) as f32 * s;
+        }
+        acc
+    }
+}
+
+/// VNNI twin of `dot_q4tp_row_avx2` (see `dot_q4t_row_vnni` for why the
+/// 256-bit VL encoding is the one to use here).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn dot_q4tp_row_vnni(
+    nib: &[u8],
+    r: usize,
+    gpr: usize,
+    xq: &[i8],
+    scales: &[f32],
+) -> f32 {
+    // SAFETY: see dot_q4tp_row_sdot.
+    unsafe {
+        use core::arch::x86_64::*;
+        let lomask = _mm_set1_epi8(0x0F);
+        let eight = _mm256_set1_epi8(8);
+        let mut acc = 0f32;
+        for gi in 0..gpr {
+            let t = nib.as_ptr().add((r * gpr + gi) * Q4TP_NIB);
+            let s = *scales.get_unchecked(gi);
+            let b = _mm_loadu_si128(t as *const __m128i);
+            let lo = _mm_and_si128(b, lomask);
+            let hi = _mm_and_si128(_mm_srli_epi16::<4>(b), lomask);
+            let w = _mm256_sub_epi8(
+                _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi)),
+                eight,
+            );
+            let x = _mm256_loadu_si256(xq.as_ptr().add(gi * GROUP_SIZE) as *const __m256i);
+            acc += dpbusd_hsum(_mm256_abs_epi8(w), _mm256_sign_epi8(x, w)) as f32 * s;
+        }
+        acc
+    }
+}
+
+/// Exact scalar q4tp row — the `CMF_SDOT=0` contract, same pairwise
+/// accumulation shape as `q4t_row_exact`.
+#[inline]
+fn q4tp_row_exact(nib: &[u8], r: usize, gpr: usize, x: &[f32], scales: &[f32]) -> f32 {
+    let mut acc = 0f32;
+    for gi in 0..gpr {
+        let tile = &nib[(r * gpr + gi) * Q4TP_NIB..(r * gpr + gi + 1) * Q4TP_NIB];
+        let s = scales[gi];
+        let xg = &x[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE];
+        let mut ga = 0f32;
+        for (k, &b) in tile.iter().enumerate() {
+            ga += ((b & 0x0F) as f32 - 8.0) * xg[k * 2]
+                + (((b >> 4) & 0x0F) as f32 - 8.0) * xg[k * 2 + 1];
+        }
+        acc += ga * s;
+    }
+    acc
+}
+
+/// Single weight of a q4tp tensor — the a8w8 outlier path, which restores
+/// activation outliers at full precision after the int8 pass.
+#[inline]
+fn q4tp_outlier(nib: &[u8], r: usize, gpr: usize, j: usize, scales: &[f32]) -> (f32, f32) {
+    let (gi, k) = (j / GROUP_SIZE, j % GROUP_SIZE);
+    let byte = nib[(r * gpr + gi) * Q4TP_NIB + k / 2];
+    let n = if k & 1 == 0 { byte & 0x0F } else { byte >> 4 };
+    ((n as i32 - 8) as f32, scales[gi])
+}
+
+/// Fused q4tp matvec (dispatch mirrors `q4t_matvec`).
+fn q4tp_matvec(
+    bytes: &[u8],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    debug_assert_eq!(out.len(), rows);
+    let gpr = cols / GROUP_SIZE;
+    let v = Q4tpView::new(bytes, rows, cols);
+    let out_addr = SendMut(out.as_mut_ptr());
+    if a8w8_enabled() {
+        let act = split_act(x);
+        let run = |start: usize, end: usize| {
+            // One scratch row of scales per worker, reused across its rows.
+            let mut sc = vec![0f32; gpr];
+            for r in start..end {
+                v.scales_into(r, gpr, &mut sc);
+                let mut acc = dot_q4tp_row_i8(v.nib, r, gpr, &act.xq, &sc) * act.sx;
+                for &(j, xv) in &act.outliers {
+                    let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
+                    acc += w * s * xv;
+                }
+                // SAFETY: disjoint row ranges per worker.
+                unsafe { *out_addr.at(r) = acc };
+            }
+        };
+        dispatch_rows(pool, rows, &run);
+        return;
+    }
+    let run = |start: usize, end: usize| {
+        let mut sc = vec![0f32; gpr];
+        for r in start..end {
+            v.scales_into(r, gpr, &mut sc);
+            // SAFETY: disjoint row ranges per worker.
+            unsafe { *out_addr.at(r) = q4tp_row_exact(v.nib, r, gpr, x, &sc) };
+        }
+    };
+    dispatch_rows(pool, rows, &run);
+}
+
+/// Fused two-input q4tp matvec — the SwiGLU gate/up pair. Weights and the
+/// row ladder are read once and spent on both activation streams.
+#[allow(clippy::too_many_arguments)]
+fn q4tp_matvec2(
+    bytes: &[u8],
+    x1: &[f32],
+    x2: &[f32],
+    rows: usize,
+    cols: usize,
+    o1: &mut [f32],
+    o2: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    let gpr = cols / GROUP_SIZE;
+    let v = Q4tpView::new(bytes, rows, cols);
+    let (p1, p2) = (SendMut(o1.as_mut_ptr()), SendMut(o2.as_mut_ptr()));
+    let run = |start: usize, end: usize| {
+        let mut sc = vec![0f32; gpr];
+        for r in start..end {
+            v.scales_into(r, gpr, &mut sc);
+            // SAFETY: disjoint row ranges per worker.
+            unsafe {
+                *p1.at(r) = q4tp_row_exact(v.nib, r, gpr, x1, &sc);
+                *p2.at(r) = q4tp_row_exact(v.nib, r, gpr, x2, &sc);
+            }
+        }
+    };
+    dispatch_rows(pool, rows, &run);
+}
+
+/// Four batch columns against one q4tp row: the tile is unpacked ONCE and
+/// spent on four activation streams, which is where a prefill batch stops
+/// being weight-bandwidth-bound. Twin of `dot_q4t_row_1x4_sdot`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn dot_q4tp_row_1x4_sdot(
+    nib: &[u8],
+    r: usize,
+    gpr: usize,
+    xs: [&[i8]; 4],
+    scales: &[f32],
+) -> [f32; 4] {
+    // SAFETY: see dot_q4tp_row_sdot; every xs[k] is gpr·GROUP_SIZE long.
+    unsafe {
+        use core::arch::aarch64::*;
+        use core::arch::asm;
+        let lomask = vdupq_n_u8(0x0F);
+        let eight = vdupq_n_s8(8);
+        // Named accumulators, NOT an array indexed by a loop variable: the
+        // latter does not stay in registers (the same defect cost 2x in the
+        // AVX2 q4t kernel and again in WGSL).
+        let (mut f0, mut f1, mut f2, mut f3) = (0f32, 0f32, 0f32, 0f32);
+        for gi in 0..gpr {
+            let t = nib.as_ptr().add((r * gpr + gi) * Q4TP_NIB);
+            let s = *scales.get_unchecked(gi);
+            let bb = vld1q_u8(t);
+            let lo = vandq_u8(bb, lomask);
+            let hi = vshrq_n_u8::<4>(bb);
+            let e0 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(lo, hi)), eight);
+            let e1 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(lo, hi)), eight);
+            let mut d = [0f32; 4];
+            for (k, dk) in d.iter_mut().enumerate() {
+                let x0 = vld1q_s8(xs[k].as_ptr().add(gi * GROUP_SIZE));
+                let x1 = vld1q_s8(xs[k].as_ptr().add(gi * GROUP_SIZE + 16));
+                let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+                asm!(
+                    "sdot {a0:v}.4s, {e0:v}.16b, {x0:v}.16b",
+                    "sdot {a1:v}.4s, {e1:v}.16b, {x1:v}.16b",
+                    a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                    e0 = in(vreg) e0, x0 = in(vreg) x0, e1 = in(vreg) e1, x1 = in(vreg) x1,
+                    options(pure, nomem, nostack),
+                );
+                *dk = vaddvq_s32(vaddq_s32(a0, a1)) as f32 * s;
+            }
+            f0 += d[0];
+            f1 += d[1];
+            f2 += d[2];
+            f3 += d[3];
+        }
+        [f0, f1, f2, f3]
+    }
+}
+
+/// Fused q4tp matmat — the same three arms `q4t_matmat` has. Shipping only
+/// the scalar one made Nanbeige-3B decode at 1.2 tok/s against q4t's 5.9:
+/// the format was fine, the missing arms were the whole regression.
+fn q4tp_matmat(
+    bytes: &[u8],
+    xs_all: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    debug_assert_eq!(out.len(), b * rows);
+    let gpr = cols / GROUP_SIZE;
+    let v = Q4tpView::new(bytes, rows, cols);
+
+    // Wide batches ride the AMX through a dequant-tile sgemm, as in q4t.
+    #[cfg(target_os = "macos")]
+    if b >= 8 && rows * cols >= 500_000 && accel_gemm_enabled() {
+        dequant_matmat_accel(
+            &|r, dst| {
+                let mut sc = [0f32; 32];
+                let mut scv;
+                let s: &[f32] = if gpr <= 32 {
+                    v.scales_into(r, gpr, &mut sc);
+                    &sc[..gpr]
+                } else {
+                    scv = vec![0f32; gpr];
+                    v.scales_into(r, gpr, &mut scv);
+                    &scv
+                };
+                for gi in 0..gpr {
+                    let tile = &v.nib[(r * gpr + gi) * Q4TP_NIB..(r * gpr + gi + 1) * Q4TP_NIB];
+                    for (k, &bb) in tile.iter().enumerate() {
+                        dst[gi * GROUP_SIZE + k * 2] = ((bb & 0x0F) as f32 - 8.0) * s[gi];
+                        dst[gi * GROUP_SIZE + k * 2 + 1] = (((bb >> 4) & 0x0F) as f32 - 8.0) * s[gi];
+                    }
+                }
+            },
+            xs_all,
+            b,
+            rows,
+            cols,
+            out,
+            pool,
+        );
+        return;
+    }
+
+    let out_addr = SendMut(out.as_mut_ptr());
+    if a8w8_enabled() {
+        let acts: Vec<SplitAct> = (0..b)
+            .map(|bi| split_act(&xs_all[bi * cols..(bi + 1) * cols]))
+            .collect();
+        let acts = &acts;
+        #[cfg(target_arch = "aarch64")]
+        let blocked_ok = sdot_enabled()
+            && std::env::var("CMF_X86_BLOCKED")
+                .map(|val| val != "0")
+                .unwrap_or(true);
+        #[cfg(not(target_arch = "aarch64"))]
+        let blocked_ok = false;
+        let run = |start: usize, end: usize| {
+            let mut sc = vec![0f32; gpr];
+            for r in start..end {
+                v.scales_into(r, gpr, &mut sc);
+                let mut bi = 0usize;
+                #[cfg(target_arch = "aarch64")]
+                if blocked_ok {
+                    while bi + 4 <= acts.len() {
+                        let xs = [
+                            acts[bi].xq.as_slice(),
+                            acts[bi + 1].xq.as_slice(),
+                            acts[bi + 2].xq.as_slice(),
+                            acts[bi + 3].xq.as_slice(),
+                        ];
+                        let d = unsafe { dot_q4tp_row_1x4_sdot(v.nib, r, gpr, xs, &sc) };
+                        for k in 0..4 {
+                            let act = &acts[bi + k];
+                            let mut acc = d[k] * act.sx;
+                            for &(j, xv) in &act.outliers {
+                                let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
+                                acc += w * s * xv;
+                            }
+                            // SAFETY: disjoint (bi, r) cells per worker.
+                            unsafe { *out_addr.at((bi + k) * rows + r) = acc };
+                        }
+                        bi += 4;
+                    }
+                }
+                let _ = blocked_ok;
+                while bi < acts.len() {
+                    let act = &acts[bi];
+                    let mut acc = dot_q4tp_row_i8(v.nib, r, gpr, &act.xq, &sc) * act.sx;
+                    for &(j, xv) in &act.outliers {
+                        let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
+                        acc += w * s * xv;
+                    }
+                    // SAFETY: disjoint (bi, r) cells per worker range.
+                    unsafe { *out_addr.at(bi * rows + r) = acc };
+                    bi += 1;
+                }
+            }
+        };
+        dispatch_rows(pool, rows, &run);
+        return;
+    }
+
+    let run = |start: usize, end: usize| {
+        let mut sc = vec![0f32; gpr];
+        for r in start..end {
+            v.scales_into(r, gpr, &mut sc);
+            for bi in 0..b {
+                let x = &xs_all[bi * cols..(bi + 1) * cols];
+                // SAFETY: disjoint (bi, r) cells per worker range.
+                unsafe { *out_addr.at(bi * rows + r) = q4tp_row_exact(v.nib, r, gpr, x, &sc) };
+            }
+        }
+    };
+    dispatch_rows(pool, rows, &run);
 }
 
 /// Fused q4_tiled matvec (dispatch mirrors `q4matvec`).
@@ -8224,6 +8776,223 @@ mod tests {
     /// The wide-batch Accelerate arm of q4t_matmat vs a brute-force
     /// f32 dequant matmul: both are f32 GEMMs, so only reduction
     /// order differs — tight tolerance.
+    /// A synthetic q4tp payload: random nibbles plus a per-row ladder whose
+    /// span varies row to row, so the codes actually exercise the full 0..31
+    /// range rather than clustering on one rung.
+    fn synth_q4tp(rows: usize, cols: usize) -> Vec<u8> {
+        use cortiq_core::quant::{f32_to_f16, q4tp_code_stride, q4tp_put_code};
+        let gpr = cols / GROUP_SIZE;
+        let stride = q4tp_code_stride(gpr);
+        let (params_off, codes_off, _) = q4tp_sections(rows, cols);
+        let mut b = vec![0u8; codes_off + rows * stride];
+        for r in 0..rows {
+            for g in 0..gpr {
+                let t = (r * gpr + g) * Q4TP_NIB;
+                for k in 0..16 {
+                    b[t + k] = ((r * 31 + g * 7 + k * 13) % 251) as u8;
+                }
+            }
+            let lo = -6.0 - 0.03 * (r % 17) as f32;
+            let step = 0.01 + 0.004 * (r % 11) as f32;
+            let p = params_off + r * 4;
+            b[p..p + 2].copy_from_slice(&f32_to_f16(lo).to_le_bytes());
+            b[p + 2..p + 4].copy_from_slice(&f32_to_f16(step).to_le_bytes());
+            let crow = &mut b[codes_off + r * stride..codes_off + (r + 1) * stride];
+            for g in 0..gpr {
+                q4tp_put_code(crow, g, (r * 5 + g * 3) % 32);
+            }
+        }
+        b
+    }
+
+    /// The same weights re-expressed as q4_tiled, so the proven kernel can
+    /// be the reference: each tile stores the ladder scale its code selects.
+    /// Only the f16 rounding of that scale separates the two payloads.
+    fn q4tp_as_q4t(bytes: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+        let gpr = cols / GROUP_SIZE;
+        let v = Q4tpView::new(bytes, rows, cols);
+        let mut out = vec![0u8; rows * gpr * Q4_TILE];
+        let mut sc = vec![0f32; gpr];
+        for r in 0..rows {
+            v.scales_into(r, gpr, &mut sc);
+            for g in 0..gpr {
+                let t = (r * gpr + g) * Q4_TILE;
+                let s = sc[g];
+                out[t..t + 2].copy_from_slice(&cortiq_core::quant::f32_to_f16(s).to_le_bytes());
+                let src = (r * gpr + g) * Q4TP_NIB;
+                out[t + 2..t + Q4_TILE].copy_from_slice(&v.nib[src..src + Q4TP_NIB]);
+            }
+        }
+        out
+    }
+
+    /// The exact (`CMF_SDOT=0`) path must reproduce `dequant_q4tp` to f32
+    /// rounding — that scalar routine is the format's definition, and the
+    /// kernels re-derive the scale from the ladder independently. Call the
+    /// row kernel directly: `matmat` picks the int8 arm when a8w8 is on,
+    /// so routing through it would test the other path by accident.
+    #[test]
+    fn q4tp_exact_path_matches_dequant_reference() {
+        let (rows, cols) = (256usize, 512usize);
+        let gpr = cols / GROUP_SIZE;
+        let bytes = synth_q4tp(rows, cols);
+        let mut w = vec![0f32; rows * cols];
+        cortiq_core::quant::dequant_q4tp(&bytes, rows, cols, &mut w);
+
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5)
+            .collect();
+        let v = Q4tpView::new(&bytes, rows, cols);
+        let mut sc = vec![0f32; gpr];
+        for r in 0..rows {
+            v.scales_into(r, gpr, &mut sc);
+            let got = q4tp_row_exact(v.nib, r, gpr, &x, &sc);
+            let want: f32 = (0..cols).map(|c| w[r * cols + c] * x[c]).sum();
+            // These dot products cancel down to ~1e-3 from terms of ~5e-2, so
+            // the meaningful yardstick is the summed magnitude, not the result:
+            // against the result any reordering of a 512-term f32 sum "fails".
+            let mag: f32 = (0..cols).map(|c| (w[r * cols + c] * x[c]).abs()).sum();
+            assert!(
+                (got - want).abs() <= 1e-5 * mag,
+                "row {r}: kernel {got} vs dequant {want}"
+            );
+        }
+    }
+
+    /// The int8 (a8w8) path can't be checked against an f32 reference — the
+    /// activation quantization dominates. Check it against the q4t kernel it
+    /// was ported from instead, on payloads holding the same weights: that
+    /// isolates exactly what the port could break (16 B stride, ladder
+    /// lookup, nibble unpack) from what it deliberately shares.
+    #[test]
+    fn q4tp_matvec_matches_the_q4t_kernel_it_was_ported_from() {
+        let (rows, cols) = (256usize, 512usize);
+        let bytes = synth_q4tp(rows, cols);
+        let twin = q4tp_as_q4t(&bytes, rows, cols);
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i * 13 + 7) % 97) as f32 / 97.0 - 0.5)
+            .collect();
+
+        let mut got = vec![0f32; rows];
+        q4tp_matvec(&bytes, &x, rows, cols, &mut got, None);
+        let mut want = vec![0f32; rows];
+        q4t_matvec(&twin, &x, rows, cols, &mut want, None);
+
+        // Scale is f16 in the twin and f32 here, so allow that rounding on
+        // top of the summed magnitude (same cancellation argument as above).
+        let mut w = vec![0f32; rows * cols];
+        cortiq_core::quant::dequant_q4tp(&bytes, rows, cols, &mut w);
+        for r in 0..rows {
+            let mag: f32 = (0..cols).map(|c| (w[r * cols + c] * x[c]).abs()).sum();
+            assert!(
+                (got[r] - want[r]).abs() <= 1e-3 * mag,
+                "row {r}: q4tp {} vs q4t {}",
+                got[r],
+                want[r]
+            );
+        }
+    }
+
+    /// `matmat` carries three arms (Accelerate, blocked int8 1x4, scalar).
+    /// Batch 5 crosses the blocked kernel's stride, so this exercises the
+    /// 1x4 path AND its scalar tail in one run — the blocked kernel is new
+    /// code and its four accumulators are exactly what tends to go wrong.
+    #[test]
+    fn q4tp_matmat_matches_the_q4t_kernel_it_was_ported_from() {
+        let (rows, cols, b) = (256usize, 512usize, 5usize);
+        let bytes = synth_q4tp(rows, cols);
+        let twin = q4tp_as_q4t(&bytes, rows, cols);
+        let xs: Vec<f32> = (0..b * cols)
+            .map(|i| ((i * 29 + 11) % 89) as f32 / 89.0 - 0.5)
+            .collect();
+
+        let mut got = vec![0f32; b * rows];
+        q4tp_matmat(&bytes, &xs, b, rows, cols, &mut got, None);
+        let mut want = vec![0f32; b * rows];
+        q4t_matmat(&twin, &xs, b, rows, cols, &mut want, None);
+
+        let mut w = vec![0f32; rows * cols];
+        cortiq_core::quant::dequant_q4tp(&bytes, rows, cols, &mut w);
+        for t in 0..b {
+            for r in 0..rows {
+                let mag: f32 = (0..cols)
+                    .map(|c| (w[r * cols + c] * xs[t * cols + c]).abs())
+                    .sum();
+                let (g, wa) = (got[t * rows + r], want[t * rows + r]);
+                assert!(
+                    (g - wa).abs() <= 1e-3 * mag,
+                    "batch {t} row {r}: q4tp {g} vs q4t {wa}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q4tp_matvec2_matches_the_single_stream_kernel() {
+        let (rows, cols) = (128usize, 256usize);
+        let gpr = cols / GROUP_SIZE;
+        let bytes = synth_q4tp(rows, cols);
+        let xs: Vec<f32> = (0..2 * cols)
+            .map(|i| ((i * 29 + 11) % 89) as f32 / 89.0 - 0.5)
+            .collect();
+
+        let (mut o1, mut o2) = (vec![0f32; rows], vec![0f32; rows]);
+        q4tp_matvec2(
+            &bytes,
+            &xs[..cols],
+            &xs[cols..],
+            rows,
+            cols,
+            &mut o1,
+            &mut o2,
+            None,
+        );
+
+        // matvec2 takes the exact path for both streams, so the single-row
+        // kernel is an exact reference — no tolerance for path differences.
+        let v = Q4tpView::new(&bytes, rows, cols);
+        let mut sc = vec![0f32; gpr];
+        for r in 0..rows {
+            v.scales_into(r, gpr, &mut sc);
+            assert_eq!(o1[r], q4tp_row_exact(v.nib, r, gpr, &xs[..cols], &sc));
+            assert_eq!(o2[r], q4tp_row_exact(v.nib, r, gpr, &xs[cols..], &sc));
+        }
+    }
+
+    /// q4tp must not COST speed — it exists to save bytes, and a format that
+    /// trades 7% of a file for a slower model is a bad trade. This guard is
+    /// here because correctness tests happily passed while `q4tp_matmat` was
+    /// missing its int8 and Accelerate arms and the model ran 5x slower.
+    /// Measured on M-series: 0.97-1.04x, i.e. parity (16 B tiles are better
+    /// aligned than q4t's 18 B, which pays for the scale indirection).
+    #[test]
+    fn q4tp_matvec_keeps_pace_with_q4t() {
+        let (rows, cols) = (4096usize, 3072usize);
+        let bytes = synth_q4tp(rows, cols);
+        let twin = q4tp_as_q4t(&bytes, rows, cols);
+        let x: Vec<f32> = (0..cols).map(|i| (i % 97) as f32 / 97.0 - 0.5).collect();
+        let mut o = vec![0f32; rows];
+        let n = 12;
+        let mut best = (f64::MAX, f64::MAX);
+        // Interleaved A/B, minimum statistic: this machine throttles, and a
+        // mean over a thermal ramp reliably indicts whichever ran second.
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                q4t_matvec(&twin, &x, rows, cols, &mut o, None);
+            }
+            best.0 = best.0.min(t0.elapsed().as_secs_f64());
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                q4tp_matvec(&bytes, &x, rows, cols, &mut o, None);
+            }
+            best.1 = best.1.min(t0.elapsed().as_secs_f64());
+        }
+        let ratio = best.1 / best.0;
+        println!("q4t {:.3} ms | q4tp {:.3} ms | {ratio:.2}x", best.0 * 1e3 / n as f64, best.1 * 1e3 / n as f64);
+        assert!(ratio < 2.0, "q4tp matvec {ratio:.2}x slower than q4t");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn q4t_matmat_accel_matches_dequant_reference() {

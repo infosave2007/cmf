@@ -343,6 +343,93 @@ pub fn dequant_q4_tiled(bytes: &[u8], dst: &mut [f32]) {
     }
 }
 
+/// Nibble bytes per `q4tp` group tile — the scale lives in a side plane,
+/// so the nibble stream is 16-byte strided (better aligned than q4t's 18).
+pub const Q4TP_NIB: usize = 16;
+
+/// Highest `q4tp` scale code: 5 bits, so the ladder has 32 rungs.
+pub const Q4TP_LMAX: usize = 31;
+
+/// Bytes of 5-bit codes per row. Rounded up to whole bytes so every row
+/// decodes independently — worth the ≤7 wasted bits for parallel row work.
+pub const fn q4tp_code_stride(gpr: usize) -> usize {
+    (gpr * 5).div_ceil(8)
+}
+
+/// Byte offsets inside a `q4tp` payload: `(params_off, codes_off, code_stride)`.
+/// Layout is `[nibbles][row params: (f16 lo, f16 step)][codes]`.
+pub fn q4tp_sections(rows: usize, cols: usize) -> (usize, usize, usize) {
+    let gpr = cols / GROUP_SIZE;
+    let nib = rows * gpr * Q4TP_NIB;
+    (nib, nib + rows * 4, q4tp_code_stride(gpr))
+}
+
+/// Read tile `g`'s 5-bit scale code out of one row's code slice.
+#[inline]
+pub fn q4tp_code(codes: &[u8], g: usize) -> usize {
+    let bit = g * 5;
+    let (b, sh) = (bit / 8, bit % 8);
+    let lo = codes[b] as u16;
+    // A 5-bit field starting past bit 3 spills into the next byte; the
+    // stride always has that byte when it does, but stay total anyway.
+    let hi = if sh > 3 {
+        codes.get(b + 1).copied().unwrap_or(0) as u16
+    } else {
+        0
+    };
+    (((lo | (hi << 8)) >> sh) & 0x1F) as usize
+}
+
+/// Write tile `g`'s 5-bit code (encoder side; assumes the slice starts zeroed).
+#[inline]
+pub fn q4tp_put_code(codes: &mut [u8], g: usize, code: usize) {
+    let bit = g * 5;
+    let (b, sh) = (bit / 8, bit % 8);
+    let v = (code & 0x1F) as u16;
+    codes[b] |= (v << sh) as u8;
+    if sh > 3 {
+        codes[b + 1] |= (v >> (8 - sh)) as u8;
+    }
+}
+
+/// Expand row `r`'s 32-rung scale ladder: `s[c] = 2^(lo + c·step)`,
+/// evaluated as one `exp2` plus 31 multiplies so that every consumer —
+/// scalar dequant, SIMD kernel, GPU shader — lands on the SAME f32 bits.
+/// The geometric form is the format's definition, not an optimization.
+#[inline]
+pub fn q4tp_ladder(params: &[u8], r: usize) -> [f32; 32] {
+    let lo = f16_to_f32(u16::from_le_bytes([params[r * 4], params[r * 4 + 1]]));
+    let st = f16_to_f32(u16::from_le_bytes([params[r * 4 + 2], params[r * 4 + 3]]));
+    let ratio = st.exp2();
+    let mut t = [0f32; 32];
+    t[0] = lo.exp2();
+    for c in 1..32 {
+        t[c] = t[c - 1] * ratio;
+    }
+    t
+}
+
+/// Dequantize a full `q4tp` tensor. Nibbles are read exactly as `q4_tiled`
+/// reads them; only where the scale comes from differs.
+pub fn dequant_q4tp(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) {
+    let gpr = cols / GROUP_SIZE;
+    let (params_off, codes_off, stride) = q4tp_sections(rows, cols);
+    let params = &bytes[params_off..params_off + rows * 4];
+    for r in 0..rows {
+        let tab = q4tp_ladder(params, r);
+        let codes = &bytes[codes_off + r * stride..codes_off + (r + 1) * stride];
+        for g in 0..gpr {
+            let s = tab[q4tp_code(codes, g)];
+            let tile = &bytes[(r * gpr + g) * Q4TP_NIB..(r * gpr + g + 1) * Q4TP_NIB];
+            let base = r * cols + g * GROUP_SIZE;
+            for (k, &byte) in tile.iter().enumerate() {
+                dst[base + k * 2] = ((byte & 0x0F) as f32 - 8.0) * s;
+                dst[base + k * 2 + 1] = (((byte >> 4) & 0x0F) as f32 - 8.0) * s;
+            }
+        }
+    }
+}
+
 /// Byte layout of a `vbit_ro` payload (roadmap §4.2):
 /// `[u8 bits: rows][f16 scales: rows·cols/32][u32 row_offsets: rows+1]
 ///  [bit-packed rows]` — offsets are relative to the packed area, so
@@ -434,6 +521,22 @@ pub fn expected_nbytes(dtype: TensorDtype, shape: &[usize]) -> Option<usize> {
             // Interleaved tiles: [f16 scale][4B bits] per 32-group.
             n.div_ceil(GROUP_SIZE).checked_mul(Q1_TILE)
         }
+        TensorDtype::Q4TiledP => {
+            // [nibbles][row params][row-aligned 5-bit codes] — needs the
+            // row count, so 2-D only (the encoder emits nothing else).
+            if shape.len() != 2 {
+                return None;
+            }
+            let (rows, cols) = (shape[0], shape[1]);
+            if cols % GROUP_SIZE != 0 {
+                return None;
+            }
+            let gpr = cols / GROUP_SIZE;
+            rows.checked_mul(gpr)?
+                .checked_mul(Q4TP_NIB)?
+                .checked_add(rows.checked_mul(4)?)?
+                .checked_add(rows.checked_mul(q4tp_code_stride(gpr))?)
+        }
         TensorDtype::Q8_2f => {
             let out = *shape.first()?;
             let inn = n / out.max(1);
@@ -453,6 +556,7 @@ fn has_fixed_payload_size(dtype: TensorDtype) -> bool {
             | TensorDtype::Q8Row
             | TensorDtype::Q4Block
             | TensorDtype::Q4Tiled
+            | TensorDtype::Q4TiledP
             | TensorDtype::Q1
             | TensorDtype::Q8_2f
     )
@@ -466,6 +570,19 @@ fn has_fixed_payload_size(dtype: TensorDtype) -> bool {
 /// on the per-row bit widths stored in the payload itself — the exact
 /// length is computed from the (validated) width header.
 pub fn validate_payload(dtype: TensorDtype, shape: &[usize], bytes: &[u8]) -> Result<(), String> {
+    if dtype == TensorDtype::Q4TiledP {
+        // Say WHY the shape is wrong; the generic length check below cannot,
+        // since expected_nbytes has to fold both causes into None.
+        if shape.len() != 2 {
+            return Err(format!("q4tp tensor must be 2-D, got {shape:?}"));
+        }
+        if shape[1] == 0 || shape[1] % GROUP_SIZE != 0 {
+            return Err(format!(
+                "q4tp cols {} not a positive multiple of {GROUP_SIZE}",
+                shape[1]
+            ));
+        }
+    }
     if dtype == TensorDtype::VbitRo {
         if shape.len() != 2 {
             return Err(format!("vbit_ro tensor must be 2-D, got {shape:?}"));
@@ -597,6 +714,12 @@ pub fn dequant_tensor(entry: &TensorEntry, bytes: &[u8], dst: &mut [f32]) -> Res
         }
         TensorDtype::Q4Block => dequant_q4_block(bytes, dst),
         TensorDtype::Q4Tiled => dequant_q4_tiled(bytes, dst),
+        TensorDtype::Q4TiledP => {
+            if entry.shape.len() != 2 {
+                return Err(format!("q4tp tensor '{}' must be 2-D", entry.name));
+            }
+            dequant_q4tp(bytes, entry.shape[0], entry.shape[1], dst);
+        }
         TensorDtype::Q1 => dequant_q1(bytes, dst),
         TensorDtype::Q1S => dequant_q1s(bytes, dst),
         TensorDtype::Q1T => {
@@ -643,6 +766,9 @@ pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
         TensorDtype::Q4Block | TensorDtype::Q4Col | TensorDtype::Mix84 | TensorDtype::Q4Tiled => {
             0.5625
         }
+        // 16 B nibbles + 5 bits of scale per 32 weights; the 4 B/row of
+        // ladder params are shape-dependent and not counted here.
+        TensorDtype::Q4TiledP => 0.519_531_25,
         TensorDtype::Vbit | TensorDtype::VbitRo => 0.5,
         TensorDtype::Q1 => 0.1875, // 6 bytes per 32 weights
         // q1 base + a small sparse f16 overlay (informational; the true

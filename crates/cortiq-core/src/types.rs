@@ -60,6 +60,35 @@ pub enum TensorDtype {
     /// near-zero weights exactly is the decisive PTQ win over binary. Variable
     /// length.
     Q1T = 14,
+    /// q4 tiled with PREDICTED scales: the same nibbles as `Q4Tiled`, but
+    /// a tile's scale is a 5-bit code into a per-row geometric ladder
+    /// instead of a standalone f16 — 4.17 bits/weight against 4.50, i.e.
+    /// 7.3% off every q4t tensor.
+    ///
+    /// `[nibbles: rows·gpr·16][row params: rows × (f16 lo, f16 step)]
+    ///  [codes: rows × ceil(gpr·5/8), 5-bit LSB-first, row-aligned]`
+    ///
+    /// Scale of tile `g` in row `r` is `2^(lo[r] + code·step[r])`, so a
+    /// kernel expands one row's 32-entry ladder once (a single exp2 and
+    /// 31 multiplies) and then reads scales by table lookup. `lo`/`step`
+    /// come from the row's exact min/max log-scale, so no code is ever out
+    /// of range and the format needs no escape hatch.
+    ///
+    /// Quantizing the SAME fp32 weights both ways, q4tp's error against the
+    /// source is 9.71% where q4t's is 9.71% — a 0.1% relative increase at
+    /// the median within-row scale spread measured on KAT-Coder-V2.5 (1.27
+    /// in log2), 0.3% at its 90th percentile, 0.8% past the tail. A coarser
+    /// scale barely matters because the nibbles simply re-round against it;
+    /// the 4-bit grid dominates the error either way. (Comparing q4tp to
+    /// q4t's OUTPUT instead reads ~1.1% RMS, but that measures the distance
+    /// between two representations, not a loss of accuracy.)
+    ///
+    /// A per-tensor Lloyd codebook was measured and rejected (0.0576% vs
+    /// 0.0591% NMSE at 4 bits): within a row the log-scales are close to
+    /// uniform, so the ladder gains nothing from being non-uniform.
+    /// Nibbles are 16 B and therefore BETTER aligned than q4t's 18 B
+    /// stride. 2-D tensors with cols % 32 == 0 only.
+    Q4TiledP = 15,
 }
 
 impl TensorDtype {
@@ -80,6 +109,7 @@ impl TensorDtype {
             12 => Self::Q1,
             13 => Self::Q1S,
             14 => Self::Q1T,
+            15 => Self::Q4TiledP,
             _ => return None,
         })
     }
@@ -105,6 +135,7 @@ impl TensorDtype {
             Self::Q1 => "q1",
             Self::Q1S => "q1s",
             Self::Q1T => "q1t",
+            Self::Q4TiledP => "q4tp",
         }
     }
 
@@ -126,6 +157,7 @@ impl TensorDtype {
                 | Self::Q1
                 | Self::Q1S
                 | Self::Q1T
+                | Self::Q4TiledP
         )
     }
 }

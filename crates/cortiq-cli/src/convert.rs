@@ -17,7 +17,10 @@
 
 use crate::npy;
 use cortiq_core::format::{CMF_VERSION, CmfHeader, CmfModel, TensorSpec, TokenizerBundle};
-use cortiq_core::quant::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use cortiq_core::quant::{
+    Q4TP_LMAX, Q4TP_NIB, bf16_to_f32, f16_to_f32, f32_to_f16, q4tp_code_stride, q4tp_ladder,
+    q4tp_put_code,
+};
 use cortiq_core::types::{
     LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle, QuantType, TensorDtype,
     YarnConfig,
@@ -350,6 +353,10 @@ pub(crate) enum Quant {
     /// Grouped variable-bit (per-row 3–8 bit, water-filled by row amplitude).
     Vbit,
     Q4Tiled,
+    /// q4 tiled with PREDICTED scales: same nibbles, but the per-tile f16
+    /// scale becomes a 5-bit rung on a per-row ladder — 7.3% off a q4t file
+    /// for 1.14% RMS weight perturbation (q4t's own error vs fp16 is ~10%).
+    Q4TiledP,
     /// 1-bit binary (explicit opt-in): for 1-bit-TRAINED models
     /// (Bonsai / BitNet class), where per-group weights already sit on
     /// two levels ±s and the encoding is (near-)lossless. As PTQ of a
@@ -388,6 +395,10 @@ pub(crate) fn quantize_2d(
             (TensorDtype::Q4Tiled, encode_q4_tiled(vals, out_dim, in_dim))
         }
         Quant::Q4Tiled => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
+        Quant::Q4TiledP if in_dim % GROUP_SIZE == 0 => {
+            (TensorDtype::Q4TiledP, encode_q4tp(vals, out_dim, in_dim))
+        }
+        Quant::Q4TiledP => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
         Quant::Vbit if in_dim % GROUP_SIZE == 0 => {
             (TensorDtype::VbitRo, encode_vbit_ro(vals, out_dim, in_dim))
         }
@@ -421,12 +432,13 @@ pub(crate) fn parse_quant(s: &str) -> anyhow::Result<Quant> {
         "f16" | "fp16" => Quant::F16,
         "vbit" | "v_bit" => Quant::Vbit,
         "q4t" | "q4_tiled" => Quant::Q4Tiled,
+        "q4tp" | "q4t_pred" => Quant::Q4TiledP,
         "q1" => Quant::Q1,
         "q1p" | "q1_ptq" => Quant::Q1p,
         "q1s" | "q1_mask" => Quant::Q1s,
         "q1t" | "q1_ternary" => Quant::Q1t,
         other => anyhow::bail!(
-            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, f16, vbit, q1, q1p, q1s, or q1t)"
+            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, q4tp, f16, vbit, q1, q1p, q1s, or q1t)"
         ),
     })
 }
@@ -494,6 +506,98 @@ pub(crate) fn encode_q4_tiled(vals: &[f32], out_dim: usize, in_dim: usize) -> Ve
         out.extend_from_slice(&packed[g * 16..(g + 1) * 16]);
     }
     out
+}
+
+/// q4tp (§4.10): the same nibbles as `q4_tiled`, but each tile's scale is a
+/// 5-bit rung on a per-row geometric ladder — `[nibbles][row (f16 lo, f16
+/// step)][5-bit codes]`, 4.17 bits/weight against 4.50.
+///
+/// Two details carry the accuracy. The row's `lo`/`step` are rounded to f16
+/// FIRST and the codes are then chosen against those rounded values, so the
+/// rounding of `lo` is absorbed by the code instead of stacking on top of it.
+/// And the nibbles are quantized against the RECONSTRUCTED scale, not the
+/// exact per-tile absmax — otherwise encoder and reader disagree, which is
+/// the same trap `f16_scale` exists to avoid.
+///
+/// Quantizing the same fp32 weights both ways, q4tp's error against the source
+/// is within 0.1% of q4t's at the median within-row scale spread measured on
+/// KAT-Coder-V2.5 (1.27 in log2), 0.3% at its 90th percentile — a coarser scale
+/// costs almost nothing because the nibbles re-round against it. Rounding the
+/// code to nearest beats rounding up (1.19% vs 1.60% RMS against q4t's output):
+/// letting the top tile clip a nibble costs less than coarsening the whole row.
+pub(crate) fn encode_q4tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
+    debug_assert_eq!(vals.len(), out_dim * in_dim);
+    debug_assert_eq!(in_dim % GROUP_SIZE, 0);
+    let gpr = in_dim / GROUP_SIZE;
+    let stride = q4tp_code_stride(gpr);
+    let mut nib = vec![0u8; out_dim * gpr * Q4TP_NIB];
+    let mut params = vec![0u8; out_dim * 4];
+    let mut codes = vec![0u8; out_dim * stride];
+    let mut lg = vec![0f32; gpr];
+    let mut dead = vec![false; gpr];
+
+    for r in 0..out_dim {
+        let row = &vals[r * in_dim..(r + 1) * in_dim];
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for g in 0..gpr {
+            let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+            let absmax = tile.iter().fold(0f32, |m, v| m.max(v.abs()));
+            // An all-zero tile dequantizes to zero whatever its scale, so keep
+            // it out of the row's range — otherwise `f16_scale`'s tiny floor
+            // stretches the ladder and coarsens every live tile in the row.
+            dead[g] = absmax == 0.0;
+            lg[g] = f16_scale(absmax / 7.0).log2();
+            if !dead[g] {
+                lo = lo.min(lg[g]);
+                hi = hi.max(lg[g]);
+            }
+        }
+        if !lo.is_finite() {
+            lo = lg[0];
+            hi = lo;
+        }
+
+        let lo_h = f32_to_f16(lo);
+        let lo_r = f16_to_f32(lo_h);
+        let span = (hi - lo_r).max(0.0);
+        let mut st_h = f32_to_f16(span / Q4TP_LMAX as f32);
+        // Round-to-nearest on `step` can land just short of `hi`; walk up by
+        // single ULPs until rung 31 provably covers the row's top scale.
+        for _ in 0..64 {
+            let st = f16_to_f32(st_h);
+            if st > 0.0 && lo_r + Q4TP_LMAX as f32 * st >= hi {
+                break;
+            }
+            st_h += 1;
+        }
+        params[r * 4..r * 4 + 2].copy_from_slice(&lo_h.to_le_bytes());
+        params[r * 4 + 2..r * 4 + 4].copy_from_slice(&st_h.to_le_bytes());
+
+        let st = f16_to_f32(st_h);
+        let tab = q4tp_ladder(&params, r);
+        let crow = &mut codes[r * stride..(r + 1) * stride];
+        for g in 0..gpr {
+            let c = if dead[g] || st <= 0.0 {
+                0
+            } else {
+                ((lg[g] - lo_r) / st).round_ties_even().clamp(0.0, Q4TP_LMAX as f32) as usize
+            };
+            q4tp_put_code(crow, g, c);
+            let inv = if tab[c] > 0.0 { 1.0 / tab[c] } else { 0.0 };
+            let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+            let dst = &mut nib[(r * gpr + g) * Q4TP_NIB..(r * gpr + g + 1) * Q4TP_NIB];
+            for k in 0..16 {
+                let q0 = ((tile[k * 2] * inv).round_ties_even().clamp(-8.0, 7.0) as i8 + 8) as u8;
+                let q1 =
+                    ((tile[k * 2 + 1] * inv).round_ties_even().clamp(-8.0, 7.0) as i8 + 8) as u8;
+                dst[k] = (q0 & 0x0F) | (q1 << 4);
+            }
+        }
+    }
+
+    nib.extend_from_slice(&params);
+    nib.extend_from_slice(&codes);
+    nib
 }
 
 /// q1 (dtype 12): per 32-group tile `[f16 scale][4B sign bits]`,
@@ -3052,7 +3156,7 @@ pub fn run_convert(
         Quant::Q4Block => QuantType::Q4Block,
         Quant::F16 => QuantType::F16,
         Quant::Vbit => QuantType::Vbit,
-        Quant::Q4Tiled => QuantType::Q4Block,
+        Quant::Q4Tiled | Quant::Q4TiledP => QuantType::Q4Block,
         // File-level label only (per-tensor truth is in the directory);
         // Vbit is the closest existing informational bucket for q1.
         Quant::Q1 | Quant::Q1p | Quant::Q1s | Quant::Q1t => QuantType::Vbit,
@@ -3133,7 +3237,118 @@ pub fn run_convert(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cortiq_core::quant::{dequant_q4_block, dequant_q8_2f, dequant_q8_row, dequant_vbit};
+    use cortiq_core::quant::{
+        dequant_q4_block, dequant_q4_tiled, dequant_q4tp, dequant_q8_2f, dequant_q8_row,
+        dequant_vbit, expected_nbytes,
+    };
+
+    /// Deterministic pseudo-random weights whose per-TILE amplitude spreads
+    /// over `spread` powers of two within each row — that spread is the only
+    /// thing a per-row scale ladder has to cope with, so it is the axis worth
+    /// parameterizing. Measured on KAT-Coder-V2.5, real rows sit at a median
+    /// spread of 1.27 and a 90th percentile of 1.89; 3.7 is past the tail.
+    fn synth_rows(rows: usize, cols: usize, spread: f32) -> Vec<f32> {
+        let mut v = vec![0f32; rows * cols];
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / 8388608.0 - 1.0
+        };
+        for r in 0..rows {
+            let amp = 10f32.powi((r % 7) as i32 - 3); // rows span 10^-3..10^3
+            for g in 0..cols / GROUP_SIZE {
+                let tilt = (next().abs() * spread).exp2();
+                for k in 0..GROUP_SIZE {
+                    v[r * cols + g * GROUP_SIZE + k] = next() * amp * tilt;
+                }
+            }
+        }
+        v
+    }
+
+    fn rel_rms(a: &[f32], b: &[f32]) -> f32 {
+        let (mut num, mut den) = (0f64, 0f64);
+        for (x, y) in a.iter().zip(b) {
+            num += ((x - y) as f64).powi(2);
+            den += (*x as f64).powi(2);
+        }
+        (num / den).sqrt() as f32
+    }
+
+    #[test]
+    fn q4tp_payload_length_matches_expected_nbytes() {
+        for &(rows, cols) in &[(1usize, 32usize), (7, 64), (16, 2048), (2048, 512)] {
+            let v = synth_rows(rows, cols, 1.27);
+            let bytes = encode_q4tp(&v, rows, cols);
+            assert_eq!(
+                Some(bytes.len()),
+                expected_nbytes(TensorDtype::Q4TiledP, &[rows, cols]),
+                "shape {rows}x{cols}"
+            );
+        }
+    }
+
+    #[test]
+    fn q4tp_codes_survive_bit_packing_at_every_offset() {
+        // 5 bits per code means the byte boundary lands differently for each
+        // tile mod 8; walk a full period plus change.
+        let gpr = 37;
+        let mut buf = vec![0u8; q4tp_code_stride(gpr)];
+        let want: Vec<usize> = (0..gpr).map(|g| (g * 7 + 3) % 32).collect();
+        for (g, &c) in want.iter().enumerate() {
+            q4tp_put_code(&mut buf, g, c);
+        }
+        let got: Vec<usize> = (0..gpr)
+            .map(|g| cortiq_core::quant::q4tp_code(&buf, g))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn q4tp_costs_almost_nothing_against_q4t_from_the_same_source() {
+        // The honest comparison is BOTH codecs against the same fp32 weights.
+        // Comparing q4tp against q4t's output instead measures the distance
+        // between two representations, which reads far worse than the truth:
+        // when the scale shifts a little the nibbles simply re-round, so the
+        // total error stays pinned to the 4-bit grid either way.
+        let (rows, cols) = (256usize, 2048usize);
+        for &(spread, budget) in &[(0.0f32, 1.02f32), (1.27, 1.02), (1.89, 1.03), (3.70, 1.06)] {
+            let v = synth_rows(rows, cols, spread);
+            let mut a = vec![0f32; rows * cols];
+            dequant_q4_tiled(&encode_q4_tiled(&v, rows, cols), &mut a);
+            let mut b = vec![0f32; rows * cols];
+            dequant_q4tp(&encode_q4tp(&v, rows, cols), rows, cols, &mut b);
+
+            let (e_q4t, e_q4tp) = (rel_rms(&v, &a), rel_rms(&v, &b));
+            assert!(
+                e_q4tp <= e_q4t * budget,
+                "spread {spread}: q4tp {e_q4tp:.4} over budget {budget}× of q4t {e_q4t:.4}"
+            );
+        }
+    }
+
+    #[test]
+    fn q4tp_keeps_an_all_zero_tile_exactly_zero() {
+        // A dead tile must not drag the row's ladder down (that would coarsen
+        // every live tile) and must still dequantize to exact zeros.
+        let (rows, cols) = (4usize, 128usize);
+        let mut v = synth_rows(rows, cols, 1.27);
+        for c in 0..GROUP_SIZE {
+            v[1 * cols + c] = 0.0;
+        }
+        let mut out = vec![0f32; rows * cols];
+        dequant_q4tp(&encode_q4tp(&v, rows, cols), rows, cols, &mut out);
+        assert!(out[cols..cols + GROUP_SIZE].iter().all(|&x| x == 0.0));
+
+        let live = &v[cols + GROUP_SIZE..2 * cols];
+        let got = &out[cols + GROUP_SIZE..2 * cols];
+        assert!(
+            rel_rms(live, got) < 0.15,
+            "dead tile stretched the row's ladder"
+        );
+    }
 
     #[test]
     fn laguna_config_maps_to_exact_cmf_contract() {
