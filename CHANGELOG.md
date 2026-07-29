@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.38] — 2026-07-29
+
+A new weight layout and the kernels to run it, plus a negative result that
+is the reason the layout looks the way it does. Measured on a fanless
+MacBook Air M4 (Metal and, via `CMF_GPU=wgpu`, the WGSL path).
+
+### Added
+- **`q4tp` (dtype 15) — q4_tiled with predicted scales.** A q4t tile spends
+  16 bits on a standalone f16 scale for 32 weights: 0.5 of its 4.5
+  bits/weight, 11% of the file. q4tp keeps the nibbles byte-identical and
+  makes that scale a 5-bit rung on a per-row geometric ladder
+  (`[nibbles][row (f16 lo, f16 step)][5-bit codes]`), for 4.17 bits/weight.
+
+  Quantizing the SAME fp32 weights both ways, q4tp's error against the
+  source is 9.71% where q4t's is 9.71% — +0.1% relative at the median
+  within-row scale spread measured on KAT-Coder-V2.5 (1.27 in log2), +0.3%
+  at its 90th percentile, +0.8% past the tail. A coarser scale costs almost
+  nothing because the nibbles simply re-round against it; the 4-bit grid
+  dominates either way. Nanbeige-3B keeps its top-5 next tokens in the same
+  order with logits within 0.7%.
+
+  Design points, each settled by measurement rather than taste: the row's
+  `lo`/`step` are rounded to f16 FIRST and the codes chosen against those
+  values, so `lo`'s rounding is absorbed by the code instead of stacking on
+  it; codes round to nearest, not up (1.19% vs 1.60% RMS — letting the top
+  tile clip one nibble beats coarsening the whole row); a per-tensor Lloyd
+  codebook was tried and rejected (0.0576% vs 0.0591% NMSE at 4 bits, since
+  within a row the log-scales are near-uniform); and `lo`/`step` come from
+  the row's exact min/max, so no code is ever out of range and the format
+  needs no escape hatch.
+
+- **`cortiq requant <model> --output <out> --quant q4tp`** — recodes a
+  published `.cmf` in place, without the original checkpoint. The
+  checkpoints behind published CMF files are tens of gigabytes;
+  re-converting them is the expensive path this avoids. KAT-Coder-V2.5:
+  12.65 → 11.80 GB (19254 tensors) in 2 min. Nanbeige-3B: 2.36 → 2.19 GB,
+  peak RSS 2.42 → 2.19 GB. `convert --quant q4tp` also works from HF.
+
+- **q4tp kernels on every path.** CPU: scalar, sdot/avx2/vnni int8, blocked
+  1×4, Accelerate sgemm, and the fused SwiGLU pair. Metal: `q4tp_matvec`,
+  `q4tp_mul_mm`, `q4tp_mul_mm_silu`, plus the chunk-graph plumbing. wgpu:
+  `q4tp_matvec` and `q4tp_mul_mm` under codec kind 6 — deliberately not
+  sharing q4t's 5, since sharing a kind is exactly how q4t once got fed to
+  the q4_block kernel and produced garbage on real Vulkan.
+
+  The layout suits a GPU better than q4t's: a 16 B nibble stride is
+  4-aligned, so Metal loads four uints where q4t needs nine unaligned
+  ushorts and WGSL reads words straight off the storage array. Decode is at
+  parity model-level (Metal 12.4 vs 12.4 tok/s) and the kernels themselves
+  are faster — 0.100 vs 0.117 ms on o_proj, 23.8 vs 26.2 ms for a cold
+  sweep over all 156 weight tensors. The batched GEMM is faster on both
+  backends at b=64: Metal 9.51 vs 10.13 ms (2096 vs 1968 GFLOP/s), wgpu
+  9.83 vs 10.76 (2027 vs 1853).
+
+### Notes
+- **MoE dictionary compression: gate failed, and the mechanism is known.**
+  The hypothesis was that fine-grained MoE experts are one function with
+  local variations — keep one as a base, code the rest as residuals against
+  a shared dictionary. On KAT-Coder-V2.5 (~202 experts/layer) it does not
+  hold: `sigma(W_e − W_base)/sigma(W_e)` is 1.34–1.38 against 1.414 for
+  independent matrices, so the residual is WIDER than the weight and a base
+  costs more bits than it saves. After optimal bipartite matching of neuron
+  triplets (gate-row ⊕ up-row ⊕ down-column, 6144 dims) the aligned cosine
+  is 0.037–0.047 against a chance level of 0.045 — there is no permutation
+  bringing experts together, so tuning the metric, block shape or clustering
+  has nothing to find. Load balancing decorrelates experts on purpose.
+
+  What survived is the only redundancy that measured real: a shared
+  per-channel scale profile (neuron-profile correlation 0.000 across
+  experts, channel-profile +0.16…+0.62). That is what q4tp exploits — and
+  per-row coding turned out to subsume the channel profile entirely, which
+  is why the format has no profile plane.
+
+  Structural pruning by raw magnitude is also empty here (dropping the
+  weakest 12.5% of neurons costs 11% of Frobenius energy — proportional).
+  That is NOT a verdict on AWNP, whose criterion is activation-weighted; no
+  calibration traces were run.
+
 ## [0.5.37] — 2026-07-29
 
 A batch of "the kernel was already there, nobody wired it up" and two
