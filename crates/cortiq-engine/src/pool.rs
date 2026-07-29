@@ -241,10 +241,19 @@ impl Pool {
             Err(_) => match Self::big_cores() {
                 Some(big) => big,
                 None => {
+                    // The cap was 8, which left big machines idle: on a
+                    // 256-core EPYC, Nanbeige 4.2 decoded at 7.4 tok/s on
+                    // the default 8 threads and 14.8 at 32, with prefill
+                    // 12 -> ~16 over the same move. Past ~32 it falls off
+                    // hard (5.5 at 64, 1.6 at 256) — decode is
+                    // memory-bound and the extra threads only add
+                    // dispatch barriers — so 32 is a ceiling, not a
+                    // target. Machines with 9 cores or fewer are
+                    // unaffected: avail-1 already bounds them.
                     let avail = std::thread::available_parallelism()
                         .map(|n| n.get())
                         .unwrap_or(1);
-                    avail.saturating_sub(1).min(8)
+                    avail.saturating_sub(1).min(32)
                 }
             },
         }
