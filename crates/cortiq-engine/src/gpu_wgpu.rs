@@ -234,6 +234,33 @@ fn q1_matvec(@builtin(workgroup_id) wid: vec3<u32>,
 var<workgroup> mm_at: array<f32, 64 * 16>;
 var<workgroup> mm_wt: array<f32, 64 * 16>;
 
+fn mm_store4(m: u32, n0: u32, v0: f32, v1: f32, v2: f32, v3: f32) {
+    if (m >= pm.nb) { return; }
+    let base = m * pm.rows + n0;
+    if (n0 < pm.rows) { ymm[base] = v0; }
+    if (n0 + 1u < pm.rows) { ymm[base + 1u] = v1; }
+    if (n0 + 2u < pm.rows) { ymm[base + 2u] = v2; }
+    if (n0 + 3u < pm.rows) { ymm[base + 3u] = v3; }
+}
+
+fn q8_store4(m: u32, n0: u32, v0: f32, v1: f32, v2: f32, v3: f32) {
+    if (m >= pm.nb) { return; }
+    let base = m * pm.rows + n0;
+    if (n0 < pm.rows) { ym[base] = v0 * rsm[n0]; }
+    if (n0 + 1u < pm.rows) { ym[base + 1u] = v1 * rsm[n0 + 1u]; }
+    if (n0 + 2u < pm.rows) { ym[base + 2u] = v2 * rsm[n0 + 2u]; }
+    if (n0 + 3u < pm.rows) { ym[base + 3u] = v3 * rsm[n0 + 3u]; }
+}
+
+fn q1m_store4(m: u32, n0: u32, v0: f32, v1: f32, v2: f32, v3: f32) {
+    if (m >= pm.nb) { return; }
+    let base = m * pm.rows + n0;
+    if (n0 < pm.rows) { ym[base] = v0; }
+    if (n0 + 1u < pm.rows) { ym[base + 1u] = v1; }
+    if (n0 + 2u < pm.rows) { ym[base + 2u] = v2; }
+    if (n0 + 3u < pm.rows) { ym[base + 3u] = v3; }
+}
+
 @compute @workgroup_size(16, 16)
 fn q8_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
              @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -241,10 +268,11 @@ fn q8_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
     let m0 = wid.y * 64u;
     let n0 = wid.x * 64u;
     let tid = lid.y * 16u + lid.x;
-    var acc: array<array<f32, 4>, 4>;
-    for (var i = 0u; i < 4u; i = i + 1u) {
-        for (var j = 0u; j < 4u; j = j + 1u) { acc[i][j] = 0.0; }
-    }
+    // Sixteen named scalars, not array<array<f32,4>,4> — see q4t_mul_mm.
+    var a00 = 0.0; var a01 = 0.0; var a02 = 0.0; var a03 = 0.0;
+    var a10 = 0.0; var a11 = 0.0; var a12 = 0.0; var a13 = 0.0;
+    var a20 = 0.0; var a21 = 0.0; var a22 = 0.0; var a23 = 0.0;
+    var a30 = 0.0; var a31 = 0.0; var a32 = 0.0; var a33 = 0.0;
     var k0 = 0u;
     loop {
         if (k0 >= cols) { break; }
@@ -279,32 +307,35 @@ fn q8_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
         }
         workgroupBarrier();
         // 4×4 outer-product accumulation over the 16 staged K values.
+        let ab = lid.y * 64u;
+        let wb = lid.x * 64u;
         for (var k = 0u; k < 16u; k = k + 1u) {
-            var av: array<f32, 4>;
-            var wv: array<f32, 4>;
-            for (var i = 0u; i < 4u; i = i + 1u) {
-                av[i] = mm_at[(lid.y * 4u + i) * 16u + k];
-                wv[i] = mm_wt[(lid.x * 4u + i) * 16u + k];
-            }
-            for (var i = 0u; i < 4u; i = i + 1u) {
-                for (var j = 0u; j < 4u; j = j + 1u) {
-                    acc[i][j] = acc[i][j] + av[i] * wv[j];
-                }
-            }
+            let x0 = mm_at[ab + k];
+            let x1 = mm_at[ab + 16u + k];
+            let x2 = mm_at[ab + 32u + k];
+            let x3 = mm_at[ab + 48u + k];
+            let y0 = mm_wt[wb + k];
+            let y1 = mm_wt[wb + 16u + k];
+            let y2 = mm_wt[wb + 32u + k];
+            let y3 = mm_wt[wb + 48u + k];
+            a00 = a00 + x0 * y0; a01 = a01 + x0 * y1;
+            a02 = a02 + x0 * y2; a03 = a03 + x0 * y3;
+            a10 = a10 + x1 * y0; a11 = a11 + x1 * y1;
+            a12 = a12 + x1 * y2; a13 = a13 + x1 * y3;
+            a20 = a20 + x2 * y0; a21 = a21 + x2 * y1;
+            a22 = a22 + x2 * y2; a23 = a23 + x2 * y3;
+            a30 = a30 + x3 * y0; a31 = a31 + x3 * y1;
+            a32 = a32 + x3 * y2; a33 = a33 + x3 * y3;
         }
         workgroupBarrier();
         k0 = k0 + 16u;
     }
-    for (var i = 0u; i < 4u; i = i + 1u) {
-        let m = m0 + lid.y * 4u + i;
-        if (m >= pm.nb) { continue; }
-        for (var j = 0u; j < 4u; j = j + 1u) {
-            let n = n0 + lid.x * 4u + j;
-            if (n < pm.rows) {
-                ym[m * pm.rows + n] = acc[i][j] * rsm[n];
-            }
-        }
-    }
+    let mb = m0 + lid.y * 4u;
+    let nb2 = n0 + lid.x * 4u;
+    q8_store4(mb, nb2, a00, a01, a02, a03);
+    q8_store4(mb + 1u, nb2, a10, a11, a12, a13);
+    q8_store4(mb + 2u, nb2, a20, a21, a22, a23);
+    q8_store4(mb + 3u, nb2, a30, a31, a32, a33);
 }
 
 // Tiled q1 GEMM for wide batches (prefill / speculative K-token decode): the
@@ -340,10 +371,11 @@ fn q1_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
     let m0 = wid.y * 64u;
     let n0 = wid.x * 64u;
     let tid = lid.y * 16u + lid.x;
-    var acc: array<array<f32, 4>, 4>;
-    for (var i = 0u; i < 4u; i = i + 1u) {
-        for (var j = 0u; j < 4u; j = j + 1u) { acc[i][j] = 0.0; }
-    }
+    // Sixteen named scalars, not array<array<f32,4>,4> — see q4t_mul_mm.
+    var a00 = 0.0; var a01 = 0.0; var a02 = 0.0; var a03 = 0.0;
+    var a10 = 0.0; var a11 = 0.0; var a12 = 0.0; var a13 = 0.0;
+    var a20 = 0.0; var a21 = 0.0; var a22 = 0.0; var a23 = 0.0;
+    var a30 = 0.0; var a31 = 0.0; var a32 = 0.0; var a33 = 0.0;
     var k0 = 0u;
     loop {
         if (k0 >= cols) { break; }
@@ -369,28 +401,35 @@ fn q1_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
             mm_wt[dst] = wv.x; mm_wt[dst + 1u] = wv.y; mm_wt[dst + 2u] = wv.z; mm_wt[dst + 3u] = wv.w;
         }
         workgroupBarrier();
+        let ab = lid.y * 64u;
+        let wb = lid.x * 64u;
         for (var k = 0u; k < 16u; k = k + 1u) {
-            var av: array<f32, 4>;
-            var wv: array<f32, 4>;
-            for (var i = 0u; i < 4u; i = i + 1u) {
-                av[i] = mm_at[(lid.y * 4u + i) * 16u + k];
-                wv[i] = mm_wt[(lid.x * 4u + i) * 16u + k];
-            }
-            for (var i = 0u; i < 4u; i = i + 1u) {
-                for (var j = 0u; j < 4u; j = j + 1u) { acc[i][j] = acc[i][j] + av[i] * wv[j]; }
-            }
+            let x0 = mm_at[ab + k];
+            let x1 = mm_at[ab + 16u + k];
+            let x2 = mm_at[ab + 32u + k];
+            let x3 = mm_at[ab + 48u + k];
+            let y0 = mm_wt[wb + k];
+            let y1 = mm_wt[wb + 16u + k];
+            let y2 = mm_wt[wb + 32u + k];
+            let y3 = mm_wt[wb + 48u + k];
+            a00 = a00 + x0 * y0; a01 = a01 + x0 * y1;
+            a02 = a02 + x0 * y2; a03 = a03 + x0 * y3;
+            a10 = a10 + x1 * y0; a11 = a11 + x1 * y1;
+            a12 = a12 + x1 * y2; a13 = a13 + x1 * y3;
+            a20 = a20 + x2 * y0; a21 = a21 + x2 * y1;
+            a22 = a22 + x2 * y2; a23 = a23 + x2 * y3;
+            a30 = a30 + x3 * y0; a31 = a31 + x3 * y1;
+            a32 = a32 + x3 * y2; a33 = a33 + x3 * y3;
         }
         workgroupBarrier();
         k0 = k0 + 16u;
     }
-    for (var i = 0u; i < 4u; i = i + 1u) {
-        let m = m0 + lid.y * 4u + i;
-        if (m >= pm.nb) { continue; }
-        for (var j = 0u; j < 4u; j = j + 1u) {
-            let n = n0 + lid.x * 4u + j;
-            if (n < pm.rows) { ym[m * pm.rows + n] = acc[i][j]; }
-        }
-    }
+    let mb = m0 + lid.y * 4u;
+    let nb2 = n0 + lid.x * 4u;
+    q1m_store4(mb, nb2, a00, a01, a02, a03);
+    q1m_store4(mb + 1u, nb2, a10, a11, a12, a13);
+    q1m_store4(mb + 2u, nb2, a20, a21, a22, a23);
+    q1m_store4(mb + 3u, nb2, a30, a31, a32, a33);
 }
 
 // ── Element-wise kernels of the MoE block (silu·mul·col, axpy, zeroing) ──
@@ -1291,10 +1330,11 @@ fn q1t_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
     let m0 = wid.y * 64u;
     let n0 = wid.x * 64u;
     let tid = lid.y * 16u + lid.x;
-    var acc: array<array<f32, 4>, 4>;
-    for (var i = 0u; i < 4u; i = i + 1u) {
-        for (var j = 0u; j < 4u; j = j + 1u) { acc[i][j] = 0.0; }
-    }
+    // Sixteen named scalars, not array<array<f32,4>,4> — see q4t_mul_mm.
+    var a00 = 0.0; var a01 = 0.0; var a02 = 0.0; var a03 = 0.0;
+    var a10 = 0.0; var a11 = 0.0; var a12 = 0.0; var a13 = 0.0;
+    var a20 = 0.0; var a21 = 0.0; var a22 = 0.0; var a23 = 0.0;
+    var a30 = 0.0; var a31 = 0.0; var a32 = 0.0; var a33 = 0.0;
     var k0 = 0u;
     loop {
         if (k0 >= cols) { break; }
@@ -1336,30 +1376,35 @@ fn q1t_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
             q1t_wt[dst + 2u] = wv.z; q1t_wt[dst + 3u] = wv.w;
         }
         workgroupBarrier();
+        let ab = lid.y * 64u;
+        let wb = lid.x * 64u;
         for (var k = 0u; k < 16u; k = k + 1u) {
-            var av: array<f32, 4>;
-            var wv: array<f32, 4>;
-            for (var i = 0u; i < 4u; i = i + 1u) {
-                av[i] = q1t_at[(lid.y * 4u + i) * 16u + k];
-                wv[i] = q1t_wt[(lid.x * 4u + i) * 16u + k];
-            }
-            for (var i = 0u; i < 4u; i = i + 1u) {
-                for (var j = 0u; j < 4u; j = j + 1u) {
-                    acc[i][j] = acc[i][j] + av[i] * wv[j];
-                }
-            }
+            let x0 = q1t_at[ab + k];
+            let x1 = q1t_at[ab + 16u + k];
+            let x2 = q1t_at[ab + 32u + k];
+            let x3 = q1t_at[ab + 48u + k];
+            let y0 = q1t_wt[wb + k];
+            let y1 = q1t_wt[wb + 16u + k];
+            let y2 = q1t_wt[wb + 32u + k];
+            let y3 = q1t_wt[wb + 48u + k];
+            a00 = a00 + x0 * y0; a01 = a01 + x0 * y1;
+            a02 = a02 + x0 * y2; a03 = a03 + x0 * y3;
+            a10 = a10 + x1 * y0; a11 = a11 + x1 * y1;
+            a12 = a12 + x1 * y2; a13 = a13 + x1 * y3;
+            a20 = a20 + x2 * y0; a21 = a21 + x2 * y1;
+            a22 = a22 + x2 * y2; a23 = a23 + x2 * y3;
+            a30 = a30 + x3 * y0; a31 = a31 + x3 * y1;
+            a32 = a32 + x3 * y2; a33 = a33 + x3 * y3;
         }
         workgroupBarrier();
         k0 = k0 + 16u;
     }
-    for (var i = 0u; i < 4u; i = i + 1u) {
-        let m = m0 + lid.y * 4u + i;
-        if (m >= pmm.nb) { continue; }
-        for (var j = 0u; j < 4u; j = j + 1u) {
-            let n = n0 + lid.x * 4u + j;
-            if (n < pmm.rows) { ymm[m * pmm.rows + n] = acc[i][j]; }
-        }
-    }
+    let mb = m0 + lid.y * 4u;
+    let nb2 = n0 + lid.x * 4u;
+    q4t_store4(mb, nb2, a00, a01, a02, a03);
+    q4t_store4(mb + 1u, nb2, a10, a11, a12, a13);
+    q4t_store4(mb + 2u, nb2, a20, a21, a22, a23);
+    q4t_store4(mb + 3u, nb2, a30, a31, a32, a33);
 }
 
 // q4t register-blocked GEMM (imagegen DiT prefill / any wide q4t
@@ -1370,6 +1415,15 @@ fn q1t_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
 var<workgroup> q4t_at: array<f32, 64 * 16>;
 var<workgroup> q4t_wt: array<f32, 64 * 16>;
 
+fn q4t_store4(m: u32, n0: u32, v0: f32, v1: f32, v2: f32, v3: f32) {
+    if (m >= pmm.nb) { return; }
+    let base = m * pmm.rows + n0;
+    if (n0 < pmm.rows) { ymm[base] = v0; }
+    if (n0 + 1u < pmm.rows) { ymm[base + 1u] = v1; }
+    if (n0 + 2u < pmm.rows) { ymm[base + 2u] = v2; }
+    if (n0 + 3u < pmm.rows) { ymm[base + 3u] = v3; }
+}
+
 @compute @workgroup_size(16, 16)
 fn q4t_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
               @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -1378,10 +1432,15 @@ fn q4t_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
     let m0 = wid.y * 64u;
     let n0 = wid.x * 64u;
     let tid = lid.y * 16u + lid.x;
-    var acc: array<array<f32, 4>, 4>;
-    for (var i = 0u; i < 4u; i = i + 1u) {
-        for (var j = 0u; j < 4u; j = j + 1u) { acc[i][j] = 0.0; }
-    }
+    // The 4x4 register block is SIXTEEN NAMED SCALARS, not
+    // array<array<f32,4>,4>: indexed by loop variables the array is a
+    // private array, which this backend puts in stack memory — the
+    // accumulators leave registers and the GEMM runs at a fraction of
+    // the card (measured 373 GFLOP/s of an RTX 3090's ~35 TFLOP/s).
+    var a00 = 0.0; var a01 = 0.0; var a02 = 0.0; var a03 = 0.0;
+    var a10 = 0.0; var a11 = 0.0; var a12 = 0.0; var a13 = 0.0;
+    var a20 = 0.0; var a21 = 0.0; var a22 = 0.0; var a23 = 0.0;
+    var a30 = 0.0; var a31 = 0.0; var a32 = 0.0; var a33 = 0.0;
     var k0 = 0u;
     loop {
         if (k0 >= cols) { break; }
@@ -1422,30 +1481,35 @@ fn q4t_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
             q4t_wt[dst + 2u] = wv.z; q4t_wt[dst + 3u] = wv.w;
         }
         workgroupBarrier();
+        let ab = lid.y * 64u;
+        let wb = lid.x * 64u;
         for (var k = 0u; k < 16u; k = k + 1u) {
-            var av: array<f32, 4>;
-            var wv: array<f32, 4>;
-            for (var i = 0u; i < 4u; i = i + 1u) {
-                av[i] = q4t_at[(lid.y * 4u + i) * 16u + k];
-                wv[i] = q4t_wt[(lid.x * 4u + i) * 16u + k];
-            }
-            for (var i = 0u; i < 4u; i = i + 1u) {
-                for (var j = 0u; j < 4u; j = j + 1u) {
-                    acc[i][j] = acc[i][j] + av[i] * wv[j];
-                }
-            }
+            let x0 = q4t_at[ab + k];
+            let x1 = q4t_at[ab + 16u + k];
+            let x2 = q4t_at[ab + 32u + k];
+            let x3 = q4t_at[ab + 48u + k];
+            let y0 = q4t_wt[wb + k];
+            let y1 = q4t_wt[wb + 16u + k];
+            let y2 = q4t_wt[wb + 32u + k];
+            let y3 = q4t_wt[wb + 48u + k];
+            a00 = a00 + x0 * y0; a01 = a01 + x0 * y1;
+            a02 = a02 + x0 * y2; a03 = a03 + x0 * y3;
+            a10 = a10 + x1 * y0; a11 = a11 + x1 * y1;
+            a12 = a12 + x1 * y2; a13 = a13 + x1 * y3;
+            a20 = a20 + x2 * y0; a21 = a21 + x2 * y1;
+            a22 = a22 + x2 * y2; a23 = a23 + x2 * y3;
+            a30 = a30 + x3 * y0; a31 = a31 + x3 * y1;
+            a32 = a32 + x3 * y2; a33 = a33 + x3 * y3;
         }
         workgroupBarrier();
         k0 = k0 + 16u;
     }
-    for (var i = 0u; i < 4u; i = i + 1u) {
-        let m = m0 + lid.y * 4u + i;
-        if (m >= pmm.nb) { continue; }
-        for (var j = 0u; j < 4u; j = j + 1u) {
-            let n = n0 + lid.x * 4u + j;
-            if (n < pmm.rows) { ymm[m * pmm.rows + n] = acc[i][j]; }
-        }
-    }
+    let mb = m0 + lid.y * 4u;
+    let nb2 = n0 + lid.x * 4u;
+    q4t_store4(mb, nb2, a00, a01, a02, a03);
+    q4t_store4(mb + 1u, nb2, a10, a11, a12, a13);
+    q4t_store4(mb + 2u, nb2, a20, a21, a22, a23);
+    q4t_store4(mb + 3u, nb2, a30, a31, a32, a33);
 }
 
 @compute @workgroup_size(64)
