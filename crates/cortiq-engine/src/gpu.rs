@@ -1004,6 +1004,29 @@ pub fn q4t_qkv(
 
 /// y=·W2ᵀ — one command buffer, only X and Y cross the CPU boundary.
 #[allow(unused_variables, clippy::too_many_arguments)]
+pub fn q4tp_ffn(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w3: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q4tp_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
+        #[cfg(feature = "gpu")]
+        // No wgpu twin yet: the fused DiT chain there is q4t-only, so a q4tp
+        // model keeps the unfused wgpu path rather than a wrong kernel.
+        Backend::Wgpu => false,
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 pub fn q4t_ffn(
     model: &Arc<CmfModel>,
     w1: usize,

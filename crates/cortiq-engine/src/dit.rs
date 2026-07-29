@@ -558,14 +558,26 @@ impl NextDit {
         let (Proj::Q(q1), Proj::Q(q3), Proj::Q(q2)) = (&blk.w1, &blk.w3, &blk.w2) else {
             return false;
         };
-        let (Some((m, i1)), Some((_, i3)), Some((_, i2))) =
+        // q4t or q4tp — the fused chain exists for both, and picking by dtype
+        // here is what keeps a q4tp image model off the unfused path (which
+        // ships the [b, inter] intermediates across the CPU boundary twice per
+        // layer: 28 s against 14 s on Lumina at 256px).
+        let tp = q1.mapped_q4tp().is_some();
+        let (Some((m, i1)), Some((_, i3)), Some((_, i2))) = (if tp {
+            (q1.mapped_q4tp(), q3.mapped_q4tp(), q2.mapped_q4tp())
+        } else {
             (q1.mapped_q4t(), q3.mapped_q4t(), q2.mapped_q4t())
-        else {
+        }) else {
             return false;
         };
         let inter = q1.rows();
         let t0 = std::time::Instant::now();
-        if !gpu::q4t_ffn(m, i1, i3, i2, xn, n, self.hidden, inter, out) {
+        let ok = if tp {
+            gpu::q4tp_ffn(m, i1, i3, i2, xn, n, self.hidden, inter, out)
+        } else {
+            gpu::q4t_ffn(m, i1, i3, i2, xn, n, self.hidden, inter, out)
+        };
+        if !ok {
             return false;
         }
         let flops = 6.0 * n as f64 * self.hidden as f64 * inter as f64;

@@ -402,6 +402,20 @@ impl QTensor {
         }
     }
 
+    /// Same slot as `mapped_q4t` for a q4tp tensor — the fused DiT FFN picks
+    /// its kernels by which of the two answers.
+    pub fn mapped_q4tp(&self) -> Option<(&Arc<CmfModel>, usize)> {
+        match self {
+            Self::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q4TiledP,
+                ..
+            } => Some((model, *idx)),
+            _ => None,
+        }
+    }
+
     pub fn cols(&self) -> usize {
         match self {
             Self::F32 { cols, .. } | Self::Mapped { cols, .. } => *cols,
