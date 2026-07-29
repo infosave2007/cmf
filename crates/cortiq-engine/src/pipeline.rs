@@ -4479,6 +4479,23 @@ pub fn create_test_pipeline(
 fn dense_ffn_batch(d: &DenseFfn, xs: &[f32], b: usize, pool: Option<&Pool>) -> Vec<f32> {
     let inter = d.gate_proj.rows();
     let hidden = d.down_proj.rows();
+    // Fused on-device SwiGLU when the device is in play: three separate
+    // `matmat` calls are three round trips per layer, and the gate/up
+    // panels (b × inter — 22 MB each at a 512-token chunk) cross the bus
+    // twice for nothing. The kernel already existed for the image DiT;
+    // the LLM prefill was simply never wired to it.
+    if d.act == Act::Silu && b >= 32 && crate::gpu::enabled_here() && !crate::gpu::mm_killed() {
+        if let (Some((model, w1)), Some((_, w3)), Some((_, w2))) = (
+            d.gate_proj.mapped_q4t(),
+            d.up_proj.mapped_q4t(),
+            d.down_proj.mapped_q4t(),
+        ) {
+            let mut out = vec![0.0f32; b * hidden];
+            if crate::gpu::q4t_ffn(model, w1, w3, w2, xs, b, hidden, inter, &mut out) {
+                return out;
+            }
+        }
+    }
     let mut g = vec![0.0f32; b * inter];
     d.gate_proj.matmat(xs, b, &mut g, pool);
     let mut u = vec![0.0f32; b * inter];
