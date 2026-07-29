@@ -1175,6 +1175,25 @@ pub fn dit_attention(
 /// GEMM's K loop. wgpu (Vulkan/DX12 → NVIDIA/AMD/Intel/Adreno/Mali):
 /// the register-blocked WGSL twin, weights cached in VRAM.
 #[allow(unused_variables)]
+pub fn q4tp_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q4tp_matmat(model, idx, xs, b, rows, cols, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q4tp_matmat(model, idx, xs, b, rows, cols, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 pub fn q4t_matmat(
     model: &Arc<CmfModel>,
     idx: usize,

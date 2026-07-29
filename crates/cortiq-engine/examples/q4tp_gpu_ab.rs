@@ -98,6 +98,47 @@ fn main() {
             cortiq_core::quant::expected_nbytes(model.tensors[i].dtype, &[r, c]).unwrap_or(0)
         })
         .sum();
+    // Batched GEMM (the prefill path): same tensors, b=64.
+    {
+        let b = 64usize;
+        let big: Vec<(usize, usize, usize)> = all
+            .iter()
+            .copied()
+            .filter(|&(_, r, c)| r * c >= 4_000_000 && r * c <= 40_000_000)
+            .take(6)
+            .collect();
+        let mut best = f64::MAX;
+        let mut gb = 0.0f64;
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            let mut ok = true;
+            for &(i, r, c) in &big {
+                let xs = vec![0.01f32; b * c];
+                let mut o = vec![0f32; b * r];
+                let tp = model.tensors[i].dtype == TensorDtype::Q4TiledP;
+                ok &= if tp {
+                    cortiq_engine::gpu::q4tp_matmat(&model, i, &xs, b, r, c, &mut o)
+                } else {
+                    cortiq_engine::gpu::q4t_matmat(&model, i, &xs, b, r, c, &mut o)
+                };
+            }
+            if !ok {
+                println!("GEMM отклонён устройством");
+                break;
+            }
+            best = best.min(t0.elapsed().as_secs_f64());
+            gb = big.iter().map(|&(_, r, c)| 2.0 * b as f64 * r as f64 * c as f64).sum::<f64>();
+        }
+        if best < f64::MAX {
+            println!(
+                "GEMM b={b} по {} тензорам: {:.2} мс, {:.2} ГФЛОП/с",
+                big.len(),
+                best * 1e3,
+                gb / best / 1e9
+            );
+        }
+    }
+
     for (serial, lbl) in [(false, "перекрытый"), (true, "сериализованный")] {
         match cortiq_engine::gpu_metal::q4_matvec_sweep(&model, &all, serial) {
             Some(t) => println!(

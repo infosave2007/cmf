@@ -41,7 +41,16 @@ fn synth(rows: usize, cols: usize) -> Vec<u8> {
     b
 }
 
-fn tiny_model(rows: usize, cols: usize, payload: Vec<u8>) -> (std::sync::Arc<CmfModel>, usize) {
+/// `tag` keeps the four backend tests off each other's file: cargo runs them
+/// in parallel threads of ONE process, so a shared path had them reading a
+/// model another test was mid-write on — which reads exactly like a broken
+/// kernel.
+fn tiny_model(
+    tag: &str,
+    rows: usize,
+    cols: usize,
+    payload: Vec<u8>,
+) -> (std::sync::Arc<CmfModel>, usize) {
     let arch: ModelArch = serde_json::from_value(serde_json::json!({
         "arch_name": "tiny",
         "hidden_size": cols,
@@ -85,7 +94,7 @@ fn tiny_model(rows: usize, cols: usize, payload: Vec<u8>) -> (std::sync::Arc<Cmf
         shape: vec![8192, 2],
         data: vec![0u8; 8192 * 8],
     };
-    let dir = std::env::temp_dir().join(format!("cmf-q4tp-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("cmf-q4tp-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("m.cmf");
     CmfModel::write(&path, &header, &[spec, pad], None, None).unwrap();
@@ -95,12 +104,15 @@ fn tiny_model(rows: usize, cols: usize, payload: Vec<u8>) -> (std::sync::Arc<Cmf
 }
 
 /// Compare a backend's kernel against the scalar dequant over a whole tensor.
-fn check(run: impl Fn(&std::sync::Arc<CmfModel>, usize, &[f32], usize, usize, &mut [f32]) -> bool) {
+fn check(
+    tag: &str,
+    run: impl Fn(&std::sync::Arc<CmfModel>, usize, &[f32], usize, usize, &mut [f32]) -> bool,
+) {
     let (rows, cols) = (512usize, 1024usize);
     let payload = synth(rows, cols);
     let mut w = vec![0f32; rows * cols];
     dequant_q4tp(&payload, rows, cols, &mut w);
-    let (model, idx) = tiny_model(rows, cols, payload);
+    let (model, idx) = tiny_model(tag, rows, cols, payload);
 
     let xs: Vec<f32> = (0..cols)
         .map(|i| ((i * 37 + 11) % 101) as f32 / 101.0 - 0.5)
@@ -132,7 +144,7 @@ fn metal_q4tp_matvec_matches_dequant_reference() {
         eprintln!("skipped: Metal disabled");
         return;
     }
-    check(cortiq_engine::gpu_metal::q4tp_matvec_for_test);
+    check("metal-mv", cortiq_engine::gpu_metal::q4tp_matvec_for_test);
 }
 
 /// wgpu covers Vulkan/DX12; `CMF_GPU=wgpu` selects it on macOS too, so this
@@ -145,5 +157,63 @@ fn wgpu_q4tp_matvec_matches_dequant_reference() {
         eprintln!("skipped: no wgpu adapter");
         return;
     }
-    check(cortiq_engine::gpu_wgpu::q4tp_matvec_for_test);
+    check("wgpu-mv", cortiq_engine::gpu_wgpu::q4tp_matvec_for_test);
+}
+
+/// Same idea for the batched GEMM. Prefill runs through this kernel, so a
+/// wrong one corrupts the prompt while decode still looks fine — the failure
+/// mode is a model that answers a question it was never asked.
+fn check_mm(
+    tag: &str,
+    run: impl Fn(&std::sync::Arc<CmfModel>, usize, &[f32], usize, usize, usize, &mut [f32]) -> bool,
+) {
+    let (rows, cols, b) = (256usize, 512usize, 48usize);
+    let payload = synth(rows, cols);
+    let mut w = vec![0f32; rows * cols];
+    dequant_q4tp(&payload, rows, cols, &mut w);
+    let (model, idx) = tiny_model(tag, rows, cols, payload);
+
+    let xs: Vec<f32> = (0..b * cols)
+        .map(|i| ((i * 29 + 13) % 103) as f32 / 103.0 - 0.5)
+        .collect();
+    let mut got = vec![0f32; b * rows];
+    assert!(
+        run(&model, idx, &xs, b, rows, cols, &mut got),
+        "GPU refused a well-formed q4tp GEMM"
+    );
+
+    for t in 0..b {
+        let x = &xs[t * cols..(t + 1) * cols];
+        for r in 0..rows {
+            let want: f32 = (0..cols).map(|c| w[r * cols + c] * x[c]).sum();
+            let mag: f32 = (0..cols).map(|c| (w[r * cols + c] * x[c]).abs()).sum();
+            assert!(
+                (got[t * rows + r] - want).abs() <= 1e-4 * mag,
+                "batch {t} row {r}: GPU {} vs dequant {want}",
+                got[t * rows + r]
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_q4tp_matmat_matches_dequant_reference() {
+    unsafe { std::env::set_var("CMF_GPU", "1") };
+    if !cortiq_engine::gpu_metal::enabled() {
+        eprintln!("skipped: Metal disabled");
+        return;
+    }
+    check_mm("metal-mm", cortiq_engine::gpu_metal::q4tp_matmat);
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+fn wgpu_q4tp_matmat_matches_dequant_reference() {
+    unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+    if !cortiq_engine::gpu_wgpu::enabled() {
+        eprintln!("skipped: no wgpu adapter");
+        return;
+    }
+    check_mm("wgpu-mm", cortiq_engine::gpu_wgpu::q4tp_matmat);
 }

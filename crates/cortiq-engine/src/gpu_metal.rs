@@ -5982,6 +5982,77 @@ pub fn q8_matmat(
 /// shared-memory tiles make this tolerance-class (like the LLM
 /// prefill graph); the probe arbitrates vs the CPU AMX arm per
 /// process.
+pub fn q4tp_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    pre: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % 32 != 0 {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let Some(need) =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+    else {
+        return false;
+    };
+    if abs + need > safe_len {
+        return false;
+    }
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let xs_buf = get_io(21_000_000_659 + pre.len(), pre.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(pre.as_ptr(), xs_buf.contents() as *mut f32, pre.len());
+    }
+    let y_buf = get_io(22_000_000_663 + b * rows, b * rows * 4);
+
+    let cmd = c.queue.new_command_buffer();
+    {
+        // C[b, rows] = X · dequant(W)ᵀ, tiles decoded in the K loop.
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.q4tpmm);
+        enc.set_buffer(0, Some(&fbuf), abs as u64);
+        enc.set_buffer(1, Some(&xs_buf), 0);
+        enc.set_buffer(2, Some(&y_buf), 0);
+        let (cols_u, rows_u, nb_u) = (cols as u32, rows as u32, b as u32);
+        enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new((b as u64).div_ceil(32), (rows as u64).div_ceil(64), 1),
+            MTLSize::new(128, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
+    }
+    tracing::debug!("gpu q4tp matmat: {rows}x{cols} b={b}");
+    true
+}
+
 pub fn q4t_matmat(
     model: &Arc<CmfModel>,
     idx: usize,

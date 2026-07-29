@@ -1494,6 +1494,110 @@ fn q4t_store4(m: u32, n0: u32, v0: f32, v1: f32, v2: f32, v3: f32) {
     if (n0 + 3u < pmm.rows) { ymm[base + 3u] = v3; }
 }
 
+// q4tp register-blocked GEMM — the q4t kernel above with one block swapped:
+// a 16 B nibble stride instead of the 18 B tile, and the scale off the row's
+// ladder. Shares q4t_store4 and the q4t_at/q4t_wt staging arrays; only one
+// entry point runs per dispatch, so the workgroup allocation is not doubled.
+@compute @workgroup_size(16, 16)
+fn q4tp_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let cols = pmm.cols4 * 4u;
+    let gpr = cols >> 5u;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    let tid = lid.y * 16u + lid.x;
+    // The 4x4 register block is SIXTEEN NAMED SCALARS, not
+    // array<array<f32,4>,4>: indexed by loop variables the array is a
+    // private array, which this backend puts in stack memory — the
+    // accumulators leave registers and the GEMM runs at a fraction of
+    // the card (measured 373 GFLOP/s of an RTX 3090's ~35 TFLOP/s).
+    var a00 = 0.0; var a01 = 0.0; var a02 = 0.0; var a03 = 0.0;
+    var a10 = 0.0; var a11 = 0.0; var a12 = 0.0; var a13 = 0.0;
+    var a20 = 0.0; var a21 = 0.0; var a22 = 0.0; var a23 = 0.0;
+    var a30 = 0.0; var a31 = 0.0; var a32 = 0.0; var a33 = 0.0;
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        for (var t = tid; t < 64u * 4u; t = t + 256u) {
+            let m = t / 4u;
+            let k4 = t % 4u;
+            var xv = vec4<f32>(0.0);
+            let col0 = k0 + k4 * 4u;
+            if (m0 + m < pmm.nb && col0 < cols) {
+                let xi = (m0 + m) * cols + col0;
+                xv = vec4<f32>(xmm[xi], xmm[xi + 1u], xmm[xi + 2u], xmm[xi + 3u]);
+            }
+            let dst = m * 16u + k4 * 4u;
+            q4t_at[dst] = xv.x; q4t_at[dst + 1u] = xv.y;
+            q4t_at[dst + 2u] = xv.z; q4t_at[dst + 3u] = xv.w;
+        }
+        for (var t = tid; t < 64u * 4u; t = t + 256u) {
+            let n = t / 4u;
+            let k4 = t % 4u;
+            var wv = vec4<f32>(0.0);
+            let col0 = k0 + k4 * 4u;
+            if (n0 + n < pmm.rows && col0 < cols) {
+                let g = col0 >> 5u;
+                let wrow = n0 + n;
+                let params_b = pmm.rows * gpr * 16u;
+                let codes_b = params_b + pmm.rows * 4u;
+                let cstride = (gpr * 5u + 7u) / 8u;
+                let bit = g * 5u;
+                let cb = codes_b + wrow * cstride + (bit >> 3u);
+                let sh = bit & 7u;
+                var cv = qmm_byte(cb);
+                if (sh > 3u) { cv = cv | (qmm_byte(cb + 1u) << 8u); }
+                // One exp2 per staged group of 4 — this thread stages exactly
+                // one such group per K-step, and the GEMM's arithmetic hides
+                // the chain that the matvec had to hoist out of its tile loop.
+                let pr = unpack2x16float(qmm[(params_b >> 2u) + wrow]);
+                let scale = exp2(pr.x + f32((cv >> sh) & 31u) * pr.y);
+                // 4 consecutive weights = 2 nibble bytes (col0 is even).
+                let toff = (wrow * gpr + g) * 16u;
+                let p = col0 - g * 32u;
+                let b0 = qmm_byte(toff + p / 2u);
+                let b1 = qmm_byte(toff + 1u + p / 2u);
+                wv[0u] = (f32(b0 & 0xFu) - 8.0) * scale;
+                wv[1u] = (f32(b0 >> 4u) - 8.0) * scale;
+                wv[2u] = (f32(b1 & 0xFu) - 8.0) * scale;
+                wv[3u] = (f32(b1 >> 4u) - 8.0) * scale;
+            }
+            let dst = n * 16u + k4 * 4u;
+            q4t_wt[dst] = wv.x; q4t_wt[dst + 1u] = wv.y;
+            q4t_wt[dst + 2u] = wv.z; q4t_wt[dst + 3u] = wv.w;
+        }
+        workgroupBarrier();
+        let ab = lid.y * 64u;
+        let wb = lid.x * 64u;
+        for (var k = 0u; k < 16u; k = k + 1u) {
+            let x0 = q4t_at[ab + k];
+            let x1 = q4t_at[ab + 16u + k];
+            let x2 = q4t_at[ab + 32u + k];
+            let x3 = q4t_at[ab + 48u + k];
+            let y0 = q4t_wt[wb + k];
+            let y1 = q4t_wt[wb + 16u + k];
+            let y2 = q4t_wt[wb + 32u + k];
+            let y3 = q4t_wt[wb + 48u + k];
+            a00 = a00 + x0 * y0; a01 = a01 + x0 * y1;
+            a02 = a02 + x0 * y2; a03 = a03 + x0 * y3;
+            a10 = a10 + x1 * y0; a11 = a11 + x1 * y1;
+            a12 = a12 + x1 * y2; a13 = a13 + x1 * y3;
+            a20 = a20 + x2 * y0; a21 = a21 + x2 * y1;
+            a22 = a22 + x2 * y2; a23 = a23 + x2 * y3;
+            a30 = a30 + x3 * y0; a31 = a31 + x3 * y1;
+            a32 = a32 + x3 * y2; a33 = a33 + x3 * y3;
+        }
+        workgroupBarrier();
+        k0 = k0 + 16u;
+    }
+    let mb = m0 + lid.y * 4u;
+    let nb2 = n0 + lid.x * 4u;
+    q4t_store4(mb, nb2, a00, a01, a02, a03);
+    q4t_store4(mb + 1u, nb2, a10, a11, a12, a13);
+    q4t_store4(mb + 2u, nb2, a20, a21, a22, a23);
+    q4t_store4(mb + 3u, nb2, a30, a31, a32, a33);
+}
+
 @compute @workgroup_size(16, 16)
 fn q4t_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
               @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -2181,6 +2285,7 @@ struct Ctx {
     q4b: wgpu::ComputePipeline,
     q4t_mv: wgpu::ComputePipeline,
     q4tp_mv: wgpu::ComputePipeline,
+    q4tp_mm: wgpu::ComputePipeline,
     silu_down: wgpu::ComputePipeline,
     q1t_mm: wgpu::ComputePipeline,
     q4t_mm: wgpu::ComputePipeline,
@@ -2561,6 +2666,7 @@ fn init() -> Result<Ctx, String> {
     let q4b = pipe("q4b_matvec");
     let q4t_mv = pipe("q4t_matvec");
     let q4tp_mv = pipe("q4tp_matvec");
+    let q4tp_mm = pipe("q4tp_mul_mm");
     let silu_down = pipe("silu_down_matvec");
     let q1t_mm = pipe("q1t_mul_mm");
     let q4t_mm = pipe("q4t_mul_mm");
@@ -2657,6 +2763,7 @@ fn init() -> Result<Ctx, String> {
         q4b,
         q4t_mv,
         q4tp_mv,
+        q4tp_mm,
         silu_down,
         q1t_mm,
         q4t_mm,
@@ -6326,6 +6433,122 @@ fn dispatch_matmat(
 /// the Metal q4t_matmat: one q4t_mul_mm dispatch reading the 18-byte
 /// tiles from the cached weight buffer. The CPU/GPU probe arbitrates
 /// per process exactly as on Metal.
+/// q4tp twin of `q4t_matmat` — the batched GEMM the wide-batch arm of
+/// `QTensor::matmat` reaches for (DiT prefill, MoE experts, dense FFN
+/// batches). Without it a q4tp model kept that arm on the CPU while q4t
+/// went to the device.
+pub fn q4tp_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let gpr = cols / 32;
+    if cols % 32 != 0 || rows == 0 || b == 0 {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    if entry.shape.first().copied().unwrap_or(0) < rows {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let bytes = model.primary_bytes();
+    let plen = entry.nbytes as usize;
+    let Some(need) =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+    else {
+        return false;
+    };
+    if plen < need
+        || abs + plen > bytes.len()
+        || xs.len() < b * cols
+        || out.len() < b * rows
+    {
+        return false;
+    }
+    let q_buf = match weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen]) {
+        Some(bf) => bf,
+        None => return false,
+    };
+    let mut sc = c.scratch.lock().unwrap();
+    let xs_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.xs,
+        (b * cols * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "q4tpmm-xs",
+    );
+    c.queue
+        .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..b * cols]));
+    let y_size = (b * rows * 4) as u64;
+    let y_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.y,
+        y_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "q4tpmm-y",
+    );
+    let params = [(cols / 4) as u32, rows as u32, b as u32, 0u32];
+    let p_buf = match &sc.params {
+        Some(bf) => bf.clone(),
+        None => {
+            let bf = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("q4tpmm-params"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            sc.params = Some(bf.clone());
+            bf
+        }
+    };
+    c.queue
+        .write_buffer(&p_buf, 0, bytemuck::cast_slice(&params));
+    let stage_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        y_size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "q4tpmm-stage",
+    );
+    let entries = [
+        bind_buf(0, &q_buf),
+        bind_buf(1, &xs_buf),
+        bind_buf(2, &y_buf),
+        bind_buf(3, &p_buf),
+    ];
+    let bind_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q4tpmm-bg"),
+        layout: &c.q4tp_mm.get_bind_group_layout(0),
+        entries: &entries,
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("q4tpmm"),
+        });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("q4tpmm"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.q4tp_mm);
+        pass.set_bind_group(0, &bind_mm, &[]);
+        pass.dispatch_workgroups(
+            (rows as u32).div_ceil(64).min(MAX_WG),
+            (b as u32).div_ceil(64),
+            1,
+        );
+    }
+    readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * rows])
+}
+
 pub fn q4t_matmat(
     model: &Arc<CmfModel>,
     idx: usize,

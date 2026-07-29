@@ -1130,6 +1130,77 @@ impl QTensor {
                     return;
                 }
                 if *dtype == TensorDtype::Q4TiledP {
+                    // GPU batched q4tp GEMM (dequant + f32nt mul_mm on the
+                    // device); the probe keeps whichever beats the CPU arm.
+                    // Narrow (prompt-encode) and wide (DiT) batches probe
+                    // as separate classes — the regimes have opposite
+                    // winners and one shared verdict locked the wrong arm.
+                    // Kill switch (gpu::mm_kill): one grossly slow GPU op
+                    // (a fair-condition op is ≤~100 ms even at 1024px)
+                    // means the device is contended by another process
+                    // (e.g. a simulator) — verdicts are per-process, so
+                    // without the bail the whole render crawls behind
+                    // someone else's queue.
+                    if b >= 32
+                        && b * rows * cols >= 128_000_000
+                        && cols % 32 == 0
+                        && !crate::gpu::mm_killed()
+                        && crate::gpu::enabled_here()
+                    {
+                        let class = if b >= 128 {
+                            crate::gpu::OpClass::MatmatWide
+                        } else {
+                            crate::gpu::OpClass::Matmat
+                        };
+                        if let Self::Mapped { model, idx, .. } = self {
+                            let t0 = std::time::Instant::now();
+                            match crate::gpu::probe_arm(class) {
+                                crate::gpu::ProbeArm::Gpu => {
+                                    if crate::gpu::q4tp_matmat(
+                                        model, *idx, xs_all, b, rows, cols, out,
+                                    ) {
+                                        let el = t0.elapsed();
+                                        // Work-proportional budget: ~8× the
+                                        // fair-device estimate (+20 ms slack).
+                                        // An absolute cap missed the worst
+                                        // case — contended ops sit at
+                                        // 100–240 ms each and still bury a
+                                        // render whose fair op is 3–9 ms.
+                                        // Cold ops (first PSO build, buffer
+                                        // alloc) are exempt: a one-off
+                                        // ~50 ms compile is not contention.
+                                        let flops = 2.0 * b as f64 * rows as f64 * cols as f64;
+                                        let budget = std::time::Duration::from_secs_f64(
+                                            flops / 1.5e12 * 8.0 + 0.020,
+                                        );
+                                        if el > budget && !crate::gpu::probe_was_cold() {
+                                            tracing::warn!(
+                                                "gpu q4tp matmat took {el:?} (budget {budget:?}) — \
+                                                 device contended, CPU for the rest of the process"
+                                            );
+                                            crate::gpu::mm_kill();
+                                        }
+                                        crate::gpu::probe_record(class, true, el);
+                                        return;
+                                    }
+                                }
+                                crate::gpu::ProbeArm::CpuTimed => {
+                                    q4tp_matmat(
+                                        self.quant_bytes(),
+                                        xs_all,
+                                        b,
+                                        rows,
+                                        cols,
+                                        out,
+                                        pool,
+                                    );
+                                    crate::gpu::probe_record(class, false, t0.elapsed());
+                                    return;
+                                }
+                                crate::gpu::ProbeArm::Cpu => {}
+                            }
+                        }
+                    }
                     q4tp_matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
                     return;
                 }
