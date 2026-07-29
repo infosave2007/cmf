@@ -208,11 +208,40 @@ cortiq info   model.cmf     # arch, tensors, quantization, skills
 
 权重经内存映射后就地读取，因此启动是瞬时的，未使用的权重从不进入内存。量化是
 按张量来的，且可以混用——`q8`（1 byte/param）· `q8_2f`（int8，同时带每行和每列
-两个缩放因子——相同字节数下质量更好）· `q4`（0.5）· `q1t`（**免训练三值**，
-`{−s,0,+s}` + 稀疏离群值叠加层，约 2.25–3.5 bit/param——低于 `q4`，用
-`quantize-gptq` 生成，在 Metal 与 wgpu 上均有 GPU 加速）· `q1`（1 位）· `f16` ·
+两个缩放因子——相同字节数下质量更好）· `q4`（0.5）· `q4t`（同样的 4 位网格，
+交错平铺）· `q4tp`（**带预测 scale 的 q4t**——0.52 B/param，见下）· `q1t`
+（**免训练三值**，`{−s,0,+s}` + 稀疏离群值叠加层，约 2.25–3.5 bit/param——低于
+`q4`，用 `quantize-gptq` 生成，在 Metal 与 wgpu 上均有 GPU 加速）· `q1`（1 位）
+· `f16` ·
 `vbit`（可变 3–8 bit，均值约 4.25 ≈ 0.53）——所以你可以在同一个文件里把注意力
 保持在 q8，而把 FFN 压到 q4/q1t。参见 [q1t PTQ](docs/Q1T_PTQ.md)。
+
+#### `q4tp`——任何 q4t 文件小 7%，只花约 0.1% 的误差预算
+
+一个 `q4t` 平铺块要为 32 个权重花 16 位存独立的 f16 scale：占其 4.5 bit/weight
+中的 0.5，即**文件的 11%**。`q4tp` 保持 nibble 逐字节不变，把这个 scale 变成
+按行几何阶梯上的 5 位档位，于是是 4.17 bit/weight。
+
+代价几乎为零。用**同一份** fp32 权重分别量化，`q4tp` 相对源权重的误差是
+9.71%，而 `q4t` 是 9.71%——在 KAT-Coder-V2.5 上实测的行内 scale 跨度中位数处
+相对增加 **0.1%**，在其 90 分位处 0.3%。scale 粗一点几乎无所谓：nibble 会据此
+重新取整，误差始终由 4 位网格主导。Nanbeige-3B 的 top-5 下一 token 顺序不变，
+logit 相差在 0.7% 以内。
+
+已发布的 `.cmf` 可就地转换，无需原始 checkpoint——当模型背后是几十 GB 时这很
+关键：
+
+```sh
+cortiq requant model.cmf --output model-q4tp.cmf --quant q4tp
+# KAT-Coder-V2.5：12.65 → 11.80 GB（19254 个张量），2 分钟
+# Nanbeige-3B：    2.36 →  2.19 GB，峰值 RSS 2.42 → 2.19 GB
+```
+
+`cortiq convert --quant q4tp` 可直接从 HF checkpoint 生成。内核覆盖所有路径——
+CPU（标量、sdot/AVX2/VNNI int8、1×4 分块、Accelerate）、Metal 与 wgpu，解码与
+批量 prefill 皆可。速度持平或更好：16 B 的 nibble 步长是 4 对齐的，因此 matvec
+读四个 `uint`，而 `q4t` 需要九个非对齐 `ushort`；b=64 的批量 GEMM 在 Metal 上是
+9.51 对 10.13 ms，在 wgpu 上是 9.83 对 10.76。
 
 ### 多个专家，共用一个骨干
 

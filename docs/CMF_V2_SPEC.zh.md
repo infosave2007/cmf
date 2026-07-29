@@ -242,12 +242,23 @@ k 个的页面 —— 与技能相同的驻留机制。写入器应当把一层�
 | 12 | `q1`      | ✅ 读/写——1 位二值权重，仅用于按 1 位训练的模型（`--quant q1`）；每 32 组一个 `[f16 scale][4B 符号位]` 平铺，`w = s·(2·bit−1)` |
 | 13 | `q1s`     | ✅ 读/写——`q1` 基底 + 稀疏高精度离群值覆盖层（普通检查点的 1 位 PTQ）：基底之后是 `[u32 count]` 与 `count × { [u32 扁平索引][f16 值] }`；变长，读取器信任目录中记录的字节数 |
 | 14 | `q1t`     | ✅ 读/写——三值 `{−s, 0, +s}`（BitNet b1.58 风格）：每 32 组 `[f16 scale][7B base-3 码]`（每字节 5 个三值，3⁵=243≤256；码 0→0、1→+s、2→−s，约 2.25 bpw），随后按行的离群值覆盖层 `[u32 row_ptr[rows+1]]` + `{ [u16 col][f16 值] }`（第 r 行的离群值在 `[row_ptr[r], row_ptr[r+1])`，`col` 为行内索引）；变长，规则同 `q1s` |
+| 15 | `q4tp`    | ✅ 读/写——`q4_tiled` 的 nibble，但每块 scale 改为按行阶梯上的 5 位档位（`--quant q4tp`，或用 `requant` 就地转换） |
 
 ### 3.2 量化布局（正典 = `.vmfc`："先量化值，后 scale"）
 
 - **`q8_row`**（仅限二维 `[out, in]`）：
   `[int8 : out·in][f16 : out]` —— 每行一个 scale，
   `w = q[o,i]·scale[o]`，`scale[o] = absmax(row_o)/127`。
+- **`q4tp`**（仅限二维，`in % 32 == 0`）：
+  `[nibbles: rows·gpr·16][行参数: rows × (f16 lo, f16 step)]
+   [codes: rows × ceil(gpr·5/8)，5 位 LSB-first，按行对齐]`，`gpr = in/32`。
+  每块 scale 为 `2^(lo[r] + code·step[r])`，因此读取方只需展开该行的 32 级
+  阶梯一次，之后按表查 scale。nibble 的取值与顺序同 `q4_tiled`，仅 scale 的
+  表示不同：4.17 bit/weight 对 4.50——f16 scale 曾占 q4t 文件的 11%。
+  `lo`/`step` 取自该行 log-scale 的精确 min/max，故码值绝不会越界，格式无需
+  逃逸机制。编码器**必须**先把 `lo`/`step` 舍入到 f16 再选码，并按重建后的
+  scale 量化 nibble——否则写入方与读取方会不一致（这正是 q4 编码器必须先舍入
+  scale 的同一个陷阱）。
 - **`q4_block`**：在展平张量上按 32 分组，零填充；
   `[u8 : ceil(n/32)·16][f16 : ceil(n/32)]`。
   半字节：元素 `2k` 为低位，`2k+1` 为高位；`w = (q − 8)·scale`，
