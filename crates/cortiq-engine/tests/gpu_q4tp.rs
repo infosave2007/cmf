@@ -2,8 +2,12 @@
 //!
 //! A wrong GPU kernel is the expensive kind of bug: the model still emits
 //! fluent text, so nothing looks broken until someone measures quality. This
-//! pins the kernel to `dequant_q4tp`, which is the format's definition.
-#![cfg(target_os = "macos")]
+//! pins each backend's kernel to `dequant_q4tp`, the format's definition.
+//!
+//! The two tests select their backend through `CMF_GPU`, which cargo's
+//! threads share. Their contexts are independent `OnceLock`s so both do run,
+//! but a backend that fails to come up says so on stderr rather than passing
+//! quietly — check for "skipped" before trusting a green combined run.
 
 use cortiq_core::format::{CMF_VERSION, CmfHeader, CmfModel, TensorSpec};
 use cortiq_core::quant::{
@@ -90,13 +94,8 @@ fn tiny_model(rows: usize, cols: usize, payload: Vec<u8>) -> (std::sync::Arc<Cmf
     (model, idx)
 }
 
-#[test]
-fn metal_q4tp_matvec_matches_dequant_reference() {
-    unsafe { std::env::set_var("CMF_GPU", "1") };
-    if !cortiq_engine::gpu_metal::enabled() {
-        eprintln!("skipped: Metal disabled");
-        return;
-    }
+/// Compare a backend's kernel against the scalar dequant over a whole tensor.
+fn check(run: impl Fn(&std::sync::Arc<CmfModel>, usize, &[f32], usize, usize, &mut [f32]) -> bool) {
     let (rows, cols) = (512usize, 1024usize);
     let payload = synth(rows, cols);
     let mut w = vec![0f32; rows * cols];
@@ -108,7 +107,7 @@ fn metal_q4tp_matvec_matches_dequant_reference() {
         .collect();
     let mut got = vec![0f32; rows];
     assert!(
-        cortiq_engine::gpu_metal::q4tp_matvec_for_test(&model, idx, &xs, rows, cols, &mut got),
+        run(&model, idx, &xs, rows, cols, &mut got),
         "GPU refused a well-formed q4tp tensor"
     );
 
@@ -123,4 +122,28 @@ fn metal_q4tp_matvec_matches_dequant_reference() {
             got[r]
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_q4tp_matvec_matches_dequant_reference() {
+    unsafe { std::env::set_var("CMF_GPU", "1") };
+    if !cortiq_engine::gpu_metal::enabled() {
+        eprintln!("skipped: Metal disabled");
+        return;
+    }
+    check(cortiq_engine::gpu_metal::q4tp_matvec_for_test);
+}
+
+/// wgpu covers Vulkan/DX12; `CMF_GPU=wgpu` selects it on macOS too, so this
+/// runs locally instead of only on the machines that have no other backend.
+#[cfg(feature = "gpu")]
+#[test]
+fn wgpu_q4tp_matvec_matches_dequant_reference() {
+    unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+    if !cortiq_engine::gpu_wgpu::enabled() {
+        eprintln!("skipped: no wgpu adapter");
+        return;
+    }
+    check(cortiq_engine::gpu_wgpu::q4tp_matvec_for_test);
 }

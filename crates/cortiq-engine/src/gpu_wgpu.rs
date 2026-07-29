@@ -1239,6 +1239,76 @@ fn q4t_matvec(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// q4tp matvec: same nibble values as q4t, but the stride is a clean 16 B —
+// so the words come straight off the u32 array instead of being assembled
+// from u16 halves the way q4t's 2-aligned 18 B tiles force. The scale is a
+// 5-bit rung on the row's ladder, kept in two planes after the nibbles.
+//
+// A workgroup owns one row at a time, so it expands that row's 32 rungs once
+// into workgroup memory. Evaluating 2^(lo + code*step) per tile instead was
+// measured on Metal to cost the model ~15% even though the kernel benchmarked
+// faster standalone: the graph's dispatches serialize on each other, which
+// exposes the dependent chain (code byte → exp2 → scale) that a free-running
+// benchmark hides.
+var<workgroup> lad_q4tp: array<f32, 32>;
+
+fn q4tp_byte(off: u32) -> u32 {
+    return (q1w[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+@compute @workgroup_size(64)
+fn q4tp_matvec(@builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(num_workgroups) nwg: vec3<u32>,
+               @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let params_w = rows * gpr * 4u;                  // u32 index of row params
+    let codes_b = rows * gpr * 16u + rows * 4u;      // byte offset of the codes
+    let cstride = (gpr * 5u + 7u) / 8u;
+    var row = wid.x;
+    loop {
+        if (row >= rows) { break; }
+        if (lid < 32u) {
+            let pr = unpack2x16float(q1w[params_w + row]);
+            lad_q4tp[lid] = exp2(pr.x + f32(lid) * pr.y);
+        }
+        workgroupBarrier();
+        var acc = 0.0;
+        var g = lid;
+        loop {
+            if (g >= gpr) { break; }
+            let bit = g * 5u;
+            let cb = codes_b + row * cstride + (bit >> 3u);
+            let sh = bit & 7u;
+            // The 5-bit field spills into the next byte past bit 3; the row's
+            // stride always holds that byte when it does.
+            var cv = q4tp_byte(cb);
+            if (sh > 3u) { cv = cv | (q4tp_byte(cb + 1u) << 8u); }
+            let scale = lad_q4tp[(cv >> sh) & 31u];
+            let base = (row * gpr + g) * 4u;
+            let xb = g * 32u;
+            var gsum = 0.0;
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                gsum = gsum + q4b_dot8(q1w[base + k], xb + 8u * k);
+            }
+            acc = acc + scale * gsum;
+            g = g + 64u;
+        }
+        partial_q1t[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid < stride) { partial_q1t[lid] = partial_q1t[lid] + partial_q1t[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lid == 0u) { q1y[row] = partial_q1t[0]; }
+        workgroupBarrier();
+        row = row + nwg.x;
+    }
+}
+
 // Fused SiLU(gate)·up → Q4Block down-proj matvec: eliminates the standalone
 // silu dispatch (saves one inter-pass pipeline flush per layer).
 @group(0) @binding(0) var<storage, read>       sd_w : array<u32>;
@@ -2110,6 +2180,7 @@ struct Ctx {
     q1t: wgpu::ComputePipeline,
     q4b: wgpu::ComputePipeline,
     q4t_mv: wgpu::ComputePipeline,
+    q4tp_mv: wgpu::ComputePipeline,
     silu_down: wgpu::ComputePipeline,
     q1t_mm: wgpu::ComputePipeline,
     q4t_mm: wgpu::ComputePipeline,
@@ -2489,6 +2560,7 @@ fn init() -> Result<Ctx, String> {
     let q1t = pipe("q1t_matvec");
     let q4b = pipe("q4b_matvec");
     let q4t_mv = pipe("q4t_matvec");
+    let q4tp_mv = pipe("q4tp_matvec");
     let silu_down = pipe("silu_down_matvec");
     let q1t_mm = pipe("q1t_mul_mm");
     let q4t_mm = pipe("q4t_mul_mm");
@@ -2584,6 +2656,7 @@ fn init() -> Result<Ctx, String> {
         q1t,
         q4b,
         q4t_mv,
+        q4tp_mv,
         silu_down,
         q1t_mm,
         q4t_mm,
@@ -3794,8 +3867,8 @@ pub fn forward_token_graph(
                     kind: 1,
                 })
             }
-            2 | 3 | 5 => {
-                // q4_block / q1t / q4_tiled: the tensor carries its own byte
+            2 | 3 | 5 | 6 => {
+                // q4_block / q1t / q4_tiled / q4tp: the tensor carries its own byte
                 // length (tiles + q1t's sparse overlay) — fetch whole,
                 // device-local.
                 let entry = model.tensors.get(gw.idx)?;
@@ -4251,6 +4324,7 @@ pub fn forward_token_graph(
             2 => encode_q1t_like(c, enc, &c.q4b, &m.buf, xs, y, rows, cols),
             3 => encode_q1t_like(c, enc, &c.q1t, &m.buf, xs, y, rows, cols),
             5 => encode_q1t_like(c, enc, &c.q4t_mv, &m.buf, xs, y, rows, cols),
+            6 => encode_q1t_like(c, enc, &c.q4tp_mv, &m.buf, xs, y, rows, cols),
             _ => encode_f32matvec(c, enc, &m.buf, xs, y, rows, cols),
         }
     };
@@ -4309,10 +4383,14 @@ pub fn forward_token_graph(
                 });
                 Some((&c.f32_matvec, bind, (rows as u32).min(MAX_WG)))
             }
-            2 | 5 => {
+            2 | 5 | 6 => {
                 let gpr = cols / 32;
                 let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
-                let pl = if m.kind == 5 { &c.q4t_mv } else { &c.q4b };
+                let pl = match m.kind {
+                    5 => &c.q4t_mv,
+                    6 => &c.q4tp_mv,
+                    _ => &c.q4b,
+                };
                 let layout = pl.get_bind_group_layout(0);
                 let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
@@ -6353,6 +6431,78 @@ pub fn q4t_matmat(
         );
     }
     readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * rows])
+}
+
+/// One q4tp matvec through the WGSL kernel, weight fetched from the model.
+/// Exists so the shader can be pinned to `dequant_q4tp` in a test: the token
+/// graph is the only other caller, and a wrong kernel there still produces
+/// fluent text.
+#[doc(hidden)]
+pub fn q4tp_matvec_for_test(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % 32 != 0 || rows == 0 || xs.len() < cols || out.len() < rows {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    if entry.dtype != cortiq_core::TensorDtype::Q4TiledP {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let bytes = model.primary_bytes();
+    let plen = entry.nbytes as usize;
+    let Some(need) =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+    else {
+        return false;
+    };
+    if plen < need || abs + plen > bytes.len() {
+        return false;
+    }
+    let Some(q_buf) = weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen])
+    else {
+        return false;
+    };
+    let mut sc = c.scratch.lock().unwrap();
+    let xs_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.xs,
+        (cols * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "q4tp-xs",
+    );
+    c.queue
+        .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..cols]));
+    let y_size = (rows * 4) as u64;
+    let y_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.y,
+        y_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "q4tp-y",
+    );
+    let stage_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        y_size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "q4tp-stage",
+    );
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("q4tp-mv"),
+        });
+    encode_q1t_like(c, &mut enc, &c.q4tp_mv, &q_buf, &xs_buf, &y_buf, rows, cols);
+    readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..rows])
 }
 
 /// DiT attention on wgpu: per head, scores = scale·Q·Kᵀ → row softmax →

@@ -450,6 +450,15 @@ impl QTensor {
                 dtype: TensorDtype::Q4Tiled,
                 ..
             } => Some((model, *idx, 5, &[])),
+            // Kind 6, not 5: q4tp's nibble stride and scale planes differ,
+            // and feeding them to the q4t kernel is exactly the mistake that
+            // produced garbage when Q4Tiled shared kind 2 with Q4Block.
+            Self::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q4TiledP,
+                ..
+            } => Some((model, *idx, 6, &[])),
             Self::Mapped {
                 model,
                 idx,
