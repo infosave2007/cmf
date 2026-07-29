@@ -367,6 +367,12 @@ pub struct MoeFfn {
     /// disagree. Off unless the env var is set — an f64 add per channel
     /// per token is cheap, but not free.
     pub act_sq: std::cell::RefCell<Vec<f64>>,
+    /// Raw FFN-input rows captured for the layers named by `CMF_ACT_DUMP`
+    /// (`"9,19"`). AWNP is nullspace PROJECTION: after dropping channels the
+    /// survivors are refitted to absorb what was removed, and how much they
+    /// can absorb depends on the activation COVARIANCE, not on per-channel
+    /// RMS. Per-channel numbers can only bound the cost from above.
+    pub act_rows: std::cell::RefCell<Vec<f32>>,
     /// Task mask over routed experts (DTG-MA over MoE, claim-12 B-field
     /// applied): `false` experts are excluded from selection, the
     /// softmax renormalizes over the allowed set. Built by the loader
@@ -4522,18 +4528,36 @@ fn dense_ffn_batch(d: &DenseFfn, xs: &[f32], b: usize, pool: Option<&Pool>) -> V
 /// Accumulate per-channel activation energy for `CMF_RMS_TRACE`.
 fn accumulate_act(m: &MoeFfn, xs: &[f32], b: usize) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("CMF_RMS_TRACE").is_ok()) || b == 0 {
+    static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("CMF_RMS_TRACE").is_ok());
+    let dump = *DUMP.get_or_init(|| std::env::var("CMF_ACT_DUMP").is_ok());
+    if (!on && !dump) || b == 0 {
         return;
     }
     let hidden = xs.len() / b;
-    let mut acc = m.act_sq.borrow_mut();
-    if acc.len() < hidden {
-        acc.resize(hidden, 0.0);
+    if on {
+        let mut acc = m.act_sq.borrow_mut();
+        if acc.len() < hidden {
+            acc.resize(hidden, 0.0);
+        }
+        for t in 0..b {
+            let row = &xs[t * hidden..(t + 1) * hidden];
+            for (a, &v) in acc.iter_mut().zip(row) {
+                *a += (v as f64) * (v as f64);
+            }
+        }
     }
-    for t in 0..b {
-        let row = &xs[t * hidden..(t + 1) * hidden];
-        for (a, &v) in acc.iter_mut().zip(row) {
-            *a += (v as f64) * (v as f64);
+    if dump {
+        // Cap the capture: the covariance needs a few thousand rows, and a
+        // whole prefill of every layer would be gigabytes for no extra rank.
+        let cap: usize = std::env::var("CMF_ACT_DUMP_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096);
+        let mut rows = m.act_rows.borrow_mut();
+        if rows.len() < cap * hidden {
+            let take = b.min((cap * hidden - rows.len()) / hidden.max(1));
+            rows.extend_from_slice(&xs[..take * hidden]);
         }
     }
 }
@@ -5620,6 +5644,7 @@ mod tests {
             shared: Some((shared, None)),
             stats: std::cell::RefCell::new(Vec::new()),
             act_sq: std::cell::RefCell::new(Vec::new()),
+            act_rows: std::cell::RefCell::new(Vec::new()),
             mask: None,
             per_expert_scale: None,
             router_input_norm: false,

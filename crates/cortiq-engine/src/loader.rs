@@ -248,6 +248,7 @@ pub(crate) fn build_layer_ffn(
         shared,
         stats: std::cell::RefCell::new(Vec::new()),
         act_sq: std::cell::RefCell::new(Vec::new()),
+        act_rows: std::cell::RefCell::new(Vec::new()),
         mask,
         per_expert_scale,
         router_input_norm,

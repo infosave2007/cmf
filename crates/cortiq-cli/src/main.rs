@@ -1811,6 +1811,29 @@ fn dump_moe_stats(pipeline: &Pipeline) -> anyhow::Result<()> {
         std::fs::write(&path, format!("{{{}}}", parts.join(",")))?;
         println!("RMS activation traces → {path} ({} layers)", parts.len());
     }
+    if let Ok(spec) = std::env::var("CMF_ACT_DUMP") {
+        // "<path>:<layer>,<layer>" — raw f32 rows per requested layer, so an
+        // offline tool can form the activation covariance AWNP projects into.
+        let (path, want) = spec.split_once(':').unwrap_or((spec.as_str(), ""));
+        let want: Vec<usize> = want.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        for (li, lw) in pipeline.weights.layers.iter().enumerate() {
+            if !want.is_empty() && !want.contains(&li) {
+                continue;
+            }
+            if let cortiq_engine::pipeline::FfnKind::Moe(m) = &lw.ffn {
+                let rows = m.act_rows.borrow();
+                if rows.is_empty() {
+                    continue;
+                }
+                let mut bytes = Vec::with_capacity(rows.len() * 4);
+                for v in rows.iter() {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                std::fs::write(format!("{path}.{li}.f32"), &bytes)?;
+                println!("activations layer {li} → {path}.{li}.f32 ({} floats)", rows.len());
+            }
+        }
+    }
     Ok(())
 }
 
