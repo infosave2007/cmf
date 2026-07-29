@@ -1753,6 +1753,145 @@ fn moe_down(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) { md_y[row] = md_pt[0]; }
 }
+// ── DiT attention (imagegen): scores GEMM -> row softmax -> P·V.
+// Same 64x64 tile / 4x4 named-scalar register block as the quantized
+// GEMMs; the operands are plain f32 here, so the staging is a copy.
+struct DitP { m: u32, k: u32, n: u32, scale: f32, };
+@group(0) @binding(0) var<storage, read> da: array<f32>;
+@group(0) @binding(1) var<storage, read> db: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dc: array<f32>;
+@group(0) @binding(3) var<uniform> dp: DitP;
+var<workgroup> dit_at: array<f32, 1024>;
+var<workgroup> dit_bt: array<f32, 1024>;
+
+fn dit_gemm(wid: vec3<u32>, lid: vec3<u32>, bt: bool) {
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    let tid = lid.y * 16u + lid.x;
+    var a00 = 0.0; var a01 = 0.0; var a02 = 0.0; var a03 = 0.0;
+    var a10 = 0.0; var a11 = 0.0; var a12 = 0.0; var a13 = 0.0;
+    var a20 = 0.0; var a21 = 0.0; var a22 = 0.0; var a23 = 0.0;
+    var a30 = 0.0; var a31 = 0.0; var a32 = 0.0; var a33 = 0.0;
+    var k0 = 0u;
+    loop {
+        if (k0 >= dp.k) { break; }
+        for (var q = 0u; q < 4u; q = q + 1u) {
+            let r = tid / 4u + q * 64u;
+            if (r < 64u) {
+                let c4 = (tid % 4u) * 4u;
+                for (var e = 0u; e < 4u; e = e + 1u) {
+                    let kk = k0 + c4 + e;
+                    var va = 0.0;
+                    if (m0 + r < dp.m && kk < dp.k) { va = da[(m0 + r) * dp.k + kk]; }
+                    dit_at[r * 16u + c4 + e] = va;
+                    var vb = 0.0;
+                    if (n0 + r < dp.n && kk < dp.k) {
+                        if (bt) { vb = db[(n0 + r) * dp.k + kk]; }
+                        else { vb = db[kk * dp.n + n0 + r]; }
+                    }
+                    dit_bt[r * 16u + c4 + e] = vb;
+                }
+            }
+        }
+        workgroupBarrier();
+        let ab = lid.y * 64u;
+        let wb = lid.x * 64u;
+        for (var k = 0u; k < 16u; k = k + 1u) {
+            let x0 = dit_at[ab + k];
+            let x1 = dit_at[ab + 16u + k];
+            let x2 = dit_at[ab + 32u + k];
+            let x3 = dit_at[ab + 48u + k];
+            let y0 = dit_bt[wb + k];
+            let y1 = dit_bt[wb + 16u + k];
+            let y2 = dit_bt[wb + 32u + k];
+            let y3 = dit_bt[wb + 48u + k];
+            a00 = a00 + x0 * y0; a01 = a01 + x0 * y1;
+            a02 = a02 + x0 * y2; a03 = a03 + x0 * y3;
+            a10 = a10 + x1 * y0; a11 = a11 + x1 * y1;
+            a12 = a12 + x1 * y2; a13 = a13 + x1 * y3;
+            a20 = a20 + x2 * y0; a21 = a21 + x2 * y1;
+            a22 = a22 + x2 * y2; a23 = a23 + x2 * y3;
+            a30 = a30 + x3 * y0; a31 = a31 + x3 * y1;
+            a32 = a32 + x3 * y2; a33 = a33 + x3 * y3;
+        }
+        workgroupBarrier();
+        k0 = k0 + 16u;
+    }
+    let mb = m0 + lid.y * 4u;
+    let nb2 = n0 + lid.x * 4u;
+    dit_store4(mb, nb2, a00, a01, a02, a03);
+    dit_store4(mb + 1u, nb2, a10, a11, a12, a13);
+    dit_store4(mb + 2u, nb2, a20, a21, a22, a23);
+    dit_store4(mb + 3u, nb2, a30, a31, a32, a33);
+}
+
+fn dit_store4(m: u32, n0: u32, v0: f32, v1: f32, v2: f32, v3: f32) {
+    if (m >= dp.m) { return; }
+    let base = m * dp.n + n0;
+    if (n0 < dp.n) { dc[base] = v0 * dp.scale; }
+    if (n0 + 1u < dp.n) { dc[base + 1u] = v1 * dp.scale; }
+    if (n0 + 2u < dp.n) { dc[base + 2u] = v2 * dp.scale; }
+    if (n0 + 3u < dp.n) { dc[base + 3u] = v3 * dp.scale; }
+}
+
+@compute @workgroup_size(16, 16)
+fn dit_qk(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    dit_gemm(wid, lid, true);
+}
+
+@compute @workgroup_size(16, 16)
+fn dit_pv(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    dit_gemm(wid, lid, false);
+}
+
+var<workgroup> dit_red: array<f32, 256>;
+
+// Row softmax over dc, one workgroup per row of dp.n columns.
+@compute @workgroup_size(256)
+fn dit_softmax(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.x * dp.n;
+    let t = lid.x;
+    var mx = -3.4e38;
+    for (var j = t; j < dp.n; j = j + 256u) { mx = max(mx, dc[row + j]); }
+    dit_red[t] = mx;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (t < s) { dit_red[t] = max(dit_red[t], dit_red[t + s]); }
+        workgroupBarrier();
+    }
+    let m = dit_red[0];
+    workgroupBarrier();
+    var sum = 0.0;
+    for (var j = t; j < dp.n; j = j + 256u) {
+        let e = exp(dc[row + j] - m);
+        dc[row + j] = e;
+        sum = sum + e;
+    }
+    dit_red[t] = sum;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (t < s) { dit_red[t] = dit_red[t] + dit_red[t + s]; }
+        workgroupBarrier();
+    }
+    let inv = 1.0 / dit_red[0];
+    for (var j = t; j < dp.n; j = j + 256u) { dc[row + j] = dc[row + j] * inv; }
+}
+
+// [nh][n][hd] panel -> [n][nh*hd].
+@compute @workgroup_size(256)
+fn dit_unstack(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let total = dp.m * dp.k * dp.n;   // nh * n * hd
+    if (i >= total) { return; }
+    let hd = dp.n;
+    let n = dp.k;
+    let h = i / (n * hd);
+    let rest = i % (n * hd);
+    let tok = rest / hd;
+    let d = rest % hd;
+    dc[tok * dp.m * hd + h * hd + d] = da[i];
+}
+
 "#;
 
 // Split-K decode attention (its own module: the main module's at_* binding
@@ -1968,6 +2107,10 @@ struct Ctx {
     silu_down: wgpu::ComputePipeline,
     q1t_mm: wgpu::ComputePipeline,
     q4t_mm: wgpu::ComputePipeline,
+    dit_qk: wgpu::ComputePipeline,
+    dit_pv: wgpu::ComputePipeline,
+    dit_softmax: wgpu::ComputePipeline,
+    dit_unstack: wgpu::ComputePipeline,
     ffn_silu: wgpu::ComputePipeline,
     q1t_ovmm: wgpu::ComputePipeline,
     rmsnorm: wgpu::ComputePipeline,
@@ -2082,6 +2225,15 @@ struct Scratch {
     /// Fused-FFN intermediates (gate / up panels).
     g: Option<(wgpu::Buffer, u64)>,
     u: Option<(wgpu::Buffer, u64)>,
+    /// DiT attention: Q/K/V uploads, scores, panel, output, staging.
+    dq: Option<(wgpu::Buffer, u64)>,
+    dk: Option<(wgpu::Buffer, u64)>,
+    dv: Option<(wgpu::Buffer, u64)>,
+    dsc: Option<(wgpu::Buffer, u64)>,
+    dpan: Option<(wgpu::Buffer, u64)>,
+    dout: Option<(wgpu::Buffer, u64)>,
+    dstage: Option<(wgpu::Buffer, u64)>,
+    dpar: Option<wgpu::Buffer>,
 }
 
 impl Scratch {
@@ -2334,6 +2486,10 @@ fn init() -> Result<Ctx, String> {
     let silu_down = pipe("silu_down_matvec");
     let q1t_mm = pipe("q1t_mul_mm");
     let q4t_mm = pipe("q4t_mul_mm");
+    let dit_qk = pipe("dit_qk");
+    let dit_pv = pipe("dit_pv");
+    let dit_softmax = pipe("dit_softmax");
+    let dit_unstack = pipe("dit_unstack");
     let ffn_silu = pipe("ffn_silu_mul");
     let q1t_ovmm = pipe("q1t_overlay_mm");
     let rmsnorm = pipe("rmsnorm");
@@ -2425,6 +2581,10 @@ fn init() -> Result<Ctx, String> {
         silu_down,
         q1t_mm,
         q4t_mm,
+        dit_qk,
+        dit_pv,
+        dit_softmax,
+        dit_unstack,
         ffn_silu,
         q1t_ovmm,
         rmsnorm,
@@ -6187,6 +6347,240 @@ pub fn q4t_matmat(
         );
     }
     readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * rows])
+}
+
+/// DiT attention on wgpu: per head, scores = scale·Q·Kᵀ → row softmax →
+/// P·V, then one unstack of the [nh][n][hd] panel into [n][nh·hd]. All
+/// of it in ONE submission with the scores and the panel resident on the
+/// device — the CPU only ships Q/K/V in and the result out. Head-major
+/// inputs, matching `gpu_metal::dit_attention`.
+#[allow(clippy::too_many_arguments)]
+pub fn dit_attention(
+    qh: &[f32],
+    kh: &[f32],
+    vh: &[f32],
+    nh: usize,
+    nkv: usize,
+    n: usize,
+    hd: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if nh == 0 || nkv == 0 || n == 0 || hd == 0 || nh % nkv != 0 {
+        return false;
+    }
+    if qh.len() < nh * n * hd || kh.len() < nkv * n * hd || vh.len() < nkv * n * hd {
+        return false;
+    }
+    if out.len() < n * nh * hd {
+        return false;
+    }
+    let dev = &c.device;
+    // Grow-only slots, not fresh allocations per call: a render calls
+    // this 26 times per forward and the driver's allocator is not free.
+    // `Scratch::ensure` also flags the cold call so the contention
+    // tripwire does not read a one-off buffer creation as a busy device.
+    let mut sc = c.scratch.lock().unwrap();
+    let st = wgpu::BufferUsages::STORAGE;
+    let up = |slot: &mut Option<(wgpu::Buffer, u64)>, data: &[f32], label: &str| -> wgpu::Buffer {
+        let b = Scratch::ensure(
+            dev,
+            slot,
+            (data.len() * 4) as u64,
+            st | wgpu::BufferUsages::COPY_DST,
+            label,
+        );
+        c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
+        b
+    };
+    let qb = up(&mut sc.dq, &qh[..nh * n * hd], "dit-q");
+    let kb = up(&mut sc.dk, &kh[..nkv * n * hd], "dit-k");
+    let vb = up(&mut sc.dv, &vh[..nkv * n * hd], "dit-v");
+    let scb = Scratch::ensure(dev, &mut sc.dsc, (n * n * 4) as u64, st, "dit-scores");
+    let pb = Scratch::ensure(dev, &mut sc.dpan, (nh * n * hd * 4) as u64, st, "dit-panel");
+    let ab = Scratch::ensure(
+        dev,
+        &mut sc.dout,
+        (n * nh * hd * 4) as u64,
+        st | wgpu::BufferUsages::COPY_SRC,
+        "dit-out",
+    );
+    let stage = Scratch::ensure(
+        dev,
+        &mut sc.dstage,
+        (n * nh * hd * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "dit-stage",
+    );
+    drop(sc);
+
+    // One uniform per distinct (m, k, n, scale) shape; the head offset
+    // rides in the bound slice, not the params.
+    let params = |m: u32, k: u32, nn: u32, sc: f32| -> wgpu::Buffer {
+        let raw = [m, k, nn, sc.to_bits()];
+        let b = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dit-params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        c.queue.write_buffer(&b, 0, bytemuck::cast_slice(&raw));
+        b
+    };
+    let p_qk = params(n as u32, hd as u32, n as u32, scale);
+    let p_sm = params(n as u32, hd as u32, n as u32, 1.0);
+    let p_pv = params(n as u32, n as u32, hd as u32, 1.0);
+    let p_un = params(nh as u32, n as u32, hd as u32, 1.0);
+
+    let bind = |pipe: &wgpu::ComputePipeline,
+                a: &wgpu::Buffer,
+                ao: u64,
+                al: u64,
+                b: &wgpu::Buffer,
+                bo: u64,
+                bl: u64,
+                cc: &wgpu::Buffer,
+                co: u64,
+                cl: u64,
+                pp: &wgpu::Buffer|
+     -> wgpu::BindGroup {
+        dev.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dit-bg"),
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: a,
+                        offset: ao,
+                        size: std::num::NonZeroU64::new(al),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: b,
+                        offset: bo,
+                        size: std::num::NonZeroU64::new(bl),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: cc,
+                        offset: co,
+                        size: std::num::NonZeroU64::new(cl),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: pp.as_entire_binding(),
+                },
+            ],
+        })
+    };
+
+    let hpk = nh / nkv;
+    let head = (n * hd * 4) as u64;
+    let sc_len = (n * n * 4) as u64;
+    let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("dit-attn"),
+    });
+    for h in 0..nh {
+        let kv = (h / hpk) as u64;
+        let bg_qk = bind(
+            &c.dit_qk, &qb, h as u64 * head, head, &kb, kv * head, head, &scb, 0, sc_len, &p_qk,
+        );
+        // Naga derives each pipeline's layout from the bindings it
+        // actually uses: softmax touches only the scores and the params,
+        // so its group has two entries, not four.
+        let bg_sm = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dit-sm-bg"),
+            layout: &c.dit_softmax.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: scb.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: p_sm.as_entire_binding(),
+                },
+            ],
+        });
+        let bg_pv = bind(
+            &c.dit_pv, &scb, 0, sc_len, &vb, kv * head, head, &pb, h as u64 * head, head, &p_pv,
+        );
+        // Each stage reads what the previous one wrote to the SAME
+        // scores buffer, so each gets its own pass: wgpu inserts the
+        // memory barrier at pass boundaries, and three dispatches inside
+        // one pass raced (max pixel error 38/255 against the CPU path).
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("dit-qk"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&c.dit_qk);
+            pass.set_bind_group(0, &bg_qk, &[]);
+            pass.dispatch_workgroups((n as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("dit-sm"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&c.dit_softmax);
+            pass.set_bind_group(0, &bg_sm, &[]);
+            pass.dispatch_workgroups(n as u32, 1, 1);
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("dit-pv"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&c.dit_pv);
+            pass.set_bind_group(0, &bg_pv, &[]);
+            pass.dispatch_workgroups((hd as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
+        }
+    }
+    {
+        let total = (nh * n * hd) as u32;
+        // unstack reads the panel (0) and writes the output (2).
+        let bg_un = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dit-un-bg"),
+            layout: &c.dit_unstack.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: pb.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: ab.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: p_un.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("dit-unstack"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.dit_unstack);
+        pass.set_bind_group(0, &bg_un, &[]);
+        pass.dispatch_workgroups(total.div_ceil(256), 1, 1);
+    }
+    readback(
+        c,
+        enc,
+        &ab,
+        &stage,
+        (n * nh * hd * 4) as u64,
+        &mut out[..n * nh * hd],
+    )
 }
 
 /// Fused DiT SwiGLU FFN on wgpu: g=X·W1ᵀ, u=X·W3ᵀ, silu(g)·u,

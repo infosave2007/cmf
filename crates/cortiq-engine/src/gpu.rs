@@ -1110,6 +1110,9 @@ pub fn dit_attention(
     match backend() {
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::dit_attention(qh, kh, vh, nh, nkv, n, hd, scale, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::dit_attention(qh, kh, vh, nh, nkv, n, hd, scale, out),
+        #[allow(unreachable_patterns)]
         _ => false,
     }
 }
