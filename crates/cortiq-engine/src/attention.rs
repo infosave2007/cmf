@@ -1084,16 +1084,38 @@ pub fn qwen_attention_batch(
     // Batched causal attend: Accelerate on macOS, the portable NEON
     // micro-GEMM elsewhere on aarch64 (mobile prefill was per-position
     // — the quadratic wall).
-    #[cfg(target_arch = "aarch64")]
-    let batched_attend = b >= 32
+    let attend_ok = b >= 32
         && cache.mode == crate::kv_cache::KvMode::F32
         && cfg.softcap == 0.0 // capped scores: per-position attend (correctness first)
+        && cfg.window.is_none();
+    // The device can batch it on any architecture. That matters because
+    // the CPU twin needs Accelerate or the NEON micro-GEMM, so x86 had
+    // no batched attend at all and prefill fell back to a per-position
+    // scalar loop — 30% of a 512-token prefill and 46% of a 1024-token
+    // one on a 256-core EPYC.
+    // Every shape condition `chunk_attend` checks is mirrored here: on a
+    // machine with no CPU twin (x86) a refusal after this point would
+    // leave the output zeroed, so refusal must be impossible short of a
+    // lost device.
+    let gpu_attend = attend_ok
+        && crate::gpu::enabled_here()
+        && !crate::gpu::mm_killed()
+        && !cfg.output_gate
+        && cfg.softplus_gate.is_none()
+        && nh > 0
+        && nkv > 0
+        && hd > 0
+        && nh % nkv == 0
+        && cache.o1.is_none();
+    #[cfg(target_arch = "aarch64")]
+    let cpu_attend = attend_ok
         && (crate::qtensor::accel_gemm_enabled()
             || std::env::var("CMF_FORCE_NEON_GEMM")
                 .map(|v| v == "1")
                 .unwrap_or(false));
     #[cfg(not(target_arch = "aarch64"))]
-    let batched_attend = false;
+    let cpu_attend = false;
+    let batched_attend = cpu_attend || gpu_attend;
     let s0 = cache.seq_len;
     let mut ao_all = take_buf(b * nh * hd);
     let mut q_rope_all = if batched_attend {
@@ -1204,20 +1226,99 @@ pub fn qwen_attention_batch(
         recycle_buf(&mut q);
         recycle_buf(&mut gate);
     }
-    #[cfg(target_arch = "aarch64")]
     if batched_attend {
-        cache.attend_chunk(
-            &q_rope_all,
-            b,
-            s0,
-            nh,
-            heads_per_kv,
-            hd,
-            &mut ao_all,
-            cfg.pool,
-            cfg.scale,
-            cfg.window,
-        );
+        // Head-major pack for the device kernel: [b][nh·hd] -> [nh][b][hd].
+        let mut done = false;
+        if gpu_attend {
+            let mut qhm = take_buf(nh * b * hd);
+            for bi in 0..b {
+                for h in 0..nh {
+                    let src = &q_rope_all[bi * nh * hd + h * hd..bi * nh * hd + (h + 1) * hd];
+                    qhm[h * b * hd + bi * hd..h * b * hd + (bi + 1) * hd].copy_from_slice(src);
+                }
+            }
+            let ks: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
+            let vs: Vec<&[f32]> = (0..nkv).map(|g| cache.head_values(g)).collect();
+            done = crate::gpu::chunk_attend(
+                &qhm, &ks, &vs, b, s0, nh, nkv, hd, cfg.scale, &mut ao_all,
+            );
+            recycle_buf(&mut qhm);
+        }
+        #[cfg(target_arch = "aarch64")]
+        if !done {
+            cache.attend_chunk(
+                &q_rope_all,
+                b,
+                s0,
+                nh,
+                heads_per_kv,
+                hd,
+                &mut ao_all,
+                cfg.pool,
+                cfg.scale,
+                cfg.window,
+            );
+            done = true;
+        }
+        if !done {
+            // Portable fallback. It exists so a device refusal can never
+            // leave `ao_all` untouched: this path is chosen BEFORE the
+            // per-position attend is skipped, and on x86 there is no
+            // other batched attend to fall back to.
+            let n = s0 + b;
+            struct OutPtr(*mut f32);
+            // SAFETY: workers own disjoint query ranges, so the writes
+            // through this pointer never overlap.
+            unsafe impl Send for OutPtr {}
+            unsafe impl Sync for OutPtr {}
+            impl OutPtr {
+                fn at(&self, i: usize) -> *mut f32 {
+                    unsafe { self.0.add(i) }
+                }
+            }
+            let out_ptr = OutPtr(ao_all.as_mut_ptr());
+            let (qr, sc) = (&q_rope_all, cfg.scale);
+            let run = |start: usize, end: usize| {
+                for bi in start..end {
+                    let lim = s0 + bi + 1;
+                    for h in 0..nh {
+                        let kv = h / heads_per_kv;
+                        let (ks, vs) = (cache.head_keys(kv), cache.head_values(kv));
+                        if ks.len() < n * hd || vs.len() < n * hd {
+                            continue;
+                        }
+                        let q = &qr[bi * nh * hd + h * hd..bi * nh * hd + (h + 1) * hd];
+                        let mut probs = vec![0f32; lim];
+                        let mut mx = f32::NEG_INFINITY;
+                        for (j, p) in probs.iter_mut().enumerate() {
+                            let krow = &ks[j * hd..(j + 1) * hd];
+                            let d: f32 = q.iter().zip(krow).map(|(&a, &b)| a * b).sum();
+                            *p = d * sc;
+                            mx = mx.max(*p);
+                        }
+                        let mut sum = 0f32;
+                        for p in probs.iter_mut() {
+                            *p = (*p - mx).exp();
+                            sum += *p;
+                        }
+                        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                        let base = bi * nh * hd + h * hd;
+                        for d in 0..hd {
+                            let mut acc = 0f32;
+                            for (j, &p) in probs.iter().enumerate() {
+                                acc += p * vs[j * hd + d];
+                            }
+                            // SAFETY: workers own disjoint query ranges.
+                            unsafe { *out_ptr.at(base + d) = acc * inv };
+                        }
+                    }
+                }
+            };
+            match cfg.pool {
+                Some(p) => p.run_rows(b, &run),
+                None => run(0, b),
+            }
+        }
         if cfg.output_gate {
             apply_gate(&mut ao_all, &gates_all);
         }

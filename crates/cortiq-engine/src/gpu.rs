@@ -949,6 +949,32 @@ pub(crate) fn mm_kill() {
 }
 
 /// Fused DiT SwiGLU FFN on the device: g=X·W1ᵀ, u=X·W3ᵀ, silu(g)·u,
+/// Causal chunk attention on the device: `b` queries against `s0 + b`
+/// cached keys. wgpu only — Metal's chunk graph keeps attention inside
+/// the resident block and never calls out.
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn chunk_attend(
+    q: &[f32],
+    k: &[&[f32]],
+    v: &[&[f32]],
+    b: usize,
+    s0: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => {
+            crate::gpu_wgpu::chunk_attend(q, k, v, b, s0, nh, nkv, hd, scale, out)
+        }
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// Fused QKV projection: one upload of the normed chunk, three GEMMs,
 /// one readback of Q|K|V back to back. Metal has no twin yet — its
 /// chunk graph keeps the whole layer resident and never surfaces QKV.

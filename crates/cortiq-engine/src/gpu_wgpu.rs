@@ -1756,7 +1756,7 @@ fn moe_down(@builtin(workgroup_id) wid: vec3<u32>,
 // ── DiT attention (imagegen): scores GEMM -> row softmax -> P·V.
 // Same 64x64 tile / 4x4 named-scalar register block as the quantized
 // GEMMs; the operands are plain f32 here, so the staging is a copy.
-struct DitP { m: u32, k: u32, n: u32, scale: f32, };
+struct DitP { m: u32, k: u32, n: u32, scale: f32, s0: u32, causal: u32, _p0: u32, _p1: u32, };
 @group(0) @binding(0) var<storage, read> da: array<f32>;
 @group(0) @binding(1) var<storage, read> db: array<f32>;
 @group(0) @binding(2) var<storage, read_write> dc: array<f32>;
@@ -1851,8 +1851,13 @@ var<workgroup> dit_red: array<f32, 256>;
 fn dit_softmax(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let row = wid.x * dp.n;
     let t = lid.x;
+    // Causal bound: query `wid.x` may see keys 0..=s0+wid.x. Masked
+    // entries are zeroed rather than set to -inf so the P·V GEMM that
+    // follows reads a clean matrix.
+    var lim = dp.n;
+    if (dp.causal != 0u) { lim = min(dp.n, dp.s0 + wid.x + 1u); }
     var mx = -3.4e38;
-    for (var j = t; j < dp.n; j = j + 256u) { mx = max(mx, dc[row + j]); }
+    for (var j = t; j < lim; j = j + 256u) { mx = max(mx, dc[row + j]); }
     dit_red[t] = mx;
     workgroupBarrier();
     for (var s = 128u; s > 0u; s = s >> 1u) {
@@ -1862,11 +1867,12 @@ fn dit_softmax(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
     let m = dit_red[0];
     workgroupBarrier();
     var sum = 0.0;
-    for (var j = t; j < dp.n; j = j + 256u) {
+    for (var j = t; j < lim; j = j + 256u) {
         let e = exp(dc[row + j] - m);
         dc[row + j] = e;
         sum = sum + e;
     }
+    for (var j = lim + t; j < dp.n; j = j + 256u) { dc[row + j] = 0.0; }
     dit_red[t] = sum;
     workgroupBarrier();
     for (var s = 128u; s > 0u; s = s >> 1u) {
@@ -1874,7 +1880,7 @@ fn dit_softmax(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
         workgroupBarrier();
     }
     let inv = 1.0 / dit_red[0];
-    for (var j = t; j < dp.n; j = j + 256u) { dc[row + j] = dc[row + j] * inv; }
+    for (var j = t; j < lim; j = j + 256u) { dc[row + j] = dc[row + j] * inv; }
 }
 
 // [nh][n][hd] panel -> [n][nh*hd].
@@ -6418,10 +6424,10 @@ pub fn dit_attention(
     // One uniform per distinct (m, k, n, scale) shape; the head offset
     // rides in the bound slice, not the params.
     let params = |m: u32, k: u32, nn: u32, sc: f32| -> wgpu::Buffer {
-        let raw = [m, k, nn, sc.to_bits()];
+        let raw = [m, k, nn, sc.to_bits(), 0u32, 0u32, 0u32, 0u32];
         let b = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dit-params"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -6580,6 +6586,229 @@ pub fn dit_attention(
         &stage,
         (n * nh * hd * 4) as u64,
         &mut out[..n * nh * hd],
+    )
+}
+
+/// Causal chunk attention on wgpu: `b` new queries against `s0 + b`
+/// cached keys, per head, with the causal bound applied in the softmax.
+/// Same three kernels as the DiT path, rectangular this time.
+///
+/// This is the prefill attention the CPU path only has on aarch64 — its
+/// batched attend needs Accelerate or the NEON micro-GEMM, so x86 fell
+/// back to a per-position scalar loop. Measured on a 256-core EPYC that
+/// loop was 30% of a 512-token prefill and 46% of a 1024-token one.
+///
+/// `q` is head-major [nh][b][hd] (post-RoPE); `k`/`v` are per-kv-head
+/// contiguous [s0+b][hd] — the cache's own layout. `out` is
+/// [b][nh·hd].
+#[allow(clippy::too_many_arguments)]
+pub fn chunk_attend(
+    q: &[f32],
+    k: &[&[f32]],
+    v: &[&[f32]],
+    b: usize,
+    s0: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let n = s0 + b;
+    if nh == 0 || nkv == 0 || b == 0 || hd == 0 || nh % nkv != 0 || n == 0 {
+        return false;
+    }
+    if q.len() < nh * b * hd || k.len() != nkv || v.len() != nkv {
+        return false;
+    }
+    for h in 0..nkv {
+        if k[h].len() < n * hd || v[h].len() < n * hd {
+            return false;
+        }
+    }
+    if out.len() < b * nh * hd {
+        return false;
+    }
+    let dev = &c.device;
+    let mut sc = c.scratch.lock().unwrap();
+    let st = wgpu::BufferUsages::STORAGE;
+    let qb = Scratch::ensure(
+        dev,
+        &mut sc.dq,
+        (nh * b * hd * 4) as u64,
+        st | wgpu::BufferUsages::COPY_DST,
+        "ca-q",
+    );
+    c.queue
+        .write_buffer(&qb, 0, bytemuck::cast_slice(&q[..nh * b * hd]));
+    // K/V are per-head slices of the CPU cache: pack them back to back
+    // so one buffer serves every head at a known stride.
+    let kvsz = (nkv * n * hd * 4) as u64;
+    let kb = Scratch::ensure(dev, &mut sc.dk, kvsz, st | wgpu::BufferUsages::COPY_DST, "ca-k");
+    let vb = Scratch::ensure(dev, &mut sc.dv, kvsz, st | wgpu::BufferUsages::COPY_DST, "ca-v");
+    for h in 0..nkv {
+        let off = (h * n * hd * 4) as u64;
+        c.queue
+            .write_buffer(&kb, off, bytemuck::cast_slice(&k[h][..n * hd]));
+        c.queue
+            .write_buffer(&vb, off, bytemuck::cast_slice(&v[h][..n * hd]));
+    }
+    let scb = Scratch::ensure(dev, &mut sc.dsc, (b * n * 4) as u64, st, "ca-scores");
+    let pb = Scratch::ensure(dev, &mut sc.dpan, (nh * b * hd * 4) as u64, st, "ca-panel");
+    let ab = Scratch::ensure(
+        dev,
+        &mut sc.dout,
+        (b * nh * hd * 4) as u64,
+        st | wgpu::BufferUsages::COPY_SRC,
+        "ca-out",
+    );
+    let stage = Scratch::ensure(
+        dev,
+        &mut sc.dstage,
+        (b * nh * hd * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "ca-stage",
+    );
+    drop(sc);
+
+    let params = |m: u32, kk: u32, nn: u32, s: f32, s0v: u32, caus: u32| -> wgpu::Buffer {
+        let raw = [m, kk, nn, s.to_bits(), s0v, caus, 0u32, 0u32];
+        let bf = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ca-params"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        c.queue.write_buffer(&bf, 0, bytemuck::cast_slice(&raw));
+        bf
+    };
+    let p_qk = params(b as u32, hd as u32, n as u32, scale, s0 as u32, 0);
+    let p_sm = params(b as u32, hd as u32, n as u32, 1.0, s0 as u32, 1);
+    let p_pv = params(b as u32, n as u32, hd as u32, 1.0, s0 as u32, 0);
+    let p_un = params(nh as u32, b as u32, hd as u32, 1.0, 0, 0);
+
+    fn slot(bf: &wgpu::Buffer, off: u64, len: u64, bind: u32) -> wgpu::BindGroupEntry<'_> {
+        wgpu::BindGroupEntry {
+            binding: bind,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: bf,
+                offset: off,
+                size: std::num::NonZeroU64::new(len),
+            }),
+        }
+    }
+    let qhead = (b * hd * 4) as u64;
+    let khead = (n * hd * 4) as u64;
+    let sc_len = (b * n * 4) as u64;
+    let hpk = nh / nkv;
+    let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("chunk-attend"),
+    });
+    for h in 0..nh {
+        let kv = (h / hpk) as u64;
+        let bg_qk = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ca-qk"),
+            layout: &c.dit_qk.get_bind_group_layout(0),
+            entries: &[
+                slot(&qb, h as u64 * qhead, qhead, 0),
+                slot(&kb, kv * khead, khead, 1),
+                slot(&scb, 0, sc_len, 2),
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: p_qk.as_entire_binding(),
+                },
+            ],
+        });
+        let bg_sm = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ca-sm"),
+            layout: &c.dit_softmax.get_bind_group_layout(0),
+            entries: &[
+                slot(&scb, 0, sc_len, 2),
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: p_sm.as_entire_binding(),
+                },
+            ],
+        });
+        let bg_pv = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ca-pv"),
+            layout: &c.dit_pv.get_bind_group_layout(0),
+            entries: &[
+                slot(&scb, 0, sc_len, 0),
+                slot(&vb, kv * khead, khead, 1),
+                slot(&pb, h as u64 * qhead, qhead, 2),
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: p_pv.as_entire_binding(),
+                },
+            ],
+        });
+        // One pass per stage: each reads what the previous wrote to the
+        // same scores buffer, and dispatches inside one pass do not
+        // order against each other.
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ca-qk"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&c.dit_qk);
+            pass.set_bind_group(0, &bg_qk, &[]);
+            pass.dispatch_workgroups((n as u32).div_ceil(64), (b as u32).div_ceil(64), 1);
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ca-sm"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&c.dit_softmax);
+            pass.set_bind_group(0, &bg_sm, &[]);
+            pass.dispatch_workgroups(b as u32, 1, 1);
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ca-pv"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&c.dit_pv);
+            pass.set_bind_group(0, &bg_pv, &[]);
+            pass.dispatch_workgroups((hd as u32).div_ceil(64), (b as u32).div_ceil(64), 1);
+        }
+    }
+    {
+        let bg_un = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ca-un"),
+            layout: &c.dit_unstack.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: pb.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: ab.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: p_un.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("ca-un"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.dit_unstack);
+        pass.set_bind_group(0, &bg_un, &[]);
+        pass.dispatch_workgroups(((nh * b * hd) as u32).div_ceil(256), 1, 1);
+    }
+    readback(
+        c,
+        enc,
+        &ab,
+        &stage,
+        (b * nh * hd * 4) as u64,
+        &mut out[..b * nh * hd],
     )
 }
 
