@@ -318,6 +318,7 @@ impl QTensor {
                     | TensorDtype::Q1T
                     | TensorDtype::Q4Block
                     | TensorDtype::Q4Tiled
+                    | TensorDtype::Q4TiledP
                     | TensorDtype::Q8Row
                     | TensorDtype::Q8_2f,
                 rows,
@@ -338,6 +339,22 @@ impl QTensor {
             Self::Mapped {
                 idx,
                 dtype: TensorDtype::Q4Tiled,
+                rows,
+                cols,
+                ..
+            } => Some((*idx, *rows, *cols)),
+            _ => None,
+        }
+    }
+
+    /// (directory idx, rows, cols) of a q4tp mapped tensor. Same empty-scale
+    /// slot as `q4t_parts` in the chunk graph — the encoder tells the two
+    /// apart by the tensor's dtype, not by the slot.
+    pub(crate) fn q4tp_parts(&self) -> Option<(usize, usize, usize)> {
+        match self {
+            Self::Mapped {
+                idx,
+                dtype: TensorDtype::Q4TiledP,
                 rows,
                 cols,
                 ..

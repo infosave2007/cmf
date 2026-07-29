@@ -3135,13 +3135,14 @@ impl Pipeline {
             if d.act != Act::Silu {
                 break;
             }
-            // q8_row (row_scale populated) or q4_tiled (row_scale empty
-            // — its scales live in the tiles). Mixing across the seven
-            // projections of one layer is fine; the encoder branches per
-            // weight. Anything else refuses the run.
+            // q8_row (row_scale populated), or q4_tiled / q4tp (row_scale
+            // empty — their scales are in the payload). Mixing across the
+            // seven projections of one layer is fine; the encoder branches
+            // per weight on the tensor's dtype. Anything else refuses.
             fn cw(t: &QTensor) -> Option<(usize, usize, usize, &[f32])> {
                 t.q8_row_parts()
                     .or_else(|| t.q4t_parts().map(|(i, r, c)| (i, r, c, &[][..])))
+                    .or_else(|| t.q4tp_parts().map(|(i, r, c)| (i, r, c, &[][..])))
             }
             let parts = (
                 cw(wq),

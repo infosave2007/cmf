@@ -2951,6 +2951,92 @@ kernel void q4t_matvec(
     }
 }
 
+// q4tp: same nibble values and order as q4t, but the scale is a 5-bit rung
+// on the row's ladder, kept in two side planes that follow all the nibbles.
+// Two consequences here, both good: the nibble stream is a clean 16 B stride
+// (4-aligned, so four uint loads replace q4t's nine unaligned ushorts), and
+// the scale costs one exp2 — a hardware instruction on-device. The CPU
+// expands the ladder geometrically instead, purely to avoid 32 libm calls
+// per row; the two forms agree to ~2e-6 relative, which is nothing against
+// a 4-bit grid (measured, see `q4tp_ladder`).
+kernel void q4tp_matvec(
+    device const uchar* q    [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       y    [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    // One rung per lane, four rows per simdgroup, eight simdgroups.
+    threadgroup float lad[8u * 4u * 32u];
+
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    bool active = r0 < rows;
+    uint nr = active ? min(rows - r0, 4u) : 0u;
+
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint  stride     = (gpr * 5u + 7u) / 8u;
+
+    // Expand each row's ladder ONCE. Evaluating 2^(lo + code*step) inside the
+    // tile loop instead was measured to cost the model ~15% even though the
+    // kernel benchmarked FASTER standalone: free-running dispatches hide the
+    // dependent chain (code byte → exp2 → scale), and the model's dispatches
+    // serialize on each other, which exposes it. The lane index IS the rung,
+    // so one exp2 per lane per row covers all 32.
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* ph = (device const half*)(q + params_off + (ulong)(r0 + ri) * 4ul);
+        lad[(sg * 4u + ri) * 32u + lane] = exp2((float)ph[0] + (float)lane * (float)ph[1]);
+    }
+    // Every thread reaches this, including the inactive tail simdgroups —
+    // a barrier skipped by part of the threadgroup is undefined.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint xb = g * 32u;
+        device const float4* xv = (device const float4*)(x + xb);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        uint bit = g * 5u;
+        uint cb  = bit >> 3u;
+        uint shf = bit & 7u;
+        for (uint ri = 0u; ri < nr; ++ri) {
+            uint r = r0 + ri;
+            // 16 B tiles are 4-aligned (tensors are 64-aligned in the blob),
+            // so four uint loads — q4t needs nine ushorts for its 18 B stride.
+            device const uint* p32 = (device const uint*)(q + ((ulong)r * gpr + (ulong)g) * 16ul);
+            uint b0 = p32[0], b1 = p32[1], b2 = p32[2], b3 = p32[3];
+            // The 5-bit field spills into the next byte past bit 3; the row's
+            // stride always holds that byte when it does.
+            device const uchar* cp = q + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            float scale = lad[(sg * 4u + ri) * 32u + code];
+            float gsum = q4_dot8_fast(b0, x0, x1)
+                       + q4_dot8_fast(b1, x2, x3)
+                       + q4_dot8_fast(b2, x4, x5)
+                       + q4_dot8_fast(b3, x6, x7);
+            float contrib = scale * gsum;
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    if (lane == 0u) {
+        y[r0] = acc0;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
+    }
+}
+
 // MEASURED NEUTRAL (M4, Lumina DiT 512² and the Nanbeige chunk prefill):
 // giving these two kernels q8_mul_mm's cols/rows function-constant
 // specialization changed nothing — paired runs at matched thermal state
@@ -2964,6 +3050,302 @@ kernel void q4t_matvec(
 // row — the weights travel device→shmem as 0.56 B each instead of a
 // dequanted f32 scratch re-read per batch tile (the two-pass variant
 // measured bandwidth-bound: ~2.8 GB of W traffic per FFN-shaped op).
+// q4tp twins of the two q4t GEMMs. Only the weight-staging block differs:
+// the 16 B nibble stride replaces the 18 B tile, and the scale comes off the
+// row's ladder instead of the tile header. Everything downstream — the
+// simdgroup machinery, the shmem layout, the epilogue — is byte-for-byte the
+// q4t kernel, because the decoded weights are the same numbers.
+kernel void q4tp_mul_mm(
+    device const uchar*  q      [[buffer(0)]],
+    device const float*  xs     [[buffer(1)]],
+    device float*        y      [[buffer(2)]],
+    constant uint&       cols_b [[buffer(3)]],
+    constant uint&       rows_b [[buffer(4)]],
+    constant uint&       nb     [[buffer(5)]],
+    uint tiitg [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint2 tg  [[threadgroup_position_in_grid]])
+{
+    uint cols = cols_b;
+    uint rows = rows_b;
+    uint gpr = cols >> 5u;
+    threadgroup char shmem[8192];
+    threadgroup half* sa = (threadgroup half*)shmem;
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+    const uint NK = 32u;
+    uint r0 = tg.y * 64u;
+    uint r1 = tg.x * 32u;
+    uint nr0 = min(rows - r0, 64u);
+    uint nr1 = min(nb - r1, 32u);
+    uint lr0 = min(tiitg / 2u, nr0 - 1u);
+    uint il0 = tiitg % 2u;
+    uint lr1 = min(tiitg / 4u, nr1 - 1u);
+    uint iy  = 8u * (tiitg % 4u);
+
+    device const float* yrow = xs + (ulong)(r1 + lr1) * cols + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8u; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (uint k0 = 0; k0 < cols; k0 += NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // W: this thread's 16 weights (row r0+lr0, K-half il0) — 8
+        // nibble bytes of one tile, low nibble first.
+        {
+            uint g = k0 >> 5u;
+            uint wr = r0 + lr0;
+            ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+            ulong codes_off  = params_off + (ulong)rows * 4ul;
+            uint  cstride    = (gpr * 5u + 7u) / 8u;
+            uint bit = g * 5u;
+            uint shf = bit & 7u;
+            device const uchar* cp = q + codes_off + (ulong)wr * (ulong)cstride + (bit >> 3u);
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            device const half* ph = (device const half*)(q + params_off + (ulong)wr * 4ul);
+            // One exp2 per staged tile: this kernel is compute-dense (each
+            // thread stages 16 weights per K-step), so the ladder-in-shmem
+            // trick the matvec needs buys nothing measurable here.
+            float scale = exp2((float)ph[0] + (float)code * (float)ph[1]);
+            device const uchar* nib = q + ((ulong)wr * gpr + (ulong)g) * 16ul + 8u * il0;
+            uint sy = (tiitg / 2u) / 8u;
+            uint lx = (tiitg / 2u) % 8u;
+            float wv[16];
+            for (uint i = 0; i < 8u; ++i) {
+                uint bb = nib[i];
+                wv[2u * i]      = ((float)(bb & 0xFu) - 8.0f) * scale;
+                wv[2u * i + 1u] = ((float)(bb >> 4u) - 8.0f) * scale;
+            }
+            uint ib0 = 8u * (2u * il0) + sy;
+            uint ib1 = 8u * (2u * il0 + 1u) + sy;
+            for (uint i = 0; i < 8u; ++i) {
+                sa[64u * ib0 + 8u * i + lx] = (half)wv[i];
+                sa[64u * ib1 + 8u * i + lx] = (half)wv[i + 8u];
+            }
+        }
+        // X: 8 consecutive floats → one 8x8-block row (identical to q8).
+        {
+            uint sx = tiitg % 4u;
+            uint sy = (tiitg / 4u) / 8u;
+            uint ly = (tiitg / 4u) % 8u;
+            uint ib = 4u * sx + sy;
+            device const float4* y4 = (device const float4*)yrow;
+            float4 v0 = y4[0];
+            float4 v1 = y4[1];
+            threadgroup half* dst = sb + 64u * ib + 8u * ly;
+            dst[0] = (half)v0.x; dst[1] = (half)v0.y;
+            dst[2] = (half)v0.z; dst[3] = (half)v0.w;
+            dst[4] = (half)v1.x; dst[5] = (half)v1.y;
+            dst[6] = (half)v1.z; dst[7] = (half)v1.w;
+        }
+        yrow += NK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < 4; ++ik) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; ++i) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    if (r0 + 64u <= rows && r1 + 32u <= nb) {
+        device float* C = y + (r0 + 32u * (sgitg & 1u))
+            + (ulong)(r1 + 16u * (sgitg >> 1u)) * rows;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * (ulong)rows * (i / 4),
+                            rows, ulong2(0, 0), false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* temp_str = ((threadgroup float*)shmem)
+            + 32u * (sgitg & 1u) + (16u * (sgitg >> 1u)) * 64u;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * 64 * (i / 4),
+                            64, ulong2(0, 0), false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (uint j = tiitg; j < nr1; j += 128u) {
+                device float* D = y + r0 + (ulong)(r1 + j) * rows;
+                threadgroup const float* Cr = ((threadgroup float*)shmem) + j * 64u;
+                for (uint i = 0; i < nr0; ++i) {
+                    D[i] = Cr[i];
+                }
+            }
+        }
+    }
+}
+
+kernel void q4tp_mul_mm_silu(
+    device const uchar*  q      [[buffer(0)]],
+    device const float*  gs     [[buffer(1)]],
+    device const float*  us     [[buffer(2)]],
+    device float*        y      [[buffer(3)]],
+    constant uint&       cols_b [[buffer(4)]],
+    constant uint&       rows_b [[buffer(5)]],
+    constant uint&       nb     [[buffer(6)]],
+    uint tiitg [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint2 tg  [[threadgroup_position_in_grid]])
+{
+    uint cols = cols_b;
+    uint rows = rows_b;
+    uint gpr = cols >> 5u;
+    threadgroup char shmem[8192];
+    threadgroup half* sa = (threadgroup half*)shmem;
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+    const uint NK = 32u;
+    uint r0 = tg.y * 64u;
+    uint r1 = tg.x * 32u;
+    uint nr0 = min(rows - r0, 64u);
+    uint nr1 = min(nb - r1, 32u);
+    uint lr0 = min(tiitg / 2u, nr0 - 1u);
+    uint il0 = tiitg % 2u;
+    uint lr1 = min(tiitg / 4u, nr1 - 1u);
+    uint iy  = 8u * (tiitg % 4u);
+
+    device const float* grow = gs + (ulong)(r1 + lr1) * cols + iy;
+    device const float* urow = us + (ulong)(r1 + lr1) * cols + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8u; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (uint k0 = 0; k0 < cols; k0 += NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // W: this thread's 16 weights (row r0+lr0, K-half il0) — 8
+        // nibble bytes of one tile, low nibble first.
+        {
+            uint g = k0 >> 5u;
+            uint wr = r0 + lr0;
+            ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+            ulong codes_off  = params_off + (ulong)rows * 4ul;
+            uint  cstride    = (gpr * 5u + 7u) / 8u;
+            uint bit = g * 5u;
+            uint shf = bit & 7u;
+            device const uchar* cp = q + codes_off + (ulong)wr * (ulong)cstride + (bit >> 3u);
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            device const half* ph = (device const half*)(q + params_off + (ulong)wr * 4ul);
+            // One exp2 per staged tile: this kernel is compute-dense (each
+            // thread stages 16 weights per K-step), so the ladder-in-shmem
+            // trick the matvec needs buys nothing measurable here.
+            float scale = exp2((float)ph[0] + (float)code * (float)ph[1]);
+            device const uchar* nib = q + ((ulong)wr * gpr + (ulong)g) * 16ul + 8u * il0;
+            uint sy = (tiitg / 2u) / 8u;
+            uint lx = (tiitg / 2u) % 8u;
+            float wv[16];
+            for (uint i = 0; i < 8u; ++i) {
+                uint bb = nib[i];
+                wv[2u * i]      = ((float)(bb & 0xFu) - 8.0f) * scale;
+                wv[2u * i + 1u] = ((float)(bb >> 4u) - 8.0f) * scale;
+            }
+            uint ib0 = 8u * (2u * il0) + sy;
+            uint ib1 = 8u * (2u * il0 + 1u) + sy;
+            for (uint i = 0; i < 8u; ++i) {
+                sa[64u * ib0 + 8u * i + lx] = (half)wv[i];
+                sa[64u * ib1 + 8u * i + lx] = (half)wv[i + 8u];
+            }
+        }
+        // X: silu(gate)·up staged straight into the tile — no act
+        // buffer, exactly as q8_mul_mm_silu does it.
+        {
+            uint sx = tiitg % 4u;
+            uint sy = (tiitg / 4u) / 8u;
+            uint ly = (tiitg / 4u) % 8u;
+            uint ib = 4u * sx + sy;
+            device const float4* g4 = (device const float4*)grow;
+            device const float4* u4 = (device const float4*)urow;
+            float4 g0 = g4[0];
+            float4 g1 = g4[1];
+            float4 u0 = u4[0];
+            float4 u1 = u4[1];
+            float4 a0 = (g0 / (1.0f + exp(-g0))) * u0;
+            float4 a1 = (g1 / (1.0f + exp(-g1))) * u1;
+            threadgroup half* dst = sb + 64u * ib + 8u * ly;
+            dst[0] = (half)a0.x; dst[1] = (half)a0.y;
+            dst[2] = (half)a0.z; dst[3] = (half)a0.w;
+            dst[4] = (half)a1.x; dst[5] = (half)a1.y;
+            dst[6] = (half)a1.z; dst[7] = (half)a1.w;
+        }
+        grow += NK;
+        urow += NK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < 4; ++ik) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; ++i) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    if (r0 + 64u <= rows && r1 + 32u <= nb) {
+        device float* C = y + (r0 + 32u * (sgitg & 1u))
+            + (ulong)(r1 + 16u * (sgitg >> 1u)) * rows;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * (ulong)rows * (i / 4),
+                            rows, ulong2(0, 0), false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* temp_str = ((threadgroup float*)shmem)
+            + 32u * (sgitg & 1u) + (16u * (sgitg >> 1u)) * 64u;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * 64 * (i / 4),
+                            64, ulong2(0, 0), false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (uint j = tiitg; j < nr1; j += 128u) {
+                device float* D = y + r0 + (ulong)(r1 + j) * rows;
+                threadgroup const float* Cr = ((threadgroup float*)shmem) + j * 64u;
+                for (uint i = 0; i < nr0; ++i) {
+                    D[i] = Cr[i];
+                }
+            }
+        }
+    }
+}
+
 kernel void q4t_mul_mm(
     device const uchar*  q      [[buffer(0)]],
     device const float*  xs     [[buffer(1)]],
@@ -3256,8 +3638,11 @@ struct Ctx {
     q4b: ComputePipelineState,
     q4bh: ComputePipelineState,
     q4t: ComputePipelineState,
+    q4tp: ComputePipelineState,
     q4tmm: ComputePipelineState,
     q4tmmsilu: ComputePipelineState,
+    q4tpmm: ComputePipelineState,
+    q4tpmmsilu: ComputePipelineState,
     smaxrows: ComputePipelineState,
     flashatt: ComputePipelineState,
     convmm: ComputePipelineState,
@@ -3407,8 +3792,11 @@ fn init() -> Result<Ctx, String> {
     let q4b = pso("q4b_matvec")?;
     let q4bh = pso("q4b_matvec_h")?;
     let q4t = pso("q4t_matvec")?;
+    let q4tp = pso("q4tp_matvec")?;
     let q4tmm = pso("q4t_mul_mm")?;
     let q4tmmsilu = pso("q4t_mul_mm_silu")?;
+    let q4tpmm = pso("q4tp_mul_mm")?;
+    let q4tpmmsilu = pso("q4tp_mul_mm_silu")?;
     let smaxrows = pso("softmax_rows")?;
     let flashatt = pso("dit_flash_attend")?;
     let convmm = pso("conv_mul_mm")?;
@@ -3465,8 +3853,11 @@ fn init() -> Result<Ctx, String> {
         q4b,
         q4bh,
         q4t,
+        q4tp,
         q4tmm,
         q4tmmsilu,
+        q4tpmm,
+        q4tpmmsilu,
         smaxrows,
         flashatt,
         convmm,
@@ -3945,6 +4336,19 @@ fn encode_q1t_matvec(
     );
 }
 
+/// Weight layout a chunk-graph GEMM reads. Was a bare `q4t: bool`; q4tp
+/// needs a third value, and a bool pair would let "neither" and "both" be
+/// spelled at every call site.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MmKind {
+    /// q8_row — row scales ride in a side buffer.
+    Q8,
+    /// q4_tiled — 18 B tiles, scale inline.
+    Q4t,
+    /// q4tp — 16 B nibble stride, scale from the row ladder.
+    Q4tp,
+}
+
 /// Which GPU kernel a graph projection uses.
 #[derive(Clone)]
 enum ProjKind {
@@ -3952,6 +4356,7 @@ enum ProjKind {
     Q1t,
     Q4b,
     Q4t,
+    Q4tp,
     Q8 {
         row_scale: Buffer,
         col_field: Option<Buffer>,
@@ -4019,6 +4424,34 @@ fn encode_q4t_matvec(
     );
 }
 
+/// q4tp twin of `encode_q4t_matvec` — same 4-rows-per-simdgroup shape; the
+/// kernel derives its three plane offsets from `rows`/`gpr`, so the argument
+/// list stays identical to q4t's.
+fn encode_q4tp_matvec(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &Buffer,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    rows: usize,
+    gpr: usize,
+) {
+    enc.set_compute_pipeline_state(&c.q4tp);
+    enc.set_buffer(0, Some(fbuf), abs as u64);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let gpr_u = gpr as u32;
+    let rows_u = rows as u32;
+    enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    let sgs = 8u64;
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
+}
+
 /// Encode a projection `in_buf → out_buf` for a Q1 / Q1T / Q4-block weight.
 /// For Q1T the base matvec is followed by the on-device overlay add. Free fn so
 /// it works inside the graph encode loops (which capture `c`/`fbuf`, not self).
@@ -4044,6 +4477,9 @@ fn encode_proj(
         }
         ProjKind::Q4t => {
             encode_q4t_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
+        }
+        ProjKind::Q4tp => {
+            encode_q4tp_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
         }
         ProjKind::Q1 => {
             encode_q1_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
@@ -4275,6 +4711,202 @@ pub fn q4t_matvec_for_test(
     true
 }
 
+/// q4tp twin of `q4t_matvec_for_test` — the same encode the whole-token
+/// graph uses, exposed so a test can hold the GPU kernel against the CPU one.
+#[doc(hidden)]
+pub fn q4tp_matvec_for_test(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % GROUP_SIZE != 0 {
+        return false;
+    }
+    let gpr = cols / GROUP_SIZE;
+    let entry = &model.tensors[idx];
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let Some(need) = cortiq_core::quant::expected_nbytes(
+        cortiq_core::TensorDtype::Q4TiledP,
+        &[rows, cols],
+    ) else {
+        return false;
+    };
+    if abs + need > safe_len {
+        return false;
+    }
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let xs_buf = get_io(15_000_000_611 + xs.len(), xs.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(xs.as_ptr(), xs_buf.contents() as *mut f32, xs.len());
+    }
+    let y_buf = get_io(16_000_000_627 + rows, rows * 4);
+    let cmd = c.queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    encode_q4tp_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
+    enc.end_encoding();
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), rows);
+    }
+    true
+}
+
+/// Time `reps` back-to-back matvec dispatches in ONE command buffer, so the
+/// number is kernel cost and not submit latency — a single-dispatch timing
+/// is ~0.25 ms of round trip on Metal and hides everything smaller.
+/// Returns seconds per dispatch. Picks the kernel from the tensor's dtype.
+#[doc(hidden)]
+pub fn q4_matvec_bench(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    reps: usize,
+) -> Option<f64> {
+    let c = ctx()?;
+    if cols % GROUP_SIZE != 0 {
+        return None;
+    }
+    let gpr = cols / GROUP_SIZE;
+    let entry = &model.tensors[idx];
+    let abs = model.entry_abs_offset(entry)?;
+    let (fbuf, safe_len) = file_buffer(c, model)?;
+    let need = cortiq_core::quant::expected_nbytes(entry.dtype, &[rows, cols])?;
+    if abs + need > safe_len {
+        return None;
+    }
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let xs_buf = get_io(17_000_000_633 + xs.len(), xs.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(xs.as_ptr(), xs_buf.contents() as *mut f32, xs.len());
+    }
+    let y_buf = get_io(18_000_000_641 + rows, rows * 4);
+    let tp = entry.dtype == cortiq_core::TensorDtype::Q4TiledP;
+    let mut best = f64::MAX;
+    for _ in 0..3 {
+        let cmd = c.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        for _ in 0..reps {
+            if tp {
+                encode_q4tp_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
+            } else {
+                encode_q4t_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
+            }
+        }
+        enc.end_encoding();
+        let t0 = std::time::Instant::now();
+        submit_and_wait(c, cmd, &[&y_buf]);
+        best = best.min(t0.elapsed().as_secs_f64() / reps as f64);
+    }
+    Some(best)
+}
+
+/// Sweep: ONE dispatch per tensor across a whole list, in one command
+/// buffer. Repeating a single tensor keeps its scale planes cache-hot, which
+/// flatters q4tp; the model touches each tensor once per token, so this is
+/// the access pattern that decides. Returns seconds for the whole sweep.
+#[doc(hidden)]
+pub fn q4_matvec_sweep(
+    model: &Arc<CmfModel>,
+    tensors: &[(usize, usize, usize)],
+    serial: bool,
+) -> Option<f64> {
+    let c = ctx()?;
+    let (fbuf, safe_len) = file_buffer(c, model)?;
+    let maxc = tensors.iter().map(|t| t.2).max()?;
+    let maxr = tensors.iter().map(|t| t.1).max()?;
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let xs_buf = get_io(19_000_000_643 + maxc, maxc * 4);
+    let y_buf = get_io(20_000_000_649 + maxr, maxr * 4);
+    let mut plan = Vec::with_capacity(tensors.len());
+    for &(idx, rows, cols) in tensors {
+        let entry = &model.tensors[idx];
+        let abs = model.entry_abs_offset(entry)?;
+        let need = cortiq_core::quant::expected_nbytes(entry.dtype, &[rows, cols])?;
+        if cols % GROUP_SIZE != 0 || abs + need > safe_len {
+            return None;
+        }
+        plan.push((
+            abs,
+            rows,
+            cols / GROUP_SIZE,
+            entry.dtype == cortiq_core::TensorDtype::Q4TiledP,
+        ));
+    }
+    // `serial` puts each dispatch in its OWN encoder. Metal fences tracked
+    // buffers across encoder boundaries, so the dispatches stop overlapping —
+    // which is the regime the token graph actually runs in, every projection
+    // feeding the next. Overlapped, a sweep measures bandwidth; serialized, it
+    // measures the per-dispatch latency the model pays.
+    let mut best = f64::MAX;
+    for _ in 0..4 {
+        let cmd = c.queue.new_command_buffer();
+        if serial {
+            for &(abs, rows, gpr, tp) in &plan {
+                let enc = cmd.new_compute_command_encoder();
+                if tp {
+                    encode_q4tp_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
+                } else {
+                    encode_q4t_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
+                }
+                enc.end_encoding();
+            }
+        } else {
+            let enc = cmd.new_compute_command_encoder();
+            for &(abs, rows, gpr, tp) in &plan {
+                if tp {
+                    encode_q4tp_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
+                } else {
+                    encode_q4t_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr);
+                }
+            }
+            enc.end_encoding();
+        }
+        let t0 = std::time::Instant::now();
+        submit_and_wait(c, cmd, &[&y_buf]);
+        best = best.min(t0.elapsed().as_secs_f64());
+    }
+    Some(best)
+}
+
 /// GEMM prefill batch: pre — prescaled inputs row-major [b, cols],
 /// out — row-major [b, rows]. false = CPU path.
 #[allow(clippy::too_many_arguments)]
@@ -4362,7 +4994,7 @@ fn enc_mul_mm(
     fbuf: &Buffer,
     abs: usize,
     rs_buf: &Buffer,
-    q4t: bool,
+    kind: MmKind,
     xs: &Buffer,
     y: &Buffer,
     b: usize,
@@ -4373,8 +5005,12 @@ fn enc_mul_mm(
     // and fully unrolled over the 18 B group), so it takes the generic
     // pipeline; q8 keeps the cols/rows-specialized one.
     let (cols_u, rows_u, b_u) = (cols as u32, rows as u32, b as u32);
-    if q4t {
-        enc.set_compute_pipeline_state(&c.q4tmm);
+    if kind != MmKind::Q8 {
+        enc.set_compute_pipeline_state(if kind == MmKind::Q4tp {
+            &c.q4tpmm
+        } else {
+            &c.q4tmm
+        });
         enc.set_buffer(0, Some(fbuf), abs as u64);
         enc.set_buffer(1, Some(xs), 0);
         enc.set_buffer(2, Some(y), 0);
@@ -4405,7 +5041,7 @@ fn encode_mul_mm(
     fbuf: &Buffer,
     abs: usize,
     rs_buf: &Buffer,
-    q4t: bool,
+    kind: MmKind,
     xs: &Buffer,
     y: &Buffer,
     b: usize,
@@ -4413,7 +5049,7 @@ fn encode_mul_mm(
     cols: usize,
 ) {
     let enc = cmd.new_compute_command_encoder();
-    enc_mul_mm(c, enc, fbuf, abs, rs_buf, q4t, xs, y, b, rows, cols);
+    enc_mul_mm(c, enc, fbuf, abs, rs_buf, kind, xs, y, b, rows, cols);
     enc.end_encoding();
 }
 
@@ -4471,9 +5107,8 @@ pub struct ChunkIo<'a> {
 struct ChunkPrep {
     abs: [usize; 7],
     rs: [Buffer; 7],
-    /// Per-projection weight layout: true = q4_tiled (18 B tiles, scale
-    /// inline), false = q8_row (`rs` carries the row scales).
-    q4t: [bool; 7],
+    /// Per-projection weight layout (`rs` carries row scales for Q8 only).
+    kind: [MmKind; 7],
     k_mb: Buffer,
     v_mb: Buffer,
     imp_mb: Buffer,
@@ -4609,16 +5244,30 @@ pub fn chunk_run_gpu(
         // An empty row_scale marks q4_tiled (scales inside the tiles);
         // its payload is 18 B per 32-weight group, not one byte per
         // weight, so the bounds check differs.
+        // Layout comes from the tensor directory, not from "row_scale is
+        // empty" — that heuristic could only ever spell two of the three.
+        let kind_of = |t: &(usize, usize, usize, &[f32])| -> Option<MmKind> {
+            Some(match l.model.tensors.get(t.0)?.dtype {
+                cortiq_core::TensorDtype::Q4Tiled => MmKind::Q4t,
+                cortiq_core::TensorDtype::Q4TiledP => MmKind::Q4tp,
+                _ => MmKind::Q8,
+            })
+        };
         let abs_of = |t: &(usize, usize, usize, &[f32])| -> Option<usize> {
             let entry = l.model.tensors.get(t.0)?;
             let abs = l.model.entry_abs_offset(entry)?;
-            let bytes = if t.3.is_empty() {
-                if t.2 % GROUP_SIZE != 0 {
-                    return None;
+            let bytes = match kind_of(t)? {
+                MmKind::Q4t => {
+                    if t.2 % GROUP_SIZE != 0 {
+                        return None;
+                    }
+                    t.1 * (t.2 / GROUP_SIZE) * Q4_TILE
                 }
-                t.1 * (t.2 / GROUP_SIZE) * Q4_TILE
-            } else {
-                t.1 * t.2
+                MmKind::Q4tp => cortiq_core::quant::expected_nbytes(
+                    cortiq_core::TensorDtype::Q4TiledP,
+                    &[t.1, t.2],
+                )?,
+                MmKind::Q8 => t.1 * t.2,
             };
             (abs + bytes <= safe_len).then_some(abs)
         };
@@ -4675,15 +5324,20 @@ pub fn chunk_run_gpu(
             rs_of(&l.up),
             rs_of(&l.down),
         ];
-        let q4t = [
-            l.wq.3.is_empty(),
-            l.wk.3.is_empty(),
-            l.wv.3.is_empty(),
-            l.wo.3.is_empty(),
-            l.gate.3.is_empty(),
-            l.up.3.is_empty(),
-            l.down.3.is_empty(),
-        ];
+        let kind = match [
+            kind_of(&l.wq),
+            kind_of(&l.wk),
+            kind_of(&l.wv),
+            kind_of(&l.wo),
+            kind_of(&l.gate),
+            kind_of(&l.up),
+            kind_of(&l.down),
+        ] {
+            [Some(a), Some(b), Some(c), Some(d), Some(e), Some(f), Some(g)] => {
+                [a, b, c, d, e, f, g]
+            }
+            _ => return false,
+        };
         // KV mirror prep (self-healing contract of the decode graph),
         // reserving b rows for the chunk.
         let (k_mb, v_mb, imp_mb, cap, st0) = {
@@ -4758,7 +5412,7 @@ pub fn chunk_run_gpu(
         preps.push(ChunkPrep {
             abs,
             rs,
-            q4t,
+            kind,
             k_mb,
             v_mb,
             imp_mb,
@@ -4896,7 +5550,7 @@ pub fn chunk_run_gpu(
                 &fbuf,
                 prep.abs[0],
                 &prep.rs[0],
-                prep.q4t[0],
+                prep.kind[0],
                 &n_b,
                 &qraw,
                 b,
@@ -4909,7 +5563,7 @@ pub fn chunk_run_gpu(
                 &fbuf,
                 prep.abs[1],
                 &prep.rs[1],
-                prep.q4t[1],
+                prep.kind[1],
                 &n_b,
                 &kraw,
                 b,
@@ -4922,7 +5576,7 @@ pub fn chunk_run_gpu(
                 &fbuf,
                 prep.abs[2],
                 &prep.rs[2],
-                prep.q4t[2],
+                prep.kind[2],
                 &n_b,
                 &vraw,
                 b,
@@ -5084,7 +5738,7 @@ pub fn chunk_run_gpu(
             &fbuf,
             prep.abs[3],
             &prep.rs[3],
-            prep.q4t[3],
+            prep.kind[3],
             &attn,
             &ob,
             b,
@@ -5102,7 +5756,7 @@ pub fn chunk_run_gpu(
                 &fbuf,
                 prep.abs[4],
                 &prep.rs[4],
-                prep.q4t[4],
+                prep.kind[4],
                 &n_b,
                 &gb,
                 b,
@@ -5115,7 +5769,7 @@ pub fn chunk_run_gpu(
                 &fbuf,
                 prep.abs[5],
                 &prep.rs[5],
-                prep.q4t[5],
+                prep.kind[5],
                 &n_b,
                 &ub,
                 b,
@@ -5132,8 +5786,12 @@ pub fn chunk_run_gpu(
             let (cols_u, rows_u, b_u) = (l.down.2 as u32, l.down.1 as u32, b as u32);
             // q4t drops the row-scale buffer, so every constant after it
             // shifts down one slot.
-            let base = if prep.q4t[6] {
-                enc.set_compute_pipeline_state(&c.q4tmmsilu);
+            let base = if prep.kind[6] != MmKind::Q8 {
+                enc.set_compute_pipeline_state(if prep.kind[6] == MmKind::Q4tp {
+                    &c.q4tpmmsilu
+                } else {
+                    &c.q4tmmsilu
+                });
                 enc.set_buffer(0, Some(&fbuf), prep.abs[6] as u64);
                 enc.set_buffer(1, Some(&gb), 0);
                 enc.set_buffer(2, Some(&ub), 0);
@@ -7094,6 +7752,24 @@ impl TokenGraph {
 
     /// Validate one q4_tiled tensor: `rows·gpr·18` interleaved tile
     /// bytes must fit the safe mmap window.
+    /// q4tp spans three planes, so the bound check must cover all of them —
+    /// the kernel reads the code plane past the end of the nibbles.
+    fn q4tp_abs(&self, t: (usize, usize, usize)) -> Option<usize> {
+        let (idx, rows, cols) = t;
+        if cols % GROUP_SIZE != 0 {
+            return None;
+        }
+        let entry = &self.model.tensors[idx];
+        let abs = self.model.entry_abs_offset(entry)?;
+        let need = cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[
+            rows, cols,
+        ])?;
+        if abs + need > self.safe_len {
+            return None;
+        }
+        Some(abs)
+    }
+
     fn q4t_abs(&self, t: (usize, usize, usize)) -> Option<usize> {
         let (idx, rows, cols) = t;
         if cols % GROUP_SIZE != 0 {
@@ -7115,6 +7791,7 @@ impl TokenGraph {
             cortiq_core::TensorDtype::Q1T => self.q1t_abs(t).map(|a| (a, ProjKind::Q1t)),
             cortiq_core::TensorDtype::Q4Block => self.q4b_abs(t).map(|a| (a, ProjKind::Q4b)),
             cortiq_core::TensorDtype::Q4Tiled => self.q4t_abs(t).map(|a| (a, ProjKind::Q4t)),
+            cortiq_core::TensorDtype::Q4TiledP => self.q4tp_abs(t).map(|a| (a, ProjKind::Q4tp)),
             cortiq_core::TensorDtype::Q8Row | cortiq_core::TensorDtype::Q8_2f => {
                 self.q8_abs(t).map(|(a, row_scale, col_field)| {
                     (
