@@ -91,6 +91,8 @@ pub fn cmd_awnp(
     acts_prefix: &str,
     output: &str,
     drop: f64,
+    ridge: f64,
+    rescale: bool,
 ) -> anyhow::Result<()> {
     if !(0.0..0.9).contains(&drop) {
         bail!("--drop must be in [0, 0.9)");
@@ -188,9 +190,14 @@ pub fn cmd_awnp(
                 css[a * keep_n + b] = c[ia * hidden + ib];
             }
         }
-        let ridge = (0..keep_n).map(|i| css[i * keep_n + i]).sum::<f64>() / keep_n as f64 * 1e-8;
+        // The ridge is the difference between a projection that generalizes
+        // and one that memorizes the calibration text. At 1e-8 it is decorative:
+        // a least-squares refit with ~1500 predictors will happily fit the
+        // sample and fall apart on held-out data (measured: PPL 7.3 baseline
+        // vs 38 at 12.5% dropped, on a narrow calibration).
+        let scale = (0..keep_n).map(|i| css[i * keep_n + i]).sum::<f64>() / keep_n as f64;
         for i in 0..keep_n {
-            css[i * keep_n + i] += ridge;
+            css[i * keep_n + i] += scale * ridge;
         }
         if !cholesky(&mut css, keep_n) {
             bail!("layer {li}: C[S,S] not positive definite even with a ridge");
@@ -220,6 +227,23 @@ pub fn cmd_awnp(
             for r in 0..rows {
                 for (a, &ia) in keep.iter().enumerate() {
                     wide[r * cols + ia] = small[r * keep_n + a];
+                }
+            }
+            // Variance-preserving rescale (patent 12). A least-squares refit
+            // shrinks the weights — it minimizes error, and part of the input
+            // it can no longer see is simply given up rather than guessed at.
+            // Restoring the original spread puts the activations back on the
+            // scale the rest of the network was trained against.
+            if rescale {
+                let mean_sq = |v: &[f32]| -> f64 {
+                    v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / v.len() as f64
+                };
+                let (before, after) = (mean_sq(&buf), mean_sq(&wide));
+                if after > 0.0 {
+                    let g = (before / after).sqrt() as f32;
+                    for v in wide.iter_mut() {
+                        *v *= g;
+                    }
                 }
             }
             projected.insert(ti, crate::convert::encode_for(e.dtype, &wide, rows, cols));

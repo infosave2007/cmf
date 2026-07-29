@@ -324,6 +324,12 @@ enum Commands {
         /// Fraction of input channels to drop (0–0.9)
         #[arg(long, default_value_t = 0.25)]
         drop: f64,
+        /// Ridge on C[S,S], relative to its mean diagonal
+        #[arg(long, default_value_t = 1e-3)]
+        ridge: f64,
+        /// Variance-preserving rescale after the projection (patent 12)
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        rescale: bool,
     },
     Requant {
         /// Source .cmf model
@@ -1025,7 +1031,9 @@ async fn main() -> anyhow::Result<()> {
             acts,
             output,
             drop,
-        } => awnp::cmd_awnp(&model, &acts, &output, drop),
+            ridge,
+            rescale,
+        } => awnp::cmd_awnp(&model, &acts, &output, drop, ridge, rescale),
         Commands::Requant {
             model,
             output,
