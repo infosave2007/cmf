@@ -2,10 +2,21 @@
 //!
 //!   cargo run --release --example q4tp_gpu_ab -- <model.cmf>
 
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    // The sweeps below time Metal encoders directly; the wgpu kernels are
+    // covered by tests/gpu_q4tp.rs, which runs on every backend.
+    eprintln!("q4tp_gpu_ab: macOS/Metal-only diagnostic");
+}
+
+#[cfg(target_os = "macos")]
 use cortiq_core::CmfModel;
+#[cfg(target_os = "macos")]
 use cortiq_core::types::TensorDtype;
+#[cfg(target_os = "macos")]
 use std::sync::Arc;
 
+#[cfg(target_os = "macos")]
 fn main() {
     unsafe { std::env::set_var("CMF_GPU", "1") };
     let path = std::env::args().nth(1).expect("usage: q4tp_gpu_ab <model.cmf>");

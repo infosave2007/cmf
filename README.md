@@ -206,7 +206,7 @@ tolerance class (+0.16%). A per-stage GPU profiler ships with it
 of the chunk while the standalone kernel benchmark was mis-crediting
 the GEMMs. The Vulkan/DX12 (wgpu) path carries the same tiled GEMM,
 gated by the runtime probe per machine. 0.3.8 also blocks the x86
-prefill GEMMs (q8 / q4 / q4_tiled / vbit): weight tiles and nibble
+prefill GEMMs (q8 / q4 / q4_tiled / q4tp / vbit): weight tiles and nibble
 unpacks stay in registers across four activation streams — +37% (q8) to
 ×4.4 (q4_block) on an EPYC AVX2 host, exact parity, `CMF_X86_BLOCKED=0`
 reverts. **0.4.0** extends the whole-token decode graph (Metal) to drive
@@ -242,11 +242,44 @@ cortiq info   model.cmf     # arch, tensors, quantization, skills
 Weights are memory-mapped and read in place, so startup is instant and unused
 weights never touch RAM. Quantization is per tensor and mixable — `q8`
 (1 byte/param) · `q8_2f` (int8 with both a per-row and a per-column scale — better
-quality at the same byte count) · `q4` (0.5) · `q1t` (**training-free ternary**,
+quality at the same byte count) · `q4` (0.5) · `q4t` (the same 4-bit grid in
+interleaved tiles) · `q4tp` (**q4t with predicted scales** — 0.52 B/param, see
+below) · `q1t` (**training-free ternary**,
 `{−s,0,+s}` + a sparse outlier overlay, ~2.25–3.5 bit/param — below `q4`, made by
 `quantize-gptq`, GPU-accelerated on Metal and wgpu) · `q1` (1-bit) · `f16` ·
 `vbit` (variable 3–8 bit, ~4.25 avg ≈ 0.53) — so you can keep attention at q8 and
 push the FFN to q4/q1t in the same file. See [q1t PTQ](docs/Q1T_PTQ.md).
+
+#### `q4tp` — 7% off any q4t file, for ~0.1% of the error budget
+
+A `q4t` tile spends 16 bits on a standalone f16 scale for 32 weights: 0.5 of
+its 4.5 bits/weight, **11% of the file**. `q4tp` keeps the nibbles
+byte-identical and makes that scale a 5-bit rung on a per-row geometric
+ladder, for 4.17 bits/weight.
+
+It is nearly free. Quantizing the *same* fp32 weights both ways, `q4tp`'s
+error against the source is 9.71% where `q4t`'s is 9.71% — a **+0.1%**
+relative increase at the median within-row scale spread measured on
+KAT-Coder-V2.5, +0.3% at its 90th percentile. A coarser scale barely matters
+because the nibbles simply re-round against it; the 4-bit grid dominates
+either way. Nanbeige-3B keeps its top-5 next tokens in the same order with
+logits within 0.7%.
+
+Existing `.cmf` files convert in place — no original checkpoint needed, which
+matters when the checkpoint behind a published model is tens of gigabytes:
+
+```sh
+cortiq requant model.cmf --output model-q4tp.cmf --quant q4tp
+# KAT-Coder-V2.5: 12.65 → 11.80 GB (19254 tensors) in 2 min
+# Nanbeige-3B:     2.36 →  2.19 GB, peak RSS 2.42 → 2.19 GB
+```
+
+`cortiq convert --quant q4tp` produces it straight from a HF checkpoint.
+Kernels cover every path — CPU (scalar, sdot/AVX2/VNNI int8, blocked 1×4,
+Accelerate), Metal and wgpu, decode and batched prefill alike. Speed is at
+parity or better: a 16 B nibble stride is 4-aligned, so the matvec loads four
+uints where `q4t` needs nine unaligned ushorts, and the batched GEMM at b=64
+runs 9.51 vs 10.13 ms on Metal and 9.83 vs 10.76 on wgpu.
 
 ### Many specialists, one backbone
 
@@ -582,7 +615,8 @@ distribution-equivalent to the CPU path (first-token probabilities within
 reductions run in a different order, as with any GPU offload.
 `CMF_GPU_ATTEND=0` keeps the attention core on the CPU, `CMF_GPU_BLOCK=0`
 disables the graph. `q4_tiled` joined the list in 0.5.35, on both the
-decode graph and the batched prefill.
+decode graph and the batched prefill; `q4tp` in 0.5.38, on Metal and wgpu
+alike.
 
 Since 0.5.35 the Metal decode attend is flash-decoding shaped — the
 simdgroups of one threadgroup split a head's positions and combine their

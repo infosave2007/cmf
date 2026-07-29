@@ -275,6 +275,7 @@ Numbering shared with `.vmfc` (ids are never reused):
 | 12 | `q1`      | ✅ read/write — 1-bit binary, for 1-bit-TRAINED models only (`--quant q1`) |
 | 13 | `q1s`     | ✅ read/write — `q1` base + sparse high-precision outlier overlay (1-bit PTQ of normal checkpoints) |
 | 14 | `q1t`     | ✅ read/write — ternary `{−s, 0, +s}` base-3 tiles + per-row outlier overlay (~2.25 bpw + overlay) |
+| 15 | `q4tp`    | ✅ read/write — `q4_tiled` nibbles with the per-tile scale as a 5-bit rung on a per-row ladder (`--quant q4tp`, or `requant` in place) |
 
 ### 3.2 Quant layouts (canon = `.vmfc`: "quants first, then scales")
 
@@ -314,6 +315,19 @@ Numbering shared with `.vmfc` (ids are never reused):
   one sequential memory stream instead of two distant ones. Values and
   nibble order are identical to `q4_block`; only the placement of the
   scale differs (kernel-measured ×1.66 ARM / ×1.13 AVX2 over split).
+- **`q4tp`** (2-D only, `in % 32 == 0`):
+  `[nibbles: rows·gpr·16][row params: rows × (f16 lo, f16 step)]
+   [codes: rows × ceil(gpr·5/8), 5-bit LSB-first, row-aligned]`,
+  `gpr = in/32`. A tile's scale is `2^(lo[r] + code·step[r])`, so a reader
+  expands one row's 32-rung ladder once and then reads scales by table
+  lookup. Nibble values and order are identical to `q4_tiled`; only the
+  scale's representation differs. 4.17 bits/weight against 4.50 — the
+  f16 scale was 11% of a q4t file.
+  `lo`/`step` come from the row's exact min/max log-scale, so no code is
+  ever out of range and the format needs no escape hatch. Encoders MUST
+  round `lo`/`step` to f16 **before** choosing codes, and MUST quantize the
+  nibbles against the reconstructed scale — otherwise writer and reader
+  disagree, the same trap that makes a q4 encoder round its scale first.
 - **`q1`** (2-D only, `in % 32 == 0`):
   `repeat per 32-group { [f16 scale][4B sign bits] }` — 6-byte tiles,
   1.5 bits/weight. Bit k of byte j (LSB-first) is weight j·8+k of the

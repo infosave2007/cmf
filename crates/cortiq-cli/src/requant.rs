@@ -46,7 +46,7 @@ pub fn cmd_requant(model_path: &str, output: &str, quant: &str) -> anyhow::Resul
     let mut buf: Vec<f32> = Vec::new();
 
     for entry in &model.tensors {
-        let shape: Vec<usize> = entry.shape.iter().map(|&d| d as usize).collect();
+        let shape: Vec<usize> = entry.shape.clone();
         let src = model.entry_bytes(entry);
         before += src.len() as u64;
 
