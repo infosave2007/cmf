@@ -3091,25 +3091,29 @@ kernel void q4tp_mul_mm(
         mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
 
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off = params_off + (ulong)rows * 4ul;
+    uint cstride = (gpr * 5u + 7u) / 8u;
+    device const half* prow = (device const half*)(q + params_off + (ulong)(r0 + lr0) * 4ul);
+    float row_lo = (float)prow[0];
+    float row_st = (float)prow[1];
+    device const uchar* codes_row = q + codes_off + (ulong)(r0 + lr0) * (ulong)cstride;
     for (uint k0 = 0; k0 < cols; k0 += NK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // W: this thread's 16 weights (row r0+lr0, K-half il0) — 8
         // nibble bytes of one tile, low nibble first.
         {
             uint g = k0 >> 5u;
-            uint wr = r0 + lr0;
-            ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
-            ulong codes_off  = params_off + (ulong)rows * 4ul;
-            uint  cstride    = (gpr * 5u + 7u) / 8u;
             uint bit = g * 5u;
             uint shf = bit & 7u;
-            device const uchar* cp = q + codes_off + (ulong)wr * (ulong)cstride + (bit >> 3u);
+            device const uchar* cp = codes_row + (bit >> 3u);
             uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
-            device const half* ph = (device const half*)(q + params_off + (ulong)wr * 4ul);
-            // One exp2 per staged tile: this kernel is compute-dense (each
-            // thread stages 16 weights per K-step), so the ladder-in-shmem
-            // trick the matvec needs buys nothing measurable here.
-            float scale = exp2((float)ph[0] + (float)code * (float)ph[1]);
+            // lo/step are loop-invariant for this thread (its row is fixed
+            // across the whole K loop), so they are read ONCE above. Leaving
+            // them in the loop cost Lumina's DiT enough that the runtime probe
+            // preferred the CPU GEMM outright — the "the GEMM's arithmetic
+            // hides the chain" argument held for FFN shapes and not for this.
+            float scale = exp2(row_lo + (float)code * row_st);
             device const uchar* nib = q + ((ulong)wr * gpr + (ulong)g) * 16ul + 8u * il0;
             uint sy = (tiitg / 2u) / 8u;
             uint lx = (tiitg / 2u) % 8u;
@@ -3234,25 +3238,29 @@ kernel void q4tp_mul_mm_silu(
         mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
 
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off = params_off + (ulong)rows * 4ul;
+    uint cstride = (gpr * 5u + 7u) / 8u;
+    device const half* prow = (device const half*)(q + params_off + (ulong)(r0 + lr0) * 4ul);
+    float row_lo = (float)prow[0];
+    float row_st = (float)prow[1];
+    device const uchar* codes_row = q + codes_off + (ulong)(r0 + lr0) * (ulong)cstride;
     for (uint k0 = 0; k0 < cols; k0 += NK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // W: this thread's 16 weights (row r0+lr0, K-half il0) — 8
         // nibble bytes of one tile, low nibble first.
         {
             uint g = k0 >> 5u;
-            uint wr = r0 + lr0;
-            ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
-            ulong codes_off  = params_off + (ulong)rows * 4ul;
-            uint  cstride    = (gpr * 5u + 7u) / 8u;
             uint bit = g * 5u;
             uint shf = bit & 7u;
-            device const uchar* cp = q + codes_off + (ulong)wr * (ulong)cstride + (bit >> 3u);
+            device const uchar* cp = codes_row + (bit >> 3u);
             uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
-            device const half* ph = (device const half*)(q + params_off + (ulong)wr * 4ul);
-            // One exp2 per staged tile: this kernel is compute-dense (each
-            // thread stages 16 weights per K-step), so the ladder-in-shmem
-            // trick the matvec needs buys nothing measurable here.
-            float scale = exp2((float)ph[0] + (float)code * (float)ph[1]);
+            // lo/step are loop-invariant for this thread (its row is fixed
+            // across the whole K loop), so they are read ONCE above. Leaving
+            // them in the loop cost Lumina's DiT enough that the runtime probe
+            // preferred the CPU GEMM outright — the "the GEMM's arithmetic
+            // hides the chain" argument held for FFN shapes and not for this.
+            float scale = exp2(row_lo + (float)code * row_st);
             device const uchar* nib = q + ((ulong)wr * gpr + (ulong)g) * 16ul + 8u * il0;
             uint sy = (tiitg / 2u) / 8u;
             uint lx = (tiitg / 2u) % 8u;
