@@ -2360,7 +2360,31 @@ pub fn sgemm_public(
     c: &mut [f32],
     ldc: usize,
 ) {
-    sgemm_rm(m, n, k, alpha, a, lda, b_mat, ldb, b_rows_are_n, c, ldc);
+    #[cfg(any(target_os = "macos", target_arch = "aarch64"))]
+    {
+        sgemm_rm(m, n, k, alpha, a, lda, b_mat, ldb, b_rows_are_n, c, ldc);
+    }
+    // x86 without Accelerate has no sgemm_rm: the specialized paths there are
+    // quantized kernels, not an f32 GEMM. Only the offline AWNP pass reaches
+    // this, so correctness matters and throughput does not — a triple loop is
+    // the honest fallback rather than a reason to make the tool macOS-only.
+    #[cfg(not(any(target_os = "macos", target_arch = "aarch64")))]
+    {
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f32;
+                for p in 0..k {
+                    let bv = if b_rows_are_n {
+                        b_mat[j * ldb + p]
+                    } else {
+                        b_mat[p * ldb + j]
+                    };
+                    acc += a[i * lda + p] * bv;
+                }
+                c[i * ldc + j] = alpha * acc;
+            }
+        }
+    }
 }
 
 /// Row-major f32 GEMM on Accelerate: C[m,n] = alpha·A[m,k] × B(ᵀ).
