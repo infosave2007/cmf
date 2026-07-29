@@ -2343,6 +2343,26 @@ pub(crate) fn sgemm_rm(
     neon_gemm_rm(m, n, k, alpha, a, lda, b_mat, ldb, b_rows_are_n, c, ldc);
 }
 
+/// Row-major f32 GEMM, exposed for offline tools (the AWNP pass builds a
+/// per-layer projection and applies it to every expert; a naive triple loop
+/// would turn a two-minute job into half an hour).
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_public(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: &[f32],
+    lda: usize,
+    b_mat: &[f32],
+    ldb: usize,
+    b_rows_are_n: bool,
+    c: &mut [f32],
+    ldc: usize,
+) {
+    sgemm_rm(m, n, k, alpha, a, lda, b_mat, ldb, b_rows_are_n, c, ldc);
+}
+
 /// Row-major f32 GEMM on Accelerate: C[m,n] = alpha·A[m,k] × B(ᵀ).
 /// `b_rows_are_n` = true multiplies by Bᵀ where B is stored [n, k].
 #[cfg(target_os = "macos")]

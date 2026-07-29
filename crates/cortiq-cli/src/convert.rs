@@ -600,6 +600,20 @@ pub(crate) fn encode_q4tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
     nib
 }
 
+/// Re-encode f32 values into an EXISTING tensor's dtype — the offline passes
+/// (AWNP) rewrite weights and must put them back in the layout the file
+/// already uses, not pick a new one.
+pub(crate) fn encode_for(dtype: TensorDtype, vals: &[f32], rows: usize, cols: usize) -> Vec<u8> {
+    match dtype {
+        TensorDtype::Q4Tiled => encode_q4_tiled(vals, rows, cols),
+        TensorDtype::Q4TiledP => encode_q4tp(vals, rows, cols),
+        TensorDtype::Q4Block => encode_q4_block(vals),
+        TensorDtype::Q8Row => encode_q8_row(vals, rows, cols),
+        TensorDtype::Q8_2f => encode_q8_2f(vals, rows, cols),
+        _ => encode_f16(vals),
+    }
+}
+
 /// q1 (dtype 12): per 32-group tile `[f16 scale][4B sign bits]`,
 /// bit k of byte j (LSB-first) = weight j·8+k; value = s·(2·bit−1).
 /// Scale = group mean |v| — the L2-optimal binary level; for a

@@ -5,6 +5,7 @@ mod gguf;
 mod gptq;
 mod imagepack;
 mod moedefrag;
+mod awnp;
 mod requant;
 mod npy;
 mod sign;
@@ -308,6 +309,22 @@ enum Commands {
     /// Recode an existing .cmf into a denser layout without the original
     /// checkpoint. `--quant q4tp` re-expresses q4_tiled/q4_block per-tile
     /// scales as rungs on a per-row ladder: same 4-bit grid, ~7% fewer bytes.
+    /// Activation-Weighted Nullspace Projection: drop the weakest input
+    /// channels of every MoE expert and refit the survivors to absorb what
+    /// was removed. Needs calibration dumps from CMF_ACT_DUMP.
+    Awnp {
+        /// Source .cmf model
+        model: String,
+        /// Prefix of the CMF_ACT_DUMP files (`<prefix>.<layer>.f32`)
+        #[arg(long)]
+        acts: String,
+        /// Output .cmf path
+        #[arg(long)]
+        output: String,
+        /// Fraction of input channels to drop (0–0.9)
+        #[arg(long, default_value_t = 0.25)]
+        drop: f64,
+    },
     Requant {
         /// Source .cmf model
         model: String,
@@ -1003,6 +1020,12 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Compact { model, output } => moedefrag::cmd_compact(&model, &output),
+        Commands::Awnp {
+            model,
+            acts,
+            output,
+            drop,
+        } => awnp::cmd_awnp(&model, &acts, &output, drop),
         Commands::Requant {
             model,
             output,
