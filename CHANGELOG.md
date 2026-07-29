@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.37] — 2026-07-29
+
+A batch of "the kernel was already there, nobody wired it up" and two
+copies of the same defect in two languages. Measured on an RTX 3090 with
+a 256-core EPYC beside it, and on a fanless MacBook Air M4.
+
+### Added
+- **DiT attention on wgpu** (`gpu::dit_attention` had a Metal arm and
+  nothing else, so Vulkan ran the whole attention block on the CPU).
+  Three WGSL kernels on the tile machinery the quantized GEMMs use —
+  scores, row softmax, P·V — plus a panel unstack, all in one
+  submission with the intermediates resident.
+- **Causal chunk attention on wgpu** for LLM prefill. The CPU twin needs
+  Accelerate or the NEON micro-GEMM, so x86 had no batched attend at all
+  and fell back to a per-position scalar loop.
+- **Fused QKV** for the batched attention path: one upload of the normed
+  chunk, three GEMMs, one readback.
+
+### Fixed
+- **The tiled WGSL GEMMs kept their register block in memory.** All four
+  (q8, q1, q1t, q4t) declared the 4×4 accumulator as
+  `array<array<f32,4>,4>` and indexed it with loop variables; a
+  dynamically indexed private array does not stay in registers on this
+  backend. The GEMM ran at 373 GFLOP/s of an RTX 3090's ~35 TFLOP/s.
+  Sixteen named scalars instead — bit-identical output, and the stage
+  itself went ×4.1.
+- **The same defect in AVX2**: the blocked q4t kernel folded each group's
+  eight i32 lanes to a scalar inside the loop, 288 cross-lane reductions
+  per weight row. Four f32 accumulator vectors and one reduction per row.
+  Also more accurate — perplexity 9.777 → 9.572, because summing 72
+  scalars in sequence loses more than accumulating in eight lanes.
+  (`avx2` does not imply `fma`: without it declared, LLVM lowered
+  `_mm256_fmadd_ps` to a libm call per lane and the "optimized" kernel
+  ran 2× slower than the one it replaced.)
+- **The batched dense FFN never used the fused GPU kernel**, so prefill
+  paid three round trips per layer and shipped the 22 MB gate/up panels
+  across the bus for nothing. The kernel had existed since the image DiT.
+- **The default thread cap left big machines idle.** `min(available−1, 8)`
+  meant eight threads on a 256-core box. Raised to 32 — a ceiling, not a
+  target: decode is memory-bound and collapses past it (14.8 tok/s at 32,
+  5.5 at 64, 1.6 at 256). Machines with nine cores or fewer, and
+  heterogeneous ARM, are untouched.
+- **A coin flip decided whether image generation ran at half speed**: the
+  fused DiT paths gated themselves on a per-op probe that is a tie on
+  Metal (2.62 vs 2.56 ms) and mere overhead on a discrete card. They now
+  trust the device on native Metal and on discrete wgpu adapters;
+  integrated and mobile keep probing.
+
+### Changed
+- Lumina's caption embedding and context refiner are hoisted out of the
+  denoise loop — they depend on the prompt alone, so 30 CFG steps were
+  evaluating 60 times a value with two distinct instances. Bit-identical,
+  and honestly small (~0.25% of a step).
+- `cortiq imagine`'s help caught up with reality: it still said "CPU f32
+  (experimental; CMF packaging comes later)" long after `imagine-pack`
+  shipped and the DiT moved onto the device.
+
+### Measured
+Lumina-Image 2.0 at 512², two steps, RTX 3090: **67.7 s → 24.75 s**.
+Nanbeige 4.2 on the same box: Vulkan prefill **15.1 → 25.0 tok/s** at
+ctx 512 and **15.0 → 23.0** at ctx 1024; CPU decode **7.8 → 14.3**, CPU
+prefill **11.8 → 16.7**. Perplexity is unchanged at every step.
+
 ## [0.5.36] — 2026-07-28
 
 ### Fixed
