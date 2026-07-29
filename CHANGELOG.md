@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.39] — 2026-07-29
+
+Same code as 0.5.38 plus the documentation it should have shipped with.
+0.5.38 was tagged but never published to crates.io: its CI was red because
+`examples/q4tp_gpu_ab.rs` referenced the Metal module unconditionally and so
+failed `--all-targets` on Linux, and the README and spec said nothing about
+the new dtype. Both fixed here; 0.5.39 is the release to use.
+
+### Added
+- **`q4tp` in the README** — what it costs, what it saves, and `requant` for
+  files already published.
+- **`q4tp` in `docs/CMF_V2_SPEC.md`** as dtype 15, with its byte layout and
+  the two encoder requirements (round `lo`/`step` to f16 before choosing
+  codes; quantize nibbles against the reconstructed scale) that keep a
+  writer and a reader on the same scale.
+
+### Fixed
+- `examples/q4tp_gpu_ab.rs` is a stub outside macOS. It times Metal encoders
+  directly; the wgpu kernels are covered by `tests/gpu_q4tp.rs`, which runs
+  on every backend.
+
+
 ## [0.5.38] — 2026-07-29
 
 A new weight layout and the kernels to run it, plus a negative result that
