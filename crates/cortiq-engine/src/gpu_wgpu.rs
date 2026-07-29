@@ -6583,6 +6583,133 @@ pub fn dit_attention(
     )
 }
 
+/// Fused QKV on wgpu: one upload of the normed chunk, three GEMMs, one
+/// readback of Q|K|V laid out back to back. The unfused route pays three
+/// submits and three uploads of the same X — at a 512-token chunk that
+/// is the same 6 MB shipped three times, 44 times per prefill.
+/// Weights stay cached in VRAM. `out` receives q (b·rq), then k (b·rk),
+/// then v (b·rv).
+#[allow(clippy::too_many_arguments)]
+pub fn q4t_qkv(
+    model: &Arc<CmfModel>,
+    wq: usize,
+    wk: usize,
+    wv: usize,
+    xs: &[f32],
+    b: usize,
+    cols: usize,
+    rq: usize,
+    rk: usize,
+    rv: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % 32 != 0 || b == 0 {
+        return false;
+    }
+    let need = b * (rq + rk + rv);
+    if xs.len() < b * cols || out.len() < need {
+        return false;
+    }
+    let bytes = model.primary_bytes();
+    let gpr = cols / 32;
+    let wbuf = |idx: usize, rows: usize| -> Option<wgpu::Buffer> {
+        let entry = &model.tensors[idx];
+        if entry.shape.first().copied().unwrap_or(0) < rows {
+            return None;
+        }
+        let abs = model.entry_abs_offset(entry)?;
+        let plen = entry.nbytes as usize;
+        if plen < rows * gpr * 18 || abs + plen > bytes.len() {
+            return None;
+        }
+        weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen])
+    };
+    let (Some(bq), Some(bk), Some(bv)) = (wbuf(wq, rq), wbuf(wk, rk), wbuf(wv, rv)) else {
+        return false;
+    };
+
+    let dev = &c.device;
+    let mut sc = c.scratch.lock().unwrap();
+    let st = wgpu::BufferUsages::STORAGE;
+    let xs_buf = Scratch::ensure(
+        dev,
+        &mut sc.xs,
+        (b * cols * 4) as u64,
+        st | wgpu::BufferUsages::COPY_DST,
+        "qkv-xs",
+    );
+    c.queue
+        .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..b * cols]));
+    let y_size = (need * 4) as u64;
+    let y_buf = Scratch::ensure(
+        dev,
+        &mut sc.y,
+        y_size,
+        st | wgpu::BufferUsages::COPY_SRC,
+        "qkv-y",
+    );
+    let stage = Scratch::ensure(
+        dev,
+        &mut sc.stage,
+        y_size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "qkv-stage",
+    );
+    drop(sc);
+
+    let params = |rows: usize| -> wgpu::Buffer {
+        let raw = [(cols / 4) as u32, rows as u32, b as u32, 0u32];
+        let bf = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("qkv-params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        c.queue.write_buffer(&bf, 0, bytemuck::cast_slice(&raw));
+        bf
+    };
+    let layout = c.q4t_mm.get_bind_group_layout(0);
+    let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("qkv"),
+    });
+    let mut off = 0u64;
+    for (wbf, rows) in [(&bq, rq), (&bk, rk), (&bv, rv)] {
+        let pbf = params(rows);
+        let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("qkv-bg"),
+            layout: &layout,
+            entries: &[
+                bind_buf(0, wbf),
+                bind_buf(1, &xs_buf),
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &y_buf,
+                        offset: off,
+                        size: std::num::NonZeroU64::new((b * rows * 4) as u64),
+                    }),
+                },
+                bind_buf(3, &pbf),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("qkv-mm"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.q4t_mm);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(
+            (rows as u32).div_ceil(64).min(MAX_WG),
+            (b as u32).div_ceil(64),
+            1,
+        );
+        drop(pass);
+        off += (b * rows * 4) as u64;
+    }
+    readback(c, enc, &y_buf, &stage, y_size, &mut out[..need])
+}
+
 /// Fused DiT SwiGLU FFN on wgpu: g=X·W1ᵀ, u=X·W3ᵀ, silu(g)·u,
 /// y=·W2ᵀ — four passes, ONE submission, one readback. The unfused
 /// per-op route pays 3 submits and ships the [b, inter] intermediates

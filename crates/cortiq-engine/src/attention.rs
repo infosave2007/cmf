@@ -1033,9 +1033,45 @@ pub fn qwen_attention_batch(
     let mut q_all = take_buf(b * qrows);
     let mut k_all = take_buf(b * nkv * hd);
     let mut v_all = take_buf(b * nkv * hd);
-    wq.matmat(normed_all, b, &mut q_all, cfg.pool);
-    wk.matmat(normed_all, b, &mut k_all, cfg.pool);
-    wv.matmat(normed_all, b, &mut v_all, cfg.pool);
+    // One fused submission when the device is in play: three `matmat`
+    // calls upload the SAME normed chunk three times and pay three round
+    // trips per layer. Falls through to the per-projection path on any
+    // refusal (non-q4t weights, no device, contention kill).
+    let fused = crate::gpu::enabled_here()
+        && !crate::gpu::mm_killed()
+        && b >= 32
+        && match (wq.mapped_q4t(), wk.mapped_q4t(), wv.mapped_q4t()) {
+            (Some((model, iq)), Some((_, ik)), Some((_, iv))) => {
+                let (rk, rv) = (wk.rows(), wv.rows());
+                let mut cat = take_buf(b * (qrows + rk + rv));
+                let ok = crate::gpu::q4t_qkv(
+                    model,
+                    iq,
+                    ik,
+                    iv,
+                    normed_all,
+                    b,
+                    cfg.hidden_size,
+                    qrows,
+                    rk,
+                    rv,
+                    &mut cat,
+                );
+                if ok {
+                    q_all.copy_from_slice(&cat[..b * qrows]);
+                    k_all.copy_from_slice(&cat[b * qrows..b * (qrows + rk)]);
+                    v_all.copy_from_slice(&cat[b * (qrows + rk)..b * (qrows + rk + rv)]);
+                }
+                recycle_buf(&mut cat);
+                ok
+            }
+            _ => false,
+        };
+    if !fused {
+        wq.matmat(normed_all, b, &mut q_all, cfg.pool);
+        wk.matmat(normed_all, b, &mut k_all, cfg.pool);
+        wv.matmat(normed_all, b, &mut v_all, cfg.pool);
+    }
     let mut projected_all = cfg.softplus_gate.map(|(proj, _)| {
         let mut values = take_buf(b * proj.rows());
         proj.matmat(normed_all, b, &mut values, cfg.pool);

@@ -949,6 +949,33 @@ pub(crate) fn mm_kill() {
 }
 
 /// Fused DiT SwiGLU FFN on the device: g=X·W1ᵀ, u=X·W3ᵀ, silu(g)·u,
+/// Fused QKV projection: one upload of the normed chunk, three GEMMs,
+/// one readback of Q|K|V back to back. Metal has no twin yet — its
+/// chunk graph keeps the whole layer resident and never surfaces QKV.
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn q4t_qkv(
+    model: &Arc<CmfModel>,
+    wq: usize,
+    wk: usize,
+    wv: usize,
+    xs: &[f32],
+    b: usize,
+    cols: usize,
+    rq: usize,
+    rk: usize,
+    rv: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => {
+            crate::gpu_wgpu::q4t_qkv(model, wq, wk, wv, xs, b, cols, rq, rk, rv, out)
+        }
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// y=·W2ᵀ — one command buffer, only X and Y cross the CPU boundary.
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn q4t_ffn(
