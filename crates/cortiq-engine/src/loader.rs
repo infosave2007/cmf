@@ -247,6 +247,7 @@ pub(crate) fn build_layer_ffn(
         routed_scaling: cfg.routed_scaling_factor.unwrap_or(1.0),
         shared,
         stats: std::cell::RefCell::new(Vec::new()),
+        act_sq: std::cell::RefCell::new(Vec::new()),
         mask,
         per_expert_scale,
         router_input_norm,

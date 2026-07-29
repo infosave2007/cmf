@@ -1796,6 +1796,21 @@ fn dump_moe_stats(pipeline: &Pipeline) -> anyhow::Result<()> {
         std::fs::write(&path, format!("{{{}}}", parts.join(",")))?;
         println!("router MoE stats → {path} ({} layers)", parts.len());
     }
+    if let Ok(path) = std::env::var("CMF_RMS_TRACE") {
+        let mut parts = Vec::new();
+        for (li, lw) in pipeline.weights.layers.iter().enumerate() {
+            if let cortiq_engine::pipeline::FfnKind::Moe(m) = &lw.ffn {
+                let a = m.act_sq.borrow();
+                if a.is_empty() {
+                    continue;
+                }
+                let v: Vec<String> = a.iter().map(|x| format!("{x:.6e}")).collect();
+                parts.push(format!("\"{li}\":[{}]", v.join(",")));
+            }
+        }
+        std::fs::write(&path, format!("{{{}}}", parts.join(",")))?;
+        println!("RMS activation traces → {path} ({} layers)", parts.len());
+    }
     Ok(())
 }
 

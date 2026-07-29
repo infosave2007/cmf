@@ -360,6 +360,13 @@ pub struct MoeFfn {
     /// routing frequency during calibration). Filled by every forward,
     /// read by the CLI via CMF_MOE_STATS. RefCell: decode is single-threaded.
     pub stats: std::cell::RefCell<Vec<u64>>,
+    /// Per-CHANNEL sum of squares of this FFN's input, accumulated over a
+    /// calibration run (`CMF_RMS_TRACE`). These are the RMS activation
+    /// traces AWNP needs: raw weight magnitude says every channel matters
+    /// equally, and the question AWNP asks is whether the ACTIVATIONS
+    /// disagree. Off unless the env var is set — an f64 add per channel
+    /// per token is cheap, but not free.
+    pub act_sq: std::cell::RefCell<Vec<f64>>,
     /// Task mask over routed experts (DTG-MA over MoE, claim-12 B-field
     /// applied): `false` experts are excluded from selection, the
     /// softmax renormalizes over the allowed set. Built by the loader
@@ -4512,6 +4519,25 @@ fn dense_ffn_batch(d: &DenseFfn, xs: &[f32], b: usize, pool: Option<&Pool>) -> V
 /// Batched MoE-FFN: router batched, positions are GROUPED by expert —
 /// an expert's weights are read once for all its positions in the chunk
 /// (the main prefill-GEMM win on MoE: 960MB/token of 35B experts).
+/// Accumulate per-channel activation energy for `CMF_RMS_TRACE`.
+fn accumulate_act(m: &MoeFfn, xs: &[f32], b: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("CMF_RMS_TRACE").is_ok()) || b == 0 {
+        return;
+    }
+    let hidden = xs.len() / b;
+    let mut acc = m.act_sq.borrow_mut();
+    if acc.len() < hidden {
+        acc.resize(hidden, 0.0);
+    }
+    for t in 0..b {
+        let row = &xs[t * hidden..(t + 1) * hidden];
+        for (a, &v) in acc.iter_mut().zip(row) {
+            *a += (v as f64) * (v as f64);
+        }
+    }
+}
+
 fn moe_ffn_batch(
     m: &MoeFfn,
     xs: &[f32],
@@ -4520,6 +4546,7 @@ fn moe_ffn_batch(
     pool: Option<&Pool>,
     allowed: Option<&[bool]>,
 ) -> Vec<f32> {
+    accumulate_act(m, xs, b);
     let ne = m.experts.len();
     let mut logits = vec![0.0f32; b * ne];
     m.router.matmat(xs, b, &mut logits, pool);
@@ -4977,6 +5004,7 @@ fn moe_route(
 /// MoE FFN: router → top-k experts (see `moe_route`). Only selected
 /// experts' pages are touched in mmap.
 fn moe_ffn(m: &MoeFfn, x: &[f32], pool: Option<&Pool>, allowed: Option<&[bool]>) -> Vec<f32> {
+    accumulate_act(m, x, 1);
     let ne = m.experts.len();
     let mut logits = vec![0.0f32; ne];
     m.router.matvec(x, &mut logits, pool);
@@ -5591,6 +5619,7 @@ mod tests {
             route_tau: None,
             shared: Some((shared, None)),
             stats: std::cell::RefCell::new(Vec::new()),
+            act_sq: std::cell::RefCell::new(Vec::new()),
             mask: None,
             per_expert_scale: None,
             router_input_norm: false,
