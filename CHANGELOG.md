@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.40] — 2026-07-29
+
+q4tp reaches parity on the image path, plus the AWNP tooling and the
+measurements that closed it. Measured on a fanless MacBook Air M4.
+
+### Added
+- **`cortiq awnp`** — activation-weighted nullspace projection: drop the
+  weakest input channels of every MoE expert and refit the survivors through
+  `C[:,S]·C[S,S]⁻¹` so they absorb what was removed. `--drop`, `--ridge`,
+  `--rescale`. Output keeps the original shapes, so the result runs on
+  today's runtime and the quality question is settled before any format
+  change.
+- **`CMF_RMS_TRACE`** (per-channel activation energy) and **`CMF_ACT_DUMP`**
+  (raw FFN-input rows) — the calibration AWNP needs. Nothing in the runtime
+  produced activation statistics before, so "is the flat weight-energy curve
+  a property of the weights or of the criterion" could only be asserted.
+- **q4tp in the Russian and Chinese README and spec.** The English pair had
+  the new dtype and the localized ones did not.
+
+### Fixed
+- **The q4tp GEMMs read their per-row scale inside the K loop.** `lo`/`step`
+  are loop-invariant — a thread's row is fixed across the whole loop — so
+  that was a dependent chain (load → exp2 → scale) paid per staged tile for
+  nothing. On Lumina's DiT the runtime probe measured the q4tp GEMM as the
+  slower arm and routed the whole render to the CPU: 18 s against q4t's 13.
+  Hoisted, interleaved at 256px/8 steps: 26 and 27 s for q4tp against 27 and
+  26 for q4t. The image is unchanged at 43.6 dB PSNR.
+- **The fused DiT SwiGLU chain had no q4tp twin**, so a q4tp image model
+  shipped its `[b, inter]` intermediates across the CPU boundary twice per
+  layer — 28 s before the twin, 18 s after, parity after the hoist above.
+- **`sgemm_public` did not compile off macOS/aarch64.** `sgemm_rm` exists
+  only where there is an f32 GEMM to call; x86 has quantized kernels and no
+  such path. A portable triple loop now backs it — only the offline AWNP
+  pass reaches it, where correctness matters and throughput does not.
+
+### Notes
+- **AWNP measured and not productized.** On KAT-Coder-V2.5 (qwen3_5_moe),
+  25000 calibration rows over 2048 channels from hundreds of distinct
+  dialogues, evaluated on a held-out half sharing no record with the
+  calibration: baseline PPL 23.4, −12.5% channels 50.1, −25% channels 194.8.
+  Widening the calibration from 2.9 to 12.2 samples per channel and adding a
+  real ridge halved the damage, and the patent's variance-preserving rescale
+  does not help — a least-squares refit already returns the minimum-error
+  weights, so scaling them back up moves away from that optimum. The
+  projection alone, without a healing pass, does not transfer out of sample.
+  A skill overlay is the better lever for the same goal.
+
+
 ## [0.5.39] — 2026-07-29
 
 Same code as 0.5.38 plus the documentation it should have shipped with.
