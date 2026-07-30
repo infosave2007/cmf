@@ -4084,6 +4084,30 @@ fn q1_weight(c: &Ctx, model: &Arc<CmfModel>, idx: usize) -> Option<(wgpu::Buffer
     Some((buf, rows, cols))
 }
 
+/// A q4_tiled / q4tp weight as one device buffer — the whole tensor, since
+/// both layouts keep their scales inside (q4t) or in trailing planes (q4tp)
+/// and the kernels index them from the same base.
+fn tile_weight(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    idx: usize,
+) -> Option<(wgpu::Buffer, usize, usize)> {
+    let entry = model.tensors.get(idx)?;
+    let rows = *entry.shape.first()? as usize;
+    let cols = *entry.shape.get(1)? as usize;
+    if cols % 32 != 0 {
+        return None;
+    }
+    let abs = model.entry_abs_offset(entry)?;
+    let bytes = model.primary_bytes();
+    let plen = entry.nbytes as usize;
+    if abs + plen > bytes.len() {
+        return None;
+    }
+    let buf = weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen])?;
+    Some((buf, rows, cols))
+}
+
 /// Production drop-in for the attention sub-block on the token graph: takes
 /// the already-normed hidden and returns the O-projection output (pre-
 /// residual) — exactly where `qwen_attention` slots in. QKV/O weights are
@@ -5747,12 +5771,17 @@ pub fn forward_batch_graph(
     eps: f32,
     k: usize,
 ) -> bool {
-    let Some(c) = ctx() else { return false };
+    let Some(c) = ctx() else {
+        bgraph_refused("no ctx");
+        return false;
+    };
     if k == 0 || positions.len() != k {
+        bgraph_refused("k/positions mismatch");
         return false;
     }
     let pos0 = positions[0];
     if pos0 + k > cap || hd % 4 != 0 || hd > c.hd_cap {
+        bgraph_refused("pos+k past cap, or head_dim not %4 / over hd_cap");
         return false; // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
     struct GMat {
@@ -5860,7 +5889,22 @@ pub fn forward_batch_graph(
                     kind: 4,
                 })
             }
-            _ => None, // q4t/q1t not batched here → CPU/per-position path
+            // q4_tiled and q4tp: same buffer shape, the kernel differs.
+            // Leaving these out is what kept every q4t/q4tp model off the
+            // batched path — including its GDN projections, which is where
+            // the refusal actually landed.
+            k @ (5 | 6) => {
+                let (b, r, cc) = tile_weight(c, model, gw.idx)?;
+                if r != rows || cc != cols {
+                    return None;
+                }
+                Some(GMat {
+                    buf: b,
+                    rs: None,
+                    kind: k,
+                })
+            }
+            _ => None, // q1t not batched here → CPU/per-position path
         }
     };
     // GEMM-able projection? (q8_row/q1). f32 (a/b) is per-position; anything else bails.
@@ -5881,6 +5925,7 @@ pub fn forward_batch_graph(
                 ..
             } => {
                 if bias.is_some() {
+                    bgraph_refused("site:5889");
                     return false;
                 } // batched bias axpy not wired
                 let qrows = nh * hd * (1 + *output_gate as usize);
@@ -5890,9 +5935,11 @@ pub fn forward_batch_graph(
                     resolve(wv, nkv * hd, hidden),
                     resolve(wo, hidden, nh * hd),
                 ) else {
+                    bgraph_refused("site:5898");
                     return false;
                 };
                 if !(gemmable(&wq) && gemmable(&wk) && gemmable(&wv) && gemmable(&wo)) {
+                    bgraph_refused("attention weights not gemmable");
                     return false;
                 }
                 LAttn::Full { wq, wk, wv, wo }
@@ -5919,10 +5966,12 @@ pub fn forward_batch_graph(
                     resolve(b, *nv, hidden),
                     resolve(out, hidden, nv * dv),
                 ) else {
+                    bgraph_refused("site:5928");
                     return false;
                 };
                 if !(gemmable(&qkv) && gemmable(&z) && gemmable(&out) && a.kind == 4 && b.kind == 4)
                 {
+                    bgraph_refused("site:5932");
                     return false;
                 }
                 LAttn::Gdn {
@@ -5951,9 +6000,11 @@ pub fn forward_batch_graph(
                     resolve(lu, inter, hidden),
                     resolve(ld, hidden, inter),
                 ) else {
+                    bgraph_refused("site:5960");
                     return false;
                 };
                 if !(gemmable(&gate) && gemmable(&up) && gemmable(&down)) {
+                    bgraph_refused("dense FFN not gemmable");
                     return false;
                 }
                 BFfn::Dense { gate, up, down }
@@ -5969,17 +6020,20 @@ pub fn forward_batch_graph(
                 q4tp,
             } => {
                 if *top_k >= 16 || *n_exp > 256 || experts.len() != n_exp + 1 {
+                    bgraph_refused("site:5979");
                     return false;
                 }
                 let (Some(router), Some(sgate)) = (
                     resolve(router, *n_exp, hidden),
                     resolve(shared_gate, 1, hidden),
                 ) else {
+                    bgraph_refused("site:5985");
                     return false;
                 };
                 let Some((gate_all, up_all, down_all)) =
                     moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp)
                 else {
+                    bgraph_refused("site:5990");
                     return false;
                 };
                 BFfn::Moe {
@@ -8675,6 +8729,17 @@ fn encode_matvec_q1(
 /// q4t and q4tp file — the same shape of bug as the `prep()` hole, and the
 /// reason prefill ran one position at a time at 33 tok/s against 54 on
 /// decode.
+/// One-shot reason the BATCHED graph declined. Three silent fallbacks in a
+/// row this session cost hours; a refusal that says nothing is the most
+/// expensive kind of bug in this file.
+fn bgraph_refused(why: &'static str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        tracing::warn!("batch graph declined: {why}");
+    }
+}
+
 fn encode_q4_tile_mm(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
