@@ -3037,6 +3037,127 @@ kernel void q4tp_matvec(
     }
 }
 
+// Job-batched q4tp matvec: ONE dispatch covers every routed expert of a
+// MoE layer.
+//
+// The experts of a layer share a shape, and q4tp passes its activations
+// raw, so the gate/up streams also share an input vector — the only
+// per-job quantity is the weight's byte offset into the model blob.
+// Encoding a dispatch per expert instead costs ~1100 encoder/dispatch
+// pairs a token on a 40-layer top-8 model, and at 512 rows apiece the
+// GPU sits latency-bound rather than throughput-bound: measured, the
+// per-expert Metal path barely beat the CPU it was meant to replace.
+//
+// `xstride` is 0 when every job reads the same activations (gate/up) and
+// `cols` when each reads its own (down). Everything from the ladder
+// expansion down is `q4tp_matvec` verbatim.
+kernel void q4tp_matvec_jobs(
+    device const uchar*  q       [[buffer(0)]],
+    device const float*  x       [[buffer(1)]],
+    device float*        y       [[buffer(2)]],
+    constant uint&       gpr     [[buffer(3)]],
+    constant uint&       rows    [[buffer(4)]],
+    device const ulong*  bases   [[buffer(5)]],
+    constant uint&       tg_per  [[buffer(6)]],
+    constant uint&       xstride [[buffer(7)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float lad[8u * 4u * 32u];
+
+    uint j   = tgpos / tg_per;
+    uint tgl = tgpos - j * tg_per;
+    device const uchar* qj = q + bases[j];
+    device const float* xj = x + (ulong)j * (ulong)xstride;
+    device float*       yj = y + (ulong)j * (ulong)rows;
+
+    uint r0 = (tgl * sgs + sg) * 4u;
+    bool active = r0 < rows;
+    uint nr = active ? min(rows - r0, 4u) : 0u;
+
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint  stride     = (gpr * 5u + 7u) / 8u;
+
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* ph = (device const half*)(qj + params_off + (ulong)(r0 + ri) * 4ul);
+        lad[(sg * 4u + ri) * 32u + lane] = exp2((float)ph[0] + (float)lane * (float)ph[1]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint xb = g * 32u;
+        device const float4* xv = (device const float4*)(xj + xb);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        uint bit = g * 5u;
+        uint cb  = bit >> 3u;
+        uint shf = bit & 7u;
+        for (uint ri = 0u; ri < nr; ++ri) {
+            uint r = r0 + ri;
+            device const uint* p32 = (device const uint*)(qj + ((ulong)r * gpr + (ulong)g) * 16ul);
+            uint b0 = p32[0], b1 = p32[1], b2 = p32[2], b3 = p32[3];
+            device const uchar* cp = qj + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            float scale = lad[(sg * 4u + ri) * 32u + code];
+            float gsum = q4_dot8_fast(b0, x0, x1)
+                       + q4_dot8_fast(b1, x2, x3)
+                       + q4_dot8_fast(b2, x4, x5)
+                       + q4_dot8_fast(b3, x6, x7);
+            float contrib = scale * gsum;
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    if (lane == 0u) {
+        yj[r0] = acc0;
+        if (nr > 1u) yj[r0 + 1u] = acc1;
+        if (nr > 2u) yj[r0 + 2u] = acc2;
+        if (nr > 3u) yj[r0 + 3u] = acc3;
+    }
+}
+
+// silu(gate)·up for every expert in one dispatch. `gu` holds all gate
+// rows followed by all up rows, as `q4tp_matvec_jobs` wrote them.
+kernel void moe_silu_jobs(
+    device const float* gu [[buffer(0)]],
+    device float*       a  [[buffer(1)]],
+    constant uint&      n  [[buffer(2)]],
+    constant uint&      ne [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n * ne) return;
+    uint e = gid / n;
+    uint i = gid - e * n;
+    float g = gu[(ulong)e * (ulong)n + i];
+    float u = gu[(ulong)(ne + e) * (ulong)n + i];
+    a[gid] = (g / (1.0f + exp(-g))) * u;
+}
+
+// Weighted sum of the experts' down projections, accumulated in expert
+// order to match the host's serial `out[i] += w·eo[i]`.
+kernel void moe_reduce_jobs(
+    device const float* d   [[buffer(0)]],
+    device const float* w   [[buffer(1)]],
+    device float*       out [[buffer(2)]],
+    constant uint&      n   [[buffer(3)]],
+    constant uint&      ne  [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    float acc = 0.0f;
+    for (uint e = 0u; e < ne; ++e) acc += w[e] * d[(ulong)e * (ulong)n + gid];
+    out[gid] = acc;
+}
+
 // MEASURED NEUTRAL (M4, Lumina DiT 512² and the Nanbeige chunk prefill):
 // giving these two kernels q8_mul_mm's cols/rows function-constant
 // specialization changed nothing — paired runs at matched thermal state
@@ -3647,6 +3768,11 @@ struct Ctx {
     q4bh: ComputePipelineState,
     q4t: ComputePipelineState,
     q4tp: ComputePipelineState,
+    /// Job-batched q4tp matvec + its two MoE companions: the whole
+    /// expert block in four dispatches instead of four per expert.
+    q4tpjobs: ComputePipelineState,
+    moesilu: ComputePipelineState,
+    moered: ComputePipelineState,
     q4tmm: ComputePipelineState,
     q4tmmsilu: ComputePipelineState,
     q4tpmm: ComputePipelineState,
@@ -3801,6 +3927,9 @@ fn init() -> Result<Ctx, String> {
     let q4bh = pso("q4b_matvec_h")?;
     let q4t = pso("q4t_matvec")?;
     let q4tp = pso("q4tp_matvec")?;
+    let q4tpjobs = pso("q4tp_matvec_jobs")?;
+    let moesilu = pso("moe_silu_jobs")?;
+    let moered = pso("moe_reduce_jobs")?;
     let q4tmm = pso("q4t_mul_mm")?;
     let q4tmmsilu = pso("q4t_mul_mm_silu")?;
     let q4tpmm = pso("q4tp_mul_mm")?;
@@ -3862,6 +3991,9 @@ fn init() -> Result<Ctx, String> {
         q4bh,
         q4t,
         q4tp,
+        q4tpjobs,
+        moesilu,
+        moered,
         q4tmm,
         q4tmmsilu,
         q4tpmm,
@@ -4041,6 +4173,19 @@ fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Buffer, usize)> {
         return Some((b.clone(), len));
     }
     crate::gpu::probe_note_cold();
+    // A no-copy buffer over the whole mmap is the point of the UMA path,
+    // but Metal caps a single buffer at maxBufferLength — on a 24 GB M4
+    // an 18 GB model can sit right at that edge, and a nil buffer here
+    // silently demotes every expert to the CPU.
+    let max_len = c._device.max_buffer_length() as usize;
+    if len > max_len {
+        tracing::warn!(
+            "model mmap {} MB exceeds Metal maxBufferLength {} MB — GPU weight path unavailable",
+            len / (1024 * 1024),
+            max_len / (1024 * 1024)
+        );
+        return None;
+    }
     let buf = c._device.new_buffer_with_bytes_no_copy(
         bytes.as_ptr() as *const std::ffi::c_void,
         len as u64,
@@ -7304,13 +7449,186 @@ pub fn q1t_matmat(
 /// gate/up-matvec → silu·mul·prescale → down-matvec → axpy into y;
 /// intermediate buffers are GPU-resident, one sync per layer. D5 design:
 /// amortizing the dispatch cost over ~25 MB of work instead of a single matvec.
+/// Is this a uniform all-q4tp expert block — the shape the job-batched
+/// kernels cover? Mixed dtypes, a per-column down field, or ragged
+/// shapes fall through to the per-expert encoder chain.
+fn moe_jobs_batchable(jobs: &[MoeJob]) -> bool {
+    if jobs.len() < 2 {
+        return false;
+    }
+    let (gr, gc) = (jobs[0].gate.1, jobs[0].gate.2);
+    let (dr, dc) = (jobs[0].down.1, jobs[0].down.2);
+    jobs.iter().all(|j| {
+        j.q4tp
+            && j.down_col.is_empty()
+            && j.gate.1 == gr
+            && j.gate.2 == gc
+            && j.up.1 == gr
+            && j.up.2 == gc
+            && j.down.1 == dr
+            && j.down.2 == dc
+            // gate/up share one activation vector — the batched kernel's
+            // xstride=0 relies on it.
+            && j.xs_gate.len() == gc
+            && j.xs_up.len() == gc
+            && j.xs_gate == jobs[0].xs_gate
+            && j.xs_up == jobs[0].xs_gate
+    })
+}
+
+/// The whole expert block in four dispatches: gate+up for every expert,
+/// one fused SiLU, every down, one weighted reduce. `None` = a guard
+/// refused and the caller should walk the per-expert chain.
+#[allow(clippy::too_many_arguments)]
+fn moe_block_jobs_q4tp(
+    c: &Ctx,
+    fbuf: &Buffer,
+    jobs: &[MoeJob],
+    abs3: &[[usize; 3]],
+    inter: usize,
+    hidden: usize,
+    out: &mut [f32],
+    get_io: &dyn Fn(usize, usize) -> Buffer,
+) -> Option<()> {
+    let ne = jobs.len();
+    let gcols = jobs[0].gate.2;
+    let dcols = jobs[0].down.2;
+    if dcols != inter || gcols % GROUP_SIZE != 0 || dcols % GROUP_SIZE != 0 {
+        return None;
+    }
+
+    // Per-call scratch, keyed by size through the shared io cache.
+    let bases_gu = get_io(11_000_000_039 + ne * 2, ne * 2 * 8);
+    let bases_dn = get_io(12_000_000_041 + ne, ne * 8);
+    let wbuf = get_io(13_000_000_051 + ne, ne * 4);
+    let xbuf = get_io(14_000_000_059 + gcols, gcols * 4);
+    let gubuf = get_io(15_000_000_063 + ne * inter, ne * 2 * inter * 4);
+    let abuf = get_io(16_000_000_069 + ne * inter, ne * inter * 4);
+    let dbuf = get_io(17_000_000_081 + ne * hidden, ne * hidden * 4);
+    let ybuf = get_io(18_000_000_099 + hidden, hidden * 4);
+
+    // gate offsets first, then up — the layout `moe_silu_jobs` expects.
+    unsafe {
+        let p = bases_gu.contents() as *mut u64;
+        for (i, t) in abs3.iter().enumerate() {
+            *p.add(i) = t[0] as u64;
+            *p.add(ne + i) = t[1] as u64;
+        }
+        let pd = bases_dn.contents() as *mut u64;
+        let pw = wbuf.contents() as *mut f32;
+        for (i, t) in abs3.iter().enumerate() {
+            *pd.add(i) = t[2] as u64;
+            *pw.add(i) = jobs[i].w;
+        }
+        std::ptr::copy_nonoverlapping(
+            jobs[0].xs_gate.as_ptr(),
+            xbuf.contents() as *mut f32,
+            gcols,
+        );
+    }
+
+    let cmd = c.queue.new_command_buffer();
+    // Encoder boundaries are the stage barriers (see the per-expert path).
+    let sgs = 8u64;
+    let enc_jobs = |enc: &metal::ComputeCommandEncoderRef,
+                    bases: &Buffer,
+                    x: &Buffer,
+                    y: &Buffer,
+                    rows: usize,
+                    cols: usize,
+                    njob: usize,
+                    xstride: usize| {
+        let tg_per = (rows as u64).div_ceil(sgs * 4);
+        enc.set_compute_pipeline_state(&c.q4tpjobs);
+        enc.set_buffer(0, Some(fbuf), 0);
+        enc.set_buffer(1, Some(x), 0);
+        enc.set_buffer(2, Some(y), 0);
+        let gpr_u = (cols / GROUP_SIZE) as u32;
+        let rows_u = rows as u32;
+        let tgp_u = tg_per as u32;
+        let xs_u = xstride as u32;
+        enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+        enc.set_buffer(5, Some(bases), 0);
+        enc.set_bytes(6, 4, &tgp_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(7, 4, &xs_u as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new(tg_per * njob as u64, 1, 1),
+            MTLSize::new(sgs * 32, 1, 1),
+        );
+    };
+
+    // 1. gate and up for every expert — 2·ne jobs over the shared input.
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc_jobs(enc, &bases_gu, &xbuf, &gubuf, inter, gcols, ne * 2, 0);
+        enc.end_encoding();
+    }
+    // 2. silu(gate)·up, all experts.
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.moesilu);
+        enc.set_buffer(0, Some(&gubuf), 0);
+        enc.set_buffer(1, Some(&abuf), 0);
+        let n_u = inter as u32;
+        let ne_u = ne as u32;
+        enc.set_bytes(2, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(3, 4, &ne_u as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_threads(
+            MTLSize::new((ne * inter) as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    // 3. every expert's down projection — each reads its own activation row.
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc_jobs(enc, &bases_dn, &abuf, &dbuf, hidden, dcols, ne, inter);
+        enc.end_encoding();
+    }
+    // 4. weighted sum across experts.
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.moered);
+        enc.set_buffer(0, Some(&dbuf), 0);
+        enc.set_buffer(1, Some(&wbuf), 0);
+        enc.set_buffer(2, Some(&ybuf), 0);
+        let n_u = hidden as u32;
+        let ne_u = ne as u32;
+        enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &ne_u as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+    }
+    cmd.commit();
+    cmd.wait_until_completed();
+    unsafe {
+        std::ptr::copy_nonoverlapping(ybuf.contents() as *const f32, out.as_mut_ptr(), hidden);
+    }
+    Some(())
+}
+
+/// One-shot report of the check that sent this MoE block to the CPU.
+fn moe_block_refused(why: &'static str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        tracing::warn!("metal moe_block refused at {why}");
+    }
+}
+
 pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> bool {
-    let Some(c) = ctx() else { return false };
+    let Some(c) = ctx() else {
+        moe_block_refused("ctx");
+        return false;
+    };
     if jobs.is_empty() {
+        moe_block_refused("empty jobs");
         return false;
     }
     let _bytes = model.primary_bytes();
     let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        moe_block_refused("file_buffer");
         return false;
     };
     let base = model_key(model);
@@ -7322,15 +7640,18 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         for (slot, (idx, rows, cols, _)) in [(0, &j.gate), (1, &j.up), (2, &j.down)] {
             let entry = &model.tensors[*idx];
             let Some(abs) = model.entry_abs_offset(entry) else {
+                moe_block_refused("entry_abs_offset");
                 return false;
             };
             let qlen = if j.q1 {
                 if cols % GROUP_SIZE != 0 || (cols / GROUP_SIZE) % 2 != 0 {
+                    moe_block_refused("q1 cols alignment");
                     return false;
                 }
                 rows * (cols / GROUP_SIZE) * Q1_TILE
             } else if j.q4tp {
                 if cols % GROUP_SIZE != 0 {
+                    moe_block_refused("q4tp cols alignment");
                     return false;
                 }
                 match cortiq_core::quant::expected_nbytes(
@@ -7338,20 +7659,26 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
                     &[*rows, *cols],
                 ) {
                     Some(n) => n,
-                    None => return false,
+                    None => {
+                        moe_block_refused("q4tp expected_nbytes");
+                        return false;
+                    }
                 }
             } else if j.q4t {
                 if cols % GROUP_SIZE != 0 {
+                    moe_block_refused("q4t cols alignment");
                     return false;
                 }
                 rows * (cols / GROUP_SIZE) * 18
             } else {
                 if cols % 4 != 0 {
+                    moe_block_refused("q8 cols alignment");
                     return false;
                 }
                 rows * cols
             };
             if abs + qlen > safe_len {
+                moe_block_refused("tensor past safe_len (file buffer truncated?)");
                 return false;
             }
             trio[slot] = abs;
@@ -7376,6 +7703,16 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
             })
             .clone()
     };
+
+    // Uniform all-q4tp block: four dispatches for every expert together.
+    if moe_jobs_batchable(jobs) {
+        if let Some(()) =
+            moe_block_jobs_q4tp(c, &fbuf, jobs, &abs3, inter, hidden, out, &get_io)
+        {
+            return true;
+        }
+    }
+
     // Salted keys — sizes may coincide between assignments.
     let g_buf = get_io(1_000_000_007 + inter, inter * 4);
     let u_buf = get_io(2_000_000_011 + inter, inter * 4);
