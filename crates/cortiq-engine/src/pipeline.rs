@@ -1447,7 +1447,14 @@ impl Pipeline {
         // lm_head-in-graph is only sound when the very next logits
         // consumer is this loop's own (MTP and skill routing interleave
         // other forwards / can swap lm_head between forward and sample).
-        let fuse_lm = mtp.is_none() && router.is_none();
+        // CMF_GPU_LMHEAD=0 keeps lm_head off the graph: the token reads back
+        // the 8 KB hidden instead of ~1 MB of logits, and the head runs on
+        // the host. A probe for how much of the graph's fixed per-token cost
+        // is the logits readback (the layer sweep puts that fixed part at
+        // 3.88 ms of an 18.5 ms frame).
+        let fuse_lm = mtp.is_none()
+            && router.is_none()
+            && std::env::var("CMF_GPU_LMHEAD").as_deref() != Ok("0");
         self.graph_logits = None;
         self.graph_want_logits = false;
         // With dynamic routing, prefill sequentially so the φ hook fires
@@ -3423,6 +3430,9 @@ impl Pipeline {
                     let router = gw(&m.router)?;
                     let inter = m.experts.first()?.gate_proj.rows();
                     let mut experts = Vec::with_capacity(m.experts.len() + 1);
+                    // q4t or q4tp, but not both in one layer — the kernels
+                    // are picked per layer, not per expert.
+                    let mut q4tp: Option<bool> = None;
                     for e in m.experts.iter().chain(std::iter::once(se)) {
                         if !matches!(e.act, Act::Silu)
                             || e.gate_proj.rows() != inter
@@ -3430,9 +3440,28 @@ impl Pipeline {
                         {
                             return None;
                         }
-                        let (mm, gi) = e.gate_proj.mapped_q4t()?;
-                        let (_, ui) = e.up_proj.mapped_q4t()?;
-                        let (_, di) = e.down_proj.mapped_q4t()?;
+                        let (mm, gi, ui, di, is_p) = match e.gate_proj.mapped_q4t() {
+                            Some((mm, gi)) => (
+                                mm,
+                                gi,
+                                e.up_proj.mapped_q4t()?.1,
+                                e.down_proj.mapped_q4t()?.1,
+                                false,
+                            ),
+                            None => {
+                                let (mm, gi) = e.gate_proj.mapped_q4tp()?;
+                                (
+                                    mm,
+                                    gi,
+                                    e.up_proj.mapped_q4tp()?.1,
+                                    e.down_proj.mapped_q4tp()?.1,
+                                    true,
+                                )
+                            }
+                        };
+                        if *q4tp.get_or_insert(is_p) != is_p {
+                            return None;
+                        }
                         model.get_or_insert_with(|| mm.clone());
                         experts.push((gi, ui, di));
                     }
@@ -3441,9 +3470,19 @@ impl Pipeline {
                         shared_gate: sgate,
                         experts,
                         n_exp: m.experts.len(),
-                        top_k: m.top_k,
+                        // CMF_TOPK_PROBE: timing probe only — output is WRONG.
+                        // Fewer experts shrink the MoE arithmetic while the
+                        // dispatch count stays identical, which is the only
+                        // clean way to tell a launch-bound decode from a
+                        // compute-bound one.
+                        top_k: std::env::var("CMF_TOPK_PROBE")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .filter(|k| *k > 0 && *k <= m.top_k)
+                            .unwrap_or(m.top_k),
                         inter,
                         norm_topk: m.norm_topk_prob,
+                        q4tp: q4tp?,
                     }
                 }
             };
@@ -3768,7 +3807,9 @@ impl Pipeline {
         if race_eligible && crate::gpu::graph_race_use_graph(graph_trusted) {
             let t_graph = std::time::Instant::now();
             let mut lg = Vec::new();
-            if let Some(hh) = self.try_token_graph_wgpu(hidden, position, &mut lg) {
+            let built = self.try_token_graph_wgpu(hidden, position, &mut lg);
+            graph_note(built.is_some());
+            if let Some(hh) = built {
                 let dur = t_graph.elapsed();
                 if std::env::var("CMF_GRAPH_PROF").is_ok() {
                     eprintln!("graph-call: {:.2} ms total", dur.as_secs_f64() * 1000.0);
@@ -5079,6 +5120,91 @@ fn moe_ffn(m: &MoeFfn, x: &[f32], pool: Option<&Pool>, allowed: Option<&[bool]>)
     moe_ffn_cpu(m, x, &idx, &p, wsum, pool)
 }
 
+/// One-shot report of whether the whole-token wgpu graph actually formed.
+/// A refusal silently reverts to the per-op path, which is how a model can
+/// look "GPU-accelerated" while every layer walks the host.
+fn graph_note(built: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        if built {
+            tracing::info!("wgpu whole-token graph: ACTIVE");
+        } else {
+            tracing::warn!("wgpu whole-token graph refused — per-op path");
+        }
+    }
+}
+
+/// `CMF_MOE_BATCH=0` restores the per-expert serial loop — the A/B lever
+/// for the batched kernel, and how its bit-identity is checked.
+fn moe_batch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_MOE_BATCH").as_deref() != Ok("0"))
+}
+
+/// Two-dispatch CPU MoE: every routed expert (and the shared one) fused
+/// into one gate/up/SiLU dispatch and one down dispatch, instead of two
+/// pool barriers per expert. Bit-identical to the serial loop below —
+/// see `moe_gate_up_many` / `moe_down_many`. `None` = the batched kernel
+/// does not cover this layer, walk the serial path.
+fn moe_ffn_cpu_batched(
+    m: &MoeFfn,
+    x: &[f32],
+    idx: &[usize],
+    p: &[f32],
+    wsum: f32,
+    pool: Option<&Pool>,
+) -> Option<Vec<f32>> {
+    if idx.is_empty() || !moe_batch_enabled() {
+        return None;
+    }
+    // The bake probe reads per-neuron activation mass out of the
+    // single-expert path; batching would skip it. Rare and offline —
+    // hand those runs to the serial loop.
+    if FFN_PROBE.with(|pr| pr.borrow().is_some()) {
+        return None;
+    }
+    let n = idx.len() + usize::from(m.shared.is_some());
+    let mut pairs = Vec::with_capacity(n);
+    let mut downs = Vec::with_capacity(n);
+    let mut ws = Vec::with_capacity(n);
+    for &e in idx {
+        let d = &m.experts[e];
+        if d.act != Act::Silu {
+            return None;
+        }
+        pairs.push((&d.gate_proj, &d.up_proj));
+        downs.push(&d.down_proj);
+        ws.push(p[e] / wsum * m.per_expert_scale.as_ref().map_or(1.0, |v| v[e]));
+    }
+    // The shared expert goes last, matching the serial loop's order —
+    // the f32 accumulation order is part of the bit-identity claim.
+    if let Some((se, gate)) = &m.shared {
+        if se.act != Act::Silu {
+            return None;
+        }
+        let g = gate.as_ref().map_or(1.0, |gate| {
+            let mut gl = [0.0f32; 1];
+            gate.matvec(x, &mut gl, pool);
+            1.0 / (1.0 + (-gl[0]).exp())
+        });
+        pairs.push((&se.gate_proj, &se.up_proj));
+        downs.push(&se.down_proj);
+        ws.push(g);
+    }
+    let inter = pairs[0].0.rows();
+    let mut gs: Vec<Vec<f32>> = (0..pairs.len()).map(|_| vec![0f32; inter]).collect();
+    if !QTensor::moe_gate_up_many(&pairs, x, &mut gs, pool) {
+        return None;
+    }
+    let mut out = attention::take_buf(x.len());
+    if !QTensor::moe_down_many(&downs, &gs, &ws, &mut out, pool) {
+        attention::recycle_buf(&mut out);
+        return None;
+    }
+    Some(out)
+}
+
 /// The pure-CPU MoE expert loop (also the fallback of every GPU refusal).
 fn moe_ffn_cpu(
     m: &MoeFfn,
@@ -5088,6 +5214,9 @@ fn moe_ffn_cpu(
     wsum: f32,
     pool: Option<&Pool>,
 ) -> Vec<f32> {
+    if let Some(out) = moe_ffn_cpu_batched(m, x, idx, p, wsum, pool) {
+        return out;
+    }
     let mut out = attention::take_buf(x.len());
     for &e in idx {
         let mut eo = dense_ffn(&m.experts[e], x, pool);
@@ -5228,6 +5357,18 @@ fn dense_moe_ffn(
 
 /// Building the MoE-layer GPU jobs: all selected experts (+shared) must
 /// be q8_2f-Mapped from the primary mapping; otherwise None → CPU path.
+/// One-shot report of why the MoE GPU block refused. A silent `?` here
+/// sends every expert to the CPU with nothing in the logs to say so —
+/// which is exactly how a q4tp MoE model looked "GPU-accelerated" while
+/// running entirely on the host.
+fn moe_gpu_refused(why: &'static str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        tracing::warn!("MoE GPU block refused ({why}) — experts run on the CPU");
+    }
+}
+
 fn moe_ffn_gpu(
     m: &MoeFfn,
     x: &[f32],
@@ -5241,7 +5382,10 @@ fn moe_ffn_gpu(
     let mut jobs: Vec<MoeJob> = Vec::with_capacity(idx.len() + 1);
     let mut model_ref = None;
     for &e in idx {
-        moe_push_job(&m.experts[e], x, p[e] / wsum, &mut jobs, &mut model_ref)?;
+        if moe_push_job(&m.experts[e], x, p[e] / wsum, &mut jobs, &mut model_ref).is_none() {
+            moe_gpu_refused("push_job(expert)");
+            return None;
+        }
     }
     if let Some((se, gate)) = &m.shared {
         let g = gate.as_ref().map_or(1.0, |gate| {
@@ -5249,12 +5393,23 @@ fn moe_ffn_gpu(
             gate.matvec(x, &mut gl, pool);
             1.0 / (1.0 + (-gl[0]).exp())
         });
-        moe_push_job(se, x, g, &mut jobs, &mut model_ref)?;
+        if moe_push_job(se, x, g, &mut jobs, &mut model_ref).is_none() {
+            moe_gpu_refused("push_job(shared)");
+            return None;
+        }
     }
-    let model = model_ref?;
+    let Some(model) = model_ref else {
+        moe_gpu_refused("no model_ref");
+        return None;
+    };
     let hidden = jobs[0].down.1;
     let mut out = vec![0.0f32; hidden];
-    crate::gpu::moe_block(&model, &jobs, &mut out).then_some(out)
+    if crate::gpu::moe_block(&model, &jobs, &mut out) {
+        Some(out)
+    } else {
+        moe_gpu_refused("gpu::moe_block");
+        None
+    }
 }
 
 /// Single-position FFN dispatch.
