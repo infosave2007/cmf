@@ -6224,6 +6224,25 @@ pub fn forward_batch_graph(
             _ => encode_q1_mm(c, enc, &m.buf, xs, y, rows, cols, k),
         }
     };
+    // SINGLE-row matvec for the per-token stretches inside the batch (the MoE
+    // router/gate run once per token). `ematb` bakes nb=k into the GEMM: fed a
+    // one-row buffer it reads k rows past the end and writes k rows into a
+    // one-row output — and it has no f32 arm at all, so a kind-4 router fell
+    // into the q1 decoder. Both were enough to turn the answer into noise.
+    let emat1 = |enc: &mut wgpu::CommandEncoder,
+                 m: &GMat,
+                 xs: &wgpu::Buffer,
+                 y: &wgpu::Buffer,
+                 rows: usize,
+                 cols: usize| {
+        match m.kind {
+            0 => encode_matvec(c, enc, &m.buf, xs, m.rs.as_ref().unwrap(), y, rows, cols),
+            1 => encode_matvec_q1(c, enc, &m.buf, xs, y, rows, cols),
+            5 => encode_q1t_like(c, enc, &c.q4t_mv, &m.buf, xs, y, rows, cols),
+            6 => encode_q1t_like(c, enc, &c.q4tp_mv, &m.buf, xs, y, rows, cols),
+            _ => encode_f32matvec(c, enc, &m.buf, xs, y, rows, cols),
+        }
+    };
     let cp =
         |enc: &mut wgpu::CommandEncoder,
          src: &wgpu::Buffer,
@@ -6530,9 +6549,9 @@ pub fn forward_batch_graph(
                     );
                     let bg_gu = bg(l_gu, &[gate_all, up_all, &row_in, msel, mact, &gu_u]);
                     let bg_dn = bg(l_dn, &[down_all, mact, msel, mwt, &row_out, &dn_u]);
-                    ematb(&mut enc, router, &row_in, mlogit, *n_exp, hidden);
+                    emat1(&mut enc, router, &row_in, mlogit, *n_exp, hidden);
                     if !sg_fold {
-                        ematb(&mut enc, sgate, &row_in, mslog, 1, hidden);
+                        emat1(&mut enc, sgate, &row_in, mslog, 1, hidden);
                     }
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: None,
