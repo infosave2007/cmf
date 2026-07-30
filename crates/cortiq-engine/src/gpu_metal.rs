@@ -3114,7 +3114,7 @@ kernel void q4tp_mul_mm(
             // preferred the CPU GEMM outright — the "the GEMM's arithmetic
             // hides the chain" argument held for FFN shapes and not for this.
             float scale = exp2(row_lo + (float)code * row_st);
-            device const uchar* nib = q + ((ulong)wr * gpr + (ulong)g) * 16ul + 8u * il0;
+            device const uchar* nib = q + ((ulong)(r0 + lr0) * gpr + (ulong)g) * 16ul + 8u * il0;
             uint sy = (tiitg / 2u) / 8u;
             uint lx = (tiitg / 2u) % 8u;
             float wv[16];
@@ -3261,7 +3261,7 @@ kernel void q4tp_mul_mm_silu(
             // preferred the CPU GEMM outright — the "the GEMM's arithmetic
             // hides the chain" argument held for FFN shapes and not for this.
             float scale = exp2(row_lo + (float)code * row_st);
-            device const uchar* nib = q + ((ulong)wr * gpr + (ulong)g) * 16ul + 8u * il0;
+            device const uchar* nib = q + ((ulong)(r0 + lr0) * gpr + (ulong)g) * 16ul + 8u * il0;
             uint sy = (tiitg / 2u) / 8u;
             uint lx = (tiitg / 2u) % 8u;
             float wv[16];

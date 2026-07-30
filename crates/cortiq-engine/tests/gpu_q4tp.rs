@@ -140,10 +140,14 @@ fn check(
 #[test]
 fn metal_q4tp_matvec_matches_dequant_reference() {
     unsafe { std::env::set_var("CMF_GPU", "1") };
-    if !cortiq_engine::gpu_metal::enabled() {
-        eprintln!("skipped: Metal disabled");
-        return;
-    }
+    // NOT a silent skip. A broken MSL kernel makes ctx() fail, Metal falls
+    // back to CPU, and `enabled()` goes false — so an early return here turns
+    // "the shader does not compile" into a green test. That shipped a dead
+    // Metal backend in 0.5.40. On macOS the backend must come up.
+    assert!(
+        cortiq_engine::gpu_metal::enabled(),
+        "Metal did not initialize — check the MSL compile log above"
+    );
     check("metal-mv", cortiq_engine::gpu_metal::q4tp_matvec_for_test);
 }
 
@@ -200,10 +204,14 @@ fn check_mm(
 #[test]
 fn metal_q4tp_matmat_matches_dequant_reference() {
     unsafe { std::env::set_var("CMF_GPU", "1") };
-    if !cortiq_engine::gpu_metal::enabled() {
-        eprintln!("skipped: Metal disabled");
-        return;
-    }
+    // NOT a silent skip. A broken MSL kernel makes ctx() fail, Metal falls
+    // back to CPU, and `enabled()` goes false — so an early return here turns
+    // "the shader does not compile" into a green test. That shipped a dead
+    // Metal backend in 0.5.40. On macOS the backend must come up.
+    assert!(
+        cortiq_engine::gpu_metal::enabled(),
+        "Metal did not initialize — check the MSL compile log above"
+    );
     check_mm("metal-mm", cortiq_engine::gpu_metal::q4tp_matmat);
 }
 

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.41] — 2026-07-30
+
+A hotfix: **0.5.40 shipped a Metal backend that does not initialize.** Update.
+
+### Fixed
+- **The q4tp GEMMs referenced a variable that 0.5.40 deleted.** Hoisting the
+  per-row scale out of the K loop removed `uint wr`, and two lines still used
+  it. The MSL then fails to compile, `ctx()` returns None, and every model on
+  macOS silently falls back to the CPU — not just q4tp ones.
+
+  It reached a release because the parity test returned early when
+  `gpu_metal::enabled()` was false, which is exactly what a broken shader
+  causes. A test that skips on the condition it is meant to detect is worse
+  than no test; it now asserts the backend came up.
+
+- **Packed 3-D expert tensors doubled the `mlp.` prefix for the qwen
+  lineage.** gemma-4 names the tensor `layers.N.experts.gate_up_proj` and
+  qwen3.5/3.6 `layers.N.mlp.experts.gate_up_proj`; the splitter stripped the
+  suffix and appended `.mlp.experts`, so the qwen form came out as
+  `layers.N.mlp.mlp.experts.0.*`. Conversion succeeded — valid file, hashes
+  matched — and the model failed at load with "router present but no expert
+  tensors", which points nowhere near the naming. Qwen3.6-35B-A3B converts
+  and runs now.
+
+
 ## [0.5.40] — 2026-07-29
 
 q4tp reaches parity on the image path, plus the AWNP tooling and the

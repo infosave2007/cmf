@@ -2771,6 +2771,13 @@ pub fn run_convert(
                     .strip_suffix(".experts.gate_up_proj")
                     .or_else(|| name.strip_suffix(".experts.down_proj"))
                     .unwrap();
+                // Two lineages name the packed tensor differently: gemma-4
+                // has `layers.N.experts.*`, qwen3.5/3.6 `layers.N.mlp.experts.*`.
+                // The output name below appends `.mlp.experts`, so a base that
+                // already ends in `.mlp` would double it — and a doubled prefix
+                // converts silently, then fails at load with "router present but
+                // no expert tensors", which points nowhere near here.
+                let base = base.strip_suffix(".mlp").unwrap_or(base);
                 let moe = arch.moe.as_ref().ok_or_else(|| anyhow::anyhow!("no moe cfg"))?;
                 let (mi, hid) = (moe.moe_intermediate_size, arch.hidden_size);
                 let (ne, d1, d2) = (m_shape[0], m_shape[1], m_shape[2]);
