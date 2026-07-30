@@ -559,7 +559,17 @@ pub fn gdn_forward_batch(
 /// kernel is compute-bound); q8 stays opt-in via CMF_GPU_GDN=1 (measured
 /// neutral). The probe in `gdn_forward` still arbitrates either way.
 fn gdn_projs_eligible(w: &GdnWeights) -> bool {
+    // Any tile-embedded-scale layout, not just q1: the batched matvec now has
+    // kernels for all of them, and the probe arbitrates whether it pays.
+    // `CMF_GPU_GDN=0` forces the CPU projections back — the switch exists so
+    // the two arms can be compared inside ONE run: this machine throttles far
+    // enough that measurements minutes apart are not comparable.
+    if std::env::var("CMF_GPU_GDN").map(|v| v == "0").unwrap_or(false) {
+        return false;
+    }
     w.in_proj_qkv.is_q1()
+        || w.in_proj_qkv.q4t_parts().is_some()
+        || w.in_proj_qkv.q4tp_parts().is_some()
         || std::env::var("CMF_GPU_GDN")
             .map(|v| v == "1")
             .unwrap_or(false)
@@ -600,7 +610,7 @@ fn gdn_projs_gpu(w: &GdnWeights, x: &[f32], qkv: &mut [f32], z: &mut [f32]) -> b
                     cols: *cols,
                     row_scale,
                     xs: prescale(x, col_field, *dt).into_owned(),
-                    q1: false,
+                    layout: crate::gpu::BatchLayout::Q8,
                 },
             )),
             QTensor::Mapped {
@@ -618,7 +628,32 @@ fn gdn_projs_gpu(w: &GdnWeights, x: &[f32], qkv: &mut [f32], z: &mut [f32]) -> b
                     cols: *cols,
                     row_scale: &[],
                     xs: x.to_vec(),
-                    q1: true,
+                    layout: crate::gpu::BatchLayout::Q1,
+                },
+            )),
+            // q4t/q4tp: same tile-embedded-scale contract as q1, different
+            // stride. Missing here, a hybrid model's GDN projections fell to
+            // the CPU on every layer while its experts rode the device.
+            QTensor::Mapped {
+                model,
+                idx,
+                dtype: dt @ (TensorDtype::Q4Tiled | TensorDtype::Q4TiledP),
+                rows,
+                cols,
+                ..
+            } => Some((
+                model.clone(),
+                BatchJob {
+                    idx: *idx,
+                    rows: *rows,
+                    cols: *cols,
+                    row_scale: &[],
+                    xs: x.to_vec(),
+                    layout: if *dt == TensorDtype::Q4TiledP {
+                        crate::gpu::BatchLayout::Q4tp
+                    } else {
+                        crate::gpu::BatchLayout::Q4t
+                    },
                 },
             )),
             _ => None,

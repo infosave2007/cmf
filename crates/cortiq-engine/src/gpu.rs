@@ -466,8 +466,20 @@ pub struct BatchJob<'a> {
     pub cols: usize,
     pub row_scale: &'a [f32],
     pub xs: Vec<f32>,
-    /// q1 tensor: tile-embedded scales, raw f32 xs (see `MoeJob::q1`).
-    pub q1: bool,
+    /// Weight layout. Was a bare `q1: bool`, which could only ever spell two
+    /// of the four and silently sent everything else back to the CPU — the
+    /// GDN projections of a q4t/q4tp model never reached the device at all.
+    pub layout: BatchLayout,
+}
+
+/// Which kernel a batched matvec needs. q8 carries row scales in a side
+/// buffer; the rest embed them in the payload and differ in stride.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BatchLayout {
+    Q8,
+    Q1,
+    Q4t,
+    Q4tp,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

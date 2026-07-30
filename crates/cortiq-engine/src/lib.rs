@@ -103,7 +103,7 @@ pub fn gpu_batch_q1_for_test(
             cols,
             row_scale: &[],
             xs: if k < 2 { x.to_vec() } else { xi.to_vec() },
-            q1: true,
+            layout: gpu::BatchLayout::Q1,
         })
         .collect();
     gpu_metal::matvec_batch(model, &jobs, outs)

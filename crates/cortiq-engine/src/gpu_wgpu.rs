@@ -8068,7 +8068,7 @@ fn matvec_batch_q1(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f3
 /// silu·mul·col_down → down-matvec → y += w·d. Intermediate buffers are
 /// GPU-resident, one sync per layer.
 pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> bool {
-    if jobs.iter().any(|j| j.q1) {
+    if jobs.iter().any(|j| j.q1 || j.q4t || j.q4tp) {
         return false; // q1 WGSL kernel not implemented yet — honest CPU
     }
     let Some(c) = ctx() else { return false };
@@ -8242,7 +8242,18 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f
     // q1 jobs carry tile-embedded scales (empty row_scale) and need the q1
     // pipeline — route the whole batch to the q1 encoder. Mixed batches
     // (shouldn't happen: QKV share a dtype) fall to the CPU path.
-    let n_q1 = jobs.iter().filter(|j| j.q1).count();
+    // wgpu has a q1 batched kernel and no q4t/q4tp twin, so those layouts
+    // keep the CPU path here rather than being fed to the wrong kernel.
+    if jobs
+        .iter()
+        .any(|j| matches!(j.layout, crate::gpu::BatchLayout::Q4t | crate::gpu::BatchLayout::Q4tp))
+    {
+        return false;
+    }
+    let n_q1 = jobs
+        .iter()
+        .filter(|j| j.layout == crate::gpu::BatchLayout::Q1)
+        .count();
     if n_q1 == jobs.len() {
         return matvec_batch_q1(model, jobs, out);
     }

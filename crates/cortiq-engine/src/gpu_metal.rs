@@ -7561,16 +7561,33 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], outs: &mut [&mut [
         let Some(abs) = model.entry_abs_offset(entry) else {
             return false;
         };
-        let qlen = if j.q1 {
-            if j.cols % GROUP_SIZE != 0 || (j.cols / GROUP_SIZE) % 2 != 0 {
-                return false;
+        use crate::gpu::BatchLayout as BL;
+        let qlen = match j.layout {
+            BL::Q1 => {
+                if j.cols % GROUP_SIZE != 0 || (j.cols / GROUP_SIZE) % 2 != 0 {
+                    return false;
+                }
+                j.rows * (j.cols / GROUP_SIZE) * Q1_TILE
             }
-            j.rows * (j.cols / GROUP_SIZE) * Q1_TILE
-        } else {
-            if j.cols % 4 != 0 {
-                return false;
+            BL::Q4t => {
+                if j.cols % GROUP_SIZE != 0 {
+                    return false;
+                }
+                j.rows * (j.cols / GROUP_SIZE) * Q4_TILE
             }
-            j.rows * j.cols
+            BL::Q4tp => match cortiq_core::quant::expected_nbytes(
+                cortiq_core::TensorDtype::Q4TiledP,
+                &[j.rows, j.cols],
+            ) {
+                Some(n) => n,
+                None => return false,
+            },
+            BL::Q8 => {
+                if j.cols % 4 != 0 {
+                    return false;
+                }
+                j.rows * j.cols
+            }
         };
         if abs + qlen > safe_len {
             return false;
@@ -7615,17 +7632,15 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], outs: &mut [&mut [
             std::ptr::copy_nonoverlapping(j.xs.as_ptr(), xs_b.contents() as *mut f32, j.xs.len());
         }
         let y_b = get_io(9_000_000_341 + slot * 137 + j.rows, j.rows * 4);
-        if j.q1 {
-            encode_q1_matvec(
-                c,
-                enc,
-                &fbuf,
-                *abs,
-                &xs_b,
-                &y_b,
-                j.rows,
-                j.cols / GROUP_SIZE,
-            );
+        use crate::gpu::BatchLayout as BL2;
+        if j.layout != BL2::Q8 {
+            let gpr = j.cols / GROUP_SIZE;
+            match j.layout {
+                BL2::Q1 => encode_q1_matvec(c, enc, &fbuf, *abs, &xs_b, &y_b, j.rows, gpr),
+                BL2::Q4t => encode_q4t_matvec(c, enc, &fbuf, *abs, &xs_b, &y_b, j.rows, gpr),
+                BL2::Q4tp => encode_q4tp_matvec(c, enc, &fbuf, *abs, &xs_b, &y_b, j.rows, gpr),
+                BL2::Q8 => unreachable!(),
+            }
         } else {
             let rs_b = rs_of(j.idx, j.row_scale);
             enc.set_compute_pipeline_state(&c.q8);

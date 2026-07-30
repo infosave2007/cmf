@@ -6791,7 +6791,7 @@ pub(crate) fn gpu_batch_job<'a>(
                 cols: *cols,
                 row_scale,
                 xs: prescale(x, col_field, *dt).into_owned(),
-                q1: false,
+                layout: crate::gpu::BatchLayout::Q8,
             },
         )),
         // q1: raw f32 activations, tile-embedded scales.
@@ -6810,7 +6810,7 @@ pub(crate) fn gpu_batch_job<'a>(
                 cols: *cols,
                 row_scale: &[],
                 xs: x.to_vec(),
-                q1: true,
+                layout: crate::gpu::BatchLayout::Q1,
             },
         )),
         _ => None,
