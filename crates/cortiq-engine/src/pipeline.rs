@@ -1554,7 +1554,19 @@ impl Pipeline {
                     hiddens[j * hs..(j + 1) * hs].copy_from_slice(&self.embed_single(id));
                 }
                 let positions: Vec<usize> = (pos..end).collect();
-                if self.try_batch_graph_wgpu(&mut hiddens, &positions, bk) {
+                let ok_b = self.try_batch_graph_wgpu(&mut hiddens, &positions, bk);
+                {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static SAID: AtomicBool = AtomicBool::new(false);
+                    if !SAID.swap(true, Ordering::Relaxed) {
+                        if ok_b {
+                            tracing::info!("batched prefill: ACTIVE (k={bk})");
+                        } else {
+                            tracing::warn!("batched prefill declined — per-position graph");
+                        }
+                    }
+                }
+                if ok_b {
                     hidden.copy_from_slice(&hiddens[(bk - 1) * hs..]);
                     pos = end;
                 } else {
@@ -3646,14 +3658,75 @@ impl Pipeline {
             let mut model = None;
             for li in 0..self.num_layers {
                 let lw = &self.weights.layers[self.phys_layer(li)];
-                // Prefill batches stay dense-only: MoE routing is per-token,
-                // so a batched expert pass needs a different kernel shape.
+                // MoE routes per token, so its experts are encoded token by
+                // token inside the batched submit while attention and the
+                // projections stay GEMMs. Refusing MoE here is what left
+                // prefill running one position at a time: 33 tok/s against
+                // 54 on decode, i.e. reading the prompt was slower than
+                // writing the answer.
                 let gffn = match &lw.ffn {
                     FfnKind::Dense(d) => crate::gpu::GraphFfn::Dense {
                         gate: gw(&d.gate_proj)?,
                         up: gw(&d.up_proj)?,
                         down: gw(&d.down_proj)?,
                     },
+                    FfnKind::Moe(m) => {
+                        if m.router_sigmoid
+                            || m.expert_bias.is_some()
+                            || m.route_tau.is_some()
+                            || m.mask.is_some()
+                        {
+                            return None;
+                        }
+                        let (se, sg) = m.shared.as_ref()?;
+                        let sgate = gw(sg.as_ref()?)?;
+                        let router = gw(&m.router)?;
+                        let inter = m.experts.first()?.gate_proj.rows();
+                        let mut experts = Vec::with_capacity(m.experts.len() + 1);
+                        let mut q4tp: Option<bool> = None;
+                        for e in m.experts.iter().chain(std::iter::once(se)) {
+                            if !matches!(e.act, Act::Silu)
+                                || e.gate_proj.rows() != inter
+                                || e.up_proj.rows() != inter
+                            {
+                                return None;
+                            }
+                            let (mm, gi, ui, di, is_p) = match e.gate_proj.mapped_q4t() {
+                                Some((mm, gi)) => (
+                                    mm,
+                                    gi,
+                                    e.up_proj.mapped_q4t()?.1,
+                                    e.down_proj.mapped_q4t()?.1,
+                                    false,
+                                ),
+                                None => {
+                                    let (mm, gi) = e.gate_proj.mapped_q4tp()?;
+                                    (
+                                        mm,
+                                        gi,
+                                        e.up_proj.mapped_q4tp()?.1,
+                                        e.down_proj.mapped_q4tp()?.1,
+                                        true,
+                                    )
+                                }
+                            };
+                            if *q4tp.get_or_insert(is_p) != is_p {
+                                return None;
+                            }
+                            model.get_or_insert_with(|| mm.clone());
+                            experts.push((gi, ui, di));
+                        }
+                        crate::gpu::GraphFfn::Moe {
+                            router,
+                            shared_gate: sgate,
+                            experts,
+                            n_exp: m.experts.len(),
+                            top_k: m.top_k,
+                            inter,
+                            norm_topk: m.norm_topk_prob,
+                            q4tp: q4tp?,
+                        }
+                    }
                     _ => return None,
                 };
                 let attn = match &lw.attn {
@@ -3721,6 +3794,13 @@ impl Pipeline {
             Some((layers, model?))
         })();
         let Some((layers, model)) = built else {
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static SAID: AtomicBool = AtomicBool::new(false);
+                if !SAID.swap(true, Ordering::Relaxed) {
+                    tracing::warn!("batch graph: BUILDER refused (layer weights/kinds)");
+                }
+            }
             return false;
         };
         crate::gpu::forward_batch_graph(

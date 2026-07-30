@@ -5781,11 +5781,34 @@ pub fn forward_batch_graph(
             cdim: usize,
         },
     }
+    /// Батчевый FFN слоя. MoE маршрутизируется ПО ТОКЕНАМ, поэтому его
+    /// эксперты кодируются в цикле внутри того же submit'а, тогда как
+    /// attention и проекции остаются батчевыми GEMM'ами. Раньше здесь
+    /// допускался только Dense, и любая MoE-модель уходила на путь
+    /// «одна позиция за submit»: префилл 33 tok/s против 54 на декоде,
+    /// то есть промпт обрабатывался медленнее, чем генерация.
+    enum BFfn {
+        Dense {
+            gate: GMat,
+            up: GMat,
+            down: GMat,
+        },
+        Moe {
+            router: GMat,
+            sgate: GMat,
+            gate_all: wgpu::Buffer,
+            up_all: wgpu::Buffer,
+            down_all: wgpu::Buffer,
+            n_exp: usize,
+            top_k: usize,
+            inter: usize,
+            norm_topk: bool,
+            q4tp: bool,
+        },
+    }
     struct LW {
         attn: LAttn,
-        gate: GMat,
-        up: GMat,
-        down: GMat,
+        ffn: BFfn,
     }
     let resolve = |gw: &crate::gpu::GraphW, rows: usize, cols: usize| -> Option<GMat> {
         match gw.kind {
@@ -5841,7 +5864,9 @@ pub fn forward_batch_graph(
         }
     };
     // GEMM-able projection? (q8_row/q1). f32 (a/b) is per-position; anything else bails.
-    let gemmable = |m: &GMat| m.kind == 0 || m.kind == 1;
+    // kinds 5/6 (q4_tiled, q4tp) have tile GEMMs too — admitting only 0/1
+    // is what kept every q4tp model off the batched path.
+    let gemmable = |m: &GMat| matches!(m.kind, 0 | 1 | 5 | 6);
     let mut lws = Vec::with_capacity(layers.len());
     let mut gdn_dims: Option<(usize, usize, usize, usize, usize, usize)> = None;
     for l in layers {
@@ -5915,32 +5940,63 @@ pub fn forward_batch_graph(
                 }
             }
         };
-        // The batch-graph builder only admits dense FFNs (MoE prefill
-        // routes per-token and stays on the per-position path).
-        let crate::gpu::GraphFfn::Dense {
-            gate: lg,
-            up: lu,
-            down: ld,
-        } = &l.ffn
-        else {
-            return false;
+        let bffn = match &l.ffn {
+            crate::gpu::GraphFfn::Dense {
+                gate: lg,
+                up: lu,
+                down: ld,
+            } => {
+                let (Some(gate), Some(up), Some(down)) = (
+                    resolve(lg, inter, hidden),
+                    resolve(lu, inter, hidden),
+                    resolve(ld, hidden, inter),
+                ) else {
+                    return false;
+                };
+                if !(gemmable(&gate) && gemmable(&up) && gemmable(&down)) {
+                    return false;
+                }
+                BFfn::Dense { gate, up, down }
+            }
+            crate::gpu::GraphFfn::Moe {
+                router,
+                shared_gate,
+                experts,
+                n_exp,
+                top_k,
+                inter: mi,
+                norm_topk,
+                q4tp,
+            } => {
+                if *top_k >= 16 || *n_exp > 256 || experts.len() != n_exp + 1 {
+                    return false;
+                }
+                let (Some(router), Some(sgate)) = (
+                    resolve(router, *n_exp, hidden),
+                    resolve(shared_gate, 1, hidden),
+                ) else {
+                    return false;
+                };
+                let Some((gate_all, up_all, down_all)) =
+                    moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp)
+                else {
+                    return false;
+                };
+                BFfn::Moe {
+                    router,
+                    sgate,
+                    gate_all,
+                    up_all,
+                    down_all,
+                    n_exp: *n_exp,
+                    top_k: *top_k,
+                    inter: *mi,
+                    norm_topk: *norm_topk,
+                    q4tp: *q4tp,
+                }
+            }
         };
-        let (Some(gate), Some(up), Some(down)) = (
-            resolve(lg, inter, hidden),
-            resolve(lu, inter, hidden),
-            resolve(ld, hidden, inter),
-        ) else {
-            return false;
-        };
-        if !(gemmable(&gate) && gemmable(&up) && gemmable(&down)) {
-            return false;
-        }
-        lws.push(LW {
-            attn,
-            gate,
-            up,
-            down,
-        });
+        lws.push(LW { attn, ffn: bffn });
     }
     let stor = |data: &[u8]| {
         let b = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -6109,6 +6165,8 @@ pub fn forward_batch_graph(
                  cols: usize| {
         match m.kind {
             0 => encode_q8_mm(c, enc, &m.buf, m.rs.as_ref().unwrap(), xs, y, rows, cols, k),
+            5 => encode_q4_tile_mm(c, enc, &c.q4t_mm, &m.buf, xs, y, rows, cols, k),
+            6 => encode_q4_tile_mm(c, enc, &c.q4tp_mm, &m.buf, xs, y, rows, cols, k),
             _ => encode_q1_mm(c, enc, &m.buf, xs, y, rows, cols, k),
         }
     };
@@ -6118,6 +6176,50 @@ pub fn forward_batch_graph(
          so: usize,
          dst: &wgpu::Buffer,
          n: usize| enc.copy_buffer_to_buffer(src, (so * 4) as u64, dst, 0, (n * 4) as u64);
+    // Однострочные срезы батча для MoE: его ядра написаны на ОДИН токен,
+    // поэтому i-я строка копируется сюда, считается и уезжает обратно.
+    let row_in = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bg-row-in"),
+        size: (hidden * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let row_out = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bg-row-out"),
+        size: (hidden * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let moe_bufs = lws.iter().find_map(|w| match &w.ffn {
+        BFfn::Moe {
+            n_exp,
+            top_k,
+            inter: mi,
+            ..
+        } => Some((*n_exp, *top_k + 1, *mi)),
+        _ => None,
+    });
+    let moe_bufs = moe_bufs.map(|(mn, ms, mi)| {
+        let mk = |n: usize, label: &str| {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (n * 4).max(4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        (
+            mk(mn, "bg-mlogit"),
+            mk(1, "bg-mslog"),
+            mk(ms, "bg-msel"),
+            mk(ms, "bg-mwt"),
+            mk(ms * mi, "bg-mact"),
+        )
+    });
     let cpo =
         |enc: &mut wgpu::CommandEncoder,
          src: &wgpu::Buffer,
@@ -6291,15 +6393,111 @@ pub fn forward_batch_graph(
             &bg(&c.layout_add_rmsnorm_b, &[&h_buf, &ob, &pnw, &n1, &rms_u]),
             k as u32,
         );
-        ematb(&mut enc, &lw.gate, &n1, &gbuf, inter, hidden);
-        ematb(&mut enc, &lw.up, &n1, &ubuf, inter, hidden);
-        go(
-            &mut enc,
-            &c.silu,
-            &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]),
-            ((k * inter) as u32).div_ceil(256),
-        );
-        ematb(&mut enc, &lw.down, &abuf, &ob, hidden, inter);
+        match &lw.ffn {
+            BFfn::Dense { gate, up, down } => {
+                ematb(&mut enc, gate, &n1, &gbuf, inter, hidden);
+                ematb(&mut enc, up, &n1, &ubuf, inter, hidden);
+                go(
+                    &mut enc,
+                    &c.silu,
+                    &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]),
+                    ((k * inter) as u32).div_ceil(256),
+                );
+                ematb(&mut enc, down, &abuf, &ob, hidden, inter);
+            }
+            // Routing is per token, so the experts run token by token —
+            // but inside THIS submit, next to the batched attention and
+            // projections. Same four kernels the token graph uses, fed a
+            // one-row slice of the batch and writing one row back.
+            BFfn::Moe {
+                router,
+                sgate,
+                gate_all,
+                up_all,
+                down_all,
+                n_exp,
+                top_k,
+                inter: mi,
+                norm_topk,
+                q4tp,
+            } => {
+                let (mlogit, mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
+                let slots = *top_k + 1;
+                let mat16 = |rows: usize, cols: usize| -> u32 {
+                    let n = if *q4tp {
+                        cortiq_core::quant::expected_nbytes(
+                            cortiq_core::TensorDtype::Q4TiledP,
+                            &[rows, cols],
+                        )
+                        .unwrap_or(0)
+                    } else {
+                        rows * (cols / 32) * 18
+                    };
+                    (n / 2) as u32
+                };
+                let sg_fold = sgate.kind == 4;
+                let sel_u = uniform_u32x4(
+                    c,
+                    [
+                        *n_exp as u32,
+                        *top_k as u32,
+                        *norm_topk as u32,
+                        (hidden as u32) << 8 | u32::from(sg_fold) * 4,
+                    ],
+                );
+                let gu_u = uniform_u32x4(
+                    c,
+                    [
+                        (hidden / 32) as u32,
+                        *mi as u32,
+                        slots as u32,
+                        mat16(*mi, hidden),
+                    ],
+                );
+                let dn_u = uniform_u32x4(
+                    c,
+                    [(*mi / 32) as u32, hidden as u32, slots as u32, mat16(hidden, *mi)],
+                );
+                let (p_gu, p_dn, l_gu, l_dn) = if *q4tp {
+                    (
+                        &c.moe_gate_up_q4tp,
+                        &c.moe_down_q4tp,
+                        &c.layout_moe_gu_q4tp,
+                        &c.layout_moe_dn_q4tp,
+                    )
+                } else {
+                    (&c.moe_gate_up, &c.moe_down, &c.layout_moe_gu, &c.layout_moe_dn)
+                };
+                for i in 0..k {
+                    cp(&mut enc, &n1, i * hidden, &row_in, hidden);
+                    let bg_sel = bg(
+                        &c.layout_moe_sel,
+                        &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &row_in],
+                    );
+                    let bg_gu = bg(l_gu, &[gate_all, up_all, &row_in, msel, mact, &gu_u]);
+                    let bg_dn = bg(l_dn, &[down_all, mact, msel, mwt, &row_out, &dn_u]);
+                    ematb(&mut enc, router, &row_in, mlogit, *n_exp, hidden);
+                    if !sg_fold {
+                        ematb(&mut enc, sgate, &row_in, mslog, 1, hidden);
+                    }
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&c.moe_select);
+                    pass.set_bind_group(0, &bg_sel, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                    pass.set_pipeline(p_gu);
+                    pass.set_bind_group(0, &bg_gu, &[]);
+                    pass.dispatch_workgroups(*mi as u32, slots as u32, 1);
+                    pass.set_pipeline(p_dn);
+                    pass.set_bind_group(0, &bg_dn, &[]);
+                    pass.dispatch_workgroups(hidden as u32, 1, 1);
+                    drop(pass);
+                    cpo(&mut enc, &row_out, &ob, i * hidden, hidden);
+                }
+            }
+        }
         if li + 1 < layers.len() {
             let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
             go(
@@ -8468,6 +8666,51 @@ fn encode_matvec_q1(
 /// Encode a resident q1 GEMM (batched prefill): Y[k,rows] = X[k,cols] @ Wᵀ, all
 /// buffers already on the device. q1_mul_mm omits binding 2 (no row scale).
 #[allow(dead_code)] // wired by forward_batch_graph (batched prefill, in progress)
+/// Batched q4_tiled / q4tp GEMM into `enc` — the tile GEMMs the imagegen
+/// path already used, wired for the graph.
+///
+/// `ematb` matched kind 0 and sent EVERYTHING else to the q1 kernel, which
+/// for a q4tp weight is simply the wrong decoder. Together with `gemmable`
+/// admitting only kinds 0 and 1, that shut batched prefill out of every
+/// q4t and q4tp file — the same shape of bug as the `prep()` hole, and the
+/// reason prefill ran one position at a time at 33 tok/s against 54 on
+/// decode.
+fn encode_q4_tile_mm(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    k: usize,
+) {
+    let p_buf = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, k as u32, 0]);
+    let layout = pipeline.get_bind_group_layout(0);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &layout,
+        entries: &[
+            bind_buf(0, weight),
+            bind_buf(1, xs),
+            bind_buf(2, y),
+            bind_buf(3, &p_buf),
+        ],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(
+        (rows as u32).div_ceil(64).min(MAX_WG),
+        (k as u32).div_ceil(64),
+        1,
+    );
+}
+
 fn encode_q1_mm(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
