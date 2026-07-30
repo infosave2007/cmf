@@ -737,7 +737,7 @@ fn rmsnorm(@builtin(local_invocation_id) lid: vec3<u32>) {
 // GDN depthwise causal conv + SiLU over the ring buffer of the last kk-1
 // positions plus the current qkv, then shift the ring (drop oldest, append
 // current). One thread per conv channel. WGSL twin of the Metal gdn_conv.
-struct GcP { cdim: u32, kk: u32, _a: u32, _b: u32 };
+struct GcP { cdim: u32, kk: u32, xoff: u32, _b: u32 };
 @group(0) @binding(0) var<storage, read>       gc_qkv  : array<f32>;
 @group(0) @binding(1) var<storage, read>       gc_taps : array<f32>;
 @group(0) @binding(2) var<storage, read_write> gc_ring : array<f32>;
@@ -750,7 +750,7 @@ fn gdn_conv(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (c >= cdim) { return; }
     let kk = gc_p.kk;
     let tb = c * kk;
-    var acc = gc_qkv[c] * gc_taps[tb + kk - 1u];
+    var acc = gc_qkv[gc_p.xoff + c] * gc_taps[tb + kk - 1u];
     for (var j = 0u; j + 1u < kk; j = j + 1u) {
         acc = acc + gc_ring[j * cdim + c] * gc_taps[tb + j];
     }
@@ -760,7 +760,7 @@ fn gdn_conv(@builtin(global_invocation_id) gid: vec3<u32>) {
         gc_ring[j * cdim + c] = gc_ring[(j + 1u) * cdim + c];
     }
     if (kk > 1u) {
-        gc_ring[(kk - 2u) * cdim + c] = gc_qkv[c];
+        gc_ring[(kk - 2u) * cdim + c] = gc_qkv[gc_p.xoff + c];
     }
 }
 
@@ -770,7 +770,7 @@ fn gdn_conv(@builtin(global_invocation_id) gid: vec3<u32>) {
 // kfᵀS) with o = qfᵀS, then the gated RMSNorm o·norm·silu(z). S ([nv,dk,dv])
 // persists across tokens (device state buffer). WGSL twin of the Metal GDN
 // state-update kernel; dk,dv ≤ 256.
-struct GdnP { nv: u32, dk: u32, dv: u32, kd: u32, rep: u32, cdim: u32, eps: f32, _p: u32 };
+struct GdnP { nv: u32, dk: u32, dv: u32, kd: u32, rep: u32, cdim: u32, eps: f32, tok: u32 };
 @group(0) @binding(0) var<storage, read>       gd_cq   : array<f32>;
 @group(0) @binding(1) var<storage, read>       gd_z    : array<f32>;
 @group(0) @binding(2) var<storage, read>       gd_a    : array<f32>;
@@ -851,8 +851,9 @@ fn gdn_step(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
     workgroupBarrier();
     let inv = 1.0 / sqrt(ss / f32(dv) + gd_p.eps);
     if (t < dv) {
-        let zz = gd_z[h * dv + t];
-        gd_o[h * dv + t] = gd_ov[t] * inv * gd_norm[t] * (zz / (1.0 + exp(-zz)));
+        let zo = gd_p.tok * gd_p.nv * dv;
+        let zz = gd_z[zo + h * dv + t];
+        gd_o[zo + h * dv + t] = gd_ov[t] * inv * gd_norm[t] * (zz / (1.0 + exp(-zz)));
     }
 }
 
@@ -3096,6 +3097,7 @@ struct Ctx {
     /// param buffers per token are token-invariant, so uploading them once
     /// keeps them off the per-token encode critical path.
     uniforms: Mutex<HashMap<[u32; 4], wgpu::Buffer>>,
+    uniforms8: Mutex<HashMap<[u32; 8], wgpu::Buffer>>,
     /// Immutable norm/small weight buffers cached by (data ptr, len) — the
     /// ~200 per-layer norm uploads per token are token-invariant. Sentinel
     /// key (0, n) holds shared zero buffers. Assumes stable weight pointers
@@ -3565,6 +3567,7 @@ fn init() -> Result<Ctx, String> {
         scratch: Mutex::new(Scratch::default()),
         weight_bufs: Mutex::new(HashMap::new()),
         uniforms: Mutex::new(HashMap::new()),
+        uniforms8: Mutex::new(HashMap::new()),
         const_bufs: Mutex::new(HashMap::new()),
         rs_bufs: Mutex::new(HashMap::new()),
         attn_kv: Mutex::new(HashMap::new()),
@@ -6741,17 +6744,40 @@ pub fn forward_batch_graph(
                     eps.to_bits(),
                     0,
                 ]);
+                // Token offsets ride in the kernels' spare uniform words:
+                // conv reads its token's qkv slice, step reads/writes its
+                // token's z/output rows in the BATCH buffers. The staging
+                // copies this replaces were 4 of the 8 commands per token
+                // per GDN layer of a chunk.
                 for i in 0..k {
-                    cp(&mut enc, &qkv_b, i * cdim, &qkv_s, *cdim);
-                    cp(&mut enc, &z_b, i * nv * dv, &z_s, nv * dv);
-                    cp(&mut enc, &n1, i * hidden, &n1_s, hidden);
-                    encode_f32matvec(c, &mut enc, &a.buf, &n1_s, &a_s, *nv, hidden);
-                    encode_f32matvec(c, &mut enc, &b.buf, &n1_s, &b_s, *nv, hidden);
+                    encode_f32matvec_off(
+                        c, &mut enc, &a.buf, &n1, (i * hidden * 4) as u64,
+                        &a_s, 0, (*nv * 4) as u64, *nv, hidden,
+                    );
+                    encode_f32matvec_off(
+                        c, &mut enc, &b.buf, &n1, (i * hidden * 4) as u64,
+                        &b_s, 0, (*nv * 4) as u64, *nv, hidden,
+                    );
+                    let gc_pt =
+                        uniform_u32x4(c, [*cdim as u32, *kk as u32, (i * cdim) as u32, 0]);
                     go(
                         &mut enc,
                         &c.gdn_conv,
-                        &bg(&c.layout_gdn_conv, &[&qkv_s, &taps, ring, &cq_s, &gc_p]),
+                        &bg(&c.layout_gdn_conv, &[&qkv_b, &taps, ring, &cq_s, &gc_pt]),
                         (*cdim as u32).div_ceil(256),
+                    );
+                    let gd_pt = uniform_u32x8(
+                        c,
+                        [
+                            *nv as u32,
+                            *dk as u32,
+                            *dv as u32,
+                            (nk * dk) as u32,
+                            (nv / nk) as u32,
+                            *cdim as u32,
+                            eps.to_bits(),
+                            i as u32,
+                        ],
                     );
                     go(
                         &mut enc,
@@ -6759,12 +6785,11 @@ pub fn forward_batch_graph(
                         &bg(
                             &c.layout_gdn,
                             &[
-                                &cq_s, &z_s, &a_s, &b_s, &alog, &dtb, &gnorm, s, &gdo_s, &gd_p,
+                                &cq_s, &z_b, &a_s, &b_s, &alog, &dtb, &gnorm, s, &gdo_b, &gd_pt,
                             ],
                         ),
                         *nv as u32,
                     );
-                    cpo(&mut enc, &gdo_s, &gdo_b, i * nv * dv, nv * dv);
                 }
                 ematb(&mut enc, out, &gdo_b, &ob, hidden, nv * dv);
             }
@@ -9261,6 +9286,25 @@ fn encode_f32matvec(
 /// offsets land on 256-byte boundaries (t·hidden·4 and t·n_exp·4 with
 /// hidden=2048, n_exp≤256), which is all wgpu asks of a buffer binding.
 #[allow(clippy::too_many_arguments)]
+/// Content-keyed cache for 8-word uniforms — the per-token GDN params of a
+/// batched chunk repeat every chunk, and `unif` mints a fresh buffer per
+/// call (the OOM lesson of the folded-gate work).
+fn uniform_u32x8(c: &Ctx, v: [u32; 8]) -> wgpu::Buffer {
+    let mut u = c.uniforms8.lock().unwrap();
+    if let Some(b) = u.get(&v) {
+        return b.clone();
+    }
+    let b = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&v),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    u.insert(v, b.clone());
+    b
+}
+
 fn encode_f32matvec_off(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
