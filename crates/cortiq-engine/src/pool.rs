@@ -595,11 +595,17 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "android", target_os = "linux"))]
     fn worker_tids_registered_before_new_returns() {
+        // WORKER_TIDS is a process-global registry, and the test harness
+        // runs suites in parallel — other tests' pools add their tids to
+        // the same list (19 showed up on a 48-core box where the old
+        // `== 3` held on a laptop by timing luck). Assert on the DELTA:
+        // our pool's three workers must be there the moment new returns.
+        let before = super::WORKER_TIDS.lock().unwrap().len();
         let _p = super::Pool::new(3);
-        assert_eq!(
-            super::WORKER_TIDS.lock().unwrap().len(),
-            3,
-            "all worker tids must be visible the moment the pool exists"
+        let after = super::WORKER_TIDS.lock().unwrap().len();
+        assert!(
+            after >= before + 3,
+            "all worker tids must be visible the moment the pool exists              (before {before}, after {after})"
         );
     }
 
