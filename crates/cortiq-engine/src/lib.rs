@@ -68,6 +68,7 @@ pub fn gpu_moe_job_for_test(
         w: 1.0,
         q1: true,
         q4t: false,
+        q4tp: false,
     }
 }
 

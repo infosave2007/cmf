@@ -4802,6 +4802,15 @@ fn moe_parts(
             cols,
             ..
         } => Some((model, *idx, *rows, *cols, &[][..], &[][..], false, true)),
+        // q4tp: same raw-xs contract, different stride and scale plane.
+        QTensor::Mapped {
+            model,
+            idx,
+            dtype: cortiq_core::TensorDtype::Q4TiledP,
+            rows,
+            cols,
+            ..
+        } => Some((model, *idx, *rows, *cols, &[][..], &[][..], false, true)),
         _ => None,
     }
 }
@@ -4844,7 +4853,8 @@ fn moe_push_job<'a>(
         down_col: dcf,
         w,
         q1: gq1,
-        q4t: gq4,
+        q4t: gq4 && d.gate_proj.mapped_q4tp().is_none(),
+        q4tp: gq4 && d.gate_proj.mapped_q4tp().is_some(),
     });
     Some(())
 }

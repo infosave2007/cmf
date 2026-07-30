@@ -453,6 +453,10 @@ pub struct MoeJob<'a> {
     /// q4_tiled trio: scales inside the 18-byte tiles (row_scale
     /// slices empty, xs raw f32) — the MoE-hybrid coder class.
     pub q4t: bool,
+    /// q4tp trio: same raw-xs contract, 16-byte nibble stride and the scale
+    /// on a per-row ladder. Without this the experts of a q4tp MoE model fall
+    /// to the CPU while every other dtype rides the device.
+    pub q4tp: bool,
 }
 
 /// A single independent batch matvec (GDN projections of one input).
