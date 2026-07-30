@@ -116,7 +116,21 @@ pub(crate) fn build_layer_ffn(
     force_f32: bool,
     ov: &Overlay,
 ) -> Result<FfnKind, CmfError> {
-    let prefix = format!("model.layers.{li}.");
+    build_ffn_at(model, arch, &format!("model.layers.{li}."), force_f32, ov)
+}
+
+/// The FFN under an arbitrary prefix. Split out of `build_layer_ffn` so the
+/// MTP block can reuse it: Qwen3.6's MTP layer carries a full MoE mlp
+/// (router + 256 experts + shared expert), not the dense one the head was
+/// first written against.
+pub(crate) fn build_ffn_at(
+    model: &Arc<CmfModel>,
+    arch: &ModelArch,
+    prefix: &str,
+    force_f32: bool,
+    ov: &Overlay,
+) -> Result<FfnKind, CmfError> {
+    let prefix = prefix.to_string();
     let load_dense = |p: &str| -> Result<DenseFfn, CmfError> {
         let gate_proj = load_matrix(model, &format!("{p}gate_proj.weight"), force_f32, ov)?;
         let up_proj = load_matrix(model, &format!("{p}up_proj.weight"), force_f32, ov)?;
@@ -973,27 +987,10 @@ impl Pipeline {
                         ov,
                     )
                     .map_err(err)?,
-                    ffn: FfnKind::Dense(DenseFfn {
-                        gate_proj: load_matrix(
-                            model,
-                            &format!("{p}layers.0.mlp.gate_proj.weight"),
-                            false,
-                            ov,
-                        )?,
-                        up_proj: load_matrix(
-                            model,
-                            &format!("{p}layers.0.mlp.up_proj.weight"),
-                            false,
-                            ov,
-                        )?,
-                        down_proj: load_matrix(
-                            model,
-                            &format!("{p}layers.0.mlp.down_proj.weight"),
-                            false,
-                            ov,
-                        )?,
-                        act: crate::pipeline::Act::from_arch_full(&arch),
-                    }),
+                    // Whatever the block actually carries: DeepSeek's MTP
+                    // layer is dense, Qwen3.6's is a full MoE (router + 256
+                    // experts + shared). Same builder as a backbone layer.
+                    ffn: build_ffn_at(model, &arch, &format!("{p}layers.0."), false, ov)?,
                     attn,
                 },
                 final_norm: load_f32(model, &format!("{p}norm.weight"), ov).map_err(err)?,

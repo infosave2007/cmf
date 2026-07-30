@@ -200,12 +200,26 @@ fn tiktoken_to_tokenizer_json(
 /// `model.language_model.*`; vision (`*.visual.*`) and the MTP head (`mtp.*`) are
 /// dropped — plain greedy decoding is correct without MTP.
 pub(crate) fn canon_name(raw: &str) -> Option<String> {
-    if raw.contains(".visual.")
-        || raw.starts_with("visual.")
-        || raw.starts_with("mtp.")
-        || raw.contains(".mtp.")
-    {
+    if raw.contains(".visual.") || raw.starts_with("visual.") {
         return None;
+    }
+    // MTP head: kept, and renamed to the layout the loader reads. Qwen3.6
+    // spells the projection `fc` and its two input norms
+    // `pre_fc_norm_{embedding,hidden}`; the loader (written against the
+    // DeepSeek spelling) wants `eh_proj`, `enorm`, `hnorm`. Everything
+    // under `layers.0.` passes through — including the MoE mlp, which the
+    // block carries here rather than a dense one.
+    if let Some(rest) = raw.strip_prefix("mtp.").or_else(|| {
+        raw.strip_prefix("model.mtp.")
+            .or_else(|| raw.split_once(".mtp.").map(|(_, r)| r))
+    }) {
+        let mapped = match rest {
+            "fc.weight" => "eh_proj.weight".to_string(),
+            "pre_fc_norm_embedding.weight" => "enorm.weight".to_string(),
+            "pre_fc_norm_hidden.weight" => "hnorm.weight".to_string(),
+            other => other.to_string(),
+        };
+        return Some(format!("model.mtp.{mapped}"));
     }
     // Gemma-4 multimodal towers (text tower converts alone).
     for pfx in [
@@ -1723,7 +1737,19 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         partial_rotary_factor: prf,
         yarn,
         attention_heads_per_layer,
-        mtp: None,
+        // MTP head, when the checkpoint ships one. Qwen3.6 spells the count
+        // `mtp_num_hidden_layers`; DeepSeek-lineage configs say
+        // `num_nextn_predict_layers`. Absent → no speculative head, which is
+        // the honest default for every model that has none.
+        mtp: ["mtp_num_hidden_layers", "num_nextn_predict_layers"]
+            .iter()
+            .find_map(|k| cfg_usize(tc, k))
+            .filter(|n| *n > 0)
+            .map(|n| cortiq_core::MtpConfig {
+                num_layers: n,
+                share_lm_head: true,
+                share_embed: true,
+            }),
         moe,
         linear_core,
         max_position_embeddings: max_pos,
@@ -4101,5 +4127,38 @@ mod tests {
         assert_eq!(model.arch().vocab_size, 32);
         assert_eq!(model.arch().num_layers, 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Qwen3.6 ships an MTP head the converter used to drop on the floor.
+    /// It must survive, and land under the names the loader reads.
+    #[test]
+    fn mtp_head_is_kept_and_renamed_to_the_loader_layout() {
+        let m = |s: &str| canon_name(s);
+        assert_eq!(m("mtp.fc.weight").as_deref(), Some("model.mtp.eh_proj.weight"));
+        assert_eq!(
+            m("mtp.pre_fc_norm_embedding.weight").as_deref(),
+            Some("model.mtp.enorm.weight")
+        );
+        assert_eq!(
+            m("mtp.pre_fc_norm_hidden.weight").as_deref(),
+            Some("model.mtp.hnorm.weight")
+        );
+        assert_eq!(m("mtp.norm.weight").as_deref(), Some("model.mtp.norm.weight"));
+        // The block's own tensors pass through untouched — including the MoE
+        // mlp, which is what this head actually carries.
+        assert_eq!(
+            m("mtp.layers.0.self_attn.q_proj.weight").as_deref(),
+            Some("model.mtp.layers.0.self_attn.q_proj.weight")
+        );
+        assert_eq!(
+            m("mtp.layers.0.mlp.experts.gate_up_proj").as_deref(),
+            Some("model.mtp.layers.0.mlp.experts.gate_up_proj")
+        );
+        assert_eq!(
+            m("mtp.layers.0.mlp.shared_expert_gate.weight").as_deref(),
+            Some("model.mtp.layers.0.mlp.shared_expert_gate.weight")
+        );
+        // Vision towers are still dropped.
+        assert!(m("visual.blocks.0.attn.qkv.weight").is_none());
     }
 }
