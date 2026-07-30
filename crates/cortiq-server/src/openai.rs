@@ -59,7 +59,57 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse>
 #[derive(Deserialize, Serialize, Clone)]
 struct ChatMessage {
     role: String,
-    content: String,
+    content: MessageContent,
+}
+
+/// `content` in the shape clients actually send it.
+///
+/// The OpenAI schema allows a bare string OR an array of typed blocks, and
+/// coding assistants (Cline, Roo/Zoo Code) switch to the array form as soon
+/// as they attach file context or a system preamble. A `String`-only field
+/// rejected those with `422 Failed to deserialize the JSON body ... expected
+/// a string` before the model was ever reached — which is why the admin
+/// playground worked (flat prompt) and the IDE did not.
+///
+/// Untagged: serde tries the string first, then the block list.
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+enum MessageContent {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
+}
+
+/// One block of a structured `content` array. Deliberately permissive —
+/// every field optional, unknown fields ignored — so a new block type from
+/// some future client degrades to "no text" instead of a 422.
+#[derive(Deserialize, Serialize, Clone)]
+struct ContentBlock {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+impl MessageContent {
+    /// Flatten to the plain prompt text the pipeline consumes. Text blocks
+    /// join with newlines, in order; non-text blocks (images and friends)
+    /// contribute nothing rather than failing the turn.
+    fn text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Blocks(bs) => bs
+                .iter()
+                .filter_map(|b| b.text.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
+impl From<String> for MessageContent {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
 }
 
 #[derive(Deserialize)]
@@ -267,7 +317,7 @@ async fn chat_completions(
         let mut msgs: Vec<(String, String)> = req
             .messages
             .iter()
-            .map(|m| (m.role.clone(), m.content.clone()))
+            .map(|m| (m.role.clone(), m.content.text()))
             .collect();
         // Hard thinking suppression: when enable_thinking=false, inject a
         // system-level directive so even models that ignore the empty
@@ -435,7 +485,7 @@ async fn chat_completions(
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    content,
+                    content: content.into(),
                 },
                 finish_reason: result.finish_reason.clone(),
             }],
@@ -561,5 +611,42 @@ mod tests {
 
         assert!(request_sampler(Some(-1.0), None, None).is_err());
         assert!(request_sampler(None, Some(1.1), None).is_err());
+    }
+
+    /// Cline / Roo-style clients send `content` as a block array once they
+    /// attach file context. Both shapes must deserialize, and the array must
+    /// flatten to the same prompt text a flat string would give.
+    #[test]
+    fn content_accepts_both_a_string_and_a_block_array() {
+        let flat: ChatMessage =
+            serde_json::from_str(r#"{"role":"user","content":"hello"}"#).unwrap();
+        assert_eq!(flat.content.text(), "hello");
+
+        let blocks: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[
+                 {"type":"text","text":"file context"},
+                 {"type":"text","text":"the question"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(blocks.content.text(), "file context\nthe question");
+
+        // A non-text block must not fail the turn — it contributes nothing.
+        let mixed: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[
+                 {"type":"image_url","image_url":{"url":"data:x"}},
+                 {"type":"text","text":"describe"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(mixed.content.text(), "describe");
+
+        // And a whole request round-trips, which is what 422'd before.
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[
+                 {"role":"system","content":[{"type":"text","text":"sys"}]},
+                 {"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.messages[0].content.text(), "sys");
+        assert_eq!(req.messages[1].content.text(), "hi");
     }
 }
