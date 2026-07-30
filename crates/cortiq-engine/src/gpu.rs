@@ -755,6 +755,12 @@ pub enum GraphFfn<'a> {
         top_k: usize,
         inter: usize,
         norm_topk: bool,
+        /// Expert weight layout, uniform across the layer: `false` =
+        /// q4_tiled (18 B tiles, inline f16 scale), `true` = q4tp
+        /// (16 B nibbles + a per-row ladder plane). The two differ only
+        /// in where the scale comes from, so they share every kernel
+        /// but the weight-staging block.
+        q4tp: bool,
     },
 }
 

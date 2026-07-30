@@ -525,6 +525,174 @@ fn f32_matvec(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
     if (lid == 0u) { f32y[row] = f32part[0]; }
 }
 
+// ── Two independent projections of the SAME input, in ONE dispatch.
+//
+// A GDN layer projects its input four ways (qkv, z, a, b); a MoE layer
+// projects it twice (router, shared gate). Those are independent, but
+// dispatches inside a compute pass are serialized by wgpu's
+// memory-visibility guarantee — so each costs a full launch (~29 µs on
+// this Vulkan stack) for work the card could overlap. Measured on a
+// 5090, the 40-layer decode spends 15.3 of its 16.4 ms in
+// submit+readback across ~520 dispatches, so collapsing pairs is worth
+// more than any arithmetic in the kernels.
+//
+// The two jobs are laid end-to-end in one row space: workgroup r < rows0
+// is job 0, the rest is job 1. Whole workgroups branch together, so the
+// per-kind branch never diverges within a workgroup. Kinds: 4 = f32,
+// 6 = q4tp; the caller keeps the unfused path for anything else.
+struct MvP2 {
+    rows0: u32, cols0: u32, kind0: u32, _pa: u32,
+    rows1: u32, cols1: u32, kind1: u32, _pb: u32,
+};
+@group(0) @binding(0) var<storage, read>       m2w0 : array<u32>;
+@group(0) @binding(1) var<storage, read>       m2w1 : array<u32>;
+@group(0) @binding(2) var<storage, read>       m2x  : array<f32>;
+@group(0) @binding(3) var<storage, read_write> m2y0 : array<f32>;
+@group(0) @binding(4) var<storage, read_write> m2y1 : array<f32>;
+@group(0) @binding(5) var<uniform>             m2p  : MvP2;
+var<workgroup> m2part: array<f32, 64>;
+var<workgroup> m2lad:  array<f32, 32>;
+
+fn m2_dot8(w: u32, xi: u32) -> f32 {
+    return (f32(w & 0xFu) - 8.0) * m2x[xi]
+         + (f32((w >> 4u) & 0xFu) - 8.0) * m2x[xi + 1u]
+         + (f32((w >> 8u) & 0xFu) - 8.0) * m2x[xi + 2u]
+         + (f32((w >> 12u) & 0xFu) - 8.0) * m2x[xi + 3u]
+         + (f32((w >> 16u) & 0xFu) - 8.0) * m2x[xi + 4u]
+         + (f32((w >> 20u) & 0xFu) - 8.0) * m2x[xi + 5u]
+         + (f32((w >> 24u) & 0xFu) - 8.0) * m2x[xi + 6u]
+         + (f32((w >> 28u) & 0xFu) - 8.0) * m2x[xi + 7u];
+}
+
+// One partial dot over job 0's weights. Split per buffer because WGSL has
+// no way to pick a binding at runtime.
+fn m2_part0(kind: u32, row: u32, cols: u32, lid: u32) -> f32 {
+    var acc = 0.0;
+    if (kind == 4u) {
+        let base = row * cols;
+        var i = lid;
+        loop {
+            if (i >= cols) { break; }
+            acc = acc + bitcast<f32>(m2w0[base + i]) * m2x[i];
+            i = i + 64u;
+        }
+        return acc;
+    }
+    let gpr = cols / 32u;
+    let rows = m2p.rows0;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    if (lid < 32u) {
+        let pr = unpack2x16float(m2w0[params_w + row]);
+        m2lad[lid] = exp2(pr.x + f32(lid) * pr.y);
+    }
+    workgroupBarrier();
+    var g = lid;
+    loop {
+        if (g >= gpr) { break; }
+        let bit = g * 5u;
+        let cb = codes_b + row * cstride + (bit >> 3u);
+        let sh = bit & 7u;
+        var cv = (m2w0[cb >> 2u] >> ((cb & 3u) * 8u)) & 0xFFu;
+        if (sh > 3u) {
+            let cb1 = cb + 1u;
+            cv = cv | (((m2w0[cb1 >> 2u] >> ((cb1 & 3u) * 8u)) & 0xFFu) << 8u);
+        }
+        let scale = m2lad[(cv >> sh) & 31u];
+        let base = (row * gpr + g) * 4u;
+        let xb = g * 32u;
+        var gs = 0.0;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            gs = gs + m2_dot8(m2w0[base + k], xb + 8u * k);
+        }
+        acc = acc + scale * gs;
+        g = g + 64u;
+    }
+    return acc;
+}
+
+fn m2_part1(kind: u32, row: u32, cols: u32, lid: u32) -> f32 {
+    var acc = 0.0;
+    if (kind == 4u) {
+        let base = row * cols;
+        var i = lid;
+        loop {
+            if (i >= cols) { break; }
+            acc = acc + bitcast<f32>(m2w1[base + i]) * m2x[i];
+            i = i + 64u;
+        }
+        return acc;
+    }
+    let gpr = cols / 32u;
+    let rows = m2p.rows1;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    if (lid < 32u) {
+        let pr = unpack2x16float(m2w1[params_w + row]);
+        m2lad[lid] = exp2(pr.x + f32(lid) * pr.y);
+    }
+    workgroupBarrier();
+    var g = lid;
+    loop {
+        if (g >= gpr) { break; }
+        let bit = g * 5u;
+        let cb = codes_b + row * cstride + (bit >> 3u);
+        let sh = bit & 7u;
+        var cv = (m2w1[cb >> 2u] >> ((cb & 3u) * 8u)) & 0xFFu;
+        if (sh > 3u) {
+            let cb1 = cb + 1u;
+            cv = cv | (((m2w1[cb1 >> 2u] >> ((cb1 & 3u) * 8u)) & 0xFFu) << 8u);
+        }
+        let scale = m2lad[(cv >> sh) & 31u];
+        let base = (row * gpr + g) * 4u;
+        let xb = g * 32u;
+        var gs = 0.0;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            gs = gs + m2_dot8(m2w1[base + k], xb + 8u * k);
+        }
+        acc = acc + scale * gs;
+        g = g + 64u;
+    }
+    return acc;
+}
+
+@compute @workgroup_size(64)
+fn matvec_pair(@builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(num_workgroups) nwg: vec3<u32>,
+               @builtin(local_invocation_index) lid: u32) {
+    let total = m2p.rows0 + m2p.rows1;
+    var flat = wid.x;
+    loop {
+        if (flat >= total) { break; }
+        var acc = 0.0;
+        let second = flat >= m2p.rows0;
+        if (second) {
+            acc = m2_part1(m2p.kind1, flat - m2p.rows0, m2p.cols1, lid);
+        } else {
+            acc = m2_part0(m2p.kind0, flat, m2p.cols0, lid);
+        }
+        m2part[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid < stride) { m2part[lid] = m2part[lid] + m2part[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lid == 0u) {
+            if (second) { m2y1[flat - m2p.rows0] = m2part[0]; }
+            else { m2y0[flat] = m2part[0]; }
+        }
+        // The next iteration rewrites m2lad/m2part; make sure every thread
+        // is done reading them first.
+        workgroupBarrier();
+        flat = flat + nwg.x;
+    }
+}
+
 // RMSNorm of one row (WGSL twin of Metal rmsnorm_k): o = x·rsqrt(mean(x²)+eps)·w',
 // w' = w or (1+w) for gemma. One workgroup, 256-thread tree reduction — the
 // building block that keeps the token graph's hidden resident across the norm.
@@ -974,6 +1142,88 @@ fn gqa_attend(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
     let invl = select(0.0, 1.0 / at_l[0], at_l[0] > 0.0);
     for (var d = lane; d < hd; d = d + 32u) {
         at_o[h * hd + d] = at_acc[d] * invl;
+    }
+}
+
+// head_dim ≤ 256 on a 32 KB device: same stride 257, HALF the lanes.
+//
+// The 32-lane kernel above needs 32·257·4 = 32 896 B of workgroup memory
+// and cannot be created where the limit is 32 768 — wgpu-Metal and mobile.
+// The stride cannot shrink (it must exceed hd, and 257 is what dodges the
+// 32-bank conflicts), so the lane count is the only free dimension:
+// 16·257·4 = 16 448 B fits with room to spare.
+//
+// Without this, `hd_cap` on Apple was 128 and the whole-token graph
+// silently declined for the ENTIRE Qwen3.5/3.6 family (head_dim 256) —
+// every layer walked the host on a machine whose GPU could have run it.
+// Halving the lanes halves the position parallelism, which this kernel
+// can afford: it is bound by the vec4 K/V reads, not by lane occupancy.
+var<workgroup> at_acc16: array<f32, 4112>; // [lane*257 + d], 16 lanes
+var<workgroup> at_m16: array<f32, 16>;
+var<workgroup> at_l16: array<f32, 16>;
+@compute @workgroup_size(16)
+fn gqa_attend_w16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let lane = lid.x;
+    if (h >= at_p.nh) { return; }
+    let hd = at_p.hd;
+    let hd4 = hd / 4u;
+    let n = at_p.n;
+    let kbase = (h / at_p.hpk) * at_p.cap * hd4;
+    let qbase = h * hd4;
+    let scale = 1.0 / sqrt(f32(hd));
+    let base = lane * 257u;
+    for (var d = 0u; d < hd; d = d + 1u) { at_acc16[base + d] = 0.0; }
+    var m = -1e30;
+    var l = 0.0;
+    var p = lane;
+    loop {
+        if (p >= n) { break; }
+        let krow = kbase + p * hd4;
+        var dot4 = vec4<f32>(0.0);
+        for (var d = 0u; d < hd4; d = d + 1u) { dot4 = dot4 + at_q[qbase + d] * at_k[krow + d]; }
+        let dot = (dot4.x + dot4.y + dot4.z + dot4.w) * scale;
+        let mp = max(m, dot);
+        let f = exp(m - mp);
+        let w = exp(dot - mp);
+        l = l * f + w;
+        for (var d = 0u; d < hd4; d = d + 1u) {
+            let vv = at_v[krow + d] * w;
+            let a = base + d * 4u;
+            at_acc16[a]      = at_acc16[a]      * f + vv.x;
+            at_acc16[a + 1u] = at_acc16[a + 1u] * f + vv.y;
+            at_acc16[a + 2u] = at_acc16[a + 2u] * f + vv.z;
+            at_acc16[a + 3u] = at_acc16[a + 3u] * f + vv.w;
+        }
+        m = mp;
+        p = p + 16u;
+    }
+    at_m16[lane] = m;
+    at_l16[lane] = l;
+    workgroupBarrier();
+    var stride = 8u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lane < stride) {
+            let o = lane + stride;
+            let m1 = at_m16[lane];
+            let m2 = at_m16[o];
+            let mm = max(m1, m2);
+            let f1 = exp(m1 - mm);
+            let f2 = exp(m2 - mm);
+            at_l16[lane] = at_l16[lane] * f1 + at_l16[o] * f2;
+            let bo = o * 257u;
+            for (var d = 0u; d < hd; d = d + 1u) {
+                at_acc16[base + d] = at_acc16[base + d] * f1 + at_acc16[bo + d] * f2;
+            }
+            at_m16[lane] = mm;
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let invl = select(0.0, 1.0 / at_l16[0], at_l16[0] > 0.0);
+    for (var d = lane; d < hd; d = d + 16u) {
+        at_o[h * hd + d] = at_acc16[d] * invl;
     }
 }
 
@@ -1716,16 +1966,26 @@ fn q1t_overlay_mm(@builtin(global_invocation_id) gid: vec3<u32>) {
 // at u16 offset e·mat16); the SHARED expert is the last block, pinned by the
 // select kernel at slot top_k with a sigmoid weight.
 
-struct MoeSelP { n_exp: u32, top_k: u32, norm: u32, _p: u32 };
+// `sg_kind` = 4 means this kernel computes the shared-expert gate itself
+// from `ms_sgw` · `ms_x` and the host skips that matvec entirely. It is a
+// ONE-ROW projection: 2048 multiply-adds for a whole dispatch, and a
+// dispatch costs ~23 us on this stack against ~5 us for a pass — measured
+// by sweeping the layer count. Folding it into a kernel that already runs
+// one workgroup is free. Any other dtype keeps the separate matvec and
+// this kernel reads its result from `ms_slog`.
+struct MoeSelP { n_exp: u32, top_k: u32, norm: u32, pk: u32 };
 @group(0) @binding(0) var<storage, read>       ms_logit : array<f32>;
 @group(0) @binding(1) var<storage, read>       ms_slog  : array<f32>;
 @group(0) @binding(2) var<storage, read_write> ms_sel   : array<u32>;
 @group(0) @binding(3) var<storage, read_write> ms_w     : array<f32>;
 @group(0) @binding(4) var<uniform>             ms_p     : MoeSelP;
+@group(0) @binding(5) var<storage, read>       ms_sgw   : array<u32>;
+@group(0) @binding(6) var<storage, read>       ms_x     : array<f32>;
 var<workgroup> ms_lg:  array<f32, 256>;
 var<workgroup> ms_red: array<f32, 256>;
 var<workgroup> ms_ri:  array<u32, 256>;
 var<workgroup> ms_pick: u32;
+var<workgroup> ms_sg:  f32;
 
 // One workgroup, ALL-parallel: softmax reductions, then k rounds of an
 // argmax reduce (the selected logit is neutralized between rounds). A
@@ -1734,6 +1994,32 @@ var<workgroup> ms_pick: u32;
 // Ties pick the LOWEST index, matching the CPU scan. n_exp ≤ 256.
 @compute @workgroup_size(256)
 fn moe_select(@builtin(local_invocation_index) lid: u32) {
+    // Shared-expert gate first: the reduction scratch below is reused, so
+    // this has to land in ms_sg before the router work starts.
+    let sg_kind = ms_p.pk & 0xFFu;
+    let sg_hidden = ms_p.pk >> 8u;
+    if (sg_kind == 4u) {
+        var d = 0.0;
+        var i = lid;
+        loop {
+            if (i >= sg_hidden) { break; }
+            d = d + bitcast<f32>(ms_sgw[i]) * ms_x[i];
+            i = i + 256u;
+        }
+        ms_red[lid] = d;
+        workgroupBarrier();
+        var st = 128u;
+        loop {
+            if (st == 0u) { break; }
+            if (lid < st) { ms_red[lid] = ms_red[lid] + ms_red[lid + st]; }
+            workgroupBarrier();
+            st = st >> 1u;
+        }
+        if (lid == 0u) { ms_sg = ms_red[0]; }
+    } else {
+        if (lid == 0u) { ms_sg = ms_slog[0]; }
+    }
+    workgroupBarrier();
     let n = ms_p.n_exp;
     var v = -3.0e38;
     if (lid < n) { v = ms_logit[lid]; }
@@ -1798,7 +2084,7 @@ fn moe_select(@builtin(local_invocation_index) lid: u32) {
             for (var slot = 0u; slot < k; slot = slot + 1u) { ms_w[slot] = ms_w[slot] / wsum; }
         }
         ms_sel[k] = n;
-        ms_w[k] = 1.0 / (1.0 + exp(-ms_slog[0]));
+        ms_w[k] = 1.0 / (1.0 + exp(-ms_sg));
     }
 }
 
@@ -1912,6 +2198,123 @@ fn moe_down(@builtin(workgroup_id) wid: vec3<u32>,
         var d = 0.0;
         for (var k = 0u; k < 4u; k = k + 1u) {
             let w = md_u16(t16 + 1u + 2u * k) | (md_u16(t16 + 2u + 2u * k) << 16u);
+            d = d + md_dot8(w, xb + 8u * k);
+        }
+        acc = acc + md_wt[slot] * scale * d;
+    }
+    md_pt[lid] = acc;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { md_pt[lid] = md_pt[lid] + md_pt[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) { md_y[row] = md_pt[0]; }
+}
+
+// ── q4tp twins of the two MoE kernels. Identical nibble math and
+// identical bindings; only where the scale comes from differs. q4t
+// carries an f16 scale inside each 18-byte tile, q4tp packs the nibbles
+// 16-byte tight and puts a 5-bit rung index into a side plane, read
+// against the row's geometric ladder `2^(lo + code·step)`. Per expert
+// the blob is [nibbles | row params (f16 lo, f16 step) | 5-bit codes],
+// so the two extra plane offsets fall out of rows/gpr.
+fn mgp_gu8(o: u32) -> u32 { return (mg_gw[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+fn mgp_uu8(o: u32) -> u32 { return (mg_uw[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+
+@compute @workgroup_size(64)
+fn moe_gate_up_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let slot = wid.y;
+    let gpr = mg_p.gpr;
+    let rows = mg_p.inter;
+    let base16 = mg_sel[slot] * mg_p.mat16;
+    let nib16 = base16 + row * gpr * 8u;
+    let par16 = base16 + rows * gpr * 8u + row * 2u;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let cod8 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + row * cst;
+
+    let gl = unpack2x16float(mg_g16(par16) | (mg_g16(par16 + 1u) << 16u));
+    let ul = unpack2x16float(mg_u16f(par16) | (mg_u16f(par16 + 1u) << 16u));
+    var ag = 0.0;
+    var au = 0.0;
+    for (var g = lid; g < gpr; g = g + 64u) {
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        var cg = mgp_gu8(cod8 + cb);
+        var cu = mgp_uu8(cod8 + cb);
+        // A 5-bit field starting past bit 3 spills into the next byte.
+        if (shf > 3u) {
+            cg = cg | (mgp_gu8(cod8 + cb + 1u) << 8u);
+            cu = cu | (mgp_uu8(cod8 + cb + 1u) << 8u);
+        }
+        let sg = exp2(gl.x + f32((cg >> shf) & 31u) * gl.y);
+        let su = exp2(ul.x + f32((cu >> shf) & 31u) * ul.y);
+        let t16 = nib16 + g * 8u;
+        let xb = g * 32u;
+        var dg = 0.0;
+        var du = 0.0;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            let wg = mg_g16(t16 + 2u * k) | (mg_g16(t16 + 1u + 2u * k) << 16u);
+            let wu = mg_u16f(t16 + 2u * k) | (mg_u16f(t16 + 1u + 2u * k) << 16u);
+            dg = dg + mg_dot8(wg, xb + 8u * k);
+            du = du + mg_dot8(wu, xb + 8u * k);
+        }
+        ag = ag + sg * dg;
+        au = au + su * du;
+    }
+    mg_pg[lid] = ag;
+    mg_pu[lid] = au;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) {
+            mg_pg[lid] = mg_pg[lid] + mg_pg[lid + stride];
+            mg_pu[lid] = mg_pu[lid] + mg_pu[lid + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) {
+        let g = mg_pg[0];
+        mg_act[slot * mg_p.inter + row] = (g / (1.0 + exp(-g))) * mg_pu[0];
+    }
+}
+
+fn mdp_u8(o: u32) -> u32 { return (md_w[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+
+@compute @workgroup_size(64)
+fn moe_down_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
+                 @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let gpr = md_p.gpr;
+    let rows = md_p.hidden;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let total = md_p.slots * gpr;
+    var acc = 0.0;
+    for (var i = lid; i < total; i = i + 64u) {
+        let slot = i / gpr;
+        let g = i % gpr;
+        let base16 = md_sel[slot] * md_p.mat16;
+        let par16 = base16 + rows * gpr * 8u + row * 2u;
+        let cod8 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + row * cst;
+        let pl = unpack2x16float(md_u16(par16) | (md_u16(par16 + 1u) << 16u));
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        var cv = mdp_u8(cod8 + cb);
+        if (shf > 3u) { cv = cv | (mdp_u8(cod8 + cb + 1u) << 8u); }
+        let scale = exp2(pl.x + f32((cv >> shf) & 31u) * pl.y);
+        let t16 = base16 + (row * gpr + g) * 8u;
+        let xb = (slot * gpr + g) * 32u;
+        var d = 0.0;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            let w = md_u16(t16 + 2u * k) | (md_u16(t16 + 1u + 2u * k) << 16u);
             d = d + md_dot8(w, xb + 8u * k);
         }
         acc = acc + md_wt[slot] * scale * d;
@@ -2311,12 +2714,20 @@ struct Ctx {
     /// devices (Adreno/Mali/wgpu-Metal) where only the stride-129
     /// kernels exist.
     hd_cap: usize,
+    /// 32 KB+ of workgroup storage: the split-K attend parts need it.
+    big_attend: bool,
     gdn_step: wgpu::ComputePipeline,
     gdn_conv: wgpu::ComputePipeline,
     f32_matvec: wgpu::ComputePipeline,
     moe_select: wgpu::ComputePipeline,
+    /// Two independent projections of one input in a single dispatch.
+    matvec_pair: wgpu::ComputePipeline,
+    layout_mv2: wgpu::BindGroupLayout,
     moe_gate_up: wgpu::ComputePipeline,
     moe_down: wgpu::ComputePipeline,
+    /// q4tp twins — same bindings, ladder-plane scale decode.
+    moe_gate_up_q4tp: wgpu::ComputePipeline,
+    moe_down_q4tp: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     layout_mm: wgpu::BindGroupLayout,
     layout_mmm: wgpu::BindGroupLayout,
@@ -2344,6 +2755,11 @@ struct Ctx {
     layout_moe_sel: wgpu::BindGroupLayout,
     layout_moe_gu: wgpu::BindGroupLayout,
     layout_moe_dn: wgpu::BindGroupLayout,
+    /// wgpu treats an auto-derived layout as exclusive to the pipeline it
+    /// came from, so the q4tp twins need their own even though the
+    /// binding lists are identical.
+    layout_moe_gu_q4tp: wgpu::BindGroupLayout,
+    layout_moe_dn_q4tp: wgpu::BindGroupLayout,
     /// Discrete card (PCIe VRAM) vs UMA — thresholds and budgets differ.
     discrete: bool,
     /// Weight-residency budget in bytes (CMF_GPU_VRAM_MB override). On a
@@ -2683,20 +3099,28 @@ fn init() -> Result<Ctx, String> {
     let attn_rope = pipe("attn_rope_qkn");
     let kv_append = pipe("kv_append");
     let gqa_attend_s = pipe("gqa_attend_s");
+    // 32 lanes where the workgroup budget allows it, 16 lanes where it does
+    // not: both cover head_dim 256, so hd_cap is 256 everywhere now.
     let gqa_attend = if big_attend {
         pipe("gqa_attend")
     } else {
-        gqa_attend_s.clone()
+        pipe("gqa_attend_w16")
     };
     let gdn_step = pipe("gdn_step");
     let gdn_conv = pipe("gdn_conv");
     let f32_matvec = pipe("f32_matvec");
+    let matvec_pair = pipe("matvec_pair");
+    let layout_mv2 = matvec_pair.get_bind_group_layout(0);
     let moe_select = pipe("moe_select");
     let moe_gate_up = pipe("moe_gate_up");
     let moe_down = pipe("moe_down");
+    let moe_gate_up_q4tp = pipe("moe_gate_up_q4tp");
+    let moe_down_q4tp = pipe("moe_down_q4tp");
     let layout_moe_sel = moe_select.get_bind_group_layout(0);
     let layout_moe_gu = moe_gate_up.get_bind_group_layout(0);
     let layout_moe_dn = moe_down.get_bind_group_layout(0);
+    let layout_moe_gu_q4tp = moe_gate_up_q4tp.get_bind_group_layout(0);
+    let layout_moe_dn_q4tp = moe_down_q4tp.get_bind_group_layout(0);
     let layout = matvec.get_bind_group_layout(0);
     let layout_q1 = q1.get_bind_group_layout(0);
     let layout_rmsnorm = rmsnorm.get_bind_group_layout(0);
@@ -2784,13 +3208,18 @@ fn init() -> Result<Ctx, String> {
         attend_part,
         attend_part_s,
         attend_merge,
-        hd_cap: if big_attend { 256 } else { 128 },
+        hd_cap: 256,
+        big_attend,
         gdn_step,
         gdn_conv,
         f32_matvec,
+        matvec_pair,
+        layout_mv2,
         moe_select,
         moe_gate_up,
         moe_down,
+        moe_gate_up_q4tp,
+        moe_down_q4tp,
         layout,
         layout_mm,
         layout_mmm,
@@ -2818,6 +3247,8 @@ fn init() -> Result<Ctx, String> {
         layout_moe_sel,
         layout_moe_gu,
         layout_moe_dn,
+        layout_moe_gu_q4tp,
+        layout_moe_dn_q4tp,
         discrete,
         vram_budget,
         resident: std::sync::atomic::AtomicU64::new(0),
@@ -2877,15 +3308,28 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
 /// expert e at u16 offset e·mat16. Uploaded once per layer (keyed by the
 /// first gate idx), budget-guarded like every resident weight; the copy
 /// walks the per-tensor directory, so no file-order contiguity is assumed.
+/// One-shot reason the whole-token graph declined. Without it the fallback
+/// to the per-op path is invisible, which is how a q4tp model looked
+/// GPU-accelerated while every layer walked the host.
+fn graph_refused(why: &'static str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        tracing::warn!("wgpu token graph declined: {why}");
+    }
+}
+
 fn moe_expert_bufs(
     c: &Ctx,
     model: &Arc<CmfModel>,
     experts: &[(usize, usize, usize)],
     inter: usize,
     hidden: usize,
+    q4tp: bool,
 ) -> Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)> {
     use std::sync::atomic::Ordering;
     if hidden % 32 != 0 || inter % 32 != 0 {
+        graph_refused("moe_expert_bufs: hidden/inter not 32-aligned");
         return None;
     }
     let bytes = model.primary_bytes();
@@ -2893,11 +3337,38 @@ fn moe_expert_bufs(
     if let Some(t) = c.moe_expw.lock().unwrap().get(&key) {
         return Some(t.clone());
     }
-    let gu_len = inter * (hidden / 32) * 18;
-    let d_len = hidden * (inter / 32) * 18;
+    // q4t is 18 B a group flat; q4tp is 16 B of nibbles plus the row
+    // params and 5-bit code planes, which the format's own accessor sizes.
+    let plen = |rows: usize, cols: usize| -> Option<usize> {
+        if q4tp {
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+        } else {
+            Some(rows * (cols / 32) * 18)
+        }
+    };
+    let gu_len = plen(inter, hidden)?;
+    let d_len = plen(hidden, inter)?;
     let total = (experts.len() * (2 * gu_len + d_len)) as u64;
     if c.resident.load(Ordering::Relaxed) + total > c.vram_budget {
-        return None; // over budget — the whole graph honestly falls to CPU
+        // Over budget — the whole graph falls to CPU. Say so ONCE with the
+        // numbers: the default budget is a conservative 8 GB on discrete
+        // cards, so a 32 GB card running a big MoE lands here and every
+        // expert quietly walks the host. That refusal used to be silent.
+        use std::sync::atomic::AtomicBool;
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            let mb = |b: u64| b / (1024 * 1024);
+            tracing::warn!(
+                "MoE experts need {} MB for this layer on top of {} MB resident, \
+                 over the {} MB weight budget — the whole-token graph falls back to \
+                 the CPU. Raise it with CMF_GPU_VRAM_MB (e.g. {} on this card).",
+                mb(total),
+                mb(c.resident.load(Ordering::Relaxed)),
+                mb(c.vram_budget),
+                mb(c.vram_budget) * 3,
+            );
+        }
+        return None;
     }
     crate::gpu::probe_note_cold();
     let mk = |role: &dyn Fn(&(usize, usize, usize)) -> usize,
@@ -2926,9 +3397,17 @@ fn moe_expert_bufs(
         c.queue.write_buffer(&b, 0, &v);
         Some(b)
     };
-    let g = mk(&|t| t.0, inter, hidden, gu_len)?;
-    let u = mk(&|t| t.1, inter, hidden, gu_len)?;
-    let d = mk(&|t| t.2, hidden, inter, d_len)?;
+    let (g, u, d) = match (
+        mk(&|t| t.0, inter, hidden, gu_len),
+        mk(&|t| t.1, inter, hidden, gu_len),
+        mk(&|t| t.2, hidden, inter, d_len),
+    ) {
+        (Some(g), Some(u), Some(d)) => (g, u, d),
+        _ => {
+            graph_refused("moe_expert_bufs: expert tensor shape/nbytes mismatch");
+            return None;
+        }
+    };
     // Flush the write_buffer staging belt NOW: with 40 MoE layers the
     // pending uploads (~17 GB) would otherwise coexist with their device
     // copies until the graph's first submit — twice the expert weights in
@@ -3875,8 +4354,22 @@ pub fn forward_token_graph(
     logits: &mut Vec<f32>,
     loop_norm_at: &[usize],
 ) -> bool {
-    let Some(c) = ctx() else { return false };
+    let Some(c) = ctx() else {
+        graph_refused("no ctx");
+        return false;
+    };
     if position >= cap || hd % 4 != 0 || hd > c.hd_cap {
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "wgpu token graph declined: position {position} >= cap {cap}, or head_dim \
+                     {hd} (must be %4 and <= hd_cap {})",
+                    c.hd_cap
+                );
+            }
+        }
         return false; // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
     let t_start = std::time::Instant::now();
@@ -3924,6 +4417,7 @@ pub fn forward_token_graph(
             top_k: usize,
             inter: usize,
             norm_topk: bool,
+            q4tp: bool,
         },
     }
     struct LW {
@@ -4113,6 +4607,7 @@ pub fn forward_token_graph(
                 top_k,
                 inter: mi,
                 norm_topk,
+                q4tp,
             } => {
                 // Select kernel: logits live in a 256-slot workgroup array;
                 // slot top_k+1 holds the shared expert.
@@ -4126,7 +4621,7 @@ pub fn forward_token_graph(
                     return false;
                 };
                 let Some((gate_all, up_all, down_all)) =
-                    moe_expert_bufs(c, model, experts, *mi, hidden)
+                    moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp)
                 else {
                     return false;
                 };
@@ -4140,6 +4635,7 @@ pub fn forward_token_graph(
                     top_k: *top_k,
                     inter: *mi,
                     norm_topk: *norm_topk,
+                    q4tp: *q4tp,
                 }
             }
         };
@@ -4368,6 +4864,34 @@ pub fn forward_token_graph(
     let group = std::env::var("CMF_GPU_GROUP")
         .map(|v| v != "0")
         .unwrap_or(true);
+    // CMF_SKIP_PROBE=moe|gdn — TIMING ONLY, the answer is garbage. Drops a
+    // whole stage's dispatches while leaving every buffer, pass and shape
+    // in place, so the delta is that stage's real share of the frame. The
+    // arithmetic-only probe (CMF_TOPK_PROBE) says MoE math is ~2 ms of 17;
+    // this one says where the rest actually goes, which neither dispatch
+    // counting nor pass counting predicted correctly.
+    let skip = std::env::var("CMF_SKIP_PROBE").unwrap_or_default();
+    let (skip_moe, skip_gdn) = (skip.contains("moe"), skip.contains("gdn"));
+    // Skeleton pieces, so the 7.5 ms that is neither MoE nor GDN can be
+    // attributed instead of guessed at: the four GDN input projections,
+    // the GDN output projection, the fused residual+norm, the router, and
+    // the whole full-attention chain.
+    let skip_proj = skip.contains("proj");
+    let skip_outp = skip.contains("outp");
+    let skip_norm = skip.contains("norm");
+    let skip_router = skip.contains("router");
+    let skip_attn = skip.contains("attn");
+    // CMF_LAYERS_PROBE=N — TIMING ONLY, the answer is garbage. Encodes just
+    // the first N layers, leaving the final norm + lm_head + readback in
+    // place. Decode time against N is a straight line whose slope is the
+    // per-layer cost and whose intercept is everything that happens once a
+    // token: the submit, the ~1 MB logits readback and the lm_head. Neither
+    // dispatch counting nor pass counting predicted the frame correctly, so
+    // this splits it by measurement instead.
+    let layer_cap = std::env::var("CMF_LAYERS_PROBE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
     let t_enc0 = std::time::Instant::now();
     let mut enc = c
         .device
@@ -4527,6 +5051,37 @@ pub fn forward_token_graph(
                 });
                 Some((&c.q1t, bind, (rows as u32).min(MAX_WG)))
             }
+            // q4_block / q4_tiled / q4tp share q1t's binding shape — only the
+            // pipeline differs (this is exactly what `encode_q1t_like` does,
+            // minus the pass it opens).
+            //
+            // Without these arms `prep` returned None for every q4t/q4tp
+            // projection, so `group_mats` fell back to one compute pass PER
+            // matvec and the MoE layer took its per-op branch. On this Vulkan
+            // stack a pass costs ~60 us against ~2 ms of arithmetic for the
+            // whole MoE block, so the missing arms — not the kernels — were
+            // what held a q4tp model's decode down.
+            k @ (2 | 5 | 6) => {
+                let gpr = cols / 32;
+                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+                let pipe = match k {
+                    2 => &c.q4b,
+                    5 => &c.q4t_mv,
+                    _ => &c.q4tp_mv,
+                };
+                let layout = pipe.get_bind_group_layout(0);
+                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layout,
+                    entries: &[
+                        bind_buf(0, &m.buf),
+                        bind_buf(1, xs),
+                        bind_buf(2, y),
+                        bind_buf(3, &p_buf),
+                    ],
+                });
+                Some((pipe, bind, (rows as u32).min(MAX_WG)))
+            }
             _ => None,
         }
     };
@@ -4559,6 +5114,32 @@ pub fn forward_token_graph(
                 emat(enc, m, xs, y, *r, *cc);
             }
         };
+    // Two projections of the same input under ONE dispatch. `false` = a
+    // kind the paired kernel does not cover, caller keeps `group_mats`.
+    let pair_mats = |enc: &mut wgpu::CommandEncoder,
+                     a: (&GMat, &wgpu::Buffer, usize, usize),
+                     b: (&GMat, &wgpu::Buffer, usize, usize),
+                     xs: &wgpu::Buffer|
+     -> bool {
+        let ok = |k: u8| k == 4 || k == 6;
+        if !ok(a.0.kind) || !ok(b.0.kind) {
+            return false;
+        }
+        let p = unif(&[
+            a.2 as u32, a.3 as u32, a.0.kind as u32, 0, b.2 as u32, b.3 as u32, b.0.kind as u32, 0,
+        ]);
+        let bind = bg(
+            &c.layout_mv2,
+            &[&a.0.buf, &b.0.buf, xs, a.1, b.1, &p],
+        );
+        go(
+            enc,
+            &c.matvec_pair,
+            &bind,
+            ((a.2 + b.2) as u32).min(MAX_WG),
+        );
+        true
+    };
     // Bootstrap the first layer's attention norm; thereafter each residual is
     // fused with the following norm (add_rmsnorm), saving two dispatches/layer.
     let inw0 = stor(bytemuck::cast_slice(layers[0].input_norm));
@@ -4569,6 +5150,9 @@ pub fn forward_token_graph(
         1,
     );
     for (li, l) in layers.iter().enumerate() {
+        if li >= layer_cap {
+            break;
+        }
         let lw = &lws[li];
         let pnw = stor(bytemuck::cast_slice(l.post_norm));
         // ── token mixing (attention or GDN) → ob ──
@@ -4664,7 +5248,10 @@ pub fn forward_token_graph(
                     pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
                 }
                 let n_ctx = position + 1;
-                if n_ctx > ATTEND_SPLIT_MIN {
+                // Split-K needs the 257-stride PART kernel, which only exists
+                // on a 32 KB+ device. Elsewhere a big head stays on the plain
+                // 16-lane kernel — slower at long context, but correct.
+                if n_ctx > ATTEND_SPLIT_MIN && (hd <= 128 || c.big_attend) {
                     // Split-K attend: (nh × chunks) part workgroups + a
                     // per-head merge, both in ONE pass (WebGPU orders
                     // dispatches within a pass, so the merge sees the
@@ -4717,7 +5304,7 @@ pub fn forward_token_graph(
                     pass.set_pipeline(&c.attend_merge);
                     pass.set_bind_group(0, &bg_merge, &[]);
                     pass.dispatch_workgroups(nh as u32, 1, 1);
-                } else {
+                } else if !skip_attn {
                     let (ap, al) = attend_pipes(c, hd);
                     go(
                         &mut enc,
@@ -4765,22 +5352,7 @@ pub fn forward_token_graph(
                 let alog = stor(bytemuck::cast_slice(a_log));
                 let dtb = stor(bytemuck::cast_slice(dt_bias));
                 let gnorm = stor(bytemuck::cast_slice(norm));
-                group_mats(
-                    &mut enc,
-                    &[
-                        (qkv, &n1, &qkv_b, *cdim, hidden),
-                        (z, &n1, &z_b, nv * dv, hidden),
-                        (a, &n1, &a_b, *nv, hidden),
-                        (b, &n1, &b_b, *nv, hidden),
-                    ],
-                );
                 let gc_p = uniform_u32x4(c, [*cdim as u32, *kk as u32, 0, 0]);
-                go(
-                    &mut enc,
-                    &c.gdn_conv,
-                    &bg(&c.layout_gdn_conv, &[&qkv_b, &taps, ring, &cq_b, &gc_p]),
-                    (*cdim as u32).div_ceil(256),
-                );
                 let gd_p = unif(&[
                     *nv as u32,
                     *dk as u32,
@@ -4791,28 +5363,83 @@ pub fn forward_token_graph(
                     eps.to_bits(),
                     0,
                 ]);
-                go(
-                    &mut enc,
-                    &c.gdn_step,
-                    &bg(
-                        &c.layout_gdn,
-                        &[
-                            &cq_b, &z_b, &a_b, &b_b, &alog, &dtb, &gnorm, s, &gdo_b, &gd_p,
-                        ],
-                    ),
-                    *nv as u32,
+                let bg_conv = bg(&c.layout_gdn_conv, &[&qkv_b, &taps, ring, &cq_b, &gc_p]);
+                let bg_step = bg(
+                    &c.layout_gdn,
+                    &[
+                        &cq_b, &z_b, &a_b, &b_b, &alog, &dtb, &gnorm, s, &gdo_b, &gd_p,
+                    ],
                 );
-                emat(&mut enc, out, &gdo_b, &ob, hidden, nv * dv);
+                // The whole GDN chain in ONE compute pass: projections →
+                // conv → step → out_proj. Each stage reads the previous
+                // stage's output, which is exactly what a pass guarantees
+                // (dispatches inside it are ordered, with memory visible
+                // between them — the same rule the fused SiLU FFN relies on).
+                //
+                // A pass, not a dispatch, is the unit that costs here:
+                // teaching `prep` the q4tp kind collapsed this layer's four
+                // projection passes into one and bought 1.46 ms a token
+                // across 30 layers — ~16 us per pass. Four passes become one.
+                let projs = [
+                    prep(qkv, &n1, &qkv_b, *cdim, hidden),
+                    prep(z, &n1, &z_b, nv * dv, hidden),
+                    prep(a, &n1, &a_b, *nv, hidden),
+                    prep(b, &n1, &b_b, *nv, hidden),
+                ];
+                let outp = prep(out, &gdo_b, &ob, hidden, nv * dv);
+                if projs.iter().all(|p| p.is_some()) && outp.is_some() {
+                    let _ = (skip_proj, skip_outp);
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                    if !skip_proj {
+                        for p in projs.iter().flatten() {
+                            pass.set_pipeline(p.0);
+                            pass.set_bind_group(0, &p.1, &[]);
+                            pass.dispatch_workgroups(p.2, 1, 1);
+                        }
+                    }
+                    if !skip_gdn {
+                        pass.set_pipeline(&c.gdn_conv);
+                        pass.set_bind_group(0, &bg_conv, &[]);
+                        pass.dispatch_workgroups((*cdim as u32).div_ceil(256), 1, 1);
+                        pass.set_pipeline(&c.gdn_step);
+                        pass.set_bind_group(0, &bg_step, &[]);
+                        pass.dispatch_workgroups(*nv as u32, 1, 1);
+                    }
+                    if !skip_outp {
+                        let o = outp.as_ref().unwrap();
+                        pass.set_pipeline(o.0);
+                        pass.set_bind_group(0, &o.1, &[]);
+                        pass.dispatch_workgroups(o.2, 1, 1);
+                    }
+                } else {
+                    group_mats(
+                        &mut enc,
+                        &[
+                            (qkv, &n1, &qkv_b, *cdim, hidden),
+                            (z, &n1, &z_b, nv * dv, hidden),
+                            (a, &n1, &a_b, *nv, hidden),
+                            (b, &n1, &b_b, *nv, hidden),
+                        ],
+                    );
+                    go(&mut enc, &c.gdn_conv, &bg_conv, (*cdim as u32).div_ceil(256));
+                    go(&mut enc, &c.gdn_step, &bg_step, *nv as u32);
+                    emat(&mut enc, out, &gdo_b, &ob, hidden, nv * dv);
+                }
             }
             _ => return false,
         }
         // token-mix residual + FFN-norm fused: h += ob, n1 = rms(h, post_norm)
-        go(
-            &mut enc,
-            &c.add_rmsnorm,
-            &bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &pnw, &n1, &rms_u]),
-            1,
-        );
+        if !skip_norm {
+            go(
+                &mut enc,
+                &c.add_rmsnorm,
+                &bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &pnw, &n1, &rms_u]),
+                1,
+            );
+        }
         // SiLU FFN: gate+up matvecs + silu fused in ONE compute pass
         // (dispatches within a pass are serialized — silu safely reads gate/up output).
         match &lw.ffn {
@@ -4861,6 +5488,7 @@ pub fn forward_token_graph(
                 top_k,
                 inter: mi,
                 norm_topk,
+                q4tp,
             } => {
                 // The WHOLE MoE FFN — router + shared-gate matvecs, top-k
                 // select, fused gate+up+SiLU over the selected experts, and
@@ -4871,15 +5499,42 @@ pub fn forward_token_graph(
                 // NVIDIA Vulkan) is what dominates a 40-layer decode.
                 let (mlogit, mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
                 let slots = *top_k + 1;
-                let sel_u =
-                    uniform_u32x4(c, [*n_exp as u32, *top_k as u32, *norm_topk as u32, 0]);
+                // sg_kind = 4 tells the select kernel to compute the shared
+                // gate itself; then the sgate matvec below is not encoded.
+                let sg_fold = sgate.kind == 4;
+                // Cached uniform: `unif` mints a fresh buffer per call, and one
+                // per MoE layer per token exhausted the device. hidden and the
+                // fold flag share the spare word.
+                let sel_u = uniform_u32x4(
+                    c,
+                    [
+                        *n_exp as u32,
+                        *top_k as u32,
+                        *norm_topk as u32,
+                        (hidden as u32) << 8 | u32::from(sg_fold) * 4,
+                    ],
+                );
+                // Per-expert stride in u16 units: q4t is 9 per group flat,
+                // q4tp adds the row params and code planes on top of 8.
+                let mat16 = |rows: usize, cols: usize| -> u32 {
+                    let n = if *q4tp {
+                        cortiq_core::quant::expected_nbytes(
+                            cortiq_core::TensorDtype::Q4TiledP,
+                            &[rows, cols],
+                        )
+                        .unwrap_or(0)
+                    } else {
+                        rows * (cols / 32) * 18
+                    };
+                    (n / 2) as u32
+                };
                 let gu_u = uniform_u32x4(
                     c,
                     [
                         (hidden / 32) as u32,
                         *mi as u32,
                         slots as u32,
-                        (*mi * (hidden / 32) * 9) as u32,
+                        mat16(*mi, hidden),
                     ],
                 );
                 let dn_u = uniform_u32x4(
@@ -4888,15 +5543,25 @@ pub fn forward_token_graph(
                         (*mi / 32) as u32,
                         hidden as u32,
                         slots as u32,
-                        (hidden * (*mi / 32) * 9) as u32,
+                        mat16(hidden, *mi),
                     ],
                 );
-                let bg_sel = bg(&c.layout_moe_sel, &[mlogit, mslog, msel, mwt, &sel_u]);
-                let bg_gu = bg(
-                    &c.layout_moe_gu,
-                    &[gate_all, up_all, &n1, msel, mact, &gu_u],
+                let (p_gu, p_dn, l_gu, l_dn) = if *q4tp {
+                    (
+                        &c.moe_gate_up_q4tp,
+                        &c.moe_down_q4tp,
+                        &c.layout_moe_gu_q4tp,
+                        &c.layout_moe_dn_q4tp,
+                    )
+                } else {
+                    (&c.moe_gate_up, &c.moe_down, &c.layout_moe_gu, &c.layout_moe_dn)
+                };
+                let bg_sel = bg(
+                    &c.layout_moe_sel,
+                    &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &n1],
                 );
-                let bg_dn = bg(&c.layout_moe_dn, &[down_all, mact, msel, mwt, &ob, &dn_u]);
+                let bg_gu = bg(l_gu, &[gate_all, up_all, &n1, msel, mact, &gu_u]);
+                let bg_dn = bg(l_dn, &[down_all, mact, msel, mwt, &ob, &dn_u]);
                 let pr = prep(router, &n1, mlogit, *n_exp, hidden);
                 let ps = prep(sgate, &n1, mslog, 1, hidden);
                 if let (Some((prp, bgr, wr)), Some((psp, bgs, ws))) = (pr, ps) {
@@ -4904,21 +5569,27 @@ pub fn forward_token_graph(
                         label: None,
                         timestamp_writes: None,
                     });
-                    pass.set_pipeline(prp);
-                    pass.set_bind_group(0, &bgr, &[]);
-                    pass.dispatch_workgroups(wr, 1, 1);
-                    pass.set_pipeline(psp);
-                    pass.set_bind_group(0, &bgs, &[]);
-                    pass.dispatch_workgroups(ws, 1, 1);
+                    if !skip_router {
+                        pass.set_pipeline(prp);
+                        pass.set_bind_group(0, &bgr, &[]);
+                        pass.dispatch_workgroups(wr, 1, 1);
+                    }
+                    if !sg_fold {
+                        pass.set_pipeline(psp);
+                        pass.set_bind_group(0, &bgs, &[]);
+                        pass.dispatch_workgroups(ws, 1, 1);
+                    }
                     pass.set_pipeline(&c.moe_select);
                     pass.set_bind_group(0, &bg_sel, &[]);
                     pass.dispatch_workgroups(1, 1, 1);
-                    pass.set_pipeline(&c.moe_gate_up);
-                    pass.set_bind_group(0, &bg_gu, &[]);
-                    pass.dispatch_workgroups(*mi as u32, slots as u32, 1);
-                    pass.set_pipeline(&c.moe_down);
-                    pass.set_bind_group(0, &bg_dn, &[]);
-                    pass.dispatch_workgroups(hidden as u32, 1, 1);
+                    if !skip_moe {
+                        pass.set_pipeline(p_gu);
+                        pass.set_bind_group(0, &bg_gu, &[]);
+                        pass.dispatch_workgroups(*mi as u32, slots as u32, 1);
+                        pass.set_pipeline(p_dn);
+                        pass.set_bind_group(0, &bg_dn, &[]);
+                        pass.dispatch_workgroups(hidden as u32, 1, 1);
+                    }
                 } else {
                     // Un-preppable router dtype: per-op passes (correct, rare).
                     group_mats(
@@ -4934,11 +5605,11 @@ pub fn forward_token_graph(
                             label: None,
                             timestamp_writes: None,
                         });
-                        pass.set_pipeline(&c.moe_gate_up);
+                        pass.set_pipeline(p_gu);
                         pass.set_bind_group(0, &bg_gu, &[]);
                         pass.dispatch_workgroups(*mi as u32, slots as u32, 1);
                     }
-                    go(&mut enc, &c.moe_down, &bg_dn, hidden as u32);
+                    go(&mut enc, p_dn, &bg_dn, hidden as u32);
                 }
             }
         }
