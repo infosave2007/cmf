@@ -2198,6 +2198,167 @@ impl QTensor {
             _ => false,
         }
     }
+
+    /// Every routed expert's fused gate/up/SiLU under ONE pool dispatch.
+    ///
+    /// The per-expert path pays a pool barrier per expert per stage: at 9
+    /// experts over 40 layers that is ~720 barriers a token, and a decode
+    /// profile of Qwen3.6-35B-A3B showed the pool parked in
+    /// `psynch_cvwait` about twice as long as it spent computing. Laying
+    /// every expert's rows end-to-end in one virtual row space collapses
+    /// the stage to a single dispatch. The per-row body is the
+    /// single-expert q4tp arm verbatim, so outputs are bit-identical.
+    ///
+    /// `false` = something is outside the fused q4tp kernel (dtype, shape,
+    /// or the `CMF_SDOT=0` exact contract); the caller walks the ordinary
+    /// per-expert path.
+    pub fn moe_gate_up_many(
+        pairs: &[(&QTensor, &QTensor)],
+        x: &[f32],
+        outs: &mut [Vec<f32>],
+        pool: Option<&Pool>,
+    ) -> bool {
+        if pairs.is_empty() || pairs.len() != outs.len() || !a8w8_enabled() {
+            return false;
+        }
+        let inter = pairs[0].0.rows();
+        let cols = pairs[0].0.cols();
+        if cols % GROUP_SIZE != 0 {
+            return false;
+        }
+        let gpr = cols / GROUP_SIZE;
+        let mut views = Vec::with_capacity(pairs.len() * 2);
+        for ((g, u), o) in pairs.iter().zip(outs.iter()) {
+            let both_q4tp = matches!(
+                g,
+                Self::Mapped {
+                    dtype: TensorDtype::Q4TiledP,
+                    ..
+                }
+            ) && matches!(
+                u,
+                Self::Mapped {
+                    dtype: TensorDtype::Q4TiledP,
+                    ..
+                }
+            );
+            if !both_q4tp
+                || g.rows() != inter
+                || u.rows() != inter
+                || g.cols() != cols
+                || u.cols() != cols
+                || o.len() != inter
+            {
+                return false;
+            }
+            views.push(Q4tpView::new(g.quant_bytes(), inter, cols));
+            views.push(Q4tpView::new(u.quant_bytes(), inter, cols));
+        }
+        let act = split_act(x);
+        let act = &act;
+        let ptrs: Vec<SendMut> = outs.iter_mut().map(|o| SendMut(o.as_mut_ptr())).collect();
+        let (views, ptrs) = (&views, &ptrs);
+        let run = |start: usize, end: usize| {
+            let (mut gsc, mut usc) = (vec![0f32; gpr], vec![0f32; gpr]);
+            for flat in start..end {
+                let (e, r) = (flat / inter, flat % inter);
+                let gv_view = &views[e * 2];
+                let uv_view = &views[e * 2 + 1];
+                gv_view.scales_into(r, gpr, &mut gsc);
+                uv_view.scales_into(r, gpr, &mut usc);
+                let mut gv = dot_q4tp_row_i8(gv_view.nib, r, gpr, &act.xq, &gsc) * act.sx;
+                let mut uv = dot_q4tp_row_i8(uv_view.nib, r, gpr, &act.xq, &usc) * act.sx;
+                for &(j, xv) in &act.outliers {
+                    let (w, s) = q4tp_outlier(gv_view.nib, r, gpr, j, &gsc);
+                    gv += w * s * xv;
+                    let (w, s) = q4tp_outlier(uv_view.nib, r, gpr, j, &usc);
+                    uv += w * s * xv;
+                }
+                let silu_g = gv / (1.0 + (-gv).exp());
+                // SAFETY: one worker owns each (expert, row) pair.
+                unsafe { *ptrs[e].at(r) = silu_g * uv };
+            }
+        };
+        dispatch_rows(pool, pairs.len() * inter, &run);
+        true
+    }
+
+    /// Every routed expert's down projection, weighted and summed into
+    /// `out`, under ONE pool dispatch.
+    ///
+    /// Partitioned by OUTPUT row rather than by expert: each row is owned
+    /// by a single worker, so the experts are summed in the caller's order
+    /// — the same sequence of f32 adds the serial `out[i] += w·eo[i]` loop
+    /// performs, hence bit-identical. Partitioning by expert instead would
+    /// race on the shared accumulator.
+    pub fn moe_down_many(
+        downs: &[&QTensor],
+        gs: &[Vec<f32>],
+        weights: &[f32],
+        out: &mut [f32],
+        pool: Option<&Pool>,
+    ) -> bool {
+        if downs.is_empty()
+            || downs.len() != gs.len()
+            || downs.len() != weights.len()
+            || !a8w8_enabled()
+        {
+            return false;
+        }
+        let rows = out.len();
+        let cols = downs[0].cols();
+        if cols % GROUP_SIZE != 0 {
+            return false;
+        }
+        let gpr = cols / GROUP_SIZE;
+        let mut views = Vec::with_capacity(downs.len());
+        for (d, g) in downs.iter().zip(gs.iter()) {
+            if !matches!(
+                d,
+                Self::Mapped {
+                    dtype: TensorDtype::Q4TiledP,
+                    ..
+                }
+            ) || d.rows() != rows
+                || d.cols() != cols
+                || g.len() != cols
+            {
+                return false;
+            }
+            views.push(Q4tpView::new(d.quant_bytes(), rows, cols));
+        }
+        // One int8 split per expert — the activation vectors differ.
+        let acts: Vec<SplitAct> = gs.iter().map(|g| split_act(g)).collect();
+        // Partitioned by OUTPUT row, with the experts folded inside: each
+        // row is owned by one worker, so they are summed in the caller's
+        // order — the same f32 sequence the serial `out[i] += w·eo[i]`
+        // loop produces. Partitioning by expert instead would either race
+        // on the accumulator or need a scratch plane and a second pass;
+        // measured, that variant was a wash, so this keeps the simpler
+        // shape.
+        let out_addr = SendMut(out.as_mut_ptr());
+        let (views, acts, weights) = (&views, &acts, &weights);
+        let run = |start: usize, end: usize| {
+            let mut sc = vec![0f32; gpr];
+            for r in start..end {
+                let mut acc = 0f32;
+                for (e, v) in views.iter().enumerate() {
+                    v.scales_into(r, gpr, &mut sc);
+                    let a = &acts[e];
+                    let mut d = dot_q4tp_row_i8(v.nib, r, gpr, &a.xq, &sc) * a.sx;
+                    for &(j, xv) in &a.outliers {
+                        let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
+                        d += w * s * xv;
+                    }
+                    acc += weights[e] * d;
+                }
+                // SAFETY: disjoint row ranges per worker.
+                unsafe { *out_addr.at(r) = acc };
+            }
+        };
+        dispatch_rows(pool, rows, &run);
+        true
+    }
 }
 
 /// Batched q8 kernel: same math as qmatvec, the row makes a single
@@ -3632,20 +3793,36 @@ impl<'a> Q4tpView<'a> {
     /// the tile's actual work is two `sdot`s, so per-tile decoding dominated
     /// the kernel and cost 5x (measured: 1.4 vs 6.9 tok/s on Nanbeige-3B).
     /// Walking the plane sequentially with a bit accumulator is ~3 ops.
+    /// Eight 5-bit codes are exactly five bytes, so a whole group of
+    /// eight decodes from one little-endian word at fixed shifts. The
+    /// bit-accumulator this replaces carried a data-dependent `while
+    /// have < 5` refill whose branch sat in the innermost loop of every
+    /// q4tp row; a decode profile put this function above the dot
+    /// products it feeds. Same bitstream, same codes — just no branch
+    /// and eight independent extractions.
     #[inline]
     fn scales_into(&self, r: usize, gpr: usize, out: &mut [f32]) {
         let tab = q4tp_ladder(self.params, r);
         let codes = &self.codes[r * self.stride..(r + 1) * self.stride];
-        let (mut acc, mut have, mut bi) = (0u64, 0u32, 0usize);
-        for o in out.iter_mut().take(gpr) {
-            while have < 5 {
-                acc |= (codes[bi] as u64) << have;
-                bi += 1;
-                have += 8;
+        let out = &mut out[..gpr];
+        let mut chunks = out.chunks_exact_mut(8);
+        let mut ci = 0usize;
+        for c in &mut chunks {
+            let w = u64::from(codes[ci])
+                | u64::from(codes[ci + 1]) << 8
+                | u64::from(codes[ci + 2]) << 16
+                | u64::from(codes[ci + 3]) << 24
+                | u64::from(codes[ci + 4]) << 32;
+            for (k, o) in c.iter_mut().enumerate() {
+                *o = tab[((w >> (5 * k)) & 31) as usize];
             }
-            *o = tab[(acc & 31) as usize];
-            acc >>= 5;
-            have -= 5;
+            ci += 5;
+        }
+        // Fewer than eight codes left: the shared total accessor, which
+        // tolerates a 5-bit field whose spill byte is past the stride.
+        let tail = &codes[ci..];
+        for (k, o) in chunks.into_remainder().iter_mut().enumerate() {
+            *o = tab[q4tp_code(tail, k)];
         }
     }
 }
