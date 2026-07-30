@@ -1554,7 +1554,15 @@ impl Pipeline {
                     hiddens[j * hs..(j + 1) * hs].copy_from_slice(&self.embed_single(id));
                 }
                 let positions: Vec<usize> = (pos..end).collect();
+                let t_chunk = std::time::Instant::now();
                 let ok_b = self.try_batch_graph_wgpu(&mut hiddens, &positions, bk);
+                if std::env::var("CMF_GRAPH_PROF").is_ok() {
+                    let ms = t_chunk.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!(
+                        "batch-chunk: k={bk} ok={ok_b} {ms:.1} ms ({:.1} tok/s)",
+                        bk as f64 / (ms / 1000.0)
+                    );
+                }
                 {
                     use std::sync::atomic::{AtomicBool, Ordering};
                     static SAID: AtomicBool = AtomicBool::new(false);
