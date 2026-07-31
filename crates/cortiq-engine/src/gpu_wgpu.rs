@@ -6541,6 +6541,33 @@ pub fn forward_token_graph(
                 go(&mut enc, &c.add_rmsnorm, &nbg, 1);
             }
         }
+        // …and the layer's TAIL (FFN residual + the next layer's input norm)
+        // rides out on the same pass. It reads `ob`, which that pass's last
+        // dispatch writes — the same within-pass ordering the block above
+        // relies on. With both ends folded in, a layer is TWO passes
+        // (token-mix, then FFN) instead of four.
+        let simple_tail = passfuse && !loop_norm_at.contains(&li);
+        let mut ffn_post: Option<(&wgpu::ComputePipeline, wgpu::BindGroup, u32)> = None;
+        let mut tail_done = false;
+        if simple_tail {
+            ffn_post = Some(if li + 1 < layers.len() {
+                let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
+                (
+                    &c.add_rmsnorm,
+                    bg(
+                        &c.layout_add_rmsnorm,
+                        &[&h_buf, &ob, &inw_next, &n1, &rms_u],
+                    ),
+                    1,
+                )
+            } else {
+                (
+                    &c.axpy,
+                    bg(&c.layout_axpy, &[&ob, &h_buf, &ax_u]),
+                    (hidden as u32).div_ceil(256),
+                )
+            });
+        }
         // SiLU FFN: gate+up matvecs + silu fused in ONE compute pass
         // (dispatches within a pass are serialized — silu safely reads gate/up output).
         match &lw.ffn {
@@ -6567,6 +6594,8 @@ pub fn forward_token_graph(
                     pass.set_pipeline(&c.silu);
                     pass.set_bind_group(0, &bg_silu, &[]);
                     pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
+                    // NOTE: the dense arm still emits `down` outside this pass
+                    // (see emat below), so the tail cannot ride here.
                 } else {
                     group_mats(
                         &mut enc,
@@ -6722,6 +6751,12 @@ pub fn forward_token_graph(
                         pass.set_pipeline(p_dn);
                         pass.set_bind_group(0, &bg_dn, &[]);
                         pass.dispatch_workgroups(hidden as u32, 1, 1);
+                        if let Some((p, b, w)) = &ffn_post {
+                            pass.set_pipeline(p);
+                            pass.set_bind_group(0, b, &[]);
+                            pass.dispatch_workgroups(*w, 1, 1);
+                            tail_done = true;
+                        }
                     }
                 } else {
                     // Un-preppable router dtype: per-op passes (correct, rare).
@@ -6749,7 +6784,9 @@ pub fn forward_token_graph(
         // FFN-residual + next layer's attn-norm fused (plain residual on the last).
         // At loop boundaries (Looped Transformer), insert final_norm between the
         // residual and the next iteration's input norm.
-        if li + 1 < layers.len() {
+        if tail_done {
+            // already emitted at the end of the FFN pass
+        } else if li + 1 < layers.len() {
             if loop_norm_at.contains(&li) {
                 // h += ob; n1 = rms(h, final_norm); copy n1→h; n1 = rms(h, next_input_norm)
                 let fnw = stor(bytemuck::cast_slice(final_norm));
