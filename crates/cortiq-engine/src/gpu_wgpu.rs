@@ -1665,51 +1665,23 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
         let row = base + sub;
         var acc = 0.0;
         if (row < rows) {
-            let crow = codes_b + row * cstride;
-            let wrow = row * gpr;
-            // Two groups per iteration: both weight vec4s and code bytes are
-            // in flight before either dot chain consumes them. Group order
-            // per lane (l, l+64, l+128, ...) and the add order are unchanged.
             var g = l;
             loop {
                 if (g >= gpr) { break; }
-                let bit_a = g * 5u;
-                let cb_a = crow + (bit_a >> 3u);
-                let sh_a = bit_a & 7u;
-                var cv_a = q4tp_byte(cb_a);
-                if (sh_a > 3u) { cv_a = cv_a | (q4tp_byte(cb_a + 1u) << 8u); }
-                let v_a = q4v_w[wrow + g];
-                let xa = g * 8u;
-                let gb = g + 64u;
-                if (gb < gpr) {
-                    let bit_b = gb * 5u;
-                    let cb_b = crow + (bit_b >> 3u);
-                    let sh_b = bit_b & 7u;
-                    var cv_b = q4tp_byte(cb_b);
-                    if (sh_b > 3u) { cv_b = cv_b | (q4tp_byte(cb_b + 1u) << 8u); }
-                    let v_b = q4v_w[wrow + gb];
-                    let xb = gb * 8u;
-                    let sa = lad_q4v[(sub << 5u) + ((cv_a >> sh_a) & 31u)];
-                    let sb = lad_q4v[(sub << 5u) + ((cv_b >> sh_b) & 31u)];
-                    acc = acc + sa
-                        * (q4v_dot8(v_a.x, q4v_x[xa], q4v_x[xa + 1u])
-                         + q4v_dot8(v_a.y, q4v_x[xa + 2u], q4v_x[xa + 3u])
-                         + q4v_dot8(v_a.z, q4v_x[xa + 4u], q4v_x[xa + 5u])
-                         + q4v_dot8(v_a.w, q4v_x[xa + 6u], q4v_x[xa + 7u]));
-                    acc = acc + sb
-                        * (q4v_dot8(v_b.x, q4v_x[xb], q4v_x[xb + 1u])
-                         + q4v_dot8(v_b.y, q4v_x[xb + 2u], q4v_x[xb + 3u])
-                         + q4v_dot8(v_b.z, q4v_x[xb + 4u], q4v_x[xb + 5u])
-                         + q4v_dot8(v_b.w, q4v_x[xb + 6u], q4v_x[xb + 7u]));
-                } else {
-                    let sa = lad_q4v[(sub << 5u) + ((cv_a >> sh_a) & 31u)];
-                    acc = acc + sa
-                        * (q4v_dot8(v_a.x, q4v_x[xa], q4v_x[xa + 1u])
-                         + q4v_dot8(v_a.y, q4v_x[xa + 2u], q4v_x[xa + 3u])
-                         + q4v_dot8(v_a.z, q4v_x[xa + 4u], q4v_x[xa + 5u])
-                         + q4v_dot8(v_a.w, q4v_x[xa + 6u], q4v_x[xa + 7u]));
-                }
-                g = g + 128u;
+                let bit = g * 5u;
+                let cb = codes_b + row * cstride + (bit >> 3u);
+                let sh = bit & 7u;
+                var cv = q4tp_byte(cb);
+                if (sh > 3u) { cv = cv | (q4tp_byte(cb + 1u) << 8u); }
+                let scale = lad_q4v[(sub << 5u) + ((cv >> sh) & 31u)];
+                let v = q4v_w[row * gpr + g];
+                let xq = g * 8u;
+                acc = acc + scale
+                    * (q4v_dot8(v.x, q4v_x[xq], q4v_x[xq + 1u])
+                     + q4v_dot8(v.y, q4v_x[xq + 2u], q4v_x[xq + 3u])
+                     + q4v_dot8(v.z, q4v_x[xq + 4u], q4v_x[xq + 5u])
+                     + q4v_dot8(v.w, q4v_x[xq + 6u], q4v_x[xq + 7u]));
+                g = g + 64u;
             }
         }
         partial_q4v[lid] = acc;
