@@ -7351,7 +7351,10 @@ pub fn forward_token_graph(
     // ── Multi-step prerequisites: the lm_head fold and a q4tp embedding,
     // both resolved up front. Anything missing refuses the WHOLE call so
     // the pipeline can fall back to single-step.
-    let multi = steps > 1;
+    // "multi" really means: the DEVICE picks the token(s) and the CPU
+    // reads ids, not logits. k=1 rides it too — a 4-byte readback against
+    // a megabyte of logits.
+    let multi = ids_out.is_some();
     let lm_pre = lm_head.and_then(|(gw, rows)| resolve(gw, rows, hidden).map(|m| (m, rows)));
     let emb_pre = embed.and_then(|(gw, rows, mult)| {
         resolve(gw, rows, hidden).map(|m| (m, rows, mult))

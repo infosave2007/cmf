@@ -1794,7 +1794,7 @@ impl Pipeline {
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(8);
                     if pure_greedy
-                        && burst_k > 1
+                        && burst_k >= 1
                         && fuse_lm
                         && task_mask.is_none()
                         && router.is_none()
@@ -1808,7 +1808,7 @@ impl Pipeline {
                                 break;
                             }
                             let k = burst_k.min(room - 1);
-                            if k < 2 {
+                            if k < 1 {
                                 break;
                             }
                             let Some(ids) = self.try_multi_burst(t_fwd, next_pos, k) else {
