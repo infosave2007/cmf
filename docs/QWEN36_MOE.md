@@ -10,9 +10,12 @@ Verified end-to-end on:
 | | hardware | decode (steady) | prompt ingest |
 |---|---|---|---|
 | Vulkan | RTX 5090 32 GB | **64.5 tok/s** | — |
-| Vulkan | RTX PRO 6000 Blackwell 96 GB | 56.9 tok/s | **99 tok/s** batched |
+| Vulkan | RTX PRO 6000 Blackwell 96 GB | **67.8 tok/s** | **99 tok/s** batched |
 | CPU | 48-core (same box) | 19.2 tok/s | 33 tok/s |
 | CPU | Apple M4, 24 GB | 18.2 tok/s (`CMF_THREADS=8`) | — |
+
+The RTX 5090 row predates 0.5.42's final q4tp matvec (vec4 loads +
+register-blocked row pairs, +19% on the RTX PRO 6000) — expect higher.
 
 Output is token-for-token identical to the CPU path at short context on
 every step above. On long prompts (hundreds of positions) greedy decoding
@@ -112,3 +115,23 @@ the graph logs `ACTIVE`/`declined` with a reason (`RUST_LOG=info`), the
 MoE block names the check that sent experts to the CPU, and the VRAM
 budget prints the numbers it compared. If you see 15 tok/s on a big
 card, the log will contain the reason on its first token.
+
+## 7. The dense sibling: Qwen3.6-27B
+
+[infosave/Qwen3.6-27Bcmf](https://huggingface.co/infosave/Qwen3.6-27Bcmf) —
+one 14.3 GB q4tp file, MTP head kept, same flags. Dense hybrid: 64 layers
+(16 full attention + 48 GDN linear), hidden 5120, FFN 17408.
+
+| | hardware | decode | prompt ingest |
+|---|---|---|---|
+| Vulkan | RTX PRO 6000 Blackwell | **32.3 tok/s** | ~10 tok/s |
+| CPU | 48-core (~55 GB/s RAM) | 2.1 tok/s | 10.4 tok/s |
+
+Two dense-specific notes. CPU decode reads all 14.3 GB per token —
+memory-bandwidth bound, budget `RAM GB/s / 14.3` tok/s. And `CMF_BATCH_K`
+buys nothing here yet: dense prefill is limited by the batched GEMM kernel
+(a known follow-up), not by dispatch structure, so batched and per-position
+ingest run at the same speed.
+
+`CMF_GPU_VRAM_MB=20000` fits the weights with room for KV; scale up on
+bigger cards.
