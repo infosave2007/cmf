@@ -456,6 +456,126 @@ pub fn expert_swiglu(
     w2(&gate, out);
 }
 
+/// Everything one layer needs that is not a plain matrix: the shapes and
+/// scalars the reference reads out of `ModelArgs`.
+#[derive(Debug, Clone, Copy)]
+pub struct Dsv4Cfg {
+    pub dim: usize,
+    pub n_heads: usize,
+    pub head_dim: usize,
+    pub rope_head_dim: usize,
+    pub q_lora_rank: usize,
+    pub o_lora_rank: usize,
+    pub o_groups: usize,
+    pub hc_mult: usize,
+    pub hc_sinkhorn_iters: usize,
+    pub hc_eps: f32,
+    pub norm_eps: f32,
+    pub n_routed_experts: usize,
+    pub top_k: usize,
+    pub moe_inter: usize,
+    pub route_scale: f32,
+    pub index_topk: usize,
+    pub vocab: usize,
+}
+
+/// The per-block hyper-connection cycle, which is the same shape around
+/// attention and around the FFN: fold the copies, normalize, run the
+/// block, expand back. `block` sees a plain `dim`-vector and knows nothing
+/// about the copies — that separation is what keeps attention and the MoE
+/// free of hyper-connection bookkeeping.
+///
+/// `hc_fn` is `[mix_hc, hc*dim]`, `hc_base` is `[mix_hc]`, `hc_scale` is 3.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_block<F: FnMut(&[f32], &mut [f32])>(
+    state: &mut [f32],
+    hc_fn: &[f32],
+    hc_scale: &[f32; 3],
+    hc_base: &[f32],
+    norm_w: &[f32],
+    cfg: &Dsv4Cfg,
+    scratch: &mut HcScratch,
+    mut block: F,
+) {
+    let (hc, dim) = (cfg.hc_mult, cfg.dim);
+    let mix_hc = (2 + hc) * hc;
+    hc_mixes(state, hc_fn, mix_hc, cfg.norm_eps, &mut scratch.mixes);
+    hc_split_sinkhorn(
+        &scratch.mixes,
+        hc_scale,
+        hc_base,
+        hc,
+        cfg.hc_sinkhorn_iters,
+        cfg.hc_eps,
+        &mut scratch.pre,
+        &mut scratch.post,
+        &mut scratch.comb,
+    );
+    hc_fold(state, &scratch.pre, hc, dim, &mut scratch.folded);
+    // RMSNorm with the layer's learned weight, on the folded vector.
+    let ms = scratch.folded.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+    let inv = 1.0 / (ms + cfg.norm_eps).sqrt();
+    for (v, w) in scratch.folded.iter_mut().zip(norm_w) {
+        *v = *v * inv * w;
+    }
+    block(&scratch.folded, &mut scratch.block_out);
+    scratch.residual.copy_from_slice(state);
+    hc_expand(
+        &scratch.block_out,
+        &scratch.residual,
+        &scratch.post,
+        &scratch.comb,
+        hc,
+        dim,
+        state,
+    );
+}
+
+/// Reusable buffers for `hc_block` — one allocation per pipeline, not per
+/// layer per token.
+pub struct HcScratch {
+    pub mixes: Vec<f32>,
+    pub pre: Vec<f32>,
+    pub post: Vec<f32>,
+    pub comb: Vec<f32>,
+    pub folded: Vec<f32>,
+    pub block_out: Vec<f32>,
+    pub residual: Vec<f32>,
+}
+
+impl HcScratch {
+    pub fn new(cfg: &Dsv4Cfg) -> Self {
+        let (hc, dim) = (cfg.hc_mult, cfg.dim);
+        Self {
+            mixes: vec![0.0; (2 + hc) * hc],
+            pre: vec![0.0; hc],
+            post: vec![0.0; hc],
+            comb: vec![0.0; hc * hc],
+            folded: vec![0.0; dim],
+            block_out: vec![0.0; dim],
+            residual: vec![0.0; hc * dim],
+        }
+    }
+}
+
+/// The final fold, after the last layer: `hc` copies to one vector, with a
+/// plain sigmoid gate (no Sinkhorn), then the model's output norm.
+pub fn hc_head_fold(
+    state: &[f32],
+    hc_fn: &[f32],
+    hc_scale: f32,
+    hc_base: &[f32],
+    cfg: &Dsv4Cfg,
+    out: &mut [f32],
+) {
+    let (hc, dim) = (cfg.hc_mult, cfg.dim);
+    let mut mixes = vec![0.0f32; hc];
+    hc_mixes(state, hc_fn, hc, cfg.norm_eps, &mut mixes);
+    let mut pre = vec![0.0f32; hc];
+    hc_head_pre(&mixes, hc_scale, hc_base, hc, cfg.hc_eps, &mut pre);
+    hc_fold(state, &pre, hc, dim, out);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,6 +755,58 @@ mod tests {
         let mut idx = Vec::new();
         top_k_positions(&sc, 2, &mut idx);
         assert_eq!(idx, vec![0, 1], "ties resolve to the lower index");
+    }
+
+    /// The block cycle must leave the state's SHAPE intact (hc copies in,
+    /// hc copies out) and must actually route the block's output back in:
+    /// a block that writes a constant has to move every copy.
+    #[test]
+    fn hc_block_preserves_the_copy_structure_and_applies_the_block() {
+        let cfg = Dsv4Cfg {
+            dim: 4,
+            n_heads: 1,
+            head_dim: 4,
+            rope_head_dim: 2,
+            q_lora_rank: 4,
+            o_lora_rank: 2,
+            o_groups: 1,
+            hc_mult: 4,
+            hc_sinkhorn_iters: 20,
+            hc_eps: 1e-6,
+            norm_eps: 1e-6,
+            n_routed_experts: 2,
+            top_k: 1,
+            moe_inter: 4,
+            route_scale: 1.0,
+            index_topk: 4,
+            vocab: 8,
+        };
+        let (hc, dim) = (cfg.hc_mult, cfg.dim);
+        let mix_hc = (2 + hc) * hc;
+        let hc_fn: Vec<f32> = (0..mix_hc * hc * dim)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
+            .collect();
+        let hc_base: Vec<f32> = (0..mix_hc).map(|i| (i as f32 * 0.2).sin()).collect();
+        let norm_w = vec![1.0f32; dim];
+        let mut state: Vec<f32> = (0..hc * dim).map(|i| (i as f32 * 0.3).cos()).collect();
+        let before = state.clone();
+        let mut scratch = HcScratch::new(&cfg);
+        hc_block(
+            &mut state,
+            &hc_fn,
+            &[1.0, 1.0, 1.0],
+            &hc_base,
+            &norm_w,
+            &cfg,
+            &mut scratch,
+            |_folded, out| out.iter_mut().for_each(|o| *o = 1.0),
+        );
+        assert_eq!(state.len(), before.len(), "copy structure must survive");
+        assert!(state.iter().all(|v| v.is_finite()), "{state:?}");
+        assert!(
+            state.iter().zip(&before).any(|(a, b)| (a - b).abs() > 1e-4),
+            "the block's output has to reach the state"
+        );
     }
 
     #[test]
