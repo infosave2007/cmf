@@ -776,6 +776,7 @@ pub fn forward_token_graph(
     // Per-layer sealed o1 (Nystrom) state; Some = replace this layer's
     // exact attention with the O(1) kernels. wgpu only.
     o1: &[Option<Vec<crate::nystrom::O1DeviceView<'_>>>],
+    o1_epoch: u64,
     invf: &[f32],
     h: &mut [f32],
     nh: usize,
@@ -800,6 +801,7 @@ pub fn forward_token_graph(
             kv_id,
             layers,
             o1,
+            o1_epoch,
             invf,
             h,
             nh,

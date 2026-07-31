@@ -2670,6 +2670,257 @@ fn moe_down_q4tp_b(@builtin(workgroup_id) wid: vec3<u32>,
     if (lid == 0u) { db_y[t * rows + row] = db_pt[0]; }
 }
 
+
+// ── O(1) Nystrom attention on the graph (spec: nystrom.rs step/far_insert).
+// State lives on the device after one upload per seal epoch: ring window,
+// sinks, landmarks, and each head's flash-scaled far skeleton. Per o1
+// layer per token: THREE dispatches replacing kv_append+attend, and the
+// work is O(m + w) instead of O(ctx) — the graph's exact attend was
+// 54 -> 37.8 tok/s from 4K to 16K while o1 holds flat by construction.
+struct O1P { hpg: u32, m: u32, w: u32, nsrect: u32, d: u32, dv: u32, scale: f32, _p: u32 };
+
+@group(0) @binding(0) var<storage, read_write> of_meta : array<u32>;
+@group(0) @binding(1) var<storage, read>       of_rk   : array<f32>;
+@group(0) @binding(2) var<storage, read>       of_rv   : array<f32>;
+@group(0) @binding(3) var<storage, read>       of_qt   : array<f32>;
+@group(0) @binding(4) var<storage, read_write> of_mz   : array<f32>;
+@group(0) @binding(5) var<storage, read_write> of_th   : array<f32>;
+@group(0) @binding(6) var<uniform>             of_p    : O1P;
+var<workgroup> of_part: array<f32, 64>;
+var<workgroup> of_rs: f32;
+var<workgroup> of_e: f32;
+
+// One workgroup per (group, head, landmark): absorb the evicted window
+// slot into this head's far accumulators (nystrom.rs far_insert).
+@compute @workgroup_size(64)
+fn o1_far(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let hm = of_p.hpg * of_p.m;
+    let g = wid.x / hm;
+    let rr = wid.x % hm;
+    let h = rr / of_p.m;
+    let i = rr % of_p.m;
+    let len = of_meta[g * 4u];
+    if (len < of_p.w) { return; }
+    let slot = of_meta[g * 4u + 1u];
+    let d = of_p.d;
+    let qb = ((g * of_p.hpg + h) * of_p.m + i) * d;
+    let kb = (g * of_p.w + slot) * d;
+    var acc = 0.0;
+    var t = lid;
+    loop {
+        if (t >= d) { break; }
+        acc = acc + of_qt[qb + t] * of_rk[kb + t];
+        t = t + 64u;
+    }
+    of_part[lid] = acc;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { of_part[lid] = of_part[lid] + of_part[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let mzb = (g * of_p.hpg + h) * 2u * of_p.m;
+    if (lid == 0u) {
+        let l = of_part[0] * of_p.scale;
+        var mm = of_mz[mzb + i];
+        var rs = 1.0;
+        if (l > mm) {
+            rs = exp(mm - l);
+            of_mz[mzb + of_p.m + i] = of_mz[mzb + of_p.m + i] * rs;
+            mm = l;
+            of_mz[mzb + i] = l;
+        }
+        let e = exp(l - mm);
+        of_mz[mzb + of_p.m + i] = of_mz[mzb + of_p.m + i] + e;
+        of_rs = rs;
+        of_e = e;
+    }
+    workgroupBarrier();
+    let rs = of_rs;
+    let e = of_e;
+    let thb = ((g * of_p.hpg + h) * of_p.m + i) * of_p.dv;
+    let vb = (g * of_p.w + slot) * of_p.dv;
+    var u = lid;
+    loop {
+        if (u >= of_p.dv) { break; }
+        of_th[thb + u] = of_th[thb + u] * rs + e * of_rv[vb + u];
+        u = u + 64u;
+    }
+}
+
+@group(0) @binding(0) var<storage, read_write> op_meta : array<u32>;
+@group(0) @binding(1) var<storage, read>       op_k    : array<f32>;
+@group(0) @binding(2) var<storage, read>       op_v    : array<f32>;
+@group(0) @binding(3) var<storage, read_write> op_rk   : array<f32>;
+@group(0) @binding(4) var<storage, read_write> op_rv   : array<f32>;
+@group(0) @binding(5) var<uniform>             op_p    : O1P;
+
+// One workgroup per group: push this token's rotated K and V into the
+// window ring (after o1_far has read the slot being overwritten).
+@compute @workgroup_size(256)
+fn o1_push(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let g = wid.x;
+    let len = op_meta[g * 4u];
+    let head = op_meta[g * 4u + 1u];
+    var slot = len;
+    if (len == op_p.w) { slot = head; }
+    let d = op_p.d;
+    var t = lid;
+    loop {
+        if (t >= d) { break; }
+        op_rk[(g * op_p.w + slot) * d + t] = op_k[g * d + t];
+        t = t + 256u;
+    }
+    t = lid;
+    loop {
+        if (t >= op_p.dv) { break; }
+        op_rv[(g * op_p.w + slot) * op_p.dv + t] = op_v[g * op_p.dv + t];
+        t = t + 256u;
+    }
+    workgroupBarrier();
+    if (lid == 0u) {
+        if (len == op_p.w) {
+            op_meta[g * 4u + 1u] = (head + 1u) % op_p.w;
+            op_meta[g * 4u + 2u] = op_meta[g * 4u + 2u] + 1u;
+        } else {
+            op_meta[g * 4u] = len + 1u;
+        }
+    }
+}
+
+@group(0) @binding(0)  var<storage, read>       oa_meta : array<u32>;
+@group(0) @binding(1)  var<storage, read>       oa_q    : array<f32>;
+@group(0) @binding(2)  var<storage, read>       oa_rk   : array<f32>;
+@group(0) @binding(3)  var<storage, read>       oa_rv   : array<f32>;
+@group(0) @binding(4)  var<storage, read>       oa_sk   : array<f32>;
+@group(0) @binding(5)  var<storage, read>       oa_sv   : array<f32>;
+@group(0) @binding(6)  var<storage, read>       oa_kt   : array<f32>;
+@group(0) @binding(7)  var<storage, read>       oa_mu   : array<f32>;
+@group(0) @binding(8)  var<storage, read>       oa_mz   : array<f32>;
+@group(0) @binding(9)  var<storage, read>       oa_th   : array<f32>;
+@group(0) @binding(10) var<storage, read_write> oa_out  : array<f32>;
+@group(0) @binding(11) var<uniform>             oa_p    : O1P;
+var<workgroup> oa_qs:  array<f32, 256>;
+var<workgroup> oa_scr: array<f32, 160>;
+var<workgroup> oa_f:   array<f32, 32>;
+var<workgroup> oa_u:   array<f32, 32>;
+var<workgroup> oa_red: array<f32, 256>;
+var<workgroup> oa_sc:  array<f32, 4>; // [c_all, far_den, den, have_far]
+
+// One workgroup per (group, head): the whole Nystrom step output.
+// Per-score dots run one THREAD per key/landmark (serial over d) — no
+// barriers in the hot part, and the same product order as the CPU's
+// scalar loop.
+@compute @workgroup_size(256)
+fn o1_attend(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let g = wid.x / oa_p.hpg;
+    let h = wid.x % oa_p.hpg;
+    let d = oa_p.d;
+    let dv = oa_p.dv;
+    let m = oa_p.m;
+    let ns = oa_p.nsrect & 0xFFu;
+    let rect_fm = (oa_p.nsrect >> 8u) != 0u;
+    let len = oa_meta[g * 4u];
+    let farl = oa_meta[g * 4u + 2u];
+    let n = ns + len;
+    let gh = g * oa_p.hpg + h;
+    // q into shared
+    var t = lid;
+    loop {
+        if (t >= d) { break; }
+        oa_qs[t] = oa_q[gh * d + t];
+        t = t + 256u;
+    }
+    workgroupBarrier();
+    // near scores: thread s owns key s
+    if (lid < n) {
+        var acc = 0.0;
+        if (lid < ns) {
+            let kb = (g * ns + lid) * d;
+            for (var j = 0u; j < d; j = j + 1u) { acc = acc + oa_qs[j] * oa_sk[kb + j]; }
+        } else {
+            let kb = (g * oa_p.w + (lid - ns)) * d;
+            for (var j = 0u; j < d; j = j + 1u) { acc = acc + oa_qs[j] * oa_rk[kb + j]; }
+        }
+        oa_scr[lid] = acc * oa_p.scale;
+    }
+    // landmark scores: thread 200+a owns landmark a (disjoint from keys)
+    if (lid >= 200u && lid < 200u + m && farl > 0u) {
+        let a = lid - 200u;
+        var acc = 0.0;
+        let ktb = (g * m + a) * d;
+        for (var j = 0u; j < d; j = j + 1u) {
+            acc = acc + oa_qs[j] * oa_kt[ktb + j];
+        }
+        oa_f[a] = acc * oa_p.scale;
+    }
+    workgroupBarrier();
+    // c = max near score (single thread — n <= 136, trivial)
+    if (lid == 0u) {
+        var c = -3.0e38;
+        for (var sidx = 0u; sidx < n; sidx = sidx + 1u) { c = max(c, oa_scr[sidx]); }
+        var c_all = c;
+        var far_den = 0.0;
+        var have_far = 0.0;
+        if (farl > 0u) {
+            var f = -3.0e38;
+            for (var a = 0u; a < m; a = a + 1u) { f = max(f, oa_f[a]); }
+            for (var a = 0u; a < m; a = a + 1u) { oa_f[a] = exp(oa_f[a] - f); }
+            for (var b = 0u; b < m; b = b + 1u) {
+                var uacc = 0.0;
+                for (var a = 0u; a < m; a = a + 1u) {
+                    uacc = uacc + oa_f[a] * oa_mu[(gh * m + a) * m + b];
+                }
+                if (rect_fm) { uacc = max(uacc, 0.0); }
+                oa_u[b] = uacc;
+            }
+            let mzb = gh * 2u * m;
+            for (var b = 0u; b < m; b = b + 1u) {
+                c_all = max(c_all, f + oa_mz[mzb + b]);
+            }
+            for (var b = 0u; b < m; b = b + 1u) {
+                let gain = oa_u[b] * exp(f + oa_mz[mzb + b] - c_all);
+                oa_u[b] = gain;
+                far_den = far_den + gain * oa_mz[mzb + m + b];
+            }
+            if (far_den >= 0.0) { have_far = 1.0; } else { far_den = 0.0; }
+        }
+        var den = far_den;
+        for (var sidx = 0u; sidx < n; sidx = sidx + 1u) {
+            let pv = exp(oa_scr[sidx] - c_all);
+            oa_scr[sidx] = pv;
+            den = den + pv;
+        }
+        oa_sc[0] = c_all;
+        oa_sc[1] = far_den;
+        oa_sc[2] = max(den, 1e-30);
+        oa_sc[3] = have_far;
+    }
+    workgroupBarrier();
+    let den = oa_sc[2];
+    let have_far = oa_sc[3] > 0.5;
+    t = lid;
+    loop {
+        if (t >= dv) { break; }
+        var acc = 0.0;
+        if (have_far) {
+            for (var b = 0u; b < m; b = b + 1u) {
+                acc = acc + oa_u[b] * oa_th[(gh * m + b) * dv + t];
+            }
+        }
+        for (var sidx = 0u; sidx < ns; sidx = sidx + 1u) {
+            acc = acc + oa_scr[sidx] * oa_sv[(g * ns + sidx) * dv + t];
+        }
+        for (var sidx = ns; sidx < n; sidx = sidx + 1u) {
+            acc = acc + oa_scr[sidx] * oa_rv[(g * oa_p.w + (sidx - ns)) * dv + t];
+        }
+        oa_out[gh * dv + t] = acc / den;
+        t = t + 256u;
+    }
+}
+
 // ── DiT attention (imagegen): scores GEMM -> row softmax -> P·V.
 // Same 64x64 tile / 4x4 named-scalar register block as the quantized
 // GEMMs; the operands are plain f32 here, so the staging is a copy.
@@ -3061,6 +3312,15 @@ struct Ctx {
     f32_matvec: wgpu::ComputePipeline,
     f32_matvec_b: wgpu::ComputePipeline,
     layout_f32b: wgpu::BindGroupLayout,
+    o1_far: wgpu::ComputePipeline,
+    o1_push: wgpu::ComputePipeline,
+    o1_attend: wgpu::ComputePipeline,
+    layout_o1_far: wgpu::BindGroupLayout,
+    layout_o1_push: wgpu::BindGroupLayout,
+    layout_o1_attend: wgpu::BindGroupLayout,
+    /// Device o1 state per (kv_id, layer); re-uploaded when the seal
+    /// epoch changes (each generate seals fresh CPU state).
+    o1m: Mutex<HashMap<(u64, usize), O1Dev>>,
     moe_select: wgpu::ComputePipeline,
     /// Two independent projections of one input in a single dispatch.
     matvec_pair: wgpu::ComputePipeline,
@@ -3462,6 +3722,12 @@ fn init() -> Result<Ctx, String> {
     let f32_matvec = pipe("f32_matvec");
     let f32_matvec_b = pipe("f32_matvec_b");
     let layout_f32b = f32_matvec_b.get_bind_group_layout(0);
+    let o1_far = pipe("o1_far");
+    let o1_push = pipe("o1_push");
+    let o1_attend = pipe("o1_attend");
+    let layout_o1_far = o1_far.get_bind_group_layout(0);
+    let layout_o1_push = o1_push.get_bind_group_layout(0);
+    let layout_o1_attend = o1_attend.get_bind_group_layout(0);
     let matvec_pair = pipe("matvec_pair");
     let layout_mv2 = matvec_pair.get_bind_group_layout(0);
     let moe_select = pipe("moe_select");
@@ -3574,6 +3840,13 @@ fn init() -> Result<Ctx, String> {
         f32_matvec,
         f32_matvec_b,
         layout_f32b,
+        o1_far,
+        o1_push,
+        o1_attend,
+        layout_o1_far,
+        layout_o1_push,
+        layout_o1_attend,
+        o1m: Mutex::new(HashMap::new()),
         matvec_pair,
         layout_mv2,
         moe_select,
@@ -4726,6 +4999,7 @@ pub fn forward_token_graph(
     kv_id: u64,
     layers: &[crate::gpu::GraphLayer],
     o1: &[Option<Vec<crate::nystrom::O1DeviceView<'_>>>],
+    o1_epoch: u64,
     invf: &[f32],
     h: &mut [f32],
     nh: usize,
@@ -4751,11 +5025,6 @@ pub fn forward_token_graph(
         graph_refused("no ctx");
         return false;
     };
-    // Stage 1 of the o1 port: the plumbing exists, the kernels do not yet.
-    if o1.iter().any(|v| v.is_some()) {
-        graph_refused("o1 layers not yet portable (stage 1)");
-        return false;
-    }
     if position >= cap || hd % 4 != 0 || hd > c.hd_cap {
         {
             use std::sync::atomic::{AtomicBool, Ordering};
@@ -5190,6 +5459,14 @@ pub fn forward_token_graph(
         for (li, l) in layers.iter().enumerate() {
             match &l.attn {
                 crate::gpu::GraphAttn::Full { cpu_k, cpu_v, .. } => {
+                    if o1.get(li).is_some_and(|v| v.is_some()) {
+                        // o1 replaces this layer's KV attention outright —
+                        // no mirror, and no prefill K/V upload (16K of it
+                        // at long context) that nothing would read.
+                        kvbufs.push(None);
+                        gdnbufs.push(None);
+                        continue;
+                    }
                     let e = kvm.entry((kv_id, li)).or_insert_with(|| {
                         let sz = (nkv * cap * hd * 4) as u64;
                         let mk = || {
@@ -5565,7 +5842,7 @@ pub fn forward_token_graph(
                     ..
                 },
             ) => {
-                let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
+                let o1_here = o1.get(li).and_then(|v| v.as_ref());
                 let qnw = q_norm
                     .map(|q| stor(bytemuck::cast_slice(q)))
                     .unwrap_or_else(|| zeros(hd));
@@ -5625,6 +5902,86 @@ pub fn forward_token_graph(
                         ((nkv * hd) as u32).div_ceil(256),
                     );
                 }
+                if let Some(views) = o1_here {
+                    // O(1) attention: rope as usual, then the three o1
+                    // kernels replace kv_append + attend. State mirrors on
+                    // the device once per seal epoch; kv mirrors are not
+                    // touched for this layer at all.
+                    if o1_ensure(c, kv_id, li, views, o1_epoch).is_none() {
+                        graph_refused("o1 state not portable");
+                        return false;
+                    }
+                    let (dmeta, drk, drv, dsk, dsv, dkt, dqt, dmu, dmz, dth, gg, hh_, mm, ww, nns, sc) = {
+                        let map = c.o1m.lock().unwrap();
+                        let d = map.get(&(kv_id, li)).unwrap();
+                        (
+                            d.meta.clone(),
+                            d.ring_k.clone(),
+                            d.ring_v.clone(),
+                            d.sink_k.clone(),
+                            d.sink_v.clone(),
+                            d.k_tilde.clone(),
+                            d.qt.clone(),
+                            d.mu.clone(),
+                            d.mz.clone(),
+                            d.that.clone(),
+                            d.g,
+                            d.h,
+                            d.m,
+                            d.w,
+                            d.ns,
+                            d.scale,
+                        )
+                    };
+                    let rect_fm = views.first().and_then(|v| v.heads.first()).is_some_and(|h| h.rect_fm);
+                    let o1_u = uniform_u32x8(
+                        c,
+                        [
+                            hh_ as u32,
+                            mm as u32,
+                            ww as u32,
+                            (nns as u32) | (u32::from(rect_fm) << 8),
+                            hd as u32,
+                            hd as u32,
+                            sc.to_bits(),
+                            0,
+                        ],
+                    );
+                    let bg_rope = bg(
+                        &c.layout_attn_rope,
+                        &[&qraw, &kb, &qout, &gout, &qnw, &knw, &invf_b, &rope_u],
+                    );
+                    let bg_far = bg(
+                        &c.layout_o1_far,
+                        &[&dmeta, &drk, &drv, &dqt, &dmz, &dth, &o1_u],
+                    );
+                    let bg_push =
+                        bg(&c.layout_o1_push, &[&dmeta, &kb, &vb, &drk, &drv, &o1_u]);
+                    let bg_att = bg(
+                        &c.layout_o1_attend,
+                        &[
+                            &dmeta, &qout, &drk, &drv, &dsk, &dsv, &dkt, &dmu, &dmz, &dth,
+                            &attn, &o1_u,
+                        ],
+                    );
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&c.attn_rope);
+                    pass.set_bind_group(0, &bg_rope, &[]);
+                    pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
+                    pass.set_pipeline(&c.o1_far);
+                    pass.set_bind_group(0, &bg_far, &[]);
+                    pass.dispatch_workgroups((gg * hh_ * mm) as u32, 1, 1);
+                    pass.set_pipeline(&c.o1_push);
+                    pass.set_bind_group(0, &bg_push, &[]);
+                    pass.dispatch_workgroups(gg as u32, 1, 1);
+                    pass.set_pipeline(&c.o1_attend);
+                    pass.set_bind_group(0, &bg_att, &[]);
+                    pass.dispatch_workgroups((gg * hh_) as u32, 1, 1);
+                } else {
+                let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
                 // rope + kv_append are independent (both read kb, neither
                 // writes it) — share ONE compute pass to avoid the inter-pass
                 // pipeline flush (~78 μs on NVIDIA Vulkan).
@@ -5712,6 +6069,7 @@ pub fn forward_token_graph(
                     );
                 }
                 // attn_out *= sigmoid(gate) before the O projection.
+                }
                 if *output_gate {
                     let gm_u = uniform_u32x4(c, [(nh * hd) as u32, 0, 0, 0]);
                     go(
@@ -9218,6 +9576,125 @@ fn bgraph_refused(why: &'static str) {
     }
 }
 
+/// Device mirror of one layer's sealed o1 state.
+struct O1Dev {
+    epoch: u64,
+    meta: wgpu::Buffer,
+    ring_k: wgpu::Buffer,
+    ring_v: wgpu::Buffer,
+    sink_k: wgpu::Buffer,
+    sink_v: wgpu::Buffer,
+    k_tilde: wgpu::Buffer,
+    qt: wgpu::Buffer,
+    mu: wgpu::Buffer,
+    mz: wgpu::Buffer,
+    that: wgpu::Buffer,
+    g: usize,
+    h: usize,
+    m: usize,
+    w: usize,
+    ns: usize,
+    scale: f32,
+}
+
+/// Upload (or reuse) a layer's o1 state. One upload per seal epoch: the
+/// window ring and far skeleton then live and MUTATE on the device, and
+/// the CPU copy is stale by design — the same one-way discipline as the
+/// KV mirror.
+fn o1_ensure(
+    c: &Ctx,
+    kv_id: u64,
+    li: usize,
+    views: &[crate::nystrom::O1DeviceView<'_>],
+    epoch: u64,
+) -> Option<()> {
+    {
+        let m = c.o1m.lock().unwrap();
+        if let Some(d) = m.get(&(kv_id, li)) {
+            if d.epoch == epoch {
+                return Some(());
+            }
+        }
+    }
+    let g0 = views.first()?;
+    let (gcnt, hcnt, m, w, ns) = (
+        views.len(),
+        g0.heads.len(),
+        g0.m_eff,
+        g0.w,
+        g0.sink_len,
+    );
+    // Landmark threads park at lane 200+ in the attend kernel.
+    if ns + w > 196 || m > 32 || g0.d > 256 || g0.dv > 256 {
+        return None;
+    }
+    for v in views {
+        if v.m_eff != m || v.w != w || v.sink_len != ns || v.heads.len() != hcnt {
+            return None;
+        }
+    }
+    let (d, dv) = (g0.d, g0.dv);
+    let stor_f = |data: &[f32], label: &str| -> wgpu::Buffer {
+        let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: ((data.len() * 4).max(4)) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
+        b
+    };
+    let mut meta = Vec::with_capacity(gcnt * 4);
+    let (mut rk, mut rv, mut sk, mut sv, mut kt) = (vec![], vec![], vec![], vec![], vec![]);
+    let (mut qt, mut mu, mut mz, mut th) = (vec![], vec![], vec![], vec![]);
+    for v in views {
+        meta.extend_from_slice(&[v.win_len as u32, v.win_head as u32, v.far_len as u32, 0]);
+        // Ring buffers are cap-sized already (cap = w in skeleton mode).
+        rk.extend_from_slice(v.win_k);
+        rk.resize(rk.len() + (w * d - v.win_k.len().min(w * d)), 0.0);
+        rv.extend_from_slice(v.win_v);
+        rv.resize(rv.len() + (w * dv - v.win_v.len().min(w * dv)), 0.0);
+        sk.extend_from_slice(v.sink_k);
+        sv.extend_from_slice(v.sink_v);
+        kt.extend_from_slice(v.k_tilde);
+        for hh in &v.heads {
+            qt.extend_from_slice(hh.q_tilde);
+            mu.extend_from_slice(hh.mu);
+            mz.extend_from_slice(hh.m_max);
+            mz.extend_from_slice(hh.z_hat);
+            th.extend_from_slice(hh.t_hat);
+        }
+    }
+    let meta_b = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("o1-meta"),
+        size: (meta.len() * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    c.queue.write_buffer(&meta_b, 0, bytemuck::cast_slice(&meta));
+    let dev = O1Dev {
+        epoch,
+        meta: meta_b,
+        ring_k: stor_f(&rk, "o1-rk"),
+        ring_v: stor_f(&rv, "o1-rv"),
+        sink_k: stor_f(&sk, "o1-sk"),
+        sink_v: stor_f(&sv, "o1-sv"),
+        k_tilde: stor_f(&kt, "o1-kt"),
+        qt: stor_f(&qt, "o1-qt"),
+        mu: stor_f(&mu, "o1-mu"),
+        mz: stor_f(&mz, "o1-mz"),
+        that: stor_f(&th, "o1-th"),
+        g: gcnt,
+        h: hcnt,
+        m,
+        w,
+        ns,
+        scale: g0.scale,
+    };
+    c.o1m.lock().unwrap().insert((kv_id, li), dev);
+    Some(())
+}
+
 fn encode_q4_tile_mm(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
@@ -10360,6 +10837,182 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(md < 1e-4, "wgpu gqa_attend hd={hd} ≠ CPU: max|Δ| = {md}");
+    }
+
+    #[test]
+    fn wgpu_o1_step_matches_cpu() {
+        // End-to-end: the REAL NystromState is the reference — prefill a
+        // group, clone it, advance the clone one token on the CPU, and
+        // require the device mirror (upload + o1_far/o1_push/o1_attend)
+        // to produce the same attention output from the same state.
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping o1 test");
+            return;
+        };
+        // Production geometry (Qwen3.6): the small-dim version passed while
+        // the real model garbled, so the test runs BOTH.
+        for (d, dv, m, w, sink, hpg, t) in [
+            (8usize, 8usize, 4usize, 8usize, 2usize, 2usize, 40usize),
+            (256, 256, 32, 128, 4, 8, 430),
+        ] {
+        let jit = |a: usize, b: usize| ((a * 37 + b * 13 + 3) % 83) as f32 / 83.0 - 0.5;
+        let ks: Vec<f32> = (0..t * d).map(|i| jit(i, 1)).collect();
+        let vs: Vec<f32> = (0..t * dv).map(|i| jit(i, 2)).collect();
+        let qs_own: Vec<Vec<f32>> = (0..hpg)
+            .map(|h| (0..t * d).map(|i| jit(i, 3 + h)).collect())
+            .collect();
+        let qs_refs: Vec<&[f32]> = qs_own.iter().map(|v| v.as_slice()).collect();
+        let mut st = crate::nystrom::NystromState::new_group(m, w, sink, hpg);
+        st.prefill_group(&qs_refs, &ks, &vs, t, d, dv);
+        // CPU ground truth for the next token (built below per group).
+        // TWO groups — the production model has nkv=2, and the group
+        // concatenation in the upload plus every g-offset in the kernels
+        // is exactly what a single-group test cannot catch.
+        let mut st2 = crate::nystrom::NystromState::new_group(m, w, sink, hpg);
+        let qs2_own: Vec<Vec<f32>> = (0..hpg)
+            .map(|h| (0..t * d).map(|i| jit(i, 23 + h)).collect())
+            .collect();
+        let qs2_refs: Vec<&[f32]> = qs2_own.iter().map(|v| v.as_slice()).collect();
+        let ks2: Vec<f32> = (0..t * d).map(|i| jit(i, 21)).collect();
+        let vs2: Vec<f32> = (0..t * dv).map(|i| jit(i, 22)).collect();
+        st2.prefill_group(&qs2_refs, &ks2, &vs2, t, d, dv);
+        let gcnt = 2usize;
+        let q_new: Vec<f32> = (0..gcnt * hpg * d).map(|i| jit(i, 5)).collect();
+        let k_new: Vec<f32> = (0..gcnt * d).map(|i| jit(i, 6)).collect();
+        let v_new: Vec<f32> = (0..gcnt * dv).map(|i| jit(i, 7)).collect();
+        let mut want = vec![0f32; gcnt * hpg * dv];
+        let mut cpu1 = st.clone();
+        let mut cpu2 = st2.clone();
+        cpu1.step_group(
+            &q_new[..hpg * d],
+            &k_new[..d],
+            &v_new[..dv],
+            &mut want[..hpg * dv],
+        );
+        cpu2.step_group(
+            &q_new[hpg * d..],
+            &k_new[d..],
+            &v_new[dv..],
+            &mut want[hpg * dv..],
+        );
+        // Device: upload the PRE-step states, run the three kernels.
+        let views = vec![st.device_view(), st2.device_view()];
+        assert!(!views[0].exact_only, "t must exceed w+8 for this test");
+        let mv = views[0].m_eff;
+        o1_ensure(c, u64::MAX, usize::MAX, &views, 1).expect("o1 upload");
+        let dev_bufs = {
+            let map = c.o1m.lock().unwrap();
+            let dref = map.get(&(u64::MAX, usize::MAX)).unwrap();
+            (
+                dref.meta.clone(),
+                dref.ring_k.clone(),
+                dref.ring_v.clone(),
+                dref.sink_k.clone(),
+                dref.sink_v.clone(),
+                dref.k_tilde.clone(),
+                dref.qt.clone(),
+                dref.mu.clone(),
+                dref.mz.clone(),
+                dref.that.clone(),
+                dref.scale,
+            )
+        };
+        let (dmeta, drk, drv, dsk, dsv, dkt, dqt, dmu, dmz, dth, sc) = dev_bufs;
+        let rect_fm = views[0].heads[0].rect_fm;
+        let stor = |data: &[f32]| {
+            use wgpu::util::DeviceExt;
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(data),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                })
+        };
+        let qb = stor(&q_new);
+        let kb = stor(&k_new);
+        let vb = stor(&v_new);
+        let ob = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (gcnt * hpg * dv * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let o1_u = uniform_u32x8(
+            c,
+            [
+                hpg as u32,
+                mv as u32,
+                w as u32,
+                (sink as u32) | (u32::from(rect_fm) << 8),
+                d as u32,
+                dv as u32,
+                sc.to_bits(),
+                0,
+            ],
+        );
+        let bgf = |layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| {
+            let entries: Vec<_> = bufs
+                .iter()
+                .enumerate()
+                .map(|(i, b)| bind_buf(i as u32, b))
+                .collect();
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout,
+                entries: &entries,
+            })
+        };
+        let bg_far = bgf(&c.layout_o1_far, &[&dmeta, &drk, &drv, &dqt, &dmz, &dth, &o1_u]);
+        let bg_push = bgf(&c.layout_o1_push, &[&dmeta, &kb, &vb, &drk, &drv, &o1_u]);
+        let bg_att = bgf(
+            &c.layout_o1_attend,
+            &[
+                &dmeta, &qb, &drk, &drv, &dsk, &dsv, &dkt, &dmu, &dmz, &dth, &ob, &o1_u,
+            ],
+        );
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&c.o1_far);
+            pass.set_bind_group(0, &bg_far, &[]);
+            pass.dispatch_workgroups((gcnt * hpg * mv) as u32, 1, 1);
+            pass.set_pipeline(&c.o1_push);
+            pass.set_bind_group(0, &bg_push, &[]);
+            pass.dispatch_workgroups(gcnt as u32, 1, 1);
+            pass.set_pipeline(&c.o1_attend);
+            pass.set_bind_group(0, &bg_att, &[]);
+            pass.dispatch_workgroups((gcnt * hpg) as u32, 1, 1);
+        }
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (gcnt * hpg * dv * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        enc.copy_buffer_to_buffer(&ob, 0, &stage, 0, (gcnt * hpg * dv * 4) as u64);
+        c.queue.submit([enc.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        stage.map_async(wgpu::MapMode::Read, .., move |r| tx.send(r).unwrap());
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().unwrap().unwrap();
+        let got: Vec<f32> = bytemuck::cast_slice(&stage.get_mapped_range(..).unwrap()).to_vec();
+        c.o1m.lock().unwrap().remove(&(u64::MAX, usize::MAX));
+        let md = want
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            md < 1e-3,
+            "wgpu o1 step ≠ CPU (d={d} m={m} w={w} hpg={hpg}): max|Δ| = {md}"
+        );
+        }
     }
 
     #[test]

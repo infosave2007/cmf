@@ -145,6 +145,9 @@ pub struct Pipeline {
     /// O(1) Nyström attention setting (CLI/env/header-hint resolved by
     /// the caller; None = plain cache attention everywhere).
     o1_cfg: Option<crate::nystrom::O1Cfg>,
+    /// Bumped at every o1 seal — the GPU state mirror re-uploads when it
+    /// sees a new epoch (each generate seals fresh CPU state).
+    o1_epoch: u64,
     /// Per-layer o1 flags derived from `o1_cfg` (Full layers only).
     o1_flags: Vec<bool>,
     /// Emit a structured per-token trace (B4 telemetry channel). Off by
@@ -1157,6 +1160,7 @@ impl Pipeline {
             dyn_phi_seen: 0,
             dyn_router: None,
             o1_cfg: None,
+            o1_epoch: 0,
             o1_flags: Vec::new(),
             trace: false,
             calib_temp: 1.0,
@@ -1241,6 +1245,7 @@ impl Pipeline {
     /// Freeze landmarks + skeleton state after the prompt pass and drop
     /// the o1 layers' full KV; decode then runs `step()` per token.
     fn o1_seal(&mut self) {
+        self.o1_epoch = self.o1_epoch.wrapping_add(1);
         if self.o1_cfg.is_none() {
             return;
         }
@@ -1540,6 +1545,7 @@ impl Pipeline {
         if batch_k > 0
             && graph_prefill
             && task_mask.is_none()
+            && !self.o1_active()
             && mtp.is_none()
             && !dyn_prefill
             && pos + 1 < input_ids.len()
@@ -3637,6 +3643,7 @@ impl Pipeline {
             self.graph_kv_id,
             &layers,
             &o1_views,
+            self.o1_epoch,
             &self.inv_freq,
             &mut h,
             nh,
