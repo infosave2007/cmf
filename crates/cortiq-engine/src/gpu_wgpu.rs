@@ -7238,7 +7238,6 @@ pub fn forward_token_graph(
                             bind_buf(0, &m.buf),
                             bind_buf(2, y),
                             bind_buf(3, &p_buf),
-                            bind_buf(4, &m.buf),
                             bind_buf(5, xs),
                         ],
                     });
@@ -7327,11 +7326,14 @@ pub fn forward_token_graph(
                     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
                         layout: &layout,
+                        // NO slot 4: q4t assembles weights from u16 halves
+                        // (18 B tiles are 2-aligned), so the entry point
+                        // never reads the vec4 weight view and its auto
+                        // layout does not carry that binding.
                         entries: &[
                             bind_buf(0, &m.buf),
                             bind_buf(2, y),
                             bind_buf(3, &p_buf),
-                            bind_buf(4, &m.buf),
                             bind_buf(5, xs),
                         ],
                     });
