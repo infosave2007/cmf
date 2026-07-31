@@ -7934,7 +7934,7 @@ pub fn forward_token_graph(
                         if c.gdn_par {
                             pass.set_pipeline(&c.gdn_step_par);
                             pass.set_bind_group(0, &bg_par, &[]);
-                            pass.dispatch_workgroups(*nv as u32, *dv as u32, 1);
+                            pass.dispatch_workgroups(*nv as u32, (*dv as u32).div_ceil(4), 1);
                             tsp!(pass, fine, 12); // step_par
                             pass.set_pipeline(&c.gdn_step_norm);
                             pass.set_bind_group(0, &bg_snorm, &[]);
@@ -7975,7 +7975,7 @@ pub fn forward_token_graph(
                                 });
                             pass.set_pipeline(&c.gdn_step_par);
                             pass.set_bind_group(0, &bg_par, &[]);
-                            pass.dispatch_workgroups(*nv as u32, *dv as u32, 1);
+                            pass.dispatch_workgroups(*nv as u32, (*dv as u32).div_ceil(4), 1);
                             pass.set_pipeline(&c.gdn_step_norm);
                             pass.set_bind_group(0, &bg_snorm, &[]);
                             pass.dispatch_workgroups(*nv as u32, 1, 1);
