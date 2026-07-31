@@ -1466,6 +1466,22 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+    // DeepSeek-V4: the name mapping and both source quantizations (FP8
+    // E4M3 with 128x128 block scales, MXFP4 experts) are in place, but
+    // five of its blocks have no runtime yet — and without them the file
+    // would convert and then decode noise. Say exactly what is missing
+    // here, at the config, rather than after a 167 GB download.
+    if model_type == "deepseek_v4" {
+        anyhow::bail!(
+            "deepseek_v4 is not runnable yet — the converter reads its formats, \
+             the engine has no node for: (1) double-LoRA attention with a 512-wide \
+             compressed KV (wq_a/wq_b, wkv, wo_a/wo_b, attn_sink), (2) the per-layer \
+             KV compressor (attn.compressor.*), (3) the sparse indexer that picks \
+             index_topk positions (attn.indexer.*), (4) hyper-connections with \
+             Sinkhorn iterations (hc_*), (5) hash-routed layers whose expert comes \
+             from a token-id table (ffn.gate.tid2eid). Tracking: docs/OPTIMIZATION_ROADMAP.md"
+        );
+    }
     let hidden = cfg_usize(tc, "hidden_size")
         .ok_or_else(|| anyhow::anyhow!("config: missing hidden_size"))?;
     let n_heads = cfg_usize(tc, "num_attention_heads")
