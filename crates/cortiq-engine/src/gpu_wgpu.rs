@@ -1238,7 +1238,6 @@ struct AtP { nh: u32, hpk: u32, hd: u32, cap: u32, n: u32, _a: u32, _b: u32, _c:
 var<workgroup> at_acc: array<f32, 8224>; // [lane*257 + d], stride 257 dodges 32-bank conflicts, hd ≤ 256 (Qwen3.5=256)
 var<workgroup> at_m: array<f32, 32>;
 var<workgroup> at_l: array<f32, 32>;
-@compute @workgroup_size(32)
 // Decode-regime attend: 256 threads per head instead of one warp. Lanes
 // are POSITIONS for the score pass (dot over hd each) and DIMENSIONS for
 // the value pass (coalesced v reads, one output dim per lane, hd <= 256).
@@ -1323,6 +1322,7 @@ fn gqa_attend_dec(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+@compute @workgroup_size(32)
 fn gqa_attend(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let h = wid.x;
     let lane = lid.x;
