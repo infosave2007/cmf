@@ -7900,24 +7900,6 @@ pub fn forward_token_graph(
                     prep(a, &n1, &a_b, *nv, hidden),
                     prep(b, &n1, &b_b, *nv, hidden),
                 ];
-                // The a/b decay-gate rows are TINY (nv rows each) f32 mats;
-                // as separate dispatches they cost sequencing, not math —
-                // pair them under ONE matvec_pair dispatch inside the pass.
-                let pair_ab = if a.kind == 4 && b.kind == 4 {
-                    let pp = unif(&[
-                        *nv as u32,
-                        hidden as u32,
-                        4,
-                        0,
-                        *nv as u32,
-                        hidden as u32,
-                        4,
-                        0,
-                    ]);
-                    Some(bg(&c.layout_mv2, &[&a.buf, &b.buf, &n1, &a_b, &b_b, &pp]))
-                } else {
-                    None
-                };
                 let outp = prep(out, &gdo_b, &ob, hidden, nv * dv);
                 if projs.iter().all(|p| p.is_some()) && outp.is_some() {
                     let _ = (skip_proj, skip_outp);
@@ -7926,16 +7908,10 @@ pub fn forward_token_graph(
                         timestamp_writes: None,
                     });
                     if !skip_proj {
-                        let solo = if pair_ab.is_some() { 2 } else { 4 };
-                        for p in projs.iter().take(solo).flatten() {
+                        for p in projs.iter().flatten() {
                             pass.set_pipeline(p.0);
                             pass.set_bind_group(0, &p.1, &[]);
                             pass.dispatch_workgroups(p.2, 1, 1);
-                        }
-                        if let Some(bp) = &pair_ab {
-                            pass.set_pipeline(&c.matvec_pair);
-                            pass.set_bind_group(0, bp, &[]);
-                            pass.dispatch_workgroups((2 * *nv as u32).min(MAX_WG), 1, 1);
                         }
                     }
                     let fine = li == 0;
