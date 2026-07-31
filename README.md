@@ -527,6 +527,9 @@ cortiq fcd model.cmf --corpus corpus.txt --gen-check --gen-gate --out model.fcd.
 
 **Model walkthroughs**: [KAT-Coder 35B MoE](docs/KAT_CODER.md) · [Qwen3.6-35B-A3B (q4tp, MTP head, o1 on GPU)](docs/QWEN36_MOE.md)
 
+**GPU performance**: [kernel recipes and the measured failures](docs/GPU_KERNEL_RECIPES.md) ·
+[where the next speed is](docs/OPTIMIZATION_ROADMAP.md)
+
 ## The format
 
 A `.cmf` is a fixed 128-byte envelope followed by sections that a reader addresses
