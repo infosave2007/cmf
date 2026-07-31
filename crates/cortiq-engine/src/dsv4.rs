@@ -576,6 +576,108 @@ pub fn hc_head_fold(
     hc_fold(state, &pre, hc, dim, out);
 }
 
+/// One layer's weights. Everything quantized rides as `QTensor` so the
+/// existing kernels (and the mmap) serve them; the small fp32 pieces —
+/// norms, the hyper-connection projections, the sink, the compressor's
+/// position bias — are plain vectors, exactly as the reference keeps them
+/// in fp32 regardless of the checkpoint's storage dtype.
+pub struct Dsv4Layer {
+    pub attn_norm: Vec<f32>,
+    pub ffn_norm: Vec<f32>,
+    // attention: the double LoRA, the compressed KV, the grouped output
+    pub wq_a: crate::qtensor::QTensor,
+    pub q_norm: Vec<f32>,
+    pub wq_b: crate::qtensor::QTensor,
+    pub wkv: crate::qtensor::QTensor,
+    pub kv_norm: Vec<f32>,
+    pub wo_a: crate::qtensor::QTensor,
+    pub wo_b: crate::qtensor::QTensor,
+    pub attn_sink: Vec<f32>,
+    /// `None` on the pure sliding-window layers (`compress_ratio == 0`).
+    pub compressor: Option<Dsv4Compressor>,
+    /// Only on the layers whose ratio is 4.
+    pub indexer: Option<Dsv4Indexer>,
+    // hyper-connections, one set for the attention half and one for the FFN
+    pub hc_attn_fn: Vec<f32>,
+    pub hc_attn_base: Vec<f32>,
+    pub hc_attn_scale: [f32; 3],
+    pub hc_ffn_fn: Vec<f32>,
+    pub hc_ffn_base: Vec<f32>,
+    pub hc_ffn_scale: [f32; 3],
+    // MoE
+    pub gate: crate::qtensor::QTensor,
+    /// noaux_tc selection bias — `None` on the hash layers.
+    pub gate_bias: Option<Vec<f32>>,
+    /// Token-id → expert table on the hash layers, `None` elsewhere.
+    pub tid2eid: Option<Vec<f32>>,
+    pub experts: Vec<Dsv4Expert>,
+    pub shared: Dsv4Expert,
+}
+
+pub struct Dsv4Expert {
+    pub w1: crate::qtensor::QTensor,
+    pub w2: crate::qtensor::QTensor,
+    pub w3: crate::qtensor::QTensor,
+}
+
+pub struct Dsv4Compressor {
+    pub wkv: crate::qtensor::QTensor,
+    pub wgate: crate::qtensor::QTensor,
+    pub norm: Vec<f32>,
+    /// `[ratio, coff*head_dim]` — the in-window position bias.
+    pub ape: Vec<f32>,
+    pub ratio: usize,
+    /// Overlapping windows (the reference sets this when ratio == 4), which
+    /// doubles the projection width.
+    pub overlap: bool,
+}
+
+pub struct Dsv4Indexer {
+    pub wq_b: crate::qtensor::QTensor,
+    pub weights_proj: crate::qtensor::QTensor,
+    pub compressor: Dsv4Compressor,
+}
+
+/// Model-global pieces: the embedding, the output head and the final
+/// hyper-connection fold.
+pub struct Dsv4Globals {
+    pub embed: crate::qtensor::QTensor,
+    pub norm: Vec<f32>,
+    pub head: crate::qtensor::QTensor,
+    pub hc_head_fn: Vec<f32>,
+    pub hc_head_base: Vec<f32>,
+    pub hc_head_scale: f32,
+}
+
+/// Per-sequence state. The compressor and the indexer each keep their own
+/// compressed cache and a partial window, so decode picks up mid-window
+/// exactly where prefill left off.
+pub struct Dsv4State {
+    /// Sliding-window KV per layer, `[window, head_dim]` ring.
+    pub window: Vec<Vec<f32>>,
+    /// Compressed KV per layer, appended once per `ratio` tokens.
+    pub compressed: Vec<Vec<f32>>,
+    /// The indexer's own compressed cache per layer.
+    pub index_kv: Vec<Vec<f32>>,
+    /// Partial window being accumulated, per layer: kv and score streams.
+    pub pending_kv: Vec<Vec<f32>>,
+    pub pending_score: Vec<Vec<f32>>,
+    pub pos: usize,
+}
+
+impl Dsv4State {
+    pub fn new(layers: usize) -> Self {
+        Self {
+            window: vec![Vec::new(); layers],
+            compressed: vec![Vec::new(); layers],
+            index_kv: vec![Vec::new(); layers],
+            pending_kv: vec![Vec::new(); layers],
+            pending_score: vec![Vec::new(); layers],
+            pos: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
