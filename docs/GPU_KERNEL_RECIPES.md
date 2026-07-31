@@ -154,6 +154,26 @@ small loss from the added branch. Reverted. The lesson matches the wgpu
 side: on this hardware a second pass over the KV is not what the frame is
 made of, and only the profiler gets a vote.
 
+## Metal's actual wall, measured
+
+`CMF_GPU=1 cortiq bench --json` now reports **`metal_submits_per_token`**.
+On an M4 decoding Nanbeige-3B q4t: **58 command-buffer round trips per
+token**, in a 44 ms frame. Command-buffer completion is the only
+system-scope ordering guarantee Metal offers (a "fast flag" variant was
+tried years ago and reverted — it corrupted real decodes), so those 58
+waits ARE the frame: the kernels themselves are already vectorized and
+already run four rows per simdgroup.
+
+So the Metal roadmap is not kernel work — it is the same whole-token
+graph the wgpu backend got, worth ~2x there for exactly this reason:
+encode the layer stack into ONE command buffer, keep every intermediate
+on the device, and wait once per token instead of 58 times. The MoE block
+(four dispatches instead of ~1100 encoder pairs) already proved the shape
+on this backend.
+
+Until then, the honest statement about Metal is: its kernels are fine,
+its submission pattern is not.
+
 ## Cross-format notes
 
 - `q2tp` shares q4tp's params/codes planes byte-for-byte; only the weight

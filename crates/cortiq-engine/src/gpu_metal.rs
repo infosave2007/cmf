@@ -4061,6 +4061,7 @@ pub fn empty_submit_bench(n: usize) -> f64 {
         let cmd = c.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
         enc.end_encoding();
+        METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         cmd.commit();
         wait_fast(cmd);
     }
@@ -4078,6 +4079,7 @@ pub fn pipelined_submit_bench(n: usize) -> f64 {
         let cmd = c.queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
         enc.end_encoding();
+        METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         cmd.commit();
         last = Some(cmd.to_owned());
     }
@@ -4107,6 +4109,11 @@ pub fn q8_resident_or_upload(model: &Arc<CmfModel>, _idx: usize, may_upload: boo
 /// the shared flag word — the driver's status/completion machinery
 /// costs ~1.3 ms per round trip, the UMA flag lands in ~0.1 ms. Status
 /// polling stays as the timeout fallback.
+/// CMF_METAL_SUBMITS=1 counts command-buffer round trips. Each costs
+/// ~1.3 ms of completion latency, so the count IS the frame budget.
+pub static METAL_SUBMITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn submit_and_wait(c: &Ctx, cmd: &metal::CommandBufferRef, outs: &[&Buffer]) {
     // NOTE: a "fast flag" variant (last encoder writes a ticket into a
     // shared buffer, CPU spins on the word) was tried here and REVERTED:
@@ -4118,6 +4125,7 @@ fn submit_and_wait(c: &Ctx, cmd: &metal::CommandBufferRef, outs: &[&Buffer]) {
     // the road to 10+ tok/s is FEWER submissions per token, not faster
     // waits.
     let _ = (c, outs);
+    METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     cmd.commit();
     wait_fast(cmd);
 }
@@ -5312,6 +5320,7 @@ impl ChunkProf {
         if !self.on {
             return cmd;
         }
+        METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         cmd.commit();
         self.log.push((label, cmd));
         c.queue.new_command_buffer().to_owned()
@@ -5975,6 +5984,7 @@ pub fn chunk_run_gpu(
         // keeps ordering, only the last buffer is waited on. Without
         // this the GPU sits idle through the whole chunk's encode.
         if !prof.on {
+            METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             cmd.commit();
             cmd = c.queue.new_command_buffer().to_owned();
         }
@@ -5994,10 +6004,12 @@ pub fn chunk_run_gpu(
         enc.end_encoding();
     }
     if prof.on {
+        METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         cmd.commit();
         cmd.wait_until_completed();
         prof.report();
     } else {
+        METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         cmd.commit();
         cmd.wait_until_completed();
     }
@@ -7600,6 +7612,7 @@ fn moe_block_jobs_q4tp(
         enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
     }
+    METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     cmd.commit();
     cmd.wait_until_completed();
     unsafe {
@@ -8002,6 +8015,7 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], outs: &mut [&mut [
         let refs: Vec<&Buffer> = y_bufs.iter().collect();
         submit_and_wait(c, cmd, &refs);
     } else {
+        METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         cmd.commit();
         wait_fast(cmd);
     }
@@ -8452,6 +8466,7 @@ impl TokenGraph {
     /// every earlier commit.
     pub fn commit(&mut self) {
         if let Some(cmd) = self.cmd.take() {
+            METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             cmd.commit();
             self.in_flight = Some(cmd);
         }
@@ -8460,6 +8475,7 @@ impl TokenGraph {
     /// Submit everything encoded so far and wait for completion.
     pub fn sync(&mut self) {
         if let Some(cmd) = self.cmd.take() {
+            METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             cmd.commit();
             self.in_flight = Some(cmd);
         }

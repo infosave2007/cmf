@@ -2551,6 +2551,23 @@ async fn cmd_run(
     Ok(())
 }
 
+/// Command-buffer round trips per token on Metal — each costs ~1.3 ms of
+/// completion latency, so this number IS that backend's frame budget.
+/// 0 elsewhere.
+fn metal_submits_per_token(tokens: usize) -> f64 {
+    #[cfg(all(target_os = "macos", feature = "gpu"))]
+    {
+        let n = cortiq_engine::gpu_metal::METAL_SUBMITS
+            .load(std::sync::atomic::Ordering::Relaxed);
+        return n as f64 / tokens.max(1) as f64;
+    }
+    #[cfg(not(all(target_os = "macos", feature = "gpu")))]
+    {
+        let _ = tokens;
+        0.0
+    }
+}
+
 async fn cmd_info(model_path: &str) -> anyhow::Result<()> {
     let model = CmfModel::open_sharded(model_path)?;
     let arch = model.arch();
@@ -3283,6 +3300,7 @@ async fn cmd_bench(
             "prompt_tokens": prompt_ids.len(),
             "prefill_tok_s": prompt_ids.len() as f64 / prefill_s.max(1e-9),
             "tokens_generated": result.tokens_generated,
+            "metal_submits_per_token": metal_submits_per_token(result.tokens_generated),
             "decode_tok_s_steady": decode_tps,
             "decode_tok_s_incl_prefill": result.tokens_generated as f64 / total_s.max(1e-9),
             "ttft_s": ttft_s,
