@@ -577,15 +577,22 @@ pub fn matvec_rows2(
 }
 
 #[derive(Clone, Copy)]
-struct SendMut(*mut f32);
+pub(crate) struct SendMut(*mut f32);
 unsafe impl Send for SendMut {}
 unsafe impl Sync for SendMut {}
 
 impl SendMut {
+    /// The caller promises the threads it hands this to write disjoint
+    /// indices, and that the pointee outlives them.
+    #[inline]
+    pub(crate) fn new(p: *mut f32) -> Self {
+        Self(p)
+    }
+
     /// Method receiver forces the closure to capture the whole (Sync)
     /// wrapper, not the bare `*mut f32` field (edition-2021 precise capture).
     #[inline]
-    fn at(self, i: usize) -> *mut f32 {
+    pub(crate) fn at(self, i: usize) -> *mut f32 {
         unsafe { self.0.add(i) }
     }
 }

@@ -328,17 +328,41 @@ pub fn sparse_attend(
 /// straight from quantized tensors.
 pub fn o_project(
     attn: &[f32],
-    wo_a_row: &dyn Fn(usize, &[f32]) -> f32,
+    wo_a_row: &(dyn Fn(usize, &[f32], &mut [f32]) -> f32 + Sync),
+    scratch_len: usize,
     wo_b: &dyn Fn(&[f32], &mut [f32]),
     groups: usize,
     lora: usize,
+    pool: Option<&crate::pool::Pool>,
     out: &mut [f32],
 ) {
     let per_group = attn.len() / groups;
     let mut mid = vec![0.0f32; groups * lora];
-    for (i, m) in mid.iter_mut().enumerate() {
+    let slice_of = |i: usize| {
         let g = i / lora;
-        *m = wo_a_row(i, &attn[g * per_group..(g + 1) * per_group]);
+        &attn[g * per_group..(g + 1) * per_group]
+    };
+    match pool {
+        // Each row of `mid` is one dot product against its group's slice —
+        // independent, so the rows split cleanly. This is the largest
+        // single-threaded cost in the decode otherwise: on the release
+        // checkpoint wo_a is 33M weights, read once per layer per token.
+        Some(p) if mid.len() >= 256 => {
+            let addr = crate::pool::SendMut::new(mid.as_mut_ptr());
+            p.run_rows(mid.len(), &|start, end| {
+                let mut sc = vec![0.0f32; scratch_len];
+                for i in start..end {
+                    let v = wo_a_row(i, slice_of(i), &mut sc);
+                    unsafe { *addr.at(i) = v };
+                }
+            });
+        }
+        _ => {
+            let mut sc = vec![0.0f32; scratch_len];
+            for (i, m) in mid.iter_mut().enumerate() {
+                *m = wo_a_row(i, slice_of(i), &mut sc);
+            }
+        }
     }
     wo_b(&mid, out);
 }
@@ -943,14 +967,14 @@ pub fn attention_step(
     // here instead costs ~270 MB of dequantization per layer per token on
     // the release checkpoint (wo_a and wo_b are 33M weights each), which is
     // the difference between decoding and not.
-    let mut scratch = vec![0.0f32; l.wo_a.cols()];
-    let scratch_cell = std::cell::RefCell::new(&mut scratch);
     o_project(
         &attn,
-        &|r, x| l.wo_a.row_dot(r, x, scratch_cell.borrow_mut().as_mut()),
+        &|r, x, sc| l.wo_a.row_dot(r, x, sc),
+        l.wo_a.cols(),
         &|mid, dst| l.wo_b.matvec(mid, dst, pool),
         cfg.o_groups,
         cfg.o_lora_rank,
+        pool,
         out,
     );
 }
@@ -1472,6 +1496,58 @@ mod tests {
             &mut raw,
         );
         assert!((raw[1] - silu(50.0) * -50.0).abs() < 1e-3, "limit 0 must not clamp");
+    }
+
+    /// The grouped projection writes its intermediate from several threads
+    /// at once. Disjoint indices are the whole argument for that being safe,
+    /// so the pooled result has to equal the serial one exactly — a race
+    /// here would show up as occasional wrong tokens, not as a crash.
+    #[test]
+    fn grouped_projection_is_identical_with_and_without_a_pool() {
+        let (groups, lora, per_group, dim) = (4usize, 128usize, 64usize, 32usize);
+        let attn: Vec<f32> = (0..groups * per_group)
+            .map(|i| ((i * 13) as f32 * 0.021).sin())
+            .collect();
+        let wo_a: Vec<f32> = (0..groups * lora * per_group)
+            .map(|i| ((i * 7) as f32 * 0.011).cos())
+            .collect();
+        let wo_b: Vec<f32> = (0..dim * groups * lora)
+            .map(|i| ((i * 5) as f32 * 0.009).sin())
+            .collect();
+        let row = |r: usize, x: &[f32], _sc: &mut [f32]| -> f32 {
+            wo_a[r * per_group..(r + 1) * per_group]
+                .iter()
+                .zip(x)
+                .map(|(a, b)| a * b)
+                .sum()
+        };
+        let project = |mid: &[f32], dst: &mut [f32]| {
+            for (d, o) in dst.iter_mut().enumerate() {
+                *o = wo_b[d * mid.len()..(d + 1) * mid.len()]
+                    .iter()
+                    .zip(mid)
+                    .map(|(a, b)| a * b)
+                    .sum();
+            }
+        };
+
+        let mut serial = vec![0.0f32; dim];
+        o_project(&attn, &row, per_group, &project, groups, lora, None, &mut serial);
+
+        let pool = crate::pool::Pool::new(4);
+        let mut pooled = vec![0.0f32; dim];
+        o_project(
+            &attn,
+            &row,
+            per_group,
+            &project,
+            groups,
+            lora,
+            Some(&pool),
+            &mut pooled,
+        );
+        assert_eq!(serial, pooled, "the pooled projection diverged");
+        assert!(serial.iter().any(|v| v.abs() > 1e-6), "test data is degenerate");
     }
 
     /// The overlapping compressor folds 2*ratio slots, not ratio: the
