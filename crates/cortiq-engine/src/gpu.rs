@@ -802,6 +802,9 @@ pub fn forward_token_graph(
     final_norm: &[f32],
     logits: &mut Vec<f32>,
     loop_norm_at: &[usize],
+    steps: usize,
+    embed: Option<(&GraphW, usize, f32)>,
+    ids_out: Option<&mut Vec<u32>>,
 ) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
@@ -827,6 +830,9 @@ pub fn forward_token_graph(
             final_norm,
             logits,
             loop_norm_at,
+            steps,
+            embed,
+            ids_out,
         ),
         #[allow(unused_variables)]
         _ => {

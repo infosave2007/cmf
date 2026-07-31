@@ -1727,6 +1727,119 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// ── Multi-step greedy tail: argmax over the logits on the device, then
+// re-embed the winner — k decode steps ride ONE submit and the CPU sees
+// k token ids instead of k megabytes of logits. Ties pick an arbitrary
+// maximal index (same class as the documented GPU float-order ties).
+struct AmP { n: u32, parts: u32, st: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       am_x   : array<f32>;
+@group(0) @binding(1) var<storage, read_write> am_pv  : array<f32>;
+@group(0) @binding(2) var<storage, read_write> am_pi  : array<u32>;
+@group(0) @binding(3) var<uniform>             am_p   : AmP;
+var<workgroup> am_wv: array<f32, 256>;
+var<workgroup> am_wi: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn argmax_part(@builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(local_invocation_index) lid: u32) {
+    var best = -3.0e38;
+    var bi = 0u;
+    var i = wid.x * 256u + lid;
+    let stride = am_p.parts * 256u;
+    loop {
+        if (i >= am_p.n) { break; }
+        let v = am_x[i];
+        if (v > best) { best = v; bi = i; }
+        i = i + stride;
+    }
+    am_wv[lid] = best;
+    am_wi[lid] = bi;
+    workgroupBarrier();
+    var s = 128u;
+    loop {
+        if (s == 0u) { break; }
+        if (lid < s && am_wv[lid + s] > am_wv[lid]) {
+            am_wv[lid] = am_wv[lid + s];
+            am_wi[lid] = am_wi[lid + s];
+        }
+        workgroupBarrier();
+        s = s >> 1u;
+    }
+    if (lid == 0u) {
+        am_pv[wid.x] = am_wv[0];
+        am_pi[wid.x] = am_wi[0];
+    }
+}
+
+@group(0) @binding(0) var<storage, read>       af_pv : array<f32>;
+@group(0) @binding(1) var<storage, read>       af_pi : array<u32>;
+@group(0) @binding(2) var<storage, read_write> af_ids: array<u32>;
+@group(0) @binding(3) var<uniform>             af_p  : AmP;
+var<workgroup> af_wv: array<f32, 256>;
+var<workgroup> af_wi: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn argmax_final(@builtin(local_invocation_index) lid: u32) {
+    var best = -3.0e38;
+    var bi = 0u;
+    var i = lid;
+    loop {
+        if (i >= af_p.parts) { break; }
+        if (af_pv[i] > best) { best = af_pv[i]; bi = af_pi[i]; }
+        i = i + 256u;
+    }
+    af_wv[lid] = best;
+    af_wi[lid] = bi;
+    workgroupBarrier();
+    var s = 128u;
+    loop {
+        if (s == 0u) { break; }
+        if (lid < s && af_wv[lid + s] > af_wv[lid]) {
+            af_wv[lid] = af_wv[lid + s];
+            af_wi[lid] = af_wi[lid + s];
+        }
+        workgroupBarrier();
+        s = s >> 1u;
+    }
+    if (lid == 0u) { af_ids[af_p.st] = af_wi[0]; }
+}
+
+// One thread = one hidden element of the winner's q4tp embedding row.
+// `mult` carries the model's embed multiplier as f32 bits.
+struct EgP { hidden: u32, gpr: u32, rows: u32, st: u32, mult: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read>       eg_w  : array<u32>;
+@group(0) @binding(1) var<storage, read>       eg_ids: array<u32>;
+@group(0) @binding(2) var<storage, read_write> eg_h  : array<f32>;
+@group(0) @binding(3) var<uniform>             eg_p  : EgP;
+
+fn eg_byte(off: u32) -> u32 {
+    return (eg_w[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+@compute @workgroup_size(256)
+fn embed_gather_q4tp(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= eg_p.hidden) { return; }
+    let r = eg_ids[eg_p.st];
+    let gpr = eg_p.gpr;
+    let g = i / 32u;
+    let k = i % 32u;
+    let params_w = eg_p.rows * gpr * 4u;
+    let codes_b = eg_p.rows * gpr * 16u + eg_p.rows * 4u;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let pr = unpack2x16float(eg_w[params_w + r]);
+    let bit = g * 5u;
+    let cb = codes_b + r * cst + (bit >> 3u);
+    let sh = bit & 7u;
+    var cv = eg_byte(cb);
+    if (sh > 3u) { cv = cv | (eg_byte(cb + 1u) << 8u); }
+    let sc = exp2(pr.x + f32((cv >> sh) & 31u) * pr.y);
+    let nb = (r * gpr + g) * 16u + (k >> 1u);
+    let byte = eg_byte(nb);
+    let q = select(byte & 0xFu, (byte >> 4u) & 0xFu, (k & 1u) == 1u);
+    eg_h[i] = (f32(q) - 8.0) * sc * bitcast<f32>(eg_p.mult);
+}
+
 // Fused SiLU(gate)·up → Q4Block down-proj matvec: eliminates the standalone
 // silu dispatch (saves one inter-pass pipeline flush per layer).
 @group(0) @binding(0) var<storage, read>       sd_w : array<u32>;
@@ -3526,6 +3639,9 @@ struct Ctx {
     q4tp_mv4: wgpu::ComputePipeline,
     use_mv4: bool,
     q4tp_mm: wgpu::ComputePipeline,
+    argmax_part: wgpu::ComputePipeline,
+    argmax_final: wgpu::ComputePipeline,
+    embed_gather_q4tp: wgpu::ComputePipeline,
     silu_down: wgpu::ComputePipeline,
     q1t_mm: wgpu::ComputePipeline,
     q4t_mm: wgpu::ComputePipeline,
@@ -3761,6 +3877,17 @@ struct GraphScratch {
     kv_u: Option<wgpu::Buffer>,   // 16 bytes: [nkv, hd, cap, position]
     at_u: Option<wgpu::Buffer>,   // 32 bytes: [nh, nh/nkv, hd, cap, pos+1, 0, 0, 0]
     rope_u: Option<wgpu::Buffer>, // 32 bytes: [nh, nkv, hd, rd, pos, flags, eps, 0]
+    // Multi-step slots: one uniform PER STEP with a stable identity, so the
+    // attention bind groups survive across chunks (write_buffer runs at
+    // submit — a single shared uniform would collapse every step to the
+    // last position written).
+    kv_us: Vec<wgpu::Buffer>,
+    at_us: Vec<wgpu::Buffer>,
+    rope_us: Vec<wgpu::Buffer>,
+    ids: Option<(wgpu::Buffer, u64)>,
+    ids_stage: Option<(wgpu::Buffer, u64)>,
+    am_pv: Option<(wgpu::Buffer, u64)>,
+    am_pi: Option<(wgpu::Buffer, u64)>,
 }
 
 impl GraphScratch {
@@ -3944,6 +4071,9 @@ fn init() -> Result<Ctx, String> {
     let q4tp_mv4 = pipe("q4tp_matvec4");
     let use_mv4 = std::env::var("CMF_MV4").map(|v| v != "0").unwrap_or(true);
     let q4tp_mm = pipe("q4tp_mul_mm");
+    let argmax_part = pipe("argmax_part");
+    let argmax_final = pipe("argmax_final");
+    let embed_gather_q4tp = pipe("embed_gather_q4tp");
     let silu_down = pipe("silu_down_matvec");
     let q1t_mm = pipe("q1t_mul_mm");
     let q4t_mm = pipe("q4t_mul_mm");
@@ -4067,6 +4197,9 @@ fn init() -> Result<Ctx, String> {
         q4tp_mv4,
         use_mv4,
         q4tp_mm,
+        argmax_part,
+        argmax_final,
+        embed_gather_q4tp,
         silu_down,
         q1t_mm,
         q4t_mm,
@@ -5284,6 +5417,12 @@ pub fn forward_token_graph(
     final_norm: &[f32],
     logits: &mut Vec<f32>,
     loop_norm_at: &[usize],
+    // Multi-step greedy: encode `steps` whole frames in THIS submit, argmax
+    // and re-embed on the device, and return the k winner ids instead of
+    // logits. Needs `embed` = (q4tp embedding weight, vocab rows, multiplier).
+    steps: usize,
+    embed: Option<(&crate::gpu::GraphW, usize, f32)>,
+    ids_out: Option<&mut Vec<u32>>,
 ) -> bool {
     let Some(c) = ctx() else {
         graph_refused("no ctx");
@@ -5887,28 +6026,48 @@ pub fn forward_token_graph(
     let rms_u = uniform_u32x4(c, [hidden as u32, g, eps.to_bits(), 0]);
     let ax_u = uniform_u32x4(c, [1.0f32.to_bits(), hidden as u32, 0, 0]);
     let silu_u = uniform_u32x4(c, [inter as u32, 0, 0, 0]);
-    let kv_u = GraphScratch::ensure_uniform(&c.device, &mut gs.kv_u, 16);
-    c.queue.write_buffer(
-        &kv_u,
-        0,
-        bytemuck::cast_slice(&[nkv as u32, hd as u32, cap as u32, position as u32]),
-    );
-    let at_u = GraphScratch::ensure_uniform(&c.device, &mut gs.at_u, 32);
-    c.queue.write_buffer(
-        &at_u,
-        0,
-        bytemuck::cast_slice(&[
-            nh as u32,
-            (nh / nkv) as u32,
-            hd as u32,
-            cap as u32,
-            (position + 1) as u32,
+    let steps = steps.max(1);
+    // One uniform PER STEP, with stable identities: write_buffer lands at
+    // submit, so a single shared buffer would collapse every step to the
+    // last position written. Slot 0 is the plain single-step path.
+    let mku = |v: &mut Vec<wgpu::Buffer>, size: u64| {
+        while v.len() < steps {
+            v.push(c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("g-step-u"),
+                size,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+    };
+    mku(&mut gs.kv_us, 16);
+    mku(&mut gs.at_us, 32);
+    mku(&mut gs.rope_us, 32);
+    for st in 0..steps {
+        let p = position + st;
+        c.queue.write_buffer(
+            &gs.kv_us[st],
             0,
+            bytemuck::cast_slice(&[nkv as u32, hd as u32, cap as u32, p as u32]),
+        );
+        c.queue.write_buffer(
+            &gs.at_us[st],
             0,
-            0,
-        ]),
-    );
-    let rope_u = GraphScratch::ensure_uniform(&c.device, &mut gs.rope_u, 32);
+            bytemuck::cast_slice(&[
+                nh as u32,
+                (nh / nkv) as u32,
+                hd as u32,
+                cap as u32,
+                (p + 1) as u32,
+                0,
+                0,
+                0,
+            ]),
+        );
+    }
+    let kv_us = std::mem::take(&mut gs.kv_us);
+    let at_us = std::mem::take(&mut gs.at_us);
+    let rope_us = std::mem::take(&mut gs.rope_us);
     // Encode one matvec, dtype-dispatched: q8_row (encode_matvec + row scales)
     // or q1 (encode_matvec_q1). Each is its own pass — pass-grouping measured
     // as a no-op (the wall is per-dispatch, not per-barrier).
@@ -6135,6 +6294,70 @@ pub fn forward_token_graph(
         true
     };
     let mut o1_dbg: Vec<(usize, wgpu::Buffer)> = Vec::new();
+    // ── Multi-step prerequisites: the lm_head fold and a q4tp embedding,
+    // both resolved up front. Anything missing refuses the WHOLE call so
+    // the pipeline can fall back to single-step.
+    let multi = steps > 1;
+    let lm_pre = lm_head.and_then(|(gw, rows)| resolve(gw, rows, hidden).map(|m| (m, rows)));
+    let emb_pre = embed.and_then(|(gw, rows, mult)| {
+        resolve(gw, rows, hidden).map(|m| (m, rows, mult))
+    });
+    if multi {
+        let embed_ok = matches!(&emb_pre, Some((m, _, _)) if m.kind == 6);
+        if lm_pre.is_none() || !embed_ok {
+            graph_refused("multi-step needs the lm_head fold and a q4tp embedding");
+            return false;
+        }
+    }
+    const AM_PARTS: u32 = 512;
+    let lm_rows_pre = lm_pre.as_ref().map(|(_, r)| *r).unwrap_or(0);
+    let (lbuf_pre, am_pv, am_pi, ids_buf, ids_stage) = if multi {
+        let lsize = (lm_rows_pre * 4) as u64;
+        (
+            Some(GraphScratch::ensure(
+                &c.device,
+                &mut gs.logits,
+                lsize,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                "g-logits",
+            )),
+            Some(GraphScratch::ensure(
+                &c.device,
+                &mut gs.am_pv,
+                (AM_PARTS * 4) as u64,
+                wgpu::BufferUsages::STORAGE,
+                "g-am-pv",
+            )),
+            Some(GraphScratch::ensure(
+                &c.device,
+                &mut gs.am_pi,
+                (AM_PARTS * 4) as u64,
+                wgpu::BufferUsages::STORAGE,
+                "g-am-pi",
+            )),
+            Some(GraphScratch::ensure(
+                &c.device,
+                &mut gs.ids,
+                (steps * 4) as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                "g-ids",
+            )),
+            Some(GraphScratch::ensure(
+                &c.device,
+                &mut gs.ids_stage,
+                (steps * 4) as u64,
+                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                "g-ids-stage",
+            )),
+        )
+    } else {
+        (None, None, None, None, None)
+    };
+    for stp in 0..steps {
+        let kv_u = kv_us[stp].clone();
+        let at_u = at_us[stp].clone();
+        let rope_u = rope_us[stp].clone();
+        let position = position + stp;
     // Bootstrap the first layer's attention norm; thereafter each residual is
     // fused with the following norm (add_rmsnorm), saving two dispatches/layer.
     let inw0 = stor(bytemuck::cast_slice(layers[0].input_norm));
@@ -6824,8 +7047,130 @@ pub fn forward_token_graph(
             );
         }
     }
+    // ── Multi-step tail: final norm + lm_head + on-device argmax; the
+    // winner's embedding becomes the next step's h. All inside the SAME
+    // encoder — one submit carries every step.
+    if multi {
+        let (lm, lrows) = lm_pre.as_ref().unwrap();
+        let lrows = *lrows;
+        let lbuf = lbuf_pre.as_ref().unwrap();
+        let fnw = stor(bytemuck::cast_slice(final_norm));
+        go(
+            &mut enc,
+            &c.rmsnorm,
+            &bg(&c.layout_rmsnorm, &[&h_buf, &fnw, &n1, &rms_u]),
+            1,
+        );
+        emat(&mut enc, lm, &n1, lbuf, lrows, hidden);
+        let am_u = uniform_u32x4(c, [lrows as u32, AM_PARTS, stp as u32, 0]);
+        let l_ap = c.argmax_part.get_bind_group_layout(0);
+        let bg_ap = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &l_ap,
+            entries: &[
+                bind_buf(0, lbuf),
+                bind_buf(1, am_pv.as_ref().unwrap()),
+                bind_buf(2, am_pi.as_ref().unwrap()),
+                bind_buf(3, &am_u),
+            ],
+        });
+        go(&mut enc, &c.argmax_part, &bg_ap, AM_PARTS);
+        let l_af = c.argmax_final.get_bind_group_layout(0);
+        let bg_af = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &l_af,
+            entries: &[
+                bind_buf(0, am_pv.as_ref().unwrap()),
+                bind_buf(1, am_pi.as_ref().unwrap()),
+                bind_buf(2, ids_buf.as_ref().unwrap()),
+                bind_buf(3, &am_u),
+            ],
+        });
+        go(&mut enc, &c.argmax_final, &bg_af, 1);
+        if stp + 1 < steps {
+            let (em, e_rows, mult) = emb_pre.as_ref().unwrap();
+            let eg_u = uniform_u32x8(
+                c,
+                [
+                    hidden as u32,
+                    (hidden / 32) as u32,
+                    *e_rows as u32,
+                    stp as u32,
+                    mult.to_bits(),
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            let l_eg = c.embed_gather_q4tp.get_bind_group_layout(0);
+            let bg_eg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &l_eg,
+                entries: &[
+                    bind_buf(0, &em.buf),
+                    bind_buf(1, ids_buf.as_ref().unwrap()),
+                    bind_buf(2, &h_buf),
+                    bind_buf(3, &eg_u),
+                ],
+            });
+            go(
+                &mut enc,
+                &c.embed_gather_q4tp,
+                &bg_eg,
+                (hidden as u32).div_ceil(256),
+            );
+        }
+    }
+    } // for stp (multi-step frames)
     let t_enc = t_enc0.elapsed().as_secs_f64() * 1000.0;
     let t_sub0 = std::time::Instant::now();
+    // Return the step-slot uniforms to the scratch pool.
+    gs.kv_us = kv_us;
+    gs.at_us = at_us;
+    gs.rope_us = rope_us;
+    // ── Multi-step exit: one submit, one k×u32 readback, no logits. ──
+    if multi {
+        let ids_b = ids_buf.as_ref().unwrap();
+        let stage = ids_stage.as_ref().unwrap();
+        let sz = (steps * 4) as u64;
+        enc.copy_buffer_to_buffer(ids_b, 0, stage, 0, sz);
+        c.queue.submit(Some(enc.finish()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        stage.map_async(wgpu::MapMode::Read, ..sz, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        let ok = rx.recv().map(|r| r.is_ok()).unwrap_or(false);
+        if ok {
+            let raw = stage.get_mapped_range(..sz).unwrap();
+            let ids: &[u32] = bytemuck::cast_slice(&raw);
+            if let Some(out) = ids_out {
+                out.clear();
+                out.extend_from_slice(ids);
+            }
+            drop(raw);
+        }
+        stage.unmap();
+        if ok {
+            let mut kvm = c.attn_kv.lock().unwrap();
+            for li in 0..layers.len() {
+                if let Some(m) = kvm.get_mut(&(kv_id, li)) {
+                    m.synced = position + steps;
+                }
+            }
+            let mut gsm = c.gdn_state.lock().unwrap();
+            let _ = &mut gsm; // states advanced on-device; nothing to sync
+        }
+        drop(gs);
+        if prof {
+            let setup = t_enc0.duration_since(t_start).as_secs_f64() * 1000.0;
+            eprintln!(
+                "token-graph[x{steps}]: setup {setup:.2} ms | encode {t_enc:.2} ms | submit+ids {:.2} ms",
+                t_sub0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        return ok;
+    }
     // h_buf now holds the final hidden. Either ride final-norm + lm_head and
     // read back logits, or (no lm / unresolved weight) read back the hidden.
     let lm_resolved = lm_head.and_then(|(gw, rows)| resolve(gw, rows, hidden).map(|m| (m, rows)));

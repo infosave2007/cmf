@@ -1780,7 +1780,57 @@ impl Pipeline {
                 // ── Vanilla: forward the sampled token ──
                 _ => {
                     self.graph_want_logits = fuse_lm;
-                    hidden = self.forward_layers(&self.embed_single(t_next), next_pos, task_mask);
+                    // Greedy burst (CMF_MULTISTEP, default 8, 1 = off): while
+                    // nothing observes per-token state — pure argmax sampling,
+                    // no router/trace/confidence/mask — decode k tokens per
+                    // submit and commit them wholesale. The trailing normal
+                    // forward leaves logits for the loop top, as always.
+                    let mut t_fwd = t_next;
+                    let pure_greedy = self.sampler_config.temperature < 1e-6
+                        && self.sampler_config.repetition_penalty == 1.0
+                        && self.sampler_config.suppress_tokens.is_empty();
+                    let burst_k = std::env::var("CMF_MULTISTEP")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(8);
+                    if pure_greedy
+                        && burst_k > 1
+                        && fuse_lm
+                        && task_mask.is_none()
+                        && router.is_none()
+                        && !trace_on
+                        && !self.confidence_on
+                    {
+                        let mut stopped = false;
+                        loop {
+                            let room = max_tokens.saturating_sub(generated);
+                            if room <= 2 {
+                                break;
+                            }
+                            let k = burst_k.min(room - 1);
+                            if k < 2 {
+                                break;
+                            }
+                            let Some(ids) = self.try_multi_burst(t_fwd, next_pos, k) else {
+                                break;
+                            };
+                            next_pos += k;
+                            for &id in &ids {
+                                if !commit!(id) {
+                                    stopped = true;
+                                    break;
+                                }
+                            }
+                            if stopped {
+                                break;
+                            }
+                            t_fwd = *ids.last().unwrap();
+                        }
+                        if stopped {
+                            break 'decode;
+                        }
+                    }
+                    hidden = self.forward_layers(&self.embed_single(t_fwd), next_pos, task_mask);
                     next_pos += 1;
                     // Dynamic routing: the forward updated φ; ask the
                     // router whether to switch skills before the next token.
@@ -3383,6 +3433,42 @@ impl Pipeline {
         position: usize,
         logits_out: &mut Vec<f32>,
     ) -> Option<Vec<f32>> {
+        self.try_token_graph_wgpu_steps(hidden, position, logits_out, 1, None)
+    }
+
+    /// Greedy burst: forward `t_next` and let the device pick + re-embed
+    /// the next k−1 tokens — k frames, ONE submit, k ids back. The ZML
+    /// trade, on wgpu. None ⇒ caller keeps the per-token path.
+    fn try_multi_burst(&self, t_next: u32, position: usize, k: usize) -> Option<Vec<u32>> {
+        if self.o1_active() || self.attn_softcap > 0.0 {
+            return None;
+        }
+        let graph_on = match std::env::var("CMF_GPU_WGPU_GRAPH").ok().as_deref() {
+            Some("0") => return None,
+            Some(_) => true,
+            None => crate::gpu::wgpu_graph_default(),
+        };
+        if !graph_on {
+            return None;
+        }
+        let emb = self.embed_single(t_next);
+        let mut lg = Vec::new();
+        let mut ids = Vec::new();
+        self.try_token_graph_wgpu_steps(&emb, position, &mut lg, k, Some(&mut ids))?;
+        (ids.len() == k).then_some(ids)
+    }
+
+    /// Multi-step greedy: k whole frames in ONE submit, argmax and re-embed
+    /// on the device. `ids_out` receives the k winner ids; the hidden/logits
+    /// outputs are NOT produced in that mode.
+    fn try_token_graph_wgpu_steps(
+        &self,
+        hidden: &[f32],
+        position: usize,
+        logits_out: &mut Vec<f32>,
+        steps: usize,
+        ids_out: Option<&mut Vec<u32>>,
+    ) -> Option<Vec<f32>> {
         // O(1) Nyström decode runs off the sealed state, not the KV cache the
         // graph mirrors — never take the graph while o1 is active.
         let o1_gpu = std::env::var("CMF_O1_GPU").as_deref() == Ok("1");
@@ -3655,6 +3741,24 @@ impl Pipeline {
             None
         };
         let lm = lm_gw.as_ref().map(|(gw, rows)| (gw, *rows));
+        // Multi-step re-embeds the winner on the device.
+        let emb_gw = if steps > 1 {
+            self.weights.embed_tokens.graph_weight().map(|(_, i, kind, rs)| {
+                (
+                    crate::gpu::GraphW {
+                        idx: i,
+                        kind,
+                        row_scale: rs,
+                        data: &[],
+                    },
+                    self.weights.embed_tokens.rows(),
+                    self.embed_multiplier as f32,
+                )
+            })
+        } else {
+            None
+        };
+
         // Loop boundaries: virtual layer indices after which final_norm is applied
         // (mid-stack only; the last layer's norm folds into lm_head).
         let loop_norm_at: Vec<usize> = if self.loop_final_norm {
@@ -3687,6 +3791,9 @@ impl Pipeline {
             &self.weights.final_norm,
             logits_out,
             &loop_norm_at,
+            steps,
+            emb_gw.as_ref().map(|(gw, rows, m)| (gw, *rows, *m)),
+            ids_out,
         )
         .then_some(h)
     }
