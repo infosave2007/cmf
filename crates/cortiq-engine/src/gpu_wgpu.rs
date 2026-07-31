@@ -6563,6 +6563,9 @@ pub fn forward_token_graph(
                 },
             ) => {
                 let o1_here = o1.get(li).and_then(|v| v.as_ref());
+                // true = the fused short-context arm already ran the output
+                // gate and the O projection inside its pass.
+                let mut attn_done = false;
                 let qnw = q_norm
                     .map(|q| stor(bytemuck::cast_slice(q)))
                     .unwrap_or_else(|| zeros(hd));
@@ -6729,6 +6732,56 @@ pub fn forward_token_graph(
                 // rope + kv_append are independent (both read kb, neither
                 // writes it) — share ONE compute pass to avoid the inter-pass
                 // pipeline flush (~78 μs on NVIDIA Vulkan).
+                let n_ctx = position + 1;
+                // Short context (the decode regime): attend + output gate +
+                // O-projection ride the SAME pass as rope/kv when they prep —
+                // five passes become one, and dispatch order is unchanged.
+                let short_ctx = !(n_ctx > ATTEND_SPLIT_MIN && (hd <= 128 || c.big_attend));
+                if passfuse && short_ctx && !skip_attn {
+                    attn_done = true;
+                    let (ap, al) = attend_pipes(c, hd);
+                    let bg_att = bg(al, &[&qout, kbuf, vbuf, &attn, &at_u]);
+                    let gm = if *output_gate {
+                        let gm_u = uniform_u32x4(c, [(nh * hd) as u32, 0, 0, 0]);
+                        Some(bg(&c.layout_gate_mul, &[&gout, &attn, &gm_u]))
+                    } else {
+                        None
+                    };
+                    let wo_prep = prep(wo, &attn, &ob, hidden, nh * hd);
+                    {
+                        let bg_rope = bg(
+                            &c.layout_attn_rope,
+                            &[&qraw, &kb, &qout, &gout, &qnw, &knw, &invf_b, &rope_u],
+                        );
+                        let bg_kv = bg(&c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]);
+                        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: None,
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&c.attn_rope);
+                        pass.set_bind_group(0, &bg_rope, &[]);
+                        pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
+                        pass.set_pipeline(&c.kv_append);
+                        pass.set_bind_group(0, &bg_kv, &[]);
+                        pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
+                        pass.set_pipeline(ap);
+                        pass.set_bind_group(0, &bg_att, &[]);
+                        pass.dispatch_workgroups(nh as u32, 1, 1);
+                        if let Some(bg_gm) = &gm {
+                            pass.set_pipeline(&c.gate_mul);
+                            pass.set_bind_group(0, bg_gm, &[]);
+                            pass.dispatch_workgroups(((nh * hd) as u32).div_ceil(256), 1, 1);
+                        }
+                        if let Some((wp, wb, ww)) = &wo_prep {
+                            pass.set_pipeline(wp);
+                            pass.set_bind_group(0, wb, &[]);
+                            pass.dispatch_workgroups(*ww, 1, 1);
+                        }
+                    }
+                    if wo_prep.is_none() {
+                        emat(&mut enc, wo, &attn, &ob, hidden, nh * hd);
+                    }
+                } else {
                 {
                     let bg_rope = bg(
                         &c.layout_attn_rope,
@@ -6746,10 +6799,6 @@ pub fn forward_token_graph(
                     pass.set_bind_group(0, &bg_kv, &[]);
                     pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
                 }
-                let n_ctx = position + 1;
-                // Split-K needs the 257-stride PART kernel, which only exists
-                // on a 32 KB+ device. Elsewhere a big head stays on the plain
-                // 16-lane kernel — slower at long context, but correct.
                 if n_ctx > ATTEND_SPLIT_MIN && (hd <= 128 || c.big_attend) {
                     // Split-K attend: (nh × chunks) part workgroups + a
                     // per-head merge, both in ONE pass (WebGPU orders
@@ -6812,9 +6861,10 @@ pub fn forward_token_graph(
                         nh as u32,
                     );
                 }
+                } // fused-vs-split attend arms
                 // attn_out *= sigmoid(gate) before the O projection.
                 }
-                if *output_gate {
+                if *output_gate && !attn_done {
                     let gm_u = uniform_u32x4(c, [(nh * hd) as u32, 0, 0, 0]);
                     go(
                         &mut enc,
@@ -6823,7 +6873,9 @@ pub fn forward_token_graph(
                         ((nh * hd) as u32).div_ceil(256),
                     );
                 }
-                emat(&mut enc, wo, &attn, &ob, hidden, nh * hd);
+                if !attn_done {
+                    emat(&mut enc, wo, &attn, &ob, hidden, nh * hd);
+                }
             }
             (
                 LAttn::Gdn {
