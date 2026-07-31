@@ -1628,12 +1628,6 @@ fn q4tp_matvec(@builtin(workgroup_id) wid: vec3<u32>,
 
 var<workgroup> lad_q4v: array<f32, 128>;
 var<workgroup> partial_q4v: array<f32, 256>;
-// One 2048-float chunk of x, staged cooperatively: the 4 sub-rows of a quad
-// consume identical x-windows, so global x-traffic drops 4x on top of the
-// vec4 win. 64 groups per chunk = each lane owns exactly one group per
-// chunk, which keeps the per-lane group sequence (l, l+64, l+128, ...) — and
-// with it the add order — identical to the one-row kernel.
-var<workgroup> xs_q4v: array<vec4<f32>, 512>;
 
 fn q4v_dot8(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
     return (f32(w & 0xFu) - 8.0) * a.x
@@ -1669,20 +1663,11 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
         }
         workgroupBarrier();
         let row = base + sub;
-        let live = row < rows;
-        let xvecs = gpr * 8u;
-        let nch = (gpr + 63u) / 64u;
         var acc = 0.0;
-        var ch = 0u;
-        loop {
-            if (ch >= nch) { break; }
-            let i0 = ch * 512u + lid;
-            workgroupBarrier();
-            if (i0 < xvecs) { xs_q4v[lid] = q4v_x[i0]; }
-            if (i0 + 256u < xvecs) { xs_q4v[lid + 256u] = q4v_x[i0 + 256u]; }
-            workgroupBarrier();
-            let g = ch * 64u + l;
-            if (live && g < gpr) {
+        if (row < rows) {
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
                 let bit = g * 5u;
                 let cb = codes_b + row * cstride + (bit >> 3u);
                 let sh = bit & 7u;
@@ -1690,14 +1675,14 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
                 if (sh > 3u) { cv = cv | (q4tp_byte(cb + 1u) << 8u); }
                 let scale = lad_q4v[(sub << 5u) + ((cv >> sh) & 31u)];
                 let v = q4v_w[row * gpr + g];
-                let xq = l * 8u;
+                let xq = g * 8u;
                 acc = acc + scale
-                    * (q4v_dot8(v.x, xs_q4v[xq], xs_q4v[xq + 1u])
-                     + q4v_dot8(v.y, xs_q4v[xq + 2u], xs_q4v[xq + 3u])
-                     + q4v_dot8(v.z, xs_q4v[xq + 4u], xs_q4v[xq + 5u])
-                     + q4v_dot8(v.w, xs_q4v[xq + 6u], xs_q4v[xq + 7u]));
+                    * (q4v_dot8(v.x, q4v_x[xq], q4v_x[xq + 1u])
+                     + q4v_dot8(v.y, q4v_x[xq + 2u], q4v_x[xq + 3u])
+                     + q4v_dot8(v.z, q4v_x[xq + 4u], q4v_x[xq + 5u])
+                     + q4v_dot8(v.w, q4v_x[xq + 6u], q4v_x[xq + 7u]));
+                g = g + 64u;
             }
-            ch = ch + 1u;
         }
         partial_q4v[lid] = acc;
         workgroupBarrier();
