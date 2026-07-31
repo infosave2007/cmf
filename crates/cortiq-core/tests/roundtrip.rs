@@ -712,3 +712,54 @@ fn stream_writer_refuses_a_head_that_does_not_fit() {
         "expected a loud refusal about the reserve, got: {msg}"
     );
 }
+
+/// The manifest exists for one scenario: the box dies mid-conversion. This
+/// simulates exactly that — payloads on disk, no head written, writer gone —
+/// and checks the file can be completed from the sidecar alone instead of
+/// re-encoding for hours.
+#[test]
+fn stream_writer_resumes_from_its_manifest_after_a_crash() {
+    use cortiq_core::format::CmfStreamWriter;
+
+    let dir = tempdir();
+    let (path, man) = (dir.join("crashed.cmf"), dir.join("crashed.cmf.manifest"));
+    let payloads: Vec<(String, Vec<u8>)> = (0..12)
+        .map(|i| {
+            let rows = 8usize;
+            let cols = 64usize;
+            let vals: Vec<f32> = (0..rows * cols).map(|k| ((k + i) as f32 * 0.03).cos()).collect();
+            (format!("layer.{i}.weight"), encode_q8_row(&vals, rows, cols))
+        })
+        .collect();
+
+    {
+        let mut w = CmfStreamWriter::new(&path, CmfStreamWriter::head_reserve_for(64, 32))
+            .unwrap()
+            .with_manifest(&man)
+            .unwrap();
+        for (name, data) in &payloads {
+            w.push(name, TensorDtype::Q8Row, &[8, 64], data).unwrap();
+        }
+        // Writer dropped without finish() — the head was never written.
+    }
+    let unfinished = CmfModel::open(&path);
+    assert!(
+        unfinished.is_err(),
+        "a file with no head must not open as a valid model"
+    );
+
+    let (w2, names) = CmfStreamWriter::resume(&path, &man).unwrap();
+    assert_eq!(names.len(), payloads.len(), "manifest lost tensors");
+    assert_eq!(w2.tensor_count(), payloads.len());
+    w2.finish(&tiny_header(), None, None).unwrap();
+
+    let m = CmfModel::open(&path).unwrap();
+    assert!(m.verify().is_empty(), "rescued file failed verify()");
+    for (name, data) in &payloads {
+        assert_eq!(
+            m.tensor_bytes(name).unwrap(),
+            &data[..],
+            "tensor '{name}' did not survive the rescue"
+        );
+    }
+}

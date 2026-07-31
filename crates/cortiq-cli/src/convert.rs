@@ -2817,7 +2817,9 @@ pub fn run_convert(
     // is patched into a reserved gap once the last tensor lands, so the
     // payloads are never held twice — not in RAM and not on disk.
     let head_reserve = cortiq_core::format::CmfStreamWriter::head_reserve_for(2 * total.max(4096), 96);
+    let manifest_path = format!("{output}.manifest");
     let mut writer = cortiq_core::format::CmfStreamWriter::new(output, head_reserve)
+        .and_then(|w| w.with_manifest(&manifest_path))
         .map_err(|e| anyhow::anyhow!("create {output}: {e}"))?;
     let mut tensors: Vec<TensorSpec> = Vec::with_capacity(total);
     let mut done = 0usize;
@@ -3631,6 +3633,8 @@ pub fn run_convert(
     writer
         .finish(&header, None, vocab.as_deref())
         .map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;
+    // The manifest only exists to rescue an interrupted run.
+    let _ = std::fs::remove_file(&manifest_path);
     progress(1.0);
     Ok(())
 }

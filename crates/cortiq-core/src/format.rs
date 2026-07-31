@@ -1108,6 +1108,10 @@ pub struct CmfStreamWriter {
     /// Write cursor, relative to `data_off`.
     cursor: u64,
     entries: Vec<TensorEntry>,
+    /// Append-only sidecar describing every payload already on disk. A Colab
+    /// box can vanish mid-conversion; with this the finished payloads can be
+    /// turned into a valid file instead of re-encoding for hours.
+    manifest: Option<BufWriter<File>>,
 }
 
 impl CmfStreamWriter {
@@ -1118,10 +1122,11 @@ impl CmfStreamWriter {
     pub fn head_reserve_for(n_tensors: usize, avg_name: usize) -> u64 {
         let dir = 16 + n_tensors * (DIR_RECORD_LEN + 6 + avg_name);
         let head = ENVELOPE_LEN + dir + (1 << 20);
-        // Tripled and floored at 16 MB. The asymmetry is deliberate: an
-        // over-estimate costs a few MB of zeros in the file, an
+        // Tripled, on top of a megabyte of slack that is already ~20x a
+        // small model's directory. The asymmetry is deliberate: an
+        // over-estimate costs zeros at the head of the file, an
         // under-estimate costs the entire conversion that produced it.
-        align_to(3 * head as u64, DATA_ALIGNMENT).max(16 << 20)
+        align_to(3 * head as u64, DATA_ALIGNMENT).max(1 << 20)
     }
 
     /// `gap` bytes are reserved for envelope + header + directory.
@@ -1136,6 +1141,7 @@ impl CmfStreamWriter {
             data_off,
             cursor: 0,
             entries: Vec::new(),
+            manifest: None,
         })
     }
 
@@ -1186,7 +1192,105 @@ impl CmfStreamWriter {
             hash: hash64(data),
         });
         self.cursor = off + data.len() as u64;
+        if let Some(m) = self.manifest.as_mut() {
+            let e = self.entries.last().unwrap();
+            writeln!(
+                m,
+                "{{\"name\":{},\"dtype\":{},\"shape\":{:?},\"off\":{},\"nbytes\":{},\"hash\":{}}}",
+                serde_json::to_string(&e.name).unwrap_or_else(|_| "\"?\"".into()),
+                dtype.id(),
+                e.shape,
+                e.off,
+                e.nbytes,
+                e.hash
+            )?;
+            m.flush()?;
+        }
         Ok(())
+    }
+
+    /// Start recording a sidecar manifest at `path`. One JSON line per
+    /// tensor, flushed as it goes, plus a first line pinning the gap size.
+    pub fn with_manifest(mut self, path: impl AsRef<Path>) -> Result<Self, CmfError> {
+        let mut f = BufWriter::new(File::create(path)?);
+        writeln!(f, "{{\"data_off\":{}}}", self.data_off)?;
+        f.flush()?;
+        self.manifest = Some(f);
+        Ok(self)
+    }
+
+    /// Rebuild a writer over an output file whose payloads are already on
+    /// disk, from the manifest that recorded them. The file is reopened for
+    /// writing without truncation and the cursor is placed after the last
+    /// recorded tensor, so `finish` can complete a conversion that died.
+    pub fn resume(
+        path: impl AsRef<Path>,
+        manifest: impl AsRef<Path>,
+    ) -> Result<(Self, Vec<String>), CmfError> {
+        let path = path.as_ref().to_path_buf();
+        let text = std::fs::read_to_string(manifest.as_ref())?;
+        let mut lines = text.lines();
+        let first = lines
+            .next()
+            .ok_or_else(|| CmfError::Parse("manifest is empty".into()))?;
+        let head: serde_json::Value = serde_json::from_str(first)
+            .map_err(|e| CmfError::Parse(format!("manifest head: {e}")))?;
+        let data_off = head["data_off"]
+            .as_u64()
+            .ok_or_else(|| CmfError::Parse("manifest head has no data_off".into()))?;
+
+        let mut entries = Vec::new();
+        let mut names = Vec::new();
+        for (i, line) in lines.enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            // A truncated last line is expected if the process was killed
+            // mid-write; it is dropped, not an error.
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                tracing::warn!("manifest line {} is truncated — ignoring it", i + 2);
+                break;
+            };
+            let dtype = TensorDtype::from_id(v["dtype"].as_u64().unwrap_or(0) as u8)
+                .ok_or_else(|| CmfError::Parse(format!("manifest line {}: dtype", i + 2)))?;
+            let name = v["name"].as_str().unwrap_or_default().to_string();
+            names.push(name.clone());
+            entries.push(TensorEntry {
+                name,
+                dtype,
+                shape: v["shape"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect())
+                    .unwrap_or_default(),
+                off: v["off"].as_u64().unwrap_or(0),
+                nbytes: v["nbytes"].as_u64().unwrap_or(0),
+                shard: 0,
+                hash: v["hash"].as_u64().unwrap_or(0),
+            });
+        }
+        let cursor = entries.last().map(|e| e.off + e.nbytes).unwrap_or(0);
+        let on_disk = std::fs::metadata(&path)?.len();
+        if on_disk < data_off + cursor {
+            return Err(CmfError::Bounds(format!(
+                "{} is {on_disk} bytes but the manifest describes {} — \
+                 the file is shorter than its own record",
+                path.display(),
+                data_off + cursor
+            )));
+        }
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        file.seek(SeekFrom::Start(data_off + cursor))?;
+        Ok((
+            Self {
+                file: BufWriter::new(file),
+                path,
+                data_off,
+                cursor,
+                entries,
+                manifest: None,
+            },
+            names,
+        ))
     }
 
     pub fn tensor_count(&self) -> usize {
