@@ -1239,6 +1239,90 @@ var<workgroup> at_acc: array<f32, 8224>; // [lane*257 + d], stride 257 dodges 32
 var<workgroup> at_m: array<f32, 32>;
 var<workgroup> at_l: array<f32, 32>;
 @compute @workgroup_size(32)
+// Decode-regime attend: 256 threads per head instead of one warp. Lanes
+// are POSITIONS for the score pass (dot over hd each) and DIMENSIONS for
+// the value pass (coalesced v reads, one output dim per lane, hd <= 256).
+// Online softmax over 256-position chunks; per-chunk stats via one tree.
+// The 32-lane kernel above kept a 257-stride accumulator per lane and a
+// five-level 256-wide merge — 137 us per layer at fifty positions of
+// context. This shape does the same math in the natural order.
+var<workgroup> ad_sc: array<f32, 256>;
+var<workgroup> ad_red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn gqa_attend_dec(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    if (h >= at_p.nh) { return; }
+    let hd = at_p.hd;
+    let hd4 = hd / 4u;
+    let n = at_p.n;
+    let kbase = (h / at_p.hpk) * at_p.cap * hd4;
+    let qbase = h * hd4;
+    let scale = 1.0 / sqrt(f32(hd));
+    var m = -1.0e30;
+    var l = 0.0;
+    var acc = 0.0;                      // this lane's output dim (lid < hd)
+    var c0 = 0u;
+    loop {
+        if (c0 >= n) { break; }
+        let cn = min(256u, n - c0);
+        // scores: lane p of the chunk
+        var sc = -1.0e30;
+        if (lid < cn) {
+            let krow = kbase + (c0 + lid) * hd4;
+            var dot4 = vec4<f32>(0.0);
+            for (var d = 0u; d < hd4; d = d + 1u) {
+                dot4 = dot4 + at_q[qbase + d] * at_k[krow + d];
+            }
+            sc = (dot4.x + dot4.y + dot4.z + dot4.w) * scale;
+        }
+        ad_sc[lid] = sc;
+        ad_red[lid] = sc;
+        workgroupBarrier();
+        var st = 128u;
+        loop {
+            if (st == 0u) { break; }
+            if (lid < st) { ad_red[lid] = max(ad_red[lid], ad_red[lid + st]); }
+            workgroupBarrier();
+            st = st >> 1u;
+        }
+        let cm = ad_red[0];
+        workgroupBarrier();
+        let mp = max(m, cm);
+        let f = exp(m - mp);
+        // weights into shared, denom via tree
+        let w = select(0.0, exp(ad_sc[lid] - mp), lid < cn);
+        ad_sc[lid] = w;
+        ad_red[lid] = w;
+        workgroupBarrier();
+        st = 128u;
+        loop {
+            if (st == 0u) { break; }
+            if (lid < st) { ad_red[lid] = ad_red[lid] + ad_red[lid + st]; }
+            workgroupBarrier();
+            st = st >> 1u;
+        }
+        l = l * f + ad_red[0];
+        workgroupBarrier();
+        // value pass: lane = output dim, coalesced across lanes
+        if (lid < hd) {
+            acc = acc * f;
+            let dw = lid >> 2u;
+            let dc = lid & 3u;
+            for (var p = 0u; p < cn; p = p + 1u) {
+                acc = acc + ad_sc[p] * at_v[kbase + (c0 + p) * hd4 + dw][dc];
+            }
+        }
+        m = mp;
+        c0 = c0 + 256u;
+        workgroupBarrier();
+    }
+    if (lid < hd) {
+        at_o[h * hd + lid] = acc / l;
+    }
+}
+
 fn gqa_attend(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let h = wid.x;
     let lane = lid.x;
@@ -4154,6 +4238,8 @@ struct Ctx {
     layout_moe_gu_q2tp: wgpu::BindGroupLayout,
     moe_gate_up_q2tp_f: wgpu::ComputePipeline,
     moe_down_q4tp_f: wgpu::ComputePipeline,
+    gqa_attend_dec: wgpu::ComputePipeline,
+    attend_dec: bool,
     foldsel: bool,
     layout_moe_dn_q4tp: wgpu::BindGroupLayout,
     /// Discrete card (PCIe VRAM) vs UMA — thresholds and budgets differ.
@@ -4591,6 +4677,8 @@ fn init() -> Result<Ctx, String> {
     let moe_gate_up_q2tp = pipe("moe_gate_up_q2tp");
     let moe_gate_up_q2tp_f = pipe("moe_gate_up_q2tp_f");
     let moe_down_q4tp_f = pipe("moe_down_q4tp_f");
+    let gqa_attend_dec = pipe("gqa_attend_dec");
+    let attend_dec = std::env::var("CMF_ATTEND_DEC").map(|v| v != "0").unwrap_or(true);
     // Measured NEGATIVE on RTX PRO 6000 (72.6 vs 79.0 tok/s): the redundant
     // per-workgroup top-k costs more than the retired select hop — in-pass
     // dispatches overlap more than the latency model assumed. Kept for
@@ -4753,6 +4841,8 @@ fn init() -> Result<Ctx, String> {
         moe_gate_up_q2tp,
         moe_gate_up_q2tp_f,
         moe_down_q4tp_f,
+        gqa_attend_dec,
+        attend_dec,
         foldsel,
         layout_moe_gu_q2tp,
         layout_moe_dn_q4tp,
@@ -7076,8 +7166,17 @@ pub fn forward_token_graph(
                 let short_ctx = !(n_ctx > ATTEND_SPLIT_MIN && (hd <= 128 || c.big_attend));
                 if passfuse && short_ctx && !skip_attn {
                     attn_done = true;
-                    let (ap, al) = attend_pipes(c, hd);
-                    let bg_att = bg(al, &[&qout, kbuf, vbuf, &attn, &at_u]);
+                    let (mut ap, al) = attend_pipes(c, hd);
+                    let dec_l;
+                    let bg_att = if c.attend_dec && hd <= 256 {
+                        ap = &c.gqa_attend_dec;
+                        // Auto layouts are pipeline-exclusive — the twin's
+                        // binding SET matches, its layout object does not.
+                        dec_l = c.gqa_attend_dec.get_bind_group_layout(0);
+                        bg(&dec_l, &[&qout, kbuf, vbuf, &attn, &at_u])
+                    } else {
+                        bg(al, &[&qout, kbuf, vbuf, &attn, &at_u])
+                    };
                     let gm = if *output_gate {
                         let gm_u = uniform_u32x4(c, [(nh * hd) as u32, 0, 0, 0]);
                         Some(bg(&c.layout_gate_mul, &[&gout, &attn, &gm_u]))
