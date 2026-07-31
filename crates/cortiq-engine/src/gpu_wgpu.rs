@@ -4886,7 +4886,10 @@ fn init() -> Result<Ctx, String> {
     let gdn_step_par = pipe("gdn_step_par");
     let gdn_step_par2 = pipe("gdn_step_par2");
     let gdn_step_norm2 = pipe("gdn_step_norm2");
-    let gdn_inline = std::env::var("CMF_GDN_INLINE").map(|v| v != "0").unwrap_or(true);
+    // Measured -1 tok/s on RTX PRO 6000: every dv-workgroup of a head
+    // recomputes the conv reads, 128-fold traffic amplification against
+    // one saved hop. Kept for narrow-dv models; CMF_GDN_INLINE=1 enables.
+    let gdn_inline = std::env::var("CMF_GDN_INLINE").as_deref() == Ok("1");
     let gdn_step_norm = pipe("gdn_step_norm");
     let gdn_par = std::env::var("CMF_GDN_PAR").map(|v| v != "0").unwrap_or(true);
     // Frame profiler (CMF_GPU_TS=1): 256 timestamp slots + resolve/stage
