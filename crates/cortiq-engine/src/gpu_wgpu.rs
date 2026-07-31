@@ -946,11 +946,18 @@ struct GdnP { nv: u32, dk: u32, dv: u32, kd: u32, rep: u32, cdim: u32, eps: f32,
 @group(0) @binding(6) var<storage, read>       gd_norm : array<f32>;
 @group(0) @binding(7) var<storage, read_write> gd_S    : array<f32>;
 @group(0) @binding(8) var<storage, read_write> gd_o    : array<f32>;
+// S and o again as vec4 (same-slot rule): a state row is dv-contiguous,
+// so a lane's four columns are ONE 16-byte access, not four scattered.
+@group(0) @binding(7) var<storage, read_write> gd_S4   : array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read_write> gd_o4   : array<vec4<f32>>;
 @group(0) @binding(9) var<uniform>             gd_p    : GdnP;
 var<workgroup> gd_kf: array<f32, 256>;
 var<workgroup> gd_qf: array<f32, 256>;
 var<workgroup> gd_ov: array<f32, 256>;
 var<workgroup> gd_red: array<f32, 256>;
+var<workgroup> gd_red2: array<f32, 256>;
+var<workgroup> gd_red3: array<f32, 256>;
+var<workgroup> gd_red4: array<f32, 256>;
 fn gd_softplus(x: f32) -> f32 {
     if (x > 20.0) { return x; }
     return log(1.0 + exp(x));
@@ -1036,11 +1043,11 @@ fn gdn_step(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
 fn gdn_step_par(@builtin(workgroup_id) wid: vec3<u32>,
                 @builtin(local_invocation_id) lid: vec3<u32>) {
     let h = wid.x;
-    let dj = wid.y;
+    let dj4 = wid.y;   // FOUR columns per workgroup, vec4 access
     let t = lid.x;
     let dk = gd_p.dk;
     let dv = gd_p.dv;
-    if (h >= gd_p.nv || dj >= dv) { return; }
+    if (h >= gd_p.nv || dj4 * 4u >= dv) { return; }
     let ko = h / gd_p.rep;
     let qs = ko * dk;
     let ks = gd_p.kd + ko * dk;
@@ -1072,43 +1079,65 @@ fn gdn_step_par(@builtin(workgroup_id) wid: vec3<u32>,
     let abo = gd_p.tok * gd_p.nv;
     let g = exp(-exp(gd_alog[h]) * gd_softplus(gd_a[abo + h] + gd_dtb[h]));
     let beta = 1.0 / (1.0 + exp(-gd_b[abo + h]));
-    let sbase = h * dk * dv;
-    let vt = gd_cq[2u * gd_p.kd + h * dv + dj];
-    // kv = kfᵀ S[:,j] as a 128-lane reduction
+    let s4base = (h * dk * dv) >> 2u;
+    let dv4 = dv >> 2u;
+    let vto = 2u * gd_p.kd + h * dv + dj4 * 4u;
+    let vt = vec4<f32>(gd_cq[vto], gd_cq[vto + 1u], gd_cq[vto + 2u], gd_cq[vto + 3u]);
     let kf_t = select(0.0, gd_cq[ks + t] * invk, t < dk);
     let qf_t = select(0.0, gd_cq[qs + t] * invq, t < dk);
-    gd_red[t] = select(0.0, gd_S[sbase + t * dv + dj] * kf_t, t < dk);
+    // kv = kfᵀ S[:, j..j+3] — the four column reductions ride together
+    var kv4 = vec4<f32>(0.0);
+    if (t < dk) {
+        kv4 = gd_S4[s4base + t * dv4 + dj4] * kf_t;
+    }
+    gd_red[t] = kv4.x;
+    gd_red2[t] = kv4.y;
+    gd_red3[t] = kv4.z;
+    gd_red4[t] = kv4.w;
     workgroupBarrier();
     stride = 64u;
     loop {
         if (stride == 0u) { break; }
-        if (t < stride) { gd_red[t] = gd_red[t] + gd_red[t + stride]; }
+        if (t < stride) {
+            gd_red[t] = gd_red[t] + gd_red[t + stride];
+            gd_red2[t] = gd_red2[t] + gd_red2[t + stride];
+            gd_red3[t] = gd_red3[t] + gd_red3[t + stride];
+            gd_red4[t] = gd_red4[t] + gd_red4[t + stride];
+        }
         workgroupBarrier();
         stride = stride / 2u;
     }
-    let kv = gd_red[0];
+    let kv = vec4<f32>(gd_red[0], gd_red2[0], gd_red3[0], gd_red4[0]);
     workgroupBarrier();
     let delta = (vt - g * kv) * beta;
-    // cell update + o = qfᵀ cell, one lane per dk row
-    var contrib = 0.0;
+    var contrib = vec4<f32>(0.0);
     if (t < dk) {
-        let idx = sbase + t * dv + dj;
-        let cell = g * gd_S[idx] + kf_t * delta;
-        gd_S[idx] = cell;
+        let idx = s4base + t * dv4 + dj4;
+        let cell = g * gd_S4[idx] + kf_t * delta;
+        gd_S4[idx] = cell;
         contrib = qf_t * cell;
     }
-    gd_red[t] = contrib;
+    gd_red[t] = contrib.x;
+    gd_red2[t] = contrib.y;
+    gd_red3[t] = contrib.z;
+    gd_red4[t] = contrib.w;
     workgroupBarrier();
     stride = 64u;
     loop {
         if (stride == 0u) { break; }
-        if (t < stride) { gd_red[t] = gd_red[t] + gd_red[t + stride]; }
+        if (t < stride) {
+            gd_red[t] = gd_red[t] + gd_red[t + stride];
+            gd_red2[t] = gd_red2[t] + gd_red2[t + stride];
+            gd_red3[t] = gd_red3[t] + gd_red3[t + stride];
+            gd_red4[t] = gd_red4[t] + gd_red4[t + stride];
+        }
         workgroupBarrier();
         stride = stride / 2u;
     }
     if (t == 0u) {
-        let zo = gd_p.tok * gd_p.nv * dv;
-        gd_o[zo + h * dv + dj] = gd_red[0];
+        let zo4 = (gd_p.tok * gd_p.nv * dv) >> 2u;
+        gd_o4[zo4 + h * dv4 + dj4] =
+            vec4<f32>(gd_red[0], gd_red2[0], gd_red3[0], gd_red4[0]);
     }
 }
 
