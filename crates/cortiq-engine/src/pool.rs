@@ -600,12 +600,22 @@ mod tests {
         // the same list (19 showed up on a 48-core box where the old
         // `== 3` held on a laptop by timing luck). Assert on the DELTA:
         // our pool's three workers must be there the moment new returns.
-        let before = super::WORKER_TIDS.lock().unwrap().len();
+        // Counting LENGTHS raced: a parallel suite dropping its pool
+        // shrinks the same registry between the two reads, and the delta
+        // goes negative through no fault of ours (this flake failed two
+        // releases). Compare SETS instead — removals elsewhere cannot
+        // take away tids that were not there before.
+        use std::collections::HashSet;
+        let before: HashSet<_> = super::WORKER_TIDS.lock().unwrap().iter().copied().collect();
         let _p = super::Pool::new(3);
-        let after = super::WORKER_TIDS.lock().unwrap().len();
+        let after: HashSet<_> = super::WORKER_TIDS.lock().unwrap().iter().copied().collect();
+        let fresh = after.difference(&before).count();
         assert!(
-            after >= before + 3,
-            "all worker tids must be visible the moment the pool exists              (before {before}, after {after})"
+            fresh >= 3,
+            "all worker tids must be visible the moment the pool exists \
+             (fresh {fresh}, before {}, after {})",
+            before.len(),
+            after.len()
         );
     }
 
