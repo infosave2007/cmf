@@ -1609,6 +1609,77 @@ fn q4tp_matvec(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// q4tp matvec, tall edition: 4 rows per 256-thread workgroup, and the group's
+// 16 B of nibbles arrive as ONE vec4<u32> load instead of four scalar loads.
+// Written for dense-FFN shapes (17408x5120: the one-row kernel left a 27B
+// dense model at ~5% of the card's bandwidth); the weight buffer is bound
+// TWICE — the scalar u32 view for params and 5-bit codes (they live at
+// unaligned offsets, and the buffer tail may not be 16 B-round, which a vec4
+// view would silently clamp) and a vec4 view for the nibble tiles, whose
+// region is 16 B-exact by construction. Each row's lane layout, add order and
+// 64-slot reduction tree are byte-identical to q4tp_matvec, so the kernels
+// are interchangeable under greedy parity.
+@group(0) @binding(4) var<storage, read> q4v_w : array<vec4<u32>>;
+
+var<workgroup> lad_q4v: array<f32, 128>;
+var<workgroup> partial_q4v: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(num_workgroups) nwg: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    var base = wid.x * 4u;
+    loop {
+        if (base >= rows) { break; }
+        if (lid < 128u) {
+            let r = base + (lid >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                lad_q4v[lid] = exp2(pr.x + f32(lid & 31u) * pr.y);
+            }
+        }
+        workgroupBarrier();
+        let row = base + sub;
+        var acc = 0.0;
+        if (row < rows) {
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cb = codes_b + row * cstride + (bit >> 3u);
+                let sh = bit & 7u;
+                var cv = q4tp_byte(cb);
+                if (sh > 3u) { cv = cv | (q4tp_byte(cb + 1u) << 8u); }
+                let scale = lad_q4v[(sub << 5u) + ((cv >> sh) & 31u)];
+                let v = q4v_w[row * gpr + g];
+                let xb = g * 32u;
+                acc = acc + scale * (q4b_dot8(v.x, xb) + q4b_dot8(v.y, xb + 8u)
+                     + q4b_dot8(v.z, xb + 16u) + q4b_dot8(v.w, xb + 24u));
+                g = g + 64u;
+            }
+        }
+        partial_q4v[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) { partial_q4v[lid] = partial_q4v[lid] + partial_q4v[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u && row < rows) { q1y[row] = partial_q4v[sub << 6u]; }
+        workgroupBarrier();
+        base = base + nwg.x * 4u;
+    }
+}
+
 // Fused SiLU(gate)·up → Q4Block down-proj matvec: eliminates the standalone
 // silu dispatch (saves one inter-pass pipeline flush per layer).
 @group(0) @binding(0) var<storage, read>       sd_w : array<u32>;
@@ -3279,6 +3350,10 @@ struct Ctx {
     q4b: wgpu::ComputePipeline,
     q4t_mv: wgpu::ComputePipeline,
     q4tp_mv: wgpu::ComputePipeline,
+    /// Tall-matrix q4tp matvec (4 rows/workgroup, vec4 nibble loads); the
+    /// per-row math is byte-identical to `q4tp_mv`. `CMF_MV4=0` reverts.
+    q4tp_mv4: wgpu::ComputePipeline,
+    use_mv4: bool,
     q4tp_mm: wgpu::ComputePipeline,
     silu_down: wgpu::ComputePipeline,
     q1t_mm: wgpu::ComputePipeline,
@@ -3693,6 +3768,8 @@ fn init() -> Result<Ctx, String> {
     let q4b = pipe("q4b_matvec");
     let q4t_mv = pipe("q4t_matvec");
     let q4tp_mv = pipe("q4tp_matvec");
+    let q4tp_mv4 = pipe("q4tp_matvec4");
+    let use_mv4 = std::env::var("CMF_MV4").map(|v| v != "0").unwrap_or(true);
     let q4tp_mm = pipe("q4tp_mul_mm");
     let silu_down = pipe("silu_down_matvec");
     let q1t_mm = pipe("q1t_mul_mm");
@@ -3812,6 +3889,8 @@ fn init() -> Result<Ctx, String> {
         q4b,
         q4t_mv,
         q4tp_mv,
+        q4tp_mv4,
+        use_mv4,
         q4tp_mm,
         silu_down,
         q1t_mm,
@@ -5651,7 +5730,13 @@ pub fn forward_token_graph(
             2 => encode_q1t_like(c, enc, &c.q4b, &m.buf, xs, y, rows, cols),
             3 => encode_q1t_like(c, enc, &c.q1t, &m.buf, xs, y, rows, cols),
             5 => encode_q1t_like(c, enc, &c.q4t_mv, &m.buf, xs, y, rows, cols),
-            6 => encode_q1t_like(c, enc, &c.q4tp_mv, &m.buf, xs, y, rows, cols),
+            6 => {
+                if c.use_mv4 {
+                    encode_q4tp_mv4(c, enc, &m.buf, xs, y, rows, cols)
+                } else {
+                    encode_q1t_like(c, enc, &c.q4tp_mv, &m.buf, xs, y, rows, cols)
+                }
+            }
             _ => encode_f32matvec(c, enc, &m.buf, xs, y, rows, cols),
         }
     };
@@ -5713,6 +5798,25 @@ pub fn forward_token_graph(
             2 | 5 | 6 => {
                 let gpr = cols / 32;
                 let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+                if m.kind == 6 && c.use_mv4 {
+                    let layout = c.q4tp_mv4.get_bind_group_layout(0);
+                    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &layout,
+                        entries: &[
+                            bind_buf(0, &m.buf),
+                            bind_buf(1, xs),
+                            bind_buf(2, y),
+                            bind_buf(3, &p_buf),
+                            bind_buf(4, &m.buf),
+                        ],
+                    });
+                    return Some((
+                        &c.q4tp_mv4,
+                        bind,
+                        (rows as u32).div_ceil(4).min(MAX_WG),
+                    ));
+                }
                 let pl = match m.kind {
                     5 => &c.q4t_mv,
                     6 => &c.q4tp_mv,
@@ -7040,7 +7144,13 @@ pub fn forward_batch_graph(
             0 => encode_matvec(c, enc, &m.buf, xs, m.rs.as_ref().unwrap(), y, rows, cols),
             1 => encode_matvec_q1(c, enc, &m.buf, xs, y, rows, cols),
             5 => encode_q1t_like(c, enc, &c.q4t_mv, &m.buf, xs, y, rows, cols),
-            6 => encode_q1t_like(c, enc, &c.q4tp_mv, &m.buf, xs, y, rows, cols),
+            6 => {
+                if c.use_mv4 {
+                    encode_q4tp_mv4(c, enc, &m.buf, xs, y, rows, cols)
+                } else {
+                    encode_q1t_like(c, enc, &c.q4tp_mv, &m.buf, xs, y, rows, cols)
+                }
+            }
             _ => encode_f32matvec(c, enc, &m.buf, xs, y, rows, cols),
         }
     };
@@ -8548,7 +8658,13 @@ pub fn q4tp_matvec_for_test(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("q4tp-mv"),
         });
-    encode_q1t_like(c, &mut enc, &c.q4tp_mv, &q_buf, &xs_buf, &y_buf, rows, cols);
+    // The hook follows the runtime's kernel choice, so the dequant-pinned
+    // test exercises whichever variant real decodes will use.
+    if c.use_mv4 {
+        encode_q4tp_mv4(c, &mut enc, &q_buf, &xs_buf, &y_buf, rows, cols);
+    } else {
+        encode_q1t_like(c, &mut enc, &c.q4tp_mv, &q_buf, &xs_buf, &y_buf, rows, cols);
+    }
     readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..rows])
 }
 
@@ -9992,6 +10108,40 @@ fn attend_part_pipes(c: &Ctx, hd: usize) -> (&wgpu::ComputePipeline, &wgpu::Bind
     } else {
         (&c.attend_part, &c.layout_attend_part)
     }
+}
+
+/// `q4tp_matvec4`: the q1t-like binding set plus the weight buffer AGAIN at
+/// slot 4 as the kernel's vec4 nibble view.
+fn encode_q4tp_mv4(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+) {
+    let gpr = cols / 32;
+    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+    let layout = c.q4tp_mv4.get_bind_group_layout(0);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &layout,
+        entries: &[
+            bind_buf(0, weight),
+            bind_buf(1, xs),
+            bind_buf(2, y),
+            bind_buf(3, &p_buf),
+            bind_buf(4, weight),
+        ],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.q4tp_mv4);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((rows as u32).div_ceil(4).min(MAX_WG), 1, 1);
 }
 
 fn encode_q1t_like(
