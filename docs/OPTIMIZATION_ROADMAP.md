@@ -128,10 +128,15 @@ q2tp expert profile (2-bit gate/up, 4-bit down and skeleton) takes it to
 ~99 GB. Expert defrag does NOT help on the hash layers: their table reaches
 all 256 experts within the first 8 000 vocabulary ids, measured.
 
-**Still open:** the indexer's Hadamard rotation and FP4 simulation are not
-implemented, so position selection is approximate at long context; the
-grouped output projection reads `wo_a` single-threaded through `row_dot`
-(~1.4 G MAC/token); and there is no GPU graph for any of it.
+**Deliberately absent:** the indexer's Hadamard rotation and FP4 simulation.
+The rotation is orthogonal and the reference applies it to both sides of the
+same dot product, so it cancels — it exists to condition the FP4 quantization,
+which we also skip by keeping f32. Omitting the pair is exact, not an
+approximation. (An earlier revision of this file called it approximate; that
+was wrong.)
+
+**Still open:** there is no GPU graph for any of this, so decode is CPU-only —
+which for a ~10B-active MoE is the whole performance story, not a detail.
 
 ## 8. Converters write once now
 

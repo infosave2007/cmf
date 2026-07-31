@@ -917,6 +917,16 @@ pub fn attention_step(
                 // per-head weights are a projection of the hidden state,
                 // scaled by head_dim^-0.5 * n_heads^-0.5 as the reference
                 // folds into `weights_proj`'s output.
+                //
+                // The reference also applies a randomized Hadamard rotation
+                // to the queries here and to the keys in the indexer's
+                // compressor, then simulates FP4 on both. That transform is
+                // orthogonal (`hadamard_transform` scaled by d^-0.5) and it
+                // hits BOTH sides of the same dot product, so it cancels:
+                // its purpose is to condition the FP4 quantization, which we
+                // do not do either. Omitting the pair is exact, and keeping
+                // f32 is strictly more accurate than the reference — not an
+                // approximation to be fixed later.
                 let ih = ix.weights_proj.rows();
                 let idim = ix.wq_b.rows() / ih.max(1);
                 let mut qi = vec![0.0f32; ix.wq_b.rows()];
