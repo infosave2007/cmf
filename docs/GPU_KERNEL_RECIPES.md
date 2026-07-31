@@ -121,6 +121,7 @@ the next pass as a prologue/epilogue instead of opening their own:
 | Subgroup top-k (`moe_select_sg`) | +~2, kept | subgroupMax/Min rounds, two barriers per slot instead of eight |
 | Pair the GDN a/b projections in one dispatch | 99.8 → 98.8 | two nv-row dispatches already overlap in-pass; the pair kernel's flat row space serializes them |
 | Device argmax at k=1 (4-byte readback vs 1 MB) | 100.0 → 98.5 | two extra dispatches cost more than the PCIe transfer they save |
+| vec4 staging in the batched GEMM trio | 18.9 vs 18.6 prefill (noise) | the GEMM already stages through workgroup memory; its loads were never the wall — the ~300 GFLOP/s ceiling is elsewhere (register blocking / K-step shape) |
 
 ## The failure mode that looks like slowness
 
@@ -142,6 +143,9 @@ this exact class. **If a model got slower after a shader edit, check
   it — the q1t ternary layout solves the same problem with an explicit
   zero code; q1 (binary) cannot represent zero at all, which is one reason
   PTQ-to-q1 destroys normal checkpoints.
+- The batched GEMM (`q4tp_mul_mm`, shared by dense prefill and the Lumina
+  DiT) did NOT respond to the load-shape recipe. Its next candidate is the
+  K-step and register-block shape, not the loads.
 - Expert-restriction masks (`moe-mask`, patent 2) are a VRAM lever, not a
   decode-speed lever: routing entropy on the models we measured is ~0.94,
   decode always runs top-k experts regardless, and the frame cost lives in
