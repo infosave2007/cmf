@@ -1626,8 +1626,9 @@ fn q4tp_matvec(@builtin(workgroup_id) wid: vec3<u32>,
 // consumed in the exact q4b_dot8 order.
 @group(0) @binding(5) var<storage, read> q4v_x : array<vec4<f32>>;
 
-var<workgroup> lad_q4v: array<f32, 128>;
+var<workgroup> lad_q4v: array<f32, 256>;
 var<workgroup> partial_q4v: array<f32, 256>;
+var<workgroup> partial_q4vb: array<f32, 256>;
 
 fn q4v_dot8(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
     return (f32(w & 0xFu) - 8.0) * a.x
@@ -1651,10 +1652,15 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
     let cstride = (gpr * 5u + 7u) / 8u;
     let sub = lid >> 6u;
     let l = lid & 63u;
-    var base = wid.x * 4u;
+    // 8 rows per workgroup, register-blocked in pairs: sub-block `sub` owns
+    // rows base+sub and base+sub+4, and every x vec4 fetched for a group
+    // feeds BOTH rows' dot chains — the x side of the LSU load nearly
+    // halves. Each row's group order and add order stay those of the
+    // one-row kernel.
+    var base = wid.x * 8u;
     loop {
         if (base >= rows) { break; }
-        if (lid < 128u) {
+        {
             let r = base + (lid >> 5u);
             if (r < rows) {
                 let pr = unpack2x16float(q1w[params_w + r]);
@@ -1662,40 +1668,62 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
             }
         }
         workgroupBarrier();
-        let row = base + sub;
-        var acc = 0.0;
-        if (row < rows) {
+        let row_a = base + sub;
+        let row_b = base + sub + 4u;
+        let live_a = row_a < rows;
+        let live_b = row_b < rows;
+        var acc_a = 0.0;
+        var acc_b = 0.0;
+        if (live_a) {
+            let crow_a = codes_b + row_a * cstride;
+            let crow_b = codes_b + row_b * cstride;
             var g = l;
             loop {
                 if (g >= gpr) { break; }
                 let bit = g * 5u;
-                let cb = codes_b + row * cstride + (bit >> 3u);
+                let cbo = bit >> 3u;
                 let sh = bit & 7u;
-                var cv = q4tp_byte(cb);
-                if (sh > 3u) { cv = cv | (q4tp_byte(cb + 1u) << 8u); }
-                let scale = lad_q4v[(sub << 5u) + ((cv >> sh) & 31u)];
-                let v = q4v_w[row * gpr + g];
+                var cv_a = q4tp_byte(crow_a + cbo);
+                if (sh > 3u) { cv_a = cv_a | (q4tp_byte(crow_a + cbo + 1u) << 8u); }
+                let v_a = q4v_w[row_a * gpr + g];
                 let xq = g * 8u;
-                acc = acc + scale
-                    * (q4v_dot8(v.x, q4v_x[xq], q4v_x[xq + 1u])
-                     + q4v_dot8(v.y, q4v_x[xq + 2u], q4v_x[xq + 3u])
-                     + q4v_dot8(v.z, q4v_x[xq + 4u], q4v_x[xq + 5u])
-                     + q4v_dot8(v.w, q4v_x[xq + 6u], q4v_x[xq + 7u]));
+                let x0 = q4v_x[xq];      let x1 = q4v_x[xq + 1u];
+                let x2 = q4v_x[xq + 2u]; let x3 = q4v_x[xq + 3u];
+                let x4 = q4v_x[xq + 4u]; let x5 = q4v_x[xq + 5u];
+                let x6 = q4v_x[xq + 6u]; let x7 = q4v_x[xq + 7u];
+                let sa = lad_q4v[(sub << 5u) + ((cv_a >> sh) & 31u)];
+                acc_a = acc_a + sa
+                    * (q4v_dot8(v_a.x, x0, x1) + q4v_dot8(v_a.y, x2, x3)
+                     + q4v_dot8(v_a.z, x4, x5) + q4v_dot8(v_a.w, x6, x7));
+                if (live_b) {
+                    var cv_b = q4tp_byte(crow_b + cbo);
+                    if (sh > 3u) { cv_b = cv_b | (q4tp_byte(crow_b + cbo + 1u) << 8u); }
+                    let v_b = q4v_w[row_b * gpr + g];
+                    let sb = lad_q4v[128u + (sub << 5u) + ((cv_b >> sh) & 31u)];
+                    acc_b = acc_b + sb
+                        * (q4v_dot8(v_b.x, x0, x1) + q4v_dot8(v_b.y, x2, x3)
+                         + q4v_dot8(v_b.z, x4, x5) + q4v_dot8(v_b.w, x6, x7));
+                }
                 g = g + 64u;
             }
         }
-        partial_q4v[lid] = acc;
+        partial_q4v[lid] = acc_a;
+        partial_q4vb[lid] = acc_b;
         workgroupBarrier();
         var stride = 32u;
         loop {
             if (stride == 0u) { break; }
-            if (l < stride) { partial_q4v[lid] = partial_q4v[lid] + partial_q4v[lid + stride]; }
+            if (l < stride) {
+                partial_q4v[lid] = partial_q4v[lid] + partial_q4v[lid + stride];
+                partial_q4vb[lid] = partial_q4vb[lid] + partial_q4vb[lid + stride];
+            }
             workgroupBarrier();
             stride = stride >> 1u;
         }
-        if (l == 0u && row < rows) { q1y[row] = partial_q4v[sub << 6u]; }
+        if (l == 0u && row_a < rows) { q1y[row_a] = partial_q4v[sub << 6u]; }
+        if (l == 0u && row_b < rows) { q1y[row_b] = partial_q4vb[sub << 6u]; }
         workgroupBarrier();
-        base = base + nwg.x * 4u;
+        base = base + nwg.x * 8u;
     }
 }
 
@@ -5833,7 +5861,7 @@ pub fn forward_token_graph(
                     return Some((
                         &c.q4tp_mv4,
                         bind,
-                        (rows as u32).div_ceil(4).min(MAX_WG),
+                        (rows as u32).div_ceil(8).min(MAX_WG),
                     ));
                 }
                 let pl = match m.kind {
@@ -10160,7 +10188,7 @@ fn encode_q4tp_mv4(
     });
     pass.set_pipeline(&c.q4tp_mv4);
     pass.set_bind_group(0, &bind, &[]);
-    pass.dispatch_workgroups((rows as u32).div_ceil(4).min(MAX_WG), 1, 1);
+    pass.dispatch_workgroups((rows as u32).div_ceil(8).min(MAX_WG), 1, 1);
 }
 
 fn encode_q1t_like(
