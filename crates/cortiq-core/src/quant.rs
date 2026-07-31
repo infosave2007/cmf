@@ -430,6 +430,41 @@ pub fn dequant_q4tp(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) {
     }
 }
 
+/// Chunk bytes per `q2tp` group — 32 weights at 2 bits. The scale ladder,
+/// row params and 5-bit rung codes are byte-identical to `q4tp`'s planes;
+/// only the weight plane shrinks from 16 to 8 bytes per group.
+pub const Q2TP_CHUNK: usize = 8;
+
+/// Byte offsets inside a `q2tp` payload: `(params_off, codes_off, code_stride)`.
+/// Layout is `[2-bit chunks][row params: (f16 lo, f16 step)][codes]`.
+pub fn q2tp_sections(rows: usize, cols: usize) -> (usize, usize, usize) {
+    let gpr = cols / GROUP_SIZE;
+    let chunk = rows * gpr * Q2TP_CHUNK;
+    (chunk, chunk + rows * 4, q4tp_code_stride(gpr))
+}
+
+/// Dequantize a full `q2tp` tensor. Weights are 2-bit fields, LSB-first
+/// within each byte: code c ∈ 0..4 → (c − 1.5)·s.
+pub fn dequant_q2tp(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) {
+    let gpr = cols / GROUP_SIZE;
+    let (params_off, codes_off, stride) = q2tp_sections(rows, cols);
+    let params = &bytes[params_off..params_off + rows * 4];
+    for r in 0..rows {
+        let tab = q4tp_ladder(params, r);
+        let codes = &bytes[codes_off + r * stride..codes_off + (r + 1) * stride];
+        for g in 0..gpr {
+            let s = tab[q4tp_code(codes, g)];
+            let chunk = &bytes[(r * gpr + g) * Q2TP_CHUNK..(r * gpr + g + 1) * Q2TP_CHUNK];
+            let base = r * cols + g * GROUP_SIZE;
+            for (k, &byte) in chunk.iter().enumerate() {
+                for j in 0..4 {
+                    dst[base + k * 4 + j] = (((byte >> (2 * j)) & 3) as f32 - 1.5) * s;
+                }
+            }
+        }
+    }
+}
+
 /// Byte layout of a `vbit_ro` payload (roadmap §4.2):
 /// `[u8 bits: rows][f16 scales: rows·cols/32][u32 row_offsets: rows+1]
 ///  [bit-packed rows]` — offsets are relative to the packed area, so
@@ -537,6 +572,20 @@ pub fn expected_nbytes(dtype: TensorDtype, shape: &[usize]) -> Option<usize> {
                 .checked_add(rows.checked_mul(4)?)?
                 .checked_add(rows.checked_mul(q4tp_code_stride(gpr))?)
         }
+        TensorDtype::Q2TiledP => {
+            if shape.len() != 2 {
+                return None;
+            }
+            let (rows, cols) = (shape[0], shape[1]);
+            if cols % GROUP_SIZE != 0 {
+                return None;
+            }
+            let gpr = cols / GROUP_SIZE;
+            rows.checked_mul(gpr)?
+                .checked_mul(Q2TP_CHUNK)?
+                .checked_add(rows.checked_mul(4)?)?
+                .checked_add(rows.checked_mul(q4tp_code_stride(gpr))?)
+        }
         TensorDtype::Q8_2f => {
             let out = *shape.first()?;
             let inn = n / out.max(1);
@@ -557,6 +606,7 @@ fn has_fixed_payload_size(dtype: TensorDtype) -> bool {
             | TensorDtype::Q4Block
             | TensorDtype::Q4Tiled
             | TensorDtype::Q4TiledP
+            | TensorDtype::Q2TiledP
             | TensorDtype::Q1
             | TensorDtype::Q8_2f
     )
@@ -579,6 +629,17 @@ pub fn validate_payload(dtype: TensorDtype, shape: &[usize], bytes: &[u8]) -> Re
         if shape[1] == 0 || shape[1] % GROUP_SIZE != 0 {
             return Err(format!(
                 "q4tp cols {} not a positive multiple of {GROUP_SIZE}",
+                shape[1]
+            ));
+        }
+    }
+    if dtype == TensorDtype::Q2TiledP {
+        if shape.len() != 2 {
+            return Err(format!("q2tp tensor must be 2-D, got {shape:?}"));
+        }
+        if shape[1] == 0 || shape[1] % GROUP_SIZE != 0 {
+            return Err(format!(
+                "q2tp cols {} not a positive multiple of {GROUP_SIZE}",
                 shape[1]
             ));
         }
@@ -720,6 +781,12 @@ pub fn dequant_tensor(entry: &TensorEntry, bytes: &[u8], dst: &mut [f32]) -> Res
             }
             dequant_q4tp(bytes, entry.shape[0], entry.shape[1], dst);
         }
+        TensorDtype::Q2TiledP => {
+            if entry.shape.len() != 2 {
+                return Err(format!("q2tp tensor '{}' must be 2-D", entry.name));
+            }
+            dequant_q2tp(bytes, entry.shape[0], entry.shape[1], dst);
+        }
         TensorDtype::Q1 => dequant_q1(bytes, dst),
         TensorDtype::Q1S => dequant_q1s(bytes, dst),
         TensorDtype::Q1T => {
@@ -769,6 +836,8 @@ pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
         // 16 B nibbles + 5 bits of scale per 32 weights; the 4 B/row of
         // ladder params are shape-dependent and not counted here.
         TensorDtype::Q4TiledP => 0.519_531_25,
+        // 8 B chunks + the same 5-bit rung per 32 weights.
+        TensorDtype::Q2TiledP => 0.269_531_25,
         TensorDtype::Vbit | TensorDtype::VbitRo => 0.5,
         TensorDtype::Q1 => 0.1875, // 6 bytes per 32 weights
         // q1 base + a small sparse f16 overlay (informational; the true

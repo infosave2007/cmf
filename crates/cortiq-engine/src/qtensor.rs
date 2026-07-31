@@ -13,7 +13,8 @@
 
 use crate::pool::{Pool, matvec_rows, matvec_rows2};
 use cortiq_core::quant::{
-    GROUP_SIZE, Q1_TILE, Q4_TILE, Q4TP_NIB, f16_to_f32, q4tp_code, q4tp_ladder, q4tp_sections,
+    GROUP_SIZE, Q1_TILE, Q2TP_CHUNK, Q4_TILE, Q4TP_NIB, f16_to_f32, q4tp_code, q4tp_ladder,
+    q2tp_sections, q4tp_sections,
 };
 use cortiq_core::{CmfModel, TensorDtype};
 use std::sync::Arc;
@@ -231,6 +232,18 @@ impl QTensor {
                 vbit_offsets: Vec::new(),
                 repack: Vec::new(),
             }),
+            // q2tp: 2-bit chunks from mmap, scale from the same row ladder.
+            TensorDtype::Q2TiledP if cols % GROUP_SIZE == 0 => Ok(Self::Mapped {
+                model: model.clone(),
+                idx,
+                dtype: entry.dtype,
+                rows,
+                cols,
+                row_scale: Vec::new(),
+                col_field: Vec::new(),
+                vbit_offsets: Vec::new(),
+                repack: Vec::new(),
+            }),
             TensorDtype::Q4Block if cols % GROUP_SIZE == 0 => Ok(Self::Mapped {
                 model: model.clone(),
                 idx,
@@ -319,6 +332,7 @@ impl QTensor {
                     | TensorDtype::Q4Block
                     | TensorDtype::Q4Tiled
                     | TensorDtype::Q4TiledP
+                    | TensorDtype::Q2TiledP
                     | TensorDtype::Q8Row
                     | TensorDtype::Q8_2f,
                 rows,
@@ -543,6 +557,24 @@ impl QTensor {
                         for (k, &b) in tile.iter().enumerate() {
                             dst[gi * GROUP_SIZE + k * 2] = ((b & 0x0F) as f32 - 8.0) * s;
                             dst[gi * GROUP_SIZE + k * 2 + 1] = (((b >> 4) & 0x0F) as f32 - 8.0) * s;
+                        }
+                    }
+                    return;
+                }
+                if *dtype == TensorDtype::Q2TiledP {
+                    let bytes = self.quant_bytes();
+                    let gpr = cols / GROUP_SIZE;
+                    let v = Q4tpView::new_q2(bytes, self.rows(), cols);
+                    let mut sc = vec![0f32; gpr];
+                    v.scales_into(r, gpr, &mut sc);
+                    for gi in 0..gpr {
+                        let ch = &v.nib[(r * gpr + gi) * Q2TP_CHUNK..(r * gpr + gi + 1) * Q2TP_CHUNK];
+                        let s = sc[gi];
+                        for (k, &b) in ch.iter().enumerate() {
+                            for j in 0..4 {
+                                dst[gi * GROUP_SIZE + k * 4 + j] =
+                                    (((b >> (2 * j)) & 3) as f32 - 1.5) * s;
+                            }
                         }
                     }
                     return;
@@ -811,6 +843,10 @@ impl QTensor {
                     q4tp_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
                     return;
                 }
+                if *dtype == TensorDtype::Q2TiledP {
+                    q2tp_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
+                    return;
+                }
                 if *dtype == TensorDtype::Q1 {
                     // GPU route for large q1 matvecs (out_proj / lm_head
                     // class): the CPU q1 kernel is load-port-bound at
@@ -1049,6 +1085,10 @@ impl QTensor {
                 }
                 if *dtype == TensorDtype::Q4TiledP {
                     q4tp_matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
+                    return;
+                }
+                if *dtype == TensorDtype::Q2TiledP {
+                    q2tp_matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
                     return;
                 }
                 if *dtype == TensorDtype::Q1 {
@@ -3785,6 +3825,17 @@ impl<'a> Q4tpView<'a> {
         }
     }
 
+    /// The q2tp view: identical params/codes planes, 8 B weight chunks.
+    fn new_q2(bytes: &'a [u8], rows: usize, cols: usize) -> Self {
+        let (params_off, codes_off, stride) = q2tp_sections(rows, cols);
+        Self {
+            nib: &bytes[..params_off],
+            params: &bytes[params_off..codes_off],
+            codes: &bytes[codes_off..],
+            stride,
+        }
+    }
+
     /// Expand row `r`'s per-tile scales into `out` (length `gpr`).
     ///
     /// Doing this once per row — rather than decoding a 5-bit code inside the
@@ -4069,6 +4120,79 @@ fn q4tp_matvec2(
             unsafe {
                 *p1.at(r) = q4tp_row_exact(v.nib, r, gpr, x1, &sc);
                 *p2.at(r) = q4tp_row_exact(v.nib, r, gpr, x2, &sc);
+            }
+        }
+    };
+    dispatch_rows(pool, rows, &run);
+}
+
+/// Exact f32 dot of one q2tp row: 2-bit fields LSB-first, (c − 1.5)·s.
+/// Scalar on purpose — the 2-bit class targets the GPU graph; the CPU
+/// path exists for parity gates and small-machine fallback.
+fn q2tp_row_exact(chunks: &[u8], r: usize, gpr: usize, x: &[f32], scales: &[f32]) -> f32 {
+    let mut acc = 0f32;
+    for gi in 0..gpr {
+        let ch = &chunks[(r * gpr + gi) * Q2TP_CHUNK..(r * gpr + gi + 1) * Q2TP_CHUNK];
+        let s = scales[gi];
+        let xb = &x[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE];
+        let mut g = 0f32;
+        for (k, &b) in ch.iter().enumerate() {
+            g += ((b & 3) as f32 - 1.5) * xb[k * 4]
+                + (((b >> 2) & 3) as f32 - 1.5) * xb[k * 4 + 1]
+                + (((b >> 4) & 3) as f32 - 1.5) * xb[k * 4 + 2]
+                + (((b >> 6) & 3) as f32 - 1.5) * xb[k * 4 + 3];
+        }
+        acc += s * g;
+    }
+    acc
+}
+
+fn q2tp_matvec(
+    bytes: &[u8],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    debug_assert_eq!(out.len(), rows);
+    let gpr = cols / GROUP_SIZE;
+    let v = Q4tpView::new_q2(bytes, rows, cols);
+    let out_addr = SendMut(out.as_mut_ptr());
+    let run = |start: usize, end: usize| {
+        let mut sc = vec![0f32; gpr];
+        for r in start..end {
+            v.scales_into(r, gpr, &mut sc);
+            // SAFETY: disjoint row ranges per worker.
+            unsafe { *out_addr.at(r) = q2tp_row_exact(v.nib, r, gpr, x, &sc) };
+        }
+    };
+    dispatch_rows(pool, rows, &run);
+}
+
+/// Fused two-input q2tp matvec — the SwiGLU gate/up pair.
+#[allow(clippy::too_many_arguments)]
+fn q2tp_matvec2(
+    bytes: &[u8],
+    x1: &[f32],
+    x2: &[f32],
+    rows: usize,
+    cols: usize,
+    o1: &mut [f32],
+    o2: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    let gpr = cols / GROUP_SIZE;
+    let v = Q4tpView::new_q2(bytes, rows, cols);
+    let (p1, p2) = (SendMut(o1.as_mut_ptr()), SendMut(o2.as_mut_ptr()));
+    let run = |start: usize, end: usize| {
+        let mut sc = vec![0f32; gpr];
+        for r in start..end {
+            v.scales_into(r, gpr, &mut sc);
+            // SAFETY: disjoint row ranges per worker.
+            unsafe {
+                *p1.at(r) = q2tp_row_exact(v.nib, r, gpr, x1, &sc);
+                *p2.at(r) = q2tp_row_exact(v.nib, r, gpr, x2, &sc);
             }
         }
     };

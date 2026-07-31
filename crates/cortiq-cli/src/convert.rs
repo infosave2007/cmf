@@ -18,8 +18,8 @@
 use crate::npy;
 use cortiq_core::format::{CMF_VERSION, CmfHeader, CmfModel, TensorSpec, TokenizerBundle};
 use cortiq_core::quant::{
-    Q4TP_LMAX, Q4TP_NIB, bf16_to_f32, f16_to_f32, f32_to_f16, q4tp_code_stride, q4tp_ladder,
-    q4tp_put_code,
+    Q2TP_CHUNK, Q4TP_LMAX, Q4TP_NIB, bf16_to_f32, f16_to_f32, f32_to_f16, q4tp_code_stride,
+    q4tp_ladder, q4tp_put_code,
 };
 use cortiq_core::types::{
     LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle, QuantType, TensorDtype,
@@ -371,6 +371,11 @@ pub(crate) enum Quant {
     /// scale becomes a 5-bit rung on a per-row ladder — 7.3% off a q4t file
     /// for 1.14% RMS weight perturbation (q4t's own error vs fp16 is ~10%).
     Q4TiledP,
+    /// 2-bit tiles on the q4tp ladder (Escha-W2 size class). As a whole-model
+    /// profile the converter applies it to MoE `gate_up` experts only and
+    /// keeps `down` experts and the skeleton at q4tp — the 2/4 split that
+    /// mirrors Escha's 2/3-bit choice.
+    Q2TiledP,
     /// 1-bit binary (explicit opt-in): for 1-bit-TRAINED models
     /// (Bonsai / BitNet class), where per-group weights already sit on
     /// two levels ±s and the encoding is (near-)lossless. As PTQ of a
@@ -413,6 +418,10 @@ pub(crate) fn quantize_2d(
             (TensorDtype::Q4TiledP, encode_q4tp(vals, out_dim, in_dim))
         }
         Quant::Q4TiledP => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
+        Quant::Q2TiledP if in_dim % GROUP_SIZE == 0 => {
+            (TensorDtype::Q2TiledP, encode_q2tp(vals, out_dim, in_dim))
+        }
+        Quant::Q2TiledP => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
         Quant::Vbit if in_dim % GROUP_SIZE == 0 => {
             (TensorDtype::VbitRo, encode_vbit_ro(vals, out_dim, in_dim))
         }
@@ -447,12 +456,13 @@ pub(crate) fn parse_quant(s: &str) -> anyhow::Result<Quant> {
         "vbit" | "v_bit" => Quant::Vbit,
         "q4t" | "q4_tiled" => Quant::Q4Tiled,
         "q4tp" | "q4t_pred" => Quant::Q4TiledP,
+        "q2tp" | "q2t_pred" => Quant::Q2TiledP,
         "q1" => Quant::Q1,
         "q1p" | "q1_ptq" => Quant::Q1p,
         "q1s" | "q1_mask" => Quant::Q1s,
         "q1t" | "q1_ternary" => Quant::Q1t,
         other => anyhow::bail!(
-            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, q4tp, f16, vbit, q1, q1p, q1s, or q1t)"
+            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, q4tp, q2tp, f16, vbit, q1, q1p, q1s, or q1t)"
         ),
     })
 }
@@ -539,6 +549,83 @@ pub(crate) fn encode_q4_tiled(vals: &[f32], out_dim: usize, in_dim: usize) -> Ve
 /// costs almost nothing because the nibbles re-round against it. Rounding the
 /// code to nearest beats rounding up (1.19% vs 1.60% RMS against q4t's output):
 /// letting the top tile clip a nibble costs less than coarsening the whole row.
+/// `q2tp`: the `q4tp` ladder with a 2-bit weight plane (8 B per 32-group).
+/// Levels are (c − 1.5)·s, so the group scale fits absmax/1.5. Built for
+/// transcoding 2-bit-class checkpoints (Escha-W2) where the source already
+/// paid the big quantization cost — and for MoE experts generally.
+pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
+    debug_assert_eq!(vals.len(), out_dim * in_dim);
+    debug_assert_eq!(in_dim % GROUP_SIZE, 0);
+    let gpr = in_dim / GROUP_SIZE;
+    let stride = q4tp_code_stride(gpr);
+    let mut chunks = vec![0u8; out_dim * gpr * Q2TP_CHUNK];
+    let mut params = vec![0u8; out_dim * 4];
+    let mut codes = vec![0u8; out_dim * stride];
+    let mut lg = vec![0f32; gpr];
+    let mut dead = vec![false; gpr];
+
+    for r in 0..out_dim {
+        let row = &vals[r * in_dim..(r + 1) * in_dim];
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for g in 0..gpr {
+            let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+            let absmax = tile.iter().fold(0f32, |m, v| m.max(v.abs()));
+            dead[g] = absmax == 0.0;
+            lg[g] = f16_scale(absmax / 1.5).log2();
+            if !dead[g] {
+                lo = lo.min(lg[g]);
+                hi = hi.max(lg[g]);
+            }
+        }
+        if !lo.is_finite() {
+            lo = lg[0];
+            hi = lo;
+        }
+        let lo_h = f32_to_f16(lo);
+        let lo_r = f16_to_f32(lo_h);
+        let span = (hi - lo_r).max(0.0);
+        let mut st_h = f32_to_f16(span / Q4TP_LMAX as f32);
+        for _ in 0..64 {
+            let st = f16_to_f32(st_h);
+            if st > 0.0 && lo_r + Q4TP_LMAX as f32 * st >= hi {
+                break;
+            }
+            st_h += 1;
+        }
+        params[r * 4..r * 4 + 2].copy_from_slice(&lo_h.to_le_bytes());
+        params[r * 4 + 2..r * 4 + 4].copy_from_slice(&st_h.to_le_bytes());
+
+        let st = f16_to_f32(st_h);
+        let tab = q4tp_ladder(&params, r);
+        let crow = &mut codes[r * stride..(r + 1) * stride];
+        for g in 0..gpr {
+            let c = if dead[g] || st <= 0.0 {
+                0
+            } else {
+                ((lg[g] - lo_r) / st).round_ties_even().clamp(0.0, Q4TP_LMAX as f32) as usize
+            };
+            q4tp_put_code(crow, g, c);
+            let inv = if tab[c] > 0.0 { 1.0 / tab[c] } else { 0.0 };
+            let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+            let dst = &mut chunks[(r * gpr + g) * Q2TP_CHUNK..(r * gpr + g + 1) * Q2TP_CHUNK];
+            for (k, d) in dst.iter_mut().enumerate() {
+                let mut b = 0u8;
+                for j in 0..4 {
+                    // (c − 1.5)·s: quantize w/s + 1.5 onto 0..=3.
+                    let q = (tile[k * 4 + j] * inv + 1.5)
+                        .round_ties_even()
+                        .clamp(0.0, 3.0) as u8;
+                    b |= q << (2 * j);
+                }
+                *d = b;
+            }
+        }
+    }
+    chunks.extend_from_slice(&params);
+    chunks.extend_from_slice(&codes);
+    chunks
+}
+
 pub(crate) fn encode_q4tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
     debug_assert_eq!(vals.len(), out_dim * in_dim);
     debug_assert_eq!(in_dim % GROUP_SIZE, 0);
@@ -2485,6 +2572,15 @@ pub fn run_convert(
     mut progress: impl FnMut(f32),
 ) -> anyhow::Result<()> {
     let quant = parse_quant(quant)?;
+    // The q2tp PROFILE: 2-bit tiles go to the MoE gate/up experts only —
+    // `down` experts and the whole skeleton stay q4tp (the 2/4 split that
+    // mirrors Escha's 2/3-bit choice). `gu_quant` is what gate/up get.
+    let gu_quant = quant;
+    let quant = if matches!(quant, Quant::Q2TiledP) {
+        Quant::Q4TiledP
+    } else {
+        quant
+    };
 
     // Source: a local HF directory, or an HF repo id — hub checkpoints
     // convert STREAMED: one weight shard on disk at a time.
@@ -2832,9 +2928,10 @@ pub fn run_convert(
                                 nm: String,
                                 vals: &[f32],
                                 rows: usize,
-                                cols: usize| {
+                                cols: usize,
+                                q: Quant| {
                         let (dt, data) = if rows * cols >= GROUP_SIZE && !force_f16(&nm) {
-                            quantize_2d(quant, vals, rows, cols)
+                            quantize_2d(q, vals, rows, cols)
                         } else {
                             (TensorDtype::F16, encode_f16(vals))
                         };
@@ -2865,6 +2962,7 @@ pub fn run_convert(
                             &gate,
                             mi,
                             hid,
+                            gu_quant,
                         );
                         emit(
                             &mut *tensors,
@@ -2872,6 +2970,7 @@ pub fn run_convert(
                             &up,
                             mi,
                             hid,
+                            gu_quant,
                         );
                     } else {
                         let mut down = vec![0.0f32; hid * mi];
@@ -2890,6 +2989,7 @@ pub fn run_convert(
                             &down,
                             hid,
                             mi,
+                            quant,
                         );
                     }
                 }
@@ -3203,7 +3303,7 @@ pub fn run_convert(
         Quant::Q4Block => QuantType::Q4Block,
         Quant::F16 => QuantType::F16,
         Quant::Vbit => QuantType::Vbit,
-        Quant::Q4Tiled | Quant::Q4TiledP => QuantType::Q4Block,
+        Quant::Q4Tiled | Quant::Q4TiledP | Quant::Q2TiledP => QuantType::Q4Block,
         // File-level label only (per-tensor truth is in the directory);
         // Vbit is the closest existing informational bucket for q1.
         Quant::Q1 | Quant::Q1p | Quant::Q1s | Quant::Q1t => QuantType::Vbit,

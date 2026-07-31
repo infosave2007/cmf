@@ -89,6 +89,12 @@ pub enum TensorDtype {
     /// Nibbles are 16 B and therefore BETTER aligned than q4t's 18 B
     /// stride. 2-D tensors with cols % 32 == 0 only.
     Q4TiledP = 15,
+    /// 2-bit tiles with the `q4tp` predicted per-row scale ladder: the
+    /// params/codes side planes are byte-identical to `Q4TiledP`; only the
+    /// weight plane shrinks to 8 B per 32-weight group (4 weights/byte,
+    /// LSB-first). Code c ∈ 0..4 → (c − 1.5)·s. 2-D, cols % 32 == 0.
+    /// Built for MoE experts in the Escha-W2 size class.
+    Q2TiledP = 16,
 }
 
 impl TensorDtype {
@@ -110,6 +116,7 @@ impl TensorDtype {
             13 => Self::Q1S,
             14 => Self::Q1T,
             15 => Self::Q4TiledP,
+            16 => Self::Q2TiledP,
             _ => return None,
         })
     }
@@ -136,6 +143,7 @@ impl TensorDtype {
             Self::Q1S => "q1s",
             Self::Q1T => "q1t",
             Self::Q4TiledP => "q4tp",
+            Self::Q2TiledP => "q2tp",
         }
     }
 
@@ -158,6 +166,7 @@ impl TensorDtype {
                 | Self::Q1S
                 | Self::Q1T
                 | Self::Q4TiledP
+                | Self::Q2TiledP
         )
     }
 }
