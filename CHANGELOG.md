@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.43] — 2026-07-31
+
+A GPU-kernel release. Same weights, same answers, roughly half the frame:
+decode on a discrete card went **67.8 → 99.6 tok/s** on Qwen3.6-35B-A3B,
+**32.3 → 39.1** on the dense 27B, **37.5 → 77.6** on a q4t 3B and
+**28.8 → 37.4** on a q1t 8B. Nothing here changes a file format.
+
+### Added
+- **`q2tp`, a 2-bit tile layout** (dtype 16): the `q4tp` predicted per-row
+  scale ladder over a 4-level ±0.5/±1.5 grid, 8 bytes per 32-weight group.
+  Rung 0 of the ladder is an EXACT ZERO — the grid cannot otherwise spell
+  one, and a pruned group would come back as noise. `--quant q2tp` writes
+  the mixed profile the 2-bit-class checkpoints want: 2-bit expert
+  `gate`/`up` (routed AND shared), 4-bit `down` and skeleton.
+- **GPU frame profiler**: `CMF_GPU_TS=1` stamps pass boundaries,
+  `CMF_GPU_TS=2` stamps every dispatch inside the first layer of each kind.
+  Every optimization below was found with it; see
+  `docs/GPU_KERNEL_RECIPES.md` for the recipes AND the measured failures.
+
+### Changed
+- **Attention decode kernel**: 256 threads per head (lanes are positions
+  for the scores, output dims for the values) instead of one warp with a
+  257-stride accumulator — 137 → 45 µs a layer. `CMF_ATTEND_DEC=0` reverts.
+- **GDN state access follows the layout's grain**: four dv-contiguous
+  columns per workgroup as one 16-byte access instead of a column per
+  workgroup striding the row. The single largest step of the release.
+- **vec4 loads across the kernels**: q4tp matvec (8-row and a 16-row twin
+  for narrow matrices), the q4t matvec, the MoE gate/up and down kernels,
+  and the batched GEMM trio. Add order is preserved everywhere, so greedy
+  output is unchanged — gated on real models, not just unit tests.
+- **q1t** reads each base-3 code byte once for its five codes instead of
+  re-reading it per weight.
+- **Fewer compute passes**: the layer's norms ride the FFN pass, and a
+  short-context attention layer runs rope + kv-append + attend + gate +
+  O-projection in ONE pass. `CMF_PASSFUSE=0` reverts.
+- **Subgroup MoE select** where the adapter carries the feature
+  (`Features::SUBGROUP`), in its own shader module. `CMF_SELECT_SG=0` off.
+
+### Notes
+- Binary `q1` was measured and left alone: it reads 4 bytes per 32 weights
+  and the recipe buys nothing there (152.8 vs 152.3 tok/s).
+- Multi-step greedy decode (k frames per submit, on-device argmax) is
+  implemented behind `CMF_MULTISTEP` and defaults OFF — at equal
+  generation length it measured at or below the plain path.
+
 ## [0.5.42] — 2026-07-31
 
 The Qwen3.6 release. The hybrid MoE flagship (35B-A3B) and the dense 27B run
