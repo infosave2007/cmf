@@ -611,3 +611,104 @@ fn tempdir() -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+// ─────────────── one-pass streaming writer ───────────────
+
+/// The streaming writer exists so a 300B-class conversion never holds its
+/// payloads twice. Its output has to be indistinguishable from `write`'s,
+/// which is what this checks: same bytes per tensor, same alignment
+/// contract, clean `verify()`, and a directory the reader agrees with.
+#[test]
+fn stream_writer_matches_the_ordinary_writer() {
+    use cortiq_core::format::CmfStreamWriter;
+
+    use cortiq_core::format::LARGE_TENSOR_ALIGN;
+    let dir = tempdir();
+    let (a, b) = (dir.join("stream.cmf"), dir.join("plain.cmf"));
+
+    // A large tensor (page-aligned path) and two small ones (64-aligned).
+    let rows = 64usize;
+    let cols = 256usize;
+    let vals: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.017).sin()).collect();
+    let tensors = vec![
+        TensorSpec {
+            name: "big.weight".into(),
+            dtype: TensorDtype::Q8Row,
+            shape: vec![rows, cols],
+            data: encode_q8_row(&vals, rows, cols),
+        },
+        TensorSpec {
+            name: "small.norm".into(),
+            dtype: TensorDtype::F16,
+            shape: vec![8],
+            data: (0..8)
+                .flat_map(|i| f32_to_f16(i as f32 * 0.25).to_le_bytes())
+                .collect(),
+        },
+        TensorSpec {
+            name: "tiny.bias".into(),
+            dtype: TensorDtype::F32,
+            shape: vec![3],
+            data: (0..3).flat_map(|i| (i as f32).to_le_bytes()).collect(),
+        },
+    ];
+    let vocab = b"stream-vocab".to_vec();
+
+    let mut w = CmfStreamWriter::new(&a, CmfStreamWriter::head_reserve_for(8, 32)).unwrap();
+    for t in &tensors {
+        w.push(&t.name, t.dtype, &t.shape, &t.data).unwrap();
+    }
+    assert_eq!(w.tensor_count(), 3);
+    w.finish(&tiny_header(), None, Some(&vocab)).unwrap();
+
+    CmfModel::write(&b, &tiny_header(), &tensors, None, Some(&vocab)).unwrap();
+
+    let sm = CmfModel::open(&a).unwrap();
+    let pm = CmfModel::open(&b).unwrap();
+    assert!(sm.verify().is_empty(), "streamed file failed verify()");
+    assert_eq!(sm.tensors.len(), pm.tensors.len());
+    for t in &tensors {
+        assert_eq!(
+            sm.tensor_bytes(&t.name).unwrap(),
+            &t.data[..],
+            "tensor '{}' differs from what was pushed",
+            t.name
+        );
+        let (se, pe) = (sm.tensor(&t.name).unwrap(), pm.tensor(&t.name).unwrap());
+        assert_eq!(se.hash, pe.hash, "tensor '{}' hash differs", t.name);
+        assert_eq!(se.nbytes, pe.nbytes);
+        assert_eq!(se.shape, pe.shape);
+        assert_eq!(se.off, pe.off, "tensor '{}' blob offset differs", t.name);
+    }
+    for e in &sm.tensors {
+        assert_eq!(e.off % 64, 0);
+    }
+    assert!(
+        sm.tensor("big.weight").unwrap().off % LARGE_TENSOR_ALIGN == 0,
+        "large tensor lost its page alignment in the streamed writer"
+    );
+    assert_eq!(sm.vocab, Some(vocab.clone()));
+    assert_eq!(sm.vocab, pm.vocab);
+}
+
+/// The gap is the writer's one failure mode: the directory is not sized until
+/// the last tensor lands, and by then the payloads are at a fixed offset. It
+/// must refuse rather than write a truncated head over live data.
+#[test]
+fn stream_writer_refuses_a_head_that_does_not_fit() {
+    use cortiq_core::format::CmfStreamWriter;
+
+    let dir = tempdir();
+    let path = dir.join("cramped.cmf");
+    let mut w = CmfStreamWriter::new(&path, 4096).unwrap();
+    for i in 0..64 {
+        let name = format!("layer.{i}.a.rather.long.tensor.name.that.eats.the.pool");
+        w.push(&name, TensorDtype::F32, &[4], &[0u8; 16]).unwrap();
+    }
+    let err = w.finish(&tiny_header(), None, None).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("reserved"),
+        "expected a loud refusal about the reserve, got: {msg}"
+    );
+}

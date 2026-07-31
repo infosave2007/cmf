@@ -1116,6 +1116,39 @@ pub fn load(
 mod tests {
     use super::*;
 
+    /// Numerical parity with the reference. The vectors below come from
+    /// running `kernel.py::hc_split_sinkhorn`'s own formula on a fixed
+    /// input; matching them pins the exponent order, the eps placement and
+    /// the off-by-one in the iteration count all at once — a property test
+    /// alone would pass with any of those wrong.
+    #[test]
+    fn sinkhorn_matches_the_reference_numbers() {
+        let hc = 4;
+        let mixes: Vec<f32> = (0..24).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+        let base: Vec<f32> = (0..24).map(|i| (i as f32 * 0.11).cos()).collect();
+        let (mut pre, mut post, mut comb) = (vec![0.0; hc], vec![0.0; hc], vec![0.0; hc * hc]);
+        hc_split_sinkhorn(
+            &mixes, &[1.0, 1.0, 1.0], &base, hc, 20, 1e-6, &mut pre, &mut post, &mut comb,
+        );
+        let want_pre = [0.7310596, 0.8888268, 0.9525191, 0.97424865];
+        let want_post = [1.9600224, 1.9534285, 1.9201256, 1.8160983];
+        let want_comb = [
+            0.5996052, 0.28253591, 0.09218107, 0.025676856,
+            0.17564717, 0.22228767, 0.27174541, 0.33031881,
+            0.029528176, 0.12206022, 0.32619134, 0.5222193,
+            0.19521846, 0.37311527, 0.30988118, 0.12178412,
+        ];
+        for (i, w) in want_pre.iter().enumerate() {
+            assert!((pre[i] - w).abs() < 1e-5, "pre[{i}]: {} vs {w}", pre[i]);
+        }
+        for (i, w) in want_post.iter().enumerate() {
+            assert!((post[i] - w).abs() < 1e-5, "post[{i}]: {} vs {w}", post[i]);
+        }
+        for (i, w) in want_comb.iter().enumerate() {
+            assert!((comb[i] - w).abs() < 1e-4, "comb[{i}]: {} vs {w}", comb[i]);
+        }
+    }
+
     /// Sinkhorn's whole point is a doubly stochastic matrix: every row and
     /// every column sums to one. If the alternating normalization is wrong
     /// (or the loop count is off by one) the sums drift, and the residual

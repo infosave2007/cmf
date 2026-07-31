@@ -22,7 +22,7 @@ use crate::types::{ModelArch, QuantType, TensorDtype};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const CMF_MAGIC: [u8; 4] = *b"CMF\x01";
@@ -1047,7 +1047,7 @@ impl CmfModel {
         Ok(())
     }
 
-    fn encode_directory(entries: &[TensorEntry]) -> Vec<u8> {
+    pub(crate) fn encode_directory(entries: &[TensorEntry]) -> Vec<u8> {
         let mut pool = Vec::new();
         let mut name_offs = Vec::with_capacity(entries.len());
         for e in entries {
@@ -1082,6 +1082,237 @@ fn align_to(x: u64, a: u64) -> u64 {
 
 fn zeros(n: usize) -> Vec<u8> {
     vec![0u8; n]
+}
+
+// ─────────────────── one-pass streaming writer (§8.4) ───────────────────
+
+/// Writes a CMF file in a single pass, payloads first.
+///
+/// [`CmfModel::write_ref`] needs every payload addressable at once, so a
+/// converter has to hold the whole encoded model — RAM, or a spill file it
+/// then copies into the output. For a 300B-class MoE that is ~120 GB written
+/// twice. This writer instead reserves a gap at the head of the file, appends
+/// each payload the moment it is encoded, and patches the envelope, header and
+/// directory into that gap at the end. The bytes are written once and peak
+/// disk cost is the finished file.
+///
+/// The gap is the one thing that can go wrong: the directory is not sized
+/// until the last tensor arrives. [`CmfStreamWriter::finish`] therefore
+/// refuses loudly if the head does not fit rather than truncating it, and
+/// [`CmfStreamWriter::head_reserve_for`] gives callers a safe estimate.
+pub struct CmfStreamWriter {
+    file: BufWriter<File>,
+    path: PathBuf,
+    /// Absolute offset of the weight blob — also the size of the reserved gap.
+    data_off: u64,
+    /// Write cursor, relative to `data_off`.
+    cursor: u64,
+    entries: Vec<TensorEntry>,
+}
+
+impl CmfStreamWriter {
+    /// A gap that comfortably holds the head for `n_tensors` whose names run
+    /// to `avg_name` bytes: the directory's fixed records, the name pool, the
+    /// envelope, and a header JSON with room for arch metadata — then doubled,
+    /// because being wrong here costs a whole re-run.
+    pub fn head_reserve_for(n_tensors: usize, avg_name: usize) -> u64 {
+        let dir = 16 + n_tensors * (DIR_RECORD_LEN + 6 + avg_name);
+        let head = ENVELOPE_LEN + dir + (1 << 20);
+        // Tripled and floored at 16 MB. The asymmetry is deliberate: an
+        // over-estimate costs a few MB of zeros in the file, an
+        // under-estimate costs the entire conversion that produced it.
+        align_to(3 * head as u64, DATA_ALIGNMENT).max(16 << 20)
+    }
+
+    /// `gap` bytes are reserved for envelope + header + directory.
+    pub fn new(path: impl AsRef<Path>, gap: u64) -> Result<Self, CmfError> {
+        let path = path.as_ref().to_path_buf();
+        let data_off = align_to(gap.max(ENVELOPE_LEN as u64 + 1), DATA_ALIGNMENT);
+        let mut file = BufWriter::new(File::create(&path)?);
+        file.write_all(&zeros(data_off as usize))?;
+        Ok(Self {
+            file,
+            path,
+            data_off,
+            cursor: 0,
+            entries: Vec::new(),
+        })
+    }
+
+    /// Append one tensor. The payload is consumed here, so the caller can drop
+    /// it immediately — that is the entire point of this writer.
+    pub fn push(
+        &mut self,
+        name: &str,
+        dtype: TensorDtype,
+        shape: &[usize],
+        data: &[u8],
+    ) -> Result<(), CmfError> {
+        if shape.len() > DIR_MAX_NDIM {
+            return Err(CmfError::Parse(format!(
+                "tensor '{}': ndim {} > {}",
+                name,
+                shape.len(),
+                DIR_MAX_NDIM
+            )));
+        }
+        if let Some(expect) = expected_nbytes(dtype, shape) {
+            if expect != data.len() {
+                return Err(CmfError::Bounds(format!(
+                    "tensor '{}': data {} bytes != expected {} for {:?}{:?}",
+                    name,
+                    data.len(),
+                    expect,
+                    dtype,
+                    shape
+                )));
+            }
+        }
+        let align = if data.len() as u64 >= LARGE_TENSOR_MIN {
+            LARGE_TENSOR_ALIGN
+        } else {
+            TENSOR_ALIGNMENT
+        };
+        let off = align_to(self.cursor, align);
+        self.file.write_all(&zeros((off - self.cursor) as usize))?;
+        self.file.write_all(data)?;
+        self.entries.push(TensorEntry {
+            name: name.to_string(),
+            dtype,
+            shape: shape.to_vec(),
+            off,
+            nbytes: data.len() as u64,
+            shard: 0,
+            hash: hash64(data),
+        });
+        self.cursor = off + data.len() as u64;
+        Ok(())
+    }
+
+    pub fn tensor_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Bytes of weight blob written so far.
+    pub fn data_len(&self) -> u64 {
+        self.cursor
+    }
+
+    /// Write the trailing sections, then patch the head into the reserved gap.
+    pub fn finish(
+        mut self,
+        header: &CmfHeader,
+        masks: Option<&MaskCatalog>,
+        vocab: Option<&[u8]>,
+    ) -> Result<(), CmfError> {
+        let data_len = self.cursor;
+
+        let masks_bytes = match masks {
+            Some(catalog) if !catalog.masks.is_empty() => {
+                Some(encode_masks_section(catalog, &header.arch).map_err(CmfError::Parse)?)
+            }
+            _ => None,
+        };
+        let index_bytes = match masks {
+            Some(catalog) if !catalog.masks.is_empty() => {
+                Some(encode_sparse_index(&build_sparse_index(catalog, &header.arch)))
+            }
+            _ => None,
+        };
+        if let Some(mb) = &masks_bytes {
+            self.file.write_all(mb)?;
+        }
+        if let Some(vb) = vocab {
+            self.file.write_all(vb)?;
+        }
+        if let Some(ib) = &index_bytes {
+            self.file.write_all(ib)?;
+        }
+        self.file.flush()?;
+
+        let dir_bytes = CmfModel::encode_directory(&self.entries);
+
+        let hex = |b: Option<&[u8]>| b.map(|b| format!("{:016x}", hash64(b)));
+        let mut header = header.clone();
+        if masks_bytes.is_some() || vocab.is_some() || index_bytes.is_some() {
+            header.section_hashes = Some(SectionHashes {
+                masks: hex(masks_bytes.as_deref()),
+                vocab: hex(vocab),
+                index: hex(index_bytes.as_deref()),
+            });
+        }
+        let header_json =
+            serde_json::to_vec(&header).map_err(|e| CmfError::Parse(format!("header: {e}")))?;
+
+        let mut required_features = features::TENSOR_DIR;
+        if masks_bytes.is_some() {
+            required_features |= features::BINARY_MASKS;
+        }
+        if self
+            .entries
+            .iter()
+            .any(|t| matches!(t.dtype, TensorDtype::Q8_2f | TensorDtype::Vbit))
+        {
+            required_features |= features::QUANT_2F;
+        }
+
+        let header_off = ENVELOPE_LEN as u64;
+        let dir_off = header_off + header_json.len() as u64;
+        let head_len = dir_off + dir_bytes.len() as u64;
+        if head_len > self.data_off {
+            return Err(CmfError::Parse(format!(
+                "streamed head is {head_len} bytes but only {} were reserved — \
+                 the payloads are already on disk at a fixed offset, so this \
+                 file cannot be salvaged; re-run with a larger reserve",
+                self.data_off
+            )));
+        }
+        let data_off = self.data_off;
+        let masks_off = data_off + data_len;
+        let masks_len = masks_bytes.as_ref().map(|b| b.len() as u64).unwrap_or(0);
+        let vocab_off = masks_off + masks_len;
+        let vocab_len = vocab.map(|b| b.len() as u64).unwrap_or(0);
+        let index_off = vocab_off + vocab_len;
+        let index_len = index_bytes.as_ref().map(|b| b.len() as u64).unwrap_or(0);
+
+        let mut env = Vec::with_capacity(ENVELOPE_LEN);
+        env.extend_from_slice(&CMF_MAGIC);
+        env.extend_from_slice(&CMF_VERSION.to_le_bytes());
+        env.extend_from_slice(&0u32.to_le_bytes());
+        env.extend_from_slice(&required_features.to_le_bytes());
+        for (off, len) in [
+            (header_off, header_json.len() as u64),
+            (dir_off, dir_bytes.len() as u64),
+            (data_off, data_len),
+            (if masks_len > 0 { masks_off } else { 0 }, masks_len),
+            (if vocab_len > 0 { vocab_off } else { 0 }, vocab_len),
+            (if index_len > 0 { index_off } else { 0 }, index_len),
+        ] {
+            env.extend_from_slice(&off.to_le_bytes());
+            env.extend_from_slice(&len.to_le_bytes());
+        }
+        env.extend_from_slice(&hash64(&header_json).to_le_bytes());
+        env.extend_from_slice(&hash64(&dir_bytes).to_le_bytes());
+        env.resize(ENVELOPE_LEN, 0);
+
+        let mut f = self
+            .file
+            .into_inner()
+            .map_err(|e| CmfError::Io(e.into_error()))?;
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(&env)?;
+        f.write_all(&header_json)?;
+        f.write_all(&dir_bytes)?;
+        f.flush()?;
+
+        tracing::info!(
+            "Wrote CMF v2 (streamed): {} ({} tensors, {:.1} MB)",
+            self.path.display(),
+            self.entries.len(),
+            (data_off + data_len + masks_len + vocab_len + index_len) as f64 / 1e6
+        );
+        Ok(())
+    }
 }
 
 // ───────────────────── sparse index (§7 of the spec) ─────────────────────
