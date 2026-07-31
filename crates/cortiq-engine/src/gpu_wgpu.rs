@@ -943,7 +943,7 @@ fn add_rmsnorm_b(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
 // (WGSL twin of Metal attn_rope_qkn; the qk-norm sum-of-squares reduces in
 // workgroup memory — no subgroup ops, portable). Heads [0,nh)=Q (2·hd each
 // when gated: q||gate), [nh,nh+nkv)=K. flags: 1=gate 2=qnorm 4=knorm 8=gemma.
-struct RqP { nh: u32, nkv: u32, hd: u32, rd: u32, pos: u32, flags: u32, eps: f32, _p: u32 };
+struct RqP { nh: u32, nkv: u32, hd: u32, rd: u32, pos: u32, flags: u32, eps: f32, tok: u32 };
 @group(0) @binding(0) var<storage, read>       rq_qraw : array<f32>;
 @group(0) @binding(1) var<storage, read_write> rq_k    : array<f32>;
 @group(0) @binding(2) var<storage, read_write> rq_qout : array<f32>;
@@ -964,13 +964,17 @@ fn attn_rope_qkn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
     let isq = head < nh;
     let gate = (rq_p.flags & 1u) != 0u;
     let src_base = select((head - nh) * hd, head * select(1u, 2u, gate) * hd, isq);
+    // Batch-graph token offsets (0 in the token graph): q rows live in the
+    // batched projection output, K is rotated IN PLACE in its batch slice.
+    let qoff = rq_p.tok * nh * select(1u, 2u, gate) * hd;
+    let koff = rq_p.tok * rq_p.nkv * hd;
     let nt = (hd + 31u) / 32u;  // ≤ 8 for head_dim ≤ 256 (Qwen3.5 uses 256)
     var xv: array<f32, 8>;
     var ss = 0.0;
     for (var t = 0u; t < nt; t = t + 1u) {
         let d = t * 32u + lane;
         var val = 0.0;
-        if (d < hd) { val = select(rq_k[src_base + d], rq_qraw[src_base + d], isq); }
+        if (d < hd) { val = select(rq_k[koff + src_base + d], rq_qraw[qoff + src_base + d], isq); }
         xv[t] = val;
         ss = ss + val * val;
     }
@@ -1024,14 +1028,14 @@ fn attn_rope_qkn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
     for (var t = 0u; t < nt; t = t + 1u) {
         let d = t * 32u + lane;
         if (d < hd) {
-            if (isq) { rq_qout[dst_base + d] = rq_head[d]; } else { rq_k[dst_base + d] = rq_head[d]; }
+            if (isq) { rq_qout[dst_base + d] = rq_head[d]; } else { rq_k[koff + dst_base + d] = rq_head[d]; }
         }
     }
     if (isq && gate) {
         let gbase = head * 2u * hd + hd;
         for (var t = 0u; t < nt; t = t + 1u) {
             let d = t * 32u + lane;
-            if (d < hd) { rq_gout[head * hd + d] = rq_qraw[gbase + d]; }
+            if (d < hd) { rq_gout[head * hd + d] = rq_qraw[qoff + gbase + d]; }
         }
     }
 }
@@ -1044,15 +1048,21 @@ struct KvP { nkv: u32, hd: u32, cap: u32, stored: u32 };
 @group(0) @binding(2) var<storage, read_write> kv_kb : array<f32>;
 @group(0) @binding(3) var<storage, read_write> kv_vb : array<f32>;
 @group(0) @binding(4) var<uniform>             kv_p  : KvP;
+// `stored` carries the batch token index in its high bits (pos | tok<<20):
+// the batch graph appends straight from its batched K/V buffers, the token
+// graph passes tok=0 and reads from offset zero as before. Positions stay
+// under 2^20, far above any cap the cache allows.
 @compute @workgroup_size(256)
 fn kv_append(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= kv_p.nkv * kv_p.hd) { return; }
+    let stored = kv_p.stored & 0xFFFFFu;
+    let toff = (kv_p.stored >> 20u) * kv_p.nkv * kv_p.hd;
     let h = i / kv_p.hd;
     let d = i % kv_p.hd;
-    let dst = (h * kv_p.cap + kv_p.stored) * kv_p.hd + d;
-    kv_kb[dst] = kv_k[i];
-    kv_vb[dst] = kv_v[i];
+    let dst = (h * kv_p.cap + stored) * kv_p.hd + d;
+    kv_kb[dst] = kv_k[toff + i];
+    kv_vb[dst] = kv_v[toff + i];
 }
 
 // Grouped decode attention, one 32-thread workgroup per Q-head. Dims sliced
@@ -6641,22 +6651,25 @@ pub fn forward_batch_graph(
                 ematb(&mut enc, wk, &n1, &kb_b, nkv * hd, hidden);
                 ematb(&mut enc, wv, &n1, &vb_b, nkv * hd, hidden);
                 for i in 0..k {
-                    cp(&mut enc, &qraw_b, i * qrows, &qraw_s, qrows);
-                    cp(&mut enc, &kb_b, i * nkv * hd, &kb_s, nkv * hd);
-                    cp(&mut enc, &vb_b, i * nkv * hd, &vb_s, nkv * hd);
                     let p = positions[i];
                     let gate_flag = if *output_gate { 1u32 } else { 0 };
-                    let rope_u = unif(&[
-                        nh as u32,
-                        nkv as u32,
-                        hd as u32,
-                        rd as u32,
-                        p as u32,
-                        flags(q_norm.is_some(), k_norm.is_some()) | gate_flag,
-                        eps.to_bits(),
-                        0,
-                    ]);
-                    let kv_u = unif(&[nkv as u32, hd as u32, cap as u32, p as u32]);
+                    // Token offsets ride the kernels' spare uniform words —
+                    // the three staging copies this loop carried were half
+                    // its commands.
+                    let rope_u = uniform_u32x8(
+                        c,
+                        [
+                            nh as u32,
+                            nkv as u32,
+                            hd as u32,
+                            rd as u32,
+                            p as u32,
+                            flags(q_norm.is_some(), k_norm.is_some()) | gate_flag,
+                            eps.to_bits(),
+                            i as u32,
+                        ],
+                    );
+                    let kv_u = uniform_u32x4(c, [nkv as u32, hd as u32, cap as u32, (p | (i << 20)) as u32]);
                     let at_u = unif(&[
                         nh as u32,
                         (nh / nkv) as u32,
@@ -6673,7 +6686,7 @@ pub fn forward_batch_graph(
                         &bg(
                             &c.layout_attn_rope,
                             &[
-                                &qraw_s, &kb_s, &qout_s, &gout_s, &qnw, &knw, &invf_b, &rope_u,
+                                &qraw_b, &kb_b, &qout_s, &gout_s, &qnw, &knw, &invf_b, &rope_u,
                             ],
                         ),
                         (nh + nkv) as u32,
@@ -6681,7 +6694,7 @@ pub fn forward_batch_graph(
                     go(
                         &mut enc,
                         &c.kv_append,
-                        &bg(&c.layout_kv, &[&kb_s, &vb_s, kbuf, vbuf, &kv_u]),
+                        &bg(&c.layout_kv, &[&kb_b, &vb_b, kbuf, vbuf, &kv_u]),
                         ((nkv * hd) as u32).div_ceil(256),
                     );
                     let (ap, al) = attend_pipes(c, hd);
