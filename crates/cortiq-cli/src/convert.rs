@@ -1127,6 +1127,58 @@ pub(crate) fn unpack_mxfp4(
     Ok(out)
 }
 
+/// OCP FP8 E4M3 → f32. 1 sign, 4 exp (bias 7), 3 mantissa; no infinities,
+/// and exp=15,mant=7 is the only NaN. Subnormals are m·2^-9.
+#[inline]
+pub(crate) fn fp8_e4m3_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0 };
+    let exp = ((b >> 3) & 0x0F) as i32;
+    let man = (b & 0x07) as f32;
+    let mag = if exp == 0 {
+        man * (2f32).powi(-9)
+    } else {
+        (1.0 + man / 8.0) * (2f32).powi(exp - 7)
+    };
+    sign * mag
+}
+
+/// DeepSeek-V4 style FP8 weights: E4M3 values with one E8M0 scale per
+/// `block`×`block` tile (`quantization_config.weight_block_size`). The
+/// scale plane is `ceil(rows/block) × ceil(cols/block)`, row-major, and
+/// the tiles at the edges are partial — the model's own layout, not a
+/// padded one.
+pub(crate) fn unpack_fp8_blocks(
+    packed: &[u8],
+    scales: &[u8],
+    rows: usize,
+    cols: usize,
+    block: usize,
+) -> anyhow::Result<Vec<f32>> {
+    anyhow::ensure!(block > 0, "fp8 blocks: block size 0");
+    let sr = rows.div_ceil(block);
+    let sc = cols.div_ceil(block);
+    anyhow::ensure!(
+        packed.len() == rows * cols && scales.len() == sr * sc,
+        "fp8 blocks: weight {} (want {}) / scales {} (want {}) for {rows}x{cols} block {block}",
+        packed.len(),
+        rows * cols,
+        scales.len(),
+        sr * sc
+    );
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        let br = r / block;
+        for c in 0..cols {
+            let k = scales[br * sc + c / block];
+            // E8M0: 2^(k−127); 255 is NaN per OCP — refuse loudly rather
+            // than fold a NaN through the whole row.
+            anyhow::ensure!(k != 255, "fp8 blocks: NaN scale at ({r},{c})");
+            out[r * cols + c] = fp8_e4m3_to_f32(packed[r * cols + c]) * (k as f32 - 127.0).exp2();
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn unpack_mlx(
     w_raw: &[u8],
     s_raw: &[u8],
@@ -3471,6 +3523,38 @@ mod tests {
     /// code planes untouched — a wrong section offset reads scales out of
     /// weight bytes and still produces fluent-looking numbers, so pin the
     /// length AND the reader's own view of it.
+    /// E4M3 has no infinities and one NaN; the values below are the
+    /// bit patterns that pin its exponent bias and its subnormal step.
+    #[test]
+    fn fp8_e4m3_decodes_the_ocp_reference_points() {
+        assert_eq!(fp8_e4m3_to_f32(0x00), 0.0);
+        assert_eq!(fp8_e4m3_to_f32(0x38), 1.0); // exp 7 → 2^0
+        assert_eq!(fp8_e4m3_to_f32(0xB8), -1.0);
+        assert_eq!(fp8_e4m3_to_f32(0x3C), 1.5); // 1 + 4/8
+        assert_eq!(fp8_e4m3_to_f32(0x40), 2.0);
+        assert_eq!(fp8_e4m3_to_f32(0x01), (2f32).powi(-9)); // smallest subnormal
+        assert_eq!(fp8_e4m3_to_f32(0x7E), 448.0); // largest finite
+    }
+
+    /// The block plane must be indexed by TILE, not by element: a wrong
+    /// stride still produces plausible numbers, which is how a silently
+    /// wrong conversion happens.
+    #[test]
+    fn fp8_block_scales_apply_per_tile() {
+        let (rows, cols, block) = (4usize, 4usize, 2usize);
+        // every weight is 1.0; scales differ per 2x2 tile: 2^0, 2^1 / 2^2, 2^3
+        let packed = vec![0x38u8; rows * cols];
+        let scales = vec![127u8, 128, 129, 130];
+        let out = unpack_fp8_blocks(&packed, &scales, rows, cols, block).unwrap();
+        assert_eq!(out[0], 1.0); // tile (0,0)
+        assert_eq!(out[2], 2.0); // tile (0,1)
+        assert_eq!(out[2 * cols], 4.0); // tile (1,0)
+        assert_eq!(out[2 * cols + 2], 8.0); // tile (1,1)
+        // a NaN scale must fail rather than poison the tensor
+        let bad = vec![255u8, 128, 129, 130];
+        assert!(unpack_fp8_blocks(&packed, &bad, rows, cols, block).is_err());
+    }
+
     #[test]
     fn q2tp_payload_length_and_sections_match_the_reader() {
         use cortiq_core::quant::{expected_nbytes, q2tp_sections, validate_payload};
