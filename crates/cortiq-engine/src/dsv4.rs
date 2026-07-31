@@ -228,6 +228,145 @@ pub fn hash_route(tid2eid: &[f32], vocab: usize, top_k: usize, tid: u32) -> Vec<
         .collect()
 }
 
+/// Rotary on the LAST `rd` dims only — the rest of the head carries no
+/// position. `inverse` runs the rotation backwards, which the reference
+/// applies to the attention OUTPUT before the o-projection (the value
+/// stream carries the same rope-tagged tail as the keys, and it has to be
+/// untagged again). Missing that step leaves a model that reads fluently
+/// and attends to the wrong offsets.
+pub fn rope_tail(v: &mut [f32], inv_freq: &[f32], pos: usize, rd: usize, inverse: bool) {
+    let n = v.len();
+    debug_assert!(rd <= n && rd % 2 == 0);
+    let base = n - rd;
+    let half = rd / 2;
+    for i in 0..half {
+        let theta = pos as f32 * inv_freq[i];
+        let (s, c) = (theta.sin(), theta.cos());
+        let s = if inverse { -s } else { s };
+        let a = v[base + i];
+        let b = v[base + i + half];
+        v[base + i] = a * c - b * s;
+        v[base + i + half] = a * s + b * c;
+    }
+}
+
+/// RMS normalize in place with no learned weight — the reference applies
+/// this to each attention head AFTER `wq_b`, on top of the `q_norm` that
+/// already normalized the LoRA rank. Two normalizations, not one.
+pub fn rms_inplace(v: &mut [f32], eps: f32) {
+    let ms = v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32;
+    let inv = 1.0 / (ms + eps).sqrt();
+    for x in v.iter_mut() {
+        *x *= inv;
+    }
+}
+
+/// Attention over an explicit position LIST (window ⊕ compressed), with a
+/// learned per-head sink. The sink is an extra logit with no value vector:
+/// it lets a head attend to "nothing", so its softmax denominator carries
+/// `exp(sink - max)` while contributing no output. Index `usize::MAX`
+/// marks a masked slot (the reference writes -1 into topk_idxs).
+pub fn sparse_attend(
+    q: &[f32],
+    kv: &[f32],
+    idxs: &[usize],
+    sink: f32,
+    scale: f32,
+    head_dim: usize,
+    out: &mut [f32],
+) {
+    let mut m = sink;
+    let mut scores = Vec::with_capacity(idxs.len());
+    for &p in idxs {
+        if p == usize::MAX {
+            scores.push(f32::NEG_INFINITY);
+            continue;
+        }
+        let k = &kv[p * head_dim..(p + 1) * head_dim];
+        let dot: f32 = q.iter().zip(k).map(|(a, b)| a * b).sum::<f32>() * scale;
+        m = m.max(dot);
+        scores.push(dot);
+    }
+    let mut denom = (sink - m).exp();
+    out.fill(0.0);
+    for (&p, &s) in idxs.iter().zip(&scores) {
+        if p == usize::MAX {
+            continue;
+        }
+        let w = (s - m).exp();
+        denom += w;
+        let v = &kv[p * head_dim..(p + 1) * head_dim];
+        for (o, x) in out.iter_mut().zip(v) {
+            *o += w * x;
+        }
+    }
+    let inv = 1.0 / denom;
+    for o in out.iter_mut() {
+        *o *= inv;
+    }
+}
+
+/// The grouped low-rank output projection: heads are split into `groups`,
+/// each group's slice is projected to `lora` by its own block of `wo_a`,
+/// and the concatenation goes through `wo_b`. `wo_a` is stored
+/// `[groups, lora, per_group]`.
+pub fn o_project(
+    attn: &[f32],
+    wo_a: &[f32],
+    wo_b: &[f32],
+    groups: usize,
+    lora: usize,
+    dim: usize,
+    out: &mut [f32],
+) {
+    let per_group = attn.len() / groups;
+    let mut mid = vec![0.0f32; groups * lora];
+    for g in 0..groups {
+        let src = &attn[g * per_group..(g + 1) * per_group];
+        let blk = &wo_a[g * lora * per_group..(g + 1) * lora * per_group];
+        for r in 0..lora {
+            let row = &blk[r * per_group..(r + 1) * per_group];
+            mid[g * lora + r] = row.iter().zip(src).map(|(a, b)| a * b).sum();
+        }
+    }
+    debug_assert_eq!(wo_b.len(), dim * mid.len());
+    for d in 0..dim {
+        let row = &wo_b[d * mid.len()..(d + 1) * mid.len()];
+        out[d] = row.iter().zip(&mid).map(|(a, b)| a * b).sum();
+    }
+}
+
+/// The KV compressor: `ratio` consecutive tokens collapse into one through
+/// a softmax over the window, with a learned in-window position bias added
+/// to the scores BEFORE the softmax. Both streams come from the same
+/// hidden state through `wkv` and `wgate`.
+pub fn compress_window(
+    kv: &[f32],
+    score: &[f32],
+    ape: &[f32],
+    ratio: usize,
+    width: usize,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(kv.len(), ratio * width);
+    debug_assert_eq!(ape.len(), ratio * width);
+    out.fill(0.0);
+    for d in 0..width {
+        let mut m = f32::NEG_INFINITY;
+        for t in 0..ratio {
+            m = m.max(score[t * width + d] + ape[t * width + d]);
+        }
+        let mut denom = 0.0;
+        for t in 0..ratio {
+            denom += (score[t * width + d] + ape[t * width + d] - m).exp();
+        }
+        for t in 0..ratio {
+            let w = (score[t * width + d] + ape[t * width + d] - m).exp() / denom;
+            out[d] += w * kv[t * width + d];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +443,71 @@ mod tests {
         assert!(w[0] < w[1], "biased expert kept its own (small) weight");
         let sum: f32 = w.iter().sum();
         assert!((sum - 1.5).abs() < 1e-5, "weights renormalize then scale");
+    }
+
+    /// The sink is an extra logit with no value: it must lower every
+    /// weight without adding output. With a huge sink the head should
+    /// attend to almost nothing.
+    #[test]
+    fn attention_sink_drains_weight_without_contributing_output() {
+        let hd = 2;
+        let q = [1.0f32, 0.0];
+        let kv = [1.0f32, 0.0, 0.0, 1.0];
+        let mut out = vec![0.0f32; hd];
+        sparse_attend(&q, &kv, &[0, 1], f32::NEG_INFINITY, 1.0, hd, &mut out);
+        let plain = out.clone();
+        assert!(plain[0] > plain[1], "the aligned key must dominate");
+        sparse_attend(&q, &kv, &[0, 1], 20.0, 1.0, hd, &mut out);
+        assert!(
+            out[0] < plain[0] * 0.01 && out[1] < plain[1] * 0.01,
+            "a large sink must drain nearly all the mass: {out:?}"
+        );
+    }
+
+    /// A masked slot must be ignored entirely — not folded in as a zero
+    /// key, which would still add exp(0) to the denominator.
+    #[test]
+    fn masked_positions_leave_the_denominator_alone() {
+        let hd = 2;
+        let q = [1.0f32, 0.0];
+        let kv = [1.0f32, 0.0, 0.0, 1.0];
+        let (mut a, mut b) = (vec![0.0f32; hd], vec![0.0f32; hd]);
+        sparse_attend(&q, &kv, &[0], f32::NEG_INFINITY, 1.0, hd, &mut a);
+        sparse_attend(&q, &kv, &[0, usize::MAX], f32::NEG_INFINITY, 1.0, hd, &mut b);
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-6, "{x} vs {y}");
+        }
+    }
+
+    /// Forward then inverse rotation is the identity — the property the
+    /// output path depends on.
+    #[test]
+    fn rope_tail_inverts_itself() {
+        let inv_freq = [1.0f32, 0.5];
+        let orig = [9.0f32, 8.0, 1.0, 2.0, 3.0, 4.0];
+        let mut v = orig;
+        rope_tail(&mut v, &inv_freq, 7, 4, false);
+        assert!(v[..2] == orig[..2], "the non-rope head must not move");
+        assert!(v[2..] != orig[2..], "the tail must actually rotate");
+        rope_tail(&mut v, &inv_freq, 7, 4, true);
+        for (a, b) in v.iter().zip(&orig) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+    }
+
+    /// The window pooling is a softmax per DIMENSION over the ratio, with
+    /// the position bias inside the exponent.
+    #[test]
+    fn compressor_pools_the_window_per_dimension() {
+        let (ratio, width) = (2usize, 2usize);
+        let kv = [1.0f32, 10.0, 3.0, 20.0];
+        // dim 0: equal scores → mean; dim 1: second token wins by a mile
+        let score = [0.0f32, 0.0, 0.0, 50.0];
+        let ape = vec![0.0f32; ratio * width];
+        let mut out = vec![0.0f32; width];
+        compress_window(&kv, &score, &ape, ratio, width, &mut out);
+        assert!((out[0] - 2.0).abs() < 1e-5, "equal scores average: {}", out[0]);
+        assert!((out[1] - 20.0).abs() < 1e-3, "a dominant score wins: {}", out[1]);
     }
 
     #[test]
