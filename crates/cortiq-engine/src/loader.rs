@@ -85,7 +85,7 @@ fn blend_f32(model: &CmfModel, name: &str, list: &[(String, f32)]) -> Result<Vec
 }
 
 /// Dequantize a tensor fully into f32 (norms, masked models).
-fn load_f32(model: &CmfModel, name: &str, ov: &Overlay) -> Result<Vec<f32>, String> {
+pub(crate) fn load_f32(model: &CmfModel, name: &str, ov: &Overlay) -> Result<Vec<f32>, String> {
     if ov.blend_touches(model, name) {
         if let Overlay::Blend(list) = ov {
             return blend_f32(model, name, list);
@@ -897,7 +897,12 @@ impl Pipeline {
         }
         let mut layers = Vec::with_capacity(arch.num_layers);
         let is_g3n = arch.g3n.is_some();
-        for li in 0..(if is_g3n { 0 } else { arch.num_layers }) {
+        // Architectures that load their own layer stack below. DeepSeek-V4
+        // has none of the canonical projections — no q/k/v/o_proj, no
+        // per-layer gate_proj — so the generic loop would demand
+        // `self_attn.q_proj.weight` and fail before its own loader ever ran.
+        let owns_its_layers = is_g3n || arch.arch_name == "deepseek_v4";
+        for li in 0..(if owns_its_layers { 0 } else { arch.num_layers }) {
             let prefix = format!("model.layers.{li}.");
             let attn = match arch.layer_types.get(li) {
                 Some(LayerType::LinearAttention) => load_linear_attn(&prefix)?,
@@ -1292,10 +1297,18 @@ impl Pipeline {
                 dim: arch.hidden_size,
                 n_heads: arch.num_attention_heads,
                 head_dim: arch.head_dim,
-                // The rope tail is 64 in the release; the header has no
-                // field for it, and the tensors cannot reveal it, so it
-                // is the one constant that stays pinned here.
-                rope_head_dim: 64.min(arch.head_dim),
+                // The rope tail: `partial_rotary_factor` carries it when the
+                // conversion recorded it (rd/head_dim), which the tensors
+                // cannot reveal. Files converted before that carry 1.0,
+                // meaning "unset" here rather than "rotate everything" —
+                // for those the release's 64 stands in, which is what they
+                // were converted from.
+                rope_head_dim: if arch.partial_rotary_factor < 1.0 {
+                    (((arch.head_dim as f32 * arch.partial_rotary_factor) as usize) & !1)
+                        .clamp(2, arch.head_dim)
+                } else {
+                    64.min(arch.head_dim)
+                },
                 // The LoRA ranks and the group count ARE visible in the
                 // weights, and reading them there means a re-tuned
                 // checkpoint loads without touching this code.

@@ -1580,6 +1580,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+    let is_dsv4 = model_type == "deepseek_v4";
     // DeepSeek-V4: the name mapping and both source quantizations (FP8
     // E4M3 with 128x128 block scales, MXFP4 experts) are in place, but
     // five of its blocks have no runtime yet — and without them the file
@@ -2083,7 +2084,18 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             .and_then(|v| v.as_bool())
             // MiniCPM3 ships no lm_head tensor — the head is the embedding.
             .unwrap_or(is_gemma || is_minicpm3),
-        partial_rotary_factor: prf,
+        // DeepSeek-V4 rotates only `qk_rope_head_dim` of each head's 512,
+        // and its config states that directly rather than as a fraction.
+        // Carrying it here is what lets a retuned checkpoint load without
+        // the loader guessing.
+        partial_rotary_factor: if is_dsv4 {
+            match (cfg_usize(tc, "qk_rope_head_dim"), cfg_usize(tc, "head_dim")) {
+                (Some(rd), Some(hd)) if hd > 0 => rd as f32 / hd as f32,
+                _ => prf,
+            }
+        } else {
+            prf
+        },
         yarn,
         attention_heads_per_layer,
         // MTP head, when the checkpoint ships one. Qwen3.6 spells the count

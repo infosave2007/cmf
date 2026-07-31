@@ -248,7 +248,10 @@ pub fn hash_route(tid2eid: &[f32], vocab: usize, top_k: usize, tid: u32) -> Vec<
 /// and attends to the wrong offsets.
 pub fn rope_tail(v: &mut [f32], inv_freq: &[f32], pos: usize, rd: usize, inverse: bool) {
     let n = v.len();
-    debug_assert!(rd <= n && rd % 2 == 0);
+    debug_assert!(rd <= n && rd % 2 == 0, "rope tail {rd} wider than the vector {n}");
+    // A tail wider than the vector is a configuration mistake, and `n - rd`
+    // would wrap into an index in the billions rather than say so.
+    let rd = rd.min(n) & !1;
     let base = n - rd;
     let half = rd / 2;
     for i in 0..half {
@@ -1191,14 +1194,11 @@ pub fn load(
     let q = |name: &str| -> Result<crate::qtensor::QTensor, String> {
         crate::qtensor::QTensor::from_model(model, name)
     };
+    // The small pieces — norms, the sink, ape, the hyper-connection
+    // projections — are read as plain f32. They are not all 2-D (a norm is a
+    // vector), so this cannot go through QTensor, which requires a matrix.
     let f = |name: &str| -> Result<Vec<f32>, String> {
-        let t = q(name)?;
-        let (r, c) = (t.rows(), t.cols());
-        let mut v = vec![0.0f32; r * c];
-        for i in 0..r {
-            t.row_f32(i, &mut v[i * c..(i + 1) * c]);
-        }
-        Ok(v)
+        crate::loader::load_f32(model, name, &crate::loader::Overlay::None)
     };
     let opt_f = |name: &str| -> Option<Vec<f32>> { f(name).ok() };
 

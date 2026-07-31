@@ -550,6 +550,18 @@ fn prefill_batched() -> bool {
         .unwrap_or(true)
 }
 
+/// The batched prefill walks `weights.layers`. Architectures that load
+/// their own stack (gemma-3n's AltUp replicas, DeepSeek-V4's hyper-
+/// connections) leave that empty and must go position by position — asking
+/// otherwise indexes an empty vector, which is a panic rather than a
+/// fallback. Every call site goes through here so the next such
+/// architecture is one line, not four.
+impl Pipeline {
+    fn can_prefill_batched(&self) -> bool {
+        prefill_batched() && !self.weights.layers.is_empty()
+    }
+}
+
 /// Prefill chunk (positions per batched pass). On macOS the AMX GEMM
 /// path wants tall panels — M=48 starves the matrix units (ggml uses
 /// ubatch 512); elsewhere the historical 48 stays. CMF_PREFILL_CHUNK
@@ -1488,7 +1500,7 @@ impl Pipeline {
         if task_mask.is_none()
             && !dyn_prefill
             && !graph_prefill
-            && prefill_batched()
+            && self.can_prefill_batched()
             && self.g3n.is_none()
             && input_ids.len() > 2
         {
@@ -2026,7 +2038,14 @@ impl Pipeline {
     /// this model. MLA and KDA run per position (their pair arms are
     /// unreachable); the seq prefill falls back to singles for them.
     fn pair_supported(&self) -> bool {
-        self.g3n.is_none()
+        // An EMPTY layer stack means the architecture loaded its own and
+        // this path has nothing to walk. Checking that directly, rather
+        // than naming each such architecture, is what makes the guard hold
+        // for the next one: `any()` over no layers is false, so a
+        // feature-by-feature test says "supported" for a model that has no
+        // layers here at all.
+        !self.weights.layers.is_empty()
+            && self.g3n.is_none()
             && !self
                 .weights
                 .layers
@@ -2286,7 +2305,7 @@ impl Pipeline {
         self.o1_begin();
         let mut hidden = vec![0.0f32; self.hidden_size];
         let mut pos = 0usize;
-        if task_mask.is_none() && prefill_batched() && ids.len() > 2 {
+        if task_mask.is_none() && self.can_prefill_batched() && ids.len() > 2 {
             // prefill-GEMM in chunks; only the last position's hidden is
             // needed. (o1-compatible: the batch path attends per position
             // through qwen_attention, which carries the collection hook.)
@@ -2407,7 +2426,7 @@ impl Pipeline {
         self.kv_history.clear();
         let mut nll = 0f64;
         let mut cnt = 0usize;
-        if prefill_batched() && self.g3n.is_none() {
+        if self.can_prefill_batched() {
             // prefill-GEMM: layer-major position chunks, lm_head batched
             // (254MB lm_head read once per chunk, not per position).
             // The layer chunk is large (grouping positions by MoE experts
@@ -2564,7 +2583,7 @@ impl Pipeline {
         let p = prefill.min(n);
         // Exact prompt pass over ids[..p]: the seal consumes its q/k/v.
         let mut pos = 0usize;
-        if prefill_batched() {
+        if self.can_prefill_batched() {
             const CHUNK: usize = 128;
             while pos < p {
                 let end = (pos + CHUNK).min(p);
