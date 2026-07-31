@@ -1620,9 +1620,25 @@ fn q4tp_matvec(@builtin(workgroup_id) wid: vec3<u32>,
 // 64-slot reduction tree are byte-identical to q4tp_matvec, so the kernels
 // are interchangeable under greedy parity.
 @group(0) @binding(4) var<storage, read> q4v_w : array<vec4<u32>>;
+// The activations again, as vec4: the scalar kernel issues 32 x-loads per
+// 16 B of weights and is LSU-bound long before it is bandwidth-bound
+// (measured 190 GB/s of 1.79 TB/s on the dense-FFN shapes). Components are
+// consumed in the exact q4b_dot8 order.
+@group(0) @binding(5) var<storage, read> q4v_x : array<vec4<f32>>;
 
 var<workgroup> lad_q4v: array<f32, 128>;
 var<workgroup> partial_q4v: array<f32, 256>;
+
+fn q4v_dot8(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
+    return (f32(w & 0xFu) - 8.0) * a.x
+         + (f32((w >> 4u) & 0xFu) - 8.0) * a.y
+         + (f32((w >> 8u) & 0xFu) - 8.0) * a.z
+         + (f32((w >> 12u) & 0xFu) - 8.0) * a.w
+         + (f32((w >> 16u) & 0xFu) - 8.0) * b.x
+         + (f32((w >> 20u) & 0xFu) - 8.0) * b.y
+         + (f32((w >> 24u) & 0xFu) - 8.0) * b.z
+         + (f32((w >> 28u) & 0xFu) - 8.0) * b.w;
+}
 
 @compute @workgroup_size(256)
 fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
@@ -1659,9 +1675,12 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
                 if (sh > 3u) { cv = cv | (q4tp_byte(cb + 1u) << 8u); }
                 let scale = lad_q4v[(sub << 5u) + ((cv >> sh) & 31u)];
                 let v = q4v_w[row * gpr + g];
-                let xb = g * 32u;
-                acc = acc + scale * (q4b_dot8(v.x, xb) + q4b_dot8(v.y, xb + 8u)
-                     + q4b_dot8(v.z, xb + 16u) + q4b_dot8(v.w, xb + 24u));
+                let xq = g * 8u;
+                acc = acc + scale
+                    * (q4v_dot8(v.x, q4v_x[xq], q4v_x[xq + 1u])
+                     + q4v_dot8(v.y, q4v_x[xq + 2u], q4v_x[xq + 3u])
+                     + q4v_dot8(v.z, q4v_x[xq + 4u], q4v_x[xq + 5u])
+                     + q4v_dot8(v.w, q4v_x[xq + 6u], q4v_x[xq + 7u]));
                 g = g + 64u;
             }
         }
@@ -5805,10 +5824,10 @@ pub fn forward_token_graph(
                         layout: &layout,
                         entries: &[
                             bind_buf(0, &m.buf),
-                            bind_buf(1, xs),
                             bind_buf(2, y),
                             bind_buf(3, &p_buf),
                             bind_buf(4, &m.buf),
+                            bind_buf(5, xs),
                         ],
                     });
                     return Some((
@@ -10129,10 +10148,10 @@ fn encode_q4tp_mv4(
         layout: &layout,
         entries: &[
             bind_buf(0, weight),
-            bind_buf(1, xs),
             bind_buf(2, y),
             bind_buf(3, &p_buf),
             bind_buf(4, weight),
+            bind_buf(5, xs),
         ],
     });
     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
