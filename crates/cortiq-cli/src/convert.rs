@@ -3205,8 +3205,16 @@ pub fn run_convert(
             }
             // 1-D tensors, tiny tensors, non-2-D, and gate-critical projections go f16.
             let two_d = m_shape.len() == 2 && numel >= GROUP_SIZE && !force_f16(&name);
+            // The SHARED expert rides in the same packed buffer as the routed
+            // ones (last slot), so its gate/up must carry the routed layout —
+            // the MoE kernels index that buffer with a single per-expert
+            // stride. A q4tp shared expert against q2tp routed ones makes the
+            // whole graph decline, silently, into a CPU MoE.
+            let shared_gu = name.contains(".shared_expert.gate_proj")
+                || name.contains(".shared_expert.up_proj");
+            let q_here = if shared_gu { gu_quant } else { quant };
             let (dt, data) = if two_d {
-                quantize_2d(quant, &vals, m_shape[0], m_shape[1])
+                quantize_2d(q_here, &vals, m_shape[0], m_shape[1])
             } else {
                 (TensorDtype::F16, encode_f16(&vals))
             };

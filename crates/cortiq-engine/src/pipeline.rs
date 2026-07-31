@@ -3531,6 +3531,14 @@ impl Pipeline {
                         if *q4tp.get_or_insert(is_p) != is_p
                             || *gu_q2.get_or_insert(is_q2) != is_q2
                         {
+                            // The shared expert rides in the same packed
+                            // buffer as the routed ones, so a layer that
+                            // mixes layouts cannot be indexed by one stride.
+                            // Say so: the symptom is a whole model quietly
+                            // running its MoE on the CPU.
+                            tracing::warn!(
+                                "MoE layer mixes expert layouts (q4tp={is_p}, q2tp gate/up={is_q2})                                  — every expert of a layer, INCLUDING the shared one, must share                                  a layout. The whole-token graph declines this layer."
+                            );
                             return None;
                         }
                         model.get_or_insert_with(|| mm.clone());
