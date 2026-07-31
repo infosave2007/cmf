@@ -2960,7 +2960,21 @@ struct MoeDnP { gpr: u32, hidden: u32, slots: u32, mat16: u32 };
 @group(0) @binding(5) var<uniform>             md_p   : MoeDnP;
 var<workgroup> md_pt: array<f32, 64>;
 
+// The activations again as vec4, on the SAME slot — the scalar view costs
+// one load per weight and put the down kernel at 33 us for ~5 MB of reads.
+@group(0) @binding(1) var<storage, read> md_actv : array<vec4<f32>>;
+
 fn md_u16(o: u32) -> u32 { return (md_w[o >> 1u] >> ((o & 1u) * 16u)) & 0xFFFFu; }
+fn md_dot8v(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
+    return (f32(w & 0xFu) - 8.0) * a.x
+         + (f32((w >> 4u) & 0xFu) - 8.0) * a.y
+         + (f32((w >> 8u) & 0xFu) - 8.0) * a.z
+         + (f32((w >> 12u) & 0xFu) - 8.0) * a.w
+         + (f32((w >> 16u) & 0xFu) - 8.0) * b.x
+         + (f32((w >> 20u) & 0xFu) - 8.0) * b.y
+         + (f32((w >> 24u) & 0xFu) - 8.0) * b.z
+         + (f32((w >> 28u) & 0xFu) - 8.0) * b.w;
+}
 fn md_dot8(w: u32, xi: u32) -> f32 {
     return (f32(w & 0xFu) - 8.0) * md_act[xi]
          + (f32((w >> 4u) & 0xFu) - 8.0) * md_act[xi + 1u]
@@ -3214,12 +3228,17 @@ fn moe_down_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
         if (shf > 3u) { cv = cv | (mdp_u8(cod8 + cb + 1u) << 8u); }
         let scale = exp2(pl.x + f32((cv >> shf) & 31u) * pl.y);
         let t16 = base16 + (row * gpr + g) * 8u;
-        let xb = (slot * gpr + g) * 32u;
-        var d = 0.0;
-        for (var k = 0u; k < 4u; k = k + 1u) {
-            let w = md_u16(t16 + 2u * k) | (md_u16(t16 + 1u + 2u * k) << 16u);
-            d = d + md_dot8(w, xb + 8u * k);
-        }
+        let xq = (slot * gpr + g) * 8u;
+        let x0 = md_actv[xq];      let x1 = md_actv[xq + 1u];
+        let x2 = md_actv[xq + 2u]; let x3 = md_actv[xq + 3u];
+        let x4 = md_actv[xq + 4u]; let x5 = md_actv[xq + 5u];
+        let x6 = md_actv[xq + 6u]; let x7 = md_actv[xq + 7u];
+        let w0 = md_u16(t16) | (md_u16(t16 + 1u) << 16u);
+        let w1 = md_u16(t16 + 2u) | (md_u16(t16 + 3u) << 16u);
+        let w2 = md_u16(t16 + 4u) | (md_u16(t16 + 5u) << 16u);
+        let w3 = md_u16(t16 + 6u) | (md_u16(t16 + 7u) << 16u);
+        let d = md_dot8v(w0, x0, x1) + md_dot8v(w1, x2, x3)
+              + md_dot8v(w2, x4, x5) + md_dot8v(w3, x6, x7);
         acc = acc + md_wt[slot] * scale * d;
     }
     md_pt[lid] = acc;
