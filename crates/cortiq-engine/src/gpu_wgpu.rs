@@ -28,8 +28,6 @@ const MAX_WG: u32 = 65_535;
 /// invalid function kills every entry point of a module (0.5.40's Metal
 /// lesson, re-learned on Vulkan this afternoon).
 const SELECT_SG_SRC: &str = r#"
-enable subgroups;
-
 struct MoeSelP { n_exp: u32, top_k: u32, norm: u32, pk: u32 };
 @group(0) @binding(0) var<storage, read>       sg_logit : array<f32>;
 @group(0) @binding(1) var<storage, read>       sg_slog  : array<f32>;
