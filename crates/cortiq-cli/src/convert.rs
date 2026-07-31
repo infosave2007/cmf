@@ -1511,16 +1511,14 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     // would convert and then decode noise. Say exactly what is missing
     // here, at the config, rather than after a 167 GB download.
     if model_type == "deepseek_v4" {
-        tracing::warn!(
-            "deepseek_v4 is not runnable yet — the converter reads its formats, \
-             the engine has no node for: (1) double-LoRA attention with a 512-wide \
-             compressed KV (wq_a/wq_b, wkv, wo_a/wo_b, attn_sink), (2) the per-layer \
-             KV compressor (attn.compressor.*), (3) the sparse indexer that picks \
-             index_topk positions (attn.indexer.*), (4) hyper-connections with \
-             Sinkhorn iterations (hc_*), (5) hash-routed layers whose expert comes \
-             from a token-id table (ffn.gate.tid2eid). The FILE converts — weights, \
-             names and both source quantizations are handled — but it will not decode \
-             until those land. Tracking: docs/OPTIMIZATION_ROADMAP.md"
+        tracing::info!(
+            "deepseek_v4: converting. The engine now carries all five of its \
+             blocks — double-LoRA attention with a compressed KV, the per-layer \
+             KV compressor, the sparse indexer, hyper-connections (Sinkhorn) and \
+             hash routing — so this file is meant to DECODE, not merely to pack. \
+             What has not been established is numerical parity against the \
+             reference implementation: treat the first coherent generation as \
+             the gate, not this message."
         );
     }
     let hidden = cfg_usize(tc, "hidden_size")
