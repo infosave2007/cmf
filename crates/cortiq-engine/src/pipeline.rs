@@ -3487,6 +3487,9 @@ impl Pipeline {
                     // q4t or q4tp, but not both in one layer — the kernels
                     // are picked per layer, not per expert.
                     let mut q4tp: Option<bool> = None;
+                    // The mixed 2-bit profile: q2tp gate/up over a q4tp
+                    // down. Uniform across the layer, like `q4tp` itself.
+                    let mut gu_q2: Option<bool> = None;
                     for e in m.experts.iter().chain(std::iter::once(se)) {
                         if !matches!(e.act, Act::Silu)
                             || e.gate_proj.rows() != inter
@@ -3494,26 +3497,40 @@ impl Pipeline {
                         {
                             return None;
                         }
-                        let (mm, gi, ui, di, is_p) = match e.gate_proj.mapped_q4t() {
+                        let (mm, gi, ui, di, is_p, is_q2) = match e.gate_proj.mapped_q4t() {
                             Some((mm, gi)) => (
                                 mm,
                                 gi,
                                 e.up_proj.mapped_q4t()?.1,
                                 e.down_proj.mapped_q4t()?.1,
                                 false,
+                                false,
                             ),
-                            None => {
-                                let (mm, gi) = e.gate_proj.mapped_q4tp()?;
-                                (
+                            None => match e.gate_proj.mapped_q2tp() {
+                                Some((mm, gi)) => (
                                     mm,
                                     gi,
-                                    e.up_proj.mapped_q4tp()?.1,
+                                    e.up_proj.mapped_q2tp()?.1,
                                     e.down_proj.mapped_q4tp()?.1,
                                     true,
-                                )
-                            }
+                                    true,
+                                ),
+                                None => {
+                                    let (mm, gi) = e.gate_proj.mapped_q4tp()?;
+                                    (
+                                        mm,
+                                        gi,
+                                        e.up_proj.mapped_q4tp()?.1,
+                                        e.down_proj.mapped_q4tp()?.1,
+                                        true,
+                                        false,
+                                    )
+                                }
+                            },
                         };
-                        if *q4tp.get_or_insert(is_p) != is_p {
+                        if *q4tp.get_or_insert(is_p) != is_p
+                            || *gu_q2.get_or_insert(is_q2) != is_q2
+                        {
                             return None;
                         }
                         model.get_or_insert_with(|| mm.clone());
@@ -3537,6 +3554,7 @@ impl Pipeline {
                         inter,
                         norm_topk: m.norm_topk_prob,
                         q4tp: q4tp?,
+                        gu_q2: gu_q2.unwrap_or(false),
                     }
                 }
             };
@@ -3770,6 +3788,9 @@ impl Pipeline {
                             inter,
                             norm_topk: m.norm_topk_prob,
                             q4tp: q4tp?,
+                            // The batched prefill kernels have no 2-bit
+                            // twin yet; a q2tp file prefills per position.
+                            gu_q2: false,
                         }
                     }
                     _ => return None,

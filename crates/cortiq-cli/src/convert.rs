@@ -18,8 +18,8 @@
 use crate::npy;
 use cortiq_core::format::{CMF_VERSION, CmfHeader, CmfModel, TensorSpec, TokenizerBundle};
 use cortiq_core::quant::{
-    Q2TP_CHUNK, Q4TP_LMAX, Q4TP_NIB, bf16_to_f32, f16_to_f32, f32_to_f16, q4tp_code_stride,
-    q4tp_ladder, q4tp_put_code,
+    Q2TP_CHUNK, Q2TP_LMAX, Q4TP_LMAX, Q4TP_NIB, bf16_to_f32, f16_to_f32, f32_to_f16,
+    q2tp_ladder, q4tp_code_stride, q4tp_ladder, q4tp_put_code,
 };
 use cortiq_core::types::{
     LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle, QuantType, TensorDtype,
@@ -584,10 +584,10 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
         let lo_h = f32_to_f16(lo);
         let lo_r = f16_to_f32(lo_h);
         let span = (hi - lo_r).max(0.0);
-        let mut st_h = f32_to_f16(span / Q4TP_LMAX as f32);
+        let mut st_h = f32_to_f16(span / Q2TP_LMAX as f32);
         for _ in 0..64 {
             let st = f16_to_f32(st_h);
-            if st > 0.0 && lo_r + Q4TP_LMAX as f32 * st >= hi {
+            if st > 0.0 && lo_r + Q2TP_LMAX as f32 * st >= hi {
                 break;
             }
             st_h += 1;
@@ -596,13 +596,16 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
         params[r * 4 + 2..r * 4 + 4].copy_from_slice(&st_h.to_le_bytes());
 
         let st = f16_to_f32(st_h);
-        let tab = q4tp_ladder(&params, r);
+        let tab = q2tp_ladder(&params, r);
         let crow = &mut codes[r * stride..(r + 1) * stride];
         for g in 0..gpr {
-            let c = if dead[g] || st <= 0.0 {
+            // Rung 0 is the exact zero; live groups start at 1.
+            let c = if dead[g] {
                 0
+            } else if st <= 0.0 {
+                1
             } else {
-                ((lg[g] - lo_r) / st).round_ties_even().clamp(0.0, Q4TP_LMAX as f32) as usize
+                1 + ((lg[g] - lo_r) / st).round_ties_even().clamp(0.0, Q2TP_LMAX as f32) as usize
             };
             q4tp_put_code(crow, g, c);
             let inv = if tab[c] > 0.0 { 1.0 / tab[c] } else { 0.0 };
@@ -3422,6 +3425,83 @@ mod tests {
             den += (*x as f64).powi(2);
         }
         (num / den).sqrt() as f32
+    }
+
+    /// Rows spanning 10^-3..10^3 with a per-group tilt, so the row ladder
+    /// has to work for the scales to come back at all.
+    fn q2tp_test_matrix(rows: usize, cols: usize) -> Vec<f32> {
+        let mut v = vec![0f32; rows * cols];
+        let mut s = 0x2545F491_4F6CDD1Du64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / 8388608.0 - 1.0
+        };
+        for r in 0..rows {
+            let amp = 10f32.powi((r % 7) as i32 - 3);
+            for g in 0..cols / GROUP_SIZE {
+                let tilt = (next().abs() * 2.0).exp2();
+                for k in 0..GROUP_SIZE {
+                    v[r * cols + g * GROUP_SIZE + k] = next() * amp * tilt;
+                }
+            }
+        }
+        v
+    }
+
+    fn q2tp_rel_rms(a: &[f32], b: &[f32]) -> f32 {
+        let (mut num, mut den) = (0f64, 0f64);
+        for (x, y) in a.iter().zip(b) {
+            num += ((x - y) as f64).powi(2);
+            den += (*x as f64).powi(2);
+        }
+        (num / den).sqrt() as f32
+    }
+
+    /// The 2-bit plane must be exactly half of q4tp's, with the params and
+    /// code planes untouched — a wrong section offset reads scales out of
+    /// weight bytes and still produces fluent-looking numbers, so pin the
+    /// length AND the reader's own view of it.
+    #[test]
+    fn q2tp_payload_length_and_sections_match_the_reader() {
+        use cortiq_core::quant::{expected_nbytes, q2tp_sections, validate_payload};
+        let (rows, cols) = (7usize, 96usize);
+        let v = q2tp_test_matrix(rows, cols);
+        let blob = encode_q2tp(&v, rows, cols);
+        let want = expected_nbytes(TensorDtype::Q2TiledP, &[rows, cols]).unwrap();
+        assert_eq!(blob.len(), want, "payload length");
+        let (params_off, codes_off, stride) = q2tp_sections(rows, cols);
+        assert_eq!(params_off, rows * (cols / GROUP_SIZE) * 8, "weight plane");
+        assert_eq!(codes_off, params_off + rows * 4, "params plane");
+        assert_eq!(codes_off + rows * stride, blob.len(), "code plane");
+        assert!(
+            validate_payload(TensorDtype::Q2TiledP, &[rows, cols], &blob).is_ok(),
+            "reader rejected its own encoder's output"
+        );
+    }
+
+    /// 2 bits carry 4 levels, so the error is large by construction — what
+    /// must hold is that it stays in the 2-bit BAND (a broken decode lands
+    /// at ~100%) and that an all-zero row survives exactly.
+    #[test]
+    fn q2tp_roundtrip_stays_in_the_two_bit_error_band() {
+        use cortiq_core::quant::dequant_q2tp;
+        let (rows, cols) = (9usize, 128usize);
+        let mut v = q2tp_test_matrix(rows, cols);
+        for k in 0..cols {
+            v[3 * cols + k] = 0.0;
+        }
+        let blob = encode_q2tp(&v, rows, cols);
+        let mut back = vec![0f32; rows * cols];
+        dequant_q2tp(&blob, rows, cols, &mut back);
+        let e = q2tp_rel_rms(&back, &v);
+        assert!(e < 0.55, "q2tp rel-RMS {e} — decode is wrong, not just coarse");
+        assert!(e > 0.05, "q2tp rel-RMS {e} — suspiciously exact for 2 bits");
+        assert!(
+            back[3 * cols..4 * cols].iter().all(|x| *x == 0.0),
+            "an all-zero row must dequantize to exact zeros"
+        );
     }
 
     #[test]

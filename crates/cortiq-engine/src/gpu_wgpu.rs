@@ -2454,6 +2454,91 @@ fn moe_gate_up_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// q2tp gate/up: the q4tp kernel with a 2-bit weight plane. A group is
+// 32 weights in 8 bytes (4 u16 units) instead of 16, and one u32 carries
+// SIXTEEN weights, so the group is two words and two dot16s. The params
+// and 5-bit code planes are byte-identical to q4tp — only the plane
+// offsets move, since they sit behind a half-size weight plane.
+fn mg_dot16(w: u32, xi: u32) -> f32 {
+    return (f32(w & 3u) - 1.5) * mg_x[xi]
+         + (f32((w >> 2u) & 3u) - 1.5) * mg_x[xi + 1u]
+         + (f32((w >> 4u) & 3u) - 1.5) * mg_x[xi + 2u]
+         + (f32((w >> 6u) & 3u) - 1.5) * mg_x[xi + 3u]
+         + (f32((w >> 8u) & 3u) - 1.5) * mg_x[xi + 4u]
+         + (f32((w >> 10u) & 3u) - 1.5) * mg_x[xi + 5u]
+         + (f32((w >> 12u) & 3u) - 1.5) * mg_x[xi + 6u]
+         + (f32((w >> 14u) & 3u) - 1.5) * mg_x[xi + 7u]
+         + (f32((w >> 16u) & 3u) - 1.5) * mg_x[xi + 8u]
+         + (f32((w >> 18u) & 3u) - 1.5) * mg_x[xi + 9u]
+         + (f32((w >> 20u) & 3u) - 1.5) * mg_x[xi + 10u]
+         + (f32((w >> 22u) & 3u) - 1.5) * mg_x[xi + 11u]
+         + (f32((w >> 24u) & 3u) - 1.5) * mg_x[xi + 12u]
+         + (f32((w >> 26u) & 3u) - 1.5) * mg_x[xi + 13u]
+         + (f32((w >> 28u) & 3u) - 1.5) * mg_x[xi + 14u]
+         + (f32((w >> 30u) & 3u) - 1.5) * mg_x[xi + 15u];
+}
+
+@compute @workgroup_size(64)
+fn moe_gate_up_q2tp(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let slot = wid.y;
+    let gpr = mg_p.gpr;
+    let rows = mg_p.inter;
+    let base16 = mg_sel[slot] * mg_p.mat16;
+    let nib16 = base16 + row * gpr * 4u;
+    let par16 = base16 + rows * gpr * 4u + row * 2u;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let cod8 = (base16 + rows * gpr * 4u + rows * 2u) * 2u + row * cst;
+
+    let gl = unpack2x16float(mg_g16(par16) | (mg_g16(par16 + 1u) << 16u));
+    let ul = unpack2x16float(mg_u16f(par16) | (mg_u16f(par16 + 1u) << 16u));
+    var ag = 0.0;
+    var au = 0.0;
+    for (var g = lid; g < gpr; g = g + 64u) {
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        var cg = mgp_gu8(cod8 + cb);
+        var cu = mgp_uu8(cod8 + cb);
+        if (shf > 3u) {
+            cg = cg | (mgp_gu8(cod8 + cb + 1u) << 8u);
+            cu = cu | (mgp_uu8(cod8 + cb + 1u) << 8u);
+        }
+        // Rung 0 is the format's exact zero (the ±0.5/±1.5 grid has no
+        // zero of its own); live rungs are the ladder shifted down one.
+        let cgv = (cg >> shf) & 31u;
+        let cuv = (cu >> shf) & 31u;
+        let sg = select(exp2(gl.x + f32(max(cgv, 1u) - 1u) * gl.y), 0.0, cgv == 0u);
+        let su = select(exp2(ul.x + f32(max(cuv, 1u) - 1u) * ul.y), 0.0, cuv == 0u);
+        // Group base in u16 units is a multiple of 4, so the two 32-bit
+        // words land on u32 lanes (nib16 >> 1) and (nib16 >> 1) + 1.
+        let w32 = (nib16 + g * 4u) >> 1u;
+        let xb = g * 32u;
+        let dg = mg_dot16(mg_gw[w32], xb) + mg_dot16(mg_gw[w32 + 1u], xb + 16u);
+        let du = mg_dot16(mg_uw[w32], xb) + mg_dot16(mg_uw[w32 + 1u], xb + 16u);
+        ag = ag + sg * dg;
+        au = au + su * du;
+    }
+    mg_pg[lid] = ag;
+    mg_pu[lid] = au;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) {
+            mg_pg[lid] = mg_pg[lid] + mg_pg[lid + stride];
+            mg_pu[lid] = mg_pu[lid] + mg_pu[lid + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) {
+        let g = mg_pg[0];
+        mg_act[slot * mg_p.inter + row] = (g / (1.0 + exp(-g))) * mg_pu[0];
+    }
+}
+
 fn mdp_u8(o: u32) -> u32 { return (md_w[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
 
 @compute @workgroup_size(64)
@@ -3491,6 +3576,8 @@ struct Ctx {
     /// came from, so the q4tp twins need their own even though the
     /// binding lists are identical.
     layout_moe_gu_q4tp: wgpu::BindGroupLayout,
+    moe_gate_up_q2tp: wgpu::ComputePipeline,
+    layout_moe_gu_q2tp: wgpu::BindGroupLayout,
     layout_moe_dn_q4tp: wgpu::BindGroupLayout,
     /// Discrete card (PCIe VRAM) vs UMA — thresholds and budgets differ.
     discrete: bool,
@@ -3869,6 +3956,8 @@ fn init() -> Result<Ctx, String> {
     let layout_moe_gu = moe_gate_up.get_bind_group_layout(0);
     let layout_moe_dn = moe_down.get_bind_group_layout(0);
     let layout_moe_gu_q4tp = moe_gate_up_q4tp.get_bind_group_layout(0);
+    let moe_gate_up_q2tp = pipe("moe_gate_up_q2tp");
+    let layout_moe_gu_q2tp = moe_gate_up_q2tp.get_bind_group_layout(0);
     let layout_moe_dn_q4tp = moe_down_q4tp.get_bind_group_layout(0);
     let layout = matvec.get_bind_group_layout(0);
     let layout_q1 = q1.get_bind_group_layout(0);
@@ -4014,6 +4103,8 @@ fn init() -> Result<Ctx, String> {
         layout_moe_gu,
         layout_moe_dn,
         layout_moe_gu_q4tp,
+        moe_gate_up_q2tp,
+        layout_moe_gu_q2tp,
         layout_moe_dn_q4tp,
         discrete,
         vram_budget,
@@ -4093,6 +4184,7 @@ fn moe_expert_bufs(
     inter: usize,
     hidden: usize,
     q4tp: bool,
+    gu_q2: bool,
 ) -> Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)> {
     use std::sync::atomic::Ordering;
     if hidden % 32 != 0 || inter % 32 != 0 {
@@ -4113,7 +4205,14 @@ fn moe_expert_bufs(
             Some(rows * (cols / 32) * 18)
         }
     };
-    let gu_len = plen(inter, hidden)?;
+    let gu_len = if gu_q2 {
+        cortiq_core::quant::expected_nbytes(
+            cortiq_core::TensorDtype::Q2TiledP,
+            &[inter, hidden],
+        )?
+    } else {
+        plen(inter, hidden)?
+    };
     let d_len = plen(hidden, inter)?;
     let total = (experts.len() * (2 * gu_len + d_len)) as u64;
     if c.resident.load(Ordering::Relaxed) + total > c.vram_budget {
@@ -5211,6 +5310,7 @@ pub fn forward_token_graph(
             inter: usize,
             norm_topk: bool,
             q4tp: bool,
+            gu_q2: bool,
         },
     }
     struct LW {
@@ -5401,6 +5501,7 @@ pub fn forward_token_graph(
                 inter: mi,
                 norm_topk,
                 q4tp,
+                gu_q2,
             } => {
                 // Select kernel: logits live in a 256-slot workgroup array;
                 // slot top_k+1 holds the shared expert.
@@ -5414,7 +5515,7 @@ pub fn forward_token_graph(
                     return false;
                 };
                 let Some((gate_all, up_all, down_all)) =
-                    moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp)
+                    moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2)
                 else {
                     return false;
                 };
@@ -5429,6 +5530,7 @@ pub fn forward_token_graph(
                     inter: *mi,
                     norm_topk: *norm_topk,
                     q4tp: *q4tp,
+                    gu_q2: *gu_q2,
                 }
             }
         };
@@ -6442,6 +6544,7 @@ pub fn forward_token_graph(
                 inter: mi,
                 norm_topk,
                 q4tp,
+                gu_q2,
             } => {
                 // The WHOLE MoE FFN — router + shared-gate matvecs, top-k
                 // select, fused gate+up+SiLU over the selected experts, and
@@ -6481,14 +6584,21 @@ pub fn forward_token_graph(
                     };
                     (n / 2) as u32
                 };
+                // gate/up may be a HALF-WIDTH plane (q2tp experts against a
+                // q4tp down), so its per-expert stride is its own.
+                let gu_mat16 = if *gu_q2 {
+                    (cortiq_core::quant::expected_nbytes(
+                        cortiq_core::TensorDtype::Q2TiledP,
+                        &[*mi, hidden],
+                    )
+                    .unwrap_or(0)
+                        / 2) as u32
+                } else {
+                    mat16(*mi, hidden)
+                };
                 let gu_u = uniform_u32x4(
                     c,
-                    [
-                        (hidden / 32) as u32,
-                        *mi as u32,
-                        slots as u32,
-                        mat16(*mi, hidden),
-                    ],
+                    [(hidden / 32) as u32, *mi as u32, slots as u32, gu_mat16],
                 );
                 let dn_u = uniform_u32x4(
                     c,
@@ -6499,7 +6609,14 @@ pub fn forward_token_graph(
                         mat16(hidden, *mi),
                     ],
                 );
-                let (p_gu, p_dn, l_gu, l_dn) = if *q4tp {
+                let (p_gu, p_dn, l_gu, l_dn) = if *gu_q2 {
+                    (
+                        &c.moe_gate_up_q2tp,
+                        &c.moe_down_q4tp,
+                        &c.layout_moe_gu_q2tp,
+                        &c.layout_moe_dn_q4tp,
+                    )
+                } else if *q4tp {
                     (
                         &c.moe_gate_up_q4tp,
                         &c.moe_down_q4tp,
@@ -6966,6 +7083,7 @@ pub fn forward_batch_graph(
                 inter: mi,
                 norm_topk,
                 q4tp,
+                gu_q2,
             } => {
                 if *top_k >= 16 || *n_exp > 256 || experts.len() != n_exp + 1 {
                     bgraph_refused("site:5979");
@@ -6979,7 +7097,7 @@ pub fn forward_batch_graph(
                     return false;
                 };
                 let Some((gate_all, up_all, down_all)) =
-                    moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp)
+                    moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, false)
                 else {
                     bgraph_refused("site:5990");
                     return false;

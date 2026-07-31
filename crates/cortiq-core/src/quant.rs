@@ -443,14 +443,30 @@ pub fn q2tp_sections(rows: usize, cols: usize) -> (usize, usize, usize) {
     (chunk, chunk + rows * 4, q4tp_code_stride(gpr))
 }
 
+/// Highest `q2tp` scale rung. One fewer than q4tp's: rung 0 is spent on
+/// the exact zero below, so the geometric part is rungs 1..=31.
+pub const Q2TP_LMAX: usize = 30;
+
+/// `q2tp` scale ladder. The 4-level grid ±0.5/±1.5 is the RMS-optimal
+/// symmetric quantizer for Gaussian-ish weights, but it cannot spell
+/// ZERO — so a pruned or masked group would come back as noise. Rung 0
+/// therefore means "this group is exactly zero" and rungs 1..=31 are the
+/// q4tp ladder shifted down one: `s(c) = 2^(lo + (c−1)·step)`.
+pub fn q2tp_ladder(params: &[u8], r: usize) -> [f32; 32] {
+    let base = q4tp_ladder(params, r);
+    let mut t = [0f32; 32];
+    t[1..32].copy_from_slice(&base[..31]);
+    t
+}
+
 /// Dequantize a full `q2tp` tensor. Weights are 2-bit fields, LSB-first
-/// within each byte: code c ∈ 0..4 → (c − 1.5)·s.
+/// within each byte: code c ∈ 0..4 → (c − 1.5)·s (and s = 0 at rung 0).
 pub fn dequant_q2tp(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) {
     let gpr = cols / GROUP_SIZE;
     let (params_off, codes_off, stride) = q2tp_sections(rows, cols);
     let params = &bytes[params_off..params_off + rows * 4];
     for r in 0..rows {
-        let tab = q4tp_ladder(params, r);
+        let tab = q2tp_ladder(params, r);
         let codes = &bytes[codes_off + r * stride..codes_off + (r + 1) * stride];
         for g in 0..gpr {
             let s = tab[q4tp_code(codes, g)];

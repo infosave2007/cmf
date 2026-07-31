@@ -13,8 +13,8 @@
 
 use crate::pool::{Pool, matvec_rows, matvec_rows2};
 use cortiq_core::quant::{
-    GROUP_SIZE, Q1_TILE, Q2TP_CHUNK, Q4_TILE, Q4TP_NIB, f16_to_f32, q4tp_code, q4tp_ladder,
-    q2tp_sections, q4tp_sections,
+    GROUP_SIZE, Q1_TILE, Q2TP_CHUNK, Q4_TILE, Q4TP_NIB, f16_to_f32, q2tp_ladder, q2tp_sections,
+    q4tp_code, q4tp_ladder, q4tp_sections,
 };
 use cortiq_core::{CmfModel, TensorDtype};
 use std::sync::Arc;
@@ -424,6 +424,20 @@ impl QTensor {
                 model,
                 idx,
                 dtype: TensorDtype::Q4TiledP,
+                ..
+            } => Some((model, *idx)),
+            _ => None,
+        }
+    }
+
+    /// (model, tensor idx) for a q2tp mapped weight — the 2-bit twin of
+    /// `mapped_q4tp`, used by the mixed MoE profile.
+    pub fn mapped_q2tp(&self) -> Option<(&Arc<CmfModel>, usize)> {
+        match self {
+            Self::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q2TiledP,
                 ..
             } => Some((model, *idx)),
             _ => None,
@@ -3812,6 +3826,8 @@ struct Q4tpView<'a> {
     params: &'a [u8],
     codes: &'a [u8],
     stride: usize,
+    /// q2tp reads the ladder with rung 0 = exact zero.
+    zero_rung: bool,
 }
 
 impl<'a> Q4tpView<'a> {
@@ -3822,6 +3838,7 @@ impl<'a> Q4tpView<'a> {
             params: &bytes[params_off..codes_off],
             codes: &bytes[codes_off..],
             stride,
+            zero_rung: false,
         }
     }
 
@@ -3833,6 +3850,7 @@ impl<'a> Q4tpView<'a> {
             params: &bytes[params_off..codes_off],
             codes: &bytes[codes_off..],
             stride,
+            zero_rung: true,
         }
     }
 
@@ -3853,7 +3871,11 @@ impl<'a> Q4tpView<'a> {
     /// and eight independent extractions.
     #[inline]
     fn scales_into(&self, r: usize, gpr: usize, out: &mut [f32]) {
-        let tab = q4tp_ladder(self.params, r);
+        let tab = if self.zero_rung {
+            q2tp_ladder(self.params, r)
+        } else {
+            q4tp_ladder(self.params, r)
+        };
         let codes = &self.codes[r * self.stride..(r + 1) * self.stride];
         let out = &mut out[..gpr];
         let mut chunks = out.chunks_exact_mut(8);

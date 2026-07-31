@@ -766,6 +766,10 @@ pub enum GraphFfn<'a> {
         /// in where the scale comes from, so they share every kernel
         /// but the weight-staging block.
         q4tp: bool,
+        /// `true` = the gate/up experts are `q2tp` (2-bit plane) while
+        /// `down` stays q4tp — the mixed profile a 2-bit-class checkpoint
+        /// converts into. Only meaningful with `q4tp: true`.
+        gu_q2: bool,
     },
 }
 
