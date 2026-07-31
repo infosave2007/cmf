@@ -400,6 +400,13 @@ fn lfm2_canon(name: &str) -> String {
 
 /// Small, noise-sensitive 2-D projections the reference converter keeps at f16
 /// (a bit-flip there is costly): the GDN a/b gate projections and MoE routers.
+/// Tensors that must not be quantized OR narrowed: lookup tables whose
+/// values are indices, not magnitudes. f16 is exact only to 2048, and
+/// DeepSeek-V4's table holds expert ids per vocabulary id (129 280 rows).
+fn force_f32(name: &str) -> bool {
+    name.ends_with(".tid2eid")
+}
+
 fn force_f16(name: &str) -> bool {
     name.ends_with("linear_attn.in_proj_a.weight")
         || name.ends_with("linear_attn.in_proj_b.weight")
@@ -1150,6 +1157,20 @@ pub(crate) fn to_f32(dtype: &str, raw: &[u8]) -> anyhow::Result<Vec<f32>> {
         "BF16" => raw
             .chunks_exact(2)
             .map(|b| bf16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+            .collect(),
+        // DeepSeek-V4's hash-routing table is I64 token→expert indices, and
+        // I32 shows up in the same role elsewhere. They are LOOKUP TABLES,
+        // not weights: widen to f32 so the pipeline can carry them, and let
+        // the writer's force_f16 rule keep them exact.
+        "I64" => raw
+            .chunks_exact(8)
+            .map(|b| {
+                i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
+            })
+            .collect(),
+        "I32" => raw
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32)
             .collect(),
         other => anyhow::bail!("unsupported safetensors dtype '{other}' (need F32/F16/BF16)"),
     })
@@ -3384,6 +3405,17 @@ pub fn run_convert(
                 );
             }
             // 1-D tensors, tiny tensors, non-2-D, and gate-critical projections go f16.
+            // Index tables ride as raw f32: quantizing them would round
+            // expert ids, and f16 cannot even hold a vocabulary id exactly.
+            if force_f32(&name) {
+                tensors.push(TensorSpec {
+                    name,
+                    dtype: TensorDtype::F32,
+                    shape: m_shape.clone(),
+                    data: vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                });
+                continue;
+            }
             let two_d = m_shape.len() == 2 && numel >= GROUP_SIZE && !force_f16(&name);
             // The SHARED expert rides in the same packed buffer as the routed
             // ones (last slot), so its gate/up must carry the routed layout —
