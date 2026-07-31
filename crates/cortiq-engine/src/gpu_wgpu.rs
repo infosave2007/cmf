@@ -1112,6 +1112,142 @@ fn gdn_step_par(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// v2 of the parallel pair: the conv is INLINE (the same taps math, the
+// same order, computed per element from the PRE-shift ring), so the par
+// kernel no longer waits on a conv dispatch — and the ring shift rides
+// the norm kernel, which was going to run anyway. One dependent hop
+// fewer per GDN layer, thirty layers a frame.
+struct GciP { kk: u32, xoff: u32, _a: u32, _b: u32 };
+@group(0) @binding(10) var<storage, read>       gi_qkv  : array<f32>;
+@group(0) @binding(11) var<storage, read_write> gi_ring : array<f32>;
+@group(0) @binding(12) var<storage, read>       gi_taps : array<f32>;
+@group(0) @binding(13) var<uniform>             gi_p    : GciP;
+
+fn gi_cq(c: u32) -> f32 {
+    let kk = gi_p.kk;
+    let tb = c * kk;
+    var acc = gi_qkv[gi_p.xoff + c] * gi_taps[tb + kk - 1u];
+    for (var j = 0u; j + 1u < kk; j = j + 1u) {
+        acc = acc + gi_ring[j * gd_p.cdim + c] * gi_taps[tb + j];
+    }
+    return acc / (1.0 + exp(-acc));
+}
+
+@compute @workgroup_size(128)
+fn gdn_step_par2(@builtin(workgroup_id) wid: vec3<u32>,
+                 @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let dj = wid.y;
+    let t = lid.x;
+    let dk = gd_p.dk;
+    let dv = gd_p.dv;
+    if (h >= gd_p.nv || dj >= dv) { return; }
+    let ko = h / gd_p.rep;
+    let qs = ko * dk;
+    let ks = gd_p.kd + ko * dk;
+    let cq_q = select(0.0, gi_cq(qs + t), t < dk);
+    let cq_k = select(0.0, gi_cq(ks + t), t < dk);
+    gd_red[t] = cq_q * cq_q;
+    workgroupBarrier();
+    var stride = 64u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) { gd_red[t] = gd_red[t] + gd_red[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let nq = gd_red[0];
+    workgroupBarrier();
+    gd_red[t] = cq_k * cq_k;
+    workgroupBarrier();
+    stride = 64u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) { gd_red[t] = gd_red[t] + gd_red[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let nkn = gd_red[0];
+    workgroupBarrier();
+    let invq = 1.0 / (sqrt(nq + 1e-6) * sqrt(f32(dk)));
+    let invk = 1.0 / sqrt(nkn + 1e-6);
+    let abo = gd_p.tok * gd_p.nv;
+    let g = exp(-exp(gd_alog[h]) * gd_softplus(gd_a[abo + h] + gd_dtb[h]));
+    let beta = 1.0 / (1.0 + exp(-gd_b[abo + h]));
+    let sbase = h * dk * dv;
+    let vt = gi_cq(2u * gd_p.kd + h * dv + dj);
+    let kf_t = cq_k * invk;
+    let qf_t = cq_q * invq;
+    gd_red[t] = select(0.0, gd_S[sbase + t * dv + dj] * kf_t, t < dk);
+    workgroupBarrier();
+    stride = 64u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) { gd_red[t] = gd_red[t] + gd_red[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let kv = gd_red[0];
+    workgroupBarrier();
+    let delta = (vt - g * kv) * beta;
+    var contrib = 0.0;
+    if (t < dk) {
+        let idx = sbase + t * dv + dj;
+        let cell = g * gd_S[idx] + kf_t * delta;
+        gd_S[idx] = cell;
+        contrib = qf_t * cell;
+    }
+    gd_red[t] = contrib;
+    workgroupBarrier();
+    stride = 64u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) { gd_red[t] = gd_red[t] + gd_red[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (t == 0u) {
+        let zo = gd_p.tok * gd_p.nv * dv;
+        gd_o[zo + h * dv + dj] = gd_red[0];
+    }
+}
+
+// norm v2: the gated RMSNorm PLUS the ring shift the conv kernel used to
+// do — its writers (par2's gi_cq readers) are all upstream in the pass.
+@compute @workgroup_size(256)
+fn gdn_step_norm2(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let t = lid.x;
+    let dv = gd_p.dv;
+    if (h >= gd_p.nv) { return; }
+    let zo = gd_p.tok * gd_p.nv * dv;
+    gd_red[t] = select(0.0, gd_o[zo + h * dv + t] * gd_o[zo + h * dv + t], t < dv);
+    workgroupBarrier();
+    let ss = gd_reduce(t);
+    workgroupBarrier();
+    let inv = 1.0 / sqrt(ss / f32(dv) + gd_p.eps);
+    if (t < dv) {
+        let zz = gd_z[zo + h * dv + t];
+        gd_o[zo + h * dv + t] =
+            gd_o[zo + h * dv + t] * inv * gd_norm[t] * (zz / (1.0 + exp(-zz)));
+    }
+    // ring shift, strided over cdim across all norm workgroups
+    let kk = gi_p.kk;
+    let cdim = gd_p.cdim;
+    var c = wid.x * 256u + t;
+    loop {
+        if (c >= cdim) { break; }
+        for (var j = 0u; j + 2u < kk; j = j + 1u) {
+            gi_ring[j * cdim + c] = gi_ring[(j + 1u) * cdim + c];
+        }
+        if (kk > 1u) {
+            gi_ring[(kk - 2u) * cdim + c] = gi_qkv[gi_p.xoff + c];
+        }
+        c = c + gd_p.nv * 256u;
+    }
+}
+
 // Gated RMSNorm tail of the parallel GDN step: in place over gd_o.
 @compute @workgroup_size(256)
 fn gdn_step_norm(@builtin(workgroup_id) wid: vec3<u32>,
@@ -4387,6 +4523,9 @@ struct Ctx {
     moe_down_q4tp_f: wgpu::ComputePipeline,
     gqa_attend_dec: wgpu::ComputePipeline,
     moe_select_sg: Option<wgpu::ComputePipeline>,
+    gdn_step_par2: wgpu::ComputePipeline,
+    gdn_step_norm2: wgpu::ComputePipeline,
+    gdn_inline: bool,
     attend_dec: bool,
     foldsel: bool,
     layout_moe_dn_q4tp: wgpu::BindGroupLayout,
@@ -4745,6 +4884,9 @@ fn init() -> Result<Ctx, String> {
     let q4tp_mm = pipe("q4tp_mul_mm");
     let argmax_part = pipe("argmax_part");
     let gdn_step_par = pipe("gdn_step_par");
+    let gdn_step_par2 = pipe("gdn_step_par2");
+    let gdn_step_norm2 = pipe("gdn_step_norm2");
+    let gdn_inline = std::env::var("CMF_GDN_INLINE").map(|v| v != "0").unwrap_or(true);
     let gdn_step_norm = pipe("gdn_step_norm");
     let gdn_par = std::env::var("CMF_GDN_PAR").map(|v| v != "0").unwrap_or(true);
     // Frame profiler (CMF_GPU_TS=1): 256 timestamp slots + resolve/stage
@@ -4928,6 +5070,9 @@ fn init() -> Result<Ctx, String> {
         q4tp_mm,
         argmax_part,
         gdn_step_par,
+        gdn_step_par2,
+        gdn_step_norm2,
+        gdn_inline,
         gdn_step_norm,
         gdn_par,
         ts_query,
@@ -7564,6 +7709,43 @@ pub fn forward_token_graph(
                         bind_buf(9, &gd_p),
                     ],
                 });
+                let gi_u = uniform_u32x4(c, [*kk as u32, 0, 0, 0]);
+                let (bg_par2, bg_snorm2) = if c.gdn_inline {
+                    (
+                        Some(c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &c.gdn_step_par2.get_bind_group_layout(0),
+                            entries: &[
+                                bind_buf(2, &a_b),
+                                bind_buf(3, &b_b),
+                                bind_buf(4, &alog),
+                                bind_buf(5, &dtb),
+                                bind_buf(7, s),
+                                bind_buf(8, &gdo_b),
+                                bind_buf(9, &gd_p),
+                                bind_buf(10, &qkv_b),
+                                bind_buf(11, ring),
+                                bind_buf(12, &taps),
+                                bind_buf(13, &gi_u),
+                            ],
+                        })),
+                        Some(c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &c.gdn_step_norm2.get_bind_group_layout(0),
+                            entries: &[
+                                bind_buf(1, &z_b),
+                                bind_buf(6, &gnorm),
+                                bind_buf(8, &gdo_b),
+                                bind_buf(9, &gd_p),
+                                bind_buf(10, &qkv_b),
+                                bind_buf(11, ring),
+                                bind_buf(13, &gi_u),
+                            ],
+                        })),
+                    )
+                } else {
+                    (None, None)
+                };
                 // The whole GDN chain in ONE compute pass: projections →
                 // conv → step → out_proj. Each stage reads the previous
                 // stage's output, which is exactly what a pass guarantees
@@ -7597,6 +7779,16 @@ pub fn forward_token_graph(
                     let fine = li == 0;
                     tsp!(pass, fine, 10); // after projections
                     if !skip_gdn {
+                        if c.gdn_par && c.gdn_inline {
+                            pass.set_pipeline(&c.gdn_step_par2);
+                            pass.set_bind_group(0, bg_par2.as_ref().unwrap(), &[]);
+                            pass.dispatch_workgroups(*nv as u32, *dv as u32, 1);
+                            tsp!(pass, fine, 12); // step_par (conv inline)
+                            pass.set_pipeline(&c.gdn_step_norm2);
+                            pass.set_bind_group(0, bg_snorm2.as_ref().unwrap(), &[]);
+                            pass.dispatch_workgroups(*nv as u32, 1, 1);
+                            tsp!(pass, fine, 13); // step_norm (+ring shift)
+                        } else {
                         pass.set_pipeline(&c.gdn_conv);
                         pass.set_bind_group(0, &bg_conv, &[]);
                         pass.dispatch_workgroups((*cdim as u32).div_ceil(256), 1, 1);
@@ -7616,6 +7808,7 @@ pub fn forward_token_graph(
                             pass.dispatch_workgroups(*nv as u32, 1, 1);
                             tsp!(pass, fine, 12);
                         }
+                        } // gdn_inline arms
                     }
                     if !skip_outp {
                         let o = outp.as_ref().unwrap();
