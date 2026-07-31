@@ -628,6 +628,71 @@ pub(crate) fn encode_q4_tiled(vals: &[f32], out_dim: usize, in_dim: usize) -> Ve
 /// Levels are (c − 1.5)·s, so the group scale fits absmax/1.5. Built for
 /// transcoding 2-bit-class checkpoints (Escha-W2) where the source already
 /// paid the big quantization cost — and for MoE experts generally.
+/// How many threads the row encoders use. `CMF_ENCODE_THREADS` overrides it,
+/// which is also how the parity test pins a single thread.
+pub(crate) fn encode_threads() -> usize {
+    std::env::var("CMF_ENCODE_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|v| v.get())
+                .unwrap_or(1)
+        })
+}
+
+/// Run a per-row encoder across the machine's cores.
+///
+/// Every tiled layout here writes three planes indexed by row at a fixed
+/// stride, and no row reads another, so splitting on rows is exact — the
+/// bytes are identical to the serial loop, which the parity test pins.
+///
+/// It is worth the plumbing: quantizing a 300B MoE is hours of arithmetic,
+/// and on a 48-core box the serial loop used one of them.
+fn encode_rows_parallel(
+    out_dim: usize,
+    strides: [usize; 3],
+    planes: [&mut [u8]; 3],
+    row: &(dyn Fn(usize, &mut [u8], &mut [u8], &mut [u8]) + Sync),
+) {
+    let [s0, s1, s2] = strides;
+    let [p0, p1, p2] = planes;
+    let threads = encode_threads().min(out_dim.max(1)).max(1);
+    if threads == 1 {
+        for (i, ((a, b), c)) in p0
+            .chunks_mut(s0)
+            .zip(p1.chunks_mut(s1))
+            .zip(p2.chunks_mut(s2))
+            .enumerate()
+        {
+            row(i, a, b, c);
+        }
+        return;
+    }
+    let per = out_dim.div_ceil(threads);
+    std::thread::scope(|sc| {
+        for (ti, ((a, b), c)) in p0
+            .chunks_mut(per * s0)
+            .zip(p1.chunks_mut(per * s1))
+            .zip(p2.chunks_mut(per * s2))
+            .enumerate()
+        {
+            sc.spawn(move || {
+                let r0 = ti * per;
+                for (i, ((aa, bb), cc)) in a
+                    .chunks_mut(s0)
+                    .zip(b.chunks_mut(s1))
+                    .zip(c.chunks_mut(s2))
+                    .enumerate()
+                {
+                    row(r0 + i, aa, bb, cc);
+                }
+            });
+        }
+    });
+}
+
 pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
     debug_assert_eq!(vals.len(), out_dim * in_dim);
     debug_assert_eq!(in_dim % GROUP_SIZE, 0);
@@ -636,10 +701,15 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
     let mut chunks = vec![0u8; out_dim * gpr * Q2TP_CHUNK];
     let mut params = vec![0u8; out_dim * 4];
     let mut codes = vec![0u8; out_dim * stride];
-    let mut lg = vec![0f32; gpr];
-    let mut dead = vec![false; gpr];
 
-    for r in 0..out_dim {
+    encode_rows_parallel(
+        out_dim,
+        [gpr * Q2TP_CHUNK, 4, stride],
+        [&mut chunks, &mut params, &mut codes],
+        &|r, chunks_row, params_row, codes_row| {
+        let mut lg = vec![0f32; gpr];
+        let mut dead = vec![false; gpr];
+
         let row = &vals[r * in_dim..(r + 1) * in_dim];
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
         for g in 0..gpr {
@@ -667,12 +737,12 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
             }
             st_h += 1;
         }
-        params[r * 4..r * 4 + 2].copy_from_slice(&lo_h.to_le_bytes());
-        params[r * 4 + 2..r * 4 + 4].copy_from_slice(&st_h.to_le_bytes());
+        params_row[0..2].copy_from_slice(&lo_h.to_le_bytes());
+        params_row[2..4].copy_from_slice(&st_h.to_le_bytes());
 
         let st = f16_to_f32(st_h);
-        let tab = q2tp_ladder(&params, r);
-        let crow = &mut codes[r * stride..(r + 1) * stride];
+        let tab = q2tp_ladder(params_row, 0);
+        let crow = &mut *codes_row;
         for g in 0..gpr {
             // Rung 0 is the exact zero; live groups start at 1.
             let c = if dead[g] {
@@ -685,7 +755,7 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
             q4tp_put_code(crow, g, c);
             let inv = if tab[c] > 0.0 { 1.0 / tab[c] } else { 0.0 };
             let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
-            let dst = &mut chunks[(r * gpr + g) * Q2TP_CHUNK..(r * gpr + g + 1) * Q2TP_CHUNK];
+            let dst = &mut chunks_row[g * Q2TP_CHUNK..(g + 1) * Q2TP_CHUNK];
             for (k, d) in dst.iter_mut().enumerate() {
                 let mut b = 0u8;
                 for j in 0..4 {
@@ -698,7 +768,8 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
                 *d = b;
             }
         }
-    }
+            },
+    );
     chunks.extend_from_slice(&params);
     chunks.extend_from_slice(&codes);
     chunks
@@ -712,10 +783,15 @@ pub(crate) fn encode_q4tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
     let mut nib = vec![0u8; out_dim * gpr * Q4TP_NIB];
     let mut params = vec![0u8; out_dim * 4];
     let mut codes = vec![0u8; out_dim * stride];
-    let mut lg = vec![0f32; gpr];
-    let mut dead = vec![false; gpr];
 
-    for r in 0..out_dim {
+    encode_rows_parallel(
+        out_dim,
+        [gpr * Q4TP_NIB, 4, stride],
+        [&mut nib, &mut params, &mut codes],
+        &|r, nib_row, params_row, codes_row| {
+        let mut lg = vec![0f32; gpr];
+        let mut dead = vec![false; gpr];
+
         let row = &vals[r * in_dim..(r + 1) * in_dim];
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
         for g in 0..gpr {
@@ -749,12 +825,12 @@ pub(crate) fn encode_q4tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
             }
             st_h += 1;
         }
-        params[r * 4..r * 4 + 2].copy_from_slice(&lo_h.to_le_bytes());
-        params[r * 4 + 2..r * 4 + 4].copy_from_slice(&st_h.to_le_bytes());
+        params_row[0..2].copy_from_slice(&lo_h.to_le_bytes());
+        params_row[2..4].copy_from_slice(&st_h.to_le_bytes());
 
         let st = f16_to_f32(st_h);
-        let tab = q4tp_ladder(&params, r);
-        let crow = &mut codes[r * stride..(r + 1) * stride];
+        let tab = q4tp_ladder(params_row, 0);
+        let crow = &mut *codes_row;
         for g in 0..gpr {
             let c = if dead[g] || st <= 0.0 {
                 0
@@ -764,7 +840,7 @@ pub(crate) fn encode_q4tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
             q4tp_put_code(crow, g, c);
             let inv = if tab[c] > 0.0 { 1.0 / tab[c] } else { 0.0 };
             let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
-            let dst = &mut nib[(r * gpr + g) * Q4TP_NIB..(r * gpr + g + 1) * Q4TP_NIB];
+            let dst = &mut nib_row[g * Q4TP_NIB..(g + 1) * Q4TP_NIB];
             for k in 0..16 {
                 let q0 = ((tile[k * 2] * inv).round_ties_even().clamp(-8.0, 7.0) as i8 + 8) as u8;
                 let q1 =
@@ -772,7 +848,8 @@ pub(crate) fn encode_q4tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
                 dst[k] = (q0 & 0x0F) | (q1 << 4);
             }
         }
-    }
+            },
+    );
 
     nib.extend_from_slice(&params);
     nib.extend_from_slice(&codes);
@@ -3744,6 +3821,51 @@ mod tests {
     /// The 2-bit profile is worth 50 GB on a 300B MoE, and getting it wrong
     /// produces a file that is merely large — no error, no warning. These are
     /// the names it has to recognize, in the spelling `canon_name` emits.
+    /// The row encoders were made parallel because a 300B MoE otherwise
+    /// quantizes on one core. Rows are independent, so the bytes must be
+    /// identical however many threads produce them — not merely close.
+    #[test]
+    fn parallel_row_encoding_is_byte_identical_to_serial() {
+        // Wide enough to split across threads, with a dead row and a row of
+        // wildly different magnitudes so the scale ladder actually varies.
+        let (rows, cols) = (97usize, 256usize);
+        let mut vals = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                vals[r * cols + c] = match r {
+                    7 => 0.0, // a dead row: rung 0 everywhere
+                    _ => ((r * 31 + c * 7) as f32 * 0.017).sin() * (1 << (r % 9)) as f32,
+                };
+            }
+        }
+        for (name, enc) in [
+            ("q2tp", encode_q2tp as fn(&[f32], usize, usize) -> Vec<u8>),
+            ("q4tp", encode_q4tp as fn(&[f32], usize, usize) -> Vec<u8>),
+        ] {
+            // SAFETY-of-test: the env var is read per call, and these run
+            // sequentially within one test.
+            unsafe { std::env::set_var("CMF_ENCODE_THREADS", "1") };
+            let serial = enc(&vals, rows, cols);
+            unsafe { std::env::set_var("CMF_ENCODE_THREADS", "8") };
+            let parallel = enc(&vals, rows, cols);
+            unsafe { std::env::remove_var("CMF_ENCODE_THREADS") };
+            assert_eq!(
+                serial.len(),
+                parallel.len(),
+                "{name}: length differs between 1 and 8 threads"
+            );
+            let diff = serial
+                .iter()
+                .zip(&parallel)
+                .position(|(a, b)| a != b);
+            assert!(
+                diff.is_none(),
+                "{name}: byte {} differs between 1 and 8 threads",
+                diff.unwrap()
+            );
+        }
+    }
+
     #[test]
     fn the_two_bit_profile_covers_every_experts_gate_and_up() {
         let gu = |name: &str| {
