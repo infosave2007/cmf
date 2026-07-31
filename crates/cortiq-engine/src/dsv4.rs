@@ -1061,6 +1061,23 @@ fn run_expert(
     );
 }
 
+/// `CMF_DSV4_TRACE=1` prints the hidden state's RMS after each half-block and
+/// the logits' shape at the end. A 300B model that decodes nonsense gives no
+/// other handle: this says whether the state grew, collapsed or went
+/// non-finite, and at which layer — before anyone reaches for a debugger on a
+/// hundred-gigabyte file.
+fn trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_TRACE").is_ok_and(|v| v != "0"))
+}
+
+fn rms_of(v: &[f32]) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt()
+}
+
 /// One token through the whole stack.
 ///
 /// The hidden state is `hc_mult` copies of a `dim`-vector from the very
@@ -1090,6 +1107,13 @@ pub fn forward_token(
     }
 
     let mut scratch = HcScratch::new(cfg);
+    if trace_on() {
+        eprintln!(
+            "[dsv4] tok={token_id} pos={} embed rms={:.5}",
+            st.pos,
+            rms_of(&emb)
+        );
+    }
     for (li, l) in layers.iter().enumerate() {
         // attention half
         hc_block(
@@ -1113,6 +1137,18 @@ pub fn forward_token(
             &mut scratch,
             |folded, out| moe_step(folded, l, cfg, token_id, pool, out),
         );
+        if trace_on() {
+            let bad = state.iter().filter(|v| !v.is_finite()).count();
+            eprintln!(
+                "[dsv4]  layer {li:>2}: rms={:.5}{}",
+                rms_of(&state),
+                if bad > 0 {
+                    format!("  NON-FINITE x{bad}")
+                } else {
+                    String::new()
+                }
+            );
+        }
     }
     st.pos += 1;
 
@@ -1123,6 +1159,22 @@ pub fn forward_token(
     logits.clear();
     logits.resize(g.head.rows(), 0.0);
     g.head.matvec(&h, logits, pool);
+    if trace_on() {
+        let (mut top, mut best) = (0usize, f32::NEG_INFINITY);
+        for (i, &v) in logits.iter().enumerate() {
+            if v > best {
+                best = v;
+                top = i;
+            }
+        }
+        let lo = logits.iter().cloned().fold(f32::MAX, f32::min);
+        eprintln!(
+            "[dsv4]  head: rms={:.5} logits[{}..{:.3}] argmax={top}",
+            rms_of(&h),
+            format_args!("{lo:.3}"),
+            best
+        );
+    }
 }
 
 /// Build the runtime weights from a converted `.cmf`.
