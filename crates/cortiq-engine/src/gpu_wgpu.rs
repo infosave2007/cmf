@@ -4510,7 +4510,9 @@ fn init() -> Result<Ctx, String> {
     let gdn_par = std::env::var("CMF_GDN_PAR").map(|v| v != "0").unwrap_or(true);
     // Frame profiler (CMF_GPU_TS=1): 256 timestamp slots + resolve/stage
     // buffers. Created only when the device carries the feature.
-    let ts_query = if want_ts && std::env::var("CMF_GPU_TS").as_deref() == Ok("1") {
+    let ts_query = if want_ts
+        && matches!(std::env::var("CMF_GPU_TS").as_deref(), Ok("1") | Ok("2"))
+    {
         let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("g-ts"),
             ty: wgpu::QueryType::Timestamp,
