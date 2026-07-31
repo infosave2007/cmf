@@ -2926,6 +2926,10 @@ fn silu_down_matvec(@builtin(workgroup_id) wid: vec3<u32>,
 struct Q1tMmP { cols4: u32, rows: u32, nb: u32, _p: u32 };
 @group(0) @binding(0) var<storage, read>       qmm : array<u32>;
 @group(0) @binding(1) var<storage, read>       xmm : array<f32>;
+// The same activations as vec4 (same-slot rule): the GEMM stages four
+// consecutive floats per thread per K-step, and col0 is a multiple of 4,
+// so that is one 16-byte load instead of four scalar ones.
+@group(0) @binding(1) var<storage, read>       xmm4 : array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> ymm : array<f32>;
 @group(0) @binding(3) var<uniform>             pmm : Q1tMmP;
 
@@ -2957,8 +2961,8 @@ fn q1t_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
             var xv = vec4<f32>(0.0);
             let col0 = k0 + k4 * 4u;
             if (m0 + m < pmm.nb && col0 < cols) {
-                let xi = (m0 + m) * cols + col0;
-                xv = vec4<f32>(xmm[xi], xmm[xi + 1u], xmm[xi + 2u], xmm[xi + 3u]);
+                // cols is a multiple of 32 and col0 of 4 — vec4-aligned.
+                xv = xmm4[((m0 + m) * cols + col0) >> 2u];
             }
             let dst = m * 16u + k4 * 4u;
             q1t_at[dst] = xv.x; q1t_at[dst + 1u] = xv.y;
@@ -3067,8 +3071,8 @@ fn q4tp_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
             var xv = vec4<f32>(0.0);
             let col0 = k0 + k4 * 4u;
             if (m0 + m < pmm.nb && col0 < cols) {
-                let xi = (m0 + m) * cols + col0;
-                xv = vec4<f32>(xmm[xi], xmm[xi + 1u], xmm[xi + 2u], xmm[xi + 3u]);
+                // cols is a multiple of 32 and col0 of 4 — vec4-aligned.
+                xv = xmm4[((m0 + m) * cols + col0) >> 2u];
             }
             let dst = m * 16u + k4 * 4u;
             q4t_at[dst] = xv.x; q4t_at[dst + 1u] = xv.y;
@@ -3098,8 +3102,18 @@ fn q4tp_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
                 // 4 consecutive weights = 2 nibble bytes (col0 is even).
                 let toff = (wrow * gpr + g) * 16u;
                 let p = col0 - g * 32u;
-                let b0 = qmm_byte(toff + p / 2u);
-                let b1 = qmm_byte(toff + 1u + p / 2u);
+                // The two nibble bytes are adjacent: one u32 covers both
+                // unless they straddle a word boundary (one case in four).
+                let bo = toff + p / 2u;
+                let w32 = qmm[bo >> 2u];
+                let sh0 = (bo & 3u) * 8u;
+                let b0 = (w32 >> sh0) & 0xFFu;
+                var b1 = 0u;
+                if ((bo & 3u) == 3u) {
+                    b1 = qmm[(bo >> 2u) + 1u] & 0xFFu;
+                } else {
+                    b1 = (w32 >> (sh0 + 8u)) & 0xFFu;
+                }
                 wv[0u] = (f32(b0 & 0xFu) - 8.0) * scale;
                 wv[1u] = (f32(b0 >> 4u) - 8.0) * scale;
                 wv[2u] = (f32(b1 & 0xFu) - 8.0) * scale;
@@ -3167,8 +3181,8 @@ fn q4t_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
             var xv = vec4<f32>(0.0);
             let col0 = k0 + k4 * 4u;
             if (m0 + m < pmm.nb && col0 < cols) {
-                let xi = (m0 + m) * cols + col0;
-                xv = vec4<f32>(xmm[xi], xmm[xi + 1u], xmm[xi + 2u], xmm[xi + 3u]);
+                // cols is a multiple of 32 and col0 of 4 — vec4-aligned.
+                xv = xmm4[((m0 + m) * cols + col0) >> 2u];
             }
             let dst = m * 16u + k4 * 4u;
             q4t_at[dst] = xv.x; q4t_at[dst + 1u] = xv.y;
