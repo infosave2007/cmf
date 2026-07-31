@@ -718,6 +718,45 @@ pub fn attention_step(
     rms_weighted(&mut kv, &l.kv_norm, cfg.norm_eps);
     rope_tail(&mut kv, inv_freq, pos, rd, false);
 
+    // ── the compressor: accumulate `ratio` tokens, then fold them into
+    // one compressed entry. The reference fires when (pos+1) % ratio == 0,
+    // so a partial window simply waits — which is why the state carries
+    // the pending streams across tokens.
+    if let Some(cp) = &l.compressor {
+        let width = cp.wkv.rows();
+        let mut ckv = vec![0.0f32; width];
+        let mut cscore = vec![0.0f32; width];
+        cp.wkv.matvec(hidden, &mut ckv, pool);
+        cp.wgate.matvec(hidden, &mut cscore, pool);
+        st.pending_kv[li].extend_from_slice(&ckv);
+        st.pending_score[li].extend_from_slice(&cscore);
+        if st.pending_kv[li].len() / width >= cp.ratio {
+            let mut folded = vec![0.0f32; width];
+            compress_window(
+                &st.pending_kv[li],
+                &st.pending_score[li],
+                &cp.ape,
+                cp.ratio,
+                width,
+                &mut folded,
+            );
+            rms_weighted(&mut folded, &cp.norm, cfg.norm_eps);
+            // The compressed entry carries the same rope-tagged tail as a
+            // window key, at the position of the window's first token.
+            let cpos = pos + 1 - cp.ratio;
+            rope_tail(&mut folded, inv_freq, cpos, rd, false);
+            // It lives in the attention cache at head width; a compressor
+            // whose width differs (the indexer's) keeps its own store.
+            if width == hd {
+                st.compressed[li].extend_from_slice(&folded);
+            } else {
+                st.index_kv[li].extend_from_slice(&folded);
+            }
+            st.pending_kv[li].clear();
+            st.pending_score[li].clear();
+        }
+    }
+
     // ── the window ring, then the compressor's output appended after it ──
     st.window[li].extend_from_slice(&kv);
     let win_len = st.window[li].len() / hd;
@@ -732,17 +771,34 @@ pub fn attention_step(
         let n_comp = st.compressed[li].len() / hd;
         match &l.indexer {
             Some(ix) => {
-                let mut qi = vec![0.0f32; ix.weights_proj.rows() * cfg.head_dim];
-                let _ = &qi; // filled by the indexer path once its cache is wired
+                // The indexer scores from the SHARED LoRA output through
+                // its own wq_b — not from attention's queries — and its
+                // per-head weights are a projection of the hidden state,
+                // scaled by head_dim^-0.5 * n_heads^-0.5 as the reference
+                // folds into `weights_proj`'s output.
+                let ih = ix.weights_proj.rows();
+                let idim = ix.wq_b.rows() / ih.max(1);
+                let mut qi = vec![0.0f32; ix.wq_b.rows()];
+                ix.wq_b.matvec(&qr, &mut qi, pool);
+                for h in 0..ih {
+                    rope_tail(&mut qi[h * idim..(h + 1) * idim], inv_freq, pos, rd, false);
+                }
+                let mut hw = vec![0.0f32; ih];
+                ix.weights_proj.matvec(hidden, &mut hw, pool);
+                let sc_factor = (idim as f32).powf(-0.5) * (ih as f32).powf(-0.5);
+                for w in hw.iter_mut() {
+                    *w *= sc_factor;
+                }
+                let n_ix = st.index_kv[li].len() / idim.max(1);
                 let mut sc = Vec::new();
                 index_scores(
-                    &q,
+                    &qi,
                     &st.index_kv[li],
-                    &vec![1.0; cfg.n_heads],
-                    cfg.n_heads.min(1),
-                    hd,
-                    n_comp,
-                    n_comp,
+                    &hw,
+                    ih,
+                    idim,
+                    n_ix.min(n_comp),
+                    n_ix.min(n_comp),
                     &mut sc,
                 );
                 let mut picked = Vec::new();
