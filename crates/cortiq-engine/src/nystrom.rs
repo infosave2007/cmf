@@ -205,6 +205,73 @@ struct NystromHead {
     scr_l: Vec<f32>,
 }
 
+/// Borrowed view of a sealed group's state for the GPU upload — every
+/// slice the device mirror needs, in the layout the kernels index.
+/// `exact_only` groups (degenerate short prompts) are not portable and
+/// make the caller refuse the GPU path for the layer.
+pub struct O1DeviceView<'a> {
+    pub m_eff: usize,
+    pub w: usize,
+    pub sink_len: usize,
+    pub d: usize,
+    pub dv: usize,
+    pub exact_only: bool,
+    pub scale: f32,
+    pub win_len: usize,
+    pub win_head: usize,
+    pub far_len: usize,
+    pub win_k: &'a [f32],
+    pub win_v: &'a [f32],
+    pub sink_k: &'a [f32],
+    pub sink_v: &'a [f32],
+    pub k_tilde: &'a [f32],
+    pub heads: Vec<O1HeadView<'a>>,
+}
+
+pub struct O1HeadView<'a> {
+    pub rect_fm: bool,
+    pub t_hat: &'a [f32],
+    pub z_hat: &'a [f32],
+    pub m_max: &'a [f32],
+    pub q_tilde: &'a [f32],
+    pub mu: &'a [f32],
+}
+
+impl NystromState {
+    pub fn device_view(&self) -> O1DeviceView<'_> {
+        let g = &self.group;
+        O1DeviceView {
+            m_eff: g.m_eff,
+            w: g.w,
+            sink_len: g.sink_len,
+            d: g.d,
+            dv: g.dv,
+            exact_only: g.exact_only,
+            scale: g.scale,
+            win_len: g.win_len,
+            win_head: g.win_head,
+            far_len: self.heads.first().map_or(0, |h| h.far_len),
+            win_k: &g.win_k,
+            win_v: &g.win_v,
+            sink_k: &g.sink_k,
+            sink_v: &g.sink_v,
+            k_tilde: &g.k_tilde,
+            heads: self
+                .heads
+                .iter()
+                .map(|h| O1HeadView {
+                    rect_fm: h.rect == O1Rect::Fm,
+                    t_hat: &h.t_hat,
+                    z_hat: &h.z_hat,
+                    m_max: &h.m_max,
+                    q_tilde: &h.q_tilde,
+                    mu: &h.mu,
+                })
+                .collect(),
+        }
+    }
+}
+
 impl NystromState {
     /// Single-head state (`heads_per_kv == 1`, and the shape the kernel
     /// unit tests use).

@@ -3379,9 +3379,37 @@ impl Pipeline {
     ) -> Option<Vec<f32>> {
         // O(1) Nyström decode runs off the sealed state, not the KV cache the
         // graph mirrors — never take the graph while o1 is active.
-        if self.o1_active() || self.attn_softcap > 0.0 {
+        let o1_gpu = std::env::var("CMF_O1_GPU").as_deref() == Ok("1");
+        if (self.o1_active() && !o1_gpu) || self.attn_softcap > 0.0 {
             // Softcapped scores have no graph kernel yet — CPU owns them.
+            // o1 rides the graph only behind CMF_O1_GPU=1 while the port
+            // proves itself; without it the CPU path owns o1 as before.
             return None;
+        }
+        // Per-layer sealed o1 state for the graph. During prefill the
+        // state is still Collecting -> views are None -> the graph
+        // refuses below and the CPU prefill records the q trace and
+        // seals, exactly as the o1 design requires.
+        let o1_views: Vec<Option<Vec<crate::nystrom::O1DeviceView<'_>>>> = (0..self.num_layers)
+            .map(|li| {
+                if !o1_gpu {
+                    return None;
+                }
+                self.kv_cache.layers[self.phys_layer(li)].o1_views()
+            })
+            .collect();
+        if self.o1_active() && o1_gpu {
+            // Any o1 layer not sealed (or degenerate exact-only) keeps the
+            // whole token on the CPU: half-graph forwards would desync.
+            let want: usize = (0..self.num_layers)
+                .filter(|li| {
+                    !matches!(self.kv_cache.layers[self.phys_layer(*li)].o1, None)
+                })
+                .count();
+            let have = o1_views.iter().filter(|v| v.is_some()).count();
+            if want == 0 || have != want {
+                return None;
+            }
         }
         let nh = self.num_heads;
         let (nkv, hd, rd) = self.layer_geom(0);
@@ -3608,6 +3636,7 @@ impl Pipeline {
             &model,
             self.graph_kv_id,
             &layers,
+            &o1_views,
             &self.inv_freq,
             &mut h,
             nh,

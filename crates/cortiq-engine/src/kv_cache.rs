@@ -240,6 +240,20 @@ impl LayerKvCache {
     /// output. Returns `[num_heads × head_dim]`. Head h belongs to group
     /// h/hpk, so a group's Q heads are contiguous in `q_all`/`out` —
     /// same math as the shared KV row the exact path appends once.
+    /// Device views of the sealed o1 groups, or None when o1 is not
+    /// sealed on this layer (or any group is in the degenerate
+    /// exact-only mode the GPU path does not carry).
+    pub fn o1_views(&self) -> Option<Vec<crate::nystrom::O1DeviceView<'_>>> {
+        let Some(O1State::Sealed { groups }) = &self.o1 else {
+            return None;
+        };
+        let views: Vec<_> = groups.iter().map(|g| g.device_view()).collect();
+        if views.iter().any(|v| v.exact_only) {
+            return None;
+        }
+        Some(views)
+    }
+
     pub fn o1_step(
         &mut self,
         q_all: &[f32],

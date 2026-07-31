@@ -4725,6 +4725,7 @@ pub fn forward_token_graph(
     model: &Arc<CmfModel>,
     kv_id: u64,
     layers: &[crate::gpu::GraphLayer],
+    o1: &[Option<Vec<crate::nystrom::O1DeviceView<'_>>>],
     invf: &[f32],
     h: &mut [f32],
     nh: usize,
@@ -4750,6 +4751,11 @@ pub fn forward_token_graph(
         graph_refused("no ctx");
         return false;
     };
+    // Stage 1 of the o1 port: the plumbing exists, the kernels do not yet.
+    if o1.iter().any(|v| v.is_some()) {
+        graph_refused("o1 layers not yet portable (stage 1)");
+        return false;
+    }
     if position >= cap || hd % 4 != 0 || hd > c.hd_cap {
         {
             use std::sync::atomic::{AtomicBool, Ordering};

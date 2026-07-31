@@ -773,6 +773,9 @@ pub fn forward_token_graph(
     model: &Arc<CmfModel>,
     kv_id: u64,
     layers: &[GraphLayer],
+    // Per-layer sealed o1 (Nystrom) state; Some = replace this layer's
+    // exact attention with the O(1) kernels. wgpu only.
+    o1: &[Option<Vec<crate::nystrom::O1DeviceView<'_>>>],
     invf: &[f32],
     h: &mut [f32],
     nh: usize,
@@ -796,6 +799,7 @@ pub fn forward_token_graph(
             model,
             kv_id,
             layers,
+            o1,
             invf,
             h,
             nh,
