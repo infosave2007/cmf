@@ -3451,14 +3451,21 @@ pub fn run_convert(
                 continue;
             }
             let two_d = m_shape.len() == 2 && numel >= GROUP_SIZE && !force_f16(&name);
-            // The SHARED expert rides in the same packed buffer as the routed
-            // ones (last slot), so its gate/up must carry the routed layout —
-            // the MoE kernels index that buffer with a single per-expert
-            // stride. A q4tp shared expert against q2tp routed ones makes the
-            // whole graph decline, silently, into a CPU MoE.
-            let shared_gu = name.contains(".shared_expert.gate_proj")
-                || name.contains(".shared_expert.up_proj");
-            let q_here = if shared_gu { gu_quant } else { quant };
+            // The q2tp profile covers the gate/up planes of EVERY expert.
+            // Checkpoints that pack their experts into one 3-D tensor are
+            // handled above; the ones that ship a tensor per expert (DeepSeek
+            // among them) arrive here, and reading this condition as
+            // "shared expert only" left the routed experts — which are
+            // essentially the whole model — at 4 bits. That is a 50% size
+            // miss on a 300B MoE, and it looks like nothing but a large file.
+            //
+            // The shared expert additionally MUST match the routed layout: it
+            // rides in the same packed buffer (last slot) and the MoE kernels
+            // index that buffer with one per-expert stride, so a mismatch
+            // makes the whole graph decline, silently, into a CPU MoE.
+            let expert_gu = (name.contains(".experts.") || name.contains(".shared_expert."))
+                && (name.ends_with(".gate_proj.weight") || name.ends_with(".up_proj.weight"));
+            let q_here = if expert_gu { gu_quant } else { quant };
             let (dt, data) = if two_d {
                 quantize_2d(q_here, &vals, m_shape[0], m_shape[1])
             } else {
@@ -3734,6 +3741,29 @@ mod tests {
     /// blocks `attn`/`ffn`. Pin the whole map: a silent miss here means a
     /// tensor lands under a name nothing reads, and the model loads with
     /// a hole instead of failing.
+    /// The 2-bit profile is worth 50 GB on a 300B MoE, and getting it wrong
+    /// produces a file that is merely large — no error, no warning. These are
+    /// the names it has to recognize, in the spelling `canon_name` emits.
+    #[test]
+    fn the_two_bit_profile_covers_every_experts_gate_and_up() {
+        let gu = |name: &str| {
+            (name.contains(".experts.") || name.contains(".shared_expert."))
+                && (name.ends_with(".gate_proj.weight") || name.ends_with(".up_proj.weight"))
+        };
+        // routed experts — the bulk of the model
+        assert!(gu("model.layers.7.mlp.experts.42.gate_proj.weight"));
+        assert!(gu("model.layers.7.mlp.experts.42.up_proj.weight"));
+        // the shared expert, which must match the routed layout
+        assert!(gu("model.layers.7.mlp.shared_expert.gate_proj.weight"));
+        assert!(gu("model.layers.7.mlp.shared_expert.up_proj.weight"));
+        // down stays 4-bit, and nothing outside the experts is touched
+        assert!(!gu("model.layers.7.mlp.experts.42.down_proj.weight"));
+        assert!(!gu("model.layers.7.mlp.shared_expert.down_proj.weight"));
+        assert!(!gu("model.layers.7.mlp.gate.weight"));
+        assert!(!gu("model.layers.7.self_attn.wq_b.weight"));
+        assert!(!gu("model.embed_tokens.weight"));
+    }
+
     #[test]
     fn deepseek_v4_names_map_onto_the_loader_layout() {
         let m = |s: &str| canon_name(s).unwrap();
