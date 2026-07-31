@@ -9681,6 +9681,7 @@ fn o1_ensure(
             }
         }
     }
+    tracing::info!("o1_ensure: UPLOADING layer {li} (epoch {epoch})");
     let g0 = views.first()?;
     let (gcnt, hcnt, m, w, ns) = (
         views.len(),
