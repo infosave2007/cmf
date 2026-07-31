@@ -1472,14 +1472,16 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     // would convert and then decode noise. Say exactly what is missing
     // here, at the config, rather than after a 167 GB download.
     if model_type == "deepseek_v4" {
-        anyhow::bail!(
+        tracing::warn!(
             "deepseek_v4 is not runnable yet — the converter reads its formats, \
              the engine has no node for: (1) double-LoRA attention with a 512-wide \
              compressed KV (wq_a/wq_b, wkv, wo_a/wo_b, attn_sink), (2) the per-layer \
              KV compressor (attn.compressor.*), (3) the sparse indexer that picks \
              index_topk positions (attn.indexer.*), (4) hyper-connections with \
              Sinkhorn iterations (hc_*), (5) hash-routed layers whose expert comes \
-             from a token-id table (ffn.gate.tid2eid). Tracking: docs/OPTIMIZATION_ROADMAP.md"
+             from a token-id table (ffn.gate.tid2eid). The FILE converts — weights, \
+             names and both source quantizations are handled — but it will not decode \
+             until those land. Tracking: docs/OPTIMIZATION_ROADMAP.md"
         );
     }
     let hidden = cfg_usize(tc, "hidden_size")
@@ -2848,6 +2850,47 @@ pub fn run_convert(
             if m.dtype == "U8" && name.ends_with(".weight_scale") {
                 continue;
             }
+            // DeepSeek-V4 keeps every quantized tensor's E8M0 scale plane in
+            // a sibling `.scale`; it rides with the weight below.
+            if m.dtype == "F8_E8M0" && name.ends_with(".scale") {
+                continue;
+            }
+            // Its own two quantizations, decoded to f32 so the rest of the
+            // pipeline (defrag, requant to q4tp/q2tp) is layout-agnostic:
+            //   * experts  — I8 holding two FP4 (E2M1) values per byte with
+            //     one E8M0 scale per 32 values: OCP MXFP4 exactly.
+            //   * skeleton — F8_E4M3 with one E8M0 scale per 128x128 tile.
+            let dsv4 = if matches!(m.dtype.as_str(), "I8" | "F8_E4M3")
+                && !name.ends_with(".scale")
+            {
+                let scale_name = format!("{}.scale", m.name.trim_end_matches(".weight"));
+                let mut sb = None;
+                for f in files {
+                    if let Some(t) = f.tensors.iter().find(|t| t.name == scale_name) {
+                        sb = Some(f.bytes(t));
+                    }
+                }
+                match sb {
+                    Some(scales) if m.shape.len() == 2 => {
+                        let (rows, cols) = (m.shape[0], m.shape[1]);
+                        if m.dtype == "I8" {
+                            // packed FP4: `cols` bytes = 2*cols values
+                            Some((
+                                vec![rows, cols * 2],
+                                unpack_mxfp4(file.bytes(m), scales, rows, cols)?,
+                            ))
+                        } else {
+                            Some((
+                                vec![rows, cols],
+                                unpack_fp8_blocks(file.bytes(m), scales, rows, cols, 128)?,
+                            ))
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
 
             let mxfp4 = if m.dtype == "U8" && m.name.ends_with(".weight_packed") {
                 // MXFP4 (Kimi-K3 experts): decode to f32 and continue the
@@ -2872,6 +2915,7 @@ pub fn run_convert(
             } else {
                 name
             };
+            let mxfp4 = mxfp4.or(dsv4);
             let (m_shape, m_vals) = if let Some(v) = mxfp4 {
                 v
             } else if m.dtype == "U32" && m.name.ends_with(".weight") {
