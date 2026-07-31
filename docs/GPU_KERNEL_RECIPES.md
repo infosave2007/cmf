@@ -66,7 +66,21 @@ math in 46 µs. If a kernel's grid cannot cover the SMs, its latency is
 the grid's, not the math's. The same disease in `gdn_step` (nv=32
 workgroups) responded to a (head × column) grid — `gdn_step_par`.
 
-## Recipe 4: pass fusion — boundaries move, order does not
+## Recipe 4: match the memory layout's grain
+
+The GDN state `S` is `[nv][dk][dv]` and its rows are dv-contiguous, but the
+step kernel gave one workgroup one COLUMN — every lane strided the row at
+`dv` floats, so each 4-byte read pulled a 32-byte sector and threw 28 away
+(~250 GB/s). Four columns per workgroup, loaded as `vec4`, made every
+access 16 bytes and the four column reductions ride together: **99.8 → 105
+tok/s in one change**, the single largest step after the attention rewrite.
+
+The general form: before optimizing a kernel's math, check whether its
+LANE→ADDRESS map matches the buffer's contiguous axis. Row-major data with
+a column-per-lane grid is the same bug in any layout — `q8_row`'s scales,
+`q1t`'s overlay and the KV cache all have axes worth re-checking this way.
+
+## Recipe 5: pass fusion — boundaries move, order does not
 
 Dispatches inside one compute pass serialize with memory visibility, so
 strictly-serial single-dispatch stages (norms, residuals, gates) can ride
@@ -90,6 +104,8 @@ the next pass as a prologue/epilogue instead of opening their own:
 | GDN conv inline in the step | −1 tok/s | 128 dv-workgroups amplify conv reads 128-fold |
 | Top-k as one lane's serial scan | 96 → 78 | shared-memory reads are ~30 cycles unpipelined in a single thread |
 | Subgroup top-k (`moe_select_sg`) | +~2, kept | subgroupMax/Min rounds, two barriers per slot instead of eight |
+| Pair the GDN a/b projections in one dispatch | 99.8 → 98.8 | two nv-row dispatches already overlap in-pass; the pair kernel's flat row space serializes them |
+| Device argmax at k=1 (4-byte readback vs 1 MB) | 100.0 → 98.5 | two extra dispatches cost more than the PCIe transfer they save |
 
 ## The failure mode that looks like slowness
 
