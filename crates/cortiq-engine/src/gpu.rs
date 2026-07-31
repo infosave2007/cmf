@@ -720,6 +720,11 @@ pub enum GraphAttn<'a> {
         dk: usize,
         dv: usize,
         kk: usize,
+        /// CPU recurrent state `[ring (kk-1)·cdim | S nv·dk·dv]` — seeds the
+        /// device mirror when prefill ran on the host (o1 collection, CPU
+        /// fallback): a zero-initialized device state at decode is exactly
+        /// the "coherent but contextless" garble.
+        cpu_state: &'a [f32],
     },
 }
 

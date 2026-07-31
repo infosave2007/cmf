@@ -5367,7 +5367,7 @@ pub fn forward_token_graph(
     };
     // ── Pooled scratch: all intermediate buffers are reused across tokens ──
     let mut gs = c.graph_scratch.lock().unwrap();
-    let st = wgpu::BufferUsages::STORAGE;
+    let st = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC; // COPY_SRC: debug taps (CMF_O1_TRACE)
     let h_buf = GraphScratch::ensure(
         &c.device,
         &mut gs.h,
@@ -5507,7 +5507,7 @@ pub fn forward_token_graph(
                     kvbufs.push(Some((e.k.clone(), e.v.clone())));
                     gdnbufs.push(None);
                 }
-                crate::gpu::GraphAttn::Gdn { .. } => {
+                crate::gpu::GraphAttn::Gdn { cpu_state, .. } => {
                     let e = gsm.entry((kv_id, li)).or_insert_with(|| {
                         let ring_sz = ((gcdim * (_gkk.max(1).saturating_sub(1))) * 4) as u64;
                         let s_sz = (gnv * gdk * gdv * 4) as u64;
@@ -5523,7 +5523,28 @@ pub fn forward_token_graph(
                             c.queue.write_buffer(&bf, 0, &vec![0u8; sz.max(4) as usize]);
                             bf
                         };
-                        (mk(ring_sz), mk(s_sz))
+                        let (ring, sbuf) = (mk(ring_sz), mk(s_sz));
+                        // Seed from the CPU recurrence when the host ran the
+                        // prefill (o1 collection, CPU fallback). A fresh entry
+                        // with an EMPTY cpu_state is the graph-prefill flow —
+                        // the graph builds the state itself from position 0.
+                        // Zero-initialized device state at decode is the
+                        // "coherent but contextless" failure this closes.
+                        let want = (ring_sz + s_sz) as usize / 4;
+                        if cpu_state.len() == want && want > 0 {
+                            let ring_n = ring_sz as usize / 4;
+                            c.queue.write_buffer(
+                                &ring,
+                                0,
+                                bytemuck::cast_slice(&cpu_state[..ring_n]),
+                            );
+                            c.queue.write_buffer(
+                                &sbuf,
+                                0,
+                                bytemuck::cast_slice(&cpu_state[ring_n..]),
+                            );
+                        }
+                        (ring, sbuf)
                     });
                     gdnbufs.push(Some((e.0.clone(), e.1.clone())));
                     kvbufs.push(None);
@@ -5815,6 +5836,7 @@ pub fn forward_token_graph(
         );
         true
     };
+    let mut o1_dbg: Vec<(usize, wgpu::Buffer)> = Vec::new();
     // Bootstrap the first layer's attention norm; thereafter each residual is
     // fused with the following norm (add_rmsnorm), saving two dispatches/layer.
     let inw0 = stor(bytemuck::cast_slice(layers[0].input_norm));
@@ -5980,6 +6002,30 @@ pub fn forward_token_graph(
                     pass.set_pipeline(&c.o1_attend);
                     pass.set_bind_group(0, &bg_att, &[]);
                     pass.dispatch_workgroups((gg * hh_) as u32, 1, 1);
+                    drop(pass);
+                    if std::env::var("CMF_O1_TRACE").is_ok() {
+                        // Debug-only: stage this layer's o1 attention output
+                        // for a post-submit dump (the attn buffer itself is
+                        // reused by every later layer).
+                        let dbgb = c.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("o1-dbg"),
+                            size: (nh * hd * 4) as u64,
+                            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                        enc.copy_buffer_to_buffer(&attn, 0, &dbgb, 0, (nh * hd * 4) as u64);
+                        o1_dbg.push((li, dbgb));
+                        let dbgq = c.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("o1-dbg-q"),
+                            size: 64,
+                            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                        enc.copy_buffer_to_buffer(&qout, 0, &dbgq, 0, 16);
+                        enc.copy_buffer_to_buffer(&kb, 0, &dbgq, 16, 16);
+                        enc.copy_buffer_to_buffer(&vb, 0, &dbgq, 32, 16);
+                        o1_dbg.push((li + 10_000, dbgq));
+                    }
                 } else {
                 let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
                 // rope + kv_append are independent (both read kb, neither
@@ -6458,6 +6504,25 @@ pub fn forward_token_graph(
         r
     };
     if ok {
+        for (li, b) in &o1_dbg {
+            let (tx, rx) = std::sync::mpsc::channel();
+            b.map_async(wgpu::MapMode::Read, .., move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            if rx.recv().map(|r| r.is_ok()).unwrap_or(false) {
+                let raw = b.get_mapped_range(..).unwrap();
+                let all: &[f32] = bytemuck::cast_slice(&raw);
+                let v: Vec<f32> = all[..all.len().min(16)].to_vec();
+                drop(raw);
+                if *li >= 10_000 {
+                    eprintln!("o1-trace L{} gpu q[..4]={:?} k[..4]={:?} v[..4]={:?}",
+                        li - 10_000, &v[..4], &v[4..8], &v[8..12]);
+                } else {
+                    eprintln!("o1-trace L{li} gpu attn[..8] = {v:?}");
+                }
+            }
+        }
         // The append at `position` is now durable — advance each mirror.
         let mut kvm = c.attn_kv.lock().unwrap();
         for li in 0..layers.len() {

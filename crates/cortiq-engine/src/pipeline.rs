@@ -3591,6 +3591,7 @@ impl Pipeline {
                         dk: cfg.key_head_dim,
                         dv: cfg.value_head_dim,
                         kk: cfg.conv_kernel,
+                        cpu_state: &self.kv_cache.layers[self.phys_layer(li)].linear_state,
                     }
                 }
                 _ => return None,
@@ -3824,6 +3825,7 @@ impl Pipeline {
                             dk: cfg.key_head_dim,
                             dv: cfg.value_head_dim,
                             kk: cfg.conv_kernel,
+                            cpu_state: &self.kv_cache.layers[self.phys_layer(li)].linear_state,
                         }
                     }
                     _ => return None,

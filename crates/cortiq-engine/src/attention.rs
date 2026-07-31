@@ -1368,6 +1368,14 @@ pub fn qwen_attention_nystrom(
     let p = project_position(hidden, wq, wk, wv, cfg, cfg.position);
     let mut projected = projected_gate(hidden, cfg);
     let mut ao = cache.o1_step(&p.q, &p.k, &p.v, cfg.num_heads);
+    if std::env::var("CMF_O1_TRACE").is_ok() {
+        eprintln!(
+            "o1-trace cpu attn[..8] = {:?} (q[..4]={:?} k[..4]={:?})",
+            &ao[..8],
+            &p.q[..4],
+            &p.k[..4]
+        );
+    }
     if cfg.output_gate {
         apply_gate(&mut ao, &p.gate);
     }
