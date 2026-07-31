@@ -21,6 +21,136 @@ use wgpu::util::DeviceExt;
 /// rows — we use grid-stride in the shader).
 const MAX_WG: u32 = 65_535;
 
+/// Subgroup-accelerated MoE select: the top-k rounds ride subgroupMax /
+/// subgroupMin (barrier-free within a subgroup) — two barriers per slot
+/// against the tree version's eight. Lives in its OWN module: `enable
+/// subgroups` fails validation on devices without the feature, and one
+/// invalid function kills every entry point of a module (0.5.40's Metal
+/// lesson, re-learned on Vulkan this afternoon).
+const SELECT_SG_SRC: &str = r#"
+enable subgroups;
+
+struct MoeSelP { n_exp: u32, top_k: u32, norm: u32, pk: u32 };
+@group(0) @binding(0) var<storage, read>       sg_logit : array<f32>;
+@group(0) @binding(1) var<storage, read>       sg_slog  : array<f32>;
+@group(0) @binding(2) var<storage, read_write> sg_sel   : array<u32>;
+@group(0) @binding(3) var<storage, read_write> sg_w     : array<f32>;
+@group(0) @binding(4) var<uniform>             sg_p     : MoeSelP;
+@group(0) @binding(5) var<storage, read>       sg_sgw   : array<u32>;
+@group(0) @binding(6) var<storage, read>       sg_x     : array<f32>;
+
+var<workgroup> sgm_lg:  array<f32, 256>;
+var<workgroup> sgm_red: array<f32, 256>;
+var<workgroup> sgm_pv:  array<f32, 8>;
+var<workgroup> sgm_pi:  array<u32, 8>;
+var<workgroup> sgm_gate: f32;
+
+@compute @workgroup_size(256)
+fn moe_select_sg(@builtin(local_invocation_index) lid: u32,
+                 @builtin(subgroup_invocation_id) sl: u32,
+                 @builtin(subgroup_size) ssz: u32) {
+    let sgid = lid / ssz;
+    let n = sg_p.n_exp;
+    let sg_kind = sg_p.pk & 0xFFu;
+    let sg_hidden = sg_p.pk >> 8u;
+    // shared-expert gate (same math as the tree kernel)
+    if (sg_kind == 4u) {
+        var d = 0.0;
+        var i = lid;
+        loop {
+            if (i >= sg_hidden) { break; }
+            d = d + bitcast<f32>(sg_sgw[i]) * sg_x[i];
+            i = i + 256u;
+        }
+        sgm_red[lid] = d;
+        workgroupBarrier();
+        var st = 128u;
+        loop {
+            if (st == 0u) { break; }
+            if (lid < st) { sgm_red[lid] = sgm_red[lid] + sgm_red[lid + st]; }
+            workgroupBarrier();
+            st = st >> 1u;
+        }
+        if (lid == 0u) { sgm_gate = sgm_red[0]; }
+    } else {
+        if (lid == 0u) { sgm_gate = sg_slog[0]; }
+    }
+    workgroupBarrier();
+    var v = -3.0e38;
+    if (lid < n) { v = sg_logit[lid]; }
+    sgm_lg[lid] = v;
+    // global max + softmax denom (subgroup sums, one barrier each)
+    let m1 = subgroupMax(v);
+    if (sl == 0u) { sgm_red[sgid] = m1; }
+    workgroupBarrier();
+    var mx = -3.0e38;
+    if (lid < 8u) { mx = sgm_red[lid]; }
+    mx = subgroupMax(mx);
+    mx = subgroupBroadcast(mx, 0u);
+    if (lid == 0u) { sgm_red[255] = mx; }
+    workgroupBarrier();
+    mx = sgm_red[255];
+    let ev = select(0.0, exp(v - mx), lid < n);
+    let s1 = subgroupAdd(ev);
+    if (sl == 0u) { sgm_red[sgid] = s1; }
+    workgroupBarrier();
+    var denom = 0.0;
+    if (lid < 8u) { denom = sgm_red[lid]; }
+    denom = subgroupAdd(denom);
+    denom = subgroupBroadcast(denom, 0u);
+    if (lid == 0u) { sgm_red[254] = denom; }
+    workgroupBarrier();
+    denom = sgm_red[254];
+    // top-k rounds: subgroup argmax (value then lowest index), then an
+    // 8-wide final in subgroup 0.
+    let k = sg_p.top_k;
+    var wsum = 0.0;
+    for (var slot = 0u; slot < k; slot = slot + 1u) {
+        let lv = sgm_lg[lid];
+        let sm = subgroupMax(lv);
+        let cand = select(0xFFFFFFFFu, lid, lv == sm);
+        let si = subgroupMin(cand);
+        if (sl == 0u) {
+            sgm_pv[sgid] = sm;
+            sgm_pi[sgid] = si;
+        }
+        workgroupBarrier();
+        if (sgid == 0u) {
+            var pv = -3.0e38;
+            var pi = 0xFFFFFFFFu;
+            if (sl < 8u) {
+                pv = sgm_pv[sl];
+                pi = sgm_pi[sl];
+            }
+            let bm = subgroupMax(pv);
+            let bc = select(0xFFFFFFFFu, pi, pv == bm);
+            let bi = subgroupMin(bc);
+            if (sl == 0u) {
+                sgm_pv[0] = bm;
+                sgm_pi[0] = bi;
+            }
+        }
+        workgroupBarrier();
+        let bi = sgm_pi[0];
+        let w = exp(sgm_pv[0] - mx) / denom;
+        if (lid == 0u) {
+            sg_sel[slot] = bi;
+            sg_w[slot] = w;
+        }
+        wsum = wsum + w;
+        if (lid == bi) { sgm_lg[lid] = -3.0e38; }
+        workgroupBarrier();
+    }
+    if (lid == 0u) {
+        if (sg_p.norm != 0u) {
+            for (var slot = 0u; slot < k; slot = slot + 1u) { sg_w[slot] = sg_w[slot] / wsum; }
+        }
+        sg_sel[k] = n;
+        sg_w[k] = 1.0 / (1.0 + exp(-sgm_gate));
+    }
+}
+"#;
+
 const WGSL: &str = r#"
 struct Params { cols4: u32, rows: u32, row0_words: u32, _pad: u32 };
 @group(0) @binding(0) var<storage, read>       q  : array<u32>;   // 4×i8 packed into u32, row-major
@@ -4258,6 +4388,7 @@ struct Ctx {
     moe_gate_up_q2tp_f: wgpu::ComputePipeline,
     moe_down_q4tp_f: wgpu::ComputePipeline,
     gqa_attend_dec: wgpu::ComputePipeline,
+    moe_select_sg: Option<wgpu::ComputePipeline>,
     attend_dec: bool,
     foldsel: bool,
     layout_moe_dn_q4tp: wgpu::BindGroupLayout,
@@ -4536,11 +4667,16 @@ fn init() -> Result<Ctx, String> {
         | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
         | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
     let want_ts = adapter.features().contains(ts_features);
+    let want_sg = adapter.features().contains(wgpu::Features::SUBGROUP);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cortiq-wgpu"),
         required_limits: limits,
         required_features: if want_ts {
             ts_features
+        } else {
+            wgpu::Features::empty()
+        } | if want_sg {
+            wgpu::Features::SUBGROUP
         } else {
             wgpu::Features::empty()
         },
@@ -4736,6 +4872,24 @@ fn init() -> Result<Ctx, String> {
         attend_part_s.clone()
     };
     let attend_merge = pipe_split("gqa_attend_merge");
+    // Subgroup select: its own module — `enable subgroups` must never
+    // reach a device without the feature.
+    let moe_select_sg = if want_sg && std::env::var("CMF_SELECT_SG").as_deref() != Ok("0") {
+        let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cmf-select-sg"),
+            source: wgpu::ShaderSource::Wgsl(SELECT_SG_SRC.into()),
+        });
+        Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("moe_select_sg"),
+            layout: None,
+            module: &m,
+            entry_point: Some("moe_select_sg"),
+            compilation_options: Default::default(),
+            cache: None,
+        }))
+    } else {
+        None
+    };
     let layout_attend_part = attend_part.get_bind_group_layout(0);
     let layout_attend_part_s = attend_part_s.get_bind_group_layout(0);
     let layout_attend_merge = attend_merge.get_bind_group_layout(0);
@@ -4861,6 +5015,7 @@ fn init() -> Result<Ctx, String> {
         moe_gate_up_q2tp_f,
         moe_down_q4tp_f,
         gqa_attend_dec,
+        moe_select_sg,
         attend_dec,
         foldsel,
         layout_moe_gu_q2tp,
@@ -7690,6 +7845,10 @@ pub fn forward_token_graph(
                     &c.layout_moe_sel,
                     &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &n1],
                 );
+                let bg_sel_sg = c.moe_select_sg.as_ref().map(|p| {
+                    let l = p.get_bind_group_layout(0);
+                    bg(&l, &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &n1])
+                });
                 let bg_gu = bg(l_gu, &[gate_all, up_all, &n1, msel, mact, &gu_u]);
                 let bg_dn = bg(l_dn, &[down_all, mact, msel, mwt, &ob, &dn_u]);
                 let pr = prep(router, &n1, mlogit, *n_exp, hidden);
@@ -7797,9 +7956,17 @@ pub fn forward_token_graph(
                         pass.set_bind_group(0, &bgs, &[]);
                         pass.dispatch_workgroups(ws, 1, 1);
                     }
-                    pass.set_pipeline(&c.moe_select);
-                    pass.set_bind_group(0, &bg_sel, &[]);
-                    pass.dispatch_workgroups(1, 1, 1);
+                    if let Some(sgp) = &c.moe_select_sg {
+                        // Same binding ORDER as the tree kernel's bg_sel —
+                        // but its OWN layout (auto layouts are exclusive).
+                        pass.set_pipeline(sgp);
+                        pass.set_bind_group(0, bg_sel_sg.as_ref().unwrap(), &[]);
+                        pass.dispatch_workgroups(1, 1, 1);
+                    } else {
+                        pass.set_pipeline(&c.moe_select);
+                        pass.set_bind_group(0, &bg_sel, &[]);
+                        pass.dispatch_workgroups(1, 1, 1);
+                    }
                     tsp!(pass, fine, 32); // select
                     if !skip_moe {
                         pass.set_pipeline(p_gu);
