@@ -2826,39 +2826,26 @@ fn moe_select(@builtin(local_invocation_index) lid: u32) {
     let denom = ms_red[0];
     workgroupBarrier();
     let k = ms_p.top_k;
-    var wsum = 0.0;
-    for (var slot = 0u; slot < k; slot = slot + 1u) {
-        ms_red[lid] = ms_lg[lid];
-        ms_ri[lid] = lid;
-        workgroupBarrier();
-        stride = 128u;
-        loop {
-            if (stride == 0u) { break; }
-            if (lid < stride) {
-                let a = ms_red[lid];
-                let b = ms_red[lid + stride];
-                let ia = ms_ri[lid];
-                let ib = ms_ri[lid + stride];
-                if (b > a || (b == a && ib < ia)) {
-                    ms_red[lid] = b;
-                    ms_ri[lid] = ib;
+    // Top-k as ONE lane's serial scan: 8x256 register compares (~3 us)
+    // against sixty-four workgroup barriers of the tree version (~20 us).
+    // Sequential lowest-index-on-tie is exactly the CPU sampler's rule.
+    if (lid == 0u) {
+        var wsum = 0.0;
+        for (var slot = 0u; slot < k; slot = slot + 1u) {
+            var best = -3.0e38;
+            var bi = 0u;
+            for (var e = 0u; e < n; e = e + 1u) {
+                if (ms_lg[e] > best) {
+                    best = ms_lg[e];
+                    bi = e;
                 }
             }
-            workgroupBarrier();
-            stride = stride >> 1u;
-        }
-        if (lid == 0u) {
-            let bi = ms_ri[0];
             ms_sel[slot] = bi;
-            ms_w[slot] = exp(ms_red[0] - mx) / denom;
-            ms_pick = bi;
+            let w = exp(best - mx) / denom;
+            ms_w[slot] = w;
+            wsum = wsum + w;
+            ms_lg[bi] = -3.0e38;
         }
-        workgroupBarrier();
-        wsum = wsum + exp(ms_red[0] - mx) / denom;
-        if (lid == ms_pick) { ms_lg[lid] = -3.0e38; }
-        workgroupBarrier();
-    }
-    if (lid == 0u) {
         if (ms_p.norm != 0u) {
             for (var slot = 0u; slot < k; slot = slot + 1u) { ms_w[slot] = ms_w[slot] / wsum; }
         }
