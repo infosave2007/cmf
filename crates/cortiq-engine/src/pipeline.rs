@@ -93,6 +93,17 @@ pub struct Pipeline {
     /// Gemma-3n stack (AltUp/LAuReL/PLE/KV-sharing): its own forward —
     /// weights.layers stays empty, the KV caches are the shared ones.
     pub g3n: Option<Box<(crate::g3n::G3nGlobals, Vec<crate::g3n::G3nLayer>)>>,
+    /// DeepSeek-V4 runs its own stack too: its hidden state is `hc_mult`
+    /// copies of a vector, so no loop written for a single residual
+    /// stream can carry it.
+    pub dsv4: Option<
+        Box<(
+            crate::dsv4::Dsv4Globals,
+            Vec<crate::dsv4::Dsv4Layer>,
+            crate::dsv4::Dsv4Cfg,
+            crate::dsv4::Dsv4State,
+        )>,
+    >,
     /// LFM2 short-convolution geometry (present when the model has
     /// `ShortConv` mixer layers).
     pub short_conv_cfg: Option<ShortConvCfg>,
@@ -1139,6 +1150,7 @@ impl Pipeline {
             gdn_cfg: None,
             kda_cfg: None,
             g3n: None,
+            dsv4: None,
             logit_multiplier: None,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             kv_history: Vec::new(),
@@ -3155,6 +3167,14 @@ impl Pipeline {
                 *v *= self.embed_multiplier;
             }
         }
+        // DeepSeek-V4's hash layers route by TOKEN ID, so the id has to
+        // reach the forward. It rides in slot 0 (the forward re-reads the
+        // real embedding itself from the table).
+        if self.dsv4.is_some() {
+            let mut v = vec![0.0f32; self.hidden_size.max(1)];
+            v[0] = id as f32;
+            return v;
+        }
         // Gemma-3n: the per-layer-embedding half needs the token ID, so
         // it rides appended to the embedding; the g3n forward splits it.
         if let Some(b) = &self.g3n {
@@ -4017,6 +4037,32 @@ impl Pipeline {
         task_mask: Option<&TaskMask>,
         upto: Option<usize>,
     ) -> Vec<f32> {
+        // DeepSeek-V4 runs its own stack: the state is hc_mult copies, and
+        // the forward returns LOGITS, not a hidden — the head is inside it
+        // (the final fold sits between the last layer and the norm). The
+        // token id rides in `hidden[0]`, written by embed_single, because
+        // the hash layers route by id rather than by content.
+        if let Some(b) = &mut self.dsv4 {
+            let _ = (task_mask, upto);
+            let token_id = hidden.first().copied().unwrap_or(0.0) as u32;
+            let (g, layers, cfg, st) = (&b.0, &b.1, b.2, &mut b.3);
+            st.pos = position;
+            let mut logits = Vec::new();
+            crate::dsv4::forward_token(
+                g,
+                layers,
+                &cfg,
+                st,
+                token_id,
+                &self.inv_freq,
+                self.pool.as_deref(),
+                &mut logits,
+            );
+            self.graph_logits = Some(logits);
+            // The caller expects a hidden; the logits went out of band, as
+            // with the fused lm_head path.
+            return vec![0.0; self.hidden_size];
+        }
         // Gemma-3n runs its own stack (4 AltUp replicas don't fit this
         // loop); `hidden` is the extended embedding from embed_single.
         if let Some(b) = &self.g3n {
