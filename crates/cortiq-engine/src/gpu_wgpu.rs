@@ -4588,7 +4588,11 @@ fn init() -> Result<Ctx, String> {
     let moe_gate_up_q2tp = pipe("moe_gate_up_q2tp");
     let moe_gate_up_q2tp_f = pipe("moe_gate_up_q2tp_f");
     let moe_down_q4tp_f = pipe("moe_down_q4tp_f");
-    let foldsel = std::env::var("CMF_MOE_FOLDSEL").map(|v| v != "0").unwrap_or(true);
+    // Measured NEGATIVE on RTX PRO 6000 (72.6 vs 79.0 tok/s): the redundant
+    // per-workgroup top-k costs more than the retired select hop — in-pass
+    // dispatches overlap more than the latency model assumed. Kept for
+    // study; CMF_MOE_FOLDSEL=1 enables.
+    let foldsel = std::env::var("CMF_MOE_FOLDSEL").as_deref() == Ok("1");
     let layout_moe_gu_q2tp = moe_gate_up_q2tp.get_bind_group_layout(0);
     let layout_moe_dn_q4tp = moe_down_q4tp.get_bind_group_layout(0);
     let layout = matvec.get_bind_group_layout(0);
