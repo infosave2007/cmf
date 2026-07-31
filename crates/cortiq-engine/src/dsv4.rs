@@ -310,36 +310,27 @@ pub fn sparse_attend(
 /// each group's slice is projected to `lora` by its own block of `wo_a`,
 /// and the concatenation goes through `wo_b`. `wo_a` is stored
 /// `[groups, lora, per_group]`.
+/// `wo_a_row` is `(row, x) -> dot`, reading one row of `wo_a` against the
+/// slice of `attn` its group owns; `wo_b` is the plain projection of the
+/// concatenated groups. Both arrive as closures so the caller can serve them
+/// straight from quantized tensors.
 pub fn o_project(
     attn: &[f32],
-    wo_a: &[f32],
-    wo_b: &[f32],
+    wo_a_row: &dyn Fn(usize, &[f32]) -> f32,
+    wo_b: &dyn Fn(&[f32], &mut [f32]),
     groups: usize,
     lora: usize,
-    dim: usize,
     out: &mut [f32],
 ) {
     let per_group = attn.len() / groups;
     let mut mid = vec![0.0f32; groups * lora];
-    for g in 0..groups {
-        let src = &attn[g * per_group..(g + 1) * per_group];
-        let blk = &wo_a[g * lora * per_group..(g + 1) * lora * per_group];
-        for r in 0..lora {
-            let row = &blk[r * per_group..(r + 1) * per_group];
-            mid[g * lora + r] = row.iter().zip(src).map(|(a, b)| a * b).sum();
-        }
+    for (i, m) in mid.iter_mut().enumerate() {
+        let g = i / lora;
+        *m = wo_a_row(i, &attn[g * per_group..(g + 1) * per_group]);
     }
-    debug_assert_eq!(wo_b.len(), dim * mid.len());
-    for d in 0..dim {
-        let row = &wo_b[d * mid.len()..(d + 1) * mid.len()];
-        out[d] = row.iter().zip(&mid).map(|(a, b)| a * b).sum();
-    }
+    wo_b(&mid, out);
 }
 
-/// The KV compressor: `ratio` consecutive tokens collapse into one through
-/// a softmax over the window, with a learned in-window position bias added
-/// to the scores BEFORE the softmax. Both streams come from the same
-/// hidden state through `wkv` and `wgate`.
 pub fn compress_window(
     kv: &[f32],
     score: &[f32],
@@ -436,6 +427,12 @@ pub fn top_k_positions(scores: &[f32], k: usize, out: &mut Vec<usize>) {
 
 /// SwiGLU expert: `w2(silu(w1(x)) * w3(x))`, with the routing weight folded
 /// in before the down projection exactly as the reference does.
+///
+/// `limit` is the reference's `swiglu_limit` (10.0 in the release), and its
+/// asymmetry is not a typo: `up` is clamped on BOTH sides, `gate` only from
+/// above — the reference leaves silu's negative tail alone. A limit of 0
+/// disables the clamp, which is also what the reference does.
+#[allow(clippy::too_many_arguments)]
 pub fn expert_swiglu(
     x: &[f32],
     w1: &dyn Fn(&[f32], &mut [f32]),
@@ -443,12 +440,21 @@ pub fn expert_swiglu(
     w2: &dyn Fn(&[f32], &mut [f32]),
     inter: usize,
     weight: f32,
+    limit: f32,
     out: &mut [f32],
 ) {
     let mut gate = vec![0.0f32; inter];
     let mut up = vec![0.0f32; inter];
     w1(x, &mut gate);
     w3(x, &mut up);
+    if limit > 0.0 {
+        for u in up.iter_mut() {
+            *u = u.clamp(-limit, limit);
+        }
+        for g in gate.iter_mut() {
+            *g = g.min(limit);
+        }
+    }
     for (g, u) in gate.iter_mut().zip(&up) {
         let silu = *g / (1.0 + (-*g).exp());
         *g = silu * u * weight;
@@ -475,6 +481,10 @@ pub struct Dsv4Cfg {
     pub top_k: usize,
     pub moe_inter: usize,
     pub route_scale: f32,
+    /// The reference's `swiglu_limit`; 0 disables the clamp.
+    pub swiglu_limit: f32,
+    /// Sliding-window size (`window_size`, 128 in the release).
+    pub window: usize,
     pub index_topk: usize,
     pub vocab: usize,
 }
@@ -759,6 +769,14 @@ pub fn attention_step(
 
     // ── the window ring, then the compressor's output appended after it ──
     st.window[li].extend_from_slice(&kv);
+    // The reference keeps the window in a ring of `window_size`; holding the
+    // last N in order is the same set, and without this the "window" grows
+    // for the whole generation — wrong attention AND unbounded memory.
+    let cap = cfg.window * hd;
+    if st.window[li].len() > cap {
+        let drop = st.window[li].len() - cap;
+        st.window[li].drain(..drop);
+    }
     let win_len = st.window[li].len() / hd;
     let mut cache: Vec<f32> = st.window[li].clone();
     cache.extend_from_slice(&st.compressed[li]);
@@ -822,25 +840,18 @@ pub fn attention_step(
     }
 
     // ── grouped low-rank output ──
-    // Materialize the two output blocks row by row (row_f32 is the only
-    // dtype-agnostic reader). They are small next to an expert, and this
-    // keeps the grouped projection free of layout branches.
-    let (ac, bc) = (l.wo_a.cols(), l.wo_b.cols());
-    let mut wo_a = vec![0.0f32; l.wo_a.rows() * ac];
-    for r in 0..l.wo_a.rows() {
-        l.wo_a.row_f32(r, &mut wo_a[r * ac..(r + 1) * ac]);
-    }
-    let mut wo_b = vec![0.0f32; l.wo_b.rows() * bc];
-    for r in 0..l.wo_b.rows() {
-        l.wo_b.row_f32(r, &mut wo_b[r * bc..(r + 1) * bc]);
-    }
+    // Read the two blocks through the quantized readers. Materializing them
+    // here instead costs ~270 MB of dequantization per layer per token on
+    // the release checkpoint (wo_a and wo_b are 33M weights each), which is
+    // the difference between decoding and not.
+    let mut scratch = vec![0.0f32; l.wo_a.cols()];
+    let scratch_cell = std::cell::RefCell::new(&mut scratch);
     o_project(
         &attn,
-        &wo_a,
-        &wo_b,
+        &|r, x| l.wo_a.row_dot(r, x, scratch_cell.borrow_mut().as_mut()),
+        &|mid, dst| l.wo_b.matvec(mid, dst, pool),
         cfg.o_groups,
         cfg.o_lora_rank,
-        cfg.dim,
         out,
     );
 }
@@ -896,6 +907,8 @@ pub fn moe_step(
     }
 }
 
+/// The routed and shared experts both come through here, so the clamp and
+/// the weight folding have exactly one implementation — `expert_swiglu`.
 fn run_expert(
     x: &[f32],
     e: &Dsv4Expert,
@@ -904,15 +917,16 @@ fn run_expert(
     pool: Option<&crate::pool::Pool>,
     out: &mut [f32],
 ) {
-    let mut gate = vec![0.0f32; cfg.moe_inter];
-    let mut up = vec![0.0f32; cfg.moe_inter];
-    e.w1.matvec(x, &mut gate, pool);
-    e.w3.matvec(x, &mut up, pool);
-    for (g, u) in gate.iter_mut().zip(&up) {
-        let silu = *g / (1.0 + (-*g).exp());
-        *g = silu * u * weight;
-    }
-    e.w2.matvec(&gate, out, pool);
+    expert_swiglu(
+        x,
+        &|src, dst| e.w1.matvec(src, dst, pool),
+        &|src, dst| e.w3.matvec(src, dst, pool),
+        &|src, dst| e.w2.matvec(src, dst, pool),
+        cfg.moe_inter,
+        weight,
+        cfg.swiglu_limit,
+        out,
+    );
 }
 
 /// One token through the whole stack.
@@ -1138,6 +1152,8 @@ mod tests {
             top_k: 2,
             moe_inter: 16,
             route_scale: 1.0,
+            swiglu_limit: 10.0,
+            window: 6,
             index_topk: 8,
             vocab: 24,
         };
@@ -1269,6 +1285,15 @@ mod tests {
         // The cache has to have grown, and the compressor layer must have
         // emitted compressed entries (10 tokens / ratio 4 = 2 windows).
         assert!(!st.window[0].is_empty(), "sliding window never filled");
+        // Ten tokens through a window of six: it must have slid, not grown.
+        for (li, w) in st.window.iter().enumerate() {
+            assert!(
+                w.len() / cfg.head_dim <= cfg.window,
+                "layer {li}: window holds {} positions, cap is {}",
+                w.len() / cfg.head_dim,
+                cfg.window
+            );
+        }
         assert!(
             !st.compressed[1].is_empty(),
             "compressor layer produced no compressed KV in 10 tokens"
@@ -1284,6 +1309,57 @@ mod tests {
             first.unwrap(),
             "the same token from a fresh state must reproduce exactly"
         );
+    }
+
+    /// The reference clamps `up` on both sides but `gate` only from above.
+    /// Getting that symmetric would quietly change every expert's output on
+    /// the tokens that saturate, which is the hardest kind of bug to see.
+    #[test]
+    fn swiglu_limit_clamps_up_both_ways_and_gate_only_from_above() {
+        let inter = 4;
+        // gate = [-50, 50, 1, -1], up = [50, -50, 1, -1]
+        let gate_src = [-50.0f32, 50.0, 1.0, -1.0];
+        let up_src = [50.0f32, -50.0, 1.0, -1.0];
+        let limit = 10.0f32;
+        let mut got = vec![0.0f32; inter];
+        expert_swiglu(
+            &[0.0],
+            &|_, d| d.copy_from_slice(&gate_src),
+            &|_, d| d.copy_from_slice(&up_src),
+            &|src, d| d.copy_from_slice(src),
+            inter,
+            1.0,
+            limit,
+            &mut got,
+        );
+        let silu = |g: f32| g / (1.0 + (-g).exp());
+        // gate: only the +50 is cut, the -50 rides through silu untouched.
+        let want = [
+            silu(-50.0) * limit,
+            silu(limit) * -limit,
+            silu(1.0) * 1.0,
+            silu(-1.0) * -1.0,
+        ];
+        for (i, w) in want.iter().enumerate() {
+            assert!(
+                (got[i] - w).abs() < 1e-5,
+                "lane {i}: got {} want {w}",
+                got[i]
+            );
+        }
+        // And with the clamp off nothing is touched.
+        let mut raw = vec![0.0f32; inter];
+        expert_swiglu(
+            &[0.0],
+            &|_, d| d.copy_from_slice(&gate_src),
+            &|_, d| d.copy_from_slice(&up_src),
+            &|src, d| d.copy_from_slice(src),
+            inter,
+            1.0,
+            0.0,
+            &mut raw,
+        );
+        assert!((raw[1] - silu(50.0) * -50.0).abs() < 1e-3, "limit 0 must not clamp");
     }
 
     /// Numerical parity with the reference. The vectors below come from
@@ -1517,6 +1593,8 @@ mod tests {
             top_k: 1,
             moe_inter: 4,
             route_scale: 1.0,
+            swiglu_limit: 10.0,
+            window: 128,
             index_topk: 4,
             vocab: 8,
         };

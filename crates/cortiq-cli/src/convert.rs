@@ -1815,8 +1815,17 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         _ => (None, None, None),
     };
     let rope_theta = g4_rope_theta.unwrap_or(rope_theta);
+    // Both spellings are in the wild: newer configs say `rope_type`, older
+    // ones (DeepSeek-V4 among them) say `type`. Reading only one of them
+    // drops the profile silently and the model decodes with unscaled
+    // frequencies — which looks like a bad conversion, not a missing field.
     let yarn = rope
-        .filter(|r| r.get("rope_type").and_then(|v| v.as_str()) == Some("yarn"))
+        .filter(|r| {
+            r.get("rope_type")
+                .or_else(|| r.get("type"))
+                .and_then(|v| v.as_str())
+                == Some("yarn")
+        })
         .map(|r| {
             Ok::<YarnConfig, anyhow::Error>(YarnConfig {
                 factor: r
@@ -3642,6 +3651,7 @@ pub fn run_convert(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cortiq_core::format::CmfModel;
     use cortiq_core::quant::{
         dequant_q4_block, dequant_q4_tiled, dequant_q4tp, dequant_q8_2f, dequant_q8_row,
         dequant_vbit, expected_nbytes,

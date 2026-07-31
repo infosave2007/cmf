@@ -1310,6 +1310,13 @@ impl Pipeline {
                 top_k: moe.top_k,
                 moe_inter: moe.moe_intermediate_size,
                 route_scale: moe.routed_scaling_factor.unwrap_or(1.0) as f32,
+                // config.json's `swiglu_limit`, which the header has no
+                // field for. The release ships 10.0; a checkpoint that
+                // retunes it would need this read from the config, so it
+                // sits next to the other pinned constants rather than
+                // hiding inside the expert.
+                swiglu_limit: 10.0,
+                window: arch.sliding_window.unwrap_or(128),
                 index_topk: 512,
                 vocab: arch.vocab_size,
             };
@@ -1328,6 +1335,43 @@ impl Pipeline {
                     cfg.hc_mult = 4;
                 }
             }
+            // RoPE rides only the last `rope_head_dim` of each head, and the
+            // reference builds its frequencies over THAT width — not over
+            // head_dim, which is 512 here. The generic path above sized them
+            // by head_dim, giving 1/base^(2i/512) where 1/base^(2i/64) is
+            // wanted: every position rotated by the wrong angle.
+            //
+            // YaRN is applied unconditionally by the reference (its guard is
+            // `original_seq_len > 0`, not the sequence length), so it belongs
+            // in these frequencies too. Older configs spell the key `type`
+            // rather than `rope_type`; when the header carries no profile the
+            // release's own numbers stand in, which is better than silently
+            // decoding with unscaled frequencies.
+            let (yf, yo, ybf, ybs) = match &arch.yarn {
+                Some(y) => (
+                    y.factor,
+                    y.original_max_position_embeddings,
+                    y.beta_fast,
+                    y.beta_slow,
+                ),
+                None => {
+                    tracing::warn!(
+                        "deepseek_v4: the header carries no YaRN profile — \
+                         falling back to the release's (factor 16, original \
+                         65536, beta 32/1). Re-converting with a build that \
+                         reads rope_scaling.type would make this exact."
+                    );
+                    (16.0, 65536, 32.0, 1.0)
+                }
+            };
+            pipeline.inv_freq = std::sync::Arc::new(crate::attention::yarn_inv_freq(
+                cfg.rope_head_dim,
+                arch.rope_theta as f32,
+                yf,
+                yo,
+                ybf,
+                ybs,
+            ));
             let st = crate::dsv4::Dsv4State::new(arch.num_layers);
             pipeline.dsv4 = Some(Box::new((g, dl, cfg, st)));
         }
