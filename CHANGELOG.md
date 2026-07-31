@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.42] — 2026-07-31
+
+The Qwen3.6 release. The hybrid MoE flagship (35B-A3B) and the dense 27B run
+whole-token on discrete GPUs — 64.5 tok/s decode on an RTX 5090, 99 tok/s
+batched prompt ingest — keep their multi-token-prediction heads through
+conversion, and O(1) Nyström attention now rides the GPU graph instead of
+dragging the model back to the CPU.
+
+### Added
+- **Qwen3.6 MTP heads survive conversion.** The converter keeps `mtp.*`
+  (renamed to the loader layout) instead of dropping it, and the loader
+  builds MoE FFNs inside the MTP block — previously it only knew dense
+  heads, so an MTP-bearing MoE file failed to load.
+- **O(1) attention on the wgpu graph** (`CMF_O1_GPU=1`): the sealed
+  landmark skeleton, far-field flash accumulators and FM rectifier run as
+  graph kernels. Qwen3.6-35B-A3B holds a flat 53.8 tok/s at ctx 16 384
+  where exact attention has fallen to 37.8.
+- **Batched prompt ingest through the graph** (`CMF_BATCH_K`): token-axis
+  MoE kernels route each position individually while the surrounding
+  skeleton stays batched — 99 tok/s ingest against 33 per-position.
+- Metal: the whole MoE block in four dispatches (M4 35B-A3B decode
+  10.6 → 18.2 tok/s), with a loud `maxBufferLength` refusal.
+- Measurement probes for the decode frame: `CMF_TOPK_PROBE`,
+  `CMF_SKIP_PROBE`, `CMF_LAYERS_PROBE` — measure before optimizing.
+
+### Fixed
+- **q4t/q4tp files never entered the whole-token graph** — a hole in the
+  layout prep silently sent every quantized-tile model to the CPU.
+- **The graph's GDN device state started zeroed after a CPU prefill**
+  (o1 calibration, `--state` resume): now seeded from the CPU recurrence.
+- The OpenAI-compatible server accepts `content` as a block array as well
+  as a string (Cline/Zoo-style clients got 422).
+- `bench --ctx` decoded without the synthetic context it had just built.
+- CPU MoE: every routed expert now runs under one pool dispatch instead
+  of one dispatch each.
+
+### Changed
+- Graph refusals are loud: the graph logs ACTIVE/declined with the
+  reason, and the VRAM budget prints the numbers it compared
+  (`RUST_LOG=info`).
+
 ## [0.5.41] — 2026-07-30
 
 A hotfix: **0.5.40 shipped a Metal backend that does not initialize.** Update.
