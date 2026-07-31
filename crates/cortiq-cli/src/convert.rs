@@ -249,6 +249,74 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
             return canon_name(&format!("model.{rest}"));
         }
     }
+    // ── DeepSeek-V4 (`deepseek_v4`) ────────────────────────────────────
+    // Its checkpoint drops the `model.` wrapper entirely and spells the
+    // blocks `attn`/`ffn`, so the names arrive at top level: `embed`,
+    // `head`, `norm`, `layers.N.attn.*`, `layers.N.ffn.*`. Everything
+    // below is a rename into the layout the loader already reads; the
+    // architecture-specific tensors (compressor, indexer, hyper-
+    // connections) keep their spelling under the layer prefix so the
+    // engine can find them once those nodes exist.
+    if raw == "embed.weight" {
+        return Some("model.embed_tokens.weight".into());
+    }
+    if raw == "head.weight" {
+        return Some("lm_head.weight".into());
+    }
+    if raw == "norm.weight" {
+        return Some("model.norm.weight".into());
+    }
+    // The hyper-connection head tensors are model-global (hc_head_base /
+    // _fn / _scale) — pass them through under `model.`.
+    if raw.starts_with("hc_head_") {
+        return Some(format!("model.{raw}"));
+    }
+    if let Some(rest) = raw.strip_prefix("layers.") {
+        // `layers.N.` + the rest; N is the layer index.
+        if let Some((li, tail)) = rest.split_once('.') {
+            if li.chars().all(|c| c.is_ascii_digit()) {
+                let mapped = match tail {
+                    "attn_norm.weight" => "input_layernorm.weight".to_string(),
+                    "ffn_norm.weight" => "post_attention_layernorm.weight".to_string(),
+                    // Router: weight + the noaux_tc selection bias, which
+                    // the loader reads as `mlp.expert_bias`.
+                    "ffn.gate.weight" => "mlp.gate.weight".to_string(),
+                    "ffn.gate.bias" => "mlp.expert_bias".to_string(),
+                    // Hash-routed layers carry a token-id → expert table
+                    // instead of a learned gate.
+                    "ffn.gate.tid2eid" => "mlp.tid2eid".to_string(),
+                    other => {
+                        // experts.E.w{1,3,2} → experts.E.{gate,up,down}_proj
+                        // (DeepSeek's w1 = gate, w3 = up, w2 = down), and
+                        // the same for the single shared expert.
+                        let mut t = other
+                            .replace("ffn.shared_experts.", "mlp.shared_expert.")
+                            .replace("ffn.experts.", "mlp.experts.");
+                        if t.starts_with("mlp.experts.") || t.starts_with("mlp.shared_expert.") {
+                            t = t
+                                .replace(".w1.weight", ".gate_proj.weight")
+                                .replace(".w3.weight", ".up_proj.weight")
+                                .replace(".w2.weight", ".down_proj.weight")
+                                .replace(".w1.scale", ".gate_proj.scale")
+                                .replace(".w3.scale", ".up_proj.scale")
+                                .replace(".w2.scale", ".down_proj.scale");
+                        }
+                        // Attention keeps DeepSeek's own spelling: the
+                        // double-LoRA q/o, the compressed KV, the sink,
+                        // the compressor and the sparse indexer have no
+                        // equivalent in any arch already supported, so
+                        // renaming them would invent a layout nothing
+                        // reads. `self_attn.` is the prefix every loader
+                        // looks under.
+                        t = t.replace("attn.", "self_attn.");
+                        t
+                    }
+                };
+                return Some(format!("model.layers.{li}.{mapped}"));
+            }
+        }
+    }
+
     // Kimi (Kimi Linear / Kimi-K3) MoE block: mixtral-style w1/w3/w2
     // experts and a router with the noaux_tc selection bias.
     // `block_sparse_moe` is Kimi-exclusive among supported archs.
@@ -3525,6 +3593,64 @@ mod tests {
     /// length AND the reader's own view of it.
     /// E4M3 has no infinities and one NaN; the values below are the
     /// bit patterns that pin its exponent bias and its subnormal step.
+    /// DeepSeek-V4 names arrive with no `model.` wrapper and spell the
+    /// blocks `attn`/`ffn`. Pin the whole map: a silent miss here means a
+    /// tensor lands under a name nothing reads, and the model loads with
+    /// a hole instead of failing.
+    #[test]
+    fn deepseek_v4_names_map_onto_the_loader_layout() {
+        let m = |s: &str| canon_name(s).unwrap();
+        assert_eq!(m("embed.weight"), "model.embed_tokens.weight");
+        assert_eq!(m("head.weight"), "lm_head.weight");
+        assert_eq!(m("norm.weight"), "model.norm.weight");
+        assert_eq!(m("hc_head_scale"), "model.hc_head_scale");
+        assert_eq!(
+            m("layers.7.attn_norm.weight"),
+            "model.layers.7.input_layernorm.weight"
+        );
+        assert_eq!(
+            m("layers.7.ffn_norm.weight"),
+            "model.layers.7.post_attention_layernorm.weight"
+        );
+        // router + the noaux_tc bias + the hash table
+        assert_eq!(m("layers.7.ffn.gate.weight"), "model.layers.7.mlp.gate.weight");
+        assert_eq!(m("layers.7.ffn.gate.bias"), "model.layers.7.mlp.expert_bias");
+        assert_eq!(m("layers.7.ffn.gate.tid2eid"), "model.layers.7.mlp.tid2eid");
+        // w1 = gate, w3 = up, w2 = down — for routed AND shared experts
+        assert_eq!(
+            m("layers.7.ffn.experts.42.w1.weight"),
+            "model.layers.7.mlp.experts.42.gate_proj.weight"
+        );
+        assert_eq!(
+            m("layers.7.ffn.experts.42.w3.weight"),
+            "model.layers.7.mlp.experts.42.up_proj.weight"
+        );
+        assert_eq!(
+            m("layers.7.ffn.experts.42.w2.scale"),
+            "model.layers.7.mlp.experts.42.down_proj.scale"
+        );
+        assert_eq!(
+            m("layers.7.ffn.shared_experts.w1.weight"),
+            "model.layers.7.mlp.shared_expert.gate_proj.weight"
+        );
+        // attention keeps its own spelling under self_attn — the double
+        // LoRA, the compressed KV, the sink, the compressor and the
+        // indexer have no equivalent in a supported arch yet
+        assert_eq!(
+            m("layers.7.attn.wq_a.weight"),
+            "model.layers.7.self_attn.wq_a.weight"
+        );
+        assert_eq!(
+            m("layers.7.attn.indexer.weights_proj.weight"),
+            "model.layers.7.self_attn.indexer.weights_proj.weight"
+        );
+        assert_eq!(
+            m("layers.7.attn.compressor.wkv.weight"),
+            "model.layers.7.self_attn.compressor.wkv.weight"
+        );
+        assert_eq!(m("layers.7.hc_attn_scale"), "model.layers.7.hc_attn_scale");
+    }
+
     #[test]
     fn fp8_e4m3_decodes_the_ocp_reference_points() {
         assert_eq!(fp8_e4m3_to_f32(0x00), 0.0);
