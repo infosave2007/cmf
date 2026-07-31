@@ -36,6 +36,14 @@ cortiq convert --model Qwen/Qwen3.6-35B-A3B --quant q4tp --output qwen36-35b-a3b
 # ~25 min on a datacenter link; needs nothing but the output space
 ```
 
+**Version gate: everything on this page needs cortiq 0.5.42+.** Earlier
+runtimes (0.5.41 and below, the current `cargo install` / GitHub release)
+**cannot load this file at all** — their loader only knows dense-FFN MTP
+heads and errors out on this model's MoE head — and their converter drops
+`mtp.*` tensors, so a 0.5.41 conversion produces a different, smaller
+file. Their whole-token graph also declines the q4tp layout, so none of
+the GPU numbers above apply to them.
+
 ## 2. Run
 
 ```sh
