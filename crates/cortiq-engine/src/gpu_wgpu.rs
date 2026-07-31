@@ -2268,6 +2268,11 @@ struct MoeGuP { gpr: u32, inter: u32, slots: u32, mat16: u32 };
 var<workgroup> mg_pg: array<f32, 64>;
 var<workgroup> mg_pu: array<f32, 64>;
 
+// The same activations as `mg_x`, as vec4: the scalar view costs one load
+// per weight, which left the dense FFN kernel at ~11% of the card's
+// bandwidth until the vec4 rewrite (+2.7x there). MoE reads x the same way.
+@group(0) @binding(6) var<storage, read> mg_xv : array<vec4<f32>>;
+
 fn mg_g16(o: u32) -> u32 { return (mg_gw[o >> 1u] >> ((o & 1u) * 16u)) & 0xFFFFu; }
 fn mg_u16f(o: u32) -> u32 { return (mg_uw[o >> 1u] >> ((o & 1u) * 16u)) & 0xFFFFu; }
 fn mg_dot8(w: u32, xi: u32) -> f32 {
@@ -2459,6 +2464,27 @@ fn moe_gate_up_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
 // SIXTEEN weights, so the group is two words and two dot16s. The params
 // and 5-bit code planes are byte-identical to q4tp — only the plane
 // offsets move, since they sit behind a half-size weight plane.
+// 16 two-bit weights against four staged vec4s — same add order as the
+// scalar mg_dot16 below, which greedy parity depends on.
+fn mg_dot16v(w: u32, a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32>) -> f32 {
+    return (f32(w & 3u) - 1.5) * a.x
+         + (f32((w >> 2u) & 3u) - 1.5) * a.y
+         + (f32((w >> 4u) & 3u) - 1.5) * a.z
+         + (f32((w >> 6u) & 3u) - 1.5) * a.w
+         + (f32((w >> 8u) & 3u) - 1.5) * b.x
+         + (f32((w >> 10u) & 3u) - 1.5) * b.y
+         + (f32((w >> 12u) & 3u) - 1.5) * b.z
+         + (f32((w >> 14u) & 3u) - 1.5) * b.w
+         + (f32((w >> 16u) & 3u) - 1.5) * c.x
+         + (f32((w >> 18u) & 3u) - 1.5) * c.y
+         + (f32((w >> 20u) & 3u) - 1.5) * c.z
+         + (f32((w >> 22u) & 3u) - 1.5) * c.w
+         + (f32((w >> 24u) & 3u) - 1.5) * d.x
+         + (f32((w >> 26u) & 3u) - 1.5) * d.y
+         + (f32((w >> 28u) & 3u) - 1.5) * d.z
+         + (f32((w >> 30u) & 3u) - 1.5) * d.w;
+}
+
 fn mg_dot16(w: u32, xi: u32) -> f32 {
     return (f32(w & 3u) - 1.5) * mg_x[xi]
          + (f32((w >> 2u) & 3u) - 1.5) * mg_x[xi + 1u]
@@ -2514,9 +2540,16 @@ fn moe_gate_up_q2tp(@builtin(workgroup_id) wid: vec3<u32>,
         // Group base in u16 units is a multiple of 4, so the two 32-bit
         // words land on u32 lanes (nib16 >> 1) and (nib16 >> 1) + 1.
         let w32 = (nib16 + g * 4u) >> 1u;
-        let xb = g * 32u;
-        let dg = mg_dot16(mg_gw[w32], xb) + mg_dot16(mg_gw[w32 + 1u], xb + 16u);
-        let du = mg_dot16(mg_uw[w32], xb) + mg_dot16(mg_uw[w32 + 1u], xb + 16u);
+        // One group = 32 activations = 8 vec4s, shared by gate and up.
+        let xq = g * 8u;
+        let x0 = mg_xv[xq];      let x1 = mg_xv[xq + 1u];
+        let x2 = mg_xv[xq + 2u]; let x3 = mg_xv[xq + 3u];
+        let x4 = mg_xv[xq + 4u]; let x5 = mg_xv[xq + 5u];
+        let x6 = mg_xv[xq + 6u]; let x7 = mg_xv[xq + 7u];
+        let dg = mg_dot16v(mg_gw[w32], x0, x1, x2, x3)
+               + mg_dot16v(mg_gw[w32 + 1u], x4, x5, x6, x7);
+        let du = mg_dot16v(mg_uw[w32], x0, x1, x2, x3)
+               + mg_dot16v(mg_uw[w32 + 1u], x4, x5, x6, x7);
         ag = ag + sg * dg;
         au = au + su * du;
     }
@@ -5788,6 +5821,12 @@ pub fn forward_token_graph(
     let group = std::env::var("CMF_GPU_GROUP")
         .map(|v| v != "0")
         .unwrap_or(true);
+    // Hand strictly-serial single-dispatch stages to the NEXT pass instead of
+    // opening a pass for each. Dispatch ORDER is unchanged, so the answer is
+    // unchanged; only pass boundaries move. CMF_PASSFUSE=0 reverts.
+    let passfuse = std::env::var("CMF_PASSFUSE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     // CMF_SKIP_PROBE=moe|gdn — TIMING ONLY, the answer is garbage. Drops a
     // whole stage's dispatches while leaving every buffer, pass and shape
     // in place, so the delta is that stage's real share of the frame. The
@@ -6486,14 +6525,21 @@ pub fn forward_token_graph(
             }
             _ => return false,
         }
-        // token-mix residual + FFN-norm fused: h += ob, n1 = rms(h, post_norm)
+        // token-mix residual + FFN-norm fused: h += ob, n1 = rms(h, post_norm).
+        // It used to open its own compute pass. On this Vulkan stack a PASS
+        // BOUNDARY is the expensive part (the MoE block is built entirely
+        // around that fact), and this one sits between two passes that are
+        // strictly serial anyway — so hand it to the FFN pass as a prologue
+        // and let within-pass serialization do the same job for free.
+        // CMF_PASSFUSE=0 puts it back in its own pass.
+        let mut ffn_pre: Option<(&wgpu::ComputePipeline, wgpu::BindGroup, u32)> = None;
         if !skip_norm {
-            go(
-                &mut enc,
-                &c.add_rmsnorm,
-                &bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &pnw, &n1, &rms_u]),
-                1,
-            );
+            let nbg = bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &pnw, &n1, &rms_u]);
+            if passfuse {
+                ffn_pre = Some((&c.add_rmsnorm, nbg, 1));
+            } else {
+                go(&mut enc, &c.add_rmsnorm, &nbg, 1);
+            }
         }
         // SiLU FFN: gate+up matvecs + silu fused in ONE compute pass
         // (dispatches within a pass are serialized — silu safely reads gate/up output).
@@ -6507,6 +6553,11 @@ pub fn forward_token_graph(
                         label: None,
                         timestamp_writes: None,
                     });
+                    if let Some((p, b, w)) = &ffn_pre {
+                        pass.set_pipeline(p);
+                        pass.set_bind_group(0, b, &[]);
+                        pass.dispatch_workgroups(*w, 1, 1);
+                    }
                     pass.set_pipeline(pgp);
                     pass.set_bind_group(0, &bg_g, &[]);
                     pass.dispatch_workgroups(wg, 1, 1);
@@ -6630,7 +6681,14 @@ pub fn forward_token_graph(
                     &c.layout_moe_sel,
                     &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &n1],
                 );
-                let bg_gu = bg(l_gu, &[gate_all, up_all, &n1, msel, mact, &gu_u]);
+                // The q2tp kernel takes the activations TWICE — scalar and
+                // vec4 views of one buffer (auto-layouts are pipeline-
+                // exclusive, so only its layout has slot 6).
+                let bg_gu = if *gu_q2 {
+                    bg(l_gu, &[gate_all, up_all, &n1, msel, mact, &gu_u, &n1])
+                } else {
+                    bg(l_gu, &[gate_all, up_all, &n1, msel, mact, &gu_u])
+                };
                 let bg_dn = bg(l_dn, &[down_all, mact, msel, mwt, &ob, &dn_u]);
                 let pr = prep(router, &n1, mlogit, *n_exp, hidden);
                 let ps = prep(sgate, &n1, mslog, 1, hidden);
@@ -6639,6 +6697,11 @@ pub fn forward_token_graph(
                         label: None,
                         timestamp_writes: None,
                     });
+                    if let Some((p, b, w)) = &ffn_pre {
+                        pass.set_pipeline(p);
+                        pass.set_bind_group(0, b, &[]);
+                        pass.dispatch_workgroups(*w, 1, 1);
+                    }
                     if !skip_router {
                         pass.set_pipeline(prp);
                         pass.set_bind_group(0, &bgr, &[]);
