@@ -353,21 +353,74 @@ pub fn compress_window(
 ) {
     debug_assert_eq!(kv.len(), ratio * width);
     debug_assert_eq!(ape.len(), ratio * width);
+    let biased: Vec<f32> = score.iter().zip(ape).map(|(s, a)| s + a).collect();
+    pool_by_score(kv, &biased, ratio, width, out);
+}
+
+/// Softmax over the `slots` axis, per dimension, then the weighted sum —
+/// the pooling both the plain and the overlapping compressor end in.
+/// `-inf` scores are how an absent slot votes for nothing, so the
+/// max-subtraction has to survive a whole column of them.
+pub fn pool_by_score(kv: &[f32], score: &[f32], slots: usize, width: usize, out: &mut [f32]) {
+    debug_assert_eq!(kv.len(), slots * width);
+    debug_assert_eq!(score.len(), slots * width);
     out.fill(0.0);
     for d in 0..width {
         let mut m = f32::NEG_INFINITY;
-        for t in 0..ratio {
-            m = m.max(score[t * width + d] + ape[t * width + d]);
+        for t in 0..slots {
+            m = m.max(score[t * width + d]);
+        }
+        if !m.is_finite() {
+            continue;
         }
         let mut denom = 0.0;
-        for t in 0..ratio {
-            denom += (score[t * width + d] + ape[t * width + d] - m).exp();
+        for t in 0..slots {
+            denom += (score[t * width + d] - m).exp();
         }
-        for t in 0..ratio {
-            let w = (score[t * width + d] + ape[t * width + d] - m).exp() / denom;
-            out[d] += w * kv[t * width + d];
+        if denom <= 0.0 {
+            continue;
+        }
+        for t in 0..slots {
+            out[d] += ((score[t * width + d] - m).exp() / denom) * kv[t * width + d];
         }
     }
+}
+
+/// The overlapping compressor (the release uses it wherever the ratio is 4).
+///
+/// Each token contributes `2*d` values: the first half belongs to the window
+/// that started half a stride earlier, the second half to the current one.
+/// At fold time the reference pools `2*ratio` entries of width `d` — the
+/// PREVIOUS window's slots taking their first half, the current window's
+/// slots taking their second half — then the current window becomes the
+/// previous one. An absent previous window votes with `-inf`.
+#[allow(clippy::too_many_arguments)]
+pub fn compress_window_overlap(
+    prev_kv: &[f32],
+    prev_score: &[f32],
+    cur_kv: &[f32],
+    cur_score: &[f32],
+    ratio: usize,
+    d: usize,
+    out: &mut [f32],
+) {
+    let slots = 2 * ratio;
+    let mut kv = vec![0.0f32; slots * d];
+    let mut sc = vec![f32::NEG_INFINITY; slots * d];
+    let have_prev = prev_kv.len() == ratio * 2 * d;
+    for t in 0..ratio {
+        if have_prev {
+            // the previous window's slots, first half of the dimensions
+            kv[t * d..(t + 1) * d].copy_from_slice(&prev_kv[t * 2 * d..t * 2 * d + d]);
+            sc[t * d..(t + 1) * d].copy_from_slice(&prev_score[t * 2 * d..t * 2 * d + d]);
+        }
+        // the current window's slots, second half
+        let src = t * 2 * d + d;
+        let dst = (ratio + t) * d;
+        kv[dst..dst + d].copy_from_slice(&cur_kv[src..src + d]);
+        sc[dst..dst + d].copy_from_slice(&cur_score[src..src + d]);
+    }
+    pool_by_score(&kv, &sc, slots, d, out);
 }
 
 /// The sparse indexer's scoring pass. For each query it ranks the
@@ -684,6 +737,10 @@ pub struct Dsv4State {
     /// Partial window being accumulated, per layer: kv and score streams.
     pub pending_kv: Vec<Vec<f32>>,
     pub pending_score: Vec<Vec<f32>>,
+    /// The window before it, kept only by the overlapping compressor —
+    /// its fold reads half its dimensions from the previous stride.
+    pub prev_kv: Vec<Vec<f32>>,
+    pub prev_score: Vec<Vec<f32>>,
     pub pos: usize,
 }
 
@@ -695,6 +752,8 @@ impl Dsv4State {
             index_kv: vec![Vec::new(); layers],
             pending_kv: vec![Vec::new(); layers],
             pending_score: vec![Vec::new(); layers],
+            prev_kv: vec![Vec::new(); layers],
+            prev_score: vec![Vec::new(); layers],
             pos: 0,
         }
     }
@@ -746,30 +805,59 @@ pub fn attention_step(
     // the pending streams across tokens.
     if let Some(cp) = &l.compressor {
         let width = cp.wkv.rows();
+        // With overlapping windows the projection is twice the entry width:
+        // half the dimensions belong to the previous stride, half to this one.
+        let ew = if cp.overlap { width / 2 } else { width };
         let mut ckv = vec![0.0f32; width];
         let mut cscore = vec![0.0f32; width];
         cp.wkv.matvec(hidden, &mut ckv, pool);
         cp.wgate.matvec(hidden, &mut cscore, pool);
+        if cp.overlap {
+            // The reference biases the score as the token arrives and keeps
+            // it biased across the shift, so ape is added ONCE, here.
+            let slot = pos % cp.ratio;
+            for (c, a) in cscore
+                .iter_mut()
+                .zip(&cp.ape[slot * width..(slot + 1) * width])
+            {
+                *c += a;
+            }
+        }
         st.pending_kv[li].extend_from_slice(&ckv);
         st.pending_score[li].extend_from_slice(&cscore);
         if st.pending_kv[li].len() / width >= cp.ratio {
-            let mut folded = vec![0.0f32; width];
-            compress_window(
-                &st.pending_kv[li],
-                &st.pending_score[li],
-                &cp.ape,
-                cp.ratio,
-                width,
-                &mut folded,
-            );
+            let mut folded = vec![0.0f32; ew];
+            if cp.overlap {
+                compress_window_overlap(
+                    &st.prev_kv[li],
+                    &st.prev_score[li],
+                    &st.pending_kv[li],
+                    &st.pending_score[li],
+                    cp.ratio,
+                    ew,
+                    &mut folded,
+                );
+                // this window becomes the previous one
+                st.prev_kv[li] = std::mem::take(&mut st.pending_kv[li]);
+                st.prev_score[li] = std::mem::take(&mut st.pending_score[li]);
+            } else {
+                compress_window(
+                    &st.pending_kv[li],
+                    &st.pending_score[li],
+                    &cp.ape,
+                    cp.ratio,
+                    width,
+                    &mut folded,
+                );
+            }
             rms_weighted(&mut folded, &cp.norm, cfg.norm_eps);
             // The compressed entry carries the same rope-tagged tail as a
             // window key, at the position of the window's first token.
             let cpos = pos + 1 - cp.ratio;
             rope_tail(&mut folded, inv_freq, cpos, rd, false);
             // It lives in the attention cache at head width; a compressor
-            // whose width differs (the indexer's) keeps its own store.
-            if width == hd {
+            // whose entry width differs (the indexer's) keeps its own store.
+            if ew == hd {
                 st.compressed[li].extend_from_slice(&folded);
             } else {
                 st.index_kv[li].extend_from_slice(&folded);
@@ -779,7 +867,6 @@ pub fn attention_step(
         }
     }
 
-    // ── the window ring, then the compressor's output appended after it ──
     st.window[li].extend_from_slice(&kv);
     // The reference keeps the window in a ring of `window_size`; holding the
     // last N in order is the same set, and without this the "window" grows
@@ -1206,14 +1293,16 @@ mod tests {
                 wo_a: t(cfg.o_groups * cfg.o_lora_rank, o_per_group, 7 + li),
                 wo_b: t(dim, cfg.o_groups * cfg.o_lora_rank, 9 + li),
                 attn_sink: vec![0.1; cfg.n_heads],
+                // Layer 1 carries the OVERLAPPING compressor, as the release
+                // does at ratio 4: the projection is twice the entry width.
                 compressor: if li == 1 {
                     Some(Dsv4Compressor {
-                        wkv: t(kv_width, dim, 11),
-                        wgate: t(kv_width, dim, 13),
+                        wkv: t(2 * kv_width, dim, 11),
+                        wgate: t(2 * kv_width, dim, 13),
                         norm: ones(kv_width),
-                        ape: vec![0.01; 4 * kv_width],
+                        ape: vec![0.01; 4 * 2 * kv_width],
                         ratio: 4,
-                        overlap: false,
+                        overlap: true,
                     })
                 } else {
                     None
@@ -1309,6 +1398,18 @@ mod tests {
             !st.compressed[1].is_empty(),
             "compressor layer produced no compressed KV in 10 tokens"
         );
+        // Ten tokens at ratio 4 fold twice, and the entries must be one head
+        // wide — the overlapping projection is 2x that, so a width mistake
+        // shows up here rather than as quiet nonsense.
+        assert_eq!(
+            st.compressed[1].len() / cfg.head_dim,
+            2,
+            "expected two folds in ten tokens at ratio 4"
+        );
+        assert!(
+            !st.prev_kv[1].is_empty(),
+            "the overlapping compressor never kept a previous window"
+        );
 
         // Context must matter: the same token at position 0 of a fresh state
         // and at the end of a filled one cannot give identical logits.
@@ -1371,6 +1472,58 @@ mod tests {
             &mut raw,
         );
         assert!((raw[1] - silu(50.0) * -50.0).abs() < 1e-3, "limit 0 must not clamp");
+    }
+
+    /// The overlapping compressor folds 2*ratio slots, not ratio: the
+    /// previous window contributes its first half of dimensions and the
+    /// current one its second half. Treating it as a plain compressor makes
+    /// the entry twice as wide as the cache expects, which lands the whole
+    /// thing in the wrong store rather than raising anything.
+    #[test]
+    fn overlapping_compressor_folds_both_windows() {
+        let (ratio, d) = (2usize, 3usize);
+        // Current window: two tokens, 2*d wide each. Second half is what the
+        // current window contributes.
+        let cur_kv: Vec<f32> = vec![
+            1.0, 1.0, 1.0, /*|*/ 10.0, 20.0, 30.0, // token 0
+            2.0, 2.0, 2.0, /*|*/ 40.0, 50.0, 60.0, // token 1
+        ];
+        // Make the current window's second-half scores dominate everywhere.
+        let cur_sc: Vec<f32> = vec![
+            0.0, 0.0, 0.0, /*|*/ 0.0, 0.0, 100.0, //
+            0.0, 0.0, 0.0, /*|*/ 100.0, 100.0, 0.0,
+        ];
+        // Previous window: its FIRST half is what it contributes.
+        let prev_kv: Vec<f32> = vec![
+            7.0, 8.0, 9.0, /*|*/ 0.0, 0.0, 0.0, //
+            5.0, 6.0, 7.0, /*|*/ 0.0, 0.0, 0.0,
+        ];
+        let prev_sc = vec![0.0f32; ratio * 2 * d];
+
+        let mut out = vec![0.0f32; d];
+        compress_window_overlap(&prev_kv, &prev_sc, &cur_kv, &cur_sc, ratio, d, &mut out);
+        // dim 0 and 1: token 1's second half wins (score 100)
+        assert!((out[0] - 40.0).abs() < 1e-3, "dim0 = {}", out[0]);
+        assert!((out[1] - 50.0).abs() < 1e-3, "dim1 = {}", out[1]);
+        // dim 2: token 0's second half wins
+        assert!((out[2] - 30.0).abs() < 1e-3, "dim2 = {}", out[2]);
+
+        // With no previous window the fold still works and uses only the
+        // current one — this is the very first window of a generation.
+        let mut first = vec![0.0f32; d];
+        compress_window_overlap(&[], &[], &cur_kv, &cur_sc, ratio, d, &mut first);
+        assert!(first.iter().all(|v| v.is_finite()), "first window: {first:?}");
+        assert!((first[0] - 40.0).abs() < 1e-3, "first dim0 = {}", first[0]);
+
+        // And a previous window with real scores does pull the result.
+        let mut both = vec![0.0f32; d];
+        let strong_prev = vec![100.0f32; ratio * 2 * d];
+        compress_window_overlap(&prev_kv, &strong_prev, &cur_kv, &cur_sc, ratio, d, &mut both);
+        assert!(
+            (both[0] - 40.0).abs() > 1.0,
+            "a scored previous window must move the fold, got {}",
+            both[0]
+        );
     }
 
     /// Numerical parity with the reference. The vectors below come from
