@@ -896,6 +896,115 @@ fn gdn_step(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
     }
 }
 
+// ── GDN step, parallel edition: one WORKGROUP PER (head, column). The
+// one-workgroup-per-head kernel put 32 workgroups on a 188-SM card — 8%
+// occupancy, 3.7 ms/token of a 12.5 ms frame on the 2-bit 35B. Column j
+// is independent under the delta rule, and both dk-loops become 128-lane
+// tree reductions. Reduction order differs from the serial kernel, so
+// bits differ within the documented GPU tie class; CMF_GDN_PAR=0 keeps
+// the old kernel for A/B. The raw o lands in gd_o and gdn_step_norm
+// applies the gated RMSNorm in place.
+@compute @workgroup_size(128)
+fn gdn_step_par(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let dj = wid.y;
+    let t = lid.x;
+    let dk = gd_p.dk;
+    let dv = gd_p.dv;
+    if (h >= gd_p.nv || dj >= dv) { return; }
+    let ko = h / gd_p.rep;
+    let qs = ko * dk;
+    let ks = gd_p.kd + ko * dk;
+    // q/k l2 norms over dk (identical formulas, tree order)
+    gd_red[t] = select(0.0, gd_cq[qs + t] * gd_cq[qs + t], t < dk);
+    workgroupBarrier();
+    var stride = 64u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) { gd_red[t] = gd_red[t] + gd_red[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let nq = gd_red[0];
+    workgroupBarrier();
+    gd_red[t] = select(0.0, gd_cq[ks + t] * gd_cq[ks + t], t < dk);
+    workgroupBarrier();
+    stride = 64u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) { gd_red[t] = gd_red[t] + gd_red[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let nkn = gd_red[0];
+    workgroupBarrier();
+    let invq = 1.0 / (sqrt(nq + 1e-6) * sqrt(f32(dk)));
+    let invk = 1.0 / sqrt(nkn + 1e-6);
+    let abo = gd_p.tok * gd_p.nv;
+    let g = exp(-exp(gd_alog[h]) * gd_softplus(gd_a[abo + h] + gd_dtb[h]));
+    let beta = 1.0 / (1.0 + exp(-gd_b[abo + h]));
+    let sbase = h * dk * dv;
+    let vt = gd_cq[2u * gd_p.kd + h * dv + dj];
+    // kv = kfᵀ S[:,j] as a 128-lane reduction
+    let kf_t = select(0.0, gd_cq[ks + t] * invk, t < dk);
+    let qf_t = select(0.0, gd_cq[qs + t] * invq, t < dk);
+    gd_red[t] = select(0.0, gd_S[sbase + t * dv + dj] * kf_t, t < dk);
+    workgroupBarrier();
+    stride = 64u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) { gd_red[t] = gd_red[t] + gd_red[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let kv = gd_red[0];
+    workgroupBarrier();
+    let delta = (vt - g * kv) * beta;
+    // cell update + o = qfᵀ cell, one lane per dk row
+    var contrib = 0.0;
+    if (t < dk) {
+        let idx = sbase + t * dv + dj;
+        let cell = g * gd_S[idx] + kf_t * delta;
+        gd_S[idx] = cell;
+        contrib = qf_t * cell;
+    }
+    gd_red[t] = contrib;
+    workgroupBarrier();
+    stride = 64u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) { gd_red[t] = gd_red[t] + gd_red[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (t == 0u) {
+        let zo = gd_p.tok * gd_p.nv * dv;
+        gd_o[zo + h * dv + dj] = gd_red[0];
+    }
+}
+
+// Gated RMSNorm tail of the parallel GDN step: in place over gd_o.
+@compute @workgroup_size(256)
+fn gdn_step_norm(@builtin(workgroup_id) wid: vec3<u32>,
+                 @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let t = lid.x;
+    let dv = gd_p.dv;
+    if (h >= gd_p.nv) { return; }
+    let zo = gd_p.tok * gd_p.nv * dv;
+    gd_red[t] = select(0.0, gd_o[zo + h * dv + t] * gd_o[zo + h * dv + t], t < dv);
+    workgroupBarrier();
+    let ss = gd_reduce(t);
+    workgroupBarrier();
+    let inv = 1.0 / sqrt(ss / f32(dv) + gd_p.eps);
+    if (t < dv) {
+        let zz = gd_z[zo + h * dv + t];
+        gd_o[zo + h * dv + t] =
+            gd_o[zo + h * dv + t] * inv * gd_norm[t] * (zz / (1.0 + exp(-zz)));
+    }
+}
+
 // Fused residual-add + RMSNorm (WGSL twin of Metal add_rmsnorm_rows): h += d
 // in place, then o = rms(h)·w. Collapses an axpy + an rmsnorm dispatch into
 // one — cuts two launches per layer off the token graph.
@@ -3640,6 +3749,9 @@ struct Ctx {
     use_mv4: bool,
     q4tp_mm: wgpu::ComputePipeline,
     argmax_part: wgpu::ComputePipeline,
+    gdn_step_par: wgpu::ComputePipeline,
+    gdn_step_norm: wgpu::ComputePipeline,
+    gdn_par: bool,
     argmax_final: wgpu::ComputePipeline,
     embed_gather_q4tp: wgpu::ComputePipeline,
     silu_down: wgpu::ComputePipeline,
@@ -4072,6 +4184,9 @@ fn init() -> Result<Ctx, String> {
     let use_mv4 = std::env::var("CMF_MV4").map(|v| v != "0").unwrap_or(true);
     let q4tp_mm = pipe("q4tp_mul_mm");
     let argmax_part = pipe("argmax_part");
+    let gdn_step_par = pipe("gdn_step_par");
+    let gdn_step_norm = pipe("gdn_step_norm");
+    let gdn_par = std::env::var("CMF_GDN_PAR").map(|v| v != "0").unwrap_or(true);
     let argmax_final = pipe("argmax_final");
     let embed_gather_q4tp = pipe("embed_gather_q4tp");
     let silu_down = pipe("silu_down_matvec");
@@ -4198,6 +4313,9 @@ fn init() -> Result<Ctx, String> {
         use_mv4,
         q4tp_mm,
         argmax_part,
+        gdn_step_par,
+        gdn_step_norm,
+        gdn_par,
         argmax_final,
         embed_gather_q4tp,
         silu_down,
@@ -6693,6 +6811,33 @@ pub fn forward_token_graph(
                         &cq_b, &z_b, &a_b, &b_b, &alog, &dtb, &gnorm, s, &gdo_b, &gd_p,
                     ],
                 );
+                // The parallel step/norm entries use SUBSETS of the gdn
+                // binding set, and an auto layout lists only what its entry
+                // reads — each gets its own bind group (lesson of the day).
+                let bg_par = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.gdn_step_par.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &cq_b),
+                        bind_buf(2, &a_b),
+                        bind_buf(3, &b_b),
+                        bind_buf(4, &alog),
+                        bind_buf(5, &dtb),
+                        bind_buf(7, s),
+                        bind_buf(8, &gdo_b),
+                        bind_buf(9, &gd_p),
+                    ],
+                });
+                let bg_snorm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.gdn_step_norm.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(1, &z_b),
+                        bind_buf(6, &gnorm),
+                        bind_buf(8, &gdo_b),
+                        bind_buf(9, &gd_p),
+                    ],
+                });
                 // The whole GDN chain in ONE compute pass: projections →
                 // conv → step → out_proj. Each stage reads the previous
                 // stage's output, which is exactly what a pass guarantees
@@ -6727,9 +6872,18 @@ pub fn forward_token_graph(
                         pass.set_pipeline(&c.gdn_conv);
                         pass.set_bind_group(0, &bg_conv, &[]);
                         pass.dispatch_workgroups((*cdim as u32).div_ceil(256), 1, 1);
-                        pass.set_pipeline(&c.gdn_step);
-                        pass.set_bind_group(0, &bg_step, &[]);
-                        pass.dispatch_workgroups(*nv as u32, 1, 1);
+                        if c.gdn_par {
+                            pass.set_pipeline(&c.gdn_step_par);
+                            pass.set_bind_group(0, &bg_par, &[]);
+                            pass.dispatch_workgroups(*nv as u32, *dv as u32, 1);
+                            pass.set_pipeline(&c.gdn_step_norm);
+                            pass.set_bind_group(0, &bg_snorm, &[]);
+                            pass.dispatch_workgroups(*nv as u32, 1, 1);
+                        } else {
+                            pass.set_pipeline(&c.gdn_step);
+                            pass.set_bind_group(0, &bg_step, &[]);
+                            pass.dispatch_workgroups(*nv as u32, 1, 1);
+                        }
                     }
                     if !skip_outp {
                         let o = outp.as_ref().unwrap();
@@ -6748,7 +6902,23 @@ pub fn forward_token_graph(
                         ],
                     );
                     go(&mut enc, &c.gdn_conv, &bg_conv, (*cdim as u32).div_ceil(256));
-                    go(&mut enc, &c.gdn_step, &bg_step, *nv as u32);
+                    if c.gdn_par {
+                        {
+                            let mut pass =
+                                enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                    label: None,
+                                    timestamp_writes: None,
+                                });
+                            pass.set_pipeline(&c.gdn_step_par);
+                            pass.set_bind_group(0, &bg_par, &[]);
+                            pass.dispatch_workgroups(*nv as u32, *dv as u32, 1);
+                            pass.set_pipeline(&c.gdn_step_norm);
+                            pass.set_bind_group(0, &bg_snorm, &[]);
+                            pass.dispatch_workgroups(*nv as u32, 1, 1);
+                        }
+                    } else {
+                        go(&mut enc, &c.gdn_step, &bg_step, *nv as u32);
+                    }
                     emat(&mut enc, out, &gdo_b, &ob, hidden, nv * dv);
                 }
             }
