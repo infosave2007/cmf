@@ -89,48 +89,64 @@ target, not the decode.
 
 ---
 
-## 7. DeepSeek-V4-Flash: the converter is done, the runtime is not
+## 7. DeepSeek-V4-Flash: ported, unproven
 
 The converter reads this model end to end — FP8 E4M3 with 128×128 block
 scales (our decoder matched `torch.float8_e4m3fn` bit for bit on its own
 weights), MXFP4 experts, the integer routing table, and the full name map.
-Conversion itself forced a fix worth having anyway: the converter used to
-hold every encoded tensor in RAM (+1.8 GB/min, a 176 GB box exhausted a
-third of the way into a 300B model), and now spills each shard's payloads
-to disk while the writer streams them back through an mmap.
+The engine now carries all five of its blocks (`crates/cortiq-engine/src/dsv4.rs`):
+double-LoRA attention with a 512-wide compressed KV, the per-layer KV
+compressor including its overlapping variant, the sparse indexer,
+hyper-connections with Sinkhorn normalization, and hash routing.
 
-**Five blocks still have no runtime**, and the file cannot decode without
-them. In dependency order, with the reference at
-`inference/model.py` in the upstream repo:
+**What is established:** seventeen tests, of which one decodes ten tokens
+through a two-layer toy model and one pins `hc_split_sinkhorn` to the
+reference's own numbers. **What is not:** numerical parity against a
+reference run. The first coherent generation is the gate.
 
-1. **Hyper-connections first** (`Block`, `kernel.py::hc_split_sinkhorn`) —
-   they change the SHAPE of the hidden state: it is `hc_mult=4` copies, not
-   a vector. Each block folds 4→1 through learned per-copy weights and
-   expands 1→4 through a mixing matrix normalized by 20 Sinkhorn iterations
-   (row-softmax, then alternating row/column normalization). There is no
-   ordinary residual. This touches the KV cache, prefill and the GPU graph,
-   so it cannot be bolted on later.
-2. **Attention + compressor** on the layers without an indexer — double
-   LoRA q (`wq_a`→norm→`wq_b`, then a SECOND normalization on the heads),
-   RoPE on the last 64 dims only, 512-wide compressed KV, grouped low-rank
-   output (8×1024), a learned per-head sink, and gated pooling of four
-   consecutive tokens through a softmax over overlapping windows.
-3. **The sparse indexer** — its own compressor with a Hadamard rotation and
-   FP4 simulation, scoring which `index_topk=512` compressed positions each
-   query reads.
-4. **The gate's three forks** — `sqrt(softplus(x))` scoring, a selection
-   bias that shifts top-k but NOT the weights (they come from the
-   pre-bias scores), and hash layers whose experts come from a token-id
-   table instead of the router.
-5. **The GPU graph** for all of the above.
+Reading the release's `config.json` and `inference/model.py` against the
+port found six real bugs that no unit test would have caught, and they are
+worth listing because the same classes recur:
 
-**On size**: the model is already 4-bit, so q4tp does not shrink it (167 →
-~175 GB). Only lower bit-depth helps — hence the q2tp expert profile. And
-expert defrag does NOT help on the hash layers: their table reaches all 256
-experts within the first 8 000 vocabulary ids, measured. Routing-statistics
-defrag on the ordinary layers needs a working runtime first.
+| what | why it was invisible |
+|---|---|
+| `swiglu_limit` (10.0) not applied | only fires on saturating activations |
+| RoPE built over `head_dim` 512, not the 64-wide tail | every angle wrong, output still finite |
+| YaRN dropped at conversion (`rope_scaling.type` vs `rope_type`) | a missing field reads as "no scaling" |
+| the sliding window never slid | correct under 128 tokens |
+| hash layers weighted the wrong experts | both lists the right length |
+| `overlap` stored but never read | entry twice the expected width, filed elsewhere |
+| the 2-bit profile reached 1 expert per layer, not 256 | a merely large file |
 
----
+**The lesson worth carrying:** for an architecture with no sibling in the
+tree, read the reference's config and forward pass line by line and write a
+test per operator AND one that decodes. Four of the seven above were found
+by reading, three by the decoding test. None by inspection of the port.
+
+**On size:** the model is already 4-bit, so q4tp does not shrink it. The
+q2tp expert profile (2-bit gate/up, 4-bit down and skeleton) takes it to
+~99 GB. Expert defrag does NOT help on the hash layers: their table reaches
+all 256 experts within the first 8 000 vocabulary ids, measured.
+
+**Still open:** the indexer's Hadamard rotation and FP4 simulation are not
+implemented, so position selection is approximate at long context; the
+grouped output projection reads `wo_a` single-threaded through `row_dot`
+(~1.4 G MAC/token); and there is no GPU graph for any of it.
+
+## 8. Converters write once now
+
+`CmfStreamWriter` (`cortiq-core/src/format.rs`) reserves a gap at the head
+of the output, appends each payload as it is encoded, and patches the
+envelope, header and directory into that gap at the end. Before this, a
+conversion held every payload — first in RAM (+1.8 GB/min), then in a spill
+file it copied into the output, so peak disk was twice the model. On the
+300B DeepSeek that was 240 GB on a 236 GB box: it would have died at ~60%,
+hours in. Any new converter path should use it rather than collecting a
+`Vec<TensorSpec>`.
+
+An append-only manifest rides alongside; `CmfStreamWriter::resume` rebuilds
+the writer over a file whose payloads are on disk but whose head was never
+written, which is what an evaporating Colab session leaves behind.
 
 ## How to work on any of this
 
