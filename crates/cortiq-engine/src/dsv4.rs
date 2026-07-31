@@ -859,6 +859,70 @@ fn run_expert(
     e.w2.matvec(&gate, out, pool);
 }
 
+/// One token through the whole stack.
+///
+/// The hidden state is `hc_mult` copies of a `dim`-vector from the very
+/// first line to the very last: the embedding is replicated, every layer
+/// folds/expands around its two halves, and only `hc_head_fold` collapses
+/// it before the output norm and the head. There is no point in this
+/// function where an ordinary residual would fit.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_token(
+    g: &Dsv4Globals,
+    layers: &[Dsv4Layer],
+    cfg: &Dsv4Cfg,
+    st: &mut Dsv4State,
+    token_id: u32,
+    inv_freq: &[f32],
+    pool: Option<&crate::pool::Pool>,
+    logits: &mut Vec<f32>,
+) {
+    let (hc, dim) = (cfg.hc_mult, cfg.dim);
+
+    // Embedding, replicated into the copies.
+    let mut emb = vec![0.0f32; dim];
+    g.embed.row_f32(token_id as usize, &mut emb);
+    let mut state = vec![0.0f32; hc * dim];
+    for j in 0..hc {
+        state[j * dim..(j + 1) * dim].copy_from_slice(&emb);
+    }
+
+    let mut scratch = HcScratch::new(cfg);
+    for (li, l) in layers.iter().enumerate() {
+        // attention half
+        hc_block(
+            &mut state,
+            &l.hc_attn_fn,
+            &l.hc_attn_scale,
+            &l.hc_attn_base,
+            &l.attn_norm,
+            cfg,
+            &mut scratch,
+            |folded, out| attention_step(folded, l, cfg, st, li, inv_freq, pool, out),
+        );
+        // FFN half
+        hc_block(
+            &mut state,
+            &l.hc_ffn_fn,
+            &l.hc_ffn_scale,
+            &l.hc_ffn_base,
+            &l.ffn_norm,
+            cfg,
+            &mut scratch,
+            |folded, out| moe_step(folded, l, cfg, token_id, pool, out),
+        );
+    }
+    st.pos += 1;
+
+    // Collapse the copies, normalize, project to the vocabulary.
+    let mut h = vec![0.0f32; dim];
+    hc_head_fold(&state, &g.hc_head_fn, g.hc_head_scale, &g.hc_head_base, cfg, &mut h);
+    rms_weighted(&mut h, &g.norm, cfg.norm_eps);
+    logits.clear();
+    logits.resize(g.head.rows(), 0.0);
+    g.head.matvec(&h, logits, pool);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
