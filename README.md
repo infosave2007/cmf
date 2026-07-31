@@ -525,6 +525,8 @@ cortiq fcd model.cmf --corpus corpus.txt --gen-check --gen-gate --out model.fcd.
 #        --val-corpus val.txt --gate-threshold 0.35 --gate-slack 0.10
 ```
 
+**Model walkthroughs**: [KAT-Coder 35B MoE](docs/KAT_CODER.md) · [Qwen3.6-35B-A3B (q4tp, MTP head, o1 on GPU)](docs/QWEN36_MOE.md)
+
 ## The format
 
 A `.cmf` is a fixed 128-byte envelope followed by sections that a reader addresses
