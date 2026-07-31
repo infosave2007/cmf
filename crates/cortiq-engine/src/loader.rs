@@ -1279,6 +1279,58 @@ impl Pipeline {
             };
             pipeline.g3n = Some(Box::new((globals, g3n_layers)));
         }
+        // DeepSeek-V4: its own stack, selected by the arch name the
+        // converter wrote. Loading failure is fatal rather than a silent
+        // fallback — the generic loop cannot represent this model at all,
+        // so a fallback would decode noise.
+        if arch.arch_name == "deepseek_v4" {
+            let moe = arch
+                .moe
+                .as_ref()
+                .ok_or_else(|| CmfError::Parse("deepseek_v4: no moe config".into()))?;
+            let cfg = crate::dsv4::Dsv4Cfg {
+                dim: arch.hidden_size,
+                n_heads: arch.num_attention_heads,
+                head_dim: arch.head_dim,
+                // The rope tail is 64 in the release; the header has no
+                // field for it, and the tensors cannot reveal it, so it
+                // is the one constant that stays pinned here.
+                rope_head_dim: 64.min(arch.head_dim),
+                // The LoRA ranks and the group count ARE visible in the
+                // weights, and reading them there means a re-tuned
+                // checkpoint loads without touching this code.
+                q_lora_rank: 0,
+                o_lora_rank: 0,
+                o_groups: 8,
+                hc_mult: 4,
+                hc_sinkhorn_iters: 20,
+                hc_eps: 1e-6,
+                norm_eps: arch.rms_norm_eps as f32,
+                n_routed_experts: moe.num_experts,
+                top_k: moe.top_k,
+                moe_inter: moe.moe_intermediate_size,
+                route_scale: moe.routed_scaling_factor.unwrap_or(1.0) as f32,
+                index_topk: 512,
+                vocab: arch.vocab_size,
+            };
+            let (g, dl) = crate::dsv4::load(model, &cfg, arch.num_layers)
+                .map_err(|e| CmfError::Parse(format!("deepseek_v4: {e}")))?;
+            // Read the ranks off the weights that define them: wq_a's
+            // rows ARE q_lora_rank, and wo_b's columns are groups x
+            // o_lora_rank. A header field could disagree with the file;
+            // these cannot.
+            let mut cfg = cfg;
+            if let Some(l0) = dl.first() {
+                cfg.q_lora_rank = l0.wq_a.rows();
+                cfg.o_lora_rank = l0.wo_b.cols() / cfg.o_groups.max(1);
+                cfg.hc_mult = (l0.hc_attn_fn.len() / l0.hc_attn_base.len().max(1)) / cfg.dim.max(1);
+                if cfg.hc_mult == 0 {
+                    cfg.hc_mult = 4;
+                }
+            }
+            let st = crate::dsv4::Dsv4State::new(arch.num_layers);
+            pipeline.dsv4 = Some(Box::new((g, dl, cfg, st)));
+        }
         pipeline.short_conv_cfg = short_conv_cfg;
         pipeline.mtp = mtp;
         pipeline.install_dynamic_routing(model, false);
