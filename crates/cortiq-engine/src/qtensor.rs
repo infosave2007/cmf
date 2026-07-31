@@ -1272,6 +1272,14 @@ impl QTensor {
                     q4tp_matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
                     return;
                 }
+                if *dtype == TensorDtype::Q2TiledP {
+                    // Without this arm a q2tp tensor falls through to the
+                    // q8 fallback, which reads it at one BYTE per weight —
+                    // a 2x overrun that killed pool workers mid-prefill
+                    // while the dispatcher waited forever.
+                    q2tp_matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
+                    return;
+                }
                 if *dtype == TensorDtype::Q4Tiled {
                     // GPU batched q4t GEMM (dequant + f32nt mul_mm on the
                     // device); the probe keeps whichever beats the CPU arm.
@@ -4215,6 +4223,36 @@ fn q2tp_matvec2(
             unsafe {
                 *p1.at(r) = q2tp_row_exact(v.nib, r, gpr, x1, &sc);
                 *p2.at(r) = q2tp_row_exact(v.nib, r, gpr, x2, &sc);
+            }
+        }
+    };
+    dispatch_rows(pool, rows, &run);
+}
+
+/// Batched q2tp matmat: scalar row kernel over every batch column. CPU
+/// prefill only — decode rides the graph, so plain and correct beats
+/// clever here.
+fn q2tp_matmat(
+    bytes: &[u8],
+    xs_all: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    debug_assert_eq!(out.len(), b * rows);
+    let gpr = cols / GROUP_SIZE;
+    let v = Q4tpView::new_q2(bytes, rows, cols);
+    let out_addr = SendMut(out.as_mut_ptr());
+    let run = |start: usize, end: usize| {
+        let mut sc = vec![0f32; gpr];
+        for r in start..end {
+            v.scales_into(r, gpr, &mut sc);
+            for bi in 0..b {
+                let x = &xs_all[bi * cols..(bi + 1) * cols];
+                // SAFETY: disjoint row ranges per worker.
+                unsafe { *out_addr.at(bi * rows + r) = q2tp_row_exact(v.nib, r, gpr, x, &sc) };
             }
         }
     };
