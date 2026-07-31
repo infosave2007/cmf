@@ -1789,10 +1789,14 @@ impl Pipeline {
                     let pure_greedy = self.sampler_config.temperature < 1e-6
                         && self.sampler_config.repetition_penalty == 1.0
                         && self.sampler_config.suppress_tokens.is_empty();
+                    // Off by default: at every k the burst measured at or
+                    // below the plain path on this graph shape (k=1 loses
+                    // the argmax dispatches vs a 1 MB readback, k>=8 loses
+                    // inter-step drains vs the saved sync). Experimental.
                     let burst_k = std::env::var("CMF_MULTISTEP")
                         .ok()
                         .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(8);
+                        .unwrap_or(0);
                     if pure_greedy
                         && burst_k >= 1
                         && fuse_lm
