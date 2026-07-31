@@ -1883,12 +1883,19 @@ fn q1t_matvec(@builtin(workgroup_id) wid: vec3<u32>,
             let codes = toff + 2u;
             let xb = g * 32u;
             var gsum = 0.0;
-            for (var k = 0u; k < 32u; k = k + 1u) {
-                let b = q1t_byte(codes + k / 5u);
-                let p = Q1T_LUT[b];
-                let code = (p >> ((k % 5u) * 2u)) & 3u;
-                let sgn = select(0.0, 1.0, code == 1u) - select(0.0, 1.0, code == 2u);
-                gsum = gsum + sgn * q1x[xb + k];
+            // One byte carries FIVE base-3 codes: read (and LUT) it once
+            // and spend it on all five, instead of re-reading per weight —
+            // 7 byte loads a group against 32. Same k order, same adds.
+            var k = 0u;
+            for (var bi = 0u; bi < 7u; bi = bi + 1u) {
+                let p = Q1T_LUT[q1t_byte(codes + bi)];
+                let n = min(5u, 32u - k);
+                for (var j = 0u; j < n; j = j + 1u) {
+                    let code = (p >> (j * 2u)) & 3u;
+                    let sgn = select(0.0, 1.0, code == 1u) - select(0.0, 1.0, code == 2u);
+                    gsum = gsum + sgn * q1x[xb + k + j];
+                }
+                k = k + n;
             }
             acc = acc + scale * gsum;
             g = g + 64u;
