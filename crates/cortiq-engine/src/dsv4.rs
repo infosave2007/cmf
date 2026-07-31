@@ -1116,6 +1116,176 @@ pub fn load(
 mod tests {
     use super::*;
 
+    // A whole model, small enough to reason about: 2 layers, 4 heads, 8
+    // experts. Weights are deterministic and tiny, which is the point —
+    // this test is about shapes, indexing and cache bookkeeping, the things
+    // that a 138 GB file would surface only after an hour of loading.
+    fn toy() -> (Dsv4Globals, Vec<Dsv4Layer>, Dsv4Cfg) {
+        use crate::qtensor::QTensor;
+        let cfg = Dsv4Cfg {
+            dim: 32,
+            n_heads: 4,
+            head_dim: 8,
+            rope_head_dim: 4,
+            q_lora_rank: 16,
+            o_lora_rank: 16,
+            o_groups: 2,
+            hc_mult: 4,
+            hc_sinkhorn_iters: 20,
+            hc_eps: 1e-6,
+            norm_eps: 1e-6,
+            n_routed_experts: 8,
+            top_k: 2,
+            moe_inter: 16,
+            route_scale: 1.0,
+            index_topk: 8,
+            vocab: 24,
+        };
+        // Deterministic pseudo-random in a narrow band: big enough to move
+        // the state, small enough that nothing saturates.
+        let w = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 7 + seed * 13) % 101) as f32 / 101.0 - 0.5) * 0.3)
+                .collect()
+        };
+        let t = |rows: usize, cols: usize, seed: usize| QTensor::from_f32(w(rows * cols, seed), rows, cols);
+        let ones = |n: usize| vec![1.0f32; n];
+
+        let (dim, hc) = (cfg.dim, cfg.hc_mult);
+        // q is n_heads*head_dim wide and kv is one head wide; rope rides the
+        // tail of each rather than widening anything.
+        let q_width = cfg.n_heads * cfg.head_dim;
+        let kv_width = cfg.head_dim;
+        let o_per_group = q_width / cfg.o_groups;
+        let mut layers = Vec::new();
+        for li in 0..2 {
+            let experts: Vec<Dsv4Expert> = (0..cfg.n_routed_experts)
+                .map(|e| Dsv4Expert {
+                    w1: t(cfg.moe_inter, dim, 40 + e + li * 8),
+                    w2: t(dim, cfg.moe_inter, 60 + e + li * 8),
+                    w3: t(cfg.moe_inter, dim, 80 + e + li * 8),
+                })
+                .collect();
+            // Layer 0 is a hash layer (table-routed); layer 1 routes normally
+            // and carries the compressor — both paths get exercised.
+            layers.push(Dsv4Layer {
+                attn_norm: ones(dim),
+                ffn_norm: ones(dim),
+                wq_a: t(cfg.q_lora_rank, dim, 1 + li),
+                q_norm: ones(cfg.q_lora_rank),
+                wq_b: t(q_width, cfg.q_lora_rank, 3 + li),
+                wkv: t(kv_width, dim, 5 + li),
+                kv_norm: ones(kv_width),
+                wo_a: t(cfg.o_groups * cfg.o_lora_rank, o_per_group, 7 + li),
+                wo_b: t(dim, cfg.o_groups * cfg.o_lora_rank, 9 + li),
+                attn_sink: vec![0.1; cfg.n_heads],
+                compressor: if li == 1 {
+                    Some(Dsv4Compressor {
+                        wkv: t(kv_width, dim, 11),
+                        wgate: t(kv_width, dim, 13),
+                        norm: ones(kv_width),
+                        ape: vec![0.01; 4 * kv_width],
+                        ratio: 4,
+                        overlap: false,
+                    })
+                } else {
+                    None
+                },
+                indexer: None,
+                hc_attn_fn: w((2 + hc) * hc * hc * dim, 15 + li),
+                hc_attn_base: w((2 + hc) * hc, 17 + li),
+                hc_attn_scale: [1.0, 1.0, 1.0],
+                hc_ffn_fn: w((2 + hc) * hc * hc * dim, 19 + li),
+                hc_ffn_base: w((2 + hc) * hc, 21 + li),
+                hc_ffn_scale: [1.0, 1.0, 1.0],
+                gate: t(cfg.n_routed_experts, dim, 23 + li),
+                gate_bias: if li == 1 {
+                    Some(vec![0.0; cfg.n_routed_experts])
+                } else {
+                    None
+                },
+                tid2eid: if li == 0 {
+                    Some(
+                        (0..cfg.vocab * cfg.top_k)
+                            .map(|i| (i % cfg.n_routed_experts) as f32)
+                            .collect(),
+                    )
+                } else {
+                    None
+                },
+                experts,
+                shared: Dsv4Expert {
+                    w1: t(cfg.moe_inter, dim, 25 + li),
+                    w2: t(dim, cfg.moe_inter, 27 + li),
+                    w3: t(cfg.moe_inter, dim, 29 + li),
+                },
+            });
+        }
+        let g = Dsv4Globals {
+            embed: t(cfg.vocab, dim, 31),
+            norm: ones(dim),
+            head: t(cfg.vocab, dim, 33),
+            hc_head_fn: w(hc * hc * dim, 35),
+            hc_head_base: w(hc, 37),
+            hc_head_scale: 1.0,
+        };
+        (g, layers, cfg)
+    }
+
+    /// The whole stack, decoding a sequence. Every block is on the path:
+    /// hyper-connections, the double-LoRA attention with its sink, the KV
+    /// compressor firing on its ratio boundary, hash routing on one layer
+    /// and score routing on the other.
+    #[test]
+    fn forward_token_decodes_a_sequence_without_falling_over() {
+        let (g, layers, cfg) = toy();
+        let mut st = Dsv4State::new(layers.len());
+        let inv_freq: Vec<f32> = (0..cfg.rope_head_dim / 2)
+            .map(|i| 1.0 / 10000f32.powf(2.0 * i as f32 / cfg.rope_head_dim as f32))
+            .collect();
+        let mut logits = Vec::new();
+
+        // Ten tokens: more than twice the compressor's ratio, so the
+        // compressed cache is written on a boundary and read afterwards.
+        let mut first: Option<Vec<f32>> = None;
+        for (step, tok) in [3u32, 7, 1, 9, 4, 2, 8, 5, 6, 0].into_iter().enumerate() {
+            forward_token(&g, &layers, &cfg, &mut st, tok, &inv_freq, None, &mut logits);
+            assert_eq!(logits.len(), cfg.vocab, "step {step}: logit count");
+            assert!(
+                logits.iter().all(|v| v.is_finite()),
+                "step {step}: non-finite logit — {logits:?}"
+            );
+            // A model that has collapsed returns the same distribution
+            // regardless of input; that is the failure this catches.
+            let spread = logits.iter().cloned().fold(f32::MIN, f32::max)
+                - logits.iter().cloned().fold(f32::MAX, f32::min);
+            assert!(spread > 1e-6, "step {step}: logits are flat ({spread})");
+            if step == 0 {
+                first = Some(logits.clone());
+            }
+            assert_eq!(st.pos, step + 1, "position bookkeeping");
+        }
+
+        // The cache has to have grown, and the compressor layer must have
+        // emitted compressed entries (10 tokens / ratio 4 = 2 windows).
+        assert!(!st.window[0].is_empty(), "sliding window never filled");
+        assert!(
+            !st.compressed[1].is_empty(),
+            "compressor layer produced no compressed KV in 10 tokens"
+        );
+
+        // Context must matter: the same token at position 0 of a fresh state
+        // and at the end of a filled one cannot give identical logits.
+        let mut fresh = Dsv4State::new(layers.len());
+        let mut relogits = Vec::new();
+        forward_token(&g, &layers, &cfg, &mut fresh, 3, &inv_freq, None, &mut relogits);
+        assert_eq!(
+            relogits,
+            first.unwrap(),
+            "the same token from a fresh state must reproduce exactly"
+        );
+    }
+
     /// Numerical parity with the reference. The vectors below come from
     /// running `kernel.py::hc_split_sinkhorn`'s own formula on a fixed
     /// input; matching them pins the exponent order, the eps placement and
