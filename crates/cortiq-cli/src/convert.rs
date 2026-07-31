@@ -1144,6 +1144,24 @@ pub(crate) fn encode_f16(vals: &[f32]) -> Vec<u8> {
 }
 
 /// Decode a safetensors dtype blob into f32 values.
+/// Move every produced payload out of RAM and into the spill file,
+/// remembering where it landed. Called after each source shard so peak
+/// residency is one shard's tensors, not the model's.
+fn drain_to_spill(
+    tensors: &mut Vec<TensorSpec>,
+    spill: &mut std::io::BufWriter<std::fs::File>,
+    off: &mut u64,
+    specs: &mut Vec<(String, TensorDtype, Vec<usize>, u64, usize)>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    for t in tensors.drain(..) {
+        spill.write_all(&t.data)?;
+        specs.push((t.name, t.dtype, t.shape, *off, t.data.len()));
+        *off += t.data.len() as u64;
+    }
+    Ok(())
+}
+
 pub(crate) fn to_f32(dtype: &str, raw: &[u8]) -> anyhow::Result<Vec<f32>> {
     Ok(match dtype {
         "F32" => raw
@@ -2796,6 +2814,19 @@ pub fn run_convert(
         arch.intermediate_size = max_kept;
     }
     let total: usize = files.iter().map(|f| f.tensors.len()).sum::<usize>().max(1);
+    // Payload spill. A 300B-class MoE encodes to ~100 GB, and holding that
+    // in `Vec<TensorSpec>` until the writer runs OOMs any machine (measured:
+    // +1.8 GB/min, 176 GB box exhausted mid-model). Each encoded tensor goes
+    // straight to a temp file; only (name, dtype, shape, offset, len) stays
+    // resident, and the writer streams the payloads back through an mmap.
+    let spill_path = std::path::PathBuf::from(format!("{output}.spill"));
+    let mut spill = std::io::BufWriter::new(
+        std::fs::File::create(&spill_path)
+            .map_err(|e| anyhow::anyhow!("spill {}: {e}", spill_path.display()))?,
+    );
+    let mut spill_off: u64 = 0;
+    let mut specs: Vec<(String, TensorDtype, Vec<usize>, u64, usize)> =
+        Vec::with_capacity(total);
     let mut tensors: Vec<TensorSpec> = Vec::with_capacity(total);
     let mut done = 0usize;
     // Tiny cross-shard tensors (gemma-4 router.scale, ~128 f32 each):
@@ -3464,6 +3495,10 @@ pub fn run_convert(
             let mut fd = 0usize;
             let mut sub = |p: f32| progress((si as f32 + p) / ns as f32);
             process_file(&one[0], &one, &mut tensors, &mut fd, ft, &mut sub)?;
+            // Spill this shard's payloads before touching the next one:
+            // that is what keeps residency at one shard instead of the
+            // whole model.
+            drain_to_spill(&mut tensors, &mut spill, &mut spill_off, &mut specs)?;
             drop(one);
             let _ = fs::remove_file(dir.join(sname));
         }
@@ -3598,7 +3633,27 @@ pub fn run_convert(
             .then_with(|| a.name.cmp(&b.name))
     });
 
-    CmfModel::write(output, &header, &tensors, None, vocab.as_deref())
+    // Anything still resident (small tensors produced outside the main
+    // loop) joins the spill, then the writer borrows straight from the map.
+    drain_to_spill(&mut tensors, &mut spill, &mut spill_off, &mut specs)?;
+    use std::io::Write as _;
+    spill.flush()?;
+    drop(spill);
+    let spill_file = std::fs::File::open(&spill_path)?;
+    let map = unsafe { memmap2::Mmap::map(&spill_file)? };
+    let refs: Vec<cortiq_core::format::TensorSpecRef> = specs
+        .iter()
+        .map(|(name, dtype, shape, off, len)| cortiq_core::format::TensorSpecRef {
+            name: name.clone(),
+            dtype: *dtype,
+            shape: shape.clone(),
+            data: &map[*off as usize..*off as usize + *len],
+        })
+        .collect();
+    let r = CmfModel::write_ref(output, &header, &refs, None, vocab.as_deref());
+    drop(map);
+    let _ = std::fs::remove_file(&spill_path);
+    r
         .map_err(|e| anyhow::anyhow!("write {output}: {e}"))?;
     progress(1.0);
     Ok(())
