@@ -3752,6 +3752,8 @@ struct Ctx {
     gdn_step_par: wgpu::ComputePipeline,
     gdn_step_norm: wgpu::ComputePipeline,
     gdn_par: bool,
+    ts_query: Option<(wgpu::QuerySet, wgpu::Buffer, wgpu::Buffer)>,
+    ts_period: f32,
     argmax_final: wgpu::ComputePipeline,
     embed_gather_q4tp: wgpu::ComputePipeline,
     silu_down: wgpu::ComputePipeline,
@@ -4115,9 +4117,19 @@ fn init() -> Result<Ctx, String> {
     // Adreno/Mali/wgpu-Metal report 32 768 — there only the stride-129
     // (hd <= 128) kernels are created.
     let big_attend = limits.max_compute_workgroup_storage_size >= 33_152;
+    // GPU timestamps (CMF_GPU_TS=1): ask for the query features when the
+    // adapter has them — the frame profiler below is the only consumer.
+    let ts_features = wgpu::Features::TIMESTAMP_QUERY
+        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+    let want_ts = adapter.features().contains(ts_features);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cortiq-wgpu"),
         required_limits: limits,
+        required_features: if want_ts {
+            ts_features
+        } else {
+            wgpu::Features::empty()
+        },
         ..Default::default()
     }))
     .map_err(|e| format!("request_device: {e}"))?;
@@ -4187,6 +4199,31 @@ fn init() -> Result<Ctx, String> {
     let gdn_step_par = pipe("gdn_step_par");
     let gdn_step_norm = pipe("gdn_step_norm");
     let gdn_par = std::env::var("CMF_GDN_PAR").map(|v| v != "0").unwrap_or(true);
+    // Frame profiler (CMF_GPU_TS=1): 256 timestamp slots + resolve/stage
+    // buffers. Created only when the device carries the feature.
+    let ts_query = if want_ts && std::env::var("CMF_GPU_TS").as_deref() == Ok("1") {
+        let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("g-ts"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 256,
+        });
+        let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("g-ts-resolve"),
+            size: 256 * 8,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let stage = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("g-ts-stage"),
+            size: 256 * 8,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Some((qs, resolve, stage))
+    } else {
+        None
+    };
+    let ts_period = queue.get_timestamp_period();
     let argmax_final = pipe("argmax_final");
     let embed_gather_q4tp = pipe("embed_gather_q4tp");
     let silu_down = pipe("silu_down_matvec");
@@ -4316,6 +4353,8 @@ fn init() -> Result<Ctx, String> {
         gdn_step_par,
         gdn_step_norm,
         gdn_par,
+        ts_query,
+        ts_period,
         argmax_final,
         embed_gather_q4tp,
         silu_down,
@@ -6412,6 +6451,24 @@ pub fn forward_token_graph(
         true
     };
     let mut o1_dbg: Vec<(usize, wgpu::Buffer)> = Vec::new();
+    // ── Frame profiler (CMF_GPU_TS=1, single-step): GPU timestamps at pass
+    // granularity, aggregated per (stage, layer-kind). The microscope that
+    // replaces cost-model guessing.
+    let mut ts_n: u32 = 0;
+    let mut ts_lbl: Vec<(u8, u8)> = Vec::new();
+    macro_rules! ts {
+        ($enc:expr, $stage:expr, $kind:expr) => {
+            if steps == 1 {
+                if let Some((qs, _, _)) = &c.ts_query {
+                    if ts_n < 255 {
+                        $enc.write_timestamp(qs, ts_n);
+                        ts_lbl.push(($stage, $kind));
+                        ts_n += 1;
+                    }
+                }
+            }
+        };
+    }
     // ── Multi-step prerequisites: the lm_head fold and a q4tp embedding,
     // both resolved up front. Anything missing refuses the WHOLE call so
     // the pipeline can fall back to single-step.
@@ -6479,6 +6536,7 @@ pub fn forward_token_graph(
     // Bootstrap the first layer's attention norm; thereafter each residual is
     // fused with the following norm (add_rmsnorm), saving two dispatches/layer.
     let inw0 = stor(bytemuck::cast_slice(layers[0].input_norm));
+    ts!(enc, 0, 0);
     go(
         &mut enc,
         &c.rmsnorm,
@@ -6490,6 +6548,7 @@ pub fn forward_token_graph(
             break;
         }
         let lw = &lws[li];
+        let lkind: u8 = if matches!(lw.attn, LAttn::Full { .. }) { 1 } else { 0 };
         let pnw = stor(bytemuck::cast_slice(l.post_norm));
         // ── token mixing (attention or GDN) → ob ──
         match (&lw.attn, &l.attn) {
@@ -6924,6 +6983,7 @@ pub fn forward_token_graph(
             }
             _ => return false,
         }
+        ts!(enc, 1, lkind);
         // token-mix residual + FFN-norm fused: h += ob, n1 = rms(h, post_norm).
         // It used to open its own compute pass. On this Vulkan stack a PASS
         // BOUNDARY is the expensive part (the MoE block is built entirely
@@ -7176,6 +7236,7 @@ pub fn forward_token_graph(
         // FFN-residual + next layer's attn-norm fused (plain residual on the last).
         // At loop boundaries (Looped Transformer), insert final_norm between the
         // residual and the next iteration's input norm.
+        ts!(enc, 2, lkind);
         if tail_done {
             // already emitted at the end of the FFN pass
         } else if li + 1 < layers.len() {
@@ -7361,6 +7422,13 @@ pub fn forward_token_graph(
             "g-logits",
         );
         emat(&mut enc, &lm, &n1, &lbuf, lrows, hidden);
+        ts!(enc, 3, 0);
+        if let Some((qs, resolve, tstage)) = &c.ts_query {
+            if steps == 1 && ts_n > 0 {
+                enc.resolve_query_set(qs, 0..ts_n, resolve, 0);
+                enc.copy_buffer_to_buffer(resolve, 0, tstage, 0, ts_n as u64 * 8);
+            }
+        }
         logits.resize(lrows, 0.0);
         let stage = GraphScratch::ensure(
             &c.device,
@@ -7385,6 +7453,44 @@ pub fn forward_token_graph(
         drop(gs);
         r
     };
+    if ok && ts_n > 1 {
+        if let Some((_, _, tstage)) = &c.ts_query {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tstage.map_async(wgpu::MapMode::Read, ..(ts_n as u64 * 8), move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            if rx.recv().map(|r| r.is_ok()).unwrap_or(false) {
+                let raw = tstage.get_mapped_range(..(ts_n as u64 * 8)).unwrap();
+                let t: Vec<u64> = bytemuck::cast_slice::<u8, u64>(&raw).to_vec();
+                drop(raw);
+                // Attribute each delta to the LATER stamp's (stage, kind).
+                let mut agg = std::collections::BTreeMap::<(u8, u8), (f64, u32)>::new();
+                for i in 1..ts_n as usize {
+                    let dt = t[i].saturating_sub(t[i - 1]) as f64 * c.ts_period as f64 / 1000.0;
+                    let e = agg.entry(ts_lbl[i]).or_insert((0.0, 0));
+                    e.0 += dt;
+                    e.1 += 1;
+                }
+                let name = |k: (u8, u8)| match k {
+                    (1, 0) => "gdn-mix",
+                    (1, 1) => "attn-mix",
+                    (2, 0) => "ffn@gdn",
+                    (2, 1) => "ffn@attn",
+                    (3, _) => "tail(norm+lm)",
+                    _ => "start",
+                };
+                let mut line = String::from("gpu-ts:");
+                let total: f64 = agg.values().map(|v| v.0).sum();
+                for (k, (us, n)) in &agg {
+                    line.push_str(&format!(" {}={:.0}us/{}", name(*k), us, n));
+                }
+                line.push_str(&format!(" | total {:.2} ms", total / 1000.0));
+                eprintln!("{line}");
+            }
+            tstage.unmap();
+        }
+    }
     if ok {
         for (li, b) in &o1_dbg {
             let (tx, rx) = std::sync::mpsc::channel();
