@@ -42,9 +42,24 @@ single entry point uses both). An auto layout lists only the bindings an
 entry point actually reads — a view on a NEW slot silently drops the old
 one from the layout and the bind group fails at runtime.
 
-Ported so far: `q4tp_matvec4`, `moe_gate_up_q2tp`, `moe_down_q4tp`.
-**Still scalar (same win waiting): `q4t_matvec`, `q4b_matvec`,
-`q1t_matvec`, `q8_matvec`, `moe_gate_up` (q4t), `moe_gate_up_q4tp`, the
+Ported so far, with the measured result on a real model:
+
+| layout | kernel | before | after |
+|---|---|---|---|
+| q4tp | `q4tp_matvec4` / `q4tp_matvec16` | 12.3 (dense 27B) | 39.1 |
+| q4tp MoE | `moe_down_q4tp` | 33 µs/layer | 16 µs/layer |
+| q2tp MoE | `moe_gate_up_q2tp` | — | part of 73 → 79 |
+| **q4t** | **`q4t_matvec8`** | **37.5** (Nanbeige-3B) | **77.6** |
+| **q1t** | byte-per-five-codes read | **28.8** (Bonsai-8B) | **37.4** |
+
+q4t keeps its weights u16-assembled — 18-byte tiles are 2-aligned, so only
+the activation side vectorizes, and the twin binds FOUR slots (no vec4
+weight view). q1t's win came from reading each base-3 code byte once for
+its five codes instead of re-reading it per weight; the ternary decode
+itself stayed.
+
+**Still scalar (same win waiting): `q4b_matvec`, `q8_matvec`,
+`q1_matvec` (binary), `moe_gate_up` (q4t) and `moe_gate_up_q4tp`, the
 `*_b` batch twins, and `q4tp_mul_mm` (the dense-prefill GEMM, ~300
 GFLOP/s today).**
 
