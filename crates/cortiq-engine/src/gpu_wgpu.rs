@@ -4428,7 +4428,8 @@ fn init() -> Result<Ctx, String> {
     // GPU timestamps (CMF_GPU_TS=1): ask for the query features when the
     // adapter has them — the frame profiler below is the only consumer.
     let ts_features = wgpu::Features::TIMESTAMP_QUERY
-        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
     let want_ts = adapter.features().contains(ts_features);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cortiq-wgpu"),
@@ -6774,6 +6775,7 @@ pub fn forward_token_graph(
     // replaces cost-model guessing.
     let mut ts_n: u32 = 0;
     let mut ts_lbl: Vec<(u8, u8)> = Vec::new();
+    let ts_fine = std::env::var("CMF_GPU_TS").as_deref() == Ok("2");
     macro_rules! ts {
         ($enc:expr, $stage:expr, $kind:expr) => {
             if steps == 1 {
@@ -6781,6 +6783,21 @@ pub fn forward_token_graph(
                     if ts_n < 255 {
                         $enc.write_timestamp(qs, ts_n);
                         ts_lbl.push(($stage, $kind));
+                        ts_n += 1;
+                    }
+                }
+            }
+        };
+    }
+    // Per-dispatch stamps INSIDE a pass (CMF_GPU_TS=2), for the first layer
+    // of each kind only — 256 slots cannot carry every dispatch of a frame.
+    macro_rules! tsp {
+        ($pass:expr, $on:expr, $stage:expr) => {
+            if ts_fine && $on && steps == 1 {
+                if let Some((qs, _, _)) = &c.ts_query {
+                    if ts_n < 255 {
+                        $pass.write_timestamp(qs, ts_n);
+                        ts_lbl.push(($stage, 9));
                         ts_n += 1;
                     }
                 }
@@ -7076,25 +7093,32 @@ pub fn forward_token_graph(
                             label: None,
                             timestamp_writes: None,
                         });
+                        let fine = li < 4;
+                        tsp!(pass, fine, 20); // pass start (after qkv projections)
                         pass.set_pipeline(&c.attn_rope);
                         pass.set_bind_group(0, &bg_rope, &[]);
                         pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
+                        tsp!(pass, fine, 21); // rope
                         pass.set_pipeline(&c.kv_append);
                         pass.set_bind_group(0, &bg_kv, &[]);
                         pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
+                        tsp!(pass, fine, 22); // kv append
                         pass.set_pipeline(ap);
                         pass.set_bind_group(0, &bg_att, &[]);
                         pass.dispatch_workgroups(nh as u32, 1, 1);
+                        tsp!(pass, fine, 23); // attend
                         if let Some(bg_gm) = &gm {
                             pass.set_pipeline(&c.gate_mul);
                             pass.set_bind_group(0, bg_gm, &[]);
                             pass.dispatch_workgroups(((nh * hd) as u32).div_ceil(256), 1, 1);
                         }
+                        tsp!(pass, fine, 24); // gate
                         if let Some((wp, wb, ww)) = &wo_prep {
                             pass.set_pipeline(wp);
                             pass.set_bind_group(0, wb, &[]);
                             pass.dispatch_workgroups(*ww, 1, 1);
                         }
+                        tsp!(pass, fine, 25); // o-proj
                     }
                     if wo_prep.is_none() {
                         emat(&mut enc, wo, &attn, &ob, hidden, nh * hd);
@@ -7297,21 +7321,27 @@ pub fn forward_token_graph(
                             pass.dispatch_workgroups(p.2, 1, 1);
                         }
                     }
+                    let fine = li == 0;
+                    tsp!(pass, fine, 10); // after projections
                     if !skip_gdn {
                         pass.set_pipeline(&c.gdn_conv);
                         pass.set_bind_group(0, &bg_conv, &[]);
                         pass.dispatch_workgroups((*cdim as u32).div_ceil(256), 1, 1);
+                        tsp!(pass, fine, 11); // conv
                         if c.gdn_par {
                             pass.set_pipeline(&c.gdn_step_par);
                             pass.set_bind_group(0, &bg_par, &[]);
                             pass.dispatch_workgroups(*nv as u32, *dv as u32, 1);
+                            tsp!(pass, fine, 12); // step_par
                             pass.set_pipeline(&c.gdn_step_norm);
                             pass.set_bind_group(0, &bg_snorm, &[]);
                             pass.dispatch_workgroups(*nv as u32, 1, 1);
+                            tsp!(pass, fine, 13); // step_norm
                         } else {
                             pass.set_pipeline(&c.gdn_step);
                             pass.set_bind_group(0, &bg_step, &[]);
                             pass.dispatch_workgroups(*nv as u32, 1, 1);
+                            tsp!(pass, fine, 12);
                         }
                     }
                     if !skip_outp {
@@ -7319,6 +7349,7 @@ pub fn forward_token_graph(
                         pass.set_pipeline(o.0);
                         pass.set_bind_group(0, &o.1, &[]);
                         pass.dispatch_workgroups(o.2, 1, 1);
+                        tsp!(pass, fine, 14); // out-proj
                     }
                 } else {
                     group_mats(
@@ -7633,11 +7664,14 @@ pub fn forward_token_graph(
                         pass.set_bind_group(0, b, &[]);
                         pass.dispatch_workgroups(*w, 1, 1);
                     }
+                    let fine = li == 0;
+                    tsp!(pass, fine, 30); // pass start (after prologue norm)
                     if !skip_router {
                         pass.set_pipeline(prp);
                         pass.set_bind_group(0, &bgr, &[]);
                         pass.dispatch_workgroups(wr, 1, 1);
                     }
+                    tsp!(pass, fine, 31); // router
                     if !sg_fold {
                         pass.set_pipeline(psp);
                         pass.set_bind_group(0, &bgs, &[]);
@@ -7646,13 +7680,16 @@ pub fn forward_token_graph(
                     pass.set_pipeline(&c.moe_select);
                     pass.set_bind_group(0, &bg_sel, &[]);
                     pass.dispatch_workgroups(1, 1, 1);
+                    tsp!(pass, fine, 32); // select
                     if !skip_moe {
                         pass.set_pipeline(p_gu);
                         pass.set_bind_group(0, &bg_gu, &[]);
                         pass.dispatch_workgroups(*mi as u32, slots as u32, 1);
+                        tsp!(pass, fine, 33); // gate/up experts
                         pass.set_pipeline(p_dn);
                         pass.set_bind_group(0, &bg_dn, &[]);
                         pass.dispatch_workgroups(hidden as u32, 1, 1);
+                        tsp!(pass, fine, 34); // down experts
                         if let Some((p, b, w)) = &ffn_post {
                             pass.set_pipeline(p);
                             pass.set_bind_group(0, b, &[]);
@@ -7929,6 +7966,22 @@ pub fn forward_token_graph(
                     (2, 0) => "ffn@gdn",
                     (2, 1) => "ffn@attn",
                     (3, _) => "tail(norm+lm)",
+                    (10, _) => "|gdn:proj",
+                    (11, _) => "|gdn:conv",
+                    (12, _) => "|gdn:step",
+                    (13, _) => "|gdn:snorm",
+                    (14, _) => "|gdn:outp",
+                    (20, _) => "|attn:qkv",
+                    (21, _) => "|attn:rope",
+                    (22, _) => "|attn:kv",
+                    (23, _) => "|attn:attend",
+                    (24, _) => "|attn:gate",
+                    (25, _) => "|attn:wo",
+                    (30, _) => "|moe:pre",
+                    (31, _) => "|moe:router",
+                    (32, _) => "|moe:select",
+                    (33, _) => "|moe:gu",
+                    (34, _) => "|moe:dn",
                     _ => "start",
                 };
                 let mut line = String::from("gpu-ts:");
