@@ -135,6 +135,25 @@ kernels live in their own shader module). The 0.5.40 Metal release shipped
 this exact class. **If a model got slower after a shader edit, check
 `RUST_LOG=warn` for "init failed" before profiling anything.**
 
+## Metal: what the recipes found there (and did not)
+
+The Metal kernels were audited against the same list. Most of it was
+already applied — `q4tp_matvec` loads activations as `float4` and weights
+as `uint`, runs four rows per simdgroup, expands the scale ladder once,
+and reduces with `simd_sum`; `gqa_attend` already splits positions across
+simdgroups with per-lane dim slicing (the shape the wgpu attend had to be
+rewritten INTO). Nanbeige-3B q4t on an M4: 22.0 tok/s decode, 152 tok/s
+prefill.
+
+One candidate looked strong and did not survive measurement: the attend
+kernel re-walks every K row a SECOND time to bank Born-importance, whose
+only consumer is eviction — which cannot fire until the cache is full.
+Gating that pass on a half-full window measured 22.03 vs 21.95 at short
+context (noise) and 7.80 vs 8.01 at ctx 3000 — i.e. no gain, possibly a
+small loss from the added branch. Reverted. The lesson matches the wgpu
+side: on this hardware a second pass over the KV is not what the frame is
+made of, and only the profiler gets a vote.
+
 ## Cross-format notes
 
 - `q2tp` shares q4tp's params/codes planes byte-for-byte; only the weight
