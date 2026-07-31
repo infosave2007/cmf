@@ -175,11 +175,16 @@ pub fn hc_head_pre(mixes: &[f32], scale: f32, base: &[f32], hc: usize, eps: f32,
 ///
 /// `bias` is `None` on the hash layers, where `indices` come from a
 /// token-id table instead (see `hash_route`).
+/// `forced` fixes the chosen experts (the hash layers' token-id table). They
+/// have to be known here rather than swapped in afterwards: the weights are
+/// the scores gathered at whichever indices win, so substituting the indices
+/// later leaves every weight attached to a different expert.
 pub fn route(
     scores_in: &[f32],
     bias: Option<&[f32]>,
     top_k: usize,
     route_scale: f32,
+    forced: Option<&[usize]>,
     indices: &mut Vec<usize>,
     weights: &mut Vec<f32>,
 ) {
@@ -192,23 +197,30 @@ pub fn route(
     }
     indices.clear();
     weights.clear();
-    let mut shifted: Vec<f32> = match bias {
-        Some(b) => scores.iter().zip(b).map(|(s, b)| s + b).collect(),
-        None => scores.clone(),
-    };
-    for _ in 0..top_k.min(n) {
-        let mut best = 0usize;
-        let mut bv = f32::NEG_INFINITY;
-        for (i, &v) in shifted.iter().enumerate() {
-            if v > bv {
-                bv = v;
-                best = i;
+    match forced {
+        Some(f) => indices.extend(f.iter().copied()),
+        None => {
+            let mut shifted: Vec<f32> = match bias {
+                Some(b) => scores.iter().zip(b).map(|(s, b)| s + b).collect(),
+                None => scores.clone(),
+            };
+            for _ in 0..top_k.min(n) {
+                let mut best = 0usize;
+                let mut bv = f32::NEG_INFINITY;
+                for (i, &v) in shifted.iter().enumerate() {
+                    if v > bv {
+                        bv = v;
+                        best = i;
+                    }
+                }
+                indices.push(best);
+                shifted[best] = f32::NEG_INFINITY;
             }
         }
-        indices.push(best);
-        // the WEIGHT is the pre-bias score
-        weights.push(scores[best]);
-        shifted[best] = f32::NEG_INFINITY;
+    }
+    // The weight is always the PRE-bias score of the chosen expert.
+    for &i in indices.iter() {
+        weights.push(scores.get(i).copied().unwrap_or(0.0));
     }
     let sum: f32 = weights.iter().sum();
     if sum > 0.0 {
@@ -883,14 +895,13 @@ pub fn moe_step(
         l.gate_bias.as_deref(),
         cfg.top_k,
         cfg.route_scale,
+        l.tid2eid
+            .as_ref()
+            .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id))
+            .as_deref(),
         &mut idx,
         &mut w,
     );
-    if let Some(tbl) = &l.tid2eid {
-        // Hash layers take the experts from the table; the weights stay
-        // the scored ones the reference gathers at those indices.
-        idx = hash_route(tbl, cfg.vocab, cfg.top_k, token_id);
-    }
     out.fill(0.0);
     let mut acc = vec![0.0f32; cfg.dim];
     for (e, &ei) in idx.iter().enumerate() {
@@ -1459,7 +1470,7 @@ mod tests {
         let scores = [3.0f32, 0.1, 2.0, 0.05];
         let bias = [0.0f32, 10.0, 0.0, 0.0];
         let (mut idx, mut w) = (Vec::new(), Vec::new());
-        route(&scores, Some(&bias), 2, 1.5, &mut idx, &mut w);
+        route(&scores, Some(&bias), 2, 1.5, None, &mut idx, &mut w);
         assert_eq!(idx[0], 1, "the biased expert must win selection");
         assert_eq!(idx[1], 0);
         // weights come from sqrt(softplus(score)) BEFORE the bias, so the
@@ -1634,5 +1645,34 @@ mod tests {
         assert_eq!(hash_route(&table, 3, 2, 2), vec![5, 6]);
         // out-of-range ids clamp instead of panicking
         assert_eq!(hash_route(&table, 3, 2, 99), vec![5, 6]);
+    }
+
+    /// On a hash layer the reference gathers the scores AT THE TABLE's
+    /// experts. Choosing top-k first and swapping the indices afterwards
+    /// leaves every weight attached to a different expert than the one it
+    /// scales — silently, since both lists are the right length.
+    #[test]
+    fn hash_layers_weight_the_experts_the_table_names() {
+        // Expert 3 scores highest, expert 0 lowest; the table names 0 and 1.
+        let scores = [0.1f32, 0.4, 0.2, 5.0];
+        let table = vec![0.0f32, 1.0];
+        let idx_forced = hash_route(&table, 1, 2, 0);
+        assert_eq!(idx_forced, vec![0, 1]);
+
+        let (mut idx, mut w) = (Vec::new(), Vec::new());
+        route(&scores, None, 2, 1.0, Some(&idx_forced), &mut idx, &mut w);
+        assert_eq!(idx, vec![0, 1], "the table must decide the experts");
+
+        // The weights must be the table experts' own scores, normalized.
+        let sp = |x: f32| (1.0 + x.exp()).ln().sqrt();
+        let (s0, s1) = (sp(scores[0]), sp(scores[1]));
+        let tot = s0 + s1;
+        assert!((w[0] - s0 / tot).abs() < 1e-6, "w[0]={} want {}", w[0], s0 / tot);
+        assert!((w[1] - s1 / tot).abs() < 1e-6, "w[1]={} want {}", w[1], s1 / tot);
+
+        // And the top-k path is untouched: expert 3 still wins there.
+        let (mut idx2, mut w2) = (Vec::new(), Vec::new());
+        route(&scores, None, 2, 1.0, None, &mut idx2, &mut w2);
+        assert_eq!(idx2[0], 3, "without a table the highest score still wins");
     }
 }
