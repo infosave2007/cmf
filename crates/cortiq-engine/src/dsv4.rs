@@ -923,6 +923,139 @@ pub fn forward_token(
     g.head.matvec(&h, logits, pool);
 }
 
+/// Build the runtime weights from a converted `.cmf`.
+///
+/// Names are the converter's output (see `canon_name`'s deepseek_v4 arm):
+/// attention keeps DeepSeek's own spelling under `self_attn.`, the MoE is
+/// rewritten into the layout every other MoE here uses, and the hyper-
+/// connection tensors ride under the layer prefix.
+pub fn load(
+    model: &std::sync::Arc<cortiq_core::CmfModel>,
+    cfg: &Dsv4Cfg,
+    n_layers: usize,
+) -> Result<(Dsv4Globals, Vec<Dsv4Layer>), String> {
+    let q = |name: &str| -> Result<crate::qtensor::QTensor, String> {
+        crate::qtensor::QTensor::from_model(model, name)
+    };
+    let f = |name: &str| -> Result<Vec<f32>, String> {
+        let t = q(name)?;
+        let (r, c) = (t.rows(), t.cols());
+        let mut v = vec![0.0f32; r * c];
+        for i in 0..r {
+            t.row_f32(i, &mut v[i * c..(i + 1) * c]);
+        }
+        Ok(v)
+    };
+    let opt_f = |name: &str| -> Option<Vec<f32>> { f(name).ok() };
+
+    let globals = Dsv4Globals {
+        embed: q("model.embed_tokens.weight")?,
+        norm: f("model.norm.weight")?,
+        head: q("lm_head.weight")?,
+        hc_head_fn: f("model.hc_head_fn")?,
+        hc_head_base: f("model.hc_head_base")?,
+        hc_head_scale: *f("model.hc_head_scale")?
+            .first()
+            .ok_or("dsv4: empty hc_head_scale")?,
+    };
+
+    let mut layers = Vec::with_capacity(n_layers);
+    for li in 0..n_layers {
+        let p = format!("model.layers.{li}");
+        let scale3 = |name: &str| -> Result<[f32; 3], String> {
+            let v = f(name)?;
+            if v.len() < 3 {
+                return Err(format!("{name}: expected 3 scales, got {}", v.len()));
+            }
+            Ok([v[0], v[1], v[2]])
+        };
+        // The compressor exists on every layer whose ratio is non-zero;
+        // its presence in the file is the only signal we need.
+        let compressor = match q(&format!("{p}.self_attn.compressor.wkv.weight")) {
+            Ok(wkv) => {
+                let ape = f(&format!("{p}.self_attn.compressor.ape"))?;
+                // ape is [ratio, coff*head_dim]; coff is 2 when the windows
+                // overlap, which the release does at ratio 4.
+                let width = wkv.rows();
+                let ratio = (ape.len() / width.max(1)).max(1);
+                Some(Dsv4Compressor {
+                    wkv,
+                    wgate: q(&format!("{p}.self_attn.compressor.wgate.weight"))?,
+                    norm: f(&format!("{p}.self_attn.compressor.norm.weight"))?,
+                    ape,
+                    ratio,
+                    overlap: ratio == 4,
+                })
+            }
+            Err(_) => None,
+        };
+        let indexer = match q(&format!("{p}.self_attn.indexer.wq_b.weight")) {
+            Ok(wq_b) => {
+                let ape = f(&format!("{p}.self_attn.indexer.compressor.ape"))?;
+                let cwkv = q(&format!("{p}.self_attn.indexer.compressor.wkv.weight"))?;
+                let width = cwkv.rows();
+                let ratio = (ape.len() / width.max(1)).max(1);
+                Some(Dsv4Indexer {
+                    wq_b,
+                    weights_proj: q(&format!("{p}.self_attn.indexer.weights_proj.weight"))?,
+                    compressor: Dsv4Compressor {
+                        wkv: cwkv,
+                        wgate: q(&format!("{p}.self_attn.indexer.compressor.wgate.weight"))?,
+                        norm: f(&format!("{p}.self_attn.indexer.compressor.norm.weight"))?,
+                        ape,
+                        ratio,
+                        overlap: ratio == 4,
+                    },
+                })
+            }
+            Err(_) => None,
+        };
+
+        let mut experts = Vec::with_capacity(cfg.n_routed_experts);
+        for e in 0..cfg.n_routed_experts {
+            let ep = format!("{p}.mlp.experts.{e}");
+            experts.push(Dsv4Expert {
+                w1: q(&format!("{ep}.gate_proj.weight"))?,
+                w2: q(&format!("{ep}.down_proj.weight"))?,
+                w3: q(&format!("{ep}.up_proj.weight"))?,
+            });
+        }
+
+        layers.push(Dsv4Layer {
+            attn_norm: f(&format!("{p}.input_layernorm.weight"))?,
+            ffn_norm: f(&format!("{p}.post_attention_layernorm.weight"))?,
+            wq_a: q(&format!("{p}.self_attn.wq_a.weight"))?,
+            q_norm: f(&format!("{p}.self_attn.q_norm.weight"))?,
+            wq_b: q(&format!("{p}.self_attn.wq_b.weight"))?,
+            wkv: q(&format!("{p}.self_attn.wkv.weight"))?,
+            kv_norm: f(&format!("{p}.self_attn.kv_norm.weight"))?,
+            wo_a: q(&format!("{p}.self_attn.wo_a.weight"))?,
+            wo_b: q(&format!("{p}.self_attn.wo_b.weight"))?,
+            attn_sink: f(&format!("{p}.self_attn.attn_sink"))?,
+            compressor,
+            indexer,
+            hc_attn_fn: f(&format!("{p}.hc_attn_fn"))?,
+            hc_attn_base: f(&format!("{p}.hc_attn_base"))?,
+            hc_attn_scale: scale3(&format!("{p}.hc_attn_scale"))?,
+            hc_ffn_fn: f(&format!("{p}.hc_ffn_fn"))?,
+            hc_ffn_base: f(&format!("{p}.hc_ffn_base"))?,
+            hc_ffn_scale: scale3(&format!("{p}.hc_ffn_scale"))?,
+            gate: q(&format!("{p}.mlp.gate.weight"))?,
+            // The bias is absent exactly on the hash layers, and the table
+            // is present exactly there — the file itself says which is which.
+            gate_bias: opt_f(&format!("{p}.mlp.expert_bias")),
+            tid2eid: opt_f(&format!("{p}.mlp.tid2eid")),
+            experts,
+            shared: Dsv4Expert {
+                w1: q(&format!("{p}.mlp.shared_expert.gate_proj.weight"))?,
+                w2: q(&format!("{p}.mlp.shared_expert.down_proj.weight"))?,
+                w3: q(&format!("{p}.mlp.shared_expert.up_proj.weight"))?,
+            },
+        });
+    }
+    Ok((globals, layers))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
