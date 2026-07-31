@@ -2268,10 +2268,16 @@ struct MoeGuP { gpr: u32, inter: u32, slots: u32, mat16: u32 };
 var<workgroup> mg_pg: array<f32, 64>;
 var<workgroup> mg_pu: array<f32, 64>;
 
-// The same activations as `mg_x`, as vec4: the scalar view costs one load
-// per weight, which left the dense FFN kernel at ~11% of the card's
-// bandwidth until the vec4 rewrite (+2.7x there). MoE reads x the same way.
-@group(0) @binding(6) var<storage, read> mg_xv : array<vec4<f32>>;
+// The same activations as `mg_x`, at the SAME SLOT, seen as vec4. The
+// scalar view costs one load per weight, which left the dense FFN kernel
+// at ~11% of the card's bandwidth until the vec4 rewrite (+2.7x there).
+//
+// A second global on slot 2 rather than a new slot 6, because an auto
+// layout lists only the bindings its entry point actually USES: the q2tp
+// kernel stopped touching `mg_x`, naga dropped slot 2, and the 7-entry
+// bind group met a 6-entry layout. Same slot = the bind group is
+// unchanged for every kernel here.
+@group(0) @binding(2) var<storage, read> mg_xv : array<vec4<f32>>;
 
 fn mg_g16(o: u32) -> u32 { return (mg_gw[o >> 1u] >> ((o & 1u) * 16u)) & 0xFFFFu; }
 fn mg_u16f(o: u32) -> u32 { return (mg_uw[o >> 1u] >> ((o & 1u) * 16u)) & 0xFFFFu; }
@@ -6710,14 +6716,7 @@ pub fn forward_token_graph(
                     &c.layout_moe_sel,
                     &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &n1],
                 );
-                // The q2tp kernel takes the activations TWICE — scalar and
-                // vec4 views of one buffer (auto-layouts are pipeline-
-                // exclusive, so only its layout has slot 6).
-                let bg_gu = if *gu_q2 {
-                    bg(l_gu, &[gate_all, up_all, &n1, msel, mact, &gu_u, &n1])
-                } else {
-                    bg(l_gu, &[gate_all, up_all, &n1, msel, mact, &gu_u])
-                };
+                let bg_gu = bg(l_gu, &[gate_all, up_all, &n1, msel, mact, &gu_u]);
                 let bg_dn = bg(l_dn, &[down_all, mact, msel, mwt, &ob, &dn_u]);
                 let pr = prep(router, &n1, mlogit, *n_exp, hidden);
                 let ps = prep(sgate, &n1, mslog, 1, hidden);
