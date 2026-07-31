@@ -1836,6 +1836,311 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// ── Fold-select MoE twins: gu/down recompute the top-k FROM THE ROUTER
+// LOGITS inside every workgroup — redundant arithmetic, but the serial
+// select hop disappears and the layer chain loses one ~25 us dispatch
+// latency. The comparator (max, lowest index on ties) is order-free, so
+// every workgroup lands on the same experts; softmax summation order
+// differs from the retired select kernel only in reduction shape.
+// Slot 3 carries the LOGITS where the plain twins carry the selection.
+@group(0) @binding(3) var<storage, read> mgf_logit : array<f32>;
+struct MgfP { n_exp: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(7) var<uniform> mgf_p : MgfP;
+
+var<workgroup> mgf_lg: array<f32, 256>;
+var<workgroup> mgf_v:  array<f32, 64>;
+var<workgroup> mgf_i:  array<u32, 64>;
+
+// top-(slot+1) of n logits with 64 lanes; returns the slot'th expert id.
+fn mgf_pick(slot: u32, n: u32, lid: u32) -> u32 {
+    var chosen = 0u;
+    for (var s = 0u; s <= slot; s = s + 1u) {
+        var best = -3.0e38;
+        var bi = 0xFFFFu;
+        var i = lid;
+        loop {
+            if (i >= n) { break; }
+            let v = mgf_lg[i];
+            if (v > best || (v == best && i < bi)) { best = v; bi = i; }
+            i = i + 64u;
+        }
+        mgf_v[lid] = best;
+        mgf_i[lid] = bi;
+        workgroupBarrier();
+        var st = 32u;
+        loop {
+            if (st == 0u) { break; }
+            if (lid < st) {
+                let b = mgf_v[lid + st];
+                let ib = mgf_i[lid + st];
+                if (b > mgf_v[lid] || (b == mgf_v[lid] && ib < mgf_i[lid])) {
+                    mgf_v[lid] = b;
+                    mgf_i[lid] = ib;
+                }
+            }
+            workgroupBarrier();
+            st = st >> 1u;
+        }
+        chosen = mgf_i[0];
+        workgroupBarrier();
+        if (lid == 0u && s < slot) { mgf_lg[chosen] = -3.0e38; }
+        workgroupBarrier();
+    }
+    return chosen;
+}
+
+@compute @workgroup_size(64)
+fn moe_gate_up_q2tp_f(@builtin(workgroup_id) wid: vec3<u32>,
+                      @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let slot = wid.y;
+    let gpr = mg_p.gpr;
+    let rows = mg_p.inter;
+    let n = mgf_p.n_exp;
+    let mat16 = mg_p.mat16;
+    // Stage logits once (shared expert = last slot, id n).
+    var i = lid;
+    loop {
+        if (i >= n) { break; }
+        mgf_lg[i] = mgf_logit[i];
+        i = i + 64u;
+    }
+    workgroupBarrier();
+    var id = n;
+    if (slot < mg_p.slots - 1u) {
+        id = mgf_pick(slot, n, lid);
+    }
+    let base16 = id * mat16;
+    let nib16 = base16 + row * gpr * 4u;
+    let par16 = base16 + rows * gpr * 4u + row * 2u;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let cod8 = (base16 + rows * gpr * 4u + rows * 2u) * 2u + row * cst;
+
+    let gl = unpack2x16float(mg_g16(par16) | (mg_g16(par16 + 1u) << 16u));
+    let ul = unpack2x16float(mg_u16f(par16) | (mg_u16f(par16 + 1u) << 16u));
+    var ag = 0.0;
+    var au = 0.0;
+    for (var g = lid; g < gpr; g = g + 64u) {
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        var cg = mgp_gu8(cod8 + cb);
+        var cu = mgp_uu8(cod8 + cb);
+        if (shf > 3u) {
+            cg = cg | (mgp_gu8(cod8 + cb + 1u) << 8u);
+            cu = cu | (mgp_uu8(cod8 + cb + 1u) << 8u);
+        }
+        let cgv = (cg >> shf) & 31u;
+        let cuv = (cu >> shf) & 31u;
+        let sg = select(exp2(gl.x + f32(max(cgv, 1u) - 1u) * gl.y), 0.0, cgv == 0u);
+        let su = select(exp2(ul.x + f32(max(cuv, 1u) - 1u) * ul.y), 0.0, cuv == 0u);
+        let w32 = (nib16 + g * 4u) >> 1u;
+        let xq = g * 8u;
+        let x0 = mg_xv[xq];      let x1 = mg_xv[xq + 1u];
+        let x2 = mg_xv[xq + 2u]; let x3 = mg_xv[xq + 3u];
+        let x4 = mg_xv[xq + 4u]; let x5 = mg_xv[xq + 5u];
+        let x6 = mg_xv[xq + 6u]; let x7 = mg_xv[xq + 7u];
+        let dg = mg_dot16v(mg_gw[w32], x0, x1, x2, x3)
+               + mg_dot16v(mg_gw[w32 + 1u], x4, x5, x6, x7);
+        let du = mg_dot16v(mg_uw[w32], x0, x1, x2, x3)
+               + mg_dot16v(mg_uw[w32 + 1u], x4, x5, x6, x7);
+        ag = ag + sg * dg;
+        au = au + su * du;
+    }
+    mg_pg[lid] = ag;
+    mg_pu[lid] = au;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) {
+            mg_pg[lid] = mg_pg[lid] + mg_pg[lid + stride];
+            mg_pu[lid] = mg_pu[lid] + mg_pu[lid + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) {
+        let g = mg_pg[0];
+        mg_act[slot * mg_p.inter + row] = (g / (1.0 + exp(-g))) * mg_pu[0];
+    }
+}
+
+// down twin: recomputes ids AND weights (softmax over picked + shared
+// sigmoid). Slot 2 = logits, slot 3 = shared-gate weight (f32 bits),
+// slot 6 = the token's activations for the shared-gate dot.
+@group(0) @binding(2) var<storage, read> mdf_logit : array<f32>;
+@group(0) @binding(3) var<storage, read> mdf_sgw   : array<u32>;
+@group(0) @binding(6) var<storage, read> mdf_x     : array<f32>;
+struct MdfP { n_exp: u32, top_k: u32, norm: u32, pk: u32 };
+@group(0) @binding(7) var<uniform> mdf_p : MdfP;
+
+var<workgroup> mdf_lg: array<f32, 256>;
+var<workgroup> mdf_v:  array<f32, 64>;
+var<workgroup> mdf_i:  array<u32, 64>;
+var<workgroup> mdf_sel: array<u32, 16>;
+var<workgroup> mdf_wt:  array<f32, 16>;
+
+@compute @workgroup_size(64)
+fn moe_down_q4tp_f(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let gpr = md_p.gpr;
+    let rows = md_p.hidden;
+    let n = mdf_p.n_exp;
+    let kk = mdf_p.top_k;
+    let sg_kind = mdf_p.pk & 0xFFu;
+    let sg_hidden = mdf_p.pk >> 8u;
+    // shared gate dot (same strided shape as the retired select kernel,
+    // 64 lanes instead of 256)
+    var sgv = 0.0;
+    if (sg_kind == 4u) {
+        var d = 0.0;
+        var i = lid;
+        loop {
+            if (i >= sg_hidden) { break; }
+            d = d + bitcast<f32>(mdf_sgw[i]) * mdf_x[i];
+            i = i + 64u;
+        }
+        mdf_v[lid] = d;
+        workgroupBarrier();
+        var st = 32u;
+        loop {
+            if (st == 0u) { break; }
+            if (lid < st) { mdf_v[lid] = mdf_v[lid] + mdf_v[lid + st]; }
+            workgroupBarrier();
+            st = st >> 1u;
+        }
+        sgv = mdf_v[0];
+        workgroupBarrier();
+    }
+    // logits + max + denom with 64-lane reductions
+    var i2 = lid;
+    loop {
+        if (i2 >= n) { break; }
+        mdf_lg[i2] = mdf_logit[i2];
+        i2 = i2 + 64u;
+    }
+    workgroupBarrier();
+    var mbest = -3.0e38;
+    var i3 = lid;
+    loop {
+        if (i3 >= n) { break; }
+        mbest = max(mbest, mdf_lg[i3]);
+        i3 = i3 + 64u;
+    }
+    mdf_v[lid] = mbest;
+    workgroupBarrier();
+    var st2 = 32u;
+    loop {
+        if (st2 == 0u) { break; }
+        if (lid < st2) { mdf_v[lid] = max(mdf_v[lid], mdf_v[lid + st2]); }
+        workgroupBarrier();
+        st2 = st2 >> 1u;
+    }
+    let mx = mdf_v[0];
+    workgroupBarrier();
+    var dsum = 0.0;
+    var i4 = lid;
+    loop {
+        if (i4 >= n) { break; }
+        dsum = dsum + exp(mdf_lg[i4] - mx);
+        i4 = i4 + 64u;
+    }
+    mdf_v[lid] = dsum;
+    workgroupBarrier();
+    st2 = 32u;
+    loop {
+        if (st2 == 0u) { break; }
+        if (lid < st2) { mdf_v[lid] = mdf_v[lid] + mdf_v[lid + st2]; }
+        workgroupBarrier();
+        st2 = st2 >> 1u;
+    }
+    let denom = mdf_v[0];
+    workgroupBarrier();
+    // top-k, weights, optional renorm; shared expert last
+    var wsum = 0.0;
+    for (var s = 0u; s < kk; s = s + 1u) {
+        var best = -3.0e38;
+        var bi = 0xFFFFu;
+        var i5 = lid;
+        loop {
+            if (i5 >= n) { break; }
+            let v = mdf_lg[i5];
+            if (v > best || (v == best && i5 < bi)) { best = v; bi = i5; }
+            i5 = i5 + 64u;
+        }
+        mdf_v[lid] = best;
+        mdf_i[lid] = bi;
+        workgroupBarrier();
+        var st3 = 32u;
+        loop {
+            if (st3 == 0u) { break; }
+            if (lid < st3) {
+                let b = mdf_v[lid + st3];
+                let ib = mdf_i[lid + st3];
+                if (b > mdf_v[lid] || (b == mdf_v[lid] && ib < mdf_i[lid])) {
+                    mdf_v[lid] = b;
+                    mdf_i[lid] = ib;
+                }
+            }
+            workgroupBarrier();
+            st3 = st3 >> 1u;
+        }
+        if (lid == 0u) {
+            mdf_sel[s] = mdf_i[0];
+            mdf_wt[s] = exp(mdf_v[0] - mx) / denom;
+        }
+        workgroupBarrier();
+        wsum = wsum + exp(mdf_v[0] - mx) / denom;
+        if (lid == 0u) { mdf_lg[mdf_i[0]] = -3.0e38; }
+        workgroupBarrier();
+    }
+    if (lid == 0u) {
+        if (mdf_p.norm != 0u) {
+            for (var s = 0u; s < kk; s = s + 1u) { mdf_wt[s] = mdf_wt[s] / wsum; }
+        }
+        mdf_sel[kk] = n;
+        mdf_wt[kk] = 1.0 / (1.0 + exp(-sgv));
+    }
+    workgroupBarrier();
+    let cst = (gpr * 5u + 7u) / 8u;
+    let total = md_p.slots * gpr;
+    var acc = 0.0;
+    for (var i6 = lid; i6 < total; i6 = i6 + 64u) {
+        let slot = i6 / gpr;
+        let g = i6 % gpr;
+        let base16 = mdf_sel[slot] * md_p.mat16;
+        let par16 = base16 + rows * gpr * 8u + row * 2u;
+        let cod8 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + row * cst;
+        let pl = unpack2x16float(md_u16(par16) | (md_u16(par16 + 1u) << 16u));
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        var cv = mdp_u8(cod8 + cb);
+        if (shf > 3u) { cv = cv | (mdp_u8(cod8 + cb + 1u) << 8u); }
+        let scale = exp2(pl.x + f32((cv >> shf) & 31u) * pl.y);
+        let t16 = base16 + (row * gpr + g) * 8u;
+        let xb = (slot * gpr + g) * 32u;
+        var d = 0.0;
+        for (var k2 = 0u; k2 < 4u; k2 = k2 + 1u) {
+            let w = md_u16(t16 + 2u * k2) | (md_u16(t16 + 1u + 2u * k2) << 16u);
+            d = d + md_dot8(w, xb + 8u * k2);
+        }
+        acc = acc + mdf_wt[slot] * scale * d;
+    }
+    md_pt[lid] = acc;
+    workgroupBarrier();
+    var st4 = 32u;
+    loop {
+        if (st4 == 0u) { break; }
+        if (lid < st4) { md_pt[lid] = md_pt[lid] + md_pt[lid + st4]; }
+        workgroupBarrier();
+        st4 = st4 >> 1u;
+    }
+    if (lid == 0u) { md_y[row] = md_pt[0]; }
+}
+
 // ── Multi-step greedy tail: argmax over the logits on the device, then
 // re-embed the winner — k decode steps ride ONE submit and the CPU sees
 // k token ids instead of k megabytes of logits. Ties pick an arbitrary
@@ -3847,6 +4152,9 @@ struct Ctx {
     layout_moe_gu_q4tp: wgpu::BindGroupLayout,
     moe_gate_up_q2tp: wgpu::ComputePipeline,
     layout_moe_gu_q2tp: wgpu::BindGroupLayout,
+    moe_gate_up_q2tp_f: wgpu::ComputePipeline,
+    moe_down_q4tp_f: wgpu::ComputePipeline,
+    foldsel: bool,
     layout_moe_dn_q4tp: wgpu::BindGroupLayout,
     /// Discrete card (PCIe VRAM) vs UMA — thresholds and budgets differ.
     discrete: bool,
@@ -4278,6 +4586,9 @@ fn init() -> Result<Ctx, String> {
     let layout_moe_dn = moe_down.get_bind_group_layout(0);
     let layout_moe_gu_q4tp = moe_gate_up_q4tp.get_bind_group_layout(0);
     let moe_gate_up_q2tp = pipe("moe_gate_up_q2tp");
+    let moe_gate_up_q2tp_f = pipe("moe_gate_up_q2tp_f");
+    let moe_down_q4tp_f = pipe("moe_down_q4tp_f");
+    let foldsel = std::env::var("CMF_MOE_FOLDSEL").map(|v| v != "0").unwrap_or(true);
     let layout_moe_gu_q2tp = moe_gate_up_q2tp.get_bind_group_layout(0);
     let layout_moe_dn_q4tp = moe_down_q4tp.get_bind_group_layout(0);
     let layout = matvec.get_bind_group_layout(0);
@@ -4433,6 +4744,9 @@ fn init() -> Result<Ctx, String> {
         layout_moe_dn,
         layout_moe_gu_q4tp,
         moe_gate_up_q2tp,
+        moe_gate_up_q2tp_f,
+        moe_down_q4tp_f,
+        foldsel,
         layout_moe_gu_q2tp,
         layout_moe_dn_q4tp,
         discrete,
@@ -7225,6 +7539,86 @@ pub fn forward_token_graph(
                 let bg_dn = bg(l_dn, &[down_all, mact, msel, mwt, &ob, &dn_u]);
                 let pr = prep(router, &n1, mlogit, *n_exp, hidden);
                 let ps = prep(sgate, &n1, mslog, 1, hidden);
+                let mut continue_moe_std = true;
+                // Fold-select (q2tp + folded shared gate): router feeds the
+                // gu/down twins DIRECTLY — the select hop and the sgate
+                // matvec disappear from the layer's dependency chain.
+                let fold = c.foldsel && *gu_q2 && sg_fold && !skip_router;
+                if fold {
+                    if let Some((prp, bgr, wr)) = prep(router, &n1, mlogit, *n_exp, hidden) {
+                        let mgf_u = uniform_u32x4(c, [*n_exp as u32, 0, 0, 0]);
+                        let l_guf = c.moe_gate_up_q2tp_f.get_bind_group_layout(0);
+                        let bg_guf = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &l_guf,
+                            entries: &[
+                                bind_buf(0, gate_all),
+                                bind_buf(1, up_all),
+                                bind_buf(2, &n1),
+                                bind_buf(3, mlogit),
+                                bind_buf(4, mact),
+                                bind_buf(5, &gu_u),
+                                bind_buf(7, &mgf_u),
+                            ],
+                        });
+                        let mdf_u = uniform_u32x4(
+                            c,
+                            [
+                                *n_exp as u32,
+                                *top_k as u32,
+                                *norm_topk as u32,
+                                (hidden as u32) << 8 | 4,
+                            ],
+                        );
+                        let l_dnf = c.moe_down_q4tp_f.get_bind_group_layout(0);
+                        let bg_dnf = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &l_dnf,
+                            entries: &[
+                                bind_buf(0, down_all),
+                                bind_buf(1, mact),
+                                bind_buf(2, mlogit),
+                                bind_buf(3, &sgate.buf),
+                                bind_buf(4, &ob),
+                                bind_buf(5, &dn_u),
+                                bind_buf(6, &n1),
+                                bind_buf(7, &mdf_u),
+                            ],
+                        });
+                        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: None,
+                            timestamp_writes: None,
+                        });
+                        if let Some((p, b, w)) = &ffn_pre {
+                            pass.set_pipeline(p);
+                            pass.set_bind_group(0, b, &[]);
+                            pass.dispatch_workgroups(*w, 1, 1);
+                        }
+                        pass.set_pipeline(prp);
+                        pass.set_bind_group(0, &bgr, &[]);
+                        pass.dispatch_workgroups(wr, 1, 1);
+                        if !skip_moe {
+                            pass.set_pipeline(&c.moe_gate_up_q2tp_f);
+                            pass.set_bind_group(0, &bg_guf, &[]);
+                            pass.dispatch_workgroups(*mi as u32, slots as u32, 1);
+                            pass.set_pipeline(&c.moe_down_q4tp_f);
+                            pass.set_bind_group(0, &bg_dnf, &[]);
+                            pass.dispatch_workgroups(hidden as u32, 1, 1);
+                            if let Some((p, b, w)) = &ffn_post {
+                                pass.set_pipeline(p);
+                                pass.set_bind_group(0, b, &[]);
+                                pass.dispatch_workgroups(*w, 1, 1);
+                                tail_done = true;
+                            }
+                        }
+                        drop(pass);
+                        enc.copy_buffer_to_buffer(&n1, 0, &h_buf, 0, 0);
+                        // (zero-length copy: keeps the borrow checker shape
+                        // identical to the non-fold arm; no-op on device)
+                        continue_moe_std = false;
+                    }
+                }
+                if continue_moe_std {
                 if let (Some((prp, bgr, wr)), Some((psp, bgs, ws))) = (pr, ps) {
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: None,
@@ -7283,6 +7677,7 @@ pub fn forward_token_graph(
                     }
                     go(&mut enc, p_dn, &bg_dn, hidden as u32);
                 }
+                } // continue_moe_std
             }
         }
         // FFN-residual + next layer's attn-norm fused (plain residual on the last).
