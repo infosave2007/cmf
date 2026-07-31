@@ -367,6 +367,95 @@ pub fn compress_window(
     }
 }
 
+/// The sparse indexer's scoring pass. For each query it ranks the
+/// compressed positions and keeps the best `topk`.
+///
+/// Three details from the reference that a shape-only reading misses:
+///   * the query comes from the SHARED LoRA output `qr` (the output of
+///     `q_norm(wq_a(x))`, before attention's own `wq_b`), through the
+///     indexer's own `wq_b` — not from attention's queries;
+///   * scores are **relu'd** before the per-head weighting, so a head can
+///     only ever vote for a position, never against it;
+///   * the per-head weights are a projection of the hidden state scaled by
+///     `head_dim^-0.5 * n_heads^-0.5`.
+///
+/// `causal_limit` is the number of compressed positions this query may see
+/// (`(pos + 1) / ratio`); anything at or past it is masked.
+pub fn index_scores(
+    q_heads: &[f32],
+    kv: &[f32],
+    head_weights: &[f32],
+    n_heads: usize,
+    head_dim: usize,
+    n_pos: usize,
+    causal_limit: usize,
+    out: &mut Vec<f32>,
+) {
+    out.clear();
+    out.resize(n_pos, 0.0);
+    for t in 0..n_pos {
+        if t >= causal_limit {
+            out[t] = f32::NEG_INFINITY;
+            continue;
+        }
+        let k = &kv[t * head_dim..(t + 1) * head_dim];
+        let mut acc = 0.0;
+        for h in 0..n_heads {
+            let q = &q_heads[h * head_dim..(h + 1) * head_dim];
+            let dot: f32 = q.iter().zip(k).map(|(a, b)| a * b).sum();
+            // relu BEFORE weighting: a head votes for a position or abstains
+            acc += dot.max(0.0) * head_weights[h];
+        }
+        out[t] = acc;
+    }
+}
+
+/// Top-`k` positions by score, ties broken by the lower index so the choice
+/// is deterministic across backends. Masked slots (-inf) never win, and a
+/// short history simply returns fewer than `k`.
+pub fn top_k_positions(scores: &[f32], k: usize, out: &mut Vec<usize>) {
+    out.clear();
+    let mut taken = vec![false; scores.len()];
+    for _ in 0..k.min(scores.len()) {
+        let mut best = usize::MAX;
+        let mut bv = f32::NEG_INFINITY;
+        for (i, &v) in scores.iter().enumerate() {
+            if !taken[i] && v > bv && v.is_finite() {
+                bv = v;
+                best = i;
+            }
+        }
+        if best == usize::MAX {
+            break;
+        }
+        taken[best] = true;
+        out.push(best);
+    }
+    out.sort_unstable();
+}
+
+/// SwiGLU expert: `w2(silu(w1(x)) * w3(x))`, with the routing weight folded
+/// in before the down projection exactly as the reference does.
+pub fn expert_swiglu(
+    x: &[f32],
+    w1: &dyn Fn(&[f32], &mut [f32]),
+    w3: &dyn Fn(&[f32], &mut [f32]),
+    w2: &dyn Fn(&[f32], &mut [f32]),
+    inter: usize,
+    weight: f32,
+    out: &mut [f32],
+) {
+    let mut gate = vec![0.0f32; inter];
+    let mut up = vec![0.0f32; inter];
+    w1(x, &mut gate);
+    w3(x, &mut up);
+    for (g, u) in gate.iter_mut().zip(&up) {
+        let silu = *g / (1.0 + (-*g).exp());
+        *g = silu * u * weight;
+    }
+    w2(&gate, out);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +597,44 @@ mod tests {
         compress_window(&kv, &score, &ape, ratio, width, &mut out);
         assert!((out[0] - 2.0).abs() < 1e-5, "equal scores average: {}", out[0]);
         assert!((out[1] - 20.0).abs() < 1e-3, "a dominant score wins: {}", out[1]);
+    }
+
+    /// A negative dot product must not drag a position down: the relu
+    /// means heads abstain rather than veto.
+    #[test]
+    fn index_scores_relu_before_weighting() {
+        let (nh, hd) = (2usize, 2usize);
+        // head 0 aligns with position 0, head 1 anti-aligns with it
+        let q = [1.0f32, 0.0, -1.0, 0.0];
+        let kv = [1.0f32, 0.0, 0.0, 1.0];
+        let w = [1.0f32, 1.0];
+        let mut sc = Vec::new();
+        index_scores(&q, &kv, &w, nh, hd, 2, 2, &mut sc);
+        // without the relu the anti-aligned head would cancel head 0 to zero
+        assert!(sc[0] > 0.9, "abstention, not veto: {:?}", sc);
+    }
+
+    #[test]
+    fn index_scores_mask_the_future() {
+        let (nh, hd) = (1usize, 2usize);
+        let q = [1.0f32, 0.0];
+        let kv = [1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let w = [1.0f32];
+        let mut sc = Vec::new();
+        index_scores(&q, &kv, &w, nh, hd, 3, 2, &mut sc);
+        assert!(sc[0].is_finite() && sc[1].is_finite());
+        assert!(sc[2] == f32::NEG_INFINITY, "position 2 is in the future");
+        let mut idx = Vec::new();
+        top_k_positions(&sc, 3, &mut idx);
+        assert_eq!(idx, vec![0, 1], "a masked slot never wins a slot");
+    }
+
+    #[test]
+    fn top_k_is_deterministic_on_ties() {
+        let sc = [1.0f32, 1.0, 1.0, 0.0];
+        let mut idx = Vec::new();
+        top_k_positions(&sc, 2, &mut idx);
+        assert_eq!(idx, vec![0, 1], "ties resolve to the lower index");
     }
 
     #[test]
