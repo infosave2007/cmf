@@ -693,6 +693,44 @@ fn matvec_pair(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// f32 matvec with a token axis for the batch graph: wid.y = token, and
+// the PER-ROW math is f32_matvec verbatim — same lane stride, same tree
+// reduction — so the logits it produces are bit-identical to k separate
+// dispatches of the single-token kernel. That equivalence is what lets
+// the batch prefill's router and GDN a/b projections collapse from one
+// dispatch per token per layer (~3200 a chunk) to one per layer.
+struct F32BP { cols: u32, rows: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read>       fb_w : array<f32>;
+@group(0) @binding(1) var<storage, read>       fb_x : array<f32>;
+@group(0) @binding(2) var<storage, read_write> fb_y : array<f32>;
+@group(0) @binding(3) var<uniform>             fb_p : F32BP;
+var<workgroup> fb_part: array<f32, 64>;
+@compute @workgroup_size(64)
+fn f32_matvec_b(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let t = wid.y;
+    if (row >= fb_p.rows) { return; }
+    let base = row * fb_p.cols;
+    let xoff = t * fb_p.cols;
+    var acc = 0.0;
+    var i = lid;
+    loop {
+        if (i >= fb_p.cols) { break; }
+        acc = acc + fb_w[base + i] * fb_x[xoff + i];
+        i = i + 64u;
+    }
+    fb_part[lid] = acc;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { fb_part[lid] = fb_part[lid] + fb_part[lid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (lid == 0u) { fb_y[t * fb_p.rows + row] = fb_part[0]; }
+}
+
 // RMSNorm of one row (WGSL twin of Metal rmsnorm_k): o = x·rsqrt(mean(x²)+eps)·w',
 // w' = w or (1+w) for gemma. One workgroup, 256-thread tree reduction — the
 // building block that keeps the token graph's hidden resident across the norm.
@@ -825,8 +863,9 @@ fn gdn_step(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
         gd_kf[t] = gd_cq[ks + t] * invk;
     }
     workgroupBarrier();
-    let g = exp(-exp(gd_alog[h]) * gd_softplus(gd_a[h] + gd_dtb[h]));
-    let beta = 1.0 / (1.0 + exp(-gd_b[h]));
+    let abo = gd_p.tok * gd_p.nv;
+    let g = exp(-exp(gd_alog[h]) * gd_softplus(gd_a[abo + h] + gd_dtb[h]));
+    let beta = 1.0 / (1.0 + exp(-gd_b[abo + h]));
     let sbase = h * dk * dv;
     if (t < dv) {
         let dj = t;
@@ -3020,6 +3059,8 @@ struct Ctx {
     gdn_step: wgpu::ComputePipeline,
     gdn_conv: wgpu::ComputePipeline,
     f32_matvec: wgpu::ComputePipeline,
+    f32_matvec_b: wgpu::ComputePipeline,
+    layout_f32b: wgpu::BindGroupLayout,
     moe_select: wgpu::ComputePipeline,
     /// Two independent projections of one input in a single dispatch.
     matvec_pair: wgpu::ComputePipeline,
@@ -3419,6 +3460,8 @@ fn init() -> Result<Ctx, String> {
     let gdn_step = pipe("gdn_step");
     let gdn_conv = pipe("gdn_conv");
     let f32_matvec = pipe("f32_matvec");
+    let f32_matvec_b = pipe("f32_matvec_b");
+    let layout_f32b = f32_matvec_b.get_bind_group_layout(0);
     let matvec_pair = pipe("matvec_pair");
     let layout_mv2 = matvec_pair.get_bind_group_layout(0);
     let moe_select = pipe("moe_select");
@@ -3529,6 +3572,8 @@ fn init() -> Result<Ctx, String> {
         gdn_step,
         gdn_conv,
         f32_matvec,
+        f32_matvec_b,
+        layout_f32b,
         matvec_pair,
         layout_mv2,
         moe_select,
@@ -6456,6 +6501,10 @@ pub fn forward_batch_graph(
     let z_s = rwc(gnv * gdv);
     let a_s = rwc(gnv);
     let b_s = rwc(gnv);
+    // Whole-batch a/b planes: one token-axis matvec per layer fills them,
+    // and gdn_step reads its token's row via GdnP.tok.
+    let a_bb = rwc(k * gnv);
+    let b_bb = rwc(k * gnv);
     let gdo_s = rwc(gnv * gdv);
     let invf_b = stor(bytemuck::cast_slice(invf));
     let dummy_hd = stor(bytemuck::cast_slice(&vec![0f32; hd]));
@@ -6762,15 +6811,21 @@ pub fn forward_batch_graph(
                 // token's z/output rows in the BATCH buffers. The staging
                 // copies this replaces were 4 of the 8 commands per token
                 // per GDN layer of a chunk.
+                // a/b for EVERY token in one dispatch each — the per-token
+                // matvecs were 1920 of the chunk's ~4800 remaining commands.
+                let fb_u = uniform_u32x4(c, [hidden as u32, *nv as u32, 0, 0]);
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                    for (w, y) in [(&a.buf, &a_bb), (&b.buf, &b_bb)] {
+                        pass.set_pipeline(&c.f32_matvec_b);
+                        pass.set_bind_group(0, &bg(&c.layout_f32b, &[w, &n1, y, &fb_u]), &[]);
+                        pass.dispatch_workgroups((*nv as u32).min(MAX_WG), k as u32, 1);
+                    }
+                }
                 for i in 0..k {
-                    encode_f32matvec_off(
-                        c, &mut enc, &a.buf, &n1, (i * hidden * 4) as u64,
-                        &a_s, 0, (*nv * 4) as u64, *nv, hidden,
-                    );
-                    encode_f32matvec_off(
-                        c, &mut enc, &b.buf, &n1, (i * hidden * 4) as u64,
-                        &b_s, 0, (*nv * 4) as u64, *nv, hidden,
-                    );
                     let gc_pt =
                         uniform_u32x4(c, [*cdim as u32, *kk as u32, (i * cdim) as u32, 0]);
                     go(
@@ -6798,7 +6853,7 @@ pub fn forward_batch_graph(
                         &bg(
                             &c.layout_gdn,
                             &[
-                                &cq_s, &z_b, &a_s, &b_s, &alog, &dtb, &gnorm, s, &gdo_b, &gd_pt,
+                                &cq_s, &z_b, &a_bb, &b_bb, &alog, &dtb, &gnorm, s, &gdo_b, &gd_pt,
                             ],
                         ),
                         *nv as u32,
@@ -6896,19 +6951,22 @@ pub fn forward_batch_graph(
                     // token-axis dispatches for select/experts/down. The
                     // loop below is ~7 commands per token per layer and
                     // clocks the chunk at per-position speed.
-                    for t in 0..k {
-                        encode_f32matvec_off(
-                            c,
-                            &mut enc,
-                            &router.buf,
-                            &n1,
-                            (t * hidden * 4) as u64,
-                            mlogit,
-                            (t * *n_exp * 4) as u64,
-                            (*n_exp * 4) as u64,
-                            *n_exp,
-                            hidden,
+                    // Router for every token in ONE dispatch; per-row math is
+                    // f32_matvec verbatim, so the logits stay bit-identical.
+                    let fr_u = uniform_u32x4(c, [hidden as u32, *n_exp as u32, 0, 0]);
+                    {
+                        let mut pass =
+                            enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                label: None,
+                                timestamp_writes: None,
+                            });
+                        pass.set_pipeline(&c.f32_matvec_b);
+                        pass.set_bind_group(
+                            0,
+                            &bg(&c.layout_f32b, &[&router.buf, &n1, mlogit, &fr_u]),
+                            &[],
                         );
+                        pass.dispatch_workgroups((*n_exp as u32).min(MAX_WG), k as u32, 1);
                     }
                     let bg_sel = bg(
                         &c.layout_moe_sel_b,
