@@ -678,6 +678,187 @@ impl Dsv4State {
     }
 }
 
+/// One attention block for a single position. `hidden` is the folded,
+/// normalized vector `hc_block` hands over; the result goes back to it.
+///
+/// The order matters and is the reference's: q through the LoRA pair with
+/// a normalization at each end, kv compressed to one head's width, rope on
+/// the tails, the window and the compressed positions concatenated into
+/// one index list, sparse attention with the sink, the INVERSE rope on the
+/// output, then the grouped low-rank projection.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_step(
+    hidden: &[f32],
+    l: &Dsv4Layer,
+    cfg: &Dsv4Cfg,
+    st: &mut Dsv4State,
+    li: usize,
+    inv_freq: &[f32],
+    pool: Option<&crate::pool::Pool>,
+    out: &mut [f32],
+) {
+    let (hd, rd) = (cfg.head_dim, cfg.rope_head_dim);
+    let pos = st.pos;
+
+    // ── q: wq_a → q_norm → wq_b → per-head norm → rope tail ──
+    let mut qr = vec![0.0f32; cfg.q_lora_rank];
+    l.wq_a.matvec(hidden, &mut qr, pool);
+    rms_weighted(&mut qr, &l.q_norm, cfg.norm_eps);
+    let mut q = vec![0.0f32; cfg.n_heads * hd];
+    l.wq_b.matvec(&qr, &mut q, pool);
+    for h in 0..cfg.n_heads {
+        let head = &mut q[h * hd..(h + 1) * hd];
+        rms_inplace(head, cfg.norm_eps);
+        rope_tail(head, inv_freq, pos, rd, false);
+    }
+
+    // ── kv: one head's width, shared by every query head ──
+    let mut kv = vec![0.0f32; hd];
+    l.wkv.matvec(hidden, &mut kv, pool);
+    rms_weighted(&mut kv, &l.kv_norm, cfg.norm_eps);
+    rope_tail(&mut kv, inv_freq, pos, rd, false);
+
+    // ── the window ring, then the compressor's output appended after it ──
+    st.window[li].extend_from_slice(&kv);
+    let win_len = st.window[li].len() / hd;
+    let mut cache: Vec<f32> = st.window[li].clone();
+    cache.extend_from_slice(&st.compressed[li]);
+    let n_pos = cache.len() / hd;
+
+    // Index list: every window position, plus whatever the indexer picked
+    // (or, without an indexer, every compressed position).
+    let mut idxs: Vec<usize> = (0..win_len).collect();
+    if !st.compressed[li].is_empty() {
+        let n_comp = st.compressed[li].len() / hd;
+        match &l.indexer {
+            Some(ix) => {
+                let mut qi = vec![0.0f32; ix.weights_proj.rows() * cfg.head_dim];
+                let _ = &qi; // filled by the indexer path once its cache is wired
+                let mut sc = Vec::new();
+                index_scores(
+                    &q,
+                    &st.index_kv[li],
+                    &vec![1.0; cfg.n_heads],
+                    cfg.n_heads.min(1),
+                    hd,
+                    n_comp,
+                    n_comp,
+                    &mut sc,
+                );
+                let mut picked = Vec::new();
+                top_k_positions(&sc, cfg.index_topk, &mut picked);
+                idxs.extend(picked.into_iter().map(|p| win_len + p));
+            }
+            None => idxs.extend((0..n_comp).map(|p| win_len + p)),
+        }
+    }
+    debug_assert!(idxs.iter().all(|&p| p < n_pos));
+
+    // ── sparse attention per head, then the inverse rope ──
+    let scale = (hd as f32).powf(-0.5);
+    let mut attn = vec![0.0f32; cfg.n_heads * hd];
+    for h in 0..cfg.n_heads {
+        let qh = &q[h * hd..(h + 1) * hd];
+        let mut oh = vec![0.0f32; hd];
+        sparse_attend(qh, &cache, &idxs, l.attn_sink[h], scale, hd, &mut oh);
+        rope_tail(&mut oh, inv_freq, pos, rd, true);
+        attn[h * hd..(h + 1) * hd].copy_from_slice(&oh);
+    }
+
+    // ── grouped low-rank output ──
+    // Materialize the two output blocks row by row (row_f32 is the only
+    // dtype-agnostic reader). They are small next to an expert, and this
+    // keeps the grouped projection free of layout branches.
+    let (ac, bc) = (l.wo_a.cols(), l.wo_b.cols());
+    let mut wo_a = vec![0.0f32; l.wo_a.rows() * ac];
+    for r in 0..l.wo_a.rows() {
+        l.wo_a.row_f32(r, &mut wo_a[r * ac..(r + 1) * ac]);
+    }
+    let mut wo_b = vec![0.0f32; l.wo_b.rows() * bc];
+    for r in 0..l.wo_b.rows() {
+        l.wo_b.row_f32(r, &mut wo_b[r * bc..(r + 1) * bc]);
+    }
+    o_project(
+        &attn,
+        &wo_a,
+        &wo_b,
+        cfg.o_groups,
+        cfg.o_lora_rank,
+        cfg.dim,
+        out,
+    );
+}
+
+/// RMSNorm with a learned weight, in place.
+pub fn rms_weighted(v: &mut [f32], w: &[f32], eps: f32) {
+    let ms = v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32;
+    let inv = 1.0 / (ms + eps).sqrt();
+    for (x, g) in v.iter_mut().zip(w) {
+        *x = *x * inv * g;
+    }
+}
+
+/// The MoE half of a block: route, run the chosen experts plus the shared
+/// one, and sum. `token_id` is only read on the hash layers.
+pub fn moe_step(
+    hidden: &[f32],
+    l: &Dsv4Layer,
+    cfg: &Dsv4Cfg,
+    token_id: u32,
+    pool: Option<&crate::pool::Pool>,
+    out: &mut [f32],
+) {
+    let mut logits = vec![0.0f32; cfg.n_routed_experts];
+    l.gate.matvec(hidden, &mut logits, pool);
+    let (mut idx, mut w) = (Vec::new(), Vec::new());
+    route(
+        &logits,
+        l.gate_bias.as_deref(),
+        cfg.top_k,
+        cfg.route_scale,
+        &mut idx,
+        &mut w,
+    );
+    if let Some(tbl) = &l.tid2eid {
+        // Hash layers take the experts from the table; the weights stay
+        // the scored ones the reference gathers at those indices.
+        idx = hash_route(tbl, cfg.vocab, cfg.top_k, token_id);
+    }
+    out.fill(0.0);
+    let mut acc = vec![0.0f32; cfg.dim];
+    for (e, &ei) in idx.iter().enumerate() {
+        let Some(exp) = l.experts.get(ei) else { continue };
+        run_expert(hidden, exp, cfg, w.get(e).copied().unwrap_or(0.0), pool, &mut acc);
+        for (o, a) in out.iter_mut().zip(&acc) {
+            *o += a;
+        }
+    }
+    // The shared expert always runs, at weight 1.
+    run_expert(hidden, &l.shared, cfg, 1.0, pool, &mut acc);
+    for (o, a) in out.iter_mut().zip(&acc) {
+        *o += a;
+    }
+}
+
+fn run_expert(
+    x: &[f32],
+    e: &Dsv4Expert,
+    cfg: &Dsv4Cfg,
+    weight: f32,
+    pool: Option<&crate::pool::Pool>,
+    out: &mut [f32],
+) {
+    let mut gate = vec![0.0f32; cfg.moe_inter];
+    let mut up = vec![0.0f32; cfg.moe_inter];
+    e.w1.matvec(x, &mut gate, pool);
+    e.w3.matvec(x, &mut up, pool);
+    for (g, u) in gate.iter_mut().zip(&up) {
+        let silu = *g / (1.0 + (-*g).exp());
+        *g = silu * u * weight;
+    }
+    e.w2.matvec(&gate, out, pool);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
