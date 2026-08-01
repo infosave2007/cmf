@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.44] — 2026-08-01
+
+DeepSeek-V4-Flash: the architecture, the converter that fits it on a laptop's
+disk, and a GPU path that decodes it **2.7 → 12.7 tok/s** on one card without
+moving a digit of the answer. Also a thread-pool bug that had been quietly
+single-threading every short job in the engine.
+
+### Added
+- **`deepseek_v4` architecture** — hyper-connections with a Sinkhorn mix,
+  double-LoRA attention, a 512-wide shared KV, the learned attention sink, an
+  overlapping KV compressor, the sparse indexer, grouped low-rank output and
+  hash-routed MoE layers. Numerical parity against a NumPy transcription of
+  the reference forward (1.6e-3), then against the CPU at every step.
+  Published: `infosave/DeepSeek-V4-Flash-0731-cmf`, q4tp 158 GB and q2tp
+  112 GB.
+- **`CmfStreamWriter`** — conversion writes each payload ONCE, appending and
+  patching the head afterwards, so a 158 GB model no longer needs 276 GB of
+  disk to be born. `convert --resume` continues from a per-shard checkpoint,
+  the download included.
+- **GPU frames for DeepSeek-V4** (`CMF_DSV4_GPU_ATTN=1`,
+  `CMF_DSV4_GPU_MOE2=1`): the attention block and the MoE block each in ONE
+  submission, with the experts resident. Perplexity 5.211 against the CPU's
+  5.211 on the release checkpoint.
+- **Whole-layer frame** (`CMF_DSV4_GPU_LAYER=1`) — one submission per layer,
+  hyper-connections and the router on the device. Correct and, on a card that
+  cannot hold every expert, slower than the two frames; see below.
+- **Routing field tools**: `CMF_MOE_STATS` records it, `CMF_MOE_MASK` /
+  `CMF_MOE_MASK_COVER` preview a restriction, `cortiq gpu` says what the
+  backend can see, `CMF_DSV4_PROFILE` splits a token into attention, experts,
+  hyper-connections and head.
+
+### Changed
+- **Thread pool grain** — `grain = (rows / (workers*8)).max(32)` handed any
+  job with fewer than 32 rows to ONE worker while waking all the others. The
+  grain is now also capped at one chunk per worker; wide jobs keep the stride
+  they had, bit for bit. The hyper-connection projection (24 rows, twice a
+  layer) was the visible victim: 42 → 4 ms a token.
+- **Expert upload** goes straight from the mapping to the queue instead of
+  through a per-layer gather buffer — 94 GB of copying that bought nothing.
+  Short generations gained 40%.
+- **Quantizer**: the group scale is chosen by error rather than by absmax —
+  25% less noise at 2 bits, 6% at 4, same bytes. `q2tp` rung 0 is an exact
+  zero, because a pruned group must not come back as dither.
+
+### Fixed
+- **RoPE pairs ADJACENT coordinates**, not halves. The two agree exactly at
+  position 0 and nowhere else, which is why every short test passed.
+- **The tokenizer applies every `Split` of a `Sequence`**, not just the first.
+- **A declared MTP head is not a present one** — the loader now checks.
+- **`const_buf` is keyed on a host address**, which is sound for model weights
+  and wrong for anything built per call: the MoE bias, assembled per layer,
+  had every layer routing with layer zero's bias.
+- **`shared` is a reserved word in WGSL** — naming a local that compiled and
+  then failed pipeline creation, which takes the whole context down. Every
+  GPU test "passed" by skipping; they now panic instead.
+
+### Known limitations
+- The per-expert cold split (`CMF_DSV4_COLD_CPU=1`, hot experts resident and
+  the rest finished on the host) is off by default: on a partial packing the
+  router still ranges over only the packed set on some layers. Five suspects
+  are eliminated by measurement — the weights, the readback, both caches, the
+  full-packing path — and `CMF_DSV4_PACK_MAX=N` reproduces it on a toy in
+  seconds.
+- The whole-layer frame is correct but slower where the experts do not all
+  fit: a layer that misses runs on the host entirely. It pays once the cold
+  split above works.
+
+
 ## [0.5.43] — 2026-07-31
 
 A GPU-kernel release. Same weights, same answers, roughly half the frame:
