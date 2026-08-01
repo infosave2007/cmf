@@ -16415,6 +16415,8 @@ pub fn dsv4_attn_frame(
         None => frame_up(c, 0, bytemuck::cast_slice(&hidden[..g.dim])),
         Some(_) => frame_buf(c, 0, 4, true),
     };
+    // These three ARE model-owned and outlive the run, so address keying is
+    // sound for them — unlike anything built per call.
     let qnw = const_buf(c, bytemuck::cast_slice(&w.q_norm[..g.q_lora]));
     let sink = const_buf(c, bytemuck::cast_slice(&w.sink[..g.nh]));
     let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..g.rd / 2]));
@@ -16611,8 +16613,13 @@ pub fn dsv4_moe_frame(
 
     // ── routing, on the device, straight into the msel/mwt the kernels read ──
     let lg = frame_up(c, 16, bytemuck::cast_slice(&w.logits[..n_pack]));
+    // NOT const_buf: that cache is keyed on the host ADDRESS, which is only
+    // meaningful for model weights that outlive the process. The bias arrives
+    // in a Vec built per layer, and the allocator hands back the same address
+    // layer after layer — so every layer was routed with layer zero's bias.
+    // The toys never caught it because they carry no expert_bias at all.
     let bs = match w.bias {
-        Some(b) if b.len() >= n_pack => const_buf(c, bytemuck::cast_slice(&b[..n_pack])),
+        Some(b) if b.len() >= n_pack => frame_up(c, 25, bytemuck::cast_slice(&b[..n_pack])),
         _ => lg.clone(),
     };
     let mk = frame_buf(c, 17, n_pack * 4, true);
