@@ -5111,7 +5111,10 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
     // flags' upper bits — writing `n` there pointed the kernel past the end
     // of the buffer at whatever followed.
     let shared_slot = rt_p.flags >> 8u;
-    if (pin_shared && lid == 0u) { rt_idx[k] = shared_slot; rt_w[k] = 1.0; }
+    if (pin_shared && lid == 0u) {
+        rt_idx[k] = shared_slot;
+        rt_w[k] = 1.0;
+    }
     // Same reason: the zero-fill is a storage write that the ranking lanes
     // must not race with.
     storageBarrier();
@@ -5189,6 +5192,7 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
 
     // Normalisation is a handful of terms; one lane keeps the add order fixed.
     if (lid == 0u) {
+
         var cnt = 0u;
         for (var j = 0u; j < k; j = j + 1u) {
             if (rt_used[j] == 1u) { cnt = cnt + 1u; }
@@ -17298,6 +17302,13 @@ pub fn dsv4_moe_frame(
 
     // ── routing, on the device, straight into the msel/mwt the kernels read ──
     let lg = frame_up(c, 16, bytemuck::cast_slice(w.logits));
+    // KNOWN DEFECT, cold path only: nothing the kernel writes into rt_cold
+    // reaches the host. Proved by writing an UNCONDITIONAL value there and
+    // reading back all-empty, so the router is not the suspect — the readback
+    // of that buffer is. Everything else about the cold path checks out: the
+    // remap arrives correct ([0..7, MAX, MAX, ...]), subset is true, the
+    // flags carry bit 4 and the shared slot. Start there next time.
+    //
     // NOT const_buf: that cache is keyed on the host ADDRESS, which is only
     // meaningful for model weights that outlive the process. The bias arrives
     // in a Vec built per layer, and the allocator hands back the same address
@@ -17332,7 +17343,25 @@ pub fn dsv4_moe_frame(
         | 8 // always pin the shared slot: these kernels take a fixed count
         | ((subset as u32) << 4)
         | ((n_pack as u32) << 8); // where the shared expert actually sits
-    let rp = uniform_mixed(c, [n_pack as u32, g.top_k as u32, rflags], g.route_scale);
+    if std::env::var("CMF_DSV4_MOE_CHECK").is_ok() {
+        eprintln!(
+            "[маршрут] n_all={n_all} n_pack={n_pack} subset={subset} flags={rflags} \
+             remap[0..12]={:?}",
+            w.remap.map(|r| &r[..12.min(r.len())])
+        );
+    }
+    // Ranking ranges over EVERY expert when the packing is a subset — that is
+    // the whole point. Passing n_pack here silently turned it back into a
+    // mask that also indexed the packed buffer with global ids.
+    let rp = uniform_mixed(
+        c,
+        [
+            if subset { n_all as u32 } else { n_pack as u32 },
+            g.top_k as u32,
+            rflags,
+        ],
+        g.route_scale,
+    );
 
     let stride16 = |rows: usize, cols: usize, q2: bool| -> u32 {
         let dt = if q2 {
