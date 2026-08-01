@@ -1009,11 +1009,55 @@ pub fn rms_weighted(v: &mut [f32], w: &[f32], eps: f32) {
 
 /// The MoE half of a block: route, run the chosen experts plus the shared
 /// one, and sum. `token_id` is only read on the hash layers.
+/// Per-layer expert-selection counts, the routing field a task-conditional
+/// expert set is derived from (`CMF_MOE_STATS`). The generic MoE path keeps
+/// these on its `MoeFfn`; this architecture has its own experts and never
+/// touches that struct, so without this the field cannot be recorded for
+/// DeepSeek-V4 at all — and its hash layers already make defrag useless, so
+/// the only interesting question is what the OTHER forty layers do.
+///
+/// Decode drives this from one thread; the pool parallelizes inside the
+/// matvecs, below this point.
+thread_local! {
+    static ROUTE_COUNTS: std::cell::RefCell<Vec<Vec<u64>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn route_stats_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_MOE_STATS").is_ok())
+}
+
+fn record_route(li: usize, n_layers_hint: usize, n_experts: usize, idx: &[usize]) {
+    ROUTE_COUNTS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() <= li.max(n_layers_hint) {
+            c.resize(li.max(n_layers_hint) + 1, Vec::new());
+        }
+        let row = &mut c[li];
+        if row.len() < n_experts {
+            row.resize(n_experts, 0);
+        }
+        for &e in idx {
+            if e < row.len() {
+                row[e] += 1;
+            }
+        }
+    });
+}
+
+/// Take the recorded routing field, leaving the counters empty.
+pub fn take_route_counts() -> Vec<Vec<u64>> {
+    ROUTE_COUNTS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
 pub fn moe_step(
     hidden: &[f32],
     l: &Dsv4Layer,
     cfg: &Dsv4Cfg,
     token_id: u32,
+    // Layer index — only used to bucket routing statistics.
+    li: usize,
     pool: Option<&crate::pool::Pool>,
     out: &mut [f32],
 ) {
@@ -1032,6 +1076,9 @@ pub fn moe_step(
         &mut idx,
         &mut w,
     );
+    if route_stats_on() {
+        record_route(li, 0, cfg.n_routed_experts, &idx);
+    }
     out.fill(0.0);
     let mut acc = vec![0.0f32; cfg.dim];
     for (e, &ei) in idx.iter().enumerate() {
@@ -1149,7 +1196,7 @@ pub fn forward_token(
             &l.ffn_norm,
             cfg,
             &mut scratch,
-            |folded, out| moe_step(folded, l, cfg, token_id, pool, out),
+            |folded, out| moe_step(folded, l, cfg, token_id, li, pool, out),
         );
         if trace_on() {
             let bad = state.iter().filter(|v| !v.is_finite()).count();

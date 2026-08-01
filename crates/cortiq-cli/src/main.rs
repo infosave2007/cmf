@@ -1834,8 +1834,31 @@ fn dump_moe_stats(pipeline: &Pipeline) -> anyhow::Result<()> {
                 parts.push(format!("\"{li}\":[{}]", counts.join(",")));
             }
         }
-        std::fs::write(&path, format!("{{{}}}", parts.join(",")))?;
-        println!("router MoE stats → {path} ({} layers)", parts.len());
+        // Only claim a dump when there is one: an architecture with its own
+        // expert stack is handled below, and writing "{}" here first made
+        // the log say 0 layers over a file that had forty.
+        if !parts.is_empty() {
+            std::fs::write(&path, format!("{{{}}}", parts.join(",")))?;
+            println!("router MoE stats → {path} ({} layers)", parts.len());
+        }
+    }
+    if let Ok(path) = std::env::var("CMF_MOE_STATS") {
+        // Architectures with their own expert stack keep their counters
+        // there, not on a MoeFfn the generic loop can see.
+        let own = cortiq_engine::dsv4::take_route_counts();
+        if !own.is_empty() {
+            let parts: Vec<String> = own
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| !r.is_empty())
+                .map(|(li, r)| {
+                    let c: Vec<String> = r.iter().map(u64::to_string).collect();
+                    format!("\"{li}\":[{}]", c.join(","))
+                })
+                .collect();
+            std::fs::write(&path, format!("{{{}}}", parts.join(",")))?;
+            println!("router MoE stats → {path} ({} layers, dsv4)", parts.len());
+        }
     }
     if let Ok(path) = std::env::var("CMF_RMS_TRACE") {
         let mut parts = Vec::new();
