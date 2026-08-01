@@ -2106,6 +2106,14 @@ fn moe_frame(
     // Routing ranges over EVERY expert; the remap turns a winner into a slot
     // or marks it cold. Nothing is masked, so nothing is lost.
     let subset = pk.globals.len() < cfg.n_routed_experts;
+    if std::env::var("CMF_DSV4_MOE_CHECK").is_ok() {
+        eprintln!(
+            "[упаковка] слой {li}: globals={} n_routed={} subset={subset} remap.len={}",
+            pk.globals.len(),
+            cfg.n_routed_experts,
+            pk.remap.len()
+        );
+    }
     let lg: Vec<f32> = if subset {
         logits.to_vec()
     } else {
@@ -2142,6 +2150,18 @@ fn moe_frame(
     // The picks the card had no room for, finished here and added in. Their
     // weights already carry the top-k normalisation the device applied.
     if std::env::var("CMF_DSV4_MOE_CHECK").is_ok() {
+        let (mut ci, mut cw) = (Vec::new(), Vec::new());
+        route(
+            logits,
+            l.gate_bias.as_deref(),
+            cfg.top_k,
+            cfg.route_scale,
+            forced,
+            None,
+            &mut ci,
+            &mut cw,
+        );
+        eprintln!("[выбор CPU] слой {li}: {ci:?} веса {cw:?}");
         let csum: f32 = cold.iter().map(|c| c.1).sum();
         eprintln!(
             "[холодные] слой {li}: вернулось {} из {} | сумма холодных {csum:.4} | \

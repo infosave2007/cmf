@@ -17418,7 +17418,13 @@ pub fn dsv4_moe_frame(
     // index, which is unique per layer and already at hand.
     let lkey = w.experts.first().map(|e| e.0).unwrap_or(0);
     {
-        let bind = cached_bind(c, (40, 0, lkey), || {
+        // NOT cached. This group holds `rp`, a CONTENT-keyed uniform: change a
+        // flag and the uniform becomes a different buffer while the cached
+        // group keeps pointing at the old one — the layer then routes with
+        // yesterday's flags forever. Encoding it costs 0.01 ms a layer; being
+        // wrong costs a model.
+        let _ = lkey;
+        let bind = {
             c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &c.moe_route.get_bind_group_layout(0),
@@ -17435,7 +17441,7 @@ pub fn dsv4_moe_frame(
                     bind_buf(9, &coldb),
                 ],
             })
-        });
+        };
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
             timestamp_writes: None,
