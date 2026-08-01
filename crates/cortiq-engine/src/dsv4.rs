@@ -945,7 +945,17 @@ pub(crate) mod prof {
 
     pub static ATTN_NS: AtomicU64 = AtomicU64::new(0);
     pub static MOE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
     pub static TOKENS: AtomicU64 = AtomicU64::new(0);
+
+    /// One token = one visit to layer zero. Counting `moe_step` calls instead
+    /// counts layers.
+    pub fn note_layer(li: usize) {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        if li == 0 {
+            TOKENS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     static REPORT: AtomicBool = AtomicBool::new(false);
 
     pub fn on() -> bool {
@@ -959,17 +969,23 @@ pub(crate) mod prof {
         if !on() || REPORT.swap(true, Ordering::Relaxed) {
             return;
         }
-        let (a, m, t) = (
+        // CALLS counts layer visits, not tokens — dividing by it and calling
+        // the result "per token" is off by the layer count, which is 43 on
+        // the release and reads as a plausible number either way.
+        let calls = CALLS.load(Ordering::Relaxed).max(1);
+        let toks = TOKENS.load(Ordering::Relaxed).max(1);
+        let (a, m) = (
             ATTN_NS.load(Ordering::Relaxed) as f64 / 1e6,
             MOE_NS.load(Ordering::Relaxed) as f64 / 1e6,
-            TOKENS.load(Ordering::Relaxed).max(1) as f64,
         );
         eprintln!(
-            "[dsv4-профиль] на токен: внимание {:.1} мс, MoE {:.1} мс, \
-             прочее вне замера; всего слоёв-вызовов {}",
-            a / t,
-            m / t,
-            TOKENS.load(Ordering::Relaxed)
+            "[dsv4-профиль] {calls} вызовов слоя за {toks} токенов | \
+             на вызов: внимание {:.2} мс, MoE {:.2} мс | \
+             на токен: внимание {:.0} мс, MoE {:.0} мс (прочее вне замера)",
+            a / calls as f64,
+            m / calls as f64,
+            a / toks as f64,
+            m / toks as f64,
         );
     }
 }
@@ -1399,8 +1415,10 @@ impl Drop for Charge {
 fn scopeguard_attn(t: Option<std::time::Instant>) -> Charge {
     Charge(t, &prof::ATTN_NS)
 }
-fn scopeguard_moe(t: Option<std::time::Instant>) -> Charge {
-    prof::TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+fn scopeguard_moe(t: Option<std::time::Instant>, li: usize) -> Charge {
+    if t.is_some() {
+        prof::note_layer(li);
+    }
     Charge(t, &prof::MOE_NS)
 }
 
@@ -1415,7 +1433,7 @@ pub fn moe_step(
     out: &mut [f32],
 ) {
     let _t0 = prof::on().then(std::time::Instant::now);
-    let _guard = scopeguard_moe(_t0);
+    let _guard = scopeguard_moe(_t0, li);
     let mut logits = vec![0.0f32; cfg.n_routed_experts];
     l.gate.matvec(hidden, &mut logits, pool);
     let (mut idx, mut w) = (Vec::new(), Vec::new());
