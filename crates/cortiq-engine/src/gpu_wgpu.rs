@@ -13380,6 +13380,38 @@ fn encode_q4tp_mv4(
     pass.dispatch_workgroups((rows as u32).div_ceil(per_wg).min(MAX_WG), 1, 1);
 }
 
+/// The one-row q4tp kernel, which is the one `gpu_q4tp_parity` blesses.
+/// `encode_q4tp_mv4` picks a wider variant by shape; when a frame has to
+/// agree with the CPU to the last bit, agreement beats throughput.
+fn encode_q4tp_mv1(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+) {
+    let p_buf = uniform_u32x4(c, [(cols / 32) as u32, rows as u32, cols as u32, 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.q4tp_mv.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, weight),
+            bind_buf(1, xs),
+            bind_buf(2, y),
+            bind_buf(3, &p_buf),
+        ],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.q4tp_mv);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+}
+
 fn encode_q1t_like(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
@@ -15943,9 +15975,9 @@ pub fn dsv4_attn_frame(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("dsv4-attn"),
         });
-    encode_q4tp_mv4(c, &mut enc, &wb[0], &hb, &qr, g.q_lora, g.dim);
+    encode_q4tp_mv1(c, &mut enc, &wb[0], &hb, &qr, g.q_lora, g.dim);
     encode_rmsnorm(c, &mut enc, &qr, &qnw, &qn, g.q_lora, g.eps);
-    encode_q4tp_mv4(c, &mut enc, &wb[1], &qn, &q, g.nh * g.hd, g.q_lora);
+    encode_q4tp_mv1(c, &mut enc, &wb[1], &qn, &q, g.nh * g.hd, g.q_lora);
     encode_rope_heads(
         c, &mut enc, &q, &freq, &posb, g.nh, g.hd, g.rd, true, false,
     );
@@ -15996,7 +16028,7 @@ pub fn dsv4_attn_frame(
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
     }
-    encode_q4tp_mv4(
+    encode_q4tp_mv1(
         c,
         &mut enc,
         &wb[3],
