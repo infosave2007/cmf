@@ -4892,6 +4892,109 @@ fn top_k_index(@builtin(local_invocation_index) lid: u32) {
     }
 }
 
+// ── MoE routing: sqrt-softplus, noaux_tc bias, top-k (DeepSeek-V4) ──────────
+//
+// The bias shifts the CHOICE and never the weight: the weight of a chosen
+// expert is its pre-bias score. Swapping those two — an easy thing to do when
+// the bias is right there — leaves a model that still speaks and routes
+// slightly wrong forever.
+//
+// Ranking replaces the repeated argmax and gives selection order for free:
+// rank i = how many experts beat it, an equal score counting only from a
+// lower index, which is precisely what "first maximum wins" means. Ranks of
+// the finite entries are dense from zero, so the count is just how many
+// slots got filled.
+
+struct RtP { n: u32, top_k: u32, flags: u32, scale: f32 };
+// flags: 1 = bias present, 2 = mask present, 4 = indices forced (hash layers)
+
+@group(0) @binding(0) var<storage, read>       rt_s      : array<f32>;   // n
+@group(0) @binding(1) var<storage, read>       rt_bias   : array<f32>;   // n
+@group(0) @binding(2) var<storage, read>       rt_mask   : array<u32>;   // n
+@group(0) @binding(3) var<storage, read>       rt_forced : array<u32>;   // top_k
+@group(0) @binding(4) var<storage, read_write> rt_idx    : array<u32>;   // top_k
+@group(0) @binding(5) var<storage, read_write> rt_w      : array<f32>;   // top_k
+@group(0) @binding(6) var<storage, read_write> rt_cnt    : array<u32>;   // 1
+@group(0) @binding(7) var<uniform>             rt_p      : RtP;
+
+var<workgroup> rt_sc:   array<f32, 1024>;   // sqrt(softplus(score))
+var<workgroup> rt_sh:   array<f32, 1024>;   // the same, biased and masked
+var<workgroup> rt_used: array<u32, 64>;
+
+@compute @workgroup_size(256)
+fn moe_route(@builtin(local_invocation_index) lid: u32) {
+    let n = rt_p.n;
+    let k = rt_p.top_k;
+    let has_bias = (rt_p.flags & 1u) != 0u;
+    let has_mask = (rt_p.flags & 2u) != 0u;
+    let forced = (rt_p.flags & 4u) != 0u;
+
+    if (lid < k) { rt_used[lid] = 0u; }
+    var i = lid;
+    loop {
+        if (i >= n) { break; }
+        let v = rt_s[i];
+        // softplus, guarded past 20 the way the reference's F.softplus is
+        var sp = v;
+        if (v <= 20.0) { sp = log(1.0 + exp(v)); }
+        let sc = sqrt(sp);
+        rt_sc[i] = sc;
+        var sh = sc;
+        if (has_bias) { sh = sh + rt_bias[i]; }
+        if (has_mask && rt_mask[i] == 0u) { sh = KP_NINF; }
+        rt_sh[i] = sh;
+        i = i + 256u;
+    }
+    workgroupBarrier();
+
+    if (forced) {
+        if (lid < k) {
+            let e = rt_forced[lid];
+            rt_idx[lid] = e;
+            var w = 0.0;
+            if (e < n) { w = rt_sc[e]; }
+            rt_w[lid] = w;
+            rt_used[lid] = 1u;
+        }
+    } else {
+        var m = lid;
+        loop {
+            if (m >= n) { break; }
+            let si = rt_sh[m];
+            if (si > KP_NINF) {
+                var rank = 0u;
+                for (var j = 0u; j < n; j = j + 1u) {
+                    let sj = rt_sh[j];
+                    if (sj > KP_NINF) {
+                        if (sj > si || (sj == si && j < m)) { rank = rank + 1u; }
+                    }
+                }
+                if (rank < k) {
+                    rt_idx[rank] = m;
+                    rt_w[rank] = rt_sc[m];
+                    rt_used[rank] = 1u;
+                }
+            }
+            m = m + 256u;
+        }
+    }
+    workgroupBarrier();
+
+    // Normalisation is a handful of terms; one lane keeps the add order fixed.
+    if (lid == 0u) {
+        var cnt = 0u;
+        for (var j = 0u; j < k; j = j + 1u) {
+            if (rt_used[j] == 1u) { cnt = cnt + 1u; }
+        }
+        rt_cnt[0] = cnt;
+        var sum = 0.0;
+        for (var j = 0u; j < cnt; j = j + 1u) { sum = sum + rt_w[j]; }
+        if (sum > 0.0) {
+            for (var j = 0u; j < cnt; j = j + 1u) { rt_w[j] = rt_w[j] / sum * rt_p.scale; }
+        }
+    }
+}
+
 // ── Sparse attention over an index list (DeepSeek-V4) ───────────────────────
 //
 // Not the sliding-window attention the canonical graph encodes: the keys are
@@ -5368,6 +5471,7 @@ struct Ctx {
     kv_pool: wgpu::ComputePipeline,
     index_scores: wgpu::ComputePipeline,
     top_k_index: wgpu::ComputePipeline,
+    moe_route: wgpu::ComputePipeline,
     sparse_attend: wgpu::ComputePipeline,
     hc_pre_fold: wgpu::ComputePipeline,
     hc_post_expand: wgpu::ComputePipeline,
@@ -5853,6 +5957,7 @@ fn init() -> Result<Ctx, String> {
     let kv_pool = pipe("kv_pool");
     let index_scores = pipe("index_scores");
     let top_k_index = pipe("top_k_index");
+    let moe_route = pipe("moe_route");
     let sparse_attend = pipe("sparse_attend");
     let hc_pre_fold = pipe("hc_pre_fold");
     let hc_post_expand = pipe("hc_post_expand");
@@ -6058,6 +6163,7 @@ fn init() -> Result<Ctx, String> {
         kv_pool,
         index_scores,
         top_k_index,
+        moe_route,
         sparse_attend,
         hc_pre_fold,
         hc_post_expand,
@@ -12717,6 +12823,12 @@ fn uniform_u32x4(c: &Ctx, v: [u32; 4]) -> wgpu::Buffer {
     b
 }
 
+/// Three words and a float, in one uniform. The cache is keyed on the bits,
+/// which is exactly right: two params differ iff their bytes differ.
+fn uniform_mixed(c: &Ctx, v: [u32; 3], f: f32) -> wgpu::Buffer {
+    uniform_u32x4(c, [v[0], v[1], v[2], f.to_bits()])
+}
+
 fn rw_f32(c: &Ctx, n: usize, copy_src: bool) -> wgpu::Buffer {
     let usage = if copy_src {
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC
@@ -15483,6 +15595,112 @@ pub fn top_k_for_test(scores: &[f32], k: usize, out: &mut Vec<u32>) -> bool {
         let cnt = (words[kk] as usize).min(kk);
         out.clear();
         out.extend_from_slice(&words[..cnt]);
+        ok = true;
+    }
+    stage.unmap();
+    drop(sc);
+    ok
+}
+
+/// MoE routing on the device: scores in, chosen experts and their normalised
+/// weights out, in selection order. `forced` is the hash layers' table row.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_route_for_test(
+    scores: &[f32],
+    bias: Option<&[f32]>,
+    mask: Option<&[bool]>,
+    forced: Option<&[usize]>,
+    top_k: usize,
+    route_scale: f32,
+    idx_out: &mut Vec<usize>,
+    w_out: &mut Vec<f32>,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let n = scores.len();
+    if n == 0 || n > 1024 || top_k == 0 || top_k > 64 {
+        return false;
+    }
+    let sb = storage_bytes(c, bytemuck::cast_slice(scores));
+    let bb = match bias {
+        Some(b) if b.len() >= n => storage_bytes(c, bytemuck::cast_slice(&b[..n])),
+        _ => sb.clone(),
+    };
+    let mb = match mask {
+        Some(m) if m.len() >= n => {
+            let v: Vec<u32> = m[..n].iter().map(|&x| x as u32).collect();
+            storage_bytes(c, bytemuck::cast_slice(&v))
+        }
+        _ => storage_bytes(c, bytemuck::cast_slice(&vec![1u32; n])),
+    };
+    let fb = match forced {
+        Some(f) if f.len() >= top_k => {
+            let v: Vec<u32> = f[..top_k].iter().map(|&x| x as u32).collect();
+            storage_bytes(c, bytemuck::cast_slice(&v))
+        }
+        _ => storage_bytes(c, bytemuck::cast_slice(&vec![0u32; top_k])),
+    };
+    let ib = rw_f32(c, top_k, true);
+    let wb = rw_f32(c, top_k, true);
+    let cb = rw_f32(c, 1, true);
+    let flags = (bias.is_some_and(|b| b.len() >= n) as u32)
+        | ((mask.is_some_and(|m| m.len() >= n) as u32) << 1)
+        | ((forced.is_some_and(|f| f.len() >= top_k) as u32) << 2);
+    let p = uniform_mixed(c, [n as u32, top_k as u32, flags], route_scale);
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("route") });
+    {
+        let layout = c.moe_route.get_bind_group_layout(0);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                bind_buf(0, &sb),
+                bind_buf(1, &bb),
+                bind_buf(2, &mb),
+                bind_buf(3, &fb),
+                bind_buf(4, &ib),
+                bind_buf(5, &wb),
+                bind_buf(6, &cb),
+                bind_buf(7, &p),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.moe_route);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    // idx | weights | count, one map.
+    let bytes = ((2 * top_k + 1) * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        bytes,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "route-stage",
+    );
+    enc.copy_buffer_to_buffer(&ib, 0, &stage, 0, (top_k * 4) as u64);
+    enc.copy_buffer_to_buffer(&wb, 0, &stage, (top_k * 4) as u64, (top_k * 4) as u64);
+    enc.copy_buffer_to_buffer(&cb, 0, &stage, (2 * top_k * 4) as u64, 4);
+    c.queue.submit(Some(enc.finish()));
+    let slice = stage.slice(..bytes);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return false;
+    }
+    let mut ok = false;
+    if let Ok(data) = slice.get_mapped_range() {
+        let words: &[u32] = bytemuck::cast_slice(&data[..bytes as usize]);
+        let ws: &[f32] = bytemuck::cast_slice(&data[top_k * 4..2 * top_k * 4]);
+        let cnt = (words[2 * top_k] as usize).min(top_k);
+        idx_out.clear();
+        w_out.clear();
+        idx_out.extend(words[..cnt].iter().map(|&x| x as usize));
+        w_out.extend_from_slice(&ws[..cnt]);
         ok = true;
     }
     stage.unmap();
