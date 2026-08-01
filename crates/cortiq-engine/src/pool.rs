@@ -95,6 +95,24 @@ fn spin_budget_from_env() -> usize {
         .unwrap_or(4000)
 }
 
+/// Rows per chunk: enough chunks to balance, large enough to keep the SDOT
+/// inner loop and the prefetcher in their stride — and never so coarse that
+/// ONE worker takes the whole job.
+///
+/// That last clause was missing. The floor was a flat 32, so any job with
+/// fewer than 32 rows went entirely to whichever worker grabbed the cursor
+/// first while the other 48 were woken, found nothing, and left. The
+/// hyper-connection projection has 24 rows and is called 86 times a token:
+/// it paid the full price of a fan-out and ran single-threaded.
+fn grain_for(rows: usize, workers: usize) -> usize {
+    if rows == 0 || workers <= 1 {
+        return rows.max(1);
+    }
+    let balanced = (rows / (workers * 8)).max(32);
+    // One chunk per worker at the very least.
+    balanced.min(rows.div_ceil(workers)).max(1)
+}
+
 impl Pool {
     pub fn new(n_workers: usize) -> Self {
         Self::with_spin(n_workers, spin_budget_from_env())
@@ -285,9 +303,7 @@ impl Pool {
     /// single grain. Row ranges stay disjoint and each row's dot is
     /// computed exactly as in the serial path → bit-identical output.
     pub fn run_rows(&self, rows: usize, f: &(dyn Fn(usize, usize) + Sync)) {
-        // Enough chunks to balance, large enough to keep the SDOT inner
-        // loop and the hardware prefetcher in their stride.
-        let grain = (rows / ((self.threads.len() + 1) * 8)).max(32);
+        let grain = grain_for(rows, self.threads.len() + 1);
         let next = AtomicUsize::new(0);
         self.run(&|_w, _n| loop {
             let start = next.fetch_add(grain, Ordering::Relaxed);
@@ -310,7 +326,7 @@ impl Pool {
         if total == 0 {
             return;
         }
-        let grain = (total / ((self.threads.len() + 1) * 8)).max(32);
+        let grain = grain_for(total, self.threads.len() + 1);
         let next = AtomicUsize::new(0);
         self.run(&|_w, _n| loop {
             let s = next.fetch_add(grain, Ordering::Relaxed);
@@ -744,5 +760,24 @@ mod tests {
         for (i, h) in hits.iter().enumerate() {
             assert_eq!(h.load(Ordering::Relaxed), 20, "participant {i} missed runs");
         }
+    }
+}
+
+#[cfg(test)]
+mod grain_tests {
+    use super::grain_for;
+
+    #[test]
+    fn a_short_job_still_reaches_every_worker() {
+        // 24 rows, 49 workers: the old flat floor of 32 handed all 24 to the
+        // first worker and woke the rest for nothing.
+        assert_eq!(grain_for(24, 49), 1);
+        // Wide jobs keep the stride the SDOT loop wants.
+        assert_eq!(grain_for(4096, 49), 32);
+        assert_eq!(grain_for(32768, 49), 83);
+        // Degenerate shapes must not divide by zero or return zero.
+        assert_eq!(grain_for(0, 49), 1);
+        assert_eq!(grain_for(7, 1), 7);
+        assert!(grain_for(1, 49) >= 1);
     }
 }
