@@ -4549,6 +4549,81 @@ fn dit_unstack(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 
+// ── Per-head RMS and the rope tail (DeepSeek-V4) ────────────────────────────
+//
+// Three places need this and they differ only in flags: the queries take a
+// second RMS on each head after wq_b and then a forward rotation; the shared
+// KV vector takes a forward rotation alone; and attention's output takes the
+// INVERSE rotation, a detail no naming convention would suggest.
+//
+// The rotation pairs ADJACENT coordinates — the reference builds its complex
+// numbers with unflatten(-1, (2)) — and pairing halves instead agrees with it
+// exactly at position 0 and nowhere else. That cost a night once.
+
+struct RpP { nh: u32, hd: u32, rd: u32, flags: u32 };   // flags: 1 = rms, 2 = inverse
+@group(0) @binding(0) var<storage, read_write> rp_x    : array<f32>;   // nh*hd
+@group(0) @binding(1) var<storage, read>       rp_freq : array<f32>;   // rd/2
+@group(0) @binding(2) var<uniform>             rp_p    : RpP;
+@group(0) @binding(3) var<storage, read>       rp_pos  : array<f32>;   // [position, eps]
+
+var<workgroup> rp_red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn rope_heads(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    if (h >= rp_p.nh) { return; }
+    let hd = rp_p.hd;
+    let rd = rp_p.rd;
+    let b = h * hd;
+
+    if ((rp_p.flags & 1u) != 0u) {
+        var acc = 0.0;
+        var i = lid;
+        loop {
+            if (i >= hd) { break; }
+            let v = rp_x[b + i];
+            acc = acc + v * v;
+            i = i + 256u;
+        }
+        rp_red[lid] = acc;
+        workgroupBarrier();
+        var stride = 128u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid < stride) { rp_red[lid] = rp_red[lid] + rp_red[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        let inv = inverseSqrt(rp_red[0] / f32(hd) + rp_pos[1]);
+        workgroupBarrier();
+        var j = lid;
+        loop {
+            if (j >= hd) { break; }
+            rp_x[b + j] = rp_x[b + j] * inv;
+            j = j + 256u;
+        }
+        workgroupBarrier();
+    }
+
+    // The tail only, adjacent pairs.
+    let base = b + hd - rd;
+    let pos = rp_pos[0];
+    var t = lid;
+    loop {
+        if (t >= rd / 2u) { break; }
+        let th = pos * rp_freq[t];
+        var sn = sin(th);
+        let cs = cos(th);
+        if ((rp_p.flags & 2u) != 0u) { sn = -sn; }
+        let a = rp_x[base + 2u * t];
+        let c = rp_x[base + 2u * t + 1u];
+        rp_x[base + 2u * t] = a * cs - c * sn;
+        rp_x[base + 2u * t + 1u] = a * sn + c * cs;
+        t = t + 256u;
+    }
+}
+
 // ── Sparse attention over an index list (DeepSeek-V4) ───────────────────────
 //
 // Not the sliding-window attention the canonical graph encodes: the keys are
@@ -5019,6 +5094,8 @@ struct Ctx {
     /// between blocks in DeepSeek-V4, where an ordinary model has a residual.
     /// Attention over an index list with a learned sink — DeepSeek-V4's,
     /// not the canonical sliding window.
+    /// Per-head RMS and the rope tail, forward or inverse.
+    rope_heads: wgpu::ComputePipeline,
     sparse_attend: wgpu::ComputePipeline,
     hc_pre_fold: wgpu::ComputePipeline,
     hc_post_expand: wgpu::ComputePipeline,
@@ -5499,6 +5576,7 @@ fn init() -> Result<Ctx, String> {
     let q1t = pipe("q1t_matvec");
     let q4b = pipe("q4b_matvec");
     let q4t_mv = pipe("q4t_matvec");
+    let rope_heads = pipe("rope_heads");
     let sparse_attend = pipe("sparse_attend");
     let hc_pre_fold = pipe("hc_pre_fold");
     let hc_post_expand = pipe("hc_post_expand");
@@ -5699,6 +5777,7 @@ fn init() -> Result<Ctx, String> {
         q1t,
         q4b,
         q4t_mv,
+        rope_heads,
         sparse_attend,
         hc_pre_fold,
         hc_post_expand,
@@ -14770,6 +14849,66 @@ mod tests {
 /// Every adapter wgpu can see, and which one would be chosen. Three times in
 /// one night the question "is the GPU actually visible?" was answered by
 /// inference from a missing log line; this answers it directly.
+/// Per-head RMS and the rope tail on the device — `rms` for the queries'
+/// second normalisation, `inverse` for attention's output.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_heads_for_test(
+    x: &mut [f32],
+    inv_freq: &[f32],
+    nh: usize,
+    hd: usize,
+    rd: usize,
+    pos: usize,
+    eps: f32,
+    rms: bool,
+    inverse: bool,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if x.len() != nh * hd || rd > hd || rd % 2 != 0 || inv_freq.len() * 2 < rd {
+        return false;
+    }
+    let xb = rw_f32(c, nh * hd, true);
+    c.queue.write_buffer(&xb, 0, bytemuck::cast_slice(x));
+    let fb = storage_bytes(c, bytemuck::cast_slice(&inv_freq[..rd / 2]));
+    let pb = storage_bytes(c, bytemuck::cast_slice(&[pos as f32, eps]));
+    let flags = (rms as u32) | ((inverse as u32) << 1);
+    let p = uniform_u32x4(c, [nh as u32, hd as u32, rd as u32, flags]);
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rope") });
+    {
+        let layout = c.rope_heads.get_bind_group_layout(0);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                bind_buf(0, &xb),
+                bind_buf(1, &fb),
+                bind_buf(2, &p),
+                bind_buf(3, &pb),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.rope_heads);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(nh as u32, 1, 1);
+    }
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        (nh * hd * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "rope-stage",
+    );
+    let ok = readback(c, enc, &xb, &stage, (nh * hd * 4) as u64, x);
+    drop(sc);
+    ok
+}
+
 /// Attention over an index list with the learned sink, on the device.
 ///
 /// Step two of the whole-token graph. Verified against `dsv4::sparse_attend`
