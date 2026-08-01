@@ -1331,6 +1331,12 @@ impl Pipeline {
                 // checkpoint loads without touching this code.
                 q_lora_rank: 0,
                 o_lora_rank: 0,
+                // Derived below from wo_a's shape — the attention output is
+                // n_heads*head_dim wide and wo_a takes one group of it per
+                // row block, so groups = width / wo_a.cols(). A pinned 8 is
+                // right for the release and wrong for anything else, which
+                // is exactly what made a toy checkpoint impossible to
+                // compare against the reference.
                 o_groups: 8,
                 hc_mult: 4,
                 hc_sinkhorn_iters: 20,
@@ -1359,6 +1365,10 @@ impl Pipeline {
             let mut cfg = cfg;
             if let Some(l0) = dl.first() {
                 cfg.q_lora_rank = l0.wq_a.rows();
+                let attn_width = arch.num_attention_heads * arch.head_dim;
+                if l0.wo_a.cols() > 0 && attn_width % l0.wo_a.cols() == 0 {
+                    cfg.o_groups = (attn_width / l0.wo_a.cols()).max(1);
+                }
                 cfg.o_lora_rank = l0.wo_b.cols() / cfg.o_groups.max(1);
                 cfg.hc_mult = (l0.hc_attn_fn.len() / l0.hc_attn_base.len().max(1)) / cfg.dim.max(1);
                 if cfg.hc_mult == 0 {

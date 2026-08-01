@@ -253,15 +253,22 @@ pub fn rope_tail(v: &mut [f32], inv_freq: &[f32], pos: usize, rd: usize, inverse
     // would wrap into an index in the billions rather than say so.
     let rd = rd.min(n) & !1;
     let base = n - rd;
-    let half = rd / 2;
-    for i in 0..half {
+    // ADJACENT pairs, not halves. The reference forms its complex numbers
+    // with `unflatten(-1, (-1, 2))` + `view_as_complex`, i.e. (x0,x1),
+    // (x2,x3), … — the interleaved convention. Half-split pairing agrees
+    // with it exactly at position 0, where the rotation is the identity,
+    // and disagrees everywhere else. That is why short answers came out
+    // right and everything longer drifted, repeated itself and could not
+    // count: every position past the first was rotated into the wrong
+    // basis.
+    for i in 0..rd / 2 {
         let theta = pos as f32 * inv_freq[i];
         let (s, c) = (theta.sin(), theta.cos());
         let s = if inverse { -s } else { s };
-        let a = v[base + i];
-        let b = v[base + i + half];
-        v[base + i] = a * c - b * s;
-        v[base + i + half] = a * s + b * c;
+        let a = v[base + 2 * i];
+        let b = v[base + 2 * i + 1];
+        v[base + 2 * i] = a * c - b * s;
+        v[base + 2 * i + 1] = a * s + b * c;
     }
 }
 
@@ -314,6 +321,14 @@ pub fn sparse_attend(
         for (o, x) in out.iter_mut().zip(v) {
             *o += w * x;
         }
+    }
+    if std::env::var("CMF_ATTN_DEBUG").is_ok() {
+        eprintln!(
+            "    [порт] позиций={} score={:?} sink={sink:.4} denom={denom:.4} |q|={:.3}",
+            idxs.iter().filter(|&&p| p != usize::MAX).count(),
+            scores.iter().map(|x| (x * 10000.0).round() / 10000.0).collect::<Vec<_>>(),
+            q.iter().map(|x| x * x).sum::<f32>().sqrt()
+        );
     }
     let inv = 1.0 / denom;
     for o in out.iter_mut() {
@@ -887,6 +902,13 @@ pub fn attention_step(
 ) {
     let (hd, rd) = (cfg.head_dim, cfg.rope_head_dim);
     let pos = st.pos;
+    if std::env::var("CMF_FREQ_DEBUG").is_ok() && li == 0 && pos == 0 {
+        eprintln!(
+            "    [порт] rd={rd} частот={} inv_freq[0..4]={:?}",
+            inv_freq.len(),
+            &inv_freq[..4.min(inv_freq.len())]
+        );
+    }
 
     // ── q: wq_a → q_norm → wq_b → per-head norm → rope tail ──
     let mut qr = vec![0.0f32; cfg.q_lora_rank];
@@ -1134,6 +1156,15 @@ pub fn moe_step(
     if route_stats_on() {
         record_route(li, 0, cfg.n_routed_experts, &idx);
     }
+    if dump_path().is_some() {
+        PICKED.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() <= li {
+                p.resize(li + 1, Vec::new());
+            }
+            p[li] = idx.clone();
+        });
+    }
     out.fill(0.0);
     let mut acc = vec![0.0f32; cfg.dim];
     for (e, &ei) in idx.iter().enumerate() {
@@ -1194,6 +1225,49 @@ fn rms_of(v: &[f32]) -> f32 {
     (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt()
 }
 
+/// `CMF_DSV4_DUMP=<path>` appends one JSON line per token: the embedding, the
+/// hyper-connection state after every layer, the folded-and-normed head input
+/// and the logits. It exists to be diffed against the reference forward on
+/// the same weights — the numerical parity this port has never had, which at
+/// toy scale is a few thousand floats and entirely tractable.
+thread_local! {
+    /// The attention body's input and output per layer, interleaved.
+    static BODY: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Experts chosen per layer for the token being decoded — the dump needs
+    /// them, because two implementations that pick DIFFERENT experts diverge
+    /// hugely for a reason that is not a bug in either.
+    static PICKED: std::cell::RefCell<Vec<Vec<usize>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn dump_path() -> Option<&'static str> {
+    static P: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    P.get_or_init(|| std::env::var("CMF_DSV4_DUMP").ok())
+        .as_deref()
+}
+
+fn dump_line(json: &str) {
+    if let Some(p) = dump_path() {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            let _ = writeln!(f, "{json}");
+        }
+    }
+}
+
+fn vec_json(v: &[f32]) -> String {
+    let mut s = String::with_capacity(v.len() * 9);
+    s.push('[');
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!("{x:.6e}"));
+    }
+    s.push(']');
+    s
+}
+
 /// One token through the whole stack.
 ///
 /// The hidden state is `hc_mult` copies of a `dim`-vector from the very
@@ -1223,6 +1297,13 @@ pub fn forward_token(
     }
 
     let mut scratch = HcScratch::new(cfg);
+    let mut dump: Vec<String> = Vec::new();
+    if dump_path().is_some() {
+        dump.push(format!("\"embed\":{}", vec_json(&emb)));
+        PICKED.with(|p| p.borrow_mut().clear());
+        BODY.with(|b| b.borrow_mut().clear());
+        dump.push(",\"layers\":[".into());
+    }
     if trace_on() {
         eprintln!(
             "[dsv4] tok={token_id} pos={} embed rms={:.5}",
@@ -1241,6 +1322,11 @@ pub fn forward_token(
             cfg,
             &mut scratch,
             |folded, out| {
+                if dump_path().is_some() {
+                    // The body's own input and output, so the reference can be
+                    // fed the port's input: then only the body can differ.
+                    BODY.with(|b| b.borrow_mut().push(vec_json(folded)));
+                }
                 // The layer's kind decides its frequencies, not the model's.
                 let freqs = if l.compressor.is_some() {
                     &g.inv_freq_compress
@@ -1248,9 +1334,21 @@ pub fn forward_token(
                     &g.inv_freq_window
                 };
                 let freqs = if freqs.is_empty() { inv_freq } else { freqs.as_slice() };
-                attention_step(folded, l, cfg, st, li, freqs, pool, out)
+                attention_step(folded, l, cfg, st, li, freqs, pool, out);
+                if dump_path().is_some() {
+                    BODY.with(|b| b.borrow_mut().push(vec_json(out)));
+                }
             },
         );
+        if dump_path().is_some() {
+            // After the attention half only — this is what separates an
+            // attention discrepancy from an expert one.
+            dump.push(format!(
+                "{}{}",
+                if li == 0 { "" } else { "," },
+                vec_json(&state)
+            ));
+        }
         // FFN half
         hc_block(
             &mut state,
@@ -1262,6 +1360,9 @@ pub fn forward_token(
             &mut scratch,
             |folded, out| moe_step(folded, l, cfg, token_id, li, pool, out),
         );
+        if dump_path().is_some() {
+            dump.push(format!(",{}", vec_json(&state)));
+        }
         if trace_on() && (st.pos % 64 == 0 || st.pos == 199) {
             eprintln!(
                 "[dsv4]  кеши слоя {li}: окно={} сжатых={} индекс={} (ratio={:?})",
@@ -1293,6 +1394,26 @@ pub fn forward_token(
     logits.clear();
     logits.resize(g.head.rows(), 0.0);
     g.head.matvec(&h, logits, pool);
+    if dump_path().is_some() {
+        dump.push("]".into());
+        let picked = PICKED.with(|p| {
+            p.borrow()
+                .iter()
+                .map(|v| format!("[{}]", v.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(",")))
+                .collect::<Vec<_>>()
+                .join(",")
+        });
+        dump.push(format!(",\"experts\":[{picked}]"));
+        let body = BODY.with(|b| b.borrow().join(","));
+        dump.push(format!(",\"attn_io\":[{body}]"));
+        dump_line(&format!(
+            "{{\"tok\":{token_id},\"pos\":{},{},\"head\":{},\"logits\":{}}}",
+            st.pos - 1,
+            dump.join(""),
+            vec_json(&h),
+            vec_json(logits)
+        ));
+    }
     if trace_on() {
         let (mut top, mut best) = (0usize, f32::NEG_INFINITY);
         for (i, &v) in logits.iter().enumerate() {

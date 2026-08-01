@@ -46,7 +46,7 @@ HC         = 4
 RATIO_MAP  = {2: 4, 3: 8}      # layer -> compress_ratio (4 => overlapping)
 INDEXER_ON = {2}
 IDX_HEADS  = 2
-IDX_HD     = 16   # >= RD, as in the release (128 vs 64)
+IDX_HD     = 64   # >= the rope tail, as in the release (128 vs 64)
 
 def vals(n, seed):
     return [math.sin((i * 7 + seed * 13) * 0.017) * 0.35 for i in range(n)]
