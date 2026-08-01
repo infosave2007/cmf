@@ -14867,8 +14867,16 @@ pub fn rope_heads_for_test(
     if x.len() != nh * hd || rd > hd || rd % 2 != 0 || inv_freq.len() * 2 < rd {
         return false;
     }
-    let xb = rw_f32(c, nh * hd, true);
-    c.queue.write_buffer(&xb, 0, bytemuck::cast_slice(x));
+    // In place: seeded from the host and read back afterwards, so the buffer
+    // needs both directions. rw_f32 gives STORAGE|COPY_SRC and refuses the
+    // write; storage_bytes gives STORAGE and refuses the read.
+    let xb = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rope-x"),
+            contents: bytemuck::cast_slice(x),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
     let fb = storage_bytes(c, bytemuck::cast_slice(&inv_freq[..rd / 2]));
     let pb = storage_bytes(c, bytemuck::cast_slice(&[pos as f32, eps]));
     let flags = (rms as u32) | ((inverse as u32) << 1);
