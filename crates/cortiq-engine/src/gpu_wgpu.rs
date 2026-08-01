@@ -17353,23 +17353,15 @@ pub fn dsv4_moe_frame(
     // Ranking ranges over EVERY expert when the packing is a subset — that is
     // the whole point. Passing n_pack here silently turned it back into a
     // mask that also indexed the packed buffer with global ids.
-    // Fresh, NOT from the content cache: the cache is keyed on the four
-    // words, which is sound in principle and is the last thing standing
-    // between "the host says n=64" and "the kernel ranked over 8".
-    let rp = {
-        let words = [
+    let rp = uniform_mixed(
+        c,
+        [
             if subset { n_all as u32 } else { n_pack as u32 },
             g.top_k as u32,
             rflags,
-            g.route_scale.to_bits(),
-        ];
-        c.device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("route-params"),
-                contents: bytemuck::cast_slice(&words),
-                usage: wgpu::BufferUsages::UNIFORM,
-            })
-    };
+        ],
+        g.route_scale,
+    );
 
     let stride16 = |rows: usize, cols: usize, q2: bool| -> u32 {
         let dt = if q2 {
