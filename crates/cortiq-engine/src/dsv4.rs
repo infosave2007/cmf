@@ -1874,6 +1874,20 @@ fn hc_fold_norm(
 
 /// `CMF_DSV4_GPU_LAYER=1`: one submission per layer instead of two, with the
 /// hyper-connection glue and the router on the device.
+///
+/// CORRECT — perplexity 5.211 against the CPU's 5.211 on the release, 128.576
+/// against 128.576 on the toy — and SLOWER on this hardware: 6.0 tok/s where
+/// the two-frame path gets 9.3. The reason is not the frame, it is the
+/// all-or-nothing granularity underneath it. A layer whose experts miss VRAM
+/// runs entirely on the host, attention included (6.5 ms a call against 0.9),
+/// and with 100 GB of experts against a 98 GB card a fifth of the layers
+/// miss. The two-frame path only loses the MoE half of those layers.
+///
+/// So the barrier it saves is real and the fallback it forces costs more. The
+/// fix is the granularity: pack the experts that FIT, route over all of them
+/// anyway, and run the few cold picks of a token on the host — per EXPERT,
+/// not per layer. Then no layer ever leaves the device and this frame wins by
+/// the 15 ms a token it was built to save.
 #[cfg(feature = "gpu")]
 fn gpu_layer_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
