@@ -4549,6 +4549,114 @@ fn dit_unstack(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 
+// ── Sparse attention over an index list (DeepSeek-V4) ───────────────────────
+//
+// Not the sliding-window attention the canonical graph encodes: the keys are
+// named by an INDEX LIST — the window's positions followed by whichever
+// compressed ones the indexer chose — and one KV vector of a single head's
+// width serves all query heads. The learned sink enters the denominator and
+// contributes nothing to the numerator, which is what lets a head attend to
+// nothing at all.
+//
+// One workgroup per head. `hd` is 512 in the release, so the accumulator
+// fits in workgroup storage and the whole head is one pass.
+
+struct SaP { nh: u32, hd: u32, m: u32, scale: f32 };
+
+@group(0) @binding(0) var<storage, read>       sa_q    : array<f32>;   // nh*hd
+@group(0) @binding(1) var<storage, read>       sa_kv   : array<f32>;   // n*hd
+@group(0) @binding(2) var<storage, read>       sa_idx  : array<u32>;   // m
+@group(0) @binding(3) var<storage, read>       sa_sink : array<f32>;   // nh
+@group(0) @binding(4) var<storage, read_write> sa_out  : array<f32>;   // nh*hd
+@group(0) @binding(5) var<uniform>             sa_p    : SaP;
+
+var<workgroup> sa_red: array<f32, 256>;
+var<workgroup> sa_acc: array<f32, 1024>;
+var<workgroup> sa_max: f32;
+var<workgroup> sa_den: f32;
+
+@compute @workgroup_size(256)
+fn sparse_attend(@builtin(workgroup_id) wid: vec3<u32>,
+                 @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    if (h >= sa_p.nh) { return; }
+    let hd = sa_p.hd;
+    let m = sa_p.m;
+    let qb = h * hd;
+
+    // max over the attended scores; the sink joins it so the exponentials
+    // below cannot overflow when it dominates.
+    var mx = sa_sink[h];
+    var t = lid;
+    loop {
+        if (t >= m) { break; }
+        let p = sa_idx[t];
+        var d = 0.0;
+        for (var k = 0u; k < hd; k = k + 1u) {
+            d = d + sa_q[qb + k] * sa_kv[p * hd + k];
+        }
+        mx = max(mx, d * sa_p.scale);
+        t = t + 256u;
+    }
+    sa_red[lid] = mx;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { sa_red[lid] = max(sa_red[lid], sa_red[lid + stride]); }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) { sa_max = sa_red[0]; }
+    workgroupBarrier();
+    let mval = sa_max;
+
+    // weighted sum, and the denominator with the sink's share
+    var k0 = lid;
+    loop {
+        if (k0 >= hd) { break; }
+        sa_acc[k0] = 0.0;
+        k0 = k0 + 256u;
+    }
+    workgroupBarrier();
+    var den = 0.0;
+    t = lid;
+    loop {
+        if (t >= m) { break; }
+        let p = sa_idx[t];
+        var d = 0.0;
+        for (var k = 0u; k < hd; k = k + 1u) {
+            d = d + sa_q[qb + k] * sa_kv[p * hd + k];
+        }
+        let w = exp(d * sa_p.scale - mval);
+        den = den + w;
+        for (var k = 0u; k < hd; k = k + 1u) {
+            // Serialised on purpose: positions are few and hd is wide, so
+            // the contention is on hd, not on m.
+            sa_acc[k] = sa_acc[k] + w * sa_kv[p * hd + k];
+        }
+        t = t + 256u;
+    }
+    sa_red[lid] = den;
+    workgroupBarrier();
+    stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { sa_red[lid] = sa_red[lid] + sa_red[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) { sa_den = sa_red[0] + exp(sa_sink[h] - mval); }
+    workgroupBarrier();
+    let inv = 1.0 / sa_den;
+    var k1 = lid;
+    loop {
+        if (k1 >= hd) { break; }
+        sa_out[qb + k1] = sa_acc[k1] * inv;
+        k1 = k1 + 256u;
+    }
+}
+
 // ── Hyper-connections on the device (DeepSeek-V4) ───────────────────────────
 //
 // The hidden state is `hc` copies of a `dim` vector, and a block folds them
@@ -4914,6 +5022,9 @@ struct Ctx {
     q4t_mv: wgpu::ComputePipeline,
     /// Hyper-connection fold (with the Sinkhorn) and expand — the join
     /// between blocks in DeepSeek-V4, where an ordinary model has a residual.
+    /// Attention over an index list with a learned sink — DeepSeek-V4's,
+    /// not the canonical sliding window.
+    sparse_attend: wgpu::ComputePipeline,
     hc_pre_fold: wgpu::ComputePipeline,
     hc_post_expand: wgpu::ComputePipeline,
     q4tp_mv: wgpu::ComputePipeline,
@@ -5393,6 +5504,7 @@ fn init() -> Result<Ctx, String> {
     let q1t = pipe("q1t_matvec");
     let q4b = pipe("q4b_matvec");
     let q4t_mv = pipe("q4t_matvec");
+    let sparse_attend = pipe("sparse_attend");
     let hc_pre_fold = pipe("hc_pre_fold");
     let hc_post_expand = pipe("hc_post_expand");
     let q4tp_mv = pipe("q4tp_matvec");
@@ -5592,6 +5704,7 @@ fn init() -> Result<Ctx, String> {
         q1t,
         q4b,
         q4t_mv,
+        sparse_attend,
         hc_pre_fold,
         hc_post_expand,
         q4tp_mv,
@@ -14662,6 +14775,74 @@ mod tests {
 /// Every adapter wgpu can see, and which one would be chosen. Three times in
 /// one night the question "is the GPU actually visible?" was answered by
 /// inference from a missing log line; this answers it directly.
+/// Attention over an index list with the learned sink, on the device.
+///
+/// Step two of the whole-token graph. Verified against `dsv4::sparse_attend`
+/// before anything depends on it: a sink that contributes to the numerator,
+/// or a denominator missing its share, changes every head's output by a
+/// factor that no generated text would reveal.
+#[allow(clippy::too_many_arguments)]
+pub fn sparse_attend_for_test(
+    q: &[f32],
+    kv: &[f32],
+    idxs: &[u32],
+    sink: &[f32],
+    scale: f32,
+    nh: usize,
+    hd: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if q.len() != nh * hd || out.len() != nh * hd || sink.len() != nh || hd > 1024 {
+        return false;
+    }
+    let qb = storage_bytes(c, bytemuck::cast_slice(q));
+    let kvb = storage_bytes(c, bytemuck::cast_slice(kv));
+    let ib = storage_bytes(c, bytemuck::cast_slice(idxs));
+    let sb = storage_bytes(c, bytemuck::cast_slice(sink));
+    let ob = rw_f32(c, nh * hd, true);
+    let p = uniform_u32x4(
+        c,
+        [nh as u32, hd as u32, idxs.len() as u32, scale.to_bits()],
+    );
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sa") });
+    {
+        let layout = c.sparse_attend.get_bind_group_layout(0);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                bind_buf(0, &qb),
+                bind_buf(1, &kvb),
+                bind_buf(2, &ib),
+                bind_buf(3, &sb),
+                bind_buf(4, &ob),
+                bind_buf(5, &p),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.sparse_attend);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(nh as u32, 1, 1);
+    }
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        (nh * hd * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "sa-stage",
+    );
+    let ok = readback(c, enc, &ob, &stage, (nh * hd * 4) as u64, out);
+    drop(sc);
+    ok
+}
+
 /// One hyper-connection join on the device: fold the copies (with the
 /// Sinkhorn) and expand them back around a block output computed elsewhere.
 ///
