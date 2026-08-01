@@ -4906,7 +4906,14 @@ fn top_k_index(@builtin(local_invocation_index) lid: u32) {
 // slots got filled.
 
 struct RtP { n: u32, top_k: u32, flags: u32, scale: f32 };
-// flags: 1 = bias present, 2 = mask present, 4 = indices forced (hash layers)
+// flags: 1 = bias present, 2 = mask present, 4 = indices forced (hash layers),
+//        8 = pin the shared expert in slot top_k with weight 1
+//
+// With bit 8 the output is the `msel`/`mwt` pair the batched expert kernels
+// read: top_k routed slots then the shared one, every slot written. Slots the
+// router could not fill (a mask that closes too much) get weight ZERO rather
+// than being left short — the kernels downstream take a fixed slot count, and
+// a stale index with a live weight is how a token gets an expert nobody chose.
 
 @group(0) @binding(0) var<storage, read>       rt_s      : array<f32>;   // n
 @group(0) @binding(1) var<storage, read>       rt_bias   : array<f32>;   // n
@@ -4929,7 +4936,9 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
     let has_mask = (rt_p.flags & 2u) != 0u;
     let forced = (rt_p.flags & 4u) != 0u;
 
-    if (lid < k) { rt_used[lid] = 0u; }
+    let shared = (rt_p.flags & 8u) != 0u;
+    if (lid < k) { rt_used[lid] = 0u; rt_idx[lid] = 0u; rt_w[lid] = 0.0; }
+    if (shared && lid == 0u) { rt_idx[k] = n; rt_w[k] = 1.0; }
     var i = lid;
     loop {
         if (i >= n) { break; }
@@ -4992,6 +5001,8 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
         if (sum > 0.0) {
             for (var j = 0u; j < cnt; j = j + 1u) { rt_w[j] = rt_w[j] / sum * rt_p.scale; }
         }
+        // The shared expert is not part of that normalisation — it rides at
+        // weight 1 whatever the router decided.
     }
 }
 
@@ -15649,6 +15660,10 @@ pub fn moe_route_for_test(
     forced: Option<&[usize]>,
     top_k: usize,
     route_scale: f32,
+    // Pin the shared expert in slot `top_k` at weight 1, and write every slot
+    // — the `msel`/`mwt` pair the batched expert kernels take. Off returns
+    // just what the router chose.
+    shared_slot: bool,
     idx_out: &mut Vec<usize>,
     w_out: &mut Vec<f32>,
 ) -> bool {
@@ -15676,12 +15691,14 @@ pub fn moe_route_for_test(
         }
         _ => storage_bytes(c, bytemuck::cast_slice(&vec![0u32; top_k])),
     };
-    let ib = rw_f32(c, top_k, true);
-    let wb = rw_f32(c, top_k, true);
+    let slots = top_k + shared_slot as usize;
+    let ib = rw_f32(c, slots, true);
+    let wb = rw_f32(c, slots, true);
     let cb = rw_f32(c, 1, true);
     let flags = (bias.is_some_and(|b| b.len() >= n) as u32)
         | ((mask.is_some_and(|m| m.len() >= n) as u32) << 1)
-        | ((forced.is_some_and(|f| f.len() >= top_k) as u32) << 2);
+        | ((forced.is_some_and(|f| f.len() >= top_k) as u32) << 2)
+        | ((shared_slot as u32) << 3);
     let p = uniform_mixed(c, [n as u32, top_k as u32, flags], route_scale);
     let mut enc = c
         .device
@@ -15711,7 +15728,7 @@ pub fn moe_route_for_test(
         pass.dispatch_workgroups(1, 1, 1);
     }
     // idx | weights | count, one map.
-    let bytes = ((2 * top_k + 1) * 4) as u64;
+    let bytes = ((2 * slots + 1) * 4) as u64;
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(
         &c.device,
@@ -15720,9 +15737,9 @@ pub fn moe_route_for_test(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "route-stage",
     );
-    enc.copy_buffer_to_buffer(&ib, 0, &stage, 0, (top_k * 4) as u64);
-    enc.copy_buffer_to_buffer(&wb, 0, &stage, (top_k * 4) as u64, (top_k * 4) as u64);
-    enc.copy_buffer_to_buffer(&cb, 0, &stage, (2 * top_k * 4) as u64, 4);
+    enc.copy_buffer_to_buffer(&ib, 0, &stage, 0, (slots * 4) as u64);
+    enc.copy_buffer_to_buffer(&wb, 0, &stage, (slots * 4) as u64, (slots * 4) as u64);
+    enc.copy_buffer_to_buffer(&cb, 0, &stage, (2 * slots * 4) as u64, 4);
     c.queue.submit(Some(enc.finish()));
     let slice = stage.slice(..bytes);
     slice.map_async(wgpu::MapMode::Read, |_| {});
@@ -15732,12 +15749,18 @@ pub fn moe_route_for_test(
     let mut ok = false;
     if let Ok(data) = slice.get_mapped_range() {
         let words: &[u32] = bytemuck::cast_slice(&data[..bytes as usize]);
-        let ws: &[f32] = bytemuck::cast_slice(&data[top_k * 4..2 * top_k * 4]);
-        let cnt = (words[2 * top_k] as usize).min(top_k);
+        let ws: &[f32] = bytemuck::cast_slice(&data[slots * 4..2 * slots * 4]);
+        // With a shared slot the caller wants every slot, filled or not; the
+        // count is what the kernels use to skip nothing.
+        let take = if shared_slot {
+            slots
+        } else {
+            (words[2 * slots] as usize).min(top_k)
+        };
         idx_out.clear();
         w_out.clear();
-        idx_out.extend(words[..cnt].iter().map(|&x| x as usize));
-        w_out.extend_from_slice(&ws[..cnt]);
+        idx_out.extend(words[..take].iter().map(|&x| x as usize));
+        w_out.extend_from_slice(&ws[..take]);
         ok = true;
     }
     stage.unmap();
