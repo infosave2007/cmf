@@ -693,6 +693,14 @@ fn encode_rows_parallel(
     });
 }
 
+/// The rung search can be turned off (`CMF_Q2TP_SEARCH=0`) so its value is
+/// measured rather than assumed. Read once per tensor — not cached for the
+/// process, or an A/B inside one test binary silently compares an arm with
+/// itself.
+fn q2tp_search() -> bool {
+    std::env::var("CMF_Q2TP_SEARCH").map(|v| v != "0").unwrap_or(true)
+}
+
 pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
     debug_assert_eq!(vals.len(), out_dim * in_dim);
     debug_assert_eq!(in_dim % GROUP_SIZE, 0);
@@ -701,6 +709,7 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
     let mut chunks = vec![0u8; out_dim * gpr * Q2TP_CHUNK];
     let mut params = vec![0u8; out_dim * 4];
     let mut codes = vec![0u8; out_dim * stride];
+    let search = q2tp_search();
 
     encode_rows_parallel(
         out_dim,
@@ -745,16 +754,45 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
         let crow = &mut *codes_row;
         for g in 0..gpr {
             // Rung 0 is the exact zero; live groups start at 1.
-            let c = if dead[g] {
+            let nominal = if dead[g] {
                 0
             } else if st <= 0.0 {
                 1
             } else {
                 1 + ((lg[g] - lo_r) / st).round_ties_even().clamp(0.0, Q2TP_LMAX as f32) as usize
             };
+            // The nominal rung comes from absmax/1.5, which pins the outer
+            // level to the largest weight — that minimises the WORST error,
+            // not the mean one, and with only four levels the difference is
+            // large. Try the neighbouring rungs and keep whichever
+            // reconstructs the group best. Costs encode time and nothing
+            // else: the layout, the decoder and the kernels are unchanged.
+            let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+            let c = if nominal == 0 || !search {
+                nominal
+            } else {
+                let mut best = (f32::INFINITY, nominal);
+                for cand in nominal.saturating_sub(2).max(1)..=(nominal + 1).min(Q2TP_LMAX as usize + 1)
+                {
+                    let s = tab[cand];
+                    if s <= 0.0 {
+                        continue;
+                    }
+                    let inv = 1.0 / s;
+                    let mut err = 0.0f32;
+                    for &w in tile {
+                        let q = (w * inv + 1.5).round_ties_even().clamp(0.0, 3.0);
+                        let d = w - (q - 1.5) * s;
+                        err += d * d;
+                    }
+                    if err < best.0 {
+                        best = (err, cand);
+                    }
+                }
+                best.1
+            };
             q4tp_put_code(crow, g, c);
             let inv = if tab[c] > 0.0 { 1.0 / tab[c] } else { 0.0 };
-            let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
             let dst = &mut chunks_row[g * Q2TP_CHUNK..(g + 1) * Q2TP_CHUNK];
             for (k, d) in dst.iter_mut().enumerate() {
                 let mut b = 0u8;
@@ -3882,6 +3920,41 @@ mod tests {
     /// The 2-bit profile is worth 50 GB on a 300B MoE, and getting it wrong
     /// produces a file that is merely large — no error, no warning. These are
     /// the names it has to recognize, in the spelling `canon_name` emits.
+    /// The 2-bit levels are (c−1.5)·s, so the scale decides everything, and
+    /// absmax/1.5 pins the outer level to the largest weight — which
+    /// minimises the WORST error, not the mean one. With four levels that
+    /// difference is large. This measures both arms on weights shaped like a
+    /// real expert plane and requires the search to actually win.
+    #[test]
+    fn two_bit_scale_search_beats_the_absmax_rule() {
+        let (rows, cols) = (16usize, 512usize);
+        let mut w = vec![0.0f32; rows * cols];
+        for (i, v) in w.iter_mut().enumerate() {
+            let x = i as f32;
+            *v = ((x * 0.017).sin() + (x * 0.041).sin() + (x * 0.093).sin()) / 3.0;
+            if i % 97 == 0 {
+                *v *= 6.0; // an outlier every so often, as in a real plane
+            }
+        }
+        let rel = |enc: &[u8]| {
+            let mut back = vec![0.0f32; rows * cols];
+            cortiq_core::quant::dequant_q2tp(enc, rows, cols, &mut back);
+            let num: f32 = w.iter().zip(&back).map(|(a, b)| (a - b) * (a - b)).sum();
+            let den: f32 = w.iter().map(|a| a * a).sum();
+            (num / den).sqrt()
+        };
+        // SAFETY-of-test: read per call, and these run in sequence.
+        unsafe { std::env::set_var("CMF_Q2TP_SEARCH", "0") };
+        let plain = rel(&encode_q2tp(&w, rows, cols));
+        unsafe { std::env::remove_var("CMF_Q2TP_SEARCH") };
+        let searched = rel(&encode_q2tp(&w, rows, cols));
+        println!("q2tp относительная ошибка: absmax {plain:.4} → подбор {searched:.4}");
+        assert!(
+            searched < plain,
+            "подбор ступени не улучшил: {searched:.4} против {plain:.4}"
+        );
+    }
+
     /// The row encoders were made parallel because a 300B MoE otherwise
     /// quantizes on one core. Rows are independent, so the bytes must be
     /// identical however many threads produce them — not merely close.
