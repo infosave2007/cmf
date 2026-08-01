@@ -5090,6 +5090,9 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
     let pin_shared = (rt_p.flags & 8u) != 0u;
     if (lid < k) { rt_used[lid] = 0u; rt_idx[lid] = 0u; rt_w[lid] = 0.0; }
     if (pin_shared && lid == 0u) { rt_idx[k] = n; rt_w[k] = 1.0; }
+    // Same reason: the zero-fill is a storage write that the ranking lanes
+    // must not race with.
+    storageBarrier();
     var i = lid;
     loop {
         if (i >= n) { break; }
@@ -5138,7 +5141,14 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
             m = m + 256u;
         }
     }
+    // BOTH barriers. The ranking above writes rt_idx/rt_w, which are STORAGE
+    // buffers, and the lane that normalises them below reads what every other
+    // lane wrote. workgroupBarrier orders workgroup memory only; without the
+    // storage barrier those writes need not be visible yet. With 8 experts it
+    // happened to work, with 256 it did not — and the failure is a routing
+    // weight quietly attached to the wrong expert.
     workgroupBarrier();
+    storageBarrier();
 
     // Normalisation is a handful of terms; one lane keeps the add order fixed.
     if (lid == 0u) {

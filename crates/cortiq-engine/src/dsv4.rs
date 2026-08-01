@@ -1169,31 +1169,22 @@ fn attn_frame(
     // The compressed axis only ever grows, so write the TAIL. Rewriting it
     // whole was 22 MB a token at 1024 positions — the cache write, not the
     // arithmetic, was what the attention block had left to pay.
-    if n_comp > 0 {
-        // A reallocation anywhere invalidates every tail count: the old
-        // contents are gone.
-        let grew = crate::gpu_wgpu::GREW.load(std::sync::atomic::Ordering::Relaxed);
-        let done = if grew == last_grew(grew) {
-            compressed_written(kv_id, li)
-        } else {
-            0
-        };
-        let from = done.min(st.compressed[li].len());
-        if !crate::gpu_wgpu::dsv4_cache_write(
+    // The compressed tail is written WHOLE every token. Writing only the new
+    // part was tried and gave nothing measurable, and the bookkeeping it
+    // needs — a per-layer tail count invalidated by every buffer growth — is
+    // exactly the kind of state that drifts silently and shows up as a model
+    // that stops early. Not worth carrying for zero.
+    if n_comp > 0
+        && !crate::gpu_wgpu::dsv4_cache_write(
             kv_id,
             li,
-            cfg.window * hd + from,
-            &st.compressed[li][from..],
+            cfg.window * hd,
+            &st.compressed[li],
             cap,
-        ) {
-            note_compressed(kv_id, li, 0);
-            return false;
-        }
-        note_compressed(kv_id, li, st.compressed[li].len());
+        )
+    {
+        return false;
     }
-    // Host list: window slots 0..win_len, then compressed. Device layout: a
-    // FIXED window region of `cfg.window` slots, then compressed. The two
-    // agree only while the window is still filling.
     let idx32: Vec<u32> = idxs
         .iter()
         .map(|&p| {
@@ -1601,6 +1592,24 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
 
 /// `CMF_DSV4_GPU_MOE2=1`: the whole MoE block in one submission, experts
 /// resident. Returns false having changed nothing if it cannot.
+///
+/// NOT CORRECT YET — off by default and it must stay off. On the release
+/// checkpoint it diverges from the CPU by up to 0.44 relative on most MoE
+/// layers (`CMF_DSV4_MOE_CHECK=1` prints them), and perplexity lands at 5.162
+/// against the CPU's 5.211 on the exact contract.
+///
+/// Ruled out so far, so the next attempt need not redo it:
+///   * the routing kernel — `gpu_route_parity` matches exactly at 256 experts
+///     with bias, mask, a hash row and an all-closed mask;
+///   * the 2-bit expert layout — a q2tp toy (gate/up Q2TiledP, down Q4TiledP,
+///     confirmed identical to the release by `expert_dtypes`) agrees bit for
+///     bit, PPL 143.512 both ways;
+///   * missing storage barriers in `moe_route` — added, no change.
+///
+/// So it is scale-dependent: the toy runs 8 experts, top_k 2, inter 64,
+/// hidden 128; the release runs 256 / 6 / 2048 / 4096. The next thing to try
+/// is a toy at release proportions, which will either reproduce it or narrow
+/// it to something only the real weights do.
 #[cfg(feature = "gpu")]
 fn moe_frame(
     hidden: &[f32],
@@ -1757,6 +1766,38 @@ pub fn moe_step(
             .as_ref()
             .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id));
         if moe_frame(hidden, l, cfg, li, &logits, forced.as_deref(), out) {
+            // CMF_DSV4_MOE_CHECK=1 recomputes the same block on the CPU and
+            // reports where they part. A wrong MoE does not fail — it answers
+            // differently — and the toy agreed bit for bit while the release
+            // did not, so the difference lives in something the toy has no
+            // instance of. Only a per-layer number will say which.
+            if std::env::var("CMF_DSV4_MOE_CHECK").is_ok() {
+                let mut want = vec![0.0f32; out.len()];
+                let mut acc = vec![0.0f32; cfg.dim];
+                for (e, &ei) in idx.iter().enumerate() {
+                    let Some(exp) = l.experts.get(ei) else { continue };
+                    run_expert(hidden, exp, cfg, w.get(e).copied().unwrap_or(0.0), pool, &mut acc);
+                    for (o, a) in want.iter_mut().zip(&acc) {
+                        *o += a;
+                    }
+                }
+                run_expert(hidden, &l.shared, cfg, 1.0, pool, &mut acc);
+                for (o, a) in want.iter_mut().zip(&acc) {
+                    *o += a;
+                }
+                let num: f32 = want.iter().zip(out.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
+                let den: f32 = want.iter().map(|a| a * a).sum::<f32>().max(1e-20);
+                let rel = (num / den).sqrt();
+                if rel > 1e-3 {
+                    eprintln!(
+                        "[кадр MoE] слой {li}: расхождение {rel:.3e} | экспертов {} | \
+                         хеш={} | смещение={}",
+                        idx.len(),
+                        l.tid2eid.is_some(),
+                        l.gate_bias.is_some()
+                    );
+                }
+            }
             return;
         }
     }
