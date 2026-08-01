@@ -779,6 +779,12 @@ pub struct Dsv4State {
     /// its fold reads half its dimensions from the previous stride.
     pub prev_kv: Vec<Vec<f32>>,
     pub prev_score: Vec<Vec<f32>>,
+    /// The indexer's compressor runs alongside the attention one and keeps
+    /// its own window — same shape, different width and different weights.
+    pub pending_ix_kv: Vec<Vec<f32>>,
+    pub pending_ix_score: Vec<Vec<f32>>,
+    pub prev_ix_kv: Vec<Vec<f32>>,
+    pub prev_ix_score: Vec<Vec<f32>>,
     pub pos: usize,
 }
 
@@ -792,6 +798,10 @@ impl Dsv4State {
             pending_score: vec![Vec::new(); layers],
             prev_kv: vec![Vec::new(); layers],
             prev_score: vec![Vec::new(); layers],
+            pending_ix_kv: vec![Vec::new(); layers],
+            pending_ix_score: vec![Vec::new(); layers],
+            prev_ix_kv: vec![Vec::new(); layers],
+            prev_ix_score: vec![Vec::new(); layers],
             pos: 0,
         }
     }
@@ -806,6 +816,64 @@ impl Dsv4State {
 /// one index list, sparse attention with the sink, the INVERSE rope on the
 /// output, then the grouped low-rank projection.
 #[allow(clippy::too_many_arguments)]
+/// Advance one compressor by a token and return its folded entry when the
+/// window closes. Both the attention compressor and the indexer's own run
+/// through here — the indexer's was simply never called, so its cache stayed
+/// empty and every layer that has an indexer selected ZERO compressed
+/// positions, discarding a correctly-built long-range memory.
+#[allow(clippy::too_many_arguments)]
+fn compressor_step(
+    cp: &Dsv4Compressor,
+    hidden: &[f32],
+    pos: usize,
+    rd: usize,
+    norm_eps: f32,
+    inv_freq: &[f32],
+    pool: Option<&crate::pool::Pool>,
+    pending_kv: &mut Vec<f32>,
+    pending_score: &mut Vec<f32>,
+    prev_kv: &mut Vec<f32>,
+    prev_score: &mut Vec<f32>,
+) -> Option<Vec<f32>> {
+    let width = cp.wkv.rows();
+    let ew = if cp.overlap { width / 2 } else { width };
+    let mut ckv = vec![0.0f32; width];
+    let mut cscore = vec![0.0f32; width];
+    cp.wkv.matvec(hidden, &mut ckv, pool);
+    cp.wgate.matvec(hidden, &mut cscore, pool);
+    if cp.overlap {
+        // The reference biases the score as the token arrives and keeps it
+        // biased across the shift, so ape is added ONCE, here.
+        let slot = pos % cp.ratio;
+        for (c, a) in cscore
+            .iter_mut()
+            .zip(&cp.ape[slot * width..(slot + 1) * width])
+        {
+            *c += a;
+        }
+    }
+    pending_kv.extend_from_slice(&ckv);
+    pending_score.extend_from_slice(&cscore);
+    if pending_kv.len() / width < cp.ratio {
+        return None;
+    }
+    let mut folded = vec![0.0f32; ew];
+    if cp.overlap {
+        compress_window_overlap(prev_kv, prev_score, pending_kv, pending_score, cp.ratio, ew, &mut folded);
+        *prev_kv = std::mem::take(pending_kv);
+        *prev_score = std::mem::take(pending_score);
+    } else {
+        compress_window(pending_kv, pending_score, &cp.ape, cp.ratio, width, &mut folded);
+    }
+    rms_weighted(&mut folded, &cp.norm, norm_eps);
+    // The entry carries the same rope-tagged tail as a window key, at the
+    // position of the window's first token.
+    rope_tail(&mut folded, inv_freq, pos + 1 - cp.ratio, rd, false);
+    pending_kv.clear();
+    pending_score.clear();
+    Some(folded)
+}
+
 pub fn attention_step(
     hidden: &[f32],
     l: &Dsv4Layer,
@@ -843,66 +911,41 @@ pub fn attention_step(
     // so a partial window simply waits — which is why the state carries
     // the pending streams across tokens.
     if let Some(cp) = &l.compressor {
-        let width = cp.wkv.rows();
-        // With overlapping windows the projection is twice the entry width:
-        // half the dimensions belong to the previous stride, half to this one.
-        let ew = if cp.overlap { width / 2 } else { width };
-        let mut ckv = vec![0.0f32; width];
-        let mut cscore = vec![0.0f32; width];
-        cp.wkv.matvec(hidden, &mut ckv, pool);
-        cp.wgate.matvec(hidden, &mut cscore, pool);
-        if cp.overlap {
-            // The reference biases the score as the token arrives and keeps
-            // it biased across the shift, so ape is added ONCE, here.
-            let slot = pos % cp.ratio;
-            for (c, a) in cscore
-                .iter_mut()
-                .zip(&cp.ape[slot * width..(slot + 1) * width])
-            {
-                *c += a;
-            }
+        let mut pk = std::mem::take(&mut st.pending_kv[li]);
+        let mut ps = std::mem::take(&mut st.pending_score[li]);
+        let mut qk = std::mem::take(&mut st.prev_kv[li]);
+        let mut qs = std::mem::take(&mut st.prev_score[li]);
+        let entry = compressor_step(
+            cp, hidden, pos, rd, cfg.norm_eps, inv_freq, pool,
+            &mut pk, &mut ps, &mut qk, &mut qs,
+        );
+        st.pending_kv[li] = pk;
+        st.pending_score[li] = ps;
+        st.prev_kv[li] = qk;
+        st.prev_score[li] = qs;
+        if let Some(e) = entry {
+            st.compressed[li].extend_from_slice(&e);
         }
-        st.pending_kv[li].extend_from_slice(&ckv);
-        st.pending_score[li].extend_from_slice(&cscore);
-        if st.pending_kv[li].len() / width >= cp.ratio {
-            let mut folded = vec![0.0f32; ew];
-            if cp.overlap {
-                compress_window_overlap(
-                    &st.prev_kv[li],
-                    &st.prev_score[li],
-                    &st.pending_kv[li],
-                    &st.pending_score[li],
-                    cp.ratio,
-                    ew,
-                    &mut folded,
-                );
-                // this window becomes the previous one
-                st.prev_kv[li] = std::mem::take(&mut st.pending_kv[li]);
-                st.prev_score[li] = std::mem::take(&mut st.pending_score[li]);
-            } else {
-                compress_window(
-                    &st.pending_kv[li],
-                    &st.pending_score[li],
-                    &cp.ape,
-                    cp.ratio,
-                    width,
-                    &mut folded,
-                );
-            }
-            rms_weighted(&mut folded, &cp.norm, cfg.norm_eps);
-            // The compressed entry carries the same rope-tagged tail as a
-            // window key, at the position of the window's first token.
-            let cpos = pos + 1 - cp.ratio;
-            rope_tail(&mut folded, inv_freq, cpos, rd, false);
-            // It lives in the attention cache at head width; a compressor
-            // whose entry width differs (the indexer's) keeps its own store.
-            if ew == hd {
-                st.compressed[li].extend_from_slice(&folded);
-            } else {
-                st.index_kv[li].extend_from_slice(&folded);
-            }
-            st.pending_kv[li].clear();
-            st.pending_score[li].clear();
+    }
+    // The indexer scores against ITS OWN compressed cache, built by its own
+    // compressor. Without this the cache is empty, `n_ix` is zero, and every
+    // indexer layer picks no compressed positions at all — the long-range
+    // memory is built and then never read.
+    if let Some(ix) = &l.indexer {
+        let mut pk = std::mem::take(&mut st.pending_ix_kv[li]);
+        let mut ps = std::mem::take(&mut st.pending_ix_score[li]);
+        let mut qk = std::mem::take(&mut st.prev_ix_kv[li]);
+        let mut qs = std::mem::take(&mut st.prev_ix_score[li]);
+        let entry = compressor_step(
+            &ix.compressor, hidden, pos, rd, cfg.norm_eps, inv_freq, pool,
+            &mut pk, &mut ps, &mut qk, &mut qs,
+        );
+        st.pending_ix_kv[li] = pk;
+        st.pending_ix_score[li] = ps;
+        st.prev_ix_kv[li] = qk;
+        st.prev_ix_score[li] = qs;
+        if let Some(e) = entry {
+            st.index_kv[li].extend_from_slice(&e);
         }
     }
 
@@ -1494,7 +1537,22 @@ mod tests {
                 } else {
                     None
                 },
-                indexer: None,
+                indexer: if li == 1 {
+                    Some(Dsv4Indexer {
+                        wq_b: t(2 * 16, cfg.q_lora_rank, 41),
+                        weights_proj: t(2, dim, 43),
+                        compressor: Dsv4Compressor {
+                            wkv: t(2 * 16, dim, 45),
+                            wgate: t(2 * 16, dim, 47),
+                            norm: ones(16),
+                            ape: vec![0.01; 4 * 2 * 16],
+                            ratio: 4,
+                            overlap: true,
+                        },
+                    })
+                } else {
+                    None
+                },
                 hc_attn_fn: w((2 + hc) * hc * hc * dim, 15 + li),
                 hc_attn_base: w((2 + hc) * hc, 17 + li),
                 hc_attn_scale: [1.0, 1.0, 1.0],
@@ -1604,6 +1662,18 @@ mod tests {
             !st.prev_kv[1].is_empty(),
             "the overlapping compressor never kept a previous window"
         );
+        // Every layer that HAS an indexer must have filled the indexer's own
+        // cache: it is what decides which compressed positions attention
+        // reads, and an empty one silently discards the whole long-range
+        // memory rather than failing.
+        for (li, l) in layers.iter().enumerate() {
+            if l.indexer.is_some() {
+                assert!(
+                    !st.index_kv[li].is_empty(),
+                    "layer {li} has an indexer but its cache stayed empty"
+                );
+            }
+        }
 
         // Context must matter: the same token at position 0 of a fresh state
         // and at the end of a filled one cannot give identical logits.
