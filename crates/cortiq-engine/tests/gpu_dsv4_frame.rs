@@ -62,8 +62,9 @@ fn the_fused_attention_block_matches_the_cpu() {
     // ── the CPU's eight steps ──
     let t = |i: usize| QTensor::from_model(&model, &model.tensors[i].name).expect("tensor");
     let (tqa, tqb, toa, tob) = (t(i_qa), t(i_qb), t(i_oa), t(i_ob));
-    let mut qr = vec![0.0f32; q_lora];
-    tqa.matvec(&hidden, &mut qr, None);
+    let mut qr_raw = vec![0.0f32; q_lora];
+    tqa.matvec(&hidden, &mut qr_raw, None);
+    let mut qr = qr_raw.clone();
     dsv4::rms_weighted(&mut qr, &q_norm, eps);
     let mut q = vec![0.0f32; nh * hd];
     tqb.matvec(&qr, &mut q, None);
@@ -86,6 +87,14 @@ fn the_fused_attention_block_matches_the_cpu() {
         );
         dsv4::rope_tail(&mut oh, &inv_freq, pos, rd, true);
         attn[h * hd..(h + 1) * hd].copy_from_slice(&oh);
+    }
+    let mut mid_cpu = vec![0.0f32; o_groups * o_lora];
+    {
+        let mut sc = vec![0.0f32; per_group];
+        for (i, m) in mid_cpu.iter_mut().enumerate() {
+            let gi = i / o_lora;
+            *m = toa.row_dot(i, &attn[gi * per_group..(gi + 1) * per_group], &mut sc);
+        }
     }
     let mut want = vec![0.0f32; dim];
     let mut scratch = vec![0.0f32; per_group];
@@ -125,17 +134,39 @@ fn the_fused_attention_block_matches_the_cpu() {
         eps,
         scale,
     };
-    let mut got = vec![0.0f32; dim];
-    if !gpu_wgpu::dsv4_attn_frame(
-        &model, &w, g, &hidden, 7, 0, &idxs, &inv_freq, pos, &mut got,
-    ) {
-        eprintln!("кадр отклонён устройством — пропуск");
-        return;
+    // Stage by stage, then whole. The first stage that moves is the wiring
+    // fault; comparing only the output tells you there is one and no more.
+    let stages: Vec<(&str, &[f32])> = vec![
+        ("qr", &qr_raw),
+        ("qn", &qr),
+        ("q", &q),
+        ("attn", &attn),
+        ("mid", &mid_cpu),
+        ("", &want),
+    ];
+    let mut worst = 0.0f32;
+    for (tap, cpu) in stages {
+        if tap.is_empty() {
+            std::env::remove_var("CMF_DSV4_FRAME_TAP");
+        } else {
+            std::env::set_var("CMF_DSV4_FRAME_TAP", tap);
+        }
+        let mut got = vec![0.0f32; nh * hd + dim];
+        if !gpu_wgpu::dsv4_attn_frame(
+            &model, &w, g, &hidden, 7, 0, &idxs, &inv_freq, pos, &mut got,
+        ) {
+            eprintln!("кадр отклонён устройством — пропуск");
+            return;
+        }
+        let got = &got[..cpu.len()];
+        let num: f32 = cpu.iter().zip(got).map(|(a, b)| (a - b) * (a - b)).sum();
+        let den: f32 = cpu.iter().map(|a| a * a).sum::<f32>().max(1e-20);
+        let rel = (num / den).sqrt();
+        let name = if tap.is_empty() { "выход" } else { tap };
+        println!("  {name:>5}: {rel:.3e}");
+        worst = worst.max(rel);
+        assert!(rel < 5e-3, "ступень {name} разошлась на {rel:.3e}");
     }
-    let num: f32 = want.iter().zip(&got).map(|(a, b)| (a - b) * (a - b)).sum();
-    let den: f32 = want.iter().map(|a| a * a).sum::<f32>().max(1e-20);
-    let rel = (num / den).sqrt();
-    println!("сшитый блок внимания: {rel:.3e}");
-    assert!(rel < 5e-3, "кадр разошёлся с CPU на {rel:.3e}");
+    println!("сшитый блок внимания: худшая ступень {worst:.3e}");
     gpu_wgpu::dsv4_cache_clear(7);
 }

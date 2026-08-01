@@ -15928,11 +15928,14 @@ pub fn dsv4_attn_frame(
     let posb = storage_bytes(c, bytemuck::cast_slice(&[pos as f32, g.eps]));
     let ixb = storage_bytes(c, bytemuck::cast_slice(idxs));
 
-    let qr = rw_f32(c, g.q_lora, false);
-    let qn = rw_f32(c, g.q_lora, false);
-    let q = rw_f32(c, g.nh * g.hd, false);
-    let attn = rw_f32(c, g.nh * g.hd, false);
-    let mid = rw_f32(c, g.o_groups * g.o_lora, false);
+    // Readable, all of them: `CMF_DSV4_FRAME_TAP` reads back an intermediate
+    // instead of the output. Eight verified kernels can still be wired wrong,
+    // and a single number at the end says only that they were.
+    let qr = rw_f32(c, g.q_lora, true);
+    let qn = rw_f32(c, g.q_lora, true);
+    let q = rw_f32(c, g.nh * g.hd, true);
+    let attn = rw_f32(c, g.nh * g.hd, true);
+    let mid = rw_f32(c, g.o_groups * g.o_lora, true);
     let yb = rw_f32(c, g.dim, true);
 
     let mut enc = c
@@ -16003,15 +16006,27 @@ pub fn dsv4_attn_frame(
         g.o_groups * g.o_lora,
     );
 
+    let tap = std::env::var("CMF_DSV4_FRAME_TAP").unwrap_or_default();
+    let (src, n) = match tap.as_str() {
+        "qr" => (&qr, g.q_lora),
+        "qn" => (&qn, g.q_lora),
+        "q" => (&q, g.nh * g.hd),
+        "attn" => (&attn, g.nh * g.hd),
+        "mid" => (&mid, g.o_groups * g.o_lora),
+        _ => (&yb, g.dim),
+    };
+    if out.len() < n {
+        no!("отвод {tap} нуждается в {n} значениях, дано {}", out.len());
+    }
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(
         &c.device,
         &mut sc.stage,
-        (g.dim * 4) as u64,
+        (n * 4) as u64,
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "dsv4-attn-stage",
     );
-    let ok = readback(c, enc, &yb, &stage, (g.dim * 4) as u64, &mut out[..g.dim]);
+    let ok = readback(c, enc, src, &stage, (n * 4) as u64, &mut out[..n]);
     drop(sc);
     ok
 }
