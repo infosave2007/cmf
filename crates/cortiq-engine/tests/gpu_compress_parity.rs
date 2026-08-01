@@ -84,7 +84,7 @@ fn device_index_scores_match_the_cpu() {
     let limit = 137usize;
 
     let mut cpu = Vec::new();
-    cortiq_engine::dsv4::index_scores(&q, &kv, &hw, nh, hd, n_pos, limit, &mut cpu);
+    cortiq_engine::dsv4::index_scores(&q, &kv, &hw, nh, hd, n_pos, limit, None, &mut cpu);
     let mut gpu = vec![0.0f32; n_pos];
     if !cortiq_engine::gpu_wgpu::index_scores_for_test(
         &q, &kv, &hw, nh, hd, n_pos, limit, &mut gpu,

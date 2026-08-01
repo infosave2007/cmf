@@ -496,6 +496,7 @@ pub fn compress_window_overlap(
 ///
 /// `causal_limit` is the number of compressed positions this query may see
 /// (`(pos + 1) / ratio`); anything at or past it is masked.
+#[allow(clippy::too_many_arguments)]
 pub fn index_scores(
     q_heads: &[f32],
     kv: &[f32],
@@ -504,14 +505,14 @@ pub fn index_scores(
     head_dim: usize,
     n_pos: usize,
     causal_limit: usize,
+    pool: Option<&crate::pool::Pool>,
     out: &mut Vec<f32>,
 ) {
     out.clear();
     out.resize(n_pos, 0.0);
-    for t in 0..n_pos {
+    let score_at = |t: usize| -> f32 {
         if t >= causal_limit {
-            out[t] = f32::NEG_INFINITY;
-            continue;
+            return f32::NEG_INFINITY;
         }
         let k = &kv[t * head_dim..(t + 1) * head_dim];
         let mut acc = 0.0;
@@ -521,7 +522,25 @@ pub fn index_scores(
             // relu BEFORE weighting: a head votes for a position or abstains
             acc += dot.max(0.0) * head_weights[h];
         }
-        out[t] = acc;
+        acc
+    };
+    // Positions are independent, and their number grows with the context —
+    // this was the one loop in the attention step still walking the whole
+    // compressed axis on one thread.
+    match pool {
+        Some(p) if n_pos >= 64 => {
+            let addr = crate::pool::SendMut::new(out.as_mut_ptr());
+            p.run_rows(n_pos, &|start, end| {
+                for t in start..end {
+                    unsafe { *addr.at(t) = score_at(t) };
+                }
+            });
+        }
+        _ => {
+            for (t, o) in out.iter_mut().enumerate() {
+                *o = score_at(t);
+            }
+        }
     }
 }
 
@@ -530,6 +549,22 @@ pub fn index_scores(
 /// short history simply returns fewer than `k`.
 pub fn top_k_positions(scores: &[f32], k: usize, out: &mut Vec<usize>) {
     out.clear();
+    // When k reaches the whole list there is nothing to choose: every finite
+    // position wins, and they come out in index order anyway. The general
+    // path is k rounds of argmax — O(k·n) — and at index_topk = 512 against a
+    // compressed axis that is still shorter than that, it was doing 160k
+    // comparisons a layer to arrive at "all of them". This grows with the
+    // context, which is exactly when it hurts.
+    if k >= scores.len() {
+        out.extend(
+            scores
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.is_finite())
+                .map(|(i, _)| i),
+        );
+        return;
+    }
     let mut taken = vec![false; scores.len()];
     for _ in 0..k.min(scores.len()) {
         let mut best = usize::MAX;
@@ -1327,6 +1362,7 @@ pub fn attention_step(
                     idim,
                     n_ix.min(n_comp),
                     n_ix.min(n_comp),
+                    pool,
                     &mut sc,
                 );
                 let mut picked = Vec::new();
@@ -2890,7 +2926,7 @@ mod tests {
         let kv = [1.0f32, 0.0, 0.0, 1.0];
         let w = [1.0f32, 1.0];
         let mut sc = Vec::new();
-        index_scores(&q, &kv, &w, nh, hd, 2, 2, &mut sc);
+        index_scores(&q, &kv, &w, nh, hd, 2, 2, None, &mut sc);
         // without the relu the anti-aligned head would cancel head 0 to zero
         assert!(sc[0] > 0.9, "abstention, not veto: {:?}", sc);
     }
@@ -2902,7 +2938,7 @@ mod tests {
         let kv = [1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0];
         let w = [1.0f32];
         let mut sc = Vec::new();
-        index_scores(&q, &kv, &w, nh, hd, 3, 2, &mut sc);
+        index_scores(&q, &kv, &w, nh, hd, 3, 2, None, &mut sc);
         assert!(sc[0].is_finite() && sc[1].is_finite());
         assert!(sc[2] == f32::NEG_INFINITY, "position 2 is in the future");
         let mut idx = Vec::new();
