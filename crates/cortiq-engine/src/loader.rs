@@ -967,7 +967,24 @@ impl Pipeline {
         }
 
         // ── MTP head (optional, spec §2.1) ──
-        let mtp = if let Some(cfg) = &arch.mtp {
+        //
+        // The header declaring an MTP head is not the same as the file
+        // carrying one. DeepSeek-V4's config announces a next-token predictor
+        // whose weights the converter does not map (they are spelled `mtp.N.*`
+        // and have none of the canonical projections), so demanding
+        // `model.mtp.layers.0.self_attn.q_proj.weight` failed a model that is
+        // otherwise complete. Presence in the directory decides.
+        let mtp_present = model
+            .tensor("model.mtp.layers.0.self_attn.q_proj.weight")
+            .is_some()
+            || model.tensor("model.mtp.eh_proj.weight").is_some();
+        if arch.mtp.is_some() && !mtp_present {
+            tracing::info!(
+                "header declares an MTP head but the file carries none — \
+                 loading without it"
+            );
+        }
+        let mtp = if let Some(cfg) = arch.mtp.as_ref().filter(|_| mtp_present) {
             if cfg.num_layers != 1 {
                 return Err(CmfError::Parse(format!(
                     "MTP with {} blocks not supported yet (only 1)",

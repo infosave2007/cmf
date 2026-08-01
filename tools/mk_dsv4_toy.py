@@ -166,6 +166,10 @@ json.dump({
     "q_lora_rank": QLORA, "o_lora_rank": OLORA, "o_groups": OGROUPS,
     "moe_intermediate_size": MOE_INTER, "n_routed_experts": NEXP,
     "num_experts_per_tok": TOPK, "n_shared_experts": 1,
+    # The release announces a next-token predictor whose weights the
+    # converter does not map. Declaring it here keeps the toy honest: a
+    # loader that demands those weights must still load this model.
+    "num_nextn_predict_layers": 1,
     "num_hash_layers": NHASH, "routed_scaling_factor": 1.5,
     "scoring_func": "sqrtsoftplus", "topk_method": "noaux_tc",
     "norm_topk_prob": True, "swiglu_limit": 10.0, "sliding_window": 8,
