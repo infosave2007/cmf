@@ -6719,7 +6719,9 @@ fn moe_expert_bufs(
               cols: usize,
               plen: usize|
      -> Option<wgpu::Buffer> {
-        let mut v: Vec<u8> = Vec::with_capacity(experts.len() * plen);
+        // Check every expert BEFORE allocating: a shape mismatch found
+        // halfway used to leave a gigabyte-scale buffer behind.
+        let mut offs = Vec::with_capacity(experts.len());
         for t in experts {
             let e = model.tensors.get(role(t))?;
             if *e.shape.first()? as usize != rows
@@ -6729,15 +6731,23 @@ fn moe_expert_bufs(
                 return None;
             }
             let abs = model.entry_abs_offset(e)?;
-            v.extend_from_slice(bytes.get(abs..abs + plen)?);
+            bytes.get(abs..abs + plen)?; // in range
+            offs.push(abs);
         }
         let b = c.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("moe-experts"),
-            size: v.len() as u64,
+            size: (experts.len() * plen) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        c.queue.write_buffer(&b, 0, &v);
+        // Straight from the mapping to the queue, expert by expert. Gathering
+        // them into one Vec first meant a 2.2 GB allocation and a full extra
+        // memcpy PER LAYER — 94 GB of pointless copying across the release,
+        // on top of the 94 GB that has to move anyway.
+        for (i, &abs) in offs.iter().enumerate() {
+            c.queue
+                .write_buffer(&b, (i * plen) as u64, &bytes[abs..abs + plen]);
+        }
         Some(b)
     };
     let (g, u, d) = match (
