@@ -910,8 +910,14 @@ pub fn attention_step(
 
     // Index list: every window position, plus whatever the indexer picked
     // (or, without an indexer, every compressed position).
+    //
+    // CMF_DSV4_NO_COMPRESSED=1 attends to the sliding window ALONE. That is
+    // not a mode anyone should serve — it drops the model's long-range
+    // memory — but it separates two failure modes that look identical from
+    // the outside: output that degrades because the compressed path is
+    // wrong, and output that degrades because the weights are too coarse.
     let mut idxs: Vec<usize> = (0..win_len).collect();
-    if !st.compressed[li].is_empty() {
+    if !st.compressed[li].is_empty() && !no_compressed() {
         let n_comp = st.compressed[li].len() / hd;
         match &l.indexer {
             Some(ix) => {
@@ -1069,6 +1075,11 @@ fn run_expert(
 /// other handle: this says whether the state grew, collapsed or went
 /// non-finite, and at which layer — before anyone reaches for a debugger on a
 /// hundred-gigabyte file.
+fn no_compressed() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("CMF_DSV4_NO_COMPRESSED").is_ok_and(|v| v != "0"))
+}
+
 fn trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CMF_DSV4_TRACE").is_ok_and(|v| v != "0"))
