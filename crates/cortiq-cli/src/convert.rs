@@ -737,20 +737,74 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
         }
         let lo_h = f32_to_f16(lo);
         let lo_r = f16_to_f32(lo_h);
-        let span = (hi - lo_r).max(0.0);
-        let mut st_h = f32_to_f16(span / Q2TP_LMAX as f32);
-        for _ in 0..64 {
-            let st = f16_to_f32(st_h);
-            if st > 0.0 && lo_r + Q2TP_LMAX as f32 * st >= hi {
-                break;
+        // The ladder spans lo..hi, where hi is the largest group scale in the
+        // row. One loud group therefore stretches the ladder and coarsens the
+        // step for all the quiet ones. Try shorter ladders too and keep the
+        // one whose whole row reconstructs best — the same argument as the
+        // per-group search, one level up.
+        let ladder_for = |top: f32, params: &mut [u8]| -> [f32; 32] {
+            let span = (top - lo_r).max(0.0);
+            let mut st_h = f32_to_f16(span / Q2TP_LMAX as f32);
+            for _ in 0..64 {
+                let st = f16_to_f32(st_h);
+                if st > 0.0 && lo_r + Q2TP_LMAX as f32 * st >= top {
+                    break;
+                }
+                st_h += 1;
             }
-            st_h += 1;
+            params[0..2].copy_from_slice(&lo_h.to_le_bytes());
+            params[2..4].copy_from_slice(&st_h.to_le_bytes());
+            q2tp_ladder(params, 0)
+        };
+        let mut tab = ladder_for(hi, params_row);
+        if search && hi > lo_r {
+            // Candidate tops: the full range, then progressively tighter.
+            let mut best = (f32::INFINITY, hi);
+            for frac in [1.0f32, 0.9, 0.8, 0.7] {
+                let top = lo_r + (hi - lo_r) * frac;
+                let mut probe = [0u8; 4];
+                let t = ladder_for(top, &mut probe);
+                let mut err = 0.0f32;
+                for g in 0..gpr {
+                    if dead[g] {
+                        continue;
+                    }
+                    let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+                    // Probe around the rung this ladder would nominally pick
+                    // rather than all 31: the best is always adjacent, and
+                    // scanning the ladder end to end costs 8x for nothing.
+                    let stc = f16_to_f32(u16::from_le_bytes([probe[2], probe[3]]));
+                    let nom = if stc > 0.0 {
+                        1 + ((lg[g] - lo_r) / stc).round_ties_even().clamp(0.0, Q2TP_LMAX as f32)
+                            as usize
+                    } else {
+                        1
+                    };
+                    let mut ge = f32::INFINITY;
+                    for cand in nom.saturating_sub(2).max(1)..=(nom + 2).min(Q2TP_LMAX as usize + 1)
+                    {
+                        let sc = t[cand];
+                        if sc <= 0.0 {
+                            continue;
+                        }
+                        let iv = 1.0 / sc;
+                        let mut e = 0.0f32;
+                        for &wv in tile {
+                            let q = (wv * iv + 1.5).round_ties_even().clamp(0.0, 3.0);
+                            let d = wv - (q - 1.5) * sc;
+                            e += d * d;
+                        }
+                        ge = ge.min(e);
+                    }
+                    err += ge;
+                }
+                if err < best.0 {
+                    best = (err, top);
+                }
+            }
+            tab = ladder_for(best.1, params_row);
         }
-        params_row[0..2].copy_from_slice(&lo_h.to_le_bytes());
-        params_row[2..4].copy_from_slice(&st_h.to_le_bytes());
-
-        let st = f16_to_f32(st_h);
-        let tab = q2tp_ladder(params_row, 0);
+        let st = f16_to_f32(u16::from_le_bytes([params_row[2], params_row[3]]));
         let crow = &mut *codes_row;
         for g in 0..gpr {
             // Rung 0 is the exact zero; live groups start at 1.
