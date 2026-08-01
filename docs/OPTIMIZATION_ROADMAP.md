@@ -117,15 +117,32 @@ worth listing because the same classes recur:
 | hash layers weighted the wrong experts | both lists the right length |
 | `overlap` stored but never read | entry twice the expected width, filed elsewhere |
 | the 2-bit profile reached 1 expert per layer, not 256 | a merely large file |
+| only the FIRST Split of a pre-tokenizer Sequence was applied | ids the model never saw; the port looks guilty |
+| the generic weight loader demanded `q_proj` | fails before the arch's own loader runs |
+| batched prefill and pair-decode walked an empty layer stack | panic on index 0 of nothing |
 
 **The lesson worth carrying:** for an architecture with no sibling in the
-tree, read the reference's config and forward pass line by line and write a
-test per operator AND one that decodes. Four of the seven above were found
-by reading, three by the decoding test. None by inspection of the port.
+tree, read the reference's config and forward pass line by line, write a test
+per operator AND one that decodes — then build a toy checkpoint with the
+release's real names and run the whole path on it (`tools/mk_dsv4_toy.py`).
+The reading found the config-level bugs, the decode test found the shape
+bugs, and only the toy found the three that live outside the architecture
+file entirely, in a pipeline that assumes every model keeps its layers where
+the generic loader put them.
+
+**And check the tokenizer against the reference before blaming the model.**
+The single most expensive bug of the night was `find_split_pattern` taking
+one rule out of a Sequence of three: the prompt never met a word boundary,
+so the ids were ones the checkpoint had never seen. Nothing about that looks
+like a tokenizer problem from the outside — it looks like a broken port.
+Ten lines of `tokenizers` in Python settle it.
 
 **On size:** the model is already 4-bit, so q4tp does not shrink it. The
 q2tp expert profile (2-bit gate/up, 4-bit down and skeleton) takes it to
-~99 GB. Expert defrag does NOT help on the hash layers: their table reaches
+112 GB — past what a Hub repo accepts in one file, so it ships as 8 GB
+slices that `cat` back into the file. CMF reads sharded models natively
+(`open_sharded`, spec §10) but nothing WRITES them yet; a `cortiq shard`
+command is the tidier answer and wants a box with room for two copies. Expert defrag does NOT help on the hash layers: their table reaches
 all 256 experts within the first 8 000 vocabulary ids, measured.
 
 **Deliberately absent:** the indexer's Hadamard rotation and FP4 simulation.
@@ -149,9 +166,20 @@ file it copied into the output, so peak disk was twice the model. On the
 hours in. Any new converter path should use it rather than collecting a
 `Vec<TensorSpec>`.
 
-An append-only manifest rides alongside; `CmfStreamWriter::resume` rebuilds
-the writer over a file whose payloads are on disk but whose head was never
-written, which is what an evaporating Colab session leaves behind.
+An append-only manifest rides alongside, with a checkpoint per source shard.
+`cortiq convert --resume` rolls the output back to the last checkpoint and
+skips the shards behind it, download included. Two orderings make that safe
+rather than plausible: the file is flushed BEFORE a checkpoint claims its
+bytes are durable (a buffered writer otherwise puts the manifest ahead of
+the disk — measured, six bytes), and the rollback goes to the checkpoint
+rather than the last tensor, since tensors after it belong to a shard that
+will be redone. Verified by killing an eight-shard conversion after three
+and resuming: byte-identical to a straight-through run.
+
+For a conversion long enough that the machine may not outlive it, ship the
+output in slices as they complete (the first Colab died at 75% and took
+80 GB with it). `tools/manifest_add_marks.py` reconstructs checkpoints for a
+manifest written before they existed.
 
 ## How to work on any of this
 
