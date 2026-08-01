@@ -31,8 +31,7 @@ fn synth(rows: usize, cols: usize) -> Vec<u8> {
         }
         let p = params_off + r * 4;
         b[p..p + 2].copy_from_slice(&f32_to_f16(-6.0 - 0.03 * (r % 17) as f32).to_le_bytes());
-        b[p + 2..p + 4]
-            .copy_from_slice(&f32_to_f16(0.01 + 0.004 * (r % 11) as f32).to_le_bytes());
+        b[p + 2..p + 4].copy_from_slice(&f32_to_f16(0.01 + 0.004 * (r % 11) as f32).to_le_bytes());
         let crow = &mut b[codes_off + r * stride..codes_off + (r + 1) * stride];
         for g in 0..gpr {
             q4tp_put_code(crow, g, (r * 5 + g * 3) % 32);

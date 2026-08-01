@@ -142,8 +142,18 @@ mod prof {
     pub const HEADTAIL: usize = 10;
     pub const GPUBLK: usize = 11;
     const NAMES: [&str; 12] = [
-        "mod+norms", "qkv-proj", "qknorm+rope", "attn-pack", "attn-qk", "softmax", "attn-pv",
-        "o-proj", "ffn-mm", "ffn-silu", "head+tail", "gpu-block",
+        "mod+norms",
+        "qkv-proj",
+        "qknorm+rope",
+        "attn-pack",
+        "attn-qk",
+        "softmax",
+        "attn-pv",
+        "o-proj",
+        "ffn-mm",
+        "ffn-silu",
+        "head+tail",
+        "gpu-block",
     ];
     static NS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 
@@ -548,10 +558,7 @@ impl NextDit {
         // A fused block is not a wide matmat: see `fused_block_trusted`.
         if !gpu::fused_block_trusted()
             && (gpu::probe_deciding(gpu::OpClass::MatmatWide)
-                || !matches!(
-                    gpu::probe_arm(gpu::OpClass::MatmatWide),
-                    gpu::ProbeArm::Gpu
-                ))
+                || !matches!(gpu::probe_arm(gpu::OpClass::MatmatWide), gpu::ProbeArm::Gpu))
         {
             return false;
         }

@@ -970,8 +970,16 @@ pub fn qwen_attention_core(
     // — the vec![true; nkv] here was one allocation per layer per token.
     cache.append(&p.k, &p.v, &[]);
 
-    let (mut ao, mut imp) =
-        attend_all_heads(&p.q, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window, cfg.softcap);
+    let (mut ao, mut imp) = attend_all_heads(
+        &p.q,
+        cache,
+        nh,
+        heads_per_kv,
+        hd,
+        cfg.scale,
+        cfg.window,
+        cfg.softcap,
+    );
     cache.accumulate_imp(&imp);
     if cfg.output_gate {
         apply_gate(&mut ao, &p.gate);
@@ -1207,8 +1215,16 @@ pub fn qwen_attention_batch(
                 gates_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&gate);
             }
         } else {
-            let (mut ao, mut imp) =
-                attend_all_heads(&q, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window, cfg.softcap);
+            let (mut ao, mut imp) = attend_all_heads(
+                &q,
+                cache,
+                nh,
+                heads_per_kv,
+                hd,
+                cfg.scale,
+                cfg.window,
+                cfg.softcap,
+            );
             cache.accumulate_imp(&imp);
             if cfg.output_gate {
                 apply_gate(&mut ao, &gate);
@@ -1240,7 +1256,16 @@ pub fn qwen_attention_batch(
             let ks: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
             let vs: Vec<&[f32]> = (0..nkv).map(|g| cache.head_values(g)).collect();
             done = crate::gpu::chunk_attend(
-                &qhm, &ks, &vs, b, s0, nh, nkv, hd, cfg.scale, &mut ao_all,
+                &qhm,
+                &ks,
+                &vs,
+                b,
+                s0,
+                nh,
+                nkv,
+                hd,
+                cfg.scale,
+                &mut ao_all,
             );
             recycle_buf(&mut qhm);
         }
@@ -1501,13 +1526,29 @@ pub fn qwen_attention_pair(
     cache.o1_push_q(&qb);
     // Empty alive slice = every head alive (see qwen_attention).
     cache.append(&k1, &v1, &[]);
-    let (mut a1, mut imp1) =
-        attend_all_heads(&qa, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window, cfg.softcap);
+    let (mut a1, mut imp1) = attend_all_heads(
+        &qa,
+        cache,
+        nh,
+        heads_per_kv,
+        hd,
+        cfg.scale,
+        cfg.window,
+        cfg.softcap,
+    );
     cache.accumulate_imp(&imp1);
 
     cache.append(&k2, &v2, &[]);
-    let (mut a2, mut imp2) =
-        attend_all_heads(&qb, cache, nh, heads_per_kv, hd, cfg.scale, cfg.window, cfg.softcap);
+    let (mut a2, mut imp2) = attend_all_heads(
+        &qb,
+        cache,
+        nh,
+        heads_per_kv,
+        hd,
+        cfg.scale,
+        cfg.window,
+        cfg.softcap,
+    );
     cache.accumulate_imp(&imp2);
 
     if cfg.output_gate {

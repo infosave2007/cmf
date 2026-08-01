@@ -41,7 +41,6 @@ pub static FORCED_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 /// governor. Refilled on every pool construction; empty elsewhere.
 pub static WORKER_TIDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 
-
 /// A `*const dyn Fn` that may cross a thread boundary. Safety is
 /// provided by `Pool::run`: the caller blocks until every worker has
 /// finished, so the borrow outlives all uses.

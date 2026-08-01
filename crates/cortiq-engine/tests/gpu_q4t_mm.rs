@@ -267,7 +267,10 @@ fn gpu_vae_conv2d_matches_cpu() {
     }
     // Odd everything: K-tail (ic·k² % 32 ≠ 0), edge oc/position tiles,
     // borders. k=3 and the 1×1 shortcut case.
-    for (ic, oc, h, w, k) in [(20usize, 70usize, 13usize, 17usize, 3usize), (24, 40, 9, 11, 1)] {
+    for (ic, oc, h, w, k) in [
+        (20usize, 70usize, 13usize, 17usize, 3usize),
+        (24, 40, 9, 11, 1),
+    ] {
         let mk = |seed: usize, len: usize| -> Vec<f32> {
             (0..len)
                 .map(|i| ((i * 37 + seed * 11 + 3) % 101) as f32 / 101.0 - 0.5)
@@ -376,9 +379,7 @@ fn gpu_vae_resnet_matches_cpu() {
     let upc = conv(70, ic, ic, 3);
     let mut got_up = vec![0f32; ic * 4 * h * w];
     assert!(
-        cortiq_engine::gpu::vae_upsample_conv(
-            &upc.w, &upc.b, &x, ic, ic, h, w, 3, &mut got_up
-        ),
+        cortiq_engine::gpu::vae_upsample_conv(&upc.w, &upc.b, &x, ic, ic, h, w, 3, &mut got_up),
         "gpu vae_upsample_conv refused"
     );
     let mut xu = vec![0f32; ic * 4 * h * w];

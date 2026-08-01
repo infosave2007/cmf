@@ -276,15 +276,13 @@ pub(crate) fn build_ffn_at(
         let norm = |suffix: &str| -> Result<Vec<f32>, CmfError> {
             load_f32(model, &format!("{prefix}{suffix}.weight"), ov).map_err(CmfError::Parse)
         };
-        return Ok(FfnKind::DenseMoe(Box::new(
-            crate::pipeline::DenseMoeFfn {
-                dense: load_dense(&format!("{prefix}mlp."))?,
-                moe,
-                post_norm_1: norm("post_feedforward_layernorm_1")?,
-                pre_norm_2: norm("pre_feedforward_layernorm_2")?,
-                post_norm_2: norm("post_feedforward_layernorm_2")?,
-            },
-        )));
+        return Ok(FfnKind::DenseMoe(Box::new(crate::pipeline::DenseMoeFfn {
+            dense: load_dense(&format!("{prefix}mlp."))?,
+            moe,
+            post_norm_1: norm("post_feedforward_layernorm_1")?,
+            pre_norm_2: norm("pre_feedforward_layernorm_2")?,
+            post_norm_2: norm("post_feedforward_layernorm_2")?,
+        })));
     }
     Ok(FfnKind::Moe(moe))
 }
@@ -310,10 +308,9 @@ pub(crate) fn moe_task_mask(prefix: &str, ne: usize) -> Option<Vec<bool>> {
         let text = std::fs::read_to_string(&path)
             .map_err(|e| tracing::warn!("CMF_MOE_MASK: cannot read {path}: {e}"))
             .ok()?;
-        let map: std::collections::HashMap<String, Vec<u64>> =
-            serde_json::from_str(&text)
-                .map_err(|e| tracing::warn!("CMF_MOE_MASK: bad JSON in {path}: {e}"))
-                .ok()?;
+        let map: std::collections::HashMap<String, Vec<u64>> = serde_json::from_str(&text)
+            .map_err(|e| tracing::warn!("CMF_MOE_MASK: bad JSON in {path}: {e}"))
+            .ok()?;
         tracing::info!("MoE task mask: {path}, cover {cover}");
         Some((
             map.into_iter()
@@ -333,7 +330,10 @@ pub(crate) fn moe_task_mask(prefix: &str, ne: usize) -> Option<Vec<bool>> {
         .ok()?;
     let counts = stats.get(&li)?;
     if counts.len() != ne {
-        tracing::warn!("CMF_MOE_MASK: layer {li} has {} counts, model has {ne} experts — skipped", counts.len());
+        tracing::warn!(
+            "CMF_MOE_MASK: layer {li} has {} counts, model has {ne} experts — skipped",
+            counts.len()
+        );
         return None;
     }
     let total: u64 = counts.iter().sum();
@@ -353,7 +353,10 @@ pub(crate) fn moe_task_mask(prefix: &str, ne: usize) -> Option<Vec<bool>> {
             break;
         }
     }
-    tracing::info!("MoE task mask L{li}: {kept}/{ne} experts for {:.0}% mass", cover * 100.0);
+    tracing::info!(
+        "MoE task mask L{li}: {kept}/{ne} experts for {:.0}% mass",
+        cover * 100.0
+    );
     Some(mask)
 }
 
@@ -608,10 +611,7 @@ impl Pipeline {
         }
 
         // ── KDA geometry (Kimi Linear / Kimi-K3 delta-attention layers) ──
-        let has_kda = arch
-            .layer_types
-            .iter()
-            .any(|t| matches!(t, LayerType::Kda));
+        let has_kda = arch.layer_types.iter().any(|t| matches!(t, LayerType::Kda));
         let kda_cfg = if has_kda {
             let need = |v: Option<usize>, name: &str| {
                 v.ok_or_else(|| CmfError::Parse(format!("KDA core needs arch.{name}")))
@@ -1169,8 +1169,7 @@ impl Pipeline {
             let mut f = vec![0.0f32; half];
             for (i, slot) in f.iter_mut().enumerate() {
                 *slot = 1.0
-                    / (arch.rope_theta as f32)
-                        .powf(2.0 * i as f32 / mla.qk_rope_head_dim as f32);
+                    / (arch.rope_theta as f32).powf(2.0 * i as f32 / mla.qk_rope_head_dim as f32);
             }
             pipeline.inv_freq = std::sync::Arc::new(f);
             for li in 0..arch.num_layers {
@@ -1270,11 +1269,7 @@ impl Pipeline {
                     gate: t(&format!("{pfx}mlp.gate_proj.weight"))?,
                     up: t(&format!("{pfx}mlp.up_proj.weight"))?,
                     down: t(&format!("{pfx}mlp.down_proj.weight"))?,
-                    sparsity: gc
-                        .activation_sparsity
-                        .get(li)
-                        .copied()
-                        .unwrap_or(0.0),
+                    sparsity: gc.activation_sparsity.get(li).copied().unwrap_or(0.0),
                     ple_gate: t(&format!("{pfx}per_layer_input_gate.weight"))?,
                     ple_proj: t(&format!("{pfx}per_layer_projection.weight"))?,
                     post_ple_norm: f(&format!("{pfx}post_per_layer_input_norm.weight"))?,
@@ -1412,6 +1407,48 @@ impl Pipeline {
                 ybf,
                 ybs,
             ));
+            // Keep the working set resident. Everything but the routed
+            // experts is touched by every token, and of the experts only the
+            // ones the task actually routes to — the page cache cannot know
+            // that and evicts by age instead.
+            if let Ok(stats) = std::env::var("CMF_MOE_PIN") {
+                let cover = std::env::var("CMF_MOE_PIN_COVER")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|&c| c > 0.0 && c <= 1.0)
+                    .unwrap_or(0.95);
+                let hot = crate::pin::hot_experts(&stats, cover);
+                let mut names: Vec<String> = Vec::new();
+                for e in &model.tensors {
+                    let is_expert = e.name.contains(".mlp.experts.");
+                    if !is_expert {
+                        names.push(e.name.clone()); // skeleton: always hot
+                    }
+                }
+                let mut kept_experts = 0usize;
+                if let Some(hot) = &hot {
+                    for (li, experts) in hot {
+                        for e in experts {
+                            for w in ["gate_proj", "up_proj", "down_proj"] {
+                                names.push(format!("model.layers.{li}.mlp.experts.{e}.{w}.weight"));
+                            }
+                            kept_experts += 1;
+                        }
+                    }
+                }
+                let r = crate::pin::pin_tensors(model, &names);
+                tracing::info!(
+                    "закреплено {:.1} ГБ ({} тензоров, горячих экспертов {kept_experts},                      покрытие {cover}); лимит {}",
+                    r.bytes as f64 / 1e9,
+                    r.tensors,
+                    r.limit
+                        .map(|l| format!("{:.1} ГБ", l as f64 / 1e9))
+                        .unwrap_or_else(|| "неизвестен".into())
+                );
+                if r.skipped > 0 {
+                    tracing::warn!("не закреплено тензоров: {}", r.skipped);
+                }
+            }
             let st = crate::dsv4::Dsv4State::new(arch.num_layers);
             pipeline.dsv4 = Some(Box::new((g, dl, cfg, st)));
         }

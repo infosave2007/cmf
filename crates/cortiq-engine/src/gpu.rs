@@ -1010,9 +1010,7 @@ pub fn chunk_attend(
 ) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
-        Backend::Wgpu => {
-            crate::gpu_wgpu::chunk_attend(q, k, v, b, s0, nh, nkv, hd, scale, out)
-        }
+        Backend::Wgpu => crate::gpu_wgpu::chunk_attend(q, k, v, b, s0, nh, nkv, hd, scale, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -1037,9 +1035,7 @@ pub fn q4t_qkv(
 ) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
-        Backend::Wgpu => {
-            crate::gpu_wgpu::q4t_qkv(model, wq, wk, wv, xs, b, cols, rq, rk, rv, out)
-        }
+        Backend::Wgpu => crate::gpu_wgpu::q4t_qkv(model, wq, wk, wv, xs, b, cols, rq, rk, rv, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }

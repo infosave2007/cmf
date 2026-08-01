@@ -990,7 +990,10 @@ mod tests {
         };
         let t = Tokenizer::from_file(&path).expect("load");
         for (text, want) in [
-            ("The capital of France is", vec![671u32, 6102, 294, 8760, 344]),
+            (
+                "The capital of France is",
+                vec![671u32, 6102, 294, 8760, 344],
+            ),
             ("2 + 2 =", vec![20, 940, 223, 20, 438]),
         ] {
             let got = t.encode(text);
@@ -1017,7 +1020,11 @@ mod tests {
         });
         let mut pats = Vec::new();
         collect_split_patterns(&pt, &mut pats);
-        assert_eq!(pats.len(), 2, "both Split stages must be collected: {pats:?}");
+        assert_eq!(
+            pats.len(),
+            2,
+            "both Split stages must be collected: {pats:?}"
+        );
         assert!(pats[0].contains("p{N}"), "digit rule first");
         assert!(pats[1].contains("p{L}"), "word rule second");
 
@@ -1051,7 +1058,11 @@ mod tests {
             pieces = next;
         }
         let got: Vec<&str> = pieces.iter().map(|(a, b)| &norm[*a..*b]).collect();
-        assert_eq!(got, vec!["ab", " cd", "12"], "staged split produced {got:?}");
+        assert_eq!(
+            got,
+            vec!["ab", " cd", "12"],
+            "staged split produced {got:?}"
+        );
     }
 
     #[test]

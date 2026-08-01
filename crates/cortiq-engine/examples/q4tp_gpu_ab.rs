@@ -19,7 +19,9 @@ use std::sync::Arc;
 #[cfg(target_os = "macos")]
 fn main() {
     unsafe { std::env::set_var("CMF_GPU", "1") };
-    let path = std::env::args().nth(1).expect("usage: q4tp_gpu_ab <model.cmf>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: q4tp_gpu_ab <model.cmf>");
     let model = Arc::new(CmfModel::open_sharded(&path).expect("open"));
 
     let mut checked = 0usize;
@@ -138,7 +140,10 @@ fn main() {
                 break;
             }
             best = best.min(t0.elapsed().as_secs_f64());
-            gb = big.iter().map(|&(_, r, c)| 2.0 * b as f64 * r as f64 * c as f64).sum::<f64>();
+            gb = big
+                .iter()
+                .map(|&(_, r, c)| 2.0 * b as f64 * r as f64 * c as f64)
+                .sum::<f64>();
         }
         if best < f64::MAX {
             println!(
@@ -150,7 +155,8 @@ fn main() {
         }
     }
 
-    for (serial, lbl) in [(false, "перекрытый"), (true, "сериализованный")] {
+    for (serial, lbl) in [(false, "перекрытый"), (true, "сериализованный")]
+    {
         match cortiq_engine::gpu_metal::q4_matvec_sweep(&model, &all, serial) {
             Some(t) => println!(
                 "проход {lbl:<16} по {} тензорам: {:.2} мс, {:.2} ГБ, {:.1} ГБ/с",

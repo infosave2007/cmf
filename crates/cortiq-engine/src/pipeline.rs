@@ -261,7 +261,10 @@ pub enum Act {
     GeluTanh,
     /// Kimi-K3 SituAndMul: BOTH halves transform —
     /// a = β·tanh(g/β)·σ(g), up' = linβ·tanh(u/linβ) (linβ>0), out = a·up'.
-    Situ { beta: f32, linear_beta: f32 },
+    Situ {
+        beta: f32,
+        linear_beta: f32,
+    },
 }
 
 impl Act {
@@ -1019,7 +1022,7 @@ impl Pipeline {
                         inv_freq: &inv_freq,
                         rotary_dim: rd,
                         scale: self.attn_scale,
-            softcap: self.attn_softcap,
+                        softcap: self.attn_softcap,
                         window: None,
                         v_norm: false,
                         q_norm: *q_norm,
@@ -1511,9 +1514,7 @@ impl Pipeline {
             // each position's hidden straight from the chunk result.
             let chunk = prefill_chunk();
             let hs = self.hidden_size;
-            while pos < input_ids.len()
-                && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
-            {
+            while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 let end = (pos + chunk).min(input_ids.len());
                 let hb = self.prefill_batch(&input_ids[pos..end], pos);
                 if let Some(m) = &mut mtp {
@@ -1533,7 +1534,11 @@ impl Pipeline {
             }
         }
         let pair_off = std::env::var("CMF_PAIR").is_ok_and(|v| v == "0");
-        if task_mask.is_none() && !dyn_prefill && !graph_prefill && !pair_off && self.pair_supported()
+        if task_mask.is_none()
+            && !dyn_prefill
+            && !graph_prefill
+            && !pair_off
+            && self.pair_supported()
         {
             while pos + 1 < input_ids.len()
                 && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
@@ -1612,9 +1617,7 @@ impl Pipeline {
                 }
             }
         }
-        while pos < input_ids.len()
-            && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
-        {
+        while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
             self.graph_want_logits = fuse_lm && pos + 1 == input_ids.len();
             hidden = self.forward_layers(&self.embed_single(input_ids[pos]), pos, task_mask);
             if let Some(m) = &mut mtp {
@@ -1633,7 +1636,10 @@ impl Pipeline {
         }
         // Cancelled mid-prefill: the cache holds a partial prompt —
         // drop the reuse history and return an empty generation.
-        if self.cancel.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .cancel
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
             self.kv_history.clear();
             if let Some(m) = mtp {
                 self.mtp = Some(m);
@@ -1680,7 +1686,10 @@ impl Pipeline {
         // ── Decode ──
         let mut next_pos = input_ids.len();
         'decode: while generated < max_tokens {
-            if self.cancel.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            if self
+                .cancel
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
                 finish_reason = "cancelled".to_string();
                 break 'decode;
             }
@@ -2092,7 +2101,7 @@ impl Pipeline {
             let (a1, a2) = match &lw.attn {
                 AttnKind::Mla(_) => unreachable!("MLA has no MTP/pair path"),
                 AttnKind::Kda(_) => unreachable!("KDA has no MTP/pair path"),
-            AttnKind::Kda(_) => unreachable!("KDA has no MTP/pair path"),
+                AttnKind::Kda(_) => unreachable!("KDA has no MTP/pair path"),
                 AttnKind::Linear(w) => {
                     let cfg = self.vmf_cfg.expect("linear layer without vmf_cfg");
                     let layer = &mut self.kv_cache.layers[li];
@@ -2159,7 +2168,7 @@ impl Pipeline {
                         inv_freq: &inv_freq_l,
                         rotary_dim: rd_l,
                         scale: self.attn_scale,
-            softcap: self.attn_softcap,
+                        softcap: self.attn_softcap,
                         window: self.layer_window(li),
                         v_norm: self.attn_v_norm,
                         q_norm: q_norm.as_deref(),
@@ -2239,7 +2248,13 @@ impl Pipeline {
                         self.pool.as_deref(),
                     ),
                 ),
-                _ => ffn_forward_pair(&lw.ffn, &self.ws.p1, &self.ws.p2, self.pool.as_deref(), None),
+                _ => ffn_forward_pair(
+                    &lw.ffn,
+                    &self.ws.p1,
+                    &self.ws.p2,
+                    self.pool.as_deref(),
+                    None,
+                ),
             };
             let (f1, f2) = match &self.weights.layers[self.phys_layer(li)].ffn_out_norm {
                 Some(w) => (
@@ -2504,7 +2519,12 @@ impl Pipeline {
                                 .unwrap_or(0);
                             eprintln!(
                                 "BTRACE pos {} target {} nll {:.4} top {} lg_t {:.3} lg_top {:.3}",
-                                pos + k0 + k, target, lse - lg[target] as f64, top, lg[target], lg[top]
+                                pos + k0 + k,
+                                target,
+                                lse - lg[target] as f64,
+                                top,
+                                lg[target],
+                                lg[top]
                             );
                         }
                     }
@@ -3013,7 +3033,7 @@ impl Pipeline {
                         inv_freq: &inv_freq_l,
                         rotary_dim: rd_l,
                         scale: self.attn_scale,
-            softcap: self.attn_softcap,
+                        softcap: self.attn_softcap,
                         window: self.layer_window(li),
                         v_norm: self.attn_v_norm,
                         q_norm: q_norm.as_deref(),
@@ -3550,9 +3570,7 @@ impl Pipeline {
             // Any o1 layer not sealed (or degenerate exact-only) keeps the
             // whole token on the CPU: half-graph forwards would desync.
             let want: usize = (0..self.num_layers)
-                .filter(|li| {
-                    !matches!(self.kv_cache.layers[self.phys_layer(*li)].o1, None)
-                })
+                .filter(|li| !matches!(self.kv_cache.layers[self.phys_layer(*li)].o1, None))
                 .count();
             let have = o1_views.iter().filter(|v| v.is_some()).count();
             if want == 0 || have != want {
@@ -3670,8 +3688,7 @@ impl Pipeline {
                                 }
                             },
                         };
-                        if *q4tp.get_or_insert(is_p) != is_p
-                            || *gu_q2.get_or_insert(is_q2) != is_q2
+                        if *q4tp.get_or_insert(is_p) != is_p || *gu_q2.get_or_insert(is_q2) != is_q2
                         {
                             // The shared expert rides in the same packed
                             // buffer as the routed ones, so a layer that
@@ -3799,18 +3816,21 @@ impl Pipeline {
         let lm = lm_gw.as_ref().map(|(gw, rows)| (gw, *rows));
         // Multi-step re-embeds the winner on the device.
         let emb_gw = if steps > 1 {
-            self.weights.embed_tokens.graph_weight().map(|(_, i, kind, rs)| {
-                (
-                    crate::gpu::GraphW {
-                        idx: i,
-                        kind,
-                        row_scale: rs,
-                        data: &[],
-                    },
-                    self.weights.embed_tokens.rows(),
-                    self.embed_multiplier as f32,
-                )
-            })
+            self.weights
+                .embed_tokens
+                .graph_weight()
+                .map(|(_, i, kind, rs)| {
+                    (
+                        crate::gpu::GraphW {
+                            idx: i,
+                            kind,
+                            row_scale: rs,
+                            data: &[],
+                        },
+                        self.weights.embed_tokens.rows(),
+                        self.embed_multiplier as f32,
+                    )
+                })
         } else {
             None
         };
@@ -4328,7 +4348,7 @@ impl Pipeline {
                         inv_freq: &inv_freq_l,
                         rotary_dim: rd_l,
                         scale: self.attn_scale,
-            softcap: self.attn_softcap,
+                        softcap: self.attn_softcap,
                         window: None,
                         v_norm: self.attn_v_norm,
                         q_norm: q_norm.as_deref(),
@@ -4459,7 +4479,7 @@ impl Pipeline {
                                 inv_freq: &inv_freq_l,
                                 rotary_dim: rd_l,
                                 scale: self.attn_scale,
-            softcap: self.attn_softcap,
+                                softcap: self.attn_softcap,
                                 window: self.layer_window(li),
                                 v_norm: self.attn_v_norm,
                                 q_norm: q_norm.as_deref(),
@@ -4571,9 +4591,13 @@ impl Pipeline {
                         // MoE is sparse by expert selection; a task mask
                         // narrows the ROUTABLE set via its expert fields
                         // (spec §5) when it carries them.
-                        let allowed = task_mask
-                            .and_then(|tm| tm.expert_flags(li, m.experts.len()));
-                        ffn_forward(&lw.ffn, post_normed, self.pool.as_deref(), allowed.as_deref())
+                        let allowed = task_mask.and_then(|tm| tm.expert_flags(li, m.experts.len()));
+                        ffn_forward(
+                            &lw.ffn,
+                            post_normed,
+                            self.pool.as_deref(),
+                            allowed.as_deref(),
+                        )
                     }
                     FfnKind::DenseMoe(dm) => dense_moe_ffn(
                         dm,
@@ -4598,7 +4622,12 @@ impl Pipeline {
                             (FfnKind::Moe(m), Some(tm)) => tm.expert_flags(li, m.experts.len()),
                             _ => None,
                         };
-                        ffn_forward(&lw.ffn, post_normed, self.pool.as_deref(), allowed.as_deref())
+                        ffn_forward(
+                            &lw.ffn,
+                            post_normed,
+                            self.pool.as_deref(),
+                            allowed.as_deref(),
+                        )
                     }
                 },
             };
@@ -5166,9 +5195,9 @@ fn moe_parts(
             row_scale,
             col_field,
             ..
-        } if (*dt == cortiq_core::TensorDtype::Q8Row) || !col_field.is_empty() => {
-            Some((model, *idx, *rows, *cols, row_scale, col_field, false, false))
-        }
+        } if (*dt == cortiq_core::TensorDtype::Q8Row) || !col_field.is_empty() => Some((
+            model, *idx, *rows, *cols, row_scale, col_field, false, false,
+        )),
         // q1: tile-embedded scales — empty rs/col slices, raw xs.
         QTensor::Mapped {
             model,
@@ -5354,11 +5383,7 @@ impl SendMut {
 /// DeepSeek-V3 `noaux_tc`: per-expert sigmoid scores, an optional
 /// selection bias (top-k CHOICE only; weights stay unbiased), a 1e-6 renorm
 /// floor and a routed scale.
-fn moe_route(
-    logits: &[f32],
-    m: &MoeFfn,
-    allowed: Option<&[bool]>,
-) -> (Vec<usize>, Vec<f32>, f32) {
+fn moe_route(logits: &[f32], m: &MoeFfn, allowed: Option<&[bool]>) -> (Vec<usize>, Vec<f32>, f32) {
     let ne = logits.len();
     let p: Vec<f32> = if m.router_sigmoid {
         logits.iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect()
@@ -5377,7 +5402,8 @@ fn moe_route(
     // With norm_topk the kept weights renormalize below; without it
     // the excluded mass is honestly dropped.
     let admit = |e: usize| {
-        m.mask.as_ref().is_none_or(|mk| mk[e]) && allowed.is_none_or(|a| a.get(e).copied().unwrap_or(false))
+        m.mask.as_ref().is_none_or(|mk| mk[e])
+            && allowed.is_none_or(|a| a.get(e).copied().unwrap_or(false))
     };
     let mut idx: Vec<usize> = (0..ne).filter(|&e| admit(e)).collect();
     // Descending by selection score, lower index wins ties (torch.topk).
@@ -5833,7 +5859,11 @@ mod tests {
         p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         let r = p.generate_from_ids(&[1, 2, 3], 8, None, None).unwrap();
         assert_eq!(r.finish_reason, "cancelled");
-        assert!(r.token_ids.is_empty(), "no tokens after cancel: {:?}", r.token_ids);
+        assert!(
+            r.token_ids.is_empty(),
+            "no tokens after cancel: {:?}",
+            r.token_ids
+        );
         // Flag auto-cleared: the next call generates normally.
         let r2 = p.generate_from_ids(&[1, 2, 3], 4, None, None).unwrap();
         assert_ne!(r2.finish_reason, "cancelled");

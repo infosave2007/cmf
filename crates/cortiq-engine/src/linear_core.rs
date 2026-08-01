@@ -564,7 +564,10 @@ fn gdn_projs_eligible(w: &GdnWeights) -> bool {
     // `CMF_GPU_GDN=0` forces the CPU projections back — the switch exists so
     // the two arms can be compared inside ONE run: this machine throttles far
     // enough that measurements minutes apart are not comparable.
-    if std::env::var("CMF_GPU_GDN").map(|v| v == "0").unwrap_or(false) {
+    if std::env::var("CMF_GPU_GDN")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
         return false;
     }
     w.in_proj_qkv.is_q1()
@@ -875,7 +878,6 @@ pub fn short_conv_pair(
     (out1, out2)
 }
 
-
 // ─── Kimi Delta Attention (KDA) ─────────────────────────────────────────
 //
 // Kimi Linear / Kimi-K3 linear mixer (reference: FLA naive_recurrent_kda
@@ -1166,7 +1168,9 @@ pub fn kda_forward(
     let gate_out = kda_gate_out(w, x, vd, pool);
 
     let mut of = vec![0.0f32; vd];
-    kda_step(&xq, &xk, &xv, &f, &b, &gate_out, w, cfg, state, &mut of, pool);
+    kda_step(
+        &xq, &xk, &xv, &f, &b, &gate_out, w, cfg, state, &mut of, pool,
+    );
 
     let mut out = vec![0.0f32; cfg.hidden_size];
     w.o_proj.matvec(&of, &mut out, pool);
@@ -1296,7 +1300,11 @@ mod tests {
                 rms_eps: 1e-6,
             };
             let xs: Vec<Vec<f32>> = (0..6)
-                .map(|t| (0..hs).map(|i| ((t * hs + i) as f32 * 0.37).sin() * 0.5).collect())
+                .map(|t| {
+                    (0..hs)
+                        .map(|i| ((t * hs + i) as f32 * 0.37).sin() * 0.5)
+                        .collect()
+                })
                 .collect();
 
             // Production path.
@@ -1408,7 +1416,8 @@ mod tests {
                     let ss: f64 = o.iter().map(|&v| v * v).sum();
                     let inv = 1.0 / (ss / dv as f64 + cfg.rms_eps).sqrt();
                     for dj in 0..dv {
-                        of[h * dv + dj] = (o[dj] * inv
+                        of[h * dv + dj] = (o[dj]
+                            * inv
                             * w.o_norm[dj] as f64
                             * sigmoid(gate_out[h * dv + dj] as f64))
                             as f32;
@@ -1419,10 +1428,7 @@ mod tests {
 
             for (t, (g, e)) in got.iter().zip(&want).enumerate() {
                 for (i, (a, b)) in g.iter().zip(e.iter()).enumerate() {
-                    assert!(
-                        (a - b).abs() < 2e-4,
-                        "{label}: t={t} i={i}: {a} vs {b}"
-                    );
+                    assert!((a - b).abs() < 2e-4, "{label}: t={t} i={i}: {a} vs {b}");
                 }
             }
         }

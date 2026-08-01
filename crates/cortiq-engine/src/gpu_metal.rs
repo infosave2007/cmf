@@ -4111,8 +4111,7 @@ pub fn q8_resident_or_upload(model: &Arc<CmfModel>, _idx: usize, may_upload: boo
 /// polling stays as the timeout fallback.
 /// CMF_METAL_SUBMITS=1 counts command-buffer round trips. Each costs
 /// ~1.3 ms of completion latency, so the count IS the frame budget.
-pub static METAL_SUBMITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+pub static METAL_SUBMITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn submit_and_wait(c: &Ctx, cmd: &metal::CommandBufferRef, outs: &[&Buffer]) {
     // NOTE: a "fast flag" variant (last encoder writes a ticket into a
@@ -4895,10 +4894,9 @@ pub fn q4tp_matvec_for_test(
     let Some((fbuf, safe_len)) = file_buffer(c, model) else {
         return false;
     };
-    let Some(need) = cortiq_core::quant::expected_nbytes(
-        cortiq_core::TensorDtype::Q4TiledP,
-        &[rows, cols],
-    ) else {
+    let Some(need) =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+    else {
         return false;
     };
     if abs + need > safe_len {
@@ -5467,7 +5465,9 @@ pub fn chunk_run_gpu(
                     // buffer is invalid, so bind a 4-byte placeholder the
                     // q4t kernels never read.
                     if t.3.is_empty() {
-                        return c._device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+                        return c
+                            ._device
+                            .new_buffer(4, MTLResourceOptions::StorageModeShared);
                     }
                     c._device.new_buffer_with_data(
                         t.3.as_ptr() as *const std::ffi::c_void,
@@ -5495,9 +5495,15 @@ pub fn chunk_run_gpu(
             kind_of(&l.up),
             kind_of(&l.down),
         ] {
-            [Some(a), Some(b), Some(c), Some(d), Some(e), Some(f), Some(g)] => {
-                [a, b, c, d, e, f, g]
-            }
+            [
+                Some(a),
+                Some(b),
+                Some(c),
+                Some(d),
+                Some(e),
+                Some(f),
+                Some(g),
+            ] => [a, b, c, d, e, f, g],
             _ => return false,
         };
         // KV mirror prep (self-healing contract of the decode graph),
@@ -5970,7 +5976,11 @@ pub fn chunk_run_gpu(
                 5
             };
             enc.set_bytes(base, 4, &cols_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(base + 1, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(
+                base + 1,
+                4,
+                &rows_u as *const u32 as *const std::ffi::c_void,
+            );
             enc.set_bytes(base + 2, 4, &b_u as *const u32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new((b as u64).div_ceil(32), (l.down.1 as u64).div_ceil(64), 1),
@@ -6507,8 +6517,10 @@ fn cached_weight_buf(c: &Ctx, base: usize, data: &[f32]) -> Buffer {
         .entry(key)
         .or_insert_with(|| {
             fresh = true;
-            c._device
-                .new_buffer((data.len() * 4) as u64, MTLResourceOptions::StorageModeShared)
+            c._device.new_buffer(
+                (data.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
         })
         .clone();
     if fresh {
@@ -6570,7 +6582,10 @@ fn encode_conv(
         for (i, wv) in words.iter().enumerate() {
             enc.set_bytes(3 + i as u64, 4, wv as *const u32 as *const std::ffi::c_void);
         }
-        enc.dispatch_threads(MTLSize::new((hw * oc) as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_threads(
+            MTLSize::new((hw * oc) as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
         enc.end_encoding();
     }
 }
@@ -6612,16 +6627,14 @@ fn encode_groupnorm(
         enc.set_buffer(2, Some(st), 0);
         enc.set_buffer(3, Some(wa), 0);
         enc.set_buffer(4, Some(ba), 0);
-        let words = [
-            per_g as u32,
-            hw as u32,
-            (ch * hw) as u32,
-            do_silu as u32,
-        ];
+        let words = [per_g as u32, hw as u32, (ch * hw) as u32, do_silu as u32];
         for (i, wv) in words.iter().enumerate() {
             enc.set_bytes(5 + i as u64, 4, wv as *const u32 as *const std::ffi::c_void);
         }
-        enc.dispatch_threads(MTLSize::new((ch * hw) as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_threads(
+            MTLSize::new((ch * hw) as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
         enc.end_encoding();
     }
 }
@@ -6766,7 +6779,10 @@ pub fn vae_resnet(a: &crate::gpu::VaeResnetArgs, x: &[f32], out: &mut [f32]) -> 
         let n_u = (oc * hw) as u32;
         enc.set_bytes(2, 4, &one as *const f32 as *const std::ffi::c_void);
         enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
-        enc.dispatch_threads(MTLSize::new((oc * hw) as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_threads(
+            MTLSize::new((oc * hw) as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
         enc.end_encoding();
     }
     submit_and_wait(c, cmd, &[&h2]);
@@ -6818,7 +6834,10 @@ pub fn vae_upsample_conv(
         for (i, wv) in words.iter().enumerate() {
             enc.set_bytes(2 + i as u64, 4, wv as *const u32 as *const std::ffi::c_void);
         }
-        enc.dispatch_threads(MTLSize::new((ic * hw2) as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_threads(
+            MTLSize::new((ic * hw2) as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
         enc.end_encoding();
     }
     encode_conv(
@@ -6934,11 +6953,7 @@ pub fn dit_attention(
                         dst.add(hh * n32 * hd),
                         n * hd,
                     );
-                    std::ptr::write_bytes(
-                        dst.add(hh * n32 * hd + n * hd),
-                        0,
-                        (n32 - n) * hd,
-                    );
+                    std::ptr::write_bytes(dst.add(hh * n32 * hd + n * hd), 0, (n32 - n) * hd);
                 }
             }
             buf
@@ -7101,8 +7116,18 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
         let dst = p_buf.contents() as *mut f32;
         let mut off = 0usize;
         for v in [
-            a.norm1, a.norm2, a.ffn_norm1, a.ffn_norm2, a.s_msa, a.gate_msa, a.s_mlp, a.gate_mlp,
-            a.norm_q, a.norm_k, a.rope_cos, a.rope_sin,
+            a.norm1,
+            a.norm2,
+            a.ffn_norm1,
+            a.ffn_norm2,
+            a.s_msa,
+            a.gate_msa,
+            a.s_mlp,
+            a.gate_mlp,
+            a.norm_q,
+            a.norm_k,
+            a.rope_cos,
+            a.rope_sin,
         ] {
             unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), dst.add(off), v.len()) };
             off += v.len();
@@ -7197,16 +7222,11 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
                     enc.set_buffer(0, Some(buf), ((hh * n32 + n) * hd * 4) as u64);
                     let cnt = ((n32 - n) * hd) as u32;
                     enc.set_bytes(1, 4, &cnt as *const u32 as *const std::ffi::c_void);
-                    enc.dispatch_threads(
-                        MTLSize::new(cnt as u64, 1, 1),
-                        MTLSize::new(256, 1, 1),
-                    );
+                    enc.dispatch_threads(MTLSize::new(cnt as u64, 1, 1), MTLSize::new(256, 1, 1));
                 }
             }
         }
-        for (src, dst, heads, w_off) in
-            [(&qtok, &qhm, nh, o_nq), (&ktok, &khm, nkv, o_nk)]
-        {
+        for (src, dst, heads, w_off) in [(&qtok, &qhm, nh, o_nq), (&ktok, &khm, nkv, o_nk)] {
             enc.set_compute_pipeline_state(&c.ropepack);
             enc.set_buffer(0, Some(src), 0);
             enc.set_buffer(1, Some(dst), 0);
@@ -7244,9 +7264,7 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
     // with the shared n×n scratch stays as the fallback.
     let scale = 1.0f32 / (hd as f32).sqrt();
     if flash_ok(hd) {
-        encode_flash_attend(
-            c, cmd, &qhm, &khm, &vhm, &attnb, nh, nkv, n, n32, hd, scale,
-        );
+        encode_flash_attend(c, cmd, &qhm, &khm, &vhm, &attnb, nh, nkv, n, n32, hd, scale);
     } else {
         let sc = get_io(19_000_000_151 + n * n, n * n * 4);
         let pb = get_io(20_000_000_167 + nh * n * hd, nh * n * hd * 4);
@@ -7277,10 +7295,7 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
                 enc.set_buffer(0, Some(&sc), 0);
                 let n_u = u32c(n);
                 enc.set_bytes(1, 4, &n_u as *const u32 as *const std::ffi::c_void);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(n as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
+                enc.dispatch_thread_groups(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
                 enc.end_encoding();
             }
             {
@@ -7532,11 +7547,7 @@ fn moe_block_jobs_q4tp(
             *pd.add(i) = t[2] as u64;
             *pw.add(i) = jobs[i].w;
         }
-        std::ptr::copy_nonoverlapping(
-            jobs[0].xs_gate.as_ptr(),
-            xbuf.contents() as *mut f32,
-            gcols,
-        );
+        std::ptr::copy_nonoverlapping(jobs[0].xs_gate.as_ptr(), xbuf.contents() as *mut f32, gcols);
     }
 
     let cmd = c.queue.new_command_buffer();
@@ -7719,9 +7730,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
 
     // Uniform all-q4tp block: four dispatches for every expert together.
     if moe_jobs_batchable(jobs) {
-        if let Some(()) =
-            moe_block_jobs_q4tp(c, &fbuf, jobs, &abs3, inter, hidden, out, &get_io)
-        {
+        if let Some(()) = moe_block_jobs_q4tp(c, &fbuf, jobs, &abs3, inter, hidden, out, &get_io) {
             return true;
         }
     }
@@ -7840,8 +7849,28 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
 
         {
             let enc = cmd.new_compute_command_encoder();
-            matvec(enc, trio[0], *grows, *gcols, rs3[0].as_ref(), j.q4t, j.q4tp, &xsg, &g_buf);
-            matvec(enc, trio[1], *urows, *ucols, rs3[1].as_ref(), j.q4t, j.q4tp, &xsu, &u_buf);
+            matvec(
+                enc,
+                trio[0],
+                *grows,
+                *gcols,
+                rs3[0].as_ref(),
+                j.q4t,
+                j.q4tp,
+                &xsg,
+                &g_buf,
+            );
+            matvec(
+                enc,
+                trio[1],
+                *urows,
+                *ucols,
+                rs3[1].as_ref(),
+                j.q4t,
+                j.q4tp,
+                &xsu,
+                &u_buf,
+            );
             enc.end_encoding();
         }
         {
@@ -8317,9 +8346,8 @@ impl TokenGraph {
         }
         let entry = &self.model.tensors[idx];
         let abs = self.model.entry_abs_offset(entry)?;
-        let need = cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[
-            rows, cols,
-        ])?;
+        let need =
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])?;
         if abs + need > self.safe_len {
             return None;
         }
@@ -8677,12 +8705,7 @@ impl TokenGraph {
 
     /// O-projection from a device-resident attention output + residual
     /// + post-norm + FFN + residual.
-    fn encode_o_ffn(
-        &self,
-        enc: &metal::ComputeCommandEncoderRef,
-        l: &AttnGpuLayer,
-        ao_b: &Buffer,
-    ) {
+    fn encode_o_ffn(&self, enc: &metal::ComputeCommandEncoderRef, l: &AttnGpuLayer, ao_b: &Buffer) {
         let (abs, q1t) = self.proj_abs(l.wo).unwrap();
         encode_proj(
             self.c,
@@ -9490,16 +9513,16 @@ mod tests {
             num_global_kv_heads: None,
             global_partial_rotary_factor: None,
             final_logit_softcapping: None,
-        attn_logit_softcapping: None,
-        mla: None,
-        activation_situ_beta: None,
-        activation_situ_linear_beta: None,
+            attn_logit_softcapping: None,
+            mla: None,
+            activation_situ_beta: None,
+            activation_situ_linear_beta: None,
             attn_v_norm: false,
             num_loops: 1,
-        kda_gate_lower_bound: None,
-        g3n: None,
-        rope_freq_factors: None,
-        logit_multiplier: None,
+            kda_gate_lower_bound: None,
+            g3n: None,
+            rope_freq_factors: None,
+            logit_multiplier: None,
             loop_final_norm: false,
         };
         let header = CmfHeader {
@@ -9616,16 +9639,16 @@ mod tests {
             num_global_kv_heads: None,
             global_partial_rotary_factor: None,
             final_logit_softcapping: None,
-        attn_logit_softcapping: None,
-        mla: None,
-        activation_situ_beta: None,
-        activation_situ_linear_beta: None,
+            attn_logit_softcapping: None,
+            mla: None,
+            activation_situ_beta: None,
+            activation_situ_linear_beta: None,
             attn_v_norm: false,
             num_loops: 1,
-        kda_gate_lower_bound: None,
-        g3n: None,
-        rope_freq_factors: None,
-        logit_multiplier: None,
+            kda_gate_lower_bound: None,
+            g3n: None,
+            rope_freq_factors: None,
+            logit_multiplier: None,
             loop_final_norm: false,
         };
         let header = CmfHeader {
@@ -9771,16 +9794,16 @@ mod tests {
             num_global_kv_heads: None,
             global_partial_rotary_factor: None,
             final_logit_softcapping: None,
-        attn_logit_softcapping: None,
-        mla: None,
-        activation_situ_beta: None,
-        activation_situ_linear_beta: None,
+            attn_logit_softcapping: None,
+            mla: None,
+            activation_situ_beta: None,
+            activation_situ_linear_beta: None,
             attn_v_norm: false,
             num_loops: 1,
-        kda_gate_lower_bound: None,
-        g3n: None,
-        rope_freq_factors: None,
-        logit_multiplier: None,
+            kda_gate_lower_bound: None,
+            g3n: None,
+            rope_freq_factors: None,
+            logit_multiplier: None,
             loop_final_norm: false,
         };
         let header = CmfHeader {

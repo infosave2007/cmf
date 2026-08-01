@@ -259,7 +259,10 @@ pub fn hash_route(tid2eid: &[f32], vocab: usize, top_k: usize, tid: u32) -> Vec<
 /// and attends to the wrong offsets.
 pub fn rope_tail(v: &mut [f32], inv_freq: &[f32], pos: usize, rd: usize, inverse: bool) {
     let n = v.len();
-    debug_assert!(rd <= n && rd % 2 == 0, "rope tail {rd} wider than the vector {n}");
+    debug_assert!(
+        rd <= n && rd % 2 == 0,
+        "rope tail {rd} wider than the vector {n}"
+    );
     // A tail wider than the vector is a configuration mistake, and `n - rd`
     // would wrap into an index in the billions rather than say so.
     let rd = rd.min(n) & !1;
@@ -337,7 +340,10 @@ pub fn sparse_attend(
         eprintln!(
             "    [порт] позиций={} score={:?} sink={sink:.4} denom={denom:.4} |q|={:.3}",
             idxs.iter().filter(|&&p| p != usize::MAX).count(),
-            scores.iter().map(|x| (x * 10000.0).round() / 10000.0).collect::<Vec<_>>(),
+            scores
+                .iter()
+                .map(|x| (x * 10000.0).round() / 10000.0)
+                .collect::<Vec<_>>(),
             q.iter().map(|x| x * x).sum::<f32>().sqrt()
         );
     }
@@ -891,11 +897,26 @@ fn compressor_step(
     }
     let mut folded = vec![0.0f32; ew];
     if cp.overlap {
-        compress_window_overlap(prev_kv, prev_score, pending_kv, pending_score, cp.ratio, ew, &mut folded);
+        compress_window_overlap(
+            prev_kv,
+            prev_score,
+            pending_kv,
+            pending_score,
+            cp.ratio,
+            ew,
+            &mut folded,
+        );
         *prev_kv = std::mem::take(pending_kv);
         *prev_score = std::mem::take(pending_score);
     } else {
-        compress_window(pending_kv, pending_score, &cp.ape, cp.ratio, width, &mut folded);
+        compress_window(
+            pending_kv,
+            pending_score,
+            &cp.ape,
+            cp.ratio,
+            width,
+            &mut folded,
+        );
     }
     rms_weighted(&mut folded, &cp.norm, norm_eps);
     // The entry carries the same rope-tagged tail as a window key, at the
@@ -955,8 +976,17 @@ pub fn attention_step(
         let mut qk = std::mem::take(&mut st.prev_kv[li]);
         let mut qs = std::mem::take(&mut st.prev_score[li]);
         let entry = compressor_step(
-            cp, hidden, pos, rd, cfg.norm_eps, inv_freq, pool,
-            &mut pk, &mut ps, &mut qk, &mut qs,
+            cp,
+            hidden,
+            pos,
+            rd,
+            cfg.norm_eps,
+            inv_freq,
+            pool,
+            &mut pk,
+            &mut ps,
+            &mut qk,
+            &mut qs,
         );
         st.pending_kv[li] = pk;
         st.pending_score[li] = ps;
@@ -976,8 +1006,17 @@ pub fn attention_step(
         let mut qk = std::mem::take(&mut st.prev_ix_kv[li]);
         let mut qs = std::mem::take(&mut st.prev_ix_score[li]);
         let entry = compressor_step(
-            &ix.compressor, hidden, pos, rd, cfg.norm_eps, inv_freq, pool,
-            &mut pk, &mut ps, &mut qk, &mut qs,
+            &ix.compressor,
+            hidden,
+            pos,
+            rd,
+            cfg.norm_eps,
+            inv_freq,
+            pool,
+            &mut pk,
+            &mut ps,
+            &mut qk,
+            &mut qs,
         );
         st.pending_ix_kv[li] = pk;
         st.pending_ix_score[li] = ps;
@@ -1186,8 +1225,17 @@ pub fn moe_step(
     out.fill(0.0);
     let mut acc = vec![0.0f32; cfg.dim];
     for (e, &ei) in idx.iter().enumerate() {
-        let Some(exp) = l.experts.get(ei) else { continue };
-        run_expert(hidden, exp, cfg, w.get(e).copied().unwrap_or(0.0), pool, &mut acc);
+        let Some(exp) = l.experts.get(ei) else {
+            continue;
+        };
+        run_expert(
+            hidden,
+            exp,
+            cfg,
+            w.get(e).copied().unwrap_or(0.0),
+            pool,
+            &mut acc,
+        );
         for (o, a) in out.iter_mut().zip(&acc) {
             *o += a;
         }
@@ -1267,7 +1315,11 @@ fn dump_path() -> Option<&'static str> {
 fn dump_line(json: &str) {
     if let Some(p) = dump_path() {
         use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+        {
             let _ = writeln!(f, "{json}");
         }
     }
@@ -1351,7 +1403,11 @@ pub fn forward_token(
                 } else {
                     &g.inv_freq_window
                 };
-                let freqs = if freqs.is_empty() { inv_freq } else { freqs.as_slice() };
+                let freqs = if freqs.is_empty() {
+                    inv_freq
+                } else {
+                    freqs.as_slice()
+                };
                 attention_step(folded, l, cfg, st, li, freqs, pool, out);
                 if dump_path().is_some() {
                     BODY.with(|b| b.borrow_mut().push(vec_json(out)));
@@ -1407,7 +1463,14 @@ pub fn forward_token(
 
     // Collapse the copies, normalize, project to the vocabulary.
     let mut h = vec![0.0f32; dim];
-    hc_head_fold(&state, &g.hc_head_fn, g.hc_head_scale, &g.hc_head_base, cfg, &mut h);
+    hc_head_fold(
+        &state,
+        &g.hc_head_fn,
+        g.hc_head_scale,
+        &g.hc_head_base,
+        cfg,
+        &mut h,
+    );
     rms_weighted(&mut h, &g.norm, cfg.norm_eps);
     logits.clear();
     logits.resize(g.head.rows(), 0.0);
@@ -1417,7 +1480,15 @@ pub fn forward_token(
         let picked = PICKED.with(|p| {
             p.borrow()
                 .iter()
-                .map(|v| format!("[{}]", v.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(",")))
+                .map(|v| {
+                    format!(
+                        "[{}]",
+                        v.iter()
+                            .map(|e| e.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(",")
         });
@@ -1636,7 +1707,9 @@ mod tests {
                 .map(|i| (((i * 7 + seed * 13) % 101) as f32 / 101.0 - 0.5) * 0.3)
                 .collect()
         };
-        let t = |rows: usize, cols: usize, seed: usize| QTensor::from_f32(w(rows * cols, seed), rows, cols);
+        let t = |rows: usize, cols: usize, seed: usize| {
+            QTensor::from_f32(w(rows * cols, seed), rows, cols)
+        };
         let ones = |n: usize| vec![1.0f32; n];
 
         let (dim, hc) = (cfg.dim, cfg.hc_mult);
@@ -1647,7 +1720,7 @@ mod tests {
         let o_per_group = q_width / cfg.o_groups;
         let mut layers = Vec::new();
         for li in 0..2 {
-        let experts: Vec<Dsv4Expert> = (0..cfg.n_routed_experts)
+            let experts: Vec<Dsv4Expert> = (0..cfg.n_routed_experts)
                 .map(|e| Dsv4Expert {
                     w1: t(cfg.moe_inter, dim, 40 + e + li * 8),
                     w2: t(dim, cfg.moe_inter, 60 + e + li * 8),
@@ -1762,7 +1835,16 @@ mod tests {
         // compressed cache is written on a boundary and read afterwards.
         let mut first: Option<Vec<f32>> = None;
         for (step, tok) in [3u32, 7, 1, 9, 4, 2, 8, 5, 6, 0].into_iter().enumerate() {
-            forward_token(&g, &layers, &cfg, &mut st, tok, &inv_freq, None, &mut logits);
+            forward_token(
+                &g,
+                &layers,
+                &cfg,
+                &mut st,
+                tok,
+                &inv_freq,
+                None,
+                &mut logits,
+            );
             assert_eq!(logits.len(), cfg.vocab, "step {step}: logit count");
             assert!(
                 logits.iter().all(|v| v.is_finite()),
@@ -1824,7 +1906,16 @@ mod tests {
         // and at the end of a filled one cannot give identical logits.
         let mut fresh = Dsv4State::new(layers.len());
         let mut relogits = Vec::new();
-        forward_token(&g, &layers, &cfg, &mut fresh, 3, &inv_freq, None, &mut relogits);
+        forward_token(
+            &g,
+            &layers,
+            &cfg,
+            &mut fresh,
+            3,
+            &inv_freq,
+            None,
+            &mut relogits,
+        );
         assert_eq!(
             relogits,
             first.unwrap(),
@@ -1880,7 +1971,10 @@ mod tests {
             0.0,
             &mut raw,
         );
-        assert!((raw[1] - silu(50.0) * -50.0).abs() < 1e-3, "limit 0 must not clamp");
+        assert!(
+            (raw[1] - silu(50.0) * -50.0).abs() < 1e-3,
+            "limit 0 must not clamp"
+        );
     }
 
     /// The grouped projection writes its intermediate from several threads
@@ -1917,7 +2011,16 @@ mod tests {
         };
 
         let mut serial = vec![0.0f32; dim];
-        o_project(&attn, &row, per_group, &project, groups, lora, None, &mut serial);
+        o_project(
+            &attn,
+            &row,
+            per_group,
+            &project,
+            groups,
+            lora,
+            None,
+            &mut serial,
+        );
 
         let pool = crate::pool::Pool::new(4);
         let mut pooled = vec![0.0f32; dim];
@@ -1932,7 +2035,10 @@ mod tests {
             &mut pooled,
         );
         assert_eq!(serial, pooled, "the pooled projection diverged");
-        assert!(serial.iter().any(|v| v.abs() > 1e-6), "test data is degenerate");
+        assert!(
+            serial.iter().any(|v| v.abs() > 1e-6),
+            "test data is degenerate"
+        );
     }
 
     /// The overlapping compressor folds 2*ratio slots, not ratio: the
@@ -1973,13 +2079,24 @@ mod tests {
         // current one — this is the very first window of a generation.
         let mut first = vec![0.0f32; d];
         compress_window_overlap(&[], &[], &cur_kv, &cur_sc, ratio, d, &mut first);
-        assert!(first.iter().all(|v| v.is_finite()), "first window: {first:?}");
+        assert!(
+            first.iter().all(|v| v.is_finite()),
+            "first window: {first:?}"
+        );
         assert!((first[0] - 40.0).abs() < 1e-3, "first dim0 = {}", first[0]);
 
         // And a previous window with real scores does pull the result.
         let mut both = vec![0.0f32; d];
         let strong_prev = vec![100.0f32; ratio * 2 * d];
-        compress_window_overlap(&prev_kv, &strong_prev, &cur_kv, &cur_sc, ratio, d, &mut both);
+        compress_window_overlap(
+            &prev_kv,
+            &strong_prev,
+            &cur_kv,
+            &cur_sc,
+            ratio,
+            d,
+            &mut both,
+        );
         assert!(
             (both[0] - 40.0).abs() > 1.0,
             "a scored previous window must move the fold, got {}",
@@ -1999,15 +2116,35 @@ mod tests {
         let base: Vec<f32> = (0..24).map(|i| (i as f32 * 0.11).cos()).collect();
         let (mut pre, mut post, mut comb) = (vec![0.0; hc], vec![0.0; hc], vec![0.0; hc * hc]);
         hc_split_sinkhorn(
-            &mixes, &[1.0, 1.0, 1.0], &base, hc, 20, 1e-6, &mut pre, &mut post, &mut comb,
+            &mixes,
+            &[1.0, 1.0, 1.0],
+            &base,
+            hc,
+            20,
+            1e-6,
+            &mut pre,
+            &mut post,
+            &mut comb,
         );
         let want_pre = [0.7310596, 0.8888268, 0.9525191, 0.97424865];
         let want_post = [1.9600224, 1.9534285, 1.9201256, 1.8160983];
         let want_comb = [
-            0.5996052, 0.28253591, 0.09218107, 0.025676856,
-            0.17564717, 0.22228767, 0.27174541, 0.33031881,
-            0.029528176, 0.12206022, 0.32619134, 0.5222193,
-            0.19521846, 0.37311527, 0.30988118, 0.12178412,
+            0.5996052,
+            0.28253591,
+            0.09218107,
+            0.025676856,
+            0.17564717,
+            0.22228767,
+            0.27174541,
+            0.33031881,
+            0.029528176,
+            0.12206022,
+            0.32619134,
+            0.5222193,
+            0.19521846,
+            0.37311527,
+            0.30988118,
+            0.12178412,
         ];
         for (i, w) in want_pre.iter().enumerate() {
             assert!((pre[i] - w).abs() < 1e-5, "pre[{i}]: {} vs {w}", pre[i]);
@@ -2122,7 +2259,15 @@ mod tests {
         let kv = [1.0f32, 0.0, 0.0, 1.0];
         let (mut a, mut b) = (vec![0.0f32; hd], vec![0.0f32; hd]);
         sparse_attend(&q, &kv, &[0], f32::NEG_INFINITY, 1.0, hd, &mut a);
-        sparse_attend(&q, &kv, &[0, usize::MAX], f32::NEG_INFINITY, 1.0, hd, &mut b);
+        sparse_attend(
+            &q,
+            &kv,
+            &[0, usize::MAX],
+            f32::NEG_INFINITY,
+            1.0,
+            hd,
+            &mut b,
+        );
         for (x, y) in a.iter().zip(&b) {
             assert!((x - y).abs() < 1e-6, "{x} vs {y}");
         }
@@ -2155,8 +2300,16 @@ mod tests {
         let ape = vec![0.0f32; ratio * width];
         let mut out = vec![0.0f32; width];
         compress_window(&kv, &score, &ape, ratio, width, &mut out);
-        assert!((out[0] - 2.0).abs() < 1e-5, "equal scores average: {}", out[0]);
-        assert!((out[1] - 20.0).abs() < 1e-3, "a dominant score wins: {}", out[1]);
+        assert!(
+            (out[0] - 2.0).abs() < 1e-5,
+            "equal scores average: {}",
+            out[0]
+        );
+        assert!(
+            (out[1] - 20.0).abs() < 1e-3,
+            "a dominant score wins: {}",
+            out[1]
+        );
     }
 
     /// A negative dot product must not drag a position down: the relu
@@ -2305,15 +2458,34 @@ mod tests {
         assert_eq!(idx_forced, vec![0, 1]);
 
         let (mut idx, mut w) = (Vec::new(), Vec::new());
-        route(&scores, None, 2, 1.0, Some(&idx_forced), None, &mut idx, &mut w);
+        route(
+            &scores,
+            None,
+            2,
+            1.0,
+            Some(&idx_forced),
+            None,
+            &mut idx,
+            &mut w,
+        );
         assert_eq!(idx, vec![0, 1], "the table must decide the experts");
 
         // The weights must be the table experts' own scores, normalized.
         let sp = |x: f32| (1.0 + x.exp()).ln().sqrt();
         let (s0, s1) = (sp(scores[0]), sp(scores[1]));
         let tot = s0 + s1;
-        assert!((w[0] - s0 / tot).abs() < 1e-6, "w[0]={} want {}", w[0], s0 / tot);
-        assert!((w[1] - s1 / tot).abs() < 1e-6, "w[1]={} want {}", w[1], s1 / tot);
+        assert!(
+            (w[0] - s0 / tot).abs() < 1e-6,
+            "w[0]={} want {}",
+            w[0],
+            s0 / tot
+        );
+        assert!(
+            (w[1] - s1 / tot).abs() < 1e-6,
+            "w[1]={} want {}",
+            w[1],
+            s1 / tot
+        );
 
         // And the top-k path is untouched: expert 3 still wins there.
         let (mut idx2, mut w2) = (Vec::new(), Vec::new());

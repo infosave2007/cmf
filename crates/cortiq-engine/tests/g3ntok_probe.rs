@@ -1,9 +1,12 @@
 #[test]
 fn g3n_tokenizer_roundtrip() {
     let p = "/Users/oleg/Documents/cortiq-bot/models/g3n-e4b-it-q4t.cmf";
-    if !std::path::Path::new(p).exists() { return; }
+    if !std::path::Path::new(p).exists() {
+        return;
+    }
     let m = std::sync::Arc::new(cortiq_core::CmfModel::open(p).unwrap());
-    let pl = cortiq_engine::Pipeline::from_model(&m, cortiq_engine::SamplerConfig::default()).unwrap();
+    let pl =
+        cortiq_engine::Pipeline::from_model(&m, cortiq_engine::SamplerConfig::default()).unwrap();
     let text = "def f():\n    return 1";
     let ids = pl.tokenizer.encode(text);
     let full = pl.tokenizer.decode(&ids);

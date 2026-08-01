@@ -582,7 +582,8 @@ impl QTensor {
                     let mut sc = vec![0f32; gpr];
                     v.scales_into(r, gpr, &mut sc);
                     for gi in 0..gpr {
-                        let ch = &v.nib[(r * gpr + gi) * Q2TP_CHUNK..(r * gpr + gi + 1) * Q2TP_CHUNK];
+                        let ch =
+                            &v.nib[(r * gpr + gi) * Q2TP_CHUNK..(r * gpr + gi + 1) * Q2TP_CHUNK];
                         let s = sc[gi];
                         for (k, &b) in ch.iter().enumerate() {
                             for j in 0..4 {
@@ -2204,10 +2205,8 @@ impl QTensor {
                     for r in start..end {
                         gv_view.scales_into(r, gpr, &mut gsc);
                         uv_view.scales_into(r, gpr, &mut usc);
-                        let mut gv =
-                            dot_q4tp_row_i8(gv_view.nib, r, gpr, &act.xq, &gsc) * act.sx;
-                        let mut uv =
-                            dot_q4tp_row_i8(uv_view.nib, r, gpr, &act.xq, &usc) * act.sx;
+                        let mut gv = dot_q4tp_row_i8(gv_view.nib, r, gpr, &act.xq, &gsc) * act.sx;
+                        let mut uv = dot_q4tp_row_i8(uv_view.nib, r, gpr, &act.xq, &usc) * act.sx;
                         for &(j, xv) in &act.outliers {
                             let (w, s) = q4tp_outlier(gv_view.nib, r, gpr, j, &gsc);
                             gv += w * s * xv;
@@ -3942,13 +3941,7 @@ fn dot_q4tp_row_i8(nib: &[u8], r: usize, gpr: usize, xq: &[i8], scales: &[f32]) 
 /// stride is 16 B (no inline scale) and the scale is a ladder lookup.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon,dotprod")]
-unsafe fn dot_q4tp_row_sdot(
-    nib: &[u8],
-    r: usize,
-    gpr: usize,
-    xq: &[i8],
-    scales: &[f32],
-) -> f32 {
+unsafe fn dot_q4tp_row_sdot(nib: &[u8], r: usize, gpr: usize, xq: &[i8], scales: &[f32]) -> f32 {
     // SAFETY: callers uphold slice-length contracts (16B tile per group,
     // xq.len() == gpr·GROUP_SIZE, codes covering gpr 5-bit fields).
     unsafe {
@@ -3983,13 +3976,7 @@ unsafe fn dot_q4tp_row_sdot(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn dot_q4tp_row_avx2(
-    nib: &[u8],
-    r: usize,
-    gpr: usize,
-    xq: &[i8],
-    scales: &[f32],
-) -> f32 {
+unsafe fn dot_q4tp_row_avx2(nib: &[u8], r: usize, gpr: usize, xq: &[i8], scales: &[f32]) -> f32 {
     // SAFETY: see dot_q4tp_row_sdot.
     unsafe {
         use core::arch::x86_64::*;
@@ -4024,13 +4011,7 @@ unsafe fn dot_q4tp_row_avx2(
 /// 256-bit VL encoding is the one to use here).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
-unsafe fn dot_q4tp_row_vnni(
-    nib: &[u8],
-    r: usize,
-    gpr: usize,
-    xq: &[i8],
-    scales: &[f32],
-) -> f32 {
+unsafe fn dot_q4tp_row_vnni(nib: &[u8], r: usize, gpr: usize, xq: &[i8], scales: &[f32]) -> f32 {
     // SAFETY: see dot_q4tp_row_sdot.
     unsafe {
         use core::arch::x86_64::*;
@@ -4347,7 +4328,8 @@ fn q4tp_matmat(
                     let tile = &v.nib[(r * gpr + gi) * Q4TP_NIB..(r * gpr + gi + 1) * Q4TP_NIB];
                     for (k, &bb) in tile.iter().enumerate() {
                         dst[gi * GROUP_SIZE + k * 2] = ((bb & 0x0F) as f32 - 8.0) * s[gi];
-                        dst[gi * GROUP_SIZE + k * 2 + 1] = (((bb >> 4) & 0x0F) as f32 - 8.0) * s[gi];
+                        dst[gi * GROUP_SIZE + k * 2 + 1] =
+                            (((bb >> 4) & 0x0F) as f32 - 8.0) * s[gi];
                     }
                 }
             },
@@ -9505,7 +9487,11 @@ mod tests {
             best.1 = best.1.min(t0.elapsed().as_secs_f64());
         }
         let ratio = best.1 / best.0;
-        println!("q4t {:.3} ms | q4tp {:.3} ms | {ratio:.2}x", best.0 * 1e3 / n as f64, best.1 * 1e3 / n as f64);
+        println!(
+            "q4t {:.3} ms | q4tp {:.3} ms | {ratio:.2}x",
+            best.0 * 1e3 / n as f64,
+            best.1 * 1e3 / n as f64
+        );
         assert!(ratio < 2.0, "q4tp matvec {ratio:.2}x slower than q4t");
     }
 

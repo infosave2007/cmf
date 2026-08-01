@@ -91,7 +91,10 @@ pub struct G3nGlobals {
 fn rms(x: &[f32], w: &[f32], eps: f64) -> Vec<f32> {
     let ms: f64 = x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / x.len() as f64;
     let inv = (ms + eps).powf(-0.5);
-    x.iter().zip(w).map(|(&v, &g)| (v as f64 * inv * g as f64) as f32).collect()
+    x.iter()
+        .zip(w)
+        .map(|(&v, &g)| (v as f64 * inv * g as f64) as f32)
+        .collect()
 }
 
 fn rms_mag(x: &[f32]) -> f64 {
@@ -107,19 +110,32 @@ fn gelu_tanh(x: f32) -> f32 {
 /// multiplier Φ⁻¹(p); only p ∈ (0.5, 1) occurs in the configs.
 pub fn inv_normal_cdf(p: f64) -> f64 {
     const A: [f64; 6] = [
-        -3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
-        1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00,
+        -3.969683028665376e+01,
+        2.209460984245205e+02,
+        -2.759285104469687e+02,
+        1.383577518672690e+02,
+        -3.066479806614716e+01,
+        2.506628277459239e+00,
     ];
     const B: [f64; 5] = [
-        -5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
-        6.680131188771972e+01, -1.328068155288572e+01,
+        -5.447609879822406e+01,
+        1.615858368580409e+02,
+        -1.556989798598866e+02,
+        6.680131188771972e+01,
+        -1.328068155288572e+01,
     ];
     const C: [f64; 6] = [
-        -7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
-        -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00,
+        -7.784894002430293e-03,
+        -3.223964580411365e-01,
+        -2.400758277161838e+00,
+        -2.549732539343734e+00,
+        4.374664141464968e+00,
+        2.938163982698783e+00,
     ];
     const D: [f64; 4] = [
-        7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+        7.784695709041462e-03,
+        3.224671290700398e-01,
+        2.445134137142996e+00,
         3.754408661907416e+00,
     ];
     let (pl, ph) = (0.02425, 1.0 - 0.02425);
@@ -170,7 +186,10 @@ impl G3nGlobals {
         for li in 0..l {
             let pn = rms(&proj[li * d..(li + 1) * d], &self.ple_norm, self.rms_eps);
             for j in 0..d {
-                let ple = ple_row.as_ref().map(|r| r[li * d + j] * ple_scale).unwrap_or(0.0);
+                let ple = ple_row
+                    .as_ref()
+                    .map(|r| r[li * d + j] * ple_scale)
+                    .unwrap_or(0.0);
                 out.push((pn[j] + ple) * half);
             }
         }
@@ -257,14 +276,30 @@ pub fn g3n_forward(
             let low = matvec(&lw.laurel.left, &an, pool);
             let up = matvec(&lw.laurel.right, &low, pool);
             let pn = rms(&up, &lw.laurel.post_norm, eps);
-            an.iter().zip(&pn).map(|(&a, &b)| a + b).collect::<Vec<f32>>()
+            an.iter()
+                .zip(&pn)
+                .map(|(&a, &b)| a + b)
+                .collect::<Vec<f32>>()
         };
 
-        let inv_freq = if lw.sliding { &g.inv_freq_local } else { &g.inv_freq_global };
+        let inv_freq = if lw.sliding {
+            &g.inv_freq_local
+        } else {
+            &g.inv_freq_global
+        };
         let attn = g3n_attention(
-            lw, &an, position, caches, li, num_heads, num_kv_heads, head_dim, inv_freq,
+            lw,
+            &an,
+            position,
+            caches,
+            li,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            inv_freq,
             if lw.sliding { Some(g.window) } else { None },
-            eps, pool,
+            eps,
+            pool,
         );
         let attn_n = rms(&attn, &lw.post_attn_norm, eps);
 
@@ -279,8 +314,11 @@ pub fn g3n_forward(
         if lw.sparsity > 0.0 {
             let n = gate_v.len() as f64;
             let mean: f64 = gate_v.iter().map(|&v| v as f64).sum::<f64>() / n;
-            let var: f64 =
-                gate_v.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
+            let var: f64 = gate_v
+                .iter()
+                .map(|&v| (v as f64 - mean).powi(2))
+                .sum::<f64>()
+                / n;
             let cutoff = mean + var.sqrt() * inv_normal_cdf(lw.sparsity as f64);
             for v in gate_v.iter_mut() {
                 *v = (*v as f64 - cutoff).max(0.0) as f32;
@@ -294,7 +332,11 @@ pub fn g3n_forward(
             .collect();
         let ffw = matvec(&lw.down, &act, pool);
         let ffw_n = rms(&ffw, &lw.post_ffw_norm, eps);
-        let h2: Vec<f32> = attn_laurel.iter().zip(&ffw_n).map(|(&a, &b)| a + b).collect();
+        let h2: Vec<f32> = attn_laurel
+            .iter()
+            .zip(&ffw_n)
+            .map(|(&a, &b)| a + b)
+            .collect();
 
         // ── AltUp correct ──
         let m2 = modalities(&lw.altup, &h2, eps, pool);
@@ -392,8 +434,7 @@ fn g3n_attention(
         for g in 0..nkv {
             // v_norm is scale-less: x̂ alone.
             let head = &mut v[g * hd..(g + 1) * hd];
-            let ms: f64 =
-                head.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / hd as f64;
+            let ms: f64 = head.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / hd as f64;
             let inv = (ms + eps).powf(-0.5) as f32;
             for x in head.iter_mut() {
                 *x *= inv;
@@ -401,16 +442,8 @@ fn g3n_attention(
         }
         caches[li].append(&k, &v, &[]);
     }
-    let (mut ao, mut imp) = attention::attend_all_heads(
-        &q,
-        &caches[src],
-        nh,
-        heads_per_kv,
-        hd,
-        1.0,
-        window,
-        0.0,
-    );
+    let (mut ao, mut imp) =
+        attention::attend_all_heads(&q, &caches[src], nh, heads_per_kv, hd, 1.0, window, 0.0);
     attention::recycle_buf(&mut imp);
     let out = matvec(&lw.wo, &ao, pool);
     attention::recycle_buf(&mut ao);
