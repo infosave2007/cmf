@@ -944,8 +944,19 @@ fn gpu_attn_enabled() -> bool {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| {
-            std::env::var("CMF_DSV4_GPU_ATTN").map(|v| v != "0").unwrap_or(false)
-                && crate::gpu::backend_available()
+            let want = std::env::var("CMF_DSV4_GPU_ATTN")
+                .map(|v| v != "0")
+                .unwrap_or(false);
+            let have = want && crate::gpu::backend_available();
+            if want && !have {
+                tracing::warn!(
+                    "CMF_DSV4_GPU_ATTN задан, но устройства нет — блок внимания                      остаётся на CPU. Проверьте CMF_GPU=wgpu и Vulkan-ICD."
+                );
+            }
+            if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
+                eprintln!("кадр dsv4: запрошен={want} доступен={have}");
+            }
+            have
         })
     }
     #[cfg(not(feature = "gpu"))]
