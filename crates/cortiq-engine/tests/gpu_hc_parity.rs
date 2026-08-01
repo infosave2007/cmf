@@ -11,6 +11,18 @@
 #[cfg(feature = "gpu")]
 #[test]
 fn device_hc_join_matches_the_cpu() {
+    // Nobody asked for wgpu here — a legitimate skip, and what CI runners
+    // look like. Asked-for-and-absent is a different thing and fails below:
+    // a reserved word in one shader once took the context down and every GPU
+    // test reported success by skipping.
+    match cortiq_engine::gpu_wgpu::selected_and_up() {
+        None => {
+            eprintln!("wgpu не запрошен (CMF_GPU=wgpu) — пропуск");
+            return;
+        }
+        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(true) => {}
+    }
     use cortiq_engine::dsv4;
 
     let (hc, dim, iters, eps) = (4usize, 256usize, 20u32, 1e-6f32);

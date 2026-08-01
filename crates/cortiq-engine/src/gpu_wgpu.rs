@@ -15563,6 +15563,18 @@ mod tests {
     }
 }
 
+/// Was the wgpu backend ASKED for, and did it come up? The two halves must
+/// be told apart: a machine nobody pointed at wgpu is a legitimate skip, a
+/// machine that was pointed at it and produced no context is a failure. A
+/// reserved word in one shader once took the whole context down and every
+/// GPU test reported success by skipping.
+pub fn selected_and_up() -> Option<bool> {
+    if !selected() {
+        return None; // nobody asked
+    }
+    Some(ctx().is_some())
+}
+
 /// Cheap device probe for `gpu::backend_available`: can wgpu bring an
 /// adapter up here at all? One instance, no device/queue, no caching —
 /// the caller caches.

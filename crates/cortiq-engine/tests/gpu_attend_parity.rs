@@ -5,6 +5,18 @@
 #[cfg(feature = "gpu")]
 #[test]
 fn device_sparse_attend_matches_the_cpu() {
+    // Nobody asked for wgpu here — a legitimate skip, and what CI runners
+    // look like. Asked-for-and-absent is a different thing and fails below:
+    // a reserved word in one shader once took the context down and every GPU
+    // test reported success by skipping.
+    match cortiq_engine::gpu_wgpu::selected_and_up() {
+        None => {
+            eprintln!("wgpu не запрошен (CMF_GPU=wgpu) — пропуск");
+            return;
+        }
+        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(true) => {}
+    }
     let (nh, hd, npos) = (4usize, 64usize, 37usize);
     let q: Vec<f32> = (0..nh * hd).map(|i| ((i * 11) as f32 * 0.019).sin()).collect();
     let kv: Vec<f32> = (0..npos * hd).map(|i| ((i * 5) as f32 * 0.013).cos()).collect();

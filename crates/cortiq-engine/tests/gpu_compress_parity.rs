@@ -25,6 +25,18 @@ fn rel(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn device_kv_pool_matches_the_cpu() {
+    // Nobody asked for wgpu here — a legitimate skip, and what CI runners
+    // look like. Asked-for-and-absent is a different thing and fails below:
+    // a reserved word in one shader once took the context down and every GPU
+    // test reported success by skipping.
+    match cortiq_engine::gpu_wgpu::selected_and_up() {
+        None => {
+            eprintln!("wgpu не запрошен (CMF_GPU=wgpu) — пропуск");
+            return;
+        }
+        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(true) => {}
+    }
     let (ratio, d) = (4usize, 128usize);
     let cur_kv = noise(ratio * 2 * d, 0.3);
     let cur_sc = noise(ratio * 2 * d, 1.1);
@@ -76,6 +88,18 @@ fn device_kv_pool_matches_the_cpu() {
 
 #[test]
 fn device_index_scores_match_the_cpu() {
+    // Nobody asked for wgpu here — a legitimate skip, and what CI runners
+    // look like. Asked-for-and-absent is a different thing and fails below:
+    // a reserved word in one shader once took the context down and every GPU
+    // test reported success by skipping.
+    match cortiq_engine::gpu_wgpu::selected_and_up() {
+        None => {
+            eprintln!("wgpu не запрошен (CMF_GPU=wgpu) — пропуск");
+            return;
+        }
+        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(true) => {}
+    }
     let (nh, hd, n_pos) = (16usize, 64usize, 200usize);
     let q = noise(nh * hd, 0.9);
     let kv = noise(n_pos * hd, 2.2);
@@ -101,6 +125,18 @@ fn device_index_scores_match_the_cpu() {
 
 #[test]
 fn device_top_k_matches_the_cpu() {
+    // Nobody asked for wgpu here — a legitimate skip, and what CI runners
+    // look like. Asked-for-and-absent is a different thing and fails below:
+    // a reserved word in one shader once took the context down and every GPU
+    // test reported success by skipping.
+    match cortiq_engine::gpu_wgpu::selected_and_up() {
+        None => {
+            eprintln!("wgpu не запрошен (CMF_GPU=wgpu) — пропуск");
+            return;
+        }
+        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(true) => {}
+    }
     for (n, k) in [(200usize, 64usize), (700, 512), (40, 512)] {
         let mut sc: Vec<f32> = (0..n).map(|i| ((i * 37 % 61) as f32) * 0.5).collect();
         // Ties are the whole point: the CPU breaks them by the lower index.
