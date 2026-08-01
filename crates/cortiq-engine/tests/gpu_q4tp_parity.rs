@@ -31,6 +31,26 @@ fn device_q4tp_matvec_matches_the_cpu() {
         let mut cpu = vec![0.0f32; rows];
         t.matvec(&xs, &mut cpu, None);
 
+        // A third opinion, from the format's own dequantizer: plain f32 dots
+        // over fully expanded weights. When the device and the matvec differ,
+        // this says which of the two moved.
+        let mut plain = vec![0.0f32; rows];
+        {
+            let bytes = model.tensor_bytes(&e.name).expect("bytes");
+            let mut w = vec![0.0f32; rows * cols];
+            cortiq_core::quant::dequant_q4tp(bytes, rows, cols, &mut w);
+            for (r, o) in plain.iter_mut().enumerate() {
+                *o = w[r * cols..(r + 1) * cols]
+                    .iter()
+                    .zip(&xs)
+                    .map(|(a, b)| a * b)
+                    .sum();
+            }
+        }
+        let dnum: f32 = plain.iter().zip(&cpu).map(|(a, b)| (a - b) * (a - b)).sum();
+        let dden: f32 = plain.iter().map(|a| a * a).sum::<f32>().max(1e-20);
+        let dq = (dnum / dden).sqrt();
+
         let mut gpu = vec![0.0f32; rows];
         if !cortiq_engine::gpu_wgpu::q4tp_matvec_for_test(&model, idx, &xs, rows, cols, &mut gpu) {
             eprintln!("устройство отказалось от {} — пропуск", e.name);
@@ -39,7 +59,12 @@ fn device_q4tp_matvec_matches_the_cpu() {
         let num: f32 = cpu.iter().zip(&gpu).map(|(a, b)| (a - b) * (a - b)).sum();
         let den: f32 = cpu.iter().map(|a| a * a).sum::<f32>().max(1e-20);
         let rel = (num / den).sqrt();
-        println!("{}: [{rows}x{cols}] расхождение {rel:.3e}", e.name);
+        let pnum: f32 = plain.iter().zip(&gpu).map(|(a, b)| (a - b) * (a - b)).sum();
+        let pgpu = (pnum / dden).sqrt();
+        println!(
+            "{}: [{rows}x{cols}] gpu↔matvec {rel:.3e}  деквант↔matvec {dq:.3e}  деквант↔gpu {pgpu:.3e}",
+            e.name
+        );
         if std::env::var("CMF_Q4TP_SHOW").is_ok() {
             // A constant ratio across rows means a scale read at a different
             // precision; scatter means a layout or ordering fault. The two
