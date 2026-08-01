@@ -4548,6 +4548,158 @@ fn dit_unstack(@builtin(global_invocation_id) gid: vec3<u32>) {
     dc[tok * dp.m * hd + h * hd + d] = da[i];
 }
 
+
+// ── Hyper-connections on the device (DeepSeek-V4) ───────────────────────────
+//
+// The hidden state is `hc` copies of a `dim` vector, and a block folds them
+// to one, runs, then expands back through a Sinkhorn-normalized mixing
+// matrix. There is no ordinary residual, so this is not an add — it is the
+// join between every pair of blocks, and leaving it on the CPU is what
+// forces a round trip per layer.
+//
+// Sizes are small where it matters: hc is 4, mix_hc is 24, and only the fold
+// runs over dim. One workgroup owns the whole thing.
+
+struct HcP { hc: u32, dim: u32, iters: u32, eps: f32 };
+
+@group(0) @binding(0) var<storage, read>       hc_state : array<f32>;   // hc*dim
+@group(0) @binding(1) var<storage, read>       hc_mix   : array<f32>;   // mix_hc, raw
+@group(0) @binding(2) var<storage, read>       hc_sc    : array<f32>;   // 3
+@group(0) @binding(3) var<storage, read>       hc_base  : array<f32>;   // mix_hc
+@group(0) @binding(4) var<storage, read_write> hc_fold  : array<f32>;   // dim
+@group(0) @binding(5) var<storage, read_write> hc_post  : array<f32>;   // hc
+@group(0) @binding(6) var<storage, read_write> hc_comb  : array<f32>;   // hc*hc
+@group(0) @binding(7) var<uniform>             hc_p     : HcP;
+
+var<workgroup> hc_red: array<f32, 256>;
+var<workgroup> hc_pre_w: array<f32, 8>;
+var<workgroup> hc_cmb_w: array<f32, 64>;
+var<workgroup> hc_rsq: f32;
+
+@compute @workgroup_size(256)
+fn hc_pre_fold(@builtin(local_invocation_index) lid: u32) {
+    let hc = hc_p.hc;
+    let dim = hc_p.dim;
+    let n = hc * dim;
+
+    // rsqrt(mean(state^2) + eps) — the reference scales the mixes by this,
+    // and it is a mean over ALL copies, not per copy.
+    var acc = 0.0;
+    var i = lid;
+    loop {
+        if (i >= n) { break; }
+        let v = hc_state[i];
+        acc = acc + v * v;
+        i = i + 256u;
+    }
+    hc_red[lid] = acc;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { hc_red[lid] = hc_red[lid] + hc_red[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) {
+        hc_rsq = inverseSqrt(hc_red[0] / f32(n) + hc_p.eps);
+    }
+    workgroupBarrier();
+    let rsq = hc_rsq;
+
+    // pre / post / comb. Thread 0 does it: hc is 4, and the Sinkhorn is a
+    // sequential fixed point over a 4x4 — parallelising it would cost more
+    // in barriers than it saves.
+    if (lid == 0u) {
+        for (var j = 0u; j < hc; j = j + 1u) {
+            let m = hc_mix[j] * rsq * hc_sc[0] + hc_base[j];
+            hc_pre_w[j] = 1.0 / (1.0 + exp(-m)) + hc_p.eps;
+            let m2 = hc_mix[hc + j] * rsq * hc_sc[1] + hc_base[hc + j];
+            hc_post[j] = 2.0 / (1.0 + exp(-m2));
+        }
+        // row softmax, then the alternating normalisation
+        for (var j = 0u; j < hc; j = j + 1u) {
+            var mx = -1e30;
+            for (var k = 0u; k < hc; k = k + 1u) {
+                let v = hc_mix[2u * hc + j * hc + k] * rsq * hc_sc[2]
+                      + hc_base[2u * hc + j * hc + k];
+                hc_cmb_w[j * hc + k] = v;
+                mx = max(mx, v);
+            }
+            var sum = 0.0;
+            for (var k = 0u; k < hc; k = k + 1u) {
+                let e = exp(hc_cmb_w[j * hc + k] - mx);
+                hc_cmb_w[j * hc + k] = e;
+                sum = sum + e;
+            }
+            for (var k = 0u; k < hc; k = k + 1u) {
+                hc_cmb_w[j * hc + k] = hc_cmb_w[j * hc + k] / sum + hc_p.eps;
+            }
+        }
+        for (var k = 0u; k < hc; k = k + 1u) {          // first column pass
+            var sum = 0.0;
+            for (var j = 0u; j < hc; j = j + 1u) { sum = sum + hc_cmb_w[j * hc + k]; }
+            for (var j = 0u; j < hc; j = j + 1u) {
+                hc_cmb_w[j * hc + k] = hc_cmb_w[j * hc + k] / (sum + hc_p.eps);
+            }
+        }
+        for (var it = 1u; it < hc_p.iters; it = it + 1u) {
+            for (var j = 0u; j < hc; j = j + 1u) {
+                var sum = 0.0;
+                for (var k = 0u; k < hc; k = k + 1u) { sum = sum + hc_cmb_w[j * hc + k]; }
+                for (var k = 0u; k < hc; k = k + 1u) {
+                    hc_cmb_w[j * hc + k] = hc_cmb_w[j * hc + k] / (sum + hc_p.eps);
+                }
+            }
+            for (var k = 0u; k < hc; k = k + 1u) {
+                var sum = 0.0;
+                for (var j = 0u; j < hc; j = j + 1u) { sum = sum + hc_cmb_w[j * hc + k]; }
+                for (var j = 0u; j < hc; j = j + 1u) {
+                    hc_cmb_w[j * hc + k] = hc_cmb_w[j * hc + k] / (sum + hc_p.eps);
+                }
+            }
+        }
+        for (var j = 0u; j < hc * hc; j = j + 1u) { hc_comb[j] = hc_cmb_w[j]; }
+    }
+    workgroupBarrier();
+
+    // fold: y[d] = sum_j pre[j] * state[j*dim + d]
+    var d = lid;
+    loop {
+        if (d >= dim) { break; }
+        var y = 0.0;
+        for (var j = 0u; j < hc; j = j + 1u) {
+            y = y + hc_pre_w[j] * hc_state[j * dim + d];
+        }
+        hc_fold[d] = y;
+        d = d + 256u;
+    }
+}
+
+// expand: state[j*dim+d] = post[j]*x[d] + sum_k comb[k*hc+j]*residual[k*dim+d]
+// Summing over the FIRST index of comb, as the reference does — reading it
+// the other way transposes the mixing and is not detectable by eye.
+@group(0) @binding(0) var<storage, read>       he_x    : array<f32>;   // dim
+@group(0) @binding(1) var<storage, read>       he_res  : array<f32>;   // hc*dim
+@group(0) @binding(2) var<storage, read>       he_post : array<f32>;   // hc
+@group(0) @binding(3) var<storage, read>       he_comb : array<f32>;   // hc*hc
+@group(0) @binding(4) var<storage, read_write> he_out  : array<f32>;   // hc*dim
+@group(0) @binding(5) var<uniform>             he_p    : HcP;
+@compute @workgroup_size(256)
+fn hc_post_expand(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let hc = he_p.hc;
+    let dim = he_p.dim;
+    let i = gid.x;
+    if (i >= hc * dim) { return; }
+    let j = i / dim;
+    let d = i % dim;
+    var y = he_post[j] * he_x[d];
+    for (var k = 0u; k < hc; k = k + 1u) {
+        y = y + he_comb[k * hc + j] * he_res[k * dim + d];
+    }
+    he_out[i] = y;
+}
+
 "#;
 
 // Split-K decode attention (its own module: the main module's at_* binding
@@ -4760,6 +4912,10 @@ struct Ctx {
     q1t: wgpu::ComputePipeline,
     q4b: wgpu::ComputePipeline,
     q4t_mv: wgpu::ComputePipeline,
+    /// Hyper-connection fold (with the Sinkhorn) and expand — the join
+    /// between blocks in DeepSeek-V4, where an ordinary model has a residual.
+    hc_pre_fold: wgpu::ComputePipeline,
+    hc_post_expand: wgpu::ComputePipeline,
     q4tp_mv: wgpu::ComputePipeline,
     /// Tall-matrix q4tp matvec (4 rows/workgroup, vec4 nibble loads); the
     /// per-row math is byte-identical to `q4tp_mv`. `CMF_MV4=0` reverts.
@@ -5237,6 +5393,8 @@ fn init() -> Result<Ctx, String> {
     let q1t = pipe("q1t_matvec");
     let q4b = pipe("q4b_matvec");
     let q4t_mv = pipe("q4t_matvec");
+    let hc_pre_fold = pipe("hc_pre_fold");
+    let hc_post_expand = pipe("hc_post_expand");
     let q4tp_mv = pipe("q4tp_matvec");
     let q4tp_mv4 = pipe("q4tp_matvec4");
     let use_mv4 = std::env::var("CMF_MV4").map(|v| v != "0").unwrap_or(true);
@@ -5434,6 +5592,8 @@ fn init() -> Result<Ctx, String> {
         q1t,
         q4b,
         q4t_mv,
+        hc_pre_fold,
+        hc_post_expand,
         q4tp_mv,
         q4tp_mv4,
         use_mv4,
@@ -14502,6 +14662,115 @@ mod tests {
 /// Every adapter wgpu can see, and which one would be chosen. Three times in
 /// one night the question "is the GPU actually visible?" was answered by
 /// inference from a missing log line; this answers it directly.
+/// One hyper-connection join on the device: fold the copies (with the
+/// Sinkhorn) and expand them back around a block output computed elsewhere.
+///
+/// Step one of the whole-token graph, and deliberately useless on its own —
+/// it costs a submission to save none. It exists so the join can be checked
+/// against the CPU before anything is built on top of it, because a
+/// transposed mixing matrix or a Sinkhorn off by one iteration produces
+/// output that looks entirely reasonable.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_join_for_test(
+    state: &[f32],
+    mixes: &[f32],
+    scale: &[f32; 3],
+    base: &[f32],
+    block_out: &[f32],
+    hc: usize,
+    dim: usize,
+    iters: u32,
+    eps: f32,
+    folded: &mut [f32],
+    expanded: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if state.len() != hc * dim || folded.len() != dim || expanded.len() != hc * dim {
+        return false;
+    }
+    let st = storage_bytes(c, bytemuck::cast_slice(state));
+    let mx = storage_bytes(c, bytemuck::cast_slice(mixes));
+    let sc = storage_bytes(c, bytemuck::cast_slice(&scale[..]));
+    let bs = storage_bytes(c, bytemuck::cast_slice(base));
+    let fo = rw_f32(c, dim, true);
+    let po = rw_f32(c, hc, false);
+    let cb = rw_f32(c, hc * hc, false);
+    let params = uniform_u32x4(c, [hc as u32, dim as u32, iters, eps.to_bits()]);
+
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("hc") });
+    {
+        let layout = c.hc_pre_fold.get_bind_group_layout(0);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                bind_buf(0, &st),
+                bind_buf(1, &mx),
+                bind_buf(2, &sc),
+                bind_buf(3, &bs),
+                bind_buf(4, &fo),
+                bind_buf(5, &po),
+                bind_buf(6, &cb),
+                bind_buf(7, &params),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.hc_pre_fold);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    let bo = storage_bytes(c, bytemuck::cast_slice(block_out));
+    let ex = rw_f32(c, hc * dim, true);
+    {
+        let layout = c.hc_post_expand.get_bind_group_layout(0);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                bind_buf(0, &bo),
+                bind_buf(1, &st),
+                bind_buf(2, &po),
+                bind_buf(3, &cb),
+                bind_buf(4, &ex),
+                bind_buf(5, &params),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.hc_post_expand);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(((hc * dim) as u32).div_ceil(256), 1, 1);
+    }
+    // Two readbacks because the two results have different lengths; this is
+    // a check, not a hot path.
+    let mut sc_lock = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc_lock.stage,
+        ((hc * dim).max(dim) * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "hc-stage",
+    );
+    if !readback(c, enc, &fo, &stage, (dim * 4) as u64, folded) {
+        return false;
+    }
+    let enc2 = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("hc2") });
+    if !readback(c, enc2, &ex, &stage, ((hc * dim) * 4) as u64, expanded) {
+        return false;
+    }
+    drop(sc_lock);
+    true
+}
+
 pub fn adapter_report() -> Vec<String> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
