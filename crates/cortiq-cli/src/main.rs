@@ -2487,6 +2487,8 @@ async fn cmd_run(
                         r.tokens_generated as f64 / secs.max(1e-9),
                         r.finish_reason
                     );
+                    #[cfg(feature = "gpu")]
+                    cortiq_engine::dsv4::profile_report();
                     let sw = pipeline.route_switches();
                     if !sw.is_empty() {
                         println!("route: {} skill switch(es):", sw.len());

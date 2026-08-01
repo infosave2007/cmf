@@ -934,6 +934,51 @@ fn compressor_step(
     Some(folded)
 }
 
+/// `CMF_DSV4_PROFILE=1` accumulates wall time per stage and prints the split
+/// when the process ends. Guessing which half of a layer costs what is how
+/// one ends up optimising the cheap one: the fused attention block came out a
+/// wash on the release checkpoint, and no amount of reasoning about MAC
+/// counts settles whether that is because attention was already cheap or
+/// because the device arm was slow.
+pub(crate) mod prof {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    pub static ATTN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static MOE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static TOKENS: AtomicU64 = AtomicU64::new(0);
+    static REPORT: AtomicBool = AtomicBool::new(false);
+
+    pub fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CMF_DSV4_PROFILE").is_ok_and(|v| v != "0"))
+    }
+
+    /// Print once, from wherever the last caller happens to be — a process
+    /// that exits through several paths would otherwise report zero or twice.
+    pub fn report() {
+        if !on() || REPORT.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let (a, m, t) = (
+            ATTN_NS.load(Ordering::Relaxed) as f64 / 1e6,
+            MOE_NS.load(Ordering::Relaxed) as f64 / 1e6,
+            TOKENS.load(Ordering::Relaxed).max(1) as f64,
+        );
+        eprintln!(
+            "[dsv4-профиль] на токен: внимание {:.1} мс, MoE {:.1} мс, \
+             прочее вне замера; всего слоёв-вызовов {}",
+            a / t,
+            m / t,
+            TOKENS.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// Print the per-token split, if `CMF_DSV4_PROFILE` asked for one.
+pub fn profile_report() {
+    prof::report();
+}
+
 /// `CMF_DSV4_GPU_ATTN=1` moves the attention block onto the device as one
 /// submission. Off by default: it needs every attention weight in q4tp and a
 /// working wgpu context, and a frame that declines mid-layer after the state
@@ -1074,6 +1119,8 @@ pub fn attention_step(
     pool: Option<&crate::pool::Pool>,
     out: &mut [f32],
 ) {
+    let _t0 = prof::on().then(std::time::Instant::now);
+    let _guard = scopeguard_attn(_t0);
     let (hd, rd) = (cfg.head_dim, cfg.rope_head_dim);
     let pos = st.pos;
     if std::env::var("CMF_FREQ_DEBUG").is_ok() && li == 0 && pos == 0 {
@@ -1335,6 +1382,28 @@ pub fn take_route_counts() -> Vec<Vec<u64>> {
     ROUTE_COUNTS.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
+/// Charge elapsed time to a counter when it goes out of scope — the two
+/// steps have several early returns each, and a timer that only stops on the
+/// long path measures the short one as free.
+struct Charge(Option<std::time::Instant>, &'static std::sync::atomic::AtomicU64);
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if let Some(t) = self.0 {
+            self.1.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+}
+fn scopeguard_attn(t: Option<std::time::Instant>) -> Charge {
+    Charge(t, &prof::ATTN_NS)
+}
+fn scopeguard_moe(t: Option<std::time::Instant>) -> Charge {
+    prof::TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Charge(t, &prof::MOE_NS)
+}
+
 pub fn moe_step(
     hidden: &[f32],
     l: &Dsv4Layer,
@@ -1345,6 +1414,8 @@ pub fn moe_step(
     pool: Option<&crate::pool::Pool>,
     out: &mut [f32],
 ) {
+    let _t0 = prof::on().then(std::time::Instant::now);
+    let _guard = scopeguard_moe(_t0);
     let mut logits = vec![0.0f32; cfg.n_routed_experts];
     l.gate.matvec(hidden, &mut logits, pool);
     let (mut idx, mut w) = (Vec::new(), Vec::new());
