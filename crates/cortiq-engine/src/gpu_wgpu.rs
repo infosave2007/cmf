@@ -15863,7 +15863,18 @@ pub fn dsv4_attn_frame(
     pos: usize,
     out: &mut [f32],
 ) -> bool {
-    let Some(c) = ctx() else { return false };
+    // A refusal used to be a silent `false`, and three of them in a row cost
+    // an evening of guessing which guard had fired.
+    macro_rules! no {
+        ($($t:tt)*) => {{
+            tracing::debug!("кадр dsv4 отклонён: {}", format_args!($($t)*));
+            if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
+                eprintln!("кадр dsv4 отклонён: {}", format_args!($($t)*));
+            }
+            return false;
+        }};
+    }
+    let Some(c) = ctx() else { no!("нет контекста wgpu") };
     if hidden.len() < g.dim
         || out.len() < g.dim
         || w.sink.len() < g.nh
@@ -15872,7 +15883,11 @@ pub fn dsv4_attn_frame(
         || idxs.len() > 1024
         || inv_freq.len() * 2 < g.rd
     {
-        return false;
+        no!(
+            "формы: hidden {} dim {} out {} sink {} nh {} q_norm {} q_lora {} idx {} freq {} rd {}",
+            hidden.len(), g.dim, out.len(), w.sink.len(), g.nh,
+            w.q_norm.len(), g.q_lora, idxs.len(), inv_freq.len(), g.rd
+        );
     }
     let bytes = model.primary_bytes();
     // Every weight q4tp, or the frame declines: a mixed layer would need the
@@ -15880,21 +15895,21 @@ pub fn dsv4_attn_frame(
     let mut wb = Vec::with_capacity(4);
     for &idx in &[w.wq_a, w.wq_b, w.wo_a, w.wo_b] {
         let Some(e) = model.tensors.get(idx) else {
-            return false;
+            no!("тензора {idx} нет в каталоге");
         };
         if e.dtype != cortiq_core::TensorDtype::Q4TiledP || e.shape.len() != 2 {
-            return false;
+            no!("{} не q4tp ({:?}, {:?})", e.name, e.dtype, e.shape);
         }
         let Some(abs) = model.entry_abs_offset(e) else {
-            return false;
+            no!("{} без абсолютного смещения", e.name);
         };
         let plen = e.nbytes as usize;
         if abs + plen > bytes.len() {
-            return false;
+            no!("{} выходит за файл", e.name);
         }
         let Some(b) = weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen])
         else {
-            return false;
+            no!("{} не поместился в бюджет VRAM", e.name);
         };
         wb.push(b);
     }
@@ -15902,7 +15917,7 @@ pub fn dsv4_attn_frame(
         let map = c.dsv4_kv.lock().unwrap();
         match map.get(&(kv_id, li)) {
             Some((b, _)) => b.clone(),
-            None => return false, // the caller never seeded it
+            None => no!("кеш ({kv_id}, {li}) не заведён"),
         }
     };
 
