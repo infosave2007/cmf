@@ -689,6 +689,10 @@ enum Commands {
         #[command(subcommand)]
         cmd: SkillCmd,
     },
+    /// What the GPU backend can see: adapters, the one that would be
+    /// chosen, and its limits. Answers "is the card visible at all?"
+    /// without inferring it from a missing log line.
+    Gpu,
     /// Verify file integrity: envelope, sections, per-tensor hashes
     Verify {
         /// Path to .cmf model file
@@ -1290,6 +1294,12 @@ async fn main() -> anyhow::Result<()> {
                 uniform_inter,
             ),
         },
+        Commands::Gpu => {
+            for line in cortiq_engine::gpu_wgpu::adapter_report() {
+                println!("  {line}");
+            }
+            Ok(())
+        }
         Commands::Verify { model } => cmd_verify(&model).await,
         Commands::Sign { model, key } => sign::cmd_sign(&model, &key),
         Commands::Fcd {

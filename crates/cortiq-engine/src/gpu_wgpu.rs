@@ -14302,6 +14302,47 @@ mod tests {
 /// Cheap device probe for `gpu::backend_available`: can wgpu bring an
 /// adapter up here at all? One instance, no device/queue, no caching —
 /// the caller caches.
+/// Every adapter wgpu can see, and which one would be chosen. Three times in
+/// one night the question "is the GPU actually visible?" was answered by
+/// inference from a missing log line; this answers it directly.
+pub fn adapter_report() -> Vec<String> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        flags: wgpu::InstanceFlags::default(),
+        memory_budget_thresholds: Default::default(),
+        backend_options: Default::default(),
+        display: None,
+    });
+    let mut out: Vec<String> = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+        .iter()
+        .map(|a| {
+            let i = a.get_info();
+            let l = a.limits();
+            format!(
+                "{:?} | {} | {:?} | буфер до {:.1} ГБ | рабочая группа {}",
+                i.backend,
+                i.name,
+                i.device_type,
+                l.max_buffer_size as f64 / 1e9,
+                l.max_compute_workgroup_size_x
+            )
+        })
+        .collect();
+    if out.is_empty() {
+        out.push("адаптеров не найдено".into());
+    }
+    match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+        apply_limit_buckets: false,
+    })) {
+        Ok(a) => out.push(format!("выбран: {}", a.get_info().name)),
+        Err(e) => out.push(format!("выбрать не удалось: {e}")),
+    }
+    out
+}
+
 pub fn adapter_probe() -> bool {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
