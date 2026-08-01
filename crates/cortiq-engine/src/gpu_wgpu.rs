@@ -17489,7 +17489,44 @@ pub fn dsv4_moe_frame(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "dsv4-moe-stage",
     );
-    let ok = readback(c, enc, &ob, &stage, (g.hidden * 4) as u64, &mut out[..g.hidden]);
+    // The cold list rides the SAME staging buffer and the SAME fence, so the
+    // host learns which picks it owes without paying a second barrier.
+    //
+    // This block went missing once — `cold_out` was declared, threaded all
+    // the way down and never filled — and the empty list read exactly like a
+    // router that had chosen no cold experts. An unconditional probe written
+    // from the kernel is what proved otherwise.
+    let cold_bytes = (2 * g.top_k * 4) as u64;
+    let total = (g.hidden * 4) as u64 + cold_bytes;
+    let stage2 = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        total,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "dsv4-moe-stage",
+    );
+    let _ = &stage;
+    enc.copy_buffer_to_buffer(&ob, 0, &stage2, 0, (g.hidden * 4) as u64);
+    enc.copy_buffer_to_buffer(&coldb, 0, &stage2, (g.hidden * 4) as u64, cold_bytes);
+    c.queue.submit(Some(enc.finish()));
+    let slice = stage2.slice(..total);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return false;
+    }
+    let mut ok = false;
+    if let Ok(data) = slice.get_mapped_range() {
+        out[..g.hidden].copy_from_slice(bytemuck::cast_slice(&data[..g.hidden * 4]));
+        let tail: &[u32] = bytemuck::cast_slice(&data[g.hidden * 4..total as usize]);
+        cold_out.clear();
+        for t in 0..g.top_k {
+            if tail[2 * t] != u32::MAX {
+                cold_out.push((tail[2 * t] as usize, f32::from_bits(tail[2 * t + 1])));
+            }
+        }
+        ok = true;
+    }
+    stage2.unmap();
     drop(sc);
     // Encoding and waiting are different problems with different fixes, and
     // the layer total cannot tell them apart. Costs one Instant per layer.
