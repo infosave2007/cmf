@@ -15864,6 +15864,546 @@ pub fn top_k_for_test(scores: &[f32], k: usize, out: &mut Vec<u32>) -> bool {
     ok
 }
 
+#[allow(clippy::too_many_arguments)]
+fn encode_hc_fold(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    state: &wgpu::Buffer,
+    mixes: &wgpu::Buffer,
+    sc: &wgpu::Buffer,
+    base: &wgpu::Buffer,
+    fold: &wgpu::Buffer,
+    post: &wgpu::Buffer,
+    comb: &wgpu::Buffer,
+    p: &wgpu::Buffer,
+) {
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.hc_pre_fold.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, state),
+            bind_buf(1, mixes),
+            bind_buf(2, sc),
+            bind_buf(3, base),
+            bind_buf(4, fold),
+            bind_buf(5, post),
+            bind_buf(6, comb),
+            bind_buf(7, p),
+        ],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.hc_pre_fold);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(1, 1, 1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_hc_expand(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    x: &wgpu::Buffer,
+    res: &wgpu::Buffer,
+    post: &wgpu::Buffer,
+    comb: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    p: &wgpu::Buffer,
+    hc: usize,
+    dim: usize,
+) {
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.hc_post_expand.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, x),
+            bind_buf(1, res),
+            bind_buf(2, post),
+            bind_buf(3, comb),
+            bind_buf(4, out),
+            bind_buf(5, p),
+        ],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.hc_post_expand);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(((hc * dim) as u32).div_ceil(256), 1, 1);
+}
+
+/// The attention chain from an already-normed LoRA vector to the block output.
+#[allow(clippy::too_many_arguments)]
+fn encode_attn_chain(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    wb: &[wgpu::Buffer],
+    qn: &wgpu::Buffer,
+    q: &wgpu::Buffer,
+    attn: &wgpu::Buffer,
+    mid: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    cache: &wgpu::Buffer,
+    ixb: &wgpu::Buffer,
+    sink: &wgpu::Buffer,
+    freq: &wgpu::Buffer,
+    posb: &wgpu::Buffer,
+    g: Dsv4AttnGeom,
+    kv_id: u64,
+    li: usize,
+    m: usize,
+) {
+    encode_q4tp_mv1(c, enc, &wb[1], qn, q, g.nh * g.hd, g.q_lora, (60, kv_id, li));
+    encode_rope_heads(c, enc, q, freq, posb, g.nh, g.hd, g.rd, true, false, (61, kv_id, li));
+    encode_sparse_attend2(c, enc, q, cache, ixb, sink, attn, g.nh, g.hd, m, g.scale);
+    encode_rope_heads(c, enc, attn, freq, posb, g.nh, g.hd, g.rd, false, true, (62, kv_id, li));
+    {
+        let rows = g.o_groups * g.o_lora;
+        let cols = g.nh * g.hd / g.o_groups;
+        let bind = cached_bind(c, (63, kv_id, li), || {
+            let p = uniform_u32x4(c, [(cols / 32) as u32, rows as u32, g.o_lora as u32, 0]);
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &c.o_lora_a.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, &wb[2]),
+                    bind_buf(1, attn),
+                    bind_buf(2, mid),
+                    bind_buf(3, &p),
+                ],
+            })
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.o_lora_a);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+    }
+    encode_q4tp_mv1(
+        c,
+        enc,
+        &wb[3],
+        mid,
+        out,
+        g.dim,
+        g.o_groups * g.o_lora,
+        (64, kv_id, li),
+    );
+}
+
+/// Route, then the chosen experts and the shared one.
+#[allow(clippy::too_many_arguments)]
+fn encode_moe_chain(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    logits: &wgpu::Buffer,
+    x: &wgpu::Buffer,
+    msel: &wgpu::Buffer,
+    mwt: &wgpu::Buffer,
+    mcnt: &wgpu::Buffer,
+    mact: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    gate_all: &wgpu::Buffer,
+    up_all: &wgpu::Buffer,
+    down_all: &wgpu::Buffer,
+    w: &Dsv4LayerW,
+    g: Dsv4MoeGeom,
+    n_pack: usize,
+    slots: usize,
+) {
+    // Same address-keying rule as everywhere: the bias is built per layer, so
+    // it goes through the per-call pool, not the const cache.
+    let bs = match w.moe.bias {
+        Some(b) if b.len() >= n_pack => frame_up(c, 25, bytemuck::cast_slice(&b[..n_pack])),
+        _ => logits.clone(),
+    };
+    let mk = frame_buf(c, 17, n_pack * 4, true);
+    let fc = match w.moe.forced {
+        Some(f) if f.len() >= g.top_k => {
+            let v: Vec<u32> = f[..g.top_k].iter().map(|&i| i as u32).collect();
+            frame_up(c, 18, bytemuck::cast_slice(&v))
+        }
+        _ => frame_buf(c, 18, g.top_k * 4, true),
+    };
+    let rflags = (w.moe.bias.is_some_and(|b| b.len() >= n_pack) as u32)
+        | ((w.moe.forced.is_some_and(|f| f.len() >= g.top_k) as u32) << 2)
+        | 8;
+    let rp = uniform_mixed(c, [n_pack as u32, g.top_k as u32, rflags], g.route_scale);
+    let stride16 = |rows: usize, cols: usize, q2: bool| -> u32 {
+        let dt = if q2 {
+            cortiq_core::TensorDtype::Q2TiledP
+        } else {
+            cortiq_core::TensorDtype::Q4TiledP
+        };
+        (cortiq_core::quant::expected_nbytes(dt, &[rows, cols]).unwrap_or(0) / 2) as u32
+    };
+    let gu_u = uniform_u32x8(
+        c,
+        [
+            (g.hidden / 32) as u32,
+            g.inter as u32,
+            slots as u32,
+            stride16(g.inter, g.hidden, g.gu_q2),
+            g.swiglu_limit.to_bits(),
+            0,
+            0,
+            0,
+        ],
+    );
+    let dn_u = uniform_u32x4(
+        c,
+        [
+            (g.inter / 32) as u32,
+            g.hidden as u32,
+            slots as u32,
+            stride16(g.hidden, g.inter, false),
+        ],
+    );
+    let (p_gu, p_dn, l_gu, l_dn) = if g.gu_q2 {
+        (
+            &c.moe_gate_up_q2tp,
+            &c.moe_down_q4tp,
+            &c.layout_moe_gu_q2tp,
+            &c.layout_moe_dn_q4tp,
+        )
+    } else {
+        (
+            &c.moe_gate_up_q4tp_b,
+            &c.moe_down_q4tp_b,
+            &c.layout_moe_gu_b,
+            &c.layout_moe_dn_b,
+        )
+    };
+    let bind_r = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.moe_route.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, logits),
+            bind_buf(1, &bs),
+            bind_buf(2, &mk),
+            bind_buf(3, &fc),
+            bind_buf(4, msel),
+            bind_buf(5, mwt),
+            bind_buf(6, mcnt),
+            bind_buf(7, &rp),
+        ],
+    });
+    let bg_gu = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: l_gu,
+        entries: &[
+            bind_buf(0, gate_all),
+            bind_buf(1, up_all),
+            bind_buf(2, x),
+            bind_buf(3, msel),
+            bind_buf(4, mact),
+            bind_buf(5, &gu_u),
+        ],
+    });
+    let bg_dn = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: l_dn,
+        entries: &[
+            bind_buf(0, down_all),
+            bind_buf(1, mact),
+            bind_buf(2, msel),
+            bind_buf(3, mwt),
+            bind_buf(4, out),
+            bind_buf(5, &dn_u),
+        ],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.moe_route);
+    pass.set_bind_group(0, &bind_r, &[]);
+    pass.dispatch_workgroups(1, 1, 1);
+    pass.set_pipeline(p_gu);
+    pass.set_bind_group(0, &bg_gu, &[]);
+    pass.dispatch_workgroups(g.inter as u32, slots as u32, 1);
+    pass.set_pipeline(p_dn);
+    pass.set_bind_group(0, &bg_dn, &[]);
+    pass.dispatch_workgroups(g.hidden as u32, 1, 1);
+}
+
+/// Everything one DeepSeek-V4 layer does, in ONE submission.
+///
+/// The two frames before this cost two barriers a layer — 30 ms of a 76 ms
+/// token, spent waiting rather than computing. Fusing them means the
+/// hyper-connection glue between the halves has to run on the device too,
+/// which is what `hc_pre_fold` (mixes, Sinkhorn and the fold in one kernel)
+/// and `hc_post_expand` were built for.
+///
+/// The frame is shifted by one on purpose: it ENDS by folding and norming the
+/// state for the NEXT layer's attention half and projecting its LoRA vector,
+/// then reads back that normed hidden. The host needs exactly that one vector
+/// — for the kv projection, the compressor and the indexer, which still live
+/// there — and nothing else. Layer zero's opening fold is done on the host
+/// once, which costs nothing at all.
+pub struct Dsv4LayerW<'a> {
+    pub attn: Dsv4AttnW<'a>,
+    pub moe: Dsv4MoeW<'a>,
+    /// Hyper-connection projection of the FFN half: `[mix_hc, hc*dim]` f32.
+    pub hc_ffn_fn: &'a [f32],
+    pub hc_ffn_scale: &'a [f32; 3],
+    pub hc_ffn_base: &'a [f32],
+    /// The same for the NEXT layer's attention half — absent on the last.
+    pub hc_next_fn: Option<&'a [f32]>,
+    pub hc_next_scale: &'a [f32; 3],
+    pub hc_next_base: &'a [f32],
+    pub ffn_norm: &'a [f32],
+    /// The next layer's input norm and its q_norm, for the tail that
+    /// prepares the following frame.
+    pub next_norm: &'a [f32],
+    pub next_q_norm: &'a [f32],
+    /// The next layer's wq_a, by directory index.
+    pub next_wq_a: Option<usize>,
+    /// Router logits weight, f32 `[n_exp, dim]`.
+    pub router: &'a [f32],
+}
+
+#[derive(Clone, Copy)]
+pub struct Dsv4LayerGeom {
+    pub attn: Dsv4AttnGeom,
+    pub moe: Dsv4MoeGeom,
+    pub hc: usize,
+    pub hc_eps: f32,
+    pub sinkhorn_iters: usize,
+}
+
+/// Returns the next layer's normed hidden in `folded_next` (or this layer's
+/// state contribution when there is no next layer).
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_layer_frame(
+    model: &Arc<CmfModel>,
+    w: &Dsv4LayerW,
+    g: Dsv4LayerGeom,
+    kv_id: u64,
+    li: usize,
+    // `None` uses the LoRA vector the previous frame left on the card — the
+    // host never sees it and never projects it.
+    qn: Option<&[f32]>,
+    idxs: &[u32],
+    inv_freq: &[f32],
+    pos: usize,
+    folded_next: &mut [f32],
+) -> bool {
+    macro_rules! no {
+        ($($t:tt)*) => {{
+            if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
+                eprintln!("кадр слоя отклонён: {}", format_args!($($t)*));
+            }
+            return false;
+        }};
+    }
+    let Some(c) = ctx() else { no!("нет контекста wgpu") };
+    let a = g.attn;
+    let m = g.moe;
+    let (hc, dim) = (g.hc, a.dim);
+    let mix_hc = (2 + hc) * hc;
+    if qn.is_some_and(|v| v.len() < a.q_lora)
+        || idxs.is_empty()
+        || idxs.len() > 1024
+        || folded_next.len() < dim
+    {
+        no!("формы: idx {} out {}", idxs.len(), folded_next.len());
+    }
+    if w.hc_ffn_fn.len() < mix_hc * hc * dim || w.router.len() < m.hidden {
+        no!("гипер-связи или роутер не той формы");
+    }
+
+    // ── weights ──
+    let bytes = model.primary_bytes();
+    let mut wb = Vec::with_capacity(5);
+    for &idx in &[
+        w.attn.wq_a,
+        w.attn.wq_b,
+        w.attn.wo_a,
+        w.attn.wo_b,
+        w.next_wq_a.unwrap_or(w.attn.wq_a),
+    ] {
+        let Some(e) = model.tensors.get(idx) else {
+            no!("тензора {idx} нет");
+        };
+        if e.dtype != cortiq_core::TensorDtype::Q4TiledP {
+            no!("{} не q4tp", e.name);
+        }
+        let (Some(abs), plen) = (model.entry_abs_offset(e), e.nbytes as usize) else {
+            no!("{} без смещения", e.name);
+        };
+        let Some(b) = weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen])
+        else {
+            no!("{} не влез в VRAM", e.name);
+        };
+        wb.push(b);
+    }
+    let Some((gate_all, up_all, down_all)) = moe_expert_bufs(
+        c,
+        model,
+        w.moe.experts,
+        m.inter,
+        m.hidden,
+        true,
+        m.gu_q2,
+    ) else {
+        no!("эксперты не влезли в VRAM");
+    };
+    let cache = {
+        let map = c.dsv4_kv.lock().unwrap();
+        match map.get(&(kv_id, li)) {
+            Some((b, _)) => b.clone(),
+            None => no!("кеш ({kv_id}, {li}) не заведён"),
+        }
+    };
+    // The hyper-connection state lives on the card for the whole token; the
+    // host seeds it once at layer zero.
+    let state = frame_buf(c, 40, hc * dim * 4, true);
+
+    // ── constants (model-owned, address keying is sound) ──
+    let qnw = const_buf(c, bytemuck::cast_slice(&w.attn.q_norm[..a.q_lora]));
+    let sink = const_buf(c, bytemuck::cast_slice(&w.attn.sink[..a.nh]));
+    let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..a.rd / 2]));
+    let ffn_fn = const_buf(c, bytemuck::cast_slice(w.hc_ffn_fn));
+    let ffn_sc = const_buf(c, bytemuck::cast_slice(w.hc_ffn_scale));
+    let ffn_bs = const_buf(c, bytemuck::cast_slice(&w.hc_ffn_base[..mix_hc]));
+    let ffn_nw = const_buf(c, bytemuck::cast_slice(&w.ffn_norm[..dim]));
+    let n_exp = w.moe.experts.len().saturating_sub(1);
+    if w.router.len() < m.hidden * n_exp {
+        no!("роутер короче {} × {}", n_exp, m.hidden);
+    }
+    let router = const_buf(c, bytemuck::cast_slice(&w.router[..m.hidden * n_exp]));
+    let next_nw = const_buf(c, bytemuck::cast_slice(&w.next_norm[..dim]));
+    let next_qn = const_buf(c, bytemuck::cast_slice(&w.next_q_norm[..a.q_lora]));
+
+    // ── per-call uploads ──
+    let posb = frame_up(c, 1, bytemuck::cast_slice(&[pos as f32, a.eps]));
+    let ixb = {
+        let cap = idxs.len().next_power_of_two().max(64);
+        let b = frame_buf(c, 2, cap * 4, true);
+        c.queue.write_buffer(&b, 0, bytemuck::cast_slice(idxs));
+        b
+    };
+    let qnb = match qn {
+        Some(v) => frame_up(c, 4, bytemuck::cast_slice(&v[..a.q_lora])),
+        None => frame_buf(c, 4, a.q_lora * 4, true),
+    };
+
+    // ── working buffers ──
+    let n_pack = n_exp;
+    let slots = m.top_k + 1;
+    let q = frame_buf(c, 5, a.nh * a.hd * 4, false);
+    let attn = frame_buf(c, 6, a.nh * a.hd * 4, false);
+    let mid = frame_buf(c, 7, a.o_groups * a.o_lora * 4, false);
+    let ao = frame_buf(c, 8, dim * 4, false);
+    let mixes = frame_buf(c, 41, mix_hc * 4, false);
+    let folded = frame_buf(c, 42, dim * 4, false);
+    let hpost = frame_buf(c, 43, hc * 4, false);
+    let hcomb = frame_buf(c, 44, hc * hc * 4, false);
+    let x2 = frame_buf(c, 45, dim * 4, false);
+    let state2 = frame_buf(c, 46, hc * dim * 4, false);
+    let logit_b = frame_buf(c, 47, n_pack * 4, false);
+    let msel = frame_buf(c, 19, slots * 4, false);
+    let mwt = frame_buf(c, 20, slots * 4, false);
+    let mcnt = frame_buf(c, 21, 4, false);
+    let mact = frame_buf(c, 22, slots * m.inter * 4, false);
+    let mo = frame_buf(c, 24, dim * 4, false);
+    let qr2 = frame_buf(c, 48, a.q_lora * 4, false);
+    let qn2 = frame_buf(c, 49, a.q_lora * 4, false);
+
+    let hcp = uniform_mixed(
+        c,
+        [hc as u32, dim as u32, g.sinkhorn_iters as u32],
+        g.hc_eps,
+    );
+
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dsv4-layer"),
+        });
+
+    // ── attention half (the fold for it was prepared by the previous frame) ──
+    encode_attn_chain(c, &mut enc, &wb, &qnb, &q, &attn, &mid, &ao, &cache, &ixb,
+                      &sink, &freq, &posb, a, kv_id, li, idxs.len());
+
+    // ── glue: expand, then the FFN half's fold and norm ──
+    encode_hc_expand(c, &mut enc, &ao, &state, &hpost, &hcomb, &state2, &hcp, hc, dim);
+    encode_f32matvec(c, &mut enc, &ffn_fn, &state2, &mixes, mix_hc, hc * dim);
+    encode_hc_fold(c, &mut enc, &state2, &mixes, &ffn_sc, &ffn_bs, &folded, &hpost, &hcomb, &hcp);
+    encode_rmsnorm(c, &mut enc, &folded, &ffn_nw, &x2, dim, a.eps, (50, kv_id, li));
+
+    // ── MoE half ──
+    encode_f32matvec(c, &mut enc, &router, &x2, &logit_b, n_pack, m.hidden);
+    encode_moe_chain(c, &mut enc, &logit_b, &x2, &msel, &mwt, &mcnt, &mact, &mo,
+                     &gate_all, &up_all, &down_all, w, m, n_pack, slots);
+
+    // ── expand, then prepare the NEXT layer ──
+    encode_hc_expand(c, &mut enc, &mo, &state2, &hpost, &hcomb, &state, &hcp, hc, dim);
+    if let Some(nf) = w.hc_next_fn {
+        let nfn = const_buf(c, bytemuck::cast_slice(nf));
+        let nsc = const_buf(c, bytemuck::cast_slice(w.hc_next_scale));
+        let nbs = const_buf(c, bytemuck::cast_slice(&w.hc_next_base[..mix_hc]));
+        encode_f32matvec(c, &mut enc, &nfn, &state, &mixes, mix_hc, hc * dim);
+        encode_hc_fold(c, &mut enc, &state, &mixes, &nsc, &nbs, &folded, &hpost, &hcomb, &hcp);
+        encode_rmsnorm(c, &mut enc, &folded, &next_nw, &x2, dim, a.eps, (51, kv_id, li));
+        // The next layer's LoRA vector, but only when the host is not going
+        // to hand it over anyway — the indexer needs `qr` there, so today it
+        // projects it regardless and computing it twice is waste.
+        if qn.is_none() {
+            encode_q4tp_mv1(c, &mut enc, &wb[4], &x2, &qr2, a.q_lora, dim, (52, kv_id, li));
+            encode_rmsnorm(c, &mut enc, &qr2, &next_qn, &qn2, a.q_lora, a.eps, (53, kv_id, li));
+            enc.copy_buffer_to_buffer(&qn2, 0, &qnb, 0, (a.q_lora * 4) as u64);
+        }
+    }
+
+    let src = if w.hc_next_fn.is_some() { &x2 } else { &ao };
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        (dim * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "dsv4-layer-stage",
+    );
+    let ok = readback(c, enc, src, &stage, (dim * 4) as u64, &mut folded_next[..dim]);
+    drop(sc);
+    ok
+}
+
+/// Seed the layer-frame's hyper-connection state from the host (layer zero).
+pub fn dsv4_state_write(state: &[f32]) -> bool {
+    let Some(c) = ctx() else { return false };
+    let b = frame_buf(c, 40, state.len() * 4, true);
+    c.queue.write_buffer(&b, 0, bytemuck::cast_slice(state));
+    true
+}
+
+/// Read the hyper-connection state back (end of token, for the head).
+pub fn dsv4_state_read(state: &mut [f32]) -> bool {
+    let Some(c) = ctx() else { return false };
+    let b = frame_buf(c, 40, state.len() * 4, true);
+    let bytes = (state.len() * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        bytes,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "dsv4-state-stage",
+    );
+    let enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("st") });
+    let ok = readback(c, enc, &b, &stage, bytes, state);
+    drop(sc);
+    ok
+}
+
 /// MoE routing on the device: scores in, chosen experts and their normalised
 /// weights out, in selection order. `forced` is the hash layers' table row.
 #[allow(clippy::too_many_arguments)]

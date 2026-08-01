@@ -1229,6 +1229,16 @@ fn attn_frame(
     )
 }
 
+/// What the host still owes the device before a layer frame can run: the
+/// shared LoRA vector the indexer reads, and the attended position list.
+#[derive(Default)]
+pub struct AttnPrep {
+    pub qr: Vec<f32>,
+    pub idxs: Vec<usize>,
+    pub win_len: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn attention_step(
     hidden: &[f32],
     l: &Dsv4Layer,
@@ -1238,6 +1248,10 @@ pub fn attention_step(
     // Chosen by the caller from the layer's kind — see Dsv4Globals.
     inv_freq: &[f32],
     pool: Option<&crate::pool::Pool>,
+    // When set, stop once the caches are advanced and the index list is
+    // built, and hand those back instead of running attention: the layer
+    // frame does the rest on the device.
+    prep_out: Option<&mut AttnPrep>,
     out: &mut [f32],
 ) {
     let _t0 = prof::on().then(std::time::Instant::now);
@@ -1401,6 +1415,12 @@ pub fn attention_step(
         }
     }
     debug_assert!(idxs.iter().all(|&p| p < n_pos));
+    if let Some(p) = prep_out {
+        p.qr = qr;
+        p.idxs = idxs;
+        p.win_len = win_len;
+        return;
+    }
 
     // ── the whole block on the device, or nothing ──
     let scale = (hd as f32).powf(-0.5);
@@ -1528,11 +1548,249 @@ fn scopeguard_moe(t: Option<std::time::Instant>, li: usize) -> Charge {
     Charge(t, &prof::MOE_NS)
 }
 
+/// The whole token, one submission per layer. Returns false having changed
+/// nothing if the device declines any layer — the caller's loop is then still
+/// correct to run.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn dsv4_layer_loop(
+    state: &mut [f32],
+    layers: &[Dsv4Layer],
+    g: &Dsv4Globals,
+    cfg: &Dsv4Cfg,
+    st: &mut Dsv4State,
+    token_id: u32,
+    inv_freq: &[f32],
+    pool: Option<&crate::pool::Pool>,
+) -> bool {
+    let dim = cfg.dim;
+    let freqs_of = |l: &Dsv4Layer| -> &[f32] {
+        let f = if l.compressor.is_some() {
+            &g.inv_freq_compress
+        } else {
+            &g.inv_freq_window
+        };
+        if f.is_empty() { inv_freq } else { f.as_slice() }
+    };
+    // Layer zero's opening fold has no frame before it to have prepared it.
+    let mut folded = hc_fold_norm(
+        state,
+        &layers[0].hc_attn_fn,
+        &layers[0].hc_attn_scale,
+        &layers[0].hc_attn_base,
+        &layers[0].attn_norm,
+        cfg,
+        pool,
+    );
+    if !crate::gpu_wgpu::dsv4_state_write(state) {
+        return false;
+    }
+    let mut sink_out = vec![0.0f32; dim];
+    for (li, l) in layers.iter().enumerate() {
+        let mut prep = AttnPrep::default();
+        attention_step(
+            &folded,
+            l,
+            cfg,
+            st,
+            li,
+            freqs_of(l),
+            pool,
+            Some(&mut prep),
+            &mut sink_out,
+        );
+        // The caches the frame will read.
+        let hd = cfg.head_dim;
+        let n_comp = st.compressed[li].len() / hd;
+        let cap = (cfg.window + n_comp.next_power_of_two().max(64)) * hd;
+        let kv_id = st.kv_id;
+        if !crate::gpu_wgpu::dsv4_cache_write(kv_id, li, 0, &st.window[li], cap)
+            || (n_comp > 0
+                && !crate::gpu_wgpu::dsv4_cache_write(
+                    kv_id,
+                    li,
+                    cfg.window * hd,
+                    &st.compressed[li],
+                    cap,
+                ))
+        {
+            return false;
+        }
+        let idx32: Vec<u32> = prep
+            .idxs
+            .iter()
+            .map(|&p| {
+                if p < prep.win_len {
+                    p as u32
+                } else {
+                    (cfg.window + (p - prep.win_len)) as u32
+                }
+            })
+            .collect();
+        let Some(pk) = pack_for(l, cfg, li) else {
+            return false;
+        };
+        let (Some(wq_a), Some(wq_b), Some(wo_a), Some(wo_b)) = (
+            l.wq_a.model_idx(),
+            l.wq_b.model_idx(),
+            l.wo_a.model_idx(),
+            l.wo_b.model_idx(),
+        ) else {
+            return false;
+        };
+        let Some(model) = l.experts.first().and_then(|e| e.w1.model_arc()) else {
+            return false;
+        };
+        let forced: Option<Vec<usize>> = l.tid2eid.as_ref().and_then(|tbl| {
+            let v: Vec<usize> = hash_route(tbl, cfg.vocab, cfg.top_k, token_id)
+                .into_iter()
+                .map(|gi| pk.to_slot[gi])
+                .collect();
+            if v.iter().any(|&x| x == usize::MAX) {
+                None
+            } else {
+                Some(v)
+            }
+        });
+        if l.tid2eid.is_some() && forced.is_none() {
+            return false;
+        }
+        let bias: Option<Vec<f32>> = l
+            .gate_bias
+            .as_deref()
+            .map(|b| pk.globals.iter().map(|&gi| b[gi]).collect());
+        let nxt = layers.get(li + 1);
+        let w = crate::gpu_wgpu::Dsv4LayerW {
+            attn: crate::gpu_wgpu::Dsv4AttnW {
+                wq_a,
+                wq_b,
+                wo_a,
+                wo_b,
+                q_norm: &l.q_norm,
+                sink: &l.attn_sink,
+            },
+            moe: crate::gpu_wgpu::Dsv4MoeW {
+                experts: &pk.tensors,
+                logits: &[],
+                bias: bias.as_deref(),
+                forced: forced.as_deref(),
+            },
+            hc_ffn_fn: &l.hc_ffn_fn,
+            hc_ffn_scale: &l.hc_ffn_scale,
+            hc_ffn_base: &l.hc_ffn_base,
+            hc_next_fn: nxt.map(|n| n.hc_attn_fn.as_slice()),
+            hc_next_scale: nxt.map_or(&l.hc_attn_scale, |n| &n.hc_attn_scale),
+            hc_next_base: nxt.map_or(&l.hc_attn_base, |n| n.hc_attn_base.as_slice()),
+            ffn_norm: &l.ffn_norm,
+            next_norm: nxt.map_or(&l.attn_norm, |n| n.attn_norm.as_slice()),
+            next_q_norm: nxt.map_or(&l.q_norm, |n| n.q_norm.as_slice()),
+            next_wq_a: nxt.and_then(|n| n.wq_a.model_idx()),
+            router: &pk.router,
+        };
+        let geom = crate::gpu_wgpu::Dsv4LayerGeom {
+            attn: crate::gpu_wgpu::Dsv4AttnGeom {
+                dim,
+                nh: cfg.n_heads,
+                hd,
+                rd: cfg.rope_head_dim,
+                q_lora: cfg.q_lora_rank,
+                o_lora: cfg.o_lora_rank,
+                o_groups: cfg.o_groups,
+                eps: cfg.norm_eps,
+                scale: (hd as f32).powf(-0.5),
+            },
+            moe: crate::gpu_wgpu::Dsv4MoeGeom {
+                hidden: dim,
+                inter: cfg.moe_inter,
+                top_k: cfg.top_k,
+                route_scale: cfg.route_scale,
+                swiglu_limit: cfg.swiglu_limit,
+                gu_q2: l.experts.first().is_some_and(|e| {
+                    e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
+                }),
+            },
+            hc: cfg.hc_mult,
+            hc_eps: cfg.hc_eps,
+            sinkhorn_iters: cfg.hc_sinkhorn_iters,
+        };
+        let mut next = vec![0.0f32; dim];
+        if !crate::gpu_wgpu::dsv4_layer_frame(
+            &model,
+            &w,
+            geom,
+            kv_id,
+            li,
+            Some(&prep.qr),
+            &idx32,
+            freqs_of(l),
+            st.pos,
+            &mut next,
+        ) {
+            return false;
+        }
+        folded = next;
+    }
+    crate::gpu_wgpu::dsv4_state_read(state)
+}
+
+/// The host half of one hyper-connection block: mixes, Sinkhorn, fold, norm.
+/// The device does this for every layer but the first, whose state it has not
+/// seen yet.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn hc_fold_norm(
+    state: &[f32],
+    hc_fn: &[f32],
+    hc_scale: &[f32; 3],
+    hc_base: &[f32],
+    norm_w: &[f32],
+    cfg: &Dsv4Cfg,
+    pool: Option<&crate::pool::Pool>,
+) -> Vec<f32> {
+    let (hc, dim) = (cfg.hc_mult, cfg.dim);
+    let mix_hc = (2 + hc) * hc;
+    let mut mixes = vec![0.0f32; mix_hc];
+    hc_mixes(state, hc_fn, mix_hc, cfg.norm_eps, pool, &mut mixes);
+    let mut pre = vec![0.0f32; hc];
+    let mut post = vec![0.0f32; hc];
+    let mut comb = vec![0.0f32; hc * hc];
+    hc_split_sinkhorn(
+        &mixes,
+        hc_scale,
+        hc_base,
+        hc,
+        cfg.hc_sinkhorn_iters,
+        cfg.hc_eps,
+        &mut pre,
+        &mut post,
+        &mut comb,
+    );
+    let mut folded = vec![0.0f32; dim];
+    hc_fold(state, &pre, hc, dim, &mut folded);
+    rms_weighted(&mut folded, norm_w, cfg.norm_eps);
+    folded
+}
+
+/// `CMF_DSV4_GPU_LAYER=1`: one submission per layer instead of two, with the
+/// hyper-connection glue and the router on the device.
+#[cfg(feature = "gpu")]
+fn gpu_layer_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CMF_DSV4_GPU_LAYER").is_ok_and(|v| v != "0")
+            && crate::gpu::backend_available()
+    })
+}
+
 /// The packed expert set of one layer: which globals made it in, and their
 /// directory indices in packing order with the shared expert last. Built once
 /// — the mask does not change during a run — and keyed by layer.
 #[cfg(feature = "gpu")]
 struct Pack {
+    /// The router as dense f32, expanded once. It is 4 MB a layer against a
+    /// 112 GB model, it lives as long as the process — so the address-keyed
+    /// device cache is sound for it, unlike anything built per call.
+    router: Vec<f32>,
     /// global expert id -> packed slot, `usize::MAX` for the ones left out.
     to_slot: Vec<usize>,
     /// packed order, globals only (shared is not in here).
@@ -1579,7 +1837,13 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
             return None;
         }
         tensors.push(idx3(&l.shared)?); // shared rides last, as the kernels expect
+        let (rows, cols) = (l.gate.rows(), l.gate.cols());
+        let mut router = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            l.gate.row_f32(r, &mut router[r * cols..(r + 1) * cols]);
+        }
         Some(Arc::new(Pack {
+            router,
             to_slot,
             globals,
             tensors,
@@ -2063,7 +2327,17 @@ pub fn forward_token(
             rms_of(&emb)
         );
     }
+    // ── one submission per layer, when the device will take it ──
+    #[cfg(feature = "gpu")]
+    let layer_frames = gpu_layer_enabled()
+        && dsv4_layer_loop(&mut state, layers, g, cfg, st, token_id, inv_freq, pool);
+    #[cfg(not(feature = "gpu"))]
+    let layer_frames = false;
+
     for (li, l) in layers.iter().enumerate() {
+        if layer_frames {
+            break;
+        }
         // attention half
         hc_block(
             &mut state,
@@ -2091,7 +2365,7 @@ pub fn forward_token(
                 } else {
                     freqs.as_slice()
                 };
-                attention_step(folded, l, cfg, st, li, freqs, pool, out);
+                attention_step(folded, l, cfg, st, li, freqs, pool, None, out);
                 if dump_path().is_some() {
                     BODY.with(|b| b.borrow_mut().push(vec_json(out)));
                 }
