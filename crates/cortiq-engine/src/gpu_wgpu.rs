@@ -4624,6 +4624,76 @@ fn rope_heads(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// ── Grouped low-rank output projection, stage A (DeepSeek-V4) ───────────────
+//
+// wo_a is block-diagonal wearing a dense disguise. It is stored as one
+// [groups*lora, per_group] matrix, but row i multiplies ONLY the slice of the
+// attention output that group i/lora owns — a matvec whose activation window
+// slides with the row. One added term in the index buys the whole operator.
+//
+// It earns a kernel of its own by size: on the release checkpoint wo_a is 33M
+// weights read once per layer per token, the largest single thing still on
+// the CPU once the experts are away.
+//
+// q4tp layout; the per-row math is copied from q4tp_matvec unchanged, so the
+// two agree bit for bit wherever they overlap — that is, at lora = rows,
+// where the window stops sliding.
+
+@compute @workgroup_size(64)
+fn o_lora_a(@builtin(workgroup_id) wid: vec3<u32>,
+            @builtin(num_workgroups) nwg: vec3<u32>,
+            @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let lora = q1p._p0;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    var row = wid.x;
+    loop {
+        if (row >= rows) { break; }
+        if (lid < 32u) {
+            let pr = unpack2x16float(q1w[params_w + row]);
+            lad_q4tp[lid] = exp2(pr.x + f32(lid) * pr.y);
+        }
+        workgroupBarrier();
+        // A row is exactly one group's width, so the slice offset needs no
+        // parameter of its own: per_group = gpr * 32.
+        let xoff = (row / lora) * gpr * 32u;
+        var acc = 0.0;
+        var g = lid;
+        loop {
+            if (g >= gpr) { break; }
+            let bit = g * 5u;
+            let cb = codes_b + row * cstride + (bit >> 3u);
+            let sh = bit & 7u;
+            var cv = q4tp_byte(cb);
+            if (sh > 3u) { cv = cv | (q4tp_byte(cb + 1u) << 8u); }
+            let scale = lad_q4tp[(cv >> sh) & 31u];
+            let base = (row * gpr + g) * 4u;
+            let xb = xoff + g * 32u;
+            var gsum = 0.0;
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                gsum = gsum + q4b_dot8(q1w[base + k], xb + 8u * k);
+            }
+            acc = acc + scale * gsum;
+            g = g + 64u;
+        }
+        partial_q1t[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid < stride) { partial_q1t[lid] = partial_q1t[lid] + partial_q1t[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lid == 0u) { q1y[row] = partial_q1t[0]; }
+        workgroupBarrier();
+        row = row + nwg.x;
+    }
+}
+
 // ── Sparse attention over an index list (DeepSeek-V4) ───────────────────────
 //
 // Not the sliding-window attention the canonical graph encodes: the keys are
@@ -5096,6 +5166,7 @@ struct Ctx {
     /// not the canonical sliding window.
     /// Per-head RMS and the rope tail, forward or inverse.
     rope_heads: wgpu::ComputePipeline,
+    o_lora_a: wgpu::ComputePipeline,
     sparse_attend: wgpu::ComputePipeline,
     hc_pre_fold: wgpu::ComputePipeline,
     hc_post_expand: wgpu::ComputePipeline,
@@ -5577,6 +5648,7 @@ fn init() -> Result<Ctx, String> {
     let q4b = pipe("q4b_matvec");
     let q4t_mv = pipe("q4t_matvec");
     let rope_heads = pipe("rope_heads");
+    let o_lora_a = pipe("o_lora_a");
     let sparse_attend = pipe("sparse_attend");
     let hc_pre_fold = pipe("hc_pre_fold");
     let hc_post_expand = pipe("hc_post_expand");
@@ -5778,6 +5850,7 @@ fn init() -> Result<Ctx, String> {
         q4b,
         q4t_mv,
         rope_heads,
+        o_lora_a,
         sparse_attend,
         hc_pre_fold,
         hc_post_expand,
@@ -14913,6 +14986,84 @@ pub fn rope_heads_for_test(
         "rope-stage",
     );
     let ok = readback(c, enc, &xb, &stage, (nh * hd * 4) as u64, x);
+    drop(sc);
+    ok
+}
+
+/// Stage A of the grouped low-rank output projection on the device.
+///
+/// `lora` rows share each group's slice of `attn`; `rows` is `groups * lora`.
+/// q4tp only — the release stores wo_a that way in both published variants,
+/// and guessing at a layout is how a kernel returns plausible nonsense.
+pub fn o_lora_a_for_test(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    attn: &[f32],
+    rows: usize,
+    lora: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if rows == 0 || lora == 0 || rows % lora != 0 || out.len() < rows {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    if entry.dtype != cortiq_core::TensorDtype::Q4TiledP || entry.shape.len() != 2 {
+        return false;
+    }
+    let (trows, cols) = (entry.shape[0], entry.shape[1]);
+    let groups = rows / lora;
+    if trows < rows || cols % 32 != 0 || attn.len() < groups * cols {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let bytes = model.primary_bytes();
+    let plen = entry.nbytes as usize;
+    if abs + plen > bytes.len() {
+        return false;
+    }
+    let Some(w) = weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen]) else {
+        return false; // over budget → the caller keeps it on the CPU
+    };
+    let xb = storage_bytes(c, bytemuck::cast_slice(&attn[..groups * cols]));
+    let yb = rw_f32(c, rows, true);
+    let p = uniform_u32x4(c, [(cols / 32) as u32, rows as u32, lora as u32, 0]);
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("o-lora-a"),
+        });
+    {
+        let layout = c.o_lora_a.get_bind_group_layout(0);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                bind_buf(0, &w),
+                bind_buf(1, &xb),
+                bind_buf(2, &yb),
+                bind_buf(3, &p),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.o_lora_a);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+    }
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        (rows * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "o-lora-stage",
+    );
+    let ok = readback(c, enc, &yb, &stage, (rows * 4) as u64, &mut out[..rows]);
     drop(sc);
     ok
 }
