@@ -5621,6 +5621,10 @@ struct Ctx {
     /// ran the code ones on the CPU forever. The two working sets overlap
     /// at a Jaccard of 0.095, measured, so that is not a corner case.
     weight_bufs: Mutex<HashMap<(usize, usize), Resident>>,
+    /// DeepSeek-V4's attention cache, per (kv id, layer), living on the card
+    /// between tokens. Re-uploading it each token costs more than the frame
+    /// saves: at 4K context it is megabytes per layer.
+    dsv4_kv: Mutex<HashMap<(u64, usize), (wgpu::Buffer, usize)>>,
     /// Access clock for the aging above — one tick per weight lookup.
     res_clock: std::sync::atomic::AtomicU64,
     /// row_scale buffer per (idx, row0) — small, cached.
@@ -6274,6 +6278,7 @@ fn init() -> Result<Ctx, String> {
         resident: std::sync::atomic::AtomicU64::new(0),
         scratch: Mutex::new(Scratch::default()),
         weight_bufs: Mutex::new(HashMap::new()),
+        dsv4_kv: Mutex::new(HashMap::new()),
         res_clock: std::sync::atomic::AtomicU64::new(0),
         uniforms: Mutex::new(HashMap::new()),
         uniforms8: Mutex::new(HashMap::new()),
@@ -15704,6 +15709,294 @@ pub fn moe_route_for_test(
         ok = true;
     }
     stage.unmap();
+    drop(sc);
+    ok
+}
+
+fn encode_rmsnorm(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    x: &wgpu::Buffer,
+    w: &wgpu::Buffer,
+    o: &wgpu::Buffer,
+    n: usize,
+    eps: f32,
+) {
+    let p = uniform_u32x4(c, [n as u32, 0, eps.to_bits(), 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.rmsnorm.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, x),
+            bind_buf(1, w),
+            bind_buf(2, o),
+            bind_buf(3, &p),
+        ],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.rmsnorm);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(1, 1, 1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_rope_heads(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    x: &wgpu::Buffer,
+    freq: &wgpu::Buffer,
+    posb: &wgpu::Buffer,
+    nh: usize,
+    hd: usize,
+    rd: usize,
+    rms: bool,
+    inverse: bool,
+) {
+    let flags = (rms as u32) | ((inverse as u32) << 1);
+    let p = uniform_u32x4(c, [nh as u32, hd as u32, rd as u32, flags]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.rope_heads.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, x),
+            bind_buf(1, freq),
+            bind_buf(2, &p),
+            bind_buf(3, posb),
+        ],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.rope_heads);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(nh as u32, 1, 1);
+}
+
+/// The one thing that has to survive between tokens. `off` and `data` are in
+/// floats; the buffer is created on first use at `cap` and never shrinks.
+pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    if off + data.len() > cap {
+        return false;
+    }
+    let mut map = c.dsv4_kv.lock().unwrap();
+    let e = map.entry((kv_id, li)).or_insert_with(|| {
+        (
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dsv4-kv"),
+                size: (cap * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            cap,
+        )
+    });
+    if e.1 < off + data.len() {
+        return false; // a longer context than the cache was built for
+    }
+    if !data.is_empty() {
+        c.queue
+            .write_buffer(&e.0, (off * 4) as u64, bytemuck::cast_slice(data));
+    }
+    true
+}
+
+/// Drop a conversation's caches (a new sequence, or the pipeline resetting).
+pub fn dsv4_cache_clear(kv_id: u64) {
+    if let Some(c) = ctx() {
+        c.dsv4_kv.lock().unwrap().retain(|k, _| k.0 != kv_id);
+    }
+}
+
+/// The quantized tensors one DeepSeek-V4 attention block reads, by directory
+/// index, plus the two small f32 vectors it needs whole.
+pub struct Dsv4AttnW<'a> {
+    pub wq_a: usize,
+    pub wq_b: usize,
+    pub wo_a: usize,
+    pub wo_b: usize,
+    pub q_norm: &'a [f32],
+    pub sink: &'a [f32],
+}
+
+/// Shapes for one block. Separate from the weights so the caller can build it
+/// once per layer and keep it.
+#[derive(Clone, Copy)]
+pub struct Dsv4AttnGeom {
+    pub dim: usize,
+    pub nh: usize,
+    pub hd: usize,
+    pub rd: usize,
+    pub q_lora: usize,
+    pub o_lora: usize,
+    pub o_groups: usize,
+    pub eps: f32,
+    pub scale: f32,
+}
+
+/// DeepSeek-V4's attention block, start to finish, in ONE submission.
+///
+/// Eight operations that were eight round trips: the query LoRA and its two
+/// norms, the rope tail, attention over the index list, the inverse rope, and
+/// the grouped output projection. Nothing between them touches the host — the
+/// intermediate vectors never leave the card, and the KV cache is already
+/// there.
+///
+/// The kv vector itself stays on the CPU deliberately: the compressor's
+/// pending windows are host state, and pulling one 512-wide vector back is
+/// cheaper than moving that state too. That is the next frame to fuse, not a
+/// thing forgotten here.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_attn_frame(
+    model: &Arc<CmfModel>,
+    w: &Dsv4AttnW,
+    g: Dsv4AttnGeom,
+    hidden: &[f32],
+    kv_id: u64,
+    li: usize,
+    idxs: &[u32],
+    inv_freq: &[f32],
+    pos: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if hidden.len() < g.dim
+        || out.len() < g.dim
+        || w.sink.len() < g.nh
+        || w.q_norm.len() < g.q_lora
+        || idxs.is_empty()
+        || idxs.len() > 1024
+        || inv_freq.len() * 2 < g.rd
+    {
+        return false;
+    }
+    let bytes = model.primary_bytes();
+    // Every weight q4tp, or the frame declines: a mixed layer would need the
+    // per-op branches back and this is not the place to guess a layout.
+    let mut wb = Vec::with_capacity(4);
+    for &idx in &[w.wq_a, w.wq_b, w.wo_a, w.wo_b] {
+        let Some(e) = model.tensors.get(idx) else {
+            return false;
+        };
+        if e.dtype != cortiq_core::TensorDtype::Q4TiledP || e.shape.len() != 2 {
+            return false;
+        }
+        let Some(abs) = model.entry_abs_offset(e) else {
+            return false;
+        };
+        let plen = e.nbytes as usize;
+        if abs + plen > bytes.len() {
+            return false;
+        }
+        let Some(b) = weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen])
+        else {
+            return false;
+        };
+        wb.push(b);
+    }
+    let cache = {
+        let map = c.dsv4_kv.lock().unwrap();
+        match map.get(&(kv_id, li)) {
+            Some((b, _)) => b.clone(),
+            None => return false, // the caller never seeded it
+        }
+    };
+
+    let hb = storage_bytes(c, bytemuck::cast_slice(&hidden[..g.dim]));
+    let qnw = storage_bytes(c, bytemuck::cast_slice(&w.q_norm[..g.q_lora]));
+    let sink = storage_bytes(c, bytemuck::cast_slice(&w.sink[..g.nh]));
+    let freq = storage_bytes(c, bytemuck::cast_slice(&inv_freq[..g.rd / 2]));
+    let posb = storage_bytes(c, bytemuck::cast_slice(&[pos as f32, g.eps]));
+    let ixb = storage_bytes(c, bytemuck::cast_slice(idxs));
+
+    let qr = rw_f32(c, g.q_lora, false);
+    let qn = rw_f32(c, g.q_lora, false);
+    let q = rw_f32(c, g.nh * g.hd, false);
+    let attn = rw_f32(c, g.nh * g.hd, false);
+    let mid = rw_f32(c, g.o_groups * g.o_lora, false);
+    let yb = rw_f32(c, g.dim, true);
+
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dsv4-attn"),
+        });
+    encode_q4tp_mv4(c, &mut enc, &wb[0], &hb, &qr, g.q_lora, g.dim);
+    encode_rmsnorm(c, &mut enc, &qr, &qnw, &qn, g.q_lora, g.eps);
+    encode_q4tp_mv4(c, &mut enc, &wb[1], &qn, &q, g.nh * g.hd, g.q_lora);
+    encode_rope_heads(
+        c, &mut enc, &q, &freq, &posb, g.nh, g.hd, g.rd, true, false,
+    );
+    {
+        let p = uniform_mixed(c, [g.nh as u32, g.hd as u32, idxs.len() as u32], g.scale);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.sparse_attend.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &q),
+                bind_buf(1, &cache),
+                bind_buf(2, &ixb),
+                bind_buf(3, &sink),
+                bind_buf(4, &attn),
+                bind_buf(5, &p),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.sparse_attend);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(g.nh as u32, 1, 1);
+    }
+    encode_rope_heads(
+        c, &mut enc, &attn, &freq, &posb, g.nh, g.hd, g.rd, false, true,
+    );
+    {
+        let rows = g.o_groups * g.o_lora;
+        let cols = g.nh * g.hd / g.o_groups;
+        let p = uniform_u32x4(c, [(cols / 32) as u32, rows as u32, g.o_lora as u32, 0]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.o_lora_a.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &wb[2]),
+                bind_buf(1, &attn),
+                bind_buf(2, &mid),
+                bind_buf(3, &p),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.o_lora_a);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+    }
+    encode_q4tp_mv4(
+        c,
+        &mut enc,
+        &wb[3],
+        &mid,
+        &yb,
+        g.dim,
+        g.o_groups * g.o_lora,
+    );
+
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        (g.dim * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "dsv4-attn-stage",
+    );
+    let ok = readback(c, enc, &yb, &stage, (g.dim * 4) as u64, &mut out[..g.dim]);
     drop(sc);
     ok
 }
