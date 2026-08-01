@@ -100,15 +100,39 @@ fn sigmoid(x: f32) -> f32 {
 /// The projection feeding `hc_split_sinkhorn`: the `hc` copies are flattened
 /// to one `hc*dim` vector, RMS-scaled (no learned weight — the reference uses
 /// a bare rsqrt of the mean square), and projected by `hc_fn` `[mix_hc, hc*dim]`.
-pub fn hc_mixes(x_flat: &[f32], hc_fn: &[f32], mix_hc: usize, eps: f32, out: &mut [f32]) {
+pub fn hc_mixes(
+    x_flat: &[f32],
+    hc_fn: &[f32],
+    mix_hc: usize,
+    eps: f32,
+    pool: Option<&crate::pool::Pool>,
+    out: &mut [f32],
+) {
     let n = x_flat.len();
     debug_assert_eq!(hc_fn.len(), mix_hc * n);
     debug_assert_eq!(out.len(), mix_hc);
     let ms = x_flat.iter().map(|v| v * v).sum::<f32>() / n as f32;
     let rsqrt = 1.0 / (ms + eps).sqrt();
-    for (i, o) in out.iter_mut().enumerate() {
-        let row = &hc_fn[i * n..(i + 1) * n];
-        *o = row.iter().zip(x_flat).map(|(a, b)| a * b).sum::<f32>() * rsqrt;
+    // A dense f32 matvec of mix_hc rows over hc*dim — 1.6 MB read per call on
+    // the release, and TWO calls per layer, so 135 MB a token. It ran on one
+    // thread and cost more than the whole attention block.
+    match pool {
+        Some(p) if n >= 4096 => {
+            let addr = crate::pool::SendMut::new(out.as_mut_ptr());
+            p.run_rows(mix_hc, &|start, end| {
+                for i in start..end {
+                    let row = &hc_fn[i * n..(i + 1) * n];
+                    let v = row.iter().zip(x_flat).map(|(a, b)| a * b).sum::<f32>() * rsqrt;
+                    unsafe { *addr.at(i) = v };
+                }
+            });
+        }
+        _ => {
+            for (i, o) in out.iter_mut().enumerate() {
+                let row = &hc_fn[i * n..(i + 1) * n];
+                *o = row.iter().zip(x_flat).map(|(a, b)| a * b).sum::<f32>() * rsqrt;
+            }
+        }
     }
 }
 
@@ -656,6 +680,7 @@ pub struct Dsv4Cfg {
 ///
 /// `hc_fn` is `[mix_hc, hc*dim]`, `hc_base` is `[mix_hc]`, `hc_scale` is 3.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn hc_block<F: FnMut(&[f32], &mut [f32])>(
     state: &mut [f32],
     hc_fn: &[f32],
@@ -664,11 +689,12 @@ pub fn hc_block<F: FnMut(&[f32], &mut [f32])>(
     norm_w: &[f32],
     cfg: &Dsv4Cfg,
     scratch: &mut HcScratch,
+    pool: Option<&crate::pool::Pool>,
     mut block: F,
 ) {
     let (hc, dim) = (cfg.hc_mult, cfg.dim);
     let mix_hc = (2 + hc) * hc;
-    hc_mixes(state, hc_fn, mix_hc, cfg.norm_eps, &mut scratch.mixes);
+    hc_mixes(state, hc_fn, mix_hc, cfg.norm_eps, pool, &mut scratch.mixes);
     hc_split_sinkhorn(
         &scratch.mixes,
         hc_scale,
@@ -735,11 +761,12 @@ pub fn hc_head_fold(
     hc_scale: f32,
     hc_base: &[f32],
     cfg: &Dsv4Cfg,
+    pool: Option<&crate::pool::Pool>,
     out: &mut [f32],
 ) {
     let (hc, dim) = (cfg.hc_mult, cfg.dim);
     let mut mixes = vec![0.0f32; hc];
-    hc_mixes(state, hc_fn, hc, cfg.norm_eps, &mut mixes);
+    hc_mixes(state, hc_fn, hc, cfg.norm_eps, pool, &mut mixes);
     let mut pre = vec![0.0f32; hc];
     hc_head_pre(&mixes, hc_scale, hc_base, hc, cfg.hc_eps, &mut pre);
     hc_fold(state, &pre, hc, dim, out);
@@ -981,6 +1008,11 @@ pub(crate) mod prof {
     pub static ATTN_NS: AtomicU64 = AtomicU64::new(0);
     pub static MOE_NS: AtomicU64 = AtomicU64::new(0);
     pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Everything in a layer that is neither attention nor the experts: the
+    /// hyper-connection fold and expand, the two norms, the residual.
+    pub static HC_NS: AtomicU64 = AtomicU64::new(0);
+    /// The head: final norm plus lm_head over 129280 rows.
+    pub static HEAD_NS: AtomicU64 = AtomicU64::new(0);
     pub static TOKENS: AtomicU64 = AtomicU64::new(0);
 
     /// One token = one visit to layer zero. Counting `moe_step` calls instead
@@ -1013,14 +1045,19 @@ pub(crate) mod prof {
             ATTN_NS.load(Ordering::Relaxed) as f64 / 1e6,
             MOE_NS.load(Ordering::Relaxed) as f64 / 1e6,
         );
+        let hc = HC_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        let hd = HEAD_NS.load(Ordering::Relaxed) as f64 / 1e6;
         eprintln!(
             "[dsv4-профиль] {calls} вызовов слоя за {toks} токенов | \
-             на вызов: внимание {:.2} мс, MoE {:.2} мс | \
-             на токен: внимание {:.0} мс, MoE {:.0} мс (прочее вне замера)",
-            a / calls as f64,
-            m / calls as f64,
+             на токен: внимание {:.0} мс, MoE {:.0} мс, гипер-связи+нормы {:.0} мс, \
+             голова {:.0} мс | на вызов: внимание {:.2}, MoE {:.2}, связи {:.2}",
             a / toks as f64,
             m / toks as f64,
+            hc / toks as f64,
+            hd / toks as f64,
+            a / calls as f64,
+            m / calls as f64,
+            hc / calls as f64,
         );
         #[cfg(feature = "gpu")]
         {
@@ -1995,6 +2032,7 @@ pub fn forward_token(
             &l.attn_norm,
             cfg,
             &mut scratch,
+            pool,
             |folded, out| {
                 if dump_path().is_some() {
                     // The body's own input and output, so the reference can be
@@ -2028,6 +2066,7 @@ pub fn forward_token(
             ));
         }
         // FFN half
+        let _t_hc2 = prof::on().then(std::time::Instant::now);
         hc_block(
             &mut state,
             &l.hc_ffn_fn,
@@ -2036,8 +2075,17 @@ pub fn forward_token(
             &l.ffn_norm,
             cfg,
             &mut scratch,
+            pool,
             |folded, out| moe_step(folded, l, cfg, token_id, li, pool, out),
         );
+        if let Some(t) = _t_hc2 {
+            // The block's own time minus the expert step inside it — what the
+            // fold, the norm and the expand cost on their own.
+            prof::HC_NS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         if dump_path().is_some() {
             dump.push(format!(",{}", vec_json(&state)));
         }
@@ -2073,12 +2121,20 @@ pub fn forward_token(
         g.hc_head_scale,
         &g.hc_head_base,
         cfg,
+        pool,
         &mut h,
     );
+    let _t_head = prof::on().then(std::time::Instant::now);
     rms_weighted(&mut h, &g.norm, cfg.norm_eps);
     logits.clear();
     logits.resize(g.head.rows(), 0.0);
     g.head.matvec(&h, logits, pool);
+    if let Some(t) = _t_head {
+        prof::HEAD_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     if dump_path().is_some() {
         dump.push("]".into());
         let picked = PICKED.with(|p| {
@@ -2998,7 +3054,8 @@ mod tests {
             &norm_w,
             &cfg,
             &mut scratch,
-            |_folded, out| out.iter_mut().for_each(|o| *o = 1.0),
+            None,
+            |_folded, out: &mut [f32]| out.iter_mut().for_each(|o| *o = 1.0),
         );
         assert_eq!(state.len(), before.len(), "copy structure must survive");
         assert!(state.iter().all(|v| v.is_finite()), "{state:?}");
@@ -3097,3 +3154,4 @@ mod tests {
         assert_eq!(idx2[0], 3, "without a table the highest score still wins");
     }
 }
+
