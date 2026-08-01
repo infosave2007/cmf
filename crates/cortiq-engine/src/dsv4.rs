@@ -1228,14 +1228,21 @@ pub fn moe_step(
     // arithmetic rather than the traffic. A refusal (missing kernel, mixed
     // layouts, weights that do not fit the budget) falls to the CPU whole,
     // never half.
-    // ON by default now that it is measured against the CPU on real weights:
-    // perplexity 6.808 → 6.839 at 64 tokens and 5.102 → 5.146 at 200, which
-    // is summation order, not a different model. The 220% divergence that
-    // held this back was an artefact of comparing two generations after they
-    // had already chosen different tokens. `CMF_DSV4_GPU_MOE=0` reverts.
+    // CORRECT but SLOWER, so off by default. Parity holds on real weights
+    // (perplexity 6.808 → 6.839 at 64 tokens, 5.102 → 5.146 at 200), and an
+    // honest alternating A/B says 1.0 tok/s against the CPU's 2.2. The first
+    // measurement claimed the opposite — 0.7 → 2.0 — because the CPU arm ran
+    // first and paged in 158 GB for the GPU arm to inherit.
+    //
+    // The cost is not arithmetic, it is round trips: this submits and reads
+    // back once per layer, forty-three times a token, and a discrete card
+    // charges milliseconds for each. Fixing it means one submission per
+    // token — the whole-token graph — not a faster kernel.
+    //
+    // `CMF_DSV4_GPU_MOE=1` opts in.
     fn gpu_moe_on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("CMF_DSV4_GPU_MOE").map(|v| v != "0").unwrap_or(true))
+        *ON.get_or_init(|| std::env::var("CMF_DSV4_GPU_MOE").is_ok_and(|v| v != "0"))
     }
     if gpu_moe_on() && crate::gpu::enabled_here() {
         let mut jobs = Vec::with_capacity(idx.len() + 1);
