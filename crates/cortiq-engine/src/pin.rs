@@ -51,13 +51,23 @@ mod imp {
             if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl) != 0 {
                 return None;
             }
-            if rl.rlim_cur < rl.rlim_max {
-                let want = libc::rlimit {
+            // Raising the soft limit to the hard one is not enough: a stock
+            // container ships 8 MB for BOTH, and the first tensor of any real
+            // model is bigger than that. With CAP_SYS_RESOURCE the hard limit
+            // can go too, so try that first and fall back.
+            for want in [
+                libc::rlimit {
+                    rlim_cur: libc::RLIM_INFINITY,
+                    rlim_max: libc::RLIM_INFINITY,
+                },
+                libc::rlimit {
                     rlim_cur: rl.rlim_max,
                     rlim_max: rl.rlim_max,
-                };
+                },
+            ] {
                 if libc::setrlimit(libc::RLIMIT_MEMLOCK, &want) == 0 {
-                    rl.rlim_cur = rl.rlim_max;
+                    rl.rlim_cur = want.rlim_cur;
+                    break;
                 }
             }
             Some(rl.rlim_cur as u64)
@@ -171,6 +181,7 @@ pub fn pin_tensors(model: &cortiq_core::CmfModel, names: &[String]) -> Pinned {
         skipped: 0,
         limit,
     };
+    let mut fails = 0usize;
     for n in names {
         let Ok(b) = model.tensor_bytes(n) else {
             out.skipped += 1;
@@ -182,12 +193,23 @@ pub fn pin_tensors(model: &cortiq_core::CmfModel, names: &[String]) -> Pinned {
                 out.tensors += 1;
             }
             Err(e) => {
-                tracing::warn!(
-                    "закрепление остановлено на {n} после {:.1} ГБ: {e}",
-                    out.bytes as f64 / 1e9
-                );
-                out.skipped += names.len() - out.tensors;
-                break;
+                // One oversized tensor is not a reason to abandon the rest —
+                // the first attempt gave up on the embedding and pinned
+                // nothing at all. Give up only when it is clearly hopeless.
+                out.skipped += 1;
+                fails += 1;
+                if fails == 1 {
+                    tracing::warn!("первое закрепление не удалось ({n}): {e}");
+                }
+                if fails >= 64 && out.tensors == 0 {
+                    tracing::warn!(
+                        "закрепление не работает вовсе — лимит {:.2} ГБ; \
+                         остальные {} тензоров пропущены",
+                        limit.unwrap_or(0) as f64 / 1e9,
+                        names.len() - out.skipped
+                    );
+                    break;
+                }
             }
         }
     }
