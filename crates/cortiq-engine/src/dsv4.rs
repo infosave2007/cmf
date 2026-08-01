@@ -987,6 +987,19 @@ pub(crate) mod prof {
             a / toks as f64,
             m / toks as f64,
         );
+        #[cfg(feature = "gpu")]
+        {
+            let e = crate::gpu_wgpu::MOE_ENC_NS.load(Ordering::Relaxed) as f64 / 1e6;
+            let wt = crate::gpu_wgpu::MOE_WAIT_NS.load(Ordering::Relaxed) as f64 / 1e6;
+            if e + wt > 0.0 {
+                eprintln!(
+                    "[dsv4-профиль] кадр MoE на вызов: кодирование {:.2} мс, \
+                     отправка и ожидание {:.2} мс",
+                    e / calls as f64,
+                    wt / calls as f64,
+                );
+            }
+        }
     }
 }
 
@@ -1066,16 +1079,30 @@ fn attn_frame(
     if !crate::gpu_wgpu::dsv4_cache_write(kv_id, li, 0, &st.window[li], cap) {
         return false;
     }
-    if n_comp > 0
-        && !crate::gpu_wgpu::dsv4_cache_write(
+    // The compressed axis only ever grows, so write the TAIL. Rewriting it
+    // whole was 22 MB a token at 1024 positions — the cache write, not the
+    // arithmetic, was what the attention block had left to pay.
+    if n_comp > 0 {
+        // A reallocation anywhere invalidates every tail count: the old
+        // contents are gone.
+        let grew = crate::gpu_wgpu::GREW.load(std::sync::atomic::Ordering::Relaxed);
+        let done = if grew == last_grew(grew) {
+            compressed_written(kv_id, li)
+        } else {
+            0
+        };
+        let from = done.min(st.compressed[li].len());
+        if !crate::gpu_wgpu::dsv4_cache_write(
             kv_id,
             li,
-            cfg.window * hd,
-            &st.compressed[li],
+            cfg.window * hd + from,
+            &st.compressed[li][from..],
             cap,
-        )
-    {
-        return false;
+        ) {
+            note_compressed(kv_id, li, 0);
+            return false;
+        }
+        note_compressed(kv_id, li, st.compressed[li].len());
     }
     // Host list: window slots 0..win_len, then compressed. Device layout: a
     // FIXED window region of `cfg.window` slots, then compressed. The two
@@ -1547,6 +1574,49 @@ fn moe_frame(
         }),
     };
     crate::gpu_wgpu::dsv4_moe_frame(&model, &w, g, hidden, out)
+}
+
+/// How much of each layer's compressed cache already sits on the card. ONE
+/// map: a reader and a writer with a `static` each are two maps, and the
+/// reader would never see a thing the writer put down.
+/// The reallocation counter as of the last successful tail write. Any change
+/// means some buffer was rebuilt and every tail count is stale.
+#[cfg(feature = "gpu")]
+fn last_grew(now: u64) -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let was = SEEN.load(Ordering::Relaxed);
+    if was != now {
+        SEEN.store(now, Ordering::Relaxed);
+        compressed_map().lock().unwrap().clear();
+        return u64::MAX; // force a full write this round
+    }
+    now
+}
+
+#[cfg(feature = "gpu")]
+fn compressed_map() -> &'static std::sync::Mutex<std::collections::HashMap<(u64, usize), usize>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static W: OnceLock<Mutex<HashMap<(u64, usize), usize>>> = OnceLock::new();
+    W.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "gpu")]
+fn compressed_written(kv_id: u64, li: usize) -> usize {
+    compressed_map()
+        .lock()
+        .unwrap()
+        .get(&(kv_id, li))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Reset to zero whenever a write fails or the buffer grows — a grown buffer
+/// keeps none of its contents.
+#[cfg(feature = "gpu")]
+fn note_compressed(kv_id: u64, li: usize, n: usize) {
+    compressed_map().lock().unwrap().insert((kv_id, li), n);
 }
 
 #[cfg(feature = "gpu")]

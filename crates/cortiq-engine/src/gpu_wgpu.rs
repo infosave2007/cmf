@@ -15966,6 +15966,7 @@ pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: us
     // losing the old contents costs nothing.
     if map.get(&(kv_id, li)).is_some_and(|(_, have)| *have < cap) {
         map.remove(&(kv_id, li));
+        GREW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let e = map.entry((kv_id, li)).or_insert_with(|| {
         (
@@ -15987,6 +15988,10 @@ pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: us
     }
     true
 }
+
+/// Bumped whenever a cache buffer is reallocated. A caller that writes only
+/// the tail has to notice, because the new buffer holds nothing.
+pub static GREW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Drop a conversation's caches (a new sequence, or the pipeline resetting).
 pub fn dsv4_cache_clear(kv_id: u64) {
@@ -16289,6 +16294,7 @@ pub fn dsv4_moe_frame(
             return false;
         }};
     }
+    let t_all = std::time::Instant::now();
     let Some(c) = ctx() else { no!("нет контекста wgpu") };
     let n_pack = w.experts.len().saturating_sub(1); // routed; shared is last
     let slots = g.top_k + 1;
@@ -16448,6 +16454,7 @@ pub fn dsv4_moe_frame(
         pass.set_bind_group(0, &bg_dn, &[]);
         pass.dispatch_workgroups(g.hidden as u32, 1, 1);
     }
+    let t_enc = std::time::Instant::now();
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(
         &c.device,
@@ -16458,8 +16465,23 @@ pub fn dsv4_moe_frame(
     );
     let ok = readback(c, enc, &ob, &stage, (g.hidden * 4) as u64, &mut out[..g.hidden]);
     drop(sc);
+    // Encoding and waiting are different problems with different fixes, and
+    // the layer total cannot tell them apart. Costs one Instant per layer.
+    MOE_ENC_NS.fetch_add(
+        t_enc.duration_since(t_all).as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    MOE_WAIT_NS.fetch_add(
+        t_enc.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     ok
 }
+
+/// Time inside `dsv4_moe_frame`, split at the submit. Read by the dsv4
+/// profile so a slow block can be blamed on the right half.
+pub static MOE_ENC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MOE_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Attention over an index list with the learned sink, on the device.
 ///
