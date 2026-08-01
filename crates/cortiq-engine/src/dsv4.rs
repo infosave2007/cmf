@@ -1422,6 +1422,123 @@ fn scopeguard_moe(t: Option<std::time::Instant>, li: usize) -> Charge {
     Charge(t, &prof::MOE_NS)
 }
 
+/// The packed expert set of one layer: which globals made it in, and their
+/// directory indices in packing order with the shared expert last. Built once
+/// — the mask does not change during a run — and keyed by layer.
+#[cfg(feature = "gpu")]
+struct Pack {
+    /// global expert id -> packed slot, `usize::MAX` for the ones left out.
+    to_slot: Vec<usize>,
+    /// packed order, globals only (shared is not in here).
+    globals: Vec<usize>,
+    tensors: Vec<(usize, usize, usize)>,
+}
+
+#[cfg(feature = "gpu")]
+fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pack>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<usize, Option<Arc<Pack>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().unwrap().get(&li) {
+        return v.clone();
+    }
+    let build = || -> Option<Arc<Pack>> {
+        let mut to_slot = vec![usize::MAX; cfg.n_routed_experts];
+        let mut globals = Vec::new();
+        let mut tensors = Vec::new();
+        let idx3 = |e: &Dsv4Expert| -> Option<(usize, usize, usize)> {
+            Some((e.w1.model_idx()?, e.w3.model_idx()?, e.w2.model_idx()?))
+        };
+        for (gi, e) in l.experts.iter().enumerate() {
+            // The mask IS the hot set: an expert left out has no logit on the
+            // device and cannot be chosen, so no remap table is needed.
+            if l.mask.as_deref().is_some_and(|m| !m.get(gi).copied().unwrap_or(true)) {
+                continue;
+            }
+            to_slot[gi] = globals.len();
+            globals.push(gi);
+            tensors.push(idx3(e)?);
+        }
+        if globals.is_empty() {
+            return None;
+        }
+        tensors.push(idx3(&l.shared)?); // shared rides last, as the kernels expect
+        Some(Arc::new(Pack {
+            to_slot,
+            globals,
+            tensors,
+        }))
+    };
+    let v = build();
+    cache.lock().unwrap().insert(li, v.clone());
+    v
+}
+
+/// `CMF_DSV4_GPU_MOE2=1`: the whole MoE block in one submission, experts
+/// resident. Returns false having changed nothing if it cannot.
+#[cfg(feature = "gpu")]
+fn moe_frame(
+    hidden: &[f32],
+    l: &Dsv4Layer,
+    cfg: &Dsv4Cfg,
+    li: usize,
+    logits: &[f32],
+    forced: Option<&[usize]>,
+    out: &mut [f32],
+) -> bool {
+    let Some(pk) = pack_for(l, cfg, li) else {
+        return false;
+    };
+    let Some(model) = l.gate.model_arc() else {
+        return false;
+    };
+    // A forced expert outside the packing has nowhere to go; the hash layers
+    // name specific experts and a mask that drops one of them is a mask this
+    // layer cannot use.
+    let fpack: Option<Vec<usize>> = match forced {
+        Some(f) => {
+            let v: Vec<usize> = f.iter().map(|&g| pk.to_slot[g]).collect();
+            if v.iter().any(|&s| s == usize::MAX) {
+                return false;
+            }
+            Some(v)
+        }
+        None => None,
+    };
+    let lg: Vec<f32> = pk.globals.iter().map(|&g| logits[g]).collect();
+    let bias: Option<Vec<f32>> = l
+        .gate_bias
+        .as_deref()
+        .map(|b| pk.globals.iter().map(|&g| b[g]).collect());
+    let w = crate::gpu_wgpu::Dsv4MoeW {
+        experts: &pk.tensors,
+        logits: &lg,
+        bias: bias.as_deref(),
+        forced: fpack.as_deref(),
+    };
+    let g = crate::gpu_wgpu::Dsv4MoeGeom {
+        hidden: cfg.dim,
+        inter: cfg.moe_inter,
+        top_k: cfg.top_k,
+        route_scale: cfg.route_scale,
+        swiglu_limit: cfg.swiglu_limit,
+        gu_q2: l.experts.first().is_some_and(|e| {
+            e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
+        }),
+    };
+    crate::gpu_wgpu::dsv4_moe_frame(&model, &w, g, hidden, out)
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_moe2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CMF_DSV4_GPU_MOE2").is_ok_and(|v| v != "0")
+            && crate::gpu::backend_available()
+    })
+}
+
 pub fn moe_step(
     hidden: &[f32],
     l: &Dsv4Layer,
@@ -1452,6 +1569,19 @@ pub fn moe_step(
     );
     if route_stats_on() {
         record_route(li, 0, cfg.n_routed_experts, &idx);
+    }
+    // The whole block on the device, in one submission, or nothing. Routing
+    // happens there too — the logits above are what it starts from, so the
+    // CPU's own choice is discarded rather than second-guessed.
+    #[cfg(feature = "gpu")]
+    if gpu_moe2_enabled() {
+        let forced = l
+            .tid2eid
+            .as_ref()
+            .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id));
+        if moe_frame(hidden, l, cfg, li, &logits, forced.as_deref(), out) {
+            return;
+        }
     }
     if dump_path().is_some() {
         PICKED.with(|p| {

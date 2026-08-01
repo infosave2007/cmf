@@ -2642,7 +2642,13 @@ fn moe_gate_up_q2tp_f(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = mg_pg[0];
-        mg_act[slot * mg_p.inter + row] = (g / (1.0 + exp(-g))) * mg_pu[0];
+        var gg = g;
+        var uu = mg_pu[0];
+        if (mg_p.lim > 0.0) {
+            uu = clamp(uu, -mg_p.lim, mg_p.lim);
+            gg = min(gg, mg_p.lim);
+        }
+        mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -3479,7 +3485,10 @@ fn moe_select(@builtin(local_invocation_index) lid: u32) {
 
 // gate+up+SiLU for every selected expert: workgroup (row, slot) does BOTH q4t
 // row dots (they share the activation reads) and writes act = silu(g)·u.
-struct MoeGuP { gpr: u32, inter: u32, slots: u32, mat16: u32 };
+struct MoeGuP { gpr: u32, inter: u32, slots: u32, mat16: u32 , lim: f32, _pad: vec3<u32> };
+// `lim` is DeepSeek-V4's swiglu_limit: the up projection is clamped both
+// ways, the gate only from above. Zero means no clamp, which is every other
+// architecture that reaches these kernels.
 @group(0) @binding(0) var<storage, read>       mg_gw  : array<u32>;
 @group(0) @binding(1) var<storage, read>       mg_uw  : array<u32>;
 @group(0) @binding(2) var<storage, read>       mg_x   : array<f32>;
@@ -3553,7 +3562,13 @@ fn moe_gate_up(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = mg_pg[0];
-        mg_act[slot * mg_p.inter + row] = (g / (1.0 + exp(-g))) * mg_pu[0];
+        var gg = g;
+        var uu = mg_pu[0];
+        if (mg_p.lim > 0.0) {
+            uu = clamp(uu, -mg_p.lim, mg_p.lim);
+            gg = min(gg, mg_p.lim);
+        }
+        mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -3696,7 +3711,13 @@ fn moe_gate_up_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = mg_pg[0];
-        mg_act[slot * mg_p.inter + row] = (g / (1.0 + exp(-g))) * mg_pu[0];
+        var gg = g;
+        var uu = mg_pu[0];
+        if (mg_p.lim > 0.0) {
+            uu = clamp(uu, -mg_p.lim, mg_p.lim);
+            gg = min(gg, mg_p.lim);
+        }
+        mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -3809,7 +3830,13 @@ fn moe_gate_up_q2tp(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = mg_pg[0];
-        mg_act[slot * mg_p.inter + row] = (g / (1.0 + exp(-g))) * mg_pu[0];
+        var gg = g;
+        var uu = mg_pu[0];
+        if (mg_p.lim > 0.0) {
+            uu = clamp(uu, -mg_p.lim, mg_p.lim);
+            gg = min(gg, mg_p.lim);
+        }
+        mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -3992,7 +4019,10 @@ fn moe_select_b(@builtin(workgroup_id) wid: vec3<u32>,
 }
 
 // gate+up+SiLU with a token axis: workgroup (row, slot, token).
-struct MoeGuBP { gpr: u32, inter: u32, slots: u32, mat16: u32 };
+struct MoeGuBP { gpr: u32, inter: u32, slots: u32, mat16: u32 , lim: f32, _pad: vec3<u32> };
+// `lim` is DeepSeek-V4's swiglu_limit: the up projection is clamped both
+// ways, the gate only from above. Zero means no clamp, which is every other
+// architecture that reaches these kernels.
 @group(0) @binding(0) var<storage, read>       gb_gw  : array<u32>;
 @group(0) @binding(1) var<storage, read>       gb_uw  : array<u32>;
 @group(0) @binding(2) var<storage, read>       gb_x   : array<f32>;
@@ -4076,8 +4106,14 @@ fn moe_gate_up_q4tp_b(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = gb_pg[0];
+        var gg = g;
+        var uu = gb_pu[0];
+        if (gb_p.lim > 0.0) {
+            uu = clamp(uu, -gb_p.lim, gb_p.lim);
+            gg = min(gg, gb_p.lim);
+        }
         gb_act[(t * gb_p.slots + slot) * gb_p.inter + row] =
-            (g / (1.0 + exp(-g))) * gb_pu[0];
+            (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -9301,9 +9337,11 @@ pub fn forward_token_graph(
                     } else {
                         mat16(*mi, hidden)
                     };
-                    let gu_u = uniform_u32x4(
+                    // Eight words now: the fifth is the swiglu limit, zero
+                    // for every architecture but DeepSeek-V4.
+                    let gu_u = uniform_u32x8(
                         c,
-                        [(hidden / 32) as u32, *mi as u32, slots as u32, gu_mat16],
+                        [(hidden / 32) as u32, *mi as u32, slots as u32, gu_mat16, 0, 0, 0, 0],
                     );
                     let dn_u = uniform_u32x4(
                         c,
@@ -10666,14 +10704,9 @@ pub fn forward_batch_graph(
                         (hidden as u32) << 8 | u32::from(sg_fold) * 4,
                     ],
                 );
-                let gu_u = uniform_u32x4(
+                let gu_u = uniform_u32x8(
                     c,
-                    [
-                        (hidden / 32) as u32,
-                        *mi as u32,
-                        slots as u32,
-                        mat16(*mi, hidden),
-                    ],
+                    [(hidden / 32) as u32, *mi as u32, slots as u32, mat16(*mi, hidden), 0, 0, 0, 0],
                 );
                 let dn_u = uniform_u32x4(
                     c,
@@ -16202,6 +16235,224 @@ pub fn dsv4_attn_frame(
         "dsv4-attn-stage",
     );
     let ok = readback(c, enc, src, &stage, (n * 4) as u64, &mut out[..n]);
+    drop(sc);
+    ok
+}
+
+/// One DeepSeek-V4 MoE block on the device: route, run the chosen experts and
+/// the shared one, sum. One submission.
+///
+/// The experts arrive PACKED — a subset chosen by the host (the hot set a
+/// mask keeps), shared expert last — and the router's logits arrive already
+/// renumbered into that packing. That removes the whole global-to-slot remap
+/// the obvious design needs, and it makes the mask implicit: an expert not in
+/// the packing has no logit and cannot be chosen.
+pub struct Dsv4MoeW<'a> {
+    /// `(gate, up, down)` directory indices per packed expert, shared LAST.
+    pub experts: &'a [(usize, usize, usize)],
+    /// Router logits over the packed routed experts (shared excluded).
+    pub logits: &'a [f32],
+    /// noaux_tc selection bias, same numbering. Absent on the hash layers.
+    pub bias: Option<&'a [f32]>,
+    /// Hash-layer row, already in packed numbering.
+    pub forced: Option<&'a [usize]>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Dsv4MoeGeom {
+    pub hidden: usize,
+    pub inter: usize,
+    pub top_k: usize,
+    pub route_scale: f32,
+    pub swiglu_limit: f32,
+    /// gate/up are q2tp against a q4tp down — the mixed 2-bit profile.
+    pub gu_q2: bool,
+}
+
+pub fn dsv4_moe_frame(
+    model: &Arc<CmfModel>,
+    w: &Dsv4MoeW,
+    g: Dsv4MoeGeom,
+    x: &[f32],
+    out: &mut [f32],
+) -> bool {
+    macro_rules! no {
+        ($($t:tt)*) => {{
+            tracing::debug!("кадр MoE отклонён: {}", format_args!($($t)*));
+            if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
+                eprintln!("кадр MoE отклонён: {}", format_args!($($t)*));
+            }
+            return false;
+        }};
+    }
+    let Some(c) = ctx() else { no!("нет контекста wgpu") };
+    let n_pack = w.experts.len().saturating_sub(1); // routed; shared is last
+    let slots = g.top_k + 1;
+    if n_pack == 0
+        || w.logits.len() < n_pack
+        || n_pack > 1024
+        || g.top_k == 0
+        || g.top_k > 63
+        || x.len() < g.hidden
+        || out.len() < g.hidden
+        || g.hidden % 32 != 0
+        || g.inter % 32 != 0
+    {
+        no!(
+            "формы: упаковано {n_pack} логитов {} top_k {} hidden {} inter {}",
+            w.logits.len(),
+            g.top_k,
+            g.hidden,
+            g.inter
+        );
+    }
+    let Some((gate_all, up_all, down_all)) =
+        moe_expert_bufs(c, model, w.experts, g.inter, g.hidden, true, g.gu_q2)
+    else {
+        no!("эксперты не поместились в бюджет VRAM");
+    };
+
+    // ── routing, on the device, straight into the msel/mwt the kernels read ──
+    let lg = frame_up(c, 16, bytemuck::cast_slice(&w.logits[..n_pack]));
+    let bs = match w.bias {
+        Some(b) if b.len() >= n_pack => const_buf(c, bytemuck::cast_slice(&b[..n_pack])),
+        _ => lg.clone(),
+    };
+    let mk = frame_buf(c, 17, n_pack * 4, true);
+    let fc = match w.forced {
+        Some(f) if f.len() >= g.top_k => {
+            let v: Vec<u32> = f[..g.top_k].iter().map(|&i| i as u32).collect();
+            frame_up(c, 18, bytemuck::cast_slice(&v))
+        }
+        _ => frame_buf(c, 18, g.top_k * 4, true),
+    };
+    let msel = frame_buf(c, 19, slots * 4, false);
+    let mwt = frame_buf(c, 20, slots * 4, false);
+    let mcnt = frame_buf(c, 21, 4, false);
+    let mact = frame_buf(c, 22, slots * g.inter * 4, false);
+    let xb = frame_up(c, 23, bytemuck::cast_slice(&x[..g.hidden]));
+    let ob = frame_buf(c, 24, g.hidden * 4, false);
+
+    let rflags = (w.bias.is_some_and(|b| b.len() >= n_pack) as u32)
+        | ((w.forced.is_some_and(|f| f.len() >= g.top_k) as u32) << 2)
+        | 8; // always pin the shared slot: these kernels take a fixed count
+    let rp = uniform_mixed(c, [n_pack as u32, g.top_k as u32, rflags], g.route_scale);
+
+    let stride16 = |rows: usize, cols: usize, q2: bool| -> u32 {
+        let dt = if q2 {
+            cortiq_core::TensorDtype::Q2TiledP
+        } else {
+            cortiq_core::TensorDtype::Q4TiledP
+        };
+        (cortiq_core::quant::expected_nbytes(dt, &[rows, cols]).unwrap_or(0) / 2) as u32
+    };
+    let gu_u = uniform_u32x8(
+        c,
+        [
+            (g.hidden / 32) as u32,
+            g.inter as u32,
+            slots as u32,
+            stride16(g.inter, g.hidden, g.gu_q2),
+            g.swiglu_limit.to_bits(),
+            0,
+            0,
+            0,
+        ],
+    );
+    let dn_u = uniform_u32x4(
+        c,
+        [
+            (g.inter / 32) as u32,
+            g.hidden as u32,
+            slots as u32,
+            stride16(g.hidden, g.inter, false),
+        ],
+    );
+    let (p_gu, p_dn, l_gu, l_dn) = if g.gu_q2 {
+        (
+            &c.moe_gate_up_q2tp,
+            &c.moe_down_q4tp,
+            &c.layout_moe_gu_q2tp,
+            &c.layout_moe_dn_q4tp,
+        )
+    } else {
+        (
+            &c.moe_gate_up_q4tp_b,
+            &c.moe_down_q4tp_b,
+            &c.layout_moe_gu_b,
+            &c.layout_moe_dn_b,
+        )
+    };
+
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dsv4-moe"),
+        });
+    {
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.moe_route.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &lg),
+                bind_buf(1, &bs),
+                bind_buf(2, &mk),
+                bind_buf(3, &fc),
+                bind_buf(4, &msel),
+                bind_buf(5, &mwt),
+                bind_buf(6, &mcnt),
+                bind_buf(7, &rp),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.moe_route);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+
+        let bg_gu = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: l_gu,
+            entries: &[
+                bind_buf(0, &gate_all),
+                bind_buf(1, &up_all),
+                bind_buf(2, &xb),
+                bind_buf(3, &msel),
+                bind_buf(4, &mact),
+                bind_buf(5, &gu_u),
+            ],
+        });
+        pass.set_pipeline(p_gu);
+        pass.set_bind_group(0, &bg_gu, &[]);
+        pass.dispatch_workgroups(g.inter as u32, slots as u32, 1);
+
+        let bg_dn = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: l_dn,
+            entries: &[
+                bind_buf(0, &down_all),
+                bind_buf(1, &mact),
+                bind_buf(2, &msel),
+                bind_buf(3, &mwt),
+                bind_buf(4, &ob),
+                bind_buf(5, &dn_u),
+            ],
+        });
+        pass.set_pipeline(p_dn);
+        pass.set_bind_group(0, &bg_dn, &[]);
+        pass.dispatch_workgroups(g.hidden as u32, 1, 1);
+    }
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        (g.hidden * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "dsv4-moe-stage",
+    );
+    let ok = readback(c, enc, &ob, &stage, (g.hidden * 4) as u64, &mut out[..g.hidden]);
     drop(sc);
     ok
 }

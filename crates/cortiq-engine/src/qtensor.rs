@@ -396,6 +396,16 @@ impl QTensor {
         }
     }
 
+    /// The layout this tensor is stored in, when it is mapped from a model.
+    /// The frames branch on it — a q2tp gate against a q4tp down is a real
+    /// combination in the 2-bit profile and needs a different kernel.
+    pub fn model_dtype(&self) -> Option<cortiq_core::TensorDtype> {
+        match self {
+            Self::Mapped { dtype, .. } => Some(*dtype),
+            _ => None,
+        }
+    }
+
     /// The tensor's index in the model directory, when it is mapped from one.
     /// The GPU frames bind by index rather than by name — a name lookup per
     /// layer per token is not free, and the index is what the device cache is
