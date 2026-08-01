@@ -16090,6 +16090,11 @@ fn frame_up(c: &Ctx, tag: u8, data: &[u8]) -> wgpu::Buffer {
     b
 }
 
+fn sa_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_SA_SPLIT").is_ok_and(|v| v != "0"))
+}
+
 /// The two-dispatch sparse attention: scores per head, then the weighted sum
 /// over nh*hd independent outputs. Same numbers as the one-workgroup-per-head
 /// kernel, spread across the card instead of 64 groups of it — which measured
@@ -16109,6 +16114,35 @@ fn encode_sparse_attend2(
     m: usize,
     scale: f32,
 ) {
+    // ONE workgroup per head after all. The split into scores + apply spread
+    // the work across the card and bought 0.54 -> 0.49 ms a layer — nothing —
+    // while moving the model's perplexity by 0.7% through a different
+    // accumulation order. Faster would have justified that; a wash does not.
+    // CMF_SA_SPLIT=1 runs the split pair for anyone who wants to retry it on
+    // a part where occupancy actually bites.
+    if !sa_split() {
+        let p = uniform_mixed(c, [nh as u32, hd as u32, m as u32], scale);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.sparse_attend.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, q),
+                bind_buf(1, kv),
+                bind_buf(2, ixb),
+                bind_buf(3, sink),
+                bind_buf(4, out),
+                bind_buf(5, &p),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.sparse_attend);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(nh as u32, 1, 1);
+        return;
+    }
     let wbuf = frame_buf(c, 9, nh * m.max(1) * 4, false);
     let p = uniform_mixed(c, [nh as u32, hd as u32, m as u32], scale);
     {
