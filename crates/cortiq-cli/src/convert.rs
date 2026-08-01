@@ -3862,6 +3862,22 @@ pub fn run_convert(
 mod tests {
     use super::*;
     use cortiq_core::format::CmfModel;
+
+    /// The encoders read their switches from the environment, and the test
+    /// harness runs tests on threads of ONE process — so two tests steering
+    /// different switches at once make each other's results meaningless.
+    /// Everything that touches those variables takes this first.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Pin both switches for the duration of a test, whatever ran before.
+    fn env_guard(threads: &str, search: &str) -> std::sync::MutexGuard<'static, ()> {
+        let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("CMF_ENCODE_THREADS", threads);
+            std::env::set_var("CMF_Q2TP_SEARCH", search);
+        }
+        g
+    }
     use cortiq_core::quant::{
         dequant_q4_block, dequant_q4_tiled, dequant_q4tp, dequant_q8_2f, dequant_q8_row,
         dequant_vbit, expected_nbytes,
@@ -3971,9 +3987,9 @@ mod tests {
             (num / den).sqrt()
         };
         // SAFETY-of-test: read per call, and these run in sequence.
-        unsafe { std::env::set_var("CMF_Q2TP_SEARCH", "0") };
+        let _g = env_guard("1", "0");
         let plain = rel(&encode_q2tp(&w, rows, cols));
-        unsafe { std::env::remove_var("CMF_Q2TP_SEARCH") };
+        unsafe { std::env::set_var("CMF_Q2TP_SEARCH", "1") };
         let searched = rel(&encode_q2tp(&w, rows, cols));
         println!("q2tp относительная ошибка: absmax {plain:.4} → подбор {searched:.4}");
         assert!(
@@ -4003,9 +4019,9 @@ mod tests {
             let den: f32 = w.iter().map(|a| a * a).sum();
             (num / den).sqrt()
         };
-        unsafe { std::env::set_var("CMF_Q2TP_SEARCH", "0") };
+        let _g = env_guard("1", "0");
         let plain = rel(&encode_q4tp(&w, rows, cols));
-        unsafe { std::env::remove_var("CMF_Q2TP_SEARCH") };
+        unsafe { std::env::set_var("CMF_Q2TP_SEARCH", "1") };
         let searched = rel(&encode_q4tp(&w, rows, cols));
         println!("q4tp относительная ошибка: absmax {plain:.4} → подбор {searched:.4}");
         assert!(searched <= plain, "подбор ухудшил 4 бита");
@@ -4028,17 +4044,15 @@ mod tests {
                 };
             }
         }
+        let _g = env_guard("1", "1");
         for (name, enc) in [
             ("q2tp", encode_q2tp as fn(&[f32], usize, usize) -> Vec<u8>),
             ("q4tp", encode_q4tp as fn(&[f32], usize, usize) -> Vec<u8>),
         ] {
-            // SAFETY-of-test: the env var is read per call, and these run
-            // sequentially within one test.
-            unsafe { std::env::set_var("CMF_ENCODE_THREADS", "1") };
             let serial = enc(&vals, rows, cols);
             unsafe { std::env::set_var("CMF_ENCODE_THREADS", "8") };
             let parallel = enc(&vals, rows, cols);
-            unsafe { std::env::remove_var("CMF_ENCODE_THREADS") };
+            unsafe { std::env::set_var("CMF_ENCODE_THREADS", "1") };
             assert_eq!(
                 serial.len(),
                 parallel.len(),
