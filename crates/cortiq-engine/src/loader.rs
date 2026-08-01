@@ -296,7 +296,7 @@ pub(crate) fn build_ffn_at(
 /// per layer, the smallest top set of experts reaching that fraction of
 /// the recorded routing mass. Selection then happens over the allowed
 /// set only (softmax renormalizes). Gate any real use on a ppl A/B.
-fn moe_task_mask(prefix: &str, ne: usize) -> Option<Vec<bool>> {
+pub(crate) fn moe_task_mask(prefix: &str, ne: usize) -> Option<Vec<bool>> {
     use std::sync::OnceLock;
     static CFG: OnceLock<Option<(std::collections::HashMap<usize, Vec<u64>>, f64)>> =
         OnceLock::new();

@@ -185,6 +185,7 @@ pub fn route(
     top_k: usize,
     route_scale: f32,
     forced: Option<&[usize]>,
+    mask: Option<&[bool]>,
     indices: &mut Vec<usize>,
     weights: &mut Vec<f32>,
 ) {
@@ -204,6 +205,13 @@ pub fn route(
                 Some(b) => scores.iter().zip(b).map(|(s, b)| s + b).collect(),
                 None => scores.clone(),
             };
+            if let Some(m) = mask {
+                for (i, s) in shifted.iter_mut().enumerate() {
+                    if !m.get(i).copied().unwrap_or(true) {
+                        *s = f32::NEG_INFINITY;
+                    }
+                }
+            }
             for _ in 0..top_k.min(n) {
                 let mut best = 0usize;
                 let mut bv = f32::NEG_INFINITY;
@@ -212,6 +220,9 @@ pub fn route(
                         bv = v;
                         best = i;
                     }
+                }
+                if !bv.is_finite() {
+                    break;
                 }
                 indices.push(best);
                 shifted[best] = f32::NEG_INFINITY;
@@ -729,6 +740,12 @@ pub struct Dsv4Layer {
     pub tid2eid: Option<Vec<f32>>,
     pub experts: Vec<Dsv4Expert>,
     pub shared: Dsv4Expert,
+    /// Task-conditional restriction over the routed experts
+    /// (`CMF_MOE_MASK` + `CMF_MOE_MASK_COVER`): `false` experts are not
+    /// selectable and the weights renormalize over what remains. `None` on
+    /// the hash layers — their table names specific experts, so masking
+    /// there would silently reroute rather than restrict.
+    pub mask: Option<Vec<bool>>,
 }
 
 pub struct Dsv4Expert {
@@ -1150,6 +1167,7 @@ pub fn moe_step(
             .as_ref()
             .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id))
             .as_deref(),
+        l.mask.as_deref(),
         &mut idx,
         &mut w,
     );
@@ -1565,6 +1583,11 @@ pub fn load(
             gate_bias: opt_f(&format!("{p}.mlp.expert_bias")),
             tid2eid: opt_f(&format!("{p}.mlp.tid2eid")),
             experts,
+            mask: if model.tensor(&format!("{p}.mlp.tid2eid")).is_some() {
+                None
+            } else {
+                crate::loader::moe_task_mask(&format!("{p}."), cfg.n_routed_experts)
+            },
             shared: Dsv4Expert {
                 w1: q(&format!("{p}.mlp.shared_expert.gate_proj.weight"))?,
                 w2: q(&format!("{p}.mlp.shared_expert.down_proj.weight"))?,
@@ -1624,7 +1647,7 @@ mod tests {
         let o_per_group = q_width / cfg.o_groups;
         let mut layers = Vec::new();
         for li in 0..2 {
-            let experts: Vec<Dsv4Expert> = (0..cfg.n_routed_experts)
+        let experts: Vec<Dsv4Expert> = (0..cfg.n_routed_experts)
                 .map(|e| Dsv4Expert {
                     w1: t(cfg.moe_inter, dim, 40 + e + li * 8),
                     w2: t(dim, cfg.moe_inter, 60 + e + li * 8),
@@ -1696,6 +1719,7 @@ mod tests {
                     None
                 },
                 experts,
+                mask: None,
                 shared: Dsv4Expert {
                     w1: t(cfg.moe_inter, dim, 25 + li),
                     w2: t(dim, cfg.moe_inter, 27 + li),
@@ -2060,7 +2084,7 @@ mod tests {
         let scores = [3.0f32, 0.1, 2.0, 0.05];
         let bias = [0.0f32, 10.0, 0.0, 0.0];
         let (mut idx, mut w) = (Vec::new(), Vec::new());
-        route(&scores, Some(&bias), 2, 1.5, None, &mut idx, &mut w);
+        route(&scores, Some(&bias), 2, 1.5, None, None, &mut idx, &mut w);
         assert_eq!(idx[0], 1, "the biased expert must win selection");
         assert_eq!(idx[1], 0);
         // weights come from sqrt(softplus(score)) BEFORE the bias, so the
@@ -2237,6 +2261,37 @@ mod tests {
         assert_eq!(hash_route(&table, 3, 2, 99), vec![5, 6]);
     }
 
+    /// A task mask restricts SELECTION and nothing else: the weights still
+    /// come from the pre-bias scores and still renormalize, now over what
+    /// survives. Masking must never reroute — an expert the mask forbids has
+    /// to be absent, not replaced by a neighbour with the wrong weight.
+    #[test]
+    fn a_task_mask_restricts_selection_and_renormalizes() {
+        // Expert 3 scores highest, then 1, then 2, then 0.
+        let scores = [0.1f32, 4.0, 1.0, 9.0];
+        let (mut idx, mut w) = (Vec::new(), Vec::new());
+        route(&scores, None, 2, 1.0, None, None, &mut idx, &mut w);
+        assert_eq!(idx, vec![3, 1], "unmasked: the two best win");
+        let sum: f32 = w.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "weights must sum to route_scale");
+
+        // Forbid the winner: the next two take its place and the weights
+        // renormalize over them.
+        let mask = [true, false, true, true];
+        let (mut i2, mut w2) = (Vec::new(), Vec::new());
+        route(&scores, None, 2, 1.0, None, Some(&mask), &mut i2, &mut w2);
+        assert_eq!(i2, vec![3, 2], "masked expert must not be selected");
+        let sum2: f32 = w2.iter().sum();
+        assert!((sum2 - 1.0).abs() < 1e-5, "masked weights must renormalize");
+
+        // A mask leaving fewer than top_k experts yields fewer, not garbage.
+        let tight = [false, false, false, true];
+        let (mut i3, mut w3) = (Vec::new(), Vec::new());
+        route(&scores, None, 2, 1.0, None, Some(&tight), &mut i3, &mut w3);
+        assert_eq!(i3, vec![3]);
+        assert_eq!(w3.len(), 1);
+    }
+
     /// On a hash layer the reference gathers the scores AT THE TABLE's
     /// experts. Choosing top-k first and swapping the indices afterwards
     /// leaves every weight attached to a different expert than the one it
@@ -2250,7 +2305,7 @@ mod tests {
         assert_eq!(idx_forced, vec![0, 1]);
 
         let (mut idx, mut w) = (Vec::new(), Vec::new());
-        route(&scores, None, 2, 1.0, Some(&idx_forced), &mut idx, &mut w);
+        route(&scores, None, 2, 1.0, Some(&idx_forced), None, &mut idx, &mut w);
         assert_eq!(idx, vec![0, 1], "the table must decide the experts");
 
         // The weights must be the table experts' own scores, normalized.
@@ -2262,7 +2317,7 @@ mod tests {
 
         // And the top-k path is untouched: expert 3 still wins there.
         let (mut idx2, mut w2) = (Vec::new(), Vec::new());
-        route(&scores, None, 2, 1.0, None, &mut idx2, &mut w2);
+        route(&scores, None, 2, 1.0, None, None, &mut idx2, &mut w2);
         assert_eq!(idx2[0], 3, "without a table the highest score still wins");
     }
 }
