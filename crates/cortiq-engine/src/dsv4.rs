@@ -1945,8 +1945,16 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
             .experts
             .first()
             .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
-        let room = crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, gu_q2)
-            .saturating_sub(1);
+        // `CMF_DSV4_COLD_CPU=1` packs only what fits and leaves the rest to
+        // the host. Exact on the toy at any budget, still 5.379 against the
+        // CPU's 5.211 on the release — so it is opt-in until that is closed.
+        // Off, a layer that does not fit whole declines and runs on the host,
+        // which is slower and right.
+        let room = if std::env::var("CMF_DSV4_COLD_CPU").is_ok_and(|v| v != "0") {
+            crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, gu_q2).saturating_sub(1)
+        } else {
+            usize::MAX
+        };
         for (gi, e) in l.experts.iter().enumerate() {
             if l.mask.as_deref().is_some_and(|m| !m.get(gi).copied().unwrap_or(true)) {
                 continue;

@@ -5106,7 +5106,12 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
         rt_cold[2u * lid] = 0xFFFFFFFFu;
         rt_cold[2u * lid + 1u] = 0u;
     }
-    if (pin_shared && lid == 0u) { rt_idx[k] = n; rt_w[k] = 1.0; }
+    // The shared expert sits LAST in the packing, which is `n` only when
+    // every expert was packed. With a subset it is n_pack, carried in the
+    // flags' upper bits — writing `n` there pointed the kernel past the end
+    // of the buffer at whatever followed.
+    let shared_slot = rt_p.flags >> 8u;
+    if (pin_shared && lid == 0u) { rt_idx[k] = shared_slot; rt_w[k] = 1.0; }
     // Same reason: the zero-fill is a storage write that the ranking lanes
     // must not race with.
     storageBarrier();
@@ -16078,7 +16083,8 @@ fn encode_moe_chain(
     };
     let rflags = (w.moe.bias.is_some_and(|b| b.len() >= n_pack) as u32)
         | ((w.moe.forced.is_some_and(|f| f.len() >= g.top_k) as u32) << 2)
-        | 8;
+        | 8
+        | ((n_pack as u32) << 8);
     let rp = uniform_mixed(c, [n_pack as u32, g.top_k as u32, rflags], g.route_scale);
     let stride16 = |rows: usize, cols: usize, q2: bool| -> u32 {
         let dt = if q2 {
@@ -17314,7 +17320,8 @@ pub fn dsv4_moe_frame(
     let rflags = (w.bias.is_some_and(|b| b.len() >= w.logits.len()) as u32)
         | ((w.forced.is_some_and(|f| f.len() >= g.top_k) as u32) << 2)
         | 8 // always pin the shared slot: these kernels take a fixed count
-        | ((subset as u32) << 4);
+        | ((subset as u32) << 4)
+        | ((n_pack as u32) << 8); // where the shared expert actually sits
     let rp = uniform_mixed(c, [n_pack as u32, g.top_k as u32, rflags], g.route_scale);
 
     let stride16 = |rows: usize, cols: usize, q2: bool| -> u32 {
