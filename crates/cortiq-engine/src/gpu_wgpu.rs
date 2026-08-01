@@ -5636,6 +5636,11 @@ struct Ctx {
     /// between tokens. Re-uploading it each token costs more than the frame
     /// saves: at 4K context it is megabytes per layer.
     dsv4_kv: Mutex<HashMap<(u64, usize), (wgpu::Buffer, usize)>>,
+    /// The frame's working buffers, keyed by role and length. Their sizes do
+    /// not change from token to token, and allocating ten of them per layer
+    /// per token — 430 allocations a token on the release — is most of what a
+    /// submission costs. Created once, written thereafter.
+    dsv4_scratch: Mutex<HashMap<(u8, usize), wgpu::Buffer>>,
     /// Access clock for the aging above — one tick per weight lookup.
     res_clock: std::sync::atomic::AtomicU64,
     /// row_scale buffer per (idx, row0) — small, cached.
@@ -6290,6 +6295,7 @@ fn init() -> Result<Ctx, String> {
         scratch: Mutex::new(Scratch::default()),
         weight_bufs: Mutex::new(HashMap::new()),
         dsv4_kv: Mutex::new(HashMap::new()),
+        dsv4_scratch: Mutex::new(HashMap::new()),
         res_clock: std::sync::atomic::AtomicU64::new(0),
         uniforms: Mutex::new(HashMap::new()),
         uniforms8: Mutex::new(HashMap::new()),
@@ -15831,6 +15837,55 @@ fn encode_rope_heads(
     pass.dispatch_workgroups(nh as u32, 1, 1);
 }
 
+/// A constant vector (a norm weight, the sinks, the frequency table) parked
+/// on the card and keyed on its host address — the same bytes arrive every
+/// token, and re-uploading them 43 times a token is pure waste.
+fn const_buf(c: &Ctx, data: &[u8]) -> wgpu::Buffer {
+    let key = (data.as_ptr() as usize, data.len());
+    let mut m = c.const_bufs.lock().unwrap();
+    if let Some(b) = m.get(&key) {
+        return b.clone();
+    }
+    let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dsv4-const"),
+        size: data.len().max(4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    c.queue.write_buffer(&b, 0, data);
+    m.insert(key, b.clone());
+    b
+}
+
+/// A frame working buffer, created on first use and reused for good. `tag`
+/// separates roles that happen to share a length — two buffers of the same
+/// size are not interchangeable when both are live in one encoder.
+fn frame_buf(c: &Ctx, tag: u8, len_bytes: usize, upload: bool) -> wgpu::Buffer {
+    let mut m = c.dsv4_scratch.lock().unwrap();
+    if let Some(b) = m.get(&(tag, len_bytes)) {
+        return b.clone();
+    }
+    let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
+    if upload {
+        usage |= wgpu::BufferUsages::COPY_DST;
+    }
+    let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dsv4-frame"),
+        size: len_bytes.max(4) as u64,
+        usage,
+        mapped_at_creation: false,
+    });
+    m.insert((tag, len_bytes), b.clone());
+    b
+}
+
+/// Upload into a reused buffer instead of minting one per call.
+fn frame_up(c: &Ctx, tag: u8, data: &[u8]) -> wgpu::Buffer {
+    let b = frame_buf(c, tag, data.len(), true);
+    c.queue.write_buffer(&b, 0, data);
+    b
+}
+
 /// The one thing that has to survive between tokens. `off` and `data` are in
 /// floats; the buffer is created on first use at `cap` and never shrinks.
 pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: usize) -> bool {
@@ -15994,34 +16049,38 @@ pub fn dsv4_attn_frame(
             no!("готовый qn короче q_lora: {} < {}", v.len(), g.q_lora);
         }
     }
+    // Constants (q_norm, sink, inv_freq) go through the const cache keyed on
+    // their address — they are the same bytes every token. Everything else is
+    // a reused buffer written in place.
     let hb = match qn_in {
-        None => storage_bytes(c, bytemuck::cast_slice(&hidden[..g.dim])),
-        Some(_) => storage_bytes(c, bytemuck::cast_slice(&[0.0f32])),
+        None => frame_up(c, 0, bytemuck::cast_slice(&hidden[..g.dim])),
+        Some(_) => frame_buf(c, 0, 4, true),
     };
-    let qnw = storage_bytes(c, bytemuck::cast_slice(&w.q_norm[..g.q_lora]));
-    let sink = storage_bytes(c, bytemuck::cast_slice(&w.sink[..g.nh]));
-    let freq = storage_bytes(c, bytemuck::cast_slice(&inv_freq[..g.rd / 2]));
-    let posb = storage_bytes(c, bytemuck::cast_slice(&[pos as f32, g.eps]));
-    let ixb = storage_bytes(c, bytemuck::cast_slice(idxs));
+    let qnw = const_buf(c, bytemuck::cast_slice(&w.q_norm[..g.q_lora]));
+    let sink = const_buf(c, bytemuck::cast_slice(&w.sink[..g.nh]));
+    let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..g.rd / 2]));
+    let posb = frame_up(c, 1, bytemuck::cast_slice(&[pos as f32, g.eps]));
+    // The list length changes token to token; round the buffer up so it is
+    // not reallocated on every step, and pass the true count in the uniform.
+    let ixb = {
+        let cap = idxs.len().next_power_of_two().max(64);
+        let b = frame_buf(c, 2, cap * 4, true);
+        c.queue.write_buffer(&b, 0, bytemuck::cast_slice(idxs));
+        b
+    };
 
     // Readable, all of them: `CMF_DSV4_FRAME_TAP` reads back an intermediate
     // instead of the output. Eight verified kernels can still be wired wrong,
     // and a single number at the end says only that they were.
-    let qr = rw_f32(c, g.q_lora, true);
+    let qr = frame_buf(c, 3, g.q_lora * 4, false);
     let qn = match qn_in {
-        Some(v) => c
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("dsv4-qn"),
-                contents: bytemuck::cast_slice(&v[..g.q_lora]),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            }),
-        None => rw_f32(c, g.q_lora, true),
+        Some(v) => frame_up(c, 4, bytemuck::cast_slice(&v[..g.q_lora])),
+        None => frame_buf(c, 4, g.q_lora * 4, true),
     };
-    let q = rw_f32(c, g.nh * g.hd, true);
-    let attn = rw_f32(c, g.nh * g.hd, true);
-    let mid = rw_f32(c, g.o_groups * g.o_lora, true);
-    let yb = rw_f32(c, g.dim, true);
+    let q = frame_buf(c, 5, g.nh * g.hd * 4, false);
+    let attn = frame_buf(c, 6, g.nh * g.hd * 4, false);
+    let mid = frame_buf(c, 7, g.o_groups * g.o_lora * 4, false);
+    let yb = frame_buf(c, 8, g.dim * 4, false);
 
     let mut enc = c
         .device
