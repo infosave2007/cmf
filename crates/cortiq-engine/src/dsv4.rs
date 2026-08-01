@@ -2142,11 +2142,14 @@ fn moe_frame(
     // The picks the card had no room for, finished here and added in. Their
     // weights already carry the top-k normalisation the device applied.
     if std::env::var("CMF_DSV4_MOE_CHECK").is_ok() {
+        let csum: f32 = cold.iter().map(|c| c.1).sum();
         eprintln!(
-            "[холодные] слой {li}: устройство вернуло {} из {} выбранных: {:?}",
+            "[холодные] слой {li}: вернулось {} из {} | сумма холодных {csum:.4} | \
+             route_scale {:.4} | {:?}",
             cold.len(),
             cfg.top_k,
-            &cold[..cold.len().min(4)]
+            cfg.route_scale,
+            &cold[..cold.len().min(3)]
         );
     }
     let mut acc = vec![0.0f32; cfg.dim];
