@@ -1076,6 +1076,11 @@ fn attn_frame(
     let n_comp = st.compressed[li].len() / hd;
     let cap = (cfg.window + n_comp.next_power_of_two().max(64)) * hd;
     let kv_id = st.kv_id;
+    // The window is rewritten whole. A ring would write one slot instead of
+    // 128 — 2 KB against 256 — and was tried: it bought NOTHING (the cost is
+    // per-dispatch driver bookkeeping, not the copy) and moved perplexity by
+    // 6e-5 because the attended positions arrive in a different order and the
+    // softmax accumulates differently. Not a trade worth making.
     if !crate::gpu_wgpu::dsv4_cache_write(kv_id, li, 0, &st.window[li], cap) {
         return false;
     }
