@@ -4571,7 +4571,9 @@ struct SaP { nh: u32, hd: u32, m: u32, scale: f32 };
 @group(0) @binding(5) var<uniform>             sa_p    : SaP;
 
 var<workgroup> sa_red: array<f32, 256>;
-var<workgroup> sa_acc: array<f32, 1024>;
+// Scores, then weights, for every attended position. Bounding it here bounds
+// the index list: window (128) + index_topk (512) fits with room.
+var<workgroup> sa_w: array<f32, 1024>;
 var<workgroup> sa_max: f32;
 var<workgroup> sa_den: f32;
 
@@ -4584,8 +4586,8 @@ fn sparse_attend(@builtin(workgroup_id) wid: vec3<u32>,
     let m = sa_p.m;
     let qb = h * hd;
 
-    // max over the attended scores; the sink joins it so the exponentials
-    // below cannot overflow when it dominates.
+    // 1. scores, kept — recomputing them per output dimension would cost
+    //    hd times more, and computing them twice was the first draft's waste.
     var mx = sa_sink[h];
     var t = lid;
     loop {
@@ -4595,7 +4597,9 @@ fn sparse_attend(@builtin(workgroup_id) wid: vec3<u32>,
         for (var k = 0u; k < hd; k = k + 1u) {
             d = d + sa_q[qb + k] * sa_kv[p * hd + k];
         }
-        mx = max(mx, d * sa_p.scale);
+        let sc = d * sa_p.scale;
+        sa_w[t] = sc;
+        mx = max(mx, sc);
         t = t + 256u;
     }
     sa_red[lid] = mx;
@@ -4607,34 +4611,17 @@ fn sparse_attend(@builtin(workgroup_id) wid: vec3<u32>,
         workgroupBarrier();
         stride = stride >> 1u;
     }
-    if (lid == 0u) { sa_max = sa_red[0]; }
+    let mval = sa_red[0];
     workgroupBarrier();
-    let mval = sa_max;
 
-    // weighted sum, and the denominator with the sink's share
-    var k0 = lid;
-    loop {
-        if (k0 >= hd) { break; }
-        sa_acc[k0] = 0.0;
-        k0 = k0 + 256u;
-    }
-    workgroupBarrier();
+    // 2. weights and the denominator, the sink taking its share of the latter
     var den = 0.0;
     t = lid;
     loop {
         if (t >= m) { break; }
-        let p = sa_idx[t];
-        var d = 0.0;
-        for (var k = 0u; k < hd; k = k + 1u) {
-            d = d + sa_q[qb + k] * sa_kv[p * hd + k];
-        }
-        let w = exp(d * sa_p.scale - mval);
+        let w = exp(sa_w[t] - mval);
+        sa_w[t] = w;
         den = den + w;
-        for (var k = 0u; k < hd; k = k + 1u) {
-            // Serialised on purpose: positions are few and hd is wide, so
-            // the contention is on hd, not on m.
-            sa_acc[k] = sa_acc[k] + w * sa_kv[p * hd + k];
-        }
         t = t + 256u;
     }
     sa_red[lid] = den;
@@ -4649,11 +4636,19 @@ fn sparse_attend(@builtin(workgroup_id) wid: vec3<u32>,
     if (lid == 0u) { sa_den = sa_red[0] + exp(sa_sink[h] - mval); }
     workgroupBarrier();
     let inv = 1.0 / sa_den;
-    var k1 = lid;
+
+    // 3. the weighted sum, parallel over the OUTPUT dimension. Splitting by
+    //    position instead makes every thread accumulate into the same
+    //    sa_acc[k] — a data race that the first draft called "serialised".
+    var k = lid;
     loop {
-        if (k1 >= hd) { break; }
-        sa_out[qb + k1] = sa_acc[k1] * inv;
-        k1 = k1 + 256u;
+        if (k >= hd) { break; }
+        var acc = 0.0;
+        for (var i = 0u; i < m; i = i + 1u) {
+            acc = acc + sa_w[i] * sa_kv[sa_idx[i] * hd + k];
+        }
+        sa_out[qb + k] = acc * inv;
+        k = k + 256u;
     }
 }
 
@@ -14793,7 +14788,7 @@ pub fn sparse_attend_for_test(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
-    if q.len() != nh * hd || out.len() != nh * hd || sink.len() != nh || hd > 1024 {
+    if q.len() != nh * hd || out.len() != nh * hd || sink.len() != nh || idxs.len() > 1024 {
         return false;
     }
     let qb = storage_bytes(c, bytemuck::cast_slice(q));
