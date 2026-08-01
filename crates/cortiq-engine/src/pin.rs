@@ -201,11 +201,14 @@ pub fn pin_tensors(model: &cortiq_core::CmfModel, names: &[String]) -> Pinned {
                 if fails == 1 {
                     tracing::warn!("первое закрепление не удалось ({n}): {e}");
                 }
-                if fails >= 64 && out.tensors == 0 {
+                if fails >= 64 && out.bytes < 1 << 30 {
                     tracing::warn!(
-                        "закрепление не работает вовсе — лимит {:.2} ГБ; \
-                         остальные {} тензоров пропущены",
-                        limit.unwrap_or(0) as f64 / 1e9,
+                        "закрепление упирается в RLIMIT_MEMLOCK = {:.0} МБ и поднять \
+                         его не дали (контейнеры обычно снимают CAP_SYS_RESOURCE). \
+                         Лечится вне процесса: `--ulimit memlock=-1` у докера, \
+                         LimitMEMLOCK=infinity в systemd, или запуск с этой \
+                         привилегией. Пропущено {} тензоров.",
+                        limit.unwrap_or(0) as f64 / 1e6,
                         names.len() - out.skipped
                     );
                     break;
