@@ -1773,6 +1773,7 @@ fn dsv4_layer_loop(
                 logits: &[],
                 bias: bias.as_deref(),
                 forced: forced.as_deref(),
+                remap: None,
             },
             hc_ffn_fn: &l.hc_ffn_fn,
             hc_ffn_scale: &l.hc_ffn_scale,
@@ -1908,6 +1909,8 @@ struct Pack {
     router: Vec<f32>,
     /// global expert id -> packed slot, `usize::MAX` for the ones left out.
     to_slot: Vec<usize>,
+    /// The same, as the u32 table the router reads.
+    remap: Vec<u32>,
     /// packed order, globals only (shared is not in here).
     globals: Vec<usize>,
     tensors: Vec<(usize, usize, usize)>,
@@ -1929,11 +1932,22 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
         let idx3 = |e: &Dsv4Expert| -> Option<(usize, usize, usize)> {
             Some((e.w1.model_idx()?, e.w3.model_idx()?, e.w2.model_idx()?))
         };
+        // How many experts the card still has room for, minus one for the
+        // shared expert, which always rides. Everything past that stays on the
+        // host and is reached through the remap — the router still ranges over
+        // all of them, so this costs speed and not a single bit of quality.
+        let gu_q2 = l
+            .experts
+            .first()
+            .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
+        let room = crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, gu_q2)
+            .saturating_sub(1);
         for (gi, e) in l.experts.iter().enumerate() {
-            // The mask IS the hot set: an expert left out has no logit on the
-            // device and cannot be chosen, so no remap table is needed.
             if l.mask.as_deref().is_some_and(|m| !m.get(gi).copied().unwrap_or(true)) {
                 continue;
+            }
+            if globals.len() >= room {
+                break;
             }
             to_slot[gi] = globals.len();
             globals.push(gi);
@@ -1957,9 +1971,14 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
         for r in 0..rows {
             l.gate.row_f32(r, &mut router[r * cols..(r + 1) * cols]);
         }
+        let remap: Vec<u32> = to_slot
+            .iter()
+            .map(|&sl| if sl == usize::MAX { u32::MAX } else { sl as u32 })
+            .collect();
         Some(Arc::new(Pack {
             router,
             to_slot,
+            remap,
             globals,
             tensors,
         }))
@@ -1997,6 +2016,7 @@ fn moe_frame(
     li: usize,
     logits: &[f32],
     forced: Option<&[usize]>,
+    pool: Option<&crate::pool::Pool>,
     out: &mut [f32],
 ) -> bool {
     macro_rules! no {
@@ -2028,16 +2048,27 @@ fn moe_frame(
         }
         None => None,
     };
-    let lg: Vec<f32> = pk.globals.iter().map(|&g| logits[g]).collect();
-    let bias: Option<Vec<f32>> = l
-        .gate_bias
-        .as_deref()
-        .map(|b| pk.globals.iter().map(|&g| b[g]).collect());
+    // Routing ranges over EVERY expert; the remap turns a winner into a slot
+    // or marks it cold. Nothing is masked, so nothing is lost.
+    let subset = pk.globals.len() < cfg.n_routed_experts;
+    let lg: Vec<f32> = if subset {
+        logits.to_vec()
+    } else {
+        pk.globals.iter().map(|&g| logits[g]).collect()
+    };
+    let bias: Option<Vec<f32>> = l.gate_bias.as_deref().map(|b| {
+        if subset {
+            b.to_vec()
+        } else {
+            pk.globals.iter().map(|&g| b[g]).collect()
+        }
+    });
     let w = crate::gpu_wgpu::Dsv4MoeW {
         experts: &pk.tensors,
         logits: &lg,
         bias: bias.as_deref(),
         forced: fpack.as_deref(),
+        remap: if subset { Some(&pk.remap) } else { None },
     };
     let g = crate::gpu_wgpu::Dsv4MoeGeom {
         hidden: cfg.dim,
@@ -2049,7 +2080,21 @@ fn moe_frame(
             e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
         }),
     };
-    crate::gpu_wgpu::dsv4_moe_frame(&model, &w, g, hidden, out)
+    let mut cold = Vec::new();
+    if !crate::gpu_wgpu::dsv4_moe_frame(&model, &w, g, hidden, &mut cold, out) {
+        return false;
+    }
+    // The picks the card had no room for, finished here and added in. Their
+    // weights already carry the top-k normalisation the device applied.
+    let mut acc = vec![0.0f32; cfg.dim];
+    for &(gi, wt) in &cold {
+        let Some(exp) = l.experts.get(gi) else { continue };
+        run_expert(hidden, exp, cfg, wt, pool, &mut acc);
+        for (o, a) in out.iter_mut().zip(&acc) {
+            *o += a;
+        }
+    }
+    true
 }
 
 /// How much of each layer's compressed cache already sits on the card. ONE
@@ -2144,7 +2189,7 @@ pub fn moe_step(
             .tid2eid
             .as_ref()
             .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id));
-        if moe_frame(hidden, l, cfg, li, &logits, forced.as_deref(), out) {
+        if moe_frame(hidden, l, cfg, li, &logits, forced.as_deref(), pool, out) {
             // CMF_DSV4_MOE_CHECK=1 recomputes the same block on the CPU and
             // reports where they part. A wrong MoE does not fail — it answers
             // differently — and the toy agreed bit for bit while the release

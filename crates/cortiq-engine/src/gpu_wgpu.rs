@@ -5055,7 +5055,15 @@ fn top_k_index(@builtin(local_invocation_index) lid: u32) {
 
 struct RtP { n: u32, top_k: u32, flags: u32, scale: f32 };
 // flags: 1 = bias present, 2 = mask present, 4 = indices forced (hash layers),
-//        8 = pin the shared expert in slot top_k with weight 1
+//        8 = pin the shared expert in slot top_k with weight 1,
+//       16 = the packed set is a SUBSET: rt_map turns a global expert id into
+//            a slot, or 0xFFFFFFFF when that expert did not fit on the card.
+//
+// A cold pick is not dropped and not substituted — it is handed back. The
+// slot gets weight zero so the device contributes nothing for it, and the
+// expert's global id and its real weight go into rt_cold for the host to
+// finish. Routing therefore still ranges over every expert, which is the
+// whole difference between this and a mask.
 //
 // With bit 8 the output is the `msel`/`mwt` pair the batched expert kernels
 // read: top_k routed slots then the shared one, every slot written. Slots the
@@ -5071,6 +5079,8 @@ struct RtP { n: u32, top_k: u32, flags: u32, scale: f32 };
 @group(0) @binding(5) var<storage, read_write> rt_w      : array<f32>;   // top_k
 @group(0) @binding(6) var<storage, read_write> rt_cnt    : array<u32>;   // 1
 @group(0) @binding(7) var<uniform>             rt_p      : RtP;
+@group(0) @binding(8) var<storage, read>       rt_map    : array<u32>;   // n
+@group(0) @binding(9) var<storage, read_write> rt_cold   : array<u32>;   // 2*top_k
 
 var<workgroup> rt_sc:   array<f32, 1024>;   // sqrt(softplus(score))
 var<workgroup> rt_sh:   array<f32, 1024>;   // the same, biased and masked
@@ -5088,7 +5098,14 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
     // failed at pipeline creation, which took the whole context down and made
     // every GPU test pass by skipping.
     let pin_shared = (rt_p.flags & 8u) != 0u;
-    if (lid < k) { rt_used[lid] = 0u; rt_idx[lid] = 0u; rt_w[lid] = 0.0; }
+    let subset = (rt_p.flags & 16u) != 0u;
+    if (lid < k) {
+        rt_used[lid] = 0u;
+        rt_idx[lid] = 0u;
+        rt_w[lid] = 0.0;
+        rt_cold[2u * lid] = 0xFFFFFFFFu;
+        rt_cold[2u * lid + 1u] = 0u;
+    }
     if (pin_shared && lid == 0u) { rt_idx[k] = n; rt_w[k] = 1.0; }
     // Same reason: the zero-fill is a storage write that the ranking lanes
     // must not race with.
@@ -5133,9 +5150,24 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
                     }
                 }
                 if (rank < k) {
-                    rt_idx[rank] = m;
-                    rt_w[rank] = rt_sc[m];
                     rt_used[rank] = 1u;
+                    if (subset) {
+                        let slot = rt_map[m];
+                        if (slot == 0xFFFFFFFFu) {
+                            // Cold: the device computes nothing for it and the
+                            // host is told which expert and with what weight.
+                            rt_idx[rank] = 0u;
+                            rt_w[rank] = 0.0;
+                            rt_cold[2u * rank] = m;
+                            rt_cold[2u * rank + 1u] = bitcast<u32>(rt_sc[m]);
+                        } else {
+                            rt_idx[rank] = slot;
+                            rt_w[rank] = rt_sc[m];
+                        }
+                    } else {
+                        rt_idx[rank] = m;
+                        rt_w[rank] = rt_sc[m];
+                    }
                 }
             }
             m = m + 256u;
@@ -5157,10 +5189,25 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
             if (rt_used[j] == 1u) { cnt = cnt + 1u; }
         }
         rt_cnt[0] = cnt;
+        // The sum runs over the chosen experts INCLUDING the cold ones — the
+        // reference normalises across the whole top-k, and leaving them out
+        // would inflate every surviving weight.
         var sum = 0.0;
-        for (var j = 0u; j < cnt; j = j + 1u) { sum = sum + rt_w[j]; }
+        for (var j = 0u; j < cnt; j = j + 1u) {
+            sum = sum + rt_w[j];
+            if (rt_cold[2u * j] != 0xFFFFFFFFu) {
+                sum = sum + bitcast<f32>(rt_cold[2u * j + 1u]);
+            }
+        }
         if (sum > 0.0) {
-            for (var j = 0u; j < cnt; j = j + 1u) { rt_w[j] = rt_w[j] / sum * rt_p.scale; }
+            let inv = rt_p.scale / sum;
+            for (var j = 0u; j < cnt; j = j + 1u) {
+                rt_w[j] = rt_w[j] * inv;
+                if (rt_cold[2u * j] != 0xFFFFFFFFu) {
+                    rt_cold[2u * j + 1u] =
+                        bitcast<u32>(bitcast<f32>(rt_cold[2u * j + 1u]) * inv);
+                }
+            }
         }
         // The shared expert is not part of that normalisation — it rides at
         // weight 1 whatever the router decided.
@@ -16090,6 +16137,8 @@ fn encode_moe_chain(
             bind_buf(5, mwt),
             bind_buf(6, mcnt),
             bind_buf(7, &rp),
+            bind_buf(8, &frame_buf(c, 26, n_pack.max(1) * 4, true)),
+            bind_buf(9, &frame_buf(c, 27, 2 * g.top_k * 4, false)),
         ],
     });
     let bg_gu = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -16390,6 +16439,31 @@ pub fn dsv4_weight_ready(model: &Arc<CmfModel>, idx: usize) -> bool {
         return false;
     }
     weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen]).is_some()
+}
+
+/// How many experts of this shape still fit on the card. The caller packs
+/// that many and leaves the rest to the host — per EXPERT, so no layer ever
+/// has to leave the device wholesale.
+pub fn dsv4_experts_fit(inter: usize, hidden: usize, gu_q2: bool) -> usize {
+    use std::sync::atomic::Ordering;
+    let Some(c) = ctx() else { return 0 };
+    let gu = if gu_q2 {
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q2TiledP, &[inter, hidden])
+    } else {
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[inter, hidden])
+    }
+    .unwrap_or(0);
+    let dn = cortiq_core::quant::expected_nbytes(
+        cortiq_core::TensorDtype::Q4TiledP,
+        &[hidden, inter],
+    )
+    .unwrap_or(0);
+    let per = (2 * gu + dn) as u64;
+    if per == 0 {
+        return 0;
+    }
+    let used = c.resident.load(Ordering::Relaxed);
+    ((c.vram_budget.saturating_sub(used)) / per) as usize
 }
 
 /// Can this layer's experts live on the card? Uploads them if they can, so a
@@ -17140,6 +17214,10 @@ pub struct Dsv4MoeW<'a> {
     pub bias: Option<&'a [f32]>,
     /// Hash-layer row, already in packed numbering.
     pub forced: Option<&'a [usize]>,
+    /// global expert id -> packed slot, `u32::MAX` where the expert did not
+    /// fit. When present the router ranges over ALL experts and hands the
+    /// cold picks back instead of avoiding them.
+    pub remap: Option<&'a [u32]>,
 }
 
 #[derive(Clone, Copy)]
@@ -17158,6 +17236,9 @@ pub fn dsv4_moe_frame(
     w: &Dsv4MoeW,
     g: Dsv4MoeGeom,
     x: &[f32],
+    // `(expert, weight)` pairs the device left for the host, empty when the
+    // whole packing was resident.
+    cold_out: &mut Vec<(usize, f32)>,
     out: &mut [f32],
 ) -> bool {
     macro_rules! no {
@@ -17173,6 +17254,8 @@ pub fn dsv4_moe_frame(
     let Some(c) = ctx() else { no!("нет контекста wgpu") };
     let n_pack = w.experts.len().saturating_sub(1); // routed; shared is last
     let slots = g.top_k + 1;
+    let n_all = w.logits.len();
+    let subset = w.remap.is_some_and(|r| r.len() >= n_all) && n_all > 0;
     if n_pack == 0
         || w.logits.len() < n_pack
         || n_pack > 1024
@@ -17198,7 +17281,7 @@ pub fn dsv4_moe_frame(
     };
 
     // ── routing, on the device, straight into the msel/mwt the kernels read ──
-    let lg = frame_up(c, 16, bytemuck::cast_slice(&w.logits[..n_pack]));
+    let lg = frame_up(c, 16, bytemuck::cast_slice(w.logits));
     // NOT const_buf: that cache is keyed on the host ADDRESS, which is only
     // meaningful for model weights that outlive the process. The bias arrives
     // in a Vec built per layer, and the allocator hands back the same address
@@ -17208,6 +17291,11 @@ pub fn dsv4_moe_frame(
         Some(b) if b.len() >= n_pack => frame_up(c, 25, bytemuck::cast_slice(&b[..n_pack])),
         _ => lg.clone(),
     };
+    let rmb = match w.remap {
+        Some(r) if subset => frame_up(c, 26, bytemuck::cast_slice(&r[..n_all])),
+        _ => frame_buf(c, 26, n_all.max(1) * 4, true),
+    };
+    let coldb = frame_buf(c, 27, 2 * g.top_k * 4, false);
     let mk = frame_buf(c, 17, n_pack * 4, true);
     let fc = match w.forced {
         Some(f) if f.len() >= g.top_k => {
@@ -17223,9 +17311,10 @@ pub fn dsv4_moe_frame(
     let xb = frame_up(c, 23, bytemuck::cast_slice(&x[..g.hidden]));
     let ob = frame_buf(c, 24, g.hidden * 4, false);
 
-    let rflags = (w.bias.is_some_and(|b| b.len() >= n_pack) as u32)
+    let rflags = (w.bias.is_some_and(|b| b.len() >= w.logits.len()) as u32)
         | ((w.forced.is_some_and(|f| f.len() >= g.top_k) as u32) << 2)
-        | 8; // always pin the shared slot: these kernels take a fixed count
+        | 8 // always pin the shared slot: these kernels take a fixed count
+        | ((subset as u32) << 4);
     let rp = uniform_mixed(c, [n_pack as u32, g.top_k as u32, rflags], g.route_scale);
 
     let stride16 = |rows: usize, cols: usize, q2: bool| -> u32 {
