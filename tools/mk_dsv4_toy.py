@@ -30,12 +30,16 @@ def _env(name, default):
     return int(os.environ.get(name, default))
 
 D          = _env("TOY_D", 64)        # hidden_size
-NH         = 2                        # num_attention_heads
-HD         = 32                       # head_dim (NOT hidden/heads — the point)
-RD         = 8                        # qk_rope_head_dim
-QLORA      = 16
-OLORA      = 16
-OGROUPS    = 2
+# Tunable, because the DEFAULTS are deliberately narrow — 16-column tensors
+# fall out of the quantizer as q8, which is honest for a toy and useless for
+# testing a q4tp-only kernel. A wide toy (TOY_QLORA=64 TOY_OLORA=64 TOY_D=128
+# TOY_NH=4 TOY_HD=64) puts every attention tensor on the 32-column grid.
+NH         = _env("TOY_NH", 2)        # num_attention_heads
+HD         = _env("TOY_HD", 32)       # head_dim (NOT hidden/heads — the point)
+RD         = _env("TOY_RD", 8)        # qk_rope_head_dim
+QLORA      = _env("TOY_QLORA", 16)
+OLORA      = _env("TOY_OLORA", 16)
+OGROUPS    = _env("TOY_OGROUPS", 2)
 NLAYERS    = _env("TOY_LAYERS", 4)
 NHASH      = 2                        # layers 0..1 route by table
 NEXP       = _env("TOY_EXPERTS", 8)
