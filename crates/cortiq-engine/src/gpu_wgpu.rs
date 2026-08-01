@@ -12950,6 +12950,12 @@ fn dispatch_q1t_mm(
 
 /// Copy the output buffer GPU→staging→CPU (map+poll). Single readback path
 /// for matvec/matmat.
+/// Spin briefly for a submission to land instead of sleeping on it.
+fn spin_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_GPU_SPIN").map(|v| v != "0").unwrap_or(true))
+}
+
 fn readback(
     c: &Ctx,
     mut enc: wgpu::CommandEncoder,
@@ -12961,8 +12967,32 @@ fn readback(
     enc.copy_buffer_to_buffer(y_buf, 0, staging, 0, y_size);
     c.queue.submit(Some(enc.finish()));
     let slice = staging.slice(..y_size);
-    slice.map_async(wgpu::MapMode::Read, |_| {});
-    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d2 = done.clone();
+    slice.map_async(wgpu::MapMode::Read, move |_| {
+        d2.store(true, std::sync::atomic::Ordering::Release);
+    });
+    // A blocking wait hands the thread to the OS scheduler, and getting it
+    // back costs more than the work did: these submissions finish in tens of
+    // microseconds and there are 86 of them a token. Spin on the queue for a
+    // short while first, then block — a decode that stalls for a real reason
+    // must not burn a core forever. CMF_GPU_SPIN=0 reverts.
+    if spin_wait() {
+        let t0 = std::time::Instant::now();
+        loop {
+            let _ = c.device.poll(wgpu::PollType::Poll);
+            if done.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            if t0.elapsed() > std::time::Duration::from_millis(2) {
+                if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+                    return false;
+                }
+                break;
+            }
+            std::hint::spin_loop();
+        }
+    } else if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
         return false;
     }
     {
