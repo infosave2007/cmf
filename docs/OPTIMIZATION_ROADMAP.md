@@ -132,6 +132,87 @@ release), and the rope tail is `qk_rope_head_dim`, not a guess from
 **The weights were never wrong.** Both published variants decode correctly
 with the fixed engine; nothing needed re-converting.
 
+## 7c. A whole-token graph for DeepSeek-V4 — the design, before the code
+
+**Why it is the only lever left.** Its experts already run on the device
+correctly: every q4tp matvec matches the CPU to 5e-4, and end-to-end
+perplexity moves 6.808 → 6.839 (64 tokens) and 5.102 → 5.146 (200). And it
+is TWICE AS SLOW — 1.0 tok/s against the CPU's 2.2, measured with an
+alternating A/B after a warm-up. The arithmetic is not the cost; the shape
+is. `moe_block` submits and blocking-reads-back once per layer, forty-three
+times per token, and a discrete card charges milliseconds per round trip.
+Nothing about the kernels fixes that. One submission per token does.
+
+The ceiling is worth the work: ~6.5 GB of weight reads per token against
+~1 TB/s of device bandwidth is single-digit milliseconds of arithmetic.
+
+### What the existing graph gives, and what it cannot
+
+`forward_token_graph` is 2357 lines over 67 compute entry points, and it
+describes a CANONICAL layer: `GraphLayer { input_norm, attn, post_norm,
+ffn }`. Its own comment states the constraint this architecture runs into —
+"the routing decision depends on the resident hidden state, so a CPU
+round-trip per layer would forfeit the one-submit design".
+
+Reusable roughly as-is (about a third of the work): RMSNorm, axpy, the q4tp
+/q4t/q8 matvec kernels, the routed-MoE block with its on-device top-k, the
+scratch pool, the residency cache, the readback path.
+
+New, because nothing in a canonical layer resembles them:
+
+| op | why it is new |
+|---|---|
+| hc fold / expand + Sinkhorn (20 iters) | the state is `hc_mult=4` copies, not a vector; there is no ordinary residual |
+| double-LoRA q | `wq_a` → norm → `wq_b` → per-head RMS → rope on the tail only |
+| shared-width KV | one head's `wkv` serves all 64 query heads |
+| compressor (+ overlapping variant) | gated pooling over a window, with state carried BETWEEN tokens |
+| indexer | its own compressor, its own cache, scoring and top-k over compressed positions |
+| sparse attention over an index list | window ⊕ selected compressed positions, with a learned sink in the denominator |
+| grouped low-rank output | 8 groups, block-diagonal — not a plain matvec |
+| hash routing | experts from a token-id table, not from the router |
+
+Three caches (window ring, compressed, indexer) must live on the device
+across tokens, or the round trips come back through the state instead.
+
+### Build order — each step verifiable on its own
+
+The order is chosen so that every step can be diffed against the CPU before
+the next one is written. `tools/mk_dsv4_toy.py` + `tools/dsv4_ref.py` +
+`CMF_DSV4_DUMP` already do that diff at layer granularity; extend the dump,
+do not trust generated text.
+
+1. **State on the device.** hc fold/expand + Sinkhorn, the hidden staying in
+   VRAM across layers. Verify: one layer, attention and MoE still on the CPU
+   with explicit readback, output equal to the current path. This is the step
+   that makes the rest possible and buys nothing on its own — resist
+   measuring speed here.
+2. **Attention body.** Double LoRA, shared KV, rope tail, sparse attend with
+   the sink, grouped output. Verify per layer against `dsv4_ref.py`, which
+   already scores the body in isolation on the port's own input.
+3. **Compressor and indexer, with their caches resident.** The subtle step:
+   the compressor fires on a stride and the indexer reads what it wrote. An
+   empty indexer cache does not fail — it silently drops the long-range
+   memory, which is exactly the bug that survived a night of gates.
+4. **MoE via the existing block, encoded into the same submission** rather
+   than submitted per layer.
+5. Only now measure. Alternating A/B, warm-up first, three rounds.
+
+### The two traps this codebase has already recorded
+
+Feeding a kernel the wrong layout produces plausible output, not an error —
+q4t tiles once went to the q4b kernel and the only symptom was a worse
+answer. And a benchmark that runs one arm first hands the second a warm
+page cache; the 0.7 → 2.0 "speedup" above was exactly that, and it was
+believed for an hour.
+
+### Residency is already solved
+
+Nothing needs preloading: the device cache grows on demand and evicts by an
+aged use count under `CMF_GPU_VRAM_MB`, with recently-touched tensors exempt
+and the CPU as the overflow path. Measured sizing: 95% of a task's routing
+mass sits in 99 of 256 experts per layer, which for the 4-bit variant is
+~57 GB — inside a 98 GB card, so the steady state holds the whole hot set.
+
 ## 7a. What the same night cost in wrong conclusions
 
 Worth recording, because each was stated with confidence and each was wrong:
