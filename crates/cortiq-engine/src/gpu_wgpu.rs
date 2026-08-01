@@ -16375,6 +16375,20 @@ pub fn dsv4_layer_frame(
     ok
 }
 
+/// Can this layer's experts live on the card? Uploads them if they can, so a
+/// caller that pre-flights every layer has also paid the upload before it
+/// commits to the device path.
+pub fn dsv4_experts_ready(
+    model: &Arc<CmfModel>,
+    experts: &[(usize, usize, usize)],
+    inter: usize,
+    hidden: usize,
+    gu_q2: bool,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    moe_expert_bufs(c, model, experts, inter, hidden, true, gu_q2).is_some()
+}
+
 /// Seed the layer-frame's hyper-connection state from the host (layer zero).
 pub fn dsv4_state_write(state: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };

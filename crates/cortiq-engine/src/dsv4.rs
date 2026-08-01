@@ -1572,6 +1572,35 @@ fn dsv4_layer_loop(
         };
         if f.is_empty() { inv_freq } else { f.as_slice() }
     };
+    // PRE-FLIGHT. The prep inside the loop advances the window and the
+    // compressor caches, so a refusal halfway leaves state that the CPU
+    // fallback would advance a SECOND time — which is not a slow answer but a
+    // wrong one. Everything that can decline is therefore asked before the
+    // first byte of state moves. The expert upload happens here too, which is
+    // where it belonged anyway.
+    for (li, l) in layers.iter().enumerate() {
+        let Some(pk) = pack_for(l, cfg, li) else {
+            return false;
+        };
+        if l.wq_a.model_idx().is_none()
+            || l.wq_b.model_idx().is_none()
+            || l.wo_a.model_idx().is_none()
+            || l.wo_b.model_idx().is_none()
+        {
+            return false;
+        }
+        let Some(model) = l.experts.first().and_then(|e| e.w1.model_arc()) else {
+            return false;
+        };
+        let gu_q2 = l
+            .experts
+            .first()
+            .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
+        if !crate::gpu_wgpu::dsv4_experts_ready(&model, &pk.tensors, cfg.moe_inter, dim, gu_q2) {
+            return false;
+        }
+    }
+
     // Layer zero's opening fold has no frame before it to have prepared it.
     let mut folded = hc_fold_norm(
         state,
