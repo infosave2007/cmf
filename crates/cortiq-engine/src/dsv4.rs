@@ -1602,8 +1602,21 @@ fn dsv4_layer_loop(
         // token: 100 GB of experts against a 98 GB card means SOME layer will
         // always miss. Those run on the host, with the state fetched and put
         // back around them — two transfers for the few that need it.
-        on_dev[li] =
-            crate::gpu_wgpu::dsv4_experts_ready(&model, &pk.tensors, cfg.moe_inter, dim, gu_q2);
+        // The attention weights have to be asked for too. Experts fill the
+        // card first, and a wo_b that misses at layer 11 used to surface as a
+        // mid-loop refusal — after the caches had advanced, which the CPU
+        // fallback then advanced again.
+        let attn_ok = [
+            l.wq_a.model_idx(),
+            l.wq_b.model_idx(),
+            l.wo_a.model_idx(),
+            l.wo_b.model_idx(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|i| crate::gpu_wgpu::dsv4_weight_ready(&model, i));
+        on_dev[li] = attn_ok
+            && crate::gpu_wgpu::dsv4_experts_ready(&model, &pk.tensors, cfg.moe_inter, dim, gu_q2);
     }
     if !on_dev.iter().any(|&x| x) {
         return false;

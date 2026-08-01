@@ -16375,9 +16375,28 @@ pub fn dsv4_layer_frame(
     ok
 }
 
+/// Is this tensor resident, or can it be made so? Uploads it if it can.
+pub fn dsv4_weight_ready(model: &Arc<CmfModel>, idx: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Some(e) = model.tensors.get(idx) else {
+        return false;
+    };
+    let Some(abs) = model.entry_abs_offset(e) else {
+        return false;
+    };
+    let bytes = model.primary_bytes();
+    let plen = e.nbytes as usize;
+    if abs + plen > bytes.len() {
+        return false;
+    }
+    weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen]).is_some()
+}
+
 /// Can this layer's experts live on the card? Uploads them if they can, so a
 /// caller that pre-flights every layer has also paid the upload before it
 /// commits to the device path.
+/// Ask for the attention weights BEFORE the experts, or the experts take the
+/// card and the skeleton — two orders of magnitude smaller — has nowhere left.
 pub fn dsv4_experts_ready(
     model: &Arc<CmfModel>,
     experts: &[(usize, usize, usize)],
