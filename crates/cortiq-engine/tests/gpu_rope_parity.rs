@@ -31,8 +31,7 @@ fn device_rope_heads_matches_the_cpu() {
             if !cortiq_engine::gpu_wgpu::rope_heads_for_test(
                 &mut got, &freq, nh, hd, rd, pos, eps, rms, inverse,
             ) {
-                eprintln!("устройство недоступно — пропуск");
-                return;
+                panic!("устройство не поднялось — тест не проверил ничего");
             }
             let num: f32 = got.iter().zip(&want).map(|(a, b)| (a - b) * (a - b)).sum();
             let den: f32 = want.iter().map(|a| a * a).sum::<f32>().max(1e-20);

@@ -27,7 +27,10 @@ fn the_fused_attention_block_matches_the_cpu() {
     // Exact CPU arm, or the reference is the int8-activation approximation
     // and every stage below reads ~1e-3 away for reasons that have nothing to
     // do with the frame.
-    unsafe { std::env::set_var("CMF_SDOT", "0") };
+    unsafe {
+        std::env::set_var("CMF_SDOT", "0");
+        std::env::set_var("CMF_DSV4_FRAME_DEBUG", "1");
+    }
     let model = std::sync::Arc::new(cortiq_core::CmfModel::open(&path).expect("open"));
     let find = |n: &str| model.tensors.iter().position(|e| e.name == n);
     let p = "model.layers.0.self_attn";

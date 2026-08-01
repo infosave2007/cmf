@@ -41,8 +41,7 @@ fn device_hc_join_matches_the_cpu() {
         &mut got_fold, &mut got_exp,
     );
     if !ok {
-        eprintln!("устройство недоступно — пропуск");
-        return;
+        panic!("устройство не поднялось — тест не проверил ничего");
     }
     let rel = |a: &[f32], b: &[f32]| {
         let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();

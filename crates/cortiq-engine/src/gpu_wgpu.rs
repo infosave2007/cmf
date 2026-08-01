@@ -4936,9 +4936,12 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
     let has_mask = (rt_p.flags & 2u) != 0u;
     let forced = (rt_p.flags & 4u) != 0u;
 
-    let shared = (rt_p.flags & 8u) != 0u;
+    // `shared` is a WGSL reserved word. Naming it that compiled here and
+    // failed at pipeline creation, which took the whole context down and made
+    // every GPU test pass by skipping.
+    let pin_shared = (rt_p.flags & 8u) != 0u;
     if (lid < k) { rt_used[lid] = 0u; rt_idx[lid] = 0u; rt_w[lid] = 0.0; }
-    if (shared && lid == 0u) { rt_idx[k] = n; rt_w[k] = 1.0; }
+    if (pin_shared && lid == 0u) { rt_idx[k] = n; rt_w[k] = 1.0; }
     var i = lid;
     loop {
         if (i >= n) { break; }
@@ -5848,7 +5851,14 @@ fn ctx() -> Option<&'static Ctx> {
         match init() {
             Ok(c) => Some(c),
             Err(e) => {
+                // Tests install no subscriber, so a tracing-only report makes
+                // an init failure look exactly like "no GPU here".
                 tracing::warn!("wgpu init failed — CPU fallback: {e}");
+                if std::env::var("CMF_GPU_DEBUG").is_ok()
+                    || std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok()
+                {
+                    eprintln!("wgpu init не удался — откат на CPU: {e}");
+                }
                 None
             }
         }
@@ -15889,8 +15899,27 @@ fn frame_up(c: &Ctx, tag: u8, data: &[u8]) -> wgpu::Buffer {
 /// The one thing that has to survive between tokens. `off` and `data` are in
 /// floats; the buffer is created on first use at `cap` and never shrinks.
 pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: usize) -> bool {
-    let Some(c) = ctx() else { return false };
+    let dbg = std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok();
+    let Some(c) = ctx() else {
+        if dbg {
+            eprintln!("кеш dsv4: нет контекста wgpu");
+        }
+        return false;
+    };
     if off + data.len() > cap {
+        if dbg {
+            eprintln!("кеш dsv4: {off}+{} не влезает в {cap}", data.len());
+        }
+        return false;
+    }
+    // Storage buffers have a size ceiling of their own, well under VRAM, and
+    // silently refusing at it reads as "no device" from the caller's side.
+    if (cap * 4) as u64 > c.device.limits().max_storage_buffer_binding_size as u64 {
+        tracing::warn!(
+            "кеш dsv4: {} МБ превышает предел одного буфера {} МБ — слой остаётся на CPU",
+            cap * 4 / (1 << 20),
+            c.device.limits().max_storage_buffer_binding_size / (1 << 20)
+        );
         return false;
     }
     let mut map = c.dsv4_kv.lock().unwrap();

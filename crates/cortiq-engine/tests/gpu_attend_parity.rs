@@ -28,8 +28,7 @@ fn device_sparse_attend_matches_the_cpu() {
     if !cortiq_engine::gpu_wgpu::sparse_attend_for_test(
         &q, &kv, &idxs, &sink, scale, nh, hd, &mut got,
     ) {
-        eprintln!("устройство недоступно — пропуск");
-        return;
+        panic!("устройство не поднялось — тест не проверил ничего");
     }
     let num: f32 = got.iter().zip(&want).map(|(a, b)| (a - b) * (a - b)).sum();
     let den: f32 = want.iter().map(|a| a * a).sum::<f32>().max(1e-20);

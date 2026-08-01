@@ -42,8 +42,7 @@ fn device_routing_matches_the_cpu() {
         if !cortiq_engine::gpu_wgpu::moe_route_for_test(
             &scores, b, m, f, top_k, scale, false, &mut gi, &mut gw,
         ) {
-            eprintln!("нет устройства — пропуск");
-            return;
+            panic!("устройство не поднялось — тест не проверил ничего");
         }
         assert_eq!(ci, gi, "{name}: разные эксперты или порядок");
         let d = cw

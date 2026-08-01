@@ -43,8 +43,7 @@ fn device_kv_pool_matches_the_cpu() {
         if !cortiq_engine::gpu_wgpu::kv_pool_for_test(
             pk, ps, &cur_kv, &cur_sc, None, ratio, d, true, &mut gpu,
         ) {
-            eprintln!("нет устройства — пропуск");
-            return;
+            panic!("устройство не поднялось — тест не проверил ничего");
         }
         let r = rel(&cpu, &gpu);
         println!("перекрытие, prev={have_prev}: {r:.3e}");
@@ -90,8 +89,7 @@ fn device_index_scores_match_the_cpu() {
     if !cortiq_engine::gpu_wgpu::index_scores_for_test(
         &q, &kv, &hw, nh, hd, n_pos, limit, &mut gpu,
     ) {
-        eprintln!("нет устройства — пропуск");
-        return;
+        panic!("устройство не поднялось — тест не проверил ничего");
     }
     for t in limit..n_pos {
         assert!(gpu[t] < -1e30, "позиция {t} за пределом не замаскирована");
@@ -116,8 +114,7 @@ fn device_top_k_matches_the_cpu() {
         cortiq_engine::dsv4::top_k_positions(&sc, k, &mut cpu);
         let mut gpu = Vec::new();
         if !cortiq_engine::gpu_wgpu::top_k_for_test(&sc, k, &mut gpu) {
-            eprintln!("нет устройства — пропуск");
-            return;
+            panic!("устройство не поднялось — тест не проверил ничего");
         }
         let cpu32: Vec<u32> = cpu.iter().map(|&x| x as u32).collect();
         println!("top-k n={n} k={k}: выбрано {} против {}", gpu.len(), cpu.len());
