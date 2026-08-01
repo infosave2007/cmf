@@ -822,6 +822,8 @@ pub(crate) fn encode_q4tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
     let mut params = vec![0u8; out_dim * 4];
     let mut codes = vec![0u8; out_dim * stride];
 
+    let search = q2tp_search();
+
     encode_rows_parallel(
         out_dim,
         [gpr * Q4TP_NIB, 4, stride],
@@ -870,14 +872,39 @@ pub(crate) fn encode_q4tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
         let tab = q4tp_ladder(params_row, 0);
         let crow = &mut *codes_row;
         for g in 0..gpr {
-            let c = if dead[g] || st <= 0.0 {
+            let nominal = if dead[g] || st <= 0.0 {
                 0
             } else {
                 ((lg[g] - lo_r) / st).round_ties_even().clamp(0.0, Q4TP_LMAX as f32) as usize
             };
+            let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+            // Same reasoning as q2tp: absmax fixes the outer level and one
+            // outlier coarsens the group behind it. Sixteen levels forgive
+            // more than four, so the win is smaller — but it is measured.
+            let c = if dead[g] || st <= 0.0 || !search {
+                nominal
+            } else {
+                let mut best = (f32::INFINITY, nominal);
+                for cand in nominal.saturating_sub(2)..=(nominal + 1).min(Q4TP_LMAX as usize) {
+                    let sc = tab[cand];
+                    if sc <= 0.0 {
+                        continue;
+                    }
+                    let iv = 1.0 / sc;
+                    let mut err = 0.0f32;
+                    for &wv in tile {
+                        let q = (wv * iv).round_ties_even().clamp(-8.0, 7.0);
+                        let d = wv - q * sc;
+                        err += d * d;
+                    }
+                    if err < best.0 {
+                        best = (err, cand);
+                    }
+                }
+                best.1
+            };
             q4tp_put_code(crow, g, c);
             let inv = if tab[c] > 0.0 { 1.0 / tab[c] } else { 0.0 };
-            let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
             let dst = &mut nib_row[g * Q4TP_NIB..(g + 1) * Q4TP_NIB];
             for k in 0..16 {
                 let q0 = ((tile[k * 2] * inv).round_ties_even().clamp(-8.0, 7.0) as i8 + 8) as u8;
@@ -3953,6 +3980,35 @@ mod tests {
             searched < plain,
             "подбор ступени не улучшил: {searched:.4} против {plain:.4}"
         );
+    }
+
+    /// The same trick in the 4-bit layout. Sixteen levels forgive an outlier
+    /// far more than four do, so this measures whether it is worth having
+    /// there at all rather than assuming it is.
+    #[test]
+    fn four_bit_scale_search_measured() {
+        let (rows, cols) = (16usize, 512usize);
+        let mut w = vec![0.0f32; rows * cols];
+        for (i, v) in w.iter_mut().enumerate() {
+            let x = i as f32;
+            *v = ((x * 0.017).sin() + (x * 0.041).sin() + (x * 0.093).sin()) / 3.0;
+            if i % 97 == 0 {
+                *v *= 6.0;
+            }
+        }
+        let rel = |enc: &[u8]| {
+            let mut back = vec![0.0f32; rows * cols];
+            cortiq_core::quant::dequant_q4tp(enc, rows, cols, &mut back);
+            let num: f32 = w.iter().zip(&back).map(|(a, b)| (a - b) * (a - b)).sum();
+            let den: f32 = w.iter().map(|a| a * a).sum();
+            (num / den).sqrt()
+        };
+        unsafe { std::env::set_var("CMF_Q2TP_SEARCH", "0") };
+        let plain = rel(&encode_q4tp(&w, rows, cols));
+        unsafe { std::env::remove_var("CMF_Q2TP_SEARCH") };
+        let searched = rel(&encode_q4tp(&w, rows, cols));
+        println!("q4tp относительная ошибка: absmax {plain:.4} → подбор {searched:.4}");
+        assert!(searched <= plain, "подбор ухудшил 4 бита");
     }
 
     /// The row encoders were made parallel because a 300B MoE otherwise
