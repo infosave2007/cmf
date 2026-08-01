@@ -1228,14 +1228,14 @@ pub fn moe_step(
     // arithmetic rather than the traffic. A refusal (missing kernel, mixed
     // layouts, weights that do not fit the budget) falls to the CPU whole,
     // never half.
-    // OFF BY DEFAULT until it is proven equal to the CPU path. As shipped it
-    // is not: on a toy checkpoint the device answered with a 220% relative
-    // divergence and different text. `CMF_DSV4_GPU_MOE=1` opts in for
-    // debugging; a wrong kernel here does not crash, it quietly changes the
-    // answer, so the default must be the arm that is known correct.
+    // ON by default now that it is measured against the CPU on real weights:
+    // perplexity 6.808 → 6.839 at 64 tokens and 5.102 → 5.146 at 200, which
+    // is summation order, not a different model. The 220% divergence that
+    // held this back was an artefact of comparing two generations after they
+    // had already chosen different tokens. `CMF_DSV4_GPU_MOE=0` reverts.
     fn gpu_moe_on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("CMF_DSV4_GPU_MOE").is_ok_and(|v| v != "0"))
+        *ON.get_or_init(|| std::env::var("CMF_DSV4_GPU_MOE").map(|v| v != "0").unwrap_or(true))
     }
     if gpu_moe_on() && crate::gpu::enabled_here() {
         let mut jobs = Vec::with_capacity(idx.len() + 1);
