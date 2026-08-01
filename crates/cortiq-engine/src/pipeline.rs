@@ -2518,19 +2518,32 @@ impl Pipeline {
         }
         for pos in 0..ids.len().saturating_sub(1) {
             let hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, None);
+            // Architectures whose head lives inside their own stack return
+            // the logits out of band and a zero hidden — DeepSeek-V4 folds
+            // its hyper-connection copies between the last layer and the
+            // norm, so it cannot hand back a vector this loop could use.
+            // Scoring the zeros gave a perplexity of exactly the vocabulary
+            // size, which is a uniform distribution reported as a
+            // measurement. `generate` already reads this channel.
+            let out_of_band = self.graph_logits.take();
             if pos < start {
                 continue;
             }
-            let normed = inference::rms_norm(
-                &hidden,
-                &self.weights.final_norm,
-                self.rms_eps,
-                self.norm_style,
-            );
-            // lm_head_forward applies the final-logit softcap itself —
-            // capping again here double-squashed gemma-class logits
-            // (tanh∘tanh) and reported a flattered ppl.
-            let logits = self.lm_head_forward(&normed);
+            let logits = match out_of_band {
+                Some(lg) => lg,
+                None => {
+                    let normed = inference::rms_norm(
+                        &hidden,
+                        &self.weights.final_norm,
+                        self.rms_eps,
+                        self.norm_style,
+                    );
+                    // lm_head_forward applies the final-logit softcap itself
+                    // — capping again here double-squashed gemma-class
+                    // logits (tanh∘tanh) and reported a flattered ppl.
+                    self.lm_head_forward(&normed)
+                }
+            };
             let target = ids[pos + 1] as usize;
             let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
             let lse: f64 = logits
