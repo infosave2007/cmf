@@ -1623,7 +1623,7 @@ fn dsv4_layer_loop(
     }
 
     // Layer zero's opening fold has no frame before it to have prepared it.
-    let mut folded = hc_fold_norm(
+    let (mut folded, post0, comb0) = hc_fold_norm(
         state,
         &layers[0].hc_attn_fn,
         &layers[0].hc_attn_scale,
@@ -1632,7 +1632,9 @@ fn dsv4_layer_loop(
         cfg,
         pool,
     );
-    if !crate::gpu_wgpu::dsv4_state_write(state) {
+    if !crate::gpu_wgpu::dsv4_state_write(state)
+        || !crate::gpu_wgpu::dsv4_hc_write(&post0, &comb0)
+    {
         return false;
     }
     let mut sink_out = vec![0.0f32; dim];
@@ -1665,7 +1667,7 @@ fn dsv4_layer_loop(
                 |f, o| moe_step(f, l, cfg, token_id, li, pool, o),
             );
             if let Some(n) = layers.get(li + 1) {
-                folded = hc_fold_norm(
+                let (f, p2, c2) = hc_fold_norm(
                     state,
                     &n.hc_attn_fn,
                     &n.hc_attn_scale,
@@ -1674,6 +1676,10 @@ fn dsv4_layer_loop(
                     cfg,
                     pool,
                 );
+                folded = f;
+                if !crate::gpu_wgpu::dsv4_hc_write(&p2, &c2) {
+                    return false;
+                }
             }
             if !crate::gpu_wgpu::dsv4_state_write(state) {
                 return false;
@@ -1839,7 +1845,7 @@ fn hc_fold_norm(
     norm_w: &[f32],
     cfg: &Dsv4Cfg,
     pool: Option<&crate::pool::Pool>,
-) -> Vec<f32> {
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let (hc, dim) = (cfg.hc_mult, cfg.dim);
     let mix_hc = (2 + hc) * hc;
     let mut mixes = vec![0.0f32; mix_hc];
@@ -1861,7 +1867,9 @@ fn hc_fold_norm(
     let mut folded = vec![0.0f32; dim];
     hc_fold(state, &pre, hc, dim, &mut folded);
     rms_weighted(&mut folded, norm_w, cfg.norm_eps);
-    folded
+    // post and comb travel with the fold: the frame's opening expand needs
+    // exactly those, and they are not recoverable from the state alone.
+    (folded, post, comb)
 }
 
 /// `CMF_DSV4_GPU_LAYER=1`: one submission per layer instead of two, with the

@@ -16302,8 +16302,8 @@ pub fn dsv4_layer_frame(
     let ao = frame_buf(c, 8, dim * 4, false);
     let mixes = frame_buf(c, 41, mix_hc * 4, false);
     let folded = frame_buf(c, 42, dim * 4, false);
-    let hpost = frame_buf(c, 43, hc * 4, false);
-    let hcomb = frame_buf(c, 44, hc * hc * 4, false);
+    let hpost = frame_buf(c, 43, hc * 4, true);
+    let hcomb = frame_buf(c, 44, hc * hc * 4, true);
     let x2 = frame_buf(c, 45, dim * 4, false);
     let state2 = frame_buf(c, 46, hc * dim * 4, false);
     let logit_b = frame_buf(c, 47, n_pack * 4, false);
@@ -16406,6 +16406,19 @@ pub fn dsv4_experts_ready(
 ) -> bool {
     let Some(c) = ctx() else { return false };
     moe_expert_bufs(c, model, experts, inter, hidden, true, gu_q2).is_some()
+}
+
+/// Seed the attention half's `post`/`comb` from the host. The frame's opening
+/// expand reads what the PREVIOUS frame's tail left there; layer zero has no
+/// previous frame, and neither does the layer after one that ran on the host.
+/// Without this both read whatever was in the buffer — perplexity 1470.
+pub fn dsv4_hc_write(post: &[f32], comb: &[f32]) -> bool {
+    let Some(c) = ctx() else { return false };
+    let pb = frame_buf(c, 43, post.len() * 4, true);
+    let cb = frame_buf(c, 44, comb.len() * 4, true);
+    c.queue.write_buffer(&pb, 0, bytemuck::cast_slice(post));
+    c.queue.write_buffer(&cb, 0, bytemuck::cast_slice(comb));
+    true
 }
 
 /// Seed the layer-frame's hyper-connection state from the host (layer zero).
