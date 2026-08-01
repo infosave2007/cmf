@@ -1222,6 +1222,49 @@ pub fn moe_step(
             p[li] = idx.clone();
         });
     }
+    // One submission for the whole block — the chosen experts plus the
+    // shared one. Per-expert dispatches are what made MoE slow elsewhere,
+    // and the device keeps the weights across tokens, so the cost is the
+    // arithmetic rather than the traffic. A refusal (missing kernel, mixed
+    // layouts, weights that do not fit the budget) falls to the CPU whole,
+    // never half.
+    if crate::gpu::enabled_here() {
+        let mut jobs = Vec::with_capacity(idx.len() + 1);
+        let mut model_ref = None;
+        let mut ok = true;
+        for (e, &ei) in idx.iter().enumerate() {
+            let Some(exp) = l.experts.get(ei) else { continue };
+            ok &= crate::pipeline::moe_push_job_parts(
+                &exp.w1,
+                &exp.w3,
+                &exp.w2,
+                hidden,
+                w.get(e).copied().unwrap_or(0.0),
+                cfg.swiglu_limit,
+                &mut jobs,
+                &mut model_ref,
+            )
+            .is_some();
+        }
+        ok &= crate::pipeline::moe_push_job_parts(
+            &l.shared.w1,
+            &l.shared.w3,
+            &l.shared.w2,
+            hidden,
+            1.0,
+            cfg.swiglu_limit,
+            &mut jobs,
+            &mut model_ref,
+        )
+        .is_some();
+        if ok {
+            if let Some(m) = model_ref.as_ref() {
+                if crate::gpu::moe_block(m, &jobs, out) {
+                    return;
+                }
+            }
+        }
+    }
     out.fill(0.0);
     let mut acc = vec![0.0f32; cfg.dim];
     for (e, &ei) in idx.iter().enumerate() {

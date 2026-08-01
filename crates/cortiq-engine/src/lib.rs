@@ -71,6 +71,7 @@ pub fn gpu_moe_job_for_test(
         q1: true,
         q4t: false,
         q4tp: false,
+            swiglu_limit: 0.0,
     }
 }
 

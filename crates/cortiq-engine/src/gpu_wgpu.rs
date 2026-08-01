@@ -561,7 +561,7 @@ fn q1_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
 }
 
 // ── Element-wise kernels of the MoE block (silu·mul·col, axpy, zeroing) ──
-struct N1 { n: u32, f: u32, _b: u32, _c: u32 };
+struct N1 { n: u32, f: u32, lim: f32, _c: u32 };
 
 @group(0) @binding(0) var<storage, read>       sg   : array<f32>;
 @group(0) @binding(1) var<storage, read>       su   : array<f32>;
@@ -572,8 +572,16 @@ struct N1 { n: u32, f: u32, _b: u32, _c: u32 };
 fn silu_mul_pre(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= snp.n) { return; }
-    let gv = sg[i];
-    var v = (gv / (1.0 + exp(-gv))) * su[i];
+    var gv = sg[i];
+    var uv = su[i];
+    // swiglu_limit, and its asymmetry is the reference's: `up` is clamped on
+    // BOTH sides, `gate` only from above. A device that skips it diverges
+    // from the CPU path exactly on the tokens that saturate.
+    if (snp.lim > 0.0) {
+        uv = clamp(uv, -snp.lim, snp.lim);
+        gv = min(gv, snp.lim);
+    }
+    var v = (gv / (1.0 + exp(-gv))) * uv;
     if (snp.f == 1u) { v = v * scol[i]; }
     sact[i] = v;
 }
@@ -12699,7 +12707,7 @@ fn matvec_batch_q1(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f3
 /// silu·mul·col_down → down-matvec → y += w·d. Intermediate buffers are
 /// GPU-resident, one sync per layer.
 pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> bool {
-    if jobs.iter().any(|j| j.q1 || j.q4t || j.q4tp) {
+    if jobs.iter().any(|j| j.q1) {
         return false; // q1 WGSL kernel not implemented yet — honest CPU
     }
     let Some(c) = ctx() else { return false };
@@ -12707,8 +12715,12 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         return false;
     }
     let q4t = jobs[0].q4t;
-    if jobs.iter().any(|j| j.q4t != q4t) {
+    let q4tp = jobs[0].q4tp;
+    if jobs.iter().any(|j| j.q4t != q4t || j.q4tp != q4tp) {
         return false; // mixed job kinds — honest CPU
+    }
+    if q4t && q4tp {
+        return false; // a trio is one layout or the other
     }
     let inter = jobs[0].gate.1;
     let hidden = jobs[0].down.1;
@@ -12717,7 +12729,16 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
     }
     // Resident weights of all triples — validate first (fail → CPU entirely).
     let fetch = |idx: usize, rows: usize, cols: usize| -> Option<wgpu::Buffer> {
-        if q4t {
+        if q4tp {
+            // Three planes, not a flat tile: nibbles, then the per-row
+            // (lo, step) pair, then the 5-bit rung codes. Only the layout
+            // owner knows the total, so ask it rather than re-deriving.
+            let n = cortiq_core::quant::expected_nbytes(
+                cortiq_core::TensorDtype::Q4TiledP,
+                &[rows, cols],
+            )?;
+            tensor_weight_sized(c, model, idx, rows, n)
+        } else if q4t {
             tensor_weight_sized(c, model, idx, rows, rows * (cols / 32) * 18)
         } else {
             tensor_weight(c, model, idx, rows, cols)
@@ -12728,7 +12749,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         let (gi, gr, gc, _) = j.gate;
         let (ui, ur, uc, _) = j.up;
         let (di, dr, dc, _) = j.down;
-        let align = if q4t { 32 } else { 4 };
+        let align = if q4t || q4tp { 32 } else { 4 };
         if gc % align != 0 || uc % align != 0 || dc % align != 0 {
             return false;
         }
@@ -12796,7 +12817,10 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         let xsg = storage_bytes(c, bytemuck::cast_slice(&j.xs_gate));
         let xsu = storage_bytes(c, bytemuck::cast_slice(&j.xs_up));
 
-        if q4t {
+        if q4tp {
+            encode_q1t_like(c, &mut enc, &c.q4tp_mv, gw, &xsg, &g_buf, *gr, *gc);
+            encode_q1t_like(c, &mut enc, &c.q4tp_mv, uw, &xsu, &u_buf, *ur, *uc);
+        } else if q4t {
             encode_q1t_like(c, &mut enc, &c.q4t_mv, gw, &xsg, &g_buf, *gr, *gc);
             encode_q1t_like(c, &mut enc, &c.q4t_mv, uw, &xsu, &u_buf, *ur, *uc);
         } else {
@@ -12805,7 +12829,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         }
         // act = silu(g)·u·col_down
         {
-            let np = uniform_u32x4(c, [inter as u32, has_col as u32, 0, 0]);
+            let np = uniform_u32x4(c, [inter as u32, has_col as u32, j.swiglu_limit.to_bits(), 0]);
             let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &c.layout_silu,
@@ -12825,7 +12849,9 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
         }
-        if q4t {
+        if q4tp {
+            encode_q1t_like(c, &mut enc, &c.q4tp_mv, dw, &a_buf, &d_buf, *dr, *dc);
+        } else if q4t {
             encode_q1t_like(c, &mut enc, &c.q4t_mv, dw, &a_buf, &d_buf, *dr, *dc);
         } else {
             encode_matvec(c, &mut enc, dw, &a_buf, &drs_b, &d_buf, *dr, *dc);

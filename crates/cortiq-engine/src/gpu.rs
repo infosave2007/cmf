@@ -457,6 +457,11 @@ pub struct MoeJob<'a> {
     /// on a per-row ladder. Without this the experts of a q4tp MoE model fall
     /// to the CPU while every other dtype rides the device.
     pub q4tp: bool,
+    /// The reference's `swiglu_limit`; 0 disables the clamp. A backend that
+    /// cannot apply it must REFUSE the job rather than drop it silently —
+    /// the difference only shows on saturating activations, which is the
+    /// hardest kind of divergence to notice.
+    pub swiglu_limit: f32,
 }
 
 /// A single independent batch matvec (GDN projections of one input).

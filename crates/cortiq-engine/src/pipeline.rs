@@ -5173,7 +5173,7 @@ fn dense_ffn_gpu(d: &DenseFfn, x: &[f32], _pool: Option<&Pool>) -> Option<Vec<f3
 /// single-job path.
 #[allow(clippy::type_complexity)]
 #[allow(clippy::type_complexity)]
-fn moe_parts(
+pub(crate) fn moe_parts(
     t: &QTensor,
 ) -> Option<(
     &std::sync::Arc<cortiq_core::CmfModel>,
@@ -5229,6 +5229,50 @@ fn moe_parts(
     }
 }
 
+/// Build one gate/up/down GPU job from three tensors. `moe_push_job` is the
+/// DenseFfn-shaped caller; architectures that keep their experts in their own
+/// structs (DeepSeek-V4) come here directly.
+pub(crate) fn moe_push_job_parts<'a>(
+    gate: &'a QTensor,
+    up: &'a QTensor,
+    down: &'a QTensor,
+    x: &[f32],
+    w: f32,
+    swiglu_limit: f32,
+    jobs: &mut Vec<crate::gpu::MoeJob<'a>>,
+    model_ref: &mut Option<std::sync::Arc<cortiq_core::CmfModel>>,
+) -> Option<()> {
+    use crate::qtensor::prescale;
+    let (gm, gi, gr, gc, grs, gcf, gq1, gq4) = moe_parts(gate)?;
+    let (_, ui, ur, uc, urs, ucf, uq1, uq4) = moe_parts(up)?;
+    let (_, di, dr, dc, drs, dcf, dq1, dq4) = moe_parts(down)?;
+    if gq1 != uq1 || uq1 != dq1 || gq4 != uq4 || uq4 != dq4 {
+        return None; // mixed-dtype trio — honest CPU path
+    }
+    model_ref.get_or_insert_with(|| gm.clone());
+    let dt = |cf: &[f32]| {
+        if cf.is_empty() {
+            cortiq_core::TensorDtype::Q8Row
+        } else {
+            cortiq_core::TensorDtype::Q8_2f
+        }
+    };
+    jobs.push(crate::gpu::MoeJob {
+        gate: (gi, gr, gc, grs),
+        up: (ui, ur, uc, urs),
+        down: (di, dr, dc, drs),
+        xs_gate: prescale(x, gcf, dt(gcf)).into_owned(),
+        xs_up: prescale(x, ucf, dt(ucf)).into_owned(),
+        down_col: dcf,
+        w,
+        q1: gq1,
+        q4t: gq4 && gate.mapped_q4tp().is_none(),
+        q4tp: gq4 && gate.mapped_q4tp().is_some(),
+        swiglu_limit,
+    });
+    Some(())
+}
+
 /// Build one gate/up/down GPU job (see `moe_parts`).
 fn moe_push_job<'a>(
     d: &'a DenseFfn,
@@ -5269,6 +5313,7 @@ fn moe_push_job<'a>(
         q1: gq1,
         q4t: gq4 && d.gate_proj.mapped_q4tp().is_none(),
         q4tp: gq4 && d.gate_proj.mapped_q4tp().is_some(),
+        swiglu_limit: 0.0,
     });
     Some(())
 }

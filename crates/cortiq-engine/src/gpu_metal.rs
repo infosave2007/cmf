@@ -7642,6 +7642,11 @@ fn moe_block_refused(why: &'static str) {
 }
 
 pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> bool {
+    if jobs.iter().any(|j| j.swiglu_limit > 0.0) {
+        // The Metal kernels do not clamp; refusing is honest, dropping the
+        // clamp would diverge from the CPU path only where it matters.
+        return false;
+    }
     let Some(c) = ctx() else {
         moe_block_refused("ctx");
         return false;
