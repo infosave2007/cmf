@@ -23,18 +23,24 @@ because the point is to exercise OUR converter and loader, not a framework.
 """
 import json, struct, math, sys, os
 
-D          = 64      # hidden_size
-NH         = 2       # num_attention_heads
-HD         = 32      # head_dim   (NOT hidden/heads — that is the point)
-RD         = 8       # qk_rope_head_dim
+# Sizes are env-overridable so the same generator serves both roles: a
+# few-second smoke checkpoint, and one big enough that a conversion can be
+# interrupted mid-flight to test --resume.
+def _env(name, default):
+    return int(os.environ.get(name, default))
+
+D          = _env("TOY_D", 64)        # hidden_size
+NH         = 2                        # num_attention_heads
+HD         = 32                       # head_dim (NOT hidden/heads — the point)
+RD         = 8                        # qk_rope_head_dim
 QLORA      = 16
 OLORA      = 16
 OGROUPS    = 2
-NLAYERS    = 4
-NHASH      = 2       # layers 0..1 route by table
-NEXP       = 8
+NLAYERS    = _env("TOY_LAYERS", 4)
+NHASH      = 2                        # layers 0..1 route by table
+NEXP       = _env("TOY_EXPERTS", 8)
 TOPK       = 2
-MOE_INTER  = 32
+MOE_INTER  = _env("TOY_INTER", 32)
 VOCAB      = 128
 HC         = 4
 RATIO_MAP  = {2: 4, 3: 8}      # layer -> compress_ratio (4 => overlapping)
@@ -115,21 +121,42 @@ for li in range(NLAYERS):
     put(f"{p}.ffn.shared_experts.w2.weight", [D, MOE_INTER], nx())
 
 out = sys.argv[1]
+# A second argument shards the checkpoint, which is what exercises the
+# converter's per-shard resume — a single file has nothing to resume from.
+nshards = int(sys.argv[2]) if len(sys.argv) > 2 else 1
 os.makedirs(out, exist_ok=True)
 
-header, blob, off = {}, bytearray(), 0
-for name, (shape, data) in tensors.items():
-    raw = struct.pack(f"<{len(data)}f", *data)
-    header[name] = {"dtype": "F32", "shape": shape, "data_offsets": [off, off + len(raw)]}
-    blob += raw
-    off += len(raw)
-hj = json.dumps(header).encode()
-pad = (-len(hj)) % 8
-hj += b" " * pad
-with open(os.path.join(out, "model.safetensors"), "wb") as f:
-    f.write(struct.pack("<Q", len(hj)))
-    f.write(hj)
-    f.write(blob)
+def write_shard(path, items):
+    header, blob, off = {}, bytearray(), 0
+    for name, (shape, data) in items:
+        raw = struct.pack(f"<{len(data)}f", *data)
+        header[name] = {"dtype": "F32", "shape": shape, "data_offsets": [off, off + len(raw)]}
+        blob += raw
+        off += len(raw)
+    hj = json.dumps(header).encode()
+    hj += b" " * ((-len(hj)) % 8)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(hj)))
+        f.write(hj)
+        f.write(blob)
+
+items = list(tensors.items())
+if nshards <= 1:
+    write_shard(os.path.join(out, "model.safetensors"), items)
+else:
+    per = -(-len(items) // nshards)
+    wmap = {}
+    for i in range(nshards):
+        chunk = items[i * per:(i + 1) * per]
+        if not chunk:
+            continue
+        fn = f"model-{i + 1:05d}-of-{nshards:05d}.safetensors"
+        write_shard(os.path.join(out, fn), chunk)
+        for name, _ in chunk:
+            wmap[name] = fn
+    json.dump({"metadata": {"total_size": sum(
+        4 * len(d) for _, (_, d) in items)}, "weight_map": wmap},
+        open(os.path.join(out, "model.safetensors.index.json"), "w"))
 
 json.dump({
     "model_type": "deepseek_v4",

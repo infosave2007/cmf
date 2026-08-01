@@ -740,6 +740,14 @@ fn stream_writer_resumes_from_its_manifest_after_a_crash() {
         for (name, data) in &payloads {
             w.push(name, TensorDtype::Q8Row, &[8, 64], data).unwrap();
         }
+        // A milestone the producer noted; resume must hand it back so the
+        // restart can skip the source work behind it.
+        w.mark("shard-0").unwrap();
+        // Tensors written AFTER the last mark belong to an interrupted
+        // shard. They must not survive the resume: the redo writes them
+        // again, and keeping both would duplicate them in the blob.
+        w.push("after.the.mark", TensorDtype::F32, &[4], &[0u8; 16])
+            .unwrap();
         // Writer dropped without finish() — the head was never written.
     }
     let unfinished = CmfModel::open(&path);
@@ -748,13 +756,22 @@ fn stream_writer_resumes_from_its_manifest_after_a_crash() {
         "a file with no head must not open as a valid model"
     );
 
-    let (w2, names) = CmfStreamWriter::resume(&path, &man).unwrap();
-    assert_eq!(names.len(), payloads.len(), "manifest lost tensors");
+    let (w2, st) = CmfStreamWriter::resume(&path, &man).unwrap();
+    assert_eq!(st.names.len(), payloads.len(), "manifest lost tensors");
+    assert_eq!(st.marks, vec!["shard-0".to_string()], "the mark did not survive");
+    assert!(
+        !st.names.contains(&"after.the.mark".to_string()),
+        "a tensor written past the last mark was kept"
+    );
     assert_eq!(w2.tensor_count(), payloads.len());
     w2.finish(&tiny_header(), None, None).unwrap();
 
     let m = CmfModel::open(&path).unwrap();
     assert!(m.verify().is_empty(), "rescued file failed verify()");
+    assert!(
+        m.tensor("after.the.mark").is_none(),
+        "the rolled-back tensor came back"
+    );
     for (name, data) in &payloads {
         assert_eq!(
             m.tensor_bytes(name).unwrap(),

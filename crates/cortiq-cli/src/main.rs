@@ -273,6 +273,14 @@ enum Commands {
         /// (e.g. GatedDeltaNet) may need 5.5–6 to stay coherent.
         #[arg(long, default_value = "4.25")]
         mean_bits: f32,
+        /// Continue a conversion that was interrupted. Keeps the payloads
+        /// already in <output> and skips every source shard its manifest
+        /// records as done — the download included, which is where a
+        /// restart otherwise spends its hours. Without the manifest
+        /// (<output>.manifest) there is nothing to resume from and the
+        /// conversion starts over.
+        #[arg(long)]
+        resume: bool,
         /// Physically defragment (Patent 2 claims 9/10): drop pruned FFN
         /// neurons so they are neither stored nor computed. Points at a
         /// skill dir with baked FFN overlays (tensors/*.npy) and/or a
@@ -985,6 +993,7 @@ async fn main() -> anyhow::Result<()> {
             output,
             hf_token,
             mean_bits,
+            resume,
             defrag,
             o1,
             o1_m,
@@ -1020,6 +1029,7 @@ async fn main() -> anyhow::Result<()> {
                 hf_token.as_deref(),
                 defrag.as_deref(),
                 o1_hint,
+                resume,
                 progress_reporter("converting"),
             )?;
             println!("✓ wrote {output}");

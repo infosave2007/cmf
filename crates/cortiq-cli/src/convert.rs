@@ -1488,6 +1488,8 @@ pub(crate) struct SafeTensors {
     mmap: memmap2::Mmap,
     data_start: usize,
     pub(crate) tensors: Vec<TensorMeta>,
+    /// File name, so a resumed conversion can tell which of these are done.
+    pub(crate) name: String,
 }
 
 impl SafeTensors {
@@ -1535,6 +1537,10 @@ fn open_safetensors(path: &Path) -> anyhow::Result<SafeTensors> {
         mmap,
         data_start,
         tensors,
+        name: path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
     })
 }
 
@@ -2843,6 +2849,10 @@ pub fn run_convert(
     // O(1) Nyström runtime hint (`--o1`): recorded in header provenance,
     // weights untouched — the runtime resolves it at load (loader.rs).
     o1_hint: Option<serde_json::Value>,
+    // Continue a conversion that died: the payloads already in `output` are
+    // kept, and every source shard the manifest marks done is skipped —
+    // download included, which is where the hours are.
+    resume: bool,
     mut progress: impl FnMut(f32),
 ) -> anyhow::Result<()> {
     let quant = parse_quant(quant)?;
@@ -2916,9 +2926,26 @@ pub fn run_convert(
     // payloads are never held twice — not in RAM and not on disk.
     let head_reserve = cortiq_core::format::CmfStreamWriter::head_reserve_for(2 * total.max(4096), 96);
     let manifest_path = format!("{output}.manifest");
-    let mut writer = cortiq_core::format::CmfStreamWriter::new(output, head_reserve)
-        .and_then(|w| w.with_manifest(&manifest_path))
-        .map_err(|e| anyhow::anyhow!("create {output}: {e}"))?;
+    let mut done_shards: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let resuming = resume
+        && std::path::Path::new(&manifest_path).exists()
+        && std::path::Path::new(output).exists();
+    let mut writer = if resuming {
+        let (w, st) = cortiq_core::format::CmfStreamWriter::resume(output, &manifest_path)
+            .map_err(|e| anyhow::anyhow!("resume {output}: {e}"))?;
+        done_shards = st.marks.into_iter().collect();
+        tracing::info!(
+            "resuming: {} tensors already written, {} source shards done",
+            st.names.len(),
+            done_shards.len()
+        );
+        w.appending_manifest(&manifest_path)
+            .map_err(|e| anyhow::anyhow!("resume {output}: {e}"))?
+    } else {
+        cortiq_core::format::CmfStreamWriter::new(output, head_reserve)
+            .and_then(|w| w.with_manifest(&manifest_path))
+            .map_err(|e| anyhow::anyhow!("create {output}: {e}"))?
+    };
     let mut tensors: Vec<TensorSpec> = Vec::with_capacity(total);
     let mut done = 0usize;
     // Tiny cross-shard tensors (gemma-4 router.scale, ~128 f32 each):
@@ -3579,6 +3606,11 @@ pub fn run_convert(
             .build();
         let ns = stream_shards.len().max(1);
         for (si, sname) in stream_shards.iter().enumerate() {
+            if done_shards.contains(sname) {
+                eprintln!("  [stream {}/{}] {sname} — уже в файле, пропуск", si + 1, ns);
+                progress((si as f32 + 1.0) / ns as f32);
+                continue;
+            }
             eprintln!("  [stream {}/{}] {sname}", si + 1, ns);
             fetch(
                 &agent,
@@ -3598,12 +3630,29 @@ pub fn run_convert(
             // that is what keeps residency at one shard instead of the
             // whole model.
             drain_to_writer(&mut tensors, &mut writer)?;
+            // Only now is this shard's work durable in the output file.
+            writer
+                .mark(sname)
+                .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
             drop(one);
             let _ = fs::remove_file(dir.join(sname));
         }
     } else {
         for file in &files {
+            if done_shards.contains(&file.name) {
+                eprintln!("  [{}] уже в файле, пропуск", file.name);
+                done += file.tensors.len();
+                progress(done as f32 / total as f32);
+                continue;
+            }
             process_file(file, &files, &mut tensors, &mut done, total, &mut progress)?;
+            // Marking per source file gives a local conversion the same
+            // resumability as a streamed one; the payloads have to reach the
+            // output first, so the drain comes before the mark.
+            drain_to_writer(&mut tensors, &mut writer)?;
+            writer
+                .mark(&file.name)
+                .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
         }
     }
 
@@ -4818,6 +4867,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             |_| {},
         )
         .unwrap();

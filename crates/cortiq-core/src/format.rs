@@ -1100,6 +1100,13 @@ fn zeros(n: usize) -> Vec<u8> {
 /// until the last tensor arrives. [`CmfStreamWriter::finish`] therefore
 /// refuses loudly if the head does not fit rather than truncating it, and
 /// [`CmfStreamWriter::head_reserve_for`] gives callers a safe estimate.
+/// What a resumed writer recovers from its manifest: the tensors already on
+/// disk and any milestones the producer noted.
+pub struct ResumeState {
+    pub names: Vec<String>,
+    pub marks: Vec<String>,
+}
+
 pub struct CmfStreamWriter {
     file: BufWriter<File>,
     path: PathBuf,
@@ -1219,6 +1226,15 @@ impl CmfStreamWriter {
         Ok(self)
     }
 
+    /// Keep recording into an existing manifest — for a writer from
+    /// [`CmfStreamWriter::resume`], whose earlier lines must survive.
+    pub fn appending_manifest(mut self, path: impl AsRef<Path>) -> Result<Self, CmfError> {
+        self.manifest = Some(BufWriter::new(
+            std::fs::OpenOptions::new().append(true).open(path)?,
+        ));
+        Ok(self)
+    }
+
     /// Rebuild a writer over an output file whose payloads are already on
     /// disk, from the manifest that recorded them. The file is reopened for
     /// writing without truncation and the cursor is placed after the last
@@ -1226,7 +1242,7 @@ impl CmfStreamWriter {
     pub fn resume(
         path: impl AsRef<Path>,
         manifest: impl AsRef<Path>,
-    ) -> Result<(Self, Vec<String>), CmfError> {
+    ) -> Result<(Self, ResumeState), CmfError> {
         let path = path.as_ref().to_path_buf();
         let text = std::fs::read_to_string(manifest.as_ref())?;
         let mut lines = text.lines();
@@ -1241,6 +1257,8 @@ impl CmfStreamWriter {
 
         let mut entries = Vec::new();
         let mut names = Vec::new();
+        let mut marks = Vec::new();
+        let (mut safe_upto, mut safe_entries) = (0u64, 0usize);
         for (i, line) in lines.enumerate() {
             if line.trim().is_empty() {
                 continue;
@@ -1251,6 +1269,16 @@ impl CmfStreamWriter {
                 tracing::warn!("manifest line {} is truncated — ignoring it", i + 2);
                 break;
             };
+            if let Some(mark) = v["mark"].as_str() {
+                marks.push(mark.to_string());
+                // Everything up to here is durable; anything the manifest
+                // records after the LAST mark belongs to a shard that was
+                // interrupted and will be redone, so it must not be kept —
+                // otherwise the redo appends those tensors a second time.
+                safe_upto = v["at"].as_u64().unwrap_or(0);
+                safe_entries = entries.len();
+                continue;
+            }
             let dtype = TensorDtype::from_id(v["dtype"].as_u64().unwrap_or(0) as u8)
                 .ok_or_else(|| CmfError::Parse(format!("manifest line {}: dtype", i + 2)))?;
             let name = v["name"].as_str().unwrap_or_default().to_string();
@@ -1268,11 +1296,18 @@ impl CmfStreamWriter {
                 hash: v["hash"].as_u64().unwrap_or(0),
             });
         }
-        let cursor = entries.last().map(|e| e.off + e.nbytes).unwrap_or(0);
+        entries.truncate(safe_entries);
+        names.truncate(safe_entries);
+        let cursor = safe_upto;
+        debug_assert_eq!(
+            entries.last().map(|e| e.off + e.nbytes).unwrap_or(0),
+            cursor,
+            "the last mark disagrees with the entries before it"
+        );
         let on_disk = std::fs::metadata(&path)?.len();
         if on_disk < data_off + cursor {
             return Err(CmfError::Bounds(format!(
-                "{} is {on_disk} bytes but the manifest describes {} — \
+                "{} is {on_disk} bytes but its last checkpoint claims {} — \
                  the file is shorter than its own record",
                 path.display(),
                 data_off + cursor
@@ -1289,8 +1324,29 @@ impl CmfStreamWriter {
                 entries,
                 manifest: None,
             },
-            names,
+            ResumeState { names, marks },
         ))
+    }
+
+    /// Note a milestone in the manifest — a source shard fully consumed, say.
+    /// Resume reads these back, which is what lets a restart skip work whose
+    /// payloads are already in the file rather than only skipping tensors it
+    /// happens to recognise by name.
+    pub fn mark(&mut self, note: &str) -> Result<(), CmfError> {
+        // The payloads must be on disk BEFORE the mark claims they are.
+        // Without this the manifest runs ahead of a buffered writer, and a
+        // kill in between leaves a record of bytes that were never written.
+        self.file.flush()?;
+        if let Some(m) = self.manifest.as_mut() {
+            writeln!(
+                m,
+                "{{\"mark\":{},\"at\":{}}}",
+                serde_json::to_string(note).unwrap_or_default(),
+                self.cursor
+            )?;
+            m.flush()?;
+        }
+        Ok(())
     }
 
     pub fn tensor_count(&self) -> usize {
