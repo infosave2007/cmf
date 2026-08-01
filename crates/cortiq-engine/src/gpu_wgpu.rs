@@ -17385,6 +17385,8 @@ pub fn dsv4_moe_frame(
                     bind_buf(5, &mwt),
                     bind_buf(6, &mcnt),
                     bind_buf(7, &rp),
+                    bind_buf(8, &rmb),
+                    bind_buf(9, &coldb),
                 ],
             })
         });
