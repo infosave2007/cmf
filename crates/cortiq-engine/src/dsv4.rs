@@ -1269,6 +1269,41 @@ pub fn moe_step(
         if ok {
             if let Some(m) = model_ref.as_ref() {
                 if crate::gpu::moe_block(m, &jobs, out) {
+                    // CMF_DSV4_GPU_CHECK=1 recomputes the same block on the
+                    // CPU and reports the divergence. A GPU MoE that is wrong
+                    // does not fail — it answers differently — so the only way
+                    // to know is to ask both.
+                    if std::env::var("CMF_DSV4_GPU_CHECK").is_ok() {
+                        let mut want = vec![0.0f32; out.len()];
+                        let mut acc = vec![0.0f32; cfg.dim];
+                        for (e, &ei) in idx.iter().enumerate() {
+                            let Some(exp) = l.experts.get(ei) else { continue };
+                            run_expert(
+                                hidden, exp, cfg,
+                                w.get(e).copied().unwrap_or(0.0), pool, &mut acc,
+                            );
+                            for (o, a) in want.iter_mut().zip(&acc) {
+                                *o += a;
+                            }
+                        }
+                        run_expert(hidden, &l.shared, cfg, 1.0, pool, &mut acc);
+                        for (o, a) in want.iter_mut().zip(&acc) {
+                            *o += a;
+                        }
+                        let num: f32 = want
+                            .iter()
+                            .zip(out.iter())
+                            .map(|(a, b)| (a - b) * (a - b))
+                            .sum();
+                        let den: f32 = want.iter().map(|a| a * a).sum::<f32>().max(1e-20);
+                        eprintln!(
+                            "[dsv4-gpu] слой {li}: расхождение {:.3e} | |CPU|={:.5} |GPU|={:.5} | экспертов {}",
+                            (num / den).sqrt(),
+                            den.sqrt(),
+                            out.iter().map(|x| x * x).sum::<f32>().sqrt(),
+                            jobs.len()
+                        );
+                    }
                     return;
                 }
             }
