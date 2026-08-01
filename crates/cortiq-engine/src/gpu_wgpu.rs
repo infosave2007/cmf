@@ -15888,6 +15888,10 @@ pub fn dsv4_attn_frame(
     w: &Dsv4AttnW,
     g: Dsv4AttnGeom,
     hidden: &[f32],
+    // The layer's own `q_norm(wq_a(x))`, when the caller already has it — the
+    // indexer needs that vector on the host anyway, and computing it twice is
+    // worse than uploading 1536 floats. `None` puts both ops in the frame.
+    qn_in: Option<&[f32]>,
     kv_id: u64,
     li: usize,
     idxs: &[u32],
@@ -15953,6 +15957,11 @@ pub fn dsv4_attn_frame(
         }
     };
 
+    if let Some(v) = qn_in {
+        if v.len() < g.q_lora {
+            no!("готовый qn короче q_lora: {} < {}", v.len(), g.q_lora);
+        }
+    }
     let hb = storage_bytes(c, bytemuck::cast_slice(&hidden[..g.dim]));
     let qnw = storage_bytes(c, bytemuck::cast_slice(&w.q_norm[..g.q_lora]));
     let sink = storage_bytes(c, bytemuck::cast_slice(&w.sink[..g.nh]));
@@ -15964,7 +15973,16 @@ pub fn dsv4_attn_frame(
     // instead of the output. Eight verified kernels can still be wired wrong,
     // and a single number at the end says only that they were.
     let qr = rw_f32(c, g.q_lora, true);
-    let qn = rw_f32(c, g.q_lora, true);
+    let qn = match qn_in {
+        Some(v) => c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("dsv4-qn"),
+                contents: bytemuck::cast_slice(&v[..g.q_lora]),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            }),
+        None => rw_f32(c, g.q_lora, true),
+    };
     let q = rw_f32(c, g.nh * g.hd, true);
     let attn = rw_f32(c, g.nh * g.hd, true);
     let mid = rw_f32(c, g.o_groups * g.o_lora, true);
@@ -15975,8 +15993,10 @@ pub fn dsv4_attn_frame(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("dsv4-attn"),
         });
-    encode_q4tp_mv1(c, &mut enc, &wb[0], &hb, &qr, g.q_lora, g.dim);
-    encode_rmsnorm(c, &mut enc, &qr, &qnw, &qn, g.q_lora, g.eps);
+    if qn_in.is_none() {
+        encode_q4tp_mv1(c, &mut enc, &wb[0], &hb, &qr, g.q_lora, g.dim);
+        encode_rmsnorm(c, &mut enc, &qr, &qnw, &qn, g.q_lora, g.eps);
+    }
     encode_q4tp_mv1(c, &mut enc, &wb[1], &qn, &q, g.nh * g.hd, g.q_lora);
     encode_rope_heads(
         c, &mut enc, &q, &freq, &posb, g.nh, g.hd, g.rd, true, false,

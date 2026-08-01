@@ -824,11 +824,18 @@ pub struct Dsv4State {
     pub prev_ix_kv: Vec<Vec<f32>>,
     pub prev_ix_score: Vec<Vec<f32>>,
     pub pos: usize,
+    /// Identifies this sequence's caches on the device. A fresh state gets a
+    /// fresh id, so a device buffer left over from the previous conversation
+    /// can never be read as if it belonged to this one.
+    pub kv_id: u64,
 }
 
 impl Dsv4State {
     pub fn new(layers: usize) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
         Self {
+            kv_id: NEXT.fetch_add(1, Ordering::Relaxed),
             window: vec![Vec::new(); layers],
             compressed: vec![Vec::new(); layers],
             index_kv: vec![Vec::new(); layers],
@@ -927,6 +934,113 @@ fn compressor_step(
     Some(folded)
 }
 
+/// `CMF_DSV4_GPU_ATTN=1` moves the attention block onto the device as one
+/// submission. Off by default: it needs every attention weight in q4tp and a
+/// working wgpu context, and a frame that declines mid-layer after the state
+/// has been advanced would be worse than one that never ran.
+fn gpu_attn_enabled() -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("CMF_DSV4_GPU_ATTN").map(|v| v != "0").unwrap_or(false)
+                && crate::gpu::backend_available()
+        })
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        false
+    }
+}
+
+/// The device half of `attention_step`. Returns false — having changed
+/// nothing — whenever it cannot do the whole block, so the caller's CPU path
+/// is still correct to run.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn attn_frame(
+    l: &Dsv4Layer,
+    cfg: &Dsv4Cfg,
+    st: &Dsv4State,
+    li: usize,
+    qn: &[f32],
+    idxs: &[usize],
+    inv_freq: &[f32],
+    pos: usize,
+    win_len: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> bool {
+    let hd = cfg.head_dim;
+    let (Some(wq_a), Some(wq_b), Some(wo_a), Some(wo_b)) = (
+        l.wq_a.model_idx(),
+        l.wq_b.model_idx(),
+        l.wo_a.model_idx(),
+        l.wo_b.model_idx(),
+    ) else {
+        return false;
+    };
+    let Some(model) = l.wq_b.model_arc() else {
+        return false;
+    };
+    // Fixed window region, then the compressed tail — so a token writes one
+    // window slot's worth of movement and whatever the compressor just added,
+    // not the whole cache. `cap` has to cover the longest run this sequence
+    // will reach; the compressed axis grows by one entry per `ratio` tokens.
+    let n_comp = st.compressed[li].len() / hd;
+    let cap = (cfg.window + n_comp.next_power_of_two().max(64)) * hd;
+    let kv_id = st.kv_id;
+    if !crate::gpu_wgpu::dsv4_cache_write(kv_id, li, 0, &st.window[li], cap) {
+        return false;
+    }
+    if n_comp > 0
+        && !crate::gpu_wgpu::dsv4_cache_write(
+            kv_id,
+            li,
+            cfg.window * hd,
+            &st.compressed[li],
+            cap,
+        )
+    {
+        return false;
+    }
+    let _ = win_len;
+    let idx32: Vec<u32> = idxs.iter().map(|&p| p as u32).collect();
+    let w = crate::gpu_wgpu::Dsv4AttnW {
+        wq_a,
+        wq_b,
+        wo_a,
+        wo_b,
+        q_norm: &l.q_norm,
+        sink: &l.attn_sink,
+    };
+    let g = crate::gpu_wgpu::Dsv4AttnGeom {
+        dim: cfg.dim,
+        nh: cfg.n_heads,
+        hd,
+        rd: cfg.rope_head_dim,
+        q_lora: cfg.q_lora_rank,
+        o_lora: cfg.o_lora_rank,
+        o_groups: cfg.o_groups,
+        eps: cfg.norm_eps,
+        scale,
+    };
+    crate::gpu_wgpu::dsv4_attn_frame(
+        &model,
+        &w,
+        g,
+        &[],
+        Some(qn),
+        kv_id,
+        li,
+        &idx32,
+        inv_freq,
+        pos,
+        out,
+    )
+}
+
 pub fn attention_step(
     hidden: &[f32],
     l: &Dsv4Layer,
@@ -952,12 +1066,18 @@ pub fn attention_step(
     let mut qr = vec![0.0f32; cfg.q_lora_rank];
     l.wq_a.matvec(hidden, &mut qr, pool);
     rms_weighted(&mut qr, &l.q_norm, cfg.norm_eps);
-    let mut q = vec![0.0f32; cfg.n_heads * hd];
-    l.wq_b.matvec(&qr, &mut q, pool);
-    for h in 0..cfg.n_heads {
-        let head = &mut q[h * hd..(h + 1) * hd];
-        rms_inplace(head, cfg.norm_eps);
-        rope_tail(head, inv_freq, pos, rd, false);
+    // The frame picks up from here, so the queries are built only if it does
+    // not. `qr` itself is kept either way: the indexer reads it.
+    let on_gpu = gpu_attn_enabled();
+    let mut q = Vec::new();
+    if !on_gpu {
+        q = vec![0.0f32; cfg.n_heads * hd];
+        l.wq_b.matvec(&qr, &mut q, pool);
+        for h in 0..cfg.n_heads {
+            let head = &mut q[h * hd..(h + 1) * hd];
+            rms_inplace(head, cfg.norm_eps);
+            rope_tail(head, inv_freq, pos, rd, false);
+        }
     }
 
     // ── kv: one head's width, shared by every query head ──
@@ -1037,9 +1157,12 @@ pub fn attention_step(
         st.window[li].drain(..drop);
     }
     let win_len = st.window[li].len() / hd;
-    let mut cache: Vec<f32> = st.window[li].clone();
-    cache.extend_from_slice(&st.compressed[li]);
-    let n_pos = cache.len() / hd;
+    let mut cache: Vec<f32> = Vec::new();
+    if !on_gpu {
+        cache = st.window[li].clone();
+        cache.extend_from_slice(&st.compressed[li]);
+    }
+    let n_pos = win_len + st.compressed[li].len() / hd;
 
     // Index list: every window position, plus whatever the indexer picked
     // (or, without an indexer, every compressed position).
@@ -1096,15 +1219,27 @@ pub fn attention_step(
                 );
                 let mut picked = Vec::new();
                 top_k_positions(&sc, cfg.index_topk, &mut picked);
-                idxs.extend(picked.into_iter().map(|p| win_len + p));
+                let base = if on_gpu { cfg.window } else { win_len };
+                idxs.extend(picked.into_iter().map(|p| base + p));
             }
-            None => idxs.extend((0..n_comp).map(|p| win_len + p)),
+            None => {
+                let base = if on_gpu { cfg.window } else { win_len };
+                idxs.extend((0..n_comp).map(|p| base + p))
+            }
         }
     }
-    debug_assert!(idxs.iter().all(|&p| p < n_pos));
+    debug_assert!(on_gpu || idxs.iter().all(|&p| p < n_pos));
 
     // ── sparse attention per head, then the inverse rope ──
     let scale = (hd as f32).powf(-0.5);
+    #[cfg(feature = "gpu")]
+    if on_gpu
+        && attn_frame(
+            l, cfg, st, li, &qr, &idxs, inv_freq, pos, win_len, scale, out,
+        )
+    {
+        return;
+    }
     let mut attn = vec![0.0f32; cfg.n_heads * hd];
     for h in 0..cfg.n_heads {
         let qh = &q[h * hd..(h + 1) * hd];

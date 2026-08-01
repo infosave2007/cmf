@@ -396,6 +396,28 @@ impl QTensor {
         }
     }
 
+    /// The tensor's index in the model directory, when it is mapped from one.
+    /// The GPU frames bind by index rather than by name — a name lookup per
+    /// layer per token is not free, and the index is what the device cache is
+    /// keyed on anyway.
+    pub fn model_idx(&self) -> Option<usize> {
+        match self {
+            Self::Mapped { idx, .. } => Some(*idx),
+            _ => None,
+        }
+    }
+
+    /// The model this tensor is mapped from, when it is mapped at all. The
+    /// GPU frames need the container to reach the bytes; a QTensor already
+    /// holds it, and threading a second handle down every call site to say
+    /// the same thing invites the two to disagree.
+    pub fn model_arc(&self) -> Option<std::sync::Arc<cortiq_core::CmfModel>> {
+        match self {
+            Self::Mapped { model, .. } => Some(model.clone()),
+            _ => None,
+        }
+    }
+
     pub fn rows(&self) -> usize {
         match self {
             Self::F32 { rows, .. } | Self::Mapped { rows, .. } => *rows,

@@ -166,7 +166,7 @@ fn the_fused_attention_block_matches_the_cpu() {
         }
         let mut got = vec![0.0f32; nh * hd + dim];
         if !gpu_wgpu::dsv4_attn_frame(
-            &model, &w, g, &hidden, 7, 0, &idxs, &inv_freq, pos, &mut got,
+            &model, &w, g, &hidden, None, 7, 0, &idxs, &inv_freq, pos, &mut got,
         ) {
             eprintln!("кадр отклонён устройством — пропуск");
             return;
@@ -178,7 +178,9 @@ fn the_fused_attention_block_matches_the_cpu() {
         let name = if tap.is_empty() { "выход" } else { tap };
         println!("  {name:>5}: {rel:.3e}");
         worst = worst.max(rel);
-        assert!(rel < 5e-3, "ступень {name} разошлась на {rel:.3e}");
+        // 1e-4, not 5e-3: on the exact contract the stages land at 1e-6, and
+        // a threshold loose enough to pass an actual wiring fault is decoration.
+        assert!(rel < 1e-4, "ступень {name} разошлась на {rel:.3e}");
     }
     println!("сшитый блок внимания: худшая ступень {worst:.3e}");
     gpu_wgpu::dsv4_cache_clear(7);
