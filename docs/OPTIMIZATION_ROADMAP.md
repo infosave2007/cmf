@@ -89,7 +89,65 @@ target, not the decode.
 
 ---
 
-## 7. DeepSeek-V4-Flash: ported, unproven
+## 7. DeepSeek-V4-Flash: ported, and now proven
+
+**Numerical parity established (01.08).** `tools/dsv4_ref.py` transcribes the
+reference forward into NumPy — the upstream one cannot be run here, its
+attention is a tilelang kernel wanting CUDA and the model is 304B — and
+diffs it against the port layer by layer on a toy checkpoint with the
+release's real tensor names. Worst divergence over a ten-token run: 1.6e-3,
+against an f16 quantization floor of 2.2e-4 on the embedding alone.
+
+It found the bug that had defeated a night of gate-passing: **RoPE paired
+the wrong coordinates.** The reference forms complex numbers with
+`unflatten(-1, (-1, 2))` + `view_as_complex` — adjacent pairs (x0,x1),
+(x2,x3) — and we rotated (x_i, x_{i+half}). The two are IDENTICAL at
+position 0, where the rotation is the identity, and differ at every other
+position.
+
+What that cost, and what fixing it returned:
+
+| tokens scored | 16 | 32 | 64 | 128 | 200 |
+|---|---|---|---|---|---|
+| half-split pairing | 22.7 | 48.4 | 57.1 | 76.6 | 189 |
+| adjacent pairing | 14.6 | 12.3 | 6.8 | **4.9** | **5.1** |
+
+Perplexity that RISES with length is the signature: the model was answering
+from the last few tokens and losing everything else. It now falls with
+length, as a model using its context does. "2 + 2" went from 2 to 4;
+"a train leaves at 3pm and takes 2 hours" now answers 5 PM and explains why.
+
+**The lesson, and it generalises:** every check that passes at position 0
+passes for both conventions. Short prompts, single-token tests, unit tests
+on one vector — all blind to it. The first measurement that could see it was
+a layer-by-layer diff at position ≥ 1, and it took writing the reference to
+get one. For a new architecture, that harness is not the last step; it is
+the one that makes the others mean something.
+
+Two more bugs fell out of building it: `o_groups` was pinned to 8 in the
+loader (derivable from `wo_a`'s shape — the pin was right only for the
+release), and the rope tail is `qk_rope_head_dim`, not a guess from
+`head_dim`.
+
+**The weights were never wrong.** Both published variants decode correctly
+with the fixed engine; nothing needed re-converting.
+
+## 7a. What the same night cost in wrong conclusions
+
+Worth recording, because each was stated with confidence and each was wrong:
+
+- "The compressed-KV path is correct and load-bearing" — from an A/B run on
+  code where the ratio-4 layers never populated that cache at all.
+- "2 bits is below what this checkpoint tolerates" — from generations
+  produced with the rope bug active, which degrades exactly the same way.
+- "Perplexity 210 means the 4-bit variant is damaged" — measured without
+  the BOS token this model requires, and through a scoring path that read
+  a zero hidden instead of the logits the architecture returns out of band.
+
+The common thread: a measurement taken in a condition known to break the
+model, reported as a property of the model.
+
+## 7b. Original notes on the conversion
 
 The converter reads this model end to end — FP8 E4M3 with 128×128 block
 scales (our decoder matched `torch.float8_e4m3fn` bit for bit on its own
