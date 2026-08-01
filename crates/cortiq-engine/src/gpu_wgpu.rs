@@ -4694,6 +4694,204 @@ fn o_lora_a(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// ── The KV compressor's pooling step (DeepSeek-V4) ──────────────────────────
+//
+// A softmax over the slot axis taken PER DIMENSION — not per token — then the
+// weighted sum. Both compressors end here; they differ only in how the slots
+// are gathered, so the gather lives inside the kernel and the graph never has
+// to materialise the interleaved copy the CPU builds.
+//
+// Overlapping (ratio 4 in the release): each token contributes 2*width
+// values, the first half belonging to the window that began half a stride
+// earlier. Fold time pools 2*ratio slots — the previous window's taking their
+// first half, the current window's taking their second. A missing previous
+// window votes with -inf, which is also how a whole column of absent slots
+// leaves the output at zero instead of dividing by nothing.
+
+struct KpP { slots: u32, width: u32, ratio: u32, flags: u32 };
+// flags: 1 = overlapping, 2 = a previous window exists, 4 = add the APE bias
+
+@group(0) @binding(0) var<storage, read>       kp_pkv : array<f32>;
+@group(0) @binding(1) var<storage, read>       kp_psc : array<f32>;
+@group(0) @binding(2) var<storage, read>       kp_ckv : array<f32>;
+@group(0) @binding(3) var<storage, read>       kp_csc : array<f32>;
+@group(0) @binding(4) var<storage, read>       kp_ape : array<f32>;
+@group(0) @binding(5) var<storage, read_write> kp_out : array<f32>;
+@group(0) @binding(6) var<uniform>             kp_p   : KpP;
+
+const KP_NINF: f32 = -3.0e38;
+
+@compute @workgroup_size(256)
+fn kv_pool(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let d = gid.x;
+    let w = kp_p.width;
+    if (d >= w) { return; }
+    let slots = kp_p.slots;
+    let r = kp_p.ratio;
+    let overlap = (kp_p.flags & 1u) != 0u;
+    let have_prev = (kp_p.flags & 2u) != 0u;
+    let use_ape = (kp_p.flags & 4u) != 0u;
+
+    // Pass one: the maximum, so the exponentials cannot overflow. A column
+    // that is entirely absent stays at -inf and the slot is left at zero.
+    var mx = KP_NINF;
+    for (var t = 0u; t < slots; t = t + 1u) {
+        var sc = KP_NINF;
+        if (overlap) {
+            if (t < r) {
+                if (have_prev) { sc = kp_psc[t * 2u * w + d]; }
+            } else {
+                sc = kp_csc[(t - r) * 2u * w + w + d];
+            }
+        } else {
+            sc = kp_csc[t * w + d];
+            if (use_ape) { sc = sc + kp_ape[t * w + d]; }
+        }
+        mx = max(mx, sc);
+    }
+    if (mx <= KP_NINF) { kp_out[d] = 0.0; return; }
+
+    var den = 0.0;
+    var acc = 0.0;
+    for (var t = 0u; t < slots; t = t + 1u) {
+        var sc = KP_NINF;
+        var kv = 0.0;
+        if (overlap) {
+            if (t < r) {
+                if (have_prev) {
+                    sc = kp_psc[t * 2u * w + d];
+                    kv = kp_pkv[t * 2u * w + d];
+                }
+            } else {
+                sc = kp_csc[(t - r) * 2u * w + w + d];
+                kv = kp_ckv[(t - r) * 2u * w + w + d];
+            }
+        } else {
+            sc = kp_csc[t * w + d];
+            if (use_ape) { sc = sc + kp_ape[t * w + d]; }
+            kv = kp_ckv[t * w + d];
+        }
+        if (sc > KP_NINF) {
+            let e = exp(sc - mx);
+            den = den + e;
+            acc = acc + e * kv;
+        }
+    }
+    if (den <= 0.0) { kp_out[d] = 0.0; return; }
+    kp_out[d] = acc / den;
+}
+
+// ── The sparse indexer: scores, then the top-k (DeepSeek-V4) ────────────────
+//
+// The relu comes BEFORE the per-head weighting, so a head can vote for a
+// position or abstain but never against it. Getting that order wrong produces
+// scores that look reasonable and a top-k that is quietly different.
+
+struct IxP { nh: u32, hd: u32, n_pos: u32, limit: u32 };
+
+@group(0) @binding(0) var<storage, read>       ix_q   : array<f32>;   // nh*hd
+@group(0) @binding(1) var<storage, read>       ix_kv  : array<f32>;   // n_pos*hd
+@group(0) @binding(2) var<storage, read>       ix_w   : array<f32>;   // nh
+@group(0) @binding(3) var<storage, read_write> ix_out : array<f32>;   // n_pos
+@group(0) @binding(4) var<uniform>             ix_p   : IxP;
+
+var<workgroup> ix_red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn index_scores(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32) {
+    let t = wid.x;
+    if (t >= ix_p.n_pos) { return; }
+    if (t >= ix_p.limit) {
+        if (lid == 0u) { ix_out[t] = KP_NINF; }
+        return;
+    }
+    let hd = ix_p.hd;
+    let kb = t * hd;
+    // One lane per head: the relu makes the heads non-additive before their
+    // weights, so a head's dot has to be finished by whoever owns it.
+    var acc = 0.0;
+    var h = lid;
+    loop {
+        if (h >= ix_p.nh) { break; }
+        var dot = 0.0;
+        let qb = h * hd;
+        for (var i = 0u; i < hd; i = i + 1u) {
+            dot = dot + ix_q[qb + i] * ix_kv[kb + i];
+        }
+        acc = acc + max(dot, 0.0) * ix_w[h];
+        h = h + 256u;
+    }
+    ix_red[lid] = acc;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { ix_red[lid] = ix_red[lid] + ix_red[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) { ix_out[t] = ix_red[0]; }
+}
+
+// Top-k without a sort. The CPU picks by repeated argmax, first maximum wins,
+// and returns the winners in index order; the same set falls out of a rank —
+// how many positions beat me, counting an equal score as a win only if it
+// sits at a lower index — kept when it is below k. Two O(n^2) passes over one
+// workgroup, which for the compressed axis is a few thousand comparisons and
+// needs neither a scan nor an atomic to stay deterministic.
+
+struct TkP { n: u32, k: u32, _a: u32, _b: u32 };
+
+@group(0) @binding(0) var<storage, read>       tk_s   : array<f32>;   // n
+@group(0) @binding(1) var<storage, read_write> tk_idx : array<u32>;   // k
+@group(0) @binding(2) var<storage, read_write> tk_cnt : array<u32>;   // 1
+@group(0) @binding(3) var<uniform>             tk_p   : TkP;
+
+var<workgroup> tk_keep: array<u32, 4096>;
+
+@compute @workgroup_size(256)
+fn top_k_index(@builtin(local_invocation_index) lid: u32) {
+    let n = tk_p.n;
+    var i = lid;
+    loop {
+        if (i >= n) { break; }
+        let si = tk_s[i];
+        var keep = 0u;
+        if (si > KP_NINF) {
+            var rank = 0u;
+            for (var j = 0u; j < n; j = j + 1u) {
+                let sj = tk_s[j];
+                if (sj > KP_NINF) {
+                    if (sj > si || (sj == si && j < i)) { rank = rank + 1u; }
+                }
+            }
+            if (rank < tk_p.k) { keep = 1u; }
+        }
+        tk_keep[i] = keep;
+        i = i + 256u;
+    }
+    workgroupBarrier();
+    // Position among the kept, by index — counted rather than scanned, which
+    // costs one more pass and removes every ordering question.
+    var m = lid;
+    loop {
+        if (m >= n) { break; }
+        if (tk_keep[m] == 1u) {
+            var before = 0u;
+            for (var j = 0u; j < m; j = j + 1u) { before = before + tk_keep[j]; }
+            tk_idx[before] = m;
+        }
+        m = m + 256u;
+    }
+    workgroupBarrier();
+    if (lid == 0u) {
+        var total = 0u;
+        for (var j = 0u; j < n; j = j + 1u) { total = total + tk_keep[j]; }
+        tk_cnt[0] = total;
+    }
+}
+
 // ── Sparse attention over an index list (DeepSeek-V4) ───────────────────────
 //
 // Not the sliding-window attention the canonical graph encodes: the keys are
@@ -5167,6 +5365,9 @@ struct Ctx {
     /// Per-head RMS and the rope tail, forward or inverse.
     rope_heads: wgpu::ComputePipeline,
     o_lora_a: wgpu::ComputePipeline,
+    kv_pool: wgpu::ComputePipeline,
+    index_scores: wgpu::ComputePipeline,
+    top_k_index: wgpu::ComputePipeline,
     sparse_attend: wgpu::ComputePipeline,
     hc_pre_fold: wgpu::ComputePipeline,
     hc_post_expand: wgpu::ComputePipeline,
@@ -5649,6 +5850,9 @@ fn init() -> Result<Ctx, String> {
     let q4t_mv = pipe("q4t_matvec");
     let rope_heads = pipe("rope_heads");
     let o_lora_a = pipe("o_lora_a");
+    let kv_pool = pipe("kv_pool");
+    let index_scores = pipe("index_scores");
+    let top_k_index = pipe("top_k_index");
     let sparse_attend = pipe("sparse_attend");
     let hc_pre_fold = pipe("hc_pre_fold");
     let hc_post_expand = pipe("hc_post_expand");
@@ -5851,6 +6055,9 @@ fn init() -> Result<Ctx, String> {
         q4t_mv,
         rope_heads,
         o_lora_a,
+        kv_pool,
+        index_scores,
+        top_k_index,
         sparse_attend,
         hc_pre_fold,
         hc_post_expand,
@@ -15064,6 +15271,221 @@ pub fn o_lora_a_for_test(
         "o-lora-stage",
     );
     let ok = readback(c, enc, &yb, &stage, (rows * 4) as u64, &mut out[..rows]);
+    drop(sc);
+    ok
+}
+
+/// The compressor's pooling step on the device — `overlap` picks the folding
+/// the release uses at ratio 4, `ape` the positional bias the plain one adds.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_pool_for_test(
+    prev_kv: &[f32],
+    prev_score: &[f32],
+    cur_kv: &[f32],
+    cur_score: &[f32],
+    ape: Option<&[f32]>,
+    ratio: usize,
+    width: usize,
+    overlap: bool,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if width == 0 || ratio == 0 || out.len() < width {
+        return false;
+    }
+    let slots = if overlap { 2 * ratio } else { ratio };
+    let stride = if overlap { 2 * width } else { width };
+    if cur_kv.len() < ratio * stride || cur_score.len() < ratio * stride {
+        return false;
+    }
+    let have_prev = overlap && prev_kv.len() >= ratio * stride && prev_score.len() >= ratio * stride;
+    // Unused bindings still have to point somewhere; the current window is as
+    // good a placeholder as an empty buffer and costs no allocation.
+    let ckv = storage_bytes(c, bytemuck::cast_slice(cur_kv));
+    let csc = storage_bytes(c, bytemuck::cast_slice(cur_score));
+    let pkv = if have_prev {
+        storage_bytes(c, bytemuck::cast_slice(prev_kv))
+    } else {
+        ckv.clone()
+    };
+    let psc = if have_prev {
+        storage_bytes(c, bytemuck::cast_slice(prev_score))
+    } else {
+        csc.clone()
+    };
+    let use_ape = ape.is_some_and(|a| a.len() >= ratio * width) && !overlap;
+    let apb = if use_ape {
+        storage_bytes(c, bytemuck::cast_slice(ape.unwrap()))
+    } else {
+        csc.clone()
+    };
+    let yb = rw_f32(c, width, true);
+    let flags = (overlap as u32) | ((have_prev as u32) << 1) | ((use_ape as u32) << 2);
+    let p = uniform_u32x4(c, [slots as u32, width as u32, ratio as u32, flags]);
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("kv-pool") });
+    {
+        let layout = c.kv_pool.get_bind_group_layout(0);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                bind_buf(0, &pkv),
+                bind_buf(1, &psc),
+                bind_buf(2, &ckv),
+                bind_buf(3, &csc),
+                bind_buf(4, &apb),
+                bind_buf(5, &yb),
+                bind_buf(6, &p),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.kv_pool);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((width as u32).div_ceil(256), 1, 1);
+    }
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        (width * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "kv-pool-stage",
+    );
+    let ok = readback(c, enc, &yb, &stage, (width * 4) as u64, &mut out[..width]);
+    drop(sc);
+    ok
+}
+
+/// The indexer's scoring pass on the device.
+#[allow(clippy::too_many_arguments)]
+pub fn index_scores_for_test(
+    q: &[f32],
+    kv: &[f32],
+    hw: &[f32],
+    nh: usize,
+    hd: usize,
+    n_pos: usize,
+    limit: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if q.len() < nh * hd || kv.len() < n_pos * hd || hw.len() < nh || out.len() < n_pos {
+        return false;
+    }
+    if n_pos == 0 {
+        return true;
+    }
+    let qb = storage_bytes(c, bytemuck::cast_slice(&q[..nh * hd]));
+    let kb = storage_bytes(c, bytemuck::cast_slice(&kv[..n_pos * hd]));
+    let wb = storage_bytes(c, bytemuck::cast_slice(&hw[..nh]));
+    let yb = rw_f32(c, n_pos, true);
+    let p = uniform_u32x4(c, [nh as u32, hd as u32, n_pos as u32, limit as u32]);
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("ix") });
+    {
+        let layout = c.index_scores.get_bind_group_layout(0);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                bind_buf(0, &qb),
+                bind_buf(1, &kb),
+                bind_buf(2, &wb),
+                bind_buf(3, &yb),
+                bind_buf(4, &p),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.index_scores);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((n_pos as u32).min(MAX_WG), 1, 1);
+    }
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        (n_pos * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "ix-stage",
+    );
+    let ok = readback(c, enc, &yb, &stage, (n_pos * 4) as u64, &mut out[..n_pos]);
+    drop(sc);
+    ok
+}
+
+/// Top-k positions on the device, in index order — the list `sparse_attend`
+/// consumes. Bounded by the kernel's workgroup array; beyond it the caller
+/// keeps the CPU's version rather than getting a truncated answer.
+pub fn top_k_for_test(scores: &[f32], k: usize, out: &mut Vec<u32>) -> bool {
+    let Some(c) = ctx() else { return false };
+    let n = scores.len();
+    if n == 0 || n > 4096 || k == 0 {
+        out.clear();
+        return n == 0;
+    }
+    let kk = k.min(n);
+    let sb = storage_bytes(c, bytemuck::cast_slice(scores));
+    let ib = rw_f32(c, kk, true);
+    let cb = rw_f32(c, 1, true);
+    let p = uniform_u32x4(c, [n as u32, k as u32, 0, 0]);
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("topk") });
+    {
+        let layout = c.top_k_index.get_bind_group_layout(0);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                bind_buf(0, &sb),
+                bind_buf(1, &ib),
+                bind_buf(2, &cb),
+                bind_buf(3, &p),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.top_k_index);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    let bytes = ((kk + 1) * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        bytes,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "topk-stage",
+    );
+    enc.copy_buffer_to_buffer(&ib, 0, &stage, 0, (kk * 4) as u64);
+    enc.copy_buffer_to_buffer(&cb, 0, &stage, (kk * 4) as u64, 4);
+    c.queue.submit(Some(enc.finish()));
+    let slice = stage.slice(..bytes);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return false;
+    }
+    let mut ok = false;
+    if let Ok(data) = slice.get_mapped_range() {
+        let words: &[u32] = bytemuck::cast_slice(&data[..bytes as usize]);
+        let cnt = (words[kk] as usize).min(kk);
+        out.clear();
+        out.extend_from_slice(&words[..cnt]);
+        ok = true;
+    }
+    stage.unmap();
     drop(sc);
     ok
 }
