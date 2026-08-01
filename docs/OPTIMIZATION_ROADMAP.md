@@ -155,7 +155,34 @@ was wrong.)
 **Still open:** there is no GPU graph for any of this, so decode is CPU-only —
 which for a ~10B-active MoE is the whole performance story, not a detail.
 
-## 8. Converters write once now
+## 8. The scale is the 2-bit quantizer
+
+`q2tp`'s four levels are `(c−1.5)·s`, so the group scale IS the quantizer,
+and the rule was `absmax/1.5` — which pins the outer level to the largest
+weight in the group. That minimises the worst error; with four levels what
+matters is the mean one, and a single outlier coarsens the other 31 values
+behind it.
+
+Trying the neighbouring rungs of the row's ladder and keeping whichever
+reconstructs the group best costs 1% of conversion time and nothing else —
+same bytes, same layout, same decoder and GPU kernels. Measured on weights
+shaped like a real expert plane (Gaussian, periodic outliers):
+
+| layout | absmax rule | rung search |
+|---|---|---|
+| q2tp (4 levels) | 0.631 | **0.476** |
+| q4tp (16 levels) | 0.1179 | 0.1103 |
+
+Sixteen levels forgive an outlier; four do not. Worth re-converting any
+2-bit file that predates this — the DeepSeek-V4 q2tp variant answers
+correctly and then loses the thread, which is what expert noise looks like.
+
+**Next in this direction:** the ladder itself is chosen from log2 of the
+group maxima before any codes are assigned. Choosing `lo`/`step` to minimise
+the row's total reconstruction error, rather than to span its range, is the
+same argument one level up and has not been tried.
+
+## 9. Converters write once now
 
 `CmfStreamWriter` (`cortiq-core/src/format.rs`) reserves a gap at the head
 of the output, appends each payload as it is encoded, and patches the
