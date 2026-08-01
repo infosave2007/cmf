@@ -168,19 +168,25 @@ reconstructs the group best costs 1% of conversion time and nothing else —
 same bytes, same layout, same decoder and GPU kernels. Measured on weights
 shaped like a real expert plane (Gaussian, periodic outliers):
 
-| layout | absmax rule | rung search |
-|---|---|---|
-| q2tp (4 levels) | 0.631 | **0.476** |
-| q4tp (16 levels) | 0.1179 | 0.1103 |
+The ladder itself had the same flaw one level up: it was built to SPAN the
+row (lo..hi over the group scales), so one loud group stretched it and
+coarsened the step for everything quiet behind it. Trying shorter ladders
+and keeping the best is the same argument again.
 
-Sixteen levels forgive an outlier; four do not. Worth re-converting any
-2-bit file that predates this — the DeepSeek-V4 q2tp variant answers
-correctly and then loses the thread, which is what expert noise looks like.
+| layout | absmax rule | + rung search | + ladder search |
+|---|---|---|---|
+| q2tp (4 levels) | 0.631 | 0.476 | **0.380** |
+| q4tp (16 levels) | 0.1179 | 0.1103 | — |
 
-**Next in this direction:** the ladder itself is chosen from log2 of the
-group maxima before any codes are assigned. Choosing `lo`/`step` to minimise
-the row's total reconstruction error, rather than to span its range, is the
-same argument one level up and has not been tried.
+Sixteen levels forgive an outlier; four do not. Cost: 9x the encoder,
+single-threaded — about 30 s across 48 cores for a 300B model, against a
+conversion measured in hours. Probing the WHOLE ladder per candidate cost
+42x and was less accurate (0.402): the tighter ±2 probe changes which
+ladder wins.
+
+Worth re-converting any 2-bit file that predates this. The DeepSeek-V4 q2tp
+variant answers correctly and then loses the thread, which is what expert
+noise looks like, and it carries 40% more of it than it needs to.
 
 ## 9. Converters write once now
 
