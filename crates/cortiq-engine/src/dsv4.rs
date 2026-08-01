@@ -743,6 +743,17 @@ pub struct Dsv4Indexer {
 /// Model-global pieces: the embedding, the output head and the final
 /// hyper-connection fold.
 pub struct Dsv4Globals {
+    /// RoPE frequencies for the layers that carry a KV compressor: base
+    /// `compress_rope_theta` (160 000 in the release) WITH YaRN.
+    pub inv_freq_compress: Vec<f32>,
+    /// …and for the pure sliding-window layers: base `rope_theta` (10 000)
+    /// with YaRN OFF. The reference picks per layer:
+    ///   if compress_ratio { original_seq_len, compress_rope_theta }
+    ///   else              { 0, rope_theta }   // "disable YaRN"
+    /// One shared table gets both groups wrong — the model still retrieves
+    /// facts, because attention still attends, but every position is rotated
+    /// by the wrong angle, so it repeats itself and cannot count.
+    pub inv_freq_window: Vec<f32>,
     pub embed: crate::qtensor::QTensor,
     pub norm: Vec<f32>,
     pub head: crate::qtensor::QTensor,
@@ -801,6 +812,7 @@ pub fn attention_step(
     cfg: &Dsv4Cfg,
     st: &mut Dsv4State,
     li: usize,
+    // Chosen by the caller from the layer's kind — see Dsv4Globals.
     inv_freq: &[f32],
     pool: Option<&crate::pool::Pool>,
     out: &mut [f32],
@@ -1185,7 +1197,16 @@ pub fn forward_token(
             &l.attn_norm,
             cfg,
             &mut scratch,
-            |folded, out| attention_step(folded, l, cfg, st, li, inv_freq, pool, out),
+            |folded, out| {
+                // The layer's kind decides its frequencies, not the model's.
+                let freqs = if l.compressor.is_some() {
+                    &g.inv_freq_compress
+                } else {
+                    &g.inv_freq_window
+                };
+                let freqs = if freqs.is_empty() { inv_freq } else { freqs.as_slice() };
+                attention_step(folded, l, cfg, st, li, freqs, pool, out)
+            },
         );
         // FFN half
         hc_block(
@@ -1260,7 +1281,20 @@ pub fn load(
     };
     let opt_f = |name: &str| -> Option<Vec<f32>> { f(name).ok() };
 
+    // Two frequency tables, chosen per layer by whether it compresses. The
+    // release's compress_rope_theta (160 000) is not in config.json — it
+    // lives in inference/config.json — so it is pinned here with the other
+    // constants the header cannot carry.
+    let rope_of = |base: f32, yarn: bool| -> Vec<f32> {
+        if yarn {
+            crate::attention::yarn_inv_freq(cfg.rope_head_dim, base, 16.0, 65536, 32.0, 1.0)
+        } else {
+            crate::attention::rope_inv_freq(cfg.rope_head_dim, base)
+        }
+    };
     let globals = Dsv4Globals {
+        inv_freq_compress: rope_of(160_000.0, true),
+        inv_freq_window: rope_of(10_000.0, false),
         embed: q("model.embed_tokens.weight")?,
         norm: f("model.norm.weight")?,
         head: q("lm_head.weight")?,
@@ -1481,7 +1515,14 @@ mod tests {
                 },
             });
         }
+        let inv = |base: f32| -> Vec<f32> {
+            (0..cfg.rope_head_dim / 2)
+                .map(|i| 1.0 / base.powf(2.0 * i as f32 / cfg.rope_head_dim as f32))
+                .collect()
+        };
         let g = Dsv4Globals {
+            inv_freq_compress: inv(160000.0),
+            inv_freq_window: inv(10000.0),
             embed: t(cfg.vocab, dim, 31),
             norm: ones(dim),
             head: t(cfg.vocab, dim, 33),
