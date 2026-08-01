@@ -1013,6 +1013,10 @@ pub(crate) mod prof {
     pub static HC_NS: AtomicU64 = AtomicU64::new(0);
     /// The head: final norm plus lm_head over 129280 rows.
     pub static HEAD_NS: AtomicU64 = AtomicU64::new(0);
+    /// The whole forward, so the buckets can be checked against a total
+    /// instead of against a guess. 78 ms of measured work in a 108 ms token
+    /// left 30 ms that no counter had ever looked at.
+    pub static ALL_NS: AtomicU64 = AtomicU64::new(0);
     pub static TOKENS: AtomicU64 = AtomicU64::new(0);
 
     /// One token = one visit to layer zero. Counting `moe_step` calls instead
@@ -1045,6 +1049,7 @@ pub(crate) mod prof {
             ATTN_NS.load(Ordering::Relaxed) as f64 / 1e6,
             MOE_NS.load(Ordering::Relaxed) as f64 / 1e6,
         );
+        let all = ALL_NS.load(Ordering::Relaxed) as f64 / 1e6;
         let hc = HC_NS.load(Ordering::Relaxed) as f64 / 1e6;
         let hd = HEAD_NS.load(Ordering::Relaxed) as f64 / 1e6;
         eprintln!(
@@ -1058,6 +1063,11 @@ pub(crate) mod prof {
             a / calls as f64,
             m / calls as f64,
             hc / calls as f64,
+        );
+        eprintln!(
+            "[dsv4-профиль] весь проход {:.0} мс на токен; вне счётчиков {:.0} мс",
+            all / toks as f64,
+            (all - a - m - hd) / toks as f64,
         );
         #[cfg(feature = "gpu")]
         {
@@ -1950,6 +1960,38 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
         // CPU's 5.211 on the release — so it is opt-in until that is closed.
         // Off, a layer that does not fit whole declines and runs on the host,
         // which is slower and right.
+        // `CMF_DSV4_PACK_MAX=N` caps the packing directly, so a toy can
+        // reproduce the subset path without needing a card that runs out.
+        if let Some(n) = std::env::var("CMF_DSV4_PACK_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            let mut to_slot = vec![usize::MAX; cfg.n_routed_experts];
+            let mut globals = Vec::new();
+            let mut tensors = Vec::new();
+            for (gi, e) in l.experts.iter().enumerate().take(n) {
+                to_slot[gi] = globals.len();
+                globals.push(gi);
+                tensors.push(idx3(e)?);
+            }
+            tensors.push(idx3(&l.shared)?);
+            let (rows, cols) = (l.gate.rows(), l.gate.cols());
+            let mut router = vec![0.0f32; rows * cols];
+            for r in 0..rows {
+                l.gate.row_f32(r, &mut router[r * cols..(r + 1) * cols]);
+            }
+            let remap: Vec<u32> = to_slot
+                .iter()
+                .map(|&sl| if sl == usize::MAX { u32::MAX } else { sl as u32 })
+                .collect();
+            return Some(Arc::new(Pack {
+                router,
+                to_slot,
+                remap,
+                globals,
+                tensors,
+            }));
+        }
         let room = if std::env::var("CMF_DSV4_COLD_CPU").is_ok_and(|v| v != "0") {
             crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, gu_q2).saturating_sub(1)
         } else {
@@ -2226,10 +2268,12 @@ pub fn moe_step(
                 let den: f32 = want.iter().map(|a| a * a).sum::<f32>().max(1e-20);
                 let rel = (num / den).sqrt();
                 if rel > 1e-3 {
+                    let packed = pack_for(l, cfg, li).map_or(0, |p| p.globals.len());
                     eprintln!(
-                        "[кадр MoE] слой {li}: расхождение {rel:.3e} | экспертов {} | \
-                         хеш={} | смещение={}",
+                        "[кадр MoE] слой {li}: расхождение {rel:.3e} | выбрано {} | \
+                         упаковано {packed} из {} | хеш={} | смещение={}",
                         idx.len(),
+                        cfg.n_routed_experts,
                         l.tid2eid.is_some(),
                         l.gate_bias.is_some()
                     );
@@ -2475,6 +2519,8 @@ pub fn forward_token(
     pool: Option<&crate::pool::Pool>,
     logits: &mut Vec<f32>,
 ) {
+    let _t_all = prof::on().then(std::time::Instant::now);
+    let _all_guard = Charge(_t_all, &prof::ALL_NS);
     let (hc, dim) = (cfg.hc_mult, cfg.dim);
 
     // Embedding, replicated into the copies.
