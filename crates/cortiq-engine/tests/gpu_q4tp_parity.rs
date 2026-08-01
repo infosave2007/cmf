@@ -40,6 +40,19 @@ fn device_q4tp_matvec_matches_the_cpu() {
         let den: f32 = cpu.iter().map(|a| a * a).sum::<f32>().max(1e-20);
         let rel = (num / den).sqrt();
         println!("{}: [{rows}x{cols}] расхождение {rel:.3e}", e.name);
+        if std::env::var("CMF_Q4TP_SHOW").is_ok() {
+            // A constant ratio across rows means a scale read at a different
+            // precision; scatter means a layout or ordering fault. The two
+            // want opposite fixes, and the norm alone tells them apart badly.
+            for r in 0..4.min(rows) {
+                println!(
+                    "    строка {r}: cpu {:+.6e}  gpu {:+.6e}  отношение {:.6}",
+                    cpu[r],
+                    gpu[r],
+                    gpu[r] / cpu[r]
+                );
+            }
+        }
         // 5e-3, not 1e-3: a [4x256] tensor reduces over four rows and the
         // summation order alone moves it that far. A real layout error is
         // orders of magnitude bigger, so this still catches what matters.
