@@ -1562,6 +1562,7 @@ fn dsv4_layer_loop(
     token_id: u32,
     inv_freq: &[f32],
     pool: Option<&crate::pool::Pool>,
+    scratch: &mut HcScratch,
 ) -> bool {
     let dim = cfg.dim;
     let freqs_of = |l: &Dsv4Layer| -> &[f32] {
@@ -1578,6 +1579,7 @@ fn dsv4_layer_loop(
     // wrong one. Everything that can decline is therefore asked before the
     // first byte of state moves. The expert upload happens here too, which is
     // where it belonged anyway.
+    let mut on_dev = vec![false; layers.len()];
     for (li, l) in layers.iter().enumerate() {
         let Some(pk) = pack_for(l, cfg, li) else {
             return false;
@@ -1596,9 +1598,15 @@ fn dsv4_layer_loop(
             .experts
             .first()
             .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
-        if !crate::gpu_wgpu::dsv4_experts_ready(&model, &pk.tensors, cfg.moe_inter, dim, gu_q2) {
-            return false;
-        }
+        // A layer whose experts do not fit is not a reason to abandon the
+        // token: 100 GB of experts against a 98 GB card means SOME layer will
+        // always miss. Those run on the host, with the state fetched and put
+        // back around them — two transfers for the few that need it.
+        on_dev[li] =
+            crate::gpu_wgpu::dsv4_experts_ready(&model, &pk.tensors, cfg.moe_inter, dim, gu_q2);
+    }
+    if !on_dev.iter().any(|&x| x) {
+        return false;
     }
 
     // Layer zero's opening fold has no frame before it to have prepared it.
@@ -1616,6 +1624,49 @@ fn dsv4_layer_loop(
     }
     let mut sink_out = vec![0.0f32; dim];
     for (li, l) in layers.iter().enumerate() {
+        if !on_dev[li] {
+            if !crate::gpu_wgpu::dsv4_state_read(state) {
+                return false;
+            }
+            let freqs = freqs_of(l);
+            hc_block(
+                state,
+                &l.hc_attn_fn,
+                &l.hc_attn_scale,
+                &l.hc_attn_base,
+                &l.attn_norm,
+                cfg,
+                scratch,
+                pool,
+                |f, o| attention_step(f, l, cfg, st, li, freqs, pool, None, o),
+            );
+            hc_block(
+                state,
+                &l.hc_ffn_fn,
+                &l.hc_ffn_scale,
+                &l.hc_ffn_base,
+                &l.ffn_norm,
+                cfg,
+                scratch,
+                pool,
+                |f, o| moe_step(f, l, cfg, token_id, li, pool, o),
+            );
+            if let Some(n) = layers.get(li + 1) {
+                folded = hc_fold_norm(
+                    state,
+                    &n.hc_attn_fn,
+                    &n.hc_attn_scale,
+                    &n.hc_attn_base,
+                    &n.attn_norm,
+                    cfg,
+                    pool,
+                );
+            }
+            if !crate::gpu_wgpu::dsv4_state_write(state) {
+                return false;
+            }
+            continue;
+        }
         let mut prep = AttnPrep::default();
         attention_step(
             &folded,
@@ -2359,7 +2410,9 @@ pub fn forward_token(
     // ── one submission per layer, when the device will take it ──
     #[cfg(feature = "gpu")]
     let layer_frames = gpu_layer_enabled()
-        && dsv4_layer_loop(&mut state, layers, g, cfg, st, token_id, inv_freq, pool);
+        && dsv4_layer_loop(
+            &mut state, layers, g, cfg, st, token_id, inv_freq, pool, &mut scratch,
+        );
     #[cfg(not(feature = "gpu"))]
     let layer_frames = false;
 
