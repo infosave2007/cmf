@@ -15816,6 +15816,13 @@ pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: us
         return false;
     }
     let mut map = c.dsv4_kv.lock().unwrap();
+    // Grow rather than refuse: the compressed axis lengthens as the sequence
+    // does, and a buffer sized for token 100 is not a reason to fall off the
+    // device at token 1000. The caller rewrites both regions each token, so
+    // losing the old contents costs nothing.
+    if map.get(&(kv_id, li)).is_some_and(|(_, have)| *have < cap) {
+        map.remove(&(kv_id, li));
+    }
     let e = map.entry((kv_id, li)).or_insert_with(|| {
         (
             c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -15911,7 +15918,9 @@ pub fn dsv4_attn_frame(
         }};
     }
     let Some(c) = ctx() else { no!("нет контекста wgpu") };
-    if hidden.len() < g.dim
+    // `hidden` is only read when the frame has to build the LoRA vector
+    // itself; demanding it regardless refused every caller that had one.
+    if (qn_in.is_none() && hidden.len() < g.dim)
         || out.len() < g.dim
         || w.sink.len() < g.nh
         || w.q_norm.len() < g.q_lora
@@ -15962,7 +15971,10 @@ pub fn dsv4_attn_frame(
             no!("готовый qn короче q_lora: {} < {}", v.len(), g.q_lora);
         }
     }
-    let hb = storage_bytes(c, bytemuck::cast_slice(&hidden[..g.dim]));
+    let hb = match qn_in {
+        None => storage_bytes(c, bytemuck::cast_slice(&hidden[..g.dim])),
+        Some(_) => storage_bytes(c, bytemuck::cast_slice(&[0.0f32])),
+    };
     let qnw = storage_bytes(c, bytemuck::cast_slice(&w.q_norm[..g.q_lora]));
     let sink = storage_bytes(c, bytemuck::cast_slice(&w.sink[..g.nh]));
     let freq = storage_bytes(c, bytemuck::cast_slice(&inv_freq[..g.rd / 2]));

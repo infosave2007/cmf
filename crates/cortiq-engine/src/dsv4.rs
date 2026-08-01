@@ -1005,8 +1005,19 @@ fn attn_frame(
     {
         return false;
     }
-    let _ = win_len;
-    let idx32: Vec<u32> = idxs.iter().map(|&p| p as u32).collect();
+    // Host list: window slots 0..win_len, then compressed. Device layout: a
+    // FIXED window region of `cfg.window` slots, then compressed. The two
+    // agree only while the window is still filling.
+    let idx32: Vec<u32> = idxs
+        .iter()
+        .map(|&p| {
+            if p < win_len {
+                p as u32
+            } else {
+                (cfg.window + (p - win_len)) as u32
+            }
+        })
+        .collect();
     let w = crate::gpu_wgpu::Dsv4AttnW {
         wq_a,
         wq_b,
@@ -1066,19 +1077,9 @@ pub fn attention_step(
     let mut qr = vec![0.0f32; cfg.q_lora_rank];
     l.wq_a.matvec(hidden, &mut qr, pool);
     rms_weighted(&mut qr, &l.q_norm, cfg.norm_eps);
-    // The frame picks up from here, so the queries are built only if it does
-    // not. `qr` itself is kept either way: the indexer reads it.
+    // The queries are built further down, after the frame has had its chance
+    // at the whole block. `qr` is needed either way: the indexer reads it.
     let on_gpu = gpu_attn_enabled();
-    let mut q = Vec::new();
-    if !on_gpu {
-        q = vec![0.0f32; cfg.n_heads * hd];
-        l.wq_b.matvec(&qr, &mut q, pool);
-        for h in 0..cfg.n_heads {
-            let head = &mut q[h * hd..(h + 1) * hd];
-            rms_inplace(head, cfg.norm_eps);
-            rope_tail(head, inv_freq, pos, rd, false);
-        }
-    }
 
     // ── kv: one head's width, shared by every query head ──
     let mut kv = vec![0.0f32; hd];
@@ -1157,11 +1158,6 @@ pub fn attention_step(
         st.window[li].drain(..drop);
     }
     let win_len = st.window[li].len() / hd;
-    let mut cache: Vec<f32> = Vec::new();
-    if !on_gpu {
-        cache = st.window[li].clone();
-        cache.extend_from_slice(&st.compressed[li]);
-    }
     let n_pos = win_len + st.compressed[li].len() / hd;
 
     // Index list: every window position, plus whatever the indexer picked
@@ -1219,18 +1215,14 @@ pub fn attention_step(
                 );
                 let mut picked = Vec::new();
                 top_k_positions(&sc, cfg.index_topk, &mut picked);
-                let base = if on_gpu { cfg.window } else { win_len };
-                idxs.extend(picked.into_iter().map(|p| base + p));
+                idxs.extend(picked.into_iter().map(|p| win_len + p));
             }
-            None => {
-                let base = if on_gpu { cfg.window } else { win_len };
-                idxs.extend((0..n_comp).map(|p| base + p))
-            }
+            None => idxs.extend((0..n_comp).map(|p| win_len + p)),
         }
     }
-    debug_assert!(on_gpu || idxs.iter().all(|&p| p < n_pos));
+    debug_assert!(idxs.iter().all(|&p| p < n_pos));
 
-    // ── sparse attention per head, then the inverse rope ──
+    // ── the whole block on the device, or nothing ──
     let scale = (hd as f32).powf(-0.5);
     #[cfg(feature = "gpu")]
     if on_gpu
@@ -1240,6 +1232,19 @@ pub fn attention_step(
     {
         return;
     }
+
+    // ── queries: wq_b, then a norm and the rope tail per head ──
+    let mut q = vec![0.0f32; cfg.n_heads * hd];
+    l.wq_b.matvec(&qr, &mut q, pool);
+    for h in 0..cfg.n_heads {
+        let head = &mut q[h * hd..(h + 1) * hd];
+        rms_inplace(head, cfg.norm_eps);
+        rope_tail(head, inv_freq, pos, rd, false);
+    }
+    let mut cache: Vec<f32> = st.window[li].clone();
+    cache.extend_from_slice(&st.compressed[li]);
+
+    // ── sparse attention per head, then the inverse rope ──
     let mut attn = vec![0.0f32; cfg.n_heads * hd];
     for h in 0..cfg.n_heads {
         let qh = &q[h * hd..(h + 1) * hd];
