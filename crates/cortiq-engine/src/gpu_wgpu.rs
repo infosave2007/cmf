@@ -3485,7 +3485,9 @@ fn moe_select(@builtin(local_invocation_index) lid: u32) {
 
 // gate+up+SiLU for every selected expert: workgroup (row, slot) does BOTH q4t
 // row dots (they share the activation reads) and writes act = silu(g)·u.
-struct MoeGuP { gpr: u32, inter: u32, slots: u32, mat16: u32 , lim: f32, _pad: vec3<u32> };
+struct MoeGuP { gpr: u32, inter: u32, slots: u32, mat16: u32 , lim: f32, _p0: u32, _p1: u32, _p2: u32 };
+// Three scalars, not a vec3: a vec3<u32> aligns to 16 in uniform layout and
+// pushes the struct to 48 bytes, while the buffer handed in is 32.
 // `lim` is DeepSeek-V4's swiglu_limit: the up projection is clamped both
 // ways, the gate only from above. Zero means no clamp, which is every other
 // architecture that reaches these kernels.
@@ -4019,7 +4021,9 @@ fn moe_select_b(@builtin(workgroup_id) wid: vec3<u32>,
 }
 
 // gate+up+SiLU with a token axis: workgroup (row, slot, token).
-struct MoeGuBP { gpr: u32, inter: u32, slots: u32, mat16: u32 , lim: f32, _pad: vec3<u32> };
+struct MoeGuBP { gpr: u32, inter: u32, slots: u32, mat16: u32 , lim: f32, _p0: u32, _p1: u32, _p2: u32 };
+// Three scalars, not a vec3: a vec3<u32> aligns to 16 in uniform layout and
+// pushes the struct to 48 bytes, while the buffer handed in is 32.
 // `lim` is DeepSeek-V4's swiglu_limit: the up projection is clamped both
 // ways, the gate only from above. Zero means no clamp, which is every other
 // architecture that reaches these kernels.

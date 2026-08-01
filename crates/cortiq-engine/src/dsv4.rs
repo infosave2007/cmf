@@ -1458,9 +1458,18 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
             }
             to_slot[gi] = globals.len();
             globals.push(gi);
-            tensors.push(idx3(e)?);
+            match idx3(e) {
+                Some(t) => tensors.push(t),
+                None => {
+                    if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
+                        eprintln!("слой {li}: эксперт {gi} без индексов в каталоге");
+                    }
+                    return None;
+                }
+            }
         }
         if globals.is_empty() {
+            tracing::warn!("слой {li}: маска не оставила ни одного эксперта");
             return None;
         }
         tensors.push(idx3(&l.shared)?); // shared rides last, as the kernels expect
@@ -1487,11 +1496,21 @@ fn moe_frame(
     forced: Option<&[usize]>,
     out: &mut [f32],
 ) -> bool {
+    macro_rules! no {
+        ($($t:tt)*) => {{
+            if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
+                eprintln!("кадр MoE отклонён: {}", format_args!($($t)*));
+            }
+            return false;
+        }};
+    }
     let Some(pk) = pack_for(l, cfg, li) else {
-        return false;
+        no!("слой {li}: упаковка экспертов не построена");
     };
-    let Some(model) = l.gate.model_arc() else {
-        return false;
+    // The router is a small f32 tensor and is usually NOT mapped; the handle
+    // has to come from something that is.
+    let Some(model) = l.experts.first().and_then(|e| e.w1.model_arc()) else {
+        no!("слой {li}: эксперты не отображены из файла");
     };
     // A forced expert outside the packing has nowhere to go; the hash layers
     // name specific experts and a mask that drops one of them is a mask this
@@ -1500,7 +1519,7 @@ fn moe_frame(
         Some(f) => {
             let v: Vec<usize> = f.iter().map(|&g| pk.to_slot[g]).collect();
             if v.iter().any(|&s| s == usize::MAX) {
-                return false;
+                no!("слой {li}: хеш-слой называет эксперта вне упаковки");
             }
             Some(v)
         }
