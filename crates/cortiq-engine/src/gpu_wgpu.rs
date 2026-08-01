@@ -5159,19 +5159,15 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
                 }
                 if (rank < k) {
                     rt_used[rank] = 1u;
-                    // ALWAYS record the winner and its weight. Letting the
-                    // kernel also decide "is this one cold" meant a silent
-                    // empty list was indistinguishable from a layer that
-                    // happened to pick only resident experts — and that
-                    // ambiguity cost a day. The host holds the same remap and
-                    // can tell; the kernel just reports what it chose.
-                    rt_cold[2u * rank] = m;
-                    rt_cold[2u * rank + 1u] = bitcast<u32>(rt_sc[m]);
                     if (subset) {
                         let slot = rt_map[m];
                         if (slot == 0xFFFFFFFFu) {
+                            // Cold: the device computes nothing for it and the
+                            // host is told which expert and with what weight.
                             rt_idx[rank] = 0u;
                             rt_w[rank] = 0.0;
+                            rt_cold[2u * rank] = m;
+                            rt_cold[2u * rank + 1u] = bitcast<u32>(rt_sc[m]);
                         } else {
                             rt_idx[rank] = slot;
                             rt_w[rank] = rt_sc[m];
@@ -5205,11 +5201,9 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
         // The sum runs over the chosen experts INCLUDING the cold ones — the
         // reference normalises across the whole top-k, and leaving them out
         // would inflate every surviving weight.
-        // rt_cold now carries EVERY winner's pre-bias score, so the sum is
-        // over it alone — rt_w holds zero for the cold ones and would
-        // double-count the rest.
         var sum = 0.0;
         for (var j = 0u; j < cnt; j = j + 1u) {
+            sum = sum + rt_w[j];
             if (rt_cold[2u * j] != 0xFFFFFFFFu) {
                 sum = sum + bitcast<f32>(rt_cold[2u * j + 1u]);
             }

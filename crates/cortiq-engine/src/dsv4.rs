@@ -2172,21 +2172,8 @@ fn moe_frame(
             &cold[..cold.len().min(3)]
         );
     }
-    // The device reports every winner; the host, holding the same remap,
-    // decides which of them it owes.
-    let owed: Vec<(usize, f32)> = cold
-        .iter()
-        .copied()
-        .filter(|&(gi, _)| pk.to_slot.get(gi).copied().unwrap_or(usize::MAX) == usize::MAX)
-        .collect();
-    if std::env::var("CMF_DSV4_MOE_CHECK").is_ok() {
-        eprintln!(
-            "[выбор карты] слой {li}: {:?}",
-            cold.iter().map(|c| c.0).collect::<Vec<_>>()
-        );
-    }
     let mut acc = vec![0.0f32; cfg.dim];
-    for &(gi, wt) in &owed {
+    for &(gi, wt) in &cold {
         let Some(exp) = l.experts.get(gi) else { continue };
         run_expert(hidden, exp, cfg, wt, pool, &mut acc);
         for (o, a) in out.iter_mut().zip(&acc) {
