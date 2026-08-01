@@ -34,7 +34,8 @@ pub struct Tokenizer {
     special_ids: HashSet<u32>,
     /// Pre-tokenizer split pattern (None = whitespace fallback for the
     /// synthetic `byte_level()` tokenizer)
-    split_re: Option<fancy_regex::Regex>,
+    /// Applied in order; each subdivides the previous stage's pieces.
+    split_res: Vec<fancy_regex::Regex>,
     /// SentencePiece Prepend("▁") normalizer present (llama family).
     /// Gemma replaces spaces with ▁ but does NOT prepend one.
     sp_prepend: bool,
@@ -141,20 +142,30 @@ struct HfAddedToken {
     special: bool,
 }
 
-/// Extract the Split regex from a pre_tokenizer JSON subtree
-/// (handles both bare Split and Sequence-of-pretokenizers).
-fn find_split_pattern(pt: &serde_json::Value) -> Option<String> {
+/// Collect EVERY Split regex from a pre_tokenizer subtree, in order.
+///
+/// A Sequence applies its splits one after another, each subdividing what
+/// the previous one produced — taking only the first is not an
+/// approximation, it is a different tokenizer. DeepSeek-V4 puts the digit
+/// rule first and the word rule third, so reading one pattern sent whole
+/// sentences into BPE as a single piece and produced ids the model has
+/// never seen.
+fn collect_split_patterns(pt: &serde_json::Value, out: &mut Vec<String>) {
     if pt.get("type").and_then(|t| t.as_str()) == Some("Split") {
-        return pt
+        if let Some(r) = pt
             .get("pattern")
             .and_then(|p| p.get("Regex"))
             .and_then(|r| r.as_str())
-            .map(String::from);
+        {
+            out.push(r.to_string());
+        }
+        return;
     }
     if let Some(list) = pt.get("pretokenizers").and_then(|l| l.as_array()) {
-        return list.iter().find_map(find_split_pattern);
+        for p in list {
+            collect_split_patterns(p, out);
+        }
     }
-    None
 }
 
 /// `prepend_scheme` of a Metaspace pre-tokenizer ("always" | "first" |
@@ -249,18 +260,22 @@ impl Tokenizer {
                 _ => (false, false),
             }
         };
-        let split_re = if metaspace {
-            None
+        let split_res = if metaspace {
+            Vec::new()
         } else {
-            let pattern = hf
-                .pre_tokenizer
-                .as_ref()
-                .and_then(find_split_pattern)
-                .unwrap_or_else(|| DEFAULT_SPLIT.to_string());
-            Some(
-                fancy_regex::Regex::new(&pattern)
-                    .map_err(|e| TokenizerError::Parse(format!("pre-tokenizer regex: {e}")))?,
-            )
+            let mut pats = Vec::new();
+            if let Some(pt) = hf.pre_tokenizer.as_ref() {
+                collect_split_patterns(pt, &mut pats);
+            }
+            if pats.is_empty() {
+                pats.push(DEFAULT_SPLIT.to_string());
+            }
+            pats.iter()
+                .map(|p| {
+                    fancy_regex::Regex::new(p)
+                        .map_err(|e| TokenizerError::Parse(format!("pre-tokenizer regex: {e}")))
+                })
+                .collect::<Result<Vec<_>, _>>()?
         };
 
         // Added tokens: longest-first so overlapping contents match right.
@@ -349,7 +364,7 @@ impl Tokenizer {
             added,
             added_ids,
             special_ids,
-            split_re,
+            split_res,
             metaspace,
             sp_prepend,
             sp_prepend_first,
@@ -384,7 +399,7 @@ impl Tokenizer {
             added: Vec::new(),
             added_ids: HashSet::new(),
             special_ids: HashSet::new(),
-            split_re: None,
+            split_res: Vec::new(),
             metaspace: false,
             sp_prepend: false,
             sp_prepend_first: false,
@@ -478,29 +493,42 @@ impl Tokenizer {
             self.bpe_piece_sp(&sp, out);
             return;
         }
-        match &self.split_re {
-            Some(re) => {
-                let mut last = 0;
-                for m in re.find_iter(&norm) {
-                    let m = match m {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::error!("pre-tokenizer regex failed: {e}");
-                            break;
+        if !self.split_res.is_empty() {
+            // Each stage subdivides the pieces the previous one left, with
+            // Isolated behaviour: both the matches and the gaps survive.
+            let mut pieces: Vec<(usize, usize)> = vec![(0, norm.len())];
+            for re in &self.split_res {
+                let mut next: Vec<(usize, usize)> = Vec::with_capacity(pieces.len() * 2);
+                for (ps, pe) in pieces {
+                    let seg = &norm[ps..pe];
+                    let mut last = 0usize;
+                    for m in re.find_iter(seg) {
+                        let m = match m {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::error!("pre-tokenizer regex failed: {e}");
+                                break;
+                            }
+                        };
+                        if m.start() > last {
+                            next.push((ps + last, ps + m.start()));
                         }
-                    };
-                    if m.start() > last {
-                        // Isolated behavior: gaps are their own pieces.
-                        self.bpe_piece(&norm[last..m.start()], out);
+                        if m.end() > m.start() {
+                            next.push((ps + m.start(), ps + m.end()));
+                        }
+                        last = m.end();
                     }
-                    self.bpe_piece(m.as_str(), out);
-                    last = m.end();
+                    if last < seg.len() {
+                        next.push((ps + last, pe));
+                    }
                 }
-                if last < norm.len() {
-                    self.bpe_piece(&norm[last..], out);
-                }
+                pieces = next;
             }
-            None => {
+            for (ps, pe) in pieces {
+                self.bpe_piece(&norm[ps..pe], out);
+            }
+        } else {
+            {
                 // Synthetic byte_level() tokenizer: raw byte tokens.
                 for b in norm.bytes() {
                     let tok = format!("<0x{:02X}>", b);
@@ -951,6 +979,79 @@ mod tests {
               ]
             }}"#
         )
+    }
+
+    /// Parity against HuggingFace on a real tokenizer, run only when the
+    /// file is present (CMF_TOK_PARITY=/path/to/tokenizer.json).
+    #[test]
+    fn real_tokenizer_parity_when_available() {
+        let Ok(path) = std::env::var("CMF_TOK_PARITY") else {
+            return;
+        };
+        let t = Tokenizer::from_file(&path).expect("load");
+        for (text, want) in [
+            ("The capital of France is", vec![671u32, 6102, 294, 8760, 344]),
+            ("2 + 2 =", vec![20, 940, 223, 20, 438]),
+        ] {
+            let got = t.encode(text);
+            assert_eq!(got, want, "«{text}»");
+        }
+    }
+
+    /// A Sequence of Splits applies ALL of them, in order. Reading only the
+    /// first is not a near-miss: DeepSeek-V4 puts a digit rule first and the
+    /// word rule third, so one-pattern behaviour hands BPE a whole sentence
+    /// as a single piece and the ids that come back are ones the model was
+    /// never trained on.
+    #[test]
+    fn every_split_in_a_sequence_is_applied() {
+        let pt = serde_json::json!({
+            "type": "Sequence",
+            "pretokenizers": [
+                {"type": "Split", "behavior": "Isolated",
+                 "pattern": {"Regex": r"\p{N}{1,3}"}},
+                {"type": "Split", "behavior": "Isolated",
+                 "pattern": {"Regex": r" ?[\p{L}]+"}},
+                {"type": "ByteLevel", "add_prefix_space": false, "use_regex": false}
+            ]
+        });
+        let mut pats = Vec::new();
+        collect_split_patterns(&pt, &mut pats);
+        assert_eq!(pats.len(), 2, "both Split stages must be collected: {pats:?}");
+        assert!(pats[0].contains("p{N}"), "digit rule first");
+        assert!(pats[1].contains("p{L}"), "word rule second");
+
+        // And the staged subdivision reaches the word boundaries. Building a
+        // byte-level tokenizer over this pre_tokenizer, "ab cd" has to become
+        // two pieces rather than one.
+        let re: Vec<fancy_regex::Regex> = pats
+            .iter()
+            .map(|p| fancy_regex::Regex::new(p).unwrap())
+            .collect();
+        let norm = "ab cd12";
+        let mut pieces: Vec<(usize, usize)> = vec![(0, norm.len())];
+        for r in &re {
+            let mut next = Vec::new();
+            for (ps, pe) in pieces {
+                let seg = &norm[ps..pe];
+                let mut last = 0;
+                for m in r.find_iter(seg).flatten() {
+                    if m.start() > last {
+                        next.push((ps + last, ps + m.start()));
+                    }
+                    if m.end() > m.start() {
+                        next.push((ps + m.start(), ps + m.end()));
+                    }
+                    last = m.end();
+                }
+                if last < seg.len() {
+                    next.push((ps + last, pe));
+                }
+            }
+            pieces = next;
+        }
+        let got: Vec<&str> = pieces.iter().map(|(a, b)| &norm[*a..*b]).collect();
+        assert_eq!(got, vec!["ab", " cd", "12"], "staged split produced {got:?}");
     }
 
     #[test]
