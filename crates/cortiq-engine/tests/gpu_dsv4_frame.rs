@@ -146,10 +146,14 @@ fn the_fused_attention_block_matches_the_cpu() {
     ];
     let mut worst = 0.0f32;
     for (tap, cpu) in stages {
-        if tap.is_empty() {
-            std::env::remove_var("CMF_DSV4_FRAME_TAP");
-        } else {
-            std::env::set_var("CMF_DSV4_FRAME_TAP", tap);
+        // One test in its own binary, no threads: nothing else can observe
+        // the variable between the set and the call it steers.
+        unsafe {
+            if tap.is_empty() {
+                std::env::remove_var("CMF_DSV4_FRAME_TAP");
+            } else {
+                std::env::set_var("CMF_DSV4_FRAME_TAP", tap);
+            }
         }
         let mut got = vec![0.0f32; nh * hd + dim];
         if !gpu_wgpu::dsv4_attn_frame(
