@@ -989,6 +989,16 @@ pub(crate) mod prof {
         );
         #[cfg(feature = "gpu")]
         {
+            let ae = crate::gpu_wgpu::ATT_ENC_NS.load(Ordering::Relaxed) as f64 / 1e6;
+            let aw = crate::gpu_wgpu::ATT_WAIT_NS.load(Ordering::Relaxed) as f64 / 1e6;
+            if ae + aw > 0.0 {
+                eprintln!(
+                    "[dsv4-профиль] кадр внимания на вызов: кодирование {:.2} мс, \
+                     отправка и ожидание {:.2} мс",
+                    ae / calls as f64,
+                    aw / calls as f64,
+                );
+            }
             let e = crate::gpu_wgpu::MOE_ENC_NS.load(Ordering::Relaxed) as f64 / 1e6;
             let wt = crate::gpu_wgpu::MOE_WAIT_NS.load(Ordering::Relaxed) as f64 / 1e6;
             if e + wt > 0.0 {

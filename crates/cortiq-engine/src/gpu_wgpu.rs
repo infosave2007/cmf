@@ -4734,6 +4734,114 @@ fn o_lora_a(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// ── Sparse attention, split in two (DeepSeek-V4) ────────────────────────────
+//
+// The one-workgroup-per-head version leaves 64 workgroups on a card with
+// 150-odd multiprocessors, and measured 0.54 ms a layer — the whole cost of
+// the attention block once its encoding was cached away. Scores are cheap and
+// genuinely per-head; the weighted sum is nh*hd independent outputs. So:
+// scores in one dispatch of nh groups, the sum in another of nh*hd/256.
+
+struct Sa2P { nh: u32, hd: u32, m: u32, scale: f32 };
+
+@group(0) @binding(0) var<storage, read>       s2_q    : array<f32>;   // nh*hd
+@group(0) @binding(1) var<storage, read>       s2_kv   : array<f32>;
+@group(0) @binding(2) var<storage, read>       s2_idx  : array<u32>;   // m
+@group(0) @binding(3) var<storage, read>       s2_sink : array<f32>;   // nh
+@group(0) @binding(4) var<storage, read_write> s2_w    : array<f32>;   // nh*m
+@group(0) @binding(5) var<uniform>             s2_p    : Sa2P;
+
+var<workgroup> s2_red: array<f32, 256>;
+var<workgroup> s2_sc:  array<f32, 1024>;
+var<workgroup> s2_max: f32;
+var<workgroup> s2_den: f32;
+
+@compute @workgroup_size(256)
+fn sa_scores(@builtin(workgroup_id) wid: vec3<u32>,
+             @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    if (h >= s2_p.nh) { return; }
+    let hd = s2_p.hd;
+    let m = s2_p.m;
+    let qb = h * hd;
+
+    var mx = s2_sink[h];
+    var t = lid;
+    loop {
+        if (t >= m) { break; }
+        let kb = s2_idx[t] * hd;
+        var d = 0.0;
+        for (var i = 0u; i < hd; i = i + 1u) { d = d + s2_q[qb + i] * s2_kv[kb + i]; }
+        d = d * s2_p.scale;
+        s2_sc[t] = d;
+        mx = max(mx, d);
+        t = t + 256u;
+    }
+    s2_red[lid] = mx;
+    workgroupBarrier();
+    var st = 128u;
+    loop {
+        if (st == 0u) { break; }
+        if (lid < st) { s2_red[lid] = max(s2_red[lid], s2_red[lid + st]); }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    if (lid == 0u) { s2_max = s2_red[0]; }
+    workgroupBarrier();
+
+    // The learned sink enters the denominator and NOT the numerator: that is
+    // what lets a head attend to nothing at all.
+    var acc = 0.0;
+    var u = lid;
+    loop {
+        if (u >= m) { break; }
+        let e = exp(s2_sc[u] - s2_max);
+        s2_sc[u] = e;
+        acc = acc + e;
+        u = u + 256u;
+    }
+    s2_red[lid] = acc;
+    workgroupBarrier();
+    st = 128u;
+    loop {
+        if (st == 0u) { break; }
+        if (lid < st) { s2_red[lid] = s2_red[lid] + s2_red[lid + st]; }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    if (lid == 0u) { s2_den = s2_red[0] + exp(s2_sink[h] - s2_max); }
+    workgroupBarrier();
+    let inv = 1.0 / s2_den;
+    var v = lid;
+    loop {
+        if (v >= m) { break; }
+        s2_w[h * m + v] = s2_sc[v] * inv;
+        v = v + 256u;
+    }
+}
+
+@group(0) @binding(0) var<storage, read>       sy_w   : array<f32>;   // nh*m
+@group(0) @binding(1) var<storage, read>       sy_kv  : array<f32>;
+@group(0) @binding(2) var<storage, read>       sy_idx : array<u32>;
+@group(0) @binding(3) var<storage, read_write> sy_out : array<f32>;   // nh*hd
+@group(0) @binding(4) var<uniform>             sy_p   : Sa2P;
+
+@compute @workgroup_size(256)
+fn sa_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let hd = sy_p.hd;
+    if (i >= sy_p.nh * hd) { return; }
+    let h = i / hd;
+    let d = i % hd;
+    let m = sy_p.m;
+    let wb = h * m;
+    var acc = 0.0;
+    for (var t = 0u; t < m; t = t + 1u) {
+        acc = acc + sy_w[wb + t] * sy_kv[sy_idx[t] * hd + d];
+    }
+    sy_out[i] = acc;
+}
+
 // ── The KV compressor's pooling step (DeepSeek-V4) ──────────────────────────
 //
 // A softmax over the slot axis taken PER DIMENSION — not per token — then the
@@ -5527,6 +5635,8 @@ struct Ctx {
     top_k_index: wgpu::ComputePipeline,
     moe_route: wgpu::ComputePipeline,
     sparse_attend: wgpu::ComputePipeline,
+    sa_scores: wgpu::ComputePipeline,
+    sa_apply: wgpu::ComputePipeline,
     hc_pre_fold: wgpu::ComputePipeline,
     hc_post_expand: wgpu::ComputePipeline,
     q4tp_mv: wgpu::ComputePipeline,
@@ -6031,6 +6141,8 @@ fn init() -> Result<Ctx, String> {
     let top_k_index = pipe("top_k_index");
     let moe_route = pipe("moe_route");
     let sparse_attend = pipe("sparse_attend");
+    let sa_scores = pipe("sa_scores");
+    let sa_apply = pipe("sa_apply");
     let hc_pre_fold = pipe("hc_pre_fold");
     let hc_post_expand = pipe("hc_post_expand");
     let q4tp_mv = pipe("q4tp_matvec");
@@ -6237,6 +6349,8 @@ fn init() -> Result<Ctx, String> {
         top_k_index,
         moe_route,
         sparse_attend,
+        sa_scores,
+        sa_apply,
         hc_pre_fold,
         hc_post_expand,
         q4tp_mv,
@@ -15946,6 +16060,70 @@ fn frame_up(c: &Ctx, tag: u8, data: &[u8]) -> wgpu::Buffer {
     b
 }
 
+/// The two-dispatch sparse attention: scores per head, then the weighted sum
+/// over nh*hd independent outputs. Same numbers as the one-workgroup-per-head
+/// kernel, spread across the card instead of 64 groups of it — which measured
+/// 0.54 ms a layer and was the whole cost of the block once its encoding was
+/// cached away.
+#[allow(clippy::too_many_arguments)]
+fn encode_sparse_attend2(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    q: &wgpu::Buffer,
+    kv: &wgpu::Buffer,
+    ixb: &wgpu::Buffer,
+    sink: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    nh: usize,
+    hd: usize,
+    m: usize,
+    scale: f32,
+) {
+    let wbuf = frame_buf(c, 9, nh * m.max(1) * 4, false);
+    let p = uniform_mixed(c, [nh as u32, hd as u32, m as u32], scale);
+    {
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.sa_scores.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, q),
+                bind_buf(1, kv),
+                bind_buf(2, ixb),
+                bind_buf(3, sink),
+                bind_buf(4, &wbuf),
+                bind_buf(5, &p),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.sa_scores);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(nh as u32, 1, 1);
+    }
+    {
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.sa_apply.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &wbuf),
+                bind_buf(1, kv),
+                bind_buf(2, ixb),
+                bind_buf(3, out),
+                bind_buf(4, &p),
+            ],
+        });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c.sa_apply);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(((nh * hd) as u32).div_ceil(256), 1, 1);
+    }
+}
+
 /// The one thing that has to survive between tokens. `off` and `data` are in
 /// floats; the buffer is created on first use at `cap` and never shrinks.
 pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: usize) -> bool {
@@ -16189,6 +16367,7 @@ pub fn dsv4_attn_frame(
     let mid = frame_buf(c, 7, g.o_groups * g.o_lora * 4, false);
     let yb = frame_buf(c, 8, g.dim * 4, false);
 
+    let t_all = std::time::Instant::now();
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -16202,30 +16381,9 @@ pub fn dsv4_attn_frame(
     encode_rope_heads(
         c, &mut enc, &q, &freq, &posb, g.nh, g.hd, g.rd, true, false, (33, kv_id, li),
     );
-    {
-        // The index COUNT rides in the uniform and changes every token, so
-        // this one bind group cannot be cached on the layer alone.
-        let p = uniform_mixed(c, [g.nh as u32, g.hd as u32, idxs.len() as u32], g.scale);
-        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &c.sparse_attend.get_bind_group_layout(0),
-            entries: &[
-                bind_buf(0, &q),
-                bind_buf(1, &cache),
-                bind_buf(2, &ixb),
-                bind_buf(3, &sink),
-                bind_buf(4, &attn),
-                bind_buf(5, &p),
-            ],
-        });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&c.sparse_attend);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(g.nh as u32, 1, 1);
-    }
+    encode_sparse_attend2(
+        c, &mut enc, &q, &cache, &ixb, &sink, &attn, g.nh, g.hd, idxs.len(), g.scale,
+    );
     encode_rope_heads(
         c, &mut enc, &attn, &freq, &posb, g.nh, g.hd, g.rd, false, true, (34, kv_id, li),
     );
@@ -16284,10 +16442,24 @@ pub fn dsv4_attn_frame(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "dsv4-attn-stage",
     );
+    let t_enc = std::time::Instant::now();
     let ok = readback(c, enc, src, &stage, (n * 4) as u64, &mut out[..n]);
     drop(sc);
+    ATT_ENC_NS.fetch_add(
+        t_enc.duration_since(t_all).as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    ATT_WAIT_NS.fetch_add(
+        t_enc.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     ok
 }
+
+/// Time inside `dsv4_attn_frame`, split at the submit — the same question the
+/// MoE frame already answers, asked of the block that now costs more.
+pub static ATT_ENC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ATT_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One DeepSeek-V4 MoE block on the device: route, run the chosen experts and
 /// the shared one, sum. One submission.
@@ -16566,28 +16738,10 @@ pub fn sparse_attend_for_test(
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sa") });
-    {
-        let layout = c.sparse_attend.get_bind_group_layout(0);
-        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &[
-                bind_buf(0, &qb),
-                bind_buf(1, &kvb),
-                bind_buf(2, &ib),
-                bind_buf(3, &sb),
-                bind_buf(4, &ob),
-                bind_buf(5, &p),
-            ],
-        });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&c.sparse_attend);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(nh as u32, 1, 1);
-    }
+    let _ = &p; // the split path builds its own params
+    encode_sparse_attend2(
+        c, &mut enc, &qb, &kvb, &ib, &sb, &ob, nh, hd, idxs.len(), scale,
+    );
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(
         &c.device,
