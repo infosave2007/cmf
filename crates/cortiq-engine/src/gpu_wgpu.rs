@@ -4897,7 +4897,17 @@ struct Ctx {
     scratch: Mutex<Scratch>,
     /// Resident quant weights in VRAM — the WHOLE tensor is loaded once
     /// (key (base_ptr, idx)); ranges/batches address it by offset.
-    weight_bufs: Mutex<HashMap<(usize, usize), wgpu::Buffer>>,
+    ///
+    /// Residency is DEMAND-DRIVEN and evicting: nothing is preloaded, the
+    /// set grows as the model routes, and when the budget is full the
+    /// least-valuable tensor makes room. Without eviction the first
+    /// tensors to arrive owned the device for the process's life — a
+    /// model that switched from prose to code kept the prose experts and
+    /// ran the code ones on the CPU forever. The two working sets overlap
+    /// at a Jaccard of 0.095, measured, so that is not a corner case.
+    weight_bufs: Mutex<HashMap<(usize, usize), Resident>>,
+    /// Access clock for the aging above — one tick per weight lookup.
+    res_clock: std::sync::atomic::AtomicU64,
     /// row_scale buffer per (idx, row0) — small, cached.
     rs_bufs: Mutex<HashMap<(usize, usize), wgpu::Buffer>>,
     /// Device K/V cache mirror per (kv_id, layer) for the token graph:
@@ -5531,6 +5541,7 @@ fn init() -> Result<Ctx, String> {
         resident: std::sync::atomic::AtomicU64::new(0),
         scratch: Mutex::new(Scratch::default()),
         weight_bufs: Mutex::new(HashMap::new()),
+        res_clock: std::sync::atomic::AtomicU64::new(0),
         uniforms: Mutex::new(HashMap::new()),
         uniforms8: Mutex::new(HashMap::new()),
         const_bufs: Mutex::new(HashMap::new()),
@@ -5552,15 +5563,72 @@ pub fn is_discrete() -> bool {
 /// new tensors return None and their ops run on the CPU. Decode touches
 /// layers in order, so the resident set is deterministically the first
 /// layers — ngl-style offload without configuration.
+/// One tensor living on the device, with what the eviction policy needs.
+struct Resident {
+    buf: wgpu::Buffer,
+    bytes: u64,
+    /// Use count, aged lazily: the score at time `t` is `uses ·
+    /// DECAY^(t − last)`. Plain frequency ossifies — an expert that was
+    /// popular during the first prompt outranks one being used right now,
+    /// forever.
+    uses: f32,
+    last: u64,
+}
+
+/// Per-tick multiplier for the aged use count. 0.999 halves a score over
+/// ~700 lookups: long enough that a steady working set is never disturbed,
+/// short enough that a change of task migrates within a prompt or two.
+const RES_DECAY: f32 = 0.999;
+
+/// A tensor touched within this many lookups is not evicted, whatever its
+/// score. Without it a budget slightly smaller than the working set evicts
+/// and re-uploads on every token, which is slower than never using the
+/// device at all.
+const RES_HYSTERESIS: u64 = 512;
+
+fn res_score(e: &Resident, now: u64) -> f32 {
+    e.uses * RES_DECAY.powi((now.saturating_sub(e.last)).min(4096) as i32)
+}
+
 fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu::Buffer> {
     use std::sync::atomic::Ordering;
+    let now = c.res_clock.fetch_add(1, Ordering::Relaxed);
     let mut map = c.weight_bufs.lock().unwrap();
-    if let Some(b) = map.get(&key) {
-        return Some(b.clone());
+    if let Some(e) = map.get_mut(&key) {
+        e.uses = res_score(e, now) + 1.0;
+        e.last = now;
+        return Some(e.buf.clone());
     }
     let len = full_quant.len() as u64;
+    if len > c.vram_budget {
+        return None; // one tensor larger than the whole budget
+    }
+    // Make room by evicting the least valuable, skipping anything touched
+    // recently. Failing to free enough is not an error: the tensor stays on
+    // the CPU, which is the pressure valve that keeps a too-small budget
+    // from thrashing the bus.
     if c.resident.load(Ordering::Relaxed) + len > c.vram_budget {
-        return None; // budget spent — this tensor stays on the CPU
+        let mut cand: Vec<((usize, usize), f32, u64)> = map
+            .iter()
+            .filter(|(_, e)| now.saturating_sub(e.last) > RES_HYSTERESIS)
+            .map(|(k, e)| (*k, res_score(e, now), e.bytes))
+            .collect();
+        cand.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut freed = 0u64;
+        for (k, _, bytes) in cand {
+            if c.resident.load(Ordering::Relaxed) - freed + len <= c.vram_budget {
+                break;
+            }
+            map.remove(&k);
+            freed += bytes;
+        }
+        if freed > 0 {
+            c.resident.fetch_sub(freed, Ordering::Relaxed);
+            crate::gpu::probe_note_cold();
+        }
+        if c.resident.load(Ordering::Relaxed) + len > c.vram_budget {
+            return None; // still no room — honest CPU
+        }
     }
     crate::gpu::probe_note_cold(); // first touch = upload, not a steady sample
     // DEVICE-LOCAL residency: create_buffer_init maps at creation → the buffer
@@ -5576,7 +5644,15 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
     });
     c.queue.write_buffer(&buf, 0, full_quant);
     c.resident.fetch_add(len, Ordering::Relaxed);
-    map.insert(key, buf.clone());
+    map.insert(
+        key,
+        Resident {
+            buf: buf.clone(),
+            bytes: len,
+            uses: 1.0,
+            last: now,
+        },
+    );
     Some(buf)
 }
 
