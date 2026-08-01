@@ -14,7 +14,7 @@ fn the_two_ladder_forms_agree() {
     let Ok(path) = std::env::var("CMF_Q4TP_PARITY") else {
         return;
     };
-    let model = cortiq_core::CmfModel::open(&path).expect("open");
+    let model = std::sync::Arc::new(cortiq_core::CmfModel::open(&path).expect("open"));
     let mut worst = 0.0f64;
     let mut worst_row = String::new();
     let mut checked = 0;
@@ -49,4 +49,40 @@ fn the_two_ladder_forms_agree() {
     }
     println!("худшее относительное расхождение лестниц: {worst:.3e}");
     println!("  {worst_row}");
+
+    // And the other half of the question, which needs no device at all: does
+    // the quantized matvec agree with the format's own dequantizer?
+    let mut checked = 0;
+    for e in model.tensors.iter() {
+        if e.dtype != cortiq_core::TensorDtype::Q4TiledP || e.shape.len() != 2 {
+            continue;
+        }
+        let (rows, cols) = (e.shape[0], e.shape[1]);
+        if cols % 32 != 0 {
+            continue;
+        }
+        let xs: Vec<f32> = (0..cols).map(|i| ((i * 7) as f32 * 0.013).sin()).collect();
+        let t = cortiq_engine::qtensor::QTensor::from_model(&model, &e.name).expect("t");
+        let mut mv = vec![0.0f32; rows];
+        t.matvec(&xs, &mut mv, None);
+        let bytes = model.tensor_bytes(&e.name).expect("bytes");
+        let mut w = vec![0.0f32; rows * cols];
+        cortiq_core::quant::dequant_q4tp(bytes, rows, cols, &mut w);
+        let plain: Vec<f32> = (0..rows)
+            .map(|r| {
+                w[r * cols..(r + 1) * cols]
+                    .iter()
+                    .zip(&xs)
+                    .map(|(a, b)| a * b)
+                    .sum()
+            })
+            .collect();
+        let num: f32 = plain.iter().zip(&mv).map(|(a, b)| (a - b) * (a - b)).sum();
+        let den: f32 = plain.iter().map(|a| a * a).sum::<f32>().max(1e-20);
+        println!("{}: [{rows}x{cols}] матвек↔деквант {:.3e}", e.name, (num / den).sqrt());
+        checked += 1;
+        if checked >= 6 {
+            break;
+        }
+    }
 }

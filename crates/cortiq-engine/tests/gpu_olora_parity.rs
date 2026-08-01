@@ -3,6 +3,11 @@
 //!     CMF_Q4TP_PARITY=/root/gtoy.cmf cargo test -p cortiq-engine \
 //!         --features gpu --test gpu_olora_parity -- --nocapture
 //!
+//!
+//! Run with `CMF_SDOT=0`. Without it the CPU arm quantizes ACTIVATIONS to
+//! int8 (the A8W8 path, on by default wherever AVX2 or ARM dotprod exists),
+//! and the comparison measures that approximation — ~9e-4 relative, uniform
+//! across tensors — instead of the device. It cost an evening once.
 //! The operator differs from a plain matvec by one thing only — each row
 //! reads its own group's slice of the input — and that one thing is invisible
 //! at `groups = 1`, where it degenerates into the matvec that already passes.

@@ -4,6 +4,11 @@
 //!     CMF_GPU=wgpu CMF_Q4TP_PARITY=/root/gtoy.cmf cargo test -p cortiq-engine \
 //!         --features gpu --test gpu_dsv4_frame -- --nocapture
 //!
+//!
+//! Run with `CMF_SDOT=0`. Without it the CPU arm quantizes ACTIVATIONS to
+//! int8 (the A8W8 path, on by default wherever AVX2 or ARM dotprod exists),
+//! and the comparison measures that approximation — ~9e-4 relative, uniform
+//! across tensors — instead of the device. It cost an evening once.
 //! Each kernel in the chain is already verified alone. What this adds is the
 //! wiring: a buffer bound to the wrong stage, a norm applied to the pre-LoRA
 //! vector instead of the post-, an output projection reading the queries
@@ -19,6 +24,10 @@ fn the_fused_attention_block_matches_the_cpu() {
     let Ok(path) = std::env::var("CMF_Q4TP_PARITY") else {
         return;
     };
+    // Exact CPU arm, or the reference is the int8-activation approximation
+    // and every stage below reads ~1e-3 away for reasons that have nothing to
+    // do with the frame.
+    unsafe { std::env::set_var("CMF_SDOT", "0") };
     let model = std::sync::Arc::new(cortiq_core::CmfModel::open(&path).expect("open"));
     let find = |n: &str| model.tensors.iter().position(|e| e.name == n);
     let p = "model.layers.0.self_attn";

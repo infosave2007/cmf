@@ -4,6 +4,11 @@
 //!
 //!     CMF_Q4TP_PARITY=/root/gtoy.cmf cargo test -p cortiq-engine --test gpu_q4tp_parity -- --nocapture
 //!
+//!
+//! Run with `CMF_SDOT=0`. Without it the CPU arm quantizes ACTIVATIONS to
+//! int8 (the A8W8 path, on by default wherever AVX2 or ARM dotprod exists),
+//! and the comparison measures that approximation — ~9e-4 relative, uniform
+//! across tensors — instead of the device. It cost an evening once.
 //! It exists to bisect a divergence seen end to end: a whole MoE block on
 //! the device answered 220% away from the CPU, and the two candidates —
 //! the kernel itself and the block that wires it — cannot be told apart
