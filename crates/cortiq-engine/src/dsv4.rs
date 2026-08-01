@@ -1219,6 +1219,15 @@ pub fn forward_token(
             &mut scratch,
             |folded, out| moe_step(folded, l, cfg, token_id, li, pool, out),
         );
+        if trace_on() && (st.pos % 64 == 0 || st.pos == 199) {
+            eprintln!(
+                "[dsv4]  кеши слоя {li}: окно={} сжатых={} индекс={} (ratio={:?})",
+                st.window[li].len() / cfg.head_dim.max(1),
+                st.compressed[li].len() / cfg.head_dim.max(1),
+                st.index_kv[li].len().max(1) / 128,
+                l.compressor.as_ref().map(|c| (c.ratio, c.overlap)),
+            );
+        }
         if trace_on() {
             let bad = state.iter().filter(|v| !v.is_finite()).count();
             eprintln!(
