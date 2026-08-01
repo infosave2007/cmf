@@ -5684,6 +5684,8 @@ struct Ctx {
     /// per token — 430 allocations a token on the release — is most of what a
     /// submission costs. Created once, written thereafter.
     dsv4_scratch: Mutex<HashMap<(u8, usize), wgpu::Buffer>>,
+    /// (epoch, bind groups) for the dsv4 frames — see `cached_bind`.
+    dsv4_binds: Mutex<(u64, HashMap<(u8, u64, usize), wgpu::BindGroup>)>,
     /// Access clock for the aging above — one tick per weight lookup.
     res_clock: std::sync::atomic::AtomicU64,
     /// row_scale buffer per (idx, row0) — small, cached.
@@ -6346,6 +6348,7 @@ fn init() -> Result<Ctx, String> {
         weight_bufs: Mutex::new(HashMap::new()),
         dsv4_kv: Mutex::new(HashMap::new()),
         dsv4_scratch: Mutex::new(HashMap::new()),
+        dsv4_binds: Mutex::new((0, HashMap::new())),
         res_clock: std::sync::atomic::AtomicU64::new(0),
         uniforms: Mutex::new(HashMap::new()),
         uniforms8: Mutex::new(HashMap::new()),
@@ -13447,6 +13450,7 @@ fn encode_q4tp_mv4(
 /// The one-row q4tp kernel, which is the one `gpu_q4tp_parity` blesses.
 /// `encode_q4tp_mv4` picks a wider variant by shape; when a frame has to
 /// agree with the CPU to the last bit, agreement beats throughput.
+#[allow(clippy::too_many_arguments)]
 fn encode_q4tp_mv1(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
@@ -13455,17 +13459,20 @@ fn encode_q4tp_mv1(
     y: &wgpu::Buffer,
     rows: usize,
     cols: usize,
+    bkey: (u8, u64, usize),
 ) {
-    let p_buf = uniform_u32x4(c, [(cols / 32) as u32, rows as u32, cols as u32, 0]);
-    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &c.q4tp_mv.get_bind_group_layout(0),
-        entries: &[
-            bind_buf(0, weight),
-            bind_buf(1, xs),
-            bind_buf(2, y),
-            bind_buf(3, &p_buf),
-        ],
+    let bind = cached_bind(c, bkey, || {
+        let p_buf = uniform_u32x4(c, [(cols / 32) as u32, rows as u32, cols as u32, 0]);
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.q4tp_mv.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, weight),
+                bind_buf(1, xs),
+                bind_buf(2, y),
+                bind_buf(3, &p_buf),
+            ],
+        })
     });
     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: None,
@@ -15829,17 +15836,20 @@ fn encode_rmsnorm(
     o: &wgpu::Buffer,
     n: usize,
     eps: f32,
+    bkey: (u8, u64, usize),
 ) {
-    let p = uniform_u32x4(c, [n as u32, 0, eps.to_bits(), 0]);
-    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &c.rmsnorm.get_bind_group_layout(0),
-        entries: &[
-            bind_buf(0, x),
-            bind_buf(1, w),
-            bind_buf(2, o),
-            bind_buf(3, &p),
-        ],
+    let bind = cached_bind(c, bkey, || {
+        let p = uniform_u32x4(c, [n as u32, 0, eps.to_bits(), 0]);
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.rmsnorm.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, x),
+                bind_buf(1, w),
+                bind_buf(2, o),
+                bind_buf(3, &p),
+            ],
+        })
     });
     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: None,
@@ -15862,18 +15872,21 @@ fn encode_rope_heads(
     rd: usize,
     rms: bool,
     inverse: bool,
+    bkey: (u8, u64, usize),
 ) {
-    let flags = (rms as u32) | ((inverse as u32) << 1);
-    let p = uniform_u32x4(c, [nh as u32, hd as u32, rd as u32, flags]);
-    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &c.rope_heads.get_bind_group_layout(0),
-        entries: &[
-            bind_buf(0, x),
-            bind_buf(1, freq),
-            bind_buf(2, &p),
-            bind_buf(3, posb),
-        ],
+    let bind = cached_bind(c, bkey, || {
+        let flags = (rms as u32) | ((inverse as u32) << 1);
+        let p = uniform_u32x4(c, [nh as u32, hd as u32, rd as u32, flags]);
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.rope_heads.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, x),
+                bind_buf(1, freq),
+                bind_buf(2, &p),
+                bind_buf(3, posb),
+            ],
+        })
     });
     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: None,
@@ -15987,6 +16000,29 @@ pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: us
             .write_buffer(&e.0, (off * 4) as u64, bytemuck::cast_slice(data));
     }
     true
+}
+
+/// Bind groups for the dsv4 frames, keyed by role and layer. Their buffers
+/// are pooled and stable between tokens, so building 11 of them per layer per
+/// token — 473 a token on the release — was pure host overhead. The epoch
+/// invalidates the lot whenever a pooled buffer is rebuilt underneath them.
+fn cached_bind<F>(c: &Ctx, key: (u8, u64, usize), build: F) -> wgpu::BindGroup
+where
+    F: FnOnce() -> wgpu::BindGroup,
+{
+    use std::sync::atomic::Ordering;
+    let epoch = GREW.load(Ordering::Relaxed);
+    let mut m = c.dsv4_binds.lock().unwrap();
+    if m.0 != epoch {
+        m.0 = epoch;
+        m.1.clear();
+    }
+    if let Some(b) = m.1.get(&key) {
+        return b.clone();
+    }
+    let b = build();
+    m.1.insert(key, b.clone());
+    b
 }
 
 /// Bumped whenever a cache buffer is reallocated. A caller that writes only
@@ -16159,14 +16195,16 @@ pub fn dsv4_attn_frame(
             label: Some("dsv4-attn"),
         });
     if qn_in.is_none() {
-        encode_q4tp_mv1(c, &mut enc, &wb[0], &hb, &qr, g.q_lora, g.dim);
-        encode_rmsnorm(c, &mut enc, &qr, &qnw, &qn, g.q_lora, g.eps);
+        encode_q4tp_mv1(c, &mut enc, &wb[0], &hb, &qr, g.q_lora, g.dim, (30, kv_id, li));
+        encode_rmsnorm(c, &mut enc, &qr, &qnw, &qn, g.q_lora, g.eps, (31, kv_id, li));
     }
-    encode_q4tp_mv1(c, &mut enc, &wb[1], &qn, &q, g.nh * g.hd, g.q_lora);
+    encode_q4tp_mv1(c, &mut enc, &wb[1], &qn, &q, g.nh * g.hd, g.q_lora, (32, kv_id, li));
     encode_rope_heads(
-        c, &mut enc, &q, &freq, &posb, g.nh, g.hd, g.rd, true, false,
+        c, &mut enc, &q, &freq, &posb, g.nh, g.hd, g.rd, true, false, (33, kv_id, li),
     );
     {
+        // The index COUNT rides in the uniform and changes every token, so
+        // this one bind group cannot be cached on the layer alone.
         let p = uniform_mixed(c, [g.nh as u32, g.hd as u32, idxs.len() as u32], g.scale);
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -16189,21 +16227,23 @@ pub fn dsv4_attn_frame(
         pass.dispatch_workgroups(g.nh as u32, 1, 1);
     }
     encode_rope_heads(
-        c, &mut enc, &attn, &freq, &posb, g.nh, g.hd, g.rd, false, true,
+        c, &mut enc, &attn, &freq, &posb, g.nh, g.hd, g.rd, false, true, (34, kv_id, li),
     );
     {
         let rows = g.o_groups * g.o_lora;
         let cols = g.nh * g.hd / g.o_groups;
-        let p = uniform_u32x4(c, [(cols / 32) as u32, rows as u32, g.o_lora as u32, 0]);
-        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &c.o_lora_a.get_bind_group_layout(0),
-            entries: &[
-                bind_buf(0, &wb[2]),
-                bind_buf(1, &attn),
-                bind_buf(2, &mid),
-                bind_buf(3, &p),
-            ],
+        let bind = cached_bind(c, (36, kv_id, li), || {
+            let p = uniform_u32x4(c, [(cols / 32) as u32, rows as u32, g.o_lora as u32, 0]);
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &c.o_lora_a.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, &wb[2]),
+                    bind_buf(1, &attn),
+                    bind_buf(2, &mid),
+                    bind_buf(3, &p),
+                ],
+            })
         });
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
@@ -16221,6 +16261,7 @@ pub fn dsv4_attn_frame(
         &yb,
         g.dim,
         g.o_groups * g.o_lora,
+        (35, kv_id, li),
     );
 
     let tap = std::env::var("CMF_DSV4_FRAME_TAP").unwrap_or_default();
@@ -16399,20 +16440,25 @@ pub fn dsv4_moe_frame(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("dsv4-moe"),
         });
+    // The layer's identity for the bind cache: its first expert's directory
+    // index, which is unique per layer and already at hand.
+    let lkey = w.experts.first().map(|e| e.0).unwrap_or(0);
     {
-        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &c.moe_route.get_bind_group_layout(0),
-            entries: &[
-                bind_buf(0, &lg),
-                bind_buf(1, &bs),
-                bind_buf(2, &mk),
-                bind_buf(3, &fc),
-                bind_buf(4, &msel),
-                bind_buf(5, &mwt),
-                bind_buf(6, &mcnt),
-                bind_buf(7, &rp),
-            ],
+        let bind = cached_bind(c, (40, 0, lkey), || {
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &c.moe_route.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, &lg),
+                    bind_buf(1, &bs),
+                    bind_buf(2, &mk),
+                    bind_buf(3, &fc),
+                    bind_buf(4, &msel),
+                    bind_buf(5, &mwt),
+                    bind_buf(6, &mcnt),
+                    bind_buf(7, &rp),
+                ],
+            })
         });
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
@@ -16422,33 +16468,37 @@ pub fn dsv4_moe_frame(
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(1, 1, 1);
 
-        let bg_gu = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: l_gu,
-            entries: &[
-                bind_buf(0, &gate_all),
-                bind_buf(1, &up_all),
-                bind_buf(2, &xb),
-                bind_buf(3, &msel),
-                bind_buf(4, &mact),
-                bind_buf(5, &gu_u),
-            ],
+        let bg_gu = cached_bind(c, (41, 0, lkey), || {
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: l_gu,
+                entries: &[
+                    bind_buf(0, &gate_all),
+                    bind_buf(1, &up_all),
+                    bind_buf(2, &xb),
+                    bind_buf(3, &msel),
+                    bind_buf(4, &mact),
+                    bind_buf(5, &gu_u),
+                ],
+            })
         });
         pass.set_pipeline(p_gu);
         pass.set_bind_group(0, &bg_gu, &[]);
         pass.dispatch_workgroups(g.inter as u32, slots as u32, 1);
 
-        let bg_dn = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: l_dn,
-            entries: &[
-                bind_buf(0, &down_all),
-                bind_buf(1, &mact),
-                bind_buf(2, &msel),
-                bind_buf(3, &mwt),
-                bind_buf(4, &ob),
-                bind_buf(5, &dn_u),
-            ],
+        let bg_dn = cached_bind(c, (42, 0, lkey), || {
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: l_dn,
+                entries: &[
+                    bind_buf(0, &down_all),
+                    bind_buf(1, &mact),
+                    bind_buf(2, &msel),
+                    bind_buf(3, &mwt),
+                    bind_buf(4, &ob),
+                    bind_buf(5, &dn_u),
+                ],
+            })
         });
         pass.set_pipeline(p_dn);
         pass.set_bind_group(0, &bg_dn, &[]);
