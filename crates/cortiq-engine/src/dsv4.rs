@@ -1615,7 +1615,12 @@ fn dsv4_layer_loop(
         .into_iter()
         .flatten()
         .all(|i| crate::gpu_wgpu::dsv4_weight_ready(&model, i));
+        // The layer frame's router has no remap yet, so a PARTIAL packing
+        // there would silently become a mask — the one thing that is known to
+        // wreck this model. Such a layer goes to the host until the frame
+        // learns to hand cold picks back the way the two-frame path does.
         on_dev[li] = attn_ok
+            && pk.globals.len() == cfg.n_routed_experts
             && crate::gpu_wgpu::dsv4_experts_ready(&model, &pk.tensors, cfg.moe_inter, dim, gu_q2);
     }
     if !on_dev.iter().any(|&x| x) {
