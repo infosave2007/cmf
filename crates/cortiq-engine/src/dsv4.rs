@@ -1150,6 +1150,18 @@ pub(crate) mod prof {
                     e / calls as f64,
                     wt / calls as f64,
                 );
+                let an = crate::gpu_wgpu::ATT_GPU_N.load(Ordering::Relaxed);
+                if an > 0 {
+                    let g = |i: usize| {
+                        crate::gpu_wgpu::ATT_GPU_NS[i].load(Ordering::Relaxed) as f64
+                            / 1e6 / an as f64
+                    };
+                    eprintln!(
+                        "[dsv4-профиль]   ВНИМАНИЕ НА КАРТЕ на вызов: одиночное {:.3} мс, \
+                         оценки {:.3} мс, применение {:.3} мс",
+                        g(0), g(1), g(2),
+                    );
+                }
                 let gn = crate::gpu_wgpu::MOE_GPU_N.load(Ordering::Relaxed);
                 let gns = crate::gpu_wgpu::MOE_GPU_NS[0].load(Ordering::Relaxed);
                 if gn > 0 && gns > 0 {

@@ -17232,6 +17232,19 @@ fn sa_split() -> bool {
 /// 0.54 ms a layer and was the whole cost of the block once its encoding was
 /// cached away.
 #[allow(clippy::too_many_arguments)]
+/// Take the next slot pair and record it under `which`, so the frame that
+/// owns the encoder can resolve every pass it wrote.
+fn ts_pair(c: &Ctx, which: usize) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+    let (qs, _, _) = c.ts_query.as_ref()?;
+    let slot = (TS_SLOT.fetch_add(2, std::sync::atomic::Ordering::Relaxed) % 254) as u32;
+    TS_PAIRS.lock().unwrap().push((which, slot));
+    Some(wgpu::ComputePassTimestampWrites {
+        query_set: qs,
+        beginning_of_pass_write_index: Some(slot),
+        end_of_pass_write_index: Some(slot + 1),
+    })
+}
+
 fn encode_sparse_attend2(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
@@ -17267,7 +17280,7 @@ fn encode_sparse_attend2(
         });
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
-            timestamp_writes: None,
+            timestamp_writes: ts_pair(c, 0),
         });
         pass.set_pipeline(&c.sparse_attend);
         pass.set_bind_group(0, &bind, &[]);
@@ -17291,7 +17304,7 @@ fn encode_sparse_attend2(
         });
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
-            timestamp_writes: None,
+            timestamp_writes: ts_pair(c, 1),
         });
         pass.set_pipeline(&c.sa_scores);
         pass.set_bind_group(0, &bind, &[]);
@@ -17311,7 +17324,7 @@ fn encode_sparse_attend2(
         });
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
-            timestamp_writes: None,
+            timestamp_writes: ts_pair(c, 2),
         });
         pass.set_pipeline(&c.sa_apply);
         pass.set_bind_group(0, &bind, &[]);
@@ -18402,8 +18415,41 @@ pub fn dsv4_attn_frame(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "dsv4-attn-stage",
     );
+    // Resolve every pair the passes above took, into the staging buffer
+    // back to back — one copy per pass, all inside this frame's encoder.
+    let pairs: Vec<(usize, u32)> = std::mem::take(&mut TS_PAIRS.lock().unwrap());
+    if let Some((qs, resolve, tstage)) = &c.ts_query {
+        for (n, (_, slot)) in pairs.iter().enumerate() {
+            enc.resolve_query_set(qs, *slot..*slot + 2, resolve, 0);
+            enc.copy_buffer_to_buffer(resolve, 0, tstage, (n as u64) * 16, 16);
+        }
+    }
     let t_enc = std::time::Instant::now();
     let ok = readback(c, enc, src, &stage, (n * 4) as u64, &mut out[..n]);
+    // The card's clock, read after the frame's own fence.
+    if ok && !pairs.is_empty() {
+        if let Some((_, _, tstage)) = &c.ts_query {
+            let bytes = (pairs.len() as u64) * 16;
+            let (tx, rx) = std::sync::mpsc::channel();
+            tstage.map_async(wgpu::MapMode::Read, ..bytes, move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            if rx.recv().map(|r| r.is_ok()).unwrap_or(false) {
+                if let Ok(raw) = tstage.get_mapped_range(..bytes) {
+                    let t: &[u64] = bytemuck::cast_slice(&raw);
+                    for (n, (which, _)) in pairs.iter().enumerate() {
+                        let d = t[2 * n + 1].saturating_sub(t[2 * n]);
+                        let ns = (d as f64 * c.ts_period as f64) as u64;
+                        ATT_GPU_NS[*which].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    drop(raw);
+                    ATT_GPU_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            tstage.unmap();
+        }
+    }
     drop(sc);
     ATT_ENC_NS.fetch_add(
         t_enc.duration_since(t_all).as_nanos() as u64,
@@ -18842,6 +18888,16 @@ pub static MOE_GPU_NS: [std::sync::atomic::AtomicU64; 3] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 pub static MOE_GPU_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Card time of the attention frame's passes: 0 = the single-kernel sparse
+/// attend, 1 = its scores half, 2 = its apply half.
+pub static ATT_GPU_NS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+pub static ATT_GPU_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// (which counter, slot) for every pass the current encoder stamped.
+static TS_PAIRS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
 /// Rotating timestamp slot, so no two frames in flight share a query.
 static TS_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// The pair the last encoded pass took, for the frame that resolves it.
