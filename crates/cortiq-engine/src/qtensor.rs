@@ -938,24 +938,17 @@ impl QTensor {
                     // keeps the winner, same as q4_block above.
                     if *rows * *cols >= 8_388_608 && crate::gpu::enabled_here() {
                         let t0 = std::time::Instant::now();
-                        match crate::gpu::probe_arm(crate::gpu::OpClass::Matvec) {
+                        let cls = crate::gpu::matvec_class(*rows, *cols);
+                        match crate::gpu::probe_arm(cls) {
                             crate::gpu::ProbeArm::Gpu => {
                                 if crate::gpu::q4tp_matvec(model, *idx, x, *rows, *cols, out) {
-                                    crate::gpu::probe_record(
-                                        crate::gpu::OpClass::Matvec,
-                                        true,
-                                        t0.elapsed(),
-                                    );
+                                    crate::gpu::probe_record(cls, true, t0.elapsed());
                                     return;
                                 }
                             }
                             crate::gpu::ProbeArm::CpuTimed => {
                                 q4tp_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
-                                crate::gpu::probe_record(
-                                    crate::gpu::OpClass::Matvec,
-                                    false,
-                                    t0.elapsed(),
-                                );
+                                crate::gpu::probe_record(cls, false, t0.elapsed());
                                 return;
                             }
                             crate::gpu::ProbeArm::Cpu => {}

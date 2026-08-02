@@ -132,6 +132,24 @@ pub enum OpClass {
     /// the CPU AMX arm is competitive) — a single shared verdict locks
     /// the wrong arm for whichever population samples second.
     MatmatWide = 4,
+    /// The lm_head itself, apart from the merely-large matvecs. Same
+    /// reasoning as `MatmatWide`, and DeepSeek-V4 is where it bit: its
+    /// attention projections are 37M weights and its head is 529M, so
+    /// the projections' verdict — CPU, honestly measured at 0.19 ms —
+    /// decided for a matvec fourteen times their size that took 11 ms
+    /// a token on the host.
+    MatvecHead = 5,
+}
+
+/// Which probe a large matvec belongs to. The head is an order of
+/// magnitude bigger than anything else that reaches this gate, and the
+/// two populations do not have the same answer.
+pub fn matvec_class(rows: usize, cols: usize) -> OpClass {
+    if rows * cols >= 67_108_864 {
+        OpClass::MatvecHead
+    } else {
+        OpClass::Matvec
+    }
 }
 
 /// Probe verdict for one call.
@@ -180,7 +198,8 @@ impl Probe {
     }
 }
 
-static PROBES: [Probe; 5] = [
+static PROBES: [Probe; 6] = [
+    Probe::new(),
     Probe::new(),
     Probe::new(),
     Probe::new(),
@@ -306,7 +325,7 @@ pub fn probe_record(c: OpClass, gpu: bool, dur: std::time::Duration) {
         {
             tracing::info!(
                 "gpu probe [{}]: gpu {:.2} ms vs cpu {:.2} ms per op → {}",
-                ["ffn", "matvec", "matmat", "qkv-batch", "matmat-wide"][c as usize],
+                ["ffn", "matvec", "matmat", "qkv-batch", "matmat-wide", "lm-head"][c as usize],
                 g / 1e6,
                 cp / 1e6,
                 if winner == 1 { "gpu" } else { "cpu" },
