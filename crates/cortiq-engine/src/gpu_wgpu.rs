@@ -5910,6 +5910,8 @@ struct Ctx {
     /// compressor without the host reading anything back: the streams are
     /// the only thing that carried state across the seam.
     dsv4_comp: Mutex<HashMap<(u8, u64, usize), [wgpu::Buffer; 4]>>,
+    /// The indexer's compressed cache per layer, grown as the sequence is.
+    dsv4_ixkv: Mutex<HashMap<(u64, usize), (wgpu::Buffer, usize)>>,
     /// (epoch, bind groups) for the dsv4 frames — see `cached_bind`.
     dsv4_binds: Mutex<(u64, HashMap<(u8, u64, usize), wgpu::BindGroup>)>,
     /// Access clock for the aging above — one tick per weight lookup.
@@ -6583,6 +6585,7 @@ fn init() -> Result<Ctx, String> {
         dsv4_kv: Mutex::new(HashMap::new()),
         dsv4_scratch: Mutex::new(HashMap::new()),
         dsv4_comp: Mutex::new(HashMap::new()),
+        dsv4_ixkv: Mutex::new(HashMap::new()),
         dsv4_binds: Mutex::new((0, HashMap::new())),
         res_clock: std::sync::atomic::AtomicU64::new(0),
         uniforms: Mutex::new(HashMap::new()),
@@ -16318,6 +16321,144 @@ pub struct Dsv4LayerGeom {
 /// Returns the next layer's normed hidden in `folded_next` (or this layer's
 /// state contribution when there is no next layer).
 #[allow(clippy::too_many_arguments)]
+/// Encode one layer's whole preparation — window, compressor, the indexer's
+/// compressor, the indexer — into the caller's encoder, and return the
+/// attended list's length.
+///
+/// The order matters and matches the host's: the compressors see the token
+/// BEFORE the window append changes what `filled` means, and the indexer
+/// scores against the cache its own compressor has just extended.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_encode_prep(
+    model: &Arc<CmfModel>,
+    p: &Dsv4Prep,
+    kv_id: u64,
+    li: usize,
+    hidden: &wgpu::Buffer,
+    qn: &wgpu::Buffer,
+    cache: &wgpu::Buffer,
+    idx_out: &wgpu::Buffer,
+    hd: usize,
+    window: usize,
+    dim: usize,
+    rope_dim: usize,
+    eps: f32,
+    pos: usize,
+    inv_freq: &[f32],
+    enc: &mut wgpu::CommandEncoder,
+) -> Option<usize> {
+    let c = ctx()?;
+    // The compressors first: both read this token's hidden state, and the
+    // attention one appends into the same cache buffer the window lives in,
+    // past the window's capacity.
+    let mut n_comp = p.n_comp;
+    if let Some((cw, cg)) = &p.comp {
+        if dsv4_compressor_frame(
+            model, cw, *cg, 0, kv_id, li, hidden, pos, inv_freq, cache, p.comp_dst_off, enc,
+        )
+        .is_some()
+        {
+            n_comp += 1;
+        }
+    }
+    let mut n_ix = p.n_ix;
+    let mut m = None;
+    if let Some((iw, ig, ixw, ixg)) = &p.ix {
+        let ixkv = dsv4_index_cache(kv_id, li, ixg.idim * (n_ix + 1))?;
+        if dsv4_compressor_frame(
+            model, iw, *ig, 1, kv_id, li, hidden, pos, inv_freq, &ixkv, p.ix_dst_off, enc,
+        )
+        .is_some()
+        {
+            n_ix += 1;
+        }
+        // Nothing compressed yet means nothing to score: attention sees the
+        // window alone, which is what the host does at the start of a
+        // sequence too.
+        if n_comp > 0 && n_ix > 0 {
+            m = dsv4_indexer_frame(
+                model, ixw, *ixg, kv_id, li, hidden, qn, &ixkv, n_ix, n_comp,
+                p.filled.min(window) + 1, pos, inv_freq, idx_out, enc,
+            );
+        }
+    }
+    let filled = dsv4_window_append(
+        model, p.wkv, p.kv_norm, hidden, cache, hd, window, p.filled, dim, rope_dim, eps,
+        pos, inv_freq, kv_id, li, enc,
+    )?;
+    match m {
+        Some(m) => Some(m),
+        // No indexer, or nothing to score: the list is the window, and every
+        // compressed position after it when there is no indexer to choose.
+        None => {
+            let k = if p.ix.is_none() { n_comp } else { 0 };
+            let pick: Vec<u32> = (0..k as u32).collect();
+            let pb = if pick.is_empty() {
+                frame_buf(c, 111, 4, true)
+            } else {
+                frame_up(c, 111, bytemuck::cast_slice(&pick))
+            };
+            encode_idx_build(c, enc, &pb, idx_out, filled, window, k);
+            Some(filled + k)
+        }
+    }
+}
+
+/// The indexer's own compressed cache, on the device and grown as the
+/// sequence does — the attention cache's twin, kept apart because the two
+/// have different widths.
+fn dsv4_index_cache(kv_id: u64, li: usize, floats: usize) -> Option<wgpu::Buffer> {
+    let c = ctx()?;
+    let cap = floats.next_power_of_two().max(1024);
+    let mut m = c.dsv4_ixkv.lock().unwrap();
+    if m.get(&(kv_id, li)).is_some_and(|(_, have)| *have < cap) {
+        m.remove(&(kv_id, li));
+    }
+    let (b, _) = m.entry((kv_id, li)).or_insert_with(|| {
+        (
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dsv4-index-kv"),
+                size: (cap * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            cap,
+        )
+    });
+    Some(b.clone())
+}
+
+/// Everything a layer needs to build its OWN attention inputs on the card:
+/// the window append, the compressor (and the indexer's, and the indexer) —
+/// the three producers that used to run on the host between submissions.
+///
+/// With this present a layer frame needs nothing from the host but the
+/// position, so its result never has to come back: `folded_next` stays on
+/// the device and the NEXT layer reads it there. That is the whole of step
+/// four — the readback at the end of this function was there for the host's
+/// prep and for nothing else.
+pub struct Dsv4Prep<'a> {
+    /// The KV projection that feeds the sliding window, and its norm.
+    pub wkv: usize,
+    pub kv_norm: &'a [f32],
+    /// The attention compressor; `None` on the pure sliding-window layers.
+    pub comp: Option<(Dsv4CompW<'a>, Dsv4CompGeom)>,
+    /// The indexer: its own compressor, then the scoring half.
+    pub ix: Option<(Dsv4CompW<'a>, Dsv4CompGeom, Dsv4IxW, Dsv4IxGeom)>,
+    /// Cache bookkeeping the host keeps (all of it is derivable from the
+    /// position, so none of it costs a readback): how much of the window is
+    /// filled BEFORE this token, how many compressed entries each cache
+    /// holds, and where the next one goes.
+    pub filled: usize,
+    pub n_comp: usize,
+    pub n_ix: usize,
+    pub comp_dst_off: usize,
+    pub ix_dst_off: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn dsv4_layer_frame(
     model: &Arc<CmfModel>,
     w: &Dsv4LayerW,
@@ -16501,6 +16642,14 @@ pub fn dsv4_layer_frame(
     }
 
     let src = if w.hc_next_fn.is_some() { &x2 } else { &ao };
+    // THIS readback — one full round trip per layer — is the last thing
+    // paying for the host having owned the preparation. Removing it means
+    // this function must stop owning its encoder (the caller has to keep
+    // encoding into the same one) and must take `Dsv4Prep` so the next layer
+    // can build its inputs on the card. That is step four, and it is a
+    // refactor of this whole function rather than a branch inside it: an
+    // early return here would still submit, which is exactly what has to
+    // stop.
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(
         &c.device,
