@@ -246,3 +246,38 @@ fn device_compressor_state_matches_the_cpu() {
         }
     }
 }
+
+/// The attended-position list, assembled on the device the way the host used
+/// to assemble it: the window in cache order, then the indexer's picks
+/// shifted by the window's CAPACITY. The two shifts differ whenever the
+/// window is not yet full, which is every sequence's first hundred tokens —
+/// and reading the wrong keys there would still produce fluent text.
+#[test]
+fn device_index_list_matches_the_host_mapping() {
+    match cortiq_engine::gpu_wgpu::selected_and_up() {
+        None => {
+            eprintln!("wgpu не запрошен (CMF_GPU=wgpu) — пропуск");
+            return;
+        }
+        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(true) => {}
+    }
+    let window = 128usize;
+    for (win_len, pick) in [
+        (128usize, vec![0u32, 3, 9]),  // full window
+        (5usize, vec![1u32, 2]),       // early: fill != capacity
+        (17usize, vec![]),             // nothing compressed picked
+    ] {
+        // What the host builds today, from `prep.idxs` mapped through the
+        // frame's own `win_len`/`window` rule.
+        let want: Vec<u32> = (0..win_len as u32)
+            .chain(pick.iter().map(|&p| window as u32 + p))
+            .collect();
+        let mut got = Vec::new();
+        assert!(
+            cortiq_engine::gpu_wgpu::dsv4_idx_build_for_test(&pick, win_len, window, &mut got),
+            "сборщик списка отказал"
+        );
+        assert_eq!(want, got, "win_len={win_len} picks={pick:?}");
+    }
+}

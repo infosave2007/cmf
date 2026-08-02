@@ -5040,6 +5040,30 @@ fn top_k_index(@builtin(local_invocation_index) lid: u32) {
     }
 }
 
+// ── The attended-position list, assembled on the device ─────────────────────
+//
+// The sliding window first, in cache order, then the compressed positions the
+// indexer picked — shifted by the window's CAPACITY, not by how much of it is
+// in use, because that is where the compressed region starts in the layer's
+// cache buffer.
+//
+// The length never has to come back from the card: it is `win_len + min(topk,
+// finite positions)`, and the host knows both. Only the CONTENTS are a device
+// secret, which is what lets the whole token stay in one submission.
+
+struct IbP { win_len: u32, window: u32, k: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       ib_pick : array<u32>;
+@group(0) @binding(1) var<storage, read_write> ib_out  : array<u32>;
+@group(0) @binding(2) var<uniform>             ib_p    : IbP;
+
+@compute @workgroup_size(256)
+fn idx_build(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < ib_p.win_len) { ib_out[i] = i; return; }
+    let j = i - ib_p.win_len;
+    if (j < ib_p.k) { ib_out[i] = ib_p.window + ib_pick[j]; }
+}
+
 // ── MoE routing: sqrt-softplus, noaux_tc bias, top-k (DeepSeek-V4) ──────────
 //
 // The bias shifts the CHOICE and never the weight: the weight of a chosen
@@ -5717,6 +5741,7 @@ struct Ctx {
     kv_pool: wgpu::ComputePipeline,
     index_scores: wgpu::ComputePipeline,
     top_k_index: wgpu::ComputePipeline,
+    idx_build: wgpu::ComputePipeline,
     moe_route: wgpu::ComputePipeline,
     sparse_attend: wgpu::ComputePipeline,
     sa_scores: wgpu::ComputePipeline,
@@ -6230,6 +6255,7 @@ fn init() -> Result<Ctx, String> {
     let kv_pool = pipe("kv_pool");
     let index_scores = pipe("index_scores");
     let top_k_index = pipe("top_k_index");
+    let idx_build = pipe("idx_build");
     let moe_route = pipe("moe_route");
     let sparse_attend = pipe("sparse_attend");
     let sa_scores = pipe("sa_scores");
@@ -6440,6 +6466,7 @@ fn init() -> Result<Ctx, String> {
         kv_pool,
         index_scores,
         top_k_index,
+        idx_build,
         moe_route,
         sparse_attend,
         sa_scores,
@@ -17184,6 +17211,291 @@ fn comp_state_step(
     Some(dst_off)
 }
 
+/// Append this token's key to the sliding window, on the device: the KV
+/// projection, its norm, its rope tail, and the shift that keeps the window
+/// at capacity.
+///
+/// The last producer the host still owned. The reference keeps a ring; the
+/// engine keeps the last N in order, which is the same SET but makes the
+/// position list plain `0..win_len` — so the shift has to be a real shift.
+/// At 128×512 floats that is a quarter of a megabyte of device-local copy a
+/// layer, which is microseconds, and it buys the host's exit from the loop.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_window_append(
+    model: &Arc<CmfModel>,
+    wkv: usize,
+    kv_norm: &[f32],
+    hidden: &wgpu::Buffer,
+    cache: &wgpu::Buffer,
+    // head_dim, the window's capacity in slots, how many are filled BEFORE
+    // this token, the model's hidden width and the rope tail.
+    hd: usize,
+    window: usize,
+    filled: usize,
+    dim: usize,
+    rope_dim: usize,
+    eps: f32,
+    pos: usize,
+    inv_freq: &[f32],
+    kv_id: u64,
+    li: usize,
+    enc: &mut wgpu::CommandEncoder,
+) -> Option<usize> {
+    let c = ctx()?;
+    let bytes = model.primary_bytes();
+    let e = model.tensors.get(wkv)?;
+    if e.dtype != cortiq_core::TensorDtype::Q4TiledP {
+        return None;
+    }
+    let abs = model.entry_abs_offset(e)?;
+    let plen = e.nbytes as usize;
+    bytes.get(abs..abs + plen)?;
+    let wb = weight_buffer(c, (bytes.as_ptr() as usize, wkv), &bytes[abs..abs + plen])?;
+
+    let raw = frame_buf(c, 104, hd * 4, false);
+    let kv = frame_buf(c, 105, hd * 4, false);
+    encode_q4tp_mv1(c, enc, &wb, hidden, &raw, hd, dim, (106, kv_id, li));
+    let nw = const_buf(c, bytemuck::cast_slice(&kv_norm[..hd]));
+    encode_rmsnorm(c, enc, &raw, &nw, &kv, hd, eps, (107, kv_id, li));
+    let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..rope_dim / 2]));
+    let posb = frame_up(c, 108, bytemuck::cast_slice(&[pos as f32, eps]));
+    encode_rope_heads(c, enc, &kv, &freq, &posb, 1, hd, rope_dim, false, false,
+        (109, kv_id, li));
+
+    // Where it lands, and whether the window has to slide first.
+    let slot = if filled < window {
+        filled
+    } else {
+        // Drop the oldest: everything moves down one slot. A copy whose
+        // source and destination overlap is not allowed, so it goes through
+        // a scratch buffer — still device-local, still no host.
+        let span = ((window - 1) * hd * 4) as u64;
+        let tmp = frame_buf(c, 110, (window - 1) * hd * 4, true);
+        enc.copy_buffer_to_buffer(cache, (hd * 4) as u64, &tmp, 0, span);
+        enc.copy_buffer_to_buffer(&tmp, 0, cache, 0, span);
+        window - 1
+    };
+    enc.copy_buffer_to_buffer(&kv, 0, cache, (slot * hd * 4) as u64, (hd * 4) as u64);
+    Some((filled + 1).min(window))
+}
+
+/// What the indexer needs from the model: two q4tp projections by directory
+/// index. Its own compressor goes through `dsv4_compressor_frame` as kind 1.
+pub struct Dsv4IxW {
+    /// `[ih*idim, q_lora]` — reads the SHARED LoRA output, not attention's
+    /// queries.
+    pub wq_b: usize,
+    /// `[ih, hidden]`.
+    pub weights_proj: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct Dsv4IxGeom {
+    pub ih: usize,
+    pub idim: usize,
+    pub q_lora: usize,
+    pub hidden: usize,
+    pub rope_dim: usize,
+    pub eps: f32,
+    pub top_k: usize,
+    /// The cache's window CAPACITY — where the compressed region starts.
+    pub window: usize,
+}
+
+/// Score the compressed positions, take the top-k, and assemble the attended
+/// list — all on the device, into `out_idx`.
+///
+/// Returns the list's length, which the host computes rather than reads back:
+/// the window in use plus however many of the top-k there were positions for.
+/// That is the whole trick — the CONTENTS are a device secret, the LENGTH
+/// never was, so nothing has to come home mid-token.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_indexer_frame(
+    model: &Arc<CmfModel>,
+    w: &Dsv4IxW,
+    g: Dsv4IxGeom,
+    kv_id: u64,
+    li: usize,
+    hidden: &wgpu::Buffer,
+    qn: &wgpu::Buffer,
+    index_kv: &wgpu::Buffer,
+    // How many entries the indexer's own cache holds, and how many compressed
+    // positions attention has: the reference scores the smaller of the two.
+    n_ix: usize,
+    n_comp: usize,
+    win_len: usize,
+    pos: usize,
+    inv_freq: &[f32],
+    out_idx: &wgpu::Buffer,
+    enc: &mut wgpu::CommandEncoder,
+) -> Option<usize> {
+    let c = ctx()?;
+    let limit = n_ix.min(n_comp);
+    if g.ih == 0 || g.idim == 0 || limit == 0 || limit > 4096 {
+        return None;
+    }
+    let bytes = model.primary_bytes();
+    let mut wb = Vec::with_capacity(2);
+    for &idx in &[w.wq_b, w.weights_proj] {
+        let e = model.tensors.get(idx)?;
+        if e.dtype != cortiq_core::TensorDtype::Q4TiledP || e.shape.len() != 2 {
+            return None;
+        }
+        let abs = model.entry_abs_offset(e)?;
+        let plen = e.nbytes as usize;
+        bytes.get(abs..abs + plen)?;
+        wb.push(weight_buffer(
+            c,
+            (bytes.as_ptr() as usize, idx),
+            &bytes[abs..abs + plen],
+        )?);
+    }
+
+    let qi = frame_buf(c, 90, g.ih * g.idim * 4, false);
+    let hw_raw = frame_buf(c, 91, g.ih * 4, false);
+    let hw = frame_buf(c, 92, g.ih * 4, false);
+    let scores = frame_buf(c, 93, limit * 4, false);
+    let pick = frame_buf(c, 94, g.top_k.min(limit).max(1) * 4, false);
+    let cnt = frame_buf(c, 95, 4, false);
+
+    encode_q4tp_mv1(c, enc, &wb[0], qn, &qi, g.ih * g.idim, g.q_lora, (96, kv_id, li));
+    let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..g.rope_dim / 2]));
+    let posb = frame_up(c, 97, bytemuck::cast_slice(&[pos as f32, g.eps]));
+    encode_rope_heads(c, enc, &qi, &freq, &posb, g.ih, g.idim, g.rope_dim, false, false,
+        (98, kv_id, li));
+    encode_q4tp_mv1(c, enc, &wb[1], hidden, &hw_raw, g.ih, g.hidden, (99, kv_id, li));
+    // The reference folds head_dim^-0.5 · n_heads^-0.5 into weights_proj's
+    // output. A uniform positive factor cannot change which positions win,
+    // but the scores are the kernel's contract, not just a ranking key.
+    let sc_factor = (g.idim as f32).powf(-0.5) * (g.ih as f32).powf(-0.5);
+    encode_fill_zero(c, enc, &hw, g.ih, (100, kv_id, li));
+    encode_axpy(c, enc, &hw_raw, &hw, sc_factor, g.ih, (101, kv_id, li));
+
+    encode_index_scores(c, enc, &qi, index_kv, &hw, &scores, g.ih, g.idim, limit);
+    encode_top_k(c, enc, &scores, &pick, &cnt, limit, g.top_k);
+    let k_actual = g.top_k.min(limit);
+    encode_idx_build(c, enc, &pick, out_idx, win_len, g.window, k_actual);
+    Some(win_len + k_actual)
+}
+
+fn encode_fill_zero(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    y: &wgpu::Buffer,
+    n: usize,
+    bkey: (u8, u64, usize),
+) {
+    let bind = cached_bind(c, bkey, || {
+        let p = uniform_u32x4(c, [n as u32, 0, 0, 0]);
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.zero.get_bind_group_layout(0),
+            entries: &[bind_buf(0, y), bind_buf(1, &p)],
+        })
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.zero);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_index_scores(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    q: &wgpu::Buffer,
+    kv: &wgpu::Buffer,
+    hw: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    nh: usize,
+    hd: usize,
+    n_pos: usize,
+) {
+    let p = uniform_u32x4(c, [nh as u32, hd as u32, n_pos as u32, n_pos as u32]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.index_scores.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, q),
+            bind_buf(1, kv),
+            bind_buf(2, hw),
+            bind_buf(3, out),
+            bind_buf(4, &p),
+        ],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.index_scores);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((n_pos as u32).min(MAX_WG), 1, 1);
+}
+
+fn encode_top_k(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    scores: &wgpu::Buffer,
+    pick: &wgpu::Buffer,
+    cnt: &wgpu::Buffer,
+    n: usize,
+    k: usize,
+) {
+    let p = uniform_u32x4(c, [n as u32, k as u32, 0, 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.top_k_index.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, scores),
+            bind_buf(1, pick),
+            bind_buf(2, cnt),
+            bind_buf(3, &p),
+        ],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.top_k_index);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(1, 1, 1);
+}
+
+/// NOT cached, and this one bites: `win_len` grows with the sequence and `k`
+/// changes with it, so the uniform — which `uniform_u32x4` keys on its
+/// CONTENTS — becomes a different buffer while a cached bind group would
+/// still point at the previous token's. The first call would be right and
+/// every one after it would read a stale window length.
+fn encode_idx_build(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    pick: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    win_len: usize,
+    window: usize,
+    k: usize,
+) {
+    let n = win_len + k;
+    let bind = {
+        let p = uniform_u32x4(c, [win_len as u32, window as u32, k as u32, 0]);
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.idx_build.get_bind_group_layout(0),
+            entries: &[bind_buf(0, pick), bind_buf(1, out), bind_buf(2, &p)],
+        })
+    };
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.idx_build);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+}
+
 /// Drive the device-side compressor state with the projections handed in,
 /// one token per call, and return the folded entry on the token that closes
 /// a window. The frame does exactly this after its two matvecs; giving the
@@ -17268,6 +17580,60 @@ pub fn dsv4_comp_state_for_test(
     let ok = readback(c, enc, &dst, &stage, (ew * 4) as u64, out);
     drop(sc);
     ok.then_some(true)
+}
+
+/// The position-list assembly alone, driven from a test: the picks come in
+/// as they would from top-k, and what comes back is what `sparse_attend`
+/// would read. The shift by the window's CAPACITY (not its fill) is the part
+/// worth pinning — get it wrong and attention reads the wrong keys while
+/// every shape still checks out.
+pub fn dsv4_idx_build_for_test(
+    pick: &[u32],
+    win_len: usize,
+    window: usize,
+    out: &mut Vec<u32>,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let n = win_len + pick.len();
+    // A zero-length binding is a validation error, and "the indexer picked
+    // nothing" is a real state — pad rather than refuse.
+    let padded: Vec<u32> = if pick.is_empty() { vec![0] } else { pick.to_vec() };
+    let pb = storage_bytes(c, bytemuck::cast_slice(&padded));
+    let ob = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (n.max(1) * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    encode_idx_build(c, &mut enc, &pb, &ob, win_len, window, pick.len());
+    let bytes = (n * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        bytes,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "idx-build-stage",
+    );
+    enc.copy_buffer_to_buffer(&ob, 0, &stage, 0, bytes);
+    c.queue.submit(Some(enc.finish()));
+    let slice = stage.slice(..bytes);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return false;
+    }
+    let mut ok = false;
+    if let Ok(data) = slice.get_mapped_range() {
+        out.clear();
+        out.extend_from_slice(bytemuck::cast_slice(&data[..bytes as usize]));
+        ok = true;
+    }
+    stage.unmap();
+    drop(sc);
+    ok
 }
 
 /// Drop a sequence's compressor streams (called with the rest of its state).
