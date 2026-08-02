@@ -6174,10 +6174,23 @@ fn init() -> Result<Ctx, String> {
     let big_attend = limits.max_compute_workgroup_storage_size >= 33_152;
     // GPU timestamps (CMF_GPU_TS=1): ask for the query features when the
     // adapter has them — the frame profiler below is the only consumer.
-    let ts_features = wgpu::Features::TIMESTAMP_QUERY
-        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+    // Two tiers, and conflating them cost the dsv4 profiler its clock on
+    // Metal: a timestamp PAIR on a pass descriptor needs TIMESTAMP_QUERY and
+    // nothing else, while write_timestamp inside an encoder or a pass needs
+    // the other two. Demanding all three meant a device that offers the
+    // first got no query set at all — which reads exactly like "the profiler
+    // printed nothing", not like "this device cannot do the fine one".
+    let ts_basic = wgpu::Features::TIMESTAMP_QUERY;
+    let ts_fine_features = wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
         | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
-    let want_ts = adapter.features().contains(ts_features);
+    let have_basic = adapter.features().contains(ts_basic);
+    let have_fine = adapter.features().contains(ts_basic | ts_fine_features);
+    let ts_features = if have_fine {
+        ts_basic | ts_fine_features
+    } else {
+        ts_basic
+    };
+    let want_ts = have_basic;
     let want_sg = adapter.features().contains(wgpu::Features::SUBGROUP);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cortiq-wgpu"),
@@ -6309,6 +6322,12 @@ fn init() -> Result<Ctx, String> {
         None
     };
     let ts_period = queue.get_timestamp_period();
+    if std::env::var("CMF_TS_DEBUG").is_ok() {
+        eprintln!(
+            "[ts] базовый={have_basic} точный={have_fine} набор={} период={ts_period}",
+            ts_query.is_some()
+        );
+    }
     let argmax_final = pipe("argmax_final");
     let embed_gather_q4tp = pipe("embed_gather_q4tp");
     let silu_down = pipe("silu_down_matvec");
@@ -18757,6 +18776,9 @@ pub fn dsv4_moe_frame(
         if rx.recv().map(|r| r.is_ok()).unwrap_or(false) {
             if let Ok(raw) = tstage.get_mapped_range(..16) {
                 let t: &[u64] = bytemuck::cast_slice(&raw);
+                if std::env::var("CMF_TS_DEBUG").is_ok() {
+                    eprintln!("[ts] t0={} t1={} period={}", t[0], t[1], c.ts_period);
+                }
                 let ns = (t[1].saturating_sub(t[0]) as f64 * c.ts_period as f64) as u64;
                 drop(raw);
                 MOE_GPU_NS[0].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
