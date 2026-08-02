@@ -38,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evict it behind the uploader had the kernel fetching the same bytes twice.
   A CPU run, a UMA device and every non-Linux target keep the readahead.
 
+### Added
+- **`CMF_DSV4_CHAIN=1`** puts a run of consecutive device-capable layers in
+  ONE submission: 59 pool dispatches a token against 285. The compressor,
+  the indexer and the window append all moved to the card to make it
+  possible. Exact on the toy (perplexity 136.750 either way over 200
+  tokens); **wrong on the release checkpoint (50.280 against the CPU's
+  3.282) and slower (12.8 tok/s against 16.2)**, so it is off by default.
+
 ### Known limitations
 - **The process can abort at exit, after printing a correct answer**
   (`double free or corruption`, `corrupted double-linked list`). Located
