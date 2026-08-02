@@ -1687,15 +1687,35 @@ fn dsv4_layer_loop(
         // card first, and a wo_b that misses at layer 11 used to surface as a
         // mid-loop refusal — after the caches had advanced, which the CPU
         // fallback then advanced again.
-        let attn_ok = [
+        // …and, when the layer is to prepare itself, everything that
+        // preparation reads: the KV projection, both compressors and the
+        // indexer. Leaving them out is how the chain came to refuse ninety
+        // times a token on the release — the experts had taken the card by
+        // the time `dsv4_encode_prep` asked, and it declined silently into a
+        // fallback that looked like "the chain simply does not help".
+        let mut want = vec![
             l.wq_a.model_idx(),
             l.wq_b.model_idx(),
             l.wo_a.model_idx(),
             l.wo_b.model_idx(),
-        ]
-        .into_iter()
-        .flatten()
-        .all(|i| crate::gpu_wgpu::dsv4_weight_ready(&model, i));
+        ];
+        if chain_enabled() {
+            want.push(l.wkv.model_idx());
+            if let Some(cp) = &l.compressor {
+                want.push(cp.wkv.model_idx());
+                want.push(cp.wgate.model_idx());
+            }
+            if let Some(ix) = &l.indexer {
+                want.push(ix.wq_b.model_idx());
+                want.push(ix.weights_proj.model_idx());
+                want.push(ix.compressor.wkv.model_idx());
+                want.push(ix.compressor.wgate.model_idx());
+            }
+        }
+        let attn_ok = want
+            .into_iter()
+            .flatten()
+            .all(|i| crate::gpu_wgpu::dsv4_weight_ready(&model, i));
         // The layer frame's router has no remap yet, so a PARTIAL packing
         // there would silently become a mask — the one thing that is known to
         // wreck this model. Such a layer goes to the host until the frame
