@@ -18280,7 +18280,10 @@ pub fn dsv4_attn_frame(
     // `hidden` is only read when the frame has to build the LoRA vector
     // itself; demanding it regardless refused every caller that had one.
     if (qn_in.is_none() && hidden.len() < g.dim)
-        || out.len() < g.dim
+        // Empty is a CONTRACT, not a mistake: "leave the result on the
+        // card". The layer-frame refactor hit this exact guard-versus-branch
+        // ordering and documented it; this is the second instance.
+        || (!out.is_empty() && out.len() < g.dim)
         || w.sink.len() < g.nh
         || w.q_norm.len() < g.q_lora
         || idxs.is_empty()

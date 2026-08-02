@@ -2737,7 +2737,11 @@ fn moe_frame(
     // Routing ranges over EVERY expert; the remap turns a winner into a slot
     // or marks it cold. Nothing is masked, so nothing is lost.
     let subset = pk.globals.len() < cfg.n_routed_experts;
-    let lg: Vec<f32> = if subset {
+    // Empty logits are the device-scored case: the frame computes them from
+    // pk.router, whose rows are already in global order, so there is nothing
+    // to reorder — and indexing an empty slice is how this line greeted the
+    // first engaged run.
+    let lg: Vec<f32> = if logits.is_empty() || subset {
         logits.to_vec()
     } else {
         pk.globals.iter().map(|&g| logits[g]).collect()
