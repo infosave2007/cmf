@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.45] — 2026-08-02
+
+The cold-expert split works and is on by default: hot experts run on the
+card, cold ones are finished on the host, and no layer has to leave the
+device because its experts do not all fit. This closes the first known
+limitation of 0.5.44 and unblocks the whole-layer frame's economics.
+
+### Fixed
+- **The router's bias went in short.** The bias was uploaded `n_pack` long
+  while the kernel ranked over `n_all`. WGSL CLAMPS an out-of-bounds read
+  instead of faulting, so every expert past the packing boundary got the
+  LAST packed expert's bias — a plausible number, and one that made the
+  router prefer the resident experts. It looked exactly like a router bug.
+  Scores, bias and the routing uniform now take ONE width, computed once;
+  toy perplexity is the CPU's number at packings of 64, 32, 8 and 2 of 64.
+  `CMF_DSV4_COLD_CPU=0` restores all-or-nothing.
+- **The kernel reports every winner** in the second half of `rt_cold`, so
+  "the router chose no cold experts" and "the readback is broken" are no
+  longer the same empty list. Nothing reads it but a human.
+- **`x86_gemm`'s CPU-against-CPU comparison silently became CPU-against-GPU**
+  whenever `CMF_GPU` was set — off by the 5e-3 that summation order costs,
+  and blaming the blocked kernel for it. It refuses the changed question now.
+- **A machine nobody pointed at wgpu and a machine where wgpu came up dead
+  read the same in tests.** `selected_and_up()` tells them apart: not
+  selected is a legitimate skip (what CI runners look like), selected with
+  no context fails — that is the case that once hid a reserved-word shader
+  error behind a wall of green skips.
+
+### Added
+- **The Hub model cards live in the tree** (`docs/hf/`), so the copy that
+  says what the engine can do is versioned with the engine that does it.
+
 ## [0.5.44] — 2026-08-01
 
 DeepSeek-V4-Flash: the architecture, the converter that fits it on a laptop's

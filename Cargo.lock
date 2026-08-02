@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-cli"
-version = "0.5.44"
+version = "0.5.45"
 dependencies = [
  "anyhow",
  "axum",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-core"
-version = "0.5.44"
+version = "0.5.45"
 dependencies = [
  "base64",
  "bincode",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-engine"
-version = "0.5.44"
+version = "0.5.45"
 dependencies = [
  "anyhow",
  "base64",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-ffi"
-version = "0.5.44"
+version = "0.5.45"
 dependencies = [
  "cortiq-core",
  "cortiq-engine",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-server"
-version = "0.5.44"
+version = "0.5.45"
 dependencies = [
  "anyhow",
  "axum",
