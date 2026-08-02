@@ -2012,8 +2012,16 @@ impl Pipeline {
 
     /// Micro-benchmark: two single-position forwards vs one fused pair
     /// from the current cache state (KV rewound after each probe).
-    /// Returns (two_singles_ms, fused_pair_ms) per probe.
+    /// Returns (two_singles_ms, fused_pair_ms) per probe, or the (0, 0)
+    /// sentinel when this model has no pair path to measure — the same
+    /// answer the o1 arm gives, and the bench prints it the same way.
+    /// (An architecture that loads its own layers leaves `weights.layers`
+    /// empty; walking it here was an index panic, found by `bench` on
+    /// deepseek_v4.)
     pub fn measure_pair_fusion(&mut self, iters: usize) -> (f64, f64) {
+        if !self.pair_supported() {
+            return (0.0, 0.0);
+        }
         let emb1 = self.embed_single(1);
         let emb2 = self.embed_single(2);
         let pos = self.kv_cache.seq_len();
@@ -2100,7 +2108,6 @@ impl Pipeline {
 
             let (a1, a2) = match &lw.attn {
                 AttnKind::Mla(_) => unreachable!("MLA has no MTP/pair path"),
-                AttnKind::Kda(_) => unreachable!("KDA has no MTP/pair path"),
                 AttnKind::Kda(_) => unreachable!("KDA has no MTP/pair path"),
                 AttnKind::Linear(w) => {
                     let cfg = self.vmf_cfg.expect("linear layer without vmf_cfg");
@@ -2333,7 +2340,13 @@ impl Pipeline {
                 pos = end;
             }
         }
-        if task_mask.is_none() {
+        // Same guards as generation's prefill: CMF_PAIR=0 opts out, and a
+        // model whose layers live outside `weights.layers` has no pair walk
+        // to take (the tail loop below covers every position either way).
+        if task_mask.is_none()
+            && !std::env::var("CMF_PAIR").is_ok_and(|v| v == "0")
+            && self.pair_supported()
+        {
             while pos + 1 < ids.len() {
                 let e1 = self.embed_single(ids[pos]);
                 let e2 = self.embed_single(ids[pos + 1]);

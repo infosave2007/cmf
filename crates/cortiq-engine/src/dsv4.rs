@@ -2017,7 +2017,19 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
             }
         }
         if globals.is_empty() {
-            tracing::warn!("слой {li}: маска не оставила ни одного эксперта");
+            // Two very different causes, and blaming the mask for the other
+            // one sent a reader looking for a mask that was never set: an
+            // actual empty mask, or a VRAM budget with no room left for even
+            // one expert (`room` is 0, which is what a nearly-full card does
+            // to the last layers).
+            if room == 0 {
+                tracing::warn!(
+                    "слой {li}: в бюджете VRAM не осталось места ни под одного эксперта — \
+                     слой уходит на CPU. Поднимите CMF_GPU_VRAM_MB"
+                );
+            } else {
+                tracing::warn!("слой {li}: маска не оставила ни одного эксперта");
+            }
             return None;
         }
         tensors.push(idx3(&l.shared)?); // shared rides last, as the kernels expect

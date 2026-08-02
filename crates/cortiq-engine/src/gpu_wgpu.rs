@@ -6726,6 +6726,9 @@ fn moe_expert_bufs(
         return None;
     }
     crate::gpu::probe_note_cold();
+    // Every byte range this layer ships to the card, for the post-upload
+    // evict below.
+    let uploaded = std::cell::RefCell::new(Vec::<(usize, usize)>::new());
     let mk = |role: &dyn Fn(&(usize, usize, usize)) -> usize,
               rows: usize,
               cols: usize,
@@ -6760,6 +6763,7 @@ fn moe_expert_bufs(
             c.queue
                 .write_buffer(&b, (i * plen) as u64, &bytes[abs..abs + plen]);
         }
+        uploaded.borrow_mut().extend(offs.iter().map(|&a| (a, plen)));
         Some(b)
     };
     let (g, u, d) = match (
@@ -6780,6 +6784,19 @@ fn moe_expert_bufs(
     // bounds transient staging to this layer's three buffers.
     c.queue.submit(std::iter::empty());
     let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    // The card holds these bytes now, and nothing on this path reads them
+    // from the CPU again — a VRAM eviction re-uploads through the same
+    // mapping, which simply re-faults. Without this the page cache keeps a
+    // second copy of every resident expert, and on a 112 GB model that
+    // second copy IS the machine's RAM. Discrete only: on UMA the mapping
+    // is the working copy. CMF_UPLOAD_EVICT=0 opts out.
+    if c.discrete
+        && std::env::var("CMF_UPLOAD_EVICT")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    {
+        model.evict_ranges(&uploaded.borrow());
+    }
     c.resident.fetch_add(total, Ordering::Relaxed);
     c.moe_expw
         .lock()
@@ -8496,6 +8513,11 @@ pub fn forward_token_graph(
                 });
                 Some((&c.f32_matvec, bind, (rows as u32).min(MAX_WG)))
             }
+            // These arms must exist: without them `prep` returned None for
+            // every q4t/q4tp projection, `group_mats` fell back to one
+            // compute pass PER matvec and the MoE layer took its per-op
+            // branch — a pass costs ~60 us on this Vulkan stack against
+            // ~2 ms of arithmetic for the whole MoE block.
             2 | 5 | 6 => {
                 let gpr = cols / 32;
                 let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
@@ -8586,37 +8608,6 @@ pub fn forward_token_graph(
                     ],
                 });
                 Some((&c.q1t, bind, (rows as u32).min(MAX_WG)))
-            }
-            // q4_block / q4_tiled / q4tp share q1t's binding shape — only the
-            // pipeline differs (this is exactly what `encode_q1t_like` does,
-            // minus the pass it opens).
-            //
-            // Without these arms `prep` returned None for every q4t/q4tp
-            // projection, so `group_mats` fell back to one compute pass PER
-            // matvec and the MoE layer took its per-op branch. On this Vulkan
-            // stack a pass costs ~60 us against ~2 ms of arithmetic for the
-            // whole MoE block, so the missing arms — not the kernels — were
-            // what held a q4tp model's decode down.
-            k @ (2 | 5 | 6) => {
-                let gpr = cols / 32;
-                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
-                let pipe = match k {
-                    2 => &c.q4b,
-                    5 => &c.q4t_mv,
-                    _ => &c.q4tp_mv,
-                };
-                let layout = pipe.get_bind_group_layout(0);
-                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &layout,
-                    entries: &[
-                        bind_buf(0, &m.buf),
-                        bind_buf(1, xs),
-                        bind_buf(2, y),
-                        bind_buf(3, &p_buf),
-                    ],
-                });
-                Some((pipe, bind, (rows as u32).min(MAX_WG)))
             }
             _ => None,
         }
