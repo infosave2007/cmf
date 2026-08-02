@@ -4205,29 +4205,31 @@ fn q4tp_matvec(
     if a8w8_enabled() {
         let act = split_act(x);
         let run = |start: usize, end: usize| {
-            // One scratch row of scales per worker, reused across its rows.
-            let mut sc = vec![0f32; gpr];
-            for r in start..end {
-                v.scales_into(r, gpr, &mut sc);
-                let mut acc = dot_q4tp_row_i8(v.nib, r, gpr, &act.xq, &sc) * act.sx;
-                for &(j, xv) in &act.outliers {
-                    let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
-                    acc += w * s * xv;
+            // One scratch row of scales per worker — borrowed, not minted.
+            with_krow(gpr, |sc| {
+                for r in start..end {
+                    v.scales_into(r, gpr, sc);
+                    let mut acc = dot_q4tp_row_i8(v.nib, r, gpr, &act.xq, sc) * act.sx;
+                    for &(j, xv) in &act.outliers {
+                        let (w, s) = q4tp_outlier(v.nib, r, gpr, j, sc);
+                        acc += w * s * xv;
+                    }
+                    // SAFETY: disjoint row ranges per worker.
+                    unsafe { *out_addr.at(r) = acc };
                 }
-                // SAFETY: disjoint row ranges per worker.
-                unsafe { *out_addr.at(r) = acc };
-            }
+            })
         };
         dispatch_rows(pool, rows, &run);
         return;
     }
     let run = |start: usize, end: usize| {
-        let mut sc = vec![0f32; gpr];
-        for r in start..end {
-            v.scales_into(r, gpr, &mut sc);
-            // SAFETY: disjoint row ranges per worker.
-            unsafe { *out_addr.at(r) = q4tp_row_exact(v.nib, r, gpr, x, &sc) };
-        }
+        with_krow(gpr, |sc| {
+            for r in start..end {
+                v.scales_into(r, gpr, sc);
+                // SAFETY: disjoint row ranges per worker.
+                unsafe { *out_addr.at(r) = q4tp_row_exact(v.nib, r, gpr, x, sc) };
+            }
+        })
     };
     dispatch_rows(pool, rows, &run);
 }
@@ -4296,12 +4298,13 @@ fn q2tp_matvec(
     let v = Q4tpView::new_q2(bytes, rows, cols);
     let out_addr = SendMut(out.as_mut_ptr());
     let run = |start: usize, end: usize| {
-        let mut sc = vec![0f32; gpr];
-        for r in start..end {
-            v.scales_into(r, gpr, &mut sc);
-            // SAFETY: disjoint row ranges per worker.
-            unsafe { *out_addr.at(r) = q2tp_row_exact(v.nib, r, gpr, x, &sc) };
-        }
+        with_krow(gpr, |sc| {
+            for r in start..end {
+                v.scales_into(r, gpr, sc);
+                // SAFETY: disjoint row ranges per worker.
+                unsafe { *out_addr.at(r) = q2tp_row_exact(v.nib, r, gpr, x, sc) };
+            }
+        })
     };
     dispatch_rows(pool, rows, &run);
 }
@@ -8065,6 +8068,29 @@ impl Drop for SplitAct {
             });
         }
     }
+}
+
+thread_local! {
+    /// One scratch row per WORKER, kept for the life of the thread.
+    ///
+    /// The kernels take a row of group scales per dispatch, and a fresh
+    /// `vec![0f32; gpr]` inside the closure is one allocation per worker per
+    /// dispatch — on the release checkpoint about six thousand a token, a
+    /// quarter of everything the benchmark counts.
+    static KROW: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Borrow `n` floats of the calling worker's scratch. Nothing inside a
+/// kernel body borrows it again, which is what keeps the RefCell honest.
+#[inline]
+fn with_krow<R>(n: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
+    KROW.with(|s| {
+        let mut b = s.borrow_mut();
+        if b.len() < n {
+            b.resize(n, 0.0);
+        }
+        f(&mut b[..n])
+    })
 }
 
 fn split_act(x: &[f32]) -> SplitAct {
