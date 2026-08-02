@@ -17049,10 +17049,17 @@ pub fn moe_route_for_test(
         // pass boundaries a layer and measure the split instead — so this is
         // the block's total, which is the number that says whether the card
         // is busy or waiting.
+        // A FRESH pair of slots per pass. Rewriting slots 0 and 1 on every
+        // one of a token's frames leaves the queries unreset between
+        // submissions, and an unreset timestamp query reads back as zero —
+        // which is exactly what both backends were reporting. The frame that
+        // owns this encoder resolves whatever pair we took.
+        let slot = (TS_SLOT.fetch_add(2, std::sync::atomic::Ordering::Relaxed) % 254) as u32;
+        TS_LAST.store(slot, std::sync::atomic::Ordering::Relaxed);
         let tsw = c.ts_query.as_ref().map(|(qs, _, _)| wgpu::ComputePassTimestampWrites {
             query_set: qs,
-            beginning_of_pass_write_index: Some(0),
-            end_of_pass_write_index: Some(1),
+            beginning_of_pass_write_index: Some(slot),
+            end_of_pass_write_index: Some(slot + 1),
         });
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
@@ -18705,8 +18712,9 @@ pub fn dsv4_moe_frame(
         pass.dispatch_workgroups(g.hidden as u32, 1, 1);
     }
     if let Some((qs, resolve, tstage)) = &c.ts_query {
-        enc.resolve_query_set(qs, 0..2, resolve, 0);
-        enc.copy_buffer_to_buffer(resolve, 0, tstage, 0, 16);
+        let slot = TS_LAST.load(std::sync::atomic::Ordering::Relaxed);
+        enc.resolve_query_set(qs, slot..slot + 2, resolve, (slot as u64) * 8);
+        enc.copy_buffer_to_buffer(resolve, (slot as u64) * 8, tstage, 0, 16);
     }
     let t_enc = std::time::Instant::now();
     MOE_PASS_NS.fetch_add(
@@ -18819,6 +18827,10 @@ pub static MOE_GPU_NS: [std::sync::atomic::AtomicU64; 3] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 pub static MOE_GPU_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Rotating timestamp slot, so no two frames in flight share a query.
+static TS_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The pair the last encoded pass took, for the frame that resolves it.
+static TS_LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 pub static MOE_BUFS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MOE_UP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MOE_PASS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
