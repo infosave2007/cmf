@@ -17049,21 +17049,9 @@ pub fn moe_route_for_test(
         // pass boundaries a layer and measure the split instead — so this is
         // the block's total, which is the number that says whether the card
         // is busy or waiting.
-        // A FRESH pair of slots per pass. Rewriting slots 0 and 1 on every
-        // one of a token's frames leaves the queries unreset between
-        // submissions, and an unreset timestamp query reads back as zero —
-        // which is exactly what both backends were reporting. The frame that
-        // owns this encoder resolves whatever pair we took.
-        let slot = (TS_SLOT.fetch_add(2, std::sync::atomic::Ordering::Relaxed) % 254) as u32;
-        TS_LAST.store(slot, std::sync::atomic::Ordering::Relaxed);
-        let tsw = c.ts_query.as_ref().map(|(qs, _, _)| wgpu::ComputePassTimestampWrites {
-            query_set: qs,
-            beginning_of_pass_write_index: Some(slot),
-            end_of_pass_write_index: Some(slot + 1),
-        });
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
-            timestamp_writes: tsw,
+            timestamp_writes: None,
         });
         pass.set_pipeline(&c.moe_route);
         pass.set_bind_group(0, &bind, &[]);
@@ -18667,9 +18655,23 @@ pub fn dsv4_moe_frame(
                 ],
             })
         };
+        // The card's own clock around the whole MoE block. All three kernels
+        // share this pass; splitting it to time them apart would add two
+        // pass boundaries a layer and measure the split.
+        //
+        // A FRESH pair of slots: rewriting the same two on every frame of
+        // every token leaves the queries unreset between submissions, and an
+        // unreset timestamp query reads back as zero.
+        let slot = (TS_SLOT.fetch_add(2, std::sync::atomic::Ordering::Relaxed) % 254) as u32;
+        TS_LAST.store(slot, std::sync::atomic::Ordering::Relaxed);
+        let tsw = c.ts_query.as_ref().map(|(qs, _, _)| wgpu::ComputePassTimestampWrites {
+            query_set: qs,
+            beginning_of_pass_write_index: Some(slot),
+            end_of_pass_write_index: Some(slot + 1),
+        });
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
-            timestamp_writes: None,
+            timestamp_writes: tsw,
         });
         pass.set_pipeline(&c.moe_route);
         pass.set_bind_group(0, &bind, &[]);
@@ -18713,6 +18715,15 @@ pub fn dsv4_moe_frame(
     }
     if let Some((qs, resolve, tstage)) = &c.ts_query {
         let slot = TS_LAST.load(std::sync::atomic::Ordering::Relaxed);
+        // An UNCONDITIONAL value in the staging buffer before the copy. If it
+        // comes back, the copy never landed; if it comes back zeroed, the
+        // copy landed and the queries themselves are empty. Two answers, one
+        // run — the same trick that separated a kernel from its readback in
+        // the cold-expert path.
+        if std::env::var("CMF_TS_DEBUG").is_ok() {
+            let mark: [u64; 2] = [0xDEAD_BEEF_1111, 0xDEAD_BEEF_2222];
+            c.queue.write_buffer(tstage, 0, bytemuck::cast_slice(&mark));
+        }
         // Offset ZERO, always: a query resolve's destination offset has to be
         // 256-byte aligned, and slot*8 is not for any slot but the first
         // thirty-two. The pair still comes from the rotating slots; only
