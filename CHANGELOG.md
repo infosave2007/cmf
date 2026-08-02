@@ -55,6 +55,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3.282) and slower (12.8 tok/s against 16.2)**, so it is off by default.
 
 ### Known limitations
+- **`CMF_DSV4_CHAIN` is correct now and not yet fast.** The in-run clobber
+  that produced perplexity 50.280 is found and fixed — queue writes land
+  before a run's single submit, so every layer routed with the LAST layer's
+  noaux_tc bias; the bias now lives in the pack with a process-stable
+  address, and the hash layers run as runs of one. Full-run parity on the
+  release is 3.301 against the CPU's 3.282, the same device-summation
+  contract as every configuration of this path. Speed is 12.5 tok/s against
+  the two-frame path's 14.9-16.3: the saved fences are spent encoding ~30
+  passes a layer, ~8 of them building fresh bind groups per call. Caching
+  those — with generation guards on the regrowable buffers — is the sized,
+  single next step.
 - **The process can abort at exit, after printing a correct answer**
   (`double free or corruption`, `corrupted double-linked list`). Located
   with AddressSanitizer, and it is not ours: a 48-byte block allocated by
