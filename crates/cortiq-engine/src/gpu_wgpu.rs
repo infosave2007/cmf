@@ -16452,6 +16452,8 @@ pub struct Dsv4Prep<'a> {
     /// filled BEFORE this token, how many compressed entries each cache
     /// holds, and where the next one goes.
     pub filled: usize,
+    /// The window's CAPACITY in slots — where the compressed region starts.
+    pub window: usize,
     pub n_comp: usize,
     pub n_ix: usize,
     pub comp_dst_off: usize,
@@ -16459,26 +16461,33 @@ pub struct Dsv4Prep<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn dsv4_layer_frame(
+/// One layer, encoded into the CALLER'S encoder and never submitted here.
+///
+/// `prep` present means the layer builds its own attention inputs on the
+/// card and `idxs` is ignored; absent means the host supplied the list, as
+/// before. Either way nothing comes back: the folded state for the next
+/// layer is left in the frame's own buffer, which is where the next call
+/// looks for it. That is what lets a whole token be one submission.
+#[allow(clippy::too_many_arguments)]
+fn dsv4_layer_frame_enc(
     model: &Arc<CmfModel>,
     w: &Dsv4LayerW,
     g: Dsv4LayerGeom,
     kv_id: u64,
     li: usize,
-    // `None` uses the LoRA vector the previous frame left on the card — the
-    // host never sees it and never projects it.
     qn: Option<&[f32]>,
     idxs: &[u32],
+    prep: Option<&Dsv4Prep>,
     inv_freq: &[f32],
     pos: usize,
-    folded_next: &mut [f32],
-) -> bool {
+    enc: &mut wgpu::CommandEncoder,
+) -> Option<wgpu::Buffer> {
     macro_rules! no {
         ($($t:tt)*) => {{
             if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
                 eprintln!("кадр слоя отклонён: {}", format_args!($($t)*));
             }
-            return false;
+            return None;
         }};
     }
     let Some(c) = ctx() else { no!("нет контекста wgpu") };
@@ -16487,11 +16496,9 @@ pub fn dsv4_layer_frame(
     let (hc, dim) = (g.hc, a.dim);
     let mix_hc = (2 + hc) * hc;
     if qn.is_some_and(|v| v.len() < a.q_lora)
-        || idxs.is_empty()
-        || idxs.len() > 1024
-        || folded_next.len() < dim
+        || (prep.is_none() && (idxs.is_empty() || idxs.len() > 1024))
     {
-        no!("формы: idx {} out {}", idxs.len(), folded_next.len());
+        no!("формы: idx {}", idxs.len());
     }
     if w.hc_ffn_fn.len() < mix_hc * hc * dim || w.router.len() < m.hidden {
         no!("гипер-связи или роутер не той формы");
@@ -16601,55 +16608,172 @@ pub fn dsv4_layer_frame(
         g.hc_eps,
     );
 
+    // ── the layer's own preparation, when it owns it ──
+    // `folded` is the previous frame's output and this token's hidden state;
+    // for layer zero the caller seeded it.
+    let m_attend = match prep {
+        None => idxs.len(),
+        Some(p) => {
+            let Some(n) = dsv4_encode_prep(
+                // `x2` and NOT `folded`: the previous frame's tail leaves
+                // the next layer's NORMED input there, which is exactly what
+                // the host used to hand in. `folded` is a mid-frame scratch
+                // and holds nothing yet at this point.
+                model, p, kv_id, li, &x2, &qnb, &cache, &ixb, a.hd, p.window,
+                dim, a.rd, a.eps, pos, inv_freq, enc,
+            ) else {
+                no!("подготовка слоя не собралась");
+            };
+            if n == 0 || n > 1024 {
+                no!("список позиций длиной {n}");
+            }
+            n
+        }
+    };
+
+    // ── attention half (the fold for it was prepared by the previous frame) ──
+    encode_attn_chain(c, enc, &wb, &qnb, &q, &attn, &mid, &ao, &cache, &ixb,
+                      &sink, &freq, &posb, a, kv_id, li, m_attend);
+
+    // ── glue: expand, then the FFN half's fold and norm ──
+    encode_hc_expand(c, enc, &ao, &state, &hpost, &hcomb, &state2, &hcp, hc, dim);
+    encode_f32matvec(c, enc, &ffn_fn, &state2, &mixes, mix_hc, hc * dim);
+    encode_hc_fold(c, enc, &state2, &mixes, &ffn_sc, &ffn_bs, &folded, &hpost, &hcomb, &hcp);
+    encode_rmsnorm(c, enc, &folded, &ffn_nw, &x2, dim, a.eps, (50, kv_id, li));
+
+    // ── MoE half ──
+    encode_f32matvec(c, enc, &router, &x2, &logit_b, n_pack, m.hidden);
+    encode_moe_chain(c, enc, &logit_b, &x2, &msel, &mwt, &mcnt, &mact, &mo,
+                     &gate_all, &up_all, &down_all, w, m, n_pack, slots);
+
+    // ── expand, then prepare the NEXT layer ──
+    encode_hc_expand(c, enc, &mo, &state2, &hpost, &hcomb, &state, &hcp, hc, dim);
+    if let Some(nf) = w.hc_next_fn {
+        let nfn = const_buf(c, bytemuck::cast_slice(nf));
+        let nsc = const_buf(c, bytemuck::cast_slice(w.hc_next_scale));
+        let nbs = const_buf(c, bytemuck::cast_slice(&w.hc_next_base[..mix_hc]));
+        encode_f32matvec(c, enc, &nfn, &state, &mixes, mix_hc, hc * dim);
+        encode_hc_fold(c, enc, &state, &mixes, &nsc, &nbs, &folded, &hpost, &hcomb, &hcp);
+        encode_rmsnorm(c, enc, &folded, &next_nw, &x2, dim, a.eps, (51, kv_id, li));
+        // The next layer's LoRA vector, but only when the host is not going
+        // to hand it over anyway — the indexer needs `qr` there, so today it
+        // projects it regardless and computing it twice is waste.
+        if qn.is_none() {
+            encode_q4tp_mv1(c, enc, &wb[4], &x2, &qr2, a.q_lora, dim, (52, kv_id, li));
+            encode_rmsnorm(c, enc, &qr2, &next_qn, &qn2, a.q_lora, a.eps, (53, kv_id, li));
+            enc.copy_buffer_to_buffer(&qn2, 0, &qnb, 0, (a.q_lora * 4) as u64);
+        }
+    }
+
+    // The next layer's input. It stays here: `folded` is where the next
+    // frame reads its hidden state from, so a chain of layers needs one
+    // copy and no round trip. The wrapper below reads it when a caller
+    // still wants the value on the host.
+    let src = if w.hc_next_fn.is_some() { &x2 } else { &ao };
+    enc.copy_buffer_to_buffer(src, 0, &folded, 0, (dim * 4) as u64);
+    Some(folded)
+}
+
+/// Seed the buffer a chain's FIRST layer reads its hidden state from.
+///
+/// Every later layer finds it there because the previous frame's tail wrote
+/// it. Layer zero has no previous frame — the same hole that once put
+/// garbage into `post`/`comb` and cost a perplexity of 1470. Seed it, or the
+/// chain starts on whatever the last token left behind.
+pub fn dsv4_chain_seed(x: &[f32]) -> bool {
+    let Some(c) = ctx() else { return false };
+    let b = frame_buf(c, 45, x.len() * 4, true);
+    c.queue.write_buffer(&b, 0, bytemuck::cast_slice(x));
+    true
+}
+
+/// Encode a run of consecutive layers into ONE encoder and submit it once,
+/// returning the last layer's folded output on the host.
+///
+/// This is the point of the whole exercise: 43 layers used to cost 86
+/// submissions and 43 round trips, because the host had to see each layer's
+/// output to prepare the next one's attention inputs. It does not any more.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_layer_chain(
+    model: &Arc<CmfModel>,
+    layers: &[(Dsv4LayerW<'_>, Dsv4LayerGeom, Dsv4Prep<'_>)],
+    kv_id: u64,
+    first_li: usize,
+    inv_freq: &[&[f32]],
+    pos: usize,
+    folded_out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Some((_, g0, _)) = layers.first() else {
+        return false;
+    };
+    let dim = g0.attn.dim;
+    if folded_out.len() < dim || inv_freq.len() != layers.len() {
+        return false;
+    }
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dsv4-chain"),
+        });
+    let mut last = None;
+    for (i, (w, g, p)) in layers.iter().enumerate() {
+        // `qn = None` throughout: the first layer's LoRA vector was left on
+        // the card by the caller's seed, every later one by the frame before.
+        let Some(b) = dsv4_layer_frame_enc(
+            model, w, *g, kv_id, first_li + i, None, &[], Some(p), inv_freq[i], pos, &mut enc,
+        ) else {
+            // Nothing has been submitted, so the token can still be run the
+            // old way — but the caches this chain advanced have NOT been
+            // touched either, because every write went into this encoder.
+            return false;
+        };
+        last = Some(b);
+    }
+    let Some(src) = last else { return false };
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        (dim * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "dsv4-chain-stage",
+    );
+    let ok = readback(c, enc, &src, &stage, (dim * 4) as u64, &mut folded_out[..dim]);
+    drop(sc);
+    ok
+}
+
+/// One layer, submitted on its own and read back — the shape the two-frame
+/// path and the current layer loop use.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_layer_frame(
+    model: &Arc<CmfModel>,
+    w: &Dsv4LayerW,
+    g: Dsv4LayerGeom,
+    kv_id: u64,
+    li: usize,
+    qn: Option<&[f32]>,
+    idxs: &[u32],
+    inv_freq: &[f32],
+    pos: usize,
+    folded_next: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let dim = g.attn.dim;
+    if folded_next.len() < dim {
+        return false;
+    }
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("dsv4-layer"),
         });
-
-    // ── attention half (the fold for it was prepared by the previous frame) ──
-    encode_attn_chain(c, &mut enc, &wb, &qnb, &q, &attn, &mid, &ao, &cache, &ixb,
-                      &sink, &freq, &posb, a, kv_id, li, idxs.len());
-
-    // ── glue: expand, then the FFN half's fold and norm ──
-    encode_hc_expand(c, &mut enc, &ao, &state, &hpost, &hcomb, &state2, &hcp, hc, dim);
-    encode_f32matvec(c, &mut enc, &ffn_fn, &state2, &mixes, mix_hc, hc * dim);
-    encode_hc_fold(c, &mut enc, &state2, &mixes, &ffn_sc, &ffn_bs, &folded, &hpost, &hcomb, &hcp);
-    encode_rmsnorm(c, &mut enc, &folded, &ffn_nw, &x2, dim, a.eps, (50, kv_id, li));
-
-    // ── MoE half ──
-    encode_f32matvec(c, &mut enc, &router, &x2, &logit_b, n_pack, m.hidden);
-    encode_moe_chain(c, &mut enc, &logit_b, &x2, &msel, &mwt, &mcnt, &mact, &mo,
-                     &gate_all, &up_all, &down_all, w, m, n_pack, slots);
-
-    // ── expand, then prepare the NEXT layer ──
-    encode_hc_expand(c, &mut enc, &mo, &state2, &hpost, &hcomb, &state, &hcp, hc, dim);
-    if let Some(nf) = w.hc_next_fn {
-        let nfn = const_buf(c, bytemuck::cast_slice(nf));
-        let nsc = const_buf(c, bytemuck::cast_slice(w.hc_next_scale));
-        let nbs = const_buf(c, bytemuck::cast_slice(&w.hc_next_base[..mix_hc]));
-        encode_f32matvec(c, &mut enc, &nfn, &state, &mixes, mix_hc, hc * dim);
-        encode_hc_fold(c, &mut enc, &state, &mixes, &nsc, &nbs, &folded, &hpost, &hcomb, &hcp);
-        encode_rmsnorm(c, &mut enc, &folded, &next_nw, &x2, dim, a.eps, (51, kv_id, li));
-        // The next layer's LoRA vector, but only when the host is not going
-        // to hand it over anyway — the indexer needs `qr` there, so today it
-        // projects it regardless and computing it twice is waste.
-        if qn.is_none() {
-            encode_q4tp_mv1(c, &mut enc, &wb[4], &x2, &qr2, a.q_lora, dim, (52, kv_id, li));
-            encode_rmsnorm(c, &mut enc, &qr2, &next_qn, &qn2, a.q_lora, a.eps, (53, kv_id, li));
-            enc.copy_buffer_to_buffer(&qn2, 0, &qnb, 0, (a.q_lora * 4) as u64);
-        }
-    }
-
-    let src = if w.hc_next_fn.is_some() { &x2 } else { &ao };
-    // THIS readback — one full round trip per layer — is the last thing
-    // paying for the host having owned the preparation. Removing it means
-    // this function must stop owning its encoder (the caller has to keep
-    // encoding into the same one) and must take `Dsv4Prep` so the next layer
-    // can build its inputs on the card. That is step four, and it is a
-    // refactor of this whole function rather than a branch inside it: an
-    // early return here would still submit, which is exactly what has to
-    // stop.
+    let Some(folded) = dsv4_layer_frame_enc(
+        model, w, g, kv_id, li, qn, idxs, None, inv_freq, pos, &mut enc,
+    ) else {
+        return false;
+    };
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(
         &c.device,
@@ -16658,7 +16782,7 @@ pub fn dsv4_layer_frame(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "dsv4-layer-stage",
     );
-    let ok = readback(c, enc, src, &stage, (dim * 4) as u64, &mut folded_next[..dim]);
+    let ok = readback(c, enc, &folded, &stage, (dim * 4) as u64, &mut folded_next[..dim]);
     drop(sc);
     ok
 }
