@@ -1619,6 +1619,19 @@ impl QTensor {
                 }
             )
         });
+        // q4tp is the skeleton dtype of the big MoE files, and without an arm
+        // here every projection that shares an input paid its own pool
+        // barrier: DeepSeek-V4's attention step alone hands this function
+        // wq_a, wkv and both compressors' pairs off the same hidden state.
+        let uniform_q4tp = ts.iter().all(|t| {
+            matches!(
+                t,
+                Self::Mapped {
+                    dtype: TensorDtype::Q4TiledP,
+                    ..
+                }
+            )
+        }) && ts.iter().all(|t| t.cols() == ts[0].cols() && t.cols() % GROUP_SIZE == 0);
         let Some(pool) = pool else {
             for (t, o) in ts.iter().zip(outs.iter_mut()) {
                 t.matvec(x, o, None);
@@ -1631,10 +1644,72 @@ impl QTensor {
                 || uniform_q4
                 || uniform_vbit
                 || uniform_q1
-                || uniform_q1t)
+                || uniform_q1t
+                || uniform_q4tp)
         {
             for (t, o) in ts.iter().zip(outs.iter_mut()) {
                 t.matvec(x, o, Some(pool));
+            }
+            return;
+        }
+
+        if uniform_q4tp {
+            // Every tensor's rows laid end to end in one virtual row space,
+            // so the whole set is ONE dispatch. The per-row body is the
+            // `q4tp_matvec` arm verbatim — same activation split, same
+            // accumulation order — so the outputs are bit-identical to the
+            // sequential calls this replaces.
+            let cols = ts[0].cols();
+            let gpr = cols / GROUP_SIZE;
+            let views: Vec<Q4tpView> = ts
+                .iter()
+                .map(|t| Q4tpView::new(t.quant_bytes(), t.rows(), cols))
+                .collect();
+            let rows_of: Vec<usize> = ts.iter().map(|t| t.rows()).collect();
+            let outs_addr: [SendMut; N] = std::array::from_fn(|i| SendMut(outs[i].as_mut_ptr()));
+            // flat index -> (which tensor, which of its rows)
+            let locate = |flat: usize| -> (usize, usize) {
+                let mut acc = 0;
+                for (i, &r) in rows_of.iter().enumerate() {
+                    if flat < acc + r {
+                        return (i, flat - acc);
+                    }
+                    acc += r;
+                }
+                (rows_of.len() - 1, 0)
+            };
+            let (views, outs_addr) = (&views, &outs_addr);
+            if a8w8_enabled() {
+                let act = split_act(x);
+                let act = &act;
+                let run = |start: usize, end: usize| {
+                    let mut sc = vec![0f32; gpr];
+                    for flat in start..end {
+                        let (t, r) = locate(flat);
+                        let v = &views[t];
+                        v.scales_into(r, gpr, &mut sc);
+                        let mut acc = dot_q4tp_row_i8(v.nib, r, gpr, &act.xq, &sc) * act.sx;
+                        for &(j, xv) in &act.outliers {
+                            let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
+                            acc += w * s * xv;
+                        }
+                        // SAFETY: one worker owns each (tensor, row) pair.
+                        unsafe { *outs_addr[t].at(r) = acc };
+                    }
+                };
+                pool.run_rows(total_rows, &run);
+            } else {
+                let run = |start: usize, end: usize| {
+                    let mut sc = vec![0f32; gpr];
+                    for flat in start..end {
+                        let (t, r) = locate(flat);
+                        let v = &views[t];
+                        v.scales_into(r, gpr, &mut sc);
+                        // SAFETY: one worker owns each (tensor, row) pair.
+                        unsafe { *outs_addr[t].at(r) = q4tp_row_exact(v.nib, r, gpr, x, &sc) };
+                    }
+                };
+                pool.run_rows(total_rows, &run);
             }
             return;
         }

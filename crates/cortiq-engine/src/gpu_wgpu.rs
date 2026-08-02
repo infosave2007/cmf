@@ -17334,11 +17334,17 @@ pub fn dsv4_moe_frame(
             g.inter
         );
     }
+    let t_bufs = std::time::Instant::now();
     let Some((gate_all, up_all, down_all)) =
         moe_expert_bufs(c, model, w.experts, g.inter, g.hidden, true, g.gu_q2)
     else {
         no!("эксперты не поместились в бюджет VRAM");
     };
+    MOE_BUFS_NS.fetch_add(
+        t_bufs.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let t_up = std::time::Instant::now();
 
     // ── routing, on the device, straight into the msel/mwt the kernels read ──
     let lg = frame_up(c, 16, bytemuck::cast_slice(&w.logits[..n_route]));
@@ -17440,6 +17446,11 @@ pub fn dsv4_moe_frame(
         )
     };
 
+    MOE_UP_NS.fetch_add(
+        t_up.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let t_pass = std::time::Instant::now();
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -17518,6 +17529,10 @@ pub fn dsv4_moe_frame(
         pass.dispatch_workgroups(g.hidden as u32, 1, 1);
     }
     let t_enc = std::time::Instant::now();
+    MOE_PASS_NS.fetch_add(
+        t_pass.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let mut sc = c.scratch.lock().unwrap();
     // The cold list rides the SAME staging buffer and the SAME fence, so the
     // host learns which picks it owes without paying a second barrier.
@@ -17588,6 +17603,12 @@ pub fn dsv4_moe_frame(
 /// profile so a slow block can be blamed on the right half.
 pub static MOE_ENC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MOE_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The encode half again, split three ways — "encoding" turned out to be the
+/// whole token's cost and "which part of it" is not guessable: the expert
+/// buffer lookup, the per-call uploads, and the passes themselves.
+pub static MOE_BUFS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MOE_UP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MOE_PASS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Attention over an index list with the learned sink, on the device.
 ///

@@ -946,8 +946,14 @@ fn compressor_step(
     let ew = if cp.overlap { width / 2 } else { width };
     let mut ckv = vec![0.0f32; width];
     let mut cscore = vec![0.0f32; width];
-    cp.wkv.matvec(hidden, &mut ckv, pool);
-    cp.wgate.matvec(hidden, &mut cscore, pool);
+    // Same input, so one dispatch instead of two — and this runs twice a
+    // layer (the compressor and the indexer's own), 43 layers a token.
+    crate::qtensor::QTensor::matvec_many(
+        [&cp.wkv, &cp.wgate],
+        hidden,
+        [&mut ckv, &mut cscore],
+        pool,
+    );
     if cp.overlap {
         // The reference biases the score as the token arrives and keeps it
         // biased across the shift, so ape is added ONCE, here.
@@ -1084,11 +1090,21 @@ pub(crate) mod prof {
             let e = crate::gpu_wgpu::MOE_ENC_NS.load(Ordering::Relaxed) as f64 / 1e6;
             let wt = crate::gpu_wgpu::MOE_WAIT_NS.load(Ordering::Relaxed) as f64 / 1e6;
             if e + wt > 0.0 {
+                let ns = |a: &std::sync::atomic::AtomicU64| {
+                    a.load(Ordering::Relaxed) as f64 / 1e6 / calls as f64
+                };
                 eprintln!(
                     "[dsv4-профиль] кадр MoE на вызов: кодирование {:.2} мс, \
                      отправка и ожидание {:.2} мс",
                     e / calls as f64,
                     wt / calls as f64,
+                );
+                eprintln!(
+                    "[dsv4-профиль]   из кодирования: буферы экспертов {:.2} мс, \
+                     загрузки {:.2} мс, проходы {:.2} мс",
+                    ns(&crate::gpu_wgpu::MOE_BUFS_NS),
+                    ns(&crate::gpu_wgpu::MOE_UP_NS),
+                    ns(&crate::gpu_wgpu::MOE_PASS_NS),
                 );
             }
         }
@@ -1276,17 +1292,18 @@ pub fn attention_step(
         );
     }
 
-    // ── q: wq_a → q_norm → wq_b → per-head norm → rope tail ──
+    // ── q and kv: both read the same hidden state, so they go out as ONE
+    // dispatch. The norms after them differ, and they stay separate.
+    // (q: wq_a → q_norm → wq_b → per-head norm → rope tail;
+    //  kv: one head's width, shared by every query head.)
     let mut qr = vec![0.0f32; cfg.q_lora_rank];
-    l.wq_a.matvec(hidden, &mut qr, pool);
+    let mut kv = vec![0.0f32; hd];
+    crate::qtensor::QTensor::matvec_many([&l.wq_a, &l.wkv], hidden, [&mut qr, &mut kv], pool);
     rms_weighted(&mut qr, &l.q_norm, cfg.norm_eps);
     // The queries are built further down, after the frame has had its chance
     // at the whole block. `qr` is needed either way: the indexer reads it.
     let on_gpu = gpu_attn_enabled();
 
-    // ── kv: one head's width, shared by every query head ──
-    let mut kv = vec![0.0f32; hd];
-    l.wkv.matvec(hidden, &mut kv, pool);
     rms_weighted(&mut kv, &l.kv_norm, cfg.norm_eps);
     rope_tail(&mut kv, inv_freq, pos, rd, false);
 
