@@ -1788,14 +1788,21 @@ fn dsv4_layer_loop(
             // separates "the layer frame is wrong" from "layers in one
             // encoder contaminate each other" in a single ppl run.
             if run.len() >= chain_max() {
-                if !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &mut folded, pool) {
+                let need_qn = run[0] == 0 || !on_dev[run[0] - 1];
+                if !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &mut folded, need_qn, pool) {
                     return false;
                 }
                 run.clear();
             }
             continue;
         }
-        if chain && !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &mut folded, pool) {
+        if chain
+            && !run.is_empty()
+            && !dsv4_chain_run(
+                layers, &run, cfg, g, st, token_id, &mut folded,
+                run[0] == 0 || !on_dev[run[0] - 1], pool,
+            )
+        {
             return false;
         }
         run.clear();
@@ -1992,7 +1999,12 @@ fn dsv4_layer_loop(
         folded = next;
     }
     if chain {
-        if !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &mut folded, pool) {
+        if !run.is_empty()
+            && !dsv4_chain_run(
+                layers, &run, cfg, g, st, token_id, &mut folded,
+                run[0] == 0 || !on_dev[run[0] - 1], pool,
+            )
+        {
             return false;
         }
         if st.dev_set.is_empty() {
@@ -2045,6 +2057,13 @@ fn dsv4_chain_run(
     // later segment starting from a stale fold: exact with one unbroken run,
     // release-scale garbage the moment anything splits the chain.
     folded: &mut Vec<f32>,
+    // Whether the device's qn buffer is stale: true at layer zero and after
+    // a host layer. When the previous layer was chained, its frame's tail
+    // already left THIS layer's LoRA vector on the card, and recomputing it
+    // here was a full wq_a matvec on the CPU per run — at CHAIN_MAX=1 that
+    // is one per LAYER, which is how a 43-fence path measured slower than
+    // an 86-fence one.
+    need_qn: bool,
     pool: Option<&crate::pool::Pool>,
 ) -> bool {
     if run.is_empty() {
@@ -2055,12 +2074,14 @@ fn dsv4_chain_run(
     let Some(model) = layers[first].experts.first().and_then(|e| e.w1.model_arc()) else {
         return false;
     };
-    // The run's first layer has no frame before it to have left its LoRA
-    // vector, so the host projects that one — once a run, not once a layer.
-    let mut qn0 = vec![0.0f32; cfg.q_lora_rank];
-    layers[first].wq_a.matvec(folded, &mut qn0, pool);
-    rms_weighted(&mut qn0, &layers[first].q_norm, cfg.norm_eps);
-    if !crate::gpu_wgpu::dsv4_chain_seed(folded, &qn0) {
+    if need_qn {
+        let mut qn0 = vec![0.0f32; cfg.q_lora_rank];
+        layers[first].wq_a.matvec(folded, &mut qn0, pool);
+        rms_weighted(&mut qn0, &layers[first].q_norm, cfg.norm_eps);
+        if !crate::gpu_wgpu::dsv4_chain_seed(folded, &qn0) {
+            return false;
+        }
+    } else if !crate::gpu_wgpu::dsv4_chain_seed_fold(folded) {
         return false;
     }
 

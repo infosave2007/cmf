@@ -16784,6 +16784,14 @@ pub fn dsv4_cache_ensure(kv_id: u64, li: usize, cap: usize) -> bool {
 /// it. Layer zero has no previous frame — the same hole that once put
 /// garbage into `post`/`comb` and cost a perplexity of 1470. Seed it, or the
 /// chain starts on whatever the last token left behind.
+/// Seed only the fold: the device's qn is already this layer's.
+pub fn dsv4_chain_seed_fold(x: &[f32]) -> bool {
+    let Some(c) = ctx() else { return false };
+    let b = frame_buf(c, 45, x.len() * 4, true);
+    c.queue.write_buffer(&b, 0, bytemuck::cast_slice(x));
+    true
+}
+
 pub fn dsv4_chain_seed(x: &[f32], qn: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };
     let b = frame_buf(c, 45, x.len() * 4, true);
