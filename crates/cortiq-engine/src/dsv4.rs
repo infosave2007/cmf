@@ -2308,8 +2308,88 @@ fn dsv4_two_frame_loop(
     {
         return false;
     }
+    // PRE-FLIGHT, before the first byte of state moves: a mid-loop refusal
+    // would hand the token back to the ordinary loop AFTER these caches
+    // advanced, and the second advance is not a slow answer but a wrong one.
+    // The same discipline the layer loop states in the same words.
+    let mut on_dev = vec![false; layers.len()];
+    for (li, l) in layers.iter().enumerate() {
+        let Some(pk) = pack_for(l, cfg, li) else {
+            return false;
+        };
+        let Some(model) = l.experts.first().and_then(|e| e.w1.model_arc()) else {
+            return false;
+        };
+        let gu_q2 = l
+            .experts
+            .first()
+            .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
+        let attn_ok = [
+            l.wq_a.model_idx(),
+            l.wq_b.model_idx(),
+            l.wo_a.model_idx(),
+            l.wo_b.model_idx(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|i| crate::gpu_wgpu::dsv4_weight_ready(&model, i));
+        on_dev[li] = attn_ok
+            && pk.globals.len() == cfg.n_routed_experts
+            && crate::gpu_wgpu::dsv4_experts_ready(&model, &pk.tensors, cfg.moe_inter, dim, gu_q2);
+    }
+    if !on_dev.iter().any(|&x| x) {
+        return false;
+    }
     let mut sink = vec![0.0f32; dim];
     for (li, l) in layers.iter().enumerate() {
+        // A layer the card cannot hold runs on the host WHOLE, with the
+        // state fetched and put back around it — the mixed ownership the
+        // layer loop already proved out.
+        if !on_dev[li] {
+            if !crate::gpu_wgpu::dsv4_state_read(state) {
+                return false;
+            }
+            let freqs = freqs_of(l);
+            hc_block(
+                state,
+                &l.hc_attn_fn,
+                &l.hc_attn_scale,
+                &l.hc_attn_base,
+                &l.attn_norm,
+                cfg,
+                scratch,
+                pool,
+                |f, o| attention_step(f, l, cfg, st, li, freqs, pool, None, o),
+            );
+            hc_block(
+                state,
+                &l.hc_ffn_fn,
+                &l.hc_ffn_scale,
+                &l.hc_ffn_base,
+                &l.ffn_norm,
+                cfg,
+                scratch,
+                pool,
+                |f, o| moe_step(f, l, cfg, token_id, li, pool, o),
+            );
+            let nref = layers.get(li + 1).unwrap_or(l);
+            let (f, p2, c2) = hc_fold_norm(
+                state,
+                &nref.hc_attn_fn,
+                &nref.hc_attn_scale,
+                &nref.hc_attn_base,
+                &nref.attn_norm,
+                cfg,
+                pool,
+            );
+            folded = f;
+            if !crate::gpu_wgpu::dsv4_hc_write(&p2, &c2)
+                || !crate::gpu_wgpu::dsv4_state_write(state)
+            {
+                return false;
+            }
+            continue;
+        }
         // The host's half: the caches and the attended list, untouched.
         let mut prep = AttnPrep::default();
         attention_step(
