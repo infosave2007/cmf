@@ -1030,7 +1030,30 @@ pub(crate) mod prof {
     pub fn note_layer(li: usize) {
         CALLS.fetch_add(1, Ordering::Relaxed);
         if li == 0 {
-            TOKENS.fetch_add(1, Ordering::Relaxed);
+            // The first token pays for the whole expert set reaching the card
+            // — tens of seconds of it. Left in, that one-time cost is divided
+            // by every later call and reads as a per-call price: it is what
+            // made "the host encodes for 4.45 ms a layer" out of an upload
+            // that happens once. Everything measured before the SECOND token
+            // starts is therefore thrown away, and the report describes
+            // steady state, which is the only thing worth optimising.
+            if TOKENS.fetch_add(1, Ordering::Relaxed) == 1 {
+                for a in [&ATTN_NS, &MOE_NS, &HC_NS, &HEAD_NS, &ALL_NS, &CALLS] {
+                    a.store(0, Ordering::Relaxed);
+                }
+                TOKENS.store(1, Ordering::Relaxed);
+                for a in [
+                    &crate::gpu_wgpu::MOE_ENC_NS,
+                    &crate::gpu_wgpu::MOE_WAIT_NS,
+                    &crate::gpu_wgpu::MOE_BUFS_NS,
+                    &crate::gpu_wgpu::MOE_UP_NS,
+                    &crate::gpu_wgpu::MOE_PASS_NS,
+                    &crate::gpu_wgpu::ATT_ENC_NS,
+                    &crate::gpu_wgpu::ATT_WAIT_NS,
+                ] {
+                    a.store(0, Ordering::Relaxed);
+                }
+            }
         }
     }
     static REPORT: AtomicBool = AtomicBool::new(false);
