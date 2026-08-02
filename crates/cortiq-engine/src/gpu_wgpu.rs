@@ -16183,10 +16183,12 @@ fn encode_moe_chain(
     n_pack: usize,
     slots: usize,
 ) {
-    // Same address-keying rule as everywhere: the bias is built per layer, so
-    // it goes through the per-call pool, not the const cache.
+    // The bias now lives in the PACK, whose address is stable for the life
+    // of the process — so the const cache is sound for it, and each layer
+    // gets its own device buffer. The per-call pool here was the many-layer
+    // clobber: every queue write lands before the run's single submit.
     let bs = match w.moe.bias {
-        Some(b) if b.len() >= n_pack => frame_up(c, 25, bytemuck::cast_slice(&b[..n_pack])),
+        Some(b) if b.len() >= n_pack => const_buf(c, bytemuck::cast_slice(&b[..n_pack])),
         _ => logits.clone(),
     };
     let mk = frame_buf(c, 17, n_pack * 4, true);

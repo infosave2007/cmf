@@ -1782,7 +1782,28 @@ fn dsv4_layer_loop(
     let mut sink_out = vec![0.0f32; dim];
     for (li, l) in layers.iter().enumerate() {
         if chain && on_dev[li] {
+            // A hash layer's forced indices change per token and go through
+            // the per-call upload pool, so two of them in one submission
+            // would route with the last one's picks. They run as runs of
+            // one; on the release that is three consecutive layers.
+            if l.tid2eid.is_some() && !run.is_empty() {
+                let need_qn = run[0] == 0 || !on_dev[run[0] - 1];
+                if !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &mut folded, need_qn, pool)
+                {
+                    return false;
+                }
+                run.clear();
+            }
             run.push(li);
+            if l.tid2eid.is_some() {
+                let need_qn = run[0] == 0 || !on_dev[run[0] - 1];
+                if !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &mut folded, need_qn, pool)
+                {
+                    return false;
+                }
+                run.clear();
+                continue;
+            }
             // CMF_DSV4_CHAIN_MAX=N caps a run's length. Diagnostic, not a
             // tuning knob: length-1 runs put ONE layer per submission, which
             // separates "the layer frame is wrong" from "layers in one
@@ -1921,10 +1942,6 @@ fn dsv4_layer_loop(
         if l.tid2eid.is_some() && forced.is_none() {
             return false;
         }
-        let bias: Option<Vec<f32>> = l
-            .gate_bias
-            .as_deref()
-            .map(|b| pk.globals.iter().map(|&gi| b[gi]).collect());
         let nxt = layers.get(li + 1);
         let w = crate::gpu_wgpu::Dsv4LayerW {
             attn: crate::gpu_wgpu::Dsv4AttnW {
@@ -1939,7 +1956,13 @@ fn dsv4_layer_loop(
                 router: &[],
                 experts: &pk.tensors,
                 logits: &[],
-                bias: bias.as_deref(),
+                // The PACK's bias, whose address outlives the process: the
+                // frame's const cache is keyed on it, and a per-layer Vec
+                // here handed every layer the first layer's — the exact
+                // transient-Vec trap the const_buf war story describes,
+                // reintroduced by this session and caught because the OFF
+                // baseline moved.
+                bias: pk.bias.as_deref(),
                 forced: forced.as_deref(),
                 remap: None,
             },
@@ -2103,12 +2126,7 @@ fn dsv4_chain_run(
         if layers[li].tid2eid.is_some() && forced.is_none() {
             return false;
         }
-        biases.push(
-            layers[li]
-                .gate_bias
-                .as_deref()
-                .map(|b| pk.globals.iter().map(|&gi| b[gi]).collect()),
-        );
+        biases.push(pk.bias.clone());
         forceds.push(forced);
         packs.push(pk);
     }
@@ -2227,7 +2245,9 @@ fn dsv4_chain_run(
                 router: &packs[i].router,
                 experts: &packs[i].tensors,
                 logits: &[],
-                bias: biases[i].as_deref(),
+                // The PACK's slice, not a per-run Vec: the address stability
+                // is the whole point (see Pack::bias).
+                bias: packs[i].bias.as_deref(),
                 forced: forceds[i].as_deref(),
                 remap: None,
             },
@@ -2598,6 +2618,15 @@ struct Pack {
     /// packed order, globals only (shared is not in here).
     globals: Vec<usize>,
     tensors: Vec<(usize, usize, usize)>,
+    /// The noaux_tc bias in PACKED order, kept here because it is the same
+    /// every token and the pack lives as long as the process: a stable
+    /// address means a stable device buffer, and a stable device buffer is
+    /// what lets many layers share one submission. A bias uploaded through
+    /// the per-call pool is written by every layer of a run BEFORE the run's
+    /// single submit — queue writes do not interleave with passes — so every
+    /// layer routed with the LAST layer's bias. On the release every scored
+    /// layer carries one, which is the 50.280.
+    bias: Option<Vec<f32>>,
 }
 
 #[cfg(feature = "gpu")]
@@ -2654,6 +2683,9 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
                 .map(|&sl| if sl == usize::MAX { u32::MAX } else { sl as u32 })
                 .collect();
             return Some(Arc::new(Pack {
+                bias: l.gate_bias.as_deref().map(|b| {
+                    globals.iter().map(|&g| b[g]).collect()
+                }),
                 router,
                 to_slot,
                 remap,
@@ -2712,6 +2744,9 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
             .map(|&sl| if sl == usize::MAX { u32::MAX } else { sl as u32 })
             .collect();
         Some(Arc::new(Pack {
+            bias: l.gate_bias.as_deref().map(|b| {
+                globals.iter().map(|&g| b[g]).collect()
+            }),
             router,
             to_slot,
             remap,
