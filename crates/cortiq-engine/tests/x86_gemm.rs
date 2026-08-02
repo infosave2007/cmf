@@ -425,6 +425,15 @@ fn q4b_blocked_vs_per_row() {
 #[test]
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn q4t_blocked_vs_per_row() {
+    // This compares two CPU implementations, and the blocked one hands a big
+    // enough matmat to the device when a backend is selected. Then it is CPU
+    // against GPU — a different contract, off by the 5e-3 that summation
+    // order costs — and the test says "blocked != per-row", which is not what
+    // went wrong. Refuse to answer a question the environment has changed.
+    if std::env::var("CMF_GPU").is_ok_and(|v| v != "0" && v != "off") {
+        eprintln!("CMF_GPU задан — сравнение CPU↔CPU невозможно, пропуск");
+        return;
+    }
     let (rows, cols, b) = (4864usize, 896usize, 256usize);
     let gpr = cols / 32;
     // 18B tiles: [f16 scale][16B nibbles].

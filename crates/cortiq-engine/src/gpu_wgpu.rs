@@ -5105,6 +5105,10 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
         rt_w[lid] = 0.0;
         rt_cold[2u * lid] = 0xFFFFFFFFu;
         rt_cold[2u * lid + 1u] = 0u;
+        // Diagnostic mirror, second half: every winner regardless of where it
+        // lives. Nothing reads it but a human, so it cannot change an answer.
+        rt_cold[2u * k + 2u * lid] = 0xFFFFFFFFu;
+        rt_cold[2u * k + 2u * lid + 1u] = 0u;
     }
     // The shared expert sits LAST in the packing, which is `n` only when
     // every expert was packed. With a subset it is n_pack, carried in the
@@ -5159,6 +5163,10 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
                 }
                 if (rank < k) {
                     rt_used[rank] = 1u;
+                    rt_cold[2u * k + 2u * rank] = m;
+                    rt_cold[2u * k + 2u * rank + 1u] = bitcast<u32>(rt_sh[m]);
+                    // What the kernel believes it was handed, in the slots the
+                    // winners do not use.
                     if (subset) {
                         let slot = rt_map[m];
                         if (slot == 0xFFFFFFFFu) {
@@ -16601,10 +16609,15 @@ pub fn moe_route_for_test(
     let ib = rw_f32(c, slots, true);
     let wb = rw_f32(c, slots, true);
     let cb = rw_f32(c, 1, true);
+    let rmb = storage_bytes(c, bytemuck::cast_slice(&vec![0u32; n]));
+    let coldb = rw_f32(c, 4 * top_k, false);
     let flags = (bias.is_some_and(|b| b.len() >= n) as u32)
         | ((mask.is_some_and(|m| m.len() >= n) as u32) << 1)
         | ((forced.is_some_and(|f| f.len() >= top_k) as u32) << 2)
-        | ((shared_slot as u32) << 3);
+        | ((shared_slot as u32) << 3)
+        // Nothing is packed away here, so the shared expert sits at n — the
+        // same slot the frame computes from its packing.
+        | ((n as u32) << 8);
     let p = uniform_mixed(c, [n as u32, top_k as u32, flags], route_scale);
     let mut enc = c
         .device
@@ -16623,6 +16636,11 @@ pub fn moe_route_for_test(
                 bind_buf(5, &wb),
                 bind_buf(6, &cb),
                 bind_buf(7, &p),
+                // The router grew a remap and a winners buffer; a standalone
+                // caller that skips them is a validation error, not a
+                // silently different answer.
+                bind_buf(8, &rmb),
+                bind_buf(9, &coldb),
             ],
         });
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -17288,6 +17306,13 @@ pub fn dsv4_moe_frame(
     let slots = g.top_k + 1;
     let n_all = w.logits.len();
     let subset = w.remap.is_some_and(|r| r.len() >= n_all) && n_all > 0;
+    // ONE width for the whole routing side: the scores, the bias and the
+    // uniform must agree, and they did not. The bias went in n_pack long
+    // while the kernel ranked over n_all, so every index past the packing
+    // boundary read the LAST bias entry — WGSL clamps an out-of-bounds read
+    // rather than faulting, so it looked like a plausible number and the
+    // router quietly preferred the packed experts.
+    let n_route = if subset { n_all } else { n_pack };
     if n_pack == 0
         || w.logits.len() < n_pack
         || n_pack > 1024
@@ -17313,7 +17338,7 @@ pub fn dsv4_moe_frame(
     };
 
     // ── routing, on the device, straight into the msel/mwt the kernels read ──
-    let lg = frame_up(c, 16, bytemuck::cast_slice(w.logits));
+    let lg = frame_up(c, 16, bytemuck::cast_slice(&w.logits[..n_route]));
     // KNOWN DEFECT, cold path only: nothing the kernel writes into rt_cold
     // reaches the host. Proved by writing an UNCONDITIONAL value there and
     // reading back all-empty, so the router is not the suspect — the readback
@@ -17327,14 +17352,16 @@ pub fn dsv4_moe_frame(
     // layer after layer — so every layer was routed with layer zero's bias.
     // The toys never caught it because they carry no expert_bias at all.
     let bs = match w.bias {
-        Some(b) if b.len() >= n_pack => frame_up(c, 25, bytemuck::cast_slice(&b[..n_pack])),
+        Some(b) if b.len() >= n_route => {
+            frame_up(c, 25, bytemuck::cast_slice(&b[..n_route]))
+        }
         _ => lg.clone(),
     };
     let rmb = match w.remap {
         Some(r) if subset => frame_up(c, 26, bytemuck::cast_slice(&r[..n_all])),
         _ => frame_buf(c, 26, n_all.max(1) * 4, true),
     };
-    let coldb = frame_buf(c, 27, 2 * g.top_k * 4, false);
+    let coldb = frame_buf(c, 27, 4 * g.top_k * 4, false);
     let mk = frame_buf(c, 17, n_pack * 4, true);
     let fc = match w.forced {
         Some(f) if f.len() >= g.top_k => {
@@ -17350,7 +17377,7 @@ pub fn dsv4_moe_frame(
     let xb = frame_up(c, 23, bytemuck::cast_slice(&x[..g.hidden]));
     let ob = frame_buf(c, 24, g.hidden * 4, false);
 
-    let rflags = (w.bias.is_some_and(|b| b.len() >= w.logits.len()) as u32)
+    let rflags = (w.bias.is_some_and(|b| b.len() >= n_route) as u32)
         | ((w.forced.is_some_and(|f| f.len() >= g.top_k) as u32) << 2)
         | 8 // always pin the shared slot: these kernels take a fixed count
         | ((subset as u32) << 4)
@@ -17367,11 +17394,7 @@ pub fn dsv4_moe_frame(
     // mask that also indexed the packed buffer with global ids.
     let rp = uniform_mixed(
         c,
-        [
-            if subset { n_all as u32 } else { n_pack as u32 },
-            g.top_k as u32,
-            rflags,
-        ],
+        [n_route as u32, g.top_k as u32, rflags],
         g.route_scale,
     );
 
@@ -17514,7 +17537,7 @@ pub fn dsv4_moe_frame(
     // the way down and never filled — and the empty list read exactly like a
     // router that had chosen no cold experts. An unconditional probe written
     // from the kernel is what proved otherwise.
-    let cold_bytes = (2 * g.top_k * 4) as u64;
+    let cold_bytes = (4 * g.top_k * 4) as u64;
     let total = (g.hidden * 4) as u64 + cold_bytes;
     let stage2 = Scratch::ensure(
         &c.device,
@@ -17541,6 +17564,17 @@ pub fn dsv4_moe_frame(
             if tail[2 * t] != u32::MAX {
                 cold_out.push((tail[2 * t] as usize, f32::from_bits(tail[2 * t + 1])));
             }
+        }
+        if std::env::var("CMF_DSV4_MOE_CHECK").is_ok() {
+            let picks: Vec<(u32, f32)> = (0..g.top_k)
+                .map(|t| {
+                    (
+                        tail[2 * g.top_k + 2 * t],
+                        f32::from_bits(tail[2 * g.top_k + 2 * t + 1]),
+                    )
+                })
+                .collect();
+            eprintln!("[победители карты] {picks:?}");
         }
         ok = true;
     }
