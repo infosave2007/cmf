@@ -1046,6 +1046,7 @@ pub(crate) mod prof {
                     a.store(0, Ordering::Relaxed);
                 }
                 TOKENS.store(1, Ordering::Relaxed);
+                #[cfg(feature = "gpu")]
                 for a in [
                     &crate::gpu_wgpu::MOE_ENC_NS,
                     &crate::gpu_wgpu::MOE_WAIT_NS,
@@ -1504,10 +1505,13 @@ pub fn attention_step(
     let mut attn = vec![0.0f32; cfg.n_heads * hd];
     for h in 0..cfg.n_heads {
         let qh = &q[h * hd..(h + 1) * hd];
-        let mut oh = vec![0.0f32; hd];
-        sparse_attend(qh, &cache, &idxs, l.attn_sink[h], scale, hd, &mut oh);
-        rope_tail(&mut oh, inv_freq, pos, rd, true);
-        attn[h * hd..(h + 1) * hd].copy_from_slice(&oh);
+        // Straight into this head's slice of the output: the scratch vector
+        // that used to sit here was an allocation and a copy per head, so 64
+        // of each per layer per token, for a value that was never read
+        // anywhere else.
+        let oh = &mut attn[h * hd..(h + 1) * hd];
+        sparse_attend(qh, &cache, &idxs, l.attn_sink[h], scale, hd, oh);
+        rope_tail(oh, inv_freq, pos, rd, true);
     }
 
     // ── grouped low-rank output ──
