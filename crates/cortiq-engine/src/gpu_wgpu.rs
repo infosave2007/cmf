@@ -17507,13 +17507,6 @@ pub fn dsv4_moe_frame(
     }
     let t_enc = std::time::Instant::now();
     let mut sc = c.scratch.lock().unwrap();
-    let stage = Scratch::ensure(
-        &c.device,
-        &mut sc.stage,
-        (g.hidden * 4) as u64,
-        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        "dsv4-moe-stage",
-    );
     // The cold list rides the SAME staging buffer and the SAME fence, so the
     // host learns which picks it owes without paying a second barrier.
     //
@@ -17523,6 +17516,9 @@ pub fn dsv4_moe_frame(
     // from the kernel is what proved otherwise.
     let cold_bytes = (4 * g.top_k * 4) as u64;
     let total = (g.hidden * 4) as u64 + cold_bytes;
+    // ONE ensure for the whole readback. A first call sized to the hidden
+    // state alone used to run before this one, on the same slot: it built a
+    // buffer that the next line immediately outgrew and replaced.
     let stage2 = Scratch::ensure(
         &c.device,
         &mut sc.stage,
@@ -17530,7 +17526,6 @@ pub fn dsv4_moe_frame(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "dsv4-moe-stage",
     );
-    let _ = &stage;
     enc.copy_buffer_to_buffer(&ob, 0, &stage2, 0, (g.hidden * 4) as u64);
     enc.copy_buffer_to_buffer(&coldb, 0, &stage2, (g.hidden * 4) as u64, cold_bytes);
     c.queue.submit(Some(enc.finish()));
