@@ -18224,6 +18224,27 @@ pub struct Dsv4AttnGeom {
 /// cheaper than moving that state too. That is the next frame to fuse, not a
 /// thing forgotten here.
 #[allow(clippy::too_many_arguments)]
+/// The hyper-connection work that sits between a layer's two halves, so the
+/// frame can do it instead of the host.
+///
+/// Measured: these are 19 ms of a 57 ms token on the CPU and hundredths of a
+/// millisecond on the card. Nothing about them needs the host — they were
+/// only there because the frames handed their output back.
+pub struct Dsv4HcTail<'a> {
+    /// The FFN half's projection, scales and base.
+    pub fn_: &'a [f32],
+    pub scale: &'a [f32; 3],
+    pub base: &'a [f32],
+    /// The norm applied to the fold that feeds the MoE half.
+    pub norm: &'a [f32],
+    pub hc: usize,
+    pub sinkhorn_iters: usize,
+    pub hc_eps: f32,
+    /// RMS epsilon for the norm that follows the fold.
+    pub eps: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn dsv4_attn_frame(
     model: &Arc<CmfModel>,
     w: &Dsv4AttnW,
@@ -18238,6 +18259,10 @@ pub fn dsv4_attn_frame(
     idxs: &[u32],
     inv_freq: &[f32],
     pos: usize,
+    // When present the frame also expands its output into the layer state,
+    // folds the FFN half and norms it, and hands back THAT — the MoE half's
+    // input — instead of the attention output.
+    hc: Option<&Dsv4HcTail>,
     out: &mut [f32],
 ) -> bool {
     // A refusal used to be a silent `false`, and three of them in a row cost
@@ -18395,6 +18420,38 @@ pub fn dsv4_attn_frame(
         (35, kv_id, li),
     );
 
+    // ── the hyper-connections, when the caller handed them over ──
+    // The same order the host's hc_block keeps: expand this half's output
+    // into the layer state, mix, fold with the FFN half's parameters, norm.
+    // What comes out is the MoE half's INPUT, so the host has nothing left
+    // to do between the two frames — which is 19 ms of a 57 ms token.
+    let hc_out = hc.map(|h| {
+        let mix_hc = (2 + h.hc) * h.hc;
+        let state = frame_buf(c, 40, h.hc * g.dim * 4, true);
+        let state2 = frame_buf(c, 46, h.hc * g.dim * 4, true);
+        let hpost = frame_buf(c, 43, h.hc * 4, true);
+        let hcomb = frame_buf(c, 44, h.hc * h.hc * 4, true);
+        let mixes = frame_buf(c, 41, mix_hc * 4, true);
+        let folded = frame_buf(c, 42, g.dim * 4, true);
+        let x2 = frame_buf(c, 45, g.dim * 4, true);
+        let hcp = uniform_mixed(
+            c,
+            [h.hc as u32, g.dim as u32, h.sinkhorn_iters as u32],
+            h.hc_eps,
+        );
+        let ffn_fn = const_buf(c, bytemuck::cast_slice(h.fn_));
+        let ffn_sc = const_buf(c, bytemuck::cast_slice(h.scale));
+        let ffn_bs = const_buf(c, bytemuck::cast_slice(&h.base[..mix_hc]));
+        let ffn_nw = const_buf(c, bytemuck::cast_slice(&h.norm[..g.dim]));
+        encode_hc_expand(c, &mut enc, &yb, &state, &hpost, &hcomb, &state2, &hcp, h.hc, g.dim);
+        encode_f32matvec(c, &mut enc, &ffn_fn, &state2, &mixes, mix_hc, h.hc * g.dim);
+        encode_hc_fold(
+            c, &mut enc, &state2, &mixes, &ffn_sc, &ffn_bs, &folded, &hpost, &hcomb, &hcp,
+        );
+        encode_rmsnorm(c, &mut enc, &folded, &ffn_nw, &x2, g.dim, h.eps, (54, kv_id, li));
+        x2
+    });
+
     let tap = std::env::var("CMF_DSV4_FRAME_TAP").unwrap_or_default();
     let (src, n) = match tap.as_str() {
         "qr" => (&qr, g.q_lora),
@@ -18402,8 +18459,19 @@ pub fn dsv4_attn_frame(
         "q" => (&q, g.nh * g.hd),
         "attn" => (&attn, g.nh * g.hd),
         "mid" => (&mid, g.o_groups * g.o_lora),
-        _ => (&yb, g.dim),
+        _ => (hc_out.as_ref().unwrap_or(&yb), g.dim),
     };
+    // An EMPTY `out` means the caller wants the result left where it is: the
+    // MoE frame reads it from the same buffer, so the token does not stop
+    // here at all.
+    if out.is_empty() {
+        c.queue.submit(Some(enc.finish()));
+        ATT_ENC_NS.fetch_add(
+            t_all.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        return true;
+    }
     if out.len() < n {
         no!("отвод {tap} нуждается в {n} значениях, дано {}", out.len());
     }
@@ -18476,6 +18544,10 @@ pub static ATT_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// the obvious design needs, and it makes the mask implicit: an expert not in
 /// the packing has no logit and cannot be chosen.
 pub struct Dsv4MoeW<'a> {
+    /// The gate as dense f32 `[n_exp, hidden]`. Used when `logits` is empty,
+    /// which is what a device-resident input forces: the host cannot score
+    /// a vector it does not have.
+    pub router: &'a [f32],
     /// `(gate, up, down)` directory indices per packed expert, shared LAST.
     pub experts: &'a [(usize, usize, usize)],
     /// Router logits over the packed routed experts (shared excluded).
@@ -18505,10 +18577,18 @@ pub fn dsv4_moe_frame(
     model: &Arc<CmfModel>,
     w: &Dsv4MoeW,
     g: Dsv4MoeGeom,
+    // EMPTY means the attention frame left this half's input on the card in
+    // its own buffer, which is the whole point: with the hyper-connections
+    // done there too, the host has nothing to carry between the halves.
     x: &[f32],
     // `(expert, weight)` pairs the device left for the host, empty when the
     // whole packing was resident.
     cold_out: &mut Vec<(usize, f32)>,
+    // The same handover as the attention frame's: expand this half's output
+    // into the state, then fold and norm for the NEXT layer, and give back
+    // that instead of the MoE output. `next` carries the following layer's
+    // attention-half parameters.
+    hc: Option<(&Dsv4HcTail, &[f32])>,
     out: &mut [f32],
 ) -> bool {
     macro_rules! no {
@@ -18524,7 +18604,11 @@ pub fn dsv4_moe_frame(
     let Some(c) = ctx() else { no!("нет контекста wgpu") };
     let n_pack = w.experts.len().saturating_sub(1); // routed; shared is last
     let slots = g.top_k + 1;
-    let n_all = w.logits.len();
+    let n_all = if w.logits.is_empty() {
+        w.router.len() / g.hidden.max(1)
+    } else {
+        w.logits.len()
+    };
     let subset = w.remap.is_some_and(|r| r.len() >= n_all) && n_all > 0;
     // ONE width for the whole routing side: the scores, the bias and the
     // uniform must agree, and they did not. The bias went in n_pack long
@@ -18538,7 +18622,7 @@ pub fn dsv4_moe_frame(
         || n_pack > 1024
         || g.top_k == 0
         || g.top_k > 63
-        || x.len() < g.hidden
+        || (!x.is_empty() && x.len() < g.hidden)
         || out.len() < g.hidden
         || g.hidden % 32 != 0
         || g.inter % 32 != 0
@@ -18564,7 +18648,20 @@ pub fn dsv4_moe_frame(
     let t_up = std::time::Instant::now();
 
     // ── routing, on the device, straight into the msel/mwt the kernels read ──
-    let lg = frame_up(c, 16, bytemuck::cast_slice(&w.logits[..n_route]));
+    let lg = if w.logits.is_empty() {
+        // Score on the card, from the input that is already there.
+        let rb = const_buf(c, bytemuck::cast_slice(&w.router[..n_route * g.hidden]));
+        let lb = frame_buf(c, 16, n_route * 4, false);
+        let mut e0 = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let xin = frame_buf(c, 45, g.hidden * 4, true);
+        encode_f32matvec(c, &mut e0, &rb, &xin, &lb, n_route, g.hidden);
+        c.queue.submit(Some(e0.finish()));
+        lb
+    } else {
+        frame_up(c, 16, bytemuck::cast_slice(&w.logits[..n_route]))
+    };
     // NOT const_buf: that cache is keyed on the host ADDRESS, which is only
     // meaningful for model weights that outlive the process. The bias arrives
     // in a Vec built per layer, and the allocator hands back the same address
@@ -18593,7 +18690,11 @@ pub fn dsv4_moe_frame(
     let mwt = frame_buf(c, 20, slots * 4, false);
     let mcnt = frame_buf(c, 21, 4, false);
     let mact = frame_buf(c, 22, slots * g.inter * 4, false);
-    let xb = frame_up(c, 23, bytemuck::cast_slice(&x[..g.hidden]));
+    let xb = if x.is_empty() {
+        frame_buf(c, 45, g.hidden * 4, true)
+    } else {
+        frame_up(c, 23, bytemuck::cast_slice(&x[..g.hidden]))
+    };
     let ob = frame_buf(c, 24, g.hidden * 4, false);
 
     let rflags = (w.bias.is_some_and(|b| b.len() >= n_route) as u32)
@@ -18759,6 +18860,34 @@ pub fn dsv4_moe_frame(
         pass.set_bind_group(0, &bg_dn, &[]);
         pass.dispatch_workgroups(g.hidden as u32, 1, 1);
     }
+    // ── the hyper-connections for the NEXT layer, on the card ──
+    let hc_out = hc.map(|(h, next_norm)| {
+        let mix_hc = (2 + h.hc) * h.hc;
+        let state = frame_buf(c, 40, h.hc * g.hidden * 4, true);
+        let state2 = frame_buf(c, 46, h.hc * g.hidden * 4, true);
+        let hpost = frame_buf(c, 43, h.hc * 4, true);
+        let hcomb = frame_buf(c, 44, h.hc * h.hc * 4, true);
+        let mixes = frame_buf(c, 41, mix_hc * 4, true);
+        let folded = frame_buf(c, 42, g.hidden * 4, true);
+        let x2 = frame_buf(c, 45, g.hidden * 4, true);
+        let hcp = uniform_mixed(
+            c,
+            [h.hc as u32, g.hidden as u32, h.sinkhorn_iters as u32],
+            h.hc_eps,
+        );
+        let nfn = const_buf(c, bytemuck::cast_slice(h.fn_));
+        let nsc = const_buf(c, bytemuck::cast_slice(h.scale));
+        let nbs = const_buf(c, bytemuck::cast_slice(&h.base[..mix_hc]));
+        let nnw = const_buf(c, bytemuck::cast_slice(&next_norm[..g.hidden]));
+        encode_hc_expand(c, &mut enc, &ob, &state2, &hpost, &hcomb, &state, &hcp, h.hc, g.hidden);
+        encode_f32matvec(c, &mut enc, &nfn, &state, &mixes, mix_hc, h.hc * g.hidden);
+        encode_hc_fold(
+            c, &mut enc, &state, &mixes, &nsc, &nbs, &folded, &hpost, &hcomb, &hcp,
+        );
+        encode_rmsnorm(c, &mut enc, &folded, &nnw, &x2, g.hidden, h.eps, (55, 0, lkey));
+        x2
+    });
+
     if let Some((qs, resolve, tstage)) = &c.ts_query {
         let slot = TS_LAST.load(std::sync::atomic::Ordering::Relaxed);
         // An UNCONDITIONAL value in the staging buffer before the copy. If it
@@ -18802,7 +18931,13 @@ pub fn dsv4_moe_frame(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "dsv4-moe-stage",
     );
-    enc.copy_buffer_to_buffer(&ob, 0, &stage2, 0, (g.hidden * 4) as u64);
+    enc.copy_buffer_to_buffer(
+        hc_out.as_ref().unwrap_or(&ob),
+        0,
+        &stage2,
+        0,
+        (g.hidden * 4) as u64,
+    );
     enc.copy_buffer_to_buffer(&coldb, 0, &stage2, (g.hidden * 4) as u64, cold_bytes);
     c.queue.submit(Some(enc.finish()));
     let slice = stage2.slice(..total);

@@ -1242,6 +1242,9 @@ fn attn_frame(
     pos: usize,
     win_len: usize,
     scale: f32,
+    // Present: the frame also does this layer's hyper-connection handover
+    // and leaves the MoE half's input on the card. `out` may then be empty.
+    hc: Option<&crate::gpu_wgpu::Dsv4HcTail>,
     out: &mut [f32],
 ) -> bool {
     let hd = cfg.head_dim;
@@ -1320,17 +1323,7 @@ fn attn_frame(
         scale,
     };
     crate::gpu_wgpu::dsv4_attn_frame(
-        &model,
-        &w,
-        g,
-        &[],
-        Some(qn),
-        kv_id,
-        li,
-        &idx32,
-        inv_freq,
-        pos,
-        out,
+        &model, &w, g, &[], Some(qn), kv_id, li, &idx32, inv_freq, pos, hc, out,
     )
 }
 
@@ -1533,7 +1526,7 @@ pub fn attention_step(
     #[cfg(feature = "gpu")]
     if on_gpu
         && attn_frame(
-            l, cfg, st, li, &qr, &idxs, inv_freq, pos, win_len, scale, out,
+            l, cfg, st, li, &qr, &idxs, inv_freq, pos, win_len, scale, None, out,
         )
     {
         return;
@@ -1918,6 +1911,7 @@ fn dsv4_layer_loop(
                 sink: &l.attn_sink,
             },
             moe: crate::gpu_wgpu::Dsv4MoeW {
+                router: &[],
                 experts: &pk.tensors,
                 logits: &[],
                 bias: bias.as_deref(),
@@ -2169,6 +2163,7 @@ fn dsv4_chain_run(
                 sink: &l.attn_sink,
             },
             moe: crate::gpu_wgpu::Dsv4MoeW {
+                router: &packs[i].router,
                 experts: &packs[i].tensors,
                 logits: &[],
                 bias: biases[i].as_deref(),
@@ -2243,6 +2238,136 @@ fn dsv4_chain_run(
     }
     st.dev_owned = true;
     true
+}
+
+/// `CMF_DSV4_HC_DEV=0` puts the hyper-connections back on the host.
+#[cfg(feature = "gpu")]
+fn hc_on_device() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CMF_DSV4_HC_DEV").map(|v| v != "0").unwrap_or(true)
+            && crate::gpu::backend_available()
+    })
+}
+
+/// The two-frame path with the hyper-connections on the card.
+///
+/// The host still prepares each layer's attention inputs — the compressor,
+/// the indexer and the window, which are exact there — but it no longer
+/// folds, Sinkhorns or norms, and it no longer carries the MoE half's input
+/// between the halves: the attention frame leaves it on the device and the
+/// MoE frame reads it from there. One readback a layer instead of two, and
+/// 19 ms of host arithmetic a token gone.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn dsv4_two_frame_loop(
+    state: &mut [f32],
+    layers: &[Dsv4Layer],
+    g: &Dsv4Globals,
+    cfg: &Dsv4Cfg,
+    st: &mut Dsv4State,
+    token_id: u32,
+    inv_freq: &[f32],
+    pool: Option<&crate::pool::Pool>,
+    scratch: &mut HcScratch,
+) -> bool {
+    let dim = cfg.dim;
+    let freqs_of = |l: &Dsv4Layer| -> &[f32] {
+        let f = if l.compressor.is_some() {
+            &g.inv_freq_compress
+        } else {
+            &g.inv_freq_window
+        };
+        if f.is_empty() { inv_freq } else { f.as_slice() }
+    };
+    // Layer zero's fold has no frame before it, exactly as in the layer path.
+    let (mut folded, post0, comb0) = hc_fold_norm(
+        state,
+        &layers[0].hc_attn_fn,
+        &layers[0].hc_attn_scale,
+        &layers[0].hc_attn_base,
+        &layers[0].attn_norm,
+        cfg,
+        pool,
+    );
+    if !crate::gpu_wgpu::dsv4_state_write(state)
+        || !crate::gpu_wgpu::dsv4_hc_write(&post0, &comb0)
+    {
+        return false;
+    }
+    let mut sink = vec![0.0f32; dim];
+    for (li, l) in layers.iter().enumerate() {
+        // The host's half: the caches and the attended list, untouched.
+        let mut prep = AttnPrep::default();
+        attention_step(
+            &folded, l, cfg, st, li, freqs_of(l), pool, Some(&mut prep), &mut sink,
+        );
+        let hd = cfg.head_dim;
+        let n_comp = st.compressed[li].len() / hd;
+        let cap = (cfg.window + n_comp.next_power_of_two().max(64)) * hd;
+        if !crate::gpu_wgpu::dsv4_cache_write(st.kv_id, li, 0, &st.window[li], cap)
+            || (n_comp > 0
+                && !crate::gpu_wgpu::dsv4_cache_write(
+                    st.kv_id, li, cfg.window * hd, &st.compressed[li], cap,
+                ))
+        {
+            return false;
+        }
+        let idx32: Vec<u32> = prep
+            .idxs
+            .iter()
+            .map(|&p| {
+                if p < prep.win_len {
+                    p as u32
+                } else {
+                    (cfg.window + (p - prep.win_len)) as u32
+                }
+            })
+            .collect();
+        let nxt = layers.get(li + 1);
+        let a_tail = crate::gpu_wgpu::Dsv4HcTail {
+            fn_: &l.hc_ffn_fn,
+            scale: &l.hc_ffn_scale,
+            base: &l.hc_ffn_base,
+            norm: &l.ffn_norm,
+            hc: cfg.hc_mult,
+            sinkhorn_iters: cfg.hc_sinkhorn_iters,
+            hc_eps: cfg.hc_eps,
+            eps: cfg.norm_eps,
+        };
+        let scale = (cfg.head_dim as f32).powf(-0.5);
+        if !attn_frame(
+            l, cfg, st, li, &prep.qr, &prep.idxs, freqs_of(l), st.pos, prep.win_len,
+            scale, Some(&a_tail), &mut [],
+        ) {
+            return false;
+        }
+        let m_tail = nxt.map(|n| crate::gpu_wgpu::Dsv4HcTail {
+            fn_: &n.hc_attn_fn,
+            scale: &n.hc_attn_scale,
+            base: &n.hc_attn_base,
+            norm: &n.attn_norm,
+            hc: cfg.hc_mult,
+            sinkhorn_iters: cfg.hc_sinkhorn_iters,
+            hc_eps: cfg.hc_eps,
+            eps: cfg.norm_eps,
+        });
+        let mut next = vec![0.0f32; dim];
+        let pair = m_tail
+            .as_ref()
+            .zip(nxt)
+            .map(|(t, n)| (t, n.attn_norm.as_slice()));
+        let forced = l
+            .tid2eid
+            .as_ref()
+            .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id));
+        if !moe_frame(&[], l, cfg, li, &[], forced.as_deref(), pool, pair, &mut next) {
+            return false;
+        }
+        folded = next;
+    }
+    let _ = scratch;
+    crate::gpu_wgpu::dsv4_state_read(state)
 }
 
 /// The host half of one hyper-connection block: mixes, Sinkhorn, fold, norm.
@@ -2481,6 +2606,8 @@ fn moe_frame(
     logits: &[f32],
     forced: Option<&[usize]>,
     pool: Option<&crate::pool::Pool>,
+    // The next layer's hyper-connection handover, done on the card.
+    hc: Option<(&crate::gpu_wgpu::Dsv4HcTail, &[f32])>,
     out: &mut [f32],
 ) -> bool {
     macro_rules! no {
@@ -2528,6 +2655,7 @@ fn moe_frame(
         }
     });
     let w = crate::gpu_wgpu::Dsv4MoeW {
+        router: &pk.router,
         experts: &pk.tensors,
         logits: &lg,
         bias: bias.as_deref(),
@@ -2545,7 +2673,7 @@ fn moe_frame(
         }),
     };
     let mut cold = Vec::new();
-    if !crate::gpu_wgpu::dsv4_moe_frame(&model, &w, g, hidden, &mut cold, out) {
+    if !crate::gpu_wgpu::dsv4_moe_frame(&model, &w, g, hidden, &mut cold, hc, out) {
         return false;
     }
     // The picks the card had no room for, finished here and added in. Their
@@ -2664,7 +2792,7 @@ pub fn moe_step(
             .tid2eid
             .as_ref()
             .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id));
-        if moe_frame(hidden, l, cfg, li, &logits, forced.as_deref(), pool, out) {
+        if moe_frame(hidden, l, cfg, li, &logits, forced.as_deref(), pool, None, out) {
             // CMF_DSV4_MOE_CHECK=1 recomputes the same block on the CPU and
             // reports where they part. A wrong MoE does not fail — it answers
             // differently — and the toy agreed bit for bit while the release
@@ -2975,6 +3103,29 @@ pub fn forward_token(
     #[cfg(not(feature = "gpu"))]
     let layer_frames = false;
 
+    // ── the fast two-frame path: hyper-connections on the card ──
+    // Measured on the release, the fold, the Sinkhorn and the norms cost 19
+    // ms of a 57 ms token on the host and hundredths of one on the device.
+    // With both frames doing their own, the host carries nothing between a
+    // layer's halves and the MoE half's input never leaves the card — one
+    // readback a layer instead of two.
+    #[cfg(feature = "gpu")]
+    let hc_dev = hc_on_device()
+        && !layer_frames
+        && gpu_attn_enabled()
+        && gpu_moe2_enabled()
+        && dump_path().is_none();
+    #[cfg(not(feature = "gpu"))]
+    let hc_dev = false;
+    #[cfg(feature = "gpu")]
+    if hc_dev
+        && dsv4_two_frame_loop(
+            &mut state, layers, g, cfg, st, token_id, inv_freq, pool, &mut scratch,
+        )
+    {
+        // The state the head needs is already back.
+    } else {
+
     for (li, l) in layers.iter().enumerate() {
         if layer_frames {
             break;
@@ -3066,6 +3217,7 @@ pub fn forward_token(
                 }
             );
         }
+    }
     }
     st.pos += 1;
 
