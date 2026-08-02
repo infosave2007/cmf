@@ -6789,17 +6789,24 @@ fn moe_expert_bufs(
     // a 112 GB model that second copy IS the machine's RAM (measured: 172 of
     // 176 GB cached).
     //
-    // Measured: resident set 6 GB with this on, 92 GB with it off.
+    // Alternated off/on/off/on from a warmed file, 256 tokens each:
     //
-    // OFF BY DEFAULT because the COST is not established yet. It contradicts
-    // the mapping's `WillNeed` (now suppressed when this is set — see
-    // CmfModel::open), and the decode numbers taken next to it are unusable:
-    // both arms ran against a cold page cache, ~10x under the same machine's
-    // own figure at the same length, so they measured the machine and not the
-    // flag. Re-measure from a clean process before flipping this.
-    // `CMF_UPLOAD_EVICT=1` turns it on; discrete only, as on UMA the mapping
-    // IS the working copy.
-    if c.discrete && std::env::var("CMF_UPLOAD_EVICT").is_ok_and(|v| v != "0") {
+    //   off  94 GB resident  1.0 tok/s      off  91 GB  0.5 tok/s
+    //   on    5 GB resident  6.9 tok/s      on    5 GB  6.1 tok/s
+    //
+    // It is not a trade — holding a second copy of the weights is what was
+    // costing the speed. At 94 GB resident the machine has nothing left for
+    // the pages it does need, and reclaim churns; at 5 GB it does not.
+    //
+    // Pairs with `open()` skipping its whole-file `WillNeed` when this is on:
+    // reading 104 GB ahead only to drop it behind the uploader had the kernel
+    // fetching the same bytes twice. `CMF_UPLOAD_EVICT=0` opts out; discrete
+    // only, as on UMA the mapping IS the working copy.
+    if c.discrete
+        && std::env::var("CMF_UPLOAD_EVICT")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    {
         model.evict_ranges(&uploaded.borrow());
     }
     c.resident.fetch_add(total, Ordering::Relaxed);

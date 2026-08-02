@@ -19,24 +19,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The budget message no longer blames a mask that isn't there** when a
   layer has no VRAM left for a single expert.
 
-### Added
-- **`CMF_UPLOAD_EVICT=1`** releases the experts' host pages once they reach
-  the card (`madvise(DONTNEED)` + `posix_fadvise`, discrete GPUs on Linux).
-  Uploading reads ~94 GB through the mapping and the page cache keeps every
-  byte — a second copy of weights that now live in VRAM, and on a 112 GB
-  model that copy is the machine's RAM (172 of 176 GB cached). Measured on
-  the release checkpoint: **resident set 6 GB with it on against 92 GB
-  with it off.**
+### Changed
+- **The experts' host pages are released once they reach the card**
+  (`madvise(DONTNEED)` + `posix_fadvise`; discrete GPUs on Linux,
+  `CMF_UPLOAD_EVICT=0` opts out). Uploading reads ~94 GB through the mapping
+  and the page cache kept every byte — a second copy of weights that now live
+  in VRAM, and on a 112 GB model that copy is the machine's RAM. Alternated
+  off/on/off/on from a warmed file, 256 tokens each:
 
-  **Off by default, because its cost is not yet established.** It also
-  contradicted the mapping's own `WillNeed` — asking the kernel to read a
-  104 GB file ahead while dropping the pages behind the uploader has it
-  fetching the same bytes twice — so `CMF_UPLOAD_EVICT=1` now suppresses
-  that advice. The decode numbers taken alongside (0.2 tok/s on, 0.4 off)
-  are not usable: both arms ran against a cold page cache and are ~10x
-  below the same machine's 4.5 tok/s at the same length, so they measure
-  the machine's state, not the flag. Re-measure from a clean process before
-  making this the default.
+  | | resident | decode |
+  |---|---|---|
+  | off | 94 GB, 91 GB | 1.0, 0.5 tok/s |
+  | on | 5 GB, 5 GB | 6.9, 6.1 tok/s |
+
+  It is not a trade: holding the second copy is what was costing the speed.
+  Opening no longer asks for `WillNeed` over the whole file when the pages
+  are headed for a device that will drop them — reading 104 GB ahead only to
+  evict it behind the uploader had the kernel fetching the same bytes twice.
+  A CPU run, a UMA device and every non-Linux target keep the readahead.
 
 ### Known limitations
 - **The cold split is associated with a heap corruption that aborts the
