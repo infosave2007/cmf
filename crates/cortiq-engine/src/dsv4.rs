@@ -890,6 +890,18 @@ pub struct Dsv4State {
     /// fresh id, so a device buffer left over from the previous conversation
     /// can never be read as if it belonged to this one.
     pub kv_id: u64,
+    /// When the token graph owns a layer's caches, the CONTENTS live on the
+    /// card and only these counts stay here — how much of the window is
+    /// filled, and how many compressed entries each cache holds. All three
+    /// follow from the position, so keeping them costs nothing and reading
+    /// them back would cost a round trip.
+    pub dev_filled: Vec<usize>,
+    pub dev_n_comp: Vec<usize>,
+    pub dev_n_ix: Vec<usize>,
+    /// True once this sequence has run a layer on the card with the device
+    /// owning its state. The host copies above are stale from then on, so
+    /// the CPU path must not be used for that layer again.
+    pub dev_owned: bool,
 }
 
 impl Dsv4State {
@@ -898,6 +910,10 @@ impl Dsv4State {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self {
             kv_id: NEXT.fetch_add(1, Ordering::Relaxed),
+            dev_filled: vec![0; layers],
+            dev_n_comp: vec![0; layers],
+            dev_n_ix: vec![0; layers],
+            dev_owned: false,
             window: vec![Vec::new(); layers],
             compressed: vec![Vec::new(); layers],
             index_kv: vec![Vec::new(); layers],

@@ -16680,10 +16680,16 @@ fn dsv4_layer_frame_enc(
 /// it. Layer zero has no previous frame — the same hole that once put
 /// garbage into `post`/`comb` and cost a perplexity of 1470. Seed it, or the
 /// chain starts on whatever the last token left behind.
-pub fn dsv4_chain_seed(x: &[f32]) -> bool {
+pub fn dsv4_chain_seed(x: &[f32], qn: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };
     let b = frame_buf(c, 45, x.len() * 4, true);
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(x));
+    // The LoRA vector too: every frame leaves the NEXT layer's there, and
+    // layer zero has no frame before it. Passing it as `qn` instead would
+    // stop that frame computing the one after — the tail is guarded on
+    // `qn.is_none()`.
+    let q = frame_buf(c, 4, qn.len() * 4, true);
+    c.queue.write_buffer(&q, 0, bytemuck::cast_slice(qn));
     true
 }
 
