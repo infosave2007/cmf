@@ -837,6 +837,9 @@ impl QTensor {
     /// bit-exact path; Mapped runs the fused int8 kernel.
     pub fn matvec(&self, x: &[f32], out: &mut [f32], pool: Option<&Pool>) {
         match self {
+            // NOTE: `out.len()` DRIVES this arm — it computes that many rows,
+            // and `x.len()` is the stride. A short `out` is legitimate here,
+            // which is why the check below lives in the Mapped arm only.
             Self::F32 { data, .. } => matvec_rows(pool, data, x, out),
             Self::Mapped {
                 model,
@@ -850,6 +853,21 @@ impl QTensor {
                 repack,
             } => {
                 let _ = (model, idx);
+                // Every kernel below writes `rows` entries through a raw
+                // pointer, so a short `out` is an out-of-bounds WRITE, not a
+                // wrong answer: it scribbles on the allocator's metadata and
+                // the process aborts much later, somewhere innocent
+                // (`double free or corruption`, `corrupted double-linked
+                // list`). The debug_assert two of the kernels carried is
+                // compiled out of the release — exactly the build where it
+                // matters. Fail here instead, while the caller is still on
+                // the stack to be named.
+                assert!(
+                    out.len() >= *rows && x.len() >= *cols,
+                    "matvec {rows}x{cols}: out {} (need {rows}), x {} (need {cols})",
+                    out.len(),
+                    x.len(),
+                );
                 if *dtype == TensorDtype::Q4Block {
                     // GPU route (wgpu q4b kernel) for large q4_block matvecs —
                     // gives NVIDIA/AMD/Intel q4 models a GPU path. Probe keeps
