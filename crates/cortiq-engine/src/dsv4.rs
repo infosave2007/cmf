@@ -1150,6 +1150,16 @@ pub(crate) mod prof {
                     e / calls as f64,
                     wt / calls as f64,
                 );
+                let gn = crate::gpu_wgpu::MOE_GPU_N.load(Ordering::Relaxed);
+                if gn > 0 {
+                    eprintln!(
+                        "[dsv4-профиль]   MoE НА КАРТЕ: {:.3} мс на вызов ({} замеров) — \
+                         сравните с ожиданием кадра",
+                        crate::gpu_wgpu::MOE_GPU_NS[0].load(Ordering::Relaxed) as f64
+                            / 1e6 / gn as f64,
+                        gn,
+                    );
+                }
                 eprintln!(
                     "[dsv4-профиль]   из кодирования: буферы экспертов {:.2} мс, \
                      загрузки {:.2} мс, проходы {:.2} мс",

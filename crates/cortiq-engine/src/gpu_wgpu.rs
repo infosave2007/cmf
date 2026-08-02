@@ -17025,9 +17025,19 @@ pub fn moe_route_for_test(
                 bind_buf(9, &coldb),
             ],
         });
+        // The card's own clock around the whole MoE block. All three kernels
+        // share one pass — splitting it to time them apart would add two
+        // pass boundaries a layer and measure the split instead — so this is
+        // the block's total, which is the number that says whether the card
+        // is busy or waiting.
+        let tsw = c.ts_query.as_ref().map(|(qs, _, _)| wgpu::ComputePassTimestampWrites {
+            query_set: qs,
+            beginning_of_pass_write_index: Some(0),
+            end_of_pass_write_index: Some(1),
+        });
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
-            timestamp_writes: None,
+            timestamp_writes: tsw,
         });
         pass.set_pipeline(&c.moe_route);
         pass.set_bind_group(0, &bind, &[]);
@@ -18675,6 +18685,10 @@ pub fn dsv4_moe_frame(
         pass.set_bind_group(0, &bg_dn, &[]);
         pass.dispatch_workgroups(g.hidden as u32, 1, 1);
     }
+    if let Some((qs, resolve, tstage)) = &c.ts_query {
+        enc.resolve_query_set(qs, 0..2, resolve, 0);
+        enc.copy_buffer_to_buffer(resolve, 0, tstage, 0, 16);
+    }
     let t_enc = std::time::Instant::now();
     MOE_PASS_NS.fetch_add(
         t_pass.elapsed().as_nanos() as u64,
@@ -18732,6 +18746,25 @@ pub fn dsv4_moe_frame(
         ok = true;
     }
     stage2.unmap();
+    // The card's clock, read after the frame's own wait — free, because the
+    // fence has already been paid for.
+    if let Some((_, _, tstage)) = &c.ts_query {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tstage.map_async(wgpu::MapMode::Read, ..16, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        if rx.recv().map(|r| r.is_ok()).unwrap_or(false) {
+            if let Ok(raw) = tstage.get_mapped_range(..16) {
+                let t: &[u64] = bytemuck::cast_slice(&raw);
+                let ns = (t[1].saturating_sub(t[0]) as f64 * c.ts_period as f64) as u64;
+                drop(raw);
+                MOE_GPU_NS[0].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+                MOE_GPU_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        tstage.unmap();
+    }
     drop(sc);
     // Encoding and waiting are different problems with different fixes, and
     // the layer total cannot tell them apart. Costs one Instant per layer.
@@ -18753,6 +18786,17 @@ pub static MOE_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// The encode half again, split three ways — "encoding" turned out to be the
 /// whole token's cost and "which part of it" is not guessable: the expert
 /// buffer lookup, the per-call uploads, and the passes themselves.
+/// GPU time inside the MoE frame, per kernel: routing, gate/up, down.
+/// The host counters above measure the CPU's share of a frame; these are the
+/// only thing that says what the CARD spends, and dsv4 had no equivalent —
+/// `CMF_GPU_TS` instruments the general token graph, which this arch does
+/// not use, so the profiler simply printed nothing.
+pub static MOE_GPU_NS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+pub static MOE_GPU_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MOE_BUFS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MOE_UP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MOE_PASS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
