@@ -266,6 +266,24 @@ fn q4_block_dequant_accuracy() {
 // ───────────────────────── file roundtrip ─────────────────────────
 
 #[test]
+fn evict_ranges_is_advisory_only() {
+    let dir = tempdir();
+    let path = dir.join("tiny.cmf");
+    let (tensors, _, _) = write_tiny_file(&path);
+    let model = CmfModel::open(&path).unwrap();
+    let spec = &tensors[0];
+    let e = model.tensor(&spec.name).unwrap();
+    let abs = model.entry_abs_offset(e).unwrap();
+    let nb = e.nbytes as usize;
+    let before = model.tensor_bytes(&spec.name).unwrap().to_vec();
+    // The real range, a zero-length one and one past the file: none may
+    // panic, and the mapping must read back byte-identical afterwards —
+    // DONTNEED drops clean pages only, the next touch re-faults them.
+    model.evict_ranges(&[(abs, nb), (abs, 0), (usize::MAX / 2, 4096)]);
+    assert_eq!(model.tensor_bytes(&spec.name).unwrap(), &before[..]);
+}
+
+#[test]
 fn full_file_roundtrip() {
     let dir = tempdir();
     let path = dir.join("tiny.cmf");

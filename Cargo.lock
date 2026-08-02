@@ -467,6 +467,7 @@ dependencies = [
  "base64",
  "bincode",
  "bytemuck",
+ "libc",
  "memmap2",
  "serde",
  "serde_json",

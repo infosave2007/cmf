@@ -21,5 +21,10 @@ bytemuck = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+# posix_fadvise for `CmfModel::evict_ranges` — releasing the page cache
+# behind expert uploads; madvise alone only trims the mapping's RSS.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 base64 = { workspace = true }

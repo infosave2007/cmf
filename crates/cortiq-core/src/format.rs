@@ -764,6 +764,54 @@ impl CmfModel {
         &bytes[start..start + entry.nbytes as usize]
     }
 
+    /// The CPU is done with these byte ranges of the primary mapping
+    /// (absolute offsets, as `entry_abs_offset` hands them out): drop them
+    /// from the resident set and let the page cache release the file pages.
+    /// Both calls are advisory and the mapping stays valid — a range that
+    /// gets touched again re-faults from disk, so a caller can only cost
+    /// time here, never correctness. Ranges are aligned OUTWARD to page
+    /// boundaries; the neighbours those edges claw in re-fault the same way.
+    /// Linux + mmap backing only; everywhere else a no-op.
+    pub fn evict_ranges(&self, ranges: &[(usize, usize)]) {
+        #[cfg(target_os = "linux")]
+        {
+            let Backing::Mmap(m) = &self.backing else {
+                return;
+            };
+            let page = 4096usize;
+            // One fd for the whole batch: fadvise targets the inode's page
+            // cache, any fd on the same file will do.
+            use std::os::unix::io::AsRawFd;
+            let file = File::open(&self.path).ok();
+            for &(off, len) in ranges {
+                if len == 0 || off.saturating_add(len) > m.len() {
+                    continue;
+                }
+                let start = off & !(page - 1);
+                let end = off + len;
+                let alen = end.next_multiple_of(page).min(m.len()) - start;
+                // SAFETY: read-only MAP_SHARED file mapping — DONTNEED here
+                // only drops clean pages; the next access re-faults them.
+                let _ = unsafe {
+                    m.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, start, alen)
+                };
+                if let Some(f) = &file {
+                    // SAFETY: plain fd + numeric range; advisory by contract.
+                    unsafe {
+                        libc::posix_fadvise(
+                            f.as_raw_fd(),
+                            start as libc::off_t,
+                            alen as libc::off_t,
+                            libc::POSIX_FADV_DONTNEED,
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = ranges;
+    }
+
     /// Tensors belonging to layer `i` (prefix `model.layers.{i}.`).
     pub fn layer_tensors(&self, layer_idx: usize) -> Vec<&TensorEntry> {
         let prefix = format!("model.layers.{layer_idx}.");
