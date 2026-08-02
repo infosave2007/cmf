@@ -6789,13 +6789,16 @@ fn moe_expert_bufs(
     // a 112 GB model that second copy IS the machine's RAM (measured: 172 of
     // 176 GB cached).
     //
-    // OFF BY DEFAULT, and the reason is measured too: `open()` asks for
-    // `WillNeed` over the whole file, and dropping pages here fights that
-    // readahead head-on — the upload of a 94 GB expert set went from ~1
-    // minute to 12, and decode from 4.5 tok/s to 0.2. The two advices have to
-    // be reconciled (skip WillNeed for what we intend to evict) before this
-    // can be the default. `CMF_UPLOAD_EVICT=1` turns it on; discrete only, as
-    // on UMA the mapping IS the working copy.
+    // Measured: resident set 6 GB with this on, 92 GB with it off.
+    //
+    // OFF BY DEFAULT because the COST is not established yet. It contradicts
+    // the mapping's `WillNeed` (now suppressed when this is set — see
+    // CmfModel::open), and the decode numbers taken next to it are unusable:
+    // both arms ran against a cold page cache, ~10x under the same machine's
+    // own figure at the same length, so they measured the machine and not the
+    // flag. Re-measure from a clean process before flipping this.
+    // `CMF_UPLOAD_EVICT=1` turns it on; discrete only, as on UMA the mapping
+    // IS the working copy.
     if c.discrete && std::env::var("CMF_UPLOAD_EVICT").is_ok_and(|v| v != "0") {
         model.evict_ranges(&uploaded.borrow());
     }

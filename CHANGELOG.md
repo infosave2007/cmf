@@ -24,11 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the card (`madvise(DONTNEED)` + `posix_fadvise`, discrete GPUs on Linux).
   Uploading reads ~94 GB through the mapping and the page cache keeps every
   byte — a second copy of weights that now live in VRAM, and on a 112 GB
-  model that copy is the machine's RAM (172 of 176 GB cached). Resident set
-  drops to 6 GB with it on. **Off by default**: `open()` asks the kernel for
-  `WillNeed` over the whole file, and dropping pages here fights that
-  readahead — the upload went from ~1 minute to 12 and decode from 4.5 tok/s
-  to 0.2. Reconciling the two advices is the work left.
+  model that copy is the machine's RAM (172 of 176 GB cached). Measured on
+  the release checkpoint: **resident set 6 GB with it on against 92 GB
+  with it off.**
+
+  **Off by default, because its cost is not yet established.** It also
+  contradicted the mapping's own `WillNeed` — asking the kernel to read a
+  104 GB file ahead while dropping the pages behind the uploader has it
+  fetching the same bytes twice — so `CMF_UPLOAD_EVICT=1` now suppresses
+  that advice. The decode numbers taken alongside (0.2 tok/s on, 0.4 off)
+  are not usable: both arms ran against a cold page cache and are ~10x
+  below the same machine's 4.5 tok/s at the same length, so they measure
+  the machine's state, not the flag. Re-measure from a clean process before
+  making this the default.
 
 ### Known limitations
 - **The cold split is associated with a heap corruption that aborts the
