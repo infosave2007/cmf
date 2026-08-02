@@ -38,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evict it behind the uploader had the kernel fetching the same bytes twice.
   A CPU run, a UMA device and every non-Linux target keep the readahead.
 
+### Changed
+- **The kernels borrow their scale row** instead of allocating one per
+  worker per dispatch: 22474 allocations a token become 15021. Decode is
+  unchanged, which is the point worth recording — five separate reductions
+  of overhead (dispatch count twice, the harness loop, submissions, and now
+  allocations) have all left the token where it was, so the cost is in the
+  kernels, not around them.
+
 ### Added
 - **`CMF_DSV4_CHAIN=1`** puts a run of consecutive device-capable layers in
   ONE submission: 59 pool dispatches a token against 285. The compressor,
