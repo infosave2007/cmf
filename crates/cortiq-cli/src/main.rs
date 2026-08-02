@@ -3374,6 +3374,11 @@ async fn cmd_bench(
         "  Steady:  {:.1} allocs/token | {:.1} pool dispatches/token",
         allocs_per_token, dispatches_per_token
     );
+    // `bench` is where the dsv4 breakdown is actually wanted — `run` had it
+    // and this did not, so every timing question needed a second command
+    // measuring a different workload.
+    #[cfg(feature = "gpu")]
+    cortiq_engine::dsv4::profile_report();
     if pair_ms > 0.0 {
         println!(
             "  Pair:    2 singles {:.2} ms vs fused {:.2} ms (×{:.2} cheaper second lane)",
