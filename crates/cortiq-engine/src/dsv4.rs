@@ -902,6 +902,10 @@ pub struct Dsv4State {
     /// owning its state. The host copies above are stale from then on, so
     /// the CPU path must not be used for that layer again.
     pub dev_owned: bool,
+    /// The device-layer set of the FIRST chained token. If it ever differs,
+    /// some layer's caches are on the wrong side and the answer would be
+    /// quietly wrong — the loop refuses instead.
+    pub dev_set: Vec<bool>,
 }
 
 impl Dsv4State {
@@ -914,6 +918,7 @@ impl Dsv4State {
             dev_n_comp: vec![0; layers],
             dev_n_ix: vec![0; layers],
             dev_owned: false,
+            dev_set: Vec::new(),
             window: vec![Vec::new(); layers],
             compressed: vec![Vec::new(); layers],
             index_kv: vec![Vec::new(); layers],
@@ -1718,8 +1723,23 @@ fn dsv4_layer_loop(
     {
         return false;
     }
+    // The device-owned set must not move once a token has run on it.
+    if st.dev_owned && st.dev_set != on_dev {
+        tracing::warn!("состав слоёв на карте изменился — кеши на разных сторонах");
+        return false;
+    }
+    let chain = chain_enabled();
+    let mut run: Vec<usize> = Vec::new();
     let mut sink_out = vec![0.0f32; dim];
     for (li, l) in layers.iter().enumerate() {
+        if chain && on_dev[li] {
+            run.push(li);
+            continue;
+        }
+        if chain && !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &folded, pool) {
+            return false;
+        }
+        run.clear();
         if !on_dev[li] {
             if !crate::gpu_wgpu::dsv4_state_read(state) {
                 return false;
@@ -1911,7 +1931,260 @@ fn dsv4_layer_loop(
         }
         folded = next;
     }
+    if chain {
+        if !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &folded, pool) {
+            return false;
+        }
+        if st.dev_set.is_empty() {
+            st.dev_set = on_dev.clone();
+        }
+    }
     crate::gpu_wgpu::dsv4_state_read(state)
+}
+
+/// `CMF_DSV4_CHAIN=1`: put a run of consecutive device-capable layers in ONE
+/// submission. Off by default until it has been measured on a real card.
+#[cfg(feature = "gpu")]
+fn chain_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_CHAIN").is_ok_and(|v| v != "0"))
+}
+
+/// Encode a maximal run of consecutive device-capable layers and submit it
+/// ONCE. Every layer in the run builds its own attention inputs on the card,
+/// so nothing comes back between them — that is the whole saving.
+///
+/// The run's state belongs to the device from here on: `st.window`,
+/// `st.compressed` and the compressor streams for these layers are stale on
+/// the host afterwards, and only the counts in `st.dev_*` are kept. A layer
+/// that has ever been in a run must therefore never be handed to the CPU
+/// path again, which `dev_owned` records.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn dsv4_chain_run(
+    layers: &[Dsv4Layer],
+    run: &[usize],
+    cfg: &Dsv4Cfg,
+    g: &Dsv4Globals,
+    st: &mut Dsv4State,
+    token_id: u32,
+    folded: &[f32],
+    pool: Option<&crate::pool::Pool>,
+) -> bool {
+    if run.is_empty() {
+        return true;
+    }
+    let (dim, hd) = (cfg.dim, cfg.head_dim);
+    let first = run[0];
+    let Some(model) = layers[first].experts.first().and_then(|e| e.w1.model_arc()) else {
+        return false;
+    };
+    // The run's first layer has no frame before it to have left its LoRA
+    // vector, so the host projects that one — once a run, not once a layer.
+    let mut qn0 = vec![0.0f32; cfg.q_lora_rank];
+    layers[first].wq_a.matvec(folded, &mut qn0, pool);
+    rms_weighted(&mut qn0, &layers[first].q_norm, cfg.norm_eps);
+    if !crate::gpu_wgpu::dsv4_chain_seed(folded, &qn0) {
+        return false;
+    }
+
+    // Held apart from the borrowing structs below, which point into them.
+    let mut packs = Vec::with_capacity(run.len());
+    let mut biases: Vec<Option<Vec<f32>>> = Vec::with_capacity(run.len());
+    let mut forceds: Vec<Option<Vec<usize>>> = Vec::with_capacity(run.len());
+    for &li in run {
+        let Some(pk) = pack_for(&layers[li], cfg, li) else {
+            return false;
+        };
+        let forced: Option<Vec<usize>> = layers[li].tid2eid.as_ref().and_then(|tbl| {
+            let v: Vec<usize> = hash_route(tbl, cfg.vocab, cfg.top_k, token_id)
+                .into_iter()
+                .map(|gi| pk.to_slot[gi])
+                .collect();
+            if v.iter().any(|&x| x == usize::MAX) { None } else { Some(v) }
+        });
+        if layers[li].tid2eid.is_some() && forced.is_none() {
+            return false;
+        }
+        biases.push(
+            layers[li]
+                .gate_bias
+                .as_deref()
+                .map(|b| pk.globals.iter().map(|&gi| b[gi]).collect()),
+        );
+        forceds.push(forced);
+        packs.push(pk);
+    }
+
+    let mut items = Vec::with_capacity(run.len());
+    let mut freqs = Vec::with_capacity(run.len());
+    for (i, &li) in run.iter().enumerate() {
+        let l = &layers[li];
+        let (Some(wq_a), Some(wq_b), Some(wo_a), Some(wo_b), Some(wkv)) = (
+            l.wq_a.model_idx(),
+            l.wq_b.model_idx(),
+            l.wo_a.model_idx(),
+            l.wo_b.model_idx(),
+            l.wkv.model_idx(),
+        ) else {
+            return false;
+        };
+        let comp = match &l.compressor {
+            None => None,
+            Some(cp) => {
+                let (Some(a), Some(b)) = (cp.wkv.model_idx(), cp.wgate.model_idx()) else {
+                    return false;
+                };
+                Some((
+                    crate::gpu_wgpu::Dsv4CompW { wkv: a, wgate: b, norm: &cp.norm, ape: &cp.ape },
+                    crate::gpu_wgpu::Dsv4CompGeom {
+                        width: cp.wkv.rows(),
+                        hidden: dim,
+                        ratio: cp.ratio,
+                        overlap: cp.overlap,
+                        rope_dim: cfg.rope_head_dim,
+                        eps: cfg.norm_eps,
+                    },
+                ))
+            }
+        };
+        let ix = match &l.indexer {
+            None => None,
+            Some(ixr) => {
+                let cp = &ixr.compressor;
+                let (Some(a), Some(b), Some(qb), Some(wp)) = (
+                    cp.wkv.model_idx(),
+                    cp.wgate.model_idx(),
+                    ixr.wq_b.model_idx(),
+                    ixr.weights_proj.model_idx(),
+                ) else {
+                    return false;
+                };
+                let ih = ixr.weights_proj.rows();
+                Some((
+                    crate::gpu_wgpu::Dsv4CompW { wkv: a, wgate: b, norm: &cp.norm, ape: &cp.ape },
+                    crate::gpu_wgpu::Dsv4CompGeom {
+                        width: cp.wkv.rows(),
+                        hidden: dim,
+                        ratio: cp.ratio,
+                        overlap: cp.overlap,
+                        rope_dim: cfg.rope_head_dim,
+                        eps: cfg.norm_eps,
+                    },
+                    crate::gpu_wgpu::Dsv4IxW { wq_b: qb, weights_proj: wp },
+                    crate::gpu_wgpu::Dsv4IxGeom {
+                        ih,
+                        idim: ixr.wq_b.rows() / ih.max(1),
+                        q_lora: cfg.q_lora_rank,
+                        hidden: dim,
+                        rope_dim: cfg.rope_head_dim,
+                        eps: cfg.norm_eps,
+                        top_k: cfg.index_topk,
+                        window: cfg.window,
+                    },
+                ))
+            }
+        };
+        let ew_c = comp.as_ref().map_or(0, |(_, cg)| {
+            if cg.overlap { cg.width / 2 } else { cg.width }
+        });
+        let ew_i = ix.as_ref().map_or(0, |(_, cg, _, _)| {
+            if cg.overlap { cg.width / 2 } else { cg.width }
+        });
+        let prep = crate::gpu_wgpu::Dsv4Prep {
+            wkv,
+            kv_norm: &l.kv_norm,
+            comp,
+            ix,
+            filled: st.dev_filled[li],
+            window: cfg.window,
+            n_comp: st.dev_n_comp[li],
+            n_ix: st.dev_n_ix[li],
+            comp_dst_off: cfg.window * hd + st.dev_n_comp[li] * ew_c,
+            ix_dst_off: st.dev_n_ix[li] * ew_i,
+        };
+        let nxt = layers.get(li + 1);
+        let w = crate::gpu_wgpu::Dsv4LayerW {
+            attn: crate::gpu_wgpu::Dsv4AttnW {
+                wq_a, wq_b, wo_a, wo_b,
+                q_norm: &l.q_norm,
+                sink: &l.attn_sink,
+            },
+            moe: crate::gpu_wgpu::Dsv4MoeW {
+                experts: &packs[i].tensors,
+                logits: &[],
+                bias: biases[i].as_deref(),
+                forced: forceds[i].as_deref(),
+                remap: None,
+            },
+            hc_ffn_fn: &l.hc_ffn_fn,
+            hc_ffn_scale: &l.hc_ffn_scale,
+            hc_ffn_base: &l.hc_ffn_base,
+            hc_next_fn: nxt.map(|n| n.hc_attn_fn.as_slice()),
+            hc_next_scale: nxt.map_or(&l.hc_attn_scale, |n| &n.hc_attn_scale),
+            hc_next_base: nxt.map_or(&l.hc_attn_base, |n| n.hc_attn_base.as_slice()),
+            ffn_norm: &l.ffn_norm,
+            next_norm: nxt.map_or(&l.attn_norm, |n| n.attn_norm.as_slice()),
+            next_q_norm: nxt.map_or(&l.q_norm, |n| n.q_norm.as_slice()),
+            next_wq_a: nxt.and_then(|n| n.wq_a.model_idx()),
+            router: &packs[i].router,
+        };
+        let geom = crate::gpu_wgpu::Dsv4LayerGeom {
+            attn: crate::gpu_wgpu::Dsv4AttnGeom {
+                dim,
+                nh: cfg.n_heads,
+                hd,
+                rd: cfg.rope_head_dim,
+                q_lora: cfg.q_lora_rank,
+                o_lora: cfg.o_lora_rank,
+                o_groups: cfg.o_groups,
+                eps: cfg.norm_eps,
+                scale: (hd as f32).powf(-0.5),
+            },
+            moe: crate::gpu_wgpu::Dsv4MoeGeom {
+                hidden: dim,
+                inter: cfg.moe_inter,
+                top_k: cfg.top_k,
+                route_scale: cfg.route_scale,
+                swiglu_limit: cfg.swiglu_limit,
+                gu_q2: l.experts.first().is_some_and(|e| {
+                    e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
+                }),
+            },
+            hc: cfg.hc_mult,
+            hc_eps: cfg.hc_eps,
+            sinkhorn_iters: cfg.hc_sinkhorn_iters,
+        };
+        freqs.push(if l.compressor.is_some() {
+            g.inv_freq_compress.as_slice()
+        } else {
+            g.inv_freq_window.as_slice()
+        });
+        items.push((w, geom, prep));
+    }
+
+    let mut out = vec![0.0f32; dim];
+    if !crate::gpu_wgpu::dsv4_layer_chain(
+        &model, &items, st.kv_id, first, &freqs, st.pos, &mut out,
+    ) {
+        return false;
+    }
+    // The device advanced these; the host keeps only the arithmetic.
+    for (i, &li) in run.iter().enumerate() {
+        st.dev_filled[li] = (st.dev_filled[li] + 1).min(cfg.window);
+        if let Some((_, cg, ..)) = items[i].2.ix.as_ref() {
+            if (st.pos + 1) % cg.ratio == 0 {
+                st.dev_n_ix[li] += 1;
+            }
+        }
+        if let Some((_, cg)) = items[i].2.comp.as_ref() {
+            if (st.pos + 1) % cg.ratio == 0 {
+                st.dev_n_comp[li] += 1;
+            }
+        }
+    }
+    st.dev_owned = true;
+    true
 }
 
 /// The host half of one hyper-connection block: mixes, Sinkhorn, fold, norm.
