@@ -13587,6 +13587,43 @@ fn encode_q8_mm(
 }
 
 /// Encode a plain f32 matvec (small unquantized projections) into `enc`.
+/// The keyed twin of `encode_f32matvec`: every buffer at the call site is
+/// stable for the layer's lifetime, so the group is built once per
+/// (tag, sequence, layer) and reused — fresh groups here were a measurable
+/// share of the chain's host encoding.
+#[allow(clippy::too_many_arguments)]
+fn encode_f32matvec_k(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    bkey: (u8, u64, usize),
+) {
+    let bind = cached_bind(c, bkey, || {
+        let p_buf = uniform_u32x4(c, [cols as u32, rows as u32, 0, 0]);
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.layout_f32,
+            entries: &[
+                bind_buf(0, weight),
+                bind_buf(1, xs),
+                bind_buf(2, y),
+                bind_buf(3, &p_buf),
+            ],
+        })
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.f32_matvec);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+}
+
 fn encode_f32matvec(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
@@ -16033,6 +16070,42 @@ pub fn top_k_for_test(scores: &[f32], k: usize, out: &mut Vec<u32>) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn encode_hc_fold_k(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    state: &wgpu::Buffer,
+    mixes: &wgpu::Buffer,
+    sc: &wgpu::Buffer,
+    base: &wgpu::Buffer,
+    fold: &wgpu::Buffer,
+    post: &wgpu::Buffer,
+    comb: &wgpu::Buffer,
+    p: &wgpu::Buffer,
+    bkey: (u8, u64, usize),
+) {
+    let bind = cached_bind(c, bkey, || c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.hc_pre_fold.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, state),
+            bind_buf(1, mixes),
+            bind_buf(2, sc),
+            bind_buf(3, base),
+            bind_buf(4, fold),
+            bind_buf(5, post),
+            bind_buf(6, comb),
+            bind_buf(7, p),
+        ],
+    }));
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.hc_pre_fold);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(1, 1, 1);
+}
+
 fn encode_hc_fold(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
@@ -16069,6 +16142,40 @@ fn encode_hc_fold(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn encode_hc_expand_k(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    x: &wgpu::Buffer,
+    res: &wgpu::Buffer,
+    post: &wgpu::Buffer,
+    comb: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    p: &wgpu::Buffer,
+    hc: usize,
+    dim: usize,
+    bkey: (u8, u64, usize),
+) {
+    let bind = cached_bind(c, bkey, || c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.hc_post_expand.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, x),
+            bind_buf(1, res),
+            bind_buf(2, post),
+            bind_buf(3, comb),
+            bind_buf(4, out),
+            bind_buf(5, p),
+        ],
+    }));
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.hc_post_expand);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(((hc * dim) as u32).div_ceil(256), 1, 1);
+}
+
 fn encode_hc_expand(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
@@ -16182,6 +16289,7 @@ fn encode_moe_chain(
     g: Dsv4MoeGeom,
     n_pack: usize,
     slots: usize,
+    bkey: (u64, usize),
 ) {
     // The bias now lives in the PACK, whose address is stable for the life
     // of the process — so the const cache is sound for it, and each layer
@@ -16249,7 +16357,7 @@ fn encode_moe_chain(
             &c.layout_moe_dn_b,
         )
     };
-    let bind_r = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let bind_r = cached_bind(c, (127, bkey.0, bkey.1), || c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &c.moe_route.get_bind_group_layout(0),
         entries: &[
@@ -16264,8 +16372,8 @@ fn encode_moe_chain(
             bind_buf(8, &frame_buf(c, 26, n_pack.max(1) * 4, true)),
             bind_buf(9, &frame_buf(c, 27, 2 * g.top_k * 4, false)),
         ],
-    });
-    let bg_gu = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+    }));
+    let bg_gu = cached_bind(c, (128, bkey.0, bkey.1), || c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: l_gu,
         entries: &[
@@ -16276,8 +16384,8 @@ fn encode_moe_chain(
             bind_buf(4, mact),
             bind_buf(5, &gu_u),
         ],
-    });
-    let bg_dn = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+    }));
+    let bg_dn = cached_bind(c, (129, bkey.0, bkey.1), || c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: l_dn,
         entries: &[
@@ -16288,7 +16396,7 @@ fn encode_moe_chain(
             bind_buf(4, out),
             bind_buf(5, &dn_u),
         ],
-    });
+    }));
     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: None,
         timestamp_writes: None,
@@ -16450,6 +16558,11 @@ fn dsv4_index_cache(kv_id: u64, li: usize, floats: usize) -> Option<wgpu::Buffer
     let mut m = c.dsv4_ixkv.lock().unwrap();
     if m.get(&(kv_id, li)).is_some_and(|(_, have)| *have < cap) {
         m.remove(&(kv_id, li));
+        // The same epoch the KV cache bumps: a cached bind group outlives
+        // the buffer it points at otherwise. Nothing cached indexer binds
+        // when this was written, which is exactly when the bump is cheap to
+        // add and expensive to forget.
+        GREW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let (b, _) = m.entry((kv_id, li)).or_insert_with(|| {
         (
@@ -16612,7 +16725,7 @@ fn dsv4_layer_frame_enc(
     let next_qn = const_buf(c, bytemuck::cast_slice(&w.next_q_norm[..a.q_lora]));
 
     // ── per-call uploads ──
-    let posb = frame_up(c, 1, bytemuck::cast_slice(&[pos as f32, a.eps]));
+    let posb = frame_up_pos(c, 1, pos, a.eps);
     let ixb = {
         let want = prep.map_or(idxs.len(), |p| p.idx_cap.max(idxs.len()));
         let cap = want.next_power_of_two().max(64);
@@ -16685,24 +16798,28 @@ fn dsv4_layer_frame_enc(
                       &sink, &freq, &posb, a, kv_id, li, m_attend);
 
     // ── glue: expand, then the FFN half's fold and norm ──
-    encode_hc_expand(c, enc, &ao, &state, &hpost, &hcomb, &state2, &hcp, hc, dim);
-    encode_f32matvec(c, enc, &ffn_fn, &state2, &mixes, mix_hc, hc * dim);
-    encode_hc_fold(c, enc, &state2, &mixes, &ffn_sc, &ffn_bs, &folded, &hpost, &hcomb, &hcp);
+    encode_hc_expand_k(c, enc, &ao, &state, &hpost, &hcomb, &state2, &hcp, hc, dim,
+        (120, kv_id, li));
+    encode_f32matvec_k(c, enc, &ffn_fn, &state2, &mixes, mix_hc, hc * dim, (121, kv_id, li));
+    encode_hc_fold_k(c, enc, &state2, &mixes, &ffn_sc, &ffn_bs, &folded, &hpost, &hcomb, &hcp,
+        (122, kv_id, li));
     encode_rmsnorm(c, enc, &folded, &ffn_nw, &x2, dim, a.eps, (50, kv_id, li));
 
     // ── MoE half ──
-    encode_f32matvec(c, enc, &router, &x2, &logit_b, n_pack, m.hidden);
+    encode_f32matvec_k(c, enc, &router, &x2, &logit_b, n_pack, m.hidden, (123, kv_id, li));
     encode_moe_chain(c, enc, &logit_b, &x2, &msel, &mwt, &mcnt, &mact, &mo,
-                     &gate_all, &up_all, &down_all, w, m, n_pack, slots);
+                     &gate_all, &up_all, &down_all, w, m, n_pack, slots, (kv_id, li));
 
     // ── expand, then prepare the NEXT layer ──
-    encode_hc_expand(c, enc, &mo, &state2, &hpost, &hcomb, &state, &hcp, hc, dim);
+    encode_hc_expand_k(c, enc, &mo, &state2, &hpost, &hcomb, &state, &hcp, hc, dim,
+        (124, kv_id, li));
     if let Some(nf) = w.hc_next_fn {
         let nfn = const_buf(c, bytemuck::cast_slice(nf));
         let nsc = const_buf(c, bytemuck::cast_slice(w.hc_next_scale));
         let nbs = const_buf(c, bytemuck::cast_slice(&w.hc_next_base[..mix_hc]));
-        encode_f32matvec(c, enc, &nfn, &state, &mixes, mix_hc, hc * dim);
-        encode_hc_fold(c, enc, &state, &mixes, &nsc, &nbs, &folded, &hpost, &hcomb, &hcp);
+        encode_f32matvec_k(c, enc, &nfn, &state, &mixes, mix_hc, hc * dim, (125, kv_id, li));
+        encode_hc_fold_k(c, enc, &state, &mixes, &nsc, &nbs, &folded, &hpost, &hcomb, &hcp,
+            (126, kv_id, li));
         encode_rmsnorm(c, enc, &folded, &next_nw, &x2, dim, a.eps, (51, kv_id, li));
         // The next layer's LoRA vector, but only when the host is not going
         // to hand it over anyway — the indexer needs `qr` there, so today it
@@ -17276,6 +17393,21 @@ fn frame_buf(c: &Ctx, tag: u8, len_bytes: usize, upload: bool) -> wgpu::Buffer {
 }
 
 /// Upload into a reused buffer instead of minting one per call.
+/// The position uniform, written once per TOKEN: its contents are the same
+/// for every layer, and the per-layer `frame_up` was 43 redundant queue
+/// writes a token.
+fn frame_up_pos(c: &Ctx, tag: u8, pos: usize, eps: f32) -> wgpu::Buffer {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: [AtomicU64; 256] = [const { AtomicU64::new(u64::MAX) }; 256];
+    let stamp = ((pos as u64) << 32) | eps.to_bits() as u64;
+    let b = frame_buf(c, tag, 8, true);
+    if LAST[tag as usize].swap(stamp, Ordering::Relaxed) != stamp {
+        c.queue
+            .write_buffer(&b, 0, bytemuck::cast_slice(&[pos as f32, eps]));
+    }
+    b
+}
+
 fn frame_up(c: &Ctx, tag: u8, data: &[u8]) -> wgpu::Buffer {
     let b = frame_buf(c, tag, data.len(), true);
     c.queue.write_buffer(&b, 0, data);
@@ -17628,7 +17760,7 @@ fn comp_state_step(
     // The entry carries a window key's rope tail, at the position of the
     // window's FIRST token — not this one.
     let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..g.rope_dim / 2]));
-    let posb = frame_up(c, 79 + kind, bytemuck::cast_slice(&[(pos + 1 - g.ratio) as f32, g.eps]));
+    let posb = frame_up_pos(c, 79 + kind, pos + 1 - g.ratio, g.eps);
     encode_rope_heads(c, enc, &normed, &freq, &posb, 1, ew, g.rope_dim, false, false,
         (88 + kind, kv_id, li));
     enc.copy_buffer_to_buffer(&normed, 0, dst, (dst_off * 4) as u64, (ew * 4) as u64);
@@ -17715,7 +17847,7 @@ fn window_place(
     let nw = const_buf(c, bytemuck::cast_slice(&kv_norm[..hd]));
     encode_rmsnorm(c, enc, raw, &nw, &kv, hd, eps, (107, kv_id, li));
     let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..rope_dim / 2]));
-    let posb = frame_up(c, 108, bytemuck::cast_slice(&[pos as f32, eps]));
+    let posb = frame_up_pos(c, 108, pos, eps);
     encode_rope_heads(c, enc, &kv, &freq, &posb, 1, hd, rope_dim, false, false,
         (109, kv_id, li));
 
@@ -17869,7 +18001,7 @@ pub fn dsv4_indexer_frame(
 
     encode_q4tp_mv1(c, enc, &wb[0], qn, &qi, g.ih * g.idim, g.q_lora, (96, kv_id, li));
     let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..g.rope_dim / 2]));
-    let posb = frame_up(c, 97, bytemuck::cast_slice(&[pos as f32, g.eps]));
+    let posb = frame_up_pos(c, 97, pos, g.eps);
     encode_rope_heads(c, enc, &qi, &freq, &posb, g.ih, g.idim, g.rope_dim, false, false,
         (98, kv_id, li));
     encode_q4tp_mv1(c, enc, &wb[1], hidden, &hw_raw, g.ih, g.hidden, (99, kv_id, li));
@@ -18406,7 +18538,7 @@ pub fn dsv4_attn_frame(
     let qnw = const_buf(c, bytemuck::cast_slice(&w.q_norm[..g.q_lora]));
     let sink = const_buf(c, bytemuck::cast_slice(&w.sink[..g.nh]));
     let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..g.rd / 2]));
-    let posb = frame_up(c, 1, bytemuck::cast_slice(&[pos as f32, g.eps]));
+    let posb = frame_up_pos(c, 1, pos, g.eps);
     // The list length changes token to token; round the buffer up so it is
     // not reallocated on every step, and pass the true count in the uniform.
     let ixb = {
