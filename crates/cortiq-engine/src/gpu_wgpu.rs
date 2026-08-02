@@ -16388,7 +16388,13 @@ pub fn dsv4_encode_prep(
         if n_comp > 0 && n_ix > 0 {
             m = dsv4_indexer_frame(
                 model, ixw, *ixg, kv_id, li, hidden, qn, &ixkv, n_ix, n_comp,
-                p.filled.min(window) + 1, pos, inv_freq, idx_out, enc,
+                // The window AFTER this token's append, which is what the
+                // host reads off its own vector: clamp the incremented
+                // count, not the count. `filled.min(window) + 1` is right
+                // until the window fills and then hands attention one
+                // position more than the window holds, for the rest of the
+                // sequence.
+                (p.filled + 1).min(window), pos, inv_freq, idx_out, enc,
             );
         }
     }
