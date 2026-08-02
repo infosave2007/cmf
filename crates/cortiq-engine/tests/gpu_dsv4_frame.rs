@@ -169,7 +169,7 @@ fn the_fused_attention_block_matches_the_cpu() {
         }
         let mut got = vec![0.0f32; nh * hd + dim];
         if !gpu_wgpu::dsv4_attn_frame(
-            &model, &w, g, &hidden, None, 7, 0, &idxs, &inv_freq, pos, &mut got,
+            &model, &w, g, &hidden, None, 7, 0, &idxs, &inv_freq, pos, None, &mut got,
         ) {
             eprintln!("кадр отклонён устройством — пропуск");
             return;

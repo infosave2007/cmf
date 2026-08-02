@@ -5912,6 +5912,8 @@ struct Ctx {
     dsv4_comp: Mutex<HashMap<(u8, u64, usize), [wgpu::Buffer; 4]>>,
     /// The indexer's compressed cache per layer, grown as the sequence is.
     dsv4_ixkv: Mutex<HashMap<(u64, usize), (wgpu::Buffer, usize)>>,
+    /// Stable per-(tag, kv, layer) uniform slots for sequence-varying scalars.
+    dsv4_uni: Mutex<HashMap<(u8, u64, usize), wgpu::Buffer>>,
     /// (epoch, bind groups) for the dsv4 frames — see `cached_bind`.
     dsv4_binds: Mutex<(u64, HashMap<(u8, u64, usize), wgpu::BindGroup>)>,
     /// Access clock for the aging above — one tick per weight lookup.
@@ -6605,6 +6607,7 @@ fn init() -> Result<Ctx, String> {
         dsv4_scratch: Mutex::new(HashMap::new()),
         dsv4_comp: Mutex::new(HashMap::new()),
         dsv4_ixkv: Mutex::new(HashMap::new()),
+        dsv4_uni: Mutex::new(HashMap::new()),
         dsv4_binds: Mutex::new((0, HashMap::new())),
         res_clock: std::sync::atomic::AtomicU64::new(0),
         uniforms: Mutex::new(HashMap::new()),
@@ -16543,7 +16546,7 @@ pub fn dsv4_encode_prep(
             } else {
                 frame_up(c, 111, bytemuck::cast_slice(&pick))
             };
-            encode_idx_build(c, enc, &pb, idx_out, filled, window, k);
+            encode_idx_build(c, enc, &pb, idx_out, filled, window, k, None);
             Some(filled + k)
         }
     }
@@ -16727,10 +16730,14 @@ fn dsv4_layer_frame_enc(
     // ── per-call uploads ──
     let posb = frame_up_pos(c, 1, pos, a.eps);
     let ixb = {
-        let want = prep.map_or(idxs.len(), |p| p.idx_cap.max(idxs.len()));
-        let cap = want.next_power_of_two().max(64);
-        let b = frame_buf(c, 2, cap * 4, true);
-        c.queue.write_buffer(&b, 0, bytemuck::cast_slice(idxs));
+        // Flat 1024 — the attention list's hard ceiling (the m > 1024
+        // guard). 4 KB buys a PERMANENT identity: frame_buf keys on
+        // (tag, len), so a growing capacity would mint a new buffer while
+        // every cached group kept the old one, with no GREW bump to save it.
+        let b = frame_buf(c, 2, 1024 * 4, true);
+        if !idxs.is_empty() {
+            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(idxs));
+        }
         b
     };
     let qnb = match qn {
@@ -17567,6 +17574,9 @@ fn encode_kv_pool(
     out: &wgpu::Buffer,
     g: Dsv4CompGeom,
     have_prev: bool,
+    kind: u8,
+    kvid: u64,
+    li: usize,
 ) {
     let ew = if g.overlap { g.width / 2 } else { g.width };
     let slots = if g.overlap { 2 * g.ratio } else { g.ratio };
@@ -17574,20 +17584,24 @@ fn encode_kv_pool(
     // kernel must not add it a second time — it does so only for the flat
     // compressor, which has nowhere else to put it.
     let use_ape = !g.overlap;
+    // `have_prev` flips once early in the sequence, so the uniform is a
+    // rewritten slot rather than a content-keyed buffer.
     let flags = (g.overlap as u32) | ((have_prev as u32) << 1) | ((use_ape as u32) << 2);
-    let p = uniform_u32x4(c, [slots as u32, ew as u32, g.ratio as u32, flags]);
-    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &c.kv_pool.get_bind_group_layout(0),
-        entries: &[
-            bind_buf(0, prev_kv),
-            bind_buf(1, prev_sc),
-            bind_buf(2, cur_kv),
-            bind_buf(3, cur_sc),
-            bind_buf(4, ape),
-            bind_buf(5, out),
-            bind_buf(6, &p),
-        ],
+    let p = uni_slot(c, 130 + kind, kvid, li, [slots as u32, ew as u32, g.ratio as u32, flags]);
+    let bind = cached_bind(c, (132 + kind, kvid, li), || {
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.kv_pool.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, prev_kv),
+                bind_buf(1, prev_sc),
+                bind_buf(2, cur_kv),
+                bind_buf(3, cur_sc),
+                bind_buf(4, ape),
+                bind_buf(5, out),
+                bind_buf(6, &p),
+            ],
+        })
     });
     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: None,
@@ -17753,7 +17767,7 @@ fn comp_state_step(
     encode_kv_pool(
         c, enc, prev_kv, prev_sc, pend_kv, pend_sc,
         &const_buf(c, bytemuck::cast_slice(w.ape)),
-        &folded, g, have_prev,
+        &folded, g, have_prev, kind, kv_id, li,
     );
     let nw = const_buf(c, bytemuck::cast_slice(&w.norm[..ew]));
     encode_rmsnorm(c, enc, &folded, &nw, &normed, ew, g.eps, (86 + kind, kv_id, li));
@@ -17995,8 +18009,12 @@ pub fn dsv4_indexer_frame(
     let qi = frame_buf(c, 90, g.ih * g.idim * 4, false);
     let hw_raw = frame_buf(c, 91, g.ih * 4, false);
     let hw = frame_buf(c, 92, g.ih * 4, false);
-    let scores = frame_buf(c, 93, limit * 4, false);
-    let pick = frame_buf(c, 94, g.top_k.min(limit).max(1) * 4, false);
+    // Fixed capacities, not `limit`-sized: frame_buf keys on (tag, len), so
+    // a length that walks with the sequence would change the buffer's
+    // identity under the cached bind groups below. `limit` is capped at
+    // 4096 on entry.
+    let scores = frame_buf(c, 93, 4096 * 4, false);
+    let pick = frame_buf(c, 94, g.top_k.max(1) * 4, false);
     let cnt = frame_buf(c, 95, 4, false);
 
     encode_q4tp_mv1(c, enc, &wb[0], qn, &qi, g.ih * g.idim, g.q_lora, (96, kv_id, li));
@@ -18012,10 +18030,11 @@ pub fn dsv4_indexer_frame(
     encode_fill_zero(c, enc, &hw, g.ih, (100, kv_id, li));
     encode_axpy(c, enc, &hw_raw, &hw, sc_factor, g.ih, (101, kv_id, li));
 
-    encode_index_scores(c, enc, &qi, index_kv, &hw, &scores, g.ih, g.idim, limit);
-    encode_top_k(c, enc, &scores, &pick, &cnt, limit, g.top_k);
+    encode_index_scores(c, enc, &qi, index_kv, &hw, &scores, g.ih, g.idim, limit,
+        (kv_id, li));
+    encode_top_k(c, enc, &scores, &pick, &cnt, limit, g.top_k, (kv_id, li));
     let k_actual = g.top_k.min(limit);
-    encode_idx_build(c, enc, &pick, out_idx, win_len, g.window, k_actual);
+    encode_idx_build(c, enc, &pick, out_idx, win_len, g.window, k_actual, Some((kv_id, li)));
     Some(win_len + k_actual)
 }
 
@@ -18054,18 +18073,24 @@ fn encode_index_scores(
     nh: usize,
     hd: usize,
     n_pos: usize,
+    bkey: (u64, usize),
 ) {
-    let p = uniform_u32x4(c, [nh as u32, hd as u32, n_pos as u32, n_pos as u32]);
-    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &c.index_scores.get_bind_group_layout(0),
-        entries: &[
-            bind_buf(0, q),
-            bind_buf(1, kv),
-            bind_buf(2, hw),
-            bind_buf(3, out),
-            bind_buf(4, &p),
-        ],
+    // n_pos walks with the sequence, so the uniform lives in a per-layer
+    // slot whose contents are rewritten each call; the bind group can then
+    // survive across tokens.
+    let p = uni_slot(c, 134, bkey.0, bkey.1, [nh as u32, hd as u32, n_pos as u32, n_pos as u32]);
+    let bind = cached_bind(c, (135, bkey.0, bkey.1), || {
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.index_scores.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, q),
+                bind_buf(1, kv),
+                bind_buf(2, hw),
+                bind_buf(3, out),
+                bind_buf(4, &p),
+            ],
+        })
     });
     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: None,
@@ -18084,17 +18109,20 @@ fn encode_top_k(
     cnt: &wgpu::Buffer,
     n: usize,
     k: usize,
+    bkey: (u64, usize),
 ) {
-    let p = uniform_u32x4(c, [n as u32, k as u32, 0, 0]);
-    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &c.top_k_index.get_bind_group_layout(0),
-        entries: &[
-            bind_buf(0, scores),
-            bind_buf(1, pick),
-            bind_buf(2, cnt),
-            bind_buf(3, &p),
-        ],
+    let p = uni_slot(c, 136, bkey.0, bkey.1, [n as u32, k as u32, 0, 0]);
+    let bind = cached_bind(c, (137, bkey.0, bkey.1), || {
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.top_k_index.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, scores),
+                bind_buf(1, pick),
+                bind_buf(2, cnt),
+                bind_buf(3, &p),
+            ],
+        })
     });
     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: None,
@@ -18118,15 +18146,25 @@ fn encode_idx_build(
     win_len: usize,
     window: usize,
     k: usize,
+    // The indexer path binds stable buffers and can keep its group; the
+    // prep fallback's pick buffer changes identity with its length, so it
+    // passes None and builds a fresh group each call.
+    bkey: Option<(u64, usize)>,
 ) {
     let n = win_len + k;
-    let bind = {
-        let p = uniform_u32x4(c, [win_len as u32, window as u32, k as u32, 0]);
+    let mk = |p: &wgpu::Buffer| {
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &c.idx_build.get_bind_group_layout(0),
-            entries: &[bind_buf(0, pick), bind_buf(1, out), bind_buf(2, &p)],
+            entries: &[bind_buf(0, pick), bind_buf(1, out), bind_buf(2, p)],
         })
+    };
+    let bind = match bkey {
+        Some((kvid, li)) => {
+            let p = uni_slot(c, 138, kvid, li, [win_len as u32, window as u32, k as u32, 0]);
+            cached_bind(c, (139, kvid, li), || mk(&p))
+        }
+        None => mk(&uniform_u32x4(c, [win_len as u32, window as u32, k as u32, 0])),
     };
     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: None,
@@ -18249,7 +18287,7 @@ pub fn dsv4_idx_build_for_test(
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-    encode_idx_build(c, &mut enc, &pb, &ob, win_len, window, pick.len());
+    encode_idx_build(c, &mut enc, &pb, &ob, win_len, window, pick.len(), None);
     let bytes = (n * 4) as u64;
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(
@@ -18364,6 +18402,29 @@ where
     }
     let b = build();
     m.1.insert(key, b.clone());
+    b
+}
+
+/// A per-(tag, sequence, layer) UNIFORM buffer, 16 bytes, written every
+/// call: how a sequence-varying scalar coexists with a CACHED bind group.
+/// The buffer's identity never changes, only its contents — the opposite
+/// trade from the content-keyed uniform pool, whose identity IS its
+/// contents.
+fn uni_slot(c: &Ctx, tag: u8, kv: u64, li: usize, vals: [u32; 4]) -> wgpu::Buffer {
+    let b = {
+        let mut m = c.dsv4_uni.lock().unwrap();
+        m.entry((tag, kv, li))
+            .or_insert_with(|| {
+                c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("dsv4-uni-slot"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .clone()
+    };
+    c.queue.write_buffer(&b, 0, bytemuck::cast_slice(&vals));
     b
 }
 
