@@ -6684,11 +6684,21 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
     // THE discrete-GPU decode fix; on UMA it's a wash.
     let buf = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("q1-weights"),
-        size: len,
+        // Rounded up: write_buffer refuses a size that is not a multiple of
+        // four, and a small q4tp payload need not be one. This only ever
+        // surfaced once the preparation's weights joined the preflight —
+        // until then every tensor through here happened to be aligned.
+        size: len.next_multiple_of(4),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    c.queue.write_buffer(&buf, 0, full_quant);
+    if full_quant.len() % 4 == 0 {
+        c.queue.write_buffer(&buf, 0, full_quant);
+    } else {
+        let mut padded = full_quant.to_vec();
+        padded.resize(padded.len().next_multiple_of(4), 0);
+        c.queue.write_buffer(&buf, 0, &padded);
+    }
     c.resident.fetch_add(len, Ordering::Relaxed);
     map.insert(
         key,
