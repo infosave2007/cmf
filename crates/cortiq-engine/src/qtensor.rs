@@ -113,6 +113,32 @@ fn vbit_row_offsets(bytes: &[u8], rows: usize, cols: usize) -> Vec<usize> {
     offsets
 }
 
+/// `CMF_X86_BLOCKED` / `CMF_GPU_LMHEAD` / `CMF_GPU_SPLIT`, read once. They
+/// used to be read from the environment on every large matvec and on every
+/// matmat in six places — microseconds each, but also a knob that could
+/// change under a running process, which is not a thing a kernel choice
+/// should be able to do mid-sequence.
+fn blocked_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true))
+}
+
+fn gpu_lmhead_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_GPU_LMHEAD").map(|v| v != "0").unwrap_or(true))
+}
+
+fn gpu_split_frac() -> f32 {
+    static F: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("CMF_GPU_SPLIT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0)
+    })
+}
+
 impl QTensor {
     pub fn from_f32(data: Vec<f32>, rows: usize, cols: usize) -> Self {
         debug_assert_eq!(data.len(), rows * cols);
@@ -1024,9 +1050,7 @@ impl QTensor {
                 // GPU share: CMF_GPU_SPLIT (0..1, default 0.5).
                 if *rows >= crate::gpu::min_rows()
                     && matches!(dtype, TensorDtype::Q8Row | TensorDtype::Q8_2f)
-                    && std::env::var("CMF_GPU_LMHEAD")
-                        .map(|v| v != "0")
-                        .unwrap_or(true)
+                    && gpu_lmhead_enabled()
                     && crate::gpu::enabled_here()
                 {
                     // Runtime probe: alternate the hybrid against the
@@ -1070,11 +1094,7 @@ impl QTensor {
                             return;
                         }
                     }
-                    let frac = std::env::var("CMF_GPU_SPLIT")
-                        .ok()
-                        .and_then(|v| v.parse::<f32>().ok())
-                        .unwrap_or(0.5)
-                        .clamp(0.0, 1.0);
+                    let frac = gpu_split_frac();
                     let cpu_rows = ((*rows as f32) * (1.0 - frac)) as usize;
                     let (out_cpu, out_gpu) = out.split_at_mut(cpu_rows);
                     let bytes = self.quant_bytes();
@@ -2932,9 +2952,7 @@ fn qmatmat(
         let out_addr = SendMut(out.as_mut_ptr());
         // Blocked 2×4 (mobile prefill: no AMX to fall back on — this
         // path IS the ARM prefill GEMM off Apple silicon).
-        let blocked_ok = std::env::var("CMF_X86_BLOCKED")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        let blocked_ok = blocked_enabled();
         let use_i8mm = i8mm_enabled();
         if blocked_ok {
             let run = |start: usize, end: usize| {
@@ -3013,9 +3031,7 @@ fn qmatmat(
         let out_addr = SendMut(out.as_mut_ptr());
         // CMF_X86_BLOCKED=0 forces the per-row path (paired in-process
         // A/B on noisy shared-vCPU hosts).
-        let blocked_ok = std::env::var("CMF_X86_BLOCKED")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        let blocked_ok = blocked_enabled();
         if !avx512vnni_enabled() && blocked_ok {
             let run = |start: usize, end: usize| {
                 let mut o = start;
@@ -4508,10 +4524,7 @@ fn q4tp_matmat(
             .collect();
         let acts = &acts;
         #[cfg(target_arch = "aarch64")]
-        let blocked_ok = sdot_enabled()
-            && std::env::var("CMF_X86_BLOCKED")
-                .map(|val| val != "0")
-                .unwrap_or(true);
+        let blocked_ok = sdot_enabled() && blocked_enabled();
         #[cfg(not(target_arch = "aarch64"))]
         let blocked_ok = false;
         let run = |start: usize, end: usize| {
@@ -4766,14 +4779,10 @@ fn q4t_matmat(
         let acts = &acts;
         #[cfg(target_arch = "x86_64")]
         let blocked_ok = avx2_enabled()
-            && std::env::var("CMF_X86_BLOCKED")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+            && blocked_enabled();
         #[cfg(target_arch = "aarch64")]
         let blocked_ok = sdot_enabled()
-            && std::env::var("CMF_X86_BLOCKED")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+            && blocked_enabled();
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let blocked_ok = false;
         let run = move |start: usize, end: usize| {
@@ -6386,14 +6395,10 @@ fn q1_matmat(
         let acts = &acts;
         #[cfg(target_arch = "x86_64")]
         let blocked_ok = avx2_enabled()
-            && std::env::var("CMF_X86_BLOCKED")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+            && blocked_enabled();
         #[cfg(target_arch = "aarch64")]
         let blocked_ok = sdot_enabled()
-            && std::env::var("CMF_X86_BLOCKED")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+            && blocked_enabled();
         let run = move |start: usize, end: usize| {
             for r in start..end {
                 let mut bi = 0usize;
@@ -6963,9 +6968,7 @@ fn q4matmat(
                     let mut bi = 0usize;
                     #[cfg(target_arch = "x86_64")]
                     if avx2_enabled()
-                        && std::env::var("CMF_X86_BLOCKED")
-                            .map(|v| v != "0")
-                            .unwrap_or(true)
+                        && blocked_enabled()
                     {
                         while bi + 4 <= acts.len() {
                             let xs = [
@@ -7166,9 +7169,7 @@ fn vbitmatmat(
                     // blocked 1×4 kernel serves the decoded row.
                     #[cfg(target_arch = "x86_64")]
                     if avx2_enabled()
-                        && std::env::var("CMF_X86_BLOCKED")
-                            .map(|v| v != "0")
-                            .unwrap_or(true)
+                        && blocked_enabled()
                     {
                         while bi + 4 <= acts.len() {
                             let xs = [

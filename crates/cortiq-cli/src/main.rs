@@ -2647,6 +2647,17 @@ async fn cmd_info(model_path: &str) -> anyhow::Result<()> {
         "  Quant:       {:?} (default; per-tensor in directory)",
         model.header.quant_type
     );
+    // The head's own dtype, which the default rarely is and which decides
+    // whether it has a GPU route at all — the largest single matvec of a
+    // decode step should not be something one has to guess at.
+    if let Some(e) = model
+        .tensors
+        .iter()
+        .find(|e| e.name == "lm_head.weight")
+        .or_else(|| model.tensors.iter().find(|e| e.name == "model.embed_tokens.weight"))
+    {
+        println!("  Head:        {:?} {:?}", e.dtype, e.shape);
+    }
     println!("  Tensors:     {}", model.tensors.len());
     println!(
         "  Params:      {:.2}B",

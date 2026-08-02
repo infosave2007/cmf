@@ -1775,6 +1775,31 @@ fn dsv4_layer_loop(
         return false;
     }
 
+    // Which layers the card actually took, said once. A layer that falls to
+    // the host costs an order of magnitude more than one that does not, and
+    // "the GPU path is on" hid the difference between all of them and most.
+    {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let host: Vec<usize> = on_dev
+                .iter()
+                .enumerate()
+                .filter(|&(_, d)| !*d)
+                .map(|(i, _)| i)
+                .collect();
+            if host.is_empty() {
+                tracing::info!("dsv4: все {} слоёв на карте", on_dev.len());
+            } else {
+                tracing::info!(
+                    "dsv4: {} из {} слоёв на карте; на хосте остались {:?}",
+                    on_dev.len() - host.len(),
+                    on_dev.len(),
+                    host,
+                );
+            }
+        }
+    }
+
     // Layer zero's opening fold has no frame before it to have prepared it.
     let (mut folded, post0, comb0) = hc_fold_norm(
         state,
