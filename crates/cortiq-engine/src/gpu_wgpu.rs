@@ -17966,7 +17966,11 @@ pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: us
             c.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("dsv4-kv"),
                 size: (cap * 4) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                // COPY_SRC as well: the window slide reads this buffer to
+                // write it one slot down, so the cache is its own source.
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }),
             cap,
