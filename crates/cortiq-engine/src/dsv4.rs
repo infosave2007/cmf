@@ -1170,6 +1170,19 @@ pub(crate) mod prof {
                         g(0), g(1), g(2),
                     );
                 }
+                let cl = crate::gpu_wgpu::CHAIN_LAYERS.load(Ordering::Relaxed);
+                if cl > 0 {
+                    let toks2 = toks.max(1) as f64;
+                    eprintln!(
+                        "[dsv4-профиль]   ЦЕПОЧКА на токен: кодирование {:.1} мс, \
+                         ожидание {:.1} мс ({} слоёв)",
+                        crate::gpu_wgpu::CHAIN_ENC_NS.load(Ordering::Relaxed) as f64
+                            / 1e6 / toks2,
+                        crate::gpu_wgpu::CHAIN_WAIT_NS.load(Ordering::Relaxed) as f64
+                            / 1e6 / toks2,
+                        cl / toks.max(1),
+                    );
+                }
                 let gn = crate::gpu_wgpu::MOE_GPU_N.load(Ordering::Relaxed);
                 let gns = crate::gpu_wgpu::MOE_GPU_NS[0].load(Ordering::Relaxed);
                 if gn > 0 && gns > 0 {

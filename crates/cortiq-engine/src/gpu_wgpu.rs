@@ -16837,6 +16837,7 @@ pub fn dsv4_layer_chain(
             label: Some("dsv4-chain"),
         });
     let mut last = None;
+    let t_enc = std::time::Instant::now();
     for (i, (w, g, p)) in layers.iter().enumerate() {
         // `qn = None` throughout: the first layer's LoRA vector was left on
         // the card by the caller's seed, every later one by the frame before.
@@ -16851,6 +16852,14 @@ pub fn dsv4_layer_chain(
         last = Some(b);
     }
     let Some(src) = last else { return false };
+    // The whole run's HOST encode time, before the fence: the number that
+    // says whether the chain is submit-bound or encode-bound.
+    CHAIN_ENC_NS.fetch_add(
+        t_enc.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    CHAIN_LAYERS.fetch_add(layers.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let t_wait = std::time::Instant::now();
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(
         &c.device,
@@ -16860,9 +16869,19 @@ pub fn dsv4_layer_chain(
         "dsv4-chain-stage",
     );
     let ok = readback(c, enc, &src, &stage, (dim * 4) as u64, &mut folded_out[..dim]);
+    CHAIN_WAIT_NS.fetch_add(
+        t_wait.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     drop(sc);
     ok
 }
+
+/// Host encode and fence-wait of the chain, per run, with the layer count —
+/// the split that decides where its 12.5 tok/s goes.
+pub static CHAIN_ENC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static CHAIN_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static CHAIN_LAYERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One layer, submitted on its own and read back — the shape the two-frame
 /// path and the current layer loop use.
