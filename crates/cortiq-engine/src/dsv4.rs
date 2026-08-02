@@ -1783,9 +1783,19 @@ fn dsv4_layer_loop(
     for (li, l) in layers.iter().enumerate() {
         if chain && on_dev[li] {
             run.push(li);
+            // CMF_DSV4_CHAIN_MAX=N caps a run's length. Diagnostic, not a
+            // tuning knob: length-1 runs put ONE layer per submission, which
+            // separates "the layer frame is wrong" from "layers in one
+            // encoder contaminate each other" in a single ppl run.
+            if run.len() >= chain_max() {
+                if !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &mut folded, pool) {
+                    return false;
+                }
+                run.clear();
+            }
             continue;
         }
-        if chain && !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &folded, pool) {
+        if chain && !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &mut folded, pool) {
             return false;
         }
         run.clear();
@@ -1982,7 +1992,7 @@ fn dsv4_layer_loop(
         folded = next;
     }
     if chain {
-        if !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &folded, pool) {
+        if !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &mut folded, pool) {
             return false;
         }
         if st.dev_set.is_empty() {
@@ -1990,6 +2000,17 @@ fn dsv4_layer_loop(
         }
     }
     crate::gpu_wgpu::dsv4_state_read(state)
+}
+
+#[cfg(feature = "gpu")]
+fn chain_max() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CMF_DSV4_CHAIN_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX)
+    })
 }
 
 /// `CMF_DSV4_CHAIN=1`: put a run of consecutive device-capable layers in ONE
@@ -2018,7 +2039,12 @@ fn dsv4_chain_run(
     g: &Dsv4Globals,
     st: &mut Dsv4State,
     token_id: u32,
-    folded: &[f32],
+    // In AND out: the run reads the fold it starts from and MUST leave the
+    // fold it produced, because whatever follows — a host layer, or the next
+    // run after a cap — seeds from this. Passing it read-only left every
+    // later segment starting from a stale fold: exact with one unbroken run,
+    // release-scale garbage the moment anything splits the chain.
+    folded: &mut Vec<f32>,
     pool: Option<&crate::pool::Pool>,
 ) -> bool {
     if run.is_empty() {
@@ -2236,6 +2262,7 @@ fn dsv4_chain_run(
     ) {
         return false;
     }
+    *folded = out;
     // The device advanced these; the host keeps only the arithmetic.
     for (i, &li) in run.iter().enumerate() {
         st.dev_filled[li] = (st.dev_filled[li] + 1).min(cfg.window);
