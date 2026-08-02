@@ -47,8 +47,19 @@ TOPK       = _env("TOY_TOPK", 2)
 MOE_INTER  = _env("TOY_INTER", 32)
 VOCAB      = 128
 HC         = 4
-RATIO_MAP  = {2: 4, 3: 8}      # layer -> compress_ratio (4 => overlapping)
-INDEXER_ON = {2}
+# layer -> compress_ratio (4 => overlapping). TOY_RATIOS="1:8,2:4" overrides —
+# the chain's release-scale fault bisected to a flat ratio-8 layer, and
+# pinning WHICH layer carries it needs the map movable.
+RATIO_MAP  = (
+    {int(k): int(v) for k, v in (kv.split(":") for kv in os.environ["TOY_RATIOS"].split(","))}
+    if os.environ.get("TOY_RATIOS")
+    else {2: 4, 3: 8}
+)
+INDEXER_ON = (
+    {int(x) for x in os.environ["TOY_INDEXER"].split(",") if x != ""}
+    if os.environ.get("TOY_INDEXER") is not None
+    else {2}
+)
 IDX_HEADS  = 2
 IDX_HD     = 64   # >= the rope tail, as in the release (128 vs 64)
 

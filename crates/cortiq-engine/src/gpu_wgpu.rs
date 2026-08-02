@@ -16493,6 +16493,13 @@ pub struct Dsv4Prep<'a> {
     pub n_ix: usize,
     pub comp_dst_off: usize,
     pub ix_dst_off: usize,
+    /// The most positions attention can be asked to read: window capacity
+    /// plus the indexer's budget (or every compressed entry, without one).
+    /// The list buffer is sized by THIS — sizing it by the host list, which
+    /// is empty when the device builds its own, cut the release's 640-entry
+    /// list to 64: the writes past that are silently clamped and the reads
+    /// return zero, so attention quietly stares at position zero.
+    pub idx_cap: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16605,7 +16612,8 @@ fn dsv4_layer_frame_enc(
     // ── per-call uploads ──
     let posb = frame_up(c, 1, bytemuck::cast_slice(&[pos as f32, a.eps]));
     let ixb = {
-        let cap = idxs.len().next_power_of_two().max(64);
+        let want = prep.map_or(idxs.len(), |p| p.idx_cap.max(idxs.len()));
+        let cap = want.next_power_of_two().max(64);
         let b = frame_buf(c, 2, cap * 4, true);
         c.queue.write_buffer(&b, 0, bytemuck::cast_slice(idxs));
         b
@@ -16726,11 +16734,35 @@ pub fn dsv4_cache_ensure(kv_id: u64, li: usize, cap: usize) -> bool {
         return false;
     }
     let mut map = c.dsv4_kv.lock().unwrap();
-    if map.get(&(kv_id, li)).is_some_and(|(_, have)| *have < cap) {
-        map.remove(&(kv_id, li));
-        GREW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Growing must CARRY the contents. The host path rewrites the whole
+    // cache every token, so drop-and-recreate cost it nothing; the chain
+    // owns the contents on the device, and dropping the buffer there wipes
+    // the window and every compressed entry the sequence has accumulated —
+    // a drift that grows with length and never fails loudly.
+    if let Some((old, have)) = map.get(&(kv_id, li)).map(|(b, h)| (b.clone(), *h)) {
+        if have < cap {
+            let bigger = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dsv4-kv"),
+                size: (cap * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let mut enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("dsv4-kv-grow"),
+                });
+            enc.copy_buffer_to_buffer(&old, 0, &bigger, 0, (have * 4) as u64);
+            c.queue.submit(Some(enc.finish()));
+            map.insert((kv_id, li), (bigger, cap));
+            GREW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return true;
     }
-    map.entry((kv_id, li)).or_insert_with(|| {
+    map.insert(
+        (kv_id, li),
         (
             c.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("dsv4-kv"),
@@ -16741,8 +16773,8 @@ pub fn dsv4_cache_ensure(kv_id: u64, li: usize, cap: usize) -> bool {
                 mapped_at_creation: false,
             }),
             cap,
-        )
-    });
+        ),
+    );
     true
 }
 

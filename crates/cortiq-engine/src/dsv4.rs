@@ -2162,6 +2162,12 @@ fn dsv4_chain_run(
             n_ix: st.dev_n_ix[li],
             comp_dst_off: cfg.window * hd + st.dev_n_comp[li] * ew_c,
             ix_dst_off: st.dev_n_ix[li] * ew_i,
+            idx_cap: cfg.window
+                + if l.indexer.is_some() {
+                    cfg.index_topk
+                } else {
+                    st.dev_n_comp[li] + 2
+                },
         };
         let nxt = layers.get(li + 1);
         let w = crate::gpu_wgpu::Dsv4LayerW {

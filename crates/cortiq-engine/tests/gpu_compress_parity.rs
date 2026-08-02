@@ -178,7 +178,9 @@ fn device_compressor_state_matches_the_cpu() {
     }
     // Both shapes the release uses: the overlapping ratio-4 compressor and
     // the flat one, whose bias is added inside the pooling kernel instead.
-    for (overlap, ratio) in [(true, 4usize), (false, 2usize)] {
+    // ratio 8 flat is the release's OTHER compressor shape, and the chain's
+    // release-scale divergence bisected to exactly such a layer.
+    for (overlap, ratio) in [(true, 4usize), (false, 2usize), (false, 8usize)] {
         let width = if overlap { 64 } else { 32 };
         let ew = if overlap { width / 2 } else { width };
         let rd = 8;
@@ -186,7 +188,11 @@ fn device_compressor_state_matches_the_cpu() {
         let norm = noise(ew, 3.0);
         let ape = noise(ratio * width, 5.0);
         let inv_freq: Vec<f32> = (0..rd / 2).map(|i| 1.0 / (10000f32.powf(i as f32 / 4.0))).collect();
-        let kv_id = if overlap { 7001 } else { 7002 };
+        // One id per CASE: the pending streams are sized at first use per
+        // (kind, kv_id, layer), so two flat cases sharing an id would hand
+        // ratio-8 a buffer sized for ratio-2 — the copy overruns, and the
+        // first version of this test did exactly that.
+        let kv_id = 7000 + ratio as u64 * 10 + overlap as u64;
 
         // The CPU reference, kept by hand so the state is visible.
         let (mut pend_kv, mut pend_sc) = (Vec::new(), Vec::new());
