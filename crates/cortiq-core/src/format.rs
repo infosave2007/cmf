@@ -329,9 +329,19 @@ impl CmfModel {
                 // logged, not fatal).
                 #[cfg(unix)]
                 {
-                    if std::env::var("CMF_MMAP_ADVISE")
-                        .map(|v| v != "0")
-                        .unwrap_or(true)
+                    // …unless the caller is going to hand those pages to a
+                    // device and drop them (`CMF_UPLOAD_EVICT=1`). Reading a
+                    // 104 GB file ahead only to throw it out behind the
+                    // uploader has the kernel fetching the same bytes twice:
+                    // measured, that turned a 1-minute expert upload into 12.
+                    // The two advices contradict each other, so the one that
+                    // asked for eviction wins.
+                    let evicting = std::env::var("CMF_UPLOAD_EVICT")
+                        .is_ok_and(|v| v != "0");
+                    if !evicting
+                        && std::env::var("CMF_MMAP_ADVISE")
+                            .map(|v| v != "0")
+                            .unwrap_or(true)
                     {
                         let _ = m.advise(memmap2::Advice::WillNeed);
                     }
