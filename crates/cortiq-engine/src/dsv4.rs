@@ -2245,7 +2245,12 @@ fn dsv4_chain_run(
 fn hc_on_device() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("CMF_DSV4_HC_DEV").map(|v| v != "0").unwrap_or(true)
+        // OPT-IN. On the release checkpoint this path reads 3.234 against
+        // the CPU's 3.282 — divergent — and the speed is unchanged, so there
+        // is no trade to weigh: it must not be the default until it is
+        // exact. The toy's near-agreement (129.787 vs 129.792) hid a real
+        // fault the release exposes.
+        std::env::var("CMF_DSV4_HC_DEV").is_ok_and(|v| v != "0")
             && crate::gpu::backend_available()
     })
 }
