@@ -18713,8 +18713,12 @@ pub fn dsv4_moe_frame(
     }
     if let Some((qs, resolve, tstage)) = &c.ts_query {
         let slot = TS_LAST.load(std::sync::atomic::Ordering::Relaxed);
-        enc.resolve_query_set(qs, slot..slot + 2, resolve, (slot as u64) * 8);
-        enc.copy_buffer_to_buffer(resolve, (slot as u64) * 8, tstage, 0, 16);
+        // Offset ZERO, always: a query resolve's destination offset has to be
+        // 256-byte aligned, and slot*8 is not for any slot but the first
+        // thirty-two. The pair still comes from the rotating slots; only
+        // where it lands is fixed.
+        enc.resolve_query_set(qs, slot..slot + 2, resolve, 0);
+        enc.copy_buffer_to_buffer(resolve, 0, tstage, 0, 16);
     }
     let t_enc = std::time::Instant::now();
     MOE_PASS_NS.fetch_add(
