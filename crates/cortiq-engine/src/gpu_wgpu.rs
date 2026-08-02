@@ -16678,6 +16678,39 @@ fn dsv4_layer_frame_enc(
     Some(folded)
 }
 
+/// Make sure a layer's cache exists and is at least `cap` floats.
+///
+/// The host path got this for free: it rewrote the whole cache every token
+/// through `dsv4_cache_write`, which creates and grows. A chained layer
+/// never calls that — it appends on the card — so without this its buffer is
+/// whatever some earlier token happened to size it to, and the compressed
+/// region walks off the end as the sequence lengthens.
+pub fn dsv4_cache_ensure(kv_id: u64, li: usize, cap: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    if (cap * 4) as u64 > c.device.limits().max_storage_buffer_binding_size as u64 {
+        return false;
+    }
+    let mut map = c.dsv4_kv.lock().unwrap();
+    if map.get(&(kv_id, li)).is_some_and(|(_, have)| *have < cap) {
+        map.remove(&(kv_id, li));
+        GREW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    map.entry((kv_id, li)).or_insert_with(|| {
+        (
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dsv4-kv"),
+                size: (cap * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            cap,
+        )
+    });
+    true
+}
+
 /// Seed the buffer a chain's FIRST layer reads its hidden state from.
 ///
 /// Every later layer finds it there because the previous frame's tail wrote

@@ -2105,6 +2105,16 @@ fn dsv4_chain_run(
                 ))
             }
         };
+        // The cache has to be big enough BEFORE the frame appends into it:
+        // a chained layer never calls dsv4_cache_write, which is what used
+        // to create and grow it.
+        let ew_c0 = l.compressor.as_ref().map_or(0, |cp| {
+            if cp.overlap { cp.wkv.rows() / 2 } else { cp.wkv.rows() }
+        });
+        let need = cfg.window * hd + (st.dev_n_comp[li] + 2) * ew_c0.max(1);
+        if !crate::gpu_wgpu::dsv4_cache_ensure(st.kv_id, li, need.next_power_of_two()) {
+            return false;
+        }
         let ew_c = comp.as_ref().map_or(0, |(_, cg)| {
             if cg.overlap { cg.width / 2 } else { cg.width }
         });
