@@ -16588,7 +16588,11 @@ fn dsv4_layer_frame_enc(
     let mid = frame_buf(c, 7, a.o_groups * a.o_lora * 4, false);
     let ao = frame_buf(c, 8, dim * 4, false);
     let mixes = frame_buf(c, 41, mix_hc * 4, false);
-    let folded = frame_buf(c, 42, dim * 4, false);
+    // `true`: the tail copies the next layer's input INTO this one, so it is
+    // a copy destination as well as a kernel output. Without the flag the
+    // layer-frame path fails validation at the first token — which is how
+    // the release run caught it, and a unit test could not have.
+    let folded = frame_buf(c, 42, dim * 4, true);
     let hpost = frame_buf(c, 43, hc * 4, true);
     let hcomb = frame_buf(c, 44, hc * hc * 4, true);
     let x2 = frame_buf(c, 45, dim * 4, false);
