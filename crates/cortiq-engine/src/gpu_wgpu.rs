@@ -6784,17 +6784,19 @@ fn moe_expert_bufs(
     // bounds transient staging to this layer's three buffers.
     c.queue.submit(std::iter::empty());
     let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
-    // The card holds these bytes now, and nothing on this path reads them
-    // from the CPU again — a VRAM eviction re-uploads through the same
-    // mapping, which simply re-faults. Without this the page cache keeps a
-    // second copy of every resident expert, and on a 112 GB model that
-    // second copy IS the machine's RAM. Discrete only: on UMA the mapping
-    // is the working copy. CMF_UPLOAD_EVICT=0 opts out.
-    if c.discrete
-        && std::env::var("CMF_UPLOAD_EVICT")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    {
+    // The card holds these bytes now, so the host copy is dead weight: the
+    // page cache otherwise keeps every resident expert a second time, and on
+    // a 112 GB model that second copy IS the machine's RAM (measured: 172 of
+    // 176 GB cached).
+    //
+    // OFF BY DEFAULT, and the reason is measured too: `open()` asks for
+    // `WillNeed` over the whole file, and dropping pages here fights that
+    // readahead head-on — the upload of a 94 GB expert set went from ~1
+    // minute to 12, and decode from 4.5 tok/s to 0.2. The two advices have to
+    // be reconciled (skip WillNeed for what we intend to evict) before this
+    // can be the default. `CMF_UPLOAD_EVICT=1` turns it on; discrete only, as
+    // on UMA the mapping IS the working copy.
+    if c.discrete && std::env::var("CMF_UPLOAD_EVICT").is_ok_and(|v| v != "0") {
         model.evict_ranges(&uploaded.borrow());
     }
     c.resident.fetch_add(total, Ordering::Relaxed);

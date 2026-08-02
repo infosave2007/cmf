@@ -19,12 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The budget message no longer blames a mask that isn't there** when a
   layer has no VRAM left for a single expert.
 
-### Changed
-- **The experts' host pages are released after they reach the card**
-  (`madvise(DONTNEED)` + `posix_fadvise`, discrete GPUs on Linux,
-  `CMF_UPLOAD_EVICT=0` opts out). Uploading reads ~94 GB through the mapping
-  and the page cache kept every byte — a second copy of weights that now live
-  in VRAM. The mapping stays valid, so a range touched again re-faults.
+### Added
+- **`CMF_UPLOAD_EVICT=1`** releases the experts' host pages once they reach
+  the card (`madvise(DONTNEED)` + `posix_fadvise`, discrete GPUs on Linux).
+  Uploading reads ~94 GB through the mapping and the page cache keeps every
+  byte — a second copy of weights that now live in VRAM, and on a 112 GB
+  model that copy is the machine's RAM (172 of 176 GB cached). Resident set
+  drops to 6 GB with it on. **Off by default**: `open()` asks the kernel for
+  `WillNeed` over the whole file, and dropping pages here fights that
+  readahead — the upload went from ~1 minute to 12 and decode from 4.5 tok/s
+  to 0.2. Reconciling the two advices is the work left.
 
 ### Known limitations
 - **The cold split is associated with a heap corruption that aborts the
