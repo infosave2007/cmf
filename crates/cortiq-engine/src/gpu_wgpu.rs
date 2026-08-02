@@ -5914,6 +5914,7 @@ struct Ctx {
     dsv4_ixkv: Mutex<HashMap<(u64, usize), (wgpu::Buffer, usize)>>,
     /// Stable per-(tag, kv, layer) uniform slots for sequence-varying scalars.
     dsv4_uni: Mutex<HashMap<(u8, u64, usize), wgpu::Buffer>>,
+    dsv4_store: Mutex<HashMap<(u8, u64, usize), wgpu::Buffer>>,
     /// (epoch, bind groups) for the dsv4 frames — see `cached_bind`.
     dsv4_binds: Mutex<(u64, HashMap<(u8, u64, usize), wgpu::BindGroup>)>,
     /// Access clock for the aging above — one tick per weight lookup.
@@ -6608,6 +6609,7 @@ fn init() -> Result<Ctx, String> {
         dsv4_comp: Mutex::new(HashMap::new()),
         dsv4_ixkv: Mutex::new(HashMap::new()),
         dsv4_uni: Mutex::new(HashMap::new()),
+        dsv4_store: Mutex::new(HashMap::new()),
         dsv4_binds: Mutex::new((0, HashMap::new())),
         res_clock: std::sync::atomic::AtomicU64::new(0),
         uniforms: Mutex::new(HashMap::new()),
@@ -16303,12 +16305,15 @@ fn encode_moe_chain(
         _ => logits.clone(),
     };
     let mk = frame_buf(c, 17, n_pack * 4, true);
+    // Per-layer, not pooled: a run holding two hash layers wrote both lists
+    // into one buffer before the single submit, and both routed with the
+    // second one's experts.
     let fc = match w.moe.forced {
         Some(f) if f.len() >= g.top_k => {
             let v: Vec<u32> = f[..g.top_k].iter().map(|&i| i as u32).collect();
-            frame_up(c, 18, bytemuck::cast_slice(&v))
+            store_slot(c, 18, bkey.0, bkey.1, bytemuck::cast_slice(&v))
         }
-        _ => frame_buf(c, 18, g.top_k * 4, true),
+        _ => store_slot(c, 18, bkey.0, bkey.1, &vec![0u8; g.top_k * 4]),
     };
     let rflags = (w.moe.bias.is_some_and(|b| b.len() >= n_pack) as u32)
         | ((w.moe.forced.is_some_and(|f| f.len() >= g.top_k) as u32) << 2)
@@ -16983,6 +16988,7 @@ pub fn dsv4_layer_chain(
         std::sync::atomic::Ordering::Relaxed,
     );
     CHAIN_LAYERS.fetch_add(layers.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    CHAIN_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let t_wait = std::time::Instant::now();
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(
@@ -17006,6 +17012,9 @@ pub fn dsv4_layer_chain(
 pub static CHAIN_ENC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static CHAIN_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static CHAIN_LAYERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Submissions per token — one fence each. The number that says whether a
+/// layer kind is still breaking the chain into pieces.
+pub static CHAIN_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One layer, submitted on its own and read back — the shape the two-frame
 /// path and the current layer loop use.
@@ -18425,6 +18434,49 @@ fn uni_slot(c: &Ctx, tag: u8, kv: u64, li: usize, vals: [u32; 4]) -> wgpu::Buffe
             .clone()
     };
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(&vals));
+    b
+}
+
+/// `uni_slot`'s storage twin: a per-(tag, sequence, layer) STORAGE buffer
+/// rewritten every call. What it buys is the hash layers — their forced
+/// expert list changes per token and used to go through the (tag, len) pool,
+/// where every layer of a run shared one buffer and the last write won. With
+/// a buffer per layer they route with their own table row and can share a
+/// submission with everyone else.
+fn store_slot(c: &Ctx, tag: u8, kv: u64, li: usize, data: &[u8]) -> wgpu::Buffer {
+    let size = (data.len().max(4) as u64).div_ceil(16) * 16;
+    let b = {
+        let mut m = c.dsv4_store.lock().unwrap();
+        let e = m.entry((tag, kv, li));
+        match e {
+            std::collections::hash_map::Entry::Occupied(o) if o.get().size() >= size => {
+                o.get().clone()
+            }
+            other => {
+                let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("dsv4-store-slot"),
+                    size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                match other {
+                    std::collections::hash_map::Entry::Occupied(mut o) => {
+                        o.insert(b.clone());
+                        // A cached bind group would otherwise outlive the
+                        // buffer it names.
+                        GREW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(b.clone());
+                    }
+                }
+                b
+            }
+        }
+    };
+    if !data.is_empty() {
+        c.queue.write_buffer(&b, 0, data);
+    }
     b
 }
 

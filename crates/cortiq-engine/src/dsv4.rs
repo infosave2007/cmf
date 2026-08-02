@@ -1076,6 +1076,10 @@ pub(crate) mod prof {
                     &crate::gpu_wgpu::MOE_PASS_NS,
                     &crate::gpu_wgpu::ATT_ENC_NS,
                     &crate::gpu_wgpu::ATT_WAIT_NS,
+                    &crate::gpu_wgpu::CHAIN_ENC_NS,
+                    &crate::gpu_wgpu::CHAIN_WAIT_NS,
+                    &crate::gpu_wgpu::CHAIN_LAYERS,
+                    &crate::gpu_wgpu::CHAIN_RUNS,
                 ] {
                     a.store(0, Ordering::Relaxed);
                 }
@@ -1175,12 +1179,13 @@ pub(crate) mod prof {
                     let toks2 = toks.max(1) as f64;
                     eprintln!(
                         "[dsv4-профиль]   ЦЕПОЧКА на токен: кодирование {:.1} мс, \
-                         ожидание {:.1} мс ({} слоёв)",
+                         ожидание {:.1} мс ({} слоёв, {} отправок)",
                         crate::gpu_wgpu::CHAIN_ENC_NS.load(Ordering::Relaxed) as f64
                             / 1e6 / toks2,
                         crate::gpu_wgpu::CHAIN_WAIT_NS.load(Ordering::Relaxed) as f64
                             / 1e6 / toks2,
                         cl / toks.max(1),
+                        crate::gpu_wgpu::CHAIN_RUNS.load(Ordering::Relaxed) / toks.max(1),
                     );
                 }
                 let gn = crate::gpu_wgpu::MOE_GPU_N.load(Ordering::Relaxed);
@@ -1795,28 +1800,11 @@ fn dsv4_layer_loop(
     let mut sink_out = vec![0.0f32; dim];
     for (li, l) in layers.iter().enumerate() {
         if chain && on_dev[li] {
-            // A hash layer's forced indices change per token and go through
-            // the per-call upload pool, so two of them in one submission
-            // would route with the last one's picks. They run as runs of
-            // one; on the release that is three consecutive layers.
-            if l.tid2eid.is_some() && !run.is_empty() {
-                let need_qn = run[0] == 0 || !on_dev[run[0] - 1];
-                if !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &mut folded, need_qn, pool)
-                {
-                    return false;
-                }
-                run.clear();
-            }
+            // Hash layers used to break the run in two: their forced expert
+            // list changes per token, went through the (tag, len) upload
+            // pool, and every layer of a submission shared one buffer. The
+            // list has a per-layer slot now, so they chain like the rest.
             run.push(li);
-            if l.tid2eid.is_some() {
-                let need_qn = run[0] == 0 || !on_dev[run[0] - 1];
-                if !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &mut folded, need_qn, pool)
-                {
-                    return false;
-                }
-                run.clear();
-                continue;
-            }
             // CMF_DSV4_CHAIN_MAX=N caps a run's length. Diagnostic, not a
             // tuning knob: length-1 runs put ONE layer per submission, which
             // separates "the layer frame is wrong" from "layers in one

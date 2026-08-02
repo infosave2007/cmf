@@ -170,7 +170,19 @@ fn check_mm(
     tag: &str,
     run: impl Fn(&std::sync::Arc<CmfModel>, usize, &[f32], usize, usize, usize, &mut [f32]) -> bool,
 ) {
-    let (rows, cols, b) = (256usize, 512usize, 48usize);
+    check_mm_b(tag, 48, &run);
+    // b=1 is the lm_head route: `gpu::q4tp_matvec` is this kernel with a
+    // batch of one, and a GEMM that only ever ran at b=48 could carry a
+    // tail bug that decode — not prefill — would be the one to hit.
+    check_mm_b(tag, 1, &run);
+}
+
+fn check_mm_b(
+    tag: &str,
+    b: usize,
+    run: &impl Fn(&std::sync::Arc<CmfModel>, usize, &[f32], usize, usize, usize, &mut [f32]) -> bool,
+) {
+    let (rows, cols) = (256usize, 512usize);
     let payload = synth(rows, cols);
     let mut w = vec![0f32; rows * cols];
     dequant_q4tp(&payload, rows, cols, &mut w);

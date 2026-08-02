@@ -1261,6 +1261,21 @@ pub fn q4tp_matmat(
     }
 }
 
+/// Single-token q4tp matvec on the device — the lm_head class. The batched
+/// kernel at b=1 IS the matvec; a 129280x2048 head is 132 MB of weights the
+/// host would otherwise stream through its load ports once per token, and
+/// `weight_buffer` uploads it once for the process.
+pub fn q4tp_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    q4tp_matmat(model, idx, xs, 1, rows, cols, out)
+}
+
 pub fn q4t_matmat(
     model: &Arc<CmfModel>,
     idx: usize,
