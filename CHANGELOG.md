@@ -7,12 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`cortiq bench` could not bench DeepSeek-V4 at all** — the paired prefill
+  inside `forward_ids` and `measure_pair_fusion` walk `weights.layers`, which
+  an architecture that loads its own layers leaves empty. Both ask
+  `pair_supported()` now. 0.5.45 shipped with this because the numbers were
+  taken with `run`, which never takes that path.
+- **`matvec` refuses a short `out`** instead of writing past it: the Mapped
+  kernels write `rows` entries through a raw pointer, and the `debug_assert`
+  two of them carried is compiled out of the release.
+- **The budget message no longer blames a mask that isn't there** when a
+  layer has no VRAM left for a single expert.
+
+### Changed
+- **The experts' host pages are released after they reach the card**
+  (`madvise(DONTNEED)` + `posix_fadvise`, discrete GPUs on Linux,
+  `CMF_UPLOAD_EVICT=0` opts out). Uploading reads ~94 GB through the mapping
+  and the page cache kept every byte — a second copy of weights that now live
+  in VRAM. The mapping stays valid, so a range touched again re-faults.
+
+### Known limitations
+- **The cold split is associated with a heap corruption that aborts the
+  process AFTER printing a correct answer** (`double free or corruption`).
+  The 0.5.45 binary aborted in 5 of 7 runs with the split on; a build of this
+  tree did not abort in 6, with no change on the `ppl` path to explain it, so
+  it is treated as unreproduced rather than fixed. Cause unknown.
+
 ## [0.5.45] — 2026-08-02
 
-The cold-expert split works and is on by default: hot experts run on the
-card, cold ones are finished on the host, and no layer has to leave the
-device because its experts do not all fit. This closes the first known
-limitation of 0.5.44 and unblocks the whole-layer frame's economics.
+The cold-expert split works: hot experts run on the card, cold ones are
+finished on the host, and no layer has to leave the device because its
+experts do not all fit. This closes the first known limitation of 0.5.44 and
+unblocks the whole-layer frame's economics.
+
+**Correction to this entry, written after release:** the split is opt-in
+(`CMF_DSV4_COLD_CPU=1`), not on by default — the code always required the
+variable to be set. It stays opt-in for now: it is exact (perplexity 3.282
+against the CPU's 3.282 on the release checkpoint, at every budget), but it
+is also the arm the abort above follows.
 
 ### Fixed
 - **The router's bias went in short.** The bias was uploaded `n_pack` long
