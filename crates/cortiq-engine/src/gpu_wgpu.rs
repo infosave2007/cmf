@@ -17587,8 +17587,35 @@ pub fn dsv4_window_append(
     let raw = frame_buf(c, 104, hd * 4, false);
     let kv = frame_buf(c, 105, hd * 4, false);
     encode_q4tp_mv1(c, enc, &wb, hidden, &raw, hd, dim, (106, kv_id, li));
+    window_place(c, enc, &raw, kv_norm, hd, window, filled, rope_dim, eps, pos,
+        inv_freq, cache, kv_id, li);
+    Some((filled + 1).min(window))
+}
+
+/// The half of the window append that is NOT a matvec: the norm, the rope
+/// tail and the slide that keeps the window at capacity. Split out so a test
+/// can drive it with the projection handed in — the q4tp matvec has its own
+/// parity test, these three did not have one at all.
+#[allow(clippy::too_many_arguments)]
+fn window_place(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    raw: &wgpu::Buffer,
+    kv_norm: &[f32],
+    hd: usize,
+    window: usize,
+    filled: usize,
+    rope_dim: usize,
+    eps: f32,
+    pos: usize,
+    inv_freq: &[f32],
+    cache: &wgpu::Buffer,
+    kv_id: u64,
+    li: usize,
+) {
+    let kv = frame_buf(c, 105, hd * 4, false);
     let nw = const_buf(c, bytemuck::cast_slice(&kv_norm[..hd]));
-    encode_rmsnorm(c, enc, &raw, &nw, &kv, hd, eps, (107, kv_id, li));
+    encode_rmsnorm(c, enc, raw, &nw, &kv, hd, eps, (107, kv_id, li));
     let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..rope_dim / 2]));
     let posb = frame_up(c, 108, bytemuck::cast_slice(&[pos as f32, eps]));
     encode_rope_heads(c, enc, &kv, &freq, &posb, 1, hd, rope_dim, false, false,
@@ -17608,7 +17635,59 @@ pub fn dsv4_window_append(
         window - 1
     };
     enc.copy_buffer_to_buffer(&kv, 0, cache, (slot * hd * 4) as u64, (hd * 4) as u64);
-    Some((filled + 1).min(window))
+}
+
+/// Drive the norm, the rope tail and the slide from a test with the
+/// projection handed in, and give back the whole window as attention would
+/// read it.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_window_place_for_test(
+    raw: &[f32],
+    kv_norm: &[f32],
+    inv_freq: &[f32],
+    seed: &[f32],
+    hd: usize,
+    window: usize,
+    filled: usize,
+    rope_dim: usize,
+    eps: f32,
+    pos: usize,
+    out: &mut Vec<f32>,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    // A POOLED buffer, not a fresh one: `encode_rmsnorm` caches its bind
+    // group by key, so a new buffer every call would leave the cache
+    // pointing at the first one. Production hands it `frame_buf` for the
+    // same reason.
+    let rb = frame_up(c, 112, bytemuck::cast_slice(&raw[..hd]));
+    let cache = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (window * hd * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    c.queue.write_buffer(&cache, 0, bytemuck::cast_slice(seed));
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    window_place(c, &mut enc, &rb, kv_norm, hd, window, filled, rope_dim, eps, pos,
+        inv_freq, &cache, 909, 0);
+    out.clear();
+    out.resize(window * hd, 0.0);
+    let bytes = (window * hd * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        bytes,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "win-test-stage",
+    );
+    let ok = readback(c, enc, &cache, &stage, bytes, out);
+    drop(sc);
+    ok
 }
 
 /// What the indexer needs from the model: two q4tp projections by directory

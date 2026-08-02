@@ -281,3 +281,56 @@ fn device_index_list_matches_the_host_mapping() {
         assert_eq!(want, got, "win_len={win_len} picks={pick:?}");
     }
 }
+
+/// The sliding window's append, on the card: the norm, the rope tail and the
+/// slide that keeps it at capacity. The projection is handed in — it has its
+/// own parity test — so a mismatch here is one of the other three.
+///
+/// Both regimes are walked, because the slide only exists in the second: a
+/// window still filling, and one at capacity where the oldest key has to go.
+#[test]
+fn device_window_append_matches_the_cpu() {
+    match cortiq_engine::gpu_wgpu::selected_and_up() {
+        None => {
+            eprintln!("wgpu не запрошен (CMF_GPU=wgpu) — пропуск");
+            return;
+        }
+        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(true) => {}
+    }
+    let (hd, window, rd, eps) = (32usize, 6usize, 8usize, 1e-6f32);
+    let kv_norm = noise(hd, 2.0);
+    let inv_freq: Vec<f32> = (0..rd / 2)
+        .map(|i| 1.0 / 10000f32.powf(i as f32 / 4.0))
+        .collect();
+
+    let mut host: Vec<f32> = Vec::new();
+    for pos in 0..window + 3 {
+        let raw = noise(hd, pos as f32 * 1.7 + 5.0);
+        // What the device is given: the window exactly as it stands now,
+        // padded to capacity the way its buffer always is.
+        let filled = host.len() / hd;
+        let mut seed = vec![0.0f32; window * hd];
+        seed[..host.len()].copy_from_slice(&host);
+
+        // The host advances its own copy.
+        let mut want = raw.clone();
+        cortiq_engine::dsv4::rms_weighted(&mut want, &kv_norm, eps);
+        cortiq_engine::dsv4::rope_tail(&mut want, &inv_freq, pos, rd, false);
+        host.extend_from_slice(&want);
+        if host.len() > window * hd {
+            let drop = host.len() - window * hd;
+            host.drain(..drop);
+        }
+
+        let mut got = Vec::new();
+        assert!(
+            cortiq_engine::gpu_wgpu::dsv4_window_place_for_test(
+                &raw, &kv_norm, &inv_freq, &seed, hd, window, filled, rd, eps, pos, &mut got,
+            ),
+            "запись окна отказала"
+        );
+        let r = rel(&host, &got[..host.len()]);
+        assert!(r < 1e-5, "поз={pos} заполнено={filled}: {r:.3e}");
+    }
+}
