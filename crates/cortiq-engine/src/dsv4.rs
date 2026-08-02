@@ -1107,7 +1107,15 @@ pub(crate) mod prof {
             MOE_NS.load(Ordering::Relaxed) as f64 / 1e6,
         );
         let all = ALL_NS.load(Ordering::Relaxed) as f64 / 1e6;
-        let hc = HC_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        // HC_NS wraps the FFN half's hc_block WHOLE, and moe_step runs
+        // inside that block — so the raw counter double-counts every MoE
+        // millisecond as hyper-connection time. Reported as the difference:
+        // the glue alone. (This inflation is what made moving the
+        // hyper-connections to the card look like a 19 ms win when the glue
+        // is ~4.)
+        let hc = (HC_NS.load(Ordering::Relaxed) as f64 / 1e6
+            - MOE_NS.load(Ordering::Relaxed) as f64 / 1e6)
+            .max(0.0);
         let hd = HEAD_NS.load(Ordering::Relaxed) as f64 / 1e6;
         eprintln!(
             "[dsv4-профиль] {calls} вызовов слоя за {toks} токенов | \
@@ -2366,7 +2374,7 @@ fn dsv4_two_frame_loop(
             .tid2eid
             .as_ref()
             .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id));
-        if !moe_frame(&[], l, cfg, li, &[], forced.as_deref(), pool, pair, &mut next) {
+        if !moe_frame(&[], l, cfg, li, &[], forced.as_deref(), pool, Some(&a_tail), pair, &mut next) {
             return false;
         }
         folded = next;
@@ -2611,8 +2619,10 @@ fn moe_frame(
     logits: &[f32],
     forced: Option<&[usize]>,
     pool: Option<&crate::pool::Pool>,
-    // The next layer's hyper-connection handover, done on the card.
-    hc: Option<(&crate::gpu_wgpu::Dsv4HcTail, &[f32])>,
+    // The state handover: expand always when the device owns the state,
+    // fold only when there is a next layer.
+    hc_cur: Option<&crate::gpu_wgpu::Dsv4HcTail>,
+    hc_next: Option<(&crate::gpu_wgpu::Dsv4HcTail, &[f32])>,
     out: &mut [f32],
 ) -> bool {
     macro_rules! no {
@@ -2678,7 +2688,7 @@ fn moe_frame(
         }),
     };
     let mut cold = Vec::new();
-    if !crate::gpu_wgpu::dsv4_moe_frame(&model, &w, g, hidden, &mut cold, hc, out) {
+    if !crate::gpu_wgpu::dsv4_moe_frame(&model, &w, g, hidden, &mut cold, hc_cur, hc_next, out) {
         return false;
     }
     // The picks the card had no room for, finished here and added in. Their
@@ -2797,7 +2807,7 @@ pub fn moe_step(
             .tid2eid
             .as_ref()
             .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id));
-        if moe_frame(hidden, l, cfg, li, &logits, forced.as_deref(), pool, None, out) {
+        if moe_frame(hidden, l, cfg, li, &logits, forced.as_deref(), pool, None, None, out) {
             // CMF_DSV4_MOE_CHECK=1 recomputes the same block on the CPU and
             // reports where they part. A wrong MoE does not fail — it answers
             // differently — and the toy agreed bit for bit while the release

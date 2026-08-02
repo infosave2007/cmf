@@ -18584,11 +18584,14 @@ pub fn dsv4_moe_frame(
     // `(expert, weight)` pairs the device left for the host, empty when the
     // whole packing was resident.
     cold_out: &mut Vec<(usize, f32)>,
-    // The same handover as the attention frame's: expand this half's output
-    // into the state, then fold and norm for the NEXT layer, and give back
-    // that instead of the MoE output. `next` carries the following layer's
-    // attention-half parameters.
-    hc: Option<(&Dsv4HcTail, &[f32])>,
+    // The state handover, split the way the layer frame splits it and for
+    // the same reason: the EXPANSION of this half's output into the state is
+    // unconditional whenever the device owns the state — the last layer has
+    // no next fold, but its MoE half still has to enter the state the head
+    // reads, and making the whole tail conditional is exactly how it did
+    // not. `hc_cur` drives the expand; `hc_next` the next layer's fold.
+    hc_cur: Option<&Dsv4HcTail>,
+    hc_next: Option<(&Dsv4HcTail, &[f32])>,
     out: &mut [f32],
 ) -> bool {
     macro_rules! no {
@@ -18777,6 +18780,11 @@ pub fn dsv4_moe_frame(
     // The layer's identity for the bind cache: its first expert's directory
     // index, which is unique per layer and already at hand.
     let lkey = w.experts.first().map(|e| e.0).unwrap_or(0);
+    if w.logits.is_empty() {
+        let rb = const_buf(c, bytemuck::cast_slice(&w.router[..n_route * g.hidden]));
+        let xin = frame_buf(c, 45, g.hidden * 4, true);
+        encode_f32matvec(c, &mut enc, &rb, &xin, &lg, n_route, g.hidden);
+    }
     {
         // NOT cached. This group holds `rp`, a CONTENT-keyed uniform: change a
         // flag and the uniform becomes a different buffer while the cached
@@ -18860,8 +18868,20 @@ pub fn dsv4_moe_frame(
         pass.set_bind_group(0, &bg_dn, &[]);
         pass.dispatch_workgroups(g.hidden as u32, 1, 1);
     }
-    // ── the hyper-connections for the NEXT layer, on the card ──
-    let hc_out = hc.map(|(h, next_norm)| {
+    // ── the state handover, on the card ──
+    if let Some(h) = hc_cur {
+        let state = frame_buf(c, 40, h.hc * g.hidden * 4, true);
+        let state2 = frame_buf(c, 46, h.hc * g.hidden * 4, true);
+        let hpost = frame_buf(c, 43, h.hc * 4, true);
+        let hcomb = frame_buf(c, 44, h.hc * h.hc * 4, true);
+        let hcp = uniform_mixed(
+            c,
+            [h.hc as u32, g.hidden as u32, h.sinkhorn_iters as u32],
+            h.hc_eps,
+        );
+        encode_hc_expand(c, &mut enc, &ob, &state2, &hpost, &hcomb, &state, &hcp, h.hc, g.hidden);
+    }
+    let hc_out = hc_next.map(|(h, next_norm)| {
         let mix_hc = (2 + h.hc) * h.hc;
         let state = frame_buf(c, 40, h.hc * g.hidden * 4, true);
         let state2 = frame_buf(c, 46, h.hc * g.hidden * 4, true);
@@ -18879,7 +18899,6 @@ pub fn dsv4_moe_frame(
         let nsc = const_buf(c, bytemuck::cast_slice(h.scale));
         let nbs = const_buf(c, bytemuck::cast_slice(&h.base[..mix_hc]));
         let nnw = const_buf(c, bytemuck::cast_slice(&next_norm[..g.hidden]));
-        encode_hc_expand(c, &mut enc, &ob, &state2, &hpost, &hcomb, &state, &hcp, h.hc, g.hidden);
         encode_f32matvec(c, &mut enc, &nfn, &state, &mixes, mix_hc, h.hc * g.hidden);
         encode_hc_fold(
             c, &mut enc, &state, &mixes, &nsc, &nbs, &folded, &hpost, &hcomb, &hcp,
