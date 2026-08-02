@@ -39,11 +39,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A CPU run, a UMA device and every non-Linux target keep the readahead.
 
 ### Known limitations
-- **The cold split is associated with a heap corruption that aborts the
-  process AFTER printing a correct answer** (`double free or corruption`).
-  The 0.5.45 binary aborted in 5 of 7 runs with the split on; a build of this
-  tree did not abort in 6, with no change on the `ppl` path to explain it, so
-  it is treated as unreproduced rather than fixed. Cause unknown.
+- **The process can abort at exit, after printing a correct answer**
+  (`double free or corruption`, `corrupted double-linked list`). Located
+  with AddressSanitizer, and it is not ours: a 48-byte block allocated by
+  `libEGL` while the NVIDIA driver compiles a shader is freed through the
+  Rust allocator on the `init → create_compute_pipeline → wgpu_hal::vulkan
+  → naga` path, and freed a second time by `libGLX_nvidia` at process exit.
+  Nothing in this crate writes out of bounds — results are unaffected, the
+  abort lands after the work is done. Seen on wgpu 30 with driver 580 on a
+  hand-registered GLVND EGL vendor; not reproduced elsewhere yet. Earlier
+  notes tied it to the cold split, which was coincidence: it aborts with the
+  split off, on both 60 GB and 94 GB budgets, in `ppl` and in `bench`.
 
 ## [0.5.45] — 2026-08-02
 
