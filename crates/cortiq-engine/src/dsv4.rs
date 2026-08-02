@@ -1151,13 +1151,19 @@ pub(crate) mod prof {
                     wt / calls as f64,
                 );
                 let gn = crate::gpu_wgpu::MOE_GPU_N.load(Ordering::Relaxed);
-                if gn > 0 {
+                let gns = crate::gpu_wgpu::MOE_GPU_NS[0].load(Ordering::Relaxed);
+                if gn > 0 && gns > 0 {
                     eprintln!(
-                        "[dsv4-профиль]   MoE НА КАРТЕ: {:.3} мс на вызов ({} замеров) — \
-                         сравните с ожиданием кадра",
-                        crate::gpu_wgpu::MOE_GPU_NS[0].load(Ordering::Relaxed) as f64
-                            / 1e6 / gn as f64,
-                        gn,
+                        "[dsv4-профиль]   MoE НА КАРТЕ: {:.3} мс на вызов ({gn} замеров)",
+                        gns as f64 / 1e6 / gn as f64,
+                    );
+                } else if gn > 0 {
+                    // Zero across thousands of samples is a broken query, not
+                    // an instant kernel, and printing it as a time is how a
+                    // profile starts lying.
+                    eprintln!(
+                        "[dsv4-профиль]   MoE НА КАРТЕ: метки вернули НОЛЬ на {gn} замерах — \
+                         запрос времени не сработал, число не использовать"
                     );
                 }
                 eprintln!(
