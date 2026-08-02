@@ -1037,7 +1037,11 @@ pub(crate) mod prof {
             // that happens once. Everything measured before the SECOND token
             // starts is therefore thrown away, and the report describes
             // steady state, which is the only thing worth optimising.
-            if TOKENS.fetch_add(1, Ordering::Relaxed) == 1 {
+            // `swap` and not a TOKENS comparison: resetting TOKENS to 1 made
+            // the test true again on every later token, so the report
+            // described one token instead of the run.
+            if TOKENS.fetch_add(1, Ordering::Relaxed) == 1 && !ZEROED.swap(true, Ordering::Relaxed)
+            {
                 for a in [&ATTN_NS, &MOE_NS, &HC_NS, &HEAD_NS, &ALL_NS, &CALLS] {
                     a.store(0, Ordering::Relaxed);
                 }
@@ -1057,6 +1061,8 @@ pub(crate) mod prof {
         }
     }
     static REPORT: AtomicBool = AtomicBool::new(false);
+    /// The one-time "drop the first token's numbers" latch.
+    static ZEROED: AtomicBool = AtomicBool::new(false);
 
     pub fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
