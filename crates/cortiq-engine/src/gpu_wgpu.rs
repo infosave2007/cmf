@@ -5683,6 +5683,16 @@ const ATTEND_CK: usize = 128;
 const ATTEND_SPLIT_MIN: usize = 256;
 
 struct Ctx {
+    /// The instance and adapter the device came from, kept for exactly as
+    /// long as the device — which Vulkan requires and we were not doing.
+    /// They were locals in `init()`, so `VkInstance` was destroyed while a
+    /// `VkDevice` made from it lived on in the static below. AddressSanitizer
+    /// caught what that costs: a 48-byte block allocated by libEGL is freed
+    /// on the way out of `init`, and freed a second time by the NVIDIA driver
+    /// at process exit — the `double free or corruption` / `corrupted
+    /// double-linked list` abort that has been landing after correct answers.
+    _instance: wgpu::Instance,
+    _adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     matvec: wgpu::ComputePipeline,
@@ -6402,6 +6412,8 @@ fn init() -> Result<Ctx, String> {
     }
 
     Ok(Ctx {
+        _instance: instance,
+        _adapter: adapter,
         device,
         queue,
         matvec,
