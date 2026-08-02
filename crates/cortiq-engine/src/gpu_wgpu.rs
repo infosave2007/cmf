@@ -17339,13 +17339,6 @@ pub fn dsv4_moe_frame(
 
     // ── routing, on the device, straight into the msel/mwt the kernels read ──
     let lg = frame_up(c, 16, bytemuck::cast_slice(&w.logits[..n_route]));
-    // KNOWN DEFECT, cold path only: nothing the kernel writes into rt_cold
-    // reaches the host. Proved by writing an UNCONDITIONAL value there and
-    // reading back all-empty, so the router is not the suspect — the readback
-    // of that buffer is. Everything else about the cold path checks out: the
-    // remap arrives correct ([0..7, MAX, MAX, ...]), subset is true, the
-    // flags carry bit 4 and the shared slot. Start there next time.
-    //
     // NOT const_buf: that cache is keyed on the host ADDRESS, which is only
     // meaningful for model weights that outlive the process. The bias arrives
     // in a Vec built per layer, and the allocator hands back the same address
