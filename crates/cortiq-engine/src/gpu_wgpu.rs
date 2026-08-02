@@ -5878,6 +5878,13 @@ struct Ctx {
     /// per token — 430 allocations a token on the release — is most of what a
     /// submission costs. Created once, written thereafter.
     dsv4_scratch: Mutex<HashMap<(u8, usize), wgpu::Buffer>>,
+    /// One compressor's streams, alive across tokens ON THE DEVICE:
+    /// `[pending_kv, pending_score, prev_kv, prev_score]` keyed by
+    /// (kind, kv_id, layer) — kind 0 is the attention compressor, 1 the
+    /// indexer's own. Keeping these here is what lets a token advance the
+    /// compressor without the host reading anything back: the streams are
+    /// the only thing that carried state across the seam.
+    dsv4_comp: Mutex<HashMap<(u8, u64, usize), [wgpu::Buffer; 4]>>,
     /// (epoch, bind groups) for the dsv4 frames — see `cached_bind`.
     dsv4_binds: Mutex<(u64, HashMap<(u8, u64, usize), wgpu::BindGroup>)>,
     /// Access clock for the aging above — one tick per weight lookup.
@@ -6548,6 +6555,7 @@ fn init() -> Result<Ctx, String> {
         weight_bufs: Mutex::new(HashMap::new()),
         dsv4_kv: Mutex::new(HashMap::new()),
         dsv4_scratch: Mutex::new(HashMap::new()),
+        dsv4_comp: Mutex::new(HashMap::new()),
         dsv4_binds: Mutex::new((0, HashMap::new())),
         res_clock: std::sync::atomic::AtomicU64::new(0),
         uniforms: Mutex::new(HashMap::new()),
@@ -16788,7 +16796,12 @@ fn const_buf(c: &Ctx, data: &[u8]) -> wgpu::Buffer {
     let b = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("dsv4-const"),
         size: data.len().max(4) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        // COPY_SRC too: the compressor frame slices one window's worth of
+        // `ape` out of the parked table with a device-to-device copy,
+        // which beats re-uploading that slice every token.
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
     c.queue.write_buffer(&b, 0, data);
@@ -16920,6 +16933,347 @@ fn encode_sparse_attend2(
         pass.set_pipeline(&c.sa_apply);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(((nh * hd) as u32).div_ceil(256), 1, 1);
+    }
+}
+
+/// `y += w·d`, both device-side, `n` floats.
+fn encode_axpy(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    d: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    w: f32,
+    n: usize,
+    bkey: (u8, u64, usize),
+) {
+    let bind = cached_bind(c, bkey, || {
+        let p = uniform_mixed(c, [n as u32, 0, 0], w);
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.axpy.get_bind_group_layout(0),
+            entries: &[bind_buf(0, d), bind_buf(1, y), bind_buf(2, &p)],
+        })
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.axpy);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+}
+
+/// The compressor's fold: a softmax over the slot axis PER DIMENSION, then
+/// the weighted sum. `width` here is the OUTPUT width — half the projection
+/// when the windows overlap, which is also the stride the kernel assumes.
+#[allow(clippy::too_many_arguments)]
+fn encode_kv_pool(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    prev_kv: &wgpu::Buffer,
+    prev_sc: &wgpu::Buffer,
+    cur_kv: &wgpu::Buffer,
+    cur_sc: &wgpu::Buffer,
+    ape: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    g: Dsv4CompGeom,
+    have_prev: bool,
+) {
+    let ew = if g.overlap { g.width / 2 } else { g.width };
+    let slots = if g.overlap { 2 * g.ratio } else { g.ratio };
+    // The bias is folded in on arrival when the windows overlap, so the
+    // kernel must not add it a second time — it does so only for the flat
+    // compressor, which has nowhere else to put it.
+    let use_ape = !g.overlap;
+    let flags = (g.overlap as u32) | ((have_prev as u32) << 1) | ((use_ape as u32) << 2);
+    let p = uniform_u32x4(c, [slots as u32, ew as u32, g.ratio as u32, flags]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.kv_pool.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, prev_kv),
+            bind_buf(1, prev_sc),
+            bind_buf(2, cur_kv),
+            bind_buf(3, cur_sc),
+            bind_buf(4, ape),
+            bind_buf(5, out),
+            bind_buf(6, &p),
+        ],
+    });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&c.kv_pool);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((ew as u32).div_ceil(256), 1, 1);
+}
+
+/// What one compressor needs from the model, by directory index (the two
+/// projections are q4tp) and by value (the small f32 pieces).
+pub struct Dsv4CompW<'a> {
+    pub wkv: usize,
+    pub wgate: usize,
+    pub norm: &'a [f32],
+    /// `[ratio, width]` — the in-window position bias.
+    pub ape: &'a [f32],
+}
+
+#[derive(Clone, Copy)]
+pub struct Dsv4CompGeom {
+    /// `wkv.rows()`; the folded entry is half this when the windows overlap.
+    pub width: usize,
+    pub hidden: usize,
+    pub ratio: usize,
+    pub overlap: bool,
+    pub rope_dim: usize,
+    pub eps: f32,
+}
+
+/// Advance ONE compressor by one token, entirely on the device, and fold the
+/// window when it closes.
+///
+/// The host's only inputs are the position and the hidden state that is
+/// already there; the pending and previous streams live in `dsv4_comp` and
+/// are never read back. That is the whole point: the compressor was the
+/// reason every layer had to come back to the CPU mid-token.
+///
+/// Returns `Some(offset)` — in floats, into the layer's cache buffer — when
+/// this token closed a window and an entry was appended there, `Some` with
+/// no write is impossible, and `None` when the window is still filling or
+/// the frame declined. `n_comp` is how many entries the cache already holds.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_compressor_frame(
+    model: &Arc<CmfModel>,
+    w: &Dsv4CompW,
+    g: Dsv4CompGeom,
+    kind: u8,
+    kv_id: u64,
+    li: usize,
+    hidden: &wgpu::Buffer,
+    pos: usize,
+    inv_freq: &[f32],
+    // Where a folded entry goes: the layer's cache and the float offset of
+    // the first free compressed slot.
+    dst: &wgpu::Buffer,
+    dst_off: usize,
+    enc: &mut wgpu::CommandEncoder,
+) -> Option<usize> {
+    let c = ctx()?;
+    let ew = if g.overlap { g.width / 2 } else { g.width };
+    if g.width == 0 || g.ratio == 0 || g.hidden % 32 != 0 {
+        return None;
+    }
+    let bytes = model.primary_bytes();
+    let mut wb = Vec::with_capacity(2);
+    for &idx in &[w.wkv, w.wgate] {
+        let e = model.tensors.get(idx)?;
+        if e.dtype != cortiq_core::TensorDtype::Q4TiledP || e.shape.len() != 2 {
+            return None;
+        }
+        let abs = model.entry_abs_offset(e)?;
+        let plen = e.nbytes as usize;
+        bytes.get(abs..abs + plen)?;
+        wb.push(weight_buffer(
+            c,
+            (bytes.as_ptr() as usize, idx),
+            &bytes[abs..abs + plen],
+        )?);
+    }
+
+    let ckv = frame_buf(c, 70 + kind, g.width * 4, false);
+    let csc = frame_buf(c, 72 + kind, g.width * 4, false);
+    encode_q4tp_mv1(c, enc, &wb[0], hidden, &ckv, g.width, g.hidden, (80 + kind, kv_id, li));
+    encode_q4tp_mv1(c, enc, &wb[1], hidden, &csc, g.width, g.hidden, (82 + kind, kv_id, li));
+    comp_state_step(c, w, g, kind, kv_id, li, &ckv, &csc, pos, inv_freq, dst, dst_off, enc)
+}
+
+/// Everything after the two projections: the slot bookkeeping, the fold when
+/// the window closes, and the shuffle of pending into previous. Split out
+/// because this — not the matvecs, which have their own parity tests — is
+/// what is new here, and it can be driven from a test with the projections
+/// handed in.
+#[allow(clippy::too_many_arguments)]
+fn comp_state_step(
+    c: &Ctx,
+    w: &Dsv4CompW,
+    g: Dsv4CompGeom,
+    kind: u8,
+    kv_id: u64,
+    li: usize,
+    ckv: &wgpu::Buffer,
+    csc: &wgpu::Buffer,
+    pos: usize,
+    inv_freq: &[f32],
+    dst: &wgpu::Buffer,
+    dst_off: usize,
+    enc: &mut wgpu::CommandEncoder,
+) -> Option<usize> {
+    let ew = if g.overlap { g.width / 2 } else { g.width };
+    let span = g.ratio * g.width;
+    let st = {
+        let mut m = c.dsv4_comp.lock().unwrap();
+        m.entry((kind, kv_id, li))
+            .or_insert_with(|| {
+                let mk = || {
+                    c.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("dsv4-comp-stream"),
+                        size: (span * 4).max(4) as u64,
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_SRC
+                            | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
+                };
+                [mk(), mk(), mk(), mk()]
+            })
+            .clone()
+    };
+    let (pend_kv, pend_sc, prev_kv, prev_sc) = (&st[0], &st[1], &st[2], &st[3]);
+    // This token's slot in the window, and whether it closes it. Both are a
+    // function of the position alone, so no counter has to live on the card.
+    let slot = pos % g.ratio;
+    let folds = slot + 1 == g.ratio;
+    // A previous window exists once one has closed.
+    let have_prev = pos + 1 > g.ratio;
+
+    if g.overlap {
+        // The reference biases the score as the token ARRIVES and keeps it
+        // biased across the shift, so `ape` is added once, here, and the
+        // pooling kernel is told not to add it again.
+        let ape_all = const_buf(c, bytemuck::cast_slice(w.ape));
+        // `true`: this one is a copy DESTINATION (the slice of `ape`).
+        let ape_slot = frame_buf(c, 74 + kind, g.width * 4, true);
+        enc.copy_buffer_to_buffer(
+            &ape_all,
+            (slot * g.width * 4) as u64,
+            &ape_slot,
+            0,
+            (g.width * 4) as u64,
+        );
+        encode_axpy(c, enc, &ape_slot, &csc, 1.0, g.width, (84 + kind, kv_id, li));
+    }
+    enc.copy_buffer_to_buffer(&ckv, 0, pend_kv, (slot * g.width * 4) as u64, (g.width * 4) as u64);
+    enc.copy_buffer_to_buffer(&csc, 0, pend_sc, (slot * g.width * 4) as u64, (g.width * 4) as u64);
+    if !folds {
+        return None;
+    }
+
+    let folded = frame_buf(c, 76 + kind, ew * 4, false);
+    let normed = frame_buf(c, 78 + kind, ew * 4, false);
+    encode_kv_pool(
+        c, enc, prev_kv, prev_sc, pend_kv, pend_sc,
+        &const_buf(c, bytemuck::cast_slice(w.ape)),
+        &folded, g, have_prev,
+    );
+    let nw = const_buf(c, bytemuck::cast_slice(&w.norm[..ew]));
+    encode_rmsnorm(c, enc, &folded, &nw, &normed, ew, g.eps, (86 + kind, kv_id, li));
+    // The entry carries a window key's rope tail, at the position of the
+    // window's FIRST token — not this one.
+    let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..g.rope_dim / 2]));
+    let posb = frame_up(c, 79 + kind, bytemuck::cast_slice(&[(pos + 1 - g.ratio) as f32, g.eps]));
+    encode_rope_heads(c, enc, &normed, &freq, &posb, 1, ew, g.rope_dim, false, false,
+        (88 + kind, kv_id, li));
+    enc.copy_buffer_to_buffer(&normed, 0, dst, (dst_off * 4) as u64, (ew * 4) as u64);
+    if g.overlap {
+        // The window that just closed becomes the previous one — the fold
+        // reads half its dimensions from that stride.
+        enc.copy_buffer_to_buffer(pend_kv, 0, prev_kv, 0, (span * 4) as u64);
+        enc.copy_buffer_to_buffer(pend_sc, 0, prev_sc, 0, (span * 4) as u64);
+    }
+    Some(dst_off)
+}
+
+/// Drive the device-side compressor state with the projections handed in,
+/// one token per call, and return the folded entry on the token that closes
+/// a window. The frame does exactly this after its two matvecs; giving the
+/// projections from the host is what lets a test compare the STATE — the
+/// slots, the fold timing, the previous-window shuffle, the rope position —
+/// against `dsv4::compressor_step` without a model file.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_comp_state_for_test(
+    ckv: &[f32],
+    csc: &[f32],
+    norm: &[f32],
+    ape: &[f32],
+    inv_freq: &[f32],
+    width: usize,
+    ratio: usize,
+    overlap: bool,
+    rope_dim: usize,
+    eps: f32,
+    pos: usize,
+    kv_id: u64,
+    out: &mut Vec<f32>,
+) -> Option<bool> {
+    let c = ctx()?;
+    let g = Dsv4CompGeom {
+        width,
+        hidden: 0,
+        ratio,
+        overlap,
+        rope_dim,
+        eps,
+    };
+    let ew = if overlap { width / 2 } else { width };
+    let w = Dsv4CompW {
+        wkv: 0,
+        wgate: 0,
+        norm,
+        ape,
+    };
+    // Explicit usages: these are copy sources (into the pending streams) and
+    // the destination is both written by a copy and read back.
+    let up = |data: &[f32]| {
+        use wgpu::util::DeviceExt;
+        c.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            })
+    };
+    let kb = up(&ckv[..width]);
+    let sb = up(&csc[..width]);
+    let dst = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (ew * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let folded = comp_state_step(
+        c, &w, g, 9, kv_id, 0, &kb, &sb, pos, inv_freq, &dst, 0, &mut enc,
+    )
+    .is_some();
+    if !folded {
+        c.queue.submit(Some(enc.finish()));
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        return Some(false);
+    }
+    out.clear();
+    out.resize(ew, 0.0);
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        (ew * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "comp-test-stage",
+    );
+    let ok = readback(c, enc, &dst, &stage, (ew * 4) as u64, out);
+    drop(sc);
+    ok.then_some(true)
+}
+
+/// Drop a sequence's compressor streams (called with the rest of its state).
+pub fn dsv4_compressor_forget(kv_id: u64) {
+    if let Some(c) = ctx() {
+        c.dsv4_comp.lock().unwrap().retain(|k, _| k.1 != kv_id);
     }
 }
 

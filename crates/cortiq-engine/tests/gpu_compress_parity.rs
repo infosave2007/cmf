@@ -157,3 +157,92 @@ fn device_top_k_matches_the_cpu() {
         assert_eq!(cpu32, gpu, "top-k разошлись при n={n} k={k}");
     }
 }
+
+/// The compressor's STATE on the device, over a run of tokens: the slot a
+/// token lands in, the stride at which the window closes, the shuffle of the
+/// closed window into `prev`, and the rope position of the folded entry —
+/// which is the window's FIRST token, not the one that closed it.
+///
+/// The projections are handed in rather than computed, because the q4tp
+/// matvec has its own parity test and this one is about the bookkeeping that
+/// used to live on the host between every pair of GPU submissions.
+#[test]
+fn device_compressor_state_matches_the_cpu() {
+    match cortiq_engine::gpu_wgpu::selected_and_up() {
+        None => {
+            eprintln!("wgpu не запрошен (CMF_GPU=wgpu) — пропуск");
+            return;
+        }
+        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(true) => {}
+    }
+    // Both shapes the release uses: the overlapping ratio-4 compressor and
+    // the flat one, whose bias is added inside the pooling kernel instead.
+    for (overlap, ratio) in [(true, 4usize), (false, 2usize)] {
+        let width = if overlap { 64 } else { 32 };
+        let ew = if overlap { width / 2 } else { width };
+        let rd = 8;
+        let eps = 1e-6;
+        let norm = noise(ew, 3.0);
+        let ape = noise(ratio * width, 5.0);
+        let inv_freq: Vec<f32> = (0..rd / 2).map(|i| 1.0 / (10000f32.powf(i as f32 / 4.0))).collect();
+        let kv_id = if overlap { 7001 } else { 7002 };
+
+        // The CPU reference, kept by hand so the state is visible.
+        let (mut pend_kv, mut pend_sc) = (Vec::new(), Vec::new());
+        let (mut prev_kv, mut prev_sc) = (Vec::new(), Vec::new());
+
+        for pos in 0..3 * ratio {
+            let ckv = noise(width, pos as f32 * 1.3 + 11.0);
+            let mut csc = noise(width, pos as f32 * 0.9 + 23.0);
+            if overlap {
+                let slot = pos % ratio;
+                for (c, a) in csc.iter_mut().zip(&ape[slot * width..(slot + 1) * width]) {
+                    *c += a;
+                }
+            }
+            pend_kv.extend_from_slice(&ckv);
+            pend_sc.extend_from_slice(&csc);
+            let cpu = if pend_kv.len() / width < ratio {
+                None
+            } else {
+                let mut folded = vec![0.0f32; ew];
+                if overlap {
+                    cortiq_engine::dsv4::compress_window_overlap(
+                        &prev_kv, &prev_sc, &pend_kv, &pend_sc, ratio, ew, &mut folded,
+                    );
+                    prev_kv = std::mem::take(&mut pend_kv);
+                    prev_sc = std::mem::take(&mut pend_sc);
+                } else {
+                    cortiq_engine::dsv4::compress_window(
+                        &pend_kv, &pend_sc, &ape, ratio, width, &mut folded,
+                    );
+                }
+                cortiq_engine::dsv4::rms_weighted(&mut folded, &norm, eps);
+                cortiq_engine::dsv4::rope_tail(&mut folded, &inv_freq, pos + 1 - ratio, rd, false);
+                pend_kv.clear();
+                pend_sc.clear();
+                Some(folded)
+            };
+
+            // The device, driven the same way. `csc` already carries the
+            // overlap bias, exactly as the frame's axpy leaves it.
+            let mut got = Vec::new();
+            let folded = cortiq_engine::gpu_wgpu::dsv4_comp_state_for_test(
+                &ckv, &csc, &norm, &ape, &inv_freq, width, ratio, overlap, rd, eps, pos,
+                kv_id, &mut got,
+            )
+            .expect("кадр компрессора отказал");
+
+            assert_eq!(
+                folded,
+                cpu.is_some(),
+                "перекрытие={overlap} поз={pos}: окно закрылось не там"
+            );
+            if let Some(want) = cpu {
+                let r = rel(&want, &got);
+                assert!(r < 1e-5, "перекрытие={overlap} поз={pos}: {r:.3e}");
+            }
+        }
+    }
+}
