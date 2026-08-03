@@ -5512,6 +5512,197 @@ fn hc_pre_fold(@builtin(local_invocation_index) lid: u32) {
     }
 }
 
+// The whole hyper-connection join in ONE dispatch.
+//
+// Expand, the mix projection, the fold with its Sinkhorn, and the norm are
+// four dependent steps over a state of hc·dim floats — 16 384 on the
+// release. As four dispatches they cost four kernel launches a piece and
+// this happens TWICE a layer, which on 42 layers is 336 launches a token:
+// the skip probe put "everything that is neither attention nor MoE" at
+// 27.9 ms of a 51.3 ms chain, and this is the largest single item in it.
+//
+// One workgroup owns all four, with barriers where a dispatch boundary used
+// to be. That is a real trade — 256 threads instead of the whole card — but
+// the arithmetic is ~400k MACs and a launch is ~30 µs, so the trade is not
+// close. `post`/`comb` are read by the expand and WRITTEN by the fold, in
+// that order, which the barrier between them makes safe.
+
+struct HbP { hc: u32, dim: u32, iters: u32, eps: f32, mix_hc: u32, _a: u32, _b: u32, _c: u32 };
+
+@group(0) @binding(0)  var<storage, read>       hb_x     : array<f32>;   // dim
+@group(0) @binding(1)  var<storage, read>       hb_res   : array<f32>;   // hc*dim
+@group(0) @binding(2)  var<storage, read_write> hb_post  : array<f32>;   // hc
+@group(0) @binding(3)  var<storage, read_write> hb_comb  : array<f32>;   // hc*hc
+@group(0) @binding(4)  var<storage, read>       hb_mixw  : array<f32>;   // mix_hc*hc*dim
+@group(0) @binding(5)  var<storage, read>       hb_sc    : array<f32>;   // 3
+@group(0) @binding(6)  var<storage, read>       hb_base  : array<f32>;   // mix_hc
+@group(0) @binding(7)  var<storage, read>       hb_nw    : array<f32>;   // dim
+@group(0) @binding(8)  var<storage, read_write> hb_state : array<f32>;   // hc*dim
+@group(0) @binding(9)  var<storage, read_write> hb_fold  : array<f32>;   // dim
+@group(0) @binding(10) var<storage, read_write> hb_norm  : array<f32>;   // dim
+@group(0) @binding(11) var<uniform>             hb_p     : HbP;
+
+var<workgroup> hb_red: array<f32, 256>;
+var<workgroup> hb_mix: array<f32, 64>;
+var<workgroup> hb_pre: array<f32, 8>;
+var<workgroup> hb_cmb: array<f32, 64>;
+var<workgroup> hb_rsq: f32;
+
+const HB_LANES: u32 = 8u;   // threads per mix output; 256/8 = 32 outputs max
+
+@compute @workgroup_size(256)
+fn hc_block(@builtin(local_invocation_index) lid: u32) {
+    let hc = hb_p.hc;
+    let dim = hb_p.dim;
+    let n = hc * dim;
+    let mh = hb_p.mix_hc;
+
+    // ── 1. expand ─────────────────────────────────────────────────────────
+    var i = lid;
+    loop {
+        if (i >= n) { break; }
+        let j = i / dim;
+        let d = i % dim;
+        var y = hb_post[j] * hb_x[d];
+        for (var k = 0u; k < hc; k = k + 1u) {
+            y = y + hb_comb[k * hc + j] * hb_res[k * dim + d];
+        }
+        hb_state[i] = y;
+        i = i + 256u;
+    }
+    workgroupBarrier();
+
+    // ── 2. the mix projection, all outputs at once ────────────────────────
+    // Eight threads to an output, striding the shared axis: one barrier for
+    // the lot instead of one tree reduction per output.
+    let o = lid / HB_LANES;
+    let sub = lid % HB_LANES;
+    var acc = 0.0;
+    if (o < mh) {
+        let base = o * n;
+        var t = sub;
+        loop {
+            if (t >= n) { break; }
+            acc = acc + hb_mixw[base + t] * hb_state[t];
+            t = t + HB_LANES;
+        }
+    }
+    hb_red[lid] = acc;
+    workgroupBarrier();
+    if (sub == 0u && o < mh) {
+        var sm = 0.0;
+        for (var t = 0u; t < HB_LANES; t = t + 1u) { sm = sm + hb_red[o * HB_LANES + t]; }
+        hb_mix[o] = sm;
+    }
+
+    // ── 3. rsqrt(mean(state^2) + eps), over ALL copies ────────────────────
+    var acc2 = 0.0;
+    var i2 = lid;
+    loop {
+        if (i2 >= n) { break; }
+        let v = hb_state[i2];
+        acc2 = acc2 + v * v;
+        i2 = i2 + 256u;
+    }
+    workgroupBarrier();           // hb_red is being reused
+    hb_red[lid] = acc2;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { hb_red[lid] = hb_red[lid] + hb_red[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) { hb_rsq = inverseSqrt(hb_red[0] / f32(n) + hb_p.eps); }
+    workgroupBarrier();
+    let rsq = hb_rsq;
+
+    // ── 4. pre / post / comb, thread 0: hc is 4 and the Sinkhorn is a
+    //       sequential fixed point over a 4x4.
+    if (lid == 0u) {
+        for (var j = 0u; j < hc; j = j + 1u) {
+            let m = hb_mix[j] * rsq * hb_sc[0] + hb_base[j];
+            hb_pre[j] = 1.0 / (1.0 + exp(-m)) + hb_p.eps;
+            let m2 = hb_mix[hc + j] * rsq * hb_sc[1] + hb_base[hc + j];
+            hb_post[j] = 2.0 / (1.0 + exp(-m2));
+        }
+        for (var j = 0u; j < hc; j = j + 1u) {
+            var mx = -1e30;
+            for (var k = 0u; k < hc; k = k + 1u) {
+                let v = hb_mix[2u * hc + j * hc + k] * rsq * hb_sc[2]
+                      + hb_base[2u * hc + j * hc + k];
+                hb_cmb[j * hc + k] = v;
+                mx = max(mx, v);
+            }
+            var sum = 0.0;
+            for (var k = 0u; k < hc; k = k + 1u) {
+                let e = exp(hb_cmb[j * hc + k] - mx);
+                hb_cmb[j * hc + k] = e;
+                sum = sum + e;
+            }
+            for (var k = 0u; k < hc; k = k + 1u) {
+                hb_cmb[j * hc + k] = hb_cmb[j * hc + k] / sum + hb_p.eps;
+            }
+        }
+        for (var k = 0u; k < hc; k = k + 1u) {
+            var sum = 0.0;
+            for (var j = 0u; j < hc; j = j + 1u) { sum = sum + hb_cmb[j * hc + k]; }
+            for (var j = 0u; j < hc; j = j + 1u) {
+                hb_cmb[j * hc + k] = hb_cmb[j * hc + k] / (sum + hb_p.eps);
+            }
+        }
+        for (var it = 1u; it < hb_p.iters; it = it + 1u) {
+            for (var j = 0u; j < hc; j = j + 1u) {
+                var sum = 0.0;
+                for (var k = 0u; k < hc; k = k + 1u) { sum = sum + hb_cmb[j * hc + k]; }
+                for (var k = 0u; k < hc; k = k + 1u) {
+                    hb_cmb[j * hc + k] = hb_cmb[j * hc + k] / (sum + hb_p.eps);
+                }
+            }
+            for (var k = 0u; k < hc; k = k + 1u) {
+                var sum = 0.0;
+                for (var j = 0u; j < hc; j = j + 1u) { sum = sum + hb_cmb[j * hc + k]; }
+                for (var j = 0u; j < hc; j = j + 1u) {
+                    hb_cmb[j * hc + k] = hb_cmb[j * hc + k] / (sum + hb_p.eps);
+                }
+            }
+        }
+        for (var j = 0u; j < hc * hc; j = j + 1u) { hb_comb[j] = hb_cmb[j]; }
+    }
+    workgroupBarrier();
+
+    // ── 5. fold, then the norm over it ────────────────────────────────────
+    var acc3 = 0.0;
+    var d = lid;
+    loop {
+        if (d >= dim) { break; }
+        var y = 0.0;
+        for (var j = 0u; j < hc; j = j + 1u) {
+            y = y + hb_pre[j] * hb_state[j * dim + d];
+        }
+        hb_fold[d] = y;
+        acc3 = acc3 + y * y;
+        d = d + 256u;
+    }
+    hb_red[lid] = acc3;
+    workgroupBarrier();
+    stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { hb_red[lid] = hb_red[lid] + hb_red[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let inv = inverseSqrt(hb_red[0] / f32(dim) + hb_p.eps);
+    var d2 = lid;
+    loop {
+        if (d2 >= dim) { break; }
+        hb_norm[d2] = hb_fold[d2] * inv * hb_nw[d2];
+        d2 = d2 + 256u;
+    }
+}
+
 // expand: state[j*dim+d] = post[j]*x[d] + sum_k comb[k*hc+j]*residual[k*dim+d]
 // Summing over the FIRST index of comb, as the reference does — reading it
 // the other way transposes the mixing and is not detectable by eye.
@@ -5768,6 +5959,7 @@ struct Ctx {
     kv_pool: wgpu::ComputePipeline,
     index_scores: wgpu::ComputePipeline,
     top_k_index: wgpu::ComputePipeline,
+    hc_block: wgpu::ComputePipeline,
     blit: wgpu::ComputePipeline,
     idx_build: wgpu::ComputePipeline,
     moe_route: wgpu::ComputePipeline,
@@ -6312,6 +6504,7 @@ fn init() -> Result<Ctx, String> {
     let kv_pool = pipe("kv_pool");
     let index_scores = pipe("index_scores");
     let top_k_index = pipe("top_k_index");
+    let hc_block = pipe("hc_block");
     let blit = pipe("blit");
     let idx_build = pipe("idx_build");
     let moe_route = pipe("moe_route");
@@ -6530,6 +6723,7 @@ fn init() -> Result<Ctx, String> {
         kv_pool,
         index_scores,
         top_k_index,
+        hc_block,
         blit,
         idx_build,
         moe_route,
@@ -16846,6 +17040,14 @@ pub struct Dsv4Prep<'a> {
 /// place, so the delta in tok/s is that stage's real share of the token.
 /// Neither dispatch counting nor pass counting predicted the frame
 /// correctly on the qwen graph; there is no reason to trust them here.
+/// `CMF_DSV4_HCFUSE=0` reverts the fused hyper-connection join to its four
+/// dispatches — the bisect handle for a kernel that folds four steps and a
+/// Sinkhorn into one workgroup.
+fn hc_fuse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_HCFUSE").map(|v| v != "0").unwrap_or(true))
+}
+
 fn dsv4_skip(what: &str) -> bool {
     static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     S.get_or_init(|| std::env::var("CMF_DSV4_SKIP").unwrap_or_default())
@@ -17037,6 +17239,13 @@ fn dsv4_layer_frame_enc(
     let mut copy_qn = false;
     {
         let mut pass = begin_pass(enc);
+        // Four dispatches — expand, mix, fold, norm — in one. `hc_fuse()`
+        // reverts to the four for a bisect.
+        if hc_fuse() {
+            encode_hc_block_p(&mut pass, c, &ao, &state, &hpost, &hcomb, &ffn_fn, &ffn_sc,
+                &ffn_bs, &ffn_nw, &state2, &folded, &x2, hc, dim, mix_hc, g.sinkhorn_iters,
+                a.eps, (172, kv_id, li));
+        } else {
         encode_hc_expand_k_p(&mut pass, c, &ao, &state, &hpost, &hcomb, &state2, &hcp, hc, dim,
             (120, kv_id, li));
         encode_f32matvec_k_p(&mut pass, c, &ffn_fn, &state2, &mixes, mix_hc, hc * dim,
@@ -17044,6 +17253,7 @@ fn dsv4_layer_frame_enc(
         encode_hc_fold_k_p(&mut pass, c, &state2, &mixes, &ffn_sc, &ffn_bs, &folded, &hpost,
             &hcomb, &hcp, (122, kv_id, li));
         encode_rmsnorm_p(&mut pass, c, &folded, &ffn_nw, &x2, dim, a.eps, (50, kv_id, li));
+        }
 
         // ── MoE half ──
         encode_f32matvec_k_p(&mut pass, c, &router, &x2, &logit_b, n_pack, m.hidden,
@@ -17061,11 +17271,24 @@ fn dsv4_layer_frame_enc(
             let nfn = const_buf(c, bytemuck::cast_slice(nf));
             let nsc = const_buf(c, bytemuck::cast_slice(w.hc_next_scale));
             let nbs = const_buf(c, bytemuck::cast_slice(&w.hc_next_base[..mix_hc]));
+            if hc_fuse() {
+                // The expand for this half already ran above (it writes the
+                // state the MoE half consumed), so only mix, fold and norm
+                // are left — the fused kernel would redo the expand from a
+                // state it just produced. Three dispatches stay three.
+                encode_f32matvec_k_p(&mut pass, c, &nfn, &state, &mixes, mix_hc, hc * dim,
+                    (125, kv_id, li));
+                encode_hc_fold_k_p(&mut pass, c, &state, &mixes, &nsc, &nbs, &folded, &hpost,
+                    &hcomb, &hcp, (126, kv_id, li));
+                encode_rmsnorm_p(&mut pass, c, &folded, &next_nw, &x2, dim, a.eps,
+                    (51, kv_id, li));
+            } else {
             encode_f32matvec_k_p(&mut pass, c, &nfn, &state, &mixes, mix_hc, hc * dim,
                 (125, kv_id, li));
             encode_hc_fold_k_p(&mut pass, c, &state, &mixes, &nsc, &nbs, &folded, &hpost,
                 &hcomb, &hcp, (126, kv_id, li));
             encode_rmsnorm_p(&mut pass, c, &folded, &next_nw, &x2, dim, a.eps, (51, kv_id, li));
+            }
             // The next layer's LoRA vector, but only when the host is not
             // going to hand it over anyway — the indexer needs `qr` there, so
             // today it projects it regardless and computing it twice is waste.
@@ -17744,6 +17967,67 @@ fn ts_pair(c: &Ctx, which: usize) -> Option<wgpu::ComputePassTimestampWrites<'_>
 /// (a pass of its own, so the query set has boundaries to write) and the
 /// fused one (a dispatch inside the layer's pass).
 #[allow(clippy::too_many_arguments)]
+/// The fused hyper-connection join: expand, mix, fold, norm — one dispatch.
+#[allow(clippy::too_many_arguments)]
+fn encode_hc_block_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
+    x: &wgpu::Buffer,
+    res: &wgpu::Buffer,
+    post: &wgpu::Buffer,
+    comb: &wgpu::Buffer,
+    mixw: &wgpu::Buffer,
+    sc: &wgpu::Buffer,
+    base: &wgpu::Buffer,
+    nw: &wgpu::Buffer,
+    state: &wgpu::Buffer,
+    fold: &wgpu::Buffer,
+    norm: &wgpu::Buffer,
+    hc: usize,
+    dim: usize,
+    mix_hc: usize,
+    iters: usize,
+    eps: f32,
+    bkey: (u8, u64, usize),
+) {
+    let bind = cached_bind(c, bkey, || {
+        let p = uniform_u32x8(
+            c,
+            [
+                hc as u32,
+                dim as u32,
+                iters as u32,
+                eps.to_bits(),
+                mix_hc as u32,
+                0,
+                0,
+                0,
+            ],
+        );
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.hc_block.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, x),
+                bind_buf(1, res),
+                bind_buf(2, post),
+                bind_buf(3, comb),
+                bind_buf(4, mixw),
+                bind_buf(5, sc),
+                bind_buf(6, base),
+                bind_buf(7, nw),
+                bind_buf(8, state),
+                bind_buf(9, fold),
+                bind_buf(10, norm),
+                bind_buf(11, &p),
+            ],
+        })
+    });
+    pass.set_pipeline(&c.hc_block);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(1, 1, 1);
+}
+
 /// A device-to-device copy of `n` floats, as a dispatch — so it can sit
 /// inside a compute pass instead of ending one.
 #[allow(clippy::too_many_arguments)]
