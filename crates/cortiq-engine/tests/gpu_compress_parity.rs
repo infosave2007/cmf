@@ -200,7 +200,13 @@ fn device_compressor_state_matches_the_cpu() {
 
         for pos in 0..3 * ratio {
             let ckv = noise(width, pos as f32 * 1.3 + 11.0);
-            let mut csc = noise(width, pos as f32 * 0.9 + 23.0);
+            // RAW for the device, biased for the host. The device's contract
+            // is that it adds `ape` itself as the token arrives — handing it
+            // an already-biased score counts the bias twice, and the second
+            // count then rides into `prev` and grows fold over fold. That is
+            // what this test reported as a kernel defect.
+            let csc_raw = noise(width, pos as f32 * 0.9 + 23.0);
+            let mut csc = csc_raw.clone();
             if overlap {
                 let slot = pos % ratio;
                 for (c, a) in csc.iter_mut().zip(&ape[slot * width..(slot + 1) * width]) {
@@ -235,7 +241,9 @@ fn device_compressor_state_matches_the_cpu() {
             // overlap bias, exactly as the frame's axpy leaves it.
             let mut got = Vec::new();
             let folded = cortiq_engine::gpu_wgpu::dsv4_comp_state_for_test(
-                &ckv, &csc, &norm, &ape, &inv_freq, width, ratio, overlap, rd, eps, pos,
+                &ckv,
+                if overlap { &csc_raw } else { &csc },
+                &norm, &ape, &inv_freq, width, ratio, overlap, rd, eps, pos,
                 kv_id, &mut got,
             )
             .expect("кадр компрессора отказал");
@@ -247,13 +255,10 @@ fn device_compressor_state_matches_the_cpu() {
             );
             if let Some(want) = cpu {
                 let r = rel(&want, &got);
-                // KNOWN FAILURE, overlap only. Without overlap the device
-                // matches to 1e-7 at every position; with it, every fold is
-                // off and the error GROWS — 9.97e-2, 2.19e-1, 2.45e-1 at
-                // positions 3, 7, 11 — which is the signature of the carried
-                // `prev` half, not of one bad fold. The release runs ratio 4,
-                // so overlap is its live path. `CMF_COMP_SURVEY=1` prints the
-                // whole ladder instead of stopping at the first.
+                // `CMF_COMP_SURVEY=1` prints the whole ladder instead of
+                // stopping at the first divergence. It is how the double-
+                // counted `ape` was told apart from a bad fold: a kernel
+                // fault would not have grown monotonically across folds.
                 if std::env::var("CMF_COMP_SURVEY").is_ok() {
                     eprintln!("СВОДКА перекрытие={overlap} поз={pos}: {r:.3e}");
                 } else {
