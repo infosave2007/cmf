@@ -5,8 +5,12 @@
 S=/private/tmp/claude-501/-Users-oleg-Documents-cortiq-bot-cmfpublic/674db62a-643b-4641-b330-5feed6d40b67/scratchpad
 E="CMF_GPU=wgpu CMF_SDOT=0 CMF_GPU_VRAM_MB=200 CMF_DSV4_GPU_LAYER=1 CMF_DSV4_GPU_ATTN=1 CMF_DSV4_GPU_MOE2=1 CMF_DSV4_SLOT_CHECK=1"
 
-up=$(env $E RUST_LOG=info ./target/release/cortiq ppl $S/plain4.cmf --file $S/long.txt --tokens 4 2>&1 \
-     | grep -ac "wgpu GPU path: on")
+# "wgpu GPU path: on" is logged BEFORE the pipelines are built, so it appears
+# even when a shader then fails to parse and the whole context falls back to
+# the CPU. The absence of the failure is the real check.
+out=$(env $E RUST_LOG=info ./target/release/cortiq ppl $S/plain4.cmf --file $S/long.txt --tokens 4 2>&1)
+up=$(printf '%s' "$out" | grep -ac "wgpu GPU path: on")
+printf '%s' "$out" | grep -aq "wgpu init failed" && up=0
 if [ "$up" != "1" ]; then
   echo "GATE ABORT: wgpu не поднялся — сравнение было бы холостым"
   env $E RUST_LOG=info ./target/release/cortiq ppl $S/plain4.cmf --file $S/long.txt --tokens 4 2>&1 \
@@ -14,6 +18,21 @@ if [ "$up" != "1" ]; then
   exit 1
 fi
 echo "устройство: поднялось"
+
+# The build gate, and it has to be the EXIT CODE. Grepping for "N failed"
+# counts test failures — a compile error produces no such line at all, so
+# that check reported success while CI reported three type errors in code
+# that only the test profile builds.
+if ! cargo test --workspace --no-run >/dev/null 2>&1; then
+  echo "GATE ABORT: тестовая сборка не компилируется"
+  cargo test --workspace --no-run 2>&1 | grep -E "^error" -A6 | head -12
+  exit 1
+fi
+if ! cargo clippy --workspace --all-targets >/dev/null 2>&1; then
+  echo "GATE ABORT: clippy"
+  exit 1
+fi
+echo "сборка тестов и clippy: чисто"
 
 # And that the chain really engages, which needs GPU_LAYER — without it both
 # arms are the same path and agree for the wrong reason.
