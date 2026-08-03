@@ -678,6 +678,66 @@ fn f32_matvec_x(@builtin(workgroup_id) wid: vec3<u32>,
     if (lid == 0u) { fxy[row] = fxpart[0]; }
 }
 
+// The f32 matvec split over COLUMNS, for the shapes with almost no rows.
+//
+// Rows are what give this kernel its workgroups, and the hyper-connection
+// mix has 24 of them over 16 384 columns: even at 1024 threads that is
+// twenty-four workgroups — six per cent of a card that holds hundreds of
+// thousands of threads. Splitting the shared axis gives rows·splits
+// workgroups and a cheap merge, the same trade the attention split makes.
+struct F32SP { cols: u32, rows: u32, nsplit: u32, chunk: u32 };
+@group(0) @binding(0) var<storage, read>       fsw : array<f32>;
+@group(0) @binding(1) var<storage, read>       fsx : array<f32>;
+@group(0) @binding(2) var<storage, read_write> fsy : array<f32>;
+@group(0) @binding(3) var<uniform>             fsp : F32SP;
+@group(0) @binding(4) var<storage, read_write> fspart : array<f32>;  // rows*nsplit
+var<workgroup> fsred: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn f32_matvec_split(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let sp = wid.y;
+    if (row >= fsp.rows || sp >= fsp.nsplit) { return; }
+    let lo = sp * fsp.chunk;
+    var hi = lo + fsp.chunk;
+    if (hi > fsp.cols) { hi = fsp.cols; }
+    let base = row * fsp.cols;
+    var acc = 0.0;
+    var i = lo + lid;
+    loop {
+        if (i >= hi) { break; }
+        acc = acc + fsw[base + i] * fsx[i];
+        i = i + 256u;
+    }
+    fsred[lid] = acc;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { fsred[lid] = fsred[lid] + fsred[lid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (lid == 0u) { fspart[row * fsp.nsplit + sp] = fsred[0]; }
+}
+
+@compute @workgroup_size(64)
+fn f32_matvec_merge(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    if (row >= fsp.rows) { return; }
+    // The splits are summed IN ORDER by one lane: the partials are few and
+    // a fixed order keeps the answer reproducible.
+    if (lid == 0u) {
+        var s = 0.0;
+        for (var t = 0u; t < fsp.nsplit; t = t + 1u) {
+            s = s + fspart[row * fsp.nsplit + t];
+        }
+        fsy[row] = s;
+    }
+}
+
 // Qwen3.5 output gate: attn_out *= sigmoid(gate), element-wise over nh·hd.
 @group(0) @binding(0) var<storage, read>       gm_g : array<f32>;
 @group(0) @binding(1) var<storage, read_write> gm_o : array<f32>;
@@ -6541,6 +6601,8 @@ struct Ctx {
     f32_matvec_w: wgpu::ComputePipeline,
     o_lora_a_w: wgpu::ComputePipeline,
     f32_matvec_x: wgpu::ComputePipeline,
+    f32_mv_split: wgpu::ComputePipeline,
+    f32_mv_merge: wgpu::ComputePipeline,
     o_lora_a_m: wgpu::ComputePipeline,
     moe_gu_q2tp_m: wgpu::ComputePipeline,
     moe_dn_q4tp_m: wgpu::ComputePipeline,
@@ -7094,6 +7156,8 @@ fn init() -> Result<Ctx, String> {
     let f32_matvec_w = pipe("f32_matvec_w");
     let o_lora_a_w = pipe("o_lora_a_w");
     let f32_matvec_x = pipe("f32_matvec_x");
+    let f32_mv_split = pipe("f32_matvec_split");
+    let f32_mv_merge = pipe("f32_matvec_merge");
     let o_lora_a_m = pipe("o_lora_a_m");
     let moe_gu_q2tp_m = pipe("moe_gate_up_q2tp_m");
     let moe_dn_q4tp_m = pipe("moe_down_q4tp_m");
@@ -7321,6 +7385,8 @@ fn init() -> Result<Ctx, String> {
         f32_matvec_w,
         o_lora_a_w,
         f32_matvec_x,
+        f32_mv_split,
+        f32_mv_merge,
         o_lora_a_m,
         moe_gu_q2tp_m,
         moe_dn_q4tp_m,
@@ -14564,7 +14630,49 @@ fn encode_f32matvec_w_p(
     cols: usize,
     bkey: (u8, u64, usize),
 ) {
-    // Rows are what give this kernel its workgroups. Few rows, wide inside.
+    // Rows are what give this kernel its workgroups. With very few of them,
+    // split the shared axis instead: rows·splits workgroups and one cheap
+    // merge pass. CMF_DSV4_F32SPLIT=0 reverts.
+    if rows <= 32 && cols >= 4096 && f32_split() {
+        let nsplit = 8usize;
+        let chunk = cols.div_ceil(nsplit);
+        let part = frame_buf(c, 115, rows * nsplit * 4, false);
+        let p = uni_slot(c, 186, bkey.1 as u64, bkey.2,
+            [cols as u32, rows as u32, nsplit as u32, chunk as u32]);
+        let b1 = cached_bind(c, (188, bkey.1 as u64, bkey.2), || {
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &c.f32_mv_split.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, weight),
+                    bind_buf(1, xs),
+                    bind_buf(2, y),
+                    bind_buf(3, &p),
+                    bind_buf(4, &part),
+                ],
+            })
+        });
+        pass.set_pipeline(&c.f32_mv_split);
+        pass.set_bind_group(0, &b1, &[]);
+        pass.dispatch_workgroups(rows as u32, nsplit as u32, 1);
+        let b2 = cached_bind(c, (190, bkey.1 as u64, bkey.2), || {
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &c.f32_mv_merge.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, weight),
+                    bind_buf(1, xs),
+                    bind_buf(2, y),
+                    bind_buf(3, &p),
+                    bind_buf(4, &part),
+                ],
+            })
+        });
+        pass.set_pipeline(&c.f32_mv_merge);
+        pass.set_bind_group(0, &b2, &[]);
+        pass.dispatch_workgroups(rows as u32, 1, 1);
+        return;
+    }
     let pipe = if rows < 64 { &c.f32_matvec_x } else { &c.f32_matvec_w };
     let bind = cached_bind(c, bkey, || {
         let p = uniform_u32x4(c, [cols as u32, rows as u32, 0, 0]);
@@ -14931,6 +15039,12 @@ fn encode_o_lora_mv4_p(
 }
 
 /// `CMF_DSV4_MOE4=0` puts the q2tp experts back on one row a workgroup.
+/// `CMF_DSV4_F32SPLIT=0` keeps the few-row f32 matvec on one dispatch.
+fn f32_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_F32SPLIT").map(|v| v != "0").unwrap_or(true))
+}
+
 /// `CMF_DSV4_OLORA_MV4=0` keeps the grouped projection on its own kernel.
 ///
 /// It is 3.82 ms of a 30.6 ms chain while wo_b — comparable weights through
