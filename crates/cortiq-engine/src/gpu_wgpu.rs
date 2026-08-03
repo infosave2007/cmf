@@ -3927,6 +3927,89 @@ fn moe_gate_up_q2tp(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// FOUR output rows to a workgroup, 64 lanes each. `gpr` is 128 on the
+// release, so a row has no use for more than 64 lanes — but four rows give
+// the memory system four more independent streams to overlap, and the MoE
+// is 5.6 ms of a 33 ms chain against a bandwidth floor near 1.8.
+var<workgroup> mgm_pg: array<f32, 256>;
+var<workgroup> mgm_pu: array<f32, 256>;
+@compute @workgroup_size(256)
+fn moe_gate_up_q2tp_m(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_index) lid: u32) {
+    let sub = lid / 64u;
+    let lane = lid % 64u;
+    let row = wid.x * 4u + sub;
+    let slot = wid.y;
+    if (row >= mg_p.inter) { return; }
+    let gpr = mg_p.gpr;
+    let rows = mg_p.inter;
+    let base16 = mg_sel[slot] * mg_p.mat16;
+    let nib16 = base16 + row * gpr * 4u;
+    let par16 = base16 + rows * gpr * 4u + row * 2u;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let cod8 = (base16 + rows * gpr * 4u + rows * 2u) * 2u + row * cst;
+
+    let gl = unpack2x16float(mg_g16(par16) | (mg_g16(par16 + 1u) << 16u));
+    let ul = unpack2x16float(mg_u16f(par16) | (mg_u16f(par16 + 1u) << 16u));
+    var ag = 0.0;
+    var au = 0.0;
+    for (var g = lane; g < gpr; g = g + 64u) {
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        var cg = mgp_gu8(cod8 + cb);
+        var cu = mgp_uu8(cod8 + cb);
+        if (shf > 3u) {
+            cg = cg | (mgp_gu8(cod8 + cb + 1u) << 8u);
+            cu = cu | (mgp_uu8(cod8 + cb + 1u) << 8u);
+        }
+        // Rung 0 is the format's exact zero (the ±0.5/±1.5 grid has no
+        // zero of its own); live rungs are the ladder shifted down one.
+        let cgv = (cg >> shf) & 31u;
+        let cuv = (cu >> shf) & 31u;
+        let sg = select(exp2(gl.x + f32(max(cgv, 1u) - 1u) * gl.y), 0.0, cgv == 0u);
+        let su = select(exp2(ul.x + f32(max(cuv, 1u) - 1u) * ul.y), 0.0, cuv == 0u);
+        // Group base in u16 units is a multiple of 4, so the two 32-bit
+        // words land on u32 lanes (nib16 >> 1) and (nib16 >> 1) + 1.
+        let w32 = (nib16 + g * 4u) >> 1u;
+        // One group = 32 activations = 8 vec4s, shared by gate and up.
+        let xq = g * 8u;
+        let x0 = mg_xv[xq];      let x1 = mg_xv[xq + 1u];
+        let x2 = mg_xv[xq + 2u]; let x3 = mg_xv[xq + 3u];
+        let x4 = mg_xv[xq + 4u]; let x5 = mg_xv[xq + 5u];
+        let x6 = mg_xv[xq + 6u]; let x7 = mg_xv[xq + 7u];
+        let dg = mg_dot16v(mg_gw[w32], x0, x1, x2, x3)
+               + mg_dot16v(mg_gw[w32 + 1u], x4, x5, x6, x7);
+        let du = mg_dot16v(mg_uw[w32], x0, x1, x2, x3)
+               + mg_dot16v(mg_uw[w32 + 1u], x4, x5, x6, x7);
+        ag = ag + sg * dg;
+        au = au + su * du;
+    }
+    mgm_pg[lid] = ag;
+    mgm_pu[lid] = au;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lane < stride) {
+            mgm_pg[lid] = mgm_pg[lid] + mgm_pg[lid + stride];
+            mgm_pu[lid] = mgm_pu[lid] + mgm_pu[lid + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lane == 0u) {
+        let g = mgm_pg[sub * 64u];
+        var gg = g;
+        var uu = mgm_pu[sub * 64u];
+        if (mg_p.lim > 0.0) {
+            uu = clamp(uu, -mg_p.lim, mg_p.lim);
+            gg = min(gg, mg_p.lim);
+        }
+        mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
+    }
+}
+
 fn mdp_u8(o: u32) -> u32 { return (md_w[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
 
 @compute @workgroup_size(64)
@@ -6385,6 +6468,7 @@ struct Ctx {
     o_lora_a_w: wgpu::ComputePipeline,
     f32_matvec_x: wgpu::ComputePipeline,
     o_lora_a_m: wgpu::ComputePipeline,
+    moe_gu_q2tp_m: wgpu::ComputePipeline,
     sa_part: wgpu::ComputePipeline,
     sa_merge: wgpu::ComputePipeline,
     blit: wgpu::ComputePipeline,
@@ -6936,6 +7020,7 @@ fn init() -> Result<Ctx, String> {
     let o_lora_a_w = pipe("o_lora_a_w");
     let f32_matvec_x = pipe("f32_matvec_x");
     let o_lora_a_m = pipe("o_lora_a_m");
+    let moe_gu_q2tp_m = pipe("moe_gate_up_q2tp_m");
     let sa_part = pipe("sparse_attend_part");
     let sa_merge = pipe("sparse_attend_merge");
     let blit = pipe("blit");
@@ -7161,6 +7246,7 @@ fn init() -> Result<Ctx, String> {
         o_lora_a_w,
         f32_matvec_x,
         o_lora_a_m,
+        moe_gu_q2tp_m,
         sa_part,
         sa_merge,
         blit,
@@ -14707,6 +14793,12 @@ fn encode_q4tp_mvw_p(
     pass.dispatch_workgroups((rows as u32).div_ceil(per_wg).min(MAX_WG), 1, 1);
 }
 
+/// `CMF_DSV4_MOE4=0` puts the q2tp experts back on one row a workgroup.
+fn moe4() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_MOE4").map(|v| v != "0").unwrap_or(true))
+}
+
 /// `CMF_DSV4_OLORA=1|2|3` pins the grouped projection to the one-row,
 /// 256-thread or four-row kernel, for the A/B that decides which.
 fn olora_pick() -> Option<u32> {
@@ -17326,9 +17418,12 @@ fn encode_moe_chain_p(
             stride16(g.hidden, g.inter, false),
         ],
     );
+    // Four rows to a workgroup where the layout allows it: the columns give
+    // gpr = 128, so a row cannot use more than 64 lanes, and the only width
+    // left is overlap between rows. CMF_DSV4_MOE4=0 reverts.
     let (p_gu, p_dn, l_gu, l_dn) = if g.gu_q2 {
         (
-            &c.moe_gate_up_q2tp,
+            if moe4() { &c.moe_gu_q2tp_m } else { &c.moe_gate_up_q2tp },
             &c.moe_down_q4tp,
             &c.layout_moe_gu_q2tp,
             &c.layout_moe_dn_q4tp,
@@ -17357,9 +17452,13 @@ fn encode_moe_chain_p(
             bind_buf(9, &frame_buf(c, 27, 2 * g.top_k * 4, false)),
         ],
     }));
+    // The layout comes from the PIPELINE, not the cached one: wgpu treats an
+    // auto-derived layout as exclusive to the pipeline that produced it, so a
+    // group built against a twin's layout is rejected at dispatch — with a
+    // message about "exclusive pipelines", not about layouts.
     let bg_gu = cached_bind(c, (128, bkey.0, bkey.1), || c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
-        layout: l_gu,
+        layout: &p_gu.get_bind_group_layout(0),
         entries: &[
             bind_buf(0, gate_all),
             bind_buf(1, up_all),
@@ -17386,7 +17485,8 @@ fn encode_moe_chain_p(
     pass.dispatch_workgroups(1, 1, 1);
     pass.set_pipeline(p_gu);
     pass.set_bind_group(0, &bg_gu, &[]);
-    pass.dispatch_workgroups(g.inter as u32, slots as u32, 1);
+    let gu_per_wg = if g.gu_q2 && moe4() { 4u32 } else { 1u32 };
+    pass.dispatch_workgroups((g.inter as u32).div_ceil(gu_per_wg), slots as u32, 1);
     pass.set_pipeline(p_dn);
     pass.set_bind_group(0, &bg_dn, &[]);
     pass.dispatch_workgroups(g.hidden as u32, 1, 1);
