@@ -4479,17 +4479,32 @@ pub fn dsv4_verify_chunk(
     argmax_out.clear();
     logits_out.clear();
     logits_out.resize(b * cfg.vocab, 0.0);
-    let mut h = vec![0.0f32; dim];
+    let mut head_in = vec![0.0f32; b * dim];
     for t in 0..b {
         let state = &mut states[t * hc * dim..(t + 1) * hc * dim];
         host_tail_walk(
             g, layers, cfg, st, gpu_end, state, ids[t], pos0 + t, inv_freq, &mut scratch,
             pool,
         );
-        hc_head_fold(state, &g.hc_head_fn, g.hc_head_scale, &g.hc_head_base, cfg, pool, &mut h);
-        rms_weighted(&mut h, &g.norm, cfg.norm_eps);
-        let row = &mut logits_out[t * cfg.vocab..(t + 1) * cfg.vocab];
-        g.head.matvec(&h, row, pool);
+        let h = &mut head_in[t * dim..(t + 1) * dim];
+        hc_head_fold(state, &g.hc_head_fn, g.hc_head_scale, &g.hc_head_base, cfg, pool, h);
+        rms_weighted(h, &g.norm, cfg.norm_eps);
+    }
+    // One B-wide head submission instead of B fenced matvecs.
+    let head_gpu = g.head.model_idx().is_some_and(|hi| {
+        let model = layers[0].experts.first().and_then(|e| e.w1.model_arc());
+        model.is_some_and(|m| {
+            crate::gpu_wgpu::q4tp_matvec_batch_for_test(
+                &m, hi, &head_in, b, cfg.vocab, dim, logits_out,
+            )
+        })
+    });
+    for t in 0..b {
+        if !head_gpu {
+            let h = &head_in[t * dim..(t + 1) * dim];
+            g.head.matvec(h, &mut logits_out[t * cfg.vocab..(t + 1) * cfg.vocab], pool);
+        }
+        let row = &logits_out[t * cfg.vocab..(t + 1) * cfg.vocab];
         let mut best = 0usize;
         for v in 1..cfg.vocab {
             if row[v] > row[best] {
@@ -4523,6 +4538,14 @@ pub fn dsv4_spec_finish(
     inv_freq: &[f32],
     pool: Option<&crate::pool::Pool>,
 ) -> bool {
+    macro_rules! sfail {
+        ($($t:tt)*) => {{
+            if std::env::var("CMF_DSV4_SPEC_DEBUG").is_ok() {
+                eprintln!("spec_finish: {}", format_args!($($t)*));
+            }
+            return false;
+        }};
+    }
     let b = txn.batch;
     let k = accepted.min(b);
     if k == b {
@@ -4530,23 +4553,23 @@ pub fn dsv4_spec_finish(
     }
     let (hc, dim, hd) = (cfg.hc_mult, cfg.dim, cfg.head_dim);
     // ── device: restore to the snapshot, then replay the accepted tokens ──
-    let Some(sh) = txn.shadow.take() else { return false };
+    let Some(sh) = txn.shadow.take() else { sfail!("нет тени") };
     if !crate::gpu_wgpu::dsv4_spec_restore(&sh) {
-        return false;
+        sfail!("restore");
     }
     let Some(model) = layers[0].experts.first().and_then(|e| e.w1.model_arc()) else {
-        return false;
+        sfail!("нет модели");
     };
     let mut plan: Vec<(usize, crate::gpu_wgpu::Dsv4Prep)> = Vec::new();
     let mut freqs_own: Vec<&[f32]> = Vec::new();
     for li in 0..txn.gpu_end {
         let l = &layers[li];
-        let Some(wkv) = l.wkv.model_idx() else { return false };
+        let Some(wkv) = l.wkv.model_idx() else { sfail!("wkv слоя {li}") };
         let comp = match &l.compressor {
             None => None,
             Some(cp) => {
                 let (Some(a), Some(bx)) = (cp.wkv.model_idx(), cp.wgate.model_idx()) else {
-                    return false;
+                    sfail!("компрессор слоя {li}");
                 };
                 Some((
                     crate::gpu_wgpu::Dsv4CompW { wkv: a, wgate: bx, norm: &cp.norm, ape: &cp.ape },
@@ -4571,7 +4594,7 @@ pub fn dsv4_spec_finish(
                     ixr.wq_b.model_idx(),
                     ixr.weights_proj.model_idx(),
                 ) else {
-                    return false;
+                    sfail!("индексер слоя {li}");
                 };
                 let ih = ixr.weights_proj.rows();
                 Some((
@@ -4638,7 +4661,7 @@ pub fn dsv4_spec_finish(
         cfg.rope_head_dim,
         cfg.norm_eps,
     ) {
-        return false;
+        sfail!("replay k={k}");
     }
     // ── host counts: the snapshot advanced by k tokens ──
     let advanced = |ratio: usize| -> usize {
@@ -6354,6 +6377,22 @@ pub fn dspark_note(li: usize, state: &[f32], cfg: &Dsv4Cfg) {
     });
 }
 
+/// Read one slot of the armed capture buffer as-is, complete or not. The
+/// speculative verify fills the DEVICE targets from its own photographs and
+/// only needs the host layers' slots from here — `dspark_take`'s
+/// completeness contract would never be met on that path.
+pub fn dspark_peek_slot(slot: usize, dim: usize, out: &mut [f32]) -> bool {
+    DSPARK_CAP.with(|c| {
+        let c = c.borrow();
+        let lo = slot * dim;
+        if c.1.len() < lo + dim {
+            return false;
+        }
+        out[..dim].copy_from_slice(&c.1[lo..lo + dim]);
+        true
+    })
+}
+
 /// Move the capture out, if this token produced a complete one.
 pub fn dspark_take(out: &mut Vec<f32>) -> bool {
     DSPARK_CAP.with(|c| {
@@ -6449,6 +6488,203 @@ fn dspark_apply_mask(out: &mut [Dsv4Mtp]) {
     }
 }
 
+/// The draft's device residency: which experts of each stage live on the
+/// card, and how the device router reaches them.
+///
+/// The draft only proposes — the trunk verifies every token — so the pack
+/// is free to keep a SUBSET of each stage's experts and mask the routing to
+/// it: acceptance pays, correctness never does. The subset is chosen by
+/// measured routing frequency (`CMF_DSPARK_PACK` names the tally file that
+/// `CMF_DSPARK_PICK_DUMP` wrote; `CMF_DSPARK_RESIDENT` caps experts per
+/// stage, default 48).
+#[cfg(feature = "gpu")]
+pub struct DsparkPack {
+    pub stages: Vec<DsparkStagePack>,
+    /// Dequantized router and bias per stage, f32 — address-stable for the
+    /// life of the pack, which is what the device's const cache needs.
+    pub routers: Vec<Vec<f32>>,
+    pub biases: Vec<Option<Vec<f32>>>,
+}
+
+#[cfg(feature = "gpu")]
+pub struct DsparkStagePack {
+    /// Selectable experts (true = resident).
+    pub mask: Vec<bool>,
+    /// Global expert id → pack slot; usize::MAX where cold.
+    pub to_slot: Vec<usize>,
+    /// The same two as the device consumes them — u32, address-stable for
+    /// the pack's lifetime (the const cache keys on the pointer).
+    pub mask_u32: Vec<u32>,
+    pub map_u32: Vec<u32>,
+    /// (gate, up, down) directory indices, pack order, shared LAST.
+    pub tensors: Vec<(usize, usize, usize)>,
+    pub n_resident: usize,
+}
+
+/// `CMF_DSPARK_GPU=1` — the probe (and later the speculative loop) drafts
+/// on the card instead of the CPU/disk tier.
+#[cfg(feature = "gpu")]
+pub fn dspark_gpu_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSPARK_GPU").is_ok_and(|v| v != "0"))
+}
+
+/// The pack, built once per process (the stand runs one model).
+#[cfg(feature = "gpu")]
+pub fn dspark_pack_get(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<&'static DsparkPack> {
+    static P: std::sync::OnceLock<Option<Box<DsparkPack>>> = std::sync::OnceLock::new();
+    P.get_or_init(|| dspark_pack_build(mtp, cfg).map(Box::new)).as_deref()
+}
+
+/// Build and upload the draft's pack. Returns `None` when the stack is
+/// absent, the budget refuses, or a stage's weights are not where the
+/// device path needs them — the caller falls back to the CPU draft.
+#[cfg(feature = "gpu")]
+pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
+    if mtp.is_empty() {
+        return None;
+    }
+    let n_res: usize = std::env::var("CMF_DSPARK_RESIDENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(48);
+    // Frequency tallies: lines of `stage<TAB>expert<TAB>count`.
+    let mut freq: Vec<Vec<(u64, usize)>> = vec![Vec::new(); mtp.len()];
+    if let Ok(path) = std::env::var("CMF_DSPARK_PACK") {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for line in text.lines() {
+                let mut it = line.split_whitespace();
+                if let (Some(s), Some(e), Some(n)) = (it.next(), it.next(), it.next()) {
+                    if let (Ok(s), Ok(e), Ok(n)) =
+                        (s.parse::<usize>(), e.parse::<usize>(), n.parse::<u64>())
+                    {
+                        if s < freq.len() {
+                            freq[s].push((n, e));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut stages = Vec::with_capacity(mtp.len());
+    let mut routers = Vec::with_capacity(mtp.len());
+    let mut biases = Vec::with_capacity(mtp.len());
+    for (si, m) in mtp.iter().enumerate() {
+        let l = &m.layer;
+        let n = l.experts.len();
+        // Frequency order, then the untallied ids — a cold start still
+        // packs SOMETHING deterministic.
+        let mut order: Vec<usize> = {
+            let mut f = freq[si].clone();
+            f.sort_by(|a, b| b.0.cmp(&a.0));
+            let mut seen = vec![false; n];
+            let mut o: Vec<usize> = f
+                .into_iter()
+                .map(|(_, e)| e)
+                .filter(|&e| {
+                    if e < n && !seen[e] {
+                        seen[e] = true;
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .collect();
+            o.extend((0..n).filter(|&e| !seen[e]));
+            o
+        };
+        order.truncate(n_res.min(n));
+        let mut mask = vec![false; n];
+        let mut to_slot = vec![usize::MAX; n];
+        let mut tensors = Vec::with_capacity(order.len() + 1);
+        for (slot, &e) in order.iter().enumerate() {
+            let ex = &l.experts[e];
+            let (Some(w1), Some(w3), Some(w2)) =
+                (ex.w1.model_idx(), ex.w3.model_idx(), ex.w2.model_idx())
+            else {
+                return None;
+            };
+            mask[e] = true;
+            to_slot[e] = slot;
+            tensors.push((w1, w3, w2));
+        }
+        let (Some(s1), Some(s3), Some(s2)) = (
+            l.shared.w1.model_idx(),
+            l.shared.w3.model_idx(),
+            l.shared.w2.model_idx(),
+        ) else {
+            return None;
+        };
+        tensors.push((s1, s3, s2));
+        // The router and bias, dequantized once.
+        let mut router = vec![0.0f32; n * cfg.dim];
+        for (r, row) in (0..n).zip(router.chunks_mut(cfg.dim)) {
+            l.gate.row_f32(r, row);
+        }
+        routers.push(router);
+        biases.push(l.gate_bias.clone());
+        let mask_u32: Vec<u32> = mask.iter().map(|&m| m as u32).collect();
+        let map_u32: Vec<u32> = to_slot
+            .iter()
+            .map(|&x| if x == usize::MAX { u32::MAX } else { x as u32 })
+            .collect();
+        stages.push(DsparkStagePack {
+            mask,
+            to_slot,
+            mask_u32,
+            map_u32,
+            tensors,
+            n_resident: order.len(),
+        });
+    }
+    // ── upload: the small skeleton FIRST, the expert stacks after — the
+    //    documented admission order (experts fill the card and the skeleton
+    //    then misses). ──
+    let model = mtp[0].layer.experts.first().and_then(|e| e.w1.model_arc())?;
+    let mut skeleton = Vec::new();
+    for m in mtp {
+        let l = &m.layer;
+        for t in [&l.wq_a, &l.wq_b, &l.wkv, &l.wo_a, &l.wo_b] {
+            skeleton.push(t.model_idx()?);
+        }
+    }
+    if let Some(mp) = mtp[0].main_proj.as_ref() {
+        skeleton.push(mp.model_idx()?);
+    }
+    for &idx in &skeleton {
+        if !crate::gpu_wgpu::dsv4_weight_ready(&model, idx) {
+            eprintln!("DSpark: скелет драфта не влез в VRAM — GPU-черновик выключен");
+            return None;
+        }
+    }
+    for (si, sp) in stages.iter().enumerate() {
+        if !crate::gpu_wgpu::dsv4_experts_ready(
+            &model,
+            &sp.tensors,
+            cfg.moe_inter,
+            cfg.dim,
+            false,
+        ) {
+            eprintln!(
+                "DSpark: эксперты стадии {si} ({} + shared) не влезли в VRAM — GPU-черновик выключен",
+                sp.n_resident
+            );
+            return None;
+        }
+    }
+    let _ = crate::gpu_wgpu::pin_weights(&model, &skeleton);
+    eprintln!(
+        "DSpark: пак драфта на карте — {} стадии по {} экспертов + shared",
+        stages.len(),
+        stages.iter().map(|s| s.n_resident.to_string()).collect::<Vec<_>>().join("/")
+    );
+    Some(DsparkPack {
+        stages,
+        routers,
+        biases,
+    })
+}
+
 /// Append one real position's entry to every stage's KV ring, from the
 /// trunk captures in `ds.main_hidden`. The draft does this for the position
 /// it drafts at; a speculative decode also owes an entry for every accepted
@@ -6485,6 +6721,226 @@ pub fn dspark_ring_append(
         ds.win[si][slot * kvw..(slot + 1) * kvw].copy_from_slice(&kv);
         ds.filled[si] = (pos + 1).min(cfg.window);
     }
+}
+
+/// The draft block on the card: one submission for all three stages and
+/// five positions, states home in one fence, the head on the host. The
+/// markov bias is skipped (its per-position chain through the previous
+/// PROPOSAL is the one part a single graph cannot batch) — compare against
+/// the CPU draft under `CMF_DSPARK_NO_MARKOV=1`.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn dspark_draft_gpu(
+    g: &Dsv4Globals,
+    mtp: &[Dsv4Mtp],
+    cfg: &Dsv4Cfg,
+    ds: &mut DsparkState,
+    pack: &DsparkPack,
+    kv_id: u64,
+    last_token: u32,
+    pos: usize,
+    pool: Option<&crate::pool::Pool>,
+    out_conf: &mut Vec<f32>,
+) -> Vec<u32> {
+    let (hc, dim) = (cfg.hc_mult, cfg.dim);
+    let block = dspark_block();
+    let Some(model) = mtp[0].layer.experts.first().and_then(|e| e.w1.model_arc()) else {
+        return Vec::new();
+    };
+    let (Some(mp), Some(mn)) = (mtp[0].main_proj.as_ref(), mtp[0].main_norm.as_ref()) else {
+        return Vec::new();
+    };
+    let Some(mp_idx) = mp.model_idx() else {
+        return Vec::new();
+    };
+    let mut stages = Vec::with_capacity(mtp.len());
+    for (si, m) in mtp.iter().enumerate() {
+        let l = &m.layer;
+        let (Some(wq_a), Some(wq_b), Some(wo_a), Some(wo_b), Some(wkv)) = (
+            l.wq_a.model_idx(),
+            l.wq_b.model_idx(),
+            l.wo_a.model_idx(),
+            l.wo_b.model_idx(),
+            l.wkv.model_idx(),
+        ) else {
+            return Vec::new();
+        };
+        let sp = &pack.stages[si];
+        stages.push(crate::gpu_wgpu::DsparkStageW {
+            wq_a,
+            wq_b,
+            wo_a,
+            wo_b,
+            wkv,
+            q_norm: &l.q_norm,
+            kv_norm: &l.kv_norm,
+            attn_norm: &l.attn_norm,
+            ffn_norm: &l.ffn_norm,
+            sink: &l.attn_sink,
+            hc_attn_fn: &l.hc_attn_fn,
+            hc_attn_scale: &l.hc_attn_scale,
+            hc_attn_base: &l.hc_attn_base,
+            hc_ffn_fn: &l.hc_ffn_fn,
+            hc_ffn_scale: &l.hc_ffn_scale,
+            hc_ffn_base: &l.hc_ffn_base,
+            router: &pack.routers[si],
+            bias: pack.biases[si].as_deref(),
+            experts: &sp.tensors,
+            mask_u32: &sp.mask_u32,
+            map_u32: &sp.map_u32,
+        });
+    }
+    let geom = crate::gpu_wgpu::DsparkGeom {
+        dim,
+        hc,
+        nh: cfg.n_heads,
+        hd: cfg.head_dim,
+        rd: cfg.rope_head_dim,
+        q_lora: cfg.q_lora_rank,
+        o_lora: cfg.o_lora_rank,
+        o_groups: cfg.o_groups,
+        inter: cfg.moe_inter,
+        n_experts: cfg.n_routed_experts,
+        top_k: cfg.top_k,
+        window: cfg.window,
+        eps: cfg.norm_eps,
+        hc_eps: cfg.hc_eps,
+        sinkhorn_iters: cfg.hc_sinkhorn_iters,
+        route_scale: cfg.route_scale,
+        swiglu_limit: cfg.swiglu_limit,
+        scale: (cfg.head_dim as f32).powf(-0.5),
+    };
+    // ── seed states: the real token, then noise, replicated over copies ──
+    let ids: Vec<u32> = (0..block)
+        .map(|i| if i == 0 { last_token } else { DSPARK_NOISE_TOKEN })
+        .collect();
+    let mut states0 = vec![0.0f32; block * hc * dim];
+    let mut emb = vec![0.0f32; dim];
+    for (i, &id) in ids.iter().enumerate() {
+        g.embed.row_f32(id as usize, &mut emb);
+        for j in 0..hc {
+            states0[(i * hc + j) * dim..(i * hc + j + 1) * dim].copy_from_slice(&emb);
+        }
+    }
+    let dspark_time = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CMF_DSPARK_TIME").is_ok_and(|v| v != "0"))
+    };
+    let t0 = std::time::Instant::now();
+    let filled = (pos + 1).min(cfg.window);
+    let mut states = vec![0.0f32; block * hc * dim];
+    if !crate::gpu_wgpu::dspark_graph(
+        &model,
+        &stages,
+        geom,
+        kv_id,
+        mp_idx,
+        mn,
+        &ds.main_hidden,
+        &states0,
+        pos,
+        filled,
+        &g.inv_freq_window,
+        block,
+        &mut states,
+    ) {
+        return Vec::new();
+    }
+    for si in 0..mtp.len() {
+        ds.filled[si] = filled;
+    }
+    let t_graph = t0.elapsed();
+
+    // ── head, on the host: fold, norm, one B-wide matmat, argmax ──
+    let last = &mtp[mtp.len() - 1];
+    let (Some(hfn), Some(hbase), Some(hscale), Some(hnorm)) = (
+        last.hc_head_fn.as_ref(),
+        last.hc_head_base.as_ref(),
+        last.hc_head_scale,
+        last.norm.as_ref(),
+    ) else {
+        return Vec::new();
+    };
+    let mut head_in = vec![0.0f32; block * dim];
+    let mut pre_norms = vec![vec![0.0f32; dim]; block];
+    for i in 0..block {
+        hc_head_fold(
+            &states[i * hc * dim..(i + 1) * hc * dim],
+            hfn,
+            hscale,
+            hbase,
+            cfg,
+            pool,
+            &mut head_in[i * dim..(i + 1) * dim],
+        );
+        pre_norms[i].copy_from_slice(&head_in[i * dim..(i + 1) * dim]);
+        rms_weighted(&mut head_in[i * dim..(i + 1) * dim], hnorm, cfg.norm_eps);
+    }
+    let t_fold = t0.elapsed();
+    let mut logits = vec![0.0f32; block * cfg.vocab];
+    // The B-axis q4tp kernel, one submission: `matmat` at B=5 falls to the
+    // CPU tile path and measured 46 ms of a 60 ms draft.
+    let head_gpu = g.head.model_idx().is_some_and(|hi| {
+        crate::gpu_wgpu::q4tp_matvec_batch_for_test(
+            &model,
+            hi,
+            &head_in,
+            block,
+            cfg.vocab,
+            dim,
+            &mut logits,
+        )
+    });
+    if !head_gpu {
+        g.head.matmat(&head_in, block, &mut logits, pool);
+    }
+    let t_head = t0.elapsed();
+    // The markov bigram is not optional: without it acceptance fell 1.02 →
+    // 0.42 on natural text. Its chain runs through the previous PROPOSAL,
+    // so it stays position-by-position; the w2 matvec is big enough that
+    // the QTensor route puts it on the card by itself.
+    let mut proposals = Vec::with_capacity(block);
+    out_conf.clear();
+    let mut prev = last_token;
+    let mut mk_embed = vec![0.0f32; last.markov_w1.as_ref().map_or(0, |t| t.cols())];
+    let mut bias = vec![0.0f32; cfg.vocab];
+    for i in 0..block {
+        let row = &mut logits[i * cfg.vocab..(i + 1) * cfg.vocab];
+        if let (Some(w1), Some(w2)) = (last.markov_w1.as_ref(), last.markov_w2.as_ref()) {
+            w1.row_f32(prev as usize, &mut mk_embed);
+            w2.matvec(&mk_embed, &mut bias, pool);
+            for (a, b) in row.iter_mut().zip(&bias) {
+                *a += *b;
+            }
+        }
+        let mut best = 0usize;
+        for v in 1..row.len() {
+            if row[v] > row[best] {
+                best = v;
+            }
+        }
+        if let Some(cf) = last.confidence.as_ref() {
+            let mut cat = pre_norms[i].clone();
+            cat.extend_from_slice(&mk_embed);
+            let mut sc = [0.0f32; 1];
+            if cat.len() == cf.cols() {
+                cf.matvec(&cat, &mut sc, pool);
+            }
+            out_conf.push(sc[0]);
+        }
+        proposals.push(best as u32);
+        prev = best as u32;
+    }
+    if dspark_time {
+        eprintln!(
+            "DSpark GPU: граф {:.1} мс, фолды {:.1}, голова {:.1}, марков+argmax {:.1}",
+            t_graph.as_secs_f64() * 1e3,
+            (t_fold - t_graph).as_secs_f64() * 1e3,
+            (t_head - t_fold).as_secs_f64() * 1e3,
+            (t0.elapsed() - t_head).as_secs_f64() * 1e3,
+        );
+    }
+    proposals
 }
 
 /// One draft: `DSPARK_BLOCK` proposed tokens and a confidence per position.
@@ -6713,7 +7169,21 @@ pub fn dspark_draft(
         // The markov head biases the logits from the PREVIOUS token — a
         // rank-256 bigram the draft samples through position by position,
         // while the network itself ran the whole block at once.
-        if let (Some(w1), Some(w2)) = (last.markov_w1.as_ref(), last.markov_w2.as_ref()) {
+        // `CMF_DSPARK_NO_MARKOV=1` drops it: the bias is sequential through
+        // the block (each position needs the previous PROPOSAL), which is
+        // the one part of the draft a single device graph cannot batch — so
+        // its acceptance value has to be known before it earns that
+        // complexity.
+        let no_markov = {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var("CMF_DSPARK_NO_MARKOV").is_ok_and(|v| v != "0"))
+        };
+        if no_markov {
+            // Still feed the confidence head's embedding slot below.
+            if let Some(w1) = last.markov_w1.as_ref() {
+                w1.row_f32(prev as usize, &mut mk_embed);
+            }
+        } else if let (Some(w1), Some(w2)) = (last.markov_w1.as_ref(), last.markov_w2.as_ref()) {
             w1.row_f32(prev as usize, &mut mk_embed);
             let mut bias = vec![0.0f32; cfg.vocab];
             w2.matvec(&mk_embed, &mut bias, pool);

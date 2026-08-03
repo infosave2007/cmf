@@ -1884,6 +1884,47 @@ impl Pipeline {
                 }
                 // ── Vanilla: forward the sampled token ──
                 _ => {
+                    // ── DeepSeek-V4 speculative decode (CMF_DSV4_SPEC=1):
+                    // draft five on the card, verify batched, commit the
+                    // accepted prefix. Greedy only; a rejected token's state
+                    // is restored and replayed, so output equals the walk. ──
+                    #[cfg(feature = "gpu")]
+                    if Self::dsv4_spec_on()
+                        && self.dsv4.is_some()
+                        && !self.dsv4_mtp.is_empty()
+                        && task_mask.is_none()
+                        && router.is_none()
+                        && !trace_on
+                        && self.sampler_config.temperature < 1e-6
+                        && self.sampler_config.repetition_penalty == 1.0
+                        && generated + 1 < max_tokens
+                        && all_ids.len() >= 2
+                    {
+                        let tip_token = all_ids[all_ids.len() - 2];
+                        if let Some((extra, n_pos)) = self.dsv4_spec_step(
+                            tip_token,
+                            t_next,
+                            next_pos,
+                            &mut drafted,
+                            &mut accepted,
+                        ) {
+                            next_pos = n_pos;
+                            let mut stopped = false;
+                            for &id in &extra {
+                                if self.confidence_on {
+                                    confidence.push(0.0);
+                                }
+                                if !commit!(id) {
+                                    stopped = true;
+                                    break;
+                                }
+                            }
+                            if stopped {
+                                break 'decode;
+                            }
+                            continue 'decode;
+                        }
+                    }
                     self.graph_want_logits = fuse_lm;
                     // Greedy burst (CMF_MULTISTEP, default 8, 1 = off): while
                     // nothing observes per-token state — pure argmax sampling,
@@ -4182,6 +4223,187 @@ fn draft_probe() -> bool {
     /// per trunk pass — so it is worth measuring before any of the machinery
     /// that would exploit it exists. Each draft is parked with the position
     /// it was made at, and graded as the real tokens arrive.
+    /// `CMF_DSV4_SPEC=1` — the DeepSeek-V4 speculative decode: draft five
+    /// on the card, verify them in one batched trunk pass, commit the
+    /// accepted prefix, roll the rest back.
+    #[cfg(feature = "gpu")]
+    fn dsv4_spec_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CMF_DSV4_SPEC").is_ok_and(|v| v != "0"))
+    }
+
+    /// One speculative round at the decode tip. `t_next` is the token the
+    /// sampler just committed for `next_pos`. Returns the EXTRA accepted
+    /// tokens (possibly none) and the new position, with `graph_logits`
+    /// left holding the last accepted position's logits — exactly what the
+    /// loop top expects. `None` means "speculate not this round": nothing
+    /// was committed, the caller forwards normally.
+    #[cfg(feature = "gpu")]
+    fn dsv4_spec_step(
+        &mut self,
+        tip_token: u32,
+        t_next: u32,
+        next_pos: usize,
+        drafted: &mut usize,
+        accepted_ctr: &mut usize,
+    ) -> Option<(Vec<u32>, usize)> {
+        let n_layers = self.dsv4.as_ref().map(|b| b.1.len())?;
+        let cfg = self.dsv4.as_ref().map(|b| b.2)?;
+        // The draft state and its capture, armed exactly as the probe does.
+        if self.dspark.is_none() {
+            let t = crate::dsv4::dspark_targets(&self.dsv4_mtp, &cfg, n_layers);
+            if t.is_empty() {
+                return None;
+            }
+            crate::dsv4::dspark_arm(&t, cfg.dim);
+            self.dspark = Some(crate::dsv4::DsparkState::new(
+                self.dsv4_mtp.len(),
+                &cfg,
+                t.len(),
+            ));
+        }
+        let targets = crate::dsv4::dspark_targets(&self.dsv4_mtp, &cfg, n_layers);
+        let pack = crate::dsv4::dspark_pack_get(&self.dsv4_mtp, &cfg)?;
+        let block = crate::dsv4::dspark_block();
+        let b_box = self.dsv4.as_mut()?;
+        let (g, layers, st) = (&b_box.0, &b_box.1, &mut b_box.3);
+        let ds = self.dspark.as_mut()?;
+        // The tip's captures: either this token ran on a normal path that
+        // filled the thread-local, or the previous spec round left them.
+        if !crate::dsv4::dspark_take(&mut ds.main_hidden) && !ds.have_hidden {
+            return None;
+        }
+        ds.have_hidden = true;
+        let tip_pos = next_pos.checked_sub(1)?;
+        let draft_started = std::time::Instant::now();
+        let mut conf = Vec::new();
+        let props = crate::dsv4::dspark_draft_gpu(
+            g,
+            &self.dsv4_mtp,
+            &cfg,
+            ds,
+            pack,
+            st.kv_id,
+            tip_token,
+            tip_pos,
+            self.pool.as_deref(),
+            &mut conf,
+        );
+        self.dspark_draft_ns += draft_started.elapsed().as_nanos();
+        *drafted += block;
+        if props.is_empty() || props[0] != t_next {
+            return None;
+        }
+        let k_verify = crate::dsv4::dspark_verify_k().min(props.len());
+        if k_verify < 2 {
+            return None;
+        }
+        let mut fed = Vec::with_capacity(k_verify);
+        fed.push(t_next);
+        fed.extend_from_slice(&props[1..k_verify]);
+        let mut argmax = Vec::new();
+        let mut logits_all = Vec::new();
+        let mut walked = Vec::new();
+        let txn = crate::dsv4::dsv4_verify_chunk(
+            g,
+            layers,
+            &cfg,
+            st,
+            &fed,
+            next_pos,
+            &self.inv_freq,
+            self.pool.as_deref(),
+            &targets,
+            &mut argmax,
+            &mut logits_all,
+            &mut walked,
+        )?;
+        let b = fed.len();
+        let mut accepted = 1usize;
+        while accepted < b && fed[accepted] == argmax[accepted - 1] {
+            accepted += 1;
+        }
+        // `CMF_DSV4_SPEC_FORCE_REJECT=1` — accept nothing beyond the known
+        // token, every round: the pure rollback exerciser. The output must
+        // stay byte-identical to the plain walk; anything else is a
+        // transaction bug, isolated from the acceptance logic.
+        if std::env::var("CMF_DSV4_SPEC_FORCE_REJECT").is_ok_and(|v| v != "0") {
+            accepted = 1;
+        }
+        if std::env::var("CMF_DSV4_SPEC_TRACE").is_ok() {
+            eprintln!(
+                "spec@{next_pos}: fed={fed:?} argmax={argmax:?} accepted={accepted}"
+            );
+        }
+        if !crate::dsv4::dsv4_spec_finish(
+            g,
+            layers,
+            &cfg,
+            st,
+            txn,
+            accepted,
+            &fed,
+            &self.inv_freq,
+            self.pool.as_deref(),
+        ) {
+            tracing::warn!("dsv4: спекулятивный откат не удался — состояние подозрительно");
+            return None;
+        }
+        *accepted_ctr += accepted - 1;
+        // Captures per accepted token: device targets photographed by the
+        // batch, host targets from the verify's own walk. The last one
+        // becomes the new tip's draft input; every one owes the ring an
+        // entry for its position.
+        let (hc, dim) = (cfg.hc_mult, cfg.dim);
+        let dev_caps: Vec<usize> = targets
+            .iter()
+            .copied()
+            .filter(|&t| st.dev_set.get(t).copied().unwrap_or(false))
+            .collect();
+        let mut caps_all = vec![0.0f32; dev_caps.len() * b * hc * dim];
+        if !crate::gpu_wgpu::dsv4_spec_cap_read_all(b, dev_caps.len(), hc * dim, &mut caps_all) {
+            return None;
+        }
+        for t in 0..accepted {
+            let tip = t + 1 == accepted;
+            for (slot, &tl) in targets.iter().enumerate() {
+                if let Some(di) = dev_caps.iter().position(|&d| d == tl) {
+                    let lo = (di * b + t) * hc * dim;
+                    crate::dsv4::dspark_capture(
+                        &caps_all[lo..lo + hc * dim],
+                        &cfg,
+                        slot,
+                        &mut ds.main_hidden,
+                    );
+                } else if tip
+                    && crate::dsv4::dspark_peek_slot(slot, dim, {
+                        let lo = slot * dim;
+                        &mut ds.main_hidden[lo..lo + dim]
+                    })
+                {
+                    // The tip's host-layer captures are the walk's own
+                    // per-layer notes — exact. (The walk that ran last ended
+                    // on exactly this token, on both the accept-all and the
+                    // rollback path.)
+                } else {
+                    // Intermediate tokens: the post-tail state stands in for
+                    // the per-layer capture on host targets below the last
+                    // layer. Ring-entry quality only; the tip is exact.
+                    crate::dsv4::dspark_capture(
+                        &walked[t * hc * dim..(t + 1) * hc * dim],
+                        &cfg,
+                        slot,
+                        &mut ds.main_hidden,
+                    );
+                }
+            }
+            crate::dsv4::dspark_ring_append(g, &self.dsv4_mtp, &cfg, ds, next_pos + t, self.pool.as_deref());
+        }
+        let row = logits_all[(accepted - 1) * cfg.vocab..accepted * cfg.vocab].to_vec();
+        self.graph_logits = Some(row);
+        Some((fed[1..accepted].to_vec(), next_pos + accepted))
+    }
+
     fn dspark_probe(&mut self, position: usize, token_id: u32) {
         if self.dsv4_mtp.is_empty() || !Self::draft_probe() {
             return;
@@ -4243,18 +4465,46 @@ fn draft_probe() -> bool {
         // out-of-core CPU/disk tier by contract: never let per-op probes try
         // to squeeze another multi-gigabyte MTP expert cache onto the card.
         let draft_started = std::time::Instant::now();
-        let props = crate::gpu::cpu_scope(|| {
-            crate::dsv4::dspark_draft(
-                g,
-                &self.dsv4_mtp,
-                &cfg,
-                ds,
-                token_id,
-                position,
-                self.pool.as_deref(),
-                &mut conf,
-            )
-        });
+        #[cfg(feature = "gpu")]
+        let gpu_draft = crate::dsv4::dspark_gpu_on();
+        #[cfg(not(feature = "gpu"))]
+        let gpu_draft = false;
+        let props = if gpu_draft {
+            #[cfg(feature = "gpu")]
+            {
+                let kv_id = b.3.kv_id;
+                match crate::dsv4::dspark_pack_get(&self.dsv4_mtp, &cfg) {
+                    Some(pk) => crate::dsv4::dspark_draft_gpu(
+                        g,
+                        &self.dsv4_mtp,
+                        &cfg,
+                        ds,
+                        pk,
+                        kv_id,
+                        token_id,
+                        position,
+                        self.pool.as_deref(),
+                        &mut conf,
+                    ),
+                    None => Vec::new(),
+                }
+            }
+            #[cfg(not(feature = "gpu"))]
+            Vec::new()
+        } else {
+            crate::gpu::cpu_scope(|| {
+                crate::dsv4::dspark_draft(
+                    g,
+                    &self.dsv4_mtp,
+                    &cfg,
+                    ds,
+                    token_id,
+                    position,
+                    self.pool.as_deref(),
+                    &mut conf,
+                )
+            })
+        };
         self.dspark_draft_ns += draft_started.elapsed().as_nanos();
         let draft_picks = crate::dsv4::pick_tally_take();
         crate::dsv4::dspark_freq_note(&draft_picks);
