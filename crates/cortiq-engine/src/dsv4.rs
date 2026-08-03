@@ -2171,6 +2171,33 @@ fn dsv4_layer_loop(
         }
         if st.dev_set.is_empty() {
             st.dev_set = on_dev.clone();
+            // The set is committed, so the card must keep it. Eviction by
+            // score is right while the set is still being chosen and wrong
+            // afterwards: an evicted layer drops off the card while its
+            // caches stay there, and the loop then refuses the whole fast
+            // path rather than read state from two sides.
+            let mut idxs = Vec::new();
+            for (li, l) in layers.iter().enumerate() {
+                if !on_dev.get(li).copied().unwrap_or(false) {
+                    continue;
+                }
+                for t in [&l.wq_a, &l.wq_b, &l.wkv, &l.wo_a, &l.wo_b, &l.gate] {
+                    idxs.extend(t.model_idx());
+                }
+                if let Some(pk) = pack_for(l, cfg, li) {
+                    for &(a, b, c) in &pk.tensors {
+                        idxs.extend([a, b, c]);
+                    }
+                }
+            }
+            let pinned = layers
+                .iter()
+                .find_map(|l| l.experts.first().and_then(|e| e.w1.model_arc()))
+                .map_or(0, |m| crate::gpu_wgpu::pin_weights(&m, &idxs));
+            tracing::info!(
+                "закреплено на карте: {pinned} тензоров {} слоёв",
+                on_dev.iter().filter(|&&x| x).count()
+            );
         }
     }
     if state_home {

@@ -7583,6 +7583,11 @@ pub fn is_discrete() -> bool {
 struct Resident {
     buf: wgpu::Buffer,
     bytes: u64,
+    /// Never evict. Set for the weights of layers the decode loop has
+    /// committed to running on the card: their caches live there, so losing
+    /// one mid-sequence is not a slower token but a refused one, and at a
+    /// budget near the working set that happened every token.
+    pinned: bool,
     /// Use count, aged lazily: the score at time `t` is `uses ·
     /// DECAY^(t − last)`. Plain frequency ossifies — an expert that was
     /// popular during the first prompt outranks one being used right now,
@@ -7606,6 +7611,30 @@ fn res_score(e: &Resident, now: u64) -> f32 {
     e.uses * RES_DECAY.powi((now.saturating_sub(e.last)).min(4096) as i32)
 }
 
+/// Pin a layer's weights on the card for the rest of the sequence.
+///
+/// The residency cache evicts by score to make room, which is right while
+/// the set is still being chosen and wrong the moment the decode loop has
+/// committed to a set: an evicted layer drops off the card, its caches stay
+/// there, and the loop refuses the whole fast path rather than read state
+/// from two sides. On a budget near the working set that fired every token —
+/// 125 times in a 48-token run on an emulated 24 GB card.
+pub fn pin_weights(model: &Arc<CmfModel>, idxs: &[usize]) -> usize {
+    let Some(c) = ctx() else { return 0 };
+    let uid = model.uid() as usize;
+    let mut map = c.weight_bufs.lock().unwrap();
+    let mut n = 0;
+    for &i in idxs {
+        if let Some(e) = map.get_mut(&(uid, i)) {
+            if !e.pinned {
+                e.pinned = true;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu::Buffer> {
     use std::sync::atomic::Ordering;
     let now = c.res_clock.fetch_add(1, Ordering::Relaxed);
@@ -7626,7 +7655,7 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
     if c.resident.load(Ordering::Relaxed) + len > c.vram_budget {
         let mut cand: Vec<((usize, usize), f32, u64)> = map
             .iter()
-            .filter(|(_, e)| now.saturating_sub(e.last) > RES_HYSTERESIS)
+            .filter(|(_, e)| !e.pinned && now.saturating_sub(e.last) > RES_HYSTERESIS)
             .map(|(k, e)| (*k, res_score(e, now), e.bytes))
             .collect();
         cand.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -7713,6 +7742,7 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
             bytes: len,
             uses: 1.0,
             last: now,
+            pinned: false,
         },
     );
     Some(buf)
