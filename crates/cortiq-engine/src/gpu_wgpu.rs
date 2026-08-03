@@ -7015,6 +7015,147 @@ fn bt_sparse_attend(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// index_scores with grid (entry, token): the query heads and the output
+// stride by the token; the weights arrive RAW with the fold factor in the
+// uniform, multiplied per head exactly where the walk's axpy used to — same
+// rounding, one dispatch fewer. Per-token entry limits ride in a table.
+struct BixP { nh: u32, hd: u32, n_pos: u32, factor: f32 };
+@group(0) @binding(0) var<storage, read>       bix_q    : array<f32>;   // b, nh*hd
+@group(0) @binding(1) var<storage, read>       bix_kv   : array<f32>;
+@group(0) @binding(2) var<storage, read>       bix_w    : array<f32>;   // b, nh (raw)
+@group(0) @binding(3) var<storage, read_write> bix_out  : array<f32>;   // b, 4096
+@group(0) @binding(4) var<uniform>             bix_p    : BixP;
+@group(0) @binding(5) var<storage, read>       bix_lim  : array<u32>;   // b
+var<workgroup> bix_red: array<f32, 256>;
+@compute @workgroup_size(256)
+fn bt_index_scores(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(local_invocation_index) lid: u32) {
+    let t = wid.x;
+    let tok = wid.y;
+    if (t >= bix_p.n_pos) { return; }
+    let limit = bix_lim[tok];
+    let ob = tok * 4096u;
+    if (t >= limit) {
+        if (lid == 0u) { bix_out[ob + t] = KP_NINF; }
+        return;
+    }
+    let hd = bix_p.hd;
+    let kb = t * hd;
+    let qtb = tok * bix_p.nh * hd;
+    let wtb = tok * bix_p.nh;
+    var acc = 0.0;
+    var h = lid;
+    loop {
+        if (h >= bix_p.nh) { break; }
+        var dot = 0.0;
+        let qb = qtb + h * hd;
+        for (var i = 0u; i < hd; i = i + 1u) {
+            dot = dot + bix_q[qb + i] * bix_kv[kb + i];
+        }
+        let hw = bix_w[wtb + h] * bix_p.factor;
+        acc = acc + max(dot, 0.0) * hw;
+        h = h + 256u;
+    }
+    bix_red[lid] = acc;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { bix_red[lid] = bix_red[lid] + bix_red[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) { bix_out[ob + t] = bix_red[0]; }
+}
+
+// top_k_index with grid (token): scores, picks and counts stride by the
+// token; the entry count comes from the same limit table.
+struct BtkP { kmax: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read>       btk_s   : array<f32>;   // b, 4096
+@group(0) @binding(1) var<storage, read_write> btk_idx : array<u32>;   // b, kmax
+@group(0) @binding(2) var<storage, read_write> btk_cnt : array<u32>;   // b
+@group(0) @binding(3) var<uniform>             btk_p   : BtkP;
+@group(0) @binding(4) var<storage, read>       btk_lim : array<u32>;   // b
+var<workgroup> btk_keep: array<u32, 4096>;
+@compute @workgroup_size(1024)
+fn bt_top_k(@builtin(workgroup_id) wid: vec3<u32>,
+            @builtin(local_invocation_index) lid: u32) {
+    let tok = wid.x;
+    let n = btk_lim[tok];
+    let sb = tok * 4096u;
+    var i = lid;
+    loop {
+        if (i >= n) { break; }
+        let si = btk_s[sb + i];
+        var keep = 0u;
+        if (si > KP_NINF) {
+            var rank = 0u;
+            for (var j = 0u; j < n; j = j + 1u) {
+                let sj = btk_s[sb + j];
+                if (sj > KP_NINF) {
+                    if (sj > si || (sj == si && j < i)) { rank = rank + 1u; }
+                }
+            }
+            if (rank < btk_p.kmax) { keep = 1u; }
+        }
+        btk_keep[i] = keep;
+        i = i + 1024u;
+    }
+    workgroupBarrier();
+    var m = lid;
+    loop {
+        if (m >= n) { break; }
+        if (btk_keep[m] == 1u) {
+            var before = 0u;
+            for (var j = 0u; j < m; j = j + 1u) { before = before + btk_keep[j]; }
+            btk_idx[tok * btk_p.kmax + before] = m;
+        }
+        m = m + 1024u;
+    }
+    workgroupBarrier();
+    if (lid == 0u) {
+        var total = 0u;
+        for (var j = 0u; j < n; j = j + 1u) { total = total + btk_keep[j]; }
+        btk_cnt[tok] = total;
+    }
+}
+
+// The staged attended-position list, per token: the visible tail of the
+// UNSLID window first (the batch never slides mid-pass; its own rows sit in
+// staging at the cache's tail), then this token's staged rows including its
+// own, then the compressed positions — the indexer's picks, or all of them
+// on the layers without one (seq flag).
+struct BibP { window: u32, kmax: u32, seq: u32, srow0: u32 };
+@group(0) @binding(0) var<storage, read>       bib_pick : array<u32>;   // b, kmax
+@group(0) @binding(1) var<storage, read_write> bib_out  : array<u32>;   // b, 1024
+@group(0) @binding(2) var<uniform>             bib_p    : BibP;
+@group(0) @binding(3) var<storage, read>       bib_meta : array<vec4<u32>>; // b: [win_start, win_n, staged_n, k]
+@compute @workgroup_size(256)
+fn bt_idx_build_staged(@builtin(workgroup_id) wid: vec3<u32>,
+                       @builtin(local_invocation_id) lid: vec3<u32>) {
+    let tok = wid.y;
+    let i = wid.x * 256u + lid.x;
+    let m = bib_meta[tok];
+    let ob = tok * 1024u;
+    if (i < m.y) {
+        bib_out[ob + i] = m.x + i;
+        return;
+    }
+    let s = i - m.y;
+    if (s < m.z) {
+        bib_out[ob + i] = bib_p.srow0 + s;
+        return;
+    }
+    let j = i - m.y - m.z;
+    if (j < m.w) {
+        if (bib_p.seq != 0u) {
+            bib_out[ob + i] = bib_p.window + j;
+        } else {
+            bib_out[ob + i] = bib_p.window + bib_pick[tok * bib_p.kmax + j];
+        }
+    }
+}
+
 // The grouped low-rank output projection with grid (row-quad, token): the
 // same four-rows-per-workgroup walk as o_lora_a_m, the activation window and
 // the output sliding with the token.
@@ -7337,6 +7478,9 @@ struct Ctx {
     bt_moe_route: wgpu::ComputePipeline,
     bt_moe_gate_up_q2tp: wgpu::ComputePipeline,
     bt_sparse_attend: wgpu::ComputePipeline,
+    bt_index_scores: wgpu::ComputePipeline,
+    bt_top_k: wgpu::ComputePipeline,
+    bt_idx_build_staged: wgpu::ComputePipeline,
     bt_o_lora_a: wgpu::ComputePipeline,
     q4tp_mv: wgpu::ComputePipeline,
     /// Tall-matrix q4tp matvec (4 rows/workgroup, vec4 nibble loads); the
@@ -7901,6 +8045,9 @@ fn init() -> Result<Ctx, String> {
     let bt_moe_route = pipe("bt_moe_route");
     let bt_moe_gate_up_q2tp = pipe("bt_moe_gate_up_q2tp");
     let bt_sparse_attend = pipe("bt_sparse_attend");
+    let bt_index_scores = pipe("bt_index_scores");
+    let bt_top_k = pipe("bt_top_k");
+    let bt_idx_build_staged = pipe("bt_idx_build_staged");
     let bt_o_lora_a = pipe("bt_o_lora_a");
     let q4tp_mv = pipe("q4tp_matvec");
     let q4tp_mv4 = pipe("q4tp_matvec4");
@@ -8139,6 +8286,9 @@ fn init() -> Result<Ctx, String> {
         bt_moe_route,
         bt_moe_gate_up_q2tp,
         bt_sparse_attend,
+        bt_index_scores,
+        bt_top_k,
+        bt_idx_build_staged,
         bt_o_lora_a,
         q4tp_mv,
         q4tp_mv4,
@@ -20071,7 +20221,7 @@ pub fn dspark_graph(
             &bytes[abs..abs + e.nbytes as usize],
         )
     };
-    let dk = |si: usize| 2000 + si; // the graph's li-namespace
+    let dk = |si: usize| 100_000 + si; // the graph's li-namespace
     let fb = |tag: u8, len: usize, upload: bool| frame_buf_t(c, tag, 0, block * len * 4, upload);
     let state_bt = fb(BT_STATE, hc * dim, true);
     let x2_bt = fb(BT_X2, dim, true);
@@ -20718,7 +20868,10 @@ pub fn dsv4_spec_shadow(
         });
     let mut layers = Vec::with_capacity(metas.len());
     for &(li, hd, window, filled) in metas {
-        let dk = filled.min((filled + batch).saturating_sub(window));
+        // Staged batches freeze the window until commit, so there is
+        // nothing to photograph there any more; only the compressor
+        // streams still mutate mid-pass.
+        let dk = 0usize.min(filled.min((filled + batch).saturating_sub(window)));
         let head = if dk > 0 {
             let cache = {
                 let map = c.dsv4_kv.lock().unwrap();
@@ -20826,6 +20979,38 @@ pub fn dsv4_spec_restore(sh: &Dsv4SpecShadow) -> bool {
     true
 }
 
+/// Land the accepted prefix's staged rows in every device layer's window —
+/// the staged batch's deferred slide. Safe for any k in 0..=batch.
+pub fn dsv4_spec_commit_windows(
+    kv_id: u64,
+    metas: &[(usize, usize, usize, usize)], // (li, filled, window, hd)
+    batch: usize,
+    k: usize,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if k == 0 {
+        return true;
+    }
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dsv4-spec-commit"),
+        });
+    for &(li, filled, window, hd) in metas {
+        let (cache, cap) = {
+            let map = c.dsv4_kv.lock().unwrap();
+            match map.get(&(kv_id, li)) {
+                Some((b, cap)) => (b.clone(), *cap),
+                None => return false,
+            }
+        };
+        let srow0 = (cap / hd).saturating_sub(batch + 1);
+        encode_staged_commit(c, &mut enc, &cache, filled, window, hd, srow0, k);
+    }
+    submit(c, enc.finish());
+    true
+}
+
 /// Re-append the state of the ACCEPTED tokens after a restore: window rows,
 /// compressor streams and folds, the indexer's compressor — from the hidden
 /// inputs the batch retained per (layer, token). No attention, no scoring:
@@ -20844,6 +21029,9 @@ pub fn dsv4_spec_replay(
     dim: usize,
     rope_dim: usize,
     eps: f32,
+    // The staged batch commits window rows by blit; the replay then owes
+    // only the compressor streams and folds.
+    skip_window: bool,
 ) -> bool {
     if k == 0 {
         return true;
@@ -20927,11 +21115,12 @@ pub fn dsv4_spec_replay(
                 }
             }
             let filled = (p.filled + t).min(p.window);
-            if dsv4_window_append(
-                model, p.wkv, p.kv_norm, &x2_t, &cache, hd, p.window, filled, dim, rope_dim,
-                eps, pos0 + t, inv_freq[i], kv_id, *li, &mut enc,
-            )
-            .is_none()
+            if !skip_window
+                && dsv4_window_append(
+                    model, p.wkv, p.kv_norm, &x2_t, &cache, hd, p.window, filled, dim,
+                    rope_dim, eps, pos0 + t, inv_freq[i], kv_id, *li, &mut enc,
+                )
+                .is_none()
             {
                 rfail!("окно слоя {li} токена {t}");
             }
@@ -20939,6 +21128,43 @@ pub fn dsv4_spec_replay(
     }
     submit(c, enc.finish());
     true
+}
+
+/// Slide the window by what a run of `k` appends would have slid it, and
+/// land the first `k` staged rows as its newest — through scratch, because
+/// neither a copy nor a blit may alias its own buffer. Three copies when it
+/// slides, two when it does not.
+#[allow(clippy::too_many_arguments)]
+fn encode_staged_commit(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    cache: &wgpu::Buffer,
+    filled: usize,
+    window: usize,
+    hd: usize,
+    srow0: usize,
+    k: usize,
+) {
+    if k == 0 {
+        return;
+    }
+    let shift = (filled + k).saturating_sub(window);
+    let keep = filled - shift.min(filled);
+    let scratch = frame_buf(c, BT_SPEC_SCRATCH, window * hd * 4, true);
+    if shift > 0 {
+        if keep > 0 {
+            enc.copy_buffer_to_buffer(cache, (shift * hd * 4) as u64, &scratch, 0,
+                (keep * hd * 4) as u64);
+        }
+        enc.copy_buffer_to_buffer(cache, (srow0 * hd * 4) as u64, &scratch,
+            (keep * hd * 4) as u64, (k * hd * 4) as u64);
+        enc.copy_buffer_to_buffer(&scratch, 0, cache, 0, ((keep + k) * hd * 4) as u64);
+    } else {
+        enc.copy_buffer_to_buffer(cache, (srow0 * hd * 4) as u64, &scratch, 0,
+            (k * hd * 4) as u64);
+        enc.copy_buffer_to_buffer(&scratch, 0, cache, (filled * hd * 4) as u64,
+            (k * hd * 4) as u64);
+    }
 }
 
 /// One layer of a whole BATCH, with the token on a grid axis: every
@@ -21067,176 +21293,409 @@ fn dsv4_layer_frame_bt_enc(
     let idx_bt = fb(BT_IDX, 1024, true);
     let forced_bt = frame_buf_t(c, BT_FORCED, li, batch * m.top_k * 4, true);
 
-    let _ = (&rope_meta, &sa_m, &idx_bt);
+    let _ = (&sa_m, &idx_bt);
 
-    // ── q for the whole batch: touches no cache, so it can precede the
-    //    preps; the mv4 family's per-row math is the walk's. ──
+    // ── STAGED batch: the window never slides mid-pass. Every token's new
+    //    key row lands in staging at the cache's tail; the attends read the
+    //    frozen window plus each token's staged prefix through per-token
+    //    index lists; the slide happens ONCE at commit. This is what lets
+    //    the attends (and the indexer) run batched instead of interleaved —
+    //    the interleave was the dispatch count, and the dispatch count was
+    //    the pass. ──
+    let metas: Vec<f32> = (0..batch)
+        .flat_map(|t| [(pos0 + t) as f32, a.eps])
+        .collect();
+    c.queue
+        .write_buffer(&rope_meta, 0, bytemuck::cast_slice(&metas));
+    let p0 = &preps[0];
+    let (cache_cap, kvw) = {
+        let map = c.dsv4_kv.lock().unwrap();
+        let cap = match map.get(&(kv_id, li)) {
+            Some((_, cap)) => *cap,
+            None => no!("кеш ({kv_id}, {li}) не заведён"),
+        };
+        let Some(e) = model.tensors.get(p0.wkv) else {
+            no!("wkv без записи");
+        };
+        (cap, e.shape[0])
+    };
+    let srow0 = (cache_cap / a.hd).saturating_sub(batch + 1);
+    {
+        // Staging must sit past everything the pass appends.
+        let ew_c = p0.comp.as_ref().map_or(0, |(_, cg)| {
+            if cg.overlap { cg.width / 2 } else { cg.width }
+        });
+        let comp_top = p0.window * a.hd
+            + (p0.n_comp + batch.div_ceil(4).max(1) + 2) * ew_c.max(1);
+        if srow0 * a.hd < comp_top {
+            no!("нет места под staging: srow0 {srow0}, comp_top {comp_top}");
+        }
+    }
+
+    // q for the whole batch — touches no cache.
     if !encode_q4tp_mv4_b(c, enc, &wb[1], &qn_bt, &q_bt, a.nh * a.hd, a.q_lora, batch) {
         no!("q-проекция пакетом не закодировалась");
     }
-    // ── prep AND attention, token by token, in causal order. The window
-    //    SHIFTS once it is full: encoding all preps first and attending
-    //    afterwards hands token t a window that later tokens already slid —
-    //    the attend must read the cache AS OF its own token, which only this
-    //    interleaving preserves. The kernels are the walk's own, windowed
-    //    into the strided buffers, so the numbers are the walk's too. ──
-    for (t, p) in preps.iter().enumerate() {
-        let _salt = Dsv4FrameSalt::enter(t + 1);
-        let x2_t = frame_buf_t(c, 45, t, dim * 4, true);
-        let qn_t = frame_buf_t(c, 4, t, a.q_lora * 4, true);
-        let idx_t = frame_buf_t(c, 2, t, 1024 * 4, true);
-        {
-            let mut pass = begin_pass(enc);
-            encode_blit_p(&mut pass, c, &x2_bt, &x2_t, dim, t * dim, 0, None);
-            encode_blit_p(&mut pass, c, &qn_bt, &qn_t, a.q_lora, t * a.q_lora, 0, None);
+
+    // Compressor streams: the two projections batch over the tokens (they
+    // read only each token's hidden), the state step stays per token in
+    // causal order — its pending/prev shuffle is order-dependent. What it
+    // appends goes PAST the logical extents, so the batched attends below
+    // stay safe.
+    let mut comp_jobs: Vec<(u8, Dsv4CompW, Dsv4CompGeom)> = Vec::new();
+    if let Some((cw, cg)) = &p0.comp {
+        comp_jobs.push((0, cw.clone(), *cg));
+    }
+    if let Some((iw, ig, _, ixg0)) = &p0.ix {
+        if dsv4_index_cache(kv_id, li, ixg0.idim * (p0.n_ix + batch + 2)).is_none() {
+            no!("ix-кеш слоя {li}");
         }
-        let Some(mt) = dsv4_encode_prep(
-            model, p, kv_id, li, &x2_t, &qn_t, &cache, &idx_t, a.hd, p.window, dim, a.rd,
-            a.eps, pos0 + t, inv_freq, enc,
-        ) else {
-            no!("подготовка токена {t} не собралась");
+        comp_jobs.push((1, iw.clone(), *ig));
+    }
+    if !dsv4_skip("comp") {
+        for (kind, cw, cg) in &comp_jobs {
+            let ckv_bt = frame_buf_t(c, BT_DSPARK_KV, 26 + *kind as usize, batch * cg.width * 4, false);
+            let csc_bt = frame_buf_t(c, BT_DSPARK_KV, 28 + *kind as usize, batch * cg.width * 4, false);
+            for (wi, out) in [(cw.wkv, &ckv_bt), (cw.wgate, &csc_bt)] {
+                let Some(e) = model.tensors.get(wi) else { no!("компрессор без тензора") };
+                let (Some(abs), plen) = (model.entry_abs_offset(e), e.nbytes as usize) else {
+                    no!("компрессор без смещения");
+                };
+                let Some(wbuf) = weight_buffer(c, (model.uid() as usize, wi), &bytes[abs..abs + plen])
+                else {
+                    no!("компрессор не влез");
+                };
+                if !encode_q4tp_mv4_b(c, enc, &wbuf, &x2_bt, out, cg.width, cg.hidden, batch) {
+                    no!("проекция компрессора пакетом");
+                }
+            }
+            let dst = if *kind == 0 {
+                cache.clone()
+            } else {
+                let m2 = c.dsv4_ixkv.lock().unwrap();
+                match m2.get(&(kv_id, li)) {
+                    Some((b, _)) => b.clone(),
+                    None => no!("ix-кеш ({kv_id},{li}) не заведён"),
+                }
+            };
+            for (t, p) in preps.iter().enumerate() {
+                let _salt = Dsv4FrameSalt::enter(t + 1);
+                let ckv_t = frame_buf(c, 70 + kind, cg.width * 4, false);
+                let csc_t = frame_buf(c, 72 + kind, cg.width * 4, false);
+                {
+                    let mut pass = begin_pass(enc);
+                    encode_blit_p(&mut pass, c, &ckv_bt, &ckv_t, cg.width, t * cg.width, 0, None);
+                    encode_blit_p(&mut pass, c, &csc_bt, &csc_t, cg.width, t * cg.width, 0, None);
+                }
+                let off = if *kind == 0 { p.comp_dst_off } else { p.ix_dst_off };
+                let _ = comp_state_step(
+                    c, cw, *cg, *kind, kv_id, li, &ckv_t, &csc_t, pos0 + t, inv_freq, &dst,
+                    off, enc, None,
+                );
+            }
+        }
+    }
+
+    // The staged key rows, batched: project, norm, rotate, park at the tail.
+    let kvfull = frame_buf_t(c, BT_DSPARK_KV, 20, batch * kvw * 4, false);
+    let kvnorm = frame_buf_t(c, BT_DSPARK_KV, 21, batch * kvw * 4, false);
+    if !dsv4_skip("win") {
+        let Some(e) = model.tensors.get(p0.wkv) else {
+            no!("wkv без записи");
         };
-        if mt == 0 || mt > 1024 {
-            no!("список позиций токена {t} длиной {mt}");
+        let (Some(abs), plen) = (model.entry_abs_offset(e), e.nbytes as usize) else {
+            no!("wkv без смещения");
+        };
+        let Some(wkv_w) = weight_buffer(c, (model.uid() as usize, p0.wkv), &bytes[abs..abs + plen])
+        else {
+            no!("wkv не влез");
+        };
+        if !encode_q4tp_mv4_b(c, enc, &wkv_w, &x2_bt, &kvfull, kvw, dim, batch) {
+            no!("wkv пакетом не закодировался");
         }
-        let tkey = (li * 8 + batch) * FRAME_TOK_STRIDE + t;
-        let posb = frame_up_pos_t(c, 1, t, pos0 + t, a.eps);
-        let q_off = (t * a.nh * a.hd * 4) as u64;
-        let q_len = (a.nh * a.hd * 4) as u64;
-        if dsv4_skip("attn") {
-            continue;
-        }
+        let knw = const_buf(c, bytemuck::cast_slice(&p0.kv_norm[..kvw]));
         let mut pass = begin_pass(enc);
-        let bind = cached_bind(c, (228, kv_id, tkey), || {
-            let pu = uniform_u32x4(c, [a.nh as u32, a.hd as u32, a.rd as u32, 1]);
-            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &c.rope_heads.get_bind_group_layout(0),
-                entries: &[
-                    bind_buf_off(0, &q_bt, q_off, q_len),
-                    bind_buf(1, &freq),
-                    bind_buf(2, &pu),
-                    bind_buf(3, &posb),
-                ],
-            })
-        });
-        pass.set_pipeline(&c.rope_heads);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(a.nh as u32, 1, 1);
-        let p_sa = uni_slot(c, 228, kv_id, tkey,
-            [a.nh as u32, a.hd as u32, mt as u32, a.scale.to_bits()]);
-        if dsv4_skip("sa") {
-            continue;
+        {
+            let bind = cached_bind(c, bk(231), || {
+                let pu = uniform_u32x4(c, [kvw as u32, 0, a.eps.to_bits(), 0]);
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.rmsnorm_b.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &kvfull),
+                        bind_buf(1, &knw),
+                        bind_buf(2, &kvnorm),
+                        bind_buf(3, &pu),
+                    ],
+                })
+            });
+            pass.set_pipeline(&c.rmsnorm_b);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(batch as u32, 1, 1);
         }
-        let bind = cached_bind(c, (229, kv_id, tkey), || {
-            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &c.sparse_attend.get_bind_group_layout(0),
-                entries: &[
-                    bind_buf_off(0, &q_bt, q_off, q_len),
-                    bind_buf(1, &cache),
-                    bind_buf(2, &idx_t),
-                    bind_buf(3, &sink),
-                    bind_buf_off(4, &attn_bt, q_off, q_len),
-                    bind_buf(5, &p_sa),
-                ],
-            })
+        {
+            let bind = cached_bind(c, bk(232), || {
+                let pu = uniform_u32x4(c, [1, kvw as u32, a.rd as u32, 0]);
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.bt_rope_heads.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &kvnorm),
+                        bind_buf(1, &freq),
+                        bind_buf(2, &pu),
+                        bind_buf(3, &rope_meta),
+                    ],
+                })
+            });
+            pass.set_pipeline(&c.bt_rope_heads);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(1, batch as u32, 1);
+        }
+        for t in 0..batch {
+            encode_blit_p(&mut pass, c, &kvnorm, &cache, a.hd, t * kvw + kvw - a.hd,
+                (srow0 + t) * a.hd, None);
+        }
+    }
+
+    // The indexer, batched: queries and head weights for every token in two
+    // B-axis projections, then scores, top-k and the staged lists.
+    let kmax = p0.idx_cap.saturating_sub(p0.window).max(1);
+    let pick_bt = fb(203, kmax, false);
+    let lim_bt = frame_buf_t(c, BT_SA_M, FRAME_TOK_STRIDE + li, batch * 4, true);
+    let meta_bt = frame_buf_t(c, BT_FORCED, FRAME_TOK_STRIDE + li, batch * 4 * 4, true);
+    let is_ix = p0.ix.is_some();
+    let mut ms = vec![0u32; batch];
+    let mut metas_ix = vec![0u32; batch * 4];
+    let mut lims = vec![0u32; batch];
+    for (t, p) in preps.iter().enumerate() {
+        let adv_c = p.comp.as_ref().map_or(0, |(_, cg)| {
+            usize::from(cg.ratio > 0 && (pos0 + t + 1) % cg.ratio.max(1) == 0)
         });
-        pass.set_pipeline(&c.sparse_attend);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(a.nh as u32, 1, 1);
-        let bind = cached_bind(c, (230, kv_id, tkey), || {
-            let pu = uniform_u32x4(c, [a.nh as u32, a.hd as u32, a.rd as u32, 2]);
-            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &c.rope_heads.get_bind_group_layout(0),
-                entries: &[
-                    bind_buf_off(0, &attn_bt, q_off, q_len),
-                    bind_buf(1, &freq),
-                    bind_buf(2, &pu),
-                    bind_buf(3, &posb),
-                ],
-            })
+        let n_comp_t = p.n_comp + adv_c;
+        let adv_i = p.ix.as_ref().map_or(0, |(_, cg, _, _)| {
+            usize::from(cg.ratio > 0 && (pos0 + t + 1) % cg.ratio.max(1) == 0)
         });
-        pass.set_pipeline(&c.rope_heads);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(a.nh as u32, 1, 1);
+        let n_ix_t = p.n_ix + adv_i;
+        let old_vis = p0.filled.min(p0.window.saturating_sub(t + 1));
+        let win_start = p0.filled - old_vis;
+        let staged_n = t + 1;
+        let k_t = if is_ix {
+            let limit = n_ix_t.min(n_comp_t);
+            lims[t] = limit as u32;
+            if limit == 0 { 0 } else { p0.idx_cap.saturating_sub(p0.window).min(4096).min({
+                let Some((_, _, _, ixg)) = p.ix.as_ref() else { unreachable!() };
+                ixg.top_k
+            }).min(limit) }
+        } else {
+            n_comp_t
+        };
+        metas_ix[t * 4] = win_start as u32;
+        metas_ix[t * 4 + 1] = old_vis as u32;
+        metas_ix[t * 4 + 2] = staged_n as u32;
+        metas_ix[t * 4 + 3] = k_t as u32;
+        ms[t] = (old_vis + staged_n + k_t) as u32;
+        if ms[t] > 1024 {
+            no!("список токена {t} длиной {}", ms[t]);
+        }
+    }
+    c.queue.write_buffer(&meta_bt, 0, bytemuck::cast_slice(&metas_ix));
+    c.queue.write_buffer(&lim_bt, 0, bytemuck::cast_slice(&lims));
+    let sa_m_li = frame_buf_t(c, BT_SA_M, li, batch * 4, true);
+    c.queue.write_buffer(&sa_m_li, 0, bytemuck::cast_slice(&ms));
+    if is_ix && !dsv4_skip("ix") {
+        let Some((_, _, ixw, ixg)) = p0.ix.as_ref() else { unreachable!() };
+        let mut ixb = Vec::with_capacity(2);
+        for &idx in &[ixw.wq_b, ixw.weights_proj] {
+            let Some(e) = model.tensors.get(idx) else { no!("индексер без тензора") };
+            let (Some(abs), plen) = (model.entry_abs_offset(e), e.nbytes as usize) else {
+                no!("индексер без смещения");
+            };
+            let Some(b) = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])
+            else {
+                no!("индексер не влез");
+            };
+            ixb.push(b);
+        }
+        let ixkv = {
+            let m2 = c.dsv4_ixkv.lock().unwrap();
+            match m2.get(&(kv_id, li)) {
+                Some((b, _)) => b.clone(),
+                None => no!("ix-кеш ({kv_id},{li}) не заведён"),
+            }
+        };
+        let qi_bt = frame_buf_t(c, BT_DSPARK_KV, 22, batch * ixg.ih * ixg.idim * 4, false);
+        let hw_bt = frame_buf_t(c, BT_DSPARK_KV, 23, batch * ixg.ih * 4, false);
+        let sc_bt = frame_buf_t(c, BT_DSPARK_KV, 24, batch * 4096 * 4, false);
+        let cnt_bt = frame_buf_t(c, BT_DSPARK_KV, 25, batch * 4, false);
+        if !encode_q4tp_mv4_b(c, enc, &ixb[0], &qn_bt, &qi_bt, ixg.ih * ixg.idim, ixg.q_lora, batch) {
+            no!("индексер q пакетом");
+        }
+        if !encode_q4tp_mv4_b(c, enc, &ixb[1], &x2_bt, &hw_bt, ixg.ih, ixg.hidden, batch) {
+            no!("индексер веса пакетом");
+        }
+        let sc_factor = (ixg.idim as f32).powf(-0.5) * (ixg.ih as f32).powf(-0.5);
+        let n_pos = lims.iter().copied().max().unwrap_or(0) as usize;
+        let mut pass = begin_pass(enc);
+        {
+            let bind = cached_bind(c, bk(233), || {
+                let pu = uniform_u32x4(c, [ixg.ih as u32, ixg.idim as u32, ixg.rope_dim as u32, 0]);
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.bt_rope_heads.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &qi_bt),
+                        bind_buf(1, &freq),
+                        bind_buf(2, &pu),
+                        bind_buf(3, &rope_meta),
+                    ],
+                })
+            });
+            pass.set_pipeline(&c.bt_rope_heads);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(ixg.ih as u32, batch as u32, 1);
+        }
+        if n_pos > 0 {
+            let bind = cached_bind(c, bk(234), || {
+                let pu = uniform_mixed(c, [ixg.ih as u32, ixg.idim as u32, 4096], sc_factor);
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.bt_index_scores.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &qi_bt),
+                        bind_buf(1, &ixkv),
+                        bind_buf(2, &hw_bt),
+                        bind_buf(3, &sc_bt),
+                        bind_buf(4, &pu),
+                        bind_buf(5, &lim_bt),
+                    ],
+                })
+            });
+            pass.set_pipeline(&c.bt_index_scores);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(n_pos as u32, batch as u32, 1);
+            let bind = cached_bind(c, bk(235), || {
+                let pu = uniform_u32x4(c, [kmax as u32, 0, 0, 0]);
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.bt_top_k.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &sc_bt),
+                        bind_buf(1, &pick_bt),
+                        bind_buf(2, &cnt_bt),
+                        bind_buf(3, &pu),
+                        bind_buf(4, &lim_bt),
+                    ],
+                })
+            });
+            pass.set_pipeline(&c.bt_top_k);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(batch as u32, 1, 1);
+        }
     }
     {
         let mut pass = begin_pass(enc);
-        // Grouped output projection — the WALK's kernel, once per token,
-        // through a per-token window into the strided buffers. The batched
-        // clone reduced in a different tree; a near-tied indexer top-k then
-        // flipped and the batch's text was not the walk's. Exactness beats
-        // one dispatch here.
-        let o_rows = a.o_groups * a.o_lora;
-        let o_cols = a.nh * a.hd / a.o_groups;
-        let o_gpr = o_cols / 32;
-        let mv4_per_wg = if o_gpr <= 64 { 16u32 } else { 8u32 };
-        let mv4_ok = olora_mv4() && o_cols % 32 == 0 && a.o_lora % mv4_per_wg as usize == 0;
-        let o_pipe = match olora_pick() {
-            Some(1) => &c.o_lora_a,
-            Some(2) => &c.o_lora_a_w,
-            Some(3) => &c.o_lora_a_m,
-            _ if !chain_mv4() => &c.o_lora_a,
-            _ if o_gpr >= 256 => &c.o_lora_a_w,
-            _ => &c.o_lora_a_m,
-        };
-        let o_rows_per_wg = if std::ptr::eq(o_pipe, &c.o_lora_a_m) { 4u32 } else { 1u32 };
-        for t in 0..batch {
-            if dsv4_skip("olora") || dsv4_skip("oproj") {
-                break;
-            }
-            let tkey = (li * 8 + batch) * FRAME_TOK_STRIDE + t;
-            let x_off = (t * a.nh * a.hd * 4) as u64;
-            let x_len = (a.nh * a.hd * 4) as u64;
-            let y_off = (t * o_rows * 4) as u64;
-            let y_len = (o_rows * 4) as u64;
-            if mv4_ok {
-                let (pipe, per_wg) = if o_gpr <= 64 {
-                    (&c.q4tp_mv16, 16u32)
-                } else {
-                    (&c.q4tp_mv4, 8u32)
-                };
-                let bind = cached_bind(c, (225, kv_id, tkey), || {
-                    let p = q4tp_mv_params_w(c, o_gpr, o_rows, 1, a.o_lora);
-                    c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &pipe.get_bind_group_layout(0),
-                        entries: &[
-                            bind_buf(0, &wb[2]),
-                            bind_buf_off(2, &mid_bt, y_off, y_len),
-                            bind_buf(3, &p),
-                            bind_buf(4, &wb[2]),
-                            bind_buf_off(5, &attn_bt, x_off, x_len),
-                        ],
-                    })
-                });
-                pass.set_pipeline(pipe);
-                pass.set_bind_group(0, &bind, &[]);
-                pass.dispatch_workgroups((o_rows as u32).div_ceil(per_wg).min(MAX_WG), 1, 1);
-            } else {
-                let bind = cached_bind(c, (226, kv_id, tkey), || {
-                    let p = uniform_u32x4(c, [o_gpr as u32, o_rows as u32, a.o_lora as u32, 0]);
-                    c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &o_pipe.get_bind_group_layout(0),
-                        entries: &[
-                            bind_buf(0, &wb[2]),
-                            bind_buf_off(1, &attn_bt, x_off, x_len),
-                            bind_buf_off(2, &mid_bt, y_off, y_len),
-                            bind_buf(3, &p),
-                        ],
-                    })
-                });
-                pass.set_pipeline(o_pipe);
-                pass.set_bind_group(0, &bind, &[]);
-                pass.dispatch_workgroups(
-                    (o_rows as u32).div_ceil(o_rows_per_wg).min(MAX_WG),
-                    1,
-                    1,
-                );
-            }
+        let bind = cached_bind(c, bk(236), || {
+            let pu = uniform_u32x4(c, [
+                p0.window as u32,
+                kmax as u32,
+                (!is_ix) as u32,
+                srow0 as u32,
+            ]);
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &c.bt_idx_build_staged.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, &pick_bt),
+                    bind_buf(1, &idx_bt),
+                    bind_buf(2, &pu),
+                    bind_buf(3, &meta_bt),
+                ],
+            })
+        });
+        pass.set_pipeline(&c.bt_idx_build_staged);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(4, batch as u32, 1);
+        // The attends, all tokens at once, over the frozen cache.
+        if !dsv4_skip("attn") && !dsv4_skip("sa") {
+            let bind = cached_bind(c, bk(228), || {
+                let pu = uniform_u32x4(c, [a.nh as u32, a.hd as u32, a.rd as u32, 1]);
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.bt_rope_heads.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &q_bt),
+                        bind_buf(1, &freq),
+                        bind_buf(2, &pu),
+                        bind_buf(3, &rope_meta),
+                    ],
+                })
+            });
+            pass.set_pipeline(&c.bt_rope_heads);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(a.nh as u32, batch as u32, 1);
+            let bind = cached_bind(c, bk(229), || {
+                let pu = uniform_mixed(c, [a.nh as u32, a.hd as u32, 1024], a.scale);
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.bt_sparse_attend.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &q_bt),
+                        bind_buf(1, &cache),
+                        bind_buf(2, &idx_bt),
+                        bind_buf(3, &sink),
+                        bind_buf(4, &attn_bt),
+                        bind_buf(5, &pu),
+                        bind_buf(6, &sa_m_li),
+                    ],
+                })
+            });
+            pass.set_pipeline(&c.bt_sparse_attend);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(a.nh as u32, batch as u32, 1);
+            let bind = cached_bind(c, bk(230), || {
+                let pu = uniform_u32x4(c, [a.nh as u32, a.hd as u32, a.rd as u32, 2]);
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.bt_rope_heads.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &attn_bt),
+                        bind_buf(1, &freq),
+                        bind_buf(2, &pu),
+                        bind_buf(3, &rope_meta),
+                    ],
+                })
+            });
+            pass.set_pipeline(&c.bt_rope_heads);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(a.nh as u32, batch as u32, 1);
+        }
+    }
+    {
+        let _ = ();
+        // Grouped output projection, one dispatch for the whole batch. The
+        // per-token walk-exact loop cost five dependent links of the pass's
+        // critical path per layer; the twin reduces in a different tree,
+        // which the speculative mode's round-off contract already covers.
+        if !dsv4_skip("olora") && !dsv4_skip("oproj") {
+            let o_rows = a.o_groups * a.o_lora;
+            let o_cols = a.nh * a.hd / a.o_groups;
+            let bind = cached_bind(c, bk(213), || {
+                let p = uniform_u32x4(c, [(o_cols / 32) as u32, o_rows as u32, a.o_lora as u32, 0]);
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.bt_o_lora_a.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &wb[2]),
+                        bind_buf(1, &attn_bt),
+                        bind_buf(2, &mid_bt),
+                        bind_buf(3, &p),
+                    ],
+                })
+            });
+            let mut pass = begin_pass(enc);
+            pass.set_pipeline(&c.bt_o_lora_a);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups((o_rows as u32).div_ceil(4), batch as u32, 1);
         }
     }
     if !dsv4_skip("wob") && !dsv4_skip("oproj")
@@ -21499,30 +21958,33 @@ fn dsv4_layer_frame_bt_enc(
         if !encode_q4tp_mv4_b(c, enc, &wb[4], &x2_bt, &qr_bt, a.q_lora, dim, batch) {
             no!("next-q пакетом не закодировался");
         }
-        // The walk's 1024-thread rmsnorm per token — its reduction tree, so
-        // the LoRA vector the indexer scores with is bit-identical.
+        // One row-per-workgroup dispatch for every token's LoRA norm: the
+        // per-token walk tree cost five dependent links; round-off class.
         let mut pass = begin_pass(enc);
-        for t in 0..batch {
-            let tkey = (li * 8 + batch) * FRAME_TOK_STRIDE + t;
-            let off = (t * a.q_lora * 4) as u64;
-            let len = (a.q_lora * 4) as u64;
-            let bind = cached_bind(c, (227, kv_id, tkey), || {
-                let p = uniform_u32x4(c, [a.q_lora as u32, 0, a.eps.to_bits(), 0]);
-                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &c.rmsnorm.get_bind_group_layout(0),
-                    entries: &[
-                        bind_buf_off(0, &qr_bt, off, len),
-                        bind_buf(1, &next_qn),
-                        bind_buf_off(2, &qn_bt, off, len),
-                        bind_buf(3, &p),
-                    ],
-                })
-            });
-            pass.set_pipeline(&c.rmsnorm);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
+        let bind = cached_bind(c, bk(227), || {
+            let p = uniform_u32x4(c, [a.q_lora as u32, 0, a.eps.to_bits(), 0]);
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &c.rmsnorm_b.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, &qr_bt),
+                    bind_buf(1, &next_qn),
+                    bind_buf(2, &qn_bt),
+                    bind_buf(3, &p),
+                ],
+            })
+        });
+        pass.set_pipeline(&c.rmsnorm_b);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(batch as u32, 1, 1);
+    }
+    // ── the slide, once: outside a speculative verify the batch commits
+    //    wholesale — the staged rows become the window's newest, the oldest
+    //    leave, exactly what B walked appends would have left. A verify
+    //    (retention armed) defers this to dsv4_spec_finish, which commits
+    //    only the accepted prefix. ──
+    if SPEC_RETAIN.with(|v| v.borrow().0) == 0 && !dsv4_skip("win") {
+        encode_staged_commit(c, enc, &cache, p0.filled, p0.window, a.hd, srow0, batch);
     }
     let src = if w.hc_next_fn.is_some() {
         x2_bt.clone()

@@ -2630,7 +2630,8 @@ fn dsv4_chain_run(
             batch.max(1).div_ceil(cp.ratio.max(1))
         });
         let need = cfg.window * hd
-            + (st.dev_n_comp[li] + comp_extra + 1) * ew_c0.max(1);
+            + (st.dev_n_comp[li] + comp_extra + 1) * ew_c0.max(1)
+            + (batch.max(1) + 1) * hd;
         if !crate::gpu_wgpu::dsv4_cache_ensure(st.kv_id, li, need.next_power_of_two()) {
             return false;
         }
@@ -4441,6 +4442,11 @@ pub fn dsv4_verify_chunk(
             return None;
         }
     }
+    let spec_time = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CMF_DSV4_SPEC_TIME").is_ok_and(|v| v != "0"))
+    };
+    let t0 = std::time::Instant::now();
     let run: Vec<usize> = (0..gpu_end).collect();
     let mut folded = Vec::new();
     let mut states = vec![0.0f32; b * hc * dim];
@@ -4473,6 +4479,7 @@ pub fn dsv4_verify_chunk(
         return None;
     }
     txn.states = states.clone();
+    let t_chain = t0.elapsed();
 
     // ── host tail + every position's head ──
     let mut scratch = HcScratch::new(cfg);
@@ -4516,6 +4523,13 @@ pub fn dsv4_verify_chunk(
     walked_out.clear();
     walked_out.extend_from_slice(&states);
     st.pos = pos0 + b;
+    if spec_time {
+        eprintln!(
+            "verify: тень+сид+цепочка {:.1} мс, хвост+голова {:.1} мс",
+            t_chain.as_secs_f64() * 1e3,
+            (t0.elapsed() - t_chain).as_secs_f64() * 1e3,
+        );
+    }
     Some(txn)
 }
 
@@ -4548,10 +4562,20 @@ pub fn dsv4_spec_finish(
     }
     let b = txn.batch;
     let k = accepted.min(b);
+    let (hc, dim, hd) = (cfg.hc_mult, cfg.dim, cfg.head_dim);
+    // The staged batch never slid the windows; land the accepted prefix now,
+    // whatever k is.
+    let win_metas: Vec<(usize, usize, usize, usize)> = (0..txn.gpu_end)
+        .map(|li| (li, txn.dev_filled[li], cfg.window, hd))
+        .collect();
+    if !crate::gpu_wgpu::dsv4_spec_commit_windows(st.kv_id, &win_metas, b, k) {
+        sfail!("коммит окон");
+    }
     if k == b {
+        // Every stream mutation was the walk's own kernels in walk order —
+        // nothing to put back.
         return true;
     }
-    let (hc, dim, hd) = (cfg.hc_mult, cfg.dim, cfg.head_dim);
     // ── device: restore to the snapshot, then replay the accepted tokens ──
     let Some(sh) = txn.shadow.take() else { sfail!("нет тени") };
     if !crate::gpu_wgpu::dsv4_spec_restore(&sh) {
@@ -4660,6 +4684,7 @@ pub fn dsv4_spec_finish(
         dim,
         cfg.rope_head_dim,
         cfg.norm_eps,
+        true,
     ) {
         sfail!("replay k={k}");
     }
