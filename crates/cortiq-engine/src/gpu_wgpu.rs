@@ -15080,9 +15080,13 @@ fn olora_mv4() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_DSV4_OLORA_MV4").map(|v| v != "0").unwrap_or(true))
 }
 
+/// OFF by default: the A/B put four rows a workgroup at 24.9 tok/s against
+/// 25.7 without, with the chain's wait identical to within 0.12 ms — so the
+/// difference is host noise and the change buys nothing measurable. Kept
+/// switchable; the default takes the path that has been measured longer.
 fn moe4() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_DSV4_MOE4").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_MOE4").is_ok_and(|v| v != "0"))
 }
 
 /// `CMF_DSV4_OLORA=1|2|3` pins the grouped projection to the one-row,
