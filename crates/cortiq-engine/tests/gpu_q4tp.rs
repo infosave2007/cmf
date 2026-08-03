@@ -318,7 +318,18 @@ fn wgpu_q4tp_batch_cost() {
     unsafe { std::env::set_var("CMF_GPU", "wgpu") };
     assert!(cortiq_engine::gpu_wgpu::enabled(), "нет адаптера wgpu");
     // Two shapes off the release: a layer projection, and the head.
-    for (rows, cols) in [(4096usize, 4096usize), (129280, 4096)] {
+    // Shape decides everything here. 4096 rows is 256 workgroups, which
+    // already saturates the card at B=1 — extra batch elements there must
+    // cost proportionally, and do. The trunk's real projections are narrow:
+    // wkv is 512 rows (32 workgroups), wq_a 1024, wo_b 4096. A kernel that
+    // leaves the card idle at B=1 is where a batch can be nearly free, and
+    // measuring only the wide shape would have hidden that entirely.
+    for (rows, cols) in [
+        (512usize, 4096usize),
+        (1024, 4096),
+        (4096, 4096),
+        (129280, 4096),
+    ] {
         let payload = synth(rows, cols);
         let (model, idx) = tiny_model(&format!("cost-{rows}"), rows, cols, payload);
         let mut base = 0f64;
