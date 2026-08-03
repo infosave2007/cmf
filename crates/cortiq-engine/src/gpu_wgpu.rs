@@ -686,55 +686,55 @@ fn f32_matvec_x(@builtin(workgroup_id) wid: vec3<u32>,
 // thousands of threads. Splitting the shared axis gives rows·splits
 // workgroups and a cheap merge, the same trade the attention split makes.
 struct F32SP { cols: u32, rows: u32, nsplit: u32, chunk: u32 };
-@group(0) @binding(0) var<storage, read>       fsw : array<f32>;
-@group(0) @binding(1) var<storage, read>       fsx : array<f32>;
-@group(0) @binding(2) var<storage, read_write> fsy : array<f32>;
-@group(0) @binding(3) var<uniform>             fsp : F32SP;
-@group(0) @binding(4) var<storage, read_write> fspart : array<f32>;  // rows*nsplit
-var<workgroup> fsred: array<f32, 256>;
+@group(0) @binding(0) var<storage, read>       fmsw : array<f32>;
+@group(0) @binding(1) var<storage, read>       fmsx : array<f32>;
+@group(0) @binding(2) var<storage, read_write> fmsy : array<f32>;
+@group(0) @binding(3) var<uniform>             fmsp : F32SP;
+@group(0) @binding(4) var<storage, read_write> fmspart : array<f32>;  // rows*nsplit
+var<workgroup> fmsred: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn f32_matvec_split(@builtin(workgroup_id) wid: vec3<u32>,
                     @builtin(local_invocation_index) lid: u32) {
     let row = wid.x;
     let sp = wid.y;
-    if (row >= fsp.rows || sp >= fsp.nsplit) { return; }
-    let lo = sp * fsp.chunk;
-    var hi = lo + fsp.chunk;
-    if (hi > fsp.cols) { hi = fsp.cols; }
-    let base = row * fsp.cols;
+    if (row >= fmsp.rows || sp >= fmsp.nsplit) { return; }
+    let lo = sp * fmsp.chunk;
+    var hi = lo + fmsp.chunk;
+    if (hi > fmsp.cols) { hi = fmsp.cols; }
+    let base = row * fmsp.cols;
     var acc = 0.0;
     var i = lo + lid;
     loop {
         if (i >= hi) { break; }
-        acc = acc + fsw[base + i] * fsx[i];
+        acc = acc + fmsw[base + i] * fmsx[i];
         i = i + 256u;
     }
-    fsred[lid] = acc;
+    fmsred[lid] = acc;
     workgroupBarrier();
     var stride = 128u;
     loop {
         if (stride == 0u) { break; }
-        if (lid < stride) { fsred[lid] = fsred[lid] + fsred[lid + stride]; }
+        if (lid < stride) { fmsred[lid] = fmsred[lid] + fmsred[lid + stride]; }
         workgroupBarrier();
         stride = stride / 2u;
     }
-    if (lid == 0u) { fspart[row * fsp.nsplit + sp] = fsred[0]; }
+    if (lid == 0u) { fmspart[row * fmsp.nsplit + sp] = fmsred[0]; }
 }
 
 @compute @workgroup_size(64)
 fn f32_matvec_merge(@builtin(workgroup_id) wid: vec3<u32>,
                     @builtin(local_invocation_index) lid: u32) {
     let row = wid.x;
-    if (row >= fsp.rows) { return; }
+    if (row >= fmsp.rows) { return; }
     // The splits are summed IN ORDER by one lane: the partials are few and
     // a fixed order keeps the answer reproducible.
     if (lid == 0u) {
         var s = 0.0;
-        for (var t = 0u; t < fsp.nsplit; t = t + 1u) {
-            s = s + fspart[row * fsp.nsplit + t];
+        for (var t = 0u; t < fmsp.nsplit; t = t + 1u) {
+            s = s + fmspart[row * fmsp.nsplit + t];
         }
-        fsy[row] = s;
+        fmsy[row] = s;
     }
 }
 
@@ -15807,7 +15807,7 @@ mod tests {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
-            let mut p = begin_pass(enc);
+            let mut p = begin_pass(&mut enc);
             p.set_pipeline(&c.add_rmsnorm);
             p.set_bind_group(0, &bind, &[]);
             p.dispatch_workgroups(1, 1, 1);
@@ -16124,7 +16124,7 @@ mod tests {
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             {
-                let mut pass = begin_pass(enc);
+                let mut pass = begin_pass(&mut enc);
                 pass.set_pipeline(&c.o1_far);
                 pass.set_bind_group(0, &bg_far, &[]);
                 pass.dispatch_workgroups((gcnt * hpg * mv) as u32, 1, 1);
@@ -16878,7 +16878,7 @@ mod tests {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
-            let mut pass = begin_pass(enc);
+            let mut pass = begin_pass(&mut enc);
             pass.set_pipeline(&c.q1_mm);
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups((rows as u32).div_ceil(64), (b as u32).div_ceil(64), 1);
@@ -17222,7 +17222,16 @@ pub fn axpy_for_test(x: &[f32], y: &mut [f32], w: f32, set: bool, soff: usize) -
         return false;
     }
     let xb = storage_bytes(c, bytemuck::cast_slice(x));
-    let yb = rw_f32(c, n, true);
+    // COPY_DST as well: this one is written from the host before the
+    // dispatch, and `rw_f32` only asks for STORAGE | COPY_SRC.
+    let yb = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("axpy-y"),
+        size: (n * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     c.queue.write_buffer(&yb, 0, bytemuck::cast_slice(y));
     let mut enc = c
         .device
