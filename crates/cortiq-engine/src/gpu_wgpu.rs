@@ -4779,6 +4779,67 @@ fn o_lora_a(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// The same grouped projection with 256 threads a row. `f32_matvec_w` showed
+// what a 64-thread workgroup costs on this card; this kernel is the other
+// one the chain leans on, and the output projection was 5.0 ms of a 45 ms
+// chain. Its own partial array, because the 64-wide one is exactly 64 long.
+var<workgroup> olw_part: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn o_lora_a_w(@builtin(workgroup_id) wid: vec3<u32>,
+            @builtin(num_workgroups) nwg: vec3<u32>,
+            @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let lora = q1p._p0;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    var row = wid.x;
+    loop {
+        if (row >= rows) { break; }
+        if (lid < 32u) {
+            let pr = unpack2x16float(q1w[params_w + row]);
+            lad_q4tp[lid] = exp2(pr.x + f32(lid) * pr.y);
+        }
+        workgroupBarrier();
+        // A row is exactly one group's width, so the slice offset needs no
+        // parameter of its own: per_group = gpr * 32.
+        let xoff = (row / lora) * gpr * 32u;
+        var acc = 0.0;
+        var g = lid;
+        loop {
+            if (g >= gpr) { break; }
+            let bit = g * 5u;
+            let cb = codes_b + row * cstride + (bit >> 3u);
+            let sh = bit & 7u;
+            var cv = q4tp_byte(cb);
+            if (sh > 3u) { cv = cv | (q4tp_byte(cb + 1u) << 8u); }
+            let scale = lad_q4tp[(cv >> sh) & 31u];
+            let base = (row * gpr + g) * 4u;
+            let xb = xoff + g * 32u;
+            var gsum = 0.0;
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                gsum = gsum + q4b_dot8(q1w[base + k], xb + 8u * k);
+            }
+            acc = acc + scale * gsum;
+            g = g + 256u;
+        }
+        olw_part[lid] = acc;
+        workgroupBarrier();
+        var stride = 128u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid < stride) { olw_part[lid] = olw_part[lid] + olw_part[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lid == 0u) { q1y[row] = olw_part[0]; }
+        workgroupBarrier();
+        row = row + nwg.x;
+    }
+}
+
 // ── Sparse attention, split in two (DeepSeek-V4) ────────────────────────────
 //
 // The one-workgroup-per-head version leaves 64 workgroups on a card with
@@ -6211,6 +6272,7 @@ struct Ctx {
     top_k_index: wgpu::ComputePipeline,
     hc_block: wgpu::ComputePipeline,
     f32_matvec_w: wgpu::ComputePipeline,
+    o_lora_a_w: wgpu::ComputePipeline,
     sa_part: wgpu::ComputePipeline,
     sa_merge: wgpu::ComputePipeline,
     blit: wgpu::ComputePipeline,
@@ -6759,6 +6821,7 @@ fn init() -> Result<Ctx, String> {
     let top_k_index = pipe("top_k_index");
     let hc_block = pipe("hc_block");
     let f32_matvec_w = pipe("f32_matvec_w");
+    let o_lora_a_w = pipe("o_lora_a_w");
     let sa_part = pipe("sparse_attend_part");
     let sa_merge = pipe("sparse_attend_merge");
     let blit = pipe("blit");
@@ -6981,6 +7044,7 @@ fn init() -> Result<Ctx, String> {
         top_k_index,
         hc_block,
         f32_matvec_w,
+        o_lora_a_w,
         sa_part,
         sa_merge,
         blit,
@@ -16950,11 +17014,12 @@ fn encode_attn_chain(
 ) {
     let rows = g.o_groups * g.o_lora;
     let cols = g.nh * g.hd / g.o_groups;
+    let o_pipe = if chain_mv4() { &c.o_lora_a_w } else { &c.o_lora_a };
     let o_bind = cached_bind(c, (63, kv_id, li), || {
         let p = uniform_u32x4(c, [(cols / 32) as u32, rows as u32, g.o_lora as u32, 0]);
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &c.o_lora_a.get_bind_group_layout(0),
+            layout: &o_pipe.get_bind_group_layout(0),
             entries: &[
                 bind_buf(0, &wb[2]),
                 bind_buf(1, attn),
@@ -16990,7 +17055,7 @@ fn encode_attn_chain(
         encode_rope_heads_p(&mut pass, c, attn, freq, posb, g.nh, g.hd, g.rd, false, true,
             (62, kv_id, li));
         if !dsv4_skip("oproj") {
-            pass.set_pipeline(&c.o_lora_a);
+            pass.set_pipeline(o_pipe);
             pass.set_bind_group(0, &o_bind, &[]);
             pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
             encode_q4tp_mvw_p(&mut pass, c, &wb[3], mid, out, g.dim, g.o_groups * g.o_lora,
@@ -17005,7 +17070,7 @@ fn encode_attn_chain(
     encode_rope_heads(c, enc, attn, freq, posb, g.nh, g.hd, g.rd, false, true, (62, kv_id, li));
     {
         let mut pass = begin_pass(enc);
-        pass.set_pipeline(&c.o_lora_a);
+        pass.set_pipeline(o_pipe);
         pass.set_bind_group(0, &o_bind, &[]);
         pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
     }
