@@ -2397,6 +2397,12 @@ fn q4tp_matvec16(@builtin(workgroup_id) wid: vec3<u32>,
         let r_b = r_a + 1u;
         let r_c = r_a + 2u;
         let r_d = r_a + 3u;
+        // `_p1`: the low-rank group width, which slides the activation
+        // window with the row. The FOUR rows this thread owns are
+        // consecutive, so they share a window only when the width divides
+        // the 16-row block — the caller checks that.
+        var xblk = 0u;
+        if (q1p._p1 > 0u) { xblk = (r_a / q1p._p1) * gpr * 8u; }
         var aa = 0.0;
         var ab = 0.0;
         var ac = 0.0;
@@ -2409,7 +2415,7 @@ fn q4tp_matvec16(@builtin(workgroup_id) wid: vec3<u32>,
                 let bit = g * 5u;
                 let cbo = bit >> 3u;
                 let sh = bit & 7u;
-                let xq = g * 8u;
+                let xq = xblk + g * 8u;
                 let x0 = q4v_x[xq];      let x1 = q4v_x[xq + 1u];
                 let x2 = q4v_x[xq + 2u]; let x3 = q4v_x[xq + 3u];
                 let x4 = q4v_x[xq + 4u]; let x5 = q4v_x[xq + 5u];
@@ -14881,7 +14887,7 @@ fn encode_o_lora_mv4_p(
     lora: usize,
     bkey: (u8, u64, usize),
 ) -> bool {
-    if lora == 0 || lora % 8 != 0 || cols % 32 != 0 {
+    if lora == 0 || cols % 32 != 0 {
         return false;
     }
     let gpr = cols / 32;
@@ -14890,6 +14896,15 @@ fn encode_o_lora_mv4_p(
     } else {
         (&c.q4tp_mv4, 8u32)
     };
+    // The rows a workgroup owns must share one activation window, and a
+    // workgroup owns `per_wg` consecutive rows starting at a multiple of
+    // `per_wg`. The 16-row kernel therefore needs a width divisible by 16,
+    // not by 8 — which is exactly the case the stands hit (their gpr is 2,
+    // so they take the 16-row path) and exactly why this read 133.433
+    // against the host's 133.396.
+    if lora % per_wg as usize != 0 {
+        return false;
+    }
     let bind = cached_bind(c, bkey, || {
         let p = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, lora as u32]);
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -14911,22 +14926,18 @@ fn encode_o_lora_mv4_p(
 }
 
 /// `CMF_DSV4_MOE4=0` puts the q2tp experts back on one row a workgroup.
-/// `CMF_DSV4_OLORA_MV4=1` routes the grouped projection through the
-/// eight-row kernel. OFF: it does not match the CPU.
+/// `CMF_DSV4_OLORA_MV4=0` keeps the grouped projection on its own kernel.
 ///
-/// The idea is sound and the prize is real — the grouped projection is
-/// 3.82 ms of a 30.6 ms chain while wo_b, comparable weights through the
-/// register-blocked kernel, is 1.24. The only difference between them is
-/// the activation window that slides with the row, and `_p1` now carries
-/// it. But the stands say 133.433 where the CPU and the dedicated kernel
-/// both say 133.396 — 0.03%, on a stand with no indexer and therefore no
-/// top-k flips to blame. Something in the pairing is wrong and I have not
-/// found it, so the flag exists and the default does not use it.
-///
-/// Kept rather than deleted because this is where the next 2.5 ms is.
+/// It is 3.82 ms of a 30.6 ms chain while wo_b — comparable weights through
+/// the register-blocked q4tp kernel — is 1.24, and the only difference is
+/// the activation window that slides with the row. `_p1` carries it now, in
+/// BOTH the 8-row and the 16-row kernel: teaching only the 8-row one is
+/// what made this read 133.433 against the host's 133.396, because the
+/// stands have gpr = 2 and take the 16-row path. The window was simply
+/// missing there, and the rows kept reading the first group's activations.
 fn olora_mv4() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_DSV4_OLORA_MV4").is_ok_and(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_OLORA_MV4").map(|v| v != "0").unwrap_or(true))
 }
 
 fn moe4() -> bool {
