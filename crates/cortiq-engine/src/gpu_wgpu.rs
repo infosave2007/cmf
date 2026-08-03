@@ -18357,8 +18357,8 @@ fn dsv4_layer_frame_enc(
     // layer-frame path fails validation at the first token — which is how
     // the release run caught it, and a unit test could not have.
     let folded = frame_buf_t(c, 42, tok, dim * 4, true);
-    let hpost = frame_buf(c, 43, hc * 4, true);
-    let hcomb = frame_buf(c, 44, hc * hc * 4, true);
+    let hpost = frame_buf_t(c, 43, tok, hc * 4, true);
+    let hcomb = frame_buf_t(c, 44, tok, hc * hc * 4, true);
     let x2 = frame_buf(c, 45, dim * 4, false);
     let state2 = frame_buf(c, 46, hc * dim * 4, false);
     let logit_b = frame_buf(c, 47, n_pack * 4, false);
@@ -18898,6 +18898,20 @@ pub fn dsv4_experts_ready(
 /// expand reads what the PREVIOUS frame's tail left there; layer zero has no
 /// previous frame, and neither does the layer after one that ran on the host.
 /// Without this both read whatever was in the buffer — perplexity 1470.
+/// Seed one token's hyper-connection mix for the run's FIRST layer.
+///
+/// Every later layer computes its own on the card, but the first takes the
+/// host's. With one slot the batch's tokens would all get whichever seed was
+/// written last — so this, like the state, is per token.
+pub fn dsv4_hc_write_t(post: &[f32], comb: &[f32], tok: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    let pb = frame_buf_t(c, 43, tok, post.len() * 4, true);
+    let cb = frame_buf_t(c, 44, tok, comb.len() * 4, true);
+    c.queue.write_buffer(&pb, 0, bytemuck::cast_slice(post));
+    c.queue.write_buffer(&cb, 0, bytemuck::cast_slice(comb));
+    true
+}
+
 pub fn dsv4_hc_write(post: &[f32], comb: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };
     let pb = frame_buf(c, 43, post.len() * 4, true);
