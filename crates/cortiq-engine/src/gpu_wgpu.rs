@@ -5352,7 +5352,10 @@ struct TkP { n: u32, k: u32, _a: u32, _b: u32 };
 
 var<workgroup> tk_keep: array<u32, 4096>;
 
-@compute @workgroup_size(256)
+// A thousand threads. Both passes are O(n²) over the attended list and
+// they run in ONE workgroup — at the release's 640 positions that is
+// 410 000 comparisons on a single multiprocessor.
+@compute @workgroup_size(1024)
 fn top_k_index(@builtin(local_invocation_index) lid: u32) {
     let n = tk_p.n;
     var i = lid;
@@ -5371,7 +5374,7 @@ fn top_k_index(@builtin(local_invocation_index) lid: u32) {
             if (rank < tk_p.k) { keep = 1u; }
         }
         tk_keep[i] = keep;
-        i = i + 256u;
+        i = i + 1024u;
     }
     workgroupBarrier();
     // Position among the kept, by index — counted rather than scanned, which
@@ -5384,7 +5387,7 @@ fn top_k_index(@builtin(local_invocation_index) lid: u32) {
             for (var j = 0u; j < m; j = j + 1u) { before = before + tk_keep[j]; }
             tk_idx[before] = m;
         }
-        m = m + 256u;
+        m = m + 1024u;
     }
     workgroupBarrier();
     if (lid == 0u) {
