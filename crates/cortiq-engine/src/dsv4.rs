@@ -1156,6 +1156,16 @@ pub(crate) mod prof {
             // frame's own report, and the chain does not use the MoE frame —
             // so the one number that says where a chained token goes was
             // printed only when the chain was not running.
+            let ub = crate::gpu_wgpu::UPLOAD_BYTES.load(Ordering::Relaxed);
+            let un = crate::gpu_wgpu::UPLOAD_NS.load(Ordering::Relaxed);
+            if ub > 0 && un > 0 {
+                eprintln!(
+                    "[dsv4-профиль] ЗАЛИВКА весов: {:.1} ГБ за {:.1} с ({:.0} МБ/с)",
+                    ub as f64 / 1e9,
+                    un as f64 / 1e9,
+                    ub as f64 / (un as f64 / 1e9) / 1e6,
+                );
+            }
             let sub = crate::gpu_wgpu::SUBMITS.load(Ordering::Relaxed);
             if sub > 0 {
                 eprintln!(
