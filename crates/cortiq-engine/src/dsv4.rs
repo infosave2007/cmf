@@ -2126,6 +2126,7 @@ fn dsv4_layer_loop(
             return false;
         }
         folded = next;
+        dspark_note(li, state, cfg);
     }
     let mut state_home = false;
     if chain {
@@ -4829,3 +4830,349 @@ mod tests {
     }
 }
 
+
+// ══ DSpark: the block-parallel draft ══════════════════════════════════
+//
+// Not a classic MTP chain. One pass through the three stages produces the
+// WHOLE block of `block_size` positions at once: position 0 carries the token
+// the trunk just emitted, the rest carry a noise token, and every position
+// attends to every other one — which is why the block cannot be measured a
+// position at a time and pretend to be faithful. Depth comes from the block,
+// not from the stage count.
+//
+// The stages' KV cache is built from the trunk's hidden state, not from the
+// draft's own tokens: one entry per real position, `kv_norm(wkv(main_x))`,
+// in a ring of `window`. The block's own keys and values are appended for
+// the duration of the block and then discarded.
+
+/// The noise token the block's unknown positions carry
+/// (`dspark_noise_token_id`).
+pub const DSPARK_NOISE_TOKEN: u32 = 128799;
+/// `dspark_block_size` — how many positions one draft proposes.
+pub const DSPARK_BLOCK: usize = 5;
+
+/// Per-sequence state of the draft: one KV ring per stage, and the trunk
+/// hidden states the block's input is projected from.
+pub struct DsparkState {
+    /// `[stage][window * kv_width]`, written at `pos % window`.
+    pub win: Vec<Vec<f32>>,
+    /// How many real positions each ring holds, capped at `window`.
+    pub filled: Vec<usize>,
+    /// The trunk's captured hidden, `dim * n_targets`, refreshed every token.
+    pub main_hidden: Vec<f32>,
+    /// True once `main_hidden` holds this position's capture.
+    pub have_hidden: bool,
+}
+
+impl DsparkState {
+    pub fn new(stages: usize, cfg: &Dsv4Cfg, targets: usize) -> Self {
+        Self {
+            win: vec![Vec::new(); stages],
+            filled: vec![0; stages],
+            main_hidden: vec![0.0; cfg.dim * targets],
+            have_hidden: false,
+        }
+    }
+}
+
+/// Which trunk layers the draft reads. Upstream names them explicitly
+/// (`dspark_target_layer_ids`); the file says the same thing less directly —
+/// `main_proj` has one `dim`-wide input block per captured layer — and the
+/// release captures the last three. Deriving it from the weight keeps the
+/// two from disagreeing.
+pub fn dspark_targets(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg, n_layers: usize) -> Vec<usize> {
+    let Some(mp) = mtp.iter().find_map(|m| m.main_proj.as_ref()) else {
+        return Vec::new();
+    };
+    let n = (mp.cols() / cfg.dim.max(1)).clamp(1, n_layers);
+    (n_layers - n..n_layers).collect()
+}
+
+thread_local! {
+    /// The armed capture: which layers to take, and the buffer they fill.
+    /// A thread-local rather than a parameter because the capture has to
+    /// reach into the middle of a layer loop that eight call sites share,
+    /// and threading an optional buffer through all of them to serve one
+    /// diagnostic is a worse trade than this.
+    static DSPARK_CAP: std::cell::RefCell<(Vec<usize>, Vec<f32>, usize)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new(), 0)) };
+}
+
+/// Arm the capture for the layers `targets`, in order.
+pub fn dspark_arm(targets: &[usize], dim: usize) {
+    DSPARK_CAP.with(|c| {
+        let mut c = c.borrow_mut();
+        c.0 = targets.to_vec();
+        c.1 = vec![0.0; dim * targets.len()];
+        c.2 = 0;
+    });
+}
+
+/// Called after every host layer. Free when nothing is armed.
+pub fn dspark_note(li: usize, state: &[f32], cfg: &Dsv4Cfg) {
+    DSPARK_CAP.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0.is_empty() {
+            return;
+        }
+        if let Some(slot) = c.0.iter().position(|&t| t == li) {
+            let (_, buf, seen) = &mut *c;
+            dspark_capture(state, cfg, slot, buf);
+            // Counted, not "was the last one" — under the device chain only
+            // the layers left on the host call this, and taking the last
+            // target as the signal would hand the draft a buffer whose other
+            // slots still hold the previous token, or nothing at all.
+            *seen = if slot == 0 { 1 } else { *seen + 1 };
+        }
+    });
+}
+
+/// Move the capture out, if this token produced a complete one.
+pub fn dspark_take(out: &mut Vec<f32>) -> bool {
+    DSPARK_CAP.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0.is_empty() || c.2 != c.0.len() {
+            return false;
+        }
+        out.clear();
+        out.extend_from_slice(&c.1);
+        c.2 = 0;
+        true
+    })
+}
+
+/// The trunk's contribution: the mean over the hyper-connection copies,
+/// appended in target order. Costs one pass over `hc * dim` per captured
+/// layer and nothing else.
+pub fn dspark_capture(state: &[f32], cfg: &Dsv4Cfg, slot: usize, out: &mut [f32]) {
+    let (hc, dim) = (cfg.hc_mult, cfg.dim);
+    let dst = &mut out[slot * dim..(slot + 1) * dim];
+    let inv = 1.0 / hc as f32;
+    for d in 0..dim {
+        let mut s = 0.0;
+        for j in 0..hc {
+            s += state[j * dim + d];
+        }
+        dst[d] = s * inv;
+    }
+}
+
+/// One draft: `DSPARK_BLOCK` proposed tokens and a confidence per position.
+///
+/// `pos` is the position of `last_token` — the block predicts `pos+1 ..
+/// pos+BLOCK`. Returns the proposals in order; `out_conf` takes the
+/// confidence head's score where the last stage carries one.
+#[allow(clippy::too_many_arguments)]
+pub fn dspark_draft(
+    g: &Dsv4Globals,
+    mtp: &[Dsv4Mtp],
+    cfg: &Dsv4Cfg,
+    ds: &mut DsparkState,
+    last_token: u32,
+    pos: usize,
+    pool: Option<&crate::pool::Pool>,
+    out_conf: &mut Vec<f32>,
+) -> Vec<u32> {
+    let (hc, dim, hd, rd) = (cfg.hc_mult, cfg.dim, cfg.head_dim, cfg.rope_head_dim);
+    let block = DSPARK_BLOCK;
+    let inv_freq = &g.inv_freq_window;
+
+    // ── the block's input: main_norm(main_proj(captured hiddens)) ──
+    let Some(stage0) = mtp.first() else {
+        return Vec::new();
+    };
+    let (Some(mp), Some(mn)) = (stage0.main_proj.as_ref(), stage0.main_norm.as_ref()) else {
+        return Vec::new();
+    };
+    let mut main_x = vec![0.0f32; dim];
+    mp.matvec(&ds.main_hidden, &mut main_x, pool);
+    rms_weighted(&mut main_x, mn, cfg.norm_eps);
+
+    // ── each stage's cache takes one entry per real position, from main_x ──
+    for (si, m) in mtp.iter().enumerate() {
+        let kvw = m.layer.wkv.rows();
+        if ds.win[si].len() < cfg.window * kvw {
+            ds.win[si].resize(cfg.window * kvw, 0.0);
+        }
+        let mut kv = vec![0.0f32; kvw];
+        m.layer.wkv.matvec(&main_x, &mut kv, pool);
+        rms_weighted(&mut kv, &m.layer.kv_norm, cfg.norm_eps);
+        rope_tail(&mut kv[kvw - hd..], inv_freq, pos, rd, false);
+        let slot = pos % cfg.window;
+        ds.win[si][slot * kvw..(slot + 1) * kvw].copy_from_slice(&kv);
+        ds.filled[si] = (pos + 1).min(cfg.window);
+    }
+
+    // ── the block: the real token, then noise ──
+    let ids: Vec<u32> = (0..block)
+        .map(|i| if i == 0 { last_token } else { DSPARK_NOISE_TOKEN })
+        .collect();
+    let mut states = vec![vec![0.0f32; hc * dim]; block];
+    let mut emb = vec![0.0f32; dim];
+    for (i, &id) in ids.iter().enumerate() {
+        g.embed.row_f32(id as usize, &mut emb);
+        for j in 0..hc {
+            states[i][j * dim..(j + 1) * dim].copy_from_slice(&emb);
+        }
+    }
+
+    let mut scratch = HcScratch::new(cfg);
+    for (si, m) in mtp.iter().enumerate() {
+        let l = &m.layer;
+        let kvw = l.wkv.rows();
+        // ── attention half: fold every position first, because each one's
+        //    keys are visible to all the others. ──
+        let mut post = vec![vec![0.0f32; hc]; block];
+        let mut comb = vec![vec![0.0f32; hc * hc]; block];
+        let mut resid = vec![vec![0.0f32; hc * dim]; block];
+        let mut folded = vec![vec![0.0f32; dim]; block];
+        let mix_hc = (2 + hc) * hc;
+        for i in 0..block {
+            hc_mixes(
+                &states[i],
+                &l.hc_attn_fn,
+                mix_hc,
+                cfg.norm_eps,
+                pool,
+                &mut scratch.mixes,
+            );
+            hc_split_sinkhorn(
+                &scratch.mixes,
+                &l.hc_attn_scale,
+                &l.hc_attn_base,
+                hc,
+                cfg.hc_sinkhorn_iters,
+                cfg.hc_eps,
+                &mut scratch.pre,
+                &mut post[i],
+                &mut comb[i],
+            );
+            hc_fold(&states[i], &scratch.pre, hc, dim, &mut folded[i]);
+            rms_weighted(&mut folded[i], &l.attn_norm, cfg.norm_eps);
+            resid[i].copy_from_slice(&states[i]);
+        }
+        // Keys and values of the block itself — kept for this block only.
+        let mut blk_kv = vec![0.0f32; block * kvw];
+        for i in 0..block {
+            let dst = &mut blk_kv[i * kvw..(i + 1) * kvw];
+            l.wkv.matvec(&folded[i], dst, pool);
+            rms_weighted(dst, &l.kv_norm, cfg.norm_eps);
+            rope_tail(&mut dst[kvw - hd..], inv_freq, pos + 1 + i, rd, false);
+        }
+        // The attended set: every cached real position, then the whole block.
+        let win_len = ds.filled[si];
+        let mut cache = Vec::with_capacity((win_len + block) * hd);
+        for p in 0..win_len {
+            let e = &ds.win[si][p * kvw..(p + 1) * kvw];
+            cache.extend_from_slice(&e[kvw - hd..]);
+        }
+        for i in 0..block {
+            let e = &blk_kv[i * kvw..(i + 1) * kvw];
+            cache.extend_from_slice(&e[kvw - hd..]);
+        }
+        let idxs: Vec<usize> = (0..win_len + block).collect();
+        let scale = (hd as f32).powf(-0.5);
+        let mut blk_out = vec![vec![0.0f32; dim]; block];
+        let mut qr = vec![0.0f32; l.wq_a.rows()];
+        let mut q = vec![0.0f32; cfg.n_heads * hd];
+        let mut attn = vec![0.0f32; cfg.n_heads * hd];
+        for i in 0..block {
+            l.wq_a.matvec(&folded[i], &mut qr, pool);
+            rms_weighted(&mut qr, &l.q_norm, cfg.norm_eps);
+            l.wq_b.matvec(&qr, &mut q, pool);
+            let qpos = pos + 1 + i;
+            for h in 0..cfg.n_heads {
+                let head = &mut q[h * hd..(h + 1) * hd];
+                rms_inplace(head, cfg.norm_eps);
+                rope_tail(head, inv_freq, qpos, rd, false);
+            }
+            for h in 0..cfg.n_heads {
+                let qh = &q[h * hd..(h + 1) * hd];
+                let oh = &mut attn[h * hd..(h + 1) * hd];
+                sparse_attend(qh, &cache, &idxs, l.attn_sink[h], scale, hd, oh);
+                rope_tail(oh, inv_freq, qpos, rd, true);
+            }
+            o_project(
+                &attn,
+                &|r, x, sc| l.wo_a.row_dot(r, x, sc),
+                l.wo_a.cols(),
+                &|mid, dst| l.wo_b.matvec(mid, dst, pool),
+                cfg.o_groups,
+                cfg.o_lora_rank,
+                pool,
+                &mut blk_out[i],
+            );
+        }
+        for i in 0..block {
+            let mut next = vec![0.0f32; hc * dim];
+            hc_expand(&blk_out[i], &resid[i], &post[i], &comb[i], hc, dim, &mut next);
+            states[i] = next;
+        }
+        // ── the MoE half is per position and needs nothing from its
+        //    neighbours, so the existing step does it unchanged. ──
+        for i in 0..block {
+            hc_block(
+                &mut states[i],
+                &l.hc_ffn_fn,
+                &l.hc_ffn_scale,
+                &l.hc_ffn_base,
+                &l.ffn_norm,
+                cfg,
+                &mut scratch,
+                pool,
+                |hidden, out| moe_step(hidden, l, cfg, ids[i], si, pool, out),
+            );
+        }
+    }
+
+    // ── head: the last stage's fold, the trunk's own head ──
+    let last = &mtp[mtp.len() - 1];
+    let (Some(hfn), Some(hbase), Some(hscale), Some(hnorm)) = (
+        last.hc_head_fn.as_ref(),
+        last.hc_head_base.as_ref(),
+        last.hc_head_scale,
+        last.norm.as_ref(),
+    ) else {
+        return Vec::new();
+    };
+    let mut proposals = Vec::with_capacity(block);
+    out_conf.clear();
+    let mut prev = last_token;
+    let mut logits = vec![0.0f32; cfg.vocab];
+    let mut mk_embed = vec![0.0f32; last.markov_w1.as_ref().map_or(0, |t| t.cols())];
+    for i in 0..block {
+        let mut folded = vec![0.0f32; dim];
+        hc_head_fold(&states[i], hfn, hscale, hbase, cfg, pool, &mut folded);
+        rms_weighted(&mut folded, hnorm, cfg.norm_eps);
+        g.head.matvec(&folded, &mut logits, pool);
+        // The markov head biases the logits from the PREVIOUS token — a
+        // rank-256 bigram the draft samples through position by position,
+        // while the network itself ran the whole block at once.
+        if let (Some(w1), Some(w2)) = (last.markov_w1.as_ref(), last.markov_w2.as_ref()) {
+            w1.row_f32(prev as usize, &mut mk_embed);
+            let mut bias = vec![0.0f32; cfg.vocab];
+            w2.matvec(&mk_embed, &mut bias, pool);
+            for (a, b) in logits.iter_mut().zip(&bias) {
+                *a += *b;
+            }
+        }
+        let mut best = 0usize;
+        for v in 1..logits.len() {
+            if logits[v] > logits[best] {
+                best = v;
+            }
+        }
+        if let Some(cf) = last.confidence.as_ref() {
+            let mut cat = folded.clone();
+            cat.extend_from_slice(&mk_embed);
+            let mut s = [0.0f32; 1];
+            if cat.len() == cf.cols() {
+                cf.matvec(&cat, &mut s, pool);
+            }
+            out_conf.push(s[0]);
+        }
+        proposals.push(best as u32);
+        prev = best as u32;
+    }
+    proposals
+}

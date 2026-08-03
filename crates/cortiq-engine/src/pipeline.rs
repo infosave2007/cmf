@@ -108,6 +108,13 @@ pub struct Pipeline {
     /// layer, plus a confidence head on the last. Empty when the file has
     /// none, which is the only signal the decode path needs.
     pub dsv4_mtp: Vec<crate::dsv4::Dsv4Mtp>,
+    /// The draft's per-sequence state (KV rings, captured trunk hidden).
+    pub dspark: Option<crate::dsv4::DsparkState>,
+    /// Drafts awaiting their verdict: (position, proposals, still matching,
+    /// accepted so far).
+    pub dspark_pending: Vec<(usize, Vec<u32>, bool, usize)>,
+    /// Accepted prefix length of every graded draft.
+    pub dspark_hist: Vec<usize>,
     /// LFM2 short-convolution geometry (present when the model has
     /// `ShortConv` mixer layers).
     pub short_conv_cfg: Option<ShortConvCfg>,
@@ -1171,6 +1178,9 @@ impl Pipeline {
             g3n: None,
             dsv4: None,
             dsv4_mtp: Vec::new(),
+            dspark: None,
+            dspark_pending: Vec::new(),
+            dspark_hist: Vec::new(),
             logit_multiplier: None,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             kv_history: Vec::new(),
@@ -4134,6 +4144,96 @@ impl Pipeline {
     }
 
     /// Same, stopping after layer `upto` inclusive (routing probe φ).
+/// `CMF_DSV4_DRAFT_PROBE=1` — grade the draft against what the trunk goes on
+/// to produce. Off by default; it runs a whole draft per decoded token.
+fn draft_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_DRAFT_PROBE").is_ok_and(|v| v != "0"))
+}
+
+    /// `CMF_DSV4_DRAFT_PROBE=1`: measure how much of the draft the trunk
+    /// would have agreed with, WITHOUT verifying or rolling anything back.
+    ///
+    /// The number this produces decides the whole speculation design — at
+    /// acceptance a, a block of B positions yields 1 + a + a² + ... tokens
+    /// per trunk pass — so it is worth measuring before any of the machinery
+    /// that would exploit it exists. Each draft is parked with the position
+    /// it was made at, and graded as the real tokens arrive.
+    fn dspark_probe(&mut self, position: usize, token_id: u32) {
+        if self.dsv4_mtp.is_empty() || !Self::draft_probe() {
+            return;
+        }
+        // Grade whatever is waiting: the token just decoded sits at
+        // `position`, so it answers the draft made at `position - 1 - i`.
+        for p in std::mem::take(&mut self.dspark_pending) {
+            let Some(i) = position.checked_sub(p.0 + 1) else {
+                continue;
+            };
+            let mut p = p;
+            if i < p.1.len() {
+                if p.2 && p.1[i] == token_id {
+                    p.3 = i + 1;
+                } else {
+                    p.2 = false;
+                }
+                if i + 1 < p.1.len() {
+                    self.dspark_pending.push(p);
+                    continue;
+                }
+            }
+            self.dspark_hist.push(p.3);
+        }
+        let Some(b) = &mut self.dsv4 else { return };
+        let (g, layers, cfg) = (&b.0, &b.1, b.2);
+        let n_layers = layers.len();
+        if self.dspark.is_none() {
+            let t = crate::dsv4::dspark_targets(&self.dsv4_mtp, &cfg, n_layers);
+            if t.is_empty() {
+                return;
+            }
+            eprintln!("DSpark: захват со слоёв {t:?}, блок {}", crate::dsv4::DSPARK_BLOCK);
+            crate::dsv4::dspark_arm(&t, cfg.dim);
+            self.dspark = Some(crate::dsv4::DsparkState::new(
+                self.dsv4_mtp.len(),
+                &cfg,
+                t.len(),
+            ));
+        }
+        let ds = self.dspark.as_mut().unwrap();
+        if !crate::dsv4::dspark_take(&mut ds.main_hidden) {
+            return; // this token ran on a path that captures nothing
+        }
+        let mut conf = Vec::new();
+        let props = crate::dsv4::dspark_draft(
+            g,
+            &self.dsv4_mtp,
+            &cfg,
+            ds,
+            token_id,
+            position,
+            self.pool.as_deref(),
+            &mut conf,
+        );
+        if !props.is_empty() {
+            self.dspark_pending.push((position, props, true, 0));
+        }
+        if self.dspark_hist.len() >= 8 && self.dspark_hist.len() % 8 == 0 {
+            let n = self.dspark_hist.len() as f32;
+            let mean: f32 = self.dspark_hist.iter().sum::<usize>() as f32 / n;
+            let block = crate::dsv4::DSPARK_BLOCK;
+            let mut at = vec![0usize; block + 1];
+            for &k in &self.dspark_hist {
+                at[k] += 1;
+            }
+            eprintln!(
+                "DSpark: черновиков {}, принято в среднем {mean:.2} из {block} \
+                 (токенов за проход {:.2}), распределение {at:?}",
+                self.dspark_hist.len(),
+                mean + 1.0
+            );
+        }
+    }
+
     fn forward_layers_upto(
         &mut self,
         hidden: &[f32],
@@ -4163,6 +4263,7 @@ impl Pipeline {
                 &mut logits,
             );
             self.graph_logits = Some(logits);
+            self.dspark_probe(position, token_id);
             // The caller expects a hidden; the logits went out of band, as
             // with the fused lm_head path.
             return vec![0.0; self.hidden_size];

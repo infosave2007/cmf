@@ -247,7 +247,18 @@ fn device_compressor_state_matches_the_cpu() {
             );
             if let Some(want) = cpu {
                 let r = rel(&want, &got);
-                assert!(r < 1e-5, "перекрытие={overlap} поз={pos}: {r:.3e}");
+                // KNOWN FAILURE, overlap only. Without overlap the device
+                // matches to 1e-7 at every position; with it, every fold is
+                // off and the error GROWS — 9.97e-2, 2.19e-1, 2.45e-1 at
+                // positions 3, 7, 11 — which is the signature of the carried
+                // `prev` half, not of one bad fold. The release runs ratio 4,
+                // so overlap is its live path. `CMF_COMP_SURVEY=1` prints the
+                // whole ladder instead of stopping at the first.
+                if std::env::var("CMF_COMP_SURVEY").is_ok() {
+                    eprintln!("СВОДКА перекрытие={overlap} поз={pos}: {r:.3e}");
+                } else {
+                    assert!(r < 1e-5, "перекрытие={overlap} поз={pos}: {r:.3e}");
+                }
             }
         }
     }
@@ -337,6 +348,13 @@ fn device_window_append_matches_the_cpu() {
             "запись окна отказала"
         );
         let r = rel(&host, &got[..host.len()]);
+        if r >= 1e-5 {
+            for b in 0..host.len() / hd {
+                let rb = rel(&host[b * hd..(b + 1) * hd], &got[b * hd..(b + 1) * hd]);
+                let z = got[b * hd..(b + 1) * hd].iter().all(|v| *v == 0.0);
+                eprintln!("  поз={pos} блок {b}: rel={rb:.3e} нули={z}");
+            }
+        }
         assert!(r < 1e-5, "поз={pos} заполнено={filled}: {r:.3e}");
     }
 }

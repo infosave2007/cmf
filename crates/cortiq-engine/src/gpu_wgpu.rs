@@ -2451,48 +2451,51 @@ fn q4tp_matvec16(@builtin(workgroup_id) wid: vec3<u32>,
     let sub = lid >> 6u;
     let l = lid & 63u;
     // `_p0`: how many activation vectors share this weight. One is a matvec;
-    // more is a batch — the weight is read ONCE and used B times, which is
-    // the whole reason a chunk of prompt costs less than a walk over it, and
-    // the reason a speculative verify of B tokens is not B tokens' work. A
-    // row block must belong to one batch element, so the caller sets this
-    // only when rows divides evenly by the block.
+    // more is a batch. The BATCH is the fast axis of the dispatch, so the
+    // workgroups that read the same weight rows are neighbours and meet in
+    // L2; walking the whole output space instead put them `rows/16` apart,
+    // which streams the weight once per batch element and defeats the point.
+    // Reuse is still L2's to give — this is not a register-blocked B kernel —
+    // so the win is a measurement, not a claim.
     let nb = max(q1p._p0, 1u);
-    let total = rows * nb;
-    var base = wid.x * 16u;
+    let blocks = (rows + 15u) / 16u;
+    var wb = wid.x;
     loop {
-        if (base >= total) { break; }
-        let bi = base / rows;
+        if (wb >= blocks * nb) { break; }
+        let bi = wb % nb;
+        let base = (wb / nb) * 16u;
         let bofs = bi * rows;
         // 16 rows x 32 rungs: each thread stages two.
         for (var q = lid; q < 512u; q = q + 256u) {
             let r = base + (q >> 5u);
-            if (r < total) {
-                let pr = unpack2x16float(q1w[params_w + r - bofs]);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
                 lad_q16[q] = exp2(pr.x + f32(q & 31u) * pr.y);
             }
         }
         workgroupBarrier();
-        let r_a = base + sub * 4u;
-        let r_b = r_a + 1u;
-        let r_c = r_a + 2u;
-        let r_d = r_a + 3u;
-        let w_a = r_a - bofs;
-        let w_b = r_b - bofs;
-        let w_c = r_c - bofs;
-        let w_d = r_d - bofs;
+        // w_* index the weight; r_* index the output, one batch apart.
+        let w_a = base + sub * 4u;
+        let w_b = w_a + 1u;
+        let w_c = w_a + 2u;
+        let w_d = w_a + 3u;
+        let r_a = bofs + w_a;
+        let r_b = bofs + w_b;
+        let r_c = bofs + w_c;
+        let r_d = bofs + w_d;
         // `_p1`: the low-rank group width, which slides the activation
         // window with the row. The FOUR rows this thread owns are
         // consecutive, so they share a window only when the width divides
         // the 16-row block — the caller checks that.
         var xblk = 0u;
         if (nb > 1u) { xblk = bi * gpr * 8u; }
-        else if (q1p._p1 > 0u) { xblk = (r_a / q1p._p1) * gpr * 8u; }
+        else if (q1p._p1 > 0u) { xblk = (w_a / q1p._p1) * gpr * 8u; }
         var aa = 0.0;
         var ab = 0.0;
         var ac = 0.0;
         var ad = 0.0;
-        if (r_a < total) {
-            let all_live = r_d < total;
+        if (w_a < rows) {
+            let all_live = w_d < rows;
             var g = l;
             loop {
                 if (g >= gpr) { break; }
@@ -2512,7 +2515,7 @@ fn q4tp_matvec16(@builtin(workgroup_id) wid: vec3<u32>,
                 aa = aa + sa
                     * (q4v_dot8(va.x, x0, x1) + q4v_dot8(va.y, x2, x3)
                      + q4v_dot8(va.z, x4, x5) + q4v_dot8(va.w, x6, x7));
-                if (all_live || r_b < total) {
+                if (all_live || w_b < rows) {
                     let crb = codes_b + w_b * cstride + cbo;
                     var cvb = q4tp_byte(crb);
                     if (sh > 3u) { cvb = cvb | (q4tp_byte(crb + 1u) << 8u); }
@@ -2522,7 +2525,7 @@ fn q4tp_matvec16(@builtin(workgroup_id) wid: vec3<u32>,
                         * (q4v_dot8(vb.x, x0, x1) + q4v_dot8(vb.y, x2, x3)
                          + q4v_dot8(vb.z, x4, x5) + q4v_dot8(vb.w, x6, x7));
                 }
-                if (all_live || r_c < total) {
+                if (all_live || w_c < rows) {
                     let crc = codes_b + w_c * cstride + cbo;
                     var cvc = q4tp_byte(crc);
                     if (sh > 3u) { cvc = cvc | (q4tp_byte(crc + 1u) << 8u); }
@@ -2532,7 +2535,7 @@ fn q4tp_matvec16(@builtin(workgroup_id) wid: vec3<u32>,
                         * (q4v_dot8(vc.x, x0, x1) + q4v_dot8(vc.y, x2, x3)
                          + q4v_dot8(vc.z, x4, x5) + q4v_dot8(vc.w, x6, x7));
                 }
-                if (all_live || r_d < total) {
+                if (all_live || w_d < rows) {
                     let crd = codes_b + w_d * cstride + cbo;
                     var cvd = q4tp_byte(crd);
                     if (sh > 3u) { cvd = cvd | (q4tp_byte(crd + 1u) << 8u); }
@@ -2563,13 +2566,13 @@ fn q4tp_matvec16(@builtin(workgroup_id) wid: vec3<u32>,
             stride = stride >> 1u;
         }
         if (l == 0u) {
-            if (r_a < total) { q1y[r_a] = p16_a[sub << 6u]; }
-            if (r_b < total) { q1y[r_b] = p16_b[sub << 6u]; }
-            if (r_c < total) { q1y[r_c] = p16_c[sub << 6u]; }
-            if (r_d < total) { q1y[r_d] = p16_d[sub << 6u]; }
+            if (w_a < rows) { q1y[r_a] = p16_a[sub << 6u]; }
+            if (w_b < rows) { q1y[r_b] = p16_b[sub << 6u]; }
+            if (w_c < rows) { q1y[r_c] = p16_c[sub << 6u]; }
+            if (w_d < rows) { q1y[r_d] = p16_d[sub << 6u]; }
         }
         workgroupBarrier();
-        base = base + nwg.x * 16u;
+        wb = wb + nwg.x;
     }
 }
 
@@ -2622,36 +2625,38 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
     // halves. Each row's group order and add order stay those of the
     // one-row kernel.
     // `_p0`: how many activation vectors share this weight. One is a matvec;
-    // more is a batch — the weight is read ONCE and used B times, which is
-    // the whole reason a chunk of prompt costs less than a walk over it, and
-    // the reason a speculative verify of B tokens is not B tokens' work. A
-    // row block must belong to one batch element, so the caller sets this
-    // only when rows divides evenly by the block.
+    // more is a batch. The BATCH is the fast axis of the dispatch, so the
+    // workgroups that read the same weight rows are neighbours and meet in
+    // L2; walking the whole output space instead put them `rows/16` apart,
+    // which streams the weight once per batch element and defeats the point.
+    // Reuse is still L2's to give — this is not a register-blocked B kernel —
+    // so the win is a measurement, not a claim.
     let nb = max(q1p._p0, 1u);
-    let total = rows * nb;
-    var base = wid.x * 8u;
+    let blocks = (rows + 7u) / 8u;
+    var wb = wid.x;
     loop {
-        if (base >= total) { break; }
-        let bi = base / rows;
+        if (wb >= blocks * nb) { break; }
+        let bi = wb % nb;
+        let base = (wb / nb) * 8u;
         let bofs = bi * rows;
         {
             let r = base + (lid >> 5u);
-            if (r < total) {
-                let pr = unpack2x16float(q1w[params_w + r - bofs]);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
                 lad_q4v[lid] = exp2(pr.x + f32(lid & 31u) * pr.y);
             }
         }
         workgroupBarrier();
-        let row_a = base + sub;
-        let row_b = base + sub + 4u;
-        let live_a = row_a < total;
-        let live_b = row_b < total;
-        let wrow_a = row_a - bofs;
-        let wrow_b = row_b - bofs;
+        let wrow_a = base + sub;
+        let wrow_b = base + sub + 4u;
+        let row_a = bofs + wrow_a;
+        let row_b = bofs + wrow_b;
+        let live_a = wrow_a < rows;
+        let live_b = wrow_b < rows;
         // In vec4 units: (row / lora) * gpr * 32 floats.
         var xblk = 0u;
         if (nb > 1u) { xblk = bi * gpr * 8u; }
-        else if (q1p._p1 > 0u) { xblk = (row_a / q1p._p1) * gpr * 8u; }
+        else if (q1p._p1 > 0u) { xblk = (wrow_a / q1p._p1) * gpr * 8u; }
         var acc_a = 0.0;
         var acc_b = 0.0;
         if (live_a) {
@@ -2707,10 +2712,10 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
             workgroupBarrier();
             stride = stride >> 1u;
         }
-        if (l == 0u && row_a < total) { q1y[row_a] = partial_q4v[sub << 6u]; }
-        if (l == 0u && row_b < total) { q1y[row_b] = partial_q4vb[sub << 6u]; }
+        if (l == 0u && wrow_a < rows) { q1y[row_a] = partial_q4v[sub << 6u]; }
+        if (l == 0u && wrow_b < rows) { q1y[row_b] = partial_q4vb[sub << 6u]; }
         workgroupBarrier();
-        base = base + nwg.x * 8u;
+        wb = wb + nwg.x;
     }
 }
 
@@ -7745,7 +7750,7 @@ fn moe_expert_bufs(
         return None;
     }
     let bytes = model.primary_bytes();
-    let key = (bytes.as_ptr() as usize, experts.first()?.0);
+    let key = (model.uid() as usize, experts.first()?.0);
     if let Some(t) = c.moe_expw.lock().unwrap().get(&key) {
         return Some(t.clone());
     }
@@ -7909,7 +7914,7 @@ pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize, may_upload: bool
     if abs + rows_total * cols > bytes.len() {
         return false;
     }
-    let key = (bytes.as_ptr() as usize, idx);
+    let key = (model.uid() as usize, idx);
     if c.weight_bufs.lock().unwrap().contains_key(&key) {
         return true;
     }
@@ -7949,7 +7954,7 @@ pub fn q8_matvec_range(
         return false;
     }
     let full_quant = &bytes[abs..abs + rows_total * cols];
-    let key = (bytes.as_ptr() as usize, idx);
+    let key = (model.uid() as usize, idx);
     dispatch_matvec(
         c,
         Some(key),
@@ -8150,7 +8155,7 @@ fn q1t_like(
     dispatch_q1t(
         c,
         pipeline,
-        Some((bytes.as_ptr() as usize, idx)),
+        Some((model.uid() as usize, idx)),
         &bytes[abs..abs + plen],
         xs,
         rows,
@@ -8283,7 +8288,7 @@ pub fn q1_matvec(
     }
     dispatch_q1(
         c,
-        Some((bytes.as_ptr() as usize, idx)),
+        Some((model.uid() as usize, idx)),
         &bytes[abs..abs + plen],
         xs,
         rows,
@@ -8542,7 +8547,7 @@ fn q1_weight(c: &Ctx, model: &Arc<CmfModel>, idx: usize) -> Option<(wgpu::Buffer
     if abs + plen > bytes.len() {
         return None;
     }
-    let buf = weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen])?;
+    let buf = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])?;
     Some((buf, rows, cols))
 }
 
@@ -8562,7 +8567,7 @@ fn tile_weight(c: &Ctx, model: &Arc<CmfModel>, idx: usize) -> Option<(wgpu::Buff
     if abs + plen > bytes.len() {
         return None;
     }
-    let buf = weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen])?;
+    let buf = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])?;
     Some((buf, rows, cols))
 }
 
@@ -8972,7 +8977,7 @@ pub fn forward_token_graph(
                 }
                 let b = weight_buffer(
                     c,
-                    (bytes.as_ptr() as usize, gw.idx),
+                    (model.uid() as usize, gw.idx),
                     &bytes[abs..abs + plen],
                 )?;
                 Some(GMat {
@@ -9499,7 +9504,7 @@ pub fn forward_token_graph(
             5 => {
                 if c.use_mv4 {
                     let gpr = cols / 32;
-                    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 0, 0]);
+                    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
                     let layout = c.q4t_mv8.get_bind_group_layout(0);
                     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
@@ -9591,7 +9596,7 @@ pub fn forward_token_graph(
             // ~2 ms of arithmetic for the whole MoE block.
             2 | 5 | 6 => {
                 let gpr = cols / 32;
-                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 0, 0]);
+                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
                 if m.kind == 2 && c.use_mv4 {
                     let layout = c.q4b_mv8.get_bind_group_layout(0);
                     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -9632,6 +9637,10 @@ pub fn forward_token_graph(
                     } else {
                         (&c.q4tp_mv4, 8u32)
                     };
+                    // Word 2 is the batch count for THIS pair and `cols` for
+                    // everything else bound to the same struct — the shared
+                    // uniform above cannot serve both.
+                    let p6 = uniform_u32x4(c, [gpr as u32, rows as u32, 1, 0]);
                     let layout = pipe6.get_bind_group_layout(0);
                     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
@@ -9639,7 +9648,7 @@ pub fn forward_token_graph(
                         entries: &[
                             bind_buf(0, &m.buf),
                             bind_buf(2, y),
-                            bind_buf(3, &p_buf),
+                            bind_buf(3, &p6),
                             bind_buf(4, &m.buf),
                             bind_buf(5, xs),
                         ],
@@ -9666,7 +9675,7 @@ pub fn forward_token_graph(
             }
             3 => {
                 let gpr = cols / 32;
-                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 0, 0]);
+                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
                 let layout = c.q1t.get_bind_group_layout(0);
                 let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
@@ -11592,7 +11601,7 @@ pub fn forward_batch_graph(
             5 => {
                 if c.use_mv4 {
                     let gpr = cols / 32;
-                    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 0, 0]);
+                    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
                     let layout = c.q4t_mv8.get_bind_group_layout(0);
                     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
@@ -12576,7 +12585,7 @@ pub fn q8_matmat(
     let full_quant = &bytes[abs..abs + rows * cols];
     dispatch_matmat(
         c,
-        Some((bytes.as_ptr() as usize, idx)),
+        Some((model.uid() as usize, idx)),
         full_quant,
         row_scale,
         pre,
@@ -12616,7 +12625,7 @@ pub fn q1_matmat(
     if abs + plen > bytes.len() {
         return false;
     }
-    let Some(w) = weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen]) else {
+    let Some(w) = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]) else {
         return false; // over VRAM budget → CPU path
     };
     let mut sc = c.scratch.lock().unwrap();
@@ -12860,7 +12869,7 @@ pub fn q4tp_matmat(
     if plen < need || abs + plen > bytes.len() || xs.len() < b * cols || out.len() < b * rows {
         return false;
     }
-    let q_buf = match weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen]) {
+    let q_buf = match weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]) {
         Some(bf) => bf,
         None => return false,
     };
@@ -12967,7 +12976,7 @@ pub fn q4t_matmat(
     {
         return false;
     }
-    let q_buf = match weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen]) {
+    let q_buf = match weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]) {
         Some(bf) => bf,
         None => return false,
     };
@@ -13115,7 +13124,7 @@ pub fn q4tp_matvec_batch_for_test(
     if plen < need || abs + plen > bytes.len() {
         return false;
     }
-    let Some(q_buf) = weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen])
+    let Some(q_buf) = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])
     else {
         return false;
     };
@@ -13692,7 +13701,7 @@ pub fn q4t_qkv(
         if plen < rows * gpr * 18 || abs + plen > bytes.len() {
             return None;
         }
-        weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen])
+        weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])
     };
     let (Some(bq), Some(bk), Some(bv)) = (wbuf(wq, rq), wbuf(wk, rk), wbuf(wv, rv)) else {
         return false;
@@ -13807,7 +13816,7 @@ pub fn q4t_ffn(
         if plen < rows * (cols / 32) * 18 || abs + plen > bytes.len() {
             return None;
         }
-        weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen])
+        weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])
     };
     let (Some(q1), Some(q3), Some(q2)) = (
         wbuf(w1, inter, hidden),
@@ -13954,7 +13963,7 @@ pub fn q1t_matmat(
     }
     dispatch_q1t_mm(
         c,
-        Some((bytes.as_ptr() as usize, idx)),
+        Some((model.uid() as usize, idx)),
         &bytes[abs..abs + plen],
         xs,
         b,
@@ -14340,7 +14349,7 @@ fn tensor_weight(
     }
     weight_buffer(
         c,
-        (bytes.as_ptr() as usize, idx),
+        (model.uid() as usize, idx),
         &bytes[abs..abs + rows * cols],
     )
 }
@@ -14365,7 +14374,7 @@ fn tensor_weight_sized(
     }
     weight_buffer(
         c,
-        (bytes.as_ptr() as usize, idx),
+        (model.uid() as usize, idx),
         &bytes[abs..abs + payload],
     )
 }
@@ -14945,8 +14954,8 @@ fn encode_q4tp_mv4(
 /// which is the point: a prompt chunk and a speculative verify both need
 /// exactly this and nothing else.
 ///
-/// Returns false when the shape cannot be blocked — a row block has to sit
-/// inside one batch element — and the caller falls back to one call each.
+/// Always encodes: the row blocking sits inside one batch element by
+/// construction, so no shape is refused.
 #[allow(clippy::too_many_arguments)]
 fn encode_q4tp_mv4_b(
     c: &Ctx,
@@ -14962,15 +14971,7 @@ fn encode_q4tp_mv4_b(
     // Narrow shapes (one group per lane in the 8-row kernel) go 16-rows.
     // With a batch the divisibility decides first: a block that straddled
     // two tokens would read one token's weights against the other's x.
-    let (pipe, per_wg) = if batch > 1 {
-        if rows % 16 == 0 && gpr <= 64 {
-            (&c.q4tp_mv16, 16u32)
-        } else if rows % 8 == 0 {
-            (&c.q4tp_mv4, 8u32)
-        } else {
-            return false;
-        }
-    } else if gpr <= 64 {
+    let (pipe, per_wg) = if gpr <= 64 {
         (&c.q4tp_mv16, 16u32)
     } else {
         (&c.q4tp_mv4, 8u32)
@@ -14991,8 +14992,10 @@ fn encode_q4tp_mv4_b(
     let mut pass = begin_pass(enc);
     pass.set_pipeline(pipe);
     pass.set_bind_group(0, &bind, &[]);
+    // One workgroup per (row block, batch element); the batch is the fast
+    // axis inside the kernel, so a row block is never split across two.
     pass.dispatch_workgroups(
-        ((rows * batch) as u32).div_ceil(per_wg).min(MAX_WG),
+        ((rows as u32).div_ceil(per_wg) * batch as u32).min(MAX_WG),
         1,
         1,
     );
@@ -15078,7 +15081,7 @@ fn encode_q4tp_mvw_p(
         (&c.q4tp_mv4, 8u32)
     };
     let bind = cached_bind(c, bkey, || {
-        let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 0, 0]);
+        let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &pipe.get_bind_group_layout(0),
@@ -15216,7 +15219,7 @@ fn encode_q1t_like(
     cols: usize,
 ) {
     let gpr = cols / 32;
-    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 0, 0]);
+    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
     let layout = pipeline.get_bind_group_layout(0);
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
@@ -15246,7 +15249,7 @@ fn encode_silu_down(
     cols: usize,
 ) {
     let gpr = cols / 32;
-    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 0, 0]);
+    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &c.layout_silu_down,
@@ -15289,7 +15292,7 @@ fn matvec_batch_q1(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f3
         if abs + plen > bytes.len() {
             return false;
         }
-        let Some(w) = weight_buffer(c, (bytes.as_ptr() as usize, j.idx), &bytes[abs..abs + plen])
+        let Some(w) = weight_buffer(c, (model.uid() as usize, j.idx), &bytes[abs..abs + plen])
         else {
             return false;
         };
@@ -17155,7 +17158,7 @@ pub fn o_lora_a_for_test(
     if abs + plen > bytes.len() {
         return false;
     }
-    let Some(w) = weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen]) else {
+    let Some(w) = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]) else {
         return false; // over budget → the caller keeps it on the CPU
     };
     let xb = storage_bytes(c, bytemuck::cast_slice(&attn[..groups * cols]));
@@ -18211,7 +18214,7 @@ fn dsv4_layer_frame_enc(
         let (Some(abs), plen) = (model.entry_abs_offset(e), e.nbytes as usize) else {
             no!("{} без смещения", e.name);
         };
-        let Some(b) = weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen])
+        let Some(b) = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])
         else {
             no!("{} не влез в VRAM", e.name);
         };
@@ -18667,7 +18670,7 @@ pub fn dsv4_weight_ready(model: &Arc<CmfModel>, idx: usize) -> bool {
     if abs + plen > bytes.len() {
         return false;
     }
-    weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen]).is_some()
+    weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]).is_some()
 }
 
 /// How many experts of this shape still fit on the card. The caller packs
@@ -19684,7 +19687,7 @@ pub fn dsv4_compressor_frame(
         bytes.get(abs..abs + plen)?;
         wb.push(weight_buffer(
             c,
-            (bytes.as_ptr() as usize, idx),
+            (model.uid() as usize, idx),
             &bytes[abs..abs + plen],
         )?);
     }
@@ -19844,7 +19847,7 @@ pub fn dsv4_window_append(
     let abs = model.entry_abs_offset(e)?;
     let plen = e.nbytes as usize;
     bytes.get(abs..abs + plen)?;
-    let wb = weight_buffer(c, (bytes.as_ptr() as usize, wkv), &bytes[abs..abs + plen])?;
+    let wb = weight_buffer(c, (model.uid() as usize, wkv), &bytes[abs..abs + plen])?;
 
     let raw = frame_buf(c, 104, hd * 4, false);
     let kv = frame_buf(c, 105, hd * 4, false);
@@ -19928,14 +19931,12 @@ pub fn dsv4_window_place_for_test(
     // pointing at the first one. Production hands it `frame_buf` for the
     // same reason.
     let rb = frame_up(c, 112, bytemuck::cast_slice(&raw[..hd]));
-    let cache = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: (window * hd * 4) as u64,
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_SRC
-            | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    // Pooled for the SAME reason as `rb` above, and the reason is not
+    // decorative: the final blit caches its bind group by key, so a fresh
+    // buffer each call leaves that group pointing at the first one. The new
+    // entry then lands in a buffer nobody reads and the slot stays zero —
+    // which is what this test reported for two months as a kernel fault.
+    let cache = frame_buf(c, 113, window * hd * 4, true);
     c.queue.write_buffer(&cache, 0, bytemuck::cast_slice(seed));
     let mut enc = c
         .device
@@ -20025,7 +20026,7 @@ pub fn dsv4_indexer_frame(
         bytes.get(abs..abs + plen)?;
         wb.push(weight_buffer(
             c,
-            (bytes.as_ptr() as usize, idx),
+            (model.uid() as usize, idx),
             &bytes[abs..abs + plen],
         )?);
     }
@@ -20296,27 +20297,14 @@ pub fn dsv4_comp_state_for_test(
         norm,
         ape,
     };
-    // Explicit usages: these are copy sources (into the pending streams) and
-    // the destination is both written by a copy and read back.
-    let up = |data: &[f32]| {
-        use wgpu::util::DeviceExt;
-        c.device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(data),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            })
-    };
-    let kb = up(&ckv[..width]);
-    let sb = up(&csc[..width]);
-    let dst = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: (ew * 4) as u64,
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_SRC
-            | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    // POOLED, all three. The steps inside cache their bind groups by key, so
+    // a buffer freshly created per call leaves those groups bound to the
+    // first call's memory: writes land where nothing reads them and the
+    // result reads as a broken kernel. Production hands these in from the
+    // frame pool for exactly this reason.
+    let kb = frame_up(c, 114, bytemuck::cast_slice(&ckv[..width]));
+    let sb = frame_up(c, 115, bytemuck::cast_slice(&csc[..width]));
+    let dst = frame_buf(c, 116, ew * 4, true);
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -20739,7 +20727,7 @@ pub fn dsv4_attn_frame(
         if abs + plen > bytes.len() {
             no!("{} выходит за файл", e.name);
         }
-        let Some(b) = weight_buffer(c, (bytes.as_ptr() as usize, idx), &bytes[abs..abs + plen])
+        let Some(b) = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])
         else {
             no!("{} не поместился в бюджет VRAM", e.name);
         };
