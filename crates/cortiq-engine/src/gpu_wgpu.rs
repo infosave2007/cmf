@@ -17778,6 +17778,9 @@ pub fn dsv4_encode_prep(
             ) };
         }
     }
+    if dsv4_skip("win") {
+        return Some(m.unwrap_or(p.filled.min(window)));
+    }
     let filled = dsv4_window_append(
         model, p.wkv, p.kv_norm, hidden, cache, hd, window, p.filled, dim, rope_dim, eps,
         pos, inv_freq, kv_id, li, enc,
@@ -18147,7 +18150,7 @@ fn dsv4_layer_frame_enc(
             // The next layer's LoRA vector, but only when the host is not
             // going to hand it over anyway — the indexer needs `qr` there, so
             // today it projects it regardless and computing it twice is waste.
-            if qn.is_none() {
+            if qn.is_none() && !dsv4_skip("nextq") {
                 encode_q4tp_mvw_p(&mut pass, c, &wb[4], &x2, &qr2, a.q_lora, dim,
                     (52, kv_id, li));
                 encode_rmsnorm_p(&mut pass, c, &qr2, &next_qn, &qn2, a.q_lora, a.eps,
