@@ -19,6 +19,10 @@ pub struct SplitMix64 {
 pub struct SamplerScratch {
     seen_epoch: Vec<u32>,
     epoch: u32,
+    /// The working copy of the logits. At a 129k vocab that is half a
+    /// megabyte allocated, filled and dropped per token; the struct that
+    /// exists to hold scratch may as well hold this one too.
+    probs: Vec<f32>,
 }
 
 impl SamplerScratch {
@@ -123,7 +127,14 @@ pub fn sample_with_scratch(
     {
         return argmax(logits);
     }
-    let mut probs = logits.to_vec();
+    // Borrowed from the scratch and handed back at the single exit: at a
+    // 129k vocab this copy is half a megabyte allocated, filled and dropped
+    // per token, and the struct that exists to hold scratch may as well
+    // hold it. Every early return goes through `done` so the buffer never
+    // leaks back to the allocator.
+    let mut probs = std::mem::take(&mut scratch.probs);
+    probs.clear();
+    probs.extend_from_slice(logits);
 
     for &tok in &config.suppress_tokens {
         if (tok as usize) < probs.len() {
@@ -135,8 +146,14 @@ pub fn sample_with_scratch(
         apply_repetition_penalty(&mut probs, past_tokens, config.repetition_penalty, scratch);
     }
 
+    let mut done = |probs: Vec<f32>, tok: u32| -> u32 {
+        scratch.probs = probs;
+        tok
+    };
+
     if config.temperature < 1e-6 {
-        return argmax(&probs); // greedy
+        let t = argmax(&probs); // greedy
+        return done(probs, t);
     }
     if config.temperature != 1.0 {
         for p in probs.iter_mut() {
@@ -171,20 +188,60 @@ pub fn sample_with_scratch(
         }
     } else {
         // Everything filtered out — fall back to greedy over original logits.
-        return argmax(logits);
+        let t = argmax(logits);
+        return done(probs, t);
     }
 
-    categorical_sample(&probs, rng.next_f32())
+    let t = categorical_sample(&probs, rng.next_f32());
+    done(probs, t)
 }
 
 /// Greedy: index of the maximum value.
+///
+/// Four running maxima instead of one: the scalar `max_by` carried a loop
+/// dependency through the comparison, which at a 129k vocab is a tenth of a
+/// millisecond of pure serial work per token.
+///
+/// Ties resolve to the HIGHEST index — not an arbitrary choice, it is what
+/// `Iterator::max_by` does (it keeps the last of several equal maxima) and
+/// therefore what this has always returned. `explain`'s preview compares
+/// its own argmax against what greedy emits, and that test is what catches
+/// the flip.
 pub fn argmax(values: &[f32]) -> u32 {
-    values
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+    if values.is_empty() {
+        return 0;
+    }
+    let n = values.len();
+    let mut best = [(0usize, f32::NEG_INFINITY); 4];
+    for (l, b) in best.iter_mut().enumerate() {
+        b.0 = l.min(n - 1);
+    }
+    let mut i = 0;
+    while i + 4 <= n {
+        for l in 0..4 {
+            let v = values[i + l];
+            if v >= best[l].1 {
+                best[l] = (i + l, v);
+            }
+        }
+        i += 4;
+    }
+    let mut bi = best[0].0;
+    let mut bv = best[0].1;
+    for b in &best[1..] {
+        if b.1 > bv || (b.1 == bv && b.0 > bi) {
+            bi = b.0;
+            bv = b.1;
+        }
+    }
+    while i < n {
+        if values[i] >= bv {
+            bv = values[i];
+            bi = i;
+        }
+        i += 1;
+    }
+    bi as u32
 }
 
 fn softmax_inplace(logits: &mut [f32]) {
@@ -285,6 +342,36 @@ fn categorical_sample(probs: &[f32], r: f32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    /// The four-lane argmax against the obvious scalar one, including the
+    /// tie rule: `max_by` keeps the LAST of several equal maxima, and a
+    /// lane split that quietly picked the first would move greedy output on
+    /// any model with two equally-likely tokens.
+    #[test]
+    fn argmax_lanes_match_the_scalar_one_ties_and_all() {
+        // The reference IS the old implementation, `max_by` and all — the
+        // point is that nothing observable changed, tie rule included.
+        let scalar = |v: &[f32]| -> u32 {
+            v.iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0)
+        };
+        for n in 0..40usize {
+            for seed in 0..8u64 {
+                let mut r = super::SplitMix64::new(seed * 7 + n as u64);
+                // Quantized to few distinct values on purpose: ties are the
+                // case the lanes can get wrong and random floats never hit.
+                let v: Vec<f32> = (0..n)
+                    .map(|_| ((r.next_u64() % 5) as f32) - 2.0)
+                    .collect();
+                assert_eq!(super::argmax(&v), scalar(&v), "n={n} seed={seed} {v:?}");
+            }
+        }
+        let flat = vec![f32::NEG_INFINITY; 13];
+        assert_eq!(super::argmax(&flat), scalar(&flat));
+    }
+
     use super::*;
 
     #[test]
