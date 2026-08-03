@@ -18304,13 +18304,13 @@ fn dsv4_layer_frame_enc(
     let next_qn = const_buf(c, bytemuck::cast_slice(&w.next_q_norm[..a.q_lora]));
 
     // ── per-call uploads ──
-    let posb = frame_up_pos(c, 1, pos, a.eps);
+    let posb = frame_up_pos_t(c, 1, tok, pos, a.eps);
     let ixb = {
         // Flat 1024 — the attention list's hard ceiling (the m > 1024
         // guard). 4 KB buys a PERMANENT identity: frame_buf keys on
         // (tag, len), so a growing capacity would mint a new buffer while
         // every cached group kept the old one, with no GREW bump to save it.
-        let b = frame_buf(c, 2, 1024 * 4, true);
+        let b = frame_buf_t(c, 2, tok, 1024 * 4, true);
         if !idxs.is_empty() {
             c.queue.write_buffer(&b, 0, bytemuck::cast_slice(idxs));
         }
@@ -18318,7 +18318,7 @@ fn dsv4_layer_frame_enc(
     };
     let qnb = match qn {
         Some(v) => frame_up(c, 4, bytemuck::cast_slice(&v[..a.q_lora])),
-        None => frame_buf(c, 4, a.q_lora * 4, true),
+        None => frame_buf_t(c, 4, tok, a.q_lora * 4, true),
     };
 
     // ── working buffers ──
@@ -18333,7 +18333,7 @@ fn dsv4_layer_frame_enc(
     // a copy destination as well as a kernel output. Without the flag the
     // layer-frame path fails validation at the first token — which is how
     // the release run caught it, and a unit test could not have.
-    let folded = frame_buf(c, 42, dim * 4, true);
+    let folded = frame_buf_t(c, 42, tok, dim * 4, true);
     let hpost = frame_buf(c, 43, hc * 4, true);
     let hcomb = frame_buf(c, 44, hc * hc * 4, true);
     let x2 = frame_buf(c, 45, dim * 4, false);
@@ -19219,6 +19219,22 @@ fn frame_buf_t(c: &Ctx, tag: u8, tok: usize, len_bytes: usize, upload: bool) -> 
 /// The position uniform, written once per TOKEN: its contents are the same
 /// for every layer, and the per-layer `frame_up` was 43 redundant queue
 /// writes a token.
+/// The position uniform for one token of a batch.
+///
+/// It cannot share a slot: several `write_buffer` calls land before the
+/// submission, so every bind group would read the LAST position written and
+/// the whole batch would attend at one place. The write-skip cache is only
+/// safe for the single-token path, so the batch always writes.
+fn frame_up_pos_t(c: &Ctx, tag: u8, tok: usize, pos: usize, eps: f32) -> wgpu::Buffer {
+    if tok == 0 {
+        return frame_up_pos(c, tag, pos, eps);
+    }
+    let b = frame_buf_t(c, tag, tok, 8, true);
+    c.queue
+        .write_buffer(&b, 0, bytemuck::cast_slice(&[pos as f32, eps]));
+    b
+}
+
 fn frame_up_pos(c: &Ctx, tag: u8, pos: usize, eps: f32) -> wgpu::Buffer {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST: [AtomicU64; 256] = [const { AtomicU64::new(u64::MAX) }; 256];
