@@ -5144,6 +5144,9 @@ pub fn dspark_draft(
     for i in 0..block {
         let mut folded = vec![0.0f32; dim];
         hc_head_fold(&states[i], hfn, hscale, hbase, cfg, pool, &mut folded);
+        // The confidence head reads the fold BEFORE the norm — upstream
+        // norms only on the way into the head — so the copy is taken here.
+        let pre_norm = folded.clone();
         rms_weighted(&mut folded, hnorm, cfg.norm_eps);
         g.head.matvec(&folded, &mut logits, pool);
         // The markov head biases the logits from the PREVIOUS token — a
@@ -5164,7 +5167,7 @@ pub fn dspark_draft(
             }
         }
         if let Some(cf) = last.confidence.as_ref() {
-            let mut cat = folded.clone();
+            let mut cat = pre_norm.clone();
             cat.extend_from_slice(&mk_embed);
             let mut s = [0.0f32; 1];
             if cat.len() == cf.cols() {
