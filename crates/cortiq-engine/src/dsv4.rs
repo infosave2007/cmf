@@ -3374,12 +3374,16 @@ pub fn pick_tally_take() -> Vec<(usize, Vec<usize>)> {
 /// How many distinct experts a set of per-token pick lists reaches, and how
 /// many picks it makes. The ratio is what a batched MoE can hope to save.
 pub fn tally_unique(picks: &[(usize, Vec<usize>)]) -> (usize, usize) {
+    // Keyed by (layer, expert). Expert 17 of layer 3 and expert 17 of layer 4
+    // are different weights, and counting them as one understated the traffic
+    // a batch has to read — badly for the draft, whose three stages each have
+    // their own 256.
     let mut seen = std::collections::HashSet::new();
     let mut total = 0;
-    for (_, v) in picks {
+    for (li, v) in picks {
         total += v.len();
         for &e in v {
-            seen.insert(e);
+            seen.insert((*li, e));
         }
     }
     (seen.len(), total)
@@ -4892,21 +4896,36 @@ mod tests {
 /// The noise token the block's unknown positions carry
 /// (`dspark_noise_token_id`).
 pub const DSPARK_NOISE_TOKEN: u32 = 128799;
-/// `dspark_block_size` — how many positions one draft proposes. Upstream
-/// trains at 5; the survival curve says the last two are paid for on every
-/// verify and delivered on four percent of them, so the width worth running
-/// is a measurement. `CMF_DSPARK_BLOCK=N` sets it, 5 stays the default
-/// because that is what the noise-token padding was trained against.
+/// `dspark_block_size` — the width of the draft block, and NOT a tuning knob.
+///
+/// All five positions attend to each other and the model was trained with
+/// exactly four noise slots behind the real token, so a narrower block is a
+/// different draft model, not a cheaper one. What the survival curve argues
+/// for is verifying fewer of the five — see `dspark_verify_k` — which costs
+/// less without changing what the draft computes.
 pub fn dspark_block() -> usize {
-    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *B.get_or_init(|| {
-        std::env::var("CMF_DSPARK_BLOCK")
+    5
+}
+
+/// How many of the block's proposals the trunk actually checks.
+///
+/// Survival is [0.67, 0.50, 0.29, 0.08, 0.04]: positions four and five are
+/// paid for on every verify and delivered on a twelfth of them. Three yields
+/// 2.46 tokens a cycle against five's 2.58, for three fifths of the verify.
+/// `CMF_DSPARK_VERIFY_K=N` sets it.
+pub fn dspark_verify_k() -> usize {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("CMF_DSPARK_VERIFY_K")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n >= 1 && n <= 16)
-            .unwrap_or(5)
+            .filter(|&n| (1..=DSPARK_BLOCK_MAX).contains(&n))
+            .unwrap_or(DSPARK_BLOCK_MAX)
     })
 }
+
+/// The trained block width.
+pub const DSPARK_BLOCK_MAX: usize = 5;
 
 /// Per-sequence state of the draft: one KV ring per stage, and the trunk
 /// hidden states the block's input is projected from.
