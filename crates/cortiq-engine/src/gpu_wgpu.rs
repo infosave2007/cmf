@@ -5584,7 +5584,7 @@ fn sparse_attend(@builtin(workgroup_id) wid: vec3<u32>,
 // Sizes are small where it matters: hc is 4, mix_hc is 24, and only the fold
 // runs over dim. One workgroup owns the whole thing.
 
-struct HcP { hc: u32, dim: u32, iters: u32, eps: f32 };
+struct HcP { hc: u32, dim: u32, iters: u32, eps: f32, nrm: u32, _a: u32, _b: u32, _c: u32 };
 
 @group(0) @binding(0) var<storage, read>       hc_state : array<f32>;   // hc*dim
 @group(0) @binding(1) var<storage, read>       hc_mix   : array<f32>;   // mix_hc, raw
@@ -5594,6 +5594,11 @@ struct HcP { hc: u32, dim: u32, iters: u32, eps: f32 };
 @group(0) @binding(5) var<storage, read_write> hc_post  : array<f32>;   // hc
 @group(0) @binding(6) var<storage, read_write> hc_comb  : array<f32>;   // hc*hc
 @group(0) @binding(7) var<uniform>             hc_p     : HcP;
+// The norm that ALWAYS follows the fold. Its own dispatch cost as much as
+// the fold did and it reduces over the same vector this workgroup just
+// wrote, so it is a phase, not a kernel. `hc_nrm != 0` turns it on.
+@group(0) @binding(8) var<storage, read>       hc_nw    : array<f32>;   // dim
+@group(0) @binding(9) var<storage, read_write> hc_out   : array<f32>;   // dim
 
 var<workgroup> hc_red: array<f32, 256>;
 var<workgroup> hc_pre_w: array<f32, 8>;
@@ -5687,7 +5692,8 @@ fn hc_pre_fold(@builtin(local_invocation_index) lid: u32) {
     }
     workgroupBarrier();
 
-    // fold: y[d] = sum_j pre[j] * state[j*dim + d]
+    // fold: y[d] = sum_j pre[j] * state[j*dim + d], and its sum of squares
+    var acc3 = 0.0;
     var d = lid;
     loop {
         if (d >= dim) { break; }
@@ -5696,7 +5702,25 @@ fn hc_pre_fold(@builtin(local_invocation_index) lid: u32) {
             y = y + hc_pre_w[j] * hc_state[j * dim + d];
         }
         hc_fold[d] = y;
+        acc3 = acc3 + y * y;
         d = d + 256u;
+    }
+    if (hc_p.nrm == 0u) { return; }
+    hc_red[lid] = acc3;
+    workgroupBarrier();
+    var st2 = 128u;
+    loop {
+        if (st2 == 0u) { break; }
+        if (lid < st2) { hc_red[lid] = hc_red[lid] + hc_red[lid + st2]; }
+        workgroupBarrier();
+        st2 = st2 >> 1u;
+    }
+    let inv = inverseSqrt(hc_red[0] / f32(dim) + hc_p.eps);
+    var d2 = lid;
+    loop {
+        if (d2 >= dim) { break; }
+        hc_out[d2] = hc_fold[d2] * inv * hc_nw[d2];
+        d2 = d2 + 256u;
     }
 }
 
@@ -16676,7 +16700,7 @@ fn encode_hc_fold_k(
     bkey: (u8, u64, usize),
 ) {
     let mut pass = begin_pass(enc);
-    encode_hc_fold_k_p(&mut pass, c, state, mixes, sc, base, fold, post, comb, p, bkey);
+    encode_hc_fold_k_p(&mut pass, c, state, mixes, sc, base, fold, post, comb, p, None, bkey);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16691,8 +16715,15 @@ fn encode_hc_fold_k_p(
     post: &wgpu::Buffer,
     comb: &wgpu::Buffer,
     p: &wgpu::Buffer,
+    // The norm that always follows: same workgroup, same reduction machinery,
+    // one dispatch instead of two.
+    nrm: Option<(&wgpu::Buffer, &wgpu::Buffer)>,
     bkey: (u8, u64, usize),
 ) {
+    // The norm's weight and output must be BOUND either way — a bind group
+    // has to satisfy the layout — so the absent case binds the fold buffer
+    // twice and the kernel skips the phase.
+    let (nw, out) = nrm.unwrap_or((fold, fold));
     let bind = cached_bind(c, bkey, || c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &c.hc_pre_fold.get_bind_group_layout(0),
@@ -16705,6 +16736,8 @@ fn encode_hc_fold_k_p(
             bind_buf(5, post),
             bind_buf(6, comb),
             bind_buf(7, p),
+            bind_buf(8, nw),
+            bind_buf(9, out),
         ],
     }));
     pass.set_pipeline(&c.hc_pre_fold);
@@ -17464,10 +17497,14 @@ fn dsv4_layer_frame_enc(
     let qr2 = frame_buf(c, 48, a.q_lora * 4, false);
     let qn2 = frame_buf(c, 49, a.q_lora * 4, false);
 
-    let hcp = uniform_mixed(
+    // Eight words now: the fifth says whether the fold also norms.
+    let hcp = uniform_u32x8(
         c,
-        [hc as u32, dim as u32, g.sinkhorn_iters as u32],
-        g.hc_eps,
+        [hc as u32, dim as u32, g.sinkhorn_iters as u32, g.hc_eps.to_bits(), 0, 0, 0, 0],
+    );
+    let hcp_n = uniform_u32x8(
+        c,
+        [hc as u32, dim as u32, g.sinkhorn_iters as u32, g.hc_eps.to_bits(), 1, 0, 0, 0],
     );
 
     // ── the layer's own preparation, when it owns it ──
@@ -17520,9 +17557,9 @@ fn dsv4_layer_frame_enc(
             (120, kv_id, li));
         encode_f32matvec_k_p(&mut pass, c, &ffn_fn, &state2, &mixes, mix_hc, hc * dim,
             (121, kv_id, li));
+        // The fold norms too: one dispatch, not two.
         encode_hc_fold_k_p(&mut pass, c, &state2, &mixes, &ffn_sc, &ffn_bs, &folded, &hpost,
-            &hcomb, &hcp, (122, kv_id, li));
-        encode_rmsnorm_p(&mut pass, c, &folded, &ffn_nw, &x2, dim, a.eps, (50, kv_id, li));
+            &hcomb, &hcp_n, Some((&ffn_nw, &x2)), (122, kv_id, li));
         }
         }
 
@@ -17557,8 +17594,7 @@ fn dsv4_layer_frame_enc(
             encode_f32matvec_k_p(&mut pass, c, &nfn, &state, &mixes, mix_hc, hc * dim,
                 (125, kv_id, li));
             encode_hc_fold_k_p(&mut pass, c, &state, &mixes, &nsc, &nbs, &folded, &hpost,
-                &hcomb, &hcp, (126, kv_id, li));
-            encode_rmsnorm_p(&mut pass, c, &folded, &next_nw, &x2, dim, a.eps, (51, kv_id, li));
+                &hcomb, &hcp_n, Some((&next_nw, &x2)), (126, kv_id, li));
             }
             // The next layer's LoRA vector, but only when the host is not
             // going to hand it over anyway — the indexer needs `qr` there, so
@@ -19944,10 +19980,9 @@ pub fn dsv4_attn_frame(
         let mixes = frame_buf(c, 41, mix_hc * 4, true);
         let folded = frame_buf(c, 42, g.dim * 4, true);
         let x2 = frame_buf(c, 45, g.dim * 4, true);
-        let hcp = uniform_mixed(
+        let hcp = uniform_u32x8(
             c,
-            [h.hc as u32, g.dim as u32, h.sinkhorn_iters as u32],
-            h.hc_eps,
+            [h.hc as u32, g.dim as u32, h.sinkhorn_iters as u32, h.hc_eps.to_bits(), 0, 0, 0, 0],
         );
         let ffn_fn = const_buf(c, bytemuck::cast_slice(h.fn_));
         let ffn_sc = const_buf(c, bytemuck::cast_slice(h.scale));
@@ -20384,10 +20419,9 @@ pub fn dsv4_moe_frame(
         let state2 = frame_buf(c, 46, h.hc * g.hidden * 4, true);
         let hpost = frame_buf(c, 43, h.hc * 4, true);
         let hcomb = frame_buf(c, 44, h.hc * h.hc * 4, true);
-        let hcp = uniform_mixed(
+        let hcp = uniform_u32x8(
             c,
-            [h.hc as u32, g.hidden as u32, h.sinkhorn_iters as u32],
-            h.hc_eps,
+            [h.hc as u32, g.hidden as u32, h.sinkhorn_iters as u32, h.hc_eps.to_bits(), 0, 0, 0, 0],
         );
         encode_hc_expand(c, &mut enc, &ob, &state2, &hpost, &hcomb, &state, &hcp, h.hc, g.hidden);
     }
@@ -20400,10 +20434,9 @@ pub fn dsv4_moe_frame(
         let mixes = frame_buf(c, 41, mix_hc * 4, true);
         let folded = frame_buf(c, 42, g.hidden * 4, true);
         let x2 = frame_buf(c, 45, g.hidden * 4, true);
-        let hcp = uniform_mixed(
+        let hcp = uniform_u32x8(
             c,
-            [h.hc as u32, g.hidden as u32, h.sinkhorn_iters as u32],
-            h.hc_eps,
+            [h.hc as u32, g.hidden as u32, h.sinkhorn_iters as u32, h.hc_eps.to_bits(), 0, 0, 0, 0],
         );
         let nfn = const_buf(c, bytemuck::cast_slice(h.fn_));
         let nsc = const_buf(c, bytemuck::cast_slice(h.scale));
