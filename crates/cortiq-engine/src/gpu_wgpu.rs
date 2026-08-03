@@ -16841,6 +16841,17 @@ pub struct Dsv4Prep<'a> {
 /// layer is left in the frame's own buffer, which is where the next call
 /// looks for it. That is what lets a whole token be one submission.
 #[allow(clippy::too_many_arguments)]
+/// `CMF_DSV4_SKIP=attn|moe|prep|hc` — TIMING ONLY, the answer is garbage.
+/// Drops a stage's dispatches while leaving every buffer, pass and shape in
+/// place, so the delta in tok/s is that stage's real share of the token.
+/// Neither dispatch counting nor pass counting predicted the frame
+/// correctly on the qwen graph; there is no reason to trust them here.
+fn dsv4_skip(what: &str) -> bool {
+    static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::env::var("CMF_DSV4_SKIP").unwrap_or_default())
+        .contains(what)
+}
+
 fn dsv4_layer_frame_enc(
     model: &Arc<CmfModel>,
     w: &Dsv4LayerW,
@@ -17013,8 +17024,10 @@ fn dsv4_layer_frame_enc(
     };
 
     // ── attention half (the fold for it was prepared by the previous frame) ──
-    encode_attn_chain(c, enc, &wb, &qnb, &q, &attn, &mid, &ao, &cache, &ixb,
-                      &sink, &freq, &posb, a, kv_id, li, m_attend);
+    if !dsv4_skip("attn") {
+        encode_attn_chain(c, enc, &wb, &qnb, &q, &attn, &mid, &ao, &cache, &ixb,
+                          &sink, &freq, &posb, a, kv_id, li, m_attend);
+    }
 
     // ── glue: expand, then the FFN half's fold and norm ──
     // Everything from the attention output to the next layer's input is one
@@ -17035,8 +17048,11 @@ fn dsv4_layer_frame_enc(
         // ── MoE half ──
         encode_f32matvec_k_p(&mut pass, c, &router, &x2, &logit_b, n_pack, m.hidden,
             (123, kv_id, li));
-        encode_moe_chain_p(&mut pass, c, &logit_b, &x2, &msel, &mwt, &mcnt, &mact, &mo,
-                           &gate_all, &up_all, &down_all, w, m, n_pack, slots, (kv_id, li));
+        if !dsv4_skip("moe") {
+            encode_moe_chain_p(&mut pass, c, &logit_b, &x2, &msel, &mwt, &mcnt, &mact, &mo,
+                               &gate_all, &up_all, &down_all, w, m, n_pack, slots,
+                               (kv_id, li));
+        }
 
         // ── expand, then prepare the NEXT layer ──
         encode_hc_expand_k_p(&mut pass, c, &mo, &state2, &hpost, &hcomb, &state, &hcp, hc, dim,
