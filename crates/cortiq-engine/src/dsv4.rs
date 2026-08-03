@@ -3155,6 +3155,16 @@ pub fn moe_step(
             return;
         }
     }
+    // Cheap tally for the batching question: how many DISTINCT experts a
+    // group of tokens reaches. If five tokens want thirty different experts,
+    // a batched MoE reads thirty weights and amortises nothing — which is
+    // the difference between a speculative verify that pays for itself and
+    // one that does not. Disarmed it costs one thread-local read.
+    PICK_TALLY.with(|t| {
+        if let Some(v) = t.borrow_mut().as_mut() {
+            v.push((li, idx.to_vec()));
+        }
+    });
     if dump_path().is_some() {
         PICKED.with(|p| {
             let mut p = p.borrow_mut();
@@ -3340,6 +3350,33 @@ thread_local! {
     /// hugely for a reason that is not a bug in either.
     static PICKED: std::cell::RefCell<Vec<Vec<usize>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// (layer, chosen experts) in call order, when armed.
+    static PICK_TALLY: std::cell::RefCell<Option<Vec<(usize, Vec<usize>)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Start recording expert picks. Idempotent; the previous tally is dropped.
+pub fn pick_tally_arm() {
+    PICK_TALLY.with(|t| *t.borrow_mut() = Some(Vec::new()));
+}
+
+/// Take what was recorded and stop recording.
+pub fn pick_tally_take() -> Vec<(usize, Vec<usize>)> {
+    PICK_TALLY.with(|t| t.borrow_mut().take().unwrap_or_default())
+}
+
+/// How many distinct experts a set of per-token pick lists reaches, and how
+/// many picks it makes. The ratio is what a batched MoE can hope to save.
+pub fn tally_unique(picks: &[(usize, Vec<usize>)]) -> (usize, usize) {
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0;
+    for (_, v) in picks {
+        total += v.len();
+        for &e in v {
+            seen.insert(e);
+        }
+    }
+    (seen.len(), total)
 }
 
 fn dump_path() -> Option<&'static str> {
