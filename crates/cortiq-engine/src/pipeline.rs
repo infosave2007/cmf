@@ -4233,16 +4233,22 @@ fn draft_probe() -> bool {
         }
         let mut conf = Vec::new();
         crate::dsv4::pick_tally_arm();
-        let props = crate::dsv4::dspark_draft(
-            g,
-            &self.dsv4_mtp,
-            &cfg,
-            ds,
-            token_id,
-            position,
-            self.pool.as_deref(),
-            &mut conf,
-        );
+        // The trunk has already consumed the adaptive VRAM budget. Until the
+        // draft owns an explicit bounded device pack, its tensors are an
+        // out-of-core CPU/disk tier by contract: never let per-op probes try
+        // to squeeze another multi-gigabyte MTP expert cache onto the card.
+        let props = crate::gpu::cpu_scope(|| {
+            crate::dsv4::dspark_draft(
+                g,
+                &self.dsv4_mtp,
+                &cfg,
+                ds,
+                token_id,
+                position,
+                self.pool.as_deref(),
+                &mut conf,
+            )
+        });
         let draft_picks = crate::dsv4::pick_tally_take();
         // Re-arm for the NEXT trunk token; the probe runs after the forward,
         // so this is the only place that can.

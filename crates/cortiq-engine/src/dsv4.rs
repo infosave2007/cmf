@@ -1941,14 +1941,17 @@ fn dsv4_layer_loop(
             // tuning knob: length-1 runs put ONE layer per submission, which
             // separates "the layer frame is wrong" from "layers in one
             // encoder contaminate each other" in a single ppl run.
-            if run.len() >= chain_max() {
+            if run.len() >= chain_max() || dspark_wants(li) {
                 let need_qn = run[0] == 0 || !on_dev[run[0] - 1];
+                let captured = *run.last().unwrap();
                 if !dsv4_chain_run(
-                    layers, &run, cfg, g, st, token_id, &mut folded, None, 1, &[], need_qn, pool,
+                    layers, &run, cfg, g, st, token_id, &mut folded,
+                    Some(state), 1, &[], need_qn, pool,
                 ) {
                     return false;
                 }
-                state_on_host = false;
+                state_on_host = true;
+                dspark_note(captured, state, cfg);
                 run.clear();
             }
             continue;
@@ -1974,6 +1977,7 @@ fn dsv4_layer_loop(
                 return false;
             }
             state_on_host = true;
+            dspark_note(*run.last().unwrap(), state, cfg);
         }
         run.clear();
         if partial_dev[li] {
@@ -1996,6 +2000,9 @@ fn dsv4_layer_loop(
                 return false;
             };
             state_on_host = home;
+            if home {
+                dspark_note(li, state, cfg);
+            }
             continue;
         }
         if !on_dev[li] {
@@ -2061,6 +2068,7 @@ fn dsv4_layer_loop(
                     return false;
                 }
             }
+            dspark_note(li, state, cfg);
             continue;
         }
         let mut prep = AttnPrep::default();
@@ -2228,6 +2236,9 @@ fn dsv4_layer_loop(
                 );
                 state_home = r;
                 state_on_host = r;
+                if r {
+                    dspark_note(*run.last().unwrap(), state, cfg);
+                }
                 r
             } else {
                 let r = dsv4_chain_run(
@@ -3473,7 +3484,7 @@ pub fn moe_step(
     // happens there too — the logits above are what it starts from, so the
     // CPU's own choice is discarded rather than second-guessed.
     #[cfg(feature = "gpu")]
-    if gpu_moe2_enabled() {
+    if gpu_moe2_enabled() && crate::gpu::enabled_here() {
         let forced = l
             .tid2eid
             .as_ref()
@@ -5598,6 +5609,13 @@ pub fn dspark_arm(targets: &[usize], dim: usize) {
         c.1 = vec![0.0; dim * targets.len()];
         c.2 = 0;
     });
+}
+
+/// Whether the armed MTP capture needs the state immediately after `li`.
+/// The normal decode path keeps a full run in one submission; DSpark is the
+/// only caller that needs an intermediate state to cross the device boundary.
+fn dspark_wants(li: usize) -> bool {
+    DSPARK_CAP.with(|c| c.borrow().0.contains(&li))
 }
 
 /// Called after every host layer. Free when nothing is armed.
