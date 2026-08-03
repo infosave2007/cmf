@@ -3689,6 +3689,190 @@ fn run_expert(
     );
 }
 
+/// The same expert computation for several inputs, streaming each selected
+/// weight once. Used by DSpark's trained five-position block: running five
+/// ordinary `moe_step`s rereads the shared expert five times and every
+/// coincident routed expert once per position.
+fn moe_step_block(
+    xs: &[f32],
+    b: usize,
+    l: &Dsv4Layer,
+    cfg: &Dsv4Cfg,
+    token_ids: &[u32],
+    tally_layer: usize,
+    pool: Option<&crate::pool::Pool>,
+    out: &mut [f32],
+) {
+    let (dim, inter) = (cfg.dim, cfg.moe_inter);
+    debug_assert_eq!(xs.len(), b * dim);
+    debug_assert_eq!(out.len(), b * dim);
+    out.fill(0.0);
+
+    let mut logits = vec![0.0f32; b * cfg.n_routed_experts];
+    l.gate.matmat(xs, b, &mut logits, pool);
+    let mut picks: Vec<Vec<usize>> = Vec::with_capacity(b);
+    let mut weights: Vec<Vec<f32>> = Vec::with_capacity(b);
+    for bi in 0..b {
+        let mut idx = Vec::new();
+        let mut wt = Vec::new();
+        let forced = l.tid2eid.as_ref().map(|tbl| {
+            hash_route(
+                tbl,
+                cfg.vocab,
+                cfg.top_k,
+                token_ids.get(bi).copied().unwrap_or(0),
+            )
+        });
+        route(
+            &logits[bi * cfg.n_routed_experts..(bi + 1) * cfg.n_routed_experts],
+            l.gate_bias.as_deref(),
+            cfg.top_k,
+            cfg.route_scale,
+            forced.as_deref(),
+            l.mask.as_deref(),
+            &mut idx,
+            &mut wt,
+        );
+        PICK_TALLY.with(|t| {
+            if let Some(v) = t.borrow_mut().as_mut() {
+                v.push((tally_layer, idx.clone()));
+            }
+        });
+        picks.push(idx);
+        weights.push(wt);
+    }
+
+    // Preserve the scalar path's accumulation order by keeping every routed
+    // slot separate; grouping below changes only when a weight is read.
+    let mut routed = vec![0.0f32; b * cfg.top_k * dim];
+    for ei in 0..l.experts.len() {
+        let mut jobs = Vec::new();
+        for bi in 0..b {
+            for (slot, &picked) in picks[bi].iter().enumerate() {
+                if picked == ei {
+                    jobs.push((bi, slot, weights[bi][slot]));
+                }
+            }
+        }
+        if jobs.is_empty() {
+            continue;
+        }
+        let e = &l.experts[ei];
+        let n = jobs.len();
+        let mut xj = vec![0.0f32; n * dim];
+        for (j, &(bi, _, _)) in jobs.iter().enumerate() {
+            xj[j * dim..(j + 1) * dim]
+                .copy_from_slice(&xs[bi * dim..(bi + 1) * dim]);
+        }
+        let mut gate = vec![0.0f32; n * inter];
+        let mut up = vec![0.0f32; n * inter];
+        e.w1.matmat(&xj, n, &mut gate, pool);
+        e.w3.matmat(&xj, n, &mut up, pool);
+        for (j, &(_, _, wt)) in jobs.iter().enumerate() {
+            let (gj, uj) = (
+                &mut gate[j * inter..(j + 1) * inter],
+                &mut up[j * inter..(j + 1) * inter],
+            );
+            if cfg.swiglu_limit > 0.0 {
+                for u in uj.iter_mut() {
+                    *u = u.clamp(-cfg.swiglu_limit, cfg.swiglu_limit);
+                }
+                for g in gj.iter_mut() {
+                    *g = g.min(cfg.swiglu_limit);
+                }
+            }
+            for (g, &u) in gj.iter_mut().zip(uj.iter()) {
+                *g = (*g / (1.0 + (-*g).exp())) * u * wt;
+            }
+        }
+        let mut down = vec![0.0f32; n * dim];
+        e.w2.matmat(&gate, n, &mut down, pool);
+        for (j, &(bi, slot, _)) in jobs.iter().enumerate() {
+            routed[(bi * cfg.top_k + slot) * dim..(bi * cfg.top_k + slot + 1) * dim]
+                .copy_from_slice(&down[j * dim..(j + 1) * dim]);
+        }
+    }
+
+    // Shared expert: all positions always use it, so this is the highest
+    // certainty weight-sharing win in the block.
+    let mut sg = vec![0.0f32; b * inter];
+    let mut su = vec![0.0f32; b * inter];
+    l.shared.w1.matmat(xs, b, &mut sg, pool);
+    l.shared.w3.matmat(xs, b, &mut su, pool);
+    for bi in 0..b {
+        let (gj, uj) = (
+            &mut sg[bi * inter..(bi + 1) * inter],
+            &mut su[bi * inter..(bi + 1) * inter],
+        );
+        if cfg.swiglu_limit > 0.0 {
+            for u in uj.iter_mut() {
+                *u = u.clamp(-cfg.swiglu_limit, cfg.swiglu_limit);
+            }
+            for g in gj.iter_mut() {
+                *g = g.min(cfg.swiglu_limit);
+            }
+        }
+        for (g, &u) in gj.iter_mut().zip(uj.iter()) {
+            *g = (*g / (1.0 + (-*g).exp())) * u;
+        }
+    }
+    let mut shared = vec![0.0f32; b * dim];
+    l.shared.w2.matmat(&sg, b, &mut shared, pool);
+
+    for bi in 0..b {
+        let dst = &mut out[bi * dim..(bi + 1) * dim];
+        for slot in 0..picks[bi].len() {
+            let src = &routed[(bi * cfg.top_k + slot) * dim
+                ..(bi * cfg.top_k + slot + 1) * dim];
+            for (o, &v) in dst.iter_mut().zip(src) {
+                *o += v;
+            }
+        }
+        for (o, &v) in dst.iter_mut().zip(&shared[bi * dim..(bi + 1) * dim]) {
+            *o += v;
+        }
+    }
+}
+
+/// Grouped output projection for a block. `wo_a` cannot use a plain matmat
+/// because each group sees a different attention slice; reading a quantized
+/// row once and applying it to every block position gives the same dot order
+/// without rereading/dequantizing that row B times.
+fn o_project_block(
+    attn: &[f32],
+    b: usize,
+    wo_a: &crate::qtensor::QTensor,
+    wo_b: &crate::qtensor::QTensor,
+    groups: usize,
+    lora: usize,
+    pool: Option<&crate::pool::Pool>,
+    out: &mut [f32],
+) {
+    let attn_len = attn.len() / b;
+    let per_group = attn_len / groups;
+    let rows = groups * lora;
+    let mut mid = vec![0.0f32; b * rows];
+    let mid_addr = crate::pool::SendMut::new(mid.as_mut_ptr());
+    let run = |start: usize, end: usize| {
+        let mut wr = vec![0.0f32; wo_a.cols()];
+        for r in start..end {
+            wo_a.row_f32(r, &mut wr);
+            let group = r / lora;
+            for bi in 0..b {
+                let x = &attn[bi * attn_len + group * per_group
+                    ..bi * attn_len + (group + 1) * per_group];
+                let v = wr.iter().zip(x).map(|(w, x)| w * x).sum();
+                unsafe { *mid_addr.at(bi * rows + r) = v };
+            }
+        }
+    };
+    match pool {
+        Some(p) if rows >= 256 => p.run_rows(rows, &run),
+        _ => run(0, rows),
+    }
+    wo_b.matmat(&mid, b, out, pool);
+}
+
 /// `CMF_DSV4_TRACE=1` prints the hidden state's RMS after each half-block and
 /// the logits' shape at the end. A 300B model that decodes nonsense gives no
 /// other handle: this says whether the state grew, collapsed or went
@@ -5051,6 +5235,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn block_grouped_projection_matches_position_walk() {
+        let (_g, layers, cfg) = toy();
+        let l = &layers[1];
+        let b = 5;
+        let attn_len = cfg.n_heads * cfg.head_dim;
+        let attn: Vec<f32> = (0..b * attn_len)
+            .map(|i| ((i * 17) as f32 * 0.013).sin())
+            .collect();
+        let mut walked = vec![0.0f32; b * cfg.dim];
+        for bi in 0..b {
+            o_project(
+                &attn[bi * attn_len..(bi + 1) * attn_len],
+                &|r, x, sc| l.wo_a.row_dot(r, x, sc),
+                l.wo_a.cols(),
+                &|mid, dst| l.wo_b.matvec(mid, dst, None),
+                cfg.o_groups,
+                cfg.o_lora_rank,
+                None,
+                &mut walked[bi * cfg.dim..(bi + 1) * cfg.dim],
+            );
+        }
+        let mut batched = vec![0.0f32; b * cfg.dim];
+        o_project_block(
+            &attn,
+            b,
+            &l.wo_a,
+            &l.wo_b,
+            cfg.o_groups,
+            cfg.o_lora_rank,
+            None,
+            &mut batched,
+        );
+        assert_eq!(batched, walked);
+    }
+
+    #[test]
+    fn block_moe_matches_position_walk_in_route_order() {
+        let (_g, layers, cfg) = toy();
+        // The scored layer exercises repeated and distinct experts without
+        // tying the result to a token-id table.
+        let l = &layers[1];
+        let b = 5;
+        let xs: Vec<f32> = (0..b * cfg.dim)
+            .map(|i| ((i * 11) as f32 * 0.019).cos())
+            .collect();
+        let ids = [1u32, 2, 3, 4, 5];
+        let mut walked = vec![0.0f32; b * cfg.dim];
+        for bi in 0..b {
+            moe_step(
+                &xs[bi * cfg.dim..(bi + 1) * cfg.dim],
+                l,
+                &cfg,
+                ids[bi],
+                1,
+                None,
+                &mut walked[bi * cfg.dim..(bi + 1) * cfg.dim],
+            );
+        }
+        let mut batched = vec![0.0f32; b * cfg.dim];
+        moe_step_block(&xs, b, l, &cfg, &ids, 1, None, &mut batched);
+        assert_eq!(batched, walked);
+    }
+
     /// The overlapping compressor folds 2*ratio slots, not ratio: the
     /// previous window contributes its first half of dimensions and the
     /// current one its second half. Treating it as a plain compressor makes
@@ -5762,10 +6010,11 @@ pub fn dspark_draft(
             resid[i].copy_from_slice(&states[i]);
         }
         // Keys and values of the block itself — kept for this block only.
+        let folded_all: Vec<f32> = folded.iter().flatten().copied().collect();
         let mut blk_kv = vec![0.0f32; block * kvw];
+        l.wkv.matmat(&folded_all, block, &mut blk_kv, pool);
         for i in 0..block {
             let dst = &mut blk_kv[i * kvw..(i + 1) * kvw];
-            l.wkv.matvec(&folded[i], dst, pool);
             rms_weighted(dst, &l.kv_norm, cfg.norm_eps);
             rope_tail(&mut dst[kvw - hd..], inv_freq, pos + 1 + i, rd, false);
         }
@@ -5782,56 +6031,97 @@ pub fn dspark_draft(
         }
         let idxs: Vec<usize> = (0..win_len + block).collect();
         let scale = (hd as f32).powf(-0.5);
-        let mut blk_out = vec![vec![0.0f32; dim]; block];
-        let mut qr = vec![0.0f32; l.wq_a.rows()];
-        let mut q = vec![0.0f32; cfg.n_heads * hd];
-        let mut attn = vec![0.0f32; cfg.n_heads * hd];
+        let qrank = l.wq_a.rows();
+        let qdim = cfg.n_heads * hd;
+        let mut qr = vec![0.0f32; block * qrank];
+        l.wq_a.matmat(&folded_all, block, &mut qr, pool);
         for i in 0..block {
-            l.wq_a.matvec(&folded[i], &mut qr, pool);
-            rms_weighted(&mut qr, &l.q_norm, cfg.norm_eps);
-            l.wq_b.matvec(&qr, &mut q, pool);
+            rms_weighted(
+                &mut qr[i * qrank..(i + 1) * qrank],
+                &l.q_norm,
+                cfg.norm_eps,
+            );
+        }
+        let mut q = vec![0.0f32; block * qdim];
+        l.wq_b.matmat(&qr, block, &mut q, pool);
+        let mut attn = vec![0.0f32; block * qdim];
+        for i in 0..block {
+            let qi = &mut q[i * qdim..(i + 1) * qdim];
+            let ai = &mut attn[i * qdim..(i + 1) * qdim];
             let qpos = pos + 1 + i;
             for h in 0..cfg.n_heads {
-                let head = &mut q[h * hd..(h + 1) * hd];
+                let head = &mut qi[h * hd..(h + 1) * hd];
                 rms_inplace(head, cfg.norm_eps);
                 rope_tail(head, inv_freq, qpos, rd, false);
             }
             for h in 0..cfg.n_heads {
-                let qh = &q[h * hd..(h + 1) * hd];
-                let oh = &mut attn[h * hd..(h + 1) * hd];
+                let qh = &qi[h * hd..(h + 1) * hd];
+                let oh = &mut ai[h * hd..(h + 1) * hd];
                 sparse_attend(qh, &cache, &idxs, l.attn_sink[h], scale, hd, oh);
                 rope_tail(oh, inv_freq, qpos, rd, true);
             }
-            o_project(
-                &attn,
-                &|r, x, sc| l.wo_a.row_dot(r, x, sc),
-                l.wo_a.cols(),
-                &|mid, dst| l.wo_b.matvec(mid, dst, pool),
-                cfg.o_groups,
-                cfg.o_lora_rank,
-                pool,
-                &mut blk_out[i],
-            );
         }
+        let mut blk_out = vec![0.0f32; block * dim];
+        o_project_block(
+            &attn, block, &l.wo_a, &l.wo_b, cfg.o_groups, cfg.o_lora_rank, pool,
+            &mut blk_out,
+        );
         for i in 0..block {
             let mut next = vec![0.0f32; hc * dim];
-            hc_expand(&blk_out[i], &resid[i], &post[i], &comb[i], hc, dim, &mut next);
+            hc_expand(
+                &blk_out[i * dim..(i + 1) * dim],
+                &resid[i], &post[i], &comb[i], hc, dim, &mut next,
+            );
             states[i] = next;
         }
-        // ── the MoE half is per position and needs nothing from its
-        //    neighbours, so the existing step does it unchanged. ──
+        // ── MoE: fold every position, group equal experts, then expand in
+        //    the original per-position route order. ──
+        let mut ffn_fold = vec![0.0f32; block * dim];
+        let mut ffn_post = vec![vec![0.0f32; hc]; block];
+        let mut ffn_comb = vec![vec![0.0f32; hc * hc]; block];
+        let mut ffn_resid = vec![vec![0.0f32; hc * dim]; block];
         for i in 0..block {
-            hc_block(
-                &mut states[i],
+            hc_mixes(
+                &states[i],
                 &l.hc_ffn_fn,
+                mix_hc,
+                cfg.norm_eps,
+                pool,
+                &mut scratch.mixes,
+            );
+            hc_split_sinkhorn(
+                &scratch.mixes,
                 &l.hc_ffn_scale,
                 &l.hc_ffn_base,
-                &l.ffn_norm,
-                cfg,
-                &mut scratch,
-                pool,
-                |hidden, out| moe_step(hidden, l, cfg, ids[i], si, pool, out),
+                hc,
+                cfg.hc_sinkhorn_iters,
+                cfg.hc_eps,
+                &mut scratch.pre,
+                &mut ffn_post[i],
+                &mut ffn_comb[i],
             );
+            hc_fold(
+                &states[i], &scratch.pre, hc, dim,
+                &mut ffn_fold[i * dim..(i + 1) * dim],
+            );
+            rms_weighted(
+                &mut ffn_fold[i * dim..(i + 1) * dim],
+                &l.ffn_norm,
+                cfg.norm_eps,
+            );
+            ffn_resid[i].copy_from_slice(&states[i]);
+        }
+        let mut moe_out = vec![0.0f32; block * dim];
+        moe_step_block(
+            &ffn_fold, block, l, cfg, &ids, si, pool, &mut moe_out,
+        );
+        for i in 0..block {
+            let mut next = vec![0.0f32; hc * dim];
+            hc_expand(
+                &moe_out[i * dim..(i + 1) * dim],
+                &ffn_resid[i], &ffn_post[i], &ffn_comb[i], hc, dim, &mut next,
+            );
+            states[i] = next;
         }
     }
 
@@ -5848,16 +6138,23 @@ pub fn dspark_draft(
     let mut proposals = Vec::with_capacity(block);
     out_conf.clear();
     let mut prev = last_token;
-    let mut logits = vec![0.0f32; cfg.vocab];
+    let mut head_in = vec![0.0f32; block * dim];
+    let mut pre_norms = vec![vec![0.0f32; dim]; block];
+    for i in 0..block {
+        hc_head_fold(
+            &states[i], hfn, hscale, hbase, cfg, pool,
+            &mut head_in[i * dim..(i + 1) * dim],
+        );
+        pre_norms[i].copy_from_slice(&head_in[i * dim..(i + 1) * dim]);
+        rms_weighted(
+            &mut head_in[i * dim..(i + 1) * dim], hnorm, cfg.norm_eps,
+        );
+    }
+    let mut logits = vec![0.0f32; block * cfg.vocab];
+    g.head.matmat(&head_in, block, &mut logits, pool);
     let mut mk_embed = vec![0.0f32; last.markov_w1.as_ref().map_or(0, |t| t.cols())];
     for i in 0..block {
-        let mut folded = vec![0.0f32; dim];
-        hc_head_fold(&states[i], hfn, hscale, hbase, cfg, pool, &mut folded);
-        // The confidence head reads the fold BEFORE the norm — upstream
-        // norms only on the way into the head — so the copy is taken here.
-        let pre_norm = folded.clone();
-        rms_weighted(&mut folded, hnorm, cfg.norm_eps);
-        g.head.matvec(&folded, &mut logits, pool);
+        let logits_i = &mut logits[i * cfg.vocab..(i + 1) * cfg.vocab];
         // The markov head biases the logits from the PREVIOUS token — a
         // rank-256 bigram the draft samples through position by position,
         // while the network itself ran the whole block at once.
@@ -5865,18 +6162,18 @@ pub fn dspark_draft(
             w1.row_f32(prev as usize, &mut mk_embed);
             let mut bias = vec![0.0f32; cfg.vocab];
             w2.matvec(&mk_embed, &mut bias, pool);
-            for (a, b) in logits.iter_mut().zip(&bias) {
+            for (a, b) in logits_i.iter_mut().zip(&bias) {
                 *a += *b;
             }
         }
         let mut best = 0usize;
-        for v in 1..logits.len() {
-            if logits[v] > logits[best] {
+        for v in 1..logits_i.len() {
+            if logits_i[v] > logits_i[best] {
                 best = v;
             }
         }
         if let Some(cf) = last.confidence.as_ref() {
-            let mut cat = pre_norm.clone();
+            let mut cat = pre_norms[i].clone();
             cat.extend_from_slice(&mk_embed);
             let mut s = [0.0f32; 1];
             if cat.len() == cf.cols() {
