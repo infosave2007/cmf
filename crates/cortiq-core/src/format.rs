@@ -271,6 +271,12 @@ impl Backing {
 /// A loaded CMF model: metadata owned, weights zero-copy via mmap.
 pub struct CmfModel {
     pub path: PathBuf,
+    /// Identifies THIS open of the file, monotonically. GPU backends cache
+    /// device weights by (model, tensor); keying that on the mapping's
+    /// address made a reloaded model inherit the previous one's buffers
+    /// whenever the new mmap landed where the old had been — silent wrong
+    /// weights in any process that unloads and reloads, which a server does.
+    uid: u64,
     pub header: CmfHeader,
     pub required_features: u32,
     pub tensors: Vec<TensorEntry>,
@@ -305,7 +311,17 @@ impl std::fmt::Debug for CmfModel {
     }
 }
 
+/// Hands out a fresh id per open. Wraps only after 2^64 opens.
+static MODEL_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl CmfModel {
+    /// A key that is unique to this open of the file and never recycled.
+    /// Backends that cache anything derived from the weights must key on
+    /// this, not on the mapping's address, which the allocator reuses.
+    pub fn uid(&self) -> u64 {
+        self.uid
+    }
+
     /// Open and strictly validate a CMF v2 file. Any inconsistency is an
     /// error — this function never substitutes defaults.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CmfError> {
@@ -478,6 +494,7 @@ impl CmfModel {
         );
 
         Ok(Self {
+            uid: MODEL_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             path,
             header,
             required_features: env.required_features,

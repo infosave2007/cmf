@@ -186,7 +186,10 @@ fn wgpu_q4tp_matvec_batch_matches_dequant_reference() {
     // first one's weights. That is a test bug that reads exactly like a
     // broken kernel, and it cost a bisect to tell apart.
     let mut built = Vec::new();
-    for (rows, cols) in [(256usize, 512usize), (128, 4096)] {
+    // 200 rows divides neither blocking: the batch is the fast axis, so a
+    // ragged tail is a tail of the LAST row block, not a block straddling two
+    // batch elements. That distinction is the whole correctness argument.
+    for (rows, cols) in [(256usize, 512usize), (128, 4096), (200, 512)] {
         let payload = synth(rows, cols);
         let mut w = vec![0f32; rows * cols];
         dequant_q4tp(&payload, rows, cols, &mut w);

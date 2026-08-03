@@ -4160,7 +4160,10 @@ unsafe extern "C" {
 
 #[inline]
 fn model_key(model: &Arc<CmfModel>) -> usize {
-    Arc::as_ptr(model) as usize
+    // The Arc's address would also work — the cache retains the Arc, so it
+    // cannot be recycled while an entry lives — but the open's own id needs
+    // no invariant to hold, and wgpu keys on the same thing.
+    model.uid() as usize
 }
 
 /// No-copy buffer over the file mapping. The cache retains the model Arc so
