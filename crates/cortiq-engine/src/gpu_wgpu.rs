@@ -604,6 +604,44 @@ fn axpy(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (ap.asg != 0u) { ay[i] = v; } else { ay[i] = ay[i] + v; }
 }
 
+// The same matvec with 256 threads and four rows to a workgroup.
+//
+// `f32_matvec` gives a row 64 threads and a workgroup, which for the
+// hyper-connection mix — 24 rows over 16 384 columns — is 24 workgroups of
+// 64 threads: fifteen hundred threads on a card that holds hundreds of
+// thousands. The dispatch itself costs ~3 µs (measured), so the time was
+// never the launch; it was the kernel using a rounding error of the machine.
+struct F32WP { cols: u32, rows: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read>       fww : array<f32>;
+@group(0) @binding(1) var<storage, read>       fwx : array<f32>;
+@group(0) @binding(2) var<storage, read_write> fwy : array<f32>;
+@group(0) @binding(3) var<uniform>             fwp : F32WP;
+var<workgroup> fwpart: array<f32, 256>;
+@compute @workgroup_size(256)
+fn f32_matvec_w(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    if (row >= fwp.rows) { return; }
+    let base = row * fwp.cols;
+    var acc = 0.0;
+    var i = lid;
+    loop {
+        if (i >= fwp.cols) { break; }
+        acc = acc + fww[base + i] * fwx[i];
+        i = i + 256u;
+    }
+    fwpart[lid] = acc;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { fwpart[lid] = fwpart[lid] + fwpart[lid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (lid == 0u) { fwy[row] = fwpart[0]; }
+}
+
 // Qwen3.5 output gate: attn_out *= sigmoid(gate), element-wise over nh·hd.
 @group(0) @binding(0) var<storage, read>       gm_g : array<f32>;
 @group(0) @binding(1) var<storage, read_write> gm_o : array<f32>;
@@ -6172,6 +6210,7 @@ struct Ctx {
     index_scores: wgpu::ComputePipeline,
     top_k_index: wgpu::ComputePipeline,
     hc_block: wgpu::ComputePipeline,
+    f32_matvec_w: wgpu::ComputePipeline,
     sa_part: wgpu::ComputePipeline,
     sa_merge: wgpu::ComputePipeline,
     blit: wgpu::ComputePipeline,
@@ -6719,6 +6758,7 @@ fn init() -> Result<Ctx, String> {
     let index_scores = pipe("index_scores");
     let top_k_index = pipe("top_k_index");
     let hc_block = pipe("hc_block");
+    let f32_matvec_w = pipe("f32_matvec_w");
     let sa_part = pipe("sparse_attend_part");
     let sa_merge = pipe("sparse_attend_merge");
     let blit = pipe("blit");
@@ -6940,6 +6980,7 @@ fn init() -> Result<Ctx, String> {
         index_scores,
         top_k_index,
         hc_block,
+        f32_matvec_w,
         sa_part,
         sa_merge,
         blit,
@@ -14168,6 +14209,36 @@ fn encode_f32matvec_k(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The chain's f32 matvec: 256 threads a row instead of 64.
+#[allow(clippy::too_many_arguments)]
+fn encode_f32matvec_w_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    bkey: (u8, u64, usize),
+) {
+    let bind = cached_bind(c, bkey, || {
+        let p = uniform_u32x4(c, [cols as u32, rows as u32, 0, 0]);
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.f32_matvec_w.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, weight),
+                bind_buf(1, xs),
+                bind_buf(2, y),
+                bind_buf(3, &p),
+            ],
+        })
+    });
+    pass.set_pipeline(&c.f32_matvec_w);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+}
+
 fn encode_f32matvec_k_p(
     pass: &mut wgpu::ComputePass<'_>,
     c: &Ctx,
@@ -17555,7 +17626,7 @@ fn dsv4_layer_frame_enc(
         if !dsv4_skip("hc") {
         encode_hc_expand_k_p(&mut pass, c, &ao, &state, &hpost, &hcomb, &state2, &hcp, hc, dim,
             (120, kv_id, li));
-        encode_f32matvec_k_p(&mut pass, c, &ffn_fn, &state2, &mixes, mix_hc, hc * dim,
+        encode_f32matvec_w_p(&mut pass, c, &ffn_fn, &state2, &mixes, mix_hc, hc * dim,
             (121, kv_id, li));
         // The fold norms too: one dispatch, not two.
         encode_hc_fold_k_p(&mut pass, c, &state2, &mixes, &ffn_sc, &ffn_bs, &folded, &hpost,
@@ -17564,7 +17635,7 @@ fn dsv4_layer_frame_enc(
         }
 
         // ── MoE half ──
-        encode_f32matvec_k_p(&mut pass, c, &router, &x2, &logit_b, n_pack, m.hidden,
+        encode_f32matvec_w_p(&mut pass, c, &router, &x2, &logit_b, n_pack, m.hidden,
             (123, kv_id, li));
         if !dsv4_skip("moe") {
             encode_moe_chain_p(&mut pass, c, &logit_b, &x2, &msel, &mwt, &mcnt, &mact, &mo,
@@ -17591,7 +17662,7 @@ fn dsv4_layer_frame_enc(
                     &nbs, &next_nw, &state, &folded, &x2, hc, dim, mix_hc, g.sinkhorn_iters,
                     a.eps, (174, kv_id, li));
             } else {
-            encode_f32matvec_k_p(&mut pass, c, &nfn, &state, &mixes, mix_hc, hc * dim,
+            encode_f32matvec_w_p(&mut pass, c, &nfn, &state, &mixes, mix_hc, hc * dim,
                 (125, kv_id, li));
             encode_hc_fold_k_p(&mut pass, c, &state, &mixes, &nsc, &nbs, &folded, &hpost,
                 &hcomb, &hcp_n, Some((&next_nw, &x2)), (126, kv_id, li));
