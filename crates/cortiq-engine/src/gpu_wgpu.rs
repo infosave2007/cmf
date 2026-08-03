@@ -4880,6 +4880,71 @@ fn o_lora_a_w(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+var<workgroup> olm_part: array<f32, 256>;
+var<workgroup> olm_lad: array<f32, 128>;
+
+// FOUR rows at once, 64 lanes each. `gpr` is 128 on the release, so a row
+// cannot use more than 64 lanes without half of them striding past the end —
+// but four rows in one workgroup give the memory system four independent
+// load streams to overlap, which is the same trick the 8-row q4tp kernel
+// uses and the reason it beat the one-row one by 6.8 ms a token.
+@compute @workgroup_size(256)
+fn o_lora_a_m(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(num_workgroups) nwg: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let lora = q1p._p0;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid / 64u;          // which of the four rows
+    let lane = lid % 64u;
+    var row = wid.x * 4u + sub;
+    loop {
+        if (row >= rows) { break; }
+        if (lane < 32u) {
+            let pr = unpack2x16float(q1w[params_w + row]);
+            olm_lad[sub * 32u + lane] = exp2(pr.x + f32(lane) * pr.y);
+        }
+        workgroupBarrier();
+        let xoff = (row / lora) * gpr * 32u;
+        var acc = 0.0;
+        var g = lane;
+        loop {
+            if (g >= gpr) { break; }
+            let bit = g * 5u;
+            let cb = codes_b + row * cstride + (bit >> 3u);
+            let sh = bit & 7u;
+            var cv = q4tp_byte(cb);
+            if (sh > 3u) { cv = cv | (q4tp_byte(cb + 1u) << 8u); }
+            let scale = olm_lad[sub * 32u + ((cv >> sh) & 31u)];
+            let base = (row * gpr + g) * 4u;
+            let xb = xoff + g * 32u;
+            var gsum = 0.0;
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                gsum = gsum + q4b_dot8(q1w[base + k], xb + 8u * k);
+            }
+            acc = acc + scale * gsum;
+            g = g + 64u;
+        }
+        olm_part[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lane < stride) {
+                olm_part[lid] = olm_part[lid] + olm_part[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lane == 0u) { q1y[row] = olm_part[sub * 64u]; }
+        workgroupBarrier();
+        row = row + nwg.x * 4u;
+    }
+}
+
 // ── Sparse attention, split in two (DeepSeek-V4) ────────────────────────────
 //
 // The one-workgroup-per-head version leaves 64 workgroups on a card with
@@ -6319,6 +6384,7 @@ struct Ctx {
     f32_matvec_w: wgpu::ComputePipeline,
     o_lora_a_w: wgpu::ComputePipeline,
     f32_matvec_x: wgpu::ComputePipeline,
+    o_lora_a_m: wgpu::ComputePipeline,
     sa_part: wgpu::ComputePipeline,
     sa_merge: wgpu::ComputePipeline,
     blit: wgpu::ComputePipeline,
@@ -6869,6 +6935,7 @@ fn init() -> Result<Ctx, String> {
     let f32_matvec_w = pipe("f32_matvec_w");
     let o_lora_a_w = pipe("o_lora_a_w");
     let f32_matvec_x = pipe("f32_matvec_x");
+    let o_lora_a_m = pipe("o_lora_a_m");
     let sa_part = pipe("sparse_attend_part");
     let sa_merge = pipe("sparse_attend_merge");
     let blit = pipe("blit");
@@ -7093,6 +7160,7 @@ fn init() -> Result<Ctx, String> {
         f32_matvec_w,
         o_lora_a_w,
         f32_matvec_x,
+        o_lora_a_m,
         sa_part,
         sa_merge,
         blit,
@@ -14639,6 +14707,13 @@ fn encode_q4tp_mvw_p(
     pass.dispatch_workgroups((rows as u32).div_ceil(per_wg).min(MAX_WG), 1, 1);
 }
 
+/// `CMF_DSV4_OLORA=1|2|3` pins the grouped projection to the one-row,
+/// 256-thread or four-row kernel, for the A/B that decides which.
+fn olora_pick() -> Option<u32> {
+    static P: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("CMF_DSV4_OLORA").ok().and_then(|v| v.parse().ok()))
+}
+
 /// `CMF_DSV4_MV4=0` puts the chain back on the one-row q4tp kernel.
 fn chain_mv4() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -17068,11 +17143,18 @@ fn encode_attn_chain(
     // the 64-thread kernel's 21.8: this projection's columns are
     // nh·hd/o_groups, so `gpr` is 128 on the release and half of 256 threads
     // would stride past the end. Wide only where there is width to use.
-    let o_pipe = if chain_mv4() && cols / 32 >= 256 {
-        &c.o_lora_a_w
-    } else {
-        &c.o_lora_a
+    // By shape: 256 threads only where a row has 256 groups to give them;
+    // otherwise four rows at once, which buys overlap instead of width.
+    // CMF_DSV4_OLORA picks explicitly for the A/B.
+    let o_pipe = match olora_pick() {
+        Some(1) => &c.o_lora_a,
+        Some(2) => &c.o_lora_a_w,
+        Some(3) => &c.o_lora_a_m,
+        _ if !chain_mv4() => &c.o_lora_a,
+        _ if cols / 32 >= 256 => &c.o_lora_a_w,
+        _ => &c.o_lora_a_m,
     };
+    let o_rows_per_wg = if std::ptr::eq(o_pipe, &c.o_lora_a_m) { 4u32 } else { 1u32 };
     let o_bind = cached_bind(c, (63, kv_id, li), || {
         let p = uniform_u32x4(c, [(cols / 32) as u32, rows as u32, g.o_lora as u32, 0]);
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -17115,7 +17197,8 @@ fn encode_attn_chain(
         if !dsv4_skip("oproj") {
             pass.set_pipeline(o_pipe);
             pass.set_bind_group(0, &o_bind, &[]);
-            pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+            pass.dispatch_workgroups(
+                (rows as u32).div_ceil(o_rows_per_wg).min(MAX_WG), 1, 1);
             encode_q4tp_mvw_p(&mut pass, c, &wb[3], mid, out, g.dim, g.o_groups * g.o_lora,
                 (64, kv_id, li));
         }
@@ -17130,7 +17213,7 @@ fn encode_attn_chain(
         let mut pass = begin_pass(enc);
         pass.set_pipeline(o_pipe);
         pass.set_bind_group(0, &o_bind, &[]);
-        pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+        pass.dispatch_workgroups((rows as u32).div_ceil(o_rows_per_wg).min(MAX_WG), 1, 1);
     }
     encode_q4tp_mv1(
         c,
