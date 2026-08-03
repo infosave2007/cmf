@@ -1824,6 +1824,14 @@ fn dsv4_layer_loop(
     let mut run: Vec<usize> = Vec::new();
     let mut sink_out = vec![0.0f32; dim];
     for (li, l) in layers.iter().enumerate() {
+        // The device path never ticked the profiler, so every per-token
+        // number it printed described the two host-path tokens at the start
+        // of a run — the ones that also pay for the upload. Ticking here is
+        // what makes the chain's encode-and-wait split a per-token figure at
+        // all.
+        if prof::on() {
+            prof::note_layer(li);
+        }
         if chain && on_dev[li] {
             // Hash layers used to break the run in two: their forced expert
             // list changes per token, went through the (tag, len) upload
