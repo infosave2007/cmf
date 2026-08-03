@@ -18190,12 +18190,24 @@ fn dsv4_skip(what: &str) -> bool {
         .contains(what)
 }
 
+/// How many tokens of one batch a layer's keys can hold apart. Generous:
+/// the keys are only cache discriminators, and collisions between layers
+/// would be far more expensive to debug than a sparse map is to keep.
+const FRAME_TOK_STRIDE: usize = 64;
+
 fn dsv4_layer_frame_enc(
     model: &Arc<CmfModel>,
     w: &Dsv4LayerW,
     g: Dsv4LayerGeom,
     kv_id: u64,
     li: usize,
+    // Which token of the batch this frame encodes. The KV cache is the
+    // layer's, so it keys on `li`; everything else — uniform slots, cached
+    // bind groups, the scratch that carries this token's state between
+    // dispatches — has to be the TOKEN's, or two tokens encoded into one
+    // submission share a slot and the last write decides for both. That is
+    // silent and it is wrong: their rope positions differ.
+    tok: usize,
     qn: Option<&[f32]>,
     idxs: &[u32],
     prep: Option<&Dsv4Prep>,
@@ -18212,6 +18224,8 @@ fn dsv4_layer_frame_enc(
         }};
     }
     let Some(c) = ctx() else { no!("нет контекста wgpu") };
+    // Keys are per (layer, token); the cache lookup below stays per layer.
+    let lk = li * FRAME_TOK_STRIDE + tok;
     let a = g.attn;
     let m = g.moe;
     let (hc, dim) = (g.hc, a.dim);
@@ -18385,28 +18399,28 @@ fn dsv4_layer_frame_enc(
         if hc_fuse() {
             encode_hc_block_p(&mut pass, c, &ao, &state, &hpost, &hcomb, &ffn_fn, &ffn_sc,
                 &ffn_bs, &ffn_nw, &state2, &folded, &x2, hc, dim, mix_hc, g.sinkhorn_iters,
-                a.eps, (172, kv_id, li));
+                a.eps, (172, kv_id, lk));
         } else {
         if !dsv4_skip("hc") {
         if !dsv4_skip("hcexp") {
         encode_hc_expand_k_p(&mut pass, c, &ao, &state, &hpost, &hcomb, &state2, &hcp, hc, dim,
-            (120, kv_id, li));
+            (120, kv_id, lk));
         }
         if !dsv4_skip("hcmix") {
         encode_f32matvec_w_p(&mut pass, c, &ffn_fn, &state2, &mixes, mix_hc, hc * dim,
-            (121, kv_id, li));
+            (121, kv_id, lk));
         }
         // The fold norms too: one dispatch, not two.
         if !dsv4_skip("hcfold") {
         encode_hc_fold_k_p(&mut pass, c, &state2, &mixes, &ffn_sc, &ffn_bs, &folded, &hpost,
-            &hcomb, &hcp_n, Some((&ffn_nw, &x2)), (122, kv_id, li));
+            &hcomb, &hcp_n, Some((&ffn_nw, &x2)), (122, kv_id, lk));
         }
         }
         }
 
         // ── MoE half ──
         encode_f32matvec_w_p(&mut pass, c, &router, &x2, &logit_b, n_pack, m.hidden,
-            (123, kv_id, li));
+            (123, kv_id, lk));
         if !dsv4_skip("moe") {
             encode_moe_chain_p(&mut pass, c, &logit_b, &x2, &msel, &mwt, &mcnt, &mact, &mo,
                                &gate_all, &up_all, &down_all, w, m, n_pack, slots,
@@ -18417,7 +18431,7 @@ fn dsv4_layer_frame_enc(
         let fused_next = hc_fuse() && w.hc_next_fn.is_some();
         if !fused_next {
             encode_hc_expand_k_p(&mut pass, c, &mo, &state2, &hpost, &hcomb, &state, &hcp,
-                hc, dim, (124, kv_id, li));
+                hc, dim, (124, kv_id, lk));
         }
         if let Some(nf) = w.hc_next_fn {
             let nfn = const_buf(c, bytemuck::cast_slice(nf));
@@ -18430,21 +18444,21 @@ fn dsv4_layer_frame_enc(
                 // is skipped when this branch runs.
                 encode_hc_block_p(&mut pass, c, &mo, &state2, &hpost, &hcomb, &nfn, &nsc,
                     &nbs, &next_nw, &state, &folded, &x2, hc, dim, mix_hc, g.sinkhorn_iters,
-                    a.eps, (174, kv_id, li));
+                    a.eps, (174, kv_id, lk));
             } else {
             encode_f32matvec_w_p(&mut pass, c, &nfn, &state, &mixes, mix_hc, hc * dim,
-                (125, kv_id, li));
+                (125, kv_id, lk));
             encode_hc_fold_k_p(&mut pass, c, &state, &mixes, &nsc, &nbs, &folded, &hpost,
-                &hcomb, &hcp_n, Some((&next_nw, &x2)), (126, kv_id, li));
+                &hcomb, &hcp_n, Some((&next_nw, &x2)), (126, kv_id, lk));
             }
             // The next layer's LoRA vector, but only when the host is not
             // going to hand it over anyway — the indexer needs `qr` there, so
             // today it projects it regardless and computing it twice is waste.
             if qn.is_none() && !dsv4_skip("nextq") {
                 encode_q4tp_mvw_p(&mut pass, c, &wb[4], &x2, &qr2, a.q_lora, dim,
-                    (52, kv_id, li));
+                    (52, kv_id, lk));
                 encode_rmsnorm_p(&mut pass, c, &qr2, &next_qn, &qn2, a.q_lora, a.eps,
-                    (53, kv_id, li));
+                    (53, kv_id, lk));
                 copy_qn = true;
             }
         }
@@ -18585,7 +18599,7 @@ pub fn dsv4_layer_chain(
         // `qn = None` throughout: the first layer's LoRA vector was left on
         // the card by the caller's seed, every later one by the frame before.
         let Some(b) = dsv4_layer_frame_enc(
-            model, w, *g, kv_id, first_li + i, None, &[], Some(p), inv_freq[i], pos, &mut enc,
+            model, w, *g, kv_id, first_li + i, 0, None, &[], Some(p), inv_freq[i], pos, &mut enc,
         ) else {
             // Nothing has been submitted, so the token can still be run the
             // old way — but the caches this chain advanced have NOT been
@@ -18669,7 +18683,7 @@ pub fn dsv4_layer_frame(
             label: Some("dsv4-layer"),
         });
     let Some(folded) = dsv4_layer_frame_enc(
-        model, w, g, kv_id, li, qn, idxs, None, inv_freq, pos, &mut enc,
+        model, w, g, kv_id, li, 0, qn, idxs, None, inv_freq, pos, &mut enc,
     ) else {
         return false;
     };
@@ -21583,12 +21597,20 @@ pub fn hc_join_for_test(
     let fo = rw_f32(c, dim, true);
     let po = rw_f32(c, hc, false);
     let cb = rw_f32(c, hc * hc, false);
-    let params = uniform_u32x4(c, [hc as u32, dim as u32, iters, eps.to_bits()]);
+    // HcP grew a fifth field, `nrm`, when the fold learned to emit the
+    // normed vector — so the uniform is 32 bytes now, and a 16-byte one is
+    // rejected outright. Zero: this hook wants the raw fold, not the norm.
+    let params = uniform_u32x8(
+        c,
+        [hc as u32, dim as u32, iters, eps.to_bits(), 0, 0, 0, 0],
+    );
 
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("hc") });
     {
+        let ones = storage_bytes(c, bytemuck::cast_slice(&vec![1.0f32; dim]));
+        let normed_out = storage_bytes(c, bytemuck::cast_slice(&vec![0.0f32; dim]));
         let layout = c.hc_pre_fold.get_bind_group_layout(0);
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -21602,6 +21624,14 @@ pub fn hc_join_for_test(
                 bind_buf(5, &po),
                 bind_buf(6, &cb),
                 bind_buf(7, &params),
+                // 8 and 9 arrived when the fold learned to emit the NORMED
+                // vector alongside the raw one. The layout takes every
+                // binding the entry point touches, so leaving them out is a
+                // validation error, not a smaller bind group — this hook had
+                // been failing on it. The test reads binding 4, the raw
+                // fold; a unit norm and a scratch output satisfy the rest.
+                bind_buf(8, &ones),
+                bind_buf(9, &normed_out),
             ],
         });
         let mut pass = begin_pass(&mut enc);
