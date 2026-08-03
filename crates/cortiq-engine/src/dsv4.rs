@@ -3913,14 +3913,23 @@ pub fn load_layer(
 /// hidden state into the next embedding before the layer runs.
 pub struct Dsv4Mtp {
     pub layer: Dsv4Layer,
-    pub main_proj: crate::qtensor::QTensor,
-    pub main_norm: Vec<f32>,
+    /// Stage 0 only: the projection that turns the trunk's captured hidden
+    /// states into the block's input. Later stages take the block from the
+    /// stage before them, so they carry none.
+    pub main_proj: Option<crate::qtensor::QTensor>,
+    pub main_norm: Option<Vec<f32>>,
     /// Last module only: what turns a draft hidden state into logits.
     pub norm: Option<Vec<f32>>,
     pub hc_head_fn: Option<Vec<f32>>,
     pub hc_head_base: Option<Vec<f32>>,
     pub hc_head_scale: Option<f32>,
     pub confidence: Option<crate::qtensor::QTensor>,
+    /// Last stage only: a rank-256 bigram table that biases the draft's
+    /// logits, and whose embedding also feeds the confidence head. Cheap
+    /// enough that the draft samples through it position by position while
+    /// the network itself runs the whole block at once.
+    pub markov_w1: Option<crate::qtensor::QTensor>,
+    pub markov_w2: Option<crate::qtensor::QTensor>,
 }
 
 /// Load as much of the speculation stack as the file carries, up to
@@ -3937,7 +3946,10 @@ pub fn load_mtp(
     let mut out = Vec::new();
     for d in 0..max_depth {
         let p = format!("model.mtp.{d}");
-        if model.tensor(&format!("{p}.main_proj.weight")).is_none() {
+        // A stage is recognised by its attention, not by `main_proj`: only
+        // stage 0 has that, and only the last has the head. Keying on either
+        // end found one module of three.
+        if model.tensor(&format!("{p}.attn.wq_a.weight")).is_none() {
             break;
         }
         let layer = match load_layer(model, cfg, &p, Scheme::Mtp) {
@@ -3947,21 +3959,11 @@ pub fn load_mtp(
                 break;
             }
         };
-        let main_proj = match crate::qtensor::QTensor::from_model(model, &format!("{p}.main_proj.weight")) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("MTP {d}: пропущен, {e}");
-                break;
-            }
-        };
-        let Some(main_norm) = f(&format!("{p}.main_norm.weight")) else {
-            eprintln!("MTP {d}: пропущен, нет main_norm");
-            break;
-        };
         out.push(Dsv4Mtp {
             layer,
-            main_proj,
-            main_norm,
+            main_proj: crate::qtensor::QTensor::from_model(model, &format!("{p}.main_proj.weight"))
+                .ok(),
+            main_norm: f(&format!("{p}.main_norm.weight")),
             norm: f(&format!("{p}.norm.weight")),
             hc_head_fn: f(&format!("{p}.hc_head_fn")),
             hc_head_base: f(&format!("{p}.hc_head_base")),
@@ -3971,17 +3973,31 @@ pub fn load_mtp(
                 &format!("{p}.confidence_head.proj.weight"),
             )
             .ok(),
+            markov_w1: crate::qtensor::QTensor::from_model(
+                model,
+                &format!("{p}.markov_head.markov_w1.weight"),
+            )
+            .ok(),
+            markov_w2: crate::qtensor::QTensor::from_model(
+                model,
+                &format!("{p}.markov_head.markov_w2.weight"),
+            )
+            .ok(),
         });
     }
     if !out.is_empty() {
-        let last = &out[out.len() - 1];
+        let mp = out
+            .iter()
+            .find_map(|m| m.main_proj.as_ref())
+            .map(|t| format!("[{}, {}]", t.rows(), t.cols()))
+            .unwrap_or_else(|| "нет".into());
         eprintln!(
-            "MTP: {} модул(ь/я/ей), main_proj [{}, {}], экспертов {}, голова уверенности {}",
+            "MTP: {} стади(я/и/й), main_proj {mp}, экспертов {}, \
+             голова уверенности {}, марков {}",
             out.len(),
-            last.main_proj.rows(),
-            last.main_proj.cols(),
-            last.layer.experts.len(),
-            if last.confidence.is_some() { "есть" } else { "нет" }
+            out[0].layer.experts.len(),
+            if out.iter().any(|m| m.confidence.is_some()) { "есть" } else { "нет" },
+            if out.iter().any(|m| m.markov_w1.is_some()) { "есть" } else { "нет" },
         );
     }
     out
