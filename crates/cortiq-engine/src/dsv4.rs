@@ -4892,8 +4892,21 @@ mod tests {
 /// The noise token the block's unknown positions carry
 /// (`dspark_noise_token_id`).
 pub const DSPARK_NOISE_TOKEN: u32 = 128799;
-/// `dspark_block_size` — how many positions one draft proposes.
-pub const DSPARK_BLOCK: usize = 5;
+/// `dspark_block_size` — how many positions one draft proposes. Upstream
+/// trains at 5; the survival curve says the last two are paid for on every
+/// verify and delivered on four percent of them, so the width worth running
+/// is a measurement. `CMF_DSPARK_BLOCK=N` sets it, 5 stays the default
+/// because that is what the noise-token padding was trained against.
+pub fn dspark_block() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("CMF_DSPARK_BLOCK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1 && n <= 16)
+            .unwrap_or(5)
+    })
+}
 
 /// Per-sequence state of the draft: one KV ring per stage, and the trunk
 /// hidden states the block's input is projected from.
@@ -5018,7 +5031,7 @@ pub fn dspark_draft(
     out_conf: &mut Vec<f32>,
 ) -> Vec<u32> {
     let (hc, dim, hd, rd) = (cfg.hc_mult, cfg.dim, cfg.head_dim, cfg.rope_head_dim);
-    let block = DSPARK_BLOCK;
+    let block = dspark_block();
     let inv_freq = &g.inv_freq_window;
 
     // ── the block's input: main_norm(main_proj(captured hiddens)) ──

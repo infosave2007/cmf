@@ -4180,7 +4180,7 @@ fn draft_probe() -> bool {
         let trunk_now = crate::dsv4::pick_tally_take();
         if !trunk_now.is_empty() {
             self.dspark_trunk_picks.push(trunk_now);
-            let keep = crate::dsv4::DSPARK_BLOCK;
+            let keep = crate::dsv4::dspark_block();
             if self.dspark_trunk_picks.len() > keep {
                 self.dspark_trunk_picks.remove(0);
             }
@@ -4214,7 +4214,7 @@ fn draft_probe() -> bool {
             if t.is_empty() {
                 return;
             }
-            eprintln!("DSpark: захват со слоёв {t:?}, блок {}", crate::dsv4::DSPARK_BLOCK);
+            eprintln!("DSpark: захват со слоёв {t:?}, блок {}", crate::dsv4::dspark_block());
             crate::dsv4::dspark_arm(&t, cfg.dim);
             self.dspark = Some(crate::dsv4::DsparkState::new(
                 self.dsv4_mtp.len(),
@@ -4274,7 +4274,7 @@ fn draft_probe() -> bool {
         if self.dspark_hist.len() >= 8 && self.dspark_hist.len() % 8 == 0 {
             let n = self.dspark_hist.len() as f32;
             let mean: f32 = self.dspark_hist.iter().sum::<usize>() as f32 / n;
-            let block = crate::dsv4::DSPARK_BLOCK;
+            let block = crate::dsv4::dspark_block();
             let mut at = vec![0usize; block + 1];
             for &k in &self.dspark_hist {
                 at[k] += 1;
