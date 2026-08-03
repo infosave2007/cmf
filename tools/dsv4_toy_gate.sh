@@ -2,7 +2,14 @@
 # The dsv4 toy gate. FIRST it proves the device came up: a WGSL parse error
 # takes the whole module with it, wgpu falls back to the CPU with one WARN,
 # and then every arm of the comparison agrees — vacuously.
-S=/private/tmp/claude-501/-Users-oleg-Documents-cortiq-bot-cmfpublic/674db62a-643b-4641-b330-5feed6d40b67/scratchpad
+# Where the stands live. CMF_TOY_DIR overrides; the default is a scratch
+# path from the session that built them, which is exactly the kind of thing
+# that makes a gate unrunnable for anyone else.
+S=${CMF_TOY_DIR:-/private/tmp/claude-501/-Users-oleg-Documents-cortiq-bot-cmfpublic/674db62a-643b-4641-b330-5feed6d40b67/scratchpad}
+if [ ! -f "$S/plain4.cmf" ]; then
+  echo "GATE ABORT: стендов нет в $S — задайте CMF_TOY_DIR"
+  exit 1
+fi
 E="CMF_GPU=wgpu CMF_SDOT=0 CMF_GPU_VRAM_MB=200 CMF_DSV4_GPU_LAYER=1 CMF_DSV4_GPU_ATTN=1 CMF_DSV4_GPU_MOE2=1 CMF_DSV4_SLOT_CHECK=1"
 
 # "wgpu GPU path: on" is logged BEFORE the pipelines are built, so it appears
@@ -23,9 +30,19 @@ echo "устройство: поднялось"
 # counts test failures — a compile error produces no such line at all, so
 # that check reported success while CI reported three type errors in code
 # that only the test profile builds.
-if ! cargo test --workspace --no-run >/dev/null 2>&1; then
-  echo "GATE ABORT: тестовая сборка не компилируется"
-  cargo test --workspace --no-run 2>&1 | grep -E "^error" -A6 | head -12
+# RUN the tests, in BOTH configurations. Compiling them is not running
+# them, and the CPU-only build is where the layer loop went missing: it
+# lived in the else arm of a cfg-gated if, so without the gpu feature no
+# layer ran at all and one test said so — in the one configuration this
+# gate never executed.
+if ! cargo test --workspace >/dev/null 2>&1; then
+  echo "GATE ABORT: тесты БЕЗ gpu"
+  cargo test --workspace 2>&1 | grep -E "^error|FAILED|panicked" -A3 | head -14
+  exit 1
+fi
+if ! cargo test --workspace --features gpu >/dev/null 2>&1; then
+  echo "GATE ABORT: тесты С gpu"
+  cargo test --workspace --features gpu 2>&1 | grep -E "^error|FAILED|panicked" -A3 | head -14
   exit 1
 fi
 if ! cargo clippy --workspace --all-targets >/dev/null 2>&1; then
