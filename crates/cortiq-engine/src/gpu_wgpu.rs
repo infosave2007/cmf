@@ -18127,6 +18127,7 @@ fn dsv4_index_cache(kv_id: u64, li: usize, floats: usize) -> Option<wgpu::Buffer
 /// the device and the NEXT layer reads it there. That is the whole of step
 /// four — the readback at the end of this function was there for the host's
 /// prep and for nothing else.
+#[derive(Clone)]
 pub struct Dsv4Prep<'a> {
     /// The KV projection that feeds the sliding window, and its norm.
     pub wkv: usize,
@@ -18568,6 +18569,118 @@ pub fn dsv4_chain_seed(x: &[f32], qn: &[f32]) -> bool {
 /// submissions and 43 round trips, because the host had to see each layer's
 /// output to prepare the next one's attention inputs. It does not any more.
 #[allow(clippy::too_many_arguments)]
+/// A whole BATCH of known tokens through a run of layers, in one submission.
+///
+/// The layer is the outer loop and the token the inner one, which is the
+/// only ordering that works: token t's attention has to see the window and
+/// the compressed entries that tokens before it in the same batch just
+/// wrote, and a compute pass orders its dispatches, so encoding them in that
+/// order is enough — no fence, no readback between them.
+///
+/// Nothing here is coupled through CONTENT. A token's prep is the layer's
+/// static weights plus counts, and the counts follow from the position: the
+/// window fills by one a token to its capacity, and a compressed entry
+/// appears every `ratio` tokens. So the whole batch's preps are known before
+/// the first dispatch is encoded — which is what lets this be one
+/// submission rather than B of them.
+///
+/// `folded_out` takes `batch * dim`: each token's fold for the head, in
+/// order. The head is the caller's business — it is one q4tp matvec with a
+/// batch, which the pair already does.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_chain_batch(
+    model: &Arc<CmfModel>,
+    layers: &[(Dsv4LayerW<'_>, Dsv4LayerGeom, Dsv4Prep<'_>)],
+    kv_id: u64,
+    first_li: usize,
+    inv_freq: &[&[f32]],
+    pos: usize,
+    batch: usize,
+    folded_out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Some((_, g0, _)) = layers.first() else {
+        return false;
+    };
+    let dim = g0.attn.dim;
+    if batch == 0
+        || batch > FRAME_TOK_STRIDE
+        || folded_out.len() < batch * dim
+        || inv_freq.len() != layers.len()
+    {
+        return false;
+    }
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dsv4-chain-batch"),
+        });
+    let gather = frame_buf(c, 117, batch * dim * 4, false);
+    let t_enc = std::time::Instant::now();
+    for (i, (w, g, p)) in layers.iter().enumerate() {
+        for t in 0..batch {
+            // The counts as of this token: everything the prep carries that
+            // is not a weight.
+            let mut pt = p.clone();
+            pt.filled = (p.filled + t).min(p.window);
+            let advanced = |ratio: usize| -> usize {
+                if ratio == 0 {
+                    return 0;
+                }
+                (0..t).filter(|k| (pos + k + 1) % ratio == 0).count()
+            };
+            if let Some((_, cg)) = p.comp.as_ref() {
+                let ew = if cg.overlap { cg.width / 2 } else { cg.width };
+                pt.n_comp = p.n_comp + advanced(cg.ratio);
+                pt.comp_dst_off = p.comp_dst_off + (pt.n_comp - p.n_comp) * ew;
+            }
+            if let Some((_, cg, _, _)) = p.ix.as_ref() {
+                let ew = if cg.overlap { cg.width / 2 } else { cg.width };
+                pt.n_ix = p.n_ix + advanced(cg.ratio);
+                pt.ix_dst_off = p.ix_dst_off + (pt.n_ix - p.n_ix) * ew;
+            }
+            let Some(b) = dsv4_layer_frame_enc(
+                model,
+                w,
+                *g,
+                kv_id,
+                first_li + i,
+                t,
+                None,
+                &[],
+                Some(&pt),
+                inv_freq[i],
+                pos + t,
+                &mut enc,
+            ) else {
+                return false;
+            };
+            // The last layer's fold is what the head reads; gather the batch
+            // into one buffer so a single readback brings all of it home.
+            if i + 1 == layers.len() {
+                let mut pass = begin_pass(&mut enc);
+                encode_blit_p(&mut pass, c, &b, &gather, dim, 0, t * dim, None);
+            }
+        }
+    }
+    CHAIN_ENC_NS.fetch_add(
+        t_enc.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let bytes = (batch * dim * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        bytes,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "dsv4-batch-stage",
+    );
+    let ok = readback(c, enc, &gather, &stage, bytes, &mut folded_out[..batch * dim]);
+    drop(sc);
+    ok
+}
+
 pub fn dsv4_layer_chain(
     model: &Arc<CmfModel>,
     layers: &[(Dsv4LayerW<'_>, Dsv4LayerGeom, Dsv4Prep<'_>)],
@@ -19677,6 +19790,7 @@ fn encode_kv_pool_p(
 
 /// What one compressor needs from the model, by directory index (the two
 /// projections are q4tp) and by value (the small f32 pieces).
+#[derive(Clone)]
 pub struct Dsv4CompW<'a> {
     pub wkv: usize,
     pub wgate: usize,
@@ -20016,6 +20130,7 @@ pub fn dsv4_window_place_for_test(
 
 /// What the indexer needs from the model: two q4tp projections by directory
 /// index. Its own compressor goes through `dsv4_compressor_frame` as kind 1.
+#[derive(Clone)]
 pub struct Dsv4IxW {
     /// `[ih*idim, q_lora]` — reads the SHARED LoRA output, not attention's
     /// queries.
