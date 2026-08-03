@@ -16243,30 +16243,54 @@ fn encode_attn_chain(
     li: usize,
     m: usize,
 ) {
+    let rows = g.o_groups * g.o_lora;
+    let cols = g.nh * g.hd / g.o_groups;
+    let o_bind = cached_bind(c, (63, kv_id, li), || {
+        let p = uniform_u32x4(c, [(cols / 32) as u32, rows as u32, g.o_lora as u32, 0]);
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.o_lora_a.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &wb[2]),
+                bind_buf(1, attn),
+                bind_buf(2, mid),
+                bind_buf(3, &p),
+            ],
+        })
+    });
+    // Six dependent dispatches, no copy between them: one pass. Split back
+    // into six only when the timestamp query set exists, because a per-stage
+    // timing needs a pass boundary to be written at — and that is the whole
+    // reason attention had six in the first place.
+    if c.ts_query.is_none() && !sa_split() {
+        let sa_bind = sa_bind_single(c, q, cache, ixb, sink, attn, g.nh, g.hd, m, g.scale,
+            Some((kv_id, li)));
+        let mut pass = begin_pass(enc);
+        encode_q4tp_mv1_p(&mut pass, c, &wb[1], qn, q, g.nh * g.hd, g.q_lora,
+            (60, kv_id, li));
+        encode_rope_heads_p(&mut pass, c, q, freq, posb, g.nh, g.hd, g.rd, true, false,
+            (61, kv_id, li));
+        pass.set_pipeline(&c.sparse_attend);
+        pass.set_bind_group(0, &sa_bind, &[]);
+        pass.dispatch_workgroups(g.nh as u32, 1, 1);
+        encode_rope_heads_p(&mut pass, c, attn, freq, posb, g.nh, g.hd, g.rd, false, true,
+            (62, kv_id, li));
+        pass.set_pipeline(&c.o_lora_a);
+        pass.set_bind_group(0, &o_bind, &[]);
+        pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+        encode_q4tp_mv1_p(&mut pass, c, &wb[3], mid, out, g.dim, g.o_groups * g.o_lora,
+            (64, kv_id, li));
+        return;
+    }
     encode_q4tp_mv1(c, enc, &wb[1], qn, q, g.nh * g.hd, g.q_lora, (60, kv_id, li));
     encode_rope_heads(c, enc, q, freq, posb, g.nh, g.hd, g.rd, true, false, (61, kv_id, li));
     encode_sparse_attend2(c, enc, q, cache, ixb, sink, attn, g.nh, g.hd, m, g.scale,
         Some((kv_id, li)));
     encode_rope_heads(c, enc, attn, freq, posb, g.nh, g.hd, g.rd, false, true, (62, kv_id, li));
     {
-        let rows = g.o_groups * g.o_lora;
-        let cols = g.nh * g.hd / g.o_groups;
-        let bind = cached_bind(c, (63, kv_id, li), || {
-            let p = uniform_u32x4(c, [(cols / 32) as u32, rows as u32, g.o_lora as u32, 0]);
-            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &c.o_lora_a.get_bind_group_layout(0),
-                entries: &[
-                    bind_buf(0, &wb[2]),
-                    bind_buf(1, attn),
-                    bind_buf(2, mid),
-                    bind_buf(3, &p),
-                ],
-            })
-        });
         let mut pass = begin_pass(enc);
         pass.set_pipeline(&c.o_lora_a);
-        pass.set_bind_group(0, &bind, &[]);
+        pass.set_bind_group(0, &o_bind, &[]);
         pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
     }
     encode_q4tp_mv1(
@@ -17535,6 +17559,46 @@ fn ts_pair(c: &Ctx, which: usize) -> Option<wgpu::ComputePassTimestampWrites<'_>
     })
 }
 
+/// The one-kernel attention's bind group, shared by the timestamped path
+/// (a pass of its own, so the query set has boundaries to write) and the
+/// fused one (a dispatch inside the layer's pass).
+#[allow(clippy::too_many_arguments)]
+fn sa_bind_single(
+    c: &Ctx,
+    q: &wgpu::Buffer,
+    kv: &wgpu::Buffer,
+    ixb: &wgpu::Buffer,
+    sink: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    nh: usize,
+    hd: usize,
+    m: usize,
+    scale: f32,
+    bkey: Option<(u64, usize)>,
+) -> wgpu::BindGroup {
+    let p = match bkey {
+        Some((kv_id, li)) => uni_slot(c, 140, kv_id, li,
+            [nh as u32, hd as u32, m as u32, scale.to_bits()]),
+        None => uniform_mixed(c, [nh as u32, hd as u32, m as u32], scale),
+    };
+    let mk = || c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.sparse_attend.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, q),
+            bind_buf(1, kv),
+            bind_buf(2, ixb),
+            bind_buf(3, sink),
+            bind_buf(4, out),
+            bind_buf(5, &p),
+        ],
+    });
+    match bkey {
+        Some((kv_id, li)) => cached_bind(c, (141, kv_id, li), mk),
+        None => mk(),
+    }
+}
+
 fn encode_sparse_attend2(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
@@ -17561,27 +17625,7 @@ fn encode_sparse_attend2(
     // CMF_SA_SPLIT=1 runs the split pair for anyone who wants to retry it on
     // a part where occupancy actually bites.
     if !sa_split() {
-        let p = match bkey {
-            Some((kv, li)) => uni_slot(c, 140, kv, li,
-                [nh as u32, hd as u32, m as u32, scale.to_bits()]),
-            None => uniform_mixed(c, [nh as u32, hd as u32, m as u32], scale),
-        };
-        let mk = || c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &c.sparse_attend.get_bind_group_layout(0),
-            entries: &[
-                bind_buf(0, q),
-                bind_buf(1, kv),
-                bind_buf(2, ixb),
-                bind_buf(3, sink),
-                bind_buf(4, out),
-                bind_buf(5, &p),
-            ],
-        });
-        let bind = match bkey {
-            Some((kv, li)) => cached_bind(c, (141, kv, li), mk),
-            None => mk(),
-        };
+        let bind = sa_bind_single(c, q, kv, ixb, sink, out, nh, hd, m, scale, bkey);
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
             timestamp_writes: ts_pair(c, 0),
