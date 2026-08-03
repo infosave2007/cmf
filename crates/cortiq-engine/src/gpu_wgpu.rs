@@ -17917,9 +17917,10 @@ pub fn dsv4_compressor_frame(
 
     let ckv = frame_buf(c, 70 + kind, g.width * 4, false);
     let csc = frame_buf(c, 72 + kind, g.width * 4, false);
-    encode_q4tp_mv1(c, enc, &wb[0], hidden, &ckv, g.width, g.hidden, (80 + kind, kv_id, li));
-    encode_q4tp_mv1(c, enc, &wb[1], hidden, &csc, g.width, g.hidden, (82 + kind, kv_id, li));
-    comp_state_step(c, w, g, kind, kv_id, li, &ckv, &csc, pos, inv_freq, dst, dst_off, enc)
+    // The two projections and everything the state step does are one chain
+    // of dependent dispatches: one pass for the whole compressor.
+    comp_state_step(c, w, g, kind, kv_id, li, &ckv, &csc, pos, inv_freq, dst, dst_off, enc,
+        Some((&wb[0], &wb[1], hidden)))
 }
 
 /// Everything after the two projections: the slot bookkeeping, the fold when
@@ -17942,6 +17943,10 @@ fn comp_state_step(
     dst: &wgpu::Buffer,
     dst_off: usize,
     enc: &mut wgpu::CommandEncoder,
+    // Some: the two projections that produce `ckv`/`csc`, encoded into this
+    // step's own pass instead of two of their own. None: the caller already
+    // filled them (the parity test hands them in).
+    proj: Option<(&wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer)>,
 ) -> Option<usize> {
     let ew = if g.overlap { g.width / 2 } else { g.width };
     let span = g.ratio * g.width;
@@ -17980,6 +17985,12 @@ fn comp_state_step(
     let nw = const_buf(c, bytemuck::cast_slice(&w.norm[..ew]));
     {
         let mut pass = begin_pass(enc);
+        if let Some((wkv, wgate, hidden)) = proj {
+            encode_q4tp_mv1_p(&mut pass, c, wkv, hidden, ckv, g.width, g.hidden,
+                (80 + kind, kv_id, li));
+            encode_q4tp_mv1_p(&mut pass, c, wgate, hidden, csc, g.width, g.hidden,
+                (82 + kind, kv_id, li));
+        }
         if g.overlap {
             // The reference biases the score as the token ARRIVES and keeps
             // it biased across the shift, so `ape` is added once, here, and
@@ -18061,9 +18072,8 @@ pub fn dsv4_window_append(
 
     let raw = frame_buf(c, 104, hd * 4, false);
     let kv = frame_buf(c, 105, hd * 4, false);
-    encode_q4tp_mv1(c, enc, &wb, hidden, &raw, hd, dim, (106, kv_id, li));
     window_place(c, enc, &raw, kv_norm, hd, window, filled, rope_dim, eps, pos,
-        inv_freq, cache, kv_id, li);
+        inv_freq, cache, kv_id, li, Some((&wb, hidden, dim)));
     Some((filled + 1).min(window))
 }
 
@@ -18087,6 +18097,9 @@ fn window_place(
     cache: &wgpu::Buffer,
     kv_id: u64,
     li: usize,
+    // Some: the KV projection that fills `raw`, encoded into this step's own
+    // pass. None: the caller filled it (the parity test hands it in).
+    proj: Option<(&wgpu::Buffer, &wgpu::Buffer, usize)>,
 ) {
     let kv = frame_buf(c, 105, hd * 4, false);
     let nw = const_buf(c, bytemuck::cast_slice(&kv_norm[..hd]));
@@ -18094,6 +18107,9 @@ fn window_place(
     let posb = frame_up_pos(c, 108, pos, eps);
     let tmp = frame_buf(c, 110, (window.max(1) - 1).max(1) * hd * 4, true);
     let mut pass = begin_pass(enc);
+    if let Some((wb, hidden, dim)) = proj {
+        encode_q4tp_mv1_p(&mut pass, c, wb, hidden, raw, hd, dim, (106, kv_id, li));
+    }
     encode_rmsnorm_p(&mut pass, c, raw, &nw, &kv, hd, eps, (107, kv_id, li));
     encode_rope_heads_p(&mut pass, c, &kv, &freq, &posb, 1, hd, rope_dim, false, false,
         (109, kv_id, li));
@@ -18149,7 +18165,7 @@ pub fn dsv4_window_place_for_test(
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     window_place(c, &mut enc, &rb, kv_norm, hd, window, filled, rope_dim, eps, pos,
-        inv_freq, &cache, 909, 0);
+        inv_freq, &cache, 909, 0, None);
     out.clear();
     out.resize(window * hd, 0.0);
     let bytes = (window * hd * 4) as u64;
@@ -18526,7 +18542,7 @@ pub fn dsv4_comp_state_for_test(
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     let folded = comp_state_step(
-        c, &w, g, 9, kv_id, 0, &kb, &sb, pos, inv_freq, &dst, 0, &mut enc,
+        c, &w, g, 9, kv_id, 0, &kb, &sb, pos, inv_freq, &dst, 0, &mut enc, None,
     )
     .is_some();
     if !folded {
