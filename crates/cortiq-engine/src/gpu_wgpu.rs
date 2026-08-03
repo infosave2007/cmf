@@ -5940,6 +5940,13 @@ struct Ctx {
     /// Stable per-(tag, kv, layer) uniform slots for sequence-varying scalars.
     dsv4_uni: Mutex<HashMap<(u8, u64, usize), wgpu::Buffer>>,
     dsv4_store: Mutex<HashMap<(u8, u64, usize), wgpu::Buffer>>,
+    /// CMF_DSV4_SLOT_CHECK: writes per slot key since the last submission.
+    /// A slot may be written ONCE per submission — queue writes do not
+    /// interleave with passes, so a second write reaches every dispatch of
+    /// the first. That is the bug that made a run of layers route with the
+    /// last layer's router bias, and a tag collision between two call sites
+    /// looks exactly the same from here.
+    slot_writes: Mutex<HashMap<(u8, u64, usize), u32>>,
     /// (epoch, bind groups) for the dsv4 frames — see `cached_bind`.
     dsv4_binds: Mutex<(u64, HashMap<(u8, u64, usize), wgpu::BindGroup>)>,
     /// Access clock for the aging above — one tick per weight lookup.
@@ -6641,6 +6648,7 @@ fn init() -> Result<Ctx, String> {
         dsv4_ixkv: Mutex::new(HashMap::new()),
         dsv4_uni: Mutex::new(HashMap::new()),
         dsv4_store: Mutex::new(HashMap::new()),
+        slot_writes: Mutex::new(HashMap::new()),
         dsv4_binds: Mutex::new((0, HashMap::new())),
         res_clock: std::sync::atomic::AtomicU64::new(0),
         uniforms: Mutex::new(HashMap::new()),
@@ -13101,7 +13109,34 @@ pub static SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 #[inline]
 fn submit(c: &Ctx, buf: wgpu::CommandBuffer) {
     SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if slot_check() {
+        c.slot_writes.lock().unwrap().clear();
+    }
     c.queue.submit(Some(buf));
+}
+
+/// `CMF_DSV4_SLOT_CHECK=1`: panic if a per-layer slot is written twice
+/// before its submission. Off by default — it costs a lock per slot write —
+/// but the toy gate runs with it on, because the invariant it guards is a
+/// convention and conventions are what the 50.280 was made of.
+fn slot_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_SLOT_CHECK").is_ok_and(|v| v != "0"))
+}
+
+fn note_slot_write(c: &Ctx, kind: &str, key: (u8, u64, usize)) {
+    if !slot_check() {
+        return;
+    }
+    let mut m = c.slot_writes.lock().unwrap();
+    let n = m.entry(key).or_insert(0);
+    *n += 1;
+    assert!(
+        *n == 1,
+        "{kind}-слот {key:?} записан {n} раз до одной отправки — \
+         последняя запись достанется ВСЕМ проходам, которые его читают \
+         (столкновение тегов или два слоя на один ключ)",
+    );
 }
 
 /// Two device buffers, one staging buffer, one fence. The chain used to
@@ -17549,6 +17584,14 @@ fn const_buf(c: &Ctx, data: &[u8]) -> wgpu::Buffer {
 /// A frame working buffer, created on first use and reused for good. `tag`
 /// separates roles that happen to share a length — two buffers of the same
 /// size are not interchangeable when both are live in one encoder.
+/// A pooled scratch buffer, keyed by (role, size).
+///
+/// GROW-ONLY BY CONTRACT: an entry is never evicted or recreated, so the
+/// handle a caller got last token is the same one it gets this token. The
+/// bind-group cache depends on that — it holds groups built from these
+/// buffers and only the GREW epoch invalidates them, so adding eviction
+/// here would leave every cached group pointing at a dead buffer with
+/// nothing to notice.
 fn frame_buf(c: &Ctx, tag: u8, len_bytes: usize, upload: bool) -> wgpu::Buffer {
     let mut m = c.dsv4_scratch.lock().unwrap();
     if let Some(b) = m.get(&(tag, len_bytes)) {
@@ -18755,6 +18798,28 @@ pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: us
     true
 }
 
+/// ── the u8 tag registry ────────────────────────────────────────────────
+///
+/// Four separate maps key on a `u8` tag, and only the tag tells two call
+/// sites apart. A collision does not crash: it hands one site the other's
+/// bind group, pointing at the wrong buffers, and the model quietly gets
+/// worse. The numbers in use, so the next one can be picked without reading
+/// the file:
+///
+/// * `frame_buf` (tag, len)   — 1, 2, 9, 17, 26, 27, 40, 43, 44, 70–79,
+///                              90–95, 104, 105, 108, 110, 111
+/// * `frame_up_pos` (tag)     — 1, 79–80, 97, 108
+/// * `uni_slot` (tag, kv, li) — 84–85, 101, 130–131, 134, 136, 138, 140,
+///                              142–164 (blit, even), 166, 168, 170
+/// * `cached_bind` (tag,kv,li)— 30–33, 36–42, 50–64, 80–101, 120–129,
+///                              132–141, 143–165 (blit, odd), 167, 169, 171
+///
+/// `CMF_DSV4_SLOT_CHECK=1` turns a collision between two `uni_slot` or
+/// `store_slot` sites into a panic instead of a silent wrong answer: a slot
+/// written twice before one submission is either a collision or the
+/// last-write-wins bug that made a run of layers route with the last
+/// layer's router bias.
+///
 /// Bind groups for the dsv4 frames, keyed by role and layer. Their buffers
 /// are pooled and stable between tokens, so building 11 of them per layer per
 /// token — 473 a token on the release — was pure host overhead. The epoch
@@ -18797,6 +18862,7 @@ fn uni_slot(c: &Ctx, tag: u8, kv: u64, li: usize, vals: [u32; 4]) -> wgpu::Buffe
             })
             .clone()
     };
+    note_slot_write(c, "uni", (tag, kv, li));
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(&vals));
     b
 }
@@ -18839,6 +18905,7 @@ fn store_slot(c: &Ctx, tag: u8, kv: u64, li: usize, data: &[u8]) -> wgpu::Buffer
         }
     };
     if !data.is_empty() {
+        note_slot_write(c, "store", (tag, kv, li));
         c.queue.write_buffer(&b, 0, data);
     }
     b
