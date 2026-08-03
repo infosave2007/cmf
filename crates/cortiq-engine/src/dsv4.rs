@@ -1860,9 +1860,28 @@ fn dsv4_layer_loop(
         return false;
     }
     let chain = chain_enabled();
+    // CMF_DSV4_LAYERS_PROBE=N — TIMING ONLY, the answer is garbage. Runs the
+    // first N layers and leaves the rest alone. Decode time against N is a
+    // line whose SLOPE is the per-layer cost and whose intercept is
+    // everything that happens once a token. Unlike the skip probe it does
+    // not change what a layer does — which on a MoE model is the difference
+    // between a measurement and an artefact, because dropping any stage
+    // changes the routing and the routing changes what the experts cost.
+    let layer_cap = {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("CMF_DSV4_LAYERS_PROBE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(usize::MAX)
+        })
+    };
     let mut run: Vec<usize> = Vec::new();
     let mut sink_out = vec![0.0f32; dim];
     for (li, l) in layers.iter().enumerate() {
+        if li >= layer_cap {
+            break;
+        }
         // The device path never ticked the profiler, so every per-token
         // number it printed described the two host-path tokens at the start
         // of a run — the ones that also pay for the upload. Ticking here is
