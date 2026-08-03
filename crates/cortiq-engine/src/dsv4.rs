@@ -3485,14 +3485,20 @@ fn forward_token_inner(
         && dump_path().is_none();
     #[cfg(not(feature = "gpu"))]
     let hc_dev = false;
+    // The device loop's verdict as a VALUE, not as a cfg-gated `if`. It used
+    // to be the latter, with the CPU loop in the `else` arm — so a build
+    // without the gpu feature compiled no layer loop at all and every token
+    // passed through untouched. The window test said so ("sliding window
+    // never filled") and only in the CPU-only build, which is the one
+    // configuration the gate was not running.
     #[cfg(feature = "gpu")]
-    if hc_dev
+    let two_frame_done = hc_dev
         && dsv4_two_frame_loop(
             &mut state, layers, g, cfg, st, token_id, inv_freq, pool, &mut scratch,
-        )
-    {
-        // The state the head needs is already back.
-    } else {
+        );
+    #[cfg(not(feature = "gpu"))]
+    let two_frame_done = false;
+    if !two_frame_done {
 
     for (li, l) in layers.iter().enumerate() {
         if layer_frames {

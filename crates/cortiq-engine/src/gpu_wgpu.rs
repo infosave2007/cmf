@@ -7792,10 +7792,17 @@ fn moe_expert_bufs(
         // them into one Vec first meant a 2.2 GB allocation and a full extra
         // memcpy PER LAYER — 94 GB of pointless copying across the release,
         // on top of the 94 GB that has to move anyway.
+        // Counted, like every other upload. The rate the profile printed —
+        // 7850 MB/s — was measured over the SKELETON only, because the
+        // expert stack is ninety per cent of the bytes and goes through
+        // this loop rather than through `weight_buffer`.
+        let t_up = std::time::Instant::now();
         for (i, &abs) in offs.iter().enumerate() {
             c.queue
                 .write_buffer(&b, (i * plen) as u64, &bytes[abs..abs + plen]);
         }
+        UPLOAD_NS.fetch_add(t_up.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        UPLOAD_BYTES.fetch_add((offs.len() * plen) as u64, Ordering::Relaxed);
         uploaded.borrow_mut().extend(offs.iter().map(|&a| (a, plen)));
         Some(b)
     };
@@ -15060,10 +15067,16 @@ fn encode_o_lora_mv4_p(
 }
 
 /// `CMF_DSV4_MOE4=0` puts the q2tp experts back on one row a workgroup.
-/// `CMF_DSV4_F32SPLIT=0` keeps the few-row f32 matvec on one dispatch.
+/// `CMF_DSV4_F32SPLIT=1` splits the few-row f32 matvec over its columns.
+///
+/// OFF: it measured 27.1 tok/s against the one-dispatch path's 27.2. The
+/// commit that claimed to turn it off did not: its patch made two edits and
+/// the second failed an assertion, so the file was never written and only
+/// the message changed. A review reading the source rather than the log
+/// caught it.
 fn f32_split() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_DSV4_F32SPLIT").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_F32SPLIT").is_ok_and(|v| v != "0"))
 }
 
 /// `CMF_DSV4_OLORA_MV4=0` keeps the grouped projection on its own kernel.
