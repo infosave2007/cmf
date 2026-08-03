@@ -18274,6 +18274,72 @@ fn ts_pair(c: &Ctx, which: usize) -> Option<wgpu::ComputePassTimestampWrites<'_>
 /// (a pass of its own, so the query set has boundaries to write) and the
 /// fused one (a dispatch inside the layer's pass).
 #[allow(clippy::too_many_arguments)]
+/// What a dispatch actually costs, and WHY.
+///
+/// Every fusion this session was bought or rejected on an assumed ~30 µs a
+/// dispatch, and that number came from dividing a frame by its dispatch
+/// count — which cannot tell a kernel LAUNCH from the memory barrier wgpu
+/// inserts when two dispatches touch the same buffer. The two have opposite
+/// remedies: launches want fewer dispatches, barriers want independent ones
+/// grouped together. So measure both.
+///
+/// N trivial dispatches into ONE buffer (every pair a hazard) against N into
+/// eight buffers round-robin (no hazard within a group of eight).
+pub fn dispatch_bench() -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(c) = ctx() else {
+        out.push("нет устройства".into());
+        return out;
+    };
+    const N: usize = 2000;
+    let bufs: Vec<wgpu::Buffer> = (0..8)
+        .map(|_| {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dbench"),
+                size: 4096,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            })
+        })
+        .collect();
+    let p = uniform_u32x4(c, [1024, 0, 0, 0]);
+    let binds: Vec<wgpu::BindGroup> = bufs
+        .iter()
+        .map(|b| {
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &c.zero.get_bind_group_layout(0),
+                entries: &[bind_buf(0, b), bind_buf(1, &p)],
+            })
+        })
+        .collect();
+    for (name, stride) in [("зависимые (один буфер)", 0usize), ("независимые (8 буферов)", 1)] {
+        // Warm, then time.
+        for round in 0..2 {
+            let t0 = std::time::Instant::now();
+            let mut enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            {
+                let mut pass = begin_pass(&mut enc);
+                pass.set_pipeline(&c.zero);
+                for i in 0..N {
+                    let b = if stride == 0 { 0 } else { i % 8 };
+                    pass.set_bind_group(0, &binds[b], &[]);
+                    pass.dispatch_workgroups(4, 1, 1);
+                }
+            }
+            submit(c, enc.finish());
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            if round == 1 {
+                let us = t0.elapsed().as_secs_f64() * 1e6 / N as f64;
+                out.push(format!("{name}: {us:.2} мкс на диспатч"));
+            }
+        }
+    }
+    out
+}
+
 /// How many position-chunks to cut a head into. One workgroup a chunk, so
 /// this is the occupancy knob: 64 heads alone left the card at a few percent.
 fn sa_chunks(m: usize) -> usize {

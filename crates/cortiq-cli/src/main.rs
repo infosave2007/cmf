@@ -1298,6 +1298,14 @@ async fn main() -> anyhow::Result<()> {
             for line in cortiq_engine::gpu_wgpu::adapter_report() {
                 println!("  {line}");
             }
+            // CMF_GPU_DISPATCH_BENCH=1: what a dispatch costs, and whether
+            // the cost is the launch or the barrier between two that touch
+            // the same buffer. Every fusion decision hangs on which.
+            if std::env::var("CMF_GPU_DISPATCH_BENCH").is_ok_and(|v| v != "0") {
+                for line in cortiq_engine::gpu_wgpu::dispatch_bench() {
+                    println!("  {line}");
+                }
+            }
             Ok(())
         }
         Commands::Verify { model } => cmd_verify(&model).await,
