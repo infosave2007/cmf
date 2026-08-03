@@ -7745,10 +7745,7 @@ pub fn attn_dropin_gpu(
         });
     let go =
         |enc: &mut wgpu::CommandEncoder, p: &wgpu::ComputePipeline, b: &wgpu::BindGroup, g: u32| {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
+            let mut pass = begin_pass(enc);
             pass.set_pipeline(p);
             pass.set_bind_group(0, b, &[]);
             pass.dispatch_workgroups(g, 1, 1);
@@ -8448,10 +8445,7 @@ pub fn forward_token_graph(
         });
     let go =
         |enc: &mut wgpu::CommandEncoder, p: &wgpu::ComputePipeline, b: &wgpu::BindGroup, g: u32| {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
+            let mut pass = begin_pass(enc);
             pass.set_pipeline(p);
             pass.set_bind_group(0, b, &[]);
             pass.dispatch_workgroups(g, 1, 1);
@@ -8537,10 +8531,7 @@ pub fn forward_token_graph(
                             bind_buf(5, xs),
                         ],
                     });
-                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: None,
-                        timestamp_writes: None,
-                    });
+                    let mut pass = begin_pass(enc);
                     pass.set_pipeline(&c.q4t_mv8);
                     pass.set_bind_group(0, &bind, &[]);
                     pass.dispatch_workgroups((rows as u32).div_ceil(8).min(MAX_WG), 1, 1);
@@ -8725,10 +8716,7 @@ pub fn forward_token_graph(
                     .filter_map(|(m, xs, y, r, cc)| prep(m, xs, y, *r, *cc))
                     .collect();
                 if prepped.len() == mats.len() {
-                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: None,
-                        timestamp_writes: None,
-                    });
+                    let mut pass = begin_pass(enc);
                     for (p, b, g) in &prepped {
                         pass.set_pipeline(p);
                         pass.set_bind_group(0, b, &[]);
@@ -9044,10 +9032,7 @@ pub fn forward_token_graph(
                                 &attn, &o1_u,
                             ],
                         );
-                        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: None,
-                            timestamp_writes: None,
-                        });
+                        let mut pass = begin_pass(&mut enc);
                         pass.set_pipeline(&c.attn_rope);
                         pass.set_bind_group(0, &bg_rope, &[]);
                         pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
@@ -9121,10 +9106,7 @@ pub fn forward_token_graph(
                                 );
                                 let bg_kv = bg(&c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]);
                                 let mut pass =
-                                    enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                                        label: None,
-                                        timestamp_writes: None,
-                                    });
+                                    begin_pass(&mut enc);
                                 let fine = li < 4;
                                 tsp!(pass, fine, 20); // pass start (after qkv projections)
                                 pass.set_pipeline(&c.attn_rope);
@@ -9167,10 +9149,7 @@ pub fn forward_token_graph(
                                 );
                                 let bg_kv = bg(&c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]);
                                 let mut pass =
-                                    enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                                        label: None,
-                                        timestamp_writes: None,
-                                    });
+                                    begin_pass(&mut enc);
                                 pass.set_pipeline(&c.attn_rope);
                                 pass.set_bind_group(0, &bg_rope, &[]);
                                 pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
@@ -9223,10 +9202,7 @@ pub fn forward_token_graph(
                                         ],
                                     });
                                 let mut pass =
-                                    enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                                        label: None,
-                                        timestamp_writes: None,
-                                    });
+                                    begin_pass(&mut enc);
                                 pass.set_pipeline(pp);
                                 pass.set_bind_group(0, &bg_part, &[]);
                                 pass.dispatch_workgroups(nh as u32, nc_used as u32, 1);
@@ -9386,10 +9362,7 @@ pub fn forward_token_graph(
                     let outp = prep(out, &gdo_b, &ob, hidden, nv * dv);
                     if projs.iter().all(|p| p.is_some()) && outp.is_some() {
                         let _ = (skip_proj, skip_outp);
-                        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: None,
-                            timestamp_writes: None,
-                        });
+                        let mut pass = begin_pass(&mut enc);
                         if !skip_proj {
                             for p in projs.iter().flatten() {
                                 pass.set_pipeline(p.0);
@@ -9461,10 +9434,7 @@ pub fn forward_token_graph(
                         if c.gdn_par {
                             {
                                 let mut pass =
-                                    enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                                        label: None,
-                                        timestamp_writes: None,
-                                    });
+                                    begin_pass(&mut enc);
                                 pass.set_pipeline(&c.gdn_step_par);
                                 pass.set_bind_group(0, &bg_par, &[]);
                                 pass.dispatch_workgroups(*nv as u32, (*dv as u32).div_ceil(4), 1);
@@ -9533,10 +9503,7 @@ pub fn forward_token_graph(
                     if let (Some((pgp, bg_g, wg)), Some((pup, bg_u, wu))) = (pg, pu) {
                         let bg_silu =
                             bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]);
-                        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: None,
-                            timestamp_writes: None,
-                        });
+                        let mut pass = begin_pass(&mut enc);
                         if let Some((p, b, w)) = &ffn_pre {
                             pass.set_pipeline(p);
                             pass.set_bind_group(0, b, &[]);
@@ -9728,10 +9695,7 @@ pub fn forward_token_graph(
                                     bind_buf(7, &mdf_u),
                                 ],
                             });
-                            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                                label: None,
-                                timestamp_writes: None,
-                            });
+                            let mut pass = begin_pass(&mut enc);
                             if let Some((p, b, w)) = &ffn_pre {
                                 pass.set_pipeline(p);
                                 pass.set_bind_group(0, b, &[]);
@@ -9763,10 +9727,7 @@ pub fn forward_token_graph(
                     }
                     if continue_moe_std {
                         if let (Some((prp, bgr, wr)), Some((psp, bgs, ws))) = (pr, ps) {
-                            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                                label: None,
-                                timestamp_writes: None,
-                            });
+                            let mut pass = begin_pass(&mut enc);
                             if let Some((p, b, w)) = &ffn_pre {
                                 pass.set_pipeline(p);
                                 pass.set_bind_group(0, b, &[]);
@@ -9825,10 +9786,7 @@ pub fn forward_token_graph(
                             go(&mut enc, &c.moe_select, &bg_sel, 1);
                             {
                                 let mut pass =
-                                    enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                                        label: None,
-                                        timestamp_writes: None,
-                                    });
+                                    begin_pass(&mut enc);
                                 pass.set_pipeline(p_gu);
                                 pass.set_bind_group(0, &bg_gu, &[]);
                                 pass.dispatch_workgroups(*mi as u32, slots as u32, 1);
@@ -10613,10 +10571,7 @@ pub fn forward_batch_graph(
         });
     let go =
         |enc: &mut wgpu::CommandEncoder, p: &wgpu::ComputePipeline, b: &wgpu::BindGroup, g: u32| {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
+            let mut pass = begin_pass(enc);
             pass.set_pipeline(p);
             pass.set_bind_group(0, b, &[]);
             pass.dispatch_workgroups(g, 1, 1);
@@ -10670,10 +10625,7 @@ pub fn forward_batch_graph(
                             bind_buf(5, xs),
                         ],
                     });
-                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: None,
-                        timestamp_writes: None,
-                    });
+                    let mut pass = begin_pass(enc);
                     pass.set_pipeline(&c.q4t_mv8);
                     pass.set_bind_group(0, &bind, &[]);
                     pass.dispatch_workgroups((rows as u32).div_ceil(8).min(MAX_WG), 1, 1);
@@ -10894,10 +10846,7 @@ pub fn forward_batch_graph(
                 // matvecs were 1920 of the chunk's ~4800 remaining commands.
                 let fb_u = uniform_u32x4(c, [hidden as u32, *nv as u32, 0, 0]);
                 {
-                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: None,
-                        timestamp_writes: None,
-                    });
+                    let mut pass = begin_pass(&mut enc);
                     for (w, y) in [(&a.buf, &a_bb), (&b.buf, &b_bb)] {
                         pass.set_pipeline(&c.f32_matvec_b);
                         pass.set_bind_group(0, &bg(&c.layout_f32b, &[w, &n1, y, &fb_u]), &[]);
@@ -11038,10 +10987,7 @@ pub fn forward_batch_graph(
                     // f32_matvec verbatim, so the logits stay bit-identical.
                     let fr_u = uniform_u32x4(c, [hidden as u32, *n_exp as u32, 0, 0]);
                     {
-                        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: None,
-                            timestamp_writes: None,
-                        });
+                        let mut pass = begin_pass(&mut enc);
                         pass.set_pipeline(&c.f32_matvec_b);
                         pass.set_bind_group(
                             0,
@@ -11059,10 +11005,7 @@ pub fn forward_batch_graph(
                         &[gate_all, up_all, &n1, msel, mact, &gu_u],
                     );
                     let bg_dn = bg(&c.layout_moe_dn_b, &[down_all, mact, msel, mwt, &ob, &dn_u]);
-                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: None,
-                        timestamp_writes: None,
-                    });
+                    let mut pass = begin_pass(&mut enc);
                     pass.set_pipeline(&c.moe_select_b);
                     pass.set_bind_group(0, &bg_sel, &[]);
                     pass.dispatch_workgroups(k as u32, 1, 1);
@@ -11088,10 +11031,7 @@ pub fn forward_batch_graph(
                         if !sg_fold {
                             emat1(&mut enc, sgate, &row_in, mslog, 1, hidden);
                         }
-                        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: None,
-                            timestamp_writes: None,
-                        });
+                        let mut pass = begin_pass(&mut enc);
                         pass.set_pipeline(&c.moe_select);
                         pass.set_bind_group(0, &bg_sel, &[]);
                         pass.dispatch_workgroups(1, 1, 1);
@@ -11195,10 +11135,7 @@ pub fn gdn_conv_gpu(
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(&c.gdn_conv);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((cdim as u32).div_ceil(256), 1, 1);
@@ -11439,10 +11376,7 @@ pub fn attn_block_gpu(
                     pipe: &wgpu::ComputePipeline,
                     bind: &wgpu::BindGroup,
                     groups: u32| {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass(enc);
         pass.set_pipeline(pipe);
         pass.set_bind_group(0, bind, &[]);
         pass.dispatch_workgroups(groups, 1, 1);
@@ -13147,6 +13081,21 @@ fn submit(c: &Ctx, buf: wgpu::CommandBuffer) {
 /// read its folded vector and then call `dsv4_state_read` for the
 /// hyper-connection state — two submissions and two map-waits for a token
 /// that is otherwise a single submission.
+/// Compute passes opened, all sites. On a decode step the dsv4 chain opens
+/// about thirty a layer, and a pass costs the driver a fixed amount whatever
+/// it dispatches — which is why a 32-layer TOY with 128-wide tensors still
+/// waits 35 ms a token. Reported per token next to the submissions.
+pub static PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn begin_pass(enc: &mut wgpu::CommandEncoder) -> wgpu::ComputePass<'_> {
+    PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    })
+}
+
 fn readback2(
     c: &Ctx,
     mut enc: wgpu::CommandEncoder,
@@ -13384,10 +13333,7 @@ fn encode_matvec(
             bind_buf(4, &p_buf),
         ],
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.matvec);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
@@ -13417,10 +13363,7 @@ fn encode_matvec_q1(
             bind_buf(3, &p_buf),
         ],
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.q1);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((rows as u32).div_ceil(8).min(MAX_WG), 1, 1);
@@ -13587,10 +13530,7 @@ fn encode_q4_tile_mm(
             bind_buf(3, &p_buf),
         ],
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(
@@ -13621,10 +13561,7 @@ fn encode_q1_mm(
             bind_buf(4, &p_buf),
         ],
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.q1_mm);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(
@@ -13659,10 +13596,7 @@ fn encode_q8_mm(
             bind_buf(4, &p_buf),
         ],
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.mul_mm);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(
@@ -13701,10 +13635,7 @@ fn encode_f32matvec_k(
             ],
         })
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.f32_matvec);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
@@ -13730,10 +13661,7 @@ fn encode_f32matvec(
             bind_buf(3, &p_buf),
         ],
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.f32_matvec);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
@@ -13809,10 +13737,7 @@ fn encode_f32matvec_off(
         layout: &c.layout_f32,
         entries: &entries,
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.f32_matvec);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
@@ -13871,10 +13796,7 @@ fn encode_q4tp_mv4(
             bind_buf(5, xs),
         ],
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(pipe);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((rows as u32).div_ceil(per_wg).min(MAX_WG), 1, 1);
@@ -13907,10 +13829,7 @@ fn encode_q4tp_mv1(
             ],
         })
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.q4tp_mv);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
@@ -13939,10 +13858,7 @@ fn encode_q1t_like(
             bind_buf(3, &p_buf),
         ],
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
@@ -13972,10 +13888,7 @@ fn encode_silu_down(
             bind_buf(4, &p_buf),
         ],
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.silu_down);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
@@ -14135,10 +14048,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
             layout: &c.layout_zero,
             entries: &[bind_buf(0, &y_buf), bind_buf(1, &np)],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(&c.zero);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((hidden as u32).div_ceil(256), 1, 1);
@@ -14197,10 +14107,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
                     bind_buf(4, &np),
                 ],
             });
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
+            let mut pass = begin_pass(&mut enc);
             pass.set_pipeline(&c.silu);
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
@@ -14220,10 +14127,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
                 layout: &c.layout_axpy,
                 entries: &[bind_buf(0, &d_buf), bind_buf(1, &y_buf), bind_buf(2, &wp)],
             });
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
+            let mut pass = begin_pass(&mut enc);
             pass.set_pipeline(&c.axpy);
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups((hidden as u32).div_ceil(256), 1, 1);
@@ -14493,10 +14397,7 @@ mod tests {
             stage.unmap();
         };
         let dispatch = |enc: &mut wgpu::CommandEncoder, even: bool| {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
+            let mut pass = begin_pass(enc);
             pass.set_pipeline(&c.matvec);
             pass.set_bind_group(0, if even { &bg_ab } else { &bg_ba }, &[]);
             pass.dispatch_workgroups(wg, 1, 1);
@@ -14664,10 +14565,7 @@ mod tests {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
-            let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
+            let mut p = begin_pass(enc);
             p.set_pipeline(&c.add_rmsnorm);
             p.set_bind_group(0, &bind, &[]);
             p.dispatch_workgroups(1, 1, 1);
@@ -14984,10 +14882,7 @@ mod tests {
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             {
-                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: None,
-                    timestamp_writes: None,
-                });
+                let mut pass = begin_pass(enc);
                 pass.set_pipeline(&c.o1_far);
                 pass.set_bind_group(0, &bg_far, &[]);
                 pass.dispatch_workgroups((gcnt * hpg * mv) as u32, 1, 1);
@@ -15741,10 +15636,7 @@ mod tests {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
+            let mut pass = begin_pass(enc);
             pass.set_pipeline(&c.q1_mm);
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups((rows as u32).div_ceil(64), (b as u32).div_ceil(64), 1);
@@ -15841,10 +15733,7 @@ pub fn rope_heads_for_test(
                 bind_buf(3, &pb),
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(&c.rope_heads);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(nh as u32, 1, 1);
@@ -15919,10 +15808,7 @@ pub fn o_lora_a_for_test(
                 bind_buf(3, &p),
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(&c.o_lora_a);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
@@ -16005,10 +15891,7 @@ pub fn kv_pool_for_test(
                 bind_buf(6, &p),
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(&c.kv_pool);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((width as u32).div_ceil(256), 1, 1);
@@ -16066,10 +15949,7 @@ pub fn index_scores_for_test(
                 bind_buf(4, &p),
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(&c.index_scores);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((n_pos as u32).min(MAX_WG), 1, 1);
@@ -16117,10 +15997,7 @@ pub fn top_k_for_test(scores: &[f32], k: usize, out: &mut Vec<u32>) -> bool {
                 bind_buf(3, &p),
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(&c.top_k_index);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(1, 1, 1);
@@ -16183,10 +16060,7 @@ fn encode_hc_fold_k(
             bind_buf(7, p),
         ],
     }));
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.hc_pre_fold);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(1, 1, 1);
@@ -16218,10 +16092,7 @@ fn encode_hc_fold(
             bind_buf(7, p),
         ],
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.hc_pre_fold);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(1, 1, 1);
@@ -16253,10 +16124,7 @@ fn encode_hc_expand_k(
             bind_buf(5, p),
         ],
     }));
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.hc_post_expand);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(((hc * dim) as u32).div_ceil(256), 1, 1);
@@ -16286,10 +16154,7 @@ fn encode_hc_expand(
             bind_buf(5, p),
         ],
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.hc_post_expand);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(((hc * dim) as u32).div_ceil(256), 1, 1);
@@ -16336,10 +16201,7 @@ fn encode_attn_chain(
                 ],
             })
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass(enc);
         pass.set_pipeline(&c.o_lora_a);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
@@ -16486,10 +16348,7 @@ fn encode_moe_chain(
             bind_buf(5, &dn_u),
         ],
     }));
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.moe_route);
     pass.set_bind_group(0, &bind_r, &[]);
     pass.dispatch_workgroups(1, 1, 1);
@@ -17340,10 +17199,7 @@ pub fn moe_route_for_test(
         // pass boundaries a layer and measure the split instead — so this is
         // the block's total, which is the number that says whether the card
         // is busy or waiting.
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(&c.moe_route);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(1, 1, 1);
@@ -17412,10 +17268,7 @@ fn encode_rmsnorm(
             ],
         })
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.rmsnorm);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(1, 1, 1);
@@ -17449,10 +17302,7 @@ fn encode_rope_heads(
             ],
         })
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.rope_heads);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(nh as u32, 1, 1);
@@ -17656,10 +17506,7 @@ fn encode_axpy(
             entries: &[bind_buf(0, d), bind_buf(1, y), bind_buf(2, &p)],
         })
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.axpy);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
@@ -17709,10 +17556,7 @@ fn encode_kv_pool(
             ],
         })
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.kv_pool);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((ew as u32).div_ceil(256), 1, 1);
@@ -18159,10 +18003,7 @@ fn encode_fill_zero(
             entries: &[bind_buf(0, y), bind_buf(1, &p)],
         })
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.zero);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
@@ -18198,10 +18039,7 @@ fn encode_index_scores(
             ],
         })
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.index_scores);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((n_pos as u32).min(MAX_WG), 1, 1);
@@ -18230,10 +18068,7 @@ fn encode_top_k(
             ],
         })
     });
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.top_k_index);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(1, 1, 1);
@@ -18272,10 +18107,7 @@ fn encode_idx_build(
         }
         None => mk(&uniform_u32x4(c, [win_len as u32, window as u32, k as u32, 0])),
     };
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
+    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.idx_build);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
@@ -18807,10 +18639,7 @@ pub fn dsv4_attn_frame(
                 ],
             })
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(&c.o_lora_a);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
@@ -19570,10 +19399,7 @@ pub fn hc_join_for_test(
                 bind_buf(7, &params),
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(&c.hc_pre_fold);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(1, 1, 1);
@@ -19594,10 +19420,7 @@ pub fn hc_join_for_test(
                 bind_buf(5, &params),
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(&c.hc_post_expand);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(((hc * dim) as u32).div_ceil(256), 1, 1);

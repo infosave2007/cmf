@@ -1081,6 +1081,7 @@ pub(crate) mod prof {
                     &crate::gpu_wgpu::CHAIN_LAYERS,
                     &crate::gpu_wgpu::CHAIN_RUNS,
                     &crate::gpu_wgpu::SUBMITS,
+                    &crate::gpu_wgpu::PASSES,
                 ] {
                     a.store(0, Ordering::Relaxed);
                 }
@@ -1158,8 +1159,11 @@ pub(crate) mod prof {
             let sub = crate::gpu_wgpu::SUBMITS.load(Ordering::Relaxed);
             if sub > 0 {
                 eprintln!(
-                    "[dsv4-профиль] ОТПРАВОК на карту: {:.1} на токен",
+                    "[dsv4-профиль] ОТПРАВОК на карту: {:.1} на токен, ПРОХОДОВ {:.0} \
+                     ({:.1} на слой)",
                     sub as f64 / toks as f64,
+                    crate::gpu_wgpu::PASSES.load(Ordering::Relaxed) as f64 / toks as f64,
+                    crate::gpu_wgpu::PASSES.load(Ordering::Relaxed) as f64 / calls as f64,
                 );
             }
             let cl = crate::gpu_wgpu::CHAIN_LAYERS.load(Ordering::Relaxed);
