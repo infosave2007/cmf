@@ -18156,9 +18156,11 @@ fn comp_state_step(
             // The reference biases the score as the token ARRIVES and keeps
             // it biased across the shift, so `ape` is added once, here, and
             // the pooling kernel is told not to add it again.
-            encode_blit_p(&mut pass, c, &ape_all, &ape_slot, g.width, slot * g.width, 0,
-                Some((142 + kind * 2, kv_id, li)));
-            encode_axpy_p(&mut pass, c, &ape_slot, &csc, 1.0, g.width, (84 + kind, kv_id, li));
+            // The strided source reads this token's slot of `ape` directly:
+            // the copy into a scratch buffer existed only because axpy could
+            // not offset its input.
+            encode_axpy_full_p(&mut pass, c, &ape_all, &csc, 1.0, g.width, false,
+                slot * g.width, Some((84 + kind, kv_id, li)));
         }
         encode_blit_p(&mut pass, c, &ckv, pend_kv, g.width, 0, slot * g.width,
             Some((146 + kind * 2, kv_id, li)));
@@ -18446,8 +18448,11 @@ pub fn dsv4_indexer_frame(
             false, false, (98, kv_id, li));
         encode_q4tp_mv1_p(&mut pass, c, &wb[1], hidden, &hw_raw, g.ih, g.hidden,
             (99, kv_id, li));
-        encode_fill_zero_p(&mut pass, c, &hw, g.ih, (100, kv_id, li));
-        encode_axpy_p(&mut pass, c, &hw_raw, &hw, sc_factor, g.ih, (101, kv_id, li));
+        // `set`: hw = sc_factor·hw_raw. This was a whole-buffer zero-fill
+        // followed by an accumulate — two dispatches to express an
+        // assignment.
+        encode_axpy_full_p(&mut pass, c, &hw_raw, &hw, sc_factor, g.ih, true, 0,
+            Some((101, kv_id, li)));
         encode_index_scores_p(&mut pass, c, &qi, index_kv, &hw, &scores, g.ih, g.idim,
             limit, (kv_id, li));
         encode_top_k_p(&mut pass, c, &scores, &pick, &cnt, limit, g.top_k, (kv_id, li));
