@@ -586,7 +586,10 @@ fn silu_mul_pre(@builtin(global_invocation_id) gid: vec3<u32>) {
     sact[i] = v;
 }
 
-struct AxpyP { w: f32, n: u32, _a: u32, _b: u32 };
+// `set`: y = w·x[soff+i] rather than y += w·x[i]. Two callers wanted the
+// assignment and were spending a whole zero-fill dispatch to get it, and one
+// wanted a strided source and was spending a copy. `soff` is in floats.
+struct AxpyP { w: f32, n: u32, set: u32, soff: u32 };
 @group(0) @binding(0) var<storage, read>       ad : array<f32>;
 @group(0) @binding(1) var<storage, read_write> ay : array<f32>;
 @group(0) @binding(2) var<uniform>             ap : AxpyP;
@@ -594,7 +597,8 @@ struct AxpyP { w: f32, n: u32, _a: u32, _b: u32 };
 fn axpy(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= ap.n) { return; }
-    ay[i] = ay[i] + ap.w * ad[i];
+    let v = ap.w * ad[ap.soff + i];
+    if (ap.set != 0u) { ay[i] = v; } else { ay[i] = ay[i] + v; }
 }
 
 // Qwen3.5 output gate: attn_out *= sigmoid(gate), element-wise over nh·hd.
@@ -16021,6 +16025,34 @@ pub fn index_scores_for_test(
 /// Top-k positions on the device, in index order — the list `sparse_attend`
 /// consumes. Bounded by the kernel's workgroup array; beyond it the caller
 /// keeps the CPU's version rather than getting a truncated answer.
+/// `y += w·x` (or `y = w·x` when `set`) on the device, for the parity test.
+/// This kernel had no test at all, and its uniform was written in a
+/// different field order than the shader reads — so it silently did nothing.
+pub fn axpy_for_test(x: &[f32], y: &mut [f32], w: f32, set: bool, soff: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    let n = y.len();
+    if n == 0 || x.len() < soff + n {
+        return false;
+    }
+    let xb = storage_bytes(c, bytemuck::cast_slice(x));
+    let yb = rw_f32(c, n, true);
+    c.queue.write_buffer(&yb, 0, bytemuck::cast_slice(y));
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("axpy") });
+    {
+        let mut pass = begin_pass(&mut enc);
+        encode_axpy_full_p(&mut pass, c, &xb, &yb, w, n, set, soff, None);
+    }
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (n * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    readback(c, enc, &yb, &stage, (n * 4) as u64, y)
+}
+
 pub fn top_k_for_test(scores: &[f32], k: usize, out: &mut Vec<u32>) -> bool {
     let Some(c) = ctx() else { return false };
     let n = scores.len();
@@ -17761,14 +17793,51 @@ fn encode_axpy_p(
     n: usize,
     bkey: (u8, u64, usize),
 ) {
-    let bind = cached_bind(c, bkey, || {
-        let p = uniform_mixed(c, [n as u32, 0, 0], w);
+    encode_axpy_full_p(pass, c, d, y, w, n, false, 0, Some(bkey));
+}
+
+/// `y = w·x[soff..]` when `set`, else `y += w·x[soff..]`.
+///
+/// The uniform is written in the order the SHADER declares — `w` first, then
+/// `n`. It used to be written `[n, 0, 0, w]` against a `{ w: f32, n: u32 }`
+/// struct, so the kernel read `n` as zero and every invocation returned at
+/// the bounds check: the whole op was a no-op wherever the device ran it.
+#[allow(clippy::too_many_arguments)]
+fn encode_axpy_full_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
+    d: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    w: f32,
+    n: usize,
+    set: bool,
+    soff: usize,
+    bkey: Option<(u8, u64, usize)>,
+) {
+    let vals = [w.to_bits(), n as u32, set as u32, soff as u32];
+    let mk = || {
+        let p = uniform_u32x4(c, vals);
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &c.axpy.get_bind_group_layout(0),
             entries: &[bind_buf(0, d), bind_buf(1, y), bind_buf(2, &p)],
         })
-    });
+    };
+    let bind = match bkey {
+        // `soff` walks with the sequence on the compressor's bias add, so the
+        // cached form takes a per-layer slot it can rewrite.
+        Some((tag, kv, li)) => {
+            let p = uni_slot(c, tag, kv, li, vals);
+            cached_bind(c, (tag, kv, li), || {
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.axpy.get_bind_group_layout(0),
+                    entries: &[bind_buf(0, d), bind_buf(1, y), bind_buf(2, &p)],
+                })
+            })
+        }
+        None => mk(),
+    };
     pass.set_pipeline(&c.axpy);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
