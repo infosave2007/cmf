@@ -16245,7 +16245,8 @@ fn encode_attn_chain(
 ) {
     encode_q4tp_mv1(c, enc, &wb[1], qn, q, g.nh * g.hd, g.q_lora, (60, kv_id, li));
     encode_rope_heads(c, enc, q, freq, posb, g.nh, g.hd, g.rd, true, false, (61, kv_id, li));
-    encode_sparse_attend2(c, enc, q, cache, ixb, sink, attn, g.nh, g.hd, m, g.scale);
+    encode_sparse_attend2(c, enc, q, cache, ixb, sink, attn, g.nh, g.hd, m, g.scale,
+        Some((kv_id, li)));
     encode_rope_heads(c, enc, attn, freq, posb, g.nh, g.hd, g.rd, false, true, (62, kv_id, li));
     {
         let rows = g.o_groups * g.o_lora;
@@ -17546,6 +17547,12 @@ fn encode_sparse_attend2(
     hd: usize,
     m: usize,
     scale: f32,
+    // Some: cache the bind group under this (sequence, layer). The attended
+    // count walks with the sequence, so the uniform is a per-layer slot that
+    // is rewritten rather than a content-keyed buffer — same trade as the
+    // prep encoders. None: build fresh (the standalone frames, whose buffers
+    // are not the chain's).
+    bkey: Option<(u64, usize)>,
 ) {
     // ONE workgroup per head after all. The split into scores + apply spread
     // the work across the card and bought 0.54 -> 0.49 ms a layer — nothing —
@@ -17554,8 +17561,12 @@ fn encode_sparse_attend2(
     // CMF_SA_SPLIT=1 runs the split pair for anyone who wants to retry it on
     // a part where occupancy actually bites.
     if !sa_split() {
-        let p = uniform_mixed(c, [nh as u32, hd as u32, m as u32], scale);
-        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let p = match bkey {
+            Some((kv, li)) => uni_slot(c, 140, kv, li,
+                [nh as u32, hd as u32, m as u32, scale.to_bits()]),
+            None => uniform_mixed(c, [nh as u32, hd as u32, m as u32], scale),
+        };
+        let mk = || c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &c.sparse_attend.get_bind_group_layout(0),
             entries: &[
@@ -17567,6 +17578,10 @@ fn encode_sparse_attend2(
                 bind_buf(5, &p),
             ],
         });
+        let bind = match bkey {
+            Some((kv, li)) => cached_bind(c, (141, kv, li), mk),
+            None => mk(),
+        };
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
             timestamp_writes: ts_pair(c, 0),
@@ -18832,7 +18847,7 @@ pub fn dsv4_attn_frame(
         c, &mut enc, &q, &freq, &posb, g.nh, g.hd, g.rd, true, false, (33, kv_id, li),
     );
     encode_sparse_attend2(
-        c, &mut enc, &q, &cache, &ixb, &sink, &attn, g.nh, g.hd, idxs.len(), g.scale,
+        c, &mut enc, &q, &cache, &ixb, &sink, &attn, g.nh, g.hd, idxs.len(), g.scale, None,
     );
     encode_rope_heads(
         c, &mut enc, &attn, &freq, &posb, g.nh, g.hd, g.rd, false, true, (34, kv_id, li),
@@ -19544,7 +19559,7 @@ pub fn sparse_attend_for_test(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sa") });
     let _ = &p; // the split path builds its own params
     encode_sparse_attend2(
-        c, &mut enc, &qb, &kvb, &ib, &sb, &ob, nh, hd, idxs.len(), scale,
+        c, &mut enc, &qb, &kvb, &ib, &sb, &ob, nh, hd, idxs.len(), scale, None,
     );
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(
