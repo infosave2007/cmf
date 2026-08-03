@@ -5847,10 +5847,23 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
     if (forced) {
         if (lid < k) {
             let e = rt_forced[lid];
-            rt_idx[lid] = e;
             var w = 0.0;
             if (e < n) { w = rt_sc[e]; }
-            rt_w[lid] = w;
+            if (subset && e < n) {
+                let slot = rt_map[e];
+                if (slot == 0xFFFFFFFFu) {
+                    rt_idx[lid] = 0u;
+                    rt_w[lid] = 0.0;
+                    rt_cold[2u * lid] = e;
+                    rt_cold[2u * lid + 1u] = bitcast<u32>(w);
+                } else {
+                    rt_idx[lid] = slot;
+                    rt_w[lid] = w;
+                }
+            } else {
+                rt_idx[lid] = e;
+                rt_w[lid] = w;
+            }
             rt_used[lid] = 1u;
         }
     } else {
@@ -7864,6 +7877,11 @@ fn moe_expert_bufs(
             c.queue
                 .write_buffer(&b, (i * plen) as u64, &bytes[abs..abs + plen]);
         }
+        // Bound transient memory by ONE projection, not a whole expert
+        // pack. Near the VRAM limit, keeping gate + up + down staging alive
+        // together can OOM even though their final device buffers fit.
+        c.queue.submit(std::iter::empty());
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
         UPLOAD_NS.fetch_add(t_up.elapsed().as_nanos() as u64, Ordering::Relaxed);
         UPLOAD_BYTES.fetch_add((offs.len() * plen) as u64, Ordering::Relaxed);
         uploaded.borrow_mut().extend(offs.iter().map(|&a| (a, plen)));
@@ -17574,6 +17592,7 @@ fn encode_hc_fold(
     comb: &wgpu::Buffer,
     p: &wgpu::Buffer,
 ) {
+    let norm_out = frame_buf(c, 123, fold.size() as usize, false);
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &c.hc_pre_fold.get_bind_group_layout(0),
@@ -17586,6 +17605,11 @@ fn encode_hc_fold(
             bind_buf(5, post),
             bind_buf(6, comb),
             bind_buf(7, p),
+            // The fused-normalisation phase is disabled in this legacy
+            // wrapper (`HcP.nrm == 0`) and runs as the next dispatch, but the
+            // pipeline layout still requires every declared binding.
+            bind_buf(8, base),
+            bind_buf(9, &norm_out),
         ],
     });
     let mut pass = begin_pass(enc);
@@ -17693,6 +17717,7 @@ fn encode_attn_chain(
     kv_id: u64,
     li: usize,
     m: usize,
+    q_ready: bool,
 ) {
     let rows = g.o_groups * g.o_lora;
     let cols = g.nh * g.hd / g.o_groups;
@@ -17733,7 +17758,7 @@ fn encode_attn_chain(
         let sa_bind = sa_bind_single(c, q, cache, ixb, sink, attn, g.nh, g.hd, m, g.scale,
             Some((kv_id, li)));
         let mut pass = begin_pass(enc);
-        if !dsv4_skip("qproj") {
+        if !q_ready && !dsv4_skip("qproj") {
             encode_q4tp_mvw_p(&mut pass, c, &wb[1], qn, q, g.nh * g.hd, g.q_lora,
                 (60, kv_id, li));
         }
@@ -17770,7 +17795,9 @@ fn encode_attn_chain(
         }
         return;
     }
-    encode_q4tp_mv1(c, enc, &wb[1], qn, q, g.nh * g.hd, g.q_lora, (60, kv_id, li));
+    if !q_ready {
+        encode_q4tp_mv1(c, enc, &wb[1], qn, q, g.nh * g.hd, g.q_lora, (60, kv_id, li));
+    }
     encode_rope_heads(c, enc, q, freq, posb, g.nh, g.hd, g.rd, true, false, (61, kv_id, li));
     encode_sparse_attend2(c, enc, q, cache, ixb, sink, attn, g.nh, g.hd, m, g.scale,
         Some((kv_id, li)));
@@ -18250,6 +18277,40 @@ fn dsv4_skip(what: &str) -> bool {
 /// would be far more expensive to debug than a sparse map is to keep.
 const FRAME_TOK_STRIDE: usize = 64;
 
+thread_local! {
+    // A batch records several calls before one submit. Every pooled upload,
+    // mutable uniform and cached bind group inside a frame must therefore
+    // have a token identity; otherwise the final queue.write_buffer wins for
+    // all of them. Persistent model/cache buffers do NOT use this salt.
+    static DSV4_FRAME_SALT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct Dsv4FrameSalt(usize);
+
+impl Dsv4FrameSalt {
+    fn enter(salt: usize) -> Self {
+        let old = DSV4_FRAME_SALT.with(|s| s.replace(salt));
+        Self(old)
+    }
+}
+
+impl Drop for Dsv4FrameSalt {
+    fn drop(&mut self) {
+        DSV4_FRAME_SALT.with(|s| s.set(self.0));
+    }
+}
+
+#[inline]
+fn dsv4_frame_salt() -> usize {
+    DSV4_FRAME_SALT.with(std::cell::Cell::get)
+}
+
+#[inline]
+fn dsv4_salted_li(li: usize) -> usize {
+    let salt = dsv4_frame_salt();
+    if salt == 0 { li } else { li + salt * 1_000_000 }
+}
+
 fn dsv4_layer_frame_enc(
     model: &Arc<CmfModel>,
     w: &Dsv4LayerW,
@@ -18263,6 +18324,9 @@ fn dsv4_layer_frame_enc(
     // submission share a slot and the last write decides for both. That is
     // silent and it is wrong: their rope positions differ.
     tok: usize,
+    batch_frame: bool,
+    q_ready: bool,
+    defer_next_q: bool,
     qn: Option<&[f32]>,
     idxs: &[u32],
     prep: Option<&Dsv4Prep>,
@@ -18270,6 +18334,9 @@ fn dsv4_layer_frame_enc(
     pos: usize,
     enc: &mut wgpu::CommandEncoder,
 ) -> Option<wgpu::Buffer> {
+    // Salt 0 preserves every single-token cache key. Batch token zero must
+    // still differ from it, hence the one-based value.
+    let _frame_salt = Dsv4FrameSalt::enter(if batch_frame { tok + 1 } else { 0 });
     macro_rules! no {
         ($($t:tt)*) => {{
             if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
@@ -18438,7 +18505,7 @@ fn dsv4_layer_frame_enc(
     // ── attention half (the fold for it was prepared by the previous frame) ──
     if !dsv4_skip("attn") {
         encode_attn_chain(c, enc, &wb, &qnb, &q, &attn, &mid, &ao, &cache, &ixb,
-                          &sink, &freq, &posb, a, kv_id, li, m_attend);
+                          &sink, &freq, &posb, a, kv_id, li, m_attend, q_ready);
     }
 
     // ── glue: expand, then the FFN half's fold and norm ──
@@ -18509,7 +18576,7 @@ fn dsv4_layer_frame_enc(
             // The next layer's LoRA vector, but only when the host is not
             // going to hand it over anyway — the indexer needs `qr` there, so
             // today it projects it regardless and computing it twice is waste.
-            if qn.is_none() && !dsv4_skip("nextq") {
+            if qn.is_none() && !defer_next_q && !dsv4_skip("nextq") {
                 encode_q4tp_mvw_p(&mut pass, c, &wb[4], &x2, &qr2, a.q_lora, dim,
                     (52, kv_id, lk));
                 encode_rmsnorm_p(&mut pass, c, &qr2, &next_qn, &qn2, a.q_lora, a.eps,
@@ -18665,18 +18732,42 @@ pub fn dsv4_chain_batch(
     // per token, each as long as `layers`; None where the layer does not hash.
     forced: Option<&[Vec<Option<Vec<usize>>>]>,
     folded_out: &mut [f32],
+    // Optional hyper-connection state for every token, laid out
+    // [batch, hc, dim]. A device prefix followed by a host layer needs it;
+    // bringing it home beside the folds still costs one fence.
+    state_out: Option<&mut [f32]>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
     let Some((_, g0, _)) = layers.first() else {
         return false;
     };
     let dim = g0.attn.dim;
+    let state_len = batch * g0.hc * dim;
     if batch == 0
         || batch > FRAME_TOK_STRIDE
         || folded_out.len() < batch * dim
+        || state_out.as_ref().is_some_and(|s| s.len() < state_len)
         || inv_freq.len() != layers.len()
     {
         return false;
+    }
+    // Grow every index cache to its FINAL batch size before recording the
+    // encoder. Growing half way through would copy only the pre-batch data:
+    // earlier tokens' appends still live in the unsubmitted encoder and the
+    // later tokens would bind a fresh buffer that cannot contain them.
+    for (i, (_, _, p)) in layers.iter().enumerate() {
+        if let Some((_, cg, _, ixg)) = p.ix.as_ref() {
+            let extra = batch.div_ceil(cg.ratio.max(1));
+            if dsv4_index_cache(
+                kv_id,
+                first_li + i,
+                ixg.idim * (p.n_ix + extra + 1),
+            )
+            .is_none()
+            {
+                return false;
+            }
+        }
     }
     let mut enc = c
         .device
@@ -18684,8 +18775,82 @@ pub fn dsv4_chain_batch(
             label: Some("dsv4-chain-batch"),
         });
     let gather = frame_buf(c, 117, batch * dim * 4, false);
+    let gather_state = state_out
+        .as_ref()
+        .map(|_| frame_buf(c, 118, state_len * 4, false));
     let t_enc = std::time::Instant::now();
     for (i, (w, g, p)) in layers.iter().enumerate() {
+        // The query projection is independent across the known tokens. Pack
+        // their normalized LoRA vectors, run the actual B-axis q4tp kernel,
+        // then scatter the heads back to the per-token frames. The previous
+        // implementation merely recorded B matvecs in one encoder and was
+        // slower than the walk despite calling itself batched.
+        let bytes = model.primary_bytes();
+        let Some(qe) = model.tensors.get(w.attn.wq_b) else {
+            return false;
+        };
+        let (Some(qabs), qlen) = (model.entry_abs_offset(qe), qe.nbytes as usize) else {
+            return false;
+        };
+        let Some(qw) = weight_buffer(
+            c,
+            (model.uid() as usize, w.attn.wq_b),
+            &bytes[qabs..qabs + qlen],
+        ) else {
+            return false;
+        };
+        let qn_pack = frame_buf(c, 119, batch * g.attn.q_lora * 4, false);
+        let q_pack = frame_buf(c, 120, batch * g.attn.nh * g.attn.hd * 4, false);
+        {
+            let mut pass = begin_pass(&mut enc);
+            for t in 0..batch {
+                let qn = frame_buf_t(c, 4, t, g.attn.q_lora * 4, true);
+                encode_blit_p(
+                    &mut pass,
+                    c,
+                    &qn,
+                    &qn_pack,
+                    g.attn.q_lora,
+                    0,
+                    t * g.attn.q_lora,
+                    None,
+                );
+            }
+        }
+        if !encode_q4tp_mv4_b(
+            c,
+            &mut enc,
+            &qw,
+            &qn_pack,
+            &q_pack,
+            g.attn.nh * g.attn.hd,
+            g.attn.q_lora,
+            batch,
+        ) {
+            return false;
+        }
+        {
+            let mut pass = begin_pass(&mut enc);
+            for t in 0..batch {
+                let q = frame_buf_t(
+                    c,
+                    5,
+                    FRAME_TOK_STRIDE + t + 1,
+                    g.attn.nh * g.attn.hd * 4,
+                    false,
+                );
+                encode_blit_p(
+                    &mut pass,
+                    c,
+                    &q_pack,
+                    &q,
+                    g.attn.nh * g.attn.hd,
+                    t * g.attn.nh * g.attn.hd,
+                    0,
+                    None,
+                );
+            }
+        }
         for t in 0..batch {
             // The counts as of this token: everything the prep carries that
             // is not a weight.
@@ -18725,6 +18890,9 @@ pub fn dsv4_chain_batch(
                 kv_id,
                 first_li + i,
                 t,
+                true,
+                true,
+                true,
                 None,
                 &[],
                 Some(&pt),
@@ -18739,6 +18907,102 @@ pub fn dsv4_chain_batch(
             if i + 1 == layers.len() {
                 let mut pass = begin_pass(&mut enc);
                 encode_blit_p(&mut pass, c, &b, &gather, dim, 0, t * dim, None);
+                if let Some(gs) = gather_state.as_ref() {
+                    let sb = frame_buf_t(c, 40, t, g0.hc * dim * 4, true);
+                    encode_blit_p(
+                        &mut pass,
+                        c,
+                        &sb,
+                        gs,
+                        g0.hc * dim,
+                        0,
+                        t * g0.hc * dim,
+                        None,
+                    );
+                }
+            }
+        }
+        // Likewise, prepare the next device layer's shared LoRA vector once
+        // for the batch. A host tail recomputes its own projection, so the
+        // final device layer deliberately does not pay for an unused next-q.
+        if i + 1 < layers.len() && !dsv4_skip("nextq") {
+            let Some(next_idx) = w.next_wq_a else {
+                return false;
+            };
+            let Some(ne) = model.tensors.get(next_idx) else {
+                return false;
+            };
+            let (Some(nabs), nlen) = (model.entry_abs_offset(ne), ne.nbytes as usize) else {
+                return false;
+            };
+            let Some(nw) = weight_buffer(
+                c,
+                (model.uid() as usize, next_idx),
+                &bytes[nabs..nabs + nlen],
+            ) else {
+                return false;
+            };
+            let x_pack = frame_buf(c, 121, batch * dim * 4, false);
+            let qr_pack = frame_buf(c, 122, batch * g.attn.q_lora * 4, false);
+            {
+                let mut pass = begin_pass(&mut enc);
+                for t in 0..batch {
+                    let x = frame_buf_t(c, 45, t, dim * 4, false);
+                    encode_blit_p(
+                        &mut pass,
+                        c,
+                        &x,
+                        &x_pack,
+                        dim,
+                        0,
+                        t * dim,
+                        None,
+                    );
+                }
+            }
+            if !encode_q4tp_mv4_b(
+                c,
+                &mut enc,
+                &nw,
+                &x_pack,
+                &qr_pack,
+                g.attn.q_lora,
+                dim,
+                batch,
+            ) {
+                return false;
+            }
+            let norm = const_buf(c, bytemuck::cast_slice(&w.next_q_norm[..g.attn.q_lora]));
+            let mut pass = begin_pass(&mut enc);
+            for t in 0..batch {
+                let qr = frame_buf_t(
+                    c,
+                    48,
+                    FRAME_TOK_STRIDE + t + 1,
+                    g.attn.q_lora * 4,
+                    false,
+                );
+                let qn = frame_buf_t(c, 4, t, g.attn.q_lora * 4, true);
+                encode_blit_p(
+                    &mut pass,
+                    c,
+                    &qr_pack,
+                    &qr,
+                    g.attn.q_lora,
+                    t * g.attn.q_lora,
+                    0,
+                    None,
+                );
+                encode_rmsnorm_p(
+                    &mut pass,
+                    c,
+                    &qr,
+                    &norm,
+                    &qn,
+                    g.attn.q_lora,
+                    g.attn.eps,
+                    (53, kv_id, 10_000_000 + (first_li + i) * FRAME_TOK_STRIDE + t),
+                );
             }
         }
     }
@@ -18746,18 +19010,28 @@ pub fn dsv4_chain_batch(
         t_enc.elapsed().as_nanos() as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
-    let bytes = (batch * dim * 4) as u64;
-    let mut sc = c.scratch.lock().unwrap();
-    let stage = Scratch::ensure(
-        &c.device,
-        &mut sc.stage,
-        bytes,
-        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        "dsv4-batch-stage",
-    );
-    let ok = readback(c, enc, &gather, &stage, bytes, &mut folded_out[..batch * dim]);
-    drop(sc);
-    ok
+    match (gather_state.as_ref(), state_out) {
+        (Some(gs), Some(states)) => readback2(
+            c,
+            enc,
+            (&gather, &mut folded_out[..batch * dim]),
+            (gs, &mut states[..state_len]),
+        ),
+        _ => {
+            let bytes = (batch * dim * 4) as u64;
+            let mut sc = c.scratch.lock().unwrap();
+            let stage = Scratch::ensure(
+                &c.device,
+                &mut sc.stage,
+                bytes,
+                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                "dsv4-batch-stage",
+            );
+            let ok = readback(c, enc, &gather, &stage, bytes, &mut folded_out[..batch * dim]);
+            drop(sc);
+            ok
+        }
+    }
 }
 
 pub fn dsv4_layer_chain(
@@ -18791,7 +19065,7 @@ pub fn dsv4_layer_chain(
         // `qn = None` throughout: the first layer's LoRA vector was left on
         // the card by the caller's seed, every later one by the frame before.
         let Some(b) = dsv4_layer_frame_enc(
-            model, w, *g, kv_id, first_li + i, 0, None, &[], Some(p), inv_freq[i], pos, &mut enc,
+            model, w, *g, kv_id, first_li + i, 0, false, false, false, None, &[], Some(p), inv_freq[i], pos, &mut enc,
         ) else {
             // Nothing has been submitted, so the token can still be run the
             // old way — but the caches this chain advanced have NOT been
@@ -18875,7 +19149,7 @@ pub fn dsv4_layer_frame(
             label: Some("dsv4-layer"),
         });
     let Some(folded) = dsv4_layer_frame_enc(
-        model, w, g, kv_id, li, 0, qn, idxs, None, inv_freq, pos, &mut enc,
+        model, w, g, kv_id, li, 0, false, false, false, qn, idxs, None, inv_freq, pos, &mut enc,
     ) else {
         return false;
     };
@@ -18931,7 +19205,15 @@ pub fn dsv4_experts_fit(inter: usize, hidden: usize, gu_q2: bool) -> usize {
         return 0;
     }
     let used = c.resident.load(Ordering::Relaxed);
-    ((c.vram_budget.saturating_sub(used)) / per) as usize
+    // A weight budget is not the physical allocation ceiling: command
+    // staging, KV/state buffers and the driver's own bookkeeping live beside
+    // it. Keep a small geometry-independent reserve that scales down on
+    // small cards and caps out on large ones. The value is intentionally a
+    // function of the configured budget, never a checkpoint/layer cutoff.
+    let mib = 1024 * 1024u64;
+    let reserve = (c.vram_budget / 128).clamp(256 * mib, 768 * mib);
+    let usable = c.vram_budget.saturating_sub(reserve);
+    ((usable.saturating_sub(used)) / per) as usize
 }
 
 /// Can this layer's experts live on the card? Uploads them if they can, so a
@@ -19014,6 +19296,73 @@ pub fn dsv4_state_read(state: &mut [f32]) -> bool {
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("st") });
     let ok = readback(c, enc, &b, &stage, bytes, state);
+    drop(sc);
+    ok
+}
+
+/// Add the experts that did not fit in VRAM to the device-owned
+/// hyper-connection state and bring the corrected state home.
+///
+/// The MoE frame has already expanded the resident experts as
+/// `post[j] * resident + comb * residual`. Hyper-connections are linear in
+/// the block output, so the exact correction is another expansion with an
+/// identity `comb`: `state[j] += post[j] * cold`. Doing it here keeps the
+/// policy independent of a layer number or a particular VRAM size.
+pub fn dsv4_state_add_cold(cold: &[f32], hc: usize, state_out: &mut [f32]) -> bool {
+    let Some(c) = ctx() else { return false };
+    if hc == 0 || cold.is_empty() || state_out.len() != hc * cold.len() {
+        return false;
+    }
+    let dim = cold.len();
+    let state = frame_buf(c, 40, state_out.len() * 4, true);
+    let corrected = frame_buf(c, 46, state_out.len() * 4, true);
+    // `post` was produced by the FFN half's opening fold and is still live in
+    // the canonical slot after the MoE frame returns its cold winners.
+    let post = frame_buf(c, 43, hc * 4, true);
+    let cold_buf = frame_up(c, 121, bytemuck::cast_slice(cold));
+    let mut identity = vec![0.0f32; hc * hc];
+    for j in 0..hc {
+        identity[j * hc + j] = 1.0;
+    }
+    let comb = frame_up(c, 122, bytemuck::cast_slice(&identity));
+    let p = uniform_u32x8(
+        c,
+        [hc as u32, dim as u32, 0, 0, 0, 0, 0, 0],
+    );
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dsv4-cold-state-fix"),
+        });
+    encode_hc_expand(
+        c,
+        &mut enc,
+        &cold_buf,
+        &state,
+        &post,
+        &comb,
+        &corrected,
+        &p,
+        hc,
+        dim,
+    );
+    enc.copy_buffer_to_buffer(
+        &corrected,
+        0,
+        &state,
+        0,
+        (state_out.len() * 4) as u64,
+    );
+    let bytes = (state_out.len() * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        bytes,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "dsv4-cold-state-stage",
+    );
+    let ok = readback(c, enc, &state, &stage, bytes, state_out);
     drop(sc);
     ok
 }
@@ -19279,7 +19628,16 @@ fn const_buf(c: &Ctx, data: &[u8]) -> wgpu::Buffer {
 /// here would leave every cached group pointing at a dead buffer with
 /// nothing to notice.
 fn frame_buf(c: &Ctx, tag: u8, len_bytes: usize, upload: bool) -> wgpu::Buffer {
-    frame_buf_t(c, tag, 0, len_bytes, upload)
+    let salt = dsv4_frame_salt();
+    let tok = if salt == 0 {
+        0
+    } else {
+        // Explicit token carriers occupy 0..FRAME_TOK_STRIDE. Keep implicit
+        // scratch in a disjoint namespace so token 1's position buffer can
+        // never alias token 0's temporary buffer with the same tag.
+        FRAME_TOK_STRIDE + salt
+    };
+    frame_buf_t(c, tag, tok, len_bytes, upload)
 }
 
 /// The same pool, one buffer per token of the batch.
@@ -20775,6 +21133,7 @@ where
     F: FnOnce() -> wgpu::BindGroup,
 {
     use std::sync::atomic::Ordering;
+    let key = (key.0, key.1, dsv4_salted_li(key.2));
     let epoch = GREW.load(Ordering::Relaxed);
     let mut m = c.dsv4_binds.lock().unwrap();
     if m.0 != epoch {
@@ -20797,6 +21156,7 @@ where
 /// `uni_slot`'s eight-word twin, for the kernels whose params do not fit in
 /// four. Same contract: one write per key per submission.
 fn uni_slot8(c: &Ctx, tag: u8, kv: u64, li: usize, vals: [u32; 8]) -> wgpu::Buffer {
+    let li = dsv4_salted_li(li);
     let b = {
         let mut m = c.dsv4_uni.lock().unwrap();
         m.entry((tag, kv, li))
@@ -20816,6 +21176,7 @@ fn uni_slot8(c: &Ctx, tag: u8, kv: u64, li: usize, vals: [u32; 8]) -> wgpu::Buff
 }
 
 fn uni_slot(c: &Ctx, tag: u8, kv: u64, li: usize, vals: [u32; 4]) -> wgpu::Buffer {
+    let li = dsv4_salted_li(li);
     let b = {
         let mut m = c.dsv4_uni.lock().unwrap();
         m.entry((tag, kv, li))
@@ -20841,6 +21202,7 @@ fn uni_slot(c: &Ctx, tag: u8, kv: u64, li: usize, vals: [u32; 4]) -> wgpu::Buffe
 /// a buffer per layer they route with their own table row and can share a
 /// submission with everyone else.
 fn store_slot(c: &Ctx, tag: u8, kv: u64, li: usize, data: &[u8]) -> wgpu::Buffer {
+    let li = dsv4_salted_li(li);
     let size = (data.len().max(4) as u64).div_ceil(16) * 16;
     let b = {
         let mut m = c.dsv4_store.lock().unwrap();
@@ -21289,6 +21651,10 @@ pub fn dsv4_moe_frame(
     // `(expert, weight)` pairs the device left for the host, empty when the
     // whole packing was resident.
     cold_out: &mut Vec<(usize, f32)>,
+    // The normalized FFN input the cold experts consume. When `x` above is
+    // empty that vector exists only in the device frame; return it beside the
+    // cold IDs so disk-backed CPU completion has real activations.
+    cold_x_out: &mut Vec<f32>,
     // The state handover, split the way the layer frame splits it and for
     // the same reason: the EXPANSION of this half's output into the state is
     // unconditional whenever the device owns the state — the last layer has
@@ -21326,7 +21692,7 @@ pub fn dsv4_moe_frame(
     // router quietly preferred the packed experts.
     let n_route = if subset { n_all } else { n_pack };
     if n_pack == 0
-        || w.logits.len() < n_pack
+        || (!w.logits.is_empty() && w.logits.len() < n_route)
         || n_pack > 1024
         || g.top_k == 0
         || g.top_k > 63
@@ -21642,7 +22008,8 @@ pub fn dsv4_moe_frame(
     // router that had chosen no cold experts. An unconditional probe written
     // from the kernel is what proved otherwise.
     let cold_bytes = (4 * g.top_k * 4) as u64;
-    let total = (g.hidden * 4) as u64 + cold_bytes;
+    let x_off = (g.hidden * 4) as u64 + cold_bytes;
+    let total = x_off + (g.hidden * 4) as u64;
     // ONE ensure for the whole readback. A first call sized to the hidden
     // state alone used to run before this one, on the same slot: it built a
     // buffer that the next line immediately outgrew and replaced.
@@ -21661,6 +22028,7 @@ pub fn dsv4_moe_frame(
         (g.hidden * 4) as u64,
     );
     enc.copy_buffer_to_buffer(&coldb, 0, &stage2, (g.hidden * 4) as u64, cold_bytes);
+    enc.copy_buffer_to_buffer(&xb, 0, &stage2, x_off, (g.hidden * 4) as u64);
     submit(c, enc.finish());
     let slice = stage2.slice(..total);
     slice.map_async(wgpu::MapMode::Read, |_| {});
@@ -21677,6 +22045,10 @@ pub fn dsv4_moe_frame(
                 cold_out.push((tail[2 * t] as usize, f32::from_bits(tail[2 * t + 1])));
             }
         }
+        cold_x_out.clear();
+        cold_x_out.extend_from_slice(bytemuck::cast_slice(
+            &data[x_off as usize..total as usize],
+        ));
         if std::env::var("CMF_DSV4_MOE_CHECK").is_ok() {
             let picks: Vec<(u32, f32)> = (0..g.top_k)
                 .map(|t| {
