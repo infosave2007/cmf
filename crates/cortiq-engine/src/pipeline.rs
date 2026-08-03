@@ -125,6 +125,10 @@ pub struct Pipeline {
     pub dspark_trunk_picks: Vec<Vec<(usize, Vec<usize>)>>,
     /// (unique, total) expert picks per draft, trunk side and draft side.
     pub dspark_exp: Vec<(usize, usize, usize, usize)>,
+    /// Wall time spent in the deliberately out-of-core draft. Kept separate
+    /// from trunk decode so block batching can be judged without conflating
+    /// it with GPU chain variance.
+    pub dspark_draft_ns: u128,
     /// LFM2 short-convolution geometry (present when the model has
     /// `ShortConv` mixer layers).
     pub short_conv_cfg: Option<ShortConvCfg>,
@@ -1194,6 +1198,7 @@ impl Pipeline {
             dspark_real: Vec::new(),
             dspark_trunk_picks: Vec::new(),
             dspark_exp: Vec::new(),
+            dspark_draft_ns: 0,
             logit_multiplier: None,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             kv_history: Vec::new(),
@@ -4237,6 +4242,7 @@ fn draft_probe() -> bool {
         // draft owns an explicit bounded device pack, its tensors are an
         // out-of-core CPU/disk tier by contract: never let per-op probes try
         // to squeeze another multi-gigabyte MTP expert cache onto the card.
+        let draft_started = std::time::Instant::now();
         let props = crate::gpu::cpu_scope(|| {
             crate::dsv4::dspark_draft(
                 g,
@@ -4249,6 +4255,7 @@ fn draft_probe() -> bool {
                 &mut conf,
             )
         });
+        self.dspark_draft_ns += draft_started.elapsed().as_nanos();
         let draft_picks = crate::dsv4::pick_tally_take();
         // Re-arm for the NEXT trunk token; the probe runs after the forward,
         // so this is the only place that can.
@@ -4315,12 +4322,13 @@ fn draft_probe() -> bool {
             eprintln!(
                 "DSpark: разных токенов {distinct} из {} (вырожденность), \
                  эксперты ствол {}/{} на слой за {block} токенов, \
-                 черновик {}/{} за блок",
+                 черновик {}/{} за блок, draft {:.2} мс/блок",
                 self.dspark_real.len(),
                 tu / m,
                 tt / m,
                 du / m,
-                dt / m
+                dt / m,
+                self.dspark_draft_ns as f64 / self.dspark_exp.len().max(1) as f64 / 1e6
             );
         }
     }
