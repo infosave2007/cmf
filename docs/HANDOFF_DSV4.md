@@ -86,8 +86,8 @@ export CMF_DSV4_GPU_LAYER=1 CMF_SDOT=0 CMF_DSV4_CHAIN=1
 ./target/release/cortiq bench /content/dsv4-q2tp.cmf --tokens 128
 ```
 
-Expected on the 97887 MiB stand: **28.6 tok/s steady**. All 43 layers use the
-card: 42 have complete expert packs and the last pack contains 140/256 routed
+Expected on the 97887 MiB stand: **30.2 tok/s steady** (128-token canonical run). All 43 layers use the
+card: 42 have complete expert packs and the last pack contains 199/256 routed
 experts; cold winners are completed from the mmap-backed CMF on the CPU.
 Perplexity gold is **3.282** (`cortiq ppl … --file /root/ppl.txt --tokens
 128`), which equals the CPU exactly — any change that moves it is a defect.
@@ -103,10 +103,11 @@ ladder below was measured without owning one.
 
 ## 4. Where the time goes
 
-Per token, about 35.0 ms total. The 42-layer full chain is 1.39 ms host encode
+Per token, about 33.1 ms total. The 42-layer full chain is 1.32 ms host encode
 and 28.03 ms wait. The final layer is a budget-sized partial GPU layer; only
 its non-resident selected experts run on the CPU. This replaced the previous
-whole host layer and moved 27.2 to 28.6 tok/s while keeping PPL 3.282.
+whole host layer; the refined workspace reserve then moved 28.6 to 30.2 tok/s
+while keeping the same exact cold-expert correction.
 
 Inside the chain: hyper-connection glue 4.14, compressors 2.90, gate/up 2.49,
 down 2.47, attention 1.80, o_lora 1.40, q-proj 1.37, indexer 1.36, wo_b 1.24,
@@ -154,7 +155,9 @@ most token bodies separately and relies on L2. On a persistent server a
 64-token prompt measured 2421 ms at B=1 and 2615 ms at B=5. Keep B=1 as the
 default until the large projections and MoE bodies use real B-axis kernels.
 
-With the draft on the host (~36 ms) there is no gain. With the draft on the
+The honest five-position CPU/disk draft is now batched by weight and costs
+about **156 ms/block** (down from 185–190 ms), not the earlier 36 ms estimate;
+with it there is no gain. With the draft on the
 card (~10 ms) it is about 38 tok/s. With the draft AND layer 42 on the card
 it is about 49. Both need VRAM this card does not have: the draft is 10.34 GB
 in q4tp (about 5.4 after requantising to q2tp) and layer 42 needs 2.18 GB,
@@ -212,6 +215,17 @@ multi-model servers and MTP stages cannot inherit another layer's pack.
 Instrument the chain's passes with `ts_pair`. The device has
 `TIMESTAMP_QUERY_INSIDE_PASSES`, so per-stage timing inside the fused passes
 is possible. This is the largest unexplained item in the token.
+
+### 6.6 Workspace reserve is part of admission
+
+The expert packer keeps a geometry-independent device workspace reserve. Its
+default is budget/384 clamped to 256–512 MiB; `CMF_GPU_WORKSPACE_MB` overrides
+it. On the 97,887 MiB stand (96,500 MiB weight budget), 768 MiB packed 140
+experts in the tail layer at 29.6 tok/s, while 256 MiB packed 199 at 30.2
+(30.6 in the shorter 32-token A/B).
+Zero packed 229 at 31.1 but is not a safe universal default. Raising the total
+budget to 96,800 MiB and packing the last layer completely caused a real
+device OOM, so do not infer physical headroom from the weight budget alone.
 
 ## 7. Traps that have already cost time
 

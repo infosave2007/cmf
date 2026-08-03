@@ -19211,7 +19211,11 @@ pub fn dsv4_experts_fit(inter: usize, hidden: usize, gu_q2: bool) -> usize {
     // small cards and caps out on large ones. The value is intentionally a
     // function of the configured budget, never a checkpoint/layer cutoff.
     let mib = 1024 * 1024u64;
-    let reserve = (c.vram_budget / 128).clamp(256 * mib, 768 * mib);
+    let reserve = std::env::var("CMF_GPU_WORKSPACE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.saturating_mul(mib))
+        .unwrap_or_else(|| (c.vram_budget / 384).clamp(256 * mib, 512 * mib));
     let usable = c.vram_budget.saturating_sub(reserve);
     ((usable.saturating_sub(used)) / per) as usize
 }
