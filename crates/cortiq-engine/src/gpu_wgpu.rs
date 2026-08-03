@@ -589,7 +589,10 @@ fn silu_mul_pre(@builtin(global_invocation_id) gid: vec3<u32>) {
 // `set`: y = w·x[soff+i] rather than y += w·x[i]. Two callers wanted the
 // assignment and were spending a whole zero-fill dispatch to get it, and one
 // wanted a strided source and was spending a copy. `soff` is in floats.
-struct AxpyP { w: f32, n: u32, set: u32, soff: u32 };
+// `asg`, not `set`: `set` is a WGSL reserved keyword, and a shader that
+// fails to parse takes the WHOLE module with it — the context then does
+// not come up and every op quietly walks the host.
+struct AxpyP { w: f32, n: u32, asg: u32, soff: u32 };
 @group(0) @binding(0) var<storage, read>       ad : array<f32>;
 @group(0) @binding(1) var<storage, read_write> ay : array<f32>;
 @group(0) @binding(2) var<uniform>             ap : AxpyP;
@@ -598,7 +601,7 @@ fn axpy(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= ap.n) { return; }
     let v = ap.w * ad[ap.soff + i];
-    if (ap.set != 0u) { ay[i] = v; } else { ay[i] = ay[i] + v; }
+    if (ap.asg != 0u) { ay[i] = v; } else { ay[i] = ay[i] + v; }
 }
 
 // Qwen3.5 output gate: attn_out *= sigmoid(gate), element-wise over nh·hd.
