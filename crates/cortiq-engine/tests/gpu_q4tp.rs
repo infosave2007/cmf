@@ -198,7 +198,9 @@ fn wgpu_q4tp_matvec_batch_matches_dequant_reference() {
     }
     for (rows, cols, w, model, idx) in &built {
         let (rows, cols, idx) = (*rows, *cols, *idx);
-        for b in [1usize, 2, 4] {
+        // 5 is production: the draft block is five positions wide. 3 is
+        // the short block near EOS, where the verify is truncated.
+        for b in [1usize, 2, 3, 4, 5] {
             let xs: Vec<f32> = (0..b * cols)
                 .map(|i| ((i * 29 + 13) % 103) as f32 / 103.0 - 0.5)
                 .collect();

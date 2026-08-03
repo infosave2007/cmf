@@ -115,6 +115,16 @@ pub struct Pipeline {
     pub dspark_pending: Vec<(usize, Vec<u32>, bool, usize)>,
     /// Accepted prefix length of every graded draft.
     pub dspark_hist: Vec<usize>,
+    /// The real tokens the drafts were graded against — a degenerate,
+    /// repeating output would make any acceptance number meaningless, and
+    /// the cheapest guard against believing one is to count them.
+    pub dspark_real: Vec<u32>,
+    /// The trunk's expert picks for the last few tokens, per layer. The
+    /// union over a window of them is what a batched verify would have to
+    /// read, and the ratio to the pick count is all it could save.
+    pub dspark_trunk_picks: Vec<Vec<(usize, Vec<usize>)>>,
+    /// (unique, total) expert picks per draft, trunk side and draft side.
+    pub dspark_exp: Vec<(usize, usize, usize, usize)>,
     /// LFM2 short-convolution geometry (present when the model has
     /// `ShortConv` mixer layers).
     pub short_conv_cfg: Option<ShortConvCfg>,
@@ -1181,6 +1191,9 @@ impl Pipeline {
             dspark: None,
             dspark_pending: Vec::new(),
             dspark_hist: Vec::new(),
+            dspark_real: Vec::new(),
+            dspark_trunk_picks: Vec::new(),
+            dspark_exp: Vec::new(),
             logit_multiplier: None,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             kv_history: Vec::new(),
@@ -4163,6 +4176,15 @@ fn draft_probe() -> bool {
         if self.dsv4_mtp.is_empty() || !Self::draft_probe() {
             return;
         }
+        // What the trunk just routed to, for this token.
+        let trunk_now = crate::dsv4::pick_tally_take();
+        if !trunk_now.is_empty() {
+            self.dspark_trunk_picks.push(trunk_now);
+            let keep = crate::dsv4::DSPARK_BLOCK;
+            if self.dspark_trunk_picks.len() > keep {
+                self.dspark_trunk_picks.remove(0);
+            }
+        }
         // Grade whatever is waiting: the token just decoded sits at
         // `position`, so it answers the draft made at `position - 1 - i`.
         for p in std::mem::take(&mut self.dspark_pending) {
@@ -4182,6 +4204,7 @@ fn draft_probe() -> bool {
                 }
             }
             self.dspark_hist.push(p.3);
+            self.dspark_real.push(token_id);
         }
         let Some(b) = &mut self.dsv4 else { return };
         let (g, layers, cfg) = (&b.0, &b.1, b.2);
@@ -4204,6 +4227,7 @@ fn draft_probe() -> bool {
             return; // this token ran on a path that captures nothing
         }
         let mut conf = Vec::new();
+        crate::dsv4::pick_tally_arm();
         let props = crate::dsv4::dspark_draft(
             g,
             &self.dsv4_mtp,
@@ -4214,7 +4238,37 @@ fn draft_probe() -> bool {
             self.pool.as_deref(),
             &mut conf,
         );
+        let draft_picks = crate::dsv4::pick_tally_take();
+        // Re-arm for the NEXT trunk token; the probe runs after the forward,
+        // so this is the only place that can.
+        crate::dsv4::pick_tally_arm();
         if !props.is_empty() {
+            // Two ratios, side by side: what a batched verify over the trunk
+            // would read against what it asks for, and the same for the
+            // draft's three stages. Near 1.0 means a batch amortises nothing.
+            let (tu, tt) = {
+                let flat: Vec<(usize, Vec<usize>)> = self
+                    .dspark_trunk_picks
+                    .iter()
+                    .flat_map(|v| v.iter().cloned())
+                    .collect();
+                // Per layer, across the window of tokens.
+                let mut per: std::collections::HashMap<usize, Vec<usize>> =
+                    std::collections::HashMap::new();
+                for (li, picks) in flat {
+                    per.entry(li).or_default().extend(picks);
+                }
+                let n = per.len().max(1);
+                let mut u = 0usize;
+                let mut t = 0usize;
+                for (_, v) in per {
+                    t += v.len();
+                    u += v.iter().collect::<std::collections::HashSet<_>>().len();
+                }
+                (u / n, t / n)
+            };
+            let (du, dt) = crate::dsv4::tally_unique(&draft_picks);
+            self.dspark_exp.push((tu, tt, du, dt));
             self.dspark_pending.push((position, props, true, 0));
         }
         if self.dspark_hist.len() >= 8 && self.dspark_hist.len() % 8 == 0 {
@@ -4225,11 +4279,37 @@ fn draft_probe() -> bool {
             for &k in &self.dspark_hist {
                 at[k] += 1;
             }
+            // Prefix survival: S_i = P(the first i positions all held).
+            let mut surv = Vec::with_capacity(block);
+            for i in 1..=block {
+                let k = at[i..].iter().sum::<usize>() as f32 / n;
+                surv.push(format!("{k:.2}"));
+            }
+            let distinct = self
+                .dspark_real
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            let (tu, tt, du, dt) = self.dspark_exp.iter().fold((0, 0, 0, 0), |a, b| {
+                (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3)
+            });
+            let m = self.dspark_exp.len().max(1);
             eprintln!(
                 "DSpark: черновиков {}, принято в среднем {mean:.2} из {block} \
-                 (токенов за проход {:.2}), распределение {at:?}",
+                 (токенов за проход {:.2}), распределение {at:?}, выживание [{}]",
                 self.dspark_hist.len(),
-                mean + 1.0
+                mean + 1.0,
+                surv.join(" ")
+            );
+            eprintln!(
+                "DSpark: разных токенов {distinct} из {} (вырожденность), \
+                 эксперты ствол {}/{} на слой за {block} токенов, \
+                 черновик {}/{} за блок",
+                self.dspark_real.len(),
+                tu / m,
+                tt / m,
+                du / m,
+                dt / m
             );
         }
     }

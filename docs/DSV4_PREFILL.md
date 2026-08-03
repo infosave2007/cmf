@@ -59,6 +59,40 @@ the same one decode uses: five stands, the host comparison, and
 - **S4 — batched attention.** A grid over (token, head) with each token's own
   index list. Smallest of the four by measurement, last by priority.
 
+## The second caller: speculative verify
+
+The draft (`docs`-less for now; see `dsv4::dspark_draft`) proposes five
+tokens per trunk step, and the trunk has to check them. Checking them one at
+a time costs five trunk passes — 5 x 36.8 ms against 5.36 tokens gained,
+which is SLOWER than not speculating at all. So the batched pass is not an
+optimisation for speculation; it is the whole of it.
+
+That makes the two callers one piece of work:
+
+| | prefill | verify |
+|---|---|---|
+| batch | 64+ prompt tokens | 5 drafted tokens |
+| causality inside the batch | yes | yes |
+| state committed | all of it | only the accepted prefix |
+| wrong answer costs | a bad prompt | a wrong token stream |
+
+Only the last row differs, and it differs only in the rollback: verify has
+to write B positions speculatively and keep k of them. The transaction is at
+most five positions deep — save the logical lengths and the ring slots it
+will overwrite, journal any compressed entry the block creates, and on
+rejection restore the tail. A full clone of the caches is not needed and
+would not be affordable.
+
+## What the batch has to beat
+
+Per token, of the 28.1 ms chain: projections 9.25 (q-proj 1.37, compressors
+2.90, indexer 1.36, wo_b 1.24, o_lora 1.40, next-q 0.98), MoE 4.96, the
+hyper-connection glue 4.14, attention 1.80, and ~8 unattributed.
+
+Batching only the projections leaves the other 19 ms paying five times over,
+which lands around 38 tok/s — under the target, after all this. The glue and
+the MoE have to come too. That is the order the work is in.
+
 ## What this does not change
 
 The decode path. `forward_token` stays exactly as it is; the chunk path is
