@@ -17014,7 +17014,15 @@ fn encode_attn_chain(
 ) {
     let rows = g.o_groups * g.o_lora;
     let cols = g.nh * g.hd / g.o_groups;
-    let o_pipe = if chain_mv4() { &c.o_lora_a_w } else { &c.o_lora_a };
+    // By SHAPE, not by flag. The 256-thread twin measured 21.3 tok/s against
+    // the 64-thread kernel's 21.8: this projection's columns are
+    // nh·hd/o_groups, so `gpr` is 128 on the release and half of 256 threads
+    // would stride past the end. Wide only where there is width to use.
+    let o_pipe = if chain_mv4() && cols / 32 >= 256 {
+        &c.o_lora_a_w
+    } else {
+        &c.o_lora_a
+    };
     let o_bind = cached_bind(c, (63, kv_id, li), || {
         let p = uniform_u32x4(c, [(cols / 32) as u32, rows as u32, g.o_lora as u32, 0]);
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
