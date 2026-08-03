@@ -3687,7 +3687,6 @@ pub fn load(
     let f = |name: &str| -> Result<Vec<f32>, String> {
         crate::loader::load_f32(model, name, &crate::loader::Overlay::None)
     };
-    let opt_f = |name: &str| -> Option<Vec<f32>> { f(name).ok() };
 
     // Two frequency tables, chosen per layer by whether it compresses. The
     // release's compress_rope_theta (160 000) is not in config.json — it
@@ -3715,7 +3714,97 @@ pub fn load(
 
     let mut layers = Vec::with_capacity(n_layers);
     for li in 0..n_layers {
-        let p = format!("model.layers.{li}");
+        layers.push(load_layer(
+            model,
+            cfg,
+            &format!("model.layers.{li}"),
+            Scheme::Main,
+        )?);
+    }
+    Ok((globals, layers))
+}
+
+/// Where a layer's tensors live in the file.
+///
+/// The MTP modules are the same layer as any other — attention, a
+/// hyper-connection pair, a gated MoE over 256 experts — but the converter
+/// wrote them under DeepSeek's internal names rather than the HF ones it used
+/// for the trunk. Two schemes, one loader: a second copy would drift.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scheme {
+    Main,
+    Mtp,
+}
+
+impl Scheme {
+    fn attn(self) -> &'static str {
+        match self {
+            Scheme::Main => "self_attn",
+            Scheme::Mtp => "attn",
+        }
+    }
+    fn attn_norm(self) -> &'static str {
+        match self {
+            Scheme::Main => "input_layernorm.weight",
+            Scheme::Mtp => "attn_norm.weight",
+        }
+    }
+    fn ffn_norm(self) -> &'static str {
+        match self {
+            Scheme::Main => "post_attention_layernorm.weight",
+            Scheme::Mtp => "ffn_norm.weight",
+        }
+    }
+    fn mlp(self) -> &'static str {
+        match self {
+            Scheme::Main => "mlp",
+            Scheme::Mtp => "ffn",
+        }
+    }
+    /// The router's per-expert bias. Absent on the trunk's hash layers, which
+    /// is how they are recognised; always present on an MTP module.
+    fn gate_bias(self) -> &'static str {
+        match self {
+            Scheme::Main => "expert_bias",
+            Scheme::Mtp => "gate.bias",
+        }
+    }
+    fn shared(self) -> &'static str {
+        match self {
+            Scheme::Main => "shared_expert",
+            Scheme::Mtp => "shared_experts",
+        }
+    }
+    /// gate, down, up — in that order, which is w1/w2/w3 upstream.
+    fn w(self, i: u8) -> &'static str {
+        match (self, i) {
+            (Scheme::Main, 1) => "gate_proj.weight",
+            (Scheme::Main, 2) => "down_proj.weight",
+            (Scheme::Main, _) => "up_proj.weight",
+            (Scheme::Mtp, 1) => "w1.weight",
+            (Scheme::Mtp, 2) => "w2.weight",
+            (Scheme::Mtp, _) => "w3.weight",
+        }
+    }
+}
+
+/// One layer, wherever it lives in the file.
+pub fn load_layer(
+    model: &std::sync::Arc<cortiq_core::CmfModel>,
+    cfg: &Dsv4Cfg,
+    p: &str,
+    s: Scheme,
+) -> Result<Dsv4Layer, String> {
+    let q = |name: &str| -> Result<crate::qtensor::QTensor, String> {
+        crate::qtensor::QTensor::from_model(model, name)
+    };
+    let f = |name: &str| -> Result<Vec<f32>, String> {
+        crate::loader::load_f32(model, name, &crate::loader::Overlay::None)
+    };
+    let opt_f = |name: &str| -> Option<Vec<f32>> { f(name).ok() };
+    let at = s.attn();
+    let ml = s.mlp();
+    {
         let scale3 = |name: &str| -> Result<[f32; 3], String> {
             let v = f(name)?;
             if v.len() < 3 {
@@ -3725,17 +3814,17 @@ pub fn load(
         };
         // The compressor exists on every layer whose ratio is non-zero;
         // its presence in the file is the only signal we need.
-        let compressor = match q(&format!("{p}.self_attn.compressor.wkv.weight")) {
+        let compressor = match q(&format!("{p}.{at}.compressor.wkv.weight")) {
             Ok(wkv) => {
-                let ape = f(&format!("{p}.self_attn.compressor.ape"))?;
+                let ape = f(&format!("{p}.{at}.compressor.ape"))?;
                 // ape is [ratio, coff*head_dim]; coff is 2 when the windows
                 // overlap, which the release does at ratio 4.
                 let width = wkv.rows();
                 let ratio = (ape.len() / width.max(1)).max(1);
                 Some(Dsv4Compressor {
                     wkv,
-                    wgate: q(&format!("{p}.self_attn.compressor.wgate.weight"))?,
-                    norm: f(&format!("{p}.self_attn.compressor.norm.weight"))?,
+                    wgate: q(&format!("{p}.{at}.compressor.wgate.weight"))?,
+                    norm: f(&format!("{p}.{at}.compressor.norm.weight"))?,
                     ape,
                     ratio,
                     overlap: ratio == 4,
@@ -3743,19 +3832,19 @@ pub fn load(
             }
             Err(_) => None,
         };
-        let indexer = match q(&format!("{p}.self_attn.indexer.wq_b.weight")) {
+        let indexer = match q(&format!("{p}.{at}.indexer.wq_b.weight")) {
             Ok(wq_b) => {
-                let ape = f(&format!("{p}.self_attn.indexer.compressor.ape"))?;
-                let cwkv = q(&format!("{p}.self_attn.indexer.compressor.wkv.weight"))?;
+                let ape = f(&format!("{p}.{at}.indexer.compressor.ape"))?;
+                let cwkv = q(&format!("{p}.{at}.indexer.compressor.wkv.weight"))?;
                 let width = cwkv.rows();
                 let ratio = (ape.len() / width.max(1)).max(1);
                 Some(Dsv4Indexer {
                     wq_b,
-                    weights_proj: q(&format!("{p}.self_attn.indexer.weights_proj.weight"))?,
+                    weights_proj: q(&format!("{p}.{at}.indexer.weights_proj.weight"))?,
                     compressor: Dsv4Compressor {
                         wkv: cwkv,
-                        wgate: q(&format!("{p}.self_attn.indexer.compressor.wgate.weight"))?,
-                        norm: f(&format!("{p}.self_attn.indexer.compressor.norm.weight"))?,
+                        wgate: q(&format!("{p}.{at}.indexer.compressor.wgate.weight"))?,
+                        norm: f(&format!("{p}.{at}.indexer.compressor.norm.weight"))?,
                         ape,
                         ratio,
                         overlap: ratio == 4,
@@ -3767,25 +3856,25 @@ pub fn load(
 
         let mut experts = Vec::with_capacity(cfg.n_routed_experts);
         for e in 0..cfg.n_routed_experts {
-            let ep = format!("{p}.mlp.experts.{e}");
+            let ep = format!("{p}.{ml}.experts.{e}");
             experts.push(Dsv4Expert {
-                w1: q(&format!("{ep}.gate_proj.weight"))?,
-                w2: q(&format!("{ep}.down_proj.weight"))?,
-                w3: q(&format!("{ep}.up_proj.weight"))?,
+                w1: q(&format!("{ep}.{w}", w = s.w(1)))?,
+                w2: q(&format!("{ep}.{w}", w = s.w(2)))?,
+                w3: q(&format!("{ep}.{w}", w = s.w(3)))?,
             });
         }
 
-        layers.push(Dsv4Layer {
-            attn_norm: f(&format!("{p}.input_layernorm.weight"))?,
-            ffn_norm: f(&format!("{p}.post_attention_layernorm.weight"))?,
-            wq_a: q(&format!("{p}.self_attn.wq_a.weight"))?,
-            q_norm: f(&format!("{p}.self_attn.q_norm.weight"))?,
-            wq_b: q(&format!("{p}.self_attn.wq_b.weight"))?,
-            wkv: q(&format!("{p}.self_attn.wkv.weight"))?,
-            kv_norm: f(&format!("{p}.self_attn.kv_norm.weight"))?,
-            wo_a: q(&format!("{p}.self_attn.wo_a.weight"))?,
-            wo_b: q(&format!("{p}.self_attn.wo_b.weight"))?,
-            attn_sink: f(&format!("{p}.self_attn.attn_sink"))?,
+        Ok(Dsv4Layer {
+            attn_norm: f(&format!("{p}.{an}", an = s.attn_norm()))?,
+            ffn_norm: f(&format!("{p}.{fnm}", fnm = s.ffn_norm()))?,
+            wq_a: q(&format!("{p}.{at}.wq_a.weight"))?,
+            q_norm: f(&format!("{p}.{at}.q_norm.weight"))?,
+            wq_b: q(&format!("{p}.{at}.wq_b.weight"))?,
+            wkv: q(&format!("{p}.{at}.wkv.weight"))?,
+            kv_norm: f(&format!("{p}.{at}.kv_norm.weight"))?,
+            wo_a: q(&format!("{p}.{at}.wo_a.weight"))?,
+            wo_b: q(&format!("{p}.{at}.wo_b.weight"))?,
+            attn_sink: f(&format!("{p}.{at}.attn_sink"))?,
             compressor,
             indexer,
             hc_attn_fn: f(&format!("{p}.hc_attn_fn"))?,
@@ -3794,25 +3883,108 @@ pub fn load(
             hc_ffn_fn: f(&format!("{p}.hc_ffn_fn"))?,
             hc_ffn_base: f(&format!("{p}.hc_ffn_base"))?,
             hc_ffn_scale: scale3(&format!("{p}.hc_ffn_scale"))?,
-            gate: q(&format!("{p}.mlp.gate.weight"))?,
+            gate: q(&format!("{p}.{ml}.gate.weight"))?,
             // The bias is absent exactly on the hash layers, and the table
             // is present exactly there — the file itself says which is which.
-            gate_bias: opt_f(&format!("{p}.mlp.expert_bias")),
-            tid2eid: opt_f(&format!("{p}.mlp.tid2eid")),
+            gate_bias: opt_f(&format!("{p}.{ml}.{b}", b = s.gate_bias())),
+            tid2eid: opt_f(&format!("{p}.{ml}.tid2eid")),
             experts,
-            mask: if model.tensor(&format!("{p}.mlp.tid2eid")).is_some() {
+            mask: if model.tensor(&format!("{p}.{ml}.tid2eid")).is_some() {
                 None
             } else {
                 crate::loader::moe_task_mask(&format!("{p}."), cfg.n_routed_experts)
             },
             shared: Dsv4Expert {
-                w1: q(&format!("{p}.mlp.shared_expert.gate_proj.weight"))?,
-                w2: q(&format!("{p}.mlp.shared_expert.down_proj.weight"))?,
-                w3: q(&format!("{p}.mlp.shared_expert.up_proj.weight"))?,
+                w1: q(&format!("{p}.{ml}.{sh}.{w}", sh = s.shared(), w = s.w(1)))?,
+                w2: q(&format!("{p}.{ml}.{sh}.{w}", sh = s.shared(), w = s.w(2)))?,
+                w3: q(&format!("{p}.{ml}.{sh}.{w}", sh = s.shared(), w = s.w(3)))?,
             },
+        })
+    }
+}
+
+/// One module of the speculation stack.
+///
+/// The release carries three, so the draft is three deep, and the last one
+/// also holds a confidence head — the model scores its own proposals rather
+/// than leaving acceptance to a threshold we would have to invent. Each
+/// module is a full layer with its own 256 experts; what makes it an MTP
+/// module rather than a 44th layer is `main_proj`, which folds the previous
+/// hidden state into the next embedding before the layer runs.
+pub struct Dsv4Mtp {
+    pub layer: Dsv4Layer,
+    pub main_proj: crate::qtensor::QTensor,
+    pub main_norm: Vec<f32>,
+    /// Last module only: what turns a draft hidden state into logits.
+    pub norm: Option<Vec<f32>>,
+    pub hc_head_fn: Option<Vec<f32>>,
+    pub hc_head_base: Option<Vec<f32>>,
+    pub hc_head_scale: Option<f32>,
+    pub confidence: Option<crate::qtensor::QTensor>,
+}
+
+/// Load as much of the speculation stack as the file carries, up to
+/// `max_depth`. Missing is not an error: a checkpoint without MTP simply
+/// yields an empty stack, and the caller falls back to plain decoding.
+pub fn load_mtp(
+    model: &std::sync::Arc<cortiq_core::CmfModel>,
+    cfg: &Dsv4Cfg,
+    max_depth: usize,
+) -> Vec<Dsv4Mtp> {
+    let f = |name: &str| -> Option<Vec<f32>> {
+        crate::loader::load_f32(model, name, &crate::loader::Overlay::None).ok()
+    };
+    let mut out = Vec::new();
+    for d in 0..max_depth {
+        let p = format!("model.mtp.{d}");
+        if model.tensor(&format!("{p}.main_proj.weight")).is_none() {
+            break;
+        }
+        let layer = match load_layer(model, cfg, &p, Scheme::Mtp) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("MTP {d}: пропущен, {e}");
+                break;
+            }
+        };
+        let main_proj = match crate::qtensor::QTensor::from_model(model, &format!("{p}.main_proj.weight")) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("MTP {d}: пропущен, {e}");
+                break;
+            }
+        };
+        let Some(main_norm) = f(&format!("{p}.main_norm.weight")) else {
+            eprintln!("MTP {d}: пропущен, нет main_norm");
+            break;
+        };
+        out.push(Dsv4Mtp {
+            layer,
+            main_proj,
+            main_norm,
+            norm: f(&format!("{p}.norm.weight")),
+            hc_head_fn: f(&format!("{p}.hc_head_fn")),
+            hc_head_base: f(&format!("{p}.hc_head_base")),
+            hc_head_scale: f(&format!("{p}.hc_head_scale")).and_then(|v| v.first().copied()),
+            confidence: crate::qtensor::QTensor::from_model(
+                model,
+                &format!("{p}.confidence_head.proj.weight"),
+            )
+            .ok(),
         });
     }
-    Ok((globals, layers))
+    if !out.is_empty() {
+        let last = &out[out.len() - 1];
+        eprintln!(
+            "MTP: {} модул(ь/я/ей), main_proj [{}, {}], экспертов {}, голова уверенности {}",
+            out.len(),
+            last.main_proj.rows(),
+            last.main_proj.cols(),
+            last.layer.experts.len(),
+            if last.confidence.is_some() { "есть" } else { "нет" }
+        );
+    }
+    out
 }
 
 #[cfg(test)]
