@@ -7015,6 +7015,190 @@ fn bt_sparse_attend(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+
+// The whole hyper-connection join, fused, with the token on the grid: the
+// four dependent dispatches per half become ONE link of the pass's critical
+// path per half. The B=1 trade was negative (measured); at B=5 each link
+// carries five tokens and the launch bookkeeping amortizes.
+@group(0) @binding(0)  var<storage, read>       bhb_x     : array<f32>;   // b, dim
+@group(0) @binding(1)  var<storage, read>       bhb_res   : array<f32>;   // b, hc*dim
+@group(0) @binding(2)  var<storage, read_write> bhb_post  : array<f32>;   // b, hc
+@group(0) @binding(3)  var<storage, read_write> bhb_comb  : array<f32>;   // b, hc*hc
+@group(0) @binding(4)  var<storage, read>       bhb_mixw  : array<f32>;
+@group(0) @binding(5)  var<storage, read>       bhb_sc    : array<f32>;
+@group(0) @binding(6)  var<storage, read>       bhb_base  : array<f32>;
+@group(0) @binding(7)  var<storage, read>       bhb_nw    : array<f32>;
+@group(0) @binding(8)  var<storage, read_write> bhb_state : array<f32>;   // b, hc*dim
+@group(0) @binding(9)  var<storage, read_write> bhb_fold  : array<f32>;   // b, dim
+@group(0) @binding(10) var<storage, read_write> bhb_norm  : array<f32>;   // b, dim
+@group(0) @binding(11) var<uniform>             bhb_p     : HbP;
+var<workgroup> bhb_red: array<f32, 256>;
+var<workgroup> bhb_mix: array<f32, 64>;
+var<workgroup> bhb_pre: array<f32, 8>;
+var<workgroup> bhb_cmb: array<f32, 64>;
+var<workgroup> bhb_rsq: f32;
+@compute @workgroup_size(256)
+fn bt_hc_block(@builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(local_invocation_index) lid: u32) {
+    let tok = wid.x;
+    let xb = tok * bhb_p.dim;
+    let rb = tok * bhb_p.hc * bhb_p.dim;
+    let sb = rb;
+    let fb = xb;
+    let pb = tok * bhb_p.hc;
+    let cb = tok * bhb_p.hc * bhb_p.hc;
+
+    let hc = bhb_p.hc;
+    let dim = bhb_p.dim;
+    let n = hc * dim;
+    let mh = bhb_p.mix_hc;
+
+    // ── 1. expand ─────────────────────────────────────────────────────────
+    var i = lid;
+    loop {
+        if (i >= n) { break; }
+        let j = i / dim;
+        let d = i % dim;
+        var y = bhb_post[pb + j] * bhb_x[xb + d];
+        for (var k = 0u; k < hc; k = k + 1u) {
+            y = y + bhb_comb[cb + k * hc + j] * bhb_res[rb + k * dim + d];
+        }
+        bhb_state[sb + i] = y;
+        i = i + 256u;
+    }
+    workgroupBarrier();
+
+    // ── 2. the mix projection, all outputs at once ────────────────────────
+    // Eight threads to an output, striding the shared axis: one barrier for
+    // the lot instead of one tree reduction per output.
+    let o = lid / HB_LANES;
+    let sub = lid % HB_LANES;
+    var acc = 0.0;
+    if (o < mh) {
+        let base = o * n;
+        var t = sub;
+        loop {
+            if (t >= n) { break; }
+            acc = acc + bhb_mixw[base + t] * bhb_state[sb + t];
+            t = t + HB_LANES;
+        }
+    }
+    bhb_red[lid] = acc;
+    workgroupBarrier();
+    if (sub == 0u && o < mh) {
+        var sm = 0.0;
+        for (var t = 0u; t < HB_LANES; t = t + 1u) { sm = sm + bhb_red[o * HB_LANES + t]; }
+        bhb_mix[o] = sm;
+    }
+
+    // ── 3. rsqrt(mean(state^2) + eps), over ALL copies ────────────────────
+    var acc2 = 0.0;
+    var i2 = lid;
+    loop {
+        if (i2 >= n) { break; }
+        let v = bhb_state[sb + i2];
+        acc2 = acc2 + v * v;
+        i2 = i2 + 256u;
+    }
+    workgroupBarrier();           // bhb_red is being reused
+    bhb_red[lid] = acc2;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { bhb_red[lid] = bhb_red[lid] + bhb_red[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) { bhb_rsq = inverseSqrt(bhb_red[0] / f32(n) + bhb_p.eps); }
+    workgroupBarrier();
+    let rsq = bhb_rsq;
+
+    // ── 4. pre / post / comb, thread 0: hc is 4 and the Sinkhorn is a
+    //       sequential fixed point over a 4x4.
+    if (lid == 0u) {
+        for (var j = 0u; j < hc; j = j + 1u) {
+            let m = bhb_mix[j] * rsq * bhb_sc[0] + bhb_base[j];
+            bhb_pre[j] = 1.0 / (1.0 + exp(-m)) + bhb_p.eps;
+            let m2 = bhb_mix[hc + j] * rsq * bhb_sc[1] + bhb_base[hc + j];
+            bhb_post[pb + j] = 2.0 / (1.0 + exp(-m2));
+        }
+        for (var j = 0u; j < hc; j = j + 1u) {
+            var mx = -1e30;
+            for (var k = 0u; k < hc; k = k + 1u) {
+                let v = bhb_mix[2u * hc + j * hc + k] * rsq * bhb_sc[2]
+                      + bhb_base[2u * hc + j * hc + k];
+                bhb_cmb[j * hc + k] = v;
+                mx = max(mx, v);
+            }
+            var sum = 0.0;
+            for (var k = 0u; k < hc; k = k + 1u) {
+                let e = exp(bhb_cmb[j * hc + k] - mx);
+                bhb_cmb[j * hc + k] = e;
+                sum = sum + e;
+            }
+            for (var k = 0u; k < hc; k = k + 1u) {
+                bhb_cmb[j * hc + k] = bhb_cmb[j * hc + k] / sum + bhb_p.eps;
+            }
+        }
+        for (var k = 0u; k < hc; k = k + 1u) {
+            var sum = 0.0;
+            for (var j = 0u; j < hc; j = j + 1u) { sum = sum + bhb_cmb[j * hc + k]; }
+            for (var j = 0u; j < hc; j = j + 1u) {
+                bhb_cmb[j * hc + k] = bhb_cmb[j * hc + k] / (sum + bhb_p.eps);
+            }
+        }
+        for (var it = 1u; it < bhb_p.iters; it = it + 1u) {
+            for (var j = 0u; j < hc; j = j + 1u) {
+                var sum = 0.0;
+                for (var k = 0u; k < hc; k = k + 1u) { sum = sum + bhb_cmb[j * hc + k]; }
+                for (var k = 0u; k < hc; k = k + 1u) {
+                    bhb_cmb[j * hc + k] = bhb_cmb[j * hc + k] / (sum + bhb_p.eps);
+                }
+            }
+            for (var k = 0u; k < hc; k = k + 1u) {
+                var sum = 0.0;
+                for (var j = 0u; j < hc; j = j + 1u) { sum = sum + bhb_cmb[j * hc + k]; }
+                for (var j = 0u; j < hc; j = j + 1u) {
+                    bhb_cmb[j * hc + k] = bhb_cmb[j * hc + k] / (sum + bhb_p.eps);
+                }
+            }
+        }
+        for (var j = 0u; j < hc * hc; j = j + 1u) { bhb_comb[cb + j] = bhb_cmb[j]; }
+    }
+    workgroupBarrier();
+
+    // ── 5. fold, then the norm over it ────────────────────────────────────
+    var acc3 = 0.0;
+    var d = lid;
+    loop {
+        if (d >= dim) { break; }
+        var y = 0.0;
+        for (var j = 0u; j < hc; j = j + 1u) {
+            y = y + bhb_pre[j] * bhb_state[sb + j * dim + d];
+        }
+        bhb_fold[fb + d] = y;
+        acc3 = acc3 + y * y;
+        d = d + 256u;
+    }
+    bhb_red[lid] = acc3;
+    workgroupBarrier();
+    stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { bhb_red[lid] = bhb_red[lid] + bhb_red[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let inv = inverseSqrt(bhb_red[0] / f32(dim) + bhb_p.eps);
+    var d2 = lid;
+    loop {
+        if (d2 >= dim) { break; }
+        bhb_norm[fb + d2] = bhb_fold[fb + d2] * inv * bhb_nw[d2];
+        d2 = d2 + 256u;
+    }
+}
+
 // index_scores with grid (entry, token): the query heads and the output
 // stride by the token; the weights arrive RAW with the fold factor in the
 // uniform, multiplied per head exactly where the walk's axpy used to — same
@@ -7472,6 +7656,7 @@ struct Ctx {
     // Token-axis twins for the batched dsv4 frame.
     bt_rope_heads: wgpu::ComputePipeline,
     bt_hc_pre_fold: wgpu::ComputePipeline,
+    bt_hc_block: wgpu::ComputePipeline,
     bt_hc_post_expand: wgpu::ComputePipeline,
     bt_f32_matvec_w: wgpu::ComputePipeline,
     bt_f32_matvec_x: wgpu::ComputePipeline,
@@ -8039,6 +8224,7 @@ fn init() -> Result<Ctx, String> {
     let hc_post_expand = pipe("hc_post_expand");
     let bt_rope_heads = pipe("bt_rope_heads");
     let bt_hc_pre_fold = pipe("bt_hc_pre_fold");
+    let bt_hc_block = pipe("bt_hc_block");
     let bt_hc_post_expand = pipe("bt_hc_post_expand");
     let bt_f32_matvec_w = pipe("bt_f32_matvec_w");
     let bt_f32_matvec_x = pipe("bt_f32_matvec_x");
@@ -8280,6 +8466,7 @@ fn init() -> Result<Ctx, String> {
         hc_post_expand,
         bt_rope_heads,
         bt_hc_pre_fold,
+        bt_hc_block,
         bt_hc_post_expand,
         bt_f32_matvec_w,
         bt_f32_matvec_x,
@@ -21912,11 +22099,41 @@ fn dsv4_layer_frame_bt_enc(
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(batch as u32, 1, 1);
         };
-        // expand the attention output into the state...
-        expand(&mut pass, 214, &ao_bt, &state_bt, &state2_bt);
-        // ...then the FFN half's fold and norm...
-        mix(&mut pass, 215, &ffn_fn, &state2_bt);
-        fold(&mut pass, 216, &state2_bt, &ffn_sc, &ffn_bs, &ffn_nw);
+        // The whole FFN-half join — expand, mix, Sinkhorn fold, norm — as
+        // ONE link of the critical path.
+        let fused = |pass: &mut wgpu::ComputePass<'_>, tag: u8, x: &wgpu::Buffer,
+                     res: &wgpu::Buffer, state_out: &wgpu::Buffer, mixw: &wgpu::Buffer,
+                     sc: &wgpu::Buffer, bs: &wgpu::Buffer, nw: &wgpu::Buffer| {
+            let bind = cached_bind(c, bk(tag), || {
+                let p = uniform_u32x8(
+                    c,
+                    [hc as u32, dim as u32, g.sinkhorn_iters as u32, g.hc_eps.to_bits(),
+                     mix_hc as u32, 0, 0, 0],
+                );
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.bt_hc_block.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, x),
+                        bind_buf(1, res),
+                        bind_buf(2, &hpost_bt),
+                        bind_buf(3, &hcomb_bt),
+                        bind_buf(4, mixw),
+                        bind_buf(5, sc),
+                        bind_buf(6, bs),
+                        bind_buf(7, nw),
+                        bind_buf(8, state_out),
+                        bind_buf(9, &fold_bt),
+                        bind_buf(10, &x2_bt),
+                        bind_buf(11, &p),
+                    ],
+                })
+            });
+            pass.set_pipeline(&c.bt_hc_block);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(batch as u32, 1, 1);
+        };
+        fused(&mut pass, 214, &ao_bt, &state_bt, &state2_bt, &ffn_fn, &ffn_sc, &ffn_bs, &ffn_nw);
         // ...router logits over the normed fold...
         {
             let pipe = if n_pack < 64 {
@@ -22052,15 +22269,14 @@ fn dsv4_layer_frame_bt_enc(
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(m.hidden as u32, batch as u32, 1);
         }
-        // ...expand the MoE output back into the state...
-        expand(&mut pass, 221, &mo_bt, &state2_bt, &state_bt);
-        // ...and prepare the NEXT layer.
+        // ...the MoE half's join and the NEXT layer's opening, fused too.
         if let Some(nf) = w.hc_next_fn {
             let nfn = const_buf(c, bytemuck::cast_slice(nf));
             let nsc = const_buf(c, bytemuck::cast_slice(w.hc_next_scale));
             let nbs = const_buf(c, bytemuck::cast_slice(&w.hc_next_base[..mix_hc]));
-            mix(&mut pass, 222, &nfn, &state_bt);
-            fold(&mut pass, 223, &state_bt, &nsc, &nbs, &next_nw);
+            fused(&mut pass, 221, &mo_bt, &state2_bt, &state_bt, &nfn, &nsc, &nbs, &next_nw);
+        } else {
+            expand(&mut pass, 221, &mo_bt, &state2_bt, &state_bt);
         }
     }
     if w.hc_next_fn.is_some() && !dsv4_skip("nextq") {
