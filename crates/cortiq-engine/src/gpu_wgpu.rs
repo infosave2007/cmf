@@ -17162,7 +17162,7 @@ pub fn dsv4_encode_prep(
     // past the window's capacity.
     let mut n_comp = p.n_comp;
     if let Some((cw, cg)) = &p.comp {
-        if dsv4_compressor_frame(
+        if !dsv4_skip("comp") && dsv4_compressor_frame(
             model, cw, *cg, 0, kv_id, li, hidden, pos, inv_freq, cache, p.comp_dst_off, enc,
         )
         .is_some()
@@ -17174,7 +17174,7 @@ pub fn dsv4_encode_prep(
     let mut m = None;
     if let Some((iw, ig, ixw, ixg)) = &p.ix {
         let ixkv = dsv4_index_cache(kv_id, li, ixg.idim * (n_ix + 1))?;
-        if dsv4_compressor_frame(
+        if !dsv4_skip("comp") && dsv4_compressor_frame(
             model, iw, *ig, 1, kv_id, li, hidden, pos, inv_freq, &ixkv, p.ix_dst_off, enc,
         )
         .is_some()
@@ -17185,7 +17185,7 @@ pub fn dsv4_encode_prep(
         // window alone, which is what the host does at the start of a
         // sequence too.
         if n_comp > 0 && n_ix > 0 {
-            m = dsv4_indexer_frame(
+            m = if dsv4_skip("ix") { None } else { dsv4_indexer_frame(
                 model, ixw, *ixg, kv_id, li, hidden, qn, &ixkv, n_ix, n_comp,
                 // The window AFTER this token's append, which is what the
                 // host reads off its own vector: clamp the incremented
@@ -17194,7 +17194,7 @@ pub fn dsv4_encode_prep(
                 // position more than the window holds, for the rest of the
                 // sequence.
                 (p.filled + 1).min(window), pos, inv_freq, idx_out, enc,
-            );
+            ) };
         }
     }
     let filled = dsv4_window_append(
@@ -17515,6 +17515,7 @@ fn dsv4_layer_frame_enc(
                 &ffn_bs, &ffn_nw, &state2, &folded, &x2, hc, dim, mix_hc, g.sinkhorn_iters,
                 a.eps, (172, kv_id, li));
         } else {
+        if !dsv4_skip("hc") {
         encode_hc_expand_k_p(&mut pass, c, &ao, &state, &hpost, &hcomb, &state2, &hcp, hc, dim,
             (120, kv_id, li));
         encode_f32matvec_k_p(&mut pass, c, &ffn_fn, &state2, &mixes, mix_hc, hc * dim,
@@ -17522,6 +17523,7 @@ fn dsv4_layer_frame_enc(
         encode_hc_fold_k_p(&mut pass, c, &state2, &mixes, &ffn_sc, &ffn_bs, &folded, &hpost,
             &hcomb, &hcp, (122, kv_id, li));
         encode_rmsnorm_p(&mut pass, c, &folded, &ffn_nw, &x2, dim, a.eps, (50, kv_id, li));
+        }
         }
 
         // ── MoE half ──
