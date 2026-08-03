@@ -7199,6 +7199,36 @@ fn bt_hc_block(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+
+// The compressor's pending append for a RUN of tokens, one dispatch: every
+// token in a fold-free segment writes a distinct slot of the pending
+// stream, so the writes commute. The score picks up its in-window position
+// bias here, exactly where the per-token step added it.
+struct BcaP { width: u32, t0: u32, n: u32, flags: u32 }; // flags: 1 = overlap (add ape), bits 8.. = pos0 % ratio? no — slot base rides in t0's precomputed slots
+@group(0) @binding(0) var<storage, read>       bca_ckv : array<f32>;   // b, width
+@group(0) @binding(1) var<storage, read>       bca_csc : array<f32>;   // b, width
+@group(0) @binding(2) var<storage, read>       bca_ape : array<f32>;
+@group(0) @binding(3) var<storage, read_write> bca_pkv : array<f32>;   // ratio, width
+@group(0) @binding(4) var<storage, read_write> bca_psc : array<f32>;
+@group(0) @binding(5) var<uniform>             bca_p   : BcaP;
+@group(0) @binding(6) var<storage, read>       bca_slot: array<u32>;   // b (slot per token)
+@compute @workgroup_size(256)
+fn bt_comp_append(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = wid.x * 256u + lid.x;
+    if (i >= bca_p.width) { return; }
+    let t = bca_p.t0 + wid.y;
+    if (wid.y >= bca_p.n) { return; }
+    let slot = bca_slot[t];
+    let src = t * bca_p.width + i;
+    bca_pkv[slot * bca_p.width + i] = bca_ckv[src];
+    var sc = bca_csc[src];
+    if ((bca_p.flags & 1u) != 0u) {
+        sc = sc + bca_ape[slot * bca_p.width + i];
+    }
+    bca_psc[slot * bca_p.width + i] = sc;
+}
+
 // index_scores with grid (entry, token): the query heads and the output
 // stride by the token; the weights arrive RAW with the fold factor in the
 // uniform, multiplied per head exactly where the walk's axpy used to — same
@@ -7657,6 +7687,7 @@ struct Ctx {
     bt_rope_heads: wgpu::ComputePipeline,
     bt_hc_pre_fold: wgpu::ComputePipeline,
     bt_hc_block: wgpu::ComputePipeline,
+    bt_comp_append: wgpu::ComputePipeline,
     bt_hc_post_expand: wgpu::ComputePipeline,
     bt_f32_matvec_w: wgpu::ComputePipeline,
     bt_f32_matvec_x: wgpu::ComputePipeline,
@@ -8225,6 +8256,7 @@ fn init() -> Result<Ctx, String> {
     let bt_rope_heads = pipe("bt_rope_heads");
     let bt_hc_pre_fold = pipe("bt_hc_pre_fold");
     let bt_hc_block = pipe("bt_hc_block");
+    let bt_comp_append = pipe("bt_comp_append");
     let bt_hc_post_expand = pipe("bt_hc_post_expand");
     let bt_f32_matvec_w = pipe("bt_f32_matvec_w");
     let bt_f32_matvec_x = pipe("bt_f32_matvec_x");
@@ -8467,6 +8499,7 @@ fn init() -> Result<Ctx, String> {
         bt_rope_heads,
         bt_hc_pre_fold,
         bt_hc_block,
+        bt_comp_append,
         bt_hc_post_expand,
         bt_f32_matvec_w,
         bt_f32_matvec_x,
@@ -21674,7 +21707,76 @@ fn dsv4_layer_frame_bt_enc(
                     None => no!("ix-кеш ({kv_id},{li}) не заведён"),
                 }
             };
+            // Fold-free tokens append in ONE dispatch per segment (their
+            // slots are all distinct between folds, so the writes commute);
+            // only the token that CLOSES a window walks the full per-token
+            // state step, folds included.
+            let streams = {
+                let mut m = c.dsv4_comp.lock().unwrap();
+                m.entry((*kind, kv_id, li))
+                    .or_insert_with(|| {
+                        let span = cg.ratio * cg.width;
+                        let mk = || {
+                            c.device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some("dsv4-comp-stream"),
+                                size: (span * 4).max(4) as u64,
+                                usage: wgpu::BufferUsages::STORAGE
+                                    | wgpu::BufferUsages::COPY_SRC
+                                    | wgpu::BufferUsages::COPY_DST,
+                                mapped_at_creation: false,
+                            })
+                        };
+                        [mk(), mk(), mk(), mk()]
+                    })
+                    .clone()
+            };
+            let ape_all = const_buf(c, bytemuck::cast_slice(cw.ape));
+            let slots: Vec<u32> = (0..batch).map(|t| ((pos0 + t) % cg.ratio) as u32).collect();
+            let slot_b = frame_buf_t(c, BT_DSPARK_META, 2 * FRAME_TOK_STRIDE + li * 2 + *kind as usize, batch * 4, true);
+            c.queue.write_buffer(&slot_b, 0, bytemuck::cast_slice(&slots));
+            let append_seg = |enc: &mut wgpu::CommandEncoder, t0: usize, n: usize| {
+                if n == 0 {
+                    return;
+                }
+                let tag = (231 + kind) as u8;
+                let bind = cached_bind(c, (tag, kv_id, li * FRAME_TOK_STRIDE * 8 + batch * 8 + t0), || {
+                    let flags = cg.overlap as u32;
+                    let pu = uniform_u32x4(c, [cg.width as u32, t0 as u32, n as u32, flags]);
+                    c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &c.bt_comp_append.get_bind_group_layout(0),
+                        entries: &[
+                            bind_buf(0, &ckv_bt),
+                            bind_buf(1, &csc_bt),
+                            bind_buf(2, &ape_all),
+                            bind_buf(3, &streams[0]),
+                            bind_buf(4, &streams[1]),
+                            bind_buf(5, &pu),
+                            bind_buf(6, &slot_b),
+                        ],
+                    })
+                });
+                let mut pass = begin_pass(enc);
+                pass.set_pipeline(&c.bt_comp_append);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups((cg.width as u32).div_ceil(256), n as u32, 1);
+            };
+            // Which kinds batch their appends. The indexer's compressor
+            // (kind 1) is proven walk-exact under segmentation; the
+            // attention one still diverges on the q4 stand and walks per
+            // token until that is found. CMF_DSV4_SEGAPP overrides.
+            let seg_on = std::env::var("CMF_DSV4_SEGAPP").unwrap_or_else(|_| "1".into());
+            let seg_this = seg_on.contains(char::from(b'0' + *kind));
+            let mut seg0 = 0usize;
             for (t, p) in preps.iter().enumerate() {
+                let folds = (pos0 + t + 1) % cg.ratio == 0;
+                if !folds && seg_this {
+                    continue;
+                }
+                if seg_this {
+                    append_seg(enc, seg0, t - seg0);
+                }
+                seg0 = t + 1;
                 let _salt = Dsv4FrameSalt::enter(t + 1);
                 let ckv_t = frame_buf(c, 70 + kind, cg.width * 4, false);
                 let csc_t = frame_buf(c, 72 + kind, cg.width * 4, false);
@@ -21688,6 +21790,9 @@ fn dsv4_layer_frame_bt_enc(
                     c, cw, *cg, *kind, kv_id, li, &ckv_t, &csc_t, pos0 + t, inv_freq, &dst,
                     off, enc, None,
                 );
+            }
+            if seg_this {
+                append_seg(enc, seg0, batch - seg0);
             }
         }
     }
