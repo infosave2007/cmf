@@ -1709,6 +1709,21 @@ fn dsv4_layer_loop(
     // wrong one. Everything that can decline is therefore asked before the
     // first byte of state moves. The expert upload happens here too, which is
     // where it belonged anyway.
+    // The head goes to the card BEFORE the experts ask for room. It is the
+    // single most-used tensor in the file — every token reads all of it —
+    // and it is a rounding error next to the expert stack: 265 MB against
+    // ninety-odd gigabytes on the release. Uploaded in first-touch order it
+    // arrived last, after the budget was gone, and stayed on the host for
+    // the life of the process.
+    {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if let (Some(idx), Some(model)) = (g.head.model_idx(), g.head.model_arc()) {
+                let ok = crate::gpu_wgpu::dsv4_weight_ready(&model, idx);
+                tracing::info!("dsv4: голова на карте: {}", if ok { "да" } else { "нет" });
+            }
+        }
+    }
     let mut on_dev = vec![false; layers.len()];
     for (li, l) in layers.iter().enumerate() {
         let Some(pk) = pack_for(l, cfg, li) else {
