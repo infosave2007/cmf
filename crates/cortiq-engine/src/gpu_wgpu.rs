@@ -18094,12 +18094,35 @@ fn dsv4_index_cache(kv_id: u64, li: usize, floats: usize) -> Option<wgpu::Buffer
     let c = ctx()?;
     let cap = floats.next_power_of_two().max(1024);
     let mut m = c.dsv4_ixkv.lock().unwrap();
-    if m.get(&(kv_id, li)).is_some_and(|(_, have)| *have < cap) {
-        m.remove(&(kv_id, li));
+    // Growing CARRIES the contents. This cache accumulates one compressed
+    // entry every `ratio` tokens for the whole sequence, and dropping the old
+    // buffer meant the indexer scored every earlier entry against zeros from
+    // the next power of two onward — silently, and only on contexts long
+    // enough to cross one. The KV cache beside it has always copied; this one
+    // did not.
+    let carry = match m.get(&(kv_id, li)) {
+        Some((old, have)) if *have < cap => Some((old.clone(), *have)),
+        _ => None,
+    };
+    if let Some((old, have)) = carry {
+        let bigger = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dsv4-index-kv"),
+            size: (cap * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ixkv-grow"),
+            });
+        enc.copy_buffer_to_buffer(&old, 0, &bigger, 0, (have * 4) as u64);
+        submit(c, enc.finish());
+        m.insert((kv_id, li), (bigger, cap));
         // The same epoch the KV cache bumps: a cached bind group outlives
-        // the buffer it points at otherwise. Nothing cached indexer binds
-        // when this was written, which is exactly when the bump is cheap to
-        // add and expensive to forget.
+        // the buffer it points at otherwise.
         GREW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let (b, _) = m.entry((kv_id, li)).or_insert_with(|| {
