@@ -1280,10 +1280,10 @@ pub fn q4tp_matmat(
     }
 }
 
-/// Single-token q4tp matvec on the device — the lm_head class. The batched
-/// kernel at b=1 IS the matvec; a 129280x2048 head is 132 MB of weights the
-/// host would otherwise stream through its load ports once per token, and
-/// `weight_buffer` uploads it once for the process.
+/// Single-token q4tp matvec on the device — the lm_head class. Through the
+/// DEDICATED matvec kernel: the batched GEMM at b=1 measured 11.73 ms
+/// against the host's 9.51 on the release head, so the route that was
+/// supposed to save eleven milliseconds a token lost its own probe instead.
 pub fn q4tp_matvec(
     model: &Arc<CmfModel>,
     idx: usize,
@@ -1292,7 +1292,14 @@ pub fn q4tp_matvec(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
-    q4tp_matmat(model, idx, xs, 1, rows, cols, out)
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q4tp_matvec_for_test(model, idx, xs, rows, cols, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q4tp_matvec(model, idx, xs, rows, cols, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
 }
 
 pub fn q4t_matmat(
