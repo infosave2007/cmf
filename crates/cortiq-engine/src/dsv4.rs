@@ -3592,6 +3592,7 @@ fn forward_token_inner(
                 }
             );
         }
+        dspark_note(li, &state, cfg);
     }
     }
     st.pos += 1;
