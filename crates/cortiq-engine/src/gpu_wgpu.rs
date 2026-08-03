@@ -9640,7 +9640,7 @@ pub fn forward_token_graph(
                     // Word 2 is the batch count for THIS pair and `cols` for
                     // everything else bound to the same struct — the shared
                     // uniform above cannot serve both.
-                    let p6 = uniform_u32x4(c, [gpr as u32, rows as u32, 1, 0]);
+                    let p6 = q4tp_mv_params(c, gpr, rows, 1);
                     let layout = pipe6.get_bind_group_layout(0);
                     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
@@ -14937,6 +14937,36 @@ fn attend_part_pipes(c: &Ctx, hd: usize) -> (&wgpu::ComputePipeline, &wgpu::Bind
 
 /// `q4tp_matvec4`: the q1t-like binding set plus the weight buffer AGAIN at
 /// slot 4 as the kernel's vec4 nibble view.
+/// Parameters for the q4tp matvec PAIR (`q4tp_matvec16` / `q4tp_matvec4`).
+///
+/// Word 2 is the batch count for these two kernels and `cols` for everything
+/// else bound to `Q1Params`. Building it by hand at each call site put `cols`
+/// into the batch slot of the chain's busiest projection encoder — the
+/// kernel then ran every row block four thousand times and decoding fell
+/// from 27 tok/s to 0.35. One constructor, so the mistake has nowhere to
+/// live.
+fn q4tp_mv_params(c: &Ctx, gpr: usize, rows: usize, batch: usize) -> wgpu::Buffer {
+    q4tp_mv_params_w(c, gpr, rows, batch, 0)
+}
+
+/// The same, with word 3 — the grouped projection's row window, which slides
+/// the activation with the row. Batch and window are mutually exclusive
+/// modes; the kernel reads the batch first.
+fn q4tp_mv_params_w(
+    c: &Ctx,
+    gpr: usize,
+    rows: usize,
+    batch: usize,
+    window: usize,
+) -> wgpu::Buffer {
+    debug_assert!((1..=64).contains(&batch), "batch {batch} out of range");
+    debug_assert!(
+        batch == 1 || window == 0,
+        "batch {batch} with window {window}: the kernel honours one or the other"
+    );
+    uniform_u32x4(c, [gpr as u32, rows as u32, batch as u32, window as u32])
+}
+
 fn encode_q4tp_mv4(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
@@ -14976,7 +15006,7 @@ fn encode_q4tp_mv4_b(
     } else {
         (&c.q4tp_mv4, 8u32)
     };
-    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, batch as u32, 0]);
+    let p_buf = q4tp_mv_params(c, gpr, rows, batch);
     let layout = pipe.get_bind_group_layout(0);
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
@@ -15081,7 +15111,7 @@ fn encode_q4tp_mvw_p(
         (&c.q4tp_mv4, 8u32)
     };
     let bind = cached_bind(c, bkey, || {
-        let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+        let p_buf = q4tp_mv_params(c, gpr, rows, 1);
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &pipe.get_bind_group_layout(0),
@@ -15140,7 +15170,7 @@ fn encode_o_lora_mv4_p(
         return false;
     }
     let bind = cached_bind(c, bkey, || {
-        let p = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, lora as u32]);
+        let p = q4tp_mv_params_w(c, gpr, rows, 1, lora);
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &pipe.get_bind_group_layout(0),
