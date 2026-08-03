@@ -1927,7 +1927,19 @@ fn dsv4_layer_loop(
                 cfg,
                 scratch,
                 pool,
-                |f, o| moe_step(f, l, cfg, token_id, li, pool, o),
+                // The layer the card had no room for. Its experts are
+                // reached one matvec at a time and the probe sends each to
+                // the device — right per op, and a fence per op: this one
+                // layer is why a token that submits ONCE for 42 layers
+                // submits 13 times. CMF_DSV4_HOST_CPU_MOE=1 keeps them on
+                // the host instead, trading arithmetic for round trips.
+                |f, o| {
+                    if host_cpu_moe() {
+                        crate::gpu::cpu_scope(|| moe_step(f, l, cfg, token_id, li, pool, o))
+                    } else {
+                        moe_step(f, l, cfg, token_id, li, pool, o)
+                    }
+                },
             );
             if let Some(n) = layers.get(li + 1) {
                 let (f, p2, c2) = hc_fold_norm(
@@ -2145,6 +2157,14 @@ fn chain_max() -> usize {
 /// `CMF_DSV4_CHAIN=1`: put a run of consecutive device-capable layers in ONE
 /// submission. Off by default until it has been measured on a real card.
 #[cfg(feature = "gpu")]
+/// `CMF_DSV4_HOST_CPU_MOE=1`: a layer that fell off the card runs its MoE on
+/// the host WITHOUT the per-op device route — one fence a token instead of
+/// one a matvec. Whether that wins is a measurement.
+fn host_cpu_moe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_HOST_CPU_MOE").is_ok_and(|v| v != "0"))
+}
+
 fn chain_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CMF_DSV4_CHAIN").is_ok_and(|v| v != "0"))
