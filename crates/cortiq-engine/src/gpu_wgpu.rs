@@ -6755,13 +6755,49 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    if full_quant.len() % 4 == 0 {
+    let t_up = std::time::Instant::now();
+    if upload_staged() {
+        // A staging buffer we map ourselves, then one copy. `queue.write_buffer`
+        // goes through wgpu's belt, which for a 92 GB expert stack measured
+        // ~48 MB/s on Vulkan — half an hour before the first token. This path
+        // memcpys straight into a mapped host-visible buffer and issues the
+        // device copy itself.
+        let n = len.next_multiple_of(4);
+        let stg = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("weight-staging"),
+            size: n,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        {
+            let Ok(mut view) = stg.slice(..).get_mapped_range_mut() else {
+                return None;
+            };
+            // Write-only by construction: mapped upload memory may be
+            // uncached, so wgpu hands out a slice you may write but not read.
+            view.slice(..full_quant.len()).copy_from_slice(full_quant);
+            if full_quant.len() < n as usize {
+                view.slice(full_quant.len()..).fill(0);
+            }
+        }
+        stg.unmap();
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wup") });
+        enc.copy_buffer_to_buffer(&stg, 0, &buf, 0, n);
+        submit(c, enc.finish());
+        // The staging buffer must outlive the copy; polling here also keeps
+        // the peak at one tensor rather than the whole stack.
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    } else if full_quant.len() % 4 == 0 {
         c.queue.write_buffer(&buf, 0, full_quant);
     } else {
         let mut padded = full_quant.to_vec();
         padded.resize(padded.len().next_multiple_of(4), 0);
         c.queue.write_buffer(&buf, 0, &padded);
     }
+    UPLOAD_NS.fetch_add(t_up.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    UPLOAD_BYTES.fetch_add(len, Ordering::Relaxed);
     c.resident.fetch_add(len, Ordering::Relaxed);
     map.insert(
         key,
@@ -13105,6 +13141,19 @@ fn spin_wait() -> bool {
 /// whether a decode step is compute-bound or latency-bound — and it is not
 /// derivable from anything else the profile prints.
 pub static SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Weight residency: how much went to the card and how long it took. The
+/// first token pays all of it, and on a 92 GB expert stack that was half an
+/// hour — worth knowing as a rate rather than as "the bench is slow to start".
+pub static UPLOAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static UPLOAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `CMF_GPU_UPLOAD=staged`: map a staging buffer and issue the copy here,
+/// instead of handing the bytes to `queue.write_buffer`.
+fn upload_staged() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_GPU_UPLOAD").is_ok_and(|v| v == "staged"))
+}
 
 #[inline]
 fn submit(c: &Ctx, buf: wgpu::CommandBuffer) {
