@@ -720,6 +720,10 @@ fn f32_matvec_split(@builtin(workgroup_id) wid: vec3<u32>,
         stride = stride / 2u;
     }
     if (lid == 0u) { fmspart[row * fmsp.nsplit + sp] = fmsred[0]; }
+    // Same reason as in the merge: this entry point never writes the output,
+    // so without a mention its derived layout is one binding short of the
+    // merge's and no single bind group can serve both. Never runs.
+    if (fmsp.rows == 0xFFFFFFFFu) { fmsy[0] = 0.0; }
 }
 
 @compute @workgroup_size(64)
@@ -736,6 +740,11 @@ fn f32_matvec_merge(@builtin(workgroup_id) wid: vec3<u32>,
         }
         fmsy[row] = s;
     }
+    // A layout is derived from the bindings an ENTRY POINT uses, not from
+    // the module's globals — so without this the merge's layout has fewer
+    // bindings than the split's and one bind group cannot serve both.
+    // The branch never runs.
+    if (fmsp.rows == 0xFFFFFFFFu) { fmsy[0] = fmsw[0] + fmsx[0]; }
 }
 
 // Qwen3.5 output gate: attn_out *= sigmoid(gate), element-wise over nh·hd.
@@ -14633,13 +14642,25 @@ fn encode_f32matvec_w_p(
     // Rows are what give this kernel its workgroups. With very few of them,
     // split the shared axis instead: rows·splits workgroups and one cheap
     // merge pass. CMF_DSV4_F32SPLIT=0 reverts.
-    if rows <= 32 && cols >= 4096 && f32_split() {
+    // 512, not 4096: the stands' hc·dim is 512, and a threshold that no toy
+    // can reach is a path no gate can check — this one reached the release
+    // unexercised and failed there on the first dispatch.
+    if rows <= 32 && cols >= 512 && f32_split() {
         let nsplit = 8usize;
         let chunk = cols.div_ceil(nsplit);
-        let part = frame_buf(c, 115, rows * nsplit * 4, false);
-        let p = uni_slot(c, 186, bkey.1 as u64, bkey.2,
+        // The caller's ROLE tag has to be in the key. Both hyper-connection
+        // mixes of a layer arrive here with the same (sequence, layer) and
+        // different roles, and sharing one slot means the second one's
+        // parameters reach the first one's dispatch — queue writes all land
+        // before the submission. CMF_DSV4_SLOT_CHECK=1 named this exactly:
+        // "slot (186, 1, 0) written 2 times".
+        let key = bkey.2 * 256 + bkey.0 as usize;
+        // The partials buffer likewise: two roles in one submission would
+        // otherwise write the same scratch.
+        let part = frame_buf(c, 115 + (bkey.0 & 1), rows * nsplit * 4, false);
+        let p = uni_slot(c, 186, bkey.1, key,
             [cols as u32, rows as u32, nsplit as u32, chunk as u32]);
-        let b1 = cached_bind(c, (188, bkey.1 as u64, bkey.2), || {
+        let b1 = cached_bind(c, (188, bkey.1, key), || {
             c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &c.f32_mv_split.get_bind_group_layout(0),
@@ -14655,7 +14676,7 @@ fn encode_f32matvec_w_p(
         pass.set_pipeline(&c.f32_mv_split);
         pass.set_bind_group(0, &b1, &[]);
         pass.dispatch_workgroups(rows as u32, nsplit as u32, 1);
-        let b2 = cached_bind(c, (190, bkey.1 as u64, bkey.2), || {
+        let b2 = cached_bind(c, (190, bkey.1, key), || {
             c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &c.f32_mv_merge.get_bind_group_layout(0),
