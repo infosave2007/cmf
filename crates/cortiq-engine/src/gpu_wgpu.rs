@@ -12143,6 +12143,21 @@ pub fn q4t_matmat(
 /// graph is the only other caller, and a wrong kernel there still produces
 /// fluent text.
 #[doc(hidden)]
+/// Single-token q4tp matvec — the lm_head class — through the DEDICATED
+/// matvec kernel rather than the batched GEMM at b=1. The GEMM measured
+/// 11.73 ms against the host's 9.51 on a 129280x4096 head, which is how a
+/// route that should have been a rout ended up losing its own probe.
+pub fn q4tp_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    q4tp_matvec_for_test(model, idx, xs, rows, cols, out)
+}
+
 pub fn q4tp_matvec_for_test(
     model: &Arc<CmfModel>,
     idx: usize,
