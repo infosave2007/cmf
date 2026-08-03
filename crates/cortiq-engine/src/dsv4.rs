@@ -2770,9 +2770,15 @@ struct Pack {
 fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pack>> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<usize, Option<Arc<Pack>>>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<(usize, usize), Option<Arc<Pack>>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(v) = cache.lock().unwrap().get(&li) {
+    // Keyed by the layer's IDENTITY, not its ordinal. The draft's three
+    // stages are layers too and they number 0, 1, 2 — under an ordinal key
+    // they would be handed the trunk's first three packs: another layer's
+    // router, another layer's tensor indices, another layer's bias. The gate
+    // tensor is what actually distinguishes them.
+    let key = (li, l.gate.model_idx().unwrap_or(usize::MAX));
+    if let Some(v) = cache.lock().unwrap().get(&key) {
         return v.clone();
     }
     let build = || -> Option<Arc<Pack>> {
@@ -2892,7 +2898,7 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
         }))
     };
     let v = build();
-    cache.lock().unwrap().insert(li, v.clone());
+    cache.lock().unwrap().insert(key, v.clone());
     v
 }
 
