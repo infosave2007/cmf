@@ -1517,6 +1517,50 @@ impl Pipeline {
             && std::env::var("CMF_GPU_LMHEAD").as_deref() != Ok("0");
         self.graph_logits = None;
         self.graph_want_logits = false;
+        let _tpf = std::time::Instant::now();
+        let batch_k = std::env::var("CMF_BATCH_K")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        // DeepSeek-V4 owns a separate hyper-connection stack. Route it
+        // before the generic prefill choices: those correctly reject an
+        // empty `weights.layers`, but their final per-position fallback used
+        // to consume the whole prompt before `dsv4::forward_chunk` could see
+        // it. The batch implementation therefore existed without a live
+        // production entry point.
+        //
+        // Bounded chunks preserve cancellation responsiveness. Only the
+        // prompt's final chunk asks for logits; every earlier head projection
+        // would produce 129 280 values that no caller reads.
+        while self.dsv4.is_some()
+            && mtp.is_none()
+            && pos < input_ids.len()
+            && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let end = (pos + prefill_chunk()).min(input_ids.len());
+            let ids: Vec<u32> = input_ids[pos..end].to_vec();
+            let mut lg = Vec::new();
+            if let Some(b) = &mut self.dsv4 {
+                let (g, layers, cfg, st) = (&b.0, &b.1, b.2, &mut b.3);
+                crate::dsv4::forward_chunk(
+                    g,
+                    layers,
+                    &cfg,
+                    st,
+                    &ids,
+                    pos,
+                    &self.inv_freq,
+                    self.pool.as_deref(),
+                    &mut lg,
+                    end == input_ids.len(),
+                );
+            }
+            if end == input_ids.len() {
+                self.graph_logits = Some(lg);
+            }
+            pos = end;
+            hidden = vec![0.0; self.hidden_size];
+        }
         // With dynamic routing, prefill sequentially so the φ hook fires
         // over the PROMPT — the router enters decode with a warm φ (the
         // fused-pair path skips the per-layer φ capture). o1 layers
@@ -1594,11 +1638,6 @@ impl Pipeline {
         // graph prefill. (Steady-state decode is provably identical either way —
         // token-graph submit and lm_head both unchanged — so this only trades
         // prefill wall.)
-        let _tpf = std::time::Instant::now();
-        let batch_k = std::env::var("CMF_BATCH_K")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
         if batch_k > 0
             && graph_prefill
             && task_mask.is_none()
@@ -1644,40 +1683,6 @@ impl Pipeline {
                     break; // unsupported → per-position graph handles the rest
                 }
             }
-        }
-        // DeepSeek-V4 walks the prompt as a CHUNK (docs/DSV4_PREFILL.md).
-        // Today that only skips the head for every token but the last —
-        // 129 280 logits per prompt token that nobody reads — and gives the
-        // batched stages somewhere to live. Not taken when MTP is on: that
-        // wants each position's hidden as it goes.
-        // Bounded chunks, and cancel between them. Handing the whole prompt
-        // to one call meant the flag was read once every ninety seconds on a
-        // 2500-token prompt — which is to say cancellation did not work.
-        while self.dsv4.is_some()
-            && mtp.is_none()
-            && pos < input_ids.len()
-            && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            let end = (pos + prefill_chunk()).min(input_ids.len());
-            let ids: Vec<u32> = input_ids[pos..end].to_vec();
-            let mut lg = Vec::new();
-            if let Some(b) = &mut self.dsv4 {
-                let (g, layers, cfg, st) = (&b.0, &b.1, b.2, &mut b.3);
-                crate::dsv4::forward_chunk(
-                    g,
-                    layers,
-                    &cfg,
-                    st,
-                    &ids,
-                    pos,
-                    &self.inv_freq,
-                    self.pool.as_deref(),
-                    &mut lg,
-                );
-            }
-            self.graph_logits = Some(lg);
-            pos = end;
-            hidden = vec![0.0; self.hidden_size];
         }
         while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
             self.graph_want_logits = fuse_lm && pos + 1 == input_ids.len();

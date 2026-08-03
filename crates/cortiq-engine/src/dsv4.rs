@@ -1747,10 +1747,8 @@ fn dsv4_layer_loop(
         }
     }
     let mut on_dev = vec![false; layers.len()];
+    let mut partial_dev = vec![false; layers.len()];
     for (li, l) in layers.iter().enumerate() {
-        let Some(pk) = pack_for(l, cfg, li) else {
-            return false;
-        };
         if l.wq_a.model_idx().is_none()
             || l.wq_b.model_idx().is_none()
             || l.wo_a.model_idx().is_none()
@@ -1802,15 +1800,29 @@ fn dsv4_layer_loop(
             .into_iter()
             .flatten()
             .all(|i| crate::gpu_wgpu::dsv4_weight_ready(&model, i));
-        // The layer frame's router has no remap yet, so a PARTIAL packing
-        // there would silently become a mask — the one thing that is known to
-        // wreck this model. Such a layer goes to the host until the frame
-        // learns to hand cold picks back the way the two-frame path does.
-        on_dev[li] = attn_ok
-            && pk.globals.len() == cfg.n_routed_experts
-            && crate::gpu_wgpu::dsv4_experts_ready(&model, &pk.tensors, cfg.moe_inter, dim, gu_q2);
+        // Size the expert pack only AFTER this layer's attention skeleton is
+        // resident. Otherwise the pack consumes the apparent free budget,
+        // the much smaller skeleton arrives next, and the supposedly fitting
+        // pack misses by exactly those bytes.
+        let pk = pack_for(l, cfg, li);
+        if let Some(pk) = pk {
+            let experts_ok = crate::gpu_wgpu::dsv4_experts_ready(
+                &model,
+                &pk.tensors,
+                cfg.moe_inter,
+                dim,
+                gu_q2,
+            );
+            on_dev[li] = attn_ok && experts_ok && pk.globals.len() == cfg.n_routed_experts;
+            partial_dev[li] = attn_ok && experts_ok && pk.globals.len() < cfg.n_routed_experts;
+        }
     }
-    if !on_dev.iter().any(|&x| x) {
+    let active_dev: Vec<bool> = on_dev
+        .iter()
+        .zip(&partial_dev)
+        .map(|(&full, &partial)| full || partial)
+        .collect();
+    if !active_dev.iter().any(|&x| x) {
         return false;
     }
 
@@ -1820,19 +1832,26 @@ fn dsv4_layer_loop(
     {
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let host: Vec<usize> = on_dev
+            let host: Vec<usize> = active_dev
                 .iter()
                 .enumerate()
                 .filter(|&(_, d)| !*d)
                 .map(|(i, _)| i)
                 .collect();
-            if host.is_empty() {
+            let partial: Vec<(usize, usize)> = partial_dev
+                .iter()
+                .enumerate()
+                .filter(|&(_, d)| *d)
+                .filter_map(|(li, _)| pack_for(&layers[li], cfg, li).map(|p| (li, p.globals.len())))
+                .collect();
+            if host.is_empty() && partial.is_empty() {
                 tracing::info!("dsv4: все {} слоёв на карте", on_dev.len());
             } else {
                 tracing::info!(
-                    "dsv4: {} из {} слоёв на карте; на хосте остались {:?}",
-                    on_dev.len() - host.len(),
+                    "dsv4: {} из {} слоёв используют карту; частичные {:?}; на хосте {:?}",
+                    active_dev.len() - host.len(),
                     on_dev.len(),
+                    partial,
                     host,
                 );
             }
@@ -1864,16 +1883,17 @@ fn dsv4_layer_loop(
     //
     // A layer LEAVING the set is the dangerous direction: its caches are on
     // the card and the host would advance its own. That still refuses.
-    if st.dev_owned && st.dev_set != on_dev {
-        let left: Vec<usize> = (0..on_dev.len().min(st.dev_set.len()))
-            .filter(|&i| st.dev_set[i] && !on_dev[i])
+    if st.dev_owned && st.dev_set != active_dev {
+        let left: Vec<usize> = (0..active_dev.len().min(st.dev_set.len()))
+            .filter(|&i| st.dev_set[i] && !active_dev[i])
             .collect();
         if !left.is_empty() {
             tracing::warn!("слои {left:?} ушли с карты — кеши на разных сторонах");
             return false;
         }
-        let n = st.dev_set.len().min(on_dev.len());
-        on_dev[..n].copy_from_slice(&st.dev_set[..n]);
+        // A layer that was active remains device-owned. Its full/partial mode
+        // is still derived from the current pack; only cache ownership is
+        // sticky across tokens.
     }
     let chain = chain_enabled();
     // CMF_DSV4_LAYERS_PROBE=N — TIMING ONLY, the answer is garbage. Runs the
@@ -1894,6 +1914,11 @@ fn dsv4_layer_loop(
     };
     let mut run: Vec<usize> = Vec::new();
     let mut sink_out = vec![0.0f32; dim];
+    // `state` starts current on both sides. A device run makes the host copy
+    // stale unless that same run carries it home. Tracking this explicitly
+    // avoids a separate state fence before a host layer and, for a final host
+    // layer, the old upload-immediately-followed-by-readback pair.
+    let mut state_on_host = true;
     for (li, l) in layers.iter().enumerate() {
         if li >= layer_cap {
             break;
@@ -1923,24 +1948,61 @@ fn dsv4_layer_loop(
                 ) {
                     return false;
                 }
+                state_on_host = false;
                 run.clear();
             }
             continue;
         }
-        if chain
-            && !run.is_empty()
-            && !dsv4_chain_run(
-                layers, &run, cfg, g, st, token_id, &mut folded, None, 1, &[],
-                run[0] == 0 || !on_dev[run[0] - 1], pool,
-            )
-        {
-            return false;
-        }
-        run.clear();
-        if !on_dev[li] {
-            if !crate::gpu_wgpu::dsv4_state_read(state) {
+        if chain && !run.is_empty() {
+            // The very next layer is on the host, so bring its state back in
+            // the chain's existing readback. Reading it in a second submit
+            // below cost one fence per token on the release's 42+1 split.
+            if !dsv4_chain_run(
+                layers,
+                &run,
+                cfg,
+                g,
+                st,
+                token_id,
+                &mut folded,
+                Some(state),
+                1,
+                &[],
+                run[0] == 0 || !on_dev[run[0] - 1],
+                pool,
+            ) {
                 return false;
             }
+            state_on_host = true;
+        }
+        run.clear();
+        if partial_dev[li] {
+            // Attention and the resident expert subset stay on the card. The
+            // router still sees every expert and returns only the winners
+            // that did not fit; those are completed on the CPU and their
+            // exact linear contribution is added back to device state.
+            let Some(home) = dsv4_partial_layer(
+                state,
+                &mut folded,
+                layers,
+                l,
+                cfg,
+                st,
+                token_id,
+                li,
+                freqs_of(l),
+                pool,
+            ) else {
+                return false;
+            };
+            state_on_host = home;
+            continue;
+        }
+        if !on_dev[li] {
+            if !state_on_host && !crate::gpu_wgpu::dsv4_state_read(state) {
+                return false;
+            }
+            state_on_host = true;
             let freqs = freqs_of(l);
             hc_block(
                 state,
@@ -1976,7 +2038,12 @@ fn dsv4_layer_loop(
                     }
                 },
             );
-            if let Some(n) = layers.get(li + 1) {
+            // Only a following DEVICE layer needs the fold/hc slots and an
+            // uploaded state. Consecutive host layers consume `state`
+            // directly, and a final host layer is already exactly where the
+            // head needs it — uploading then reading it back was pure sync.
+            if layers.get(li + 1).is_some() && on_dev.get(li + 1).copied().unwrap_or(false) {
+                let n = &layers[li + 1];
                 let (f, p2, c2) = hc_fold_norm(
                     state,
                     &n.hc_attn_fn,
@@ -1990,9 +2057,9 @@ fn dsv4_layer_loop(
                 if !crate::gpu_wgpu::dsv4_hc_write(&p2, &c2) {
                     return false;
                 }
-            }
-            if !crate::gpu_wgpu::dsv4_state_write(state) {
-                return false;
+                if !crate::gpu_wgpu::dsv4_state_write(state) {
+                    return false;
+                }
             }
             continue;
         }
@@ -2141,6 +2208,7 @@ fn dsv4_layer_loop(
         ) {
             return false;
         }
+        state_on_host = false;
         folded = next;
         dspark_note(li, state, cfg);
     }
@@ -2159,18 +2227,23 @@ fn dsv4_layer_loop(
                     Some(state), 1, &[], need_qn, pool,
                 );
                 state_home = r;
+                state_on_host = r;
                 r
             } else {
-                dsv4_chain_run(
+                let r = dsv4_chain_run(
                     layers, &run, cfg, g, st, token_id, &mut folded, None, 1, &[], need_qn, pool,
-                )
+                );
+                if r {
+                    state_on_host = false;
+                }
+                r
             };
             if !ok {
                 return false;
             }
         }
         if st.dev_set.is_empty() {
-            st.dev_set = on_dev.clone();
+            st.dev_set = active_dev.clone();
             // The set is committed, so the card must keep it. Eviction by
             // score is right while the set is still being chosen and wrong
             // afterwards: an evicted layer drops off the card while its
@@ -2178,7 +2251,7 @@ fn dsv4_layer_loop(
             // path rather than read state from two sides.
             let mut idxs = Vec::new();
             for (li, l) in layers.iter().enumerate() {
-                if !on_dev.get(li).copied().unwrap_or(false) {
+                if !active_dev.get(li).copied().unwrap_or(false) {
                     continue;
                 }
                 for t in [&l.wq_a, &l.wq_b, &l.wkv, &l.wo_a, &l.wo_b, &l.gate] {
@@ -2198,7 +2271,7 @@ fn dsv4_layer_loop(
             // two have different fixes and reading the code cannot tell them
             // apart.
             for (li, l) in layers.iter().enumerate() {
-                if on_dev.get(li).copied().unwrap_or(false) {
+                if active_dev.get(li).copied().unwrap_or(false) {
                     continue;
                 }
                 let packed = pack_for(l, cfg, li).map_or(0, |p| p.globals.len());
@@ -2217,10 +2290,139 @@ fn dsv4_layer_loop(
             );
         }
     }
-    if state_home {
+    if state_home || state_on_host {
         return true;
     }
     crate::gpu_wgpu::dsv4_state_read(state)
+}
+
+/// Run a layer whose attention skeleton fits but only a subset of its MoE
+/// experts does. This path is selected from the live VRAM budget, never from
+/// a layer number. It is exact: routing spans all experts and cold winners
+/// are folded back into the hyper-connection state before the next layer.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn dsv4_partial_layer(
+    state: &mut [f32],
+    folded: &mut Vec<f32>,
+    layers: &[Dsv4Layer],
+    l: &Dsv4Layer,
+    cfg: &Dsv4Cfg,
+    st: &mut Dsv4State,
+    token_id: u32,
+    li: usize,
+    freqs: &[f32],
+    pool: Option<&crate::pool::Pool>,
+) -> Option<bool> {
+    let dim = cfg.dim;
+    let mut prep = AttnPrep::default();
+    let mut sink = vec![0.0f32; dim];
+    attention_step(
+        folded,
+        l,
+        cfg,
+        st,
+        li,
+        freqs,
+        pool,
+        Some(&mut prep),
+        &mut sink,
+    );
+    let hd = cfg.head_dim;
+    let n_comp = st.compressed[li].len() / hd;
+    let cap = (cfg.window + n_comp.next_power_of_two().max(64)) * hd;
+    if !crate::gpu_wgpu::dsv4_cache_write(st.kv_id, li, 0, &st.window[li], cap)
+        || (n_comp > 0
+            && !crate::gpu_wgpu::dsv4_cache_write(
+                st.kv_id,
+                li,
+                cfg.window * hd,
+                &st.compressed[li],
+                cap,
+            ))
+    {
+        return None;
+    }
+    let a_tail = crate::gpu_wgpu::Dsv4HcTail {
+        fn_: &l.hc_ffn_fn,
+        scale: &l.hc_ffn_scale,
+        base: &l.hc_ffn_base,
+        norm: &l.ffn_norm,
+        hc: cfg.hc_mult,
+        sinkhorn_iters: cfg.hc_sinkhorn_iters,
+        hc_eps: cfg.hc_eps,
+        eps: cfg.norm_eps,
+    };
+    let scale = (cfg.head_dim as f32).powf(-0.5);
+    if !attn_frame(
+        l,
+        cfg,
+        st,
+        li,
+        &prep.qr,
+        &prep.idxs,
+        freqs,
+        st.pos,
+        prep.win_len,
+        scale,
+        Some(&a_tail),
+        &mut [],
+    ) {
+        return None;
+    }
+    let nxt = layers.get(li + 1);
+    let forced = l
+        .tid2eid
+        .as_ref()
+        .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id));
+    let mut next = vec![0.0f32; dim];
+    let (cold_sum, cold_count) = moe_frame(
+        &[],
+        l,
+        cfg,
+        li,
+        &[],
+        forced.as_deref(),
+        pool,
+        Some(&a_tail),
+        // Do not pre-fold the next layer yet. That fold reuses the canonical
+        // `post` slot; a cold correction still needs THIS layer's post. Once
+        // the corrected state is home, the exact next fold is cheap on the
+        // host and seeds either another partial frame or the next full run.
+        None,
+        &mut next,
+    )?;
+    // The resident contribution has already been expanded on the device. If
+    // there were cold winners, add `post[j] * cold_sum` and retrieve the
+    // corrected state in that submission; otherwise a plain readback is
+    // enough. This state handoff is what makes partial layers composable at
+    // arbitrary positions, not just at the tail of one checkpoint.
+    let state_ok = if cold_count == 0 {
+        crate::gpu_wgpu::dsv4_state_read(state)
+    } else {
+        crate::gpu_wgpu::dsv4_state_add_cold(&cold_sum, cfg.hc_mult, state)
+    };
+    if !state_ok {
+        return None;
+    }
+    if let Some(n) = nxt {
+        let (f, post, comb) = hc_fold_norm(
+            state,
+            &n.hc_attn_fn,
+            &n.hc_attn_scale,
+            &n.hc_attn_base,
+            &n.attn_norm,
+            cfg,
+            pool,
+        );
+        *folded = f;
+        if !crate::gpu_wgpu::dsv4_hc_write(&post, &comb)
+            || !crate::gpu_wgpu::dsv4_state_write(state)
+        {
+            return None;
+        }
+    }
+    Some(true)
 }
 
 #[cfg(feature = "gpu")]
@@ -2303,14 +2505,17 @@ fn dsv4_chain_run(
     let Some(model) = layers[first].experts.first().and_then(|e| e.w1.model_arc()) else {
         return false;
     };
-    if need_qn {
+    // Batch callers seed every token's fold and qn in its own slot. Seeding
+    // the legacy shared slot here is not merely redundant: `folded` carries
+    // only the eventual LAST output and is empty before the batch runs.
+    if batch <= 1 && need_qn {
         let mut qn0 = vec![0.0f32; cfg.q_lora_rank];
         layers[first].wq_a.matvec(folded, &mut qn0, pool);
         rms_weighted(&mut qn0, &layers[first].q_norm, cfg.norm_eps);
         if !crate::gpu_wgpu::dsv4_chain_seed(folded, &qn0) {
             return false;
         }
-    } else if !crate::gpu_wgpu::dsv4_chain_seed_fold(folded) {
+    } else if batch <= 1 && !crate::gpu_wgpu::dsv4_chain_seed_fold(folded) {
         return false;
     }
 
@@ -2410,7 +2615,11 @@ fn dsv4_chain_run(
         let ew_c0 = l.compressor.as_ref().map_or(0, |cp| {
             if cp.overlap { cp.wkv.rows() / 2 } else { cp.wkv.rows() }
         });
-        let need = cfg.window * hd + (st.dev_n_comp[li] + 2) * ew_c0.max(1);
+        let comp_extra = l.compressor.as_ref().map_or(0, |cp| {
+            batch.max(1).div_ceil(cp.ratio.max(1))
+        });
+        let need = cfg.window * hd
+            + (st.dev_n_comp[li] + comp_extra + 1) * ew_c0.max(1);
         if !crate::gpu_wgpu::dsv4_cache_ensure(st.kv_id, li, need.next_power_of_two()) {
             return false;
         }
@@ -2435,7 +2644,7 @@ fn dsv4_chain_run(
                 + if l.indexer.is_some() {
                     cfg.index_topk
                 } else {
-                    st.dev_n_comp[li] + 2
+                    st.dev_n_comp[li] + comp_extra + 1
                 },
         };
         let nxt = layers.get(li + 1);
@@ -2503,12 +2712,8 @@ fn dsv4_chain_run(
 
     let mut out = vec![0.0f32; dim * batch.max(1)];
     if batch > 1 {
-        // A batch keeps its own state per token and brings every fold home in
-        // one readback; the hyper-connection state does not ride back, so a
-        // batched run cannot be the one that hands state to a host layer.
-        if state_out.is_some() {
-            return false;
-        }
+        // A batch keeps its own state per token. When a host tail follows,
+        // all of those states ride home beside the folds in the same fence.
         // One forced row per token: same layers, the hash rows re-derived
         // from each token's own id.
         let mut forced_pt: Vec<Vec<Option<Vec<usize>>>> = Vec::with_capacity(batch);
@@ -2531,7 +2736,7 @@ fn dsv4_chain_run(
         }
         if !crate::gpu_wgpu::dsv4_chain_batch(
             &model, &items, st.kv_id, first, &freqs, st.pos, batch,
-            Some(&forced_pt), &mut out,
+            Some(&forced_pt), &mut out, state_out,
         ) {
             return false;
         }
@@ -2775,7 +2980,9 @@ fn dsv4_two_frame_loop(
             .tid2eid
             .as_ref()
             .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id));
-        if !moe_frame(&[], l, cfg, li, &[], forced.as_deref(), pool, Some(&a_tail), pair, &mut next) {
+        if moe_frame(&[], l, cfg, li, &[], forced.as_deref(), pool, Some(&a_tail), pair, &mut next)
+            .is_none()
+        {
             return false;
         }
         folded = next;
@@ -2880,14 +3087,30 @@ struct Pack {
 fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pack>> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<(usize, usize), Option<Arc<Pack>>>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<(u64, usize, usize), Option<Arc<Pack>>>>> =
+        OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     // Keyed by the layer's IDENTITY, not its ordinal. The draft's three
     // stages are layers too and they number 0, 1, 2 — under an ordinal key
     // they would be handed the trunk's first three packs: another layer's
     // router, another layer's tensor indices, another layer's bias. The gate
     // tensor is what actually distinguishes them.
-    let key = (li, l.gate.model_idx().unwrap_or(usize::MAX));
+    let model_uid = l
+        .experts
+        .first()
+        .and_then(|e| e.w1.model_arc())
+        .map_or(0, |m| m.uid());
+    // Dense f32 routers need not have a directory handle, so the gate index
+    // alone can be `None` for every layer. Pair the ordinal with the first
+    // expert's mapped identity; model UID keeps long-lived multi-model
+    // servers separate, while the expert index distinguishes trunk and MTP
+    // layers that reuse ordinal 0/1/2.
+    let first_expert = l
+        .experts
+        .first()
+        .and_then(|e| e.w1.model_idx())
+        .unwrap_or(usize::MAX);
+    let key = (model_uid, li, first_expert);
     if let Some(v) = cache.lock().unwrap().get(&key) {
         return v.clone();
     }
@@ -2906,11 +3129,12 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
             .experts
             .first()
             .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
-        // `CMF_DSV4_COLD_CPU=1` packs only what fits and leaves the rest to
-        // the host. Exact on the toy at any budget, still 5.379 against the
-        // CPU's 5.211 on the release — so it is opt-in until that is closed.
-        // Off, a layer that does not fit whole declines and runs on the host,
-        // which is slower and right.
+        // Pack what fits and leave the rest to the host. The router still
+        // ranges over every expert; a missing winner is returned as a cold
+        // pick and completed on the CPU. This is deliberately budget-driven,
+        // not layer-driven: the same model scales from a small card (more
+        // partial/host layers) to a large one (all experts resident) without
+        // a checkpoint-specific cutoff.
         // `CMF_DSV4_PACK_MAX=N` caps the packing directly, so a toy can
         // reproduce the subset path without needing a card that runs out.
         if let Some(n) = std::env::var("CMF_DSV4_PACK_MAX")
@@ -2946,11 +3170,8 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
                 tensors,
             }));
         }
-        let room = if std::env::var("CMF_DSV4_COLD_CPU").is_ok_and(|v| v != "0") {
-            crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, gu_q2).saturating_sub(1)
-        } else {
-            usize::MAX
-        };
+        let room = crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, gu_q2)
+            .saturating_sub(1);
         for (gi, e) in l.experts.iter().enumerate() {
             if l.mask.as_deref().is_some_and(|m| !m.get(gi).copied().unwrap_or(true)) {
                 continue;
@@ -2977,10 +3198,14 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
             // one expert (`room` is 0, which is what a nearly-full card does
             // to the last layers).
             if room == 0 {
-                tracing::warn!(
-                    "слой {li}: в бюджете VRAM не осталось места ни под одного эксперта — \
-                     слой уходит на CPU. Поднимите CMF_GPU_VRAM_MB"
-                );
+                static SAID_ZERO: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !SAID_ZERO.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        "начиная со слоя {li}, в бюджете VRAM не осталось места даже под одного \
+                         эксперта — остальные веса остаются mmap-backed и читаются по требованию"
+                    );
+                }
             } else {
                 tracing::warn!("слой {li}: маска не оставила ни одного эксперта");
             }
@@ -3046,13 +3271,13 @@ fn moe_frame(
     hc_cur: Option<&crate::gpu_wgpu::Dsv4HcTail>,
     hc_next: Option<(&crate::gpu_wgpu::Dsv4HcTail, &[f32])>,
     out: &mut [f32],
-) -> bool {
+) -> Option<(Vec<f32>, usize)> {
     macro_rules! no {
         ($($t:tt)*) => {{
             if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
                 eprintln!("кадр MoE отклонён: {}", format_args!($($t)*));
             }
-            return false;
+            return None;
         }};
     }
     let Some(pk) = pack_for(l, cfg, li) else {
@@ -3063,10 +3288,12 @@ fn moe_frame(
     let Some(model) = l.experts.first().and_then(|e| e.w1.model_arc()) else {
         no!("слой {li}: эксперты не отображены из файла");
     };
-    // A forced expert outside the packing has nowhere to go; the hash layers
-    // name specific experts and a mask that drops one of them is a mask this
-    // layer cannot use.
+    let subset = pk.globals.len() < cfg.n_routed_experts;
+    // With a complete pack the forced row is translated to packed numbering.
+    // With a subset it stays global: the router's remap either finds its slot
+    // or returns the forced expert as a cold pick, exactly like a scored one.
     let fpack: Option<Vec<usize>> = match forced {
+        Some(f) if subset => Some(f.to_vec()),
         Some(f) => {
             let v: Vec<usize> = f.iter().map(|&g| pk.to_slot[g]).collect();
             if v.iter().any(|&s| s == usize::MAX) {
@@ -3078,7 +3305,6 @@ fn moe_frame(
     };
     // Routing ranges over EVERY expert; the remap turns a winner into a slot
     // or marks it cold. Nothing is masked, so nothing is lost.
-    let subset = pk.globals.len() < cfg.n_routed_experts;
     // Empty logits are the device-scored case: the frame computes them from
     // pk.router, whose rows are already in global order, so there is nothing
     // to reorder — and indexing an empty slice is how this line greeted the
@@ -3114,8 +3340,19 @@ fn moe_frame(
         }),
     };
     let mut cold = Vec::new();
-    if !crate::gpu_wgpu::dsv4_moe_frame(&model, &w, g, hidden, &mut cold, hc_cur, hc_next, out) {
-        return false;
+    let mut cold_x = Vec::new();
+    if !crate::gpu_wgpu::dsv4_moe_frame(
+        &model,
+        &w,
+        g,
+        hidden,
+        &mut cold,
+        &mut cold_x,
+        hc_cur,
+        hc_next,
+        out,
+    ) {
+        return None;
     }
     // The picks the card had no room for, finished here and added in. Their
     // weights already carry the top-k normalisation the device applied.
@@ -3131,14 +3368,22 @@ fn moe_frame(
         );
     }
     let mut acc = vec![0.0f32; cfg.dim];
+    let mut cold_sum = vec![0.0f32; cfg.dim];
+    let cold_input = if hidden.is_empty() { cold_x.as_slice() } else { hidden };
     for &(gi, wt) in &cold {
         let Some(exp) = l.experts.get(gi) else { continue };
-        run_expert(hidden, exp, cfg, wt, pool, &mut acc);
-        for (o, a) in out.iter_mut().zip(&acc) {
+        // Cold means out-of-core by contract. The tensors remain mmap-backed:
+        // missing pages are faulted from the CMF file and the OS may evict
+        // them again under RAM pressure. Do not let the generic matvec probe
+        // turn this into an unbounded second GPU cache behind the packer's
+        // back.
+        crate::gpu::cpu_scope(|| run_expert(cold_input, exp, cfg, wt, pool, &mut acc));
+        for ((o, sum), a) in out.iter_mut().zip(&mut cold_sum).zip(&acc) {
             *o += a;
+            *sum += a;
         }
     }
-    true
+    Some((cold_sum, cold.len()))
 }
 
 /// How much of each layer's compressed cache already sits on the card. ONE
@@ -3233,7 +3478,9 @@ pub fn moe_step(
             .tid2eid
             .as_ref()
             .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id));
-        if moe_frame(hidden, l, cfg, li, &logits, forced.as_deref(), pool, None, None, out) {
+        if moe_frame(hidden, l, cfg, li, &logits, forced.as_deref(), pool, None, None, out)
+            .is_some()
+        {
             // CMF_DSV4_MOE_CHECK=1 recomputes the same block on the CPU and
             // reports where they part. A wrong MoE does not fail — it answers
             // differently — and the toy agreed bit for bit while the release
@@ -3583,25 +3830,45 @@ fn forward_chunk_batched(
     st: &mut Dsv4State,
     ids: &[u32],
     pos0: usize,
+    inv_freq: &[f32],
     pool: Option<&crate::pool::Pool>,
     logits: &mut Vec<f32>,
+    want_logits: bool,
 ) -> bool {
     #[cfg(not(feature = "gpu"))]
     {
-        let _ = (g, layers, cfg, st, ids, pos0, pool, logits);
+        let _ = (
+            g, layers, cfg, st, ids, pos0, inv_freq, pool, logits, want_logits,
+        );
         false
     }
     #[cfg(feature = "gpu")]
     {
         let b = ids.len();
+        // The batch encoder currently requires a complete expert pack. A
+        // partial layer is still device-owned for decode, but becomes part of
+        // the causal host tail here instead of being silently treated as a
+        // full chain layer.
+        let gpu_end = st
+            .dev_set
+            .iter()
+            .enumerate()
+            .position(|(li, &on)| {
+                !on
+                    || pack_for(&layers[li], cfg, li)
+                        .is_none_or(|p| p.globals.len() < cfg.n_routed_experts)
+            })
+            .unwrap_or(st.dev_set.len());
         let why = if b < 2 {
             "токенов меньше двух"
         } else if !chain_enabled() {
             "цепочка выключена"
         } else if !st.dev_owned {
             "карта ещё не владеет состоянием"
-        } else if st.dev_set.len() != layers.len() || !st.dev_set.iter().all(|&x| x) {
-            "не все слои на карте"
+        } else if st.dev_set.len() != layers.len() {
+            "набор слоёв ещё не зафиксирован"
+        } else if gpu_end == 0 || st.dev_set[gpu_end..].iter().any(|&on| on) {
+            "слои на карте не образуют префикс"
         } else {
             ""
         };
@@ -3637,8 +3904,9 @@ fn forward_chunk_batched(
                 return false;
             }
         }
-        let run: Vec<usize> = (0..layers.len()).collect();
+        let run: Vec<usize> = (0..gpu_end).collect();
         let mut folded = Vec::new();
+        let mut states = vec![0.0f32; b * hc * dim];
         st.pos = pos0;
         if !dsv4_chain_run(
             layers,
@@ -3648,7 +3916,7 @@ fn forward_chunk_batched(
             st,
             *ids.last().unwrap(),
             &mut folded,
-            None,
+            Some(&mut states),
             b,
             ids,
             true,
@@ -3656,7 +3924,58 @@ fn forward_chunk_batched(
         ) {
             return false;
         }
-        st.pos = pos0 + b - 1;
+        // Finish the trailing host layers in causal token order. Their KV
+        // caches are host-owned, while the device prefix advanced its own
+        // caches inside the one submission above. On the release this loop
+        // is exactly layer 42; keeping it general makes smaller VRAM budgets
+        // correct as long as the resident layers remain one prefix.
+        let mut scratch = HcScratch::new(cfg);
+        for t in 0..b {
+            st.pos = pos0 + t;
+            let state = &mut states[t * hc * dim..(t + 1) * hc * dim];
+            for (li, l) in layers.iter().enumerate().skip(gpu_end) {
+                let freqs = if l.compressor.is_some() {
+                    &g.inv_freq_compress
+                } else {
+                    &g.inv_freq_window
+                };
+                let freqs = if freqs.is_empty() {
+                    inv_freq
+                } else {
+                    freqs.as_slice()
+                };
+                hc_block(
+                    state,
+                    &l.hc_attn_fn,
+                    &l.hc_attn_scale,
+                    &l.hc_attn_base,
+                    &l.attn_norm,
+                    cfg,
+                    &mut scratch,
+                    pool,
+                    |f, o| attention_step(f, l, cfg, st, li, freqs, pool, None, o),
+                );
+                hc_block(
+                    state,
+                    &l.hc_ffn_fn,
+                    &l.hc_ffn_scale,
+                    &l.hc_ffn_base,
+                    &l.ffn_norm,
+                    cfg,
+                    &mut scratch,
+                    pool,
+                    |f, o| {
+                        if host_cpu_moe() {
+                            crate::gpu::cpu_scope(|| moe_step(f, l, cfg, ids[t], li, pool, o))
+                        } else {
+                            moe_step(f, l, cfg, ids[t], li, pool, o)
+                        }
+                    },
+                );
+                dspark_note(li, state, cfg);
+            }
+        }
+        st.pos = pos0 + b;
         // Said once. A gate that compares a batched prompt against a walked
         // one proves nothing if the batch quietly declined — the numbers match
         // because the same code produced both. This line is what tells the
@@ -3666,9 +3985,27 @@ fn forward_chunk_batched(
             SAID.call_once(|| tracing::warn!("dsv4: префилл пакетами по {b}"));
         }
         // Only the last token's logits are read; the rest of the chunk exists
-        // to fill the caches.
-        logits.resize(cfg.vocab, 0.0);
-        g.head.matvec(&folded, logits, pool);
+        // to fill the caches. The head consumes the hyper-connection state,
+        // not the chain's intermediate fold — skipping this final learned
+        // fold used to make a full-device batch fast and wrong.
+        if want_logits {
+            let last = &states[(b - 1) * hc * dim..b * hc * dim];
+            let mut h = vec![0.0f32; dim];
+            hc_head_fold(
+                last,
+                &g.hc_head_fn,
+                g.hc_head_scale,
+                &g.hc_head_base,
+                cfg,
+                pool,
+                &mut h,
+            );
+            rms_weighted(&mut h, &g.norm, cfg.norm_eps);
+            logits.resize(cfg.vocab, 0.0);
+            g.head.matvec(&h, logits, pool);
+        } else {
+            logits.clear();
+        }
         true
     }
 }
@@ -3683,6 +4020,7 @@ pub fn forward_chunk(
     inv_freq: &[f32],
     pool: Option<&crate::pool::Pool>,
     logits: &mut Vec<f32>,
+    want_logits: bool,
 ) {
     let bs = batch_prefill();
     if bs > 1 {
@@ -3701,7 +4039,18 @@ pub fn forward_chunk(
         while i < ids.len() {
             let end = (i + bs).min(ids.len());
             st.pos = pos0 + i;
-            if !forward_chunk_batched(g, layers, cfg, st, &ids[i..end], pos0 + i, pool, logits) {
+            if !forward_chunk_batched(
+                g,
+                layers,
+                cfg,
+                st,
+                &ids[i..end],
+                pos0 + i,
+                inv_freq,
+                pool,
+                logits,
+                want_logits && end == ids.len(),
+            ) {
                 break;
             }
             i = end;
@@ -3712,14 +4061,14 @@ pub fn forward_chunk(
         // Refused before touching anything; the walk starts where it left off.
         for (k, &id) in ids.iter().enumerate().skip(i) {
             st.pos = pos0 + k;
-            let last = k + 1 == ids.len();
+            let last = want_logits && k + 1 == ids.len();
             forward_token_inner(g, layers, cfg, st, id, inv_freq, pool, logits, last);
         }
         return;
     }
     for (i, &id) in ids.iter().enumerate() {
         st.pos = pos0 + i;
-        let last = i + 1 == ids.len();
+        let last = want_logits && i + 1 == ids.len();
         forward_token_inner(g, layers, cfg, st, id, inv_freq, pool, logits, last);
     }
 }

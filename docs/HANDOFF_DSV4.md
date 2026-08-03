@@ -86,17 +86,27 @@ export CMF_DSV4_GPU_LAYER=1 CMF_SDOT=0 CMF_DSV4_CHAIN=1
 ./target/release/cortiq bench /content/dsv4-q2tp.cmf --tokens 128
 ```
 
-Expected: **27.2 tok/s steady, 42 of 43 layers on the card.** Perplexity gold
-is **3.282** (`cortiq ppl … --file /root/ppl.txt --tokens 128`), which equals
-the CPU exactly — any change that moves it is a defect.
+Expected on the 97887 MiB stand: **28.6 tok/s steady**. All 43 layers use the
+card: 42 have complete expert packs and the last pack contains 140/256 routed
+experts; cold winners are completed from the mmap-backed CMF on the CPU.
+Perplexity gold is **3.282** (`cortiq ppl … --file /root/ppl.txt --tokens
+128`), which equals the CPU exactly — any change that moves it is a defect.
+
+`CMF_UPLOAD_EVICT=0` above is for a hot benchmark on a machine with enough
+RAM. Omit it (the default is eviction) for the out-of-core production mode:
+pages uploaded to a discrete GPU are dropped from the host page cache, and a
+later cold expert faults only its own ranges back from the CMF file. The 112
+GB model is always mmap-backed; it is not copied into a 112 GB heap buffer.
 
 `CMF_GPU_VRAM_MB` also emulates a smaller card, which is how the degradation
 ladder below was measured without owning one.
 
 ## 4. Where the time goes
 
-Per token, 36.8 ms total: chain 30.5 ms of GPU + 1.3 ms host encode, plus
-5.0 ms for layer 42, which does not fit on the card and runs on the host.
+Per token, about 35.0 ms total. The 42-layer full chain is 1.39 ms host encode
+and 28.03 ms wait. The final layer is a budget-sized partial GPU layer; only
+its non-resident selected experts run on the CPU. This replaced the previous
+whole host layer and moved 27.2 to 28.6 tok/s while keeping PPL 3.282.
 
 Inside the chain: hyper-connection glue 4.14, compressors 2.90, gate/up 2.49,
 down 2.47, attention 1.80, o_lora 1.40, q-proj 1.37, indexer 1.36, wo_b 1.24,
@@ -108,10 +118,13 @@ Degradation by VRAM (emulated):
 
 | budget | layers on card | tok/s |
 |---|---|---|
-| 96500 | 42/43 | 27.2 |
+| 96500 | 42 full + 1 partial (140/256) | 28.6 |
 | 48000 | 21/43 | 4.7 |
 | 24000 | 10/43 | 3.8 |
 | CPU only | 0/43 | 2.1 |
+
+The sub-96-GB rows predate adaptive partial packs and are historical; re-run
+them before using them as current capacity-planning numbers.
 
 ## 5. The speed target and why it is where it is
 
@@ -132,13 +145,14 @@ distinct tokens beside any acceptance number.)
 Cost model, measured rather than assumed:
 
 ```
-verify(B) = 36.8 + (4.1 + h43) * (B - 1)
+verify(B) = 35.0 + marginal_batch_cost * (B - 1)
 ```
 
-4.1 ms is the marginal weight traffic of an extra token (2.4 GB of
-projections plus 1.66 GB of distinct experts at the ~1 TB/s the kernels
-achieve). `h43` is layer 42's per-token host cost, about 5 ms, and nobody has
-measured whether grouping it across a batch helps.
+The earlier 4.1 ms marginal estimate came from isolated q4tp batch kernels.
+It does **not** describe the current production batch: the B=5 frame records
+most token bodies separately and relies on L2. On a persistent server a
+64-token prompt measured 2421 ms at B=1 and 2615 ms at B=5. Keep B=1 as the
+default until the large projections and MoE bodies use real B-axis kernels.
 
 With the draft on the host (~36 ms) there is no gain. With the draft on the
 card (~10 ms) it is about 38 tok/s. With the draft AND layer 42 on the card
@@ -149,26 +163,14 @@ card the whole thing fits.
 
 ## 6. Open problems, in the order they should be taken
 
-### 6.1 The batched prefill does not run — find its entry point
+### 6.1 Make the production batch a real weight-sharing batch
 
-This is the immediate blocker and it is small.
-
-`dsv4::forward_chunk` has a batched path (`CMF_DSV4_BATCH=N`,
-`forward_chunk_batched`) that sends N prompt tokens through the card in one
-submission. Everything under it is written and green: per-token buffers,
-per-token seeding, per-token forced expert rows for hash layers, the batched
-chain itself.
-
-**It has never executed.** Neither its "batching by N" line nor its refusal
-line appears — under `cortiq ppl` or under `cortiq run`, at any batch width,
-and not because of the log level (both were switched to `warn!` to rule that
-out). So `forward_chunk` is not on the prompt path at all.
-
-`pipeline.rs` has a chunked dsv4 prompt loop around line 1660 guarded by
-`self.dsv4.is_some() && mtp.is_none() && pos < input_ids.len() && !cancel`,
-and a separate generic batched path above it gated on `CMF_BATCH_K`. One of
-them is being taken, or the prompt is consumed before either. Find which,
-and put the batch there.
+The production entry point is connected and B=1/B=5 greedy parity is exact.
+Per-token state, positions, forced hash rows and cache growth are separated;
+q and next-q use the real q4tp batch kernel. That is correctness scaffolding,
+not yet acceleration: B=5 is 8% slower on a hot 64-token prompt. Convert the
+large projections and selected-expert bodies to true B-axis kernels before
+enabling it by default.
 
 Beware: **two checks in this area have already been vacuous.** The gate
 compared a batched prompt against a walked one and reported agreement while
@@ -177,12 +179,15 @@ of a fast path against a reference must first prove the fast path executed —
 `tools/dsv4_toy_gate.sh` now demands that and prints NOT TESTED otherwise.
 Keep it that way.
 
-### 6.2 Measure h43
+### 6.2 Improve partial-pack selection and cold completion
 
-Layer 42's MoE on the host costs about 4 ms a token. Grouping the batch's
-tokens by chosen expert should cut it — 16 distinct experts per layer across
-5 tokens against 28 picks was measured — but it has not been implemented or
-timed. `h43` decides whether speculation lands near 38 or near 45.
+The packer now adapts to the live VRAM budget for every layer. It reserves
+workspace, flushes upload staging per projection, routes over all experts,
+returns cold scored or hash-forced winners, and applies their exact
+`post[j] * cold` correction before the next layer. The simple policy packs
+the first N expert IDs. A frequency-aware stable pack (or an evictable,
+reusable disk-to-GPU cold slot) is the next improvement; do not grow an
+unbounded second GPU cache.
 
 ### 6.3 Speculative verify and its state transaction
 
@@ -194,14 +199,13 @@ Test rejections of length 0 through 5, at a compressor ratio boundary, and at
 a window wrap, and check that the next ordinary token matches the sequential
 reference afterwards.
 
-### 6.4 The 43rd layer
+### 6.4 Out-of-core ownership (implemented; keep it invariant)
 
-It needs 2184 MB and there is not that much free. `pack_for` plans all 256 of
-its experts, so the partial-pack path (`CMF_DSV4_COLD_CPU=1`) never engages
-for it. That path is exact — PPL 3.282 with it and without — but measured
-SLOWER where it does engage (3.5 against 3.9 tok/s on an emulated 24 GB
-card), because a cold pick forces a fence per layer per token. Do not expect
-it to fix anything without solving the fence.
+There is no layer-number cutoff and no requirement that the model fit in RAM
+or VRAM. Full GPU runs are chained; partial layers use resident experts plus
+mmap-backed CPU completion; layers with no room remain wholly mmap-backed.
+The pack cache key is `(model_uid, ordinal, first_expert_idx)`, so long-lived
+multi-model servers and MTP stages cannot inherit another layer's pack.
 
 ### 6.5 The unattributed 8 ms
 
