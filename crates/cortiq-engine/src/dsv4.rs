@@ -1854,10 +1854,26 @@ fn dsv4_layer_loop(
     {
         return false;
     }
-    // The device-owned set must not move once a token has run on it.
+    // The device-owned set must not move once a token has run on it — but
+    // the two directions are not the same risk. At a tight budget the set
+    // GROWS between tokens as more weights finish uploading, and a layer that
+    // merely joined can be left on the host: its caches are there and nothing
+    // is inconsistent. Refusing on that was costing the whole fast path once
+    // per token — 125 times in a 48-token run on an emulated 24 GB card, on
+    // which the engine is slow enough already.
+    //
+    // A layer LEAVING the set is the dangerous direction: its caches are on
+    // the card and the host would advance its own. That still refuses.
     if st.dev_owned && st.dev_set != on_dev {
-        tracing::warn!("состав слоёв на карте изменился — кеши на разных сторонах");
-        return false;
+        let left: Vec<usize> = (0..on_dev.len().min(st.dev_set.len()))
+            .filter(|&i| st.dev_set[i] && !on_dev[i])
+            .collect();
+        if !left.is_empty() {
+            tracing::warn!("слои {left:?} ушли с карты — кеши на разных сторонах");
+            return false;
+        }
+        let n = st.dev_set.len().min(on_dev.len());
+        on_dev[..n].copy_from_slice(&st.dev_set[..n]);
     }
     let chain = chain_enabled();
     // CMF_DSV4_LAYERS_PROBE=N — TIMING ONLY, the answer is garbage. Runs the
