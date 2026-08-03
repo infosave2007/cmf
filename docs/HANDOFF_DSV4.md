@@ -164,6 +164,52 @@ in q4tp (about 5.4 after requantising to q2tp) and layer 42 needs 2.18 GB,
 against roughly 3.3 GB physically free. **Short by 4-5 GB.** On a ~110 GB
 card the whole thing fits.
 
+## 5a. State after the speculative-decode session (2026-08-03, commits d7431ea + 7374e34)
+
+What now exists and is measured on the stand:
+
+- **The batch is a token-axis frame** (`dsv4_chain_batch_bt`, `CMF_DSV4_BT=0`
+  reverts): glue, MoE and projections carry the token on a grid axis; prep
+  and attention stay per token in causal order, because a full window SHIFTS
+  on append and an attend must read the cache as of its own token. Text
+  parity against the walk holds on ten toy stands (widths 3 and 5,
+  multi-chunk) and on the release checkpoint. Speed did NOT move
+  (verify(5) ≈ 181 ms ≈ the old 204): the pass is dispatch-latency-bound at
+  ~60 µs a dispatch, and the per-token attention interleave keeps the count
+  high. The fix is a STAGED-append batch — batch appends into staging rows
+  at the cache tail, per-token index lists built on the host, every attend
+  batched, one shift-by-k at commit. NB: naive ring-slot writes are wrong at
+  a full window (token t' destroys a row inside earlier token t's view).
+- **The draft runs on the card**: `CMF_DSPARK_GPU=1` +
+  `CMF_DSPARK_PACK=<freq.tsv>` + `CMF_DSPARK_RESIDENT=64` packs the top-64
+  experts per stage by measured frequency (masked routing — acceptance
+  pays, correctness never does) and `dspark_graph` runs all three stages ×
+  five positions in one submission. **11.1 ms a block** (was 156–176 on the
+  CPU tier), acceptance intact: 0.99/5 natural, 4.77/5 on the bench prompt.
+  The markov bigram is NOT optional (without it 1.02 → 0.42) and rides on
+  the host over the one B-wide head submission. VRAM: the pack needs
+  `CMF_DSV4_PACK_MAX_LI=40` (two host tail layers) at budget 96500; budget
+  97200 was a real device OOM again.
+- **The speculative loop is wired**: `CMF_DSV4_SPEC=1` (greedy only,
+  default off). Verify = one batched pass over `[t_next, drafts...]`;
+  rollback = device photograph restore + replay of accepted tokens' state
+  appends from retained hiddens + host-tail re-walk (`gpu_spec_txn` pins
+  six all-rejected rounds at drift ≤ 2e-3).
+- **The honesty line**: the speculative output is greedy-equivalent to
+  ROUND-OFF, not bit-identical. One ulp of reassociation survives in the
+  attention half (x2 after one device layer differs by 8.9e-8 with MoE
+  skipped; near-tied expert selection amplifies it). Measured on the
+  natural prompt: ~110 tokens of exact agreement, then a near-tie flip.
+  PPL is untouched (ppl never speculates). Chasing the ulp further needs a
+  two-process buffer diff — the in-process one is poisoned by the shared
+  frame-buffer pool.
+- **Where the clock stands**: walk bench 24.6 tok/s at PACK_MAX_LI=40
+  (30.2 at the canonical 96500/41 config without the draft pack), spec
+  bench 24.5 — break-even, entirely because verify(5) ≈ 181 ms against the
+  11 ms draft. With the staged-append batch bringing verify(5) to 60–90 ms
+  the bench lands at 40–55 tok/s (acceptance 4.77). Natural text stays near
+  baseline (tokens/pass ≈ 2.0) — speculation pays on predictable text.
+
 ## 6. Open problems, in the order they should be taken
 
 ### 6.1 Make the production batch a real weight-sharing batch
