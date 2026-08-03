@@ -4262,6 +4262,19 @@ fn draft_probe() -> bool {
         drafted: &mut usize,
         accepted_ctr: &mut usize,
     ) -> Option<(Vec<u32>, usize)> {
+        let t_all = std::time::Instant::now();
+        if std::env::var("CMF_DSV4_SPEC_TIME").is_ok() {
+            thread_local! {
+                static LAST: std::cell::Cell<Option<std::time::Instant>> =
+                    const { std::cell::Cell::new(None) };
+            }
+            LAST.with(|l| {
+                if let Some(prev) = l.get() {
+                    eprintln!("между раундами {:.1} мс", prev.elapsed().as_secs_f64() * 1e3);
+                }
+                l.set(Some(std::time::Instant::now()));
+            });
+        }
         if std::env::var("CMF_DSV4_SPEC_DEBUG").is_ok() {
             eprintln!("spec_step: вход pos={next_pos}");
         }
@@ -4442,6 +4455,9 @@ fn draft_probe() -> bool {
         }
         let row = logits_all[(accepted - 1) * cfg.vocab..accepted * cfg.vocab].to_vec();
         self.graph_logits = Some(row);
+        if std::env::var("CMF_DSV4_SPEC_TIME").is_ok() {
+            eprintln!("spec_step total {:.1} мс (k={accepted})", t_all.elapsed().as_secs_f64() * 1e3);
+        }
         Some((fed[1..accepted].to_vec(), next_pos + accepted))
     }
 
