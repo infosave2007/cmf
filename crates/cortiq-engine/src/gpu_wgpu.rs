@@ -5040,20 +5040,44 @@ fn sparse_attend_part(@builtin(workgroup_id) wid: vec3<u32>,
     }
     let len = hi - lo;
 
-    // 1. this chunk's scores, and its own max
-    var mx = -3.0e38;
-    var t = lid;
+    // 1. this chunk's scores.
+    //
+    // THIRTY-TWO THREADS TO A POSITION, not one. A thread that owns a whole
+    // position reads its 512-float row by itself while its neighbour reads a
+    // row two kilobytes away: every load is its own cache line and the
+    // workgroup coalesces nothing. Splitting across k instead means the 32
+    // threads of a group ask for 32 CONSECUTIVE floats at a time, which is
+    // one transaction — and the head's positions are then done eight at a
+    // time instead of 256, which costs a barrier per eight and is worth it.
+    let lane = lid % 32u;
+    let grp = lid / 32u;
+    var t = grp;
     loop {
         if (t >= len) { break; }
         let p = sp_idx[lo + t];
         var d = 0.0;
-        for (var k = 0u; k < hd; k = k + 1u) {
+        var k = lane;
+        loop {
+            if (k >= hd) { break; }
             d = d + sp_q[qb + k] * sp_kv[p * hd + k];
+            k = k + 32u;
         }
-        let sc = d * sp_p.scale;
-        sp_w[t] = sc;
-        mx = max(mx, sc);
-        t = t + 256u;
+        sp_red[lid] = d;
+        workgroupBarrier();
+        if (lane == 0u) {
+            var sd = 0.0;
+            for (var j = 0u; j < 32u; j = j + 1u) { sd = sd + sp_red[grp * 32u + j]; }
+            sp_w[t] = sd * sp_p.scale;
+        }
+        workgroupBarrier();
+        t = t + 8u;
+    }
+    var mx = -3.0e38;
+    var t2 = lid;
+    loop {
+        if (t2 >= len) { break; }
+        mx = max(mx, sp_w[t2]);
+        t2 = t2 + 256u;
     }
     sp_red[lid] = mx;
     workgroupBarrier();
