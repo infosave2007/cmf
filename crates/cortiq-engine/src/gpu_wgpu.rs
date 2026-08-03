@@ -17040,12 +17040,19 @@ pub struct Dsv4Prep<'a> {
 /// place, so the delta in tok/s is that stage's real share of the token.
 /// Neither dispatch counting nor pass counting predicted the frame
 /// correctly on the qwen graph; there is no reason to trust them here.
-/// `CMF_DSV4_HCFUSE=0` reverts the fused hyper-connection join to its four
-/// dispatches — the bisect handle for a kernel that folds four steps and a
-/// Sinkhorn into one workgroup.
+/// `CMF_DSV4_HCFUSE=1` runs the fused hyper-connection join — four steps and
+/// a Sinkhorn in ONE workgroup instead of four dispatches.
+///
+/// OFF by default, because it was MEASURED and it loses. The arithmetic
+/// argument was right and the conclusion was wrong: 336 launches a token is
+/// real, but so is the mix projection — 24 outputs over hc·dim = 16 384
+/// inputs, 1.5 MB of weights — and putting that through one workgroup uses
+/// one SM of two hundred. On the release the chain's wait went 51.6 → 84.5
+/// ms and decode 16.5 → 10.6 tok/s. Kept, and kept switchable, because the
+/// same kernel wins wherever launches dominate and the mix is small.
 fn hc_fuse() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_DSV4_HCFUSE").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_HCFUSE").is_ok_and(|v| v != "0"))
 }
 
 fn dsv4_skip(what: &str) -> bool {
@@ -17265,23 +17272,23 @@ fn dsv4_layer_frame_enc(
         }
 
         // ── expand, then prepare the NEXT layer ──
-        encode_hc_expand_k_p(&mut pass, c, &mo, &state2, &hpost, &hcomb, &state, &hcp, hc, dim,
-            (124, kv_id, li));
+        let fused_next = hc_fuse() && w.hc_next_fn.is_some();
+        if !fused_next {
+            encode_hc_expand_k_p(&mut pass, c, &mo, &state2, &hpost, &hcomb, &state, &hcp,
+                hc, dim, (124, kv_id, li));
+        }
         if let Some(nf) = w.hc_next_fn {
             let nfn = const_buf(c, bytemuck::cast_slice(nf));
             let nsc = const_buf(c, bytemuck::cast_slice(w.hc_next_scale));
             let nbs = const_buf(c, bytemuck::cast_slice(&w.hc_next_base[..mix_hc]));
-            if hc_fuse() {
-                // The expand for this half already ran above (it writes the
-                // state the MoE half consumed), so only mix, fold and norm
-                // are left — the fused kernel would redo the expand from a
-                // state it just produced. Three dispatches stay three.
-                encode_f32matvec_k_p(&mut pass, c, &nfn, &state, &mixes, mix_hc, hc * dim,
-                    (125, kv_id, li));
-                encode_hc_fold_k_p(&mut pass, c, &state, &mixes, &nsc, &nbs, &folded, &hpost,
-                    &hcomb, &hcp, (126, kv_id, li));
-                encode_rmsnorm_p(&mut pass, c, &folded, &next_nw, &x2, dim, a.eps,
-                    (51, kv_id, li));
+            if fused_next {
+                // The same four steps as the FFN half, for the next layer's
+                // attention: expand the MoE output into the state, mix, fold,
+                // norm. The expand above is folded in here, which is why it
+                // is skipped when this branch runs.
+                encode_hc_block_p(&mut pass, c, &mo, &state2, &hpost, &hcomb, &nfn, &nsc,
+                    &nbs, &next_nw, &state, &folded, &x2, hc, dim, mix_hc, g.sinkhorn_iters,
+                    a.eps, (174, kv_id, li));
             } else {
             encode_f32matvec_k_p(&mut pass, c, &nfn, &state, &mixes, mix_hc, hc * dim,
                 (125, kv_id, li));
