@@ -6420,6 +6420,663 @@ fn hc_post_expand(@builtin(global_invocation_id) gid: vec3<u32>) {
     he_out[i] = y;
 }
 
+// ── Token-axis twins for the DeepSeek-V4 batched frame ─────────────────────
+//
+// The batch used to encode one FRAME per token: at B=5 that is five times the
+// dispatches of a single token, and the chain is launch-latency-bound, so the
+// batch was slower per token than the walk. These twins carry the token on a
+// grid axis instead: per-token operands live in ONE buffer strided by the
+// token, weights are read once per dispatch. Every kernel is an arithmetic
+// copy of its single-token original — same add order, same tie-breaks — so
+// greedy parity carries over term for term.
+
+// rope_heads with grid (head, token): x is [b, nh*hd], the position comes
+// from a per-token table instead of a uniform.
+@group(0) @binding(0) var<storage, read_write> br_x    : array<f32>;
+@group(0) @binding(1) var<storage, read>       br_freq : array<f32>;
+@group(0) @binding(2) var<uniform>             br_p    : RpP;
+@group(0) @binding(3) var<storage, read>       br_meta : array<vec2<f32>>;  // [pos, eps] per token
+var<workgroup> br_red: array<f32, 256>;
+@compute @workgroup_size(256)
+fn bt_rope_heads(@builtin(workgroup_id) wid: vec3<u32>,
+                 @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    let t = wid.y;
+    if (h >= br_p.nh) { return; }
+    let hd = br_p.hd;
+    let rd = br_p.rd;
+    let b = t * br_p.nh * hd + h * hd;
+    if ((br_p.flags & 1u) != 0u) {
+        var acc = 0.0;
+        var i = lid;
+        loop {
+            if (i >= hd) { break; }
+            let v = br_x[b + i];
+            acc = acc + v * v;
+            i = i + 256u;
+        }
+        br_red[lid] = acc;
+        workgroupBarrier();
+        var stride = 128u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid < stride) { br_red[lid] = br_red[lid] + br_red[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        let inv = inverseSqrt(br_red[0] / f32(hd) + br_meta[t].y);
+        workgroupBarrier();
+        var j = lid;
+        loop {
+            if (j >= hd) { break; }
+            br_x[b + j] = br_x[b + j] * inv;
+            j = j + 256u;
+        }
+        workgroupBarrier();
+    }
+    let base = b + hd - rd;
+    let pos = br_meta[t].x;
+    var tt = lid;
+    loop {
+        if (tt >= rd / 2u) { break; }
+        let th = pos * br_freq[tt];
+        var sn = sin(th);
+        let cs = cos(th);
+        if ((br_p.flags & 2u) != 0u) { sn = -sn; }
+        let a = br_x[base + 2u * tt];
+        let c = br_x[base + 2u * tt + 1u];
+        br_x[base + 2u * tt] = a * cs - c * sn;
+        br_x[base + 2u * tt + 1u] = a * sn + c * cs;
+        tt = tt + 256u;
+    }
+}
+
+// hc_pre_fold with grid (token): all per-token operands strided.
+// `hc_p._a` carries mix_hc (the mixes stride).
+@group(0) @binding(0) var<storage, read>       bhf_state : array<f32>;   // b, hc*dim
+@group(0) @binding(1) var<storage, read>       bhf_mix   : array<f32>;   // b, mix_hc
+@group(0) @binding(2) var<storage, read>       bhf_sc    : array<f32>;   // 3
+@group(0) @binding(3) var<storage, read>       bhf_base  : array<f32>;   // mix_hc
+@group(0) @binding(4) var<storage, read_write> bhf_fold  : array<f32>;   // b, dim
+@group(0) @binding(5) var<storage, read_write> bhf_post  : array<f32>;   // b, hc
+@group(0) @binding(6) var<storage, read_write> bhf_comb  : array<f32>;   // b, hc*hc
+@group(0) @binding(7) var<uniform>             bhf_p     : HcP;
+@group(0) @binding(8) var<storage, read>       bhf_nw    : array<f32>;   // dim
+@group(0) @binding(9) var<storage, read_write> bhf_out   : array<f32>;   // b, dim
+var<workgroup> bhf_red: array<f32, 1024>;
+var<workgroup> bhf_pre_w: array<f32, 8>;
+var<workgroup> bhf_cmb_w: array<f32, 64>;
+var<workgroup> bhf_rsq: f32;
+@compute @workgroup_size(1024)
+fn bt_hc_pre_fold(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let hc = bhf_p.hc;
+    let dim = bhf_p.dim;
+    let n = hc * dim;
+    let t = wid.x;
+    let sb = t * n;
+    let mb = t * bhf_p._a;
+    var acc = 0.0;
+    var i = lid;
+    loop {
+        if (i >= n) { break; }
+        let v = bhf_state[sb + i];
+        acc = acc + v * v;
+        i = i + 1024u;
+    }
+    bhf_red[lid] = acc;
+    workgroupBarrier();
+    var stride = 512u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { bhf_red[lid] = bhf_red[lid] + bhf_red[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) {
+        bhf_rsq = inverseSqrt(bhf_red[0] / f32(n) + bhf_p.eps);
+    }
+    workgroupBarrier();
+    let rsq = bhf_rsq;
+    if (lid == 0u) {
+        for (var j = 0u; j < hc; j = j + 1u) {
+            let m = bhf_mix[mb + j] * rsq * bhf_sc[0] + bhf_base[j];
+            bhf_pre_w[j] = 1.0 / (1.0 + exp(-m)) + bhf_p.eps;
+            let m2 = bhf_mix[mb + hc + j] * rsq * bhf_sc[1] + bhf_base[hc + j];
+            bhf_post[t * hc + j] = 2.0 / (1.0 + exp(-m2));
+        }
+        for (var j = 0u; j < hc; j = j + 1u) {
+            var mx = -1e30;
+            for (var k = 0u; k < hc; k = k + 1u) {
+                let v = bhf_mix[mb + 2u * hc + j * hc + k] * rsq * bhf_sc[2]
+                      + bhf_base[2u * hc + j * hc + k];
+                bhf_cmb_w[j * hc + k] = v;
+                mx = max(mx, v);
+            }
+            var sum = 0.0;
+            for (var k = 0u; k < hc; k = k + 1u) {
+                let e = exp(bhf_cmb_w[j * hc + k] - mx);
+                bhf_cmb_w[j * hc + k] = e;
+                sum = sum + e;
+            }
+            for (var k = 0u; k < hc; k = k + 1u) {
+                bhf_cmb_w[j * hc + k] = bhf_cmb_w[j * hc + k] / sum + bhf_p.eps;
+            }
+        }
+        for (var k = 0u; k < hc; k = k + 1u) {
+            var sum = 0.0;
+            for (var j = 0u; j < hc; j = j + 1u) { sum = sum + bhf_cmb_w[j * hc + k]; }
+            for (var j = 0u; j < hc; j = j + 1u) {
+                bhf_cmb_w[j * hc + k] = bhf_cmb_w[j * hc + k] / (sum + bhf_p.eps);
+            }
+        }
+        for (var it = 1u; it < bhf_p.iters; it = it + 1u) {
+            for (var j = 0u; j < hc; j = j + 1u) {
+                var sum = 0.0;
+                for (var k = 0u; k < hc; k = k + 1u) { sum = sum + bhf_cmb_w[j * hc + k]; }
+                for (var k = 0u; k < hc; k = k + 1u) {
+                    bhf_cmb_w[j * hc + k] = bhf_cmb_w[j * hc + k] / (sum + bhf_p.eps);
+                }
+            }
+            for (var k = 0u; k < hc; k = k + 1u) {
+                var sum = 0.0;
+                for (var j = 0u; j < hc; j = j + 1u) { sum = sum + bhf_cmb_w[j * hc + k]; }
+                for (var j = 0u; j < hc; j = j + 1u) {
+                    bhf_cmb_w[j * hc + k] = bhf_cmb_w[j * hc + k] / (sum + bhf_p.eps);
+                }
+            }
+        }
+        for (var j = 0u; j < hc * hc; j = j + 1u) { bhf_comb[t * hc * hc + j] = bhf_cmb_w[j]; }
+    }
+    workgroupBarrier();
+    var acc3 = 0.0;
+    var d = lid;
+    loop {
+        if (d >= dim) { break; }
+        var y = 0.0;
+        for (var j = 0u; j < hc; j = j + 1u) {
+            y = y + bhf_pre_w[j] * bhf_state[sb + j * dim + d];
+        }
+        bhf_fold[t * dim + d] = y;
+        acc3 = acc3 + y * y;
+        d = d + 1024u;
+    }
+    if (bhf_p.nrm == 0u) { return; }
+    bhf_red[lid] = acc3;
+    workgroupBarrier();
+    var st2 = 512u;
+    loop {
+        if (st2 == 0u) { break; }
+        if (lid < st2) { bhf_red[lid] = bhf_red[lid] + bhf_red[lid + st2]; }
+        workgroupBarrier();
+        st2 = st2 >> 1u;
+    }
+    let inv = inverseSqrt(bhf_red[0] / f32(dim) + bhf_p.eps);
+    var d2 = lid;
+    loop {
+        if (d2 >= dim) { break; }
+        bhf_out[t * dim + d2] = bhf_fold[t * dim + d2] * inv * bhf_nw[d2];
+        d2 = d2 + 1024u;
+    }
+}
+
+// hc_post_expand with grid (ceil(hc*dim/256), token).
+@group(0) @binding(0) var<storage, read>       bhe_x    : array<f32>;   // b, dim
+@group(0) @binding(1) var<storage, read>       bhe_res  : array<f32>;   // b, hc*dim
+@group(0) @binding(2) var<storage, read>       bhe_post : array<f32>;   // b, hc
+@group(0) @binding(3) var<storage, read>       bhe_comb : array<f32>;   // b, hc*hc
+@group(0) @binding(4) var<storage, read_write> bhe_out  : array<f32>;   // b, hc*dim
+@group(0) @binding(5) var<uniform>             bhe_p    : HcP;
+@compute @workgroup_size(256)
+fn bt_hc_post_expand(@builtin(workgroup_id) wid: vec3<u32>,
+                     @builtin(local_invocation_id) lid: vec3<u32>) {
+    let hc = bhe_p.hc;
+    let dim = bhe_p.dim;
+    let i = wid.x * 256u + lid.x;
+    if (i >= hc * dim) { return; }
+    let t = wid.y;
+    let j = i / dim;
+    let d = i % dim;
+    var y = bhe_post[t * hc + j] * bhe_x[t * dim + d];
+    for (var k = 0u; k < hc; k = k + 1u) {
+        y = y + bhe_comb[t * hc * hc + k * hc + j] * bhe_res[t * hc * dim + k * dim + d];
+    }
+    bhe_out[t * hc * dim + i] = y;
+}
+
+// f32_matvec_w with grid (row, token): the weight is read for the whole
+// batch, x and y stride by the token.
+@group(0) @binding(0) var<storage, read>       bfw_w : array<f32>;
+@group(0) @binding(1) var<storage, read>       bfw_x : array<f32>;   // b, cols
+@group(0) @binding(2) var<storage, read_write> bfw_y : array<f32>;   // b, rows
+@group(0) @binding(3) var<uniform>             bfw_p : F32WP;
+var<workgroup> bfw_part: array<f32, 256>;
+@compute @workgroup_size(256)
+fn bt_f32_matvec_w(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    if (row >= bfw_p.rows) { return; }
+    let t = wid.y;
+    let base = row * bfw_p.cols;
+    let xb = t * bfw_p.cols;
+    var acc = 0.0;
+    var i = lid;
+    loop {
+        if (i >= bfw_p.cols) { break; }
+        acc = acc + bfw_w[base + i] * bfw_x[xb + i];
+        i = i + 256u;
+    }
+    bfw_part[lid] = acc;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { bfw_part[lid] = bfw_part[lid] + bfw_part[lid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (lid == 0u) { bfw_y[t * bfw_p.rows + row] = bfw_part[0]; }
+}
+
+// f32_matvec_x with grid (row, token): the 1024-thread tree of the walk's
+// few-row path, unchanged — the batch must reduce in the SAME order or a
+// near-tied indexer top-k flips and the verified text is not the walked one.
+@group(0) @binding(0) var<storage, read>       bfx_w : array<f32>;
+@group(0) @binding(1) var<storage, read>       bfx_x : array<f32>;   // b, cols
+@group(0) @binding(2) var<storage, read_write> bfx_y : array<f32>;   // b, rows
+@group(0) @binding(3) var<uniform>             bfx_p : F32WP;
+var<workgroup> bfx_part: array<f32, 1024>;
+@compute @workgroup_size(1024)
+fn bt_f32_matvec_x(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    if (row >= bfx_p.rows) { return; }
+    let t = wid.y;
+    let base = row * bfx_p.cols;
+    let xb = t * bfx_p.cols;
+    var acc = 0.0;
+    var i = lid;
+    loop {
+        if (i >= bfx_p.cols) { break; }
+        acc = acc + bfx_w[base + i] * bfx_x[xb + i];
+        i = i + 1024u;
+    }
+    bfx_part[lid] = acc;
+    workgroupBarrier();
+    var stride = 512u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { bfx_part[lid] = bfx_part[lid] + bfx_part[lid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (lid == 0u) { bfx_y[t * bfx_p.rows + row] = bfx_part[0]; }
+}
+
+// moe_route with grid (token): logits, winners, weights, counts, forced rows
+// and cold mirrors all stride by the token; the bias, mask and slot map are
+// the layer's and shared.
+@group(0) @binding(0) var<storage, read>       bt_s      : array<f32>;   // b, n
+@group(0) @binding(1) var<storage, read>       bt_bias   : array<f32>;   // n
+@group(0) @binding(2) var<storage, read>       bt_mask   : array<u32>;   // n
+@group(0) @binding(3) var<storage, read>       bt_forced : array<u32>;   // b, top_k
+@group(0) @binding(4) var<storage, read_write> bt_idx    : array<u32>;   // b, top_k+1
+@group(0) @binding(5) var<storage, read_write> bt_w      : array<f32>;   // b, top_k+1
+@group(0) @binding(6) var<storage, read_write> bt_cnt    : array<u32>;   // b
+@group(0) @binding(7) var<uniform>             bt_p      : RtP;
+@group(0) @binding(8) var<storage, read>       bt_map    : array<u32>;   // n
+@group(0) @binding(9) var<storage, read_write> bt_cold   : array<u32>;   // b, 4*top_k
+var<workgroup> btr_sc:   array<f32, 1024>;
+var<workgroup> btr_sh:   array<f32, 1024>;
+var<workgroup> btr_used: array<u32, 64>;
+@compute @workgroup_size(1024)
+fn bt_moe_route(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32) {
+    let n = bt_p.n;
+    let k = bt_p.top_k;
+    let t = wid.x;
+    let lb = t * n;
+    let ob = t * (k + 1u);
+    let cb = t * 4u * k;
+    let has_bias = (bt_p.flags & 1u) != 0u;
+    let has_mask = (bt_p.flags & 2u) != 0u;
+    let forced = (bt_p.flags & 4u) != 0u;
+    let pin_shared = (bt_p.flags & 8u) != 0u;
+    let subset = (bt_p.flags & 16u) != 0u;
+    if (lid < k) {
+        btr_used[lid] = 0u;
+        bt_idx[ob + lid] = 0u;
+        bt_w[ob + lid] = 0.0;
+        bt_cold[cb + 2u * lid] = 0xFFFFFFFFu;
+        bt_cold[cb + 2u * lid + 1u] = 0u;
+        bt_cold[cb + 2u * k + 2u * lid] = 0xFFFFFFFFu;
+        bt_cold[cb + 2u * k + 2u * lid + 1u] = 0u;
+    }
+    let shared_slot = bt_p.flags >> 8u;
+    if (pin_shared && lid == 0u) {
+        bt_idx[ob + k] = shared_slot;
+        bt_w[ob + k] = 1.0;
+    }
+    storageBarrier();
+    var i = lid;
+    loop {
+        if (i >= n) { break; }
+        let v = bt_s[lb + i];
+        var sp = v;
+        if (v <= 20.0) { sp = log(1.0 + exp(v)); }
+        let sc = sqrt(sp);
+        btr_sc[i] = sc;
+        var sh = sc;
+        if (has_bias) { sh = sh + bt_bias[i]; }
+        if (has_mask && bt_mask[i] == 0u) { sh = KP_NINF; }
+        btr_sh[i] = sh;
+        i = i + 1024u;
+    }
+    workgroupBarrier();
+    if (forced) {
+        if (lid < k) {
+            let e = bt_forced[t * k + lid];
+            var w = 0.0;
+            if (e < n) { w = btr_sc[e]; }
+            if (subset && e < n) {
+                let slot = bt_map[e];
+                if (slot == 0xFFFFFFFFu) {
+                    bt_idx[ob + lid] = 0u;
+                    bt_w[ob + lid] = 0.0;
+                    bt_cold[cb + 2u * lid] = e;
+                    bt_cold[cb + 2u * lid + 1u] = bitcast<u32>(w);
+                } else {
+                    bt_idx[ob + lid] = slot;
+                    bt_w[ob + lid] = w;
+                }
+            } else {
+                bt_idx[ob + lid] = e;
+                bt_w[ob + lid] = w;
+            }
+            btr_used[lid] = 1u;
+        }
+    } else {
+        var m = lid;
+        loop {
+            if (m >= n) { break; }
+            let si = btr_sh[m];
+            if (si > KP_NINF) {
+                var rank = 0u;
+                for (var j = 0u; j < n; j = j + 1u) {
+                    let sj = btr_sh[j];
+                    if (sj > KP_NINF) {
+                        if (sj > si || (sj == si && j < m)) { rank = rank + 1u; }
+                    }
+                }
+                if (rank < k) {
+                    btr_used[rank] = 1u;
+                    bt_cold[cb + 2u * k + 2u * rank] = m;
+                    bt_cold[cb + 2u * k + 2u * rank + 1u] = bitcast<u32>(btr_sh[m]);
+                    if (subset) {
+                        let slot = bt_map[m];
+                        if (slot == 0xFFFFFFFFu) {
+                            bt_idx[ob + rank] = 0u;
+                            bt_w[ob + rank] = 0.0;
+                            bt_cold[cb + 2u * rank] = m;
+                            bt_cold[cb + 2u * rank + 1u] = bitcast<u32>(btr_sc[m]);
+                        } else {
+                            bt_idx[ob + rank] = slot;
+                            bt_w[ob + rank] = btr_sc[m];
+                        }
+                    } else {
+                        bt_idx[ob + rank] = m;
+                        bt_w[ob + rank] = btr_sc[m];
+                    }
+                }
+            }
+            m = m + 1024u;
+        }
+    }
+    workgroupBarrier();
+    storageBarrier();
+    if (lid == 0u) {
+        var cnt = 0u;
+        for (var j = 0u; j < k; j = j + 1u) {
+            if (btr_used[j] == 1u) { cnt = cnt + 1u; }
+        }
+        bt_cnt[t] = cnt;
+        var sum = 0.0;
+        for (var j = 0u; j < cnt; j = j + 1u) {
+            sum = sum + bt_w[ob + j];
+            if (bt_cold[cb + 2u * j] != 0xFFFFFFFFu) {
+                sum = sum + bitcast<f32>(bt_cold[cb + 2u * j + 1u]);
+            }
+        }
+        if (sum > 0.0) {
+            let inv = bt_p.scale / sum;
+            for (var j = 0u; j < cnt; j = j + 1u) {
+                bt_w[ob + j] = bt_w[ob + j] * inv;
+                if (bt_cold[cb + 2u * j] != 0xFFFFFFFFu) {
+                    bt_cold[cb + 2u * j + 1u] =
+                        bitcast<u32>(bitcast<f32>(bt_cold[cb + 2u * j + 1u]) * inv);
+                }
+            }
+        }
+    }
+}
+
+// moe_gate_up_q2tp with grid (row, slot, token).
+var<workgroup> btg_pg: array<f32, 64>;
+var<workgroup> btg_pu: array<f32, 64>;
+@compute @workgroup_size(64)
+fn bt_moe_gate_up_q2tp(@builtin(workgroup_id) wid: vec3<u32>,
+                       @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let slot = wid.y;
+    let t = wid.z;
+    let gpr = mg_p.gpr;
+    let rows = mg_p.inter;
+    let base16 = mg_sel[t * mg_p.slots + slot] * mg_p.mat16;
+    let nib16 = base16 + row * gpr * 4u;
+    let par16 = base16 + rows * gpr * 4u + row * 2u;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let cod8 = (base16 + rows * gpr * 4u + rows * 2u) * 2u + row * cst;
+    let xb4 = t * gpr * 8u;
+    let gl = unpack2x16float(mg_g16(par16) | (mg_g16(par16 + 1u) << 16u));
+    let ul = unpack2x16float(mg_u16f(par16) | (mg_u16f(par16 + 1u) << 16u));
+    var ag = 0.0;
+    var au = 0.0;
+    for (var g = lid; g < gpr; g = g + 64u) {
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        var cg = mgp_gu8(cod8 + cb);
+        var cu = mgp_uu8(cod8 + cb);
+        if (shf > 3u) {
+            cg = cg | (mgp_gu8(cod8 + cb + 1u) << 8u);
+            cu = cu | (mgp_uu8(cod8 + cb + 1u) << 8u);
+        }
+        let cgv = (cg >> shf) & 31u;
+        let cuv = (cu >> shf) & 31u;
+        let sg = select(exp2(gl.x + f32(max(cgv, 1u) - 1u) * gl.y), 0.0, cgv == 0u);
+        let su = select(exp2(ul.x + f32(max(cuv, 1u) - 1u) * ul.y), 0.0, cuv == 0u);
+        let w32 = (nib16 + g * 4u) >> 1u;
+        let xq = xb4 + g * 8u;
+        let x0 = mg_xv[xq];      let x1 = mg_xv[xq + 1u];
+        let x2 = mg_xv[xq + 2u]; let x3 = mg_xv[xq + 3u];
+        let x4 = mg_xv[xq + 4u]; let x5 = mg_xv[xq + 5u];
+        let x6 = mg_xv[xq + 6u]; let x7 = mg_xv[xq + 7u];
+        let dg = mg_dot16v(mg_gw[w32], x0, x1, x2, x3)
+               + mg_dot16v(mg_gw[w32 + 1u], x4, x5, x6, x7);
+        let du = mg_dot16v(mg_uw[w32], x0, x1, x2, x3)
+               + mg_dot16v(mg_uw[w32 + 1u], x4, x5, x6, x7);
+        ag = ag + sg * dg;
+        au = au + su * du;
+    }
+    btg_pg[lid] = ag;
+    btg_pu[lid] = au;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) {
+            btg_pg[lid] = btg_pg[lid] + btg_pg[lid + stride];
+            btg_pu[lid] = btg_pu[lid] + btg_pu[lid + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) {
+        let g = btg_pg[0];
+        var gg = g;
+        var uu = btg_pu[0];
+        if (mg_p.lim > 0.0) {
+            uu = clamp(uu, -mg_p.lim, mg_p.lim);
+            gg = min(gg, mg_p.lim);
+        }
+        mg_act[(t * mg_p.slots + slot) * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
+    }
+}
+
+// sparse_attend with grid (head, token): q and out stride by nh*hd, the
+// index list by `m` (the uniform carries the per-token STRIDE of the list
+// buffer), the attended count comes from a per-token table. The KV cache is
+// the layer's and shared — earlier tokens' appends are ordered by the pass.
+@group(0) @binding(0) var<storage, read>       bsa_q    : array<f32>;   // b, nh*hd
+@group(0) @binding(1) var<storage, read>       bsa_kv   : array<f32>;
+@group(0) @binding(2) var<storage, read>       bsa_idx  : array<u32>;   // b, stride
+@group(0) @binding(3) var<storage, read>       bsa_sink : array<f32>;   // nh
+@group(0) @binding(4) var<storage, read_write> bsa_out  : array<f32>;   // b, nh*hd
+@group(0) @binding(5) var<uniform>             bsa_p    : SaP;          // m = idx stride
+@group(0) @binding(6) var<storage, read>       bsa_m    : array<u32>;   // b
+var<workgroup> bsa_red: array<f32, 256>;
+var<workgroup> bsa_w: array<f32, 1024>;
+var<workgroup> bsa_den: f32;
+@compute @workgroup_size(256)
+fn bt_sparse_attend(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    if (h >= bsa_p.nh) { return; }
+    let t = wid.y;
+    let hd = bsa_p.hd;
+    let m = bsa_m[t];
+    let ib = t * bsa_p.m;
+    let qb = t * bsa_p.nh * hd + h * hd;
+    var mx = bsa_sink[h];
+    var i = lid;
+    loop {
+        if (i >= m) { break; }
+        let p = bsa_idx[ib + i];
+        var d = 0.0;
+        for (var k = 0u; k < hd; k = k + 1u) {
+            d = d + bsa_q[qb + k] * bsa_kv[p * hd + k];
+        }
+        let sc = d * bsa_p.scale;
+        bsa_w[i] = sc;
+        mx = max(mx, sc);
+        i = i + 256u;
+    }
+    bsa_red[lid] = mx;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { bsa_red[lid] = max(bsa_red[lid], bsa_red[lid + stride]); }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    let mval = bsa_red[0];
+    workgroupBarrier();
+    var den = 0.0;
+    i = lid;
+    loop {
+        if (i >= m) { break; }
+        let w = exp(bsa_w[i] - mval);
+        bsa_w[i] = w;
+        den = den + w;
+        i = i + 256u;
+    }
+    bsa_red[lid] = den;
+    workgroupBarrier();
+    stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { bsa_red[lid] = bsa_red[lid] + bsa_red[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) { bsa_den = bsa_red[0] + exp(bsa_sink[h] - mval); }
+    workgroupBarrier();
+    let inv = 1.0 / bsa_den;
+    var k = lid;
+    loop {
+        if (k >= hd) { break; }
+        var acc = 0.0;
+        for (var j = 0u; j < m; j = j + 1u) {
+            acc = acc + bsa_w[j] * bsa_kv[bsa_idx[ib + j] * hd + k];
+        }
+        bsa_out[qb + k] = acc * inv;
+        k = k + 256u;
+    }
+}
+
+// The grouped low-rank output projection with grid (row-quad, token): the
+// same four-rows-per-workgroup walk as o_lora_a_m, the activation window and
+// the output sliding with the token.
+var<workgroup> obt_part: array<f32, 256>;
+var<workgroup> obt_lad: array<f32, 128>;
+@compute @workgroup_size(256)
+fn bt_o_lora_a(@builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(num_workgroups) nwg: vec3<u32>,
+               @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let lora = q1p._p0;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let t = wid.y;
+    let xtok = t * (rows / lora) * gpr * 32u;
+    let sub = lid / 64u;
+    let lane = lid % 64u;
+    var row = wid.x * 4u + sub;
+    loop {
+        if (row >= rows) { break; }
+        if (lane < 32u) {
+            let pr = unpack2x16float(q1w[params_w + row]);
+            obt_lad[sub * 32u + lane] = exp2(pr.x + f32(lane) * pr.y);
+        }
+        workgroupBarrier();
+        let xoff = xtok + (row / lora) * gpr * 32u;
+        var acc = 0.0;
+        var g = lane;
+        loop {
+            if (g >= gpr) { break; }
+            let bit = g * 5u;
+            let cb = codes_b + row * cstride + (bit >> 3u);
+            let sh = bit & 7u;
+            var cv = q4tp_byte(cb);
+            if (sh > 3u) { cv = cv | (q4tp_byte(cb + 1u) << 8u); }
+            let scale = obt_lad[sub * 32u + ((cv >> sh) & 31u)];
+            let base = (row * gpr + g) * 4u;
+            let xb = xoff + g * 32u;
+            var gsum = 0.0;
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                gsum = gsum + q4b_dot8(q1w[base + k], xb + 8u * k);
+            }
+            acc = acc + scale * gsum;
+            g = g + 64u;
+        }
+        obt_part[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lane < stride) { obt_part[lid] = obt_part[lid] + obt_part[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lane == 0u) { q1y[t * rows + row] = obt_part[sub * 64u]; }
+        workgroupBarrier();
+        row = row + nwg.x * 4u;
+    }
+}
+
 "#;
 
 // Split-K decode attention (its own module: the main module's at_* binding
@@ -6671,6 +7328,16 @@ struct Ctx {
     sa_apply: wgpu::ComputePipeline,
     hc_pre_fold: wgpu::ComputePipeline,
     hc_post_expand: wgpu::ComputePipeline,
+    // Token-axis twins for the batched dsv4 frame.
+    bt_rope_heads: wgpu::ComputePipeline,
+    bt_hc_pre_fold: wgpu::ComputePipeline,
+    bt_hc_post_expand: wgpu::ComputePipeline,
+    bt_f32_matvec_w: wgpu::ComputePipeline,
+    bt_f32_matvec_x: wgpu::ComputePipeline,
+    bt_moe_route: wgpu::ComputePipeline,
+    bt_moe_gate_up_q2tp: wgpu::ComputePipeline,
+    bt_sparse_attend: wgpu::ComputePipeline,
+    bt_o_lora_a: wgpu::ComputePipeline,
     q4tp_mv: wgpu::ComputePipeline,
     /// Tall-matrix q4tp matvec (4 rows/workgroup, vec4 nibble loads); the
     /// per-row math is byte-identical to `q4tp_mv`. `CMF_MV4=0` reverts.
@@ -7226,6 +7893,15 @@ fn init() -> Result<Ctx, String> {
     let sa_apply = pipe("sa_apply");
     let hc_pre_fold = pipe("hc_pre_fold");
     let hc_post_expand = pipe("hc_post_expand");
+    let bt_rope_heads = pipe("bt_rope_heads");
+    let bt_hc_pre_fold = pipe("bt_hc_pre_fold");
+    let bt_hc_post_expand = pipe("bt_hc_post_expand");
+    let bt_f32_matvec_w = pipe("bt_f32_matvec_w");
+    let bt_f32_matvec_x = pipe("bt_f32_matvec_x");
+    let bt_moe_route = pipe("bt_moe_route");
+    let bt_moe_gate_up_q2tp = pipe("bt_moe_gate_up_q2tp");
+    let bt_sparse_attend = pipe("bt_sparse_attend");
+    let bt_o_lora_a = pipe("bt_o_lora_a");
     let q4tp_mv = pipe("q4tp_matvec");
     let q4tp_mv4 = pipe("q4tp_matvec4");
     let use_mv4 = std::env::var("CMF_MV4").map(|v| v != "0").unwrap_or(true);
@@ -7455,6 +8131,15 @@ fn init() -> Result<Ctx, String> {
         sa_apply,
         hc_pre_fold,
         hc_post_expand,
+        bt_rope_heads,
+        bt_hc_pre_fold,
+        bt_hc_post_expand,
+        bt_f32_matvec_w,
+        bt_f32_matvec_x,
+        bt_moe_route,
+        bt_moe_gate_up_q2tp,
+        bt_sparse_attend,
+        bt_o_lora_a,
         q4tp_mv,
         q4tp_mv4,
         use_mv4,
@@ -14331,6 +15016,21 @@ fn bind_buf(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     }
 }
 
+/// A window into a strided per-token buffer: how the batched frame hands a
+/// single-token kernel one token's slice without changing the kernel. The
+/// offset must respect `min_storage_buffer_offset_alignment` (256 on every
+/// card this runs on), which every per-token stride here does.
+fn bind_buf_off(binding: u32, buf: &wgpu::Buffer, off: u64, size: u64) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: buf,
+            offset: off,
+            size: std::num::NonZeroU64::new(size),
+        }),
+    }
+}
+
 fn storage_bytes(c: &Ctx, data: &[u8]) -> wgpu::Buffer {
     c.device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -18751,6 +19451,12 @@ pub fn dsv4_chain_batch(
     {
         return false;
     }
+    if bt_frame_on() {
+        return dsv4_chain_batch_bt(
+            model, layers, kv_id, first_li, inv_freq, pos, batch, forced, folded_out,
+            state_out,
+        );
+    }
     // Grow every index cache to its FINAL batch size before recording the
     // encoder. Growing half way through would copy only the pre-batch data:
     // earlier tokens' appends still live in the unsubmitted encoder and the
@@ -19032,6 +19738,1139 @@ pub fn dsv4_chain_batch(
             ok
         }
     }
+}
+
+/// The token-axis batch: one encoder, one frame per LAYER, every dispatch
+/// covering all B tokens. The historical path encoded one frame per token
+/// and was launch-bound — 204 ms for a 5-wide pass against 37.8 for one
+/// token; the token axis exists to put the batch back at one token's
+/// dispatch count.
+#[allow(clippy::too_many_arguments)]
+fn dsv4_chain_batch_bt(
+    model: &Arc<CmfModel>,
+    layers: &[(Dsv4LayerW<'_>, Dsv4LayerGeom, Dsv4Prep<'_>)],
+    kv_id: u64,
+    first_li: usize,
+    inv_freq: &[&[f32]],
+    pos: usize,
+    batch: usize,
+    forced: Option<&[Vec<Option<Vec<usize>>>]>,
+    folded_out: &mut [f32],
+    state_out: Option<&mut [f32]>,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Some((_, g0, _)) = layers.first() else {
+        return false;
+    };
+    let dim = g0.attn.dim;
+    let state_len = batch * g0.hc * dim;
+    // Index caches grow to their final batch size before recording — growing
+    // mid-encode would strand the unsubmitted appends (see the per-token
+    // path's comment).
+    for (i, (_, _, p)) in layers.iter().enumerate() {
+        if let Some((_, cg, _, ixg)) = p.ix.as_ref() {
+            let extra = batch.div_ceil(cg.ratio.max(1));
+            if dsv4_index_cache(kv_id, first_li + i, ixg.idim * (p.n_ix + extra + 1)).is_none()
+            {
+                return false;
+            }
+        }
+    }
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dsv4-chain-batch-bt"),
+        });
+    let t_enc = std::time::Instant::now();
+    let mut last: Option<(wgpu::Buffer, wgpu::Buffer)> = None;
+    for (i, (w, g, p)) in layers.iter().enumerate() {
+        // Per-token counts follow from the position alone (window fills by
+        // one, a compressed entry appears every `ratio`), so the whole
+        // batch's preps are known before anything is encoded.
+        let mut preps = Vec::with_capacity(batch);
+        for t in 0..batch {
+            let mut pt = p.clone();
+            pt.filled = (p.filled + t).min(p.window);
+            let advanced = |ratio: usize| -> usize {
+                if ratio == 0 {
+                    return 0;
+                }
+                (0..t).filter(|k| (pos + k + 1) % ratio == 0).count()
+            };
+            if let Some((_, cg)) = p.comp.as_ref() {
+                let ew = if cg.overlap { cg.width / 2 } else { cg.width };
+                pt.n_comp = p.n_comp + advanced(cg.ratio);
+                pt.comp_dst_off = p.comp_dst_off + (pt.n_comp - p.n_comp) * ew;
+            }
+            if let Some((_, cg, _, _)) = p.ix.as_ref() {
+                let ew = if cg.overlap { cg.width / 2 } else { cg.width };
+                pt.n_ix = p.n_ix + advanced(cg.ratio);
+                pt.ix_dst_off = p.ix_dst_off + (pt.n_ix - p.n_ix) * ew;
+            }
+            preps.push(pt);
+        }
+        let rows: Option<Vec<Option<Vec<usize>>>> = forced.map(|f| {
+            (0..batch)
+                .map(|t| f.get(t).and_then(|r| r.get(i)).cloned().flatten())
+                .collect()
+        });
+        // Speculative verify: photograph every layer's per-token hidden
+        // input so a partial acceptance can replay the accepted tokens'
+        // state appends without recomputing the pass.
+        let (retain_n, caps) = SPEC_RETAIN.with(|v| v.borrow().clone());
+        if retain_n > 0 && i < retain_n {
+            let x2_bt = frame_buf_t(c, BT_X2, 0, batch * dim * 4, true);
+            let retain = frame_buf_t(c, BT_RETAIN, 0, retain_n * batch * dim * 4, false);
+            let mut pass = begin_pass(&mut enc);
+            encode_blit_p(
+                &mut pass,
+                c,
+                &x2_bt,
+                &retain,
+                batch * dim,
+                0,
+                i * batch * dim,
+                None,
+            );
+        }
+        let Some(out) = dsv4_layer_frame_bt_enc(
+            model,
+            w,
+            *g,
+            kv_id,
+            first_li + i,
+            batch,
+            &preps,
+            rows.as_deref(),
+            inv_freq[i],
+            pos,
+            &mut enc,
+        ) else {
+            return false;
+        };
+        // The draft's capture: photograph the post-layer state of the armed
+        // target layers, every token, for the host to read after acceptance.
+        if let Some(slot) = caps.iter().position(|&t| t == first_li + i) {
+            let hcd = g0.hc * dim;
+            let cap = frame_buf_t(c, BT_CAP, 0, caps.len() * batch * hcd * 4, false);
+            let mut pass = begin_pass(&mut enc);
+            encode_blit_p(
+                &mut pass,
+                c,
+                &out.1,
+                &cap,
+                batch * hcd,
+                0,
+                slot * batch * hcd,
+                None,
+            );
+        }
+        last = Some(out);
+    }
+    let Some((folds, states)) = last else {
+        return false;
+    };
+    // Blit, not copy_buffer_to_buffer: the pooled gather buffers carry no
+    // COPY_DST (the per-token path fills them with the same kernel).
+    let gather = frame_buf(c, 117, batch * dim * 4, false);
+    let gather_state = state_out
+        .as_ref()
+        .map(|_| frame_buf(c, 118, state_len * 4, false));
+    {
+        let mut pass = begin_pass(&mut enc);
+        encode_blit_p(&mut pass, c, &folds, &gather, batch * dim, 0, 0, None);
+        if let Some(gs) = gather_state.as_ref() {
+            encode_blit_p(&mut pass, c, &states, gs, state_len, 0, 0, None);
+        }
+    }
+    CHAIN_ENC_NS.fetch_add(
+        t_enc.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    match (gather_state.as_ref(), state_out) {
+        (Some(gs), Some(states_out)) => readback2(
+            c,
+            enc,
+            (&gather, &mut folded_out[..batch * dim]),
+            (gs, &mut states_out[..state_len]),
+        ),
+        _ => {
+            let bytes = (batch * dim * 4) as u64;
+            let mut sc = c.scratch.lock().unwrap();
+            let stage = Scratch::ensure(
+                &c.device,
+                &mut sc.stage,
+                bytes,
+                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                "dsv4-batch-stage",
+            );
+            let ok = readback(c, enc, &gather, &stage, bytes, &mut folded_out[..batch * dim]);
+            drop(sc);
+            ok
+        }
+    }
+}
+
+/// Whether the batch uses the token-axis frame (default) or the historical
+/// one-frame-per-token encoding (`CMF_DSV4_BT=0`, kept for a bisect).
+fn bt_frame_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_BT").map(|v| v != "0").unwrap_or(true))
+}
+
+// ── the batched frame's buffer tags (frame_buf, tok 0) ──
+// Working buffers are sized batch*len, so a different batch width lands in a
+// different pool entry by length; bind groups additionally salt their key
+// with the batch. Registry: frame_buf 180–202, cached_bind 180–199.
+const BT_STATE: u8 = 180;
+const BT_X2: u8 = 181;
+const BT_FOLD: u8 = 182;
+const BT_QN: u8 = 183;
+const BT_Q: u8 = 184;
+const BT_ATTN: u8 = 185;
+const BT_MID: u8 = 186;
+const BT_AO: u8 = 187;
+const BT_MIXES: u8 = 188;
+const BT_HPOST: u8 = 189;
+const BT_HCOMB: u8 = 190;
+const BT_STATE2: u8 = 191;
+const BT_LOGIT: u8 = 192;
+const BT_MSEL: u8 = 193;
+const BT_MWT: u8 = 194;
+const BT_MCNT: u8 = 195;
+const BT_MACT: u8 = 196;
+const BT_MO: u8 = 197;
+const BT_QR: u8 = 198;
+const BT_ROPE_META: u8 = 199;
+const BT_SA_M: u8 = 200;
+const BT_IDX: u8 = 201;
+const BT_FORCED: u8 = 202;
+
+/// Seed one token of the batched frame: its hyper-connection state, the
+/// attention half's post/comb (computed on the host for layer zero), its
+/// opening fold and its LoRA vector. The strided twin of
+/// `dsv4_state_write_t` + `dsv4_hc_write_t` + `dsv4_chain_seed_t`.
+pub fn dsv4_chain_seed_bt(
+    tok: usize,
+    batch: usize,
+    state: &[f32],
+    post: &[f32],
+    comb: &[f32],
+    fold: &[f32],
+    qn: &[f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let up = |tag: u8, len: usize, off: usize, data: &[f32]| {
+        let b = frame_buf_t(c, tag, 0, batch * len * 4, true);
+        c.queue
+            .write_buffer(&b, (off * len * 4) as u64, bytemuck::cast_slice(data));
+    };
+    up(BT_STATE, state.len(), tok, state);
+    up(BT_HPOST, post.len(), tok, post);
+    up(BT_HCOMB, comb.len(), tok, comb);
+    up(BT_X2, fold.len(), tok, fold);
+    up(BT_QN, qn.len(), tok, qn);
+    true
+}
+
+const BT_RETAIN: u8 = 204;
+const BT_SPEC_SCRATCH: u8 = 205;
+
+thread_local! {
+    /// Armed by the speculative verify: how many layers' per-token hidden
+    /// inputs the batch should retain on the device (0 = off), and which
+    /// layers' post-layer hyper-connection states to photograph for the
+    /// draft's capture. The retained hiddens feed the state replay after a
+    /// partial acceptance; the captures feed the next draft.
+    static SPEC_RETAIN: std::cell::RefCell<(usize, Vec<usize>)> =
+        const { std::cell::RefCell::new((0, Vec::new())) };
+}
+
+/// Arm (n_layers > 0) or disarm (0) hidden-state retention for the next
+/// batched chain call on this thread. `caps` lists the layer ordinals whose
+/// post-layer state the draft's capture needs.
+pub fn dsv4_spec_retain_arm(n_layers: usize, caps: &[usize]) {
+    SPEC_RETAIN.with(|c| *c.borrow_mut() = (n_layers, caps.to_vec()));
+}
+
+const BT_CAP: u8 = 206;
+
+/// Read one photographed capture back: `slot` indexes the armed `caps`
+/// list, `tok` the batch position. `out` takes hc*dim floats.
+pub fn dsv4_spec_cap_read(
+    slot: usize,
+    tok: usize,
+    batch: usize,
+    n_caps: usize,
+    hc_dim: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let cap = frame_buf_t(c, BT_CAP, 0, n_caps * batch * hc_dim * 4, false);
+    let bytes = (hc_dim * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        bytes,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "dsv4-cap-stage",
+    );
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dsv4-cap-read"),
+        });
+    enc.copy_buffer_to_buffer(
+        &cap,
+        ((slot * batch + tok) * hc_dim * 4) as u64,
+        &stage,
+        0,
+        bytes,
+    );
+    let ok = {
+        submit(c, enc.finish());
+        let slice = stage.slice(..bytes);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d2 = done.clone();
+        slice.map_async(wgpu::MapMode::Read, move |_| {
+            d2.store(true, std::sync::atomic::Ordering::Release);
+        });
+        if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+            false
+        } else if let Ok(data) = slice.get_mapped_range() {
+            out[..hc_dim].copy_from_slice(bytemuck::cast_slice(&data[..hc_dim * 4]));
+            drop(data);
+            stage.unmap();
+            true
+        } else {
+            false
+        }
+    };
+    drop(sc);
+    ok
+}
+
+/// The device state a speculative pass damages and how to put it back.
+///
+/// Append-only regions (the compressed tail inside the KV cache, the
+/// indexer's cache) roll back by COUNT and are not copied. What is copied:
+/// the window rows the B appends will shift out (at most B per layer), and
+/// the compressor streams (pending/previous, both kinds), which mutate on
+/// every token.
+pub struct Dsv4SpecShadow {
+    kv_id: u64,
+    batch: usize,
+    layers: Vec<SpecLayerShadow>,
+}
+struct SpecLayerShadow {
+    li: usize,
+    hd: usize,
+    window: usize,
+    filled: usize,
+    /// The first `dk` window rows, photographed before the pass.
+    dk: usize,
+    head: Option<wgpu::Buffer>,
+    comp: Vec<(u8, [wgpu::Buffer; 4])>,
+}
+
+/// Photograph what the B-token pass will destroy. One submission.
+pub fn dsv4_spec_shadow(
+    kv_id: u64,
+    metas: &[(usize, usize, usize, usize)], // (li, hd, window, filled)
+    batch: usize,
+) -> Option<Dsv4SpecShadow> {
+    let c = ctx()?;
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dsv4-spec-shadow"),
+        });
+    let mut layers = Vec::with_capacity(metas.len());
+    for &(li, hd, window, filled) in metas {
+        let dk = filled.min((filled + batch).saturating_sub(window));
+        let head = if dk > 0 {
+            let cache = {
+                let map = c.dsv4_kv.lock().unwrap();
+                map.get(&(kv_id, li)).map(|(b, _)| b.clone())?
+            };
+            let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dsv4-spec-head"),
+                size: (dk * hd * 4) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            enc.copy_buffer_to_buffer(&cache, 0, &b, 0, (dk * hd * 4) as u64);
+            Some(b)
+        } else {
+            None
+        };
+        let mut comp = Vec::new();
+        for kind in [0u8, 1u8] {
+            let live = {
+                let map = c.dsv4_comp.lock().unwrap();
+                map.get(&(kind, kv_id, li)).cloned()
+            };
+            if let Some(bufs) = live {
+                let clones: [wgpu::Buffer; 4] = std::array::from_fn(|i| {
+                    let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("dsv4-spec-comp"),
+                        size: bufs[i].size(),
+                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: false,
+                    });
+                    enc.copy_buffer_to_buffer(&bufs[i], 0, &b, 0, bufs[i].size());
+                    b
+                });
+                comp.push((kind, clones));
+            }
+        }
+        layers.push(SpecLayerShadow {
+            li,
+            hd,
+            window,
+            filled,
+            dk,
+            head,
+            comp,
+        });
+    }
+    submit(c, enc.finish());
+    Some(Dsv4SpecShadow {
+        kv_id,
+        batch,
+        layers,
+    })
+}
+
+/// Put the device back to the snapshot (as if NO speculative token ran):
+/// drop the B appended window rows, un-shift, restore the shadowed head
+/// rows, copy the compressor streams back. Counts are the host's business.
+pub fn dsv4_spec_restore(sh: &Dsv4SpecShadow) -> bool {
+    let Some(c) = ctx() else { return false };
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dsv4-spec-restore"),
+        });
+    for l in &sh.layers {
+        if l.dk > 0 {
+            let cache = {
+                let map = c.dsv4_kv.lock().unwrap();
+                match map.get(&(sh.kv_id, l.li)) {
+                    Some((b, _)) => b.clone(),
+                    None => return false,
+                }
+            };
+            // Surviving original rows sit at [0, keep); slide them right by
+            // dk and put the photographed head back in front.
+            let keep = l.filled - l.dk;
+            if keep > 0 {
+                let scratch = frame_buf(c, BT_SPEC_SCRATCH, l.window * l.hd * 4, true);
+                enc.copy_buffer_to_buffer(&cache, 0, &scratch, 0, (keep * l.hd * 4) as u64);
+                enc.copy_buffer_to_buffer(
+                    &scratch,
+                    0,
+                    &cache,
+                    (l.dk * l.hd * 4) as u64,
+                    (keep * l.hd * 4) as u64,
+                );
+            }
+            if let Some(head) = &l.head {
+                enc.copy_buffer_to_buffer(head, 0, &cache, 0, (l.dk * l.hd * 4) as u64);
+            }
+        }
+        for (kind, clones) in &l.comp {
+            let live = {
+                let map = c.dsv4_comp.lock().unwrap();
+                map.get(&(*kind, sh.kv_id, l.li)).cloned()
+            };
+            let Some(live) = live else { return false };
+            for i in 0..4 {
+                let n = live[i].size().min(clones[i].size());
+                enc.copy_buffer_to_buffer(&clones[i], 0, &live[i], 0, n);
+            }
+        }
+    }
+    submit(c, enc.finish());
+    true
+}
+
+/// Re-append the state of the ACCEPTED tokens after a restore: window rows,
+/// compressor streams and folds, the indexer's compressor — from the hidden
+/// inputs the batch retained per (layer, token). No attention, no scoring:
+/// state only, exactly what a sequential walk of those k tokens would have
+/// written.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_spec_replay(
+    model: &Arc<CmfModel>,
+    layers: &[(usize, Dsv4Prep<'_>)], // (li, prep with counts AS OF the snapshot)
+    kv_id: u64,
+    pos0: usize,
+    batch: usize,
+    k: usize,
+    inv_freq: &[&[f32]],
+    hd: usize,
+    dim: usize,
+    rope_dim: usize,
+    eps: f32,
+) -> bool {
+    if k == 0 {
+        return true;
+    }
+    let Some(c) = ctx() else { return false };
+    let retain = frame_buf_t(c, BT_RETAIN, 0, layers.len() * batch * dim * 4, false);
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dsv4-spec-replay"),
+        });
+    for (i, (li, p)) in layers.iter().enumerate() {
+        for t in 0..k {
+            let _salt = Dsv4FrameSalt::enter(t + 1);
+            let x2_t = frame_buf_t(c, 45, t, dim * 4, true);
+            {
+                let mut pass = begin_pass(&mut enc);
+                encode_blit_p(
+                    &mut pass,
+                    c,
+                    &retain,
+                    &x2_t,
+                    dim,
+                    (i * batch + t) * dim,
+                    0,
+                    None,
+                );
+            }
+            let advanced = |ratio: usize| -> usize {
+                if ratio == 0 {
+                    return 0;
+                }
+                (0..t).filter(|j| (pos0 + j + 1) % ratio == 0).count()
+            };
+            let cache = {
+                let map = c.dsv4_kv.lock().unwrap();
+                match map.get(&(kv_id, *li)) {
+                    Some((b, _)) => b.clone(),
+                    None => return false,
+                }
+            };
+            if let Some((cw, cg)) = &p.comp {
+                let ew = if cg.overlap { cg.width / 2 } else { cg.width };
+                let n_comp = p.n_comp + advanced(cg.ratio);
+                let off = p.comp_dst_off + (n_comp - p.n_comp) * ew;
+                if dsv4_compressor_frame(
+                    model, cw, *cg, 0, kv_id, *li, &x2_t, pos0 + t, inv_freq[i], &cache, off,
+                    &mut enc,
+                )
+                .is_none()
+                {
+                    return false;
+                }
+            }
+            if let Some((iw, ig, _, ixg)) = &p.ix {
+                let ew = if ig.overlap { ig.width / 2 } else { ig.width };
+                let n_ix = p.n_ix + advanced(ig.ratio);
+                let off = p.ix_dst_off + (n_ix - p.n_ix) * ew;
+                let Some(ixkv) = dsv4_index_cache(kv_id, *li, ixg.idim * (n_ix + 2)) else {
+                    return false;
+                };
+                if dsv4_compressor_frame(
+                    model, iw, *ig, 1, kv_id, *li, &x2_t, pos0 + t, inv_freq[i], &ixkv, off,
+                    &mut enc,
+                )
+                .is_none()
+                {
+                    return false;
+                }
+            }
+            let filled = (p.filled + t).min(p.window);
+            if dsv4_window_append(
+                model, p.wkv, p.kv_norm, &x2_t, &cache, hd, p.window, filled, dim, rope_dim,
+                eps, pos0 + t, inv_freq[i], kv_id, *li, &mut enc,
+            )
+            .is_none()
+            {
+                return false;
+            }
+        }
+    }
+    submit(c, enc.finish());
+    true
+}
+
+/// One layer of a whole BATCH, with the token on a grid axis: every
+/// dispatch covers all B tokens, so the layer costs the dispatch count of a
+/// single token. The arithmetic per token is the single frame's, term for
+/// term; only the prep (window append, compressors, indexer) still encodes
+/// per token — its writes are ordered by the pass, which is what lets token
+/// t attend to the entries token t-1 just appended.
+#[allow(clippy::too_many_arguments)]
+fn dsv4_layer_frame_bt_enc(
+    model: &Arc<CmfModel>,
+    w: &Dsv4LayerW,
+    g: Dsv4LayerGeom,
+    kv_id: u64,
+    li: usize,
+    batch: usize,
+    preps: &[Dsv4Prep],
+    forced_rows: Option<&[Option<Vec<usize>>]>,
+    inv_freq: &[f32],
+    pos0: usize,
+    enc: &mut wgpu::CommandEncoder,
+) -> Option<(wgpu::Buffer, wgpu::Buffer)> {
+    macro_rules! no {
+        ($($t:tt)*) => {{
+            if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
+                eprintln!("пакетный кадр слоя отклонён: {}", format_args!($($t)*));
+            }
+            return None;
+        }};
+    }
+    let Some(c) = ctx() else { no!("нет контекста wgpu") };
+    let a = g.attn;
+    let m = g.moe;
+    let (hc, dim) = (g.hc, a.dim);
+    let mix_hc = (2 + hc) * hc;
+    if preps.len() != batch {
+        no!("подготовок {} на пакет {batch}", preps.len());
+    }
+    // The bind-group key: the layer, salted by the batch width so a 3-wide
+    // chunk never reuses a 5-wide chunk's groups (their buffers differ by
+    // length and therefore identity).
+    let bk = |tag: u8| (tag, kv_id, li * FRAME_TOK_STRIDE + batch);
+
+    // ── weights (same set and order as the single frame) ──
+    let bytes = model.primary_bytes();
+    let mut wb = Vec::with_capacity(5);
+    for &idx in &[
+        w.attn.wq_a,
+        w.attn.wq_b,
+        w.attn.wo_a,
+        w.attn.wo_b,
+        w.next_wq_a.unwrap_or(w.attn.wq_a),
+    ] {
+        let Some(e) = model.tensors.get(idx) else {
+            no!("тензора {idx} нет");
+        };
+        if e.dtype != cortiq_core::TensorDtype::Q4TiledP {
+            no!("{} не q4tp", e.name);
+        }
+        let (Some(abs), plen) = (model.entry_abs_offset(e), e.nbytes as usize) else {
+            no!("{} без смещения", e.name);
+        };
+        let Some(b) = weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])
+        else {
+            no!("{} не влез в VRAM", e.name);
+        };
+        wb.push(b);
+    }
+    let Some((gate_all, up_all, down_all)) =
+        moe_expert_bufs(c, model, w.moe.experts, m.inter, m.hidden, true, m.gu_q2)
+    else {
+        no!("эксперты не влезли в VRAM");
+    };
+    let cache = {
+        let map = c.dsv4_kv.lock().unwrap();
+        match map.get(&(kv_id, li)) {
+            Some((b, _)) => b.clone(),
+            None => no!("кеш ({kv_id}, {li}) не заведён"),
+        }
+    };
+
+    // ── constants ──
+    let sink = const_buf(c, bytemuck::cast_slice(&w.attn.sink[..a.nh]));
+    let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..a.rd / 2]));
+    let ffn_fn = const_buf(c, bytemuck::cast_slice(w.hc_ffn_fn));
+    let ffn_sc = const_buf(c, bytemuck::cast_slice(w.hc_ffn_scale));
+    let ffn_bs = const_buf(c, bytemuck::cast_slice(&w.hc_ffn_base[..mix_hc]));
+    let ffn_nw = const_buf(c, bytemuck::cast_slice(&w.ffn_norm[..dim]));
+    let n_exp = w.moe.experts.len().saturating_sub(1);
+    if w.router.len() < m.hidden * n_exp {
+        no!("роутер короче {} × {}", n_exp, m.hidden);
+    }
+    let router = const_buf(c, bytemuck::cast_slice(&w.router[..m.hidden * n_exp]));
+    let next_nw = const_buf(c, bytemuck::cast_slice(&w.next_norm[..dim]));
+    let next_qn = const_buf(c, bytemuck::cast_slice(&w.next_q_norm[..a.q_lora]));
+
+    // ── strided working buffers ──
+    let n_pack = n_exp;
+    let slots = m.top_k + 1;
+    let fb = |tag: u8, len: usize, upload: bool| frame_buf_t(c, tag, 0, batch * len * 4, upload);
+    let state_bt = fb(BT_STATE, hc * dim, true);
+    let x2_bt = fb(BT_X2, dim, true);
+    let fold_bt = fb(BT_FOLD, dim, false);
+    let qn_bt = fb(BT_QN, a.q_lora, true);
+    let q_bt = fb(BT_Q, a.nh * a.hd, false);
+    let attn_bt = fb(BT_ATTN, a.nh * a.hd, false);
+    let mid_bt = fb(BT_MID, a.o_groups * a.o_lora, false);
+    let ao_bt = fb(BT_AO, dim, false);
+    let mixes_bt = fb(BT_MIXES, mix_hc, false);
+    let hpost_bt = fb(BT_HPOST, hc, true);
+    let hcomb_bt = fb(BT_HCOMB, hc * hc, true);
+    let state2_bt = fb(BT_STATE2, hc * dim, false);
+    let logit_bt = fb(BT_LOGIT, n_pack, false);
+    let msel_bt = fb(BT_MSEL, slots, false);
+    let mwt_bt = fb(BT_MWT, slots, false);
+    let mcnt_bt = fb(BT_MCNT, 1, false);
+    let mact_bt = fb(BT_MACT, slots * m.inter, false);
+    let mo_bt = fb(BT_MO, dim, false);
+    let qr_bt = fb(BT_QR, a.q_lora, false);
+    let rope_meta = fb(BT_ROPE_META, 2, true);
+    // PER LAYER, not pooled: these are filled with `queue.write_buffer`,
+    // and every such write lands before the run's single submit — a shared
+    // buffer would hand every layer the LAST layer's contents. The same
+    // trap once made two hash layers route with one list.
+    let sa_m = frame_buf_t(c, BT_SA_M, li, batch * 4, true);
+    let idx_bt = fb(BT_IDX, 1024, true);
+    let forced_bt = frame_buf_t(c, BT_FORCED, li, batch * m.top_k * 4, true);
+
+    let _ = (&rope_meta, &sa_m, &idx_bt);
+
+    // ── q for the whole batch: touches no cache, so it can precede the
+    //    preps; the mv4 family's per-row math is the walk's. ──
+    if !encode_q4tp_mv4_b(c, enc, &wb[1], &qn_bt, &q_bt, a.nh * a.hd, a.q_lora, batch) {
+        no!("q-проекция пакетом не закодировалась");
+    }
+    // ── prep AND attention, token by token, in causal order. The window
+    //    SHIFTS once it is full: encoding all preps first and attending
+    //    afterwards hands token t a window that later tokens already slid —
+    //    the attend must read the cache AS OF its own token, which only this
+    //    interleaving preserves. The kernels are the walk's own, windowed
+    //    into the strided buffers, so the numbers are the walk's too. ──
+    for (t, p) in preps.iter().enumerate() {
+        let _salt = Dsv4FrameSalt::enter(t + 1);
+        let x2_t = frame_buf_t(c, 45, t, dim * 4, true);
+        let qn_t = frame_buf_t(c, 4, t, a.q_lora * 4, true);
+        let idx_t = frame_buf_t(c, 2, t, 1024 * 4, true);
+        {
+            let mut pass = begin_pass(enc);
+            encode_blit_p(&mut pass, c, &x2_bt, &x2_t, dim, t * dim, 0, None);
+            encode_blit_p(&mut pass, c, &qn_bt, &qn_t, a.q_lora, t * a.q_lora, 0, None);
+        }
+        let Some(mt) = dsv4_encode_prep(
+            model, p, kv_id, li, &x2_t, &qn_t, &cache, &idx_t, a.hd, p.window, dim, a.rd,
+            a.eps, pos0 + t, inv_freq, enc,
+        ) else {
+            no!("подготовка токена {t} не собралась");
+        };
+        if mt == 0 || mt > 1024 {
+            no!("список позиций токена {t} длиной {mt}");
+        }
+        let tkey = (li * 8 + batch) * FRAME_TOK_STRIDE + t;
+        let posb = frame_up_pos_t(c, 1, t, pos0 + t, a.eps);
+        let q_off = (t * a.nh * a.hd * 4) as u64;
+        let q_len = (a.nh * a.hd * 4) as u64;
+        let mut pass = begin_pass(enc);
+        let bind = cached_bind(c, (228, kv_id, tkey), || {
+            let pu = uniform_u32x4(c, [a.nh as u32, a.hd as u32, a.rd as u32, 1]);
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &c.rope_heads.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf_off(0, &q_bt, q_off, q_len),
+                    bind_buf(1, &freq),
+                    bind_buf(2, &pu),
+                    bind_buf(3, &posb),
+                ],
+            })
+        });
+        pass.set_pipeline(&c.rope_heads);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(a.nh as u32, 1, 1);
+        let p_sa = uni_slot(c, 228, kv_id, tkey,
+            [a.nh as u32, a.hd as u32, mt as u32, a.scale.to_bits()]);
+        let bind = cached_bind(c, (229, kv_id, tkey), || {
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &c.sparse_attend.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf_off(0, &q_bt, q_off, q_len),
+                    bind_buf(1, &cache),
+                    bind_buf(2, &idx_t),
+                    bind_buf(3, &sink),
+                    bind_buf_off(4, &attn_bt, q_off, q_len),
+                    bind_buf(5, &p_sa),
+                ],
+            })
+        });
+        pass.set_pipeline(&c.sparse_attend);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(a.nh as u32, 1, 1);
+        let bind = cached_bind(c, (230, kv_id, tkey), || {
+            let pu = uniform_u32x4(c, [a.nh as u32, a.hd as u32, a.rd as u32, 2]);
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &c.rope_heads.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf_off(0, &attn_bt, q_off, q_len),
+                    bind_buf(1, &freq),
+                    bind_buf(2, &pu),
+                    bind_buf(3, &posb),
+                ],
+            })
+        });
+        pass.set_pipeline(&c.rope_heads);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(a.nh as u32, 1, 1);
+    }
+    {
+        let mut pass = begin_pass(enc);
+        // Grouped output projection — the WALK's kernel, once per token,
+        // through a per-token window into the strided buffers. The batched
+        // clone reduced in a different tree; a near-tied indexer top-k then
+        // flipped and the batch's text was not the walk's. Exactness beats
+        // one dispatch here.
+        let o_rows = a.o_groups * a.o_lora;
+        let o_cols = a.nh * a.hd / a.o_groups;
+        let o_gpr = o_cols / 32;
+        let mv4_per_wg = if o_gpr <= 64 { 16u32 } else { 8u32 };
+        let mv4_ok = olora_mv4() && o_cols % 32 == 0 && a.o_lora % mv4_per_wg as usize == 0;
+        let o_pipe = match olora_pick() {
+            Some(1) => &c.o_lora_a,
+            Some(2) => &c.o_lora_a_w,
+            Some(3) => &c.o_lora_a_m,
+            _ if !chain_mv4() => &c.o_lora_a,
+            _ if o_gpr >= 256 => &c.o_lora_a_w,
+            _ => &c.o_lora_a_m,
+        };
+        let o_rows_per_wg = if std::ptr::eq(o_pipe, &c.o_lora_a_m) { 4u32 } else { 1u32 };
+        for t in 0..batch {
+            let tkey = (li * 8 + batch) * FRAME_TOK_STRIDE + t;
+            let x_off = (t * a.nh * a.hd * 4) as u64;
+            let x_len = (a.nh * a.hd * 4) as u64;
+            let y_off = (t * o_rows * 4) as u64;
+            let y_len = (o_rows * 4) as u64;
+            if mv4_ok {
+                let (pipe, per_wg) = if o_gpr <= 64 {
+                    (&c.q4tp_mv16, 16u32)
+                } else {
+                    (&c.q4tp_mv4, 8u32)
+                };
+                let bind = cached_bind(c, (225, kv_id, tkey), || {
+                    let p = q4tp_mv_params_w(c, o_gpr, o_rows, 1, a.o_lora);
+                    c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &pipe.get_bind_group_layout(0),
+                        entries: &[
+                            bind_buf(0, &wb[2]),
+                            bind_buf_off(2, &mid_bt, y_off, y_len),
+                            bind_buf(3, &p),
+                            bind_buf(4, &wb[2]),
+                            bind_buf_off(5, &attn_bt, x_off, x_len),
+                        ],
+                    })
+                });
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups((o_rows as u32).div_ceil(per_wg).min(MAX_WG), 1, 1);
+            } else {
+                let bind = cached_bind(c, (226, kv_id, tkey), || {
+                    let p = uniform_u32x4(c, [o_gpr as u32, o_rows as u32, a.o_lora as u32, 0]);
+                    c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &o_pipe.get_bind_group_layout(0),
+                        entries: &[
+                            bind_buf(0, &wb[2]),
+                            bind_buf_off(1, &attn_bt, x_off, x_len),
+                            bind_buf_off(2, &mid_bt, y_off, y_len),
+                            bind_buf(3, &p),
+                        ],
+                    })
+                });
+                pass.set_pipeline(o_pipe);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups(
+                    (o_rows as u32).div_ceil(o_rows_per_wg).min(MAX_WG),
+                    1,
+                    1,
+                );
+            }
+        }
+    }
+    if !encode_q4tp_mv4_b(c, enc, &wb[3], &mid_bt, &ao_bt, dim, a.o_groups * a.o_lora, batch) {
+        no!("wo_b пакетом не закодировался");
+    }
+
+    // ── glue and MoE, one pass ──
+    let hcp = uniform_u32x8(
+        c,
+        [hc as u32, dim as u32, g.sinkhorn_iters as u32, g.hc_eps.to_bits(), 0, 0, 0, 0],
+    );
+    let hcp_n = uniform_u32x8(
+        c,
+        [hc as u32, dim as u32, g.sinkhorn_iters as u32, g.hc_eps.to_bits(), 1, mix_hc as u32, 0, 0],
+    );
+    // The routing description: per-token forced rows when the layer hashes.
+    let has_forced = forced_rows.is_some_and(|f| f.iter().any(|r| r.is_some()));
+    if has_forced {
+        let mut rows = vec![0u32; batch * m.top_k];
+        for (t, r) in forced_rows.unwrap().iter().enumerate() {
+            let Some(r) = r else {
+                no!("хэш-слой без строки токена {t}");
+            };
+            if r.len() < m.top_k {
+                no!("хэш-строка токена {t} короче top_k");
+            }
+            for (i, &e) in r[..m.top_k].iter().enumerate() {
+                rows[t * m.top_k + i] = e as u32;
+            }
+        }
+        c.queue
+            .write_buffer(&forced_bt, 0, bytemuck::cast_slice(&rows));
+    }
+    {
+        let mut pass = begin_pass(enc);
+        let expand = |pass: &mut wgpu::ComputePass<'_>, tag: u8, x: &wgpu::Buffer,
+                      res: &wgpu::Buffer, out: &wgpu::Buffer| {
+            let bind = cached_bind(c, bk(tag), || {
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.bt_hc_post_expand.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, x),
+                        bind_buf(1, res),
+                        bind_buf(2, &hpost_bt),
+                        bind_buf(3, &hcomb_bt),
+                        bind_buf(4, out),
+                        bind_buf(5, &hcp),
+                    ],
+                })
+            });
+            pass.set_pipeline(&c.bt_hc_post_expand);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(((hc * dim) as u32).div_ceil(256), batch as u32, 1);
+        };
+        let mix = |pass: &mut wgpu::ComputePass<'_>, tag: u8, fnw: &wgpu::Buffer,
+                   state: &wgpu::Buffer| {
+            // The walk picks the 1024-thread kernel below 64 rows; the twin
+            // must reduce in the same tree.
+            let pipe = if mix_hc < 64 {
+                &c.bt_f32_matvec_x
+            } else {
+                &c.bt_f32_matvec_w
+            };
+            let bind = cached_bind(c, bk(tag), || {
+                let p = uniform_u32x4(c, [(hc * dim) as u32, mix_hc as u32, 0, 0]);
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &pipe.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, fnw),
+                        bind_buf(1, state),
+                        bind_buf(2, &mixes_bt),
+                        bind_buf(3, &p),
+                    ],
+                })
+            });
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(mix_hc as u32, batch as u32, 1);
+        };
+        let fold = |pass: &mut wgpu::ComputePass<'_>, tag: u8, state: &wgpu::Buffer,
+                    sc: &wgpu::Buffer, bs: &wgpu::Buffer, nw: &wgpu::Buffer| {
+            let bind = cached_bind(c, bk(tag), || {
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.bt_hc_pre_fold.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, state),
+                        bind_buf(1, &mixes_bt),
+                        bind_buf(2, sc),
+                        bind_buf(3, bs),
+                        bind_buf(4, &fold_bt),
+                        bind_buf(5, &hpost_bt),
+                        bind_buf(6, &hcomb_bt),
+                        bind_buf(7, &hcp_n),
+                        bind_buf(8, nw),
+                        bind_buf(9, &x2_bt),
+                    ],
+                })
+            });
+            pass.set_pipeline(&c.bt_hc_pre_fold);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(batch as u32, 1, 1);
+        };
+        // expand the attention output into the state...
+        expand(&mut pass, 214, &ao_bt, &state_bt, &state2_bt);
+        // ...then the FFN half's fold and norm...
+        mix(&mut pass, 215, &ffn_fn, &state2_bt);
+        fold(&mut pass, 216, &state2_bt, &ffn_sc, &ffn_bs, &ffn_nw);
+        // ...router logits over the normed fold...
+        {
+            let pipe = if n_pack < 64 {
+                &c.bt_f32_matvec_x
+            } else {
+                &c.bt_f32_matvec_w
+            };
+            let bind = cached_bind(c, bk(217), || {
+                let p = uniform_u32x4(c, [m.hidden as u32, n_pack as u32, 0, 0]);
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &pipe.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &router),
+                        bind_buf(1, &x2_bt),
+                        bind_buf(2, &logit_bt),
+                        bind_buf(3, &p),
+                    ],
+                })
+            });
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(n_pack as u32, batch as u32, 1);
+        }
+        // ...route, gate/up, down...
+        let bs = match w.moe.bias {
+            Some(b) if b.len() >= n_pack => const_buf(c, bytemuck::cast_slice(&b[..n_pack])),
+            _ => logit_bt.clone(),
+        };
+        let rflags = (w.moe.bias.is_some_and(|b| b.len() >= n_pack) as u32)
+            | ((has_forced as u32) << 2)
+            | 8
+            | ((n_pack as u32) << 8);
+        let mk = frame_buf(c, 17, n_pack * 4, true);
+        let rmap = frame_buf(c, 26, n_pack.max(1) * 4, true);
+        let cold = fb(203, 4 * m.top_k, false);
+        {
+            let bind = cached_bind(c, bk(218), || {
+                let rp = uniform_mixed(c, [n_pack as u32, m.top_k as u32, rflags], m.route_scale);
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.bt_moe_route.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &logit_bt),
+                        bind_buf(1, &bs),
+                        bind_buf(2, &mk),
+                        bind_buf(3, &forced_bt),
+                        bind_buf(4, &msel_bt),
+                        bind_buf(5, &mwt_bt),
+                        bind_buf(6, &mcnt_bt),
+                        bind_buf(7, &rp),
+                        bind_buf(8, &rmap),
+                        bind_buf(9, &cold),
+                    ],
+                })
+            });
+            pass.set_pipeline(&c.bt_moe_route);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(batch as u32, 1, 1);
+        }
+        let stride16 = |rows: usize, cols: usize, q2: bool| -> u32 {
+            let dt = if q2 {
+                cortiq_core::TensorDtype::Q2TiledP
+            } else {
+                cortiq_core::TensorDtype::Q4TiledP
+            };
+            (cortiq_core::quant::expected_nbytes(dt, &[rows, cols]).unwrap_or(0) / 2) as u32
+        };
+        let gu_u = uniform_u32x8(
+            c,
+            [
+                (m.hidden / 32) as u32,
+                m.inter as u32,
+                slots as u32,
+                stride16(m.inter, m.hidden, m.gu_q2),
+                m.swiglu_limit.to_bits(),
+                0,
+                0,
+                0,
+            ],
+        );
+        let dn_u = uniform_u32x4(
+            c,
+            [
+                (m.inter / 32) as u32,
+                m.hidden as u32,
+                slots as u32,
+                stride16(m.hidden, m.inter, false),
+            ],
+        );
+        let p_gu = if m.gu_q2 {
+            &c.bt_moe_gate_up_q2tp
+        } else {
+            &c.moe_gate_up_q4tp_b
+        };
+        let bind = cached_bind(c, bk(219), || {
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &p_gu.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, &gate_all),
+                    bind_buf(1, &up_all),
+                    bind_buf(2, &x2_bt),
+                    bind_buf(3, &msel_bt),
+                    bind_buf(4, &mact_bt),
+                    bind_buf(5, &gu_u),
+                ],
+            })
+        });
+        pass.set_pipeline(p_gu);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(m.inter as u32, slots as u32, batch as u32);
+        let bind = cached_bind(c, bk(220), || {
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &c.moe_down_q4tp_b.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, &down_all),
+                    bind_buf(1, &mact_bt),
+                    bind_buf(2, &msel_bt),
+                    bind_buf(3, &mwt_bt),
+                    bind_buf(4, &mo_bt),
+                    bind_buf(5, &dn_u),
+                ],
+            })
+        });
+        pass.set_pipeline(&c.moe_down_q4tp_b);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(m.hidden as u32, batch as u32, 1);
+        // ...expand the MoE output back into the state...
+        expand(&mut pass, 221, &mo_bt, &state2_bt, &state_bt);
+        // ...and prepare the NEXT layer.
+        if let Some(nf) = w.hc_next_fn {
+            let nfn = const_buf(c, bytemuck::cast_slice(nf));
+            let nsc = const_buf(c, bytemuck::cast_slice(w.hc_next_scale));
+            let nbs = const_buf(c, bytemuck::cast_slice(&w.hc_next_base[..mix_hc]));
+            mix(&mut pass, 222, &nfn, &state_bt);
+            fold(&mut pass, 223, &state_bt, &nsc, &nbs, &next_nw);
+        }
+    }
+    if w.hc_next_fn.is_some() && !dsv4_skip("nextq") {
+        if !encode_q4tp_mv4_b(c, enc, &wb[4], &x2_bt, &qr_bt, a.q_lora, dim, batch) {
+            no!("next-q пакетом не закодировался");
+        }
+        // The walk's 1024-thread rmsnorm per token — its reduction tree, so
+        // the LoRA vector the indexer scores with is bit-identical.
+        let mut pass = begin_pass(enc);
+        for t in 0..batch {
+            let tkey = (li * 8 + batch) * FRAME_TOK_STRIDE + t;
+            let off = (t * a.q_lora * 4) as u64;
+            let len = (a.q_lora * 4) as u64;
+            let bind = cached_bind(c, (227, kv_id, tkey), || {
+                let p = uniform_u32x4(c, [a.q_lora as u32, 0, a.eps.to_bits(), 0]);
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.rmsnorm.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf_off(0, &qr_bt, off, len),
+                        bind_buf(1, &next_qn),
+                        bind_buf_off(2, &qn_bt, off, len),
+                        bind_buf(3, &p),
+                    ],
+                })
+            });
+            pass.set_pipeline(&c.rmsnorm);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+    }
+    let src = if w.hc_next_fn.is_some() {
+        x2_bt.clone()
+    } else {
+        ao_bt.clone()
+    };
+    Some((src, state_bt))
 }
 
 pub fn dsv4_layer_chain(
@@ -19374,6 +21213,114 @@ pub fn dsv4_state_add_cold(cold: &[f32], hc: usize, state_out: &mut [f32]) -> bo
 /// MoE routing on the device: scores in, chosen experts and their normalised
 /// weights out, in selection order. `forced` is the hash layers' table row.
 #[allow(clippy::too_many_arguments)]
+/// The token-axis router against the same contract, `b` tokens at once:
+/// `scores` is `[b, n]`, outputs are `[b, top_k+1]`. Exercises exactly the
+/// kernel the batched frame dispatches.
+#[allow(clippy::too_many_arguments)]
+pub fn bt_moe_route_for_test(
+    scores: &[f32],
+    b: usize,
+    bias: Option<&[f32]>,
+    forced: Option<&[Vec<usize>]>,
+    top_k: usize,
+    route_scale: f32,
+    idx_out: &mut Vec<usize>,
+    w_out: &mut Vec<f32>,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let n = scores.len() / b.max(1);
+    if n == 0 || n > 1024 || top_k == 0 || top_k > 64 || b == 0 {
+        return false;
+    }
+    let slots = top_k + 1;
+    let sb = storage_bytes(c, bytemuck::cast_slice(scores));
+    let bb = match bias {
+        Some(v) if v.len() >= n => storage_bytes(c, bytemuck::cast_slice(&v[..n])),
+        _ => sb.clone(),
+    };
+    let mb = storage_bytes(c, bytemuck::cast_slice(&vec![1u32; n]));
+    let fbuf = match forced {
+        Some(rows) if rows.len() >= b => {
+            let mut v = vec![0u32; b * top_k];
+            for (t, r) in rows.iter().enumerate() {
+                for (i, &e) in r.iter().take(top_k).enumerate() {
+                    v[t * top_k + i] = e as u32;
+                }
+            }
+            storage_bytes(c, bytemuck::cast_slice(&v))
+        }
+        _ => storage_bytes(c, bytemuck::cast_slice(&vec![0u32; b * top_k])),
+    };
+    let ib = rw_f32(c, b * slots, true);
+    let wb = rw_f32(c, b * slots, true);
+    let cnt = rw_f32(c, b, true);
+    let rmb = storage_bytes(c, bytemuck::cast_slice(&vec![0u32; n]));
+    let coldb = rw_f32(c, b * 4 * top_k, false);
+    let flags = (bias.is_some_and(|v| v.len() >= n) as u32)
+        | ((forced.is_some() as u32) << 2)
+        | 8
+        | ((n as u32) << 8);
+    let p = uniform_mixed(c, [n as u32, top_k as u32, flags], route_scale);
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bt-route-test"),
+        });
+    {
+        let layout = c.bt_moe_route.get_bind_group_layout(0);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                bind_buf(0, &sb),
+                bind_buf(1, &bb),
+                bind_buf(2, &mb),
+                bind_buf(3, &fbuf),
+                bind_buf(4, &ib),
+                bind_buf(5, &wb),
+                bind_buf(6, &cnt),
+                bind_buf(7, &p),
+                bind_buf(8, &rmb),
+                bind_buf(9, &coldb),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.bt_moe_route);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(b as u32, 1, 1);
+    }
+    let ib_bytes = (b * slots * 4) as u64;
+    let mut iv = vec![0.0f32; b * slots];
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        ib_bytes,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "bt-route-stage",
+    );
+    if !readback(c, enc, &ib, &stage, ib_bytes, &mut iv) {
+        return false;
+    }
+    let iu: Vec<u32> = bytemuck::cast_slice(&iv).to_vec();
+    idx_out.clear();
+    idx_out.extend(iu.iter().map(|&x| x as usize));
+    let mut enc2 = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bt-route-test-w"),
+        });
+    let _ = &mut enc2;
+    let mut wv = vec![0.0f32; b * slots];
+    if !readback(c, enc2, &wb, &stage, ib_bytes, &mut wv) {
+        return false;
+    }
+    w_out.clear();
+    w_out.extend_from_slice(&wv);
+    drop(sc);
+    true
+}
+
 pub fn moe_route_for_test(
     scores: &[f32],
     bias: Option<&[f32]>,

@@ -527,6 +527,10 @@ enum Commands {
     Info {
         /// Path to .cmf model file
         model: String,
+        /// List directory entries whose name starts with this prefix
+        /// (name, dtype, shape, bytes), with a per-prefix total.
+        #[arg(long)]
+        tensors: Option<String>,
     },
     /// List available masks
     Masks {
@@ -1182,7 +1186,7 @@ async fn main() -> anyhow::Result<()> {
             },
             o1_prefill,
         ),
-        Commands::Info { model } => cmd_info(&model).await,
+        Commands::Info { model, tensors } => cmd_info(&model, tensors.as_deref()).await,
         Commands::Story { model } => cmd_story(&model),
         Commands::Diff { a, b } => cmd_diff(&a, &b),
         Commands::Imagine {
@@ -2621,9 +2625,21 @@ fn metal_submits_per_token(tokens: usize) -> f64 {
     }
 }
 
-async fn cmd_info(model_path: &str) -> anyhow::Result<()> {
+async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()> {
     let model = CmfModel::open_sharded(model_path)?;
     let arch = model.arch();
+
+    if let Some(prefix) = tensors {
+        let mut total = 0u64;
+        let mut n = 0usize;
+        for e in model.tensors.iter().filter(|e| e.name.starts_with(prefix)) {
+            println!("{}\t{:?}\t{:?}\t{}", e.name, e.dtype, e.shape, e.nbytes);
+            total += e.nbytes;
+            n += 1;
+        }
+        println!("# {n} tensors, {total} bytes ({:.2} GiB)", total as f64 / (1 << 30) as f64);
+        return Ok(());
+    }
 
     let count = |k: cortiq_core::LayerType| arch.layer_types.iter().filter(|&&t| t == k).count();
     let full = count(cortiq_core::LayerType::FullAttention);
