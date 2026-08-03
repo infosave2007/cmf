@@ -13622,6 +13622,21 @@ fn encode_f32matvec_k(
     cols: usize,
     bkey: (u8, u64, usize),
 ) {
+    let mut pass = begin_pass(enc);
+    encode_f32matvec_k_p(&mut pass, c, weight, xs, y, rows, cols, bkey);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_f32matvec_k_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    bkey: (u8, u64, usize),
+) {
     let bind = cached_bind(c, bkey, || {
         let p_buf = uniform_u32x4(c, [cols as u32, rows as u32, 0, 0]);
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -13635,7 +13650,6 @@ fn encode_f32matvec_k(
             ],
         })
     });
-    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.f32_matvec);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
@@ -13816,6 +13830,21 @@ fn encode_q4tp_mv1(
     cols: usize,
     bkey: (u8, u64, usize),
 ) {
+    let mut pass = begin_pass(enc);
+    encode_q4tp_mv1_p(&mut pass, c, weight, xs, y, rows, cols, bkey);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_q4tp_mv1_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    bkey: (u8, u64, usize),
+) {
     let bind = cached_bind(c, bkey, || {
         let p_buf = uniform_u32x4(c, [(cols / 32) as u32, rows as u32, cols as u32, 0]);
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -13829,7 +13858,6 @@ fn encode_q4tp_mv1(
             ],
         })
     });
-    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.q4tp_mv);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
@@ -16046,6 +16074,24 @@ fn encode_hc_fold_k(
     p: &wgpu::Buffer,
     bkey: (u8, u64, usize),
 ) {
+    let mut pass = begin_pass(enc);
+    encode_hc_fold_k_p(&mut pass, c, state, mixes, sc, base, fold, post, comb, p, bkey);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_hc_fold_k_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
+    state: &wgpu::Buffer,
+    mixes: &wgpu::Buffer,
+    sc: &wgpu::Buffer,
+    base: &wgpu::Buffer,
+    fold: &wgpu::Buffer,
+    post: &wgpu::Buffer,
+    comb: &wgpu::Buffer,
+    p: &wgpu::Buffer,
+    bkey: (u8, u64, usize),
+) {
     let bind = cached_bind(c, bkey, || c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &c.hc_pre_fold.get_bind_group_layout(0),
@@ -16060,7 +16106,6 @@ fn encode_hc_fold_k(
             bind_buf(7, p),
         ],
     }));
-    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.hc_pre_fold);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(1, 1, 1);
@@ -16112,6 +16157,24 @@ fn encode_hc_expand_k(
     dim: usize,
     bkey: (u8, u64, usize),
 ) {
+    let mut pass = begin_pass(enc);
+    encode_hc_expand_k_p(&mut pass, c, x, res, post, comb, out, p, hc, dim, bkey);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_hc_expand_k_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
+    x: &wgpu::Buffer,
+    res: &wgpu::Buffer,
+    post: &wgpu::Buffer,
+    comb: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    p: &wgpu::Buffer,
+    hc: usize,
+    dim: usize,
+    bkey: (u8, u64, usize),
+) {
     let bind = cached_bind(c, bkey, || c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &c.hc_post_expand.get_bind_group_layout(0),
@@ -16124,7 +16187,6 @@ fn encode_hc_expand_k(
             bind_buf(5, p),
         ],
     }));
-    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.hc_post_expand);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(((hc * dim) as u32).div_ceil(256), 1, 1);
@@ -16223,6 +16285,30 @@ fn encode_attn_chain(
 fn encode_moe_chain(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
+    logits: &wgpu::Buffer,
+    x: &wgpu::Buffer,
+    msel: &wgpu::Buffer,
+    mwt: &wgpu::Buffer,
+    mcnt: &wgpu::Buffer,
+    mact: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    gate_all: &wgpu::Buffer,
+    up_all: &wgpu::Buffer,
+    down_all: &wgpu::Buffer,
+    w: &Dsv4LayerW,
+    g: Dsv4MoeGeom,
+    n_pack: usize,
+    slots: usize,
+    bkey: (u64, usize),
+) {
+    let mut pass = begin_pass(enc);
+    encode_moe_chain_p(&mut pass, c, logits, x, msel, mwt, mcnt, mact, out, gate_all, up_all, down_all, w, g, n_pack, slots, bkey);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_moe_chain_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
     logits: &wgpu::Buffer,
     x: &wgpu::Buffer,
     msel: &wgpu::Buffer,
@@ -16348,7 +16434,6 @@ fn encode_moe_chain(
             bind_buf(5, &dn_u),
         ],
     }));
-    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.moe_route);
     pass.set_bind_group(0, &bind_r, &[]);
     pass.dispatch_workgroups(1, 1, 1);
@@ -16750,37 +16835,54 @@ fn dsv4_layer_frame_enc(
                       &sink, &freq, &posb, a, kv_id, li, m_attend);
 
     // ── glue: expand, then the FFN half's fold and norm ──
-    encode_hc_expand_k(c, enc, &ao, &state, &hpost, &hcomb, &state2, &hcp, hc, dim,
-        (120, kv_id, li));
-    encode_f32matvec_k(c, enc, &ffn_fn, &state2, &mixes, mix_hc, hc * dim, (121, kv_id, li));
-    encode_hc_fold_k(c, enc, &state2, &mixes, &ffn_sc, &ffn_bs, &folded, &hpost, &hcomb, &hcp,
-        (122, kv_id, li));
-    encode_rmsnorm(c, enc, &folded, &ffn_nw, &x2, dim, a.eps, (50, kv_id, li));
+    // Everything from the attention output to the next layer's input is one
+    // chain of dependent dispatches with no copy in the middle, so it is ONE
+    // pass. Twelve passes' worth of driver bookkeeping a layer went here,
+    // and on a small layer that bookkeeping IS the token.
+    let mut copy_qn = false;
+    {
+        let mut pass = begin_pass(enc);
+        encode_hc_expand_k_p(&mut pass, c, &ao, &state, &hpost, &hcomb, &state2, &hcp, hc, dim,
+            (120, kv_id, li));
+        encode_f32matvec_k_p(&mut pass, c, &ffn_fn, &state2, &mixes, mix_hc, hc * dim,
+            (121, kv_id, li));
+        encode_hc_fold_k_p(&mut pass, c, &state2, &mixes, &ffn_sc, &ffn_bs, &folded, &hpost,
+            &hcomb, &hcp, (122, kv_id, li));
+        encode_rmsnorm_p(&mut pass, c, &folded, &ffn_nw, &x2, dim, a.eps, (50, kv_id, li));
 
-    // ── MoE half ──
-    encode_f32matvec_k(c, enc, &router, &x2, &logit_b, n_pack, m.hidden, (123, kv_id, li));
-    encode_moe_chain(c, enc, &logit_b, &x2, &msel, &mwt, &mcnt, &mact, &mo,
-                     &gate_all, &up_all, &down_all, w, m, n_pack, slots, (kv_id, li));
+        // ── MoE half ──
+        encode_f32matvec_k_p(&mut pass, c, &router, &x2, &logit_b, n_pack, m.hidden,
+            (123, kv_id, li));
+        encode_moe_chain_p(&mut pass, c, &logit_b, &x2, &msel, &mwt, &mcnt, &mact, &mo,
+                           &gate_all, &up_all, &down_all, w, m, n_pack, slots, (kv_id, li));
 
-    // ── expand, then prepare the NEXT layer ──
-    encode_hc_expand_k(c, enc, &mo, &state2, &hpost, &hcomb, &state, &hcp, hc, dim,
-        (124, kv_id, li));
-    if let Some(nf) = w.hc_next_fn {
-        let nfn = const_buf(c, bytemuck::cast_slice(nf));
-        let nsc = const_buf(c, bytemuck::cast_slice(w.hc_next_scale));
-        let nbs = const_buf(c, bytemuck::cast_slice(&w.hc_next_base[..mix_hc]));
-        encode_f32matvec_k(c, enc, &nfn, &state, &mixes, mix_hc, hc * dim, (125, kv_id, li));
-        encode_hc_fold_k(c, enc, &state, &mixes, &nsc, &nbs, &folded, &hpost, &hcomb, &hcp,
-            (126, kv_id, li));
-        encode_rmsnorm(c, enc, &folded, &next_nw, &x2, dim, a.eps, (51, kv_id, li));
-        // The next layer's LoRA vector, but only when the host is not going
-        // to hand it over anyway — the indexer needs `qr` there, so today it
-        // projects it regardless and computing it twice is waste.
-        if qn.is_none() {
-            encode_q4tp_mv1(c, enc, &wb[4], &x2, &qr2, a.q_lora, dim, (52, kv_id, li));
-            encode_rmsnorm(c, enc, &qr2, &next_qn, &qn2, a.q_lora, a.eps, (53, kv_id, li));
-            enc.copy_buffer_to_buffer(&qn2, 0, &qnb, 0, (a.q_lora * 4) as u64);
+        // ── expand, then prepare the NEXT layer ──
+        encode_hc_expand_k_p(&mut pass, c, &mo, &state2, &hpost, &hcomb, &state, &hcp, hc, dim,
+            (124, kv_id, li));
+        if let Some(nf) = w.hc_next_fn {
+            let nfn = const_buf(c, bytemuck::cast_slice(nf));
+            let nsc = const_buf(c, bytemuck::cast_slice(w.hc_next_scale));
+            let nbs = const_buf(c, bytemuck::cast_slice(&w.hc_next_base[..mix_hc]));
+            encode_f32matvec_k_p(&mut pass, c, &nfn, &state, &mixes, mix_hc, hc * dim,
+                (125, kv_id, li));
+            encode_hc_fold_k_p(&mut pass, c, &state, &mixes, &nsc, &nbs, &folded, &hpost,
+                &hcomb, &hcp, (126, kv_id, li));
+            encode_rmsnorm_p(&mut pass, c, &folded, &next_nw, &x2, dim, a.eps, (51, kv_id, li));
+            // The next layer's LoRA vector, but only when the host is not
+            // going to hand it over anyway — the indexer needs `qr` there, so
+            // today it projects it regardless and computing it twice is waste.
+            if qn.is_none() {
+                encode_q4tp_mv1_p(&mut pass, c, &wb[4], &x2, &qr2, a.q_lora, dim,
+                    (52, kv_id, li));
+                encode_rmsnorm_p(&mut pass, c, &qr2, &next_qn, &qn2, a.q_lora, a.eps,
+                    (53, kv_id, li));
+                copy_qn = true;
+            }
         }
+    }
+    // Outside the pass: a buffer-to-buffer copy cannot be recorded inside one.
+    if copy_qn {
+        enc.copy_buffer_to_buffer(&qn2, 0, &qnb, 0, (a.q_lora * 4) as u64);
     }
 
     // The next layer's input. It stays here: `folded` is where the next
@@ -17255,6 +17357,21 @@ fn encode_rmsnorm(
     eps: f32,
     bkey: (u8, u64, usize),
 ) {
+    let mut pass = begin_pass(enc);
+    encode_rmsnorm_p(&mut pass, c, x, w, o, n, eps, bkey);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_rmsnorm_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
+    x: &wgpu::Buffer,
+    w: &wgpu::Buffer,
+    o: &wgpu::Buffer,
+    n: usize,
+    eps: f32,
+    bkey: (u8, u64, usize),
+) {
     let bind = cached_bind(c, bkey, || {
         let p = uniform_u32x4(c, [n as u32, 0, eps.to_bits(), 0]);
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -17268,7 +17385,6 @@ fn encode_rmsnorm(
             ],
         })
     });
-    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.rmsnorm);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(1, 1, 1);
@@ -17278,6 +17394,24 @@ fn encode_rmsnorm(
 fn encode_rope_heads(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
+    x: &wgpu::Buffer,
+    freq: &wgpu::Buffer,
+    posb: &wgpu::Buffer,
+    nh: usize,
+    hd: usize,
+    rd: usize,
+    rms: bool,
+    inverse: bool,
+    bkey: (u8, u64, usize),
+) {
+    let mut pass = begin_pass(enc);
+    encode_rope_heads_p(&mut pass, c, x, freq, posb, nh, hd, rd, rms, inverse, bkey);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_rope_heads_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
     x: &wgpu::Buffer,
     freq: &wgpu::Buffer,
     posb: &wgpu::Buffer,
@@ -17302,7 +17436,6 @@ fn encode_rope_heads(
             ],
         })
     });
-    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.rope_heads);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(nh as u32, 1, 1);
@@ -17498,6 +17631,20 @@ fn encode_axpy(
     n: usize,
     bkey: (u8, u64, usize),
 ) {
+    let mut pass = begin_pass(enc);
+    encode_axpy_p(&mut pass, c, d, y, w, n, bkey);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_axpy_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
+    d: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    w: f32,
+    n: usize,
+    bkey: (u8, u64, usize),
+) {
     let bind = cached_bind(c, bkey, || {
         let p = uniform_mixed(c, [n as u32, 0, 0], w);
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -17506,7 +17653,6 @@ fn encode_axpy(
             entries: &[bind_buf(0, d), bind_buf(1, y), bind_buf(2, &p)],
         })
     });
-    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.axpy);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
@@ -17967,30 +18113,52 @@ pub fn dsv4_indexer_frame(
     let pick = frame_buf(c, 94, g.top_k.max(1) * 4, false);
     let cnt = frame_buf(c, 95, 4, false);
 
-    encode_q4tp_mv1(c, enc, &wb[0], qn, &qi, g.ih * g.idim, g.q_lora, (96, kv_id, li));
     let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..g.rope_dim / 2]));
     let posb = frame_up_pos(c, 97, pos, g.eps);
-    encode_rope_heads(c, enc, &qi, &freq, &posb, g.ih, g.idim, g.rope_dim, false, false,
-        (98, kv_id, li));
-    encode_q4tp_mv1(c, enc, &wb[1], hidden, &hw_raw, g.ih, g.hidden, (99, kv_id, li));
     // The reference folds head_dim^-0.5 · n_heads^-0.5 into weights_proj's
     // output. A uniform positive factor cannot change which positions win,
     // but the scores are the kernel's contract, not just a ranking key.
     let sc_factor = (g.idim as f32).powf(-0.5) * (g.ih as f32).powf(-0.5);
-    encode_fill_zero(c, enc, &hw, g.ih, (100, kv_id, li));
-    encode_axpy(c, enc, &hw_raw, &hw, sc_factor, g.ih, (101, kv_id, li));
-
-    encode_index_scores(c, enc, &qi, index_kv, &hw, &scores, g.ih, g.idim, limit,
-        (kv_id, li));
-    encode_top_k(c, enc, &scores, &pick, &cnt, limit, g.top_k, (kv_id, li));
     let k_actual = g.top_k.min(limit);
-    encode_idx_build(c, enc, &pick, out_idx, win_len, g.window, k_actual, Some((kv_id, li)));
+    // EIGHT dispatches, ONE pass. Each is a step of the one before it, and
+    // dispatches inside a compute pass already run in order with the writes
+    // of the previous one visible — so the eight passes this used to open
+    // bought nothing but eight lots of driver bookkeeping, which on a small
+    // layer is most of what the token costs.
+    {
+        let mut pass = begin_pass(enc);
+        encode_q4tp_mv1_p(&mut pass, c, &wb[0], qn, &qi, g.ih * g.idim, g.q_lora,
+            (96, kv_id, li));
+        encode_rope_heads_p(&mut pass, c, &qi, &freq, &posb, g.ih, g.idim, g.rope_dim,
+            false, false, (98, kv_id, li));
+        encode_q4tp_mv1_p(&mut pass, c, &wb[1], hidden, &hw_raw, g.ih, g.hidden,
+            (99, kv_id, li));
+        encode_fill_zero_p(&mut pass, c, &hw, g.ih, (100, kv_id, li));
+        encode_axpy_p(&mut pass, c, &hw_raw, &hw, sc_factor, g.ih, (101, kv_id, li));
+        encode_index_scores_p(&mut pass, c, &qi, index_kv, &hw, &scores, g.ih, g.idim,
+            limit, (kv_id, li));
+        encode_top_k_p(&mut pass, c, &scores, &pick, &cnt, limit, g.top_k, (kv_id, li));
+        encode_idx_build_p(&mut pass, c, &pick, out_idx, win_len, g.window, k_actual,
+            Some((kv_id, li)));
+    }
     Some(win_len + k_actual)
 }
 
 fn encode_fill_zero(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
+    y: &wgpu::Buffer,
+    n: usize,
+    bkey: (u8, u64, usize),
+) {
+    let mut pass = begin_pass(enc);
+    encode_fill_zero_p(&mut pass, c, y, n, bkey);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_fill_zero_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
     y: &wgpu::Buffer,
     n: usize,
     bkey: (u8, u64, usize),
@@ -18003,7 +18171,6 @@ fn encode_fill_zero(
             entries: &[bind_buf(0, y), bind_buf(1, &p)],
         })
     });
-    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.zero);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
@@ -18013,6 +18180,23 @@ fn encode_fill_zero(
 fn encode_index_scores(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
+    q: &wgpu::Buffer,
+    kv: &wgpu::Buffer,
+    hw: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    nh: usize,
+    hd: usize,
+    n_pos: usize,
+    bkey: (u64, usize),
+) {
+    let mut pass = begin_pass(enc);
+    encode_index_scores_p(&mut pass, c, q, kv, hw, out, nh, hd, n_pos, bkey);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_index_scores_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
     q: &wgpu::Buffer,
     kv: &wgpu::Buffer,
     hw: &wgpu::Buffer,
@@ -18039,7 +18223,6 @@ fn encode_index_scores(
             ],
         })
     });
-    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.index_scores);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((n_pos as u32).min(MAX_WG), 1, 1);
@@ -18048,6 +18231,21 @@ fn encode_index_scores(
 fn encode_top_k(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
+    scores: &wgpu::Buffer,
+    pick: &wgpu::Buffer,
+    cnt: &wgpu::Buffer,
+    n: usize,
+    k: usize,
+    bkey: (u64, usize),
+) {
+    let mut pass = begin_pass(enc);
+    encode_top_k_p(&mut pass, c, scores, pick, cnt, n, k, bkey);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_top_k_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
     scores: &wgpu::Buffer,
     pick: &wgpu::Buffer,
     cnt: &wgpu::Buffer,
@@ -18068,7 +18266,6 @@ fn encode_top_k(
             ],
         })
     });
-    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.top_k_index);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(1, 1, 1);
@@ -18082,6 +18279,24 @@ fn encode_top_k(
 fn encode_idx_build(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
+    pick: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    win_len: usize,
+    window: usize,
+    k: usize,
+    // The indexer path binds stable buffers and can keep its group; the
+    // prep fallback's pick buffer changes identity with its length, so it
+    // passes None and builds a fresh group each call.
+    bkey: Option<(u64, usize)>,
+) {
+    let mut pass = begin_pass(enc);
+    encode_idx_build_p(&mut pass, c, pick, out, win_len, window, k, bkey);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_idx_build_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
     pick: &wgpu::Buffer,
     out: &wgpu::Buffer,
     win_len: usize,
@@ -18107,7 +18322,6 @@ fn encode_idx_build(
         }
         None => mk(&uniform_u32x4(c, [win_len as u32, window as u32, k as u32, 0])),
     };
-    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.idx_build);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
