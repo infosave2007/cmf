@@ -22,6 +22,22 @@ subs=$(env $E CMF_DSV4_CHAIN=1 CMF_DSV4_PROFILE=1 ./target/release/cortiq run $S
 [ -z "$subs" ] && { echo "GATE ABORT: цепочка не включилась"; exit 1; }
 echo "цепочка: $subs"
 
+# The CPU arm. The chain and the layer frame run the SAME kernels, so a
+# kernel that computes the wrong thing makes both of them agree — which is
+# exactly how a rewritten projection passed this gate and then read 133.433
+# where the CPU read 133.396. The host path is the only reference that is
+# not also the thing under test.
+echo "--- против CPU (стенды без индексатора обязаны совпасть) ---"
+for toy in plain4 sc4; do
+  cpu=$(env CMF_SDOT=0 CMF_GPU=off ./target/release/cortiq ppl $S/$toy.cmf --file $S/long.txt --tokens 120 2>/dev/null | grep -o "PPL = [0-9.]*")
+  gpu=$(env $E CMF_DSV4_CHAIN=1 ./target/release/cortiq ppl $S/$toy.cmf --file $S/long.txt --tokens 120 2>/dev/null | grep -o "PPL = [0-9.]*")
+  if [ "$cpu" != "$gpu" ]; then
+    echo "$toy  CPU:$cpu  карта:$gpu  ← РАСХОЖДЕНИЕ С ХОСТОМ"
+    exit 1
+  fi
+  echo "$toy  CPU:$cpu  карта:$gpu"
+done
+
 fail=0
 for toy in hx4 plain4 sc4 q4 big2; do
   a=$(env $E CMF_DSV4_CHAIN=0 ./target/release/cortiq ppl $S/$toy.cmf --file $S/long.txt --tokens 120 2>/dev/null | grep -o "PPL = [0-9.]*")
