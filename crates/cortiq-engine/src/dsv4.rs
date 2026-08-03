@@ -1919,7 +1919,7 @@ fn dsv4_layer_loop(
             if run.len() >= chain_max() {
                 let need_qn = run[0] == 0 || !on_dev[run[0] - 1];
                 if !dsv4_chain_run(
-                    layers, &run, cfg, g, st, token_id, &mut folded, None, 1, need_qn, pool,
+                    layers, &run, cfg, g, st, token_id, &mut folded, None, 1, &[], need_qn, pool,
                 ) {
                     return false;
                 }
@@ -1930,7 +1930,7 @@ fn dsv4_layer_loop(
         if chain
             && !run.is_empty()
             && !dsv4_chain_run(
-                layers, &run, cfg, g, st, token_id, &mut folded, None, 1,
+                layers, &run, cfg, g, st, token_id, &mut folded, None, 1, &[],
                 run[0] == 0 || !on_dev[run[0] - 1], pool,
             )
         {
@@ -2156,13 +2156,13 @@ fn dsv4_layer_loop(
             let ok = if carry {
                 let r = dsv4_chain_run(
                     layers, &run, cfg, g, st, token_id, &mut folded,
-                    Some(state), 1, need_qn, pool,
+                    Some(state), 1, &[], need_qn, pool,
                 );
                 state_home = r;
                 r
             } else {
                 dsv4_chain_run(
-                    layers, &run, cfg, g, st, token_id, &mut folded, None, 1, need_qn, pool,
+                    layers, &run, cfg, g, st, token_id, &mut folded, None, 1, &[], need_qn, pool,
                 )
             };
             if !ok {
@@ -2282,6 +2282,10 @@ fn dsv4_chain_run(
     // How many consecutive tokens this run carries. One is decode; more is a
     // prompt chunk or a speculative verify, which are the same shape of work.
     batch: usize,
+    // Their ids, needed only when `batch > 1`: a hash layer forces its expert
+    // list from the token's id, so the batch needs one list per token and the
+    // single `token_id` above cannot supply them.
+    batch_ids: &[u32],
     // Whether the device's qn buffer is stale: true at layer zero and after
     // a host layer. When the previous layer was chained, its frame's tail
     // already left THIS layer's LoRA vector on the card, and recomputing it
@@ -2505,8 +2509,29 @@ fn dsv4_chain_run(
         if state_out.is_some() {
             return false;
         }
+        // One forced row per token: same layers, the hash rows re-derived
+        // from each token's own id.
+        let mut forced_pt: Vec<Vec<Option<Vec<usize>>>> = Vec::with_capacity(batch);
+        for t in 0..batch {
+            let id = batch_ids.get(t).copied().unwrap_or(token_id);
+            let mut row = Vec::with_capacity(run.len());
+            for (i, &li) in run.iter().enumerate() {
+                row.push(layers[li].tid2eid.as_ref().and_then(|tbl| {
+                    let v: Vec<usize> = hash_route(tbl, cfg.vocab, cfg.top_k, id)
+                        .into_iter()
+                        .map(|gi| packs[i].to_slot[gi])
+                        .collect();
+                    if v.iter().any(|&x| x == usize::MAX) { None } else { Some(v) }
+                }));
+                if layers[li].tid2eid.is_some() && row[i].is_none() {
+                    return false;
+                }
+            }
+            forced_pt.push(row);
+        }
         if !crate::gpu_wgpu::dsv4_chain_batch(
-            &model, &items, st.kv_id, first, &freqs, st.pos, batch, &mut out,
+            &model, &items, st.kv_id, first, &freqs, st.pos, batch,
+            Some(&forced_pt), &mut out,
         ) {
             return false;
         }
@@ -3573,8 +3598,6 @@ fn forward_chunk_batched(
             "токенов меньше двух"
         } else if !chain_enabled() {
             "цепочка выключена"
-        } else if layers.iter().any(|l| l.tid2eid.is_some()) {
-            "есть хеш-слои"
         } else if !st.dev_owned {
             "карта ещё не владеет состоянием"
         } else if st.dev_set.len() != layers.len() || !st.dev_set.iter().all(|&x| x) {
@@ -3627,6 +3650,7 @@ fn forward_chunk_batched(
             &mut folded,
             None,
             b,
+            ids,
             true,
             pool,
         ) {
