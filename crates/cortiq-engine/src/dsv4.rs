@@ -1080,6 +1080,7 @@ pub(crate) mod prof {
                     &crate::gpu_wgpu::CHAIN_WAIT_NS,
                     &crate::gpu_wgpu::CHAIN_LAYERS,
                     &crate::gpu_wgpu::CHAIN_RUNS,
+                    &crate::gpu_wgpu::SUBMITS,
                 ] {
                     a.store(0, Ordering::Relaxed);
                 }
@@ -1154,6 +1155,13 @@ pub(crate) mod prof {
             // frame's own report, and the chain does not use the MoE frame —
             // so the one number that says where a chained token goes was
             // printed only when the chain was not running.
+            let sub = crate::gpu_wgpu::SUBMITS.load(Ordering::Relaxed);
+            if sub > 0 {
+                eprintln!(
+                    "[dsv4-профиль] ОТПРАВОК на карту: {:.1} на токен",
+                    sub as f64 / toks as f64,
+                );
+            }
             let cl = crate::gpu_wgpu::CHAIN_LAYERS.load(Ordering::Relaxed);
             if cl > 0 {
                 let toks2 = toks.max(1) as f64;
@@ -1861,7 +1869,9 @@ fn dsv4_layer_loop(
             // encoder contaminate each other" in a single ppl run.
             if run.len() >= chain_max() {
                 let need_qn = run[0] == 0 || !on_dev[run[0] - 1];
-                if !dsv4_chain_run(layers, &run, cfg, g, st, token_id, &mut folded, need_qn, pool) {
+                if !dsv4_chain_run(
+                    layers, &run, cfg, g, st, token_id, &mut folded, None, need_qn, pool,
+                ) {
                     return false;
                 }
                 run.clear();
@@ -1871,7 +1881,7 @@ fn dsv4_layer_loop(
         if chain
             && !run.is_empty()
             && !dsv4_chain_run(
-                layers, &run, cfg, g, st, token_id, &mut folded,
+                layers, &run, cfg, g, st, token_id, &mut folded, None,
                 run[0] == 0 || !on_dev[run[0] - 1], pool,
             )
         {
@@ -2072,18 +2082,37 @@ fn dsv4_layer_loop(
         }
         folded = next;
     }
+    let mut state_home = false;
     if chain {
-        if !run.is_empty()
-            && !dsv4_chain_run(
-                layers, &run, cfg, g, st, token_id, &mut folded,
-                run[0] == 0 || !on_dev[run[0] - 1], pool,
-            )
-        {
-            return false;
+        if !run.is_empty() {
+            // The token's LAST run brings the state back with it. Only the
+            // last: an earlier run's state is one the layers after it still
+            // change.
+            let need_qn = run[0] == 0 || !on_dev[run[0] - 1];
+            let last_on_dev = *on_dev.last().unwrap_or(&false);
+            let carry = last_on_dev && run.last() == Some(&(layers.len() - 1));
+            let ok = if carry {
+                let r = dsv4_chain_run(
+                    layers, &run, cfg, g, st, token_id, &mut folded,
+                    Some(state), need_qn, pool,
+                );
+                state_home = r;
+                r
+            } else {
+                dsv4_chain_run(
+                    layers, &run, cfg, g, st, token_id, &mut folded, None, need_qn, pool,
+                )
+            };
+            if !ok {
+                return false;
+            }
         }
         if st.dev_set.is_empty() {
             st.dev_set = on_dev.clone();
         }
+    }
+    if state_home {
+        return true;
     }
     crate::gpu_wgpu::dsv4_state_read(state)
 }
@@ -2131,6 +2160,11 @@ fn dsv4_chain_run(
     // later segment starting from a stale fold: exact with one unbroken run,
     // release-scale garbage the moment anything splits the chain.
     folded: &mut Vec<f32>,
+    // When present, the hyper-connection state rides home in the run's own
+    // submission instead of costing a second fence afterwards. Only the
+    // token's LAST run passes it — an earlier one would read a state the
+    // layers after it still change.
+    state_out: Option<&mut [f32]>,
     // Whether the device's qn buffer is stale: true at layer zero and after
     // a host layer. When the previous layer was chained, its frame's tail
     // already left THIS layer's LoRA vector on the card, and recomputing it
@@ -2348,7 +2382,7 @@ fn dsv4_chain_run(
 
     let mut out = vec![0.0f32; dim];
     if !crate::gpu_wgpu::dsv4_layer_chain(
-        &model, &items, st.kv_id, first, &freqs, st.pos, &mut out,
+        &model, &items, st.kv_id, first, &freqs, st.pos, &mut out, state_out,
     ) {
         return false;
     }

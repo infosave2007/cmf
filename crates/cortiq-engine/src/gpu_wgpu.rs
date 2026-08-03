@@ -5959,6 +5959,10 @@ struct Scratch {
     xs: Option<(wgpu::Buffer, u64)>,
     y: Option<(wgpu::Buffer, u64)>,
     stage: Option<(wgpu::Buffer, u64)>,
+    /// The chain's paired readback (folded vector + hyper-connection state).
+    /// Its own slot: `stage` is sized for one of them and sharing would make
+    /// every token recreate whichever was asked for second.
+    stage2: Option<(wgpu::Buffer, u64)>,
     params: Option<wgpu::Buffer>,
     /// Fused-FFN intermediates (gate / up panels).
     g: Option<(wgpu::Buffer, u64)>,
@@ -7449,7 +7453,7 @@ pub fn attn_rope_qkn_gpu(
     enc.copy_buffer_to_buffer(&qout_b, 0, &sq, 0, (nh * hd * 4) as u64);
     enc.copy_buffer_to_buffer(&k_b, 0, &sk, 0, (nkv * hd * 4) as u64);
     enc.copy_buffer_to_buffer(&gout_b, 0, &sgt, 0, (nh * hd * 4) as u64);
-    c.queue.submit(Some(enc.finish()));
+    submit(c, enc.finish());
     for s in [&sq, &sk, &sgt] {
         s.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     }
@@ -9966,7 +9970,7 @@ pub fn forward_token_graph(
         let stage = ids_stage.as_ref().unwrap();
         let sz = (steps * 4) as u64;
         enc.copy_buffer_to_buffer(ids_b, 0, stage, 0, sz);
-        c.queue.submit(Some(enc.finish()));
+        submit(c, enc.finish());
         let (tx, rx) = std::sync::mpsc::channel();
         stage.map_async(wgpu::MapMode::Read, ..sz, move |r| {
             let _ = tx.send(r);
@@ -11215,7 +11219,7 @@ pub fn gdn_conv_gpu(
     });
     enc.copy_buffer_to_buffer(&rb, 0, &sr, 0, rsz);
     enc.copy_buffer_to_buffer(&cb, 0, &scq, 0, csz);
-    c.queue.submit(Some(enc.finish()));
+    submit(c, enc.finish());
     sr.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     scq.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
@@ -11324,7 +11328,7 @@ pub fn gdn_step_gpu(
     });
     enc.copy_buffer_to_buffer(&sb, 0, &stage_s, 0, ssz);
     enc.copy_buffer_to_buffer(&ob, 0, &stage_o, 0, osz);
-    c.queue.submit(Some(enc.finish()));
+    submit(c, enc.finish());
     stage_s.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     stage_o.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
@@ -13127,6 +13131,83 @@ fn spin_wait() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_GPU_SPIN").map(|v| v != "0").unwrap_or(true))
 }
 
+/// Submissions to the device, all sites. A round trip costs a fence
+/// whatever it carries, so "how many a token" is the number that decides
+/// whether a decode step is compute-bound or latency-bound — and it is not
+/// derivable from anything else the profile prints.
+pub static SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn submit(c: &Ctx, buf: wgpu::CommandBuffer) {
+    SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    c.queue.submit(Some(buf));
+}
+
+/// Two device buffers, one staging buffer, one fence. The chain used to
+/// read its folded vector and then call `dsv4_state_read` for the
+/// hyper-connection state — two submissions and two map-waits for a token
+/// that is otherwise a single submission.
+fn readback2(
+    c: &Ctx,
+    mut enc: wgpu::CommandEncoder,
+    a: (&wgpu::Buffer, &mut [f32]),
+    b: (&wgpu::Buffer, &mut [f32]),
+) -> bool {
+    let (a_buf, a_out) = a;
+    let (b_buf, b_out) = b;
+    let a_bytes = (a_out.len() * 4) as u64;
+    let b_bytes = (b_out.len() * 4) as u64;
+    // COPY_BUFFER_ALIGNMENT is 4; the second slice starts on a 16-byte
+    // boundary so the map range stays comfortably aligned on every backend.
+    let off = a_bytes.div_ceil(16) * 16;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage2,
+        off + b_bytes,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "dsv4-pair-stage",
+    );
+    enc.copy_buffer_to_buffer(a_buf, 0, &stage, 0, a_bytes);
+    enc.copy_buffer_to_buffer(b_buf, 0, &stage, off, b_bytes);
+    submit(c, enc.finish());
+    let slice = stage.slice(..off + b_bytes);
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d2 = done.clone();
+    slice.map_async(wgpu::MapMode::Read, move |_| {
+        d2.store(true, std::sync::atomic::Ordering::Release);
+    });
+    if spin_wait() {
+        let t0 = std::time::Instant::now();
+        loop {
+            let _ = c.device.poll(wgpu::PollType::Poll);
+            if done.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            if t0.elapsed() > std::time::Duration::from_millis(2) {
+                if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+                    return false;
+                }
+                break;
+            }
+            std::hint::spin_loop();
+        }
+    } else if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return false;
+    }
+    {
+        let Ok(data) = slice.get_mapped_range() else {
+            return false;
+        };
+        a_out.copy_from_slice(bytemuck::cast_slice(&data[..a_bytes as usize]));
+        b_out.copy_from_slice(bytemuck::cast_slice(
+            &data[off as usize..(off + b_bytes) as usize],
+        ));
+    }
+    stage.unmap();
+    true
+}
+
 fn readback(
     c: &Ctx,
     mut enc: wgpu::CommandEncoder,
@@ -13136,7 +13217,7 @@ fn readback(
     out: &mut [f32],
 ) -> bool {
     enc.copy_buffer_to_buffer(y_buf, 0, staging, 0, y_size);
-    c.queue.submit(Some(enc.finish()));
+    submit(c, enc.finish());
     let slice = staging.slice(..y_size);
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let d2 = done.clone();
@@ -13958,7 +14039,7 @@ fn matvec_batch_q1(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f3
         enc.copy_buffer_to_buffer(y_b, 0, &stage, off, (j.rows * 4) as u64);
         off += (j.rows * 4) as u64;
     }
-    c.queue.submit(Some(enc.finish()));
+    submit(c, enc.finish());
     stage.slice(..total).map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
         return false;
@@ -14231,7 +14312,7 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f
         enc.copy_buffer_to_buffer(y_b, 0, &stage, off, (j.rows * 4) as u64);
         off += (j.rows * 4) as u64;
     }
-    c.queue.submit(Some(enc.finish()));
+    submit(c, enc.finish());
     stage.slice(..total).map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
         return false;
@@ -14405,7 +14486,7 @@ mod tests {
         let readback = |buf: &wgpu::Buffer, enc: wgpu::CommandEncoder| {
             let mut enc = enc;
             enc.copy_buffer_to_buffer(buf, 0, &stage, 0, (n * 4) as u64);
-            c.queue.submit(Some(enc.finish()));
+            submit(c, enc.finish());
             stage.slice(..).map_async(wgpu::MapMode::Read, |_| {});
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
             let _ = stage.slice(..).get_mapped_range();
@@ -14924,7 +15005,7 @@ mod tests {
                 mapped_at_creation: false,
             });
             enc.copy_buffer_to_buffer(&ob, 0, &stage, 0, (gcnt * hpg * dv * 4) as u64);
-            c.queue.submit([enc.finish()]);
+            submit(c, enc.finish());
             let (tx, rx) = std::sync::mpsc::channel();
             stage.map_async(wgpu::MapMode::Read, .., move |r| tx.send(r).unwrap());
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
@@ -16055,7 +16136,7 @@ pub fn top_k_for_test(scores: &[f32], k: usize, out: &mut Vec<u32>) -> bool {
     );
     enc.copy_buffer_to_buffer(&ib, 0, &stage, 0, (kk * 4) as u64);
     enc.copy_buffer_to_buffer(&cb, 0, &stage, (kk * 4) as u64, 4);
-    c.queue.submit(Some(enc.finish()));
+    submit(c, enc.finish());
     let slice = stage.slice(..bytes);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
@@ -16886,7 +16967,7 @@ pub fn dsv4_cache_ensure(kv_id: u64, li: usize, cap: usize) -> bool {
                     label: Some("dsv4-kv-grow"),
                 });
             enc.copy_buffer_to_buffer(&old, 0, &bigger, 0, (have * 4) as u64);
-            c.queue.submit(Some(enc.finish()));
+            submit(c, enc.finish());
             map.insert((kv_id, li), (bigger, cap));
             GREW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -16951,6 +17032,9 @@ pub fn dsv4_layer_chain(
     inv_freq: &[&[f32]],
     pos: usize,
     folded_out: &mut [f32],
+    // When present, the hyper-connection state comes back in the SAME
+    // submission — the caller then skips `dsv4_state_read` entirely.
+    state_out: Option<&mut [f32]>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
     let Some((_, g0, _)) = layers.first() else {
@@ -16990,20 +17074,33 @@ pub fn dsv4_layer_chain(
     CHAIN_LAYERS.fetch_add(layers.len() as u64, std::sync::atomic::Ordering::Relaxed);
     CHAIN_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let t_wait = std::time::Instant::now();
-    let mut sc = c.scratch.lock().unwrap();
-    let stage = Scratch::ensure(
-        &c.device,
-        &mut sc.stage,
-        (dim * 4) as u64,
-        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        "dsv4-chain-stage",
-    );
-    let ok = readback(c, enc, &src, &stage, (dim * 4) as u64, &mut folded_out[..dim]);
+    let ok = match state_out {
+        // The state comes back in the SAME submission as the folded vector.
+        // Asking for it afterwards cost a second fence on a token that is
+        // otherwise one submission — a third of the round trips, for a copy
+        // of a few kilobytes.
+        Some(st) => {
+            let sb = frame_buf(c, 40, st.len() * 4, true);
+            readback2(c, enc, (&src, &mut folded_out[..dim]), (&sb, st))
+        }
+        None => {
+            let mut sc = c.scratch.lock().unwrap();
+            let stage = Scratch::ensure(
+                &c.device,
+                &mut sc.stage,
+                (dim * 4) as u64,
+                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                "dsv4-chain-stage",
+            );
+            let ok = readback(c, enc, &src, &stage, (dim * 4) as u64, &mut folded_out[..dim]);
+            drop(sc);
+            ok
+        }
+    };
     CHAIN_WAIT_NS.fetch_add(
         t_wait.elapsed().as_nanos() as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
-    drop(sc);
     ok
 }
 
@@ -17264,7 +17361,7 @@ pub fn moe_route_for_test(
     enc.copy_buffer_to_buffer(&ib, 0, &stage, 0, (slots * 4) as u64);
     enc.copy_buffer_to_buffer(&wb, 0, &stage, (slots * 4) as u64, (slots * 4) as u64);
     enc.copy_buffer_to_buffer(&cb, 0, &stage, (2 * slots * 4) as u64, 4);
-    c.queue.submit(Some(enc.finish()));
+    submit(c, enc.finish());
     let slice = stage.slice(..bytes);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
@@ -18251,7 +18348,7 @@ pub fn dsv4_comp_state_for_test(
     )
     .is_some();
     if !folded {
-        c.queue.submit(Some(enc.finish()));
+        submit(c, enc.finish());
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
         return Some(false);
     }
@@ -18307,7 +18404,7 @@ pub fn dsv4_idx_build_for_test(
         "idx-build-stage",
     );
     enc.copy_buffer_to_buffer(&ob, 0, &stage, 0, bytes);
-    c.queue.submit(Some(enc.finish()));
+    submit(c, enc.finish());
     let slice = stage.slice(..bytes);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
@@ -18774,7 +18871,7 @@ pub fn dsv4_attn_frame(
     // MoE frame reads it from the same buffer, so the token does not stop
     // here at all.
     if out.is_empty() {
-        c.queue.submit(Some(enc.finish()));
+        submit(c, enc.finish());
         ATT_ENC_NS.fetch_add(
             t_all.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -18969,7 +19066,7 @@ pub fn dsv4_moe_frame(
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         let xin = frame_buf(c, 45, g.hidden * 4, true);
         encode_f32matvec(c, &mut e0, &rb, &xin, &lb, n_route, g.hidden);
-        c.queue.submit(Some(e0.finish()));
+        submit(c, e0.finish());
         lb
     } else {
         frame_up(c, 16, bytemuck::cast_slice(&w.logits[..n_route]))
@@ -19267,7 +19364,7 @@ pub fn dsv4_moe_frame(
         (g.hidden * 4) as u64,
     );
     enc.copy_buffer_to_buffer(&coldb, 0, &stage2, (g.hidden * 4) as u64, cold_bytes);
-    c.queue.submit(Some(enc.finish()));
+    submit(c, enc.finish());
     let slice = stage2.slice(..total);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
