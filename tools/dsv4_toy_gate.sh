@@ -35,7 +35,13 @@ for toy in hx4 plain4 sc4 q4 big2; do
         d=$(python3 -c "import sys;x=float('$a'.split()[-1]);y=float('$b'.split()[-1]);print(abs(x-y)/x*100)")
         ok=$(python3 -c "print(1 if $d < 0.05 else 0)")
         if [ "$ok" = "1" ]; then mark="  (флип $d%)"; else mark="  ← РАСХОЖДЕНИЕ $d%"; fail=1; fi ;;
-      *) mark="  ← РАСХОЖДЕНИЕ"; fail=1 ;;
+      *)
+        d=$(python3 -c "x=float('$a'.split()[-1]);y=float('$b'.split()[-1]);print(abs(x-y)/x*100)")
+        ok=$(python3 -c "print(1 if $d < 0.001 else 0)")
+        # 0.001%: the split attention and the wide matvec sum in a different
+        # lane order, so 'exact' now means 'below the float noise floor', not
+        # 'the same bits'. Anything real is orders of magnitude above this.
+        if [ "$ok" = "1" ]; then mark="  (шум $d%)"; else mark="  ← РАСХОЖДЕНИЕ $d%"; fail=1; fi ;;
     esac
   fi
   echo "$toy  кадр:$a  цепочка:$b$mark"
