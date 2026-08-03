@@ -4989,6 +4989,170 @@ fn index_scores(@builtin(workgroup_id) wid: vec3<u32>,
     if (lid == 0u) { ix_out[t] = ix_red[0]; }
 }
 
+// Sparse attention, split over the ATTENDED POSITIONS.
+//
+// The one-workgroup-per-head kernel launches 64 workgroups on the release —
+// 64 of the ~200 the card can hold, so it sits at a few percent occupancy and
+// waits on memory latency rather than running out of arithmetic: the skip
+// probe puts it at 18.1 ms of a 51.3 ms chain while doing 42M MACs a layer,
+// which is about 1% of the machine.
+//
+// So each head's positions are cut into chunks, one workgroup a chunk, and
+// each returns its own softmax frame — the running max, the running
+// denominator, and an accumulator weighted against ITS max. The merge
+// rescales the frames into a common max. Same flash-decoding shape as
+// `gqa_attend_part`/`gqa_attend_merge` for the other architecture, and the
+// same caveat: the sum happens in a different order, so this is a contract
+// change, not an identity.
+
+struct SapP { nh: u32, hd: u32, m: u32, nc: u32, ck: u32, _a: u32, _b: u32, scale: f32 };
+
+@group(0) @binding(0) var<storage, read>       sp_q    : array<f32>;   // nh*hd
+@group(0) @binding(1) var<storage, read>       sp_kv   : array<f32>;   // n*hd
+@group(0) @binding(2) var<storage, read>       sp_idx  : array<u32>;   // m
+@group(0) @binding(3) var<storage, read_write> sp_acc  : array<f32>;   // nh*nc*hd
+@group(0) @binding(4) var<storage, read_write> sp_mx   : array<f32>;   // nh*nc
+@group(0) @binding(5) var<storage, read_write> sp_ln   : array<f32>;   // nh*nc
+@group(0) @binding(6) var<uniform>             sp_p    : SapP;
+
+var<workgroup> sp_red: array<f32, 256>;
+var<workgroup> sp_w:   array<f32, 256>;
+var<workgroup> sp_mval: f32;
+var<workgroup> sp_den: f32;
+
+@compute @workgroup_size(256)
+fn sparse_attend_part(@builtin(workgroup_id) wid: vec3<u32>,
+                      @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    let c = wid.y;
+    if (h >= sp_p.nh || c >= sp_p.nc) { return; }
+    let hd = sp_p.hd;
+    let qb = h * hd;
+    let lo = c * sp_p.ck;
+    var hi = lo + sp_p.ck;
+    if (hi > sp_p.m) { hi = sp_p.m; }
+    let slot = h * sp_p.nc + c;
+    if (lo >= hi) {
+        if (lid == 0u) { sp_mx[slot] = -3.0e38; sp_ln[slot] = 0.0; }
+        var z = lid;
+        loop { if (z >= hd) { break; } sp_acc[slot * hd + z] = 0.0; z = z + 256u; }
+        return;
+    }
+    let len = hi - lo;
+
+    // 1. this chunk's scores, and its own max
+    var mx = -3.0e38;
+    var t = lid;
+    loop {
+        if (t >= len) { break; }
+        let p = sp_idx[lo + t];
+        var d = 0.0;
+        for (var k = 0u; k < hd; k = k + 1u) {
+            d = d + sp_q[qb + k] * sp_kv[p * hd + k];
+        }
+        let sc = d * sp_p.scale;
+        sp_w[t] = sc;
+        mx = max(mx, sc);
+        t = t + 256u;
+    }
+    sp_red[lid] = mx;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { sp_red[lid] = max(sp_red[lid], sp_red[lid + stride]); }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) { sp_mval = sp_red[0]; }
+    workgroupBarrier();
+    let mval = sp_mval;
+
+    // 2. weights against THIS chunk's max, and its denominator
+    var den = 0.0;
+    t = lid;
+    loop {
+        if (t >= len) { break; }
+        let e = exp(sp_w[t] - mval);
+        sp_w[t] = e;
+        den = den + e;
+        t = t + 256u;
+    }
+    sp_red[lid] = den;
+    workgroupBarrier();
+    stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { sp_red[lid] = sp_red[lid] + sp_red[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) {
+        sp_den = sp_red[0];
+        sp_mx[slot] = mval;
+        sp_ln[slot] = sp_red[0];
+    }
+    workgroupBarrier();
+
+    // 3. the chunk's unnormalised accumulator, parallel over the output dim
+    var k2 = lid;
+    loop {
+        if (k2 >= hd) { break; }
+        var acc = 0.0;
+        for (var i = 0u; i < len; i = i + 1u) {
+            acc = acc + sp_w[i] * sp_kv[sp_idx[lo + i] * hd + k2];
+        }
+        sp_acc[slot * hd + k2] = acc;
+        k2 = k2 + 256u;
+    }
+}
+
+struct SamP { nh: u32, hd: u32, nc: u32, _a: u32 };
+
+@group(0) @binding(0) var<storage, read>       sm_acc  : array<f32>;   // nh*nc*hd
+@group(0) @binding(1) var<storage, read>       sm_mx   : array<f32>;   // nh*nc
+@group(0) @binding(2) var<storage, read>       sm_ln   : array<f32>;   // nh*nc
+@group(0) @binding(3) var<storage, read>       sm_sink : array<f32>;   // nh
+@group(0) @binding(4) var<storage, read_write> sm_out  : array<f32>;   // nh*hd
+@group(0) @binding(5) var<uniform>             sm_p    : SamP;
+
+var<workgroup> sm_m: f32;
+var<workgroup> sm_d: f32;
+
+@compute @workgroup_size(256)
+fn sparse_attend_merge(@builtin(workgroup_id) wid: vec3<u32>,
+                       @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    if (h >= sm_p.nh) { return; }
+    let hd = sm_p.hd;
+    let nc = sm_p.nc;
+    // The sink enters the denominator and nothing else — which is what lets a
+    // head attend to nothing at all.
+    if (lid == 0u) {
+        var mm = sm_sink[h];
+        for (var c = 0u; c < nc; c = c + 1u) { mm = max(mm, sm_mx[h * nc + c]); }
+        var dd = exp(sm_sink[h] - mm);
+        for (var c = 0u; c < nc; c = c + 1u) {
+            dd = dd + exp(sm_mx[h * nc + c] - mm) * sm_ln[h * nc + c];
+        }
+        sm_m = mm;
+        sm_d = dd;
+    }
+    workgroupBarrier();
+    let mm = sm_m;
+    let inv = 1.0 / sm_d;
+    var k = lid;
+    loop {
+        if (k >= hd) { break; }
+        var y = 0.0;
+        for (var c = 0u; c < nc; c = c + 1u) {
+            y = y + exp(sm_mx[h * nc + c] - mm) * sm_acc[(h * nc + c) * hd + k];
+        }
+        sm_out[h * hd + k] = y * inv;
+        k = k + 256u;
+    }
+}
+
 // A copy, as a dispatch. `copy_buffer_to_buffer` cannot be recorded inside a
 // compute pass, so every small copy in the prep path — this token's slot in
 // the compressor window, the window shift, the closed window becoming the
@@ -5960,6 +6124,8 @@ struct Ctx {
     index_scores: wgpu::ComputePipeline,
     top_k_index: wgpu::ComputePipeline,
     hc_block: wgpu::ComputePipeline,
+    sa_part: wgpu::ComputePipeline,
+    sa_merge: wgpu::ComputePipeline,
     blit: wgpu::ComputePipeline,
     idx_build: wgpu::ComputePipeline,
     moe_route: wgpu::ComputePipeline,
@@ -6505,6 +6671,8 @@ fn init() -> Result<Ctx, String> {
     let index_scores = pipe("index_scores");
     let top_k_index = pipe("top_k_index");
     let hc_block = pipe("hc_block");
+    let sa_part = pipe("sparse_attend_part");
+    let sa_merge = pipe("sparse_attend_merge");
     let blit = pipe("blit");
     let idx_build = pipe("idx_build");
     let moe_route = pipe("moe_route");
@@ -6724,6 +6892,8 @@ fn init() -> Result<Ctx, String> {
         index_scores,
         top_k_index,
         hc_block,
+        sa_part,
+        sa_merge,
         blit,
         idx_build,
         moe_route,
@@ -16621,9 +16791,14 @@ fn encode_attn_chain(
             (60, kv_id, li));
         encode_rope_heads_p(&mut pass, c, q, freq, posb, g.nh, g.hd, g.rd, true, false,
             (61, kv_id, li));
+        if sa_split_k() {
+            encode_sa_split_p(&mut pass, c, q, cache, ixb, sink, attn, g.nh, g.hd, m,
+                g.scale, kv_id, li);
+        } else {
         pass.set_pipeline(&c.sparse_attend);
         pass.set_bind_group(0, &sa_bind, &[]);
         pass.dispatch_workgroups(g.nh as u32, 1, 1);
+        }
         encode_rope_heads_p(&mut pass, c, attn, freq, posb, g.nh, g.hd, g.rd, false, true,
             (62, kv_id, li));
         pass.set_pipeline(&c.o_lora_a);
@@ -17974,6 +18149,115 @@ fn ts_pair(c: &Ctx, which: usize) -> Option<wgpu::ComputePassTimestampWrites<'_>
 /// (a pass of its own, so the query set has boundaries to write) and the
 /// fused one (a dispatch inside the layer's pass).
 #[allow(clippy::too_many_arguments)]
+/// How many position-chunks to cut a head into. One workgroup a chunk, so
+/// this is the occupancy knob: 64 heads alone left the card at a few percent.
+fn sa_chunks(m: usize) -> usize {
+    if m == 0 {
+        return 1;
+    }
+    // CMF_DSV4_SA_CHUNKS forces the count. The toys attend to fewer than 128
+    // positions, so they would take one chunk and never exercise the merge
+    // at all — the flag is what lets the known-good stands test it.
+    static F: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let forced = *F.get_or_init(|| {
+        std::env::var("CMF_DSV4_SA_CHUNKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    });
+    if forced > 0 {
+        return forced.min(m).min(8);
+    }
+    // ~128 positions a chunk, capped so the merge stays cheap and the
+    // scratch (nh·nc·hd floats) stays small.
+    m.div_ceil(128).clamp(1, 8)
+}
+
+/// `CMF_DSV4_SA_SPLIT=0` reverts attention to the one-workgroup-per-head
+/// kernel. The split changes the order the softmax sums in, so it is a
+/// contract change and wants a flag.
+fn sa_split_k() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_SA_SPLIT").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Sparse attention as two dispatches: a per-chunk pass and a merge.
+#[allow(clippy::too_many_arguments)]
+fn encode_sa_split_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
+    q: &wgpu::Buffer,
+    kv: &wgpu::Buffer,
+    ixb: &wgpu::Buffer,
+    sink: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    nh: usize,
+    hd: usize,
+    m: usize,
+    scale: f32,
+    kv_id: u64,
+    li: usize,
+) {
+    let nc = sa_chunks(m);
+    let ck = m.div_ceil(nc).max(1);
+    let acc = frame_buf(c, 112, nh * 8 * hd * 4, false);
+    let mxb = frame_buf(c, 113, nh * 8 * 4, false);
+    let lnb = frame_buf(c, 114, nh * 8 * 4, false);
+    let pp = uni_slot8(
+        c,
+        176,
+        kv_id,
+        li,
+        [
+            nh as u32,
+            hd as u32,
+            m as u32,
+            nc as u32,
+            ck as u32,
+            0,
+            0,
+            scale.to_bits(),
+        ],
+    );
+    let bind = cached_bind(c, (180, kv_id, li), || {
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.sa_part.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, q),
+                bind_buf(1, kv),
+                bind_buf(2, ixb),
+                bind_buf(3, &acc),
+                bind_buf(4, &mxb),
+                bind_buf(5, &lnb),
+                bind_buf(6, &pp),
+            ],
+        })
+    });
+    pass.set_pipeline(&c.sa_part);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(nh as u32, nc as u32, 1);
+
+    let mp = uni_slot(c, 182, kv_id, li, [nh as u32, hd as u32, nc as u32, 0]);
+    let bind2 = cached_bind(c, (184, kv_id, li), || {
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.sa_merge.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &acc),
+                bind_buf(1, &mxb),
+                bind_buf(2, &lnb),
+                bind_buf(3, sink),
+                bind_buf(4, out),
+                bind_buf(5, &mp),
+            ],
+        })
+    });
+    pass.set_pipeline(&c.sa_merge);
+    pass.set_bind_group(0, &bind2, &[]);
+    pass.dispatch_workgroups(nh as u32, 1, 1);
+}
+
 /// The fused hyper-connection join: expand, mix, fold, norm — one dispatch.
 #[allow(clippy::too_many_arguments)]
 fn encode_hc_block_p(
@@ -19227,6 +19511,27 @@ where
 /// The buffer's identity never changes, only its contents — the opposite
 /// trade from the content-keyed uniform pool, whose identity IS its
 /// contents.
+/// `uni_slot`'s eight-word twin, for the kernels whose params do not fit in
+/// four. Same contract: one write per key per submission.
+fn uni_slot8(c: &Ctx, tag: u8, kv: u64, li: usize, vals: [u32; 8]) -> wgpu::Buffer {
+    let b = {
+        let mut m = c.dsv4_uni.lock().unwrap();
+        m.entry((tag, kv, li))
+            .or_insert_with(|| {
+                c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("dsv4-uni-slot8"),
+                    size: 32,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .clone()
+    };
+    note_slot_write(c, "uni8", (tag, kv, li));
+    c.queue.write_buffer(&b, 0, bytemuck::cast_slice(&vals));
+    b
+}
+
 fn uni_slot(c: &Ctx, tag: u8, kv: u64, li: usize, vals: [u32; 4]) -> wgpu::Buffer {
     let b = {
         let mut m = c.dsv4_uni.lock().unwrap();
