@@ -4257,6 +4257,7 @@ fn draft_probe() -> bool {
         });
         self.dspark_draft_ns += draft_started.elapsed().as_nanos();
         let draft_picks = crate::dsv4::pick_tally_take();
+        crate::dsv4::dspark_freq_note(&draft_picks);
         // Re-arm for the NEXT trunk token; the probe runs after the forward,
         // so this is the only place that can.
         crate::dsv4::pick_tally_arm();
