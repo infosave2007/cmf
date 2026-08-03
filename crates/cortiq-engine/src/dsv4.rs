@@ -3569,11 +3569,22 @@ fn forward_chunk_batched(
     #[cfg(feature = "gpu")]
     {
         let b = ids.len();
-        if b < 2 || !chain_enabled() || layers.iter().any(|l| l.tid2eid.is_some()) {
-            return false;
-        }
-        // Only once a single-token run has proved every layer takes the card.
-        if !st.dev_owned || st.dev_set.len() != layers.len() || !st.dev_set.iter().all(|&x| x) {
+        let why = if b < 2 {
+            "токенов меньше двух"
+        } else if !chain_enabled() {
+            "цепочка выключена"
+        } else if layers.iter().any(|l| l.tid2eid.is_some()) {
+            "есть хеш-слои"
+        } else if !st.dev_owned {
+            "карта ещё не владеет состоянием"
+        } else if st.dev_set.len() != layers.len() || !st.dev_set.iter().all(|&x| x) {
+            "не все слои на карте"
+        } else {
+            ""
+        };
+        if !why.is_empty() {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| tracing::info!("dsv4: пакет отказал — {why}"));
             return false;
         }
         let (hc, dim) = (cfg.hc_mult, cfg.dim);
