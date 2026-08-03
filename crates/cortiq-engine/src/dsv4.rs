@@ -1919,7 +1919,7 @@ fn dsv4_layer_loop(
             if run.len() >= chain_max() {
                 let need_qn = run[0] == 0 || !on_dev[run[0] - 1];
                 if !dsv4_chain_run(
-                    layers, &run, cfg, g, st, token_id, &mut folded, None, need_qn, pool,
+                    layers, &run, cfg, g, st, token_id, &mut folded, None, 1, need_qn, pool,
                 ) {
                     return false;
                 }
@@ -1930,7 +1930,7 @@ fn dsv4_layer_loop(
         if chain
             && !run.is_empty()
             && !dsv4_chain_run(
-                layers, &run, cfg, g, st, token_id, &mut folded, None,
+                layers, &run, cfg, g, st, token_id, &mut folded, None, 1,
                 run[0] == 0 || !on_dev[run[0] - 1], pool,
             )
         {
@@ -2156,13 +2156,13 @@ fn dsv4_layer_loop(
             let ok = if carry {
                 let r = dsv4_chain_run(
                     layers, &run, cfg, g, st, token_id, &mut folded,
-                    Some(state), need_qn, pool,
+                    Some(state), 1, need_qn, pool,
                 );
                 state_home = r;
                 r
             } else {
                 dsv4_chain_run(
-                    layers, &run, cfg, g, st, token_id, &mut folded, None, need_qn, pool,
+                    layers, &run, cfg, g, st, token_id, &mut folded, None, 1, need_qn, pool,
                 )
             };
             if !ok {
@@ -2279,6 +2279,9 @@ fn dsv4_chain_run(
     // token's LAST run passes it — an earlier one would read a state the
     // layers after it still change.
     state_out: Option<&mut [f32]>,
+    // How many consecutive tokens this run carries. One is decode; more is a
+    // prompt chunk or a speculative verify, which are the same shape of work.
+    batch: usize,
     // Whether the device's qn buffer is stale: true at layer zero and after
     // a host layer. When the previous layer was chained, its frame's tail
     // already left THIS layer's LoRA vector on the card, and recomputing it
@@ -2494,26 +2497,48 @@ fn dsv4_chain_run(
         items.push((w, geom, prep));
     }
 
-    let mut out = vec![0.0f32; dim];
-    if !crate::gpu_wgpu::dsv4_layer_chain(
-        &model, &items, st.kv_id, first, &freqs, st.pos, &mut out, state_out,
-    ) {
-        return false;
+    let mut out = vec![0.0f32; dim * batch.max(1)];
+    if batch > 1 {
+        // A batch keeps its own state per token and brings every fold home in
+        // one readback; the hyper-connection state does not ride back, so a
+        // batched run cannot be the one that hands state to a host layer.
+        if state_out.is_some() {
+            return false;
+        }
+        if !crate::gpu_wgpu::dsv4_chain_batch(
+            &model, &items, st.kv_id, first, &freqs, st.pos, batch, &mut out,
+        ) {
+            return false;
+        }
+        // The caller wants the LAST token's fold: it is the one whose logits
+        // continue the sequence.
+        *folded = out[(batch - 1) * dim..batch * dim].to_vec();
+    } else {
+        if !crate::gpu_wgpu::dsv4_layer_chain(
+            &model, &items, st.kv_id, first, &freqs, st.pos, &mut out, state_out,
+        ) {
+            return false;
+        }
+        *folded = out;
     }
-    *folded = out;
-    // The device advanced these; the host keeps only the arithmetic.
+    // The device advanced these; the host keeps only the arithmetic. A batch
+    // advanced them once per token, in order, so the host replays the same
+    // rule that many times rather than inventing a closed form for it.
     for (i, &li) in run.iter().enumerate() {
+      for t in 0..batch.max(1) {
+        let pos = st.pos + t;
         st.dev_filled[li] = (st.dev_filled[li] + 1).min(cfg.window);
         if let Some((_, cg, ..)) = items[i].2.ix.as_ref() {
-            if (st.pos + 1) % cg.ratio == 0 {
+            if (pos + 1) % cg.ratio == 0 {
                 st.dev_n_ix[li] += 1;
             }
         }
         if let Some((_, cg)) = items[i].2.comp.as_ref() {
-            if (st.pos + 1) % cg.ratio == 0 {
+            if (pos + 1) % cg.ratio == 0 {
                 st.dev_n_comp[li] += 1;
             }
         }
+      }
     }
     st.dev_owned = true;
     true

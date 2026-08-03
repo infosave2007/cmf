@@ -18389,7 +18389,7 @@ fn dsv4_layer_frame_enc(
     let folded = frame_buf_t(c, 42, tok, dim * 4, true);
     let hpost = frame_buf_t(c, 43, tok, hc * 4, true);
     let hcomb = frame_buf_t(c, 44, tok, hc * hc * 4, true);
-    let x2 = frame_buf(c, 45, dim * 4, false);
+    let x2 = frame_buf_t(c, 45, tok, dim * 4, false);
     let state2 = frame_buf(c, 46, hc * dim * 4, false);
     let logit_b = frame_buf(c, 47, n_pack * 4, false);
     let msel = frame_buf(c, 19, slots * 4, false);
@@ -18599,6 +18599,16 @@ pub fn dsv4_chain_seed_fold(x: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };
     let b = frame_buf(c, 45, x.len() * 4, true);
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(x));
+    true
+}
+
+/// Seed one token of a batch: its opening fold and its LoRA vector.
+pub fn dsv4_chain_seed_t(x: &[f32], qn: &[f32], tok: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    let b = frame_buf_t(c, 45, tok, x.len() * 4, true);
+    c.queue.write_buffer(&b, 0, bytemuck::cast_slice(x));
+    let q = frame_buf_t(c, 4, tok, qn.len() * 4, true);
+    c.queue.write_buffer(&q, 0, bytemuck::cast_slice(qn));
     true
 }
 
