@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **DeepSeek-V4 decode: 10.6 → 24.5 tok/s** on an RTX PRO 6000, measured at
+- **DeepSeek-V4 decode: 10.6 → 27.2 tok/s** on an RTX PRO 6000, measured at
   each step against the same 192-token bench and gated on five toy stands
   plus golden parity. In order: the chain's bind groups cached; the hash
   layers joined the chain; the whole token became ONE submission; the head
@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   turned into minutes. The profile reports the rate.
 
 ### Fixed
+- **DeepSeek-V4 on the device now matches the host EXACTLY** — perplexity
+  3.282 against the CPU's 3.282, where the chained path had read 3.301 and
+  that 0.6% had been written down as a device-summation contract. It was
+  not arithmetic: the indexer's head weights were left at zero by the
+  `axpy` bug below, so every compressed position scored the same and the
+  top-k degenerated to the first k. The model's long-range memory was
+  attending to the wrong positions.
 - **`axpy` did nothing.** Its uniform was written `[n, 0, 0, w]` against a
   shader declaring `{ w: f32, n: u32, … }`, so the kernel read `n` as zero
   and every invocation returned at the bounds check. Two callers: the
