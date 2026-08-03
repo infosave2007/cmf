@@ -6525,6 +6525,9 @@ fn dspark_apply_mask(out: &mut [Dsv4Mtp]) {
 #[cfg(feature = "gpu")]
 pub struct DsparkPack {
     pub stages: Vec<DsparkStagePack>,
+    /// Gate/up requantized to q2tp at upload (the binary registered an
+    /// encoder); the graph then dispatches the q2tp kernels.
+    pub gu_q2: bool,
     /// Dequantized router and bias per stage, f32 — address-stable for the
     /// life of the pack, which is what the device's const cache needs.
     pub routers: Vec<Vec<f32>>,
@@ -6545,6 +6548,15 @@ pub struct DsparkStagePack {
     pub tensors: Vec<(usize, usize, usize)>,
     pub n_resident: usize,
 }
+
+/// The q2tp encoder, registered by the binary that has one (the CLI's
+/// converter owns the rung-search implementation and the engine must not
+/// depend on the CLI). When present, the draft's gate/up experts are
+/// requantized q4tp → q2tp AT UPLOAD — half the VRAM and the same kernels
+/// the trunk's q2tp experts already use. Draft-only fidelity: acceptance
+/// pays, correctness never does.
+pub static DSPARK_Q2TP_ENCODE: std::sync::OnceLock<fn(&[f32], usize, usize) -> Vec<u8>> =
+    std::sync::OnceLock::new();
 
 /// `CMF_DSPARK_GPU=1` — the probe (and later the speculative loop) drafts
 /// on the card instead of the CPU/disk tier.
@@ -6682,14 +6694,20 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
             return None;
         }
     }
+    let gu_q2 = crate::dsv4::DSPARK_Q2TP_ENCODE.get().is_some();
     for (si, sp) in stages.iter().enumerate() {
-        if !crate::gpu_wgpu::dsv4_experts_ready(
-            &model,
-            &sp.tensors,
-            cfg.moe_inter,
-            cfg.dim,
-            false,
-        ) {
+        let ok = if gu_q2 {
+            crate::gpu_wgpu::moe_expert_bufs_requant_gu(
+                &model,
+                &sp.tensors,
+                cfg.moe_inter,
+                cfg.dim,
+            )
+            .is_some()
+        } else {
+            crate::gpu_wgpu::dsv4_experts_ready(&model, &sp.tensors, cfg.moe_inter, cfg.dim, false)
+        };
+        if !ok {
             eprintln!(
                 "DSpark: эксперты стадии {si} ({} + shared) не влезли в VRAM — GPU-черновик выключен",
                 sp.n_resident
@@ -6705,6 +6723,7 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
     );
     Some(DsparkPack {
         stages,
+        gu_q2,
         routers,
         biases,
     })
@@ -6834,6 +6853,7 @@ pub fn dspark_draft_gpu(
         route_scale: cfg.route_scale,
         swiglu_limit: cfg.swiglu_limit,
         scale: (cfg.head_dim as f32).powf(-0.5),
+        gu_q2: pack.gu_q2,
     };
     // ── seed states: the real token, then noise, replicated over copies ──
     let ids: Vec<u32> = (0..block)

@@ -8773,6 +8773,107 @@ fn moe_expert_bufs(
     Some((g, u, d))
 }
 
+/// The draft pack's expert upload with gate/up requantized q4tp → q2tp on
+/// the way through — via the encoder the binary registered. The down
+/// projection stays q4tp (the q2tp down kernel does not exist). Cached
+/// under the same first-gate key as every pack; only the draft reaches
+/// these tensors, so the variant is unambiguous per process.
+pub fn moe_expert_bufs_requant_gu(
+    model: &Arc<CmfModel>,
+    experts: &[(usize, usize, usize)],
+    inter: usize,
+    hidden: usize,
+) -> Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)> {
+    use std::sync::atomic::Ordering;
+    let c = ctx()?;
+    let enc2 = *crate::dsv4::DSPARK_Q2TP_ENCODE.get()?;
+    if hidden % 32 != 0 || inter % 32 != 0 {
+        return None;
+    }
+    let bytes = model.primary_bytes();
+    let key = (model.uid() as usize, experts.first()?.0);
+    if let Some(t) = c.moe_expw.lock().unwrap().get(&key) {
+        return Some(t.clone());
+    }
+    let gu_len =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q2TiledP, &[inter, hidden])?;
+    let d_len =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[hidden, inter])?;
+    let total = (experts.len() * (2 * gu_len + d_len)) as u64;
+    if c.resident.load(Ordering::Relaxed) + total > c.vram_budget {
+        return None;
+    }
+    let t0 = std::time::Instant::now();
+    let mut vals = vec![0.0f32; inter * hidden];
+    let mk_gu = |role: &dyn Fn(&(usize, usize, usize)) -> usize,
+                 vals: &mut Vec<f32>|
+     -> Option<wgpu::Buffer> {
+        let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dspark-experts-q2"),
+            size: (experts.len() * gu_len) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        for (i, t) in experts.iter().enumerate() {
+            let e = model.tensors.get(role(t))?;
+            if e.dtype != cortiq_core::TensorDtype::Q4TiledP
+                || e.shape != [inter, hidden]
+            {
+                return None;
+            }
+            let abs = model.entry_abs_offset(e)?;
+            let src = bytes.get(abs..abs + e.nbytes as usize)?;
+            cortiq_core::quant::dequant_q4tp(src, inter, hidden, vals);
+            let q2 = enc2(vals, inter, hidden);
+            if q2.len() != gu_len {
+                return None;
+            }
+            c.queue.write_buffer(&b, (i * gu_len) as u64, &q2);
+        }
+        c.queue.submit(std::iter::empty());
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        Some(b)
+    };
+    let mk_d = || -> Option<wgpu::Buffer> {
+        let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dspark-experts-dn"),
+            size: (experts.len() * d_len) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        for (i, t) in experts.iter().enumerate() {
+            let e = model.tensors.get(t.2)?;
+            if e.dtype != cortiq_core::TensorDtype::Q4TiledP
+                || e.nbytes as usize != d_len
+            {
+                return None;
+            }
+            let abs = model.entry_abs_offset(e)?;
+            c.queue
+                .write_buffer(&b, (i * d_len) as u64, bytes.get(abs..abs + d_len)?);
+        }
+        c.queue.submit(std::iter::empty());
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        Some(b)
+    };
+    let (g, u, d) = match (mk_gu(&|t| t.0, &mut vals), mk_gu(&|t| t.1, &mut vals), mk_d()) {
+        (Some(g), Some(u), Some(d)) => (g, u, d),
+        _ => return None,
+    };
+    tracing::info!(
+        "DSpark: реквант q4tp→q2tp {} экспертов за {:.1} с ({} МБ на карте)",
+        experts.len(),
+        t0.elapsed().as_secs_f64(),
+        total / (1024 * 1024),
+    );
+    c.resident.fetch_add(total, Ordering::Relaxed);
+    c.moe_expw
+        .lock()
+        .unwrap()
+        .insert(key, (g.clone(), u.clone(), d.clone()));
+    Some((g, u, d))
+}
+
 /// GPU enabled and initialized?
 pub fn enabled() -> bool {
     ctx().is_some()
@@ -20179,6 +20280,7 @@ pub struct DsparkGeom {
     pub route_scale: f32,
     pub swiglu_limit: f32,
     pub scale: f32,
+    pub gu_q2: bool,
 }
 
 /// The five-position DSpark block, whole, in ONE submission.
@@ -20336,9 +20438,11 @@ pub fn dspark_graph(
         else {
             return false;
         };
-        let Some((gate_all, up_all, down_all)) =
+        let Some((gate_all, up_all, down_all)) = (if g.gu_q2 {
+            moe_expert_bufs_requant_gu(model, s.experts, g.inter, dim)
+        } else {
             moe_expert_bufs(c, model, s.experts, g.inter, dim, true, false)
-        else {
+        }) else {
             return false;
         };
         let cache = {
@@ -20614,13 +20718,13 @@ pub fn dspark_graph(
             pass.set_pipeline(&c.bt_moe_route);
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(block as u32, 1, 1);
-            let stride16 = |rows: usize, cols: usize| -> u32 {
-                (cortiq_core::quant::expected_nbytes(
-                    cortiq_core::TensorDtype::Q4TiledP,
-                    &[rows, cols],
-                )
-                .unwrap_or(0)
-                    / 2) as u32
+            let stride16 = |rows: usize, cols: usize, q2: bool| -> u32 {
+                let dt = if q2 {
+                    cortiq_core::TensorDtype::Q2TiledP
+                } else {
+                    cortiq_core::TensorDtype::Q4TiledP
+                };
+                (cortiq_core::quant::expected_nbytes(dt, &[rows, cols]).unwrap_or(0) / 2) as u32
             };
             let gu_u = uniform_u32x8(
                 c,
@@ -20628,7 +20732,7 @@ pub fn dspark_graph(
                     (dim / 32) as u32,
                     g.inter as u32,
                     slots as u32,
-                    stride16(g.inter, dim),
+                    stride16(g.inter, dim, g.gu_q2),
                     g.swiglu_limit.to_bits(),
                     0,
                     0,
@@ -20637,12 +20741,17 @@ pub fn dspark_graph(
             );
             let dn_u = uniform_u32x4(
                 c,
-                [(g.inter / 32) as u32, dim as u32, slots as u32, stride16(dim, g.inter)],
+                [(g.inter / 32) as u32, dim as u32, slots as u32, stride16(dim, g.inter, false)],
             );
+            let p_gu = if g.gu_q2 {
+                &c.bt_moe_gate_up_q2tp
+            } else {
+                &c.moe_gate_up_q4tp_b
+            };
             let bind = cached_bind(c, bk(250), || {
                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
-                    layout: &c.moe_gate_up_q4tp_b.get_bind_group_layout(0),
+                    layout: &p_gu.get_bind_group_layout(0),
                     entries: &[
                         bind_buf(0, &gate_all),
                         bind_buf(1, &up_all),
@@ -20653,7 +20762,7 @@ pub fn dspark_graph(
                     ],
                 })
             });
-            pass.set_pipeline(&c.moe_gate_up_q4tp_b);
+            pass.set_pipeline(p_gu);
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(g.inter as u32, slots as u32, block as u32);
             let bind = cached_bind(c, bk(251), || {

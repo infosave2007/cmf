@@ -957,6 +957,12 @@ enum SkillCmd {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // The engine cannot depend on the CLI, but the draft's device pack wants
+    // the converter's q2tp encoder to requantize its experts at upload —
+    // register it here, once, for whichever command ends up drafting.
+    #[cfg(feature = "gpu")]
+    let _ = cortiq_engine::dsv4::DSPARK_Q2TP_ENCODE.set(convert::encode_q2tp);
+
     // `run` hands the screen to the model: the loader's INFO chatter is noise
     // in front of an answer. Every other command keeps the informative
     // default. RUST_LOG overrides either way.
