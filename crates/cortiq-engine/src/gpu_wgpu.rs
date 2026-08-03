@@ -920,8 +920,12 @@ struct RmsP { n: u32, gemma: u32, eps: f32, _p: u32 };
 @group(0) @binding(1) var<storage, read>       rn_w : array<f32>;
 @group(0) @binding(2) var<storage, read_write> rn_o : array<f32>;
 @group(0) @binding(3) var<uniform>             rn_p : RmsP;
-var<workgroup> rn_part: array<f32, 256>;
-@compute @workgroup_size(256)
+// A THOUSAND threads, not 256. This kernel reduces, so it is one workgroup
+// by construction — one SM of two hundred — and a dispatch costs 2.7 µs
+// while this one takes ~23. There is nothing to hide the load latency
+// behind except more threads on the same SM.
+var<workgroup> rn_part: array<f32, 1024>;
+@compute @workgroup_size(1024)
 fn rmsnorm(@builtin(local_invocation_id) lid: vec3<u32>) {
     let tid = lid.x;
     let n = rn_p.n;
@@ -931,11 +935,11 @@ fn rmsnorm(@builtin(local_invocation_id) lid: vec3<u32>) {
         if (i >= n) { break; }
         let v = rn_x[i];
         acc = acc + v * v;
-        i = i + 256u;
+        i = i + 1024u;
     }
     rn_part[tid] = acc;
     workgroupBarrier();
-    var stride = 128u;
+    var stride = 512u;
     loop {
         if (stride == 0u) { break; }
         if (tid < stride) { rn_part[tid] = rn_part[tid] + rn_part[tid + stride]; }
@@ -949,7 +953,7 @@ fn rmsnorm(@builtin(local_invocation_id) lid: vec3<u32>) {
         var wv = rn_w[i];
         if (rn_p.gemma == 1u) { wv = 1.0 + wv; }
         rn_o[i] = rn_x[i] * inv * wv;
-        i = i + 256u;
+        i = i + 1024u;
     }
 }
 
@@ -5699,12 +5703,14 @@ struct HcP { hc: u32, dim: u32, iters: u32, eps: f32, nrm: u32, _a: u32, _b: u32
 @group(0) @binding(8) var<storage, read>       hc_nw    : array<f32>;   // dim
 @group(0) @binding(9) var<storage, read_write> hc_out   : array<f32>;   // dim
 
-var<workgroup> hc_red: array<f32, 256>;
+// A thousand threads: this kernel reduces, so it is one workgroup by
+// construction, and on one SM only more threads can hide the latency.
+var<workgroup> hc_red: array<f32, 1024>;
 var<workgroup> hc_pre_w: array<f32, 8>;
 var<workgroup> hc_cmb_w: array<f32, 64>;
 var<workgroup> hc_rsq: f32;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(1024)
 fn hc_pre_fold(@builtin(local_invocation_index) lid: u32) {
     let hc = hc_p.hc;
     let dim = hc_p.dim;
@@ -5718,11 +5724,11 @@ fn hc_pre_fold(@builtin(local_invocation_index) lid: u32) {
         if (i >= n) { break; }
         let v = hc_state[i];
         acc = acc + v * v;
-        i = i + 256u;
+        i = i + 1024u;
     }
     hc_red[lid] = acc;
     workgroupBarrier();
-    var stride = 128u;
+    var stride = 512u;
     loop {
         if (stride == 0u) { break; }
         if (lid < stride) { hc_red[lid] = hc_red[lid] + hc_red[lid + stride]; }
@@ -5802,12 +5808,12 @@ fn hc_pre_fold(@builtin(local_invocation_index) lid: u32) {
         }
         hc_fold[d] = y;
         acc3 = acc3 + y * y;
-        d = d + 256u;
+        d = d + 1024u;
     }
     if (hc_p.nrm == 0u) { return; }
     hc_red[lid] = acc3;
     workgroupBarrier();
-    var st2 = 128u;
+    var st2 = 512u;
     loop {
         if (st2 == 0u) { break; }
         if (lid < st2) { hc_red[lid] = hc_red[lid] + hc_red[lid + st2]; }
@@ -5819,7 +5825,7 @@ fn hc_pre_fold(@builtin(local_invocation_index) lid: u32) {
     loop {
         if (d2 >= dim) { break; }
         hc_out[d2] = hc_fold[d2] * inv * hc_nw[d2];
-        d2 = d2 + 256u;
+        d2 = d2 + 1024u;
     }
 }
 
