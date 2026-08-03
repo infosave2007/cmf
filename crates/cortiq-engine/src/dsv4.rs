@@ -3607,7 +3607,7 @@ fn forward_chunk_batched(
         };
         if !why.is_empty() {
             static SAID: std::sync::Once = std::sync::Once::new();
-            SAID.call_once(|| tracing::info!("dsv4: пакет отказал — {why}"));
+            SAID.call_once(|| tracing::warn!("dsv4: пакет отказал — {why}"));
             return false;
         }
         let (hc, dim) = (cfg.hc_mult, cfg.dim);
@@ -3663,7 +3663,7 @@ fn forward_chunk_batched(
         // two apart.
         {
             static SAID: std::sync::Once = std::sync::Once::new();
-            SAID.call_once(|| tracing::info!("dsv4: префилл пакетами по {b}"));
+            SAID.call_once(|| tracing::warn!("dsv4: префилл пакетами по {b}"));
         }
         // Only the last token's logits are read; the rest of the chunk exists
         // to fill the caches.
