@@ -16811,25 +16811,31 @@ fn encode_attn_chain(
         let sa_bind = sa_bind_single(c, q, cache, ixb, sink, attn, g.nh, g.hd, m, g.scale,
             Some((kv_id, li)));
         let mut pass = begin_pass(enc);
-        encode_q4tp_mv1_p(&mut pass, c, &wb[1], qn, q, g.nh * g.hd, g.q_lora,
-            (60, kv_id, li));
+        if !dsv4_skip("qproj") {
+            encode_q4tp_mv1_p(&mut pass, c, &wb[1], qn, q, g.nh * g.hd, g.q_lora,
+                (60, kv_id, li));
+        }
         encode_rope_heads_p(&mut pass, c, q, freq, posb, g.nh, g.hd, g.rd, true, false,
             (61, kv_id, li));
-        if sa_split_k() {
-            encode_sa_split_p(&mut pass, c, q, cache, ixb, sink, attn, g.nh, g.hd, m,
-                g.scale, kv_id, li);
-        } else {
-        pass.set_pipeline(&c.sparse_attend);
-        pass.set_bind_group(0, &sa_bind, &[]);
-        pass.dispatch_workgroups(g.nh as u32, 1, 1);
+        if !dsv4_skip("sa") {
+            if sa_split_k() {
+                encode_sa_split_p(&mut pass, c, q, cache, ixb, sink, attn, g.nh, g.hd, m,
+                    g.scale, kv_id, li);
+            } else {
+                pass.set_pipeline(&c.sparse_attend);
+                pass.set_bind_group(0, &sa_bind, &[]);
+                pass.dispatch_workgroups(g.nh as u32, 1, 1);
+            }
         }
         encode_rope_heads_p(&mut pass, c, attn, freq, posb, g.nh, g.hd, g.rd, false, true,
             (62, kv_id, li));
-        pass.set_pipeline(&c.o_lora_a);
-        pass.set_bind_group(0, &o_bind, &[]);
-        pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
-        encode_q4tp_mv1_p(&mut pass, c, &wb[3], mid, out, g.dim, g.o_groups * g.o_lora,
-            (64, kv_id, li));
+        if !dsv4_skip("oproj") {
+            pass.set_pipeline(&c.o_lora_a);
+            pass.set_bind_group(0, &o_bind, &[]);
+            pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+            encode_q4tp_mv1_p(&mut pass, c, &wb[3], mid, out, g.dim, g.o_groups * g.o_lora,
+                (64, kv_id, li));
+        }
         return;
     }
     encode_q4tp_mv1(c, enc, &wb[1], qn, q, g.nh * g.hd, g.q_lora, (60, kv_id, li));
@@ -17414,6 +17420,7 @@ fn dsv4_layer_frame_enc(
     let m_attend = match prep {
         None => idxs.len(),
         Some(p) => {
+            if dsv4_skip("prep") { return None; }
             let Some(n) = dsv4_encode_prep(
                 // `x2` and NOT `folded`: the previous frame's tail leaves
                 // the next layer's NORMED input there, which is exactly what
