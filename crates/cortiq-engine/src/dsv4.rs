@@ -2190,6 +2190,23 @@ fn dsv4_layer_loop(
                     }
                 }
             }
+            // Why a HOST layer stayed on the host, said in numbers. Its MoE
+            // can still run on the card with a partial pack — `moe_frame` has
+            // the remap and hands cold picks back — so the interesting figure
+            // is how many experts it got. Zero means the upload order never
+            // reached it; a few hundred means the readiness gate refused. The
+            // two have different fixes and reading the code cannot tell them
+            // apart.
+            for (li, l) in layers.iter().enumerate() {
+                if on_dev.get(li).copied().unwrap_or(false) {
+                    continue;
+                }
+                let packed = pack_for(l, cfg, li).map_or(0, |p| p.globals.len());
+                tracing::info!(
+                    "слой {li} на хосте: упаковано {packed} экспертов из {}",
+                    cfg.n_routed_experts
+                );
+            }
             let pinned = layers
                 .iter()
                 .find_map(|l| l.experts.first().and_then(|e| e.w1.model_arc()))
