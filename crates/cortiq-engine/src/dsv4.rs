@@ -1150,6 +1150,22 @@ pub(crate) mod prof {
                     aw / calls as f64,
                 );
             }
+            // At the OUTER level on purpose: this used to sit inside the MoE
+            // frame's own report, and the chain does not use the MoE frame —
+            // so the one number that says where a chained token goes was
+            // printed only when the chain was not running.
+            let cl = crate::gpu_wgpu::CHAIN_LAYERS.load(Ordering::Relaxed);
+            if cl > 0 {
+                let toks2 = toks.max(1) as f64;
+                eprintln!(
+                    "[dsv4-профиль] ЦЕПОЧКА на токен: кодирование {:.2} мс, \
+                     ожидание {:.2} мс ({} слоёв, {} отправок)",
+                    crate::gpu_wgpu::CHAIN_ENC_NS.load(Ordering::Relaxed) as f64 / 1e6 / toks2,
+                    crate::gpu_wgpu::CHAIN_WAIT_NS.load(Ordering::Relaxed) as f64 / 1e6 / toks2,
+                    cl / toks.max(1),
+                    crate::gpu_wgpu::CHAIN_RUNS.load(Ordering::Relaxed) / toks.max(1),
+                );
+            }
             let e = crate::gpu_wgpu::MOE_ENC_NS.load(Ordering::Relaxed) as f64 / 1e6;
             let wt = crate::gpu_wgpu::MOE_WAIT_NS.load(Ordering::Relaxed) as f64 / 1e6;
             if e + wt > 0.0 {
@@ -1172,20 +1188,6 @@ pub(crate) mod prof {
                         "[dsv4-профиль]   ВНИМАНИЕ НА КАРТЕ на вызов: одиночное {:.3} мс, \
                          оценки {:.3} мс, применение {:.3} мс",
                         g(0), g(1), g(2),
-                    );
-                }
-                let cl = crate::gpu_wgpu::CHAIN_LAYERS.load(Ordering::Relaxed);
-                if cl > 0 {
-                    let toks2 = toks.max(1) as f64;
-                    eprintln!(
-                        "[dsv4-профиль]   ЦЕПОЧКА на токен: кодирование {:.1} мс, \
-                         ожидание {:.1} мс ({} слоёв, {} отправок)",
-                        crate::gpu_wgpu::CHAIN_ENC_NS.load(Ordering::Relaxed) as f64
-                            / 1e6 / toks2,
-                        crate::gpu_wgpu::CHAIN_WAIT_NS.load(Ordering::Relaxed) as f64
-                            / 1e6 / toks2,
-                        cl / toks.max(1),
-                        crate::gpu_wgpu::CHAIN_RUNS.load(Ordering::Relaxed) / toks.max(1),
                     );
                 }
                 let gn = crate::gpu_wgpu::MOE_GPU_N.load(Ordering::Relaxed);
