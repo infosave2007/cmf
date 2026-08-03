@@ -642,6 +642,42 @@ fn f32_matvec_w(@builtin(workgroup_id) wid: vec3<u32>,
     if (lid == 0u) { fwy[row] = fwpart[0]; }
 }
 
+// The same again with a thousand threads, for the shapes with FEW rows. The
+// hyper-connection mix is 24 rows over 16 384 columns: at 256 threads that
+// is 24 workgroups of 256, six thousand threads. Rows are what give this
+// kernel its workgroups, so when rows are scarce the only width left is
+// inside one.
+
+@group(0) @binding(0) var<storage, read>       fxw : array<f32>;
+@group(0) @binding(1) var<storage, read>       fxx : array<f32>;
+@group(0) @binding(2) var<storage, read_write> fxy : array<f32>;
+@group(0) @binding(3) var<uniform>             fxp : F32WP;
+var<workgroup> fxpart: array<f32, 1024>;
+@compute @workgroup_size(1024)
+fn f32_matvec_x(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    if (row >= fxp.rows) { return; }
+    let base = row * fxp.cols;
+    var acc = 0.0;
+    var i = lid;
+    loop {
+        if (i >= fxp.cols) { break; }
+        acc = acc + fxw[base + i] * fxx[i];
+        i = i + 1024u;
+    }
+    fxpart[lid] = acc;
+    workgroupBarrier();
+    var stride = 512u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { fxpart[lid] = fxpart[lid] + fxpart[lid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (lid == 0u) { fxy[row] = fxpart[0]; }
+}
+
 // Qwen3.5 output gate: attn_out *= sigmoid(gate), element-wise over nh·hd.
 @group(0) @binding(0) var<storage, read>       gm_g : array<f32>;
 @group(0) @binding(1) var<storage, read_write> gm_o : array<f32>;
@@ -6279,6 +6315,7 @@ struct Ctx {
     hc_block: wgpu::ComputePipeline,
     f32_matvec_w: wgpu::ComputePipeline,
     o_lora_a_w: wgpu::ComputePipeline,
+    f32_matvec_x: wgpu::ComputePipeline,
     sa_part: wgpu::ComputePipeline,
     sa_merge: wgpu::ComputePipeline,
     blit: wgpu::ComputePipeline,
@@ -6828,6 +6865,7 @@ fn init() -> Result<Ctx, String> {
     let hc_block = pipe("hc_block");
     let f32_matvec_w = pipe("f32_matvec_w");
     let o_lora_a_w = pipe("o_lora_a_w");
+    let f32_matvec_x = pipe("f32_matvec_x");
     let sa_part = pipe("sparse_attend_part");
     let sa_merge = pipe("sparse_attend_merge");
     let blit = pipe("blit");
@@ -7051,6 +7089,7 @@ fn init() -> Result<Ctx, String> {
         hc_block,
         f32_matvec_w,
         o_lora_a_w,
+        f32_matvec_x,
         sa_part,
         sa_merge,
         blit,
@@ -14291,11 +14330,13 @@ fn encode_f32matvec_w_p(
     cols: usize,
     bkey: (u8, u64, usize),
 ) {
+    // Rows are what give this kernel its workgroups. Few rows, wide inside.
+    let pipe = if rows < 64 { &c.f32_matvec_x } else { &c.f32_matvec_w };
     let bind = cached_bind(c, bkey, || {
         let p = uniform_u32x4(c, [cols as u32, rows as u32, 0, 0]);
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &c.f32_matvec_w.get_bind_group_layout(0),
+            layout: &pipe.get_bind_group_layout(0),
             entries: &[
                 bind_buf(0, weight),
                 bind_buf(1, xs),
@@ -14304,7 +14345,7 @@ fn encode_f32matvec_w_p(
             ],
         })
     });
-    pass.set_pipeline(&c.f32_matvec_w);
+    pass.set_pipeline(pipe);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
 }
@@ -18507,12 +18548,17 @@ fn sa_chunks(m: usize) -> usize {
             .unwrap_or(0)
     });
     if forced > 0 {
-        return forced.min(m).min(8);
+        return forced.min(m).min(SA_MAX_CHUNKS);
     }
-    // ~128 positions a chunk, capped so the merge stays cheap and the
-    // scratch (nh·nc·hd floats) stays small.
-    m.div_ceil(128).clamp(1, 8)
+    // MEASURED, not reasoned: on the release, 2 chunks gave 22.9 tok/s, 4
+    // gave 23.6 and 8 gave 24.5 — monotone, because each chunk is a
+    // workgroup and 64 heads alone leave the card idle. ~16 positions a
+    // chunk, so a short list still splits.
+    m.div_ceil(16).clamp(1, SA_MAX_CHUNKS)
 }
+
+/// The scratch is nh·SA_MAX_CHUNKS·hd floats — 4 MB at the release's shape.
+const SA_MAX_CHUNKS: usize = 32;
 
 /// `CMF_DSV4_SA_SPLIT=0` reverts attention to the one-workgroup-per-head
 /// kernel. The split changes the order the softmax sums in, so it is a
@@ -18541,9 +18587,9 @@ fn encode_sa_split_p(
 ) {
     let nc = sa_chunks(m);
     let ck = m.div_ceil(nc).max(1);
-    let acc = frame_buf(c, 112, nh * 8 * hd * 4, false);
-    let mxb = frame_buf(c, 113, nh * 8 * 4, false);
-    let lnb = frame_buf(c, 114, nh * 8 * 4, false);
+    let acc = frame_buf(c, 112, nh * SA_MAX_CHUNKS * hd * 4, false);
+    let mxb = frame_buf(c, 113, nh * SA_MAX_CHUNKS * 4, false);
+    let lnb = frame_buf(c, 114, nh * SA_MAX_CHUNKS * 4, false);
     let pp = uni_slot8(
         c,
         176,
