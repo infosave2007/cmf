@@ -5684,7 +5684,12 @@ var<workgroup> rt_sc:   array<f32, 1024>;   // sqrt(softplus(score))
 var<workgroup> rt_sh:   array<f32, 1024>;   // the same, biased and masked
 var<workgroup> rt_used: array<u32, 64>;
 
-@compute @workgroup_size(256)
+// A THOUSAND threads. The ranking is O(n²) — for each expert it counts how
+// many beat it — and with 256 routed experts that is 65 536 comparisons in
+// ONE workgroup, which measured 1.65 ms of a 30.6 ms chain. Counting ranks
+// is order-independent, so the tie-break (equal score, lower index wins) is
+// untouched by how many threads do the counting.
+@compute @workgroup_size(1024)
 fn moe_route(@builtin(local_invocation_index) lid: u32) {
     let n = rt_p.n;
     let k = rt_p.top_k;
@@ -5733,7 +5738,7 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
         if (has_bias) { sh = sh + rt_bias[i]; }
         if (has_mask && rt_mask[i] == 0u) { sh = KP_NINF; }
         rt_sh[i] = sh;
-        i = i + 256u;
+        i = i + 1024u;
     }
     workgroupBarrier();
 
@@ -5784,7 +5789,7 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
                     }
                 }
             }
-            m = m + 256u;
+            m = m + 1024u;
         }
     }
     // BOTH barriers. The ranking above writes rt_idx/rt_w, which are STORAGE
