@@ -6812,7 +6812,7 @@ struct Ctx {
     /// not change from token to token, and allocating ten of them per layer
     /// per token — 430 allocations a token on the release — is most of what a
     /// submission costs. Created once, written thereafter.
-    dsv4_scratch: Mutex<HashMap<(u8, usize), wgpu::Buffer>>,
+    dsv4_scratch: Mutex<HashMap<(u8, usize, usize), wgpu::Buffer>>,
     /// One compressor's streams, alive across tokens ON THE DEVICE:
     /// `[pending_kv, pending_score, prev_kv, prev_score]` keyed by
     /// (kind, kv_id, layer) — kind 0 is the attention compressor, 1 the
@@ -18284,7 +18284,7 @@ fn dsv4_layer_frame_enc(
     };
     // The hyper-connection state lives on the card for the whole token; the
     // host seeds it once at layer zero.
-    let state = frame_buf(c, 40, hc * dim * 4, true);
+    let state = frame_buf_t(c, 40, tok, hc * dim * 4, true);
 
     // ── constants (model-owned, address keying is sound) ──
     let qnw = const_buf(c, bytemuck::cast_slice(&w.attn.q_norm[..a.q_lora]));
@@ -19061,8 +19061,19 @@ fn const_buf(c: &Ctx, data: &[u8]) -> wgpu::Buffer {
 /// here would leave every cached group pointing at a dead buffer with
 /// nothing to notice.
 fn frame_buf(c: &Ctx, tag: u8, len_bytes: usize, upload: bool) -> wgpu::Buffer {
+    frame_buf_t(c, tag, 0, len_bytes, upload)
+}
+
+/// The same pool, one buffer per token of the batch.
+///
+/// Scratch that is written and consumed inside a single layer can stay
+/// shared: tokens are encoded one after another and a compute pass orders
+/// its dispatches. What cannot be shared is anything that CARRIES a token
+/// from one layer to the next — the hyper-connection state above all — since
+/// the second token would overwrite the first one's before it is read.
+fn frame_buf_t(c: &Ctx, tag: u8, tok: usize, len_bytes: usize, upload: bool) -> wgpu::Buffer {
     let mut m = c.dsv4_scratch.lock().unwrap();
-    if let Some(b) = m.get(&(tag, len_bytes)) {
+    if let Some(b) = m.get(&(tag, tok, len_bytes)) {
         return b.clone();
     }
     let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
@@ -19075,7 +19086,7 @@ fn frame_buf(c: &Ctx, tag: u8, len_bytes: usize, upload: bool) -> wgpu::Buffer {
         usage,
         mapped_at_creation: false,
     });
-    m.insert((tag, len_bytes), b.clone());
+    m.insert((tag, tok, len_bytes), b.clone());
     b
 }
 
