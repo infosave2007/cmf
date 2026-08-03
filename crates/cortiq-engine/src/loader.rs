@@ -978,7 +978,12 @@ impl Pipeline {
             .tensor("model.mtp.layers.0.self_attn.q_proj.weight")
             .is_some()
             || model.tensor("model.mtp.eh_proj.weight").is_some();
-        if arch.mtp.is_some() && !mtp_present {
+        // DeepSeek-V4 writes its own stack under `model.mtp.N.*` — three full
+        // layers, not a V3-style single block — so it cannot go through the
+        // path below and is loaded by the dsv4 arm instead. Saying the file
+        // "carries none" was a false negative worth six gigabytes.
+        let dsv4_mtp = model.tensor("model.mtp.0.main_proj.weight").is_some();
+        if arch.mtp.is_some() && !mtp_present && !dsv4_mtp {
             tracing::info!(
                 "header declares an MTP head but the file carries none — \
                  loading without it"
@@ -1450,6 +1455,14 @@ impl Pipeline {
                 }
             }
             let st = crate::dsv4::Dsv4State::new(arch.num_layers);
+            // The speculation stack, if the file carries one. Reading it is
+            // metadata only — the expert weights stay in the mapping until a
+            // draft actually runs — so it costs nothing to know it is there.
+            let depth = std::env::var("CMF_DSV4_MTP_DEPTH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(3);
+            pipeline.dsv4_mtp = crate::dsv4::load_mtp(model, &cfg, depth);
             pipeline.dsv4 = Some(Box::new((g, dl, cfg, st)));
         }
         pipeline.short_conv_cfg = short_conv_cfg;

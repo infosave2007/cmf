@@ -163,6 +163,67 @@ fn wgpu_q4tp_matvec_matches_dequant_reference() {
     check("wgpu-mv", cortiq_engine::gpu_wgpu::q4tp_matvec_for_test);
 }
 
+/// The batched MATVEC — the mv4/mv16 pair with `_p0 > 1`, which is a
+/// different kernel from the GEMM above. It carries the whole prefill chunk
+/// and every speculative verify, and it shares its inner loop with decode's
+/// matvec: a bug in the batch dimension is one row-block boundary away from
+/// being a bug in decode. Both row blockings are covered — 16 rows when the
+/// shape is narrow, 8 when it is wide — because the batch offset is computed
+/// per block and the two compute it separately.
+#[cfg(feature = "gpu")]
+#[test]
+fn wgpu_q4tp_matvec_batch_matches_dequant_reference() {
+    unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+    if !cortiq_engine::gpu_wgpu::enabled() {
+        eprintln!("skipped: no wgpu adapter");
+        return;
+    }
+    // cols 512 -> gpr 16, the 16-row kernel; cols 4096 -> gpr 128, the 8-row.
+    //
+    // The models are built up front and HELD. The device-side weight cache is
+    // keyed by the mapping's address, so a model dropped mid-loop frees an
+    // address the next mmap can take — and the second shape then reads the
+    // first one's weights. That is a test bug that reads exactly like a
+    // broken kernel, and it cost a bisect to tell apart.
+    let mut built = Vec::new();
+    for (rows, cols) in [(256usize, 512usize), (128, 4096)] {
+        let payload = synth(rows, cols);
+        let mut w = vec![0f32; rows * cols];
+        dequant_q4tp(&payload, rows, cols, &mut w);
+        let (model, idx) = tiny_model(&format!("wgpu-mvb-{rows}-{cols}"), rows, cols, payload);
+        built.push((rows, cols, w, model, idx));
+    }
+    for (rows, cols, w, model, idx) in &built {
+        let (rows, cols, idx) = (*rows, *cols, *idx);
+        for b in [1usize, 2, 4] {
+            let xs: Vec<f32> = (0..b * cols)
+                .map(|i| ((i * 29 + 13) % 103) as f32 / 103.0 - 0.5)
+                .collect();
+            let mut got = vec![0f32; b * rows];
+            assert!(
+                cortiq_engine::gpu_wgpu::q4tp_matvec_batch_for_test(
+                    &model, idx, &xs, b, rows, cols, &mut got
+                ),
+                "GPU refused a well-formed batched q4tp matvec ({rows}x{cols}, b={b})"
+            );
+            // Every batch element against the SAME weight, which is the claim
+            // the kernel makes: one read, B uses.
+            for t in 0..b {
+                let x = &xs[t * cols..(t + 1) * cols];
+                for r in 0..rows {
+                    let want: f32 = (0..cols).map(|c| w[r * cols + c] * x[c]).sum();
+                    let mag: f32 = (0..cols).map(|c| (w[r * cols + c] * x[c]).abs()).sum();
+                    assert!(
+                        (got[t * rows + r] - want).abs() <= 1e-4 * mag,
+                        "{rows}x{cols} b={b} token {t} row {r}: GPU {} vs dequant {want}",
+                        got[t * rows + r]
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Same idea for the batched GEMM. Prefill runs through this kernel, so a
 /// wrong one corrupts the prompt while decode still looks fine — the failure
 /// mode is a model that answers a question it was never asked.

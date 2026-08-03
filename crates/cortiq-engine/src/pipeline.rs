@@ -104,6 +104,10 @@ pub struct Pipeline {
             crate::dsv4::Dsv4State,
         )>,
     >,
+    /// DeepSeek-V4's own speculation stack: three draft modules, each a full
+    /// layer, plus a confidence head on the last. Empty when the file has
+    /// none, which is the only signal the decode path needs.
+    pub dsv4_mtp: Vec<crate::dsv4::Dsv4Mtp>,
     /// LFM2 short-convolution geometry (present when the model has
     /// `ShortConv` mixer layers).
     pub short_conv_cfg: Option<ShortConvCfg>,
@@ -1166,6 +1170,7 @@ impl Pipeline {
             kda_cfg: None,
             g3n: None,
             dsv4: None,
+            dsv4_mtp: Vec::new(),
             logit_multiplier: None,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             kv_history: Vec::new(),

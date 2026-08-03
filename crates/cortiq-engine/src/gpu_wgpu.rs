@@ -2450,14 +2450,24 @@ fn q4tp_matvec16(@builtin(workgroup_id) wid: vec3<u32>,
     let cstride = (gpr * 5u + 7u) / 8u;
     let sub = lid >> 6u;
     let l = lid & 63u;
+    // `_p0`: how many activation vectors share this weight. One is a matvec;
+    // more is a batch — the weight is read ONCE and used B times, which is
+    // the whole reason a chunk of prompt costs less than a walk over it, and
+    // the reason a speculative verify of B tokens is not B tokens' work. A
+    // row block must belong to one batch element, so the caller sets this
+    // only when rows divides evenly by the block.
+    let nb = max(q1p._p0, 1u);
+    let total = rows * nb;
     var base = wid.x * 16u;
     loop {
-        if (base >= rows) { break; }
+        if (base >= total) { break; }
+        let bi = base / rows;
+        let bofs = bi * rows;
         // 16 rows x 32 rungs: each thread stages two.
         for (var q = lid; q < 512u; q = q + 256u) {
             let r = base + (q >> 5u);
-            if (r < rows) {
-                let pr = unpack2x16float(q1w[params_w + r]);
+            if (r < total) {
+                let pr = unpack2x16float(q1w[params_w + r - bofs]);
                 lad_q16[q] = exp2(pr.x + f32(q & 31u) * pr.y);
             }
         }
@@ -2466,18 +2476,23 @@ fn q4tp_matvec16(@builtin(workgroup_id) wid: vec3<u32>,
         let r_b = r_a + 1u;
         let r_c = r_a + 2u;
         let r_d = r_a + 3u;
+        let w_a = r_a - bofs;
+        let w_b = r_b - bofs;
+        let w_c = r_c - bofs;
+        let w_d = r_d - bofs;
         // `_p1`: the low-rank group width, which slides the activation
         // window with the row. The FOUR rows this thread owns are
         // consecutive, so they share a window only when the width divides
         // the 16-row block — the caller checks that.
         var xblk = 0u;
-        if (q1p._p1 > 0u) { xblk = (r_a / q1p._p1) * gpr * 8u; }
+        if (nb > 1u) { xblk = bi * gpr * 8u; }
+        else if (q1p._p1 > 0u) { xblk = (r_a / q1p._p1) * gpr * 8u; }
         var aa = 0.0;
         var ab = 0.0;
         var ac = 0.0;
         var ad = 0.0;
-        if (r_a < rows) {
-            let all_live = r_d < rows;
+        if (r_a < total) {
+            let all_live = r_d < total;
             var g = l;
             loop {
                 if (g >= gpr) { break; }
@@ -2489,40 +2504,40 @@ fn q4tp_matvec16(@builtin(workgroup_id) wid: vec3<u32>,
                 let x2 = q4v_x[xq + 2u]; let x3 = q4v_x[xq + 3u];
                 let x4 = q4v_x[xq + 4u]; let x5 = q4v_x[xq + 5u];
                 let x6 = q4v_x[xq + 6u]; let x7 = q4v_x[xq + 7u];
-                let cra = codes_b + r_a * cstride + cbo;
+                let cra = codes_b + w_a * cstride + cbo;
                 var cva = q4tp_byte(cra);
                 if (sh > 3u) { cva = cva | (q4tp_byte(cra + 1u) << 8u); }
                 let sa = lad_q16[(sub * 4u << 5u) + ((cva >> sh) & 31u)];
-                let va = q4v_w[r_a * gpr + g];
+                let va = q4v_w[w_a * gpr + g];
                 aa = aa + sa
                     * (q4v_dot8(va.x, x0, x1) + q4v_dot8(va.y, x2, x3)
                      + q4v_dot8(va.z, x4, x5) + q4v_dot8(va.w, x6, x7));
-                if (all_live || r_b < rows) {
-                    let crb = codes_b + r_b * cstride + cbo;
+                if (all_live || r_b < total) {
+                    let crb = codes_b + w_b * cstride + cbo;
                     var cvb = q4tp_byte(crb);
                     if (sh > 3u) { cvb = cvb | (q4tp_byte(crb + 1u) << 8u); }
                     let sb = lad_q16[((sub * 4u + 1u) << 5u) + ((cvb >> sh) & 31u)];
-                    let vb = q4v_w[r_b * gpr + g];
+                    let vb = q4v_w[w_b * gpr + g];
                     ab = ab + sb
                         * (q4v_dot8(vb.x, x0, x1) + q4v_dot8(vb.y, x2, x3)
                          + q4v_dot8(vb.z, x4, x5) + q4v_dot8(vb.w, x6, x7));
                 }
-                if (all_live || r_c < rows) {
-                    let crc = codes_b + r_c * cstride + cbo;
+                if (all_live || r_c < total) {
+                    let crc = codes_b + w_c * cstride + cbo;
                     var cvc = q4tp_byte(crc);
                     if (sh > 3u) { cvc = cvc | (q4tp_byte(crc + 1u) << 8u); }
                     let sc = lad_q16[((sub * 4u + 2u) << 5u) + ((cvc >> sh) & 31u)];
-                    let vc = q4v_w[r_c * gpr + g];
+                    let vc = q4v_w[w_c * gpr + g];
                     ac = ac + sc
                         * (q4v_dot8(vc.x, x0, x1) + q4v_dot8(vc.y, x2, x3)
                          + q4v_dot8(vc.z, x4, x5) + q4v_dot8(vc.w, x6, x7));
                 }
-                if (all_live || r_d < rows) {
-                    let crd = codes_b + r_d * cstride + cbo;
+                if (all_live || r_d < total) {
+                    let crd = codes_b + w_d * cstride + cbo;
                     var cvd = q4tp_byte(crd);
                     if (sh > 3u) { cvd = cvd | (q4tp_byte(crd + 1u) << 8u); }
                     let sd = lad_q16[((sub * 4u + 3u) << 5u) + ((cvd >> sh) & 31u)];
-                    let vd = q4v_w[r_d * gpr + g];
+                    let vd = q4v_w[w_d * gpr + g];
                     ad = ad + sd
                         * (q4v_dot8(vd.x, x0, x1) + q4v_dot8(vd.y, x2, x3)
                          + q4v_dot8(vd.z, x4, x5) + q4v_dot8(vd.w, x6, x7));
@@ -2548,10 +2563,10 @@ fn q4tp_matvec16(@builtin(workgroup_id) wid: vec3<u32>,
             stride = stride >> 1u;
         }
         if (l == 0u) {
-            if (r_a < rows) { q1y[r_a] = p16_a[sub << 6u]; }
-            if (r_b < rows) { q1y[r_b] = p16_b[sub << 6u]; }
-            if (r_c < rows) { q1y[r_c] = p16_c[sub << 6u]; }
-            if (r_d < rows) { q1y[r_d] = p16_d[sub << 6u]; }
+            if (r_a < total) { q1y[r_a] = p16_a[sub << 6u]; }
+            if (r_b < total) { q1y[r_b] = p16_b[sub << 6u]; }
+            if (r_c < total) { q1y[r_c] = p16_c[sub << 6u]; }
+            if (r_d < total) { q1y[r_d] = p16_d[sub << 6u]; }
         }
         workgroupBarrier();
         base = base + nwg.x * 16u;
@@ -2606,29 +2621,42 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
     // feeds BOTH rows' dot chains — the x side of the LSU load nearly
     // halves. Each row's group order and add order stay those of the
     // one-row kernel.
+    // `_p0`: how many activation vectors share this weight. One is a matvec;
+    // more is a batch — the weight is read ONCE and used B times, which is
+    // the whole reason a chunk of prompt costs less than a walk over it, and
+    // the reason a speculative verify of B tokens is not B tokens' work. A
+    // row block must belong to one batch element, so the caller sets this
+    // only when rows divides evenly by the block.
+    let nb = max(q1p._p0, 1u);
+    let total = rows * nb;
     var base = wid.x * 8u;
     loop {
-        if (base >= rows) { break; }
+        if (base >= total) { break; }
+        let bi = base / rows;
+        let bofs = bi * rows;
         {
             let r = base + (lid >> 5u);
-            if (r < rows) {
-                let pr = unpack2x16float(q1w[params_w + r]);
+            if (r < total) {
+                let pr = unpack2x16float(q1w[params_w + r - bofs]);
                 lad_q4v[lid] = exp2(pr.x + f32(lid & 31u) * pr.y);
             }
         }
         workgroupBarrier();
         let row_a = base + sub;
         let row_b = base + sub + 4u;
-        let live_a = row_a < rows;
-        let live_b = row_b < rows;
+        let live_a = row_a < total;
+        let live_b = row_b < total;
+        let wrow_a = row_a - bofs;
+        let wrow_b = row_b - bofs;
         // In vec4 units: (row / lora) * gpr * 32 floats.
         var xblk = 0u;
-        if (q1p._p1 > 0u) { xblk = (row_a / q1p._p1) * gpr * 8u; }
+        if (nb > 1u) { xblk = bi * gpr * 8u; }
+        else if (q1p._p1 > 0u) { xblk = (row_a / q1p._p1) * gpr * 8u; }
         var acc_a = 0.0;
         var acc_b = 0.0;
         if (live_a) {
-            let crow_a = codes_b + row_a * cstride;
-            let crow_b = codes_b + row_b * cstride;
+            let crow_a = codes_b + wrow_a * cstride;
+            let crow_b = codes_b + wrow_b * cstride;
             var g = l;
             loop {
                 if (g >= gpr) { break; }
@@ -2637,7 +2665,7 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
                 let sh = bit & 7u;
                 var cv_a = q4tp_byte(crow_a + cbo);
                 if (sh > 3u) { cv_a = cv_a | (q4tp_byte(crow_a + cbo + 1u) << 8u); }
-                let v_a = q4v_w[row_a * gpr + g];
+                let v_a = q4v_w[wrow_a * gpr + g];
                 // `_p1` is the low-rank group width. Set, it slides the
                 // activation window with the row — which is the ONLY thing
                 // the grouped output projection does differently, and the
@@ -2657,7 +2685,7 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
                 if (live_b) {
                     var cv_b = q4tp_byte(crow_b + cbo);
                     if (sh > 3u) { cv_b = cv_b | (q4tp_byte(crow_b + cbo + 1u) << 8u); }
-                    let v_b = q4v_w[row_b * gpr + g];
+                    let v_b = q4v_w[wrow_b * gpr + g];
                     let sb = lad_q4v[128u + (sub << 5u) + ((cv_b >> sh) & 31u)];
                     acc_b = acc_b + sb
                         * (q4v_dot8(v_b.x, x0, x1) + q4v_dot8(v_b.y, x2, x3)
@@ -2679,8 +2707,8 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
             workgroupBarrier();
             stride = stride >> 1u;
         }
-        if (l == 0u && row_a < rows) { q1y[row_a] = partial_q4v[sub << 6u]; }
-        if (l == 0u && row_b < rows) { q1y[row_b] = partial_q4vb[sub << 6u]; }
+        if (l == 0u && row_a < total) { q1y[row_a] = partial_q4v[sub << 6u]; }
+        if (l == 0u && row_b < total) { q1y[row_b] = partial_q4vb[sub << 6u]; }
         workgroupBarrier();
         base = base + nwg.x * 8u;
     }
@@ -9471,7 +9499,7 @@ pub fn forward_token_graph(
             5 => {
                 if c.use_mv4 {
                     let gpr = cols / 32;
-                    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+                    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 0, 0]);
                     let layout = c.q4t_mv8.get_bind_group_layout(0);
                     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
@@ -9563,7 +9591,7 @@ pub fn forward_token_graph(
             // ~2 ms of arithmetic for the whole MoE block.
             2 | 5 | 6 => {
                 let gpr = cols / 32;
-                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 0, 0]);
                 if m.kind == 2 && c.use_mv4 {
                     let layout = c.q4b_mv8.get_bind_group_layout(0);
                     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -9638,7 +9666,7 @@ pub fn forward_token_graph(
             }
             3 => {
                 let gpr = cols / 32;
-                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 0, 0]);
                 let layout = c.q1t.get_bind_group_layout(0);
                 let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
@@ -11564,7 +11592,7 @@ pub fn forward_batch_graph(
             5 => {
                 if c.use_mv4 {
                     let gpr = cols / 32;
-                    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+                    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 0, 0]);
                     let layout = c.q4t_mv8.get_bind_group_layout(0);
                     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
@@ -13044,8 +13072,30 @@ pub fn q4tp_matvec_for_test(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
+    q4tp_matvec_batch_for_test(model, idx, xs, 1, rows, cols, out)
+}
+
+/// `batch` activation vectors end to end against one weight, `batch * rows`
+/// outputs. Exposed so the dequant-pinned test can hold the batched form to
+/// the same definition as the single one — the batch dimension shares the
+/// kernel with the matvec, so a bug in it is a bug in decode too.
+#[allow(clippy::too_many_arguments)]
+pub fn q4tp_matvec_batch_for_test(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    batch: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
     let Some(c) = ctx() else { return false };
-    if cols % 32 != 0 || rows == 0 || xs.len() < cols || out.len() < rows {
+    if cols % 32 != 0
+        || rows == 0
+        || batch == 0
+        || xs.len() < batch * cols
+        || out.len() < batch * rows
+    {
         return false;
     }
     let entry = &model.tensors[idx];
@@ -13073,13 +13123,13 @@ pub fn q4tp_matvec_for_test(
     let xs_buf = Scratch::ensure(
         &c.device,
         &mut sc.xs,
-        (cols * 4) as u64,
+        (batch * cols * 4) as u64,
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         "q4tp-xs",
     );
     c.queue
-        .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..cols]));
-    let y_size = (rows * 4) as u64;
+        .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..batch * cols]));
+    let y_size = (batch * rows * 4) as u64;
     let y_buf = Scratch::ensure(
         &c.device,
         &mut sc.y,
@@ -13102,11 +13152,15 @@ pub fn q4tp_matvec_for_test(
     // The hook follows the runtime's kernel choice, so the dequant-pinned
     // test exercises whichever variant real decodes will use.
     if c.use_mv4 {
-        encode_q4tp_mv4(c, &mut enc, &q_buf, &xs_buf, &y_buf, rows, cols);
-    } else {
+        if !encode_q4tp_mv4_b(c, &mut enc, &q_buf, &xs_buf, &y_buf, rows, cols, batch) {
+            return false;
+        }
+    } else if batch == 1 {
         encode_q1t_like(c, &mut enc, &c.q4tp_mv, &q_buf, &xs_buf, &y_buf, rows, cols);
+    } else {
+        return false;
     }
-    readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..rows])
+    readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..batch * rows])
 }
 
 /// DiT attention on wgpu: per head, scores = scale·Q·Kᵀ → row softmax →
@@ -14883,14 +14937,45 @@ fn encode_q4tp_mv4(
     rows: usize,
     cols: usize,
 ) {
+    encode_q4tp_mv4_b(c, enc, weight, xs, y, rows, cols, 1);
+}
+
+/// The same projection against `batch` activation vectors laid end to end,
+/// writing `batch * rows` outputs. The weight is read once for all of them,
+/// which is the point: a prompt chunk and a speculative verify both need
+/// exactly this and nothing else.
+///
+/// Returns false when the shape cannot be blocked — a row block has to sit
+/// inside one batch element — and the caller falls back to one call each.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4tp_mv4_b(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    batch: usize,
+) -> bool {
     let gpr = cols / 32;
     // Narrow shapes (one group per lane in the 8-row kernel) go 16-rows.
-    let (pipe, per_wg) = if gpr <= 64 {
+    // With a batch the divisibility decides first: a block that straddled
+    // two tokens would read one token's weights against the other's x.
+    let (pipe, per_wg) = if batch > 1 {
+        if rows % 16 == 0 && gpr <= 64 {
+            (&c.q4tp_mv16, 16u32)
+        } else if rows % 8 == 0 {
+            (&c.q4tp_mv4, 8u32)
+        } else {
+            return false;
+        }
+    } else if gpr <= 64 {
         (&c.q4tp_mv16, 16u32)
     } else {
         (&c.q4tp_mv4, 8u32)
     };
-    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, batch as u32, 0]);
     let layout = pipe.get_bind_group_layout(0);
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
@@ -14906,7 +14991,12 @@ fn encode_q4tp_mv4(
     let mut pass = begin_pass(enc);
     pass.set_pipeline(pipe);
     pass.set_bind_group(0, &bind, &[]);
-    pass.dispatch_workgroups((rows as u32).div_ceil(per_wg).min(MAX_WG), 1, 1);
+    pass.dispatch_workgroups(
+        ((rows * batch) as u32).div_ceil(per_wg).min(MAX_WG),
+        1,
+        1,
+    );
+    true
 }
 
 /// The one-row q4tp kernel, which is the one `gpu_q4tp_parity` blesses.
@@ -14988,7 +15078,7 @@ fn encode_q4tp_mvw_p(
         (&c.q4tp_mv4, 8u32)
     };
     let bind = cached_bind(c, bkey, || {
-        let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+        let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 0, 0]);
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &pipe.get_bind_group_layout(0),
@@ -15126,7 +15216,7 @@ fn encode_q1t_like(
     cols: usize,
 ) {
     let gpr = cols / 32;
-    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 0, 0]);
     let layout = pipeline.get_bind_group_layout(0);
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
@@ -15156,7 +15246,7 @@ fn encode_silu_down(
     cols: usize,
 ) {
     let gpr = cols / 32;
-    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 0, 0]);
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &c.layout_silu_down,
