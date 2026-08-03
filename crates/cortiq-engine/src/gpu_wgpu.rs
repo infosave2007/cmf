@@ -17991,6 +17991,7 @@ fn encode_moe_chain_p(
 /// — for the kv projection, the compressor and the indexer, which still live
 /// there — and nothing else. Layer zero's opening fold is done on the host
 /// once, which costs nothing at all.
+#[derive(Clone)]
 pub struct Dsv4LayerW<'a> {
     pub attn: Dsv4AttnW<'a>,
     pub moe: Dsv4MoeW<'a>,
@@ -18659,6 +18660,10 @@ pub fn dsv4_chain_batch(
     inv_freq: &[&[f32]],
     pos: usize,
     batch: usize,
+    // Hash layers force their expert list from the TOKEN's id, so the layer
+    // description itself varies across a batch — not just the prep. One row
+    // per token, each as long as `layers`; None where the layer does not hash.
+    forced: Option<&[Vec<Option<Vec<usize>>>]>,
     folded_out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
@@ -18702,6 +18707,17 @@ pub fn dsv4_chain_batch(
                 pt.n_ix = p.n_ix + advanced(cg.ratio);
                 pt.ix_dst_off = p.ix_dst_off + (pt.n_ix - p.n_ix) * ew;
             }
+            // The layer as this token sees it: identical but for the row a
+            // hash layer forces from the token's id.
+            let mut wt;
+            let w = match forced.and_then(|f| f.get(t)).and_then(|r| r.get(i)) {
+                Some(row) => {
+                    wt = w.clone();
+                    wt.moe.forced = row.as_deref();
+                    &wt
+                }
+                None => w,
+            };
             let Some(b) = dsv4_layer_frame_enc(
                 model,
                 w,
@@ -20875,6 +20891,7 @@ pub fn dsv4_cache_clear(kv_id: u64) {
 
 /// The quantized tensors one DeepSeek-V4 attention block reads, by directory
 /// index, plus the two small f32 vectors it needs whole.
+#[derive(Clone)]
 pub struct Dsv4AttnW<'a> {
     pub wq_a: usize,
     pub wq_b: usize,
@@ -21230,6 +21247,7 @@ pub static ATT_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// renumbered into that packing. That removes the whole global-to-slot remap
 /// the obvious design needs, and it makes the mask implicit: an expert not in
 /// the packing has no logit and cannot be chosen.
+#[derive(Clone)]
 pub struct Dsv4MoeW<'a> {
     /// The gate as dense f32 `[n_exp, hidden]`. Used when `logits` is empty,
     /// which is what a device-resident input forces: the host cannot score
