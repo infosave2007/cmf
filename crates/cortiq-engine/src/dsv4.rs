@@ -4347,6 +4347,101 @@ fn host_tail_walk(
     }
 }
 
+/// The host tail for a whole batch: attention stays causal per token (its
+/// window mutates), the MoE half runs through the block-grouped path — the
+/// same accumulation order as the position walk, which the block tests pin
+/// bit for bit. This is the verify's tail; the single-token paths keep
+/// `hc_block`.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn host_tail_walk_batch(
+    g: &Dsv4Globals,
+    layers: &[Dsv4Layer],
+    cfg: &Dsv4Cfg,
+    st: &mut Dsv4State,
+    gpu_end: usize,
+    states: &mut [f32],
+    ids: &[u32],
+    pos0: usize,
+    b: usize,
+    inv_freq: &[f32],
+    scratch: &mut HcScratch,
+    pool: Option<&crate::pool::Pool>,
+) {
+    let (hc, dim) = (cfg.hc_mult, cfg.dim);
+    let mix_hc = (2 + hc) * hc;
+    let mut folds = vec![0.0f32; b * dim];
+    let mut mo = vec![0.0f32; b * dim];
+    let mut posts = vec![0.0f32; b * hc];
+    let mut combs = vec![0.0f32; b * hc * hc];
+    let mut resid = vec![0.0f32; b * hc * dim];
+    for (li, l) in layers.iter().enumerate().skip(gpu_end) {
+        let freqs = if l.compressor.is_some() {
+            &g.inv_freq_compress
+        } else {
+            &g.inv_freq_window
+        };
+        let freqs = if freqs.is_empty() { inv_freq } else { freqs.as_slice() };
+        for t in 0..b {
+            st.pos = pos0 + t;
+            let state = &mut states[t * hc * dim..(t + 1) * hc * dim];
+            hc_block(
+                state,
+                &l.hc_attn_fn,
+                &l.hc_attn_scale,
+                &l.hc_attn_base,
+                &l.attn_norm,
+                cfg,
+                scratch,
+                pool,
+                |f, o| attention_step(f, l, cfg, st, li, freqs, pool, None, o),
+            );
+        }
+        for t in 0..b {
+            let state = &states[t * hc * dim..(t + 1) * hc * dim];
+            hc_mixes(state, &l.hc_ffn_fn, mix_hc, cfg.norm_eps, pool, &mut scratch.mixes);
+            hc_split_sinkhorn(
+                &scratch.mixes,
+                &l.hc_ffn_scale,
+                &l.hc_ffn_base,
+                hc,
+                cfg.hc_sinkhorn_iters,
+                cfg.hc_eps,
+                &mut scratch.pre,
+                &mut posts[t * hc..(t + 1) * hc],
+                &mut combs[t * hc * hc..(t + 1) * hc * hc],
+            );
+            let fold = &mut folds[t * dim..(t + 1) * dim];
+            hc_fold(state, &scratch.pre, hc, dim, fold);
+            let ms = fold.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+            let inv = 1.0 / (ms + cfg.norm_eps).sqrt();
+            for (v, w) in fold.iter_mut().zip(&l.ffn_norm) {
+                *v = *v * inv * w;
+            }
+            resid[t * hc * dim..(t + 1) * hc * dim]
+                .copy_from_slice(&states[t * hc * dim..(t + 1) * hc * dim]);
+        }
+        if host_cpu_moe() {
+            crate::gpu::cpu_scope(|| moe_step_block(&folds, b, l, cfg, ids, li, pool, &mut mo));
+        } else {
+            moe_step_block(&folds, b, l, cfg, ids, li, pool, &mut mo);
+        }
+        for t in 0..b {
+            let state = &mut states[t * hc * dim..(t + 1) * hc * dim];
+            hc_expand(
+                &mo[t * dim..(t + 1) * dim],
+                &resid[t * hc * dim..(t + 1) * hc * dim],
+                &posts[t * hc..(t + 1) * hc],
+                &combs[t * hc * hc..(t + 1) * hc * hc],
+                hc,
+                dim,
+                state,
+            );
+            dspark_note(li, state, cfg);
+        }
+    }
+}
+
 /// A speculative verify pass: run `ids` (the committed next token followed
 /// by draft proposals) at positions `pos0..pos0+B` through the trunk in one
 /// batched submission, WITHOUT giving up the ability to roll back, and
@@ -4487,12 +4582,11 @@ pub fn dsv4_verify_chunk(
     logits_out.clear();
     logits_out.resize(b * cfg.vocab, 0.0);
     let mut head_in = vec![0.0f32; b * dim];
+    host_tail_walk_batch(
+        g, layers, cfg, st, gpu_end, &mut states, ids, pos0, b, inv_freq, &mut scratch, pool,
+    );
     for t in 0..b {
-        let state = &mut states[t * hc * dim..(t + 1) * hc * dim];
-        host_tail_walk(
-            g, layers, cfg, st, gpu_end, state, ids[t], pos0 + t, inv_freq, &mut scratch,
-            pool,
-        );
+        let state = &states[t * hc * dim..(t + 1) * hc * dim];
         let h = &mut head_in[t * dim..(t + 1) * dim];
         hc_head_fold(state, &g.hc_head_fn, g.hc_head_scale, &g.hc_head_base, cfg, pool, h);
         rms_weighted(h, &g.norm, cfg.norm_eps);
@@ -4710,13 +4804,10 @@ pub fn dsv4_spec_finish(
     }
     let mut scratch = HcScratch::new(cfg);
     let mut states = txn.states.clone();
-    for t in 0..k {
-        let state = &mut states[t * hc * dim..(t + 1) * hc * dim];
-        host_tail_walk(
-            g, layers, cfg, st, txn.gpu_end, state, ids[t], txn.pos0 + t, inv_freq,
-            &mut scratch, pool,
-        );
-    }
+    host_tail_walk_batch(
+        g, layers, cfg, st, txn.gpu_end, &mut states[..k * hc * dim], ids, txn.pos0, k,
+        inv_freq, &mut scratch, pool,
+    );
     st.pos = txn.pos0 + k;
     true
 }
