@@ -3381,6 +3381,34 @@ fn vec_json(v: &[f32]) -> String {
 /// it before the output norm and the head. There is no point in this
 /// function where an ordinary residual would fit.
 #[allow(clippy::too_many_arguments)]
+/// A chunk of prompt tokens. Stage one of the batched prefill (see
+/// docs/DSV4_PREFILL.md): the walk itself, with the head skipped for every
+/// token but the last.
+///
+/// Prefill costs `len × per-token` today, and on a 2500-token prompt that is
+/// a minute and a half before the first word. The stages that follow batch
+/// the weight reads — which is where the nine-fold gap to the bandwidth
+/// floor lives — but this one is the scaffolding they hang on, and it
+/// already stops computing 129 280 logits for tokens nobody asks about.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_chunk(
+    g: &Dsv4Globals,
+    layers: &[Dsv4Layer],
+    cfg: &Dsv4Cfg,
+    st: &mut Dsv4State,
+    ids: &[u32],
+    pos0: usize,
+    inv_freq: &[f32],
+    pool: Option<&crate::pool::Pool>,
+    logits: &mut Vec<f32>,
+) {
+    for (i, &id) in ids.iter().enumerate() {
+        st.pos = pos0 + i;
+        let last = i + 1 == ids.len();
+        forward_token_inner(g, layers, cfg, st, id, inv_freq, pool, logits, last);
+    }
+}
+
 pub fn forward_token(
     g: &Dsv4Globals,
     layers: &[Dsv4Layer],
@@ -3390,6 +3418,22 @@ pub fn forward_token(
     inv_freq: &[f32],
     pool: Option<&crate::pool::Pool>,
     logits: &mut Vec<f32>,
+) {
+    forward_token_inner(g, layers, cfg, st, token_id, inv_freq, pool, logits, true);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_token_inner(
+    g: &Dsv4Globals,
+    layers: &[Dsv4Layer],
+    cfg: &Dsv4Cfg,
+    st: &mut Dsv4State,
+    token_id: u32,
+    inv_freq: &[f32],
+    pool: Option<&crate::pool::Pool>,
+    logits: &mut Vec<f32>,
+    // Prompt tokens other than the last one have their logits thrown away.
+    want_logits: bool,
 ) {
     let _t_all = prof::on().then(std::time::Instant::now);
     let _all_guard = Charge(_t_all, &prof::ALL_NS);
@@ -3556,6 +3600,10 @@ pub fn forward_token(
         pool,
         &mut h,
     );
+    if !want_logits {
+        logits.clear();
+        return;
+    }
     let _t_head = prof::on().then(std::time::Instant::now);
     rms_weighted(&mut h, &g.norm, cfg.norm_eps);
     logits.clear();

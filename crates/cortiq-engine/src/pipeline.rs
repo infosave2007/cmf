@@ -1617,6 +1617,32 @@ impl Pipeline {
                 }
             }
         }
+        // DeepSeek-V4 walks the prompt as a CHUNK (docs/DSV4_PREFILL.md).
+        // Today that only skips the head for every token but the last —
+        // 129 280 logits per prompt token that nobody reads — and gives the
+        // batched stages somewhere to live. Not taken when MTP is on: that
+        // wants each position's hidden as it goes.
+        if self.dsv4.is_some() && mtp.is_none() && pos < input_ids.len() {
+            let ids: Vec<u32> = input_ids[pos..].to_vec();
+            let mut lg = Vec::new();
+            if let Some(b) = &mut self.dsv4 {
+                let (g, layers, cfg, st) = (&b.0, &b.1, b.2, &mut b.3);
+                crate::dsv4::forward_chunk(
+                    g,
+                    layers,
+                    &cfg,
+                    st,
+                    &ids,
+                    pos,
+                    &self.inv_freq,
+                    self.pool.as_deref(),
+                    &mut lg,
+                );
+            }
+            self.graph_logits = Some(lg);
+            pos = input_ids.len();
+            hidden = vec![0.0; self.hidden_size];
+        }
         while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
             self.graph_want_logits = fuse_lm && pos + 1 == input_ids.len();
             hidden = self.forward_layers(&self.embed_single(input_ids[pos]), pos, task_mask);
