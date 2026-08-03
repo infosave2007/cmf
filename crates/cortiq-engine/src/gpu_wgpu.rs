@@ -4982,6 +4982,26 @@ fn index_scores(@builtin(workgroup_id) wid: vec3<u32>,
     if (lid == 0u) { ix_out[t] = ix_red[0]; }
 }
 
+// A copy, as a dispatch. `copy_buffer_to_buffer` cannot be recorded inside a
+// compute pass, so every small copy in the prep path — this token's slot in
+// the compressor window, the window shift, the closed window becoming the
+// previous one — used to end a pass and start another. At ~30 passes a layer
+// that bookkeeping was most of what a decode step cost, so the copies become
+// dispatches and the whole layer becomes a handful of passes.
+
+struct BlP { n: u32, soff: u32, doff: u32, _a: u32 };
+
+@group(0) @binding(0) var<storage, read>       bl_src : array<f32>;
+@group(0) @binding(1) var<storage, read_write> bl_dst : array<f32>;
+@group(0) @binding(2) var<uniform>             bl_p   : BlP;
+
+@compute @workgroup_size(256)
+fn blit(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= bl_p.n) { return; }
+    bl_dst[bl_p.doff + i] = bl_src[bl_p.soff + i];
+}
+
 // Top-k without a sort. The CPU picks by repeated argmax, first maximum wins,
 // and returns the winners in index order; the same set falls out of a rank —
 // how many positions beat me, counting an equal score as a win only if it
@@ -5741,6 +5761,7 @@ struct Ctx {
     kv_pool: wgpu::ComputePipeline,
     index_scores: wgpu::ComputePipeline,
     top_k_index: wgpu::ComputePipeline,
+    blit: wgpu::ComputePipeline,
     idx_build: wgpu::ComputePipeline,
     moe_route: wgpu::ComputePipeline,
     sparse_attend: wgpu::ComputePipeline,
@@ -6277,6 +6298,7 @@ fn init() -> Result<Ctx, String> {
     let kv_pool = pipe("kv_pool");
     let index_scores = pipe("index_scores");
     let top_k_index = pipe("top_k_index");
+    let blit = pipe("blit");
     let idx_build = pipe("idx_build");
     let moe_route = pipe("moe_route");
     let sparse_attend = pipe("sparse_attend");
@@ -6494,6 +6516,7 @@ fn init() -> Result<Ctx, String> {
         kv_pool,
         index_scores,
         top_k_index,
+        blit,
         idx_build,
         moe_route,
         sparse_attend,
@@ -17563,6 +17586,40 @@ fn ts_pair(c: &Ctx, which: usize) -> Option<wgpu::ComputePassTimestampWrites<'_>
 /// (a pass of its own, so the query set has boundaries to write) and the
 /// fused one (a dispatch inside the layer's pass).
 #[allow(clippy::too_many_arguments)]
+/// A device-to-device copy of `n` floats, as a dispatch — so it can sit
+/// inside a compute pass instead of ending one.
+#[allow(clippy::too_many_arguments)]
+fn encode_blit_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
+    src: &wgpu::Buffer,
+    dst: &wgpu::Buffer,
+    n: usize,
+    soff: usize,
+    doff: usize,
+    // Some: cache the group. The offsets move with the sequence, so they ride
+    // a per-layer uniform slot that is rewritten rather than a content-keyed
+    // buffer.
+    bkey: Option<(u8, u64, usize)>,
+) {
+    let p = match bkey {
+        Some((tag, kv, li)) => uni_slot(c, tag, kv, li, [n as u32, soff as u32, doff as u32, 0]),
+        None => uniform_u32x4(c, [n as u32, soff as u32, doff as u32, 0]),
+    };
+    let mk = || c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.blit.get_bind_group_layout(0),
+        entries: &[bind_buf(0, src), bind_buf(1, dst), bind_buf(2, &p)],
+    });
+    let bind = match bkey {
+        Some((tag, kv, li)) => cached_bind(c, (tag.wrapping_add(1), kv, li), mk),
+        None => mk(),
+    };
+    pass.set_pipeline(&c.blit);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+}
+
 fn sa_bind_single(
     c: &Ctx,
     q: &wgpu::Buffer,
@@ -17736,6 +17793,26 @@ fn encode_kv_pool(
     kvid: u64,
     li: usize,
 ) {
+    let mut pass = begin_pass(enc);
+    encode_kv_pool_p(&mut pass, c, prev_kv, prev_sc, cur_kv, cur_sc, ape, out, g, have_prev, kind, kvid, li);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_kv_pool_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
+    prev_kv: &wgpu::Buffer,
+    prev_sc: &wgpu::Buffer,
+    cur_kv: &wgpu::Buffer,
+    cur_sc: &wgpu::Buffer,
+    ape: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    g: Dsv4CompGeom,
+    have_prev: bool,
+    kind: u8,
+    kvid: u64,
+    li: usize,
+) {
     let ew = if g.overlap { g.width / 2 } else { g.width };
     let slots = if g.overlap { 2 * g.ratio } else { g.ratio };
     // The bias is folded in on arrival when the windows overlap, so the
@@ -17761,7 +17838,6 @@ fn encode_kv_pool(
             ],
         })
     });
-    let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.kv_pool);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups((ew as u32).div_ceil(256), 1, 1);
@@ -17895,49 +17971,49 @@ fn comp_state_step(
     // A previous window exists once one has closed.
     let have_prev = pos + 1 > g.ratio;
 
-    if g.overlap {
-        // The reference biases the score as the token ARRIVES and keeps it
-        // biased across the shift, so `ape` is added once, here, and the
-        // pooling kernel is told not to add it again.
-        let ape_all = const_buf(c, bytemuck::cast_slice(w.ape));
-        // `true`: this one is a copy DESTINATION (the slice of `ape`).
-        let ape_slot = frame_buf(c, 74 + kind, g.width * 4, true);
-        enc.copy_buffer_to_buffer(
-            &ape_all,
-            (slot * g.width * 4) as u64,
-            &ape_slot,
-            0,
-            (g.width * 4) as u64,
-        );
-        encode_axpy(c, enc, &ape_slot, &csc, 1.0, g.width, (84 + kind, kv_id, li));
-    }
-    enc.copy_buffer_to_buffer(&ckv, 0, pend_kv, (slot * g.width * 4) as u64, (g.width * 4) as u64);
-    enc.copy_buffer_to_buffer(&csc, 0, pend_sc, (slot * g.width * 4) as u64, (g.width * 4) as u64);
-    if !folds {
-        return None;
-    }
-
+    // One pass for the whole compressor step: the copies are dispatches now
+    // (`blit`), which is what let them stop cutting the layer into pieces.
+    let ape_all = const_buf(c, bytemuck::cast_slice(w.ape));
+    let ape_slot = frame_buf(c, 74 + kind, g.width * 4, true);
     let folded = frame_buf(c, 76 + kind, ew * 4, false);
     let normed = frame_buf(c, 78 + kind, ew * 4, false);
-    encode_kv_pool(
-        c, enc, prev_kv, prev_sc, pend_kv, pend_sc,
-        &const_buf(c, bytemuck::cast_slice(w.ape)),
-        &folded, g, have_prev, kind, kv_id, li,
-    );
     let nw = const_buf(c, bytemuck::cast_slice(&w.norm[..ew]));
-    encode_rmsnorm(c, enc, &folded, &nw, &normed, ew, g.eps, (86 + kind, kv_id, li));
+    {
+        let mut pass = begin_pass(enc);
+        if g.overlap {
+            // The reference biases the score as the token ARRIVES and keeps
+            // it biased across the shift, so `ape` is added once, here, and
+            // the pooling kernel is told not to add it again.
+            encode_blit_p(&mut pass, c, &ape_all, &ape_slot, g.width, slot * g.width, 0,
+                Some((142 + kind * 2, kv_id, li)));
+            encode_axpy_p(&mut pass, c, &ape_slot, &csc, 1.0, g.width, (84 + kind, kv_id, li));
+        }
+        encode_blit_p(&mut pass, c, &ckv, pend_kv, g.width, 0, slot * g.width,
+            Some((146 + kind * 2, kv_id, li)));
+        encode_blit_p(&mut pass, c, &csc, pend_sc, g.width, 0, slot * g.width,
+            Some((150 + kind * 2, kv_id, li)));
+        if !folds {
+            return None;
+        }
+        encode_kv_pool_p(&mut pass, c, prev_kv, prev_sc, pend_kv, pend_sc, &ape_all,
+            &folded, g, have_prev, kind, kv_id, li);
+        encode_rmsnorm_p(&mut pass, c, &folded, &nw, &normed, ew, g.eps, (86 + kind, kv_id, li));
     // The entry carries a window key's rope tail, at the position of the
     // window's FIRST token — not this one.
-    let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..g.rope_dim / 2]));
-    let posb = frame_up_pos(c, 79 + kind, pos + 1 - g.ratio, g.eps);
-    encode_rope_heads(c, enc, &normed, &freq, &posb, 1, ew, g.rope_dim, false, false,
-        (88 + kind, kv_id, li));
-    enc.copy_buffer_to_buffer(&normed, 0, dst, (dst_off * 4) as u64, (ew * 4) as u64);
-    if g.overlap {
-        // The window that just closed becomes the previous one — the fold
-        // reads half its dimensions from that stride.
-        enc.copy_buffer_to_buffer(pend_kv, 0, prev_kv, 0, (span * 4) as u64);
-        enc.copy_buffer_to_buffer(pend_sc, 0, prev_sc, 0, (span * 4) as u64);
+        let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..g.rope_dim / 2]));
+        let posb = frame_up_pos(c, 79 + kind, pos + 1 - g.ratio, g.eps);
+        encode_rope_heads_p(&mut pass, c, &normed, &freq, &posb, 1, ew, g.rope_dim, false,
+            false, (88 + kind, kv_id, li));
+        encode_blit_p(&mut pass, c, &normed, dst, ew, 0, dst_off,
+            Some((154 + kind * 2, kv_id, li)));
+        if g.overlap {
+            // The window that just closed becomes the previous one — the fold
+            // reads half its dimensions from that stride.
+            encode_blit_p(&mut pass, c, pend_kv, prev_kv, span, 0, 0,
+                Some((158 + kind * 2, kv_id, li)));
+            encode_blit_p(&mut pass, c, pend_sc, prev_sc, span, 0, 0,
+                Some((162 + kind * 2, kv_id, li)));
+        }
     }
     Some(dst_off)
 }
@@ -18014,10 +18090,12 @@ fn window_place(
 ) {
     let kv = frame_buf(c, 105, hd * 4, false);
     let nw = const_buf(c, bytemuck::cast_slice(&kv_norm[..hd]));
-    encode_rmsnorm(c, enc, raw, &nw, &kv, hd, eps, (107, kv_id, li));
     let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..rope_dim / 2]));
     let posb = frame_up_pos(c, 108, pos, eps);
-    encode_rope_heads(c, enc, &kv, &freq, &posb, 1, hd, rope_dim, false, false,
+    let tmp = frame_buf(c, 110, (window.max(1) - 1).max(1) * hd * 4, true);
+    let mut pass = begin_pass(enc);
+    encode_rmsnorm_p(&mut pass, c, raw, &nw, &kv, hd, eps, (107, kv_id, li));
+    encode_rope_heads_p(&mut pass, c, &kv, &freq, &posb, 1, hd, rope_dim, false, false,
         (109, kv_id, li));
 
     // Where it lands, and whether the window has to slide first.
@@ -18027,13 +18105,12 @@ fn window_place(
         // Drop the oldest: everything moves down one slot. A copy whose
         // source and destination overlap is not allowed, so it goes through
         // a scratch buffer — still device-local, still no host.
-        let span = ((window - 1) * hd * 4) as u64;
-        let tmp = frame_buf(c, 110, (window - 1) * hd * 4, true);
-        enc.copy_buffer_to_buffer(cache, (hd * 4) as u64, &tmp, 0, span);
-        enc.copy_buffer_to_buffer(&tmp, 0, cache, 0, span);
+        let n = (window - 1) * hd;
+        encode_blit_p(&mut pass, c, cache, &tmp, n, hd, 0, Some((166, kv_id, li)));
+        encode_blit_p(&mut pass, c, &tmp, cache, n, 0, 0, Some((168, kv_id, li)));
         window - 1
     };
-    enc.copy_buffer_to_buffer(&kv, 0, cache, (slot * hd * 4) as u64, (hd * 4) as u64);
+    encode_blit_p(&mut pass, c, &kv, cache, hd, 0, slot * hd, Some((170, kv_id, li)));
 }
 
 /// Drive the norm, the rope tail and the slide from a test with the
