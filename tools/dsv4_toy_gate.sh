@@ -98,4 +98,35 @@ for toy in hx4 plain4 sc4 q4 big2; do
   fi
   echo "$toy  кадр:$a  цепочка:$b$mark"
 done
+# ── the batched prompt against the walk ────────────────────────────────
+# A batch changes only HOW the prompt reaches the card, never what it
+# computes, so any difference here is a defect. The walk is the reference;
+# widths 2, 3 and 5 are decode-block sizes, and 5 straddles the compressor's
+# ratio-4 boundary, which is where a closed-form counter would go wrong.
+echo "--- пакетный префилл против прохода по токенам ---"
+# The comparison is only worth its name if the batch RAN. `ppl` walks tokens
+# one at a time and never reaches forward_chunk, so this section compared the
+# walk against itself and printed agreement — which is how a vacuous check
+# looks from the outside. It now demands the engine say it batched, and says
+# plainly that it did not when it did not.
+for toy in plain4 sc4 q4; do
+  base=$(env $E CMF_DSV4_CHAIN=1 CMF_DSV4_BATCH=1 ./target/release/cortiq ppl \
+    $S/$toy.cmf --file $S/long.txt --tokens 120 2>/dev/null | grep -o "PPL = [0-9.]*")
+  for b in 2 3 5; do
+    log=$(env $E CMF_DSV4_CHAIN=1 CMF_DSV4_BATCH=$b RUST_LOG=info \
+      ./target/release/cortiq ppl $S/$toy.cmf --file $S/long.txt --tokens 120 2>&1)
+    got=$(echo "$log" | grep -o "PPL = [0-9.]*")
+    if ! echo "$log" | grep -q "префилл пакетами"; then
+      echo "$toy  пакет=$b: НЕ ПРОВЕРЕНО — пакет не включился на этом пути"
+      continue
+    fi
+    if [ "$base" = "$got" ]; then
+      echo "$toy  пакет=$b: $got  (совпало)"
+    else
+      echo "GATE FAIL: $toy пакет=$b: $got против прохода $base"
+      exit 1
+    fi
+  done
+done
+
 exit $fail

@@ -3524,6 +3524,120 @@ fn vec_json(v: &[f32]) -> String {
 /// floor lives — but this one is the scaffolding they hang on, and it
 /// already stops computing 129 280 logits for tokens nobody asks about.
 #[allow(clippy::too_many_arguments)]
+/// `CMF_DSV4_BATCH=N` — how many prompt tokens go through the card in one
+/// submission. 1 keeps the walk. The chunk still bounds it: a batch never
+/// spans two chunks, so cancellation stays as responsive as it was.
+fn batch_prefill() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CMF_DSV4_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| (1..=32).contains(&n))
+            .unwrap_or(1)
+    })
+}
+
+/// The prompt as batches instead of a walk, when every layer will take one.
+///
+/// Refuses before touching any state, never half way: the caller's fallback
+/// is the per-token walk, and a batch that advanced the caches and then gave
+/// up would have them advanced twice. So everything that can decline is asked
+/// first, and after the first dispatch the only outcomes are success and a
+/// hard failure.
+///
+/// Hash layers are the one shape it cannot take: their expert list is forced
+/// by the TOKEN's id and the layer description carries one list, not one per
+/// token. The release has three of them (0, 1, 2); a file without them
+/// batches the whole stack.
+#[allow(clippy::too_many_arguments)]
+fn forward_chunk_batched(
+    g: &Dsv4Globals,
+    layers: &[Dsv4Layer],
+    cfg: &Dsv4Cfg,
+    st: &mut Dsv4State,
+    ids: &[u32],
+    pos0: usize,
+    pool: Option<&crate::pool::Pool>,
+    logits: &mut Vec<f32>,
+) -> bool {
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (g, layers, cfg, st, ids, pos0, pool, logits);
+        false
+    }
+    #[cfg(feature = "gpu")]
+    {
+        let b = ids.len();
+        if b < 2 || !chain_enabled() || layers.iter().any(|l| l.tid2eid.is_some()) {
+            return false;
+        }
+        // Only once a single-token run has proved every layer takes the card.
+        if !st.dev_owned || st.dev_set.len() != layers.len() || !st.dev_set.iter().all(|&x| x) {
+            return false;
+        }
+        let (hc, dim) = (cfg.hc_mult, cfg.dim);
+        let mut emb = vec![0.0f32; dim];
+        for (t, &id) in ids.iter().enumerate() {
+            let mut state = vec![0.0f32; hc * dim];
+            g.embed.row_f32(id as usize, &mut emb);
+            for j in 0..hc {
+                state[j * dim..(j + 1) * dim].copy_from_slice(&emb);
+            }
+            let (folded, post0, comb0) = hc_fold_norm(
+                &state,
+                &layers[0].hc_attn_fn,
+                &layers[0].hc_attn_scale,
+                &layers[0].hc_attn_base,
+                &layers[0].attn_norm,
+                cfg,
+                pool,
+            );
+            let mut qn0 = vec![0.0f32; layers[0].wq_a.rows()];
+            layers[0].wq_a.matvec(&folded, &mut qn0, pool);
+            rms_weighted(&mut qn0, &layers[0].q_norm, cfg.norm_eps);
+            if !crate::gpu_wgpu::dsv4_state_write_t(&state, t)
+                || !crate::gpu_wgpu::dsv4_hc_write_t(&post0, &comb0, t)
+                || !crate::gpu_wgpu::dsv4_chain_seed_t(&folded, &qn0, t)
+            {
+                return false;
+            }
+        }
+        let run: Vec<usize> = (0..layers.len()).collect();
+        let mut folded = Vec::new();
+        st.pos = pos0;
+        if !dsv4_chain_run(
+            layers,
+            &run,
+            cfg,
+            g,
+            st,
+            *ids.last().unwrap(),
+            &mut folded,
+            None,
+            b,
+            true,
+            pool,
+        ) {
+            return false;
+        }
+        st.pos = pos0 + b - 1;
+        // Said once. A gate that compares a batched prompt against a walked
+        // one proves nothing if the batch quietly declined — the numbers match
+        // because the same code produced both. This line is what tells the
+        // two apart.
+        {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| tracing::info!("dsv4: префилл пакетами по {b}"));
+        }
+        // Only the last token's logits are read; the rest of the chunk exists
+        // to fill the caches.
+        logits.resize(cfg.vocab, 0.0);
+        g.head.matvec(&folded, logits, pool);
+        true
+    }
+}
+
 pub fn forward_chunk(
     g: &Dsv4Globals,
     layers: &[Dsv4Layer],
@@ -3535,6 +3649,39 @@ pub fn forward_chunk(
     pool: Option<&crate::pool::Pool>,
     logits: &mut Vec<f32>,
 ) {
+    let bs = batch_prefill();
+    if bs > 1 {
+        // The first token walks, always. The batch will only run where every
+        // layer has already proved it takes the card, and that proof is a
+        // completed single-token run — with the whole prompt arriving as one
+        // chunk there is otherwise no first run to give it, and the batch
+        // declines for the entire prompt while a gate comparing it against
+        // the walk reports agreement it never tested.
+        let mut i = 0;
+        if !st.dev_owned && !ids.is_empty() {
+            st.pos = pos0;
+            forward_token_inner(g, layers, cfg, st, ids[0], inv_freq, pool, logits, ids.len() == 1);
+            i = 1;
+        }
+        while i < ids.len() {
+            let end = (i + bs).min(ids.len());
+            st.pos = pos0 + i;
+            if !forward_chunk_batched(g, layers, cfg, st, &ids[i..end], pos0 + i, pool, logits) {
+                break;
+            }
+            i = end;
+        }
+        if i == ids.len() {
+            return;
+        }
+        // Refused before touching anything; the walk starts where it left off.
+        for (k, &id) in ids.iter().enumerate().skip(i) {
+            st.pos = pos0 + k;
+            let last = k + 1 == ids.len();
+            forward_token_inner(g, layers, cfg, st, id, inv_freq, pool, logits, last);
+        }
+        return;
+    }
     for (i, &id) in ids.iter().enumerate() {
         st.pos = pos0 + i;
         let last = i + 1 == ids.len();
