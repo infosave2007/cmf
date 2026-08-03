@@ -14380,6 +14380,62 @@ fn encode_q4tp_mv1_p(
     pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
 }
 
+/// The wide q4tp matvec, as a dispatch inside a caller's pass.
+///
+/// The chain used the one-row kernel throughout — one workgroup a row — while
+/// `encode_q4tp_mv4` picks an 8- or 16-row variant by shape and is the
+/// default everywhere else, including the head that measured 0.32 ms against
+/// the host's 9.43. The projections inside a chained layer are the same
+/// shapes; there is no reason for them to take the narrow kernel.
+///
+/// It sums the same products in a different lane order, so it is a contract
+/// change and carries `CMF_DSV4_MV4=0`.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4tp_mvw_p(
+    pass: &mut wgpu::ComputePass<'_>,
+    c: &Ctx,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    bkey: (u8, u64, usize),
+) {
+    if !chain_mv4() {
+        encode_q4tp_mv1_p(pass, c, weight, xs, y, rows, cols, bkey);
+        return;
+    }
+    let gpr = cols / 32;
+    let (pipe, per_wg) = if gpr <= 64 {
+        (&c.q4tp_mv16, 16u32)
+    } else {
+        (&c.q4tp_mv4, 8u32)
+    };
+    let bind = cached_bind(c, bkey, || {
+        let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, cols as u32, 0]);
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, weight),
+                bind_buf(2, y),
+                bind_buf(3, &p_buf),
+                bind_buf(4, weight),
+                bind_buf(5, xs),
+            ],
+        })
+    });
+    pass.set_pipeline(pipe);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups((rows as u32).div_ceil(per_wg).min(MAX_WG), 1, 1);
+}
+
+/// `CMF_DSV4_MV4=0` puts the chain back on the one-row q4tp kernel.
+fn chain_mv4() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_MV4").map(|v| v != "0").unwrap_or(true))
+}
+
 fn encode_q1t_like(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
@@ -16812,7 +16868,7 @@ fn encode_attn_chain(
             Some((kv_id, li)));
         let mut pass = begin_pass(enc);
         if !dsv4_skip("qproj") {
-            encode_q4tp_mv1_p(&mut pass, c, &wb[1], qn, q, g.nh * g.hd, g.q_lora,
+            encode_q4tp_mvw_p(&mut pass, c, &wb[1], qn, q, g.nh * g.hd, g.q_lora,
                 (60, kv_id, li));
         }
         encode_rope_heads_p(&mut pass, c, q, freq, posb, g.nh, g.hd, g.rd, true, false,
@@ -16833,7 +16889,7 @@ fn encode_attn_chain(
             pass.set_pipeline(&c.o_lora_a);
             pass.set_bind_group(0, &o_bind, &[]);
             pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
-            encode_q4tp_mv1_p(&mut pass, c, &wb[3], mid, out, g.dim, g.o_groups * g.o_lora,
+            encode_q4tp_mvw_p(&mut pass, c, &wb[3], mid, out, g.dim, g.o_groups * g.o_lora,
                 (64, kv_id, li));
         }
         return;
@@ -17506,7 +17562,7 @@ fn dsv4_layer_frame_enc(
             // going to hand it over anyway — the indexer needs `qr` there, so
             // today it projects it regardless and computing it twice is waste.
             if qn.is_none() {
-                encode_q4tp_mv1_p(&mut pass, c, &wb[4], &x2, &qr2, a.q_lora, dim,
+                encode_q4tp_mvw_p(&mut pass, c, &wb[4], &x2, &qr2, a.q_lora, dim,
                     (52, kv_id, li));
                 encode_rmsnorm_p(&mut pass, c, &qr2, &next_qn, &qn2, a.q_lora, a.eps,
                     (53, kv_id, li));
@@ -18787,9 +18843,9 @@ fn comp_state_step(
     {
         let mut pass = begin_pass(enc);
         if let Some((wkv, wgate, hidden)) = proj {
-            encode_q4tp_mv1_p(&mut pass, c, wkv, hidden, ckv, g.width, g.hidden,
+            encode_q4tp_mvw_p(&mut pass, c, wkv, hidden, ckv, g.width, g.hidden,
                 (80 + kind, kv_id, li));
-            encode_q4tp_mv1_p(&mut pass, c, wgate, hidden, csc, g.width, g.hidden,
+            encode_q4tp_mvw_p(&mut pass, c, wgate, hidden, csc, g.width, g.hidden,
                 (82 + kind, kv_id, li));
         }
         if g.overlap {
@@ -18911,7 +18967,7 @@ fn window_place(
     let tmp = frame_buf(c, 110, (window.max(1) - 1).max(1) * hd * 4, true);
     let mut pass = begin_pass(enc);
     if let Some((wb, hidden, dim)) = proj {
-        encode_q4tp_mv1_p(&mut pass, c, wb, hidden, raw, hd, dim, (106, kv_id, li));
+        encode_q4tp_mvw_p(&mut pass, c, wb, hidden, raw, hd, dim, (106, kv_id, li));
     }
     encode_rmsnorm_p(&mut pass, c, raw, &nw, &kv, hd, eps, (107, kv_id, li));
     encode_rope_heads_p(&mut pass, c, &kv, &freq, &posb, 1, hd, rope_dim, false, false,
@@ -19082,11 +19138,11 @@ pub fn dsv4_indexer_frame(
     // layer is most of what the token costs.
     {
         let mut pass = begin_pass(enc);
-        encode_q4tp_mv1_p(&mut pass, c, &wb[0], qn, &qi, g.ih * g.idim, g.q_lora,
+        encode_q4tp_mvw_p(&mut pass, c, &wb[0], qn, &qi, g.ih * g.idim, g.q_lora,
             (96, kv_id, li));
         encode_rope_heads_p(&mut pass, c, &qi, &freq, &posb, g.ih, g.idim, g.rope_dim,
             false, false, (98, kv_id, li));
-        encode_q4tp_mv1_p(&mut pass, c, &wb[1], hidden, &hw_raw, g.ih, g.hidden,
+        encode_q4tp_mvw_p(&mut pass, c, &wb[1], hidden, &hw_raw, g.ih, g.hidden,
             (99, kv_id, li));
         // `set`: hw = sc_factor·hw_raw. This was a whole-buffer zero-fill
         // followed by an accumulate — two dispatches to express an
