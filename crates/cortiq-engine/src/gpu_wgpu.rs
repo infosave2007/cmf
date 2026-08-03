@@ -17342,11 +17342,16 @@ fn encode_attn_chain(
         }
         encode_rope_heads_p(&mut pass, c, attn, freq, posb, g.nh, g.hd, g.rd, false, true,
             (62, kv_id, li));
-        if !dsv4_skip("oproj") {
+        // Split apart: the pair measured 5.0 ms of a 30.6 ms chain against a
+        // bandwidth floor near 0.7, and they are different kernels reading
+        // differently-shaped weights.
+        if !dsv4_skip("olora") && !dsv4_skip("oproj") {
             pass.set_pipeline(o_pipe);
             pass.set_bind_group(0, &o_bind, &[]);
             pass.dispatch_workgroups(
                 (rows as u32).div_ceil(o_rows_per_wg).min(MAX_WG), 1, 1);
+        }
+        if !dsv4_skip("wob") && !dsv4_skip("oproj") {
             encode_q4tp_mvw_p(&mut pass, c, &wb[3], mid, out, g.dim, g.o_groups * g.o_lora,
                 (64, kv_id, li));
         }
@@ -17536,16 +17541,27 @@ fn encode_moe_chain_p(
             bind_buf(5, &dn_u),
         ],
     }));
-    pass.set_pipeline(&c.moe_route);
-    pass.set_bind_group(0, &bind_r, &[]);
-    pass.dispatch_workgroups(1, 1, 1);
-    pass.set_pipeline(p_gu);
-    pass.set_bind_group(0, &bg_gu, &[]);
-    let gu_per_wg = if g.gu_q2 && moe4() { 4u32 } else { 1u32 };
-    pass.dispatch_workgroups((g.inter as u32).div_ceil(gu_per_wg), slots as u32, 1);
-    pass.set_pipeline(p_dn);
-    pass.set_bind_group(0, &bg_dn, &[]);
-    pass.dispatch_workgroups(g.hidden as u32, 1, 1);
+    // Three separately-skippable parts: the router ranks 256 experts in one
+    // workgroup, the gate/up pair streams the experts' weights, and the down
+    // projection streams them again. The MoE measured 5.5 ms of a 30.6 ms
+    // chain against a weight-bandwidth floor near 2.5, and which of the
+    // three owns that gap is not something to reason about.
+    if !dsv4_skip("route") {
+        pass.set_pipeline(&c.moe_route);
+        pass.set_bind_group(0, &bind_r, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    if !dsv4_skip("gu") {
+        pass.set_pipeline(p_gu);
+        pass.set_bind_group(0, &bg_gu, &[]);
+        let gu_per_wg = if g.gu_q2 && moe4() { 4u32 } else { 1u32 };
+        pass.dispatch_workgroups((g.inter as u32).div_ceil(gu_per_wg), slots as u32, 1);
+    }
+    if !dsv4_skip("dn") {
+        pass.set_pipeline(p_dn);
+        pass.set_bind_group(0, &bg_dn, &[]);
+        pass.dispatch_workgroups(g.hidden as u32, 1, 1);
+    }
 }
 
 /// Everything one DeepSeek-V4 layer does, in ONE submission.
