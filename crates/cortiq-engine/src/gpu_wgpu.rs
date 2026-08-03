@@ -4060,6 +4060,59 @@ fn moe_down_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
     if (lid == 0u) { md_y[row] = md_pt[0]; }
 }
 
+// 256 threads. The loop walks slots·gpr = 576 terms on the release, which
+// at 64 threads is nine iterations of dependent loads per thread; at 256 it
+// is two and a bit, and the workgroup count (one per hidden row, 4096) was
+// never the problem.
+var<workgroup> mdm_pt: array<f32, 256>;
+@compute @workgroup_size(256)
+fn moe_down_q4tp_m(@builtin(workgroup_id) wid: vec3<u32>,
+                 @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let gpr = md_p.gpr;
+    let rows = md_p.hidden;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let total = md_p.slots * gpr;
+    var acc = 0.0;
+    for (var i = lid; i < total; i = i + 256u) {
+        let slot = i / gpr;
+        let g = i % gpr;
+        let base16 = md_sel[slot] * md_p.mat16;
+        let par16 = base16 + rows * gpr * 8u + row * 2u;
+        let cod8 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + row * cst;
+        let pl = unpack2x16float(md_u16(par16) | (md_u16(par16 + 1u) << 16u));
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        var cv = mdp_u8(cod8 + cb);
+        if (shf > 3u) { cv = cv | (mdp_u8(cod8 + cb + 1u) << 8u); }
+        let scale = exp2(pl.x + f32((cv >> shf) & 31u) * pl.y);
+        let t16 = base16 + (row * gpr + g) * 8u;
+        let xq = (slot * gpr + g) * 8u;
+        let x0 = md_actv[xq];      let x1 = md_actv[xq + 1u];
+        let x2 = md_actv[xq + 2u]; let x3 = md_actv[xq + 3u];
+        let x4 = md_actv[xq + 4u]; let x5 = md_actv[xq + 5u];
+        let x6 = md_actv[xq + 6u]; let x7 = md_actv[xq + 7u];
+        let w0 = md_u16(t16) | (md_u16(t16 + 1u) << 16u);
+        let w1 = md_u16(t16 + 2u) | (md_u16(t16 + 3u) << 16u);
+        let w2 = md_u16(t16 + 4u) | (md_u16(t16 + 5u) << 16u);
+        let w3 = md_u16(t16 + 6u) | (md_u16(t16 + 7u) << 16u);
+        let d = md_dot8v(w0, x0, x1) + md_dot8v(w1, x2, x3)
+              + md_dot8v(w2, x4, x5) + md_dot8v(w3, x6, x7);
+        acc = acc + md_wt[slot] * scale * d;
+    }
+    mdm_pt[lid] = acc;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { mdm_pt[lid] = mdm_pt[lid] + mdm_pt[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) { md_y[row] = mdm_pt[0]; }
+}
+
 // ── Batched MoE: the whole layer's routing and experts with a TOKEN
 // dimension, for the batch (prefill) graph. The per-token encoding of
 // this block cost ~7 commands per token per layer — at k=32 over 40
@@ -6469,6 +6522,7 @@ struct Ctx {
     f32_matvec_x: wgpu::ComputePipeline,
     o_lora_a_m: wgpu::ComputePipeline,
     moe_gu_q2tp_m: wgpu::ComputePipeline,
+    moe_dn_q4tp_m: wgpu::ComputePipeline,
     sa_part: wgpu::ComputePipeline,
     sa_merge: wgpu::ComputePipeline,
     blit: wgpu::ComputePipeline,
@@ -7021,6 +7075,7 @@ fn init() -> Result<Ctx, String> {
     let f32_matvec_x = pipe("f32_matvec_x");
     let o_lora_a_m = pipe("o_lora_a_m");
     let moe_gu_q2tp_m = pipe("moe_gate_up_q2tp_m");
+    let moe_dn_q4tp_m = pipe("moe_down_q4tp_m");
     let sa_part = pipe("sparse_attend_part");
     let sa_merge = pipe("sparse_attend_merge");
     let blit = pipe("blit");
@@ -7247,6 +7302,7 @@ fn init() -> Result<Ctx, String> {
         f32_matvec_x,
         o_lora_a_m,
         moe_gu_q2tp_m,
+        moe_dn_q4tp_m,
         sa_part,
         sa_merge,
         blit,
@@ -17424,7 +17480,7 @@ fn encode_moe_chain_p(
     let (p_gu, p_dn, l_gu, l_dn) = if g.gu_q2 {
         (
             if moe4() { &c.moe_gu_q2tp_m } else { &c.moe_gate_up_q2tp },
-            &c.moe_down_q4tp,
+            if moe4() { &c.moe_dn_q4tp_m } else { &c.moe_down_q4tp },
             &c.layout_moe_gu_q2tp,
             &c.layout_moe_dn_q4tp,
         )
@@ -17470,7 +17526,7 @@ fn encode_moe_chain_p(
     }));
     let bg_dn = cached_bind(c, (129, bkey.0, bkey.1), || c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
-        layout: l_dn,
+        layout: &p_dn.get_bind_group_layout(0),
         entries: &[
             bind_buf(0, down_all),
             bind_buf(1, mact),
