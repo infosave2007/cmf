@@ -7,7 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **DeepSeek-V4 decode: 10.6 → 24.5 tok/s** on an RTX PRO 6000, measured at
+  each step against the same 192-token bench and gated on five toy stands
+  plus golden parity. In order: the chain's bind groups cached; the hash
+  layers joined the chain; the whole token became ONE submission; the head
+  reached the card through the matvec kernel rather than the batched GEMM
+  at b=1 (0.32 ms against the host's 9.43); compute passes went 23 a layer
+  to 4; and then the strategy changed.
+
+  What changed it was measuring what a dispatch actually costs instead of
+  dividing a frame by its count: `CMF_GPU_DISPATCH_BENCH=1` on `cortiq gpu`
+  says 2.67 µs on Vulkan, with a barrier between dependent dispatches
+  essentially free. So the chain was never made of overhead — it was
+  kernels using a rounding error of the card. `f32_matvec` gave a row 64
+  threads and one workgroup, which for the hyper-connection mix is 24
+  workgroups of 64: fifteen hundred threads on a machine that holds
+  hundreds of thousands. Width by shape — 256 threads where rows are many,
+  1024 where they are few, 1024 for the reducing kernels that are one
+  workgroup by construction, four rows to a workgroup where the columns
+  leave no width to take — is most of the second half of that number.
+
+- **`CMF_GPU_UPLOAD=staged`** maps a staging buffer and issues the weight
+  copy itself instead of handing the bytes to `queue.write_buffer`: 48 MB/s
+  to 280+ on a cold page cache, which is half an hour of first-token wait
+  turned into minutes. The profile reports the rate.
+
 ### Fixed
+- **`axpy` did nothing.** Its uniform was written `[n, 0, 0, w]` against a
+  shader declaring `{ w: f32, n: u32, … }`, so the kernel read `n` as zero
+  and every invocation returned at the bounds check. Two callers: the
+  DeepSeek-V4 indexer's score scaling (head weights left at zero, so every
+  compressed position scored the same and top-k fell back to the first k)
+  and the overlapping compressor's position bias. It had no test; it has
+  one now.
+- **A WGSL reserved word took the whole device with it.** Naming a field
+  `set` made the q8 module fail to parse — which does not disable one
+  kernel, it stops wgpu initialising, and every op falls to the host behind
+  a single WARN. `tools/dsv4_toy_gate.sh` proves the device is up before it
+  compares anything.
 - **`cortiq bench` could not bench DeepSeek-V4 at all** — the paired prefill
   inside `forward_ids` and `measure_pair_fusion` walk `weights.layers`, which
   an architecture that loads its own layers leaves empty. Both ask
