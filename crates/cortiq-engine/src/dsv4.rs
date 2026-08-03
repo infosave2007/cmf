@@ -2144,7 +2144,6 @@ fn dsv4_chain_run(
 
     // Held apart from the borrowing structs below, which point into them.
     let mut packs = Vec::with_capacity(run.len());
-    let mut biases: Vec<Option<Vec<f32>>> = Vec::with_capacity(run.len());
     let mut forceds: Vec<Option<Vec<usize>>> = Vec::with_capacity(run.len());
     for &li in run {
         let Some(pk) = pack_for(&layers[li], cfg, li) else {
@@ -2160,7 +2159,6 @@ fn dsv4_chain_run(
         if layers[li].tid2eid.is_some() && forced.is_none() {
             return false;
         }
-        biases.push(pk.bias.clone());
         forceds.push(forced);
         packs.push(pk);
     }
