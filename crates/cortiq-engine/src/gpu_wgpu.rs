@@ -18885,6 +18885,18 @@ pub fn dsv4_hc_write(post: &[f32], comb: &[f32]) -> bool {
 }
 
 /// Seed the layer-frame's hyper-connection state from the host (layer zero).
+/// Seed one token's hyper-connection state on the card.
+///
+/// The batch needs one of these per token before the chain runs: each token
+/// enters at its own embedding, and after the frame's buffers went per token
+/// the single-slot writer can only reach token zero.
+pub fn dsv4_state_write_t(state: &[f32], tok: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    let b = frame_buf_t(c, 40, tok, state.len() * 4, true);
+    c.queue.write_buffer(&b, 0, bytemuck::cast_slice(state));
+    true
+}
+
 pub fn dsv4_state_write(state: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };
     let b = frame_buf(c, 40, state.len() * 4, true);
