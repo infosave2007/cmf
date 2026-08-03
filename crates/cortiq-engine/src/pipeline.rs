@@ -1889,6 +1889,21 @@ impl Pipeline {
                     // accepted prefix. Greedy only; a rejected token's state
                     // is restored and replayed, so output equals the walk. ──
                     #[cfg(feature = "gpu")]
+                    if Self::dsv4_spec_on() && self.dsv4.is_some() {
+                        static SAID: std::sync::Once = std::sync::Once::new();
+                        SAID.call_once(|| {
+                            eprintln!(
+                                "dsv4-spec гейт: mtp={} mask={} router={} trace={} temp={} rep={} ",
+                                !self.dsv4_mtp.is_empty(),
+                                task_mask.is_none(),
+                                router.is_none(),
+                                !trace_on,
+                                self.sampler_config.temperature < 1e-6,
+                                self.sampler_config.repetition_penalty == 1.0,
+                            );
+                        });
+                    }
+                    #[cfg(feature = "gpu")]
                     if Self::dsv4_spec_on()
                         && self.dsv4.is_some()
                         && !self.dsv4_mtp.is_empty()
@@ -4247,6 +4262,9 @@ fn draft_probe() -> bool {
         drafted: &mut usize,
         accepted_ctr: &mut usize,
     ) -> Option<(Vec<u32>, usize)> {
+        if std::env::var("CMF_DSV4_SPEC_DEBUG").is_ok() {
+            eprintln!("spec_step: вход pos={next_pos}");
+        }
         let n_layers = self.dsv4.as_ref().map(|b| b.1.len())?;
         let cfg = self.dsv4.as_ref().map(|b| b.2)?;
         // The draft state and its capture, armed exactly as the probe does.
@@ -4263,14 +4281,22 @@ fn draft_probe() -> bool {
             ));
         }
         let targets = crate::dsv4::dspark_targets(&self.dsv4_mtp, &cfg, n_layers);
-        let pack = crate::dsv4::dspark_pack_get(&self.dsv4_mtp, &cfg)?;
+        let pack = crate::dsv4::dspark_pack_get(&self.dsv4_mtp, &cfg);
+        if pack.is_none() && std::env::var("CMF_DSV4_SPEC_DEBUG").is_ok() {
+            eprintln!("spec_step: пак не построился (targets {targets:?})");
+        }
+        let pack = pack?;
         let block = crate::dsv4::dspark_block();
         let b_box = self.dsv4.as_mut()?;
         let (g, layers, st) = (&b_box.0, &b_box.1, &mut b_box.3);
         let ds = self.dspark.as_mut()?;
         // The tip's captures: either this token ran on a normal path that
         // filled the thread-local, or the previous spec round left them.
+        let dbg = std::env::var("CMF_DSV4_SPEC_DEBUG").is_ok();
         if !crate::dsv4::dspark_take(&mut ds.main_hidden) && !ds.have_hidden {
+            if dbg {
+                eprintln!("spec_step: нет захвата");
+            }
             return None;
         }
         ds.have_hidden = true;
@@ -4292,6 +4318,13 @@ fn draft_probe() -> bool {
         self.dspark_draft_ns += draft_started.elapsed().as_nanos();
         *drafted += block;
         if props.is_empty() || props[0] != t_next {
+            if dbg {
+                eprintln!(
+                    "spec_step: черновик {} (props0={:?} t_next={t_next})",
+                    if props.is_empty() { "пуст" } else { "мимо" },
+                    props.first()
+                );
+            }
             return None;
         }
         let k_verify = crate::dsv4::dspark_verify_k().min(props.len());
@@ -4317,7 +4350,11 @@ fn draft_probe() -> bool {
             &mut argmax,
             &mut logits_all,
             &mut walked,
-        )?;
+        );
+        if txn.is_none() && dbg {
+            eprintln!("spec_step: verify отказал");
+        }
+        let txn = txn?;
         let b = fed.len();
         let mut accepted = 1usize;
         while accepted < b && fed[accepted] == argmax[accepted - 1] {
@@ -4335,6 +4372,7 @@ fn draft_probe() -> bool {
                 "spec@{next_pos}: fed={fed:?} argmax={argmax:?} accepted={accepted}"
             );
         }
+        let t_fin = std::time::Instant::now();
         if !crate::dsv4::dsv4_spec_finish(
             g,
             layers,
@@ -4348,6 +4386,9 @@ fn draft_probe() -> bool {
         ) {
             tracing::warn!("dsv4: спекулятивный откат не удался — состояние подозрительно");
             return None;
+        }
+        if std::env::var("CMF_DSV4_SPEC_TIME").is_ok() {
+            eprintln!("finish(k={accepted}): {:.1} мс", t_fin.elapsed().as_secs_f64() * 1e3);
         }
         *accepted_ctr += accepted - 1;
         // Captures per accepted token: device targets photographed by the

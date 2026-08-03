@@ -164,7 +164,7 @@ in q4tp (about 5.4 after requantising to q2tp) and layer 42 needs 2.18 GB,
 against roughly 3.3 GB physically free. **Short by 4-5 GB.** On a ~110 GB
 card the whole thing fits.
 
-## 5a. State after the speculative-decode session (2026-08-03, commits d7431ea + 7374e34)
+## 5a. State after the speculative-decode sessions (2026-08-03, commits d7431ea + 7374e34 + the staged batch)
 
 What now exists and is measured on the stand:
 
@@ -203,6 +203,35 @@ What now exists and is measured on the stand:
   PPL is untouched (ppl never speculates). Chasing the ulp further needs a
   two-process buffer diff — the in-process one is poisoned by the shared
   frame-buffer pool.
+- **The staged batch** landed after the first write-up: the window freezes
+  for the whole pass (new rows park in staging at the cache's tail,
+  per-token index lists splice them in, ONE slide at commit), the indexer
+  runs batched (bt_index_scores / bt_top_k / bt_idx_build_staged), the
+  compressor projections batch and only its state step walks per token.
+  Walk-parity held everywhere — and the clock did not move, which
+  falsified the dispatch-COUNT theory: the pass is bound by its chain of
+  DEPENDENT links (~100 µs each), not by how many dispatches exist.
+- **A gate bug hid the real speculative numbers for a while**: the default
+  bench carries a repetition penalty, the speculative gate (greedy-only)
+  refused, and every "spec bench" figure was silently the walk. With
+  `bench --core` speculation actually runs (accepted=5 rounds confirmed).
+  True numbers, --core, 128 tokens: spec 23.7–25.3 tok/s at
+  PACK_MAX_LI=41 + CMF_DSPARK_RESIDENT=24 (the largest q4tp pack that
+  physically fits there; 32 was a device OOM), against walk 30.2
+  (canonical) / ~28 (same pack config). Per pass: draft 11 ms, verify
+  chain 105–126 ms (THE wall), host tail+head 30 ms (one host layer),
+  finish 0.3 ms on full accept / 29–39 ms on rollback.
+- **What 40+ still needs**: (a) requantize the draft experts to q2tp at
+  upload (move `encode_q2tp` из cortiq-cli/convert.rs в core; RESIDENT=48
+  then fits at PACK_MAX_LI=41 and acceptance recovers to ~0.91 rel), and
+  (b) a ~1.7× cut of the verify chain's critical path — kernel fusion for
+  the glue at B>1 (the hc_block trade flips when each link carries 5
+  tokens), batching the compressor state step, fewer dependent links per
+  layer. Projection with both: pass ≈ 11+65+30+5 ≈ 111 ms at ~4.5
+  tokens/pass ≈ 25 ms/token ≈ 40 tok/s. Also: the canonical bench includes
+  the repetition penalty — either make verify penalty-aware (apply the
+  sampler's transform to each row over the known prefix before argmax) or
+  adopt `--core` as the speculative metric.
 - **Where the clock stands**: walk bench 24.6 tok/s at PACK_MAX_LI=40
   (30.2 at the canonical 96500/41 config without the draft pack), spec
   bench 24.5 — break-even, entirely because verify(5) ≈ 181 ms against the
