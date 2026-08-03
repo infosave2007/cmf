@@ -3698,8 +3698,7 @@ pub fn run_convert(
             // rides in the same packed buffer (last slot) and the MoE kernels
             // index that buffer with one per-expert stride, so a mismatch
             // makes the whole graph decline, silently, into a CPU MoE.
-            let expert_gu = (name.contains(".experts.") || name.contains(".shared_expert."))
-                && (name.ends_with(".gate_proj.weight") || name.ends_with(".up_proj.weight"));
+            let expert_gu = q2tp_expert_gate_or_up(&name);
             let q_here = if expert_gu { gu_quant } else { quant };
             let (dt, data) = if two_d {
                 quantize_2d(q_here, &vals, m_shape[0], m_shape[1])
@@ -3910,6 +3909,21 @@ pub fn run_convert(
     let _ = std::fs::remove_file(&manifest_path);
     progress(1.0);
     Ok(())
+}
+
+/// Whether this tensor is one of an expert's two SwiGLU input planes.
+/// Trunk names are canonicalized to gate/up_proj; DeepSeek-V4's MTP stack
+/// deliberately keeps its upstream ffn.w1/w3 schema, so both are part of
+/// the same q2tp profile.
+fn q2tp_expert_gate_or_up(name: &str) -> bool {
+    let expert = name.contains(".experts.")
+        || name.contains(".shared_expert.")
+        || name.contains(".shared_experts.");
+    expert
+        && (name.ends_with(".gate_proj.weight")
+            || name.ends_with(".up_proj.weight")
+            || name.ends_with(".w1.weight")
+            || name.ends_with(".w3.weight"))
 }
 
 #[cfg(test)]
@@ -4126,10 +4140,7 @@ mod tests {
 
     #[test]
     fn the_two_bit_profile_covers_every_experts_gate_and_up() {
-        let gu = |name: &str| {
-            (name.contains(".experts.") || name.contains(".shared_expert."))
-                && (name.ends_with(".gate_proj.weight") || name.ends_with(".up_proj.weight"))
-        };
+        let gu = q2tp_expert_gate_or_up;
         // routed experts — the bulk of the model
         assert!(gu("model.layers.7.mlp.experts.42.gate_proj.weight"));
         assert!(gu("model.layers.7.mlp.experts.42.up_proj.weight"));
@@ -4142,6 +4153,12 @@ mod tests {
         assert!(!gu("model.layers.7.mlp.gate.weight"));
         assert!(!gu("model.layers.7.self_attn.wq_b.weight"));
         assert!(!gu("model.embed_tokens.weight"));
+        // DeepSeek-V4 keeps the MTP layer's own ffn/w1,w3 spelling.
+        assert!(gu("model.mtp.0.ffn.experts.42.w1.weight"));
+        assert!(gu("model.mtp.2.ffn.experts.42.w3.weight"));
+        assert!(gu("model.mtp.1.ffn.shared_experts.w1.weight"));
+        assert!(gu("model.mtp.1.ffn.shared_experts.w3.weight"));
+        assert!(!gu("model.mtp.0.ffn.experts.42.w2.weight"));
     }
 
     #[test]
