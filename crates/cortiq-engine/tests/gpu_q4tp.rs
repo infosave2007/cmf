@@ -300,3 +300,52 @@ fn wgpu_q4tp_matmat_matches_dequant_reference() {
     }
     check_mm("wgpu-mm", cortiq_engine::gpu_wgpu::q4tp_matmat);
 }
+
+/// What a batch actually COSTS. The parity test says the answer is right;
+/// this says whether it is cheaper, which is the only reason to want it.
+///
+/// The whole speculative design rests on one number: a trunk pass over B
+/// drafted tokens has to cost far less than B passes, or verifying five
+/// proposals costs five tokens and the draft is pure overhead. Ignored by
+/// default because it wants a real GPU and a few seconds:
+///     cargo test --features gpu --test gpu_q4tp -- --ignored --nocapture
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore]
+fn wgpu_q4tp_batch_cost() {
+    unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+    assert!(cortiq_engine::gpu_wgpu::enabled(), "нет адаптера wgpu");
+    // Two shapes off the release: a layer projection, and the head.
+    for (rows, cols) in [(4096usize, 4096usize), (129280, 4096)] {
+        let payload = synth(rows, cols);
+        let (model, idx) = tiny_model(&format!("cost-{rows}"), rows, cols, payload);
+        let mut base = 0f64;
+        for b in [1usize, 2, 4, 8] {
+            let xs: Vec<f32> = (0..b * cols).map(|i| (i % 97) as f32 / 97.0 - 0.5).collect();
+            let mut got = vec![0f32; b * rows];
+            // Warm: the first call uploads the weight and builds the groups.
+            for _ in 0..2 {
+                assert!(cortiq_engine::gpu_wgpu::q4tp_matvec_batch_for_test(
+                    &model, idx, &xs, b, rows, cols, &mut got
+                ));
+            }
+            let reps = 20;
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                cortiq_engine::gpu_wgpu::q4tp_matvec_batch_for_test(
+                    &model, idx, &xs, b, rows, cols, &mut got,
+                );
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+            if b == 1 {
+                base = ms;
+            }
+            eprintln!(
+                "СТОИМОСТЬ {rows}x{cols} B={b}: {ms:.3} мс, {:.2}x от B=1, \
+                 на токен {:.3} мс",
+                ms / base,
+                ms / b as f64
+            );
+        }
+    }
+}
