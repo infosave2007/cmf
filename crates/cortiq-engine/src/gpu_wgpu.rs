@@ -18104,13 +18104,19 @@ fn dsv4_layer_frame_enc(
                 a.eps, (172, kv_id, li));
         } else {
         if !dsv4_skip("hc") {
+        if !dsv4_skip("hcexp") {
         encode_hc_expand_k_p(&mut pass, c, &ao, &state, &hpost, &hcomb, &state2, &hcp, hc, dim,
             (120, kv_id, li));
+        }
+        if !dsv4_skip("hcmix") {
         encode_f32matvec_w_p(&mut pass, c, &ffn_fn, &state2, &mixes, mix_hc, hc * dim,
             (121, kv_id, li));
+        }
         // The fold norms too: one dispatch, not two.
+        if !dsv4_skip("hcfold") {
         encode_hc_fold_k_p(&mut pass, c, &state2, &mixes, &ffn_sc, &ffn_bs, &folded, &hpost,
             &hcomb, &hcp_n, Some((&ffn_nw, &x2)), (122, kv_id, li));
+        }
         }
         }
 
