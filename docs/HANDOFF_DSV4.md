@@ -89,6 +89,17 @@ export CMF_DSV4_GPU_LAYER=1 CMF_SDOT=0 CMF_DSV4_CHAIN=1
 Expected on the 97887 MiB stand: **30.2 tok/s steady** (128-token canonical run). All 43 layers use the
 card: 42 have complete expert packs and the last pack contains 199/256 routed
 experts; cold winners are completed from the mmap-backed CMF on the CPU.
+
+Speculative decode (`CMF_DSV4_SPEC=1 CMF_DSPARK_GPU=1`, greedy `--core`
+metric, `CMF_DSV4_PACK_MAX_LI=41 CMF_DSPARK_RESIDENT=56 CMF_SDOT=1`)
+reads **28-30.2 tok/s** on the same stand — its first clear win over the
+walk after the register-spill fix took the verify chain from 187 to 81 ms.
+The round is draft ≈7 + chain ≈81 + host tail ≈27 + finish 0.3-10; the
+bottleneck left is acceptance (59-68%, a noisy near-tie band). The two
+open levers: a fused compressor fold (the comp machinery is ~5 passes per
+layer per pass), and the draft's down planes to q2tp for RESIDENT=64 —
+the 96 GB card refuses 64 by ~0.2 GB and 96 800 MiB of budget is a real
+device OOM, measured twice.
 Perplexity gold is **4.578** (`cortiq ppl … --file docs/ppl_nat.txt
 --tokens 128`), which equals the CPU exactly — any change that moves it is
 a defect. The reference text lives in the repository now: the previous

@@ -7478,6 +7478,167 @@ fn bt_comp_append(@builtin(workgroup_id) wid: vec3<u32>,
     bca_psc[slot * bca_p.width + i] = sc;
 }
 
+// The whole fold-token compressor step as ONE dispatch: append the
+// closing token's row, softmax-pool the window (kv_pool's expressions,
+// element for element), norm through rmsnorm's exact 1024-thread tree,
+// rotate the rope tail, land the entry in the cache and shift pending
+// into previous. The per-token path spent seven dependent dispatches on
+// this; the math here is the same operations in the same order, so the
+// bits are too.
+struct BcfP {
+    width: u32, ratio: u32, rd: u32, flags: u32,
+    dst_off: u32, pos_bits: u32, eps_bits: u32, trow: u32,
+};
+@group(0) @binding(0) var<storage, read>       bcf_ckv : array<f32>;
+@group(0) @binding(1) var<storage, read>       bcf_csc : array<f32>;
+@group(0) @binding(2) var<storage, read>       bcf_ape : array<f32>;
+@group(0) @binding(3) var<storage, read_write> bcf_pkv : array<f32>;
+@group(0) @binding(4) var<storage, read_write> bcf_psc : array<f32>;
+@group(0) @binding(5) var<storage, read_write> bcf_qkv : array<f32>;
+@group(0) @binding(6) var<storage, read_write> bcf_qsc : array<f32>;
+@group(0) @binding(7) var<storage, read>       bcf_nw  : array<f32>;
+@group(0) @binding(8) var<storage, read>       bcf_fr  : array<f32>;
+@group(0) @binding(9) var<storage, read_write> bcf_dst : array<f32>;
+@group(0) @binding(10) var<storage, read>      bcf_p   : BcfP;
+var<workgroup> bcf_fold: array<f32, 512>;
+var<workgroup> bcf_part: array<f32, 1024>;
+@compute @workgroup_size(1024)
+fn bt_comp_fold(@builtin(local_invocation_index) lid: u32) {
+    let w = bcf_p.width;
+    let r = bcf_p.ratio;
+    let overlap = (bcf_p.flags & 1u) != 0u;
+    let have_prev = (bcf_p.flags & 2u) != 0u;
+    let ew = select(w, w / 2u, overlap);
+    let slot = r - 1u;
+    let trow = bcf_p.trow;
+    // ── append the closing token ──
+    var i = lid;
+    loop {
+        if (i >= w) { break; }
+        bcf_pkv[slot * w + i] = bcf_ckv[trow * w + i];
+        var sc = bcf_csc[trow * w + i];
+        if (overlap) { sc = sc + bcf_ape[slot * w + i]; }
+        bcf_psc[slot * w + i] = sc;
+        i = i + 1024u;
+    }
+    storageBarrier();
+    workgroupBarrier();
+    // ── pool: kv_pool per element, w there is ew here ──
+    let slots = select(r, 2u * r, overlap);
+    var d = lid;
+    loop {
+        if (d >= ew) { break; }
+        var mx = KP_NINF;
+        for (var t = 0u; t < slots; t = t + 1u) {
+            var sc = KP_NINF;
+            if (overlap) {
+                if (t < r) {
+                    if (have_prev) { sc = bcf_qsc[t * 2u * ew + d]; }
+                } else {
+                    sc = bcf_psc[(t - r) * 2u * ew + ew + d];
+                }
+            } else {
+                sc = bcf_psc[t * ew + d] + bcf_ape[t * ew + d];
+            }
+            mx = max(mx, sc);
+        }
+        var outv = 0.0;
+        if (mx > KP_NINF) {
+            var den = 0.0;
+            var acc = 0.0;
+            for (var t = 0u; t < slots; t = t + 1u) {
+                var sc = KP_NINF;
+                var kv = 0.0;
+                if (overlap) {
+                    if (t < r) {
+                        if (have_prev) {
+                            sc = bcf_qsc[t * 2u * ew + d];
+                            kv = bcf_qkv[t * 2u * ew + d];
+                        }
+                    } else {
+                        sc = bcf_psc[(t - r) * 2u * ew + ew + d];
+                        kv = bcf_pkv[(t - r) * 2u * ew + ew + d];
+                    }
+                } else {
+                    sc = bcf_psc[t * ew + d] + bcf_ape[t * ew + d];
+                    kv = bcf_pkv[t * ew + d];
+                }
+                if (sc > KP_NINF) {
+                    let e = exp(sc - mx);
+                    den = den + e;
+                    acc = acc + e * kv;
+                }
+            }
+            if (den > 0.0) { outv = acc / den; }
+        }
+        bcf_fold[d] = outv;
+        d = d + 1024u;
+    }
+    workgroupBarrier();
+    // ── rmsnorm, the 1024-thread kernel's exact tree ──
+    var acc2 = 0.0;
+    var j = lid;
+    loop {
+        if (j >= ew) { break; }
+        let v = bcf_fold[j];
+        acc2 = acc2 + v * v;
+        j = j + 1024u;
+    }
+    bcf_part[lid] = acc2;
+    workgroupBarrier();
+    var stride = 512u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { bcf_part[lid] = bcf_part[lid] + bcf_part[lid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let inv = inverseSqrt(bcf_part[0] / f32(ew) + bitcast<f32>(bcf_p.eps_bits));
+    workgroupBarrier();
+    var k2 = lid;
+    loop {
+        if (k2 >= ew) { break; }
+        bcf_fold[k2] = bcf_fold[k2] * inv * bcf_nw[k2];
+        k2 = k2 + 1024u;
+    }
+    workgroupBarrier();
+    // ── rope tail, adjacent pairs at the window's FIRST position ──
+    let rd = bcf_p.rd;
+    let rbase = ew - rd;
+    let pos = bitcast<f32>(bcf_p.pos_bits);
+    var t2 = lid;
+    loop {
+        if (t2 >= rd / 2u) { break; }
+        let th = pos * bcf_fr[t2];
+        let sn = sin(th);
+        let cs = cos(th);
+        let a = bcf_fold[rbase + 2u * t2];
+        let cc = bcf_fold[rbase + 2u * t2 + 1u];
+        bcf_fold[rbase + 2u * t2] = a * cs - cc * sn;
+        bcf_fold[rbase + 2u * t2 + 1u] = a * sn + cc * cs;
+        t2 = t2 + 1024u;
+    }
+    workgroupBarrier();
+    // ── land the entry, then pending becomes previous ──
+    var d2 = lid;
+    loop {
+        if (d2 >= ew) { break; }
+        bcf_dst[bcf_p.dst_off + d2] = bcf_fold[d2];
+        d2 = d2 + 1024u;
+    }
+    if (overlap) {
+        storageBarrier();
+        workgroupBarrier();
+        var m = lid;
+        loop {
+            if (m >= r * w) { break; }
+            bcf_qkv[m] = bcf_pkv[m];
+            bcf_qsc[m] = bcf_psc[m];
+            m = m + 1024u;
+        }
+    }
+}
+
 // index_scores with grid (entry, token): the query heads and the output
 // stride by the token; the weights arrive RAW with the fold factor in the
 // uniform, multiplied per head exactly where the walk's axpy used to — same
@@ -8014,6 +8175,7 @@ struct Ctx {
     bt_hc_pre_fold: wgpu::ComputePipeline,
     bt_hc_block: wgpu::ComputePipeline,
     bt_comp_append: wgpu::ComputePipeline,
+    bt_comp_fold: wgpu::ComputePipeline,
     bt_hc_post_expand: wgpu::ComputePipeline,
     bt_f32_matvec_w: wgpu::ComputePipeline,
     bt_f32_matvec_x: wgpu::ComputePipeline,
@@ -8589,6 +8751,7 @@ fn init() -> Result<Ctx, String> {
     let bt_hc_pre_fold = pipe("bt_hc_pre_fold");
     let bt_hc_block = pipe("bt_hc_block");
     let bt_comp_append = pipe("bt_comp_append");
+    let bt_comp_fold = pipe("bt_comp_fold");
     let bt_hc_post_expand = pipe("bt_hc_post_expand");
     let bt_f32_matvec_w = pipe("bt_f32_matvec_w");
     let bt_f32_matvec_x = pipe("bt_f32_matvec_x");
@@ -8839,6 +9002,7 @@ fn init() -> Result<Ctx, String> {
         bt_hc_pre_fold,
         bt_hc_block,
         bt_comp_append,
+        bt_comp_fold,
         bt_hc_post_expand,
         bt_f32_matvec_w,
         bt_f32_matvec_x,
@@ -20824,6 +20988,19 @@ fn bt_dn_mode() -> u8 {
     })
 }
 
+/// `CMF_DSV4_COMPFOLD=1`: the fold token as ONE fused dispatch instead of
+/// the seven-dispatch per-token step. Bit-exact on every toy and on
+/// chunked-prefill perplexity, −4 ms off the verify chain — and OFF by
+/// default, because on the release bench the DRAFT's proposals diverge
+/// two rounds after an indexer fold inside a verify pass (trace: fed
+/// differs at spec@97 while both argmaxes agree) and acceptance pays 5
+/// points, more than the chain saves. The verify-only difference is not
+/// found yet; the trace and the suspects live in the campaign notes.
+fn bt_comp_fold_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_COMPFOLD").is_ok_and(|v| v != "0"))
+}
+
 /// Whether the batch uses the token-axis frame (default) or the historical
 /// one-frame-per-token encoding (`CMF_DSV4_BT=0`, kept for a bisect).
 fn bt_frame_on() -> bool {
@@ -22238,19 +22415,69 @@ fn dsv4_layer_frame_bt_enc(
                     append_seg(enc, seg0, t - seg0);
                 }
                 seg0 = t + 1;
-                let _salt = Dsv4FrameSalt::enter(t + 1);
-                let ckv_t = frame_buf(c, 70 + kind, cg.width * 4, false);
-                let csc_t = frame_buf(c, 72 + kind, cg.width * 4, false);
-                {
+                let ew_f = if cg.overlap { cg.width / 2 } else { cg.width };
+                if bt_comp_fold_on() && ew_f <= 512 {
+                    // Append + pool + norm + rope + land + shift, one link.
+                    let off = if *kind == 0 { p.comp_dst_off } else { p.ix_dst_off };
+                    let pos = pos0 + t;
+                    let have_prev = pos + 1 > cg.ratio;
+                    let flags = (cg.overlap as u32) | ((have_prev as u32) << 1);
+                    let posb = (pos + 1 - cg.ratio) as f32;
+                    // PER (layer, kind, token): two folds can share one
+                    // pass at B=5, and every queue.write_buffer lands
+                    // before the submit — a shared buffer would hand the
+                    // first fold the second fold's uniform.
+                    let pu = frame_buf_t(
+                        c,
+                        BT_DSPARK_META,
+                        8 * FRAME_TOK_STRIDE + (li * FRAME_TOK_STRIDE + t) * 2 + *kind as usize,
+                        32,
+                        true,
+                    );
+                    c.queue.write_buffer(&pu, 0, bytemuck::cast_slice(&[
+                        cg.width as u32, cg.ratio as u32, cg.rope_dim as u32, flags,
+                        off as u32, posb.to_bits(), cg.eps.to_bits(), t as u32,
+                    ]));
+                    let nw_f = const_buf(c, bytemuck::cast_slice(&cw.norm[..ew_f]));
+                    let fr_f = const_buf(c, bytemuck::cast_slice(&inv_freq[..cg.rope_dim / 2]));
+                    let bind = cached_bind(c, ((253 + *kind) as u8, kv_id, li * FRAME_TOK_STRIDE + t), || {
+                        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &c.bt_comp_fold.get_bind_group_layout(0),
+                            entries: &[
+                                bind_buf(0, &ckv_bt),
+                                bind_buf(1, &csc_bt),
+                                bind_buf(2, &ape_all),
+                                bind_buf(3, &streams[0]),
+                                bind_buf(4, &streams[1]),
+                                bind_buf(5, &streams[2]),
+                                bind_buf(6, &streams[3]),
+                                bind_buf(7, &nw_f),
+                                bind_buf(8, &fr_f),
+                                bind_buf(9, &dst),
+                                bind_buf(10, &pu),
+                            ],
+                        })
+                    });
                     let mut pass = begin_pass(enc);
-                    encode_blit_p(&mut pass, c, &ckv_bt, &ckv_t, cg.width, t * cg.width, 0, None);
-                    encode_blit_p(&mut pass, c, &csc_bt, &csc_t, cg.width, t * cg.width, 0, None);
+                    pass.set_pipeline(&c.bt_comp_fold);
+                    pass.set_bind_group(0, &bind, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                } else {
+                    let _salt = Dsv4FrameSalt::enter(t + 1);
+                    let ckv_t = frame_buf(c, 70 + kind, cg.width * 4, false);
+                    let csc_t = frame_buf(c, 72 + kind, cg.width * 4, false);
+                    {
+                        let mut pass = begin_pass(enc);
+                        encode_blit_p(&mut pass, c, &ckv_bt, &ckv_t, cg.width, t * cg.width, 0, None);
+                        encode_blit_p(&mut pass, c, &csc_bt, &csc_t, cg.width, t * cg.width, 0, None);
+                    }
+                    let off = if *kind == 0 { p.comp_dst_off } else { p.ix_dst_off };
+                    let _ = comp_state_step(
+                        c, cw, *cg, *kind, kv_id, li, &ckv_t, &csc_t, pos0 + t, inv_freq, &dst,
+                        off, enc, None,
+                    );
                 }
-                let off = if *kind == 0 { p.comp_dst_off } else { p.ix_dst_off };
-                let _ = comp_state_step(
-                    c, cw, *cg, *kind, kv_id, li, &ckv_t, &csc_t, pos0 + t, inv_freq, &dst,
-                    off, enc, None,
-                );
             }
             if seg_this {
                 append_seg(enc, seg0, batch - seg0);
