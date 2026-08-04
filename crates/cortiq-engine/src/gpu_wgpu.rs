@@ -21027,8 +21027,32 @@ fn dsv4_chain_batch_bt(
         TS_PAIRS.lock().unwrap().clear();
     }
     let t_enc = std::time::Instant::now();
+    // `CMF_DSV4_CHAIN_SPLIT=N` (default 2): submit the chain in N pieces so
+    // the card starts the first layers while the host still encodes the
+    // rest. Same queue, same order — the split changes when work is handed
+    // over, never what it computes. N=1 restores the single submission.
+    let split_n = {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("CMF_DSV4_CHAIN_SPLIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or(2)
+        })
+    };
+    let chunk = layers.len().div_ceil(split_n).max(1);
     let mut last: Option<(wgpu::Buffer, wgpu::Buffer)> = None;
     for (i, (w, g, p)) in layers.iter().enumerate() {
+        if i > 0 && i % chunk == 0 {
+            let full = std::mem::replace(
+                &mut enc,
+                c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("dsv4-chain-batch-bt"),
+                }),
+            );
+            c.queue.submit([full.finish()]);
+        }
         // Per-token counts follow from the position alone (window fills by
         // one, a compressed entry appears every `ratio`), so the whole
         // batch's preps are known before anything is encoded.

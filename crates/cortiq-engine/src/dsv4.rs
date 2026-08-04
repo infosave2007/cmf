@@ -3201,6 +3201,47 @@ struct Pack {
 }
 
 #[cfg(feature = "gpu")]
+/// Candidate order for a budget-limited pack: hottest expert first, by the
+/// measured tally `CMF_DSV4_PACK_FREQ` points at (`layer<TAB>expert<TAB>count`
+/// lines). None when the variable is unset, the file is unreadable, or the
+/// tally has nothing for this layer — the caller keeps id order then. Ties
+/// and untallied experts follow in id order, so the choice is deterministic.
+fn pack_freq_order(li: usize, n: usize) -> Option<Vec<usize>> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static FREQ: OnceLock<Option<HashMap<(usize, usize), u64>>> = OnceLock::new();
+    let map = FREQ
+        .get_or_init(|| {
+            let path = std::env::var("CMF_DSV4_PACK_FREQ").ok()?;
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("CMF_DSV4_PACK_FREQ={path} не читается ({e}) — порядок по id");
+                    return None;
+                }
+            };
+            let mut m = HashMap::new();
+            for line in text.lines() {
+                let mut it = line.split('\t');
+                if let (Some(l), Some(e), Some(c)) = (it.next(), it.next(), it.next()) {
+                    if let (Ok(l), Ok(e), Ok(c)) =
+                        (l.trim().parse(), e.trim().parse(), c.trim().parse::<u64>())
+                    {
+                        *m.entry((l, e)).or_insert(0) += c;
+                    }
+                }
+            }
+            Some(m)
+        })
+        .as_ref()?;
+    if !(0..n).any(|e| map.contains_key(&(li, e))) {
+        return None;
+    }
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by_key(|&e| (std::cmp::Reverse(map.get(&(li, e)).copied().unwrap_or(0)), e));
+    Some(idx)
+}
+
 fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pack>> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -3305,7 +3346,18 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
             .is_some_and(|e| e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
         let room = crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, gu_q2, dn_q2_fit)
             .saturating_sub(1);
-        for (gi, e) in l.experts.iter().enumerate() {
+        // When the budget packs a SUBSET, which subset matters: a partial
+        // layer completes its cold picks from the host, so every resident
+        // expert that the routing actually reaches is host work saved.
+        // `CMF_DSV4_PACK_FREQ` names a measured tally
+        // (`CMF_DSV4_TRUNK_PICK_DUMP` wrote it) and reorders the candidates
+        // hottest-first; layers absent from the tally keep id order. The
+        // router still ranges over every expert either way — residency
+        // choice changes speed, never a bit of the answer.
+        let order = pack_freq_order(li, l.experts.len())
+            .unwrap_or_else(|| (0..l.experts.len()).collect());
+        for gi in order {
+            let e = &l.experts[gi];
             if l.mask.as_deref().is_some_and(|m| !m.get(gi).copied().unwrap_or(true)) {
                 continue;
             }
@@ -6805,6 +6857,35 @@ pub fn dspark_freq_note(picks: &[(usize, Vec<usize>)]) {
         let body: String = lines
             .iter()
             .map(|((s, e), n)| format!("{s}\t{e}\t{n}\n"))
+            .collect();
+        let _ = std::fs::write(&path, body);
+    }
+}
+
+/// `CMF_DSV4_TRUNK_PICK_DUMP=path` — the same tally for the TRUNK's layers:
+/// `layer<TAB>expert<TAB>count`, rewritten every 32 tokens. The pick lists
+/// come from the probe's own tally window, so only layers that route on the
+/// host are counted — which is exactly the population a partial pack serves.
+pub fn trunk_freq_note(picks: &[(usize, Vec<usize>)]) {
+    static FREQ: std::sync::Mutex<Option<(std::collections::HashMap<(usize, usize), u64>, u64)>> =
+        std::sync::Mutex::new(None);
+    let Ok(path) = std::env::var("CMF_DSV4_TRUNK_PICK_DUMP") else {
+        return;
+    };
+    let mut g = FREQ.lock().unwrap();
+    let (map, blocks) = g.get_or_insert_with(|| (std::collections::HashMap::new(), 0));
+    for (li, idx) in picks {
+        for &e in idx {
+            *map.entry((*li, e)).or_insert(0) += 1;
+        }
+    }
+    *blocks += 1;
+    if *blocks % 32 == 0 {
+        let mut lines: Vec<_> = map.iter().collect();
+        lines.sort();
+        let body: String = lines
+            .iter()
+            .map(|((l, e), n)| format!("{l}\t{e}\t{n}\n"))
             .collect();
         let _ = std::fs::write(&path, body);
     }
