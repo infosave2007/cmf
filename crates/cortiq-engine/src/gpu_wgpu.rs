@@ -8796,16 +8796,20 @@ impl GraphScratch {
 
 static CTX: OnceLock<Option<Ctx>> = OnceLock::new();
 
-/// Whether the wgpu path is selected by env (the facade asks before `enabled()`):
+/// Whether the wgpu path is selected (the facade asks before `enabled()`):
 /// `CMF_GPU=wgpu` — always; `CMF_GPU=1` (≠0) — only on non-macOS, where
-/// there is no native Metal (on macOS `=1` goes to Metal).
+/// there is no native Metal (on macOS `=1` goes to Metal). UNSET selects
+/// the path by default on Linux/Windows when the feature is compiled —
+/// init failure is a clean CPU fallback, so a box without a driver loses
+/// nothing. `CMF_GPU=0` forces the CPU.
 pub fn selected() -> bool {
     match std::env::var("CMF_GPU") {
         Ok(v) if v == "wgpu" => true,
-        Ok(v) if v != "0" => !cfg!(target_os = "macos"),
-        _ => {
+        Ok(v) if v != "0" && v != "off" => !cfg!(target_os = "macos"),
+        Ok(_) => false,
+        Err(_) => {
             crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)
-                && !cfg!(target_os = "macos")
+                || cfg!(any(target_os = "linux", target_os = "windows"))
         }
     }
 }
@@ -8831,6 +8835,38 @@ fn ctx() -> Option<&'static Ctx> {
         }
     })
     .as_ref()
+}
+
+/// Total device-local memory of a Vulkan adapter, from the driver's own heap
+/// report. None on other backends or when the query is unavailable.
+#[cfg(not(target_os = "macos"))]
+fn vulkan_vram_total(adapter: &wgpu::Adapter) -> Option<u64> {
+    if adapter.get_info().backend != wgpu::Backend::Vulkan {
+        return None;
+    }
+    unsafe {
+        let hal = adapter.as_hal::<wgpu::hal::api::Vulkan>()?;
+        let phd = hal.raw_physical_device();
+        let mem = hal
+            .shared_instance()
+            .raw_instance()
+            .get_physical_device_memory_properties(phd);
+        let mut total = 0u64;
+        for heap in mem.memory_heaps[..mem.memory_heap_count as usize].iter() {
+            // DEVICE_LOCAL is bit 0 of VkMemoryHeapFlags. The LARGEST such
+            // heap is the card's memory; summing would double-count the
+            // small host-visible BAR window some drivers report separately.
+            if heap.flags.as_raw() & 0x1 != 0 {
+                total = total.max(heap.size);
+            }
+        }
+        (total > 0).then_some(total)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn vulkan_vram_total(_adapter: &wgpu::Adapter) -> Option<u64> {
+    None
 }
 
 fn init() -> Result<Ctx, String> {
@@ -8918,9 +8954,18 @@ fn init() -> Result<Ctx, String> {
         .and_then(|v| v.parse::<u64>().ok())
         .map(|mb| mb * 1024 * 1024)
         .unwrap_or(if discrete {
-            // Conservative default for unknown cards; 4090-class users
-            // should set CMF_GPU_VRAM_MB=20000.
-            8 * 1024 * 1024 * 1024
+            // No knob: ask the driver. The Vulkan device-local heap is what
+            // the card actually has; a margin of total/64 (1–2 GB) is left
+            // to the driver's own bookkeeping. Backends that cannot answer
+            // (DX12/GL) keep the conservative default — CMF_GPU_VRAM_MB
+            // overrides either way.
+            match vulkan_vram_total(&adapter) {
+                Some(total) => {
+                    let gib = 1024 * 1024 * 1024u64;
+                    total - (total / 72).clamp(gib, 2 * gib).min(total / 2)
+                }
+                None => 8 * 1024 * 1024 * 1024,
+            }
         } else {
             u64::MAX // UMA: the OS pages shared memory
         });
@@ -16070,11 +16115,12 @@ pub static SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 pub static UPLOAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static UPLOAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// `CMF_GPU_UPLOAD=staged`: map a staging buffer and issue the copy here,
-/// instead of handing the bytes to `queue.write_buffer`.
+/// Staged upload (default): map a staging buffer and issue the copy here,
+/// instead of handing the bytes to `queue.write_buffer`. `CMF_GPU_UPLOAD=map`
+/// restores the historical write_buffer path.
 fn upload_staged() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_GPU_UPLOAD").is_ok_and(|v| v == "staged"))
+    *ON.get_or_init(|| std::env::var("CMF_GPU_UPLOAD").map(|v| v == "staged").unwrap_or(true))
 }
 
 #[inline]
@@ -21027,7 +21073,7 @@ fn dsv4_chain_batch_bt(
         TS_PAIRS.lock().unwrap().clear();
     }
     let t_enc = std::time::Instant::now();
-    // `CMF_DSV4_CHAIN_SPLIT=N` (default 2): submit the chain in N pieces so
+    // `CMF_DSV4_CHAIN_SPLIT=N` (default 4): submit the chain in N pieces so
     // the card starts the first layers while the host still encodes the
     // rest. Same queue, same order — the split changes when work is handed
     // over, never what it computes. N=1 restores the single submission.
@@ -21038,7 +21084,7 @@ fn dsv4_chain_batch_bt(
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|&n| n >= 1)
-                .unwrap_or(2)
+                .unwrap_or(4)
         })
     };
     let chunk = layers.len().div_ceil(split_n).max(1);
@@ -23796,9 +23842,66 @@ pub fn dsv4_experts_fit(inter: usize, hidden: usize, gu_q2: bool, dn_q2: bool) -
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(|v| v.saturating_mul(mib))
-        .unwrap_or_else(|| (c.vram_budget / 384).clamp(256 * mib, 512 * mib));
+        .unwrap_or_else(|| {
+            // The base covers command staging, KV growth and driver
+            // bookkeeping; the draft term carves out what the speculative
+            // draft's own resident pack will take, so the trunk's greedy
+            // packing stops before the draft has nowhere to live. Packing
+            // against the physical ceiling fails NONDETERMINISTICALLY as
+            // the KV grows mid-run, so the base rides twice when a draft
+            // is coming.
+            let base = (c.vram_budget / 384).clamp(256 * mib, 512 * mib);
+            let draft = DRAFT_RESERVE.load(Ordering::Relaxed);
+            if draft > 0 { 2 * base + draft } else { base }
+        });
     let usable = c.vram_budget.saturating_sub(reserve);
     ((usable.saturating_sub(used)) / per) as usize
+}
+
+/// What the speculative draft's device pack will need, set at load when the
+/// file carries an MTP stack and speculation is not disabled. Zero means no
+/// draft is coming and the trunk may pack into the whole budget.
+pub static DRAFT_RESERVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The configured weight budget, initializing the device on first ask.
+/// None when no GPU path is selected or init failed.
+pub fn dsv4_vram_budget() -> Option<u64> {
+    ctx().map(|c| c.vram_budget)
+}
+
+/// `dsv4_experts_fit` with the draft's own carve-out handed back: the draft
+/// pack builder must see the room that was reserved FOR it, not the room
+/// that remains after its own reservation.
+pub fn dsv4_draft_fit(inter: usize, hidden: usize, gu_q2: bool, dn_q2: bool) -> usize {
+    let base = dsv4_experts_fit(inter, hidden, gu_q2, dn_q2);
+    if std::env::var("CMF_GPU_WORKSPACE_MB").is_ok() {
+        // An explicit workspace is the operator's own split; the draft
+        // competes inside it exactly as before the reservation existed.
+        return base;
+    }
+    let gu = cortiq_core::quant::expected_nbytes(
+        if gu_q2 {
+            cortiq_core::TensorDtype::Q2TiledP
+        } else {
+            cortiq_core::TensorDtype::Q4TiledP
+        },
+        &[inter, hidden],
+    )
+    .unwrap_or(0);
+    let dn = cortiq_core::quant::expected_nbytes(
+        if dn_q2 {
+            cortiq_core::TensorDtype::Q2TiledP
+        } else {
+            cortiq_core::TensorDtype::Q4TiledP
+        },
+        &[hidden, inter],
+    )
+    .unwrap_or(0);
+    let per = (2 * gu + dn) as u64;
+    if per == 0 {
+        return base;
+    }
+    base + (DRAFT_RESERVE.load(std::sync::atomic::Ordering::Relaxed) / per) as usize
 }
 
 /// Can this layer's experts live on the card? Uploads them if they can, so a

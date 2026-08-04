@@ -1177,7 +1177,14 @@ async fn main() -> anyhow::Result<()> {
             o1_sink,
             o1_rect,
             o1_prefill,
-        } => cmd_ppl(
+        } => {
+            // The perplexity gate is the exactness contract: CPU == GPU bit
+            // for bit, which needs the strict dot kernels. Generation keeps
+            // the fast ones; an explicit CMF_SDOT still wins here.
+            if std::env::var("CMF_SDOT").is_err() {
+                unsafe { std::env::set_var("CMF_SDOT", "0") };
+            }
+            cmd_ppl(
             &model,
             &file,
             tokens,
@@ -1196,7 +1203,8 @@ async fn main() -> anyhow::Result<()> {
                 rect: o1_rect,
             },
             o1_prefill,
-        ),
+        )
+        }
         Commands::Info { model, tensors } => cmd_info(&model, tensors.as_deref()).await,
         Commands::Story { model } => cmd_story(&model),
         Commands::Diff { a, b } => cmd_diff(&a, &b),

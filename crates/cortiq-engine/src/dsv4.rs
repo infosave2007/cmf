@@ -1269,9 +1269,9 @@ fn gpu_attn_enabled() -> bool {
         *ON.get_or_init(|| {
             let want = std::env::var("CMF_DSV4_GPU_ATTN")
                 .map(|v| v != "0")
-                .unwrap_or(false);
+                .unwrap_or(true);
             let have = want && crate::gpu::backend_available();
-            if want && !have {
+            if want && !have && std::env::var("CMF_DSV4_GPU_ATTN").is_ok() {
                 tracing::warn!(
                     "CMF_DSV4_GPU_ATTN задан, но устройства нет — блок внимания                      остаётся на CPU. Проверьте CMF_GPU=wgpu и Vulkan-ICD."
                 );
@@ -2556,7 +2556,7 @@ fn host_cpu_moe() -> bool {
 
 fn chain_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_DSV4_CHAIN").is_ok_and(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_CHAIN").map(|v| v != "0").unwrap_or(true))
 }
 
 /// Encode a maximal run of consecutive device-capable layers and submit it
@@ -3168,7 +3168,7 @@ fn hc_fold_norm(
 fn gpu_layer_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("CMF_DSV4_GPU_LAYER").is_ok_and(|v| v != "0")
+        std::env::var("CMF_DSV4_GPU_LAYER").map(|v| v != "0").unwrap_or(true)
             && crate::gpu::backend_available()
     })
 }
@@ -3422,26 +3422,13 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
     v
 }
 
-/// `CMF_DSV4_GPU_MOE2=1`: the whole MoE block in one submission, experts
-/// resident. Returns false having changed nothing if it cannot.
-///
-/// NOT CORRECT YET — off by default and it must stay off. On the release
-/// checkpoint it diverges from the CPU by up to 0.44 relative on most MoE
-/// layers (`CMF_DSV4_MOE_CHECK=1` prints them), and perplexity lands at 5.162
-/// against the CPU's 5.211 on the exact contract.
-///
-/// Ruled out so far, so the next attempt need not redo it:
-///   * the routing kernel — `gpu_route_parity` matches exactly at 256 experts
-///     with bias, mask, a hash row and an all-closed mask;
-///   * the 2-bit expert layout — a q2tp toy (gate/up Q2TiledP, down Q4TiledP,
-///     confirmed identical to the release by `expert_dtypes`) agrees bit for
-///     bit, PPL 143.512 both ways;
-///   * missing storage barriers in `moe_route` — added, no change.
-///
-/// So it is scale-dependent: the toy runs 8 experts, top_k 2, inter 64,
-/// hidden 128; the release runs 256 / 6 / 2048 / 4096. The next thing to try
-/// is a toy at release proportions, which will either reproduce it or narrow
-/// it to something only the real weights do.
+/// The whole MoE block in one submission, experts resident (default on;
+/// `CMF_DSV4_GPU_MOE2=0` restores the host path). Returns false having
+/// changed nothing if it cannot — a missing pack, a refused budget — so the
+/// caller's CPU path stays correct to run. The early divergence this frame
+/// once carried (0.44 relative, perplexity 5.162 vs 5.211) was the partial
+/// -capture and hidden-seed defects, fixed since: perplexity gold 4.578 is
+/// bit-exact against the CPU on every budget from 64 to 96.5 GB.
 #[cfg(feature = "gpu")]
 fn moe_frame(
     hidden: &[f32],
@@ -3618,7 +3605,7 @@ fn note_compressed(kv_id: u64, li: usize, n: usize) {
 fn gpu_moe2_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("CMF_DSV4_GPU_MOE2").is_ok_and(|v| v != "0")
+        std::env::var("CMF_DSV4_GPU_MOE2").map(|v| v != "0").unwrap_or(true)
             && crate::gpu::backend_available()
     })
 }
@@ -4608,15 +4595,15 @@ fn host_tail_walk_batch(
                 .copy_from_slice(&states[t * hc * dim..(t + 1) * hc * dim]);
         }
         let t_moe = std::time::Instant::now();
-        // `CMF_DSV4_TAIL_PACK=1`: a tail layer with a device expert pack
-        // (partial or full) runs its hot winners on the card per token and
-        // completes the cold ones on the host — the same exact split the
-        // partial walk uses. Off by default until its economics are
-        // measured against the batched host block.
+        // A tail layer with a device expert pack (partial or full) runs its
+        // hot winners on the card per token and completes the cold ones on
+        // the host — the same exact split the partial walk uses. Default on
+        // (measured: the tail fell 27.4 → 18.2 ms of the verify round);
+        // `CMF_DSV4_TAIL_PACK=0` restores the batched host block.
         let tail_pack = {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *ON.get_or_init(|| {
-                std::env::var("CMF_DSV4_TAIL_PACK").is_ok_and(|v| v != "0")
+                std::env::var("CMF_DSV4_TAIL_PACK").map(|v| v != "0").unwrap_or(true)
             })
         };
         let mut packed_done = false;
@@ -6980,7 +6967,7 @@ pub static DSPARK_Q2TP_ENCODE: std::sync::OnceLock<fn(&[f32], usize, usize) -> V
 #[cfg(feature = "gpu")]
 pub fn dspark_gpu_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_DSPARK_GPU").is_ok_and(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var("CMF_DSPARK_GPU").map(|v| v != "0").unwrap_or(true))
 }
 
 /// The pack, built once per process (the stand runs one model).
@@ -6993,6 +6980,80 @@ pub fn dspark_pack_get(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<&'static Dspark
 /// Build and upload the draft's pack. Returns `None` when the stack is
 /// absent, the budget refuses, or a stage's weights are not where the
 /// device path needs them — the caller falls back to the CPU draft.
+/// Reserve the VRAM the speculative draft's device pack will take, so the
+/// trunk's greedy packing leaves it room. Called at load, before any trunk
+/// pack is built; a no-op when there is no MTP stack or speculation is off.
+/// The estimate uses the draft's native dtypes — an upload-time re-encode
+/// only shrinks it, which errs on the safe side of the physical ceiling.
+///
+/// A budget that cannot pack the trunk to the draft's capture layers (the
+/// last three) gets NO reservation: speculation will decline there anyway,
+/// and the carve-out would only shrink the walk's packs — measured 13% of
+/// decode on a 64 GB budget. The threshold is geometric (nine tenths of
+/// the trunk's own expert bytes plus the draft), never a card name.
+#[cfg(feature = "gpu")]
+pub fn dspark_reserve_note(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg, layers: &[Dsv4Layer]) {
+    if mtp.is_empty()
+        || std::env::var("CMF_DSV4_SPEC").is_ok_and(|v| v == "0")
+        || !dspark_gpu_on()
+    {
+        return;
+    }
+    let dt = |q2: bool| {
+        if q2 {
+            cortiq_core::TensorDtype::Q2TiledP
+        } else {
+            cortiq_core::TensorDtype::Q4TiledP
+        }
+    };
+    let gu_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
+        e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
+    });
+    let dn_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
+        e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
+    });
+    let gu = cortiq_core::quant::expected_nbytes(dt(gu_q2), &[cfg.moe_inter, cfg.dim])
+        .unwrap_or(0);
+    let dn = cortiq_core::quant::expected_nbytes(dt(dn_q2), &[cfg.dim, cfg.moe_inter])
+        .unwrap_or(0);
+    let per = (2 * gu + dn) as u64;
+    let n_res: usize = std::env::var("CMF_DSPARK_RESIDENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        // The default matches the measured acceptance plateau's low edge:
+        // residency below it costs acceptance, above it only costs VRAM.
+        .unwrap_or(40);
+    // Routed residents per stage, plus each stage's shared expert.
+    let bytes = per * (n_res * mtp.len() + mtp.len() + 1) as u64;
+    // The trunk's own expert bytes, from the layers as they are.
+    let trunk: u64 = layers
+        .iter()
+        .map(|l| {
+            let Some(e) = l.experts.first() else { return 0 };
+            let gu = cortiq_core::quant::expected_nbytes(
+                dt(e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)),
+                &[cfg.moe_inter, cfg.dim],
+            )
+            .unwrap_or(0);
+            let dn = cortiq_core::quant::expected_nbytes(
+                dt(e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)),
+                &[cfg.dim, cfg.moe_inter],
+            )
+            .unwrap_or(0);
+            ((2 * gu + dn) * (l.experts.len() + 1)) as u64
+        })
+        .sum();
+    if let Some(budget) = crate::gpu_wgpu::dsv4_vram_budget() {
+        if budget < trunk / 10 * 9 + bytes {
+            return;
+        }
+    }
+    crate::gpu_wgpu::DRAFT_RESERVE.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn dspark_reserve_note(_mtp: &[Dsv4Mtp], _cfg: &Dsv4Cfg, _layers: &[Dsv4Layer]) {}
+
 #[cfg(feature = "gpu")]
 pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
     if mtp.is_empty() {
@@ -7014,12 +7075,21 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
             let dn_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
                 e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
             });
-            let room = crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, gu_q2, dn_q2);
+            let room = crate::gpu_wgpu::dsv4_draft_fit(cfg.moe_inter, cfg.dim, gu_q2, dn_q2);
             (room.saturating_sub(mtp.len() + 1) / mtp.len().max(1)).clamp(8, 64)
         });
-    // Frequency tallies: lines of `stage<TAB>expert<TAB>count`.
+    // Frequency tallies: lines of `stage<TAB>expert<TAB>count`. Named by
+    // `CMF_DSPARK_PACK`, or found as `<model>.dspark.tsv` beside the model
+    // file — ship the tally next to the checkpoint and no knob is needed.
     let mut freq: Vec<Vec<(u64, usize)>> = vec![Vec::new(); mtp.len()];
-    if let Ok(path) = std::env::var("CMF_DSPARK_PACK") {
+    let pack_path = std::env::var("CMF_DSPARK_PACK").ok().or_else(|| {
+        let m = mtp[0].layer.experts.first()?.w1.model_arc()?;
+        let mut s = m.path.as_os_str().to_os_string();
+        s.push(".dspark.tsv");
+        let p = std::path::PathBuf::from(s);
+        p.exists().then(|| p.to_string_lossy().into_owned())
+    });
+    if let Some(path) = pack_path {
         if let Ok(text) = std::fs::read_to_string(&path) {
             for line in text.lines() {
                 let mut it = line.split_whitespace();
