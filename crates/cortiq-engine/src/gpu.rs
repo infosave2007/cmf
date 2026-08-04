@@ -584,7 +584,14 @@ pub fn wgpu_active() -> bool {
 pub fn wgpu_graph_default() -> bool {
     #[cfg(feature = "gpu")]
     {
-        matches!(backend(), Backend::Wgpu) && crate::gpu_wgpu::discrete_active()
+        // Discrete cards always; Apple-silicon UMA on macOS too — desktop
+        // -class GPUs where the graph measured ~2x the CPU on the Qwen3.6
+        // family (M4: 13.3 tok/s against 7.3). Phone-class UMA (Android/
+        // iOS builds) keeps the per-op probe path: tiled mobile GPUs have
+        // turned the ~300-dispatch graph into seconds per token.
+        matches!(backend(), Backend::Wgpu)
+            && (crate::gpu_wgpu::discrete_active()
+                || (cfg!(target_os = "macos") && crate::gpu_wgpu::adapter_up()))
     }
     #[cfg(not(feature = "gpu"))]
     {

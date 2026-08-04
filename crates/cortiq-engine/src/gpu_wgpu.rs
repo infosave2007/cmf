@@ -10576,6 +10576,13 @@ pub(crate) fn discrete_active() -> bool {
     ctx().map(|c| c.discrete).unwrap_or(false)
 }
 
+/// A wgpu context of any kind is up — the graph-default check for
+/// desktop-class UMA (Apple silicon), where discreteness is the wrong
+/// question.
+pub(crate) fn adapter_up() -> bool {
+    ctx().is_some()
+}
+
 fn q1_weight(c: &Ctx, model: &Arc<CmfModel>, idx: usize) -> Option<(wgpu::Buffer, usize, usize)> {
     let entry = model.tensors.get(idx)?;
     let rows = *entry.shape.first()? as usize;
