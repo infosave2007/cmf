@@ -4628,6 +4628,64 @@ fn moe_down_q4tp_red(@builtin(workgroup_id) wid: vec3<u32>,
     dr_y[t * dr_p.hidden + row] = acc;
 }
 
+// The 2-bit down-projection for the DRAFT's experts: the same ladder
+// and packing as gate/up (five-bit rung codes, sixteen weights a word),
+// pointed the other way. Draft-only fidelity: nothing downstream needs
+// this to match a walk bit for bit — a trunk pass verifies every token.
+@compute @workgroup_size(64)
+fn moe_down_q2tp_b(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let t = wid.y;
+    let gpr = db_p.gpr;
+    let rows = db_p.hidden;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let sb = t * db_p.slots;
+    let ab4 = t * db_p.slots * gpr * 8u;
+    let total = db_p.slots * gpr;
+    var cur = 0xFFFFFFFFu;
+    var base16 = 0u;
+    var cod8 = 0u;
+    var sw = 0.0;
+    var pl = vec2<f32>(0.0, 0.0);
+    var acc = 0.0;
+    for (var i = lid; i < total; i = i + 64u) {
+        let slot = i / gpr;
+        let g = i % gpr;
+        if (slot != cur) {
+            cur = slot;
+            base16 = db_sel[sb + slot] * db_p.mat16;
+            let par16 = base16 + rows * gpr * 4u + row * 2u;
+            pl = unpack2x16float(db_u16(par16) | (db_u16(par16 + 1u) << 16u));
+            cod8 = (base16 + rows * gpr * 4u + rows * 2u) * 2u + row * cst;
+            sw = db_wt[sb + slot];
+        }
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        var cv = db_u8(cod8 + cb);
+        if (shf > 3u) { cv = cv | (db_u8(cod8 + cb + 1u) << 8u); }
+        let code = (cv >> shf) & 31u;
+        let scale = select(exp2(pl.x + f32(max(code, 1u) - 1u) * pl.y), 0.0, code == 0u);
+        let w32 = (base16 + (row * gpr + g) * 4u) >> 1u;
+        let x4 = ab4 + (slot * gpr + g) * 8u;
+        let d = mg_dot16v(db_w[w32], db_x4[x4], db_x4[x4 + 1u], db_x4[x4 + 2u], db_x4[x4 + 3u])
+              + mg_dot16v(db_w[w32 + 1u], db_x4[x4 + 4u], db_x4[x4 + 5u], db_x4[x4 + 6u],
+                          db_x4[x4 + 7u]);
+        acc = acc + sw * scale * d;
+    }
+    db_pt[lid] = acc;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { db_pt[lid] = db_pt[lid] + db_pt[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) { db_y[t * rows + row] = db_pt[0]; }
+}
+
 // Four rows per workgroup: the x span is loaded once per thread and
 // feeds four weight tiles, cutting the L2 activation traffic that limits
 // the one-row kernel four-fold. Each row's accumulation order equals the
@@ -8262,6 +8320,7 @@ struct Ctx {
     moe_down_q4tp_b2: wgpu::ComputePipeline,
     moe_down_q4tp_part: wgpu::ComputePipeline,
     moe_down_q4tp_b4: wgpu::ComputePipeline,
+    moe_down_q2tp_b: wgpu::ComputePipeline,
     moe_down_q4tp_red: wgpu::ComputePipeline,
     layout_moe_sel_b: wgpu::BindGroupLayout,
     layout_moe_gu_b: wgpu::BindGroupLayout,
@@ -8865,6 +8924,7 @@ fn init() -> Result<Ctx, String> {
     let moe_down_q4tp_b2 = pipe("moe_down_q4tp_b2");
     let moe_down_q4tp_part = pipe("moe_down_q4tp_part");
     let moe_down_q4tp_b4 = pipe("moe_down_q4tp_b4");
+    let moe_down_q2tp_b = pipe("moe_down_q2tp_b");
     let moe_down_q4tp_red = pipe("moe_down_q4tp_red");
     let layout_moe_sel_b = moe_select_b.get_bind_group_layout(0);
     let layout_moe_gu_b = moe_gate_up_q4tp_b.get_bind_group_layout(0);
@@ -9079,6 +9139,7 @@ fn init() -> Result<Ctx, String> {
         moe_down_q4tp_b2,
         moe_down_q4tp_part,
         moe_down_q4tp_b4,
+        moe_down_q2tp_b,
         moe_down_q4tp_red,
         layout_moe_sel_b,
         layout_moe_gu_b,
@@ -9349,6 +9410,7 @@ fn moe_expert_bufs(
     hidden: usize,
     q4tp: bool,
     gu_q2: bool,
+    dn_q2: bool,
 ) -> Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)> {
     use std::sync::atomic::Ordering;
     if hidden % 32 != 0 || inter % 32 != 0 {
@@ -9374,7 +9436,11 @@ fn moe_expert_bufs(
     } else {
         plen(inter, hidden)?
     };
-    let d_len = plen(hidden, inter)?;
+    let d_len = if dn_q2 {
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q2TiledP, &[hidden, inter])?
+    } else {
+        plen(hidden, inter)?
+    };
     let total = (experts.len() * (2 * gu_len + d_len)) as u64;
     if c.resident.load(Ordering::Relaxed) + total > c.vram_budget {
         // Over budget — the whole graph falls to CPU. Say so ONCE with the
@@ -10827,7 +10893,7 @@ pub fn forward_token_graph(
                     return false;
                 };
                 let Some((gate_all, up_all, down_all)) =
-                    moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2)
+                    moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false)
                 else {
                     return false;
                 };
@@ -13102,7 +13168,7 @@ pub fn forward_batch_graph(
                     return false;
                 };
                 let Some((gate_all, up_all, down_all)) =
-                    moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, false)
+                    moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, false, false)
                 else {
                     bgraph_refused("site:5990");
                     return false;
@@ -20081,6 +20147,7 @@ fn dsv4_layer_frame_enc(
         m.hidden,
         true,
         m.gu_q2,
+        false,
     ) else {
         no!("эксперты не влезли в VRAM");
     };
@@ -21120,6 +21187,7 @@ pub struct DsparkGeom {
     pub swiglu_limit: f32,
     pub scale: f32,
     pub gu_q2: bool,
+    pub dn_q2: bool,
 }
 
 /// The five-position DSpark block, whole, in ONE submission.
@@ -21280,7 +21348,7 @@ pub fn dspark_graph(
         let Some((gate_all, up_all, down_all)) = (if g.gu_q2 {
             moe_expert_bufs_requant_gu(model, s.experts, g.inter, dim)
         } else {
-            moe_expert_bufs(c, model, s.experts, g.inter, dim, true, false)
+            moe_expert_bufs(c, model, s.experts, g.inter, dim, true, false, false)
         }) else {
             return false;
         };
@@ -21581,7 +21649,8 @@ pub fn dspark_graph(
             );
             let dn_u = uniform_u32x4(
                 c,
-                [(g.inter / 32) as u32, dim as u32, slots as u32, stride16(dim, g.inter, false)],
+                [(g.inter / 32) as u32, dim as u32, slots as u32,
+                 stride16(dim, g.inter, g.dn_q2)],
             );
             let p_gu = if g.gu_q2 {
                 &c.bt_moe_gate_up_q2tp
@@ -21605,21 +21674,29 @@ pub fn dspark_graph(
             pass.set_pipeline(p_gu);
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(g.inter as u32, slots as u32, block as u32);
+            let p_dn = if g.dn_q2 { &c.moe_down_q2tp_b } else { &c.moe_down_q4tp_b };
             let bind = cached_bind(c, bk(251), || {
+                // The 2-bit kernel reads x through the vec4 view and never
+                // touches the scalar activation binding; the layouts differ.
+                let mut entries = vec![
+                    bind_buf(0, &down_all),
+                    bind_buf(2, &msel_bt),
+                    bind_buf(3, &mwt_bt),
+                    bind_buf(4, &mo_bt),
+                    bind_buf(5, &dn_u),
+                ];
+                if g.dn_q2 {
+                    entries.push(bind_buf(7, &mact_bt));
+                } else {
+                    entries.insert(1, bind_buf(1, &mact_bt));
+                }
                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
-                    layout: &c.moe_down_q4tp_b.get_bind_group_layout(0),
-                    entries: &[
-                        bind_buf(0, &down_all),
-                        bind_buf(1, &mact_bt),
-                        bind_buf(2, &msel_bt),
-                        bind_buf(3, &mwt_bt),
-                        bind_buf(4, &mo_bt),
-                        bind_buf(5, &dn_u),
-                    ],
+                    layout: &p_dn.get_bind_group_layout(0),
+                    entries: &entries,
                 })
             });
-            pass.set_pipeline(&c.moe_down_q4tp_b);
+            pass.set_pipeline(p_dn);
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(dim as u32, block as u32, 1);
             expand(&mut pass, 252, &mo_bt, &state2_bt, &state_bt);
@@ -22183,7 +22260,7 @@ fn dsv4_layer_frame_bt_enc(
         wb.push(b);
     }
     let Some((gate_all, up_all, down_all)) =
-        moe_expert_bufs(c, model, w.moe.experts, m.inter, m.hidden, true, m.gu_q2)
+        moe_expert_bufs(c, model, w.moe.experts, m.inter, m.hidden, true, m.gu_q2, false)
     else {
         no!("эксперты не влезли в VRAM");
     };
@@ -23401,7 +23478,7 @@ pub fn dsv4_weight_ready(model: &Arc<CmfModel>, idx: usize) -> bool {
 /// How many experts of this shape still fit on the card. The caller packs
 /// that many and leaves the rest to the host — per EXPERT, so no layer ever
 /// has to leave the device wholesale.
-pub fn dsv4_experts_fit(inter: usize, hidden: usize, gu_q2: bool) -> usize {
+pub fn dsv4_experts_fit(inter: usize, hidden: usize, gu_q2: bool, dn_q2: bool) -> usize {
     use std::sync::atomic::Ordering;
     let Some(c) = ctx() else { return 0 };
     let gu = if gu_q2 {
@@ -23411,7 +23488,11 @@ pub fn dsv4_experts_fit(inter: usize, hidden: usize, gu_q2: bool) -> usize {
     }
     .unwrap_or(0);
     let dn = cortiq_core::quant::expected_nbytes(
-        cortiq_core::TensorDtype::Q4TiledP,
+        if dn_q2 {
+            cortiq_core::TensorDtype::Q2TiledP
+        } else {
+            cortiq_core::TensorDtype::Q4TiledP
+        },
         &[hidden, inter],
     )
     .unwrap_or(0);
@@ -23446,9 +23527,10 @@ pub fn dsv4_experts_ready(
     inter: usize,
     hidden: usize,
     gu_q2: bool,
+    dn_q2: bool,
 ) -> bool {
     let Some(c) = ctx() else { return false };
-    moe_expert_bufs(c, model, experts, inter, hidden, true, gu_q2).is_some()
+    moe_expert_bufs(c, model, experts, inter, hidden, true, gu_q2, dn_q2).is_some()
 }
 
 /// Seed the attention half's `post`/`comb` from the host. The frame's opening
@@ -26038,7 +26120,7 @@ pub fn dsv4_moe_frame(
     }
     let t_bufs = std::time::Instant::now();
     let Some((gate_all, up_all, down_all)) =
-        moe_expert_bufs(c, model, w.experts, g.inter, g.hidden, true, g.gu_q2)
+        moe_expert_bufs(c, model, w.experts, g.inter, g.hidden, true, g.gu_q2, false)
     else {
         no!("эксперты не поместились в бюджет VRAM");
     };
