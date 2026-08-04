@@ -1806,12 +1806,17 @@ fn dsv4_layer_loop(
         // pack misses by exactly those bytes.
         let pk = pack_for(l, cfg, li);
         if let Some(pk) = pk {
+            let dn_q2 = l
+                .experts
+                .first()
+                .is_some_and(|e| e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
             let experts_ok = crate::gpu_wgpu::dsv4_experts_ready(
                 &model,
                 &pk.tensors,
                 cfg.moe_inter,
                 dim,
                 gu_q2,
+                dn_q2,
             );
             on_dev[li] = attn_ok && experts_ok && pk.globals.len() == cfg.n_routed_experts;
             partial_dev[li] = attn_ok && experts_ok && pk.globals.len() < cfg.n_routed_experts;
@@ -2873,7 +2878,16 @@ fn dsv4_two_frame_loop(
         .all(|i| crate::gpu_wgpu::dsv4_weight_ready(&model, i));
         on_dev[li] = attn_ok
             && pk.globals.len() == cfg.n_routed_experts
-            && crate::gpu_wgpu::dsv4_experts_ready(&model, &pk.tensors, cfg.moe_inter, dim, gu_q2);
+            && crate::gpu_wgpu::dsv4_experts_ready(
+                &model,
+                &pk.tensors,
+                cfg.moe_inter,
+                dim,
+                gu_q2,
+                l.experts.first().is_some_and(|e| {
+                    e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
+                }),
+            );
     }
     if !on_dev.iter().any(|&x| x) {
         return false;
@@ -3194,7 +3208,11 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
                 tensors,
             }));
         }
-        let room = crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, gu_q2)
+        let dn_q2_fit = l
+            .experts
+            .first()
+            .is_some_and(|e| e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
+        let room = crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, gu_q2, dn_q2_fit)
             .saturating_sub(1);
         for (gi, e) in l.experts.iter().enumerate() {
             if l.mask.as_deref().is_some_and(|m| !m.get(gi).copied().unwrap_or(true)) {
@@ -6660,6 +6678,9 @@ pub struct DsparkPack {
     /// Gate/up requantized to q2tp at upload (the binary registered an
     /// encoder); the graph then dispatches the q2tp kernels.
     pub gu_q2: bool,
+    /// The down planes too (native in the file, never requantized at
+    /// upload); the graph dispatches the 2-bit down kernel.
+    pub dn_q2: bool,
     /// Dequantized router and bias per stage, f32 — address-stable for the
     /// life of the pack, which is what the device's const cache needs.
     pub routers: Vec<Vec<f32>>,
@@ -6726,7 +6747,10 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
                 e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
             });
             let gu_q2 = native_q2 || DSPARK_Q2TP_ENCODE.get().is_some();
-            let room = crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, gu_q2);
+            let dn_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
+                e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
+            });
+            let room = crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, gu_q2, dn_q2);
             (room.saturating_sub(mtp.len() + 1) / mtp.len().max(1)).clamp(8, 64)
         });
     // Frequency tallies: lines of `stage<TAB>expert<TAB>count`.
@@ -6847,9 +6871,14 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
         e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
     });
     let gu_q2 = native_q2 || crate::dsv4::DSPARK_Q2TP_ENCODE.get().is_some();
+    let dn_native = mtp[0].layer.experts.first().is_some_and(|e| {
+        e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
+    });
     for (si, sp) in stages.iter().enumerate() {
         let ok = if native_q2 {
-            crate::gpu_wgpu::dsv4_experts_ready(&model, &sp.tensors, cfg.moe_inter, cfg.dim, true)
+            crate::gpu_wgpu::dsv4_experts_ready(
+                &model, &sp.tensors, cfg.moe_inter, cfg.dim, true, dn_native,
+            )
         } else if gu_q2 {
             crate::gpu_wgpu::moe_expert_bufs_requant_gu(
                 &model,
@@ -6859,7 +6888,9 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
             )
             .is_some()
         } else {
-            crate::gpu_wgpu::dsv4_experts_ready(&model, &sp.tensors, cfg.moe_inter, cfg.dim, false)
+            crate::gpu_wgpu::dsv4_experts_ready(
+                &model, &sp.tensors, cfg.moe_inter, cfg.dim, false, false,
+            )
         };
         if !ok {
             eprintln!(
@@ -6878,6 +6909,7 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
     Some(DsparkPack {
         stages,
         gu_q2,
+        dn_q2: dn_native,
         routers,
         biases,
     })
@@ -7008,6 +7040,7 @@ pub fn dspark_draft_gpu(
         swiglu_limit: cfg.swiglu_limit,
         scale: (cfg.head_dim as f32).powf(-0.5),
         gu_q2: pack.gu_q2,
+        dn_q2: pack.dn_q2,
     };
     // ── seed states: the real token, then noise, replicated over copies ──
     let ids: Vec<u32> = (0..block)

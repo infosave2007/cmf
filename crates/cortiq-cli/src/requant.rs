@@ -34,6 +34,12 @@ enum Mode {
     FullQ4tp,
     /// Draft-only expert inputs to the 2-bit grid.
     DraftQ2tp,
+    /// The draft's whole expert bodies — inputs AND the down plane. Still
+    /// draft-only for the grid, but EXPERIMENTAL and measured harmful: on
+    /// the release the drafts collapsed to 13% acceptance and the host
+    /// q2 path corrupts on down-shaped tensors — do not run this against
+    /// a file you cannot re-download until both are resolved.
+    DraftQ2tpFull,
 }
 
 /// Which dtypes this mode recodes, and into what.
@@ -55,6 +61,19 @@ fn target_dtype(mode: &Mode, name: &str, src: TensorDtype, shape: &[usize]) -> O
         {
             Some(TensorDtype::Q2TiledP)
         }
+        // …and with the down plane too, for the residency the 2-bit body
+        // buys. Same scope: `.mtp.` only, the trunk never qualifies.
+        Mode::DraftQ2tpFull
+            if two_d
+                && src == TensorDtype::Q4TiledP
+                && name.contains(".mtp.")
+                && (q2tp_expert_gate_or_up(name)
+                    || ((name.contains(".experts.") || name.contains(".shared_experts.")
+                        || name.contains(".shared_expert."))
+                        && name.ends_with(".w2.weight"))) =>
+        {
+            Some(TensorDtype::Q2TiledP)
+        }
         _ => None,
     }
 }
@@ -67,6 +86,8 @@ pub fn cmd_requant(
 ) -> anyhow::Result<()> {
     let mode = if quant == "q2tp-draft" {
         Mode::DraftQ2tp
+    } else if quant == "q2tp-draft-full" {
+        Mode::DraftQ2tpFull
     } else if matches!(parse_quant(quant)?, Quant::Q4TiledP) {
         Mode::FullQ4tp
     } else {
