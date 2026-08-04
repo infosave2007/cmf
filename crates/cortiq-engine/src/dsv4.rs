@@ -4172,7 +4172,14 @@ fn forward_chunk_batched(
             "карта ещё не владеет состоянием"
         } else if st.dev_set.len() != layers.len() {
             "набор слоёв ещё не зафиксирован"
-        } else if gpu_end == 0 || st.dev_set[gpu_end..].iter().any(|&on| on) {
+        } else if gpu_end == 0
+            || st.dev_set[gpu_end.min(st.dev_set.len())..]
+                .iter()
+                .enumerate()
+                .any(|(i, &on)| {
+                    on && !st.partial_set.get(gpu_end + i).copied().unwrap_or(false)
+                })
+        {
             "слои на карте не образуют префикс"
         } else {
             ""
@@ -4602,12 +4609,21 @@ pub fn dsv4_verify_chunk(
                 .is_none_or(|p| p.globals.len() < cfg.n_routed_experts)
         })
         .unwrap_or(st.dev_set.len());
+    // A PARTIAL layer past the prefix is fine: it walks in the host tail
+    // like any host layer. Only a FULL device layer out there means the
+    // prefix assumption is really broken.
+    let full_beyond = st.dev_set[gpu_end.min(st.dev_set.len())..]
+        .iter()
+        .enumerate()
+        .any(|(i, &on)| {
+            on && !st.partial_set.get(gpu_end + i).copied().unwrap_or(false)
+        });
     if b < 2
         || !chain_enabled()
         || !st.dev_owned
         || st.dev_set.len() != layers.len()
         || gpu_end == 0
-        || st.dev_set[gpu_end..].iter().any(|&on| on)
+        || full_beyond
     {
         return None;
     }
