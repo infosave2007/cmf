@@ -342,12 +342,16 @@ enum Commands {
     Requant {
         /// Source .cmf model
         model: String,
-        /// Output .cmf path
+        /// Output .cmf path (omit with --in-place)
         #[arg(long)]
-        output: String,
-        /// Target layout (currently: q4tp)
+        output: Option<String>,
+        /// Target layout: q4tp, or q2tp-draft (MTP draft expert inputs)
         #[arg(long, default_value = "q4tp")]
         quant: String,
+        /// Rewrite tensors inside the source file itself — for disks that
+        /// cannot hold the model twice. New payloads must fit their slots.
+        #[arg(long, default_value_t = false)]
+        in_place: bool,
     },
     /// Bake a task's expert restriction as a switchable task mask
     /// (spec §5 expert fields): the full expert set stays, `run --task`
@@ -1062,7 +1066,8 @@ async fn main() -> anyhow::Result<()> {
             model,
             output,
             quant,
-        } => requant::cmd_requant(&model, &output, &quant),
+            in_place,
+        } => requant::cmd_requant(&model, output.as_deref(), &quant, in_place),
         Commands::MoeMask {
             model,
             stats,

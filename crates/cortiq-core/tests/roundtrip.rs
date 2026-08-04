@@ -798,3 +798,63 @@ fn stream_writer_resumes_from_its_manifest_after_a_crash() {
         );
     }
 }
+
+// ───────────────────── in-place recode surgery ─────────────────────
+
+/// `recode_entries_in_place` must shrink a tensor inside its slot, leave
+/// every other byte alone, keep the neighbours addressable, and keep
+/// `verify()` clean (entry hash and directory hash both recomputed).
+#[test]
+fn recode_in_place_shrinks_within_slot_and_stays_verifiable() {
+    let dir = tempdir();
+    let path = dir.join("recode.cmf");
+
+    let a: Vec<f32> = (0..32).map(|i| i as f32 * 0.25 - 4.0).collect();
+    let b: Vec<f32> = (0..32).map(|i| (i as f32).sin()).collect();
+    let c: Vec<f32> = (0..32).map(|i| 1.0 / (i as f32 + 1.0)).collect();
+    let spec = |name: &str, v: &[f32]| TensorSpec {
+        name: name.into(),
+        dtype: TensorDtype::F32,
+        shape: vec![4, 8],
+        data: v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+    };
+    let tensors = vec![spec("keep.before", &a), spec("model.mtp.0.x", &b), spec("keep.after", &c)];
+    CmfModel::write(&path, &tiny_header(), &tensors, None, None).unwrap();
+
+    // Recode the middle tensor F32 → F16: half the bytes, same shape, a
+    // dtype the loader's nbytes check knows how to validate.
+    let halves: Vec<u8> = b.iter().flat_map(|&x| f32_to_f16(x).to_le_bytes()).collect();
+    let bi = {
+        let m = CmfModel::open(&path).unwrap();
+        m.tensors.iter().position(|t| t.name == "model.mtp.0.x").unwrap()
+    };
+    CmfModel::recode_entries_in_place(
+        path.to_str().unwrap(),
+        &[(bi, TensorDtype::F16, halves.clone())],
+    )
+    .unwrap();
+
+    let m = CmfModel::open(&path).unwrap();
+    assert!(m.verify().is_empty(), "recoded file failed verify(): {:?}", m.verify());
+    let e = &m.tensors[bi];
+    assert_eq!(e.dtype, TensorDtype::F16);
+    assert_eq!(e.nbytes, halves.len() as u64);
+    assert_eq!(m.entry_bytes(e), &halves[..], "patched payload differs");
+    assert_eq!(m.tensor_bytes("keep.before").unwrap(), &tensors[0].data[..]);
+    assert_eq!(m.tensor_bytes("keep.after").unwrap(), &tensors[2].data[..]);
+    // The dequantized values must round-trip through the f16 grid.
+    for (i, &x) in b.iter().enumerate() {
+        let got = f16_to_f32(u16::from_le_bytes([halves[2 * i], halves[2 * i + 1]]));
+        assert!((got - x).abs() <= 1e-3, "value {i}: {got} vs {x}");
+    }
+
+    // An oversized payload must be refused before anything is written.
+    let too_big = vec![0u8; 4 * 32 + 1];
+    let err = CmfModel::recode_entries_in_place(
+        path.to_str().unwrap(),
+        &[(0, TensorDtype::F32, too_big)],
+    );
+    assert!(err.is_err(), "oversized recode was accepted");
+    let m2 = CmfModel::open(&path).unwrap();
+    assert!(m2.verify().is_empty(), "refused recode still dirtied the file");
+}

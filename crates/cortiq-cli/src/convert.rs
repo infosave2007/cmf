@@ -3915,7 +3915,7 @@ pub fn run_convert(
 /// Trunk names are canonicalized to gate/up_proj; DeepSeek-V4's MTP stack
 /// deliberately keeps its upstream ffn.w1/w3 schema, so both are part of
 /// the same q2tp profile.
-fn q2tp_expert_gate_or_up(name: &str) -> bool {
+pub(crate) fn q2tp_expert_gate_or_up(name: &str) -> bool {
     let expert = name.contains(".experts.")
         || name.contains(".shared_expert.")
         || name.contains(".shared_experts.");
