@@ -2501,6 +2501,11 @@ fn dsv4_partial_layer(
             return None;
         }
     }
+    // The draft's ring owes an entry for this position like every other
+    // walked layer — this path skipping the note was why any partial-last-
+    // layer configuration drafted blind (acceptance 0%): the capture layer
+    // fell exactly here.
+    dspark_note(li, state, cfg);
     Some(true)
 }
 
