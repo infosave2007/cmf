@@ -2046,7 +2046,7 @@ fn dsv4_layer_loop(
             dspark_note(*run.last().unwrap(), state, cfg);
         }
         run.clear();
-        if partial_dev[li] {
+        if partial_dev[li] && partial_walk_on() {
             // Attention and the resident expert subset stay on the card. The
             // router still sees every expert and returns only the winners
             // that did not fit; those are completed on the CPU and their
@@ -2501,11 +2501,10 @@ fn dsv4_partial_layer(
             return None;
         }
     }
-    // The draft's ring owes an entry for this position like every other
-    // walked layer — this path skipping the note was why any partial-last-
-    // layer configuration drafted blind (acceptance 0%): the capture layer
-    // fell exactly here.
-    dspark_note(li, state, cfg);
+    // NB: the CALLER notes this layer for the draft's ring — a note here
+    // as well double-counts the capture and fails `dspark_take`'s
+    // completeness check (seen 4 of 3, measured), which reads exactly like
+    // the starvation it was meant to fix.
     Some(true)
 }
 
@@ -2526,6 +2525,18 @@ fn chain_max() -> usize {
 /// `CMF_DSV4_HOST_CPU_MOE=1`: a layer that fell off the card runs its MoE on
 /// the host WITHOUT the per-op device route — one fence a token instead of
 /// one a matvec. Whether that wins is a measurement.
+/// `CMF_DSV4_PARTIAL_WALK=1`: the fused device walk of a partial layer.
+/// OFF until its self-poisoning is repaired: its attention frame reads the
+/// pooled slots its own MoE frame rewrote on the previous token, so every
+/// token after the first attends over leftovers — the drafts it captures
+/// от такого состояния never match the verify (acceptance 0, measured).
+/// The host branch walks these layers correctly; the pack stays resident
+/// for the verify tail.
+fn partial_walk_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_PARTIAL_WALK").is_ok_and(|v| v != "0"))
+}
+
 fn host_cpu_moe() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CMF_DSV4_HOST_CPU_MOE").is_ok_and(|v| v != "0"))
@@ -6647,6 +6658,9 @@ pub fn dspark_note(li: usize, state: &[f32], cfg: &Dsv4Cfg) {
             // target as the signal would hand the draft a buffer whose other
             // slots still hold the previous token, or nothing at all.
             *seen = if slot == 0 { 1 } else { *seen + 1 };
+            if std::env::var("CMF_DSPARK_CAP_DBG").is_ok() {
+                eprintln!("[cap] note li={li} slot={slot} seen={}", *seen);
+            }
         }
     });
 }
@@ -6672,6 +6686,9 @@ pub fn dspark_take(out: &mut Vec<f32>) -> bool {
     DSPARK_CAP.with(|c| {
         let mut c = c.borrow_mut();
         if c.0.is_empty() || c.2 != c.0.len() {
+            if std::env::var("CMF_DSPARK_CAP_DBG").is_ok() {
+                eprintln!("[cap] take FAIL armed={:?} seen={}", c.0, c.2);
+            }
             return false;
         }
         out.clear();
