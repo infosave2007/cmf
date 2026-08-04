@@ -462,6 +462,16 @@ enum Commands {
         /// Greedy decoding (temperature 0) — gates and base models
         #[arg(long)]
         greedy: bool,
+        /// Sampling temperature (default 0.7; ignored with --greedy)
+        #[arg(long, conflicts_with = "greedy")]
+        temperature: Option<f32>,
+        /// Repetition penalty (default 1.1; 1.0 disables — better for code,
+        /// where repeated identifiers are the point, not a defect)
+        #[arg(long, conflicts_with = "greedy")]
+        rep_penalty: Option<f32>,
+        /// Fixed RNG seed for reproducible sampling
+        #[arg(long)]
+        seed: Option<u64>,
         /// Skip the model's chat template: feed the prompt to the model
         /// verbatim (completion mode). Default is to apply the template
         /// when the file carries one; base models without one always run raw.
@@ -1116,6 +1126,9 @@ async fn main() -> anyhow::Result<()> {
             max_tokens,
             skill,
             greedy,
+            temperature,
+            rep_penalty,
+            seed,
             raw,
             no_think,
             blend,
@@ -1143,6 +1156,9 @@ async fn main() -> anyhow::Result<()> {
                 max_tokens,
                 skill.as_deref(),
                 greedy,
+                temperature,
+                rep_penalty,
+                seed,
                 raw,
                 no_think,
                 blend.as_deref(),
@@ -2321,6 +2337,9 @@ async fn cmd_run(
     max_tokens: usize,
     skill: Option<&str>,
     greedy: bool,
+    temperature: Option<f32>,
+    rep_penalty: Option<f32>,
+    seed: Option<u64>,
     raw: bool,
     no_think: bool,
     blend: Option<&str>,
@@ -2388,6 +2407,15 @@ async fn cmd_run(
     if greedy {
         sampler.temperature = 0.0;
         sampler.repetition_penalty = 1.0;
+    }
+    if let Some(t) = temperature {
+        sampler.temperature = t;
+    }
+    if let Some(r) = rep_penalty {
+        sampler.repetition_penalty = r;
+    }
+    if let Some(s) = seed {
+        sampler.seed = Some(s);
     }
     if let Some(s) = resume_seed {
         sampler.seed = Some(s); // deterministic continuation of the frozen session
