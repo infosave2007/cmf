@@ -4556,10 +4556,49 @@ fn host_tail_walk_batch(
                 .copy_from_slice(&states[t * hc * dim..(t + 1) * hc * dim]);
         }
         let t_moe = std::time::Instant::now();
-        if host_cpu_moe() {
-            crate::gpu::cpu_scope(|| moe_step_block(&folds, b, l, cfg, ids, li, pool, &mut mo));
-        } else {
-            moe_step_block(&folds, b, l, cfg, ids, li, pool, &mut mo);
+        // `CMF_DSV4_TAIL_PACK=1`: a tail layer with a device expert pack
+        // (partial or full) runs its hot winners on the card per token and
+        // completes the cold ones on the host — the same exact split the
+        // partial walk uses. Off by default until its economics are
+        // measured against the batched host block.
+        let tail_pack = {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                std::env::var("CMF_DSV4_TAIL_PACK").is_ok_and(|v| v != "0")
+            })
+        };
+        let mut packed_done = false;
+        if tail_pack && pack_for(l, cfg, li).is_some() {
+            packed_done = true;
+            for t in 0..b {
+                let f = &folds[t * dim..(t + 1) * dim];
+                let forced = l.tid2eid.as_ref().map(|tbl| {
+                    hash_route(tbl, cfg.vocab, cfg.top_k, ids.get(t).copied().unwrap_or(0))
+                });
+                let o = &mut mo[t * dim..(t + 1) * dim];
+                match moe_frame(f, l, cfg, li, &[], forced.as_deref(), pool, None, None, o) {
+                    Some((cold_sum, n)) => {
+                        if n > 0 {
+                            for (od, cd) in o.iter_mut().zip(cold_sum.iter()) {
+                                *od += cd;
+                            }
+                        }
+                    }
+                    None => {
+                        packed_done = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !packed_done {
+            if host_cpu_moe() {
+                crate::gpu::cpu_scope(|| {
+                    moe_step_block(&folds, b, l, cfg, ids, li, pool, &mut mo)
+                });
+            } else {
+                moe_step_block(&folds, b, l, cfg, ids, li, pool, &mut mo);
+            }
         }
         let t_exp = std::time::Instant::now();
         for t in 0..b {
