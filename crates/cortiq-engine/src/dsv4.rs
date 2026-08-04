@@ -4235,6 +4235,11 @@ pub struct Dsv4SpecTxn {
     dev_n_comp: Vec<usize>,
     dev_n_ix: Vec<usize>,
     host: Vec<(usize, HostLayerSnap)>,
+    /// Per host layer, per verified token: the layer's state right after
+    /// that token's attention — what a rollback restores INSTEAD of
+    /// re-walking the tail it already walked (the values are identical;
+    /// only the side effects were ever needed).
+    host_steps: Vec<(usize, Vec<HostLayerSnap>)>,
     /// Every token's hyper-connection state as it left the device prefix,
     /// BEFORE the host tail walked (and mutated) anything: the rewalk's
     /// input, and the head's.
@@ -4367,6 +4372,7 @@ fn host_tail_walk_batch(
     inv_freq: &[f32],
     scratch: &mut HcScratch,
     pool: Option<&crate::pool::Pool>,
+    mut steps: Option<&mut Vec<(usize, Vec<HostLayerSnap>)>>,
 ) {
     let (hc, dim) = (cfg.hc_mult, cfg.dim);
     let mix_hc = (2 + hc) * hc;
@@ -4401,6 +4407,12 @@ fn host_tail_walk_batch(
                 pool,
                 |f, o| attention_step(f, l, cfg, st, li, freqs, pool, None, o),
             );
+            if let Some(steps) = steps.as_mut() {
+                match steps.iter_mut().find(|(l, _)| *l == li) {
+                    Some((_, v)) => v.push(host_snap(st, li)),
+                    None => steps.push((li, vec![host_snap(st, li)])),
+                }
+            }
         }
         let t_glue = std::time::Instant::now();
         for t in 0..b {
@@ -4519,6 +4531,7 @@ pub fn dsv4_verify_chunk(
             .map(|li| (li, host_snap(st, li)))
             .collect(),
         states: Vec::new(),
+        host_steps: Vec::new(),
         shadow: Some(shadow),
     };
     // The capture targets that live on the device: photograph their states.
@@ -4599,9 +4612,12 @@ pub fn dsv4_verify_chunk(
     logits_out.clear();
     logits_out.resize(b * cfg.vocab, 0.0);
     let mut head_in = vec![0.0f32; b * dim];
+    let mut host_steps: Vec<(usize, Vec<HostLayerSnap>)> = Vec::new();
     host_tail_walk_batch(
         g, layers, cfg, st, gpu_end, &mut states, ids, pos0, b, inv_freq, &mut scratch, pool,
+        Some(&mut host_steps),
     );
+    txn.host_steps = host_steps;
     for t in 0..b {
         let state = &states[t * hc * dim..(t + 1) * hc * dim];
         let h = &mut head_in[t * dim..(t + 1) * dim];
@@ -4815,16 +4831,24 @@ pub fn dsv4_spec_finish(
         st.dev_n_ix[li] = txn.dev_n_ix[li] + ai;
         note_compressed(st.kv_id, li, st.dev_n_comp[li]);
     }
-    // ── host tail: restore the snapshot and re-walk the accepted tokens ──
-    for (li, snap) in &txn.host {
-        host_restore(st, *li, snap);
+    // ── host tail: the verify pass already walked these tokens; restore
+    //    the per-token snapshot it took instead of walking them again. ──
+    if k >= 1 && txn.host_steps.iter().all(|(_, v)| v.len() >= k) && !txn.host_steps.is_empty()
+    {
+        for (li, v) in &txn.host_steps {
+            host_restore(st, *li, &v[k - 1]);
+        }
+    } else {
+        for (li, snap) in &txn.host {
+            host_restore(st, *li, snap);
+        }
+        let mut scratch = HcScratch::new(cfg);
+        let mut states = txn.states.clone();
+        host_tail_walk_batch(
+            g, layers, cfg, st, txn.gpu_end, &mut states[..k * hc * dim], ids, txn.pos0, k,
+            inv_freq, &mut scratch, pool, None,
+        );
     }
-    let mut scratch = HcScratch::new(cfg);
-    let mut states = txn.states.clone();
-    host_tail_walk_batch(
-        g, layers, cfg, st, txn.gpu_end, &mut states[..k * hc * dim], ids, txn.pos0, k,
-        inv_freq, &mut scratch, pool,
-    );
     st.pos = txn.pos0 + k;
     true
 }
