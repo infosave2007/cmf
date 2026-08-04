@@ -4531,6 +4531,233 @@ fn moe_down_q4tp_b(@builtin(workgroup_id) wid: vec3<u32>,
     if (lid == 0u) { db_y[t * rows + row] = db_pt[0]; }
 }
 
+// The down-projection split for parallelism: one workgroup per
+// (row, slot, token) writes its weighted partial, a second dispatch sums
+// the slots in ascending order. The single-dispatch kernel above gives
+// each (row, token) all nine slots and stalls on latency — measured 0.71
+// ms of the layer against gate/up's 0.22 for the same bytes. Round-off
+// class: the partial's reduction tree differs from the fused loop's.
+@compute @workgroup_size(64)
+fn moe_down_q4tp_part(@builtin(workgroup_id) wid: vec3<u32>,
+                      @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let slot = wid.y;
+    let t = wid.z;
+    let gpr = db_p.gpr;
+    let rows = db_p.hidden;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let sb = t * db_p.slots;
+    let ab = t * db_p.slots * gpr * 32u;
+    let base16 = db_sel[sb + slot] * db_p.mat16;
+    let par16 = base16 + rows * gpr * 8u + row * 2u;
+    let pl = unpack2x16float(db_u16(par16) | (db_u16(par16 + 1u) << 16u));
+    let cod8 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + row * cst;
+    var acc = 0.0;
+    for (var g = lid; g < gpr; g = g + 64u) {
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        var cv = db_u8(cod8 + cb);
+        if (shf > 3u) { cv = cv | (db_u8(cod8 + cb + 1u) << 8u); }
+        let scale = exp2(pl.x + f32((cv >> shf) & 31u) * pl.y);
+        let t16 = base16 + (row * gpr + g) * 8u;
+        let xb = ab + (slot * gpr + g) * 32u;
+        var d = 0.0;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            let w = db_u16(t16 + 2u * k) | (db_u16(t16 + 1u + 2u * k) << 16u);
+            d = d + db_dot8(w, xb + 8u * k);
+        }
+        acc = acc + scale * d;
+    }
+    db_pt[lid] = acc;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { db_pt[lid] = db_pt[lid] + db_pt[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) {
+        db_y[(t * db_p.slots + slot) * rows + row] = db_wt[sb + slot] * db_pt[0];
+    }
+}
+
+// …and the slot sum, one thread per (row, token), slots ascending.
+@group(0) @binding(0) var<storage, read>       dr_part : array<f32>;
+@group(0) @binding(1) var<storage, read_write> dr_y    : array<f32>;
+@group(0) @binding(2) var<uniform>             dr_p    : MoeDnBP;
+@compute @workgroup_size(256)
+fn moe_down_q4tp_red(@builtin(workgroup_id) wid: vec3<u32>,
+                     @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x * 256u + lid;
+    let t = wid.y;
+    if (row >= dr_p.hidden) { return; }
+    var acc = 0.0;
+    for (var s = 0u; s < dr_p.slots; s = s + 1u) {
+        acc = acc + dr_part[(t * dr_p.slots + s) * dr_p.hidden + row];
+    }
+    dr_y[t * dr_p.hidden + row] = acc;
+}
+
+// Four rows per workgroup: the x span is loaded once per thread and
+// feeds four weight tiles, cutting the L2 activation traffic that limits
+// the one-row kernel four-fold. Each row's accumulation order equals the
+// one-row kernel's, so per-row sums are bit-identical.
+@compute @workgroup_size(64)
+fn moe_down_q4tp_b4(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_index) lid: u32) {
+    let row0 = wid.x * 4u;
+    let t = wid.y;
+    let gpr = db_p.gpr;
+    let rows = db_p.hidden;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let sb = t * db_p.slots;
+    let ab = t * db_p.slots * gpr * 32u;
+    let total = db_p.slots * gpr;
+    var cur = 0xFFFFFFFFu;
+    var base16 = 0u;
+    var codb = 0u;
+    var sw = 0.0;
+    var pl = vec2<f32>(0.0, 0.0);
+    var pl1 = vec2<f32>(0.0, 0.0);
+    var pl2 = vec2<f32>(0.0, 0.0);
+    var pl3 = vec2<f32>(0.0, 0.0);
+    var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
+    for (var i = lid; i < total; i = i + 64u) {
+        let slot = i / gpr;
+        let g = i % gpr;
+        if (slot != cur) {
+            cur = slot;
+            base16 = db_sel[sb + slot] * db_p.mat16;
+            let par16 = base16 + rows * gpr * 8u + row0 * 2u;
+            pl = unpack2x16float(db_u16(par16) | (db_u16(par16 + 1u) << 16u));
+            pl1 = unpack2x16float(db_u16(par16 + 2u) | (db_u16(par16 + 3u) << 16u));
+            pl2 = unpack2x16float(db_u16(par16 + 4u) | (db_u16(par16 + 5u) << 16u));
+            pl3 = unpack2x16float(db_u16(par16 + 6u) | (db_u16(par16 + 7u) << 16u));
+            codb = (base16 + rows * gpr * 8u + rows * 2u) * 2u;
+            sw = db_wt[sb + slot];
+        }
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        let xb = ab + (slot * gpr + g) * 32u;
+        // The x span once, into registers all four rows read.
+        var xs: array<f32, 32>;
+        for (var j = 0u; j < 32u; j = j + 1u) { xs[j] = db_act[xb + j]; }
+        for (var r = 0u; r < 4u; r = r + 1u) {
+            let row = row0 + r;
+            if (row >= rows) { break; }
+            let cod8 = codb + row * cst;
+            var cv = db_u8(cod8 + cb);
+            if (shf > 3u) { cv = cv | (db_u8(cod8 + cb + 1u) << 8u); }
+            var plr = pl;
+            if (r == 1u) { plr = pl1; }
+            if (r == 2u) { plr = pl2; }
+            if (r == 3u) { plr = pl3; }
+            let scale = exp2(plr.x + f32((cv >> shf) & 31u) * plr.y);
+            let w32 = (base16 + (row * gpr + g) * 8u) >> 1u;
+            var d = 0.0;
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                let w = db_w[w32 + k];
+                let x8 = 8u * k;
+                d = d + (f32(w & 0xFu) - 8.0) * xs[x8]
+                      + (f32((w >> 4u) & 0xFu) - 8.0) * xs[x8 + 1u]
+                      + (f32((w >> 8u) & 0xFu) - 8.0) * xs[x8 + 2u]
+                      + (f32((w >> 12u) & 0xFu) - 8.0) * xs[x8 + 3u]
+                      + (f32((w >> 16u) & 0xFu) - 8.0) * xs[x8 + 4u]
+                      + (f32((w >> 20u) & 0xFu) - 8.0) * xs[x8 + 5u]
+                      + (f32((w >> 24u) & 0xFu) - 8.0) * xs[x8 + 6u]
+                      + (f32((w >> 28u) & 0xFu) - 8.0) * xs[x8 + 7u];
+            }
+            let v = sw * scale * d;
+            if (r == 0u) { a0 = a0 + v; }
+            if (r == 1u) { a1 = a1 + v; }
+            if (r == 2u) { a2 = a2 + v; }
+            if (r == 3u) { a3 = a3 + v; }
+        }
+    }
+    // Four reductions through the same shared tree, one row at a time —
+    // the tree per row equals the one-row kernel's.
+    for (var r = 0u; r < 4u; r = r + 1u) {
+        var acc = a0;
+        if (r == 1u) { acc = a1; }
+        if (r == 2u) { acc = a2; }
+        if (r == 3u) { acc = a3; }
+        db_pt[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid < stride) { db_pt[lid] = db_pt[lid] + db_pt[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lid == 0u && row0 + r < rows) { db_y[t * rows + row0 + r] = db_pt[0]; }
+        workgroupBarrier();
+    }
+}
+
+// The same weighted down-projection with the loads it always meant: the
+// tile's four u32 words read directly (the u16 pair OR-ed together above
+// is two loads of ONE word — legal only because the tile base is even,
+// which the host checks), and the slot's params fetched once per slot
+// instead of once per group. The per-thread accumulation order is the
+// original loop's, so the sum is bit-identical.
+@compute @workgroup_size(64)
+fn moe_down_q4tp_b2(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    let t = wid.y;
+    let gpr = db_p.gpr;
+    let rows = db_p.hidden;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let sb = t * db_p.slots;
+    let ab = t * db_p.slots * gpr * 32u;
+    let total = db_p.slots * gpr;
+    var cur = 0xFFFFFFFFu;
+    var base16 = 0u;
+    var cod8 = 0u;
+    var sw = 0.0;
+    var pl = vec2<f32>(0.0, 0.0);
+    var acc = 0.0;
+    for (var i = lid; i < total; i = i + 64u) {
+        let slot = i / gpr;
+        let g = i % gpr;
+        if (slot != cur) {
+            cur = slot;
+            base16 = db_sel[sb + slot] * db_p.mat16;
+            let par16 = base16 + rows * gpr * 8u + row * 2u;
+            pl = unpack2x16float(db_u16(par16) | (db_u16(par16 + 1u) << 16u));
+            cod8 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + row * cst;
+            sw = db_wt[sb + slot];
+        }
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        var cv = db_u8(cod8 + cb);
+        if (shf > 3u) { cv = cv | (db_u8(cod8 + cb + 1u) << 8u); }
+        let scale = exp2(pl.x + f32((cv >> shf) & 31u) * pl.y);
+        let w32 = (base16 + (row * gpr + g) * 8u) >> 1u;
+        let xb = ab + (slot * gpr + g) * 32u;
+        var d = 0.0;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            d = d + db_dot8(db_w[w32 + k], xb + 8u * k);
+        }
+        acc = acc + sw * scale * d;
+    }
+    db_pt[lid] = acc;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { db_pt[lid] = db_pt[lid] + db_pt[lid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) { db_y[t * rows + row] = db_pt[0]; }
+}
+
 
 // ── O(1) Nystrom attention on the graph (spec: nystrom.rs step/far_insert).
 // State lives on the device after one upload per seal epoch: ring window,
@@ -7770,6 +7997,10 @@ struct Ctx {
     moe_select_b: wgpu::ComputePipeline,
     moe_gate_up_q4tp_b: wgpu::ComputePipeline,
     moe_down_q4tp_b: wgpu::ComputePipeline,
+    moe_down_q4tp_b2: wgpu::ComputePipeline,
+    moe_down_q4tp_part: wgpu::ComputePipeline,
+    moe_down_q4tp_b4: wgpu::ComputePipeline,
+    moe_down_q4tp_red: wgpu::ComputePipeline,
     layout_moe_sel_b: wgpu::BindGroupLayout,
     layout_moe_gu_b: wgpu::BindGroupLayout,
     layout_moe_dn_b: wgpu::BindGroupLayout,
@@ -8364,6 +8595,10 @@ fn init() -> Result<Ctx, String> {
     let moe_select_b = pipe("moe_select_b");
     let moe_gate_up_q4tp_b = pipe("moe_gate_up_q4tp_b");
     let moe_down_q4tp_b = pipe("moe_down_q4tp_b");
+    let moe_down_q4tp_b2 = pipe("moe_down_q4tp_b2");
+    let moe_down_q4tp_part = pipe("moe_down_q4tp_part");
+    let moe_down_q4tp_b4 = pipe("moe_down_q4tp_b4");
+    let moe_down_q4tp_red = pipe("moe_down_q4tp_red");
     let layout_moe_sel_b = moe_select_b.get_bind_group_layout(0);
     let layout_moe_gu_b = moe_gate_up_q4tp_b.get_bind_group_layout(0);
     let layout_moe_dn_b = moe_down_q4tp_b.get_bind_group_layout(0);
@@ -8572,6 +8807,10 @@ fn init() -> Result<Ctx, String> {
         moe_select_b,
         moe_gate_up_q4tp_b,
         moe_down_q4tp_b,
+        moe_down_q4tp_b2,
+        moe_down_q4tp_part,
+        moe_down_q4tp_b4,
+        moe_down_q4tp_red,
         layout_moe_sel_b,
         layout_moe_gu_b,
         layout_moe_dn_b,
@@ -20465,6 +20704,21 @@ fn bt_hc_split() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_DSV4_BT_HCSPLIT").map(|v| v != "0").unwrap_or(true))
 }
 
+/// `CMF_DSV4_DN=b|b2|split|b4` picks the batch frame's down-projection
+/// kernel. b4 (default) gives each workgroup four rows so the x span
+/// loads once for four weight tiles — the one-row kernel is L2-bound on
+/// exactly that traffic. split keeps per-slot partials + an ascending
+/// sum (round-off class); b/b2 are the one-row originals for a bisect.
+fn bt_dn_mode() -> u8 {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("CMF_DSV4_DN").as_deref() {
+        Ok("b") => 0,
+        Ok("b2") => 1,
+        Ok("split") => 2,
+        _ => 3,
+    })
+}
+
 /// Whether the batch uses the token-axis frame (default) or the historical
 /// one-frame-per-token encoding (`CMF_DSV4_BT=0`, kept for a bisect).
 fn bt_frame_on() -> bool {
@@ -22484,24 +22738,90 @@ fn dsv4_layer_frame_bt_enc(
             bt_ts(13);
             pass = begin_pass(enc);
         }
-        let bind = cached_bind(c, bk(220), || {
-            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &c.moe_down_q4tp_b.get_bind_group_layout(0),
-                entries: &[
-                    bind_buf(0, &down_all),
-                    bind_buf(1, &mact_bt),
-                    bind_buf(2, &msel_bt),
-                    bind_buf(3, &mwt_bt),
-                    bind_buf(4, &mo_bt),
-                    bind_buf(5, &dn_u),
-                ],
-            })
-        });
-        if !dsv4_skip("dn") && !dsv4_skip("moe") {
-            pass.set_pipeline(&c.moe_down_q4tp_b);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups(m.hidden as u32, batch as u32, 1);
+        if bt_dn_mode() == 3 {
+            let bind = cached_bind(c, bk(248), || {
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.moe_down_q4tp_b4.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &down_all),
+                        bind_buf(1, &mact_bt),
+                        bind_buf(2, &msel_bt),
+                        bind_buf(3, &mwt_bt),
+                        bind_buf(4, &mo_bt),
+                        bind_buf(5, &dn_u),
+                    ],
+                })
+            });
+            if !dsv4_skip("dn") && !dsv4_skip("moe") {
+                pass.set_pipeline(&c.moe_down_q4tp_b4);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups((m.hidden as u32).div_ceil(4), batch as u32, 1);
+            }
+        } else if bt_dn_mode() == 2 {
+            // Per-slot partials, then the ascending-slot sum.
+            let dpart = frame_buf_t(c, BT_DSPARK_KV, 30, batch * slots * m.hidden * 4, false);
+            let bindp = cached_bind(c, bk(246), || {
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.moe_down_q4tp_part.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &down_all),
+                        bind_buf(1, &mact_bt),
+                        bind_buf(2, &msel_bt),
+                        bind_buf(3, &mwt_bt),
+                        bind_buf(4, &dpart),
+                        bind_buf(5, &dn_u),
+                    ],
+                })
+            });
+            let bindr = cached_bind(c, bk(247), || {
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &c.moe_down_q4tp_red.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &dpart),
+                        bind_buf(1, &mo_bt),
+                        bind_buf(2, &dn_u),
+                    ],
+                })
+            });
+            if !dsv4_skip("dn") && !dsv4_skip("moe") {
+                pass.set_pipeline(&c.moe_down_q4tp_part);
+                pass.set_bind_group(0, &bindp, &[]);
+                pass.dispatch_workgroups(m.hidden as u32, slots as u32, batch as u32);
+                pass.set_pipeline(&c.moe_down_q4tp_red);
+                pass.set_bind_group(0, &bindr, &[]);
+                pass.dispatch_workgroups((m.hidden as u32).div_ceil(256), batch as u32, 1);
+            }
+        } else {
+            // The direct-load twin needs an even u16 stride so a tile's four
+            // words ARE four words; every published layout satisfies it, the
+            // check keeps an exotic one honest.
+            let p_dn = if bt_dn_mode() == 1 && stride16(m.hidden, m.inter, false) % 2 == 0 {
+                &c.moe_down_q4tp_b2
+            } else {
+                &c.moe_down_q4tp_b
+            };
+            let bind = cached_bind(c, bk(220), || {
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &p_dn.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, &down_all),
+                        bind_buf(1, &mact_bt),
+                        bind_buf(2, &msel_bt),
+                        bind_buf(3, &mwt_bt),
+                        bind_buf(4, &mo_bt),
+                        bind_buf(5, &dn_u),
+                    ],
+                })
+            });
+            if !dsv4_skip("dn") && !dsv4_skip("moe") {
+                pass.set_pipeline(p_dn);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups(m.hidden as u32, batch as u32, 1);
+            }
         }
         // ...the MoE half's join and the NEXT layer's opening, fused too.
         if ts_armed {
