@@ -77,14 +77,21 @@ git clone https://github.com/infosave2007/cmf.git /root/cmf
 cd /root/cmf && cargo build --release --features gpu
 ```
 
-Canonical run:
+Canonical run — since 0.5.46 the defaults ARE the fast path (GPU
+self-selects, VRAM auto-detected from the Vulkan heap, speculation and
+every proven kernel default-on, the draft tally auto-loads from
+`<model>.dspark.tsv` beside the file):
 
 ```bash
-export CMF_GPU=wgpu WGPU_BACKEND=vulkan CMF_DSV4_GPU_ATTN=1 CMF_DSV4_GPU_MOE2=1
-export CMF_GPU_VRAM_MB=96500 CMF_GPU_UPLOAD=staged CMF_UPLOAD_EVICT=0
-export CMF_DSV4_GPU_LAYER=1 CMF_SDOT=0 CMF_DSV4_CHAIN=1
-./target/release/cortiq bench /content/dsv4-q2tp.cmf --tokens 128
+./target/release/cortiq bench /content/dsv4-q2tp.cmf --core --tokens 128
 ```
+
+Bare-command ladder on the stand (only `CMF_GPU_VRAM_MB` capped to what a
+smaller card would auto-detect): 16 GB → 3.2, 32 GB → 3.9, 64 GB → 6.9,
+full card → **40.2 tok/s at 63% acceptance**. Speculation reserves the
+draft's VRAM only when the budget can pack the trunk to the capture
+layers; below that it declines and the walk keeps the whole budget. Every
+historical `CMF_*` knob still exists as an override (=0 escape hatches).
 
 Expected on the 97887 MiB stand: **30.2 tok/s steady** (128-token canonical run). All 43 layers use the
 card: 42 have complete expert packs and the last pack contains 199/256 routed
