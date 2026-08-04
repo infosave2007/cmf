@@ -4485,6 +4485,14 @@ fn draft_probe() -> bool {
         }
         let row = logits_all[(accepted - 1) * cfg.vocab..accepted * cfg.vocab].to_vec();
         self.graph_logits = Some(row);
+        // The speculative loop never runs the probe, so the trunk tally has
+        // no other place to cycle. Armed only when someone asked for the
+        // dump; the host tail is the only tallying path here, which is
+        // precisely the population a partial pack would serve.
+        if std::env::var("CMF_DSV4_TRUNK_PICK_DUMP").is_ok() {
+            crate::dsv4::trunk_freq_note(&crate::dsv4::pick_tally_take());
+            crate::dsv4::pick_tally_arm();
+        }
         if std::env::var("CMF_DSV4_SPEC_TIME").is_ok() {
             eprintln!("spec_step total {:.1} мс (k={accepted})", t_all.elapsed().as_secs_f64() * 1e3);
         }
@@ -4497,6 +4505,7 @@ fn draft_probe() -> bool {
         }
         // What the trunk just routed to, for this token.
         let trunk_now = crate::dsv4::pick_tally_take();
+        crate::dsv4::trunk_freq_note(&trunk_now);
         if !trunk_now.is_empty() {
             self.dspark_trunk_picks.push(trunk_now);
             let keep = crate::dsv4::dspark_block();
