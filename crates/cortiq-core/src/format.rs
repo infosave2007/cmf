@@ -866,6 +866,63 @@ impl CmfModel {
             .sum()
     }
 
+    /// Recode selected tensors IN PLACE: each new payload must fit its old
+    /// slot, the entry keeps its offset and the file keeps its length — the
+    /// bytes between the new end and the old simply go dark (every reader
+    /// walks the directory, nothing addresses the gap). This is what lets a
+    /// published 100+ GB file change a tensor's layout on a disk too small
+    /// to hold two copies of it. Patches are `(directory index, new dtype,
+    /// new payload)`; entry hashes and the directory hash are recomputed so
+    /// `verify` stays clean. Not atomic: a crash between the payload writes
+    /// and the directory write leaves the old dtype over new bytes — verify
+    /// (or re-fetch the source) after an interrupted run.
+    pub fn recode_entries_in_place(
+        path: &str,
+        patches: &[(usize, TensorDtype, Vec<u8>)],
+    ) -> Result<(), CmfError> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        let file_len = f.metadata()?.len();
+        let mut head = vec![0u8; ENVELOPE_LEN];
+        f.read_exact(&mut head)?;
+        let env = Self::parse_envelope(&head, file_len)?;
+
+        let mut dir = vec![0u8; env.dir.1 as usize];
+        f.seek(SeekFrom::Start(env.dir.0))?;
+        f.read_exact(&mut dir)?;
+        let count = u64::from_le_bytes(dir[0..8].try_into().unwrap()) as usize;
+
+        for (i, dtype, data) in patches {
+            if *i >= count {
+                return Err(CmfError::Bounds(format!(
+                    "recode: tensor #{i} out of directory ({count} entries)"
+                )));
+            }
+            let rb = 16 + i * DIR_RECORD_LEN;
+            let rec = &mut dir[rb..rb + DIR_RECORD_LEN];
+            let off = u64::from_le_bytes(rec[32..40].try_into().unwrap());
+            let old_n = u64::from_le_bytes(rec[40..48].try_into().unwrap());
+            if data.len() as u64 > old_n {
+                return Err(CmfError::Bounds(format!(
+                    "recode: tensor #{i} payload {} > slot {old_n}",
+                    data.len()
+                )));
+            }
+            f.seek(SeekFrom::Start(env.data.0 + off))?;
+            f.write_all(data)?;
+            rec[6] = dtype.id();
+            rec[40..48].copy_from_slice(&(data.len() as u64).to_le_bytes());
+            rec[48..56].copy_from_slice(&hash64(data).to_le_bytes());
+        }
+
+        f.seek(SeekFrom::Start(env.dir.0))?;
+        f.write_all(&dir)?;
+        f.seek(SeekFrom::Start(0x78))?;
+        f.write_all(&hash64(&dir).to_le_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    }
+
     /// Recompute all tensor hashes; returns human-readable problems
     /// (empty = file intact).
     pub fn verify(&self) -> Vec<String> {
