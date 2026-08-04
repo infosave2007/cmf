@@ -8838,8 +8838,10 @@ fn ctx() -> Option<&'static Ctx> {
 }
 
 /// Total device-local memory of a Vulkan adapter, from the driver's own heap
-/// report. None on other backends or when the query is unavailable.
-#[cfg(not(target_os = "macos"))]
+/// report. None on other backends or when the query is unavailable. Only
+/// platforms where wgpu carries the Vulkan backend at all; elsewhere the
+/// stub answers None and the conservative default budget stands.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
 fn vulkan_vram_total(adapter: &wgpu::Adapter) -> Option<u64> {
     if adapter.get_info().backend != wgpu::Backend::Vulkan {
         return None;
@@ -8864,7 +8866,7 @@ fn vulkan_vram_total(adapter: &wgpu::Adapter) -> Option<u64> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 fn vulkan_vram_total(_adapter: &wgpu::Adapter) -> Option<u64> {
     None
 }
@@ -19109,7 +19111,11 @@ mod tests {
 /// reserved word in one shader once took the whole context down and every
 /// GPU test reported success by skipping.
 pub fn selected_and_up() -> Option<bool> {
-    if !selected() {
+    // "Asked" means an EXPLICIT request. The wgpu path also self-selects
+    // by default on Linux/Windows, but a default selection on a box with
+    // no device is the designed CPU fallback, not a failure — parity
+    // tests skip there (what headless CI looks like) instead of dying.
+    if std::env::var("CMF_GPU").is_err() || !selected() {
         return None; // nobody asked
     }
     Some(ctx().is_some())

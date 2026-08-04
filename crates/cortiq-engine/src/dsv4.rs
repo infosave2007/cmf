@@ -3242,6 +3242,7 @@ fn pack_freq_order(li: usize, n: usize) -> Option<Vec<usize>> {
     Some(idx)
 }
 
+#[cfg(feature = "gpu")]
 fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pack>> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
