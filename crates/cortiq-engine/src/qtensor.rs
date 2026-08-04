@@ -4380,6 +4380,24 @@ fn q2tp_matvec2(
 /// Batched q2tp matmat: scalar row kernel over every batch column. CPU
 /// prefill only — decode rides the graph, so plain and correct beats
 /// clever here.
+/// Test doors into the host 2-bit kernels: the stand's heap corruption
+/// pointed at down-shaped tensors, and the private fns need a way to be
+/// held to a reference without a model file around them.
+pub fn q2tp_matvec_for_test(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
+    q2tp_matvec(bytes, x, rows, cols, out, None);
+}
+
+pub fn q2tp_matmat_for_test(
+    bytes: &[u8],
+    xs_all: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
+    q2tp_matmat(bytes, xs_all, b, rows, cols, out, None);
+}
+
 fn q2tp_matmat(
     bytes: &[u8],
     xs_all: &[f32],

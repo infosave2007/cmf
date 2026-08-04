@@ -99,6 +99,13 @@ pub fn cmd_requant(
     if !in_place && output.is_none() {
         bail!("either --output or --in-place is required");
     }
+    if in_place && matches!(mode, Mode::DraftQ2tpFull) {
+        bail!(
+            "q2tp-draft-full is experimental and measured harmful (13% acceptance, \
+             and the host 2-bit path corrupts on down-shaped tensors); refusing to \
+             rewrite a file in place — use --output so the original survives"
+        );
+    }
 
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
 
@@ -279,6 +286,58 @@ mod tests {
         dequant_tensor(e, m.entry_bytes(e), &mut back).unwrap();
         let q2_direct = encode_q2tp(&vals_dequant(&q4, rows, cols), rows, cols);
         assert_eq!(m.entry_bytes(e), &q2_direct[..], "not the conversion-path bytes");
+    }
+
+    /// The heap corruption on the stand pointed at 2-bit tensors shaped
+    /// like a DOWN projection (rows ≫ cols). Encode one, run the host
+    /// matvec and matmat against a dequant reference, and hold the line —
+    /// whatever the stand's crash was, this shape must be provably sound.
+    #[test]
+    fn host_q2_survives_down_shaped_tensors() {
+        let (rows, cols) = (4096usize, 2048usize);
+        let vals: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32 * 0.7311).sin()) * 0.3)
+            .collect();
+        let q2 = encode_q2tp(&vals, rows, cols);
+        assert_eq!(
+            q2.len(),
+            cortiq_core::quant::expected_nbytes(TensorDtype::Q2TiledP, &[rows, cols]).unwrap()
+        );
+        let entry = cortiq_core::format::TensorEntry {
+            name: "x".into(),
+            dtype: TensorDtype::Q2TiledP,
+            shape: vec![rows, cols],
+            off: 0,
+            nbytes: q2.len() as u64,
+            hash: 0,
+            shard: 0,
+        };
+        let mut back = vec![0.0f32; rows * cols];
+        dequant_tensor(&entry, &q2, &mut back).unwrap();
+        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.013).cos()).collect();
+        let mut got = vec![0.0f32; rows];
+        cortiq_engine::qtensor::q2tp_matvec_for_test(&q2, &x, rows, cols, &mut got);
+        for r in (0..rows).step_by(511) {
+            let want: f32 = back[r * cols..(r + 1) * cols]
+                .iter()
+                .zip(&x)
+                .map(|(w, xv)| w * xv)
+                .sum();
+            assert!(
+                (got[r] - want).abs() <= want.abs().max(1.0) * 1e-4,
+                "row {r}: {} vs {}",
+                got[r],
+                want
+            );
+        }
+        // The batched path walks the same rows for two columns at once.
+        let xs: Vec<f32> = x.iter().chain(x.iter()).copied().collect();
+        let mut got2 = vec![0.0f32; 2 * rows];
+        cortiq_engine::qtensor::q2tp_matmat_for_test(&q2, &xs, 2, rows, cols, &mut got2);
+        for r in (0..rows).step_by(777) {
+            assert!((got2[r] - got[r]).abs() <= got[r].abs().max(1.0) * 1e-5);
+            assert!((got2[rows + r] - got[r]).abs() <= got[r].abs().max(1.0) * 1e-5);
+        }
     }
 
     fn vals_dequant(q4: &[u8], rows: usize, cols: usize) -> Vec<f32> {
