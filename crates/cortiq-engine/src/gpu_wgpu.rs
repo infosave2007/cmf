@@ -7253,6 +7253,98 @@ fn bt_moe_gate_up_q2tp(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// Four rows of the SwiGLU inputs to one 64-thread workgroup: the x spans
+// load once per group and feed all four rows' gate AND up tiles. Each
+// row's group order, accumulation and tree are the one-row kernel's, so
+// the activations are bit-identical.
+var<workgroup> btg4_pg: array<f32, 64>;
+var<workgroup> btg4_pu: array<f32, 64>;
+@compute @workgroup_size(64)
+fn bt_moe_gate_up_q2tp_r4(@builtin(workgroup_id) wid: vec3<u32>,
+                          @builtin(local_invocation_index) lid: u32) {
+    let row0 = wid.x * 4u;
+    let slot = wid.y;
+    let t = wid.z;
+    let gpr = mg_p.gpr;
+    let rows = mg_p.inter;
+    let base16 = mg_sel[t * mg_p.slots + slot] * mg_p.mat16;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let cod0 = (base16 + rows * gpr * 4u + rows * 2u) * 2u;
+    let xb4 = t * gpr * 8u;
+    var ag0 = 0.0; var au0 = 0.0;
+    var ag1 = 0.0; var au1 = 0.0;
+    var ag2 = 0.0; var au2 = 0.0;
+    var ag3 = 0.0; var au3 = 0.0;
+    for (var g = lid; g < gpr; g = g + 64u) {
+        let bit = g * 5u;
+        let cb0 = bit >> 3u;
+        let shf = bit & 7u;
+        let xq = xb4 + g * 8u;
+        let x0 = mg_xv[xq];      let x1 = mg_xv[xq + 1u];
+        let x2 = mg_xv[xq + 2u]; let x3 = mg_xv[xq + 3u];
+        let x4 = mg_xv[xq + 4u]; let x5 = mg_xv[xq + 5u];
+        let x6 = mg_xv[xq + 6u]; let x7 = mg_xv[xq + 7u];
+        for (var r = 0u; r < 4u; r = r + 1u) {
+            let row = row0 + r;
+            if (row >= rows) { break; }
+            let par16 = base16 + rows * gpr * 4u + row * 2u;
+            let gl = unpack2x16float(mg_g16(par16) | (mg_g16(par16 + 1u) << 16u));
+            let ul = unpack2x16float(mg_u16f(par16) | (mg_u16f(par16 + 1u) << 16u));
+            let cod8 = cod0 + row * cst;
+            var cg = mgp_gu8(cod8 + cb0);
+            var cu = mgp_uu8(cod8 + cb0);
+            if (shf > 3u) {
+                cg = cg | (mgp_gu8(cod8 + cb0 + 1u) << 8u);
+                cu = cu | (mgp_uu8(cod8 + cb0 + 1u) << 8u);
+            }
+            let cgv = (cg >> shf) & 31u;
+            let cuv = (cu >> shf) & 31u;
+            let sg = select(exp2(gl.x + f32(max(cgv, 1u) - 1u) * gl.y), 0.0, cgv == 0u);
+            let su = select(exp2(ul.x + f32(max(cuv, 1u) - 1u) * ul.y), 0.0, cuv == 0u);
+            let nib16 = base16 + row * gpr * 4u;
+            let w32 = (nib16 + g * 4u) >> 1u;
+            let dg = mg_dot16v(mg_gw[w32], x0, x1, x2, x3)
+                   + mg_dot16v(mg_gw[w32 + 1u], x4, x5, x6, x7);
+            let du = mg_dot16v(mg_uw[w32], x0, x1, x2, x3)
+                   + mg_dot16v(mg_uw[w32 + 1u], x4, x5, x6, x7);
+            if (r == 0u) { ag0 = ag0 + sg * dg; au0 = au0 + su * du; }
+            if (r == 1u) { ag1 = ag1 + sg * dg; au1 = au1 + su * du; }
+            if (r == 2u) { ag2 = ag2 + sg * dg; au2 = au2 + su * du; }
+            if (r == 3u) { ag3 = ag3 + sg * dg; au3 = au3 + su * du; }
+        }
+    }
+    for (var r = 0u; r < 4u; r = r + 1u) {
+        var ag = ag0; var au = au0;
+        if (r == 1u) { ag = ag1; au = au1; }
+        if (r == 2u) { ag = ag2; au = au2; }
+        if (r == 3u) { ag = ag3; au = au3; }
+        btg4_pg[lid] = ag;
+        btg4_pu[lid] = au;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid < stride) {
+                btg4_pg[lid] = btg4_pg[lid] + btg4_pg[lid + stride];
+                btg4_pu[lid] = btg4_pu[lid] + btg4_pu[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lid == 0u && row0 + r < rows) {
+            var gg = btg4_pg[0];
+            var uu = btg4_pu[0];
+            if (mg_p.lim > 0.0) {
+                uu = clamp(uu, -mg_p.lim, mg_p.lim);
+                gg = min(gg, mg_p.lim);
+            }
+            mg_act[(t * mg_p.slots + slot) * mg_p.inter + row0 + r] =
+                (gg / (1.0 + exp(-gg))) * uu;
+        }
+        workgroupBarrier();
+    }
+}
+
 // sparse_attend with grid (head, token): q and out stride by nh*hd, the
 // index list by `m` (the uniform carries the per-token STRIDE of the list
 // buffer), the attended count comes from a per-token table. The KV cache is
@@ -8326,6 +8418,7 @@ struct Ctx {
     bt_f32_matvec_x: wgpu::ComputePipeline,
     bt_moe_route: wgpu::ComputePipeline,
     bt_moe_gate_up_q2tp: wgpu::ComputePipeline,
+    bt_moe_gate_up_q2tp_r4: wgpu::ComputePipeline,
     bt_sparse_attend: wgpu::ComputePipeline,
     bt_index_scores: wgpu::ComputePipeline,
     bt_top_k: wgpu::ComputePipeline,
@@ -8904,6 +8997,7 @@ fn init() -> Result<Ctx, String> {
     let bt_f32_matvec_x = pipe("bt_f32_matvec_x");
     let bt_moe_route = pipe("bt_moe_route");
     let bt_moe_gate_up_q2tp = pipe("bt_moe_gate_up_q2tp");
+    let bt_moe_gate_up_q2tp_r4 = pipe("bt_moe_gate_up_q2tp_r4");
     let bt_sparse_attend = pipe("bt_sparse_attend");
     let bt_index_scores = pipe("bt_index_scores");
     let bt_top_k = pipe("bt_top_k");
@@ -9157,6 +9251,7 @@ fn init() -> Result<Ctx, String> {
         bt_f32_matvec_x,
         bt_moe_route,
         bt_moe_gate_up_q2tp,
+        bt_moe_gate_up_q2tp_r4,
         bt_sparse_attend,
         bt_index_scores,
         bt_top_k,
@@ -21764,7 +21859,7 @@ pub fn dspark_graph(
                  stride16(dim, g.inter, g.dn_q2)],
             );
             let p_gu = if g.gu_q2 {
-                &c.bt_moe_gate_up_q2tp
+                if g.inter % 4 == 0 { &c.bt_moe_gate_up_q2tp_r4 } else { &c.bt_moe_gate_up_q2tp }
             } else {
                 &c.moe_gate_up_q4tp_b
             };
@@ -21784,7 +21879,12 @@ pub fn dspark_graph(
             });
             pass.set_pipeline(p_gu);
             pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups(g.inter as u32, slots as u32, block as u32);
+            let gx = if g.gu_q2 && g.inter % 4 == 0 {
+                (g.inter as u32).div_ceil(4)
+            } else {
+                g.inter as u32
+            };
+            pass.dispatch_workgroups(gx, slots as u32, block as u32);
             let p_dn = if g.dn_q2 { &c.moe_down_q2tp_b } else { &c.moe_down_q4tp_b };
             let bind = cached_bind(c, bk(251), || {
                 // The 2-bit kernel reads x through the vec4 view and never
@@ -23294,7 +23394,7 @@ fn dsv4_layer_frame_bt_enc(
             ],
         );
         let p_gu = if m.gu_q2 {
-            &c.bt_moe_gate_up_q2tp
+            if m.inter % 4 == 0 { &c.bt_moe_gate_up_q2tp_r4 } else { &c.bt_moe_gate_up_q2tp }
         } else {
             &c.moe_gate_up_q4tp_b
         };
@@ -23320,7 +23420,12 @@ fn dsv4_layer_frame_bt_enc(
         if !dsv4_skip("gu") && !dsv4_skip("moe") {
             pass.set_pipeline(p_gu);
             pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups(m.inter as u32, slots as u32, batch as u32);
+            let gx = if m.gu_q2 && m.inter % 4 == 0 {
+                (m.inter as u32).div_ceil(4)
+            } else {
+                m.inter as u32
+            };
+            pass.dispatch_workgroups(gx, slots as u32, batch as u32);
         }
         if ts_armed {
             drop(pass);
