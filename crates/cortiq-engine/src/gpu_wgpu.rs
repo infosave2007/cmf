@@ -15364,9 +15364,17 @@ pub static PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 #[inline]
 fn begin_pass(enc: &mut wgpu::CommandEncoder) -> wgpu::ComputePass<'_> {
     PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // A stage label set by the BT frame turns this pass into a timestamped
+    // one; everything else stays on the cold path of one atomic load.
+    let which = BT_TS_STAGE.load(std::sync::atomic::Ordering::Relaxed);
+    let timestamp_writes = if which != 0 {
+        ctx().and_then(|c| ts_pair(c, which))
+    } else {
+        None
+    };
     enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: None,
-        timestamp_writes: None,
+        timestamp_writes,
     })
 }
 
@@ -20252,6 +20260,12 @@ fn dsv4_chain_batch_bt(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("dsv4-chain-batch-bt"),
         });
+    // Fresh slots for this chain's sampled passes: the counter rotates
+    // globally, and a wrap inside one chain would pair unrelated stamps.
+    if c.ts_query.is_some() && !bt_ts_lis().is_empty() {
+        TS_SLOT.store(0, std::sync::atomic::Ordering::Relaxed);
+        TS_PAIRS.lock().unwrap().clear();
+    }
     let t_enc = std::time::Instant::now();
     let mut last: Option<(wgpu::Buffer, wgpu::Buffer)> = None;
     for (i, (w, g, p)) in layers.iter().enumerate() {
@@ -20358,7 +20372,23 @@ fn dsv4_chain_batch_bt(
         t_enc.elapsed().as_nanos() as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
-    match (gather_state.as_ref(), state_out) {
+    // Resolve the sampled layers' pass stamps into the staging buffer; the
+    // frame's own fence below pays for the round trip.
+    let ts_pairs: Vec<(usize, u32)> = if !bt_ts_lis().is_empty() {
+        std::mem::take(&mut TS_PAIRS.lock().unwrap())
+    } else {
+        Vec::new()
+    };
+    if let (false, Some((qs, resolve, tstage))) = (ts_pairs.is_empty(), c.ts_query.as_ref()) {
+        for (n, (_, slot)) in ts_pairs.iter().enumerate() {
+            if (n as u64 + 1) * 16 > 256 * 8 {
+                break;
+            }
+            enc.resolve_query_set(qs, *slot..*slot + 2, resolve, 0);
+            enc.copy_buffer_to_buffer(resolve, 0, tstage, (n as u64) * 16, 16);
+        }
+    }
+    let ok = match (gather_state.as_ref(), state_out) {
         (Some(gs), Some(states_out)) => readback2(
             c,
             enc,
@@ -20379,7 +20409,60 @@ fn dsv4_chain_batch_bt(
             drop(sc);
             ok
         }
+    };
+    if ok && !ts_pairs.is_empty() {
+        if let Some((_, _, tstage)) = &c.ts_query {
+            let n_read = ts_pairs.len().min(128);
+            let bytes = (n_read as u64) * 16;
+            let (tx, rx) = std::sync::mpsc::channel();
+            tstage.map_async(wgpu::MapMode::Read, ..bytes, move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            if rx.recv().map(|r| r.is_ok()).unwrap_or(false) {
+                if let Ok(raw) = tstage.get_mapped_range(..bytes) {
+                    let t: &[u64] = bytemuck::cast_slice(&raw);
+                    let mut agg = [(0f64, 0u32); BT_TS_NAMES.len()];
+                    for (n, (which, _)) in ts_pairs.iter().enumerate().take(n_read) {
+                        let d = t[2 * n + 1].saturating_sub(t[2 * n]);
+                        let ms = d as f64 * c.ts_period as f64 / 1e6;
+                        if let Some(e) = agg.get_mut(*which) {
+                            e.0 += ms;
+                            e.1 += 1;
+                        }
+                    }
+                    drop(raw);
+                    let n_lis = bt_ts_lis().len().max(1) as f64;
+                    let line: Vec<String> = agg
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| e.1 > 0)
+                        .map(|(i, e)| {
+                            format!("{} {:.2}({})", BT_TS_NAMES[i], e.0 / n_lis, e.1)
+                        })
+                        .collect();
+                    eprintln!(
+                        "[bt-ts] на слой ({} слоёв): {}",
+                        bt_ts_lis().len(),
+                        line.join(" | ")
+                    );
+                }
+            }
+            tstage.unmap();
+        }
     }
+    ok
+}
+
+/// `CMF_DSV4_BT_HCSPLIT=0`: the batch frame joins the halves with the
+/// one-workgroup fused block instead of the three-dispatch
+/// expand→mix→fold sequence. The fuse saves two links but serializes the
+/// mix's 1.5 MB of weights through one SM per token — measured on the
+/// release at B=5: fused 2.98 ms of the layer, split 1.15; the chain went
+/// 187 → 110 ms. Split is the default; the fuse stays for a bisect.
+fn bt_hc_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_BT_HCSPLIT").map(|v| v != "0").unwrap_or(true))
 }
 
 /// Whether the batch uses the token-axis frame (default) or the historical
@@ -21661,6 +21744,15 @@ fn dsv4_layer_frame_bt_enc(
         }
     }
 
+    // Sampled-layer GPU profile: every pass opened between two marks lands
+    // under the earlier mark's stage.
+    let ts_armed = c.ts_query.is_some() && bt_ts_lis().contains(&li);
+    let mark = |s: usize| {
+        if ts_armed {
+            bt_ts(s);
+        }
+    };
+    mark(1);
     // q for the whole batch — touches no cache.
     if !encode_q4tp_mv4_b(c, enc, &wb[1], &qn_bt, &q_bt, a.nh * a.hd, a.q_lora, batch) {
         no!("q-проекция пакетом не закодировалась");
@@ -21681,6 +21773,7 @@ fn dsv4_layer_frame_bt_enc(
         }
         comp_jobs.push((1, iw.clone(), *ig));
     }
+    mark(2);
     if !dsv4_skip("comp") {
         for (kind, cw, cg) in &comp_jobs {
             let ckv_bt = frame_buf_t(c, BT_DSPARK_KV, 26 + *kind as usize, batch * cg.width * 4, false);
@@ -21805,6 +21898,7 @@ fn dsv4_layer_frame_bt_enc(
         }
     }
 
+    mark(3);
     // The staged key rows, batched: project, norm, rotate, park at the tail.
     let kvfull = frame_buf_t(c, BT_DSPARK_KV, 20, batch * kvw * 4, false);
     let kvnorm = frame_buf_t(c, BT_DSPARK_KV, 21, batch * kvw * 4, false);
@@ -21936,12 +22030,14 @@ fn dsv4_layer_frame_bt_enc(
         let hw_bt = frame_buf_t(c, BT_DSPARK_KV, 23, batch * ixg.ih * 4, false);
         let sc_bt = frame_buf_t(c, BT_DSPARK_KV, 24, batch * 4096 * 4, false);
         let cnt_bt = frame_buf_t(c, BT_DSPARK_KV, 25, batch * 4, false);
+        mark(4);
         if !encode_q4tp_mv4_b(c, enc, &ixb[0], &qn_bt, &qi_bt, ixg.ih * ixg.idim, ixg.q_lora, batch) {
             no!("индексер q пакетом");
         }
         if !encode_q4tp_mv4_b(c, enc, &ixb[1], &x2_bt, &hw_bt, ixg.ih, ixg.hidden, batch) {
             no!("индексер веса пакетом");
         }
+        mark(5);
         let sc_factor = (ixg.idim as f32).powf(-0.5) * (ixg.ih as f32).powf(-0.5);
         let n_pos = lims.iter().copied().max().unwrap_or(0) as usize;
         let mut pass = begin_pass(enc);
@@ -22001,6 +22097,7 @@ fn dsv4_layer_frame_bt_enc(
             pass.dispatch_workgroups(batch as u32, 1, 1);
         }
     }
+    mark(6);
     {
         let mut pass = begin_pass(enc);
         let bind = cached_bind(c, bk(236), || {
@@ -22088,6 +22185,7 @@ fn dsv4_layer_frame_bt_enc(
         if !dsv4_skip("olora") && !dsv4_skip("oproj") {
             let o_rows = a.o_groups * a.o_lora;
             let o_cols = a.nh * a.hd / a.o_groups;
+            mark(7);
             let bind = cached_bind(c, bk(213), || {
                 let p = uniform_u32x4(c, [(o_cols / 32) as u32, o_rows as u32, a.o_lora as u32, 0]);
                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -22107,12 +22205,14 @@ fn dsv4_layer_frame_bt_enc(
             pass.dispatch_workgroups((o_rows as u32).div_ceil(4), batch as u32, 1);
         }
     }
+    mark(15);
     if !dsv4_skip("wob") && !dsv4_skip("oproj")
         && !encode_q4tp_mv4_b(c, enc, &wb[3], &mid_bt, &ao_bt, dim, a.o_groups * a.o_lora, batch)
     {
         no!("wo_b пакетом не закодировался");
     }
 
+    mark(8);
     // ── glue and MoE, one pass ──
     let hcp = uniform_u32x8(
         c,
@@ -22246,8 +22346,19 @@ fn dsv4_layer_frame_bt_enc(
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(batch as u32, 1, 1);
         };
-        fused(&mut pass, 214, &ao_bt, &state_bt, &state2_bt, &ffn_fn, &ffn_sc, &ffn_bs, &ffn_nw);
+        if bt_hc_split() {
+            expand(&mut pass, 240, &ao_bt, &state_bt, &state2_bt);
+            mix(&mut pass, 241, &ffn_fn, &state2_bt);
+            fold(&mut pass, 242, &state2_bt, &ffn_sc, &ffn_bs, &ffn_nw);
+        } else {
+            fused(&mut pass, 214, &ao_bt, &state_bt, &state2_bt, &ffn_fn, &ffn_sc, &ffn_bs, &ffn_nw);
+        }
         // ...router logits over the normed fold...
+        if ts_armed {
+            drop(pass);
+            bt_ts(11);
+            pass = begin_pass(enc);
+        }
         {
             let pipe = if n_pack < 64 {
                 &c.bt_f32_matvec_x
@@ -22344,6 +22455,11 @@ fn dsv4_layer_frame_bt_enc(
         } else {
             &c.moe_gate_up_q4tp_b
         };
+        if ts_armed {
+            drop(pass);
+            bt_ts(12);
+            pass = begin_pass(enc);
+        }
         let bind = cached_bind(c, bk(219), || {
             c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
@@ -22362,6 +22478,11 @@ fn dsv4_layer_frame_bt_enc(
             pass.set_pipeline(p_gu);
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(m.inter as u32, slots as u32, batch as u32);
+        }
+        if ts_armed {
+            drop(pass);
+            bt_ts(13);
+            pass = begin_pass(enc);
         }
         let bind = cached_bind(c, bk(220), || {
             c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -22383,15 +22504,27 @@ fn dsv4_layer_frame_bt_enc(
             pass.dispatch_workgroups(m.hidden as u32, batch as u32, 1);
         }
         // ...the MoE half's join and the NEXT layer's opening, fused too.
+        if ts_armed {
+            drop(pass);
+            bt_ts(14);
+            pass = begin_pass(enc);
+        }
         if let Some(nf) = w.hc_next_fn {
             let nfn = const_buf(c, bytemuck::cast_slice(nf));
             let nsc = const_buf(c, bytemuck::cast_slice(w.hc_next_scale));
             let nbs = const_buf(c, bytemuck::cast_slice(&w.hc_next_base[..mix_hc]));
-            fused(&mut pass, 221, &mo_bt, &state2_bt, &state_bt, &nfn, &nsc, &nbs, &next_nw);
+            if bt_hc_split() {
+                expand(&mut pass, 243, &mo_bt, &state2_bt, &state_bt);
+                mix(&mut pass, 244, &nfn, &state_bt);
+                fold(&mut pass, 245, &state_bt, &nsc, &nbs, &next_nw);
+            } else {
+                fused(&mut pass, 221, &mo_bt, &state2_bt, &state_bt, &nfn, &nsc, &nbs, &next_nw);
+            }
         } else {
             expand(&mut pass, 221, &mo_bt, &state2_bt, &state_bt);
         }
     }
+    mark(9);
     if w.hc_next_fn.is_some() && !dsv4_skip("nextq") {
         if !encode_q4tp_mv4_b(c, enc, &wb[4], &x2_bt, &qr_bt, a.q_lora, dim, batch) {
             no!("next-q пакетом не закодировался");
@@ -22421,6 +22554,7 @@ fn dsv4_layer_frame_bt_enc(
     //    leave, exactly what B walked appends would have left. A verify
     //    (retention armed) defers this to dsv4_spec_finish, which commits
     //    only the accepted prefix. ──
+    mark(10);
     if SPEC_RETAIN.with(|v| v.borrow().0) == 0 && !dsv4_skip("win") {
         encode_staged_commit(c, enc, &cache, p0.filled, p0.window, a.hd, srow0, batch);
     }
@@ -22429,6 +22563,9 @@ fn dsv4_layer_frame_bt_enc(
     } else {
         ao_bt.clone()
     };
+    if ts_armed {
+        bt_ts(0);
+    }
     Some((src, state_bt))
 }
 
@@ -25641,6 +25778,29 @@ static TS_PAIRS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
 static TS_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// The pair the last encoded pass took, for the frame that resolves it.
 static TS_LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Per-stage GPU time inside the BT chain frame: `CMF_GPU_TS=1` plus
+/// `CMF_BT_TS=li[,li…]` pick the sampled layers; `begin_pass` stamps every
+/// pass opened while a stage label is set, and the chain's own fence pays
+/// for the readback. Labels index `BT_TS_NAMES`.
+static BT_TS_STAGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const BT_TS_NAMES: [&str; 16] = [
+    "", "q", "comp", "окно", "ix-mv", "ix-score", "attend", "olora", "glue1", "nextq", "commit",
+    "route", "gu", "dn", "glue2", "wo_b",
+];
+
+fn bt_ts_lis() -> &'static [usize] {
+    static L: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    L.get_or_init(|| {
+        std::env::var("CMF_BT_TS")
+            .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+            .unwrap_or_default()
+    })
+}
+
+fn bt_ts(stage: usize) {
+    BT_TS_STAGE.store(stage, std::sync::atomic::Ordering::Relaxed);
+}
 pub static MOE_BUFS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MOE_UP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MOE_PASS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
