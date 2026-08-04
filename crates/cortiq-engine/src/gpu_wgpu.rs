@@ -4473,6 +4473,26 @@ struct MoeDnBP { gpr: u32, hidden: u32, slots: u32, mat16: u32 };
 // exactly one vec4<u32>, and the scalar view above pays four transactions
 // for it. Only the b4 kernel binds this view.
 @group(0) @binding(6) var<storage, read>       db_wv  : array<vec4<u32>>;
+// The activations too: the four-row kernel once staged them through a
+// function-scope array, and dynamic indexing sent that array to local
+// memory — every dot read paid a spill. Eight named vec4 registers do
+// what the array was meant to.
+@group(0) @binding(7) var<storage, read>       db_x4  : array<vec4<f32>>;
+
+// Takes and returns the running sum so the fold order is EXACTLY the
+// scalar kernel's left-to-right chain — grouping the eight terms first
+// would round differently.
+fn db_dotv(acc: f32, w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
+    return acc
+         + (f32(w & 0xFu) - 8.0) * a.x
+         + (f32((w >> 4u) & 0xFu) - 8.0) * a.y
+         + (f32((w >> 8u) & 0xFu) - 8.0) * a.z
+         + (f32((w >> 12u) & 0xFu) - 8.0) * a.w
+         + (f32((w >> 16u) & 0xFu) - 8.0) * b.x
+         + (f32((w >> 20u) & 0xFu) - 8.0) * b.y
+         + (f32((w >> 24u) & 0xFu) - 8.0) * b.z
+         + (f32((w >> 28u) & 0xFu) - 8.0) * b.w;
+}
 var<workgroup> db_pt: array<f32, 64>;
 
 fn db_u16(o: u32) -> u32 { return (db_w[o >> 1u] >> ((o & 1u) * 16u)) & 0xFFFFu; }
@@ -4645,10 +4665,13 @@ fn moe_down_q4tp_b4(@builtin(workgroup_id) wid: vec3<u32>,
         let bit = g * 5u;
         let cb = bit >> 3u;
         let shf = bit & 7u;
-        let xb = ab + (slot * gpr + g) * 32u;
-        // The x span once, into registers all four rows read.
-        var xs: array<f32, 32>;
-        for (var j = 0u; j < 32u; j = j + 1u) { xs[j] = db_act[xb + j]; }
+        let x4 = (ab + (slot * gpr + g) * 32u) >> 2u;
+        // The x span once, into eight NAMED vec4s — registers, not a
+        // spilled array.
+        let v0 = db_x4[x4];      let v1 = db_x4[x4 + 1u];
+        let v2 = db_x4[x4 + 2u]; let v3 = db_x4[x4 + 3u];
+        let v4 = db_x4[x4 + 4u]; let v5 = db_x4[x4 + 5u];
+        let v6 = db_x4[x4 + 6u]; let v7 = db_x4[x4 + 7u];
         for (var r = 0u; r < 4u; r = r + 1u) {
             let row = row0 + r;
             if (row >= rows) { break; }
@@ -4661,22 +4684,10 @@ fn moe_down_q4tp_b4(@builtin(workgroup_id) wid: vec3<u32>,
             if (r == 3u) { plr = pl3; }
             let scale = exp2(plr.x + f32((cv >> shf) & 31u) * plr.y);
             let wv = db_wv[(base16 + (row * gpr + g) * 8u) >> 3u];
-            var d = 0.0;
-            for (var k = 0u; k < 4u; k = k + 1u) {
-                var w = wv.x;
-                if (k == 1u) { w = wv.y; }
-                if (k == 2u) { w = wv.z; }
-                if (k == 3u) { w = wv.w; }
-                let x8 = 8u * k;
-                d = d + (f32(w & 0xFu) - 8.0) * xs[x8]
-                      + (f32((w >> 4u) & 0xFu) - 8.0) * xs[x8 + 1u]
-                      + (f32((w >> 8u) & 0xFu) - 8.0) * xs[x8 + 2u]
-                      + (f32((w >> 12u) & 0xFu) - 8.0) * xs[x8 + 3u]
-                      + (f32((w >> 16u) & 0xFu) - 8.0) * xs[x8 + 4u]
-                      + (f32((w >> 20u) & 0xFu) - 8.0) * xs[x8 + 5u]
-                      + (f32((w >> 24u) & 0xFu) - 8.0) * xs[x8 + 6u]
-                      + (f32((w >> 28u) & 0xFu) - 8.0) * xs[x8 + 7u];
-            }
+            let d = db_dotv(
+                db_dotv(db_dotv(db_dotv(0.0, wv.x, v0, v1), wv.y, v2, v3), wv.z, v4, v5),
+                wv.w, v6, v7,
+            );
             let v = sw * scale * d;
             if (r == 0u) { a0 = a0 + v; }
             if (r == 1u) { a1 = a1 + v; }
@@ -22845,14 +22856,17 @@ fn dsv4_layer_frame_bt_enc(
                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &c.moe_down_q4tp_b4.get_bind_group_layout(0),
+                    // No entry for binding 1: the register-vec4 kernel
+                    // reads x only through the vec4 view, and the auto
+                    // layout drops what the entry point never touches.
                     entries: &[
                         bind_buf(0, &down_all),
-                        bind_buf(1, &mact_bt),
                         bind_buf(2, &msel_bt),
                         bind_buf(3, &mwt_bt),
                         bind_buf(4, &mo_bt),
                         bind_buf(5, &dn_u),
                         bind_buf(6, &down_all),
+                        bind_buf(7, &mact_bt),
                     ],
                 })
             });
