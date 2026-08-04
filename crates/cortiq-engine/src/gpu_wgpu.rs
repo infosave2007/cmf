@@ -7659,6 +7659,82 @@ fn bt_o_lora_a(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+
+// The grouped projection with the group's x span staged through shared
+// memory: all four sub-rows of a workgroup belong to one o-group and
+// re-read the same span — the stage cuts that traffic four-fold. Values
+// and per-lane order are the un-staged kernel's, so the sums are
+// bit-identical. Created only when the device's workgroup storage fits
+// the 4608-float span (18 KB + change); the host also refuses shapes
+// that straddle groups.
+var<workgroup> obt_xs: array<f32, 4608>;
+@compute @workgroup_size(256)
+fn bt_o_lora_a2(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(num_workgroups) nwg: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let lora = q1p._p0;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let t = wid.y;
+    let xtok = t * (rows / lora) * gpr * 32u;
+    let sub = lid / 64u;
+    let lane = lid % 64u;
+    var row = wid.x * 4u + sub;
+    loop {
+        if (row >= rows) { break; }
+        let span = gpr * 32u;
+        let xoff = xtok + (row / lora) * span;
+        for (var j = lid; j < span; j = j + 256u) { obt_xs[j] = q1x[xoff + j]; }
+        if (lane < 32u) {
+            let pr = unpack2x16float(q1w[params_w + row]);
+            obt_lad[sub * 32u + lane] = exp2(pr.x + f32(lane) * pr.y);
+        }
+        workgroupBarrier();
+        var acc = 0.0;
+        var g = lane;
+        loop {
+            if (g >= gpr) { break; }
+            let bit = g * 5u;
+            let cb = codes_b + row * cstride + (bit >> 3u);
+            let sh = bit & 7u;
+            var cv = q4tp_byte(cb);
+            if (sh > 3u) { cv = cv | (q4tp_byte(cb + 1u) << 8u); }
+            let scale = obt_lad[sub * 32u + ((cv >> sh) & 31u)];
+            let base = (row * gpr + g) * 4u;
+            let xb = g * 32u;
+            var gsum = 0.0;
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                let w = q1w[base + k];
+                let x8 = xb + 8u * k;
+                gsum = gsum + (f32(w & 0xFu) - 8.0) * obt_xs[x8]
+                     + (f32((w >> 4u) & 0xFu) - 8.0) * obt_xs[x8 + 1u]
+                     + (f32((w >> 8u) & 0xFu) - 8.0) * obt_xs[x8 + 2u]
+                     + (f32((w >> 12u) & 0xFu) - 8.0) * obt_xs[x8 + 3u]
+                     + (f32((w >> 16u) & 0xFu) - 8.0) * obt_xs[x8 + 4u]
+                     + (f32((w >> 20u) & 0xFu) - 8.0) * obt_xs[x8 + 5u]
+                     + (f32((w >> 24u) & 0xFu) - 8.0) * obt_xs[x8 + 6u]
+                     + (f32((w >> 28u) & 0xFu) - 8.0) * obt_xs[x8 + 7u];
+            }
+            acc = acc + scale * gsum;
+            g = g + 64u;
+        }
+        obt_part[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lane < stride) { obt_part[lid] = obt_part[lid] + obt_part[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lane == 0u) { q1y[t * rows + row] = obt_part[sub * 64u]; }
+        workgroupBarrier();
+        row = row + nwg.x * 4u;
+    }
+}
 "#;
 
 // Split-K decode attention (its own module: the main module's at_* binding
@@ -7925,6 +8001,7 @@ struct Ctx {
     bt_top_k: wgpu::ComputePipeline,
     bt_idx_build_staged: wgpu::ComputePipeline,
     bt_o_lora_a: wgpu::ComputePipeline,
+    bt_o_lora_a2: Option<wgpu::ComputePipeline>,
     q4tp_mv: wgpu::ComputePipeline,
     /// Tall-matrix q4tp matvec (4 rows/workgroup, vec4 nibble loads); the
     /// per-row math is byte-identical to `q4tp_mv`. `CMF_MV4=0` reverts.
@@ -8367,6 +8444,7 @@ fn init() -> Result<Ctx, String> {
     // Adreno/Mali/wgpu-Metal report 32 768 — there only the stride-129
     // (hd <= 128) kernels are created.
     let big_attend = limits.max_compute_workgroup_storage_size >= 33_152;
+    let wg_storage = limits.max_compute_workgroup_storage_size;
     // GPU timestamps (CMF_GPU_TS=1): ask for the query features when the
     // adapter has them — the frame profiler below is the only consumer.
     // Two tiers, and conflating them cost the dsv4 profiler its clock on
@@ -8498,6 +8576,9 @@ fn init() -> Result<Ctx, String> {
     let bt_top_k = pipe("bt_top_k");
     let bt_idx_build_staged = pipe("bt_idx_build_staged");
     let bt_o_lora_a = pipe("bt_o_lora_a");
+    // The staged twin's 4608-float span needs 18 KB and change of
+    // workgroup storage; a 16 KB device simply never creates it.
+    let bt_o_lora_a2 = (wg_storage >= 19_500).then(|| pipe("bt_o_lora_a2"));
     let q4tp_mv = pipe("q4tp_matvec");
     let q4tp_mv4 = pipe("q4tp_matvec4");
     let use_mv4 = std::env::var("CMF_MV4").map(|v| v != "0").unwrap_or(true);
@@ -8745,6 +8826,7 @@ fn init() -> Result<Ctx, String> {
         bt_top_k,
         bt_idx_build_staged,
         bt_o_lora_a,
+        bt_o_lora_a2,
         q4tp_mv,
         q4tp_mv4,
         use_mv4,
@@ -22440,11 +22522,24 @@ fn dsv4_layer_frame_bt_enc(
             let o_rows = a.o_groups * a.o_lora;
             let o_cols = a.nh * a.hd / a.o_groups;
             mark(7);
+            // The staged twin shares one o-group's x span across its four
+            // sub-rows; shapes that straddle a group keep the direct kernel.
+            // Staging the span bought nothing on the release (0.41→0.45:
+            // the weights, not x, are what this dispatch waits on) — the
+            // twin stays for the next investigation, off by default.
+            let ol_stage = {
+                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *ON.get_or_init(|| std::env::var("CMF_DSV4_OLORA_STAGE").is_ok_and(|v| v != "0"))
+            };
+            let p_ol = match c.bt_o_lora_a2.as_ref() {
+                Some(p2) if ol_stage && o_cols <= 4608 && a.o_lora % 4 == 0 => p2,
+                _ => &c.bt_o_lora_a,
+            };
             let bind = cached_bind(c, bk(213), || {
                 let p = uniform_u32x4(c, [(o_cols / 32) as u32, o_rows as u32, a.o_lora as u32, 0]);
                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
-                    layout: &c.bt_o_lora_a.get_bind_group_layout(0),
+                    layout: &p_ol.get_bind_group_layout(0),
                     entries: &[
                         bind_buf(0, &wb[2]),
                         bind_buf(1, &attn_bt),
@@ -22454,7 +22549,7 @@ fn dsv4_layer_frame_bt_enc(
                 })
             });
             let mut pass = begin_pass(enc);
-            pass.set_pipeline(&c.bt_o_lora_a);
+            pass.set_pipeline(p_ol);
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups((o_rows as u32).div_ceil(4), batch as u32, 1);
         }
