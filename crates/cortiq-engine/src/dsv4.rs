@@ -906,6 +906,11 @@ pub struct Dsv4State {
     /// some layer's caches are on the wrong side and the answer would be
     /// quietly wrong — the loop refuses instead.
     pub dev_set: Vec<bool>,
+    /// Which layers run their MoE on the card from a PARTIAL expert pack.
+    /// Their walk attention must stay on the host: the device attention
+    /// frame and the device MoE frame of one layer share pooled slots and
+    /// poison each other across tokens (see `attention_step`).
+    pub partial_set: Vec<bool>,
 }
 
 impl Dsv4State {
@@ -919,6 +924,7 @@ impl Dsv4State {
             dev_n_ix: vec![0; layers],
             dev_owned: false,
             dev_set: Vec::new(),
+            partial_set: Vec::new(),
             window: vec![Vec::new(); layers],
             compressed: vec![Vec::new(); layers],
             index_kv: vec![Vec::new(); layers],
@@ -1286,6 +1292,7 @@ fn attn_frame(
     cfg: &Dsv4Cfg,
     st: &Dsv4State,
     li: usize,
+    hidden: &[f32],
     qn: &[f32],
     idxs: &[usize],
     inv_freq: &[f32],
@@ -1372,8 +1379,15 @@ fn attn_frame(
         eps: cfg.norm_eps,
         scale,
     };
+    // The host fold, explicitly. The frame used to read this half's input
+    // from the pooled x2 slot — which a device MoE frame of the SAME layer
+    // overwrites each token with the NEXT layer's input, so the second
+    // token of any chain+partial configuration attended over garbage
+    // (perplexity 5.3 against the 4.578 gold on every budget small enough
+    // to split a layer). The host has the exact vector either way; one
+    // hidden-width upload per call is what correctness costs.
     crate::gpu_wgpu::dsv4_attn_frame(
-        &model, &w, g, &[], Some(qn), kv_id, li, &idx32, inv_freq, pos, hc, out,
+        &model, &w, g, hidden, Some(qn), kv_id, li, &idx32, inv_freq, pos, hc, out,
     )
 }
 
@@ -1424,7 +1438,31 @@ pub fn attention_step(
     rms_weighted(&mut qr, &l.q_norm, cfg.norm_eps);
     // The queries are built further down, after the frame has had its chance
     // at the whole block. `qr` is needed either way: the indexer reads it.
-    let on_gpu = gpu_attn_enabled();
+    // A PARTIAL layer walks its attention on the host. Its device MoE
+    // frame refills the pooled walk slots (x2, the hyper-connection state)
+    // each token with the NEXT layer's values, so the same layer's device
+    // attention frame attends over the previous token's leftovers on the
+    // second token — measured as perplexity 5.3 against the 4.578 gold on
+    // every budget small enough to split a layer, and exact the moment
+    // that one layer's attention walks on the host. Layers whose MoE runs
+    // on the HOST keep their device attention: nothing refills their
+    // slots mid-walk, and the MAX_LI ladder measures them bit-exact.
+    // …and it spreads: the partial layer's MoE frame cycles slots that the
+    // FOLLOWING host-MoE layers' device attention also reads, so in any
+    // configuration that holds a partial layer, every layer past the chain
+    // prefix walks its attention on the host. A configuration with no
+    // partial layer keeps device attention everywhere — the canonical
+    // stand and the MAX_LI ladder both measure that bit-exact.
+    let split_config = st.partial_set.iter().any(|&p| p);
+    let past_chain = st.dev_owned
+        && (li >= st.dev_set.len() || !st.dev_set.get(li).copied().unwrap_or(false));
+    if std::env::var("CMF_DSV4_GATE_DBG").is_ok() {
+        eprintln!(
+            "[gate] li={li} pos={} split={split_config} past={past_chain} dev_owned={} set_len={} part_len={}",
+            st.pos, st.dev_owned, st.dev_set.len(), st.partial_set.len()
+        );
+    }
+    let on_gpu = gpu_attn_enabled() && !(split_config && past_chain);
 
     rms_weighted(&mut kv, &l.kv_norm, cfg.norm_eps);
     rope_tail(&mut kv, inv_freq, pos, rd, false);
@@ -1575,8 +1613,24 @@ pub fn attention_step(
     let scale = (hd as f32).powf(-0.5);
     #[cfg(feature = "gpu")]
     if on_gpu
+        && {
+            if std::env::var("CMF_DSV4_XCHK").is_ok() {
+                // The frame reads this half's input from the card's x2
+                // slot; the host walked its own. Disagreement = the
+                // chain→walk handoff, and the number says by how much.
+                if let Some(card) = crate::gpu_wgpu::dsv4_dbg_read_tag(45, 0, hidden.len()) {
+                    let md = hidden
+                        .iter()
+                        .zip(card.iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    eprintln!("[xchk] li={li} pos={pos} x2 maxdiff={md:.3e}");
+                }
+            }
+            true
+        }
         && attn_frame(
-            l, cfg, st, li, &qr, &idxs, inv_freq, pos, win_len, scale, None, out,
+            l, cfg, st, li, hidden, &qr, &idxs, inv_freq, pos, win_len, scale, None, out,
         )
     {
         return;
@@ -1829,6 +1883,13 @@ fn dsv4_layer_loop(
         .collect();
     if !active_dev.iter().any(|&x| x) {
         return false;
+    }
+    // The attention gate below needs to know about partial layers BEFORE
+    // the decode path commits the device set — a perplexity run only ever
+    // prefills, and with this left empty every split budget scored the
+    // model wrong (measured; see `attention_step`).
+    if st.partial_set.len() != partial_dev.len() || st.partial_set != partial_dev {
+        st.partial_set = partial_dev.clone();
     }
 
     // Which layers the card actually took, said once. A layer that falls to
@@ -2260,6 +2321,7 @@ fn dsv4_layer_loop(
         }
         if st.dev_set.is_empty() {
             st.dev_set = active_dev.clone();
+            st.partial_set = partial_dev.clone();
             // The set is committed, so the card must keep it. Eviction by
             // score is right while the set is still being chosen and wrong
             // afterwards: an evicted layer drops off the card while its
@@ -2375,6 +2437,7 @@ fn dsv4_partial_layer(
         cfg,
         st,
         li,
+        folded,
         &prep.qr,
         &prep.idxs,
         freqs,
@@ -2982,8 +3045,8 @@ fn dsv4_two_frame_loop(
         };
         let scale = (cfg.head_dim as f32).powf(-0.5);
         if !attn_frame(
-            l, cfg, st, li, &prep.qr, &prep.idxs, freqs_of(l), st.pos, prep.win_len,
-            scale, Some(&a_tail), &mut [],
+            l, cfg, st, li, &folded, &prep.qr, &prep.idxs, freqs_of(l), st.pos,
+            prep.win_len, scale, Some(&a_tail), &mut [],
         ) {
             return false;
         }
