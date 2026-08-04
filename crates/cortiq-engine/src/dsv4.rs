@@ -4691,6 +4691,37 @@ pub fn dsv4_verify_chunk(
     }
     txn.states = states.clone();
     let t_chain = t0.elapsed();
+    if std::env::var("CMF_DSV4_FOLD_DBG").is_ok() {
+        // Any indexer fold this window landed: read the entry back and
+        // print a fingerprint, so the fused and per-token folds can be
+        // held against each other on the release shapes.
+        for li in 0..gpu_end {
+            let Some(ixr) = &layers[li].indexer else { continue };
+            let ratio = ixr.compressor.ratio;
+            for t in 0..b {
+                if (pos0 + t + 1) % ratio == 0 {
+                    let ew = {
+                        let w = ixr.compressor.wkv.rows();
+                        if ixr.compressor.overlap { w / 2 } else { w }
+                    };
+                    let idx_new = txn.dev_n_ix[li] + (0..=t)
+                        .filter(|k| (pos0 + k + 1) % ratio == 0)
+                        .count()
+                        - 1;
+                    if let Some(v) =
+                        crate::gpu_wgpu::dsv4_dbg_read_ix(st.kv_id, li, idx_new * ew, ew.min(8))
+                    {
+                        let sum: f32 = v.iter().sum();
+                        eprintln!(
+                            "[fold] li={li} pos={} entry={idx_new} head={:?} sum={sum:.6}",
+                            pos0 + t,
+                            &v[..4.min(v.len())]
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // ── host tail + every position's head ──
     let mut scratch = HcScratch::new(cfg);

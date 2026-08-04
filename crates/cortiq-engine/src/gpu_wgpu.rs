@@ -271,6 +271,19 @@ struct Q1Params { np: u32, rows: u32, _p0: u32, _p1: u32 };
 // base (row·gpr+g)·4 words is vec4-aligned by construction. Only the
 // batch o_lora kernel binds this view.
 @group(0) @binding(4) var<storage, read>       q1wv : array<vec4<u32>>;
+@group(0) @binding(5) var<storage, read>       q1xv : array<vec4<f32>>;
+
+// q4b_dot8's eight terms, the activations arriving as two vec4 registers.
+fn q1_dot8v(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
+    return (f32(w & 0xFu) - 8.0) * a.x
+         + (f32((w >> 4u) & 0xFu) - 8.0) * a.y
+         + (f32((w >> 8u) & 0xFu) - 8.0) * a.z
+         + (f32((w >> 12u) & 0xFu) - 8.0) * a.w
+         + (f32((w >> 16u) & 0xFu) - 8.0) * b.x
+         + (f32((w >> 20u) & 0xFu) - 8.0) * b.y
+         + (f32((w >> 24u) & 0xFu) - 8.0) * b.z
+         + (f32((w >> 28u) & 0xFu) - 8.0) * b.w;
+}
 
 var<workgroup> partial_q1: array<f32, 256>;   // 16 rows × 16 lanes
 // 1024-col activation tile, PADDED to 33 slots per 32-col group. The read
@@ -7902,6 +7915,80 @@ fn bt_o_lora_a(@builtin(workgroup_id) wid: vec3<u32>,
 }
 
 
+// The grouped projection, four rows to a 64-thread workgroup: the x span
+// loads once per group iteration and feeds all four rows from registers,
+// and the scale comes straight from the row params — the shared ladder
+// with its barriers is what made the original spend 0.4 ms on 30 MB.
+// Each row keeps the original's lane assignment, group order and 64-wide
+// tree, so its sum is bit-identical.
+var<workgroup> obt_p4: array<f32, 64>;
+@compute @workgroup_size(64)
+fn bt_o_lora_a4(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let lora = q1p._p0;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let t = wid.y;
+    let row0 = wid.x * 4u;
+    let xtok = t * (rows / lora) * gpr * 32u;
+    let xoff = xtok + (row0 / lora) * gpr * 32u;
+    var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
+    var g = lid;
+    loop {
+        if (g >= gpr) { break; }
+        let xb = xoff + g * 32u;
+        let v0 = q1xv[(xb >> 2u)];      let v1 = q1xv[(xb >> 2u) + 1u];
+        let v2 = q1xv[(xb >> 2u) + 2u]; let v3 = q1xv[(xb >> 2u) + 3u];
+        let v4 = q1xv[(xb >> 2u) + 4u]; let v5 = q1xv[(xb >> 2u) + 5u];
+        let v6 = q1xv[(xb >> 2u) + 6u]; let v7 = q1xv[(xb >> 2u) + 7u];
+        let bit = g * 5u;
+        let cb0 = bit >> 3u;
+        let sh = bit & 7u;
+        for (var r = 0u; r < 4u; r = r + 1u) {
+            let row = row0 + r;
+            if (row >= rows) { break; }
+            let pr = unpack2x16float(q1w[params_w + row]);
+            let cb = codes_b + row * cstride + cb0;
+            var cv = q4tp_byte(cb);
+            if (sh > 3u) { cv = cv | (q4tp_byte(cb + 1u) << 8u); }
+            let code = (cv >> sh) & 31u;
+            let scale = exp2(pr.x + f32(code) * pr.y);
+            let wv = q1wv[row * gpr + g];
+            var gsum = 0.0;
+            gsum = q1_dot8v(wv.x, v0, v1)
+                 + q1_dot8v(wv.y, v2, v3)
+                 + q1_dot8v(wv.z, v4, v5)
+                 + q1_dot8v(wv.w, v6, v7);
+            let vsc = scale * gsum;
+            if (r == 0u) { a0 = a0 + vsc; }
+            if (r == 1u) { a1 = a1 + vsc; }
+            if (r == 2u) { a2 = a2 + vsc; }
+            if (r == 3u) { a3 = a3 + vsc; }
+        }
+        g = g + 64u;
+    }
+    for (var r = 0u; r < 4u; r = r + 1u) {
+        var acc = a0;
+        if (r == 1u) { acc = a1; }
+        if (r == 2u) { acc = a2; }
+        if (r == 3u) { acc = a3; }
+        obt_p4[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid < stride) { obt_p4[lid] = obt_p4[lid] + obt_p4[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lid == 0u && row0 + r < rows) { q1y[t * rows + row0 + r] = obt_p4[0]; }
+        workgroupBarrier();
+    }
+}
+
 // The grouped projection with the group's x span staged through shared
 // memory: all four sub-rows of a workgroup belong to one o-group and
 // re-read the same span — the stage cuts that traffic four-fold. Values
@@ -8244,6 +8331,7 @@ struct Ctx {
     bt_top_k: wgpu::ComputePipeline,
     bt_idx_build_staged: wgpu::ComputePipeline,
     bt_o_lora_a: wgpu::ComputePipeline,
+    bt_o_lora_a4: wgpu::ComputePipeline,
     bt_o_lora_a2: Option<wgpu::ComputePipeline>,
     q4tp_mv: wgpu::ComputePipeline,
     /// Tall-matrix q4tp matvec (4 rows/workgroup, vec4 nibble loads); the
@@ -8821,6 +8909,7 @@ fn init() -> Result<Ctx, String> {
     let bt_top_k = pipe("bt_top_k");
     let bt_idx_build_staged = pipe("bt_idx_build_staged");
     let bt_o_lora_a = pipe("bt_o_lora_a");
+    let bt_o_lora_a4 = pipe("bt_o_lora_a4");
     // The staged twin's 4608-float span needs 18 KB and change of
     // workgroup storage; a 16 KB device simply never creates it.
     let bt_o_lora_a2 = (wg_storage >= 19_500).then(|| pipe("bt_o_lora_a2"));
@@ -9073,6 +9162,7 @@ fn init() -> Result<Ctx, String> {
         bt_top_k,
         bt_idx_build_staged,
         bt_o_lora_a,
+        bt_o_lora_a4,
         bt_o_lora_a2,
         q4tp_mv,
         q4tp_mv4,
@@ -21035,6 +21125,14 @@ fn dsv4_chain_batch_bt(
 /// mix's 1.5 MB of weights through one SM per token — measured on the
 /// release at B=5: fused 2.98 ms of the layer, split 1.15; the chain went
 /// 187 → 110 ms. Split is the default; the fuse stays for a bisect.
+/// `CMF_DSV4_OLORA_A4=0`: the grouped projection back on the shared-ladder
+/// kernel. The four-row register twin computes the same sums in the same
+/// order without the ladder's barriers.
+fn ol_a4() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV4_OLORA_A4").map(|v| v != "0").unwrap_or(true))
+}
+
 fn bt_hc_split() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CMF_DSV4_BT_HCSPLIT").map(|v| v != "0").unwrap_or(true))
@@ -21541,21 +21639,34 @@ pub fn dspark_graph(
             // o_project
             let o_rows = g.o_groups * g.o_lora;
             let o_cols = g.nh * g.hd / g.o_groups;
+            let p_ol = if g.o_lora % 4 == 0 && ol_a4() {
+                &c.bt_o_lora_a4
+            } else {
+                &c.bt_o_lora_a
+            };
+            let a4 = std::ptr::eq(
+                p_ol as *const wgpu::ComputePipeline,
+                &c.bt_o_lora_a4 as *const _,
+            );
             let bind = cached_bind(c, bk(244), || {
                 let p = uniform_u32x4(c, [(o_cols / 32) as u32, o_rows as u32, g.o_lora as u32, 0]);
+                let mut entries = vec![bind_buf(0, &wo_a)];
+                if !a4 {
+                    entries.push(bind_buf(1, &attn_bt));
+                }
+                entries.push(bind_buf(2, &mid_bt));
+                entries.push(bind_buf(3, &p));
+                entries.push(bind_buf(4, &wo_a));
+                if a4 {
+                    entries.push(bind_buf(5, &attn_bt));
+                }
                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
-                    layout: &c.bt_o_lora_a.get_bind_group_layout(0),
-                    entries: &[
-                        bind_buf(0, &wo_a),
-                        bind_buf(1, &attn_bt),
-                        bind_buf(2, &mid_bt),
-                        bind_buf(3, &p),
-                        bind_buf(4, &wo_a),
-                    ],
+                    layout: &p_ol.get_bind_group_layout(0),
+                    entries: &entries,
                 })
             });
-            pass.set_pipeline(&c.bt_o_lora_a);
+            pass.set_pipeline(p_ol);
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups((o_rows as u32).div_ceil(4), block as u32, 1);
         }
@@ -21730,6 +21841,35 @@ thread_local! {
 
 /// Read a pooled frame buffer back, for parity debugging only: the tag
 /// registry names what lives where.
+/// Debug window into a layer's INDEX cache: `n` floats from float offset
+/// `off`. The fold-in-verify investigation reads the entry a fused fold
+/// just landed and compares it against the per-token path's.
+pub fn dsv4_dbg_read_ix(kv_id: u64, li: usize, off: usize, n: usize) -> Option<Vec<f32>> {
+    let c = ctx()?;
+    let b = {
+        let m = c.dsv4_ixkv.lock().unwrap();
+        m.get(&(kv_id, li)).map(|(b, _)| b.clone())?
+    };
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dbg-ix-stage"),
+        size: (n * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    enc.copy_buffer_to_buffer(&b, (off * 4) as u64, &stage, 0, (n * 4) as u64);
+    submit(c, enc.finish());
+    let slice = stage.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+    let data = slice.get_mapped_range().ok()?;
+    let v: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+    drop(data);
+    Some(v)
+}
+
 pub fn dsv4_dbg_read_tag(tag: u8, tok: usize, n: usize) -> Option<Vec<f32>> {
     let c = ctx()?;
     let b = {
@@ -22849,6 +22989,13 @@ fn dsv4_layer_frame_bt_enc(
         if !dsv4_skip("olora") && !dsv4_skip("oproj") {
             let o_rows = a.o_groups * a.o_lora;
             let o_cols = a.nh * a.hd / a.o_groups;
+            if ts_armed {
+                // Attribution probe: an empty pass between the attends and
+                // this dispatch absorbs the prior pass's drain into its own
+                // window, so `olora` reads the dispatch alone.
+                bt_ts(10);
+                let _p = begin_pass(enc);
+            }
             mark(7);
             // The staged twin shares one o-group's x span across its four
             // sub-rows; shapes that straddle a group keep the direct kernel.
@@ -22861,24 +23008,33 @@ fn dsv4_layer_frame_bt_enc(
             };
             let p_ol = match c.bt_o_lora_a2.as_ref() {
                 Some(p2) if ol_stage && o_cols <= 4608 && a.o_lora % 4 == 0 => p2,
+                _ if a.o_lora % 4 == 0 && ol_a4() => &c.bt_o_lora_a4,
                 _ => &c.bt_o_lora_a,
             };
             let bind = cached_bind(c, bk(213), || {
                 let p = uniform_u32x4(c, [(o_cols / 32) as u32, o_rows as u32, a.o_lora as u32, 0]);
-                // The direct kernel reads its tiles through the vec4 view
-                // (binding 4); the staged twin never touches it and its
-                // auto layout has no slot for the entry.
-                let mut entries = vec![
-                    bind_buf(0, &wb[2]),
-                    bind_buf(1, &attn_bt),
-                    bind_buf(2, &mid_bt),
-                    bind_buf(3, &p),
-                ];
-                if !std::ptr::eq(
+                // Entries follow the chosen pipeline's auto layout: the a4
+                // twin reads x only through the vec4 view and drops the
+                // scalar binding; the staged twin has neither vec4 view.
+                let a4 = std::ptr::eq(
+                    p_ol as *const wgpu::ComputePipeline,
+                    &c.bt_o_lora_a4 as *const _,
+                );
+                let a2 = std::ptr::eq(
                     p_ol as *const wgpu::ComputePipeline,
                     c.bt_o_lora_a2.as_ref().map_or(std::ptr::null(), |x| x as *const _),
-                ) {
+                );
+                let mut entries = vec![bind_buf(0, &wb[2])];
+                if !a4 {
+                    entries.push(bind_buf(1, &attn_bt));
+                }
+                entries.push(bind_buf(2, &mid_bt));
+                entries.push(bind_buf(3, &p));
+                if !a2 {
                     entries.push(bind_buf(4, &wb[2]));
+                }
+                if a4 {
+                    entries.push(bind_buf(5, &attn_bt));
                 }
                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
