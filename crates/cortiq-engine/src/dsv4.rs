@@ -4375,7 +4375,12 @@ fn host_tail_walk_batch(
     let mut posts = vec![0.0f32; b * hc];
     let mut combs = vec![0.0f32; b * hc * hc];
     let mut resid = vec![0.0f32; b * hc * dim];
+    let spec_time = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CMF_DSV4_SPEC_TIME").is_ok_and(|v| v != "0"))
+    };
     for (li, l) in layers.iter().enumerate().skip(gpu_end) {
+        let t_attn = std::time::Instant::now();
         let freqs = if l.compressor.is_some() {
             &g.inv_freq_compress
         } else {
@@ -4397,6 +4402,7 @@ fn host_tail_walk_batch(
                 |f, o| attention_step(f, l, cfg, st, li, freqs, pool, None, o),
             );
         }
+        let t_glue = std::time::Instant::now();
         for t in 0..b {
             let state = &states[t * hc * dim..(t + 1) * hc * dim];
             hc_mixes(state, &l.hc_ffn_fn, mix_hc, cfg.norm_eps, pool, &mut scratch.mixes);
@@ -4421,11 +4427,13 @@ fn host_tail_walk_batch(
             resid[t * hc * dim..(t + 1) * hc * dim]
                 .copy_from_slice(&states[t * hc * dim..(t + 1) * hc * dim]);
         }
+        let t_moe = std::time::Instant::now();
         if host_cpu_moe() {
             crate::gpu::cpu_scope(|| moe_step_block(&folds, b, l, cfg, ids, li, pool, &mut mo));
         } else {
             moe_step_block(&folds, b, l, cfg, ids, li, pool, &mut mo);
         }
+        let t_exp = std::time::Instant::now();
         for t in 0..b {
             let state = &mut states[t * hc * dim..(t + 1) * hc * dim];
             hc_expand(
@@ -4438,6 +4446,15 @@ fn host_tail_walk_batch(
                 state,
             );
             dspark_note(li, state, cfg);
+        }
+        if spec_time {
+            eprintln!(
+                "хвост слоя {li}: attn {:.1} мс, клей {:.1}, moe {:.1}, expand {:.1}",
+                (t_glue - t_attn).as_secs_f64() * 1e3,
+                (t_moe - t_glue).as_secs_f64() * 1e3,
+                (t_exp - t_moe).as_secs_f64() * 1e3,
+                t_exp.elapsed().as_secs_f64() * 1e3,
+            );
         }
     }
 }
