@@ -4430,10 +4430,19 @@ fn draft_probe() -> bool {
         // becomes the new tip's draft input; every one owes the ring an
         // entry for its position.
         let (hc, dim) = (cfg.hc_mult, cfg.dim);
+        // A PARTIAL capture layer never rides the chain, so the batch has
+        // no photograph of it — its tip capture comes from the walk's own
+        // note like any host layer's. Filtering on the device set alone
+        // handed the draft a never-written photo slot for exactly the
+        // most important input (the last layer feeds main_proj), and the
+        // split configurations drafted at 27% no matter the residency.
         let dev_caps: Vec<usize> = targets
             .iter()
             .copied()
-            .filter(|&t| st.dev_set.get(t).copied().unwrap_or(false))
+            .filter(|&t| {
+                st.dev_set.get(t).copied().unwrap_or(false)
+                    && !st.partial_set.get(t).copied().unwrap_or(false)
+            })
             .collect();
         let mut caps_all = vec![0.0f32; dev_caps.len() * b * hc * dim];
         if !crate::gpu_wgpu::dsv4_spec_cap_read_all(b, dev_caps.len(), hc * dim, &mut caps_all) {

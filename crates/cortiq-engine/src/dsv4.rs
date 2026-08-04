@@ -911,6 +911,11 @@ pub struct Dsv4State {
     /// frame and the device MoE frame of one layer share pooled slots and
     /// poison each other across tokens (see `attention_step`).
     pub partial_set: Vec<bool>,
+    /// More than one layer walks past the device prefix. The stale-slot
+    /// poison needs a CHAIN of walk frames handing state through the pooled
+    /// slots; a single tail layer (the canonical shape) never chains and
+    /// its device attention is measured exact.
+    pub split_deep: bool,
 }
 
 impl Dsv4State {
@@ -925,6 +930,7 @@ impl Dsv4State {
             dev_owned: false,
             dev_set: Vec::new(),
             partial_set: Vec::new(),
+            split_deep: false,
             window: vec![Vec::new(); layers],
             compressed: vec![Vec::new(); layers],
             index_kv: vec![Vec::new(); layers],
@@ -1453,7 +1459,7 @@ pub fn attention_step(
     // prefix walks its attention on the host. A configuration with no
     // partial layer keeps device attention everywhere — the canonical
     // stand and the MAX_LI ladder both measure that bit-exact.
-    let split_config = st.partial_set.iter().any(|&p| p);
+    let split_config = st.partial_set.iter().any(|&p| p) && st.split_deep;
     let past_chain = st.dev_owned
         && (li >= st.dev_set.len() || !st.dev_set.get(li).copied().unwrap_or(false));
     if std::env::var("CMF_DSV4_GATE_DBG").is_ok() {
@@ -1890,6 +1896,12 @@ fn dsv4_layer_loop(
     // model wrong (measured; see `attention_step`).
     if st.partial_set.len() != partial_dev.len() || st.partial_set != partial_dev {
         st.partial_set = partial_dev.clone();
+        st.split_deep = active_dev
+            .iter()
+            .zip(&partial_dev)
+            .filter(|(a, p)| !**a || **p)
+            .count()
+            > 1;
     }
 
     // Which layers the card actually took, said once. A layer that falls to
