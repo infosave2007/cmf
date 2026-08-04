@@ -4340,7 +4340,28 @@ fn draft_probe() -> bool {
             }
             return None;
         }
-        let k_verify = crate::dsv4::dspark_verify_k().min(props.len());
+        let mut k_verify = crate::dsv4::dspark_verify_k().min(props.len());
+        // Adaptive depth: positions the draft itself doubts are paid for on
+        // every verify and delivered almost never (natural-text survival
+        // [.67 .50 .29 .08 .04]). `CMF_DSPARK_CONF_MIN=p` trims the fed
+        // prefix at the first proposal whose confidence drops below p; on
+        // predictable text the confidences stay high and nothing changes.
+        let conf_min = {
+            static M: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+            *M.get_or_init(|| {
+                std::env::var("CMF_DSPARK_CONF_MIN")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.0)
+            })
+        };
+        if conf_min > 0.0 && conf.len() >= props.len() {
+            let mut keep = 1usize;
+            while keep < k_verify && conf.get(keep).copied().unwrap_or(0.0) >= conf_min {
+                keep += 1;
+            }
+            k_verify = k_verify.min(keep.max(2));
+        }
         if k_verify < 2 {
             return None;
         }
