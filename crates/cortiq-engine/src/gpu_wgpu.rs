@@ -267,6 +267,10 @@ struct Q1Params { np: u32, rows: u32, _p0: u32, _p1: u32 };
 @group(0) @binding(1) var<storage, read>       q1x : array<f32>;   // raw f32 activations
 @group(0) @binding(2) var<storage, read_write> q1y : array<f32>;
 @group(0) @binding(3) var<uniform>             q1p : Q1Params;
+// The grouped projection's weight tiles, 16 bytes at a time — the tile
+// base (row·gpr+g)·4 words is vec4-aligned by construction. Only the
+// batch o_lora kernel binds this view.
+@group(0) @binding(4) var<storage, read>       q1wv : array<vec4<u32>>;
 
 var<workgroup> partial_q1: array<f32, 256>;   // 16 rows × 16 lanes
 // 1024-col activation tile, PADDED to 33 slots per 32-col group. The read
@@ -7653,12 +7657,13 @@ fn bt_o_lora_a(@builtin(workgroup_id) wid: vec3<u32>,
             var cv = q4tp_byte(cb);
             if (sh > 3u) { cv = cv | (q4tp_byte(cb + 1u) << 8u); }
             let scale = obt_lad[sub * 32u + ((cv >> sh) & 31u)];
-            let base = (row * gpr + g) * 4u;
+            let wv = q1wv[row * gpr + g];
             let xb = xoff + g * 32u;
             var gsum = 0.0;
-            for (var k = 0u; k < 4u; k = k + 1u) {
-                gsum = gsum + q4b_dot8(q1w[base + k], xb + 8u * k);
-            }
+            gsum = gsum + q4b_dot8(wv.x, xb);
+            gsum = gsum + q4b_dot8(wv.y, xb + 8u);
+            gsum = gsum + q4b_dot8(wv.z, xb + 16u);
+            gsum = gsum + q4b_dot8(wv.w, xb + 24u);
             acc = acc + scale * gsum;
             g = g + 64u;
         }
@@ -21301,6 +21306,7 @@ pub fn dspark_graph(
                         bind_buf(1, &attn_bt),
                         bind_buf(2, &mid_bt),
                         bind_buf(3, &p),
+                        bind_buf(4, &wo_a),
                     ],
                 })
             });
@@ -22555,15 +22561,25 @@ fn dsv4_layer_frame_bt_enc(
             };
             let bind = cached_bind(c, bk(213), || {
                 let p = uniform_u32x4(c, [(o_cols / 32) as u32, o_rows as u32, a.o_lora as u32, 0]);
+                // The direct kernel reads its tiles through the vec4 view
+                // (binding 4); the staged twin never touches it and its
+                // auto layout has no slot for the entry.
+                let mut entries = vec![
+                    bind_buf(0, &wb[2]),
+                    bind_buf(1, &attn_bt),
+                    bind_buf(2, &mid_bt),
+                    bind_buf(3, &p),
+                ];
+                if !std::ptr::eq(
+                    p_ol as *const wgpu::ComputePipeline,
+                    c.bt_o_lora_a2.as_ref().map_or(std::ptr::null(), |x| x as *const _),
+                ) {
+                    entries.push(bind_buf(4, &wb[2]));
+                }
                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &p_ol.get_bind_group_layout(0),
-                    entries: &[
-                        bind_buf(0, &wb[2]),
-                        bind_buf(1, &attn_bt),
-                        bind_buf(2, &mid_bt),
-                        bind_buf(3, &p),
-                    ],
+                    entries: &entries,
                 })
             });
             let mut pass = begin_pass(enc);
