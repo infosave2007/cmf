@@ -64,7 +64,7 @@ either way.
 
 ```bash
 # 112 GB, 15 parts, concatenated:
-BASE=https://huggingface.co/infosave/DeepSeek-V4-Flash-0731-cmf/resolve/main/parts-q2tp-v2
+BASE=https://huggingface.co/infosave/DeepSeek-V4-Flash-0731-cmf/resolve/main/parts-q2tp-v3
 : > /content/dsv4-q2tp.cmf
 for i in $(seq 0 14); do
   aria2c -x8 -s8 -q --allow-overwrite=true -d /content -o tmp "$BASE/$(printf part_%03d $i)"
@@ -89,8 +89,16 @@ export CMF_DSV4_GPU_LAYER=1 CMF_SDOT=0 CMF_DSV4_CHAIN=1
 Expected on the 97887 MiB stand: **30.2 tok/s steady** (128-token canonical run). All 43 layers use the
 card: 42 have complete expert packs and the last pack contains 199/256 routed
 experts; cold winners are completed from the mmap-backed CMF on the CPU.
-Perplexity gold is **3.282** (`cortiq ppl … --file /root/ppl.txt --tokens
-128`), which equals the CPU exactly — any change that moves it is a defect.
+Perplexity gold is **4.578** (`cortiq ppl … --file docs/ppl_nat.txt
+--tokens 128`), which equals the CPU exactly — any change that moves it is
+a defect. The reference text lives in the repository now: the previous
+gold (3.282) was pinned to a file that existed only on a Colab box and
+died with it, taking the comparable number along. The absolute value is a
+property of the TEXT — the invariants are before==after for any format
+surgery and GPU==CPU on the same file. parts-q2tp-v3 differs from v2 in
+exactly one respect: the MTP draft stack's expert gate/up planes are
+Q2TiledP in the file (drafting fidelity only; the trunk is byte-identical,
+verified by hash and by bit-equal perplexity across the recode).
 
 `CMF_UPLOAD_EVICT=0` above is for a hot benchmark on a machine with enough
 RAM. Omit it (the default is eviction) for the out-of-core production mode:
