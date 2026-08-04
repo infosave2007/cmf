@@ -6785,9 +6785,19 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
             return None;
         }
     }
-    let gu_q2 = crate::dsv4::DSPARK_Q2TP_ENCODE.get().is_some();
+    // The dtype in the FILE decides: a properly converted CMF stores the
+    // draft's gate/up as q2tp and uploads through the same path as the
+    // trunk's 2-bit experts. The at-upload requant is only the fallback for
+    // files published before the converter's q2tp profile covered the MTP
+    // stack (and only when the binary registered an encoder).
+    let native_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
+        e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
+    });
+    let gu_q2 = native_q2 || crate::dsv4::DSPARK_Q2TP_ENCODE.get().is_some();
     for (si, sp) in stages.iter().enumerate() {
-        let ok = if gu_q2 {
+        let ok = if native_q2 {
+            crate::gpu_wgpu::dsv4_experts_ready(&model, &sp.tensors, cfg.moe_inter, cfg.dim, true)
+        } else if gu_q2 {
             crate::gpu_wgpu::moe_expert_bufs_requant_gu(
                 &model,
                 &sp.tensors,
