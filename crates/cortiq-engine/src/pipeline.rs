@@ -4244,7 +4244,7 @@ fn draft_probe() -> bool {
     #[cfg(feature = "gpu")]
     fn dsv4_spec_on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("CMF_DSV4_SPEC").is_ok_and(|v| v != "0"))
+        *ON.get_or_init(|| std::env::var("CMF_DSV4_SPEC").map(|v| v != "0").unwrap_or(true))
     }
 
     /// One speculative round at the decode tip. `t_next` is the token the

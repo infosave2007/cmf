@@ -1463,6 +1463,8 @@ impl Pipeline {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(3);
             pipeline.dsv4_mtp = crate::dsv4::load_mtp(model, &cfg, depth);
+            // Before any trunk pack is built: leave the draft its VRAM.
+            crate::dsv4::dspark_reserve_note(&pipeline.dsv4_mtp, &cfg, &dl);
             pipeline.dsv4 = Some(Box::new((g, dl, cfg, st)));
         }
         pipeline.short_conv_cfg = short_conv_cfg;
