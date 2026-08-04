@@ -6675,7 +6675,19 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
     let n_res: usize = std::env::var("CMF_DSPARK_RESIDENT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(48);
+        .unwrap_or_else(|| {
+            // No knob: take what the card actually has left, whatever the
+            // card is. The stages split the fit evenly after their shared
+            // experts; the clamp keeps the band where drafting is known to
+            // be worth the VRAM at the low end and past diminishing
+            // returns at the high one.
+            let native_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
+                e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
+            });
+            let gu_q2 = native_q2 || DSPARK_Q2TP_ENCODE.get().is_some();
+            let room = crate::gpu_wgpu::dsv4_experts_fit(cfg.moe_inter, cfg.dim, gu_q2);
+            (room.saturating_sub(mtp.len() + 1) / mtp.len().max(1)).clamp(8, 64)
+        });
     // Frequency tallies: lines of `stage<TAB>expert<TAB>count`.
     let mut freq: Vec<Vec<(u64, usize)>> = vec![Vec::new(); mtp.len()];
     if let Ok(path) = std::env::var("CMF_DSPARK_PACK") {
