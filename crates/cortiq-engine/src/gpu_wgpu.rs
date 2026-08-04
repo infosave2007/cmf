@@ -4469,6 +4469,10 @@ struct MoeDnBP { gpr: u32, hidden: u32, slots: u32, mat16: u32 };
 @group(0) @binding(3) var<storage, read>       db_wt  : array<f32>;
 @group(0) @binding(4) var<storage, read_write> db_y   : array<f32>;
 @group(0) @binding(5) var<uniform>             db_p   : MoeDnBP;
+// The same weight buffer, seen 16 bytes at a time: one q4tp group tile is
+// exactly one vec4<u32>, and the scalar view above pays four transactions
+// for it. Only the b4 kernel binds this view.
+@group(0) @binding(6) var<storage, read>       db_wv  : array<vec4<u32>>;
 var<workgroup> db_pt: array<f32, 64>;
 
 fn db_u16(o: u32) -> u32 { return (db_w[o >> 1u] >> ((o & 1u) * 16u)) & 0xFFFFu; }
@@ -4656,10 +4660,13 @@ fn moe_down_q4tp_b4(@builtin(workgroup_id) wid: vec3<u32>,
             if (r == 2u) { plr = pl2; }
             if (r == 3u) { plr = pl3; }
             let scale = exp2(plr.x + f32((cv >> shf) & 31u) * plr.y);
-            let w32 = (base16 + (row * gpr + g) * 8u) >> 1u;
+            let wv = db_wv[(base16 + (row * gpr + g) * 8u) >> 3u];
             var d = 0.0;
             for (var k = 0u; k < 4u; k = k + 1u) {
-                let w = db_w[w32 + k];
+                var w = wv.x;
+                if (k == 1u) { w = wv.y; }
+                if (k == 2u) { w = wv.z; }
+                if (k == 3u) { w = wv.w; }
                 let x8 = 8u * k;
                 d = d + (f32(w & 0xFu) - 8.0) * xs[x8]
                       + (f32((w >> 4u) & 0xFu) - 8.0) * xs[x8 + 1u]
@@ -22833,7 +22840,7 @@ fn dsv4_layer_frame_bt_enc(
             bt_ts(13);
             pass = begin_pass(enc);
         }
-        if bt_dn_mode() == 3 {
+        if bt_dn_mode() == 3 && stride16(m.hidden, m.inter, false) % 8 == 0 {
             let bind = cached_bind(c, bk(248), || {
                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
@@ -22845,6 +22852,7 @@ fn dsv4_layer_frame_bt_enc(
                         bind_buf(3, &mwt_bt),
                         bind_buf(4, &mo_bt),
                         bind_buf(5, &dn_u),
+                        bind_buf(6, &down_all),
                     ],
                 })
             });
