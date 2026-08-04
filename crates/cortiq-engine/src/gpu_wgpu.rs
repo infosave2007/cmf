@@ -26134,7 +26134,13 @@ pub fn dsv4_moe_frame(
     let lg = if w.logits.is_empty() {
         // Score on the card, from the input that is already there.
         let rb = const_buf(c, bytemuck::cast_slice(&w.router[..n_route * g.hidden]));
-        let lb = frame_buf(c, 16, n_route * 4, false);
+        // upload=true even on the device-scored arm: the pool keys buffers
+        // by (tag, tok, len) and the OTHER arm of this `if` fills the same
+        // slot with `write_buffer`. Whichever arm ran first used to fix the
+        // usage flags for the whole process — on a card small enough to
+        // route some layers on the host and some on the device, the second
+        // pattern died on a COPY_DST validation. An unused COPY_DST is free.
+        let lb = frame_buf(c, 16, n_route * 4, true);
         let mut e0 = c
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
