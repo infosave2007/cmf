@@ -20211,7 +20211,7 @@ fn dsv4_layer_frame_enc(
     let folded = frame_buf_t(c, 42, tok, dim * 4, true);
     let hpost = frame_buf_t(c, 43, tok, hc * 4, true);
     let hcomb = frame_buf_t(c, 44, tok, hc * hc * 4, true);
-    let x2 = frame_buf_t(c, 45, tok, dim * 4, false);
+    let x2 = frame_buf_t(c, 45, tok, dim * 4, true);
     let state2 = frame_buf(c, 46, hc * dim * 4, false);
     let logit_b = frame_buf(c, 47, n_pack * 4, false);
     let msel = frame_buf(c, 19, slots * 4, false);
@@ -20707,7 +20707,7 @@ pub fn dsv4_chain_batch(
             {
                 let mut pass = begin_pass(&mut enc);
                 for t in 0..batch {
-                    let x = frame_buf_t(c, 45, t, dim * 4, false);
+                    let x = frame_buf_t(c, 45, t, dim * 4, true);
                     encode_blit_p(
                         &mut pass,
                         c,
