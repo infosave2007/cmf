@@ -3649,8 +3649,9 @@ impl Pipeline {
         hidden: &[f32],
         position: usize,
         logits_out: &mut Vec<f32>,
+        layers_run: &mut usize,
     ) -> Option<Vec<f32>> {
-        self.try_token_graph_wgpu_steps(hidden, position, logits_out, 1, None)
+        self.try_token_graph_wgpu_steps(hidden, position, logits_out, 1, None, Some(layers_run))
     }
 
     /// Greedy burst: forward `t_next` and let the device pick + re-embed
@@ -3671,7 +3672,7 @@ impl Pipeline {
         let emb = self.embed_single(t_next);
         let mut lg = Vec::new();
         let mut ids = Vec::new();
-        self.try_token_graph_wgpu_steps(&emb, position, &mut lg, k, Some(&mut ids))?;
+        self.try_token_graph_wgpu_steps(&emb, position, &mut lg, k, Some(&mut ids), None)?;
         (ids.len() == k).then_some(ids)
     }
 
@@ -3685,6 +3686,7 @@ impl Pipeline {
         logits_out: &mut Vec<f32>,
         steps: usize,
         ids_out: Option<&mut Vec<u32>>,
+        layers_run: Option<&mut usize>,
     ) -> Option<Vec<f32>> {
         // O(1) Nyström decode runs off the sealed state, not the KV cache the
         // graph mirrors — never take the graph while o1 is active.
@@ -4011,6 +4013,7 @@ impl Pipeline {
             steps,
             emb_gw.as_ref().map(|(gw, rows, m)| (gw, *rows, *m)),
             ids_out,
+            layers_run,
         )
         .then_some(h)
     }
@@ -4767,17 +4770,27 @@ fn draft_probe() -> bool {
         let graph_trusted =
             graph_env.is_some() || crate::gpu::wgpu_graph_default() || self.gdn_cfg.is_some();
         let race_eligible = graph_on && upto.is_none() && task_mask.is_none();
+        let mut tail_start = 0usize;
         if race_eligible && crate::gpu::graph_race_use_graph(graph_trusted) {
             let t_graph = std::time::Instant::now();
             let mut lg = Vec::new();
-            let built = self.try_token_graph_wgpu(hidden, position, &mut lg);
+            let mut gl = 0usize;
+            let built = self.try_token_graph_wgpu(hidden, position, &mut lg, &mut gl);
             graph_note(built.is_some());
             if let Some(hh) = built {
                 let dur = t_graph.elapsed();
                 if std::env::var("CMF_GRAPH_PROF").is_ok() {
                     eprintln!("graph-call: {:.2} ms total", dur.as_secs_f64() * 1000.0);
                 }
-                if graph_trusted || !crate::gpu::graph_race_first_token_hopeless(dur) {
+                if gl > 0 && gl < self.num_layers {
+                    // Device prefix: the graph ran layers 0..gl and handed
+                    // back the boundary hidden — the loop below owns the
+                    // tail. The prefix layers' KV/state advanced on the
+                    // device; the tail's advances on the host below. One
+                    // boundary crossing per token.
+                    h = hh;
+                    tail_start = gl;
+                } else if graph_trusted || !crate::gpu::graph_race_first_token_hopeless(dur) {
                     if !graph_trusted {
                         crate::gpu::graph_race_record(true, dur);
                     }
@@ -4805,7 +4818,7 @@ fn draft_probe() -> bool {
 
         #[cfg(target_os = "macos")]
         let mut gpu_skip_until = 0usize;
-        for li in 0..self.num_layers {
+        for li in tail_start..self.num_layers {
             crate::gpu::set_layer(li as i64); // layer-split GPU/CPU (CMF_GPU_LAYERS)
             if let Some(u) = upto {
                 if li > u {

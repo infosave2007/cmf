@@ -829,6 +829,9 @@ pub fn forward_token_graph(
     steps: usize,
     embed: Option<(&GraphW, usize, f32)>,
     ids_out: Option<&mut Vec<u32>>,
+    // How many leading layers the graph ran (see the wgpu twin) — smaller
+    // than layers.len() when the expert budget ended the device prefix.
+    layers_run: Option<&mut usize>,
 ) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
@@ -857,10 +860,11 @@ pub fn forward_token_graph(
             steps,
             embed,
             ids_out,
+            layers_run,
         ),
         #[allow(unused_variables)]
         _ => {
-            let _ = (lm_head, final_norm, logits, loop_norm_at);
+            let _ = (lm_head, final_norm, logits, loop_norm_at, layers_run);
             false
         }
     }

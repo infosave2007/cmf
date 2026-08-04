@@ -9634,6 +9634,38 @@ fn graph_refused(why: &'static str) {
     }
 }
 
+/// Device bytes one layer's expert stack wants (gate + up + down, all
+/// experts). The builder asks BEFORE uploading to decide where the device
+/// prefix ends; `moe_expert_bufs` uses the same arithmetic for its budget
+/// refusal, so the two never disagree.
+fn moe_pack_bytes(
+    n_experts: usize,
+    inter: usize,
+    hidden: usize,
+    q4tp: bool,
+    gu_q2: bool,
+    dn_q2: bool,
+) -> Option<u64> {
+    let plen = |rows: usize, cols: usize| -> Option<usize> {
+        if q4tp {
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+        } else {
+            Some(rows * (cols / 32) * 18)
+        }
+    };
+    let gu_len = if gu_q2 {
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q2TiledP, &[inter, hidden])?
+    } else {
+        plen(inter, hidden)?
+    };
+    let d_len = if dn_q2 {
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q2TiledP, &[hidden, inter])?
+    } else {
+        plen(hidden, inter)?
+    };
+    Some((n_experts * (2 * gu_len + d_len)) as u64)
+}
+
 fn moe_expert_bufs(
     c: &Ctx,
     model: &Arc<CmfModel>,
@@ -10855,6 +10887,11 @@ pub fn forward_token_graph(
     steps: usize,
     embed: Option<(&crate::gpu::GraphW, usize, f32)>,
     ids_out: Option<&mut Vec<u32>>,
+    // Reports how many leading layers the graph executed. Equal to
+    // `layers.len()` on a full run; smaller when the expert budget ended
+    // the device prefix early — then `h` holds the boundary hidden, no
+    // logits were produced, and the caller owns the remaining layers.
+    mut layers_run: Option<&mut usize>,
 ) -> bool {
     let Some(c) = ctx() else {
         graph_refused("no ctx");
@@ -11030,6 +11067,11 @@ pub fn forward_token_graph(
     };
     let mut lws = Vec::with_capacity(layers.len());
     let mut gdn_dims: Option<(usize, usize, usize, usize, usize, usize)> = None; // nv,nk,dk,dv,kk,cdim
+    // Budget-driven device prefix: the first MoE layer whose experts no
+    // longer fit ends the prefix instead of sinking the whole graph — the
+    // caller finishes the remaining layers on the host from the boundary
+    // hidden. One sync per token at the boundary, not per layer.
+    let mut prefix = false;
     for l in layers {
         let attn = match &l.attn {
             crate::gpu::GraphAttn::Full {
@@ -11124,6 +11166,29 @@ pub fn forward_token_graph(
                 ) else {
                     return false;
                 };
+                // Over budget with layers already built: end the prefix
+                // here. Layer zero over budget keeps the historical loud
+                // whole-graph refusal inside moe_expert_bufs. A layer whose
+                // buffers are ALREADY on the card is never the one to stop
+                // at — its bytes are inside `resident`, so re-running the
+                // check against them would shrink the prefix to one layer
+                // on the second token (measured: 25 tok/s where 60 belongs).
+                let cached = experts.first().is_some_and(|e| {
+                    c.moe_expw
+                        .lock()
+                        .unwrap()
+                        .contains_key(&(model.uid() as usize, e.0))
+                });
+                let need = moe_pack_bytes(experts.len(), *mi, hidden, *q4tp, *gu_q2, false)
+                    .unwrap_or(u64::MAX);
+                if !cached
+                    && !lws.is_empty()
+                    && c.resident.load(std::sync::atomic::Ordering::Relaxed) + need
+                        > c.vram_budget
+                {
+                    prefix = true;
+                    break;
+                }
                 let Some((gate_all, up_all, down_all)) =
                     moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false)
                 else {
@@ -11146,6 +11211,28 @@ pub fn forward_token_graph(
         };
         lws.push(LW { attn, ffn });
     }
+    if prefix {
+        // The multi-step tail (on-device argmax + re-embed) needs the head,
+        // which a prefix does not reach — those callers fall back whole.
+        if steps > 1 || ids_out.is_some() {
+            graph_refused("device prefix cannot serve the multi-step tail");
+            return false;
+        }
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                "wgpu token graph: device prefix {} of {} layers (expert budget), \
+                 the tail runs on the host from the boundary hidden",
+                lws.len(),
+                layers.len()
+            );
+        }
+    }
+    if let Some(n) = layers_run.as_deref_mut() {
+        *n = lws.len();
+    }
+    let layers = &layers[..lws.len()];
     // DEVICE-LOCAL + content-cached: create_buffer + write_buffer keeps norm
     // weights in VRAM (not the HOST_VISIBLE heap create_buffer_init forces);
     // caching by (ptr,len) uploads each token-invariant norm buffer once.
@@ -12965,8 +13052,13 @@ pub fn forward_token_graph(
         return ok;
     }
     // h_buf now holds the final hidden. Either ride final-norm + lm_head and
-    // read back logits, or (no lm / unresolved weight) read back the hidden.
-    let lm_resolved = lm_head.and_then(|(gw, rows)| resolve(gw, rows, hidden).map(|m| (m, rows)));
+    // read back logits, or (no lm / unresolved weight / device prefix) read
+    // back the hidden — a prefix boundary is mid-stack, so no final norm.
+    let lm_resolved = if prefix {
+        None
+    } else {
+        lm_head.and_then(|(gw, rows)| resolve(gw, rows, hidden).map(|m| (m, rows)))
+    };
     let ok = if let Some((lm, lrows)) = lm_resolved {
         let fnw = stor(bytemuck::cast_slice(final_norm));
         go(
