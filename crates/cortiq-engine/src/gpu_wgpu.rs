@@ -21739,7 +21739,14 @@ fn dsv4_layer_frame_bt_enc(
                     return;
                 }
                 let tag = (231 + kind) as u8;
-                let bind = cached_bind(c, (tag, kv_id, li * FRAME_TOK_STRIDE * 8 + batch * 8 + t0), || {
+                // The uniform carries (t0, n); the fold position slides with
+                // pos0, so the SAME t0 recurs with a DIFFERENT n — n must be
+                // in the key or a stale shorter uniform silently drops the
+                // tail tokens' appends.
+                let bkey = ((li * FRAME_TOK_STRIDE + batch) * FRAME_TOK_STRIDE + t0)
+                    * FRAME_TOK_STRIDE
+                    + n;
+                let bind = cached_bind(c, (tag, kv_id, bkey), || {
                     let flags = cg.overlap as u32;
                     let pu = uniform_u32x4(c, [cg.width as u32, t0 as u32, n as u32, flags]);
                     c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -21761,11 +21768,12 @@ fn dsv4_layer_frame_bt_enc(
                 pass.set_bind_group(0, &bind, &[]);
                 pass.dispatch_workgroups((cg.width as u32).div_ceil(256), n as u32, 1);
             };
-            // Which kinds batch their appends. The indexer's compressor
-            // (kind 1) is proven walk-exact under segmentation; the
-            // attention one still diverges on the q4 stand and walks per
-            // token until that is found. CMF_DSV4_SEGAPP overrides.
-            let seg_on = std::env::var("CMF_DSV4_SEGAPP").unwrap_or_else(|_| "1".into());
+            // Which kinds batch their appends. Both are walk-exact now that
+            // the uniform's (t0, n) pair is part of the bind key — the old
+            // kind-0 "divergence" was a stale shorter n from a previous
+            // pass's cached uniform dropping tail appends. CMF_DSV4_SEGAPP
+            // overrides for a bisect.
+            let seg_on = std::env::var("CMF_DSV4_SEGAPP").unwrap_or_else(|_| "01".into());
             let seg_this = seg_on.contains(char::from(b'0' + *kind));
             let mut seg0 = 0usize;
             for (t, p) in preps.iter().enumerate() {
