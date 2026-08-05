@@ -876,9 +876,39 @@ impl Pipeline {
             }
             scan += 1;
         }
-        let Some(model) = model_ref else { return start };
-        if plan.is_empty() {
+        let Some(model) = model_ref else {
+            if std::env::var("CMF_GRAPH_DBG").is_ok() {
+                eprintln!("q1-graph: no model ref (start {start}, scanned to {scan})");
+            }
             return start;
+        };
+        if plan.is_empty() {
+            if std::env::var("CMF_GRAPH_DBG").is_ok() {
+                eprintln!("q1-graph: empty plan at layer {start}");
+            }
+            return start;
+        }
+        if std::env::var("CMF_GRAPH_DBG").is_ok() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                let fg = plan
+                    .iter()
+                    .filter(|it| matches!(it, Item::Attn { full_gpu: true, .. }))
+                    .count();
+                let att = plan
+                    .iter()
+                    .filter(|it| matches!(it, Item::Attn { .. }))
+                    .count();
+                eprintln!(
+                    "q1-graph: plan of {} items from layer {start} to {scan} | dev_attend={dev_attend} full_gpu {fg}/{att} | hd={} rd={} nkv={} nh={}",
+                    plan.len(),
+                    self.head_dim,
+                    self.rotary_dim,
+                    self.num_kv_heads,
+                    self.num_heads,
+                );
+            }
         }
         let dims = GraphDims {
             hidden: self.hidden_size,
