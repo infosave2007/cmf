@@ -1186,6 +1186,20 @@ pub struct DitBlockArgs<'a> {
 /// attention, residuals and the SwiGLU FFN in a single command
 /// buffer; only `x` crosses the CPU boundary (in and out).
 #[allow(unused_variables)]
+/// Is a FUSED whole-block device path on offer? The batched-CFG shape
+/// (two sequences in one tall batch) and the fused block (one sequence,
+/// one command buffer) are alternatives, and the caller picks.
+pub fn fused_dit_block_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        matches!(backend(), Backend::Metal) && fused_block_trusted()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 pub fn dit_block(model: &Arc<CmfModel>, a: &DitBlockArgs, x: &mut [f32]) -> bool {
     match backend() {
         #[cfg(target_os = "macos")]
