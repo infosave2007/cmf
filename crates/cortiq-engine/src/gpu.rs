@@ -1122,9 +1122,7 @@ pub fn q4tp_ffn(
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::q4tp_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
         #[cfg(feature = "gpu")]
-        // No wgpu twin yet: the fused DiT chain there is q4t-only, so a q4tp
-        // model keeps the unfused wgpu path rather than a wrong kernel.
-        Backend::Wgpu => false,
+        Backend::Wgpu => crate::gpu_wgpu::q4tp_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -1246,6 +1244,11 @@ pub fn vae_upsample_conv(
     match backend() {
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::vae_upsample_conv(w, bias, x, ic, oc, h, w_img, k, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => {
+            crate::gpu_wgpu::vae_upsample_conv(w, bias, x, ic, oc, h, w_img, k, out)
+        }
+        #[allow(unreachable_patterns)]
         _ => false,
     }
 }
@@ -1267,6 +1270,9 @@ pub fn vae_conv2d(
     match backend() {
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::vae_conv2d(w, bias, x, ic, oc, h, w_img, k, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::vae_conv2d(w, bias, x, ic, oc, h, w_img, k, out),
+        #[allow(unreachable_patterns)]
         _ => false,
     }
 }

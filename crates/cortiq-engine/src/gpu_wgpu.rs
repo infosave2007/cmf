@@ -1069,6 +1069,55 @@ fn f32_gemm_dx(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
     if (lid == 0u) { gx_dx[r * gx_p.k + j] = gx_part[0]; }
 }
 
+// ── VAE convolution (direct, same padding, stride 1) ────────────────────
+// One thread per (output channel, pixel). The CPU path builds an im2col
+// matrix — multi-GB at 512² — and the Metal path has had a device kernel
+// since the image runtime shipped; without this twin every Vulkan/DX12/
+// Android box decoded the latent on the CPU, which is 3.1 s of a 11.8 s
+// 256² render and grows with the pixels.
+// `up2` != 0 reads the source at (y/2, x/2): the nearest-2× upsample the
+// decoder does before its conv, fused so only the SMALL image crosses.
+struct VcP { ic: u32, oc: u32, h: u32, w: u32, k: u32, up2: u32, sh: u32, sw: u32 };
+@group(0) @binding(0) var<storage, read>       vc_w : array<f32>;
+@group(0) @binding(1) var<storage, read>       vc_b : array<f32>;
+@group(0) @binding(2) var<storage, read>       vc_x : array<f32>;
+@group(0) @binding(3) var<storage, read_write> vc_y : array<f32>;
+@group(0) @binding(4) var<uniform>             vc_p : VcP;
+@compute @workgroup_size(64)
+fn vae_conv(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let hw = vc_p.h * vc_p.w;
+    let pix = gid.x;
+    let oc = gid.y;
+    if (pix >= hw || oc >= vc_p.oc) { return; }
+    let oy = pix / vc_p.w;
+    let ox = pix % vc_p.w;
+    let k = vc_p.k;
+    let pad = k / 2u;
+    let shw = vc_p.sh * vc_p.sw;
+    var acc = vc_b[oc];
+    for (var ci = 0u; ci < vc_p.ic; ci = ci + 1u) {
+        let wbase = (oc * vc_p.ic + ci) * k * k;
+        let xbase = ci * shw;
+        for (var ky = 0u; ky < k; ky = ky + 1u) {
+            // Signed arithmetic in u32: skip taps that fall outside.
+            let sy = oy + ky;
+            if (sy < pad) { continue; }
+            var iy = sy - pad;
+            if (vc_p.up2 != 0u) { iy = iy / 2u; }
+            if (iy >= vc_p.sh) { continue; }
+            for (var kx = 0u; kx < k; kx = kx + 1u) {
+                let sx = ox + kx;
+                if (sx < pad) { continue; }
+                var ix = sx - pad;
+                if (vc_p.up2 != 0u) { ix = ix / 2u; }
+                if (ix >= vc_p.sw) { continue; }
+                acc = acc + vc_w[wbase + ky * k + kx] * vc_x[xbase + iy * vc_p.sw + ix];
+            }
+        }
+    }
+    vc_y[oc * hw + pix] = acc;
+}
+
 // RMSNorm of one row (WGSL twin of Metal rmsnorm_k): o = x·rsqrt(mean(x²)+eps)·w',
 // w' = w or (1+w) for gemma. One workgroup, 256-thread tree reduction — the
 // building block that keeps the token graph's hidden resident across the norm.
@@ -9072,6 +9121,7 @@ struct Ctx {
     q4tp_mv_k: wgpu::ComputePipeline,
     q4tp_mv16w: wgpu::ComputePipeline,
     f32_gemm_dx: wgpu::ComputePipeline,
+    vae_conv: wgpu::ComputePipeline,
     gdn_step_par_k: wgpu::ComputePipeline,
     gdn_step_norm_k: wgpu::ComputePipeline,
     gdn_step_k: wgpu::ComputePipeline,
@@ -9737,6 +9787,7 @@ fn init() -> Result<Ctx, String> {
     let q4tp_mv_k = pipe("q4tp_matvec4_k");
     let q4tp_mv16w = pipe("q4tp_matvec16w");
     let f32_gemm_dx = pipe("f32_gemm_dx");
+    let vae_conv = pipe("vae_conv");
     let gdn_step_par_k = pipe("gdn_step_par_k");
     let gdn_step_norm_k = pipe("gdn_step_norm_k");
     let gdn_step_k = pipe("gdn_step_k");
@@ -9961,6 +10012,7 @@ fn init() -> Result<Ctx, String> {
         q4tp_mv_k,
         q4tp_mv16w,
         f32_gemm_dx,
+        vae_conv,
         gdn_step_par_k,
         gdn_step_norm_k,
         gdn_step_k,
@@ -16878,6 +16930,41 @@ pub fn q4t_ffn(
     inter: usize,
     out: &mut [f32],
 ) -> bool {
+    ffn_q4(model, w1, w3, w2, xs, b, hidden, inter, false, out)
+}
+
+/// The q4tp twin. Same three GEMMs, same scratch, the ladder layout's
+/// kernel — without it every Vulkan/DX12/Android box ran a q4tp image
+/// model's diffusion transformer entirely on the CPU: the facade had no
+/// wgpu arm to offer and said so by returning false.
+#[allow(clippy::too_many_arguments)]
+pub fn q4tp_ffn(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w3: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    out: &mut [f32],
+) -> bool {
+    ffn_q4(model, w1, w3, w2, xs, b, hidden, inter, true, out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ffn_q4(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w3: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    q4tp: bool,
+    out: &mut [f32],
+) -> bool {
     let Some(c) = ctx() else { return false };
     if hidden % 32 != 0 || inter % 32 != 0 || b == 0 {
         return false;
@@ -16887,7 +16974,13 @@ pub fn q4t_ffn(
         let entry = &model.tensors[idx];
         let abs = model.entry_abs_offset(entry)?;
         let plen = entry.nbytes as usize;
-        if plen < rows * (cols / 32) * 18 || abs + plen > bytes.len() {
+        let want = if q4tp {
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+                .unwrap_or(usize::MAX)
+        } else {
+            rows * (cols / 32) * 18
+        };
+        if plen < want || abs + plen > bytes.len() {
             return None;
         }
         weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])
@@ -16947,7 +17040,8 @@ pub fn q4t_ffn(
     let p13 = uniform_u32x4(c, [(hidden / 4) as u32, inter as u32, b as u32, 0]);
     let p2 = uniform_u32x4(c, [(inter / 4) as u32, hidden as u32, b as u32, 0]);
     let psilu = uniform_u32x4(c, [(b * inter) as u32, 0, 0, 0]);
-    let mm_layout = c.q4t_mm.get_bind_group_layout(0);
+    let mm = if q4tp { &c.q4tp_mm } else { &c.q4t_mm };
+    let mm_layout = mm.get_bind_group_layout(0);
     let bind_mm = |q: &wgpu::Buffer, x: &wgpu::Buffer, y: &wgpu::Buffer, p: &wgpu::Buffer| {
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("q4tffn-bg"),
@@ -16982,7 +17076,7 @@ pub fn q4t_ffn(
             label: Some("q4tffn-mm"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&c.q4t_mm);
+        pass.set_pipeline(mm);
         pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(
             (rows as u32).div_ceil(64).min(MAX_WG),
@@ -25100,6 +25194,141 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
         mapped_at_creation: false,
     });
     readback(c, enc, &dxb, &stage, bytes, &mut dx[..n * k])
+}
+
+/// VAE conv2d on the card: same padding, stride 1, direct (no im2col).
+/// The weights are cached by address — a decoder calls the same convs
+/// once per image, and a server renders many.
+#[allow(clippy::too_many_arguments)]
+pub fn vae_conv2d(
+    w: &[f32],
+    bias: &[f32],
+    x: &[f32],
+    ic: usize,
+    oc: usize,
+    h: usize,
+    w_img: usize,
+    k: usize,
+    out: &mut [f32],
+) -> bool {
+    vae_conv_impl(w, bias, x, ic, oc, h, w_img, k, false, out)
+}
+
+/// Nearest-2× upsample fused with the conv that follows it: the source
+/// is the SMALL image (h/2 × w/2), so only it crosses the boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn vae_upsample_conv(
+    w: &[f32],
+    bias: &[f32],
+    x: &[f32],
+    ic: usize,
+    oc: usize,
+    h: usize,
+    w_img: usize,
+    k: usize,
+    out: &mut [f32],
+) -> bool {
+    vae_conv_impl(w, bias, x, ic, oc, h, w_img, k, true, out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vae_conv_impl(
+    w: &[f32],
+    bias: &[f32],
+    x: &[f32],
+    ic: usize,
+    oc: usize,
+    h: usize,
+    w_img: usize,
+    k: usize,
+    up2: bool,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    // `h`/`w_img` are the SOURCE dims; an upsampling conv writes 2x.
+    let (oh, ow) = if up2 { (h * 2, w_img * 2) } else { (h, w_img) };
+    let ick2 = ic * k * k;
+    if w.len() != oc * ick2 || x.len() != ic * h * w_img || out.len() != oc * oh * ow {
+        return false;
+    }
+    if oc as u32 > 65_000 || (oh * ow) as u32 > 65_000 * 64 {
+        return false;
+    }
+    let cache = |data: &[f32], label: &'static str| -> wgpu::Buffer {
+        let key = (data.as_ptr() as usize, data.len());
+        let mut cb = c.const_bufs.lock().unwrap();
+        if let Some(b) = cb.get(&key) {
+            return b.clone();
+        }
+        let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (data.len() * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
+        cb.insert(key, b.clone());
+        b
+    };
+    let wb = cache(w, "vae-w");
+    let bb = cache(bias, "vae-b");
+    let xb = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vae-x"),
+        size: (x.len() * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    c.queue.write_buffer(&xb, 0, bytemuck::cast_slice(x));
+    let yb = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vae-y"),
+        size: (out.len() * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let u = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[
+                ic as u32,
+                oc as u32,
+                oh as u32,
+                ow as u32,
+                k as u32,
+                up2 as u32,
+                h as u32,
+                w_img as u32,
+            ]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("vae-conv") });
+    {
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.vae_conv.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &wb),
+                bind_buf(1, &bb),
+                bind_buf(2, &xb),
+                bind_buf(3, &yb),
+                bind_buf(4, &u),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.vae_conv);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(((oh * ow) as u32).div_ceil(64), oc as u32, 1);
+    }
+    let bytes = (out.len() * 4) as u64;
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vae-stage"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    readback(c, enc, &yb, &stage, bytes, out)
 }
 
 /// The configured weight budget, initializing the device on first ask.
