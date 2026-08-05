@@ -25331,6 +25331,116 @@ fn vae_conv_impl(
     readback(c, enc, &yb, &stage, bytes, out)
 }
 
+/// Three projections of ONE input in one submission: the DiT's q, k and
+/// v. Each was its own round trip — upload x, compute, read back — and
+/// x is identical for all three, so two uploads and two waits per block
+/// were pure ceremony. Weights stay resident; only x in and the three
+/// panels out cross the boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn q4tp_qkv(
+    model: &Arc<CmfModel>,
+    wq: usize,
+    wk: usize,
+    wv: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    qrows: usize,
+    kvrows: usize,
+    q_out: &mut [f32],
+    k_out: &mut [f32],
+    v_out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if hidden % 32 != 0 || b == 0 || xs.len() < b * hidden {
+        return false;
+    }
+    if q_out.len() < b * qrows || k_out.len() < b * kvrows || v_out.len() < b * kvrows {
+        return false;
+    }
+    let (Some(q1), Some(q2), Some(q3)) = (
+        tensor_weight(c, model, wq, qrows, hidden),
+        tensor_weight(c, model, wk, kvrows, hidden),
+        tensor_weight(c, model, wv, kvrows, hidden),
+    ) else {
+        return false;
+    };
+    let xb = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("qkv-x"),
+        size: (b * hidden * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    c.queue.write_buffer(&xb, 0, bytemuck::cast_slice(&xs[..b * hidden]));
+    let mk = |n: usize, label: &'static str| {
+        c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (n * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        })
+    };
+    let qy = mk(b * qrows, "qkv-q");
+    let ky = mk(b * kvrows, "qkv-k");
+    let vy = mk(b * kvrows, "qkv-v");
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dit-qkv") });
+    encode_q4_tile_mm(c, &mut enc, &c.q4tp_mm, &q1, &xb, &qy, qrows, hidden, b);
+    encode_q4_tile_mm(c, &mut enc, &c.q4tp_mm, &q2, &xb, &ky, kvrows, hidden, b);
+    encode_q4_tile_mm(c, &mut enc, &c.q4tp_mm, &q3, &xb, &vy, kvrows, hidden, b);
+    // One submission, one wait: the three readbacks share the fence.
+    let qs = (b * qrows * 4) as u64;
+    let ks = (b * kvrows * 4) as u64;
+    let stage_q = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("qkv-sq"),
+        size: qs,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let stage_k = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("qkv-sk"),
+        size: ks,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let stage_v = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("qkv-sv"),
+        size: ks,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    enc.copy_buffer_to_buffer(&qy, 0, &stage_q, 0, qs);
+    enc.copy_buffer_to_buffer(&ky, 0, &stage_k, 0, ks);
+    enc.copy_buffer_to_buffer(&vy, 0, &stage_v, 0, ks);
+    c.queue.submit([enc.finish()]);
+    let read = |stage: &wgpu::Buffer, bytes: u64, dst: &mut [f32]| -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        stage.map_async(wgpu::MapMode::Read, ..bytes, move |r| {
+            let _ = tx.send(r);
+        });
+        if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+            return false;
+        }
+        if !rx.recv().map(|r| r.is_ok()).unwrap_or(false) {
+            return false;
+        }
+        let ok = match stage.get_mapped_range(..bytes) {
+            Ok(raw) => {
+                dst.copy_from_slice(bytemuck::cast_slice(&raw));
+                drop(raw);
+                true
+            }
+            Err(_) => false,
+        };
+        stage.unmap();
+        ok
+    };
+    read(&stage_q, qs, &mut q_out[..b * qrows])
+        && read(&stage_k, ks, &mut k_out[..b * kvrows])
+        && read(&stage_v, ks, &mut v_out[..b * kvrows])
+}
+
 /// The configured weight budget, initializing the device on first ask.
 /// None when no GPU path is selected or init failed.
 pub fn dsv4_vram_budget() -> Option<u64> {

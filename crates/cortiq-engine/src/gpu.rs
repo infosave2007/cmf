@@ -1186,6 +1186,34 @@ pub struct DitBlockArgs<'a> {
 /// attention, residuals and the SwiGLU FFN in a single command
 /// buffer; only `x` crosses the CPU boundary (in and out).
 #[allow(unused_variables)]
+/// The DiT's three projections in one submission (wgpu only; the
+/// Metal path fuses the whole block instead). False = the caller keeps
+/// its three separate calls.
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn dit_qkv(
+    model: &Arc<CmfModel>,
+    wq: usize,
+    wk: usize,
+    wv: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    qrows: usize,
+    kvrows: usize,
+    q_out: &mut [f32],
+    k_out: &mut [f32],
+    v_out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q4tp_qkv(
+            model, wq, wk, wv, xs, b, hidden, qrows, kvrows, q_out, k_out, v_out,
+        ),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// Is a FUSED whole-block device path on offer? The batched-CFG shape
 /// (two sequences in one tall batch) and the fused block (one sequence,
 /// one command buffer) are alternatives, and the caller picks.

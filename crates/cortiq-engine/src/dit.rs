@@ -978,9 +978,28 @@ impl NextDit {
         let mut v_all = vec![0f32; n * nkv * hd];
         {
             let _s = prof::span(prof::QKV);
-            blk.q.matmat(&xn, n, &mut q_all, pool);
-            blk.k.matmat(&xn, n, &mut k_all, pool);
-            blk.v.matmat(&xn, n, &mut v_all, pool);
+            // One submission for the three projections when the device
+            // offers it: they share `xn`, so three uploads and three
+            // waits a block were ceremony.
+            let fused = match (&blk.q, &blk.k, &blk.v) {
+                (Proj::Q(q), Proj::Q(k), Proj::Q(v))
+                    if n >= 128 && crate::gpu::enabled_here() && !crate::gpu::mm_killed() =>
+                {
+                    match (q.model_arc(), q.model_idx(), k.model_idx(), v.model_idx()) {
+                        (Some(m), Some(iq), Some(ik), Some(iv)) => crate::gpu::dit_qkv(
+                            &m, iq, ik, iv, &xn, n, hs, nh * hd, nkv * hd, &mut q_all,
+                            &mut k_all, &mut v_all,
+                        ),
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+            if !fused {
+                blk.q.matmat(&xn, n, &mut q_all, pool);
+                blk.k.matmat(&xn, n, &mut k_all, pool);
+                blk.v.matmat(&xn, n, &mut v_all, pool);
+            }
         }
         let rope_span = prof::span(prof::ROPE);
         // per-head qk-norm, then interleaved-pair RoPE
