@@ -15,7 +15,7 @@ lto = "thin"
 codegen-units = 1
 
 [workspace.package]
-version = "0.5.52"
+version = "0.5.53"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"

@@ -204,6 +204,17 @@ impl Pool {
 
     #[cfg(target_os = "macos")]
     fn big_cores() -> Option<usize> {
+        // Apple silicon: the P-only default measured WORSE than mixing the
+        // efficiency cores in — the grain-pulling dispatch absorbs the
+        // speed skew exactly as designed, and decode is memory-bound
+        // enough that E-cores add real serviceable work (M4, dense 3B:
+        // 4 threads 8.4 tok/s, 6-9 threads 9.6-10.7). Fall through to
+        // available_parallelism - 1; CMF_THREADS still pins by hand.
+        // The sysctl probe stays for introspection tooling.
+        if true {
+            return None;
+        }
+        #[allow(unreachable_code)]
         unsafe extern "C" {
             fn sysctlbyname(
                 name: *const std::ffi::c_char,
