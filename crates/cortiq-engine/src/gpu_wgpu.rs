@@ -2877,6 +2877,119 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// ── q4tp matvec, QUAD row blocking: sixteen rows a workgroup, each
+// 64-lane sub-block owning FOUR rows 4 apart, so the eight x vec4 loads
+// of a group feed four dot chains instead of two. The pair kernel's LSU
+// is x-bound at large widths — 128 bytes of activations per group
+// against ~20 of weights per row — and halving-again the x side is the
+// same medicine the DSV4 down projection took (its 4-row twin). The
+// accumulator is a NAMED vec4: constant component indexing only, or the
+// registers spill to stack and the GEMV runs at a fraction of the card.
+var<workgroup> lad_q4w: array<f32, 512>;
+@compute @workgroup_size(256)
+fn q4tp_matvec16w(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(num_workgroups) nwg: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let blocks = (rows + 15u) / 16u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks) { break; }
+        let base = wb * 16u;
+        for (var t = lid; t < 512u; t = t + 256u) {
+            let r = base + (t >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                lad_q4w[t] = exp2(pr.x + f32(t & 31u) * pr.y);
+            }
+        }
+        workgroupBarrier();
+        let r0 = base + sub;
+        let r1 = base + sub + 4u;
+        let r2 = base + sub + 8u;
+        let r3 = base + sub + 12u;
+        var acc = vec4<f32>(0.0);
+        if (r0 < rows) {
+            let c0 = codes_b + r0 * cstride;
+            let c1 = codes_b + r1 * cstride;
+            let c2 = codes_b + r2 * cstride;
+            let c3 = codes_b + r3 * cstride;
+            let l1 = r1 < rows;
+            let l2 = r2 < rows;
+            let l3 = r3 < rows;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                let x0 = g * 8u;
+                let xa = q4v_x[x0];      let xb = q4v_x[x0 + 1u];
+                let xc = q4v_x[x0 + 2u]; let xd = q4v_x[x0 + 3u];
+                let xe = q4v_x[x0 + 4u]; let xf = q4v_x[x0 + 5u];
+                let xg = q4v_x[x0 + 6u]; let xh = q4v_x[x0 + 7u];
+                var cv = q4tp_byte(c0 + cbo);
+                if (sh > 3u) { cv = cv | (q4tp_byte(c0 + cbo + 1u) << 8u); }
+                var v = q4v_w[r0 * gpr + g];
+                acc.x = acc.x + lad_q4w[(sub << 5u) + ((cv >> sh) & 31u)]
+                    * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                     + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                if (l1) {
+                    cv = q4tp_byte(c1 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c1 + cbo + 1u) << 8u); }
+                    v = q4v_w[r1 * gpr + g];
+                    acc.y = acc.y + lad_q4w[128u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                if (l2) {
+                    cv = q4tp_byte(c2 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c2 + cbo + 1u) << 8u); }
+                    v = q4v_w[r2 * gpr + g];
+                    acc.z = acc.z + lad_q4w[256u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                if (l3) {
+                    cv = q4tp_byte(c3 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c3 + cbo + 1u) << 8u); }
+                    v = q4v_w[r3 * gpr + g];
+                    acc.w = acc.w + lad_q4w[384u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                g = g + 64u;
+            }
+        }
+        partial_q4k[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+                partial_q4k[lid] = partial_q4k[lid] + partial_q4k[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u) {
+            let r = partial_q4k[sub << 6u];
+            if (r0 < rows) { q1y[r0] = r.x; }
+            if (r1 < rows) { q1y[r1] = r.y; }
+            if (r2 < rows) { q1y[r2] = r.z; }
+            if (r3 < rows) { q1y[r3] = r.w; }
+        }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+
 // ── q4tp matvec, k-in-registers batch: ONE weight decode serves up to
 // FOUR activation vectors. The nb-dispatch batch streams the whole weight
 // once per element and hopes for L2; at 2-8 MB a layer there is nothing
@@ -8779,6 +8892,7 @@ struct Ctx {
     moe_select_b: wgpu::ComputePipeline,
     gdn_conv_k: wgpu::ComputePipeline,
     q4tp_mv_k: wgpu::ComputePipeline,
+    q4tp_mv16w: wgpu::ComputePipeline,
     gdn_step_k: wgpu::ComputePipeline,
     moe_gate_up_q4tp_b: wgpu::ComputePipeline,
     moe_down_q4tp_b: wgpu::ComputePipeline,
@@ -9440,6 +9554,7 @@ fn init() -> Result<Ctx, String> {
     let moe_select_b = pipe("moe_select_b");
     let gdn_conv_k = pipe("gdn_conv_k");
     let q4tp_mv_k = pipe("q4tp_matvec4_k");
+    let q4tp_mv16w = pipe("q4tp_matvec16w");
     let gdn_step_k = pipe("gdn_step_k");
     let moe_gate_up_q4tp_b = pipe("moe_gate_up_q4tp_b");
     let moe_down_q4tp_b = pipe("moe_down_q4tp_b");
@@ -9660,6 +9775,7 @@ fn init() -> Result<Ctx, String> {
         moe_select_b,
         gdn_conv_k,
         q4tp_mv_k,
+        q4tp_mv16w,
         gdn_step_k,
         moe_gate_up_q4tp_b,
         moe_down_q4tp_b,
@@ -12046,10 +12162,13 @@ pub fn forward_token_graph(
                     return Some((&c.q4t_mv8, bind, (rows as u32).div_ceil(8).min(MAX_WG)));
                 }
                 if m.kind == 6 && c.use_mv4 {
+                    // Wide rows: the quad-row kernel, four dot chains per
+                    // x fetch (the pair kernel was x-LSU-bound at the
+                    // dense FFN widths).
                     let (pipe6, per_wg) = if gpr <= 64 {
                         (&c.q4tp_mv16, 16u32)
                     } else {
-                        (&c.q4tp_mv4, 8u32)
+                        (&c.q4tp_mv16w, 16u32)
                     };
                     // Word 2 is the batch count for THIS pair and `cols` for
                     // everything else bound to the same struct — the shared
@@ -17771,6 +17890,8 @@ fn encode_q4tp_mv4_b(
     // two tokens would read one token's weights against the other's x.
     let (pipe, per_wg) = if gpr <= 64 {
         (&c.q4tp_mv16, 16u32)
+    } else if batch == 1 {
+        (&c.q4tp_mv16w, 16u32)
     } else {
         (&c.q4tp_mv4, 8u32)
     };
