@@ -286,6 +286,13 @@ pub fn gemm_dx(
     debug_assert_eq!(dy.len(), n * m);
     debug_assert_eq!(w.len(), m * k);
     debug_assert_eq!(dx.len(), n * k);
+    // The card takes the backward too: phase A of a bake is three of
+    // these per layer and nothing else, so this is what makes a bake
+    // GPU work rather than a CPU vigil. CMF_BAKE_GPU=0 opts out.
+    #[cfg(feature = "gpu")]
+    if crate::gpu_wgpu::gemm_dx_f32(dy, w, dx, n, k, m) {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if accel::on() && n * k * m >= 1 << 18 {
         // dX += dY · W (row-major, beta = 1 accumulates).
@@ -1696,4 +1703,34 @@ pub fn gdn_seq_bwd<F: Fp>(
         gdn_group_bwd(&cq, z, a, b, t, cfg, ko, dout, &mut dcq, dz, da, db);
     }
     gdn_conv_bwd(&pre, t, c_dim, cfg.kk, cfg.conv, &dcq, dqkv);
+}
+
+
+#[cfg(test)]
+mod gpu_bake_tests {
+    /// The bake's GPU backward must answer what the CPU answers: same
+    /// contraction, different order of summation, so a relative 1e-4 is
+    /// the honest bar (f32 reductions differ by shape).
+    #[test]
+    #[cfg(feature = "gpu")]
+    fn gemm_dx_gpu_matches_cpu() {
+        if std::env::var("CMF_GPU").is_err() {
+            eprintln!("no backend requested — skip");
+            return;
+        }
+        let (n, k, m) = (8usize, 512usize, 1024usize);
+        let dy: Vec<f32> = (0..n * m).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+        let w: Vec<f32> = (0..m * k).map(|i| ((i * 17 % 97) as f32 - 48.0) / 48.0).collect();
+        let mut want = vec![0f32; n * k];
+        super::gemm_dx(&dy, &w, &mut want, n, k, m, None);
+        let mut got = vec![0f32; n * k];
+        if !crate::gpu_wgpu::gemm_dx_f32(&dy, &w, &mut got, n, k, m) {
+            eprintln!("device declined — skip");
+            return;
+        }
+        let num: f64 = want.iter().zip(&got).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+        let den: f64 = want.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().max(1e-30);
+        let rel = (num / den).sqrt();
+        assert!(rel < 1e-4, "gemm_dx GPU vs CPU rel {rel:e}");
+    }
 }

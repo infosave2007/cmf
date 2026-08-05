@@ -1034,6 +1034,41 @@ fn f32_matvec_b(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
     if (lid == 0u) { fb_y[t * fb_p.rows + row] = fb_part[0]; }
 }
 
+// Backward GEMM for the skill-bake trainer: dx[n,k] = dy[n,m] · w[m,k].
+// The forward kernel contracts over w's SECOND index; this one contracts
+// over its first, which is the whole difference between y = W·x and the
+// gradient that comes back through W. One workgroup per (output column,
+// row), 64 lanes striding the contraction.
+struct GdxP { m: u32, k: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read>       gx_w  : array<f32>;
+@group(0) @binding(1) var<storage, read>       gx_dy : array<f32>;
+@group(0) @binding(2) var<storage, read_write> gx_dx : array<f32>;
+@group(0) @binding(3) var<uniform>             gx_p  : GdxP;
+var<workgroup> gx_part: array<f32, 64>;
+@compute @workgroup_size(64)
+fn f32_gemm_dx(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let j = wid.x;
+    let r = wid.y;
+    if (j >= gx_p.k) { return; }
+    var acc = 0.0;
+    var o = lid;
+    loop {
+        if (o >= gx_p.m) { break; }
+        acc = acc + gx_dy[r * gx_p.m + o] * gx_w[o * gx_p.k + j];
+        o = o + 64u;
+    }
+    gx_part[lid] = acc;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { gx_part[lid] = gx_part[lid] + gx_part[lid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (lid == 0u) { gx_dx[r * gx_p.k + j] = gx_part[0]; }
+}
+
 // RMSNorm of one row (WGSL twin of Metal rmsnorm_k): o = x·rsqrt(mean(x²)+eps)·w',
 // w' = w or (1+w) for gemma. One workgroup, 256-thread tree reduction — the
 // building block that keeps the token graph's hidden resident across the norm.
@@ -9036,6 +9071,7 @@ struct Ctx {
     gdn_conv_k: wgpu::ComputePipeline,
     q4tp_mv_k: wgpu::ComputePipeline,
     q4tp_mv16w: wgpu::ComputePipeline,
+    f32_gemm_dx: wgpu::ComputePipeline,
     gdn_step_par_k: wgpu::ComputePipeline,
     gdn_step_norm_k: wgpu::ComputePipeline,
     gdn_step_k: wgpu::ComputePipeline,
@@ -9700,6 +9736,7 @@ fn init() -> Result<Ctx, String> {
     let gdn_conv_k = pipe("gdn_conv_k");
     let q4tp_mv_k = pipe("q4tp_matvec4_k");
     let q4tp_mv16w = pipe("q4tp_matvec16w");
+    let f32_gemm_dx = pipe("f32_gemm_dx");
     let gdn_step_par_k = pipe("gdn_step_par_k");
     let gdn_step_norm_k = pipe("gdn_step_norm_k");
     let gdn_step_k = pipe("gdn_step_k");
@@ -9923,6 +9960,7 @@ fn init() -> Result<Ctx, String> {
         gdn_conv_k,
         q4tp_mv_k,
         q4tp_mv16w,
+        f32_gemm_dx,
         gdn_step_par_k,
         gdn_step_norm_k,
         gdn_step_k,
@@ -24981,6 +25019,87 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
         mapped_at_creation: false,
     });
     readback(c, enc, &ybuf, &stage, bytes, &mut y[..n * m])
+}
+
+/// Backward twin of `gemm_nt_f32`: dx[n,k] = dy[n,m] · w[m,k], the
+/// gradient the bake pushes back through a frozen projection. Phase A
+/// calls it three times a layer and nothing else touches the card
+/// there, so this is what decides whether a bake is GPU work or not.
+pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m: usize) -> bool {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
+        return false;
+    }
+    let Some(c) = ctx() else { return false };
+    if n * k * m < (1 << 22) || k > 65_000 || n > 65_000 {
+        return false;
+    }
+    if dy.len() < n * m || w.len() < m * k || dx.len() < n * k {
+        return false;
+    }
+    let wbuf = {
+        let key = (w.as_ptr() as usize, w.len());
+        let mut cb = c.const_bufs.lock().unwrap();
+        if let Some(b) = cb.get(&key) {
+            b.clone()
+        } else {
+            let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("bake-dxw"),
+                size: (w.len() * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(w));
+            cb.insert(key, b.clone());
+            b
+        }
+    };
+    let dyb = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bake-dy"),
+        size: (n * m * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    c.queue.write_buffer(&dyb, 0, bytemuck::cast_slice(&dy[..n * m]));
+    let dxb = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bake-dx"),
+        size: (n * k * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let u = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[m as u32, k as u32, 0u32, 0u32]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bake-dx") });
+    {
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.f32_gemm_dx.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &wbuf),
+                bind_buf(1, &dyb),
+                bind_buf(2, &dxb),
+                bind_buf(3, &u),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.f32_gemm_dx);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(k as u32, n as u32, 1);
+    }
+    let bytes = (n * k * 4) as u64;
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bake-dx-stage"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    readback(c, enc, &dxb, &stage, bytes, &mut dx[..n * k])
 }
 
 /// The configured weight budget, initializing the device on first ask.
