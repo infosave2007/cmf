@@ -8618,6 +8618,11 @@ struct Ctx {
     /// GDN recurrent state per (kv_id, layer): (conv ring, S), persists across
     /// decode tokens (created zeroed on first touch).
     gdn_state: Mutex<HashMap<(u64, usize), (wgpu::Buffer, wgpu::Buffer)>>,
+    /// Speculative verify: per (kv_id, layer) snapshot buffer holding the
+    /// GDN (ring, S) after every batch position, so a partial acceptance
+    /// restores the recurrent state to the last position that was real.
+    /// Value: (buffer, ring bytes, state bytes, slots).
+    gdn_snap: Mutex<HashMap<(u64, usize), (wgpu::Buffer, u64, u64, usize)>>,
     /// Per-layer concatenated MoE expert weights (gate_all, up_all, down_all)
     /// keyed by (file base ptr, first gate idx) — every routed expert plus the
     /// shared one as the trailing block, uploaded once, addressed by expert id
@@ -9433,6 +9438,7 @@ fn init() -> Result<Ctx, String> {
         rs_bufs: Mutex::new(HashMap::new()),
         attn_kv: Mutex::new(HashMap::new()),
         gdn_state: Mutex::new(HashMap::new()),
+        gdn_snap: Mutex::new(HashMap::new()),
         moe_expw: Mutex::new(HashMap::new()),
         graph_scratch: Mutex::new(GraphScratch::default()),
     })
@@ -13237,6 +13243,11 @@ pub fn forward_batch_graph(
     gemma: bool,
     eps: f32,
     k: usize,
+    // Speculative verify: fold final-norm + lm_head over every position and
+    // read the k logit rows back beside the hiddens, snapshotting the GDN
+    // state after each position so a partial acceptance can restore it
+    // (`gdn_spec_restore`). None = the plain batched prefill.
+    mut spec: Option<crate::gpu::SpecTail<'_>>,
 ) -> bool {
     let Some(c) = ctx() else {
         bgraph_refused("no ctx");
@@ -13918,6 +13929,35 @@ pub fn forward_batch_graph(
                 },
             ) => {
                 let (ring, s) = gdnbufs[li].as_ref().unwrap();
+                // Speculative rounds: a snapshot slot per position, taken
+                // right after this position's state advance. The buffer
+                // lives per (kv_id, layer) and regrows if k does.
+                let snap = if spec.is_some() {
+                    let ring_sz = (cdim * kk.saturating_sub(1) * 4) as u64;
+                    let s_sz = (nv * dk * dv * 4) as u64;
+                    let mut m = c.gdn_snap.lock().unwrap();
+                    let e = m.entry((kv_id, li)).or_insert_with(|| {
+                        let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("gdn-snap"),
+                            size: (k as u64 * (ring_sz + s_sz)).max(4),
+                            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                            mapped_at_creation: false,
+                        });
+                        (b, ring_sz, s_sz, k)
+                    });
+                    if e.3 < k {
+                        e.0 = c.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("gdn-snap"),
+                            size: (k as u64 * (ring_sz + s_sz)).max(4),
+                            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                            mapped_at_creation: false,
+                        });
+                        e.3 = k;
+                    }
+                    Some((e.0.clone(), ring_sz, s_sz))
+                } else {
+                    None
+                };
                 let taps = stor(bytemuck::cast_slice(conv1d));
                 let alog = stor(bytemuck::cast_slice(a_log));
                 let dtb = stor(bytemuck::cast_slice(dt_bias));
@@ -13983,6 +14023,13 @@ pub fn forward_batch_graph(
                         ),
                         *nv as u32,
                     );
+                    if let Some((snap, ring_sz, s_sz)) = snap.as_ref() {
+                        let off = i as u64 * (ring_sz + s_sz);
+                        if *ring_sz > 0 {
+                            enc.copy_buffer_to_buffer(ring, 0, snap, off, *ring_sz);
+                        }
+                        enc.copy_buffer_to_buffer(s, 0, snap, off + ring_sz, *s_sz);
+                    }
                 }
                 ematb(&mut enc, out, &gdo_b, &ob, hidden, nv * dv);
             }
@@ -14173,7 +14220,53 @@ pub fn forward_batch_graph(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let ok = readback(c, enc, &h_buf, &stage, size, &mut h[..k * hidden]);
+    let t_enc_done = std::time::Instant::now();
+    let ok = if let Some(sp) = spec.as_mut() {
+        // Speculative tail: final-norm each row, one batched lm_head GEMM,
+        // read every position's logits back beside the hiddens. The CPU
+        // argmaxes them — a verify wants the last accepted row's WHOLE
+        // logits anyway (the sampler's contract at the loop top).
+        let Some(lm) = resolve(&sp.lm, sp.lm_rows, hidden) else {
+            bgraph_refused("spec tail: lm head weight did not resolve");
+            return false;
+        };
+        let fnw = stor(bytemuck::cast_slice(sp.final_norm));
+        let n1b = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("spec-n1"),
+            size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        go(
+            &mut enc,
+            &c.rmsnorm_b,
+            &bg(&c.layout_rmsnorm_b, &[&h_buf, &fnw, &n1b, &rms_u]),
+            k as u32,
+        );
+        let lsize = (k * sp.lm_rows * 4) as u64;
+        let lbuf = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("spec-logits"),
+            size: lsize,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        ematb(&mut enc, &lm, &n1b, &lbuf, sp.lm_rows, hidden);
+        sp.logits_out.resize(k * sp.lm_rows, 0.0);
+        readback2(
+            c,
+            enc,
+            (&h_buf, &mut h[..k * hidden]),
+            (&lbuf, &mut sp.logits_out[..]),
+        )
+    } else {
+        readback(c, enc, &h_buf, &stage, size, &mut h[..k * hidden])
+    };
+    if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+        eprintln!(
+            "batch-graph: gpu+readback {:.1} ms",
+            t_enc_done.elapsed().as_secs_f64() * 1e3,
+        );
+    }
     if ok {
         let mut kvm = c.attn_kv.lock().unwrap();
         for li in 0..layers.len() {
@@ -14183,6 +14276,35 @@ pub fn forward_batch_graph(
         }
     }
     ok
+}
+
+/// After a partial speculative acceptance: put every GDN layer's (ring, S)
+/// back to the snapshot taken after batch position `slot` — the last
+/// position whose input token was real.
+pub fn gdn_spec_restore(kv_id: u64, slot: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    let snaps = c.gdn_snap.lock().unwrap();
+    let states = c.gdn_state.lock().unwrap();
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gdn-restore") });
+    let mut any = false;
+    for ((id, li), (snap, ring_sz, s_sz, slots)) in snaps.iter() {
+        if *id != kv_id || slot >= *slots {
+            continue;
+        }
+        let Some((ring, s)) = states.get(&(*id, *li)) else {
+            continue;
+        };
+        let off = slot as u64 * (ring_sz + s_sz);
+        if *ring_sz > 0 {
+            enc.copy_buffer_to_buffer(snap, off, ring, 0, *ring_sz);
+        }
+        enc.copy_buffer_to_buffer(snap, off + ring_sz, s, 0, *s_sz);
+        any = true;
+    }
+    c.queue.submit([enc.finish()]);
+    any
 }
 
 /// Drop the device K/V mirror for a pipeline (called on cache clear).

@@ -1466,11 +1466,25 @@ impl Pipeline {
                 // the per-op probe path — see gpu::wgpu_graph_default.
                 crate::gpu::wgpu_graph_default()
             });
+        // Graph speculative decode (`CMF_GRAPH_SPEC=1`, experimental): the
+        // MTP head drafts, ONE batched graph submit verifies the whole
+        // chain. The machinery is correct — 81% of drafts accepted on the
+        // bench — but it stays OPT-IN until the batched graph itself is
+        // fast: today it costs ~48 ms per verified position against the
+        // token graph's 7.3, which turns a win into a 6x loss.
+        let graph_spec = self.speculative
+            && graph_on
+            && self.mtp.is_some()
+            && task_mask.is_none()
+            && !self.o1_active()
+            && self.sampler_config.temperature < 1e-6
+            && self.sampler_config.repetition_penalty == 1.0
+            && std::env::var("CMF_GRAPH_SPEC").is_ok_and(|v| v != "0");
         let spec_active = self.speculative
             && self.mtp.is_some()
             && task_mask.is_none()
             && !self.o1_active()
-            && !graph_on
+            && (!graph_on || graph_spec)
             && self.sampler_config.temperature < 1e-6;
         // The MTP module is detached during generation so its mutable
         // state does not fight the borrow on `self`.
@@ -1732,7 +1746,7 @@ impl Pipeline {
                 }
                 let positions: Vec<usize> = (pos..end).collect();
                 let t_chunk = std::time::Instant::now();
-                let ok_b = self.try_batch_graph_wgpu(&mut hiddens, &positions, bk);
+                let ok_b = self.try_batch_graph_wgpu(&mut hiddens, &positions, bk, None);
                 if std::env::var("CMF_GRAPH_PROF").is_ok() {
                     let ms = t_chunk.elapsed().as_secs_f64() * 1000.0;
                     eprintln!(
@@ -1918,8 +1932,41 @@ impl Pipeline {
             }
 
             match &mut mtp {
+                // ── Graph speculation: chain-draft, batch-verify on device ──
+                #[cfg(feature = "gpu")]
+                Some(m) if graph_spec && generated + 1 < max_tokens && next_pos > 0 => {
+                    if let Some((extra, n_pos, new_h)) = self.graph_spec_step(
+                        m,
+                        &hidden,
+                        t_next,
+                        next_pos,
+                        &mut drafted,
+                        &mut accepted,
+                    ) {
+                        next_pos = n_pos;
+                        hidden = new_h;
+                        let mut stopped = false;
+                        for &id in &extra {
+                            if self.confidence_on {
+                                confidence.push(0.0);
+                            }
+                            if !commit!(id) {
+                                stopped = true;
+                                break;
+                            }
+                        }
+                        if stopped {
+                            break 'decode;
+                        }
+                        continue 'decode;
+                    }
+                    // Declined (batch graph refused): plain forward below.
+                    hidden = self.forward_layers(&self.embed_single(t_next), next_pos, task_mask);
+                    next_pos += 1;
+                    continue 'decode;
+                }
                 // ── Speculative: draft t+2, verify in a fused pair ──
-                Some(m) if generated + 1 < max_tokens => {
+                Some(m) if !graph_spec && generated + 1 < max_tokens => {
                     let draft = self.mtp_step(m, &hidden, t_next, next_pos - 1);
                     drafted += 1;
                     let emb1 = self.embed_single(t_next);
@@ -2273,6 +2320,149 @@ impl Pipeline {
         let draft = sampler::argmax(&lg);
         attention::recycle_buf(&mut lg);
         (draft, x)
+    }
+
+    /// The MTP block alone — advance its KV with a (hidden, token) pair the
+    /// verify just proved, without paying the head. What keeps the draft's
+    /// attention context warm between speculative rounds.
+    fn mtp_warm(&mut self, m: &mut MtpModule, hidden: &[f32], next_token: u32, position: usize) {
+        let e = self.embed_single(next_token);
+        let mut cat = vec![0.0f32; 2 * self.hidden_size];
+        let (cat_e, cat_h) = cat.split_at_mut(self.hidden_size);
+        inference::rms_norm_into(&e, &m.enorm, self.rms_eps, self.norm_style, cat_e);
+        inference::rms_norm_into(hidden, &m.hnorm, self.rms_eps, self.norm_style, cat_h);
+        let mut x = vec![0.0f32; self.hidden_size];
+        m.eh_proj.matvec(&cat, &mut x, self.pool.as_deref());
+        inference::rms_norm_into(&x, &m.layer.input_norm, self.rms_eps, self.norm_style, &mut self.ws.n1);
+        let attn = match &m.layer.attn {
+            AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, softplus_gate, bias } => {
+                let mut cfg = self.attn_cfg(position);
+                cfg.q_norm = q_norm.as_deref();
+                cfg.k_norm = k_norm.as_deref();
+                cfg.output_gate = *output_gate;
+                cfg.softplus_gate = softplus_gate.as_ref().map(|(g, p)| (g, *p));
+                cfg.bias = bias.as_ref().map(|(q, k, v)| (q.as_slice(), k.as_slice(), v.as_slice()));
+                attention::qwen_attention(&self.ws.n1, wq, wk, wv, wo, &mut m.kv, &cfg)
+            }
+            _ => return,
+        };
+        let _ = attn;
+    }
+
+    /// Speculative decode ON the wgpu whole-token graph: draft k with the
+    /// MTP head, verify all of them plus the tip in ONE batched graph
+    /// submit whose tail folds the head, commit the accepted prefix and
+    /// roll the GDN state back to the last real position. Greedy only —
+    /// output equals the plain graph's token for token, the way the DSV4
+    /// verify equals the walk.
+    #[cfg(feature = "gpu")]
+    #[allow(clippy::too_many_arguments)]
+    fn graph_spec_step(
+        &mut self,
+        m: &mut MtpModule,
+        hidden: &[f32],
+        t_next: u32,
+        next_pos: usize,
+        drafted: &mut usize,
+        accepted: &mut usize,
+    ) -> Option<(Vec<u32>, usize, Vec<f32>)> {
+        let k_spec: usize = std::env::var("CMF_GRAPH_SPEC_K")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| (1..=8).contains(&v))
+            .unwrap_or(2);
+        if next_pos == 0 {
+            return None;
+        }
+        let t_round = std::time::Instant::now();
+        // Draft the chain: first from the trunk's tip hidden, then the head
+        // iterating on itself. Rows land in the MTP KV; the chain rows past
+        // the first are speculation over speculative state and roll back
+        // below, replaced by verified pairs.
+        let mut drafts = Vec::with_capacity(k_spec);
+        let (d1, mut hx) = self.mtp_step_h(m, hidden, t_next, next_pos - 1);
+        drafts.push(d1);
+        for j in 1..k_spec {
+            let (dj, hj) = self.mtp_step_h(m, &hx, drafts[j - 1], next_pos - 1 + j);
+            drafts.push(dj);
+            hx = hj;
+        }
+        *drafted += k_spec;
+        let t_draft = t_round.elapsed();
+        // Verify batch: [t_next, d1 .. d_{k-1}] at next_pos.. — every row's
+        // logits come back from the graph's own head.
+        let b = k_spec + 1;
+        let mut hiddens = vec![0.0f32; b * self.hidden_size];
+        for (i, &t) in std::iter::once(&t_next).chain(drafts.iter()).enumerate() {
+            let e = self.embed_single(t);
+            hiddens[i * self.hidden_size..(i + 1) * self.hidden_size].copy_from_slice(&e);
+        }
+        let positions: Vec<usize> = (next_pos..next_pos + b).collect();
+        let (lm_gw, lm_rows) = {
+            let (_, i, kind, rs) = self.weights.lm_head.graph_weight()?;
+            (
+                crate::gpu::GraphW { idx: i, kind, row_scale: rs, data: &[] },
+                self.weights.lm_head.rows(),
+            )
+        };
+        let mut logits = Vec::new();
+        let final_norm = self.weights.final_norm.clone();
+        let ok = self.try_batch_graph_wgpu(
+            &mut hiddens,
+            &positions,
+            b,
+            Some(crate::gpu::SpecTail {
+                lm: lm_gw,
+                lm_rows,
+                final_norm: &final_norm,
+                logits_out: &mut logits,
+            }),
+        );
+        if !ok {
+            // Roll the draft rows back out of the MTP cache and decline —
+            // the caller runs the plain path, nothing has changed.
+            m.kv.truncate_last(k_spec);
+            return None;
+        }
+        if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+            eprintln!(
+                "spec-round: draft {:.1} ms | verify {:.1} ms",
+                t_draft.as_secs_f64() * 1e3,
+                (t_round.elapsed() - t_draft).as_secs_f64() * 1e3,
+            );
+        }
+        // Acceptance: row i's argmax is the trunk's token after input i.
+        let ids: Vec<u32> = (0..b)
+            .map(|i| sampler::argmax(&logits[i * lm_rows..(i + 1) * lm_rows]))
+            .collect();
+        let mut a = 0usize;
+        while a < k_spec && ids[a] == drafts[a] {
+            a += 1;
+        }
+        // a fully-accepted round needs no restore: every input was real.
+        if a + 1 < b {
+            crate::gpu::gdn_spec_restore(self.graph_kv_id, a);
+        }
+        *accepted += a;
+        // MTP cache: keep the first draft row (its inputs were real), drop
+        // the chain's, then append the verified pairs the round produced.
+        m.kv.truncate_last(k_spec.saturating_sub(1));
+        for j in 0..a {
+            let row = &hiddens[j * self.hidden_size..(j + 1) * self.hidden_size];
+            let row = row.to_vec();
+            self.mtp_warm(m, &row, ids[j], next_pos + j);
+        }
+        // The sampler's contract: logits of the LAST verified position.
+        let mut row = logits[a * lm_rows..(a + 1) * lm_rows].to_vec();
+        row.resize(self.vocab_size, 0.0);
+        if let Some(c) = self.final_softcap {
+            for l in row.iter_mut() {
+                *l = c * (*l / c).tanh();
+            }
+        }
+        self.graph_logits = Some(row);
+        let new_hidden = hiddens[a * self.hidden_size..(a + 1) * self.hidden_size].to_vec();
+        Some((drafts[..a].to_vec(), next_pos + a + 1, new_hidden))
     }
 
     /// Micro-benchmark: two single-position forwards vs one fused pair
@@ -4159,7 +4349,14 @@ impl Pipeline {
     /// graph in ONE submit (projections/FFN as GEMMs). `hiddens` is [k·hidden]
     /// in/out (embeddings in, layer output out); KV mirror / GDN state advance.
     /// false ⇒ unsupported → caller keeps the per-position graph.
-    fn try_batch_graph_wgpu(&self, hiddens: &mut [f32], positions: &[usize], k: usize) -> bool {
+    fn try_batch_graph_wgpu(
+        &self,
+        hiddens: &mut [f32],
+        positions: &[usize],
+        k: usize,
+        spec: Option<crate::gpu::SpecTail<'_>>,
+    ) -> bool {
+        let _tb = std::time::Instant::now();
         if self.attn_softcap > 0.0 {
             return false; // capped scores: no graph kernel — CPU path
         }
@@ -4342,6 +4539,9 @@ impl Pipeline {
             }
             return false;
         };
+        if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+            eprintln!("batch-build: {:.1} ms", _tb.elapsed().as_secs_f64() * 1e3);
+        }
         crate::gpu::forward_batch_graph(
             &model,
             self.graph_kv_id,
@@ -4359,6 +4559,7 @@ impl Pipeline {
             gemma,
             self.rms_eps as f32,
             k,
+            spec,
         )
     }
 
