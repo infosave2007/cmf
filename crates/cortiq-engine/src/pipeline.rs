@@ -1480,11 +1480,19 @@ impl Pipeline {
             && self.sampler_config.temperature < 1e-6
             && self.sampler_config.repetition_penalty == 1.0
             && std::env::var("CMF_GRAPH_SPEC").is_ok_and(|v| v != "0");
+        // GDN hybrids sit the fused-pair speculation out by default: the
+        // recurrence is sequential, so the pair lane cannot parallelize
+        // (the bench's own Pair line reads fused 1.28x TWO singles on the
+        // 35B) and the draft's full-vocab head rides on top — measured 2x
+        // SLOWER end to end (16.1 vs 32.4 tok/s on the 48-core stand).
+        // CMF_MTP=1 forces it back for study.
+        let pair_pays = self.gdn_cfg.is_none()
+            || std::env::var("CMF_MTP").as_deref() == Ok("1");
         let spec_active = self.speculative
             && self.mtp.is_some()
             && task_mask.is_none()
             && !self.o1_active()
-            && (!graph_on || graph_spec)
+            && ((!graph_on && pair_pays) || graph_spec)
             && self.sampler_config.temperature < 1e-6;
         // The MTP module is detached during generation so its mutable
         // state does not fight the borrow on `self`.
