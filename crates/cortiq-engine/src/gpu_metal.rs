@@ -3845,11 +3845,21 @@ unsafe impl Sync for Ctx {}
 static CTX: OnceLock<Result<Ctx, String>> = OnceLock::new();
 
 fn ctx() -> Option<&'static Ctx> {
-    let requested = std::env::var("CMF_GPU")
-        .map(|v| v != "0")
-        .unwrap_or_else(|_| {
+    // UNSET selects Metal by default on macOS — the mirror of the wgpu
+    // path's Linux/Windows self-selection: init failure is a clean CPU
+    // fallback, and a zero-config run measured 2x the CPU on the M4
+    // (19.2 against 9.9 tok/s on the dense 3B). `CMF_GPU=0` forces CPU;
+    // `CMF_GPU=wgpu` still routes to the wgpu backend instead.
+    let requested = match std::env::var("CMF_GPU") {
+        // "wgpu" still counts as requested HERE: the backend dispatcher
+        // routes it to wgpu before Metal is ever asked, and refusing the
+        // context outright broke parallel tests that flip the variable.
+        Ok(v) => v != "0" && v != "off",
+        Err(_) => {
             crate::pipeline::GLOBAL_USE_GPU.load(std::sync::atomic::Ordering::Relaxed)
-        });
+                || cfg!(target_os = "macos")
+        }
+    };
     if !requested {
         // Do not permanently cache the disabled state: callers may enable the
         // backend after process start (the CLI and tests both do this).

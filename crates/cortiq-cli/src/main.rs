@@ -1200,6 +1200,15 @@ async fn main() -> anyhow::Result<()> {
             if std::env::var("CMF_SDOT").is_err() {
                 unsafe { std::env::set_var("CMF_SDOT", "0") };
             }
+            // The native Metal path is not held to the bit-parity contract
+            // (10.217 vs the CPU/wgpu 10.224 on the 3B) — on macOS the
+            // gate defaults to the CPU reference unless the caller picks a
+            // backend explicitly. Linux/Windows keep the (proven-exact,
+            // much faster) wgpu path.
+            #[cfg(target_os = "macos")]
+            if std::env::var("CMF_GPU").is_err() {
+                unsafe { std::env::set_var("CMF_GPU", "0") };
+            }
             cmd_ppl(
             &model,
             &file,
