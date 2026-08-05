@@ -2877,6 +2877,149 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// ── GDN step, parallel edition, k-looped: a workgroup per (head,
+// column-quad) with the position loop INSIDE — the occupancy of the
+// parallel kernel (thousands of workgroups where the serial one raised
+// nv) and none of the per-position dispatch drains. Every state slice
+// is workgroup-local across positions, so the loop needs no cross-
+// workgroup sync; the raw o lands per position and gdn_step_norm_k
+// applies the gated RMSNorm after. Snapshots ride the update itself.
+@group(0) @binding(7) var<storage, read_write> gdk_S4 : array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read_write> gdk_o4 : array<vec4<f32>>;
+@group(0) @binding(10) var<storage, read_write> gdk_snap4 : array<vec4<f32>>;
+var<workgroup> gdk_r2: array<f32, 256>;
+var<workgroup> gdk_r3: array<f32, 256>;
+var<workgroup> gdk_r4: array<f32, 256>;
+@compute @workgroup_size(128)
+fn gdn_step_par_k(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let dj4 = wid.y;
+    let t = lid.x;
+    let dk = gdk_p.dk;
+    let dv = gdk_p.dv;
+    if (h >= gdk_p.nv || dj4 * 4u >= dv) { return; }
+    let ko = h / gdk_p.rep;
+    let dv4 = dv >> 2u;
+    let s4base = (h * dk * dv) >> 2u;
+    for (var i = 0u; i < gdk_p.kb; i = i + 1u) {
+        let cq0 = i * gdk_p.cdim;
+        let qs = cq0 + ko * dk;
+        let ks = cq0 + gdk_p.kd + ko * dk;
+        gdk_red[t] = select(0.0, gdk_cq[qs + t] * gdk_cq[qs + t], t < dk);
+        workgroupBarrier();
+        var stride = 64u;
+        loop {
+            if (stride == 0u) { break; }
+            if (t < stride) { gdk_red[t] = gdk_red[t] + gdk_red[t + stride]; }
+            workgroupBarrier();
+            stride = stride / 2u;
+        }
+        let nq = gdk_red[0];
+        workgroupBarrier();
+        gdk_red[t] = select(0.0, gdk_cq[ks + t] * gdk_cq[ks + t], t < dk);
+        workgroupBarrier();
+        stride = 64u;
+        loop {
+            if (stride == 0u) { break; }
+            if (t < stride) { gdk_red[t] = gdk_red[t] + gdk_red[t + stride]; }
+            workgroupBarrier();
+            stride = stride / 2u;
+        }
+        let nkn = gdk_red[0];
+        workgroupBarrier();
+        let invq = 1.0 / (sqrt(nq + 1e-6) * sqrt(f32(dk)));
+        let invk = 1.0 / sqrt(nkn + 1e-6);
+        let abo = i * gdk_p.nv;
+        let g = exp(-exp(gdk_alog[h]) * gd_softplus(gdk_a[abo + h] + gdk_dtb[h]));
+        let beta = 1.0 / (1.0 + exp(-gdk_b[abo + h]));
+        let vto = cq0 + 2u * gdk_p.kd + h * dv + dj4 * 4u;
+        let vt = vec4<f32>(gdk_cq[vto], gdk_cq[vto + 1u], gdk_cq[vto + 2u], gdk_cq[vto + 3u]);
+        let kf_t = select(0.0, gdk_cq[ks + t] * invk, t < dk);
+        let qf_t = select(0.0, gdk_cq[qs + t] * invq, t < dk);
+        var kv4 = vec4<f32>(0.0);
+        if (t < dk) {
+            kv4 = gdk_S4[s4base + t * dv4 + dj4] * kf_t;
+        }
+        gdk_red[t] = kv4.x;
+        gdk_r2[t] = kv4.y;
+        gdk_r3[t] = kv4.z;
+        gdk_r4[t] = kv4.w;
+        workgroupBarrier();
+        stride = 64u;
+        loop {
+            if (stride == 0u) { break; }
+            if (t < stride) {
+                gdk_red[t] = gdk_red[t] + gdk_red[t + stride];
+                gdk_r2[t] = gdk_r2[t] + gdk_r2[t + stride];
+                gdk_r3[t] = gdk_r3[t] + gdk_r3[t + stride];
+                gdk_r4[t] = gdk_r4[t] + gdk_r4[t + stride];
+            }
+            workgroupBarrier();
+            stride = stride / 2u;
+        }
+        let kv = vec4<f32>(gdk_red[0], gdk_r2[0], gdk_r3[0], gdk_r4[0]);
+        workgroupBarrier();
+        let delta = (vt - g * kv) * beta;
+        var contrib = vec4<f32>(0.0);
+        if (t < dk) {
+            let idx = s4base + t * dv4 + dj4;
+            let cell = g * gdk_S4[idx] + kf_t * delta;
+            gdk_S4[idx] = cell;
+            if (gdk_p.stride != 0u) {
+                gdk_snap4[(i * gdk_p.stride + gdk_p.ring_els) / 4u + idx] = cell;
+            }
+            contrib = qf_t * cell;
+        }
+        gdk_red[t] = contrib.x;
+        gdk_r2[t] = contrib.y;
+        gdk_r3[t] = contrib.z;
+        gdk_r4[t] = contrib.w;
+        workgroupBarrier();
+        stride = 64u;
+        loop {
+            if (stride == 0u) { break; }
+            if (t < stride) {
+                gdk_red[t] = gdk_red[t] + gdk_red[t + stride];
+                gdk_r2[t] = gdk_r2[t] + gdk_r2[t + stride];
+                gdk_r3[t] = gdk_r3[t] + gdk_r3[t + stride];
+                gdk_r4[t] = gdk_r4[t] + gdk_r4[t + stride];
+            }
+            workgroupBarrier();
+            stride = stride / 2u;
+        }
+        if (t == 0u) {
+            gdk_o4[(i * gdk_p.nv * dv) / 4u + h * dv4 + dj4] =
+                vec4<f32>(gdk_red[0], gdk_r2[0], gdk_r3[0], gdk_r4[0]);
+        }
+        workgroupBarrier();
+    }
+}
+
+// Gated RMSNorm over the k raw o rows the parallel step left.
+@compute @workgroup_size(256)
+fn gdn_step_norm_k(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let t = lid.x;
+    let dv = gdk_p.dv;
+    if (h >= gdk_p.nv) { return; }
+    for (var i = 0u; i < gdk_p.kb; i = i + 1u) {
+        let zo = i * gdk_p.nv * dv;
+        gdk_red[t] = select(0.0, gdk_o[zo + h * dv + t] * gdk_o[zo + h * dv + t], t < dv);
+        workgroupBarrier();
+        let ss = gdk_reduce(t);
+        workgroupBarrier();
+        let inv = 1.0 / sqrt(ss / f32(dv) + gdk_p.eps);
+        if (t < dv) {
+            let zz = gdk_z[zo + h * dv + t];
+            gdk_o[zo + h * dv + t] =
+                gdk_o[zo + h * dv + t] * inv * gdk_norm[t] * (zz / (1.0 + exp(-zz)));
+        }
+        workgroupBarrier();
+    }
+}
+
 // ── q4tp matvec, QUAD row blocking: sixteen rows a workgroup, each
 // 64-lane sub-block owning FOUR rows 4 apart, so the eight x vec4 loads
 // of a group feed four dot chains instead of two. The pair kernel's LSU
@@ -8893,6 +9036,8 @@ struct Ctx {
     gdn_conv_k: wgpu::ComputePipeline,
     q4tp_mv_k: wgpu::ComputePipeline,
     q4tp_mv16w: wgpu::ComputePipeline,
+    gdn_step_par_k: wgpu::ComputePipeline,
+    gdn_step_norm_k: wgpu::ComputePipeline,
     gdn_step_k: wgpu::ComputePipeline,
     moe_gate_up_q4tp_b: wgpu::ComputePipeline,
     moe_down_q4tp_b: wgpu::ComputePipeline,
@@ -9555,6 +9700,8 @@ fn init() -> Result<Ctx, String> {
     let gdn_conv_k = pipe("gdn_conv_k");
     let q4tp_mv_k = pipe("q4tp_matvec4_k");
     let q4tp_mv16w = pipe("q4tp_matvec16w");
+    let gdn_step_par_k = pipe("gdn_step_par_k");
+    let gdn_step_norm_k = pipe("gdn_step_norm_k");
     let gdn_step_k = pipe("gdn_step_k");
     let moe_gate_up_q4tp_b = pipe("moe_gate_up_q4tp_b");
     let moe_down_q4tp_b = pipe("moe_down_q4tp_b");
@@ -9776,6 +9923,8 @@ fn init() -> Result<Ctx, String> {
         gdn_conv_k,
         q4tp_mv_k,
         q4tp_mv16w,
+        gdn_step_par_k,
+        gdn_step_norm_k,
         gdn_step_k,
         moe_gate_up_q4tp_b,
         moe_down_q4tp_b,
@@ -14155,7 +14304,12 @@ pub fn forward_batch_graph(
                 // streams the weight once per batch element with the batch
                 // as the fast dispatch axis — its other callers proved it;
                 // the tile GEMM keeps the big-chunk prefill.
-                if k <= 4 && c.use_mv4 {
+                if k <= 4 && cols / 32 <= 64 && c.use_mv4 {
+                    // Narrow rows only: with eight x vec4 fetches PER BATCH
+                    // ELEMENT in flight the register file overflows at the
+                    // dense 17408-wide shapes and the amortized weight read
+                    // buys nothing back (measured 470 us/layer against the
+                    // pair kernel's 3x167). MoE-width experts keep the win.
                     let gpr = cols / 32;
                     let p_buf = q4tp_mv_params(c, gpr, rows, k);
                     let layout = c.q4tp_mv_k.get_bind_group_layout(0);
@@ -14573,26 +14727,45 @@ pub fn forward_batch_graph(
                         &[],
                     );
                     pass.dispatch_workgroups((*cdim as u32).div_ceil(256), 1, 1);
-                    pass.set_pipeline(&c.gdn_step_k);
+                    pass.set_pipeline(&c.gdn_step_par_k);
                     pass.set_bind_group(
                         0,
                         &{
-                            let l = c.gdn_step_k.get_bind_group_layout(0);
+                            let l = c.gdn_step_par_k.get_bind_group_layout(0);
+                            // The auto layout keeps only what the entry
+                            // point touches: no z, no norm weight here.
                             c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                                 label: None,
                                 layout: &l,
                                 entries: &[
                                     bind_buf(0, &cq_s),
-                                    bind_buf(1, &z_b),
                                     bind_buf(2, &a_bb),
                                     bind_buf(3, &b_bb),
                                     bind_buf(4, &alog),
                                     bind_buf(5, &dtb),
-                                    bind_buf(6, &gnorm),
                                     bind_buf(7, s),
                                     bind_buf(8, &gdo_b),
                                     bind_buf(9, &gd_pt),
                                     bind_buf(10, &snap_buf),
+                                ],
+                            })
+                        },
+                        &[],
+                    );
+                    pass.dispatch_workgroups(*nv as u32, (*dv as u32).div_ceil(4), 1);
+                    pass.set_pipeline(&c.gdn_step_norm_k);
+                    pass.set_bind_group(
+                        0,
+                        &{
+                            let l = c.gdn_step_norm_k.get_bind_group_layout(0);
+                            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: None,
+                                layout: &l,
+                                entries: &[
+                                    bind_buf(1, &z_b),
+                                    bind_buf(6, &gnorm),
+                                    bind_buf(8, &gdo_b),
+                                    bind_buf(9, &gd_pt),
                                 ],
                             })
                         },
