@@ -13249,6 +13249,7 @@ pub fn forward_batch_graph(
     // (`gdn_spec_restore`). None = the plain batched prefill.
     mut spec: Option<crate::gpu::SpecTail<'_>>,
 ) -> bool {
+    let t_bfn = std::time::Instant::now();
     let Some(c) = ctx() else {
         bgraph_refused("no ctx");
         return false;
@@ -13700,7 +13701,18 @@ pub fn forward_batch_graph(
         match m.kind {
             0 => encode_q8_mm(c, enc, &m.buf, m.rs.as_ref().unwrap(), xs, y, rows, cols, k),
             5 => encode_q4_tile_mm(c, enc, &c.q4t_mm, &m.buf, xs, y, rows, cols, k),
-            6 => encode_q4_tile_mm(c, enc, &c.q4tp_mm, &m.buf, xs, y, rows, cols, k),
+            6 => {
+                // The 64-wide GEMM tile wastes a small batch (a k=3 verify
+                // keeps 3 rows of 64 busy). The batched matvec kernel
+                // streams the weight once per batch element with the batch
+                // as the fast dispatch axis — its other callers proved it;
+                // the tile GEMM keeps the big-chunk prefill.
+                if k <= 16 && c.use_mv4 {
+                    let _ = encode_q4tp_mv4_b(c, enc, &m.buf, xs, y, rows, cols, k);
+                } else {
+                    encode_q4_tile_mm(c, enc, &c.q4tp_mm, &m.buf, xs, y, rows, cols, k)
+                }
+            }
             _ => encode_q1_mm(c, enc, &m.buf, xs, y, rows, cols, k),
         }
     };
@@ -13932,7 +13944,7 @@ pub fn forward_batch_graph(
                 // Speculative rounds: a snapshot slot per position, taken
                 // right after this position's state advance. The buffer
                 // lives per (kv_id, layer) and regrows if k does.
-                let snap = if spec.is_some() {
+                let snap = if spec.is_some() && std::env::var("CMF_SPEC_NOSNAP").is_err() {
                     let ring_sz = (cdim * kk.saturating_sub(1) * 4) as u64;
                     let s_sz = (nv * dk * dv * 4) as u64;
                     let mut m = c.gdn_snap.lock().unwrap();
@@ -14122,6 +14134,18 @@ pub fn forward_batch_graph(
                         &c.layout_moe_dn,
                     )
                 };
+                {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static SAID: AtomicBool = AtomicBool::new(false);
+                    if !SAID.swap(true, Ordering::Relaxed)
+                        && std::env::var("CMF_GRAPH_SPEC_TIME").is_ok()
+                    {
+                        eprintln!(
+                            "batch-moe path: q4tp={} router.kind={} sgate.kind={} n_exp={}",
+                            q4tp, router.kind, sgate.kind, n_exp
+                        );
+                    }
+                }
                 if *q4tp && router.kind == 4 && sgate.kind == 4 && *n_exp <= 256 {
                     // Uniform q4tp experts + f32 router/gate: k router
                     // matvecs (offset bindings, no staging rows) plus THREE
@@ -14262,9 +14286,11 @@ pub fn forward_batch_graph(
         readback(c, enc, &h_buf, &stage, size, &mut h[..k * hidden])
     };
     if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+        let post = t_enc_done.elapsed().as_secs_f64() * 1e3;
         eprintln!(
-            "batch-graph: gpu+readback {:.1} ms",
-            t_enc_done.elapsed().as_secs_f64() * 1e3,
+            "batch-graph: encode {:.1} ms | gpu+readback {:.1} ms",
+            t_bfn.elapsed().as_secs_f64() * 1e3 - post,
+            post,
         );
     }
     if ok {
