@@ -264,6 +264,14 @@ pub struct FcdModel {
     nys: NysCfg,
     /// GDN geometry (present when the model has linear layers).
     gdn: Option<GdnDims>,
+    /// Looped Transformer: how many times the layer stack runs per
+    /// token, and whether a final_norm is inserted at each loop
+    /// boundary. A replica that ignores these computes a DIFFERENT
+    /// model — on Nanbeige 4.2 (22 layers x 2 loops) the single-pass
+    /// forward measured perplexity 4773 where the engine reads 16.5,
+    /// and every gradient taken through it was fitted to that fiction.
+    pub(crate) loops: usize,
+    pub(crate) loop_norm: bool,
     pub(crate) pool: Option<Arc<Pool>>,
 }
 
@@ -401,6 +409,8 @@ impl FcdModel {
         let inv_freq: Vec<f64> = (0..rotary_dim / 2)
             .map(|i| 1.0 / base.powf(2.0 * i as f64 / rotary_dim as f64))
             .collect();
+        let loops = arch.num_loops.max(1);
+        let loop_norm = arch.loop_final_norm;
         let mut flags = o1.layer_flags(arch.num_layers);
         flags.resize(arch.num_layers, false);
         // Only full-attention layers are o1-convertible (same rule as
@@ -435,6 +445,8 @@ impl FcdModel {
                 prefill: None,
             },
             gdn,
+            loops,
+            loop_norm,
             pool: Pool::from_env(),
         })
     }

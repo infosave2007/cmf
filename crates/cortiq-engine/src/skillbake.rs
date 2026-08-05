@@ -219,11 +219,22 @@ impl Pass<'_> {
             h[r * hsz..(r + 1) * hsz]
                 .copy_from_slice(&fm.embed[id as usize * hsz..(id as usize + 1) * hsz]);
         }
-        // Forward, keeping per-layer inputs + activations.
-        let mut h_ins = Vec::with_capacity(nl);
-        let mut acts = Vec::with_capacity(nl);
-        let mut masks = Vec::with_capacity(nl);
-        for li in 0..nl {
+        // Forward over VIRTUAL layers: a Looped Transformer runs the
+        // stack `fm.loops` times, with a final_norm at each loop
+        // boundary when the file says so. Everything below indexes
+        // activations by the virtual step and weights/grads by the
+        // physical layer `vl % nl` — so a physical layer visited twice
+        // accumulates both visits' gradients, which is what the loop
+        // means mathematically.
+        let loops = fm.loops.max(1);
+        let vn = nl * loops;
+        let mut h_ins = Vec::with_capacity(vn);
+        let mut acts = Vec::with_capacity(vn);
+        let mut masks = Vec::with_capacity(vn);
+        // Loop-boundary norms, saved for the backward: (input, inv).
+        let mut lnorms: Vec<Option<(Vec<f32>, Vec<f32>)>> = vec![None; vn];
+        for vl in 0..vn {
+            let li = vl % nl;
             let g = self.gates(li);
             let wts = self.wts(li);
             let want = grad.is_some();
@@ -232,6 +243,17 @@ impl Pass<'_> {
             acts.push(a);
             masks.push(g);
             h = h2;
+            // Mid-stack norm at every loop boundary except the last —
+            // the final one folds into the head below.
+            if fm.loop_norm && li + 1 == nl && vl + 1 < vn {
+                let mut hn = vec![0f32; t * hsz];
+                let mut inv = vec![0f32; t];
+                ops::rmsnorm_fwd(&h, &fm.final_norm, fm.eps, fm.gemma, &mut hn, &mut inv);
+                if want {
+                    lnorms[vl] = Some((h, inv));
+                }
+                h = hn;
+            }
         }
         // Final norm + tied LM head, CE summed over positions 1..t.
         let mut hn = vec![0f32; t * hsz];
@@ -295,9 +317,16 @@ impl Pass<'_> {
         // Backward: final norm, then the FFN chain layer by layer.
         let mut dh = vec![0f32; t * hsz];
         ops::rmsnorm_bwd(&h, &fm.final_norm, &inv, &dh_n, fm.gemma, &mut dh, None);
-        for li in (0..nl).rev() {
-            let a = acts[li].as_ref().expect("acts saved in grad mode");
-            let g = &masks[li];
+        for vl in (0..vn).rev() {
+            let li = vl % nl;
+            // Undo the loop-boundary norm this step fed into.
+            if let Some((hb, inv)) = lnorms[vl].as_ref() {
+                let mut dprev = vec![0f32; t * hsz];
+                ops::rmsnorm_bwd(hb, &fm.final_norm, inv, &dh, fm.gemma, &mut dprev, None);
+                dh = dprev;
+            }
+            let a = acts[vl].as_ref().expect("acts saved in grad mode");
+            let g = &masks[vl];
             let inter = fm.layers[li].inter;
             let wts = self.wts(li);
             // h2 = h1 + act2 @ downᵀ  →  dact2 = dh @ down.
@@ -386,7 +415,7 @@ impl Pass<'_> {
             let mut dh1 = dh.clone(); // residual h2 = h1 + ffn
             ops::rmsnorm_bwd(&a.h1, wts.pln, &a.inv2, &dn2, fm.gemma, &mut dh1, None);
             dh = dh1;
-            let _ = &h_ins[li];
+            let _ = &h_ins[vl];
         }
         (nll, scored)
     }
