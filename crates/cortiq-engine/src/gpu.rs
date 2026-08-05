@@ -877,6 +877,16 @@ pub fn forward_token_graph(
     }
 }
 
+/// Speculative-verify tail for the batched graph: fold final-norm + lm_head
+/// over every batch position and read all k logit rows back; the batch also
+/// snapshots the GDN state per position for `gdn_spec_restore`.
+pub struct SpecTail<'a> {
+    pub lm: GraphW<'a>,
+    pub lm_rows: usize,
+    pub final_norm: &'a [f32],
+    pub logits_out: &'a mut Vec<f32>,
+}
+
 /// Batched prefill: k contiguous positions through the whole graph in one submit
 /// (projections/FFN as GEMMs, attention/GDN looped over scratch). `h` is
 /// [k·hidden] in/out; `positions` len k. wgpu only.
@@ -898,14 +908,33 @@ pub fn forward_batch_graph(
     gemma: bool,
     eps: f32,
     k: usize,
+    spec: Option<SpecTail<'_>>,
 ) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::forward_batch_graph(
             model, kv_id, layers, invf, h, nh, nkv, hd, rd, hidden, inter, positions, cap, gemma,
-            eps, k,
+            eps, k, spec,
         ),
-        _ => false,
+        #[allow(unreachable_patterns)]
+        _ => {
+            let _ = spec;
+            false
+        }
+    }
+}
+
+/// After a partial speculative acceptance: restore every GDN layer's device
+/// state to the snapshot after batch position `slot`. wgpu only.
+pub fn gdn_spec_restore(kv_id: u64, slot: usize) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gdn_spec_restore(kv_id, slot);
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = (kv_id, slot);
+        false
     }
 }
 
