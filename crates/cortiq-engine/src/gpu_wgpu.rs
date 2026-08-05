@@ -9922,6 +9922,20 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
 /// One-shot reason the whole-token graph declined. Without it the fallback
 /// to the per-op path is invisible, which is how a q4tp model looked
 /// GPU-accelerated while every layer walked the host.
+/// `CMF_GRAPH_SPLIT=N` — how many pieces the token graph's submission is
+/// cut into (default 10, the sweep's plateau: 2→110.4, 6→119.9,
+/// 10-13→122.3, 40→120.1 on the 35B against 97.9 unsplit; 0/1 = the
+/// historical single submit).
+fn graph_split_n() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CMF_GRAPH_SPLIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10)
+    })
+}
+
 fn graph_refused(why: &'static str) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static SAID: AtomicBool = AtomicBool::new(false);
@@ -12254,9 +12268,33 @@ pub fn forward_token_graph(
             &bg(&c.layout_rmsnorm, &[&h_buf, &inw0, &n1, &rms_u]),
             1,
         );
+        // Split the submission mid-stack (single-step decode only): the card
+        // starts the first layers while the host still encodes the rest —
+        // the DSV4 chain-split trick. Measured +12.8% on the 35B (97.9 ->
+        // 110.4): it hides the encode AND the driver's submit latency.
+        // Same queue, same order; nothing about the computation changes.
+        // `CMF_GRAPH_SPLIT=N` pieces; 0/1 = historical single submit.
+        let split_n = graph_split_n();
+        let chunk = if steps == 1 && split_n > 1 {
+            // Never below four layers a piece: a short device prefix cut
+            // into per-layer submits pays more in submissions than it
+            // hides in encode.
+            lws.len().div_ceil(split_n).max(4)
+        } else {
+            usize::MAX
+        };
         for (li, l) in layers.iter().enumerate() {
             if li >= layer_cap {
                 break;
+            }
+            if li > 0 && chunk != usize::MAX && li % chunk == 0 {
+                let full = std::mem::replace(
+                    &mut enc,
+                    c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("token-graph"),
+                    }),
+                );
+                c.queue.submit([full.finish()]);
             }
             let lw = &lws[li];
             let lkind: u8 = if matches!(lw.attn, LAttn::Full { .. }) {
