@@ -24897,6 +24897,92 @@ pub fn dsv4_experts_fit(inter: usize, hidden: usize, gu_q2: bool, dn_q2: bool) -
 /// draft is coming and the trunk may pack into the whole budget.
 pub static DRAFT_RESERVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// f32 GEMM for the skill-bake trainer: y[n,m] = x[n,k] · w[m,k]ᵀ on the
+/// card, riding the existing batched f32 matvec kernel. The weight side
+/// is the bake's long-lived f32 replica, cached device-side by address —
+/// uploaded once, reused for every one of the run's hundreds of steps.
+/// False = caller keeps its CPU path (no device, tiny job, or oversize
+/// dispatch). Bit-parity is NOT claimed (GPU sum order differs); the
+/// trainer's loss landscape does not care, and the quality gate at the
+/// end is the arbiter.
+pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
+        return false;
+    }
+    let Some(c) = ctx() else { return false };
+    // Small jobs lose to the round trip; huge dispatch dims are illegal.
+    if n * k * m < (1 << 22) || m > 65_000 || n > 65_000 {
+        return false;
+    }
+    if x.len() < n * k || w.len() < m * k || y.len() < n * m {
+        return false;
+    }
+    let wbuf = {
+        let key = (w.as_ptr() as usize, w.len());
+        let mut cb = c.const_bufs.lock().unwrap();
+        if let Some(b) = cb.get(&key) {
+            b.clone()
+        } else {
+            let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("bake-w"),
+                size: (w.len() * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(w));
+            cb.insert(key, b.clone());
+            b
+        }
+    };
+    let xbuf = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bake-x"),
+        size: (n * k * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    c.queue.write_buffer(&xbuf, 0, bytemuck::cast_slice(&x[..n * k]));
+    let ybuf = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bake-y"),
+        size: (n * m * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let u = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[k as u32, m as u32, 0u32, 0u32]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bake-gemm") });
+    {
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.f32_matvec_b.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &wbuf),
+                bind_buf(1, &xbuf),
+                bind_buf(2, &ybuf),
+                bind_buf(3, &u),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.f32_matvec_b);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(m as u32, n as u32, 1);
+    }
+    let bytes = (n * m * 4) as u64;
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bake-stage"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    readback(c, enc, &ybuf, &stage, bytes, &mut y[..n * m])
+}
+
 /// The configured weight budget, initializing the device on first ask.
 /// None when no GPU path is selected or init failed.
 pub fn dsv4_vram_budget() -> Option<u64> {

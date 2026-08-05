@@ -212,6 +212,14 @@ pub fn gemm_nt(
     debug_assert_eq!(x.len(), n * k);
     debug_assert_eq!(w.len(), m * k);
     debug_assert_eq!(y.len(), n * m);
+    // A discrete card takes the big forwards whole: the weight side is
+    // the bake's stable f32 replica, cached on-device after first use,
+    // so a 360-step run uploads each matrix once. CMF_BAKE_GPU=0 keeps
+    // the CPU path.
+    #[cfg(feature = "gpu")]
+    if crate::gpu_wgpu::gemm_nt_f32(x, w, y, n, k, m) {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if accel::on() && n * k * m >= 1 << 18 {
         // Y = X · Wᵀ (row-major).
