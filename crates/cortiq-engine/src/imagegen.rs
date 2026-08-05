@@ -140,13 +140,31 @@ fn denoise(
     // 2 evaluations where the loop used to do 60.
     let cap_r = dit.refine_caption(cap, cap_n);
     let cap_u_r = cap_u.map(|(cu, un)| (dit.refine_caption(cu, *un), *un));
+    let mut uncond_slot: Option<Vec<f32>> = None;
     for i in 0..p.steps {
         let t = (1.0 - sg[i]) as f32;
-        let mut pred = dit.forward_with_cap(&latents, lh, lw, &cap_r, cap_n, t);
+        let cfg_on = cap_u_r.is_some() && (i + 1) as f32 / p.steps as f32 <= p.cfg_trunc_ratio;
+        // Both CFG branches in ONE pass when nothing better is on offer:
+        // the weights are read once for the pair (the whole cost on a
+        // CPU or a phone) and the image branch runs once. A fused
+        // whole-block device path beats it — that one wants a single
+        // sequence — so Metal keeps the two-call shape.
+        let batched = cfg_on && !crate::gpu::fused_dit_block_available();
+        let mut pred = if batched {
+            let (cu, un) = cap_u_r.as_ref().map(|(v, n)| (v.as_slice(), *n)).unwrap();
+            let (pc, pu) = dit.forward_cfg_pair(&latents, lh, lw, &cap_r, cap_n, cu, un, t);
+            uncond_slot = Some(pu);
+            pc
+        } else {
+            dit.forward_with_cap(&latents, lh, lw, &cap_r, cap_n, t)
+        };
         if let Some((cu, un)) = &cap_u_r {
             // CFG truncation: past the ratio only cond runs.
-            if (i + 1) as f32 / p.steps as f32 <= p.cfg_trunc_ratio {
-                let uncond = dit.forward_with_cap(&latents, lh, lw, cu, *un, t);
+            if cfg_on {
+                let uncond = match uncond_slot.take() {
+                    Some(u) => u,
+                    None => dit.forward_with_cap(&latents, lh, lw, cu, *un, t),
+                };
                 let gs = p.guidance_scale;
                 let mut comb: Vec<f32> = uncond
                     .iter()

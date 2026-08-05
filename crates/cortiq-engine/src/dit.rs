@@ -776,6 +776,91 @@ impl NextDit {
         true
     }
 
+
+    /// Full bidirectional attention over ONE sequence: per head, pack
+    /// q/k/v, scores as a GEMM, row softmax, P·V, scatter back. Lifted
+    /// out of the block so a batched call can run it per segment
+    /// without the segments ever meeting in a score matrix.
+    fn attention_seq(
+        &self,
+        q_all: &[f32],
+        k_all: &[f32],
+        v_all: &[f32],
+        n: usize,
+        scale: f32,
+        attn: &mut [f32],
+    ) {
+        let (nh, nkv, hd) = (self.nh, self.nkv, self.hd);
+        let hpk = nh / nkv;
+        let pool = self.pool.as_deref();
+            let mut qh = vec![0f32; n * hd];
+            let mut kh = vec![0f32; n * hd];
+            let mut vt = vec![0f32; hd * n]; // V transposed: gemm_nt's W layout
+            let mut scores = vec![0f32; n * n];
+            let mut oh = vec![0f32; n * hd];
+            for hh in 0..nh {
+                let kv = hh / hpk;
+                {
+                    let _s = prof::span(prof::APACK);
+                    let (sq, sk, sv) = (
+                        SendRows(qh.as_mut_ptr()),
+                        SendRows(kh.as_mut_ptr()),
+                        SendRows(vt.as_mut_ptr()),
+                    );
+                    pool_rows(pool, n, &|start, end| {
+                        for p in start..end {
+                            let qsrc = &q_all[(p * nh + hh) * hd..(p * nh + hh + 1) * hd];
+                            // SAFETY: workers cover disjoint token ranges
+                            // (`vt` columns are indexed by token too).
+                            let qd = unsafe { sq.row(p * hd, hd) };
+                            for (d, &v) in qsrc.iter().enumerate() {
+                                qd[d] = v * scale;
+                            }
+                            unsafe { sk.row(p * hd, hd) }.copy_from_slice(
+                                &k_all[(p * nkv + kv) * hd..(p * nkv + kv + 1) * hd],
+                            );
+                            let vv = &v_all[(p * nkv + kv) * hd..(p * nkv + kv + 1) * hd];
+                            for (d, &val) in vv.iter().enumerate() {
+                                unsafe { sv.set(d * n + p, val) };
+                            }
+                        }
+                    });
+                }
+                {
+                    let _s = prof::span(prof::AQK);
+                    crate::fcd_ops::gemm_nt(&qh, &kh, &mut scores, n, hd, n, pool);
+                }
+                {
+                    let _s = prof::span(prof::SOFTMAX);
+                    let sp = SendRows(scores.as_mut_ptr());
+                    let soft = |start: usize, end: usize| {
+                        for r in start..end {
+                            // SAFETY: workers cover disjoint row ranges.
+                            softmax_inplace(unsafe { sp.row(r * n, n) });
+                        }
+                    };
+                    match pool {
+                        Some(p) => p.run_rows(n, &soft),
+                        None => soft(0, n),
+                    }
+                }
+                {
+                    let _s = prof::span(prof::APV);
+                    crate::fcd_ops::gemm_nt(&scores, &vt, &mut oh, n, n, hd, pool);
+                }
+                let _s = prof::span(prof::APACK);
+                let sa = SendRows(attn.as_mut_ptr());
+                pool_rows(pool, n, &|start, end| {
+                    for p in start..end {
+                        // SAFETY: workers cover disjoint token ranges.
+                        unsafe { sa.row((p * nh + hh) * hd, hd) }
+                            .copy_from_slice(&oh[p * hd..(p + 1) * hd]);
+                    }
+                });
+            }
+        
+    }
+
     fn block_forward(
         &self,
         blk: &Block,
@@ -783,6 +868,26 @@ impl NextDit {
         rope: &(Vec<f64>, Vec<f64>),
         rope32: Option<&(Vec<f32>, Vec<f32>)>,
         temb: Option<&[f32]>,
+    ) {
+        let n_all = x.len() / self.hidden;
+        self.block_forward_seg(blk, x, rope, rope32, temb, &[n_all]);
+    }
+
+    /// `block_forward` over a CONCATENATION of independent sequences.
+    /// Everything position-wise (norms, projections, FFN) sees one tall
+    /// batch — the weights are read once for all of them, which is the
+    /// whole point on a CPU or a phone — while attention runs per
+    /// segment, so no sample ever attends to another's tokens. `segs`
+    /// are the token counts in order; a single-element slice is the
+    /// plain path, bit for bit.
+    fn block_forward_seg(
+        &self,
+        blk: &Block,
+        x: &mut [f32],
+        rope: &(Vec<f64>, Vec<f64>),
+        rope32: Option<&(Vec<f32>, Vec<f32>)>,
+        temb: Option<&[f32]>,
+        segs: &[usize],
     ) {
         let (hs, nh, nkv, hd) = (self.hidden, self.nh, self.nkv, self.hd);
         let pool = self.pool.as_deref();
@@ -799,10 +904,12 @@ impl NextDit {
                 m
             })
         };
-        if let (Some(m), Some(r32)) = (&modv, rope32) {
-            let _s = prof::span(prof::GPUBLK);
-            if self.gpu_block(blk, x, n, r32, m) {
-                return;
+        if segs.len() <= 1 {
+            if let (Some(m), Some(r32)) = (&modv, rope32) {
+                let _s = prof::span(prof::GPUBLK);
+                if self.gpu_block(blk, x, n, r32, m) {
+                    return;
+                }
             }
         }
         let modnorm = prof::span(prof::MODNORM);
@@ -909,72 +1016,25 @@ impl NextDit {
         let scale = 1.0 / (hd as f32).sqrt();
         let hpk = nh / nkv;
         let mut attn = vec![0f32; n * nh * hd];
-        if !self.gpu_attention(&q_all, &k_all, &v_all, n, scale, &mut attn) {
-            let mut qh = vec![0f32; n * hd];
-            let mut kh = vec![0f32; n * hd];
-            let mut vt = vec![0f32; hd * n]; // V transposed: gemm_nt's W layout
-            let mut scores = vec![0f32; n * n];
-            let mut oh = vec![0f32; n * hd];
-            for hh in 0..nh {
-                let kv = hh / hpk;
-                {
-                    let _s = prof::span(prof::APACK);
-                    let (sq, sk, sv) = (
-                        SendRows(qh.as_mut_ptr()),
-                        SendRows(kh.as_mut_ptr()),
-                        SendRows(vt.as_mut_ptr()),
-                    );
-                    pool_rows(pool, n, &|start, end| {
-                        for p in start..end {
-                            let qsrc = &q_all[(p * nh + hh) * hd..(p * nh + hh + 1) * hd];
-                            // SAFETY: workers cover disjoint token ranges
-                            // (`vt` columns are indexed by token too).
-                            let qd = unsafe { sq.row(p * hd, hd) };
-                            for (d, &v) in qsrc.iter().enumerate() {
-                                qd[d] = v * scale;
-                            }
-                            unsafe { sk.row(p * hd, hd) }.copy_from_slice(
-                                &k_all[(p * nkv + kv) * hd..(p * nkv + kv + 1) * hd],
-                            );
-                            let vv = &v_all[(p * nkv + kv) * hd..(p * nkv + kv + 1) * hd];
-                            for (d, &val) in vv.iter().enumerate() {
-                                unsafe { sv.set(d * n + p, val) };
-                            }
-                        }
-                    });
+        if segs.len() > 1 {
+            // Each sequence attends within itself. The slices are row
+            // ranges of the same buffers, so the per-head math below is
+            // the one the single-sequence path runs.
+            let mut off = 0usize;
+            for &ns in segs {
+                let (qs, ks, vs) = (
+                    &q_all[off * nh * hd..(off + ns) * nh * hd],
+                    &k_all[off * nkv * hd..(off + ns) * nkv * hd],
+                    &v_all[off * nkv * hd..(off + ns) * nkv * hd],
+                );
+                let dst = &mut attn[off * nh * hd..(off + ns) * nh * hd];
+                if !self.gpu_attention(qs, ks, vs, ns, scale, dst) {
+                    self.attention_seq(qs, ks, vs, ns, scale, dst);
                 }
-                {
-                    let _s = prof::span(prof::AQK);
-                    crate::fcd_ops::gemm_nt(&qh, &kh, &mut scores, n, hd, n, pool);
-                }
-                {
-                    let _s = prof::span(prof::SOFTMAX);
-                    let sp = SendRows(scores.as_mut_ptr());
-                    let soft = |start: usize, end: usize| {
-                        for r in start..end {
-                            // SAFETY: workers cover disjoint row ranges.
-                            softmax_inplace(unsafe { sp.row(r * n, n) });
-                        }
-                    };
-                    match pool {
-                        Some(p) => p.run_rows(n, &soft),
-                        None => soft(0, n),
-                    }
-                }
-                {
-                    let _s = prof::span(prof::APV);
-                    crate::fcd_ops::gemm_nt(&scores, &vt, &mut oh, n, n, hd, pool);
-                }
-                let _s = prof::span(prof::APACK);
-                let sa = SendRows(attn.as_mut_ptr());
-                pool_rows(pool, n, &|start, end| {
-                    for p in start..end {
-                        // SAFETY: workers cover disjoint token ranges.
-                        unsafe { sa.row((p * nh + hh) * hd, hd) }
-                            .copy_from_slice(&oh[p * hd..(p + 1) * hd]);
-                    }
-                });
+                off += ns;
             }
+        } else if !self.gpu_attention(&q_all, &k_all, &v_all, n, scale, &mut attn) {
+            self.attention_seq(&q_all, &k_all, &v_all, n, scale, &mut attn);
         }
         let mut proj = vec![0f32; n * hs];
         {
@@ -1072,6 +1132,149 @@ impl NextDit {
     }
 
     /// The rest of the forward, from an already-refined caption.
+    /// Classifier-free guidance in ONE pass: the conditional and the
+    /// unconditional sequence go through the joint stack as a single
+    /// batch. Every weight is read once for both — which is the whole
+    /// cost on a CPU or a phone — and the image branch (patchify,
+    /// x_embedder, the noise refiners) is computed once instead of
+    /// twice, because it does not depend on the caption at all.
+    /// Attention stays per sequence, so the two never mix and each
+    /// prediction equals what the single-sequence path returns.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_cfg_pair(
+        &self,
+        latent: &[f32],
+        h: usize,
+        w: usize,
+        cap_c: &[f32],
+        cap_c_n: usize,
+        cap_u: &[f32],
+        cap_u_n: usize,
+        t: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let (c, p, hs) = (self.in_channels, self.patch, self.hidden);
+        let (hp, wp) = (h / p, w / p);
+        let n_img = hp * wp;
+        let head = prof::span(prof::HEADTAIL);
+        let temb = self.time_embed(t);
+        let pv = p * p * c;
+        let mut tok = vec![0f32; n_img * pv];
+        for ph in 0..hp {
+            for pw in 0..wp {
+                let dst = &mut tok[(ph * wp + pw) * pv..(ph * wp + pw + 1) * pv];
+                for dy in 0..p {
+                    for dx in 0..p {
+                        for ch in 0..c {
+                            dst[(dy * p + dx) * c + ch] =
+                                latent[ch * h * w + (ph * p + dy) * w + pw * p + dx];
+                        }
+                    }
+                }
+            }
+        }
+        let mut img = vec![0f32; n_img * hs];
+        self.x_emb.matmat(&tok, n_img, &mut img, self.pool.as_deref());
+        for i in 0..n_img {
+            for (v, &b) in img[i * hs..(i + 1) * hs].iter_mut().zip(&self.x_emb_b) {
+                *v += b;
+            }
+        }
+        let img_ids: Vec<[u32; 3]> = (0..n_img)
+            .map(|i| [0, (i / wp) as u32, (i % wp) as u32])
+            .collect();
+        let to32 = |r: &(Vec<f64>, Vec<f64>)| {
+            (
+                r.0.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+                r.1.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+            )
+        };
+        // The refiners see the image alone — same for both branches.
+        let img_rope_r = rope_table(
+            &(0..n_img)
+                .map(|i| [0u32, (i / wp) as u32, (i % wp) as u32])
+                .collect::<Vec<_>>(),
+            &self.axes_dim,
+        );
+        let img_rope32_r = to32(&img_rope_r);
+        drop(head);
+        for blk in &self.noise_refiner {
+            self.block_forward(blk, &mut img, &img_rope_r, Some(&img_rope32_r), Some(&temb));
+        }
+        let _ = img_ids;
+        // Joint sequences, concatenated: [cap_c | img] then [cap_u | img].
+        let n_c = cap_c_n + n_img;
+        let n_u = cap_u_n + n_img;
+        let mut x = Vec::with_capacity((n_c + n_u) * hs);
+        x.extend_from_slice(&cap_c[..cap_c_n * hs]);
+        x.extend_from_slice(&img);
+        x.extend_from_slice(&cap_u[..cap_u_n * hs]);
+        x.extend_from_slice(&img);
+        let rope_for = |cap_n: usize| -> (Vec<f64>, Vec<f64>) {
+            let cap_ids: Vec<[u32; 3]> = (0..cap_n).map(|i| [i as u32, 0, 0]).collect();
+            let im_ids: Vec<[u32; 3]> = (0..n_img)
+                .map(|i| [cap_n as u32, (i / wp) as u32, (i % wp) as u32])
+                .collect();
+            let a = rope_table(&cap_ids, &self.axes_dim);
+            let b = rope_table(&im_ids, &self.axes_dim);
+            ([a.0, b.0].concat(), [a.1, b.1].concat())
+        };
+        let (rc, ru) = (rope_for(cap_c_n), rope_for(cap_u_n));
+        let joint_rope = ([rc.0, ru.0].concat(), [rc.1, ru.1].concat());
+        let joint_rope32 = to32(&joint_rope);
+        let segs = [n_c, n_u];
+        for blk in &self.layers {
+            self.block_forward_seg(
+                blk,
+                &mut x,
+                &joint_rope,
+                Some(&joint_rope32),
+                Some(&temb),
+                &segs,
+            );
+        }
+        let _tail = prof::span(prof::HEADTAIL);
+        let n = n_c + n_u;
+        let silu_t: Vec<f32> = temb.iter().map(|&v| silu(v)).collect();
+        let scale = linear(&silu_t, &self.out_lin1_w, &self.out_lin1_b);
+        for row in x.chunks_exact_mut(hs) {
+            let mean = row.iter().map(|&v| v as f64).sum::<f64>() / hs as f64;
+            let var = row
+                .iter()
+                .map(|&v| (v as f64 - mean) * (v as f64 - mean))
+                .sum::<f64>()
+                / hs as f64;
+            let inv = 1.0 / (var + 1e-6).sqrt();
+            for (v, &s) in row.iter_mut().zip(&scale) {
+                *v = ((*v as f64 - mean) * inv) as f32 * (1.0 + s);
+            }
+        }
+        let mut out = vec![0f32; n * pv];
+        self.out_lin2.matmat(&x, n, &mut out, self.pool.as_deref());
+        for i in 0..n {
+            for (v, &b) in out[i * pv..(i + 1) * pv].iter_mut().zip(&self.out_lin2_b) {
+                *v += b;
+            }
+        }
+        let unpatch = |base: usize| -> Vec<f32> {
+            let mut pred = vec![0f32; c * h * w];
+            for ph in 0..hp {
+                for pw in 0..wp {
+                    let src = &out[(base + ph * wp + pw) * pv..(base + ph * wp + pw + 1) * pv];
+                    for dy in 0..p {
+                        for dx in 0..p {
+                            for ch in 0..c {
+                                pred[ch * h * w + (ph * p + dy) * w + pw * p + dx] =
+                                    src[(dy * p + dx) * c + ch];
+                            }
+                        }
+                    }
+                }
+            }
+            pred
+        };
+        (unpatch(cap_c_n), unpatch(n_c + cap_u_n))
+    }
+
     pub fn forward_with_cap(
         &self,
         latent: &[f32],
