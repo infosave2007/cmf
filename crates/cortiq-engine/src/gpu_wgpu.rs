@@ -13828,6 +13828,25 @@ pub fn forward_batch_graph(
         &bg(&c.layout_rmsnorm_b, &[&h_buf, &inw0, &n1, &rms_u]),
         k as u32,
     );
+    // `CMF_BATCH_TS=1`: coarse GPU stage stamps over the batch — the
+    // k-independent fixed cost lives somewhere in here and host timers
+    // cannot see past the submit boundary.
+    let bts_on = std::env::var("CMF_BATCH_TS").is_ok() && c.ts_query.is_some();
+    let mut bts_lbl: Vec<u8> = Vec::new();
+    macro_rules! bts {
+        ($enc:expr, $lbl:expr) => {
+            if bts_on {
+                if let Some((qs, _, _)) = c.ts_query.as_ref() {
+                    let n = bts_lbl.len() as u32;
+                    if n < 250 {
+                        $enc.write_timestamp(qs, n);
+                        bts_lbl.push($lbl);
+                    }
+                }
+            }
+        };
+    }
+    bts!(enc, 0);
     for (li, l) in layers.iter().enumerate() {
         let lw = &lws[li];
         let pnw = stor(bytemuck::cast_slice(l.post_norm));
@@ -13848,75 +13867,73 @@ pub fn forward_batch_graph(
                 ematb(&mut enc, wq, &n1, &qraw_b, qrows, hidden);
                 ematb(&mut enc, wk, &n1, &kb_b, nkv * hd, hidden);
                 ematb(&mut enc, wv, &n1, &vb_b, nkv * hd, hidden);
-                for i in 0..k {
-                    let p = positions[i];
-                    let gate_flag = if *output_gate { 1u32 } else { 0 };
-                    // Token offsets ride the kernels' spare uniform words —
-                    // the three staging copies this loop carried were half
-                    // its commands.
-                    let rope_u = uniform_u32x8(
-                        c,
-                        [
-                            nh as u32,
-                            nkv as u32,
-                            hd as u32,
-                            rd as u32,
-                            p as u32,
-                            flags(q_norm.is_some(), k_norm.is_some()) | gate_flag,
-                            eps.to_bits(),
-                            i as u32,
-                        ],
-                    );
-                    let kv_u = uniform_u32x4(
-                        c,
-                        [nkv as u32, hd as u32, cap as u32, (p | (i << 20)) as u32],
-                    );
-                    let at_u = unif(&[
-                        nh as u32,
-                        (nh / nkv) as u32,
-                        hd as u32,
-                        cap as u32,
-                        (p + 1) as u32,
-                        0,
-                        0,
-                        0,
-                    ]);
-                    go(
-                        &mut enc,
-                        &c.attn_rope,
-                        &bg(
-                            &c.layout_attn_rope,
-                            &[
-                                &qraw_b, &kb_b, &qout_s, &gout_s, &qnw, &knw, &invf_b, &rope_u,
+                {
+                    // ONE compute pass for every position: the loop's four
+                    // dispatches per token each carried their own pass, and
+                    // pass boundaries — not the math — were 4.3 of this
+                    // stage's 5.4 ms. In-pass dispatch ordering already
+                    // guarantees each sees the previous one's writes.
+                    let mut pass = begin_pass(&mut enc);
+                    for i in 0..k {
+                        let p = positions[i];
+                        let gate_flag = if *output_gate { 1u32 } else { 0 };
+                        let rope_u = uniform_u32x8(
+                            c,
+                            [
+                                nh as u32,
+                                nkv as u32,
+                                hd as u32,
+                                rd as u32,
+                                p as u32,
+                                flags(q_norm.is_some(), k_norm.is_some()) | gate_flag,
+                                eps.to_bits(),
+                                i as u32,
                             ],
-                        ),
-                        (nh + nkv) as u32,
-                    );
-                    go(
-                        &mut enc,
-                        &c.kv_append,
-                        &bg(&c.layout_kv, &[&kb_b, &vb_b, kbuf, vbuf, &kv_u]),
-                        ((nkv * hd) as u32).div_ceil(256),
-                    );
-                    let (ap, al) = attend_pipes(c, hd);
-                    go(
-                        &mut enc,
-                        ap,
-                        &bg(al, &[&qout_s, kbuf, vbuf, &attn_s, &at_u]),
-                        nh as u32,
-                    );
-                    if *output_gate {
-                        let gm_u = unif(&[(nh * hd) as u32, 0, 0, 0]);
-                        go(
-                            &mut enc,
-                            &c.gate_mul,
-                            &bg(&c.layout_gate_mul, &[&gout_s, &attn_s, &gm_u]),
-                            ((nh * hd) as u32).div_ceil(256),
                         );
+                        let kv_u = uniform_u32x4(
+                            c,
+                            [nkv as u32, hd as u32, cap as u32, (p | (i << 20)) as u32],
+                        );
+                        let at_u = unif(&[
+                            nh as u32,
+                            (nh / nkv) as u32,
+                            hd as u32,
+                            cap as u32,
+                            (p + 1) as u32,
+                            0,
+                            0,
+                            0,
+                        ]);
+                        pass.set_pipeline(&c.attn_rope);
+                        pass.set_bind_group(
+                            0,
+                            &bg(
+                                &c.layout_attn_rope,
+                                &[
+                                    &qraw_b, &kb_b, &qout_s, &gout_s, &qnw, &knw, &invf_b, &rope_u,
+                                ],
+                            ),
+                            &[],
+                        );
+                        pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
+                        pass.set_pipeline(&c.kv_append);
+                        pass.set_bind_group(0, &bg(&c.layout_kv, &[&kb_b, &vb_b, kbuf, vbuf, &kv_u]), &[]);
+                        pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
+                        let (ap, al) = attend_pipes(c, hd);
+                        pass.set_pipeline(ap);
+                        pass.set_bind_group(0, &bg(al, &[&qout_s, kbuf, vbuf, &attn_s, &at_u]), &[]);
+                        pass.dispatch_workgroups(nh as u32, 1, 1);
+                        if *output_gate {
+                            let gm_u = unif(&[(nh * hd) as u32, 0, 0, 0]);
+                            pass.set_pipeline(&c.gate_mul);
+                            pass.set_bind_group(0, &bg(&c.layout_gate_mul, &[&gout_s, &attn_s, &gm_u]), &[]);
+                            pass.dispatch_workgroups(((nh * hd) as u32).div_ceil(256), 1, 1);
+                        }
+                        encode_blit_p(&mut pass, c, &attn_s, &attn_bb, nh * hd, 0, i * nh * hd, None);
                     }
-                    cpo(&mut enc, &attn_s, &attn_bb, i * nh * hd, nh * hd);
                 }
                 ematb(&mut enc, wo, &attn_bb, &ob, hidden, nh * hd);
+                bts!(enc, 1);
             }
             (
                 LAttn::Gdn {
@@ -13952,7 +13969,9 @@ pub fn forward_batch_graph(
                         let b = c.device.create_buffer(&wgpu::BufferDescriptor {
                             label: Some("gdn-snap"),
                             size: (k as u64 * (ring_sz + s_sz)).max(4),
-                            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                            usage: wgpu::BufferUsages::STORAGE
+                                | wgpu::BufferUsages::COPY_DST
+                                | wgpu::BufferUsages::COPY_SRC,
                             mapped_at_creation: false,
                         });
                         (b, ring_sz, s_sz, k)
@@ -13961,7 +13980,9 @@ pub fn forward_batch_graph(
                         e.0 = c.device.create_buffer(&wgpu::BufferDescriptor {
                             label: Some("gdn-snap"),
                             size: (k as u64 * (ring_sz + s_sz)).max(4),
-                            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                            usage: wgpu::BufferUsages::STORAGE
+                                | wgpu::BufferUsages::COPY_DST
+                                | wgpu::BufferUsages::COPY_SRC,
                             mapped_at_creation: false,
                         });
                         e.3 = k;
@@ -14003,47 +14024,62 @@ pub fn forward_batch_graph(
                         pass.dispatch_workgroups((*nv as u32).min(MAX_WG), k as u32, 1);
                     }
                 }
-                for i in 0..k {
-                    let gc_pt = uniform_u32x4(c, [*cdim as u32, *kk as u32, (i * cdim) as u32, 0]);
-                    go(
-                        &mut enc,
-                        &c.gdn_conv,
-                        &bg(&c.layout_gdn_conv, &[&qkv_b, &taps, ring, &cq_s, &gc_pt]),
-                        (*cdim as u32).div_ceil(256),
-                    );
-                    let gd_pt = uniform_u32x8(
-                        c,
-                        [
-                            *nv as u32,
-                            *dk as u32,
-                            *dv as u32,
-                            (nk * dk) as u32,
-                            (nv / nk) as u32,
-                            *cdim as u32,
-                            eps.to_bits(),
-                            i as u32,
-                        ],
-                    );
-                    go(
-                        &mut enc,
-                        &c.gdn_step,
-                        &bg(
-                            &c.layout_gdn,
-                            &[
-                                &cq_s, &z_b, &a_bb, &b_bb, &alog, &dtb, &gnorm, s, &gdo_b, &gd_pt,
+                {
+                    // ONE pass per layer (was: a pass per dispatch, 6-9 of
+                    // them) — pass boundaries were 7.6 of this stage's
+                    // 9.6 ms. State snapshots ride the same pass as compute
+                    // blits, so speculation adds no boundaries either.
+                    let mut pass = begin_pass(&mut enc);
+                    for i in 0..k {
+                        let gc_pt = uniform_u32x4(c, [*cdim as u32, *kk as u32, (i * cdim) as u32, 0]);
+                        pass.set_pipeline(&c.gdn_conv);
+                        pass.set_bind_group(0, &bg(&c.layout_gdn_conv, &[&qkv_b, &taps, ring, &cq_s, &gc_pt]), &[]);
+                        pass.dispatch_workgroups((*cdim as u32).div_ceil(256), 1, 1);
+                        let gd_pt = uniform_u32x8(
+                            c,
+                            [
+                                *nv as u32,
+                                *dk as u32,
+                                *dv as u32,
+                                (nk * dk) as u32,
+                                (nv / nk) as u32,
+                                *cdim as u32,
+                                eps.to_bits(),
+                                i as u32,
                             ],
-                        ),
-                        *nv as u32,
-                    );
-                    if let Some((snap, ring_sz, s_sz)) = snap.as_ref() {
-                        let off = i as u64 * (ring_sz + s_sz);
-                        if *ring_sz > 0 {
-                            enc.copy_buffer_to_buffer(ring, 0, snap, off, *ring_sz);
+                        );
+                        pass.set_pipeline(&c.gdn_step);
+                        pass.set_bind_group(
+                            0,
+                            &bg(
+                                &c.layout_gdn,
+                                &[
+                                    &cq_s, &z_b, &a_bb, &b_bb, &alog, &dtb, &gnorm, s, &gdo_b, &gd_pt,
+                                ],
+                            ),
+                            &[],
+                        );
+                        pass.dispatch_workgroups(*nv as u32, 1, 1);
+                        if let Some((snap, ring_sz, s_sz)) = snap.as_ref() {
+                            let off = i * ((*ring_sz as usize + *s_sz as usize) / 4);
+                            if *ring_sz > 0 {
+                                encode_blit_p(&mut pass, c, ring, snap, (*ring_sz / 4) as usize, 0, off, None);
+                            }
+                            encode_blit_p(
+                                &mut pass,
+                                c,
+                                s,
+                                snap,
+                                (*s_sz / 4) as usize,
+                                0,
+                                off + (*ring_sz / 4) as usize,
+                                None,
+                            );
                         }
-                        enc.copy_buffer_to_buffer(s, 0, snap, off + ring_sz, *s_sz);
                     }
                 }
                 ematb(&mut enc, out, &gdo_b, &ob, hidden, nv * dv);
+                bts!(enc, 2);
             }
             _ => return false,
         }
@@ -14216,6 +14252,7 @@ pub fn forward_batch_graph(
                 }
             }
         }
+        bts!(enc, 3);
         if li + 1 < layers.len() {
             let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
             go(
@@ -14236,6 +14273,7 @@ pub fn forward_batch_graph(
                 ((k * hidden) as u32).div_ceil(256),
             );
         }
+        bts!(enc, 4);
     }
     let size = (k * hidden * 4) as u64;
     let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -14275,6 +14313,13 @@ pub fn forward_batch_graph(
             mapped_at_creation: false,
         });
         ematb(&mut enc, &lm, &n1b, &lbuf, sp.lm_rows, hidden);
+        bts!(enc, 5);
+        if bts_on && bts_lbl.len() > 1 {
+            if let Some((qs, resolve, tstage)) = c.ts_query.as_ref() {
+                enc.resolve_query_set(qs, 0..bts_lbl.len() as u32, resolve, 0);
+                enc.copy_buffer_to_buffer(resolve, 0, tstage, 0, bts_lbl.len() as u64 * 8);
+            }
+        }
         sp.logits_out.resize(k * sp.lm_rows, 0.0);
         readback2(
             c,
@@ -14283,6 +14328,12 @@ pub fn forward_batch_graph(
             (&lbuf, &mut sp.logits_out[..]),
         )
     } else {
+        if bts_on && bts_lbl.len() > 1 {
+            if let Some((qs, resolve, tstage)) = c.ts_query.as_ref() {
+                enc.resolve_query_set(qs, 0..bts_lbl.len() as u32, resolve, 0);
+                enc.copy_buffer_to_buffer(resolve, 0, tstage, 0, bts_lbl.len() as u64 * 8);
+            }
+        }
         readback(c, enc, &h_buf, &stage, size, &mut h[..k * hidden])
     };
     if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
@@ -14292,6 +14343,38 @@ pub fn forward_batch_graph(
             t_bfn.elapsed().as_secs_f64() * 1e3 - post,
             post,
         );
+    }
+    if ok && bts_on && bts_lbl.len() > 1 {
+        if let Some((_, _, tstage)) = c.ts_query.as_ref() {
+            let bytes = bts_lbl.len() as u64 * 8;
+            let (tx, rx) = std::sync::mpsc::channel();
+            tstage.map_async(wgpu::MapMode::Read, ..bytes, move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            if rx.recv().map(|r| r.is_ok()).unwrap_or(false) {
+                if let Ok(raw) = tstage.get_mapped_range(..bytes) {
+                    let t: Vec<u64> = bytemuck::cast_slice::<u8, u64>(&raw).to_vec();
+                    drop(raw);
+                    let mut agg = [(0f64, 0u32); 8];
+                    for i in 1..bts_lbl.len() {
+                        let d = t[i].saturating_sub(t[i - 1]) as f64 * c.ts_period as f64 / 1e6;
+                        let e = &mut agg[bts_lbl[i] as usize];
+                        e.0 += d;
+                        e.1 += 1;
+                    }
+                    let names = ["start", "attn", "gdn", "ffn", "norm", "tail", "?", "?"];
+                    let line: Vec<String> = agg
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| e.1 > 0)
+                        .map(|(i, e)| format!("{}={:.2}ms/{}", names[i], e.0, e.1))
+                        .collect();
+                    eprintln!("batch-ts: {}", line.join(" "));
+                }
+            }
+            tstage.unmap();
+        }
     }
     if ok {
         let mut kvm = c.attn_kv.lock().unwrap();
