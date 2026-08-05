@@ -1475,6 +1475,14 @@ impl Pipeline {
         // The MTP module is detached during generation so its mutable
         // state does not fight the borrow on `self`.
         let mut mtp = if spec_active { self.mtp.take() } else { None };
+        if std::env::var("CMF_MTP_CHAIN_PROBE").is_ok() {
+            eprintln!(
+                "mtp-probe gate: spec_active={spec_active} mtp={} speculative={} graph_on={graph_on} temp_ok={}",
+                mtp.is_some(),
+                self.speculative,
+                self.sampler_config.temperature < 1e-6,
+            );
+        }
         if let Some(m) = &mut mtp {
             m.kv.clear();
         }
@@ -1595,14 +1603,47 @@ impl Pipeline {
                 let end = (pos + chunk).min(input_ids.len());
                 let hb = self.prefill_batch(&input_ids[pos..end], pos);
                 if let Some(m) = &mut mtp {
+                    let probe: usize = std::env::var("CMF_MTP_CHAIN_PROBE")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
                     for p in pos..end {
                         if p + 1 < input_ids.len() {
-                            let _ = self.mtp_step(
-                                m,
-                                &hb[(p - pos) * hs..(p - pos + 1) * hs],
-                                input_ids[p + 1],
-                                p,
-                            );
+                            if probe >= 1 && p + 2 < input_ids.len() {
+                                // Teacher-forced chain acceptance (see the
+                                // tail loop's twin): the warm-up row stays,
+                                // the chain's rows roll back.
+                                let (d1, mut hx) = self.mtp_step_h(
+                                    m,
+                                    &hb[(p - pos) * hs..(p - pos + 1) * hs],
+                                    input_ids[p + 1],
+                                    p,
+                                );
+                                let mut ok = d1 == input_ids[p + 2];
+                                Self::chain_probe_note(0, ok);
+                                let mut d_prev = d1;
+                                let mut extra = 0usize;
+                                for j in 1..probe {
+                                    if p + 2 + j >= input_ids.len() {
+                                        break;
+                                    }
+                                    let (dj, hj) =
+                                        self.mtp_step_h(m, &hx, d_prev, p + 1 + j);
+                                    extra += 1;
+                                    ok = ok && dj == input_ids[p + 2 + j];
+                                    Self::chain_probe_note(j, ok);
+                                    d_prev = dj;
+                                    hx = hj;
+                                }
+                                m.kv.truncate_last(extra);
+                            } else {
+                                let _ = self.mtp_step(
+                                    m,
+                                    &hb[(p - pos) * hs..(p - pos + 1) * hs],
+                                    input_ids[p + 1],
+                                    p,
+                                );
+                            }
                         }
                     }
                 }
@@ -1628,7 +1669,36 @@ impl Pipeline {
                 if let Some(m) = &mut mtp {
                     let _ = self.mtp_step(m, &h1, input_ids[pos + 1], pos);
                     if pos + 2 < input_ids.len() {
-                        let _ = self.mtp_step(m, &h2, input_ids[pos + 2], pos + 1);
+                        let probe: usize = std::env::var("CMF_MTP_CHAIN_PROBE")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0);
+                        if probe >= 1 && pos + 3 < input_ids.len() {
+                            // Same teacher-forced chain table as the tail
+                            // loop below, fed from the pair path that owns
+                            // most prefill positions.
+                            let (d1, mut hx) =
+                                self.mtp_step_h(m, &h2, input_ids[pos + 2], pos + 1);
+                            let mut ok = d1 == input_ids[pos + 3];
+                            Self::chain_probe_note(0, ok);
+                            let mut d_prev = d1;
+                            let mut extra = 0usize;
+                            for j in 1..probe {
+                                if pos + 3 + j >= input_ids.len() {
+                                    break;
+                                }
+                                let (dj, hj) =
+                                    self.mtp_step_h(m, &hx, d_prev, pos + 2 + j);
+                                extra += 1;
+                                ok = ok && dj == input_ids[pos + 3 + j];
+                                Self::chain_probe_note(j, ok);
+                                d_prev = dj;
+                                hx = hj;
+                            }
+                            m.kv.truncate_last(extra);
+                        } else {
+                            let _ = self.mtp_step(m, &h2, input_ids[pos + 2], pos + 1);
+                        }
                     }
                 }
                 hidden = h2;
@@ -1694,7 +1764,39 @@ impl Pipeline {
             hidden = self.forward_layers(&self.embed_single(input_ids[pos]), pos, task_mask);
             if let Some(m) = &mut mtp {
                 if pos + 1 < input_ids.len() {
-                    let _ = self.mtp_step(m, &hidden, input_ids[pos + 1], pos);
+                    // `CMF_MTP_CHAIN_PROBE=k`: teacher-forced acceptance of a
+                    // CHAINED draft — iterate the head on its own hidden k
+                    // deep and score every depth against the prompt's real
+                    // continuation. The economics of a k-token speculative
+                    // round stand or fall on this table.
+                    let probe: usize = std::env::var("CMF_MTP_CHAIN_PROBE")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    if probe >= 1 && pos + 2 < input_ids.len() {
+                        let (d1, mut hx) = self.mtp_step_h(m, &hidden, input_ids[pos + 1], pos);
+                        let mut ok = d1 == input_ids[pos + 2];
+                        Self::chain_probe_note(0, ok);
+                        let mut d_prev = d1;
+                        let mut extra = 0usize;
+                        for j in 1..probe {
+                            if pos + 2 + j >= input_ids.len() {
+                                break;
+                            }
+                            let (dj, hj) =
+                                self.mtp_step_h(m, &hx, d_prev, pos + 1 + j);
+                            extra += 1;
+                            ok = ok && dj == input_ids[pos + 2 + j];
+                            Self::chain_probe_note(j, ok);
+                            d_prev = dj;
+                            hx = hj;
+                        }
+                        // The chain's rows are speculation, not the prompt —
+                        // keep only the warmup row the plain path would add.
+                        m.kv.truncate_last(extra);
+                    } else {
+                        let _ = self.mtp_step(m, &hidden, input_ids[pos + 1], pos);
+                    }
                 }
             }
             pos += 1;
@@ -2059,6 +2161,41 @@ impl Pipeline {
         next_token: u32,
         position: usize,
     ) -> u32 {
+        self.mtp_step_h(m, hidden, next_token, position).0
+    }
+
+    /// Tally for `CMF_MTP_CHAIN_PROBE`: per depth, how often the CHAIN is
+    /// still an exact prefix of the real continuation. Printed every 128
+    /// depth-0 samples so a killed run still shows its table.
+    fn chain_probe_note(depth: usize, prefix_ok: bool) {
+        use std::sync::Mutex;
+        static T: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+        let mut t = T.lock().unwrap();
+        if t.len() <= depth {
+            t.resize(depth + 1, (0, 0));
+        }
+        t[depth].0 += 1;
+        t[depth].1 += prefix_ok as u64;
+        if depth == 0 && t[0].0 % 128 == 0 {
+            let line: Vec<String> = t
+                .iter()
+                .enumerate()
+                .map(|(d, (n, k))| format!("d{}={:.0}%({n})", d + 1, 100.0 * *k as f64 / (*n).max(1) as f64))
+                .collect();
+            eprintln!("mtp-chain: {}", line.join(" "));
+        }
+    }
+
+    /// `mtp_step` that also hands back the block's own output hidden — the
+    /// state a CHAINED draft feeds the next step, the way a multi-token
+    /// speculative round iterates the head on itself.
+    fn mtp_step_h(
+        &mut self,
+        m: &mut MtpModule,
+        hidden: &[f32],
+        next_token: u32,
+        position: usize,
+    ) -> (u32, Vec<f32>) {
         // fc concat order is [enorm(embed); hnorm(hidden)] — EMBEDDING
         // FIRST. Verified by the oracle (converter/mtp_oracle.py):
         // [emb;hid] → 45.8% acceptance, [hid;emb] → 0.00%.
@@ -2135,7 +2272,7 @@ impl Pipeline {
         let mut lg = self.lm_head_forward(&self.ws.n1);
         let draft = sampler::argmax(&lg);
         attention::recycle_buf(&mut lg);
-        draft
+        (draft, x)
     }
 
     /// Micro-benchmark: two single-position forwards vs one fused pair
