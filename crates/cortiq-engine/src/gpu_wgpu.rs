@@ -14195,7 +14195,25 @@ pub fn forward_batch_graph(
         };
     }
     bts!(enc, 0);
+    // The token graph's pipelined submission, ported: the card starts the
+    // first layers of the verify/prefill batch while the host still
+    // encodes the rest. Timestamps must stay inside ONE submission-window
+    // accounting, so the stamps simply ride whichever encoder is current.
+    let bchunk = if graph_split_n() > 1 {
+        layers.len().div_ceil(graph_split_n()).max(4)
+    } else {
+        usize::MAX
+    };
     for (li, l) in layers.iter().enumerate() {
+        if li > 0 && bchunk != usize::MAX && li % bchunk == 0 {
+            let full = std::mem::replace(
+                &mut enc,
+                c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("batch-graph"),
+                }),
+            );
+            c.queue.submit([full.finish()]);
+        }
         let lw = &lws[li];
         let pnw = stor(bytemuck::cast_slice(l.post_norm));
         match (&lw.attn, &l.attn) {
