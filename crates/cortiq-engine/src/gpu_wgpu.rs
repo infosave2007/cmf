@@ -1210,6 +1210,147 @@ fn gdn_step(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
     }
 }
 
+// ── GDN, k-looped twins for the batched verify: the position recurrence
+// stays INSIDE the kernel, so a layer is two dispatches with one barrier
+// between them instead of 2k dispatches with 2k barrier drains — which
+// were 7-8 ms of a 3-position verify. Columns are independent in the
+// conv (no barriers at all); heads are independent in the step, so the
+// loop lives inside the workgroup. When snap_stride > 0 each position's
+// (ring, S) lands in the snapshot buffer as it is produced — the rows a
+// partial acceptance restores from, at zero extra passes.
+struct GcKP { cdim: u32, kk: u32, kb: u32, snap: u32, stride: u32, p0: u32, p1: u32, p2: u32 };
+@group(0) @binding(0) var<storage, read>       gck_qkv : array<f32>;
+@group(0) @binding(1) var<storage, read>       gck_taps: array<f32>;
+@group(0) @binding(2) var<storage, read_write> gck_ring: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gck_cq  : array<f32>;
+@group(0) @binding(4) var<uniform>             gck_p   : GcKP;
+@group(0) @binding(5) var<storage, read_write> gck_snap: array<f32>;
+@compute @workgroup_size(256)
+fn gdn_conv_k(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    let cdim = gck_p.cdim;
+    if (c >= cdim) { return; }
+    let kk = gck_p.kk;
+    let tb = c * kk;
+    for (var i = 0u; i < gck_p.kb; i = i + 1u) {
+        let x = gck_qkv[i * cdim + c];
+        var acc = x * gck_taps[tb + kk - 1u];
+        for (var j = 0u; j + 1u < kk; j = j + 1u) {
+            acc = acc + gck_ring[j * cdim + c] * gck_taps[tb + j];
+        }
+        gck_cq[i * cdim + c] = acc / (1.0 + exp(-acc));
+        for (var j = 0u; j + 2u < kk; j = j + 1u) {
+            gck_ring[j * cdim + c] = gck_ring[(j + 1u) * cdim + c];
+        }
+        if (kk > 1u) {
+            gck_ring[(kk - 2u) * cdim + c] = x;
+        }
+        if (gck_p.snap != 0u) {
+            let off = i * gck_p.stride;
+            for (var j = 0u; j + 1u < kk; j = j + 1u) {
+                gck_snap[off + j * cdim + c] = gck_ring[j * cdim + c];
+            }
+        }
+    }
+}
+
+struct GdKP {
+    nv: u32, dk: u32, dv: u32, kd: u32,
+    rep: u32, cdim: u32, eps: f32, kb: u32,
+    stride: u32, ring_els: u32, p0: u32, p1: u32,
+};
+@group(0) @binding(0) var<storage, read>       gdk_cq   : array<f32>;
+@group(0) @binding(1) var<storage, read>       gdk_z    : array<f32>;
+@group(0) @binding(2) var<storage, read>       gdk_a    : array<f32>;
+@group(0) @binding(3) var<storage, read>       gdk_b    : array<f32>;
+@group(0) @binding(4) var<storage, read>       gdk_alog : array<f32>;
+@group(0) @binding(5) var<storage, read>       gdk_dtb  : array<f32>;
+@group(0) @binding(6) var<storage, read>       gdk_norm : array<f32>;
+@group(0) @binding(7) var<storage, read_write> gdk_S    : array<f32>;
+@group(0) @binding(8) var<storage, read_write> gdk_o    : array<f32>;
+@group(0) @binding(9) var<uniform>             gdk_p    : GdKP;
+@group(0) @binding(10) var<storage, read_write> gdk_snap: array<f32>;
+var<workgroup> gdk_kf: array<f32, 256>;
+var<workgroup> gdk_qf: array<f32, 256>;
+var<workgroup> gdk_ov: array<f32, 256>;
+var<workgroup> gdk_red: array<f32, 256>;
+fn gdk_reduce(t: u32) -> f32 {
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) { gdk_red[t] = gdk_red[t] + gdk_red[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    return gdk_red[0];
+}
+@compute @workgroup_size(256)
+fn gdn_step_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let t = lid.x;
+    if (h >= gdk_p.nv) { return; }
+    let dk = gdk_p.dk;
+    let dv = gdk_p.dv;
+    let ko = h / gdk_p.rep;
+    let sbase = h * dk * dv;
+    for (var i = 0u; i < gdk_p.kb; i = i + 1u) {
+        let cq0 = i * gdk_p.cdim;
+        let qs = cq0 + ko * dk;
+        let ks = cq0 + gdk_p.kd + ko * dk;
+        gdk_red[t] = select(0.0, gdk_cq[qs + t] * gdk_cq[qs + t], t < dk);
+        workgroupBarrier();
+        let nq = gdk_reduce(t);
+        workgroupBarrier();
+        gdk_red[t] = select(0.0, gdk_cq[ks + t] * gdk_cq[ks + t], t < dk);
+        workgroupBarrier();
+        let nkn = gdk_reduce(t);
+        workgroupBarrier();
+        let invq = 1.0 / (sqrt(nq + 1e-6) * sqrt(f32(dk)));
+        let invk = 1.0 / sqrt(nkn + 1e-6);
+        if (t < dk) {
+            gdk_qf[t] = gdk_cq[qs + t] * invq;
+            gdk_kf[t] = gdk_cq[ks + t] * invk;
+        }
+        workgroupBarrier();
+        let abo = i * gdk_p.nv;
+        let g = exp(-exp(gdk_alog[h]) * gd_softplus(gdk_a[abo + h] + gdk_dtb[h]));
+        let beta = 1.0 / (1.0 + exp(-gdk_b[abo + h]));
+        if (t < dv) {
+            let dj = t;
+            let vt = gdk_cq[cq0 + 2u * gdk_p.kd + h * dv + dj];
+            var kv = 0.0;
+            for (var di = 0u; di < dk; di = di + 1u) {
+                kv = kv + gdk_S[sbase + di * dv + dj] * gdk_kf[di];
+            }
+            let delta = (vt - g * kv) * beta;
+            var o = 0.0;
+            let snap0 = i * gdk_p.stride + gdk_p.ring_els + sbase;
+            for (var di = 0u; di < dk; di = di + 1u) {
+                let idx = sbase + di * dv + dj;
+                let cell = g * gdk_S[idx] + gdk_kf[di] * delta;
+                gdk_S[idx] = cell;
+                if (gdk_p.stride != 0u) {
+                    gdk_snap[snap0 + di * dv + dj] = cell;
+                }
+                o = o + gdk_qf[di] * cell;
+            }
+            gdk_ov[dj] = o;
+        }
+        workgroupBarrier();
+        gdk_red[t] = select(0.0, gdk_ov[t] * gdk_ov[t], t < dv);
+        workgroupBarrier();
+        let ss = gdk_reduce(t);
+        workgroupBarrier();
+        let inv = 1.0 / sqrt(ss / f32(dv) + gdk_p.eps);
+        if (t < dv) {
+            let zo = i * gdk_p.nv * dv;
+            let zz = gdk_z[zo + h * dv + t];
+            gdk_o[zo + h * dv + t] = gdk_ov[t] * inv * gdk_norm[t] * (zz / (1.0 + exp(-zz)));
+        }
+        workgroupBarrier();
+    }
+}
+
 // ── GDN step, parallel edition: one WORKGROUP PER (head, column). The
 // one-workgroup-per-head kernel put 32 workgroups on a 188-SM card — 8%
 // occupancy, 3.7 ms/token of a 12.5 ms frame on the 2-bit 35B. Column j
@@ -2731,6 +2872,146 @@ fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
         }
         if (l == 0u && wrow_a < rows) { q1y[row_a] = partial_q4v[sub << 6u]; }
         if (l == 0u && wrow_b < rows) { q1y[row_b] = partial_q4vb[sub << 6u]; }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+
+// ── q4tp matvec, k-in-registers batch: ONE weight decode serves up to
+// FOUR activation vectors. The nb-dispatch batch streams the whole weight
+// once per element and hopes for L2; at 2-8 MB a layer there is nothing
+// left to hope with, and a k=3 verify paid the weight bandwidth three
+// times. Here the batch lives in a vec4 accumulator (named, constant
+// -indexed — a dynamically indexed array would spill to stack and run at
+// a fraction of the card, the register-spill lesson). Rows past kb read
+// clamped garbage and are zeroed by the mask.
+var<workgroup> partial_q4k: array<vec4<f32>, 256>;
+var<workgroup> partial_q4kb: array<vec4<f32>, 256>;
+@compute @workgroup_size(256)
+fn q4tp_matvec4_k(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(num_workgroups) nwg: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let kb = max(q1p._p0, 1u);
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let xr = gpr * 8u;
+    let mask = vec4<f32>(
+        1.0,
+        select(0.0, 1.0, kb > 1u),
+        select(0.0, 1.0, kb > 2u),
+        select(0.0, 1.0, kb > 3u),
+    );
+    let blocks = (rows + 7u) / 8u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks) { break; }
+        let base = wb * 8u;
+        {
+            let r = base + (lid >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                lad_q4v[lid] = exp2(pr.x + f32(lid & 31u) * pr.y);
+            }
+        }
+        workgroupBarrier();
+        let wrow_a = base + sub;
+        let wrow_b = base + sub + 4u;
+        let live_b = wrow_b < rows;
+        var acc_a = vec4<f32>(0.0);
+        var acc_b = vec4<f32>(0.0);
+        if (wrow_a < rows) {
+            let crow_a = codes_b + wrow_a * cstride;
+            let crow_b = codes_b + wrow_b * cstride;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                var cv_a = q4tp_byte(crow_a + cbo);
+                if (sh > 3u) { cv_a = cv_a | (q4tp_byte(crow_a + cbo + 1u) << 8u); }
+                let v_a = q4v_w[wrow_a * gpr + g];
+                let sa = lad_q4v[(sub << 5u) + ((cv_a >> sh) & 31u)];
+                let x0 = g * 8u;
+                let d_a = vec4<f32>(
+                    q4v_dot8(v_a.x, q4v_x[x0], q4v_x[x0 + 1u])
+                        + q4v_dot8(v_a.y, q4v_x[x0 + 2u], q4v_x[x0 + 3u])
+                        + q4v_dot8(v_a.z, q4v_x[x0 + 4u], q4v_x[x0 + 5u])
+                        + q4v_dot8(v_a.w, q4v_x[x0 + 6u], q4v_x[x0 + 7u]),
+                    q4v_dot8(v_a.x, q4v_x[xr + x0], q4v_x[xr + x0 + 1u])
+                        + q4v_dot8(v_a.y, q4v_x[xr + x0 + 2u], q4v_x[xr + x0 + 3u])
+                        + q4v_dot8(v_a.z, q4v_x[xr + x0 + 4u], q4v_x[xr + x0 + 5u])
+                        + q4v_dot8(v_a.w, q4v_x[xr + x0 + 6u], q4v_x[xr + x0 + 7u]),
+                    q4v_dot8(v_a.x, q4v_x[2u * xr + x0], q4v_x[2u * xr + x0 + 1u])
+                        + q4v_dot8(v_a.y, q4v_x[2u * xr + x0 + 2u], q4v_x[2u * xr + x0 + 3u])
+                        + q4v_dot8(v_a.z, q4v_x[2u * xr + x0 + 4u], q4v_x[2u * xr + x0 + 5u])
+                        + q4v_dot8(v_a.w, q4v_x[2u * xr + x0 + 6u], q4v_x[2u * xr + x0 + 7u]),
+                    q4v_dot8(v_a.x, q4v_x[3u * xr + x0], q4v_x[3u * xr + x0 + 1u])
+                        + q4v_dot8(v_a.y, q4v_x[3u * xr + x0 + 2u], q4v_x[3u * xr + x0 + 3u])
+                        + q4v_dot8(v_a.z, q4v_x[3u * xr + x0 + 4u], q4v_x[3u * xr + x0 + 5u])
+                        + q4v_dot8(v_a.w, q4v_x[3u * xr + x0 + 6u], q4v_x[3u * xr + x0 + 7u]),
+                );
+                acc_a = acc_a + sa * d_a * mask;
+                if (live_b) {
+                    var cv_b = q4tp_byte(crow_b + cbo);
+                    if (sh > 3u) { cv_b = cv_b | (q4tp_byte(crow_b + cbo + 1u) << 8u); }
+                    let v_b = q4v_w[wrow_b * gpr + g];
+                    let sb = lad_q4v[128u + (sub << 5u) + ((cv_b >> sh) & 31u)];
+                    let d_b = vec4<f32>(
+                        q4v_dot8(v_b.x, q4v_x[x0], q4v_x[x0 + 1u])
+                            + q4v_dot8(v_b.y, q4v_x[x0 + 2u], q4v_x[x0 + 3u])
+                            + q4v_dot8(v_b.z, q4v_x[x0 + 4u], q4v_x[x0 + 5u])
+                            + q4v_dot8(v_b.w, q4v_x[x0 + 6u], q4v_x[x0 + 7u]),
+                        q4v_dot8(v_b.x, q4v_x[xr + x0], q4v_x[xr + x0 + 1u])
+                            + q4v_dot8(v_b.y, q4v_x[xr + x0 + 2u], q4v_x[xr + x0 + 3u])
+                            + q4v_dot8(v_b.z, q4v_x[xr + x0 + 4u], q4v_x[xr + x0 + 5u])
+                            + q4v_dot8(v_b.w, q4v_x[xr + x0 + 6u], q4v_x[xr + x0 + 7u]),
+                        q4v_dot8(v_b.x, q4v_x[2u * xr + x0], q4v_x[2u * xr + x0 + 1u])
+                            + q4v_dot8(v_b.y, q4v_x[2u * xr + x0 + 2u], q4v_x[2u * xr + x0 + 3u])
+                            + q4v_dot8(v_b.z, q4v_x[2u * xr + x0 + 4u], q4v_x[2u * xr + x0 + 5u])
+                            + q4v_dot8(v_b.w, q4v_x[2u * xr + x0 + 6u], q4v_x[2u * xr + x0 + 7u]),
+                        q4v_dot8(v_b.x, q4v_x[3u * xr + x0], q4v_x[3u * xr + x0 + 1u])
+                            + q4v_dot8(v_b.y, q4v_x[3u * xr + x0 + 2u], q4v_x[3u * xr + x0 + 3u])
+                            + q4v_dot8(v_b.z, q4v_x[3u * xr + x0 + 4u], q4v_x[3u * xr + x0 + 5u])
+                            + q4v_dot8(v_b.w, q4v_x[3u * xr + x0 + 6u], q4v_x[3u * xr + x0 + 7u]),
+                    );
+                    acc_b = acc_b + sb * d_b * mask;
+                }
+                g = g + 64u;
+            }
+        }
+        partial_q4k[lid] = acc_a;
+        partial_q4kb[lid] = acc_b;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+                partial_q4k[lid] = partial_q4k[lid] + partial_q4k[lid + stride];
+                partial_q4kb[lid] = partial_q4kb[lid] + partial_q4kb[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u && wrow_a < rows) {
+            let ra = partial_q4k[sub << 6u];
+            q1y[wrow_a] = ra.x;
+            if (kb > 1u) { q1y[rows + wrow_a] = ra.y; }
+            if (kb > 2u) { q1y[2u * rows + wrow_a] = ra.z; }
+            if (kb > 3u) { q1y[3u * rows + wrow_a] = ra.w; }
+        }
+        if (l == 0u && live_b) {
+            let rb = partial_q4kb[sub << 6u];
+            q1y[wrow_b] = rb.x;
+            if (kb > 1u) { q1y[rows + wrow_b] = rb.y; }
+            if (kb > 2u) { q1y[2u * rows + wrow_b] = rb.z; }
+            if (kb > 3u) { q1y[3u * rows + wrow_b] = rb.w; }
+        }
         workgroupBarrier();
         wb = wb + nwg.x;
     }
@@ -8496,6 +8777,9 @@ struct Ctx {
     /// Batched (token-axis) MoE for the batch graph; select_b carries the
     /// f32 router matvec inside itself.
     moe_select_b: wgpu::ComputePipeline,
+    gdn_conv_k: wgpu::ComputePipeline,
+    q4tp_mv_k: wgpu::ComputePipeline,
+    gdn_step_k: wgpu::ComputePipeline,
     moe_gate_up_q4tp_b: wgpu::ComputePipeline,
     moe_down_q4tp_b: wgpu::ComputePipeline,
     moe_down_q4tp_b2: wgpu::ComputePipeline,
@@ -9154,6 +9438,9 @@ fn init() -> Result<Ctx, String> {
     let moe_gate_up_q4tp = pipe("moe_gate_up_q4tp");
     let moe_down_q4tp = pipe("moe_down_q4tp");
     let moe_select_b = pipe("moe_select_b");
+    let gdn_conv_k = pipe("gdn_conv_k");
+    let q4tp_mv_k = pipe("q4tp_matvec4_k");
+    let gdn_step_k = pipe("gdn_step_k");
     let moe_gate_up_q4tp_b = pipe("moe_gate_up_q4tp_b");
     let moe_down_q4tp_b = pipe("moe_down_q4tp_b");
     let moe_down_q4tp_b2 = pipe("moe_down_q4tp_b2");
@@ -9371,6 +9658,9 @@ fn init() -> Result<Ctx, String> {
         moe_gate_up_q4tp,
         moe_down_q4tp,
         moe_select_b,
+        gdn_conv_k,
+        q4tp_mv_k,
+        gdn_step_k,
         moe_gate_up_q4tp_b,
         moe_down_q4tp_b,
         moe_down_q4tp_b2,
@@ -13609,7 +13899,8 @@ pub fn forward_batch_graph(
     let gout_s = rwc(nh * hd);
     let attn_s = rwc(nh * hd);
     let qkv_s = rwc(gcdim);
-    let cq_s = rwc(gcdim);
+    // k rows for the k-looped conv/step twins — row i at i*cdim.
+    let cq_s = rwc(k * gcdim);
     let z_s = rwc(gnv * gdv);
     let a_s = rwc(gnv);
     let b_s = rwc(gnv);
@@ -13707,7 +13998,26 @@ pub fn forward_batch_graph(
                 // streams the weight once per batch element with the batch
                 // as the fast dispatch axis — its other callers proved it;
                 // the tile GEMM keeps the big-chunk prefill.
-                if k <= 16 && c.use_mv4 {
+                if k <= 4 && c.use_mv4 {
+                    let gpr = cols / 32;
+                    let p_buf = q4tp_mv_params(c, gpr, rows, k);
+                    let layout = c.q4tp_mv_k.get_bind_group_layout(0);
+                    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &layout,
+                        entries: &[
+                            bind_buf(0, &m.buf),
+                            bind_buf(2, y),
+                            bind_buf(3, &p_buf),
+                            bind_buf(4, &m.buf),
+                            bind_buf(5, xs),
+                        ],
+                    });
+                    let mut pass = begin_pass(enc);
+                    pass.set_pipeline(&c.q4tp_mv_k);
+                    pass.set_bind_group(0, &bind, &[]);
+                    pass.dispatch_workgroups((rows as u32).div_ceil(8).min(MAX_WG), 1, 1);
+                } else if k <= 16 && c.use_mv4 {
                     let _ = encode_q4tp_mv4_b(c, enc, &m.buf, xs, y, rows, cols, k);
                 } else {
                     encode_q4_tile_mm(c, enc, &c.q4tp_mm, &m.buf, xs, y, rows, cols, k)
@@ -13995,6 +14305,7 @@ pub fn forward_batch_graph(
                 let alog = stor(bytemuck::cast_slice(a_log));
                 let dtb = stor(bytemuck::cast_slice(dt_bias));
                 let gnorm = stor(bytemuck::cast_slice(norm));
+                bts!(enc, 6);
                 ematb(&mut enc, qkv, &n1, &qkv_b, *cdim, hidden);
                 ematb(&mut enc, z, &n1, &z_b, nv * dv, hidden);
                 let gc_p = unif(&[*cdim as u32, *kk as u32, 0, 0]);
@@ -14024,60 +14335,97 @@ pub fn forward_batch_graph(
                         pass.dispatch_workgroups((*nv as u32).min(MAX_WG), k as u32, 1);
                     }
                 }
+                bts!(enc, 7);
                 {
-                    // ONE pass per layer (was: a pass per dispatch, 6-9 of
-                    // them) — pass boundaries were 7.6 of this stage's
-                    // 9.6 ms. State snapshots ride the same pass as compute
-                    // blits, so speculation adds no boundaries either.
+                    // The position recurrence lives INSIDE two k-looped
+                    // kernels: one dispatch of conv (columns independent —
+                    // no barriers at all), one of step (heads independent),
+                    // with each position's (ring, S) written straight into
+                    // the snapshot buffer by the kernels themselves. The
+                    // per-dispatch chain this replaces spent 7-8 ms of a
+                    // 3-position verify on barrier drains.
+                    let (snap_stride, ring_els, snap_buf) = match snap.as_ref() {
+                        Some((b, ring_sz, s_sz)) => (
+                            ((*ring_sz + *s_sz) / 4) as u32,
+                            (*ring_sz / 4) as u32,
+                            b.clone(),
+                        ),
+                        None => (0u32, 0u32, row_in.clone()),
+                    };
+                    let gc_pt = unif(&[
+                        *cdim as u32,
+                        *kk as u32,
+                        k as u32,
+                        snap_stride.min(1),
+                        snap_stride,
+                        0,
+                        0,
+                        0,
+                    ]);
+                    let gd_pt = unif(&[
+                        *nv as u32,
+                        *dk as u32,
+                        *dv as u32,
+                        (nk * dk) as u32,
+                        (nv / nk) as u32,
+                        *cdim as u32,
+                        eps.to_bits(),
+                        k as u32,
+                        snap_stride,
+                        ring_els,
+                        0,
+                        0,
+                    ]);
                     let mut pass = begin_pass(&mut enc);
-                    for i in 0..k {
-                        let gc_pt = uniform_u32x4(c, [*cdim as u32, *kk as u32, (i * cdim) as u32, 0]);
-                        pass.set_pipeline(&c.gdn_conv);
-                        pass.set_bind_group(0, &bg(&c.layout_gdn_conv, &[&qkv_b, &taps, ring, &cq_s, &gc_pt]), &[]);
-                        pass.dispatch_workgroups((*cdim as u32).div_ceil(256), 1, 1);
-                        let gd_pt = uniform_u32x8(
-                            c,
-                            [
-                                *nv as u32,
-                                *dk as u32,
-                                *dv as u32,
-                                (nk * dk) as u32,
-                                (nv / nk) as u32,
-                                *cdim as u32,
-                                eps.to_bits(),
-                                i as u32,
-                            ],
-                        );
-                        pass.set_pipeline(&c.gdn_step);
-                        pass.set_bind_group(
-                            0,
-                            &bg(
-                                &c.layout_gdn,
-                                &[
-                                    &cq_s, &z_b, &a_bb, &b_bb, &alog, &dtb, &gnorm, s, &gdo_b, &gd_pt,
+                    pass.set_pipeline(&c.gdn_conv_k);
+                    pass.set_bind_group(
+                        0,
+                        &{
+                            let l = c.gdn_conv_k.get_bind_group_layout(0);
+                            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: None,
+                                layout: &l,
+                                entries: &[
+                                    bind_buf(0, &qkv_b),
+                                    bind_buf(1, &taps),
+                                    bind_buf(2, ring),
+                                    bind_buf(3, &cq_s),
+                                    bind_buf(4, &gc_pt),
+                                    bind_buf(5, &snap_buf),
                                 ],
-                            ),
-                            &[],
-                        );
-                        pass.dispatch_workgroups(*nv as u32, 1, 1);
-                        if let Some((snap, ring_sz, s_sz)) = snap.as_ref() {
-                            let off = i * ((*ring_sz as usize + *s_sz as usize) / 4);
-                            if *ring_sz > 0 {
-                                encode_blit_p(&mut pass, c, ring, snap, (*ring_sz / 4) as usize, 0, off, None);
-                            }
-                            encode_blit_p(
-                                &mut pass,
-                                c,
-                                s,
-                                snap,
-                                (*s_sz / 4) as usize,
-                                0,
-                                off + (*ring_sz / 4) as usize,
-                                None,
-                            );
-                        }
-                    }
+                            })
+                        },
+                        &[],
+                    );
+                    pass.dispatch_workgroups((*cdim as u32).div_ceil(256), 1, 1);
+                    pass.set_pipeline(&c.gdn_step_k);
+                    pass.set_bind_group(
+                        0,
+                        &{
+                            let l = c.gdn_step_k.get_bind_group_layout(0);
+                            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: None,
+                                layout: &l,
+                                entries: &[
+                                    bind_buf(0, &cq_s),
+                                    bind_buf(1, &z_b),
+                                    bind_buf(2, &a_bb),
+                                    bind_buf(3, &b_bb),
+                                    bind_buf(4, &alog),
+                                    bind_buf(5, &dtb),
+                                    bind_buf(6, &gnorm),
+                                    bind_buf(7, s),
+                                    bind_buf(8, &gdo_b),
+                                    bind_buf(9, &gd_pt),
+                                    bind_buf(10, &snap_buf),
+                                ],
+                            })
+                        },
+                        &[],
+                    );
+                    pass.dispatch_workgroups(*nv as u32, 1, 1);
                 }
+                bts!(enc, 5);
                 ematb(&mut enc, out, &gdo_b, &ob, hidden, nv * dv);
                 bts!(enc, 2);
             }
@@ -14363,7 +14711,7 @@ pub fn forward_batch_graph(
                         e.0 += d;
                         e.1 += 1;
                     }
-                    let names = ["start", "attn", "gdn", "ffn", "norm", "tail", "?", "?"];
+                    let names = ["start", "attn", "gdn-out", "ffn", "norm", "recur", "gdn-in", "gdn-proj"];
                     let line: Vec<String> = agg
                         .iter()
                         .enumerate()
