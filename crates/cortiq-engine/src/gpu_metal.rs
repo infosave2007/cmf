@@ -7091,7 +7091,12 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
     };
     let abs_ok = |idx: usize, rows: usize, cols: usize| -> Option<usize> {
         let abs = model.entry_abs_offset(&model.tensors[idx])?;
-        (abs + rows * (cols / 32) * 18 <= safe_len).then_some(abs)
+        let need = if a.q4tp {
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])?
+        } else {
+            rows * (cols / 32) * 18
+        };
+        (abs + need <= safe_len).then_some(abs)
     };
     let (Some(aq), Some(ak), Some(av), Some(ao)) = (
         abs_ok(a.wq, nh * hd, h),
@@ -7199,7 +7204,7 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
               ybuf: &Buffer,
               rows: usize,
               cols: usize| {
-        enc.set_compute_pipeline_state(&c.q4tmm);
+        enc.set_compute_pipeline_state(if a.q4tp { &c.q4tpmm } else { &c.q4tmm });
         enc.set_buffer(0, Some(&fbuf), abs as u64);
         enc.set_buffer(1, Some(xbuf), 0);
         enc.set_buffer(2, Some(ybuf), 0);
