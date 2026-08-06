@@ -95,9 +95,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   machine can already write, and this binary earns its "nothing to
   install" by not carrying code it does not need.
 
-  `ref2va` — reference images, videos and audio — is still out: it
-  needs the encoder's other two temporal taps, the ones a single frame
-  cannot reach.
+  `tools/mmh3_fl2va_pack.sh` adds the two stacks to an existing file
+  rather than repacking it: the tower comes out of the 51.5 GB prompt
+  encoder by ranged read — 351 tensors, 1.19 GB — and the encoder out of
+  the video VAE, so the whole upgrade is ~7 GB of transfer and about
+  half a gigabyte of growth.
+
+  `ref2va` — reference images, videos and audio — is still out. It needs
+  the video encoder's other two temporal taps (the ones a single frame
+  cannot reach), the audio VAE's encoder, and a layout where reference
+  blocks advance the cursor.
 
   The parity harness for all of this now runs on an ordinary host, with
   no GPU and no stand. The DiT's reference needs a CUDA-only fused

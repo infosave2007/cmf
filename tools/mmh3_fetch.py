@@ -25,6 +25,8 @@ FULL = ("https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/"
         "diffusion_models/minimax_h3_fl2va_bf16.safetensors")
 PRUNED = ("https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/"
           "diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors")
+TEXT_ENCODER = ("https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/"
+                "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors")
 
 TIME_EMBEDDER = [
     "time_embedder.proj_in.weight",
@@ -143,12 +145,26 @@ def check():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", choices=["time-embedder", "check"])
+    ap.add_argument("what", choices=["time-embedder", "visual", "check"])
     ap.add_argument("--out", default="minimax_h3_time_embedder.safetensors")
     ap.add_argument("--url", default=FULL)
     a = ap.parse_args()
     if a.what == "check":
         check()
+        return
+    if a.what == "visual":
+        # Qwen3-VL's vision tower lives inside the 51.5 GB prompt-encoder
+        # file and is 1.2 GB of it. `fl2va` needs the tower and nothing
+        # else from there, so take the `visual.*` span by ranged reads
+        # rather than the file.
+        url = a.url if a.url != FULL else TEXT_ENCODER
+        hdr, _ = header(url)
+        names = sorted(k for k in hdr if k.startswith("visual."))
+        if not names:
+            raise SystemExit(f"{url}: no visual.* tensors")
+        print(f"{len(names)} tensors", file=sys.stderr)
+        write_safetensors(a.out, fetch(url, names))
+        print(a.out)
         return
     write_safetensors(a.out, fetch(a.url, TIME_EMBEDDER))
     print(a.out)
