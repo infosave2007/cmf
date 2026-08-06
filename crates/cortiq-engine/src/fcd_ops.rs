@@ -200,6 +200,77 @@ mod accel {
     }
 }
 
+/// Is the 4x4 f32 micro-kernel available here?
+#[cfg(target_arch = "x86_64")]
+fn gemm_avx512() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CMF_GEMM_BLOCK4").map(|v| v != "0").unwrap_or(true)
+            && std::arch::is_x86_feature_detected!("avx512f")
+    })
+}
+
+/// A 4x4 block of `y = x · wᵀ`, sixteen accumulators in `zmm` registers.
+/// Each 16-float step loads four rows of each side and issues sixteen
+/// fused multiply-adds — two per load, where a dot product manages one
+/// per two.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn gemm_block4x4_avx512(
+    x: &[f32],
+    w: &[f32],
+    i0: usize,
+    o0: usize,
+    k: usize,
+) -> [[f32; 4]; 4] {
+    // SAFETY: caller guarantees i0 + 4 and o0 + 4 rows exist and the ISA.
+    unsafe {
+        use core::arch::x86_64::*;
+        let mut acc = [[_mm512_setzero_ps(); 4]; 4];
+        let xp = x.as_ptr().add(i0 * k);
+        let wp = w.as_ptr().add(o0 * k);
+        let mut c = 0usize;
+        while c + 16 <= k {
+            let xv = [
+                _mm512_loadu_ps(xp.add(c)),
+                _mm512_loadu_ps(xp.add(k + c)),
+                _mm512_loadu_ps(xp.add(2 * k + c)),
+                _mm512_loadu_ps(xp.add(3 * k + c)),
+            ];
+            let wv = [
+                _mm512_loadu_ps(wp.add(c)),
+                _mm512_loadu_ps(wp.add(k + c)),
+                _mm512_loadu_ps(wp.add(2 * k + c)),
+                _mm512_loadu_ps(wp.add(3 * k + c)),
+            ];
+            for a in 0..4 {
+                for b in 0..4 {
+                    acc[a][b] = _mm512_fmadd_ps(xv[a], wv[b], acc[a][b]);
+                }
+            }
+            c += 16;
+        }
+        let mut out = [[0f32; 4]; 4];
+        for a in 0..4 {
+            for b in 0..4 {
+                out[a][b] = _mm512_reduce_add_ps(acc[a][b]);
+            }
+        }
+        // The tail, scalar: k is a channel count times a kernel area and
+        // is not always a multiple of sixteen.
+        while c < k {
+            for a in 0..4 {
+                let xe = *xp.add(a * k + c);
+                for b in 0..4 {
+                    out[a][b] += xe * *wp.add(b * k + c);
+                }
+            }
+            c += 1;
+        }
+        out
+    }
+}
+
 pub fn gemm_nt(
     x: &[f32],
     w: &[f32],
@@ -245,7 +316,45 @@ pub fn gemm_nt(
     }
     let nb = n.div_ceil(GEMM_BLOCK);
     let block = |r0: usize, r1: usize, y: &mut [f32]| {
-        for o in 0..m {
+        // Four rows by four columns at a time, in vector registers: one
+        // dot product per output spends two loads on one multiply and
+        // re-reads the whole activation row for every column, while a 4x4
+        // block reads four of each and does sixteen multiplies. This is
+        // the VAE decoder's inner loop — 79 s of a 512x512 render on 48
+        // threads before it.
+        //
+        // Written with intrinsics, not by hand in scalars: the same
+        // blocking expressed as `for l in 0..8 { t += x[l] * w[l] }` lost
+        // the vectorisation that `dot_f32` already had and ran the whole
+        // render from 90 s to 168.
+        let mut o = 0usize;
+        #[cfg(target_arch = "x86_64")]
+        if gemm_avx512() {
+            while o + 4 <= m {
+                let mut i = r0;
+                while i + 4 <= r1 {
+                    // SAFETY: the ISA is checked above and every access
+                    // below stays inside the 4x4 block of x, w and y.
+                    let acc = unsafe { gemm_block4x4_avx512(x, w, i, o, k) };
+                    for (di, ai) in acc.iter().enumerate() {
+                        for (dj, v) in ai.iter().enumerate() {
+                            y[(i - r0 + di) * m + o + dj] = *v;
+                        }
+                    }
+                    i += 4;
+                }
+                for i in i..r1 {
+                    let xr = &x[i * k..(i + 1) * k];
+                    for dj in 0..4 {
+                        let wr = &w[(o + dj) * k..(o + dj + 1) * k];
+                        y[(i - r0) * m + o + dj] =
+                            crate::attention::dot_f32(xr, wr);
+                    }
+                }
+                o += 4;
+            }
+        }
+        for o in o..m {
             let wr = &w[o * k..(o + 1) * k];
             for i in r0..r1 {
                 y[(i - r0) * m + o] = crate::attention::dot_f32(&x[i * k..(i + 1) * k], wr);

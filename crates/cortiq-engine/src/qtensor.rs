@@ -4545,6 +4545,98 @@ fn q4tp_v1() -> bool {
     }
 }
 
+/// Two weight rows against eight columns. The activation load is the
+/// same for both rows, so it is paid once for twice the arithmetic, and
+/// sixteen accumulator chains run where eight did — which is what a kernel
+/// retiring 0.29 instructions a cycle is short of. Register pressure is
+/// the limit: sixteen `zmm` accumulators, two weight tiles, one
+/// activation, of thirty-two.
+///
+/// Four rows by four columns spends the same sixteen accumulators the
+/// other way and measured worse — 1488 GFLOP/s against 1644 — so the
+/// unpack, which four rows pay twice as often, costs more than the extra
+/// sharing of one activation load buys.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn dot_q4tp_2x8_avx512(
+    nib: &[u8],
+    r0: usize,
+    gpr: usize,
+    xs: [&[i8]; 8],
+    sc0: &[f32],
+    sc1: &[f32],
+) -> [[f32; 8]; 2] {
+    // SAFETY: as dot_q4tp_row_1x8_avx512, two adjacent rows at once; the
+    // caller guarantees r0 + 1 < rows and the ISA.
+    unsafe {
+        use core::arch::x86_64::*;
+        let lomask = _mm256_set1_epi8(0x0F);
+        let eight = _mm256_set1_epi8(8);
+        let zero = _mm512_setzero_si512();
+        let mut v0 = [_mm512_setzero_ps(); 8];
+        let mut v1 = [_mm512_setzero_ps(); 8];
+        let pairs = gpr / 2;
+        let unpack = |r: usize, gi: usize| -> (__m512i, __mmask64) {
+            let t = nib.as_ptr().add((r * gpr + gi) * Q4TP_NIB);
+            let bb = _mm256_loadu_si256(t as *const __m256i);
+            let lo = _mm256_and_si256(bb, lomask);
+            let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(bb), lomask);
+            let ul = _mm256_sub_epi8(_mm256_unpacklo_epi8(lo, hi), eight);
+            let uh = _mm256_sub_epi8(_mm256_unpackhi_epi8(lo, hi), eight);
+            let cat = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(ul), uh);
+            let w = _mm512_shuffle_i64x2::<0b11_01_10_00>(cat, cat);
+            (_mm512_abs_epi8(w), _mm512_movepi8_mask(w))
+        };
+        for gp in 0..pairs {
+            let gi = gp * 2;
+            let (wa0, neg0) = unpack(r0, gi);
+            let (wa1, neg1) = unpack(r0 + 1, gi);
+            let off = gi * GROUP_SIZE;
+            let sv = |sc: &[f32]| {
+                _mm512_insertf32x8::<1>(
+                    _mm512_castps256_ps512(_mm256_set1_ps(*sc.get_unchecked(gi))),
+                    _mm256_set1_ps(*sc.get_unchecked(gi + 1)),
+                )
+            };
+            let s0 = sv(sc0);
+            let s1 = sv(sc1);
+            for k in 0..8 {
+                let xv = _mm512_loadu_si512(xs[k].as_ptr().add(off) as *const __m512i);
+                let d0 = _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(
+                    zero,
+                    wa0,
+                    _mm512_mask_sub_epi8(xv, neg0, zero, xv),
+                ));
+                let d1 = _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(
+                    zero,
+                    wa1,
+                    _mm512_mask_sub_epi8(xv, neg1, zero, xv),
+                ));
+                v0[k] = _mm512_fmadd_ps(d0, s0, v0[k]);
+                v1[k] = _mm512_fmadd_ps(d1, s1, v1[k]);
+            }
+        }
+        let mut acc = [[0f32; 8]; 2];
+        for k in 0..8 {
+            acc[0][k] = _mm512_reduce_add_ps(v0[k]);
+            acc[1][k] = _mm512_reduce_add_ps(v1[k]);
+        }
+        if gpr % 2 == 1 {
+            let off = (gpr - 1) * GROUP_SIZE;
+            for j in off..off + GROUP_SIZE {
+                let (w0, sa) = q4tp_outlier(nib, r0, gpr, j, sc0);
+                let (w1, sb) = q4tp_outlier(nib, r0 + 1, gpr, j, sc1);
+                for k in 0..8 {
+                    let x = *xs[k].get_unchecked(j) as f32;
+                    acc[0][k] += w0 * sa * x;
+                    acc[1][k] += w1 * sb * x;
+                }
+            }
+        }
+        acc
+    }
+}
+
 /// The same, eight columns at a time. One unpack then feeds twice as many
 /// activation streams, so a wide batch reads the weight tile half as
 /// often; the price is eight accumulators live at once. Measured 9.0 ->
@@ -4870,7 +4962,78 @@ fn q4tp_matmat(
         let blocked_ok = false;
         let run = |start: usize, end: usize| {
             let mut sc = vec![0f32; gpr];
-            for r in start..end {
+            // Two rows at a time where the wide kernel is available: the
+            // activation load is shared between them, which is the traffic
+            // this loop was drowning in.
+            #[cfg(target_arch = "x86_64")]
+            let mut r_lo = start;
+            #[cfg(target_arch = "x86_64")]
+            if blocked_ok && acts.len() >= 8 {
+                let mut sc1 = vec![0f32; gpr];
+                while r_lo + 2 <= end {
+                    v.scales_into(r_lo, gpr, &mut sc);
+                    v.scales_into(r_lo + 1, gpr, &mut sc1);
+                    let mut bi = 0usize;
+                    while bi + 8 <= acts.len() {
+                        let xs = [
+                            acts[bi].xq.as_slice(),
+                            acts[bi + 1].xq.as_slice(),
+                            acts[bi + 2].xq.as_slice(),
+                            acts[bi + 3].xq.as_slice(),
+                            acts[bi + 4].xq.as_slice(),
+                            acts[bi + 5].xq.as_slice(),
+                            acts[bi + 6].xq.as_slice(),
+                            acts[bi + 7].xq.as_slice(),
+                        ];
+                        let d =
+                            unsafe { dot_q4tp_2x8_avx512(v.nib, r_lo, gpr, xs, &sc, &sc1) };
+                        for (row, dr, scr) in
+                            [(r_lo, &d[0], &sc), (r_lo + 1, &d[1], &sc1)]
+                        {
+                            for k in 0..8 {
+                                let act = &acts[bi + k];
+                                let mut acc = dr[k] * act.sx;
+                                for &(j, xv) in &act.outliers {
+                                    let (w, s) = q4tp_outlier(v.nib, row, gpr, j, scr);
+                                    acc += w * s * xv;
+                                }
+                                // SAFETY: disjoint (bi, r) cells per worker.
+                                unsafe { *out_addr.at((bi + k) * rows + row) = acc };
+                            }
+                        }
+                        bi += 8;
+                    }
+                    // Columns past the last group of eight, both rows —
+                    // the same single-row kernel the tail below uses.
+                    for row in [r_lo, r_lo + 1] {
+                        let scr: &[f32] = if row == r_lo { &sc } else { &sc1 };
+                        for b2 in bi..acts.len() {
+                            let act = &acts[b2];
+                            let xs4 = [
+                                act.xq.as_slice(),
+                                act.xq.as_slice(),
+                                act.xq.as_slice(),
+                                act.xq.as_slice(),
+                            ];
+                            let d =
+                                unsafe { dot_q4tp_row_1x4_avx512(v.nib, row, gpr, xs4, scr) };
+                            let mut acc = d[0] * act.sx;
+                            for &(j, xv) in &act.outliers {
+                                let (w, s) = q4tp_outlier(v.nib, row, gpr, j, scr);
+                                acc += w * s * xv;
+                            }
+                            // SAFETY: disjoint (bi, r) cells per worker.
+                            unsafe { *out_addr.at(b2 * rows + row) = acc };
+                        }
+                    }
+                    r_lo += 2;
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            let row_start = r_lo;
+            #[cfg(not(target_arch = "x86_64"))]
+            let row_start = start;
+            for r in row_start..end {
                 v.scales_into(r, gpr, &mut sc);
                 let mut bi = 0usize;
                 #[cfg(target_arch = "x86_64")]
