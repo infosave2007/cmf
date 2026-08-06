@@ -4430,22 +4430,23 @@ fn q2tp_matmat(
 /// being weight-bandwidth-bound. Twin of `dot_q4t_row_1x4_sdot`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon,dotprod")]
-unsafe fn dot_q4tp_row_1x4_sdot(
+/// The pre-vectorised shape, kept for A/B (`CMF_Q4TP_V1=1`): the
+/// horizontal add lands once per group per column instead of once per
+/// row. Same weights, same activations — only the reduction differs.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn dot_q4tp_row_1x4_sdot_v1(
     nib: &[u8],
     r: usize,
     gpr: usize,
     xs: [&[i8]; 4],
     scales: &[f32],
 ) -> [f32; 4] {
-    // SAFETY: see dot_q4tp_row_sdot; every xs[k] is gpr·GROUP_SIZE long.
     unsafe {
         use core::arch::aarch64::*;
         use core::arch::asm;
         let lomask = vdupq_n_u8(0x0F);
         let eight = vdupq_n_s8(8);
-        // Named accumulators, NOT an array indexed by a loop variable: the
-        // latter does not stay in registers (the same defect cost 2x in the
-        // AVX2 q4t kernel and again in WGSL).
         let (mut f0, mut f1, mut f2, mut f3) = (0f32, 0f32, 0f32, 0f32);
         for gi in 0..gpr {
             let t = nib.as_ptr().add((r * gpr + gi) * Q4TP_NIB);
@@ -4475,6 +4476,83 @@ unsafe fn dot_q4tp_row_1x4_sdot(
             f3 += d[3];
         }
         [f0, f1, f2, f3]
+    }
+}
+
+/// `CMF_Q4TP_V1=1` picks the old reduction shape (A/B only).
+#[cfg(target_arch = "aarch64")]
+fn q4tp_v1() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_Q4TP_V1").is_ok_and(|v| v != "0"))
+}
+
+unsafe fn dot_q4tp_row_1x4_sdot(
+    nib: &[u8],
+    r: usize,
+    gpr: usize,
+    xs: [&[i8]; 4],
+    scales: &[f32],
+) -> [f32; 4] {
+    // SAFETY: see dot_q4tp_row_sdot; every xs[k] is gpr·GROUP_SIZE long.
+    unsafe {
+        use core::arch::aarch64::*;
+        use core::arch::asm;
+        let lomask = vdupq_n_u8(0x0F);
+        let eight = vdupq_n_s8(8);
+        // Named accumulators, NOT an array indexed by a loop variable: the
+        // latter does not stay in registers (the same defect cost 2x in the
+        // AVX2 q4t kernel and again in WGSL).
+        //
+        // They are VECTORS, and the horizontal add happens once at the end
+        // instead of once per group per column. `vaddvq` is a cross-lane
+        // reduction — with 72 groups and four columns the old shape paid
+        // 288 of them per row, each one a dependency stall the pipeline
+        // cannot hide, to save four float adds. The group's scale now
+        // rides an fma into the lane accumulators, so the arithmetic per
+        // group is one convert and one fma. Summation order changes (the
+        // lanes carry independent partial sums), which is the same
+        // round-off class the SDOT path already lives in — the strict
+        // kernel (`CMF_SDOT=0`, what `cortiq ppl` runs) is unchanged and
+        // stays the reference.
+        let (mut v0, mut v1, mut v2, mut v3) = (
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+            vdupq_n_f32(0.0),
+        );
+        for gi in 0..gpr {
+            let t = nib.as_ptr().add((r * gpr + gi) * Q4TP_NIB);
+            let s = *scales.get_unchecked(gi);
+            let bb = vld1q_u8(t);
+            let lo = vandq_u8(bb, lomask);
+            let hi = vshrq_n_u8::<4>(bb);
+            let e0 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(lo, hi)), eight);
+            let e1 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(lo, hi)), eight);
+            let off = gi * GROUP_SIZE;
+            let dot4 = |x: &[i8]| -> int32x4_t {
+                let x0 = vld1q_s8(x.as_ptr().add(off));
+                let x1 = vld1q_s8(x.as_ptr().add(off + 16));
+                let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+                asm!(
+                    "sdot {a0:v}.4s, {e0:v}.16b, {x0:v}.16b",
+                    "sdot {a1:v}.4s, {e1:v}.16b, {x1:v}.16b",
+                    a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                    e0 = in(vreg) e0, x0 = in(vreg) x0, e1 = in(vreg) e1, x1 = in(vreg) x1,
+                    options(pure, nomem, nostack),
+                );
+                vaddq_s32(a0, a1)
+            };
+            v0 = vfmaq_n_f32(v0, vcvtq_f32_s32(dot4(xs[0])), s);
+            v1 = vfmaq_n_f32(v1, vcvtq_f32_s32(dot4(xs[1])), s);
+            v2 = vfmaq_n_f32(v2, vcvtq_f32_s32(dot4(xs[2])), s);
+            v3 = vfmaq_n_f32(v3, vcvtq_f32_s32(dot4(xs[3])), s);
+        }
+        [
+            vaddvq_f32(v0),
+            vaddvq_f32(v1),
+            vaddvq_f32(v2),
+            vaddvq_f32(v3),
+        ]
     }
 }
 
@@ -4552,7 +4630,13 @@ fn q4tp_matmat(
                             acts[bi + 2].xq.as_slice(),
                             acts[bi + 3].xq.as_slice(),
                         ];
-                        let d = unsafe { dot_q4tp_row_1x4_sdot(v.nib, r, gpr, xs, &sc) };
+                        let d = unsafe {
+                            if q4tp_v1() {
+                                dot_q4tp_row_1x4_sdot_v1(v.nib, r, gpr, xs, &sc)
+                            } else {
+                                dot_q4tp_row_1x4_sdot(v.nib, r, gpr, xs, &sc)
+                            }
+                        };
                         for k in 0..4 {
                             let act = &acts[bi + k];
                             let mut acc = d[k] * act.sx;
@@ -10327,6 +10411,62 @@ mod tests {
         println!(
             "q1t matvec {rows}x{cols} (1 thread): div-decode {slow_ms:.2} ms  fused-LUT {fast_ms:.2} ms  => {:.2}x",
             slow_ms / fast_ms
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod q4tp_bench {
+    /// `cargo test -p cortiq-engine --release q4tp_matmat_throughput -- --ignored --nocapture`
+    /// Times the batched q4tp GEMM at the shapes the image DiT runs
+    /// (b=296 tokens, 2304 -> 9216), on synthetic bytes: no model, no
+    /// mmap, no thermal drift over minutes — a kernel change shows up
+    /// here in seconds where a full render hides it in noise.
+    #[test]
+    #[ignore]
+    fn q4tp_matmat_throughput() {
+        let (rows, cols, b) = (9216usize, 2304usize, 296usize);
+        let (_, _, _) = (rows, cols, b);
+        let total = cortiq_core::quant::expected_nbytes(
+            cortiq_core::TensorDtype::Q4TiledP,
+            &[rows, cols],
+        )
+        .unwrap();
+        // Random nibbles are fine, but the row params are f16 (lo, step)
+        // of a geometric ladder: garbage there gives exp2 of a huge
+        // exponent, the scales come back inf, and the whole bench times
+        // NaN arithmetic instead of the kernel.
+        let (params_off, codes_off, _) =
+            cortiq_core::quant::q4tp_sections(rows, cols);
+        let mut bytes: Vec<u8> = (0..total).map(|i| (i * 37 % 251) as u8).collect();
+        let lo = cortiq_core::quant::f32_to_f16(-4.0);
+        let step = cortiq_core::quant::f32_to_f16(0.1);
+        for r in 0..rows {
+            let o = params_off + r * 4;
+            bytes[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+            bytes[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+        }
+        let _ = codes_off;
+        let xs: Vec<f32> = (0..b * cols)
+            .map(|i| ((i % 97) as f32 - 48.0) / 48.0)
+            .collect();
+        let mut out = vec![0f32; b * rows];
+        let pool = crate::pool::Pool::from_env();
+        // Warm the caches, then time three passes.
+        super::q4tp_matmat(&bytes, &xs, b, rows, cols, &mut out, pool.as_deref());
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            super::q4tp_matmat(&bytes, &xs, b, rows, cols, &mut out, pool.as_deref());
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        let flops = 2.0 * b as f64 * rows as f64 * cols as f64;
+        println!(
+            "q4tp matmat {rows}x{cols} b={b}: {:.1} ms  {:.1} GFLOP/s  (checksum {:.3})",
+            best * 1e3,
+            flops / best / 1e9,
+            out.iter().take(64).sum::<f32>()
         );
     }
 }
