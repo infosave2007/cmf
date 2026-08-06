@@ -38,6 +38,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output, not a memory strategy, because the decoder is global attention —
   and the vocoder 1.7e-9.
 
+- **The video VAE's encoder, one temporal tap of it.** `fl2va`
+  conditions on single FRAMES, and a causal 3-D convolution fed one
+  frame pads its front with zeros — the reference's own `autopad`
+  therefore trims the kernel to `weight[:, :, -T:]`, which at T = 1 is
+  the last tap and nothing else. `animate-pack` stores that tap alone
+  and the runtime runs plain 2-D convolutions over it: a third of the
+  encoder's bytes for the same numbers, matched to max 2.4e-6 on a
+  signal of rms 0.67. Encoding real video (`ref2va`) needs the other
+  two taps back.
+
+  This is half of `fl2va`. The other half is Qwen3-VL's vision tower,
+  which the presentation puts in the TEXT stream (`"<Picture 1>: "` and
+  a vision block) alongside the latent the DiT conditions on — 27 ViT
+  blocks, a bilinearly interpolated position grid, a patch merger and
+  three deepstack mergers, and with it two changes to what is already
+  here: the prompt encoder's real interleaved MRoPE (the text-only path
+  is exact only while no image shares the sequence) and the deepstack
+  injection at layers 8, 16 and 24. Not written; not pretended.
+
 ### Fixed
 - **`gemm_nt_f32` cached the device-side weight buffer BY POINTER
   ADDRESS.** Every batched attention in this engine allocates one k/v
