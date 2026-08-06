@@ -1180,6 +1180,10 @@ pub struct DitBlockArgs<'a> {
     pub w1: usize,
     pub w3: usize,
     pub w2: usize,
+    /// The projections' layout: q4tp (ladder scales) vs plain q4_tiled.
+    /// The recommended Lumina file is q4tp, and a backend that only
+    /// knows q4t must decline rather than decode with the wrong reader.
+    pub q4tp: bool,
 }
 
 /// One whole modulated DiT block on the device — norms, qkv, RoPE,
@@ -1229,9 +1233,31 @@ pub fn fused_dit_block_available() -> bool {
 }
 
 pub fn dit_block(model: &Arc<CmfModel>, a: &DitBlockArgs, x: &mut [f32]) -> bool {
+    dit_block_seg(model, a, &[a.n], x)
+}
+
+/// The same block over a CONCATENATION of independent sequences:
+/// attention per segment, everything position-wise batched. wgpu only —
+/// the Metal path takes the single-sequence entry above.
+pub fn dit_block_seg(
+    model: &Arc<CmfModel>,
+    a: &DitBlockArgs,
+    segs: &[usize],
+    x: &mut [f32],
+) -> bool {
     match backend() {
         #[cfg(target_os = "macos")]
-        Backend::Metal => crate::gpu_metal::dit_block(model, a, x),
+        Backend::Metal if segs.len() <= 1 => crate::gpu_metal::dit_block(model, a, x),
+        // `CMF_DIT_FUSED=1`: the wgpu whole-block path. It runs and it
+        // is fast, but its output still differs from the CPU reference
+        // (PSNR 14 dB where the per-op path holds 42) — the orchestration
+        // is right in shape and wrong somewhere in the numbers, so it
+        // stays opt-in until a per-kernel comparison finds it.
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu if std::env::var("CMF_DIT_FUSED").is_ok_and(|v| v != "0") => {
+            crate::gpu_wgpu::dit_block_seg(model, a, segs, x)
+        }
+        #[allow(unreachable_patterns)]
         _ => false,
     }
 }

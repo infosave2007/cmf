@@ -682,6 +682,19 @@ impl NextDit {
         rope32: &(Vec<f32>, Vec<f32>),
         m: &[f32],
     ) -> bool {
+        self.gpu_block_seg(blk, x, n, rope32, m, &[n])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_block_seg(
+        &self,
+        blk: &Block,
+        x: &mut [f32],
+        n: usize,
+        rope32: &(Vec<f32>, Vec<f32>),
+        m: &[f32],
+        segs: &[usize],
+    ) -> bool {
         use crate::gpu;
         let (hs, nh, nkv, hd) = (self.hidden, self.nh, self.nkv, self.hd);
         if n < 128 || !gpu::enabled_here() || gpu::mm_killed() {
@@ -699,12 +712,16 @@ impl NextDit {
         if rope32.0.len() != n * hd / 2 {
             return false;
         }
+        // Either 4-bit tiled layout: the ladder (q4tp) is what the
+        // published file uses, and taking only the older one is how the
+        // fused path came to be dead for it on every backend.
         fn q(p: &Proj) -> Option<(&Arc<CmfModel>, usize)> {
             match p {
-                Proj::Q(q) => q.mapped_q4t(),
+                Proj::Q(q) => q.mapped_q4t().or_else(|| q.mapped_q4tp()),
                 Proj::F32 { .. } => None,
             }
         }
+        let is_q4tp = matches!(&blk.q, Proj::Q(q) if q.mapped_q4tp().is_some());
         let (
             Some((model, wq)),
             Some((_, wk)),
@@ -729,6 +746,7 @@ impl NextDit {
         let gate_msa: Vec<f32> = m[hs..2 * hs].iter().map(|&v| v.tanh()).collect();
         let gate_mlp: Vec<f32> = m[3 * hs..].iter().map(|&v| v.tanh()).collect();
         let args = gpu::DitBlockArgs {
+            q4tp: is_q4tp,
             n,
             hidden: hs,
             inter,
@@ -757,7 +775,7 @@ impl NextDit {
             w2,
         };
         let t0 = std::time::Instant::now();
-        if !gpu::dit_block(model, &args, x) {
+        if !gpu::dit_block_seg(model, &args, segs, x) {
             return false;
         }
         let flops = 2.0 * n as f64 * hs as f64 * ((nh + 2 * nkv) * hd) as f64
@@ -904,12 +922,10 @@ impl NextDit {
                 m
             })
         };
-        if segs.len() <= 1 {
-            if let (Some(m), Some(r32)) = (&modv, rope32) {
-                let _s = prof::span(prof::GPUBLK);
-                if self.gpu_block(blk, x, n, r32, m) {
-                    return;
-                }
+        if let (Some(m), Some(r32)) = (&modv, rope32) {
+            let _s = prof::span(prof::GPUBLK);
+            if self.gpu_block_seg(blk, x, n, r32, m, segs) {
+                return;
             }
         }
         let modnorm = prof::span(prof::MODNORM);

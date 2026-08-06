@@ -1069,6 +1069,150 @@ fn f32_gemm_dx(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
     if (lid == 0u) { gx_dx[r * gx_p.k + j] = gx_part[0]; }
 }
 
+// ── DiT fused-block kernels ─────────────────────────────────────────────
+// Modulated RMSNorm: o = rms(x)·w·(1+s) when `has_s`, else rms(x)·w.
+// One workgroup a row, 256-lane tree reduction — the shape every norm
+// in this file uses.
+struct DmP { n: u32, hs: u32, eps: f32, has_s: u32 };
+@group(0) @binding(0) var<storage, read>       dm_x : array<f32>;
+@group(0) @binding(1) var<storage, read>       dm_w : array<f32>;
+@group(0) @binding(2) var<storage, read>       dm_s : array<f32>;
+@group(0) @binding(3) var<storage, read_write> dm_o : array<f32>;
+@group(0) @binding(4) var<uniform>             dm_p : DmP;
+var<workgroup> dm_part: array<f32, 256>;
+@compute @workgroup_size(256)
+fn dit_rmsmod(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let row = wid.x;
+    if (row >= dm_p.n) { return; }
+    let base = row * dm_p.hs;
+    var acc = 0.0;
+    var i = lid;
+    loop {
+        if (i >= dm_p.hs) { break; }
+        let v = dm_x[base + i];
+        acc = acc + v * v;
+        i = i + 256u;
+    }
+    dm_part[lid] = acc;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { dm_part[lid] = dm_part[lid] + dm_part[lid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let inv = inverseSqrt(dm_part[0] / f32(dm_p.hs) + dm_p.eps);
+    i = lid;
+    loop {
+        if (i >= dm_p.hs) { break; }
+        var v = dm_x[base + i] * inv * dm_w[i];
+        if (dm_p.has_s != 0u) { v = v * (1.0 + dm_s[i]); }
+        dm_o[base + i] = v;
+        i = i + 256u;
+    }
+}
+
+// Gated residual: x += gate ⊙ rms(d)·w — the DiT's sandwich norm
+// on the way out of a sub-block; the gate comes in already tanh'd.
+struct GrP { n: u32, hs: u32, eps: f32, _p: u32 };
+@group(0) @binding(0) var<storage, read_write> gr_x : array<f32>;
+@group(0) @binding(1) var<storage, read>       gr_d : array<f32>;
+@group(0) @binding(2) var<storage, read>       gr_w : array<f32>;
+@group(0) @binding(3) var<storage, read>       gr_g : array<f32>;
+@group(0) @binding(4) var<uniform>             gr_p : GrP;
+var<workgroup> gr_part: array<f32, 256>;
+@compute @workgroup_size(256)
+fn dit_gated_residual(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+) {
+    let row = wid.x;
+    if (row >= gr_p.n) { return; }
+    let base = row * gr_p.hs;
+    var acc = 0.0;
+    var i = lid;
+    loop {
+        if (i >= gr_p.hs) { break; }
+        let v = gr_d[base + i];
+        acc = acc + v * v;
+        i = i + 256u;
+    }
+    gr_part[lid] = acc;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { gr_part[lid] = gr_part[lid] + gr_part[lid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let inv = inverseSqrt(gr_part[0] / f32(gr_p.hs) + gr_p.eps);
+    i = lid;
+    loop {
+        if (i >= gr_p.hs) { break; }
+        // The gate arrives tanh'd — the host computes it once per block
+        // for all rows, and doing it again here squashed it twice.
+        gr_x[base + i] = gr_x[base + i] + gr_g[i] * (gr_d[base + i] * inv * gr_w[i]);
+        i = i + 256u;
+    }
+}
+
+// Per-head qk-norm + interleaved-pair RoPE, packing token-major input
+// into head-major output. The DiT's rope table is (cos, sin) per token
+// and pair; a head's dims share it. One workgroup per (token, head).
+struct DrpP { n: u32, heads: u32, hd: u32, eps: f32, scale: f32, raw: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read>       drp_src : array<f32>;
+@group(0) @binding(1) var<storage, read_write> drp_dst : array<f32>;
+@group(0) @binding(2) var<storage, read>       drp_w   : array<f32>;
+@group(0) @binding(3) var<storage, read>       drp_cos : array<f32>;
+@group(0) @binding(4) var<storage, read>       drp_sin : array<f32>;
+@group(0) @binding(5) var<uniform>             drp_p   : DrpP;
+var<workgroup> drp_part: array<f32, 128>;
+@compute @workgroup_size(128)
+fn dit_ropepack(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let tokn = wid.x;
+    let hh = wid.y;
+    if (tokn >= drp_p.n || hh >= drp_p.heads) { return; }
+    let hd = drp_p.hd;
+    let src = (tokn * drp_p.heads + hh) * hd;
+    var acc = 0.0;
+    var i = lid;
+    loop {
+        if (i >= hd) { break; }
+        let v = drp_src[src + i];
+        acc = acc + v * v;
+        i = i + 128u;
+    }
+    drp_part[lid] = acc;
+    workgroupBarrier();
+    var stride = 64u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) { drp_part[lid] = drp_part[lid] + drp_part[lid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    // `raw`: transpose only — v needs the token-major to head-major move
+    // without the qk-norm or the rotation, and a norm with a huge eps
+    // would zero it rather than skip it.
+    var inv = 1.0;
+    if (drp_p.raw == 0u) { inv = inverseSqrt(drp_part[0] / f32(hd) + drp_p.eps); }
+    let pairs = hd / 2u;
+    let dst = (hh * drp_p.n + tokn) * hd;
+    var j = lid;
+    loop {
+        if (j >= pairs) { break; }
+        let a = drp_src[src + 2u * j] * inv * drp_w[2u * j];
+        let b = drp_src[src + 2u * j + 1u] * inv * drp_w[2u * j + 1u];
+        let cs = drp_cos[tokn * pairs + j];
+        let sn = drp_sin[tokn * pairs + j];
+        drp_dst[dst + 2u * j] = (a * cs - b * sn) * drp_p.scale;
+        drp_dst[dst + 2u * j + 1u] = (a * sn + b * cs) * drp_p.scale;
+        j = j + 128u;
+    }
+}
+
 // ── VAE convolution (direct, same padding, stride 1) ────────────────────
 // One thread per (output channel, pixel). The CPU path builds an im2col
 // matrix — multi-GB at 512² — and the Metal path has had a device kernel
@@ -9122,6 +9266,9 @@ struct Ctx {
     q4tp_mv16w: wgpu::ComputePipeline,
     f32_gemm_dx: wgpu::ComputePipeline,
     vae_conv: wgpu::ComputePipeline,
+    dit_ropepack: wgpu::ComputePipeline,
+    dit_gres: wgpu::ComputePipeline,
+    dit_rmsmod: wgpu::ComputePipeline,
     gdn_step_par_k: wgpu::ComputePipeline,
     gdn_step_norm_k: wgpu::ComputePipeline,
     gdn_step_k: wgpu::ComputePipeline,
@@ -9617,10 +9764,17 @@ fn init() -> Result<Ctx, String> {
         },
     );
 
+    let msc = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("q8"),
         source: wgpu::ShaderSource::Wgsl(WGSL.into()),
     });
+    if let Some(e) = pollster::block_on(msc.pop()) {
+        // The module's own diagnostic names the offending line; without
+        // it every pipeline built from the module reports the same
+        // opaque "Validation Error".
+        tracing::warn!("wgpu shader module rejected: {e}");
+    }
     // Auto layout: the bind group layout is inferred from the shader.
     let pipe = |ep: &str| {
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -9787,7 +9941,21 @@ fn init() -> Result<Ctx, String> {
     let q4tp_mv_k = pipe("q4tp_matvec4_k");
     let q4tp_mv16w = pipe("q4tp_matvec16w");
     let f32_gemm_dx = pipe("f32_gemm_dx");
-    let vae_conv = pipe("vae_conv");
+    // Per-kernel validation while these are new: a scope around each
+    // names the shader the driver rejected, where the module-wide scope
+    // only says that one of them was.
+    let named = |name: &'static str| {
+        let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let p = pipe(name);
+        if let Some(e) = pollster::block_on(sc.pop()) {
+            tracing::warn!("wgpu kernel {name} rejected: {e}");
+        }
+        p
+    };
+    let vae_conv = named("vae_conv");
+    let dit_ropepack = named("dit_ropepack");
+    let dit_gres = named("dit_gated_residual");
+    let dit_rmsmod = named("dit_rmsmod");
     let gdn_step_par_k = pipe("gdn_step_par_k");
     let gdn_step_norm_k = pipe("gdn_step_norm_k");
     let gdn_step_k = pipe("gdn_step_k");
@@ -9886,7 +10054,16 @@ fn init() -> Result<Ctx, String> {
     let layout_zero = zero.get_bind_group_layout(0);
 
     if let Some(e) = pollster::block_on(vscope.pop()) {
-        return Err(format!("wgpu pipeline validation: {e}"));
+        // The Display impl stops at "Validation Error"; the cause chain
+        // carries the shader and the line, which is the only part that
+        // tells you WHICH kernel to fix.
+        let mut detail = format!("{e}");
+        let mut src: &dyn std::error::Error = &e;
+        while let Some(c) = std::error::Error::source(src) {
+            detail.push_str(&format!(" | {c}"));
+            src = c;
+        }
+        return Err(format!("wgpu pipeline validation: {detail}"));
     }
 
     Ok(Ctx {
@@ -10013,6 +10190,9 @@ fn init() -> Result<Ctx, String> {
         q4tp_mv16w,
         f32_gemm_dx,
         vae_conv,
+        dit_ropepack,
+        dit_gres,
+        dit_rmsmod,
         gdn_step_par_k,
         gdn_step_norm_k,
         gdn_step_k,
@@ -25439,6 +25619,446 @@ pub fn q4tp_qkv(
     read(&stage_q, qs, &mut q_out[..b * qrows])
         && read(&stage_k, ks, &mut k_out[..b * kvrows])
         && read(&stage_v, ks, &mut v_out[..b * kvrows])
+}
+
+/// One whole modulated DiT block on the card — the norms, the three
+/// projections, qk-norm + RoPE, attention, both residuals and the
+/// SwiGLU FFN in ONE command buffer. Only `x` crosses the boundary,
+/// once in and once out, where the per-op path made six round trips a
+/// block and the profile showed the transfers, not the math.
+///
+/// `segs` are token counts of independent sequences packed back to
+/// back: attention runs per segment (so classifier-free guidance can
+/// send both branches through as one batch and still never let them
+/// meet in a score matrix), everything position-wise sees the whole
+/// batch. A single-element slice is the plain one-sequence block.
+pub fn dit_block_seg(
+    model: &Arc<CmfModel>,
+    a: &crate::gpu::DitBlockArgs,
+    segs: &[usize],
+    x: &mut [f32],
+) -> bool {
+    let bail = |why: &str| {
+        if std::env::var("CMF_DIT_DBG").is_ok() {
+            eprintln!("dit fused block declined: {why}");
+        }
+    };
+    let Some(c) = ctx() else {
+        bail("no ctx");
+        return false;
+    };
+    let (n, hs, inter) = (a.n, a.hidden, a.inter);
+    let (nh, nkv, hd) = (a.nh, a.nkv, a.hd);
+    if hs % 32 != 0 || inter % 32 != 0 || hd % 2 != 0 || nkv == 0 {
+        bail("dims");
+        return false;
+    }
+    if nh % nkv != 0 || x.len() < n * hs || segs.iter().sum::<usize>() != n {
+        bail("shape/segs");
+        return false;
+    }
+    let pairs = hd / 2;
+    if a.rope_cos.len() < n * pairs || a.rope_sin.len() < n * pairs {
+        bail("rope len");
+        return false;
+    }
+    let (Some(wq), Some(wk), Some(wv), Some(wo)) = (
+        tensor_weight(c, model, a.wq, nh * hd, hs),
+        tensor_weight(c, model, a.wk, nkv * hd, hs),
+        tensor_weight(c, model, a.wv, nkv * hd, hs),
+        tensor_weight(c, model, a.wo, hs, nh * hd),
+    ) else {
+        bail("weights");
+        return false;
+    };
+    let (Some(w1), Some(w3), Some(w2)) = (
+        tensor_weight(c, model, a.w1, inter, hs),
+        tensor_weight(c, model, a.w3, inter, hs),
+        tensor_weight(c, model, a.w2, hs, inter),
+    ) else {
+        bail("weights");
+        return false;
+    };
+    let store = |data: &[f32], label: &'static str| -> wgpu::Buffer {
+        let key = (data.as_ptr() as usize, data.len());
+        let mut cb = c.const_bufs.lock().unwrap();
+        if let Some(b) = cb.get(&key) {
+            return b.clone();
+        }
+        let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (data.len().max(1) * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
+        cb.insert(key, b.clone());
+        b
+    };
+    // Per-block vectors are content-stable across steps only for the
+    // norms; the modulation changes with t, so it rides a fresh upload.
+    let n1w = store(a.norm1, "dit-n1");
+    let n2w = store(a.norm2, "dit-n2");
+    let f1w = store(a.ffn_norm1, "dit-f1");
+    let f2w = store(a.ffn_norm2, "dit-f2");
+    let nqw = store(a.norm_q, "dit-nq");
+    let nkw = store(a.norm_k, "dit-nk");
+    let up = |data: &[f32], label: &'static str| -> wgpu::Buffer {
+        let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (data.len().max(1) * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
+        b
+    };
+    let smsa = up(a.s_msa, "dit-smsa");
+    let gmsa = up(a.gate_msa, "dit-gmsa");
+    let smlp = up(a.s_mlp, "dit-smlp");
+    let gmlp = up(a.gate_mlp, "dit-gmlp");
+    let rcos = up(a.rope_cos, "dit-rcos");
+    let rsin = up(a.rope_sin, "dit-rsin");
+    let mk = |els: usize, label: &'static str, io: bool| {
+        c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (els.max(1) * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | if io { wgpu::BufferUsages::COPY_SRC } else { wgpu::BufferUsages::empty() },
+            mapped_at_creation: false,
+        })
+    };
+    let xb = mk(n * hs, "dit-x", true);
+    c.queue.write_buffer(&xb, 0, bytemuck::cast_slice(&x[..n * hs]));
+    let xn = mk(n * hs, "dit-xn", false);
+    let qtok = mk(n * nh * hd, "dit-qt", false);
+    let ktok = mk(n * nkv * hd, "dit-kt", false);
+    let vtok = mk(n * nkv * hd, "dit-vt", false);
+    let qhm = mk(nh * n * hd, "dit-qh", false);
+    let khm = mk(nkv * n * hd, "dit-kh", false);
+    let vhm = mk(nkv * n * hd, "dit-vh", false);
+    let pan = mk(nh * n * hd, "dit-pan", false);
+    let attn = mk(n * nh * hd, "dit-attn", false);
+    let proj = mk(n * hs, "dit-proj", false);
+    let gbuf = mk(n * inter, "dit-g", false);
+    let ubuf = mk(n * inter, "dit-u", false);
+    let abuf = mk(n * inter, "dit-a", false);
+    let seg_max = segs.iter().copied().max().unwrap_or(n);
+    let scb = mk(seg_max * seg_max, "dit-sc", false);
+    // The attention kernels' param block is EIGHT words; a 16-byte
+    // uniform is rejected outright (min binding size 32).
+    let p8 = |m: u32, k: u32, nn: u32, sc: f32| -> wgpu::Buffer {
+        let raw = [m, k, nn, sc.to_bits(), 0u32, 0u32, 0u32, 0u32];
+        let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dit-blk-params"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        c.queue.write_buffer(&b, 0, bytemuck::cast_slice(&raw));
+        b
+    };
+    let u4 = |v: [u32; 4]| uniform_u32x4(c, v);
+    let mm = if a.q4tp { &c.q4tp_mm } else { &c.q4t_mm };
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dit-block") });
+    // E1 — attention pre-norm, modulated.
+    let dm_p = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[n as u32, hs as u32, a.eps.to_bits(), 1u32]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let norm = |enc: &mut wgpu::CommandEncoder,
+                src: &wgpu::Buffer,
+                w: &wgpu::Buffer,
+                sc: &wgpu::Buffer,
+                dst: &wgpu::Buffer,
+                p: &wgpu::Buffer| {
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.dit_rmsmod.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, src),
+                bind_buf(1, w),
+                bind_buf(2, sc),
+                bind_buf(3, dst),
+                bind_buf(4, p),
+            ],
+        });
+        let mut pass = begin_pass(enc);
+        pass.set_pipeline(&c.dit_rmsmod);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(n as u32, 1, 1);
+    };
+    norm(&mut enc, &xb, &n1w, &smsa, &xn, &dm_p);
+    // E2 — the three projections.
+    encode_q4_tile_mm(c, &mut enc, mm, &wq, &xn, &qtok, nh * hd, hs, n);
+    encode_q4_tile_mm(c, &mut enc, mm, &wk, &xn, &ktok, nkv * hd, hs, n);
+    encode_q4_tile_mm(c, &mut enc, mm, &wv, &xn, &vtok, nkv * hd, hs, n);
+    // E3 — qk-norm + RoPE into head-major panels; v is packed as is.
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let rope_pass = |enc: &mut wgpu::CommandEncoder,
+                     src: &wgpu::Buffer,
+                     dst: &wgpu::Buffer,
+                     w: &wgpu::Buffer,
+                     heads: usize,
+                     sc: f32| {
+        let p = c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[
+                    n as u32,
+                    heads as u32,
+                    hd as u32,
+                    a.eps.to_bits(),
+                    sc.to_bits(),
+                    0u32,
+                    0u32,
+                    0u32,
+                ]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.dit_ropepack.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, src),
+                bind_buf(1, dst),
+                bind_buf(2, w),
+                bind_buf(3, &rcos),
+                bind_buf(4, &rsin),
+                bind_buf(5, &p),
+            ],
+        });
+        let mut pass = begin_pass(enc);
+        pass.set_pipeline(&c.dit_ropepack);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(n as u32, heads as u32, 1);
+    };
+    // The scale rides the qk kernel's params, as in dit_attention.
+    rope_pass(&mut enc, &qtok, &qhm, &nqw, nh, 1.0);
+    rope_pass(&mut enc, &ktok, &khm, &nkw, nkv, 1.0);
+    // v needs the same token-major → head-major transpose, without the
+    // norm or the rotation: a unit weight vector and identity rope would
+    // do it, but the blit is cheaper and exact.
+    {
+        let ones = store(&vec![1.0f32; hd], "dit-ones");
+        let idc = store(&vec![1.0f32; n * pairs], "dit-rc1");
+        let ids = store(&vec![0.0f32; n * pairs], "dit-rs0");
+        let p = c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[
+                    n as u32,
+                    nkv as u32,
+                    hd as u32,
+                    0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    1u32,
+                    0u32,
+                    0u32,
+                ]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.dit_ropepack.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &vtok),
+                bind_buf(1, &vhm),
+                bind_buf(2, &ones),
+                bind_buf(3, &idc),
+                bind_buf(4, &ids),
+                bind_buf(5, &p),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.dit_ropepack);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(n as u32, nkv as u32, 1);
+    }
+    // E4 — attention, per segment and per head.
+    let hpk = nh / nkv;
+    let mut off = 0usize;
+    for &ns in segs {
+        let p_qk = p8(ns as u32, hd as u32, ns as u32, scale);
+        let p_sm = p8(ns as u32, hd as u32, ns as u32, 1.0);
+        let p_pv = p8(ns as u32, ns as u32, hd as u32, 1.0);
+        for h in 0..nh {
+            let kv = h / hpk;
+            let qoff = ((h * n + off) * hd * 4) as u64;
+            let koff = ((kv * n + off) * hd * 4) as u64;
+            let hlen = (ns * hd * 4) as u64;
+            let slen = (ns * ns * 4) as u64;
+            let bind3 = |pipe: &wgpu::ComputePipeline,
+                         a0: (&wgpu::Buffer, u64, u64),
+                         a1: (&wgpu::Buffer, u64, u64),
+                         a2: (&wgpu::Buffer, u64, u64),
+                         pu: &wgpu::Buffer| {
+                c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &pipe.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: a0.0,
+                                offset: a0.1,
+                                size: std::num::NonZeroU64::new(a0.2),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: a1.0,
+                                offset: a1.1,
+                                size: std::num::NonZeroU64::new(a1.2),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: a2.0,
+                                offset: a2.1,
+                                size: std::num::NonZeroU64::new(a2.2),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: pu.as_entire_binding(),
+                        },
+                    ],
+                })
+            };
+            let bg_qk = bind3(
+                &c.dit_qk,
+                (&qhm, qoff, hlen),
+                (&khm, koff, hlen),
+                (&scb, 0, slen),
+                &p_qk,
+            );
+            let bg_sm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &c.dit_softmax.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &scb,
+                            offset: 0,
+                            size: std::num::NonZeroU64::new(slen),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: p_sm.as_entire_binding(),
+                    },
+                ],
+            });
+            let bg_pv = bind3(
+                &c.dit_pv,
+                (&scb, 0, slen),
+                (&vhm, koff, hlen),
+                (&pan, qoff, hlen),
+                &p_pv,
+            );
+            for (pipe, bg, gx, gy) in [
+                (&c.dit_qk, &bg_qk, (ns as u32).div_ceil(64), (ns as u32).div_ceil(64)),
+                (&c.dit_softmax, &bg_sm, ns as u32, 1u32),
+                (&c.dit_pv, &bg_pv, (hd as u32).div_ceil(64), (ns as u32).div_ceil(64)),
+            ] {
+                let mut pass = begin_pass(&mut enc);
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(0, bg, &[]);
+                pass.dispatch_workgroups(gx, gy, 1);
+            }
+        }
+        off += ns;
+    }
+    // E5 — head-major panel back to token-major, then o and residual.
+    {
+        let p_un = p8(nh as u32, n as u32, hd as u32, 1.0);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.dit_unstack.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &pan),
+                bind_buf(2, &attn),
+                bind_buf(3, &p_un),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.dit_unstack);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(((nh * n * hd) as u32).div_ceil(256), 1, 1);
+    }
+    encode_q4_tile_mm(c, &mut enc, mm, &wo, &attn, &proj, hs, nh * hd, n);
+    let gr_p = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[n as u32, hs as u32, a.eps.to_bits(), 0u32]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let gated = |enc: &mut wgpu::CommandEncoder,
+                 d: &wgpu::Buffer,
+                 w: &wgpu::Buffer,
+                 g: &wgpu::Buffer| {
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.dit_gres.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &xb),
+                bind_buf(1, d),
+                bind_buf(2, w),
+                bind_buf(3, g),
+                bind_buf(4, &gr_p),
+            ],
+        });
+        let mut pass = begin_pass(enc);
+        pass.set_pipeline(&c.dit_gres);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(n as u32, 1, 1);
+    };
+    gated(&mut enc, &proj, &n2w, &gmsa);
+    // E6 — FFN: modulated norm, SwiGLU, gated residual.
+    norm(&mut enc, &xb, &f1w, &smlp, &xn, &dm_p);
+    encode_q4_tile_mm(c, &mut enc, mm, &w1, &xn, &gbuf, inter, hs, n);
+    encode_q4_tile_mm(c, &mut enc, mm, &w3, &xn, &ubuf, inter, hs, n);
+    {
+        let n1 = u4([(n * inter) as u32, 0, 0, 0]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.silu.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &gbuf),
+                bind_buf(1, &ubuf),
+                bind_buf(2, &gbuf),
+                bind_buf(3, &abuf),
+                bind_buf(4, &n1),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.silu);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(((n * inter) as u32).div_ceil(256), 1, 1);
+    }
+    encode_q4_tile_mm(c, &mut enc, mm, &w2, &abuf, &proj, hs, inter, n);
+    gated(&mut enc, &proj, &f2w, &gmlp);
+    let bytes = (n * hs * 4) as u64;
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dit-block-stage"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    readback(c, enc, &xb, &stage, bytes, &mut x[..n * hs])
 }
 
 /// The configured weight budget, initializing the device on first ask.
