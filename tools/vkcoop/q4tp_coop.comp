@@ -1,0 +1,129 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// 128 threads = 4 subgroups of 32. Output tile: 64 tokens x 64 weight
+// rows; subgroup s owns m rows [s*16, s*16+16) and all 64 n, so four
+// 16x16 accumulators. K marches 32 at a time.
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer W { uint qmm[]; };
+layout(std430, binding = 1) readonly buffer X { float xin[]; };
+layout(std430, binding = 2) writeonly buffer Y { float yout[]; };
+layout(binding = 3) uniform P {
+    uint cols4;
+    uint rows;
+    uint nb;
+    uint pad;
+} p;
+
+const uint KS = 32u;
+shared float16_t at[64 * 32];
+shared float16_t wt[64 * 32];
+
+uint qbyte(uint off) {
+    return (qmm[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint cols = p.cols4 * 4u;
+    uint gpr = cols >> 5u;
+    uint m0 = gl_WorkGroupID.y * 64u;
+    uint n0 = gl_WorkGroupID.x * 64u;
+    uint tid = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1 = c0;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c2 = c0;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c3 = c0;
+
+    uint params_b = p.rows * gpr * 16u;
+    uint codes_b = params_b + p.rows * 4u;
+    uint cstride = (gpr * 5u + 7u) / 8u;
+
+    for (uint k0 = 0u; k0 < cols; k0 += KS) {
+        // Stage 64 x 32 of each side; 128 threads take 16 values apiece.
+        for (uint t = tid; t < 64u * 8u; t += 128u) {
+            uint m = t / 8u;
+            uint k4 = (t % 8u) * 4u;
+            uint col0 = k0 + k4;
+            uint dst = m * KS + k4;
+            if (m0 + m < p.nb && col0 < cols) {
+                uint base = (m0 + m) * cols + col0;
+                at[dst] = float16_t(xin[base]);
+                at[dst + 1u] = float16_t(xin[base + 1u]);
+                at[dst + 2u] = float16_t(xin[base + 2u]);
+                at[dst + 3u] = float16_t(xin[base + 3u]);
+            } else {
+                at[dst] = float16_t(0.0); at[dst + 1u] = float16_t(0.0);
+                at[dst + 2u] = float16_t(0.0); at[dst + 3u] = float16_t(0.0);
+            }
+        }
+        for (uint t = tid; t < 64u * 8u; t += 128u) {
+            uint n = t / 8u;
+            uint k4 = (t % 8u) * 4u;
+            uint col0 = k0 + k4;
+            uint dst = n * KS + k4;
+            float w0 = 0.0, w1 = 0.0, w2 = 0.0, w3 = 0.0;
+            if (n0 + n < p.rows && col0 < cols) {
+                uint g = col0 >> 5u;
+                uint wrow = n0 + n;
+                uint bit = g * 5u;
+                uint cb = codes_b + wrow * cstride + (bit >> 3u);
+                uint sh = bit & 7u;
+                uint cv = qbyte(cb);
+                if (sh > 3u) cv |= qbyte(cb + 1u) << 8u;
+                uint prw = qmm[(params_b >> 2u) + wrow];
+                vec2 pr = unpackHalf2x16(prw);
+                float scale = exp2(pr.x + float((cv >> sh) & 31u) * pr.y);
+                uint toff = (wrow * gpr + g) * 16u;
+                uint pp = col0 - g * 32u;
+                uint bo = toff + pp / 2u;
+                uint b0 = qbyte(bo);
+                uint b1 = qbyte(bo + 1u);
+                w0 = (float(b0 & 0xFu) - 8.0) * scale;
+                w1 = (float(b0 >> 4u) - 8.0) * scale;
+                w2 = (float(b1 & 0xFu) - 8.0) * scale;
+                w3 = (float(b1 >> 4u) - 8.0) * scale;
+            }
+            wt[dst] = float16_t(w0); wt[dst + 1u] = float16_t(w1);
+            wt[dst + 2u] = float16_t(w2); wt[dst + 3u] = float16_t(w3);
+        }
+        barrier();
+        for (uint kk = 0u; kk < KS; kk += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+            coopMatLoad(a, at, sg * 16u * KS + kk, KS, gl_CooperativeMatrixLayoutRowMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+            coopMatLoad(b, wt, 0u * 16u * KS + kk, KS, gl_CooperativeMatrixLayoutColumnMajor);
+            c0 = coopMatMulAdd(a, b, c0);
+            coopMatLoad(b, wt, 1u * 16u * KS + kk, KS, gl_CooperativeMatrixLayoutColumnMajor);
+            c1 = coopMatMulAdd(a, b, c1);
+            coopMatLoad(b, wt, 2u * 16u * KS + kk, KS, gl_CooperativeMatrixLayoutColumnMajor);
+            c2 = coopMatMulAdd(a, b, c2);
+            coopMatLoad(b, wt, 3u * 16u * KS + kk, KS, gl_CooperativeMatrixLayoutColumnMajor);
+            c3 = coopMatMulAdd(a, b, c3);
+        }
+        barrier();
+    }
+    // Land through shared memory so the edges can be masked on the way out.
+    barrier();
+    coopMatStore(c0, at, sg * 16u * 32u + 0u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(c1, at, sg * 16u * 32u + 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(c2, wt, sg * 16u * 32u + 0u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(c3, wt, sg * 16u * 32u + 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    for (uint t = tid; t < 64u * 64u; t += 128u) {
+        uint m = t / 64u;
+        uint n = t % 64u;
+        if (m0 + m < p.nb && n0 + n < p.rows) {
+            float v = (n < 32u) ? float(at[m * 32u + n]) : float(wt[m * 32u + n - 32u]);
+            yout[(m0 + m) * p.rows + n0 + n] = v;
+        }
+    }
+}
