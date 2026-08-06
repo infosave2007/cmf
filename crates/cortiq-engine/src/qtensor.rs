@@ -4519,7 +4519,11 @@ static Q4TP_ALT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(
 fn q4tp_blocked_x86() -> bool {
     match Q4TP_ALT.load(std::sync::atomic::Ordering::Relaxed) {
         1 => false,
-        2 => true,
+        // A forced ON still asks the CPU. The switch exists so a bench can
+        // pick a kernel, not so it can promise instructions the machine
+        // does not have — CI caught that as a SIGILL on a runner without
+        // AVX-512, where the parity test had turned the path on by hand.
+        2 => avx512vnni_enabled(),
         // Deliberately not cached back into the switch: both gates below
         // hold their own `OnceLock`, and latching their answer here would
         // make a test's override outlive the test that set it.
