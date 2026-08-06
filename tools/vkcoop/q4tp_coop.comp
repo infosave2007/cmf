@@ -24,6 +24,9 @@ layout(binding = 3) uniform P {
 const uint KS = 32u;
 shared float16_t at[64 * 32];
 shared float16_t wt[64 * 32];
+// The accumulators are f32 and must land in an f32 plane: storing them
+// into the f16 staging arrays compiles and writes nothing usable.
+shared float acc[64 * 64];
 
 uint qbyte(uint off) {
     return (qmm[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
@@ -111,19 +114,19 @@ void main() {
         }
         barrier();
     }
-    // Land through shared memory so the edges can be masked on the way out.
+    // Land through shared memory so the edges can be masked on the way out:
+    // a cooperative store writes its whole tile or nothing.
     barrier();
-    coopMatStore(c0, at, sg * 16u * 32u + 0u, 32u, gl_CooperativeMatrixLayoutRowMajor);
-    coopMatStore(c1, at, sg * 16u * 32u + 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
-    coopMatStore(c2, wt, sg * 16u * 32u + 0u, 32u, gl_CooperativeMatrixLayoutRowMajor);
-    coopMatStore(c3, wt, sg * 16u * 32u + 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(c0, acc, sg * 16u * 64u + 0u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(c1, acc, sg * 16u * 64u + 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(c2, acc, sg * 16u * 64u + 32u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(c3, acc, sg * 16u * 64u + 48u, 64u, gl_CooperativeMatrixLayoutRowMajor);
     barrier();
     for (uint t = tid; t < 64u * 64u; t += 128u) {
         uint m = t / 64u;
         uint n = t % 64u;
         if (m0 + m < p.nb && n0 + n < p.rows) {
-            float v = (n < 32u) ? float(at[m * 32u + n]) : float(wt[m * 32u + n - 32u]);
-            yout[(m0 + m) * p.rows + n0 + n] = v;
+            yout[(m0 + m) * p.rows + n0 + n] = acc[m * 64u + n];
         }
     }
 }
