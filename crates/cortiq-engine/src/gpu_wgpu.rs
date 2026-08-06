@@ -9777,10 +9777,24 @@ fn init() -> Result<Ctx, String> {
     // went from 0.68 to 52 seconds a step and the isolated GEMM did not
     // finish at all. The kernel below is kept, and `CMF_COOP=1` runs it,
     // for the day the runtime exposes a shape the hardware wants.
+    // Tensor cores, and only where the card reports the shape the kernel
+    // is written against — f16 in, f32 accumulator, 16x16x16. The feature
+    // flag alone is not enough: wgpu raises it on a weaker configuration
+    // too, and a shader compiled against a shape the hardware does not
+    // have is a silently wrong image, not an error.
+    let coop_shape = adapter.cooperative_matrix_properties().iter().any(|c| {
+        c.m_size == 16
+            && c.n_size == 16
+            && c.k_size == 16
+            && c.ab_type == wgpu::CooperativeScalarType::F16
+            && c.cr_type == wgpu::CooperativeScalarType::F32
+    });
     let want_coop = adapter
         .features()
         .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
-        && std::env::var("CMF_COOP").is_ok_and(|v| v != "0");
+        && adapter.features().contains(wgpu::Features::SHADER_F16)
+        && coop_shape
+        && std::env::var("CMF_COOP").map(|v| v != "0").unwrap_or(true);
     // Half precision, where the card has it: the matrix units take f16
     // operands, and without this the shader cannot even name the type.
     let want_f16 = adapter.features().contains(wgpu::Features::SHADER_F16);
@@ -17670,22 +17684,33 @@ impl FlatDispatch for wgpu::ComputePass<'_> {
 /// Weights are staged dequantized, as in the scalar kernel — the matrix
 /// units want f32 planes, not nibbles.
 #[cfg(feature = "gpu")]
-/// The same GEMM on wgpu's own cooperative matrices. It compiles — wgpu
-/// takes `coop_mat16x16<f16, A>` with an f32 accumulator, which its
-/// documentation says it does not — and it computes the wrong numbers.
+/// The q4tp GEMM on the card's matrix units — tensor cores on NVIDIA —
+/// through wgpu's own cooperative matrices. On the shape this is written
+/// against, f16 operands with an f32 accumulator at 16x16x16:
 ///
-/// What has been ruled out, each by a test in this file that passes:
-/// `coopLoad` is row-major for both operands and honours a stride wider
-/// than the matrix and a non-zero offset (`wgpu_coop_layout_probe`); an
-/// accumulator survives a loop; `subgroup_id` really does distinguish the
-/// four subgroups. And in `wgpu_coop_small_gemm` the staged tiles match
-/// the reference element for element, while a scalar product computed
-/// from those same tiles inside the same shader is correct — so the fault
-/// is in the feeding of the matrix units, not in the data.
+/// ```text
+/// scalar WGSL      25 077 GFLOP/s    3.53 ms
+/// cooperative      50 730 GFLOP/s    1.75 ms    2.02x
+/// ```
 ///
-/// Until that is found, `CMF_COOP=1` is the only way here, and the native
-/// Vulkan lane in `vulkan.rs` — which does the same arithmetic correctly,
-/// 2.5x faster than the scalar WGSL kernel — is what the work rests on.
+/// and a 512x512x30-step render goes 20.2 -> 14.7 s. The image moves in
+/// the last bits — f16 multiplies where the scalar kernel used f32 — but
+/// not away from the truth: against the diffusers reference it measures
+/// 22.5 dB where the scalar path measures 22.3.
+///
+/// Two things about the WGSL surface, both settled by disassembling naga's
+/// SPIR-V beside glslang's rather than by reading documentation:
+///
+/// * `coopLoad` emits **ColumnMajor** and `coopLoadT` **RowMajor** — the
+///   opposite way round from what the names suggest. A square probe cannot
+///   see this: transposing both operands and the result cancels out, and
+///   the arithmetic only breaks once the two tiles have different strides,
+///   which is to say once it is a real GEMM.
+/// * wgpu's own documentation says the implementation "currently only
+///   supports 8x8 f32 matrices". It compiles and runs 16x16 f16 — but the
+///   feature flag is raised on the weaker configuration too, so the shape
+///   is checked against `adapter.cooperative_matrix_properties()` before
+///   this pipeline is built. `CMF_COOP=0` opts out.
 const COOP_MM_SRC: &str = r#"
 enable wgpu_cooperative_matrix;
 enable f16;
@@ -17706,7 +17731,7 @@ var<workgroup> cm_a: array<f16, 64 * 32>;
 // settled that `coopLoad` means row-major for both operands. Staging the
 // weights the other way round and asking for a transposed load reads
 // something else again — measured, twice, both wrong.
-var<workgroup> cm_b: array<f16, 32 * 64>;
+var<workgroup> cm_b: array<f16, 64 * 32>;
 // The result plane must be f32: storing an f32 accumulator into an f16
 // array compiles and writes nothing usable.
 var<workgroup> cm_c: array<f32, 64 * 64>;
@@ -17779,30 +17804,31 @@ fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
                 wv[2u] = (f32(b1 & 0xFu) - 8.0) * scale;
                 wv[3u] = (f32(b1 >> 4u) - 8.0) * scale;
             }
-            // One n, four consecutive k — four rows of the k-major tile.
-            cm_b[k4 * 64u + n] = f16(wv.x);
-            cm_b[(k4 + 1u) * 64u + n] = f16(wv.y);
-            cm_b[(k4 + 2u) * 64u + n] = f16(wv.z);
-            cm_b[(k4 + 3u) * 64u + n] = f16(wv.w);
+            // n-major, four consecutive k in a row: `coopLoad` reads it
+            // ColumnMajor, which turns [n][k] into the K x N the B role
+            // wants without a transposing load.
+            let bd = n * KS + k4;
+            cm_b[bd] = f16(wv.x); cm_b[bd + 1u] = f16(wv.y);
+            cm_b[bd + 2u] = f16(wv.z); cm_b[bd + 3u] = f16(wv.w);
         }
         workgroupBarrier();
         {
-            let a = coopLoad<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 0u], 32u);
-            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 0u], 64u);
-            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 16u], 64u);
-            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 32u], 64u);
-            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 48u], 64u);
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 0u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 0u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u + 0u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 0u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u + 0u], 32u);
             c0 = coopMultiplyAdd(a, b0, c0);
             c1 = coopMultiplyAdd(a, b1, c1);
             c2 = coopMultiplyAdd(a, b2, c2);
             c3 = coopMultiplyAdd(a, b3, c3);
         }
         {
-            let a = coopLoad<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 16u], 32u);
-            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 0u], 64u);
-            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 16u], 64u);
-            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 32u], 64u);
-            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 48u], 64u);
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 16u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 16u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u + 16u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 16u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u + 16u], 32u);
             c0 = coopMultiplyAdd(a, b0, c0);
             c1 = coopMultiplyAdd(a, b1, c1);
             c2 = coopMultiplyAdd(a, b2, c2);
@@ -17812,10 +17838,10 @@ fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
         k0 = k0 + KS;
     }
     workgroupBarrier();
-    coopStore(c0, &cm_c[sg * 16u * 64u + 0u], 64u);
-    coopStore(c1, &cm_c[sg * 16u * 64u + 16u], 64u);
-    coopStore(c2, &cm_c[sg * 16u * 64u + 32u], 64u);
-    coopStore(c3, &cm_c[sg * 16u * 64u + 48u], 64u);
+    coopStoreT(c0, &cm_c[sg * 16u * 64u + 0u], 64u);
+    coopStoreT(c1, &cm_c[sg * 16u * 64u + 16u], 64u);
+    coopStoreT(c2, &cm_c[sg * 16u * 64u + 32u], 64u);
+    coopStoreT(c3, &cm_c[sg * 16u * 64u + 48u], 64u);
     workgroupBarrier();
     for (var t = tid; t < 64u * 64u; t = t + 128u) {
         let m = t / 64u;
