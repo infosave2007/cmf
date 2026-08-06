@@ -17670,6 +17670,22 @@ impl FlatDispatch for wgpu::ComputePass<'_> {
 /// Weights are staged dequantized, as in the scalar kernel — the matrix
 /// units want f32 planes, not nibbles.
 #[cfg(feature = "gpu")]
+/// The same GEMM on wgpu's own cooperative matrices. It compiles — wgpu
+/// takes `coop_mat16x16<f16, A>` with an f32 accumulator, which its
+/// documentation says it does not — and it computes the wrong numbers.
+///
+/// What has been ruled out, each by a test in this file that passes:
+/// `coopLoad` is row-major for both operands and honours a stride wider
+/// than the matrix and a non-zero offset (`wgpu_coop_layout_probe`); an
+/// accumulator survives a loop; `subgroup_id` really does distinguish the
+/// four subgroups. And in `wgpu_coop_small_gemm` the staged tiles match
+/// the reference element for element, while a scalar product computed
+/// from those same tiles inside the same shader is correct — so the fault
+/// is in the feeding of the matrix units, not in the data.
+///
+/// Until that is found, `CMF_COOP=1` is the only way here, and the native
+/// Vulkan lane in `vulkan.rs` — which does the same arithmetic correctly,
+/// 2.5x faster than the scalar WGSL kernel — is what the work rests on.
 const COOP_MM_SRC: &str = r#"
 enable wgpu_cooperative_matrix;
 enable f16;
@@ -17701,14 +17717,16 @@ fn cm_byte(off: u32) -> u32 {
 
 @compute @workgroup_size(128)
 fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
-                @builtin(local_invocation_index) tid: u32) {
+                @builtin(local_invocation_index) tid: u32,
+                @builtin(subgroup_id) sg: u32) {
     let cols = pmm.cols4 * 4u;
     let gpr = cols >> 5u;
     let m0 = wid.y * 64u;
     let n0 = wid.x * 64u;
-    // Four subgroups of 32. There is no portable subgroup index in WGSL,
-    // and the lane count is checked before this pipeline is used.
-    let sg = tid / 32u;
+    // Four subgroups, and which one this is comes from the builtin rather
+    // than from `tid / 32`: nothing promises the driver hands out lanes to
+    // subgroups in that order, and a cooperative matrix belongs to a
+    // subgroup, not to a range of local indices.
 
     var c0: coop_mat16x16<f32, C>;
     var c1: coop_mat16x16<f32, C>;
@@ -17768,12 +17786,27 @@ fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
             cm_b[(k4 + 3u) * 64u + n] = f16(wv.w);
         }
         workgroupBarrier();
-        for (var kk = 0u; kk < KS; kk = kk + 16u) {
-            let a = coopLoad<coop_mat16x16<f16, A>>(&cm_a[sg * 16u * KS + kk], KS);
-            c0 = coopMultiplyAdd(a, coopLoad<coop_mat16x16<f16, B>>(&cm_b[kk * 64u + 0u], 64u), c0);
-            c1 = coopMultiplyAdd(a, coopLoad<coop_mat16x16<f16, B>>(&cm_b[kk * 64u + 16u], 64u), c1);
-            c2 = coopMultiplyAdd(a, coopLoad<coop_mat16x16<f16, B>>(&cm_b[kk * 64u + 32u], 64u), c2);
-            c3 = coopMultiplyAdd(a, coopLoad<coop_mat16x16<f16, B>>(&cm_b[kk * 64u + 48u], 64u), c3);
+        {
+            let a = coopLoad<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 0u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 0u], 64u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 16u], 64u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 32u], 64u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 48u], 64u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        {
+            let a = coopLoad<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 16u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 0u], 64u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 16u], 64u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 32u], 64u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 48u], 64u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
         }
         workgroupBarrier();
         k0 = k0 + KS;
@@ -20282,6 +20315,135 @@ mod tests {
         std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
     }
 
+    /// The cooperative GEMM on the smallest shape that still exercises it:
+    /// one K-step, one tile, sixteen tokens. Everything the full kernel
+    /// does, with few enough numbers to read.
+    ///
+    /// `cargo test -p cortiq-engine --release --features gpu
+    ///  wgpu_coop_small_gemm -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn wgpu_coop_small_gemm() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        unsafe { std::env::set_var("CMF_COOP", "1") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu device — skipping");
+            return;
+        };
+        let Some(pipe) = c.q4tp_mm_coop.as_ref() else {
+            eprintln!("no cooperative pipeline — skipping");
+            return;
+        };
+        let (rows, cols, nb) = (64usize, 32usize, 16usize);
+        let total = cortiq_core::quant::expected_nbytes(
+            cortiq_core::TensorDtype::Q4TiledP,
+            &[rows, cols],
+        )
+        .unwrap();
+        let (params_off, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+        let mut wb: Vec<u8> = (0..total).map(|i| (i * 37 % 251) as u8).collect();
+        let lo = cortiq_core::quant::f32_to_f16(-4.0);
+        let step = cortiq_core::quant::f32_to_f16(0.1);
+        for r in 0..rows {
+            let o = params_off + r * 4;
+            wb[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+            wb[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+        }
+        let mut w = vec![0f32; rows * cols];
+        cortiq_core::quant::dequant_q4tp(&wb, rows, cols, &mut w);
+        let xs: Vec<f32> = (0..nb * cols)
+            .map(|i| ((i % 97) as f32 - 48.0) / 48.0)
+            .collect();
+
+        use wgpu::util::DeviceExt;
+        let mk = |b: &[u8], u: wgpu::BufferUsages| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: b,
+                    usage: u,
+                })
+        };
+        let wbuf = mk(&wb, wgpu::BufferUsages::STORAGE);
+        let xbuf = mk(
+            bytemuck::cast_slice(&xs),
+            wgpu::BufferUsages::STORAGE,
+        );
+        let ybytes = (nb * rows * 4) as u64;
+        let ybuf = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: ybytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: ybytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let pbuf = mk(
+            bytemuck::cast_slice(&[
+                (cols / 4) as u32,
+                rows as u32,
+                nb as u32,
+                0u32,
+            ]),
+            wgpu::BufferUsages::UNIFORM,
+        );
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &wbuf),
+                bind_buf(1, &xbuf),
+                bind_buf(2, &ybuf),
+                bind_buf(3, &pbuf),
+            ],
+        });
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(
+                (rows as u32).div_ceil(64),
+                (nb as u32).div_ceil(64),
+                1,
+            );
+        }
+        let mut got = vec![0f32; nb * rows];
+        assert!(readback(c, enc, &ybuf, &stage, ybytes, &mut got), "readback");
+        let want: Vec<f32> = (0..nb)
+            .flat_map(|t| {
+                let x = &xs[t * cols..(t + 1) * cols];
+                (0..rows)
+                    .map(|r| (0..cols).map(|k| w[r * cols + k] * x[k]).sum::<f32>())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        println!("  w[0][0..4] {:?}", &w[..4]);
+        println!("  x[0][0..4] {:?}", &xs[..4]);
+        for t in [0usize, 1, 15] {
+            println!(
+                "token {t}: got {:?}",
+                &got[t * rows..t * rows + 4]
+            );
+            println!(
+                "         want {:?}",
+                &want[t * rows..t * rows + 4]
+            );
+        }
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (g - w).abs() / w.abs().max(1e-3))
+            .fold(0f32, f32::max);
+        println!("worst relative {worst:.3e}");
+    }
+
     /// What do `coopLoad`, `coopLoadT` and `coopStore` actually mean?
     /// A 16x16 product of two matrices whose answer is known by hand, so
     /// the layout question is settled by arithmetic instead of by trying
@@ -20308,23 +20470,42 @@ enable f16;
 @group(0) @binding(0) var<storage, read> ain: array<f32>;
 @group(0) @binding(1) var<storage, read> bin: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
-var<workgroup> sa: array<f16, 256>;
-var<workgroup> sb: array<f16, 256>;
-var<workgroup> sc: array<f32, 256>;
-@compute @workgroup_size(32)
-fn main(@builtin(local_invocation_index) tid: u32) {
-    for (var i = tid; i < 256u; i = i + 32u) {
-        sa[i] = f16(ain[i]);
-        sb[i] = f16(bin[i]);
+var<workgroup> sa: array<f16, 32 * 32>;
+var<workgroup> sb: array<f16, 32 * 32>;
+var<workgroup> sc: array<f32, 32 * 32>;
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_index) tid: u32,
+        @builtin(subgroup_id) sg: u32) {
+    for (var i = tid; i < 1024u; i = i + 128u) {
+        sa[i] = f16(0.0); sb[i] = f16(0.0); sc[i] = 0.0;
     }
     workgroupBarrier();
-    let a = coopLoad<coop_mat16x16<f16, A>>(&sa[0], 16u);
-    let b = coopLoad<coop_mat16x16<f16, B>>(&sb[0], 16u);
-    var acc: coop_mat16x16<f32, C>;
-    acc = coopMultiplyAdd(a, b, acc);
-    coopStore(acc, &sc[0], 16u);
+    for (var i = tid; i < 256u; i = i + 128u) {
+        let r = i / 16u;
+        let cc = i % 16u;
+        sa[16u + r * 32u + cc] = f16(ain[i]);
+        sb[16u + r * 32u + cc] = f16(bin[i]);
+    }
     workgroupBarrier();
-    for (var i = tid; i < 256u; i = i + 32u) { out[i] = sc[i]; }
+    // The same product twice, accumulated across a loop iteration — which
+    // is what a GEMM does and what the isolated probe never did.
+    var acc: coop_mat16x16<f32, C>;
+    for (var it = 0u; it < 2u; it = it + 1u) {
+        let a = coopLoad<coop_mat16x16<f16, A>>(&sa[16u], 32u);
+        let b = coopLoad<coop_mat16x16<f16, B>>(&sb[16u], 32u);
+        acc = coopMultiplyAdd(a, b, acc);
+    }
+    // Each subgroup writes its OWN row of the output. If `subgroup_id`
+    // does not actually distinguish them, three of the four blocks stay
+    // zero — which the probe with a single shared store could not see.
+    if (sg == 0u) { coopStore(acc, &sc[16u], 32u); }
+    workgroupBarrier();
+    for (var i = tid; i < 256u; i = i + 128u) {
+        let r = i / 16u;
+        let cc = i % 16u;
+        out[i] = sc[16u + r * 32u + cc];
+    }
+    out[256u + tid] = f32(sg);
 }
 "#;
         let scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -20425,13 +20606,13 @@ fn main(@builtin(local_invocation_index) tid: u32,
         let bb = mk(&b, wgpu::BufferUsages::STORAGE);
         let ob = c.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: 1024,
+            size: 1536,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: 1024,
+            size: 1536,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -20449,8 +20630,16 @@ fn main(@builtin(local_invocation_index) tid: u32,
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
-        let mut got = vec![0f32; 256];
-        assert!(readback(c, enc, &ob, &stage, 1024, &mut got), "readback");
+        let mut all = vec![0f32; 384];
+        assert!(readback(c, enc, &ob, &stage, 1536, &mut all), "readback");
+        let ids: Vec<u32> = all[256..384].iter().map(|v| *v as u32).collect();
+        let distinct: std::collections::BTreeSet<u32> = ids.iter().copied().collect();
+        println!(
+            "subgroup_id over 128 lanes: {distinct:?}, lane0..3 {:?}, lane32 {}",
+            &ids[..4],
+            ids[32]
+        );
+        let got: Vec<f32> = all[..256].to_vec();
         // Row-major on both sides: c[i][j] = sum_k a[i][k] * b[k][j].
         let mut want = vec![0f32; 256];
         for i in 0..16 {
@@ -20463,6 +20652,15 @@ fn main(@builtin(local_invocation_index) tid: u32,
             .zip(&want)
             .map(|(g, w)| (g - w).abs() / w.abs().max(1.0))
             .fold(0f32, f32::max);
+        // The kernel now accumulates the product TWICE, so the answer is
+        // 2x the single product; anything else means the accumulator did
+        // not survive the loop.
+        println!(
+            "loop-carried accumulator: got[0]={} want 2x={}  ratio {:.4}",
+            got[0],
+            2.0 * want[0],
+            got[0] / (2.0 * want[0])
+        );
         println!("row-major both: worst {worst:.3e}   got[0]={} want[0]={}", got[0], want[0]);
         // And what it would be if B were read column-major.
         let mut wantt = vec![0f32; 256];
