@@ -56,6 +56,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the host it displaced. It goes through the same probe as every other
   op class now (`OpClass::GemmNt`), which on that stack measures
   0.24 ms against the host's 0.13 and hands the work back.
+
+  That probe is shared by every `gemm_nt` caller, and one verdict
+  deciding for two populations is the hazard `MatmatWide` was split to
+  avoid — so Lumina-Image, the other model on this path, was measured
+  either side of the change: 512×512 at 30 steps, 14.4 s on 0.5.58
+  against 14.6 s on 0.5.59, and the two renders agree to 55 dB (mean
+  |Δ| 0.16 of 255 — the summation order of a GEMM that moved off the
+  device, not a change in behaviour). Both of its populations land on
+  the host too, so the shared verdict costs nothing today; it is worth
+  splitting the moment one of them wants the card.
 - **The cooperative-matrix GEMM runs this model out of f16 range.** At
   256×160 the render is correct; at 512×288 the audio stream goes NaN
   on the second sampling step and the video follows. Bisected against
