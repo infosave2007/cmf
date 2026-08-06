@@ -108,6 +108,11 @@ pub fn sigmas(steps: usize, shift: f64) -> Vec<f64> {
     out
 }
 
+/// Shared with the DiT's condition-row noise blend.
+pub fn gauss_pub(n: usize, seed: u64) -> Vec<f32> {
+    gauss(n, seed)
+}
+
 fn gauss(n: usize, seed: u64) -> Vec<f32> {
     let mut rng = SplitMix64::new(seed);
     let mut u = || (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
@@ -186,6 +191,7 @@ fn generate_inner(
         let dit = MiniMaxH3::from_cmf(&model)?;
         let layout = Layout::t2va(ids.len(), latent_t, lat_h, lat_w, audio_t);
         let text = dit.refine_text(&states, ids.len());
+        let cond: Vec<Vec<f32>> = Vec::new();
         let mut v = gauss(dit.latents_dim * latent_t * lat_h * lat_w, p.seed);
         let mut a = gauss(dit.audio_dim * 2 * audio_t, p.seed ^ 0x9E37_79B9_7F4A_7C15);
         let sg = sigmas(p.steps, dit.shift_video);
@@ -206,7 +212,7 @@ fn generate_inner(
         }
         for i in 0..p.steps {
             let (sv, sv_n) = (sg[i], sg[i + 1]);
-            let (dv, da) = dit.forward(&layout, &text, &v, &a, sv);
+            let (dv, da) = dit.forward(&layout, &text, &v, &a, sv, &cond);
             let step_v = (sv_n - sv) as f32;
             for (x, &d) in v.iter_mut().zip(&dv) {
                 *x += step_v * d;

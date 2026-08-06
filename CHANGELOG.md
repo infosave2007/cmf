@@ -63,16 +63,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one. Preprocessing matches bit for bit, the merged tokens to 6.2e-6
   on a signal of rms 1.79, both deepstack outputs the same.
 
-  What remains for `fl2va` is plumbing rather than model: the packed
-  layout's keyframe condition rows and their third timestep, the
-  prompt encoder's real interleaved MRoPE (the text-only path is exact
-  only while no image shares the sequence) and the deepstack injection
-  at layers 8, 16 and 24. `ref2va` additionally needs the encoder's
-  other two temporal taps.
+- **`fl2va`'s conditioning, and the DiT agrees with the reference on
+  it.** Keyframe condition rows sit between the text and the audio,
+  share the TARGET spatial grid, and are pinned to the time coordinate
+  of the frame they stand for — the first at the text's end, the last a
+  whole clip further on minus one span. They never advance the cursor,
+  so the audio and video streams still start where they would have.
+  They also get a timestep of their own near 1: they are conditions,
+  not noise being removed. Measured against the reference at
+  7.1e-5 (video) and 4.9e-5 (audio), beside t2va's 8.7e-5.
 
-  The parity harness for all of this now runs on an ordinary host —
-  `tools/mk_qwen3vis_toy.py` needs a ComfyUI checkout and torch, no GPU
-  and no stand.
+  That timestep is the noise-augmentation figure and not a separate
+  constant — the reference blends `aug` of the latent with `1 − aug` of
+  noise and then tells the block the row sits at `aug` — so it is a
+  field here rather than a literal. The blend's 0.1% comes from a
+  torch-seeded stream this port does not reproduce; ours is its own,
+  and the parity gate sets `aug = 1` so everything else compares
+  exactly.
+
+  What remains for `fl2va` is the pipeline: reading a picture, and
+  calling the encoder and the tower from `videogen`. `ref2va`
+  additionally needs the encoder's other two temporal taps.
+
+  The parity harness for all of this now runs on an ordinary host, with
+  no GPU and no stand. The DiT's reference needs a CUDA-only fused
+  rms+rope kernel, so `tools/mk_mmh3_toy.py` carries a torch stand-in
+  for it — checked rather than trusted: the t2va golden it produces
+  lands the port at 8.733e-5 where the CUDA-built one landed 8.784e-5,
+  so a stand-in with the convention wrong would have moved that.
 
 ### Fixed
 - **`gemm_nt_f32` cached the device-side weight buffer BY POINTER
