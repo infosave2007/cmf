@@ -869,6 +869,17 @@ enum Commands {
         /// stay exact, adaLN curves f16)
         #[arg(long, default_value = "q4tp")]
         quant: String,
+        /// Qwen3-VL's vision tower — `fl2va` needs it, and it lives
+        /// inside the prompt encoder's file under `visual.`
+        #[arg(long)]
+        vision: Option<String>,
+        /// Attention heads of the vision tower — architecture, not in
+        /// the checkpoint
+        #[arg(long, default_value_t = 16)]
+        vis_heads: usize,
+        /// Vision layers whose features feed the deepstack mergers
+        #[arg(long, default_value = "8,16,24")]
+        vis_deepstack: String,
         /// Attention heads of the video VAE's ViT3D decoder — an
         /// architecture constant of the release, not in the checkpoint
         #[arg(long, default_value_t = 32)]
@@ -1342,6 +1353,9 @@ async fn main() -> anyhow::Result<()> {
             tokenizer,
             quant,
             vvae_heads,
+            vision,
+            vis_heads,
+            vis_deepstack,
         } => videopack::cmd_animate_pack(videopack::PackArgs {
             out: &out,
             carry: carry.as_deref(),
@@ -1355,6 +1369,13 @@ async fn main() -> anyhow::Result<()> {
             tokenizer: tokenizer.as_deref(),
             quant: &quant,
             vvae_heads,
+            vision: vision.as_deref(),
+            vis_heads,
+            vis_deepstack: vis_deepstack
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().parse::<usize>())
+                .collect::<Result<Vec<_>, _>>()?,
         }),
         Commands::Animate {
             model,
