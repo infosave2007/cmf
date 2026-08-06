@@ -192,9 +192,13 @@ the weight GEMMs to the card (25.8 ms against 92.0).
 Still held: **the cooperative-matrix kernel runs this model out of f16 range.**
 At 256×160 the render is correct; at 512×288 the audio stream goes NaN on the
 second sampling step and the video follows. Bisected — `CMF_BAKE_GPU=0` does
-not help, `CMF_COOP=0` does — so `cortiq animate` pins `CMF_COOP=0`. Tensor
-cores are worth having here; the kernel needs to carry a scale before it can
-carry these activations. That is the next real speedup in this model.
+not help, `CMF_COOP=0` does — so `cortiq animate` pins `CMF_COOP=0`.
+
+That hold is specific to this model, not a verdict on the kernel: the image
+model on the same card and the same kernel renders 20.5 s without it against
+14.8 with, and the two agree to 42.6 dB — the price of f16 operands, which
+the kernel documents, not a fault. MiniMax-H3's activations are simply larger.
+Giving that kernel a scale is the next real speedup here.
 
 ## What the conversion did
 

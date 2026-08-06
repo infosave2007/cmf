@@ -66,13 +66,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device, not a change in behaviour). Both of its populations land on
   the host too, so the shared verdict costs nothing today; it is worth
   splitting the moment one of them wants the card.
-- **The cooperative-matrix GEMM runs this model out of f16 range.** At
+- **The cooperative-matrix GEMM runs THIS model out of f16 range.** At
   256×160 the render is correct; at 512×288 the audio stream goes NaN
   on the second sampling step and the video follows. Bisected against
   the alternatives: `CMF_BAKE_GPU=0` does not help, `CMF_COOP=0` does.
-  Tensor cores are worth having here, so `cortiq animate` pins
-  `CMF_COOP=0` as a hold rather than a verdict — the kernel needs a
-  scale before it can carry these activations.
+  The hold is model-scoped on purpose — Lumina-Image on the same card
+  and the same kernel renders 20.5 s without it against 14.8 with, and
+  the two agree to 42.6 dB, which is the f16 cost the kernel documents
+  and not a fault. So `cortiq animate` pins `CMF_COOP=0` and nothing
+  else changes; what the kernel needs is a scale on its operands
+  before it can carry activations this large.
+
+  Separately and NOT from this work: the native Vulkan lane's own
+  `tests/vk_coop.rs` fails identically on 0.5.58 and 0.5.59 — "256x512
+  b=48: cooperative GEMM off by 8.760e3 of the row's magnitude", same
+  cell either side — which is what master's CI has been red on. Two
+  cooperative-matrix implementations, two separate problems.
 - **`cortiq animate` decides its own device policy before the backend
   comes up.** `gpu::cpu_scope` cannot do it: it sets a thread-local the
   op probe's own CPU arm reads, while the probe still executes the
