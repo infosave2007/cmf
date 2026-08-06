@@ -586,8 +586,9 @@ struct N1 { n: u32, f: u32, lim: f32, _c: u32 };
 @group(0) @binding(3) var<storage, read_write> sact : array<f32>;
 @group(0) @binding(4) var<uniform>             snp  : N1;
 @compute @workgroup_size(256)
-fn silu_mul_pre(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn silu_mul_pre(@builtin(global_invocation_id) gid: vec3<u32>,
+                @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 256u;
     if (i >= snp.n) { return; }
     var gv = sg[i];
     var uv = su[i];
@@ -6008,8 +6009,9 @@ fn dit_softmax(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
 
 // [nh][n][hd] panel -> [n][nh*hd].
 @compute @workgroup_size(256)
-fn dit_unstack(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn dit_unstack(@builtin(global_invocation_id) gid: vec3<u32>,
+               @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = gid.x + gid.y * nwg.x * 256u;
     let total = dp.m * dp.k * dp.n;   // nh * n * hd
     if (i >= total) { return; }
     let hd = dp.n;
@@ -13491,7 +13493,7 @@ pub fn forward_token_graph(
                         pass.dispatch_workgroups(wu, 1, 1);
                         pass.set_pipeline(&c.silu);
                         pass.set_bind_group(0, &bg_silu, &[]);
-                        pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
+                        pass.dispatch_workgroups_flat((inter as u32).div_ceil(256));
                         // NOTE: the dense arm still emits `down` outside this pass
                         // (see emat below), so the tail cannot ride here.
                     } else {
@@ -16729,7 +16731,7 @@ pub fn dit_attention(
         });
         pass.set_pipeline(&c.dit_unstack);
         pass.set_bind_group(0, &bg_un, &[]);
-        pass.dispatch_workgroups(total.div_ceil(256), 1, 1);
+        pass.dispatch_workgroups_flat(total.div_ceil(256));
     }
     readback(
         c,
@@ -16964,7 +16966,7 @@ pub fn chunk_attend(
         });
         pass.set_pipeline(&c.dit_unstack);
         pass.set_bind_group(0, &bg_un, &[]);
-        pass.dispatch_workgroups(((nh * b * hd) as u32).div_ceil(256), 1, 1);
+        pass.dispatch_workgroups_flat(((nh * b * hd) as u32).div_ceil(256));
     }
     readback(
         c,
@@ -17514,6 +17516,34 @@ fn note_slot_write(c: &Ctx, kind: &str, key: (u8, u64, usize)) {
 /// it dispatches — which is why a 32-layer TOY with 128-wide tensors still
 /// waits 35 ms a token. Reported per token next to the submissions.
 pub static PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Split a flat element dispatch across x and y: a dimension caps at
+/// 65535 workgroups, and Lumina at 512x512 asks for 75060 of them for one
+/// SwiGLU (2085 tokens x 9216 intermediate / 256). Shaders paired with
+/// this read their index as `gid.x + gid.y * nwg.x * WG`, so the x-extent
+/// stays whatever is chosen here, and a y of 1 leaves the old arithmetic
+/// untouched for every caller still under the cap.
+fn flat_groups(groups: u32) -> (u32, u32) {
+    const MAX: u32 = 65535;
+    if groups <= MAX {
+        (groups, 1)
+    } else {
+        (MAX, groups.div_ceil(MAX))
+    }
+}
+
+trait FlatDispatch {
+    /// `dispatch_workgroups` for a flat element count, folded into two
+    /// dimensions when it overflows one.
+    fn dispatch_workgroups_flat(&mut self, groups: u32);
+}
+
+impl FlatDispatch for wgpu::ComputePass<'_> {
+    fn dispatch_workgroups_flat(&mut self, groups: u32) {
+        let (x, y) = flat_groups(groups);
+        self.dispatch_workgroups(x, y, 1);
+    }
+}
 
 #[inline]
 fn begin_pass(enc: &mut wgpu::CommandEncoder) -> wgpu::ComputePass<'_> {
@@ -18896,7 +18926,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
             let mut pass = begin_pass(&mut enc);
             pass.set_pipeline(&c.silu);
             pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
+            pass.dispatch_workgroups_flat((inter as u32).div_ceil(256));
         }
         if q4tp {
             encode_q1t_like(c, &mut enc, &c.q4tp_mv, dw, &a_buf, &d_buf, *dr, *dc);
@@ -26002,7 +26032,7 @@ pub fn dit_block_seg(
         let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(&c.dit_unstack);
         pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(((nh * n * hd) as u32).div_ceil(256), 1, 1);
+        pass.dispatch_workgroups_flat(((nh * n * hd) as u32).div_ceil(256));
     }
     encode_q4_tile_mm(c, &mut enc, mm, &wo, &attn, &proj, hs, nh * hd, n);
     let gr_p = c
@@ -26053,7 +26083,7 @@ pub fn dit_block_seg(
         let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(&c.silu);
         pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(((n * inter) as u32).div_ceil(256), 1, 1);
+        pass.dispatch_workgroups_flat(((n * inter) as u32).div_ceil(256));
     }
     encode_q4_tile_mm(c, &mut enc, mm, &w2, &abuf, &proj, hs, inter, n);
     gated(&mut enc, &proj, &f2w, &gmlp);
