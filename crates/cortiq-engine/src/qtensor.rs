@@ -10599,7 +10599,7 @@ mod tests {
 
 
 #[cfg(test)]
-mod q4tp_bench {
+mod gemm_bench {
     /// `cargo test -p cortiq-engine --release q4tp_matmat_throughput -- --ignored --nocapture`
     /// Times the batched q4tp GEMM at the shapes the image DiT runs
     /// (b=296 tokens, 2304 -> 9216), on synthetic bytes: no model, no
@@ -10790,4 +10790,49 @@ mod q4tp_bench {
             );
         }
     }
+
+    /// The q4t twin of the throughput bench, same shape and rules, so the
+    /// two quantisations' batch kernels can be read against each other.
+    /// `cargo test -p cortiq-engine --release q4t_matmat_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn q4t_matmat_throughput() {
+        let (rows, cols, b) = (9216usize, 2304usize, 296usize);
+        let total = cortiq_core::quant::expected_nbytes(
+            cortiq_core::TensorDtype::Q4Tiled,
+            &[rows, cols],
+        )
+        .unwrap();
+        // q4t carries a per-group f16 scale in the tile's first two bytes;
+        // random bytes there decode to inf and the bench would time NaNs.
+        let mut bytes: Vec<u8> = (0..total).map(|i| (i * 37 % 251) as u8).collect();
+        let sc = cortiq_core::quant::f32_to_f16(0.02);
+        for t in bytes.chunks_mut(super::Q4_TILE) {
+            t[..2].copy_from_slice(&sc.to_le_bytes());
+        }
+        let xs: Vec<f32> = (0..b * cols)
+            .map(|i| ((i % 97) as f32 - 48.0) / 48.0)
+            .collect();
+        let mut out = vec![0f32; b * rows];
+        let pool = crate::pool::Pool::from_env();
+        super::q4t_matmat(&bytes, &xs, b, rows, cols, &mut out, pool.as_deref());
+        let reps: usize = std::env::var("CMF_BENCH_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let mut best = f64::MAX;
+        for _ in 0..reps {
+            let t = std::time::Instant::now();
+            super::q4t_matmat(&bytes, &xs, b, rows, cols, &mut out, pool.as_deref());
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        let flops = 2.0 * b as f64 * rows as f64 * cols as f64;
+        println!(
+            "q4t matmat {rows}x{cols} b={b}: {:.1} ms  {:.1} GFLOP/s  (checksum {:.3})",
+            best * 1e3,
+            flops / best / 1e9,
+            out.iter().take(64).sum::<f32>()
+        );
+    }
+
 }
