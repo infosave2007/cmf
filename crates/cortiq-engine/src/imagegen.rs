@@ -73,6 +73,24 @@ fn sigmas(steps: usize, shift: f64) -> Vec<f64> {
 }
 
 fn gauss_latent(n: usize, seed: u64) -> Vec<f32> {
+    // `CMF_INIT_LATENT=<path>` takes the starting noise from a file of raw
+    // little-endian f32 instead of drawing it. Comparing this engine's
+    // image against the diffusers reference needs the SAME sample: the two
+    // draw from different generators, and two different draws differ far
+    // more than any arithmetic between them, so a pixel comparison without
+    // this measures the RNGs.
+    if let Ok(path) = std::env::var("CMF_INIT_LATENT") {
+        match std::fs::read(&path) {
+            Ok(b) if b.len() == n * 4 => {
+                return b
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+            }
+            Ok(b) => panic!("{path}: {} floats, the latent needs {n}", b.len() / 4),
+            Err(e) => panic!("{path}: {e}"),
+        }
+    }
     let mut rng = SplitMix64::new(seed);
     let mut u = || (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
     let mut out = Vec::with_capacity(n);
