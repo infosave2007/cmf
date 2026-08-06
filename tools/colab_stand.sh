@@ -10,6 +10,9 @@ apt-get install -y -q libvulkan1 aria2 >/dev/null 2>&1 || {
   apt-get install -y -q libvulkan1 aria2 >/dev/null
 }
 # The NVIDIA driver is present but its Vulkan/EGL manifests are not (HANDOFF §2).
+# Kept here as a fallback; tools/colab_connect_cell.sh does the same in the
+# notebook cell that opens the tunnel, which is early enough that a hand-typed
+# `cortiq gpu` does not report llvmpipe and start a false hunt.
 echo /usr/lib64-nvidia > /etc/ld.so.conf.d/nvidia-colab.conf && ldconfig 2>/dev/null || true
 mkdir -p /usr/share/vulkan/icd.d /usr/share/glvnd/egl_vendor.d
 printf '{"file_format_version":"1.0.0","ICD":{"library_path":"/usr/lib64-nvidia/libGLX_nvidia.so.0","api_version":"1.3.0"}}' \
