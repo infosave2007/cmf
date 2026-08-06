@@ -4139,24 +4139,47 @@ fn submit_and_wait(c: &Ctx, cmd: &metal::CommandBufferRef, outs: &[&Buffer]) {
     wait_fast(cmd);
 }
 
-/// Latency-critical wait: spin-poll the status instead of
-/// waitUntilCompleted (sleeping/waking the thread costs ~1–3 ms —
-/// across 40 MoE layers/token this canceled out the kernel's gain).
+/// How long the recent waits took, in microseconds (EWMA). Decides whether
+/// the next one spins or sleeps.
+static WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Wait for a command buffer, spinning only when spinning is cheaper.
+///
+/// Sleeping and waking the thread costs ~1–3 ms, which across 40 MoE
+/// layers a token cancelled out the kernel's gain — hence the spin. But
+/// the spin budget used to be a flat 200 ms, and an image DiT block runs
+/// for ~260 ms on an M4: every block burned a performance core to a stop
+/// for 200 ms and then slept anyway. On a fanless machine that core is
+/// also competing with the GPU for the power budget, so the spin was
+/// making the render slower as well as hotter.
+///
+/// So the budget follows the work: an average wait past a few milliseconds
+/// means the wake-up cost is noise and the thread should sleep.
 fn wait_fast(cmd: &metal::CommandBufferRef) {
     use metal::MTLCommandBufferStatus as S;
     let t0 = std::time::Instant::now();
-    loop {
-        match cmd.status() {
-            S::Completed | S::Error => return,
-            _ => {
-                if t0.elapsed().as_millis() > 200 {
-                    cmd.wait_until_completed(); // safeguard against an infinite spin
-                    return;
+    let ewma = WAIT_US.load(std::sync::atomic::Ordering::Relaxed);
+    if ewma > 3_000 {
+        cmd.wait_until_completed();
+    } else {
+        loop {
+            match cmd.status() {
+                S::Completed | S::Error => break,
+                _ => {
+                    if t0.elapsed().as_micros() > 1_000 {
+                        cmd.wait_until_completed();
+                        break;
+                    }
+                    std::hint::spin_loop();
                 }
-                std::hint::spin_loop();
             }
         }
     }
+    let took = t0.elapsed().as_micros() as u64;
+    WAIT_US.store(
+        (ewma * 7 + took) / 8,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 fn page_size() -> usize {

@@ -682,7 +682,7 @@ impl NextDit {
         rope32: &(Vec<f32>, Vec<f32>),
         m: &[f32],
     ) -> bool {
-        self.gpu_block_seg(blk, x, n, rope32, m, &[n])
+        self.gpu_block_seg(blk, x, n, rope32, m, &[n], (false, false))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -694,6 +694,7 @@ impl NextDit {
         rope32: &(Vec<f32>, Vec<f32>),
         m: &[f32],
         segs: &[usize],
+        resident: (bool, bool),
     ) -> bool {
         use crate::gpu;
         let (hs, nh, nkv, hd) = (self.hidden, self.nh, self.nkv, self.hd);
@@ -747,6 +748,8 @@ impl NextDit {
         let gate_mlp: Vec<f32> = m[3 * hs..].iter().map(|&v| v.tanh()).collect();
         let args = gpu::DitBlockArgs {
             q4tp: is_q4tp,
+            resident_in: resident.0,
+            resident_out: resident.1,
             n,
             hidden: hs,
             inter,
@@ -888,7 +891,7 @@ impl NextDit {
         temb: Option<&[f32]>,
     ) {
         let n_all = x.len() / self.hidden;
-        self.block_forward_seg(blk, x, rope, rope32, temb, &[n_all]);
+        let _ = self.block_forward_seg(blk, x, rope, rope32, temb, &[n_all], (false, false));
     }
 
     /// `block_forward` over a CONCATENATION of independent sequences.
@@ -906,7 +909,8 @@ impl NextDit {
         rope32: Option<&(Vec<f32>, Vec<f32>)>,
         temb: Option<&[f32]>,
         segs: &[usize],
-    ) {
+        resident: (bool, bool),
+    ) -> bool {
         let (hs, nh, nkv, hd) = (self.hidden, self.nh, self.nkv, self.hd);
         let pool = self.pool.as_deref();
         let n = x.len() / hs;
@@ -924,9 +928,14 @@ impl NextDit {
         };
         if let (Some(m), Some(r32)) = (&modv, rope32) {
             let _s = prof::span(prof::GPUBLK);
-            if self.gpu_block_seg(blk, x, n, r32, m, segs) {
-                return;
+            if self.gpu_block_seg(blk, x, n, r32, m, segs, resident) {
+                return true;
             }
+        }
+        // Falling back to the host after a chained block: the device holds
+        // the state and `x` is stale. Recover it before reading `x`.
+        if resident.0 {
+            crate::gpu::dit_state_fetch(&mut x[..n * hs]);
         }
         let modnorm = prof::span(prof::MODNORM);
         let (s_msa, g_msa, s_mlp, g_mlp) = match &modv {
@@ -1115,6 +1124,7 @@ impl NextDit {
         }
         let _modnorm = prof::span(prof::MODNORM);
         residual(&d_all, &blk.ffn_norm2, gate_mlp.as_deref(), x);
+            false
     }
 
     /// One denoising forward: latent `[c, h, w]` (NCHW), caption
@@ -1257,15 +1267,31 @@ impl NextDit {
         let joint_rope = ([rc.0, ru.0].concat(), [rc.1, ru.1].concat());
         let joint_rope32 = to32(&joint_rope);
         let segs = [n_c, n_u];
-        for blk in &self.layers {
-            self.block_forward_seg(
+        // The state stays on the device for the whole stack: nothing here
+        // reads `x` between blocks, so uploading and reading back 19 MB
+        // around each of 28 blocks was pure round trip. Only the first
+        // block uploads and only the last reads back.
+        let chain = crate::gpu::dit_chain_supported();
+        let last = self.layers.len().saturating_sub(1);
+        let mut resident = false;
+        for (i, blk) in self.layers.iter().enumerate() {
+            let want = if chain {
+                (resident, i != last)
+            } else {
+                (false, false)
+            };
+            // A block the device declines runs on the host and leaves the
+            // state there, so the next one must upload again.
+            let on_gpu = self.block_forward_seg(
                 blk,
                 &mut x,
                 &joint_rope,
                 Some(&joint_rope32),
                 Some(&temb),
                 &segs,
+                want,
             );
+            resident = on_gpu && want.1;
         }
         let _tail = prof::span(prof::HEADTAIL);
         let n = n_c + n_u;
