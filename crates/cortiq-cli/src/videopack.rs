@@ -757,12 +757,105 @@ fn pack_video_vae(
         "vvae.proj_out.weight",
         level,
     )?;
+
+    // ── the encoder, one temporal tap of it ──
+    //
+    // fl2va conditions on single FRAMES, and a causal 3-D convolution
+    // fed one frame pads its front with zeros — the reference's own
+    // `autopad="causal_zero"` trims the kernel to `weight[:, :, -T:]`,
+    // which at T = 1 is the last tap and nothing else. The other two
+    // taps cannot be reached by a keyframe, so they are not packed: the
+    // encoder lands at a third of its size. Encoding real video (ref2va)
+    // would need them back.
+    // Level count, blocks per level and which levels downsample all come
+    // from the checkpoint; only the spatial stride is architectural (every
+    // downsample in this encoder halves H and W).
+    let n_levels = (0..)
+        .take_while(|i| v.has(&format!("encoder.down.{i}.block.0.conv1.weight")))
+        .count();
+    let n_res = (0..)
+        .take_while(|j| v.has(&format!("encoder.down.0.block.{j}.conv1.weight")))
+        .count();
+    let space_down: Vec<usize> = (0..n_levels)
+        .map(|i| {
+            if v.has(&format!("encoder.down.{i}.downsample.conv.weight")) {
+                2
+            } else {
+                1
+            }
+        })
+        .collect();
+    for (i, &sd) in space_down.iter().enumerate() {
+        for j in 0..n_res {
+            let p = format!("encoder.down.{i}.block.{j}");
+            for k in ["conv1", "conv2", "nin_shortcut"] {
+                if v.has(&format!("{p}.{k}.weight")) {
+                    push_last_tap(specs, &v, &format!("{p}.{k}"), &format!("vvae.enc.down.{i}.block.{j}.{k}"), level)?;
+                }
+            }
+            for k in ["norm1", "norm2"] {
+                for t in ["weight", "bias"] {
+                    push_exact(specs, &v, &format!("{p}.{k}.{t}"),
+                        &format!("vvae.enc.down.{i}.block.{j}.{k}.{t}"), Level::F32)?;
+                }
+            }
+        }
+        if sd > 1 {
+            push_last_tap(specs, &v, &format!("encoder.down.{i}.downsample.conv"),
+                &format!("vvae.enc.down.{i}.downsample.conv"), level)?;
+        }
+    }
+    push_last_tap(specs, &v, "encoder.conv_in", "vvae.enc.conv_in", level)?;
+    push_last_tap(specs, &v, "encoder.conv_out", "vvae.enc.conv_out", level)?;
+    for t in ["weight", "bias"] {
+        push_exact(specs, &v, &format!("encoder.norm_out.{t}"),
+            &format!("vvae.enc.norm_out.{t}"), Level::F32)?;
+        push_exact(specs, &v, &format!("quant_conv.{t}"),
+            &format!("vvae.quant_conv.{t}"), Level::F32)?;
+    }
+
     Ok(serde_json::json!({
         "num_layers": n, "dim": dim, "heads": heads, "dim_head": dim / heads,
         "z_channels": z, "patch_size": 16, "patch_size_t": 4,
         "rope_theta": 100.0, "rope_dim_ratio": 0.75,
         "num_register_tokens": 4, "eps": 1e-5,
+        "space_down": space_down, "num_res_blocks": n_res, "num_levels": n_levels,
     }))
+}
+
+/// A 5-D causal convolution reduced to the one temporal tap a single
+/// frame can reach: `[o, i, kt, kh, kw]` → `[o, i, kh, kw]`, plus its
+/// bias unchanged.
+fn push_last_tap(
+    specs: &mut Vec<TensorSpec>,
+    src: &StFile,
+    key: &str,
+    out_name: &str,
+    level: Level,
+) -> anyhow::Result<()> {
+    let name = format!("{key}.weight");
+    let shape = src
+        .shape(&name)
+        .ok_or_else(|| anyhow!("missing {name}"))?
+        .to_vec();
+    if shape.len() != 5 {
+        return Err(anyhow!("{name}: expected a 5-D kernel, got {shape:?}"));
+    }
+    let (o, i, kt, kh, kw) = (shape[0], shape[1], shape[2], shape[3], shape[4]);
+    let w = src.get(&name)?;
+    let mut tap = vec![0f32; o * i * kh * kw];
+    for oi in 0..o {
+        for ii in 0..i {
+            let s = ((oi * i + ii) * kt + (kt - 1)) * kh * kw;
+            let d = (oi * i + ii) * kh * kw;
+            tap[d..d + kh * kw].copy_from_slice(&w[s..s + kh * kw]);
+        }
+    }
+    // f16 unless the caller asked for exact — the parity gate does, or
+    // it measures the codec instead of the port.
+    let lv = if level == Level::F32 { Level::F32 } else { Level::F16 };
+    specs.push(spec(format!("{out_name}.weight"), &tap, vec![o, i, kh, kw], lv));
+    push_exact(specs, src, &format!("{key}.bias"), &format!("{out_name}.bias"), Level::F32)
 }
 
 /// Audio VAE: `dec_in_proj` + BigVGAN. 90 M parameters — f16 all the
