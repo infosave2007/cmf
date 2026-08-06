@@ -4960,170 +4960,185 @@ fn q4tp_matmat(
         let blocked_ok = q4tp_blocked_x86();
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let blocked_ok = false;
+        // Columns are swept in panels that fit L2. Without this a
+        // row-pair walks every activation in the batch — 4.8 MB at
+        // 512x512 — and does it again for the next pair, so the whole
+        // batch streams out of the shared cache once per row. Measured
+        // 800 GB/s of it, flat across batch sizes, which is the signature
+        // of a loop bound by traffic rather than by arithmetic. A panel of
+        // 256 columns is 590 KB beside 221 KB of this worker's weights:
+        // both stay resident and the batch crosses L3 once instead of
+        // once per row.
+        let panel_cols: usize = std::env::var("CMF_Q4TP_PANEL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(256);
         let run = |start: usize, end: usize| {
-            let mut sc = vec![0f32; gpr];
-            // Two rows at a time where the wide kernel is available: the
-            // activation load is shared between them, which is the traffic
-            // this loop was drowning in.
-            #[cfg(target_arch = "x86_64")]
-            let mut r_lo = start;
-            #[cfg(target_arch = "x86_64")]
-            if blocked_ok && acts.len() >= 8 {
-                let mut sc1 = vec![0f32; gpr];
-                while r_lo + 2 <= end {
-                    v.scales_into(r_lo, gpr, &mut sc);
-                    v.scales_into(r_lo + 1, gpr, &mut sc1);
-                    let mut bi = 0usize;
-                    while bi + 8 <= acts.len() {
-                        let xs = [
-                            acts[bi].xq.as_slice(),
-                            acts[bi + 1].xq.as_slice(),
-                            acts[bi + 2].xq.as_slice(),
-                            acts[bi + 3].xq.as_slice(),
-                            acts[bi + 4].xq.as_slice(),
-                            acts[bi + 5].xq.as_slice(),
-                            acts[bi + 6].xq.as_slice(),
-                            acts[bi + 7].xq.as_slice(),
-                        ];
-                        let d =
-                            unsafe { dot_q4tp_2x8_avx512(v.nib, r_lo, gpr, xs, &sc, &sc1) };
-                        for (row, dr, scr) in
-                            [(r_lo, &d[0], &sc), (r_lo + 1, &d[1], &sc1)]
-                        {
-                            for k in 0..8 {
-                                let act = &acts[bi + k];
-                                let mut acc = dr[k] * act.sx;
+            for abase in (0..acts.len()).step_by(panel_cols) {
+                let alen = (acts.len() - abase).min(panel_cols);
+                let mut sc = vec![0f32; gpr];
+                #[cfg(target_arch = "x86_64")]
+                let mut r_lo = start;
+                #[cfg(target_arch = "x86_64")]
+                if blocked_ok && alen >= 8 {
+                    let mut sc1 = vec![0f32; gpr];
+                    while r_lo + 2 <= end {
+                        v.scales_into(r_lo, gpr, &mut sc);
+                        v.scales_into(r_lo + 1, gpr, &mut sc1);
+                        let mut bi = 0usize;
+                        while bi + 8 <= alen {
+                            let xs = [
+                                acts[abase + bi].xq.as_slice(),
+                                acts[abase + bi + 1].xq.as_slice(),
+                                acts[abase + bi + 2].xq.as_slice(),
+                                acts[abase + bi + 3].xq.as_slice(),
+                                acts[abase + bi + 4].xq.as_slice(),
+                                acts[abase + bi + 5].xq.as_slice(),
+                                acts[abase + bi + 6].xq.as_slice(),
+                                acts[abase + bi + 7].xq.as_slice(),
+                            ];
+                            let d =
+                                unsafe { dot_q4tp_2x8_avx512(v.nib, r_lo, gpr, xs, &sc, &sc1) };
+                            for (row, dr, scr) in
+                                [(r_lo, &d[0], &sc), (r_lo + 1, &d[1], &sc1)]
+                            {
+                                for k in 0..8 {
+                                    let act = &acts[abase + bi + k];
+                                    let mut acc = dr[k] * act.sx;
+                                    for &(j, xv) in &act.outliers {
+                                        let (w, s) = q4tp_outlier(v.nib, row, gpr, j, scr);
+                                        acc += w * s * xv;
+                                    }
+                                    // SAFETY: disjoint (bi, r) cells per worker.
+                                    unsafe { *out_addr.at((abase + bi + k) * rows + row) = acc };
+                                }
+                            }
+                            bi += 8;
+                        }
+                        // Columns past the last group of eight, both rows —
+                        // the same single-row kernel the tail below uses.
+                        for row in [r_lo, r_lo + 1] {
+                            let scr: &[f32] = if row == r_lo { &sc } else { &sc1 };
+                            for b2 in bi..alen {
+                                let act = &acts[abase + b2];
+                                let xs4 = [
+                                    act.xq.as_slice(),
+                                    act.xq.as_slice(),
+                                    act.xq.as_slice(),
+                                    act.xq.as_slice(),
+                                ];
+                                let d =
+                                    unsafe { dot_q4tp_row_1x4_avx512(v.nib, row, gpr, xs4, scr) };
+                                let mut acc = d[0] * act.sx;
                                 for &(j, xv) in &act.outliers {
                                     let (w, s) = q4tp_outlier(v.nib, row, gpr, j, scr);
                                     acc += w * s * xv;
                                 }
                                 // SAFETY: disjoint (bi, r) cells per worker.
-                                unsafe { *out_addr.at((bi + k) * rows + row) = acc };
+                                unsafe { *out_addr.at((abase + b2) * rows + row) = acc };
                             }
                         }
-                        bi += 8;
+                        r_lo += 2;
                     }
-                    // Columns past the last group of eight, both rows —
-                    // the same single-row kernel the tail below uses.
-                    for row in [r_lo, r_lo + 1] {
-                        let scr: &[f32] = if row == r_lo { &sc } else { &sc1 };
-                        for b2 in bi..acts.len() {
-                            let act = &acts[b2];
-                            let xs4 = [
-                                act.xq.as_slice(),
-                                act.xq.as_slice(),
-                                act.xq.as_slice(),
-                                act.xq.as_slice(),
-                            ];
-                            let d =
-                                unsafe { dot_q4tp_row_1x4_avx512(v.nib, row, gpr, xs4, scr) };
-                            let mut acc = d[0] * act.sx;
-                            for &(j, xv) in &act.outliers {
-                                let (w, s) = q4tp_outlier(v.nib, row, gpr, j, scr);
-                                acc += w * s * xv;
-                            }
-                            // SAFETY: disjoint (bi, r) cells per worker.
-                            unsafe { *out_addr.at(b2 * rows + row) = acc };
-                        }
-                    }
-                    r_lo += 2;
                 }
-            }
-            #[cfg(target_arch = "x86_64")]
-            let row_start = r_lo;
-            #[cfg(not(target_arch = "x86_64"))]
-            let row_start = start;
-            for r in row_start..end {
-                v.scales_into(r, gpr, &mut sc);
-                let mut bi = 0usize;
                 #[cfg(target_arch = "x86_64")]
-                if blocked_ok {
-                    while bi + 8 <= acts.len() {
-                        let xs = [
-                            acts[bi].xq.as_slice(),
-                            acts[bi + 1].xq.as_slice(),
-                            acts[bi + 2].xq.as_slice(),
-                            acts[bi + 3].xq.as_slice(),
-                            acts[bi + 4].xq.as_slice(),
-                            acts[bi + 5].xq.as_slice(),
-                            acts[bi + 6].xq.as_slice(),
-                            acts[bi + 7].xq.as_slice(),
-                        ];
-                        let d = unsafe { dot_q4tp_row_1x8_avx512(v.nib, r, gpr, xs, &sc) };
-                        for k in 0..8 {
-                            let act = &acts[bi + k];
-                            let mut acc = d[k] * act.sx;
-                            for &(j, xv) in &act.outliers {
-                                let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
-                                acc += w * s * xv;
+                let row_start = r_lo;
+                #[cfg(not(target_arch = "x86_64"))]
+                let row_start = start;
+                for r in row_start..end {
+                    v.scales_into(r, gpr, &mut sc);
+                    let mut bi = 0usize;
+                    #[cfg(target_arch = "x86_64")]
+                    if blocked_ok {
+                        while bi + 8 <= alen {
+                            let xs = [
+                                acts[abase + bi].xq.as_slice(),
+                                acts[abase + bi + 1].xq.as_slice(),
+                                acts[abase + bi + 2].xq.as_slice(),
+                                acts[abase + bi + 3].xq.as_slice(),
+                                acts[abase + bi + 4].xq.as_slice(),
+                                acts[abase + bi + 5].xq.as_slice(),
+                                acts[abase + bi + 6].xq.as_slice(),
+                                acts[abase + bi + 7].xq.as_slice(),
+                            ];
+                            let d = unsafe { dot_q4tp_row_1x8_avx512(v.nib, r, gpr, xs, &sc) };
+                            for k in 0..8 {
+                                let act = &acts[abase + bi + k];
+                                let mut acc = d[k] * act.sx;
+                                for &(j, xv) in &act.outliers {
+                                    let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
+                                    acc += w * s * xv;
+                                }
+                                // SAFETY: disjoint (bi, r) cells per worker.
+                                unsafe { *out_addr.at((abase + bi + k) * rows + r) = acc };
                             }
-                            // SAFETY: disjoint (bi, r) cells per worker.
-                            unsafe { *out_addr.at((bi + k) * rows + r) = acc };
+                            bi += 8;
                         }
-                        bi += 8;
+                        while bi + 4 <= alen {
+                            let xs = [
+                                acts[abase + bi].xq.as_slice(),
+                                acts[abase + bi + 1].xq.as_slice(),
+                                acts[abase + bi + 2].xq.as_slice(),
+                                acts[abase + bi + 3].xq.as_slice(),
+                            ];
+                            let d = unsafe { dot_q4tp_row_1x4_avx512(v.nib, r, gpr, xs, &sc) };
+                            for k in 0..4 {
+                                let act = &acts[abase + bi + k];
+                                let mut acc = d[k] * act.sx;
+                                for &(j, xv) in &act.outliers {
+                                    let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
+                                    acc += w * s * xv;
+                                }
+                                // SAFETY: disjoint (bi, r) cells per worker.
+                                unsafe { *out_addr.at((abase + bi + k) * rows + r) = acc };
+                            }
+                            bi += 4;
+                        }
                     }
-                    while bi + 4 <= acts.len() {
-                        let xs = [
-                            acts[bi].xq.as_slice(),
-                            acts[bi + 1].xq.as_slice(),
-                            acts[bi + 2].xq.as_slice(),
-                            acts[bi + 3].xq.as_slice(),
-                        ];
-                        let d = unsafe { dot_q4tp_row_1x4_avx512(v.nib, r, gpr, xs, &sc) };
-                        for k in 0..4 {
-                            let act = &acts[bi + k];
-                            let mut acc = d[k] * act.sx;
-                            for &(j, xv) in &act.outliers {
-                                let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
-                                acc += w * s * xv;
+                    #[cfg(target_arch = "aarch64")]
+                    if blocked_ok {
+                        while bi + 4 <= alen {
+                            let xs = [
+                                acts[abase + bi].xq.as_slice(),
+                                acts[abase + bi + 1].xq.as_slice(),
+                                acts[abase + bi + 2].xq.as_slice(),
+                                acts[abase + bi + 3].xq.as_slice(),
+                            ];
+                            let d = unsafe {
+                                if q4tp_v1() {
+                                    dot_q4tp_row_1x4_sdot_v1(v.nib, r, gpr, xs, &sc)
+                                } else {
+                                    dot_q4tp_row_1x4_sdot(v.nib, r, gpr, xs, &sc)
+                                }
+                            };
+                            for k in 0..4 {
+                                let act = &acts[abase + bi + k];
+                                let mut acc = d[k] * act.sx;
+                                for &(j, xv) in &act.outliers {
+                                    let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
+                                    acc += w * s * xv;
+                                }
+                                // SAFETY: disjoint (bi, r) cells per worker.
+                                unsafe { *out_addr.at((abase + bi + k) * rows + r) = acc };
                             }
-                            // SAFETY: disjoint (bi, r) cells per worker.
-                            unsafe { *out_addr.at((bi + k) * rows + r) = acc };
+                            bi += 4;
                         }
-                        bi += 4;
+                    }
+                    let _ = blocked_ok;
+                    while bi < alen {
+                        let act = &acts[abase + bi];
+                        let mut acc = dot_q4tp_row_i8(v.nib, r, gpr, &act.xq, &sc) * act.sx;
+                        for &(j, xv) in &act.outliers {
+                            let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
+                            acc += w * s * xv;
+                        }
+                        // SAFETY: disjoint (bi, r) cells per worker range.
+                        unsafe { *out_addr.at((abase + bi) * rows + r) = acc };
+                        bi += 1;
                     }
                 }
-                #[cfg(target_arch = "aarch64")]
-                if blocked_ok {
-                    while bi + 4 <= acts.len() {
-                        let xs = [
-                            acts[bi].xq.as_slice(),
-                            acts[bi + 1].xq.as_slice(),
-                            acts[bi + 2].xq.as_slice(),
-                            acts[bi + 3].xq.as_slice(),
-                        ];
-                        let d = unsafe {
-                            if q4tp_v1() {
-                                dot_q4tp_row_1x4_sdot_v1(v.nib, r, gpr, xs, &sc)
-                            } else {
-                                dot_q4tp_row_1x4_sdot(v.nib, r, gpr, xs, &sc)
-                            }
-                        };
-                        for k in 0..4 {
-                            let act = &acts[bi + k];
-                            let mut acc = d[k] * act.sx;
-                            for &(j, xv) in &act.outliers {
-                                let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
-                                acc += w * s * xv;
-                            }
-                            // SAFETY: disjoint (bi, r) cells per worker.
-                            unsafe { *out_addr.at((bi + k) * rows + r) = acc };
-                        }
-                        bi += 4;
-                    }
-                }
-                let _ = blocked_ok;
-                while bi < acts.len() {
-                    let act = &acts[bi];
-                    let mut acc = dot_q4tp_row_i8(v.nib, r, gpr, &act.xq, &sc) * act.sx;
-                    for &(j, xv) in &act.outliers {
-                        let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
-                        acc += w * s * xv;
-                    }
-                    // SAFETY: disjoint (bi, r) cells per worker range.
-                    unsafe { *out_addr.at(bi * rows + r) = acc };
-                    bi += 1;
-                }
+        
             }
         };
         dispatch_rows(pool, rows, &run);
@@ -10893,7 +10908,14 @@ mod gemm_bench {
     #[test]
     #[ignore]
     fn q4tp_matmat_throughput() {
-        let (rows, cols, b) = (9216usize, 2304usize, 296usize);
+        // 296 is a prompt-encode batch; the image DiT runs 2085 at
+        // 512x512, where the activation panel stops fitting L2 and the
+        // loop's shape starts to matter more than its instructions.
+        let b: usize = std::env::var("CMF_BENCH_B")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(296);
+        let (rows, cols) = (9216usize, 2304usize);
         let (_, _, _) = (rows, cols, b);
         let total = cortiq_core::quant::expected_nbytes(
             cortiq_core::TensorDtype::Q4TiledP,
