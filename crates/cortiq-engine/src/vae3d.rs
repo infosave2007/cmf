@@ -788,3 +788,429 @@ mod tests {
         assert_eq!((ratio_t - CLIP_LENGTH % ratio_t) % ratio_t, 3);
     }
 }
+
+// ── the encoder, for keyframes only ─────────────────────────────────
+//
+// `fl2va` conditions on a first and/or last frame, and a frame is ONE
+// frame. That collapses the whole 3-D causal encoder to a 2-D one:
+// causal padding fills the front with zeros, and the reference's own
+// `autopad="causal_zero"` therefore trims the kernel to
+// `weight[:, :, -T:]` — at T = 1, the last temporal tap and nothing
+// else. So the packer stores that tap alone (a third of the bytes) and
+// this runs plain 2-D convolutions over it. Encoding real video would
+// need the other two taps back; keyframes never reach them.
+
+/// A 2-D convolution with the reference's padding policy: reflect on
+/// H and W, applied by hand because the checkpoint's convolutions
+/// carry no padding of their own.
+struct EncConv {
+    w: Vec<f32>, // [out, in, kh, kw]
+    b: Vec<f32>,
+    out_ch: usize,
+    in_ch: usize,
+    k: usize,
+    stride: usize,
+    pad: usize,
+}
+
+impl EncConv {
+    fn load(model: &Arc<CmfModel>, name: &str, stride: usize, pad: usize) -> Result<Self, String> {
+        let e = model
+            .tensor(&format!("{name}.weight"))
+            .ok_or_else(|| format!("missing {name}.weight"))?;
+        // [out, in, kh, kw] — the packer already dropped the temporal axis.
+        let (out_ch, in_ch, k) = (e.shape[0], e.shape[1], e.shape[2]);
+        Ok(Self {
+            w: crate::dit::cmf_f32(model, &format!("{name}.weight"))?,
+            b: crate::dit::cmf_f32(model, &format!("{name}.bias"))?,
+            out_ch,
+            in_ch,
+            k,
+            stride,
+            pad,
+        })
+    }
+
+    /// `x` is `[in_ch, h, w]`; reflect-padded by `self.pad` on each side.
+    fn apply(&self, x: &[f32], h: usize, w: usize, pool: Option<&Pool>) -> (Vec<f32>, usize, usize) {
+        let (ph, pw) = (h + 2 * self.pad, w + 2 * self.pad);
+        let oh = (ph - self.k) / self.stride + 1;
+        let ow = (pw - self.k) / self.stride + 1;
+        // Reflect padding: index |p| mirrored about the edges, which for
+        // pad 1 on a plane of at least 2 is just the neighbour row.
+        let refl = |i: isize, n: usize| -> usize {
+            let n = n as isize;
+            let mut i = i;
+            while i < 0 || i >= n {
+                if i < 0 {
+                    i = -i;
+                }
+                if i >= n {
+                    i = 2 * (n - 1) - i;
+                }
+            }
+            i as usize
+        };
+        let mut out = vec![0f32; self.out_ch * oh * ow];
+        let ptr = SendPtr(out.as_mut_ptr());
+        let work = |lo: usize, hi: usize| {
+            for o in lo..hi {
+                // SAFETY: workers own disjoint output channels.
+                let dst = unsafe { ptr.row(o * oh * ow, oh * ow) };
+                dst.fill(self.b[o]);
+                for i in 0..self.in_ch {
+                    let ker = &self.w[(o * self.in_ch + i) * self.k * self.k
+                        ..(o * self.in_ch + i + 1) * self.k * self.k];
+                    let src = &x[i * h * w..(i + 1) * h * w];
+                    for oy in 0..oh {
+                        for ox in 0..ow {
+                            let mut acc = 0f32;
+                            for ky in 0..self.k {
+                                let sy = (oy * self.stride + ky) as isize - self.pad as isize;
+                                let sy = refl(sy, h);
+                                for kx in 0..self.k {
+                                    let sx = (ox * self.stride + kx) as isize - self.pad as isize;
+                                    acc += ker[ky * self.k + kx] * src[sy * w + refl(sx, w)];
+                                }
+                            }
+                            dst[oy * ow + ox] += acc;
+                        }
+                    }
+                }
+            }
+        };
+        match pool {
+            Some(p) => p.run_rows(self.out_ch, &work),
+            None => work(0, self.out_ch),
+        }
+        (out, oh, ow)
+    }
+}
+
+/// GroupNorm(32) with affine parameters, over `[ch, h, w]`.
+struct GroupNorm {
+    w: Vec<f32>,
+    b: Vec<f32>,
+}
+
+impl GroupNorm {
+    fn load(model: &Arc<CmfModel>, name: &str) -> Result<Self, String> {
+        Ok(Self {
+            w: crate::dit::cmf_f32(model, &format!("{name}.weight"))?,
+            b: crate::dit::cmf_f32(model, &format!("{name}.bias"))?,
+        })
+    }
+
+    fn apply(&self, x: &mut [f32], ch: usize, hw: usize) {
+        let groups = 32;
+        let per = ch / groups;
+        for g in 0..groups {
+            let seg = &mut x[g * per * hw..(g + 1) * per * hw];
+            let n = seg.len() as f64;
+            let mean = seg.iter().map(|&v| v as f64).sum::<f64>() / n;
+            let var = seg.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
+            let inv = 1.0 / (var + 1e-6).sqrt();
+            for (i, v) in seg.iter_mut().enumerate() {
+                let c = g * per + i / hw;
+                *v = ((*v as f64 - mean) * inv) as f32 * self.w[c] + self.b[c];
+            }
+        }
+    }
+}
+
+struct ResBlock {
+    norm1: GroupNorm,
+    norm2: GroupNorm,
+    conv1: EncConv,
+    conv2: EncConv,
+    shortcut: Option<EncConv>,
+}
+
+/// The encoder half: `[3, h, w]` in [-1, 1] → normalized latents
+/// `[24, h/16, w/16]`.
+pub struct VideoVaeEncoder {
+    conv_in: EncConv,
+    levels: Vec<(Vec<ResBlock>, Option<EncConv>)>,
+    norm_out: GroupNorm,
+    conv_out: EncConv,
+    quant: Vec<f32>, // [48, 48] 1x1x1
+    quant_b: Vec<f32>,
+    latents_mean: Vec<f32>,
+    latents_std: Vec<f32>,
+    pool: Option<Arc<Pool>>,
+    z_channels: usize,
+    ratio: usize,
+}
+
+impl VideoVaeEncoder {
+    pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
+        let cfg: serde_json::Value = serde_json::from_slice(
+            model
+                .tensor_bytes("vvae.config_json")
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("vvae.config_json: {e}"))?;
+        let space_down: Vec<usize> = cfg["space_down"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_u64().unwrap_or(1) as usize).collect())
+            .unwrap_or_else(|| vec![2, 2, 2, 2, 1, 1]);
+        let n_res = cfg["num_res_blocks"].as_u64().unwrap_or(2) as usize;
+        let mut levels = Vec::new();
+        for (i, &sd) in space_down.iter().enumerate() {
+            let mut blocks = Vec::new();
+            for j in 0..n_res {
+                let p = format!("vvae.enc.down.{i}.block.{j}");
+                let shortcut = model
+                    .tensor(&format!("{p}.nin_shortcut.weight"))
+                    .map(|_| EncConv::load(model, &format!("{p}.nin_shortcut"), 1, 0))
+                    .transpose()?;
+                blocks.push(ResBlock {
+                    norm1: GroupNorm::load(model, &format!("{p}.norm1"))?,
+                    norm2: GroupNorm::load(model, &format!("{p}.norm2"))?,
+                    conv1: EncConv::load(model, &format!("{p}.conv1"), 1, 1)?,
+                    conv2: EncConv::load(model, &format!("{p}.conv2"), 1, 1)?,
+                    shortcut,
+                });
+            }
+            // The downsample's own convolution pads nothing: the caller
+            // reflect-pads one row and column on the far side instead.
+            let down = if sd > 1 {
+                Some(EncConv::load(
+                    model,
+                    &format!("vvae.enc.down.{i}.downsample.conv"),
+                    sd,
+                    0,
+                )?)
+            } else {
+                None
+            };
+            levels.push((blocks, down));
+        }
+        Ok(Self {
+            conv_in: EncConv::load(model, "vvae.enc.conv_in", 1, 1)?,
+            levels,
+            norm_out: GroupNorm::load(model, "vvae.enc.norm_out")?,
+            conv_out: EncConv::load(model, "vvae.enc.conv_out", 1, 1)?,
+            quant: crate::dit::cmf_f32(model, "vvae.quant_conv.weight")?,
+            quant_b: crate::dit::cmf_f32(model, "vvae.quant_conv.bias")?,
+            latents_mean: crate::dit::cmf_f32(model, "vvae.latents_mean")?,
+            latents_std: crate::dit::cmf_f32(model, "vvae.latents_std")?,
+            pool: Pool::from_env(),
+            z_channels: cfg["z_channels"].as_u64().unwrap_or(24) as usize,
+            ratio: cfg["patch_size"].as_u64().unwrap_or(16) as usize,
+        })
+    }
+
+    /// One tile, unpadded: `[3, h, w]` → moments `[2·z, h/16, w/16]`.
+    fn encode_tile(&self, x: &[f32], h: usize, w: usize) -> (Vec<f32>, usize, usize) {
+        let pool = self.pool.as_deref();
+        let (mut cur, mut ch, mut cw) = self.conv_in.apply(x, h, w, pool);
+        let mut c = self.conv_in.out_ch;
+        for (blocks, down) in &self.levels {
+            for b in blocks {
+                let mut hh = cur.clone();
+                self.norm_out_like(&b.norm1, &mut hh, c, ch * cw);
+                for v in hh.iter_mut() {
+                    *v = silu(*v);
+                }
+                let (mut t, th, tw) = b.conv1.apply(&hh, ch, cw, pool);
+                let oc = b.conv1.out_ch;
+                self.norm_out_like(&b.norm2, &mut t, oc, th * tw);
+                for v in t.iter_mut() {
+                    *v = silu(*v);
+                }
+                let (t2, th2, tw2) = b.conv2.apply(&t, th, tw, pool);
+                let skip = match &b.shortcut {
+                    Some(s) => s.apply(&cur, ch, cw, pool).0,
+                    None => cur.clone(),
+                };
+                cur = t2.iter().zip(&skip).map(|(&a, &b)| a + b).collect();
+                (ch, cw, c) = (th2, tw2, oc);
+            }
+            if let Some(d) = down {
+                // reflect one row and column on the far side, as the
+                // reference does before its unpadded stride-2 kernel
+                let (padded, ph, pw) = reflect_pad_far(&cur, c, ch, cw);
+                let (t, th, tw) = d.apply(&padded, ph, pw, pool);
+                cur = t;
+                (ch, cw, c) = (th, tw, d.out_ch);
+            }
+        }
+        self.norm_out_like(&self.norm_out, &mut cur, c, ch * cw);
+        for v in cur.iter_mut() {
+            *v = silu(*v);
+        }
+        let (moments, mh, mw) = self.conv_out.apply(&cur, ch, cw, pool);
+        // quant_conv is 1x1x1: a per-position linear.
+        let n = 2 * self.z_channels;
+        let mut out = vec![0f32; n * mh * mw];
+        for o in 0..n {
+            for p in 0..mh * mw {
+                let mut acc = self.quant_b[o];
+                for i in 0..n {
+                    acc += self.quant[o * n + i] * moments[i * mh * mw + p];
+                }
+                out[o * mh * mw + p] = acc;
+            }
+        }
+        (out, mh, mw)
+    }
+
+    fn norm_out_like(&self, g: &GroupNorm, x: &mut [f32], ch: usize, hw: usize) {
+        g.apply(x, ch, hw);
+    }
+
+    /// A single frame in [-1, 1], `[3, h, w]` → normalized latents
+    /// `[z, h/16, w/16]`, spatially tiled exactly as the reference does.
+    pub fn encode_frame(&self, rgb: &[f32], h: usize, w: usize) -> (Vec<f32>, usize, usize) {
+        // [-1, 1] → [0, 1] → ImageNet-normalized, the reference's order.
+        let mut x = vec![0f32; 3 * h * w];
+        for c in 0..3 {
+            for p in 0..h * w {
+                let v = (rgb[c * h * w + p] + 1.0) * 0.5;
+                x[c * h * w + p] = (v - IMAGENET_MEAN[c]) / IMAGENET_STD[c];
+            }
+        }
+        let r = self.ratio;
+        let (ys, yl, yo) = split_tiles(h, r);
+        let (xs, xl, xo) = split_tiles(w, r);
+        let (zh, zw) = (h / r, w / r);
+        let zc = 2 * self.z_channels;
+        let mut rows: Vec<Vec<Vec<f32>>> = Vec::new();
+        let mut dims: Vec<Vec<(usize, usize)>> = Vec::new();
+        for (&ip, &il) in ys.iter().zip(&yl) {
+            let mut row = Vec::new();
+            let mut rd = Vec::new();
+            for (&jp, &jl) in xs.iter().zip(&xl) {
+                let mut sub = vec![0f32; 3 * il * jl];
+                for c in 0..3 {
+                    for yy in 0..il {
+                        let s = (c * h + ip + yy) * w + jp;
+                        let d = (c * il + yy) * jl;
+                        sub[d..d + jl].copy_from_slice(&x[s..s + jl]);
+                    }
+                }
+                let (t, th, tw) = self.encode_tile(&sub, il, jl);
+                row.push(t);
+                rd.push((th, tw));
+            }
+            rows.push(row);
+            dims.push(rd);
+        }
+        // Latent-space blend then trim, mirroring `tiled_encode`.
+        let mut canvas = vec![0f32; zc * zh * zw];
+        let mut out_y = 0usize;
+        for i in 0..rows.len() {
+            let mut out_x = 0usize;
+            let mut row_h = 0usize;
+            for j in 0..rows[i].len() {
+                let (th, tw) = dims[i][j];
+                let mut tile = rows[i][j].clone();
+                let (mut ch_, mut cw_) = (th, tw);
+                if i > 0 {
+                    tile = blend_plane(&rows[i - 1][j], &tile, zc, dims[i - 1][j], (ch_, cw_), yo[i - 1] / r, 0);
+                }
+                if j > 0 {
+                    tile = blend_plane(&rows[i][j - 1], &tile, zc, dims[i][j - 1], (ch_, cw_), xo[j - 1] / r, 1);
+                }
+                if i + 1 < rows.len() {
+                    tile = crop_plane(&tile, zc, ch_, cw_, 0, ch_ - yo[i] / r, 0, cw_);
+                    ch_ -= yo[i] / r;
+                }
+                if j + 1 < rows[i].len() {
+                    tile = crop_plane(&tile, zc, ch_, cw_, 0, ch_, 0, cw_ - xo[j] / r);
+                    cw_ -= xo[j] / r;
+                }
+                for c in 0..zc {
+                    for yy in 0..ch_ {
+                        let d = (c * zh + out_y + yy) * zw + out_x;
+                        let s = (c * ch_ + yy) * cw_;
+                        canvas[d..d + cw_].copy_from_slice(&tile[s..s + cw_]);
+                    }
+                }
+                out_x += cw_;
+                row_h = ch_;
+            }
+            out_y += row_h;
+        }
+        // The posterior MEAN is the first z channels; no sampling.
+        let mut z = vec![0f32; self.z_channels * zh * zw];
+        for c in 0..self.z_channels {
+            let (m, s) = (self.latents_mean[c], self.latents_std[c]);
+            for p in 0..zh * zw {
+                z[c * zh * zw + p] = (canvas[c * zh * zw + p] - m) / s;
+            }
+        }
+        (z, zh, zw)
+    }
+}
+
+/// Reflect one row and one column onto the far edge — `F.pad(x, (0,1,0,1))`.
+fn reflect_pad_far(x: &[f32], c: usize, h: usize, w: usize) -> (Vec<f32>, usize, usize) {
+    let (ph, pw) = (h + 1, w + 1);
+    let mut out = vec![0f32; c * ph * pw];
+    for ci in 0..c {
+        for y in 0..ph {
+            let sy = if y < h { y } else { h - 2 };
+            for x2 in 0..pw {
+                let sx = if x2 < w { x2 } else { w - 2 };
+                out[(ci * ph + y) * pw + x2] = x[(ci * h + sy) * w + sx];
+            }
+        }
+    }
+    (out, ph, pw)
+}
+
+/// Cross-fade `a`'s tail into `b`'s head over `extent`, `dim` 0 = y, 1 = x.
+fn blend_plane(
+    a: &[f32],
+    b: &[f32],
+    c: usize,
+    ad: (usize, usize),
+    bd: (usize, usize),
+    extent: usize,
+    dim: usize,
+) -> Vec<f32> {
+    let (ah, aw) = ad;
+    let (bh, bw) = bd;
+    let mut out = b.to_vec();
+    let e = if dim == 0 { extent.min(ah).min(bh) } else { extent.min(aw).min(bw) };
+    if e == 0 {
+        return out;
+    }
+    for ci in 0..c {
+        for k in 0..e {
+            let wb = k as f32 / e as f32;
+            let wa = 1.0 - wb;
+            if dim == 0 {
+                for x in 0..bw.min(aw) {
+                    let sa = (ci * ah + ah - e + k) * aw + x;
+                    let sb = (ci * bh + k) * bw + x;
+                    out[sb] = a[sa] * wa + b[sb] * wb;
+                }
+            } else {
+                for y in 0..bh.min(ah) {
+                    let sa = (ci * ah + y) * aw + aw - e + k;
+                    let sb = (ci * bh + y) * bw + k;
+                    out[sb] = a[sa] * wa + b[sb] * wb;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `[c, h, w]` sub-rectangle.
+#[allow(clippy::too_many_arguments)]
+fn crop_plane(x: &[f32], c: usize, h: usize, w: usize, y0: usize, y1: usize, x0: usize, x1: usize) -> Vec<f32> {
+    let (nh, nw) = (y1 - y0, x1 - x0);
+    let mut out = vec![0f32; c * nh * nw];
+    for ci in 0..c {
+        for y in 0..nh {
+            let s = (ci * h + y0 + y) * w + x0;
+            let d = (ci * nh + y) * nw;
+            out[d..d + nw].copy_from_slice(&x[s..s + nw]);
+        }
+    }
+    out
+}

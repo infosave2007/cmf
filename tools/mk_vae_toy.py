@@ -63,6 +63,16 @@ def video(comfyui, out_dir):
         dec = vae.decode(z)          # [-1, 1]
     rgb = (dec + 1.0) / 2.0          # what the port returns
 
+    # A single keyframe through the encoder — the only path fl2va needs,
+    # and the one where a causal 3-D kernel collapses to its last tap.
+    fh, fw = VID["lat_h"] * 16, VID["lat_w"] * 16
+    frame = torch.randn(1, 3, 1, fh, fw).clamp(-1, 1)
+    with torch.no_grad():
+        zf = vae.encode(frame)
+    frame.numpy().astype("<f4").tofile(os.path.join(out_dir, "frame_in.bin"))
+    zf.float().numpy().astype("<f4").tofile(os.path.join(out_dir, "frame_z.bin"))
+    print("encode", tuple(zf.shape), "rms", float(zf.pow(2).mean().sqrt()))
+
     from safetensors.torch import save_file
     save_file({k: v.contiguous() for k, v in sd.items()},
               os.path.join(out_dir, "video_vae.safetensors"))
@@ -70,7 +80,9 @@ def video(comfyui, out_dir):
     rgb.float().numpy().astype("<f4").tofile(os.path.join(out_dir, "video_rgb.bin"))
     print("video", tuple(dec.shape), "rms", float(rgb.pow(2).mean().sqrt()))
     return dict(VID, frames=int(dec.shape[2]),
-                height=int(dec.shape[3]), width=int(dec.shape[4]))
+                height=int(dec.shape[3]), width=int(dec.shape[4]),
+                frame_h=fh, frame_w=fw,
+                enc_zh=int(zf.shape[3]), enc_zw=int(zf.shape[4]))
 
 
 def audio(comfyui, out_dir):

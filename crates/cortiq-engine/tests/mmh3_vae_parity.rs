@@ -84,3 +84,23 @@ fn audio_decoder_matches_the_reference() {
     let mx = report("audio wav", &wav, &read_f32(&dir.join("audio_wav.bin")));
     assert!(mx < 2e-3, "audio decoder diverges: max {mx:.3e}");
 }
+
+#[test]
+fn keyframe_encoder_matches_the_reference() {
+    let Some((dir, meta)) = toy() else {
+        eprintln!("CMF_MMH3_VAE_TOY unset — skipping");
+        return;
+    };
+    let v = &meta["video"];
+    let u = |k: &str| v[k].as_u64().unwrap() as usize;
+    let model = Arc::new(cortiq_core::CmfModel::open(dir.join("vvae.cmf")).unwrap());
+    let enc = cortiq_engine::vae3d::VideoVaeEncoder::from_cmf(&model).unwrap();
+    let (z, zh, zw) = enc.encode_frame(
+        &read_f32(&dir.join("frame_in.bin")),
+        u("frame_h"),
+        u("frame_w"),
+    );
+    assert_eq!((zh, zw), (u("enc_zh"), u("enc_zw")), "latent shape");
+    let mx = report("keyframe z", &z, &read_f32(&dir.join("frame_z.bin")));
+    assert!(mx < 2e-3, "encoder diverges: max {mx:.3e}");
+}
