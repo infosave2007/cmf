@@ -32,6 +32,7 @@ pub mod pipeline;
 pub mod pool;
 pub mod qtensor;
 pub mod qwen3te;
+pub mod qwen3vis;
 pub mod router;
 pub mod runtime;
 pub mod sampler;

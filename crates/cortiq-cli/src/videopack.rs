@@ -900,6 +900,94 @@ fn pack_audio_vae(
     }))
 }
 
+/// Qwen3-VL's vision tower — the half of `fl2va` that rides in the text
+/// stream. It lives inside the prompt encoder's file under `visual.`,
+/// or at the top level of a standalone export.
+fn pack_vision(
+    specs: &mut Vec<TensorSpec>,
+    src: &StFile,
+    level: Level,
+    heads: usize,
+    deepstack_at: &[usize],
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let pre = if src.has("visual.patch_embed.proj.weight") {
+        "visual."
+    } else if src.has("patch_embed.proj.weight") {
+        ""
+    } else {
+        return Ok(None);
+    };
+    let n = (0..)
+        .take_while(|i| src.has(&format!("{pre}blocks.{i}.attn.qkv.weight")))
+        .count();
+    let hidden = src.shape(&format!("{pre}patch_embed.proj.weight")).unwrap()[0];
+    let pe = src.shape(&format!("{pre}patch_embed.proj.weight")).unwrap().to_vec();
+    // Conv3d over a whole patch IS a linear: flatten [o, in, t, ph, pw].
+    let flat: usize = pe[1..].iter().product();
+    let w = src.get(&format!("{pre}patch_embed.proj.weight"))?;
+    specs.push(spec("vis.patch_embed.weight".into(), &w, vec![hidden, flat], level));
+    push_exact(specs, src, &format!("{pre}patch_embed.proj.bias"), "vis.patch_embed.bias", Level::F32)?;
+    push_exact(specs, src, &format!("{pre}pos_embed.weight"), "vis.pos_embed.weight", Level::F32)?;
+    for i in 0..n {
+        let p = format!("{pre}blocks.{i}");
+        for (k, o) in [
+            ("attn.qkv", "attn.qkv"),
+            ("attn.proj", "attn.proj"),
+            ("mlp.linear_fc1", "mlp.linear_fc1"),
+            ("mlp.linear_fc2", "mlp.linear_fc2"),
+        ] {
+            push_exact(specs, src, &format!("{p}.{k}.weight"), &format!("vis.blocks.{i}.{o}.weight"), level)?;
+            push_exact(specs, src, &format!("{p}.{k}.bias"), &format!("vis.blocks.{i}.{o}.bias"), Level::F32)?;
+        }
+        for k in ["norm1", "norm2"] {
+            for t in ["weight", "bias"] {
+                push_exact(specs, src, &format!("{p}.{k}.{t}"), &format!("vis.blocks.{i}.{k}.{t}"), Level::F32)?;
+            }
+        }
+    }
+    let mut mergers = vec![(format!("{pre}merger"), "vis.merger".to_string())];
+    let n_deep = (0..)
+        .take_while(|k| src.has(&format!("{pre}deepstack_merger_list.{k}.norm.weight")))
+        .count();
+    for k in 0..n_deep {
+        mergers.push((
+            format!("{pre}deepstack_merger_list.{k}"),
+            format!("vis.deepstack.{k}"),
+        ));
+    }
+    for (from, to) in mergers {
+        for t in ["weight", "bias"] {
+            push_exact(specs, src, &format!("{from}.norm.{t}"), &format!("{to}.norm.{t}"), Level::F32)?;
+        }
+        for k in ["linear_fc1", "linear_fc2"] {
+            push_exact(specs, src, &format!("{from}.{k}.weight"), &format!("{to}.{k}.weight"), level)?;
+            push_exact(specs, src, &format!("{from}.{k}.bias"), &format!("{to}.{k}.bias"), Level::F32)?;
+        }
+    }
+    let out_hidden = src.shape(&format!("{pre}merger.linear_fc2.weight")).unwrap()[0];
+    let inter = src.shape(&format!("{pre}blocks.0.mlp.linear_fc1.weight")).unwrap()[0];
+    // The patch geometry is in the embedding kernel [o, in, t, ph, pw],
+    // and the merge factor falls out of the merger's input width. The
+    // head count and which layers feed the deepstack are architecture,
+    // written nowhere in the weights — hence the flags.
+    let (temporal, patch_size) = (pe[2], pe[3]);
+    let merge_dim = src.shape(&format!("{pre}merger.linear_fc1.weight")).unwrap()[1];
+    let merge = ((merge_dim / hidden) as f64).sqrt().round() as usize;
+    let deep: Vec<usize> = deepstack_at.iter().copied().filter(|&d| d < n).collect();
+    if deep.len() != n_deep {
+        return Err(anyhow!(
+            "--vis-deepstack lists {} usable layers but the checkpoint has {n_deep} mergers",
+            deep.len()
+        ));
+    }
+    Ok(Some(serde_json::json!({
+        "hidden_size": hidden, "intermediate_size": inter, "depth": n,
+        "num_heads": heads, "patch_size": patch_size,
+        "temporal_patch_size": temporal, "spatial_merge_size": merge,
+        "out_hidden_size": out_hidden, "deepstack_visual_indexes": deep,
+    })))
+}
+
 fn config_spec(prefix: &str, cfg: &serde_json::Value) -> TensorSpec {
     let raw = serde_json::to_vec(cfg).expect("config json");
     TensorSpec {
@@ -925,6 +1013,9 @@ pub struct PackArgs<'a> {
     pub tokenizer: Option<&'a str>,
     pub quant: &'a str,
     pub vvae_heads: usize,
+    pub vision: Option<&'a str>,
+    pub vis_heads: usize,
+    pub vis_deepstack: Vec<usize>,
 }
 
 pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
@@ -963,6 +1054,17 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
             prov.insert("lora_scale".into(), serde_json::json!(args.lora_scale));
         }
         eprintln!("dit packed ({:.1}s)", t0.elapsed().as_secs_f64());
+    }
+    if let Some(p) = args.vision {
+        let src = StFile::open(Path::new(p))?;
+        match pack_vision(&mut specs, &src, level, args.vis_heads, &args.vis_deepstack)? {
+            Some(cfg) => {
+                specs.push(config_spec("vis", &cfg));
+                prov.insert("vision".into(), serde_json::json!(p));
+                eprintln!("vision tower packed ({:.1}s)", t0.elapsed().as_secs_f64());
+            }
+            None => return Err(anyhow!("{p}: no vision tower (no patch_embed.proj)")),
+        }
     }
     if let Some(p) = args.video_vae {
         let cfg = pack_video_vae(&mut specs, Path::new(p), level, args.vvae_heads)?;
