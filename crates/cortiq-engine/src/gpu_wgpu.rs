@@ -9254,6 +9254,7 @@ struct Ctx {
     q4t_mv8: wgpu::ComputePipeline,
     q4b_mv8: wgpu::ComputePipeline,
     q4tp_mm: wgpu::ComputePipeline,
+    q4tp_mm_coop: Option<wgpu::ComputePipeline>,
     argmax_part: wgpu::ComputePipeline,
     gdn_step_par: wgpu::ComputePipeline,
     gdn_step_norm: wgpu::ComputePipeline,
@@ -9770,6 +9771,17 @@ fn init() -> Result<Ctx, String> {
     };
     let want_ts = have_basic;
     let want_sg = adapter.features().contains(wgpu::Features::SUBGROUP);
+    // Tensor cores — OPT-IN, and off by default because the only shape
+    // wgpu 30 exposes is 8x8 f32. NVIDIA's units want f16 at 16x16; asked
+    // for 8x8 f32 this driver falls back to something so slow the render
+    // went from 0.68 to 52 seconds a step and the isolated GEMM did not
+    // finish at all. The kernel below is kept, and `CMF_COOP=1` runs it,
+    // for the day the runtime exposes a shape the hardware wants.
+    let want_coop = adapter
+        .features()
+        .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        && std::env::var("CMF_COOP").is_ok_and(|v| v != "0");
+    COOP_OK.store(want_coop, std::sync::atomic::Ordering::Relaxed);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cortiq-wgpu"),
         required_limits: limits,
@@ -9779,6 +9791,10 @@ fn init() -> Result<Ctx, String> {
             wgpu::Features::empty()
         } | if want_sg {
             wgpu::Features::SUBGROUP
+        } else {
+            wgpu::Features::empty()
+        } | if want_coop {
+            wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
         } else {
             wgpu::Features::empty()
         },
@@ -9910,6 +9926,36 @@ fn init() -> Result<Ctx, String> {
     let q4t_mv8 = pipe("q4t_matvec8");
     let q4b_mv8 = pipe("q4b_matvec8");
     let q4tp_mm = pipe("q4tp_mul_mm");
+    // The tensor-core GEMM lives in its own module: its `enable` directive
+    // does not parse without the feature, so a device that lacks it must
+    // never be handed the source.
+    let q4tp_mm_coop = want_coop.then(|| {
+        let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("q4tp-coop"),
+            source: wgpu::ShaderSource::Wgsl(COOP_MM_SRC.into()),
+        });
+        if let Some(e) = pollster::block_on(sc.pop()) {
+            tracing::warn!("cooperative-matrix module rejected: {e}");
+            COOP_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("q4tp_mm_coop"),
+            layout: None,
+            module: &m,
+            entry_point: Some("q4tp_mm_coop"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        if let Some(e) = pollster::block_on(sc.pop()) {
+            tracing::warn!("cooperative-matrix pipeline rejected: {e}");
+            COOP_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        Some(p)
+    }).flatten();
     let argmax_part = pipe("argmax_part");
     let gdn_step_par = pipe("gdn_step_par");
     let gdn_step_par2 = pipe("gdn_step_par2");
@@ -10193,6 +10239,7 @@ fn init() -> Result<Ctx, String> {
         q4t_mv8,
         q4b_mv8,
         q4tp_mm,
+        q4tp_mm_coop,
         argmax_part,
         gdn_step_par,
         gdn_step_par2,
@@ -17596,6 +17643,159 @@ impl FlatDispatch for wgpu::ComputePass<'_> {
     }
 }
 
+/// The q4tp GEMM on cooperative matrices — tensor cores on NVIDIA,
+/// simdgroup matrices on Apple. Kept in its own module because the
+/// `enable` directive below is a parse error on a device that does not
+/// offer the feature, so it must never reach one.
+///
+/// The shape: a workgroup of 256 threads is eight subgroups; the output
+/// tile is 64 tokens by 64 weight rows; subgroup `s` owns rows
+/// `s*8 .. s*8+8` and holds eight 8x8 accumulators across the 64 columns.
+/// Weights are staged dequantized, as in the scalar kernel — the matrix
+/// units want f32 planes, not nibbles.
+#[cfg(feature = "gpu")]
+const COOP_MM_SRC: &str = r#"
+enable wgpu_cooperative_matrix;
+
+struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read> qmm: array<u32>;
+@group(0) @binding(1) var<storage, read> xmm4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
+@group(0) @binding(3) var<uniform> pmm: MmP;
+
+const KS: u32 = 32u;
+const AS: u32 = 32u;
+
+var<workgroup> cm_at: array<f32, 64u * 32u>;
+var<workgroup> cm_wt: array<f32, 64u * 32u>;
+
+fn qmm_byte(off: u32) -> u32 {
+    return (qmm[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+@compute @workgroup_size(256)
+fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) tid: u32) {
+    let cols = pmm.cols4 * 4u;
+    let gpr = cols >> 5u;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    let sg = tid / 32u;
+
+    var c0 = coop_mat8x8<f32, C>(0.0);
+    var c1 = coop_mat8x8<f32, C>(0.0);
+    var c2 = coop_mat8x8<f32, C>(0.0);
+    var c3 = coop_mat8x8<f32, C>(0.0);
+    var c4 = coop_mat8x8<f32, C>(0.0);
+    var c5 = coop_mat8x8<f32, C>(0.0);
+    var c6 = coop_mat8x8<f32, C>(0.0);
+    var c7 = coop_mat8x8<f32, C>(0.0);
+
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        // 64 rows x 32 k of each side, eight values a thread.
+        for (var t = tid; t < 64u * 8u; t = t + 256u) {
+            let m = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            var xv = vec4<f32>(0.0);
+            let col0 = k0 + k4;
+            if (m0 + m < pmm.nb && col0 < cols) {
+                xv = xmm4[((m0 + m) * cols + col0) >> 2u];
+            }
+            let dst = m * AS + k4;
+            cm_at[dst] = xv.x; cm_at[dst + 1u] = xv.y;
+            cm_at[dst + 2u] = xv.z; cm_at[dst + 3u] = xv.w;
+        }
+        for (var t = tid; t < 64u * 8u; t = t + 256u) {
+            let n = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            var wv = vec4<f32>(0.0);
+            let col0 = k0 + k4;
+            if (n0 + n < pmm.rows && col0 < cols) {
+                let g = col0 >> 5u;
+                let wrow = n0 + n;
+                let params_b = pmm.rows * gpr * 16u;
+                let codes_b = params_b + pmm.rows * 4u;
+                let cstride = (gpr * 5u + 7u) / 8u;
+                let bit = g * 5u;
+                let cb = codes_b + wrow * cstride + (bit >> 3u);
+                let sh = bit & 7u;
+                var cv = qmm_byte(cb);
+                if (sh > 3u) { cv = cv | (qmm_byte(cb + 1u) << 8u); }
+                let pr = unpack2x16float(qmm[(params_b >> 2u) + wrow]);
+                let scale = exp2(pr.x + f32((cv >> sh) & 31u) * pr.y);
+                let toff = (wrow * gpr + g) * 16u;
+                let p = col0 - g * 32u;
+                let bo = toff + p / 2u;
+                let w32 = qmm[bo >> 2u];
+                let sh0 = (bo & 3u) * 8u;
+                let b0 = (w32 >> sh0) & 0xFFu;
+                var b1 = 0u;
+                if ((bo & 3u) == 3u) {
+                    b1 = qmm[(bo >> 2u) + 1u] & 0xFFu;
+                } else {
+                    b1 = (w32 >> (sh0 + 8u)) & 0xFFu;
+                }
+                wv[0u] = (f32(b0 & 0xFu) - 8.0) * scale;
+                wv[1u] = (f32(b0 >> 4u) - 8.0) * scale;
+                wv[2u] = (f32(b1 & 0xFu) - 8.0) * scale;
+                wv[3u] = (f32(b1 >> 4u) - 8.0) * scale;
+            }
+            let dst = n * AS + k4;
+            cm_wt[dst] = wv.x; cm_wt[dst + 1u] = wv.y;
+            cm_wt[dst + 2u] = wv.z; cm_wt[dst + 3u] = wv.w;
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < KS; kk = kk + 8u) {
+            let a = coopLoad<coop_mat8x8<f32, A>>(&cm_at[sg * 8u * AS + kk], AS);
+            // The weight tile is row-major in n, and the B role wants
+            // K x N — hence the transposed load.
+            c0 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[0u * 8u * AS + kk], AS), c0);
+            c1 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[1u * 8u * AS + kk], AS), c1);
+            c2 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[2u * 8u * AS + kk], AS), c2);
+            c3 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[3u * 8u * AS + kk], AS), c3);
+            c4 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[4u * 8u * AS + kk], AS), c4);
+            c5 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[5u * 8u * AS + kk], AS), c5);
+            c6 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[6u * 8u * AS + kk], AS), c6);
+            c7 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[7u * 8u * AS + kk], AS), c7);
+        }
+        workgroupBarrier();
+        k0 = k0 + KS;
+    }
+    // Land the tile in shared memory, then copy out under bounds checks:
+    // a cooperative store cannot mask an edge tile.
+    workgroupBarrier();
+    coopStore(c0, &cm_at[sg * 8u * AS + 0u], AS);
+    coopStore(c1, &cm_at[sg * 8u * AS + 8u], AS);
+    coopStore(c2, &cm_at[sg * 8u * AS + 16u], AS);
+    coopStore(c3, &cm_at[sg * 8u * AS + 24u], AS);
+    coopStore(c4, &cm_wt[sg * 8u * AS + 0u], AS);
+    coopStore(c5, &cm_wt[sg * 8u * AS + 8u], AS);
+    coopStore(c6, &cm_wt[sg * 8u * AS + 16u], AS);
+    coopStore(c7, &cm_wt[sg * 8u * AS + 24u], AS);
+    workgroupBarrier();
+    for (var t = tid; t < 64u * 64u; t = t + 256u) {
+        let m = t / 64u;
+        let n = t % 64u;
+        if (m0 + m < pmm.nb && n0 + n < pmm.rows) {
+            var v = 0.0;
+            if (n < 32u) { v = cm_at[m * AS + n]; } else { v = cm_wt[m * AS + n - 32u]; }
+            ymm[(m0 + m) * pmm.rows + n0 + n] = v;
+        }
+    }
+}
+"#;
+
+/// Did the device come up with cooperative matrices? Read by the GEMM to
+/// pick its pipeline, and by the shader-module builder to decide whether
+/// the tensor-core source can be compiled at all.
+static COOP_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn coop_matrix_active() -> bool {
+    COOP_OK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[inline]
 fn begin_pass(enc: &mut wgpu::CommandEncoder) -> wgpu::ComputePass<'_> {
     PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -18070,6 +18270,18 @@ fn encode_q4_tile_mm(
         (k as u32).div_ceil(64),
         1,
     );
+}
+
+/// The GEMM pipeline to use for this weight layout: the tensor-core one
+/// when the device brought it up, the scalar one otherwise.
+fn mm_pipeline<'a>(c: &'a Ctx, q4tp: bool) -> &'a wgpu::ComputePipeline {
+    if q4tp {
+        if let Some(p) = c.q4tp_mm_coop.as_ref() {
+            return p;
+        }
+        return &c.q4tp_mm;
+    }
+    &c.q4t_mm
 }
 
 fn encode_q1_mm(
@@ -20063,6 +20275,37 @@ mod tests {
         std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
     }
 
+    /// What the selected adapter offers for matrix math: cooperative
+    /// (tensor-core) matrices and f16. Run:
+    /// `cargo test -p cortiq-engine --release --features gpu
+    ///  wgpu_matrix_features -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn wgpu_matrix_features() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let inst = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: Default::default(),
+            backend_options: Default::default(),
+            display: None,
+        });
+        for a in pollster::block_on(inst.enumerate_adapters(wgpu::Backends::all())) {
+            let info = a.get_info();
+            let f = a.features();
+            let l = a.limits();
+            println!(
+                "{:?} {} | coop_matrix {} | f16 {} | subgroup {} | wg storage {} B",
+                info.backend,
+                info.name,
+                f.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX),
+                f.contains(wgpu::Features::SHADER_F16),
+                f.contains(wgpu::Features::SUBGROUP),
+                l.max_compute_workgroup_storage_size,
+            );
+        }
+    }
+
     /// The DiT's own GEMM shape, on the device, with nothing else in the
     /// submission: 9216x2304 weights against 2085 tokens, the Lumina FFN
     /// at 512x512. Iterating on the kernel through a full render measures
@@ -20123,7 +20366,7 @@ mod tests {
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             for _ in 0..reps {
-                encode_q4_tile_mm(c, &mut enc, &c.q4tp_mm, &wbuf, &xbuf, &ybuf, rows, cols, n);
+                encode_q4_tile_mm(c, &mut enc, mm_pipeline(c, true), &wbuf, &xbuf, &ybuf, rows, cols, n);
             }
             c.queue.submit(Some(enc.finish()));
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
@@ -25956,7 +26199,7 @@ pub fn dit_block_seg(
         b
     };
     let u4 = |v: [u32; 4]| uniform_u32x4(c, v);
-    let mm = if a.q4tp { &c.q4tp_mm } else { &c.q4t_mm };
+    let mm = mm_pipeline(c, a.q4tp);
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dit-block") });
