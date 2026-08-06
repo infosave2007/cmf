@@ -119,8 +119,34 @@ fn vbit_row_offsets(bytes: &[u8], rows: usize, cols: usize) -> Vec<usize> {
 /// change under a running process, which is not a thing a kernel choice
 /// should be able to do mid-sequence.
 fn blocked_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true))
+    use std::sync::atomic::Ordering::Relaxed;
+    match BLOCKED_OVERRIDE.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true)
+            })
+        }
+    }
+}
+
+static BLOCKED_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force the blocked GEMM on or off, ignoring the environment; `None`
+/// restores it. For tests that need to run BOTH paths and compare them:
+/// `blocked_enabled` caches its answer for the life of the process, which
+/// is right when the environment is the only input, but leaves a test that
+/// flips `CMF_X86_BLOCKED` between two calls comparing a path against
+/// itself — or against whatever a test running in parallel latched first.
+pub fn set_blocked_override(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    BLOCKED_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn gpu_lmhead_enabled() -> bool {
@@ -4171,6 +4197,7 @@ unsafe fn dot_q4tp_row_avx2(nib: &[u8], r: usize, gpr: usize, xq: &[i8], scales:
     }
 }
 
+
 /// VNNI twin of `dot_q4tp_row_avx2` (see `dot_q4t_row_vnni` for why the
 /// 256-bit VL encoding is the one to use here).
 #[cfg(target_arch = "x86_64")]
@@ -4425,11 +4452,6 @@ fn q2tp_matmat(
     dispatch_rows(pool, rows, &run);
 }
 
-/// Four batch columns against one q4tp row: the tile is unpacked ONCE and
-/// spent on four activation streams, which is where a prefill batch stops
-/// being weight-bandwidth-bound. Twin of `dot_q4t_row_1x4_sdot`.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon,dotprod")]
 /// The pre-vectorised shape, kept for A/B (`CMF_Q4TP_V1=1`): the
 /// horizontal add lands once per group per column instead of once per
 /// row. Same weights, same activations — only the reduction differs.
@@ -4479,13 +4501,142 @@ unsafe fn dot_q4tp_row_1x4_sdot_v1(
     }
 }
 
-/// `CMF_Q4TP_V1=1` picks the old reduction shape (A/B only).
-#[cfg(target_arch = "aarch64")]
-fn q4tp_v1() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_Q4TP_V1").is_ok_and(|v| v != "0"))
+/// Which q4tp batch kernel to run: 1 = the previous one, 2 = the tuned
+/// one, 0 = decide from the CPU. An atomic rather than a `OnceLock` so a
+/// benchmark can alternate the two inside one process, where the machine's
+/// mood — a shared box drifts ±25% between runs — is the same for both.
+/// What the two mean is per-architecture: on x86 the blocked AVX-512 path
+/// against the per-column one, on ARM the two reduction shapes.
+#[allow(dead_code)]
+static Q4TP_ALT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Blocking pays on x86 only with 512-bit VNNI. With AVX2 alone, four
+/// columns sharing an unpack still measured slower than the per-column
+/// path (23.2 ms against 19.4 on a 48-thread EPYC), because that path
+/// already dequantizes the row once — so the blocked kernel bought a
+/// second unpack-free pass at the price of half the vector width.
+#[cfg(target_arch = "x86_64")]
+fn q4tp_blocked_x86() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match Q4TP_ALT.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = blocked_enabled() && avx512vnni_enabled();
+            Q4TP_ALT.store(1 + on as u8, Relaxed);
+            on
+        }
+    }
 }
 
+/// `CMF_Q4TP_V1=1` picks the old reduction shape (A/B only).
+#[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
+fn q4tp_v1() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match Q4TP_ALT.load(Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let v1 = std::env::var("CMF_Q4TP_V1").is_ok_and(|v| v != "0");
+            Q4TP_ALT.store(2 - v1 as u8, Relaxed);
+            v1
+        }
+    }
+}
+
+/// The same four columns, 512 bits wide. Two groups (64 weights) ride one
+/// unpack and one `vpdpbusd`, where AVX2 needs two unpacks and four
+/// `maddubs`/`madd` pairs — about 2.3x fewer instructions for the same
+/// arithmetic. The two groups carry different scales, so the fma takes a
+/// vector whose halves hold each group's scale rather than a broadcast.
+///
+/// There is no 512-bit `vpsignb`, so the activation's sign is applied by
+/// negating under a mask taken from the weight's sign bits. That mask is
+/// per-tile, so it is hoisted out of the column loop and the per-column
+/// cost stays exactly one instruction, as with `sign_epi8`. Weights of
+/// zero are not zeroed by the mask trick and do not need to be: their
+/// magnitude is zero, so the product is.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn dot_q4tp_row_1x4_avx512(
+    nib: &[u8],
+    r: usize,
+    gpr: usize,
+    xs: [&[i8]; 4],
+    scales: &[f32],
+) -> [f32; 4] {
+    // SAFETY: as dot_q4tp_row_1x4_avx2; caller guarantees the ISA.
+    unsafe {
+        use core::arch::x86_64::*;
+        let lomask = _mm256_set1_epi8(0x0F);
+        let eight = _mm256_set1_epi8(8);
+        let zero = _mm512_setzero_si512();
+        let (mut v0, mut v1, mut v2, mut v3) = (
+            _mm512_setzero_ps(),
+            _mm512_setzero_ps(),
+            _mm512_setzero_ps(),
+            _mm512_setzero_ps(),
+        );
+        let pairs = gpr / 2;
+        for gp in 0..pairs {
+            let gi = gp * 2;
+            let t = nib.as_ptr().add((r * gpr + gi) * Q4TP_NIB);
+            let bb = _mm256_loadu_si256(t as *const __m256i);
+            let lo = _mm256_and_si256(bb, lomask);
+            let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(bb), lomask);
+            // `unpack` works per 128-bit lane, so the halves come out as
+            // [A.lo, B.lo] and [A.hi, B.hi]; the shuffle reorders the four
+            // 128-bit lanes into the weights' natural order, which is what
+            // the straight activation load expects.
+            let ul = _mm256_sub_epi8(_mm256_unpacklo_epi8(lo, hi), eight);
+            let uh = _mm256_sub_epi8(_mm256_unpackhi_epi8(lo, hi), eight);
+            let cat = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(ul), uh);
+            let w = _mm512_shuffle_i64x2::<0b11_01_10_00>(cat, cat);
+            let wabs = _mm512_abs_epi8(w);
+            let neg = _mm512_movepi8_mask(w);
+            let off = gi * GROUP_SIZE;
+            let sv = _mm512_insertf32x8::<1>(
+                _mm512_castps256_ps512(_mm256_set1_ps(*scales.get_unchecked(gi))),
+                _mm256_set1_ps(*scales.get_unchecked(gi + 1)),
+            );
+            let dot = |x: &[i8]| -> __m512 {
+                let xv = _mm512_loadu_si512(x.as_ptr().add(off) as *const __m512i);
+                let sx = _mm512_mask_sub_epi8(xv, neg, zero, xv);
+                _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(zero, wabs, sx))
+            };
+            v0 = _mm512_fmadd_ps(dot(xs[0]), sv, v0);
+            v1 = _mm512_fmadd_ps(dot(xs[1]), sv, v1);
+            v2 = _mm512_fmadd_ps(dot(xs[2]), sv, v2);
+            v3 = _mm512_fmadd_ps(dot(xs[3]), sv, v3);
+        }
+        let mut acc = [
+            _mm512_reduce_add_ps(v0),
+            _mm512_reduce_add_ps(v1),
+            _mm512_reduce_add_ps(v2),
+            _mm512_reduce_add_ps(v3),
+        ];
+        // An odd group count leaves one group over; the narrow kernel
+        // finishes it rather than the tail being a special case here.
+        if gpr % 2 == 1 {
+            let off = (gpr - 1) * GROUP_SIZE;
+            for j in off..off + GROUP_SIZE {
+                let (w, s) = q4tp_outlier(nib, r, gpr, j, scales);
+                let ws = w * s;
+                for k in 0..4 {
+                    acc[k] += ws * *xs[k].get_unchecked(j) as f32;
+                }
+            }
+        }
+        acc
+    }
+}
+
+/// Four batch columns against one q4tp row: the tile is unpacked ONCE and
+/// spent on four activation streams, which is where a prefill batch stops
+/// being weight-bandwidth-bound. Twin of `dot_q4t_row_1x4_sdot`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
 unsafe fn dot_q4tp_row_1x4_sdot(
     nib: &[u8],
     r: usize,
@@ -4614,13 +4765,44 @@ fn q4tp_matmat(
         let acts = &acts;
         #[cfg(target_arch = "aarch64")]
         let blocked_ok = sdot_enabled() && blocked_enabled();
-        #[cfg(not(target_arch = "aarch64"))]
+        // x86 gets the same blocking: one tile unpack spent on four
+        // columns. Without it every column re-decoded the row, which is
+        // why a 48-core EPYC measured a sixth of an M4's per-core rate.
+        // The gate is `avx2_enabled`, as in q4t — `sdot_enabled` answers
+        // for ARM's dotprod and is hard-wired false everywhere else, so
+        // asking it here left the whole blocked path unreachable on x86.
+        #[cfg(target_arch = "x86_64")]
+        let blocked_ok = q4tp_blocked_x86();
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let blocked_ok = false;
         let run = |start: usize, end: usize| {
             let mut sc = vec![0f32; gpr];
             for r in start..end {
                 v.scales_into(r, gpr, &mut sc);
                 let mut bi = 0usize;
+                #[cfg(target_arch = "x86_64")]
+                if blocked_ok {
+                    while bi + 4 <= acts.len() {
+                        let xs = [
+                            acts[bi].xq.as_slice(),
+                            acts[bi + 1].xq.as_slice(),
+                            acts[bi + 2].xq.as_slice(),
+                            acts[bi + 3].xq.as_slice(),
+                        ];
+                        let d = unsafe { dot_q4tp_row_1x4_avx512(v.nib, r, gpr, xs, &sc) };
+                        for k in 0..4 {
+                            let act = &acts[bi + k];
+                            let mut acc = d[k] * act.sx;
+                            for &(j, xv) in &act.outliers {
+                                let (w, s) = q4tp_outlier(v.nib, r, gpr, j, &sc);
+                                acc += w * s * xv;
+                            }
+                            // SAFETY: disjoint (bi, r) cells per worker.
+                            unsafe { *out_addr.at((bi + k) * rows + r) = acc };
+                        }
+                        bi += 4;
+                    }
+                }
                 #[cfg(target_arch = "aarch64")]
                 if blocked_ok {
                     while bi + 4 <= acts.len() {
@@ -10423,6 +10605,11 @@ mod q4tp_bench {
     /// (b=296 tokens, 2304 -> 9216), on synthetic bytes: no model, no
     /// mmap, no thermal drift over minutes — a kernel change shows up
     /// here in seconds where a full render hides it in noise.
+    ///
+    /// On macOS add `CMF_ACCEL=0`: this shape is over the 500k-cell mark
+    /// where the matmat hands off to Accelerate's dequant sgemm, and
+    /// without the opt-out both rows below measure the AMX, not the
+    /// kernel under test.
     #[test]
     #[ignore]
     fn q4tp_matmat_throughput() {
@@ -10453,20 +10640,154 @@ mod q4tp_bench {
             .collect();
         let mut out = vec![0f32; b * rows];
         let pool = crate::pool::Pool::from_env();
-        // Warm the caches, then time three passes.
+        // A shared 48-core stand drifts ±25% run to run, which is wider
+        // than any kernel change worth making. So: alternate the two
+        // kernels inside one process and keep the BEST time for
+        // each. Interleaving makes both see the same interference, and a
+        // minimum is the one statistic another tenant cannot inflate.
         super::q4tp_matmat(&bytes, &xs, b, rows, cols, &mut out, pool.as_deref());
-        let mut best = f64::MAX;
-        for _ in 0..3 {
-            let t = std::time::Instant::now();
-            super::q4tp_matmat(&bytes, &xs, b, rows, cols, &mut out, pool.as_deref());
-            best = best.min(t.elapsed().as_secs_f64());
+        let reps: usize = std::env::var("CMF_BENCH_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let mut best = [f64::MAX; 2];
+        let mut sums = [0f32; 2];
+        for _ in 0..reps {
+            for (k, w) in [(0usize, 1u8), (1usize, 2u8)] {
+                super::Q4TP_ALT.store(w, std::sync::atomic::Ordering::Relaxed);
+                let t = std::time::Instant::now();
+                super::q4tp_matmat(&bytes, &xs, b, rows, cols, &mut out, pool.as_deref());
+                best[k] = best[k].min(t.elapsed().as_secs_f64());
+                sums[k] = out.iter().take(64).sum::<f32>();
+            }
         }
         let flops = 2.0 * b as f64 * rows as f64 * cols as f64;
-        println!(
-            "q4tp matmat {rows}x{cols} b={b}: {:.1} ms  {:.1} GFLOP/s  (checksum {:.3})",
-            best * 1e3,
-            flops / best / 1e9,
-            out.iter().take(64).sum::<f32>()
+        for (k, name) in ["previous", "tuned   "].iter().enumerate() {
+            println!(
+                "q4tp matmat {rows}x{cols} b={b} {name}: {:.1} ms  {:.1} GFLOP/s  (checksum {:.3})",
+                best[k] * 1e3,
+                flops / best[k] / 1e9,
+                sums[k]
+            );
+        }
+        assert!(
+            (sums[0] - sums[1]).abs() < 1e-2,
+            "the tuned kernel changed the result: {} vs {}",
+            sums[0],
+            sums[1]
         );
+    }
+
+    /// The blocked kernel must agree with the per-column path exactly —
+    /// same weights, same activation split, only a different instruction
+    /// mix. Shapes are chosen to hit the awkward cases: a column count
+    /// that leaves an odd group (the 512-bit kernel does two at a time),
+    /// and a batch that does not divide by four.
+    #[test]
+    fn q4tp_matmat_blocked_matches_scalar() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // The last shape carries the image DiT's column count — 2304, so
+        // 72 groups of accumulation, which is where a reordered sum can
+        // actually drift — and runs through the thread pool, since the
+        // blocked path splits rows across workers. Its row count stays
+        // under 500k cells on purpose: above that, macOS diverts the whole
+        // matmat to the Accelerate/AMX dequant sgemm and neither kernel
+        // here would run.
+        for &(rows, cols, b) in &[
+            (64usize, 128usize, 7usize),
+            (33, 96, 4),
+            (16, 256, 9),
+            (192, 2304, 37),
+        ] {
+            let total = cortiq_core::quant::expected_nbytes(
+                cortiq_core::TensorDtype::Q4TiledP,
+                &[rows, cols],
+            )
+            .unwrap();
+            let (params_off, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+            let mut bytes: Vec<u8> = (0..total).map(|i| (i * 61 % 251) as u8).collect();
+            let lo = cortiq_core::quant::f32_to_f16(-4.0);
+            let step = cortiq_core::quant::f32_to_f16(0.1);
+            for r in 0..rows {
+                let o = params_off + r * 4;
+                bytes[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+                bytes[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+            }
+            let xs: Vec<f32> = (0..b * cols)
+                .map(|i| ((i % 89) as f32 - 44.0) / 44.0)
+                .collect();
+            let mut got = vec![0f32; b * rows];
+            let mut want = vec![0f32; b * rows];
+            let gpr = cols / 32;
+            let view = super::Q4tpView::new(&bytes, rows, cols);
+            let pool = crate::pool::Pool::from_env();
+            super::Q4TP_ALT.store(2, Relaxed);
+            super::q4tp_matmat(&bytes, &xs, b, rows, cols, &mut got, pool.as_deref());
+            super::Q4TP_ALT.store(1, Relaxed);
+            super::q4tp_matmat(&bytes, &xs, b, rows, cols, &mut want, pool.as_deref());
+            super::Q4TP_ALT.store(0, Relaxed);
+            // Measured against the output's scale, not cell by cell: a
+            // dot product of 2304 terms lands near zero wherever the row
+            // and the activation nearly cancel, and there a per-cell
+            // ratio reports 1e-3 for an absolute error of 5e-6 — f32's
+            // own rounding, reordered. What must stay small is the error
+            // relative to what the layer actually outputs.
+            let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let (mut worst, mut at) = (0f32, 0usize);
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                if (g - w).abs() > worst {
+                    worst = (g - w).abs();
+                    at = i;
+                }
+            }
+            assert!(
+                worst <= 1e-4 * scale,
+                "{rows}x{cols} b={b}: blocked and scalar disagree by {worst:.3e} \
+                 (scale {scale:.3e}) at cell {at}: {} vs {}",
+                got[at],
+                want[at]
+            );
+
+            // "Same speed, no quality loss" is a claim about which answer
+            // is RIGHT, not about which two agree. Both paths sum the same
+            // 2304 products in different orders, so f64 decides: the
+            // blocked kernel keeps sixteen partial sums and folds them at
+            // the end, which is a shallower addition tree than the
+            // per-column path's running scalar, and it must not be worse.
+            let (mut e_blocked, mut e_scalar) = (0f64, 0f64);
+            for bi in 0..b {
+                let act = super::split_act(&xs[bi * cols..(bi + 1) * cols]);
+                for r in 0..rows {
+                    let mut sc = vec![0f32; gpr];
+                    view.scales_into(r, gpr, &mut sc);
+                    let mut exact = 0f64;
+                    for j in 0..cols {
+                        let (w, sq) = super::q4tp_outlier(view.nib, r, gpr, j, &sc);
+                        exact += w as f64 * sq as f64 * act.xq[j] as f64;
+                    }
+                    exact *= act.sx as f64;
+                    for &(j, xv) in &act.outliers {
+                        let (w, sq) = super::q4tp_outlier(view.nib, r, gpr, j, &sc);
+                        exact += w as f64 * sq as f64 * xv as f64;
+                    }
+                    let i = bi * rows + r;
+                    e_blocked = e_blocked.max((got[i] as f64 - exact).abs());
+                    e_scalar = e_scalar.max((want[i] as f64 - exact).abs());
+                }
+            }
+            println!(
+                "{rows}x{cols} b={b}: worst error vs f64 — blocked {e_blocked:.3e}, \
+                 per-column {e_scalar:.3e}"
+            );
+            // An absolute bar, not a race between the two: at these
+            // magnitudes both sit in f32's last bits, and on a small shape
+            // whichever one happens to round the unluckiest cell "wins" by
+            // a factor the next seed reverses.
+            assert!(
+                e_blocked <= 1e-5 * scale as f64 && e_scalar <= 1e-5 * scale as f64,
+                "{rows}x{cols} b={b}: error against f64 too large — blocked \
+                 {e_blocked:.3e}, per-column {e_scalar:.3e}, scale {scale:.3e}"
+            );
+        }
     }
 }
