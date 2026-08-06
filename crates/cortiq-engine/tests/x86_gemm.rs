@@ -7,8 +7,14 @@
 use cortiq_core::quant::f32_to_f16;
 use cortiq_core::*;
 
+/// The switch these tests flip is process-global, so they take turns.
+/// Poisoning is ignored deliberately: one test failing its assertion must
+/// not turn the other three into a second, misleading failure.
+static GEMM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn blocked_vs_per_row() {
+    let _serial = GEMM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // On Apple silicon the AMX/Accelerate GEMM would intercept this
     // shape — force the portable SDOT batch path (the mobile prefill).
     unsafe { std::env::set_var("CMF_ACCEL", "0") };
@@ -113,9 +119,9 @@ fn blocked_vs_per_row() {
     let mut y_b = vec![0f32; b * rows];
 
     // Parity first.
-    unsafe { std::env::set_var("CMF_X86_BLOCKED", "1") };
+    cortiq_engine::qtensor::set_blocked_override(Some(true));
     qt.matmat(&x, b, &mut y_a, None);
-    unsafe { std::env::set_var("CMF_X86_BLOCKED", "0") };
+    cortiq_engine::qtensor::set_blocked_override(Some(false));
     qt.matmat(&x, b, &mut y_b, None);
     let max_d = y_a
         .iter()
@@ -127,11 +133,11 @@ fn blocked_vs_per_row() {
     // Paired timing, min-of interleaved rounds.
     let (mut t_blk, mut t_row) = (f64::MAX, f64::MAX);
     for _ in 0..6 {
-        unsafe { std::env::set_var("CMF_X86_BLOCKED", "1") };
+        cortiq_engine::qtensor::set_blocked_override(Some(true));
         let t0 = std::time::Instant::now();
         qt.matmat(&x, b, &mut y_a, None);
         t_blk = t_blk.min(t0.elapsed().as_secs_f64() * 1000.0);
-        unsafe { std::env::set_var("CMF_X86_BLOCKED", "0") };
+        cortiq_engine::qtensor::set_blocked_override(Some(false));
         let t1 = std::time::Instant::now();
         qt.matmat(&x, b, &mut y_b, None);
         t_row = t_row.min(t1.elapsed().as_secs_f64() * 1000.0);
@@ -143,6 +149,7 @@ fn blocked_vs_per_row() {
         gflop / t_row * 1e3
     );
     std::fs::remove_dir_all(&dir).ok();
+    cortiq_engine::qtensor::set_blocked_override(None);
 }
 
 /// Paired A/B for the q1 leg (1-bit-trained models on x86 finally get
@@ -151,6 +158,7 @@ fn blocked_vs_per_row() {
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn q1_blocked_vs_per_row() {
+    let _serial = GEMM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (rows, cols, b) = (4864usize, 896usize, 256usize);
     let gpr = cols / 32;
     // 6B tiles: [f16 scale][4B sign bits].
@@ -250,11 +258,11 @@ fn q1_blocked_vs_per_row() {
     };
     let mut y_a = vec![0f32; b * rows];
     let mut y_b = vec![0f32; b * rows];
-    unsafe { std::env::set_var("CMF_X86_BLOCKED", "1") };
+    cortiq_engine::qtensor::set_blocked_override(Some(true));
     qt.matmat(&x, b, &mut y_a, None);
-    unsafe { std::env::set_var("CMF_X86_BLOCKED", "0") };
+    cortiq_engine::qtensor::set_blocked_override(Some(false));
     qt.matmat(&x, b, &mut y_b, None);
-    unsafe { std::env::remove_var("CMF_X86_BLOCKED") };
+    cortiq_engine::qtensor::set_blocked_override(None);
     let max_d = y_a
         .iter()
         .zip(&y_b)
@@ -263,16 +271,16 @@ fn q1_blocked_vs_per_row() {
     assert!(max_d < 1e-3, "q1 blocked ≠ per-row: max|Δ| = {max_d}");
     let (mut t_blk, mut t_row) = (f64::MAX, f64::MAX);
     for _ in 0..6 {
-        unsafe { std::env::set_var("CMF_X86_BLOCKED", "1") };
+        cortiq_engine::qtensor::set_blocked_override(Some(true));
         let t0 = std::time::Instant::now();
         qt.matmat(&x, b, &mut y_a, None);
         t_blk = t_blk.min(t0.elapsed().as_secs_f64() * 1000.0);
-        unsafe { std::env::set_var("CMF_X86_BLOCKED", "0") };
+        cortiq_engine::qtensor::set_blocked_override(Some(false));
         let t1 = std::time::Instant::now();
         qt.matmat(&x, b, &mut y_b, None);
         t_row = t_row.min(t1.elapsed().as_secs_f64() * 1000.0);
     }
-    unsafe { std::env::remove_var("CMF_X86_BLOCKED") };
+    cortiq_engine::qtensor::set_blocked_override(None);
     let gflop = 2.0 * (b * rows * cols) as f64 / 1e9;
     println!(
         "x86 q1 matmat {rows}x{cols} b={b}: blocked {t_blk:.1} ms ({:.0} GF/s) | per-row-avx2 {t_row:.1} ms ({:.0} GF/s)",
@@ -280,6 +288,7 @@ fn q1_blocked_vs_per_row() {
         gflop / t_row * 1e3
     );
     std::fs::remove_dir_all(&dir).ok();
+    cortiq_engine::qtensor::set_blocked_override(None);
 }
 
 /// Paired A/B for the q4_block leg (the current q4 default): the row is
@@ -288,6 +297,7 @@ fn q1_blocked_vs_per_row() {
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn q4b_blocked_vs_per_row() {
+    let _serial = GEMM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (rows, cols, b) = (4864usize, 896usize, 256usize);
     let gpr = cols / 32;
     let groups = rows * gpr;
@@ -389,9 +399,9 @@ fn q4b_blocked_vs_per_row() {
     };
     let mut y_a = vec![0f32; b * rows];
     let mut y_b = vec![0f32; b * rows];
-    unsafe { std::env::set_var("CMF_X86_BLOCKED", "1") };
+    cortiq_engine::qtensor::set_blocked_override(Some(true));
     qt.matmat(&x, b, &mut y_a, None);
-    unsafe { std::env::set_var("CMF_X86_BLOCKED", "0") };
+    cortiq_engine::qtensor::set_blocked_override(Some(false));
     qt.matmat(&x, b, &mut y_b, None);
     let max_d = y_a
         .iter()
@@ -401,11 +411,11 @@ fn q4b_blocked_vs_per_row() {
     assert!(max_d < 1e-3, "q4b blocked ≠ per-row: max|Δ| = {max_d}");
     let (mut t_blk, mut t_row) = (f64::MAX, f64::MAX);
     for _ in 0..6 {
-        unsafe { std::env::set_var("CMF_X86_BLOCKED", "1") };
+        cortiq_engine::qtensor::set_blocked_override(Some(true));
         let t0 = std::time::Instant::now();
         qt.matmat(&x, b, &mut y_a, None);
         t_blk = t_blk.min(t0.elapsed().as_secs_f64() * 1000.0);
-        unsafe { std::env::set_var("CMF_X86_BLOCKED", "0") };
+        cortiq_engine::qtensor::set_blocked_override(Some(false));
         let t1 = std::time::Instant::now();
         qt.matmat(&x, b, &mut y_b, None);
         t_row = t_row.min(t1.elapsed().as_secs_f64() * 1000.0);
@@ -417,6 +427,7 @@ fn q4b_blocked_vs_per_row() {
         gflop / t_row * 1e3
     );
     std::fs::remove_dir_all(&dir).ok();
+    cortiq_engine::qtensor::set_blocked_override(None);
 }
 
 /// Same paired A/B for the q4_tiled leg (unpack reuse across four
@@ -425,6 +436,7 @@ fn q4b_blocked_vs_per_row() {
 #[test]
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn q4t_blocked_vs_per_row() {
+    let _serial = GEMM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // This compares two CPU implementations, and the blocked one hands a big
     // enough matmat to the device when a backend is selected. Then it is CPU
     // against GPU — a different contract, off by the 5e-3 that summation
@@ -536,9 +548,9 @@ fn q4t_blocked_vs_per_row() {
     };
     let mut y_a = vec![0f32; b * rows];
     let mut y_b = vec![0f32; b * rows];
-    unsafe { std::env::set_var("CMF_X86_BLOCKED", "1") };
+    cortiq_engine::qtensor::set_blocked_override(Some(true));
     qt.matmat(&x, b, &mut y_a, None);
-    unsafe { std::env::set_var("CMF_X86_BLOCKED", "0") };
+    cortiq_engine::qtensor::set_blocked_override(Some(false));
     qt.matmat(&x, b, &mut y_b, None);
     let max_d = y_a
         .iter()
@@ -548,11 +560,11 @@ fn q4t_blocked_vs_per_row() {
     assert!(max_d < 1e-3, "q4t blocked ≠ per-row: max|Δ| = {max_d}");
     let (mut t_blk, mut t_row) = (f64::MAX, f64::MAX);
     for _ in 0..6 {
-        unsafe { std::env::set_var("CMF_X86_BLOCKED", "1") };
+        cortiq_engine::qtensor::set_blocked_override(Some(true));
         let t0 = std::time::Instant::now();
         qt.matmat(&x, b, &mut y_a, None);
         t_blk = t_blk.min(t0.elapsed().as_secs_f64() * 1000.0);
-        unsafe { std::env::set_var("CMF_X86_BLOCKED", "0") };
+        cortiq_engine::qtensor::set_blocked_override(Some(false));
         let t1 = std::time::Instant::now();
         qt.matmat(&x, b, &mut y_b, None);
         t_row = t_row.min(t1.elapsed().as_secs_f64() * 1000.0);
@@ -564,6 +576,7 @@ fn q4t_blocked_vs_per_row() {
         gflop / t_row * 1e3
     );
     std::fs::remove_dir_all(&dir).ok();
+    cortiq_engine::qtensor::set_blocked_override(None);
 }
 
 /// Fused q4t FFN mid (`matvec_silu_mul`) == composed
