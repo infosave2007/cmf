@@ -51,6 +51,8 @@ const TAG_AUDIO: usize = 2;
 const MODALITIES: usize = 3;
 /// shift/scale/gate for attention, then the same three for the MLP.
 const EXPAND: usize = 6;
+/// Where a visual condition row sits on the schedule: all but arrived.
+const VISUAL_COND_TIMESTEP: f64 = 0.999;
 
 // ── the flow-schedule remap ─────────────────────────────────────────
 
@@ -72,6 +74,8 @@ pub fn time_shift_slope(sigma: f64, from_shift: f64, to_shift: f64) -> f64 {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
     Text,
+    /// A keyframe's latent, re-injected every step and never denoised.
+    Cond,
     Audio,
     Video,
 }
@@ -98,6 +102,9 @@ pub struct Layout {
     pub lat_w: usize,
     /// Rows per latent frame after the 2×2 patch.
     pub frame_rows: usize,
+    /// Per-token modality tag for the text span. A vision block inside
+    /// the prompt carries the VIDEO tag, not the text one.
+    pub text_tags: Vec<u8>,
 }
 
 /// `linspace((1 − ratio)/2, (1 + ratio)/2, dim/patch, endpoint=False) · 32`
@@ -114,6 +121,39 @@ impl Layout {
     /// that order. Keyframe and reference blocks would slot between the
     /// text and the audio; this port does text-to-video only.
     pub fn t2va(text_len: usize, latent_t: usize, lat_h: usize, lat_w: usize, audio_t: usize) -> Self {
+        Self::build(text_len, latent_t, lat_h, lat_w, audio_t, &[], &[])
+    }
+
+    /// `fl2va`: keyframe condition rows sit between the text and the
+    /// audio, sharing the TARGET spatial grid, each pinned to the time
+    /// coordinate of the frame it stands for — the first frame at the
+    /// text's end, the last one a whole clip further on, minus one
+    /// span. They never advance the cursor, so audio and video still
+    /// start where they would have.
+    ///
+    /// `frames` gives each keyframe's pixel index and the clip's total,
+    /// and `text_tags` the per-token modality of the prompt span.
+    pub fn fl2va(
+        text_len: usize,
+        latent_t: usize,
+        lat_h: usize,
+        lat_w: usize,
+        audio_t: usize,
+        frames: &[(usize, usize)],
+        text_tags: &[u8],
+    ) -> Self {
+        Self::build(text_len, latent_t, lat_h, lat_w, audio_t, frames, text_tags)
+    }
+
+    fn build(
+        text_len: usize,
+        latent_t: usize,
+        lat_h: usize,
+        lat_w: usize,
+        audio_t: usize,
+        frames: &[(usize, usize)],
+        text_tags: &[u8],
+    ) -> Self {
         let area = ((lat_h * lat_w) as f64).sqrt();
         let h_axis = axis_from_sqrt_area(lat_h, 2, area);
         let w_axis = axis_from_sqrt_area(lat_w, 2, area);
@@ -130,6 +170,27 @@ impl Layout {
         // Both target streams share this origin: the text runs out at
         // `text_len` and audio and video start together from there.
         let cursor = text_len as f64;
+
+        // Keyframes, in the order given.
+        let spans: f64 = (0..latent_t)
+            .map(|k| FRAME_RESCALE * FRAME_PER_TOKEN[k % 5])
+            .sum();
+        for &(pixel_index, frame_count) in frames {
+            let cond_t = if pixel_index == 0 {
+                cursor
+            } else if frame_count > 0 && pixel_index == frame_count - 1 {
+                cursor + spans - FRAME_RESCALE
+            } else {
+                panic!("only the first and last frame can anchor a keyframe");
+            };
+            let start = pos.len();
+            for &h in &h_axis {
+                for &w in &w_axis {
+                    pos.push([cond_t, h, w]);
+                }
+            }
+            segments.push(Segment { start, stop: pos.len(), kind: Kind::Cond });
+        }
 
         // Audio is channel-major stereo: every latent frame once per
         // channel, the two channels pinned to the frame grid's extreme
@@ -168,7 +229,21 @@ impl Layout {
             lat_h,
             lat_w,
             frame_rows,
+            text_tags: if text_tags.is_empty() {
+                vec![TAG_TEXT as u8; text_len]
+            } else {
+                text_tags.to_vec()
+            },
         }
+    }
+
+    /// How many keyframe condition rows the layout carries.
+    pub fn cond_rows(&self) -> usize {
+        self.segments
+            .iter()
+            .filter(|s| s.kind == Kind::Cond)
+            .map(|s| s.stop - s.start)
+            .sum()
     }
 
     fn segment(&self, kind: Kind) -> Segment {
@@ -275,6 +350,10 @@ pub struct MiniMaxH3 {
     eps: f64,
     qk_eps: f64,
     final_eps: f64,
+    /// How much of a keyframe latent survives the noise blend, and
+    /// therefore where its rows sit on the schedule. `VISUAL_COND_
+    /// TIMESTEP` is the reference's default; 1.0 turns the blend off.
+    pub cond_aug: f64,
 }
 
 fn rms_norm_into(x: &[f32], w: &[f32], eps: f64, dst: &mut [f32]) {
@@ -355,6 +434,7 @@ impl MiniMaxH3 {
             eps: f("norm_eps", 1e-5),
             qk_eps: f("qk_norm_eps", 1e-5),
             final_eps: f("final_norm_eps", 1e-5),
+            cond_aug: VISUAL_COND_TIMESTEP,
         })
     }
 
@@ -656,6 +736,7 @@ impl MiniMaxH3 {
         video: &[f32],
         audio: &[f32],
         sigma_v: f64,
+        cond: &[Vec<f32>],
     ) -> (Vec<f32>, Vec<f32>) {
         let hs = self.hidden;
         let pool = self.pool.as_deref();
@@ -664,23 +745,52 @@ impl MiniMaxH3 {
         let t_a = 1.0 - time_shift_sigma(sigma_v, self.shift_video, self.shift_audio);
 
         // Distinct timesteps, sorted — the adaLN row index is a position
-        // in this list, so the order is part of the contract.
+        // in this list, so the order is part of the contract. A keyframe
+        // pins its rows near 1: they are conditions, not noise being
+        // removed.
+        let has_cond = layout.segments.iter().any(|s| s.kind == Kind::Cond);
+        // The condition rows' timestep IS the noise-augmentation figure:
+        // the reference blends `aug` of the latent with `1 − aug` of
+        // noise and then tells the block the row sits at `aug`. Turning
+        // the blend off means aug = 1, and the timestep moves with it.
+        let t_cond = t_v.max(self.cond_aug);
         let mut ts = vec![t_v, t_a];
+        if has_cond {
+            ts.push(t_cond);
+        }
         ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
         ts.dedup();
         let row_of = |t: f64| ts.iter().position(|&x| x == t).unwrap();
         let (row_v, row_a) = (row_of(t_v), row_of(t_a));
+        let row_c = if has_cond { row_of(t_cond) } else { 0 };
 
-        // Per-token modulation row: t_row · MODALITIES + tag.
+        // Per-token modulation row: t_row · MODALITIES + tag. The text
+        // span is not uniform once a vision block is in it — those
+        // positions carry the VIDEO tag.
         let mut rows = vec![0u32; layout.seq_len];
         for s in &layout.segments {
-            let r = match s.kind {
-                Kind::Text => row_v * MODALITIES + TAG_TEXT,
-                Kind::Video => row_v * MODALITIES + TAG_VIDEO,
-                Kind::Audio => row_a * MODALITIES + TAG_AUDIO,
-            };
-            for v in rows[s.start..s.stop].iter_mut() {
-                *v = r as u32;
+            match s.kind {
+                Kind::Text => {
+                    for (i, v) in rows[s.start..s.stop].iter_mut().enumerate() {
+                        let tag = *layout.text_tags.get(i).unwrap_or(&(TAG_TEXT as u8));
+                        *v = (row_v * MODALITIES + tag as usize) as u32;
+                    }
+                }
+                Kind::Cond => {
+                    for v in rows[s.start..s.stop].iter_mut() {
+                        *v = (row_c * MODALITIES + TAG_VIDEO) as u32;
+                    }
+                }
+                Kind::Video => {
+                    for v in rows[s.start..s.stop].iter_mut() {
+                        *v = (row_v * MODALITIES + TAG_VIDEO) as u32;
+                    }
+                }
+                Kind::Audio => {
+                    for v in rows[s.start..s.stop].iter_mut() {
+                        *v = (row_a * MODALITIES + TAG_AUDIO) as u32;
+                    }
+                }
             }
         }
 
@@ -688,8 +798,45 @@ impl MiniMaxH3 {
         let v_rows = patchify_video(video, self.latents_dim, layout.latent_t, layout.lat_h, layout.lat_w);
         let v_n = v_rows.len() / (self.latents_dim * 4);
         let a_rows = pack_audio(audio, self.audio_dim, layout.audio_t);
+        // Condition rows go through the SAME patch projection as the
+        // target, so they are patchified the same way — one frame each.
+        let vd = self.latents_dim * 4;
+        let cond_rows: Vec<Vec<f32>> = cond
+            .iter()
+            .enumerate()
+            .map(|(i, z)| {
+                let mut r = patchify_video(z, self.latents_dim, 1, layout.lat_h, layout.lat_w);
+                if self.cond_aug < 1.0 {
+                    // The reference draws this from a torch generator
+                    // reseeded per condition; ours is its own stream, so
+                    // the 0.1% it contributes differs — deliberately, and
+                    // it is 0.1% of a unit normal.
+                    let noise = crate::videogen::gauss_pub(r.len(), 0x5EED ^ i as u64);
+                    let a = self.cond_aug as f32;
+                    for (v, n) in r.iter_mut().zip(&noise) {
+                        *v = a * *v + (1.0 - a) * n;
+                    }
+                }
+                r
+            })
+            .collect();
 
         let mut h = vec![0f32; layout.seq_len * hs];
+        let mut ci = 0usize;
+        for s in layout.segments.iter().filter(|s| s.kind == Kind::Cond) {
+            let n = s.stop - s.start;
+            let r = cond_rows
+                .get(ci)
+                .unwrap_or_else(|| panic!("layout has {} cond segments, {} latents given", ci + 1, cond_rows.len()));
+            self.video_patch
+                .matmat(r, n, &mut h[s.start * hs..s.stop * hs], pool);
+            for row in h[s.start * hs..s.stop * hs].chunks_exact_mut(hs) {
+                for (v, &b) in row.iter_mut().zip(&self.video_patch_b) {
+                    *v += b;
+                }
+            }
+            ci += 1;
+        }
         let vseg = layout.segment(Kind::Video);
         let aseg = layout.segment(Kind::Audio);
         let tseg = layout.segment(Kind::Text);
@@ -723,7 +870,6 @@ impl MiniMaxH3 {
 
         // ── heads ──
         let fm = self.final_adaln.eval(&ts, pool);
-        let vd = self.latents_dim * 4;
         let mut video_out = vec![0f32; (vseg.stop - vseg.start) * vd];
         let mut audio_out = vec![0f32; (aseg.stop - aseg.start) * self.audio_dim];
         for (seg, row, w, b, dst, dim) in [
@@ -921,6 +1067,36 @@ mod tests {
         let x: Vec<f32> = (0..c * 2 * t).map(|i| i as f32).collect();
         let rows = pack_audio(&x, c, t);
         assert_eq!(unpack_audio(&rows, c, t), x);
+    }
+
+    #[test]
+    fn keyframes_sit_between_the_text_and_the_audio() {
+        let (tl, lt, lh, lw, at) = (8usize, 3usize, 8usize, 12usize, 5usize);
+        let base = Layout::t2va(tl, lt, lh, lw, at);
+        // First and last frame of a 39-frame clip.
+        let l = Layout::fl2va(tl, lt, lh, lw, at, &[(0, 39), (38, 39)], &[]);
+        assert_eq!(l.cond_rows(), 2 * l.frame_rows);
+        assert_eq!(l.seq_len, base.seq_len + 2 * l.frame_rows);
+        let kinds: Vec<_> = l.segments.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![Kind::Text, Kind::Cond, Kind::Cond, Kind::Audio, Kind::Video]
+        );
+        // A keyframe never advances the cursor: audio and video start
+        // where they would have without it.
+        let (a0, v0) = (l.segment(Kind::Audio), l.segment(Kind::Video));
+        let (ba, bv) = (base.segment(Kind::Audio), base.segment(Kind::Video));
+        assert_eq!(l.pos[a0.start][0], base.pos[ba.start][0]);
+        assert_eq!(l.pos[v0.start][0], base.pos[bv.start][0]);
+        // The first frame's rows sit at the text's end; the last one's a
+        // whole clip further on, minus one span.
+        let c: Vec<_> = l.segments.iter().filter(|s| s.kind == Kind::Cond).collect();
+        assert_eq!(l.pos[c[0].start][0], tl as f64);
+        let spans: f64 = (0..lt).map(|k| FRAME_RESCALE * FRAME_PER_TOKEN[k % 5]).sum();
+        assert!((l.pos[c[1].start][0] - (tl as f64 + spans - FRAME_RESCALE)).abs() < 1e-12);
+        // Both share the TARGET spatial grid.
+        assert_eq!(l.pos[c[0].start][1], l.pos[v0.start][1]);
+        assert_eq!(l.pos[c[0].start][2], l.pos[v0.start][2]);
     }
 
     #[test]

@@ -52,9 +52,58 @@ SHAPE = dict(text_len=7, latent_t=3, lat_h=8, lat_w=12, audio_t=5)
 SIGMA = 0.923077  # the third rung of the 4-step simple schedule at shift 12
 
 
+def install_ck_shim():
+    """A pure-torch stand-in for `comfy_kitchen`'s fused rms+rope.
+
+    The real kernel is CUDA-only, so a host without one cannot run the
+    reference at all. This is NOT taken on trust: the t2va golden it
+    produces is compared against the same port that already matched the
+    REAL kernel on a CUDA box, so a shim that got the convention wrong
+    would move those numbers and fail the existing test.
+    """
+    import types
+
+    def _apply(x, freqs, w, eps, rot_dim):
+        # x: [1, s, heads, hd]; freqs: [1, S, 1, rot/2, 2, 2]
+        hd = x.shape[-1]
+        var = x.float().pow(2).mean(-1, keepdim=True)
+        x.copy_((x.float() * torch.rsqrt(var + eps)).to(x.dtype) * w)
+        half = rot_dim // 2
+        c = freqs[..., 0, 0]              # [1, S, 1, half]
+        sn = freqs[..., 1, 0]             # sin
+        a = x[..., :half]
+        b = x[..., half:rot_dim]
+        na = a * c - b * sn
+        nb = a * sn + b * c
+        x[..., :half] = na
+        x[..., half:rot_dim] = nb
+
+    def rms_rope_split_half_(q, k, freqs_cis, q_scale, k_scale, epsilon=1e-5, rot_dim=None):
+        rot_dim = rot_dim or q.shape[-1]
+        _apply(q, freqs_cis, q_scale, epsilon, rot_dim)
+        _apply(k, freqs_cis, k_scale, epsilon, rot_dim)
+
+    def rms_rope_split_half(q, k, freqs_cis, q_scale, k_scale, epsilon=1e-5, rot_dim=None):
+        q, k = q.clone(), k.clone()
+        rms_rope_split_half_(q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim)
+        return q, k
+
+    ck = types.SimpleNamespace(
+        rms_rope_split_half_=rms_rope_split_half_,
+        rms_rope_split_half=rms_rope_split_half,
+    )
+    import comfy.quant_ops
+    if not hasattr(comfy.quant_ops, "ck"):
+        comfy.quant_ops.ck = ck
+        print("comfy_kitchen absent — using the torch stand-in "
+              "(the t2va golden below is what checks it)", file=sys.stderr)
+
+
 def build(comfyui, seed=1234):
     sys.path.insert(0, comfyui)
     import comfy.ops
+    import comfy.quant_ops
+    install_ck_shim()
     import comfy.ldm.minimax.model as mm
 
     torch.manual_seed(seed)
@@ -101,6 +150,21 @@ def golden(model, out_dir):
         refined = model.preprocess_text_embeds(text)
         v_out, a_out = model._forward([video, audio], ts, text, {}, minimax_payload={})
 
+        # fl2va: the same clip conditioned on a first and a last frame.
+        # `visual_cond_noise_aug=1.0` turns off the 0.1% noise blend,
+        # whose stream comes from a torch-seeded generator this port
+        # does not reproduce — everything else is compared exactly.
+        frame_count = 39
+        kf = [torch.randn(1, CFG["latents_dim"], 1, s["lat_h"], s["lat_w"]) for _ in range(2)]
+        payload = {
+            "keyframes": [{"resolved_frame_index": 0},
+                          {"resolved_frame_index": frame_count - 1}],
+            "frame_count": frame_count,
+            "cond_video_latents": kf,
+            "visual_cond_noise_aug": 1.0,
+        }
+        v_kf, a_kf = model._forward([video, audio], ts, text, {}, minimax_payload=payload)
+
     slope = model_slope(SIGMA)
     a_unscaled = a_out / (-slope) * (-1.0)  # undo the reference's (-slope) factor
     os.makedirs(out_dir, exist_ok=True)
@@ -115,11 +179,17 @@ def golden(model, out_dir):
     dump("text_refined.bin", refined)
     dump("video_out.bin", v_out)
     dump("audio_out.bin", a_unscaled)
+    for i, k in enumerate(kf):
+        dump(f"kf{i}.bin", k)
+    dump("kf_video_out.bin", v_kf)
+    dump("kf_audio_out.bin", a_kf / (-slope) * (-1.0))
     meta = dict(CFG)
     meta["patch_size"] = list(CFG["patch_size"])
     meta.update(s)
     meta["sigma"] = SIGMA
     meta["slope"] = slope
+    meta["frame_count"] = frame_count
+    meta["n_keyframes"] = len(kf)
     with open(os.path.join(out_dir, "golden.json"), "w") as f:
         json.dump(meta, f, indent=1)
     print("video_out", tuple(v_out.shape), "rms", float(v_out.pow(2).mean().sqrt()))
