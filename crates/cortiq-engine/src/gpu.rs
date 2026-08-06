@@ -1184,6 +1184,37 @@ pub struct DitBlockArgs<'a> {
     /// The recommended Lumina file is q4tp, and a backend that only
     /// knows q4t must decline rather than decode with the wrong reader.
     pub q4tp: bool,
+    /// The hidden state is already on the device from the previous block,
+    /// so `x` need not be uploaded.
+    pub resident_in: bool,
+    /// Leave the result on the device instead of reading it back. The DiT
+    /// loop does not touch `x` between blocks, so 27 of every 28 readbacks
+    /// were moving 19 MB across PCIe and stalling on it for nothing.
+    pub resident_out: bool,
+}
+
+/// Can the selected backend keep the DiT's hidden state on the device
+/// between blocks? Only the wgpu whole-block path; the Metal entry takes
+/// and returns host memory every call.
+pub fn dit_chain_supported() -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        return matches!(backend(), Backend::Wgpu) && fused_dit_block_available();
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Pull the resident hidden state back to the host. For the caller that
+/// chained blocks and then hit one the device declined.
+pub fn dit_state_fetch(_x: &mut [f32]) -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        if matches!(backend(), Backend::Wgpu) {
+            return crate::gpu_wgpu::dit_state_fetch(_x);
+        }
+    }
+    false
 }
 
 /// One whole modulated DiT block on the device — norms, qkv, RoPE,
