@@ -137,3 +137,101 @@ fn keyframes_match_the_reference() {
     println!("fl2va audio velocity: max {mx:.3e}");
     assert!(mx < 5e-4, "keyframe audio head diverges: max {mx:.3e}");
 }
+
+/// `ref2va`'s layout against the reference's `PackedLayout`.
+///
+/// A reference block ADVANCES the cursor where a keyframe does not, so
+/// every later stream's time coordinate moves with it — an image by
+/// one, standalone audio by its length, a clip by the greater of its
+/// soundtrack and its frame spans. That arithmetic is the whole risk,
+/// so this compares every row's three coordinates and the segment table
+/// beside them.
+#[test]
+fn reference_blocks_lay_out_like_the_reference() {
+    let Some(dir) = std::env::var_os("CMF_MMH3_TOY") else {
+        eprintln!("CMF_MMH3_TOY unset — skipping");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let Ok(raw) = std::fs::read(dir.join("ref_segments.json")) else {
+        eprintln!("fixture predates the ref2va golden — skipping");
+        return;
+    };
+    let seg: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("golden.json")).unwrap()).unwrap();
+    let u = |k: &str| meta[k].as_u64().unwrap() as usize;
+
+    let refs: Vec<cortiq_engine::mmh3::Ref> = seg["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let g = |k: &str| r[k].as_u64().unwrap_or(0) as usize;
+            match r["kind"].as_str().unwrap() {
+                "image" => cortiq_engine::mmh3::Ref::Image {
+                    lat_h: g("latent_h"),
+                    lat_w: g("latent_w"),
+                },
+                "audio" => cortiq_engine::mmh3::Ref::Audio { t: g("ref_audio_t") },
+                _ => cortiq_engine::mmh3::Ref::Video {
+                    latent_t: g("latent_t"),
+                    lat_h: g("latent_h"),
+                    lat_w: g("latent_w"),
+                    audio_t: g("ref_audio_t"),
+                },
+            }
+        })
+        .collect();
+
+    let l = Layout::ref2va(
+        u("text_len"),
+        u("latent_t"),
+        u("lat_h"),
+        u("lat_w"),
+        u("audio_t"),
+        &refs,
+        &[],
+    );
+    assert_eq!(l.seq_len, seg["seq_len"].as_u64().unwrap() as usize, "row count");
+
+    let want_kinds: Vec<&str> = seg["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s[2].as_str().unwrap())
+        .collect();
+    let got_kinds: Vec<&str> = l
+        .segments
+        .iter()
+        .map(|s| match s.kind {
+            cortiq_engine::mmh3::Kind::Text => "text",
+            cortiq_engine::mmh3::Kind::Cond => "cond",
+            cortiq_engine::mmh3::Kind::RefImg => "ref_img",
+            cortiq_engine::mmh3::Kind::RefAudio => "ref_audio",
+            cortiq_engine::mmh3::Kind::Audio => "audio",
+            cortiq_engine::mmh3::Kind::Video => "video",
+        })
+        .collect();
+    assert_eq!(got_kinds, want_kinds, "segment kinds");
+    for (i, s) in seg["segments"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(l.segments[i].start, s[0].as_u64().unwrap() as usize, "seg {i} start");
+        assert_eq!(l.segments[i].stop, s[1].as_u64().unwrap() as usize, "seg {i} stop");
+    }
+
+    let want = read_f32(&dir.join("ref_pos.bin"));
+    assert_eq!(want.len(), l.seq_len * 3, "position count");
+    let mut worst = 0f32;
+    let mut at = 0usize;
+    for (i, p) in l.pos.iter().enumerate() {
+        for k in 0..3 {
+            let d = (p[k] as f32 - want[i * 3 + k]).abs();
+            if d > worst {
+                worst = d;
+                at = i;
+            }
+        }
+    }
+    println!("ref2va positions: {} rows, worst {worst:.3e} at row {at}", l.seq_len);
+    assert!(worst < 1e-5, "position {at} diverges by {worst:.3e}");
+}

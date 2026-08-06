@@ -101,10 +101,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the video VAE, so the whole upgrade is ~7 GB of transfer and about
   half a gigabyte of growth.
 
-  `ref2va` — reference images, videos and audio — is still out. It needs
-  the video encoder's other two temporal taps (the ones a single frame
-  cannot reach), the audio VAE's encoder, and a layout where reference
-  blocks advance the cursor.
+- **`ref2va`'s layout**, which is the part of it that is arithmetic. A
+  reference block ADVANCES the cursor where a keyframe does not — an
+  image by one, standalone audio by its length, a clip by the greater
+  of its soundtrack and its frame spans — so every later stream's time
+  coordinate moves with it. A clip's soundtrack packs immediately
+  before its frames from the same origin and takes its stereo w
+  extremes from the block's own grid rather than the target's. Compared
+  against the reference's `PackedLayout` row by row: 164 rows, all
+  three coordinates, worst difference 0.000e0, and the same eight
+  segments at the same bounds. Reference rows also get their own
+  timestep — visual conditions at 0.999, audio at 1.0, which is not
+  noised at all.
+
+  What `ref2va` still needs to RUN is two encoders: the video one's
+  other two temporal taps, which a single frame cannot reach, and the
+  audio VAE's encoder, which is not packed at all.
 
   The parity harness for all of this now runs on an ordinary host, with
   no GPU and no stand. The DiT's reference needs a CUDA-only fused

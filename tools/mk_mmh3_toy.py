@@ -181,6 +181,28 @@ def golden(model, out_dir):
     dump("audio_out.bin", a_unscaled)
     for i, k in enumerate(kf):
         dump(f"kf{i}.bin", k)
+    # ref2va: the layout alone. Reference blocks ADVANCE the cursor, so
+    # every later stream moves with them — the arithmetic is the whole
+    # risk, and PackedLayout is the authority on it.
+    import comfy.ldm.minimax.model as mmod
+    refs = [
+        {"kind": "image", "latent_h": 6, "latent_w": 10},
+        {"kind": "audio", "ref_audio_t": 4},
+        {"kind": "video_audio", "latent_t": 2, "latent_h": 4, "latent_w": 8,
+         "ref_audio_t": 3},
+        {"kind": "video", "latent_t": 2, "latent_h": 10, "latent_w": 6,
+         "ref_audio_t": 0},
+    ]
+    rl = mmod.PackedLayout(s["text_len"], s["latent_t"], s["lat_h"], s["lat_w"],
+                           s["audio_t"], refs=refs)
+    rl.position_ids.float().numpy().astype("<f4").tofile(
+        os.path.join(out_dir, "ref_pos.bin"))
+    with open(os.path.join(out_dir, "ref_segments.json"), "w") as f:
+        json.dump({"segments": [[a, b, k] for a, b, k in rl.segments],
+                   "seq_len": int(rl.seq_len), "refs": refs}, f, indent=1)
+    print("ref2va layout:", rl.seq_len, "rows,",
+          len(rl.segments), "segments")
+
     dump("kf_video_out.bin", v_kf)
     dump("kf_audio_out.bin", a_kf / (-slope) * (-1.0))
     meta = dict(CFG)
