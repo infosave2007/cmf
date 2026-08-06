@@ -18,7 +18,9 @@
 
 use crate::audiovae::AudioVae;
 use crate::mmh3::{Layout, MiniMaxH3, time_shift_sigma};
-use crate::qwen3te::Qwen3Encoder;
+use crate::qwen3te::{ImageSpan, Qwen3Encoder};
+use crate::qwen3vis::{self, VisionTower};
+use crate::vae3d::VideoVaeEncoder;
 use crate::sampler::SplitMix64;
 use crate::tokenizer::Tokenizer;
 use crate::vae3d::VideoVae;
@@ -39,6 +41,57 @@ pub struct AnimParams {
     /// would. Wrong at four steps; kept for A/B.
     pub stock_sampler: bool,
     pub max_tokens: usize,
+    /// RGB in [0, 1] as `[3, h, w]` with its size — the clip's first
+    /// frame, and/or its last.
+    pub first_frame: Option<(Vec<f32>, usize, usize)>,
+    pub last_frame: Option<(Vec<f32>, usize, usize)>,
+}
+
+/// The vision-block token ids the H3 presentation flanks a picture with.
+const VISION_START: u32 = 151_652;
+const VISION_END: u32 = 151_653;
+
+/// Resize `[3, h, w]` RGB to the canvas. The first frame is a geometry
+/// anchor and is stretched; the last one follows and is cover-cropped,
+/// which is what the reference node does with each.
+pub fn fit_to_canvas(
+    rgb: &[f32],
+    h: usize,
+    w: usize,
+    out_h: usize,
+    out_w: usize,
+    crop: bool,
+) -> Vec<f32> {
+    // Cover-crop picks the largest centred rectangle of the source with
+    // the target's aspect; a stretch takes the whole thing.
+    let (sx0, sy0, sw, sh) = if crop {
+        let (tw, th) = (out_w as f64, out_h as f64);
+        let scale = (w as f64 / tw).min(h as f64 / th);
+        let (cw, ch) = ((tw * scale).round() as usize, (th * scale).round() as usize);
+        ((w - cw) / 2, (h - ch) / 2, cw.max(1), ch.max(1))
+    } else {
+        (0, 0, w, h)
+    };
+    let mut out = vec![0f32; 3 * out_h * out_w];
+    for c in 0..3 {
+        for y in 0..out_h {
+            let sy = ((y as f64 + 0.5) * sh as f64 / out_h as f64 - 0.5).max(0.0);
+            let y0 = sy.floor() as usize;
+            let y1 = (y0 + 1).min(sh - 1);
+            let fy = (sy - y0 as f64) as f32;
+            for x in 0..out_w {
+                let sx = ((x as f64 + 0.5) * sw as f64 / out_w as f64 - 0.5).max(0.0);
+                let x0 = sx.floor() as usize;
+                let x1 = (x0 + 1).min(sw - 1);
+                let fx = (sx - x0 as f64) as f32;
+                let p = |yy: usize, xx: usize| rgb[(c * h + sy0 + yy) * w + sx0 + xx];
+                let top = p(y0, x0) * (1.0 - fx) + p(y0, x1) * fx;
+                let bot = p(y1, x0) * (1.0 - fx) + p(y1, x1) * fx;
+                out[(c * out_h + y) * out_w + x] = top * (1.0 - fy) + bot * fy;
+            }
+        }
+    }
+    out
 }
 
 impl Default for AnimParams {
@@ -51,6 +104,8 @@ impl Default for AnimParams {
             seed: 42,
             stock_sampler: false,
             max_tokens: 512,
+            first_frame: None,
+            last_frame: None,
         }
     }
 }
@@ -163,7 +218,7 @@ fn generate_inner(
     let model = Arc::new(
         cortiq_core::CmfModel::open(path).map_err(|e| format!("{}: {e}", path.display()))?,
     );
-    let (frames, latent_t, audio_t) = temporal_shape(p.frames);
+    let (frames_total, latent_t, audio_t) = temporal_shape(p.frames);
     let (lat_h, lat_w) = (p.height / 16, p.width / 16);
 
     // ── prompt ──
@@ -174,24 +229,96 @@ fn generate_inner(
         .as_deref()
         .ok_or("packaged .cmf has no embedded tokenizer")?;
     let tok = Tokenizer::from_bytes(vocab).map_err(|e| format!("tokenizer: {e}"))?;
-    let mut ids = tok.encode(prompt);
+    // fl2va: every keyframe is presented as "<Picture i>: " and a
+    // vision block BEFORE the prompt, and separately conditions the DiT
+    // as a latent. Both halves come from the same picture.
+    let keyframes: Vec<(&(Vec<f32>, usize, usize), usize)> = p
+        .first_frame
+        .iter()
+        .map(|f| (f, 0usize))
+        .chain(p.last_frame.iter().map(|f| (f, frames_total - 1)))
+        .collect();
+    let mut ids: Vec<u32> = Vec::new();
+    let mut spans: Vec<ImageSpan> = Vec::new();
+    let mut embeds: Vec<Vec<f32>> = Vec::new();
+    let mut deepstack: Vec<Vec<f32>> = Vec::new();
+    let mut cond: Vec<Vec<f32>> = Vec::new();
+    let mut tags: Vec<u8> = Vec::new();
+
+    if !keyframes.is_empty() {
+        let tower = VisionTower::from_cmf(&model)?;
+        let venc = VideoVaeEncoder::from_cmf(&model)?;
+        for (i, (frame, _)) in keyframes.iter().enumerate() {
+            let (src, sh, sw) = *frame;
+            // The picture the DiT sees is on the generation canvas; the
+            // one Qwen sees keeps its own resolution policy.
+            let fitted = fit_to_canvas(src, *sh, *sw, p.height, p.width, i > 0);
+            let (z, _, _) = venc.encode_frame(
+                &fitted.iter().map(|&v| v * 2.0 - 1.0).collect::<Vec<_>>(),
+                p.height,
+                p.width,
+            );
+            cond.push(z);
+
+            for t in tok.encode(&format!("<Picture {}>: ", i + 1)) {
+                ids.push(t);
+                tags.push(1);
+            }
+            let (patches, gh, gw) = qwen3vis::preprocess(
+                &fitted, p.height, p.width,
+                tower.patch_size, tower.temporal_patch, tower.merge,
+            );
+            let (merged, deep) = tower.forward(&patches, gh, gw);
+            let n_img = merged.len() / tower.out_hidden;
+            // The whole block carries the VIDEO tag, the flanking
+            // markers included.
+            ids.push(VISION_START);
+            tags.push(0);
+            let start = ids.len();
+            for _ in 0..n_img {
+                ids.push(VISION_START); // a placeholder the embed replaces
+                tags.push(0);
+            }
+            ids.push(VISION_END);
+            tags.push(0);
+            spans.push(ImageSpan { start, len: n_img, merged_h: gh / tower.merge, merged_w: gw / tower.merge });
+            embeds.push(merged);
+            if deepstack.is_empty() {
+                deepstack = deep;
+            } else {
+                for (a, b) in deepstack.iter_mut().zip(deep) {
+                    a.extend_from_slice(&b);
+                }
+            }
+        }
+    }
+    for t in tok.encode(prompt) {
+        ids.push(t);
+        tags.push(1);
+    }
     if ids.is_empty() {
         ids.push(151643); // the pad id, as the reference does for ""
+        tags.push(1);
     }
     ids.truncate(p.max_tokens);
+    tags.truncate(ids.len());
     progress("encode", 0, 1);
     let states = {
         let enc = Qwen3Encoder::from_cmf(&model)?;
-        enc.encode(&ids)
+        enc.encode_with_images(&ids, &spans, &embeds, &deepstack)
     };
     progress("encode", 1, 1);
 
     // ── denoise ──
     let (video, audio) = {
         let dit = MiniMaxH3::from_cmf(&model)?;
-        let layout = Layout::t2va(ids.len(), latent_t, lat_h, lat_w, audio_t);
+        let kf: Vec<(usize, usize)> = keyframes.iter().map(|&(_, idx)| (idx, frames_total)).collect();
+        let layout = if kf.is_empty() {
+            Layout::t2va(ids.len(), latent_t, lat_h, lat_w, audio_t)
+        } else {
+            Layout::fl2va(ids.len(), latent_t, lat_h, lat_w, audio_t, &kf, &tags)
+        };
         let text = dit.refine_text(&states, ids.len());
-        let cond: Vec<Vec<f32>> = Vec::new();
         let mut v = gauss(dit.latents_dim * latent_t * lat_h * lat_w, p.seed);
         let mut a = gauss(dit.audio_dim * 2 * audio_t, p.seed ^ 0x9E37_79B9_7F4A_7C15);
         let sg = sigmas(p.steps, dit.shift_video);
@@ -257,7 +384,7 @@ fn generate_inner(
     // The VAE emits latent_t·4 frames; the request snapped to 17k+5,
     // which is one fewer than a multiple of four plus the leading key
     // frame, so trim rather than pad.
-    let keep = out_frames.min(frames);
+    let keep = out_frames.min(frames_total);
     Ok(Anim {
         rgb: trim_frames(&rgb, out_frames, keep, p.height, p.width),
         frames: keep,
@@ -294,6 +421,33 @@ mod tests {
         for (g, w) in s.iter().zip(&want) {
             assert!((g - w).abs() < 1e-6, "{s:?}");
         }
+    }
+
+    #[test]
+    fn a_stretch_keeps_the_corners_and_a_crop_takes_the_middle() {
+        // A 4x2 ramp: value rises left to right, so the corners name
+        // themselves.
+        let (h, w) = (2usize, 4usize);
+        let mut rgb = vec![0f32; 3 * h * w];
+        for c in 0..3 {
+            for y in 0..h {
+                for x in 0..w {
+                    rgb[(c * h + y) * w + x] = x as f32 / (w - 1) as f32;
+                }
+            }
+        }
+        // Stretch to a square: the far edges survive.
+        let s = fit_to_canvas(&rgb, h, w, 4, 4, false);
+        assert!((s[0] - 0.0).abs() < 1e-6, "left edge");
+        assert!((s[3] - 1.0).abs() < 1e-6, "right edge");
+        // Cover-crop to a square takes the centre 2x2, so the extremes
+        // are gone and the span is narrower.
+        let c = fit_to_canvas(&rgb, h, w, 4, 4, true);
+        let (lo, hi) = c[..16]
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+        assert!(lo > 0.05, "crop kept the left edge: {lo}");
+        assert!(hi < 0.95, "crop kept the right edge: {hi}");
     }
 
     #[test]
