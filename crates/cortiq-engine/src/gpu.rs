@@ -139,6 +139,13 @@ pub enum OpClass {
     /// decided for a matvec fourteen times their size that took 11 ms
     /// a token on the host.
     MatvecHead = 5,
+    /// The blocked f32 GEMM (`fcd_ops::gemm_nt`): attention's QKᵀ and
+    /// AV, and the VAE decoders' projections. It used to take every job
+    /// over 4 M MACs on sight, with no CPU arm to lose to — which on
+    /// the MiniMax-H3 video decoder was three times SLOWER than the
+    /// host it displaced. Its population is per-head slices, nothing
+    /// like the weight GEMMs above, so it probes on its own.
+    GemmNt = 6,
 }
 
 /// Which probe a large matvec belongs to. The head is an order of
@@ -198,7 +205,8 @@ impl Probe {
     }
 }
 
-static PROBES: [Probe; 6] = [
+static PROBES: [Probe; 7] = [
+    Probe::new(),
     Probe::new(),
     Probe::new(),
     Probe::new(),
@@ -325,7 +333,8 @@ pub fn probe_record(c: OpClass, gpu: bool, dur: std::time::Duration) {
         {
             tracing::info!(
                 "gpu probe [{}]: gpu {:.2} ms vs cpu {:.2} ms per op → {}",
-                ["ffn", "matvec", "matmat", "qkv-batch", "matmat-wide", "lm-head"][c as usize],
+                ["ffn", "matvec", "matmat", "qkv-batch", "matmat-wide", "lm-head", "gemm-nt"]
+                    [c as usize],
                 g / 1e6,
                 cp / 1e6,
                 if winner == 1 { "gpu" } else { "cpu" },

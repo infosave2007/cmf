@@ -1,6 +1,7 @@
 //! Cortiq inference engine — sparse forward pass, attention, tokenization, sampling.
 
 pub mod attention;
+pub mod audiovae;
 pub mod dit;
 pub mod dsv4;
 pub mod fcd;
@@ -24,11 +25,13 @@ pub mod inference;
 pub mod kv_cache;
 pub mod linear_core;
 pub mod loader;
+pub mod mmh3;
 pub mod nystrom;
 pub mod pin;
 pub mod pipeline;
 pub mod pool;
 pub mod qtensor;
+pub mod qwen3te;
 pub mod router;
 pub mod runtime;
 pub mod sampler;
@@ -37,6 +40,8 @@ pub mod swarm;
 pub mod textenc;
 pub mod tokenizer;
 pub mod vae;
+pub mod vae3d;
+pub mod videogen;
 
 pub use nystrom::NystromState;
 pub use pipeline::{GenerateResult, Pipeline, TokenCallback, TokenTrace};

@@ -1,0 +1,536 @@
+//! MiniMax-H3's audio VAE decoder: BigVGAN at 32 kHz, stereo.
+//!
+//! 32 latent channels at 40 frames a second become a waveform at 800
+//! samples a frame, through seven transposed-convolution stages and
+//! their AMP residual blocks. The two stereo channels are two
+//! independent mono passes, which is how the reference batches them.
+//!
+//! The activations are the interesting part and the easy thing to get
+//! subtly wrong: every nonlinearity is wrapped in a 2× kaiser-sinc
+//! upsample, the pointwise SnakeBeta, and a 2× lowpass back down. The
+//! filter is designed here rather than shipped, from the same
+//! `kaiser_sinc_filter1d(cutoff, half_width, 12)` the reference calls,
+//! so it cannot drift out of step with a checkpoint that does not
+//! contain it.
+
+use crate::pool::Pool;
+use cortiq_core::CmfModel;
+use std::sync::Arc;
+
+/// Both resampling filters in the alias-free activation are designed at
+/// this kernel length.
+const FILTER_LEN: usize = 12;
+
+struct Conv1d {
+    w: Vec<f32>, // [out, in, k]
+    b: Option<Vec<f32>>,
+    out_ch: usize,
+    in_ch: usize,
+    k: usize,
+    pad: usize,
+    dilation: usize,
+}
+
+impl Conv1d {
+    fn load(model: &Arc<CmfModel>, name: &str, pad: usize, dilation: usize) -> Result<Self, String> {
+        let e = model
+            .tensor(&format!("{name}.weight"))
+            .ok_or_else(|| format!("missing {name}.weight"))?;
+        let w = crate::dit::cmf_f32(model, &format!("{name}.weight"))?;
+        let b = crate::dit::cmf_f32(model, &format!("{name}.bias")).ok();
+        Ok(Self {
+            out_ch: e.shape[0],
+            in_ch: e.shape[1],
+            k: e.shape[2],
+            w,
+            b,
+            pad,
+            dilation,
+        })
+    }
+
+    /// `x` is `[in_ch, n]`; the result is `[out_ch, n]` for the
+    /// paddings used here (all `same`).
+    fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
+        let out_n = (n + 2 * self.pad).saturating_sub(self.dilation * (self.k - 1));
+        let mut out = vec![0f32; self.out_ch * out_n];
+        let ptr = SendPtr(out.as_mut_ptr());
+        let work = |lo: usize, hi: usize| {
+            for o in lo..hi {
+                // SAFETY: workers own disjoint output channels.
+                let dst = unsafe { ptr.row(o * out_n, out_n) };
+                let bias = self.b.as_ref().map_or(0.0, |b| b[o]);
+                dst.fill(bias);
+                for i in 0..self.in_ch {
+                    let ker = &self.w[(o * self.in_ch + i) * self.k..(o * self.in_ch + i + 1) * self.k];
+                    let src = &x[i * n..(i + 1) * n];
+                    for (t, d) in dst.iter_mut().enumerate() {
+                        let mut acc = 0f32;
+                        for (j, &kv) in ker.iter().enumerate() {
+                            let p = (t + j * self.dilation) as isize - self.pad as isize;
+                            if p >= 0 && (p as usize) < n {
+                                acc += kv * src[p as usize];
+                            }
+                        }
+                        *d += acc;
+                    }
+                }
+            }
+        };
+        match pool {
+            Some(p) => p.run_rows(self.out_ch, &work),
+            None => work(0, self.out_ch),
+        }
+        out
+    }
+}
+
+struct ConvT1d {
+    w: Vec<f32>, // [in, out, k]
+    b: Vec<f32>,
+    in_ch: usize,
+    out_ch: usize,
+    k: usize,
+    stride: usize,
+    pad: usize,
+}
+
+impl ConvT1d {
+    fn load(model: &Arc<CmfModel>, name: &str, stride: usize) -> Result<Self, String> {
+        let e = model
+            .tensor(&format!("{name}.weight"))
+            .ok_or_else(|| format!("missing {name}.weight"))?;
+        let (in_ch, out_ch, k) = (e.shape[0], e.shape[1], e.shape[2]);
+        Ok(Self {
+            w: crate::dit::cmf_f32(model, &format!("{name}.weight"))?,
+            b: crate::dit::cmf_f32(model, &format!("{name}.bias"))?,
+            in_ch,
+            out_ch,
+            k,
+            stride,
+            pad: (k - stride) / 2,
+        })
+    }
+
+    fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
+        let full = (n - 1) * self.stride + self.k;
+        let out_n = full - 2 * self.pad;
+        let mut out = vec![0f32; self.out_ch * out_n];
+        let ptr = SendPtr(out.as_mut_ptr());
+        let work = |lo: usize, hi: usize| {
+            for o in lo..hi {
+                // SAFETY: workers own disjoint output channels.
+                let dst = unsafe { ptr.row(o * out_n, out_n) };
+                dst.fill(self.b[o]);
+                for i in 0..self.in_ch {
+                    let ker = &self.w[(i * self.out_ch + o) * self.k..(i * self.out_ch + o + 1) * self.k];
+                    let src = &x[i * n..(i + 1) * n];
+                    for (t, &sv) in src.iter().enumerate() {
+                        if sv == 0.0 {
+                            continue;
+                        }
+                        let base = t * self.stride;
+                        for (j, &kv) in ker.iter().enumerate() {
+                            let p = base + j;
+                            if p >= self.pad && p - self.pad < out_n {
+                                dst[p - self.pad] += sv * kv;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        match pool {
+            Some(p) => p.run_rows(self.out_ch, &work),
+            None => work(0, self.out_ch),
+        }
+        out
+    }
+}
+
+/// `x + sin²(α·x)/β`, with α and β stored in log scale.
+struct SnakeBeta {
+    alpha: Vec<f32>,
+    beta: Vec<f32>,
+}
+
+impl SnakeBeta {
+    fn load(model: &Arc<CmfModel>, name: &str) -> Result<Self, String> {
+        Ok(Self {
+            alpha: crate::dit::cmf_f32(model, &format!("{name}.alpha"))?
+                .iter()
+                .map(|v| v.exp())
+                .collect(),
+            beta: crate::dit::cmf_f32(model, &format!("{name}.beta"))?
+                .iter()
+                .map(|v| v.exp())
+                .collect(),
+        })
+    }
+
+    fn apply(&self, x: &mut [f32], n: usize) {
+        for (c, row) in x.chunks_exact_mut(n).enumerate() {
+            let (a, b) = (self.alpha[c], 1.0 / (self.beta[c] + 1e-9));
+            for v in row.iter_mut() {
+                let s = (a * *v).sin();
+                *v += s * s * b;
+            }
+        }
+    }
+}
+
+fn bessel_i0(x: f64) -> f64 {
+    // Series; the argument here is ~4.7, where a dozen terms is exact
+    // to double precision.
+    let mut sum = 1.0;
+    let mut term = 1.0;
+    for k in 1..40 {
+        term *= (x / (2.0 * k as f64)).powi(2);
+        sum += term;
+        if term < 1e-18 * sum {
+            break;
+        }
+    }
+    sum
+}
+
+fn sinc(x: f64) -> f64 {
+    if x == 0.0 {
+        1.0
+    } else {
+        (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x)
+    }
+}
+
+/// The reference's `kaiser_sinc_filter1d`, normalized to unit sum.
+fn kaiser_sinc(cutoff: f64, half_width: f64, k: usize) -> Vec<f32> {
+    let half = k / 2;
+    let delta_f = 4.0 * half_width;
+    let a = 2.285 * (half as f64 - 1.0) * std::f64::consts::PI * delta_f + 7.95;
+    let beta = if a > 50.0 {
+        0.1102 * (a - 8.7)
+    } else if a >= 21.0 {
+        0.5842 * (a - 21.0).powf(0.4) + 0.078_86 * (a - 21.0)
+    } else {
+        0.0
+    };
+    let denom = bessel_i0(beta);
+    let n = k as f64 - 1.0;
+    let mut f: Vec<f64> = (0..k)
+        .map(|i| {
+            let r = (2.0 * i as f64 / n) - 1.0;
+            let win = bessel_i0(beta * (1.0 - r * r).max(0.0).sqrt()) / denom;
+            // even length: sample points sit on half-integers
+            let t = -(half as f64) + i as f64 + 0.5;
+            2.0 * cutoff * win * sinc(2.0 * cutoff * t)
+        })
+        .collect();
+    let s: f64 = f.iter().sum();
+    for v in f.iter_mut() {
+        *v /= s;
+    }
+    f.into_iter().map(|v| v as f32).collect()
+}
+
+/// Replicate-pad, then a per-channel FIR.
+fn fir_pad(x: &[f32], ch: usize, n: usize, f: &[f32], pad_l: usize, pad_r: usize, stride: usize) -> (Vec<f32>, usize) {
+    let padded = n + pad_l + pad_r;
+    let out_n = (padded - f.len()) / stride + 1;
+    let mut out = vec![0f32; ch * out_n];
+    let mut buf = vec![0f32; padded];
+    for c in 0..ch {
+        let src = &x[c * n..(c + 1) * n];
+        for (i, b) in buf.iter_mut().enumerate() {
+            let p = i as isize - pad_l as isize;
+            *b = src[p.clamp(0, n as isize - 1) as usize];
+        }
+        for t in 0..out_n {
+            let mut acc = 0f32;
+            for (j, &kv) in f.iter().enumerate() {
+                acc += kv * buf[t * stride + j];
+            }
+            out[c * out_n + t] = acc;
+        }
+    }
+    (out, out_n)
+}
+
+/// Upsample ×2, apply, downsample ×2 — the anti-aliased activation.
+struct Activation1d {
+    act: SnakeBeta,
+    up: Vec<f32>,
+    down: Vec<f32>,
+}
+
+impl Activation1d {
+    /// `name` is the Activation1d module, not its `.act`. The release
+    /// ships both resampling filters as buffers — 254 of them — so read
+    /// them rather than re-designing them, and keep `kaiser_sinc` as
+    /// the fallback for a checkpoint that drops them.
+    fn load(model: &Arc<CmfModel>, name: &str) -> Result<Self, String> {
+        let designed = || kaiser_sinc(0.25, 0.3, FILTER_LEN);
+        Ok(Self {
+            act: SnakeBeta::load(model, &format!("{name}.act"))?,
+            up: crate::dit::cmf_f32(model, &format!("{name}.upsample.filter"))
+                .unwrap_or_else(|_| designed()),
+            down: crate::dit::cmf_f32(model, &format!("{name}.downsample.lowpass.filter"))
+                .unwrap_or_else(|_| designed()),
+        })
+    }
+
+    fn apply(&self, x: &[f32], ch: usize, n: usize) -> (Vec<f32>, usize) {
+        // conv_transpose1d(pad(x, 5, 5), filter, stride 2) · 2, then the
+        // 15-sample margins the reference trims off each end.
+        let pad = FILTER_LEN / 2 - 1;
+        let pad_l = pad * 2 + (FILTER_LEN - 2) / 2;
+        let pad_r = pad * 2 + (FILTER_LEN - 2 + 1) / 2;
+        let pn = n + 2 * pad;
+        let full = (pn - 1) * 2 + FILTER_LEN;
+        let mut up = vec![0f32; ch * full];
+        for c in 0..ch {
+            let src = &x[c * n..(c + 1) * n];
+            let dst = &mut up[c * full..(c + 1) * full];
+            for i in 0..pn {
+                let p = i as isize - pad as isize;
+                let v = src[p.clamp(0, n as isize - 1) as usize] * 2.0;
+                if v == 0.0 {
+                    continue;
+                }
+                for (j, &kv) in self.up.iter().enumerate() {
+                    dst[i * 2 + j] += v * kv;
+                }
+            }
+        }
+        let keep = full - pad_l - pad_r;
+        let mut mid = vec![0f32; ch * keep];
+        for c in 0..ch {
+            mid[c * keep..(c + 1) * keep]
+                .copy_from_slice(&up[c * full + pad_l..c * full + pad_l + keep]);
+        }
+        self.act.apply(&mut mid, keep);
+        // LowPassFilter1d at stride 2: even kernel pads 5 left, 6 right.
+        fir_pad(&mid, ch, keep, &self.down, FILTER_LEN / 2 - 1, FILTER_LEN / 2, 2)
+    }
+}
+
+struct AmpBlock {
+    convs1: Vec<Conv1d>,
+    convs2: Vec<Conv1d>,
+    acts: Vec<Activation1d>,
+}
+
+pub struct AudioVae {
+    dec_in: Conv1d,
+    conv_pre: Conv1d,
+    ups: Vec<ConvT1d>,
+    resblocks: Vec<AmpBlock>,
+    act_post: Activation1d,
+    conv_post: Conv1d,
+    latents_mean: Vec<f32>,
+    latents_std: Vec<f32>,
+    pool: Option<Arc<Pool>>,
+    n_kernels: usize,
+    pub sample_rate: usize,
+}
+
+fn get_padding(k: usize, d: usize) -> usize {
+    (k * d - d) / 2
+}
+
+impl AudioVae {
+    pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
+        let cfg: serde_json::Value = serde_json::from_slice(
+            model.tensor_bytes("avae.config_json").map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("avae.config_json: {e}"))?;
+        let rates: Vec<usize> = cfg["upsample_rates"]
+            .as_array()
+            .ok_or("upsample_rates")?
+            .iter()
+            .map(|v| v.as_u64().unwrap_or(1) as usize)
+            .collect();
+        let rk: Vec<usize> = cfg["resblock_kernel_sizes"]
+            .as_array()
+            .ok_or("resblock_kernel_sizes")?
+            .iter()
+            .map(|v| v.as_u64().unwrap_or(3) as usize)
+            .collect();
+        let rd: Vec<Vec<usize>> = cfg["resblock_dilation_sizes"]
+            .as_array()
+            .ok_or("resblock_dilation_sizes")?
+            .iter()
+            .map(|a| {
+                a.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_u64().unwrap_or(1) as usize)
+                    .collect()
+            })
+            .collect();
+
+        let mut ups = Vec::new();
+        for (i, &u) in rates.iter().enumerate() {
+            ups.push(ConvT1d::load(model, &format!("avae.decoder.ups.{i}.0"), u)?);
+        }
+        let mut resblocks = Vec::new();
+        for i in 0..rates.len() {
+            for (j, (&k, d)) in rk.iter().zip(&rd).enumerate() {
+                let p = format!("avae.decoder.resblocks.{}", i * rk.len() + j);
+                let convs1 = (0..d.len())
+                    .map(|q| Conv1d::load(model, &format!("{p}.convs1.{q}"), get_padding(k, d[q]), d[q]))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let convs2 = (0..d.len())
+                    .map(|q| Conv1d::load(model, &format!("{p}.convs2.{q}"), get_padding(k, 1), 1))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let acts = (0..convs1.len() + convs2.len())
+                    .map(|q| Activation1d::load(model, &format!("{p}.activations.{q}")))
+                    .collect::<Result<Vec<_>, _>>()?;
+                resblocks.push(AmpBlock { convs1, convs2, acts });
+            }
+        }
+        Ok(Self {
+            dec_in: Conv1d::load(model, "avae.dec_in_proj", 0, 1)?,
+            conv_pre: Conv1d::load(model, "avae.decoder.conv_pre", 3, 1)?,
+            ups,
+            resblocks,
+            act_post: Activation1d::load(model, "avae.decoder.activation_post")?,
+            conv_post: Conv1d::load(model, "avae.decoder.conv_post", 3, 1)?,
+            latents_mean: crate::dit::cmf_f32(model, "avae.latents_mean")?,
+            latents_std: crate::dit::cmf_f32(model, "avae.latents_std")?,
+            pool: Pool::from_env(),
+            n_kernels: rk.len(),
+            sample_rate: cfg["sample_rate"].as_u64().unwrap_or(32000) as usize,
+        })
+    }
+
+    /// Normalized latents `[C, 2, T]` → stereo `[2, L]` in [-1, 1].
+    pub fn decode(&self, z: &[f32], c: usize, t: usize) -> (Vec<f32>, usize) {
+        let pool = self.pool.as_deref();
+        let mut chans: Vec<Vec<f32>> = Vec::with_capacity(2);
+        for ch in 0..2 {
+            let mut lat = vec![0f32; c * t];
+            for ci in 0..c {
+                let (m, s) = (self.latents_mean[ci], self.latents_std[ci]);
+                for ti in 0..t {
+                    lat[ci * t + ti] = z[(ci * 2 + ch) * t + ti] * s + m;
+                }
+            }
+            // `CMF_AVAE_PROF=1`: per-stage rms, to diff against the
+            // reference stage by stage rather than at the waveform.
+            let prof = std::env::var_os("CMF_AVAE_PROF").is_some();
+            let rms = |x: &[f32]| (x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>()
+                / x.len() as f64)
+                .sqrt();
+            let mut x = self.dec_in.apply(&lat, t, pool);
+            let mut n = t;
+            if prof {
+                eprintln!("ch{ch} dec_in rms {:.6e} n {n}", rms(&x));
+            }
+            x = self.conv_pre.apply(&x, n, pool);
+            if prof {
+                eprintln!("ch{ch} conv_pre rms {:.6e} n {n}", rms(&x));
+            }
+            for i in 0..self.ups.len() {
+                let up = &self.ups[i];
+                x = up.apply(&x, n, pool);
+                n = (n - 1) * up.stride + up.k - 2 * up.pad;
+                let ch_n = up.out_ch;
+                let mut acc = vec![0f32; ch_n * n];
+                for j in 0..self.n_kernels {
+                    let r = self.resblocks[i * self.n_kernels + j].apply(&x, ch_n, n, pool);
+                    for (a, b) in acc.iter_mut().zip(&r) {
+                        *a += b;
+                    }
+                }
+                let inv = 1.0 / self.n_kernels as f32;
+                for v in acc.iter_mut() {
+                    *v *= inv;
+                }
+                x = acc;
+                if prof {
+                    eprintln!("ch{ch} up{i} rms {:.6e} ch {ch_n} n {n}", rms(&x));
+                }
+            }
+            let last_ch = self.ups[self.ups.len() - 1].out_ch;
+            let (mut y, yn) = self.act_post.apply(&x, last_ch, n);
+            y = self.conv_post.apply(&y, yn, pool);
+            for v in y.iter_mut() {
+                *v = v.clamp(-1.0, 1.0);
+            }
+            chans.push(y);
+            n = yn;
+            let _ = n;
+        }
+        let len = chans[0].len().min(chans[1].len());
+        let mut out = vec![0f32; 2 * len];
+        for (ch, c) in chans.iter().enumerate() {
+            out[ch * len..(ch + 1) * len].copy_from_slice(&c[..len]);
+        }
+        (out, len)
+    }
+}
+
+impl AmpBlock {
+    fn apply(&self, x: &[f32], ch: usize, n: usize, pool: Option<&Pool>) -> Vec<f32> {
+        let mut cur = x.to_vec();
+        for i in 0..self.convs1.len() {
+            let (a1, a2) = (&self.acts[i * 2], &self.acts[i * 2 + 1]);
+            let (xt, tn) = a1.apply(&cur, ch, n);
+            let xt = self.convs1[i].apply(&xt, tn, pool);
+            let (xt, tn2) = a2.apply(&xt, ch, tn);
+            let xt = self.convs2[i].apply(&xt, tn2, pool);
+            for (a, b) in cur.iter_mut().zip(&xt) {
+                *a += b;
+            }
+        }
+        cur
+    }
+}
+
+/// Test hook: the designed 12-tap resampling filter.
+#[doc(hidden)]
+pub fn kaiser_sinc_for_test() -> Vec<f32> {
+    kaiser_sinc(0.25, 0.3, FILTER_LEN)
+}
+
+struct SendPtr(*mut f32);
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+impl SendPtr {
+    /// SAFETY: caller guarantees disjoint `[off, off+len)` per worker.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn row(&self, off: usize, len: usize) -> &mut [f32] {
+        unsafe { std::slice::from_raw_parts_mut(self.0.add(off), len) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_resampling_filter_is_the_references() {
+        let f = kaiser_sinc(0.25, 0.3, FILTER_LEN);
+        assert_eq!(f.len(), FILTER_LEN);
+        // Unit sum: without it a constant input leaks amplitude, which
+        // is the whole reason the reference normalizes.
+        assert!((f.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        // Symmetric about the centre, and its peak is at the centre.
+        for i in 0..FILTER_LEN / 2 {
+            assert!((f[i] - f[FILTER_LEN - 1 - i]).abs() < 1e-6, "asymmetric at {i}");
+        }
+        let peak = f.iter().cloned().fold(f32::MIN, f32::max);
+        assert!((f[5] - peak).abs() < 1e-6);
+
+    }
+
+    #[test]
+    fn bessel_i0_matches_known_values() {
+        // The third is the β the 12-tap filter's Kaiser window is
+        // designed at, so it is the value that actually gets used.
+        for (x, want) in [(0.0, 1.0), (1.0, 1.266_065_878), (4.664, 20.204_6)] {
+            let got = bessel_i0(x);
+            assert!((got - want).abs() < 1e-3 * want.max(1.0), "I0({x}) = {got}");
+        }
+    }
+}

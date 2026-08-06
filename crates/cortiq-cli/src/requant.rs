@@ -233,6 +233,10 @@ mod tests {
         let vals: Vec<f32> = (0..rows * cols)
             .map(|i| ((i as f32 * 0.377).sin()) * 0.5)
             .collect();
+        // Pin the encoder switches: `convert`'s tests steer the same
+        // process-global variables, and the harness runs both on
+        // threads of ONE process.
+        let _g = crate::convert::tests::env_guard("1", "1");
         let q4 = encode_q4tp(&vals, rows, cols);
         let spec = |name: &str| TensorSpec {
             name: name.into(),
@@ -298,6 +302,7 @@ mod tests {
         let vals: Vec<f32> = (0..rows * cols)
             .map(|i| ((i as f32 * 0.7311).sin()) * 0.3)
             .collect();
+        let _g = crate::convert::tests::env_guard("1", "1");
         let q2 = encode_q2tp(&vals, rows, cols);
         assert_eq!(
             q2.len(),
