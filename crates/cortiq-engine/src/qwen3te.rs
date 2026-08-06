@@ -12,11 +12,18 @@
 //! rotation, GQA 64/8, split-half RoPE at θ=5e6, SwiGLU, plain-w
 //! RMSNorm (not Gemma's 1+w) and no embedding scale.
 //!
-//! Text-only. Qwen3-VL's interleaved MRoPE assigns some frequency slots
-//! to the h and w axes, but a text token's three axis positions are
-//! equal, so every slot sees the same angle and the interleave is a
-//! no-op — which is why this can be one plain position per token. The
-//! moment an image enters the presentation that stops being true.
+//! The rotation is Qwen3-VL's interleaved MRoPE. A text token's three
+//! axis positions are equal, so every frequency slot sees the same
+//! angle and the interleave is invisible; an image span pins the time
+//! axis and lays its merged grid out on the other two, and the tokens
+//! after it resume from the grid's larger side rather than from the
+//! span's length. `encode` is the text-only entry point and
+//! `encode_with_images` the general one.
+//!
+//! Deepstack features go in at LM layers 0, 1, 2 — the FIRST layers.
+//! `deepstack_visual_indexes` (8, 16, 24) names the vision layers the
+//! features are taken FROM, which is a different list and an easy one
+//! to conflate.
 
 use crate::dit::Proj;
 use crate::pool::Pool;
@@ -74,6 +81,15 @@ impl SendPtr {
     }
 }
 
+/// One image spliced into the prompt: where its tokens start, how many
+/// there are, and the merged patch grid they came from.
+pub struct ImageSpan {
+    pub start: usize,
+    pub len: usize,
+    pub merged_h: usize,
+    pub merged_w: usize,
+}
+
 impl Qwen3Encoder {
     pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
         let cfg: serde_json::Value = serde_json::from_slice(
@@ -119,7 +135,7 @@ impl Qwen3Encoder {
 
     /// Per-head RMSNorm then split-half RoPE over the whole head, in
     /// place across a `[n, heads·hd]` buffer.
-    fn norm_rope(&self, all: &mut [f32], n: usize, heads: usize, w: &[f32]) {
+    fn norm_rope(&self, all: &mut [f32], n: usize, heads: usize, w: &[f32], pos: &[[f32; 3]]) {
         let hd = self.hd;
         let half = hd / 2;
         let pool = self.pool.as_deref();
@@ -136,7 +152,19 @@ impl Qwen3Encoder {
                     }
                     for i in 0..half {
                         let freq = 1.0 / self.theta.powf(2.0 * i as f32 / hd as f32);
-                        let (s, c) = (p as f32 * freq).sin_cos();
+                        // Qwen3-VL's interleaved MRoPE: the time axis by
+                        // default, with height and width taking every
+                        // third slot below 3·rope_dims. All three axes
+                        // carry the same value on a text token, so this
+                        // is `p` there whatever the slot.
+                        let axis = if i < 60 && i % 3 == 1 {
+                            1
+                        } else if i < 60 && i % 3 == 2 {
+                            2
+                        } else {
+                            0
+                        };
+                        let (s, c) = (pos[p][axis] * freq).sin_cos();
                         let (a, b) = (x[i], x[i + half]);
                         x[i] = a * c - b * s;
                         x[i + half] = a * s + b * c;
@@ -154,6 +182,54 @@ impl Qwen3Encoder {
     /// residual stream leaving the last layer, normed only if the
     /// config says the checkpoint has a final norm (H3's does not).
     pub fn encode(&self, ids: &[u32]) -> Vec<f32> {
+        self.encode_with_images(ids, &[], &[], &[])
+    }
+
+    /// The 3-axis MRoPE position of every token.
+    ///
+    /// Text runs sequentially on all three axes; an image span pins the
+    /// time axis and lays its merged grid out on the other two, and
+    /// everything after it resumes from the grid's larger side rather
+    /// than from the span's length. With no image the three axes are
+    /// equal and this reduces to `0..n` — which is why the text-only
+    /// path can ignore the interleave entirely.
+    fn mrope_positions(&self, n: usize, spans: &[ImageSpan]) -> Vec<[f32; 3]> {
+        let mut pos: Vec<[f32; 3]> = (0..n).map(|i| [i as f32; 3]).collect();
+        let mut offset = 0i64;
+        for sp in spans {
+            let (start, end) = (sp.start, sp.start + sp.len);
+            let len_max = sp.merged_h.max(sp.merged_w) as i64;
+            let base = start as i64 + offset;
+            for i in start..end {
+                let k = i - start;
+                pos[i] = [
+                    base as f32,
+                    (base + (k / sp.merged_w) as i64) as f32,
+                    (base + (k % sp.merged_w) as i64) as f32,
+                ];
+            }
+            let next = len_max + start as i64;
+            for (j, p) in pos.iter_mut().enumerate().skip(end) {
+                let v = (next + offset + (j - end) as i64) as f32;
+                *p = [v; 3];
+            }
+            offset += len_max - sp.len as i64;
+        }
+        pos
+    }
+
+    /// Full forward with images. `embeds` replaces the token embedding
+    /// at `[span.start, span.start + span.len)` with the vision tower's
+    /// merged tokens; `deepstack[k]` is added at the visual positions
+    /// after LM layer k — the first layers, not the vision layers the
+    /// features were taken from.
+    pub fn encode_with_images(
+        &self,
+        ids: &[u32],
+        spans: &[ImageSpan],
+        embeds: &[Vec<f32>],
+        deepstack: &[Vec<f32>],
+    ) -> Vec<f32> {
         let n = ids.len();
         let hs = self.hidden;
         let (nh, nkv, hd) = (self.nh, self.nkv, self.hd);
@@ -165,6 +241,15 @@ impl Qwen3Encoder {
         for (i, &id) in ids.iter().enumerate() {
             self.embed.row_f32(id as usize, &mut h[i * hs..(i + 1) * hs]);
         }
+        for (sp, e) in spans.iter().zip(embeds) {
+            h[sp.start * hs..(sp.start + sp.len) * hs].copy_from_slice(&e[..sp.len * hs]);
+        }
+        let pos = self.mrope_positions(n, spans);
+        // Which rows a deepstack feature lands on, in span order.
+        let visual: Vec<usize> = spans
+            .iter()
+            .flat_map(|s| s.start..s.start + s.len)
+            .collect();
         let mut xn = vec![0f32; n * hs];
         let mut q_all = vec![0f32; n * nh * hd];
         let mut k_all = vec![0f32; n * nkv * hd];
@@ -172,15 +257,15 @@ impl Qwen3Encoder {
         let mut attn = vec![0f32; n * nh * hd];
         let mut proj = vec![0f32; n * hs];
 
-        for layer in &self.layers {
+        for (li, layer) in self.layers.iter().enumerate() {
             for (o, src) in xn.chunks_exact_mut(hs).zip(h.chunks_exact(hs)) {
                 rms_norm_into(src, &layer.input_norm, self.eps, o);
             }
             layer.q.matmat(&xn, n, &mut q_all, pool);
             layer.k.matmat(&xn, n, &mut k_all, pool);
             layer.v.matmat(&xn, n, &mut v_all, pool);
-            self.norm_rope(&mut q_all, n, nh, &layer.q_norm);
-            self.norm_rope(&mut k_all, n, nkv, &layer.k_norm);
+            self.norm_rope(&mut q_all, n, nh, &layer.q_norm, &pos);
+            self.norm_rope(&mut k_all, n, nkv, &layer.k_norm, &pos);
 
             attn.fill(0.0);
             let ap = SendPtr(attn.as_mut_ptr());
@@ -238,6 +323,13 @@ impl Qwen3Encoder {
             layer.down.matmat(&g, n, &mut proj, pool);
             for (d, &v) in h.iter_mut().zip(&proj) {
                 *d += v;
+            }
+            if let Some(f) = deepstack.get(li) {
+                for (k, &row) in visual.iter().enumerate() {
+                    for c in 0..hs {
+                        h[row * hs + c] += f[k * hs + c];
+                    }
+                }
             }
         }
         if let Some(w) = &self.final_norm {
