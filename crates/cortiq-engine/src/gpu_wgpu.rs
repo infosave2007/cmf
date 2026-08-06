@@ -9781,6 +9781,9 @@ fn init() -> Result<Ctx, String> {
         .features()
         .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
         && std::env::var("CMF_COOP").is_ok_and(|v| v != "0");
+    // Half precision, where the card has it: the matrix units take f16
+    // operands, and without this the shader cannot even name the type.
+    let want_f16 = adapter.features().contains(wgpu::Features::SHADER_F16);
     COOP_OK.store(want_coop, std::sync::atomic::Ordering::Relaxed);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cortiq-wgpu"),
@@ -9797,6 +9800,19 @@ fn init() -> Result<Ctx, String> {
             wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
         } else {
             wgpu::Features::empty()
+        } | if want_f16 {
+            wgpu::Features::SHADER_F16
+        } else {
+            wgpu::Features::empty()
+        },
+        // Anything wgpu prefixes with EXPERIMENTAL needs this token, and
+        // without it `request_device` fails outright rather than dropping
+        // the feature — which is how asking for cooperative matrices took
+        // the whole device down and every op with it.
+        experimental_features: if want_coop {
+            unsafe { wgpu::ExperimentalFeatures::enabled() }
+        } else {
+            wgpu::ExperimentalFeatures::disabled()
         },
         ..Default::default()
     }))
@@ -16337,7 +16353,7 @@ pub fn q4tp_matmat(
     ];
     let bind_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("q4tpmm-bg"),
-        layout: &c.q4tp_mm.get_bind_group_layout(0),
+        layout: &mm_pipeline(c, true).get_bind_group_layout(0),
         entries: &entries,
     });
     let mut enc = c
@@ -16350,7 +16366,7 @@ pub fn q4tp_matmat(
             label: Some("q4tpmm"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&c.q4tp_mm);
+        pass.set_pipeline(mm_pipeline(c, true));
         pass.set_bind_group(0, &bind_mm, &[]);
         pass.dispatch_workgroups(
             (rows as u32).div_ceil(64).min(MAX_WG),
@@ -17656,132 +17672,123 @@ impl FlatDispatch for wgpu::ComputePass<'_> {
 #[cfg(feature = "gpu")]
 const COOP_MM_SRC: &str = r#"
 enable wgpu_cooperative_matrix;
+enable f16;
 
 struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
 @group(0) @binding(0) var<storage, read> qmm: array<u32>;
-@group(0) @binding(1) var<storage, read> xmm4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> xmm: array<f32>;
 @group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
 @group(0) @binding(3) var<uniform> pmm: MmP;
 
 const KS: u32 = 32u;
-const AS: u32 = 32u;
 
-var<workgroup> cm_at: array<f32, 64u * 32u>;
-var<workgroup> cm_wt: array<f32, 64u * 32u>;
+// Operands are f16 because that is what the matrix units take; the
+// accumulator stays f32, which is the configuration the hardware reports
+// (M16 N16 K16, f16 x f16 -> f32).
+var<workgroup> cm_a: array<f16, 64 * 32>;
+// k-major: the B role is K x N read row by row, and the layout probe
+// settled that `coopLoad` means row-major for both operands. Staging the
+// weights the other way round and asking for a transposed load reads
+// something else again — measured, twice, both wrong.
+var<workgroup> cm_b: array<f16, 32 * 64>;
+// The result plane must be f32: storing an f32 accumulator into an f16
+// array compiles and writes nothing usable.
+var<workgroup> cm_c: array<f32, 64 * 64>;
 
-fn qmm_byte(off: u32) -> u32 {
+fn cm_byte(off: u32) -> u32 {
     return (qmm[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(128)
 fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
                 @builtin(local_invocation_index) tid: u32) {
     let cols = pmm.cols4 * 4u;
     let gpr = cols >> 5u;
     let m0 = wid.y * 64u;
     let n0 = wid.x * 64u;
+    // Four subgroups of 32. There is no portable subgroup index in WGSL,
+    // and the lane count is checked before this pipeline is used.
     let sg = tid / 32u;
 
-    var c0 = coop_mat8x8<f32, C>(0.0);
-    var c1 = coop_mat8x8<f32, C>(0.0);
-    var c2 = coop_mat8x8<f32, C>(0.0);
-    var c3 = coop_mat8x8<f32, C>(0.0);
-    var c4 = coop_mat8x8<f32, C>(0.0);
-    var c5 = coop_mat8x8<f32, C>(0.0);
-    var c6 = coop_mat8x8<f32, C>(0.0);
-    var c7 = coop_mat8x8<f32, C>(0.0);
+    var c0: coop_mat16x16<f32, C>;
+    var c1: coop_mat16x16<f32, C>;
+    var c2: coop_mat16x16<f32, C>;
+    var c3: coop_mat16x16<f32, C>;
+
+    let params_b = pmm.rows * gpr * 16u;
+    let codes_b = params_b + pmm.rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
 
     var k0 = 0u;
     loop {
         if (k0 >= cols) { break; }
-        // 64 rows x 32 k of each side, eight values a thread.
-        for (var t = tid; t < 64u * 8u; t = t + 256u) {
+        // 64 rows x 32 k of each side; 128 threads take sixteen apiece.
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
             let m = t / 8u;
             let k4 = (t % 8u) * 4u;
-            var xv = vec4<f32>(0.0);
             let col0 = k0 + k4;
+            let dst = m * KS + k4;
+            var v = vec4<f32>(0.0);
             if (m0 + m < pmm.nb && col0 < cols) {
-                xv = xmm4[((m0 + m) * cols + col0) >> 2u];
+                let base = (m0 + m) * cols + col0;
+                v = vec4<f32>(xmm[base], xmm[base + 1u], xmm[base + 2u], xmm[base + 3u]);
             }
-            let dst = m * AS + k4;
-            cm_at[dst] = xv.x; cm_at[dst + 1u] = xv.y;
-            cm_at[dst + 2u] = xv.z; cm_at[dst + 3u] = xv.w;
+            cm_a[dst] = f16(v.x); cm_a[dst + 1u] = f16(v.y);
+            cm_a[dst + 2u] = f16(v.z); cm_a[dst + 3u] = f16(v.w);
         }
-        for (var t = tid; t < 64u * 8u; t = t + 256u) {
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
             let n = t / 8u;
             let k4 = (t % 8u) * 4u;
-            var wv = vec4<f32>(0.0);
             let col0 = k0 + k4;
+            var wv = vec4<f32>(0.0);
             if (n0 + n < pmm.rows && col0 < cols) {
                 let g = col0 >> 5u;
                 let wrow = n0 + n;
-                let params_b = pmm.rows * gpr * 16u;
-                let codes_b = params_b + pmm.rows * 4u;
-                let cstride = (gpr * 5u + 7u) / 8u;
                 let bit = g * 5u;
                 let cb = codes_b + wrow * cstride + (bit >> 3u);
                 let sh = bit & 7u;
-                var cv = qmm_byte(cb);
-                if (sh > 3u) { cv = cv | (qmm_byte(cb + 1u) << 8u); }
+                var cv = cm_byte(cb);
+                if (sh > 3u) { cv = cv | (cm_byte(cb + 1u) << 8u); }
                 let pr = unpack2x16float(qmm[(params_b >> 2u) + wrow]);
                 let scale = exp2(pr.x + f32((cv >> sh) & 31u) * pr.y);
                 let toff = (wrow * gpr + g) * 16u;
-                let p = col0 - g * 32u;
-                let bo = toff + p / 2u;
-                let w32 = qmm[bo >> 2u];
-                let sh0 = (bo & 3u) * 8u;
-                let b0 = (w32 >> sh0) & 0xFFu;
-                var b1 = 0u;
-                if ((bo & 3u) == 3u) {
-                    b1 = qmm[(bo >> 2u) + 1u] & 0xFFu;
-                } else {
-                    b1 = (w32 >> (sh0 + 8u)) & 0xFFu;
-                }
+                let pp = col0 - g * 32u;
+                let bo = toff + pp / 2u;
+                let b0 = cm_byte(bo);
+                let b1 = cm_byte(bo + 1u);
                 wv[0u] = (f32(b0 & 0xFu) - 8.0) * scale;
                 wv[1u] = (f32(b0 >> 4u) - 8.0) * scale;
                 wv[2u] = (f32(b1 & 0xFu) - 8.0) * scale;
                 wv[3u] = (f32(b1 >> 4u) - 8.0) * scale;
             }
-            let dst = n * AS + k4;
-            cm_wt[dst] = wv.x; cm_wt[dst + 1u] = wv.y;
-            cm_wt[dst + 2u] = wv.z; cm_wt[dst + 3u] = wv.w;
+            // One n, four consecutive k — four rows of the k-major tile.
+            cm_b[k4 * 64u + n] = f16(wv.x);
+            cm_b[(k4 + 1u) * 64u + n] = f16(wv.y);
+            cm_b[(k4 + 2u) * 64u + n] = f16(wv.z);
+            cm_b[(k4 + 3u) * 64u + n] = f16(wv.w);
         }
         workgroupBarrier();
-        for (var kk = 0u; kk < KS; kk = kk + 8u) {
-            let a = coopLoad<coop_mat8x8<f32, A>>(&cm_at[sg * 8u * AS + kk], AS);
-            // The weight tile is row-major in n, and the B role wants
-            // K x N — hence the transposed load.
-            c0 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[0u * 8u * AS + kk], AS), c0);
-            c1 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[1u * 8u * AS + kk], AS), c1);
-            c2 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[2u * 8u * AS + kk], AS), c2);
-            c3 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[3u * 8u * AS + kk], AS), c3);
-            c4 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[4u * 8u * AS + kk], AS), c4);
-            c5 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[5u * 8u * AS + kk], AS), c5);
-            c6 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[6u * 8u * AS + kk], AS), c6);
-            c7 = coopMultiplyAdd(a, coopLoadT<coop_mat8x8<f32, B>>(&cm_wt[7u * 8u * AS + kk], AS), c7);
+        for (var kk = 0u; kk < KS; kk = kk + 16u) {
+            let a = coopLoad<coop_mat16x16<f16, A>>(&cm_a[sg * 16u * KS + kk], KS);
+            c0 = coopMultiplyAdd(a, coopLoad<coop_mat16x16<f16, B>>(&cm_b[kk * 64u + 0u], 64u), c0);
+            c1 = coopMultiplyAdd(a, coopLoad<coop_mat16x16<f16, B>>(&cm_b[kk * 64u + 16u], 64u), c1);
+            c2 = coopMultiplyAdd(a, coopLoad<coop_mat16x16<f16, B>>(&cm_b[kk * 64u + 32u], 64u), c2);
+            c3 = coopMultiplyAdd(a, coopLoad<coop_mat16x16<f16, B>>(&cm_b[kk * 64u + 48u], 64u), c3);
         }
         workgroupBarrier();
         k0 = k0 + KS;
     }
-    // Land the tile in shared memory, then copy out under bounds checks:
-    // a cooperative store cannot mask an edge tile.
     workgroupBarrier();
-    coopStore(c0, &cm_at[sg * 8u * AS + 0u], AS);
-    coopStore(c1, &cm_at[sg * 8u * AS + 8u], AS);
-    coopStore(c2, &cm_at[sg * 8u * AS + 16u], AS);
-    coopStore(c3, &cm_at[sg * 8u * AS + 24u], AS);
-    coopStore(c4, &cm_wt[sg * 8u * AS + 0u], AS);
-    coopStore(c5, &cm_wt[sg * 8u * AS + 8u], AS);
-    coopStore(c6, &cm_wt[sg * 8u * AS + 16u], AS);
-    coopStore(c7, &cm_wt[sg * 8u * AS + 24u], AS);
+    coopStore(c0, &cm_c[sg * 16u * 64u + 0u], 64u);
+    coopStore(c1, &cm_c[sg * 16u * 64u + 16u], 64u);
+    coopStore(c2, &cm_c[sg * 16u * 64u + 32u], 64u);
+    coopStore(c3, &cm_c[sg * 16u * 64u + 48u], 64u);
     workgroupBarrier();
-    for (var t = tid; t < 64u * 64u; t = t + 256u) {
+    for (var t = tid; t < 64u * 64u; t = t + 128u) {
         let m = t / 64u;
         let n = t % 64u;
         if (m0 + m < pmm.nb && n0 + n < pmm.rows) {
-            var v = 0.0;
-            if (n < 32u) { v = cm_at[m * AS + n]; } else { v = cm_wt[m * AS + n - 32u]; }
-            ymm[(m0 + m) * pmm.rows + n0 + n] = v;
+            ymm[(m0 + m) * pmm.rows + n0 + n] = cm_c[m * 64u + n];
         }
     }
 }
@@ -20273,6 +20280,272 @@ mod tests {
     //   cargo test -p cortiq-engine --release --features gpu attn_block_timing -- --ignored --nocapture
     fn env_usize(k: &str, d: usize) -> usize {
         std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    }
+
+    /// What do `coopLoad`, `coopLoadT` and `coopStore` actually mean?
+    /// A 16x16 product of two matrices whose answer is known by hand, so
+    /// the layout question is settled by arithmetic instead of by trying
+    /// variants on a GEMM with a thousand other moving parts.
+    ///
+    /// `cargo test -p cortiq-engine --release --features gpu
+    ///  wgpu_coop_layout_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn wgpu_coop_layout_probe() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        unsafe { std::env::set_var("CMF_COOP", "1") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu device — skipping");
+            return;
+        };
+        // a[i][k] = i + k/16, b[k][j] = (k == j) ? 1 : 0  → c == a.
+        // With b the identity, any mix-up in B's layout still returns a,
+        // so b is made asymmetric: b[k][j] = k*16 + j, and the expected
+        // product is computed on the host below.
+        let src = r#"
+enable wgpu_cooperative_matrix;
+enable f16;
+@group(0) @binding(0) var<storage, read> ain: array<f32>;
+@group(0) @binding(1) var<storage, read> bin: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+var<workgroup> sa: array<f16, 256>;
+var<workgroup> sb: array<f16, 256>;
+var<workgroup> sc: array<f32, 256>;
+@compute @workgroup_size(32)
+fn main(@builtin(local_invocation_index) tid: u32) {
+    for (var i = tid; i < 256u; i = i + 32u) {
+        sa[i] = f16(ain[i]);
+        sb[i] = f16(bin[i]);
+    }
+    workgroupBarrier();
+    let a = coopLoad<coop_mat16x16<f16, A>>(&sa[0], 16u);
+    let b = coopLoad<coop_mat16x16<f16, B>>(&sb[0], 16u);
+    var acc: coop_mat16x16<f32, C>;
+    acc = coopMultiplyAdd(a, b, acc);
+    coopStore(acc, &sc[0], 16u);
+    workgroupBarrier();
+    for (var i = tid; i < 256u; i = i + 32u) { out[i] = sc[i]; }
+}
+"#;
+        let scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let m = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("coop-layout"),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
+        });
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            println!("module rejected: {e}");
+            return;
+        }
+        let pipe = c
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("coop-layout"),
+                layout: None,
+                module: &m,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        // What the driver actually gives a 128-thread workgroup: the GEMM
+        // derives its subgroup index as `tid / 32`, which is only right if
+        // this says 32 and the assignment is linear.
+        {
+            let probe = r#"
+enable subgroups;
+@group(0) @binding(0) var<storage, read_write> o: array<f32>;
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_index) tid: u32,
+        @builtin(subgroup_size) ssz: u32,
+        @builtin(subgroup_invocation_id) sid: u32) {
+    o[tid] = f32(ssz) * 1000.0 + f32(sid);
+}
+"#;
+            let sc2 = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let pm = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("sg-probe"),
+                source: wgpu::ShaderSource::Wgsl(probe.into()),
+            });
+            if let Some(e) = pollster::block_on(sc2.pop()) {
+                println!("subgroup probe rejected: {}", format!("{e}").lines().take(2).collect::<Vec<_>>().join(" | "));
+            } else {
+                let pp = c.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("sg-probe"),
+                    layout: None,
+                    module: &pm,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+                let ob2 = c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: 512,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let st2 = c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: 512,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bg2 = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &pp.get_bind_group_layout(0),
+                    entries: &[bind_buf(0, &ob2)],
+                });
+                let mut e2 = c
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                {
+                    let mut ps = begin_pass(&mut e2);
+                    ps.set_pipeline(&pp);
+                    ps.set_bind_group(0, &bg2, &[]);
+                    ps.dispatch_workgroups(1, 1, 1);
+                }
+                let mut sg = vec![0f32; 128];
+                if readback(c, e2, &ob2, &st2, 512, &mut sg) {
+                    let size = (sg[0] / 1000.0) as u32;
+                    let linear = (0..128).all(|i| (sg[i] as u32 % 1000) == (i as u32 % size));
+                    println!("subgroup size {size}, tid/{size} is the subgroup index: {linear}");
+                }
+            }
+        }
+        let a: Vec<f32> = (0..256).map(|i| (i / 16) as f32 + (i % 16) as f32 / 16.0).collect();
+        let b: Vec<f32> = (0..256).map(|i| ((i / 16) * 16 + (i % 16)) as f32 / 64.0).collect();
+        let mk = |d: &[f32], usage: wgpu::BufferUsages| {
+            use wgpu::util::DeviceExt;
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(d),
+                    usage,
+                })
+        };
+        let ab = mk(&a, wgpu::BufferUsages::STORAGE);
+        let bb = mk(&b, wgpu::BufferUsages::STORAGE);
+        let ob = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 1024,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 1024,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[bind_buf(0, &ab), bind_buf(1, &bb), bind_buf(2, &ob)],
+        });
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(&pipe);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        let mut got = vec![0f32; 256];
+        assert!(readback(c, enc, &ob, &stage, 1024, &mut got), "readback");
+        // Row-major on both sides: c[i][j] = sum_k a[i][k] * b[k][j].
+        let mut want = vec![0f32; 256];
+        for i in 0..16 {
+            for j in 0..16 {
+                want[i * 16 + j] = (0..16).map(|k| a[i * 16 + k] * b[k * 16 + j]).sum();
+            }
+        }
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (g - w).abs() / w.abs().max(1.0))
+            .fold(0f32, f32::max);
+        println!("row-major both: worst {worst:.3e}   got[0]={} want[0]={}", got[0], want[0]);
+        // And what it would be if B were read column-major.
+        let mut wantt = vec![0f32; 256];
+        for i in 0..16 {
+            for j in 0..16 {
+                wantt[i * 16 + j] = (0..16).map(|k| a[i * 16 + k] * b[j * 16 + k]).sum();
+            }
+        }
+        let worstt = got
+            .iter()
+            .zip(&wantt)
+            .map(|(g, w)| (g - w).abs() / w.abs().max(1.0))
+            .fold(0f32, f32::max);
+        println!("B column-major:  worst {worstt:.3e}  wantT[0]={}", wantt[0]);
+    }
+
+    /// Does wgpu accept the shape the hardware actually implements —
+    /// f16 16x16 with an f32 accumulator? Its docs say 8x8 f32 only, but
+    /// naga's type generator knows `coop_mat16x16`, and a doc sentence is
+    /// not a test. If this compiles, the native Vulkan lane is unnecessary.
+    #[test]
+    #[ignore]
+    fn wgpu_coop_f16_16x16_probe() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        unsafe { std::env::set_var("CMF_COOP", "1") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu device — skipping");
+            return;
+        };
+        for (label, src) in [
+            (
+                "16x16 f16 in, f32 out",
+                r#"
+enable wgpu_cooperative_matrix;
+enable f16;
+@group(0) @binding(0) var<storage, read_write> y: array<f32>;
+var<workgroup> sa: array<f16, 256>;
+var<workgroup> sb: array<f16, 256>;
+var<workgroup> sc: array<f32, 256>;
+@compute @workgroup_size(32)
+fn main() {
+    let a = coopLoad<coop_mat16x16<f16, A>>(&sa[0], 16u);
+    let b = coopLoad<coop_mat16x16<f16, B>>(&sb[0], 16u);
+    var acc: coop_mat16x16<f32, C>;
+    acc = coopMultiplyAdd(a, b, acc);
+    coopStore(acc, &sc[0], 16u);
+    y[0] = sc[0];
+}
+"#,
+            ),
+            (
+                "8x8 f32, what the docs promise",
+                r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage, read_write> y: array<f32>;
+var<workgroup> sa: array<f32, 64>;
+var<workgroup> sb: array<f32, 64>;
+var<workgroup> sc: array<f32, 64>;
+@compute @workgroup_size(32)
+fn main() {
+    let a = coopLoad<coop_mat8x8<f32, A>>(&sa[0], 8u);
+    let b = coopLoad<coop_mat8x8<f32, B>>(&sb[0], 8u);
+    var acc: coop_mat8x8<f32, C>;
+    acc = coopMultiplyAdd(a, b, acc);
+    coopStore(acc, &sc[0], 8u);
+    y[0] = sc[0];
+}
+"#,
+            ),
+        ] {
+            let scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let _m = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            match pollster::block_on(scope.pop()) {
+                None => println!("{label}: ACCEPTED"),
+                Some(e) => {
+                    let t = format!("{e}");
+                    println!("{label}: rejected — {}", t.lines().take(8).collect::<Vec<_>>().join(" | "));
+                }
+            }
+        }
     }
 
     /// What the selected adapter offers for matrix math: cooperative

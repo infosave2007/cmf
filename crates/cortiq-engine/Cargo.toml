@@ -34,7 +34,7 @@ bytemuck = { version = "1", optional = true, features = ["derive"] }
 
 [features]
 # `--features gpu` enables the wgpu path; test on a discrete card.
-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:ash"]
 
 # GPU path (D5): Metal on Apple Silicon; unified memory + no-copy buffers.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -43,3 +43,11 @@ metal = "0.29"
 # gettid for the worker-tid registry (ADPF) + Android core pinning.
 [target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
 libc = "0.2"
+
+# The native Vulkan fast lane. `ash` is bindings and nothing else — it
+# links no library, it opens `libvulkan.so.1` at run time exactly as wgpu
+# already does, so this adds a code path and not a dependency. Only where
+# Vulkan exists: Apple has none (the Metal backend uses its own matrix
+# units) and the wgpu path remains the universal one everywhere.
+[target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))'.dependencies]
+ash = { version = "0.38", optional = true }

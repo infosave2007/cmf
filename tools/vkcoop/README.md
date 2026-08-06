@@ -8,14 +8,27 @@ cores actually implement.
     NVIDIA RTX PRO 6000 Blackwell, 9216×2304 weights, 2085 tokens
 
     wgpu, scalar fp32          25 082 GFLOP/s     3.53 ms
-    Vulkan, cooperative f16    81 315 GFLOP/s     1.09 ms   3.24×
+    Vulkan, cooperative f16    62 776 GFLOP/s     1.41 ms   2.50×
+
+The first number this probe produced was 81 315 GFLOP/s, from a kernel
+that stored its f32 accumulators into an f16 plane and therefore wrote
+nothing: a benchmark with no correctness check measures whatever the
+shader felt like doing. `crates/cortiq-engine/tests/vk_coop.rs` now pins
+the kernel to `dequant_q4tp` before anyone times it.
 
 It exists to answer one question before a large amount of work is done on
-its assumption: is the runtime the ceiling, or is the kernel? It is the
-runtime. wgpu 30 exposes exactly one cooperative shape, 8×8 f32, which
-this driver does not implement on the matrix units — asked for it, a
-render went from 0.68 s a step to 52. Vulkan directly reports what the
-hardware has:
+its assumption: is the runtime the ceiling, or is the kernel?
+
+The first answer was "the runtime", and it was wrong. Asking wgpu for
+cooperative matrices appeared to make a render forty times slower, which
+read as a driver falling off the matrix units. It was not: `request_device`
+was *failing* — anything wgpu prefixes with EXPERIMENTAL needs an
+`ExperimentalFeatures` token that we were not passing — so the GPU path
+never came up at all and the whole render ran on the CPU. With the token,
+and with `SHADER_F16` requested, wgpu accepts `coop_mat16x16<f16, A>` with
+an f32 accumulator: the shape its own documentation says is unsupported.
+
+Vulkan directly reports what the hardware has:
 
     M16 N16 K16  f16 × f16 → f32     ← what this probe uses
     M16 N16 K32  i8  × i8  → i32     ← 2× again, and our quantisation

@@ -12,6 +12,13 @@ pub mod gpu;
 pub mod gpu_metal;
 #[cfg(feature = "gpu")]
 pub mod gpu_wgpu;
+/// The native Vulkan lane — an accelerator behind a capability probe,
+/// present only where Vulkan is.
+#[cfg(all(
+    feature = "gpu",
+    any(target_os = "linux", target_os = "windows", target_os = "android")
+))]
+pub mod vulkan;
 pub mod imagegen;
 pub mod inference;
 pub mod kv_cache;
