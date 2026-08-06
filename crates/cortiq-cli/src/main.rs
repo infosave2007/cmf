@@ -913,10 +913,75 @@ enum Commands {
         /// JPEG quality for the AVI's frames
         #[arg(long, default_value_t = 92)]
         quality: u32,
+        /// First frame of the clip, as a binary P6 PPM. Turns the run
+        /// into fl2va: the picture conditions the DiT as a latent AND
+        /// enters the prompt as a vision block
+        #[arg(long)]
+        first_frame: Option<String>,
+        /// Last frame, same format. Cover-cropped to the canvas where
+        /// the first one is stretched, as the reference does
+        #[arg(long)]
+        last_frame: Option<String>,
         /// Output .avi (a .wav is written alongside)
         #[arg(long, default_value = "out.avi")]
         out: String,
     },
+}
+
+/// A binary P6 PPM → RGB in [0, 1] as `[3, h, w]`.
+///
+/// PPM and not PNG on purpose: a decoder for either of the compressed
+/// formats is a few hundred lines of table-driven code for something
+/// every tool on the machine can already write, and `cortiq` earns its
+/// "nothing to install" by not carrying code it does not need.
+fn read_ppm(path: &str) -> anyhow::Result<(Vec<f32>, usize, usize)> {
+    let b = std::fs::read(path).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    let mut it = b.iter().copied().enumerate();
+    let mut fields: Vec<usize> = Vec::new();
+    let mut cur: Option<usize> = None;
+    let mut start = 0usize;
+    let mut comment = false;
+    for (i, c) in it.by_ref() {
+        if i == 0 || i == 1 {
+            continue; // "P6"
+        }
+        if comment {
+            if c == b'\n' {
+                comment = false;
+            }
+            continue;
+        }
+        if c == b'#' {
+            comment = true;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            cur = Some(cur.unwrap_or(0) * 10 + (c - b'0') as usize);
+        } else if let Some(v) = cur.take() {
+            fields.push(v);
+            if fields.len() == 3 {
+                start = i + 1;
+                break;
+            }
+        }
+    }
+    if &b[..2] != b"P6" || fields.len() != 3 {
+        return Err(anyhow::anyhow!("{path}: not a binary P6 PPM"));
+    }
+    let (w, h, maxv) = (fields[0], fields[1], fields[2]);
+    if maxv != 255 {
+        return Err(anyhow::anyhow!("{path}: only 8-bit PPM (maxval 255)"));
+    }
+    let px = b
+        .get(start..start + w * h * 3)
+        .ok_or_else(|| anyhow::anyhow!("{path}: truncated ({} bytes short)", w * h * 3))?;
+    let mut out = vec![0f32; 3 * h * w];
+    for p in 0..h * w {
+        for c in 0..3 {
+            out[c * h * w + p] = px[p * 3 + c] as f32 / 255.0;
+        }
+    }
+    Ok((out, h, w))
 }
 
 /// Convert/import progress. `@PROGRESS <fraction>` is a marker for supervisors
@@ -1387,6 +1452,8 @@ async fn main() -> anyhow::Result<()> {
             seed,
             stock_sampler,
             quality,
+            first_frame,
+            last_frame,
             out,
         } => cmd_animate(
             &model,
@@ -1398,6 +1465,8 @@ async fn main() -> anyhow::Result<()> {
                 steps,
                 seed,
                 stock_sampler,
+                first_frame: first_frame.as_deref().map(read_ppm).transpose()?,
+                last_frame: last_frame.as_deref().map(read_ppm).transpose()?,
                 ..Default::default()
             },
             quality,

@@ -81,9 +81,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the parity gate sets `aug = 1` so everything else compares
   exactly.
 
-  What remains for `fl2va` is the pipeline: reading a picture, and
-  calling the encoder and the tower from `videogen`. `ref2va`
-  additionally needs the encoder's other two temporal taps.
+- **`cortiq animate --first-frame / --last-frame`** — the pipeline
+  around all of the above. A picture conditions the run twice, from one
+  read: the VAE encoder turns it into the latent the DiT holds in a
+  condition row, and the vision tower turns it into the tokens the
+  prompt carries as `"<Picture 1>: "` and a vision block. The first
+  frame is a geometry anchor and is stretched to the canvas; the last
+  one follows and is cover-cropped, which is what the reference node
+  does with each.
+
+  Pictures come in as binary P6 PPM. A PNG or JPEG decoder is a few
+  hundred lines of table-driven code for something every tool on the
+  machine can already write, and this binary earns its "nothing to
+  install" by not carrying code it does not need.
+
+  `ref2va` — reference images, videos and audio — is still out: it
+  needs the encoder's other two temporal taps, the ones a single frame
+  cannot reach.
 
   The parity harness for all of this now runs on an ordinary host, with
   no GPU and no stand. The DiT's reference needs a CUDA-only fused
