@@ -7,6 +7,14 @@
 use cortiq_core::quant::f32_to_f16;
 use cortiq_core::*;
 
+/// Every `matmat` below runs inside `gpu::cpu_scope`. Built with the
+/// `gpu` feature — which the CLI turns on by default, so a workspace test
+/// run gets it — the dispatcher probes device against host and hands some
+/// calls to the GPU. Two calls meant to differ only in CPU blocking then
+/// landed on different processors, and the comparison measured int8
+/// activations against the device's f32: 0.0055, reported as a kernel
+/// mismatch. Standalone (`-p cortiq-engine --test x86_gemm`) the feature
+/// is off and the tests passed, which is why this hid.
 /// The switch these tests flip is process-global, so they take turns.
 /// Poisoning is ignored deliberately: one test failing its assertion must
 /// not turn the other three into a second, misleading failure.
@@ -120,9 +128,9 @@ fn blocked_vs_per_row() {
 
     // Parity first.
     cortiq_engine::qtensor::set_blocked_override(Some(true));
-    qt.matmat(&x, b, &mut y_a, None);
+    cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_a, None));
     cortiq_engine::qtensor::set_blocked_override(Some(false));
-    qt.matmat(&x, b, &mut y_b, None);
+    cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_b, None));
     let max_d = y_a
         .iter()
         .zip(&y_b)
@@ -135,11 +143,11 @@ fn blocked_vs_per_row() {
     for _ in 0..6 {
         cortiq_engine::qtensor::set_blocked_override(Some(true));
         let t0 = std::time::Instant::now();
-        qt.matmat(&x, b, &mut y_a, None);
+        cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_a, None));
         t_blk = t_blk.min(t0.elapsed().as_secs_f64() * 1000.0);
         cortiq_engine::qtensor::set_blocked_override(Some(false));
         let t1 = std::time::Instant::now();
-        qt.matmat(&x, b, &mut y_b, None);
+        cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_b, None));
         t_row = t_row.min(t1.elapsed().as_secs_f64() * 1000.0);
     }
     let gflop = 2.0 * (b * rows * cols) as f64 / 1e9;
@@ -259,9 +267,9 @@ fn q1_blocked_vs_per_row() {
     let mut y_a = vec![0f32; b * rows];
     let mut y_b = vec![0f32; b * rows];
     cortiq_engine::qtensor::set_blocked_override(Some(true));
-    qt.matmat(&x, b, &mut y_a, None);
+    cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_a, None));
     cortiq_engine::qtensor::set_blocked_override(Some(false));
-    qt.matmat(&x, b, &mut y_b, None);
+    cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_b, None));
     cortiq_engine::qtensor::set_blocked_override(None);
     let max_d = y_a
         .iter()
@@ -273,11 +281,11 @@ fn q1_blocked_vs_per_row() {
     for _ in 0..6 {
         cortiq_engine::qtensor::set_blocked_override(Some(true));
         let t0 = std::time::Instant::now();
-        qt.matmat(&x, b, &mut y_a, None);
+        cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_a, None));
         t_blk = t_blk.min(t0.elapsed().as_secs_f64() * 1000.0);
         cortiq_engine::qtensor::set_blocked_override(Some(false));
         let t1 = std::time::Instant::now();
-        qt.matmat(&x, b, &mut y_b, None);
+        cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_b, None));
         t_row = t_row.min(t1.elapsed().as_secs_f64() * 1000.0);
     }
     cortiq_engine::qtensor::set_blocked_override(None);
@@ -400,9 +408,9 @@ fn q4b_blocked_vs_per_row() {
     let mut y_a = vec![0f32; b * rows];
     let mut y_b = vec![0f32; b * rows];
     cortiq_engine::qtensor::set_blocked_override(Some(true));
-    qt.matmat(&x, b, &mut y_a, None);
+    cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_a, None));
     cortiq_engine::qtensor::set_blocked_override(Some(false));
-    qt.matmat(&x, b, &mut y_b, None);
+    cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_b, None));
     let max_d = y_a
         .iter()
         .zip(&y_b)
@@ -413,11 +421,11 @@ fn q4b_blocked_vs_per_row() {
     for _ in 0..6 {
         cortiq_engine::qtensor::set_blocked_override(Some(true));
         let t0 = std::time::Instant::now();
-        qt.matmat(&x, b, &mut y_a, None);
+        cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_a, None));
         t_blk = t_blk.min(t0.elapsed().as_secs_f64() * 1000.0);
         cortiq_engine::qtensor::set_blocked_override(Some(false));
         let t1 = std::time::Instant::now();
-        qt.matmat(&x, b, &mut y_b, None);
+        cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_b, None));
         t_row = t_row.min(t1.elapsed().as_secs_f64() * 1000.0);
     }
     let gflop = 2.0 * (b * rows * cols) as f64 / 1e9;
@@ -549,9 +557,9 @@ fn q4t_blocked_vs_per_row() {
     let mut y_a = vec![0f32; b * rows];
     let mut y_b = vec![0f32; b * rows];
     cortiq_engine::qtensor::set_blocked_override(Some(true));
-    qt.matmat(&x, b, &mut y_a, None);
+    cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_a, None));
     cortiq_engine::qtensor::set_blocked_override(Some(false));
-    qt.matmat(&x, b, &mut y_b, None);
+    cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_b, None));
     let max_d = y_a
         .iter()
         .zip(&y_b)
@@ -562,11 +570,11 @@ fn q4t_blocked_vs_per_row() {
     for _ in 0..6 {
         cortiq_engine::qtensor::set_blocked_override(Some(true));
         let t0 = std::time::Instant::now();
-        qt.matmat(&x, b, &mut y_a, None);
+        cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_a, None));
         t_blk = t_blk.min(t0.elapsed().as_secs_f64() * 1000.0);
         cortiq_engine::qtensor::set_blocked_override(Some(false));
         let t1 = std::time::Instant::now();
-        qt.matmat(&x, b, &mut y_b, None);
+        cortiq_engine::gpu::cpu_scope(|| qt.matmat(&x, b, &mut y_b, None));
         t_row = t_row.min(t1.elapsed().as_secs_f64() * 1000.0);
     }
     let gflop = 2.0 * (b * rows * cols) as f64 / 1e9;
