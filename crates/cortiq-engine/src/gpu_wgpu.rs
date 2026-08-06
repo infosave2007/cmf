@@ -9469,6 +9469,17 @@ struct Ctx {
     /// key (0, n) holds shared zero buffers. Assumes stable weight pointers
     /// (mmap), same as `weight_bufs`.
     const_bufs: Mutex<HashMap<(usize, usize), wgpu::Buffer>>,
+    /// `gemm_nt_f32`'s w-side cache, keyed on the CONTENT and not on the
+    /// address. Every batched attention in this engine hands that
+    /// function a per-head SCRATCH buffer as `w` — one `kh`/`vt` pair
+    /// allocated per call and refilled per head — so the address is
+    /// stable across heads while the matrix is not, and an
+    /// address-keyed entry silently serves head 0's keys to every other
+    /// head. (`CmfModel::uid` documents the same footgun on the model
+    /// mapping; this is the same mistake one file over.) The
+    /// fingerprint is a sequential read of a buffer we would otherwise
+    /// push over PCIe, so a genuinely stable weight still uploads once.
+    gemm_w_bufs: Mutex<HashMap<(usize, usize), (wgpu::Buffer, u64)>>,
     /// Per-role scratch for the fused DiT block, kept between calls. The
     /// block used to allocate its sixteen intermediates fresh every time —
     /// three of them 77 MB at 512x512 — which is ~300 MB of driver
@@ -10398,6 +10409,7 @@ fn init() -> Result<Ctx, String> {
         uniforms: Mutex::new(HashMap::new()),
         uniforms8: Mutex::new(HashMap::new()),
         const_bufs: Mutex::new(HashMap::new()),
+        gemm_w_bufs: Mutex::new(HashMap::new()),
         dit_pool: Mutex::new(HashMap::new()),
         rs_bufs: Mutex::new(HashMap::new()),
         attn_kv: Mutex::new(HashMap::new()),
@@ -26131,6 +26143,24 @@ pub static DRAFT_RESERVE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// dispatch). Bit-parity is NOT claimed (GPU sum order differs); the
 /// trainer's loss landscape does not care, and the quality gate at the
 /// end is the arbiter.
+/// 64-bit FNV-1a over a float buffer, read eight bytes at a time. Used
+/// to tell "the same weight again" from "a scratch buffer refilled with
+/// a different head" — one sequential pass, against a PCIe upload.
+fn fingerprint_f32(w: &[f32]) -> u64 {
+    let bytes: &[u8] = bytemuck::cast_slice(w);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let (chunks, tail) = bytes.split_at(bytes.len() & !7);
+    for c in chunks.chunks_exact(8) {
+        h ^= u64::from_le_bytes(c.try_into().unwrap());
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    for &b in tail {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
 pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
     if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
         return false;
@@ -26145,19 +26175,30 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
     }
     let wbuf = {
         let key = (w.as_ptr() as usize, w.len());
-        let mut cb = c.const_bufs.lock().unwrap();
-        if let Some(b) = cb.get(&key) {
-            b.clone()
-        } else {
-            let b = c.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("bake-w"),
-                size: (w.len() * 4) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(w));
-            cb.insert(key, b.clone());
-            b
+        let fp = fingerprint_f32(w);
+        let mut cb = c.gemm_w_bufs.lock().unwrap();
+        match cb.get(&key) {
+            // Same address AND same contents: the upload already happened.
+            Some((b, f)) if *f == fp => b.clone(),
+            // Same address, different matrix — a reused scratch buffer.
+            // Refill the device copy rather than hand back the last one.
+            Some((b, _)) => {
+                let b = b.clone();
+                c.queue.write_buffer(&b, 0, bytemuck::cast_slice(w));
+                cb.insert(key, (b.clone(), fp));
+                b
+            }
+            None => {
+                let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("bake-w"),
+                    size: (w.len() * 4) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                c.queue.write_buffer(&b, 0, bytemuck::cast_slice(w));
+                cb.insert(key, (b.clone(), fp));
+                b
+            }
         }
     };
     let xbuf = c.device.create_buffer(&wgpu::BufferDescriptor {

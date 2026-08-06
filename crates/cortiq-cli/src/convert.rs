@@ -3927,7 +3927,7 @@ pub(crate) fn q2tp_expert_gate_or_up(name: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cortiq_core::format::CmfModel;
 
@@ -3935,10 +3935,10 @@ mod tests {
     /// harness runs tests on threads of ONE process — so two tests steering
     /// different switches at once make each other's results meaningless.
     /// Everything that touches those variables takes this first.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Pin both switches for the duration of a test, whatever ran before.
-    fn env_guard(threads: &str, search: &str) -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn env_guard(threads: &str, search: &str) -> std::sync::MutexGuard<'static, ()> {
         let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("CMF_ENCODE_THREADS", threads);

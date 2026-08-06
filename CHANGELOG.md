@@ -7,7 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.59] - 2026-08-07
+
+### Added
+- **MiniMax-H3 with the 4-step Turbo LoRA: video AND synchronized stereo
+  audio, from one 23.5 GB file.** `cortiq animate-pack` packs the DiT, the
+  Qwen3-VL-32B prompt encoder, the ViT3D video decoder and the BigVGAN
+  vocoder into one mmap; `cortiq animate` renders an MJPEG+PCM AVI and a
+  .wav with no ffmpeg and nothing to install. Against the reference — four
+  files plus a ComfyUI checkout — that is 124.4 GB down to 23.5.
+
+  Most of the reduction is not quantization. **Forty per cent of the
+  released 33 B DiT is `adaln_proj.linear`**: `[96768, 2688]` per block,
+  13 B parameters, for a map whose input is one number. Its output over
+  the schedule is a 1-D curve, and Comfy-Org's pruned checkpoints already
+  ship it as a rank-8 one. The Turbo LoRA is written against the full
+  matrix, which is why the ComfyUI node re-injects the time conditioning
+  at run time; the packer folds both into one rank-24 basis,
+  `[W_p | B] · [u(t) ; A·silu(e(t))]`, 4.6 MB a block instead of 520.
+  `tools/mmh3_fetch.py check` measures what the collapse costs by
+  range-reading 520 MB out of the 66 GB file: rms 8.7e-5 against a signal
+  of rms 0.464, with the time curve's 9th singular value already 3.7e-5
+  of its first.
+
+  Parity is per stack, against ComfyUI's own modules on toy checkpoints
+  carrying the release's real tensor names and real schedules
+  (`tools/mmh3_toy_gate.sh`): DiT video velocity 8.8e-5 worst on a signal
+  of 0.515, audio velocity 5.2e-5 on 0.409, prompt encoder 1.1e-6, video
+  decoder 4.2e-7 including its 256-pixel tiling — which is part of the
+  output, not a memory strategy, because the decoder is global attention —
+  and the vocoder 1.7e-9.
+
+### Fixed
+- **`gemm_nt_f32` cached the device-side weight buffer BY POINTER
+  ADDRESS.** Every batched attention in this engine allocates one k/v
+  scratch pair per call and refills it per head, so the address is
+  constant across heads while the matrix is not — head 0's keys came
+  back for every head, on the GPU only, silently. It is the same
+  mistake `CmfModel::uid` documents on the model mapping, one file
+  over. The cache is keyed on a content fingerprint now: one sequential
+  read against a PCIe upload, so a genuinely stable weight still
+  uploads once. `tests/gpu_gemm_scratch.rs` refills a buffer between
+  two calls and would have caught it.
+- **`gemm_nt` took every job over 4 M MACs on sight, with no CPU arm to
+  lose to.** It carries attention's per-head QKᵀ and AV and the video
+  decoder's projections, where the round trip costs more than the work
+  — on the MiniMax-H3 decoder the device was THREE TIMES SLOWER than
+  the host it displaced. It goes through the same probe as every other
+  op class now (`OpClass::GemmNt`), which on that stack measures
+  0.24 ms against the host's 0.13 and hands the work back.
+- **The cooperative-matrix GEMM runs this model out of f16 range.** At
+  256×160 the render is correct; at 512×288 the audio stream goes NaN
+  on the second sampling step and the video follows. Bisected against
+  the alternatives: `CMF_BAKE_GPU=0` does not help, `CMF_COOP=0` does.
+  Tensor cores are worth having here, so `cortiq animate` pins
+  `CMF_COOP=0` as a hold rather than a verdict — the kernel needs a
+  scale before it can carry these activations.
+- **`cortiq animate` decides its own device policy before the backend
+  comes up.** `gpu::cpu_scope` cannot do it: it sets a thread-local the
+  op probe's own CPU arm reads, while the probe still executes the
+  device arm for real while timing it.
+
 ### Changed
+- **MiniMax-H3 on one GPU: 371.3 → 172.0 s** for a 512×288, 39-frame
+  render, against the same host baseline and the same four steps. The
+  weight GEMMs go to the device (25.8 ms against the host's 92.0),
+  attention and the small per-head products stay on it. What was left
+  on the host after that was the DiT's elementwise glue — four RMS
+  norms, two modulations, two gated residuals and a SwiGLU per block,
+  all running on one thread while forty-seven sat idle — plus four full
+  copies of `n·heads·head_dim` per block to normalize q and k through a
+  scratch buffer. The norms, the modulation, the residuals and the
+  activation are across the pool now, and the rotation happens where
+  the values already lie: 10 G element copies a render, gone.
+
 - **DeepSeek-V4 decode: 10.6 → 27.2 tok/s** on an RTX PRO 6000, measured at
   each step against the same 192-token bench and gated on five toy stands
   plus golden parity. In order: the chain's bind groups cached; the hash
@@ -2143,7 +2216,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.5.59...HEAD
+[0.5.59]: https://github.com/infosave2007/cmf/compare/v0.2.2...v0.5.59
 [0.2.2]: https://github.com/infosave2007/cmf/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/infosave2007/cmf/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/infosave2007/cmf/compare/v0.1.10...v0.2.0

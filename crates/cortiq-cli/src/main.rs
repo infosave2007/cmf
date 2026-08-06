@@ -8,8 +8,10 @@ mod moedefrag;
 mod awnp;
 mod requant;
 mod npy;
+mod avout;
 mod sign;
 mod skill;
+mod videopack;
 
 use clap::{Parser, Subcommand};
 use cortiq_core::CmfModel;
@@ -823,6 +825,87 @@ enum Commands {
         #[arg(long)]
         out: String,
     },
+    /// Pack MiniMax-H3 (+ the 4-step Turbo LoRA) into ONE quantized
+    /// .cmf that `animate` runs straight off the mmap. Each source is
+    /// optional and `--in` carries a previous pass through, so a stand
+    /// with less disk than the sum of the inputs packs one at a time.
+    AnimatePack {
+        /// Output .cmf path
+        #[arg(long)]
+        out: String,
+        /// A .cmf from an earlier pass; its tensors are copied through
+        #[arg(long = "in")]
+        carry: Option<String>,
+        /// MiniMax-H3 DiT — the PRUNED/curve checkpoint
+        /// (minimax_h3_*_pruned_bf16.safetensors)
+        #[arg(long)]
+        dit: Option<String>,
+        /// Turbo 4-step LoRA, merged into the packed weights
+        #[arg(long)]
+        lora: Option<String>,
+        /// The silu(t_emb) curve the LoRA's adaLN update lives in —
+        /// needed only with `--lora` on a pruned base. Either the Turbo
+        /// node's bundled `h3_silu_temb_grid.safetensors` (5.5 MB) or
+        /// the full checkpoint's four `time_embedder.*` tensors
+        /// (tools/mmh3_fetch.py range-reads them, 64 MB)
+        #[arg(long)]
+        time_embedder: Option<String>,
+        /// LoRA strength: down for over-sharp grain, up for smear
+        #[arg(long, default_value_t = 1.0)]
+        lora_scale: f32,
+        /// Qwen3-VL-32B prompt encoder safetensors
+        #[arg(long)]
+        te: Option<String>,
+        /// Video VAE (only the ViT3D decoder half is packed)
+        #[arg(long)]
+        video_vae: Option<String>,
+        /// Audio VAE (only the BigVGAN decoder half is packed)
+        #[arg(long)]
+        audio_vae: Option<String>,
+        /// Qwen3-VL tokenizer.json for the VOCAB section
+        #[arg(long)]
+        tokenizer: Option<String>,
+        /// Projection codec: q4tp | q8 | f16 (norms and the fp32 island
+        /// stay exact, adaLN curves f16)
+        #[arg(long, default_value = "q4tp")]
+        quant: String,
+        /// Attention heads of the video VAE's ViT3D decoder — an
+        /// architecture constant of the release, not in the checkpoint
+        #[arg(long, default_value_t = 32)]
+        vvae_heads: usize,
+    },
+    /// MiniMax-H3 text → video with synchronized stereo audio, from a
+    /// `.cmf` packed by `animate-pack`. Writes an MJPEG+PCM AVI (and a
+    /// .wav beside it) — no ffmpeg, nothing to install
+    Animate {
+        /// Packed .cmf
+        model: String,
+        #[arg(long)]
+        prompt: String,
+        /// Multiple of 32; the trained short edge is 768
+        #[arg(long, default_value_t = 512)]
+        width: usize,
+        #[arg(long, default_value_t = 288)]
+        height: usize,
+        /// Frames at 24 fps, snapped up to the model's 17k+5 grid
+        #[arg(long, default_value_t = 39)]
+        frames: usize,
+        /// The Turbo LoRA is trained for 4; more still helps a little
+        #[arg(long, default_value_t = 4)]
+        steps: usize,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Integrate the audio on the VIDEO sigma grid, as a stock
+        /// sampler does. Wrong at 4 steps; here to measure how wrong
+        #[arg(long)]
+        stock_sampler: bool,
+        /// JPEG quality for the AVI's frames
+        #[arg(long, default_value_t = 92)]
+        quality: u32,
+        /// Output .avi (a .wav is written alongside)
+        #[arg(long, default_value = "out.avi")]
+        out: String,
+    },
 }
 
 /// Convert/import progress. `@PROGRESS <fraction>` is a marker for supervisors
@@ -1246,6 +1329,59 @@ async fn main() -> anyhow::Result<()> {
         Commands::ImaginePack { root, quant, out } => {
             imagepack::cmd_imagine_pack(&root, &quant, &out)
         }
+        Commands::AnimatePack {
+            out,
+            carry,
+            dit,
+            lora,
+            time_embedder,
+            lora_scale,
+            te,
+            video_vae,
+            audio_vae,
+            tokenizer,
+            quant,
+            vvae_heads,
+        } => videopack::cmd_animate_pack(videopack::PackArgs {
+            out: &out,
+            carry: carry.as_deref(),
+            dit: dit.as_deref(),
+            lora: lora.as_deref(),
+            time_embedder: time_embedder.as_deref(),
+            lora_scale,
+            te: te.as_deref(),
+            video_vae: video_vae.as_deref(),
+            audio_vae: audio_vae.as_deref(),
+            tokenizer: tokenizer.as_deref(),
+            quant: &quant,
+            vvae_heads,
+        }),
+        Commands::Animate {
+            model,
+            prompt,
+            width,
+            height,
+            frames,
+            steps,
+            seed,
+            stock_sampler,
+            quality,
+            out,
+        } => cmd_animate(
+            &model,
+            &prompt,
+            cortiq_engine::videogen::AnimParams {
+                width,
+                height,
+                frames,
+                steps,
+                seed,
+                stock_sampler,
+                ..Default::default()
+            },
+            quality,
+            &out,
+        ),
         Commands::Explain { model, prompt, top } => cmd_explain(&model, &prompt, top),
         Commands::Calibrate {
             model,
@@ -2809,6 +2945,92 @@ fn cmd_imagine(
         "{out}: {width}x{height}, {steps} steps in {:.1}s",
         t0.elapsed().as_secs_f64()
     );
+    Ok(())
+}
+
+fn cmd_animate(
+    model: &str,
+    prompt: &str,
+    params: cortiq_engine::videogen::AnimParams,
+    quality: u32,
+    out: &str,
+) -> anyhow::Result<()> {
+    // The wgpu wide-GEMM arm is WRONG on this stack: measured on an RTX
+    // PRO 6000 Blackwell, the DiT's first step disagrees with the host
+    // (audio velocity rms 0.15 against 1.01) and the second returns
+    // NaN. The engine's op probe alternates arms to time them, so it
+    // runs the bad one for real before it has anything to compare, and
+    // it brings the backend up before any in-engine gate of ours can
+    // speak. So the decision is made HERE, before the first engine
+    // call. `CMF_MMH3_GPU=1` — or an explicit `CMF_GPU` — opts back in.
+    if std::env::var_os("CMF_GPU").is_none()
+        && std::env::var("CMF_MMH3_GPU").ok().as_deref() != Some("1")
+    {
+        // SAFETY: no engine thread exists yet — this is the first thing
+        // the subcommand does.
+        unsafe { std::env::set_var("CMF_GPU", "0") };
+    }
+    // The cooperative-matrix GEMM takes f16 operands, and this model's
+    // packed sequence runs it out of range: at 256x160 the render is
+    // correct, at 512x288 the audio stream goes NaN on the second step
+    // and the video follows. Bisected — `CMF_BAKE_GPU=0` does not help,
+    // `CMF_COOP=0` does. Tensor cores are worth having here, so this is
+    // a hold and not a verdict; until the kernel carries a scale, the
+    // device path runs on the f32 arm.
+    if std::env::var_os("CMF_COOP").is_none() {
+        // SAFETY: as above.
+        unsafe { std::env::set_var("CMF_COOP", "0") };
+    }
+    let t0 = std::time::Instant::now();
+    let anim = cortiq_engine::videogen::generate(
+        std::path::Path::new(model),
+        prompt,
+        &params,
+        |stage, i, n| {
+            eprintln!("{stage} {i}/{n} ({:.1}s)", t0.elapsed().as_secs_f64());
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let plane = anim.height * anim.width;
+    let frames: Vec<Vec<u8>> = (0..anim.frames)
+        .map(|f| {
+            // The renderer's planes are [3, frames, h, w]; the encoder
+            // wants one frame's three planes contiguous.
+            let mut rgb = vec![0f32; 3 * plane];
+            for c in 0..3 {
+                let s = (c * anim.frames + f) * plane;
+                rgb[c * plane..(c + 1) * plane].copy_from_slice(&anim.rgb[s..s + plane]);
+            }
+            avout::encode_jpeg(&rgb, anim.height, anim.width, quality)
+        })
+        .collect();
+    let path = std::path::Path::new(out);
+    avout::write_avi(
+        path,
+        &frames,
+        anim.width,
+        anim.height,
+        cortiq_engine::videogen::FPS,
+        &anim.audio,
+        anim.samples,
+        anim.sample_rate,
+    )?;
+    let wav = path.with_extension("wav");
+    std::fs::write(&wav, avout::wav_bytes(&anim.audio, anim.samples, anim.sample_rate))?;
+    println!(
+        "{out}: {}x{}, {} frames at {} fps ({:.2}s), {:.2}s of {} Hz stereo, {:.1} MB in {:.1}s",
+        anim.width,
+        anim.height,
+        anim.frames,
+        cortiq_engine::videogen::FPS,
+        anim.frames as f64 / cortiq_engine::videogen::FPS as f64,
+        anim.samples as f64 / anim.sample_rate as f64,
+        anim.sample_rate,
+        std::fs::metadata(path)?.len() as f64 / 1e6,
+        t0.elapsed().as_secs_f64()
+    );
+    println!("{}: stereo PCM", wav.display());
     Ok(())
 }
 

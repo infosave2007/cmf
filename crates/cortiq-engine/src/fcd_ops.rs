@@ -271,7 +271,46 @@ unsafe fn gemm_block4x4_avx512(
     }
 }
 
+/// `y = x · wᵀ`, row-major.
+///
+/// A discrete card can take the big forwards whole — the weight side is
+/// cached on-device after first use, so a 360-step run uploads each
+/// matrix once. It does not always WIN, though: this call also carries
+/// attention's per-head QKᵀ and AV and the video decoder's projections,
+/// where the round trip cost more than the work. So the device arm goes
+/// through the same probe every other op class uses instead of taking
+/// the job on sight. `CMF_BAKE_GPU=0` keeps the CPU path outright.
 pub fn gemm_nt(
+    x: &[f32],
+    w: &[f32],
+    y: &mut [f32],
+    n: usize,
+    k: usize,
+    m: usize,
+    pool: Option<&Pool>,
+) {
+    #[cfg(feature = "gpu")]
+    if n * k * m >= (1 << 22) && crate::gpu::enabled_here() {
+        let t0 = std::time::Instant::now();
+        match crate::gpu::probe_arm(crate::gpu::OpClass::GemmNt) {
+            crate::gpu::ProbeArm::Gpu => {
+                if crate::gpu_wgpu::gemm_nt_f32(x, w, y, n, k, m) {
+                    crate::gpu::probe_record(crate::gpu::OpClass::GemmNt, true, t0.elapsed());
+                    return;
+                }
+            }
+            crate::gpu::ProbeArm::CpuTimed => {
+                crate::gpu::cpu_scope(|| gemm_nt_cpu(x, w, y, n, k, m, pool));
+                crate::gpu::probe_record(crate::gpu::OpClass::GemmNt, false, t0.elapsed());
+                return;
+            }
+            crate::gpu::ProbeArm::Cpu => {}
+        }
+    }
+    gemm_nt_cpu(x, w, y, n, k, m, pool)
+}
+
+fn gemm_nt_cpu(
     x: &[f32],
     w: &[f32],
     y: &mut [f32],
@@ -283,14 +322,6 @@ pub fn gemm_nt(
     debug_assert_eq!(x.len(), n * k);
     debug_assert_eq!(w.len(), m * k);
     debug_assert_eq!(y.len(), n * m);
-    // A discrete card takes the big forwards whole: the weight side is
-    // the bake's stable f32 replica, cached on-device after first use,
-    // so a 360-step run uploads each matrix once. CMF_BAKE_GPU=0 keeps
-    // the CPU path.
-    #[cfg(feature = "gpu")]
-    if crate::gpu_wgpu::gemm_nt_f32(x, w, y, n, k, m) {
-        return;
-    }
     #[cfg(target_os = "macos")]
     if accel::on() && n * k * m >= 1 << 18 {
         // Y = X · Wᵀ (row-major).
