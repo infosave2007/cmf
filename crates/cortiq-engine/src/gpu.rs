@@ -1248,13 +1248,20 @@ pub fn dit_block_seg(
     match backend() {
         #[cfg(target_os = "macos")]
         Backend::Metal if segs.len() <= 1 => crate::gpu_metal::dit_block(model, a, x),
-        // `CMF_DIT_FUSED=1`: the wgpu whole-block path. It runs and it
-        // is fast, but its output still differs from the CPU reference
-        // (PSNR 14 dB where the per-op path holds 42) — the orchestration
-        // is right in shape and wrong somewhere in the numbers, so it
-        // stays opt-in until a per-kernel comparison finds it.
+        // The wgpu whole-block path. What it buys is host round trips —
+        // six a block become one — so it defaults ON where those cost
+        // real time (a discrete card across PCIe) and OFF on unified
+        // memory, where the per-op path shares the same pages and the
+        // fusion measured slightly slower on an M4. `CMF_DIT_FUSED=1`
+        // forces it anywhere, `=0` forbids it.
         #[cfg(feature = "gpu")]
-        Backend::Wgpu if std::env::var("CMF_DIT_FUSED").is_ok_and(|v| v != "0") => {
+        Backend::Wgpu
+            if match std::env::var("CMF_DIT_FUSED").ok().as_deref() {
+                Some("0") => false,
+                Some(_) => true,
+                None => crate::gpu_wgpu::discrete_active(),
+            } =>
+        {
             crate::gpu_wgpu::dit_block_seg(model, a, segs, x)
         }
         #[allow(unreachable_patterns)]

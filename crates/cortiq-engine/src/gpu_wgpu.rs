@@ -1196,6 +1196,9 @@ fn dit_ropepack(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
     // `raw`: transpose only — v needs the token-major to head-major move
     // without the qk-norm or the rotation, and a norm with a huge eps
     // would zero it rather than skip it.
+    // `raw`: transpose only — v needs the token-major to head-major move
+    // with neither the qk-norm nor the rotation, so the weight and the
+    // rope table it is handed are ignored rather than faked.
     var inv = 1.0;
     if (drp_p.raw == 0u) { inv = inverseSqrt(drp_part[0] / f32(hd) + drp_p.eps); }
     let pairs = hd / 2u;
@@ -1203,10 +1206,16 @@ fn dit_ropepack(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
     var j = lid;
     loop {
         if (j >= pairs) { break; }
-        let a = drp_src[src + 2u * j] * inv * drp_w[2u * j];
-        let b = drp_src[src + 2u * j + 1u] * inv * drp_w[2u * j + 1u];
-        let cs = drp_cos[tokn * pairs + j];
-        let sn = drp_sin[tokn * pairs + j];
+        var a = drp_src[src + 2u * j];
+        var b = drp_src[src + 2u * j + 1u];
+        var cs = 1.0;
+        var sn = 0.0;
+        if (drp_p.raw == 0u) {
+            a = a * inv * drp_w[2u * j];
+            b = b * inv * drp_w[2u * j + 1u];
+            cs = drp_cos[tokn * pairs + j];
+            sn = drp_sin[tokn * pairs + j];
+        }
         drp_dst[dst + 2u * j] = (a * cs - b * sn) * drp_p.scale;
         drp_dst[dst + 2u * j + 1u] = (a * sn + b * cs) * drp_p.scale;
         j = j + 128u;
@@ -11417,7 +11426,7 @@ pub fn gqa_attend_gpu(
 /// Returns (buffer, rows, cols). None on budget/shape refusal.
 /// Is wgpu initialized on a DISCRETE adapter? Gates the whole-token
 /// graph default (see gpu::wgpu_graph_default).
-pub(crate) fn discrete_active() -> bool {
+pub fn discrete_active() -> bool {
     ctx().map(|c| c.discrete).unwrap_or(false)
 }
 
@@ -25847,9 +25856,6 @@ pub fn dit_block_seg(
     // norm or the rotation: a unit weight vector and identity rope would
     // do it, but the blit is cheaper and exact.
     {
-        let ones = store(&vec![1.0f32; hd], "dit-ones");
-        let idc = store(&vec![1.0f32; n * pairs], "dit-rc1");
-        let ids = store(&vec![0.0f32; n * pairs], "dit-rs0");
         let p = c
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -25872,9 +25878,9 @@ pub fn dit_block_seg(
             entries: &[
                 bind_buf(0, &vtok),
                 bind_buf(1, &vhm),
-                bind_buf(2, &ones),
-                bind_buf(3, &idc),
-                bind_buf(4, &ids),
+                bind_buf(2, &nqw),
+                bind_buf(3, &rcos),
+                bind_buf(4, &rsin),
                 bind_buf(5, &p),
             ],
         });
