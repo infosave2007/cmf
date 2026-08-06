@@ -4517,15 +4517,13 @@ static Q4TP_ALT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(
 /// second unpack-free pass at the price of half the vector width.
 #[cfg(target_arch = "x86_64")]
 fn q4tp_blocked_x86() -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    match Q4TP_ALT.load(Relaxed) {
+    match Q4TP_ALT.load(std::sync::atomic::Ordering::Relaxed) {
         1 => false,
         2 => true,
-        _ => {
-            let on = blocked_enabled() && avx512vnni_enabled();
-            Q4TP_ALT.store(1 + on as u8, Relaxed);
-            on
-        }
+        // Deliberately not cached back into the switch: both gates below
+        // hold their own `OnceLock`, and latching their answer here would
+        // make a test's override outlive the test that set it.
+        _ => blocked_enabled() && avx512vnni_enabled(),
     }
 }
 
@@ -4533,14 +4531,12 @@ fn q4tp_blocked_x86() -> bool {
 #[cfg(target_arch = "aarch64")]
 #[allow(dead_code)]
 fn q4tp_v1() -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    match Q4TP_ALT.load(Relaxed) {
+    match Q4TP_ALT.load(std::sync::atomic::Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let v1 = std::env::var("CMF_Q4TP_V1").is_ok_and(|v| v != "0");
-            Q4TP_ALT.store(2 - v1 as u8, Relaxed);
-            v1
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var("CMF_Q4TP_V1").is_ok_and(|v| v != "0"))
         }
     }
 }
