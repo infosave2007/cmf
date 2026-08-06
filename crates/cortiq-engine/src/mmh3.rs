@@ -53,6 +53,8 @@ const MODALITIES: usize = 3;
 const EXPAND: usize = 6;
 /// Where a visual condition row sits on the schedule: all but arrived.
 const VISUAL_COND_TIMESTEP: f64 = 0.999;
+/// An audio condition is not noised at all.
+const AUDIO_COND_TIMESTEP: f64 = 1.0;
 
 // ── the flow-schedule remap ─────────────────────────────────────────
 
@@ -76,6 +78,10 @@ pub enum Kind {
     Text,
     /// A keyframe's latent, re-injected every step and never denoised.
     Cond,
+    /// A reference block's video rows — an image, or a clip's frames.
+    RefImg,
+    /// A reference block's audio rows.
+    RefAudio,
     Audio,
     Video,
 }
@@ -105,6 +111,35 @@ pub struct Layout {
     /// Per-token modality tag for the text span. A vision block inside
     /// the prompt carries the VIDEO tag, not the text one.
     pub text_tags: Vec<u8>,
+}
+
+/// One reference block, in the order it was given.
+#[derive(Clone, Debug)]
+pub enum Ref {
+    /// A still, at its own latent size.
+    Image { lat_h: usize, lat_w: usize },
+    /// Standalone audio, `t` latent frames of it.
+    Audio { t: usize },
+    /// Frames, with an optional soundtrack that packs immediately
+    /// before them and shares their origin.
+    Video {
+        latent_t: usize,
+        lat_h: usize,
+        lat_w: usize,
+        audio_t: usize,
+    },
+}
+
+/// Channel-major stereo rows: `t` frames per channel, the two channels
+/// pinned to the grid's extreme w coordinates so RoPE can tell them
+/// apart, h flat at zero.
+fn push_audio_grid(pos: &mut Vec<[f64; 3]>, cursor: f64, t: usize, w_low: f64, w_high: f64) {
+    for ch in 0..2 {
+        let w = if ch == 0 { w_low } else { w_high };
+        for i in 0..t {
+            pos.push([cursor + i as f64, 0.0, w]);
+        }
+    }
 }
 
 /// `linspace((1 − ratio)/2, (1 + ratio)/2, dim/patch, endpoint=False) · 32`
@@ -145,6 +180,22 @@ impl Layout {
         Self::build(text_len, latent_t, lat_h, lat_w, audio_t, frames, text_tags)
     }
 
+    /// `ref2va`: reference images, audio and clips ahead of the target
+    /// streams. Unlike a keyframe, a reference ADVANCES the cursor —
+    /// each block occupies its own stretch of the time axis, and the
+    /// target audio and video begin after the last of them.
+    pub fn ref2va(
+        text_len: usize,
+        latent_t: usize,
+        lat_h: usize,
+        lat_w: usize,
+        audio_t: usize,
+        refs: &[Ref],
+        text_tags: &[u8],
+    ) -> Self {
+        Self::build_full(text_len, latent_t, lat_h, lat_w, audio_t, &[], refs, text_tags)
+    }
+
     fn build(
         text_len: usize,
         latent_t: usize,
@@ -152,6 +203,20 @@ impl Layout {
         lat_w: usize,
         audio_t: usize,
         frames: &[(usize, usize)],
+        text_tags: &[u8],
+    ) -> Self {
+        Self::build_full(text_len, latent_t, lat_h, lat_w, audio_t, frames, &[], text_tags)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_full(
+        text_len: usize,
+        latent_t: usize,
+        lat_h: usize,
+        lat_w: usize,
+        audio_t: usize,
+        frames: &[(usize, usize)],
+        refs: &[Ref],
         text_tags: &[u8],
     ) -> Self {
         let area = ((lat_h * lat_w) as f64).sqrt();
@@ -168,8 +233,66 @@ impl Layout {
         }
 
         // Both target streams share this origin: the text runs out at
-        // `text_len` and audio and video start together from there.
-        let cursor = text_len as f64;
+        // `text_len` and audio and video start together from there —
+        // unless references push it along.
+        let mut cursor = text_len as f64;
+        let (w_low_t, w_high_t) = (w_axis[0], w_axis[w_axis.len() - 1]);
+
+        for r in refs {
+            match r {
+                Ref::Image { lat_h, lat_w } => {
+                    let (rh, rw) = (
+                        axis_from_sqrt_area(*lat_h, 2, ((lat_h * lat_w) as f64).sqrt()),
+                        axis_from_sqrt_area(*lat_w, 2, ((lat_h * lat_w) as f64).sqrt()),
+                    );
+                    let start = pos.len();
+                    for &h in &rh {
+                        for &w in &rw {
+                            pos.push([cursor, h, w]);
+                        }
+                    }
+                    segments.push(Segment { start, stop: pos.len(), kind: Kind::RefImg });
+                    cursor += 1.0;
+                }
+                Ref::Audio { t } => {
+                    if *t > 0 {
+                        let start = pos.len();
+                        push_audio_grid(&mut pos, cursor, *t, w_low_t, w_high_t);
+                        segments.push(Segment { start, stop: pos.len(), kind: Kind::RefAudio });
+                    }
+                    cursor += *t as f64;
+                }
+                Ref::Video { latent_t: vt, lat_h: rh_, lat_w: rw_, audio_t: rt } => {
+                    let area = ((rh_ * rw_) as f64).sqrt();
+                    let rh = axis_from_sqrt_area(*rh_, 2, area);
+                    let rw = axis_from_sqrt_area(*rw_, 2, area);
+                    // The block's audio packs immediately BEFORE its
+                    // frames, both from the same origin, and takes its
+                    // w extremes from the block's own grid.
+                    if *rt > 0 {
+                        let start = pos.len();
+                        push_audio_grid(&mut pos, cursor, *rt, rw[0], rw[rw.len() - 1]);
+                        segments.push(Segment { start, stop: pos.len(), kind: Kind::RefAudio });
+                    }
+                    let start = pos.len();
+                    let mut t_coord = cursor;
+                    for k in 0..*vt {
+                        for &h in &rh {
+                            for &w in &rw {
+                                pos.push([t_coord, h, w]);
+                            }
+                        }
+                        t_coord += FRAME_RESCALE * FRAME_PER_TOKEN[k % 5];
+                    }
+                    segments.push(Segment { start, stop: pos.len(), kind: Kind::RefImg });
+                    let spans: f64 = (0..*vt)
+                        .map(|k| FRAME_RESCALE * FRAME_PER_TOKEN[k % 5])
+                        .sum();
+                    cursor += (*rt as f64).max(spans);
+                }
+            }
+        }
+        let cursor = cursor;
 
         // Keyframes, in the order given.
         let spans: f64 = (0..latent_t)
@@ -195,14 +318,8 @@ impl Layout {
         // Audio is channel-major stereo: every latent frame once per
         // channel, the two channels pinned to the frame grid's extreme
         // w coordinates so they are distinguishable under RoPE.
-        let (w_low, w_high) = (w_axis[0], w_axis[w_axis.len() - 1]);
         let a_start = pos.len();
-        for ch in 0..2 {
-            let w = if ch == 0 { w_low } else { w_high };
-            for i in 0..audio_t {
-                pos.push([cursor + i as f64, 0.0, w]);
-            }
-        }
+        push_audio_grid(&mut pos, cursor, audio_t, w_low_t, w_high_t);
         segments.push(Segment { start: a_start, stop: pos.len(), kind: Kind::Audio });
 
         // Video: the t axis advances by the per-token frame spans, not
@@ -354,6 +471,9 @@ pub struct MiniMaxH3 {
     /// therefore where its rows sit on the schedule. `VISUAL_COND_
     /// TIMESTEP` is the reference's default; 1.0 turns the blend off.
     pub cond_aug: f64,
+    /// The same, for a reference soundtrack. The reference's default is
+    /// 1.0 — an audio condition is not noised at all.
+    pub cond_aug_audio: f64,
 }
 
 fn rms_norm_into(x: &[f32], w: &[f32], eps: f64, dst: &mut [f32]) {
@@ -435,6 +555,7 @@ impl MiniMaxH3 {
             qk_eps: f("qk_norm_eps", 1e-5),
             final_eps: f("final_norm_eps", 1e-5),
             cond_aug: VISUAL_COND_TIMESTEP,
+            cond_aug_audio: AUDIO_COND_TIMESTEP,
         })
     }
 
@@ -748,7 +869,14 @@ impl MiniMaxH3 {
         // in this list, so the order is part of the contract. A keyframe
         // pins its rows near 1: they are conditions, not noise being
         // removed.
-        let has_cond = layout.segments.iter().any(|s| s.kind == Kind::Cond);
+        let has_cond = layout
+            .segments
+            .iter()
+            .any(|s| matches!(s.kind, Kind::Cond | Kind::RefImg));
+        let has_ref_audio = layout.segments.iter().any(|s| s.kind == Kind::RefAudio);
+        // A reference soundtrack pins to the AUDIO clock's condition
+        // timestep, which is its own number.
+        let t_cond_a = t_a.max(self.cond_aug_audio);
         // The condition rows' timestep IS the noise-augmentation figure:
         // the reference blends `aug` of the latent with `1 − aug` of
         // noise and then tells the block the row sits at `aug`. Turning
@@ -758,11 +886,15 @@ impl MiniMaxH3 {
         if has_cond {
             ts.push(t_cond);
         }
+        if has_ref_audio {
+            ts.push(t_cond_a);
+        }
         ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
         ts.dedup();
         let row_of = |t: f64| ts.iter().position(|&x| x == t).unwrap();
         let (row_v, row_a) = (row_of(t_v), row_of(t_a));
         let row_c = if has_cond { row_of(t_cond) } else { 0 };
+        let row_ca = if has_ref_audio { row_of(t_cond_a) } else { 0 };
 
         // Per-token modulation row: t_row · MODALITIES + tag. The text
         // span is not uniform once a vision block is in it — those
@@ -776,9 +908,17 @@ impl MiniMaxH3 {
                         *v = (row_v * MODALITIES + tag as usize) as u32;
                     }
                 }
-                Kind::Cond => {
+                // A reference's rows are conditions too: same timestep
+                // near 1, and the modality of whichever stream they
+                // belong to.
+                Kind::Cond | Kind::RefImg => {
                     for v in rows[s.start..s.stop].iter_mut() {
                         *v = (row_c * MODALITIES + TAG_VIDEO) as u32;
+                    }
+                }
+                Kind::RefAudio => {
+                    for v in rows[s.start..s.stop].iter_mut() {
+                        *v = (row_ca * MODALITIES + TAG_AUDIO) as u32;
                     }
                 }
                 Kind::Video => {
