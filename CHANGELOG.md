@@ -48,14 +48,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signal of rms 0.67. Encoding real video (`ref2va`) needs the other
   two taps back.
 
-  This is half of `fl2va`. The other half is Qwen3-VL's vision tower,
-  which the presentation puts in the TEXT stream (`"<Picture 1>: "` and
-  a vision block) alongside the latent the DiT conditions on — 27 ViT
-  blocks, a bilinearly interpolated position grid, a patch merger and
-  three deepstack mergers, and with it two changes to what is already
-  here: the prompt encoder's real interleaved MRoPE (the text-only path
-  is exact only while no image shares the sequence) and the deepstack
-  injection at layers 8, 16 and 24. Not written; not pretended.
+- **Qwen3-VL's vision tower** — the other half of what a keyframe needs,
+  since the presentation puts the picture in the TEXT stream
+  (`"<Picture 1>: "` and a vision block) alongside the latent the DiT
+  conditions on. 27 ViT blocks at hidden 1152, a merger down to the
+  LM's 5120, three deepstack mergers.
+
+  Three of its conventions pass any single-patch check and fail on a
+  real image, so the fixture uses a grid that exercises all three: the
+  48×48 position table is read BILINEARLY and then permuted into 2×2
+  merge blocks; the patches arrive in that same block order rather than
+  row-major (the reference's `permute(0, 3, 6, 4, 7, …)`); and the
+  blocks' MLP wants the tanh GELU while both mergers want the exact
+  one. Preprocessing matches bit for bit, the merged tokens to 6.2e-6
+  on a signal of rms 1.79, both deepstack outputs the same.
+
+  What remains for `fl2va` is plumbing rather than model: the packed
+  layout's keyframe condition rows and their third timestep, the
+  prompt encoder's real interleaved MRoPE (the text-only path is exact
+  only while no image shares the sequence) and the deepstack injection
+  at layers 8, 16 and 24. `ref2va` additionally needs the encoder's
+  other two temporal taps.
+
+  The parity harness for all of this now runs on an ordinary host —
+  `tools/mk_qwen3vis_toy.py` needs a ComfyUI checkout and torch, no GPU
+  and no stand.
 
 ### Fixed
 - **`gemm_nt_f32` cached the device-side weight buffer BY POINTER
