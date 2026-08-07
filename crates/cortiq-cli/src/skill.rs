@@ -14,7 +14,7 @@ use crate::convert::{
 };
 use anyhow::Context as _;
 use base64::Engine as _;
-use cortiq_core::mask::{MaskPriority, TaskMask};
+use cortiq_core::mask::{MaskCatalog, MaskPriority, TaskMask};
 use cortiq_core::quant::f32_to_f16;
 use cortiq_core::{CmfModel, SelectionDescriptor, SkillRecord, TensorDtype, TensorSpec};
 use cortiq_engine::{Pipeline, SamplerConfig};
@@ -851,15 +851,27 @@ pub fn run_skill_bake(
             .map_err(|e| anyhow::anyhow!(e))?;
         Ok(out)
     };
+    // A Looped Transformer's weights serve every pass, so a neuron may
+    // be dead in one visit and load-bearing in the other. Physical row
+    // removal is only legal for the union — and remapping per-visit
+    // bitfields onto compacted indices buys bytes at the cost of a
+    // second index space. So for looped models the file keeps its full
+    // FFN shape and the sparsity ships as a per-visit task mask the
+    // runtime applies each pass (format feature LOOP_MASKS).
+    let loops = model.arch().num_loops.max(1);
     let mut max_kept = 0usize;
     for li in 0..nl {
         let alive = &arts.keep[li];
-        let kept: Vec<usize> = alive
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| **a)
-            .map(|(i, _)| i)
-            .collect();
+        let kept: Vec<usize> = if loops > 1 {
+            (0..orig_inter).collect()
+        } else {
+            alive
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| **a)
+                .map(|(i, _)| i)
+                .collect()
+        };
         anyhow::ensure!(!kept.is_empty(), "layer {li}: 0 live neurons");
         max_kept = max_kept.max(kept.len());
         let (gate_f, up_f) = match &arts.gate_up[li] {
@@ -929,26 +941,62 @@ pub fn run_skill_bake(
                      "held_out_chunks": held},
     });
     header.provenance = Some(prov);
+    // The per-visit mask, when there is one to ship.
+    let ffn_b = orig_inter.div_ceil(8);
+    let visit_mask: Option<TaskMask> = (loops > 1).then(|| {
+        let ffn_masks: Vec<Vec<u8>> = arts
+            .keep_visits
+            .iter()
+            .map(|alive| {
+                let mut row = vec![0u8; ffn_b];
+                for (j, &a) in alive.iter().enumerate() {
+                    if a {
+                        row[j / 8] |= 1 << (j % 8);
+                    }
+                }
+                row
+            })
+            .collect();
+        TaskMask {
+            task_id: 1,
+            name: "specialist".into(),
+            description: Some("DTG-MA per-visit mask (loop-aware bake)".into()),
+            sparsity: report.pruned_ratio as f32,
+            quality: None,
+            ffn_masks,
+            head_masks: Vec::new(),
+            layer_gates: vec![true; nl],
+            expert_masks: Vec::new(),
+            parent: None,
+            has_hot_pack: false,
+            priority: MaskPriority::Primary,
+        }
+    });
+    let catalog = visit_mask.as_ref().map(|m| MaskCatalog {
+        masks: vec![m.clone()],
+        default_task: "specialist".into(),
+    });
     let tmp = format!("{output}.tmp");
-    CmfModel::write(&tmp, &header, &tensors, None, model.vocab.as_deref())?;
+    CmfModel::write(&tmp, &header, &tensors, catalog.as_ref(), model.vocab.as_deref())?;
 
     // ── end-to-end gate: held-out PPL through the REAL runtime ──
     let held_ids: Vec<&Vec<u32>> = chunks[..held.min(chunks.len())].iter().collect();
-    let runtime_ppl = |path: &str| -> anyhow::Result<f64> {
+    let runtime_ppl = |path: &str, mask: Option<&TaskMask>| -> anyhow::Result<f64> {
         let m = Arc::new(CmfModel::open(path)?);
         let mut p =
             Pipeline::from_model(&m, SamplerConfig::default()).map_err(|e| anyhow::anyhow!(e))?;
         let mut nll = 0f64;
         let mut n = 0usize;
         for c in &held_ids {
-            let (l, k) = p.nll_ids_from(c, 0);
+            let (l, k) = p.nll_ids_masked(c, 0, mask);
             nll += l;
             n += k;
         }
         Ok((nll / n.max(1) as f64).exp())
     };
-    let rt_base = runtime_ppl(model_path)?;
-    let rt_spec = runtime_ppl(&tmp)?;
+    let rt_base = runtime_ppl(model_path, None)?;
+    // The specialist is scored the way it will be served: mask active.
+    let rt_spec = runtime_ppl(&tmp, visit_mask.as_ref())?;
     println!(
         "runtime gate (held-out, real engine): backbone {rt_base:.3} → specialist {rt_spec:.3} ({:+.1}%)",
         (rt_spec / rt_base - 1.0) * 100.0
