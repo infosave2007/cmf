@@ -58,10 +58,8 @@ give it a first and/or last frame and it continues from there. The release's
 third path — `ref2va`, conditioning on reference images, clips and audio — is
 not ported.
 
-| file | size | what differs |
-|---|---|---|
-| `mmh3-turbo-fl2va-q4tp.cmf` | 23.94 GB | every projection at 4 bits |
-| `mmh3-turbo-fl2va-q2tp.cmf` | 18.74 GB | the gate/up planes at 2 |
+One file: `mmh3-turbo-fl2va-q4tp.cmf`, 23.94 GB, every projection at
+four bits. A two-bit build exists and is **not** published — see below.
 
 ## Keyframe to video
 
@@ -167,6 +165,35 @@ CMF_MMH3_GPU=1 cortiq animate mmh3-turbo-q4tp.cmf --prompt "…" --out corgi.avi
 RAM at least the file's size — 24 GB — or every step faults on non-resident
 pages; the weights are memory-mapped, not read. Disk: 24 GB. A GPU is optional
 and wants ~14 GB of VRAM for the DiT's planes. No network access at run time.
+
+## Two bits was tried, and it is not shipped
+
+The obvious next cut is the DeepSeek-V4 policy: gate/up at two bits,
+everything else at four. It builds — 23.94 GB down to **18.74**, and
+with a device kernel of its own it renders *faster* than the four-bit
+file (217.3 s against 258.4, because there is less weight to move).
+`cortiq verify` passes.
+
+It also stops following the prompt.
+
+| | |
+|---|---|
+| ![four bits](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/ab_q4tp.gif) | ![two bits](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/ab_q2tp.gif) |
+| `q4tp` — 23.94 GB, 258.4 s | `q2tp` — 18.74 GB, 217.3 s |
+
+Same prompt, same seed, same four steps. On the left the corgi is behind
+a pan with batter in it, drawn flat and clean, which is what was asked
+for. On the right it is a different animal in a different style with
+**no pan and no pancake at all**, over a washed-out ground with visible
+texture noise. That is not a quantizer trading detail for size; that is
+a model answering a different question.
+
+The likely culprit is where the two bits landed. Half this file is the
+PROMPT ENCODER, and the policy put two bits on its gate/up planes along
+with the DiT's — so the loss falls on the part that decides what the
+clip is about, not on the part that draws it. A two-bit build confined
+to the DiT would save ~2.9 GB instead of 5.2 and is the version worth
+measuring next. Until someone does, four bits is what ships.
 
 ## What it costs to run
 
