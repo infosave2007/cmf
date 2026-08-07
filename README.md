@@ -509,10 +509,10 @@ block graph.
 On everything else, `CMF_GPU=1` runs the quantized GEMMs and the fused
 FFN through wgpu (Vulkan / DX12 → NVIDIA / AMD / Intel, and Adreno /
 Mali on phones): an RTX 4090 renders 512×512 in **less than half** the
-time its host's 32 CPU cores need. The GPU arm is probed against the CPU exactly
-like LLM inference — a device that loses keeps the CPU path, so
-enabling the GPU never makes you slower — and GPU renders stay
-visually identical. For apps, the C ABI exports `cortiq_imagine`
+time its host's 32 CPU cores need. The GPU arm is probed against the CPU
+exactly like LLM inference — a device that loses keeps the CPU path, so
+enabling the GPU never makes you slower — and GPU renders stay visually
+identical. For apps, the C ABI exports `cortiq_imagine`
 (text → RGB8 with a per-step progress callback); `--cfg 1` disables
 guidance and halves the work — the right default on phones.
 
