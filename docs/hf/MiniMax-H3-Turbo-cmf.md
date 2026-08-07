@@ -58,8 +58,10 @@ give it a first and/or last frame and it continues from there. The release's
 third path — `ref2va`, conditioning on reference images, clips and audio — is
 not ported.
 
-One file: `mmh3-turbo-fl2va-q4tp.cmf`, 23.94 GB, every projection at
-four bits. A two-bit build exists and is **not** published — see below.
+| file | size | |
+|---|---|---|
+| `mmh3-turbo-fl2va-q4tp.cmf` | 23.94 GB | **use this one** |
+| `mmh3-turbo-fl2va-q2tp.cmf` | 18.74 GB | two bits on the gate/up planes. Smaller, faster, and it stops following the prompt — kept for anyone who wants to push on it, not for rendering. See below |
 
 ## Keyframe to video
 
@@ -166,15 +168,16 @@ RAM at least the file's size — 24 GB — or every step faults on non-resident
 pages; the weights are memory-mapped, not read. Disk: 24 GB. A GPU is optional
 and wants ~14 GB of VRAM for the DiT's planes. No network access at run time.
 
-## Two bits was tried, and it is not shipped
+## Two bits: smaller, faster, and answering a different question
 
 The obvious next cut is the DeepSeek-V4 policy: gate/up at two bits,
 everything else at four. It builds — 23.94 GB down to **18.74**, and
 with a device kernel of its own it renders *faster* than the four-bit
 file (217.3 s against 258.4, because there is less weight to move).
-`cortiq verify` passes.
+`cortiq verify` passes. The file is here.
 
-It also stops following the prompt.
+It also stops following the prompt, which is why it is not the one to
+reach for.
 
 | | |
 |---|---|
@@ -193,7 +196,10 @@ PROMPT ENCODER, and the policy put two bits on its gate/up planes along
 with the DiT's — so the loss falls on the part that decides what the
 clip is about, not on the part that draws it. A two-bit build confined
 to the DiT would save ~2.9 GB instead of 5.2 and is the version worth
-measuring next. Until someone does, four bits is what ships.
+measuring next — the packer's policy is one predicate,
+`is_wide_plane`, if you want to try it. The file above is published so
+that experiment starts from something rather than nothing; four bits is
+what to render with.
 
 ## What it costs to run
 
