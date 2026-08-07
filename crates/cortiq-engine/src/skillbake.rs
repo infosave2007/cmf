@@ -698,7 +698,11 @@ pub fn skill_bake(
             params.push(d.as_mut_slice());
             grads.push(dd);
         }
-        adam_b.step(&mut params, &grads, lr_scale);
+        // Same visit normalisation as Phase A: dffn accumulates every
+        // visit of a physical layer, and an FFN update perturbs BOTH
+        // passes of the loop, so per-step damage is `loops` times what
+        // lr_b was tuned for on ordinary stacks.
+        adam_b.step(&mut params, &grads, lr_scale * mask_step_scale(loops));
         if (step + 1) % hy.eval_every == 0 {
             let pass = Pass {
                 fm: &fm,
