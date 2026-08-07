@@ -360,6 +360,8 @@ set `CMF_GPU=1` to use it (see [GPU](#gpu)).
 | `cortiq compact` | tight container rewrite after append-only skill growth |
 | `cortiq imagine model.cmf --prompt "…"` | text → image (Lumina-Image 2.0), native Rust, CPU or Metal |
 | `cortiq imagine-pack <diffusers-dir>` | pack text encoder + DiT + VAE + tokenizer into one quantized `.cmf` |
+| `cortiq animate model.cmf --prompt "…"` | text → video **with synchronized stereo audio** (MiniMax-H3 + Turbo LoRA); `--first-frame`/`--last-frame` to continue from a picture |
+| `cortiq animate-pack` | pack the audio-video DiT, its Qwen3-VL encoder, both VAE decoders and the vision tower into one `.cmf` |
 
 `cortiq <command> --help` documents every flag.
 
@@ -489,6 +491,46 @@ enabling the GPU never makes you slower — and GPU renders stay
 visually identical. For apps, the C ABI exports `cortiq_imagine`
 (text → RGB8 with a per-step progress callback); `--cfg 1` disables
 guidance and halves the work — the right default on phones.
+
+### Text to video, with the sound (MiniMax-H3 + Turbo LoRA)
+
+The same container carries a joint audio-video model. One prompt, one
+transformer, and out comes a clip **and its synchronized stereo track** —
+the two are denoised together in one packed sequence, on two different
+flow schedules, in four sampling steps.
+
+```sh
+CMF_MMH3_GPU=1 cortiq animate mmh3-turbo-fl2va-q4tp.cmf \
+    --prompt "A corgi in a chef hat flipping a pancake, sizzling sounds and a cheerful bark." \
+    --width 512 --height 288 --frames 39 --out corgi.avi
+# continue from a picture instead:
+CMF_MMH3_GPU=1 cortiq animate mmh3-turbo-fl2va-q4tp.cmf \
+    --prompt "…" --first-frame frame.ppm --out clip.avi
+```
+
+Four files and a ComfyUI checkout — 124.4 GB — become **one 23.9 GB
+`.cmf`**: the 33 B DiT, its Qwen3-VL-32B prompt encoder, the ViT3D video
+decoder, the BigVGAN vocoder, Qwen3-VL's vision tower and the VAE
+encoder that a keyframe needs. The 4-step LoRA is merged in, so the file
+IS the turbo model. Output is MJPEG+PCM in an AVI plus a `.wav` — the
+JPEG encoder and the RIFF muxer are in the binary, because a pipeline
+that ends in a shell-out to ffmpeg is not one you can ship.
+
+Most of that reduction is not quantization. **Forty per cent of the
+released model is one matrix per block** — `adaln_proj.linear`, 13 B
+parameters, for a map whose only input is the timestep. Over the
+schedule its output traces a curve, so `animate-pack` collapses it onto
+a rank-24 basis with the Turbo LoRA already folded in: 4.6 MB a block
+instead of 520, at rms 8.7e-5 against a signal of rms 0.464.
+
+Every stack is diffed against ComfyUI's own modules on toy checkpoints
+carrying the release's real tensor names and schedules (`tools/mmh3_toy_gate.sh`):
+DiT velocities 8.8e-5, prompt encoder 1.1e-6, video decoder 4.2e-7
+including its 256-pixel tiling, vocoder 1.7e-9, vision tower 6.2e-6.
+512×288 over 39 frames renders in 346.5 s on 48 CPU cores and **172.0 s
+on one RTX PRO 6000** — the device arm is opt-in for this model, hence
+the `CMF_MMH3_GPU=1` above. Weights and a model card:
+[infosave/MiniMax-H3-Turbo-cmf](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf).
 
 ## O(1) in depth
 
