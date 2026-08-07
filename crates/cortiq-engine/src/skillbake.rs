@@ -478,13 +478,25 @@ pub fn skill_bake(
     // baseline 4.187 → 278.4 at step 30 with 0% pruned. Nothing had been
     // pruned; the mask had simply turned the model down.
     //
-    // So solve for the init instead of hardcoding it: pick m0 such that
-    // σ(m0)^loops = 0.999, which is identity to three digits for any
-    // depth and leaves L1 the whole job of closing neurons.
+    // So solve for the init instead of hardcoding it — but solve for the
+    // right target. Pushing σ(m0)^loops to 0.999 starts at the backbone
+    // and cannot move: the gradient carries σ'(m) = σ(1−σ), which at
+    // σ = 0.9995 is 5e-4 against 0.105 at the old 2.0, and BOTH the data
+    // term and the L1 term are scaled by it (see the update below). That
+    // was tried: 60 steps, 0% pruned, hard-PPL equal to the baseline to
+    // three digits. Identity that cannot learn is not an improvement.
+    //
+    // The quantity to preserve is the EFFECTIVE start — what the stack
+    // actually multiplies by, once per visit compounded over the loop —
+    // at the value the recipe was validated with on ordinary models:
+    // σ(m0)^loops = σ(2.0) = 0.881. One loop reproduces the old constant
+    // exactly, so nothing regresses; two loops open the per-visit gate to
+    // 0.9385 so the compounded factor is again 0.881, with σ' = 0.058
+    // rather than 0.0005.
     let loops = fm.loops.max(1) as f32;
     let m0 = {
-        let per_visit = 0.999f32.powf(1.0 / loops);
-        (per_visit / (1.0 - per_visit)).ln()
+        let target = (1.0f32 / (1.0 + (-2.0f32).exp())).powf(1.0 / loops);
+        (target / (1.0 - target)).ln()
     };
     let mut logits: Vec<Vec<f32>> = vec![vec![m0; inter]; nl];
     let mut ffn: Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>> = vec![None; nl];
