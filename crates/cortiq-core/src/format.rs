@@ -57,9 +57,15 @@ pub mod features {
     pub const QUANT_2F: u32 = 1 << 2;
     pub const DELTA_MASKS: u32 = 1 << 3;
     pub const HOT_PACKS: u32 = 1 << 4;
+    /// FFN mask rows are stored PER VIRTUAL LAYER (physical × loops) so
+    /// a Looped Transformer can mask a neuron in one pass and keep it in
+    /// the other. A reader without this bit would slice the mask area by
+    /// the physical count and misread every row after the first pass —
+    /// silently — so the bit makes it refuse instead.
+    pub const LOOP_MASKS: u32 = 1 << 5;
 
     /// Features this reader implements today.
-    pub const SUPPORTED: u32 = TENSOR_DIR | BINARY_MASKS | QUANT_2F;
+    pub const SUPPORTED: u32 = TENSOR_DIR | BINARY_MASKS | QUANT_2F | LOOP_MASKS;
 }
 
 /// JSON header — architecture and provenance (human-readable part;
@@ -1111,6 +1117,9 @@ impl CmfModel {
         let mut required_features = features::TENSOR_DIR;
         if masks_bytes.is_some() {
             required_features |= features::BINARY_MASKS;
+            if header.arch.num_loops > 1 {
+                required_features |= features::LOOP_MASKS;
+            }
         }
         if entries
             .iter()
@@ -1548,6 +1557,9 @@ impl CmfStreamWriter {
         let mut required_features = features::TENSOR_DIR;
         if masks_bytes.is_some() {
             required_features |= features::BINARY_MASKS;
+            if header.arch.num_loops > 1 {
+                required_features |= features::LOOP_MASKS;
+            }
         }
         if self
             .entries

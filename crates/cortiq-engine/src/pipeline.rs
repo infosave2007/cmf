@@ -2942,6 +2942,65 @@ impl Pipeline {
     /// Returning (nll, cnt) rather than a ppl is what lets a windowed
     /// caller combine windows before the exp, so every scored token
     /// weighs the same regardless of how the windows are cut.
+    /// `nll_ids_from` with a task mask held active at every position.
+    ///
+    /// The batched prefill path does not thread masks, so this walks the
+    /// per-position forward — slower, but it scores the file exactly the
+    /// way `run --task` will serve it, which is the point of the gate
+    /// that calls it. With `None` it defers to the fast path.
+    pub fn nll_ids_masked(
+        &mut self,
+        ids: &[u32],
+        start: usize,
+        task_mask: Option<&TaskMask>,
+    ) -> (f64, usize) {
+        if task_mask.is_none() {
+            return self.nll_ids_from(ids, start);
+        }
+        self.kv_cache.clear();
+        self.kv_history.clear();
+        let mut nll = 0f64;
+        let mut cnt = 0usize;
+        let n = ids.len().saturating_sub(1);
+        let hs = self.hidden_size;
+        let rows = self.weights.lm_head.rows();
+        let voc = self.vocab_size.min(rows);
+        for pos in 0..n {
+            let hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, task_mask);
+            if pos < start {
+                continue;
+            }
+            let normed = inference::rms_norm(
+                &hidden[..hs],
+                &self.weights.final_norm,
+                self.rms_eps,
+                self.norm_style,
+            );
+            let mut logits = vec![0.0f32; rows];
+            self.weights
+                .lm_head
+                .matmat(&normed, 1, &mut logits, self.pool.as_deref());
+            let lg = &mut logits[..voc];
+            if let Some(mu) = self.logit_multiplier {
+                for v in lg.iter_mut() {
+                    *v *= mu;
+                }
+            }
+            if let Some(c) = self.final_softcap {
+                for v in lg.iter_mut() {
+                    *v = c * (*v / c).tanh();
+                }
+            }
+            let target = ids[pos + 1] as usize;
+            let max = lg.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+            let lse: f64 = lg.iter().map(|&v| ((v - max) as f64).exp()).sum::<f64>().ln()
+                + max as f64;
+            nll += lse - lg[target.min(voc - 1)] as f64;
+            cnt += 1;
+        }
+        (nll, cnt)
+    }
+
     pub fn nll_ids_from(&mut self, ids: &[u32], start: usize) -> (f64, usize) {
         self.kv_cache.clear();
         self.kv_history.clear();

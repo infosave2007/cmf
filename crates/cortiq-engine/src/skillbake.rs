@@ -89,8 +89,12 @@ pub struct BakeReport {
 
 /// The trained artifacts: everything the defrag writer needs, f32.
 pub struct BakeArtifacts {
-    /// Per-layer live-neuron flags (true = keep).
+    /// Per-PHYSICAL-layer live flags: the union over visits — a weight
+    /// row is removable from disk only when no visit keeps it.
     pub keep: Vec<Vec<bool>>,
+    /// Per-VIRTUAL-layer live flags (physical × loops, pass-major): the
+    /// mask the file ships and the runtime applies per visit.
+    pub keep_visits: Vec<Vec<bool>>,
     /// Per-layer down_proj `[hidden, inter]` with dead columns zeroed
     /// (FCD layers: the trained weights; others: the backbone's).
     pub down: Vec<Vec<f32>>,
@@ -268,7 +272,11 @@ impl Pass<'_> {
         let mut lnorms: Vec<Option<(Vec<f32>, Vec<f32>)>> = vec![None; vn];
         for vl in 0..vn {
             let li = vl % nl;
-            let g = self.gates(li);
+            // The gate is PER VISIT: the two passes of a loop are
+            // different computations sharing one set of weights, so the
+            // mask must be allowed to differ between them. Weights stay
+            // indexed by the physical layer.
+            let g = self.gates(vl);
             let wts = self.wts(li);
             let want = grad.is_some();
             let (h2, a) = fm.layer_forward_scaled(li, &h, 1, t, &wts, false, want, Some(&g));
@@ -380,8 +388,10 @@ impl Pass<'_> {
                 }
             }
             // Mask grad: dm = Σ_t dact2·act · σ'(m)  (soft; STE-equal).
+            // Indexed by the VIRTUAL layer: each visit's mask row gets
+            // exactly its own visit's gradient, no cross-visit sum.
             {
-                let dm = &mut dmask[li];
+                let dm = &mut dmask[vl];
                 for r in 0..t {
                     let da = &dact2[r * inter..(r + 1) * inter];
                     let aa = &a.act[r * inter..(r + 1) * inter];
@@ -528,12 +538,14 @@ pub fn skill_bake(
     // rather than 0.0005.
     let loops = fm.loops.max(1);
     let m0 = mask_init_logit(loops);
-    let mut logits: Vec<Vec<f32>> = vec![vec![m0; inter]; nl];
+    // One mask row per VIRTUAL layer: nl × loops. Unlooped: vn == nl.
+    let vn = nl * loops;
+    let mut logits: Vec<Vec<f32>> = vec![vec![m0; inter]; vn];
     let mut ffn: Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>> = vec![None; nl];
 
     // Baseline (no mask): even σ(m0) is not exactly 1, so measure with
     // gates forced open via hard mask over +∞… simplest: logits +50.
-    let open: Vec<Vec<f32>> = vec![vec![50.0; inter]; nl];
+    let open: Vec<Vec<f32>> = vec![vec![50.0; inter]; vn];
     let base_pass = Pass {
         fm: &fm,
         tau: hy.tau,
@@ -545,7 +557,7 @@ pub fn skill_bake(
     log(&format!("baseline (full): {backbone:.3}"));
 
     // ── Phase A: mask training ──
-    let mut adam_a = Adam::new(&vec![inter; nl], hy.lr_a);
+    let mut adam_a = Adam::new(&vec![inter; vn], hy.lr_a);
     let mut l1 = hy.l1_init * hy.l1_mult;
     let l1_step_eff = hy.l1_step * hy.l1_mult;
     // best = (ppl, logits_snapshot, sparsity)
@@ -555,7 +567,7 @@ pub fn skill_bake(
     let mut prev_alive: Option<Vec<Vec<bool>>> = None;
     for step in 0..hy.steps_a {
         let chunk = &calib[step % calib.len()];
-        let mut dmask: Vec<Vec<f64>> = vec![vec![0.0; inter]; nl];
+        let mut dmask: Vec<Vec<f64>> = vec![vec![0.0; inter]; vn];
         let mut dffn: Vec<Option<(Vec<f64>, Vec<f64>, Vec<f64>)>> = vec![None; nl];
         let pass = Pass {
             fm: &fm,
@@ -567,7 +579,7 @@ pub fn skill_bake(
         let _ = pass.chunk(chunk, Some((&mut dmask, &mut dffn)));
         // Fold σ'(m) into the mask grads + add the L1 term.
         let l1_per = l1 / (inter as f64 * nl as f64);
-        for li in 0..nl {
+        for li in 0..vn {
             for j in 0..inter {
                 let s = sigmoid(logits[li][j]) as f64;
                 dmask[li][j] = dmask[li][j] * s * (1.0 - s) + l1_per * s * (1.0 - s);
@@ -581,8 +593,12 @@ pub fn skill_bake(
         // first evaluation window, and each of them is then missing from
         // both passes. Dividing by the visit count makes a step mean the
         // same thing at any loop depth.
+        // Per-visit rows: each mask logit receives exactly one visit's
+        // gradient, so the step needs no visit normalisation here — that
+        // scale now belongs to Phase B alone, where the FFN weights ARE
+        // shared across visits.
         let mut params: Vec<&mut [f32]> = logits.iter_mut().map(|v| v.as_mut_slice()).collect();
-        adam_a.step(&mut params, &dmask, mask_step_scale(loops));
+        adam_a.step(&mut params, &dmask, 1.0);
         if (step + 1) % hy.eval_every == 0 {
             l1 += l1_step_eff;
             let pass = Pass {
@@ -626,7 +642,7 @@ pub fn skill_bake(
             }
             let alive: usize = cur.iter().map(|l| l.iter().filter(|&&b| b).count()).sum();
             prev_alive = Some(cur);
-            let sp = 1.0 - alive as f64 / (nl * inter) as f64;
+            let sp = 1.0 - alive as f64 / (vn * inter) as f64;
             // Track highest-sparsity checkpoint.
             if sp > max_sp.2 {
                 max_sp = (hp, Some(logits.clone()), sp);
@@ -694,7 +710,7 @@ pub fn skill_bake(
     let mut best_b: (f64, Option<Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>>>) = (masked, None);
     for step in 0..hy.steps_b {
         let chunk = &calib[step % calib.len()];
-        let mut dmask: Vec<Vec<f64>> = vec![vec![0.0; inter]; nl];
+        let mut dmask: Vec<Vec<f64>> = vec![vec![0.0; inter]; vn];
         let mut dffn: Vec<Option<(Vec<f64>, Vec<f64>, Vec<f64>)>> = (0..nl)
             .map(|li| {
                 ffn[li]
@@ -758,17 +774,30 @@ pub fn skill_bake(
     let overlaid = best_b.0;
 
     // ── Export artifacts ──
-    let keep = keep_masks(&logits, hy.tau, hy.align, hy.uniform_inter);
+    // Per-visit keep flags are the mask that ships; the PHYSICAL keep is
+    // their union, because a weight row can only be removed from disk if
+    // no visit needs it.
+    let keep_visits = keep_masks(&logits, hy.tau, hy.align, hy.uniform_inter);
+    let keep: Vec<Vec<bool>> = (0..nl)
+        .map(|li| {
+            (0..inter)
+                .map(|j| (0..loops).any(|v| keep_visits[v * nl + li][j]))
+                .collect()
+        })
+        .collect();
     if hy.align > 1 || hy.uniform_inter {
         let raw: usize = logits
             .iter()
             .map(|l| l.iter().filter(|&&x| sigmoid(x) > hy.tau).count())
             .sum();
-        let padded: usize = keep
+        // Compare like with like: raw σ-counts are over the VIRTUAL
+        // rows, so the padded count must be too — the union rows are
+        // fewer and the subtraction would underflow.
+        let padded: usize = keep_visits
             .iter()
             .map(|a| a.iter().filter(|&&x| x).count())
             .sum::<usize>()
-            - raw;
+            .saturating_sub(raw);
         log(&format!(
             "align: +{padded} neurons resurrected (align {}, uniform {})",
             hy.align, hy.uniform_inter
@@ -796,17 +825,21 @@ pub fn skill_bake(
         gate_up.push(ffn[li].as_ref().map(|(g, u, _)| (g.clone(), u.clone())));
         down_out.push(down);
     }
-    let total: usize = kept_per_layer.iter().sum();
+    let total: usize = keep_visits
+        .iter()
+        .map(|a| a.iter().filter(|&&x| x).count())
+        .sum();
     let report = BakeReport {
         backbone,
         masked,
         overlaid,
-        pruned_ratio: 1.0 - total as f64 / (nl * inter) as f64,
+        pruned_ratio: 1.0 - total as f64 / (vn * inter) as f64,
         kept_per_layer,
         sec: t0.elapsed().as_secs_f64(),
     };
     let arts = BakeArtifacts {
         keep,
+        keep_visits,
         down: down_out,
         gate_up,
         fcd_layers: fcd,

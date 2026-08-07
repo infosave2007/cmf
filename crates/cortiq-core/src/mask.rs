@@ -370,7 +370,14 @@ pub fn encode_masks_section(catalog: &MaskCatalog, arch: &ModelArch) -> Result<V
     let head_b = arch.head_mask_bytes();
     let gates_b = arch.gates_mask_bytes();
     let expert_b = arch.expert_mask_bytes();
-    let blob_len = arch.mask_blob_len();
+    // A Looped Transformer stores one FFN mask row per VIRTUAL layer
+    // (physical × loops, ordered pass-major: pass 0's layers, then pass
+    // 1's), because the runtime indexes masks by the virtual layer and
+    // the passes are different computations sharing one set of weights.
+    // Heads and gates stay per physical layer. Unlooped: rows == layers,
+    // byte-identical to the legacy layout.
+    let ffn_rows = arch.num_layers * arch.num_loops.max(1);
+    let blob_len = ffn_rows * ffn_b + arch.num_layers * head_b + gates_b;
 
     // Build blobs first to know sizes. Blob lengths are per-mask now:
     // base, or base + the optional expert area (spec §5).
@@ -382,9 +389,17 @@ pub fn encode_masks_section(catalog: &MaskCatalog, arch: &ModelArch) -> Result<V
         } else {
             blob_len
         });
-        for li in 0..arch.num_layers {
+        for vl in 0..ffn_rows {
+            // A caller that built per-physical masks (every pre-loop
+            // writer) gets them replicated to every pass — the exact
+            // semantics its mask had before this area existed.
+            let src_i = if m.ffn_masks.len() >= ffn_rows {
+                vl
+            } else {
+                vl % arch.num_layers.max(1)
+            };
             let mut row = vec![0u8; ffn_b];
-            if let Some(src) = m.ffn_masks.get(li) {
+            if let Some(src) = m.ffn_masks.get(src_i) {
                 let n = src.len().min(ffn_b);
                 row[..n].copy_from_slice(&src[..n]);
             }
@@ -512,15 +527,28 @@ pub fn decode_masks_section(bytes: &[u8], arch: &ModelArch) -> Result<MaskCatalo
     let ffn_b = arch.ffn_mask_bytes();
     let head_b = arch.head_mask_bytes();
     let expert_b = arch.expert_mask_bytes();
-    let expected_blob = arch.mask_blob_len() as u64;
-    let expected_with_experts = arch.mask_blob_len_with_experts() as u64;
+    // Two acceptable layouts, told apart by the stored blob_len: the
+    // legacy one with one FFN row per PHYSICAL layer, and the loop one
+    // with one per VIRTUAL layer. Unlooped models: identical.
+    let vrows = arch.num_layers * arch.num_loops.max(1);
+    let legacy_blob = arch.mask_blob_len() as u64;
+    let legacy_with_experts = arch.mask_blob_len_with_experts() as u64;
+    let loop_blob =
+        (vrows * ffn_b + arch.num_layers * head_b + arch.gates_mask_bytes()) as u64;
+    let loop_with_experts = loop_blob + (arch.num_layers * expert_b) as u64;
 
     let mut masks = Vec::with_capacity(n_masks);
     for mm in &meta.masks {
-        let expected = if mm.has_expert_fields {
-            expected_with_experts
+        let (expected, ffn_rows) = if mm.has_expert_fields {
+            if mm.blob_len == loop_with_experts {
+                (loop_with_experts, vrows)
+            } else {
+                (legacy_with_experts, arch.num_layers)
+            }
+        } else if mm.blob_len == loop_blob {
+            (loop_blob, vrows)
         } else {
-            expected_blob
+            (legacy_blob, arch.num_layers)
         };
         if mm.has_expert_fields && expert_b == 0 {
             return Err(format!(
@@ -546,11 +574,21 @@ pub fn decode_masks_section(bytes: &[u8], arch: &ModelArch) -> Result<MaskCatalo
         }
         let blob = &bytes[start..end];
 
-        let mut ffn_masks = Vec::with_capacity(arch.num_layers);
-        for li in 0..arch.num_layers {
+        let mut ffn_masks = Vec::with_capacity(vrows);
+        for li in 0..ffn_rows {
             ffn_masks.push(blob[li * ffn_b..(li + 1) * ffn_b].to_vec());
         }
-        let heads_base = arch.num_layers * ffn_b;
+        // A legacy mask on a looped model: replicate each physical row
+        // to every pass. Without this, the runtime — which indexes masks
+        // by the VIRTUAL layer — finds nothing past the first pass,
+        // `ffn_active_count` answers 0, and the sparse path silently
+        // zeroes the entire second pass's FFN output.
+        if ffn_rows < vrows {
+            ffn_masks = (0..vrows)
+                .map(|vl| ffn_masks[vl % arch.num_layers.max(1)].clone())
+                .collect();
+        }
+        let heads_base = ffn_rows * ffn_b;
         let mut head_masks = Vec::with_capacity(arch.num_layers);
         for li in 0..arch.num_layers {
             head_masks
