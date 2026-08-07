@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.61] - 2026-08-07
+
 ### Fixed
 - **A software rasteriser was being accepted as a GPU.** Mesa ships
   lavapipe/llvmpipe in most container images — Hugging Face Spaces, CI
@@ -2386,7 +2388,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.5.60...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.5.61...HEAD
+[0.5.61]: https://github.com/infosave2007/cmf/compare/v0.5.60...v0.5.61
 [0.5.60]: https://github.com/infosave2007/cmf/compare/v0.5.59...v0.5.60
 [0.5.59]: https://github.com/infosave2007/cmf/compare/v0.2.2...v0.5.59
 [0.2.2]: https://github.com/infosave2007/cmf/compare/v0.2.1...v0.2.2
