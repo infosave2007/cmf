@@ -18,6 +18,29 @@ BLAS、不用 ONNX、不用装 CUDA、不用 C++ 工具链——在所有平台�
 它的不同之处在于：**只用一个开关，你就能把模型的注意力转换成常量内存的流式
 算子**——无需重训练，权重逐字节不变——于是长对话不再比短对话更费内存。
 
+## 它还能生成画面
+
+同一个容器，同一个二进制文件，推理时同样不需要 Python。
+
+| `cortiq animate` — 视频**连同它的声音** | `--first-frame` — 从一张图继续 |
+|---|---|
+| ![戴厨师帽的柯基在颠煎饼](docs/media/corgi.gif) | ![同一段片子，从一帧静图续出来](docs/media/keyframe.gif) |
+
+512×288，39 帧，**四步采样**，全部出自一个 23.9 GB 的文件。声音不是事后配上去
+的：它和视频在同一条打包序列里去噪，走自己的流匹配时间表，所以出来就是同步的。
+带声音的成片、以及生成第二段所用的那一帧，都放在
+[模型仓库](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/tree/main/samples)里；
+[下面的章节](#文本生成视频连同声音minimax-h3--turbo-lora)讲了 124.4 GB 的参考
+实现是怎么变成一个文件的。
+
+| `cortiq imagine` — Lumina-Image 2.0，19 GB 的 diffusers 目录装进 3.2 GB 的 `.cmf` |
+|---|
+| <img src="docs/media/fox-512.png" width="380" alt="雪林中的红狐"> |
+
+不装任何东西就能试：[转换一个模型](https://huggingface.co/spaces/infosave/cmf-converter)、
+[生成一张图](https://huggingface.co/spaces/infosave/cmf-imagine)、
+[看看成片](https://huggingface.co/spaces/infosave/cmf-animate)。
+
 ## 上手试试
 
 ```sh
@@ -315,6 +338,8 @@ cargo add cortiq-core                    # or use the format from your own Rust 
 | `cortiq compact` | append-only 技能增长后的紧致容器重写 |
 | `cortiq imagine model.cmf --prompt "…"` | 文本 → 图片（Lumina-Image 2.0），纯 Rust，CPU 或 Metal |
 | `cortiq imagine-pack <diffusers-dir>` | 把文本编码器 + DiT + VAE + 分词器打包成一个量化 `.cmf` |
+| `cortiq animate model.cmf --prompt "…"` | 文本 → 视频**连同同步的立体声**（MiniMax-H3 + Turbo LoRA）；`--first-frame`/`--last-frame` 可从一张图继续 |
+| `cortiq animate-pack` | 把音视频 DiT、它的 Qwen3-VL 编码器、两个 VAE 解码器和视觉塔打包成一个 `.cmf` |
 
 `cortiq <command> --help` 里有每个参数的说明。
 
@@ -427,6 +452,42 @@ GPU 路径与 CPU 的对比探测方式和 LLM 推理完全相同——探测输
 CPU 路径上，开启 GPU 永远不会让你更慢——GPU 渲染在视觉上完全一致。面向
 应用，C ABI 导出 `cortiq_imagine`（文本 → RGB8，带每步进度回调）；
 `--cfg 1` 关闭 guidance、工作量减半——是手机上的正确默认值。
+
+### 文本生成视频，连同声音（MiniMax-H3 + Turbo LoRA）
+
+同一个容器里还装着一个音视频联合模型。一个提示词、一个 transformer，出来
+的是一段片子**和与之同步的立体声**：两者在同一条打包序列里、按两套不同的
+流匹配时间表、用四步一起去噪。
+
+```sh
+CMF_MMH3_GPU=1 cortiq animate mmh3-turbo-fl2va-q4tp.cmf \
+    --prompt "A corgi in a chef hat flipping a pancake, sizzling sounds and a cheerful bark." \
+    --width 512 --height 288 --frames 39 --out corgi.avi
+# 改成从一张图继续：
+CMF_MMH3_GPU=1 cortiq animate mmh3-turbo-fl2va-q4tp.cmf \
+    --prompt "…" --first-frame frame.ppm --out clip.avi
+```
+
+四个文件外加一份 ComfyUI 代码——一共 124.4 GB——变成**一个 23.9 GB 的
+`.cmf`**：330 亿参数的 DiT、它的 Qwen3-VL-32B 提示词编码器、ViT3D 视频
+解码器、BigVGAN 声码器、Qwen3-VL 的视觉塔，以及关键帧所需的 VAE 编码器。
+四步 Turbo LoRA 已经合并进去，所以这个文件**就是** turbo 模型。输出是
+AVI 里的 MJPEG+PCM 加一个 `.wav`——JPEG 编码器和 RIFF 封装器都在这个二进制
+文件里，因为一条以调用 ffmpeg 结尾的流水线是没法交付的。
+
+这里的体积缩减大部分并不来自量化。**发布版模型的四成是每个块里的一个
+矩阵**——`adaln_proj.linear`，130 亿参数，而它这个映射的唯一输入是时间步。
+它的输出沿着时间表画出一条曲线，所以 `animate-pack` 把它压到一组秩为 24
+的基上，并且 LoRA 已经折进去了：每块 4.6 MB 而不是 520 MB，误差 rms
+8.7e-5，而信号本身的 rms 是 0.464。
+
+每个栈都在带着发布版真实张量名和真实时间表的玩具检查点上，与 ComfyUI 自己
+的模块逐一比对（`tools/mmh3_toy_gate.sh`）：DiT 速度场 8.8e-5，提示词编码器
+1.1e-6，视频解码器 4.2e-7（含它那 256 像素的分块），声码器 1.7e-9，视觉塔
+6.2e-6。512×288、39 帧，在 48 个 CPU 核上需要 346.5 秒，在一块 RTX PRO 6000
+上需要 **172.0 秒**——这个模型的设备分支需要显式打开，所以上面写了
+`CMF_MMH3_GPU=1`。权重和模型卡：
+[infosave/MiniMax-H3-Turbo-cmf](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf)。
 
 ## O(1) 深入解析
 
