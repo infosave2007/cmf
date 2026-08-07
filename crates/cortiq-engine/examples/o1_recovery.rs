@@ -121,6 +121,75 @@ fn trial(m: usize, w: usize, sink: usize, amp: f32, depth: usize, seed: u64) -> 
     got[0] / want0
 }
 
+
+/// The background channel on its own: no needle, no signal, just the
+/// skeleton's error in estimating a far field of ordinary keys.
+///
+/// The recovery statistic divides by the exact answer, so it mixes two
+/// error sources — the needle's own estimate and the denominator built
+/// from every background key. Removing the needle isolates the second,
+/// and it is the one that should follow the central-limit law: a sum
+/// over ~n far keys approximated from m landmarks.
+///
+/// Returned: ‖o_o1 − o_exact‖ / ‖o_exact‖ over the whole output vector.
+/// An AMPLITUDE, deliberately — its square is the energy, and the two
+/// differ by exactly a factor of two in any log-log slope, which is why
+/// only one of them needs measuring.
+fn background_error(m: usize, w: usize, sink: usize, depth: usize, seed: u64) -> f32 {
+    let (d, dv) = (64usize, 8usize);
+    // Sequence length is FIXED, not 8*m + …. Tying it to m — which the
+    // recovery sweep above does, to guarantee m_eff reaches m — means a
+    // larger budget also gets a longer far field, and the sweep varies
+    // two things at once. Here only m moves. `8 * 64` keeps m_eff = m up
+    // to the largest budget measured.
+    let t = 8 * 64 + w + depth;
+    let _ = m;
+    let mut s = seed;
+    let rd = (d as f32).sqrt();
+
+    let mut unit = |s: &mut u64| -> Vec<f32> {
+        let v: Vec<f32> = (0..d).map(|_| unif(s)).collect();
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter().map(|x| x / n).collect()
+    };
+    let q: Vec<f32> = unit(&mut s).iter().map(|x| x * rd).collect();
+    let mut qs = Vec::with_capacity(t * d);
+    for _ in 0..t {
+        let u = unit(&mut s);
+        qs.extend(u.iter().map(|x| x * rd));
+    }
+    let ks: Vec<f32> = (0..t * d).map(|_| unif(&mut s) * 1.732).collect();
+    let vs: Vec<f32> = (0..t * dv).map(|_| unif(&mut s)).collect();
+
+    let mut st = NystromState::new(m, w, sink);
+    st.prefill(&qs, &ks, &vs, t, d, dv);
+    let k_new: Vec<f32> = (0..d).map(|_| unif(&mut s) * 1.732).collect();
+    let v_new: Vec<f32> = (0..dv).map(|_| unif(&mut s)).collect();
+    let mut got = vec![0f32; dv];
+    st.step(&q, &k_new, &v_new, &mut got);
+
+    let mut logits = Vec::with_capacity(t + 1);
+    for j in 0..t {
+        logits.push((0..d).map(|c| q[c] * ks[j * d + c]).sum::<f32>() / rd);
+    }
+    logits.push((0..d).map(|c| q[c] * k_new[c]).sum::<f32>() / rd);
+    let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut den = 0f64;
+    let mut want = vec![0f64; dv];
+    for (j, &l) in logits.iter().enumerate() {
+        let e = ((l - mx) as f64).exp();
+        den += e;
+        let src = if j == t { &v_new[..] } else { &vs[j * dv..(j + 1) * dv] };
+        for (c, wc) in want.iter_mut().enumerate() {
+            *wc += e * src[c] as f64;
+        }
+    }
+    let want: Vec<f32> = want.iter().map(|x| (x / den) as f32).collect();
+    let num: f32 = got.iter().zip(&want).map(|(g, x)| (g - x) * (g - x)).sum::<f32>().sqrt();
+    let den2: f32 = want.iter().map(|x| x * x).sum::<f32>().sqrt();
+    num / den2.max(1e-9)
+}
+
 struct Cell {
     mean: f32,
     sd: f32,
@@ -208,6 +277,44 @@ fn main() {
         }
         println!();
     }
+
+
+    // ── the background channel alone ───────────────────────────────────
+    // No needle. This is the sum over ~n far keys that the skeleton
+    // estimates from m landmarks, and nothing else — the channel the
+    // recovery statistic divides by and therefore cannot see cleanly.
+    println!("\nbackground-only error (no needle) — the denominator channel isolated");
+    println!("{:>6}{:>14}{:>14}{:>12}", "m", "rel error", "sd", "log2 drop");
+    let mut prev: Option<f32> = None;
+    let mut pts: Vec<(f32, f32)> = Vec::new();
+    for &m in &ms {
+        let mut es: Vec<f32> = (0..trials)
+            .map(|i| background_error(m, w, sink, depth, 0x5000 + i as u64 * 0x9E3779B9))
+            .filter(|e| e.is_finite())
+            .collect();
+        es.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = es.len().max(1) as f32;
+        let mean = es.iter().sum::<f32>() / n;
+        let sd = (es.iter().map(|e| (e - mean) * (e - mean)).sum::<f32>() / n).sqrt();
+        let drop = prev.map(|p| (p / mean).log2()).unwrap_or(f32::NAN);
+        println!("{m:>6}{:>14.4}{:>14.4}{:>12.2}", mean, sd, drop);
+        prev = Some(mean);
+        pts.push(((m as f32).ln(), mean.max(1e-9).ln()));
+    }
+    let n = pts.len() as f32;
+    let (sx, sy) = pts.iter().fold((0f32, 0f32), |(a, b), (x, y)| (a + x, b + y));
+    let (mx, my) = (sx / n, sy / n);
+    let num: f32 = pts.iter().map(|(x, y)| (x - mx) * (y - my)).sum();
+    let den: f32 = pts.iter().map(|(x, _)| (x - mx) * (x - mx)).sum();
+    let beta = num / den;
+    println!(
+        "\nlog-log slope of the background error vs m: {beta:.3}  (amplitude)\n\
+         its energy would be {:.3} by identity — squaring doubles any slope, which is\n\
+         why only one of the two is worth measuring. CLT on a mean of m samples predicts\n\
+         -0.500 in amplitude; a Nystrom skeleton on a slowly-decaying kernel predicts\n\
+         nearer -0.250. That is the difference this table can actually settle.",
+        2.0 * beta
+    );
 
     // Step or continuum? A step in m would show as the 50% and 95%
     // criteria crossing at the SAME m — the needle is either kept whole
