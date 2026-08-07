@@ -466,11 +466,30 @@ pub fn skill_bake(
     let fcd: Vec<usize> = (nl.saturating_sub(hy.fcd_layers)..nl).collect();
     let _rng = SplitMix64::new(hy.seed);
 
-    // Trainables.
-    let mut logits: Vec<Vec<f32>> = vec![vec![2.0; inter]; nl];
+    // Trainables. The gate starts as close to OPEN as the arithmetic
+    // allows, because step zero must be the backbone and nothing else.
+    //
+    // It used to start at 2.0, and σ(2.0) = 0.881 — every FFN neuron
+    // scaled to seven eighths before a single gradient. On an ordinary
+    // stack that costs a few percent of perplexity and hides. On a
+    // LOOPED Transformer it does not: Nanbeige 4.2 runs its 22 layers
+    // twice, so each physical FFN is visited twice and the factor
+    // compounds to 0.881² = 0.776 per layer over 44 visits. Measured:
+    // baseline 4.187 → 278.4 at step 30 with 0% pruned. Nothing had been
+    // pruned; the mask had simply turned the model down.
+    //
+    // So solve for the init instead of hardcoding it: pick m0 such that
+    // σ(m0)^loops = 0.999, which is identity to three digits for any
+    // depth and leaves L1 the whole job of closing neurons.
+    let loops = fm.loops.max(1) as f32;
+    let m0 = {
+        let per_visit = 0.999f32.powf(1.0 / loops);
+        (per_visit / (1.0 - per_visit)).ln()
+    };
+    let mut logits: Vec<Vec<f32>> = vec![vec![m0; inter]; nl];
     let mut ffn: Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>> = vec![None; nl];
 
-    // Baseline (no mask): σ(2.0)≈0.88 is NOT identity, so measure with
+    // Baseline (no mask): even σ(m0) is not exactly 1, so measure with
     // gates forced open via hard mask over +∞… simplest: logits +50.
     let open: Vec<Vec<f32>> = vec![vec![50.0; inter]; nl];
     let base_pass = Pass {

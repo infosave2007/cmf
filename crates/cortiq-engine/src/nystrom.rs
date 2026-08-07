@@ -512,6 +512,28 @@ impl NystromGroup {
         // integer split (i·t)/m matches the reference probe; the clamp
         // keeps tiny prompts from producing duplicate landmarks.
         let m_eff = (t / 8).clamp(4, self.m);
+        // Say so when the budget asked for is not the budget used. A
+        // prefill of 256 caps m_eff at 32, so `--o1-m 64`, `128` and
+        // `256` all run as 32 and report perplexities identical to the
+        // last digit — which reads as a saturating method rather than a
+        // clamp, and cost a sweep before it was noticed. This file's own
+        // discipline is that a file is either valid or open() fails
+        // loudly; a flag that silently does nothing is the same defect
+        // one level up.
+        if m_eff < self.m {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "o1: landmark budget m={} clamped to m_eff={} — the prefill is {t} tokens \
+                     and the skeleton takes t/8. Prefill at least {} tokens to use the budget \
+                     you asked for.",
+                    self.m,
+                    m_eff,
+                    self.m * 8
+                );
+            }
+        }
         self.m_eff = m_eff;
         let k_tilde64 = seg_means(ks, t, d, m_eff);
         self.k_tilde = k_tilde64.iter().map(|&x| x as f32).collect();
