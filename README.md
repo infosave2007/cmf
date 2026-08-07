@@ -22,6 +22,30 @@ constant-memory streaming operator with one flag** — no retraining, weights
 byte-identical — so a long conversation stops costing more memory than a short
 one.
 
+## It renders, too
+
+The same container, the same binary, and no Python at inference for any of it.
+
+| `cortiq animate` — video **and its soundtrack** | `--first-frame` — continue from a picture |
+|---|---|
+| ![a corgi in a chef hat flipping a pancake](docs/media/corgi.gif) | ![the same clip continued from a still frame](docs/media/keyframe.gif) |
+
+512×288, 39 frames, **four sampling steps**, out of one 23.9 GB file. The audio
+is not dubbed on afterwards: it is denoised in the same packed sequence as the
+video, on its own flow schedule, so it arrives already in sync. Clips with
+sound, and the keyframe that produced the second one, are in the
+[model repo](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/tree/main/samples);
+[the section below](#text-to-video-with-the-sound-minimax-h3--turbo-lora) says
+how 124.4 GB of reference tree became one file.
+
+| `cortiq imagine` — Lumina-Image 2.0, a 19 GB diffusers tree in a 3.2 GB `.cmf` |
+|---|
+| <img src="docs/media/fox-512.png" width="380" alt="a red fox in a snowy forest"> |
+
+Try either without installing anything: [convert a model](https://huggingface.co/spaces/infosave/cmf-converter),
+[render an image](https://huggingface.co/spaces/infosave/cmf-imagine),
+[watch the clips](https://huggingface.co/spaces/infosave/cmf-animate).
+
 ## Try it
 
 ```sh
