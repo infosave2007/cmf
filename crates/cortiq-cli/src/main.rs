@@ -865,8 +865,9 @@ enum Commands {
         /// Qwen3-VL tokenizer.json for the VOCAB section
         #[arg(long)]
         tokenizer: Option<String>,
-        /// Projection codec: q4tp | q8 | f16 (norms and the fp32 island
-        /// stay exact, adaLN curves f16)
+        /// Projection codec: q4tp | q2tp | q8 | f16. q2tp drops the
+        /// gate/up planes to two bits and leaves everything else at
+        /// four; norms and the fp32 island stay exact either way
         #[arg(long, default_value = "q4tp")]
         quant: String,
         /// Qwen3-VL's vision tower — `fl2va` needs it, and it lives

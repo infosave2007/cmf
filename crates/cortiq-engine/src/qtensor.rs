@@ -1393,10 +1393,54 @@ impl QTensor {
                     return;
                 }
                 if *dtype == TensorDtype::Q2TiledP {
-                    // Without this arm a q2tp tensor falls through to the
-                    // q8 fallback, which reads it at one BYTE per weight —
-                    // a 2x overrun that killed pool workers mid-prefill
-                    // while the dispatcher waited forever.
+                    // Same device arm as q4tp, behind the same probe:
+                    // the planes differ, the dispatch does not. Without
+                    // this a q2tp file ran its widest projections on the
+                    // host while the 4-bit one had the card, which is a
+                    // codec paying for its size twice.
+                    if b >= 32
+                        && b * rows * cols >= 128_000_000
+                        && cols % 32 == 0
+                        && !crate::gpu::mm_killed()
+                        && crate::gpu::enabled_here()
+                    {
+                        let class = if b >= 128 {
+                            crate::gpu::OpClass::MatmatWide
+                        } else {
+                            crate::gpu::OpClass::Matmat
+                        };
+                        if let Self::Mapped { model, idx, .. } = self {
+                            let t0 = std::time::Instant::now();
+                            match crate::gpu::probe_arm(class) {
+                                crate::gpu::ProbeArm::Gpu => {
+                                    if crate::gpu::q2tp_matmat(
+                                        model, *idx, xs_all, b, rows, cols, out,
+                                    ) {
+                                        crate::gpu::probe_record(class, true, t0.elapsed());
+                                        return;
+                                    }
+                                }
+                                crate::gpu::ProbeArm::CpuTimed => {
+                                    q2tp_matmat(
+                                        self.quant_bytes(),
+                                        xs_all,
+                                        b,
+                                        rows,
+                                        cols,
+                                        out,
+                                        pool,
+                                    );
+                                    crate::gpu::probe_record(class, false, t0.elapsed());
+                                    return;
+                                }
+                                crate::gpu::ProbeArm::Cpu => {}
+                            }
+                        }
+                    }
+                    // Without a host arm a q2tp tensor falls through to
+                    // the q8 fallback, which reads it at one BYTE per
+                    // weight — a 2x overrun that killed pool workers
+                    // mid-prefill while the dispatcher waited forever.
                     q2tp_matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
                     return;
                 }

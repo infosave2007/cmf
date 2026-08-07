@@ -4259,6 +4259,122 @@ fn q4tp_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
     q4t_store4(mb + 3u, nb2, a30, a31, a32, a33);
 }
 
+// The same GEMM over a `q2tp` weight plane. Three things differ and
+// nothing else does: the weight plane is 8 bytes a group rather than
+// 16, a byte holds four 2-bit codes instead of two nibbles, and the
+// scale ladder is shifted down a rung because rung 0 is spent naming
+// the exact zero the +-0.5/+-1.5 grid cannot reach. The params and
+// codes planes are byte-identical to q4tp's.
+@compute @workgroup_size(16, 16)
+fn q2tp_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let cols = pmm.cols4 * 4u;
+    let gpr = cols >> 5u;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    let tid = lid.y * 16u + lid.x;
+    // The 4x4 register block is SIXTEEN NAMED SCALARS, not
+    // array<array<f32,4>,4>: indexed by loop variables the array is a
+    // private array, which this backend puts in stack memory — the
+    // accumulators leave registers and the GEMM runs at a fraction of
+    // the card (measured 373 GFLOP/s of an RTX 3090's ~35 TFLOP/s).
+    var a00 = 0.0; var a01 = 0.0; var a02 = 0.0; var a03 = 0.0;
+    var a10 = 0.0; var a11 = 0.0; var a12 = 0.0; var a13 = 0.0;
+    var a20 = 0.0; var a21 = 0.0; var a22 = 0.0; var a23 = 0.0;
+    var a30 = 0.0; var a31 = 0.0; var a32 = 0.0; var a33 = 0.0;
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        // Each thread owns ONE whole vec4 of the tile. Writing single
+        // lanes of a shared vec4 from four threads is a data race on any
+        // backend that lowers a dynamic component write to read-modify-write
+        // the whole vector — Metal does, and three lanes in four came back
+        // zero while Vulkan was fine.
+        {
+            let kk = tid / 16u;
+            let slot = tid % 16u;
+            let col = k0 + kk;
+            let m = m0 + slot * 4u;
+            var xv = vec4<f32>(0.0);
+            if (col < cols) {
+                let i0 = m * cols + col;
+                if (m < pmm.nb) { xv.x = xmm4[i0 >> 2u][i0 & 3u]; }
+                let i1 = i0 + cols;
+                if (m + 1u < pmm.nb) { xv.y = xmm4[i1 >> 2u][i1 & 3u]; }
+                let i2 = i1 + cols;
+                if (m + 2u < pmm.nb) { xv.z = xmm4[i2 >> 2u][i2 & 3u]; }
+                let i3 = i2 + cols;
+                if (m + 3u < pmm.nb) { xv.w = xmm4[i3 >> 2u][i3 & 3u]; }
+            }
+            q4t_at4[kk * 16u + slot] = xv;
+        }
+        for (var t = tid; t < 64u * 4u; t = t + 256u) {
+            let n = t / 4u;
+            let k4 = t % 4u;
+            var wv = vec4<f32>(0.0);
+            let col0 = k0 + k4 * 4u;
+            if (n0 + n < pmm.rows && col0 < cols) {
+                let g = col0 >> 5u;
+                let wrow = n0 + n;
+                let params_b = pmm.rows * gpr * 8u;
+                let codes_b = params_b + pmm.rows * 4u;
+                let cstride = (gpr * 5u + 7u) / 8u;
+                let bit = g * 5u;
+                let cb = codes_b + wrow * cstride + (bit >> 3u);
+                let sh = bit & 7u;
+                var cv = qmm_byte(cb);
+                if (sh > 3u) { cv = cv | (qmm_byte(cb + 1u) << 8u); }
+                let pr = unpack2x16float(qmm[(params_b >> 2u) + wrow]);
+                // Rung 0 means the group is exactly zero — the 4-level
+                // grid cannot spell it — and 1..=31 are the q4tp ladder
+                // shifted down one.
+                let code = (cv >> sh) & 31u;
+                var scale = 0.0;
+                if (code > 0u) { scale = exp2(pr.x + f32(code - 1u) * pr.y); }
+                let toff = (wrow * gpr + g) * 8u;
+                let p = col0 - g * 32u;
+                // Four 2-bit weights to a byte, LSB first, so one byte
+                // is exactly the vec4 this thread owns.
+                let bo = toff + p / 4u;
+                let by = (qmm[bo >> 2u] >> ((bo & 3u) * 8u)) & 0xFFu;
+                wv[0u] = (f32(by & 3u) - 1.5) * scale;
+                wv[1u] = (f32((by >> 2u) & 3u) - 1.5) * scale;
+                wv[2u] = (f32((by >> 4u) & 3u) - 1.5) * scale;
+                wv[3u] = (f32((by >> 6u) & 3u) - 1.5) * scale;
+            }
+            let dst = n * TSTRIDE + k4 * 4u;
+            q4t_wt[dst] = wv.x; q4t_wt[dst + 1u] = wv.y;
+            q4t_wt[dst + 2u] = wv.z; q4t_wt[dst + 3u] = wv.w;
+        }
+        workgroupBarrier();
+        let wb = lid.x * 4u * TSTRIDE;
+        for (var k = 0u; k < 16u; k = k + 1u) {
+            let xv = q4t_at4[k * 16u + lid.y];
+            let x0 = xv.x; let x1 = xv.y; let x2 = xv.z; let x3 = xv.w;
+            let y0 = q4t_wt[wb + k];
+            let y1 = q4t_wt[wb + TSTRIDE + k];
+            let y2 = q4t_wt[wb + 2u * TSTRIDE + k];
+            let y3 = q4t_wt[wb + 3u * TSTRIDE + k];
+            a00 = a00 + x0 * y0; a01 = a01 + x0 * y1;
+            a02 = a02 + x0 * y2; a03 = a03 + x0 * y3;
+            a10 = a10 + x1 * y0; a11 = a11 + x1 * y1;
+            a12 = a12 + x1 * y2; a13 = a13 + x1 * y3;
+            a20 = a20 + x2 * y0; a21 = a21 + x2 * y1;
+            a22 = a22 + x2 * y2; a23 = a23 + x2 * y3;
+            a30 = a30 + x3 * y0; a31 = a31 + x3 * y1;
+            a32 = a32 + x3 * y2; a33 = a33 + x3 * y3;
+        }
+        workgroupBarrier();
+        k0 = k0 + 16u;
+    }
+    let mb = m0 + lid.y * 4u;
+    let nb2 = n0 + lid.x * 4u;
+    q4t_store4(mb, nb2, a00, a01, a02, a03);
+    q4t_store4(mb + 1u, nb2, a10, a11, a12, a13);
+    q4t_store4(mb + 2u, nb2, a20, a21, a22, a23);
+    q4t_store4(mb + 3u, nb2, a30, a31, a32, a33);
+}
+
 @compute @workgroup_size(16, 16)
 fn q4t_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
               @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -9254,6 +9370,7 @@ struct Ctx {
     q4t_mv8: wgpu::ComputePipeline,
     q4b_mv8: wgpu::ComputePipeline,
     q4tp_mm: wgpu::ComputePipeline,
+    q2tp_mm: wgpu::ComputePipeline,
     q4tp_mm_coop: Option<wgpu::ComputePipeline>,
     argmax_part: wgpu::ComputePipeline,
     gdn_step_par: wgpu::ComputePipeline,
@@ -9967,6 +10084,7 @@ fn init() -> Result<Ctx, String> {
     let q4t_mv8 = pipe("q4t_matvec8");
     let q4b_mv8 = pipe("q4b_matvec8");
     let q4tp_mm = pipe("q4tp_mul_mm");
+    let q2tp_mm = pipe("q2tp_mul_mm");
     // The tensor-core GEMM lives in its own module: its `enable` directive
     // does not parse without the feature, so a device that lacks it must
     // never be handed the source.
@@ -10280,6 +10398,7 @@ fn init() -> Result<Ctx, String> {
         q4t_mv8,
         q4b_mv8,
         q4tp_mm,
+        q2tp_mm,
         q4tp_mm_coop,
         argmax_part,
         gdn_step_par,
@@ -16304,6 +16423,37 @@ pub fn q4tp_matmat(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
+    tp_matmat(model, idx, xs, b, rows, cols, out, false)
+}
+
+/// The same, over a two-bit weight plane.
+pub fn q2tp_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    tp_matmat(model, idx, xs, b, rows, cols, out, true)
+}
+
+/// `q4tp` and `q2tp` differ in their weight plane and their ladder, and
+/// in nothing this function does: same buffers, same bind group, same
+/// dispatch. Only the pipeline and the expected byte count follow the
+/// width.
+#[allow(clippy::too_many_arguments)]
+fn tp_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    two_bit: bool,
+) -> bool {
     let Some(c) = ctx() else { return false };
     let gpr = cols / 32;
     if cols % 32 != 0 || rows == 0 || b == 0 {
@@ -16318,8 +16468,12 @@ pub fn q4tp_matmat(
     };
     let bytes = model.primary_bytes();
     let plen = entry.nbytes as usize;
-    let Some(need) =
-        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+    let dt = if two_bit {
+        cortiq_core::TensorDtype::Q2TiledP
+    } else {
+        cortiq_core::TensorDtype::Q4TiledP
+    };
+    let Some(need) = cortiq_core::quant::expected_nbytes(dt, &[rows, cols])
     else {
         return false;
     };
@@ -16379,7 +16533,7 @@ pub fn q4tp_matmat(
     ];
     let bind_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("q4tpmm-bg"),
-        layout: &mm_pipeline(c, true).get_bind_group_layout(0),
+        layout: &mm_pipeline(c, true, two_bit).get_bind_group_layout(0),
         entries: &entries,
     });
     let mut enc = c
@@ -16392,7 +16546,7 @@ pub fn q4tp_matmat(
             label: Some("q4tpmm"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(mm_pipeline(c, true));
+        pass.set_pipeline(mm_pipeline(c, true, two_bit));
         pass.set_bind_group(0, &bind_mm, &[]);
         pass.dispatch_workgroups(
             (rows as u32).div_ceil(64).min(MAX_WG),
@@ -17371,7 +17525,7 @@ fn ffn_q4(
     let p13 = uniform_u32x4(c, [(hidden / 4) as u32, inter as u32, b as u32, 0]);
     let p2 = uniform_u32x4(c, [(inter / 4) as u32, hidden as u32, b as u32, 0]);
     let psilu = uniform_u32x4(c, [(b * inter) as u32, 0, 0, 0]);
-    let mm = if q4tp { &c.q4tp_mm } else { &c.q4t_mm };
+    let mm = mm_pipeline(c, q4tp, false);
     let mm_layout = mm.get_bind_group_layout(0);
     let bind_mm = |q: &wgpu::Buffer, x: &wgpu::Buffer, y: &wgpu::Buffer, p: &wgpu::Buffer| {
         c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -18352,7 +18506,13 @@ fn encode_q4_tile_mm(
 
 /// The GEMM pipeline to use for this weight layout: the tensor-core one
 /// when the device brought it up, the scalar one otherwise.
-fn mm_pipeline<'a>(c: &'a Ctx, q4tp: bool) -> &'a wgpu::ComputePipeline {
+fn mm_pipeline<'a>(c: &'a Ctx, q4tp: bool, two_bit: bool) -> &'a wgpu::ComputePipeline {
+    if two_bit {
+        // No cooperative variant: the tensor-core kernel is written
+        // against the 4-bit plane, and a shader compiled against a
+        // layout the weights do not have is a silently wrong answer.
+        return &c.q2tp_mm;
+    }
     if q4tp {
         if let Some(p) = c.q4tp_mm_coop.as_ref() {
             return p;
@@ -20875,7 +21035,7 @@ fn main() {
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             for _ in 0..reps {
-                encode_q4_tile_mm(c, &mut enc, mm_pipeline(c, true), &wbuf, &xbuf, &ybuf, rows, cols, n);
+                encode_q4_tile_mm(c, &mut enc, mm_pipeline(c, true, false), &wbuf, &xbuf, &ybuf, rows, cols, n);
             }
             c.queue.submit(Some(enc.finish()));
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
@@ -26737,7 +26897,7 @@ pub fn dit_block_seg(
         b
     };
     let u4 = |v: [u32; 4]| uniform_u32x4(c, v);
-    let mm = mm_pipeline(c, a.q4tp);
+    let mm = mm_pipeline(c, a.q4tp, false);
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dit-block") });

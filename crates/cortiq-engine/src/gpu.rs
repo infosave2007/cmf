@@ -1441,6 +1441,25 @@ pub fn q4tp_matmat(
     }
 }
 
+/// The same over a two-bit weight plane. Metal has no q2tp kernel, so
+/// there it declines and the host takes it.
+pub fn q2tp_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q2tp_matmat(model, idx, xs, b, rows, cols, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// Single-token q4tp matvec on the device — the lm_head class. Through the
 /// DEDICATED matvec kernel: the batched GEMM at b=1 measured 11.73 ms
 /// against the host's 9.51 on the release head, so the route that was
