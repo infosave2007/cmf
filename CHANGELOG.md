@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A software rasteriser was being accepted as a GPU.** Mesa ships
+  lavapipe/llvmpipe in most container images — Hugging Face Spaces, CI
+  runners, cloud VMs — and with no real card present wgpu hands it to
+  `request_adapter` as the best available. `force_fallback_adapter: false`
+  means "do not PREFER a fallback", not "refuse one", so the engine took
+  it, logged `wgpu GPU path: on (llvmpipe (LLVM 19.1.7) / Vulkan)` and ran
+  every shader through an LLVM rasteriser on the same cores its native
+  kernels were already using: the same silicon plus an emulation layer,
+  and slower than doing nothing.
+
+  Caught on a CPU Space, where a 256x256 Lumina render announced a GPU
+  that did not exist. `init()` now declines a `DeviceType::Cpu` adapter
+  and returns Err, which the caller already treats as a clean CPU
+  fallback. `CMF_GPU_SOFTWARE=1` takes it anyway — checking a shader
+  against a reference rasteriser is the one job it is good at.
+
+  The same trap sits on ZeroGPU: a probe there found eight NVIDIA devices
+  present but the ICD directory holding only Mesa drivers, no
+  `nvidia_icd.json` and `NVIDIA_DRIVER_CAPABILITIES` unset. A card cortiq
+  cannot enumerate through Vulkan is a card it cannot use, whatever CUDA
+  reports.
+
 ## [0.5.60] - 2026-08-07
 
 Keyframe-to-video on the published MiniMax-H3 file, and a two-bit build
