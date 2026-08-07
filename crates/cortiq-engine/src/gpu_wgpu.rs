@@ -9871,6 +9871,31 @@ fn init() -> Result<Ctx, String> {
     }))
     .map_err(|e| format!("no adapter: {e}"))?;
 
+    // A SOFTWARE adapter is not a GPU and taking it is a loss, not a
+    // fallback. Mesa ships lavapipe/llvmpipe in most container images —
+    // Hugging Face Spaces, CI runners, cloud VMs — and with no real card
+    // present wgpu hands it over as the best available: `request_adapter`
+    // honours `force_fallback_adapter: false` by not PREFERRING a
+    // fallback, not by refusing one. The engine would then report "GPU
+    // path: on" and run every shader through an LLVM rasteriser on the
+    // same cores its native kernels were already using, which is the same
+    // silicon plus an emulation layer.
+    //
+    // So decline it and let the caller keep the CPU path, exactly as any
+    // other init failure does. `CMF_GPU_SOFTWARE=1` takes it anyway —
+    // validating a shader against a reference rasteriser is the one job
+    // this adapter is genuinely good at.
+    let adapter_info = adapter.get_info();
+    if adapter_info.device_type == wgpu::DeviceType::Cpu
+        && std::env::var("CMF_GPU_SOFTWARE").ok().as_deref() != Some("1")
+    {
+        return Err(format!(
+            "only a software rasteriser is available ({} / {:?}); staying on the CPU path \
+             — set CMF_GPU_SOFTWARE=1 to use it anyway",
+            adapter_info.name, adapter_info.backend
+        ));
+    }
+
     // Take the card's maximum limits — large tensors (lm_head ≈ 254 MB
     // int8) require a raised storage buffer; a discrete card handles GB.
     let limits = adapter.limits();
