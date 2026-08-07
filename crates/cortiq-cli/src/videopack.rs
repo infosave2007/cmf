@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::convert::{encode_f16, encode_q4tp, encode_q8_row};
+use crate::convert::{encode_f16, encode_q2tp, encode_q4tp, encode_q8_row};
 use cortiq_engine::pool::Pool;
 
 /// Timestep-embedding grid of the pruned checkpoints. The runtime reads
@@ -154,9 +154,23 @@ impl StFile {
 enum Level {
     /// 4.16 bits a weight with the predicted per-row scale ladder.
     Q4tp,
+    /// 2.16 bits, the same ladder one rung narrower. Reserved for the
+    /// gate/up planes: DeepSeek-V4 measured 2 bits there at 1.3x the
+    /// perplexity for 0.71x the file, and the down projection and the
+    /// attention are where that trade stops paying.
+    Q2tp,
     Q8,
     F16,
     F32,
+}
+
+/// Which planes drop to two bits under `--quant q2tp`. Everything else
+/// stays at four.
+fn is_wide_plane(name: &str) -> bool {
+    name.ends_with("mlp.fc1.weight")
+        || name.ends_with("mlp.gate_proj.weight")
+        || name.ends_with("mlp.up_proj.weight")
+        || name.ends_with("ff.w1.weight")
 }
 
 fn f32_bytes(vals: &[f32]) -> Vec<u8> {
@@ -171,7 +185,15 @@ fn f32_bytes(vals: &[f32]) -> Vec<u8> {
 /// that misses either constraint falls to q8, then f16.
 fn spec(name: String, vals: &[f32], shape: Vec<usize>, level: Level) -> TensorSpec {
     let two_d = shape.len() == 2;
+    // q2tp is a policy, not a blanket: only the wide gate/up planes take
+    // it, and only where the codec's column constraint is met.
+    let level = match level {
+        Level::Q2tp if two_d && shape[1] % 32 == 0 && is_wide_plane(&name) => Level::Q2tp,
+        Level::Q2tp => Level::Q4tp,
+        other => other,
+    };
     let (dtype, data) = match level {
+        Level::Q2tp => (TensorDtype::Q2TiledP, encode_q2tp(vals, shape[0], shape[1])),
         Level::Q4tp if two_d && shape[1] % 32 == 0 => {
             (TensorDtype::Q4TiledP, encode_q4tp(vals, shape[0], shape[1]))
         }
@@ -1021,12 +1043,13 @@ pub struct PackArgs<'a> {
 pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
     let level = match args.quant {
         "q4tp" | "q4" => Level::Q4tp,
+        "q2tp" | "q2" => Level::Q2tp,
         "q8" => Level::Q8,
         "f16" => Level::F16,
         // Exact, for the parity gate: any quantization noise floor sits
         // above the arithmetic difference the gate is looking for.
         "f32" => Level::F32,
-        other => return Err(anyhow!("--quant {other}: expected q4tp, q8, f16 or f32")),
+        other => return Err(anyhow!("--quant {other}: expected q4tp, q2tp, q8, f16 or f32")),
     };
     let t0 = std::time::Instant::now();
     let mut specs: Vec<TensorSpec> = Vec::new();
@@ -1156,6 +1179,7 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
         arch,
         quant_type: match level {
             Level::Q8 => QuantType::Q8Row,
+            Level::Q2tp => QuantType::Q4Block,
             _ => QuantType::Q4Block,
         },
         provenance: Some(serde_json::json!({

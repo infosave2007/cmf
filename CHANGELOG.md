@@ -125,6 +125,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lands the port at 8.733e-5 where the CUDA-built one landed 8.784e-5,
   so a stand-in with the convention wrong would have moved that.
 
+- **A device GEMM for the two-bit plane.** `q2tp` had no GPU arm at all,
+  so a two-bit file ran its WIDEST projections on the host while the
+  four-bit one had the card — a codec paying for its size twice. The
+  kernel is the q4tp one with three changes and no others: the weight
+  plane is 8 bytes a group rather than 16, a byte holds four 2-bit
+  codes instead of two nibbles, and the ladder is shifted down a rung
+  because rung 0 is spent naming the exact zero the ±0.5/±1.5 grid
+  cannot reach. Params and codes are byte-identical, so the dispatch,
+  the buffers and the bind group are shared — `mm_pipeline` picks by
+  width.
+
+  No cooperative variant: the tensor-core kernel is written against the
+  4-bit plane, and a shader compiled against a layout the weights do
+  not have is a silently wrong answer — which this release already has
+  three of. Against the host on the shapes a q2tp file actually uses:
+  max |Δ| 1.3e-5 on a signal of 3.5, no non-finite values, at both
+  batches (`tests/gpu_q4tp_batch.rs`).
+
 ### Fixed
 - **`gemm_nt_f32` cached the device-side weight buffer BY POINTER
   ADDRESS.** Every batched attention in this engine allocates one k/v

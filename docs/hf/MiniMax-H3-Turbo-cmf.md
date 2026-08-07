@@ -53,10 +53,37 @@ ffmpeg.
 The LoRA is not a separate download: it is merged into the weights, so the file
 IS the 4-step model.
 
-**Text-to-video only.** The release also takes first/last keyframes (`fl2va`)
-and reference images, videos and audio (`ref2va`); those paths are not ported
-and the vision tower is not packed. What is here is `t2va`: prompt in, video
-and audio out.
+**Text-to-video and keyframe-to-video.** Prompt in, video and audio out; or
+give it a first and/or last frame and it continues from there. The release's
+third path — `ref2va`, conditioning on reference images, clips and audio — is
+not ported.
+
+| file | size | what differs |
+|---|---|---|
+| `mmh3-turbo-fl2va-q4tp.cmf` | 23.94 GB | every projection at 4 bits |
+| `mmh3-turbo-fl2va-q2tp.cmf` | 18.74 GB | the gate/up planes at 2 |
+
+## Keyframe to video
+
+![The corgi flipping the pancake, started from one frame](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/i2v_corgi_flip.gif)
+
+```bash
+cortiq animate mmh3-turbo-fl2va-q4tp.cmf \
+  --prompt "the corgi lifts the pan and flips the pancake high, sizzling" \
+  --first-frame keyframe.ppm --out flip.avi
+```
+
+One picture conditions the run twice, and both halves matter. Its VAE latent
+becomes a row the DiT holds at a timestep of its own near 1 — a condition, not
+noise being removed — and never denoises. The picture ITSELF goes to the prompt
+encoder through Qwen3-VL's vision tower, as `"<Picture 1>: "` and a vision
+block: at 512×288 that is 144 tokens of the 168 the prompt above carries.
+Leave one out and the model is conditioned on something the reference never
+conditions on.
+
+`--last-frame` anchors the other end. The first frame is a geometry anchor and
+is stretched to the canvas; the last one follows and is cover-cropped, which is
+what the reference does with each. Frames come in as binary P6 PPM.
 
 ## Running it
 

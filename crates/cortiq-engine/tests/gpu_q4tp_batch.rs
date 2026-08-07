@@ -11,7 +11,7 @@
 #![cfg(feature = "gpu")]
 
 use cortiq_core::format::{CmfHeader, TensorSpec};
-use cortiq_core::quant::{f32_to_f16, q4tp_put_code, q4tp_sections};
+use cortiq_core::quant::{f32_to_f16, q2tp_sections, q4tp_put_code, q4tp_sections};
 use cortiq_core::types::{ModelArch, QuantType, TensorDtype};
 use cortiq_core::CmfModel;
 use std::sync::Arc;
@@ -44,6 +44,35 @@ fn encode(vals: &[f32], rows: usize, cols: usize, scale: f32) -> Vec<u8> {
     out
 }
 
+/// The same for `q2tp`: 8 bytes a group, four 2-bit codes to a byte
+/// LSB-first, and rung 1 (not 0 — that one names the exact zero) so the
+/// scale is `2^lo` throughout.
+fn encode2(vals: &[f32], rows: usize, cols: usize, scale: f32) -> Vec<u8> {
+    let gpr = cols / GROUP;
+    let (params_off, codes_off, stride) = q2tp_sections(rows, cols);
+    let mut out = vec![0u8; codes_off + rows * stride];
+    let inv = 1.0 / scale;
+    for r in 0..rows {
+        for g in 0..gpr {
+            let tile = &vals[r * cols + g * GROUP..r * cols + (g + 1) * GROUP];
+            let dst = &mut out[(r * gpr + g) * 8..(r * gpr + g + 1) * 8];
+            for k in 0..8 {
+                let mut byte = 0u8;
+                for j in 0..4 {
+                    let q = (tile[k * 4 + j] * inv + 1.5).round_ties_even().clamp(0.0, 3.0) as u8;
+                    byte |= q << (2 * j);
+                }
+                dst[k] = byte;
+            }
+            q4tp_put_code(&mut out[codes_off + r * stride..codes_off + (r + 1) * stride], g, 1);
+        }
+        let lo = f32_to_f16(scale.log2());
+        out[params_off + r * 4..params_off + r * 4 + 2].copy_from_slice(&lo.to_le_bytes());
+        out[params_off + r * 4 + 2..params_off + r * 4 + 4].copy_from_slice(&0u16.to_le_bytes());
+    }
+    out
+}
+
 fn noise(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed | 1;
     (0..n)
@@ -69,16 +98,37 @@ fn the_device_gemm_agrees_with_the_host_at_every_batch() {
         (5376, 14336),           // mlp.fc2
         (4096, 5376),            // a shape nothing uses, as a control
     ] {
-        one_shape(rows, cols);
+        one_shape(rows, cols, false);
     }
 }
 
-fn one_shape(rows: usize, cols: usize) {
+/// The two-bit plane's own sweep. `mlp.fc1` is the only shape a q2tp
+/// file actually puts two bits on, and it is the widest one there is.
+#[test]
+fn the_two_bit_device_gemm_agrees_with_the_host() {
+    for (rows, cols) in [(28672usize, 5376usize), (4096, 5376)] {
+        one_shape(rows, cols, true);
+    }
+}
+
+fn one_shape(rows: usize, cols: usize, two_bit: bool) {
     let scale = 0.01f32;
     let w = noise(rows * cols, 0xfeed_face);
-    let payload = encode(&w, rows, cols, scale);
+    let payload = if two_bit {
+        encode2(&w, rows, cols, scale)
+    } else {
+        encode(&w, rows, cols, scale)
+    };
 
-    let dir = std::env::temp_dir().join(format!("cmf-q4tp-batch-{}", std::process::id()));
+    // Unique per SHAPE and width, not just per process: the two tests
+    // run on separate threads of one process, and a shared path means
+    // one truncating the file the other has mapped — SIGBUS, not a
+    // wrong number.
+    let dir = std::env::temp_dir().join(format!(
+        "cmf-tp-batch-{}-{rows}x{cols}-{}",
+        std::process::id(),
+        if two_bit { "q2" } else { "q4" }
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("t.cmf");
     let header = CmfHeader {
@@ -106,7 +156,11 @@ fn one_shape(rows: usize, cols: usize) {
         &header,
         &[TensorSpec {
             name: "w".into(),
-            dtype: TensorDtype::Q4TiledP,
+            dtype: if two_bit {
+                TensorDtype::Q2TiledP
+            } else {
+                TensorDtype::Q4TiledP
+            },
             shape: vec![rows, cols],
             data: payload,
         }],
@@ -127,7 +181,12 @@ fn one_shape(rows: usize, cols: usize) {
     for &b in &[375usize, 1879] {
         let x = noise(b * cols, 0x1234 + b as u64);
         let mut got = vec![0f32; b * rows];
-        if !cortiq_engine::gpu::q4tp_matmat(&model, idx, &x, b, rows, cols, &mut got) {
+        let ok = if two_bit {
+            cortiq_engine::gpu::q2tp_matmat(&model, idx, &x, b, rows, cols, &mut got)
+        } else {
+            cortiq_engine::gpu::q4tp_matmat(&model, idx, &x, b, rows, cols, &mut got)
+        };
+        if !ok {
             eprintln!("b={b}: device declined — skipping");
             continue;
         }
@@ -140,8 +199,9 @@ fn one_shape(rows: usize, cols: usize) {
             .fold(0f32, |a, (&p, &q)| a.max((p - q).abs()));
         let mag = want.iter().fold(0f32, |a, &v| a.max(v.abs()));
         println!(
-            "[{rows:5} x {cols:5}] b={b:5}: max |Δ| {d:.3e} over |ref| {mag:.3e}  \
+            "[{rows:5} x {cols:5}] b={b:5} {}: max |Δ| {d:.3e} over |ref| {mag:.3e}  \
              out {:.0} MB  non-finite {nans}",
+            if two_bit { "q2tp" } else { "q4tp" },
             (b * rows * 4) as f64 / 1e6
         );
         assert_eq!(
