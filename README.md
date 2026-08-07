@@ -508,8 +508,8 @@ block graph.
 
 On everything else, `CMF_GPU=1` runs the quantized GEMMs and the fused
 FFN through wgpu (Vulkan / DX12 → NVIDIA / AMD / Intel, and Adreno /
-Mali on phones): an RTX 4090 renders 512×512 in ~7.5 min vs ~16 min on
-its host's 32 CPU cores. The GPU arm is probed against the CPU exactly
+Mali on phones): an RTX 4090 renders 512×512 in **less than half** the
+time its host's 32 CPU cores need. The GPU arm is probed against the CPU exactly
 like LLM inference — a device that loses keeps the CPU path, so
 enabling the GPU never makes you slower — and GPU renders stay
 visually identical. For apps, the C ABI exports `cortiq_imagine`

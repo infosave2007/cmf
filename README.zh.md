@@ -447,7 +447,7 @@ GEMM 在 K 循环内解码自己的 tile，注意力 softmax 和 SwiGLU FFN 都�
 
 在其它平台上，`CMF_GPU=1` 通过 wgpu 运行量化 GEMM 和融合 FFN
 （Vulkan / DX12 → NVIDIA / AMD / Intel，手机上是 Adreno / Mali）：
-RTX 4090 渲染 512×512 约 7.5 分钟，同主机 32 个 CPU 核心要 16 分钟。
+RTX 4090 渲染 512×512 的时间**不到**同主机 32 个 CPU 核心所需时间的**一半**。
 GPU 路径与 CPU 的对比探测方式和 LLM 推理完全相同——探测输掉的设备会留在
 CPU 路径上，开启 GPU 永远不会让你更慢——GPU 渲染在视觉上完全一致。面向
 应用，C ABI 导出 `cortiq_imagine`（文本 → RGB8，带每步进度回调）；
