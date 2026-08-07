@@ -542,8 +542,16 @@ pub fn skill_bake(
                 dmask[li][j] = dmask[li][j] * s * (1.0 - s) + l1_per * s * (1.0 - s);
             }
         }
+        // One gradient per VISIT, one step per token. A Looped
+        // Transformer visits each physical layer `loops` times and the
+        // backward accumulates every visit into the same mask, so an
+        // unnormalised step is `loops` times the one the recipe was
+        // tuned with — the mask overshoots, neurons cross tau within the
+        // first evaluation window, and each of them is then missing from
+        // both passes. Dividing by the visit count makes a step mean the
+        // same thing at any loop depth.
         let mut params: Vec<&mut [f32]> = logits.iter_mut().map(|v| v.as_mut_slice()).collect();
-        adam_a.step(&mut params, &dmask, 1.0);
+        adam_a.step(&mut params, &dmask, 1.0 / loops as f64);
         if (step + 1) % hy.eval_every == 0 {
             l1 += l1_step_eff;
             let pass = Pass {
@@ -572,7 +580,7 @@ pub fn skill_bake(
                 best = (hp, Some(logits.clone()), sp);
             }
             log(&format!(
-                "  [A] step {}: L1={l1:.3} pruned={:.0}% hard-PPL={hp:.3} (bottom {}@{:.0}%)",
+                "  [A] step {}: L1={l1:.3} pruned={:.2}% hard-PPL={hp:.3} (bottom {}@{:.2}%)",
                 step + 1,
                 sp * 100.0,
                 if best.0 == f64::MAX {
