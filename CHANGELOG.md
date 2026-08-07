@@ -143,6 +143,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   max |Δ| 1.3e-5 on a signal of 3.5, no non-finite values, at both
   batches (`tests/gpu_q4tp_batch.rs`).
 
+- **A two-bit build, measured and not shipped.** `--quant q2tp` puts the
+  gate/up planes at two bits and leaves the rest at four, which is the
+  policy DeepSeek-V4 measured at 1.3x the perplexity for 0.71x the file.
+  Here it builds (23.94 GB → 18.74, `verify` clean) and, with the device
+  kernel above, renders FASTER than the four-bit file — 217.3 s against
+  258.4, there being less weight to move.
+
+  It also stops following the prompt. Same seed, same four steps: the
+  four-bit render puts the corgi behind a pan with batter in it, drawn
+  flat and clean; the two-bit one is a different animal in a different
+  style with no pan and no pancake at all. That is not detail traded for
+  size. The likely cause is where the two bits landed — half the file is
+  the PROMPT ENCODER, so the policy cut the part that decides what the
+  clip is about rather than the part that draws it. A build confined to
+  the DiT would save ~2.9 GB instead of 5.2 and is what to measure next.
+  Both clips are on the Hub beside each other.
+
 ### Fixed
 - **`gemm_nt_f32` cached the device-side weight buffer BY POINTER
   ADDRESS.** Every batched attention in this engine allocates one k/v
