@@ -147,6 +147,39 @@ impl Adam {
     }
 }
 
+/// Mask logit at step zero, solved for the loop depth.
+///
+/// The gate multiplies the FFN once per VISIT, so a Looped Transformer
+/// applies it `loops` times per token and the factor compounds. What
+/// must be held constant across depths is the EFFECTIVE start — the
+/// product the stack actually sees — at the value the recipe was
+/// validated with on ordinary models, σ(2.0) = 0.881:
+///
+/// ```text
+/// σ(m0)^loops = σ(2.0)   →   m0 = logit( σ(2.0)^(1/loops) )
+/// ```
+///
+/// `loops = 1` returns 2.0 exactly, so nothing regresses. Two known
+/// wrong answers this replaces: the old hardcoded 2.0, which at two
+/// visits compounds to 0.776 and took Nanbeige 4.2 from a baseline of
+/// 4.187 to 278.4 at step 30; and a start pushed to identity, which
+/// cannot learn because the update carries σ'(m) = σ(1−σ), worth 5e-4
+/// at σ = 0.9995 against 0.105 at 2.0.
+pub fn mask_init_logit(loops: usize) -> f32 {
+    let base = 1.0f32 / (1.0 + (-2.0f32).exp());
+    let per_visit = base.powf(1.0 / loops.max(1) as f32);
+    (per_visit / (1.0 - per_visit)).ln()
+}
+
+/// Learning-rate scale for the mask step, given the loop depth.
+///
+/// The backward accumulates every visit of a physical layer into the
+/// same mask gradient, so an unscaled step is `loops` times the tuned
+/// one. One step should mean one token's worth of movement at any depth.
+pub fn mask_step_scale(loops: usize) -> f64 {
+    1.0 / loops.max(1) as f64
+}
+
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -493,11 +526,8 @@ pub fn skill_bake(
     // exactly, so nothing regresses; two loops open the per-visit gate to
     // 0.9385 so the compounded factor is again 0.881, with σ' = 0.058
     // rather than 0.0005.
-    let loops = fm.loops.max(1) as f32;
-    let m0 = {
-        let target = (1.0f32 / (1.0 + (-2.0f32).exp())).powf(1.0 / loops);
-        (target / (1.0 - target)).ln()
-    };
+    let loops = fm.loops.max(1);
+    let m0 = mask_init_logit(loops);
     let mut logits: Vec<Vec<f32>> = vec![vec![m0; inter]; nl];
     let mut ffn: Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>> = vec![None; nl];
 
@@ -551,7 +581,7 @@ pub fn skill_bake(
         // both passes. Dividing by the visit count makes a step mean the
         // same thing at any loop depth.
         let mut params: Vec<&mut [f32]> = logits.iter_mut().map(|v| v.as_mut_slice()).collect();
-        adam_a.step(&mut params, &dmask, 1.0 / loops as f64);
+        adam_a.step(&mut params, &dmask, mask_step_scale(loops));
         if (step + 1) % hy.eval_every == 0 {
             l1 += l1_step_eff;
             let pass = Pass {
