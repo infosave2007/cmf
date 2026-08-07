@@ -552,6 +552,7 @@ pub fn skill_bake(
     let mut best: (f64, Option<Vec<Vec<f32>>>, f64) = (f64::MAX, None, 0.0);
     // Track the highest-sparsity checkpoint as fallback.
     let mut max_sp: (f64, Option<Vec<Vec<f32>>>, f64) = (f64::MAX, None, 0.0);
+    let mut prev_alive: Option<Vec<Vec<bool>>> = None;
     for step in 0..hy.steps_a {
         let chunk = &calib[step % calib.len()];
         let mut dmask: Vec<Vec<f64>> = vec![vec![0.0; inter]; nl];
@@ -592,10 +593,39 @@ pub fn skill_bake(
                 ffn: &ffn,
             };
             let hp = held_ppl(&pass, &held);
-            let alive: usize = logits
+            // Name the neurons that crossed τ since the last eval. At
+            // 0.01% pruned = ~24 neurons for a 135 held-PPL, WHICH 24 is
+            // the whole diagnosis: it decides between "this model has no
+            // noise neurons" and "a shared mask cannot spare a neuron
+            // that only one visit of the loop needs".
+            let cur: Vec<Vec<bool>> = logits
                 .iter()
-                .map(|l| l.iter().filter(|&&x| sigmoid(x) > hy.tau).count())
-                .sum();
+                .map(|l| l.iter().map(|&x| sigmoid(x) > hy.tau).collect())
+                .collect();
+            if let Some(prev) = &prev_alive {
+                let died: Vec<String> = cur
+                    .iter()
+                    .zip(prev)
+                    .enumerate()
+                    .flat_map(|(li, (c, p))| {
+                        c.iter()
+                            .zip(p.iter())
+                            .enumerate()
+                            .filter(|&(_, (&cj, &pj))| pj && !cj)
+                            .map(move |(j, _)| format!("L{li}:{j}"))
+                    })
+                    .collect();
+                if !died.is_empty() {
+                    log(&format!(
+                        "    closed since last eval: {}: {}{}",
+                        died.len(),
+                        died.iter().take(32).cloned().collect::<Vec<_>>().join(" "),
+                        if died.len() > 32 { " …" } else { "" }
+                    ));
+                }
+            }
+            let alive: usize = cur.iter().map(|l| l.iter().filter(|&&b| b).count()).sum();
+            prev_alive = Some(cur);
             let sp = 1.0 - alive as f64 / (nl * inter) as f64;
             // Track highest-sparsity checkpoint.
             if sp > max_sp.2 {
