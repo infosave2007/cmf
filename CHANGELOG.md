@@ -7,37 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.59] - 2026-08-07
+## [0.5.60] - 2026-08-07
+
+Keyframe-to-video on the published MiniMax-H3 file, and a two-bit build
+measured beside it.
 
 ### Added
-- **MiniMax-H3 with the 4-step Turbo LoRA: video AND synchronized stereo
-  audio, from one 23.5 GB file.** `cortiq animate-pack` packs the DiT, the
-  Qwen3-VL-32B prompt encoder, the ViT3D video decoder and the BigVGAN
-  vocoder into one mmap; `cortiq animate` renders an MJPEG+PCM AVI and a
-  .wav with no ffmpeg and nothing to install. Against the reference — four
-  files plus a ComfyUI checkout — that is 124.4 GB down to 23.5.
-
-  Most of the reduction is not quantization. **Forty per cent of the
-  released 33 B DiT is `adaln_proj.linear`**: `[96768, 2688]` per block,
-  13 B parameters, for a map whose input is one number. Its output over
-  the schedule is a 1-D curve, and Comfy-Org's pruned checkpoints already
-  ship it as a rank-8 one. The Turbo LoRA is written against the full
-  matrix, which is why the ComfyUI node re-injects the time conditioning
-  at run time; the packer folds both into one rank-24 basis,
-  `[W_p | B] · [u(t) ; A·silu(e(t))]`, 4.6 MB a block instead of 520.
-  `tools/mmh3_fetch.py check` measures what the collapse costs by
-  range-reading 520 MB out of the 66 GB file: rms 8.7e-5 against a signal
-  of rms 0.464, with the time curve's 9th singular value already 3.7e-5
-  of its first.
-
-  Parity is per stack, against ComfyUI's own modules on toy checkpoints
-  carrying the release's real tensor names and real schedules
-  (`tools/mmh3_toy_gate.sh`): DiT video velocity 8.8e-5 worst on a signal
-  of 0.515, audio velocity 5.2e-5 on 0.409, prompt encoder 1.1e-6, video
-  decoder 4.2e-7 including its 256-pixel tiling — which is part of the
-  output, not a memory strategy, because the decoder is global attention —
-  and the vocoder 1.7e-9.
-
 - **The video VAE's encoder, one temporal tap of it.** `fl2va`
   conditions on single FRAMES, and a causal 3-D convolution fed one
   frame pads its front with zeros — the reference's own `autopad`
@@ -159,6 +134,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clip is about rather than the part that draws it. A build confined to
   the DiT would save ~2.9 GB instead of 5.2 and is what to measure next.
   Both clips are on the Hub beside each other.
+
+## [0.5.59] - 2026-08-07
+
+### Added
+- **MiniMax-H3 with the 4-step Turbo LoRA: video AND synchronized stereo
+  audio, from one 23.5 GB file.** `cortiq animate-pack` packs the DiT, the
+  Qwen3-VL-32B prompt encoder, the ViT3D video decoder and the BigVGAN
+  vocoder into one mmap; `cortiq animate` renders an MJPEG+PCM AVI and a
+  .wav with no ffmpeg and nothing to install. Against the reference — four
+  files plus a ComfyUI checkout — that is 124.4 GB down to 23.5.
+
+  Most of the reduction is not quantization. **Forty per cent of the
+  released 33 B DiT is `adaln_proj.linear`**: `[96768, 2688]` per block,
+  13 B parameters, for a map whose input is one number. Its output over
+  the schedule is a 1-D curve, and Comfy-Org's pruned checkpoints already
+  ship it as a rank-8 one. The Turbo LoRA is written against the full
+  matrix, which is why the ComfyUI node re-injects the time conditioning
+  at run time; the packer folds both into one rank-24 basis,
+  `[W_p | B] · [u(t) ; A·silu(e(t))]`, 4.6 MB a block instead of 520.
+  `tools/mmh3_fetch.py check` measures what the collapse costs by
+  range-reading 520 MB out of the 66 GB file: rms 8.7e-5 against a signal
+  of rms 0.464, with the time curve's 9th singular value already 3.7e-5
+  of its first.
+
+  Parity is per stack, against ComfyUI's own modules on toy checkpoints
+  carrying the release's real tensor names and real schedules
+  (`tools/mmh3_toy_gate.sh`): DiT video velocity 8.8e-5 worst on a signal
+  of 0.515, audio velocity 5.2e-5 on 0.409, prompt encoder 1.1e-6, video
+  decoder 4.2e-7 including its 256-pixel tiling — which is part of the
+  output, not a memory strategy, because the decoder is global attention —
+  and the vocoder 1.7e-9.
 
 ### Fixed
 - **`gemm_nt_f32` cached the device-side weight buffer BY POINTER
@@ -2357,7 +2363,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.5.59...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.5.60...HEAD
+[0.5.60]: https://github.com/infosave2007/cmf/compare/v0.5.59...v0.5.60
 [0.5.59]: https://github.com/infosave2007/cmf/compare/v0.2.2...v0.5.59
 [0.2.2]: https://github.com/infosave2007/cmf/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/infosave2007/cmf/compare/v0.2.0...v0.2.1
