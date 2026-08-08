@@ -241,14 +241,10 @@ pub mod prof {
 /// point for through-backwards (docs/RUST_FCD.md §3).
 enum FcdAttn {
     Full {
-        wq: Vec<f32>,
-        wk: Vec<f32>,
-        wv: Vec<f32>,
-        /// `[wq; wk; wv]` rows concatenated: one GEMM submit instead of
-        /// three. The profiler priced a submit at ~20 ms on the stand,
-        /// which is 5-10x the multiply it carries at these shapes.
-        wqkv: Vec<f32>,
-        wo: Vec<f32>,
+        /// The projections live in the streamed `LayerMats`, not here:
+        /// eagerly resident weights are what made a 4 B bake swap a
+        /// laptop. Only the small per-head metadata stays.
+        qrows: usize,
         q_norm: Option<Vec<f32>>,
         k_norm: Option<Vec<f32>>,
         bias: Option<(Vec<f32>, Vec<f32>, Vec<f32>)>,
@@ -274,14 +270,10 @@ enum FcdAttn {
 pub(crate) struct FcdLayer {
     attn: FcdAttn,
     pub(crate) inter: usize,
-    // Frozen originals: the teacher's LN/FFN and the student's init.
+    // Frozen originals: the teacher's LN (small, eager). The big FFN
+    // matrices stream through `LayerMats`.
     pub(crate) iln: Vec<f32>,
     pub(crate) pln: Vec<f32>,
-    pub(crate) gate: Vec<f32>,
-    pub(crate) up: Vec<f32>,
-    pub(crate) down: Vec<f32>,
-    /// `[gate; up]` prebuilt for the one-submit FFN projection.
-    pub(crate) gu: Vec<f32>,
 }
 
 /// GDN geometry shared by every linear layer (arch.linear_* fields).
@@ -320,6 +312,16 @@ pub struct FcdModel {
     pub(crate) lm_head: Option<Vec<f32>>,
     pub(crate) final_norm: Vec<f32>,
     pub(crate) layers: Vec<FcdLayer>,
+    /// The container the replica came from — the streaming mats
+    /// dequantize from its mmap on demand.
+    pub(crate) src: std::sync::Arc<CmfModel>,
+    /// Per-layer big-matrix cache: filled on touch, evicted outside the
+    /// window. The f32 replica used to hold every matrix of every layer
+    /// eagerly — 16.7 GB for a 4 B model before the fused concats, ~25
+    /// after — which a 24 GB laptop answered with ten minutes of swap.
+    mats_cache: Vec<std::sync::Mutex<Option<std::sync::Arc<LayerMats>>>>,
+    /// How many layers stay resident (0 = all, big machines).
+    mats_window: usize,
     /// Which layers run the Nyström kernel in the student forward.
     o1_flags: Vec<bool>,
     nys: NysCfg,
@@ -420,47 +422,94 @@ fn available_ram_bytes() -> Option<u64> {
     None
 }
 
+
+/// `deq` for sibling modules (the bake's Phase-B masters dequant once,
+/// straight from the source container).
+pub(crate) fn deq_pub(model: &CmfModel, name: &str) -> Result<Vec<f32>, String> {
+    deq(model, name)
+}
+
+/// The four big matrices the hot path reads for one layer, dequantized
+/// together: the fused attention projection, the attention output, the
+/// fused FFN gate+up, and the FFN down. Everything else a layer owns —
+/// norms, biases, GDN cores — is small and stays eagerly resident.
+pub(crate) struct LayerMats {
+    pub(crate) wqkv: Vec<f32>,
+    pub(crate) wo: Vec<f32>,
+    pub(crate) gu: Vec<f32>,
+    pub(crate) down: Vec<f32>,
+}
+
 impl FcdModel {
-    /// Dequantize a model into the f32 training replica. Refuses what
-    /// the backward cannot honestly differentiate yet (loud, not silent).
-    pub fn from_cmf(model: &CmfModel, o1: &O1Cfg) -> Result<Self, String> {
-        let arch = model.arch().clone();
-        // The replica dequantizes every weight to f32: params × 4 bytes.
-        // On a machine without that much PHYSICAL memory the load does
-        // not fail — it swaps, and a 4 B model turned a 24 GB laptop
-        // into 27 GB of swap before printing a single line. Refuse
-        // loudly instead, and say what would fit. CMF_BAKE_FORCE=1
-        // overrides for people who know their swap budget.
-        let need = model.total_param_count() as u64 * 4;
-        if std::env::var("CMF_BAKE_FORCE").as_deref() != Ok("1") {
-            // AVAILABLE memory, not total: the first version compared
-            // against physical RAM, passed on a 24 GB machine whose apps
-            // already held 10, and the machine swapped for ten minutes
-            // anyway. What matters is what is free to take right now.
-            // Two ceilings, both required. Available memory catches a
-            // busy machine — but on a machine that ALREADY swapped,
-            // "free" reads high precisely because everything was paged
-            // out, so a hard cap against physical total (60%) backstops
-            // it: a replica bigger than that cannot coexist with any OS.
-            let total_cap = physical_total_bytes().map(|t| t / 5 * 3);
-            let avail_cap = available_ram_bytes().map(|a| a - a / 10);
-            let budget = match (total_cap, avail_cap) {
-                (Some(t), Some(a)) => Some(t.min(a)),
-                (x, y) => x.or(y),
-            };
-            if let Some(budget) = budget {
-                if need > budget {
-                    return Err(format!(
-                        "skill bake needs ~{:.1} GB for the f32 training replica; this \
-                         machine's safe budget is {:.1} GB. It would swap, not run. Bake \
-                         on a bigger machine, or set CMF_BAKE_FORCE=1 to try anyway. (A \
-                         quantized-forward bake that removes this wall is on the roadmap.)",
-                        need as f64 / 1e9,
-                        budget as f64 / 1e9,
-                    ));
+    /// The layer's big matrices, dequantized on first touch. Sequential
+    /// sweeps (forward 0..nl, backward nl..0) hit the same physical
+    /// layer at most twice per virtual pass, so a small window streams
+    /// a model far bigger than RAM without swapping.
+    pub(crate) fn mats(&self, li: usize) -> Result<std::sync::Arc<LayerMats>, String> {
+        {
+            let slot = self.mats_cache[li].lock().unwrap();
+            if let Some(m) = slot.as_ref() {
+                return Ok(m.clone());
+            }
+        }
+        let p = format!("model.layers.{li}.");
+        let d = |name: String| -> Result<Vec<f32>, String> { deq(&self.src, &name) };
+        let built = if matches!(self.layers[li].attn, FcdAttn::Full { .. }) {
+            let wq = d(format!("{p}self_attn.q_proj.weight"))?;
+            let wk = d(format!("{p}self_attn.k_proj.weight"))?;
+            let wv = d(format!("{p}self_attn.v_proj.weight"))?;
+            let mut wqkv = Vec::with_capacity(wq.len() + wk.len() + wv.len());
+            wqkv.extend_from_slice(&wq);
+            wqkv.extend_from_slice(&wk);
+            wqkv.extend_from_slice(&wv);
+            let gate = d(format!("{p}mlp.gate_proj.weight"))?;
+            let up = d(format!("{p}mlp.up_proj.weight"))?;
+            let mut gu = Vec::with_capacity(gate.len() + up.len());
+            gu.extend_from_slice(&gate);
+            gu.extend_from_slice(&up);
+            LayerMats {
+                wqkv,
+                wo: d(format!("{p}self_attn.o_proj.weight"))?,
+                gu,
+                down: d(format!("{p}mlp.down_proj.weight"))?,
+            }
+        } else {
+            // GDN layers keep their attention core eagerly; only the FFN
+            // streams.
+            let gate = d(format!("{p}mlp.gate_proj.weight"))?;
+            let up = d(format!("{p}mlp.up_proj.weight"))?;
+            let mut gu = Vec::with_capacity(gate.len() + up.len());
+            gu.extend_from_slice(&gate);
+            gu.extend_from_slice(&up);
+            LayerMats {
+                wqkv: Vec::new(),
+                wo: Vec::new(),
+                gu,
+                down: d(format!("{p}mlp.down_proj.weight"))?,
+            }
+        };
+        let arc = std::sync::Arc::new(built);
+        *self.mats_cache[li].lock().unwrap() = Some(arc.clone());
+        // Evict outside the window — cheap, and the access pattern is
+        // sequential, so the evicted slots are exactly the cold ones.
+        if self.mats_window > 0 {
+            let w = self.mats_window;
+            for (j, slot) in self.mats_cache.iter().enumerate() {
+                let dist = li.abs_diff(j).min(self.layers.len() - li.abs_diff(j));
+                if dist > w {
+                    *slot.lock().unwrap() = None;
                 }
             }
         }
+        Ok(arc)
+    }
+}
+
+impl FcdModel {
+    /// Dequantize a model into the f32 training replica. Refuses what
+    /// the backward cannot honestly differentiate yet (loud, not silent).
+    pub fn from_cmf(model: &std::sync::Arc<CmfModel>, o1: &O1Cfg) -> Result<Self, String> {
+        let arch = model.arch().clone();
         if arch.hidden_act != "silu" {
             return Err(format!(
                 "fcd/skill-bake: hidden_act '{}' not supported yet (SiLU only)",
@@ -549,18 +598,10 @@ impl FcdModel {
                         (Some(a), Some(b), Some(c)) => Some((a, b, c)),
                         _ => None,
                     };
-                    let wk = deq(model, &format!("{p}self_attn.k_proj.weight"))?;
-                    let wv = deq(model, &format!("{p}self_attn.v_proj.weight"))?;
-                    let mut wqkv = Vec::with_capacity(wq.len() + wk.len() + wv.len());
-                    wqkv.extend_from_slice(&wq);
-                    wqkv.extend_from_slice(&wk);
-                    wqkv.extend_from_slice(&wv);
+                    let qrows = wq.len() / h;
+                    drop(wq);
                     FcdAttn::Full {
-                        wq,
-                        wk,
-                        wv,
-                        wqkv,
-                        wo: deq(model, &format!("{p}self_attn.o_proj.weight"))?,
+                        qrows,
                         q_norm: opt("q_norm.weight"),
                         k_norm: opt("k_norm.weight"),
                         bias,
@@ -570,19 +611,12 @@ impl FcdModel {
             };
             let gate = deq(model, &format!("{p}mlp.gate_proj.weight"))?;
             let inter = gate.len() / h;
-            let up = deq(model, &format!("{p}mlp.up_proj.weight"))?;
-            let mut gu = Vec::with_capacity(gate.len() + up.len());
-            gu.extend_from_slice(&gate);
-            gu.extend_from_slice(&up);
+            drop(gate);
             layers.push(FcdLayer {
                 attn,
                 inter,
                 iln: deq(model, &format!("{p}input_layernorm.weight"))?,
                 pln: deq(model, &format!("{p}post_attention_layernorm.weight"))?,
-                gate,
-                up,
-                down: deq(model, &format!("{p}mlp.down_proj.weight"))?,
-                gu,
             });
         }
 
@@ -604,7 +638,52 @@ impl FcdModel {
                 *f = false;
             }
         }
+        // Streaming window: how many layers' big matrices stay resident.
+        // Sized from available memory; CMF_BAKE_MATS_LAYERS overrides.
+        // 0 = everything resident (big machines keep today's speed).
+        let per_layer: u64 = layers
+            .first()
+            .map(|_| {
+                let qrows = match layers[0].attn {
+                    FcdAttn::Full { qrows, .. } => qrows,
+                    _ => 0,
+                };
+                ((qrows + 2 * (nkv * hd)) as u64 * h as u64      // wqkv
+                    + (h as u64 * nh as u64 * hd as u64)          // wo
+                    + 3 * (layers[0].inter as u64 * h as u64))    // gu + down
+                    * 4
+            })
+            .unwrap_or(0);
+        let mats_window = if let Ok(v) = std::env::var("CMF_BAKE_MATS_LAYERS") {
+            v.parse().unwrap_or(0)
+        } else {
+            let avail = available_ram_bytes().unwrap_or(u64::MAX);
+            let cap = physical_total_bytes()
+                .map(|t| t / 5 * 3)
+                .unwrap_or(u64::MAX)
+                .min(avail.saturating_sub(avail / 10));
+            let all = per_layer.saturating_mul(arch.num_layers as u64);
+            if all + 4 * 1024 * 1024 * 1024 <= cap {
+                0 // everything fits with headroom — stay eager-equivalent
+            } else {
+                let w = (cap.saturating_sub(3 * 1024 * 1024 * 1024) / per_layer.max(1))
+                    .clamp(2, arch.num_layers as u64) as usize;
+                tracing::info!(
+                    "fcd replica: streaming {w} of {} layers (~{:.1} GB resident of ~{:.1} GB total)",
+                    arch.num_layers,
+                    (w as u64 * per_layer) as f64 / 1e9,
+                    all as f64 / 1e9,
+                );
+                w
+            }
+        };
+        let mats_cache = (0..arch.num_layers)
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
         Ok(Self {
+            src: model.clone(),
+            mats_cache,
+            mats_window,
             hidden: h,
             nh,
             nkv,
@@ -667,11 +746,14 @@ impl TrainState {
         let mut data = Vec::with_capacity(layers.len() * PARAMS_PER_LAYER);
         for &li in &layers {
             let l = &fm.layers[li];
+            let p = format!("model.layers.{li}.");
             data.push(l.iln.clone());
             data.push(l.pln.clone());
-            data.push(l.gate.clone());
-            data.push(l.up.clone());
-            data.push(l.down.clone());
+            // Trained masters dequant once, straight from the source —
+            // the streamed cache holds only the fused hot-path concats.
+            data.push(deq(&fm.src, &format!("{p}mlp.gate_proj.weight")).expect("gate"));
+            data.push(deq(&fm.src, &format!("{p}mlp.up_proj.weight")).expect("up"));
+            data.push(deq(&fm.src, &format!("{p}mlp.down_proj.weight")).expect("down"));
         }
         let zeros: Vec<Vec<f32>> = data.iter().map(|d| vec![0f32; d.len()]).collect();
         Self {
@@ -752,7 +834,7 @@ pub(crate) struct LnFfn<'a> {
     pub(crate) gu: Option<&'a [f32]>,
 }
 
-fn ln_ffn<'a>(fm: &'a FcdModel, ts: Option<&'a TrainState>, li: usize) -> LnFfn<'a> {
+fn ln_ffn<'a>(fm: &'a FcdModel, ts: Option<&'a TrainState>, li: usize, mats: &'a LayerMats) -> LnFfn<'a> {
     if let Some(t) = ts {
         if let Some(s) = t.slot(li) {
             let b = s * PARAMS_PER_LAYER;
@@ -770,10 +852,12 @@ fn ln_ffn<'a>(fm: &'a FcdModel, ts: Option<&'a TrainState>, li: usize) -> LnFfn<
     LnFfn {
         iln: &l.iln,
         pln: &l.pln,
-        gate: &l.gate,
-        up: &l.up,
-        down: &l.down,
-        gu: Some(&l.gu),
+        // The fused concat carries both projections; the fallback slots
+        // are never read while `gu` is Some.
+        gate: &[],
+        up: &[],
+        down: &mats.down,
+        gu: Some(&mats.gu),
     }
 }
 
@@ -902,9 +986,10 @@ impl FcdModel {
         let mut inv1 = vec![0f32; n];
         ops::rmsnorm_fwd(h_in, wts.iln, self.eps, self.gemma, &mut n1, &mut inv1);
 
+        let mats = self.mats(li).expect("layer mats");
         let t_attn = std::time::Instant::now();
         let (attn_out, attn_acts) = match &l.attn {
-            FcdAttn::Full { .. } => self.full_attn_fwd(&l.attn, &n1, b, t, nystrom),
+            FcdAttn::Full { .. } => self.full_attn_fwd(&l.attn, &mats, &n1, b, t, nystrom),
             FcdAttn::Gdn { .. } => self.gdn_attn_fwd(&l.attn, &n1, b, t),
         };
         prof::add(&prof::ATTN_FWD, t_attn);
@@ -979,17 +1064,15 @@ impl FcdModel {
     fn full_attn_fwd(
         &self,
         attn: &FcdAttn,
+        mats: &LayerMats,
         n1: &[f32],
         b: usize,
         t: usize,
         nystrom: bool,
     ) -> (Vec<f32>, AttnActs) {
+        let (wqkv, wo) = (&mats.wqkv[..], &mats.wo[..]);
         let FcdAttn::Full {
-            wq,
-            wk,
-            wv,
-            wqkv,
-            wo,
+            qrows: _,
             q_norm,
             k_norm,
             bias,
@@ -1012,7 +1095,6 @@ impl FcdModel {
         let fused = qrows + 2 * kvdim;
         let mut qkv = vec![0f32; n * fused];
         ops::gemm_nt(n1, wqkv, &mut qkv, n, hsz, fused, pool);
-        let _ = (wq, wk, wv);
         let mut qraw = vec![0f32; n * qrows];
         let mut kpre = vec![0f32; n * kvdim];
         let mut vproj = vec![0f32; n * kvdim];
@@ -1312,8 +1394,20 @@ impl FcdModel {
             du[i] = dact[i] * ops::silu(acts.gpre[i]);
         }
         let mut dn2 = vec![0f32; n * hsz];
-        ops::gemm_dx(&dg, wts.gate, &mut dn2, n, hsz, inter, pool);
-        ops::gemm_dx(&du, wts.up, &mut dn2, n, hsz, inter, pool);
+        // Fused when the frozen concat exists (its gate/up slots are
+        // empty by design); trained masters keep the two-call path.
+        if let Some(gu) = wts.gu {
+            let mut dgu = vec![0f32; n * 2 * inter];
+            for r in 0..n {
+                let row = &mut dgu[r * 2 * inter..(r + 1) * 2 * inter];
+                row[..inter].copy_from_slice(&dg[r * inter..(r + 1) * inter]);
+                row[inter..].copy_from_slice(&du[r * inter..(r + 1) * inter]);
+            }
+            ops::gemm_dx(&dgu, gu, &mut dn2, n, hsz, 2 * inter, pool);
+        } else {
+            ops::gemm_dx(&dg, wts.gate, &mut dn2, n, hsz, inter, pool);
+            ops::gemm_dx(&du, wts.up, &mut dn2, n, hsz, inter, pool);
+        }
         if let Some(g) = grads.as_deref_mut() {
             ops::gemm_dw(&dg, &acts.n2, &mut g[2], n, hsz, inter, pool);
             ops::gemm_dw(&du, &acts.n2, &mut g[3], n, hsz, inter, pool);
@@ -1331,8 +1425,11 @@ impl FcdModel {
         );
 
         // ── attention backward (dispatch) → dn1 ──
+        let mats = self.mats(li).expect("layer mats");
         let dn1 = match &l.attn {
-            FcdAttn::Full { .. } => self.full_attn_bwd(&l.attn, &acts.attn, &dh1, b, t, nystrom),
+            FcdAttn::Full { .. } => {
+                self.full_attn_bwd(&l.attn, &mats, &acts.attn, &dh1, b, t, nystrom)
+            }
             FcdAttn::Gdn { .. } => self.gdn_attn_bwd(&l.attn, &acts.attn, &dh1, b, t),
         };
 
@@ -1355,18 +1452,16 @@ impl FcdModel {
     fn full_attn_bwd(
         &self,
         attn: &FcdAttn,
+        mats: &LayerMats,
         acts: &AttnActs,
         dattn: &[f32],
         b: usize,
         t: usize,
         nystrom: bool,
     ) -> Vec<f32> {
+        let (wqkv, wo) = (&mats.wqkv[..], &mats.wo[..]);
         let FcdAttn::Full {
-            wq,
-            wqkv,
-            wk,
-            wv,
-            wo,
+            qrows: _,
             q_norm,
             k_norm,
             output_gate,
@@ -1568,7 +1663,6 @@ impl FcdModel {
         }
         let mut dn1 = vec![0f32; n * hsz];
         ops::gemm_dx(&dqkv, wqkv, &mut dn1, n, hsz, fused, pool);
-        let _ = (wq, wk, wv);
         dn1
     }
 
@@ -1764,7 +1858,8 @@ impl FcdModel {
             if let Some(k) = keep.as_deref_mut() {
                 k.push(h.clone());
             }
-            let wts = ln_ffn(self, if student { ts } else { None }, li);
+            let mats = self.mats(li).expect("layer mats");
+            let wts = ln_ffn(self, if student { ts } else { None }, li, &mats);
             let nys = student && self.o1_flags[li];
             h = self.layer_forward(li, &h, b, t, &wts, nys, false).0;
         }
@@ -1893,6 +1988,7 @@ impl FcdModel {
             let h_in = &keep[li];
             let nys = self.o1_flags[li];
             let slot = layers.iter().position(|&x| x == li);
+            let mats_hold = self.mats(li).expect("layer mats");
             let wts = match slot {
                 Some(s) => {
                     let bi = s * PARAMS_PER_LAYER;
@@ -1910,10 +2006,10 @@ impl FcdModel {
                     LnFfn {
                         iln: &l.iln,
                         pln: &l.pln,
-                        gate: &l.gate,
-                        up: &l.up,
-                        down: &l.down,
-                        gu: Some(&l.gu),
+                        gate: &[],
+                        up: &[],
+                        down: &mats_hold.down,
+                        gu: Some(&mats_hold.gu),
                     }
                 }
             };

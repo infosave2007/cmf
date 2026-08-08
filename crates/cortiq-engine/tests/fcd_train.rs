@@ -357,7 +357,7 @@ fn block_gradcheck_full_graph_exact_mode() {
     let dir = std::env::temp_dir().join(format!("fcd_block_ex_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = write_tiny_model(&dir);
-    let model = CmfModel::open(&path).unwrap();
+    let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
     let o1 = O1Cfg::from_spec("all", Some(4), Some(64), Some(0), None).unwrap(); // w ≥ t → exact
     let fm = FcdModel::from_cmf(&model, &o1).unwrap();
     let mut ts = TrainState::new(&fm);
@@ -378,7 +378,7 @@ fn block_gradcheck_skeleton_active_last_layer_tight() {
     let dir = std::env::temp_dir().join(format!("fcd_block_ny_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = write_tiny_model(&dir);
-    let model = CmfModel::open(&path).unwrap();
+    let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
     let fm = FcdModel::from_cmf(&model, &tiny_o1()).unwrap(); // w=4 → skeleton on
     let mut ts = TrainState::new(&fm);
     let seqs = rand_ids(SEQ + 1, 7);
@@ -486,7 +486,7 @@ fn block_gradcheck_hybrid_gdn_above_trainable() {
     let dir = std::env::temp_dir().join(format!("fcd_block_gdn_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = write_tiny_model_variant(&dir, "tiny_hybrid", false, true);
-    let model = CmfModel::open(&path).unwrap();
+    let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
     // "0" alone means OFF in the spec grammar — build the cfg directly.
     let o1 = O1Cfg {
         layers: cortiq_engine::nystrom::O1Layers::List(vec![0]),
@@ -512,7 +512,7 @@ fn block_gradcheck_output_gate() {
     let dir = std::env::temp_dir().join(format!("fcd_block_gate_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = write_tiny_model_variant(&dir, "tiny_gate", true, false);
-    let model = CmfModel::open(&path).unwrap();
+    let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
     let o1 = O1Cfg::from_spec("all", Some(4), Some(64), Some(0), None).unwrap();
     let fm = FcdModel::from_cmf(&model, &o1).unwrap();
     let mut ts = TrainState::new(&fm);
