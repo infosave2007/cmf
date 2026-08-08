@@ -152,6 +152,7 @@ fn bake_ffn_chain_matches_host_composition() {
             &down,
             sc,
             want_both.then_some(&mut both[..]),
+            None,
             &mut ffn,
             n,
             hsz,
@@ -214,4 +215,92 @@ fn bake_ffn_chain_matches_host_composition() {
         }
         println!("chain(scale={}): ffn worst |Δ| {worst:.2e}", sc.is_some());
     }
+}
+
+/// The backward chain against its host composition, fed by the plane a
+/// forward call parked — the resident-graph handshake end to end.
+#[test]
+fn bake_ffn_bwd_chain_matches_host_composition() {
+    unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+    let (n, hsz, inter, li) = (64usize, 256usize, 512usize, 7usize);
+    let n2: Vec<f32> = (0..n * hsz)
+        .map(|i| ((i * 29 + 13) % 103) as f32 / 103.0 - 0.5)
+        .collect();
+    let gu: Vec<f32> = (0..2 * inter * hsz)
+        .map(|i| ((i * 17 + 41) % 97) as f32 / 97.0 - 0.5)
+        .collect();
+    let down: Vec<f32> = (0..hsz * inter)
+        .map(|i| ((i * 23 + 5) % 89) as f32 / 89.0 - 0.5)
+        .collect();
+    let dh2: Vec<f32> = (0..n * hsz)
+        .map(|i| ((i * 13 + 3) % 71) as f32 / 71.0 - 0.5)
+        .collect();
+    // Park the plane exactly as the checkpointed recompute does.
+    let mut ffn = vec![0f32; n * hsz];
+    let mut both = vec![0f32; n * 2 * inter];
+    if !cortiq_engine::gpu_wgpu::ffn_chain_f32(
+        &n2,
+        &gu,
+        &down,
+        None,
+        Some(&mut both[..]),
+        Some(li),
+        &mut ffn,
+        n,
+        hsz,
+        inter,
+    ) {
+        eprintln!("forward chain declined (no cooperative arm) — skipped");
+        return;
+    }
+    let mut dn2 = vec![0f32; n * hsz];
+    if !cortiq_engine::gpu_wgpu::ffn_bwd_chain_f32(&dh2, &down, &gu, li, &mut dn2, n, hsz, inter)
+    {
+        // The forward parked a plane; on a cooperative device the
+        // backward must take it (a non-discrete adapter may not).
+        eprintln!("bwd chain declined (uma adapter?) — skipped");
+        return;
+    }
+    // Host composition from the DEVICE plane — the same numbers the
+    // trainer's host arm would read out of `both`.
+    let silu = |x: f32| x / (1.0 + (-x).exp());
+    let silu_bwd = |x: f32| {
+        let s = 1.0 / (1.0 + (-x).exp());
+        s * (1.0 + x * (1.0 - s))
+    };
+    let mut r_dn2 = vec![0f32; n * hsz];
+    for i in 0..n {
+        // dact = dh2 · down
+        let mut dact = vec![0f32; inter];
+        for j in 0..inter {
+            let mut a = 0f64;
+            for o in 0..hsz {
+                a += dh2[i * hsz + o] as f64 * down[o * inter + j] as f64;
+            }
+            dact[j] = a as f32;
+        }
+        for o in 0..hsz {
+            let mut a = 0f64;
+            for j in 0..inter {
+                let g = both[i * 2 * inter + j];
+                let u = both[i * 2 * inter + inter + j];
+                let dg = dact[j] * u * silu_bwd(g);
+                let du = dact[j] * silu(g);
+                a += dg as f64 * gu[j * hsz + o] as f64
+                    + du as f64 * gu[(inter + j) * hsz + o] as f64;
+            }
+            r_dn2[i * hsz + o] = a as f32;
+        }
+    }
+    let scale = r_dn2.iter().fold(0f32, |a, v| a.max(v.abs()));
+    let worst = dn2
+        .iter()
+        .zip(&r_dn2)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        worst <= 2e-2 * scale.max(1.0),
+        "bwd chain: worst |Δ| {worst} (scale {scale})"
+    );
+    println!("bwd chain: dn2 worst |Δ| {worst:.2e} against scale {scale:.2}");
 }

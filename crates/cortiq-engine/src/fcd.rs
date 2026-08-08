@@ -1024,6 +1024,7 @@ impl FcdModel {
                     wts.down,
                     ffn_scale,
                     both.as_deref_mut(),
+                    want_acts.then_some(li),
                     &mut ffn,
                     n,
                     hsz,
@@ -1419,35 +1420,53 @@ impl FcdModel {
         let inter = l.inter;
 
         // ── FFN backward ──
-        let mut dact = vec![0f32; n * inter];
-        ops::gemm_dx(dh2, wts.down, &mut dact, n, inter, hsz, pool);
-        if let Some(g) = grads.as_deref_mut() {
-            ops::gemm_dw(dh2, &acts.act, &mut g[4], n, inter, hsz, pool);
-        }
-        let mut dg = vec![0f32; n * inter];
-        let mut du = vec![0f32; n * inter];
-        for i in 0..n * inter {
-            dg[i] = dact[i] * acts.upre[i] * ops::silu_bwd(acts.gpre[i]);
-            du[i] = dact[i] * ops::silu(acts.gpre[i]);
-        }
         let mut dn2 = vec![0f32; n * hsz];
-        // Fused when the frozen concat exists (its gate/up slots are
-        // empty by design); trained masters keep the two-call path.
-        if let Some(gu) = wts.gu {
-            let mut dgu = vec![0f32; n * 2 * inter];
-            for r in 0..n {
-                let row = &mut dgu[r * 2 * inter..(r + 1) * 2 * inter];
-                row[..inter].copy_from_slice(&dg[r * inter..(r + 1) * inter]);
-                row[inter..].copy_from_slice(&du[r * inter..(r + 1) * inter]);
+        // A frozen layer (no weight grads wanted) rides the device chain
+        // fed by the plane its forward parked: only dh2 goes down and dn2
+        // comes back, where the host path uploads the 80 MB dgu concat.
+        let mut bwd_fused = false;
+        #[cfg(feature = "gpu")]
+        if grads.is_none() {
+            if let Some(gu) = wts.gu {
+                if crate::gpu::enabled_here()
+                    && crate::gpu_wgpu::ffn_bwd_chain_f32(
+                        dh2, wts.down, gu, li, &mut dn2, n, hsz, inter,
+                    )
+                {
+                    bwd_fused = true;
+                }
             }
-            ops::gemm_dx(&dgu, gu, &mut dn2, n, hsz, 2 * inter, pool);
-        } else {
-            ops::gemm_dx(&dg, wts.gate, &mut dn2, n, hsz, inter, pool);
-            ops::gemm_dx(&du, wts.up, &mut dn2, n, hsz, inter, pool);
         }
-        if let Some(g) = grads.as_deref_mut() {
-            ops::gemm_dw(&dg, &acts.n2, &mut g[2], n, hsz, inter, pool);
-            ops::gemm_dw(&du, &acts.n2, &mut g[3], n, hsz, inter, pool);
+        if !bwd_fused {
+            let mut dact = vec![0f32; n * inter];
+            ops::gemm_dx(dh2, wts.down, &mut dact, n, inter, hsz, pool);
+            if let Some(g) = grads.as_deref_mut() {
+                ops::gemm_dw(dh2, &acts.act, &mut g[4], n, inter, hsz, pool);
+            }
+            let mut dg = vec![0f32; n * inter];
+            let mut du = vec![0f32; n * inter];
+            for i in 0..n * inter {
+                dg[i] = dact[i] * acts.upre[i] * ops::silu_bwd(acts.gpre[i]);
+                du[i] = dact[i] * ops::silu(acts.gpre[i]);
+            }
+            // Fused when the frozen concat exists (its gate/up slots are
+            // empty by design); trained masters keep the two-call path.
+            if let Some(gu) = wts.gu {
+                let mut dgu = vec![0f32; n * 2 * inter];
+                for r in 0..n {
+                    let row = &mut dgu[r * 2 * inter..(r + 1) * 2 * inter];
+                    row[..inter].copy_from_slice(&dg[r * inter..(r + 1) * inter]);
+                    row[inter..].copy_from_slice(&du[r * inter..(r + 1) * inter]);
+                }
+                ops::gemm_dx(&dgu, gu, &mut dn2, n, hsz, 2 * inter, pool);
+            } else {
+                ops::gemm_dx(&dg, wts.gate, &mut dn2, n, hsz, inter, pool);
+                ops::gemm_dx(&du, wts.up, &mut dn2, n, hsz, inter, pool);
+            }
+            if let Some(g) = grads.as_deref_mut() {
+                ops::gemm_dw(&dg, &acts.n2, &mut g[2], n, hsz, inter, pool);
+                ops::gemm_dw(&du, &acts.n2, &mut g[3], n, hsz, inter, pool);
+            }
         }
 
         let mut dh1 = dh2.to_vec();

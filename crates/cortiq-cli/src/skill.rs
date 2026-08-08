@@ -1008,6 +1008,9 @@ pub fn run_skill_bake(
         }
         Ok((nll / n.max(1) as f64).exp())
     };
+    // The bake's device residency (f32 weights, planes) and the runtime's
+    // do not fit one card together — hand the VRAM back first.
+    cortiq_engine::gpu::bake_release();
     let rt_base = runtime_ppl(model_path, None)?;
     // The per-position masked scorer is currently the only way to hold
     // the mask active — and on QUANTIZED storage the runtime's FFN mask
