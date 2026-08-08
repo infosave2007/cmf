@@ -200,6 +200,41 @@ pub mod prof {
     pub fn take(c: &AtomicU64) -> f64 {
         c.swap(0, Ordering::Relaxed) as f64 / 1e9
     }
+
+    use std::sync::Mutex;
+    /// (n, k, m) → (calls, ns). A handful of shapes dominate a training
+    /// step; naming them decides which ones are worth a GPU submit and
+    /// which are cheaper computed in place.
+    pub static SHAPES: Mutex<Vec<((usize, usize, usize), (u64, u64))>> = Mutex::new(Vec::new());
+    pub fn gemm_shape(n: usize, k: usize, m: usize, t0: std::time::Instant) {
+        let ns = t0.elapsed().as_nanos() as u64;
+        let mut g = SHAPES.lock().unwrap();
+        match g.iter_mut().find(|(s, _)| *s == (n, k, m)) {
+            Some((_, (c, tt))) => {
+                *c += 1;
+                *tt += ns;
+            }
+            None => g.push(((n, k, m), (1, ns))),
+        }
+    }
+    pub fn shape_report(top: usize) -> String {
+        let mut g = SHAPES.lock().unwrap();
+        g.sort_by_key(|(_, (_, ns))| std::cmp::Reverse(*ns));
+        let out = g
+            .iter()
+            .take(top)
+            .map(|((n, k, m), (c, ns))| {
+                format!(
+                    "    [{n}x{k}x{m}] {c} calls, {:.1}s total, {:.1} ms/call",
+                    *ns as f64 / 1e9,
+                    *ns as f64 / 1e6 / *c as f64
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        g.clear();
+        out
+    }
 }
 
 /// Frozen attention operator of one layer — the per-layer dispatch
