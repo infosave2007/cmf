@@ -1252,7 +1252,7 @@ impl FcdModel {
     ) -> Vec<f32> {
         let FcdAttn::Full {
             wq,
-            wqkv: _,
+            wqkv,
             wk,
             wv,
             wo,
@@ -1444,10 +1444,20 @@ impl FcdModel {
         };
 
         // Projections (frozen weights → dX only; bias add is identity).
+        // One fused submit: wqkv's row layout is exactly what gemm_dx
+        // wants, so the sum dq·Wq + dk·Wk + dv·Wv is a concat of the
+        // gradients and a single call.
+        let fused = qrows + 2 * kvdim;
+        let mut dqkv = vec![0f32; n * fused];
+        for r in 0..n {
+            let row = &mut dqkv[r * fused..(r + 1) * fused];
+            row[..qrows].copy_from_slice(&dqraw[r * qrows..(r + 1) * qrows]);
+            row[qrows..qrows + kvdim].copy_from_slice(&dkpre[r * kvdim..(r + 1) * kvdim]);
+            row[qrows + kvdim..].copy_from_slice(&dvproj[r * kvdim..(r + 1) * kvdim]);
+        }
         let mut dn1 = vec![0f32; n * hsz];
-        ops::gemm_dx(&dqraw, wq, &mut dn1, n, hsz, qrows, pool);
-        ops::gemm_dx(&dkpre, wk, &mut dn1, n, hsz, kvdim, pool);
-        ops::gemm_dx(&dvproj, wv, &mut dn1, n, hsz, kvdim, pool);
+        ops::gemm_dx(&dqkv, wqkv, &mut dn1, n, hsz, fused, pool);
+        let _ = (wq, wk, wv);
         dn1
     }
 

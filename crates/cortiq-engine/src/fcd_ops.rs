@@ -443,6 +443,9 @@ pub fn gemm_dx(
     m: usize,
     pool: Option<&Pool>,
 ) {
+    let _t = std::time::Instant::now();
+    crate::fcd::prof::GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _guard = scopeguard_gemm(_t, n, k, m);
     debug_assert_eq!(dy.len(), n * m);
     debug_assert_eq!(w.len(), m * k);
     debug_assert_eq!(dx.len(), n * k);
@@ -520,6 +523,9 @@ pub fn gemm_dw(
     m: usize,
     pool: Option<&Pool>,
 ) {
+    let _t = std::time::Instant::now();
+    crate::fcd::prof::GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _guard = scopeguard_gemm(_t, n, k, m);
     debug_assert_eq!(dy.len(), n * m);
     debug_assert_eq!(x.len(), n * k);
     debug_assert_eq!(dw.len(), m * k);
