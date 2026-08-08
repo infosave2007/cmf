@@ -707,6 +707,7 @@ pub fn skill_bake(
             hy.steps_a,
             if gc > 0 { g * 1000.0 / gc as f64 } else { 0.0 }
         ));
+        log(&format!("[prof] gemm shapes:\n{}", prof::shape_report(6)));
     }
     if let Some(b) = best.1.take() {
         logits = b;

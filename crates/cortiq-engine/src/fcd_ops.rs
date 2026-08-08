@@ -304,6 +304,7 @@ pub fn gemm_nt(
 ) {
     let _t_gemm = std::time::Instant::now();
     crate::fcd::prof::GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::fcd::prof::gemm_shape(n, k, m, _t_gemm);
     let _guard = scopeguard_gemm(_t_gemm);
     #[cfg(feature = "gpu")]
     if n * k * m >= (1 << 22) && crate::gpu::enabled_here() {
