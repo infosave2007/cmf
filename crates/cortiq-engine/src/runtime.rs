@@ -104,7 +104,15 @@ impl CortiqRuntime {
             } else {
                 model.masks.default_task.clone()
             },
-            active_mask: model.masks.fallback().cloned(),
+            // The MASK must follow the same switch: clearing only the
+            // task name while seeding active_mask from fallback() hands
+            // generate a mask anyway — measured at 0.2 tok/s against
+            // 3.5 bare, with "Task:" printing empty the whole time.
+            active_mask: if std::env::var("CMF_TASK").as_deref() == Ok("off") {
+                None
+            } else {
+                model.masks.fallback().cloned()
+            },
             execution_mode,
             metrics: PerformanceMetrics::default(),
             layer_stats,

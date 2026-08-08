@@ -501,13 +501,25 @@ impl Pipeline {
             ));
         }
 
-        // Masks × quantized mmap: only ATTENTION keeps f32 (the head-mask
-        // path needs f32 slices). FFN masks now run sparse directly on the
-        // quant bytes (sparse_ffn_quant), and embed/lm_head are never
-        // masked — so a masked model runs at quantized RSS, not the old
-        // whole-model-f32 blowup.
-        let masks_present = !model.masks.masks.is_empty();
-        let force_f32 = masks_present; // attention only (head masks)
+        // Masks × quantized mmap: only the HEAD-mask path needs f32
+        // slices, so f32 is forced only when some mask actually restricts
+        // attention heads. FFN masks run sparse directly on the quant
+        // bytes (sparse_ffn_quant), and embed/lm_head are never masked.
+        // The old condition forced f32 for ANY mask: a 4.17 B file whose
+        // mask touched only the FFN dequantized to 16.7 GB at load and
+        // ran the bare-f32 GEMMs — 0.0 tok/s on a laptop that swapped,
+        // and a 30× crawl on a 48-core server. A mask with no head rows
+        // costs nothing now.
+        let heads_masked = model.masks.masks.iter().any(|m| {
+            m.head_masks.iter().any(|row| {
+                let mut bits = 0usize;
+                for &b in row.iter() {
+                    bits += b.count_ones() as usize;
+                }
+                !row.is_empty() && bits < arch.num_attention_heads
+            })
+        });
+        let force_f32 = heads_masked; // attention only (head masks)
 
         // ── Tokenizer: embedded → sidecar → byte-level fallback ──
         let mut tokenizer = if let Some(vocab_bytes) = &model.vocab {
