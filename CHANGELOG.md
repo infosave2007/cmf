@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.62] - 2026-08-08
+
+### Added
+- **Per-visit FFN masks — a Looped Transformer can finally be masked**
+  (format feature bit `LOOP_MASKS`). The runtime indexes task masks by
+  the VIRTUAL layer, exactly as it indexes KV, but the mask area stored
+  one row per physical layer: on a looped model every row past the
+  first pass was missing and the sparse path silently zeroed the entire
+  second pass's FFN. Rows are now stored per virtual layer
+  (pass-major); legacy masks replicate to every pass at decode;
+  unlooped files are byte-identical. Measured on Nanbeige 4.2: a shared
+  mask closing 24 of 236 544 neurons cost ×32 perplexity; per-visit
+  masks close ~21 000 visit-neurons at the denoising bottom for 0.9%,
+  and FCD on top lands the specialist BELOW the untouched baseline
+  (4.069 vs 4.187 held-out).
+- **Tool calling in `cortiq serve`** — the OpenAI protocol end to end:
+  `tools`/`tool_choice` in, the FILE's own chat template renders them
+  (its `{%- if tools %}` branch had been waiting since the first
+  convert), `<tool_call>` blocks parsed out — JSON and Nanbeige's XML
+  grammar both — plus the strict bare-JSON fallback small models need,
+  streaming with marker holdback and an indexed `tool_calls` delta,
+  `finish_reason: "tool_calls"`, nullable `content`, `role: "tool"`
+  history. Proven live on converted Qwen3-0.6B and Nanbeige 4.2: call,
+  tool-result round trip, stream. Both real templates are test
+  fixtures now.
+- **`CMF_TASK=off`** starts a mask-carrying file bare — full-speed
+  paths, no default task, honest `Sparsity: 0%`.
+- **`--calib-chunks`** on `skill bake`: the corpus cap (112 chunks,
+  silently truncating in file order) becomes a knob.
+
+### Fixed
+- **The bake now works on Looped Transformers.** Three compounding
+  defects: the mask init (σ(2.0) per VISIT squares to 0.776 over two
+  passes — baseline 4.187 read 278.4 at step 30 with nothing pruned),
+  the unnormalised per-visit gradient accumulation (one step meant
+  `loops` steps), and `pruned={:.0}%` printing a flat 0% for anything
+  under half a percent. Init is solved per loop depth, steps are
+  normalised per phase, five closed-form invariants pin all of it.
+- **A mask-carrying file no longer pays for masks it is not using**:
+  the loader forced whole-model f32 (16.7 GB for a 2.4 GB file, swap on
+  a laptop) for ANY mask; f32 is now forced only by actual head
+  restrictions. The specialist writer emitted all-zero head rows ("no
+  active heads"); `examples/fix_head_masks` repairs written files.
+  Measured: 0.2 → 32 tok/s.
+- **Chat templates stopped failing silently**: minijinja gains the
+  `json` feature (`tojson` — without it every tools branch errored into
+  a TOOLLESS ChatML fallback), transformers' `visible_text()` helper is
+  provided, `tool_call_format` is pinned to the JSON grammar in every
+  render arm, and string `arguments` normalise to objects for templates
+  that iterate them.
+
+### Performance
+- **Skill-bake GEMM submits cut ×4** (~4200 → 1040 on the 5-step
+  probe), each an exact-equivalence change: the held set scores in one
+  batched pass instead of twelve; QKV and gate+up fuse to one submit in
+  the forward; their gradients fuse in the backward; the lm-head scores
+  in 64-position blocks. In-process phase and per-shape profilers keep
+  the accounting honest — the dispatch tax (~20 ms per submit on the
+  stand's Vulkan stack, 5-10× the multiply it carries) is now a named,
+  measured quantity. Projected on the profiled stand: ~26 s/step → ~10.
+
 ## [0.5.61] - 2026-08-07
 
 ### Fixed
@@ -2388,7 +2449,8 @@ Initial public release.
 - **Licensing** — Apache-2.0 with an explicit patent-grant explanation
   (`LICENSE`, `NOTICE`, `PATENTS.md`).
 
-[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.5.61...HEAD
+[Unreleased]: https://github.com/infosave2007/cmf/compare/v0.5.62...HEAD
+[0.5.62]: https://github.com/infosave2007/cmf/compare/v0.5.61...v0.5.62
 [0.5.61]: https://github.com/infosave2007/cmf/compare/v0.5.60...v0.5.61
 [0.5.60]: https://github.com/infosave2007/cmf/compare/v0.5.59...v0.5.60
 [0.5.59]: https://github.com/infosave2007/cmf/compare/v0.2.2...v0.5.59
