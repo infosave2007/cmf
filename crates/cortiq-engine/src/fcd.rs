@@ -244,6 +244,10 @@ enum FcdAttn {
         wq: Vec<f32>,
         wk: Vec<f32>,
         wv: Vec<f32>,
+        /// `[wq; wk; wv]` rows concatenated: one GEMM submit instead of
+        /// three. The profiler priced a submit at ~20 ms on the stand,
+        /// which is 5-10x the multiply it carries at these shapes.
+        wqkv: Vec<f32>,
         wo: Vec<f32>,
         q_norm: Option<Vec<f32>>,
         k_norm: Option<Vec<f32>>,
@@ -276,6 +280,8 @@ pub(crate) struct FcdLayer {
     pub(crate) gate: Vec<f32>,
     pub(crate) up: Vec<f32>,
     pub(crate) down: Vec<f32>,
+    /// `[gate; up]` prebuilt for the one-submit FFN projection.
+    pub(crate) gu: Vec<f32>,
 }
 
 /// GDN geometry shared by every linear layer (arch.linear_* fields).
@@ -432,10 +438,17 @@ impl FcdModel {
                         (Some(a), Some(b), Some(c)) => Some((a, b, c)),
                         _ => None,
                     };
+                    let wk = deq(model, &format!("{p}self_attn.k_proj.weight"))?;
+                    let wv = deq(model, &format!("{p}self_attn.v_proj.weight"))?;
+                    let mut wqkv = Vec::with_capacity(wq.len() + wk.len() + wv.len());
+                    wqkv.extend_from_slice(&wq);
+                    wqkv.extend_from_slice(&wk);
+                    wqkv.extend_from_slice(&wv);
                     FcdAttn::Full {
                         wq,
-                        wk: deq(model, &format!("{p}self_attn.k_proj.weight"))?,
-                        wv: deq(model, &format!("{p}self_attn.v_proj.weight"))?,
+                        wk,
+                        wv,
+                        wqkv,
                         wo: deq(model, &format!("{p}self_attn.o_proj.weight"))?,
                         q_norm: opt("q_norm.weight"),
                         k_norm: opt("k_norm.weight"),
@@ -446,14 +459,19 @@ impl FcdModel {
             };
             let gate = deq(model, &format!("{p}mlp.gate_proj.weight"))?;
             let inter = gate.len() / h;
+            let up = deq(model, &format!("{p}mlp.up_proj.weight"))?;
+            let mut gu = Vec::with_capacity(gate.len() + up.len());
+            gu.extend_from_slice(&gate);
+            gu.extend_from_slice(&up);
             layers.push(FcdLayer {
                 attn,
                 inter,
                 iln: deq(model, &format!("{p}input_layernorm.weight"))?,
                 pln: deq(model, &format!("{p}post_attention_layernorm.weight"))?,
                 gate,
-                up: deq(model, &format!("{p}mlp.up_proj.weight"))?,
+                up,
                 down: deq(model, &format!("{p}mlp.down_proj.weight"))?,
+                gu,
             });
         }
 
@@ -617,6 +635,10 @@ pub(crate) struct LnFfn<'a> {
     pub(crate) gate: &'a [f32],
     pub(crate) up: &'a [f32],
     pub(crate) down: &'a [f32],
+    /// `[gate; up]` rows concatenated — one GEMM submit instead of two.
+    /// `None` for Phase-B trained copies, whose rows move every step;
+    /// the frozen majority carries the concat prebuilt at load.
+    pub(crate) gu: Option<&'a [f32]>,
 }
 
 fn ln_ffn<'a>(fm: &'a FcdModel, ts: Option<&'a TrainState>, li: usize) -> LnFfn<'a> {
@@ -629,6 +651,7 @@ fn ln_ffn<'a>(fm: &'a FcdModel, ts: Option<&'a TrainState>, li: usize) -> LnFfn<
                 gate: &t.data[b + 2],
                 up: &t.data[b + 3],
                 down: &t.data[b + 4],
+                gu: None,
             };
         }
     }
@@ -639,6 +662,7 @@ fn ln_ffn<'a>(fm: &'a FcdModel, ts: Option<&'a TrainState>, li: usize) -> LnFfn<
         gate: &l.gate,
         up: &l.up,
         down: &l.down,
+        gu: Some(&l.gu),
     }
 }
 
@@ -786,9 +810,21 @@ impl FcdModel {
 
         let inter = l.inter;
         let mut gpre = vec![0f32; n * inter];
-        ops::gemm_nt(&n2, wts.gate, &mut gpre, n, hsz, inter, pool);
         let mut upre = vec![0f32; n * inter];
-        ops::gemm_nt(&n2, wts.up, &mut upre, n, hsz, inter, pool);
+        if let Some(gu) = wts.gu {
+            // One submit; split back so everything downstream is
+            // byte-identical to the two-call path.
+            let mut both = vec![0f32; n * 2 * inter];
+            ops::gemm_nt(&n2, gu, &mut both, n, hsz, 2 * inter, pool);
+            for r in 0..n {
+                let row = &both[r * 2 * inter..(r + 1) * 2 * inter];
+                gpre[r * inter..(r + 1) * inter].copy_from_slice(&row[..inter]);
+                upre[r * inter..(r + 1) * inter].copy_from_slice(&row[inter..]);
+            }
+        } else {
+            ops::gemm_nt(&n2, wts.gate, &mut gpre, n, hsz, inter, pool);
+            ops::gemm_nt(&n2, wts.up, &mut upre, n, hsz, inter, pool);
+        }
         let mut act = vec![0f32; n * inter];
         for i in 0..n * inter {
             act[i] = ops::silu(gpre[i]) * upre[i];
@@ -841,6 +877,7 @@ impl FcdModel {
             wq,
             wk,
             wv,
+            wqkv,
             wo,
             q_norm,
             k_norm,
@@ -858,12 +895,22 @@ impl FcdModel {
         let rep = nh / nkv;
         let qrows = if *output_gate { 2 * qdim } else { qdim };
 
+        // One fused submit; the split back into three buffers is a
+        // memcpy that costs microseconds and keeps everything below
+        // this line byte-identical to the unfused path.
+        let fused = qrows + 2 * kvdim;
+        let mut qkv = vec![0f32; n * fused];
+        ops::gemm_nt(n1, wqkv, &mut qkv, n, hsz, fused, pool);
+        let _ = (wq, wk, wv);
         let mut qraw = vec![0f32; n * qrows];
-        ops::gemm_nt(n1, wq, &mut qraw, n, hsz, qrows, pool);
         let mut kpre = vec![0f32; n * kvdim];
-        ops::gemm_nt(n1, wk, &mut kpre, n, hsz, kvdim, pool);
         let mut vproj = vec![0f32; n * kvdim];
-        ops::gemm_nt(n1, wv, &mut vproj, n, hsz, kvdim, pool);
+        for r in 0..n {
+            let row = &qkv[r * fused..(r + 1) * fused];
+            qraw[r * qrows..(r + 1) * qrows].copy_from_slice(&row[..qrows]);
+            kpre[r * kvdim..(r + 1) * kvdim].copy_from_slice(&row[qrows..qrows + kvdim]);
+            vproj[r * kvdim..(r + 1) * kvdim].copy_from_slice(&row[qrows + kvdim..]);
+        }
         if let Some((bq, bk, bv)) = bias {
             for r in 0..n {
                 for (x, bb) in qraw[r * qrows..(r + 1) * qrows].iter_mut().zip(bq) {
@@ -1205,6 +1252,7 @@ impl FcdModel {
     ) -> Vec<f32> {
         let FcdAttn::Full {
             wq,
+            wqkv: _,
             wk,
             wv,
             wo,
@@ -1733,6 +1781,7 @@ impl FcdModel {
                         gate: &data[bi + 2],
                         up: &data[bi + 3],
                         down: &data[bi + 4],
+                        gu: None,
                     }
                 }
                 None => {
@@ -1743,6 +1792,7 @@ impl FcdModel {
                         gate: &l.gate,
                         up: &l.up,
                         down: &l.down,
+                        gu: Some(&l.gu),
                     }
                 }
             };
