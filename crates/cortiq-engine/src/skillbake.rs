@@ -215,7 +215,7 @@ impl Pass<'_> {
             .collect()
     }
 
-    fn wts<'b>(&'b self, li: usize) -> LnFfn<'b> {
+    fn wts<'b>(&'b self, li: usize, mats: &'b crate::fcd::LayerMats) -> LnFfn<'b> {
         let l = &self.fm.layers[li];
         match &self.ffn[li] {
             Some((g, u, d)) => LnFfn {
@@ -230,10 +230,10 @@ impl Pass<'_> {
             None => LnFfn {
                 iln: &l.iln,
                 pln: &l.pln,
-                gate: &l.gate,
-                up: &l.up,
-                down: &l.down,
-                gu: Some(&l.gu),
+                gate: &[],
+                up: &[],
+                down: &mats.down,
+                gu: Some(&mats.gu),
             },
         }
     }
@@ -305,7 +305,8 @@ impl Pass<'_> {
             // mask must be allowed to differ between them. Weights stay
             // indexed by the physical layer.
             let g = self.gates(vl);
-            let wts = self.wts(li);
+            let mats_hold = fm.mats(li).expect("layer mats");
+            let wts = self.wts(li, &mats_hold);
             let want = grad.is_some();
             let (h2, a) = fm.layer_forward_scaled(li, &h, b, t, &wts, false, want, Some(&g));
             h_ins.push(if want { h } else { Vec::new() });
@@ -403,7 +404,8 @@ impl Pass<'_> {
             let a = acts[vl].as_ref().expect("acts saved in grad mode");
             let g = &masks[vl];
             let inter = fm.layers[li].inter;
-            let wts = self.wts(li);
+            let mats_hold = fm.mats(li).expect("layer mats");
+            let wts = self.wts(li, &mats_hold);
             // h2 = h1 + act2 @ downᵀ  →  dact2 = dh @ down.
             let mut dact2 = vec![0f32; t * inter];
             ops::gemm_dx(&dh, wts.down, &mut dact2, t, inter, hsz, fm.pool.as_deref());
@@ -783,14 +785,21 @@ pub fn skill_bake(
 
     // ── Phase B: FCD of the last N layers' FFN (hard mask active) ──
     for &li in &fcd {
-        let l = &fm.layers[li];
-        ffn[li] = Some((l.gate.clone(), l.up.clone(), l.down.clone()));
+        let p = format!("model.layers.{li}.");
+        ffn[li] = Some((
+            crate::fcd::deq_pub(&fm.src, &format!("{p}mlp.gate_proj.weight"))
+                .map_err(|e| format!("phase-B gate: {e}"))?,
+            crate::fcd::deq_pub(&fm.src, &format!("{p}mlp.up_proj.weight"))
+                .map_err(|e| format!("phase-B up: {e}"))?,
+            crate::fcd::deq_pub(&fm.src, &format!("{p}mlp.down_proj.weight"))
+                .map_err(|e| format!("phase-B down: {e}"))?,
+        ));
     }
     let sizes: Vec<usize> = fcd
         .iter()
         .flat_map(|&li| {
-            let l = &fm.layers[li];
-            [l.gate.len(), l.up.len(), l.down.len()]
+            let (g, u, d) = ffn[li].as_ref().expect("phase-B masters");
+            [g.len(), u.len(), d.len()]
         })
         .collect();
     let mut adam_b = Adam::new(&sizes, hy.lr_b);
@@ -896,10 +905,9 @@ pub fn skill_bake(
     for li in 0..nl {
         let alive = &keep[li];
         kept_per_layer.push(alive.iter().filter(|&&a| a).count());
-        let l = &fm.layers[li];
         let mut down = match &ffn[li] {
             Some((_, _, d)) => d.clone(),
-            None => l.down.clone(),
+            None => fm.mats(li).expect("layer mats").down.clone(),
         };
         let hsz = fm.hidden;
         for r in 0..hsz {
