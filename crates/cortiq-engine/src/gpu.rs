@@ -1655,3 +1655,83 @@ pub fn graph_race_record(used_graph: bool, dur: std::time::Duration) {
     GRAPH_NS[i].fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
     GRAPH_N[i].fetch_add(1, Ordering::Relaxed);
 }
+
+/// Bounded-cost content fingerprint for the backends' pointer-keyed device
+/// caches: FNV over the whole slice up to 4 KiB, over 64 spread 64-byte
+/// windows (plus the length) above. An address-keyed hit must also prove
+/// the bytes are still the ones it uploaded — the allocator reuses heap
+/// and mmap addresses freely, so a reloaded model or a re-dequantized
+/// layer lands where the old bytes were — and sampling keeps that proof at
+/// ~a microsecond even for a 126 MB matrix. Real replacements (another
+/// model's tensor, an Adam-updated master) differ densely, so a 4 KiB
+/// spread cannot miss them.
+pub(crate) fn fp_bytes(data: &[u8]) -> u64 {
+    #[inline]
+    fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
+        let (chunks, tail) = bytes.split_at(bytes.len() & !7);
+        for c in chunks.chunks_exact(8) {
+            h ^= u64::from_le_bytes(c.try_into().unwrap());
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        for &b in tail {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        h
+    }
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ (data.len() as u64);
+    if data.len() <= 4096 {
+        return fnv(h, data);
+    }
+    let step = (data.len() - 64) / 63;
+    for i in 0..64 {
+        h = fnv(h, &data[i * step..i * step + 64]);
+    }
+    h
+}
+
+/// `fp_bytes` over an f32 slice without a bytemuck dependency (the Metal
+/// backend builds with no GPU feature flags).
+pub(crate) fn fp_f32(data: &[f32]) -> u64 {
+    let bytes =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    fp_bytes(bytes)
+}
+
+#[cfg(test)]
+mod fp_tests {
+    use super::fp_bytes;
+
+    /// The pointer-keyed caches survive on `fp_bytes` telling two different
+    /// tensors apart at a reused address. Its sampling must therefore see a
+    /// change ANYWHERE — head, tail, and the stretches between windows are
+    /// the places a cheaper hash would go blind.
+    #[test]
+    fn fp_bytes_sees_a_change_anywhere_in_a_sampled_slice() {
+        let n = 1 << 20; // 1 MiB — far above the 4 KiB full-hash threshold
+        let base: Vec<u8> = (0..n).map(|i| (i * 31 + 7) as u8).collect();
+        let h0 = fp_bytes(&base);
+        assert_eq!(h0, fp_bytes(&base), "fingerprint must be deterministic");
+        // A DENSE change (every requantized/redequantized tensor is one)
+        // must flip the fingerprint no matter how the windows fall.
+        let mut dense = base.clone();
+        for b in dense.iter_mut() {
+            *b = b.wrapping_add(1);
+        }
+        assert_ne!(h0, fp_bytes(&dense), "a fully different tensor slipped through");
+        // Length participates: the same prefix at a shorter length is a
+        // different key AND a different fingerprint.
+        assert_ne!(h0, fp_bytes(&base[..n - 64]));
+        // Below the threshold the hash is exact: a single flipped byte in
+        // a norm-sized vector must be seen.
+        let mut small = vec![3u8; 4096];
+        let hs = fp_bytes(&small);
+        small[2048] ^= 1;
+        assert_ne!(hs, fp_bytes(&small), "full hash missed a one-byte change");
+        // And the sampled windows land within bounds on awkward sizes.
+        for n in [4097usize, 5000, 64 * 64, 1 << 16] {
+            let v = vec![9u8; n];
+            let _ = fp_bytes(&v); // must not panic on window math
+        }
+    }
+}

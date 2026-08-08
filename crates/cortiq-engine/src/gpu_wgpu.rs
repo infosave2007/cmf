@@ -9581,11 +9581,18 @@ struct Ctx {
     /// keeps them off the per-token encode critical path.
     uniforms: Mutex<HashMap<[u32; 4], wgpu::Buffer>>,
     uniforms8: Mutex<HashMap<[u32; 8], wgpu::Buffer>>,
-    /// Immutable norm/small weight buffers cached by (data ptr, len) — the
-    /// ~200 per-layer norm uploads per token are token-invariant. Sentinel
-    /// key (0, n) holds shared zero buffers. Assumes stable weight pointers
-    /// (mmap), same as `weight_bufs`.
-    const_bufs: Mutex<HashMap<(usize, usize), wgpu::Buffer>>,
+    /// Immutable norm/small weight buffers cached by (data ptr, len), each
+    /// carrying a content fingerprint — the ~200 per-layer norm uploads per
+    /// token are token-invariant, but the ADDRESS is not a stable identity:
+    /// a reloaded model's mmap lands where the dropped one's was, and the
+    /// bake's streaming replica re-dequantizes layers into recycled Vecs.
+    /// A hit whose fingerprint disagrees rewrites the same buffer in place
+    /// (never a new object — cached bind groups hold the old handle).
+    /// Scoring model B after model A in one process used to inherit A's
+    /// norms wherever B's mapping overlapped and report PPL in the
+    /// millions for an intact file. Sentinel key (0, n) holds shared zero
+    /// buffers (fingerprint 0, content never changes).
+    const_bufs: Mutex<HashMap<(usize, usize), (wgpu::Buffer, u64)>>,
     /// `gemm_nt_f32`'s w-side cache, keyed on the CONTENT and not on the
     /// address. Every batched attention in this engine hands that
     /// function a per-head SCRATCH buffer as `w` — one `kh`/`vt` pair
@@ -12121,10 +12128,17 @@ pub fn forward_token_graph(
                     return None;
                 }
                 let b = tensor_weight(c, model, gw.idx, rows, cols)?; // device-local
-                // Row scales are token-invariant — cache by (ptr,rows).
+                // Row scales are token-invariant — cache by (ptr,rows),
+                // fingerprint-checked (the ptr is not a stable identity).
                 let key = (gw.row_scale.as_ptr() as usize, rows);
+                let fp = fp_bytes(bytemuck::cast_slice(&gw.row_scale[..rows]));
                 let mut cb = c.const_bufs.lock().unwrap();
-                let rsb = if let Some(x) = cb.get(&key) {
+                let rsb = if let Some((x, f)) = cb.get_mut(&key) {
+                    if *f != fp {
+                        c.queue
+                            .write_buffer(x, 0, bytemuck::cast_slice(&gw.row_scale[..rows]));
+                        *f = fp;
+                    }
                     x.clone()
                 } else {
                     let x = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -12135,7 +12149,7 @@ pub fn forward_token_graph(
                     });
                     c.queue
                         .write_buffer(&x, 0, bytemuck::cast_slice(&gw.row_scale[..rows]));
-                    cb.insert(key, x.clone());
+                    cb.insert(key, (x.clone(), fp));
                     x
                 };
                 Some(GMat {
@@ -12188,8 +12202,14 @@ pub fn forward_token_graph(
                     return None;
                 }
                 let key = (gw.data.as_ptr() as usize, rows * cols);
+                let fp = fp_bytes(bytemuck::cast_slice(&gw.data[..rows * cols]));
                 let mut cb = c.const_bufs.lock().unwrap();
-                let b = if let Some(x) = cb.get(&key) {
+                let b = if let Some((x, f)) = cb.get_mut(&key) {
+                    if *f != fp {
+                        c.queue
+                            .write_buffer(x, 0, bytemuck::cast_slice(&gw.data[..rows * cols]));
+                        *f = fp;
+                    }
                     x.clone()
                 } else {
                     let x = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -12200,7 +12220,7 @@ pub fn forward_token_graph(
                     });
                     c.queue
                         .write_buffer(&x, 0, bytemuck::cast_slice(&gw.data[..rows * cols]));
-                    cb.insert(key, x.clone());
+                    cb.insert(key, (x.clone(), fp));
                     x
                 };
                 Some(GMat {
@@ -12382,11 +12402,18 @@ pub fn forward_token_graph(
     let layers = &layers[..lws.len()];
     // DEVICE-LOCAL + content-cached: create_buffer + write_buffer keeps norm
     // weights in VRAM (not the HOST_VISIBLE heap create_buffer_init forces);
-    // caching by (ptr,len) uploads each token-invariant norm buffer once.
+    // caching by (ptr,len) uploads each token-invariant norm buffer once,
+    // and the fingerprint refreshes it in place when another model's mmap
+    // lands on the same address.
     let stor = |data: &[u8]| {
         let key = (data.as_ptr() as usize, data.len());
+        let fp = fp_bytes(data);
         let mut cb = c.const_bufs.lock().unwrap();
-        if let Some(b) = cb.get(&key) {
+        if let Some((b, f)) = cb.get_mut(&key) {
+            if *f != fp {
+                c.queue.write_buffer(b, 0, data);
+                *f = fp;
+            }
             return b.clone();
         }
         let b = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -12396,7 +12423,7 @@ pub fn forward_token_graph(
             mapped_at_creation: false,
         });
         c.queue.write_buffer(&b, 0, data);
-        cb.insert(key, b.clone());
+        cb.insert(key, (b.clone(), fp));
         b
     };
     // Shared zero buffer of `n` f32 (sentinel key (0,n)) — for absent q/k-norms
@@ -12404,7 +12431,7 @@ pub fn forward_token_graph(
     let zeros = |n: usize| -> wgpu::Buffer {
         let key = (0usize, n * 4);
         let mut cb = c.const_bufs.lock().unwrap();
-        if let Some(b) = cb.get(&key) {
+        if let Some((b, _)) = cb.get(&key) {
             return b.clone();
         }
         let b = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -12414,7 +12441,7 @@ pub fn forward_token_graph(
             mapped_at_creation: false,
         });
         c.queue.write_buffer(&b, 0, &vec![0u8; n * 4]);
-        cb.insert(key, b.clone());
+        cb.insert(key, (b.clone(), 0));
         b
     };
     let unif = |d: &[u32]| {
@@ -26331,6 +26358,8 @@ pub static DRAFT_RESERVE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// 64-bit FNV-1a over a float buffer, read eight bytes at a time. Used
 /// to tell "the same weight again" from "a scratch buffer refilled with
 /// a different head" — one sequential pass, against a PCIe upload.
+use crate::gpu::fp_bytes;
+
 fn fingerprint_f32(w: &[f32]) -> u64 {
     let bytes: &[u8] = bytemuck::cast_slice(w);
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -26451,9 +26480,18 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
         return false;
     }
     let wbuf = {
+        // The streaming replica re-dequantizes evicted layers into recycled
+        // Vecs — same address, different matrix — so the hit must prove the
+        // contents too, or a narrow residency window bakes with the wrong
+        // frozen weights.
         let key = (w.as_ptr() as usize, w.len());
+        let fp = fp_bytes(bytemuck::cast_slice(w));
         let mut cb = c.const_bufs.lock().unwrap();
-        if let Some(b) = cb.get(&key) {
+        if let Some((b, f)) = cb.get_mut(&key) {
+            if *f != fp {
+                c.queue.write_buffer(b, 0, bytemuck::cast_slice(w));
+                *f = fp;
+            }
             b.clone()
         } else {
             let b = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -26463,7 +26501,7 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
                 mapped_at_creation: false,
             });
             c.queue.write_buffer(&b, 0, bytemuck::cast_slice(w));
-            cb.insert(key, b.clone());
+            cb.insert(key, (b.clone(), fp));
             b
         }
     };
@@ -26576,8 +26614,13 @@ fn vae_conv_impl(
     }
     let cache = |data: &[f32], label: &'static str| -> wgpu::Buffer {
         let key = (data.as_ptr() as usize, data.len());
+        let fp = fp_bytes(bytemuck::cast_slice(data));
         let mut cb = c.const_bufs.lock().unwrap();
-        if let Some(b) = cb.get(&key) {
+        if let Some((b, f)) = cb.get_mut(&key) {
+            if *f != fp {
+                c.queue.write_buffer(b, 0, bytemuck::cast_slice(data));
+                *f = fp;
+            }
             return b.clone();
         }
         let b = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -26587,7 +26630,7 @@ fn vae_conv_impl(
             mapped_at_creation: false,
         });
         c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
-        cb.insert(key, b.clone());
+        cb.insert(key, (b.clone(), fp));
         b
     };
     let wb = cache(w, "vae-w");
@@ -26821,8 +26864,13 @@ pub fn dit_block_seg(
     };
     let store = |data: &[f32], label: &'static str| -> wgpu::Buffer {
         let key = (data.as_ptr() as usize, data.len());
+        let fp = fp_bytes(bytemuck::cast_slice(data));
         let mut cb = c.const_bufs.lock().unwrap();
-        if let Some(b) = cb.get(&key) {
+        if let Some((b, f)) = cb.get_mut(&key) {
+            if *f != fp {
+                c.queue.write_buffer(b, 0, bytemuck::cast_slice(data));
+                *f = fp;
+            }
             return b.clone();
         }
         let b = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -26832,7 +26880,7 @@ pub fn dit_block_seg(
             mapped_at_creation: false,
         });
         c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
-        cb.insert(key, b.clone());
+        cb.insert(key, (b.clone(), fp));
         b
     };
     // Per-block vectors are content-stable across steps only for the
@@ -27809,11 +27857,19 @@ fn encode_rope_heads_p(
 
 /// A constant vector (a norm weight, the sinks, the frequency table) parked
 /// on the card and keyed on its host address — the same bytes arrive every
-/// token, and re-uploading them 43 times a token is pure waste.
+/// token, and re-uploading them 43 times a token is pure waste. The
+/// fingerprint refreshes the SAME buffer in place when a reloaded model's
+/// mapping reuses the address — never a new object, because the dsv4
+/// bind-group cache holds the handle it was built from.
 fn const_buf(c: &Ctx, data: &[u8]) -> wgpu::Buffer {
     let key = (data.as_ptr() as usize, data.len());
+    let fp = fp_bytes(data);
     let mut m = c.const_bufs.lock().unwrap();
-    if let Some(b) = m.get(&key) {
+    if let Some((b, f)) = m.get_mut(&key) {
+        if *f != fp {
+            c.queue.write_buffer(b, 0, data);
+            *f = fp;
+        }
         return b.clone();
     }
     let b = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -27828,7 +27884,7 @@ fn const_buf(c: &Ctx, data: &[u8]) -> wgpu::Buffer {
         mapped_at_creation: false,
     });
     c.queue.write_buffer(&b, 0, data);
-    m.insert(key, b.clone());
+    m.insert(key, (b.clone(), fp));
     b
 }
 
