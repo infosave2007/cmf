@@ -9372,6 +9372,9 @@ struct Ctx {
     q4tp_mm: wgpu::ComputePipeline,
     q2tp_mm: wgpu::ComputePipeline,
     q4tp_mm_coop: Option<wgpu::ComputePipeline>,
+    /// The bake's f32-operand forward GEMM on the matrix units; None off
+    /// tensor-core devices, and `gemm_nt_f32` falls back to the scalar arm.
+    gemm_nt_coop: Option<wgpu::ComputePipeline>,
     argmax_part: wgpu::ComputePipeline,
     gdn_step_par: wgpu::ComputePipeline,
     gdn_step_norm: wgpu::ComputePipeline,
@@ -9644,6 +9647,13 @@ struct Scratch {
     dout: Option<(wgpu::Buffer, u64)>,
     dstage: Option<(wgpu::Buffer, u64)>,
     dpar: Option<wgpu::Buffer>,
+    /// The bake GEMMs' per-call activations and readback staging. Fresh
+    /// 20-260 MB allocations per call cost ~100 ms each on a discrete
+    /// card — more than the tensor-core kernel they served — so these are
+    /// grow-only like everything else here.
+    bx: Option<(wgpu::Buffer, u64)>,
+    by: Option<(wgpu::Buffer, u64)>,
+    bst: Option<(wgpu::Buffer, u64)>,
 }
 
 impl Scratch {
@@ -10147,6 +10157,35 @@ fn init() -> Result<Ctx, String> {
         }
         Some(p)
     }).flatten();
+    // The bake's f32 forward GEMM on the same units, guarded the same way:
+    // a validation error must cost this pipeline, never the device.
+    let gemm_nt_coop = (want_coop && q4tp_mm_coop.is_some())
+        .then(|| {
+            let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("bake-nt-coop"),
+                source: wgpu::ShaderSource::Wgsl(COOP_NT_SRC.into()),
+            });
+            if let Some(e) = pollster::block_on(sc.pop()) {
+                tracing::warn!("bake coop module rejected: {e}");
+                return None;
+            }
+            let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("gemm_nt_coop"),
+                layout: None,
+                module: &m,
+                entry_point: Some("gemm_nt_coop"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            if let Some(e) = pollster::block_on(sc.pop()) {
+                tracing::warn!("bake coop pipeline rejected: {e}");
+                return None;
+            }
+            Some(p)
+        })
+        .flatten();
     let argmax_part = pipe("argmax_part");
     let gdn_step_par = pipe("gdn_step_par");
     let gdn_step_par2 = pipe("gdn_step_par2");
@@ -10432,6 +10471,7 @@ fn init() -> Result<Ctx, String> {
         q4tp_mm,
         q2tp_mm,
         q4tp_mm_coop,
+        gemm_nt_coop,
         argmax_part,
         gdn_step_par,
         gdn_step_par2,
@@ -18025,6 +18065,114 @@ fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
             // n-major, four consecutive k in a row: `coopLoad` reads it
             // ColumnMajor, which turns [n][k] into the K x N the B role
             // wants without a transposing load.
+            let bd = n * KS + k4;
+            cm_b[bd] = f16(wv.x); cm_b[bd + 1u] = f16(wv.y);
+            cm_b[bd + 2u] = f16(wv.z); cm_b[bd + 3u] = f16(wv.w);
+        }
+        workgroupBarrier();
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 0u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 0u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u + 0u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 0u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u + 0u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 16u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 16u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u + 16u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 16u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u + 16u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        workgroupBarrier();
+        k0 = k0 + KS;
+    }
+    workgroupBarrier();
+    coopStoreT(c0, &cm_c[sg * 16u * 64u + 0u], 64u);
+    coopStoreT(c1, &cm_c[sg * 16u * 64u + 16u], 64u);
+    coopStoreT(c2, &cm_c[sg * 16u * 64u + 32u], 64u);
+    coopStoreT(c3, &cm_c[sg * 16u * 64u + 48u], 64u);
+    workgroupBarrier();
+    for (var t = tid; t < 64u * 64u; t = t + 128u) {
+        let m = t / 64u;
+        let n = t % 64u;
+        if (m0 + m < pmm.nb && n0 + n < pmm.rows) {
+            ymm[(m0 + m) * pmm.rows + n0 + n] = cm_c[m * 64u + n];
+        }
+    }
+}
+"#;
+
+/// The bake's forward GEMM on the same matrix units: y[nb,rows] =
+/// x[nb,cols] · w[rows,cols]ᵀ with both operands ALREADY f32 in memory —
+/// frozen weights the replica dequantized, or trained masters. The
+/// staging, tile shape and load/store choreography are `q4tp_mm_coop`'s
+/// verbatim (every hard-won layout fact above applies unchanged); the
+/// only difference is that the B tile reads f32 planes instead of
+/// dequantizing nibbles. f16 operands, f32 accumulator — the same
+/// numerics contract the DiT ships with.
+const COOP_NT_SRC: &str = r#"
+enable wgpu_cooperative_matrix;
+enable f16;
+
+struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read> wmm: array<f32>;
+@group(0) @binding(1) var<storage, read> xmm: array<f32>;
+@group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
+@group(0) @binding(3) var<uniform> pmm: MmP;
+
+const KS: u32 = 32u;
+
+var<workgroup> cm_a: array<f16, 64 * 32>;
+var<workgroup> cm_b: array<f16, 64 * 32>;
+var<workgroup> cm_c: array<f32, 64 * 64>;
+
+@compute @workgroup_size(128)
+fn gemm_nt_coop(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) tid: u32,
+                @builtin(subgroup_id) sg: u32) {
+    let cols = pmm.cols4 * 4u;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+
+    var c0: coop_mat16x16<f32, C>;
+    var c1: coop_mat16x16<f32, C>;
+    var c2: coop_mat16x16<f32, C>;
+    var c3: coop_mat16x16<f32, C>;
+
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let m = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            let dst = m * KS + k4;
+            var v = vec4<f32>(0.0);
+            if (m0 + m < pmm.nb && col0 < cols) {
+                let base = (m0 + m) * cols + col0;
+                v = vec4<f32>(xmm[base], xmm[base + 1u], xmm[base + 2u], xmm[base + 3u]);
+            }
+            cm_a[dst] = f16(v.x); cm_a[dst + 1u] = f16(v.y);
+            cm_a[dst + 2u] = f16(v.z); cm_a[dst + 3u] = f16(v.w);
+        }
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let n = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            var wv = vec4<f32>(0.0);
+            if (n0 + n < pmm.rows && col0 < cols) {
+                let base = (n0 + n) * cols + col0;
+                wv = vec4<f32>(wmm[base], wmm[base + 1u], wmm[base + 2u], wmm[base + 3u]);
+            }
             let bd = n * KS + k4;
             cm_b[bd] = f16(wv.x); cm_b[bd + 1u] = f16(wv.y);
             cm_b[bd + 2u] = f16(wv.z); cm_b[bd + 3u] = f16(wv.w);
@@ -26380,8 +26528,23 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
         return false;
     }
     let Some(c) = ctx() else { return false };
-    // Small jobs lose to the round trip; huge dispatch dims are illegal.
-    if n * k * m < (1 << 22) || m > 65_000 || n > 65_000 {
+    // Small jobs lose to the round trip.
+    if n * k * m < (1 << 22) {
+        return false;
+    }
+    // Tensor cores when the device brought them up: 64x64 tiles, so the
+    // dispatch grid is m/64 x n/64 and the vocabulary head (m = 166k, which
+    // the scalar arm's one-workgroup-per-element grid could never dispatch)
+    // becomes an ordinary call. Held to discrete cards for the big-m case:
+    // on unified memory the head weight's device copy would be 2 GB of the
+    // laptop's RAM that the CPU path does not spend.
+    let coop = c
+        .gemm_nt_coop
+        .as_ref()
+        .filter(|_| k % 4 == 0 && m.div_ceil(64) <= 65_535 && n.div_ceil(64) <= 65_535)
+        .filter(|_| c.discrete || (m <= 65_000 && n <= 65_000));
+    // The scalar arm's dispatch is (m, n) workgroups — huge dims are illegal.
+    if coop.is_none() && (m > 65_000 || n > 65_000) {
         return false;
     }
     if x.len() < n * k || w.len() < m * k || y.len() < n * m {
@@ -26397,12 +26560,18 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
             // Same address, different matrix — a reused scratch buffer.
             // Refill the device copy rather than hand back the last one.
             Some((b, _)) => {
+                crate::gpu::probe_note_cold();
                 let b = b.clone();
                 c.queue.write_buffer(&b, 0, bytemuck::cast_slice(w));
                 cb.insert(key, (b.clone(), fp));
                 b
             }
             None => {
+                // First touch pays the PCIe upload; the probe must not
+                // bill it to the steady state, or a 264 MB weight makes
+                // the tensor-core arm look slower than 384 CPU cores and
+                // the whole bake runs scalar forever.
+                crate::gpu::probe_note_cold();
                 let b = c.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("bake-w"),
                     size: (w.len() * 4) as u64,
@@ -26415,30 +26584,67 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
             }
         }
     };
-    let xbuf = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("bake-x"),
-        size: (n * k * 4) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let (xbuf, ybuf, stage) = {
+        let mut sc = c.scratch.lock().unwrap();
+        let xbuf = Scratch::ensure(
+            &c.device,
+            &mut sc.bx,
+            (n * k * 4) as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            "bake-x",
+        );
+        let ybuf = Scratch::ensure(
+            &c.device,
+            &mut sc.by,
+            (n * m * 4) as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "bake-y",
+        );
+        let stage = Scratch::ensure(
+            &c.device,
+            &mut sc.bst,
+            (n * m * 4) as u64,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            "bake-stage",
+        );
+        (xbuf, ybuf, stage)
+    };
     c.queue.write_buffer(&xbuf, 0, bytemuck::cast_slice(&x[..n * k]));
-    let ybuf = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("bake-y"),
-        size: (n * m * 4) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let u = c
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&[k as u32, m as u32, 0u32, 0u32]),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bake-gemm") });
-    {
+    if let Some(pipe) = coop {
+        // MmP { cols4, rows, nb } in the coop kernel's terms: rows = weight
+        // rows (m), nb = tokens (n).
+        let u = c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[(k / 4) as u32, m as u32, n as u32, 0u32]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &wbuf),
+                bind_buf(1, &xbuf),
+                bind_buf(2, &ybuf),
+                bind_buf(3, &u),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((m as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
+    } else {
+        let u = c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[k as u32, m as u32, 0u32, 0u32]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &c.f32_matvec_b.get_bind_group_layout(0),
@@ -26455,12 +26661,6 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
         pass.dispatch_workgroups(m as u32, n as u32, 1);
     }
     let bytes = (n * m * 4) as u64;
-    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("bake-stage"),
-        size: bytes,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
     readback(c, enc, &ybuf, &stage, bytes, &mut y[..n * m])
 }
 
@@ -26489,11 +26689,13 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
         let mut cb = c.const_bufs.lock().unwrap();
         if let Some((b, f)) = cb.get_mut(&key) {
             if *f != fp {
+                crate::gpu::probe_note_cold();
                 c.queue.write_buffer(b, 0, bytemuck::cast_slice(w));
                 *f = fp;
             }
             b.clone()
         } else {
+            crate::gpu::probe_note_cold(); // first touch = upload, not a steady sample
             let b = c.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("bake-dxw"),
                 size: (w.len() * 4) as u64,
@@ -26505,19 +26707,34 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
             b
         }
     };
-    let dyb = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("bake-dy"),
-        size: (n * m * 4) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let (dyb, dxb, stage) = {
+        // Shares the forward GEMM's pooled slots — same usage flags, and
+        // the two never overlap in flight (the bake is sequential).
+        let mut sc = c.scratch.lock().unwrap();
+        let dyb = Scratch::ensure(
+            &c.device,
+            &mut sc.bx,
+            (n * m * 4) as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            "bake-x",
+        );
+        let dxb = Scratch::ensure(
+            &c.device,
+            &mut sc.by,
+            (n * k * 4) as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "bake-y",
+        );
+        let stage = Scratch::ensure(
+            &c.device,
+            &mut sc.bst,
+            (n * k * 4) as u64,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            "bake-stage",
+        );
+        (dyb, dxb, stage)
+    };
     c.queue.write_buffer(&dyb, 0, bytemuck::cast_slice(&dy[..n * m]));
-    let dxb = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("bake-dx"),
-        size: (n * k * 4) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
     let u = c
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -26545,12 +26762,6 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
         pass.dispatch_workgroups(k as u32, n as u32, 1);
     }
     let bytes = (n * k * 4) as u64;
-    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("bake-dx-stage"),
-        size: bytes,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
     readback(c, enc, &dxb, &stage, bytes, &mut dx[..n * k])
 }
 
