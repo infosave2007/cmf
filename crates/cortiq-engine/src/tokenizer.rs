@@ -764,6 +764,94 @@ impl Tokenizer {
     /// reasoning-model templates (Qwen3/3.5 emit an empty <think> block when it
     /// is false, so the model answers directly). `None` leaves the variable
     /// undefined — the template's own default applies.
+
+    /// Chat template with the FULL message shape and a tool list.
+    ///
+    /// The pair-based API below flattens every message to (role, text),
+    /// which silently drops exactly what agentic use needs: the `tools`
+    /// array, `role: "tool"` results, and `tool_calls` on assistant
+    /// turns. The templates this format embeds — Qwen-family, Nanbeige —
+    /// have carried a `{%- if tools %}` branch all along; this is the
+    /// call that finally feeds it. Messages arrive as JSON objects in
+    /// the OpenAI shape and pass through to minijinja unflattened, so a
+    /// template sees the same fields a Python `apply_chat_template`
+    /// would.
+    pub fn apply_chat_template_json(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: Option<bool>,
+    ) -> Vec<u32> {
+        if let Some(tpl) = &self.chat_template {
+            match self.render_template_json(tpl, messages, tools, enable_thinking) {
+                Ok(text) => return self.with_bos(self.encode(&text)),
+                Err(e) => {
+                    tracing::error!("chat template render failed ({e}); ChatML fallback");
+                }
+            }
+        }
+        let pairs: Vec<(String, String)> = messages
+            .iter()
+            .map(|m| {
+                (
+                    m.get("role").and_then(|v| v.as_str()).unwrap_or("user").to_string(),
+                    m.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        self.with_bos(self.chatml_fallback_opts(&pairs, enable_thinking))
+    }
+
+    /// Render the template against JSON-shaped messages (parity surface).
+    pub fn render_chat_json(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: Option<bool>,
+    ) -> Option<String> {
+        let tpl = self.chat_template.as_ref()?;
+        self.render_template_json(tpl, messages, tools, enable_thinking).ok()
+    }
+
+    fn render_template_json(
+        &self,
+        tpl: &str,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: Option<bool>,
+    ) -> Result<String, minijinja::Error> {
+        let mut env = minijinja::Environment::new();
+        env.set_trim_blocks(true);
+        env.set_lstrip_blocks(true);
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.add_template("chat", tpl)?;
+        let msgs: Vec<minijinja::Value> = messages
+            .iter()
+            .map(minijinja::Value::from_serialize)
+            .collect();
+        let tools_v: Option<Vec<minijinja::Value>> = tools.map(|ts| {
+            ts.iter().map(minijinja::Value::from_serialize).collect()
+        });
+        let tpl = env.get_template("chat")?;
+        // Three axes, each present only when meaningful: templates guard
+        // with `is defined`, and an explicit null flips those guards.
+        let rendered = match (tools_v, enable_thinking) {
+            (Some(ts), Some(v)) => tpl.render(minijinja::context! {
+                messages => msgs, tools => ts, add_generation_prompt => true, enable_thinking => v,
+            })?,
+            (Some(ts), None) => tpl.render(minijinja::context! {
+                messages => msgs, tools => ts, add_generation_prompt => true,
+            })?,
+            (None, Some(v)) => tpl.render(minijinja::context! {
+                messages => msgs, add_generation_prompt => true, enable_thinking => v,
+            })?,
+            (None, None) => tpl.render(minijinja::context! {
+                messages => msgs, add_generation_prompt => true,
+            })?,
+        };
+        Ok(rendered)
+    }
+
     pub fn apply_chat_template_opts(
         &self,
         messages: &[(String, String)],

@@ -59,7 +59,20 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse>
 #[derive(Deserialize, Serialize, Clone)]
 struct ChatMessage {
     role: String,
-    content: MessageContent,
+    /// Nullable: an assistant turn that made tool calls has
+    /// `content: null` in the OpenAI shape, and a required field here
+    /// 422'd the whole conversation on the SECOND request of every
+    /// agent loop — the one that carries the history.
+    #[serde(default)]
+    content: Option<MessageContent>,
+    /// Assistant history: the calls it made, echoed back by the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<serde_json::Value>,
+    /// `role: "tool"` results reference the call they answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 /// `content` in the shape clients actually send it.
@@ -248,9 +261,35 @@ struct ChatCompletionsRequest {
     /// Cortiq extension: task routing
     #[serde(default)]
     cortiq: Option<CortiqExtension>,
+    /// OpenAI function calling. Passed through to the FILE's chat
+    /// template, whose `{%- if tools %}` branch has been waiting for
+    /// them since the first Qwen-family convert.
+    #[serde(default)]
+    tools: Option<Vec<serde_json::Value>>,
+    /// "none" suppresses the tool prompt; "auto"/absent lets the model
+    /// decide. A forced {"function": {...}} is honoured as "auto" —
+    /// grammar-constrained forcing is not implemented, and pretending
+    /// otherwise would be worse than saying so.
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
 }
 
 impl ChatCompletionsRequest {
+    /// Tools the template should see: none when absent, empty, or
+    /// explicitly refused via tool_choice: "none".
+    fn effective_tools(&self) -> Option<&[serde_json::Value]> {
+        if matches!(
+            self.tool_choice.as_ref().and_then(|v| v.as_str()),
+            Some("none")
+        ) {
+            return None;
+        }
+        match self.tools.as_deref() {
+            Some([]) | None => None,
+            Some(ts) => Some(ts),
+        }
+    }
+
     /// Effective enable_thinking: top-level field, else chat_template_kwargs.
     fn thinking(&self) -> Option<bool> {
         self.enable_thinking.or_else(|| {
@@ -314,31 +353,47 @@ async fn chat_completions(
 
     // Chat template → prompt ids (uses real special tokens).
     let prompt_ids = {
-        let mut msgs: Vec<(String, String)> = req
+        let mut msgs: Vec<serde_json::Value> = req
             .messages
             .iter()
-            .map(|m| (m.role.clone(), m.content.text()))
+            .map(|m| {
+                let mut o = serde_json::json!({
+                    "role": m.role,
+                    "content": m.content.as_ref().map(|c| c.text()).unwrap_or_default(),
+                });
+                if let Some(tc) = &m.tool_calls {
+                    o["tool_calls"] = tc.clone();
+                }
+                if let Some(id) = &m.tool_call_id {
+                    o["tool_call_id"] = serde_json::json!(id);
+                }
+                if let Some(n) = &m.name {
+                    o["name"] = serde_json::json!(n);
+                }
+                o
+            })
             .collect();
         // Hard thinking suppression: when enable_thinking=false, inject a
         // system-level directive so even models that ignore the empty
         //  block still produce direct answers.
         eprintln!("[serve] thinking={:?}", req.thinking());
         if req.thinking() == Some(false) {
-            let has_system = msgs.iter().any(|(r, _)| r == "system");
+            let has_system = msgs.iter().any(|m| m["role"] == "system");
             let directive = "Answer directly and concisely. Do NOT reason, think step-by-step, or explain your process. Output ONLY the final answer.";
             if has_system {
                 // Prepend to existing system message
-                if let Some((_, content)) = msgs.iter_mut().find(|(r, _)| r == "system") {
-                    *content = format!("{directive}\n\n{content}");
+                if let Some(m) = msgs.iter_mut().find(|m| m["role"] == "system") {
+                    let cur = m["content"].as_str().unwrap_or_default();
+                    m["content"] = serde_json::json!(format!("{directive}\n\n{cur}"));
                 }
             } else {
-                msgs.insert(0, ("system".to_string(), directive.to_string()));
+                msgs.insert(0, serde_json::json!({"role": "system", "content": directive}));
             }
         }
         eprintln!("[serve] msgs[0]={:?}", msgs.get(0));
         state
             .tokenizer
-            .apply_chat_template_opts(&msgs, req.thinking())
+            .apply_chat_template_json(&msgs, req.effective_tools(), req.thinking())
     };
 
     let request_id = format!("cmf-{}", uuid::Uuid::new_v4());
@@ -346,6 +401,14 @@ async fn chat_completions(
     let max_tokens = req.max_tokens as usize;
 
     if req.stream {
+        let tool_names: Vec<String> = req
+            .effective_tools()
+            .map(|ts| {
+                ts.iter()
+                    .filter_map(|t| t["function"]["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
         let (tx, stream) = ChatStream::new(64);
         let model = req.model.clone();
         let id = request_id.clone();
@@ -364,6 +427,7 @@ async fn chat_completions(
                         delta: streaming::StreamDelta {
                             role: Some("assistant".to_string()),
                             content: None,
+                            tool_calls: None,
                         },
                         finish_reason: None,
                     }],
@@ -378,9 +442,49 @@ async fn chat_completions(
             let model2 = model.clone();
             let mut filter_buf = String::new();
             let mut filter_passthrough = req.thinking() != Some(false);
+            // Tool-call holdback: once the model opens a <tool_call>
+            // block, nothing more goes out as content — the calls are
+            // parsed whole at the end and shipped as a tool_calls delta.
+            // Until the marker is certain, the last few characters stay
+            // buffered so a marker split across tokens cannot leak.
+            let tools_active = req.effective_tools().is_some();
+            let mut tool_tail = String::new();
+            let mut tool_holding = false;
+            const MARK: &str = "<tool_call>";
 
             let callback: cortiq_engine::TokenCallback = Box::new(move |token: &str| {
                 if filter_passthrough {
+                    if tools_active {
+                        if tool_holding {
+                            return !tx_tokens.is_closed();
+                        }
+                        tool_tail.push_str(token);
+                        if let Some(pos) = tool_tail.find(MARK) {
+                            tool_holding = true;
+                            let before = tool_tail[..pos].to_string();
+                            if !before.is_empty() {
+                                let chunk =
+                                    streaming::token_chunk(&id2, &model2, &before, created);
+                                return tx_tokens.blocking_send(chunk).is_ok();
+                            }
+                            return !tx_tokens.is_closed();
+                        }
+                        // Flush all but a marker's worth of tail.
+                        if tool_tail.len() > MARK.len() {
+                            let cut = tool_tail.len() - (MARK.len() - 1);
+                            let safe_cut = (0..=cut)
+                                .rev()
+                                .find(|&c| tool_tail.is_char_boundary(c))
+                                .unwrap_or(0);
+                            if safe_cut > 0 {
+                                let out: String = tool_tail.drain(..safe_cut).collect();
+                                let chunk =
+                                    streaming::token_chunk(&id2, &model2, &out, created);
+                                return tx_tokens.blocking_send(chunk).is_ok();
+                            }
+                        }
+                        return !tx_tokens.is_closed();
+                    }
                     let chunk = streaming::token_chunk(&id2, &model2, token, created);
                     return tx_tokens.blocking_send(chunk).is_ok();
                 }
@@ -421,6 +525,34 @@ async fn chat_completions(
                         .runtime
                         .record_generation(result.tokens_generated, elapsed_ms, elapsed_ms)
                         .await;
+                    let (plain2, mut calls) = extract_tool_calls(&result.text);
+                    if calls.is_empty() {
+                        if let Some(c) = bare_call_fallback(&plain2, &tool_names) {
+                            calls = vec![c];
+                        }
+                    }
+                    let finish = if calls.is_empty() {
+                        result.finish_reason.clone()
+                    } else {
+                        let _ = tx
+                            .send(streaming::tool_calls_chunk(
+                                &id,
+                                &model,
+                                serde_json::Value::Array(
+                                    calls
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(i, mut c)| {
+                                            c["index"] = serde_json::json!(i);
+                                            c
+                                        })
+                                        .collect(),
+                                ),
+                                created,
+                            ))
+                            .await;
+                        "tool_calls".to_string()
+                    };
                     // exact counts ahead of the finish chunk (OpenAI include_usage shape)
                     let _ = tx
                         .send(streaming::usage_chunk(
@@ -432,12 +564,7 @@ async fn chat_completions(
                         ))
                         .await;
                     let _ = tx
-                        .send(streaming::finish_chunk(
-                            &id,
-                            &model,
-                            &result.finish_reason,
-                            created,
-                        ))
+                        .send(streaming::finish_chunk(&id, &model, &finish, created))
                         .await;
                 }
                 Err(_) => {
@@ -487,6 +614,20 @@ async fn chat_completions(
             result.text.clone()
         };
 
+        let (mut plain, mut calls) = extract_tool_calls(&content);
+        if calls.is_empty() {
+            if let Some(names) = req.effective_tools().map(|ts| {
+                ts.iter()
+                    .filter_map(|t| t["function"]["name"].as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            }) {
+                if let Some(c) = bare_call_fallback(&plain, &names) {
+                    calls = vec![c];
+                    plain = String::new();
+                }
+            }
+        }
+        let made_calls = !calls.is_empty();
         Json(ChatCompletionsResponse {
             id: request_id,
             object: "chat.completion".to_string(),
@@ -496,9 +637,21 @@ async fn chat_completions(
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    content: content.into(),
+                    // OpenAI shape: a pure tool-call turn has null content.
+                    content: if made_calls && plain.is_empty() {
+                        None
+                    } else {
+                        Some(plain.into())
+                    },
+                    tool_calls: made_calls.then(|| serde_json::Value::Array(calls)),
+                    tool_call_id: None,
+                    name: None,
                 },
-                finish_reason: result.finish_reason.clone(),
+                finish_reason: if made_calls {
+                    "tool_calls".to_string()
+                } else {
+                    result.finish_reason.clone()
+                },
             }],
             usage: Usage {
                 prompt_tokens: result.prompt_tokens as u32,
@@ -509,6 +662,83 @@ async fn chat_completions(
         })
         .into_response()
     }
+}
+
+
+
+/// Small-model fallback: the whole reply is ONE bare JSON object that
+/// names a REQUESTED tool. Qwen-family minis often emit the call
+/// without its <tool_call> wrapper; vLLM and llama.cpp both accept
+/// this shape, and refusing it here would fail every agent loop on a
+/// small model while a human can see the call sitting in the text.
+/// Conditions are strict on purpose: tools were requested, the text
+/// parses as a single object, `name` is a string matching a declared
+/// tool, and `arguments` (when present) is an object.
+fn bare_call_fallback(text: &str, allowed: &[String]) -> Option<serde_json::Value> {
+    let t = text.trim();
+    if !t.starts_with('{') || !t.ends_with('}') {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(t).ok()?;
+    let name = v.get("name")?.as_str()?;
+    if !allowed.iter().any(|a| a == name) {
+        return None;
+    }
+    let args = v.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+    if !args.is_object() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "id": format!("call_{}", uuid::Uuid::new_v4().simple()),
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()),
+        }
+    }))
+}
+
+/// Extract `<tool_call>{...}</tool_call>` blocks from generated text —
+/// the format every Qwen-family template (Nanbeige included) trains the
+/// model to emit. Returns the text OUTSIDE the blocks and the calls in
+/// OpenAI shape. `arguments` stays a STRING of JSON per the OpenAI
+/// contract; a block whose body does not parse as JSON is left in the
+/// text rather than shipped as a broken call — a client can read prose,
+/// but it cannot execute garbage.
+fn extract_tool_calls(text: &str) -> (String, Vec<serde_json::Value>) {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
+    let mut rest = text;
+    let mut plain = String::new();
+    let mut calls = Vec::new();
+    while let Some(i) = rest.find(OPEN) {
+        let Some(j) = rest[i + OPEN.len()..].find(CLOSE) else {
+            break; // unterminated block: keep as text (truncated output)
+        };
+        let body = rest[i + OPEN.len()..i + OPEN.len() + j].trim();
+        let after = &rest[i + OPEN.len() + j + CLOSE.len()..];
+        match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(v) if v.get("name").map(|n| n.is_string()) == Some(true) => {
+                plain.push_str(&rest[..i]);
+                let args = v.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+                calls.push(serde_json::json!({
+                    "id": format!("call_{}", uuid::Uuid::new_v4().simple()),
+                    "type": "function",
+                    "function": {
+                        "name": v["name"],
+                        "arguments": serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()),
+                    }
+                }));
+            }
+            _ => {
+                // Not a call: keep the whole block verbatim as text.
+                plain.push_str(&rest[..i + OPEN.len() + j + CLOSE.len()]);
+            }
+        }
+        rest = after;
+    }
+    plain.push_str(rest);
+    (plain.trim().to_string(), calls)
 }
 
 fn strip_think_block(s: &str) -> String {
@@ -605,6 +835,47 @@ fn default_max_tokens() -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn tool_calls_extract_single() {
+        let (text, calls) = extract_tool_calls(
+            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
+        );
+        assert_eq!(text, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        // arguments is a STRING of JSON per the OpenAI contract
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["city"], "Paris");
+        assert!(calls[0]["id"].as_str().unwrap().starts_with("call_"));
+    }
+
+    #[test]
+    fn tool_calls_extract_text_and_multiple() {
+        let (text, calls) = extract_tool_calls(
+            "Let me check both.\n<tool_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool_call>\n<tool_call>\n{\"name\": \"b\", \"arguments\": {\"x\": 1}}\n</tool_call>",
+        );
+        assert_eq!(text, "Let me check both.");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1]["function"]["name"], "b");
+    }
+
+    #[test]
+    fn tool_calls_malformed_body_stays_text() {
+        let (text, calls) =
+            extract_tool_calls("<tool_call>\nnot json at all\n</tool_call> done");
+        assert!(calls.is_empty());
+        assert!(text.contains("not json at all"), "broken call must stay readable text");
+    }
+
+    #[test]
+    fn tool_calls_unterminated_stays_text() {
+        let (text, calls) = extract_tool_calls("<tool_call>\n{\"name\": \"a\"");
+        assert!(calls.is_empty());
+        assert!(text.contains("<tool_call>"), "truncated output must not vanish");
+    }
+
     use super::*;
 
     #[test]
@@ -631,7 +902,7 @@ mod tests {
     fn content_accepts_both_a_string_and_a_block_array() {
         let flat: ChatMessage =
             serde_json::from_str(r#"{"role":"user","content":"hello"}"#).unwrap();
-        assert_eq!(flat.content.text(), "hello");
+        assert_eq!(flat.content.as_ref().unwrap().text(), "hello");
 
         let blocks: ChatMessage = serde_json::from_str(
             r#"{"role":"user","content":[
@@ -639,7 +910,7 @@ mod tests {
                  {"type":"text","text":"the question"}]}"#,
         )
         .unwrap();
-        assert_eq!(blocks.content.text(), "file context\nthe question");
+        assert_eq!(blocks.content.as_ref().unwrap().text(), "file context\nthe question");
 
         // A non-text block must not fail the turn — it contributes nothing.
         let mixed: ChatMessage = serde_json::from_str(
@@ -648,7 +919,7 @@ mod tests {
                  {"type":"text","text":"describe"}]}"#,
         )
         .unwrap();
-        assert_eq!(mixed.content.text(), "describe");
+        assert_eq!(mixed.content.as_ref().unwrap().text(), "describe");
 
         // And a whole request round-trips, which is what 422'd before.
         let req: ChatCompletionsRequest = serde_json::from_str(
@@ -657,7 +928,7 @@ mod tests {
                  {"role":"user","content":"hi"}]}"#,
         )
         .unwrap();
-        assert_eq!(req.messages[0].content.text(), "sys");
-        assert_eq!(req.messages[1].content.text(), "hi");
+        assert_eq!(req.messages[0].content.as_ref().unwrap().text(), "sys");
+        assert_eq!(req.messages[1].content.as_ref().unwrap().text(), "hi");
     }
 }
