@@ -1106,6 +1106,12 @@ enum SkillCmd {
         /// Held-out chunks (the quality gate)
         #[arg(long, default_value = "12")]
         held: usize,
+        /// Calibration chunks read from the corpus (consumed in file
+        /// order, silently truncated past this). Raise it to feed a
+        /// bigger corpus whole — more variety, same wall time: steps
+        /// are what cost, chunks only feed them.
+        #[arg(long, default_value = "112")]
+        calib_chunks: usize,
         /// Target sparsity (0.0–1.0): force at least this fraction of
         /// FFN neurons to be pruned. 0 = auto (denoising bottom)
         #[arg(long, default_value = "0.0")]
@@ -1550,6 +1556,7 @@ async fn main() -> anyhow::Result<()> {
                 fcd_layers,
                 chunk,
                 held,
+                calib_chunks,
                 target_sparsity,
                 l1_aggression,
                 ffn_align,
@@ -1563,6 +1570,7 @@ async fn main() -> anyhow::Result<()> {
                 fcd_layers,
                 chunk,
                 held,
+                calib_chunks,
                 target_sparsity,
                 l1_aggression,
                 ffn_align,
