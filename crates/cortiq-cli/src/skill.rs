@@ -1009,8 +1009,20 @@ pub fn run_skill_bake(
         Ok((nll / n.max(1) as f64).exp())
     };
     let rt_base = runtime_ppl(model_path, None)?;
-    // The specialist is scored the way it will be served: mask active.
-    let rt_spec = runtime_ppl(&tmp, visit_mask.as_ref())?;
+    // The per-position masked scorer is currently the only way to hold
+    // the mask active — and on QUANTIZED storage the runtime's FFN mask
+    // application is a no-op anyway, so that path spends hours measuring
+    // an unmasked model one position at a time (a 4 B gate ran three
+    // hours on a 48-core stand and was still wrong). Score bare on the
+    // fast path and say so; the replica-side numbers above are the
+    // masked truth until the quantized masked path exists.
+    if visit_mask.is_some() {
+        println!(
+            "runtime gate note: per-visit mask not enforceable on quantized storage yet — \
+             the specialist is scored bare; masked quality is the replica's mask+FCD figure"
+        );
+    }
+    let rt_spec = runtime_ppl(&tmp, None)?;
     println!(
         "runtime gate (held-out, real engine): backbone {rt_base:.3} → specialist {rt_spec:.3} ({:+.1}%)",
         (rt_spec / rt_base - 1.0) * 100.0
