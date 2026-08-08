@@ -336,7 +336,7 @@ impl Pass<'_> {
         // Chunk the vocab matmul over positions to bound the logits buf.
         // Positions are walked PER SEQUENCE: the last position of chunk
         // i must not be scored against the first token of chunk i+1.
-        const POS_CHUNK: usize = 32;
+        const POS_CHUNK: usize = 64;
         let scored = b * (t - 1);
         for bi in 0..b {
         let base = bi * t;
@@ -451,29 +451,40 @@ impl Pass<'_> {
                     du_pre[i] = da * sg;
                 }
             }
-            // dn2 = dg_pre @ gate + du_pre @ up.
+            // dn2 = dg_pre @ gate + du_pre @ up — one fused submit when
+            // the frozen concat exists; the trained-copy path keeps two.
             let mut dn2 = vec![0f32; t * hsz];
-            ops::gemm_dx(
-                &dg_pre,
-                wts.gate,
-                &mut dn2,
-                t,
-                hsz,
-                inter,
-                fm.pool.as_deref(),
-            );
-            let mut dn2b = vec![0f32; t * hsz];
-            ops::gemm_dx(
-                &du_pre,
-                wts.up,
-                &mut dn2b,
-                t,
-                hsz,
-                inter,
-                fm.pool.as_deref(),
-            );
-            for (x, &y) in dn2.iter_mut().zip(&dn2b) {
-                *x += y;
+            if let Some(gu) = wts.gu {
+                let mut dgu = vec![0f32; t * 2 * inter];
+                for r in 0..t {
+                    let row = &mut dgu[r * 2 * inter..(r + 1) * 2 * inter];
+                    row[..inter].copy_from_slice(&dg_pre[r * inter..(r + 1) * inter]);
+                    row[inter..].copy_from_slice(&du_pre[r * inter..(r + 1) * inter]);
+                }
+                ops::gemm_dx(&dgu, gu, &mut dn2, t, hsz, 2 * inter, fm.pool.as_deref());
+            } else {
+                ops::gemm_dx(
+                    &dg_pre,
+                    wts.gate,
+                    &mut dn2,
+                    t,
+                    hsz,
+                    inter,
+                    fm.pool.as_deref(),
+                );
+                let mut dn2b = vec![0f32; t * hsz];
+                ops::gemm_dx(
+                    &du_pre,
+                    wts.up,
+                    &mut dn2b,
+                    t,
+                    hsz,
+                    inter,
+                    fm.pool.as_deref(),
+                );
+                for (x, &y) in dn2.iter_mut().zip(&dn2b) {
+                    *x += y;
+                }
             }
             if let Some((dgw, duw, _)) = dffn[li].as_mut() {
                 let mut dw = vec![0f32; inter * hsz];
