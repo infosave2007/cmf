@@ -9375,6 +9375,8 @@ struct Ctx {
     /// The bake's f32-operand forward GEMM on the matrix units; None off
     /// tensor-core devices, and `gemm_nt_f32` falls back to the scalar arm.
     gemm_nt_coop: Option<wgpu::ComputePipeline>,
+    /// Its backward twin (reduction over w's leading axis) for `gemm_dx_f32`.
+    gemm_nn_coop: Option<wgpu::ComputePipeline>,
     argmax_part: wgpu::ComputePipeline,
     gdn_step_par: wgpu::ComputePipeline,
     gdn_step_norm: wgpu::ComputePipeline,
@@ -10157,34 +10159,39 @@ fn init() -> Result<Ctx, String> {
         }
         Some(p)
     }).flatten();
-    // The bake's f32 forward GEMM on the same units, guarded the same way:
-    // a validation error must cost this pipeline, never the device.
-    let gemm_nt_coop = (want_coop && q4tp_mm_coop.is_some())
-        .then(|| {
-            let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("bake-nt-coop"),
-                source: wgpu::ShaderSource::Wgsl(COOP_NT_SRC.into()),
-            });
-            if let Some(e) = pollster::block_on(sc.pop()) {
-                tracing::warn!("bake coop module rejected: {e}");
-                return None;
-            }
-            let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("gemm_nt_coop"),
-                layout: None,
-                module: &m,
-                entry_point: Some("gemm_nt_coop"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-            if let Some(e) = pollster::block_on(sc.pop()) {
-                tracing::warn!("bake coop pipeline rejected: {e}");
-                return None;
-            }
-            Some(p)
-        })
+    // The bake's f32 forward/backward GEMMs on the same units, guarded the
+    // same way: a validation error must cost the pipeline, never the device.
+    let bake_coop = |src: &str, mod_label: &'static str, entry: &'static str| {
+        let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(mod_label),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
+        });
+        if let Some(e) = pollster::block_on(sc.pop()) {
+            tracing::warn!("{mod_label} module rejected: {e}");
+            return None;
+        }
+        let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: None,
+            module: &m,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        if let Some(e) = pollster::block_on(sc.pop()) {
+            tracing::warn!("{entry} pipeline rejected: {e}");
+            return None;
+        }
+        Some(p)
+    };
+    let bake_ok = want_coop && q4tp_mm_coop.is_some();
+    let gemm_nt_coop = bake_ok
+        .then(|| bake_coop(COOP_NT_SRC, "bake-nt-coop", "gemm_nt_coop"))
+        .flatten();
+    let gemm_nn_coop = bake_ok
+        .then(|| bake_coop(COOP_NN_SRC, "bake-nn-coop", "gemm_nn_coop"))
         .flatten();
     let argmax_part = pipe("argmax_part");
     let gdn_step_par = pipe("gdn_step_par");
@@ -10472,6 +10479,7 @@ fn init() -> Result<Ctx, String> {
         q2tp_mm,
         q4tp_mm_coop,
         gemm_nt_coop,
+        gemm_nn_coop,
         argmax_part,
         gdn_step_par,
         gdn_step_par2,
@@ -18219,6 +18227,117 @@ fn gemm_nt_coop(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// The backward twin on the same units: dx[nb,rows] = dy[nb,cols] ·
+/// w[cols,rows] — the reduction runs over w's ROWS (its leading axis), so
+/// the B staging reads a column of w per output: four stride-`rows` loads
+/// where the forward kernel read four consecutive. Everything else —
+/// tiles, loads, the store — is the forward kernel unchanged.
+const COOP_NN_SRC: &str = r#"
+enable wgpu_cooperative_matrix;
+enable f16;
+
+struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read> wmm: array<f32>;
+@group(0) @binding(1) var<storage, read> xmm: array<f32>;
+@group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
+@group(0) @binding(3) var<uniform> pmm: MmP;
+
+const KS: u32 = 32u;
+
+var<workgroup> cm_a: array<f16, 64 * 32>;
+var<workgroup> cm_b: array<f16, 64 * 32>;
+var<workgroup> cm_c: array<f32, 64 * 64>;
+
+@compute @workgroup_size(128)
+fn gemm_nn_coop(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) tid: u32,
+                @builtin(subgroup_id) sg: u32) {
+    let cols = pmm.cols4 * 4u;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+
+    var c0: coop_mat16x16<f32, C>;
+    var c1: coop_mat16x16<f32, C>;
+    var c2: coop_mat16x16<f32, C>;
+    var c3: coop_mat16x16<f32, C>;
+
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let m = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            let dst = m * KS + k4;
+            var v = vec4<f32>(0.0);
+            if (m0 + m < pmm.nb && col0 < cols) {
+                let base = (m0 + m) * cols + col0;
+                v = vec4<f32>(xmm[base], xmm[base + 1u], xmm[base + 2u], xmm[base + 3u]);
+            }
+            cm_a[dst] = f16(v.x); cm_a[dst + 1u] = f16(v.y);
+            cm_a[dst + 2u] = f16(v.z); cm_a[dst + 3u] = f16(v.w);
+        }
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let n = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            var wv = vec4<f32>(0.0);
+            if (n0 + n < pmm.rows && col0 < cols) {
+                // w is [cols][rows] row-major here: the four reduction
+                // neighbours live a full row apart.
+                let base = col0 * pmm.rows + n0 + n;
+                let lim = cols - col0;
+                wv.x = wmm[base];
+                if (lim > 1u) { wv.y = wmm[base + pmm.rows]; }
+                if (lim > 2u) { wv.z = wmm[base + 2u * pmm.rows]; }
+                if (lim > 3u) { wv.w = wmm[base + 3u * pmm.rows]; }
+            }
+            let bd = n * KS + k4;
+            cm_b[bd] = f16(wv.x); cm_b[bd + 1u] = f16(wv.y);
+            cm_b[bd + 2u] = f16(wv.z); cm_b[bd + 3u] = f16(wv.w);
+        }
+        workgroupBarrier();
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 0u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 0u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u + 0u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 0u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u + 0u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 16u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 16u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u + 16u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 16u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u + 16u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        workgroupBarrier();
+        k0 = k0 + KS;
+    }
+    workgroupBarrier();
+    coopStoreT(c0, &cm_c[sg * 16u * 64u + 0u], 64u);
+    coopStoreT(c1, &cm_c[sg * 16u * 64u + 16u], 64u);
+    coopStoreT(c2, &cm_c[sg * 16u * 64u + 32u], 64u);
+    coopStoreT(c3, &cm_c[sg * 16u * 64u + 48u], 64u);
+    workgroupBarrier();
+    for (var t = tid; t < 64u * 64u; t = t + 128u) {
+        let m = t / 64u;
+        let n = t % 64u;
+        if (m0 + m < pmm.nb && n0 + n < pmm.rows) {
+            ymm[(m0 + m) * pmm.rows + n0 + n] = cm_c[m * 64u + n];
+        }
+    }
+}
+"#;
+
 /// Did the device come up with cooperative matrices? Read by the GEMM to
 /// pick its pipeline, and by the shader-module builder to decide whether
 /// the tensor-core source can be compiled at all.
@@ -18349,7 +18468,26 @@ fn readback(
         let Ok(data) = slice.get_mapped_range() else {
             return false;
         };
-        out.copy_from_slice(bytemuck::cast_slice(&data[..out.len() * 4]));
+        let src: &[f32] = bytemuck::cast_slice(&data[..out.len() * 4]);
+        // A mapped range is uncached host memory: one thread streams it at
+        // ~1-2 GB/s, and the bake's big planes (a 264 MB dw readback) turn
+        // that memcpy into the call's dominant cost. Split copies above a
+        // few MB across threads — read bandwidth scales nearly linearly.
+        const PAR_MIN: usize = 4 << 20;
+        if out.len() * 4 >= PAR_MIN {
+            let lanes = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(16);
+            let chunk = out.len().div_ceil(lanes);
+            std::thread::scope(|s| {
+                for (dst, sr) in out.chunks_mut(chunk).zip(src.chunks(chunk)) {
+                    s.spawn(move || dst.copy_from_slice(sr));
+                }
+            });
+        } else {
+            out.copy_from_slice(src);
+        }
     }
     staging.unmap();
     true
@@ -26503,25 +26641,7 @@ pub static DRAFT_RESERVE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// dispatch). Bit-parity is NOT claimed (GPU sum order differs); the
 /// trainer's loss landscape does not care, and the quality gate at the
 /// end is the arbiter.
-/// 64-bit FNV-1a over a float buffer, read eight bytes at a time. Used
-/// to tell "the same weight again" from "a scratch buffer refilled with
-/// a different head" — one sequential pass, against a PCIe upload.
 use crate::gpu::fp_bytes;
-
-fn fingerprint_f32(w: &[f32]) -> u64 {
-    let bytes: &[u8] = bytemuck::cast_slice(w);
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let (chunks, tail) = bytes.split_at(bytes.len() & !7);
-    for c in chunks.chunks_exact(8) {
-        h ^= u64::from_le_bytes(c.try_into().unwrap());
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    for &b in tail {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
-}
 
 pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
     if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
@@ -26552,7 +26672,13 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
     }
     let wbuf = {
         let key = (w.as_ptr() as usize, w.len());
-        let fp = fingerprint_f32(w);
+        // Sampled, not the full sweep: hashing a 2 GB vocabulary head at
+        // memory speed cost 350 ms per WARM call — five times the kernel
+        // it was guarding. Every matrix that legitimately changes at a
+        // kept address (per-head scratch, an Adam-updated master, a
+        // re-dequantized layer) changes densely, which the 4 KiB spread
+        // cannot miss.
+        let fp = fp_bytes(bytemuck::cast_slice(w));
         let mut cb = c.gemm_w_bufs.lock().unwrap();
         match cb.get(&key) {
             // Same address AND same contents: the upload already happened.
@@ -26584,31 +26710,32 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
             }
         }
     };
-    let (xbuf, ybuf, stage) = {
-        let mut sc = c.scratch.lock().unwrap();
-        let xbuf = Scratch::ensure(
-            &c.device,
-            &mut sc.bx,
-            (n * k * 4) as u64,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            "bake-x",
-        );
-        let ybuf = Scratch::ensure(
-            &c.device,
-            &mut sc.by,
-            (n * m * 4) as u64,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            "bake-y",
-        );
-        let stage = Scratch::ensure(
-            &c.device,
-            &mut sc.bst,
-            (n * m * 4) as u64,
-            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            "bake-stage",
-        );
-        (xbuf, ybuf, stage)
-    };
+    // The guard lives to the end of the call: the pooled slots are shared,
+    // and two concurrent callers interleaving dispatch and readback on the
+    // same buffers return each other's numbers (the parity test caught
+    // exactly that once cargo ran its two tests in parallel).
+    let mut sc = c.scratch.lock().unwrap();
+    let xbuf = Scratch::ensure(
+        &c.device,
+        &mut sc.bx,
+        (n * k * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "bake-x",
+    );
+    let ybuf = Scratch::ensure(
+        &c.device,
+        &mut sc.by,
+        (n * m * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "bake-y",
+    );
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.bst,
+        (n * m * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "bake-stage",
+    );
     c.queue.write_buffer(&xbuf, 0, bytemuck::cast_slice(&x[..n * k]));
     let mut enc = c
         .device
@@ -26707,45 +26834,70 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
             b
         }
     };
-    let (dyb, dxb, stage) = {
-        // Shares the forward GEMM's pooled slots — same usage flags, and
-        // the two never overlap in flight (the bake is sequential).
-        let mut sc = c.scratch.lock().unwrap();
-        let dyb = Scratch::ensure(
-            &c.device,
-            &mut sc.bx,
-            (n * m * 4) as u64,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            "bake-x",
-        );
-        let dxb = Scratch::ensure(
-            &c.device,
-            &mut sc.by,
-            (n * k * 4) as u64,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            "bake-y",
-        );
-        let stage = Scratch::ensure(
-            &c.device,
-            &mut sc.bst,
-            (n * k * 4) as u64,
-            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            "bake-stage",
-        );
-        (dyb, dxb, stage)
-    };
+    // Shares the forward GEMM's pooled slots; the guard lives to the end of
+    // the call so concurrent callers serialize instead of interleaving.
+    let mut sc = c.scratch.lock().unwrap();
+    let dyb = Scratch::ensure(
+        &c.device,
+        &mut sc.bx,
+        (n * m * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "bake-x",
+    );
+    let dxb = Scratch::ensure(
+        &c.device,
+        &mut sc.by,
+        (n * k * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "bake-y",
+    );
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.bst,
+        (n * k * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "bake-stage",
+    );
     c.queue.write_buffer(&dyb, 0, bytemuck::cast_slice(&dy[..n * m]));
-    let u = c
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&[m as u32, k as u32, 0u32, 0u32]),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bake-dx") });
-    {
+    let coop = c
+        .gemm_nn_coop
+        .as_ref()
+        .filter(|_| m % 4 == 0 && k.div_ceil(64) <= 65_535 && n.div_ceil(64) <= 65_535);
+    if let Some(pipe) = coop {
+        // MmP for the NN twin: cols4 = reduction (m) / 4, rows = dx's
+        // width (k), nb = tokens (n).
+        let u = c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[(m / 4) as u32, k as u32, n as u32, 0u32]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &wbuf),
+                bind_buf(1, &dyb),
+                bind_buf(2, &dxb),
+                bind_buf(3, &u),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((k as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
+    } else {
+        let u = c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[m as u32, k as u32, 0u32, 0u32]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &c.f32_gemm_dx.get_bind_group_layout(0),
