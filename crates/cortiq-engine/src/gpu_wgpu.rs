@@ -9093,6 +9093,31 @@ fn bt_o_lora_a2(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// The bake FFN chain's middle link, in its own module (the main module's
+/// binding slots are all taken): act[r][j] = silu(g)·u·scale[j], where g
+/// and u are the two halves of the fused gate+up GEMM's row. Runs between
+/// the two cooperative GEMMs so the intermediate plane never crosses PCIe.
+/// `stride` linearizes a 2-D dispatch — one dim overflows at n=3072.
+const BAKE_SILU_SRC: &str = r#"
+struct BsP { inter: u32, total: u32, scaled: u32, stride: u32 };
+@group(0) @binding(0) var<storage, read> bs_b : array<f32>;
+@group(0) @binding(1) var<storage, read> bs_s : array<f32>;
+@group(0) @binding(2) var<storage, read_write> bs_a : array<f32>;
+@group(0) @binding(3) var<uniform> bs_p : BsP;
+@compute @workgroup_size(256)
+fn bake_silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.y * bs_p.stride + gid.x;
+    if (i >= bs_p.total) { return; }
+    let r = i / bs_p.inter;
+    let j = i % bs_p.inter;
+    let g = bs_b[r * 2u * bs_p.inter + j];
+    let u = bs_b[r * 2u * bs_p.inter + bs_p.inter + j];
+    var a = (g / (1.0 + exp(-g))) * u;
+    if (bs_p.scaled != 0u) { a = a * bs_s[j]; }
+    bs_a[i] = a;
+}
+"#;
+
 // Split-K decode attention (its own module: the main module's at_* binding
 // slots are taken, and WGSL forbids two resource vars on one binding).
 // `gqa_attend_part` runs the flash-decoding loop over ONE ck-position chunk
@@ -9377,6 +9402,8 @@ struct Ctx {
     gemm_nt_coop: Option<wgpu::ComputePipeline>,
     /// Its backward twin (reduction over w's leading axis) for `gemm_dx_f32`.
     gemm_nn_coop: Option<wgpu::ComputePipeline>,
+    /// silu(g)·u·scale between the chain's two GEMMs (plain f32 module).
+    bake_silu: wgpu::ComputePipeline,
     argmax_part: wgpu::ComputePipeline,
     gdn_step_par: wgpu::ComputePipeline,
     gdn_step_norm: wgpu::ComputePipeline,
@@ -9656,6 +9683,9 @@ struct Scratch {
     bx: Option<(wgpu::Buffer, u64)>,
     by: Option<(wgpu::Buffer, u64)>,
     bst: Option<(wgpu::Buffer, u64)>,
+    /// The FFN chain's device-resident middle (gate+up plane, activation).
+    bb: Option<(wgpu::Buffer, u64)>,
+    ba: Option<(wgpu::Buffer, u64)>,
 }
 
 impl Scratch {
@@ -10193,6 +10223,20 @@ fn init() -> Result<Ctx, String> {
     let gemm_nn_coop = bake_ok
         .then(|| bake_coop(COOP_NN_SRC, "bake-nn-coop", "gemm_nn_coop"))
         .flatten();
+    let bake_silu = {
+        let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bake-silu"),
+            source: wgpu::ShaderSource::Wgsl(BAKE_SILU_SRC.into()),
+        });
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("bake_silu_mul"),
+            layout: None,
+            module: &m,
+            entry_point: Some("bake_silu_mul"),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
     let argmax_part = pipe("argmax_part");
     let gdn_step_par = pipe("gdn_step_par");
     let gdn_step_par2 = pipe("gdn_step_par2");
@@ -10480,6 +10524,7 @@ fn init() -> Result<Ctx, String> {
         q4tp_mm_coop,
         gemm_nt_coop,
         gemm_nn_coop,
+        bake_silu,
         argmax_part,
         gdn_step_par,
         gdn_step_par2,
@@ -18468,29 +18513,32 @@ fn readback(
         let Ok(data) = slice.get_mapped_range() else {
             return false;
         };
-        let src: &[f32] = bytemuck::cast_slice(&data[..out.len() * 4]);
-        // A mapped range is uncached host memory: one thread streams it at
-        // ~1-2 GB/s, and the bake's big planes (a 264 MB dw readback) turn
-        // that memcpy into the call's dominant cost. Split copies above a
-        // few MB across threads — read bandwidth scales nearly linearly.
-        const PAR_MIN: usize = 4 << 20;
-        if out.len() * 4 >= PAR_MIN {
-            let lanes = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-                .min(16);
-            let chunk = out.len().div_ceil(lanes);
-            std::thread::scope(|s| {
-                for (dst, sr) in out.chunks_mut(chunk).zip(src.chunks(chunk)) {
-                    s.spawn(move || dst.copy_from_slice(sr));
-                }
-            });
-        } else {
-            out.copy_from_slice(src);
-        }
+        par_copy(out, bytemuck::cast_slice(&data[..out.len() * 4]));
     }
     staging.unmap();
     true
+}
+
+/// A mapped range is uncached host memory: one thread streams it at
+/// ~1-2 GB/s, and the bake's big planes (a 264 MB dw readback) turn that
+/// memcpy into the call's dominant cost. Split copies above a few MB
+/// across threads — read bandwidth scales nearly linearly.
+fn par_copy(out: &mut [f32], src: &[f32]) {
+    const PAR_MIN: usize = 4 << 20;
+    if out.len() * 4 >= PAR_MIN {
+        let lanes = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(16);
+        let chunk = out.len().div_ceil(lanes);
+        std::thread::scope(|s| {
+            for (dst, sr) in out.chunks_mut(chunk).zip(src.chunks(chunk)) {
+                s.spawn(move || dst.copy_from_slice(sr));
+            }
+        });
+    } else {
+        out.copy_from_slice(src);
+    }
 }
 
 fn bind_buf(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
@@ -26643,6 +26691,45 @@ pub static DRAFT_RESERVE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// end is the arbiter.
 use crate::gpu::fp_bytes;
 
+/// One bake-GPU op at a time: gemm_nt / gemm_dx / the FFN chain share the
+/// pooled slots (bx/by/bst/bb/ba), and two callers interleaving dispatch
+/// and readback on the same buffers return each other's numbers. The bake
+/// is sequential in practice; this makes the API safe rather than lucky.
+static BAKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A bake weight, device-resident and content-checked: the sampled
+/// fingerprint tells "the same matrix again" from "a scratch buffer
+/// refilled with a different head" at ~1 µs, and a mismatch refreshes the
+/// SAME buffer in place. First touch (or refresh) notes cold so the probe
+/// bills only steady-state calls.
+fn bake_weight(c: &Ctx, w: &[f32], label: &'static str) -> wgpu::Buffer {
+    let key = (w.as_ptr() as usize, w.len());
+    let fp = fp_bytes(bytemuck::cast_slice(w));
+    let mut cb = c.gemm_w_bufs.lock().unwrap();
+    match cb.get(&key) {
+        Some((b, f)) if *f == fp => b.clone(),
+        Some((b, _)) => {
+            crate::gpu::probe_note_cold();
+            let b = b.clone();
+            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(w));
+            cb.insert(key, (b.clone(), fp));
+            b
+        }
+        None => {
+            crate::gpu::probe_note_cold();
+            let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (w.len() * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(w));
+            cb.insert(key, (b.clone(), fp));
+            b
+        }
+    }
+}
+
 pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
     if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
         return false;
@@ -26670,50 +26757,8 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
     if x.len() < n * k || w.len() < m * k || y.len() < n * m {
         return false;
     }
-    let wbuf = {
-        let key = (w.as_ptr() as usize, w.len());
-        // Sampled, not the full sweep: hashing a 2 GB vocabulary head at
-        // memory speed cost 350 ms per WARM call — five times the kernel
-        // it was guarding. Every matrix that legitimately changes at a
-        // kept address (per-head scratch, an Adam-updated master, a
-        // re-dequantized layer) changes densely, which the 4 KiB spread
-        // cannot miss.
-        let fp = fp_bytes(bytemuck::cast_slice(w));
-        let mut cb = c.gemm_w_bufs.lock().unwrap();
-        match cb.get(&key) {
-            // Same address AND same contents: the upload already happened.
-            Some((b, f)) if *f == fp => b.clone(),
-            // Same address, different matrix — a reused scratch buffer.
-            // Refill the device copy rather than hand back the last one.
-            Some((b, _)) => {
-                crate::gpu::probe_note_cold();
-                let b = b.clone();
-                c.queue.write_buffer(&b, 0, bytemuck::cast_slice(w));
-                cb.insert(key, (b.clone(), fp));
-                b
-            }
-            None => {
-                // First touch pays the PCIe upload; the probe must not
-                // bill it to the steady state, or a 264 MB weight makes
-                // the tensor-core arm look slower than 384 CPU cores and
-                // the whole bake runs scalar forever.
-                crate::gpu::probe_note_cold();
-                let b = c.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("bake-w"),
-                    size: (w.len() * 4) as u64,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                c.queue.write_buffer(&b, 0, bytemuck::cast_slice(w));
-                cb.insert(key, (b.clone(), fp));
-                b
-            }
-        }
-    };
-    // The guard lives to the end of the call: the pooled slots are shared,
-    // and two concurrent callers interleaving dispatch and readback on the
-    // same buffers return each other's numbers (the parity test caught
-    // exactly that once cargo ran its two tests in parallel).
+    let _bake = BAKE_LOCK.lock().unwrap();
+    let wbuf = bake_weight(c, w, "bake-w");
     let mut sc = c.scratch.lock().unwrap();
     let xbuf = Scratch::ensure(
         &c.device,
@@ -26736,6 +26781,7 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "bake-stage",
     );
+    drop(sc);
     c.queue.write_buffer(&xbuf, 0, bytemuck::cast_slice(&x[..n * k]));
     let mut enc = c
         .device
@@ -26834,8 +26880,8 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
             b
         }
     };
-    // Shares the forward GEMM's pooled slots; the guard lives to the end of
-    // the call so concurrent callers serialize instead of interleaving.
+    let _bake = BAKE_LOCK.lock().unwrap();
+    // Shares the forward GEMM's pooled slots under the same bake lock.
     let mut sc = c.scratch.lock().unwrap();
     let dyb = Scratch::ensure(
         &c.device,
@@ -26858,6 +26904,7 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "bake-stage",
     );
+    drop(sc);
     c.queue.write_buffer(&dyb, 0, bytemuck::cast_slice(&dy[..n * m]));
     let mut enc = c
         .device
@@ -26915,6 +26962,203 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
     }
     let bytes = (n * k * 4) as u64;
     readback(c, enc, &dxb, &stage, bytes, &mut dx[..n * k])
+}
+
+/// The bake's frozen FFN as ONE device chain: both = n2·guᵀ, act =
+/// silu(g)·u·(scale), ffn = act·downᵀ — one submit, one map. The gate+up
+/// plane (n×2·inter, tens of MB) stops crossing PCIe at all on eval calls
+/// — most of a bake — and a training call reads it back beside ffn in the
+/// same map for the backward pass. Numerics are the tensor-core GEMM's
+/// (f16 operands, f32 accumulator) with silu in plain f32 on device.
+/// Returns false untouched wherever the cooperative pipeline is absent or
+/// a shape steps outside the tiles — the caller keeps its scalar path.
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_chain_f32(
+    n2: &[f32],
+    gu: &[f32],
+    down: &[f32],
+    scale: Option<&[f32]>,
+    both_out: Option<&mut [f32]>,
+    ffn: &mut [f32],
+    n: usize,
+    hsz: usize,
+    inter: usize,
+) -> bool {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
+        return false;
+    }
+    let Some(c) = ctx() else { return false };
+    let Some(nt) = c.gemm_nt_coop.as_ref() else {
+        return false;
+    };
+    if hsz % 4 != 0 || inter % 4 != 0 || n * hsz * 2 * inter < (1 << 22) {
+        return false;
+    }
+    if (2 * inter).div_ceil(64) > 65_535 || n.div_ceil(64) > 65_535 || hsz.div_ceil(64) > 65_535 {
+        return false;
+    }
+    if n2.len() < n * hsz
+        || gu.len() < 2 * inter * hsz
+        || down.len() < hsz * inter
+        || ffn.len() < n * hsz
+        || scale.is_some_and(|s| s.len() < inter)
+        || both_out.as_ref().is_some_and(|b| b.len() < n * 2 * inter)
+    {
+        return false;
+    }
+    let _bake = BAKE_LOCK.lock().unwrap();
+    let wgu = bake_weight(c, gu, "bake-gu");
+    let wdn = bake_weight(c, down, "bake-dn");
+    let ffn_bytes = (n * hsz * 4) as u64;
+    let both_bytes = (n * 2 * inter * 4) as u64;
+    // ffn first, both after — the second slice starts 16-aligned.
+    let off = ffn_bytes.div_ceil(16) * 16;
+    let stage_need = if both_out.is_some() { off + both_bytes } else { ffn_bytes };
+    let mut sc = c.scratch.lock().unwrap();
+    let xbuf = Scratch::ensure(
+        &c.device,
+        &mut sc.bx,
+        (n * hsz * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "bake-x",
+    );
+    let both = Scratch::ensure(
+        &c.device,
+        &mut sc.bb,
+        both_bytes,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "bake-both",
+    );
+    let act = Scratch::ensure(
+        &c.device,
+        &mut sc.ba,
+        (n * inter * 4) as u64,
+        wgpu::BufferUsages::STORAGE,
+        "bake-act",
+    );
+    let ybuf = Scratch::ensure(
+        &c.device,
+        &mut sc.by,
+        ffn_bytes,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "bake-y",
+    );
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.bst,
+        stage_need,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "bake-stage",
+    );
+    drop(sc);
+    c.queue.write_buffer(&xbuf, 0, bytemuck::cast_slice(&n2[..n * hsz]));
+    // The mask gate rides a tiny upload; a static zero word keeps the
+    // binding well-formed when no scale is active.
+    static NO_SCALE: [u8; 4] = [0; 4];
+    let sbuf = match scale {
+        Some(s) => const_buf(c, bytemuck::cast_slice(&s[..inter])),
+        None => const_buf(c, &NO_SCALE),
+    };
+    let uni = |v: [u32; 4]| {
+        c.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&v),
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
+    };
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bake-ffn") });
+    {
+        let u1 = uni([(hsz / 4) as u32, (2 * inter) as u32, n as u32, 0]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &nt.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &wgu),
+                bind_buf(1, &xbuf),
+                bind_buf(2, &both),
+                bind_buf(3, &u1),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(nt);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((2 * inter as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
+    }
+    {
+        let total = (n * inter) as u32;
+        let wgs = total.div_ceil(256);
+        let gx = wgs.min(32_768);
+        let gy = wgs.div_ceil(32_768);
+        let u2 = uni([inter as u32, total, scale.is_some() as u32, gx * 256]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.bake_silu.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &both),
+                bind_buf(1, &sbuf),
+                bind_buf(2, &act),
+                bind_buf(3, &u2),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.bake_silu);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(gx, gy, 1);
+    }
+    {
+        let u3 = uni([(inter / 4) as u32, hsz as u32, n as u32, 0]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &nt.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &wdn),
+                bind_buf(1, &act),
+                bind_buf(2, &ybuf),
+                bind_buf(3, &u3),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(nt);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((hsz as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
+    }
+    enc.copy_buffer_to_buffer(&ybuf, 0, &stage, 0, ffn_bytes);
+    if both_out.is_some() {
+        enc.copy_buffer_to_buffer(&both, 0, &stage, off, both_bytes);
+    }
+    submit(c, enc.finish());
+    let slice = stage.slice(..stage_need);
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d2 = done.clone();
+    slice.map_async(wgpu::MapMode::Read, move |_| {
+        d2.store(true, std::sync::atomic::Ordering::Release);
+    });
+    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return false;
+    }
+    if !done.load(std::sync::atomic::Ordering::Acquire) {
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+    {
+        let Ok(data) = slice.get_mapped_range() else {
+            return false;
+        };
+        par_copy(
+            &mut ffn[..n * hsz],
+            bytemuck::cast_slice(&data[..ffn_bytes as usize]),
+        );
+        if let Some(bo) = both_out {
+            par_copy(
+                &mut bo[..n * 2 * inter],
+                bytemuck::cast_slice(&data[off as usize..(off + both_bytes) as usize]),
+            );
+        }
+    }
+    stage.unmap();
+    true
 }
 
 /// VAE conv2d on the card: same padding, stride 1, direct (no im2col).

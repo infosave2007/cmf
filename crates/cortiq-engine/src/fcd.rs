@@ -1007,37 +1007,74 @@ impl FcdModel {
         let inter = l.inter;
         let mut gpre = vec![0f32; n * inter];
         let mut upre = vec![0f32; n * inter];
-        if let Some(gu) = wts.gu {
-            // One submit; split back so everything downstream is
-            // byte-identical to the two-call path.
-            let mut both = vec![0f32; n * 2 * inter];
-            ops::gemm_nt(&n2, gu, &mut both, n, hsz, 2 * inter, pool);
-            for r in 0..n {
-                let row = &both[r * 2 * inter..(r + 1) * 2 * inter];
-                gpre[r * inter..(r + 1) * inter].copy_from_slice(&row[..inter]);
-                upre[r * inter..(r + 1) * inter].copy_from_slice(&row[inter..]);
-            }
-        } else {
-            ops::gemm_nt(&n2, wts.gate, &mut gpre, n, hsz, inter, pool);
-            ops::gemm_nt(&n2, wts.up, &mut upre, n, hsz, inter, pool);
-        }
         let mut act = vec![0f32; n * inter];
-        for i in 0..n * inter {
-            act[i] = ops::silu(gpre[i]) * upre[i];
-        }
         let mut ffn = vec![0f32; n * hsz];
-        match ffn_scale {
-            Some(g) => {
-                debug_assert_eq!(g.len(), inter);
-                let mut act2 = act.clone();
-                for r in 0..n {
-                    for (a, &gv) in act2[r * inter..(r + 1) * inter].iter_mut().zip(g) {
-                        *a *= gv;
+        // The frozen fused-gu FFN rides the whole chain on the device when
+        // the tensor-core arm is up: one submit, and the gate+up plane
+        // only crosses PCIe when the backward pass will need it. An eval
+        // call moves three matrices and reads back one.
+        let mut fused = false;
+        #[cfg(feature = "gpu")]
+        if let Some(gu) = wts.gu {
+            if crate::gpu::enabled_here() {
+                let mut both = want_acts.then(|| vec![0f32; n * 2 * inter]);
+                if crate::gpu_wgpu::ffn_chain_f32(
+                    &n2,
+                    gu,
+                    wts.down,
+                    ffn_scale,
+                    both.as_deref_mut(),
+                    &mut ffn,
+                    n,
+                    hsz,
+                    inter,
+                ) {
+                    fused = true;
+                    if let Some(b) = &both {
+                        for r in 0..n {
+                            let row = &b[r * 2 * inter..(r + 1) * 2 * inter];
+                            gpre[r * inter..(r + 1) * inter].copy_from_slice(&row[..inter]);
+                            upre[r * inter..(r + 1) * inter].copy_from_slice(&row[inter..]);
+                        }
+                        // PRE-scale, as the mask backward expects.
+                        for i in 0..n * inter {
+                            act[i] = ops::silu(gpre[i]) * upre[i];
+                        }
                     }
                 }
-                ops::gemm_nt(&act2, wts.down, &mut ffn, n, inter, hsz, pool);
             }
-            None => ops::gemm_nt(&act, wts.down, &mut ffn, n, inter, hsz, pool),
+        }
+        if !fused {
+            if let Some(gu) = wts.gu {
+                // One submit; split back so everything downstream is
+                // byte-identical to the two-call path.
+                let mut both = vec![0f32; n * 2 * inter];
+                ops::gemm_nt(&n2, gu, &mut both, n, hsz, 2 * inter, pool);
+                for r in 0..n {
+                    let row = &both[r * 2 * inter..(r + 1) * 2 * inter];
+                    gpre[r * inter..(r + 1) * inter].copy_from_slice(&row[..inter]);
+                    upre[r * inter..(r + 1) * inter].copy_from_slice(&row[inter..]);
+                }
+            } else {
+                ops::gemm_nt(&n2, wts.gate, &mut gpre, n, hsz, inter, pool);
+                ops::gemm_nt(&n2, wts.up, &mut upre, n, hsz, inter, pool);
+            }
+            for i in 0..n * inter {
+                act[i] = ops::silu(gpre[i]) * upre[i];
+            }
+            match ffn_scale {
+                Some(g) => {
+                    debug_assert_eq!(g.len(), inter);
+                    let mut act2 = act.clone();
+                    for r in 0..n {
+                        for (a, &gv) in act2[r * inter..(r + 1) * inter].iter_mut().zip(g) {
+                            *a *= gv;
+                        }
+                    }
+                    ops::gemm_nt(&act2, wts.down, &mut ffn, n, inter, hsz, pool);
+                }
+                None => ops::gemm_nt(&act, wts.down, &mut ffn, n, inter, hsz, pool),
+            }
         }
         let mut h2 = h1.clone();
         for (a, &x) in h2.iter_mut().zip(&ffn) {
