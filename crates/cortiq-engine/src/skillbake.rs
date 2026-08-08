@@ -565,7 +565,13 @@ pub fn skill_bake(
     // Track the highest-sparsity checkpoint as fallback.
     let mut max_sp: (f64, Option<Vec<Vec<f32>>>, f64) = (f64::MAX, None, 0.0);
     let mut prev_alive: Option<Vec<Vec<bool>>> = None;
+    // In-process phase timers: this loop was estimated three different
+    // ways and every estimate came out under a fifth of the measured
+    // step time. Measure, then optimize the top line, not the guess.
+    let mut acc_chunk = 0f64;
+    let mut acc_adam = 0f64;
     for step in 0..hy.steps_a {
+        let t_step = std::time::Instant::now();
         let chunk = &calib[step % calib.len()];
         let mut dmask: Vec<Vec<f64>> = vec![vec![0.0; inter]; vn];
         let mut dffn: Vec<Option<(Vec<f64>, Vec<f64>, Vec<f64>)>> = vec![None; nl];
@@ -597,8 +603,11 @@ pub fn skill_bake(
         // gradient, so the step needs no visit normalisation here — that
         // scale now belongs to Phase B alone, where the FFN weights ARE
         // shared across visits.
+        let t_chunk = t_step.elapsed().as_secs_f64();
         let mut params: Vec<&mut [f32]> = logits.iter_mut().map(|v| v.as_mut_slice()).collect();
         adam_a.step(&mut params, &dmask, 1.0);
+        acc_chunk += t_chunk;
+        acc_adam += t_step.elapsed().as_secs_f64() - t_chunk;
         if (step + 1) % hy.eval_every == 0 {
             l1 += l1_step_eff;
             let pass = Pass {
@@ -656,7 +665,7 @@ pub fn skill_bake(
                 best = (hp, Some(logits.clone()), sp);
             }
             log(&format!(
-                "  [A] step {}: L1={l1:.3} pruned={:.2}% hard-PPL={hp:.3} (bottom {}@{:.2}%)",
+                "  [A] step {}: L1={l1:.3} pruned={:.2}% hard-PPL={hp:.3} (bottom {}@{:.2}%) [fwd+bwd {:.1}s, adam {:.2}s per step]",
                 step + 1,
                 sp * 100.0,
                 if best.0 == f64::MAX {
@@ -664,7 +673,9 @@ pub fn skill_bake(
                 } else {
                     format!("{:.3}", best.0)
                 },
-                best.2 * 100.0
+                best.2 * 100.0,
+                acc_chunk / (step + 1) as f64,
+                acc_adam / (step + 1) as f64
             ));
         }
     }
