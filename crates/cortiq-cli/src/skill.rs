@@ -771,6 +771,7 @@ pub fn run_skill_bake(
     fcd_layers: usize,
     chunk: usize,
     held: usize,
+    calib_chunks: usize,
     target_sparsity: f64,
     l1_aggression: f64,
     ffn_align: usize,
@@ -783,7 +784,7 @@ pub fn run_skill_bake(
         .context("model has no embedded tokenizer")?;
     let tok = cortiq_engine::tokenizer::Tokenizer::from_bytes(&vocab_bytes)
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-    let chunks = corpus_chunks(&tok, files, chunk, 112 + held)?;
+    let chunks = corpus_chunks(&tok, files, chunk, calib_chunks + held)?;
     println!(
         "bake: {} calib + {held} held chunks of {chunk} tokens | FCD last {fcd_layers} layer(s)",
         chunks.len().saturating_sub(held)
