@@ -72,3 +72,55 @@ fn bake_gemm_matches_cpu_reference_on_tile_edges() {
         eprintln!("no GPU arm engaged anywhere — skipped");
     }
 }
+
+fn cpu_ref_nn(dy: &[f32], w: &[f32], n: usize, k: usize, m: usize) -> Vec<f32> {
+    let mut dx = vec![0f32; n * k];
+    for i in 0..n {
+        for kk in 0..k {
+            let mut acc = 0f64;
+            for j in 0..m {
+                acc += dy[i * m + j] as f64 * w[j * k + kk] as f64;
+            }
+            dx[i * k + kk] = acc as f32;
+        }
+    }
+    dx
+}
+
+/// The backward twin reads w down its columns — the staging pattern the
+/// forward kernel never exercises, and the one a stride bug would hide in.
+#[test]
+fn bake_gemm_dx_matches_cpu_reference() {
+    unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+    let shapes: [(usize, usize, usize); 3] = [(64, 320, 512), (63, 321, 512), (256, 1024, 768)];
+    let mut ran = 0;
+    for &(n, k, m) in &shapes {
+        let dy: Vec<f32> = (0..n * m)
+            .map(|i| ((i * 31 + 7) % 101) as f32 / 101.0 - 0.5)
+            .collect();
+        let w: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 23 + 5) % 89) as f32 / 89.0 - 0.5)
+            .collect();
+        let mut dx = vec![0f32; n * k];
+        if !cortiq_engine::gpu_wgpu::gemm_dx_f32(&dy, &w, &mut dx, n, k, m) {
+            eprintln!("dx ({n},{k},{m}): the GPU arm declined — skipping");
+            continue;
+        }
+        ran += 1;
+        let r = cpu_ref_nn(&dy, &w, n, k, m);
+        let scale = r.iter().fold(0f32, |a, v| a.max(v.abs()));
+        let worst = dx
+            .iter()
+            .zip(&r)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            worst <= 1e-2 * scale.max(1.0),
+            "dx ({n},{k},{m}): worst |Δ| {worst} (scale {scale})"
+        );
+        println!("dx ({n},{k},{m}): worst |Δ| {worst:.2e} against scale {scale:.2}");
+    }
+    if ran == 0 {
+        eprintln!("no GPU arm engaged for dx — skipped");
+    }
+}
