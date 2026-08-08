@@ -224,6 +224,8 @@ impl Pass<'_> {
                 gate: g,
                 up: u,
                 down: d,
+                // Trained copies move every Adam step — no prebuilt concat.
+                gu: None,
             },
             None => LnFfn {
                 iln: &l.iln,
@@ -231,6 +233,7 @@ impl Pass<'_> {
                 gate: &l.gate,
                 up: &l.up,
                 down: &l.down,
+                gu: Some(&l.gu),
             },
         }
     }
