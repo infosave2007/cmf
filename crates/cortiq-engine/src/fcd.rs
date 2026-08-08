@@ -345,11 +345,122 @@ fn deq(model: &CmfModel, name: &str) -> Result<Vec<f32>, String> {
     Ok(out)
 }
 
+
+
+/// Physical RAM total, for the hard replica ceiling.
+fn physical_total_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        return String::from_utf8_lossy(&out.stdout).trim().parse().ok();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mem = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: u64 = mem
+            .lines()
+            .find(|l| l.starts_with("MemTotal:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        return Some(kb * 1024);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// AVAILABLE RAM in bytes, best effort — used only to refuse a bake
+/// whose f32 replica would swap instead of run.
+fn available_ram_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        // free% × total from the same counters the memory-pressure
+        // subsystem uses; hw.memsize alone lied by whatever the other
+        // apps were holding.
+        let total: u64 = {
+            let out = std::process::Command::new("sysctl")
+                .args(["-n", "hw.memsize"])
+                .output()
+                .ok()?;
+            String::from_utf8_lossy(&out.stdout).trim().parse().ok()?
+        };
+        let out = std::process::Command::new("memory_pressure")
+            .arg("-Q")
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let pct: u64 = text
+            .lines()
+            .find(|l| l.contains("free percentage"))?
+            .split(':')
+            .nth(1)?
+            .trim()
+            .trim_end_matches('%')
+            .parse()
+            .ok()?;
+        return Some(total / 100 * pct);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mem = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: u64 = mem
+            .lines()
+            .find(|l| l.starts_with("MemAvailable:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        return Some(kb * 1024);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 impl FcdModel {
     /// Dequantize a model into the f32 training replica. Refuses what
     /// the backward cannot honestly differentiate yet (loud, not silent).
     pub fn from_cmf(model: &CmfModel, o1: &O1Cfg) -> Result<Self, String> {
         let arch = model.arch().clone();
+        // The replica dequantizes every weight to f32: params × 4 bytes.
+        // On a machine without that much PHYSICAL memory the load does
+        // not fail — it swaps, and a 4 B model turned a 24 GB laptop
+        // into 27 GB of swap before printing a single line. Refuse
+        // loudly instead, and say what would fit. CMF_BAKE_FORCE=1
+        // overrides for people who know their swap budget.
+        let need = model.total_param_count() as u64 * 4;
+        if std::env::var("CMF_BAKE_FORCE").as_deref() != Ok("1") {
+            // AVAILABLE memory, not total: the first version compared
+            // against physical RAM, passed on a 24 GB machine whose apps
+            // already held 10, and the machine swapped for ten minutes
+            // anyway. What matters is what is free to take right now.
+            // Two ceilings, both required. Available memory catches a
+            // busy machine — but on a machine that ALREADY swapped,
+            // "free" reads high precisely because everything was paged
+            // out, so a hard cap against physical total (60%) backstops
+            // it: a replica bigger than that cannot coexist with any OS.
+            let total_cap = physical_total_bytes().map(|t| t / 5 * 3);
+            let avail_cap = available_ram_bytes().map(|a| a - a / 10);
+            let budget = match (total_cap, avail_cap) {
+                (Some(t), Some(a)) => Some(t.min(a)),
+                (x, y) => x.or(y),
+            };
+            if let Some(budget) = budget {
+                if need > budget {
+                    return Err(format!(
+                        "skill bake needs ~{:.1} GB for the f32 training replica; this \
+                         machine's safe budget is {:.1} GB. It would swap, not run. Bake \
+                         on a bigger machine, or set CMF_BAKE_FORCE=1 to try anyway. (A \
+                         quantized-forward bake that removes this wall is on the roadmap.)",
+                        need as f64 / 1e9,
+                        budget as f64 / 1e9,
+                    ));
+                }
+            }
+        }
         if arch.hidden_act != "silu" {
             return Err(format!(
                 "fcd/skill-bake: hidden_act '{}' not supported yet (SiLU only)",
