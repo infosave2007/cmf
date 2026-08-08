@@ -57,6 +57,10 @@ pub struct StreamDelta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Tool calls arrive as one aggregated delta right before the
+    /// finish chunk — the shape every OpenAI client accumulates anyway.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
 }
 
 impl ChatStream {
@@ -120,6 +124,33 @@ impl Stream for SseStream {
 }
 
 /// A content-delta chunk (built synchronously from the generation thread).
+
+/// One delta carrying the aggregated tool calls, indexed for clients
+/// that merge by `index`.
+pub fn tool_calls_chunk(
+    id: &str,
+    model: &str,
+    calls: serde_json::Value,
+    created: u64,
+) -> StreamChunk {
+    StreamChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model: model.to_string(),
+        choices: vec![StreamChoice {
+            index: 0,
+            delta: StreamDelta {
+                role: None,
+                content: None,
+                tool_calls: Some(calls),
+            },
+            finish_reason: None,
+        }],
+        usage: None,
+    }
+}
+
 pub fn token_chunk(id: &str, model: &str, token: &str, created: u64) -> StreamChunk {
     StreamChunk {
         id: id.to_string(),
@@ -131,6 +162,7 @@ pub fn token_chunk(id: &str, model: &str, token: &str, created: u64) -> StreamCh
             delta: StreamDelta {
                 role: None,
                 content: Some(token.to_string()),
+                tool_calls: None,
             },
             finish_reason: None,
         }],
@@ -173,6 +205,7 @@ pub fn finish_chunk(id: &str, model: &str, reason: &str, created: u64) -> Stream
             delta: StreamDelta {
                 role: None,
                 content: None,
+                tool_calls: None,
             },
             finish_reason: Some(reason.to_string()),
         }],

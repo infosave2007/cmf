@@ -48,7 +48,10 @@ bytemuck = { version = "1", features = ["derive"] }
 fancy-regex = "0.14"
 unicode-normalization = "0.1"
 # Chat template rendering (Jinja, HF-compatible)
-minijinja = { version = "2", features = ["loop_controls"] }
+# json: the `tojson` filter every tools-capable chat template calls
+# on its function declarations — without it the tools branch errors and
+# the renderer silently fell back to a toolless prompt.
+minijinja = { version = "2", features = ["loop_controls", "json"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 base64 = "0.22"
 # CLI
