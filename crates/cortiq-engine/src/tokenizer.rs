@@ -810,7 +810,14 @@ impl Tokenizer {
         enable_thinking: Option<bool>,
     ) -> Option<String> {
         let tpl = self.chat_template.as_ref()?;
-        self.render_template_json(tpl, messages, tools, enable_thinking).ok()
+        match self.render_template_json(tpl, messages, tools, enable_thinking) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::error!("chat template render (json): {e:#}");
+                eprintln!("chat template render (json): {e:#}");
+                None
+            }
+        }
     }
 
     fn render_template_json(
@@ -824,6 +831,30 @@ impl Tokenizer {
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        // `visible_text` is a helper transformers injects into its
+        // template env (it flattens multimodal content to its text).
+        // Nanbeige's template calls it unconditionally in the tools
+        // branch; without it the render errors and the fallback quietly
+        // serves a TOOLLESS prompt.
+        env.add_function("visible_text", |v: minijinja::Value| -> String {
+            if let Some(s) = v.as_str() {
+                return s.to_string();
+            }
+            if let Ok(iter) = v.try_iter() {
+                let mut out = Vec::new();
+                for item in iter {
+                    if let Some(s) = item.as_str() {
+                        out.push(s.to_string());
+                    } else if let Ok(t) = item.get_attr("text") {
+                        if let Some(s) = t.as_str() {
+                            out.push(s.to_string());
+                        }
+                    }
+                }
+                return out.join("\n");
+            }
+            String::new()
+        });
         env.add_template("chat", tpl)?;
         let msgs: Vec<minijinja::Value> = messages
             .iter()
@@ -835,18 +866,26 @@ impl Tokenizer {
         let tpl = env.get_template("chat")?;
         // Three axes, each present only when meaningful: templates guard
         // with `is defined`, and an explicit null flips those guards.
+        // `tool_call_format` picks the grammar in two-mode templates
+        // (Nanbeige): undefined falls into their XML branch. The JSON
+        // grammar is the one every parser downstream speaks, so choose
+        // it explicitly; templates without the knob never read it.
         let rendered = match (tools_v, enable_thinking) {
             (Some(ts), Some(v)) => tpl.render(minijinja::context! {
                 messages => msgs, tools => ts, add_generation_prompt => true, enable_thinking => v,
+                tool_call_format => "json",
             })?,
             (Some(ts), None) => tpl.render(minijinja::context! {
                 messages => msgs, tools => ts, add_generation_prompt => true,
+                tool_call_format => "json",
             })?,
             (None, Some(v)) => tpl.render(minijinja::context! {
                 messages => msgs, add_generation_prompt => true, enable_thinking => v,
+                tool_call_format => "json",
             })?,
             (None, None) => tpl.render(minijinja::context! {
                 messages => msgs, add_generation_prompt => true,
+                tool_call_format => "json",
             })?,
         };
         Ok(rendered)
