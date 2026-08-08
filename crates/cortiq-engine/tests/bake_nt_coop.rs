@@ -124,3 +124,94 @@ fn bake_gemm_dx_matches_cpu_reference() {
         eprintln!("no GPU arm engaged for dx — skipped");
     }
 }
+
+/// The whole frozen-FFN chain against its own composition on the host:
+/// gate+up GEMM → silu·mul(·scale) → down GEMM, with and without the
+/// mask gate, with and without the training readback of the middle plane.
+#[test]
+fn bake_ffn_chain_matches_host_composition() {
+    unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+    let (n, hsz, inter) = (64usize, 256usize, 512usize);
+    let n2: Vec<f32> = (0..n * hsz)
+        .map(|i| ((i * 29 + 13) % 103) as f32 / 103.0 - 0.5)
+        .collect();
+    let gu: Vec<f32> = (0..2 * inter * hsz)
+        .map(|i| ((i * 17 + 41) % 97) as f32 / 97.0 - 0.5)
+        .collect();
+    let down: Vec<f32> = (0..hsz * inter)
+        .map(|i| ((i * 23 + 5) % 89) as f32 / 89.0 - 0.5)
+        .collect();
+    let scale: Vec<f32> = (0..inter).map(|j| 0.5 + (j % 7) as f32 * 0.1).collect();
+    let silu = |x: f32| x / (1.0 + (-x).exp());
+    for (sc, want_both) in [(None, false), (Some(&scale[..]), true)] {
+        let mut ffn = vec![0f32; n * hsz];
+        let mut both = vec![0f32; n * 2 * inter];
+        let got = cortiq_engine::gpu_wgpu::ffn_chain_f32(
+            &n2,
+            &gu,
+            &down,
+            sc,
+            want_both.then_some(&mut both[..]),
+            &mut ffn,
+            n,
+            hsz,
+            inter,
+        );
+        if !got {
+            eprintln!("chain declined (no cooperative arm here) — skipped");
+            return;
+        }
+        // Host composition in f64-free f32, the reference the scalar
+        // path computes.
+        let mut r_both = vec![0f32; n * 2 * inter];
+        for i in 0..n {
+            for j in 0..2 * inter {
+                let mut a = 0f64;
+                for p in 0..hsz {
+                    a += n2[i * hsz + p] as f64 * gu[j * hsz + p] as f64;
+                }
+                r_both[i * 2 * inter + j] = a as f32;
+            }
+        }
+        let mut r_ffn = vec![0f32; n * hsz];
+        for i in 0..n {
+            for o in 0..hsz {
+                let mut a = 0f64;
+                for j in 0..inter {
+                    let g = r_both[i * 2 * inter + j];
+                    let u = r_both[i * 2 * inter + inter + j];
+                    let mut v = silu(g) * u;
+                    if let Some(s) = sc {
+                        v *= s[j];
+                    }
+                    a += v as f64 * down[o * inter + j] as f64;
+                }
+                r_ffn[i * hsz + o] = a as f32;
+            }
+        }
+        let fscale = r_ffn.iter().fold(0f32, |a, v| a.max(v.abs()));
+        let worst = ffn
+            .iter()
+            .zip(&r_ffn)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            worst <= 2e-2 * fscale.max(1.0),
+            "chain(scale={}): worst |Δ| {worst} (scale {fscale})",
+            sc.is_some()
+        );
+        if want_both {
+            let bscale = r_both.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let bworst = both
+                .iter()
+                .zip(&r_both)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                bworst <= 1e-2 * bscale.max(1.0),
+                "chain middle plane: worst |Δ| {bworst} (scale {bscale})"
+            );
+        }
+        println!("chain(scale={}): ffn worst |Δ| {worst:.2e}", sc.is_some());
+    }
+}
