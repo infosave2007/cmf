@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The bake's GEMMs run on tensor cores** (`gemm_nt_coop` /
+  `gemm_nn_coop`, wgpu cooperative matrices — f16 operands, f32
+  accumulator, parity vs CPU reference ~1e-3). The vocabulary head
+  (166k rows) reaches the card for the first time; the probe judges
+  warm calls only (weight uploads are one-off, not steady state);
+  activation/staging buffers are pooled; mapped readbacks above 4 MB
+  copy in parallel; the weight cache's content check is sampled.
+  Measured on a rented RTX 5090, 3-step phase A: 455 s (CPU fallback)
+  → 200 s, GEMM 233 → 44 ms/call, backward 52.5 → 12.8 s — with
+  baseline/mask/FCD pinned at 4.187 and the runtime gate at +0.0%
+  at every step. Devices without cooperative matrices (Apple via
+  wgpu) keep the scalar arm bit-for-bit.
+
 ### Fixed
 - **A GPU cache hit by host address now proves its bytes.** Both
   backends parked constant vectors (norms, row scales, sinks, bake
