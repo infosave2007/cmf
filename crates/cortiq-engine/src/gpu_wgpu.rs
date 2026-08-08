@@ -9666,7 +9666,11 @@ struct Ctx {
     /// mapping; this is the same mistake one file over.) The
     /// fingerprint is a sequential read of a buffer we would otherwise
     /// push over PCIe, so a genuinely stable weight still uploads once.
-    gemm_w_bufs: Mutex<HashMap<(usize, usize), (wgpu::Buffer, u64)>>,
+    /// `None` buffer = a fingerprint on probation: seen once, not yet
+    /// proven to recur. See `bake_weight` — adopting every matrix on
+    /// sight let phase B's per-step activations grow this cache past the
+    /// card.
+    gemm_w_bufs: Mutex<HashMap<(usize, usize), (Option<wgpu::Buffer>, u64)>>,
     /// Per-role scratch for the fused DiT block, kept between calls. The
     /// block used to allocate its sixteen intermediates fresh every time —
     /// three of them 77 MB at 512x512 — which is ~300 MB of driver
@@ -26732,35 +26736,57 @@ use crate::gpu::fp_bytes;
 /// is sequential in practice; this makes the API safe rather than lucky.
 static BAKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// A bake weight, device-resident and content-checked: the sampled
-/// fingerprint tells "the same matrix again" from "a scratch buffer
-/// refilled with a different head" at ~1 µs, and a mismatch refreshes the
-/// SAME buffer in place. First touch (or refresh) notes cold so the probe
-/// bills only steady-state calls.
+/// A bake weight on the card — but RESIDENT only once it has proven it
+/// recurs. Phase B hands this function a fresh activation matrix per dw
+/// step; a cache that adopts everything it sees grows by 250 MB a step
+/// and killed a 90-step phase B at step ~40 with a silent device OOM.
+/// The ledger: first sighting of (ptr, fp) uploads a TRANSIENT buffer
+/// (freed with the submission) and only records the fingerprint; the
+/// second sighting with the same fp promotes to resident. An in-place
+/// update (Adam masters: same ptr, new fp on a resident entry) refreshes
+/// the resident buffer rather than demoting it. Transients never repeat
+/// a fingerprint, so they never occupy a byte past their own call.
 fn bake_weight(c: &Ctx, w: &[f32], label: &'static str) -> wgpu::Buffer {
     let key = (w.as_ptr() as usize, w.len());
     let fp = fp_bytes(bytemuck::cast_slice(w));
-    let mut cb = c.gemm_w_bufs.lock().unwrap();
-    match cb.get(&key) {
-        Some((b, f)) if *f == fp => b.clone(),
-        Some((b, _)) => {
+    let fresh = |note: bool| {
+        if note {
             crate::gpu::probe_note_cold();
-            let b = b.clone();
+        }
+        let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (w.len() * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        c.queue.write_buffer(&b, 0, bytemuck::cast_slice(w));
+        b
+    };
+    let mut cb = c.gemm_w_bufs.lock().unwrap();
+    match cb.get_mut(&key) {
+        Some((Some(b), f)) if *f == fp => b.clone(),
+        Some((slot @ Some(_), f)) => {
+            // Resident, contents moved on: an in-place weight update.
+            crate::gpu::probe_note_cold();
+            *f = fp;
+            let b = slot.as_ref().unwrap().clone();
             c.queue.write_buffer(&b, 0, bytemuck::cast_slice(w));
-            cb.insert(key, (b.clone(), fp));
             b
         }
-        None => {
-            crate::gpu::probe_note_cold();
-            let b = c.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: (w.len() * 4) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(w));
-            cb.insert(key, (b.clone(), fp));
+        Some((slot @ None, f)) if *f == fp => {
+            // Second sighting of the same bytes — it recurs; promote.
+            let b = fresh(true);
+            *slot = Some(b.clone());
             b
+        }
+        Some((None, f)) => {
+            // Same address, different transient — stay transient.
+            *f = fp;
+            fresh(false)
+        }
+        None => {
+            cb.insert(key, (None, fp));
+            fresh(true)
         }
     }
 }

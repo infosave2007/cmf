@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   baseline/mask/FCD pinned at 4.187 and the runtime gate at +0.0%
   at every step. Devices without cooperative matrices (Apple via
   wgpu) keep the scalar arm bit-for-bit.
+- **The bake runs as device chains** — frozen FFN forward (gate+up →
+  silu·mask → down, one submit) and its backward riding per-layer
+  planes parked on the card; a finished bake releases its VRAM before
+  the runtime gate. The weight cache admits only matrices that RECUR
+  (fingerprint probation), so phase B's per-step activation planes can
+  no longer grow it past the card — the failure mode that silently
+  killed a 90-step phase B at step ~40.
 
 ### Fixed
 - **A GPU cache hit by host address now proves its bytes.** Both
