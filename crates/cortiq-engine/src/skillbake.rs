@@ -356,6 +356,7 @@ impl Pass<'_> {
             return (nll, scored);
         };
         // Backward: final norm, then the FFN chain layer by layer.
+        let t_bwd = std::time::Instant::now();
         let mut dh = vec![0f32; t * hsz];
         ops::rmsnorm_bwd(&h, &fm.final_norm, &inv, &dh_n, fm.gemma, &mut dh, None);
         for vl in (0..vn).rev() {
@@ -460,6 +461,7 @@ impl Pass<'_> {
             dh = dh1;
             let _ = &h_ins[vl];
         }
+        crate::fcd::prof::add(&crate::fcd::prof::BWD, t_bwd);
         (nll, scored)
     }
 }
@@ -688,6 +690,23 @@ pub fn skill_bake(
             max_sp.2 * 100.0
         ));
         best = max_sp;
+    }
+    // Phase totals, printed unconditionally — a 5-step measurement run
+    // must report even though no eval fired.
+    {
+        use crate::fcd::prof;
+        let (a, f, bw, g, gc) = (
+            prof::take(&prof::ATTN_FWD),
+            prof::take(&prof::FFN_FWD),
+            prof::take(&prof::BWD),
+            prof::take(&prof::GEMM),
+            prof::GEMM_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        );
+        log(&format!(
+            "[prof] phase A over {} step(s): attn-fwd {a:.1}s | ffn-fwd {f:.1}s | bwd {bw:.1}s |              gemm total {g:.1}s in {gc} calls ({:.1} ms/call)",
+            hy.steps_a,
+            if gc > 0 { g * 1000.0 / gc as f64 } else { 0.0 }
+        ));
     }
     if let Some(b) = best.1.take() {
         logits = b;

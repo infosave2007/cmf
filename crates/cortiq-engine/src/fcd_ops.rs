@@ -280,6 +280,19 @@ unsafe fn gemm_block4x4_avx512(
 /// where the round trip cost more than the work. So the device arm goes
 /// through the same probe every other op class uses instead of taking
 /// the job on sight. `CMF_BAKE_GPU=0` keeps the CPU path outright.
+
+/// Tiny drop-guard so every return path of gemm_nt lands in the GEMM
+/// phase counter — the function has four exits (two GPU, two CPU).
+struct GemmGuard(std::time::Instant);
+impl Drop for GemmGuard {
+    fn drop(&mut self) {
+        crate::fcd::prof::add(&crate::fcd::prof::GEMM, self.0);
+    }
+}
+fn scopeguard_gemm(t: std::time::Instant) -> GemmGuard {
+    GemmGuard(t)
+}
+
 pub fn gemm_nt(
     x: &[f32],
     w: &[f32],
@@ -289,6 +302,9 @@ pub fn gemm_nt(
     m: usize,
     pool: Option<&Pool>,
 ) {
+    let _t_gemm = std::time::Instant::now();
+    crate::fcd::prof::GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _guard = scopeguard_gemm(_t_gemm);
     #[cfg(feature = "gpu")]
     if n * k * m >= (1 << 22) && crate::gpu::enabled_here() {
         let t0 = std::time::Instant::now();

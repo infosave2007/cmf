@@ -182,6 +182,26 @@ pub fn select_checkpoint(
 
 // ───────────────────────── model container ─────────────────────────
 
+
+/// Wall-clock phase counters for the bake profiler (CMF_BAKE_PROF=1
+/// prints them). Written from worker threads, so atomics; nanoseconds.
+pub mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static ATTN_FWD: AtomicU64 = AtomicU64::new(0);
+    pub static FFN_FWD: AtomicU64 = AtomicU64::new(0);
+    pub static BWD: AtomicU64 = AtomicU64::new(0);
+    pub static GEMM: AtomicU64 = AtomicU64::new(0);
+    pub static GEMM_CALLS: AtomicU64 = AtomicU64::new(0);
+    #[inline]
+    pub fn add(c: &AtomicU64, t: std::time::Instant) {
+        c.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    /// Read and reset, in seconds.
+    pub fn take(c: &AtomicU64) -> f64 {
+        c.swap(0, Ordering::Relaxed) as f64 / 1e9
+    }
+}
+
 /// Frozen attention operator of one layer — the per-layer dispatch
 /// point for through-backwards (docs/RUST_FCD.md §3).
 enum FcdAttn {
@@ -712,10 +732,13 @@ impl FcdModel {
         let mut inv1 = vec![0f32; n];
         ops::rmsnorm_fwd(h_in, wts.iln, self.eps, self.gemma, &mut n1, &mut inv1);
 
+        let t_attn = std::time::Instant::now();
         let (attn_out, attn_acts) = match &l.attn {
             FcdAttn::Full { .. } => self.full_attn_fwd(&l.attn, &n1, b, t, nystrom),
             FcdAttn::Gdn { .. } => self.gdn_attn_fwd(&l.attn, &n1, b, t),
         };
+        prof::add(&prof::ATTN_FWD, t_attn);
+        let t_ffn = std::time::Instant::now();
 
         let mut h1 = h_in.to_vec();
         for (a, &x) in h1.iter_mut().zip(&attn_out) {
@@ -764,6 +787,7 @@ impl FcdModel {
             upre,
             act,
         });
+        prof::add(&prof::FFN_FWD, t_ffn);
         (h2, acts)
     }
 
