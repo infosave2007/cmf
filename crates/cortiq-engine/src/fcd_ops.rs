@@ -282,15 +282,19 @@ unsafe fn gemm_block4x4_avx512(
 /// the job on sight. `CMF_BAKE_GPU=0` keeps the CPU path outright.
 
 /// Tiny drop-guard so every return path of gemm_nt lands in the GEMM
-/// phase counter — the function has four exits (two GPU, two CPU).
-struct GemmGuard(std::time::Instant);
+/// phase counter — the function has four exits (two GPU, two CPU). The
+/// per-shape bucket lives here too: the first version measured the
+/// shape at ENTRY and reported 0.0 ms for every shape while the total
+/// said 8.9 s.
+struct GemmGuard(std::time::Instant, usize, usize, usize);
 impl Drop for GemmGuard {
     fn drop(&mut self) {
         crate::fcd::prof::add(&crate::fcd::prof::GEMM, self.0);
+        crate::fcd::prof::gemm_shape(self.1, self.2, self.3, self.0);
     }
 }
-fn scopeguard_gemm(t: std::time::Instant) -> GemmGuard {
-    GemmGuard(t)
+fn scopeguard_gemm(t: std::time::Instant, n: usize, k: usize, m: usize) -> GemmGuard {
+    GemmGuard(t, n, k, m)
 }
 
 pub fn gemm_nt(
@@ -304,8 +308,7 @@ pub fn gemm_nt(
 ) {
     let _t_gemm = std::time::Instant::now();
     crate::fcd::prof::GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    crate::fcd::prof::gemm_shape(n, k, m, _t_gemm);
-    let _guard = scopeguard_gemm(_t_gemm);
+    let _guard = scopeguard_gemm(_t_gemm, n, k, m);
     #[cfg(feature = "gpu")]
     if n * k * m >= (1 << 22) && crate::gpu::enabled_here() {
         let t0 = std::time::Instant::now();
