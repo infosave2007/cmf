@@ -964,7 +964,20 @@ pub fn run_skill_bake(
             sparsity: report.pruned_ratio as f32,
             quality: None,
             ffn_masks,
-            head_masks: Vec::new(),
+            // ALL-ONES, not empty: the codec writes a zero row for a
+            // missing entry, and a zero head row means "no active
+            // heads" — the loader then forces f32 storage for the head
+            // path and attention itself is masked away. An FFN-only
+            // mask must say so explicitly.
+            head_masks: {
+                let hb = model.arch().num_attention_heads.div_ceil(8);
+                let mut row = vec![0xFFu8; hb];
+                let tail = model.arch().num_attention_heads % 8;
+                if tail != 0 {
+                    row[hb - 1] = (1u8 << tail) - 1;
+                }
+                vec![row; nl]
+            },
             layer_gates: vec![true; nl],
             expert_masks: Vec::new(),
             parent: None,
