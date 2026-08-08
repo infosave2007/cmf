@@ -362,7 +362,32 @@ async fn chat_completions(
                     "content": m.content.as_ref().map(|c| c.text()).unwrap_or_default(),
                 });
                 if let Some(tc) = &m.tool_calls {
-                    o["tool_calls"] = tc.clone();
+                    // OpenAI sends function.arguments as a STRING of
+                    // JSON; some templates (Nanbeige's XML history
+                    // branch) iterate it as an object. Normalise:
+                    // parseable strings become objects, everything else
+                    // passes through untouched. Qwen-style templates
+                    // tojson the object back to the identical text.
+                    let mut tc = tc.clone();
+                    if let Some(arr) = tc.as_array_mut() {
+                        for call in arr {
+                            if let Some(args) = call
+                                .get_mut("function")
+                                .and_then(|f| f.get_mut("arguments"))
+                            {
+                                if let Some(s) = args.as_str() {
+                                    if let Ok(v) =
+                                        serde_json::from_str::<serde_json::Value>(s)
+                                    {
+                                        if v.is_object() {
+                                            *args = v;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    o["tool_calls"] = tc;
                 }
                 if let Some(id) = &m.tool_call_id {
                     o["tool_call_id"] = serde_json::json!(id);
@@ -698,6 +723,40 @@ fn bare_call_fallback(text: &str, allowed: &[String]) -> Option<serde_json::Valu
     }))
 }
 
+
+/// Nanbeige's XML tool grammar, normalised to the JSON shape:
+/// `<function=NAME>\n<parameter=K>\nV\n</parameter>...</function>`.
+/// Parameter values keep inner newlines (the format allows multi-line
+/// values); the surrounding single newline the grammar inserts is
+/// trimmed.
+fn parse_xml_function(body: &str) -> Option<serde_json::Value> {
+    let t = body.trim();
+    let name_start = t.find("<function=")? + "<function=".len();
+    let name_end = t[name_start..].find(['>', '\n'])? + name_start;
+    let name = t[name_start..name_end].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut args = serde_json::Map::new();
+    let mut rest = &t[name_end..];
+    while let Some(ps) = rest.find("<parameter=") {
+        let key_start = ps + "<parameter=".len();
+        let key_end = rest[key_start..].find('>')? + key_start;
+        let key = rest[key_start..key_end].trim().to_string();
+        let val_start = key_end + 1;
+        let val_end = rest[val_start..].find("</parameter>")? + val_start;
+        let val = rest[val_start..val_end]
+            .strip_prefix('\n')
+            .unwrap_or(&rest[val_start..val_end])
+            .strip_suffix('\n')
+            .unwrap_or(&rest[val_start..val_end])
+            .to_string();
+        args.insert(key, serde_json::Value::String(val));
+        rest = &rest[val_end + "</parameter>".len()..];
+    }
+    Some(serde_json::json!({"name": name, "arguments": args}))
+}
+
 /// Extract `<tool_call>{...}</tool_call>` blocks from generated text —
 /// the format every Qwen-family template (Nanbeige included) trains the
 /// model to emit. Returns the text OUTSIDE the blocks and the calls in
@@ -717,8 +776,14 @@ fn extract_tool_calls(text: &str) -> (String, Vec<serde_json::Value>) {
         };
         let body = rest[i + OPEN.len()..i + OPEN.len() + j].trim();
         let after = &rest[i + OPEN.len() + j + CLOSE.len()..];
-        match serde_json::from_str::<serde_json::Value>(body) {
-            Ok(v) if v.get("name").map(|n| n.is_string()) == Some(true) => {
+        // Two trained grammars share the <tool_call> wrapper: the JSON
+        // object, and Nanbeige's XML `<function=name><parameter=k>v...`.
+        // Parse whichever arrived.
+        let parsed = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .or_else(|| parse_xml_function(body));
+        match parsed {
+            Some(v) if v.get("name").map(|n| n.is_string()) == Some(true) => {
                 plain.push_str(&rest[..i]);
                 let args = v.get("arguments").cloned().unwrap_or(serde_json::json!({}));
                 calls.push(serde_json::json!({

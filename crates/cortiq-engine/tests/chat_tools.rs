@@ -113,3 +113,55 @@ fn consecutive_tool_results_share_one_user_turn() {
     assert_eq!(user_starts, 2, "the two tool results must share one user turn:\n{text}");
     assert_eq!(text.matches("<tool_response>").count(), 2);
 }
+
+// ── Nanbeige 4.2 — the template that found three renderer gaps ──
+
+fn nanbeige_tok() -> Tokenizer {
+    let mut t = Tokenizer::byte_level();
+    t.chat_template =
+        Some(include_str!("fixtures/nanbeige42_chat_template.jinja").to_string());
+    t
+}
+
+/// Nanbeige's tools branch calls transformers' `visible_text()` helper,
+/// reads dicts with python `.get`, and picks its grammar from a
+/// `tool_call_format` variable whose UNDEFINED value selects the XML
+/// branch. Any of the three silently produced a toolless prompt before;
+/// this pins all of them at once, on the template byte-for-byte from a
+/// user's converted file.
+#[test]
+fn nanbeige_tools_render_in_json_grammar() {
+    let t = nanbeige_tok();
+    let tools = vec![j(serde_json::json!({
+        "type": "function",
+        "function": {"name": "get_weather", "description": "d",
+                      "parameters": {"type": "object", "properties": {}}}
+    }))];
+    let msgs = vec![j(serde_json::json!({"role": "user", "content": "Weather in Paris?"}))];
+    let text = t.render_chat_json(&msgs, Some(&tools), None).unwrap();
+    assert!(text.contains("<tools>"), "tools section missing:\n{}", &text[..text.len().min(400)]);
+    assert!(text.contains("\"get_weather\""));
+    assert!(
+        text.contains("\"arguments\": <args-json-object>"),
+        "the JSON grammar must be selected, not the XML default"
+    );
+    assert!(
+        !text.contains("<function=example_function_name>"),
+        "the XML branch must not be the one rendered"
+    );
+}
+
+#[test]
+fn nanbeige_tool_history_round_trips() {
+    let t = nanbeige_tok();
+    let msgs = vec![
+        j(serde_json::json!({"role": "user", "content": "Weather?"})),
+        j(serde_json::json!({"role": "assistant", "content": "",
+            "tool_calls": [{"type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]})),
+        j(serde_json::json!({"role": "tool", "content": "18C"})),
+    ];
+    let text = t.render_chat_json(&msgs, None, None).unwrap();
+    assert!(text.contains("get_weather"), "call history lost:\n{text}");
+    assert!(text.contains("<tool_response>"), "tool result lost:\n{text}");
+}
