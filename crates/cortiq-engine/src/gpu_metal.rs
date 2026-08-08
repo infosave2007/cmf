@@ -3832,6 +3832,12 @@ struct Ctx {
     cf_bufs: Mutex<HashMap<(usize, usize), Buffer>>,
     /// Reusable xs/y buffers by size (no per-token allocations).
     io_bufs: Mutex<HashMap<usize, Buffer>>,
+    /// Pointer-keyed constant/weight buffers, each carrying a content
+    /// fingerprint: the address is NOT a stable identity — a reloaded
+    /// model's slices and a recreated module's Vecs land on freed
+    /// addresses — so a hit whose bytes changed is memcpy-refreshed in
+    /// place (StorageModeShared) instead of trusted.
+    cv_bufs: Mutex<HashMap<(usize, usize), (Buffer, u64)>>,
     /// Shared completion-flag word + monotone ticket (fast wait).
     flag_buf: Buffer,
     ticket: std::sync::atomic::AtomicU32,
@@ -4052,6 +4058,7 @@ fn init() -> Result<Ctx, String> {
         rs_bufs: Mutex::new(HashMap::new()),
         cf_bufs: Mutex::new(HashMap::new()),
         io_bufs: Mutex::new(HashMap::new()),
+        cv_bufs: Mutex::new(HashMap::new()),
         flag_buf,
         ticket: std::sync::atomic::AtomicU32::new(0),
     })
@@ -6541,25 +6548,32 @@ fn io_shared(c: &Ctx, key: usize, nbytes: usize) -> Buffer {
         .clone()
 }
 
-/// Weight/bias buffer keyed by heap address — stable for the owner's
-/// lifetime, so each layer uploads its constants once per process.
+/// Weight/bias buffer keyed by heap address, fingerprint-checked: the
+/// address holds only for the owner's lifetime, and a recreated owner's
+/// Vecs reuse freed addresses — so a hit whose bytes changed is refreshed
+/// in the same shared buffer instead of served stale.
 fn cached_weight_buf(c: &Ctx, base: usize, data: &[f32]) -> Buffer {
-    let key = base
-        .wrapping_add(data.as_ptr() as usize)
-        .wrapping_add(data.len());
-    let mut cache = c.io_bufs.lock().unwrap();
-    let mut fresh = false;
-    let buf = cache
-        .entry(key)
-        .or_insert_with(|| {
-            fresh = true;
-            c._device.new_buffer(
-                (data.len() * 4) as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
-        })
-        .clone();
-    if fresh {
+    let key = (
+        base.wrapping_add(data.as_ptr() as usize),
+        data.len() * 4,
+    );
+    let fp = crate::gpu::fp_f32(data);
+    let mut cache = c.cv_bufs.lock().unwrap();
+    let mut refresh = false;
+    let (buf, f) = cache.entry(key).or_insert_with(|| {
+        refresh = true;
+        let b = c._device.new_buffer(
+            (data.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        (b, fp)
+    });
+    if !refresh && *f != fp {
+        refresh = true;
+        *f = fp;
+    }
+    let buf = buf.clone();
+    if refresh {
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents() as *mut f32, data.len());
         }
@@ -8174,20 +8188,35 @@ fn io_buf(c: &Ctx, key: usize, nbytes: usize) -> Buffer {
         .clone()
 }
 
-/// Small constant vectors cached by their (stable) data pointer.
+/// Small constant vectors (norms, inv_freq, biases) cached by data
+/// pointer + length, fingerprint-checked: these slices point into the
+/// model's mmap, and a reloaded model maps where the dropped one was —
+/// trusting the address alone served one model's norms to another.
 fn const_buf(c: &Ctx, data: &[f32]) -> Buffer {
-    let mut cache = c.rs_bufs.lock().unwrap();
-    cache
-        .entry((data.as_ptr() as usize, usize::MAX - 2))
-        .or_insert_with(|| {
-            crate::gpu::probe_note_cold();
-            c._device.new_buffer_with_data(
-                data.as_ptr() as *const std::ffi::c_void,
-                (data.len() * 4) as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
-        })
-        .clone()
+    let key = (data.as_ptr() as usize, data.len() * 4);
+    let fp = crate::gpu::fp_f32(data);
+    let mut cache = c.cv_bufs.lock().unwrap();
+    if let Some((b, f)) = cache.get_mut(&key) {
+        if *f != fp {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    b.contents() as *mut f32,
+                    data.len(),
+                );
+            }
+            *f = fp;
+        }
+        return b.clone();
+    }
+    crate::gpu::probe_note_cold();
+    let b = c._device.new_buffer_with_data(
+        data.as_ptr() as *const std::ffi::c_void,
+        (data.len() * 4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    cache.insert(key, (b.clone(), fp));
+    b
 }
 
 fn enc_simple(

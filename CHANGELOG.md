@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A GPU cache hit by host address now proves its bytes.** Both
+  backends parked constant vectors (norms, row scales, sinks, bake
+  weights) on the card keyed by `(pointer, length)` — but an address is
+  not an identity: a reloaded model's mmap lands where the dropped
+  one's was, and the streaming replica re-dequantizes evicted layers
+  into recycled Vecs. Scoring model B after model A in one process
+  served A's norms to B wherever the mappings overlapped — an intact
+  specialist file measured PPL in the millions while a fresh process
+  measured 5.1. Every pointer-keyed entry now carries a sampled content
+  fingerprint (~µs even on a 126 MB matrix) and is refreshed **in
+  place** on mismatch, so cached bind groups stay coherent. Found by
+  the bake gate the moment it was made fast enough to finish.
+- **`skill bake`'s runtime gate scores the specialist bare, and says
+  so.** The per-position masked scorer was an hours-long no-op on
+  quantized storage (the FFN mask application doesn't reach fused
+  quantized kernels yet); the gate now takes the fast batched path and
+  prints that masked quality is the replica's mask+FCD figure.
+
 ## [0.5.62] - 2026-08-08
 
 ### Added
