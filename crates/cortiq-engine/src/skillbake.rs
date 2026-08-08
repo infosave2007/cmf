@@ -247,11 +247,36 @@ impl Pass<'_> {
             &mut [Option<(Vec<f64>, Vec<f64>, Vec<f64>)>],
         )>,
     ) -> (f64, usize) {
+        self.chunk_batch(ids, 1, grad)
+    }
+
+    /// `chunk` over `b` equal-length sequences flattened into `ids`.
+    ///
+    /// Everything under this level was batch-aware all along
+    /// (`layer_forward_scaled` and every attention fwd/bwd take `b`);
+    /// only this wrapper hardcoded 1. Evaluation is where it pays: the
+    /// held set is 12 chunks scored one at a time, which on a 4 B model
+    /// meant 12× the GEMM submits for the same arithmetic.
+    fn chunk_batch(
+        &self,
+        ids: &[u32],
+        b: usize,
+        grad: Option<(
+            &mut [Vec<f64>],
+            &mut [Option<(Vec<f64>, Vec<f64>, Vec<f64>)>],
+        )>,
+    ) -> (f64, usize) {
         let fm = self.fm;
-        let (t, hsz) = (ids.len(), fm.hidden);
+        let hsz = fm.hidden;
+        debug_assert!(ids.len() % b.max(1) == 0, "ragged batch");
+        // Training differentiates one chunk at a time — the recipe's
+        // gradient accumulation is per-chunk by design.
+        debug_assert!(grad.is_none() || b == 1, "grads are per-chunk");
+        let t = ids.len() / b.max(1);
+        let n = b * t;
         let nl = fm.layers.len();
         // Embed.
-        let mut h = vec![0f32; t * hsz];
+        let mut h = vec![0f32; n * hsz];
         for (r, &id) in ids.iter().enumerate() {
             h[r * hsz..(r + 1) * hsz]
                 .copy_from_slice(&fm.embed[id as usize * hsz..(id as usize + 1) * hsz]);
@@ -279,7 +304,7 @@ impl Pass<'_> {
             let g = self.gates(vl);
             let wts = self.wts(li);
             let want = grad.is_some();
-            let (h2, a) = fm.layer_forward_scaled(li, &h, 1, t, &wts, false, want, Some(&g));
+            let (h2, a) = fm.layer_forward_scaled(li, &h, b, t, &wts, false, want, Some(&g));
             h_ins.push(if want { h } else { Vec::new() });
             acts.push(a);
             masks.push(g);
@@ -287,8 +312,8 @@ impl Pass<'_> {
             // Mid-stack norm at every loop boundary except the last —
             // the final one folds into the head below.
             if fm.loop_norm && li + 1 == nl && vl + 1 < vn {
-                let mut hn = vec![0f32; t * hsz];
-                let mut inv = vec![0f32; t];
+                let mut hn = vec![0f32; n * hsz];
+                let mut inv = vec![0f32; n];
                 ops::rmsnorm_fwd(&h, &fm.final_norm, fm.eps, fm.gemma, &mut hn, &mut inv);
                 if want {
                     lnorms[vl] = Some((h, inv));
@@ -297,23 +322,27 @@ impl Pass<'_> {
             }
         }
         // Final norm + tied LM head, CE summed over positions 1..t.
-        let mut hn = vec![0f32; t * hsz];
-        let mut inv = vec![0f32; t];
+        let mut hn = vec![0f32; n * hsz];
+        let mut inv = vec![0f32; n];
         ops::rmsnorm_fwd(&h, &fm.final_norm, fm.eps, fm.gemma, &mut hn, &mut inv);
         let lm: &[f32] = fm.lm_head.as_deref().unwrap_or(&fm.embed);
         let vocab = lm.len() / hsz;
         let pool = fm.pool.as_deref();
         let mut nll = 0f64;
-        let mut dh_n = vec![0f32; t * hsz]; // dL/d hn
+        let mut dh_n = vec![0f32; n * hsz]; // dL/d hn
         // Chunk the vocab matmul over positions to bound the logits buf.
+        // Positions are walked PER SEQUENCE: the last position of chunk
+        // i must not be scored against the first token of chunk i+1.
         const POS_CHUNK: usize = 32;
-        let scored = t - 1;
+        let scored = b * (t - 1);
+        for bi in 0..b {
+        let base = bi * t;
         let mut p0 = 0usize;
-        while p0 < scored {
-            let pc = POS_CHUNK.min(scored - p0);
+        while p0 < t - 1 {
+            let pc = POS_CHUNK.min(t - 1 - p0);
             let mut logits = vec![0f32; pc * vocab];
             ops::gemm_nt(
-                &hn[p0 * hsz..(p0 + pc) * hsz],
+                &hn[(base + p0) * hsz..(base + p0 + pc) * hsz],
                 lm,
                 &mut logits,
                 pc,
@@ -322,7 +351,7 @@ impl Pass<'_> {
                 pool,
             );
             for r in 0..pc {
-                let target = ids[p0 + r + 1] as usize;
+                let target = ids[base + p0 + r + 1] as usize;
                 let row = &mut logits[r * vocab..(r + 1) * vocab];
                 let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
                 let mut sum = 0f64;
@@ -343,7 +372,7 @@ impl Pass<'_> {
                 ops::gemm_dx(
                     &logits,
                     lm,
-                    &mut dh_n[p0 * hsz..(p0 + pc) * hsz],
+                    &mut dh_n[(base + p0) * hsz..(base + p0 + pc) * hsz],
                     pc,
                     hsz,
                     vocab,
@@ -352,18 +381,19 @@ impl Pass<'_> {
             }
             p0 += pc;
         }
+        }
         let Some((dmask, dffn)) = grad else {
             return (nll, scored);
         };
         // Backward: final norm, then the FFN chain layer by layer.
         let t_bwd = std::time::Instant::now();
-        let mut dh = vec![0f32; t * hsz];
+        let mut dh = vec![0f32; n * hsz];
         ops::rmsnorm_bwd(&h, &fm.final_norm, &inv, &dh_n, fm.gemma, &mut dh, None);
         for vl in (0..vn).rev() {
             let li = vl % nl;
             // Undo the loop-boundary norm this step fed into.
             if let Some((hb, inv)) = lnorms[vl].as_ref() {
-                let mut dprev = vec![0f32; t * hsz];
+                let mut dprev = vec![0f32; n * hsz];
                 ops::rmsnorm_bwd(hb, &fm.final_norm, inv, &dh, fm.gemma, &mut dprev, None);
                 dh = dprev;
             }
@@ -468,6 +498,18 @@ impl Pass<'_> {
 
 /// Held-out PPL with the hard mask (and Phase-B weights when present).
 fn held_ppl(pass: &Pass, held: &[Vec<u32>]) -> f64 {
+    // One batched pass over the whole held set: same arithmetic, one
+    // GEMM per weight instead of one per chunk. On the 4 B looped model
+    // the sequential version spent 12× the submits for identical math.
+    if held.is_empty() {
+        return f64::NAN;
+    }
+    let t = held[0].len();
+    if held.iter().all(|c| c.len() == t) {
+        let flat: Vec<u32> = held.iter().flatten().copied().collect();
+        let (l, k) = pass.chunk_batch(&flat, held.len(), None);
+        return (l / k.max(1) as f64).exp();
+    }
     let mut nll = 0f64;
     let mut n = 0usize;
     for c in held {
