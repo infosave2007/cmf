@@ -6,6 +6,7 @@ pub mod openai;
 pub mod streaming;
 
 use axum::{Json, Router, routing::get};
+use axum::extract::State;
 use cortiq_engine::{CortiqRuntime, Pipeline};
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
@@ -85,8 +86,20 @@ pub struct AppState {
 /// Liveness probe — returns 200 as soon as the server is accepting
 /// connections. Used by process managers that embed `cortiq serve` (e.g.
 /// a gateway spawning it as a local model server) to know when it is ready.
-async fn healthz() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ok" }))
+/// Also advertises the loaded model's capabilities so managers can route
+/// capability-gated traffic (tool calling) without manual configuration:
+/// tools are "supported" when the model's chat template has a tools branch.
+async fn healthz(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let tools = st
+        .tokenizer
+        .chat_template
+        .as_deref()
+        .map(|t| t.contains("tool"))
+        .unwrap_or(false);
+    Json(serde_json::json!({
+        "status": "ok",
+        "capabilities": { "tools": tools }
+    }))
 }
 
 /// Build the full router with all endpoints.
