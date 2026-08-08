@@ -1735,3 +1735,11 @@ mod fp_tests {
         }
     }
 }
+
+/// Hand the card back after a bake: drop its resident weights, planes and
+/// pools so the ordinary engine (the runtime gate, a serve that follows)
+/// starts from a clean budget. No-op off the wgpu backend.
+pub fn bake_release() {
+    #[cfg(feature = "gpu")]
+    crate::gpu_wgpu::bake_release();
+}

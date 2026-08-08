@@ -9118,6 +9118,31 @@ fn bake_silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// The backward twin of the silu link, in its own module: reads the
+/// RESIDENT gate+up plane the forward chain parked on the card and turns
+/// dact into the concatenated dgu — silu·mul backward, exactly
+/// `ops::silu_bwd`'s σ(x)·(1 + x·(1−σ(x))).
+const BAKE_SILU_BWD_SRC: &str = r#"
+struct BwP { inter: u32, total: u32, _a: u32, stride: u32 };
+@group(0) @binding(0) var<storage, read> bw_plane : array<f32>;
+@group(0) @binding(1) var<storage, read> bw_dact : array<f32>;
+@group(0) @binding(2) var<storage, read_write> bw_dgu : array<f32>;
+@group(0) @binding(3) var<uniform> bw_p : BwP;
+@compute @workgroup_size(256)
+fn bake_silu_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.y * bw_p.stride + gid.x;
+    if (i >= bw_p.total) { return; }
+    let r = i / bw_p.inter;
+    let j = i % bw_p.inter;
+    let g = bw_plane[r * 2u * bw_p.inter + j];
+    let u = bw_plane[r * 2u * bw_p.inter + bw_p.inter + j];
+    let da = bw_dact[i];
+    let s = 1.0 / (1.0 + exp(-g));
+    bw_dgu[r * 2u * bw_p.inter + j] = da * u * (s * (1.0 + g * (1.0 - s)));
+    bw_dgu[r * 2u * bw_p.inter + bw_p.inter + j] = da * (g * s);
+}
+"#;
+
 // Split-K decode attention (its own module: the main module's at_* binding
 // slots are taken, and WGSL forbids two resource vars on one binding).
 // `gqa_attend_part` runs the flash-decoding loop over ONE ck-position chunk
@@ -9404,6 +9429,12 @@ struct Ctx {
     gemm_nn_coop: Option<wgpu::ComputePipeline>,
     /// silu(g)·u·scale between the chain's two GEMMs (plain f32 module).
     bake_silu: wgpu::ComputePipeline,
+    /// Its backward: dact + the resident plane → concatenated dgu.
+    bake_silu_bwd: wgpu::ComputePipeline,
+    /// Per-layer gate+up planes the forward chain parks for the backward
+    /// one — the resident graph's memory. Grow-only per layer; ~84 MB a
+    /// layer at chunk size, discrete cards only.
+    bake_planes: Mutex<HashMap<usize, (wgpu::Buffer, u64)>>,
     argmax_part: wgpu::ComputePipeline,
     gdn_step_par: wgpu::ComputePipeline,
     gdn_step_norm: wgpu::ComputePipeline,
@@ -10223,20 +10254,22 @@ fn init() -> Result<Ctx, String> {
     let gemm_nn_coop = bake_ok
         .then(|| bake_coop(COOP_NN_SRC, "bake-nn-coop", "gemm_nn_coop"))
         .flatten();
-    let bake_silu = {
+    let plain = |src: &str, mod_label: &'static str, entry: &'static str| {
         let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("bake-silu"),
-            source: wgpu::ShaderSource::Wgsl(BAKE_SILU_SRC.into()),
+            label: Some(mod_label),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
         });
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("bake_silu_mul"),
+            label: Some(entry),
             layout: None,
             module: &m,
-            entry_point: Some("bake_silu_mul"),
+            entry_point: Some(entry),
             compilation_options: Default::default(),
             cache: None,
         })
     };
+    let bake_silu = plain(BAKE_SILU_SRC, "bake-silu", "bake_silu_mul");
+    let bake_silu_bwd = plain(BAKE_SILU_BWD_SRC, "bake-silu-bwd", "bake_silu_bwd");
     let argmax_part = pipe("argmax_part");
     let gdn_step_par = pipe("gdn_step_par");
     let gdn_step_par2 = pipe("gdn_step_par2");
@@ -10525,6 +10558,8 @@ fn init() -> Result<Ctx, String> {
         gemm_nt_coop,
         gemm_nn_coop,
         bake_silu,
+        bake_silu_bwd,
+        bake_planes: Mutex::new(HashMap::new()),
         argmax_part,
         gdn_step_par,
         gdn_step_par2,
@@ -26979,6 +27014,7 @@ pub fn ffn_chain_f32(
     down: &[f32],
     scale: Option<&[f32]>,
     both_out: Option<&mut [f32]>,
+    plane: Option<usize>,
     ffn: &mut [f32],
     n: usize,
     hsz: usize,
@@ -27022,13 +27058,41 @@ pub fn ffn_chain_f32(
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         "bake-x",
     );
-    let both = Scratch::ensure(
-        &c.device,
-        &mut sc.bb,
-        both_bytes,
-        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        "bake-both",
-    );
+    // A training call parks the plane per LAYER so the backward chain can
+    // consume it without the round trip; anything else shares one slot.
+    // Discrete cards only — on unified memory those 22 planes are RAM.
+    let both = match plane.filter(|_| c.discrete) {
+        Some(li) => {
+            let mut planes = c.bake_planes.lock().unwrap();
+            let slot = planes.entry(li).or_insert((
+                c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("bake-plane"),
+                    size: both_bytes.next_power_of_two(),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }),
+                both_bytes.next_power_of_two(),
+            ));
+            if slot.1 < both_bytes {
+                crate::gpu::probe_note_cold();
+                slot.0 = c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("bake-plane"),
+                    size: both_bytes.next_power_of_two(),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                slot.1 = both_bytes.next_power_of_two();
+            }
+            slot.0.clone()
+        }
+        None => Scratch::ensure(
+            &c.device,
+            &mut sc.bb,
+            both_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "bake-both",
+        ),
+    };
     let act = Scratch::ensure(
         &c.device,
         &mut sc.ba,
@@ -27159,6 +27223,181 @@ pub fn ffn_chain_f32(
     }
     stage.unmap();
     true
+}
+
+/// Release everything the bake parked on the card: resident f32 weights
+/// (~14 GB on a 4 B model), per-layer planes, pooled activations and
+/// staging. Called when a bake hands the process to something else — the
+/// runtime gate opens the model through the ordinary engine, and on a
+/// 32 GB card the two residencies do not fit together (measured: the
+/// gate OOM-panicked the moment the planes joined the weights).
+pub fn bake_release() {
+    let Some(c) = ctx() else { return };
+    let _bake = BAKE_LOCK.lock().unwrap();
+    c.bake_planes.lock().unwrap().clear();
+    c.gemm_w_bufs.lock().unwrap().clear();
+    let mut sc = c.scratch.lock().unwrap();
+    sc.bx = None;
+    sc.by = None;
+    sc.bst = None;
+    sc.bb = None;
+    sc.ba = None;
+}
+
+/// The frozen FFN's backward as one device chain, fed by the plane the
+/// forward parked: dact = dh2·down, dgu = silu·mul-backward(plane, dact),
+/// dn2 = dgu·gu — one submit, and the only PCIe traffic is dh2 down
+/// (3 MB) and dn2 back (3 MB) where the host path uploaded the 80 MB
+/// concatenated dgu every layer. Declines (false) when the plane for
+/// `li` is absent or undersized — the caller keeps its host path.
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_bwd_chain_f32(
+    dh2: &[f32],
+    down: &[f32],
+    gu: &[f32],
+    li: usize,
+    dn2: &mut [f32],
+    n: usize,
+    hsz: usize,
+    inter: usize,
+) -> bool {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
+        return false;
+    }
+    let Some(c) = ctx() else { return false };
+    let Some(nn) = c.gemm_nn_coop.as_ref() else {
+        return false;
+    };
+    if !c.discrete || hsz % 4 != 0 || inter % 2 != 0 || n * hsz * 2 * inter < (1 << 22) {
+        return false;
+    }
+    if inter.div_ceil(64) > 65_535 || hsz.div_ceil(64) > 65_535 || n.div_ceil(64) > 65_535 {
+        return false;
+    }
+    if dh2.len() < n * hsz || down.len() < hsz * inter || gu.len() < 2 * inter * hsz || dn2.len() < n * hsz
+    {
+        return false;
+    }
+    let both_bytes = (n * 2 * inter * 4) as u64;
+    let _bake = BAKE_LOCK.lock().unwrap();
+    let plane = {
+        let planes = c.bake_planes.lock().unwrap();
+        match planes.get(&li) {
+            Some((b, cap)) if *cap >= both_bytes => b.clone(),
+            _ => return false,
+        }
+    };
+    let wdn = bake_weight(c, down, "bake-dn");
+    let wgu = bake_weight(c, gu, "bake-gu");
+    let dn2_bytes = (n * hsz * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let dhb = Scratch::ensure(
+        &c.device,
+        &mut sc.bx,
+        dn2_bytes,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "bake-x",
+    );
+    let dact = Scratch::ensure(
+        &c.device,
+        &mut sc.ba,
+        (n * inter * 4) as u64,
+        wgpu::BufferUsages::STORAGE,
+        "bake-act",
+    );
+    let dgu = Scratch::ensure(
+        &c.device,
+        &mut sc.bb,
+        both_bytes,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "bake-both",
+    );
+    let ybuf = Scratch::ensure(
+        &c.device,
+        &mut sc.by,
+        dn2_bytes,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "bake-y",
+    );
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.bst,
+        dn2_bytes,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "bake-stage",
+    );
+    drop(sc);
+    c.queue
+        .write_buffer(&dhb, 0, bytemuck::cast_slice(&dh2[..n * hsz]));
+    let uni = |v: [u32; 4]| {
+        c.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&v),
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
+    };
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bake-ffn-bwd") });
+    {
+        // dact[n, inter] = dh2[n, hsz] · down[hsz, inter]
+        let u = uni([(hsz / 4) as u32, inter as u32, n as u32, 0]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &nn.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &wdn),
+                bind_buf(1, &dhb),
+                bind_buf(2, &dact),
+                bind_buf(3, &u),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(nn);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((inter as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
+    }
+    {
+        let total = (n * inter) as u32;
+        let wgs = total.div_ceil(256);
+        let gx = wgs.min(32_768);
+        let gy = wgs.div_ceil(32_768);
+        let u = uni([inter as u32, total, 0, gx * 256]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.bake_silu_bwd.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &plane),
+                bind_buf(1, &dact),
+                bind_buf(2, &dgu),
+                bind_buf(3, &u),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.bake_silu_bwd);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(gx, gy, 1);
+    }
+    {
+        // dn2[n, hsz] = dgu[n, 2·inter] · gu[2·inter, hsz]
+        let u = uni([(2 * inter / 4) as u32, hsz as u32, n as u32, 0]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &nn.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &wgu),
+                bind_buf(1, &dgu),
+                bind_buf(2, &ybuf),
+                bind_buf(3, &u),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(nn);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((hsz as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
+    }
+    readback(c, enc, &ybuf, &stage, dn2_bytes, &mut dn2[..n * hsz])
 }
 
 /// VAE conv2d on the card: same padding, stride 1, direct (no im2col).
