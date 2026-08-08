@@ -31,6 +31,17 @@ pub struct StreamChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<StreamChoice>,
+    /// Real token counts, emitted once ahead of the finish chunk (the OpenAI
+    /// `include_usage` shape) — clients get exact numbers, not estimates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<StreamUsage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,6 +134,30 @@ pub fn token_chunk(id: &str, model: &str, token: &str, created: u64) -> StreamCh
             },
             finish_reason: None,
         }],
+        usage: None,
+    }
+}
+
+/// The usage chunk (empty `choices`, real counts) sent just before the finish
+/// chunk, exactly as OpenAI's `stream_options.include_usage` does.
+pub fn usage_chunk(
+    id: &str,
+    model: &str,
+    created: u64,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+) -> StreamChunk {
+    StreamChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model: model.to_string(),
+        choices: Vec::new(),
+        usage: Some(StreamUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        }),
     }
 }
 
@@ -141,5 +176,6 @@ pub fn finish_chunk(id: &str, model: &str, reason: &str, created: u64) -> Stream
             },
             finish_reason: Some(reason.to_string()),
         }],
+        usage: None,
     }
 }

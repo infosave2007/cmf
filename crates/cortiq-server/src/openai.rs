@@ -367,6 +367,7 @@ async fn chat_completions(
                         },
                         finish_reason: None,
                     }],
+                    usage: None,
                 })
                 .await;
 
@@ -419,6 +420,16 @@ async fn chat_completions(
                     state2
                         .runtime
                         .record_generation(result.tokens_generated, elapsed_ms, elapsed_ms)
+                        .await;
+                    // exact counts ahead of the finish chunk (OpenAI include_usage shape)
+                    let _ = tx
+                        .send(streaming::usage_chunk(
+                            &id,
+                            &model,
+                            created,
+                            result.prompt_tokens as u32,
+                            result.tokens_generated as u32,
+                        ))
                         .await;
                     let _ = tx
                         .send(streaming::finish_chunk(

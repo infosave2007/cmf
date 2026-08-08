@@ -93,7 +93,17 @@ impl CortiqRuntime {
             .collect();
 
         let state = RuntimeState {
-            active_task: model.masks.default_task.clone(),
+            // The catalog's default task activates on load — that is the
+            // "one file, many specialists" contract. CMF_TASK=off starts
+            // bare instead: no mask, backbone behaviour. Needed because a
+            // per-visit mask currently has no fast inference path, and a
+            // file whose default is masked would otherwise offer no way
+            // to run at full speed at all.
+            active_task: if std::env::var("CMF_TASK").as_deref() == Ok("off") {
+                String::new()
+            } else {
+                model.masks.default_task.clone()
+            },
             active_mask: model.masks.fallback().cloned(),
             execution_mode,
             metrics: PerformanceMetrics::default(),
