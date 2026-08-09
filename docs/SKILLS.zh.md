@@ -395,3 +395,30 @@ skill-hub 做准备），最小护照如下：
   `--route-dynamic` 读取的都是同一份约 4 KB 的描述符。
 - 注册表的 `quality` 字段是诚实契约（claim 16，[PATENTS.md](../PATENTS.md)）：测了什么、在什么上测、
   结果如何。`skill list` 会显示它。
+
+## 烘焙一次，分享增量：独立技能文件
+
+烘焙出的专家与基座的差别只是几十个张量加一份掩码目录。自 0.5.63 起，
+这个差别可以作为独立的 `.cmf` 传播：
+
+```bash
+# 你（一次，用你的 GPU）：烘焙，然后裁出增量
+cortiq skill bake base.cmf --files corpus/*.txt --steps-a 150 --steps-b 90 -o specialist.cmf
+cortiq skill export specialist.cmf --base base.cmf --id gfx-html -o gfx.skill.cmf
+
+# 任何人（几秒，无需 GPU）：附加到自己的基座副本上
+cortiq skill apply base.cmf gfx.skill.cmf -o specialist.cmf
+```
+
+在 Nanbeige 4.2 图形专家上的实测：2.4 GB 的专家导出为 **557 MB** 的
+技能文件，`apply` 精确复原（held-out PPL 到最后一位相同）。
+
+技能文件通过注册表记录中的**身份键**绑定基座：`base_dir_hash` 是基座
+张量目录的哈希——正是裁出增量所针对的那些字节——因此 `apply` 会拒绝
+错误或重新量化过的基座，而不是悄悄产出嵌合体（懂行的人有 `--force`）。
+技能文件升起 `SKILL_FILE` 特性位：旧读取器大声拒绝，运行时拒绝*运行*
+它——半张网络不是模型——并提示先附加到基座。
+
+对循环 Transformer，内部掩码是按访问的（`LOOP_MASKS`）：循环的两遍
+携带独立掩码；正是它让循环主干变得可剪枝（共享掩码曾付出 ×32 PPL 的
+代价——那次测量迫使我们引入这一区分）。

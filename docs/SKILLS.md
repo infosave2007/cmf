@@ -465,3 +465,35 @@ operation — no weight recomputation.
   `--blend`, `--route-dynamic` all read the same 4 KB descriptors.
 - The registry's `quality` field is the claim-16 honest contract: what
   was measured, on what, with what result. `skill list` shows it.
+
+## Bake once, share the delta: standalone skill files
+
+A baked specialist differs from its base in a few dozen tensors and a
+mask catalog. Since 0.5.63 that difference travels as its own `.cmf`:
+
+```bash
+# You (once, on your GPU): bake, then cut the delta
+cortiq skill bake base.cmf --files corpus/*.txt --steps-a 150 --steps-b 90 -o specialist.cmf
+cortiq skill export specialist.cmf --base base.cmf --id gfx-html -o gfx.skill.cmf
+
+# Anyone (seconds, no GPU): attach it to their own copy of the base
+cortiq skill apply base.cmf gfx.skill.cmf -o specialist.cmf
+```
+
+Measured on the Nanbeige 4.2 graphics specialist: the 2.4 GB specialist
+exports as a **557 MB** skill file, and `apply` reproduces it exactly
+(held-out PPL identical to the last digit).
+
+The skill file is bound to its base by **identity keys** in the
+registry record: `base_dir_hash` is the hash of the base's tensor
+directory — the exact bytes the delta was cut against — so `apply`
+refuses a wrong or re-quantized base instead of silently producing a
+chimera (`--force` exists for people who know better). A skill file
+raises the `SKILL_FILE` feature bit: old readers refuse it loudly, and
+the runtime refuses to *run* one — half a network is not a model — and
+tells you to apply it instead.
+
+For Looped Transformers the mask inside is per-visit (`LOOP_MASKS`):
+the two passes of a loop carry independent masks, which is what makes
+a looped backbone prunable at all (a shared mask costing ×32 PPL was
+the measurement that forced the distinction).

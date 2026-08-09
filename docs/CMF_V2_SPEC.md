@@ -79,6 +79,8 @@ no "read as best we can").
 | 2   | `QUANT_2F`     | directory contains `q8_2f`/`vbit` tensors (two-field 𝒲×θ quant) |
 | 3   | `DELTA_MASKS`  | reserved: XOR mask deltas from a parent |
 | 4   | `HOT_PACKS`    | reserved: materialized dense slices |
+| 5   | `LOOP_MASKS`   | mask rows are per VISIT (physical layers × loops, pass-major) — a Looped Transformer's two passes carry independent masks (§5.1) |
+| 6   | `SKILL_FILE`   | the file is a STANDALONE SKILL: a partial tensor set cut against a specific base, bound by `SkillRecord.base_dir_hash` (§9.1). Not runnable — attach with `cortiq skill apply` |
 
 Unknown **header-JSON** fields are ignored (additive evolution);
 breaking changes go only through feature bits or a `version` bump.
@@ -571,6 +573,41 @@ tail + updating envelope offsets in place (offset 0 is fixed). Bytes and
 offsets of previously written tensors never change; old dir/header bytes
 become dead section tails (compatible: readers navigate only through the
 envelope). Compaction (`converter/cmf_compact.py`) = a plain rewrite.
+
+### 9.1 Standalone skill files (`SKILL_FILE`, bit 6)
+
+A skill can also travel WITHOUT its backbone: a `.cmf` whose tensor set
+is only what a bake changed (plus the mask catalog), bound to the base
+it was cut against by identity keys in the registry record:
+
+```json
+"skills": [{
+  "id": "gfx-html",
+  "layers": [0, 1, "...", 21],
+  "base_dir_hash": "9f22593eb458bc6f",
+  "base_arch": "nanbeige",
+  "task": "specialist",
+  "provenance": {"corpus": "…", "tensors": 30}
+}]
+```
+
+- `base_dir_hash` — hex `hash64` of the BASE file's tensor-directory
+  bytes (the same value the envelope carries at `[0x78]`). A skill is a
+  delta against exact bytes, not against an architecture: `apply` MUST
+  refuse a base whose directory hash differs (an explicit `--force`
+  may override; the result is out of spec).
+- `base_arch`, `task`, `provenance` — informative keys: the human check,
+  the mask-catalog task the skill activates, and where it came from.
+
+Any record with `base_dir_hash` present raises feature bit 6, so a
+pre-bit reader refuses the file loudly and a runtime that knows the bit
+refuses to RUN it (a partial tensor set is not a model) and points to
+`cortiq skill apply <base> <skill> -o out.cmf`, which verifies the key,
+overlays tensors and masks over the base, and writes a complete file —
+byte-equivalent to the specialist the skill was cut from.
+
+Lifecycle: `skill bake` (specialist) → `skill export --base` (delta +
+keys) → publish the small file → `skill apply` on any copy of the base.
 
 Status: fully implemented and gated (container + indirection,
 production recipes, recon-argmin routing, append-only + compaction,

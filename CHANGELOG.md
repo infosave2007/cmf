@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.63] - 2026-08-09
+
+### Added
+- **Standalone skill files: bake once, share the delta.**
+  `cortiq skill export <specialist> --base <base> -o x.skill.cmf` cuts
+  a baked specialist against its base by the directory's per-tensor
+  hashes into a `.cmf` carrying only the changed tensors, the mask
+  catalog, and IDENTITY KEYS (`base_dir_hash` — the exact bytes the
+  delta was cut against, `base_arch`, `task`, `provenance`).
+  `cortiq skill apply <base> <skill> -o out.cmf` verifies the key,
+  refuses a stranger base (`--force` overrides), and reproduces the
+  specialist byte-equivalently. New feature bit `SKILL_FILE` (6): old
+  readers refuse the file loudly; the runtime refuses to RUN one and
+  says to apply it. Measured: the Nanbeige graphics specialist
+  (2364 MB) travels as a 557 MB skill; applied PPL identical to the
+  last digit. Spec §9.1; docs/SKILLS.md.
+
+### Fixed
+- **Phase A trains in strict f32 — f16 rounding was mis-selecting
+  neurons.** The mask SELECTS by the ordering of tiny gradient values,
+  and f16 operand rounding on the tensor-core arms reordered that tail:
+  hard-PPL 5.207 vs the reference 4.293 at the SAME 2.56% sparsity,
+  while an f32 run retraces the reference to the third decimal. The
+  bake's training steps now decline the device arms (forward/eval
+  sweeps keep tensor cores — their PPL matches f32 at print
+  precision). Verified end-to-end: phase A bottom 4.225@4.40% (ref
+  4.223), FCD 3.929 on the replica, runtime gate −1.5% vs backbone.
+
 ### Changed
 - **The bake's GEMMs run on tensor cores** (`gemm_nt_coop` /
   `gemm_nn_coop`, wgpu cooperative matrices — f16 operands, f32
