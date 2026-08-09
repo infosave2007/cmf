@@ -1181,20 +1181,11 @@ pub fn run_skill_bake(
     // do not fit one card together — hand the VRAM back first.
     cortiq_engine::gpu::bake_release();
     let rt_base = runtime_ppl(model_path, None)?;
-    // The per-position masked scorer is currently the only way to hold
-    // the mask active — and on QUANTIZED storage the runtime's FFN mask
-    // application is a no-op anyway, so that path spends hours measuring
-    // an unmasked model one position at a time (a 4 B gate ran three
-    // hours on a 48-core stand and was still wrong). Score bare on the
-    // fast path and say so; the replica-side numbers above are the
-    // masked truth until the quantized masked path exists.
-    if visit_mask.is_some() {
-        println!(
-            "runtime gate note: per-visit mask not enforceable on quantized storage yet — \
-             the specialist is scored bare; masked quality is the replica's mask+FCD figure"
-        );
-    }
-    let rt_spec = runtime_ppl(&tmp, None)?;
+    // Masked scoring rides the batched sweep since the masked-inference
+    // fast path (activation zeroing inside the fused arms) — the
+    // specialist is scored the way it is meant to be served: mask active,
+    // quantized storage untouched, batched speed.
+    let rt_spec = runtime_ppl(&tmp, visit_mask.as_ref())?;
     println!(
         "runtime gate (held-out, real engine): backbone {rt_base:.3} → specialist {rt_spec:.3} ({:+.1}%)",
         (rt_spec / rt_base - 1.0) * 100.0
