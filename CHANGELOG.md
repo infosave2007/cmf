@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.64] - 2026-08-09
+
+### Added
+- **Masked inference is a fast path.** A task mask used to eject
+  scoring and generation into a per-position path that dequantized
+  three FFN matrices per call (a masked gate ran hours). The mask now
+  lands on the ACTIVATIONS between the fused halves — arithmetically
+  the pruned network, zero quantized bytes touched — and rides the
+  batched sweep: scoring 75 s where it took an hour, generation with an
+  active skill mask batched too, the bake gate scores specialists
+  masked (the way they serve). Faithfulness proven by a decomposition
+  probe (`skillbake::replica_score_file_mask`): runtime masked within
+  0.8% of the replica's f32 math on the same written file.
+- **The bake's attention forward is one device chain** (tensor-core
+  qkv/wo around split+qk-norm+RoPE, causal softmax·V and the output
+  gate on device; RoPE from a host-precomputed f64 table). Parity vs
+  the host reference 7e-4; Nyström layers and strict-f32 phase A stay
+  host by design.
+
+### Fixed
+- **Trained FCD masters write as 8-bit rows.** Requantizing freshly
+  trained masters to q4 erased the fine co-adaptation with the mask
+  (+7.9% held-PPL, enough to turn the mask into a net loss). With
+  Q8Row masters the coding specialist's masked runtime gate went from
+  +7.7% to **−1.1% vs its backbone** (replica 9.515, runtime 9.633 —
+  the requant now costs 1.2%).
+- **Matvec-style GPU kernels refuse billion-thread grids.** Phase B's
+  dw shapes on a device without cooperative matrices dispatched
+  3072×21504 workgroups — minutes per call, a bake that looked hung.
+  Grid products past 2^22 go to the CPU outright.
+- The Metal context banner logs once, not per operation (a bake left
+  47k copies in its log).
+
 ## [0.5.63] - 2026-08-09
 
 ### Added
