@@ -77,6 +77,8 @@ blob（对齐到 4096）** → 掩码 → 词表 → 稀疏索引。读取器必
 | 2   | `QUANT_2F`     | 目录包含 `q8_2f`/`vbit` 张量（双场 𝒲×θ 量化） |
 | 3   | `DELTA_MASKS`  | 保留：来自父级的 XOR 掩码增量 |
 | 4   | `HOT_PACKS`    | 保留：物化的稠密切片 |
+| 5   | `LOOP_MASKS`   | 掩码行按访问（VISIT）存储（物理层 × 循环数，按遍历优先）——循环 Transformer 的每一遍携带独立掩码（§5.1） |
+| 6   | `SKILL_FILE`   | 该文件是独立技能文件：针对特定基座裁出的部分张量集，由 `SkillRecord.base_dir_hash` 绑定（§9.1）。不可运行——用 `cortiq skill apply` 附加 |
 
 未知的**头部 JSON** 字段被忽略（增量式演进）；
 破坏性变更只通过特性位或 `version` 递增来引入。
@@ -485,6 +487,37 @@ entry (4-aligned):
 偏移量永不改变；旧的 dir/header 字节
 成为死区段尾（兼容：读取器只通过
 信封导航）。压实（`converter/cmf_compact.py`）= 一次普通重写。
+
+### 9.1 独立技能文件（`SKILL_FILE`，位 6）
+
+技能也可以脱离基座旅行：一个 `.cmf`，其张量集只包含烘焙改变的部分
+（加上掩码目录），并通过注册表记录中的身份键绑定到它所裁自的基座：
+
+```json
+"skills": [{
+  "id": "gfx-html",
+  "layers": [0, 1, "...", 21],
+  "base_dir_hash": "9f22593eb458bc6f",
+  "base_arch": "nanbeige",
+  "task": "specialist",
+  "provenance": {"corpus": "…", "tensors": 30}
+}]
+```
+
+- `base_dir_hash` —— 基座文件张量目录字节的 hex `hash64`（信封在
+  `[0x78]` 携带的同一值）。技能是针对精确字节的增量，而非针对架构：
+  当基座目录哈希不同，`apply` 必须拒绝（显式 `--force` 可覆盖；
+  其结果超出规范）。
+- `base_arch`、`task`、`provenance` —— 信息键：人工校验、激活的掩码
+  任务、来源。
+
+任何带 `base_dir_hash` 的记录都会升起位 6：旧读取器大声拒绝，知道
+该位的运行时拒绝运行它（部分张量集不是模型），并指向
+`cortiq skill apply <base> <skill> -o out.cmf` —— 验证密钥、把张量与
+掩码叠加到基座上、写出完整文件（与技能裁出时的专家逐字节等价）。
+
+生命周期：`skill bake`（专家）→ `skill export --base`（增量 + 密钥）→
+发布小文件 → 在任意基座副本上 `skill apply`。
 
 状态：完全实现并把关（容器 + 间接寻址、
 生产配方、recon-argmin 路由、仅追加 + 压实、
