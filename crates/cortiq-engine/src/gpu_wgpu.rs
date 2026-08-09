@@ -9143,6 +9143,211 @@ fn bake_silu_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// The bake attention chain, stage 1: from the fused qkv plane the coop
+/// GEMM left on the card — bias, per-head [q; gate] split, qk-RMSNorm
+/// (inv saved for the backward), RoPE from a HOST-precomputed cos/sin
+/// table (host trigonometry is f64; recomputing angles in f32 on device
+/// is exactly the parity drift the table avoids). One thread per
+/// (row, unit) where units run q-heads, then k-heads, then v-heads.
+const BAKE_QKR_SRC: &str = r#"
+struct QkrP {
+    n: u32, t: u32, nh: u32, nkv: u32,
+    hd: u32, qrows: u32, half: u32, flags: u32,
+    eps: f32, _a: u32, _b: u32, _c: u32,
+};
+@group(0) @binding(0) var<storage, read> qk_plane : array<f32>;
+@group(0) @binding(1) var<storage, read> qk_qnorm : array<f32>;
+@group(0) @binding(2) var<storage, read> qk_knorm : array<f32>;
+@group(0) @binding(3) var<storage, read> qk_bias : array<f32>;
+@group(0) @binding(4) var<storage, read> qk_rope : array<f32>;
+@group(0) @binding(5) var<storage, read_write> qk_qrot : array<f32>;
+@group(0) @binding(6) var<storage, read_write> qk_krot : array<f32>;
+@group(0) @binding(7) var<storage, read_write> qk_vproj : array<f32>;
+@group(0) @binding(8) var<storage, read_write> qk_gate : array<f32>;
+@group(0) @binding(9) var<storage, read_write> qk_qinv : array<f32>;
+@group(0) @binding(10) var<storage, read_write> qk_kinv : array<f32>;
+@group(0) @binding(11) var<uniform> qk_p : QkrP;
+
+const FL_GATED: u32 = 1u;
+const FL_QNORM: u32 = 2u;
+const FL_KNORM: u32 = 4u;
+const FL_GEMMA: u32 = 8u;
+
+var<private> head_buf: array<f32, 256>;
+
+fn qk_rms(len: u32, w_is_q: bool) -> f32 {
+    var ss = 0.0;
+    for (var j = 0u; j < len; j = j + 1u) {
+        ss = ss + head_buf[j] * head_buf[j];
+    }
+    let inv = 1.0 / sqrt(ss / f32(len) + qk_p.eps);
+    for (var j = 0u; j < len; j = j + 1u) {
+        var w: f32;
+        if (w_is_q) { w = qk_qnorm[j]; } else { w = qk_knorm[j]; }
+        if ((qk_p.flags & FL_GEMMA) != 0u) { w = 1.0 + w; }
+        head_buf[j] = head_buf[j] * inv * w;
+    }
+    return inv;
+}
+
+fn qk_rope_apply(pos: u32) {
+    for (var i = 0u; i < qk_p.half; i = i + 1u) {
+        let c = qk_rope[(pos * qk_p.half + i) * 2u];
+        let s = qk_rope[(pos * qk_p.half + i) * 2u + 1u];
+        let x0 = head_buf[i];
+        let x1 = head_buf[i + qk_p.half];
+        head_buf[i] = x0 * c - x1 * s;
+        head_buf[i + qk_p.half] = x0 * s + x1 * c;
+    }
+}
+
+@compute @workgroup_size(64)
+fn bake_qkr(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let units_per_row = qk_p.nh + 2u * qk_p.nkv;
+    let total = qk_p.n * units_per_row;
+    if (gid.x >= total) { return; }
+    let r = gid.x / units_per_row;
+    let u = gid.x % units_per_row;
+    let pos = r % qk_p.t;
+    let hd = qk_p.hd;
+    let kvdim = qk_p.nkv * hd;
+    let fused = qk_p.qrows + 2u * kvdim;
+    let base_row = r * fused;
+    if (u < qk_p.nh) {
+        // q-head u: [q(hd); gate(hd)] when gated, plain q otherwise.
+        let h = u;
+        var src: u32;
+        if ((qk_p.flags & FL_GATED) != 0u) { src = base_row + 2u * h * hd; }
+        else { src = base_row + h * hd; }
+        var boff: u32;
+        if ((qk_p.flags & FL_GATED) != 0u) { boff = 2u * h * hd; } else { boff = h * hd; }
+        for (var j = 0u; j < hd; j = j + 1u) {
+            head_buf[j] = qk_plane[src + j] + qk_bias[boff + j];
+        }
+        var inv = 1.0;
+        if ((qk_p.flags & FL_QNORM) != 0u) { inv = qk_rms(hd, true); }
+        qk_qinv[r * qk_p.nh + h] = inv;
+        qk_rope_apply(pos);
+        let dst = r * qk_p.nh * hd + h * hd;
+        for (var j = 0u; j < hd; j = j + 1u) {
+            qk_qrot[dst + j] = head_buf[j];
+        }
+        if ((qk_p.flags & FL_GATED) != 0u) {
+            for (var j = 0u; j < hd; j = j + 1u) {
+                qk_gate[dst + j] = qk_plane[src + hd + j] + qk_bias[boff + hd + j];
+            }
+        }
+    } else if (u < qk_p.nh + qk_p.nkv) {
+        // k-head
+        let g = u - qk_p.nh;
+        let src = base_row + qk_p.qrows + g * hd;
+        for (var j = 0u; j < hd; j = j + 1u) {
+            head_buf[j] = qk_plane[src + j] + qk_bias[qk_p.qrows + g * hd + j];
+        }
+        var inv = 1.0;
+        if ((qk_p.flags & FL_KNORM) != 0u) { inv = qk_rms(hd, false); }
+        qk_kinv[r * qk_p.nkv + g] = inv;
+        qk_rope_apply(pos);
+        let dst = r * kvdim + g * hd;
+        for (var j = 0u; j < hd; j = j + 1u) {
+            qk_krot[dst + j] = head_buf[j];
+        }
+    } else {
+        // v-head: bias only.
+        let g = u - qk_p.nh - qk_p.nkv;
+        let src = base_row + qk_p.qrows + kvdim + g * hd;
+        let dst = r * kvdim + g * hd;
+        for (var j = 0u; j < hd; j = j + 1u) {
+            qk_vproj[dst + j] = qk_plane[src + j] + qk_bias[qk_p.qrows + kvdim + g * hd + j];
+        }
+    }
+}
+"#;
+
+/// Stage 2: causal max-softmax attention, one workgroup per (query
+/// position, sequence·head). Phase one spreads the ≤t score dots over
+/// the lanes; the reduction and the exp/denominator run on lane 0 (a
+/// few hundred scalar ops — not worth a tree); phase two flips the
+/// axis: each lane owns one output component and walks j SEQUENTIALLY,
+/// which is the host loop's accumulation order per component.
+const BAKE_ATTN_SRC: &str = r#"
+struct AtP { t: u32, nh: u32, nkv: u32, hd: u32, b: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read> at_q : array<f32>;
+@group(0) @binding(1) var<storage, read> at_k : array<f32>;
+@group(0) @binding(2) var<storage, read> at_v : array<f32>;
+@group(0) @binding(3) var<storage, read_write> at_o : array<f32>;
+@group(0) @binding(4) var<uniform> at_p : AtP;
+
+var<workgroup> at_scores: array<f32, 1024>;
+var<workgroup> at_stat: array<f32, 2>;
+
+@compute @workgroup_size(128)
+fn bake_attn_head(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let ti = wid.x;
+    let unit = wid.y;
+    let bi = unit / at_p.nh;
+    let h = unit % at_p.nh;
+    let rep = at_p.nh / at_p.nkv;
+    let g = h / rep;
+    let hd = at_p.hd;
+    let qdim = at_p.nh * hd;
+    let kvdim = at_p.nkv * hd;
+    let scale = 1.0 / sqrt(f32(hd));
+    let qbase = (bi * at_p.t + ti) * qdim + h * hd;
+    // Phase 1: scores for j ≤ ti.
+    for (var j = lid; j <= ti; j = j + 128u) {
+        let kbase = (bi * at_p.t + j) * kvdim + g * hd;
+        var s = 0.0;
+        for (var c = 0u; c < hd; c = c + 1u) {
+            s = s + at_q[qbase + c] * at_k[kbase + c];
+        }
+        at_scores[j] = s * scale;
+    }
+    workgroupBarrier();
+    if (lid == 0u) {
+        var mx = at_scores[0];
+        for (var j = 1u; j <= ti; j = j + 1u) {
+            mx = max(mx, at_scores[j]);
+        }
+        var den = 0.0;
+        for (var j = 0u; j <= ti; j = j + 1u) {
+            let e = exp(at_scores[j] - mx);
+            at_scores[j] = e;
+            den = den + e;
+        }
+        at_stat[0] = den;
+    }
+    workgroupBarrier();
+    // Phase 2: lane c owns output component c, walks j in order.
+    let den = at_stat[0];
+    if (lid < hd) {
+        var acc = 0.0;
+        for (var j = 0u; j <= ti; j = j + 1u) {
+            let p = at_scores[j] / den;
+            acc = acc + p * at_v[(bi * at_p.t + j) * kvdim + g * hd + lid];
+        }
+        at_o[(bi * at_p.t + ti) * qdim + h * hd + lid] = acc;
+    }
+}
+"#;
+
+/// Stage 3: the output gate — ao·σ(gate), elementwise, 2-D dispatch.
+const BAKE_AGATE_SRC: &str = r#"
+struct AgP { total: u32, stride: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read> ag_a : array<f32>;
+@group(0) @binding(1) var<storage, read> ag_g : array<f32>;
+@group(0) @binding(2) var<storage, read_write> ag_o : array<f32>;
+@group(0) @binding(3) var<uniform> ag_p : AgP;
+@compute @workgroup_size(256)
+fn bake_attn_gate(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.y * ag_p.stride + gid.x;
+    if (i >= ag_p.total) { return; }
+    let g = ag_g[i];
+    ag_o[i] = ag_a[i] * (1.0 / (1.0 + exp(-g)));
+}
+"#;
+
 // Split-K decode attention (its own module: the main module's at_* binding
 // slots are taken, and WGSL forbids two resource vars on one binding).
 // `gqa_attend_part` runs the flash-decoding loop over ONE ck-position chunk
@@ -9431,6 +9636,11 @@ struct Ctx {
     bake_silu: wgpu::ComputePipeline,
     /// Its backward: dact + the resident plane → concatenated dgu.
     bake_silu_bwd: wgpu::ComputePipeline,
+    /// The bake attention chain's middle: split+norm+rope, causal
+    /// softmax·V per head, output gate (plain f32 modules).
+    bake_qkr: wgpu::ComputePipeline,
+    bake_attn_head: wgpu::ComputePipeline,
+    bake_attn_gate: wgpu::ComputePipeline,
     /// Per-layer gate+up planes the forward chain parks for the backward
     /// one — the resident graph's memory. Grow-only per layer; ~84 MB a
     /// layer at chunk size, discrete cards only.
@@ -9721,6 +9931,16 @@ struct Scratch {
     /// The FFN chain's device-resident middle (gate+up plane, activation).
     bb: Option<(wgpu::Buffer, u64)>,
     ba: Option<(wgpu::Buffer, u64)>,
+    /// The attention chain's per-call planes (qrot/krot/vproj/gate/ao/
+    /// ao_eff and the two inv vectors).
+    bqr: Option<(wgpu::Buffer, u64)>,
+    bkr: Option<(wgpu::Buffer, u64)>,
+    bvp: Option<(wgpu::Buffer, u64)>,
+    bgp: Option<(wgpu::Buffer, u64)>,
+    bao: Option<(wgpu::Buffer, u64)>,
+    bae: Option<(wgpu::Buffer, u64)>,
+    biq: Option<(wgpu::Buffer, u64)>,
+    bik: Option<(wgpu::Buffer, u64)>,
 }
 
 impl Scratch {
@@ -10274,6 +10494,9 @@ fn init() -> Result<Ctx, String> {
     };
     let bake_silu = plain(BAKE_SILU_SRC, "bake-silu", "bake_silu_mul");
     let bake_silu_bwd = plain(BAKE_SILU_BWD_SRC, "bake-silu-bwd", "bake_silu_bwd");
+    let bake_qkr = plain(BAKE_QKR_SRC, "bake-qkr", "bake_qkr");
+    let bake_attn_head = plain(BAKE_ATTN_SRC, "bake-attn", "bake_attn_head");
+    let bake_attn_gate = plain(BAKE_AGATE_SRC, "bake-agate", "bake_attn_gate");
     let argmax_part = pipe("argmax_part");
     let gdn_step_par = pipe("gdn_step_par");
     let gdn_step_par2 = pipe("gdn_step_par2");
@@ -10563,6 +10786,9 @@ fn init() -> Result<Ctx, String> {
         gemm_nn_coop,
         bake_silu,
         bake_silu_bwd,
+        bake_qkr,
+        bake_attn_head,
+        bake_attn_gate,
         bake_planes: Mutex::new(HashMap::new()),
         argmax_part,
         gdn_step_par,
@@ -27288,6 +27514,314 @@ pub fn bake_release() {
     sc.bst = None;
     sc.bb = None;
     sc.ba = None;
+}
+
+/// Everything the trainer's backward needs from a device attention
+/// forward, read back in one map. `qkv_plane` is the RAW fused
+/// projection (bias not yet applied) — the host derives qpre/kpre/
+/// vproj/gate_pre from it exactly as the host path's split does.
+pub struct AttnChainActs {
+    pub qkv_plane: Vec<f32>,
+    pub qrot: Vec<f32>,
+    pub krot: Vec<f32>,
+    pub qinv: Vec<f32>,
+    pub kinv: Vec<f32>,
+    pub ao: Vec<f32>,
+}
+
+/// Configuration mirror of the replica's `full_attn_fwd` — every field
+/// the host math reads, so the chain can reproduce it bit-honestly.
+pub struct AttnChainCfg<'a> {
+    pub wqkv: &'a [f32],
+    pub wo: &'a [f32],
+    pub q_norm: Option<&'a [f32]>,
+    pub k_norm: Option<&'a [f32]>,
+    /// Concatenated (bq | bk | bv) or None.
+    pub bias: Option<&'a [f32]>,
+    pub output_gate: bool,
+    pub gemma: bool,
+    pub eps: f32,
+    pub rotary_half: usize,
+    /// cos/sin table [t × rotary_half × 2], f32 from HOST f64 trig.
+    pub rope: &'a [f32],
+    pub b: usize,
+    pub t: usize,
+    pub nh: usize,
+    pub nkv: usize,
+    pub hd: usize,
+    pub hsz: usize,
+}
+
+/// The bake's attention forward as ONE device chain: qkv GEMM (tensor
+/// cores) → bias+split+qk-norm+RoPE → causal softmax·V per head →
+/// output gate → wo GEMM (tensor cores) → attn_out. An eval call reads
+/// back 3 MB; a training call adds the activation planes in the same
+/// map. Declines (false) in strict-f32 mode and wherever a shape steps
+/// outside what the kernels take — the caller keeps the host path.
+pub fn attn_chain_f32(
+    n1: &[f32],
+    cfg: &AttnChainCfg,
+    attn_out: &mut [f32],
+    want_acts: bool,
+) -> Option<AttnChainActs> {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
+        return None;
+    }
+    let c = ctx()?;
+    let nt = c.gemm_nt_coop.as_ref()?;
+    let (b, t, nh, nkv, hd, hsz) = (cfg.b, cfg.t, cfg.nh, cfg.nkv, cfg.hd, cfg.hsz);
+    let n = b * t;
+    let qdim = nh * hd;
+    let kvdim = nkv * hd;
+    let qrows = if cfg.output_gate { 2 * qdim } else { qdim };
+    let fused = qrows + 2 * kvdim;
+    if hd > 128
+        || t > 1024
+        || hsz % 4 != 0
+        || nh % nkv != 0
+        || n * hsz * fused < (1 << 22)
+        || cfg.rotary_half * 2 > hd
+        || cfg.rope.len() < t * cfg.rotary_half * 2
+        || n1.len() < n * hsz
+        || cfg.wqkv.len() < fused * hsz
+        || cfg.wo.len() < hsz * qdim
+        || attn_out.len() < n * hsz
+    {
+        return None;
+    }
+    let _bake = BAKE_LOCK.lock().unwrap();
+    let wqkv = bake_weight(c, cfg.wqkv, "bake-wqkv");
+    let wo = bake_weight(c, cfg.wo, "bake-wo");
+    let f4 = |x: usize| (x * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let xbuf = Scratch::ensure(&c.device, &mut sc.bx, f4(n * hsz),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, "bake-x");
+    let plane = Scratch::ensure(&c.device, &mut sc.bb, f4(n * fused),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, "bake-both");
+    let qrot = Scratch::ensure(&c.device, &mut sc.bqr, f4(n * qdim),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, "bake-qrot");
+    let krot = Scratch::ensure(&c.device, &mut sc.bkr, f4(n * kvdim),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, "bake-krot");
+    let vproj = Scratch::ensure(&c.device, &mut sc.bvp, f4(n * kvdim),
+        wgpu::BufferUsages::STORAGE, "bake-vproj");
+    let gate = Scratch::ensure(&c.device, &mut sc.bgp, f4((n * qdim).max(1)),
+        wgpu::BufferUsages::STORAGE, "bake-gate");
+    let ao = Scratch::ensure(&c.device, &mut sc.bao, f4(n * qdim),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, "bake-ao");
+    let ao_eff = Scratch::ensure(&c.device, &mut sc.bae, f4(n * qdim),
+        wgpu::BufferUsages::STORAGE, "bake-aoeff");
+    let qinv = Scratch::ensure(&c.device, &mut sc.biq, f4(n * nh),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, "bake-qinv");
+    let kinv = Scratch::ensure(&c.device, &mut sc.bik, f4(n * nkv),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, "bake-kinv");
+    let ybuf = Scratch::ensure(&c.device, &mut sc.by, f4(n * hsz),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, "bake-y");
+    // Readback plan: attn_out first, then (training) the act planes,
+    // every slice 16-aligned into one staging buffer.
+    let mut offs = vec![(0u64, f4(n * hsz))];
+    if want_acts {
+        for sz in [n * fused, n * qdim, n * kvdim, n * nh, n * nkv, n * qdim] {
+            let start = offs.last().map(|(o, l)| (o + l).div_ceil(16) * 16).unwrap();
+            offs.push((start, f4(sz)));
+        }
+    }
+    let need = offs.last().map(|(o, l)| o + l).unwrap();
+    let stage = Scratch::ensure(&c.device, &mut sc.bst, need,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, "bake-stage");
+    drop(sc);
+    c.queue.write_buffer(&xbuf, 0, bytemuck::cast_slice(&n1[..n * hsz]));
+    // Small constants ride the fingerprinted cache; absent ones bind a
+    // zero plane so the kernel adds nothing.
+    static ONE_F32: [u8; 4] = [0, 0, 0, 0];
+    // The zero-bias plane lives under the graph's (0, len) sentinel key —
+    // a fresh Vec per call would mint a new cache entry per call.
+    let bias_buf = match cfg.bias {
+        Some(bs) => const_buf(c, bytemuck::cast_slice(&bs[..fused])),
+        None => {
+            let key = (0usize, fused * 4);
+            let mut cb = c.const_bufs.lock().unwrap();
+            match cb.get(&key) {
+                Some((b, _)) => b.clone(),
+                None => {
+                    let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("g-zero"),
+                        size: (fused * 4) as u64,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    c.queue.write_buffer(&b, 0, &vec![0u8; fused * 4]);
+                    cb.insert(key, (b.clone(), 0));
+                    b
+                }
+            }
+        }
+    };
+    let qnorm_buf = match cfg.q_norm {
+        Some(w) => const_buf(c, bytemuck::cast_slice(&w[..hd])),
+        None => const_buf(c, &ONE_F32),
+    };
+    let knorm_buf = match cfg.k_norm {
+        Some(w) => const_buf(c, bytemuck::cast_slice(&w[..hd])),
+        None => const_buf(c, &ONE_F32),
+    };
+    let rope_buf = const_buf(c, bytemuck::cast_slice(&cfg.rope[..t * cfg.rotary_half * 2]));
+    let uni = |v: [u32; 4]| {
+        c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&v),
+            usage: wgpu::BufferUsages::UNIFORM,
+        })
+    };
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bake-attn") });
+    {
+        // qkv = n1 · wqkvᵀ on the matrix units.
+        let u = uni([(hsz / 4) as u32, fused as u32, n as u32, 0]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &nt.get_bind_group_layout(0),
+            entries: &[bind_buf(0, &wqkv), bind_buf(1, &xbuf), bind_buf(2, &plane), bind_buf(3, &u)],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(nt);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((fused as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
+    }
+    {
+        let flags = (cfg.output_gate as u32)
+            | ((cfg.q_norm.is_some() as u32) << 1)
+            | ((cfg.k_norm.is_some() as u32) << 2)
+            | ((cfg.gemma as u32) << 3);
+        let params: [u32; 12] = [
+            n as u32, t as u32, nh as u32, nkv as u32,
+            hd as u32, qrows as u32, cfg.rotary_half as u32, flags,
+            cfg.eps.to_bits(), 0, 0, 0,
+        ];
+        let u = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.bake_qkr.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &plane), bind_buf(1, &qnorm_buf), bind_buf(2, &knorm_buf),
+                bind_buf(3, &bias_buf), bind_buf(4, &rope_buf), bind_buf(5, &qrot),
+                bind_buf(6, &krot), bind_buf(7, &vproj), bind_buf(8, &gate),
+                bind_buf(9, &qinv), bind_buf(10, &kinv), bind_buf(11, &u),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.bake_qkr);
+        pass.set_bind_group(0, &bind, &[]);
+        let units = (n * (nh + 2 * nkv)) as u32;
+        pass.dispatch_workgroups(units.div_ceil(64), 1, 1);
+    }
+    {
+        let u2 = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[t as u32, nh as u32, nkv as u32, hd as u32, b as u32, 0, 0, 0]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.bake_attn_head.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &qrot), bind_buf(1, &krot), bind_buf(2, &vproj),
+                bind_buf(3, &ao), bind_buf(4, &u2),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.bake_attn_head);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(t as u32, (b * nh) as u32, 1);
+    }
+    let wo_input = if cfg.output_gate {
+        let total = (n * qdim) as u32;
+        let wgs = total.div_ceil(256);
+        let gx = wgs.min(32_768);
+        let gy = wgs.div_ceil(32_768);
+        let u = uni([total, gx * 256, 0, 0]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.bake_attn_gate.get_bind_group_layout(0),
+            entries: &[bind_buf(0, &ao), bind_buf(1, &gate), bind_buf(2, &ao_eff), bind_buf(3, &u)],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.bake_attn_gate);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(gx, gy, 1);
+        &ao_eff
+    } else {
+        &ao
+    };
+    {
+        // attn_out = ao_eff · woᵀ on the matrix units.
+        let u = uni([(qdim / 4) as u32, hsz as u32, n as u32, 0]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &nt.get_bind_group_layout(0),
+            entries: &[bind_buf(0, &wo), bind_buf(1, wo_input), bind_buf(2, &ybuf), bind_buf(3, &u)],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(nt);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((hsz as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
+    }
+    enc.copy_buffer_to_buffer(&ybuf, 0, &stage, offs[0].0, offs[0].1);
+    if want_acts {
+        for (i, buf) in [&plane, &qrot, &krot, &qinv, &kinv, &ao].iter().enumerate() {
+            enc.copy_buffer_to_buffer(buf, 0, &stage, offs[i + 1].0, offs[i + 1].1);
+        }
+    }
+    submit(c, enc.finish());
+    let slice = stage.slice(..need);
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d2 = done.clone();
+    slice.map_async(wgpu::MapMode::Read, move |_| {
+        d2.store(true, std::sync::atomic::Ordering::Release);
+    });
+    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return None;
+    }
+    let mut acts = None;
+    {
+        let Ok(data) = slice.get_mapped_range() else {
+            stage.unmap();
+            return None;
+        };
+        let read = |o: u64, l: u64| -> Vec<f32> {
+            bytemuck::cast_slice(&data[o as usize..(o + l) as usize]).to_vec()
+        };
+        par_copy(
+            &mut attn_out[..n * hsz],
+            bytemuck::cast_slice(&data[offs[0].0 as usize..(offs[0].0 + offs[0].1) as usize]),
+        );
+        if want_acts {
+            acts = Some(AttnChainActs {
+                qkv_plane: read(offs[1].0, offs[1].1),
+                qrot: read(offs[2].0, offs[2].1),
+                krot: read(offs[3].0, offs[3].1),
+                qinv: read(offs[4].0, offs[4].1),
+                kinv: read(offs[5].0, offs[5].1),
+                ao: read(offs[6].0, offs[6].1),
+            });
+        }
+    }
+    stage.unmap();
+    if !want_acts {
+        return Some(AttnChainActs {
+            qkv_plane: Vec::new(),
+            qrot: Vec::new(),
+            krot: Vec::new(),
+            qinv: Vec::new(),
+            kinv: Vec::new(),
+            ao: Vec::new(),
+        });
+    }
+    acts
 }
 
 /// The frozen FFN's backward as one device chain, fed by the plane the

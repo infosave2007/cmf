@@ -217,6 +217,170 @@ fn bake_ffn_chain_matches_host_composition() {
     }
 }
 
+/// The whole attention forward chain against a host reference that
+/// mirrors the replica's math: qkv GEMM → bias + gate split → qk-RMSNorm
+/// → RoPE (f64 angles) → causal max-softmax·V per head (GQA) → σ(gate)
+/// → wo GEMM. Gated + normed + biased — every branch the kernel has.
+#[test]
+fn bake_attn_chain_matches_host_reference() {
+    unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+    let (b, t, nh, nkv, hd, hsz) = (2usize, 64usize, 4usize, 2usize, 64usize, 256usize);
+    let n = b * t;
+    let (qdim, kvdim) = (nh * hd, nkv * hd);
+    let qrows = 2 * qdim; // output gate on
+    let fused = qrows + 2 * kvdim;
+    let half = hd / 2;
+    let g = |i: usize, m: usize, s: f32| ((i * 29 + m) % 97) as f32 / 97.0 * s - s / 2.0;
+    let n1: Vec<f32> = (0..n * hsz).map(|i| g(i, 13, 1.0)).collect();
+    let wqkv: Vec<f32> = (0..fused * hsz).map(|i| g(i, 17, 0.2)).collect();
+    let wo: Vec<f32> = (0..hsz * qdim).map(|i| g(i, 23, 0.2)).collect();
+    let qn: Vec<f32> = (0..hd).map(|i| 0.8 + g(i, 5, 0.2)).collect();
+    let kn: Vec<f32> = (0..hd).map(|i| 0.9 + g(i, 7, 0.2)).collect();
+    let bias: Vec<f32> = (0..fused).map(|i| g(i, 11, 0.1)).collect();
+    let inv_freq: Vec<f64> = (0..half)
+        .map(|i| 1.0 / 10_000f64.powf(2.0 * i as f64 / hd as f64))
+        .collect();
+    let mut rope = Vec::with_capacity(t * half * 2);
+    for pos in 0..t {
+        for &f in &inv_freq {
+            let a = pos as f64 * f;
+            rope.push(a.cos() as f32);
+            rope.push(a.sin() as f32);
+        }
+    }
+    let eps = 1e-6f32;
+    let cfg = cortiq_engine::gpu_wgpu::AttnChainCfg {
+        wqkv: &wqkv,
+        wo: &wo,
+        q_norm: Some(&qn),
+        k_norm: Some(&kn),
+        bias: Some(&bias),
+        output_gate: true,
+        gemma: false,
+        eps,
+        rotary_half: half,
+        rope: &rope,
+        b,
+        t,
+        nh,
+        nkv,
+        hd,
+        hsz,
+    };
+    let mut got = vec![0f32; n * hsz];
+    let Some(acts) = cortiq_engine::gpu_wgpu::attn_chain_f32(&n1, &cfg, &mut got, true) else {
+        eprintln!("attention chain declined (no cooperative arm here) — skipped");
+        return;
+    };
+    // ── host reference ──
+    let mut plane = vec![0f32; n * fused];
+    for r in 0..n {
+        for j in 0..fused {
+            let mut a = 0f64;
+            for p in 0..hsz {
+                a += n1[r * hsz + p] as f64 * wqkv[j * hsz + p] as f64;
+            }
+            plane[r * fused + j] = a as f32 + bias[j];
+        }
+    }
+    let silu_sig = |x: f32| 1.0 / (1.0 + (-x).exp());
+    let mut qrot = vec![0f32; n * qdim];
+    let mut krot = vec![0f32; n * kvdim];
+    let mut vproj = vec![0f32; n * kvdim];
+    let mut gate_pre = vec![0f32; n * qdim];
+    let norm_rope = |head: &mut [f32], w: &[f32], pos: usize| {
+        let ss: f64 = head.iter().map(|&x| (x as f64) * (x as f64)).sum();
+        let inv = (1.0 / (ss / hd as f64 + eps as f64).sqrt()) as f32;
+        for (j, x) in head.iter_mut().enumerate() {
+            *x *= inv * w[j];
+        }
+        for i in 0..half {
+            let a = pos as f64 * inv_freq[i];
+            let (c, s) = (a.cos() as f32, a.sin() as f32);
+            let (x0, x1) = (head[i], head[i + half]);
+            head[i] = x0 * c - x1 * s;
+            head[i + half] = x0 * s + x1 * c;
+        }
+    };
+    for r in 0..n {
+        let pos = r % t;
+        let row = &plane[r * fused..(r + 1) * fused];
+        for h in 0..nh {
+            let mut hb: Vec<f32> = row[2 * h * hd..2 * h * hd + hd].to_vec();
+            norm_rope(&mut hb, &qn, pos);
+            qrot[r * qdim + h * hd..r * qdim + (h + 1) * hd].copy_from_slice(&hb);
+            gate_pre[r * qdim + h * hd..r * qdim + (h + 1) * hd]
+                .copy_from_slice(&row[2 * h * hd + hd..2 * h * hd + 2 * hd]);
+        }
+        for gi in 0..nkv {
+            let mut hb: Vec<f32> = row[qrows + gi * hd..qrows + (gi + 1) * hd].to_vec();
+            norm_rope(&mut hb, &kn, pos);
+            krot[r * kvdim + gi * hd..r * kvdim + (gi + 1) * hd].copy_from_slice(&hb);
+            vproj[r * kvdim + gi * hd..r * kvdim + (gi + 1) * hd]
+                .copy_from_slice(&row[qrows + kvdim + gi * hd..qrows + kvdim + (gi + 1) * hd]);
+        }
+    }
+    let rep = nh / nkv;
+    let scale = 1.0 / (hd as f64).sqrt();
+    let mut ao = vec![0f32; n * qdim];
+    for bi in 0..b {
+        for h in 0..nh {
+            let gi = h / rep;
+            for ti in 0..t {
+                let qb = (bi * t + ti) * qdim + h * hd;
+                let mut sc = vec![0f64; ti + 1];
+                let mut mx = f64::NEG_INFINITY;
+                for j in 0..=ti {
+                    let kb = (bi * t + j) * kvdim + gi * hd;
+                    let mut s = 0f64;
+                    for c in 0..hd {
+                        s += qrot[qb + c] as f64 * krot[kb + c] as f64;
+                    }
+                    sc[j] = s * scale;
+                    mx = mx.max(sc[j]);
+                }
+                let mut den = 0f64;
+                for v in sc.iter_mut() {
+                    *v = (*v - mx).exp();
+                    den += *v;
+                }
+                for c in 0..hd {
+                    let mut acc = 0f64;
+                    for j in 0..=ti {
+                        acc += sc[j] / den
+                            * vproj[(bi * t + j) * kvdim + gi * hd + c] as f64;
+                    }
+                    ao[(bi * t + ti) * qdim + h * hd + c] = acc as f32;
+                }
+            }
+        }
+    }
+    let mut r_out = vec![0f32; n * hsz];
+    for r in 0..n {
+        for o in 0..hsz {
+            let mut a = 0f64;
+            for j in 0..qdim {
+                a += (ao[r * qdim + j] * silu_sig(gate_pre[r * qdim + j])) as f64
+                    * wo[o * qdim + j] as f64;
+            }
+            r_out[r * hsz + o] = a as f32;
+        }
+    }
+    let cmp = |name: &str, a: &[f32], r: &[f32], tol: f32| {
+        let scale = r.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = a.iter().zip(r).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        assert!(
+            worst <= tol * scale.max(1.0),
+            "{name}: worst |Δ| {worst} (scale {scale})"
+        );
+        println!("attn chain {name}: worst |Δ| {worst:.2e} / scale {scale:.2}");
+    };
+    cmp("attn_out", &got, &r_out, 2e-2);
+    cmp("qrot", &acts.qrot, &qrot, 1e-2);
+    cmp("krot", &acts.krot, &krot, 1e-2);
+    cmp("ao", &acts.ao, &ao, 1e-2);
+}
+
 /// The backward chain against its host composition, fed by the plane a
 /// forward call parked — the resident-graph handshake end to end.
 #[test]

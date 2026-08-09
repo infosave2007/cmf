@@ -248,6 +248,10 @@ enum FcdAttn {
         q_norm: Option<Vec<f32>>,
         k_norm: Option<Vec<f32>>,
         bias: Option<(Vec<f32>, Vec<f32>, Vec<f32>)>,
+        /// (bq|bk|bv) concatenated once at build: the device chain binds
+        /// it by a STABLE address, which is what keeps the fingerprinted
+        /// const cache from minting an entry per call.
+        bias_cat: Option<Vec<f32>>,
         /// Qwen3.5: wq rows = 2·nh·hd, per-head [q; gate]; the head
         /// outputs are multiplied by σ(gate) before o_proj.
         output_gate: bool,
@@ -320,6 +324,10 @@ pub struct FcdModel {
     /// eagerly — 16.7 GB for a 4 B model before the fused concats, ~25
     /// after — which a 24 GB laptop answered with ten minutes of swap.
     mats_cache: Vec<std::sync::Mutex<Option<std::sync::Arc<LayerMats>>>>,
+    /// cos/sin table for the device attention chain, keyed by t. Arc so
+    /// the underlying address stays STABLE across calls — the GPU const
+    /// cache dedups uploads by (pointer, fingerprint).
+    rope_tab: std::sync::Mutex<Option<(usize, std::sync::Arc<Vec<f32>>)>>,
     /// How many layers stay resident (0 = all, big machines).
     mats_window: usize,
     /// Which layers run the Nyström kernel in the student forward.
@@ -600,11 +608,19 @@ impl FcdModel {
                     };
                     let qrows = wq.len() / h;
                     drop(wq);
+                    let bias_cat = bias.as_ref().map(|(bq, bk, bv)| {
+                        let mut v = Vec::with_capacity(bq.len() + bk.len() + bv.len());
+                        v.extend_from_slice(bq);
+                        v.extend_from_slice(bk);
+                        v.extend_from_slice(bv);
+                        v
+                    });
                     FcdAttn::Full {
                         qrows,
                         q_norm: opt("q_norm.weight"),
                         k_norm: opt("k_norm.weight"),
                         bias,
+                        bias_cat,
                         output_gate,
                     }
                 }
@@ -683,6 +699,7 @@ impl FcdModel {
         Ok(Self {
             src: model.clone(),
             mats_cache,
+            rope_tab: std::sync::Mutex::new(None),
             mats_window,
             hidden: h,
             nh,
@@ -1114,6 +1131,7 @@ impl FcdModel {
             q_norm,
             k_norm,
             bias,
+            bias_cat,
             output_gate,
         } = attn
         else {
@@ -1127,10 +1145,116 @@ impl FcdModel {
         let rep = nh / nkv;
         let qrows = if *output_gate { 2 * qdim } else { qdim };
 
+        let fused = qrows + 2 * kvdim;
+        // ── device chain: the whole attention forward in one submit ──
+        // Declines in strict-f32 mode, on Nyström layers (their kernel is
+        // certified f64 and stays host), and wherever a shape steps
+        // outside the kernels; the host path below is the fallback and
+        // the reference.
+        #[cfg(feature = "gpu")]
+        if !nystrom && crate::gpu::enabled_here() {
+            let want_acts = true; // the caller always builds acts today
+            let rope = {
+                let mut rt = self.rope_tab.lock().unwrap();
+                match rt.as_ref() {
+                    Some((tt, arc)) if *tt == t => arc.clone(),
+                    _ => {
+                        let half = self.rotary_dim / 2;
+                        let mut tab = Vec::with_capacity(t * half * 2);
+                        for pos in 0..t {
+                            for (_i, &freq) in self.inv_freq.iter().enumerate() {
+                                let a = pos as f64 * freq;
+                                tab.push(a.cos() as f32);
+                                tab.push(a.sin() as f32);
+                            }
+                        }
+                        let arc = std::sync::Arc::new(tab);
+                        *rt = Some((t, arc.clone()));
+                        arc
+                    }
+                }
+            };
+            let cfg = crate::gpu_wgpu::AttnChainCfg {
+                wqkv,
+                wo,
+                q_norm: q_norm.as_deref(),
+                k_norm: k_norm.as_deref(),
+                bias: bias_cat.as_deref(),
+                output_gate: *output_gate,
+                gemma: self.gemma,
+                eps: self.eps as f32,
+                rotary_half: self.rotary_dim / 2,
+                rope: &rope,
+                b,
+                t,
+                nh,
+                nkv,
+                hd,
+                hsz: self.hidden,
+            };
+            let mut attn_out = vec![0f32; n * self.hidden];
+            if let Some(ch) = crate::gpu_wgpu::attn_chain_f32(n1, &cfg, &mut attn_out, want_acts)
+            {
+                // Rebuild the host-visible acts from the raw plane, with
+                // exactly the host split's bias/gate arithmetic.
+                let mut qraw = vec![0f32; n * qrows];
+                let mut kpre = vec![0f32; n * kvdim];
+                let mut vproj = vec![0f32; n * kvdim];
+                for r in 0..n {
+                    let row = &ch.qkv_plane[r * fused..(r + 1) * fused];
+                    qraw[r * qrows..(r + 1) * qrows].copy_from_slice(&row[..qrows]);
+                    kpre[r * kvdim..(r + 1) * kvdim]
+                        .copy_from_slice(&row[qrows..qrows + kvdim]);
+                    vproj[r * kvdim..(r + 1) * kvdim].copy_from_slice(&row[qrows + kvdim..]);
+                }
+                if let Some((bq, bk, bv)) = bias {
+                    for r in 0..n {
+                        for (x, bb) in qraw[r * qrows..(r + 1) * qrows].iter_mut().zip(bq) {
+                            *x += bb;
+                        }
+                        for (x, bb) in kpre[r * kvdim..(r + 1) * kvdim].iter_mut().zip(bk) {
+                            *x += bb;
+                        }
+                        for (x, bb) in vproj[r * kvdim..(r + 1) * kvdim].iter_mut().zip(bv) {
+                            *x += bb;
+                        }
+                    }
+                }
+                let (qpre, gate_pre) = if *output_gate {
+                    let mut qh = vec![0f32; n * qdim];
+                    let mut gp = vec![0f32; n * qdim];
+                    for r in 0..n {
+                        for h in 0..nh {
+                            let src = r * qrows + 2 * h * hd;
+                            let dst = r * qdim + h * hd;
+                            qh[dst..dst + hd].copy_from_slice(&qraw[src..src + hd]);
+                            gp[dst..dst + hd].copy_from_slice(&qraw[src + hd..src + 2 * hd]);
+                        }
+                    }
+                    (qh, gp)
+                } else {
+                    (qraw, Vec::new())
+                };
+                return (
+                    attn_out,
+                    AttnActs::Full {
+                        qpre,
+                        kpre,
+                        vproj,
+                        qrot: ch.qrot,
+                        krot: ch.krot,
+                        qinv: ch.qinv,
+                        kinv: ch.kinv,
+                        ao: ch.ao,
+                        gate_pre,
+                    },
+                );
+            }
+        }
+
         // One fused submit; the split back into three buffers is a
         // memcpy that costs microseconds and keeps everything below
         // this line byte-identical to the unfused path.
-        let fused = qrows + 2 * kvdim;
         let mut qkv = vec![0f32; n * fused];
         ops::gemm_nt(n1, wqkv, &mut qkv, n, hsz, fused, pool);
         let mut qraw = vec![0f32; n * qrows];
