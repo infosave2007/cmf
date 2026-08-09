@@ -27057,8 +27057,12 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
         .as_ref()
         .filter(|_| k % 4 == 0 && m.div_ceil(64) <= 65_535 && n.div_ceil(64) <= 65_535)
         .filter(|_| c.discrete || (m <= 65_000 && n <= 65_000));
-    // The scalar arm's dispatch is (m, n) workgroups — huge dims are illegal.
-    if coop.is_none() && (m > 65_000 || n > 65_000) {
+    // The scalar arm's dispatch is (m, n) workgroups — huge dims are
+    // illegal, and a huge PRODUCT is a hang: a phase-B dw shape
+    // (3072×21504 = 66M workgroups, four billion threads) ran minutes
+    // per call on an M4 and looked like a stuck bake. Matvec-style
+    // kernels are for matvec-style grids; anything bigger is the CPU's.
+    if coop.is_none() && (m > 65_000 || n > 65_000 || m.saturating_mul(n) > (1 << 22)) {
         return false;
     }
     if x.len() < n * k || w.len() < m * k || y.len() < n * m {
@@ -27220,6 +27224,12 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
         .gemm_nn_coop
         .as_ref()
         .filter(|_| m % 4 == 0 && k.div_ceil(64) <= 65_535 && n.div_ceil(64) <= 65_535);
+    // Same grid-product guard as the forward: the scalar dx dispatch is
+    // (k, n) workgroups, and a matvec-style kernel must not take a
+    // billion-thread grid.
+    if coop.is_none() && k.saturating_mul(n) > (1 << 22) {
+        return false;
+    }
     if let Some(pipe) = coop {
         // MmP for the NN twin: cols4 = reduction (m) / 4, rows = dx's
         // width (k), nb = tokens (n).
