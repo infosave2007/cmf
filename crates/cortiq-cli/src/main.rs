@@ -1009,6 +1009,40 @@ fn progress_reporter(what: &'static str) -> impl FnMut(f32) {
 
 #[derive(Subcommand)]
 enum SkillCmd {
+    /// Cut a baked specialist against its base into a STANDALONE skill
+    /// file: only the tensors that changed, the mask catalog, and the
+    /// identity keys binding it to the base's exact bytes
+    Export {
+        /// The baked specialist .cmf
+        specialist: String,
+        /// The base .cmf it was baked from
+        #[arg(long)]
+        base: String,
+        /// Skill id ([A-Za-z0-9_-])
+        #[arg(long)]
+        id: String,
+        /// Human-readable name
+        #[arg(long)]
+        name: Option<String>,
+        /// Output skill file
+        #[arg(short, long)]
+        output: String,
+    },
+    /// Attach a standalone skill file to its base: verify the identity
+    /// keys, overlay the tensors and masks, write the specialist
+    Apply {
+        /// The base .cmf the skill was cut against
+        base: String,
+        /// The skill file
+        skill: String,
+        /// Output specialist .cmf
+        #[arg(short, long)]
+        output: String,
+        /// Attach even if the base's directory hash does not match the
+        /// skill's key (the result is unsupported territory)
+        #[arg(long)]
+        force: bool,
+    },
     /// Graft a skill from a donor HF checkpoint (same architecture):
     /// replacement tensors + routing subspace + measured quality
     Add {
@@ -1547,6 +1581,19 @@ async fn main() -> anyhow::Result<()> {
                 hf_token.as_deref(),
             ),
             SkillCmd::List { model } => skill::run_skill_list(&model),
+            SkillCmd::Export {
+                specialist,
+                base,
+                id,
+                name,
+                output,
+            } => skill::run_skill_export(&specialist, &base, &id, name.as_deref(), &output),
+            SkillCmd::Apply {
+                base,
+                skill,
+                output,
+                force,
+            } => skill::run_skill_apply(&base, &skill, &output, force),
             SkillCmd::Bake {
                 model,
                 files,

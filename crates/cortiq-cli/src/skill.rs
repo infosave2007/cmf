@@ -16,7 +16,7 @@ use anyhow::Context as _;
 use base64::Engine as _;
 use cortiq_core::mask::{MaskCatalog, MaskPriority, TaskMask};
 use cortiq_core::quant::f32_to_f16;
-use cortiq_core::{CmfModel, SelectionDescriptor, SkillRecord, TensorDtype, TensorSpec};
+use cortiq_core::{CmfModel, SelectionDescriptor, SkillRecord, TensorDtype, TensorEntry, TensorSpec};
 use cortiq_engine::{Pipeline, SamplerConfig};
 use std::path::Path;
 use std::sync::Arc;
@@ -448,6 +448,10 @@ pub fn run_skill_add(
         selection,
         input_mask_task: None,
         quality: None, // measured below, on the REBUILT file
+        base_dir_hash: None,
+        base_arch: None,
+        task: None,
+        provenance: None,
     });
 
     let out_path = output.unwrap_or(model_path).to_string();
@@ -665,6 +669,171 @@ pub fn run_skill_add(
     drop(model);
     std::fs::rename(&tmp, &out_path)?;
     println!("✓ wrote {out_path}");
+    Ok(())
+}
+
+/// Cut a baked specialist against its base into a standalone skill file:
+/// the tensors whose directory hashes differ, the mask catalog, and the
+/// identity keys (`base_dir_hash`, `base_arch`, `task`) that let `apply`
+/// refuse the wrong base. Payloads are borrowed straight from the
+/// specialist's mmap — a 2.4 GB specialist exports without materializing.
+pub fn run_skill_export(
+    specialist_path: &str,
+    base_path: &str,
+    id: &str,
+    name: Option<&str>,
+    output: &str,
+) -> anyhow::Result<()> {
+    use cortiq_core::TensorSpecRef;
+    let spec = CmfModel::open(specialist_path)?;
+    let base = CmfModel::open(base_path)?;
+    if spec.header.arch.arch_name != base.header.arch.arch_name
+        || spec.header.arch.num_layers != base.header.arch.num_layers
+        || spec.header.arch.hidden_size != base.header.arch.hidden_size
+    {
+        anyhow::bail!(
+            "specialist and base disagree on architecture ({} vs {}) — nothing to cut",
+            spec.header.arch.arch_name,
+            base.header.arch.arch_name
+        );
+    }
+    let base_by_name: std::collections::HashMap<&str, u64> =
+        base.tensors.iter().map(|t| (t.name.as_str(), t.hash)).collect();
+    let mut refs: Vec<TensorSpecRef> = Vec::new();
+    let mut layers: Vec<usize> = Vec::new();
+    let sbytes = spec.primary_bytes();
+    for e in &spec.tensors {
+        if base_by_name.get(e.name.as_str()) == Some(&e.hash) {
+            continue; // byte-identical to the base — the base carries it
+        }
+        let abs = spec
+            .entry_abs_offset(e)
+            .ok_or_else(|| anyhow::anyhow!("tensor {} out of bounds", e.name))?;
+        refs.push(TensorSpecRef {
+            name: e.name.clone(),
+            dtype: e.dtype,
+            shape: e.shape.clone(),
+            data: &sbytes[abs..abs + e.nbytes as usize],
+        });
+        if let Some(li) = e
+            .name
+            .strip_prefix("model.layers.")
+            .and_then(|r| r.split('.').next())
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            if !layers.contains(&li) {
+                layers.push(li);
+            }
+        }
+    }
+    if refs.is_empty() {
+        anyhow::bail!("specialist and base are byte-identical — no skill to export");
+    }
+    layers.sort_unstable();
+    let mut header = spec.header.clone();
+    header.skills = vec![SkillRecord {
+        id: id.to_string(),
+        name: name.map(str::to_string),
+        layers: layers.clone(),
+        selection: None,
+        input_mask_task: None,
+        quality: None,
+        base_dir_hash: Some(format!("{:016x}", base.dir_hash())),
+        base_arch: Some(base.header.arch.arch_name.clone()),
+        task: (!spec.masks.default_task.is_empty()).then(|| spec.masks.default_task.clone()),
+        provenance: Some(serde_json::json!({
+            "cut_from": std::path::Path::new(specialist_path)
+                .file_name().map(|s| s.to_string_lossy().into_owned()),
+            "tensors": refs.len(),
+        })),
+    }];
+    let catalog = (!spec.masks.masks.is_empty()).then(|| spec.masks.clone());
+    CmfModel::write_ref(output, &header, &refs, catalog.as_ref(), None)?;
+    let sz = std::fs::metadata(output)?.len();
+    println!(
+        "✓ skill '{id}': {} tensor(s) across layers {:?}, {} masks | {:.1} MB (specialist was {:.1} MB)",
+        refs.len(),
+        layers,
+        spec.masks.masks.len(),
+        sz as f64 / 1e6,
+        std::fs::metadata(specialist_path)?.len() as f64 / 1e6,
+    );
+    Ok(())
+}
+
+/// Attach a standalone skill to its base: verify the identity keys, lay
+/// the skill's tensors over the base's, carry the skill's masks, write
+/// the specialist. Both payload sets are borrowed mmaps.
+pub fn run_skill_apply(
+    base_path: &str,
+    skill_path: &str,
+    output: &str,
+    force: bool,
+) -> anyhow::Result<()> {
+    use cortiq_core::TensorSpecRef;
+    let base = CmfModel::open(base_path)?;
+    let skill = CmfModel::open(skill_path)?;
+    let rec = skill
+        .header
+        .skills
+        .iter()
+        .find(|s| s.base_dir_hash.is_some())
+        .ok_or_else(|| {
+            anyhow::anyhow!("{skill_path} carries no standalone-skill record — not a skill file")
+        })?;
+    let want = rec.base_dir_hash.as_deref().unwrap_or_default();
+    let have = format!("{:016x}", base.dir_hash());
+    if want != have {
+        if force {
+            eprintln!(
+                "warning: base directory hash {have} does not match the skill's key {want} — \
+                 --force accepted, the result is unsupported territory"
+            );
+        } else {
+            anyhow::bail!(
+                "this skill was cut against a different base (key {want}, this base {have}).\n\
+                 The right base is '{}' with exactly those bytes; --force overrides.",
+                rec.base_arch.as_deref().unwrap_or("?"),
+            );
+        }
+    }
+    let over: std::collections::HashMap<&str, &TensorEntry> =
+        skill.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+    let bbytes = base.primary_bytes();
+    let sbytes = skill.primary_bytes();
+    let mut refs: Vec<TensorSpecRef> = Vec::with_capacity(base.tensors.len());
+    let mut replaced = 0usize;
+    for e in &base.tensors {
+        let (src, m, bytes) = match over.get(e.name.as_str()) {
+            Some(s) => (*s, &skill, sbytes),
+            None => (e, &base, bbytes),
+        };
+        let abs = m
+            .entry_abs_offset(src)
+            .ok_or_else(|| anyhow::anyhow!("tensor {} out of bounds", src.name))?;
+        if over.contains_key(e.name.as_str()) {
+            replaced += 1;
+        }
+        refs.push(TensorSpecRef {
+            name: src.name.clone(),
+            dtype: src.dtype,
+            shape: src.shape.clone(),
+            data: &bytes[abs..abs + src.nbytes as usize],
+        });
+    }
+    let mut header = base.header.clone();
+    // The record rides along minus the binding keys: the output is a
+    // complete model again, not a partial file.
+    let mut carried = rec.clone();
+    carried.base_dir_hash = None;
+    header.skills = vec![carried];
+    let catalog = (!skill.masks.masks.is_empty()).then(|| skill.masks.clone());
+    CmfModel::write_ref(output, &header, &refs, catalog.as_ref(), base.vocab.as_deref())?;
+    println!(
+        "✓ applied skill '{}': {replaced} tensor(s) replaced, {} masks carried → {output}",
+        rec.id,
+        skill.masks.masks.len()
+    );
     Ok(())
 }
 
