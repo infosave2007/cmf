@@ -26736,6 +26736,26 @@ use crate::gpu::fp_bytes;
 /// is sequential in practice; this makes the API safe rather than lucky.
 static BAKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Strict-f32 mode for the bake GEMMs: the coop arms and device chains
+/// stand down and everything runs the scalar f32 kernels. Phase A turns
+/// this ON for its training steps: the mask SELECTS neurons by a
+/// gradient signal, and f16 operand rounding (~1e-3) on that signal
+/// compounds over ~90 steps into closing the wrong ones — measured as
+/// hard-PPL 5.207 vs 4.293 at the same 2.56% sparsity, twice, while an
+/// f32 run reproduces the reference trajectory to the third decimal.
+/// Forward/eval sweeps stay on tensor cores everywhere: their PPL
+/// matches the f32 path exactly at print precision.
+static BAKE_F32_STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn bake_precision_strict(on: bool) {
+    BAKE_F32_STRICT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn f32_strict() -> bool {
+    BAKE_F32_STRICT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A bake weight on the card — but RESIDENT only once it has proven it
 /// recurs. Phase B hands this function a fresh activation matrix per dw
 /// step; a cache that adopts everything it sees grows by 250 MB a step
@@ -26792,7 +26812,7 @@ fn bake_weight(c: &Ctx, w: &[f32], label: &'static str) -> wgpu::Buffer {
 }
 
 pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
-    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
         return false;
     }
     let Some(c) = ctx() else { return false };
@@ -26903,7 +26923,7 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
 /// calls it three times a layer and nothing else touches the card
 /// there, so this is what decides whether a bake is GPU work or not.
 pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m: usize) -> bool {
-    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
         return false;
     }
     let Some(c) = ctx() else { return false };
@@ -27053,7 +27073,7 @@ pub fn ffn_chain_f32(
     let Some(nt) = c.gemm_nt_coop.as_ref() else {
         return false;
     };
-    if hsz % 4 != 0 || inter % 4 != 0 || n * hsz * 2 * inter < (1 << 22) {
+    if f32_strict() || hsz % 4 != 0 || inter % 4 != 0 || n * hsz * 2 * inter < (1 << 22) {
         return false;
     }
     if (2 * inter).div_ceil(64) > 65_535 || n.div_ceil(64) > 65_535 || hsz.div_ceil(64) > 65_535 {
@@ -27294,7 +27314,8 @@ pub fn ffn_bwd_chain_f32(
     let Some(nn) = c.gemm_nn_coop.as_ref() else {
         return false;
     };
-    if !c.discrete || hsz % 4 != 0 || inter % 2 != 0 || n * hsz * 2 * inter < (1 << 22) {
+    if f32_strict() || !c.discrete || hsz % 4 != 0 || inter % 2 != 0 || n * hsz * 2 * inter < (1 << 22)
+    {
         return false;
     }
     if inter.div_ceil(64) > 65_535 || hsz.div_ceil(64) > 65_535 || n.div_ceil(64) > 65_535 {
