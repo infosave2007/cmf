@@ -177,6 +177,10 @@ fn write_swarm(path: &std::path::Path, with_skill: bool) -> u64 {
             selection: None,
             input_mask_task: None,
             quality: None,
+            base_dir_hash: None,
+            base_arch: None,
+            task: None,
+            provenance: None,
         });
     }
     let header = CmfHeader {
@@ -289,6 +293,10 @@ fn routing_picks_the_matching_skill() {
         selection: Some(sel(mean)),
         input_mask_task: None,
         quality: None,
+        base_dir_hash: None,
+        base_arch: None,
+        task: None,
+        provenance: None,
     };
 
     // Rewrite the file with routable skills (registry only differs).
