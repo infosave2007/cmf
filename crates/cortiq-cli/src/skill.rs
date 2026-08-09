@@ -1078,10 +1078,21 @@ pub fn run_skill_bake(
         } else {
             Quant::Q8_2f
         };
+        // A freshly TRAINED master carries the fine co-adaptation with
+        // the mask that 4-bit rounding wipes — measured +7.9% held-PPL
+        // on the written file, enough to turn the mask from a gain into
+        // a loss. Trained layers write 8-bit rows; frozen layers
+        // re-encode in their own dtype (their round trip is near-idempotent).
+        let trained = arts.gate_up[li].is_some();
+        let (q_gu, q_dn) = if trained {
+            (Quant::Q8Row, Quant::Q8Row)
+        } else {
+            (q_rowsafe, q_down)
+        };
         for (suffix, vals, rows, cols, q) in [
-            ("gate_proj", &gate_k, kept.len(), hidden, q_rowsafe),
-            ("up_proj", &up_k, kept.len(), hidden, q_rowsafe),
-            ("down_proj", &down_k, hidden, kept.len(), q_down),
+            ("gate_proj", &gate_k, kept.len(), hidden, q_gu),
+            ("up_proj", &up_k, kept.len(), hidden, q_gu),
+            ("down_proj", &down_k, hidden, kept.len(), q_dn),
         ] {
             let (dtype, data) = quantize_2d(q, vals, rows, cols);
             tensors.push(TensorSpec {
