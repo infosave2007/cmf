@@ -27224,10 +27224,12 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
         .gemm_nn_coop
         .as_ref()
         .filter(|_| m % 4 == 0 && k.div_ceil(64) <= 65_535 && n.div_ceil(64) <= 65_535);
-    // Same grid-product guard as the forward: the scalar dx dispatch is
-    // (k, n) workgroups, and a matvec-style kernel must not take a
-    // billion-thread grid.
-    if coop.is_none() && k.saturating_mul(n) > (1 << 22) {
+    // The scalar dx arm has NO probe arbitrating it — the call site takes
+    // whatever this function accepts, shadowing the Accelerate arm on
+    // macOS. So without cooperative matrices it accepts only genuinely
+    // matvec-sized grids; a phase-B dx (3072×256 workgroups) ground a
+    // Mac bake to 12% CPU while the BLAS arm sat right below it.
+    if coop.is_none() && k.saturating_mul(n) > (1 << 16) {
         return false;
     }
     if let Some(pipe) = coop {
