@@ -3871,13 +3871,20 @@ fn ctx() -> Option<&'static Ctx> {
         // backend after process start (the CLI and tests both do this).
         return None;
     }
+    let first = CTX.get().is_none();
     match CTX.get_or_init(init) {
         Ok(c) => {
-            tracing::info!("Metal GPU path: on ({})", c._device.name());
+            // Once: this getter runs per OP, and a bake left 47k copies
+            // of the banner in its log.
+            if first {
+                tracing::info!("Metal GPU path: on ({})", c._device.name());
+            }
             Some(c)
         }
         Err(e) => {
-            tracing::warn!("Metal init failed — CPU fallback: {e}");
+            if first {
+                tracing::warn!("Metal init failed — CPU fallback: {e}");
+            }
             None
         }
     }
