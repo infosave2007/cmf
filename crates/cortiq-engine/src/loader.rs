@@ -441,11 +441,25 @@ impl Pipeline {
         Self::from_model_with_overlay(model, sampler_config, &Overlay::Blend(blend))
     }
 
+    fn skill_file_guard(model: &CmfModel) -> Result<(), CmfError> {
+        // A standalone skill file carries a PARTIAL tensor set cut against
+        // a base; running it would be half a network answering questions.
+        if model.required_features & cortiq_core::format::features::SKILL_FILE != 0 {
+            return Err(CmfError::Parse(
+                "this file is a standalone SKILL, not a runnable model — attach it: \
+                 cortiq skill apply <base.cmf> <this file> -o specialist.cmf"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn from_model_with_overlay(
         model: &Arc<CmfModel>,
         sampler_config: SamplerConfig,
         ov: &Overlay,
     ) -> Result<Self, CmfError> {
+        Self::skill_file_guard(model)?;
         let skill = match ov {
             Overlay::One(s) => Some(*s),
             _ => None,

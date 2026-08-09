@@ -63,9 +63,15 @@ pub mod features {
     /// the physical count and misread every row after the first pass —
     /// silently — so the bit makes it refuse instead.
     pub const LOOP_MASKS: u32 = 1 << 5;
+    /// The file is a STANDALONE SKILL — a partial tensor set cut against a
+    /// specific base (`SkillRecord.base_dir_hash`), not a runnable model.
+    /// Readers that predate the bit refuse the file loudly instead of
+    /// running half a network; runtimes that know it refuse to RUN it and
+    /// say `cortiq skill apply` instead.
+    pub const SKILL_FILE: u32 = 1 << 6;
 
     /// Features this reader implements today.
-    pub const SUPPORTED: u32 = TENSOR_DIR | BINARY_MASKS | QUANT_2F | LOOP_MASKS;
+    pub const SUPPORTED: u32 = TENSOR_DIR | BINARY_MASKS | QUANT_2F | LOOP_MASKS | SKILL_FILE;
 }
 
 /// JSON header — architecture and provenance (human-readable part;
@@ -161,6 +167,23 @@ pub struct SkillRecord {
     /// Measured quality (claim 16): overlaid vs backbone, held-out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality: Option<serde_json::Value>,
+
+    // ── Standalone-skill-file keys (features::SKILL_FILE) ──
+    /// hex hash64 of the BASE model's tensor directory this skill was cut
+    /// against. `skill apply` refuses a base whose directory hash differs:
+    /// a skill is a delta against exact bytes, not an architecture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_dir_hash: Option<String>,
+    /// The base's architecture name — the cheap human-readable identity
+    /// check next to the exact one above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_arch: Option<String>,
+    /// Mask-catalog task this skill activates once applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Free-form provenance: corpus, steps, recipe, who baked it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<serde_json::Value>,
 }
 
 /// Hex-encoded hash64 per optional section (u64 as JSON number would
@@ -785,6 +808,12 @@ impl CmfModel {
 
     /// All bytes of the primary mapping (GPU path: no-copy Metal buffer
     /// over the same mmap — unified memory, zero copying).
+    /// hash64 of this file's tensor directory — the identity a standalone
+    /// skill binds to (`SkillRecord.base_dir_hash`).
+    pub fn dir_hash(&self) -> u64 {
+        self.envelope.dir_hash
+    }
+
     pub fn primary_bytes(&self) -> &[u8] {
         self.backing.bytes()
     }
@@ -1126,6 +1155,11 @@ impl CmfModel {
             .any(|t| matches!(t.dtype, TensorDtype::Q8_2f | TensorDtype::Vbit))
         {
             required_features |= features::QUANT_2F;
+        }
+        // A skill record bound to a base directory makes this file a
+        // standalone skill, and the bit keeps every reader honest about it.
+        if header.skills.iter().any(|s| s.base_dir_hash.is_some()) {
+            required_features |= features::SKILL_FILE;
         }
 
         // Section offsets.
