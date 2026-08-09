@@ -2820,7 +2820,7 @@ impl Pipeline {
         self.o1_begin();
         let mut hidden = vec![0.0f32; self.hidden_size];
         let mut pos = 0usize;
-        if task_mask.is_none() && self.can_prefill_batched() && ids.len() > 2 {
+        if self.can_prefill_batched() && ids.len() > 2 {
             // prefill-GEMM in chunks; only the last position's hidden is
             // needed. (o1-compatible: the batch path attends per position
             // through qwen_attention, which carries the collection hook.)
@@ -2828,7 +2828,7 @@ impl Pipeline {
             let hs = self.hidden_size;
             while pos < ids.len() {
                 let end = (pos + chunk).min(ids.len());
-                let hb = self.prefill_batch(&ids[pos..end], pos);
+                let hb = self.prefill_batch_masked(&ids[pos..end], pos, task_mask);
                 hidden.copy_from_slice(&hb[(end - pos - 1) * hs..]);
                 pos = end;
             }
@@ -2948,60 +2948,29 @@ impl Pipeline {
     /// per-position forward — slower, but it scores the file exactly the
     /// way `run --task` will serve it, which is the point of the gate
     /// that calls it. With `None` it defers to the fast path.
+    /// Masked scoring rides the SAME batched sweep as unmasked scoring —
+    /// the masked-inference fast path: `prefill_batch_masked` lands the
+    /// per-visit FFN rows on the activations inside the fused arms. The
+    /// per-position loop below remains only as the no-batch fallback.
     pub fn nll_ids_masked(
         &mut self,
         ids: &[u32],
         start: usize,
         task_mask: Option<&TaskMask>,
     ) -> (f64, usize) {
-        if task_mask.is_none() {
-            return self.nll_ids_from(ids, start);
-        }
-        self.kv_cache.clear();
-        self.kv_history.clear();
-        let mut nll = 0f64;
-        let mut cnt = 0usize;
-        let n = ids.len().saturating_sub(1);
-        let hs = self.hidden_size;
-        let rows = self.weights.lm_head.rows();
-        let voc = self.vocab_size.min(rows);
-        for pos in 0..n {
-            let hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, task_mask);
-            if pos < start {
-                continue;
-            }
-            let normed = inference::rms_norm(
-                &hidden[..hs],
-                &self.weights.final_norm,
-                self.rms_eps,
-                self.norm_style,
-            );
-            let mut logits = vec![0.0f32; rows];
-            self.weights
-                .lm_head
-                .matmat(&normed, 1, &mut logits, self.pool.as_deref());
-            let lg = &mut logits[..voc];
-            if let Some(mu) = self.logit_multiplier {
-                for v in lg.iter_mut() {
-                    *v *= mu;
-                }
-            }
-            if let Some(c) = self.final_softcap {
-                for v in lg.iter_mut() {
-                    *v = c * (*v / c).tanh();
-                }
-            }
-            let target = ids[pos + 1] as usize;
-            let max = lg.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
-            let lse: f64 = lg.iter().map(|&v| ((v - max) as f64).exp()).sum::<f64>().ln()
-                + max as f64;
-            nll += lse - lg[target.min(voc - 1)] as f64;
-            cnt += 1;
-        }
-        (nll, cnt)
+        self.nll_ids_inner(ids, start, task_mask)
     }
 
     pub fn nll_ids_from(&mut self, ids: &[u32], start: usize) -> (f64, usize) {
+        self.nll_ids_inner(ids, start, None)
+    }
+
+    fn nll_ids_inner(
+        &mut self,
+        ids: &[u32],
+        start: usize,
+        task_mask: Option<&TaskMask>,
+    ) -> (f64, usize) {
         self.kv_cache.clear();
         self.kv_history.clear();
         let mut nll = 0f64;
@@ -3021,7 +2990,7 @@ impl Pipeline {
             while pos < n {
                 let end = (pos + CHUNK).min(n);
                 let bsz = end - pos;
-                let hb = self.prefill_batch(&ids[pos..end], pos);
+                let hb = self.prefill_batch_masked(&ids[pos..end], pos, task_mask);
                 let mut k0 = 0usize;
                 while k0 < bsz {
                     let k1 = (k0 + LM_SUB).min(bsz);
@@ -3102,7 +3071,7 @@ impl Pipeline {
             return (nll, cnt);
         }
         for pos in 0..ids.len().saturating_sub(1) {
-            let hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, None);
+            let hidden = self.forward_layers(&self.embed_single(ids[pos]), pos, task_mask);
             // Architectures whose head lives inside their own stack return
             // the logits out of band and a zero hidden — DeepSeek-V4 folds
             // its hyper-connection copies between the last layer and the
@@ -3384,6 +3353,20 @@ impl Pipeline {
     /// (a weight row is read from DRAM once per chunk, not per
     /// position). Returns the hidden of all positions [b × hidden].
     fn prefill_batch(&mut self, ids: &[u32], start_pos: usize) -> Vec<f32> {
+        self.prefill_batch_masked(ids, start_pos, None)
+    }
+
+    /// `prefill_batch` with a task mask honored on the dense-FFN panels
+    /// (the masked-inference fast path: full fused compute, mask lands on
+    /// the activations). The whole-chunk GPU graph is skipped for masked
+    /// layers by the callers' arms; the per-GEMM device paths stay in
+    /// play because the zeroing happens on the host between them.
+    fn prefill_batch_masked(
+        &mut self,
+        ids: &[u32],
+        start_pos: usize,
+        task_mask: Option<&TaskMask>,
+    ) -> Vec<f32> {
         let b = ids.len();
         let hs = self.hidden_size;
         // The CPU embed is deferred: when the chunk graph takes the run
@@ -3415,7 +3398,7 @@ impl Pipeline {
             // append, causal attend, O, FFN, hidden device-resident
             // across the run. Any refusal falls through to the CPU path.
             #[cfg(target_os = "macos")]
-            {
+            if task_mask.is_none() {
                 if li < chunk_skip_until {
                     continue;
                 }
@@ -3671,8 +3654,14 @@ impl Pipeline {
                     inference::rms_norm(&h[bi * hs..(bi + 1) * hs], &lw.post_norm, eps, norm_style);
                 post[bi * hs..(bi + 1) * hs].copy_from_slice(&r);
             }
+            // A restrictive per-visit FFN row lands on the activations
+            // inside the dense arm; an all-open row costs nothing.
+            let mask_row = task_mask
+                .filter(|m| m.ffn_active_count(li) < self.intermediate_size)
+                .and_then(|m| m.ffn_masks.get(li))
+                .map(|v| v.as_slice());
             let mut ffn = match &lw.ffn {
-                FfnKind::Dense(d) => dense_ffn_batch(d, &post, b, pool.as_deref()),
+                FfnKind::Dense(d) => dense_ffn_batch(d, &post, b, pool.as_deref(), mask_row),
                 FfnKind::Moe(m) => moe_ffn_batch(m, &post, b, hs, pool.as_deref(), None),
                 // Dual-branch layers run per position (the expert branch
                 // reads the raw residual — nothing to batch yet).
@@ -5951,15 +5940,58 @@ pub fn create_test_pipeline(
 
 /// Batched dense-FFN: gate/up/down via matmat (element-wise the same
 /// math as b × dense_ffn — the same dot kernels).
-fn dense_ffn_batch(d: &DenseFfn, xs: &[f32], b: usize, pool: Option<&Pool>) -> Vec<f32> {
+/// One mask bit, LSB-first per byte — `TaskMask::ffn_active_indices`'s
+/// convention.
+#[inline]
+fn mask_bit(row: &[u8], j: usize) -> bool {
+    (row.get(j >> 3).copied().unwrap_or(0) >> (j & 7)) & 1 != 0
+}
+
+/// Zero the CLOSED neurons' activations in a [rows × inter] panel — the
+/// masked-inference fast path's whole trick: full fused quant compute,
+/// then the mask lands on the ACTIVATIONS, which is arithmetically the
+/// pruned network without touching a quantized weight byte. Whole open
+/// bytes (0xFF = 8 open neurons) skip in one test.
+fn zero_masked_cols(g: &mut [f32], rows: usize, inter: usize, row: &[u8]) {
+    for r in 0..rows {
+        let base = r * inter;
+        for (bi, &byte) in row.iter().enumerate() {
+            if byte == 0xFF {
+                continue;
+            }
+            let j0 = bi * 8;
+            for bit in 0..8 {
+                let j = j0 + bit;
+                if j < inter && byte & (1 << bit) == 0 {
+                    g[base + j] = 0.0;
+                }
+            }
+        }
+    }
+}
+
+fn dense_ffn_batch(
+    d: &DenseFfn,
+    xs: &[f32],
+    b: usize,
+    pool: Option<&Pool>,
+    mask_row: Option<&[u8]>,
+) -> Vec<f32> {
     let inter = d.gate_proj.rows();
     let hidden = d.down_proj.rows();
     // Fused on-device SwiGLU when the device is in play: three separate
     // `matmat` calls are three round trips per layer, and the gate/up
     // panels (b × inter — 22 MB each at a 512-token chunk) cross the bus
     // twice for nothing. The kernel already existed for the image DiT;
-    // the LLM prefill was simply never wired to it.
-    if d.act == Act::Silu && b >= 32 && crate::gpu::enabled_here() && !crate::gpu::mm_killed() {
+    // the LLM prefill was simply never wired to it. A task mask needs the
+    // activations on the host between the halves, so it keeps the CPU
+    // arm below.
+    if mask_row.is_none()
+        && d.act == Act::Silu
+        && b >= 32
+        && crate::gpu::enabled_here()
+        && !crate::gpu::mm_killed()
+    {
         if let (Some((model, w1)), Some((_, w3)), Some((_, w2))) = (
             d.gate_proj.mapped_q4t(),
             d.up_proj.mapped_q4t(),
@@ -5977,6 +6009,9 @@ fn dense_ffn_batch(d: &DenseFfn, xs: &[f32], b: usize, pool: Option<&Pool>) -> V
     d.up_proj.matmat(xs, b, &mut u, pool);
     for i in 0..b * inter {
         g[i] = d.act.combine(g[i], u[i]);
+    }
+    if let Some(row) = mask_row {
+        zero_masked_cols(&mut g, b, inter, row);
     }
     let mut out = vec![0.0f32; b * hidden];
     d.down_proj.matmat(&g, b, &mut out, pool);
@@ -6061,7 +6096,7 @@ fn moe_ffn_batch(
         for (k, &(bi, _)) in list.iter().enumerate() {
             sub[k * cols..(k + 1) * cols].copy_from_slice(&xs[bi * cols..(bi + 1) * cols]);
         }
-        let eo = dense_ffn_batch(d, &sub, sb, pool);
+        let eo = dense_ffn_batch(d, &sub, sb, pool, None);
         for (k, &(bi, w)) in list.iter().enumerate() {
             for i in 0..hidden {
                 out[bi * hidden + i] += w * eo[k * hidden + i];

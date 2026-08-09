@@ -536,6 +536,67 @@ fn held_ppl(pass: &Pass, held: &[Vec<u32>]) -> f64 {
     (nll / n.max(1) as f64).exp()
 }
 
+/// Score a WRITTEN specialist through the replica's own math (f32
+/// dequant of whatever the file carries) with the file's binary mask
+/// held hard — the decomposition probe that tells "the requant at write
+/// cost the quality" from "the runtime applies the mask differently".
+/// Returns (bare, masked) held-PPL over the chunks.
+pub fn replica_score_file_mask(
+    model: &Arc<CmfModel>,
+    chunks: &[Vec<u32>],
+) -> Result<(f64, f64), String> {
+    let o1_off = crate::nystrom::O1Cfg {
+        layers: crate::nystrom::O1Layers::List(Vec::new()),
+        m: 4,
+        w: 8,
+        sink: 1,
+        rect: crate::nystrom::O1_DEFAULT_RECT,
+    };
+    let fm = FcdModel::from_cmf(model, &o1_off)?;
+    let nl = fm.layers.len();
+    let loops = fm.loops.max(1);
+    let vn = nl * loops;
+    let inter = fm.layers[0].inter;
+    let ffn: Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>> = vec![None; nl];
+    // Binary mask → logits at ±50: σ crosses any τ exactly as the bit says.
+    let task = &model.masks.default_task;
+    let mask = model
+        .masks
+        .masks
+        .iter()
+        .find(|m| &m.name == task)
+        .or_else(|| model.masks.masks.first());
+    let open: Vec<Vec<f32>> = vec![vec![50.0; inter]; vn];
+    let masked_logits: Vec<Vec<f32>> = match mask {
+        Some(m) => (0..vn)
+            .map(|vl| {
+                let row = m.ffn_masks.get(vl).map(|v| v.as_slice()).unwrap_or(&[]);
+                (0..inter)
+                    .map(|j| {
+                        if (row.get(j >> 3).copied().unwrap_or(0) >> (j & 7)) & 1 != 0 {
+                            50.0
+                        } else {
+                            -50.0
+                        }
+                    })
+                    .collect()
+            })
+            .collect(),
+        None => open.clone(),
+    };
+    let score = |logits: &[Vec<f32>]| -> f64 {
+        let pass = Pass {
+            fm: &fm,
+            tau: 0.5,
+            logits,
+            hard: true,
+            ffn: &ffn,
+        };
+        held_ppl(&pass, chunks)
+    };
+    Ok((score(&open), score(&masked_logits)))
+}
+
 /// The whole recipe. `log` receives progress lines.
 pub fn skill_bake(
     model: &Arc<CmfModel>,
