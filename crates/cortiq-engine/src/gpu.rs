@@ -1743,3 +1743,13 @@ pub fn bake_release() {
     #[cfg(feature = "gpu")]
     crate::gpu_wgpu::bake_release();
 }
+
+/// Strict-f32 for the bake's GEMMs (phase A mask training): the mask
+/// selects neurons by a gradient signal, and f16 operand rounding on
+/// that signal closes the wrong ones. No-op off the wgpu backend.
+pub fn bake_precision_strict(on: bool) {
+    #[cfg(feature = "gpu")]
+    crate::gpu_wgpu::bake_precision_strict(on);
+    #[cfg(not(feature = "gpu"))]
+    let _ = on;
+}

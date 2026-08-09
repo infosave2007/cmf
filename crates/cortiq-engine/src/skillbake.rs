@@ -630,6 +630,14 @@ pub fn skill_bake(
     // step time. Measure, then optimize the top line, not the guess.
     let mut acc_chunk = 0f64;
     let mut acc_adam = 0f64;
+    // Phase A trains in strict f32: the mask SELECTS neurons by its
+    // gradient, and f16 operand rounding on that signal — fine for every
+    // forward and eval in this file — compounds over ~90 steps into
+    // closing the wrong neurons (measured: hard-PPL 5.207 vs 4.293 at the
+    // same 2.56% sparsity; the f32 run retraces the reference trajectory
+    // to the third decimal). Evals inside the loop lift the restriction —
+    // their tensor-core numbers match f32 at print precision.
+    crate::gpu::bake_precision_strict(true);
     for step in 0..hy.steps_a {
         let t_step = std::time::Instant::now();
         let chunk = &calib[step % calib.len()];
@@ -677,7 +685,9 @@ pub fn skill_bake(
                 hard: true,
                 ffn: &ffn,
             };
+            crate::gpu::bake_precision_strict(false);
             let hp = held_ppl(&pass, &held);
+            crate::gpu::bake_precision_strict(true);
             // Name the neurons that crossed τ since the last eval. At
             // 0.01% pruned = ~24 neurons for a 135 held-PPL, WHICH 24 is
             // the whole diagnosis: it decides between "this model has no
@@ -741,6 +751,8 @@ pub fn skill_bake(
     }
     // If target_sparsity was set but no checkpoint qualified, fall back
     // to the highest-sparsity checkpoint.
+    // Phase A is over — phase B and every eval after run on the fast arms.
+    crate::gpu::bake_precision_strict(false);
     if hy.target_sparsity > 0.0 && best.1.is_none() {
         log(&format!(
             "[A] target sparsity {:.0}% not reached; using max-sparsity checkpoint ({:.0}%)",
