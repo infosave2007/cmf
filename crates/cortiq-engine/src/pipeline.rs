@@ -5643,9 +5643,10 @@ fn draft_probe() -> bool {
             let upto_excl = upto.map_or(self.num_layers, |u| u + 1);
             let mut lg = Vec::new();
             let mut gl = 0usize;
-            if let Some(hh) =
-                self.try_token_graph_wgpu_span(hidden, position, &mut lg, from, upto_excl, &mut gl)
-            {
+            let span_res =
+                self.try_token_graph_wgpu_span(hidden, position, &mut lg, from, upto_excl, &mut gl);
+            graph_note(span_res.is_some() && gl == upto_excl - from);
+            if let Some(hh) = span_res {
                 if gl == upto_excl - from {
                     if !lg.is_empty() {
                         lg.resize(self.vocab_size, 0.0);
@@ -7249,6 +7250,11 @@ fn moe_ffn(m: &MoeFfn, x: &[f32], pool: Option<&Pool>, allowed: Option<&[bool]>)
 /// look "GPU-accelerated" while every layer walks the host.
 fn graph_note(built: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
+    if built {
+        GRAPH_TOK_OK.fetch_add(1, Ordering::Relaxed);
+    } else {
+        GRAPH_TOK_MISS.fetch_add(1, Ordering::Relaxed);
+    }
     static SAID: AtomicBool = AtomicBool::new(false);
     if !SAID.swap(true, Ordering::Relaxed) {
         if built {
@@ -7258,6 +7264,12 @@ fn graph_note(built: bool) {
         }
     }
 }
+
+/// Whole-token graph outcomes, process-wide: a benchmark that claims a
+/// GPU number while MISS climbs is measuring the CPU — the honest-bench
+/// contract makes that an error, not a footnote.
+pub static GRAPH_TOK_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GRAPH_TOK_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `CMF_MOE_BATCH=0` restores the per-expert serial loop — the A/B lever
 /// for the batched kernel, and how its bit-identity is checked.

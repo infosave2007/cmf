@@ -594,6 +594,18 @@ pub fn wgpu_active() -> bool {
     }
 }
 
+/// Device weight bytes uploaded so far (wgpu; 0 on other backends).
+/// Steady-state windows must show a ZERO delta — growth mid-benchmark
+/// means eviction/re-upload and disqualifies the number.
+pub fn upload_bytes() -> u64 {
+    #[cfg(feature = "gpu")]
+    {
+        return crate::gpu_wgpu::UPLOAD_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "gpu"))]
+    0
+}
+
 pub fn wgpu_graph_default() -> bool {
     #[cfg(feature = "gpu")]
     {
