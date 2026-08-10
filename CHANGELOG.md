@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A real gate under the tensor-core GEMM.** The neighbouring coop test
+  only PRINTED its worst relative error, so the f16 operands, the
+  activation scale and the unpacked plane could all drift unwatched.
+  `wgpu_q4tp_mm_coop_matches_scalar` now runs both arms over the same
+  weights with activations spanning ±3000 — the range that used to
+  overflow f16 — and asserts they agree: measured 3.19e-4 relative rms
+  on an RTX 5090, threshold 1e-2. It skips cleanly on machines without
+  a cooperative-matrix device.
+- **Kernel-level number for the dequantize-once work**: the same q4tp
+  GEMM (9216×2304, n=2085) runs **25.0 → 51.9 TFLOP/s** with the tensor
+  cores, measured by `wgpu_q4tp_mm_throughput` on both arms.
+
 ## [0.5.67] - 2026-08-11
 
 ### Added
