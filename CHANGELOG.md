@@ -11,8 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`cortiq animate` decides host-vs-GPU by a parity probe, not a
   hardcoded verdict.** The wgpu wide-GEMM arm was measured wrong on one
   driver stack (RTX PRO 6000: step-1 rms off, step-2 NaN) and byte-
-  healthy on another (2×RTX 5090: coop and plain arms within 0.5% of
-  each other, 3.5% of the host render — legal accumulation drift). So
+  healthy on another (2×RTX 5090: the plain f32 arm within 3.5% of the
+  host render — legal accumulation drift; the coop arm stays off for
+  animate, its f16-operand overflow at packed-sequence scale is
+  bisected and unfixed). So
   the pipeline now probes ITS OWN first qkv weight at DiT-scale
   activations (±2000 mixed with ±2) against the host path and takes
   the device only under 1e-2 relative rms — the measured failure was
