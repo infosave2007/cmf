@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.67] - 2026-08-11
+
 ### Added
 - **The tensor cores stop waiting on a nibble unpacker: q4tp GEMM
   dequantizes ONCE per call.** The cooperative-matrix kernel unpacked
