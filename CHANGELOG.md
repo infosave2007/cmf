@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Prefill was 15× slower than it had to be: the CPU pair walk was
+  eating the GPU graph's positions.** `forward_ids` — the path `bench`
+  times as "prefill" and `ppl` scores through — used neither of
+  generation's two routing guards. It took the batched CPU prefill on
+  models whose recurrent state is GPU-resident (a correctness hazard:
+  decode then reads buffers the prefill never wrote), and then let the
+  CPU pair walk consume every remaining position, 89 ms of host forward
+  where the resident token graph needs 7 ms. Both guards now live in
+  one predicate used by both entry points. W2 34.7B on an RTX 5090,
+  ctx 512: prefill **8.7 → 137.4 tok/s**, decode unchanged at ~105.
+  Attention-only models keep the chunked CPU prefill they measured
+  faster on (nanbeige 101.6, bonsai-8b 51.6 — unchanged).
+
 ### Added
 - **`cortiq animate` decides host-vs-GPU by a parity probe, not a
   hardcoded verdict.** The wgpu wide-GEMM arm was measured wrong on one
