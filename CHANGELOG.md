@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The tensor cores stop waiting on a nibble unpacker: q4tp GEMM
+  dequantizes ONCE per call.** The cooperative-matrix kernel unpacked
+  4-bit weights inside its inner loop — about as many scalar ops per
+  weight tile as the matrix units spend MACs on it, repeated for every
+  64-row tile of activations, so the units idled through a
+  dequantizer. Now a separate pass unpacks the plane into f16 in a
+  reused scratch buffer and a pure f16 GEMM runs over it. Measured on
+  an RTX 5090 (MiniMax DiT step): **22.1 s → 14.7 s**, fc1 8.3 → 4.3,
+  qkv 4.9 → 2.1. Caching planes per tensor was tried first and is the
+  wrong idea — this model would want 38 GB of them.
+- **The f16 operands carry an activation scale.** DiT activations run
+  past f16's 65504 and that overflow was the NaN this kernel was
+  benched for; the host now brings max|x| to ~1000 and the store
+  multiplies it back (f16's relative precision is scale-free, so
+  nothing is lost). Parity probe on the real weights: 4.65e-3 relative
+  rms, the same as the scalar arm.
 - **MiniMax-H3 attention moved to the device — 41.5% of a denoise step
   became 16.6%.** The kernels were already there (`dit_qk` →
   `dit_softmax` → `dit_pv`, scores staying in device buffers) and
