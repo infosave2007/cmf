@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an RTX 5090 (MiniMax DiT step): **22.1 s → 14.7 s**, fc1 8.3 → 4.3,
   qkv 4.9 → 2.1. Caching planes per tensor was tried first and is the
   wrong idea — this model would want 38 GB of them.
+- **`cortiq animate` runs the tensor cores by default now.** The hold
+  that pinned it to the scalar arm is lifted: the kernel carries an
+  activation scale, dequantizes once, and the engine's parity probe
+  validates that exact path on the file's own weights before a frame is
+  drawn. `CMF_COOP=0` still forces the scalar arm.
 - **The f16 operands carry an activation scale.** DiT activations run
   past f16's 65504 and that overflow was the NaN this kernel was
   benched for; the host now brings max|x| to ~1000 and the store
