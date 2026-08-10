@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **MiniMax-H3 attention moved to the device — 41.5% of a denoise step
+  became 16.6%.** The kernels were already there (`dit_qk` →
+  `dit_softmax` → `dit_pv`, scores staying in device buffers) and
+  Lumina's DiT already rode them; MiniMax kept its own host loop, which
+  materialized an n×n score plane — 144 MB at render size — and walked
+  it across the bus twice per head. Now it repacks q/k/v head-major and
+  calls the same path. Measured (512×288, RTX 5090, CMF_MMH3_PROF):
+  attention **33.3 s → 8.5 s**, whole DiT step **80.3 s → 51.4 s**.
+  `CMF_MMH3_ATTN=cpu` forces the host loop back.
 - **The local layer split runs IN-PROCESS now — and it is finally
   free.** `run/bench --gpus N` splits the stack across cards inside one
   process: segment i executes pinned to card i, and the only thing

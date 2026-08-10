@@ -704,6 +704,53 @@ impl MiniMaxH3 {
         let inner = nh * hd;
         let scale = 1.0 / (hd as f32).sqrt();
         let pool = self.pool.as_deref();
+        // Device path: scores, softmax and the PV product all stay in
+        // device buffers (`dit_qk` → `dit_softmax` → `dit_pv`), so the
+        // n×n score plane — 144 MB at render size — never crosses the
+        // bus. Measured share of a denoise step before this: 41.5%.
+        // The kernels exist and Lumina's DiT already rides them; this
+        // block is what puts MiniMax on the same road. CMF_MMH3_ATTN=cpu
+        // forces the host loop (the A/B that proved the parity).
+        if std::env::var("CMF_MMH3_ATTN").as_deref() != Ok("cpu")
+            && crate::gpu::enabled_here()
+            && n >= 256
+        {
+            let mut qh = vec![0f32; nh * n * hd];
+            let mut kh = vec![0f32; nh * n * hd];
+            let mut vh = vec![0f32; nh * n * hd];
+            {
+                let (pq, pk, pv) = (
+                    SendPtr(qh.as_mut_ptr()),
+                    SendPtr(kh.as_mut_ptr()),
+                    SendPtr(vh.as_mut_ptr()),
+                );
+                pool_rows(pool, n, &|lo, hi| {
+                    for p in lo..hi {
+                        let base = p * 3 * inner;
+                        for h in 0..nh {
+                            let dst = (h * n + p) * hd;
+                            // SAFETY: workers own disjoint token ranges,
+                            // and each token writes its own head slots.
+                            unsafe {
+                                pq.row(dst, hd).copy_from_slice(
+                                    &qkv[base + h * hd..base + (h + 1) * hd],
+                                );
+                                pk.row(dst, hd).copy_from_slice(
+                                    &qkv[base + inner + h * hd..base + inner + (h + 1) * hd],
+                                );
+                                pv.row(dst, hd).copy_from_slice(
+                                    &qkv[base + 2 * inner + h * hd
+                                        ..base + 2 * inner + (h + 1) * hd],
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+            if crate::gpu::dit_attention(&qh, &kh, &vh, nh, nh, n, hd, scale, attn) {
+                return;
+            }
+        }
         let mut qh = vec![0f32; n * hd];
         let mut kh = vec![0f32; n * hd];
         let mut vt = vec![0f32; hd * n];
