@@ -254,6 +254,20 @@ enum Commands {
         /// Permanent exact sink keys for --o1 (validated default 4)
         #[arg(long)]
         o1_sink: Option<usize>,
+        /// Network pipeline-split: address of a `cortiq worker` holding
+        /// the tail layers of the SAME .cmf (verified by dir_hash).
+        /// Forces a single serve slot — one worker holds one KV session.
+        #[arg(long)]
+        peer: Option<String>,
+        /// First layer the peer runs (default: half the stack)
+        #[arg(long, requires = "peer")]
+        peer_split: Option<usize>,
+        /// Shared secret for --peer (must match the worker's --token)
+        #[arg(long, requires = "peer")]
+        net_token: Option<String>,
+        /// Wire payload dtype for --peer: f32 = bit-exact, f16 = half the bytes
+        #[arg(long, default_value = "f32", requires = "peer")]
+        net_dtype: String,
     },
     /// Convert a Hugging Face checkpoint to .cmf — native Rust, no Python
     Convert {
@@ -523,6 +537,37 @@ enum Commands {
         /// Permanent exact sink keys for --o1 (validated default 4)
         #[arg(long)]
         o1_sink: Option<usize>,
+        /// Network pipeline-split: address of a `cortiq worker` holding the
+        /// tail layers of the SAME .cmf (e.g. 169.254.33.120:9911). The
+        /// worker's file is verified by dir_hash — a different file is
+        /// refused, never blended.
+        #[arg(long)]
+        peer: Option<String>,
+        /// First layer the peer runs (it holds [SPLIT..num_layers)).
+        /// Default: half the stack. 0 = the peer runs every layer (this
+        /// side keeps embed / head / sampler only).
+        #[arg(long, requires = "peer")]
+        peer_split: Option<usize>,
+        /// Shared secret for --peer (must match the worker's --token).
+        #[arg(long, requires = "peer")]
+        net_token: Option<String>,
+        /// Wire payload dtype for --peer: f32 = bit-exact, f16 = half the
+        /// bytes (hidden states tolerate it; measure your model).
+        #[arg(long, default_value = "f32", requires = "peer")]
+        net_dtype: String,
+    },
+    /// Serve a layer span of a model to a network coordinator (`run --peer`).
+    /// The worker holds the SAME .cmf as the coordinator (checked by
+    /// dir_hash) and runs the layer range the coordinator assigns.
+    Worker {
+        /// Path to .cmf model file (same file as the coordinator's)
+        model: String,
+        /// Listen address; beyond loopback --token is REQUIRED
+        #[arg(long, default_value = "127.0.0.1:9911")]
+        listen: String,
+        /// Shared secret the coordinator must present
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Freeze the current context into a `.cmfstate` (B2): the token prefix
     /// + active skill + seed + model fingerprint. Resume with `run --state`.
@@ -1205,6 +1250,10 @@ async fn main() -> anyhow::Result<()> {
             o1_m,
             o1_window,
             o1_sink,
+            peer,
+            peer_split,
+            net_token,
+            net_dtype,
         } => {
             let o1 = O1Flags {
                 spec: o1,
@@ -1213,7 +1262,19 @@ async fn main() -> anyhow::Result<()> {
                 sink: o1_sink,
                 rect: None,
             };
-            cmd_serve(&model, &host, port, &task, compat_port, &o1).await
+            cmd_serve(
+                &model,
+                &host,
+                port,
+                &task,
+                compat_port,
+                &o1,
+                peer.as_deref(),
+                peer_split,
+                net_token.as_deref(),
+                &net_dtype,
+            )
+            .await
         }
         Commands::Convert {
             model,
@@ -1341,6 +1402,10 @@ async fn main() -> anyhow::Result<()> {
             o1_m,
             o1_window,
             o1_sink,
+            peer,
+            peer_split,
+            net_token,
+            net_dtype,
         } => {
             let o1 = O1Flags {
                 spec: o1,
@@ -1368,9 +1433,23 @@ async fn main() -> anyhow::Result<()> {
                 trace_json,
                 state.as_deref(),
                 &o1,
+                peer.as_deref(),
+                peer_split,
+                net_token.as_deref(),
+                &net_dtype,
             )
             .await
         }
+        Commands::Worker {
+            model,
+            listen,
+            token,
+        } => cortiq_net::worker_serve(cortiq_net::WorkerConfig {
+            model_path: model,
+            listen,
+            token,
+        })
+        .map_err(|e| anyhow::anyhow!(e)),
         Commands::Freeze {
             model,
             prompt,
@@ -1682,6 +1761,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_serve(
     model_path: &str,
     host: &str,
@@ -1689,6 +1769,10 @@ async fn cmd_serve(
     default_task: &str,
     _compat_port: Option<u16>,
     o1: &O1Flags,
+    peer: Option<&str>,
+    peer_split: Option<usize>,
+    net_token: Option<&str>,
+    net_dtype: &str,
 ) -> anyhow::Result<()> {
     println!();
     println!("  ╔═══════════════════════════════════════╗");
@@ -1714,10 +1798,16 @@ async fn cmd_serve(
     let avail = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let slots = std::env::var("CMF_SERVE_SLOTS")
+    let mut slots = std::env::var("CMF_SERVE_SLOTS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| (avail / 4).clamp(1, 4));
+    if peer.is_some() && slots != 1 {
+        // One worker holds ONE KV session; more slots would interleave
+        // sequences into it. Loud, not silent.
+        println!("    note: --peer forces 1 slot (the worker holds one KV session)");
+        slots = 1;
+    }
     if std::env::var("CMF_THREADS").is_err() {
         // Split the cores between slots instead of oversubscribing
         // N pools × (cores−1) workers. Explicit CMF_THREADS wins.
@@ -1742,6 +1832,43 @@ async fn cmd_serve(
     );
     println!();
 
+    // Network pipeline-split (serve --peer): connect and assign before
+    // the listener starts — a bad worker fails the whole serve loudly.
+    let mut remote = None;
+    if let Some(addr) = peer {
+        pipelines[0]
+            .split_supported()
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let nl = pipelines[0].num_layers;
+        let split = peer_split.unwrap_or(nl / 2);
+        if split >= nl {
+            anyhow::bail!("--peer-split {split} out of range: the model has {nl} layers");
+        }
+        let dtype = match net_dtype {
+            "f32" => cortiq_net::WireDtype::F32,
+            "f16" => cortiq_net::WireDtype::F16,
+            other => anyhow::bail!("--net-dtype {other}: expected f32 or f16"),
+        };
+        let rs = cortiq_net::RemoteSegment::connect(
+            addr,
+            net_token.unwrap_or(""),
+            model.dir_hash(),
+            &model.arch().arch_name,
+            nl,
+            pipelines[0].hidden_size,
+            split,
+            nl - 1,
+            dtype,
+            &cortiq_net::SessionSpec::default(),
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        println!(
+            "    Peer: {addr} · layers {split}..{} remote · wire {net_dtype}",
+            nl - 1
+        );
+        remote = Some(std::sync::Arc::new(std::sync::Mutex::new(rs)));
+    }
+
     // Create runtime
     let runtime = CortiqRuntime::new(model);
     if runtime.masks().get(default_task).is_some() {
@@ -1752,6 +1879,7 @@ async fn cmd_serve(
         runtime,
         tokenizer,
         slots: cortiq_server::PipelinePool::new(pipelines),
+        remote,
     });
 
     // Build router
@@ -2640,6 +2768,10 @@ async fn cmd_run(
     trace_json: bool,
     state: Option<&str>,
     o1: &O1Flags,
+    peer: Option<&str>,
+    peer_split: Option<usize>,
+    net_token: Option<&str>,
+    net_dtype: &str,
 ) -> anyhow::Result<()> {
     println!("Loading model: {}", model_path);
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
@@ -2775,6 +2907,79 @@ async fn cmd_run(
         status.active_sparsity * 100.0
     );
 
+    // ── Network pipeline-split (v1): one worker holds the tail layers ──
+    // Backbone-only and mask-free on purpose: the worker verified it holds
+    // the same FILE (dir_hash), but a skill/blend/mask is run-time state
+    // this side only — running half a stack with it would be a chimera.
+    let mut remote_opt: Option<cortiq_net::RemoteSegment> = None;
+    if let Some(addr) = peer {
+        if blend.is_some() || route_dynamic {
+            anyhow::bail!(
+                "--peer does not run --blend/--route-dynamic yet: a blend materializes \
+                 mixed weights this side only, and dynamic routing switches mid-decode — \
+                 both would desync the worker"
+            );
+        }
+        if state.is_some() {
+            anyhow::bail!("--peer does not resume .cmfstate sessions yet");
+        }
+        pipeline.split_supported().map_err(|e| anyhow::anyhow!(e))?;
+        let nl = pipeline.num_layers;
+        let split = peer_split.unwrap_or(nl / 2);
+        if split >= nl {
+            anyhow::bail!("--peer-split {split} out of range: the model has {nl} layers");
+        }
+        let dtype = match net_dtype {
+            "f32" => cortiq_net::WireDtype::F32,
+            "f16" => cortiq_net::WireDtype::F16,
+            other => anyhow::bail!("--net-dtype {other}: expected f32 or f16"),
+        };
+        // The session spec the worker mirrors: skill overlay, mask task
+        // (each side masks its own layers), o1 config over its span.
+        let spec = cortiq_net::SessionSpec {
+            skill: skill.clone(),
+            task: mask.as_ref().map(|_| task.to_string()),
+            o1: o1.spec.as_deref().map(|s| cortiq_net::O1Wire {
+                spec: s.to_string(),
+                m: o1.m.map(|v| v as u32),
+                w: o1.w.map(|v| v as u32),
+                sink: o1.sink.map(|v| v as u32),
+                rect: o1.rect.clone(),
+            }),
+        };
+        let rs = cortiq_net::RemoteSegment::connect(
+            addr,
+            net_token.unwrap_or(""),
+            runtime.model().dir_hash(),
+            &runtime.model().arch().arch_name,
+            nl,
+            pipeline.hidden_size,
+            split,
+            nl - 1,
+            dtype,
+            &spec,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        println!(
+            "peer {addr}: layers {split}..{} remote, 0..{split} local \
+             (embed/head/sampler local), wire {net_dtype}{}{}{}",
+            nl - 1,
+            spec.skill
+                .as_deref()
+                .map(|s| format!(", skill {s}"))
+                .unwrap_or_default(),
+            spec.task
+                .as_deref()
+                .map(|t| format!(", task {t}"))
+                .unwrap_or_default(),
+            spec.o1
+                .as_ref()
+                .map(|w| format!(", o1 {}", w.spec))
+                .unwrap_or_default(),
+        );
+        remote_opt = Some(rs);
+    }
+
     // The FILE decides chat behaviour (spec §6.1): a container that carries a
     // template is chatted with, one that doesn't is completed. Gate on the
     // template itself — apply_chat_template_opts() falls back to hardcoded
@@ -2791,7 +2996,7 @@ async fn cmd_run(
         tracing::info!("no chat template in this container — running completion mode");
     }
 
-    let generate_and_print =
+    let mut generate_and_print =
         |pipeline: &mut Pipeline, ids: &[u32]| -> anyhow::Result<Option<String>> {
             use std::io::Write;
             // Stream silently when the confidence view will reprint coloured;
@@ -2806,7 +3011,37 @@ async fn cmd_run(
                 })
             };
             let started = std::time::Instant::now();
-            match pipeline.generate_from_ids(ids, max_tokens, mask.as_ref(), Some(cb)) {
+            let gen_res = match remote_opt.as_mut() {
+                Some(rs) => {
+                    cortiq_net::generate_split(pipeline, rs, ids, max_tokens, mask.as_ref(), Some(cb)).map(
+                        |(r, st)| {
+                            // The numbers that decide whether this wire pays:
+                            // measured, per generation, stderr.
+                            if st.remote_steps > 0 {
+                                let reused = r.prompt_tokens.saturating_sub(st.prefilled);
+                                eprintln!(
+                                    "\nnet: prefill {:.0} ms ({} of {} pos{}) · {} round trips · \
+                                     {:.2} ms avg rtt+remote · {:.0}% of decode wall",
+                                    st.prefill_s * 1e3,
+                                    st.prefilled,
+                                    r.prompt_tokens,
+                                    if reused > 0 {
+                                        format!(", {reused} reused")
+                                    } else {
+                                        String::new()
+                                    },
+                                    st.remote_steps,
+                                    st.net_s * 1e3 / st.remote_steps as f64,
+                                    100.0 * st.net_s / st.decode_s.max(1e-9),
+                                );
+                            }
+                            r
+                        },
+                    )
+                }
+                None => pipeline.generate_from_ids(ids, max_tokens, mask.as_ref(), Some(cb)),
+            };
+            match gen_res {
                 Ok(r) => {
                     let secs = started.elapsed().as_secs_f64();
                     // Confidence view: reprint token-by-token, coloured by the

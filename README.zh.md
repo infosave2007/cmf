@@ -41,6 +41,10 @@ BLAS、不用 ONNX、不用装 CUDA、不用 C++ 工具链——在所有平台�
 [生成一张图](https://huggingface.co/spaces/infosave/cmf-imagine)、
 [看看成片](https://huggingface.co/spaces/infosave/cmf-animate)。
 
+> **关于 Hub 下载计数。** `.cmf` 文件尚未进入 Hugging Face 的下载统计
+> 注册表，因此 CMF 模型仓库即使有真实流量，计数也显示为 `0`。上游修复
+> 等待合并：[huggingface.js#2354](https://github.com/huggingface/huggingface.js/pull/2354)。
+
 ## 上手试试
 
 ```sh

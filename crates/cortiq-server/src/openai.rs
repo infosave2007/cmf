@@ -185,12 +185,45 @@ async fn run_generation(
     // Check a pipeline slot out for this generation: up to
     // `slots` requests decode concurrently, the rest queue here.
     let mut slot = state.slots.acquire().await;
+    let remote = state.remote.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let p = &mut *slot.pipe;
         // A pooled pipeline must not inherit sampling state or RNG position
         // from the request that previously occupied this slot.
         p.set_sampler_config(sampler_config);
-        p.generate_from_ids(&prompt_ids, max_tokens, mask.as_ref(), on_token)
+        match remote {
+            Some(rm) => {
+                // Task masks would apply to this side's layers only —
+                // refuse rather than run half a mask (same rule as
+                // `run --peer`).
+                if mask.is_some() {
+                    return Err(
+                        "this server runs a network split (--peer): task masks are not \
+                         supported yet — use task 'general'"
+                            .to_string(),
+                    );
+                }
+                let mut rm = rm.lock().expect("remote segment mutex");
+                cortiq_net::generate_split(p, &mut rm, &prompt_ids, max_tokens, None, on_token)
+                    .map(
+                    |(r, st)| {
+                        if st.remote_steps > 0 {
+                            tracing::info!(
+                                "net: prefill {:.0} ms ({} of {} pos) · {} trips · {:.2} ms avg · {:.0}% of decode",
+                                st.prefill_s * 1e3,
+                                st.prefilled,
+                                r.prompt_tokens,
+                                st.remote_steps,
+                                st.net_s * 1e3 / st.remote_steps as f64,
+                                100.0 * st.net_s / st.decode_s.max(1e-9),
+                            );
+                        }
+                        r
+                    },
+                )
+            }
+            None => p.generate_from_ids(&prompt_ids, max_tokens, mask.as_ref(), on_token),
+        }
     })
     .await;
 
@@ -465,7 +498,12 @@ async fn chat_completions(
             let tx_tokens = tx.clone();
             let id2 = id.clone();
             let model2 = model.clone();
-            let mut filter_buf = String::new();
+            // Shared with the post-generation flush: a short reply that
+            // never opens a <think> block (the template prefilled an
+            // empty one) used to be swallowed whole — the filter waited
+            // for a </think> that never comes.
+            let filter_shared = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let filter_cb = filter_shared.clone();
             let mut filter_passthrough = req.thinking() != Some(false);
             // Tool-call holdback: once the model opens a <tool_call>
             // block, nothing more goes out as content — the calls are
@@ -513,6 +551,7 @@ async fn chat_completions(
                     let chunk = streaming::token_chunk(&id2, &model2, token, created);
                     return tx_tokens.blocking_send(chunk).is_ok();
                 }
+                let mut filter_buf = filter_cb.lock().expect("think filter buf");
                 filter_buf.push_str(token);
                 if let Some(pos) = filter_buf.find("</think>") {
                     let tail = filter_buf[pos + "</think>".len()..].to_string();
@@ -526,7 +565,7 @@ async fn chat_completions(
                     return true;
                 }
                 if filter_buf.len() > 100 && !filter_buf.contains("<think>") {
-                    let b = std::mem::take(&mut filter_buf);
+                    let b = std::mem::take(&mut *filter_buf);
                     filter_passthrough = true;
                     let chunk = streaming::token_chunk(&id2, &model2, &b, created);
                     return tx_tokens.blocking_send(chunk).is_ok();
@@ -546,6 +585,27 @@ async fn chat_completions(
 
             match outcome {
                 Ok((result, elapsed_ms)) => {
+                    // End-of-generation flush of the think filter, by the
+                    // filter's own rules: a buffer that never opened a
+                    // <think> block IS the answer; a closed block ships
+                    // its tail; an unterminated block stays private.
+                    let leftover = std::mem::take(&mut *filter_shared.lock().expect("filter buf"));
+                    if !leftover.is_empty() {
+                        let out = if !leftover.contains("<think>") {
+                            leftover
+                        } else if let Some(pos) = leftover.find("</think>") {
+                            leftover[pos + "</think>".len()..]
+                                .trim_start_matches('\n')
+                                .to_string()
+                        } else {
+                            String::new()
+                        };
+                        if !out.is_empty() {
+                            let _ = tx
+                                .send(streaming::token_chunk(&id, &model, &out, created))
+                                .await;
+                        }
+                    }
                     state2
                         .runtime
                         .record_generation(result.tokens_generated, elapsed_ms, elapsed_ms)

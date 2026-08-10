@@ -45,6 +45,11 @@ wgpu (Vulkan / DX12 / Metal) из коробки. Конвертация мод�
 [нарисовать картинку](https://huggingface.co/spaces/infosave/cmf-imagine),
 [посмотреть ролики](https://huggingface.co/spaces/infosave/cmf-animate).
 
+> **Про счётчики скачиваний на Hub.** Файлы `.cmf` пока не входят в реестр
+> учёта скачиваний Hugging Face, поэтому у CMF-реп счётчик показывает `0`
+> даже при реальном трафике. Исправление ждёт merge:
+> [huggingface.js#2354](https://github.com/huggingface/huggingface.js/pull/2354).
+
 ## Попробуйте
 
 ```sh

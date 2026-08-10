@@ -485,6 +485,10 @@ pub struct MoeJob<'a> {
     /// on a per-row ladder. Without this the experts of a q4tp MoE model fall
     /// to the CPU while every other dtype rides the device.
     pub q4tp: bool,
+    /// Mixed 2-bit profile: gate/up are q2tp (8-byte chunks, zero rung),
+    /// down stays q4tp. Set together with `q4tp`; a backend without the
+    /// 2-bit kernel must refuse the whole job.
+    pub gu_q2: bool,
     /// The reference's `swiglu_limit`; 0 disables the clamp. A backend that
     /// cannot apply it must REFUSE the job rather than drop it silently —
     /// the difference only shows on saturating activations, which is the
@@ -848,6 +852,10 @@ pub fn forward_token_graph(
     // How many leading layers the graph ran (see the wgpu twin) — smaller
     // than layers.len() when the expert budget ended the device prefix.
     layers_run: Option<&mut usize>,
+    // Absolute index of layers[0] in the model — the KV/state mirrors key
+    // on it, so a layer SPAN (network split segment) shares mirrors with
+    // a full-stack run instead of colliding at slot 0.
+    layer_base: usize,
 ) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
@@ -877,10 +885,11 @@ pub fn forward_token_graph(
             embed,
             ids_out,
             layers_run,
+            layer_base,
         ),
         #[allow(unused_variables)]
         _ => {
-            let _ = (lm_head, final_norm, logits, loop_norm_at, layers_run);
+            let _ = (lm_head, final_norm, logits, loop_norm_at, layers_run, layer_base);
             false
         }
     }
@@ -1482,6 +1491,27 @@ pub fn q4tp_matvec(
     }
 }
 
+/// Single-token q4_tiled matvec on the device — the lm_head class (a
+/// q4t checkpoint's head is its biggest host matvec, exactly like the
+/// q4tp twin above). wgpu holds q4t_mv pipelines only inside the graph
+/// encoder — the standalone arm stays an honest refusal until a
+/// discrete-GPU q4t model reaches the bench.
+pub fn q4t_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q4t_matvec_for_test(model, idx, xs, rows, cols, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 pub fn q4t_matmat(
     model: &Arc<CmfModel>,
     idx: usize,
@@ -1504,8 +1534,8 @@ pub fn q4t_matmat(
 /// Whole-block token-graph types re-exported from the Metal backend.
 #[cfg(target_os = "macos")]
 pub use crate::gpu_metal::{
-    AttnDeviceParams, AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GraphDims, TokenGraph, kv_mirror_drop,
-    kv_mirror_read_last, kv_mirror_take_imp,
+    AttnDeviceParams, AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GpuMoe, GraphDims, MetalFfn,
+    TokenGraph, kv_mirror_drop, kv_mirror_read_last, kv_mirror_take_imp,
 };
 
 /// A BLOCK of consecutive q1 GDN layers in one submission (Metal only).

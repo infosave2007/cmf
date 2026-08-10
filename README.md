@@ -46,6 +46,11 @@ Try either without installing anything: [convert a model](https://huggingface.co
 [render an image](https://huggingface.co/spaces/infosave/cmf-imagine),
 [watch the clips](https://huggingface.co/spaces/infosave/cmf-animate).
 
+> **Note on Hub download counters.** `.cmf` files are not yet in the Hub's
+> download-counting registry, so CMF model repos currently show `0` even
+> under real traffic. Upstream fix pending:
+> [huggingface.js#2354](https://github.com/huggingface/huggingface.js/pull/2354).
+
 ## Try it
 
 ```sh

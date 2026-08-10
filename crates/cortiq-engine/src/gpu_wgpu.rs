@@ -12404,6 +12404,10 @@ pub fn forward_token_graph(
     // the device prefix early — then `h` holds the boundary hidden, no
     // logits were produced, and the caller owns the remaining layers.
     mut layers_run: Option<&mut usize>,
+    // Absolute index of layers[0] in the model: KV/GDN mirror keys use
+    // `layer_base + li` so a span run (network split) and a full run
+    // address the SAME per-layer mirrors.
+    layer_base: usize,
 ) -> bool {
     let Some(c) = ctx() else {
         graph_refused("no ctx");
@@ -12924,7 +12928,7 @@ pub fn forward_token_graph(
                         gdnbufs.push(None);
                         continue;
                     }
-                    let e = kvm.entry((kv_id, li)).or_insert_with(|| {
+                    let e = kvm.entry((kv_id, layer_base + li)).or_insert_with(|| {
                         let sz = (nkv * cap * hd * 4) as u64;
                         let mk = || {
                             c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -12965,7 +12969,7 @@ pub fn forward_token_graph(
                     gdnbufs.push(None);
                 }
                 crate::gpu::GraphAttn::Gdn { cpu_state, .. } => {
-                    let e = gsm.entry((kv_id, li)).or_insert_with(|| {
+                    let e = gsm.entry((kv_id, layer_base + li)).or_insert_with(|| {
                         let ring_sz = ((gcdim * (_gkk.max(1).saturating_sub(1))) * 4) as u64;
                         let s_sz = (gnv * gdk * gdv * 4) as u64;
                         let mk = |sz: u64| {
@@ -13624,7 +13628,7 @@ pub fn forward_token_graph(
                             sc,
                         ) = {
                             let map = c.o1m.lock().unwrap();
-                            let d = map.get(&(kv_id, li)).unwrap();
+                            let d = map.get(&(kv_id, layer_base + li)).unwrap();
                             (
                                 d.meta.clone(),
                                 d.ring_k.clone(),
@@ -14858,6 +14862,9 @@ pub fn forward_batch_graph(
             inter: usize,
             norm_topk: bool,
             q4tp: bool,
+            /// Mixed 2-bit profile: q2tp gate/up over a q4tp down. The
+            /// whole-chunk q4tp fast lane must NOT take these bytes.
+            gu_q2: bool,
         },
     }
     struct LW {
@@ -15057,7 +15064,7 @@ pub fn forward_batch_graph(
                     return false;
                 };
                 let Some((gate_all, up_all, down_all)) =
-                    moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, false, false)
+                    moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false)
                 else {
                     bgraph_refused("site:5990");
                     return false;
@@ -15073,6 +15080,7 @@ pub fn forward_batch_graph(
                     inter: *mi,
                     norm_topk: *norm_topk,
                     q4tp: *q4tp,
+                    gu_q2: *gu_q2,
                 }
             }
         };
@@ -15762,6 +15770,7 @@ pub fn forward_batch_graph(
                 inter: mi,
                 norm_topk,
                 q4tp,
+                gu_q2,
             } => {
                 let (mlogit, mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
                 let mut continue_ffn = true;
@@ -15788,9 +15797,22 @@ pub fn forward_batch_graph(
                         (hidden as u32) << 8 | u32::from(sg_fold) * 4,
                     ],
                 );
+                // Gate/up stride follows the GU dtype: the mixed profile
+                // packs them q2tp while down stays q4tp (see mat16 for
+                // the down side).
+                let gu_stride = if *gu_q2 {
+                    (cortiq_core::quant::expected_nbytes(
+                        cortiq_core::TensorDtype::Q2TiledP,
+                        &[*mi, hidden],
+                    )
+                    .unwrap_or(0)
+                        / 2) as u32
+                } else {
+                    mat16(*mi, hidden)
+                };
                 let gu_u = uniform_u32x8(
                     c,
-                    [(hidden / 32) as u32, *mi as u32, slots as u32, mat16(*mi, hidden), 0, 0, 0, 0],
+                    [(hidden / 32) as u32, *mi as u32, slots as u32, gu_stride, 0, 0, 0, 0],
                 );
                 let dn_u = uniform_u32x4(
                     c,
@@ -15801,7 +15823,16 @@ pub fn forward_batch_graph(
                         mat16(hidden, *mi),
                     ],
                 );
-                let (p_gu, p_dn, l_gu, l_dn) = if *q4tp {
+                let (p_gu, p_dn, l_gu, l_dn) = if *gu_q2 {
+                    // Mixed profile: 2-bit gate/up kernel, exact q4tp down
+                    // (same pair the DSV4 chain path runs).
+                    (
+                        &c.moe_gate_up_q2tp,
+                        &c.moe_down_q4tp,
+                        &c.layout_moe_gu_q2tp,
+                        &c.layout_moe_dn_q4tp,
+                    )
+                } else if *q4tp {
                     (
                         &c.moe_gate_up_q4tp,
                         &c.moe_down_q4tp,
@@ -15828,7 +15859,7 @@ pub fn forward_batch_graph(
                         );
                     }
                 }
-                if *q4tp && router.kind == 4 && sgate.kind == 4 && *n_exp <= 256 {
+                if *q4tp && !*gu_q2 && router.kind == 4 && sgate.kind == 4 && *n_exp <= 256 {
                     // Uniform q4tp experts + f32 router/gate: k router
                     // matvecs (offset bindings, no staging rows) plus THREE
                     // token-axis dispatches for select/experts/down. The
@@ -19946,6 +19977,12 @@ fn matvec_batch_q1(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f3
 pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> bool {
     if jobs.iter().any(|j| j.q1) {
         return false; // q1 WGSL kernel not implemented yet — honest CPU
+    }
+    if jobs.iter().any(|j| j.gu_q2) {
+        // Mixed 2-bit gate/up: this per-op path has no q2tp matvec WGSL —
+        // the 2-bit lanes live in the graphs. Honest refusal, CPU or the
+        // Metal jobs path own it.
+        return false;
     }
     let Some(c) = ctx() else { return false };
     if jobs.is_empty() {

@@ -392,11 +392,20 @@ impl CmfModel {
                         && std::env::var("CMF_UPLOAD_EVICT")
                             .map(|v| v != "0")
                             .unwrap_or(true);
-                    if !evicting
-                        && std::env::var("CMF_MMAP_ADVISE")
-                            .map(|v| v != "0")
-                            .unwrap_or(true)
-                    {
+                    // WILLNEED is a whole-file readahead and macOS runs it
+                    // SYNCHRONOUSLY — on a 12.9 GB MoE file it held open()
+                    // for ~6.5 s while polluting RAM with experts that a
+                    // routed decode never touches. Small dense files keep
+                    // the readahead (it pays there); big files rely on
+                    // demand paging. CMF_MMAP_ADVISE=1 forces the old
+                    // blanket advise, =0 disables it entirely.
+                    const ADVISE_CAP: usize = 4 << 30;
+                    let advise = match std::env::var("CMF_MMAP_ADVISE").as_deref() {
+                        Ok("0") => false,
+                        Ok("1") => true,
+                        _ => m.len() <= ADVISE_CAP,
+                    };
+                    if !evicting && advise {
                         let _ = m.advise(memmap2::Advice::WillNeed);
                     }
                     if std::env::var("CMF_MLOCK")
