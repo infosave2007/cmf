@@ -56,7 +56,11 @@ struct Inner {
     /// The published job: closure pointer + total participant count.
     /// Written by the caller BEFORE the epoch bump, read by workers
     /// AFTER they observe the new epoch (acquire/release pairing).
-    slot: UnsafeCell<Option<(TaskPtr, usize)>>,
+    /// (task, worker count, publisher's GPU device). The device rides
+    /// along because a dispatch begun on card 1 must not finish on card
+    /// 0: worker threads have their own thread-locals, and the engine
+    /// resolves its wgpu context through one.
+    slot: UnsafeCell<Option<(TaskPtr, usize, usize)>>,
     shutdown: AtomicBool,
     /// Spin iterations before a worker parks (0 = park immediately).
     spin_budget: usize,
@@ -374,7 +378,8 @@ impl Pool {
             unsafe { std::mem::transmute(ptr) };
         // SAFETY: no job in flight (previous run() drained `remaining`),
         // so the slot is not being read.
-        unsafe { *self.inner.slot.get() = Some((TaskPtr(ptr), n)) };
+        let dev = crate::gpu::current_device();
+        unsafe { *self.inner.slot.get() = Some((TaskPtr(ptr), n, dev)) };
         self.inner.remaining.store(nw, Ordering::Relaxed);
         self.inner.epoch.fetch_add(1, Ordering::SeqCst);
         for (i, t) in self.threads.iter().enumerate() {
@@ -507,8 +512,9 @@ fn worker_loop(inner: &Inner, idx: usize) {
         // SAFETY: the slot was written before the epoch bump we just
         // observed (release/acquire), and stays valid until `remaining`
         // drops to zero — which happens only after `f` returns below.
-        let (task, n) = unsafe { (*inner.slot.get()).expect("job published with epoch") };
+        let (task, n, dev) = unsafe { (*inner.slot.get()).expect("job published with epoch") };
         let f = unsafe { &*task.0 };
+        crate::gpu::set_current_device(dev);
         f(idx, n);
         inner.remaining.fetch_sub(1, Ordering::AcqRel);
     }

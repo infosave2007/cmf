@@ -268,8 +268,10 @@ enum Commands {
         /// Wire payload dtype for --peer: f32 = bit-exact, f16 = half the bytes
         #[arg(long, default_value = "f32", requires = "peer")]
         net_dtype: String,
-        /// Serve on N local GPUs: layer split via a spawned local worker
-        /// pinned to the second adapter (see `cortiq gpu`)
+        /// Serve N GPU replicas: one slot per card, each holding the
+        /// whole model — N requests decode at once (the multi-GPU mode
+        /// that scales throughput). For a model too big for one card,
+        /// use --peer with a `cortiq worker` instead.
         #[arg(long, conflicts_with = "peer")]
         gpus: Option<usize>,
     },
@@ -1292,17 +1294,6 @@ async fn main() -> anyhow::Result<()> {
                 sink: o1_sink,
                 rect: None,
             };
-            let local = match gpus {
-                Some(n) if n >= 2 => Some(spawn_local_gpu_worker(&model, n)?),
-                Some(n) => anyhow::bail!(
-                    "--gpus {n}: смысл флага — несколько карт; для одной                      просто уберите его (пин карты — CMF_GPU_ADAPTER)"
-                ),
-                None => None,
-            };
-            let (peer, net_token) = match &local {
-                Some(l) => (Some(l.addr.clone()), Some(l.token.clone())),
-                None => (peer, net_token),
-            };
             cmd_serve(
                 &model,
                 &host,
@@ -1314,6 +1305,7 @@ async fn main() -> anyhow::Result<()> {
                 peer_split,
                 net_token.as_deref(),
                 &net_dtype,
+                gpus,
             )
             .await
         }
@@ -1844,6 +1836,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn cmd_serve(
     model_path: &str,
     host: &str,
@@ -1855,6 +1848,7 @@ async fn cmd_serve(
     peer_split: Option<usize>,
     net_token: Option<&str>,
     net_dtype: &str,
+    replicas: Option<usize>,
 ) -> anyhow::Result<()> {
     println!();
     println!("  ╔═══════════════════════════════════════╗");
@@ -1884,6 +1878,29 @@ async fn cmd_serve(
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| (avail / 4).clamp(1, 4));
+    // Replica mode (`--gpus N`): one slot PER CARD, each holding the
+    // whole model on its own device. This is the multi-GPU mode that
+    // actually scales — a layer split runs the cards in sequence and at
+    // best matches one of them, replicas serve N requests at once
+    // (2×RTX 5090, W2 34.7B: 232 tok/s aggregate against 119.8).
+    let mut devices: Vec<usize> = Vec::new();
+    if let Some(n) = replicas {
+        let have = cortiq_engine::gpu::device_count();
+        if n < 2 {
+            anyhow::bail!("--gpus {n}: реплики имеют смысл от 2 карт");
+        }
+        if have < n {
+            anyhow::bail!(
+                "--gpus {n}, а карт видно {have} (см. `cortiq gpu`) —                  просить больше реплик, чем устройств, нечестно"
+            );
+        }
+        if peer.is_some() {
+            anyhow::bail!("--gpus и --peer — разные режимы: реплики против сплита слоёв");
+        }
+        slots = n;
+        devices = (0..n).collect();
+        println!("    Реплики: {n} карт × полная модель — по запросу на карту");
+    }
     if peer.is_some() && slots != 1 {
         // One worker holds ONE KV session; more slots would interleave
         // sequences into it. Loud, not silent.
@@ -1898,7 +1915,12 @@ async fn cmd_serve(
         unsafe { std::env::set_var("CMF_THREADS", per.to_string()) };
     }
     let mut pipelines = Vec::with_capacity(slots);
-    for _ in 0..slots {
+    for i in 0..slots {
+        // Load with the thread pinned to the slot's card, so every
+        // device-resident allocation this pipeline makes lands there.
+        if let Some(d) = devices.get(i) {
+            cortiq_engine::gpu::set_current_device(*d);
+        }
         let mut pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
         o1.apply(&mut pipeline);
         pipelines.push(pipeline);
@@ -1960,7 +1982,11 @@ async fn cmd_serve(
     let state = Arc::new(AppState {
         runtime,
         tokenizer,
-        slots: cortiq_server::PipelinePool::new(pipelines),
+        slots: if devices.is_empty() {
+            cortiq_server::PipelinePool::new(pipelines)
+        } else {
+            cortiq_server::PipelinePool::with_devices(pipelines, devices)
+        },
         remote,
     });
 
