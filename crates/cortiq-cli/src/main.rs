@@ -268,10 +268,10 @@ enum Commands {
         /// Wire payload dtype for --peer: f32 = bit-exact, f16 = half the bytes
         #[arg(long, default_value = "f32", requires = "peer")]
         net_dtype: String,
-        /// Serve N GPU replicas: one slot per card, each holding the
-        /// whole model — N requests decode at once (the multi-GPU mode
-        /// that scales throughput). For a model too big for one card,
-        /// use --peer with a `cortiq worker` instead.
+        /// Use N local GPUs. Replicas when the model fits one card —
+        /// a full copy per card, N requests decoding at once, the mode
+        /// that scales throughput; an in-process layer split when it
+        /// does not. The server prints which mode it took and why.
         #[arg(long, conflicts_with = "peer")]
         gpus: Option<usize>,
     },
@@ -562,10 +562,12 @@ enum Commands {
         /// bytes (hidden states tolerate it; measure your model).
         #[arg(long, default_value = "f32", requires = "peer")]
         net_dtype: String,
-        /// Run on N local GPUs: the model's layer stack is split across
-        /// the cards (`cortiq gpu` lists them). Spawns a local worker
-        /// pinned to the second adapter — same proven path as --peer,
-        /// zero configuration. Use --peer-split to move the boundary.
+        /// Split the layer stack across N local GPUs, in ONE process:
+        /// segment i runs pinned to card i and only a hidden vector
+        /// crosses the boundary. This is the CAPACITY mode — for a
+        /// model that fits one card it costs nothing but gains nothing
+        /// either; for throughput use `serve --gpus N` (replicas).
+        /// `cortiq gpu` lists the cards.
         #[arg(long, conflicts_with = "peer")]
         gpus: Option<usize>,
     },
@@ -632,10 +634,10 @@ enum Commands {
         /// linear core (spec §2, vmf_phase)
         #[arg(long)]
         ctx: Option<usize>,
-        /// Bench on N local GPUs (layer split via a spawned worker on
-        /// the second adapter). Honest procedure: warmup generation,
-        /// then 3 measured repeats, median steady decode. See also
-        /// --peer for a remote worker.
+        /// Bench the in-process layer split across N local GPUs. The
+        /// warmup generation is untimed (shader compile and weight
+        /// upload belong there, not in the number). `--peer` benches a
+        /// remote worker instead, with three repeats and a median.
         #[arg(long, conflicts_with = "peer")]
         gpus: Option<usize>,
         /// Bench against a remote `cortiq worker`
@@ -2983,7 +2985,7 @@ async fn cmd_run(
         }
         let devs: Vec<usize> = (0..n).collect();
         pipeline
-            .set_gpu_plan(Some(&devs))
+            .set_gpu_plan_at(Some(&devs), peer_split)
             .map_err(|e| anyhow::anyhow!("--gpus {n}: {e}"))?;
         if let Some(plan) = pipeline.gpu_plan() {
             let seg = plan
@@ -4116,7 +4118,7 @@ async fn cmd_bench(
         }
         let devs: Vec<usize> = (0..n).collect();
         pipeline
-            .set_gpu_plan(Some(&devs))
+            .set_gpu_plan_at(Some(&devs), peer_split)
             .map_err(|e| anyhow::anyhow!("--gpus {n}: {e}"))?;
         if !json {
             if let Some(plan) = pipeline.gpu_plan() {

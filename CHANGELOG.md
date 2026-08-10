@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   multiplies it back (f16's relative precision is scale-free, so
   nothing is lost). Parity probe on the real weights: 4.65e-3 relative
   rms, the same as the scalar arm.
+- **`--peer-split` now moves the boundary of the in-process split too**
+  (`run/bench --gpus 2 --peer-split K`), not just the network one —
+  the help had promised it for both.
+- **The whole video pipeline, end to end: 716.6 s → 251.9 s (2.8×) on
+  one RTX 5090.** Denoise step 105 s (host) → 37.6 s, video VAE 201 s →
+  91 s, and the frames land within 0.1% of the previous render's — the
+  attention move is not a quality trade.
 - **MiniMax-H3 attention moved to the device — 41.5% of a denoise step
   became 16.6%.** The kernels were already there (`dit_qk` →
   `dit_softmax` → `dit_pv`, scores staying in device buffers) and
