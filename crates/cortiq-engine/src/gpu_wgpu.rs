@@ -9627,6 +9627,10 @@ struct Ctx {
     q4tp_mm: wgpu::ComputePipeline,
     q2tp_mm: wgpu::ComputePipeline,
     q4tp_mm_coop: Option<wgpu::ComputePipeline>,
+    /// Dequantize-once path: q4tp plane → packed f16, then a pure f16
+    /// coop GEMM. Both or neither.
+    q4tp_dq_f16: Option<wgpu::ComputePipeline>,
+    q4tp_mm_coop_f16: Option<wgpu::ComputePipeline>,
     /// The bake's f32-operand forward GEMM on the matrix units; None off
     /// tensor-core devices, and `gemm_nt_f32` falls back to the scalar arm.
     gemm_nt_coop: Option<wgpu::ComputePipeline>,
@@ -9912,6 +9916,10 @@ struct Scratch {
     /// Fused-FFN intermediates (gate / up panels).
     g: Option<(wgpu::Buffer, u64)>,
     u: Option<(wgpu::Buffer, u64)>,
+    /// q4tp weight plane dequantized to f16 for the tensor-core GEMM
+    /// (one grow-only slot: caching planes per tensor would want tens
+    /// of GB on a DiT).
+    dqw: Option<(wgpu::Buffer, u64)>,
     /// DiT attention: Q/K/V uploads, scores, panel, output, staging.
     dq: Option<(wgpu::Buffer, u64)>,
     dk: Option<(wgpu::Buffer, u64)>,
@@ -10525,6 +10533,41 @@ fn init(dev: usize) -> Result<Ctx, String> {
         }
         Some(p)
     }).flatten();
+    // Dequantize-once twin: the plane kernel and the f16 GEMM. Guarded
+    // like every other coop pipeline — a validation error costs the
+    // pipeline, never the device, and the in-kernel path stays.
+    let mk_coop = |src: &str, mod_label: &'static str, entry: &'static str| {
+        let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(mod_label),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
+        });
+        if let Some(e) = pollster::block_on(sc.pop()) {
+            tracing::warn!("{mod_label} module rejected: {e}");
+            return None;
+        }
+        let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: None,
+            module: &m,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        if let Some(e) = pollster::block_on(sc.pop()) {
+            tracing::warn!("{entry} pipeline rejected: {e}");
+            return None;
+        }
+        Some(p)
+    };
+    let q4tp_dq_f16 = (want_f16 && q4tp_mm_coop.is_some())
+        .then(|| mk_coop(COOP_DQ_SRC, "q4tp-dq", "q4tp_dq_f16"))
+        .flatten();
+    let q4tp_mm_coop_f16 = (q4tp_dq_f16.is_some())
+        .then(|| mk_coop(COOP_MM_F16_SRC, "q4tp-mm-f16", "q4tp_mm_coop_f16"))
+        .flatten();
+
     // The bake's f32 forward/backward GEMMs on the same units, guarded the
     // same way: a validation error must cost the pipeline, never the device.
     let bake_coop = |src: &str, mod_label: &'static str, entry: &'static str| {
@@ -10863,6 +10906,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mm,
         q2tp_mm,
         q4tp_mm_coop,
+        q4tp_dq_f16,
+        q4tp_mm_coop_f16,
         gemm_nt_coop,
         gemm_nn_coop,
         bake_silu,
@@ -17000,6 +17045,59 @@ pub fn q2tp_matmat(
 /// dispatch. Only the pipeline and the expected byte count follow the
 /// width.
 #[allow(clippy::too_many_arguments)]
+/// Dequantize a q4tp plane into f16 in a REUSED scratch buffer, once
+/// per GEMM call. Caching whole planes was the obvious idea and the
+/// wrong one: this model's DiT would want 38 GB of them. The unpack
+/// pass costs a fraction of a millisecond; what it buys is a GEMM whose
+/// matrix units are not waiting on a nibble unpacker that re-runs for
+/// every 64-row tile of activations.
+fn dq_f16_plane(
+    c: &Ctx,
+    sc: &mut Scratch,
+    q_buf: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+) -> Option<wgpu::Buffer> {
+    if cols % 2 != 0 {
+        return None;
+    }
+    let pipe = c.q4tp_dq_f16.as_ref()?;
+    let bytes = (rows * cols * 2) as u64;
+    // The caller already holds the scratch guard; std's Mutex is not
+    // reentrant, and taking it again here hung the device at 0%.
+    let plane = Scratch::ensure(
+        &c.device,
+        &mut sc.dqw,
+        bytes,
+        wgpu::BufferUsages::STORAGE,
+        "q4tp-dq-plane",
+    );
+    let u = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[cols as u32, rows as u32, 0u32, 0u32]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipe.get_bind_group_layout(0),
+        entries: &[bind_buf(0, q_buf), bind_buf(1, &plane), bind_buf(2, &u)],
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("q4tp-dq") });
+    {
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, &bind, &[]);
+        let wgs = ((rows * cols / 2) as u32).div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+    }
+    c.queue.submit(Some(enc.finish()));
+    Some(plane)
+}
+
 fn tp_matmat(
     model: &Arc<CmfModel>,
     idx: usize,
@@ -17058,7 +17156,29 @@ fn tp_matmat(
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         "q4tpmm-y",
     );
-    let params = [(cols / 4) as u32, rows as u32, b as u32, 0u32];
+    // Activation scale for the coop arm: bring max|x| to ~1000 so the
+    // f16 operands cannot overflow (the DiT's modulated activations run
+    // past 65504 — that overflow was this kernel's NaN). 0 = no scaling,
+    // so the scalar arm and every other caller keep their numerics.
+    let coop_arm = !two_bit && c.q4tp_mm_coop.is_some();
+    if std::env::var("CMF_GPU_DEBUG").is_ok() && b >= 512 {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "tp_matmat(render): b={b} rows={rows} cols={cols} two_bit={two_bit} coop={coop_arm}"
+            );
+        }
+    }
+    let ascale: f32 = if coop_arm {
+        let mx = xs[..b * cols]
+            .iter()
+            .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
+        if mx > 1000.0 { 1000.0 / mx } else { 1.0 }
+    } else {
+        0.0
+    };
+    let params = [(cols / 4) as u32, rows as u32, b as u32, ascale.to_bits()];
     let p_buf = match &sc.params {
         Some(bf) => bf.clone(),
         None => {
@@ -17081,15 +17201,31 @@ fn tp_matmat(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "q4tpmm-stage",
     );
+    // Dequantize-once: unpack the weight plane into f16 (cached per
+    // tensor, so repeat calls — every layer, every step — pay nothing)
+    // and run the pure f16 GEMM. The in-kernel unpacker spends about as
+    // many scalar ops per weight tile as the matrix units spend MACs on
+    // it, and repeats them for every 64-row tile of activations; this
+    // pays that once.
+    let dq_plane = if coop_arm && c.q4tp_mm_coop_f16.is_some() {
+        dq_f16_plane(c, &mut sc, &q_buf, rows, cols)
+    } else {
+        None
+    };
+    drop(sc);
+    let (mm_pipe, w_bind) = match (&dq_plane, c.q4tp_mm_coop_f16.as_ref()) {
+        (Some(dq), Some(pipe)) => (pipe, dq),
+        _ => (mm_pipeline(c, true, two_bit), &q_buf),
+    };
     let entries = [
-        bind_buf(0, &q_buf),
+        bind_buf(0, w_bind),
         bind_buf(1, &xs_buf),
         bind_buf(2, &y_buf),
         bind_buf(3, &p_buf),
     ];
     let bind_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("q4tpmm-bg"),
-        layout: &mm_pipeline(c, true, two_bit).get_bind_group_layout(0),
+        layout: &mm_pipe.get_bind_group_layout(0),
         entries: &entries,
     });
     let mut enc = c
@@ -17102,7 +17238,7 @@ fn tp_matmat(
             label: Some("q4tpmm"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(mm_pipeline(c, true, two_bit));
+        pass.set_pipeline(mm_pipe);
         pass.set_bind_group(0, &bind_mm, &[]);
         pass.dispatch_workgroups(
             (rows as u32).div_ceil(64).min(MAX_WG),
@@ -18433,6 +18569,168 @@ impl FlatDispatch for wgpu::ComputePass<'_> {
 ///   feature flag is raised on the weaker configuration too, so the shape
 ///   is checked against `adapter.cooperative_matrix_properties()` before
 ///   this pipeline is built. `CMF_COOP=0` opts out.
+/// Dequantize a q4tp weight plane into packed f16 pairs ONCE per GEMM,
+/// so the matrix units stop waiting on nibble unpacking. Measured on an
+/// RTX 5090: the in-kernel path spends about as many scalar ops
+/// unpacking a 64×32 weight tile as it spends MACs on it, and it repeats
+/// that work for every 64-row tile of activations — tensor cores idle
+/// through a dequantizer. One pass, then a pure f16 GEMM.
+const COOP_DQ_SRC: &str = r#"
+enable f16;
+
+struct DqP { cols: u32, rows: u32, pad0: u32, pad1: u32 };
+@group(0) @binding(0) var<storage, read> qsrc: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(2) var<uniform> dp: DqP;
+
+fn dq_byte(off: u32) -> u32 {
+    return (qsrc[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+// One thread per PAIR of weights (a packed u32 of two f16).
+@compute @workgroup_size(256)
+fn q4tp_dq_f16(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let pairs_per_row = dp.cols / 2u;
+    // 2-D grid: a plane of 77M pairs needs 300k workgroups and the
+    // per-dimension limit is 65 535. Clamping the x dimension (the
+    // obvious shortcut) silently dequantizes a fifth of the weight and
+    // leaves the rest as garbage the GEMM will happily multiply.
+    let idx = gid.y * (65535u * 256u) + gid.x;
+    if (idx >= dp.rows * pairs_per_row) { return; }
+    let row = idx / pairs_per_row;
+    let pair = idx % pairs_per_row;
+    let col0 = pair * 2u;
+    let gpr = dp.cols >> 5u;
+    let params_b = dp.rows * gpr * 16u;
+    let codes_b = params_b + dp.rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let g = col0 >> 5u;
+    let bit = g * 5u;
+    let cb = codes_b + row * cstride + (bit >> 3u);
+    let sh = bit & 7u;
+    var cv = dq_byte(cb);
+    if (sh > 3u) { cv = cv | (dq_byte(cb + 1u) << 8u); }
+    let pr = unpack2x16float(qsrc[(params_b >> 2u) + row]);
+    let scale = exp2(pr.x + f32((cv >> sh) & 31u) * pr.y);
+    let toff = (row * gpr + g) * 16u;
+    let pp = col0 - g * 32u;
+    let bo = toff + pp / 2u;
+    let b0 = dq_byte(bo);
+    // Two consecutive columns share a byte when pp is even, which it is:
+    // col0 is even by construction (one thread per pair).
+    let w0 = (f32(b0 & 0xFu) - 8.0) * scale;
+    let w1 = (f32(b0 >> 4u) - 8.0) * scale;
+    dst[idx] = pack2x16float(vec2<f32>(w0, w1));
+}
+"#;
+
+/// The same tiled coop GEMM as `q4tp_mm_coop`, reading an ALREADY
+/// dequantized f16 plane (packed pairs). Everything else — tile shape,
+/// load choreography, the activation scale in `pmm.pad` — is verbatim.
+const COOP_MM_F16_SRC: &str = r#"
+enable wgpu_cooperative_matrix;
+enable f16;
+
+struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read> wmm: array<u32>;
+@group(0) @binding(1) var<storage, read> xmm: array<f32>;
+@group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
+@group(0) @binding(3) var<uniform> pmm: MmP;
+
+const KS: u32 = 32u;
+var<workgroup> cm_a: array<f16, 64 * 32>;
+var<workgroup> cm_b: array<f16, 64 * 32>;
+var<workgroup> cm_c: array<f32, 64 * 64>;
+
+@compute @workgroup_size(128)
+fn q4tp_mm_coop_f16(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_index) tid: u32,
+                    @builtin(subgroup_id) sg: u32) {
+    let cols = pmm.cols4 * 4u;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    var c0: coop_mat16x16<f32, C>;
+    var c1: coop_mat16x16<f32, C>;
+    var c2: coop_mat16x16<f32, C>;
+    var c3: coop_mat16x16<f32, C>;
+    let ascale = bitcast<f32>(pmm.pad);
+    let ainv = select(1.0, ascale, ascale > 0.0);
+
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let m = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            let dst = m * KS + k4;
+            var v = vec4<f32>(0.0);
+            if (m0 + m < pmm.nb && col0 < cols) {
+                let base = (m0 + m) * cols + col0;
+                v = vec4<f32>(xmm[base], xmm[base + 1u], xmm[base + 2u], xmm[base + 3u]);
+            }
+            cm_a[dst] = f16(v.x * ainv); cm_a[dst + 1u] = f16(v.y * ainv);
+            cm_a[dst + 2u] = f16(v.z * ainv); cm_a[dst + 3u] = f16(v.w * ainv);
+        }
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let n = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            let bd = n * KS + k4;
+            var p0 = vec2<f32>(0.0);
+            var p1 = vec2<f32>(0.0);
+            if (n0 + n < pmm.rows && col0 < cols) {
+                let base = ((n0 + n) * cols + col0) >> 1u;
+                p0 = unpack2x16float(wmm[base]);
+                p1 = unpack2x16float(wmm[base + 1u]);
+            }
+            cm_b[bd] = f16(p0.x); cm_b[bd + 1u] = f16(p0.y);
+            cm_b[bd + 2u] = f16(p1.x); cm_b[bd + 3u] = f16(p1.y);
+        }
+        workgroupBarrier();
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 0u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 0u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u + 0u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 0u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u + 0u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 16u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 16u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u + 16u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 16u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u + 16u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        workgroupBarrier();
+        k0 = k0 + KS;
+    }
+    workgroupBarrier();
+    coopStoreT(c0, &cm_c[sg * 16u * 64u + 0u], 64u);
+    coopStoreT(c1, &cm_c[sg * 16u * 64u + 16u], 64u);
+    coopStoreT(c2, &cm_c[sg * 16u * 64u + 32u], 64u);
+    coopStoreT(c3, &cm_c[sg * 16u * 64u + 48u], 64u);
+    workgroupBarrier();
+    let asc = bitcast<f32>(pmm.pad);
+    let aback = select(1.0, 1.0 / asc, asc > 0.0);
+    for (var t = tid; t < 64u * 64u; t = t + 128u) {
+        let m = t / 64u;
+        let n = t % 64u;
+        if (m0 + m < pmm.nb && n0 + n < pmm.rows) {
+            ymm[(m0 + m) * pmm.rows + n0 + n] = cm_c[m * 64u + n] * aback;
+        }
+    }
+}
+"#;
+
 const COOP_MM_SRC: &str = r#"
 enable wgpu_cooperative_matrix;
 enable f16;
