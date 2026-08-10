@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **An honest multi-GPU benchmark: `cortiq bench --gpus 2` (also
+  --peer/--peer-split/--net-dtype).** One untimed warmup generation
+  (shader compile, weight upload, cold prefill land there), then three
+  measured repeats of ≥256 tokens, median steady decode from
+  inter-token stamps, TTFT, cold-prefill line, wire share. The contract
+  has teeth: a run where the local segment refused the token graph or
+  where weights re-uploaded inside the steady window EXITS NON-ZERO —
+  a CPU number can no longer wear a GPU label. Engine grew the
+  counters that enforce it (GRAPH_TOK_OK/MISS, gpu::upload_bytes()).
+  First honest numbers (W2 34.7B, 2×RTX 5090): single 119.8 tok/s,
+  split 101.4 — capacity mode costs 15%, not the 2-10× the
+  window-tainted `run` numbers suggested.
+
 ### Fixed
+- **`--gpus` device pinning could put both processes on one card.** An
+  externally set CMF_GPU_ADAPTER was inherited by the worker verbatim;
+  now the coordinator keeps its pin and the worker takes a DIFFERENT
+  index, both logged. `--peer-split` no longer requires `--peer` (it
+  works with --gpus); `--gpus 0/1` is a loud error instead of a silent
+  single-GPU run.
+
 - **A span ending ON a loop boundary dropped the boundary norm (wgpu
   graph).** The executor fuses each layer's residual with the NEXT
   layer's input norm, and the last layer of a span took the plain-

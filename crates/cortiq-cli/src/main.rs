@@ -259,8 +259,8 @@ enum Commands {
         /// Forces a single serve slot — one worker holds one KV session.
         #[arg(long)]
         peer: Option<String>,
-        /// First layer the peer runs (default: half the stack)
-        #[arg(long, requires = "peer")]
+        /// First layer the peer/second GPU runs (default: half the stack)
+        #[arg(long)]
         peer_split: Option<usize>,
         /// Shared secret for --peer (must match the worker's --token)
         #[arg(long, requires = "peer")]
@@ -547,10 +547,11 @@ enum Commands {
         /// refused, never blended.
         #[arg(long)]
         peer: Option<String>,
-        /// First layer the peer runs (it holds [SPLIT..num_layers)).
-        /// Default: half the stack. 0 = the peer runs every layer (this
-        /// side keeps embed / head / sampler only).
-        #[arg(long, requires = "peer")]
+        /// First layer the peer/second GPU runs (it holds
+        /// [SPLIT..num_layers)). Default: half the stack. 0 = the peer
+        /// runs every layer (this side keeps embed / head / sampler
+        /// only). Works with both --peer and --gpus.
+        #[arg(long)]
         peer_split: Option<usize>,
         /// Shared secret for --peer (must match the worker's --token).
         #[arg(long, requires = "peer")]
@@ -629,6 +630,24 @@ enum Commands {
         /// linear core (spec §2, vmf_phase)
         #[arg(long)]
         ctx: Option<usize>,
+        /// Bench on N local GPUs (layer split via a spawned worker on
+        /// the second adapter). Honest procedure: warmup generation,
+        /// then 3 measured repeats, median steady decode. See also
+        /// --peer for a remote worker.
+        #[arg(long, conflicts_with = "peer")]
+        gpus: Option<usize>,
+        /// Bench against a remote `cortiq worker`
+        #[arg(long)]
+        peer: Option<String>,
+        /// First layer the peer/second GPU runs (default: half)
+        #[arg(long)]
+        peer_split: Option<usize>,
+        /// Shared secret for --peer
+        #[arg(long)]
+        net_token: Option<String>,
+        /// Wire dtype: f32 (bit-exact) | f16
+        #[arg(long, default_value = "f32")]
+        net_dtype: String,
         /// Core timing (llama-bench contract): greedy argmax without a
         /// working copy, no repetition penalty, no per-token confidence
         /// softmax. Default (off) measures the full production loop.
@@ -1275,7 +1294,10 @@ async fn main() -> anyhow::Result<()> {
             };
             let local = match gpus {
                 Some(n) if n >= 2 => Some(spawn_local_gpu_worker(&model, n)?),
-                _ => None,
+                Some(n) => anyhow::bail!(
+                    "--gpus {n}: смысл флага — несколько карт; для одной                      просто уберите его (пин карты — CMF_GPU_ADAPTER)"
+                ),
+                None => None,
             };
             let (peer, net_token) = match &local {
                 Some(l) => (Some(l.addr.clone()), Some(l.token.clone())),
@@ -1439,7 +1461,10 @@ async fn main() -> anyhow::Result<()> {
             // guard kills the worker when the run ends.
             let local = match gpus {
                 Some(n) if n >= 2 => Some(spawn_local_gpu_worker(&model, n)?),
-                _ => None,
+                Some(n) => anyhow::bail!(
+                    "--gpus {n}: смысл флага — несколько карт; для одной                      просто уберите его (пин карты — CMF_GPU_ADAPTER)"
+                ),
+                None => None,
             };
             let (peer, net_token) = match &local {
                 Some(l) => (Some(l.addr.clone()), Some(l.token.clone())),
@@ -1637,12 +1662,26 @@ async fn main() -> anyhow::Result<()> {
             tokens,
             json,
             ctx,
+            gpus,
+            peer,
+            peer_split,
+            net_token,
+            net_dtype,
             core,
             o1,
             o1_m,
             o1_window,
             o1_sink,
         } => {
+            let local = match gpus {
+                Some(n) if n >= 2 => Some(spawn_local_gpu_worker(&model, n)?),
+                Some(n) => anyhow::bail!("--gpus {n}: нужно ≥ 2 карт"),
+                None => None,
+            };
+            let (peer, net_token) = match &local {
+                Some(l) => (Some(l.addr.clone()), Some(l.token.clone())),
+                None => (peer, net_token),
+            };
             let o1 = O1Flags {
                 spec: o1,
                 m: o1_m,
@@ -1650,7 +1689,19 @@ async fn main() -> anyhow::Result<()> {
                 sink: o1_sink,
                 rect: None,
             };
-            cmd_bench(&model, &task, tokens, ctx, &o1, json, core).await
+            cmd_bench(
+                &model,
+                &task,
+                tokens,
+                ctx,
+                &o1,
+                json,
+                core,
+                peer.as_deref(),
+                peer_split,
+                net_token.as_deref(),
+                &net_dtype,
+            ).await
         }
         Commands::Skill { cmd } => match cmd {
             SkillCmd::Add {
@@ -3238,23 +3289,31 @@ fn spawn_local_gpu_worker(model: &str, n: usize) -> anyhow::Result<LocalGpuWorke
             "--gpus {n}: пока поддержаны ровно 2 GPU (координатор + локальный воркер);              для N карт — цепочка `cortiq worker` + --peer"
         );
     }
-    // The coordinator takes card 0 explicitly — with two identical
-    // cards `request_adapter` gives BOTH processes the same "best" one.
+    // The coordinator takes card 0 unless already pinned — with two
+    // identical cards `request_adapter` gives BOTH processes the same
+    // "best" one. The worker then takes a DIFFERENT index: inheriting
+    // the coordinator's pin verbatim put both processes on one card
+    // (a 110 → 1-3 tok/s faceplant that looks like a slow wire).
+    let coord_pin = std::env::var("CMF_GPU_ADAPTER").unwrap_or_else(|_| "0".into());
     if std::env::var("CMF_GPU_ADAPTER").is_err() {
         unsafe { std::env::set_var("CMF_GPU_ADAPTER", "0") };
     }
+    let worker_pin = if coord_pin.trim() == "1" { "0" } else { "1" };
     // Let the OS pick a free port; the tiny bind→spawn race is local.
     let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
     let addr = format!("127.0.0.1:{port}");
     let token = format!("local-gpus-{}", std::process::id());
     let child = std::process::Command::new(std::env::current_exe()?)
         .args(["worker", model, "--listen", &addr, "--token", &token])
-        .env("CMF_GPU_ADAPTER", "1")
+        .env("CMF_GPU_ADAPTER", worker_pin)
         .stdout(std::process::Stdio::null())
         .spawn()
         .map_err(|e| anyhow::anyhow!("не удалось запустить локальный воркер: {e}"))?;
     let mut w = LocalGpuWorker { child, addr, token };
-    eprintln!("gpus: воркер на второй карте — {} (adapter 1)", w.addr);
+    eprintln!(
+        "gpus: координатор adapter {coord_pin}, воркер adapter {worker_pin} — {}",
+        w.addr
+    );
     // Readiness = the listener answers. The worker binds before serving,
     // so this bounds model-load time, not just process start.
     for _ in 0..1800 {
@@ -3949,6 +4008,7 @@ async fn cmd_masks(model_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_bench(
     model_path: &str,
     task: &str,
@@ -3957,6 +4017,10 @@ async fn cmd_bench(
     o1: &O1Flags,
     json: bool,
     core: bool,
+    peer: Option<&str>,
+    peer_split: Option<usize>,
+    net_token: Option<&str>,
+    net_dtype: &str,
 ) -> anyhow::Result<()> {
     if !json {
         println!(
@@ -4009,6 +4073,145 @@ async fn cmd_bench(
     } else {
         runtime.active_mask().await
     };
+
+    // ── Split bench (--gpus / --peer): the honest procedure — one
+    // warmup generation (shader compile + weight upload + prefill land
+    // here, untimed), then three measured repeats, median steady tok/s
+    // from inter-token stamps. A benchmark where the graph refused or
+    // weights re-uploaded mid-window FAILS instead of reporting CPU
+    // numbers as GPU ones.
+    if let Some(addr) = peer {
+        pipeline.split_supported().map_err(|e| anyhow::anyhow!(e))?;
+        let nl = pipeline.num_layers;
+        let split = peer_split.unwrap_or(nl / 2);
+        if split >= nl {
+            anyhow::bail!("--peer-split {split}: модель держит {nl} слоёв");
+        }
+        let dtype = match net_dtype {
+            "f32" => cortiq_net::WireDtype::F32,
+            "f16" => cortiq_net::WireDtype::F16,
+            other => anyhow::bail!("--net-dtype {other}: f32 или f16"),
+        };
+        let spec = cortiq_net::SessionSpec {
+            skill: None,
+            task: mask.as_ref().map(|_| task.to_string()),
+            o1: None,
+        };
+        let mut rs = cortiq_net::RemoteSegment::connect(
+            addr,
+            net_token.unwrap_or(""),
+            runtime.model().dir_hash(),
+            &runtime.model().arch().arch_name,
+            nl,
+            pipeline.hidden_size,
+            split,
+            nl - 1,
+            dtype,
+            &spec,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+        let prompt = "The quick brown fox jumps over the lazy dog. ".repeat(4);
+        let prompt_ids = pipeline.tokenizer.encode(&prompt);
+        // Warmup: 32 tokens, untimed; its SplitStats carry the COLD
+        // prefill (uploads included) — reported as such, not as steady.
+        let (_wr, wst) = cortiq_net::generate_split(
+            &mut pipeline,
+            &mut rs,
+            &prompt_ids,
+            32,
+            mask.as_ref(),
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+        let miss0 = cortiq_engine::pipeline::GRAPH_TOK_MISS.load(AtomicOrdering::Relaxed);
+        let mut steady = Vec::new();
+        let mut ttft = Vec::new();
+        let mut net_share = Vec::new();
+        let mut upload_delta = 0u64;
+        let reps = 3usize;
+        let meas = (tokens as usize).max(256);
+        for _ in 0..reps {
+            let up0 = cortiq_engine::gpu::upload_bytes();
+            type Stamp = std::time::Instant;
+            let stamps: Arc<std::sync::Mutex<Vec<Stamp>>> = Arc::default();
+            let st = stamps.clone();
+            let cb: cortiq_engine::TokenCallback =
+                Box::new(move |_t| {
+                    st.lock().unwrap().push(std::time::Instant::now());
+                    true
+                });
+            let t0 = std::time::Instant::now();
+            let (_r, sst) = cortiq_net::generate_split(
+                &mut pipeline,
+                &mut rs,
+                &prompt_ids,
+                meas,
+                mask.as_ref(),
+                Some(cb),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+            upload_delta += cortiq_engine::gpu::upload_bytes() - up0;
+            let stamps = stamps.lock().unwrap();
+            let n = stamps.len();
+            if n >= 34 {
+                // Drop 32 ramp tokens from the window as well.
+                steady.push(
+                    (n - 33) as f64
+                        / (stamps[n - 1] - stamps[32]).as_secs_f64().max(1e-9),
+                );
+            }
+            if let Some(first) = stamps.first() {
+                ttft.push((*first - t0).as_secs_f64() * 1e3);
+            }
+            net_share.push(sst.net_s / sst.decode_s.max(1e-9));
+        }
+        let missn = cortiq_engine::pipeline::GRAPH_TOK_MISS.load(AtomicOrdering::Relaxed);
+        steady.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ttft.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = |v: &Vec<f64>| v.get(v.len() / 2).copied().unwrap_or(0.0);
+        let graph_miss = missn - miss0;
+        let out = serde_json::json!({
+            "mode": "split",
+            "split": split,
+            "layers": nl,
+            "wire": net_dtype,
+            "adapter_local": std::env::var("CMF_GPU_ADAPTER").unwrap_or_default(),
+            "measured_tokens": meas,
+            "reps": reps,
+            "prefill_cold_tok_s": wst.prefilled as f64 / wst.prefill_s.max(1e-9),
+            "ttft_ms_median": med(&ttft),
+            "decode_tok_s_steady_median": med(&steady),
+            "decode_tok_s_steady_all": steady,
+            "net_share_of_decode": net_share,
+            "local_graph_miss_tokens": graph_miss,
+            "steady_upload_bytes": upload_delta,
+        });
+        if json {
+            println!("{out}");
+        } else {
+            println!(
+                "split {split}/{nl} wire {net_dtype}: steady {:.1} tok/s (median of {reps}),                  ttft {:.0} ms, cold prefill {:.1} tok/s",
+                med(&steady),
+                med(&ttft),
+                wst.prefilled as f64 / wst.prefill_s.max(1e-9),
+            );
+        }
+        // Honest-bench contract: fast-path refusal or steady-window
+        // re-upload disqualifies the number LOUDLY.
+        if graph_miss > 0 {
+            anyhow::bail!(
+                "BENCH INVALID: локальный сегмент отказал графу на {graph_miss} токенах —                  это CPU-число, не GPU (CMF_GPU_DEBUG=1 покажет причину)"
+            );
+        }
+        if upload_delta > 64 * 1024 * 1024 {
+            anyhow::bail!(
+                "BENCH INVALID: {upload_delta} байт весов доехало в steady-окне —                  вытеснение/перезаливка, поднимите CMF_GPU_VRAM_MB"
+            );
+        }
+        return Ok(());
+    }
 
     // Warmup: touch every weight page once so the numbers below are
     // steady-state (a cold 14 GB mmap otherwise bills its first pass
