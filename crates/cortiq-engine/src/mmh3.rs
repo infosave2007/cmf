@@ -35,6 +35,54 @@
 //! module; `tools/mmh3_toy_gate.sh` diffs this port against it.
 
 use crate::dit::Proj;
+
+/// Per-phase microseconds of the DiT block, under `CMF_MMH3_PROF=1`:
+/// 0 norm+modulate · 1 qkv GEMM · 2 qk-norm+RoPE · 3 attention ·
+/// 4 out GEMM+residual · 5 fc1 GEMM · 6 SwiGLU · 7 fc2 GEMM.
+pub static MMH3_PROF: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+pub(crate) fn mmh3_prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_MMH3_PROF").is_ok())
+}
+
+/// One line per phase, sorted by cost — the map that says which kernel
+/// to write next.
+pub fn mmh3_prof_report() -> Option<String> {
+    if !mmh3_prof_on() {
+        return None;
+    }
+    const NAMES: [&str; 8] = [
+        "norm+mod", "qkv gemm", "qknorm+rope", "attention", "out gemm+res", "fc1 gemm",
+        "swiglu", "fc2 gemm",
+    ];
+    let mut v: Vec<(u64, &str)> = MMH3_PROF
+        .iter()
+        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+        .zip(NAMES)
+        .collect();
+    let total: u64 = v.iter().map(|(us, _)| *us).sum();
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out = format!("mmh3 phases (total {:.1} s):", total as f64 / 1e6);
+    for (us, name) in v {
+        out.push_str(&format!(
+            "\n  {name:<14} {:>7.1} s  {:>5.1}%",
+            us as f64 / 1e6,
+            100.0 * us as f64 / total.max(1) as f64
+        ));
+    }
+    Some(out)
+}
+
 use crate::pool::Pool;
 use cortiq_core::CmfModel;
 use std::sync::Arc;
@@ -695,6 +743,16 @@ impl MiniMaxH3 {
         }
     }
 
+    /// Where a denoise step's wall actually goes, in microseconds, under
+    /// `CMF_MMH3_PROF=1`. Optimizing a 60-second step without this is
+    /// guesswork, and guesswork on a rented card is expensive.
+    fn prof(slot: usize, t: std::time::Instant) {
+        if !mmh3_prof_on() {
+            return;
+        }
+        MMH3_PROF[slot].fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// One block. `mods` is the block's modulation buffer and `rows` the
     /// per-token row index into it; both empty for the refiner, which is
     /// unmodulated and unrotated.
@@ -716,30 +774,45 @@ impl MiniMaxH3 {
             self.rope_angles(pos)
         };
 
+        let t = std::time::Instant::now();
         let mut xn = vec![0f32; n * hs];
         self.norm_rows(&mut xn, x, n, hs, &blk.norm1, self.eps);
         if let (Some(m), false) = (mods, rows.is_empty()) {
             self.modulate(&mut xn, hs, m, rows, 0, 1);
         }
+        Self::prof(0, t);
+        let t = std::time::Instant::now();
         let mut qkv = vec![0f32; n * 3 * inner];
         blk.qkv.matmat(&xn, n, &mut qkv, pool);
+        Self::prof(1, t);
         // q and k are the first two thirds of every row; normalize and
         // rotate them where they lie, leaving v alone.
+        let t = std::time::Instant::now();
         for (which, w) in [(0usize, &blk.q_norm), (1usize, &blk.k_norm)] {
             self.norm_rope_w(&mut qkv, n, self.heads, w, &angles, 3 * inner, which * inner);
         }
+        Self::prof(2, t);
+        let t = std::time::Instant::now();
         let mut attn = vec![0f32; n * inner];
         self.attention(&qkv, n, &mut attn);
+        Self::prof(3, t);
+        let t = std::time::Instant::now();
         let mut proj = vec![0f32; n * hs];
         blk.out.matmat(&attn, n, &mut proj, pool);
         self.residual(x, hs, &proj, mods, rows, 2);
+        Self::prof(4, t);
 
+        let t = std::time::Instant::now();
         self.norm_rows(&mut xn, x, n, hs, &blk.norm2, self.eps);
         if let (Some(m), false) = (mods, rows.is_empty()) {
             self.modulate(&mut xn, hs, m, rows, 3, 4);
         }
+        Self::prof(0, t);
+        let t = std::time::Instant::now();
         let mut gu = vec![0f32; n * 2 * self.ffn];
         blk.fc1.matmat(&xn, n, &mut gu, pool);
+        Self::prof(5, t);
+        let t = std::time::Instant::now();
         // SwiGLU: fc1's output is [gate | up] per row.
         let ffn = self.ffn;
         let mut act = vec![0f32; n * ffn];
@@ -757,7 +830,10 @@ impl MiniMaxH3 {
                 }
             }
         });
+        Self::prof(6, t);
+        let t = std::time::Instant::now();
         blk.fc2.matmat(&act, n, &mut proj, pool);
+        Self::prof(7, t);
         self.residual(x, hs, &proj, mods, rows, 5);
     }
 
