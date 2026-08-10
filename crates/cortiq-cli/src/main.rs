@@ -2988,6 +2988,9 @@ async fn cmd_run(
         None => Pipeline::from_model_with_skill(&model, sampler, skill.as_deref())?,
     };
     o1.apply(&mut pipeline);
+    // Same rule for the CLI: the vocabulary-wide softmax runs when its
+    // output is going to be shown, not on every run.
+    pipeline.set_confidence(confidence || trace);
     if let Some(n) = gpus {
         // In-process split: segment i runs pinned to card i and hands
         // the next one a hidden vector that never leaves this address

@@ -55,6 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1.00×)** — where the TCP split cost 0.77–0.85×. Output stays
   byte-identical to the single-card run on both. `--peer` remains the
   answer for a model bigger than one HOST.
+- **Per-token confidence is computed when it will be shown, not always.**
+  It is a softmax over the whole vocabulary (151936 rows on this model)
+  on every token; the OpenAI surface never returns it and `run` only
+  shows it under `--confidence`/`--trace`. Serving one request went
+  109.2 → 114.0 tok/s, and four concurrent 185 → 222.9.
 - **`CMF_SLOTS_PER_GPU`: slots per card, default 1 — because the
   measurement said so.** The frame profiler (`CMF_GPU_TS=1`) shows a
   decode dispatch leaves an RTX 5090 mostly idle — 30-70 µs of work per
