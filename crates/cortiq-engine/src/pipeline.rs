@@ -5539,6 +5539,17 @@ fn draft_probe() -> bool {
     /// VRAM-weighted planner is the next step, and an uneven card pair
     /// is why it will be needed. `None` clears the plan.
     pub fn set_gpu_plan(&mut self, devices: Option<&[usize]>) -> Result<(), String> {
+        self.set_gpu_plan_at(devices, None)
+    }
+
+    /// The same, with an explicit first boundary (`--peer-split`): card
+    /// 0 takes layers `[0..at)`, the rest split what remains. Uneven
+    /// cards, or an attention-heavy head, are why this knob exists.
+    pub fn set_gpu_plan_at(
+        &mut self,
+        devices: Option<&[usize]>,
+        at: Option<usize>,
+    ) -> Result<(), String> {
         let Some(devs) = devices.filter(|d| d.len() > 1) else {
             self.gpu_plan = None;
             return Ok(());
@@ -5547,6 +5558,22 @@ fn draft_probe() -> bool {
         let n = self.num_layers;
         if devs.len() > n {
             return Err(format!("{} devices for {n} layers", devs.len()));
+        }
+        if let Some(k) = at {
+            if k == 0 || k >= n {
+                return Err(format!("split at {k}: the model has {n} layers"));
+            }
+            if devs.len() == 2 {
+                self.gpu_plan = Some(std::sync::Arc::new(vec![
+                    (devs[0], 0, k - 1),
+                    (devs[1], k, n - 1),
+                ]));
+                return Ok(());
+            }
+            return Err(format!(
+                "an explicit split point takes exactly 2 devices, got {}",
+                devs.len()
+            ));
         }
         let per = n.div_ceil(devs.len());
         let mut plan = Vec::with_capacity(devs.len());
