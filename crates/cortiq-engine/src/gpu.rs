@@ -594,6 +594,59 @@ pub fn wgpu_active() -> bool {
     }
 }
 
+/// Which GPU this thread's engine calls address. Multi-card hosts hold
+/// one wgpu context PER card (weights, KV mirrors and scratch live
+/// inside a context, so per-device contexts give per-device caches for
+/// free); this thread-local says which one is current. Default: the
+/// process pin (CMF_GPU_ADAPTER) or 0 — so single-card runs behave
+/// exactly as they always have.
+pub fn default_device() -> usize {
+    static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        std::env::var("CMF_GPU_ADAPTER")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
+thread_local! {
+    static CUR_DEV: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The device this thread is pinned to.
+pub fn current_device() -> usize {
+    CUR_DEV.with(|c| c.get()).unwrap_or_else(default_device)
+}
+
+/// Pin this thread to a device. Server slots call it once per request;
+/// the worker pool propagates it into its threads, so a dispatch begun
+/// on card 1 does not finish on card 0.
+pub fn set_current_device(i: usize) {
+    CUR_DEV.with(|c| c.set(Some(i)));
+}
+
+/// Run `f` with this thread pinned to `dev`, restoring the previous pin.
+pub fn with_device<R>(dev: usize, f: impl FnOnce() -> R) -> R {
+    let prev = CUR_DEV.with(|c| c.replace(Some(dev)));
+    let r = f();
+    CUR_DEV.with(|c| c.set(prev));
+    r
+}
+
+/// How many GPUs this process can address (wgpu adapter count; 1 on
+/// Metal, 0 without a backend).
+pub fn device_count() -> usize {
+    #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+    {
+        return crate::gpu_wgpu::adapter_count();
+    }
+    #[cfg(not(all(feature = "gpu", not(target_os = "macos"))))]
+    {
+        usize::from(backend_available())
+    }
+}
+
 /// Device weight bytes uploaded so far (wgpu; 0 on other backends).
 /// Steady-state windows must show a ZERO delta — growth mid-benchmark
 /// means eviction/re-upload and disqualifies the number.

@@ -22,6 +22,9 @@ use tower_http::cors::CorsLayer;
 /// batching (этап 5.2+).
 pub struct PipelinePool {
     slots: Vec<Arc<Mutex<Pipeline>>>,
+    /// GPU each slot's weights live on (replica mode: slot i → card i).
+    /// Empty = single-device, every slot on the process default.
+    devices: Vec<usize>,
     sem: Arc<Semaphore>,
 }
 
@@ -29,6 +32,10 @@ pub struct PipelinePool {
 /// pipeline lock until dropped.
 pub struct SlotGuard {
     pub pipe: OwnedMutexGuard<Pipeline>,
+    /// The card this slot's weights are on. The handler thread is
+    /// pinned to it for the whole request — the engine resolves its
+    /// device context (and therefore its weight cache) through that pin.
+    pub device: usize,
     // Keep the permit after the mutex guard so drop glue unlocks the
     // pipeline before another waiter can acquire the permit.
     _permit: OwnedSemaphorePermit,
@@ -36,9 +43,22 @@ pub struct SlotGuard {
 
 impl PipelinePool {
     pub fn new(pipelines: Vec<Pipeline>) -> Self {
+        let n = pipelines.len();
+        Self::with_devices(pipelines, vec![cortiq_engine::gpu::default_device(); n])
+    }
+
+    /// Replica mode: `devices[i]` is the card slot i was loaded on.
+    pub fn with_devices(pipelines: Vec<Pipeline>, devices: Vec<usize>) -> Self {
         assert!(
             !pipelines.is_empty(),
             "pipeline pool needs at least one slot"
+        );
+        assert_eq!(
+            pipelines.len(),
+            devices.len(),
+            "one device per slot: {} pipelines, {} devices",
+            pipelines.len(),
+            devices.len()
         );
         let sem = Arc::new(Semaphore::new(pipelines.len()));
         Self {
@@ -46,6 +66,7 @@ impl PipelinePool {
                 .into_iter()
                 .map(|p| Arc::new(Mutex::new(p)))
                 .collect(),
+            devices,
             sem,
         }
     }
@@ -63,10 +84,16 @@ impl PipelinePool {
             .acquire_owned()
             .await
             .expect("slot semaphore closed");
-        for s in &self.slots {
+        for (i, s) in self.slots.iter().enumerate() {
             if let Ok(pipe) = s.clone().try_lock_owned() {
+                let device = self.devices[i];
+                // Pin the caller's thread: everything this request does
+                // downstream — including the worker pool, which carries
+                // the pin with each dispatch — addresses this card.
+                cortiq_engine::gpu::set_current_device(device);
                 return SlotGuard {
                     pipe,
+                    device,
                     _permit: permit,
                 };
             }

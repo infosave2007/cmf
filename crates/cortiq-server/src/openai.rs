@@ -187,6 +187,12 @@ async fn run_generation(
     let mut slot = state.slots.acquire().await;
     let remote = state.remote.clone();
     let outcome = tokio::task::spawn_blocking(move || {
+        // Replica mode: the compute happens HERE, on a blocking-pool
+        // thread that never saw the pin `acquire` set on the async
+        // thread. Pin it again or every replica quietly shares card 0
+        // (measured: 400 tokens across two "replicas" ran 103 tok/s,
+        // exactly one card's worth, with the second card at 17 MB).
+        cortiq_engine::gpu::set_current_device(slot.device);
         let p = &mut *slot.pipe;
         // A pooled pipeline must not inherit sampling state or RNG position
         // from the request that previously occupied this slot.

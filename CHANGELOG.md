@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`cortiq serve --gpus N`: N GPU replicas in ONE process, and the
+  multi-GPU mode that actually scales.** Each slot holds the whole
+  model on its own card and serves whole requests, so N requests decode
+  at once. Measured on 2×RTX 5090 (W2 34.7B, 200-token completions):
+  one request 115.3 tok/s, two concurrent **218.5 tok/s aggregate
+  (1.9×)**, both cards resident at 14.4 GB and busy. Refuses loudly
+  when asked for more replicas than there are adapters, or together
+  with --peer (replicas and layer split are different answers to
+  different problems: throughput vs capacity).
+- **The engine addresses GPUs by device, not by process.** wgpu
+  contexts are now a registry keyed by adapter index — and since weight
+  buffers, KV mirrors and scratch live INSIDE a context, per-device
+  contexts give per-device caches for free. A thread-local pin says
+  which card the current thread talks to (`gpu::set_current_device` /
+  `with_device`), the worker pool carries that pin into its threads
+  (a dispatch begun on card 1 no longer finishes on card 0), and the
+  server re-pins inside its blocking task — without that last piece two
+  "replicas" quietly shared card 0 and measured exactly one card's
+  throughput.
+
 ### Fixed
 - **Prefill was 15× slower than it had to be: the CPU pair walk was
   eating the GPU graph's positions.** `forward_ids` — the path `bench`

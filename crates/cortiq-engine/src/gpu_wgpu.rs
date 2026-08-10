@@ -10069,7 +10069,13 @@ impl GraphScratch {
     }
 }
 
-static CTX: OnceLock<Option<Ctx>> = OnceLock::new();
+/// One context PER GPU, built on first touch of that device. A Ctx owns
+/// its weight buffers, KV mirrors and scratch, so keying contexts by
+/// device is what keys those caches by device — the alternative (one
+/// global context) is why a second card used to be unreachable from the
+/// same process.
+static CTXS: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Option<&'static Ctx>>>> =
+    OnceLock::new();
 
 /// Whether the wgpu path is selected (the facade asks before `enabled()`):
 /// `CMF_GPU=wgpu` — always; `CMF_GPU=1` (≠0) — only on non-macOS, where
@@ -10090,26 +10096,72 @@ pub fn selected() -> bool {
 }
 
 fn ctx() -> Option<&'static Ctx> {
-    CTX.get_or_init(|| {
-        if !selected() {
-            return None;
-        }
-        match init() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                // Tests install no subscriber, so a tracing-only report makes
-                // an init failure look exactly like "no GPU here".
-                tracing::warn!("wgpu init failed — CPU fallback: {e}");
-                if std::env::var("CMF_GPU_DEBUG").is_ok()
-                    || std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok()
-                {
-                    eprintln!("wgpu init не удался — откат на CPU: {e}");
-                }
-                None
+    ctx_for(crate::gpu::current_device())
+}
+
+fn ctx_for(dev: usize) -> Option<&'static Ctx> {
+    if !selected() {
+        return None;
+    }
+    let map = CTXS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut g = map.lock().unwrap();
+    if let Some(slot) = g.get(&dev) {
+        return *slot;
+    }
+    let built = match init(dev) {
+        // Leaked on purpose: a device context lives for the process, and
+        // every caller wants &'static (buffers outlive any one call).
+        Ok(c) => Some(&*Box::leak(Box::new(c))),
+        Err(e) => {
+            // Tests install no subscriber, so a tracing-only report makes
+            // an init failure look exactly like "no GPU here".
+            tracing::warn!("wgpu init failed on device {dev} — CPU fallback: {e}");
+            if std::env::var("CMF_GPU_DEBUG").is_ok()
+                || std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok()
+            {
+                eprintln!("wgpu init не удался (устройство {dev}) — откат на CPU: {e}");
             }
+            None
         }
+    };
+    g.insert(dev, built);
+    built
+}
+
+/// How many adapters this build can see (0 when the backend is off).
+pub fn adapter_count() -> usize {
+    if !selected() {
+        return 0;
+    }
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: backends_from_env(),
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: Default::default(),
+            backend_options: Default::default(),
+            display: None,
+        });
+        pollster::block_on(instance.enumerate_adapters(backends_from_env()))
+            .iter()
+            .filter(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
+            .count()
     })
-    .as_ref()
+}
+
+/// Backend mask from the standard WGPU_BACKEND env (shared by init and
+/// the adapter census, so both count the same list).
+fn backends_from_env() -> wgpu::Backends {
+    std::env::var("WGPU_BACKEND")
+        .ok()
+        .map(|v| match v.to_lowercase().as_str() {
+            "vulkan" | "vk" => wgpu::Backends::VULKAN,
+            "dx12" | "d3d12" => wgpu::Backends::DX12,
+            "metal" | "mtl" => wgpu::Backends::METAL,
+            "gl" | "gles" => wgpu::Backends::GL,
+            _ => wgpu::Backends::all(),
+        })
+        .unwrap_or(wgpu::Backends::all())
 }
 
 /// Total device-local memory of a Vulkan adapter, from the driver's own heap
@@ -10146,20 +10198,11 @@ fn vulkan_vram_total(_adapter: &wgpu::Adapter) -> Option<u64> {
     None
 }
 
-fn init() -> Result<Ctx, String> {
+fn init(dev: usize) -> Result<Ctx, String> {
     // Backend selection is automatic (wgpu picks the platform's best:
     // DX12 on Windows, Vulkan on Linux, Metal on macOS), but the
     // standard WGPU_BACKEND env (vulkan|dx12|metal|gl) forces one.
-    let backends = std::env::var("WGPU_BACKEND")
-        .ok()
-        .map(|v| match v.to_lowercase().as_str() {
-            "vulkan" | "vk" => wgpu::Backends::VULKAN,
-            "dx12" | "d3d12" => wgpu::Backends::DX12,
-            "metal" | "mtl" => wgpu::Backends::METAL,
-            "gl" | "gles" => wgpu::Backends::GL,
-            _ => wgpu::Backends::all(),
-        })
-        .unwrap_or(wgpu::Backends::all());
+    let backends = backends_from_env();
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends,
         flags: wgpu::InstanceFlags::default(),
@@ -10171,22 +10214,34 @@ fn init() -> Result<Ctx, String> {
     // listing or a case-insensitive name substring. Without it every
     // process on the host gets the same "best" adapter — the pin is
     // what lets a local worker take the SECOND GPU (`run --gpus N`).
-    let adapter = if let Ok(want) = std::env::var("CMF_GPU_ADAPTER") {
+    // Device index first (the multi-GPU registry asks for a specific
+    // card), then the CMF_GPU_ADAPTER pin (index or name substring),
+    // then wgpu's own "best". A named pin only makes sense for the
+    // default device — a request for card 2 by index means card 2.
+    let want_env = std::env::var("CMF_GPU_ADAPTER").ok();
+    let by_index = (dev != 0 || want_env.is_none()).then_some(dev);
+    let adapter = if by_index.is_some() || want_env.is_some() {
         let mut all = pollster::block_on(instance.enumerate_adapters(backends));
-        let pick = want
-            .parse::<usize>()
-            .ok()
+        let pick = by_index
             .filter(|&i| i < all.len())
             .or_else(|| {
-                let w = want.to_lowercase();
-                all.iter()
-                    .position(|a| a.get_info().name.to_lowercase().contains(&w))
+                let want = want_env.as_deref().unwrap_or_default();
+                want.parse::<usize>()
+                    .ok()
+                    .filter(|&i| i < all.len())
+                    .or_else(|| {
+                        let w = want.to_lowercase();
+                        all.iter()
+                            .position(|a| a.get_info().name.to_lowercase().contains(&w))
+                    })
             });
         match pick {
             Some(i) => all.swap_remove(i),
             None => {
                 return Err(format!(
-                    "CMF_GPU_ADAPTER={want} matches none of the {} adapters (see `cortiq gpu`)",
+                    "device {dev} / CMF_GPU_ADAPTER={:?} matches none of the {} adapters \
+                     (see `cortiq gpu`)",
+                    want_env,
                     all.len()
                 ));
             }
