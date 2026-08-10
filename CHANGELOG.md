@@ -55,6 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1.00×)** — where the TCP split cost 0.77–0.85×. Output stays
   byte-identical to the single-card run on both. `--peer` remains the
   answer for a model bigger than one HOST.
+- **`CMF_SLOTS_PER_GPU`: slots per card, default 1 — because the
+  measurement said so.** The frame profiler (`CMF_GPU_TS=1`) shows a
+  decode dispatch leaves an RTX 5090 mostly idle — 30-70 µs of work per
+  layer where the card wants thousands of workgroups — so a second slot
+  per card looks like free throughput. It is not: four concurrent
+  requests over four slots ran 185 tok/s against 210 over two. They
+  contend for the queue and the CPU pool rather than interleaving. The
+  knob ships for hardware that disagrees; the default does not guess.
 - **`serve --gpus N` picks the right mode by itself.** Replicas need the
   model to fit one card; when it does not, the honest answer is the
   layer split, and the server now says which mode it took and why
