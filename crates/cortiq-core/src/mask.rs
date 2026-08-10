@@ -74,9 +74,14 @@ impl TaskMask {
             .unwrap_or(0)
     }
 
-    /// Check if a specific layer is alive (not pruned).
+    /// Check if a specific layer is alive (not pruned). An ABSENT gate
+    /// means "no restriction recorded", which must read as alive: a
+    /// looped runtime walks virtual layers past a physical-length gate
+    /// list, and the old false-default silently killed every layer of
+    /// the second pass — a specialist that generated CJK soup at the
+    /// exact moment its mask went active.
     pub fn layer_alive(&self, layer_idx: usize) -> bool {
-        self.layer_gates.get(layer_idx).copied().unwrap_or(false)
+        self.layer_gates.get(layer_idx).copied().unwrap_or(true)
     }
 
     /// Count total active layers.
@@ -596,8 +601,15 @@ pub fn decode_masks_section(bytes: &[u8], arch: &ModelArch) -> Result<MaskCatalo
         }
         let gates_base = heads_base + arch.num_layers * head_b;
         let gates = &blob[gates_base..];
-        let layer_gates: Vec<bool> = (0..arch.num_layers)
-            .map(|li| gates[li / 8] & (1 << (li % 8)) != 0)
+        // Gates decode per PHYSICAL layer then replicate to every visit,
+        // exactly like the FFN rows above: the runtime asks
+        // `layer_alive(virtual)` and a short list must not read as a
+        // dead second pass.
+        let layer_gates: Vec<bool> = (0..vrows.max(arch.num_layers))
+            .map(|vl| {
+                let li = vl % arch.num_layers.max(1);
+                gates[li / 8] & (1 << (li % 8)) != 0
+            })
             .collect();
         let expert_masks: Vec<Vec<u8>> = if mm.has_expert_fields {
             let base = gates_base + arch.gates_mask_bytes();

@@ -5567,83 +5567,40 @@ fn draft_probe() -> bool {
             let ffn_masked = task_mask
                 .map(|m| m.ffn_active_count(li) < self.intermediate_size)
                 .unwrap_or(false);
-            // Sparse mask path applies to dense f32 FFN only; MoE
-            // layers route through the normal dispatch below.
-            let f32_ffn = match &lw.ffn {
-                FfnKind::Dense(d) => (
-                    d.gate_proj.as_f32(),
-                    d.up_proj.as_f32(),
-                    d.down_proj.as_f32(),
-                ),
-                FfnKind::Moe(_) | FfnKind::DenseMoe(_) => (None, None, None),
-            };
-            let ffn_out = match (ffn_masked, f32_ffn) {
-                (true, (Some(g), Some(u), Some(d))) => {
-                    let active = task_mask.unwrap().ffn_active_indices(li);
-                    inference::sparse_ffn_forward(
+            // One masked dense path, ONE semantics: the same
+            // activation-zeroing arm the batched sweep runs (validated
+            // against the replica's f32 math to 0.8%), at b=1. The old
+            // per-dtype zoo of sparse arms diverged on q8_row trained
+            // masters and scored PPL in the thousands where the batched
+            // path scored 4.27 — three implementations of one contract
+            // is two too many.
+            let ffn_out = match (ffn_masked, &lw.ffn) {
+                (true, FfnKind::Dense(d)) => {
+                    let row = task_mask
+                        .and_then(|tm| tm.ffn_masks.get(li))
+                        .map(|v| v.as_slice());
+                    dense_ffn_batch(d, post_normed, 1, self.pool.as_deref(), row)
+                }
+                (true, FfnKind::Moe(m)) => {
+                    // MoE is sparse by expert selection; a task mask
+                    // narrows the ROUTABLE set via its expert fields
+                    // (spec §5) when it carries them.
+                    let allowed = task_mask.and_then(|tm| tm.expert_flags(li, m.experts.len()));
+                    ffn_forward(
+                        &lw.ffn,
                         post_normed,
-                        g,
-                        u,
-                        d,
-                        self.hidden_size,
-                        self.intermediate_size,
-                        &active,
                         self.pool.as_deref(),
+                        allowed.as_deref(),
                     )
                 }
-                // Mask × quantized mmap: sparse FFN reads only active
-                // neurons' rows/cols directly from the quant bytes — no
-                // f32 model copy (a masked big model runs at quant RSS).
-                (true, _) => match &lw.ffn {
-                    FfnKind::Dense(d) if d.down_proj.sparse_col_ok() => {
-                        let active = task_mask.unwrap().ffn_active_indices(li);
-                        sparse_ffn_quant(
-                            d,
-                            post_normed,
-                            &active,
-                            self.hidden_size,
-                            self.pool.as_deref(),
-                        )
-                    }
-                    // q4/vbit down_proj has no cheap column access → dequant
-                    // the three matrices to f32 (transient) and run the f32
-                    // sparse path. Correct (mask honored), just not
-                    // memory-lean for those dtypes — a rare masked case.
-                    FfnKind::Dense(d) => {
-                        let active = task_mask.unwrap().ffn_active_indices(li);
-                        let (gf, uf, df) = dequant_dense_f32(d);
-                        inference::sparse_ffn_forward(
-                            post_normed,
-                            &gf,
-                            &uf,
-                            &df,
-                            self.hidden_size,
-                            self.intermediate_size,
-                            &active,
-                            self.pool.as_deref(),
-                        )
-                    }
-                    FfnKind::Moe(m) => {
-                        // MoE is sparse by expert selection; a task mask
-                        // narrows the ROUTABLE set via its expert fields
-                        // (spec §5) when it carries them.
-                        let allowed = task_mask.and_then(|tm| tm.expert_flags(li, m.experts.len()));
-                        ffn_forward(
-                            &lw.ffn,
-                            post_normed,
-                            self.pool.as_deref(),
-                            allowed.as_deref(),
-                        )
-                    }
-                    FfnKind::DenseMoe(dm) => dense_moe_ffn(
-                        dm,
-                        post_normed,
-                        &h,
-                        self.rms_eps,
-                        self.norm_style,
-                        self.pool.as_deref(),
-                    ),
-                },
+                (true, FfnKind::DenseMoe(dm)) => dense_moe_ffn(
+                    dm,
+                    post_normed,
+                    &h,
+                    self.rms_eps,
+                    self.norm_style,
+                    self.pool.as_deref(),
+                ),
                 (false, _) => match &lw.ffn {
                     FfnKind::DenseMoe(dm) => dense_moe_ffn(
                         dm,
@@ -6217,6 +6174,37 @@ thread_local! {
     /// accumulator, alive only during `Pipeline::probe_ffn_mass`.
     static FFN_PROBE: std::cell::RefCell<Option<Vec<Vec<f64>>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// `dense_ffn_cpu` with a per-visit mask landing on the activations —
+/// the masked-inference fast path's decode arm. Full fused quant
+/// compute, closed neurons zeroed before down: arithmetically the
+/// pruned network, no dequant, no weight bytes touched.
+fn dense_ffn_masked(
+    d: &DenseFfn,
+    x: &[f32],
+    pool: Option<&Pool>,
+    mask_row: &[u8],
+) -> Vec<f32> {
+    let inter = d.gate_proj.rows();
+    FFN_SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        let [g, u, ..] = &mut *s;
+        g.resize(inter, 0.0);
+        if d.act == Act::Silu && QTensor::matvec_silu_mul(&d.gate_proj, &d.up_proj, x, g, pool) {
+            // g holds silu(gate)·up.
+        } else {
+            u.resize(inter, 0.0);
+            QTensor::matvec_many([&d.gate_proj, &d.up_proj], x, [g, u], pool);
+            for i in 0..inter {
+                g[i] = d.act.combine(g[i], u[i]);
+            }
+        }
+        zero_masked_cols(g, 1, inter, mask_row);
+        let mut out = attention::take_buf(d.down_proj.rows());
+        d.down_proj.matvec(g, &mut out, pool);
+        out
+    })
 }
 
 /// Dense FFN as one GPU submission via the MoE block path (single

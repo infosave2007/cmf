@@ -148,3 +148,28 @@ fn unlooped_layout_is_unchanged() {
         "unlooped: one row per physical layer, as ever"
     );
 }
+
+/// A physical-length gate list on a looped model must read as ALIVE for
+/// every visit: the runtime asks `layer_alive(virtual)`, and the old
+/// false-default silently killed the whole second pass — a specialist
+/// that produced CJK soup the moment its mask went active, while every
+/// batched scorer (which never consults gates) said the file was fine.
+#[test]
+fn physical_gates_replicate_and_absent_gates_read_alive() {
+    let a = arch(2);
+    let cat = MaskCatalog {
+        masks: vec![mask_with_ffn(vec![vec![0xFF, 0xFF], vec![0xFF, 0xFF]])],
+        default_task: String::new(),
+    };
+    let bytes = encode_masks_section(&cat, &a).unwrap();
+    let back = decode_masks_section(&bytes, &a).unwrap();
+    let m = &back.masks[0];
+    for vl in 0..4 {
+        assert!(
+            m.layer_alive(vl),
+            "visit {vl} read as dead from a physical-length gate list"
+        );
+    }
+    // And past ANY recorded gate — absence is "no restriction", not death.
+    assert!(m.layer_alive(97), "an absent gate must read alive");
+}
