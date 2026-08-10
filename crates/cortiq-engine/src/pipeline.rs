@@ -4312,7 +4312,10 @@ impl Pipeline {
                 self.num_layers
             ));
         }
-        if self.can_prefill_batched() {
+        // Same predicate as the whole-stack prefill: a span whose GDN
+        // state lives on the device must walk positions through the
+        // graph, not through the batched CPU span.
+        if self.can_prefill_batched() && !self.graph_prefill_preferred() {
             Ok(self.prefill_batch_span(PrefillIn::Ids(ids), start_pos, task_mask, 0, upto + 1))
         } else {
             let hs = self.hidden_size;
@@ -4355,7 +4358,7 @@ impl Pipeline {
                 self.num_layers
             ));
         }
-        if self.can_prefill_batched() {
+        if self.can_prefill_batched() && !self.graph_prefill_preferred() {
             Ok(self.prefill_batch_span(
                 PrefillIn::Hidden(hidden),
                 start_pos,

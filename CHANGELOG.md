@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ctx 512: prefill **8.7 → 137.4 tok/s**, decode unchanged at ~105.
   Attention-only models keep the chunked CPU prefill they measured
   faster on (nanbeige 101.6, bonsai-8b 51.6 — unchanged).
+- **The same fix on the split's span prefill made capacity mode FREE.**
+  `prefill_span_ids`/`prefill_span_hidden` took the batched CPU span on
+  models whose state is device-resident, so both sides of a two-GPU
+  split paid host prefill and desynced their device state. With the
+  predicate applied there too, W2 on 2×RTX 5090: split decode
+  **100.6 → 119.96 tok/s — dead level with a single card's 119.8** (was
+  0.85×), and TTFT **4569 → 268 ms**. Split output stays byte-identical
+  to the single-GPU run.
 
 ### Added
 - **`cortiq animate` decides host-vs-GPU by a parity probe, not a
