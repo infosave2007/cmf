@@ -1864,6 +1864,7 @@ async fn cmd_serve(
     // best matches one of them, replicas serve N requests at once
     // (2×RTX 5090, W2 34.7B: 232 tok/s aggregate against 119.8).
     let mut devices: Vec<usize> = Vec::new();
+    let mut split_devices: Option<Vec<usize>> = None;
     if let Some(n) = replicas {
         let have = cortiq_engine::gpu::device_count();
         if n < 2 {
@@ -1877,9 +1878,26 @@ async fn cmd_serve(
         if peer.is_some() {
             anyhow::bail!("--gpus и --peer — разные режимы: реплики против сплита слоёв");
         }
-        slots = n;
-        devices = (0..n).collect();
-        println!("    Реплики: {n} карт × полная модель — по запросу на карту");
+        // Replicas need the model to fit ONE card. When it does not, the
+        // honest answer is the layer split, not a refusal and not N
+        // copies that thrash: say which mode you are in and why.
+        let budget = cortiq_engine::gpu::vram_budget();
+        let weights = model.primary_bytes().len() as u64;
+        if budget != u64::MAX && weights > budget {
+            slots = 1;
+            devices.clear();
+            split_devices = Some((0..n).collect());
+            println!(
+                "    Сплит по картам: модель {:.1} ГБ не влезает в бюджет одной ({:.1} ГБ) — \
+                 слои режутся на {n} устройств (реплики требуют полной копии на карту)",
+                weights as f64 / 1e9,
+                budget as f64 / 1e9,
+            );
+        } else {
+            slots = n;
+            devices = (0..n).collect();
+            println!("    Реплики: {n} карт × полная модель — по запросу на карту");
+        }
     }
     if peer.is_some() && slots != 1 {
         // One worker holds ONE KV session; more slots would interleave
@@ -1903,6 +1921,11 @@ async fn cmd_serve(
         }
         let mut pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
         o1.apply(&mut pipeline);
+        if let Some(devs) = &split_devices {
+            pipeline
+                .set_gpu_plan(Some(devs))
+                .map_err(|e| anyhow::anyhow!("--gpus: {e}"))?;
+        }
         pipelines.push(pipeline);
     }
     if pipelines[0].o1_active() {
