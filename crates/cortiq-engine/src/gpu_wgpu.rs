@@ -11157,6 +11157,17 @@ fn graph_split_n() -> usize {
     })
 }
 
+/// Loud decline for the honest bench: tracing is invisible on many
+/// stacks (the CLI's Run filter, containers without a collector), and
+/// a silent `return false` cost a day of KAT diagnosis. CMF_GPU_DEBUG=1
+/// prints every decline reason to stderr directly.
+fn graph_decline(why: &str) {
+    if std::env::var("CMF_GPU_DEBUG").is_ok() {
+        eprintln!("wgpu graph decline: {why}");
+    }
+    tracing::warn!("wgpu token graph declined: {why}");
+}
+
 fn graph_refused(why: &'static str) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static SAID: AtomicBool = AtomicBool::new(false);
@@ -12645,6 +12656,7 @@ pub fn forward_token_graph(
                     resolve(wv, nkv * hd, hidden),
                     resolve(wo, hidden, nh * hd),
                 ) else {
+                    graph_decline("attn q/k/v/o resolve");
                     return false;
                 };
                 LAttn::Full { wq, wk, wv, wo }
@@ -12671,6 +12683,7 @@ pub fn forward_token_graph(
                     resolve(b, *nv, hidden),
                     resolve(out, hidden, nv * dv),
                 ) else {
+                    graph_decline("weight resolve (dtype/shape outside graph contract)");
                     return false;
                 };
                 LAttn::Gdn {
@@ -12695,6 +12708,7 @@ pub fn forward_token_graph(
                     resolve(up, inter, hidden),
                     resolve(down, hidden, inter),
                 ) else {
+                    graph_decline("weight resolve (dtype/shape outside graph contract)");
                     return false;
                 };
                 LFfn::Dense { gate, up, down }
@@ -12713,12 +12727,17 @@ pub fn forward_token_graph(
                 // Select kernel: logits live in a 256-slot workgroup array;
                 // slot top_k+1 holds the shared expert.
                 if *top_k >= 16 || *n_exp > 256 || experts.len() != n_exp + 1 {
+                    graph_decline(&format!(
+                        "moe shape: top_k {top_k} n_exp {n_exp} experts {}",
+                        experts.len()
+                    ));
                     return false;
                 }
                 let (Some(router), Some(sgate)) = (
                     resolve(router, *n_exp, hidden),
                     resolve(shared_gate, 1, hidden),
                 ) else {
+                    graph_decline("moe router/shared_gate resolve");
                     return false;
                 };
                 // Over budget with layers already built: end the prefix
@@ -12747,6 +12766,7 @@ pub fn forward_token_graph(
                 let Some((gate_all, up_all, down_all)) =
                     moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false)
                 else {
+                    graph_decline("moe_expert_bufs (pack/budget/dtype)");
                     return false;
                 };
                 LFfn::Moe {
