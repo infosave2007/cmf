@@ -194,19 +194,77 @@ pub fn generate(
     if p.width % 32 != 0 || p.height % 32 != 0 {
         return Err("width/height must be multiples of 32".into());
     }
-    // The wgpu wide-GEMM arm is WRONG on this stack: measured on an RTX
-    // PRO 6000, the DiT's first step already disagrees with the host
-    // (video velocity rms 1.32 against 1.73, audio 0.16 against 1.01)
-    // and the second returns NaN. The op probe picks that arm on its
-    // own because it is three times faster, so this pipeline runs pure
-    // host unless the caller says otherwise — a wrong answer produced
-    // quickly is not a faster answer. `CMF_MMH3_GPU=1` opts in.
-    let force_gpu = std::env::var("CMF_MMH3_GPU").ok().as_deref() == Some("1");
-    if force_gpu {
+    // The wgpu wide-GEMM arm was measured WRONG on one driver stack
+    // (RTX PRO 6000: step-1 velocity rms off, step-2 NaN) and byte-
+    // healthy on another (2×RTX 5090, coop and plain arms within 0.5%
+    // of each other and 3.5% of the host render). Trust is therefore
+    // PER-STACK, decided by a parity probe on this file's own first
+    // qkv weight at DiT-scale activations — not by a hardcoded verdict
+    // either way. CMF_MMH3_GPU=1/0 still forces.
+    let use_gpu = match std::env::var("CMF_MMH3_GPU").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => mmh3_gpu_parity_probe(path).unwrap_or(false),
+    };
+    if use_gpu {
         generate_inner(path, prompt, p, &mut progress)
     } else {
         crate::gpu::cpu_scope(|| generate_inner(path, prompt, p, &mut progress))
     }
+}
+
+/// GPU-vs-host parity on the packed DiT's first attention projection:
+/// the real q4tp bytes, activations spanning the modulation range
+/// (±2000 mixed with ±2), rms gate at 1e-2 — the measured failure was
+/// ~24%, honest drift is ~1e-5, so the gate has a decade of margin on
+/// each side. Any refusal (no adapter, dtype outside the kernel) is a
+/// clean "no": the host path is never wrong, only slower.
+fn mmh3_gpu_parity_probe(path: &Path) -> Result<bool, String> {
+    let model = Arc::new(
+        cortiq_core::CmfModel::open(path).map_err(|e| format!("{}: {e}", path.display()))?,
+    );
+    let Some(idx) = model.tensors.iter().position(|t| {
+        t.name.starts_with("dit.")
+            && t.name.ends_with("attn.qkv_proj.weight")
+            && t.dtype == cortiq_core::TensorDtype::Q4TiledP
+    }) else {
+        return Ok(false);
+    };
+    let entry = &model.tensors[idx];
+    let (rows, cols) = (entry.shape[0], entry.shape[1]);
+    let b = 64usize;
+    let mut xs = vec![0f32; b * cols];
+    for (i, v) in xs.iter_mut().enumerate() {
+        let base = ((i * 37 + 11) % 1009) as f32 / 1009.0 - 0.5;
+        *v = base * if i % 7 == 0 { 2000.0 } else { 2.0 };
+    }
+    let mut gpu = vec![0f32; b * rows];
+    if !crate::gpu::q4tp_matmat(&model, idx, &xs, b, rows, cols, &mut gpu) {
+        return Ok(false);
+    }
+    let host = {
+        let name = entry.name.clone();
+        let proj = crate::dit::Proj::from_model(&model, &name)?;
+        let mut out = vec![0f32; b * rows];
+        crate::gpu::cpu_scope(|| proj.matmat(&xs, b, &mut out, None));
+        out
+    };
+    let mut num = 0f64;
+    let mut den = 0f64;
+    for (g, h) in gpu.iter().zip(&host) {
+        num += ((g - h) as f64).powi(2);
+        den += (*h as f64).powi(2);
+    }
+    let rel = (num / den.max(1e-30)).sqrt();
+    let ok = rel < 1e-2;
+    tracing::info!(
+        "mmh3 GPU parity probe: rel rms {rel:.2e} → {}",
+        if ok { "device" } else { "host" }
+    );
+    if std::env::var("CMF_GPU_DEBUG").is_ok() {
+        eprintln!("mmh3 GPU parity probe: rel rms {rel:.2e}");
+    }
+    Ok(ok)
 }
 
 fn generate_inner(
