@@ -3521,15 +3521,14 @@ fn cmd_animate(
     // measured wrong on an RTX PRO 6000, healthy on 2×RTX 5090.
     // CMF_MMH3_GPU=1/0 and an explicit CMF_GPU still force.
     //
-    // The cooperative-matrix GEMM stays OFF here regardless: its f16
-    // operands run out of range at this model's packed-sequence scale
-    // (256x160 correct, 512x288 NaN on step 2 — bisected, CMF_COOP=0
-    // is the fix). Until the kernel carries a per-row scale, the
-    // device path runs on the f32 arm, which the probe covers.
-    if std::env::var_os("CMF_COOP").is_none() {
-        // SAFETY: as above.
-        unsafe { std::env::set_var("CMF_COOP", "0") };
-    }
+    // The cooperative-matrix hold is LIFTED: the kernel now carries an
+    // activation scale (its f16 operands can no longer overflow — that
+    // overflow was the 512×288 NaN) and dequantizes the weight plane
+    // once instead of per activation tile. The engine's parity probe
+    // validates exactly this path on this file's own weights before
+    // any frame is rendered, and the tensor cores are worth 1.5× on a
+    // denoise step. CMF_COOP=0 still forces the scalar arm.
+
     let t0 = std::time::Instant::now();
     let anim = cortiq_engine::videogen::generate(
         std::path::Path::new(model),

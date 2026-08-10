@@ -17057,7 +17057,7 @@ fn dq_f16_plane(
     q_buf: &wgpu::Buffer,
     rows: usize,
     cols: usize,
-) -> Option<wgpu::Buffer> {
+) -> Option<(wgpu::Buffer, wgpu::BindGroup)> {
     if cols % 2 != 0 {
         return None;
     }
@@ -17084,18 +17084,7 @@ fn dq_f16_plane(
         layout: &pipe.get_bind_group_layout(0),
         entries: &[bind_buf(0, q_buf), bind_buf(1, &plane), bind_buf(2, &u)],
     });
-    let mut enc = c
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("q4tp-dq") });
-    {
-        let mut pass = begin_pass(&mut enc);
-        pass.set_pipeline(pipe);
-        pass.set_bind_group(0, &bind, &[]);
-        let wgs = ((rows * cols / 2) as u32).div_ceil(256);
-        pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
-    }
-    c.queue.submit(Some(enc.finish()));
-    Some(plane)
+    Some((plane, bind))
 }
 
 fn tp_matmat(
@@ -17207,12 +17196,17 @@ fn tp_matmat(
     // many scalar ops per weight tile as the matrix units spend MACs on
     // it, and repeats them for every 64-row tile of activations; this
     // pays that once.
-    let dq_plane = if coop_arm && c.q4tp_mm_coop_f16.is_some() {
+    // Worth unpacking the plane only when the batch amortizes it: the
+    // pass touches rows×cols regardless of b, so a narrow GEMM pays for
+    // a dequantizer it barely uses (measured: nanbeige prefill chunks
+    // lost 7× to it before this gate).
+    let dq = if coop_arm && c.q4tp_mm_coop_f16.is_some() && b >= 64 {
         dq_f16_plane(c, &mut sc, &q_buf, rows, cols)
     } else {
         None
     };
     drop(sc);
+    let dq_plane = dq.as_ref().map(|(p, _)| p.clone());
     let (mm_pipe, w_bind) = match (&dq_plane, c.q4tp_mm_coop_f16.as_ref()) {
         (Some(dq), Some(pipe)) => (pipe, dq),
         _ => (mm_pipeline(c, true, two_bit), &q_buf),
@@ -17233,6 +17227,15 @@ fn tp_matmat(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("q4tpmm"),
         });
+    if let (Some((_, bind_dq)), Some(pipe_dq)) = (&dq, c.q4tp_dq_f16.as_ref()) {
+        // Same encoder as the GEMM: a submit of its own made the driver
+        // serialize two round trips where one belongs.
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(pipe_dq);
+        pass.set_bind_group(0, bind_dq, &[]);
+        let wgs = ((rows * cols / 2) as u32).div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+    }
     {
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("q4tpmm"),
