@@ -791,10 +791,38 @@ fn fill_zero(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(2) var<uniform>             fsp : N1;
 @compute @workgroup_size(256)
 fn ffn_silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+    let i = gid.y * (65535u * 256u) + gid.x;
     if (i >= fsp.n) { return; }
     let g = fsg[i];
     fsg[i] = (g / (1.0 + exp(-g))) * fsu[i];
+}
+
+// The same, for a fc1 that emits gate and up PACKED IN ONE ROW
+// ([gate|up] per token, as MiniMax-H3's DiT stores it) instead of two
+// separate panels. `n` counts activations (b·inter), `fsp2.inter` is the
+// half-width. Writes a compact [b][inter] panel the second GEMM reads.
+struct FsP2 { n: u32, inter: u32, has_bias: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read>       fpgu : array<f32>;
+@group(0) @binding(1) var<storage, read_write> fpact: array<f32>;
+@group(0) @binding(2) var<uniform>             fsp2 : FsP2;
+// Gate/up bias, [2·inter] — the 3D VAE's FFN carries one, the DiT's
+// does not. A one-element dummy is bound when there is none.
+@group(0) @binding(3) var<storage, read>       fpb  : array<f32>;
+
+@compute @workgroup_size(256)
+fn ffn_silu_mul_packed(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.y * (65535u * 256u) + gid.x;
+    if (i >= fsp2.n) { return; }
+    let p = i / fsp2.inter;
+    let j = i - p * fsp2.inter;
+    let base = p * 2u * fsp2.inter;
+    var g = fpgu[base + j];
+    var u = fpgu[base + fsp2.inter + j];
+    if (fsp2.has_bias != 0u) {
+        g = g + fpb[j];
+        u = u + fpb[fsp2.inter + j];
+    }
+    fpact[i] = (g / (1.0 + exp(-g))) * u;
 }
 
 // Plain f32 matvec (for small unquantized projections like GDN in_proj_a/b):
@@ -9629,6 +9657,7 @@ struct Ctx {
     q4tp_mm_coop: Option<wgpu::ComputePipeline>,
     /// Dequantize-once path: q4tp plane → packed f16, then a pure f16
     /// coop GEMM. Both or neither.
+    ffn_silu_packed: wgpu::ComputePipeline,
     q4tp_dq_f16: Option<wgpu::ComputePipeline>,
     q4tp_mm_coop_f16: Option<wgpu::ComputePipeline>,
     /// The bake's f32-operand forward GEMM on the matrix units; None off
@@ -10568,6 +10597,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         }
         Some(p)
     };
+    let ffn_silu_packed = pipe("ffn_silu_mul_packed");
     let q4tp_dq_f16 = (want_f16 && q4tp_mm_coop.is_some())
         .then(|| mk_coop(COOP_DQ_SRC, "q4tp-dq", "q4tp_dq_f16"))
         .flatten();
@@ -10913,6 +10943,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mm,
         q2tp_mm,
         q4tp_mm_coop,
+        ffn_silu_packed,
         q4tp_dq_f16,
         q4tp_mm_coop_f16,
         gemm_nt_coop,
@@ -18125,6 +18156,173 @@ pub fn q4t_ffn(
 /// model's diffusion transformer entirely on the CPU: the facade had no
 /// wgpu arm to offer and said so by returning false.
 #[allow(clippy::too_many_arguments)]
+/// SwiGLU FFN whose fc1 emits gate and up PACKED in one row — the
+/// MiniMax-H3 DiT's layout — with everything resident between the two
+/// GEMMs. Before this, the intermediate crossed the bus twice per block
+/// (at render size the gate/up panel alone is ~660 MB down and the
+/// activation ~330 MB back up); now one upload of x and one readback of
+/// the result. `false` = shapes or dtypes outside the contract, and the
+/// host loop runs as before.
+#[allow(clippy::too_many_arguments)]
+pub fn q4tp_ffn_packed(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if hidden % 32 != 0 || inter % 32 != 0 || b == 0 {
+        return false;
+    }
+    if xs.len() < b * hidden || out.len() < b * hidden {
+        return false;
+    }
+    let bytes = model.primary_bytes();
+    let wbuf = |idx: usize, rows: usize, cols: usize| -> Option<wgpu::Buffer> {
+        let e = model.tensors.get(idx)?;
+        if e.dtype != cortiq_core::TensorDtype::Q4TiledP
+            || e.shape.first().copied()? != rows
+            || e.shape.get(1).copied()? != cols
+        {
+            return None;
+        }
+        let abs = model.entry_abs_offset(e)?;
+        let plen = e.nbytes as usize;
+        if abs + plen > bytes.len() {
+            return None;
+        }
+        weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen])
+    };
+    let (Some(w1b), Some(w2b)) = (wbuf(w1, 2 * inter, hidden), wbuf(w2, hidden, inter)) else {
+        return false;
+    };
+    let mut sc = c.scratch.lock().unwrap();
+    let st = wgpu::BufferUsages::STORAGE;
+    let xs_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.xs,
+        (b * hidden * 4) as u64,
+        st | wgpu::BufferUsages::COPY_DST,
+        "pffn-x",
+    );
+    let gu_buf = Scratch::ensure(&c.device, &mut sc.g, (b * 2 * inter * 4) as u64, st, "pffn-gu");
+    let act_buf = Scratch::ensure(&c.device, &mut sc.u, (b * inter * 4) as u64, st, "pffn-act");
+    let y_size = (b * hidden * 4) as u64;
+    let y_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.y,
+        y_size,
+        st | wgpu::BufferUsages::COPY_SRC,
+        "pffn-y",
+    );
+    let stage_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        y_size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "pffn-stage",
+    );
+    let dq1 = dq_f16_plane(c, &mut sc, &w1b, 2 * inter, hidden);
+    drop(sc);
+    c.queue
+        .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..b * hidden]));
+    let bias = bias.filter(|v| v.len() >= 2 * inter);
+    let ps2 = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[
+                (b * inter) as u32,
+                inter as u32,
+                u32::from(bias.is_some()),
+                0u32,
+            ]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let bbuf = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pffn-bias"),
+            contents: bytemuck::cast_slice(bias.unwrap_or(&[0.0f32])),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+    let bg_silu = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("pffn-silu-bg"),
+        layout: &c.ffn_silu_packed.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, &gu_buf),
+            bind_buf(1, &act_buf),
+            bind_buf(2, &ps2),
+            bind_buf(3, &bbuf),
+        ],
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pffn") });
+    // fc1 over the dequantized plane when the tensor cores are up; the
+    // second GEMM keeps the in-kernel path (its plane would need its own
+    // scratch, and it is the smaller of the two).
+    if let (Some((_, bind_dq)), Some(pipe_dq)) = (&dq1, c.q4tp_dq_f16.as_ref()) {
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(pipe_dq);
+        pass.set_bind_group(0, bind_dq, &[]);
+        let wgs = ((2 * inter * hidden / 2) as u32).div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+    }
+    let (p1, w1_bind) = match (&dq1, c.q4tp_mm_coop_f16.as_ref()) {
+        (Some((plane, _)), Some(pipe)) => (pipe, plane.clone()),
+        _ => (mm_pipeline(c, true, false), w1b.clone()),
+    };
+    // f16 operands cap at 65504 and a DiT's modulated activations pass
+    // it. The scale is computed from the input we just uploaded; the
+    // kernel divides it back out at the store.
+    let ascale = {
+        let mx = xs[..b * hidden]
+            .iter()
+            .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
+        if mx > 1000.0 { 1000.0 / mx } else { 1.0 }
+    };
+    encode_q4_tile_mm_scaled(
+        c, &mut enc, p1, &w1_bind, &xs_buf, &gu_buf, 2 * inter, hidden, b, ascale,
+    );
+    {
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.ffn_silu_packed);
+        pass.set_bind_group(0, &bg_silu, &[]);
+        // 2-D grid: b·inter/256 passes 65 535 workgroups at render batch
+        // sizes, and clamping x leaves the tail of the activations as
+        // whatever the buffer held (measured: frames 92% smaller, i.e.
+        // nearly blank, at 512×288 while 256×160 looked fine).
+        let wgs = ((b * inter) as u32).div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+    }
+    // fc2 stays on the SCALAR arm: its activations are the SwiGLU
+    // output, which lives on the device, and the cooperative kernel
+    // needs an activation scale the host cannot compute without reading
+    // that panel back — the very round trip this function exists to
+    // avoid. Without the scale its f16 operands overflow (measured:
+    // correct at 256×160, nearly blank frames at 512×288). A
+    // device-side max reduction feeding the scale is the follow-up;
+    // this arm reads f32 directly and cannot overflow.
+    encode_q4_tile_mm(
+        c,
+        &mut enc,
+        &c.q4tp_mm,
+        &w2b,
+        &act_buf,
+        &y_buf,
+        hidden,
+        inter,
+        b,
+    );
+    readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * hidden])
+}
+
 pub fn q4tp_ffn(
     model: &Arc<CmfModel>,
     w1: usize,
@@ -18280,7 +18478,12 @@ fn ffn_q4(
         });
         pass.set_pipeline(&c.ffn_silu);
         pass.set_bind_group(0, &bg_silu, &[]);
-        pass.dispatch_workgroups(((b * inter) as u32).div_ceil(256).min(MAX_WG), 1, 1);
+        // 2-D grid: b·inter/256 passes 65 535 workgroups at render batch
+        // sizes, and clamping x leaves the tail of the activations as
+        // whatever the buffer held (measured: frames 92% smaller, i.e.
+        // nearly blank, at 512×288 while 256×160 looked fine).
+        let wgs = ((b * inter) as u32).div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
     }
     mm_pass(&mut enc, &bg2, hidden);
     readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * hidden])
@@ -19587,7 +19790,30 @@ fn encode_q4_tile_mm(
     cols: usize,
     k: usize,
 ) {
-    let p_buf = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, k as u32, 0]);
+    encode_q4_tile_mm_scaled(c, enc, pipeline, weight, xs, y, rows, cols, k, 0.0)
+}
+
+/// The same, carrying the activation scale the cooperative kernel reads
+/// out of `pmm.pad`. 0 = no scaling (the scalar arm's contract). A fused
+/// chain that skipped this let f16 operands overflow at render batch
+/// sizes — correct at 256×160, nearly blank frames at 512×288.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4_tile_mm_scaled(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    k: usize,
+    ascale: f32,
+) {
+    let p_buf = uniform_u32x4(
+        c,
+        [(cols / 4) as u32, rows as u32, k as u32, ascale.to_bits()],
+    );
     let layout = pipeline.get_bind_group_layout(0);
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,

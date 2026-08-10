@@ -856,6 +856,29 @@ impl MiniMaxH3 {
         }
         Self::prof(0, t);
         let t = std::time::Instant::now();
+        // Device-resident FFN: fc1 → SwiGLU → fc2 without the
+        // intermediate crossing the bus. At render size that panel is
+        // hundreds of megabytes each way, per block, per step.
+        // CMF_MMH3_FFN=cpu forces the host chain below.
+        if std::env::var("CMF_MMH3_FFN").as_deref() != Ok("cpu")
+            && crate::gpu::enabled_here()
+            && n >= 64
+        {
+            if let (Proj::Q(q1), Proj::Q(q2)) = (&blk.fc1, &blk.fc2) {
+                if let (Some((m, i1)), Some((_, i2))) =
+                    (q1.mapped_q4tp(), q2.mapped_q4tp())
+                {
+                    let mut fout = vec![0f32; n * hs];
+                    if crate::gpu::q4tp_ffn_packed(
+                        m, i1, i2, &xn, n, hs, self.ffn, None, &mut fout,
+                    ) {
+                        Self::prof(5, t);
+                        self.residual(x, hs, &fout, mods, rows, 5);
+                        return;
+                    }
+                }
+            }
+        }
         let mut gu = vec![0f32; n * 2 * self.ffn];
         blk.fc1.matmat(&xn, n, &mut gu, pool);
         Self::prof(5, t);
