@@ -5567,19 +5567,53 @@ fn draft_probe() -> bool {
             let ffn_masked = task_mask
                 .map(|m| m.ffn_active_count(li) < self.intermediate_size)
                 .unwrap_or(false);
-            // One masked dense path, ONE semantics: the same
-            // activation-zeroing arm the batched sweep runs (validated
-            // against the replica's f32 math to 0.8%), at b=1. The old
-            // per-dtype zoo of sparse arms diverged on q8_row trained
-            // masters and scored PPL in the thousands where the batched
-            // path scored 4.27 — three implementations of one contract
-            // is two too many.
+            // One masked dense CONTRACT, dispatched by cost. The
+            // activation-zeroing arm (the batched sweep's, validated
+            // against the replica to 0.8%) computes the FULL fused FFN
+            // and zeroes the dead — right whenever most neurons live.
+            // The sparse arm reads ONLY active rows and down columns —
+            // per-row dots are slower per element than the fused kernel,
+            // so it pays only once the mask is deep enough. The 0.5
+            // crossover is first-principles (fused kernels run ~2x the
+            // per-row dot throughput); a shallow specialist (95% alive)
+            // stays fused, a --target-sparsity bake flips arms on its
+            // own weight.
             let ffn_out = match (ffn_masked, &lw.ffn) {
                 (true, FfnKind::Dense(d)) => {
-                    let row = task_mask
-                        .and_then(|tm| tm.ffn_masks.get(li))
-                        .map(|v| v.as_slice());
-                    dense_ffn_batch(d, post_normed, 1, self.pool.as_deref(), row)
+                    let tm = task_mask.unwrap();
+                    let alive = tm.ffn_active_count(li);
+                    let deep = alive * 2 <= self.intermediate_size;
+                    if deep && d.down_proj.sparse_col_ok() {
+                        let active = tm.ffn_active_indices(li);
+                        sparse_ffn_quant(
+                            d,
+                            post_normed,
+                            &active,
+                            self.hidden_size,
+                            self.pool.as_deref(),
+                        )
+                    } else if deep
+                        && let (Some(g), Some(u), Some(dn)) = (
+                            d.gate_proj.as_f32(),
+                            d.up_proj.as_f32(),
+                            d.down_proj.as_f32(),
+                        )
+                    {
+                        let active = tm.ffn_active_indices(li);
+                        inference::sparse_ffn_forward(
+                            post_normed,
+                            g,
+                            u,
+                            dn,
+                            self.hidden_size,
+                            self.intermediate_size,
+                            &active,
+                            self.pool.as_deref(),
+                        )
+                    } else {
+                        let row = tm.ffn_masks.get(li).map(|v| v.as_slice());
+                        dense_ffn_batch(d, post_normed, 1, self.pool.as_deref(), row)
+                    }
                 }
                 (true, FfnKind::Moe(m)) => {
                     // MoE is sparse by expert selection; a task mask
