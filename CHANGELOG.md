@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A span ending ON a loop boundary dropped the boundary norm (wgpu
+  graph).** The executor fuses each layer's residual with the NEXT
+  layer's input norm, and the last layer of a span took the plain-
+  residual branch without consulting `loop_norm_at` — so a network/
+  multi-GPU split cut exactly at a Looped-Transformer iteration edge
+  (nanbeige's default half: 22 of 44 virtual layers) handed the peer a
+  raw, un-normed hidden. The tail then spoke template noise ("М user").
+  The builder always promised the boundary norm stays with the span
+  ("keeps its boundary norm even when it is the span's own last
+  layer"); the executor now honours it: residual + final_norm before
+  readback. Found on 2×RTX 5090, reproduced on wgpu-Metal, fixed with
+  the split producing the CPU reference's wording.
+
 ### Added
 - **Local multi-GPU in one flag: `cortiq run model.cmf --gpus 2`.** The
   layer stack splits across two cards via the proven `--peer` path — a
