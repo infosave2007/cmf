@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Local multi-GPU in one flag: `cortiq run model.cmf --gpus 2`.** The
+  layer stack splits across two cards via the proven `--peer` path — a
+  worker process is spawned on 127.0.0.1 pinned to the second adapter,
+  handshakes by dir_hash, and is killed when the run ends (guard on
+  drop, no zombie model-sized processes). The wire is loopback, whose
+  cost the Thunderbolt-stand numbers already showed is amortised by the
+  two processes overlapping their submit bubbles. Exactly two cards in
+  v1: the coordinator speaks to ONE worker; N-card chaining is the
+  recorded next step, and pretending otherwise would run N−2 cards idle.
+- **`CMF_GPU_ADAPTER` pins the wgpu card** — an index into the
+  `cortiq gpu` listing (now numbered) or a case-insensitive name
+  substring. Without the pin every process on a host gets the same
+  "best" adapter, which is precisely wrong for a two-GPU split. Unknown
+  values fail loudly with the adapter count instead of silently taking
+  the default card.
+
 ## [0.5.66] - 2026-08-10
 
 ### Added

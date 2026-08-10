@@ -268,6 +268,10 @@ enum Commands {
         /// Wire payload dtype for --peer: f32 = bit-exact, f16 = half the bytes
         #[arg(long, default_value = "f32", requires = "peer")]
         net_dtype: String,
+        /// Serve on N local GPUs: layer split via a spawned local worker
+        /// pinned to the second adapter (see `cortiq gpu`)
+        #[arg(long, conflicts_with = "peer")]
+        gpus: Option<usize>,
     },
     /// Convert a Hugging Face checkpoint to .cmf — native Rust, no Python
     Convert {
@@ -555,6 +559,12 @@ enum Commands {
         /// bytes (hidden states tolerate it; measure your model).
         #[arg(long, default_value = "f32", requires = "peer")]
         net_dtype: String,
+        /// Run on N local GPUs: the model's layer stack is split across
+        /// the cards (`cortiq gpu` lists them). Spawns a local worker
+        /// pinned to the second adapter — same proven path as --peer,
+        /// zero configuration. Use --peer-split to move the boundary.
+        #[arg(long, conflicts_with = "peer")]
+        gpus: Option<usize>,
     },
     /// Serve a layer span of a model to a network coordinator (`run --peer`).
     /// The worker holds the SAME .cmf as the coordinator (checked by
@@ -1254,6 +1264,7 @@ async fn main() -> anyhow::Result<()> {
             peer_split,
             net_token,
             net_dtype,
+            gpus,
         } => {
             let o1 = O1Flags {
                 spec: o1,
@@ -1261,6 +1272,14 @@ async fn main() -> anyhow::Result<()> {
                 w: o1_window,
                 sink: o1_sink,
                 rect: None,
+            };
+            let local = match gpus {
+                Some(n) if n >= 2 => Some(spawn_local_gpu_worker(&model, n)?),
+                _ => None,
+            };
+            let (peer, net_token) = match &local {
+                Some(l) => (Some(l.addr.clone()), Some(l.token.clone())),
+                None => (peer, net_token),
             };
             cmd_serve(
                 &model,
@@ -1406,6 +1425,7 @@ async fn main() -> anyhow::Result<()> {
             peer_split,
             net_token,
             net_dtype,
+            gpus,
         } => {
             let o1 = O1Flags {
                 spec: o1,
@@ -1413,6 +1433,17 @@ async fn main() -> anyhow::Result<()> {
                 w: o1_window,
                 sink: o1_sink,
                 rect: None,
+            };
+            // --gpus N: the split is the SAME code as --peer, the worker
+            // just lives on this host pinned to the second card. The
+            // guard kills the worker when the run ends.
+            let local = match gpus {
+                Some(n) if n >= 2 => Some(spawn_local_gpu_worker(&model, n)?),
+                _ => None,
+            };
+            let (peer, net_token) = match &local {
+                Some(l) => (Some(l.addr.clone()), Some(l.token.clone())),
+                None => (peer, net_token),
             };
             cmd_run(
                 &model,
@@ -3179,6 +3210,63 @@ async fn cmd_run(
 
     dump_moe_stats(&pipeline)?;
     Ok(())
+}
+
+/// A local worker process holding the tail layers on the SECOND GPU.
+/// Killed on drop — a run must never leave a model-sized process behind.
+struct LocalGpuWorker {
+    child: std::process::Child,
+    addr: String,
+    token: String,
+}
+
+impl Drop for LocalGpuWorker {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// `--gpus N`: spawn `cortiq worker <model>` on 127.0.0.1 pinned to
+/// adapter 1 (CMF_GPU_ADAPTER), pin THIS process to adapter 0, and let
+/// the ordinary --peer machinery do the split. v1 is exactly two cards:
+/// the coordinator speaks to ONE worker; chaining is a recorded next
+/// step, and pretending otherwise would silently run N-2 cards idle.
+fn spawn_local_gpu_worker(model: &str, n: usize) -> anyhow::Result<LocalGpuWorker> {
+    if n != 2 {
+        anyhow::bail!(
+            "--gpus {n}: пока поддержаны ровно 2 GPU (координатор + локальный воркер);              для N карт — цепочка `cortiq worker` + --peer"
+        );
+    }
+    // The coordinator takes card 0 explicitly — with two identical
+    // cards `request_adapter` gives BOTH processes the same "best" one.
+    if std::env::var("CMF_GPU_ADAPTER").is_err() {
+        unsafe { std::env::set_var("CMF_GPU_ADAPTER", "0") };
+    }
+    // Let the OS pick a free port; the tiny bind→spawn race is local.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let addr = format!("127.0.0.1:{port}");
+    let token = format!("local-gpus-{}", std::process::id());
+    let child = std::process::Command::new(std::env::current_exe()?)
+        .args(["worker", model, "--listen", &addr, "--token", &token])
+        .env("CMF_GPU_ADAPTER", "1")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("не удалось запустить локальный воркер: {e}"))?;
+    let mut w = LocalGpuWorker { child, addr, token };
+    eprintln!("gpus: воркер на второй карте — {} (adapter 1)", w.addr);
+    // Readiness = the listener answers. The worker binds before serving,
+    // so this bounds model-load time, not just process start.
+    for _ in 0..1800 {
+        if let Some(st) = w.child.try_wait()? {
+            anyhow::bail!("локальный воркер умер при старте ({st}); его stderr выше");
+        }
+        if std::net::TcpStream::connect(&w.addr).is_ok() {
+            return Ok(w);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    anyhow::bail!("локальный воркер не поднялся за 180 с")
 }
 
 /// Command-buffer round trips per token on Metal — each costs ~1.3 ms of
