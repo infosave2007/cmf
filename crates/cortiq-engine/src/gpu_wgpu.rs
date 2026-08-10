@@ -10167,13 +10167,39 @@ fn init() -> Result<Ctx, String> {
         backend_options: Default::default(),
         display: None,
     });
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        force_fallback_adapter: false,
-        compatible_surface: None,
-        apply_limit_buckets: false,
-    }))
-    .map_err(|e| format!("no adapter: {e}"))?;
+    // CMF_GPU_ADAPTER pins the card: an index into the `cortiq gpu`
+    // listing or a case-insensitive name substring. Without it every
+    // process on the host gets the same "best" adapter — the pin is
+    // what lets a local worker take the SECOND GPU (`run --gpus N`).
+    let adapter = if let Ok(want) = std::env::var("CMF_GPU_ADAPTER") {
+        let mut all = pollster::block_on(instance.enumerate_adapters(backends));
+        let pick = want
+            .parse::<usize>()
+            .ok()
+            .filter(|&i| i < all.len())
+            .or_else(|| {
+                let w = want.to_lowercase();
+                all.iter()
+                    .position(|a| a.get_info().name.to_lowercase().contains(&w))
+            });
+        match pick {
+            Some(i) => all.swap_remove(i),
+            None => {
+                return Err(format!(
+                    "CMF_GPU_ADAPTER={want} matches none of the {} adapters (see `cortiq gpu`)",
+                    all.len()
+                ));
+            }
+        }
+    } else {
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+            apply_limit_buckets: false,
+        }))
+        .map_err(|e| format!("no adapter: {e}"))?
+    };
 
     // A SOFTWARE adapter is not a GPU and taking it is a loss, not a
     // fallback. Mesa ships lavapipe/llvmpipe in most container images —
@@ -32089,14 +32115,17 @@ pub fn adapter_report() -> Vec<String> {
         backend_options: Default::default(),
         display: None,
     });
+    // The [N] prefix is the CMF_GPU_ADAPTER index — the pin that lets a
+    // second process take a second card (`run --gpus N`).
     let mut out: Vec<String> =
         pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
             .iter()
-            .map(|a| {
+            .enumerate()
+            .map(|(n, a)| {
                 let i = a.get_info();
                 let l = a.limits();
                 format!(
-                    "{:?} | {} | {:?} | буфер до {:.1} ГБ | рабочая группа {}",
+                    "[{n}] {:?} | {} | {:?} | буфер до {:.1} ГБ | рабочая группа {}",
                     i.backend,
                     i.name,
                     i.device_type,
