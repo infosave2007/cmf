@@ -47,6 +47,11 @@ impl ForwardScratch {
 
 /// Complete inference pipeline state.
 pub struct Pipeline {
+    /// In-process layer split across local GPUs: (device, first layer,
+    /// last layer) per segment, in execution order. `None` = one device.
+    /// Arc so cloning the plan out of `&mut self` does not fight the
+    /// borrow checker on the hot path.
+    gpu_plan: Option<std::sync::Arc<Vec<(usize, usize, usize)>>>,
     /// Arc: the server shares one tokenizer handle across request
     /// handlers without borrowing a pipeline slot.
     pub tokenizer: std::sync::Arc<Tokenizer>,
@@ -1296,6 +1301,7 @@ impl Pipeline {
             tracing::info!("worker pool: {} threads", p.n_workers());
         }
         Self {
+            gpu_plan: None,
             tokenizer: std::sync::Arc::new(tokenizer),
             kv_cache: KvCache::new(num_layers, num_kv_heads, head_dim, max_seq_len),
             sampler_config,
@@ -5509,7 +5515,57 @@ fn draft_probe() -> bool {
         task_mask: Option<&TaskMask>,
         upto: Option<usize>,
     ) -> Vec<f32> {
+        // In-process multi-GPU: each segment runs pinned to its card,
+        // and the only thing crossing the boundary is one hidden vector
+        // that never leaves this address space. Same layer split the
+        // network mode does, minus the second process, the socket, the
+        // serialization and the dir_hash handshake.
+        if let Some(plan) = self.gpu_plan.clone() {
+            if upto.is_none() && plan.len() > 1 {
+                let mut h = hidden.to_vec();
+                for &(dev, from, upto_incl) in plan.iter() {
+                    h = crate::gpu::with_device(dev, || {
+                        self.forward_layers_span(&h, position, task_mask, from, Some(upto_incl))
+                    });
+                }
+                return h;
+            }
+        }
         self.forward_layers_span(hidden, position, task_mask, 0, upto)
+    }
+
+    /// Split this pipeline's layer stack across local GPUs: segment i
+    /// runs on `devices[i]`. Contiguous and even by layer count — the
+    /// VRAM-weighted planner is the next step, and an uneven card pair
+    /// is why it will be needed. `None` clears the plan.
+    pub fn set_gpu_plan(&mut self, devices: Option<&[usize]>) -> Result<(), String> {
+        let Some(devs) = devices.filter(|d| d.len() > 1) else {
+            self.gpu_plan = None;
+            return Ok(());
+        };
+        self.split_supported()?;
+        let n = self.num_layers;
+        if devs.len() > n {
+            return Err(format!("{} devices for {n} layers", devs.len()));
+        }
+        let per = n.div_ceil(devs.len());
+        let mut plan = Vec::with_capacity(devs.len());
+        let mut from = 0usize;
+        for &d in devs {
+            if from >= n {
+                break;
+            }
+            let upto = (from + per - 1).min(n - 1);
+            plan.push((d, from, upto));
+            from = upto + 1;
+        }
+        self.gpu_plan = Some(std::sync::Arc::new(plan));
+        Ok(())
+    }
+
+    /// The active in-process split, if any: (device, first layer, last).
+    pub fn gpu_plan(&self) -> Option<Vec<(usize, usize, usize)>> {
+        self.gpu_plan.as_ref().map(|p| p.as_ref().clone())
     }
 
     /// Layer span [from ..= upto] (upto None = last layer): the building
