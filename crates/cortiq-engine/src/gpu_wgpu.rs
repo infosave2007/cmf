@@ -22166,6 +22166,95 @@ fn main() {
         );
     }
 
+    /// The tensor-core GEMM must agree with the scalar one it replaced.
+    /// This is the gate the dequantize-once path needed and did not
+    /// have: the neighbouring `wgpu_coop_small_gemm` only PRINTS its
+    /// worst relative error, so the f16 operands, the activation scale
+    /// and the unpacked plane could all drift unwatched. Runs on any
+    /// machine with a device; skips cleanly without one.
+    #[test]
+    fn wgpu_q4tp_mm_coop_matches_scalar() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        if c.q4tp_mm_coop_f16.is_none() {
+            eprintln!("no cooperative-matrix pipeline here — skipping");
+            return;
+        }
+        // Small enough to run anywhere, wide enough to cross several
+        // 64-row tiles and more than one k-chunk.
+        let (rows, cols, n) = (256usize, 128usize, 96usize);
+        let total = cortiq_core::quant::expected_nbytes(
+            cortiq_core::TensorDtype::Q4TiledP,
+            &[rows, cols],
+        )
+        .unwrap();
+        let (params_off, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+        let mut wb: Vec<u8> = (0..total).map(|i| (i * 37 % 251) as u8).collect();
+        let lo = cortiq_core::quant::f32_to_f16(-4.0);
+        let step = cortiq_core::quant::f32_to_f16(0.1);
+        for r in 0..rows {
+            let o = params_off + r * 4;
+            wb[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+            wb[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+        }
+        // Activations spanning the range that used to overflow f16.
+        let xs: Vec<f32> = (0..n * cols)
+            .map(|i| {
+                let b = ((i % 97) as f32 - 48.0) / 48.0;
+                if i % 11 == 0 { b * 3000.0 } else { b }
+            })
+            .collect();
+        let mk = |bytes: &[u8]| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let wbuf = mk(&wb);
+        let xbuf = mk(bytemuck::cast_slice(&xs));
+        let run = |pipe: &wgpu::ComputePipeline| -> Vec<f32> {
+            let ybuf = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (n * rows * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (n * rows * 4) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            encode_q4_tile_mm(c, &mut enc, pipe, &wbuf, &xbuf, &ybuf, rows, cols, n);
+            let mut out = vec![0f32; n * rows];
+            assert!(readback(c, enc, &ybuf, &stage, (n * rows * 4) as u64, &mut out));
+            out
+        };
+        let scalar = run(&c.q4tp_mm);
+        let coop = run(c.q4tp_mm_coop.as_ref().unwrap());
+        let rel = |a: &[f32], b: &[f32]| -> f64 {
+            let (mut num, mut den) = (0f64, 0f64);
+            for (x, y) in a.iter().zip(b) {
+                num += ((x - y) as f64).powi(2);
+                den += (*y as f64).powi(2);
+            }
+            (num / den.max(1e-30)).sqrt()
+        };
+        let r = rel(&coop, &scalar);
+        println!("coop vs scalar: relative rms {r:.3e}");
+        // f16 operands carry ~11 bits of mantissa; anything past 1e-2 is
+        // a broken layout or a lost activation scale, not rounding.
+        assert!(r < 1e-2, "coop GEMM drifted from the scalar arm: {r:.3e}");
+    }
+
     #[test]
     #[ignore]
     fn wgpu_attn_block_timing() {
