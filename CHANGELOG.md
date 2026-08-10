@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.65] - 2026-08-10
+
+### Fixed
+- **Masked GENERATION on a looped model produced garbage** — the first
+  decode with an active per-visit mask ever run. Three layers to it:
+  `layer_alive()` defaulted an ABSENT gate to dead, the writer recorded
+  gates per physical layer, and the decode loop asks by the VIRTUAL
+  index — so the entire second pass was silently skipped as "dead
+  layers" (batched scoring never consults gates, which is why every
+  scorer said the file was fine). Absent gates now read alive, the
+  codec replicates gates to every visit exactly like the FFN rows, and
+  the writer records them per visit. Pinned in `loop_masks.rs`.
+- **Masked decode rides the same activation-zeroing arm as the batched
+  sweep** (b=1) — the per-dtype zoo of sparse decode arms diverged on
+  q8_row trained masters; one contract, one implementation. Masked
+  generation is coherent at normal decode speed now.
+- **The scalar dx arm accepts only matvec-sized grids** (≤2^16
+  workgroups without cooperative matrices): it has no probe arbitrating
+  it, and on macOS it shadowed the Accelerate BLAS arm below — a
+  phase-B dx ground a bake to 12% CPU for an hour.
+
 ## [0.5.64] - 2026-08-09
 
 ### Added

@@ -1159,7 +1159,10 @@ pub fn run_skill_bake(
                 }
                 vec![row; nl]
             },
-            layer_gates: vec![true; nl],
+            // Per VISIT like the ffn rows: the runtime gates layers
+            // by the virtual index, and a short list read as a dead
+            // second pass.
+            layer_gates: vec![true; nl * loops],
             expert_masks: Vec::new(),
             parent: None,
             has_hot_pack: false,
