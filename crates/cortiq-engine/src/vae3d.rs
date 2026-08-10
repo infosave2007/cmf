@@ -257,6 +257,60 @@ impl VideoVae {
         let pairs = angles.len() / n; // = rope_dim / 2
         let scale = 1.0 / (hd as f32).sqrt();
         let pool = self.pool.as_deref();
+        // Device path: the same `dit_qk`/`dit_softmax`/`dit_pv` chain the
+        // DiT rides, so the n×n score plane stays on the card. This VAE
+        // is the larger half of a render's wall (201 s of 475 on an RTX
+        // 5090), and it was materializing those scores per head on the
+        // host. CMF_VAE3D_ATTN=cpu forces the loop below.
+        if std::env::var("CMF_VAE3D_ATTN").as_deref() != Ok("cpu")
+            && crate::gpu::enabled_here()
+            && n >= 256
+        {
+            let mut qa = vec![0f32; nh * n * hd];
+            let mut ka = vec![0f32; nh * n * hd];
+            let mut va = vec![0f32; nh * n * hd];
+            {
+                let (pq, pk, pv) = (
+                    SendPtr(qa.as_mut_ptr()),
+                    SendPtr(ka.as_mut_ptr()),
+                    SendPtr(va.as_mut_ptr()),
+                );
+                let fill = |lo: usize, hi: usize| {
+                    for p in lo..hi {
+                        for h in 0..nh {
+                            let base = p * 3 * dim + h * 3 * hd;
+                            let dst = (h * n + p) * hd;
+                            // SAFETY: disjoint token ranges per worker,
+                            // and each token owns its own head slots.
+                            let (q, k, v) = unsafe {
+                                (pq.row(dst, hd), pk.row(dst, hd), pv.row(dst, hd))
+                            };
+                            q.copy_from_slice(&qkv[base..base + hd]);
+                            k.copy_from_slice(&qkv[base + hd..base + 2 * hd]);
+                            v.copy_from_slice(&qkv[base + 2 * hd..base + 3 * hd]);
+                            // q and k carry the same norm + rotation the
+                            // host loop applies; v is untouched.
+                            for x in [&mut *q, &mut *k] {
+                                rms_norm_plain(x, self.eps);
+                                for j in 0..pairs {
+                                    let (sn, cs) = angles[p * pairs + j].sin_cos();
+                                    let (a, b) = (x[j], x[j + pairs]);
+                                    x[j] = a * cs - b * sn;
+                                    x[j + pairs] = a * sn + b * cs;
+                                }
+                            }
+                        }
+                    }
+                };
+                match pool {
+                    Some(pl) => pl.run_rows(n, &fill),
+                    None => fill(0, n),
+                }
+            }
+            if crate::gpu::dit_attention(&qa, &ka, &va, nh, nh, n, hd, scale, attn) {
+                return;
+            }
+        }
         let mut qh = vec![0f32; n * hd];
         let mut kh = vec![0f32; n * hd];
         let mut vt = vec![0f32; hd * n];
