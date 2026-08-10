@@ -14507,6 +14507,20 @@ pub fn forward_token_graph(
                         1,
                     );
                 }
+            } else if loop_norm_at.contains(&li) {
+                // The span ENDS on a loop boundary: the boundary norm
+                // belongs to this side — the wire (and the CPU span it
+                // must match) hands over the NORMED hidden. Dropping it
+                // here fed the next loop a raw residual: nanbeige split
+                // at the default half spoke template noise ("М user").
+                let fnw = stor(bytemuck::cast_slice(final_norm));
+                go(
+                    &mut enc,
+                    &c.add_rmsnorm,
+                    &bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &fnw, &n1, &rms_u]),
+                    1,
+                );
+                enc.copy_buffer_to_buffer(&n1, 0, &h_buf, 0, (hidden * 4) as u64);
             } else {
                 go(
                     &mut enc,
