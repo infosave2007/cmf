@@ -672,6 +672,33 @@ Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 CMF_GPU=1 cortiq run model.cmf
 ```
 
+### More than one GPU
+
+Two flags, two different problems:
+
+```sh
+cortiq serve model.cmf --gpus 2   # throughput: one full replica per card
+cortiq run   model.cmf --gpus 2   # capacity: the layer stack split across cards
+```
+
+**Replicas** (`serve --gpus N`) put a whole copy of the model on each
+card and serve N requests at once. On 2×RTX 5090 with a 34.7B MoE:
+115.3 tok/s for one request, **218.5 tok/s aggregate for two** — the
+mode that actually scales, and the one to reach for when the model
+fits on a single card.
+
+**Layer split** (`run/bench --gpus N`) runs segment *i* pinned to card
+*i* inside ONE process; only a hidden vector crosses a boundary, and it
+never leaves the address space. It exists for models bigger than one
+card, and it is free when they are not: 115.4 → 115.7 tok/s on that
+same MoE, 80.9 → 82.4 on a looped 4.2B, output byte-identical to the
+single-card run. `--peer-split N` moves the boundary; `cortiq gpu`
+lists the cards and their indices, `CMF_GPU_ADAPTER=<index|name>` pins
+one.
+
+For a model bigger than one HOST, `--peer` speaks to a `cortiq worker`
+over the network instead — same split, one socket further away.
+
 The backend is picked automatically: wgpu chooses Vulkan on Linux/Windows,
 DX12 on Windows if Vulkan is absent, Metal on macOS — nothing to configure
 (`WGPU_BACKEND=vulkan|dx12|metal|gl` overrides). Weights stay in VRAM up to
