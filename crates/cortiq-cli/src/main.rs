@@ -1448,20 +1448,6 @@ async fn main() -> anyhow::Result<()> {
                 sink: o1_sink,
                 rect: None,
             };
-            // --gpus N: the split is the SAME code as --peer, the worker
-            // just lives on this host pinned to the second card. The
-            // guard kills the worker when the run ends.
-            let local = match gpus {
-                Some(n) if n >= 2 => Some(spawn_local_gpu_worker(&model, n)?),
-                Some(n) => anyhow::bail!(
-                    "--gpus {n}: смысл флага — несколько карт; для одной                      просто уберите его (пин карты — CMF_GPU_ADAPTER)"
-                ),
-                None => None,
-            };
-            let (peer, net_token) = match &local {
-                Some(l) => (Some(l.addr.clone()), Some(l.token.clone())),
-                None => (peer, net_token),
-            };
             cmd_run(
                 &model,
                 &task,
@@ -1485,6 +1471,7 @@ async fn main() -> anyhow::Result<()> {
                 peer_split,
                 net_token.as_deref(),
                 &net_dtype,
+                gpus,
             )
             .await
         }
@@ -1665,15 +1652,7 @@ async fn main() -> anyhow::Result<()> {
             o1_window,
             o1_sink,
         } => {
-            let local = match gpus {
-                Some(n) if n >= 2 => Some(spawn_local_gpu_worker(&model, n)?),
-                Some(n) => anyhow::bail!("--gpus {n}: нужно ≥ 2 карт"),
-                None => None,
-            };
-            let (peer, net_token) = match &local {
-                Some(l) => (Some(l.addr.clone()), Some(l.token.clone())),
-                None => (peer, net_token),
-            };
+
             let o1 = O1Flags {
                 spec: o1,
                 m: o1_m,
@@ -1693,6 +1672,7 @@ async fn main() -> anyhow::Result<()> {
                 peer_split,
                 net_token.as_deref(),
                 &net_dtype,
+                gpus,
             ).await
         }
         Commands::Skill { cmd } => match cmd {
@@ -2857,6 +2837,7 @@ fn chat_mode(has_template: bool, raw: bool, resuming: bool) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn cmd_run(
     model_path: &str,
     task: &str,
@@ -2880,6 +2861,7 @@ async fn cmd_run(
     peer_split: Option<usize>,
     net_token: Option<&str>,
     net_dtype: &str,
+    gpus: Option<usize>,
 ) -> anyhow::Result<()> {
     println!("Loading model: {}", model_path);
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
@@ -2965,6 +2947,30 @@ async fn cmd_run(
         None => Pipeline::from_model_with_skill(&model, sampler, skill.as_deref())?,
     };
     o1.apply(&mut pipeline);
+    if let Some(n) = gpus {
+        // In-process split: segment i runs pinned to card i and hands
+        // the next one a hidden vector that never leaves this address
+        // space — no worker process, no socket, no serialization.
+        let have = cortiq_engine::gpu::device_count();
+        if n < 2 {
+            anyhow::bail!("--gpus {n}: нужно ≥ 2 карт (пин одной — CMF_GPU_ADAPTER)");
+        }
+        if have < n {
+            anyhow::bail!("--gpus {n}, а карт видно {have} (см. `cortiq gpu`)");
+        }
+        let devs: Vec<usize> = (0..n).collect();
+        pipeline
+            .set_gpu_plan(Some(&devs))
+            .map_err(|e| anyhow::anyhow!("--gpus {n}: {e}"))?;
+        if let Some(plan) = pipeline.gpu_plan() {
+            let seg = plan
+                .iter()
+                .map(|(d, a, b)| format!("карта {d}: слои {a}..={b}"))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            println!("gpus: {seg}");
+        }
+    }
     if route_dynamic {
         if skill.is_some() || blend.is_some() {
             println!(
@@ -4039,6 +4045,7 @@ async fn cmd_bench(
     peer_split: Option<usize>,
     net_token: Option<&str>,
     net_dtype: &str,
+    gpus: Option<usize>,
 ) -> anyhow::Result<()> {
     if !json {
         println!(
@@ -4077,6 +4084,24 @@ async fn cmd_bench(
         }
     }
     o1.apply(&mut pipeline);
+    if let Some(n) = gpus {
+        let have = cortiq_engine::gpu::device_count();
+        if n < 2 {
+            anyhow::bail!("--gpus {n}: нужно ≥ 2 карт");
+        }
+        if have < n {
+            anyhow::bail!("--gpus {n}, а карт видно {have}");
+        }
+        let devs: Vec<usize> = (0..n).collect();
+        pipeline
+            .set_gpu_plan(Some(&devs))
+            .map_err(|e| anyhow::anyhow!("--gpus {n}: {e}"))?;
+        if !json {
+            if let Some(plan) = pipeline.gpu_plan() {
+                println!("  GPUs:    {plan:?} (in-process split)");
+            }
+        }
+    }
     if pipeline.o1_active() {
         println!("  O(1):    nystrom attention on (KV replaced on flagged layers)");
     }

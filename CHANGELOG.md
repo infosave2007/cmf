@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The local layer split runs IN-PROCESS now — and it is finally
+  free.** `run/bench --gpus N` splits the stack across cards inside one
+  process: segment i executes pinned to card i, and the only thing
+  crossing a boundary is a hidden vector that never leaves the address
+  space. No second process, no socket, no serialization, no dir_hash
+  handshake. Measured on 2×RTX 5090 (honest bench, steady decode):
+  nanbeige 4.2 **80.9 → 82.4 tok/s (1.02×)**, W2 34.7B **115.4 → 115.7
+  (1.00×)** — where the TCP split cost 0.77–0.85×. Output stays
+  byte-identical to the single-card run on both. `--peer` remains the
+  answer for a model bigger than one HOST.
 - **`cortiq serve --gpus N`: N GPU replicas in ONE process, and the
   multi-GPU mode that actually scales.** Each slot holds the whole
   model on its own card and serves whole requests, so N requests decode
