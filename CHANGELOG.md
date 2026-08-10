@@ -7,6 +7,355 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.66] - 2026-08-10
+
+### Added
+- **Metal-MoE in the shared command buffer.** MoE layers now live inside
+  the whole-token Metal graph: a device-side `moe_topk_select` kernel
+  (softmax router, top-k with lower-index tie-break, norm/scale weight
+  semantics, gated shared expert — unit oracle against `moe_route`
+  including a deliberate bit-equal tie) fills the weight vector and the
+  jobs base tables, so routing never leaves the GPU and the per-layer
+  commit+wait round trip is gone. Layer types carry `MetalFfn::{Dense,
+  Moe}`; `encode_post_moe_ffn` chains addnorm → f32 router → select →
+  gate/up jobs (q4tp or the mixed q2tp profile) → fused SiLU → down
+  jobs → weighted reduce → residual in ONE encoder. The plan builder
+  maps softmax-router MoE with a gated shared expert and refuses
+  sigmoid/bias/τ routers, masks, per-expert scales, router-input norm
+  and non-SiLU experts to the CPU path unchanged.
+
+### Changed
+- **Device-attend policy is decided after the plan scan.** The hd>128
+  default-off was measured on dense models; a MoE plan inverts it —
+  every CPU-attend sandwich costs a commit+wait. W2 q2tp-MoE 34.7B on
+  M4 (steady decode): sandwiched graph 14.7 tok/s, device-attend graph
+  **24.8–27.1 tok/s**, pure CPU 18.8 — the graph now beats CPU on MoE,
+  which was the point of the spec. Dense models keep the measured
+  hd≤128 default; `CMF_GPU_ATTEND=0/off/force/256` still override.
+  Parity: with the CPU-attend sandwich the graph's texts match the
+  exact-CPU reference 48/48 with confidence drift 0.098 — inside the
+  CPU's own i8↔exact envelope (0.11); device-attend drift is the
+  pre-existing lever's class, not the MoE branch's.
+- **Known limit, measured:** the 17.8 GB 35B-A3B q4tp file exceeds this
+  M4's Metal `maxBufferLength` (13.6 GB), so NO Metal weight path (per
+  op or graph) can run it single-device; the 12.9 GB W2 fits. Follow-up
+  recorded: window the no-copy file buffer to the layer span (the same
+  windowing the network split wants).
+
+### Fixed
+- **Streaming swallowed short no-think replies whole.** With
+  `enable_thinking=false` the chat template prefills an EMPTY think
+  block, so the reply never emits `</think>` — and the SSE think-filter
+  buffered forever waiting for one; any answer under its 100-char
+  escape hatch shipped zero content chunks (usage and finish arrived,
+  the words did not). The filter buffer is now shared with the
+  post-generation path and flushed by the filter's own rules: a buffer
+  that never opened `<think>` IS the answer, a closed block ships its
+  tail, an unterminated block stays private. Found while validating
+  `serve --peer` streaming; applies to every serve, split or not.
+
+### Added
+- **Network pipeline-split (v1): a second machine's compute joins a
+  generation** — `cortiq worker model.cmf --listen IP:9911` holds a layer
+  span of the model; `cortiq run … --peer IP:9911 [--peer-split N]` runs
+  layers `[0..N)` + embed/head/sampler locally and ships one boundary
+  hidden per token (prefill batches positions per frame, one round trip
+  per chunk). New crate `cortiq-net`: length-prefixed bincode frames,
+  wire version checked at handshake, worker as a LIBRARY entry
+  (`worker_serve`) so app-packaged platforms (iOS) can host one. The
+  worker proves it holds the same model by `dir_hash` — a mismatch is
+  refused with both hashes named; beyond loopback `--token` is required.
+  The `.cmf` container is untouched: the split is a property of the run,
+  never of the file. Engine side: `forward_layers_upto` generalized to a
+  span `[from..=upto]` (delegation, zero behavior change at `from=0`),
+  pub building blocks `embed_id` / `forward_span` / `logits_from_hidden`
+  / `sample_next` / `reset_session`, and `split_supported()` refusing
+  the un-cuttable stacks (DSV4, Gemma-3n, O(1) attention) loudly.
+  Measured (bonsai-1.7b-q1, greedy, 48 tok, byte-identical output in
+  EVERY config): loopback split 82.5 vs 83.1 tok/s single-process; over
+  a real Thunderbolt bridge to an M1 worker — 34.5 tok/s at half the
+  stack remote (15.96 ms/token remote+wire), 44.1 tok/s at one layer
+  remote. A split of a model that already fits locally onto a slower
+  peer is a net LOSS, as the roadmap predicts — pipeline split buys
+  capacity, not single-stream speed. And the capacity claim is now
+  MEASURED at scale: Qwen3.6-27B q4tp (13.3 GB, 64 layers) on a
+  24 GB + 16 GB Mac pair answers correctly at ~1.3–1.6 tok/s warm
+  (split 40, CPU worker) where the 24 GB machine alone thrashes at
+  0.4–0.9 tok/s and the 16 GB one cannot run it at all. Two pinned
+  operational facts: a memory-tight worker must run `CMF_GPU=0`
+  (Metal's buffer footprint on top of a near-full span collapses it —
+  11 s/token at 6.4 GB span), and the M1's practical resident span
+  ceiling is ~4.8 GB regardless of nominal free RAM — plan spans to
+  the measured ceiling, not the spec sheet.
+- **Wire v2: the protocol stopped costing more than the wire.** v1 shipped
+  a frame as TWO write syscalls — under TCP_NODELAY the 4-byte length
+  prefix went out as its own segment, four packets per round trip. v2:
+  one buffer, one write; per-token frames (Step/Hidden/Prefill) are raw
+  little-endian instead of bincode; float payloads reuse scratch (the
+  hot path does not allocate); optional f16 payload negotiated
+  EXPLICITLY in Assign (`run --net-dtype f16`, default stays bit-exact
+  f32); a bounded busy-poll before blocking reads (`CMF_NET_SPIN` µs,
+  default 3000, 0 disables) — the wakeup from a cold blocking read on a
+  power-managed core costs more than the Thunderbolt wire, and the
+  no-spin A/B drops 77.7 → 50.8 tok/s at the same RTT. Measured on the
+  same stand, same prompt, output identical in every config INCLUDING
+  f16: Thunderbolt split-14 34.5 → 53.6 tok/s (+55%; the last chunk
+  from `CMF_GPU=0` on the worker — per-op Metal submits on a partial
+  stack lose to the NEON q1 path on M1, 13.0 vs 9.0 ms for 14 layers —
+  the honest fix is the per-segment graph, roadmap Phase 2), split-27
+  44.1 → 77.7 tok/s (+76%), wire cost per token 4.33 → 3.24 ms;
+  loopback split-14 82.5 → 99.8 tok/s — ABOVE the 83.1 single-process
+  baseline (two processes overlap their submit/readback bubbles).
+- **Wire v3: pipelined prefill.** Prefill frames are fire-and-forget and
+  a `Sync` barrier fetches the last boundary hidden — the coordinator
+  computes chunk k+1 while the worker chews chunk k (prefill wall ≈ max
+  of the sides, not their sum); decode round-trip stats no longer mix
+  prefill in. Validated on the LOOPED Nanbeige-4.2 (22 phys × 2 loops =
+  44 virtual layers): split at the loop boundary, mid-loop-1 and
+  mid-loop-2 all match the single-process output token-for-token —
+  bit-exact when both sides run the same device kind (CPU⇔CPU); a
+  mixed CPU/Metal split diverges within normal GPU-vs-CPU numerics,
+  same as any `CMF_GPU` toggle (ppl's CPU-reference rule applies).
+  Worker device recipe is PER-QUANT on the M1: q1 runs faster on NEON
+  (`CMF_GPU=0`, 9.0 vs 13.0 ms), q4t runs faster on Metal (24.9 vs
+  37.9 ms per token for its span). And the honest headline: a 4.17B
+  that FITS locally decodes 16 tok/s local vs 6.1 tok/s best-split to
+  a 2× slower peer — pipeline split buys capacity, not single-stream
+  speed, exactly as the roadmap says.
+- **Batched span prefill.** `prefill_batch_masked` generalized to a layer
+  span `[from..upto)` over ids OR ready boundary hiddens (pure
+  delegation at full range — local behavior bit-identical, baselines
+  re-verified); the macOS chunk graph takes a hard cap so a device run
+  never crosses the split boundary. Both split sides now prefill through
+  the same layer-major GEMM/graph machinery as a local run: Nanbeige
+  42-position prefill on the stand 2.3 s → 0.47 s, 138 positions →
+  1.07 s (~5× vs the per-position walk), best-split decode 6.1 →
+  11.1 tok/s. Found and pinned along the way: PREFILL PANEL WIDTH IS
+  PART OF THE GENERATION — a different `CMF_PREFILL_CHUNK` reorders
+  GEMM accumulation and can legitimately flip a greedy argmax (measured
+  on the same CPU with chunk 64 vs 512). `pipeline::prefill_chunk()` is
+  now pub and the network split chunks EXACTLY like the local path, so
+  a split run reproduces the local generation bit-for-bit when both
+  sides run the same device kind.
+- **Cross-turn KV reuse over the wire.** `generate_split` mirrors
+  `generate_from_ids`: when a chat turn strictly EXTENDS the forwarded
+  history, only the tail is prefilled and the worker's KV rides along
+  untouched (no Reset frame) — turn latency stays proportional to the
+  new text, not the session. `CMF_KV_REUSE=0` disables, a cancelled
+  prefill poisons the history, and the net line now reports it
+  honestly: `prefill 1224 ms (37 of 197 pos, 160 reused)` — measured
+  on the stand, a full 197-position re-prefill would have cost ~3.5 s.
+  Same trigger as local reuse: the re-rendered history must retokenize
+  to the exact forwarded ids — a reply ending in a truncated multibyte
+  sequence blocks it (observed on Nanbeige's byte-token tails).
+  Pinned, not yet chased: a short TAIL prefill runs at ~2× the
+  per-position cost of a long fresh one (small-batch attend arms below
+  their GEMM thresholds + deeper KV) — a constant factor the linear
+  history saving dwarfs; belongs to the per-segment-graph phase.
+- **Layer-skip speculation measured DEAD on present models** — recorded
+  so nobody builds it. New tool `spec-probe` (cortiq-net bin):
+  teacher-forced acceptance of argmax(final-norm + lm_head over the
+  hidden after L layers) against the full model's own greedy token.
+  Nanbeige-4.2 (looped, 44 virtual): 0% at every depth except exactly
+  the loop-1 boundary (9.4% at layer 22) — mid-loop hiddens live in a
+  different representation space than the head reads. Bonsai (plain
+  qwen3, 28L): ≤1.6% until layer 23, and only 32.8% at 82% depth,
+  where a draft saves nothing. Network speculative decode therefore
+  needs an MTP-carrying arch or a companion draft model — not an
+  early-exit head. Ten minutes of measurement, days of machinery not
+  built.
+- **First MoE over the wire.** Qwen3.6-35B-A3B q4tp (18.7 GB) across
+  the Thunderbolt pair: split 20/20, f16, CPU worker — 12.2–12.4 tok/s
+  warm, remote 32 ms/token, byte-identical to the local CPU run. That
+  MATCHES the box's own best (11.6–12.1 tok/s local CPU) while halving
+  each side's hot set — MoE is the split's natural cargo: per-token
+  remote compute is the routed experts only, so the wire's fixed cost
+  stops dominating. Same file's local numbers double as the honest
+  llama.cpp comparison base for the "20 tok/s" claim.
+- **Model open no longer blocks on a whole-file readahead.** `open`
+  issued one `madvise(WillNeed)` over the entire mapping; macOS runs
+  that SYNCHRONOUSLY, so a 12.9 GB MoE file held open() for ~6.5 s
+  while prefetching experts a routed decode never touches. The advise
+  is now capped at 4 GiB: dense small/mid files keep the readahead
+  (every weight gets touched anyway), big files — the MoE class above
+  all — rely on demand paging. `CMF_MMAP_ADVISE=1` forces the old
+  blanket advise, `=0` still disables. Measured: W2 open 6.5 s →
+  0.49 s cold / 0.01 s warm, `run -n 2` 7.6 → 3.4 s, chat turns
+  4.0/5.0 → 4.8/5.5 tok/s; nanbeige (2.2 GB, under the cap) keeps its
+  readahead and its 15-16 tok/s.
+- **MoE prefill: parallelism inverted over experts.** The batched
+  prefill already grouped positions by expert, but each tiny panel
+  (a few positions of a 512-inter expert) went through `dense_ffn_batch`
+  with the POOL — thousands of barrier-priced dispatches per chunk.
+  Workers now take WHOLE experts (serial math inside, zero inner
+  barriers), results land in per-expert panels, and one deterministic
+  scatter in expert order reproduces the serial accumulation exactly;
+  small batches keep the old path. W2 sustained decode+prefill rose
+  8.1–10.1 tok/s at n=64 (from 7.7–7.9), chat turns 4.0/5.0/3.1
+  (from 3.5/4.7/2.9), output byte-identical. Engine suite 152/152.
+- **Metal grew its 2-bit MoE kernel** — the gap behind "GPU no faster
+  than CPU on the W2": the experts (the bulk of a 2-bit MoE's compute)
+  never reached Metal at all. New MSL `q2tp_matvec_jobs` (twin of the
+  q4tp jobs kernel: same ladder planes and 5-bit rung codes; 8-byte
+  weight chunks where a uint carries SIXTEEN 2-bit fields, and rung 0
+  of the ladder is an EXACT ZERO so pruned groups stay silent), the
+  jobs pipeline flips only stage 1 (gate/up) — silu, the q4tp down and
+  the weighted sum are dtype-blind. The mixed trio now flows end to
+  end: `MoeJob.gu_q2`, a Q2TiledP arm in `moe_parts`, trio validation
+  demanding a plain q4tp down under 2-bit gate/up, and an honest
+  refusal in the wgpu per-op moe_block (its 2-bit lanes live in the
+  graphs). Measured on the M4: the CPU still wins (5.9 vs 2.8 tok/s
+  forced-GPU — 30 synchronous per-layer submits) and the Batch/Ffn
+  probes keep it, exactly as designed; the kernel is for GPU-strong
+  devices, and folding the MoE block into the token command buffer is
+  the recorded follow-up, together with a device-vs-dequant unit
+  oracle for strict bit-level kernel verification.
+- **q2tp CPU decode: the scalar holdout joined the i8 family.**
+  `dot_q2tp_row_i8` — the half-integer grid (c − 1.5) becomes exact
+  integer math through group sums, NEON unpacks the four 2-bit fields
+  by shift+mask against a vld4-deinterleaved activation vector
+  (widening MACs, exact i32); the a8w8 branch landed in `q2tp_matvec`,
+  the fused `matvec_silu_mul` arm covers 2-bit gate/up pairs, and
+  `moe_gate_up_many` accepts the q2tp expert profile (coverage gap #12
+  for this class) — the per-expert pool-barrier storm of a 2-bit MoE
+  collapses into two dispatches per layer. Grid-exact unit test pins
+  i8 == exact scalar; W2 output byte-identical. Profile after: the
+  2-bit dot fell from 58% of decode compute to a co-equal share with
+  the q4tp ladder decode; measured sustained W2 decode on the M4 rose
+  to 7.7–7.9 tok/s at n=64 (3 runs), with per-turn arithmetic putting
+  steady decode near ~15-20 tok/s and the remaining wall in PREFILL —
+  the MoE prefill still walks experts per position, that is the next
+  slice, together with the promised Metal q2tp expert kernel (MSL twin
+  of `q4tp_matvec`, same ladder planes, 2-bit unpack) + the mixed-trio
+  `MoeJob` so Metal finally accelerates 2-bit MoE.
+- **Coverage gap #6 CLOSED: the q2tp-MoE mixed profile reaches the wgpu
+  batch/prefill graph** — validated against a real parity oracle
+  (Qwen3.6-35B-A3B-Escha-W2, 34.7B, 2-bit experts): the builder gained
+  the token graph's q2tp ladder (q4t → q2tp gate/up over q4tp down →
+  q4tp, uniform per layer), `gu_q2` now flows through `BFfn::Moe` into
+  both executor lanes; the per-position lane dispatches
+  `moe_gate_up_q2tp` + the EXACT `moe_down_q4tp` (the DSV4-chain pair),
+  the GU uniform stride comes from `expected_nbytes(Q2TiledP)`, and the
+  whole-chunk q4tp fast lane now EXCLUDES `gu_q2` explicitly — the
+  mixed profile sets `q4tp=true`, so without `!gu_q2` that lane would
+  have ground q2tp bytes through the q4tp kernel into silent garbage.
+  CPU⇔wgpu long-prompt output is byte-identical, zero batch-graph
+  refusals under RUST_LOG, engine suite 151/151, bonsai/nanbeige
+  baselines untouched. Deliberately NOT wired: `bt_moe_gate_up_q2tp`
+  (whole-chunk 2-bit lane stays a future optimization — the
+  per-position lane lives in the same submit) and `moe_down_q2tp_b`
+  (a DSpark draft-grade kernel, excluded from the exact path by its
+  own contract).
+- **Coverage gap #6 (q2tp MoE batch) rediagnosed, wiring deliberately
+  NOT done (superseded above the same day).** The batch q2tp kernels (`bt_moe_gate_up_q2tp(_r4)`,
+  `moe_down_q2tp_b`) are registered but dispatched NOWHERE: the batch
+  executor's whole-chunk lane hardcodes the q4tp pipeline and the
+  per-position lane branches on `q4tp` only — q2tp bytes under a q4tp
+  kernel would be silent garbage, which is exactly why the builder's
+  `gu_q2: false` stays. The wire needs the builder plus BOTH executor
+  lanes with their own layouts/strides, and it cannot be validated
+  blind: the stand has no MoE checkpoint at all. Prerequisite recorded
+  in QUANT_COVERAGE.ru.md — convert an MoE model (Qwen3-30B-A3B also
+  settles the llama.cpp comparison), then wire with parity.
+- **Coverage gaps #5 and #8-q8 closed.** `gpu_batch_job` grew Q4Tiled /
+  Q4TiledP arms — the attention QKV batch can now reach the Metal batch
+  kernels the GDN projection path already uses; the existing
+  OpClass::Batch probe arbitrates, and on both stand machines it
+  honestly keeps the CPU (measured: no regression at 15.3–15.9 and
+  8.6–8.7 tok/s) — the route matters where the batch amortizes its
+  submit. The dense-FFN fuse grew a Q8Row arm on a new portable
+  `q8_row_dot` (SDOT/AVX2 fast arms + an exact scalar oracle, unit test
+  pins fast==scalar; a q8 checkpoint bench is pending — none on the
+  stand). Q8_2f is excluded from the fuse ON PURPOSE: its column field
+  prescales activations per tensor, breaking the shared split_act
+  contract. Engine lib suite: 151/151.
+- **Coverage gaps #2 and #8 closed** (from QUANT_COVERAGE.ru.md).
+  Q4Tiled decode matvec got its missing GPU dispatcher — `gpu::q4t_matvec`
+  facade + the probe arm in `QTensor::matvec`, same shape as the q4tp
+  twin (Metal enters via the existing kernel; wgpu stays an honest
+  refusal until a discrete-GPU q4t model reaches the bench; on M4 the
+  probe keeps the CPU head, as it does for q4tp — the route matters
+  where the GPU wins). And the q1 dense FFN got its fused
+  `matvec_silu_mul` arm — one row pass over both sign streams with
+  shared activation group-sums instead of two dispatches + a combine
+  loop: the bonsai-recipe M1 worker span dropped 9.03 → 7.5–7.9
+  ms/token (−14%), CPU output byte-identical to the reference.
+- **Quant-coverage audit: every dtype × every execution path**, written
+  down as `docs/QUANT_COVERAGE.ru.md` — 17 dtypes against 10 paths with
+  file:line evidence, 13 open "kernel exists, caller filters it out"
+  gaps and the honest no-kernel list. Two findings overturned this
+  session's own working theory: the Metal block graph is NOT q1-only —
+  `proj_abs` already encodes Q1/Q1T/Q4Block/Q4Tiled/Q4TiledP/Q8Row/
+  Q8_2f and the graph executes the whole GDN-hybrid 27B (the `q1_*`
+  names are historical); and the decode brake on hd=256 archs is the
+  device-attend gate, not the kernels — `CMF_GPU_ATTEND=256` cut the
+  27B coordinator span 159 → 108 ms/token (−35%) on the stand, taking
+  the 24+16 GB pair to ~3.5 tok/s steady decode (from 0.4 at the start
+  of the investigation). Fixed along the way: `q1_parts` advertised
+  Q2TiledP to a backend with no q2tp kernel, silently truncating the
+  block plan at the first q2tp layer; the graph's break reasons now
+  print under the existing `CMF_GRAPH_DBG`.
+- **q4tp prefill panels reach the Metal GPU.** `dense_ffn_batch` wired
+  the fused on-device SwiGLU only for q4_tiled; a q4tp model's prefill
+  FFN silently stayed on the CPU. The q4tp twin now rides
+  `gpu::q4tp_ffn` — the exact kernel the image DiT has run in
+  production. (On the GDN-hybrid 27B the prefill floor is the
+  sequential GDN recurrence, so the win there is small; full-attention
+  q4tp models get the full panel offload.) Pinned for the next Phase-2
+  slice, with the decode floor measured: a GDN layer's q4tp
+  projections run on CPU (~4-5 ms/layer incl. the scales_into ladder
+  decode) because the Metal token graph's weight extraction is
+  q1-only (`q1_parts()` throughout `q1_graph_gpu`), while the
+  ProjKind::Q4tp ENCODER already exists — the extension is typed
+  weights in GdnGpuLayer/AttnGpuLayer, not new shaders.
+- **Per-segment wgpu token graph (roadmap Phase 2, first cut).** The
+  whole-token wgpu graph — the discrete-GPU fast path (4090 class:
+  76 → 137 tok/s) — generalized from all-or-nothing to a layer span
+  `[from..=upto]`: a split coordinator and worker each run their whole
+  SEGMENT in one submit per token instead of falling to the per-op
+  path. `forward_token_graph` takes a `layer_base` so span and
+  full-stack runs address the same per-layer KV/GDN mirrors; lm_head
+  folds in only when the span reaches the last layer; looped-model
+  boundary norms go span-relative (a span ending mid-stack keeps its
+  boundary norm). Span runs skip the graph RACE (its state is global
+  and calibrated on full stacks) and engage only where the graph is
+  trusted by default. Verified on loopback with `CMF_GPU=wgpu`
+  (bonsai): both sides build exactly their segment (`graph L1..L13` /
+  `graph L14..L27` under CMF_GRAPH_DEBUG), output byte-identical to
+  the full-graph baseline; the default Metal path is untouched
+  (`wgpu_graph_default` already requires the wgpu backend). The
+  Metal-native q4t decode graph remains the next Phase-2 slice.
+- **Skills, task masks and O(1) attention ride the network split**
+  (wire v4). `Assign` carries the session spec — skill overlay id,
+  task-mask name, O(1) config — and the worker mirrors it over its own
+  layers: reloads its pipeline with the same skill (same file, verified
+  by dir_hash, so the overlay resolves to identical bytes), resolves
+  the mask from ITS catalog and masks the layers IT runs, applies the
+  same `O1Cfg` and runs the o1 lifecycle over its span (begin at
+  Reset, collect through prefill, seal at the Sync barrier — exactly
+  where the local path seals). Unknown skill / unknown task / bad o1
+  spec are loud Ack refusals; `--blend`, `--route-dynamic` and
+  `--state` stay refused (they desync by construction). Validated with
+  a new parity oracle — `mkskill-test` writes a `skill.test` whose
+  tensors are byte copies of the layer-0 FFN, so `--skill test` MUST
+  equal the backbone: local backbone == local skill == split skill,
+  byte-for-byte (CPU⇔CPU), and o1 local == o1 split with the
+  approximation active. Measured on the Thunderbolt stand at a
+  ~1000-token context: `--o1 all` cuts the worker's per-token cost
+  14.44 → 9.73 ms (−33%), the O(1)-vs-O(n) gap growing with context.
+- **`serve --peer`: the OpenAI API rides the network split.** Same
+  flags as `run --peer` (`--peer-split`, `--net-token`, `--net-dtype`);
+  the worker is dialed and verified (dir_hash, geometry, wire version)
+  BEFORE the listener starts, so a bad peer fails the whole serve
+  loudly. Peer mode forces one slot — one worker holds one KV session —
+  and a request carrying a task mask is refused with a clear message
+  rather than half-masked. SSE streaming, usage accounting, session
+  turnover and the cross-turn KV reuse all flow through unchanged;
+  per-generation net stats land in the server log via tracing.
+  Speculation,
+  task masks, skills and multi-worker plans stay refused-not-degraded —
+  they return per MULTI_DEVICE_ROADMAP.ru.md.
+
 ## [0.5.65] - 2026-08-10
 
 ### Fixed

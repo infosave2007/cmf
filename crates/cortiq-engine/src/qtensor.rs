@@ -383,8 +383,10 @@ impl QTensor {
                     | TensorDtype::Q1T
                     | TensorDtype::Q4Block
                     | TensorDtype::Q4Tiled
+                    // Q2TiledP deliberately absent: the Metal graph has no
+                    // q2tp kernel, and advertising it here made the block
+                    // plan truncate mid-run at the first q2tp layer.
                     | TensorDtype::Q4TiledP
-                    | TensorDtype::Q2TiledP
                     | TensorDtype::Q8Row
                     | TensorDtype::Q8_2f,
                 rows,
@@ -953,6 +955,28 @@ impl QTensor {
                     return;
                 }
                 if *dtype == TensorDtype::Q4Tiled {
+                    // GPU route for large q4t matvecs — the lm_head class,
+                    // same shape as the q4tp arm below. The probe keeps the
+                    // winner; a backend without the kernel refuses and the
+                    // CPU path stays.
+                    if *rows * *cols >= 8_388_608 && crate::gpu::enabled_here() {
+                        let t0 = std::time::Instant::now();
+                        let cls = crate::gpu::matvec_class(*rows, *cols);
+                        match crate::gpu::probe_arm(cls) {
+                            crate::gpu::ProbeArm::Gpu => {
+                                if crate::gpu::q4t_matvec(model, *idx, x, *rows, *cols, out) {
+                                    crate::gpu::probe_record(cls, true, t0.elapsed());
+                                    return;
+                                }
+                            }
+                            crate::gpu::ProbeArm::CpuTimed => {
+                                q4t_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
+                                crate::gpu::probe_record(cls, false, t0.elapsed());
+                                return;
+                            }
+                            crate::gpu::ProbeArm::Cpu => {}
+                        }
+                    }
                     q4t_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
                     return;
                 }
@@ -2459,6 +2483,117 @@ impl QTensor {
                 dispatch_rows(pool, inter, &run);
                 true
             }
+            // Q1 gate + Q1 up — one row pass over both sign streams,
+            // silu·mul fused (the per-row math of `q1_range_a8w8`); the
+            // activation group sums are shared by both streams. Without
+            // this arm a q1 dense FFN paid two dispatches + a combine
+            // loop — the exact barrier this function exists to remove.
+            (
+                Self::Mapped {
+                    dtype: TensorDtype::Q1,
+                    ..
+                },
+                Self::Mapped {
+                    dtype: TensorDtype::Q1,
+                    ..
+                },
+            ) => {
+                let g_bytes = gate.quant_bytes();
+                let u_bytes = up.quant_bytes();
+                let gpr = gate.cols() / GROUP_SIZE;
+                let gsum = q1_group_sums(&act.xq, gpr);
+                let gsum = &gsum;
+                let run = move |start: usize, end: usize| {
+                    for r in start..end {
+                        let mut gv = dot_q1_row_i8(g_bytes, r, gpr, &act.xq, gsum) * act.sx;
+                        let mut uv = dot_q1_row_i8(u_bytes, r, gpr, &act.xq, gsum) * act.sx;
+                        for &(j, xv) in &act.outliers {
+                            let (w, s) = q1_outlier(g_bytes, r, gpr, j);
+                            gv += w * s * xv;
+                            let (w, s) = q1_outlier(u_bytes, r, gpr, j);
+                            uv += w * s * xv;
+                        }
+                        let silu_g = gv / (1.0 + (-gv).exp());
+                        // SAFETY: disjoint row ranges per worker.
+                        unsafe { *out_addr.at(r) = silu_g * uv };
+                    }
+                };
+                dispatch_rows(pool, inter, &run);
+                true
+            }
+            // Q2TiledP gate + Q2TiledP up — the 2-bit expert pair (MoE
+            // FFNs of the W2 class): one row pass, both ladders built
+            // once, integer code dots with shared group sums.
+            (
+                Self::Mapped {
+                    dtype: TensorDtype::Q2TiledP,
+                    ..
+                },
+                Self::Mapped {
+                    dtype: TensorDtype::Q2TiledP,
+                    ..
+                },
+            ) => {
+                let cols = gate.cols();
+                let gpr = cols / GROUP_SIZE;
+                let gv_view = Q4tpView::new_q2(gate.quant_bytes(), inter, cols);
+                let uv_view = Q4tpView::new_q2(up.quant_bytes(), inter, cols);
+                let gsum = q1_group_sums(&act.xq, gpr);
+                let gsum = &gsum;
+                let run = move |start: usize, end: usize| {
+                    let (mut gsc, mut usc) = (vec![0f32; gpr], vec![0f32; gpr]);
+                    for r in start..end {
+                        gv_view.scales_into(r, gpr, &mut gsc);
+                        uv_view.scales_into(r, gpr, &mut usc);
+                        let mut gv =
+                            dot_q2tp_row_i8(gv_view.nib, r, gpr, &act.xq, gsum, &gsc) * act.sx;
+                        let mut uv =
+                            dot_q2tp_row_i8(uv_view.nib, r, gpr, &act.xq, gsum, &usc) * act.sx;
+                        for &(j, xv) in &act.outliers {
+                            let (w, s) = q2tp_outlier(gv_view.nib, r, gpr, j, &gsc);
+                            gv += w * s * xv;
+                            let (w, s) = q2tp_outlier(uv_view.nib, r, gpr, j, &usc);
+                            uv += w * s * xv;
+                        }
+                        let silu_g = gv / (1.0 + (-gv).exp());
+                        // SAFETY: disjoint row ranges per worker.
+                        unsafe { *out_addr.at(r) = silu_g * uv };
+                    }
+                };
+                dispatch_rows(pool, inter, &run);
+                true
+            }
+            // Q8Row gate + Q8Row up — one row pass over both i8 streams.
+            // Q8_2f stays out on purpose: its column field prescales the
+            // activations PER TENSOR, which breaks this fn's shared
+            // split_act contract — it keeps the two-dispatch path.
+            (
+                Self::Mapped {
+                    dtype: TensorDtype::Q8Row,
+                    row_scale: g_rs,
+                    ..
+                },
+                Self::Mapped {
+                    dtype: TensorDtype::Q8Row,
+                    row_scale: u_rs,
+                    ..
+                },
+            ) => {
+                let g_bytes = gate.quant_bytes();
+                let u_bytes = up.quant_bytes();
+                let cols = gate.cols();
+                let run = move |start: usize, end: usize| {
+                    for r in start..end {
+                        let gv = q8_row_dot(&g_bytes[r * cols..(r + 1) * cols], act) * g_rs[r];
+                        let uv = q8_row_dot(&u_bytes[r * cols..(r + 1) * cols], act) * u_rs[r];
+                        let silu_g = gv / (1.0 + (-gv).exp());
+                        // SAFETY: disjoint row ranges per worker.
+                        unsafe { *out_addr.at(r) = silu_g * uv };
+                    }
+                };
+                dispatch_rows(pool, inter, &run);
+                true
+            }
             // Q1T gate + Q1T up
             (
                 Self::Mapped {
@@ -2526,22 +2661,25 @@ impl QTensor {
             return false;
         }
         let gpr = cols / GROUP_SIZE;
+        // Uniform layout across every routed pair: q4tp, or the 2-bit
+        // profile's q2tp gate/up (the W2 class). Mixed sets refuse.
+        let q2 = matches!(
+            pairs[0].0,
+            Self::Mapped {
+                dtype: TensorDtype::Q2TiledP,
+                ..
+            }
+        );
+        let want = if q2 {
+            TensorDtype::Q2TiledP
+        } else {
+            TensorDtype::Q4TiledP
+        };
         let mut views = Vec::with_capacity(pairs.len() * 2);
         for ((g, u), o) in pairs.iter().zip(outs.iter()) {
-            let both_q4tp = matches!(
-                g,
-                Self::Mapped {
-                    dtype: TensorDtype::Q4TiledP,
-                    ..
-                }
-            ) && matches!(
-                u,
-                Self::Mapped {
-                    dtype: TensorDtype::Q4TiledP,
-                    ..
-                }
-            );
-            if !both_q4tp
+            let both = matches!(g, Self::Mapped { dtype, .. } if *dtype == want)
+                && matches!(u, Self::Mapped { dtype, .. } if *dtype == want);
+            if !both
                 || g.rows() != inter
                 || u.rows() != inter
                 || g.cols() != cols
@@ -2550,11 +2688,17 @@ impl QTensor {
             {
                 return false;
             }
-            views.push(Q4tpView::new(g.quant_bytes(), inter, cols));
-            views.push(Q4tpView::new(u.quant_bytes(), inter, cols));
+            let mk = if q2 { Q4tpView::new_q2 } else { Q4tpView::new };
+            views.push(mk(g.quant_bytes(), inter, cols));
+            views.push(mk(u.quant_bytes(), inter, cols));
         }
         let act = split_act(x);
-        let act = &act;
+        let gsum = if q2 {
+            q1_group_sums(&act.xq, gpr)
+        } else {
+            Vec::new()
+        };
+        let (act, gsum) = (&act, &gsum);
         let ptrs: Vec<SendMut> = outs.iter_mut().map(|o| SendMut(o.as_mut_ptr())).collect();
         let (views, ptrs) = (&views, &ptrs);
         let run = |start: usize, end: usize| {
@@ -2565,13 +2709,31 @@ impl QTensor {
                 let uv_view = &views[e * 2 + 1];
                 gv_view.scales_into(r, gpr, &mut gsc);
                 uv_view.scales_into(r, gpr, &mut usc);
-                let mut gv = dot_q4tp_row_i8(gv_view.nib, r, gpr, &act.xq, &gsc) * act.sx;
-                let mut uv = dot_q4tp_row_i8(uv_view.nib, r, gpr, &act.xq, &usc) * act.sx;
+                let (mut gv, mut uv) = if q2 {
+                    (
+                        dot_q2tp_row_i8(gv_view.nib, r, gpr, &act.xq, gsum, &gsc) * act.sx,
+                        dot_q2tp_row_i8(uv_view.nib, r, gpr, &act.xq, gsum, &usc) * act.sx,
+                    )
+                } else {
+                    (
+                        dot_q4tp_row_i8(gv_view.nib, r, gpr, &act.xq, &gsc) * act.sx,
+                        dot_q4tp_row_i8(uv_view.nib, r, gpr, &act.xq, &usc) * act.sx,
+                    )
+                };
                 for &(j, xv) in &act.outliers {
-                    let (w, s) = q4tp_outlier(gv_view.nib, r, gpr, j, &gsc);
-                    gv += w * s * xv;
-                    let (w, s) = q4tp_outlier(uv_view.nib, r, gpr, j, &usc);
-                    uv += w * s * xv;
+                    let (og, ou) = if q2 {
+                        (
+                            q2tp_outlier(gv_view.nib, r, gpr, j, &gsc),
+                            q2tp_outlier(uv_view.nib, r, gpr, j, &usc),
+                        )
+                    } else {
+                        (
+                            q4tp_outlier(gv_view.nib, r, gpr, j, &gsc),
+                            q4tp_outlier(uv_view.nib, r, gpr, j, &usc),
+                        )
+                    };
+                    gv += og.0 * og.1 * xv;
+                    uv += ou.0 * ou.1 * xv;
                 }
                 let silu_g = gv / (1.0 + (-gv).exp());
                 // SAFETY: one worker owns each (expert, row) pair.
@@ -4374,6 +4536,79 @@ fn q4tp_matvec2(
     dispatch_rows(pool, rows, &run);
 }
 
+/// One q2tp outlier weight at column `j` of row `r`: the 2-bit code and
+/// its group scale, mirrored on `q4tp_outlier`.
+#[inline]
+fn q2tp_outlier(chunks: &[u8], r: usize, gpr: usize, j: usize, scales: &[f32]) -> (f32, f32) {
+    let (gi, k) = (j / GROUP_SIZE, j % GROUP_SIZE);
+    let byte = chunks[(r * gpr + gi) * Q2TP_CHUNK + k / 4];
+    let c = (byte >> (2 * (k % 4))) & 3;
+    (c as f32 - 1.5, scales[gi])
+}
+
+/// Integer dot of one q2tp row against pre-quantized activations:
+/// Σ_g s_g · (Σ c·xq − 1.5·Σ xq). The half-integer grid (c − 1.5)
+/// becomes exact integer math through the group sums — the same trick
+/// every a8w8 kernel in this file rides. The codes decode into a
+/// 32-byte scratch in natural order and the dot itself is the shared
+/// SDOT primitive; elsewhere a scalar integer loop.
+#[inline]
+fn dot_q2tp_row_i8(
+    chunks: &[u8],
+    r: usize,
+    gpr: usize,
+    xq: &[i8],
+    gsum: &[i32],
+    scales: &[f32],
+) -> f32 {
+    let mut acc = 0f32;
+    let base = r * gpr * Q2TP_CHUNK;
+    #[cfg(not(target_arch = "aarch64"))]
+    let mut codes = [0i8; GROUP_SIZE];
+    for gi in 0..gpr {
+        let ch = &chunks[base + gi * Q2TP_CHUNK..base + (gi + 1) * Q2TP_CHUNK];
+        let xg = &xq[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE];
+        #[cfg(target_arch = "aarch64")]
+        // NEON: the byte's four 2-bit fields land in four lane vectors
+        // (shift+mask), vld4 de-interleaves xq to match (xj[k] =
+        // xq[4k+j]), widening MACs accumulate exactly in i32. A scalar
+        // decode here cost as much as the dot it fed — the profile put
+        // it at the top of the whole W2 decode.
+        let dot = unsafe {
+            use core::arch::aarch64::*;
+            let b = vld1_u8(ch.as_ptr());
+            let three = vdup_n_u8(3);
+            let c0 = vreinterpret_s8_u8(vand_u8(b, three));
+            let c1 = vreinterpret_s8_u8(vand_u8(vshr_n_u8(b, 2), three));
+            let c2 = vreinterpret_s8_u8(vand_u8(vshr_n_u8(b, 4), three));
+            let c3 = vreinterpret_s8_u8(vand_u8(vshr_n_u8(b, 6), three));
+            let x4 = vld4_s8(xg.as_ptr());
+            let mut acc4 = vdupq_n_s32(0);
+            acc4 = vpadalq_s16(acc4, vmull_s8(c0, x4.0));
+            acc4 = vpadalq_s16(acc4, vmull_s8(c1, x4.1));
+            acc4 = vpadalq_s16(acc4, vmull_s8(c2, x4.2));
+            acc4 = vpadalq_s16(acc4, vmull_s8(c3, x4.3));
+            vaddvq_s32(acc4)
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let dot: i32 = {
+            for (k, &b) in ch.iter().enumerate() {
+                codes[k * 4] = (b & 3) as i8;
+                codes[k * 4 + 1] = ((b >> 2) & 3) as i8;
+                codes[k * 4 + 2] = ((b >> 4) & 3) as i8;
+                codes[k * 4 + 3] = ((b >> 6) & 3) as i8;
+            }
+            codes
+                .iter()
+                .zip(xg)
+                .map(|(&c, &x)| c as i32 * x as i32)
+                .sum()
+        };
+        acc += scales[gi] * (dot as f32 - 1.5 * gsum[gi] as f32);
+    }
+    acc
+}
+
 /// Exact f32 dot of one q2tp row: 2-bit fields LSB-first, (c − 1.5)·s.
 /// Scalar on purpose — the 2-bit class targets the GPU graph; the CPU
 /// path exists for parity gates and small-machine fallback.
@@ -4407,6 +4642,31 @@ fn q2tp_matvec(
     let gpr = cols / GROUP_SIZE;
     let v = Q4tpView::new_q2(bytes, rows, cols);
     let out_addr = SendMut(out.as_mut_ptr());
+    // a8w8 fast path (CMF_SDOT=0 keeps the exact scalar walk): integer
+    // code dots + group sums, exact outlier correction — the same
+    // contract as every sibling kernel; measured 2-bit rows were the
+    // only scalar holdout in the family.
+    if a8w8_enabled() {
+        let act = split_act(x);
+        let gsum = q1_group_sums(&act.xq, gpr);
+        let (act, gsum) = (&act, &gsum);
+        let run = move |start: usize, end: usize| {
+            with_krow(gpr, |sc| {
+                for r in start..end {
+                    v.scales_into(r, gpr, sc);
+                    let mut acc = dot_q2tp_row_i8(v.nib, r, gpr, &act.xq, gsum, sc) * act.sx;
+                    for &(j, xv) in &act.outliers {
+                        let (w, s) = q2tp_outlier(v.nib, r, gpr, j, sc);
+                        acc += w * s * xv;
+                    }
+                    // SAFETY: disjoint row ranges per worker.
+                    unsafe { *out_addr.at(r) = acc };
+                }
+            })
+        };
+        dispatch_rows(pool, rows, &run);
+        return;
+    }
     let run = |start: usize, end: usize| {
         with_krow(gpr, |sc| {
             for r in start..end {
@@ -4455,7 +4715,18 @@ fn q2tp_matvec2(
 /// pointed at down-shaped tensors, and the private fns need a way to be
 /// held to a reference without a model file around them.
 pub fn q2tp_matvec_for_test(bytes: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
-    q2tp_matvec(bytes, x, rows, cols, out, None);
+    // The facade IS the reference: encoder oracles hold requant output
+    // to the exact scalar walk. The production dispatch may take the i8
+    // fast path, whose error scale is the ACTIVATIONS' — a different
+    // claim than the encoder correctness these tests pin.
+    let gpr = cols / GROUP_SIZE;
+    let v = Q4tpView::new_q2(bytes, rows, cols);
+    with_krow(gpr, |sc| {
+        for r in 0..rows {
+            v.scales_into(r, gpr, sc);
+            out[r] = q2tp_row_exact(v.nib, r, gpr, x, sc);
+        }
+    });
 }
 
 pub fn q2tp_matmat_for_test(
@@ -7931,6 +8202,32 @@ pub(crate) fn gpu_batch_job<'a>(
                 layout: crate::gpu::BatchLayout::Q1,
             },
         )),
+        // q4_tiled / q4tp: raw f32 activations; the scales live in the
+        // payload (inline tiles / row ladder), so row_scale stays empty.
+        // The GDN projection batch already runs these layouts on Metal —
+        // this arm lets the attention QKV batch reach the same kernels.
+        QTensor::Mapped {
+            model,
+            idx,
+            dtype: dt @ (TensorDtype::Q4Tiled | TensorDtype::Q4TiledP),
+            rows,
+            cols,
+            ..
+        } => Some((
+            model.clone(),
+            crate::gpu::BatchJob {
+                idx: *idx,
+                rows: *rows,
+                cols: *cols,
+                row_scale: &[],
+                xs: x.to_vec(),
+                layout: if *dt == TensorDtype::Q4Tiled {
+                    crate::gpu::BatchLayout::Q4t
+                } else {
+                    crate::gpu::BatchLayout::Q4tp
+                },
+            },
+        )),
         _ => None,
     }
 }
@@ -9125,6 +9422,32 @@ fn q8_range_f32(
     }
 }
 
+/// One q8 row against a split activation, portable: the per-arch fast
+/// dots where they exist, the exact scalar loop elsewhere. The scalar
+/// arm is also the test oracle for both fast arms.
+#[inline]
+fn q8_row_dot(row: &[u8], act: &SplitAct) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    return row_dot_sdot(row, act);
+    #[cfg(target_arch = "x86_64")]
+    return row_dot_avx2(row, act);
+    #[allow(unreachable_code)]
+    q8_row_dot_scalar(row, act)
+}
+
+#[allow(dead_code)]
+fn q8_row_dot_scalar(row: &[u8], act: &SplitAct) -> f32 {
+    let mut acc = 0i32;
+    for (k, &b) in row.iter().enumerate() {
+        acc += (b as i8) as i32 * act.xq[k] as i32;
+    }
+    let mut acc = acc as f32 * act.sx;
+    for &(j, xv) in &act.outliers {
+        acc += (row[j] as i8) as f32 * xv;
+    }
+    acc
+}
+
 /// SDOT row dot with exact outlier correction:
 /// `dot = sdot(w, xq)·sx + Σ_outl w[j]·x[j]` (then × row_scale by caller).
 #[cfg(target_arch = "aarch64")]
@@ -9626,6 +9949,52 @@ impl SendMut {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q2tp_i8_dot_matches_exact_on_grid() {
+        // On-grid activations (±1 → sx=1/127, xq=±127 dequantizes
+        // exactly, no outliers) must make the integer path agree with
+        // the exact scalar walk to f32 rounding.
+        let (rows, cols) = (5, 64);
+        let gpr = cols / GROUP_SIZE;
+        // Synthetic codes plane + a flat ladder: scales_into is not under
+        // test here, so drive dot_q2tp_row_i8 / q2tp_row_exact directly
+        // with hand-made scales.
+        let chunks: Vec<u8> = (0..rows * gpr * Q2TP_CHUNK)
+            .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+            .collect();
+        let scales: Vec<f32> = (0..gpr).map(|g| 0.5 + g as f32 * 0.25).collect();
+        let x: Vec<f32> = (0..cols).map(|i| if i % 3 == 0 { -1.0 } else { 1.0 }).collect();
+        let act = split_act(&x);
+        assert!(act.outliers.is_empty(), "on-grid input must have no outliers");
+        let gsum = q1_group_sums(&act.xq, gpr);
+        for r in 0..rows {
+            let exact = q2tp_row_exact(&chunks, r, gpr, &x, &scales);
+            let fast = dot_q2tp_row_i8(&chunks, r, gpr, &act.xq, &gsum, &scales) * act.sx;
+            assert!(
+                (exact - fast).abs() <= exact.abs() * 1e-5 + 1e-5,
+                "row {r}: exact {exact} vs i8 {fast}"
+            );
+        }
+    }
+
+    #[test]
+    fn q8_row_dot_fast_matches_scalar() {
+        // The per-arch fast dot must agree with the exact scalar oracle
+        // (same contract the fused q8 FFN arm rides on).
+        let cols = 96;
+        let row: Vec<u8> = (0..cols)
+            .map(|i| ((i as i32 * 37 % 251) - 125) as i8 as u8)
+            .collect();
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.13).sin()).collect();
+        let act = split_act(&x);
+        let fast = q8_row_dot(&row, &act);
+        let scalar = q8_row_dot_scalar(&row, &act);
+        assert!(
+            (fast - scalar).abs() <= scalar.abs() * 1e-5 + 1e-5,
+            "fast {fast} vs scalar {scalar}"
+        );
+    }
 
     #[test]
     fn f32_matvec_matches_matvec_rows_bitexact() {

@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-cli"
-version = "0.5.65"
+version = "0.5.66"
 dependencies = [
  "anyhow",
  "axum",
@@ -448,6 +448,7 @@ dependencies = [
  "clap",
  "cortiq-core",
  "cortiq-engine",
+ "cortiq-net",
  "cortiq-server",
  "ed25519-dalek",
  "memmap2",
@@ -462,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-core"
-version = "0.5.65"
+version = "0.5.66"
 dependencies = [
  "base64",
  "bincode",
@@ -477,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-engine"
-version = "0.5.65"
+version = "0.5.66"
 dependencies = [
  "anyhow",
  "ash",
@@ -501,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "cortiq-ffi"
-version = "0.5.65"
+version = "0.5.66"
 dependencies = [
  "cortiq-core",
  "cortiq-engine",
@@ -510,8 +511,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortiq-net"
+version = "0.5.66"
+dependencies = [
+ "bincode",
+ "cortiq-core",
+ "cortiq-engine",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "cortiq-server"
-version = "0.5.65"
+version = "0.5.66"
 dependencies = [
  "anyhow",
  "axum",
@@ -519,6 +532,7 @@ dependencies = [
  "chrono",
  "cortiq-core",
  "cortiq-engine",
+ "cortiq-net",
  "futures",
  "serde",
  "serde_json",

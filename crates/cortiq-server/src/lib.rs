@@ -81,6 +81,11 @@ pub struct AppState {
     pub runtime: CortiqRuntime,
     pub tokenizer: Arc<cortiq_engine::tokenizer::Tokenizer>,
     pub slots: PipelinePool,
+    /// Network pipeline-split worker (serve --peer). One worker holds one
+    /// KV session, so peer mode runs with exactly one slot; the mutex is
+    /// never contended (the slot semaphore already serializes) but keeps
+    /// the type honest.
+    pub remote: Option<Arc<std::sync::Mutex<cortiq_net::RemoteSegment>>>,
 }
 
 /// Liveness probe — returns 200 as soon as the server is accepting

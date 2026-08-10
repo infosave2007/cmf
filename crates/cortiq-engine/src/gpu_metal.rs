@@ -3125,6 +3125,151 @@ kernel void q4tp_matvec_jobs(
     }
 }
 
+// q2tp twin of `q4tp_matvec_jobs`: the 2-bit expert gate/up of the mixed
+// profile. Same ladder planes and 5-bit rung codes; two differences,
+// both local. The weight stride is 8 B per 32-weight group (a uint holds
+// SIXTEEN 2-bit fields, LSB-first — little-endian byte order makes
+// code_i = (word >> 2i) & 3 for the flat element order), and rung 0 of
+// the ladder is an EXACT ZERO (a pruned group must not come back as
+// noise): lad = lane == 0 ? 0 : 2^(lo + (lane-1)·step).
+inline float q2_dot16(uint b, float4 x0, float4 x1, float4 x2, float4 x3) {
+    const float4 h = float4(1.5f);
+    float4 c0 = float4((b      ) & 3u, (b >> 2u ) & 3u, (b >> 4u ) & 3u, (b >> 6u ) & 3u);
+    float4 c1 = float4((b >> 8u) & 3u, (b >> 10u) & 3u, (b >> 12u) & 3u, (b >> 14u) & 3u);
+    float4 c2 = float4((b >> 16u) & 3u, (b >> 18u) & 3u, (b >> 20u) & 3u, (b >> 22u) & 3u);
+    float4 c3 = float4((b >> 24u) & 3u, (b >> 26u) & 3u, (b >> 28u) & 3u, (b >> 30u) & 3u);
+    return dot(c0 - h, x0) + dot(c1 - h, x1) + dot(c2 - h, x2) + dot(c3 - h, x3);
+}
+
+kernel void q2tp_matvec_jobs(
+    device const uchar*  q       [[buffer(0)]],
+    device const float*  x       [[buffer(1)]],
+    device float*        y       [[buffer(2)]],
+    constant uint&       gpr     [[buffer(3)]],
+    constant uint&       rows    [[buffer(4)]],
+    device const ulong*  bases   [[buffer(5)]],
+    constant uint&       tg_per  [[buffer(6)]],
+    constant uint&       xstride [[buffer(7)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float lad[8u * 4u * 32u];
+
+    uint j   = tgpos / tg_per;
+    uint tgl = tgpos - j * tg_per;
+    device const uchar* qj = q + bases[j];
+    device const float* xj = x + (ulong)j * (ulong)xstride;
+    device float*       yj = y + (ulong)j * (ulong)rows;
+
+    uint r0 = (tgl * sgs + sg) * 4u;
+    bool active = r0 < rows;
+    uint nr = active ? min(rows - r0, 4u) : 0u;
+
+    ulong params_off = (ulong)rows * (ulong)gpr * 8ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint  stride     = (gpr * 5u + 7u) / 8u;
+
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* ph = (device const half*)(qj + params_off + (ulong)(r0 + ri) * 4ul);
+        float s = (lane == 0u)
+            ? 0.0f
+            : exp2((float)ph[0] + (float)(lane - 1u) * (float)ph[1]);
+        lad[(sg * 4u + ri) * 32u + lane] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint xb = g * 32u;
+        device const float4* xv = (device const float4*)(xj + xb);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        uint bit = g * 5u;
+        uint cb  = bit >> 3u;
+        uint shf = bit & 7u;
+        for (uint ri = 0u; ri < nr; ++ri) {
+            uint r = r0 + ri;
+            // 8 B chunks are 4-aligned in the blob — two uint loads.
+            device const uint* p32 = (device const uint*)(qj + ((ulong)r * gpr + (ulong)g) * 8ul);
+            uint b0 = p32[0], b1 = p32[1];
+            device const uchar* cp = qj + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            float scale = lad[(sg * 4u + ri) * 32u + code];
+            float gsum = q2_dot16(b0, x0, x1, x2, x3)
+                       + q2_dot16(b1, x4, x5, x6, x7);
+            float contrib = scale * gsum;
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    if (lane == 0u) {
+        yj[r0] = acc0;
+        if (nr > 1u) yj[r0 + 1u] = acc1;
+        if (nr > 2u) yj[r0 + 2u] = acc2;
+        if (nr > 3u) yj[r0 + 3u] = acc3;
+    }
+}
+
+// Single-thread top-k router select: deterministic mirror of the CPU
+// `moe_route` (softmax over ALL logits, k rounds of argmax with the
+// LOWER index winning ties, weights p/wsum with the norm_topk formula),
+// and it fills the JOBS BASES itself from per-expert offset tables —
+// the jobs kernels stay untouched. The shared expert rides the LAST
+// slot with its sigmoid gate. One thread: n_exp ≤ 256, k ≤ 16 — the
+// whole select is ~4k scalar ops, noise next to one expert matvec,
+// and a serial walk is the only ordering that matches torch.topk
+// bit for bit.
+kernel void moe_topk_select(
+    device const float* logits [[buffer(0)]],
+    device const float* slog   [[buffer(1)]],
+    device const ulong* gtbl   [[buffer(2)]],
+    device const ulong* utbl   [[buffer(3)]],
+    device const ulong* dtbl   [[buffer(4)]],
+    device const ulong* stbl   [[buffer(5)]],
+    device float*       w      [[buffer(6)]],
+    device ulong*       bgu    [[buffer(7)]],
+    device ulong*       bdn    [[buffer(8)]],
+    constant uint&      n_exp  [[buffer(9)]],
+    constant uint&      top_k  [[buffer(10)]],
+    constant uint&      norm   [[buffer(11)]],
+    constant float&     scale  [[buffer(12)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0u) return;
+    float p[256];
+    float mx = -3.0e38f;
+    for (uint i = 0u; i < n_exp; ++i) mx = max(mx, logits[i]);
+    float den = 0.0f;
+    for (uint i = 0u; i < n_exp; ++i) den += exp(logits[i] - mx);
+    for (uint i = 0u; i < n_exp; ++i) p[i] = exp(logits[i] - mx) / den;
+    float wsum = 0.0f;
+    uint k = top_k;
+    for (uint s = 0u; s < k; ++s) {
+        uint bi = 0u; float bv = -1.0f;
+        for (uint i = 0u; i < n_exp; ++i) {
+            if (p[i] > bv) { bv = p[i]; bi = i; }
+        }
+        w[s] = bv; wsum += bv;
+        bgu[s] = gtbl[bi];
+        bgu[k + 1u + s] = utbl[bi];
+        bdn[s] = dtbl[bi];
+        p[bi] = -2.0f;
+    }
+    float div = (norm != 0u) ? (wsum / scale) : (1.0f / scale);
+    for (uint s = 0u; s < k; ++s) w[s] = w[s] / div;
+    w[k] = 1.0f / (1.0f + exp(-slog[0]));
+    bgu[k] = stbl[0];
+    bgu[2u * k + 1u] = stbl[1];
+    bdn[k] = stbl[2];
+}
+
 // silu(gate)·up for every expert in one dispatch. `gu` holds all gate
 // rows followed by all up rows, as `q4tp_matvec_jobs` wrote them.
 kernel void moe_silu_jobs(
@@ -3771,6 +3916,10 @@ struct Ctx {
     /// Job-batched q4tp matvec + its two MoE companions: the whole
     /// expert block in four dispatches instead of four per expert.
     q4tpjobs: ComputePipelineState,
+    /// 2-bit gate/up jobs of the mixed MoE profile.
+    q2tpjobs: ComputePipelineState,
+    /// Single-thread top-k router select of the MoE graph item.
+    moesel: ComputePipelineState,
     moesilu: ComputePipelineState,
     moered: ComputePipelineState,
     q4tmm: ComputePipelineState,
@@ -3951,6 +4100,8 @@ fn init() -> Result<Ctx, String> {
     let q4t = pso("q4t_matvec")?;
     let q4tp = pso("q4tp_matvec")?;
     let q4tpjobs = pso("q4tp_matvec_jobs")?;
+    let q2tpjobs = pso("q2tp_matvec_jobs")?;
+    let moesel = pso("moe_topk_select")?;
     let moesilu = pso("moe_silu_jobs")?;
     let moered = pso("moe_reduce_jobs")?;
     let q4tmm = pso("q4t_mul_mm")?;
@@ -4015,6 +4166,8 @@ fn init() -> Result<Ctx, String> {
         q4t,
         q4tp,
         q4tpjobs,
+        q2tpjobs,
+        moesel,
         moesilu,
         moered,
         q4tmm,
@@ -7615,6 +7768,9 @@ fn moe_block_jobs_q4tp(
     let cmd = c.queue.new_command_buffer();
     // Encoder boundaries are the stage barriers (see the per-expert path).
     let sgs = 8u64;
+    // The mixed 2-bit profile packs gate/up q2tp while down stays q4tp —
+    // stage 1 flips kernels, stages 2..4 are dtype-blind.
+    let gu_q2 = jobs[0].gu_q2;
     let enc_jobs = |enc: &metal::ComputeCommandEncoderRef,
                     bases: &Buffer,
                     x: &Buffer,
@@ -7622,9 +7778,10 @@ fn moe_block_jobs_q4tp(
                     rows: usize,
                     cols: usize,
                     njob: usize,
-                    xstride: usize| {
+                    xstride: usize,
+                    q2: bool| {
         let tg_per = (rows as u64).div_ceil(sgs * 4);
-        enc.set_compute_pipeline_state(&c.q4tpjobs);
+        enc.set_compute_pipeline_state(if q2 { &c.q2tpjobs } else { &c.q4tpjobs });
         enc.set_buffer(0, Some(fbuf), 0);
         enc.set_buffer(1, Some(x), 0);
         enc.set_buffer(2, Some(y), 0);
@@ -7646,7 +7803,7 @@ fn moe_block_jobs_q4tp(
     // 1. gate and up for every expert — 2·ne jobs over the shared input.
     {
         let enc = cmd.new_compute_command_encoder();
-        enc_jobs(enc, &bases_gu, &xbuf, &gubuf, inter, gcols, ne * 2, 0);
+        enc_jobs(enc, &bases_gu, &xbuf, &gubuf, inter, gcols, ne * 2, 0, gu_q2);
         enc.end_encoding();
     }
     // 2. silu(gate)·up, all experts.
@@ -7668,7 +7825,7 @@ fn moe_block_jobs_q4tp(
     // 3. every expert's down projection — each reads its own activation row.
     {
         let enc = cmd.new_compute_command_encoder();
-        enc_jobs(enc, &bases_dn, &abuf, &dbuf, hidden, dcols, ne, inter);
+        enc_jobs(enc, &bases_dn, &abuf, &dbuf, hidden, dcols, ne, inter, false);
         enc.end_encoding();
     }
     // 4. weighted sum across experts.
@@ -7740,6 +7897,23 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
                     return false;
                 }
                 rows * (cols / GROUP_SIZE) * Q1_TILE
+            } else if j.gu_q2 && slot < 2 {
+                // Mixed profile: gate/up are q2tp planes; down (slot 2)
+                // falls through to the q4tp bound below.
+                if cols % GROUP_SIZE != 0 {
+                    moe_block_refused("q2tp cols alignment");
+                    return false;
+                }
+                match cortiq_core::quant::expected_nbytes(
+                    cortiq_core::TensorDtype::Q2TiledP,
+                    &[*rows, *cols],
+                ) {
+                    Some(n) => n,
+                    None => {
+                        moe_block_refused("q2tp expected_nbytes");
+                        return false;
+                    }
+                }
             } else if j.q4tp {
                 if cols % GROUP_SIZE != 0 {
                     moe_block_refused("q4tp cols alignment");
@@ -8134,13 +8308,45 @@ pub struct GdnGpuLayer<'a> {
     pub a: (&'a [f32], usize, usize),
     pub b: (&'a [f32], usize, usize),
     pub out: (usize, usize, usize),
-    pub gate: (usize, usize, usize),
-    pub up: (usize, usize, usize),
-    pub down: (usize, usize, usize),
+    pub ffn: MetalFfn<'a>,
     pub conv1d: &'a [f32],
     pub a_log: &'a [f32],
     pub dt_bias: &'a [f32],
     pub gnorm: &'a [f32],
+}
+
+/// The FFN of one token-graph layer: the dense SwiGLU trio, or a routed
+/// MoE whose router runs ON DEVICE — that is what lets a MoE layer live
+/// inside the un-committed command buffer instead of forcing a
+/// commit+wait per layer for a CPU routing round trip.
+pub enum MetalFfn<'a> {
+    Dense {
+        gate: (usize, usize, usize),
+        up: (usize, usize, usize),
+        down: (usize, usize, usize),
+    },
+    Moe(GpuMoe<'a>),
+}
+
+/// Softmax-router MoE with a gated shared expert — the scope the wgpu
+/// graph proved (sigmoid/bias/τ routers and per-expert scales refuse
+/// upstream in the plan builder).
+pub struct GpuMoe<'a> {
+    /// Router weight rows [n_exp × hidden], owned f32.
+    pub router: &'a [f32],
+    /// Shared-expert gate weight [1 × hidden], owned f32.
+    pub sgate: &'a [f32],
+    /// Routed experts' (gate, up, down) directory indices.
+    pub experts: Vec<(usize, usize, usize)>,
+    /// The shared expert's trio.
+    pub shared: (usize, usize, usize),
+    pub n_exp: usize,
+    pub top_k: usize,
+    pub inter: usize,
+    pub norm_topk: bool,
+    pub route_scale: f32,
+    /// Mixed 2-bit profile: q2tp gate/up over a q4tp down.
+    pub gu_q2: bool,
 }
 
 /// Shared dims of the block (identical across GDN layers of a model).
@@ -8178,9 +8384,7 @@ pub struct AttnGpuLayer<'a> {
     pub wk: (usize, usize, usize),
     pub wv: (usize, usize, usize),
     pub wo: (usize, usize, usize),
-    pub gate: (usize, usize, usize),
-    pub up: (usize, usize, usize),
-    pub down: (usize, usize, usize),
+    pub ffn: MetalFfn<'a>,
 }
 
 fn io_buf(c: &Ctx, key: usize, nbytes: usize) -> Buffer {
@@ -8538,6 +8742,58 @@ impl TokenGraph {
         Some((abs, rs_buf, col_buf))
     }
 
+    /// Pre-flight of a layer's FFN half (shared by both layer kinds).
+    fn ffn_ok(&self, f: &MetalFfn) -> bool {
+        match f {
+            MetalFfn::Dense { gate, up, down } => {
+                down.1 == self.dims.hidden
+                    && [gate, up, down].iter().all(|t| self.proj_abs(**t).is_some())
+            }
+            MetalFfn::Moe(m) => {
+                if m.n_exp == 0
+                    || m.n_exp > 256
+                    || m.top_k == 0
+                    || m.top_k >= 16
+                    || m.top_k > m.n_exp
+                    || m.experts.len() != m.n_exp
+                    || m.router.len() != m.n_exp * self.dims.hidden
+                    || m.sgate.len() != self.dims.hidden
+                    || m.inter % GROUP_SIZE != 0
+                    || self.dims.hidden % GROUP_SIZE != 0
+                {
+                    return false;
+                }
+                // Every expert trio bounds-checked against the mmap: the
+                // jobs kernels read raw offsets with no further checks.
+                let ok_at = |idx: usize, rows: usize, cols: usize, q2: bool| -> bool {
+                    let Some(entry) = self.model.tensors.get(idx) else {
+                        return false;
+                    };
+                    let Some(abs) = self.model.entry_abs_offset(entry) else {
+                        return false;
+                    };
+                    let dt = if q2 {
+                        cortiq_core::TensorDtype::Q2TiledP
+                    } else {
+                        cortiq_core::TensorDtype::Q4TiledP
+                    };
+                    match cortiq_core::quant::expected_nbytes(dt, &[rows, cols]) {
+                        Some(n) => abs + n <= self.safe_len && entry.dtype == dt,
+                        None => false,
+                    }
+                };
+                m.experts
+                    .iter()
+                    .chain(std::iter::once(&m.shared))
+                    .all(|&(g, u, d)| {
+                        ok_at(g, m.inter, self.dims.hidden, m.gu_q2)
+                            && ok_at(u, m.inter, self.dims.hidden, m.gu_q2)
+                            && ok_at(d, self.dims.hidden, m.inter, false)
+                    })
+            }
+        }
+    }
+
     /// Pre-flight check for a GDN layer (call before any encode).
     pub fn gdn_ok(&self, l: &GdnGpuLayer, cfg: &GdnGpuCfg) -> bool {
         if cfg.kk < 2 || cfg.dv % 32 != 0 || cfg.dv > 1024 || cfg.hidden != self.dims.hidden {
@@ -8546,21 +8802,23 @@ impl TokenGraph {
         if l.a.0.len() != l.a.1 * l.a.2 || l.b.0.len() != l.b.1 * l.b.2 {
             return false;
         }
-        [l.qkv, l.z, l.out, l.gate, l.up, l.down]
+        [l.qkv, l.z, l.out]
             .iter()
             .all(|t| self.proj_abs(*t).is_some())
+            && self.ffn_ok(&l.ffn)
     }
 
     /// Pre-flight check for a full-attention layer.
     pub fn attn_ok(&self, l: &AttnGpuLayer) -> bool {
         // The suffix reads the attention output back through ao (wo
         // cols) and writes hidden (wo rows) — both must match dims.
-        if l.wo.1 != self.dims.hidden || l.down.1 != self.dims.hidden {
+        if l.wo.1 != self.dims.hidden {
             return false;
         }
-        [l.wq, l.wk, l.wv, l.wo, l.gate, l.up, l.down]
+        [l.wq, l.wk, l.wv, l.wo]
             .iter()
             .all(|t| self.proj_abs(*t).is_some())
+            && self.ffn_ok(&l.ffn)
     }
 
     fn ensure_cmd(&mut self) -> metal::CommandBuffer {
@@ -8802,7 +9060,14 @@ impl TokenGraph {
         );
         // Fused: h += d_b, n = rmsnorm(h, post_norm) — one dispatch
         // instead of separate enc_axpy + rmsnorm.
-        self.encode_post_ffn(enc, l.post_norm, l.gate, l.up, l.down, Some(&self.d_b));
+        match &l.ffn {
+            MetalFfn::Dense { gate, up, down } => {
+                self.encode_post_ffn(enc, l.post_norm, *gate, *up, *down, Some(&self.d_b));
+            }
+            MetalFfn::Moe(m) => {
+                self.encode_post_moe_ffn(enc, l.post_norm, m, Some(&self.d_b));
+            }
+        }
     }
 
     /// Dims contract of the device-attend kernels (host-side check).
@@ -9146,6 +9411,185 @@ impl TokenGraph {
         disp_axpy(self.c, enc, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
     }
 
+    /// MoE twin of `encode_post_ffn`: router + top-k selection run ON
+    /// DEVICE (`moe_topk_select` fills the weight vector and the jobs
+    /// base tables), so the layer never leaves the shared command
+    /// buffer. Caller must have passed `ffn_ok` — offsets are trusted.
+    fn encode_post_moe_ffn(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        post_norm: &[f32],
+        m: &GpuMoe,
+        delta: Option<&Buffer>,
+    ) {
+        let c = self.c;
+        let ne = m.top_k + 1; // routed experts + the gated shared one
+        let inter = m.inter;
+        let hidden = self.dims.hidden;
+        // Directory index of the first routed gate — unique per layer,
+        // salts the static offset tables so layers don't share them.
+        let salt = m.experts[0].0;
+        let gt_b = io_buf(c, 40_000_000_231 + salt, m.n_exp * 8);
+        let ut_b = io_buf(c, 41_000_000_233 + salt, m.n_exp * 8);
+        let dt_b = io_buf(c, 42_000_000_239 + salt, m.n_exp * 8);
+        let st_b = io_buf(c, 43_000_000_241 + salt, 3 * 8);
+        // Rewritten every encode with identical bytes: cheap, and benign
+        // even if a prior committed buffer is still reading them.
+        let abs_of = |idx: usize| -> u64 {
+            self.model
+                .entry_abs_offset(&self.model.tensors[idx])
+                .unwrap() as u64
+        };
+        unsafe {
+            let (pg, pu, pd) = (
+                gt_b.contents() as *mut u64,
+                ut_b.contents() as *mut u64,
+                dt_b.contents() as *mut u64,
+            );
+            for (i, &(g, u, d)) in m.experts.iter().enumerate() {
+                *pg.add(i) = abs_of(g);
+                *pu.add(i) = abs_of(u);
+                *pd.add(i) = abs_of(d);
+            }
+            let ps = st_b.contents() as *mut u64;
+            *ps = abs_of(m.shared.0);
+            *ps.add(1) = abs_of(m.shared.1);
+            *ps.add(2) = abs_of(m.shared.2);
+        }
+        // GPU-written scratch, size-keyed like the dense FFN's buffers:
+        // shared across layers, hazard tracking serializes the reuse.
+        let lg_b = io_buf(c, 44_000_000_247 + m.n_exp, m.n_exp * 4);
+        let sl_b = io_buf(c, 45_000_000_249, 4);
+        let w_b = io_buf(c, 46_000_000_253 + ne, ne * 4);
+        let bgu_b = io_buf(c, 47_000_000_257 + ne, ne * 2 * 8);
+        let bdn_b = io_buf(c, 48_000_000_259 + ne, ne * 8);
+        let gu_b = io_buf(c, 49_000_000_261 + ne * inter, ne * 2 * inter * 4);
+        let a_b = io_buf(c, 50_000_000_263 + ne * inter, ne * inter * 4);
+        let eo_b = io_buf(c, 51_000_000_269 + ne * hidden, ne * hidden * 4);
+
+        // 1. Fused residual-add + RMSNorm — identical to the dense path.
+        {
+            let pn_buf = const_buf(c, post_norm);
+            enc.set_compute_pipeline_state(&c.addnorm);
+            enc.set_buffer(0, Some(&self.h_b), 0);
+            enc.set_buffer(1, Some(delta.unwrap_or(&self.h_b)), 0);
+            enc.set_buffer(2, Some(&pn_buf), 0);
+            enc.set_buffer(3, Some(&self.n_b), 0);
+            let n_u = hidden as u32;
+            let g_u = self.dims.gemma as u32;
+            let hd_u = delta.is_some() as u32;
+            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &g_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(
+                6,
+                4,
+                &self.dims.eps as *const f32 as *const std::ffi::c_void,
+            );
+            enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+        }
+        // 2. Router logits and the shared-expert gate logit (f32 rows).
+        let f32mv = |wb: &Buffer, y: &Buffer, rows: usize| {
+            enc.set_compute_pipeline_state(&c.f16mv);
+            enc.set_buffer(0, Some(wb), 0);
+            enc.set_buffer(1, Some(&self.n_b), 0);
+            enc.set_buffer(2, Some(y), 0);
+            let (cu, ru) = (hidden as u32, rows as u32);
+            enc.set_bytes(3, 4, &cu as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &ru as *const u32 as *const std::ffi::c_void);
+            let sgs = 8u64;
+            enc.dispatch_thread_groups(
+                MTLSize::new((rows as u64).div_ceil(sgs), 1, 1),
+                MTLSize::new(sgs * 32, 1, 1),
+            );
+        };
+        f32mv(&const_buf(c, m.router), &lg_b, m.n_exp);
+        f32mv(&const_buf(c, m.sgate), &sl_b, 1);
+        // 3. Top-k select: weights + jobs base tables, one thread.
+        {
+            enc.set_compute_pipeline_state(&c.moesel);
+            enc.set_buffer(0, Some(&lg_b), 0);
+            enc.set_buffer(1, Some(&sl_b), 0);
+            enc.set_buffer(2, Some(&gt_b), 0);
+            enc.set_buffer(3, Some(&ut_b), 0);
+            enc.set_buffer(4, Some(&dt_b), 0);
+            enc.set_buffer(5, Some(&st_b), 0);
+            enc.set_buffer(6, Some(&w_b), 0);
+            enc.set_buffer(7, Some(&bgu_b), 0);
+            enc.set_buffer(8, Some(&bdn_b), 0);
+            let ne_u = m.n_exp as u32;
+            let tk_u = m.top_k as u32;
+            let no_u = m.norm_topk as u32;
+            enc.set_bytes(9, 4, &ne_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(10, 4, &tk_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(11, 4, &no_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(
+                12,
+                4,
+                &m.route_scale as *const f32 as *const std::ffi::c_void,
+            );
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+        }
+        // 4-6. The jobs ladder of `moe_block_jobs_q4tp`, bases from the
+        // select kernel instead of the host.
+        let sgs = 8u64;
+        let enc_jobs = |bases: &Buffer,
+                        x: &Buffer,
+                        y: &Buffer,
+                        rows: usize,
+                        cols: usize,
+                        njob: usize,
+                        xstride: usize,
+                        q2: bool| {
+            let tg_per = (rows as u64).div_ceil(sgs * 4);
+            enc.set_compute_pipeline_state(if q2 { &c.q2tpjobs } else { &c.q4tpjobs });
+            enc.set_buffer(0, Some(&self.fbuf), 0);
+            enc.set_buffer(1, Some(x), 0);
+            enc.set_buffer(2, Some(y), 0);
+            let gpr_u = (cols / GROUP_SIZE) as u32;
+            let rows_u = rows as u32;
+            let tgp_u = tg_per as u32;
+            let xs_u = xstride as u32;
+            enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+            enc.set_buffer(5, Some(bases), 0);
+            enc.set_bytes(6, 4, &tgp_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(7, 4, &xs_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(tg_per * njob as u64, 1, 1),
+                MTLSize::new(sgs * 32, 1, 1),
+            );
+        };
+        enc_jobs(&bgu_b, &self.n_b, &gu_b, inter, hidden, ne * 2, 0, m.gu_q2);
+        {
+            enc.set_compute_pipeline_state(&c.moesilu);
+            enc.set_buffer(0, Some(&gu_b), 0);
+            enc.set_buffer(1, Some(&a_b), 0);
+            let n_u = inter as u32;
+            let ne_u = ne as u32;
+            enc.set_bytes(2, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(3, 4, &ne_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(
+                MTLSize::new((ne * inter) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+        enc_jobs(&bdn_b, &a_b, &eo_b, hidden, inter, ne, inter, false);
+        // 7. Weighted reduce into the delta, residual add — dense epilogue.
+        {
+            enc.set_compute_pipeline_state(&c.moered);
+            enc.set_buffer(0, Some(&eo_b), 0);
+            enc.set_buffer(1, Some(&w_b), 0);
+            enc.set_buffer(2, Some(&self.d_b), 0);
+            let n_u = hidden as u32;
+            let ne_u = ne as u32;
+            enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &ne_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256, 1, 1));
+        }
+        disp_axpy(c, enc, &self.d_b, &self.h_b, 1.0, hidden);
+    }
+
     /// Encode a run of consecutive GDN layers; recurrent states upload
     /// now and read back via `read_states` after the next `sync`.
     pub fn encode_gdn_run(
@@ -9163,13 +9607,13 @@ impl TokenGraph {
         let s_len = cfg.nv * cfg.dk * cfg.dv;
 
         // Resolve and validate every projection (Q1 or Q1T) before encoding.
-        let mut abss: Vec<[(usize, ProjKind); 6]> = Vec::with_capacity(layers.len());
+        let mut abss: Vec<[(usize, ProjKind); 3]> = Vec::with_capacity(layers.len());
         for (l, st) in layers.iter().zip(states) {
             if !self.gdn_ok(l, cfg) || st.len() != ring_len + s_len {
                 return false;
             }
-            let mut a8 = core::array::from_fn(|_| (0usize, ProjKind::Q1));
-            for (slot, t) in [l.qkv, l.z, l.out, l.gate, l.up, l.down].iter().enumerate() {
+            let mut a8: [(usize, ProjKind); 3] = core::array::from_fn(|_| (0usize, ProjKind::Q1));
+            for (slot, t) in [l.qkv, l.z, l.out].iter().enumerate() {
                 a8[slot] = self.proj_abs(*t).unwrap();
             }
             abss.push(a8);
@@ -9358,7 +9802,14 @@ impl TokenGraph {
             // Fused: h += d, n = rmsnorm(h, post_norm) — one dispatch.
             {
                 let enc = cmd.new_compute_command_encoder();
-                self.encode_post_ffn(enc, l.post_norm, l.gate, l.up, l.down, Some(&d_b));
+                match &l.ffn {
+                    MetalFfn::Dense { gate, up, down } => {
+                        self.encode_post_ffn(enc, l.post_norm, *gate, *up, *down, Some(&d_b));
+                    }
+                    MetalFfn::Moe(m) => {
+                        self.encode_post_moe_ffn(enc, l.post_norm, m, Some(&d_b));
+                    }
+                }
                 enc.end_encoding();
             }
         }
@@ -9954,5 +10405,124 @@ mod tests {
         }
         Q1_KERNEL_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Device `moe_topk_select` == the CPU routing semantics: softmax
+    /// over all logits, top-k descending with the LOWER index winning
+    /// ties, weight p/div with div = norm ? wsum/scale : 1/scale,
+    /// shared slot gated by sigmoid. Tables land in the jobs layout
+    /// (gates first, shared at k, ups after, shared up last).
+    #[test]
+    fn moe_topk_select_matches_cpu_route() {
+        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let Some(c) = ctx() else {
+            eprintln!("gpu test skipped: no Metal device");
+            return;
+        };
+        let (n_exp, top_k) = (64usize, 8usize);
+        let ne = top_k + 1;
+        let mut logits = vec![0f32; n_exp];
+        for (i, v) in logits.iter_mut().enumerate() {
+            *v = (((i * 37 + 11) % 101) as f32 / 101.0 - 0.5) * 4.0;
+        }
+        // A deliberate tie inside the winning set: the kernel must pick
+        // index 5 before 23 even though their masses are bit-equal.
+        logits[23] = logits[5];
+        let slog = [0.37f32];
+        let gtbl: Vec<u64> = (0..n_exp as u64).map(|i| 1000 + i * 7).collect();
+        let utbl: Vec<u64> = (0..n_exp as u64).map(|i| 2000 + i * 7).collect();
+        let dtbl: Vec<u64> = (0..n_exp as u64).map(|i| 3000 + i * 7).collect();
+        let stbl: Vec<u64> = vec![91, 92, 93];
+
+        for (norm, scale) in [(true, 2.5f32), (false, 1.0f32), (true, 1.0f32)] {
+            // Reference: the semantics of `moe_route`.
+            let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
+            let den: f32 = logits.iter().map(|&l| (l - mx).exp()).sum();
+            let p: Vec<f32> = logits.iter().map(|&l| (l - mx).exp() / den).collect();
+            let mut order: Vec<usize> = (0..n_exp).collect();
+            order.sort_by(|&a, &b| p[b].partial_cmp(&p[a]).unwrap().then(a.cmp(&b)));
+            let idx = &order[..top_k];
+            let wsum: f32 = idx.iter().map(|&e| p[e]).sum();
+            let div = if norm { wsum / scale } else { 1.0 / scale };
+            let want_w: Vec<f32> = idx.iter().map(|&e| p[e] / div).collect();
+            let want_shared = 1.0 / (1.0 + (-slog[0]).exp());
+
+            let buf = |bytes: &[u8]| {
+                c._device.new_buffer_with_data(
+                    bytes.as_ptr() as *const std::ffi::c_void,
+                    bytes.len() as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            };
+            let as_bytes = |v: &[u64]| -> Vec<u8> {
+                v.iter().flat_map(|x| x.to_le_bytes()).collect()
+            };
+            let lg_b = buf(unsafe {
+                std::slice::from_raw_parts(logits.as_ptr() as *const u8, n_exp * 4)
+            });
+            let sl_b = buf(&slog[0].to_le_bytes());
+            let gt_b = buf(&as_bytes(&gtbl));
+            let ut_b = buf(&as_bytes(&utbl));
+            let dt_b = buf(&as_bytes(&dtbl));
+            let st_b = buf(&as_bytes(&stbl));
+            let mk = |n: usize| {
+                c._device
+                    .new_buffer(n as u64, MTLResourceOptions::StorageModeShared)
+            };
+            let w_b = mk(ne * 4);
+            let bgu_b = mk(ne * 2 * 8);
+            let bdn_b = mk(ne * 8);
+
+            let cmd = c.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.moesel);
+            for (slot, b) in [
+                (0, &lg_b),
+                (1, &sl_b),
+                (2, &gt_b),
+                (3, &ut_b),
+                (4, &dt_b),
+                (5, &st_b),
+                (6, &w_b),
+                (7, &bgu_b),
+                (8, &bdn_b),
+            ] {
+                enc.set_buffer(slot, Some(b), 0);
+            }
+            let ne_u = n_exp as u32;
+            let tk_u = top_k as u32;
+            let no_u = norm as u32;
+            enc.set_bytes(9, 4, &ne_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(10, 4, &tk_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(11, 4, &no_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(12, 4, &scale as *const f32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            let got_w =
+                unsafe { std::slice::from_raw_parts(w_b.contents() as *const f32, ne) };
+            let got_gu =
+                unsafe { std::slice::from_raw_parts(bgu_b.contents() as *const u64, ne * 2) };
+            let got_dn =
+                unsafe { std::slice::from_raw_parts(bdn_b.contents() as *const u64, ne) };
+            for (s, &e) in idx.iter().enumerate() {
+                assert_eq!(got_gu[s], gtbl[e], "gate base slot {s} (norm={norm})");
+                assert_eq!(got_gu[ne + s], utbl[e], "up base slot {s}");
+                assert_eq!(got_dn[s], dtbl[e], "down base slot {s}");
+                let rel = (got_w[s] - want_w[s]).abs() / want_w[s].abs().max(1e-12);
+                assert!(
+                    rel < 1e-4,
+                    "w[{s}]: device {} vs cpu {} (norm={norm} scale={scale})",
+                    got_w[s],
+                    want_w[s]
+                );
+            }
+            assert_eq!(got_gu[top_k], stbl[0], "shared gate slot");
+            assert_eq!(got_gu[2 * top_k + 1], stbl[1], "shared up slot");
+            assert_eq!(got_dn[top_k], stbl[2], "shared down slot");
+            assert!((got_w[top_k] - want_shared).abs() < 1e-5, "shared weight");
+        }
     }
 }

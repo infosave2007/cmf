@@ -1,0 +1,374 @@
+//! The coordinator side: `RemoteSegment` speaks the wire protocol to one
+//! worker; `generate_split` is the split twin of `generate_from_ids` —
+//! deliberately the PLAIN path (no speculation, no whole-token graph, no
+//! task masks): correctness and honest timing first, the fast paths
+//! return per the roadmap once this one is measured.
+
+use crate::{
+    recv_msg, send_control, send_prefill, send_step, Frame, Msg, O1Wire, WireDtype, WIRE_VERSION,
+};
+use cortiq_core::TaskMask;
+use cortiq_engine::pipeline::{GenerateResult, Pipeline, TokenCallback};
+use std::net::TcpStream;
+use std::time::Instant;
+
+/// The model configuration a split session runs under — shipped in
+/// Assign so the worker mirrors it over its own layers.
+#[derive(Clone, Default)]
+pub struct SessionSpec {
+    /// Skill overlay id (worker reloads its pipeline with it).
+    pub skill: Option<String>,
+    /// Task-mask name (each side masks the layers IT runs).
+    pub task: Option<String>,
+    /// O(1)-attention config (worker mirrors it over its span).
+    pub o1: Option<O1Wire>,
+}
+
+pub struct RemoteSegment {
+    stream: TcpStream,
+    pub addr: String,
+    /// Layers [from ..= upto] the worker runs.
+    pub from: usize,
+    pub upto: usize,
+    /// Payload dtype both directions (negotiated at Assign).
+    pub dtype: WireDtype,
+    /// Accumulated wall time inside round trips (the wire + remote compute).
+    pub net_s: f64,
+    raw: Vec<u8>,
+    floats: Vec<f32>,
+}
+
+impl RemoteSegment {
+    /// Connect, handshake (wire version, token, dir_hash, geometry), and
+    /// assign the worker its span + wire dtype. Every refusal arrives as
+    /// a worker message, not a hang.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect(
+        addr: &str,
+        token: &str,
+        dir_hash: u64,
+        arch: &str,
+        num_layers: usize,
+        hidden_size: usize,
+        from: usize,
+        upto: usize,
+        dtype: WireDtype,
+        spec: &SessionSpec,
+    ) -> Result<Self, String> {
+        let stream = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|e| format!("set_nodelay: {e}"))?;
+        let mut rs = Self {
+            stream,
+            addr: addr.to_string(),
+            from,
+            upto,
+            dtype,
+            net_s: 0.0,
+            raw: Vec::with_capacity(64 * 1024),
+            floats: Vec::new(),
+        };
+        rs.send_ctl(&Frame::Hello {
+            wire: WIRE_VERSION,
+            token: token.to_string(),
+            dir_hash,
+            arch: arch.to_string(),
+            num_layers: num_layers as u32,
+            hidden_size: hidden_size as u32,
+        })?;
+        rs.expect_ack("hello")?;
+        rs.send_ctl(&Frame::Assign {
+            from: from as u32,
+            upto: upto as u32,
+            dtype: dtype.code(),
+            skill: spec.skill.clone(),
+            task: spec.task.clone(),
+            o1: spec.o1.clone(),
+        })?;
+        rs.expect_ack("assign")?;
+        Ok(rs)
+    }
+
+    fn send_ctl(&mut self, f: &Frame) -> Result<(), String> {
+        send_control(&mut self.stream, &mut self.raw, f)
+    }
+
+    fn recv(&mut self, spin: bool) -> Result<Msg, String> {
+        let mut floats = std::mem::take(&mut self.floats);
+        let r = recv_msg(&mut self.stream, &mut self.raw, &mut floats, spin);
+        self.floats = floats;
+        match r? {
+            Some(Msg::Control(Frame::Err { msg })) => Err(format!("worker {}: {msg}", self.addr)),
+            Some(m) => Ok(m),
+            None => Err(format!("worker {} hung up", self.addr)),
+        }
+    }
+
+    fn expect_ack(&mut self, what: &str) -> Result<(), String> {
+        match self.recv(false)? {
+            Msg::Control(Frame::Ack { err }) if err.is_empty() => Ok(()),
+            Msg::Control(Frame::Ack { err }) => {
+                Err(format!("worker {} refused {what}: {err}", self.addr))
+            }
+            other => Err(format!(
+                "worker {}: expected Ack after {what}, got {other:?}",
+                self.addr
+            )),
+        }
+    }
+
+    /// Wait for a Hidden reply; the payload lands in `self.floats`.
+    fn expect_hidden(&mut self) -> Result<(), String> {
+        match self.recv(true)? {
+            Msg::Hidden => Ok(()),
+            other => Err(format!(
+                "worker {}: expected Hidden, got {other:?}",
+                self.addr
+            )),
+        }
+    }
+
+    pub fn reset(&mut self) -> Result<(), String> {
+        self.send_ctl(&Frame::Reset)?;
+        self.expect_ack("reset")
+    }
+
+    /// Ship `count` boundary hiddens (flattened) fire-and-forget: the
+    /// worker chews them while we compute the next chunk; `sync()` is
+    /// the barrier.
+    pub fn prefill_send(
+        &mut self,
+        start_pos: usize,
+        count: usize,
+        flat: &[f32],
+    ) -> Result<(), String> {
+        let mut raw = std::mem::take(&mut self.raw);
+        let r = send_prefill(
+            &mut self.stream,
+            &mut raw,
+            self.dtype,
+            start_pos as u64,
+            count as u32,
+            flat,
+        );
+        self.raw = raw;
+        r
+    }
+
+    /// Prefill barrier: the last prefill position's output lands in
+    /// `self.floats` (returned as a slice).
+    pub fn sync(&mut self) -> Result<&[f32], String> {
+        self.send_ctl(&Frame::Sync)?;
+        self.expect_hidden()?;
+        Ok(&self.floats)
+    }
+
+    /// One decode step; the boundary hidden goes out, the worker's output
+    /// comes back in `self.floats` (returned as a slice).
+    pub fn step(&mut self, pos: usize, hidden: &[f32]) -> Result<&[f32], String> {
+        let t = Instant::now();
+        let mut raw = std::mem::take(&mut self.raw);
+        let r = send_step(&mut self.stream, &mut raw, self.dtype, pos as u64, hidden);
+        self.raw = raw;
+        r?;
+        self.expect_hidden()?;
+        self.net_s += t.elapsed().as_secs_f64();
+        Ok(&self.floats)
+    }
+}
+
+/// Measured split telemetry for the caller to print — the numbers that
+/// decide whether this topology pays on this wire.
+pub struct SplitStats {
+    pub prefill_s: f64,
+    pub decode_s: f64,
+    /// Time inside remote round trips (wire + remote compute), all phases.
+    pub net_s: f64,
+    pub remote_steps: usize,
+    /// Positions actually prefilled this call (< prompt length when the
+    /// cross-turn KV reuse kicked in).
+    pub prefilled: usize,
+}
+
+/// Split generation: coordinator runs layers [0..remote.from) plus
+/// embed / final norm / head / sampler; the worker runs the rest.
+/// `remote.from == 0` is legal (worker runs every layer; the coordinator
+/// still embeds and samples) — useful for loading a remote box fully.
+pub fn generate_split(
+    p: &mut Pipeline,
+    remote: &mut RemoteSegment,
+    input_ids: &[u32],
+    max_tokens: usize,
+    task_mask: Option<&TaskMask>,
+    mut on_token: Option<TokenCallback>,
+) -> Result<(GenerateResult, SplitStats), String> {
+    p.split_supported()?;
+    if input_ids.is_empty() {
+        return Err("empty prompt: nothing to generate from".to_string());
+    }
+    if remote.upto + 1 != p.num_layers {
+        return Err(format!(
+            "v1 topology holds the TAIL on the worker: upto {} must be the last layer {}",
+            remote.upto,
+            p.num_layers - 1
+        ));
+    }
+    let split = remote.from;
+    let hs = p.hidden_size;
+
+    // Cross-turn KV reuse, mirroring generate_from_ids: when the new ids
+    // strictly EXTEND what both sides already hold, prefill only the
+    // tail — chat turn latency stays proportional to the new text, not
+    // the whole session. Extension-only (no rollback); the worker's KV
+    // advanced in lockstep, so its state is the coordinator's history.
+    let reuse_from = {
+        let on = !std::env::var("CMF_KV_REUSE").is_ok_and(|v| v == "0");
+        let h = &p.kv_history;
+        // o1 excluded, as locally: the Nyström insertion is irreversible
+        // and re-sealing over a reused prefix is not the same state.
+        if on
+            && !p.o1_active()
+            && task_mask.is_none()
+            && !h.is_empty()
+            && h.len() < input_ids.len()
+            && input_ids[..h.len()] == h[..]
+        {
+            h.len()
+        } else {
+            0
+        }
+    };
+    if reuse_from == 0 {
+        p.reset_session();
+        p.o1_begin();
+        remote.reset()?;
+    }
+    remote.net_s = 0.0;
+
+    // ── Prefill: pipelined — the worker chews chunk k while we compute
+    // chunk k+1; one barrier (Sync) at the end. Wall ≈ max(sides), not sum.
+    let t_prefill = Instant::now();
+    let chunk = cortiq_engine::pipeline::prefill_chunk();
+    let mut flat: Vec<f32> = Vec::with_capacity(chunk * hs);
+    let mut pos = reuse_from;
+    while pos < input_ids.len() {
+        let end = (pos + chunk).min(input_ids.len());
+        if split > 0 {
+            // Layer-major batched walk over the local span — the same
+            // GEMM/graph machinery as local prefill, cut at the boundary.
+            flat = p.prefill_span_ids(&input_ids[pos..end], pos, split - 1, task_mask)?;
+        } else {
+            flat.clear();
+            for &id in &input_ids[pos..end] {
+                flat.extend_from_slice(&p.embed_id(id));
+            }
+        }
+        remote.prefill_send(pos, end - pos, &flat)?;
+        pos = end;
+        if p.cancel.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            // Partial prompt in both KVs — poison the reuse history.
+            p.kv_history.clear();
+            return Ok((
+                result(String::new(), Vec::new(), input_ids.len(), "cancelled"),
+                stats(t_prefill.elapsed().as_secs_f64(), 0.0, remote),
+            ));
+        }
+    }
+    // Prompt absorbed on the local span — freeze o1 skeletons exactly
+    // where the local path would; the worker seals at Sync.
+    p.o1_seal();
+    let last_hidden = remote.sync()?.to_vec();
+    let prefill_s = t_prefill.elapsed().as_secs_f64();
+    // From here net_s counts DECODE round trips only — the honest share.
+    remote.net_s = 0.0;
+
+    // ── Decode: one local span + one round trip + head per token ──
+    let t_decode = Instant::now();
+    let mut all_ids = input_ids.to_vec();
+    let mut token_ids = Vec::new();
+    let mut text = String::new();
+    let mut finish_reason = "max_tokens".to_string();
+    let mut remote_steps = 0usize;
+
+    let mut logits = p.logits_from_hidden(&last_hidden);
+    let mut next = p.sample_next(&logits, &all_ids);
+    let mut next_pos = input_ids.len();
+
+    while token_ids.len() < max_tokens {
+        // Commit `next` (mirrors generate_from_ids: EOS stops unemitted).
+        all_ids.push(next);
+        token_ids.push(next);
+        if p.tokenizer.is_eos(next) {
+            finish_reason = "stop".to_string();
+            break;
+        }
+        let piece = p.tokenizer.decode_token(next);
+        text.push_str(&piece);
+        if let Some(cb) = on_token.as_mut() {
+            if !cb(&piece) {
+                finish_reason = "cancelled".to_string();
+                break;
+            }
+        }
+        if p.cancel.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            finish_reason = "cancelled".to_string();
+            break;
+        }
+        if token_ids.len() == max_tokens {
+            break;
+        }
+
+        let emb = p.embed_id(next);
+        let boundary = if split > 0 {
+            p.forward_span(&emb, next_pos, 0, split - 1, task_mask)?
+        } else {
+            emb
+        };
+        remote.step(next_pos, &boundary)?;
+        remote_steps += 1;
+        next_pos += 1;
+        logits = p.logits_from_hidden(&remote.floats);
+        next = p.sample_next(&logits, &all_ids);
+    }
+
+    let decode_s = t_decode.elapsed().as_secs_f64();
+    // The forwarded prefix = everything except the last committed token
+    // (sampled but never forwarded) — the exact state both KVs hold, and
+    // the reuse key for the next turn.
+    let fwd = all_ids.len() - usize::from(!token_ids.is_empty());
+    p.kv_history = all_ids[..fwd].to_vec();
+    let mut st = stats(prefill_s, decode_s, remote);
+    st.remote_steps = remote_steps;
+    st.prefilled = input_ids.len() - reuse_from;
+    Ok((result(text, token_ids, input_ids.len(), &finish_reason), st))
+}
+
+fn result(
+    text: String,
+    token_ids: Vec<u32>,
+    prompt_tokens: usize,
+    finish_reason: &str,
+) -> GenerateResult {
+    GenerateResult {
+        text,
+        tokens_generated: token_ids.len(),
+        token_ids,
+        prompt_tokens,
+        finish_reason: finish_reason.to_string(),
+        mtp_drafted: 0,
+        mtp_accepted: 0,
+        token_confidence: Vec::new(),
+        traces: Vec::new(),
+    }
+}
+
+fn stats(prefill_s: f64, decode_s: f64, remote: &RemoteSegment) -> SplitStats {
+    SplitStats {
+        prefill_s,
+        decode_s,
+        net_s: remote.net_s,
+        remote_steps: 0,
+        prefilled: 0,
+    }
+}
