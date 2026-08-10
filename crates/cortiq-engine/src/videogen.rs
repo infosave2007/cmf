@@ -228,6 +228,7 @@ fn mmh3_gpu_parity_probe(path: &Path) -> Result<bool, String> {
             && t.name.ends_with("attn.qkv_proj.weight")
             && t.dtype == cortiq_core::TensorDtype::Q4TiledP
     }) else {
+        tracing::info!("mmh3 GPU parity probe: no q4tp qkv tensor — host path");
         return Ok(false);
     };
     let entry = &model.tensors[idx];
@@ -239,7 +240,21 @@ fn mmh3_gpu_parity_probe(path: &Path) -> Result<bool, String> {
         *v = base * if i % 7 == 0 { 2000.0 } else { 2.0 };
     }
     let mut gpu = vec![0f32; b * rows];
+    if std::env::var("CMF_GPU_DEBUG").is_ok() {
+        eprintln!(
+            "mmh3 probe env: CMF_GPU={:?} enabled={} avail={}",
+            std::env::var("CMF_GPU").ok(),
+            crate::gpu::enabled(),
+            crate::gpu::backend_available(),
+        );
+    }
     if !crate::gpu::q4tp_matmat(&model, idx, &xs, b, rows, cols, &mut gpu) {
+        tracing::info!(
+            "mmh3 GPU parity probe: q4tp_matmat refused ({rows}x{cols}) — host path"
+        );
+        if std::env::var("CMF_GPU_DEBUG").is_ok() {
+            eprintln!("mmh3 probe: q4tp_matmat refused {rows}x{cols}");
+        }
         return Ok(false);
     }
     let host = {

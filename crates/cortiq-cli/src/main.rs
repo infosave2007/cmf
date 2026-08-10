@@ -3483,28 +3483,17 @@ fn cmd_animate(
     quality: u32,
     out: &str,
 ) -> anyhow::Result<()> {
-    // The wgpu wide-GEMM arm is WRONG on this stack: measured on an RTX
-    // PRO 6000 Blackwell, the DiT's first step disagrees with the host
-    // (audio velocity rms 0.15 against 1.01) and the second returns
-    // NaN. The engine's op probe alternates arms to time them, so it
-    // runs the bad one for real before it has anything to compare, and
-    // it brings the backend up before any in-engine gate of ours can
-    // speak. So the decision is made HERE, before the first engine
-    // call. `CMF_MMH3_GPU=1` — or an explicit `CMF_GPU` — opts back in.
-    if std::env::var_os("CMF_GPU").is_none()
-        && std::env::var("CMF_MMH3_GPU").ok().as_deref() != Some("1")
-    {
-        // SAFETY: no engine thread exists yet — this is the first thing
-        // the subcommand does.
-        unsafe { std::env::set_var("CMF_GPU", "0") };
-    }
-    // The cooperative-matrix GEMM takes f16 operands, and this model's
-    // packed sequence runs it out of range: at 256x160 the render is
-    // correct, at 512x288 the audio stream goes NaN on the second step
-    // and the video follows. Bisected — `CMF_BAKE_GPU=0` does not help,
-    // `CMF_COOP=0` does. Tensor cores are worth having here, so this is
-    // a hold and not a verdict; until the kernel carries a scale, the
-    // device path runs on the f32 arm.
+    // GPU-vs-host is decided by the ENGINE's parity probe on this
+    // file's own first qkv weight (videogen::mmh3_gpu_parity_probe):
+    // the arm that renders is the arm that got probed, per stack —
+    // measured wrong on an RTX PRO 6000, healthy on 2×RTX 5090.
+    // CMF_MMH3_GPU=1/0 and an explicit CMF_GPU still force.
+    //
+    // The cooperative-matrix GEMM stays OFF here regardless: its f16
+    // operands run out of range at this model's packed-sequence scale
+    // (256x160 correct, 512x288 NaN on step 2 — bisected, CMF_COOP=0
+    // is the fix). Until the kernel carries a per-row scale, the
+    // device path runs on the f32 arm, which the probe covers.
     if std::env::var_os("CMF_COOP").is_none() {
         // SAFETY: as above.
         unsafe { std::env::set_var("CMF_COOP", "0") };
