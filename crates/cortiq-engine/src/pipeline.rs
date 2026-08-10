@@ -2922,7 +2922,14 @@ impl Pipeline {
         self.o1_begin();
         let mut hidden = vec![0.0f32; self.hidden_size];
         let mut pos = 0usize;
-        if self.can_prefill_batched() && ids.len() > 2 {
+        // Same routing predicate generation uses. Two reasons it must be
+        // the same one: (1) a GDN hybrid's recurrent state is GPU-
+        // resident, and a batched CPU prefill would build it on the host
+        // only — decode then reads buffers the prefill never wrote;
+        // (2) bench times THIS function and calls the result "prefill",
+        // so a different path here reports a number production never
+        // sees (W2 on 2×5090: 8.7 tok/s reported against 125 real).
+        if self.can_prefill_batched() && !self.graph_prefill_preferred() && ids.len() > 2 {
             // prefill-GEMM in chunks; only the last position's hidden is
             // needed. (o1-compatible: the batch path attends per position
             // through qwen_attention, which carries the collection hook.)
@@ -2935,10 +2942,16 @@ impl Pipeline {
                 pos = end;
             }
         }
-        // Same guards as generation's prefill: CMF_PAIR=0 opts out, and a
-        // model whose layers live outside `weights.layers` has no pair walk
-        // to take (the tail loop below covers every position either way).
+        // Same guards as generation's prefill — INCLUDING the graph one.
+        // The CPU pair walk was intercepting positions that the resident
+        // token graph would have run itself: on a GDN hybrid over wgpu
+        // that is 89 ms of host forward against 7 ms of device submit,
+        // and it made prefill look 12× slower than it is (W2 on an RTX
+        // 5090, ctx 512: 11.2 tok/s with the walk, 136.6 without).
+        // CMF_PAIR=0 opts out; a model whose layers live outside
+        // `weights.layers` has no pair walk to take.
         if task_mask.is_none()
+            && !self.graph_prefill_preferred()
             && !std::env::var("CMF_PAIR").is_ok_and(|v| v == "0")
             && self.pair_supported()
         {
