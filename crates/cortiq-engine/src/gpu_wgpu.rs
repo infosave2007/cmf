@@ -10136,6 +10136,13 @@ fn ctx_for(dev: usize) -> Option<&'static Ctx> {
     built
 }
 
+/// Weight budget of the current device, in bytes (0 when there is no
+/// device). What `serve --gpus` asks before deciding between replicas
+/// and a layer split.
+pub fn device_vram_budget() -> u64 {
+    ctx().map(|c| c.vram_budget).unwrap_or(0)
+}
+
 /// How many adapters this build can see (0 when the backend is off).
 pub fn adapter_count() -> usize {
     if !selected() {

@@ -647,6 +647,20 @@ pub fn device_count() -> usize {
     }
 }
 
+/// Weight budget of the current GPU in bytes; 0 when there is none and
+/// u64::MAX on unified memory (where the OS pages shared RAM and the
+/// question "does the model fit the card" has no separate answer).
+pub fn vram_budget() -> u64 {
+    #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+    {
+        return crate::gpu_wgpu::device_vram_budget();
+    }
+    #[cfg(not(all(feature = "gpu", not(target_os = "macos"))))]
+    {
+        if backend_available() { u64::MAX } else { 0 }
+    }
+}
+
 /// Device weight bytes uploaded so far (wgpu; 0 on other backends).
 /// Steady-state windows must show a ZERO delta — growth mid-benchmark
 /// means eviction/re-upload and disqualifies the number.

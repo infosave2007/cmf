@@ -48,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1.00×)** — where the TCP split cost 0.77–0.85×. Output stays
   byte-identical to the single-card run on both. `--peer` remains the
   answer for a model bigger than one HOST.
+- **`serve --gpus N` picks the right mode by itself.** Replicas need the
+  model to fit one card; when it does not, the honest answer is the
+  layer split, and the server now says which mode it took and why
+  (weights vs the card's measured budget) instead of refusing or
+  thrashing N copies.
 - **`cortiq serve --gpus N`: N GPU replicas in ONE process, and the
   multi-GPU mode that actually scales.** Each slot holds the whole
   model on its own card and serves whole requests, so N requests decode
