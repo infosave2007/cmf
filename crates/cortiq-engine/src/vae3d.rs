@@ -424,6 +424,40 @@ impl VideoVae {
             for (o, src) in xn.chunks_exact_mut(dim).zip(x.chunks_exact(dim)) {
                 rms_norm_into(src, &blk.norm2, self.eps, o);
             }
+            // Device-resident FFN when both weights are q4tp: fc1 →
+            // SwiGLU (with this VAE's gate/up bias) → fc2 without the
+            // intermediate panel crossing the bus twice per block.
+            // CMF_VAE3D_FFN=cpu forces the host chain.
+            if std::env::var("CMF_VAE3D_FFN").as_deref() != Ok("cpu")
+                && crate::gpu::enabled_here()
+                && n >= 64
+            {
+                if let (Proj::Q(q1), Proj::Q(q2)) = (&blk.w1, &blk.w2) {
+                    if let (Some((m, i1)), Some((_, i2))) =
+                        (q1.mapped_q4tp(), q2.mapped_q4tp())
+                    {
+                        let mut fout = vec![0f32; n * dim];
+                        if crate::gpu::q4tp_ffn_packed(
+                            m,
+                            i1,
+                            i2,
+                            &xn,
+                            n,
+                            dim,
+                            inner,
+                            Some(&blk.w1_b),
+                            &mut fout,
+                        ) {
+                            for (p, r) in fout.chunks_exact(dim).enumerate() {
+                                for (i, v) in r.iter().enumerate() {
+                                    x[p * dim + i] += (*v + blk.w2_b[i]) * blk.scale2[i];
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
             let mut gu = vec![0f32; n * 2 * inner];
             blk.w1.matmat(&xn, n, &mut gu, pool);
             let mut act = vec![0f32; n * inner];

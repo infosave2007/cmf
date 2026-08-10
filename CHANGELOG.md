@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The video FFN runs end to end on the device — a render is now
+  716.6 s → 137.4 s (5.2×).** MiniMax's DiT and the 3D VAE both use a
+  SwiGLU whose fc1 emits gate and up PACKED in one row, so neither could
+  reach the existing fused path; each block shipped its intermediate
+  panel across the bus twice (at render size ~660 MB down and ~330 MB
+  back up, per block, per step). `q4tp_ffn_packed` keeps fc1 → SwiGLU →
+  fc2 in device buffers: one upload, one readback. DiT step at 256×160:
+  **16.0 s → 6.4 s**; full render **251.9 s → 137.4 s**, frames within
+  2.6% of the host reference. `CMF_MMH3_FFN=cpu` / `CMF_VAE3D_FFN=cpu`
+  force the host chain.
+
+### Fixed
+- **`.min(MAX_WG)` on a 1-D dispatch is silent corruption, not a
+  guard.** wgpu caps each grid dimension at 65 535; clamping x means the
+  tail of the data keeps whatever the buffer held. It bit twice today —
+  the q4tp plane dequantized a fifth of its weights, and the SwiGLU left
+  most activations untouched (frames 92% smaller, i.e. nearly blank, at
+  512×288 while 256×160 looked perfect). Both now dispatch 2-D and index
+  `gid.y·(65535·256) + gid.x`.
+- **A fused chain must carry the activation scale to EVERY cooperative
+  GEMM in it.** The second GEMM of the packed FFN read its input from a
+  device panel the host never sees, so no scale could be computed for it
+  and its f16 operands overflowed. It runs the scalar arm — which reads
+  f32 directly — until a device-side max reduction can feed the scale.
+
+### Added
 - **A real gate under the tensor-core GEMM.** The neighbouring coop test
   only PRINTED its worst relative error, so the f16 operands, the
   activation scale and the unpacked plane could all drift unwatched.

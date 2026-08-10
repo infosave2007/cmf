@@ -1204,6 +1204,31 @@ pub fn q4t_qkv(
 
 /// y=·W2ᵀ — one command buffer, only X and Y cross the CPU boundary.
 #[allow(unused_variables, clippy::too_many_arguments)]
+/// SwiGLU FFN with a row-packed [gate|up] fc1 (MiniMax-H3's DiT), run
+/// end to end on the device. wgpu only: Metal keeps the host loop until
+/// its own packed kernel exists.
+#[allow(clippy::too_many_arguments, unused_variables)]
+pub fn q4tp_ffn_packed(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => {
+            crate::gpu_wgpu::q4tp_ffn_packed(model, w1, w2, xs, b, hidden, inter, bias, out)
+        }
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 pub fn q4tp_ffn(
     model: &Arc<CmfModel>,
     w1: usize,
