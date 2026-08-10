@@ -1896,9 +1896,25 @@ async fn cmd_serve(
                 budget as f64 / 1e9,
             );
         } else {
-            slots = n;
-            devices = (0..n).collect();
-            println!("    Реплики: {n} карт × полная модель — по запросу на карту");
+            // One slot per card by default. The frame profiler shows a
+            // decode dispatch leaves this class of GPU mostly idle (a
+            // 2048-hidden layer is 30-70 µs of work where the card
+            // wants thousands of workgroups), which suggests a second
+            // slot could interleave into the gaps — MEASURED, and it
+            // does not: on 2×RTX 5090, four concurrent requests over
+            // four slots ran 185 tok/s against 210 over two. They
+            // contend for the queue and for the CPU pool instead of
+            // overlapping. The knob stays for hardware that disagrees.
+            let per_gpu = std::env::var("CMF_SLOTS_PER_GPU")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(1);
+            slots = n * per_gpu;
+            devices = (0..slots).map(|i| i % n).collect();
+            println!(
+                "    Реплики: {n} карт × полная модель, {slots} слот(ов) —                  {per_gpu} на карту"
+            );
         }
     }
     if peer.is_some() && slots != 1 {
