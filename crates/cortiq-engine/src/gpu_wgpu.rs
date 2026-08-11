@@ -31181,6 +31181,19 @@ pub fn dit_block_seg(
     // verdict is caching the unpacked plane across steps rather than
     // re-encoding it: 30 steps pay 30 times for a weight that never
     // moves.
+    //
+    // The cache was then BUILT (`plane_cached`) and it did not change the
+    // verdict: 11.36 s cached against 11.05 scalar. So the unpack was
+    // never the cost, and the reason is bytes rather than work — an f16
+    // plane is FOUR TIMES the q4 weight it came from (10.6 MB against
+    // 2.65 here). A GEMM this narrow is bound by reading the weight, so
+    // the in-loop unpack spends ALU that is free in that regime while
+    // the plane spends bandwidth that is not.
+    //
+    // That is the rule, and it explains the video DiT's 22.1 → 14.7 too:
+    // dequantize-once wins where the weight is re-read per activation
+    // tile often enough to amortize four times the bytes. Judge it by
+    // tokens per weight byte, not by "tensor cores are faster".
     let coop16 = std::env::var("CMF_DIT_COOP16").as_deref() == Ok("1")
         && a.q4tp
         && c.q4tp_mm_coop_f16.is_some()
