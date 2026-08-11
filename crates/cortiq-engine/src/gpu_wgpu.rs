@@ -9998,6 +9998,7 @@ struct Scratch {
     vcc: Option<(wgpu::Buffer, u64)>,
     vcy: Option<(wgpu::Buffer, u64)>,
     vcs: Option<(wgpu::Buffer, u64)>,
+    vcb: Option<(wgpu::Buffer, u64)>,
     bst: Option<(wgpu::Buffer, u64)>,
     /// The FFN chain's device-resident middle (gate+up plane, activation).
     bb: Option<(wgpu::Buffer, u64)>,
@@ -29575,7 +29576,7 @@ pub fn vae_conv2d_coop(
             Scratch::ensure(
                 &c.device,
                 &mut sc.vcs,
-                (tile * oc * 4) as u64,
+                (hw * oc * 4) as u64,
                 wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 "vae-conv-stage",
             ),
@@ -29583,7 +29584,23 @@ pub fn vae_conv2d_coop(
     };
     c.queue
         .write_buffer(&xb, 0, bytemuck::cast_slice(&x[..ic * hw]));
-    let mut yt = vec![0f32; tile * oc];
+    // Every tile lands in ONE device buffer and comes home once. Reading
+    // each tile back instead drains the queue per tile — eighteen stalls
+    // in a 512×512 conv, which is why the first version of this was no
+    // faster than the scalar kernel it replaced.
+    let ybig = {
+        let mut sc = c.scratch.lock().unwrap();
+        Scratch::ensure(
+            &c.device,
+            &mut sc.vcb,
+            (hw * oc * 4) as u64,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            "vae-conv-all",
+        )
+    };
+    let mut yt = vec![0f32; hw * oc];
     let mut p0 = 0usize;
     while p0 < hw {
         let t = tile.min(hw - p0);
@@ -29642,20 +29659,47 @@ pub fn vae_conv2d_coop(
             pass.set_bind_group(0, &bgg, &[]);
             pass.dispatch_workgroups((oc as u32).div_ceil(64), (t as u32).div_ceil(64), 1);
         }
-        if !readback(c, enc, &yb, &stage, (t * oc * 4) as u64, &mut yt[..t * oc]) {
-            return false;
-        }
-        // [t, oc] → NCHW, bias on the way.
-        for o in 0..oc {
-            let b = bias.map_or(0.0, |bb| bb[o]);
-            let dst = &mut out[o * hw + p0..o * hw + p0 + t];
-            for (j, d) in dst.iter_mut().enumerate() {
-                *d = yt[j * oc + o] + b;
-            }
-        }
+        enc.copy_buffer_to_buffer(&yb, 0, &ybig, (p0 * oc * 4) as u64, (t * oc * 4) as u64);
+        c.queue.submit(Some(enc.finish()));
         p0 += t;
     }
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("vae-conv-out"),
+        });
+    if !readback(c, enc_take(&mut enc), &ybig, &stage, (hw * oc * 4) as u64, &mut yt) {
+        return false;
+    }
+    // [hw, oc] → NCHW, bias on the way, across the pool.
+    let po = SendPtrC(out.as_mut_ptr());
+    let work = |lo: usize, hi: usize| {
+        for o in lo..hi {
+            let b = bias.map_or(0.0, |bb| bb[o]);
+            // SAFETY: one output channel per worker, disjoint.
+            let dst = unsafe { std::slice::from_raw_parts_mut(po.0.add(o * hw), hw) };
+            for (p, d) in dst.iter_mut().enumerate() {
+                *d = yt[p * oc + o] + b;
+            }
+        }
+    };
+    // No pool handle down here, and the scatter is memory-bound anyway.
+    work(0, oc);
     true
+}
+
+struct SendPtrC(*mut f32);
+unsafe impl Send for SendPtrC {}
+unsafe impl Sync for SendPtrC {}
+
+fn enc_take(e: &mut wgpu::CommandEncoder) -> wgpu::CommandEncoder {
+    std::mem::replace(
+        e,
+        ctx()
+            .unwrap()
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }),
+    )
 }
 
 pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {

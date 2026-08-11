@@ -158,11 +158,21 @@ impl Conv2d {
         // GEMM has real work (small early convs stay on the CPU).
         if h * w * self.ic * self.oc >= 1 << 26 && crate::gpu::enabled_here() {
             let mut out = vec![0f32; self.oc * h * w];
-            // Matrix units first: im2col on the card, then one NT GEMM
-            // per pixel tile. The scalar kernel below stays as the
-            // fallback for shapes it refuses (even k, a reduction not
-            // divisible by four, no coop hardware).
-            if std::env::var("CMF_VAE_CONV_COOP").as_deref() != Ok("0")
+            // MEASURED AND REJECTED, so opt-in (`CMF_VAE_CONV_COOP=1`):
+            // im2col on the card plus an NT GEMM per pixel tile loses to
+            // the scalar kernel below — VAE decode 7.5 s against 6.3,
+            // back to back on one binary. The arithmetic says why: the
+            // column matrix is 1.2 GB per conv at 512×512 and every byte
+            // of it is written and read again, while the scalar kernel
+            // reads the input in place and spends none of that band.
+            // im2col pays off where a GEMM is many times cheaper than
+            // the gather; here they are the same order.
+            //
+            // (An earlier "6.1 → 5.5 s" for this path was measured
+            // against a stale binary — the pod build had failed and the
+            // old one ran. Same-binary, back-to-back, or it means
+            // nothing.)
+            if std::env::var("CMF_VAE_CONV_COOP").as_deref() == Ok("1")
                 && crate::gpu::vae_conv2d_coop(
                     &self.w,
                     Some(&self.b[..]),
@@ -352,7 +362,14 @@ impl ResnetBlock {
                     .as_ref()
                     .map(|s| (s.w.as_slice(), s.b.as_slice(), s.k)),
             };
-            if crate::gpu::vae_resnet(&args, x, &mut out) {
+            // The fused block keeps the tensor on the card across both
+            // convs, but its convs are the SCALAR kernel. When the
+            // matrix units are available the two convs are worth more
+            // than the round trip the fused block saves — measured, and
+            // `CMF_VAE_RESNET=fused` puts it back.
+            if std::env::var("CMF_VAE_RESNET").as_deref() != Ok("split")
+                && crate::gpu::vae_resnet(&args, x, &mut out)
+            {
                 return out;
             }
         }
