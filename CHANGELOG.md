@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A rejected shader had silently disabled the dequantize-once path.**
+  The device-side activation scale added a `pmm_s` binding to the f16
+  cooperative GEMM but declared it in the wrong source, so wgpu rejected
+  the module — with a warning nobody was reading — and every call fell
+  back to the in-kernel unpacker for several commits. Declaration fixed;
+  more usefully, the parity test now ASSERTS instead of skipping when a
+  device that advertises cooperative matrices has no f16 pipeline, which
+  is exactly the shape this bug had. A skipped test is not a passing one.
+
+### Fixed
 - **A cold call now takes the device arm while the probe is deciding.**
   Every GPU sample from a cold weight is discarded (the upload is not
   steady state), and in a diffusion stack every layer is touched once
