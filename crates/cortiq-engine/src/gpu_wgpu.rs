@@ -3341,6 +3341,195 @@ fn q4tp_matvec4_bk(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// The two halves of a packed u32 as ready f32 weights. `q4v_dot8` fuses
+// unpack and multiply, which is right for ONE activation vector and
+// wrong for a batch: it redoes the shift/mask/convert/bias per nibble
+// for every element. Split, the unpack is paid once.
+fn q4v_lo4(w: u32) -> vec4<f32> {
+    return vec4<f32>(f32(w & 0xFu), f32((w >> 4u) & 0xFu),
+                     f32((w >> 8u) & 0xFu), f32((w >> 12u) & 0xFu)) - vec4<f32>(8.0);
+}
+fn q4v_hi4(w: u32) -> vec4<f32> {
+    return vec4<f32>(f32((w >> 16u) & 0xFu), f32((w >> 20u) & 0xFu),
+                     f32((w >> 24u) & 0xFu), f32((w >> 28u) & 0xFu)) - vec4<f32>(8.0);
+}
+
+// ── q4tp matvec, batch blocked with the unpack SHARED (`CMF_MV_BK=2`).
+// Same sixteen rows and four rows a lane as `q4tp_matvec4_bk`, but the
+// nibbles of a u32 become f32 once and every batch element multiplies
+// against them, where the sibling re-unpacks per element.
+//
+// The arithmetic is what this is for, and the budget is measured, not
+// guessed. At b=1 a dense FFN layer needs 8.9 ms of weight stream and
+// 6.3 ms of arithmetic, so the arithmetic hides and the token is
+// bus-bound (`CMF_MV_PROBE` shows stripping it saves 4%). At b=3 the
+// stream still needs 6.5 ms while the arithmetic needs 13.8 — measured
+// 11.83/13.83/16.03 ms at b=2/3/4, dead linear, because each element
+// unpacks again. Sharing it costs 3.25 ops a weight plus one FMA an
+// element instead of five an element: at b=3 that is 6.25 against 15,
+// which lands the batch FFN back on its memory floor.
+//
+// The unpack is held for ONE u32 at a time (eight f32 × four rows = 32
+// registers). Holding a whole group's 32 weights for four rows was 128
+// registers, and an earlier attempt that did something close to it lost
+// outright: occupancy hides load latency, and this kernel still has to
+// stream weights while it computes.
+@compute @workgroup_size(256)
+fn q4tp_matvec4_bku(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(num_workgroups) nwg: vec3<u32>,
+                    @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let nb = max(q1p._p0, 1u);
+    let blocks = (rows + 15u) / 16u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks) { break; }
+        let base = wb * 16u;
+        for (var t = lid; t < 512u; t = t + 256u) {
+            let r = base + (t >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                lad_q4w[t] = exp2(pr.x + f32(t & 31u) * pr.y);
+            }
+        }
+        workgroupBarrier();
+        let r0 = base + sub;
+        let r1 = base + sub + 4u;
+        let r2 = base + sub + 8u;
+        let r3 = base + sub + 12u;
+        var acc0 = vec4<f32>(0.0);
+        var acc1 = vec4<f32>(0.0);
+        var acc2 = vec4<f32>(0.0);
+        var acc3 = vec4<f32>(0.0);
+        if (r0 < rows) {
+            let c0 = codes_b + r0 * cstride;
+            let c1 = codes_b + r1 * cstride;
+            let c2 = codes_b + r2 * cstride;
+            let c3 = codes_b + r3 * cstride;
+            let l1 = r1 < rows;
+            let l2 = r2 < rows;
+            let l3 = r3 < rows;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                var cv = q4tp_byte(c0 + cbo);
+                if (sh > 3u) { cv = cv | (q4tp_byte(c0 + cbo + 1u) << 8u); }
+                let v0 = q4v_w[r0 * gpr + g];
+                let s0 = lad_q4w[(sub << 5u) + ((cv >> sh) & 31u)];
+                var v1 = vec4<u32>(0u, 0u, 0u, 0u);
+                var s1 = 0.0;
+                if (l1) {
+                    cv = q4tp_byte(c1 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c1 + cbo + 1u) << 8u); }
+                    v1 = q4v_w[r1 * gpr + g];
+                    s1 = lad_q4w[128u + (sub << 5u) + ((cv >> sh) & 31u)];
+                }
+                var v2 = vec4<u32>(0u, 0u, 0u, 0u);
+                var s2 = 0.0;
+                if (l2) {
+                    cv = q4tp_byte(c2 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c2 + cbo + 1u) << 8u); }
+                    v2 = q4v_w[r2 * gpr + g];
+                    s2 = lad_q4w[256u + (sub << 5u) + ((cv >> sh) & 31u)];
+                }
+                var v3 = vec4<u32>(0u, 0u, 0u, 0u);
+                var s3 = 0.0;
+                if (l3) {
+                    cv = q4tp_byte(c3 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c3 + cbo + 1u) << 8u); }
+                    v3 = q4v_w[r3 * gpr + g];
+                    s3 = lad_q4w[384u + (sub << 5u) + ((cv >> sh) & 31u)];
+                }
+                var j = 0u;
+                loop {
+                    if (j >= 4u) { break; }
+                    var w0 = v0.x; var w1 = v1.x; var w2 = v2.x; var w3 = v3.x;
+                    if (j == 1u) { w0 = v0.y; w1 = v1.y; w2 = v2.y; w3 = v3.y; }
+                    if (j == 2u) { w0 = v0.z; w1 = v1.z; w2 = v2.z; w3 = v3.z; }
+                    if (j == 3u) { w0 = v0.w; w1 = v1.w; w2 = v2.w; w3 = v3.w; }
+                    let a0 = q4v_lo4(w0); let b0 = q4v_hi4(w0);
+                    let a1 = q4v_lo4(w1); let b1 = q4v_hi4(w1);
+                    let a2 = q4v_lo4(w2); let b2 = q4v_hi4(w2);
+                    let a3 = q4v_lo4(w3); let b3 = q4v_hi4(w3);
+                    let xj = g * 8u + j * 2u;
+                    {
+                        let xa = q4v_x[xj]; let xb = q4v_x[xj + 1u];
+                        acc0.x = acc0.x + s0 * (dot(a0, xa) + dot(b0, xb));
+                        acc1.x = acc1.x + s1 * (dot(a1, xa) + dot(b1, xb));
+                        acc2.x = acc2.x + s2 * (dot(a2, xa) + dot(b2, xb));
+                        acc3.x = acc3.x + s3 * (dot(a3, xa) + dot(b3, xb));
+                    }
+                    if (nb > 1u) {
+                        let xq = xj + gpr * 8u;
+                        let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
+                        acc0.y = acc0.y + s0 * (dot(a0, xa) + dot(b0, xb));
+                        acc1.y = acc1.y + s1 * (dot(a1, xa) + dot(b1, xb));
+                        acc2.y = acc2.y + s2 * (dot(a2, xa) + dot(b2, xb));
+                        acc3.y = acc3.y + s3 * (dot(a3, xa) + dot(b3, xb));
+                    }
+                    if (nb > 2u) {
+                        let xq = xj + gpr * 16u;
+                        let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
+                        acc0.z = acc0.z + s0 * (dot(a0, xa) + dot(b0, xb));
+                        acc1.z = acc1.z + s1 * (dot(a1, xa) + dot(b1, xb));
+                        acc2.z = acc2.z + s2 * (dot(a2, xa) + dot(b2, xb));
+                        acc3.z = acc3.z + s3 * (dot(a3, xa) + dot(b3, xb));
+                    }
+                    if (nb > 3u) {
+                        let xq = xj + gpr * 24u;
+                        let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
+                        acc0.w = acc0.w + s0 * (dot(a0, xa) + dot(b0, xb));
+                        acc1.w = acc1.w + s1 * (dot(a1, xa) + dot(b1, xb));
+                        acc2.w = acc2.w + s2 * (dot(a2, xa) + dot(b2, xb));
+                        acc3.w = acc3.w + s3 * (dot(a3, xa) + dot(b3, xb));
+                    }
+                    j = j + 1u;
+                }
+                g = g + 64u;
+            }
+        }
+        var e = 0u;
+        loop {
+            if (e >= nb) { break; }
+            var mine = vec4<f32>(acc0.x, acc1.x, acc2.x, acc3.x);
+            if (e == 1u) { mine = vec4<f32>(acc0.y, acc1.y, acc2.y, acc3.y); }
+            if (e == 2u) { mine = vec4<f32>(acc0.z, acc1.z, acc2.z, acc3.z); }
+            if (e == 3u) { mine = vec4<f32>(acc0.w, acc1.w, acc2.w, acc3.w); }
+            partial_q4k[lid] = mine;
+            workgroupBarrier();
+            var stride = 32u;
+            loop {
+                if (stride == 0u) { break; }
+                if (l < stride) {
+                    partial_q4k[lid] = partial_q4k[lid] + partial_q4k[lid + stride];
+                }
+                workgroupBarrier();
+                stride = stride >> 1u;
+            }
+            if (l == 0u) {
+                let r = partial_q4k[sub << 6u];
+                let yo = e * rows;
+                if (r0 < rows) { q1y[yo + r0] = r.x; }
+                if (r1 < rows) { q1y[yo + r1] = r.y; }
+                if (r2 < rows) { q1y[yo + r2] = r.z; }
+                if (r3 < rows) { q1y[yo + r3] = r.w; }
+            }
+            workgroupBarrier();
+            e = e + 1u;
+        }
+        wb = wb + nwg.x;
+    }
+}
+
 // ── TIMING PROBE, answers are GARBAGE (`CMF_MV_PROBE`). The quad-row
 // kernel with its arithmetic removed and every LOAD kept: same grid,
 // same weight/code/x traffic, same loop trip count, but no nibble
@@ -9986,7 +10175,12 @@ struct Ctx {
     /// cost about one position's bandwidth. `CMF_MV_BK=0` reverts to the
     /// (row-block × batch) dispatch above.
     q4tp_mv4_bk: wgpu::ComputePipeline,
-    use_mv_bk: bool,
+    /// The same, with the nibble unpack shared across the batch instead
+    /// of repeated per element (`CMF_MV_BK=2` selects it).
+    q4tp_mv4_bku: wgpu::ComputePipeline,
+    /// 0 = the historical (row-block × batch) dispatch, 1 = batch inside
+    /// the workgroup, 2 (default) = that plus a shared unpack.
+    use_mv_bk: usize,
     /// `CMF_MV_PROBE=1|2`: the quad-row kernel with the arithmetic taken
     /// out (1) and the activation loads too (2). The ANSWER IS GARBAGE;
     /// the point is the time, which says how much of the matvec is the
@@ -10917,6 +11111,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let q4tp_mv = pipe("q4tp_matvec");
     let q4tp_mv4 = pipe("q4tp_matvec4");
     let q4tp_mv4_bk = pipe("q4tp_matvec4_bk");
+    let q4tp_mv4_bku = pipe("q4tp_matvec4_bku");
     // TIMING ONLY, and only when asked: the arithmetic-free twin of the
     // quad-row kernel. Built lazily so a normal run never compiles it.
     let mv_probe: usize = std::env::var("CMF_MV_PROBE")
@@ -10924,7 +11119,16 @@ fn init(dev: usize) -> Result<Ctx, String> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let q4tp_mv16w_probe = (mv_probe > 0).then(|| pipe("q4tp_matvec16w_probe"));
-    let use_mv_bk = std::env::var("CMF_MV_BK").map(|v| v != "0").unwrap_or(true);
+    // 2 = batch inside the workgroup with the unpack shared. Measured on
+    // Qwen3.6-27B / RTX 5090, k=2 speculative verify: the batched FFN is
+    // 15.05 / 13.86 / 11.15 ms at arm 0 / 1 / 2 and the verify round
+    // 53.3 / 52.1 / 45.9 ms, which is what finally makes a speculative
+    // token cheaper than a plain one (51.0 tok/s against 49.3, medians
+    // of three; arm 0 was 43.6 — a 11% LOSS).
+    let use_mv_bk: usize = std::env::var("CMF_MV_BK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
     let use_mv4 = std::env::var("CMF_MV4").map(|v| v != "0").unwrap_or(true);
     let q4tp_mv16 = pipe("q4tp_matvec16");
     let q4t_mv8 = pipe("q4t_matvec8");
@@ -11339,6 +11543,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mv,
         q4tp_mv4,
         q4tp_mv4_bk,
+        q4tp_mv4_bku,
         use_mv_bk,
         q4tp_mv16w_probe,
         mv_probe,
@@ -22424,18 +22629,30 @@ fn encode_q4tp_mv4_b(
     // read it once per element and leave the reuse to L2. On the dense
     // 5120/17408 FFN planes that reuse never materialized — a k=3 verify
     // cost 2.95x one row's, which is the flat "no reuse" number.
-    if c.use_mv_bk && (2..=4).contains(&batch) && gpr > 64 {
+    if c.use_mv_bk > 0 && (2..=4).contains(&batch) && gpr > 64 {
         // A kernel swap that cannot be OBSERVED is a kernel swap that
         // gets credited with someone else's timing. One line, once.
         if std::env::var("CMF_MV_BK_TRACE").is_ok() {
             use std::sync::atomic::{AtomicBool, Ordering};
             static SAID: AtomicBool = AtomicBool::new(false);
             if !SAID.swap(true, Ordering::Relaxed) {
-                eprintln!("mv-bk: engaged ({rows}x{cols}, batch {batch}, gpr {gpr})");
+                eprintln!(
+                    "mv-bk{}: engaged ({rows}x{cols}, batch {batch}, gpr {gpr})",
+                    c.use_mv_bk
+                );
             }
         }
         let p_buf = q4tp_mv_params(c, gpr, rows, batch);
-        let layout = c.q4tp_mv4_bk.get_bind_group_layout(0);
+        // The layout comes from the pipeline that will RUN. wgpu's auto
+        // layouts are built per entry point and are not interchangeable
+        // even between kernels declaring the same bindings — borrowing a
+        // sibling's cost a day once already.
+        let bk = if c.use_mv_bk >= 2 {
+            &c.q4tp_mv4_bku
+        } else {
+            &c.q4tp_mv4_bk
+        };
+        let layout = bk.get_bind_group_layout(0);
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &layout,
@@ -22448,7 +22665,7 @@ fn encode_q4tp_mv4_b(
             ],
         });
         let mut pass = begin_pass(enc);
-        pass.set_pipeline(&c.q4tp_mv4_bk);
+        pass.set_pipeline(bk);
         pass.set_bind_group(0, &bind, &[]);
         // The batch lives INSIDE the workgroup now, so the grid is the
         // row blocks alone — the same grid, and the same sixteen rows a
