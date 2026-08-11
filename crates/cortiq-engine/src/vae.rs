@@ -100,6 +100,28 @@ pub fn read_safetensors(
 // ── NCHW ops ─────────────────────────────────────────────────────────
 
 /// 2-D convolution, stride 1, square kernel, symmetric padding
+///
+/// NEXT TARGET, measured (`CMF_VAE_PROF=1`, 512×512, one RTX 5090):
+/// the decoder is 5.9–7.0 s of a 21 s image, and the three resnets at
+/// the 512×512 level are 2.73 s of it — 39% — with up2's another 1.4 s
+/// and `mid_attn` 0.69 s. All of that is this convolution, and on the
+/// device it runs `vae_conv`: ONE SCALAR KERNEL, no matrix units. At
+/// 512×512×128×128 a 3×3 conv is 77 GFLOP and takes ~0.35 s, which is
+/// about 220 GFLOP/s on a card that does two orders more in f16.
+///
+/// The fix is the one that took the audio vocoder 8.2 s → 4.3 s:
+/// im2col onto `gemm_nt_f32`, which is already public in the backend
+/// and runs on tensor cores. `out[oc, hw] = W · col`, and W is already
+/// `[oc, ic·k·k]` in the order this kernel reads it, so no repacking.
+///
+/// THE TRAP, and the reason this is a design note and not a patch: the
+/// column matrix does not fit. At 512×512 with ic=128, k=3 it is
+/// 1152 × 262144 floats — 1.2 GB, and that is one conv of six at that
+/// level. It has to be tiled over the pixel axis (≈32k pixels a tile
+/// keeps the buffer near 150 MB), with the tiles chained inside one
+/// submission so the panel never comes home between them. Size the
+/// tile from `CMF_GPU_VRAM_MB`, not from a constant.
+
 /// (pad = k/2). Parallel over output channels.
 pub struct Conv2d {
     pub w: Vec<f32>, // [oc, ic, k, k]
