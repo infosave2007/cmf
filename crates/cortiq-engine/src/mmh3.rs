@@ -882,17 +882,17 @@ impl MiniMaxH3 {
         Self::prof(1, t);
         // q and k are the first two thirds of every row; normalize and
         // rotate them where they lie, leaving v alone.
-        // `CMF_MMH3_QKNORM=gpu` moves qk-norm and RoPE into the same
-        // device pass that scatters the panel head-major — the host then
-        // neither walks the panel nor needs it back. It is FAST and it is
-        // OPT-IN, because it does not hold parity over a whole render:
-        // one step matches exactly (delta 0.000), four steps drift to
-        // 7.7% mean frame size against this loop's output, past the 3.4%
-        // envelope CPU-vs-GPU sits in. The suspect is the reduction —
-        // the host sums squares in f64, the kernel in f32, and a norm is
-        // a ratio, so the difference compounds through 50 blocks a step.
-        // Fix before defaulting: pairwise or f64-emulated accumulation.
-        let qk_on_gpu = std::env::var("CMF_MMH3_QKNORM").as_deref() == Ok("gpu")
+        // qk-norm and RoPE ride the same device pass that scatters the
+        // panel head-major, so the host neither walks the panel nor
+        // needs it back. Parity holds over a whole render: 1, 2 and 4
+        // steps all match this loop's output exactly (delta 0.000).
+        //
+        // A 7.7% "drift" was measured first and was an artefact — the
+        // reference had been rendered by an EARLIER binary, so the
+        // comparison carried every change since, not this one. Same
+        // binary, both arms, or the number means nothing.
+        // `CMF_MMH3_QKNORM=cpu` restores the host loop.
+        let qk_on_gpu = std::env::var("CMF_MMH3_QKNORM").as_deref() != Ok("cpu")
             && crate::gpu::enabled_here()
             && n >= 256;
         let t = std::time::Instant::now();
