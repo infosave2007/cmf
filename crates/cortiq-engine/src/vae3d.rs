@@ -328,6 +328,13 @@ impl VideoVae {
             && crate::gpu::enabled_here()
             && n >= 256
         {
+            if std::env::var("CMF_VAE3D_SPLIT").as_deref() == Ok("1")
+                && crate::gpu::vae_attention_packed(
+                    qkv, nh, n, hd, scale, angles, self.eps as f32, attn,
+                )
+            {
+                return;
+            }
             let t_rp = std::time::Instant::now();
             let mut qa = vec![0f32; nh * n * hd];
             let mut ka = vec![0f32; nh * n * hd];
@@ -484,6 +491,65 @@ impl VideoVae {
             }
             vprof(0, t);
             let t = std::time::Instant::now();
+            // The whole attention half on the card: qkv GEMM, bias, the
+            // weightless q/k norm, RoPE, attention, output projection —
+            // nothing crossing the bus between them. The DiT's chain cut
+            // its step 29%; this decoder spent 18.2 s of 26.1 on the
+            // same six steps. `CMF_VAE3D_FUSE=0` restores the host chain.
+            if std::env::var("CMF_GPU_DEBUG").is_ok() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "vae3d shape: n={n} dim={dim} heads={} head_dim={} pairs={}",
+                        self.heads,
+                        self.head_dim,
+                        angles.len() / n.max(1)
+                    )
+                });
+            }
+            let mut fused = false;
+            // NOT CORRECT YET, so opt-in: rel rms 0.296 against the host
+            // chain, 97% of pixels. Worth 26.1 s → 16.1 s on this stage
+            // and 57.6 s → 47.2 s on a 2-step render once it is right.
+            //
+            // What is known: the error survives with both GEMMs on the
+            // host (`CMF_VAE3D_SPLIT=1` reproduces it byte for byte), so
+            // it lives in the split or the qk-norm kernel, not in the
+            // resident hand-off. Teaching BOTH kernels this panel's
+            // layout (head-interleaved, mode=1) and its bias changed the
+            // output by nothing — which should be impossible at nh=32,
+            // where the two addressings differ for every head above the
+            // first. That contradiction is the thread to pull: the
+            // one-shot probe in `packed_src` fires on the DiT's first
+            // call and never reaches the VAE's, so instrument per layout.
+            if std::env::var("CMF_VAE3D_FUSE").as_deref() == Ok("1")
+                && crate::gpu::enabled_here()
+                && n >= 256
+            {
+                if let (Proj::Q(q), Proj::Q(o)) = (&blk.qkv, &blk.out) {
+                    if let (Some((m, i)), Some((_, oi))) = (q.mapped_q4tp(), o.mapped_q4tp()) {
+                        fused = crate::gpu::vae_qkv_attn_out(
+                            m,
+                            i,
+                            oi,
+                            &xn,
+                            n,
+                            dim,
+                            self.heads,
+                            self.head_dim,
+                            1.0 / (self.head_dim as f32).sqrt(),
+                            &angles,
+                            self.eps as f32,
+                            &blk.qkv_b,
+                            &mut proj,
+                        );
+                    }
+                }
+            }
+            if fused {
+                vprof(1, t);
+            }
+            if !fused {
             blk.qkv.matmat(&xn, n, &mut qkv, pool);
             {
                 let pq = SendPtr(qkv.as_mut_ptr());
@@ -503,6 +569,8 @@ impl VideoVae {
             self.attention(&qkv, n, &mut attn, &angles);
             let t = std::time::Instant::now();
             blk.out.matmat(&attn, n, &mut proj, pool);
+            vprof(4, t);
+            }
             {
                 let pxx = SendPtr(x.as_mut_ptr());
                 rows_par(pool, n, &|lo, hi| {
@@ -516,7 +584,6 @@ impl VideoVae {
                     }
                 });
             }
-            vprof(4, t);
             let t = std::time::Instant::now();
             {
                 let px = SendPtr(xn.as_mut_ptr());

@@ -17848,7 +17848,7 @@ pub fn dit_qkv_attention(
     else {
         return false;
     };
-    dit_attention_packed_src(&[], Some(&panel), nh, n, hd, scale, Some(nr), out, None)
+    dit_attention_packed_src(&[], Some(&panel), nh, n, hd, scale, Some(nr), out, None, 0, None)
 }
 
 /// qkv GEMM, attention, AND the output projection with nothing crossing
@@ -17921,6 +17921,8 @@ pub fn dit_qkv_attn_out(
         Some(nr),
         &mut [],
         Some(&mut ab),
+        0,
+        None,
     ) {
         if std::env::var("CMF_GPU_DEBUG").is_ok() {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -17938,6 +17940,101 @@ pub fn dit_qkv_attn_out(
     ok
 }
 
+/// The VAE decoder's attention half on the card: qkv GEMM, bias, plain
+/// RMS norm on q and k, RoPE, attention, output projection. Only the
+/// projection's result comes home. Its panel is head-interleaved and
+/// its norm carries no weight — a ones vector makes `dit_qknorm_rope`
+/// compute exactly `rms_norm_plain`, so no second kernel exists for it.
+#[allow(clippy::too_many_arguments)]
+pub fn vae_qkv_attn_out(
+    model: &Arc<CmfModel>,
+    qkv_idx: usize,
+    out_idx: usize,
+    xn: &[f32],
+    n: usize,
+    dim: usize,
+    nh: usize,
+    hd: usize,
+    scale: f32,
+    angles: &[f32],
+    eps: f32,
+    qkv_bias: &[f32],
+    proj: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let inner = nh * hd;
+    let can_dev_scale =
+        (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
+    if !can_dev_scale
+        || c.q4tp_mm_coop_f16.is_none()
+        || c.q4tp_dq_f16.is_none()
+        || c.dit_qkv_split.is_none()
+        || c.dit_qknorm.is_none()
+        || inner != dim
+        || inner % 32 != 0
+        || n < 64
+        || angles.is_empty()
+        || qkv_bias.len() < 3 * dim
+        || proj.len() < n * dim
+    {
+        return false;
+    }
+    let mut unused = Vec::new();
+    let Some(panel) = tp_matmat_keep(model, qkv_idx, xn, n, 3 * inner, dim, &mut unused, false)
+    else {
+        return false;
+    };
+    let ones = vec![1.0f32; hd];
+    let mut ab = None;
+    if !dit_attention_packed_src(
+        &[],
+        Some(&panel),
+        nh,
+        n,
+        hd,
+        scale,
+        Some((angles, &ones[..], &ones[..], eps)),
+        &mut [],
+        Some(&mut ab),
+        1,
+        Some(qkv_bias),
+    ) {
+        return false;
+    }
+    let Some(ab) = ab else { return false };
+    tp_matmat_impl(model, out_idx, &[], n, dim, inner, Some(proj), Some(&ab), false).is_some()
+}
+
+/// Bisect handle: the VAE's head-interleaved split plus the weightless
+/// q/k norm and RoPE, fed a HOST panel that already carries its bias.
+/// Isolates those two kernels from the resident-GEMM handoff.
+#[allow(clippy::too_many_arguments)]
+pub fn vae_attention_packed(
+    qkv: &[f32],
+    nh: usize,
+    n: usize,
+    hd: usize,
+    scale: f32,
+    angles: &[f32],
+    eps: f32,
+    out: &mut [f32],
+) -> bool {
+    let ones = vec![1.0f32; hd];
+    dit_attention_packed_src(
+        qkv,
+        None,
+        nh,
+        n,
+        hd,
+        scale,
+        Some((angles, &ones[..], &ones[..], eps)),
+        out,
+        None,
+        1,
+        None,
+    )
+}
+
 pub fn dit_attention_packed(
     qkv: &[f32],
     nh: usize,
@@ -17947,7 +18044,7 @@ pub fn dit_attention_packed(
     nr: Option<(&[f32], &[f32], &[f32], f32)>,
     out: &mut [f32],
 ) -> bool {
-    dit_attention_packed_src(qkv, None, nh, n, hd, scale, nr, out, None)
+    dit_attention_packed_src(qkv, None, nh, n, hd, scale, nr, out, None, 0, None)
 }
 
 /// The same, with the panel possibly ALREADY on the card (`pre`): its
@@ -17964,6 +18061,8 @@ pub fn dit_attention_packed_src(
     nr: Option<(&[f32], &[f32], &[f32], f32)>,
     out: &mut [f32],
     keep: Option<&mut Option<wgpu::Buffer>>,
+    layout: u32,
+    qkv_bias: Option<&[f32]>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
     let Some(split) = c.dit_qkv_split.as_ref() else {
@@ -18008,8 +18107,26 @@ pub fn dit_attention_packed_src(
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::cast_slice(&[n as u32, nh as u32, hd as u32, 0u32]),
+            contents: bytemuck::cast_slice(&[
+                n as u32,
+                nh as u32,
+                hd as u32,
+                layout,
+                u32::from(qkv_bias.is_some()),
+                0u32,
+                0u32,
+                0u32,
+            ]),
             usage: wgpu::BufferUsages::UNIFORM,
+        });
+    // The bias binding always exists; one element stands in when the
+    // panel has none, because a declared binding must be bound.
+    let bias_buf = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dit-qkv-bias"),
+            contents: bytemuck::cast_slice(qkv_bias.unwrap_or(&[0.0f32][..])),
+            usage: wgpu::BufferUsages::STORAGE,
         });
     let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
@@ -18020,6 +18137,7 @@ pub fn dit_attention_packed_src(
             bind_buf(2, &kb),
             bind_buf(3, &vb),
             bind_buf(4, &u),
+            bind_buf(5, &bias_buf),
         ],
     });
     let mut enc = c
@@ -18035,6 +18153,17 @@ pub fn dit_attention_packed_src(
     // qk-norm + RoPE on the card: two dispatches over the SAME kernel,
     // q and k differing only in the output plane, the weight buffer and
     // src_off. When `nr` is None the caller already did this on the host.
+    if std::env::var("CMF_GPU_DEBUG").is_ok() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            eprintln!(
+                "packed_src: layout={layout} bias={} qknorm={} nr={} n={n} nh={nh} hd={hd}",
+                qkv_bias.is_some(),
+                c.dit_qknorm.is_some(),
+                nr.is_some(),
+            )
+        });
+    }
     if let (Some(pipe), Some((angles, qw, kw, eps))) = (c.dit_qknorm.as_ref(), nr) {
         let pairs = if angles.is_empty() { 0 } else { angles.len() / n };
         let ang_b = c
@@ -18063,8 +18192,8 @@ pub fn dit_attention_packed_src(
                         pairs as u32,
                         eps.to_bits(),
                         (half * inner) as u32,
-                        0u32,
-                        0u32,
+                        layout,
+                        u32::from(qkv_bias.is_some()),
                     ]),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
@@ -18077,6 +18206,7 @@ pub fn dit_attention_packed_src(
                     bind_buf(2, &ang_b),
                     bind_buf(3, &w_b),
                     bind_buf(4, &u),
+                    bind_buf(5, &bias_buf),
                 ],
             });
             let mut e = c
@@ -20138,12 +20268,16 @@ fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
 /// head dimension. Host semantics (`mmh3::norm_rope_w`): mean of squares
 /// + eps, then the weight, then rotate x[j] against x[j+pairs].
 const DIT_QKNORM_SRC: &str = r#"
-struct QnP { n: u32, nh: u32, hd: u32, pairs: u32, eps: f32, src_off: u32, _a: u32, _b: u32 };
+// This kernel reads the PACKED PANEL, not the split planes — so it
+// needs the layout and the bias just as the split does. It re-derives
+// q and k itself and overwrites what the split wrote for them.
+struct QnP { n: u32, nh: u32, hd: u32, pairs: u32, eps: f32, src_off: u32, mode: u32, bias: u32 };
 @group(0) @binding(0) var<storage, read>       qn_src: array<f32>;
 @group(0) @binding(1) var<storage, read_write> qn_dst: array<f32>;
 @group(0) @binding(2) var<storage, read>       qn_ang: array<f32>;
 @group(0) @binding(3) var<storage, read>       qn_w: array<f32>;
 @group(0) @binding(4) var<uniform>             qn_p: QnP;
+@group(0) @binding(5) var<storage, read>       qn_bias: array<f32>;
 
 var<workgroup> qn_buf: array<f32, 256>;
 var<workgroup> qn_red: array<f32, 64>;
@@ -20157,14 +20291,23 @@ fn dit_qknorm_rope(@builtin(workgroup_id) wid: vec3<u32>,
     let h = job - p * qn_p.nh;
     let inner = qn_p.nh * qn_p.hd;
     // qn_p.src_off selects q (0) or k (inner) inside the packed panel.
-    let src = p * 3u * inner + qn_p.src_off + h * qn_p.hd;
+    let row = p * 3u * inner;
+    var src = row + qn_p.src_off + h * qn_p.hd;
+    if (qn_p.mode == 1u) {
+        // Head-interleaved: [q_h | k_h | v_h] per head. src_off still
+        // says which of the two this dispatch is doing.
+        src = row + h * 3u * qn_p.hd + select(0u, qn_p.hd, qn_p.src_off > 0u);
+    }
     let dst = (h * qn_p.n + p) * qn_p.hd;
 
     var acc = 0.0;
     var i = lid;
     loop {
         if (i >= qn_p.hd) { break; }
-        let x = qn_src[src + i];
+        var x = qn_src[src + i];
+        if (qn_p.bias == 1u) {
+            x = x + qn_bias[src + i - row];
+        }
         qn_buf[i] = x;
         acc = acc + x * x;
         i = i + 64u;
@@ -20225,12 +20368,17 @@ fn dit_v_transpose(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 const DIT_SPLIT_SRC: &str = r#"
-struct SpP { n: u32, nh: u32, hd: u32, _p: u32 };
+// `mode` 0: a token row is [q(inner) | k | v] — the DiT's panel.
+// `mode` 1: it is head-interleaved, [q_h | k_h | v_h] per head — the
+// VAE's. Same kernel, one branch, because the only other difference
+// between the two attentions is a bias this now adds in place.
+struct SpP { n: u32, nh: u32, hd: u32, mode: u32, bias: u32, _a: u32, _b: u32, _c: u32 };
 @group(0) @binding(0) var<storage, read>       sqkv: array<f32>;
 @group(0) @binding(1) var<storage, read_write> sq: array<f32>;
 @group(0) @binding(2) var<storage, read_write> sk: array<f32>;
 @group(0) @binding(3) var<storage, read_write> sv: array<f32>;
 @group(0) @binding(4) var<uniform>             sp: SpP;
+@group(0) @binding(5) var<storage, read>       sbias: array<f32>;
 
 @compute @workgroup_size(256)
 fn dit_qkv_split(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -20242,11 +20390,27 @@ fn dit_qkv_split(@builtin(global_invocation_id) gid: vec3<u32>) {
     let r = i - p * inner;      // head*hd + d
     let h = r / sp.hd;
     let d = r - h * sp.hd;
-    let src = p * 3u * inner + h * sp.hd + d;
+    let row = p * 3u * inner;
+    var qo = row + h * sp.hd + d;
+    var ko = qo + inner;
+    var vo = qo + 2u * inner;
+    if (sp.mode == 1u) {
+        qo = row + h * 3u * sp.hd + d;
+        ko = qo + sp.hd;
+        vo = qo + 2u * sp.hd;
+    }
     let dst = (h * sp.n + p) * sp.hd + d;
-    sq[dst] = sqkv[src];
-    sk[dst] = sqkv[src + inner];
-    sv[dst] = sqkv[src + 2u * inner];
+    var qv = sqkv[qo];
+    var kv = sqkv[ko];
+    var vv = sqkv[vo];
+    if (sp.bias == 1u) {
+        qv = qv + sbias[qo - row];
+        kv = kv + sbias[ko - row];
+        vv = vv + sbias[vo - row];
+    }
+    sq[dst] = qv;
+    sk[dst] = kv;
+    sv[dst] = vv;
 }
 "#;
 
