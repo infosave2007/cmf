@@ -17121,10 +17121,16 @@ pub fn weight_is_resident(model: &Arc<CmfModel>, idx: usize) -> bool {
 }
 
 /// q4tp GEMM whose result STAYS on the device: the caller gets the
-/// buffer, not a host copy. The DiT computed qkv on the card, read
-/// 160 MB back per block, and the attention split uploaded the same
+/// buffer, not a host copy. The DiT computes qkv on the card, reads
+/// 160 MB back per block, and the attention split uploads the same
 /// bytes again — 320 MB a block of pure round trip.
-pub fn q4tp_matmat_dev(
+///
+/// Deliberately NOT on the backend facade: a `wgpu::Buffer` cannot cross
+/// it, and a facade that returns `Option<()>` (as the first version did)
+/// throws away the only thing the caller wanted. The user of this is the
+/// attention path in this same module, once qk-norm and RoPE move to the
+/// device — until then the panel has to come home anyway.
+pub(crate) fn q4tp_matmat_dev(
     model: &Arc<CmfModel>,
     idx: usize,
     xs: &[f32],
