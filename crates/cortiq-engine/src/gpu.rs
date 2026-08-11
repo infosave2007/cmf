@@ -1589,27 +1589,6 @@ pub fn dit_attention(
 /// GEMM's K loop. wgpu (Vulkan/DX12 → NVIDIA/AMD/Intel/Adreno/Mali):
 /// the register-blocked WGSL twin, weights cached in VRAM.
 #[allow(unused_variables)]
-/// The same GEMM, result left ON the card. For a caller whose very next
-/// step is another device pass — the DiT reads 160 MB of qkv back per
-/// block only to upload the same bytes again for the attention split.
-/// wgpu only; `None` elsewhere and the caller keeps the host form.
-#[allow(unused_variables)]
-pub fn q4tp_matmat_dev(
-    model: &Arc<CmfModel>,
-    idx: usize,
-    xs: &[f32],
-    b: usize,
-    rows: usize,
-    cols: usize,
-) -> Option<()> {
-    match backend() {
-        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
-        Backend::Wgpu => crate::gpu_wgpu::q4tp_matmat_dev(model, idx, xs, b, rows, cols).map(|_| ()),
-        #[allow(unreachable_patterns)]
-        _ => None,
-    }
-}
-
 pub fn q4tp_matmat(
     model: &Arc<CmfModel>,
     idx: usize,
