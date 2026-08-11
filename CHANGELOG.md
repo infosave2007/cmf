@@ -23,6 +23,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are 47.1.
 
 ### Fixed
+- **A seeded render is reproducible again.** It was not: three runs of
+  one binary with one seed produced two different files. While a probe
+  class is undecided the arbitration ALTERNATES arms on real user data
+  (`flip % 2`), and whether it ever decides depends on how many samples
+  the cold-discard throws away — so which ops ran on which arm, and the
+  frames that came out, turned on a race. `animate` now pins the arms
+  (an explicit `CMF_GPU_PROBE` still wins). Measured cost: none —
+  57.4 s and 57.8 s against 57.5 s with probing.
+
+  This also invalidated every md5 comparison made against a render from
+  a previous binary: the 6.7e-4 and 7.8e-4 "deltas" attributed to two
+  optimizations today were this race, not the changes, both of which are
+  arithmetic-for-arithmetic identical.
+
 - **The output projection joins the resident chain: a DiT step is 29%
   faster (11.23 s → 7.92 s), a full render 143.2 s → 116.4 s at 8 steps.**
   With qkv, qk-norm, RoPE and attention already on the card, the output
