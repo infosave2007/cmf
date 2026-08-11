@@ -644,8 +644,18 @@ impl VideoVae {
                 });
             }
             let mut fused = false;
-            // NOT CORRECT YET, so opt-in: rel rms 0.296 against the host
-            // chain, 97% of pixels.
+            // Default since the split kernel's encoder started reaching
+            // the queue: this stage 26.1 s → 16.6 s and a 2-step render
+            // 57.1 s → 46.9 s, at 2.33e-3 rel rms from the host chain
+            // (max 8/255 on 3% of pixels) — four times inside the gate
+            // the DiT's own device path is held to. `CMF_VAE3D_FUSE=0`
+            // restores the host chain.
+            //
+            // It read 0.296 rel rms and 97% of pixels for most of a day,
+            // and none of that was this code: the split never ran, so V
+            // was zeros and P·V was zero. Zero does not depend on
+            // addressing, which is why every layout experiment agreed
+            // with every other and sent the search the wrong way.
             //
             // Narrowed to four stages, with everything else measured
             // and cleared (`CMF_VAE3D_CHECK=1` runs the harness):
@@ -677,7 +687,7 @@ impl VideoVae {
             // first. That contradiction is the thread to pull: the
             // one-shot probe in `packed_src` fires on the DiT's first
             // call and never reaches the VAE's, so instrument per layout.
-            if std::env::var("CMF_VAE3D_FUSE").as_deref() == Ok("1")
+            if std::env::var("CMF_VAE3D_FUSE").as_deref() != Ok("0")
                 && crate::gpu::enabled_here()
                 && n >= 256
             {
