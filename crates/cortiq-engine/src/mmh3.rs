@@ -700,7 +700,17 @@ impl MiniMaxH3 {
     }
 
     /// Full bidirectional attention over the packed sequence.
-    fn attention(&self, qkv: &[f32], n: usize, attn: &mut [f32]) {
+    /// `nr` = (rope angles, q norm weights, k norm weights, eps) when the
+    /// DEVICE should apply qk-norm and RoPE. Passing it means the caller
+    /// skipped `norm_rope_w`, which is the only reason the qkv panel had
+    /// to come back to the host at all.
+    fn attention(
+        &self,
+        qkv: &[f32],
+        n: usize,
+        attn: &mut [f32],
+        nr: Option<(&[f32], &[f32], &[f32], f32)>,
+    ) {
         let t_repack = std::time::Instant::now();
         let (nh, hd) = (self.heads, self.head_dim);
         let inner = nh * hd;
@@ -730,7 +740,7 @@ impl MiniMaxH3 {
             // last step of task #33, and the point where the panel stops
             // coming home at all.
             if std::env::var("CMF_MMH3_ATTN").as_deref() != Ok("repack")
-                && crate::gpu::dit_attention_packed(qkv, nh, n, hd, scale, None, attn)
+                && crate::gpu::dit_attention_packed(qkv, nh, n, hd, scale, nr, attn)
             {
                 // No stamp: the caller's slot-3 stopwatch already spans
                 // this whole call, and CMF_DIT_ATTN_PROF breaks the
@@ -739,6 +749,11 @@ impl MiniMaxH3 {
                 // came to read as 26.1.
                 return;
             }
+            assert!(
+                nr.is_none(),
+                "device qk-norm was requested but the device path refused; \
+                 the host loops below expect q/k already normalized"
+            );
             let mut qh = vec![0f32; nh * n * hd];
             let mut kh = vec![0f32; nh * n * hd];
             let mut vh = vec![0f32; nh * n * hd];
@@ -867,14 +882,39 @@ impl MiniMaxH3 {
         Self::prof(1, t);
         // q and k are the first two thirds of every row; normalize and
         // rotate them where they lie, leaving v alone.
+        // `CMF_MMH3_QKNORM=gpu` moves qk-norm and RoPE into the same
+        // device pass that scatters the panel head-major — the host then
+        // neither walks the panel nor needs it back. It is FAST and it is
+        // OPT-IN, because it does not hold parity over a whole render:
+        // one step matches exactly (delta 0.000), four steps drift to
+        // 7.7% mean frame size against this loop's output, past the 3.4%
+        // envelope CPU-vs-GPU sits in. The suspect is the reduction —
+        // the host sums squares in f64, the kernel in f32, and a norm is
+        // a ratio, so the difference compounds through 50 blocks a step.
+        // Fix before defaulting: pairwise or f64-emulated accumulation.
+        let qk_on_gpu = std::env::var("CMF_MMH3_QKNORM").as_deref() == Ok("gpu")
+            && crate::gpu::enabled_here()
+            && n >= 256;
         let t = std::time::Instant::now();
-        for (which, w) in [(0usize, &blk.q_norm), (1usize, &blk.k_norm)] {
-            self.norm_rope_w(&mut qkv, n, self.heads, w, &angles, 3 * inner, which * inner);
+        if !qk_on_gpu {
+            for (which, w) in [(0usize, &blk.q_norm), (1usize, &blk.k_norm)] {
+                self.norm_rope_w(&mut qkv, n, self.heads, w, &angles, 3 * inner, which * inner);
+            }
         }
         Self::prof(2, t);
         let t = std::time::Instant::now();
         let mut attn = vec![0f32; n * inner];
-        self.attention(&qkv, n, &mut attn);
+        self.attention(
+            &qkv,
+            n,
+            &mut attn,
+            qk_on_gpu.then_some((
+                &angles[..],
+                &blk.q_norm[..],
+                &blk.k_norm[..],
+                self.qk_eps as f32,
+            )),
+        );
         Self::prof(3, t);
         let t = std::time::Instant::now();
         let mut proj = vec![0f32; n * hs];
