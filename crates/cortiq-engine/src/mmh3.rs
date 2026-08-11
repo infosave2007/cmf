@@ -701,6 +701,7 @@ impl MiniMaxH3 {
 
     /// Full bidirectional attention over the packed sequence.
     fn attention(&self, qkv: &[f32], n: usize, attn: &mut [f32]) {
+        let t_repack = std::time::Instant::now();
         let (nh, hd) = (self.heads, self.head_dim);
         let inner = nh * hd;
         let scale = 1.0 / (hd as f32).sqrt();
@@ -716,6 +717,18 @@ impl MiniMaxH3 {
             && crate::gpu::enabled_here()
             && n >= 256
         {
+            // Device-side split, OPT-IN (`CMF_MMH3_ATTN=split`) until it
+            // is measured at render size: the host repack below costs
+            // 4.4 s of a 7.3 s attention phase — more than the device
+            // work it feeds — so this is where that time should go, but
+            // a path verified only at 64×32 does not get to be the
+            // default on a render that takes minutes to check.
+            if std::env::var("CMF_MMH3_ATTN").as_deref() == Ok("split")
+                && crate::gpu::dit_attention_packed(qkv, nh, n, hd, scale, attn)
+            {
+                Self::prof(3, t_repack);
+                return;
+            }
             let mut qh = vec![0f32; nh * n * hd];
             let mut kh = vec![0f32; nh * n * hd];
             let mut vh = vec![0f32; nh * n * hd];
@@ -748,7 +761,17 @@ impl MiniMaxH3 {
                     }
                 });
             }
-            if crate::gpu::dit_attention(&qh, &kh, &vh, nh, nh, n, hd, scale, attn) {
+            // Split the phase: the repack above is host work, this call
+            // is device work. The last round wrote a tensor-core QK on
+            // the assumption that the GEMMs dominate and the step did
+            // not move — so measure the halves before writing anything
+            // else. Slot 2 (qknorm+rope, unused on this path) takes the
+            // repack; slot 3 keeps the device call.
+            Self::prof(2, t_repack);
+            let t2 = std::time::Instant::now();
+            let ok = crate::gpu::dit_attention(&qh, &kh, &vh, nh, nh, n, hd, scale, attn);
+            Self::prof(3, t2);
+            if ok {
                 return;
             }
         }

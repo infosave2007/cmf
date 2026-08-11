@@ -1543,6 +1543,26 @@ pub fn vae_conv2d(
 /// scores GEMM → row softmax → P·V → panel unstack, one command
 /// buffer). Head-major inputs; out is [n, nh·hd].
 #[allow(unused_variables, clippy::too_many_arguments)]
+/// Attention from an interleaved qkv panel, splitting into head-major
+/// planes ON the device. wgpu only; `false` elsewhere so the caller
+/// keeps its host repack.
+#[allow(unused_variables)]
+pub fn dit_attention_packed(
+    qkv: &[f32],
+    nh: usize,
+    n: usize,
+    hd: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::dit_attention_packed(qkv, nh, n, hd, scale, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 pub fn dit_attention(
     qh: &[f32],
     kh: &[f32],
