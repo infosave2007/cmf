@@ -5733,33 +5733,24 @@ fn draft_probe() -> bool {
                 // (the race just settled on the normal path).
             }
         }
-        // KIMI-LINEAR LOSES 2.6× ON THE SPLIT and the cause is NOT here.
-        // Measured on 2×RTX 5090: 12.2 tok/s on one card against 4.6
-        // across two, where the other five models lose 0.5-5%. What is
-        // established: the whole-token graph is refused for this model
-        // (`wgpu whole-token graph refused — per-op path`), and its
-        // hybrid stack — linear-attention layers interleaved with full
-        // attention — cannot cover a span whole.
+        // KIMI-LINEAR HAS NO SPLIT BUG. The 2.6× reported from the
+        // model rotation (12.2 tok/s on one card against 4.6 on two)
+        // was a single measurement of a model whose arm arbitration is
+        // borderline, and it did not survive repetition. Three runs an
+        // arm, same binary, back to back:
+        //   probe on : 1 GPU 9.5 / 5.7 / 5.9   2 GPU 7.8 / 13.0 / 13.3
+        //   pinned   : 1 GPU 5.6 / 5.3 / 5.2   2 GPU 3.5 / 4.2 / 3.4
+        // With the arms pinned the split costs about 1.45×, which is
+        // what a layer split costs. With the probe free, TWO CARDS RUN
+        // FASTER — because for this model the CPU arm wins some op
+        // classes and the probe finds that.
         //
-        // A first reading of this block said the partial graph was
-        // thrown away and the span re-run from scratch. IT IS NOT: the
-        // `h = hh; tail_start = from + gl;` below keeps the device
-        // prefix and the tail continues per-op. That explanation was
-        // wrong and is retracted.
-        //
-        // MEASURED (`CMF_GPU_DEBUG=1` prints the coverage below):
-        // `covered 0 of 14 layers [0..14)` and `0 of 13 [14..27)`. The
-        // graph builds NOTHING for this model, so every layer walks
-        // per-op on one card and on two alike — which rules the graph
-        // out of the 2.6× entirely.
-        //
-        // What is left is what the split adds to a per-op stack, and
-        // the hidden hand-off is too small to be it: one vector a token
-        // against 82 ms a token on one card. The remaining suspect is
-        // residency — with the stack split, each device holds half the
-        // weights but the VRAM budget is per context, so if the second
-        // device's half is not resident it streams every token. Measure
-        // `weight_is_resident` per segment before anything else.
+        // Two things do stand, and both are measured. The token graph
+        // builds NOTHING here (`covered 0 of 14 layers [0..14)`), so
+        // every layer walks per-op on either arm — that is where the
+        // headroom is, not in the split. And this model's benchmark is
+        // unusable without `CMF_GPU_PROBE=0`: the arbitration alone
+        // moves it by more than 2×.
         //
         // Span runs (network split): the graph covers exactly [from..=upto]
         // — one submit per SEGMENT per token. No race: its state is global
