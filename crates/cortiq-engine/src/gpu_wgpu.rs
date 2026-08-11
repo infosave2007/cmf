@@ -9658,6 +9658,8 @@ struct Ctx {
     /// Dequantize-once path: q4tp plane → packed f16, then a pure f16
     /// coop GEMM. Both or neither.
     ffn_silu_packed: wgpu::ComputePipeline,
+    /// max|x| of a device panel → 1/scale for the coop GEMM.
+    act_absmax: Option<wgpu::ComputePipeline>,
     q4tp_dq_f16: Option<wgpu::ComputePipeline>,
     q4tp_mm_coop_f16: Option<wgpu::ComputePipeline>,
     /// The bake's f32-operand forward GEMM on the matrix units; None off
@@ -9949,6 +9951,9 @@ struct Scratch {
     /// (one grow-only slot: caching planes per tensor would want tens
     /// of GB on a DiT).
     dqw: Option<(wgpu::Buffer, u64)>,
+    /// Second plane slot: a fused FFN unpacks BOTH its weights into the
+    /// same command buffer, so one slot cannot serve them.
+    dqw2: Option<(wgpu::Buffer, u64)>,
     /// DiT attention: Q/K/V uploads, scores, panel, output, staging.
     dq: Option<(wgpu::Buffer, u64)>,
     dk: Option<(wgpu::Buffer, u64)>,
@@ -10598,6 +10603,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         Some(p)
     };
     let ffn_silu_packed = pipe("ffn_silu_mul_packed");
+    let act_absmax = mk_coop(COOP_AMAX_SRC, "act-absmax", "act_absmax");
     let q4tp_dq_f16 = (want_f16 && q4tp_mm_coop.is_some())
         .then(|| mk_coop(COOP_DQ_SRC, "q4tp-dq", "q4tp_dq_f16"))
         .flatten();
@@ -10944,6 +10950,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q2tp_mm,
         q4tp_mm_coop,
         ffn_silu_packed,
+        act_absmax,
         q4tp_dq_f16,
         q4tp_mm_coop_f16,
         gemm_nt_coop,
@@ -17096,6 +17103,17 @@ fn dq_f16_plane(
     rows: usize,
     cols: usize,
 ) -> Option<(wgpu::Buffer, wgpu::BindGroup)> {
+    dq_f16_plane_slot(c, sc, q_buf, rows, cols, false)
+}
+
+fn dq_f16_plane_slot(
+    c: &Ctx,
+    sc: &mut Scratch,
+    q_buf: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    second: bool,
+) -> Option<(wgpu::Buffer, wgpu::BindGroup)> {
     if cols % 2 != 0 {
         return None;
     }
@@ -17103,9 +17121,10 @@ fn dq_f16_plane(
     let bytes = (rows * cols * 2) as u64;
     // The caller already holds the scratch guard; std's Mutex is not
     // reentrant, and taking it again here hung the device at 0%.
+    let slot = if second { &mut sc.dqw2 } else { &mut sc.dqw };
     let plane = Scratch::ensure(
         &c.device,
-        &mut sc.dqw,
+        slot,
         bytes,
         wgpu::BufferUsages::STORAGE,
         "q4tp-dq-plane",
@@ -18301,25 +18320,89 @@ pub fn q4tp_ffn_packed(
         let wgs = ((b * inter) as u32).div_ceil(256);
         pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
     }
-    // fc2 stays on the SCALAR arm: its activations are the SwiGLU
-    // output, which lives on the device, and the cooperative kernel
-    // needs an activation scale the host cannot compute without reading
-    // that panel back — the very round trip this function exists to
-    // avoid. Without the scale its f16 operands overflow (measured:
-    // correct at 256×160, nearly blank frames at 512×288). A
-    // device-side max reduction feeding the scale is the follow-up;
-    // this arm reads f32 directly and cannot overflow.
-    encode_q4_tile_mm(
-        c,
-        &mut enc,
-        &c.q4tp_mm,
-        &w2b,
-        &act_buf,
-        &y_buf,
-        hidden,
-        inter,
-        b,
-    );
+    // fc2's input is the SwiGLU panel, which lives on the device — so
+    // its activation scale is computed there too (`act_absmax` writes
+    // 1/scale into one float) and the GEMM reads it from that buffer.
+    // Without a scale the f16 operands overflow: measured as nearly
+    // blank frames at 512×288 while 256×160 looked perfect. When the
+    // reduction or the f16 twin is unavailable, the scalar arm runs —
+    // it reads f32 and cannot overflow.
+    let asc_buf = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("pffn-ascale"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let dq2 = if std::env::var("CMF_FFN_FC2_COOP").as_deref() == Ok("1") {
+        let mut sc = c.scratch.lock().unwrap();
+        dq_f16_plane_slot(c, &mut sc, &w2b, hidden, inter, true)
+    } else {
+        None
+    };
+    // MEASURED NEUTRAL, so opt-in: putting fc2 on the matrix units costs
+    // a second plane unpack plus a max-reduction that one workgroup
+    // walks over the whole activation panel (330 MB at render size).
+    // Full render 139.8 s with it against 137.4 s without — the scalar
+    // arm wins on simplicity at the same speed. `CMF_FFN_FC2_COOP=1`
+    // takes it; a multi-workgroup reduction is what would tip it.
+    let want_fc2_coop = std::env::var("CMF_FFN_FC2_COOP").as_deref() == Ok("1");
+    match (
+        c.act_absmax.as_ref().filter(|_| want_fc2_coop),
+        &dq2,
+        c.q4tp_mm_coop_f16.as_ref(),
+    ) {
+        (Some(amax), Some((plane2, bind_dq2)), Some(pipe)) => {
+            {
+                let mut pass = begin_pass(&mut enc);
+                pass.set_pipeline(c.q4tp_dq_f16.as_ref().unwrap());
+                pass.set_bind_group(0, bind_dq2, &[]);
+                let wgs = ((hidden * inter / 2) as u32).div_ceil(256);
+                pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+            }
+            let ap = c
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&[(b * inter) as u32, 0u32, 0u32, 0u32]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let bg_amax = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &amax.get_bind_group_layout(0),
+                entries: &[bind_buf(0, &act_buf), bind_buf(1, &asc_buf), bind_buf(2, &ap)],
+            });
+            {
+                let mut pass = begin_pass(&mut enc);
+                pass.set_pipeline(amax);
+                pass.set_bind_group(0, &bg_amax, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            encode_q4_tile_mm_full(
+                c,
+                &mut enc,
+                pipe,
+                plane2,
+                &act_buf,
+                &y_buf,
+                hidden,
+                inter,
+                b,
+                0.0,
+                Some(&asc_buf),
+            );
+        }
+        _ => encode_q4_tile_mm(
+            c,
+            &mut enc,
+            &c.q4tp_mm,
+            &w2b,
+            &act_buf,
+            &y_buf,
+            hidden,
+            inter,
+            b,
+        ),
+    }
     readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * hidden])
 }
 
@@ -18932,7 +19015,7 @@ fn q4tp_mm_coop_f16(@builtin(workgroup_id) wid: vec3<u32>,
     coopStoreT(c2, &cm_c[sg * 16u * 64u + 32u], 64u);
     coopStoreT(c3, &cm_c[sg * 16u * 64u + 48u], 64u);
     workgroupBarrier();
-    let asc = bitcast<f32>(pmm.pad);
+    let asc = select(bitcast<f32>(pmm.pad), pmm_s[0], pmm.pad == 0xFFFFFFFFu);
     let aback = select(1.0, 1.0 / asc, asc > 0.0);
     for (var t = tid; t < 64u * 64u; t = t + 128u) {
         let m = t / 64u;
@@ -18940,6 +19023,48 @@ fn q4tp_mm_coop_f16(@builtin(workgroup_id) wid: vec3<u32>,
         if (m0 + m < pmm.nb && n0 + n < pmm.rows) {
             ymm[(m0 + m) * pmm.rows + n0 + n] = cm_c[m * 64u + n] * aback;
         }
+    }
+}
+"#;
+
+/// max|x| over a device panel, into one f32. The fused FFN's second GEMM
+/// reads its input from a buffer the host never sees, so the activation
+/// scale its f16 operands need has to be computed HERE — reading that
+/// panel back to find it would be the round trip the fusion exists to
+/// avoid. One workgroup: 256 partial maxima, then a tree reduce.
+const COOP_AMAX_SRC: &str = r#"
+struct AmP { n: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read>       amx : array<f32>;
+@group(0) @binding(1) var<storage, read_write> amo : array<f32>;
+@group(0) @binding(2) var<uniform>             amp : AmP;
+var<workgroup> am_red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn act_absmax(@builtin(local_invocation_index) lid: u32) {
+    var m = 0.0;
+    var i = lid;
+    loop {
+        if (i >= amp.n) { break; }
+        let v = abs(amx[i]);
+        if (v > m && v < 3.0e38) { m = v; }
+        i = i + 256u;
+    }
+    am_red[lid] = m;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) {
+            am_red[lid] = max(am_red[lid], am_red[lid + stride]);
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid == 0u) {
+        // Store the SCALE the GEMM multiplies by on load: bring the peak
+        // to ~1000, well inside f16's range, or leave the data alone.
+        let mx = am_red[0];
+        amo[0] = select(1.0, 1000.0 / mx, mx > 1000.0);
     }
 }
 "#;
@@ -19810,20 +19935,65 @@ fn encode_q4_tile_mm_scaled(
     k: usize,
     ascale: f32,
 ) {
-    let p_buf = uniform_u32x4(
-        c,
-        [(cols / 4) as u32, rows as u32, k as u32, ascale.to_bits()],
-    );
+    encode_q4_tile_mm_full(c, enc, pipeline, weight, xs, y, rows, cols, k, ascale, None)
+}
+
+/// The full form: `scale_buf` carries a DEVICE-computed activation scale
+/// (see `act_absmax`) for a GEMM whose input never reaches the host.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4_tile_mm_full(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    k: usize,
+    ascale: f32,
+    scale_buf: Option<&wgpu::Buffer>,
+) {
+    // 0xFFFFFFFF is not a float the host would ever pass; the kernel
+    // reads it as "take the scale from the buffer instead".
+    let pad = if scale_buf.is_some() {
+        0xFFFF_FFFFu32
+    } else {
+        ascale.to_bits()
+    };
+    let p_buf = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, k as u32, pad]);
     let layout = pipeline.get_bind_group_layout(0);
+    let dummy;
+    let sbuf = match scale_buf {
+        Some(b) => b,
+        None => {
+            dummy = c
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&[0.0f32]),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+            &dummy
+        }
+    };
+    let mut entries = vec![
+        bind_buf(0, weight),
+        bind_buf(1, xs),
+        bind_buf(2, y),
+        bind_buf(3, &p_buf),
+    ];
+    // Only the f16 twin declares binding 4; the others must not see it.
+    if c.q4tp_mm_coop_f16
+        .as_ref()
+        .is_some_and(|p| std::ptr::eq(p, pipeline))
+    {
+        entries.push(bind_buf(4, sbuf));
+    }
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &layout,
-        entries: &[
-            bind_buf(0, weight),
-            bind_buf(1, xs),
-            bind_buf(2, y),
-            bind_buf(3, &p_buf),
-        ],
+        entries: &entries,
     });
     let mut pass = begin_pass(enc);
     pass.set_pipeline(pipeline);

@@ -15,9 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   panel across the bus twice (at render size ~660 MB down and ~330 MB
   back up, per block, per step). `q4tp_ffn_packed` keeps fc1 → SwiGLU →
   fc2 in device buffers: one upload, one readback. DiT step at 256×160:
-  **16.0 s → 6.4 s**; full render **251.9 s → 137.4 s**, frames within
-  2.6% of the host reference. `CMF_MMH3_FFN=cpu` / `CMF_VAE3D_FFN=cpu`
+  **16.0 s → 6.4 s**; full render **251.9 s → 136.4 s**, frames within
+  2.6% of the host reference — and 716.6 s → 136.4 s (**5.3×**) against
+  where the host path started. `CMF_MMH3_FFN=cpu` / `CMF_VAE3D_FFN=cpu`
   force the host chain.
+
+### Added (measured neutral, kept behind a flag)
+- **`CMF_FFN_FC2_COOP=1`** puts the fused FFN's second GEMM on the
+  matrix units, with the activation scale computed ON the device
+  (`act_absmax` reduces max|x| of a panel the host never sees, and the
+  cooperative kernel reads its scale from that buffer instead of a
+  uniform). Correct — frames match the default path exactly — but a
+  wash: 139.8 s against 137.4 s, because a second plane unpack plus a
+  single-workgroup reduction over 330 MB costs what the tensor cores
+  save. The lever that would tip it is a multi-workgroup reduction.
 
 ### Fixed
 - **`.min(MAX_WG)` on a 1-D dispatch is silent corruption, not a
