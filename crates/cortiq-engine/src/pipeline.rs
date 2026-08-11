@@ -5747,13 +5747,19 @@ fn draft_probe() -> bool {
         // prefix and the tail continues per-op. That explanation was
         // wrong and is retracted.
         //
-        // So the 2.6× is still unexplained. What to measure next, in
-        // order: whether `gl` is 0 on this model (a prefix of nothing
-        // means every layer walks per-op on BOTH arms, and then the
-        // split's extra cost is the per-token hidden hand-off between
-        // devices, not the graph); and whether the recurrent state of
-        // the linear layers is being moved or rebuilt across the
-        // segment boundary, which one card never has to do.
+        // MEASURED (`CMF_GPU_DEBUG=1` prints the coverage below):
+        // `covered 0 of 14 layers [0..14)` and `0 of 13 [14..27)`. The
+        // graph builds NOTHING for this model, so every layer walks
+        // per-op on one card and on two alike — which rules the graph
+        // out of the 2.6× entirely.
+        //
+        // What is left is what the split adds to a per-op stack, and
+        // the hidden hand-off is too small to be it: one vector a token
+        // against 82 ms a token on one card. The remaining suspect is
+        // residency — with the stack split, each device holds half the
+        // weights but the VRAM budget is per context, so if the second
+        // device's half is not resident it streams every token. Measure
+        // `weight_is_resident` per segment before anything else.
         //
         // Span runs (network split): the graph covers exactly [from..=upto]
         // — one submit per SEGMENT per token. No race: its state is global
@@ -5767,6 +5773,20 @@ fn draft_probe() -> bool {
             let span_res =
                 self.try_token_graph_wgpu_span(hidden, position, &mut lg, from, upto_excl, &mut gl);
             graph_note(span_res.is_some() && gl == upto_excl - from);
+            if std::env::var("CMF_GPU_DEBUG").is_ok() {
+                // How much of the span the graph actually covered. A
+                // prefix of nothing means every layer walks per-op and
+                // the split's extra cost is elsewhere.
+                static SEEN: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                    eprintln!(
+                        "span graph: covered {gl} of {} layers [{from}..{upto_excl}) res={}",
+                        upto_excl - from,
+                        span_res.is_some()
+                    );
+                }
+            }
             if let Some(hh) = span_res {
                 if gl == upto_excl - from {
                     if !lg.is_empty() {
