@@ -10620,7 +10620,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let ffn_silu_packed = pipe("ffn_silu_mul_packed");
     let act_absmax = mk_coop(COOP_AMAX_SRC, "act-absmax", "act_absmax");
     let dit_qkv_split = mk_coop(DIT_SPLIT_SRC, "dit-split", "dit_qkv_split");
-    let dit_v_transpose = mk_coop(DIT_SPLIT_SRC, "dit-vt", "dit_v_transpose");
+    let dit_v_transpose = mk_coop(DIT_VT_SRC, "dit-vt", "dit_v_transpose");
     let dit_gemm_coop = (q4tp_mm_coop.is_some())
         .then(|| mk_coop(DIT_COOP_SRC, "dit-coop", "dit_gemm_coop"))
         .flatten();
@@ -17899,10 +17899,7 @@ fn dit_attention_inner(
             let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &tp.get_bind_group_layout(0),
-                // An auto layout is per ENTRY POINT: dit_v_transpose
-                // touches sq, sk and sp only, so binding the split
-                // kernel's full set fails validation (5 against 3).
-                entries: &[bind_buf(0, &vb), bind_buf(1, &vt), bind_buf(4, &u)],
+                entries: &[bind_buf(0, &vb), bind_buf(1, &vt), bind_buf(2, &u)],
             });
             let mut e = c
                 .device
@@ -17952,7 +17949,13 @@ fn dit_attention_inner(
                 ],
             })
         });
-        let bg_pv_coop = match (coop_dit, &vtb) {
+        // The NT form needs its reduction width in multiples of four
+        // (`cols4 * 4`), and PV reduces over n — 1859 at render size,
+        // which truncates to 1856 and quietly drops three columns of
+        // every score row (measured: frames 59% off). Until the kernel
+        // carries a true-k alongside cols4, take it only when n divides.
+        let pv_nt_ok = n % 4 == 0;
+        let bg_pv_coop = match (coop_dit.filter(|_| pv_nt_ok), &vtb) {
             (Some(p), Some(vt)) => {
                 let u = c
                     .device
@@ -19723,6 +19726,30 @@ fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
 /// head-major planes attention wants. Measured motive: doing this on
 /// the host cost 4.4 s of a 7.3 s attention phase — more than the
 /// device work it was feeding.
+/// v per head from [n][hd] to [hd][n], in its OWN module. It lived in
+/// the split kernel's module first, and could not be bound: wgpu builds
+/// an auto layout PER ENTRY POINT, so a kernel touching bindings 0, 1
+/// and 4 of a five-binding module gets a three-entry layout whose
+/// numbering is its own ("no declaration for binding 0").
+const DIT_VT_SRC: &str = r#"
+struct VtP { n: u32, nh: u32, hd: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       vt_src: array<f32>;
+@group(0) @binding(1) var<storage, read_write> vt_dst: array<f32>;
+@group(0) @binding(2) var<uniform>             vt_p: VtP;
+
+@compute @workgroup_size(256)
+fn dit_v_transpose(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let total = vt_p.n * vt_p.nh * vt_p.hd;
+    let i = gid.y * (65535u * 256u) + gid.x;
+    if (i >= total) { return; }
+    let h = i / (vt_p.n * vt_p.hd);
+    let r = i - h * vt_p.n * vt_p.hd;
+    let p = r / vt_p.hd;
+    let d = r - p * vt_p.hd;
+    vt_dst[h * vt_p.n * vt_p.hd + d * vt_p.n + p] = vt_src[i];
+}
+"#;
+
 const DIT_SPLIT_SRC: &str = r#"
 struct SpP { n: u32, nh: u32, hd: u32, _p: u32 };
 @group(0) @binding(0) var<storage, read>       sqkv: array<f32>;
@@ -19730,23 +19757,6 @@ struct SpP { n: u32, nh: u32, hd: u32, _p: u32 };
 @group(0) @binding(2) var<storage, read_write> sk: array<f32>;
 @group(0) @binding(3) var<storage, read_write> sv: array<f32>;
 @group(0) @binding(4) var<uniform>             sp: SpP;
-
-// v per head from [n][hd] to [hd][n]. PV reads its right operand down
-// columns in the [n][hd] layout — measured 4.76 s a step against QK's
-// 1.65 at identical FLOPs. n·hd of copying buys that back.
-@compute @workgroup_size(256)
-fn dit_v_transpose(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let inner = sp.nh * sp.hd;
-    let total = sp.n * inner;
-    let i = gid.y * (65535u * 256u) + gid.x;
-    if (i >= total) { return; }
-    let h = i / (sp.n * sp.hd);
-    let r = i - h * sp.n * sp.hd;
-    let p = r / sp.hd;
-    let d = r - p * sp.hd;
-    // sq holds v in head-major [h][n][hd]; sk receives [h][hd][n].
-    sk[h * sp.n * sp.hd + d * sp.n + p] = sq[i];
-}
 
 @compute @workgroup_size(256)
 fn dit_qkv_split(@builtin(global_invocation_id) gid: vec3<u32>) {
