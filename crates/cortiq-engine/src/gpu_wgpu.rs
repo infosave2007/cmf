@@ -9841,6 +9841,9 @@ struct Ctx {
     /// the other's operand. The scratch lock cannot cover it: `readback`
     /// takes that lock itself, and std mutexes do not re-enter.
     mm_gate: Mutex<()>,
+    /// One unpacked f16 plane PER WEIGHT, kept across calls — the
+    /// scratch-slot version re-unpacked every weight before every GEMM.
+    planes: Mutex<std::collections::HashMap<(usize, usize), (wgpu::Buffer, u64)>>,
     /// Resident quant weights in VRAM — the WHOLE tensor is loaded once
     /// (key (base_ptr, idx)); ranges/batches address it by offset.
     ///
@@ -11123,6 +11126,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         resident: std::sync::atomic::AtomicU64::new(0),
         scratch: Mutex::new(Scratch::default()),
         mm_gate: Mutex::new(()),
+        planes: Mutex::new(std::collections::HashMap::new()),
         weight_bufs: Mutex::new(HashMap::new()),
         dsv4_kv: Mutex::new(HashMap::new()),
         dsv4_scratch: Mutex::new(HashMap::new()),
@@ -17220,6 +17224,63 @@ pub fn q2tp_matmat(
 /// Lumina's DiT is ~6 GB of planes (fits a 32 GB card and pays for
 /// itself over 30 steps) while MiniMax's 25.7 GB does not — the cache
 /// has to evict, and the honest policy is largest-first by call count.
+/// An f16 plane per weight, kept for the life of the context. Returns
+/// the plane and — only when it was just created — the bind group its
+/// unpack pass needs, so a warm plane costs the caller one hash lookup
+/// and no dispatch at all.
+///
+/// Bounded, because a plane is 2× the q4 bytes: `CMF_PLANE_CACHE_MB`
+/// (default 8192) is the ceiling, and past it this refuses rather than
+/// evicting — a DiT that does not fit keeps the old behaviour instead
+/// of thrashing.
+fn plane_cached(
+    c: &Ctx,
+    key: (usize, usize),
+    q_buf: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+) -> Option<(wgpu::Buffer, Option<wgpu::BindGroup>)> {
+    if cols % 2 != 0 {
+        return None;
+    }
+    let pipe = c.q4tp_dq_f16.as_ref()?;
+    let bytes = (rows * cols * 2) as u64;
+    let cap = std::env::var("CMF_PLANE_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(8192)
+        * 1024
+        * 1024;
+    let mut m = c.planes.lock().unwrap();
+    if let Some((p, _)) = m.get(&key) {
+        return Some((p.clone(), None));
+    }
+    let used: u64 = m.values().map(|(_, b)| *b).sum();
+    if used + bytes > cap {
+        return None;
+    }
+    let plane = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("q4tp-plane-cached"),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let u = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[cols as u32, rows as u32, 0u32, 0u32]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipe.get_bind_group_layout(0),
+        entries: &[bind_buf(0, q_buf), bind_buf(1, &plane), bind_buf(2, &u)],
+    });
+    m.insert(key, (plane.clone(), bytes));
+    Some((plane, Some(bind)))
+}
+
 fn dq_f16_plane(
     c: &Ctx,
     sc: &mut Scratch,
@@ -31125,7 +31186,9 @@ pub fn dit_block_seg(
         && c.q4tp_mm_coop_f16.is_some()
         && c.q4tp_dq_f16.is_some()
         && ((c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some());
+    let uid = model.uid() as usize;
     let mm_enc = |enc: &mut wgpu::CommandEncoder,
+                  idx: usize,
                   w: &wgpu::Buffer,
                   xs: &wgpu::Buffer,
                   y: &wgpu::Buffer,
@@ -31133,16 +31196,15 @@ pub fn dit_block_seg(
                   cols: usize,
                   k: usize| {
         if coop16 && cols % 2 == 0 {
-            let dq = {
-                let mut sc = c.scratch.lock().unwrap();
-                dq_f16_plane(c, &mut sc, w, rows, cols)
-            };
-            if let (Some((plane, bind_dq)), Some(pdq), Some(pipe)) = (
+            // Cached per weight: the unpack pass is encoded on the FIRST
+            // step only, and the remaining twenty-nine read the plane.
+            let dq = plane_cached(c, (uid, idx), w, rows, cols);
+            if let (Some((plane, fresh)), Some(pdq), Some(pipe)) = (
                 &dq,
                 c.q4tp_dq_f16.as_ref(),
                 c.q4tp_mm_coop_f16.as_ref(),
             ) {
-                {
+                if let Some(bind_dq) = fresh {
                     let mut pass = begin_pass(enc);
                     pass.set_pipeline(pdq);
                     pass.set_bind_group(0, bind_dq, &[]);
@@ -31200,9 +31262,9 @@ pub fn dit_block_seg(
     };
     norm(&mut enc, &xb, &n1w, &smsa, &xn, &dm_p);
     // E2 — the three projections.
-    mm_enc(&mut enc, &wq, &xn, &qtok, nh * hd, hs, n);
-    mm_enc(&mut enc, &wk, &xn, &ktok, nkv * hd, hs, n);
-    mm_enc(&mut enc, &wv, &xn, &vtok, nkv * hd, hs, n);
+    mm_enc(&mut enc, a.wq, &wq, &xn, &qtok, nh * hd, hs, n);
+    mm_enc(&mut enc, a.wk, &wk, &xn, &ktok, nkv * hd, hs, n);
+    mm_enc(&mut enc, a.wv, &wv, &xn, &vtok, nkv * hd, hs, n);
     // E3 — qk-norm + RoPE into head-major panels; v is packed as is.
     let scale = 1.0f32 / (hd as f32).sqrt();
     let rope_pass = |enc: &mut wgpu::CommandEncoder,
@@ -31428,7 +31490,7 @@ pub fn dit_block_seg(
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups_flat(((nh * n * hd) as u32).div_ceil(256));
     }
-    mm_enc(&mut enc, &wo, &attn, &proj, hs, nh * hd, n);
+    mm_enc(&mut enc, a.wo, &wo, &attn, &proj, hs, nh * hd, n);
     let gr_p = c
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -31459,8 +31521,8 @@ pub fn dit_block_seg(
     gated(&mut enc, &proj, &n2w, &gmsa);
     // E6 — FFN: modulated norm, SwiGLU, gated residual.
     norm(&mut enc, &xb, &f1w, &smlp, &xn, &dm_p);
-    mm_enc(&mut enc, &w1, &xn, &gbuf, inter, hs, n);
-    mm_enc(&mut enc, &w3, &xn, &ubuf, inter, hs, n);
+    mm_enc(&mut enc, a.w1, &w1, &xn, &gbuf, inter, hs, n);
+    mm_enc(&mut enc, a.w3, &w3, &xn, &ubuf, inter, hs, n);
     {
         let n1 = u4([(n * inter) as u32, 0, 0, 0]);
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -31479,7 +31541,7 @@ pub fn dit_block_seg(
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups_flat(((n * inter) as u32).div_ceil(256));
     }
-    mm_enc(&mut enc, &w2, &abuf, &proj, hs, inter, n);
+    mm_enc(&mut enc, a.w2, &w2, &abuf, &proj, hs, inter, n);
     gated(&mut enc, &proj, &f2w, &gmlp);
     let bytes = (n * hs * 4) as u64;
     if a.resident_out {
