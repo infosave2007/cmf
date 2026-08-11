@@ -9660,6 +9660,8 @@ struct Ctx {
     ffn_silu_packed: wgpu::ComputePipeline,
     /// max|x| of a device panel → the scale the coop GEMM multiplies by.
     act_absmax: Option<wgpu::ComputePipeline>,
+    /// The DiT's attention GEMMs on the matrix units.
+    dit_gemm_coop: Option<wgpu::ComputePipeline>,
     /// Two-stage form of the same: partials, then a fold.
     act_amax_part: Option<wgpu::ComputePipeline>,
     act_amax_fold: Option<wgpu::ComputePipeline>,
@@ -10609,6 +10611,9 @@ fn init(dev: usize) -> Result<Ctx, String> {
     };
     let ffn_silu_packed = pipe("ffn_silu_mul_packed");
     let act_absmax = mk_coop(COOP_AMAX_SRC, "act-absmax", "act_absmax");
+    let dit_gemm_coop = (q4tp_mm_coop.is_some())
+        .then(|| mk_coop(DIT_COOP_SRC, "dit-coop", "dit_gemm_coop"))
+        .flatten();
     let act_amax_part = mk_coop(COOP_AMAX_SRC, "act-absmax-p", "act_absmax_part");
     let act_amax_fold = mk_coop(COOP_AMAX_SRC, "act-absmax-f", "act_absmax_fold");
     let q4tp_dq_f16 = (want_f16 && q4tp_mm_coop.is_some())
@@ -10958,6 +10963,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mm_coop,
         ffn_silu_packed,
         act_absmax,
+        dit_gemm_coop,
         act_amax_part,
         act_amax_fold,
         q4tp_dq_f16,
@@ -17707,8 +17713,44 @@ pub fn dit_attention(
     let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("dit-attn"),
     });
+    // Opt-in while it earns its keep: CMF_DIT_ATTN_COOP=1.
+    let coop_dit = c
+        .dit_gemm_coop
+        .as_ref()
+        .filter(|_| std::env::var("CMF_DIT_ATTN_COOP").as_deref() == Ok("1"));
     for h in 0..nh {
         let kv = (h / hpk) as u64;
+        // QK on the matrix units: x = this head's q rows, w = its k
+        // rows, y = its score plane; offsets in ELEMENTS, as the kernel
+        // reads them.
+        let bg_qk_coop = coop_dit.map(|p| {
+            let u = c
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&[
+                        (hd / 4) as u32,
+                        n as u32,
+                        n as u32,
+                        scale.to_bits(),
+                        (h * n * hd) as u32,
+                        (kv as usize * n * hd) as u32,
+                        0u32,
+                        0u32,
+                    ]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &p.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, &kb),
+                    bind_buf(1, &qb),
+                    bind_buf(2, &scb),
+                    bind_buf(3, &u),
+                ],
+            })
+        });
         let bg_qk = bind(
             &c.dit_qk,
             &qb,
@@ -17761,9 +17803,30 @@ pub fn dit_attention(
                 label: Some("dit-qk"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&c.dit_qk);
-            pass.set_bind_group(0, &bg_qk, &[]);
-            pass.dispatch_workgroups((n as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
+            // Matrix units when the device has them and the caller opted
+            // in: same NT product, f16 operands, f32 accumulator. The
+            // scalar tile kernel below runs this attention at 0.5
+            // TFLOP/s where the card's q4tp GEMM holds 51.9.
+            match (&coop_dit, &bg_qk_coop) {
+                (Some(p), Some(bgc)) => {
+                    pass.set_pipeline(p);
+                    pass.set_bind_group(0, bgc, &[]);
+                    pass.dispatch_workgroups(
+                        (n as u32).div_ceil(64),
+                        (n as u32).div_ceil(64),
+                        1,
+                    );
+                }
+                _ => {
+                    pass.set_pipeline(&c.dit_qk);
+                    pass.set_bind_group(0, &bg_qk, &[]);
+                    pass.dispatch_workgroups(
+                        (n as u32).div_ceil(64),
+                        (n as u32).div_ceil(64),
+                        1,
+                    );
+                }
+            }
         }
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -19357,6 +19420,118 @@ fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
 /// only difference is that the B tile reads f32 planes instead of
 /// dequantizing nibbles. f16 operands, f32 accumulator — the same
 /// numerics contract the DiT ships with.
+/// The DiT's attention GEMMs on the matrix units. Same tiling and load
+/// choreography as `COOP_NT_SRC`, plus what attention needs: per-head
+/// offsets into the packed planes, a score scale, and GQA's head
+/// mapping. Measured motive: `dit_qk`/`dit_pv` are scalar f32 and run
+/// the attention at 0.5 TFLOP/s where this card's q4tp GEMM holds 51.9.
+const DIT_COOP_SRC: &str = r#"
+enable wgpu_cooperative_matrix;
+enable f16;
+
+struct DcP {
+    cols4: u32,  // k/4 (the reduction width)
+    rows: u32,   // output columns of the NT product
+    nb: u32,     // output rows
+    scale: f32,  // applied at the store (QK only; 1.0 for PV)
+    a_off: u32,  // element offset of this head's x plane
+    b_off: u32,  // element offset of this head's w plane
+    c_off: u32,  // element offset of this head's y plane
+    _pad: u32,
+};
+@group(0) @binding(0) var<storage, read> dcw: array<f32>;
+@group(0) @binding(1) var<storage, read> dcx: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dcy: array<f32>;
+@group(0) @binding(3) var<uniform> dcp: DcP;
+
+const KS: u32 = 32u;
+var<workgroup> dm_a: array<f16, 64 * 32>;
+var<workgroup> dm_b: array<f16, 64 * 32>;
+var<workgroup> dm_c: array<f32, 64 * 64>;
+
+@compute @workgroup_size(128)
+fn dit_gemm_coop(@builtin(workgroup_id) wid: vec3<u32>,
+                 @builtin(local_invocation_index) tid: u32,
+                 @builtin(subgroup_id) sg: u32) {
+    let cols = dcp.cols4 * 4u;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    var c0: coop_mat16x16<f32, C>;
+    var c1: coop_mat16x16<f32, C>;
+    var c2: coop_mat16x16<f32, C>;
+    var c3: coop_mat16x16<f32, C>;
+
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let m = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            let dst = m * KS + k4;
+            var v = vec4<f32>(0.0);
+            if (m0 + m < dcp.nb && col0 < cols) {
+                let base = dcp.a_off + (m0 + m) * cols + col0;
+                v = vec4<f32>(dcx[base], dcx[base + 1u], dcx[base + 2u], dcx[base + 3u]);
+            }
+            dm_a[dst] = f16(v.x); dm_a[dst + 1u] = f16(v.y);
+            dm_a[dst + 2u] = f16(v.z); dm_a[dst + 3u] = f16(v.w);
+        }
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let nn = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            let bd = nn * KS + k4;
+            var wv = vec4<f32>(0.0);
+            if (n0 + nn < dcp.rows && col0 < cols) {
+                let base = dcp.b_off + (n0 + nn) * cols + col0;
+                wv = vec4<f32>(dcw[base], dcw[base + 1u], dcw[base + 2u], dcw[base + 3u]);
+            }
+            dm_b[bd] = f16(wv.x); dm_b[bd + 1u] = f16(wv.y);
+            dm_b[bd + 2u] = f16(wv.z); dm_b[bd + 3u] = f16(wv.w);
+        }
+        workgroupBarrier();
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&dm_a[sg * 512u + 0u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&dm_b[0u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&dm_b[512u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&dm_b[1024u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&dm_b[1536u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&dm_a[sg * 512u + 16u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&dm_b[16u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&dm_b[528u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&dm_b[1040u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&dm_b[1552u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        workgroupBarrier();
+        k0 = k0 + KS;
+    }
+    workgroupBarrier();
+    coopStoreT(c0, &dm_c[sg * 16u * 64u + 0u], 64u);
+    coopStoreT(c1, &dm_c[sg * 16u * 64u + 16u], 64u);
+    coopStoreT(c2, &dm_c[sg * 16u * 64u + 32u], 64u);
+    coopStoreT(c3, &dm_c[sg * 16u * 64u + 48u], 64u);
+    workgroupBarrier();
+    for (var t = tid; t < 64u * 64u; t = t + 128u) {
+        let m = t / 64u;
+        let nn = t % 64u;
+        if (m0 + m < dcp.nb && n0 + nn < dcp.rows) {
+            dcy[dcp.c_off + (m0 + m) * dcp.rows + n0 + nn] = dm_c[m * 64u + nn] * dcp.scale;
+        }
+    }
+}
+"#;
+
 const COOP_NT_SRC: &str = r#"
 enable wgpu_cooperative_matrix;
 enable f16;
