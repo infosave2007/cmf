@@ -3626,6 +3626,10 @@ fn cmd_animate(
     if let Some(rep) = cortiq_engine::mmh3::mmh3_prof_report() {
         println!("{rep}");
     }
+    #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+    if let Some(rep) = cortiq_engine::gpu_wgpu::dit_phase_report() {
+        println!("  {rep}");
+    }
     Ok(())
 }
 
