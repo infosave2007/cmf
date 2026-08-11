@@ -18154,15 +18154,20 @@ pub fn dit_attention_packed_src(
     // q and k differing only in the output plane, the weight buffer and
     // src_off. When `nr` is None the caller already did this on the host.
     if std::env::var("CMF_GPU_DEBUG").is_ok() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
+        // Once per LAYOUT, not once per process: a single `Once` is
+        // spent by the DiT's first call and the VAE's never prints.
+        static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let bit = 1u32 << layout.min(1);
+        if SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
             eprintln!(
-                "packed_src: layout={layout} bias={} qknorm={} nr={} n={n} nh={nh} hd={hd}",
+                "packed_src: layout={layout} bias={} qknorm={} nr={} pre={} n={n} nh={nh} hd={hd} pairs={}",
                 qkv_bias.is_some(),
                 c.dit_qknorm.is_some(),
                 nr.is_some(),
-            )
-        });
+                pre.is_some(),
+                nr.map_or(0, |(a, _, _, _)| if a.is_empty() { 0 } else { a.len() / n }),
+            );
+        }
     }
     if let (Some(pipe), Some((angles, qw, kw, eps))) = (c.dit_qknorm.as_ref(), nr) {
         let pairs = if angles.is_empty() { 0 } else { angles.len() / n };
