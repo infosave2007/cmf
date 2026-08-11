@@ -26,9 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`act_absmax` reduces max|x| of a panel the host never sees, and the
   cooperative kernel reads its scale from that buffer instead of a
   uniform). Correct — frames match the default path exactly — but a
-  wash: 139.8 s against 137.4 s, because a second plane unpack plus a
-  single-workgroup reduction over 330 MB costs what the tensor cores
-  save. The lever that would tip it is a multi-workgroup reduction.
+  wash: 139.8 s against 137.4 s. The suspected cause — a single
+  workgroup walking 330 MB — was then removed (a two-stage reduction:
+  512 workgroups of partials, then a fold) and it made no difference
+  either: 139.6 s, frames bit-identical. So the cost is the SECOND plane
+  unpack, 77 M elements per call, and the scalar arm stays the default
+  on evidence rather than on suspicion.
 
 ### Fixed
 - **`.min(MAX_WG)` on a 1-D dispatch is silent corruption, not a
