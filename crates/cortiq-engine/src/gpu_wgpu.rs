@@ -17120,6 +17120,27 @@ pub fn weight_is_resident(model: &Arc<CmfModel>, idx: usize) -> bool {
         .contains_key(&(model.uid() as usize, idx))
 }
 
+/// q4tp GEMM whose result STAYS on the device: the caller gets the
+/// buffer, not a host copy. The DiT computed qkv on the card, read
+/// 160 MB back per block, and the attention split uploaded the same
+/// bytes again — 320 MB a block of pure round trip.
+pub fn q4tp_matmat_dev(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+) -> Option<wgpu::Buffer> {
+    let c = ctx()?;
+    let mut out = Vec::new();
+    // Reuse the whole validated path; `keep` swaps the readback for a
+    // handle to the same buffer.
+    let buf = tp_matmat_keep(model, idx, xs, b, rows, cols, &mut out, false)?;
+    let _ = c;
+    Some(buf)
+}
+
 pub fn q4tp_matmat(
     model: &Arc<CmfModel>,
     idx: usize,
@@ -17214,17 +17235,45 @@ fn tp_matmat(
     out: &mut [f32],
     two_bit: bool,
 ) -> bool {
-    let Some(c) = ctx() else { return false };
+    tp_matmat_impl(model, idx, xs, b, rows, cols, Some(out), two_bit).is_some()
+}
+
+/// Result stays on the device; the caller owns the returned handle.
+fn tp_matmat_keep(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    _unused: &mut Vec<f32>,
+    two_bit: bool,
+) -> Option<wgpu::Buffer> {
+    tp_matmat_impl(model, idx, xs, b, rows, cols, None, two_bit)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tp_matmat_impl(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: Option<&mut [f32]>,
+    two_bit: bool,
+) -> Option<wgpu::Buffer> {
+    let c = ctx()?;
     let gpr = cols / 32;
     if cols % 32 != 0 || rows == 0 || b == 0 {
-        return false;
+        return None;
     }
     let entry = &model.tensors[idx];
     if entry.shape.first().copied().unwrap_or(0) < rows {
-        return false;
+        return None;
     }
     let Some(abs) = model.entry_abs_offset(entry) else {
-        return false;
+        return None;
     };
     let bytes = model.primary_bytes();
     let plen = entry.nbytes as usize;
@@ -17235,7 +17284,7 @@ fn tp_matmat(
     };
     let Some(need) = cortiq_core::quant::expected_nbytes(dt, &[rows, cols])
     else {
-        return false;
+        return None;
     };
     if std::env::var("CMF_GPU_DEBUG").is_ok() && b >= 512 {
         use std::collections::HashSet;
@@ -17245,16 +17294,16 @@ fn tp_matmat(
         if g.get_or_insert_with(HashSet::new).insert((rows, cols)) {
             eprintln!(
                 "tp_matmat entry: {rows}x{cols} plen={plen} need={need} xs={} b*cols={} out={} b*rows={}",
-                xs.len(), b * cols, out.len(), b * rows
+                xs.len(), b * cols, out.as_ref().map_or(0, |o| o.len()), b * rows
             );
         }
     }
-    if plen < need || abs + plen > bytes.len() || xs.len() < b * cols || out.len() < b * rows {
-        return false;
+    if plen < need || abs + plen > bytes.len() || xs.len() < b * cols || out.as_ref().is_some_and(|o| o.len() < b * rows) {
+        return None;
     }
     let q_buf = match weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]) {
         Some(bf) => bf,
-        None => return false,
+        None => return None,
     };
     let mut sc = c.scratch.lock().unwrap();
     let xs_buf = Scratch::ensure(
@@ -17395,7 +17444,20 @@ fn tp_matmat(
             1,
         );
     }
-    readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * rows])
+    match out {
+        Some(o) => {
+            if readback(c, enc, &y_buf, &stage_buf, y_size, &mut o[..b * rows]) {
+                Some(y_buf)
+            } else {
+                None
+            }
+        }
+        None => {
+            // No host copy: submit and hand the buffer over.
+            c.queue.submit(Some(enc.finish()));
+            Some(y_buf)
+        }
+    }
 }
 
 pub fn q4t_matmat(
