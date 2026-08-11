@@ -31074,6 +31074,19 @@ pub fn dit_block_seg(
         b
     };
     let u4 = |v: [u32; 4]| uniform_u32x4(c, v);
+    // THE IMAGE DiT'S BIGGEST REMAINING LEVER, and it is a known one:
+    // this is the scalar arm — `q4tp_mm`, which unpacks the weight tile
+    // inside the GEMM loop and repeats that for every 64-row tile of
+    // activations. The matrix units are never touched. The same switch
+    // on the video DiT (dequantize the plane ONCE into f16, then run the
+    // pure f16 GEMM `q4tp_mm_coop_f16`) took its step 22.1 s → 14.7 s.
+    //
+    // Denoise is 13.0 s of a 20.4 s image and 88.5% of it is this block,
+    // so the arm is worth ~4 s a render. The wiring is the work: each
+    // weight needs its own plane from `dq_f16_plane` — which caches per
+    // tensor, so 30 steps pay for it once — and every bind group here
+    // grows a fifth entry for the activation scale (or the 0xFFFFFFFF
+    // sentinel and a device-computed one, as `tp_matmat_impl` does).
     let mm = mm_pipeline(c, a.q4tp, false);
     let mut enc = c
         .device
