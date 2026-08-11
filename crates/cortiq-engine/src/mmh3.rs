@@ -877,6 +877,15 @@ impl MiniMaxH3 {
         }
         Self::prof(0, t);
         let t = std::time::Instant::now();
+        // The panel could stay on the card from here: the backend has
+        // `dit_qkv_attention` (GEMM into a device buffer + split that
+        // reads it there), and with qk-norm now on the device nothing
+        // else touches the panel on the host — 160 MB down and the same
+        // back up, per block. What blocks the call is shape, not
+        // capability: taking it means returning early from the middle of
+        // this function, and the FFN tail below would have to be a
+        // function of its own first. That extraction is the last step of
+        // task #33.
         let mut qkv = vec![0f32; n * 3 * inner];
         blk.qkv.matmat(&xn, n, &mut qkv, pool);
         Self::prof(1, t);
