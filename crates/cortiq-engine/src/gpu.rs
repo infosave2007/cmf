@@ -1599,6 +1599,54 @@ pub fn dit_qkv_attn_out(
     }
 }
 
+/// The VAE decoder's attention half on the card. Only `proj` returns.
+#[allow(clippy::too_many_arguments)]
+pub fn vae_qkv_attn_out(
+    model: &Arc<CmfModel>,
+    qkv_idx: usize,
+    out_idx: usize,
+    xn: &[f32],
+    n: usize,
+    dim: usize,
+    nh: usize,
+    hd: usize,
+    scale: f32,
+    angles: &[f32],
+    eps: f32,
+    qkv_bias: &[f32],
+    proj: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::vae_qkv_attn_out(
+            model, qkv_idx, out_idx, xn, n, dim, nh, hd, scale, angles, eps, qkv_bias, proj,
+        ),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn vae_attention_packed(
+    qkv: &[f32],
+    nh: usize,
+    n: usize,
+    hd: usize,
+    scale: f32,
+    angles: &[f32],
+    eps: f32,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => {
+            crate::gpu_wgpu::vae_attention_packed(qkv, nh, n, hd, scale, angles, eps, out)
+        }
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 pub fn dit_attention_packed(
     qkv: &[f32],
     nh: usize,
