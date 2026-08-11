@@ -9658,8 +9658,11 @@ struct Ctx {
     /// Dequantize-once path: q4tp plane → packed f16, then a pure f16
     /// coop GEMM. Both or neither.
     ffn_silu_packed: wgpu::ComputePipeline,
-    /// max|x| of a device panel → 1/scale for the coop GEMM.
+    /// max|x| of a device panel → the scale the coop GEMM multiplies by.
     act_absmax: Option<wgpu::ComputePipeline>,
+    /// Two-stage form of the same: partials, then a fold.
+    act_amax_part: Option<wgpu::ComputePipeline>,
+    act_amax_fold: Option<wgpu::ComputePipeline>,
     q4tp_dq_f16: Option<wgpu::ComputePipeline>,
     q4tp_mm_coop_f16: Option<wgpu::ComputePipeline>,
     /// The bake's f32-operand forward GEMM on the matrix units; None off
@@ -9954,6 +9957,8 @@ struct Scratch {
     /// Second plane slot: a fused FFN unpacks BOTH its weights into the
     /// same command buffer, so one slot cannot serve them.
     dqw2: Option<(wgpu::Buffer, u64)>,
+    /// Partial maxima of the two-stage activation reduction.
+    amaxp: Option<(wgpu::Buffer, u64)>,
     /// DiT attention: Q/K/V uploads, scores, panel, output, staging.
     dq: Option<(wgpu::Buffer, u64)>,
     dk: Option<(wgpu::Buffer, u64)>,
@@ -10604,6 +10609,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
     };
     let ffn_silu_packed = pipe("ffn_silu_mul_packed");
     let act_absmax = mk_coop(COOP_AMAX_SRC, "act-absmax", "act_absmax");
+    let act_amax_part = mk_coop(COOP_AMAX_SRC, "act-absmax-p", "act_absmax_part");
+    let act_amax_fold = mk_coop(COOP_AMAX_SRC, "act-absmax-f", "act_absmax_fold");
     let q4tp_dq_f16 = (want_f16 && q4tp_mm_coop.is_some())
         .then(|| mk_coop(COOP_DQ_SRC, "q4tp-dq", "q4tp_dq_f16"))
         .flatten();
@@ -10951,6 +10958,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mm_coop,
         ffn_silu_packed,
         act_absmax,
+        act_amax_part,
+        act_amax_fold,
         q4tp_dq_f16,
         q4tp_mm_coop_f16,
         gemm_nt_coop,
@@ -18366,16 +18375,65 @@ pub fn q4tp_ffn_packed(
                     contents: bytemuck::cast_slice(&[(b * inter) as u32, 0u32, 0u32, 0u32]),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
-            let bg_amax = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &amax.get_bind_group_layout(0),
-                entries: &[bind_buf(0, &act_buf), bind_buf(1, &asc_buf), bind_buf(2, &ap)],
-            });
-            {
-                let mut pass = begin_pass(&mut enc);
-                pass.set_pipeline(amax);
-                pass.set_bind_group(0, &bg_amax, &[]);
-                pass.dispatch_workgroups(1, 1, 1);
+            // Two stages when both halves are available: N workgroups
+            // read the panel in parallel (one SM cannot saturate a card's
+            // bandwidth), then a single fold turns the partials into the
+            // scale. Falls back to the one-workgroup form otherwise.
+            match (c.act_amax_part.as_ref(), c.act_amax_fold.as_ref()) {
+                (Some(part), Some(fold)) => {
+                    let nparts = 512usize;
+                    let pbuf = {
+                        let mut sc = c.scratch.lock().unwrap();
+                        Scratch::ensure(
+                            &c.device,
+                            &mut sc.amaxp,
+                            (nparts * 4) as u64,
+                            wgpu::BufferUsages::STORAGE,
+                            "pffn-amax-parts",
+                        )
+                    };
+                    let bg1 = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &part.get_bind_group_layout(0),
+                        entries: &[bind_buf(0, &act_buf), bind_buf(1, &pbuf), bind_buf(2, &ap)],
+                    });
+                    let fp = c
+                        .device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None,
+                            contents: bytemuck::cast_slice(&[nparts as u32, 0u32, 0u32, 0u32]),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        });
+                    let bg2 = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &fold.get_bind_group_layout(0),
+                        entries: &[bind_buf(0, &pbuf), bind_buf(1, &asc_buf), bind_buf(2, &fp)],
+                    });
+                    let mut pass = begin_pass(&mut enc);
+                    pass.set_pipeline(part);
+                    pass.set_bind_group(0, &bg1, &[]);
+                    pass.dispatch_workgroups(nparts as u32, 1, 1);
+                    drop(pass);
+                    let mut pass = begin_pass(&mut enc);
+                    pass.set_pipeline(fold);
+                    pass.set_bind_group(0, &bg2, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+                _ => {
+                    let bg_amax = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &amax.get_bind_group_layout(0),
+                        entries: &[
+                            bind_buf(0, &act_buf),
+                            bind_buf(1, &asc_buf),
+                            bind_buf(2, &ap),
+                        ],
+                    });
+                    let mut pass = begin_pass(&mut enc);
+                    pass.set_pipeline(amax);
+                    pass.set_bind_group(0, &bg_amax, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
             }
             encode_q4_tile_mm_full(
                 c,
@@ -19038,6 +19096,61 @@ struct AmP { n: u32, _a: u32, _b: u32, _c: u32 };
 @group(0) @binding(1) var<storage, read_write> amo : array<f32>;
 @group(0) @binding(2) var<uniform>             amp : AmP;
 var<workgroup> am_red: array<f32, 256>;
+
+// Stage 1: one workgroup per slice, each writing its own partial max.
+// A single workgroup walking the whole panel (330 MB at render size)
+// was what made the device-side scale a wash — one SM reading what the
+// card can read with hundreds.
+@compute @workgroup_size(256)
+fn act_absmax_part(@builtin(local_invocation_index) lid: u32,
+                   @builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(num_workgroups) nwg: vec3<u32>) {
+    var m = 0.0;
+    var i = wid.x * 256u + lid;
+    let stride = nwg.x * 256u;
+    loop {
+        if (i >= amp.n) { break; }
+        let v = abs(amx[i]);
+        if (v > m && v < 3.0e38) { m = v; }
+        i = i + stride;
+    }
+    am_red[lid] = m;
+    workgroupBarrier();
+    var st = 128u;
+    loop {
+        if (st == 0u) { break; }
+        if (lid < st) { am_red[lid] = max(am_red[lid], am_red[lid + st]); }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    if (lid == 0u) { amo[wid.x] = am_red[0]; }
+}
+
+// Stage 2: fold the partials into the scale the GEMM multiplies by.
+@compute @workgroup_size(256)
+fn act_absmax_fold(@builtin(local_invocation_index) lid: u32) {
+    var m = 0.0;
+    var i = lid;
+    loop {
+        if (i >= amp.n) { break; }
+        let v = amx[i];
+        if (v > m) { m = v; }
+        i = i + 256u;
+    }
+    am_red[lid] = m;
+    workgroupBarrier();
+    var st = 128u;
+    loop {
+        if (st == 0u) { break; }
+        if (lid < st) { am_red[lid] = max(am_red[lid], am_red[lid + st]); }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    if (lid == 0u) {
+        let mx = am_red[0];
+        amo[0] = select(1.0, 1000.0 / mx, mx > 1000.0);
+    }
+}
 
 @compute @workgroup_size(256)
 fn act_absmax(@builtin(local_invocation_index) lid: u32) {
