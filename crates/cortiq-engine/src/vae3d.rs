@@ -645,7 +645,26 @@ impl VideoVae {
             }
             let mut fused = false;
             // NOT CORRECT YET, so opt-in: rel rms 0.296 against the host
-            // chain, 97% of pixels. Worth 26.1 s → 16.1 s on this stage
+            // chain, 97% of pixels.
+            //
+            // Narrowed to four stages, with everything else measured
+            // and cleared (`CMF_VAE3D_CHECK=1` runs the harness):
+            //   * the device attention returns ZEROS — proven with a
+            //     sentinel fill, so "it wrote" is a fact, not a guess;
+            //   * the split reproduces the host repack EXACTLY at this
+            //     head-interleaved layout (maxdiff 0.0000e0);
+            //   * qk-norm + RoPE match the host loop to 3.8e-6 against
+            //     a magnitude of 6.87 — f32 rounding;
+            //   * the plane pickup is sound: with an empty slice
+            //     `Scratch::ensure` asks for 0 bytes, its `cap >= need`
+            //     arm holds for any live slot, and both sides name the
+            //     same slots with the same usage.
+            // So the zeros are made in QK, softmax, PV or the unstack,
+            // at nh=32 hd=64 n=1797 — shapes at which that same code is
+            // correct when the planes arrive by upload instead
+            // (`resident=false`, the shipped path). Give each of those
+            // four private buffers, one at a time; the first that comes
+            // back zero is the answer. Worth 26.1 s → 16.1 s on this stage
             // and 57.6 s → 47.2 s on a 2-step render once it is right.
             //
             // What is known: the error survives with both GEMMs on the
