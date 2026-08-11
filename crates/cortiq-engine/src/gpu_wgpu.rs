@@ -18052,12 +18052,14 @@ pub fn vae_attention_packed_layout(
 
 /// Diagnostic: run ONLY the split and read the q plane back. No norm,
 /// no RoPE, no attention — so a mismatch here is the hand-off itself.
+#[allow(clippy::too_many_arguments)]
 pub fn dit_split_only(
     qkv: &[f32],
     nh: usize,
     n: usize,
     hd: usize,
     layout: u32,
+    norm: Option<(&[f32], f32)>,
     out_q: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
@@ -18132,6 +18134,62 @@ pub fn dit_split_only(
         pass.set_bind_group(0, &bg, &[]);
         let wgs = ((n * inner) as u32).div_ceil(256);
         pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+    }
+    // Stage two, same treatment: qk-norm + RoPE over q only.
+    if let (Some((angles, eps)), Some(pipe)) = (norm, c.dit_qknorm.as_ref()) {
+        let pairs = if angles.is_empty() { 0 } else { angles.len() / n };
+        let ang = c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(if angles.is_empty() {
+                    &[0.0f32][..]
+                } else {
+                    angles
+                }),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let ones = vec![1.0f32; hd];
+        let w = c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&ones),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let up = c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[
+                    n as u32,
+                    nh as u32,
+                    hd as u32,
+                    pairs as u32,
+                    eps.to_bits(),
+                    0u32,
+                    layout,
+                    0u32,
+                ]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bgn = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &src),
+                bind_buf(1, &qb),
+                bind_buf(2, &ang),
+                bind_buf(3, &w),
+                bind_buf(4, &up),
+                bind_buf(5, &dummy),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, &bgn, &[]);
+        let jobs = (n * nh) as u32;
+        pass.dispatch_workgroups(jobs.min(65535), jobs.div_ceil(65535), 1);
     }
     readback(c, enc, &qb, &stage, plane, &mut out_q[..nh * n * hd])
 }

@@ -403,7 +403,13 @@ impl VideoVae {
                 // The split ALONE: no norm, no RoPE, no attention. If
                 // this mismatches, the hand-off is the whole story.
                 let mut sq = vec![SENT; nh * n * hd];
-                let oks = crate::gpu::dit_split_only(qkv, nh, n, hd, 1, &mut sq);
+                let oks = crate::gpu::dit_split_only(qkv, nh, n, hd, 1, None, &mut sq);
+                let mut sqn = vec![SENT; nh * n * hd];
+                let okn = crate::gpu::dit_split_only(
+                    qkv, nh, n, hd, 1,
+                    Some((angles, self.eps as f32)),
+                    &mut sqn,
+                );
                 let mut hq = vec![0f32; nh * n * hd];
                 for p in 0..n {
                     for h in 0..nh {
@@ -417,10 +423,32 @@ impl VideoVae {
                     .iter()
                     .zip(&hq)
                     .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                // The same q plane after norm+RoPE, against the host's
+                // own loop on a copy of it.
+                let mut hqn = hq.clone();
+                let pairs = angles.len() / n;
+                for p in 0..n {
+                    for h in 0..nh {
+                        let r = &mut hqn[(h * n + p) * hd..(h * n + p) * hd + hd];
+                        rms_norm_plain(r, self.eps);
+                        for j in 0..pairs {
+                            let (sn, cs) = angles[p * pairs + j].sin_cos();
+                            let (a, b) = (r[j], r[j + pairs]);
+                            r[j] = a * cs - b * sn;
+                            r[j + pairs] = a * sn + b * cs;
+                        }
+                    }
+                }
+                let n_wrote = sqn.iter().filter(|&&x| x != SENT).count();
+                let n_diff = sqn
+                    .iter()
+                    .zip(&hqn)
+                    .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
                 eprintln!(
-                    "vae split-only: ok={oks} wrote={sq_wrote}/{} maxdiff={sq_diff:.4e} host|max|={:.4e}",
+                    "vae split-only: ok={oks} wrote={sq_wrote}/{} maxdiff={sq_diff:.4e} host|max|={:.4e} || +norm: ok={okn} wrote={n_wrote} maxdiff={n_diff:.4e} host|max|={:.4e}",
                     sq.len(),
                     hq.iter().fold(0f32, |m, v| m.max(v.abs())),
+                    hqn.iter().fold(0f32, |m, v| m.max(v.abs())),
                 );
                 let md = |a: &[f32], b: &[f32]| {
                     a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()))

@@ -1662,17 +1662,19 @@ pub fn vae_attention_packed_layout(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn dit_split_only(
     qkv: &[f32],
     nh: usize,
     n: usize,
     hd: usize,
     layout: u32,
+    norm: Option<(&[f32], f32)>,
     out_q: &mut [f32],
 ) -> bool {
     match backend() {
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
-        Backend::Wgpu => crate::gpu_wgpu::dit_split_only(qkv, nh, n, hd, layout, out_q),
+        Backend::Wgpu => crate::gpu_wgpu::dit_split_only(qkv, nh, n, hd, layout, norm, out_q),
         #[allow(unreachable_patterns)]
         _ => false,
     }
