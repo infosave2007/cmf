@@ -471,11 +471,21 @@ impl AudioVae {
     /// per-channel FIR bought only 9.2 s → 8.1 s, so the time is in the
     /// convolutions, not the filter).
     ///
-    /// Not done blind, because both passes already call into `self.pool`
-    /// and nesting is the open question: check whether `Pool::run_rows`
-    /// tolerates two concurrent callers before wrapping this in a
-    /// `thread::scope`. If it does not, the cheaper shape is to give the
-    /// convolutions a time split for the narrow layers instead.
+    /// The nesting question is ANSWERED, and the answer forbids the
+    /// obvious version: `Pool` keeps ONE job slot (`inner.slot`), and
+    /// `run()` writes it on the stated assumption that no job is in
+    /// flight. Two concurrent callers would overwrite each other's job.
+    /// So wrapping this loop in a `thread::scope` while the passes still
+    /// call into the pool is a data race, not an optimization.
+    ///
+    /// Two shapes remain. Drive the pool from the OUTSIDE — one row per
+    /// stereo channel, `None` inside — which is correct but caps the
+    /// whole decode at two threads and would lose the wide layers what
+    /// it wins the narrow ones. Or split the narrow convolutions over
+    /// TIME instead of output channels, which keeps every thread busy
+    /// at both ends. Measure before choosing: this decoder still has no
+    /// phase profiler, and the FIR already proved the shape of the code
+    /// is a poor guide to where its seconds are.
     pub fn decode(&self, z: &[f32], c: usize, t: usize) -> (Vec<f32>, usize) {
         let pool = self.pool.as_deref();
         let mut chans: Vec<Vec<f32>> = Vec::with_capacity(2);
