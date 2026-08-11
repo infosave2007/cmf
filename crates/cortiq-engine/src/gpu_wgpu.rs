@@ -18309,6 +18309,14 @@ pub fn dit_attention_packed_src(
         let wgs = ((n * inner) as u32).div_ceil(256);
         pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
     }
+    // SUBMIT IT. This encoder was built, filled and dropped — the split
+    // never ran, and only the qk-norm encoder below reached the queue.
+    // q and k survived that (qk-norm reads the packed panel itself and
+    // rewrites both planes), so the DiT could not see it; v is written
+    // by nobody else, so it stayed zero and P·V came out exactly zero.
+    // That is the VAE's all-zero attention, and the reason the layout
+    // experiments all agreed: zero does not depend on addressing.
+    c.queue.submit(Some(enc.finish()));
     // qk-norm + RoPE on the card: two dispatches over the SAME kernel,
     // q and k differing only in the output plane, the weight buffer and
     // src_off. When `nr` is None the caller already did this on the host.
