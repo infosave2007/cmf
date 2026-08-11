@@ -723,8 +723,14 @@ impl MiniMaxH3 {
             // work it fed. Measured at render size: repack 4.4 → 1.5 s,
             // render 130.0 → 111.8 s, frames bit-identical.
             // `CMF_MMH3_ATTN=repack` forces the host form.
+            // The device can do qk-norm and RoPE itself (kernel and
+            // plumbing are in; pass Some((angles, q_norm, k_norm, eps))).
+            // `attention` cannot reach them: they live in the caller,
+            // and handing them over means changing this signature — the
+            // last step of task #33, and the point where the panel stops
+            // coming home at all.
             if std::env::var("CMF_MMH3_ATTN").as_deref() != Ok("repack")
-                && crate::gpu::dit_attention_packed(qkv, nh, n, hd, scale, attn)
+                && crate::gpu::dit_attention_packed(qkv, nh, n, hd, scale, None, attn)
             {
                 // No stamp: the caller's slot-3 stopwatch already spans
                 // this whole call, and CMF_DIT_ATTN_PROF breaks the

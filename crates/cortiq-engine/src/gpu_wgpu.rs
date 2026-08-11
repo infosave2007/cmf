@@ -17706,12 +17706,14 @@ pub fn q4tp_matvec_batch_for_test(
 /// head-major planes happens on the device. `false` means the split
 /// kernel is unavailable and the caller should repack on the host.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn dit_attention_packed(
     qkv: &[f32],
     nh: usize,
     n: usize,
     hd: usize,
     scale: f32,
+    nr: Option<(&[f32], &[f32], &[f32], f32)>,
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
@@ -17774,7 +17776,66 @@ pub fn dit_attention_packed(
         let wgs = ((n * inner) as u32).div_ceil(256);
         pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
     }
-    c.queue.submit(Some(enc.finish()));
+    // qk-norm + RoPE on the card: two dispatches over the SAME kernel,
+    // q and k differing only in the output plane, the weight buffer and
+    // src_off. When `nr` is None the caller already did this on the host.
+    if let (Some(pipe), Some((angles, qw, kw, eps))) = (c.dit_qknorm.as_ref(), nr) {
+        let pairs = if angles.is_empty() { 0 } else { angles.len() / n };
+        let ang_b = c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("dit-ang"),
+                contents: bytemuck::cast_slice(if angles.is_empty() { &[0.0f32][..] } else { angles }),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        for (half, wts, dst) in [(0usize, qw, &qb), (1usize, kw, &kb)] {
+            let w_b = c
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("dit-qkw"),
+                    contents: bytemuck::cast_slice(wts),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+            let u = c
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&[
+                        n as u32,
+                        nh as u32,
+                        hd as u32,
+                        pairs as u32,
+                        eps.to_bits(),
+                        (half * inner) as u32,
+                        0u32,
+                        0u32,
+                    ]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, &src),
+                    bind_buf(1, dst),
+                    bind_buf(2, &ang_b),
+                    bind_buf(3, &w_b),
+                    bind_buf(4, &u),
+                ],
+            });
+            let mut e = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dit-qkn") });
+            {
+                let mut pass = begin_pass(&mut e);
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(0, &bg, &[]);
+                let jobs = (n * nh) as u32;
+                pass.dispatch_workgroups(jobs.min(65535), jobs.div_ceil(65535), 1);
+            }
+            c.queue.submit(Some(e.finish()));
+        }
+    }
     // The planes are on the card now; the shared path skips its uploads.
     dit_attention_inner(&[], &[], &[], nh, nh, n, hd, scale, out, true)
 }
