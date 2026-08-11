@@ -717,13 +717,13 @@ impl MiniMaxH3 {
             && crate::gpu::enabled_here()
             && n >= 256
         {
-            // Device-side split, OPT-IN (`CMF_MMH3_ATTN=split`) until it
-            // is measured at render size: the host repack below costs
+            // The qkv panel goes up in one piece and is split into
+            // head-major planes ON the card. The host repack below cost
             // 4.4 s of a 7.3 s attention phase — more than the device
-            // work it feeds — so this is where that time should go, but
-            // a path verified only at 64×32 does not get to be the
-            // default on a render that takes minutes to check.
-            if std::env::var("CMF_MMH3_ATTN").as_deref() == Ok("split")
+            // work it fed. Measured at render size: repack 4.4 → 1.5 s,
+            // render 130.0 → 111.8 s, frames bit-identical.
+            // `CMF_MMH3_ATTN=repack` forces the host form.
+            if std::env::var("CMF_MMH3_ATTN").as_deref() != Ok("repack")
                 && crate::gpu::dit_attention_packed(qkv, nh, n, hd, scale, attn)
             {
                 Self::prof(3, t_repack);

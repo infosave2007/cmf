@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The qkv split moved to the device, and it was the attention
+  bottleneck all along.** Timing the phase's halves separately showed
+  4.4 s of a 7.3 s attention phase was the HOST building head-major
+  q/k/v out of the interleaved panel — more than the device work it fed,
+  and the reason last round's tensor-core QK (correct, and worth
+  nothing) optimized the wrong half. `dit_qkv_split` sends the panel up
+  in one piece and scatters it on the card. Measured at render size:
+  repack **4.4 → 1.5 s**, full render **130.0 → 111.8 s**, frames
+  **bit-identical** (delta 0.000). `CMF_MMH3_ATTN=repack` forces the
+  host form. Against where this started, a render is now 716.6 →
+  **111.8 s (6.4×)**.
+
 ### Fixed
 - **A rejected shader had silently disabled the dequantize-once path.**
   The device-side activation scale added a `pmm_s` binding to the f16
