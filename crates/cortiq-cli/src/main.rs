@@ -3559,6 +3559,17 @@ fn cmd_animate(
     quality: u32,
     out: &str,
 ) -> anyhow::Result<()> {
+    // A seeded render must come out the same twice. It did not: while a
+    // probe class is undecided the arbitration ALTERNATES arms on real
+    // user data, and whether it ever decides depends on how many samples
+    // the cold-discard throws away — a race. Three runs of one binary,
+    // one seed, gave two different files. Pinning the arms costs nothing
+    // measurable here (57.4 s and 57.8 s against 57.5 s probing), so the
+    // render pins them and an explicit CMF_GPU_PROBE still wins.
+    if std::env::var_os("CMF_GPU_PROBE").is_none() {
+        // SAFETY: single-threaded, before any engine or GPU init.
+        unsafe { std::env::set_var("CMF_GPU_PROBE", "0") };
+    }
     // GPU-vs-host is decided by the ENGINE's parity probe on this
     // file's own first qkv weight (videogen::mmh3_gpu_parity_probe):
     // the arm that renders is the arm that got probed, per stack —
