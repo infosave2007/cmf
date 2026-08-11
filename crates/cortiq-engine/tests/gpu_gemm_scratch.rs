@@ -53,13 +53,22 @@ fn refilling_the_w_buffer_is_not_a_cache_hit() {
         return;
     }
     let want = reference(&x, &w, n, k, m);
+    // RELATIVE, not absolute: on a card with cooperative matrices this
+    // GEMM feeds the units f16 operands (f32 accumulator), so ~1e-3 of
+    // the result's own magnitude is the floor, not a defect — an
+    // absolute 2e-3 passed on the scalar arm and failed the tensor-core
+    // one at 4.4e-3 while being numerically fine. What this test is
+    // actually about is the CACHE: a stale weight gives O(1) relative
+    // error, which 5e-3 still catches by three orders of magnitude.
     let worst = |a: &[f32], b: &[f32]| {
+        let scale = b.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
         a.iter()
             .zip(b)
             .fold(0f32, |acc, (&p, &q)| acc.max((p - q).abs()))
+            / scale
     };
     let d0 = worst(&y, &want);
-    assert!(d0 < 2e-3, "first call already wrong: max {d0:.3e}");
+    assert!(d0 < 5e-3, "first call already wrong: rel {d0:.3e}");
 
     // The same allocation, a different matrix — one head later.
     fill(&mut w, 0x5555_aaaa);
@@ -69,8 +78,8 @@ fn refilling_the_w_buffer_is_not_a_cache_hit() {
     let d1 = worst(&y2, &want2);
     println!("first {d0:.3e}, after refill {d1:.3e}");
     assert!(
-        d1 < 2e-3,
-        "stale w served from the cache: max {d1:.3e} (a hit on the address, not the contents)"
+        d1 < 5e-3,
+        "stale w served from the cache: rel {d1:.3e} (a hit on the address, not the contents)"
     );
 
     // And the original contents again: a real hit, still correct.
@@ -78,5 +87,5 @@ fn refilling_the_w_buffer_is_not_a_cache_hit() {
     let mut y3 = vec![0f32; n * m];
     assert!(gemm_nt_f32(&x, &w, &mut y3, n, k, m));
     let d2 = worst(&y3, &want);
-    assert!(d2 < 2e-3, "cache hit returned the wrong matrix: max {d2:.3e}");
+    assert!(d2 < 5e-3, "cache hit returned the wrong matrix: rel {d2:.3e}");
 }
