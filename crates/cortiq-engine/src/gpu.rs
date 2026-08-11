@@ -1547,17 +1547,21 @@ pub fn vae_conv2d(
 /// planes ON the device. wgpu only; `false` elsewhere so the caller
 /// keeps its host repack.
 #[allow(unused_variables)]
+#[allow(clippy::too_many_arguments)]
 pub fn dit_attention_packed(
     qkv: &[f32],
     nh: usize,
     n: usize,
     hd: usize,
     scale: f32,
+    // (rope angles, q norm weights, k norm weights, eps) when the device
+    // should apply qk-norm and RoPE itself; None when the host already did.
+    nr: Option<(&[f32], &[f32], &[f32], f32)>,
     out: &mut [f32],
 ) -> bool {
     match backend() {
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
-        Backend::Wgpu => crate::gpu_wgpu::dit_attention_packed(qkv, nh, n, hd, scale, out),
+        Backend::Wgpu => crate::gpu_wgpu::dit_attention_packed(qkv, nh, n, hd, scale, nr, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }
