@@ -537,6 +537,12 @@ CMF_MMH3_GPU=1 cortiq animate mmh3-turbo-fl2va-q4tp.cmf \
     --prompt "…" --first-frame frame.ppm --out clip.avi
 ```
 
+At 512×288, 39 frames, on one RTX 5090: **91.6 s for an 8-step render,
+42.8 s for 2** — denoise 67.4 s, video VAE 16.6 s, audio VAE 5.0 s, and
+`RUST_LOG=info` prints that breakdown for every run. The DiT block, both
+VAE decoders and the vocoder's convolutions all run on the card; a given
+seed reproduces bit for bit.
+
 Four files and a ComfyUI checkout — 124.4 GB — become **one 23.9 GB
 `.cmf`**: the 33 B DiT, its Qwen3-VL-32B prompt encoder, the ViT3D video
 decoder, the BigVGAN vocoder, Qwen3-VL's vision tower and the VAE
