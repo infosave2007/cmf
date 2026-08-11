@@ -17314,12 +17314,26 @@ fn tp_matmat(
         (Some(dq), Some(pipe)) => (pipe, dq),
         _ => (mm_pipeline(c, true, two_bit), &q_buf),
     };
-    let entries = [
+    // The f16 twin declares a fifth binding (the device-scale buffer);
+    // it takes a one-element dummy here because this path computes the
+    // scale on the host and passes it in `pad`.
+    let f16_arm = dq_plane.is_some() && c.q4tp_mm_coop_f16.is_some();
+    let dummy_scale = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[0.0f32]),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+    let mut entries = vec![
         bind_buf(0, w_bind),
         bind_buf(1, &xs_buf),
         bind_buf(2, &y_buf),
         bind_buf(3, &p_buf),
     ];
+    if f16_arm {
+        entries.push(bind_buf(4, &dummy_scale));
+    }
     let bind_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("q4tpmm-bg"),
         layout: &mm_pipe.get_bind_group_layout(0),
@@ -18507,8 +18521,26 @@ pub fn q4tp_ffn_packed(
             .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
         if mx > 1000.0 { 1000.0 / mx } else { 1.0 }
     };
-    encode_q4_tile_mm_scaled(
-        c, &mut enc, p1, &w1_bind, &xs_buf, &gu_buf, 2 * inter, hidden, b, ascale,
+    let f16_arm = dq1.is_some() && c.q4tp_mm_coop_f16.is_some();
+    let host_scale = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[ascale]),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+    encode_q4_tile_mm_full(
+        c,
+        &mut enc,
+        p1,
+        &w1_bind,
+        &xs_buf,
+        &gu_buf,
+        2 * inter,
+        hidden,
+        b,
+        ascale,
+        f16_arm.then_some(&host_scale),
     );
     {
         let mut pass = begin_pass(&mut enc);
@@ -20433,11 +20465,15 @@ fn encode_q4_tile_mm_full(
         bind_buf(2, y),
         bind_buf(3, &p_buf),
     ];
-    // Only the f16 twin declares binding 4; the others must not see it.
-    if c.q4tp_mm_coop_f16
-        .as_ref()
-        .is_some_and(|p| std::ptr::eq(p, pipeline))
-    {
+    // Only the f16 twin declares binding 4. Deciding that by comparing
+    // pipeline ADDRESSES was wrong — the handle passed in is not the
+    // same object as the one in the Ctx, so the entry was never added
+    // and every dispatch failed layout validation. Ask the pipeline's
+    // own layout instead: it is the thing that knows.
+    // wgpu 30 exposes no identity on either handle, so the caller says
+    // so: `scale_buf` is passed exactly when the f16 twin is the
+    // pipeline, and that twin is the only one with binding 4.
+    if scale_buf.is_some() {
         entries.push(bind_buf(4, sbuf));
     }
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
