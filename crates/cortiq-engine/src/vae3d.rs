@@ -358,13 +358,25 @@ impl VideoVae {
             // produced nothing. That also explains why every layout
             // experiment agreed: zero does not depend on addressing.
             //
-            // Prime suspect: shape. The DiT runs these same kernels at
-            // nh=56 hd=128 n=1859 and is correct; the VAE asks for
-            // hd=64. A 64-wide head against a kernel that tiles 64×64,
-            // or a dispatch whose grid rounds to zero groups, would
-            // leave an untouched (freshly zeroed) output exactly like
-            // this. Next: run the QK stage alone at hd=64 and look at
-            // the score plane before softmax.
+            // Already eliminated, so nobody re-walks them:
+            //  * the split/qk-norm encoder IS submitted before attention
+            //    reads the planes (`c.queue.submit` at the end of that
+            //    block) — the planes are not merely un-flushed;
+            //  * the scratch slots are grow-only and the DiT ran first
+            //    at LARGER shapes, so nothing here is undersized;
+            //  * the split's dispatch grid is 14376 groups in x, well
+            //    under the 65535 bound, so it is not rounding to zero;
+            //  * `dit_attention_packed_src` returned true, so no stage
+            //    refused — the chain ran and produced zeros.
+            //
+            // What is left: the three planes the split writes are read
+            // back as zeros while the SAME kernels, fed the same three
+            // planes uploaded from the host (`resident=false`, the
+            // shipped VAE path), are correct at this very hd=64. So the
+            // difference is the hand-off of the planes themselves, not
+            // the attention math. Next: read `sc.dq` back right after
+            // the split and compare it against the host repack — one
+            // buffer, one dispatch, no attention involved.
             if std::env::var("CMF_VAE3D_CHECK").as_deref() == Ok("1")
                 && !CHECKING.with(|c| c.get())
             {
