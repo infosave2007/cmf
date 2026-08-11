@@ -233,6 +233,21 @@ fn kaiser_sinc(cutoff: f64, half_width: f64, k: usize) -> Vec<f32> {
 }
 
 /// Replicate-pad, then a per-channel FIR.
+///
+/// NEXT TARGET, and the numbers that name it: the audio decoder is
+/// 9.2 s of a 95.6 s render — the same share the video decoder had
+/// before its host loops met the thread pool (38.3 s → 16.6 s). This
+/// function is the shape that fix wanted: every channel is independent
+/// and the whole thing runs on one thread. The convolutions above DO
+/// use the pool, but they split over OUTPUT CHANNELS, and this decoder
+/// narrows to a handful of them near the output — where the samples
+/// are longest and the parallelism collapses exactly when it is needed.
+///
+/// It needs a `pool` argument threaded from `Activation1d`/`AudioVae`
+/// and a per-worker `buf` instead of the shared one. Measure first with
+/// a phase profiler like `CMF_VAE3D_PROF`: this decoder has none, and
+/// the video one went untuned for a whole session precisely because
+/// nothing measured it.
 fn fir_pad(x: &[f32], ch: usize, n: usize, f: &[f32], pad_l: usize, pad_r: usize, stride: usize) -> (Vec<f32>, usize) {
     let padded = n + pad_l + pad_r;
     let out_n = (padded - f.len()) / stride + 1;
