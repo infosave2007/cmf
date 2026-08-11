@@ -23,6 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are 47.1.
 
 ### Fixed
+- **Two GEMMs on one device could compute on each other's operand.**
+  The activation, result and staging slots are ONE buffer each per
+  context: written under the scratch lock, then read at submit time
+  after that lock is released. Two threads in `tp_matmat` would upload
+  into the same slot and one would run against the other's data. The
+  batch parity test caught it the moment an unrelated edit moved the
+  parameter write a few lines later — but the window had been open all
+  along, and the parameters were a shared slot too. Parameters are now
+  built per call, and a per-device gate holds the whole GEMM (upload,
+  encode, submit, readback). The scratch lock could not do that job:
+  `readback` takes it itself and std mutexes do not re-enter. Verified
+  four consecutive clean runs against one failure in three before.
+
 - **A seeded render is reproducible again.** It was not: three runs of
   one binary with one seed produced two different files. While a probe
   class is undecided the arbitration ALTERNATES arms on real user data
