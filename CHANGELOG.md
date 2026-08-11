@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The VAE decoder's resident chain, opt-in (`CMF_VAE3D_FUSE=1`), NOT
+  yet correct.** The split and qk-norm kernels learned this decoder's
+  head-interleaved panel and its qkv bias, and the chain runs: 26.1 s →
+  16.1 s on the stage, 57.6 s → 47.2 s on a 2-step render. But it is
+  0.296 rel rms off the host chain on 97% of pixels, so the default is
+  unchanged and byte-identical to before (same md5, 57.2 s).
+
+  Bisected: the error survives with both GEMMs on the host
+  (`CMF_VAE3D_SPLIT=1` reproduces it byte for byte), so it lives in the
+  two kernels, not the resident hand-off. The open contradiction:
+  teaching BOTH kernels the layout and the bias changed the output by
+  NOTHING — impossible at nh=32, where block and head-interleaved
+  addressing differ for every head above the first. The one-shot probe
+  fires on the DiT's first call and never reaches the VAE's; instrument
+  per layout.
+
 - **The VAE decoder's host loops meet the thread pool: the stage drops
   38.3 s → 26.1 s and a 2-step render 69.8 s → 57.5 s (−17.6%).** Its
   norms, biases and gated residuals were sequential `chunks_exact`
