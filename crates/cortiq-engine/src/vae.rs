@@ -158,6 +158,25 @@ impl Conv2d {
         // GEMM has real work (small early convs stay on the CPU).
         if h * w * self.ic * self.oc >= 1 << 26 && crate::gpu::enabled_here() {
             let mut out = vec![0f32; self.oc * h * w];
+            // Matrix units first: im2col on the card, then one NT GEMM
+            // per pixel tile. The scalar kernel below stays as the
+            // fallback for shapes it refuses (even k, a reduction not
+            // divisible by four, no coop hardware).
+            if std::env::var("CMF_VAE_CONV_COOP").as_deref() != Ok("0")
+                && crate::gpu::vae_conv2d_coop(
+                    &self.w,
+                    Some(&self.b[..]),
+                    x,
+                    self.ic,
+                    self.oc,
+                    h,
+                    w,
+                    self.k,
+                    &mut out,
+                )
+            {
+                return out;
+            }
             if crate::gpu::vae_conv2d(
                 &self.w, &self.b, x, self.ic, self.oc, h, w, self.k, &mut out,
             ) {

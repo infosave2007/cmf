@@ -1693,6 +1693,27 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
     }
 }
 
+/// The convolution as a GEMM on the matrix units. `false` = refused.
+#[allow(clippy::too_many_arguments)]
+pub fn vae_conv2d_coop(
+    w: &[f32],
+    bias: Option<&[f32]>,
+    x: &[f32],
+    ic: usize,
+    oc: usize,
+    h: usize,
+    wi: usize,
+    k: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::vae_conv2d_coop(w, bias, x, ic, oc, h, wi, k, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 pub fn dit_attention_packed(
     qkv: &[f32],
     nh: usize,

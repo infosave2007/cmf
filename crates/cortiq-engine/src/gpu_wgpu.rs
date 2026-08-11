@@ -9664,6 +9664,7 @@ struct Ctx {
     dit_gemm_coop: Option<wgpu::ComputePipeline>,
     /// Interleaved qkv → head-major q/k/v, on the device.
     dit_qkv_split: Option<wgpu::ComputePipeline>,
+    vae_im2col: Option<wgpu::ComputePipeline>,
     /// v [h][n][hd] → [h][hd][n], so PV is an NT product.
     dit_v_transpose: Option<wgpu::ComputePipeline>,
     /// qk-norm + RoPE + head-major scatter, one of q/k per dispatch.
@@ -9993,6 +9994,10 @@ struct Scratch {
     /// grow-only like everything else here.
     bx: Option<(wgpu::Buffer, u64)>,
     by: Option<(wgpu::Buffer, u64)>,
+    vcx: Option<(wgpu::Buffer, u64)>,
+    vcc: Option<(wgpu::Buffer, u64)>,
+    vcy: Option<(wgpu::Buffer, u64)>,
+    vcs: Option<(wgpu::Buffer, u64)>,
     bst: Option<(wgpu::Buffer, u64)>,
     /// The FFN chain's device-resident middle (gate+up plane, activation).
     bb: Option<(wgpu::Buffer, u64)>,
@@ -10629,6 +10634,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let ffn_silu_packed = pipe("ffn_silu_mul_packed");
     let act_absmax = mk_coop(COOP_AMAX_SRC, "act-absmax", "act_absmax");
     let dit_qkv_split = mk_coop(DIT_SPLIT_SRC, "dit-split", "dit_qkv_split");
+    let vae_im2col = mk_coop(VAE_IM2COL_SRC, "vae-im2col", "vae_im2col");
     let dit_v_transpose = mk_coop(DIT_VT_SRC, "dit-vt", "dit_v_transpose");
     let dit_qknorm = mk_coop(DIT_QKNORM_SRC, "dit-qknorm", "dit_qknorm_rope");
     let dit_gemm_coop = (q4tp_mm_coop.is_some())
@@ -10985,6 +10991,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         act_absmax,
         dit_gemm_coop,
         dit_qkv_split,
+        vae_im2col,
         dit_v_transpose,
         dit_qknorm,
         act_amax_part,
@@ -20539,6 +20546,41 @@ fn dit_v_transpose(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+const VAE_IM2COL_SRC: &str = r#"
+// One patch column per pixel: col[t][r] = x[i, y+dy-pad, x+dx-pad] with
+// r = (i·k + dy)·k + dx. That is exactly A for an NT GEMM against a
+// weight already stored as [oc, ic·k·k], so nothing is repacked.
+struct IcP { ic: u32, h: u32, w: u32, k: u32, pad: u32, p0: u32, tile: u32, _a: u32 };
+@group(0) @binding(0) var<storage, read>       ic_x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> ic_col: array<f32>;
+@group(0) @binding(2) var<uniform>             icp: IcP;
+
+@compute @workgroup_size(256)
+fn vae_im2col(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let kk = icp.k * icp.k;
+    let kdim = icp.ic * kk;
+    let total = icp.tile * kdim;
+    let idx = gid.y * (65535u * 256u) + gid.x;
+    if (idx >= total) { return; }
+    let t = idx / kdim;
+    let r = idx - t * kdim;
+    let p = icp.p0 + t;
+    let y = p / icp.w;
+    let xx = p - y * icp.w;
+    let i = r / kk;
+    let rem = r - i * kk;
+    let dy = rem / icp.k;
+    let dx = rem - dy * icp.k;
+    let sy = i32(y) + i32(dy) - i32(icp.pad);
+    let sx = i32(xx) + i32(dx) - i32(icp.pad);
+    var v = 0.0;
+    if (sy >= 0 && sy < i32(icp.h) && sx >= 0 && sx < i32(icp.w)) {
+        v = ic_x[(i * icp.h + u32(sy)) * icp.w + u32(sx)];
+    }
+    ic_col[idx] = v;
+}
+"#;
+
 const DIT_SPLIT_SRC: &str = r#"
 // `mode` 0: a token row is [q(inner) | k | v] — the DiT's panel.
 // `mode` 1: it is head-interleaved, [q_h | k_h | v_h] per head — the
@@ -29478,6 +29520,142 @@ fn bake_weight(c: &Ctx, w: &[f32], label: &'static str) -> wgpu::Buffer {
             fresh(true)
         }
     }
+}
+
+/// A 2-D convolution as a GEMM on the matrix units: im2col ON THE CARD
+/// into a pixel tile, then `gemm_nt_coop` against the weight, which is
+/// already `[oc, ic·k·k]` in the order the patch column is built — so
+/// nothing is repacked. The scalar `vae_conv` kernel this replaces runs
+/// at about 220 GFLOP/s; a 512×512×128×128 3×3 conv is 77 GFLOP of it.
+///
+/// Tiled over pixels because the column matrix does not fit: at that
+/// size it would be 1.2 GB whole. One tile of 16k pixels is ~75 MB.
+#[allow(clippy::too_many_arguments)]
+pub fn vae_conv2d_coop(
+    w: &[f32],
+    bias: Option<&[f32]>,
+    x: &[f32],
+    ic: usize,
+    oc: usize,
+    h: usize,
+    wi: usize,
+    k: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let (Some(im2col), Some(gemm)) = (c.vae_im2col.as_ref(), c.gemm_nt_coop.as_ref()) else {
+        return false;
+    };
+    let kdim = ic * k * k;
+    let hw = h * wi;
+    // The coop kernel reads the reduction four wide, and its grid is
+    // one workgroup per 64×64 output tile.
+    if kdim % 4 != 0 || k % 2 == 0 || w.len() < oc * kdim || x.len() < ic * hw || out.len() < oc * hw
+    {
+        return false;
+    }
+    let pad = k / 2;
+    let _gate = c.mm_gate.lock().unwrap();
+    let tile = (1usize << 24) / kdim.max(1); // ~64 MB of columns
+    let tile = tile.clamp(64, hw).min(hw);
+    let wbuf = bake_weight(c, &w[..oc * kdim], "vae-conv-w");
+    let st = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+    let (xb, colb, yb, stage) = {
+        let mut sc = c.scratch.lock().unwrap();
+        (
+            Scratch::ensure(&c.device, &mut sc.vcx, (ic * hw * 4) as u64, st, "vae-conv-x"),
+            Scratch::ensure(&c.device, &mut sc.vcc, (tile * kdim * 4) as u64, st, "vae-conv-col"),
+            Scratch::ensure(
+                &c.device,
+                &mut sc.vcy,
+                (tile * oc * 4) as u64,
+                st | wgpu::BufferUsages::COPY_SRC,
+                "vae-conv-y",
+            ),
+            Scratch::ensure(
+                &c.device,
+                &mut sc.vcs,
+                (tile * oc * 4) as u64,
+                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                "vae-conv-stage",
+            ),
+        )
+    };
+    c.queue
+        .write_buffer(&xb, 0, bytemuck::cast_slice(&x[..ic * hw]));
+    let mut yt = vec![0f32; tile * oc];
+    let mut p0 = 0usize;
+    while p0 < hw {
+        let t = tile.min(hw - p0);
+        let up = c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[
+                    ic as u32, h as u32, wi as u32, k as u32, pad as u32, p0 as u32, t as u32, 0u32,
+                ]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &im2col.get_bind_group_layout(0),
+            entries: &[bind_buf(0, &xb), bind_buf(1, &colb), bind_buf(2, &up)],
+        });
+        let ug = c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[
+                    (kdim / 4) as u32,
+                    oc as u32,
+                    t as u32,
+                    0u32,
+                ]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bgg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &gemm.get_bind_group_layout(0),
+            entries: [
+                bind_buf(0, &wbuf),
+                bind_buf(1, &colb),
+                bind_buf(2, &yb),
+                bind_buf(3, &ug),
+            ]
+            .as_slice(),
+        });
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("vae-conv"),
+            });
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(im2col);
+            pass.set_bind_group(0, &bg, &[]);
+            let wgs = ((t * kdim) as u32).div_ceil(256);
+            pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+        }
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(gemm);
+            pass.set_bind_group(0, &bgg, &[]);
+            pass.dispatch_workgroups((oc as u32).div_ceil(64), (t as u32).div_ceil(64), 1);
+        }
+        if !readback(c, enc, &yb, &stage, (t * oc * 4) as u64, &mut yt[..t * oc]) {
+            return false;
+        }
+        // [t, oc] → NCHW, bias on the way.
+        for o in 0..oc {
+            let b = bias.map_or(0.0, |bb| bb[o]);
+            let dst = &mut out[o * hw + p0..o * hw + p0 + t];
+            for (j, d) in dst.iter_mut().enumerate() {
+                *d = yt[j * oc + o] + b;
+            }
+        }
+        p0 += t;
+    }
+    true
 }
 
 pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
