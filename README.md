@@ -696,11 +696,16 @@ fits on a single card.
 **Layer split** (`run/bench --gpus N`) runs segment *i* pinned to card
 *i* inside ONE process; only a hidden vector crosses a boundary, and it
 never leaves the address space. It exists for models bigger than one
-card, and it is free when they are not: 115.4 → 115.7 tok/s on that
-same MoE, 80.9 → 82.4 on a looped 4.2B, output byte-identical to the
-single-card run. `--peer-split N` moves the boundary; `cortiq gpu`
-lists the cards and their indices, `CMF_GPU_ADAPTER=<index|name>` pins
-one.
+card, and on a model that already fits it costs a few percent rather
+than saving any — measured on 2×RTX 5090, single-stream decode: Bonsai
+1.7B 191.6 → 174.8 tok/s, Nanbeige 3B 77.4 → 71.8, the 34.7B MoE 129.6
+→ 118.9. All three run correctly on the split; all three are slower for
+one stream. A layer split buys room, not speed. `--peer-split N` moves
+the boundary; `cortiq gpu` lists the cards and their indices,
+`CMF_GPU_ADAPTER=<index|name>` pins one.
+
+[docs/MULTI_GPU.md](docs/MULTI_GPU.md) has the full table, the
+across-machines form, and what to check when a card is not used.
 
 For a model bigger than one HOST, `--peer` speaks to a `cortiq worker`
 over the network instead — same split, one socket further away.
