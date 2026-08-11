@@ -1680,6 +1680,19 @@ pub fn dit_split_only(
     }
 }
 
+/// The backend's f32 NT GEMM: `y[n×m] = x[n×k] · wᵀ[m×k]`. Tensor
+/// cores where the card has them. Refuses under `CMF_BAKE_GPU=0` or
+/// strict f32, and for jobs below n·k·m = 4M, where the round trip
+/// costs more than the arithmetic saves.
+pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
+    match backend() {
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::gemm_nt_f32(x, w, y, n, k, m),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 pub fn dit_attention_packed(
     qkv: &[f32],
     nh: usize,

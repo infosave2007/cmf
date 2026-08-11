@@ -140,6 +140,60 @@ impl Conv1d {
         // (out_ch × in_ch·k × out_n runs to hundreds of millions).
         // So the work is: a facade re-export, an im2col buffer, and a
         // parity check against this loop.
+        // im2col + the device GEMM: `out[out_ch × out_n] = W · col`,
+        // with W already `[out_ch × in_ch·k]` in the order this loop
+        // reads it. Opt-in (`CMF_AVAE_CONV_GPU=1`) until measured — the
+        // column buffer is in_ch·k × out_n floats, which is the price.
+        if std::env::var("CMF_AVAE_CONV_GPU").as_deref() != Ok("0")
+            && crate::gpu::enabled_here()
+        {
+            let kk = self.in_ch * self.k;
+            if let Some(col_len) = kk.checked_mul(out_n) {
+                let mut col = vec![0f32; col_len];
+                let pc = SendPtr(col.as_mut_ptr());
+                let fill = |lo: usize, hi: usize| {
+                    for r in lo..hi {
+                        let (i, j) = (r / self.k, r % self.k);
+                        let src = &x[i * n..(i + 1) * n];
+                        // SAFETY: workers own disjoint rows of `col`.
+                        let dst = unsafe { pc.row(r * out_n, out_n) };
+                        for (t, d) in dst.iter_mut().enumerate() {
+                            let p = (t + j * self.dilation) as isize - self.pad as isize;
+                            *d = if p >= 0 && (p as usize) < n {
+                                src[p as usize]
+                            } else {
+                                0.0
+                            };
+                        }
+                    }
+                };
+                match pool {
+                    Some(p) => p.run_rows(kk, &fill),
+                    None => fill(0, kk),
+                }
+                // colᵀ is [out_n × kk]; the GEMM wants x[n×k]·wᵀ[m×k],
+                // so n = out_n, k = kk, m = out_ch — and `col` is built
+                // row-major over kk, so it is transposed on the way in.
+                let mut colt = vec![0f32; col_len];
+                for r in 0..kk {
+                    for t in 0..out_n {
+                        colt[t * kk + r] = col[r * out_n + t];
+                    }
+                }
+                let mut yt = vec![0f32; out_n * self.out_ch];
+                if crate::gpu::gemm_nt_f32(&colt, &self.w, &mut yt, out_n, kk, self.out_ch) {
+                    for o in 0..self.out_ch {
+                        let bias = self.b.as_ref().map_or(0.0, |b| b[o]);
+                        // SAFETY: single-threaded here.
+                        let dst = unsafe { ptr.row(o * out_n, out_n) };
+                        for (t, d) in dst.iter_mut().enumerate() {
+                            *d = yt[t * self.out_ch + o] + bias;
+                        }
+                    }
+                    return out;
+                }
+            }
+        }
         let tiles = (128 / self.out_ch.max(1)).max(1);
         let tile = out_n.div_ceil(tiles.max(1));
         let rows = self.out_ch * tiles;

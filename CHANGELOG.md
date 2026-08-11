@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.68] - 2026-08-11
+
+**A render is 7.5× faster than it was this morning: 716.6 s → 91.6 s at
+8 steps, 42.8 s at 2.** Every stage of the video pipeline now runs on
+the card and stays there — the DiT block, both VAE decoders, and the
+audio vocoder's convolutions — and the two bugs that were quietly
+corrupting the fused paths are fixed. Renders are bit-reproducible for a
+given seed, which they were not.
+
+| stage | before | now |
+|---|---|---|
+| denoise (8 steps) | 8×11.23 s | 8×7.92 s |
+| video VAE | 38.3 s | 16.6 s |
+| audio VAE | 9.2 s | 5.0 s |
+| **whole render, 8 steps** | **143.2 s** | **91.6 s** |
+
+(The 716.6 s figure is where this pipeline started the session; 143.2 s
+is where 0.5.67 left it.)
+
 ### Added
 - **A phase profiler for the audio decoder (`CMF_AVAE_TIME=1`), and
   what it says: 95.4% of that stage is the resblocks' dilated
