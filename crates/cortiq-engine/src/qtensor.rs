@@ -1366,7 +1366,11 @@ impl QTensor {
                         };
                         if let Self::Mapped { model, idx, .. } = self {
                             let t0 = std::time::Instant::now();
-                            match crate::gpu::probe_arm(class) {
+                            // A cold call takes the device arm: its sample
+                            // is discarded either way, and the upload is
+                            // what the next step needs.
+                            let resident = crate::gpu::weight_is_resident(model, *idx);
+                            match crate::gpu::probe_arm_cold_prefers_gpu(class, resident) {
                                 crate::gpu::ProbeArm::Gpu => {
                                     if crate::gpu::q4tp_matmat(
                                         model, *idx, xs_all, b, rows, cols, out,
