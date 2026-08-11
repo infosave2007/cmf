@@ -3623,6 +3623,9 @@ fn cmd_animate(
         t0.elapsed().as_secs_f64()
     );
     println!("{}: stereo PCM", wav.display());
+    if let Some(rep) = cortiq_engine::vae3d::vae3d_prof_report() {
+        eprint!("{rep}");
+    }
     if let Some(rep) = cortiq_engine::mmh3::mmh3_prof_report() {
         println!("{rep}");
     }

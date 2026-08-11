@@ -17,6 +17,58 @@
 //! clip/token-drop bookkeeping that makes a chunk emit 17 frames and
 //! carry 5 over.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Where a VAE decode actually goes. The DiT had a profiler for months
+/// while this stage — the LARGER half of a render at low step counts,
+/// 37.8 s against the denoiser's 19.2 — had none, so every hour of
+/// tuning went to the half that was already instrumented.
+pub static VAE3D_PROF: [AtomicU64; 8] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+
+pub(crate) fn vae3d_prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_VAE3D_PROF").is_ok())
+}
+
+fn vprof(slot: usize, t: std::time::Instant) {
+    if vae3d_prof_on() {
+        VAE3D_PROF[slot].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// One line per phase, sorted by cost.
+pub fn vae3d_prof_report() -> Option<String> {
+    if !vae3d_prof_on() {
+        return None;
+    }
+    const NAMES: [&str; 8] = [
+        "norm rows", "qkv gemm", "repack+rope", "attention", "out gemm", "ffn",
+        "head+proj", "pixel shuffle",
+    ];
+    let mut v: Vec<(u64, &str)> = VAE3D_PROF
+        .iter()
+        .map(|a| a.load(Ordering::Relaxed))
+        .zip(NAMES)
+        .collect();
+    let total: u64 = v.iter().map(|(u, _)| u).sum();
+    if total == 0 {
+        return None;
+    }
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out = format!("vae3d phases (total {:.1} s):\n", total as f64 / 1e6);
+    for (us, name) in v {
+        out.push_str(&format!(
+            "  {name:<16} {:>6.1} s  {:>5.1}%\n",
+            us as f64 / 1e6,
+            100.0 * us as f64 / total as f64
+        ));
+    }
+    Some(out)
+}
+
 use crate::dit::Proj;
 use crate::pool::Pool;
 use cortiq_core::CmfModel;
@@ -104,6 +156,16 @@ fn rms_norm_plain(x: &mut [f32], eps: f64) {
 
 fn silu(v: f32) -> f32 {
     v / (1.0 + (-v).exp())
+}
+
+/// Rows across the pool, or straight through when there is none. The
+/// DiT has had this since the start; this decoder was still walking its
+/// norms and residuals on one thread — 3.3 s of a 38 s stage.
+fn rows_par(pool: Option<&crate::pool::Pool>, n: usize, f: &(dyn Fn(usize, usize) + Sync)) {
+    match pool {
+        Some(pl) => pl.run_rows(n, f),
+        None => f(0, n),
+    }
 }
 
 struct SendPtr(*mut f32);
@@ -266,6 +328,7 @@ impl VideoVae {
             && crate::gpu::enabled_here()
             && n >= 256
         {
+            let t_rp = std::time::Instant::now();
             let mut qa = vec![0f32; nh * n * hd];
             let mut ka = vec![0f32; nh * n * hd];
             let mut va = vec![0f32; nh * n * hd];
@@ -307,7 +370,10 @@ impl VideoVae {
                     None => fill(0, n),
                 }
             }
+            vprof(2, t_rp);
+            let t_at = std::time::Instant::now();
             if crate::gpu::dit_attention(&qa, &ka, &va, nh, nh, n, hd, scale, attn) {
+                vprof(3, t_at);
                 return;
             }
         }
@@ -404,26 +470,67 @@ impl VideoVae {
         let mut proj = vec![0f32; n * dim];
         let inner = 4 * dim;
         for blk in &self.blocks {
-            for (o, src) in xn.chunks_exact_mut(dim).zip(x.chunks_exact(dim)) {
-                rms_norm_into(src, &blk.norm1, self.eps, o);
+            let t = std::time::Instant::now();
+            {
+                let px = SendPtr(xn.as_mut_ptr());
+                rows_par(pool, n, &|lo, hi| {
+                    for p in lo..hi {
+                        // SAFETY: workers own disjoint token rows.
+                        rms_norm_into(&x[p * dim..(p + 1) * dim], &blk.norm1, self.eps, unsafe {
+                            px.row(p * dim, dim)
+                        });
+                    }
+                });
             }
+            vprof(0, t);
+            let t = std::time::Instant::now();
             blk.qkv.matmat(&xn, n, &mut qkv, pool);
-            for r in qkv.chunks_exact_mut(3 * dim) {
-                for (v, &b) in r.iter_mut().zip(&blk.qkv_b) {
-                    *v += b;
-                }
+            {
+                let pq = SendPtr(qkv.as_mut_ptr());
+                rows_par(pool, n, &|lo, hi| {
+                    for p in lo..hi {
+                        // SAFETY: disjoint token rows.
+                        for (v, &b) in unsafe { pq.row(p * 3 * dim, 3 * dim) }
+                            .iter_mut()
+                            .zip(&blk.qkv_b)
+                        {
+                            *v += b;
+                        }
+                    }
+                });
             }
+            vprof(1, t);
             self.attention(&qkv, n, &mut attn, &angles);
+            let t = std::time::Instant::now();
             blk.out.matmat(&attn, n, &mut proj, pool);
-            for (p, r) in proj.chunks_exact_mut(dim).enumerate() {
-                for (i, v) in r.iter_mut().enumerate() {
-                    *v += blk.out_b[i];
-                    x[p * dim + i] += *v * blk.scale1[i];
-                }
+            {
+                let pxx = SendPtr(x.as_mut_ptr());
+                rows_par(pool, n, &|lo, hi| {
+                    for p in lo..hi {
+                        let r = &proj[p * dim..(p + 1) * dim];
+                        // SAFETY: workers own disjoint token rows.
+                        let dst = unsafe { pxx.row(p * dim, dim) };
+                        for (i, v) in dst.iter_mut().enumerate() {
+                            *v += (r[i] + blk.out_b[i]) * blk.scale1[i];
+                        }
+                    }
+                });
             }
-            for (o, src) in xn.chunks_exact_mut(dim).zip(x.chunks_exact(dim)) {
-                rms_norm_into(src, &blk.norm2, self.eps, o);
+            vprof(4, t);
+            let t = std::time::Instant::now();
+            {
+                let px = SendPtr(xn.as_mut_ptr());
+                rows_par(pool, n, &|lo, hi| {
+                    for p in lo..hi {
+                        // SAFETY: workers own disjoint token rows.
+                        rms_norm_into(&x[p * dim..(p + 1) * dim], &blk.norm2, self.eps, unsafe {
+                            px.row(p * dim, dim)
+                        });
+                    }
+                });
             }
+            vprof(0, t);
+            let t_ffn = std::time::Instant::now();
             // Device-resident FFN when both weights are q4tp: fc1 →
             // SwiGLU (with this VAE's gate/up bias) → fc2 without the
             // intermediate panel crossing the bus twice per block.
@@ -448,11 +555,20 @@ impl VideoVae {
                             Some(&blk.w1_b),
                             &mut fout,
                         ) {
-                            for (p, r) in fout.chunks_exact(dim).enumerate() {
-                                for (i, v) in r.iter().enumerate() {
-                                    x[p * dim + i] += (*v + blk.w2_b[i]) * blk.scale2[i];
-                                }
+                            {
+                                let pxx = SendPtr(x.as_mut_ptr());
+                                rows_par(pool, n, &|lo, hi| {
+                                    for p in lo..hi {
+                                        let r = &fout[p * dim..(p + 1) * dim];
+                                        // SAFETY: disjoint token rows.
+                                        let dst = unsafe { pxx.row(p * dim, dim) };
+                                        for (i, v) in dst.iter_mut().enumerate() {
+                                            *v += (r[i] + blk.w2_b[i]) * blk.scale2[i];
+                                        }
+                                    }
+                                });
                             }
+                            vprof(5, t_ffn);
                             continue;
                         }
                     }
@@ -469,19 +585,40 @@ impl VideoVae {
                 }
             }
             blk.w2.matmat(&act, n, &mut proj, pool);
-            for (p, r) in proj.chunks_exact_mut(dim).enumerate() {
-                for (i, v) in r.iter_mut().enumerate() {
-                    *v += blk.w2_b[i];
-                    x[p * dim + i] += *v * blk.scale2[i];
-                }
+            {
+                let pxx = SendPtr(x.as_mut_ptr());
+                rows_par(pool, n, &|lo, hi| {
+                    for p in lo..hi {
+                        let r = &proj[p * dim..(p + 1) * dim];
+                        // SAFETY: disjoint token rows.
+                        let dst = unsafe { pxx.row(p * dim, dim) };
+                        for (i, v) in dst.iter_mut().enumerate() {
+                            *v += (r[i] + blk.w2_b[i]) * blk.scale2[i];
+                        }
+                    }
+                });
             }
+            vprof(5, t_ffn);
         }
 
         let (pt, ps) = (self.patch_t, self.patch);
         let od = 3 * pt * ps * ps;
+        let t_head = std::time::Instant::now();
         let mut head = vec![0f32; np * dim];
-        for (o, src) in head.chunks_exact_mut(dim).zip(x[..np * dim].chunks_exact(dim)) {
-            layer_norm(src, &self.norm_out_w, &self.norm_out_b, self.eps, o);
+        {
+            let ph = SendPtr(head.as_mut_ptr());
+            rows_par(pool, np, &|lo, hi| {
+                for p in lo..hi {
+                    // SAFETY: disjoint token rows.
+                    layer_norm(
+                        &x[p * dim..(p + 1) * dim],
+                        &self.norm_out_w,
+                        &self.norm_out_b,
+                        self.eps,
+                        unsafe { ph.row(p * dim, dim) },
+                    );
+                }
+            });
         }
         let mut out = vec![0f32; np * od];
         self.proj_out.matmat(&head, np, &mut out, pool);
@@ -491,6 +628,8 @@ impl VideoVae {
             }
         }
 
+        vprof(6, t_head);
+        let t_px = std::time::Instant::now();
         // [T,H,W, 3,pt,ps,ps] → [3, T·pt, H·ps, W·ps]
         let (ot, oh, ow) = (t * pt, h * ps, w * ps);
         let mut px = vec![0f32; 3 * ot * oh * ow];
@@ -512,6 +651,7 @@ impl VideoVae {
                 }
             }
         }
+        vprof(7, t_px);
         px
     }
 

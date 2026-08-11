@@ -297,6 +297,15 @@ fn generate_inner(
     // ── prompt ──
     // The H3 presentation is raw text: no chat template, no BOS, no
     // special tokens at all.
+    // Stage clock. Half of a render is not the DiT — at 8 steps the
+    // denoiser is 63 s of 116 — and until this line existed there was
+    // no way to see which half anything went to.
+    let t_stage = std::time::Instant::now();
+    let mut marks: Vec<(&str, f32)> = Vec::new();
+    let mut lap = |marks: &mut Vec<(&'static str, f32)>, name: &'static str| {
+        let prev: f32 = marks.iter().map(|(_, v)| v).sum();
+        marks.push((name, t_stage.elapsed().as_secs_f32() - prev));
+    };
     let vocab = model
         .vocab
         .as_deref()
@@ -375,12 +384,14 @@ fn generate_inner(
     }
     ids.truncate(p.max_tokens);
     tags.truncate(ids.len());
+    lap(&mut marks, "prepare");
     progress("encode", 0, 1);
     let states = {
         let enc = Qwen3Encoder::from_cmf(&model)?;
         enc.encode_with_images(&ids, &spans, &embeds, &deepstack)
     };
     progress("encode", 1, 1);
+    lap(&mut marks, "text encode");
 
     // ── denoise ──
     let (video, audio) = {
@@ -438,6 +449,7 @@ fn generate_inner(
         (v, a)
     };
 
+    lap(&mut marks, "denoise");
     // ── decode ──
     progress("video vae", 0, 1);
     let (rgb, out_frames) = {
@@ -445,6 +457,7 @@ fn generate_inner(
         vae.decode(&video, latent_t, lat_h, lat_w)
     };
     progress("video vae", 1, 1);
+    lap(&mut marks, "video vae");
     progress("audio vae", 0, 1);
     let (wave, samples, sr) = {
         let vae = AudioVae::from_cmf(&model)?;
@@ -453,6 +466,15 @@ fn generate_inner(
         (w, n, vae.sample_rate)
     };
     progress("audio vae", 1, 1);
+    lap(&mut marks, "audio vae");
+    tracing::info!(
+        "stages: {}",
+        marks
+            .iter()
+            .map(|(n, v)| format!("{n} {v:.1}s"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    );
 
     // The VAE emits latent_t·4 frames; the request snapped to 17k+5,
     // which is one fewer than a multiple of four plus the leading key

@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The VAE decoder's host loops meet the thread pool: the stage drops
+  38.3 s → 26.1 s and a 2-step render 69.8 s → 57.5 s (−17.6%).** Its
+  norms, biases and gated residuals were sequential `chunks_exact`
+  walks — the DiT has run the same work across the pool since the
+  start. Norm rows alone: 3.3 s → 0.5 s. Every loop is per-token and
+  independent, so the arithmetic is unchanged, operand for operand.
+- **A phase profiler for the VAE decoder (`CMF_VAE3D_PROF=1`) and a
+  permanent stage line for every render.** The DiT had a profiler for
+  months; the VAE — the LARGER half of a short render — had none, and
+  that is the whole reason it went untuned this long. The stage line
+  (`prepare · text encode · denoise · video vae · audio vae`) is what
+  showed it: at 2 steps the denoiser is 19.2 s of 68.9 and the two VAEs
+  are 47.1.
+
+### Fixed
 - **The output projection joins the resident chain: a DiT step is 29%
   faster (11.23 s → 7.92 s), a full render 143.2 s → 116.4 s at 8 steps.**
   With qkv, qk-norm, RoPE and attention already on the card, the output
