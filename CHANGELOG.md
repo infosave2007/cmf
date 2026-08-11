@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **On the VAE chain: a measurement that measured itself.** A check
+  harness compared the device attention against a host reference and
+  reported "both layouts byte-identical, 7.2765 off the host". Both
+  halves were wrong: its reference arm re-entered the very function it
+  was checking, and its device arm was never asserted to have written
+  anything — 7.2765 is simply max|host| against two buffers of zeros.
+  A tripwire settled it: making the split kernel write ZEROS for this
+  layout changed the verdict by nothing, which no working comparison
+  can report. Harness removed rather than left to be believed. The
+  replacement must assert the device arm wrote before comparing, and
+  call the host repack directly instead of through the dispatcher.
+
 - **The VAE decoder's resident chain, opt-in (`CMF_VAE3D_FUSE=1`), NOT
   yet correct.** The split and qk-norm kernels learned this decoder's
   head-interleaved panel and its qkv bias, and the chain runs: 26.1 s →
