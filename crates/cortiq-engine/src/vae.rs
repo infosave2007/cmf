@@ -391,6 +391,20 @@ impl AttnBlock {
         let k = Self::proj(&self.k.0, &self.k.1, &nt, hw, c);
         let v = Self::proj(&self.v.0, &self.v.1, &nt, hw, c);
         let scale = 1.0 / (c as f32).sqrt();
+        // One head over the spatial grid, so q/k/v are ALREADY the
+        // head-major planes the device chain wants — `nh = 1` and the
+        // hidden size is the head dim. It keeps the hw×hw score plane
+        // on the card; at 64×64 that plane is 67 MB the host was
+        // materializing and walking twice. `CMF_VAE_ATTN=cpu` reverts.
+        if std::env::var("CMF_VAE_ATTN").as_deref() != Ok("cpu")
+            && crate::gpu::enabled_here()
+            && hw >= 256
+        {
+            let mut got = vec![0f32; hw * c];
+            if crate::gpu::dit_attention(&q, &k, &v, 1, 1, hw, c, scale, &mut got) {
+                return Self::finish(self, x, &got, h, w);
+            }
+        }
         for qv in q.iter_mut() {
             *qv *= scale;
         }
@@ -418,8 +432,14 @@ impl AttnBlock {
         }
         let mut ot = vec![0f32; hw * c];
         crate::fcd_ops::gemm_nt(&scores, &vt, &mut ot, hw, hw, c, None);
-        let o = Self::proj(&self.out.0, &self.out.1, &ot, hw, c);
-        // Token-major → channel-major + residual.
+        Self::finish(self, x, &ot, h, w)
+    }
+
+    /// Output projection, token-major → channel-major, residual. Shared
+    /// by the device arm and the host loop so the two cannot drift.
+    fn finish(&self, x: &[f32], ot: &[f32], h: usize, w: usize) -> Vec<f32> {
+        let (c, hw) = (self.c, h * w);
+        let o = Self::proj(&self.out.0, &self.out.1, ot, hw, c);
         let mut y = x.to_vec();
         for p in 0..hw {
             for ci in 0..c {
