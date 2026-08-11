@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The audio decoder's FIR runs across the pool: that stage 9.2 s →
+  8.1 s, output bit-identical.** Every channel is independent and the
+  whole filter ran on one thread, sharing a single scratch buffer;
+  each worker owns one now. The win is smaller than the shape
+  suggested, which is itself the finding: the stage's time is in the
+  convolutions, and those split over output channels — a dimension
+  this decoder narrows to a handful of near the output, exactly where
+  the samples are longest.
+
 - **The VAE decoder's resident chain is the default: the stage runs
   26.1 s → 16.6 s and an 8-step render 107.3 s → 95.6 s.** qkv GEMM,
   bias, the weightless q/k norm, RoPE, attention and the output
