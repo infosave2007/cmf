@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The output projection joins the resident chain: a DiT step is 29%
+  faster (11.23 s → 7.92 s), a full render 143.2 s → 116.4 s at 8 steps.**
+  With qkv, qk-norm, RoPE and attention already on the card, the output
+  projection was the last thing pulling a panel home — and a readback is
+  never just its own bytes, it drains the queue, so the card idled once
+  per block waiting for the host to take delivery. `dit_qkv_attn_out`
+  now runs qkv → attention → projection with nothing crossing the bus;
+  only the projection's own result (n×hidden) comes home.
+
+  Two guards had to learn about a resident operand, and both refused
+  silently until instrumented: `dit_attention_inner` size-checks a host
+  slice that keep-mode does not have, and `tp_matmat_impl` rejects an
+  empty `xs`. The second one refused AFTER attention had already run, so
+  the caller redid the whole chain — the fused arm measured 3 s SLOWER
+  than the one it replaced until that was found. Refuse at the door or
+  not at all.
+
+  The activation scale is now computed by the card (`act_absmax` over
+  the resident panel) because the host never sees the numbers; without
+  a scale the f16 operands overflow, which is how this kernel first
+  produced NaN. When that reduction is unavailable the scalar arm runs
+  instead — it reads f32 and cannot overflow. Frames: max 6/255 on
+  0.26% of pixels, rel rms 7.8e-4, an order below the parity gate; the
+  difference is f16 rounding around a scale computed in a different
+  place, not a different result. `CMF_MMH3_FUSEOUT=0` restores the
+  previous chain.
+
+  Measured in both orders (cold-first and warm-first) after a first
+  attempt compared a cold run against a warm one and read the probe's
+  cold arbitration as a frame difference.
+- **The DiT profiler stops lying by 59%.** The fused attention path
+  never stamped its slots, so a step the card spent 13.4 s in reported
+  as 5.5 s and named the FFN as 92% of the work. It is 38%. Every early
+  return now stamps the same slots the long path does.
 - **The DiT's qkv panel stops crossing the bus: 716.6 s → 98.1 s (7.3×).**
   Three pieces had to land in order. qk-norm and RoPE became a device
   kernel (one workgroup per token-head for the reduction; q and k are
