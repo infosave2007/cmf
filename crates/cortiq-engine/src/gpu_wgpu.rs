@@ -9666,6 +9666,8 @@ struct Ctx {
     dit_qkv_split: Option<wgpu::ComputePipeline>,
     /// v [h][n][hd] → [h][hd][n], so PV is an NT product.
     dit_v_transpose: Option<wgpu::ComputePipeline>,
+    /// qk-norm + RoPE + head-major scatter, one of q/k per dispatch.
+    dit_qknorm: Option<wgpu::ComputePipeline>,
     /// Two-stage form of the same: partials, then a fold.
     act_amax_part: Option<wgpu::ComputePipeline>,
     act_amax_fold: Option<wgpu::ComputePipeline>,
@@ -10621,6 +10623,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let act_absmax = mk_coop(COOP_AMAX_SRC, "act-absmax", "act_absmax");
     let dit_qkv_split = mk_coop(DIT_SPLIT_SRC, "dit-split", "dit_qkv_split");
     let dit_v_transpose = mk_coop(DIT_VT_SRC, "dit-vt", "dit_v_transpose");
+    let dit_qknorm = mk_coop(DIT_QKNORM_SRC, "dit-qknorm", "dit_qknorm_rope");
     let dit_gemm_coop = (q4tp_mm_coop.is_some())
         .then(|| mk_coop(DIT_COOP_SRC, "dit-coop", "dit_gemm_coop"))
         .flatten();
@@ -10976,6 +10979,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         dit_gemm_coop,
         dit_qkv_split,
         dit_v_transpose,
+        dit_qknorm,
         act_amax_part,
         act_amax_fold,
         q4tp_dq_f16,
@@ -19793,6 +19797,83 @@ fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
 /// an auto layout PER ENTRY POINT, so a kernel touching bindings 0, 1
 /// and 4 of a five-binding module gets a three-entry layout whose
 /// numbering is its own ("no declaration for binding 0").
+/// qk-norm + RoPE for ONE of q/k, scattered head-major in the same pass.
+/// The draft that tried to do q and k inside one dispatch could not:
+/// WGSL cannot take a storage binding as a parameter, so the helper had
+/// no way to write two different planes. Two dispatches with different
+/// bindings solve it without duplicating a line of shader.
+///
+/// One workgroup per (token, head): the norm needs a reduction over the
+/// head dimension. Host semantics (`mmh3::norm_rope_w`): mean of squares
+/// + eps, then the weight, then rotate x[j] against x[j+pairs].
+const DIT_QKNORM_SRC: &str = r#"
+struct QnP { n: u32, nh: u32, hd: u32, pairs: u32, eps: f32, src_off: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read>       qn_src: array<f32>;
+@group(0) @binding(1) var<storage, read_write> qn_dst: array<f32>;
+@group(0) @binding(2) var<storage, read>       qn_ang: array<f32>;
+@group(0) @binding(3) var<storage, read>       qn_w: array<f32>;
+@group(0) @binding(4) var<uniform>             qn_p: QnP;
+
+var<workgroup> qn_buf: array<f32, 256>;
+var<workgroup> qn_red: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn dit_qknorm_rope(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(local_invocation_index) lid: u32) {
+    let job = wid.y * 65535u + wid.x;
+    if (job >= qn_p.n * qn_p.nh) { return; }
+    let p = job / qn_p.nh;
+    let h = job - p * qn_p.nh;
+    let inner = qn_p.nh * qn_p.hd;
+    // qn_p.src_off selects q (0) or k (inner) inside the packed panel.
+    let src = p * 3u * inner + qn_p.src_off + h * qn_p.hd;
+    let dst = (h * qn_p.n + p) * qn_p.hd;
+
+    var acc = 0.0;
+    var i = lid;
+    loop {
+        if (i >= qn_p.hd) { break; }
+        let x = qn_src[src + i];
+        qn_buf[i] = x;
+        acc = acc + x * x;
+        i = i + 64u;
+    }
+    qn_red[lid] = acc;
+    workgroupBarrier();
+    var st = 32u;
+    loop {
+        if (st == 0u) { break; }
+        if (lid < st) { qn_red[lid] = qn_red[lid] + qn_red[lid + st]; }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    let inv = 1.0 / sqrt(qn_red[0] / f32(qn_p.hd) + qn_p.eps);
+    workgroupBarrier();
+    i = lid;
+    loop {
+        if (i >= qn_p.hd) { break; }
+        qn_buf[i] = qn_buf[i] * inv * qn_w[i];
+        i = i + 64u;
+    }
+    workgroupBarrier();
+    i = lid;
+    loop {
+        if (i >= qn_p.hd) { break; }
+        var out = qn_buf[i];
+        if (i < qn_p.pairs) {
+            let a = qn_ang[p * qn_p.pairs + i];
+            out = qn_buf[i] * cos(a) - qn_buf[i + qn_p.pairs] * sin(a);
+        } else if (i < 2u * qn_p.pairs) {
+            let j = i - qn_p.pairs;
+            let a = qn_ang[p * qn_p.pairs + j];
+            out = qn_buf[j] * sin(a) + qn_buf[i] * cos(a);
+        }
+        qn_dst[dst + i] = out;
+        i = i + 64u;
+    }
+}
+"#;
+
 const DIT_VT_SRC: &str = r#"
 struct VtP { n: u32, nh: u32, hd: u32, _p: u32 };
 @group(0) @binding(0) var<storage, read>       vt_src: array<f32>;
