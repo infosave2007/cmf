@@ -5733,6 +5733,23 @@ fn draft_probe() -> bool {
                 // (the race just settled on the normal path).
             }
         }
+        // KIMI-LINEAR'S SPLIT BUG LIVES HERE, and it is worth 2.6×
+        // (12.2 tok/s on one card against 4.6 across two). Below, a
+        // graph that covers only PART of the span has its result thrown
+        // away and the whole span re-runs per-op — the work is done
+        // twice. On one card there is no span at all (`from == 0` and
+        // `upto == None` take the branch above), so only the split pays
+        // it, and a hybrid stack like Kimi's — linear-attention layers
+        // interleaved with full attention — can never cover a span
+        // whole, so it pays it on every segment of every token.
+        //
+        // The fix is to keep what was built: `span_res` already returns
+        // the hidden after `gl` layers, so accept it and continue per-op
+        // from `from + gl` instead of discarding and restarting. The
+        // care needed is the continuation — calling back into this
+        // function would re-enter the graph attempt, so it has to reach
+        // the per-op loop directly.
+        //
         // Span runs (network split): the graph covers exactly [from..=upto]
         // — one submit per SEGMENT per token. No race: its state is global
         // and calibrated on full stacks, so spans take the graph only where
