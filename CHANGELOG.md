@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The DiT's qkv panel stops crossing the bus: 716.6 s → 98.1 s (7.3×).**
+  Three pieces had to land in order. qk-norm and RoPE became a device
+  kernel (one workgroup per token-head for the reduction; q and k are
+  two dispatches of the same kernel, differing only in output plane,
+  weights and offset — WGSL cannot take a storage binding as a
+  parameter, which is what sank the first draft). Then the FFN half of
+  a block became its own function, so the attention half can return
+  early. Then the projection writes into a device buffer that the split
+  reads in place. 160 MB down and the same back up, per block, per
+  step — gone. Frames bit-identical at 1, 2 and 4 steps.
+  `CMF_MMH3_QKNORM=cpu` / `CMF_MMH3_FUSEQKV=0` restore the host path.
+
+### Added
 - **`CMF_DIT_ATTN_PROF=1` splits the attention phase into its three
   walls, and it named the culprit in one run**: QK 1.65 s, softmax
   0.97 s, **PV 4.76 s** per step at 512×288. PV is 3× QK at identical
