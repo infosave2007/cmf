@@ -249,16 +249,37 @@ pub fn generate(
             .as_deref()
             .ok_or("packaged .cmf has no embedded tokenizer")?;
         let tok = Tokenizer::from_bytes(vocab).map_err(|e| format!("tokenizer: {e}"))?;
+        // Stage clock, the same one a render prints. The DiT has had a
+        // profiler all along; nothing measured what surrounds it, and
+        // that is where a third of a 512×512 image was hiding.
+        let t_stage = std::time::Instant::now();
+        let mut marks: Vec<(&str, f32)> = Vec::new();
+        let mut lap = |marks: &mut Vec<(&'static str, f32)>, name: &'static str| {
+            let prev: f32 = marks.iter().map(|(_, v)| v).sum();
+            marks.push((name, t_stage.elapsed().as_secs_f32() - prev));
+        };
         let (cap, cap_n, cap_u) = {
             let enc = GemmaEncoder::from_cmf(&model)?;
             encode_prompt(&tok, &enc, prompt, p, want_uncond)
         };
+        lap(&mut marks, "text encode");
         let latents = {
             let dit = NextDit::from_cmf(&model)?;
             denoise(&dit, &cap, cap_n, cap_u.as_ref(), lh, lw, p, &mut progress)
         };
+        lap(&mut marks, "denoise");
         let vae = VaeDecoder::from_cmf(&model)?;
-        return Ok(to_rgb01(vae.decode(&latents, lh, lw)));
+        let rgb = to_rgb01(vae.decode(&latents, lh, lw));
+        lap(&mut marks, "vae decode");
+        tracing::info!(
+            "stages: {}",
+            marks
+                .iter()
+                .map(|(n, v)| format!("{n} {v:.1}s"))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        );
+        return Ok(rgb);
     }
 
     // ── diffusers directory: exact f32, stages load-and-drop ──
