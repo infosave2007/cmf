@@ -146,6 +146,12 @@ fn rms_norm_into(x: &[f32], w: &[f32], eps: f64, dst: &mut [f32]) {
 }
 
 /// RMSNorm with NO affine — the decoder's q/k norms are weightless.
+thread_local! {
+    /// The check's reference arm re-enters `attention`; without this it
+    /// checks its own check, forever.
+    static CHECKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn rms_norm_plain(x: &mut [f32], eps: f64) {
     let ss = x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / x.len() as f64;
     let inv = 1.0 / (ss + eps).sqrt();
@@ -337,6 +343,65 @@ impl VideoVae {
             // itself. A replacement must assert the device arm wrote
             // before it compares, and must call the host repack
             // DIRECTLY rather than through the dispatcher.
+            // A sound version of the harness the previous one failed to
+            // be: a re-entry guard (its reference arm calls back into
+            // this function), and a sentinel that proves the device arm
+            // WROTE before its numbers are believed.
+            //
+            // VERDICT, and it moves the search a long way: the device
+            // arm writes EVERY element (wrote=3680256/3680256) and it
+            // writes ZEROS — `l1-host` comes back exactly equal to
+            // `host|max|`, which is the distance from an all-zero
+            // buffer. So the whole device attention is empty for this
+            // decoder, and the split's addressing, its bias and its
+            // layout are all downstream of a stage that has already
+            // produced nothing. That also explains why every layout
+            // experiment agreed: zero does not depend on addressing.
+            //
+            // Prime suspect: shape. The DiT runs these same kernels at
+            // nh=56 hd=128 n=1859 and is correct; the VAE asks for
+            // hd=64. A 64-wide head against a kernel that tiles 64×64,
+            // or a dispatch whose grid rounds to zero groups, would
+            // leave an untouched (freshly zeroed) output exactly like
+            // this. Next: run the QK stage alone at hd=64 and look at
+            // the score plane before softmax.
+            if std::env::var("CMF_VAE3D_CHECK").as_deref() == Ok("1")
+                && !CHECKING.with(|c| c.get())
+            {
+                CHECKING.with(|c| c.set(true));
+                const SENT: f32 = -12345.0;
+                let mut d1 = vec![SENT; attn.len()];
+                let mut d0 = vec![SENT; attn.len()];
+                let ok1 = crate::gpu::vae_attention_packed_layout(
+                    qkv, nh, n, hd, scale, angles, self.eps as f32, &mut d1, 1,
+                );
+                let ok0 = crate::gpu::vae_attention_packed_layout(
+                    qkv, nh, n, hd, scale, angles, self.eps as f32, &mut d0, 0,
+                );
+                let wrote = |v: &[f32]| v.iter().filter(|&&x| x != SENT).count();
+                let mut host = vec![0f32; attn.len()];
+                let saved = std::env::var("CMF_VAE3D_ATTN").ok();
+                // SAFETY: single-threaded diagnostic, guarded above.
+                unsafe { std::env::set_var("CMF_VAE3D_ATTN", "cpu") };
+                self.attention(qkv, n, &mut host, angles);
+                match &saved {
+                    Some(v) => unsafe { std::env::set_var("CMF_VAE3D_ATTN", v) },
+                    None => unsafe { std::env::remove_var("CMF_VAE3D_ATTN") },
+                }
+                let md = |a: &[f32], b: &[f32]| {
+                    a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()))
+                };
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "vae attn check: ok={ok1}/{ok0} wrote={}/{} of {} | host|max| {:.4e} | l1-host {:.4e} | l0-host {:.4e} | l1-l0 {:.4e}",
+                        wrote(&d1), wrote(&d0), attn.len(),
+                        host.iter().fold(0f32, |m, v| m.max(v.abs())),
+                        md(&d1, &host), md(&d0, &host), md(&d1, &d0),
+                    )
+                });
+                CHECKING.with(|c| c.set(false));
+            }
             if std::env::var("CMF_VAE3D_SPLIT").as_deref() == Ok("1")
                 && crate::gpu::vae_attention_packed(
                     qkv, nh, n, hd, scale, angles, self.eps as f32, attn,
