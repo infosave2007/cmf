@@ -234,8 +234,16 @@ fn kaiser_sinc(cutoff: f64, half_width: f64, k: usize) -> Vec<f32> {
 
 /// Replicate-pad, then a per-channel FIR.
 ///
-/// NEXT TARGET, and the numbers that name it: the audio decoder is
-/// 9.2 s of a 95.6 s render — the same share the video decoder had
+/// MEASURED, and smaller than it looked: parallelizing this took the
+/// audio stage 9.2 s → 8.1 s, output bit-identical. So the FIR is not
+/// where that stage's time goes — the rest is in the convolutions,
+/// which DO use the pool but split over OUTPUT CHANNELS, and this
+/// decoder narrows to a handful of them near the output where the
+/// samples are longest. Splitting those over TIME instead is the next
+/// thing to try, and it wants a phase profiler first: this decoder
+/// still has none.
+///
+/// Original note: the audio decoder is 9.2 s of a 95.6 s render — the same share the video decoder had
 /// before its host loops met the thread pool (38.3 s → 16.6 s). This
 /// function is the shape that fix wanted: every channel is independent
 /// and the whole thing runs on one thread. The convolutions above DO
@@ -248,24 +256,58 @@ fn kaiser_sinc(cutoff: f64, half_width: f64, k: usize) -> Vec<f32> {
 /// a phase profiler like `CMF_VAE3D_PROF`: this decoder has none, and
 /// the video one went untuned for a whole session precisely because
 /// nothing measured it.
-fn fir_pad(x: &[f32], ch: usize, n: usize, f: &[f32], pad_l: usize, pad_r: usize, stride: usize) -> (Vec<f32>, usize) {
+#[allow(clippy::too_many_arguments)]
+fn fir_pad(
+    x: &[f32],
+    ch: usize,
+    n: usize,
+    f: &[f32],
+    pad_l: usize,
+    pad_r: usize,
+    stride: usize,
+    pool: Option<&Pool>,
+) -> (Vec<f32>, usize) {
     let padded = n + pad_l + pad_r;
     let out_n = (padded - f.len()) / stride + 1;
     let mut out = vec![0f32; ch * out_n];
-    let mut buf = vec![0f32; padded];
-    for c in 0..ch {
-        let src = &x[c * n..(c + 1) * n];
-        for (i, b) in buf.iter_mut().enumerate() {
-            let p = i as isize - pad_l as isize;
-            *b = src[p.clamp(0, n as isize - 1) as usize];
+    struct P(*mut f32);
+    // SAFETY: each channel owns `out[c*out_n .. (c+1)*out_n]` and no
+    // two workers take the same channel.
+    unsafe impl Send for P {}
+    unsafe impl Sync for P {}
+    impl P {
+        // Through a method, so the closure captures the WRAPPER and not
+        // the bare pointer — 2021 captures disjoint fields, and a
+        // captured `*mut f32` is neither Send nor Sync.
+        #[allow(clippy::mut_from_ref)]
+        unsafe fn row(&self, off: usize, len: usize) -> &mut [f32] {
+            unsafe { std::slice::from_raw_parts_mut(self.0.add(off), len) }
         }
-        for t in 0..out_n {
-            let mut acc = 0f32;
-            for (j, &kv) in f.iter().enumerate() {
-                acc += kv * buf[t * stride + j];
+    }
+    let po = P(out.as_mut_ptr());
+    let work = |lo: usize, hi: usize| {
+        // Per worker, not shared: the old single `buf` is what kept this
+        // on one thread.
+        let mut buf = vec![0f32; padded];
+        for c in lo..hi {
+            let src = &x[c * n..(c + 1) * n];
+            for (i, b) in buf.iter_mut().enumerate() {
+                let p = i as isize - pad_l as isize;
+                *b = src[p.clamp(0, n as isize - 1) as usize];
             }
-            out[c * out_n + t] = acc;
+            let dst = unsafe { po.row(c * out_n, out_n) };
+            for (t, d) in dst.iter_mut().enumerate() {
+                let mut acc = 0f32;
+                for (j, &kv) in f.iter().enumerate() {
+                    acc += kv * buf[t * stride + j];
+                }
+                *d = acc;
+            }
         }
+    };
+    match pool {
+        Some(p) => p.run_rows(ch, &work),
+        None => work(0, ch),
     }
     (out, out_n)
 }
@@ -293,7 +335,7 @@ impl Activation1d {
         })
     }
 
-    fn apply(&self, x: &[f32], ch: usize, n: usize) -> (Vec<f32>, usize) {
+    fn apply(&self, x: &[f32], ch: usize, n: usize, pool: Option<&Pool>) -> (Vec<f32>, usize) {
         // conv_transpose1d(pad(x, 5, 5), filter, stride 2) · 2, then the
         // 15-sample margins the reference trims off each end.
         let pad = FILTER_LEN / 2 - 1;
@@ -324,7 +366,7 @@ impl Activation1d {
         }
         self.act.apply(&mut mid, keep);
         // LowPassFilter1d at stride 2: even kernel pads 5 left, 6 right.
-        fir_pad(&mid, ch, keep, &self.down, FILTER_LEN / 2 - 1, FILTER_LEN / 2, 2)
+        fir_pad(&mid, ch, keep, &self.down, FILTER_LEN / 2 - 1, FILTER_LEN / 2, 2, pool)
     }
 }
 
@@ -467,7 +509,7 @@ impl AudioVae {
                 }
             }
             let last_ch = self.ups[self.ups.len() - 1].out_ch;
-            let (mut y, yn) = self.act_post.apply(&x, last_ch, n);
+            let (mut y, yn) = self.act_post.apply(&x, last_ch, n, pool);
             y = self.conv_post.apply(&y, yn, pool);
             for v in y.iter_mut() {
                 *v = v.clamp(-1.0, 1.0);
@@ -490,9 +532,9 @@ impl AmpBlock {
         let mut cur = x.to_vec();
         for i in 0..self.convs1.len() {
             let (a1, a2) = (&self.acts[i * 2], &self.acts[i * 2 + 1]);
-            let (xt, tn) = a1.apply(&cur, ch, n);
+            let (xt, tn) = a1.apply(&cur, ch, n, pool);
             let xt = self.convs1[i].apply(&xt, tn, pool);
-            let (xt, tn2) = a2.apply(&xt, ch, tn);
+            let (xt, tn2) = a2.apply(&xt, ch, tn, pool);
             let xt = self.convs2[i].apply(&xt, tn2, pool);
             for (a, b) in cur.iter_mut().zip(&xt) {
                 *a += b;
