@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **A phase profiler for the audio decoder (`CMF_AVAE_TIME=1`), and
+  what it says: 95.4% of that stage is the resblocks' dilated
+  convolutions.** Tiling those over time as well as output channels
+  took the stage 8.6 s → 8.2 s, bit-identical — small, and that IS the
+  result: they are not starved of parallelism, they are ~8 s of
+  convolution arithmetic on the CPU while the card is idle. The audio
+  decoder is now the only host-bound stage left in a render.
+
 - **The audio decoder's FIR runs across the pool: that stage 9.2 s →
   8.1 s, output bit-identical.** Every channel is independent and the
   whole filter ran on one thread, sharing a single scratch buffer;
