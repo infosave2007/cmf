@@ -83,7 +83,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are 47.1.
 
 ### Fixed
-- **The qkv split kernel never ran — for anyone.** Its command encoder
+- **The qkv split kernel never ran — for anyone.** (Swept afterwards:
+  of the 92 command encoders in the wgpu backend this was the only one
+  that was never consumed — every other is either finished in place or
+  handed to `readback`/`submit`, which finish it.) Its command encoder
   was created, filled with the dispatch, and dropped; only the qk-norm
   encoder that follows reached the queue. q and k hid it, because
   qk-norm reads the packed panel itself and rewrites both planes. Only
