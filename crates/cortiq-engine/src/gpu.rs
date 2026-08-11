@@ -1548,6 +1548,31 @@ pub fn vae_conv2d(
 /// keeps its host repack.
 #[allow(unused_variables)]
 #[allow(clippy::too_many_arguments)]
+/// qkv projection + attention with the panel never leaving the card.
+/// wgpu only; `false` elsewhere and the caller keeps its host chain.
+#[allow(clippy::too_many_arguments, unused_variables)]
+pub fn dit_qkv_attention(
+    model: &Arc<CmfModel>,
+    qkv_idx: usize,
+    xn: &[f32],
+    n: usize,
+    hidden: usize,
+    nh: usize,
+    hd: usize,
+    scale: f32,
+    nr: (&[f32], &[f32], &[f32], f32),
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::dit_qkv_attention(
+            model, qkv_idx, xn, n, hidden, nh, hd, scale, nr, out,
+        ),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 pub fn dit_attention_packed(
     qkv: &[f32],
     nh: usize,

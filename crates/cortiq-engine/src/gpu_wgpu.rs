@@ -17707,8 +17707,53 @@ pub fn q4tp_matvec_batch_for_test(
 /// kernel is unavailable and the caller should repack on the host.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
+/// qkv GEMM + attention with the panel never leaving the card: the
+/// projection writes into a device buffer and the split reads it there.
+/// Requires the device to own qk-norm and RoPE too (`nr`), because the
+/// host loop that used to apply them is the only other reason the panel
+/// came home. `false` = anything refused, and the caller runs its host
+/// chain unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn dit_qkv_attention(
+    model: &Arc<CmfModel>,
+    qkv_idx: usize,
+    xn: &[f32],
+    n: usize,
+    hidden: usize,
+    nh: usize,
+    hd: usize,
+    scale: f32,
+    nr: (&[f32], &[f32], &[f32], f32),
+    out: &mut [f32],
+) -> bool {
+    let inner = nh * hd;
+    let mut unused = Vec::new();
+    let Some(panel) = tp_matmat_keep(model, qkv_idx, xn, n, 3 * inner, hidden, &mut unused, false)
+    else {
+        return false;
+    };
+    dit_attention_packed_src(&[], Some(&panel), nh, n, hd, scale, Some(nr), out)
+}
+
 pub fn dit_attention_packed(
     qkv: &[f32],
+    nh: usize,
+    n: usize,
+    hd: usize,
+    scale: f32,
+    nr: Option<(&[f32], &[f32], &[f32], f32)>,
+    out: &mut [f32],
+) -> bool {
+    dit_attention_packed_src(qkv, None, nh, n, hd, scale, nr, out)
+}
+
+/// The same, with the panel possibly ALREADY on the card (`pre`): its
+/// GEMM kept it there, so nothing is uploaded and nothing was read back
+/// — 320 MB a block that used to cross the bus twice.
+#[allow(clippy::too_many_arguments)]
+pub fn dit_attention_packed_src(
+    qkv: &[f32],
+    pre: Option<&wgpu::Buffer>,
     nh: usize,
     n: usize,
     hd: usize,
@@ -17721,11 +17766,12 @@ pub fn dit_attention_packed(
         return false;
     };
     let inner = nh * hd;
-    if qkv.len() < n * 3 * inner || out.len() < n * inner {
+    if (pre.is_none() && qkv.len() < n * 3 * inner) || out.len() < n * inner {
         return false;
     }
     let plane = (nh * n * hd * 4) as u64;
     let (qb, kb, vb, src) = {
+
         let mut sc = c.scratch.lock().unwrap();
         // COPY_DST too: these are the SAME slots the host-repack path
         // uploads into, and a grow-only slot keeps whatever usage it was
@@ -17746,8 +17792,14 @@ pub fn dit_attention_packed(
             src,
         )
     };
-    c.queue
-        .write_buffer(&src, 0, bytemuck::cast_slice(&qkv[..n * 3 * inner]));
+    let src = match pre {
+        Some(b) => b.clone(),
+        None => {
+            c.queue
+                .write_buffer(&src, 0, bytemuck::cast_slice(&qkv[..n * 3 * inner]));
+            src
+        }
+    };
     let u = c
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
