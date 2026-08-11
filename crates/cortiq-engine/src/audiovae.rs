@@ -130,10 +130,16 @@ impl Conv1d {
         // `out = W · col` with a bias per row. im2col is a gather, which
         // the card does far better than it does the branch in this loop.
         //
-        // The missing piece is an f32 device GEMM in the public facade:
-        // `gemm_nt_coop` exists in the wgpu backend but only the bake
-        // reaches it, and `tp_matmat` is q4tp-only. Exposing it is the
-        // actual work; this decoder is then just a caller.
+        // The f32 device GEMM already exists and is public INSIDE the
+        // backend — `gpu_wgpu::gemm_nt_f32(x, w, y, n, k, m)`, tensor
+        // cores when the card has them. It is simply not re-exported
+        // through `gpu.rs`, which is where every other caller goes. Two
+        // conditions come with it and both suit this decoder: it refuses
+        // under `CMF_BAKE_GPU=0` or strict-f32, and it refuses jobs
+        // below n·k·m = 4M — these convolutions are far above that
+        // (out_ch × in_ch·k × out_n runs to hundreds of millions).
+        // So the work is: a facade re-export, an im2col buffer, and a
+        // parity check against this loop.
         let tiles = (128 / self.out_ch.max(1)).max(1);
         let tile = out_n.div_ceil(tiles.max(1));
         let rows = self.out_ch * tiles;
