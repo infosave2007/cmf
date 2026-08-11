@@ -20973,6 +20973,7 @@ fn readback2(
             }
             if t0.elapsed() > std::time::Duration::from_millis(2) {
                 if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+                    stage.unmap();
                     return false;
                 }
                 break;
@@ -20980,10 +20981,12 @@ fn readback2(
             std::hint::spin_loop();
         }
     } else if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        stage.unmap();
         return false;
     }
     {
         let Ok(data) = slice.get_mapped_range() else {
+            stage.unmap();
             return false;
         };
         a_out.copy_from_slice(bytemuck::cast_slice(&data[..a_bytes as usize]));
@@ -21025,6 +21028,7 @@ fn readback(
             }
             if t0.elapsed() > std::time::Duration::from_millis(2) {
                 if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+                    staging.unmap();
                     return false;
                 }
                 break;
@@ -21032,10 +21036,12 @@ fn readback(
             std::hint::spin_loop();
         }
     } else if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        staging.unmap();
         return false;
     }
     {
         let Ok(data) = slice.get_mapped_range() else {
+            staging.unmap();
             return false;
         };
         par_copy(out, bytemuck::cast_slice(&data[..out.len() * 4]));
