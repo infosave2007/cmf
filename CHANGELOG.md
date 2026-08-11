@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The VAE split kernel is exonerated: it reproduces the host repack
+  exactly.** Run alone into private buffers (`CMF_VAE3D_CHECK=1`), the
+  head-interleaved split matches the host element for element —
+  maxdiff 0.0000e0. The zeros the device attention returns are made
+  further down the chain, in qk-norm, QK, softmax, PV or the unstack,
+  every one of which reads shared grow-only scratch the DiT touched
+  first at larger dimensions. The probe itself hit that trap: a
+  grow-only slot keeps the usage flags it was FIRST created with, so
+  asking an existing plane for COPY_SRC is silently not granted.
+
 - **The VAE chain's defect located: the device attention writes zeros.**
   With a harness that proves the device arm wrote (sentinel fill) and
   cannot recurse into itself, the verdict is unambiguous: every element

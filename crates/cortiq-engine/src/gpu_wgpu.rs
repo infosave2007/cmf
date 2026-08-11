@@ -18050,6 +18050,92 @@ pub fn vae_attention_packed_layout(
     )
 }
 
+/// Diagnostic: run ONLY the split and read the q plane back. No norm,
+/// no RoPE, no attention — so a mismatch here is the hand-off itself.
+pub fn dit_split_only(
+    qkv: &[f32],
+    nh: usize,
+    n: usize,
+    hd: usize,
+    layout: u32,
+    out_q: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Some(split) = c.dit_qkv_split.as_ref() else {
+        return false;
+    };
+    let _gate = c.mm_gate.lock().unwrap();
+    let inner = nh * hd;
+    if qkv.len() < n * 3 * inner || out_q.len() < nh * n * hd {
+        return false;
+    }
+    let plane = (nh * n * hd * 4) as u64;
+    let st = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+    // Own buffers, NOT the shared slots: a grow-only slot keeps the
+    // usage flags it was FIRST created with, so asking an existing
+    // `dit-q` for COPY_SRC is silently not granted and the copy fails
+    // validation. That trap is documented two functions up; it caught
+    // this probe anyway.
+    let mk = |size: u64, usage: wgpu::BufferUsages, label: &str| {
+        c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage,
+            mapped_at_creation: false,
+        })
+    };
+    let src = mk((n * 3 * inner * 4) as u64, st, "dso-qkv");
+    let qb = mk(plane, st | wgpu::BufferUsages::COPY_SRC, "dso-q");
+    let kb = mk(plane, st, "dso-k");
+    let vb = mk(plane, st, "dso-v");
+    let stage = mk(
+        plane,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "dso-stage",
+    );
+    c.queue
+        .write_buffer(&src, 0, bytemuck::cast_slice(&qkv[..n * 3 * inner]));
+    let u = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[
+                n as u32, nh as u32, hd as u32, layout, 0u32, 0u32, 0u32, 0u32,
+            ]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let dummy = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[0.0f32]),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+    let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &split.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, &src),
+            bind_buf(1, &qb),
+            bind_buf(2, &kb),
+            bind_buf(3, &vb),
+            bind_buf(4, &u),
+            bind_buf(5, &dummy),
+        ],
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dso") });
+    {
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(split);
+        pass.set_bind_group(0, &bg, &[]);
+        let wgs = ((n * inner) as u32).div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+    }
+    readback(c, enc, &qb, &stage, plane, &mut out_q[..nh * n * hd])
+}
+
 pub fn dit_attention_packed(
     qkv: &[f32],
     nh: usize,
