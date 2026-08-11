@@ -71,6 +71,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are 47.1.
 
 ### Fixed
+- **The qkv split kernel never ran — for anyone.** Its command encoder
+  was created, filled with the dispatch, and dropped; only the qk-norm
+  encoder that follows reached the queue. q and k hid it, because
+  qk-norm reads the packed panel itself and rewrites both planes. Only
+  `v` had no second writer, so it held whatever the previous block left
+  in the slot.
+
+  The DiT's fused attention has been shipping with that stale `v`. With
+  the encoder submitted, the fused path now equals the host chain
+  EXACTLY — identical md5, zero differing pixels — where before it did
+  not, and it is 15% faster than that chain (57.1 s against 67.2 s).
+
+  It also explains the VAE's all-zero device attention: there `v` was
+  never anything but zeros, and P·V of a zero V is zero — which is why
+  every layout experiment agreed with every other. With the split
+  running, the layout finally matters: 0.61 from the host at this
+  decoder's layout against 15.29 at the DiT's.
+
 - **Two GEMMs on one device could compute on each other's operand.**
   The activation, result and staging slots are ONE buffer each per
   context: written under the scratch lock, then read at submit time
