@@ -2584,13 +2584,7 @@ impl Pipeline {
             m.kv.truncate_last(k_spec);
             return None;
         }
-        if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
-            eprintln!(
-                "spec-round: draft {:.1} ms | verify {:.1} ms",
-                t_draft.as_secs_f64() * 1e3,
-                (t_round.elapsed() - t_draft).as_secs_f64() * 1e3,
-            );
-        }
+        let t_verify = t_round.elapsed();
         // Acceptance: row i's argmax is the trunk's token after input i.
         let ids: Vec<u32> = (0..b)
             .map(|i| sampler::argmax(&logits[i * lm_rows..(i + 1) * lm_rows]))
@@ -2606,11 +2600,22 @@ impl Pipeline {
         *accepted += a;
         // MTP cache: keep the first draft row (its inputs were real), drop
         // the chain's, then append the verified pairs the round produced.
+        // Each of those is a whole MTP block on the per-op path and they
+        // cost 5.8 ms of a 69 ms round at k=3 — a third of what the
+        // round's own draft costs. PRICED, and they earn it: skipping
+        // them (`CMF_SPEC_WARM=0`) drops acceptance from 89% to 81% at
+        // k=3 and 85% to 74% at k=4, and the tok/s goes nowhere at k=3
+        // (50.3 against 50.5) and backwards at k=4 (48.1 against 50.1).
+        // The knob stays so the next person can re-price it after the
+        // warms are batched instead of assuming either way.
         m.kv.truncate_last(k_spec.saturating_sub(1));
-        for j in 0..a {
-            let row = &hiddens[j * self.hidden_size..(j + 1) * self.hidden_size];
-            let row = row.to_vec();
-            self.mtp_warm(m, &row, ids[j], next_pos + j);
+        let warm_off = std::env::var("CMF_SPEC_WARM").is_ok_and(|v| v == "0");
+        if !warm_off {
+            for j in 0..a {
+                let row = &hiddens[j * self.hidden_size..(j + 1) * self.hidden_size];
+                let row = row.to_vec();
+                self.mtp_warm(m, &row, ids[j], next_pos + j);
+            }
         }
         // The sampler's contract: logits of the LAST verified position.
         let mut row = logits[a * lm_rows..(a + 1) * lm_rows].to_vec();
@@ -2622,6 +2627,19 @@ impl Pipeline {
         }
         self.graph_logits = Some(row);
         let new_hidden = hiddens[a * self.hidden_size..(a + 1) * self.hidden_size].to_vec();
+        // Three phases, not two. The round's wall clock was 4 ms longer
+        // than draft+verify and the difference had nowhere to be seen:
+        // the accepted prefix re-runs the MTP block once per token to
+        // keep the draft head's attention cache warm, and the GDN state
+        // rolls back on any rejection. Both live here, after the verify.
+        if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+            eprintln!(
+                "spec-round: draft {:.1} ms | verify {:.1} ms | commit {:.1} ms                  (accepted {a} of {k_spec})",
+                t_draft.as_secs_f64() * 1e3,
+                (t_verify - t_draft).as_secs_f64() * 1e3,
+                (t_round.elapsed() - t_verify).as_secs_f64() * 1e3,
+            );
+        }
         Some((drafts[..a].to_vec(), next_pos + a + 1, new_hidden))
     }
 
