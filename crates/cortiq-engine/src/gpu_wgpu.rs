@@ -19182,6 +19182,9 @@ struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
 @group(0) @binding(1) var<storage, read> xmm: array<f32>;
 @group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
 @group(0) @binding(3) var<uniform> pmm: MmP;
+// Device-computed activation scale (1 element). Used when pmm.pad is
+// the sentinel 0xFFFFFFFF — a host-side scale still rides in pmm.pad.
+@group(0) @binding(4) var<storage, read> pmm_s: array<f32>;
 
 const KS: u32 = 32u;
 var<workgroup> cm_a: array<f16, 64 * 32>;
@@ -23023,7 +23026,17 @@ fn main() {
             return;
         };
         if c.q4tp_mm_coop_f16.is_none() {
-            eprintln!("no cooperative-matrix pipeline here — skipping");
+            // A device WITH cooperative matrices that has no f16 pipeline
+            // means the shader was rejected — which is how a wrong
+            // binding hid for several commits while the path silently
+            // fell back. Skipping is only honest where the hardware
+            // cannot do it at all.
+            assert!(
+                c.q4tp_mm_coop.is_none(),
+                "cooperative matrices are up but the f16 pipeline is missing — \
+                 the shader was rejected (check the init warning)"
+            );
+            eprintln!("no cooperative-matrix hardware here — skipping");
             return;
         }
         // Small enough to run anywhere, wide enough to cross several
