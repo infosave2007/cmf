@@ -461,6 +461,21 @@ impl AudioVae {
     }
 
     /// Normalized latents `[C, 2, T]` → stereo `[2, L]` in [-1, 1].
+    ///
+    /// THE REMAINING WIN IS THIS LOOP: the two stereo channels are two
+    /// complete, independent decoder passes and they run one after the
+    /// other. That is a factor of two sitting outside the exact place
+    /// the inside cannot use — the convolutions parallelize over output
+    /// channels, and this decoder narrows to a handful of those near the
+    /// output where the samples are longest (measured: parallelizing the
+    /// per-channel FIR bought only 9.2 s → 8.1 s, so the time is in the
+    /// convolutions, not the filter).
+    ///
+    /// Not done blind, because both passes already call into `self.pool`
+    /// and nesting is the open question: check whether `Pool::run_rows`
+    /// tolerates two concurrent callers before wrapping this in a
+    /// `thread::scope`. If it does not, the cheaper shape is to give the
+    /// convolutions a time split for the narrow layers instead.
     pub fn decode(&self, z: &[f32], c: usize, t: usize) -> (Vec<f32>, usize) {
         let pool = self.pool.as_deref();
         let mut chans: Vec<Vec<f32>> = Vec::with_capacity(2);
