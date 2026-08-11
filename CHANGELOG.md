@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   more usefully, the parity test now ASSERTS instead of skipping when a
   device that advertises cooperative matrices has no f16 pipeline, which
   is exactly the shape this bug had. A skipped test is not a passing one.
+- **And the binding it declared then failed to bind.** With the shader
+  compiling again, every dispatch hit "4 bindings against a layout of
+  5": the code decided whether to add the scale entry by comparing
+  pipeline ADDRESSES, and the handle passed in is not the object held
+  in the context. wgpu 30 exposes no identity on either handle, so the
+  caller now says so directly — it passes a scale buffer exactly when
+  the f16 twin is the pipeline. Render restored end to end: 130.0 s,
+  frames within 2.6% of the reference.
 
 ### Fixed
 - **A cold call now takes the device arm while the probe is deciding.**
