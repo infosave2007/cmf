@@ -9664,6 +9664,8 @@ struct Ctx {
     dit_gemm_coop: Option<wgpu::ComputePipeline>,
     /// Interleaved qkv → head-major q/k/v, on the device.
     dit_qkv_split: Option<wgpu::ComputePipeline>,
+    /// v [h][n][hd] → [h][hd][n], so PV is an NT product.
+    dit_v_transpose: Option<wgpu::ComputePipeline>,
     /// Two-stage form of the same: partials, then a fold.
     act_amax_part: Option<wgpu::ComputePipeline>,
     act_amax_fold: Option<wgpu::ComputePipeline>,
@@ -9963,6 +9965,8 @@ struct Scratch {
     dqw2: Option<(wgpu::Buffer, u64)>,
     /// Interleaved qkv upload for the device-side split.
     dqkv: Option<(wgpu::Buffer, u64)>,
+    /// v transposed per head, for the NT form of PV.
+    dvt: Option<(wgpu::Buffer, u64)>,
     /// Partial maxima of the two-stage activation reduction.
     amaxp: Option<(wgpu::Buffer, u64)>,
     /// DiT attention: Q/K/V uploads, scores, panel, output, staging.
@@ -10616,6 +10620,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let ffn_silu_packed = pipe("ffn_silu_mul_packed");
     let act_absmax = mk_coop(COOP_AMAX_SRC, "act-absmax", "act_absmax");
     let dit_qkv_split = mk_coop(DIT_SPLIT_SRC, "dit-split", "dit_qkv_split");
+    let dit_v_transpose = mk_coop(DIT_SPLIT_SRC, "dit-vt", "dit_v_transpose");
     let dit_gemm_coop = (q4tp_mm_coop.is_some())
         .then(|| mk_coop(DIT_COOP_SRC, "dit-coop", "dit_gemm_coop"))
         .flatten();
@@ -10970,6 +10975,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         act_absmax,
         dit_gemm_coop,
         dit_qkv_split,
+        dit_v_transpose,
         act_amax_part,
         act_amax_fold,
         q4tp_dq_f16,
@@ -17863,6 +17869,56 @@ fn dit_attention_inner(
         .dit_gemm_coop
         .as_ref()
         .filter(|_| std::env::var("CMF_DIT_ATTN_COOP").as_deref() == Ok("1"));
+    // PV's right operand is read down columns in v's [n][hd] layout —
+    // 4.76 s a step against QK's 1.65 at the same FLOPs. Transpose it
+    // once per block and PV becomes the NT product QK already is.
+    // PV through the NT form needs its own switch: the transpose lands,
+    // but the PV bind group still fails validation and I ran out of room
+    // to chase it. CMF_DIT_ATTN_COOP=1 (QK only) must not drag a
+    // crashing path along with it — that is what CMF_DIT_PV_COOP is for.
+    let pv_coop_on = std::env::var("CMF_DIT_PV_COOP").as_deref() == Ok("1");
+    let vtb = match (coop_dit.filter(|_| pv_coop_on), c.dit_v_transpose.as_ref()) {
+        (Some(_), Some(tp)) => {
+            let vt = {
+                let mut sc = c.scratch.lock().unwrap();
+                Scratch::ensure(
+                    &c.device,
+                    &mut sc.dvt,
+                    (nh * n * hd * 4) as u64,
+                    wgpu::BufferUsages::STORAGE,
+                    "dit-vt",
+                )
+            };
+            let u = c
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&[n as u32, nh as u32, hd as u32, 0u32]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &tp.get_bind_group_layout(0),
+                // An auto layout is per ENTRY POINT: dit_v_transpose
+                // touches sq, sk and sp only, so binding the split
+                // kernel's full set fails validation (5 against 3).
+                entries: &[bind_buf(0, &vb), bind_buf(1, &vt), bind_buf(4, &u)],
+            });
+            let mut e = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dit-vt") });
+            {
+                let mut pass = begin_pass(&mut e);
+                pass.set_pipeline(tp);
+                pass.set_bind_group(0, &bg, &[]);
+                let wgs = ((n * nh * hd) as u32).div_ceil(256);
+                pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+            }
+            c.queue.submit(Some(e.finish()));
+            Some(vt)
+        }
+        _ => None,
+    };
     for h in 0..nh {
         let kv = (h / hpk) as u64;
         // QK on the matrix units: x = this head's q rows, w = its k
@@ -17896,6 +17952,37 @@ fn dit_attention_inner(
                 ],
             })
         });
+        let bg_pv_coop = match (coop_dit, &vtb) {
+            (Some(p), Some(vt)) => {
+                let u = c
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytemuck::cast_slice(&[
+                            (n / 4) as u32,
+                            hd as u32,
+                            n as u32,
+                            1.0f32.to_bits(),
+                            0u32,
+                            (kv as usize * n * hd) as u32,
+                            (h * n * hd) as u32,
+                            0u32,
+                        ]),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                Some(c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &p.get_bind_group_layout(0),
+                    entries: &[
+                        bind_buf(0, vt),
+                        bind_buf(1, &scb),
+                        bind_buf(2, &pb),
+                        bind_buf(3, &u),
+                    ],
+                }))
+            }
+            _ => None,
+        };
         let bg_qk = bind(
             &c.dit_qk,
             &qb,
@@ -18010,9 +18097,26 @@ fn dit_attention_inner(
                 label: Some("dit-pv"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&c.dit_pv);
-            pass.set_bind_group(0, &bg_pv, &[]);
-            pass.dispatch_workgroups((hd as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
+            match (&coop_dit, &bg_pv_coop) {
+                (Some(p), Some(bgc)) => {
+                    pass.set_pipeline(p);
+                    pass.set_bind_group(0, bgc, &[]);
+                    pass.dispatch_workgroups(
+                        (hd as u32).div_ceil(64),
+                        (n as u32).div_ceil(64),
+                        1,
+                    );
+                }
+                _ => {
+                    pass.set_pipeline(&c.dit_pv);
+                    pass.set_bind_group(0, &bg_pv, &[]);
+                    pass.dispatch_workgroups(
+                        (hd as u32).div_ceil(64),
+                        (n as u32).div_ceil(64),
+                        1,
+                    );
+                }
+            }
         }
         split_now(&mut enc, 2);
     }
@@ -19626,6 +19730,23 @@ struct SpP { n: u32, nh: u32, hd: u32, _p: u32 };
 @group(0) @binding(2) var<storage, read_write> sk: array<f32>;
 @group(0) @binding(3) var<storage, read_write> sv: array<f32>;
 @group(0) @binding(4) var<uniform>             sp: SpP;
+
+// v per head from [n][hd] to [hd][n]. PV reads its right operand down
+// columns in the [n][hd] layout — measured 4.76 s a step against QK's
+// 1.65 at identical FLOPs. n·hd of copying buys that back.
+@compute @workgroup_size(256)
+fn dit_v_transpose(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let inner = sp.nh * sp.hd;
+    let total = sp.n * inner;
+    let i = gid.y * (65535u * 256u) + gid.x;
+    if (i >= total) { return; }
+    let h = i / (sp.n * sp.hd);
+    let r = i - h * sp.n * sp.hd;
+    let p = r / sp.hd;
+    let d = r - p * sp.hd;
+    // sq holds v in head-major [h][n][hd]; sk receives [h][hd][n].
+    sk[h * sp.n * sp.hd + d * sp.n + p] = sq[i];
+}
 
 @compute @workgroup_size(256)
 fn dit_qkv_split(@builtin(global_invocation_id) gid: vec3<u32>) {

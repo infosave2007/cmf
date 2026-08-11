@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`CMF_DIT_ATTN_PROF=1` splits the attention phase into its three
+  walls, and it named the culprit in one run**: QK 1.65 s, softmax
+  0.97 s, **PV 4.76 s** per step at 512×288. PV is 3× QK at identical
+  FLOPs, so it is not arithmetic — its right operand `v` is stored
+  [n][hd] and the GEMM reads it down columns. The fix is n·hd of
+  transposing against n²·hd of work.
+- **The transpose kernel (`dit_v_transpose`) is in and the PV-as-NT
+  wiring is written, but it still fails bind-group validation** and I
+  ran out of room to chase it. It sits behind its OWN switch
+  (`CMF_DIT_PV_COOP=1`) so that `CMF_DIT_ATTN_COOP=1` — the QK path,
+  which is correct and measured neutral — does not drag a crashing path
+  along with it. Default is untouched and verified: render whole,
+  frames bit-identical.
+
+### Added
 - **The qkv split moved to the device, and it was the attention
   bottleneck all along.** Timing the phase's halves separately showed
   4.4 s of a 7.3 s attention phase was the HOST building head-major
