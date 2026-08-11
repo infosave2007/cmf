@@ -120,6 +120,20 @@ impl Conv1d {
         // while the card is idle. The next move is the device, not a
         // finer split — everything else in this render already went
         // that way, and this is the last host-bound stage left.
+        //
+        // The shape it wants, so the next pass is implementation and not
+        // research: this convolution IS a GEMM under im2col. Build
+        // `[in_ch·k × out_n]` where row `(i, j)` holds
+        // `x[i, t + j·dilation - pad]` (zero outside), and the weights
+        // are ALREADY `[out_ch × in_ch·k]` in exactly that order —
+        // `w[(o·in_ch + i)·k + j]` — so nothing needs repacking. Then
+        // `out = W · col` with a bias per row. im2col is a gather, which
+        // the card does far better than it does the branch in this loop.
+        //
+        // The missing piece is an f32 device GEMM in the public facade:
+        // `gemm_nt_coop` exists in the wgpu backend but only the bake
+        // reaches it, and `tp_matmat` is q4tp-only. Exposing it is the
+        // actual work; this decoder is then just a caller.
         let tiles = (128 / self.out_ch.max(1)).max(1);
         let tile = out_n.div_ceil(tiles.max(1));
         let rows = self.out_ch * tiles;
