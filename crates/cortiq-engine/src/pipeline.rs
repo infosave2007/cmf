@@ -5733,22 +5733,27 @@ fn draft_probe() -> bool {
                 // (the race just settled on the normal path).
             }
         }
-        // KIMI-LINEAR'S SPLIT BUG LIVES HERE, and it is worth 2.6×
-        // (12.2 tok/s on one card against 4.6 across two). Below, a
-        // graph that covers only PART of the span has its result thrown
-        // away and the whole span re-runs per-op — the work is done
-        // twice. On one card there is no span at all (`from == 0` and
-        // `upto == None` take the branch above), so only the split pays
-        // it, and a hybrid stack like Kimi's — linear-attention layers
-        // interleaved with full attention — can never cover a span
-        // whole, so it pays it on every segment of every token.
+        // KIMI-LINEAR LOSES 2.6× ON THE SPLIT and the cause is NOT here.
+        // Measured on 2×RTX 5090: 12.2 tok/s on one card against 4.6
+        // across two, where the other five models lose 0.5-5%. What is
+        // established: the whole-token graph is refused for this model
+        // (`wgpu whole-token graph refused — per-op path`), and its
+        // hybrid stack — linear-attention layers interleaved with full
+        // attention — cannot cover a span whole.
         //
-        // The fix is to keep what was built: `span_res` already returns
-        // the hidden after `gl` layers, so accept it and continue per-op
-        // from `from + gl` instead of discarding and restarting. The
-        // care needed is the continuation — calling back into this
-        // function would re-enter the graph attempt, so it has to reach
-        // the per-op loop directly.
+        // A first reading of this block said the partial graph was
+        // thrown away and the span re-run from scratch. IT IS NOT: the
+        // `h = hh; tail_start = from + gl;` below keeps the device
+        // prefix and the tail continues per-op. That explanation was
+        // wrong and is retracted.
+        //
+        // So the 2.6× is still unexplained. What to measure next, in
+        // order: whether `gl` is 0 on this model (a prefix of nothing
+        // means every layer walks per-op on BOTH arms, and then the
+        // split's extra cost is the per-token hidden hand-off between
+        // devices, not the graph); and whether the recurrent state of
+        // the linear layers is being moved or rebuilt across the
+        // segment boundary, which one card never has to do.
         //
         // Span runs (network split): the graph covers exactly [from..=upto]
         // — one submit per SEGMENT per token. No race: its state is global
