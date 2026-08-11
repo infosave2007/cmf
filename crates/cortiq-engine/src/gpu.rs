@@ -1662,6 +1662,22 @@ pub fn vae_attention_packed_layout(
     }
 }
 
+pub fn dit_split_only(
+    qkv: &[f32],
+    nh: usize,
+    n: usize,
+    hd: usize,
+    layout: u32,
+    out_q: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::dit_split_only(qkv, nh, n, hd, layout, out_q),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 pub fn dit_attention_packed(
     qkv: &[f32],
     nh: usize,

@@ -400,6 +400,28 @@ impl VideoVae {
                     Some(v) => unsafe { std::env::set_var("CMF_VAE3D_ATTN", v) },
                     None => unsafe { std::env::remove_var("CMF_VAE3D_ATTN") },
                 }
+                // The split ALONE: no norm, no RoPE, no attention. If
+                // this mismatches, the hand-off is the whole story.
+                let mut sq = vec![SENT; nh * n * hd];
+                let oks = crate::gpu::dit_split_only(qkv, nh, n, hd, 1, &mut sq);
+                let mut hq = vec![0f32; nh * n * hd];
+                for p in 0..n {
+                    for h in 0..nh {
+                        let b = p * 3 * dim + h * 3 * hd;
+                        hq[(h * n + p) * hd..(h * n + p) * hd + hd]
+                            .copy_from_slice(&qkv[b..b + hd]);
+                    }
+                }
+                let sq_wrote = sq.iter().filter(|&&x| x != SENT).count();
+                let sq_diff = sq
+                    .iter()
+                    .zip(&hq)
+                    .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                eprintln!(
+                    "vae split-only: ok={oks} wrote={sq_wrote}/{} maxdiff={sq_diff:.4e} host|max|={:.4e}",
+                    sq.len(),
+                    hq.iter().fold(0f32, |m, v| m.max(v.abs())),
+                );
                 let md = |a: &[f32], b: &[f32]| {
                     a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()))
                 };
