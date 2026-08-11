@@ -17203,6 +17203,23 @@ pub fn q2tp_matmat(
 /// pass costs a fraction of a millisecond; what it buys is a GEMM whose
 /// matrix units are not waiting on a nibble unpacker that re-runs for
 /// every 64-row tile of activations.
+/// THE NAME LIES, AND IT IS THE BIGGEST LEVER LEFT ON EVERY DiT: this
+/// "dequantize once" plane is ONE SCRATCH SLOT shared by every weight,
+/// so each GEMM overwrites the previous one's plane and the unpack has
+/// to be re-encoded before every call — every weight, every block,
+/// every step. Nothing is cached but the allocation.
+///
+/// That is why the f16 arm loses on Lumina (11.23 s against 11.02 for
+/// the scalar arm, 2304×2304 weights) and wins on the video DiT only
+/// because its 21504×5376 GEMM is large enough to swallow the unpack
+/// it repeats. Both would be faster with a real cache.
+///
+/// The fix is a plane cache keyed by (model uid, tensor index) — the
+/// caller has that identity, this function does not, so it belongs one
+/// level up. Bound it by VRAM: an f16 plane is 2× the q4 bytes, so
+/// Lumina's DiT is ~6 GB of planes (fits a 32 GB card and pays for
+/// itself over 30 steps) while MiniMax's 25.7 GB does not — the cache
+/// has to evict, and the honest policy is largest-first by call count.
 fn dq_f16_plane(
     c: &Ctx,
     sc: &mut Scratch,
