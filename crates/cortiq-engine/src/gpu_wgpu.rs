@@ -17069,6 +17069,16 @@ fn dispatch_matmat(
 /// `QTensor::matmat` reaches for (DiT prefill, MoE experts, dense FFN
 /// batches). Without it a q4tp model kept that arm on the CPU while q4t
 /// went to the device.
+/// Is this tensor's weight buffer already on the card? The probe asks
+/// before it decides which arm a still-cold call should take.
+pub fn weight_is_resident(model: &Arc<CmfModel>, idx: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    c.weight_bufs
+        .lock()
+        .unwrap()
+        .contains_key(&(model.uid() as usize, idx))
+}
+
 pub fn q4tp_matmat(
     model: &Arc<CmfModel>,
     idx: usize,

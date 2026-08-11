@@ -268,6 +268,33 @@ pub fn fused_block_trusted() -> bool {
 /// Which arm should this GPU-eligible call take? Consult AFTER the
 /// eligibility gates (`enabled_here` / `min_rows`) so only real
 /// candidates alternate.
+/// While a class is still probing, a call whose weights are NOT yet on
+/// the card should take the GPU arm anyway: the upload is work the next
+/// step needs regardless, and the sample it produces is discarded as
+/// cold — so handing that call to the CPU arm buys nothing and costs a
+/// host GEMM. Measured on a diffusion stack, where every layer is
+/// touched once per step and therefore EVERY first-step GPU sample is
+/// cold: one projection drew the CPU arm for the whole first step, 9.8 s
+/// against the 2.8 s it costs once the weights are warm.
+pub fn weight_is_resident(model: &Arc<CmfModel>, idx: usize) -> bool {
+    #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+    {
+        return crate::gpu_wgpu::weight_is_resident(model, idx);
+    }
+    #[cfg(not(all(feature = "gpu", not(target_os = "macos"))))]
+    {
+        let _ = (model, idx);
+        true
+    }
+}
+
+pub fn probe_arm_cold_prefers_gpu(c: OpClass, weights_resident: bool) -> ProbeArm {
+    if !weights_resident && probe_deciding(c) {
+        return ProbeArm::Gpu;
+    }
+    probe_arm(c)
+}
+
 pub fn probe_arm(c: OpClass) -> ProbeArm {
     // Every arbitrated call starts with a clean cold flag: both the
     // sample discard in `probe_record` and the contention kill-switch

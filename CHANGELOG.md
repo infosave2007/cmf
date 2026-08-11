@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A cold call now takes the device arm while the probe is deciding.**
+  Every GPU sample from a cold weight is discarded (the upload is not
+  steady state), and in a diffusion stack every layer is touched once
+  per step — so on step 1 the GPU arm never accumulates and the class
+  keeps alternating. With exactly two arbitrated GEMMs per block and a
+  shared alternation counter, one projection drew the CPU arm for the
+  whole first step. Handing it to the host bought nothing: the upload
+  was needed for step 2 regardless. MiniMax DiT, first step: `out`
+  **9.8 s → 3.0 s**, whole step **27.5 s → 18.9 s**; full render
+  136.4 s → **127.8 s**, frames unchanged. LLM decode/prefill unmoved
+  (W2 122.6/155.7, nanbeige 81.2/58.7).
+
 ### Added
 - **The video FFN runs end to end on the device — a render is now
   716.6 s → 137.4 s (5.2×).** MiniMax's DiT and the 3D VAE both use a
