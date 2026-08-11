@@ -18019,6 +18019,21 @@ pub fn vae_attention_packed(
     eps: f32,
     out: &mut [f32],
 ) -> bool {
+    vae_attention_packed_layout(qkv, nh, n, hd, scale, angles, eps, out, 1)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn vae_attention_packed_layout(
+    qkv: &[f32],
+    nh: usize,
+    n: usize,
+    hd: usize,
+    scale: f32,
+    angles: &[f32],
+    eps: f32,
+    out: &mut [f32],
+    layout: u32,
+) -> bool {
     let ones = vec![1.0f32; hd];
     dit_attention_packed_src(
         qkv,
@@ -18030,7 +18045,7 @@ pub fn vae_attention_packed(
         Some((angles, &ones[..], &ones[..], eps)),
         out,
         None,
-        1,
+        layout,
         None,
     )
 }

@@ -1637,11 +1637,26 @@ pub fn vae_attention_packed(
     eps: f32,
     out: &mut [f32],
 ) -> bool {
+    vae_attention_packed_layout(qkv, nh, n, hd, scale, angles, eps, out, 1)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn vae_attention_packed_layout(
+    qkv: &[f32],
+    nh: usize,
+    n: usize,
+    hd: usize,
+    scale: f32,
+    angles: &[f32],
+    eps: f32,
+    out: &mut [f32],
+    layout: u32,
+) -> bool {
     match backend() {
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
-        Backend::Wgpu => {
-            crate::gpu_wgpu::vae_attention_packed(qkv, nh, n, hd, scale, angles, eps, out)
-        }
+        Backend::Wgpu => crate::gpu_wgpu::vae_attention_packed_layout(
+            qkv, nh, n, hd, scale, angles, eps, out, layout,
+        ),
         #[allow(unreachable_patterns)]
         _ => false,
     }

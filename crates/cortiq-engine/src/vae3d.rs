@@ -328,6 +328,15 @@ impl VideoVae {
             && crate::gpu::enabled_here()
             && n >= 256
         {
+            // A CMF_VAE3D_CHECK harness lived here and was WRONG: its
+            // reference arm re-entered this very function (so it
+            // recursed through its own check) and its device arm was
+            // never verified to have written anything, so its verdict
+            // — "both layouts identical, 7.2765 from the host" — was
+            // just max|host| against two buffers of zeros. It measured
+            // itself. A replacement must assert the device arm wrote
+            // before it compares, and must call the host repack
+            // DIRECTLY rather than through the dispatcher.
             if std::env::var("CMF_VAE3D_SPLIT").as_deref() == Ok("1")
                 && crate::gpu::vae_attention_packed(
                     qkv, nh, n, hd, scale, angles, self.eps as f32, attn,
