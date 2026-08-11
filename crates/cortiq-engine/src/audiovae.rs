@@ -14,6 +14,62 @@
 //! contain it.
 
 use crate::pool::Pool;
+
+/// Where an audio decode goes (`CMF_AVAE_TIME=1`). The video decoder
+/// went a whole session untuned because nothing measured it; this one
+/// already misled once, when the shape of the per-channel FIR promised
+/// more than the 9.2 s → 8.1 s it delivered.
+pub static AVAE_TIME: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn atime_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_AVAE_TIME").is_ok())
+}
+
+fn atime(slot: usize, t: std::time::Instant) {
+    if atime_on() {
+        AVAE_TIME[slot].fetch_add(
+            t.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// One line per phase, sorted by cost.
+pub fn avae_time_report() -> Option<String> {
+    if !atime_on() {
+        return None;
+    }
+    const NAMES: [&str; 6] = [
+        "dec_in", "conv_pre", "upsamples", "resblocks", "act_post", "conv_post",
+    ];
+    let mut v: Vec<(u64, &str)> = AVAE_TIME
+        .iter()
+        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+        .zip(NAMES)
+        .collect();
+    let total: u64 = v.iter().map(|(u, _)| u).sum();
+    if total == 0 {
+        return None;
+    }
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out = format!("audio vae phases (total {:.1} s):\n", total as f64 / 1e6);
+    for (us, name) in v {
+        out.push_str(&format!(
+            "  {name:<12} {:>6.1} s  {:>5.1}%\n",
+            us as f64 / 1e6,
+            100.0 * us as f64 / total as f64
+        ));
+    }
+    Some(out)
+}
 use cortiq_core::CmfModel;
 use std::sync::Arc;
 
@@ -55,16 +111,35 @@ impl Conv1d {
         let out_n = (n + 2 * self.pad).saturating_sub(self.dilation * (self.k - 1));
         let mut out = vec![0f32; self.out_ch * out_n];
         let ptr = SendPtr(out.as_mut_ptr());
+        // Each (channel, time slice) pair is independent, so time is
+        // tiled until there are enough rows for any pool. Kept because
+        // it is free and bit-identical — but MEASURED SMALL: 8.6 s →
+        // 8.2 s on a stage that is 95.4% these convolutions. That is
+        // the finding. The resblocks are not starved of parallelism,
+        // they are arithmetic: ~8 s of dilated convolution on the CPU
+        // while the card is idle. The next move is the device, not a
+        // finer split — everything else in this render already went
+        // that way, and this is the last host-bound stage left.
+        let tiles = (128 / self.out_ch.max(1)).max(1);
+        let tile = out_n.div_ceil(tiles.max(1));
+        let rows = self.out_ch * tiles;
         let work = |lo: usize, hi: usize| {
-            for o in lo..hi {
-                // SAFETY: workers own disjoint output channels.
-                let dst = unsafe { ptr.row(o * out_n, out_n) };
+            for r in lo..hi {
+                let o = r / tiles;
+                let t0 = (r - o * tiles) * tile;
+                if t0 >= out_n {
+                    continue;
+                }
+                let len = tile.min(out_n - t0);
+                // SAFETY: workers own disjoint (channel, time) slices.
+                let dst = unsafe { ptr.row(o * out_n + t0, len) };
                 let bias = self.b.as_ref().map_or(0.0, |b| b[o]);
                 dst.fill(bias);
                 for i in 0..self.in_ch {
                     let ker = &self.w[(o * self.in_ch + i) * self.k..(o * self.in_ch + i + 1) * self.k];
                     let src = &x[i * n..(i + 1) * n];
-                    for (t, d) in dst.iter_mut().enumerate() {
+                    for (tt, d) in dst.iter_mut().enumerate() {
+                        let t = t0 + tt;
                         let mut acc = 0f32;
                         for (j, &kv) in ker.iter().enumerate() {
                             let p = (t + j * self.dilation) as isize - self.pad as isize;
@@ -78,8 +153,8 @@ impl Conv1d {
             }
         };
         match pool {
-            Some(p) => p.run_rows(self.out_ch, &work),
-            None => work(0, self.out_ch),
+            Some(p) => p.run_rows(rows, &work),
+            None => work(0, rows),
         }
         out
     }
@@ -503,23 +578,31 @@ impl AudioVae {
             let rms = |x: &[f32]| (x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>()
                 / x.len() as f64)
                 .sqrt();
+            let tt = std::time::Instant::now();
             let mut x = self.dec_in.apply(&lat, t, pool);
+            atime(0, tt);
             let mut n = t;
             if prof {
                 eprintln!("ch{ch} dec_in rms {:.6e} n {n}", rms(&x));
             }
+            let tt = std::time::Instant::now();
             x = self.conv_pre.apply(&x, n, pool);
+            atime(1, tt);
             if prof {
                 eprintln!("ch{ch} conv_pre rms {:.6e} n {n}", rms(&x));
             }
             for i in 0..self.ups.len() {
                 let up = &self.ups[i];
+                let tt = std::time::Instant::now();
                 x = up.apply(&x, n, pool);
+                atime(2, tt);
                 n = (n - 1) * up.stride + up.k - 2 * up.pad;
                 let ch_n = up.out_ch;
                 let mut acc = vec![0f32; ch_n * n];
                 for j in 0..self.n_kernels {
+                    let tt = std::time::Instant::now();
                     let r = self.resblocks[i * self.n_kernels + j].apply(&x, ch_n, n, pool);
+                    atime(3, tt);
                     for (a, b) in acc.iter_mut().zip(&r) {
                         *a += b;
                     }
@@ -534,8 +617,12 @@ impl AudioVae {
                 }
             }
             let last_ch = self.ups[self.ups.len() - 1].out_ch;
+            let tt = std::time::Instant::now();
             let (mut y, yn) = self.act_post.apply(&x, last_ch, n, pool);
+            atime(4, tt);
+            let tt = std::time::Instant::now();
             y = self.conv_post.apply(&y, yn, pool);
+            atime(5, tt);
             for v in y.iter_mut() {
                 *v = v.clamp(-1.0, 1.0);
             }
