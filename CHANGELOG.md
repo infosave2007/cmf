@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The VAE chain's defect located: the device attention writes zeros.**
+  With a harness that proves the device arm wrote (sentinel fill) and
+  cannot recurse into itself, the verdict is unambiguous: every element
+  is written, and every element is zero — the reported distance to the
+  host equals `max|host|` exactly. So the split's addressing, its bias
+  and its layout were all downstream of a stage already producing
+  nothing, which is why every layout experiment agreed with every
+  other. Prime suspect is shape: the DiT drives these same kernels at
+  nh=56 hd=128 and is correct, the VAE asks for hd=64.
+
 - **On the VAE chain: a measurement that measured itself.** A check
   harness compared the device attention against a host reference and
   reported "both layouts byte-identical, 7.2765 off the host". Both
