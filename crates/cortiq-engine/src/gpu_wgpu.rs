@@ -9833,6 +9833,13 @@ struct Ctx {
     /// whole op (encode → submit → poll): ops already serialize on the
     /// single queue.
     scratch: Mutex<Scratch>,
+    /// One GEMM at a time per device. The activation, result and stage
+    /// slots are ONE buffer each per context, written under the scratch
+    /// lock but read at submit time after it is released — so two
+    /// threads could upload into the same slot and one would compute on
+    /// the other's operand. The scratch lock cannot cover it: `readback`
+    /// takes that lock itself, and std mutexes do not re-enter.
+    mm_gate: Mutex<()>,
     /// Resident quant weights in VRAM — the WHOLE tensor is loaded once
     /// (key (base_ptr, idx)); ranges/batches address it by offset.
     ///
@@ -11107,6 +11114,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         vram_budget,
         resident: std::sync::atomic::AtomicU64::new(0),
         scratch: Mutex::new(Scratch::default()),
+        mm_gate: Mutex::new(()),
         weight_bufs: Mutex::new(HashMap::new()),
         dsv4_kv: Mutex::new(HashMap::new()),
         dsv4_scratch: Mutex::new(HashMap::new()),
@@ -17352,6 +17360,7 @@ fn tp_matmat_impl(
     two_bit: bool,
 ) -> Option<wgpu::Buffer> {
     let c = ctx()?;
+    let _gate = c.mm_gate.lock().unwrap();
     let gpr = cols / 32;
     if cols % 32 != 0 || rows == 0 || b == 0 {
         return None;
@@ -17447,19 +17456,6 @@ fn tp_matmat_impl(
         0.0
     };
     let mut params = [(cols / 4) as u32, rows as u32, b as u32, ascale.to_bits()];
-    let p_buf = match &sc.params {
-        Some(bf) => bf.clone(),
-        None => {
-            let bf = c.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("q4tpmm-params"),
-                size: 16,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            sc.params = Some(bf.clone());
-            bf
-        }
-    };
     let stage_buf = Scratch::ensure(
         &c.device,
         &mut sc.stage,
@@ -17504,8 +17500,18 @@ fn tp_matmat_impl(
     if dev_scale {
         params[3] = 0xFFFF_FFFFu32;
     }
-    c.queue
-        .write_buffer(&p_buf, 0, bytemuck::cast_slice(&params));
+    // Per call, NOT the shared `sc.params` slot. That slot is written
+    // outside the scratch lock and read at submit time, so two threads
+    // in this function raced: one GEMM ran with the other's rows/cols.
+    // The batch parity test caught it the moment the write moved a few
+    // lines later — the window had always been there.
+    let p_buf = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("q4tpmm-params"),
+            contents: bytemuck::cast_slice(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
     let asc_buf = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("q4tpmm-ascale"),
         size: 4,
@@ -17589,6 +17595,7 @@ pub fn q4t_matmat(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _gate = c.mm_gate.lock().unwrap();
     let gpr = cols / 32;
     if cols % 32 != 0 || rows == 0 || b == 0 {
         return false;
@@ -18957,6 +18964,7 @@ pub fn q4tp_ffn_packed(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _gate = c.mm_gate.lock().unwrap();
     if hidden % 32 != 0 || inter % 32 != 0 || b == 0 {
         return false;
     }
