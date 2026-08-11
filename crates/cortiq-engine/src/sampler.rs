@@ -23,6 +23,11 @@ pub struct SamplerScratch {
     /// megabyte allocated, filled and dropped per token; the struct that
     /// exists to hold scratch may as well hold this one too.
     probs: Vec<f32>,
+    /// The SECOND whole-vocab copy — top-k's partition buffer. Qwen3.6's
+    /// vocab is 248320, so this was another megabyte allocated, filled
+    /// and dropped per token, on the same hot path and for the same
+    /// reason. Same fix.
+    topk: Vec<f32>,
 }
 
 impl SamplerScratch {
@@ -174,7 +179,7 @@ pub fn sample_with_scratch(
     }
 
     if config.top_k > 0 && (config.top_k as usize) < probs.len() {
-        apply_top_k(&mut probs, config.top_k as usize);
+        apply_top_k(&mut probs, config.top_k as usize, &mut scratch.topk);
     }
 
     if config.top_p < 1.0 && config.top_p > 0.0 {
@@ -282,11 +287,14 @@ fn apply_repetition_penalty(
 /// threshold), zero the rest. Selection, not a full vocab sort — the
 /// old double `sort_by` over ~150k probs was ~1ms of pure per-token
 /// overhead (roadmap §3 P0).
-fn apply_top_k(probs: &mut [f32], k: usize) {
+fn apply_top_k(probs: &mut [f32], k: usize, sel: &mut Vec<f32>) {
     if k == 0 || k >= probs.len() {
         return;
     }
-    let mut sel: Vec<f32> = probs.to_vec();
+    // `select_nth_unstable` permutes, so the partition needs its own
+    // buffer — but not a FRESH one each token.
+    sel.clear();
+    sel.extend_from_slice(probs);
     // k-th largest = (k-1)-th index in a descending partition.
     let (_, kth, _) = sel.select_nth_unstable_by(k - 1, |a, b| {
         b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
@@ -419,7 +427,7 @@ mod tests {
     #[test]
     fn top_k_keeps_exactly_k() {
         let mut probs = vec![0.1, 0.4, 0.05, 0.3, 0.15];
-        apply_top_k(&mut probs, 2);
+        apply_top_k(&mut probs, 2, &mut Vec::new());
         let kept = probs.iter().filter(|&&p| p > 0.0).count();
         assert_eq!(kept, 2, "top-k must keep exactly k (was k+1 in v1)");
         assert!(probs[1] > 0.0 && probs[3] > 0.0);
