@@ -9662,6 +9662,8 @@ struct Ctx {
     act_absmax: Option<wgpu::ComputePipeline>,
     /// The DiT's attention GEMMs on the matrix units.
     dit_gemm_coop: Option<wgpu::ComputePipeline>,
+    /// Interleaved qkv → head-major q/k/v, on the device.
+    dit_qkv_split: Option<wgpu::ComputePipeline>,
     /// Two-stage form of the same: partials, then a fold.
     act_amax_part: Option<wgpu::ComputePipeline>,
     act_amax_fold: Option<wgpu::ComputePipeline>,
@@ -9959,6 +9961,8 @@ struct Scratch {
     /// Second plane slot: a fused FFN unpacks BOTH its weights into the
     /// same command buffer, so one slot cannot serve them.
     dqw2: Option<(wgpu::Buffer, u64)>,
+    /// Interleaved qkv upload for the device-side split.
+    dqkv: Option<(wgpu::Buffer, u64)>,
     /// Partial maxima of the two-stage activation reduction.
     amaxp: Option<(wgpu::Buffer, u64)>,
     /// DiT attention: Q/K/V uploads, scores, panel, output, staging.
@@ -10611,6 +10615,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     };
     let ffn_silu_packed = pipe("ffn_silu_mul_packed");
     let act_absmax = mk_coop(COOP_AMAX_SRC, "act-absmax", "act_absmax");
+    let dit_qkv_split = mk_coop(DIT_SPLIT_SRC, "dit-split", "dit_qkv_split");
     let dit_gemm_coop = (q4tp_mm_coop.is_some())
         .then(|| mk_coop(DIT_COOP_SRC, "dit-coop", "dit_gemm_coop"))
         .flatten();
@@ -10964,6 +10969,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         ffn_silu_packed,
         act_absmax,
         dit_gemm_coop,
+        dit_qkv_split,
         act_amax_part,
         act_amax_fold,
         q4tp_dq_f16,
@@ -17581,6 +17587,79 @@ pub fn q4tp_matvec_batch_for_test(
 /// device — the CPU only ships Q/K/V in and the result out. Head-major
 /// inputs, matching `gpu_metal::dit_attention`.
 #[allow(clippy::too_many_arguments)]
+/// Attention straight from an interleaved qkv panel: the split into
+/// head-major planes happens on the device. `false` means the split
+/// kernel is unavailable and the caller should repack on the host.
+#[allow(clippy::too_many_arguments)]
+pub fn dit_attention_packed(
+    qkv: &[f32],
+    nh: usize,
+    n: usize,
+    hd: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Some(split) = c.dit_qkv_split.as_ref() else {
+        return false;
+    };
+    let inner = nh * hd;
+    if qkv.len() < n * 3 * inner || out.len() < n * inner {
+        return false;
+    }
+    let plane = (nh * n * hd * 4) as u64;
+    let (qb, kb, vb, src) = {
+        let mut sc = c.scratch.lock().unwrap();
+        let st = wgpu::BufferUsages::STORAGE;
+        let src = Scratch::ensure(
+            &c.device,
+            &mut sc.dqkv,
+            (n * 3 * inner * 4) as u64,
+            st | wgpu::BufferUsages::COPY_DST,
+            "dit-qkv",
+        );
+        (
+            Scratch::ensure(&c.device, &mut sc.dq, plane, st, "dit-q"),
+            Scratch::ensure(&c.device, &mut sc.dk, plane, st, "dit-k"),
+            Scratch::ensure(&c.device, &mut sc.dv, plane, st, "dit-v"),
+            src,
+        )
+    };
+    c.queue
+        .write_buffer(&src, 0, bytemuck::cast_slice(&qkv[..n * 3 * inner]));
+    let u = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[n as u32, nh as u32, hd as u32, 0u32]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &split.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, &src),
+            bind_buf(1, &qb),
+            bind_buf(2, &kb),
+            bind_buf(3, &vb),
+            bind_buf(4, &u),
+        ],
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dit-split") });
+    {
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(split);
+        pass.set_bind_group(0, &bg, &[]);
+        let wgs = ((n * inner) as u32).div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+    }
+    c.queue.submit(Some(enc.finish()));
+    // The planes are on the card now; the shared path skips its uploads.
+    dit_attention_inner(&[], &[], &[], nh, nh, n, hd, scale, out, true)
+}
+
 pub fn dit_attention(
     qh: &[f32],
     kh: &[f32],
@@ -17592,11 +17671,32 @@ pub fn dit_attention(
     scale: f32,
     out: &mut [f32],
 ) -> bool {
+    dit_attention_inner(qh, kh, vh, nh, nkv, n, hd, scale, out, false)
+}
+
+/// `resident` = the q/k/v planes are ALREADY in the scratch slots (the
+/// device-side split just wrote them), so the host slices are empty and
+/// the uploads are skipped.
+#[allow(clippy::too_many_arguments)]
+fn dit_attention_inner(
+    qh: &[f32],
+    kh: &[f32],
+    vh: &[f32],
+    nh: usize,
+    nkv: usize,
+    n: usize,
+    hd: usize,
+    scale: f32,
+    out: &mut [f32],
+    resident: bool,
+) -> bool {
     let Some(c) = ctx() else { return false };
     if nh == 0 || nkv == 0 || n == 0 || hd == 0 || nh % nkv != 0 {
         return false;
     }
-    if qh.len() < nh * n * hd || kh.len() < nkv * n * hd || vh.len() < nkv * n * hd {
+    if !resident
+        && (qh.len() < nh * n * hd || kh.len() < nkv * n * hd || vh.len() < nkv * n * hd)
+    {
         return false;
     }
     if out.len() < n * nh * hd {
@@ -17617,12 +17717,16 @@ pub fn dit_attention(
             st | wgpu::BufferUsages::COPY_DST,
             label,
         );
-        c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
+        // Empty slice = the plane is already resident (the device-side
+        // split wrote it); allocating the slot is all that is needed.
+        if !data.is_empty() {
+            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(data));
+        }
         b
     };
-    let qb = up(&mut sc.dq, &qh[..nh * n * hd], "dit-q");
-    let kb = up(&mut sc.dk, &kh[..nkv * n * hd], "dit-k");
-    let vb = up(&mut sc.dv, &vh[..nkv * n * hd], "dit-v");
+    let qb = up(&mut sc.dq, if resident { &[] } else { &qh[..nh * n * hd] }, "dit-q");
+    let kb = up(&mut sc.dk, if resident { &[] } else { &kh[..nkv * n * hd] }, "dit-k");
+    let vb = up(&mut sc.dv, if resident { &[] } else { &vh[..nkv * n * hd] }, "dit-v");
     let scb = Scratch::ensure(dev, &mut sc.dsc, (n * n * 4) as u64, st, "dit-scores");
     let pb = Scratch::ensure(dev, &mut sc.dpan, (nh * n * hd * 4) as u64, st, "dit-panel");
     let ab = Scratch::ensure(
@@ -19425,6 +19529,36 @@ fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
 /// offsets into the packed planes, a score scale, and GQA's head
 /// mapping. Measured motive: `dit_qk`/`dit_pv` are scalar f32 and run
 /// the attention at 0.5 TFLOP/s where this card's q4tp GEMM holds 51.9.
+/// Split an interleaved qkv panel ([token][q|k|v][head][dim]) into the
+/// head-major planes attention wants. Measured motive: doing this on
+/// the host cost 4.4 s of a 7.3 s attention phase — more than the
+/// device work it was feeding.
+const DIT_SPLIT_SRC: &str = r#"
+struct SpP { n: u32, nh: u32, hd: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read>       sqkv: array<f32>;
+@group(0) @binding(1) var<storage, read_write> sq: array<f32>;
+@group(0) @binding(2) var<storage, read_write> sk: array<f32>;
+@group(0) @binding(3) var<storage, read_write> sv: array<f32>;
+@group(0) @binding(4) var<uniform>             sp: SpP;
+
+@compute @workgroup_size(256)
+fn dit_qkv_split(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let inner = sp.nh * sp.hd;
+    let total = sp.n * inner;
+    let i = gid.y * (65535u * 256u) + gid.x;
+    if (i >= total) { return; }
+    let p = i / inner;          // token
+    let r = i - p * inner;      // head*hd + d
+    let h = r / sp.hd;
+    let d = r - h * sp.hd;
+    let src = p * 3u * inner + h * sp.hd + d;
+    let dst = (h * sp.n + p) * sp.hd + d;
+    sq[dst] = sqkv[src];
+    sk[dst] = sqkv[src + inner];
+    sv[dst] = sqkv[src + 2u * inner];
+}
+"#;
+
 const DIT_COOP_SRC: &str = r#"
 enable wgpu_cooperative_matrix;
 enable f16;
