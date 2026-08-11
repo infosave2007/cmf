@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The VAE decoder's resident chain is the default: the stage runs
+  26.1 s → 16.6 s and an 8-step render 107.3 s → 95.6 s.** qkv GEMM,
+  bias, the weightless q/k norm, RoPE, attention and the output
+  projection all run without a panel crossing the bus; only the
+  projection's result comes home. 2.33e-3 rel rms from the host chain
+  (max 8/255 on 3% of pixels), four times inside the gate the DiT's own
+  device path is held to, and bit-reproducible run to run.
+  `CMF_VAE3D_FUSE=0` restores the host chain.
+
+  It measured 0.296 rel rms and 97% of pixels for most of a day, and
+  none of that was this code — see the split-encoder fix below.
+
 - **The VAE split kernel is exonerated: it reproduces the host repack
   exactly.** Run alone into private buffers (`CMF_VAE3D_CHECK=1`), the
   head-interleaved split matches the host element for element —
