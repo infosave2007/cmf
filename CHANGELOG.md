@@ -14,13 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   FLOPs, so it is not arithmetic — its right operand `v` is stored
   [n][hd] and the GEMM reads it down columns. The fix is n·hd of
   transposing against n²·hd of work.
-- **The transpose kernel (`dit_v_transpose`) is in and the PV-as-NT
-  wiring is written, but it still fails bind-group validation** and I
-  ran out of room to chase it. It sits behind its OWN switch
-  (`CMF_DIT_PV_COOP=1`) so that `CMF_DIT_ATTN_COOP=1` — the QK path,
-  which is correct and measured neutral — does not drag a crashing path
-  along with it. Default is untouched and verified: render whole,
-  frames bit-identical.
+- **PV now rides the matrix units too, and it is the default.** Its
+  operand is transposed first (`dit_v_transpose`, n·hd of copying
+  against n²·hd of work), which turns PV into the same NT product QK
+  already was. Two traps on the way, both recorded: an auto bind-group
+  layout is built PER ENTRY POINT and renumbers, so the transpose needed
+  its own module; and the NT form took its reduction width as
+  `cols4 * 4`, which truncated PV's k of 1859 to 1856 and dropped three
+  columns of every score row (frames 59% off) — the spare uniform word
+  now carries the true k. Measured: **PV 4.76 → 2.91 s** a step, frames
+  within 0.1% of the scalar path, full render **111.0 → 106.9 s**.
+  `CMF_DIT_ATTN_COOP=0` / `CMF_DIT_PV_COOP=0` opt out.
 
 ### Added
 - **The qkv split moved to the device, and it was the attention

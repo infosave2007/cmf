@@ -17864,19 +17864,19 @@ fn dit_attention_inner(
     let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("dit-attn"),
     });
-    // Opt-in while it earns its keep: CMF_DIT_ATTN_COOP=1.
+    // Default now, on the numbers: QK and PV both ride the matrix units
+    // and PV's operand is transposed first (4.76 → 2.91 s a step, frames
+    // within 0.1% of the scalar path). `CMF_DIT_ATTN_COOP=0` opts out.
     let coop_dit = c
         .dit_gemm_coop
         .as_ref()
-        .filter(|_| std::env::var("CMF_DIT_ATTN_COOP").as_deref() == Ok("1"));
+        .filter(|_| std::env::var("CMF_DIT_ATTN_COOP").as_deref() != Ok("0"));
     // PV's right operand is read down columns in v's [n][hd] layout —
     // 4.76 s a step against QK's 1.65 at the same FLOPs. Transpose it
     // once per block and PV becomes the NT product QK already is.
-    // PV through the NT form needs its own switch: the transpose lands,
-    // but the PV bind group still fails validation and I ran out of room
-    // to chase it. CMF_DIT_ATTN_COOP=1 (QK only) must not drag a
-    // crashing path along with it — that is what CMF_DIT_PV_COOP is for.
-    let pv_coop_on = std::env::var("CMF_DIT_PV_COOP").as_deref() == Ok("1");
+    // PV keeps its own switch for bisecting, but defaults on with the
+    // rest: `CMF_DIT_PV_COOP=0` leaves PV on the scalar tile kernel.
+    let pv_coop_on = std::env::var("CMF_DIT_PV_COOP").as_deref() != Ok("0");
     let vtb = match (coop_dit.filter(|_| pv_coop_on), c.dit_v_transpose.as_ref()) {
         (Some(_), Some(tp)) => {
             let vt = {
@@ -17934,7 +17934,7 @@ fn dit_attention_inner(
                         (h * n * hd) as u32,
                         (kv as usize * n * hd) as u32,
                         0u32,
-                        0u32,
+                        hd as u32,
                     ]),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
@@ -17949,13 +17949,7 @@ fn dit_attention_inner(
                 ],
             })
         });
-        // The NT form needs its reduction width in multiples of four
-        // (`cols4 * 4`), and PV reduces over n — 1859 at render size,
-        // which truncates to 1856 and quietly drops three columns of
-        // every score row (measured: frames 59% off). Until the kernel
-        // carries a true-k alongside cols4, take it only when n divides.
-        let pv_nt_ok = n % 4 == 0;
-        let bg_pv_coop = match (coop_dit.filter(|_| pv_nt_ok), &vtb) {
+        let bg_pv_coop = match (coop_dit, &vtb) {
             (Some(p), Some(vt)) => {
                 let u = c
                     .device
@@ -17969,7 +17963,7 @@ fn dit_attention_inner(
                             0u32,
                             (kv as usize * n * hd) as u32,
                             (h * n * hd) as u32,
-                            0u32,
+                            n as u32,
                         ]),
                         usage: wgpu::BufferUsages::UNIFORM,
                     });
@@ -19788,7 +19782,7 @@ struct DcP {
     a_off: u32,  // element offset of this head's x plane
     b_off: u32,  // element offset of this head's w plane
     c_off: u32,  // element offset of this head's y plane
-    _pad: u32,
+    kk: u32,     // TRUE reduction width; 0 = use cols4*4 for both
 };
 @group(0) @binding(0) var<storage, read> dcw: array<f32>;
 @group(0) @binding(1) var<storage, read> dcx: array<f32>;
@@ -19804,7 +19798,11 @@ var<workgroup> dm_c: array<f32, 64 * 64>;
 fn dit_gemm_coop(@builtin(workgroup_id) wid: vec3<u32>,
                  @builtin(local_invocation_index) tid: u32,
                  @builtin(subgroup_id) sg: u32) {
-    let cols = dcp.cols4 * 4u;
+    // PV reduces over the token count, which is not a multiple of four
+    // at render size (1859 → 1856 truncated, three columns of every
+    // score row silently dropped, frames 59% off). The row STRIDE and
+    // the loop BOUND are the same number and it is this one.
+    let cols = select(dcp.cols4 * 4u, dcp.kk, dcp.kk > 0u);
     let m0 = wid.y * 64u;
     let n0 = wid.x * 64u;
     var c0: coop_mat16x16<f32, C>;
