@@ -321,9 +321,16 @@ pub fn probe_record(c: OpClass, gpu: bool, dur: std::time::Duration) {
         // that the cold-flag machinery cannot see.
         let g = p.gpu_min.load(Ordering::Relaxed) as f64;
         let cp = p.cpu_min.load(Ordering::Relaxed) as f64;
-        // Early verdict on a ≥3× gap — no reason to keep feeding the
-        // losing arm; close races take the full sample count.
-        if (gn < PROBE_SAMPLES || cn < PROBE_SAMPLES) && g < cp * 3.0 && cp < g * 3.0 {
+        // Early verdict on a ≥2× gap — no reason to keep feeding the
+        // losing arm; close races take the full sample count. It was 3×,
+        // and the cost of that half-octave was measured: a DiT whose
+        // wide GEMMs run 11.4 ms on the device against 32.2 on the host
+        // (2.8×) kept ALTERNATING through the whole diffusion stack, and
+        // because the alternation counter is shared per class in call
+        // order, one projection drew the CPU arm every single time — 9.9
+        // seconds a step on a kernel that needs 0.4. Both arms are
+        // compared on their BEST sample, so a 2× gap is not noise.
+        if (gn < PROBE_SAMPLES || cn < PROBE_SAMPLES) && g < cp * 2.0 && cp < g * 2.0 {
             return;
         }
         let winner = if g <= cp { 1 } else { 2 };

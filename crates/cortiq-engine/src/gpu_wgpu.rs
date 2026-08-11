@@ -17186,6 +17186,18 @@ fn tp_matmat(
     else {
         return false;
     };
+    if std::env::var("CMF_GPU_DEBUG").is_ok() && b >= 512 {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        static SEEN: Mutex<Option<HashSet<(usize, usize)>>> = Mutex::new(None);
+        let mut g = SEEN.lock().unwrap();
+        if g.get_or_insert_with(HashSet::new).insert((rows, cols)) {
+            eprintln!(
+                "tp_matmat entry: {rows}x{cols} plen={plen} need={need} xs={} b*cols={} out={} b*rows={}",
+                xs.len(), b * cols, out.len(), b * rows
+            );
+        }
+    }
     if plen < need || abs + plen > bytes.len() || xs.len() < b * cols || out.len() < b * rows {
         return false;
     }
@@ -17217,9 +17229,12 @@ fn tp_matmat(
     // so the scalar arm and every other caller keep their numerics.
     let coop_arm = !two_bit && c.q4tp_mm_coop.is_some();
     if std::env::var("CMF_GPU_DEBUG").is_ok() && b >= 512 {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static SAID: AtomicBool = AtomicBool::new(false);
-        if !SAID.swap(true, Ordering::Relaxed) {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        static SEEN: Mutex<Option<HashSet<(usize, usize)>>> = Mutex::new(None);
+        let mut g = SEEN.lock().unwrap();
+        let set = g.get_or_insert_with(HashSet::new);
+        if set.insert((rows, cols)) {
             eprintln!(
                 "tp_matmat(render): b={b} rows={rows} cols={cols} two_bit={two_bit} coop={coop_arm}"
             );
