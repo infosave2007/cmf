@@ -324,16 +324,35 @@ fn wgpu_q4tp_batch_cost() {
     // wkv is 512 rows (32 workgroups), wq_a 1024, wo_b 4096. A kernel that
     // leaves the card idle at B=1 is where a batch can be nearly free, and
     // measuring only the wide shape would have hidden that entirely.
-    for (rows, cols) in [
-        (512usize, 4096usize),
-        (1024, 4096),
-        (4096, 4096),
-        (129280, 4096),
-    ] {
+    // The last two are the Qwen3.6-27B dense FFN exactly (gate/up and
+    // down at hidden 5120, inter 17408). A speculative verify spends half
+    // its device time there, so a batch kernel that is only measured on
+    // 4096-square shapes has not been measured where it is paid for.
+    // CMF_COST_SHAPES="rows:cols,..." overrides the list.
+    let shapes: Vec<(usize, usize)> = match std::env::var("CMF_COST_SHAPES") {
+        Ok(s) => s
+            .split(',')
+            .filter_map(|p| {
+                let (r, c) = p.split_once(':')?;
+                Some((r.trim().parse().ok()?, c.trim().parse().ok()?))
+            })
+            .collect(),
+        Err(_) => vec![
+            (512usize, 4096usize),
+            (1024, 4096),
+            (4096, 4096),
+            (129280, 4096),
+            (17408, 5120),
+            (5120, 17408),
+        ],
+    };
+    for (rows, cols) in shapes {
         let payload = synth(rows, cols);
-        let (model, idx) = tiny_model(&format!("cost-{rows}"), rows, cols, payload);
+        let (model, idx) = tiny_model(&format!("cost-{rows}x{cols}"), rows, cols, payload);
         let mut base = 0f64;
-        for b in [1usize, 2, 4, 8] {
+        // 3 is the verify width a k=2 draft produces — the one shape the
+        // decode actually runs, and the powers of two had skipped it.
+        for b in [1usize, 2, 3, 4, 8] {
             let xs: Vec<f32> = (0..b * cols).map(|i| (i % 97) as f32 / 97.0 - 0.5).collect();
             let mut got = vec![0f32; b * rows];
             // Warm: the first call uploads the weight and builds the groups.
@@ -353,11 +372,17 @@ fn wgpu_q4tp_batch_cost() {
             if b == 1 {
                 base = ms;
             }
+            // GB/s counts the weight ONCE: at 4 bits plus the tiled
+            // params that is what a batch-blocked kernel has to move,
+            // and the number says outright whether the bus or the ALU
+            // is the wall.
+            let wbytes = (rows * cols) as f64 * 0.5;
             eprintln!(
                 "СТОИМОСТЬ {rows}x{cols} B={b}: {ms:.3} мс, {:.2}x от B=1, \
-                 на токен {:.3} мс",
+                 на токен {:.3} мс, вес-один-раз {:.0} ГБ/с",
                 ms / base,
-                ms / b as f64
+                ms / b as f64,
+                wbytes / (ms / 1000.0) / 1e9
             );
         }
     }
