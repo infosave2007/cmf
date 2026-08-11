@@ -17081,6 +17081,29 @@ fn dispatch_matmat(
 /// `QTensor::matmat` reaches for (DiT prefill, MoE experts, dense FFN
 /// batches). Without it a q4tp model kept that arm on the CPU while q4t
 /// went to the device.
+/// Per-phase microseconds of the DiT attention under
+/// `CMF_DIT_ATTN_PROF=1`: 0 = QK, 1 = softmax, 2 = PV.
+pub static DIT_PHASE: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// The three walls, or None when the mode is off.
+pub fn dit_phase_report() -> Option<String> {
+    if std::env::var("CMF_DIT_ATTN_PROF").is_err() {
+        return None;
+    }
+    let v: Vec<f64> = DIT_PHASE
+        .iter()
+        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6)
+        .collect();
+    Some(format!(
+        "dit attention: qk {:.2} s · softmax {:.2} s · pv {:.2} s",
+        v[0], v[1], v[2]
+    ))
+}
+
 /// Is this tensor's weight buffer already on the card? The probe asks
 /// before it decides which arm a still-cold call should take.
 pub fn weight_is_resident(model: &Arc<CmfModel>, idx: usize) -> bool {
@@ -17920,6 +17943,27 @@ fn dit_attention_inner(
         // scores buffer, so each gets its own pass: wgpu inserts the
         // memory barrier at pass boundaries, and three dispatches inside
         // one pass raced (max pixel error 38/255 against the CPU path).
+        // CMF_DIT_ATTN_PROF=1 splits the three phases into their own
+        // submits and waits between them, so each wall is separable.
+        // A measurement mode, not a path: the syncs cost real time.
+        let prof = std::env::var("CMF_DIT_ATTN_PROF").is_ok();
+        let mut split_now = |enc: &mut wgpu::CommandEncoder, slot: usize| {
+            if !prof {
+                return;
+            }
+            let e = std::mem::replace(
+                enc,
+                c.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }),
+            );
+            let t = std::time::Instant::now();
+            c.queue.submit(Some(e.finish()));
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            DIT_PHASE[slot].fetch_add(
+                t.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        };
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("dit-qk"),
@@ -17950,6 +17994,7 @@ fn dit_attention_inner(
                 }
             }
         }
+        split_now(&mut enc, 0);
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("dit-sm"),
@@ -17959,6 +18004,7 @@ fn dit_attention_inner(
             pass.set_bind_group(0, &bg_sm, &[]);
             pass.dispatch_workgroups(n as u32, 1, 1);
         }
+        split_now(&mut enc, 1);
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("dit-pv"),
@@ -17968,6 +18014,7 @@ fn dit_attention_inner(
             pass.set_bind_group(0, &bg_pv, &[]);
             pass.dispatch_workgroups((hd as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
         }
+        split_now(&mut enc, 2);
     }
     {
         let total = (nh * n * hd) as u32;
