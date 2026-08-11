@@ -39,7 +39,8 @@ use crate::dit::Proj;
 /// Per-phase microseconds of the DiT block, under `CMF_MMH3_PROF=1`:
 /// 0 norm+modulate · 1 qkv GEMM · 2 qk-norm+RoPE · 3 attention ·
 /// 4 out GEMM+residual · 5 fc1 GEMM · 6 SwiGLU · 7 fc2 GEMM.
-pub static MMH3_PROF: [std::sync::atomic::AtomicU64; 8] = [
+pub static MMH3_PROF: [std::sync::atomic::AtomicU64; 9] = [
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -61,9 +62,9 @@ pub fn mmh3_prof_report() -> Option<String> {
     if !mmh3_prof_on() {
         return None;
     }
-    const NAMES: [&str; 8] = [
-        "norm+mod", "qkv gemm", "qknorm+rope", "attention", "out gemm+res", "fc1 gemm",
-        "swiglu", "fc2 gemm",
+    const NAMES: [&str; 9] = [
+        "norm+mod", "qkv gemm", "qknorm+rope", "attention", "out gemm", "fc1 gemm",
+        "swiglu", "fc2 gemm", "residual",
     ];
     let mut v: Vec<(u64, &str)> = MMH3_PROF
         .iter()
@@ -846,8 +847,13 @@ impl MiniMaxH3 {
         let t = std::time::Instant::now();
         let mut proj = vec![0f32; n * hs];
         blk.out.matmat(&attn, n, &mut proj, pool);
-        self.residual(x, hs, &proj, mods, rows, 2);
         Self::prof(4, t);
+        // Own slot: the residual is host-side elementwise work with
+        // modulation, and billing it to the projection hid which of the
+        // two actually costs (they were 9.8 s together at 512×288).
+        let t = std::time::Instant::now();
+        self.residual(x, hs, &proj, mods, rows, 2);
+        Self::prof(8, t);
 
         let t = std::time::Instant::now();
         self.norm_rows(&mut xn, x, n, hs, &blk.norm2, self.eps);
