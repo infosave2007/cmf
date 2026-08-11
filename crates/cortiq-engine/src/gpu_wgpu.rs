@@ -31088,6 +31088,66 @@ pub fn dit_block_seg(
     // grows a fifth entry for the activation scale (or the 0xFFFFFFFF
     // sentinel and a device-computed one, as `tp_matmat_impl` does).
     let mm = mm_pipeline(c, a.q4tp, false);
+    // Matrix units when the device has them: unpack each weight plane
+    // ONCE into f16 and run the pure f16 GEMM, instead of unpacking the
+    // same tile inside the loop for every 64-row block of activations.
+    // The activation scale is computed on the card — the host never
+    // sees these panels — and without one the f16 operands overflow.
+    // MEASURED AND REJECTED for this model, so opt-in
+    // (`CMF_DIT_COOP16=1`): 11.23 s of block time against 11.02 for the
+    // scalar arm. The plane unpack and the scale reduction are encoded
+    // on EVERY call — every block, every step — and Lumina's weights
+    // (2304×2304) are a quarter of the video DiT's (21504×5376), where
+    // this same arm won 22.1 s → 14.7. The GEMM here does not get big
+    // enough to pay for its own preparation. What would change the
+    // verdict is caching the unpacked plane across steps rather than
+    // re-encoding it: 30 steps pay 30 times for a weight that never
+    // moves.
+    let coop16 = std::env::var("CMF_DIT_COOP16").as_deref() == Ok("1")
+        && a.q4tp
+        && c.q4tp_mm_coop_f16.is_some()
+        && c.q4tp_dq_f16.is_some()
+        && ((c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some());
+    let mm_enc = |enc: &mut wgpu::CommandEncoder,
+                  w: &wgpu::Buffer,
+                  xs: &wgpu::Buffer,
+                  y: &wgpu::Buffer,
+                  rows: usize,
+                  cols: usize,
+                  k: usize| {
+        if coop16 && cols % 2 == 0 {
+            let dq = {
+                let mut sc = c.scratch.lock().unwrap();
+                dq_f16_plane(c, &mut sc, w, rows, cols)
+            };
+            if let (Some((plane, bind_dq)), Some(pdq), Some(pipe)) = (
+                &dq,
+                c.q4tp_dq_f16.as_ref(),
+                c.q4tp_mm_coop_f16.as_ref(),
+            ) {
+                {
+                    let mut pass = begin_pass(enc);
+                    pass.set_pipeline(pdq);
+                    pass.set_bind_group(0, bind_dq, &[]);
+                    let wgs = ((rows * cols / 2) as u32).div_ceil(256);
+                    pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+                }
+                let asc = c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("dit-ascale"),
+                    size: 4,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                });
+                if encode_act_absmax(c, enc, xs, k * cols, &asc) {
+                    encode_q4_tile_mm_full(
+                        c, enc, pipe, plane, xs, y, rows, cols, k, 0.0, Some(&asc),
+                    );
+                    return;
+                }
+            }
+        }
+        encode_q4_tile_mm(c, enc, mm, w, xs, y, rows, cols, k);
+    };
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dit-block") });
@@ -31123,9 +31183,9 @@ pub fn dit_block_seg(
     };
     norm(&mut enc, &xb, &n1w, &smsa, &xn, &dm_p);
     // E2 — the three projections.
-    encode_q4_tile_mm(c, &mut enc, mm, &wq, &xn, &qtok, nh * hd, hs, n);
-    encode_q4_tile_mm(c, &mut enc, mm, &wk, &xn, &ktok, nkv * hd, hs, n);
-    encode_q4_tile_mm(c, &mut enc, mm, &wv, &xn, &vtok, nkv * hd, hs, n);
+    mm_enc(&mut enc, &wq, &xn, &qtok, nh * hd, hs, n);
+    mm_enc(&mut enc, &wk, &xn, &ktok, nkv * hd, hs, n);
+    mm_enc(&mut enc, &wv, &xn, &vtok, nkv * hd, hs, n);
     // E3 — qk-norm + RoPE into head-major panels; v is packed as is.
     let scale = 1.0f32 / (hd as f32).sqrt();
     let rope_pass = |enc: &mut wgpu::CommandEncoder,
@@ -31351,7 +31411,7 @@ pub fn dit_block_seg(
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups_flat(((nh * n * hd) as u32).div_ceil(256));
     }
-    encode_q4_tile_mm(c, &mut enc, mm, &wo, &attn, &proj, hs, nh * hd, n);
+    mm_enc(&mut enc, &wo, &attn, &proj, hs, nh * hd, n);
     let gr_p = c
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -31382,8 +31442,8 @@ pub fn dit_block_seg(
     gated(&mut enc, &proj, &n2w, &gmsa);
     // E6 — FFN: modulated norm, SwiGLU, gated residual.
     norm(&mut enc, &xb, &f1w, &smlp, &xn, &dm_p);
-    encode_q4_tile_mm(c, &mut enc, mm, &w1, &xn, &gbuf, inter, hs, n);
-    encode_q4_tile_mm(c, &mut enc, mm, &w3, &xn, &ubuf, inter, hs, n);
+    mm_enc(&mut enc, &w1, &xn, &gbuf, inter, hs, n);
+    mm_enc(&mut enc, &w3, &xn, &ubuf, inter, hs, n);
     {
         let n1 = u4([(n * inter) as u32, 0, 0, 0]);
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -31402,7 +31462,7 @@ pub fn dit_block_seg(
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups_flat(((n * inter) as u32).div_ceil(256));
     }
-    encode_q4_tile_mm(c, &mut enc, mm, &w2, &abuf, &proj, hs, inter, n);
+    mm_enc(&mut enc, &w2, &abuf, &proj, hs, inter, n);
     gated(&mut enc, &proj, &f2w, &gmlp);
     let bytes = (n * hs * 4) as u64;
     if a.resident_out {
