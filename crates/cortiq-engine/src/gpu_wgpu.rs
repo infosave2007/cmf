@@ -17624,7 +17624,11 @@ pub fn dit_attention_packed(
     let plane = (nh * n * hd * 4) as u64;
     let (qb, kb, vb, src) = {
         let mut sc = c.scratch.lock().unwrap();
-        let st = wgpu::BufferUsages::STORAGE;
+        // COPY_DST too: these are the SAME slots the host-repack path
+        // uploads into, and a grow-only slot keeps whatever usage it was
+        // first created with — leaving it out made a later host call
+        // fail on a buffer this one had allocated.
+        let st = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let src = Scratch::ensure(
             &c.device,
             &mut sc.dqkv,
