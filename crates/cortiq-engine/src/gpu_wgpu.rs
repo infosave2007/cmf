@@ -3403,6 +3403,14 @@ fn q4tp_matvec4_bku(@builtin(workgroup_id) wid: vec3<u32>,
         let r1 = base + sub + 4u;
         let r2 = base + sub + 8u;
         let r3 = base + sub + 12u;
+        // Batches wider than the four accumulator components run in
+        // chunks of four: the weight is re-read once per CHUNK, not once
+        // per element. A k=4 draft is b=5, and before this it fell off
+        // the kernel entirely and paid five reads (measured: k=4 decoded
+        // SLOWER than k=3, 43.8 against 51.0, for exactly that reason).
+        var cbase = 0u;
+        loop {
+        if (cbase >= nb) { break; }
         var acc0 = vec4<f32>(0.0);
         var acc1 = vec4<f32>(0.0);
         var acc2 = vec4<f32>(0.0);
@@ -3462,30 +3470,31 @@ fn q4tp_matvec4_bku(@builtin(workgroup_id) wid: vec3<u32>,
                     let a3 = q4v_lo4(w3); let b3 = q4v_hi4(w3);
                     let xj = g * 8u + j * 2u;
                     {
-                        let xa = q4v_x[xj]; let xb = q4v_x[xj + 1u];
+                        let x0q = xj + gpr * 8u * cbase;
+                        let xa = q4v_x[x0q]; let xb = q4v_x[x0q + 1u];
                         acc0.x = acc0.x + s0 * (dot(a0, xa) + dot(b0, xb));
                         acc1.x = acc1.x + s1 * (dot(a1, xa) + dot(b1, xb));
                         acc2.x = acc2.x + s2 * (dot(a2, xa) + dot(b2, xb));
                         acc3.x = acc3.x + s3 * (dot(a3, xa) + dot(b3, xb));
                     }
-                    if (nb > 1u) {
-                        let xq = xj + gpr * 8u;
+                    if (cbase + 1u < nb) {
+                        let xq = xj + gpr * 8u * (cbase + 1u);
                         let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
                         acc0.y = acc0.y + s0 * (dot(a0, xa) + dot(b0, xb));
                         acc1.y = acc1.y + s1 * (dot(a1, xa) + dot(b1, xb));
                         acc2.y = acc2.y + s2 * (dot(a2, xa) + dot(b2, xb));
                         acc3.y = acc3.y + s3 * (dot(a3, xa) + dot(b3, xb));
                     }
-                    if (nb > 2u) {
-                        let xq = xj + gpr * 16u;
+                    if (cbase + 2u < nb) {
+                        let xq = xj + gpr * 8u * (cbase + 2u);
                         let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
                         acc0.z = acc0.z + s0 * (dot(a0, xa) + dot(b0, xb));
                         acc1.z = acc1.z + s1 * (dot(a1, xa) + dot(b1, xb));
                         acc2.z = acc2.z + s2 * (dot(a2, xa) + dot(b2, xb));
                         acc3.z = acc3.z + s3 * (dot(a3, xa) + dot(b3, xb));
                     }
-                    if (nb > 3u) {
-                        let xq = xj + gpr * 24u;
+                    if (cbase + 3u < nb) {
+                        let xq = xj + gpr * 8u * (cbase + 3u);
                         let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
                         acc0.w = acc0.w + s0 * (dot(a0, xa) + dot(b0, xb));
                         acc1.w = acc1.w + s1 * (dot(a1, xa) + dot(b1, xb));
@@ -3499,7 +3508,7 @@ fn q4tp_matvec4_bku(@builtin(workgroup_id) wid: vec3<u32>,
         }
         var e = 0u;
         loop {
-            if (e >= nb) { break; }
+            if (cbase + e >= nb || e >= 4u) { break; }
             var mine = vec4<f32>(acc0.x, acc1.x, acc2.x, acc3.x);
             if (e == 1u) { mine = vec4<f32>(acc0.y, acc1.y, acc2.y, acc3.y); }
             if (e == 2u) { mine = vec4<f32>(acc0.z, acc1.z, acc2.z, acc3.z); }
@@ -3517,7 +3526,7 @@ fn q4tp_matvec4_bku(@builtin(workgroup_id) wid: vec3<u32>,
             }
             if (l == 0u) {
                 let r = partial_q4k[sub << 6u];
-                let yo = e * rows;
+                let yo = (cbase + e) * rows;
                 if (r0 < rows) { q1y[yo + r0] = r.x; }
                 if (r1 < rows) { q1y[yo + r1] = r.y; }
                 if (r2 < rows) { q1y[yo + r2] = r.z; }
@@ -3525,6 +3534,8 @@ fn q4tp_matvec4_bku(@builtin(workgroup_id) wid: vec3<u32>,
             }
             workgroupBarrier();
             e = e + 1u;
+        }
+        cbase = cbase + 4u;
         }
         wb = wb + nwg.x;
     }
@@ -22629,7 +22640,10 @@ fn encode_q4tp_mv4_b(
     // read it once per element and leave the reuse to L2. On the dense
     // 5120/17408 FFN planes that reuse never materialized — a k=3 verify
     // cost 2.95x one row's, which is the flat "no reuse" number.
-    if c.use_mv_bk > 0 && (2..=4).contains(&batch) && gpr > 64 {
+    // Arm 2 chunks the batch internally, so it covers up to 8; arm 1
+    // has four accumulator components and stops at 4.
+    let bk_max = if c.use_mv_bk >= 2 { 8 } else { 4 };
+    if c.use_mv_bk > 0 && (2..=bk_max).contains(&batch) && gpr > 64 {
         // A kernel swap that cannot be OBSERVED is a kernel swap that
         // gets credited with someone else's timing. One line, once.
         if std::env::var("CMF_MV_BK_TRACE").is_ok() {

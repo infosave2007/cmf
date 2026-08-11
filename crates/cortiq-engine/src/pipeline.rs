@@ -1604,12 +1604,21 @@ impl Pipeline {
                 // the per-op probe path — see gpu::wgpu_graph_default.
                 crate::gpu::wgpu_graph_default()
             });
-        // Graph speculative decode (`CMF_GRAPH_SPEC=1`, experimental): the
-        // MTP head drafts, ONE batched graph submit verifies the whole
-        // chain. The machinery is correct — 81% of drafts accepted on the
-        // bench — but it stays OPT-IN until the batched graph itself is
-        // fast: today it costs ~48 ms per verified position against the
-        // token graph's 7.3, which turns a win into a 6x loss.
+        // Graph speculative decode (`CMF_GRAPH_SPEC=1`): the MTP head
+        // drafts, ONE batched graph submit verifies the whole chain.
+        //
+        // It now PAYS on Qwen3.6-27B / RTX 5090 — 51.1 tok/s against a
+        // plain 49.4 at k=3, medians of three, 89% of drafts accepted,
+        // and the greedy continuation is byte-identical to the plain
+        // path. That took the batch matvec sharing its nibble unpack
+        // across the batch (`CMF_MV_BK=2`); before it, the same round
+        // measured 43.6, an 11% LOSS, which is what the earlier note
+        // here described.
+        //
+        // Still opt-in. One model's win is not a default: the verify
+        // rides `gdn_spec_restore` and a batched frame whose numerics
+        // are the batch kernels', and that has to be shown on more than
+        // one architecture before every greedy decode takes it.
         let graph_spec = self.speculative
             && graph_on
             && self.mtp.is_some()
@@ -2512,11 +2521,16 @@ impl Pipeline {
         drafted: &mut usize,
         accepted: &mut usize,
     ) -> Option<(Vec<u32>, usize, Vec<f32>)> {
+        // 3 is the measured optimum on Qwen3.6-27B / RTX 5090 (medians
+        // of three, greedy): 51.1 tok/s against a plain 49.4, where k=2
+        // gives 46.1, k=4 50.0, k=5 47.4, k=6 45.2. Acceptance is 89-91%
+        // throughout — what turns the curve over is the verify, which
+        // costs ~7.4 ms per extra position, and the draft ~3 ms a step.
         let k_spec: usize = std::env::var("CMF_GRAPH_SPEC_K")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&v| (1..=8).contains(&v))
-            .unwrap_or(2);
+            .unwrap_or(3);
         if next_pos == 0 {
             return None;
         }
