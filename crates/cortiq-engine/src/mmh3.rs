@@ -883,10 +883,58 @@ impl MiniMaxH3 {
         // back up per block simply stop happening. Measured at render
         // size: 104.9 → 98.1 s, frames bit-identical.
         // `CMF_MMH3_FUSEQKV=0` sends the panel home again.
+        let t_qkv = std::time::Instant::now();
         let qk_gpu = std::env::var("CMF_MMH3_QKNORM").as_deref() != Ok("cpu")
             && crate::gpu::enabled_here()
             && n >= 256;
         if qk_gpu && std::env::var("CMF_MMH3_FUSEQKV").as_deref() != Ok("0") {
+            // Best case first: qkv, attention and the output projection
+            // with nothing crossing the bus between them. It refuses at
+            // the door when anything is missing, so falling through to
+            // the chain below never repeats work.
+            let fuse_out = std::env::var("CMF_MMH3_FUSEOUT").as_deref() != Ok("0");
+            if std::env::var("CMF_GPU_DEBUG").is_ok() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "mmh3 fuse-out gate: qkv_q={} out_q={} qkv_map={} out_map={}",
+                        matches!(&blk.qkv, Proj::Q(_)),
+                        matches!(&blk.out, Proj::Q(_)),
+                        matches!(&blk.qkv, Proj::Q(q) if q.mapped_q4tp().is_some()),
+                        matches!(&blk.out, Proj::Q(o) if o.mapped_q4tp().is_some()),
+                    )
+                });
+            }
+            if let (true, Proj::Q(q), Proj::Q(o)) = (fuse_out, &blk.qkv, &blk.out) {
+                if let (Some((m, i)), Some((_, oi))) = (q.mapped_q4tp(), o.mapped_q4tp()) {
+                    let mut proj = vec![0f32; n * hs];
+                    if crate::gpu::dit_qkv_attn_out(
+                        m,
+                        i,
+                        oi,
+                        &xn,
+                        n,
+                        hs,
+                        self.heads,
+                        self.head_dim,
+                        1.0 / (self.head_dim as f32).sqrt(),
+                        (
+                            &angles[..],
+                            &blk.q_norm[..],
+                            &blk.k_norm[..],
+                            self.qk_eps as f32,
+                        ),
+                        &mut proj,
+                    ) {
+                        Self::prof(1, t_qkv);
+                        let t_res = std::time::Instant::now();
+                        self.residual(x, hs, &proj, mods, rows, 2);
+                        Self::prof(8, t_res);
+                        self.ffn_tail(blk, x, n, mods, rows);
+                        return;
+                    }
+                }
+            }
             if let Proj::Q(q) = &blk.qkv {
                 if let Some((m, i)) = q.mapped_q4tp() {
                     let mut attn = vec![0f32; n * inner];
@@ -907,9 +955,19 @@ impl MiniMaxH3 {
                         ),
                         &mut attn,
                     ) {
+                        // Stamp the same slots the unfused path does, or
+                        // the profile reads 5.5 s for a step the device
+                        // spends 6+ in: an instrument with a blind spot
+                        // is worse than none, and this one has cost two
+                        // wrong conclusions already.
+                        Self::prof(1, t_qkv);
+                        let t_out = std::time::Instant::now();
                         let mut proj = vec![0f32; n * hs];
                         blk.out.matmat(&attn, n, &mut proj, pool);
+                        Self::prof(4, t_out);
+                        let t_res = std::time::Instant::now();
                         self.residual(x, hs, &proj, mods, rows, 2);
+                        Self::prof(8, t_res);
                         self.ffn_tail(blk, x, n, mods, rows);
                         return;
                     }

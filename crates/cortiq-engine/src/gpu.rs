@@ -1573,6 +1573,32 @@ pub fn dit_qkv_attention(
     }
 }
 
+/// The whole attention half of a DiT block on the card: qkv GEMM,
+/// attention, output projection. Only `proj` comes home.
+#[allow(clippy::too_many_arguments)]
+pub fn dit_qkv_attn_out(
+    model: &Arc<CmfModel>,
+    qkv_idx: usize,
+    out_idx: usize,
+    xn: &[f32],
+    n: usize,
+    hidden: usize,
+    nh: usize,
+    hd: usize,
+    scale: f32,
+    nr: (&[f32], &[f32], &[f32], f32),
+    proj: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => crate::gpu_wgpu::dit_qkv_attn_out(
+            model, qkv_idx, out_idx, xn, n, hidden, nh, hd, scale, nr, proj,
+        ),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 pub fn dit_attention_packed(
     qkv: &[f32],
     nh: usize,

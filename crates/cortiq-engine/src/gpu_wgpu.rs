@@ -17235,6 +17235,83 @@ fn dq_f16_plane_slot(
     Some((plane, bind))
 }
 
+/// max|x| over an activation panel that lives on the card, folded into
+/// the reciprocal scale the f16 GEMM reads from binding 4. Two stages
+/// when both halves exist: one workgroup cannot saturate a card's
+/// bandwidth, and this panel is hundreds of megabytes.
+fn encode_act_absmax(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    act: &wgpu::Buffer,
+    n: usize,
+    asc: &wgpu::Buffer,
+) -> bool {
+    let ap = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[n as u32, 0u32, 0u32, 0u32]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    match (c.act_amax_part.as_ref(), c.act_amax_fold.as_ref()) {
+        (Some(part), Some(fold)) => {
+            let nparts = 512usize;
+            let pbuf = {
+                let mut sc = c.scratch.lock().unwrap();
+                Scratch::ensure(
+                    &c.device,
+                    &mut sc.amaxp,
+                    (nparts * 4) as u64,
+                    wgpu::BufferUsages::STORAGE,
+                    "q4tpmm-amax-parts",
+                )
+            };
+            let bg1 = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &part.get_bind_group_layout(0),
+                entries: &[bind_buf(0, act), bind_buf(1, &pbuf), bind_buf(2, &ap)],
+            });
+            let fp = c
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&[nparts as u32, 0u32, 0u32, 0u32]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let bg2 = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &fold.get_bind_group_layout(0),
+                entries: &[bind_buf(0, &pbuf), bind_buf(1, asc), bind_buf(2, &fp)],
+            });
+            let mut pass = begin_pass(enc);
+            pass.set_pipeline(part);
+            pass.set_bind_group(0, &bg1, &[]);
+            pass.dispatch_workgroups(nparts as u32, 1, 1);
+            drop(pass);
+            let mut pass = begin_pass(enc);
+            pass.set_pipeline(fold);
+            pass.set_bind_group(0, &bg2, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+            true
+        }
+        _ => match c.act_absmax.as_ref() {
+            Some(amax) => {
+                let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &amax.get_bind_group_layout(0),
+                    entries: &[bind_buf(0, act), bind_buf(1, asc), bind_buf(2, &ap)],
+                });
+                let mut pass = begin_pass(enc);
+                pass.set_pipeline(amax);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+                true
+            }
+            None => false,
+        },
+    }
+}
+
 fn tp_matmat(
     model: &Arc<CmfModel>,
     idx: usize,
@@ -17245,7 +17322,7 @@ fn tp_matmat(
     out: &mut [f32],
     two_bit: bool,
 ) -> bool {
-    tp_matmat_impl(model, idx, xs, b, rows, cols, Some(out), two_bit).is_some()
+    tp_matmat_impl(model, idx, xs, b, rows, cols, Some(out), None, two_bit).is_some()
 }
 
 /// Result stays on the device; the caller owns the returned handle.
@@ -17259,7 +17336,7 @@ fn tp_matmat_keep(
     _unused: &mut Vec<f32>,
     two_bit: bool,
 ) -> Option<wgpu::Buffer> {
-    tp_matmat_impl(model, idx, xs, b, rows, cols, None, two_bit)
+    tp_matmat_impl(model, idx, xs, b, rows, cols, None, None, two_bit)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -17271,6 +17348,7 @@ fn tp_matmat_impl(
     rows: usize,
     cols: usize,
     out: Option<&mut [f32]>,
+    src: Option<&wgpu::Buffer>,
     two_bit: bool,
 ) -> Option<wgpu::Buffer> {
     let c = ctx()?;
@@ -17308,7 +17386,7 @@ fn tp_matmat_impl(
             );
         }
     }
-    if plen < need || abs + plen > bytes.len() || xs.len() < b * cols || out.as_ref().is_some_and(|o| o.len() < b * rows) {
+    if plen < need || abs + plen > bytes.len() || (src.is_none() && xs.len() < b * cols) || out.as_ref().is_some_and(|o| o.len() < b * rows) {
         return None;
     }
     let q_buf = match weight_buffer(c, (model.uid() as usize, idx), &bytes[abs..abs + plen]) {
@@ -17316,15 +17394,25 @@ fn tp_matmat_impl(
         None => return None,
     };
     let mut sc = c.scratch.lock().unwrap();
-    let xs_buf = Scratch::ensure(
-        &c.device,
-        &mut sc.xs,
-        (b * cols * 4) as u64,
-        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        "q4tpmm-xs",
-    );
-    c.queue
-        .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..b * cols]));
+    // A resident A operand: the kernel before us left it on the card, so
+    // there is nothing to upload and — the point of the exercise —
+    // nothing to read back first. A readback drains the whole queue, and
+    // that stall was the last one left inside a DiT block.
+    let xs_buf = match src {
+        Some(bf) => bf.clone(),
+        None => {
+            let bf = Scratch::ensure(
+                &c.device,
+                &mut sc.xs,
+                (b * cols * 4) as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                "q4tpmm-xs",
+            );
+            c.queue
+                .write_buffer(&bf, 0, bytemuck::cast_slice(&xs[..b * cols]));
+            bf
+        }
+    };
     let y_size = (b * rows * 4) as u64;
     let y_buf = Scratch::ensure(
         &c.device,
@@ -17350,7 +17438,7 @@ fn tp_matmat_impl(
             );
         }
     }
-    let ascale: f32 = if coop_arm {
+    let ascale: f32 = if coop_arm && src.is_none() {
         let mx = xs[..b * cols]
             .iter()
             .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
@@ -17358,7 +17446,7 @@ fn tp_matmat_impl(
     } else {
         0.0
     };
-    let params = [(cols / 4) as u32, rows as u32, b as u32, ascale.to_bits()];
+    let mut params = [(cols / 4) as u32, rows as u32, b as u32, ascale.to_bits()];
     let p_buf = match &sc.params {
         Some(bf) => bf.clone(),
         None => {
@@ -17372,8 +17460,6 @@ fn tp_matmat_impl(
             bf
         }
     };
-    c.queue
-        .write_buffer(&p_buf, 0, bytemuck::cast_slice(&params));
     let stage_buf = Scratch::ensure(
         &c.device,
         &mut sc.stage,
@@ -17397,6 +17483,14 @@ fn tp_matmat_impl(
         None
     };
     drop(sc);
+    // A resident operand never passed through the host, so nothing here
+    // has seen max|x| — the f16 arm needs the card to compute it. If
+    // that reduction is missing, take the scalar arm instead of running
+    // f16 unscaled: unscaled f16 on DiT activations overflows to NaN,
+    // which is exactly how this kernel failed the first time.
+    let can_dev_scale =
+        (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
+    let dq = if src.is_some() && !can_dev_scale { None } else { dq };
     let dq_plane = dq.as_ref().map(|(p, _)| p.clone());
     let (mm_pipe, w_bind) = match (&dq_plane, c.q4tp_mm_coop_f16.as_ref()) {
         (Some(dq), Some(pipe)) => (pipe, dq),
@@ -17406,6 +17500,18 @@ fn tp_matmat_impl(
     // it takes a one-element dummy here because this path computes the
     // scale on the host and passes it in `pad`.
     let f16_arm = dq_plane.is_some() && c.q4tp_mm_coop_f16.is_some();
+    let dev_scale = f16_arm && src.is_some();
+    if dev_scale {
+        params[3] = 0xFFFF_FFFFu32;
+    }
+    c.queue
+        .write_buffer(&p_buf, 0, bytemuck::cast_slice(&params));
+    let asc_buf = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("q4tpmm-ascale"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
     let dummy_scale = c
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -17420,7 +17526,7 @@ fn tp_matmat_impl(
         bind_buf(3, &p_buf),
     ];
     if f16_arm {
-        entries.push(bind_buf(4, &dummy_scale));
+        entries.push(bind_buf(4, if dev_scale { &asc_buf } else { &dummy_scale }));
     }
     let bind_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("q4tpmm-bg"),
@@ -17440,6 +17546,9 @@ fn tp_matmat_impl(
         pass.set_bind_group(0, bind_dq, &[]);
         let wgs = ((rows * cols / 2) as u32).div_ceil(256);
         pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+    }
+    if dev_scale {
+        encode_act_absmax(c, &mut enc, &xs_buf, b * cols, &asc_buf);
     }
     {
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -17732,7 +17841,94 @@ pub fn dit_qkv_attention(
     else {
         return false;
     };
-    dit_attention_packed_src(&[], Some(&panel), nh, n, hd, scale, Some(nr), out)
+    dit_attention_packed_src(&[], Some(&panel), nh, n, hd, scale, Some(nr), out, None)
+}
+
+/// qkv GEMM, attention, AND the output projection with nothing crossing
+/// the bus in between: the projection reads the attention panel where
+/// the unstack left it, and only its own result (n×hidden) comes home.
+/// This was the last round trip inside a DiT block — and a readback is
+/// not just its own bytes, it drains the queue, so the card idled once
+/// per block waiting for the host to take delivery.
+/// `false` = refused at the door (every condition is checked BEFORE any
+/// work, so the caller's fallback never repeats work this already did).
+#[allow(clippy::too_many_arguments)]
+pub fn dit_qkv_attn_out(
+    model: &Arc<CmfModel>,
+    qkv_idx: usize,
+    out_idx: usize,
+    xn: &[f32],
+    n: usize,
+    hidden: usize,
+    nh: usize,
+    hd: usize,
+    scale: f32,
+    nr: (&[f32], &[f32], &[f32], f32),
+    proj: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let inner = nh * hd;
+    let can_dev_scale =
+        (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
+    let refuse = if !can_dev_scale {
+        "no device absmax"
+    } else if c.q4tp_mm_coop_f16.is_none() {
+        "no coop f16 gemm"
+    } else if c.q4tp_dq_f16.is_none() {
+        "no f16 dequant"
+    } else if c.dit_qkv_split.is_none() {
+        "no qkv split"
+    } else if inner % 32 != 0 {
+        "inner not 32-aligned"
+    } else if n < 64 {
+        "batch too small"
+    } else if proj.len() < n * hidden {
+        "proj too small"
+    } else {
+        ""
+    };
+    if !refuse.is_empty() {
+        if std::env::var("CMF_GPU_DEBUG").is_ok() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| eprintln!("dit_qkv_attn_out refused: {refuse}"));
+        }
+        return false;
+    }
+    let mut unused = Vec::new();
+    let Some(panel) = tp_matmat_keep(model, qkv_idx, xn, n, 3 * inner, hidden, &mut unused, false)
+    else {
+        if std::env::var("CMF_GPU_DEBUG").is_ok() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| eprintln!("dit_qkv_attn_out refused: qkv gemm"));
+        }
+        return false;
+    };
+    let mut ab = None;
+    if !dit_attention_packed_src(
+        &[],
+        Some(&panel),
+        nh,
+        n,
+        hd,
+        scale,
+        Some(nr),
+        &mut [],
+        Some(&mut ab),
+    ) {
+        if std::env::var("CMF_GPU_DEBUG").is_ok() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| eprintln!("dit_qkv_attn_out refused: attention"));
+        }
+        return false;
+    }
+    let Some(ab) = ab else { return false };
+    let ok = tp_matmat_impl(model, out_idx, &[], n, hidden, inner, Some(proj), Some(&ab), false)
+        .is_some();
+    if !ok && std::env::var("CMF_GPU_DEBUG").is_ok() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| eprintln!("dit_qkv_attn_out refused: out gemm {hidden}x{inner} b={n}"));
+    }
+    ok
 }
 
 pub fn dit_attention_packed(
@@ -17744,7 +17940,7 @@ pub fn dit_attention_packed(
     nr: Option<(&[f32], &[f32], &[f32], f32)>,
     out: &mut [f32],
 ) -> bool {
-    dit_attention_packed_src(qkv, None, nh, n, hd, scale, nr, out)
+    dit_attention_packed_src(qkv, None, nh, n, hd, scale, nr, out, None)
 }
 
 /// The same, with the panel possibly ALREADY on the card (`pre`): its
@@ -17760,13 +17956,14 @@ pub fn dit_attention_packed_src(
     scale: f32,
     nr: Option<(&[f32], &[f32], &[f32], f32)>,
     out: &mut [f32],
+    keep: Option<&mut Option<wgpu::Buffer>>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
     let Some(split) = c.dit_qkv_split.as_ref() else {
         return false;
     };
     let inner = nh * hd;
-    if (pre.is_none() && qkv.len() < n * 3 * inner) || out.len() < n * inner {
+    if (pre.is_none() && qkv.len() < n * 3 * inner) || (keep.is_none() && out.len() < n * inner) {
         return false;
     }
     let plane = (nh * n * hd * 4) as u64;
@@ -17889,7 +18086,7 @@ pub fn dit_attention_packed_src(
         }
     }
     // The planes are on the card now; the shared path skips its uploads.
-    dit_attention_inner(&[], &[], &[], nh, nh, n, hd, scale, out, true)
+    dit_attention_inner(&[], &[], &[], nh, nh, n, hd, scale, out, true, keep)
 }
 
 pub fn dit_attention(
@@ -17903,7 +18100,7 @@ pub fn dit_attention(
     scale: f32,
     out: &mut [f32],
 ) -> bool {
-    dit_attention_inner(qh, kh, vh, nh, nkv, n, hd, scale, out, false)
+    dit_attention_inner(qh, kh, vh, nh, nkv, n, hd, scale, out, false, None)
 }
 
 /// `resident` = the q/k/v planes are ALREADY in the scratch slots (the
@@ -17921,6 +18118,7 @@ fn dit_attention_inner(
     scale: f32,
     out: &mut [f32],
     resident: bool,
+    keep: Option<&mut Option<wgpu::Buffer>>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
     if nh == 0 || nkv == 0 || n == 0 || hd == 0 || nh % nkv != 0 {
@@ -17931,7 +18129,9 @@ fn dit_attention_inner(
     {
         return false;
     }
-    if out.len() < n * nh * hd {
+    // Empty in keep mode: the panel is handed over as a buffer,
+    // so there is no host slice to size-check.
+    if keep.is_none() && out.len() < n * nh * hd {
         return false;
     }
     let dev = &c.device;
@@ -18331,14 +18531,24 @@ fn dit_attention_inner(
         pass.set_bind_group(0, &bg_un, &[]);
         pass.dispatch_workgroups_flat(total.div_ceil(256));
     }
-    readback(
-        c,
-        enc,
-        &ab,
-        &stage,
-        (n * nh * hd * 4) as u64,
-        &mut out[..n * nh * hd],
-    )
+    match keep {
+        // The caller is the next GEMM in the same block: hand it the
+        // panel where it already is. Nothing crosses the bus, and the
+        // queue is never drained mid-block.
+        Some(slot) => {
+            c.queue.submit(Some(enc.finish()));
+            *slot = Some(ab);
+            true
+        }
+        None => readback(
+            c,
+            enc,
+            &ab,
+            &stage,
+            (n * nh * hd * 4) as u64,
+            &mut out[..n * nh * hd],
+        ),
+    }
 }
 
 /// Causal chunk attention on wgpu: `b` new queries against `s0 + b`
