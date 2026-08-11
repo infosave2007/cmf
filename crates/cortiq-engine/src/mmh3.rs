@@ -726,7 +726,11 @@ impl MiniMaxH3 {
             if std::env::var("CMF_MMH3_ATTN").as_deref() != Ok("repack")
                 && crate::gpu::dit_attention_packed(qkv, nh, n, hd, scale, attn)
             {
-                Self::prof(3, t_repack);
+                // No stamp: the caller's slot-3 stopwatch already spans
+                // this whole call, and CMF_DIT_ATTN_PROF breaks the
+                // device half into its three walls. Two overlapping
+                // stopwatches on the same work is how a 19.2 s step
+                // came to read as 26.1.
                 return;
             }
             let mut qh = vec![0f32; nh * n * hd];
@@ -768,10 +772,9 @@ impl MiniMaxH3 {
             // else. Slot 2 (qknorm+rope, unused on this path) takes the
             // repack; slot 3 keeps the device call.
             Self::prof(2, t_repack);
-            let t2 = std::time::Instant::now();
-            let ok = crate::gpu::dit_attention(&qh, &kh, &vh, nh, nh, n, hd, scale, attn);
-            Self::prof(3, t2);
-            if ok {
+            // No stamp on the device call: the caller's slot-3 stopwatch
+            // already spans it, and stamping both double-counts.
+            if crate::gpu::dit_attention(&qh, &kh, &vh, nh, nh, n, hd, scale, attn) {
                 return;
             }
         }
