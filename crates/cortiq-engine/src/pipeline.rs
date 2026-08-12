@@ -2535,6 +2535,13 @@ impl Pipeline {
             return None;
         }
         let t_round = std::time::Instant::now();
+        // Submissions per phase. The draft costs ~3.2 ms a step where the
+        // MTP block plus the head is 834 MB — 0.8 ms at this card's
+        // measured 1056 GB/s — so what matters is how many round trips it
+        // pays, and that decides whether fusing the block into a graph is
+        // worth the work. Counted, not estimated.
+        let subs = || crate::gpu_wgpu::SUBMITS.load(std::sync::atomic::Ordering::Relaxed);
+        let sub0 = subs();
         // Draft the chain: first from the trunk's tip hidden, then the head
         // iterating on itself. Rows land in the MTP KV; the chain rows past
         // the first are speculation over speculative state and roll back
@@ -2549,6 +2556,7 @@ impl Pipeline {
         }
         *drafted += k_spec;
         let t_draft = t_round.elapsed();
+        let sub_draft = subs();
         // Verify batch: [t_next, d1 .. d_{k-1}] at next_pos.. — every row's
         // logits come back from the graph's own head.
         let b = k_spec + 1;
@@ -2585,6 +2593,7 @@ impl Pipeline {
             return None;
         }
         let t_verify = t_round.elapsed();
+        let sub_verify = subs();
         // Acceptance: row i's argmax is the trunk's token after input i.
         let ids: Vec<u32> = (0..b)
             .map(|i| sampler::argmax(&logits[i * lm_rows..(i + 1) * lm_rows]))
@@ -2633,11 +2642,16 @@ impl Pipeline {
         // keep the draft head's attention cache warm, and the GDN state
         // rolls back on any rejection. Both live here, after the verify.
         if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+            let end = subs();
             eprintln!(
-                "spec-round: draft {:.1} ms | verify {:.1} ms | commit {:.1} ms                  (accepted {a} of {k_spec})",
+                "spec-round: draft {:.1} ms/{} sub | verify {:.1} ms/{} sub | \
+                 commit {:.1} ms/{} sub (accepted {a} of {k_spec})",
                 t_draft.as_secs_f64() * 1e3,
+                sub_draft - sub0,
                 (t_verify - t_draft).as_secs_f64() * 1e3,
+                sub_verify - sub_draft,
                 (t_round.elapsed() - t_verify).as_secs_f64() * 1e3,
+                end - sub_verify,
             );
         }
         Some((drafts[..a].to_vec(), next_pos + a + 1, new_hidden))
