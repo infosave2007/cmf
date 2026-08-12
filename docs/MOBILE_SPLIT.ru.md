@@ -131,13 +131,36 @@ loopback: без него воркер откажется слушать.
 
 ### Шаг 1. Пересобрать нативную библиотеку
 
+Матрица сборки НЕ одинаковая по ABI, и обе особенности молча ломают
+приложение, если их пропустить.
+
 ```sh
-# Android, все три ABI как сейчас в jniLibs
-cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 --platform 26 \
-  build --release -p cortiq-ffi
+# 64-битные ABI — с фичей gpu. Она НЕ дефолтная: сборка без неё даёт
+# библиотеку вдвое меньше и приложение без Vulkan, без единой ошибки.
+cargo ndk -t arm64-v8a -t x86_64 --platform 26 \
+  build --release -p cortiq-ffi --features gpu
+
+# armeabi-v7a — без gpu (так собрано то, что лежит в приложении) И с
+# 16 KB-страницами: по умолчанию линкер даёт выравнивание 0x1000, а такая
+# библиотека не загрузится на Android 15 и не пройдёт в Play.
+RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384" \
+  cargo ndk -t armeabi-v7a --platform 26 build --release -p cortiq-ffi
+
 # iOS
 cargo build --release -p cortiq-ffi --target aarch64-apple-ios
 ```
+
+Проверить ПЕРЕД копированием — три символа на месте и выравнивание 0x4000
+у всех трёх ABI (`NDK/toolchains/llvm/prebuilt/*/bin`):
+
+```sh
+llvm-nm -D libcortiq_ffi.so | grep -c "cortiq_\(worker_start\|set_peer\|peer_stats\)"   # 3
+llvm-readelf -l libcortiq_ffi.so | awk '/LOAD/{print $NF}' | sort -u        # 0x4000
+```
+
+Размеры — тоже проверка: arm64 ≈ 14 МБ и x86_64 ≈ 14.5 МБ (с gpu),
+v7a ≈ 4.5 МБ (без). Arm64 на 7 МБ легче ожидаемого означает, что фича gpu
+потерялась.
 
 Скопировать `libcortiq_ffi.so` в `android/app/src/main/jniLibs/<abi>/` и
 обновить `native/cortiq_ffi.h` из `crates/cortiq-ffi/include/cortiq.h`.
