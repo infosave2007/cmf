@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.70] - 2026-08-12
+
+**A phone can now drive a desktop, which is the opposite of what the
+roadmap planned for it — and the measurements are why.** The mobile
+extender was specified as a phone adding memory and compute to a host.
+It fails that test: a layer split does not parallelise a token, so every
+configuration where both sides compute is slower than the faster side
+alone (bonsai 1.7B: 28.6 tok/s on an M4, 14.3 on the phone, 14.0 split
+in half over USB). Inverted, it pays enormously — a Xiaomi 12 Lite with
+2 GB of free RAM generates from a 34.7B MoE at 16.3 tok/s.
+
+| Android coordinator + Mac worker, all layers remote, USB | head local | head on peer |
+|---|---|---|
+| bonsai 1.7B | 12.6–13.0 tok/s | **26.0–27.3** |
+| Qwen3.6 35B-A3B q2tp (34.7B) | 9.1–9.4 | **15.7–16.3** |
+| per-token wire | 4 KB | **16 bytes** |
+| prefill, 1800 positions, phone alone → offloaded | 86.9 s | **11.3 s** |
+
+### Added
+- **Wire v5: `Assign.head` moves the final norm, `lm_head` and the
+  sampler to the worker, which answers a token ID** (`--peer-head`).
+  The head does not shrink as layers move away — at `--peer-split 0` a
+  phone computing no layers at all still spent 29 ms of a 73 ms token on
+  it, because 151669 × 2048 sat on the weakest machine. Moving only the
+  head would have lost: those logits are 300 KB a token in f16, 20 ms at
+  the measured 14.6 MB/s of Wi-Fi. The sampler goes with it, so `Ids`
+  ships the prompt history the repetition penalty reads, and the sampler
+  config travels as JSON in `Assign` — a greedy run here against a
+  default temperature there would have been a different answer with no
+  error anywhere. With the worker on layer 0, `StepId` replaces the
+  hidden and the token costs 16 bytes of wire.
+- **`Stats` and `nodestat.rs`: what a node is worth right now.** Thermal
+  zone, mains power, the fastest core's current and peak clock, free
+  memory, pool size. Every field is `Option` — on the test device
+  `/sys/class/power_supply` is unreadable to a shell process and the
+  field stays empty rather than claiming false. Unknown and zero must
+  never be the same value to a scheduler. `cortiq run --peer` prints the
+  line on connect.
+- **`cortiq_worker_start(json)`, `cortiq_set_peer(json)`,
+  `cortiq_peer_stats()` in the C ABI.** Phase 4b required the worker to
+  be a library, and the ABI had no networking at all — which blocked iOS
+  outright. The port is bound on the caller's thread so a busy port is a
+  message, not a dead background thread; the peer segment is cached
+  across generates for cross-turn KV reuse and dropped on a broken wire
+  so the next call redials.
+- **`docs/MOBILE_SPLIT.ru.md`** — the integration guide: four roles with
+  the numbers that rank them, the ABI, Dart bindings, and six traps.
+
+### Fixed
+- Nothing behavioural. `serve --peer` keeps the head local (the sampler
+  config is per-request there and `Assign` carries it once).
+
+### Measured, not changed
+- **The transport is ranked by its tail, not its bandwidth.** One 4 KB
+  round trip — exactly one hidden state: USB p50 1.89 ms / p99 2.94;
+  Wi-Fi 5 GHz ax at −53 dBm with a 680 Mbit/s link, p50 8.95 / **p99
+  94.81**, and p90 85 when the coordinator pauses 100 ms between tokens.
+  One round trip per token means the tail is what the user sees.
+- **The phone's DVFS is worth 2×, and it is not thermal.** The same
+  worker served the same span at 22.6 ms and then 42.4 ms at 36 °C with
+  no throttling: `schedutil` never raises the clock for a task that
+  computes for a few milliseconds and then blocks on a socket (cpu4 sat
+  at 691 of 2400 MHz). The fix is ADPF, for which `cortiq_worker_tids()`
+  already exists.
+- **The worker pool's big-core sizing is already optimal on big.LITTLE**
+  — pinning adds 0.3%, and letting the pool grow to all 8 cores costs
+  28% (14.3 → 10.3 tok/s), because an A55 becomes the straggler on every
+  layer barrier. An earlier +16% for pinning was an artifact of timing
+  `run` instead of `bench --json`.
+
 ## [0.5.69] - 2026-08-12
 
 **Speculative decode stopped costing money and started making it, and the

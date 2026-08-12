@@ -733,7 +733,14 @@ the boundary; `cortiq gpu` lists the cards and their indices,
 across-machines form, and what to check when a card is not used.
 
 For a model bigger than one HOST, `--peer` speaks to a `cortiq worker`
-over the network instead — same split, one socket further away.
+over the network instead — same split, one socket further away. Add
+`--peer-head` and the worker also runs the head and the sampler and
+answers token ids: the caller keeps only its tokenizer, and the wire
+drops to 16 bytes a token. That is what lets a weak machine drive a
+strong one — an Android phone with 2 GB of free RAM generates from a
+34.7B MoE at 16.3 tok/s, against 9.1 with the head at home.
+[docs/MOBILE_SPLIT.ru.md](docs/MOBILE_SPLIT.ru.md) has the roles, the
+numbers behind them, and the mobile ABI.
 
 The backend is picked automatically: wgpu chooses Vulkan on Linux/Windows,
 DX12 on Windows if Vulkan is absent, Metal on macOS — nothing to configure
