@@ -21831,8 +21831,22 @@ fn readback(
 /// memcpy into the call's dominant cost. Split copies above a few MB
 /// across threads — read bandwidth scales nearly linearly.
 fn par_copy(out: &mut [f32], src: &[f32]) {
-    const PAR_MIN: usize = 4 << 20;
-    if out.len() * 4 >= PAR_MIN {
+    // 4 MB, and it stays there. The tempting change is to lower it so the
+    // decode's own per-token copy qualifies — a folded lm_head reads back
+    // the whole logit row, 993 KB at Qwen3.6's 248320 vocab, which is
+    // real single-threaded time out of a 20 ms token. MEASURED, and it
+    // LOSES: at 256 KB the production loop goes 44.4 -> 42.5 tok/s and
+    // greedy 49.0 -> 47.3 (medians of three, RTX 5090). `thread::scope`
+    // spawns fresh OS threads on every call, and for a megabyte once a
+    // token that costs more than the copy. It pays for the bake's 264 MB
+    // planes, which is what the threshold was chosen for. A pooled
+    // version would be a different measurement; this one is not it.
+    // `CMF_PARCOPY_MIN` (bytes) is there to re-run the experiment.
+    let par_min: usize = std::env::var("CMF_PARCOPY_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4 << 20);
+    if out.len() * 4 >= par_min {
         let lanes = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
