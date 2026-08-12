@@ -15980,7 +15980,23 @@ pub fn forward_batch_graph(
         };
         lws.push(LW { attn, ffn: bffn });
     }
+    // Content-cached, exactly as the token graph's: norm weights are
+    // token-invariant, and this minted a fresh device buffer for every one
+    // of them on every call — a speculative verify walks 64 layers and
+    // asks for several apiece. Same `const_bufs` map, same (ptr,len) key,
+    // same fingerprint so another model's mmap landing on the address
+    // refreshes rather than aliases.
     let stor = |data: &[u8]| {
+        let key = (data.as_ptr() as usize, data.len());
+        let fp = crate::gpu::fp_bytes(data);
+        let mut cb = c.const_bufs.lock().unwrap();
+        if let Some((b, f)) = cb.get_mut(&key) {
+            if *f != fp {
+                c.queue.write_buffer(b, 0, data);
+                *f = fp;
+            }
+            return b.clone();
+        }
         let b = c.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: data.len() as u64,
@@ -15988,6 +16004,7 @@ pub fn forward_batch_graph(
             mapped_at_creation: false,
         });
         c.queue.write_buffer(&b, 0, data);
+        cb.insert(key, (b.clone(), fp));
         b
     };
     let unif = |d: &[u32]| {
