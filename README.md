@@ -739,6 +739,13 @@ answers token ids: the caller keeps only its tokenizer, and the wire
 drops to 16 bytes a token. That is what lets a weak machine drive a
 strong one — an Android phone with 2 GB of free RAM generates from a
 34.7B MoE at 16.3 tok/s, against 9.1 with the head at home.
+`--peer-run-ahead K` returns K tokens for one round trip, which is what
+makes that work over Wi-Fi rather than a cable (13.3 → 23.6 tok/s); it
+is not speculation, just the handshakes removed, and the output is
+identical. `--peer-prefill` is the mode where the wire leaves: the peer
+absorbs the prompt, its KV comes home, and the conversation continues
+with nothing plugged in — an 1800-token prompt goes 86.9 s → 16.3 s on
+that phone. `cortiq peers` finds a worker on the LAN.
 [docs/MOBILE_SPLIT.ru.md](docs/MOBILE_SPLIT.ru.md) has the roles, the
 numbers behind them, and the mobile ABI.
 

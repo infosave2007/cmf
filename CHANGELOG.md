@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.71] - 2026-08-12
+
+**The wire now does its work and leaves.** Every split mode so far kept
+the network in the loop forever; this release adds the one that does
+not. A phone hands its prompt to a laptop, takes the state home, and the
+cable can be pulled — measured end to end, with the peer killed the
+moment the state landed.
+
+| Xiaomi 12 Lite ↔ M4 | before | now |
+|---|---|---|
+| 1800-token prompt to first token (USB) | 86.9 s | **16.3 s** |
+| thin client over Wi-Fi, bonsai 1.7B | 13.3 tok/s | **23.6** |
+| thin client over Wi-Fi, 34.7B MoE | 6.5 tok/s | **12.4** |
+| finding a peer | type the address | `cortiq peers`, 5 s |
+
+### Added
+- **Wire v7 / `--peer-prefill`: prefill on the peer, pull the state
+  home, decode locally.** Prefill and decode have opposite shapes — a
+  prompt ships in whole chunks while decode pays one round trip per
+  token — so offloading the prompt is the one thing a split does that a
+  local run cannot match: 1799 positions cost 86.9 s on the phone and
+  10.3 s on the laptop, and the state follows in 5.9 s over USB (206.5
+  MB in f16 at the 35 MB/s a cable actually sustains). Verified as
+  stated: the worker AND the tunnel were killed the moment the state
+  arrived, and the phone generated its tokens anyway.
+- **`LayerKvCache::{export_wire, import_wire}`.** The state is 224 KiB a
+  position (measured), so `--net-dtype f16` decides whether the trade
+  pays. It REFUSES rather than travelling half-described — q8 storage, a
+  Nyström overlay and frozen columns each hold state this format does
+  not carry. Born-rule importance does travel: every attention call
+  accumulates it and eviction reads it, so leaving it behind would make
+  the far side forget the wrong positions later, under pressure, long
+  after the transfer looked fine. The oracle is what the layer ANSWERS —
+  export, import into a fresh layer, `attend()` must match bit for bit.
+- **Wire v6 / `--peer-run-ahead K`: K tokens for one round trip.** In
+  head mode over the whole stack the coordinator does nothing between
+  tokens, so asking permission each time costs a round trip and buys
+  nothing. Not speculation: no draft model, no verification, the same
+  sequential decode with the handshakes removed, and output identical
+  token for token. `StepId` carries the caller's remaining budget so a
+  batch never advances the worker's KV past what will be emitted.
+- **`cortiq peers`: discovery by asking.** The obvious design — a worker
+  announcing itself — was refuted before it shipped: broadcast from the
+  laptop never reaches an Android phone on the same Wi-Fi, while unicast
+  to that phone always does. So the seeker broadcasts one query and each
+  worker answers by unicast. The answer carries the model file name,
+  dir_hash, geometry, wire version and whether a token is needed — never
+  the token, never the path. `CMF_NET_BEACON=0` opts out.
+
+### Measured, not changed
+- **A worker running ON a phone is not discoverable**, and it is not
+  broken: it binds the port, serves fine when its address is typed in,
+  and is invisible to a scan because the phone never receives the query.
+  Two phones therefore cannot find each other this way at all — the
+  phone-to-phone section of `docs/MOBILE_SPLIT.ru.md` records what a
+  pair would need instead, and the arithmetic saying a pair is only ever
+  worth it for a model that fits neither.
+- **Run-ahead cannot help a capacity split.** It is legal only when the
+  coordinator idles between tokens; two phones split precisely because
+  each must compute. That topology is where a real speculative batch —
+  and a draft head — would be needed.
+
 ## [0.5.70] - 2026-08-12
 
 **A phone can now drive a desktop, which is the opposite of what the
