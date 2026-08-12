@@ -31,6 +31,10 @@ pub struct SessionSpec {
     /// v5 head mode: the coordinator's `SamplerConfig` as JSON, so the far
     /// side samples with the caller's settings and not its defaults.
     pub sampler: Option<String>,
+    /// v6: how many tokens the worker may return for one round trip.
+    /// 0/1 keeps the classic one-token exchange. Needs `head` and a peer
+    /// holding the whole stack; the worker refuses it otherwise, loudly.
+    pub run_ahead: u32,
 }
 
 pub struct RemoteSegment {
@@ -45,6 +49,11 @@ pub struct RemoteSegment {
     pub net_s: f64,
     /// v5: the worker owns the head and answers token ids.
     pub head: bool,
+    /// v6: tokens per round trip (1 = classic).
+    pub run_ahead: usize,
+    /// Ids from the last run-ahead batch, and whether it ended on EOS.
+    batch: Vec<u32>,
+    pub batch_eos: bool,
     raw: Vec<u8>,
     floats: Vec<f32>,
 }
@@ -78,6 +87,9 @@ impl RemoteSegment {
             dtype,
             net_s: 0.0,
             head: spec.head,
+            run_ahead: spec.run_ahead.max(1) as usize,
+            batch: Vec::new(),
+            batch_eos: false,
             raw: Vec::with_capacity(64 * 1024),
             floats: Vec::new(),
         };
@@ -99,6 +111,7 @@ impl RemoteSegment {
             o1: spec.o1.clone(),
             head: spec.head,
             sampler: spec.sampler.clone(),
+            run_ahead: spec.run_ahead,
         })?;
         rs.expect_ack("assign")?;
         Ok(rs)
@@ -238,12 +251,40 @@ impl RemoteSegment {
         Ok(id)
     }
 
+    /// v6: one round trip, up to `run_ahead` tokens back. The ids are the
+    /// same the one-at-a-time path would have produced — the worker runs
+    /// the identical sequential decode, it just stops asking permission.
+    pub fn step_id_many(&mut self, pos: usize, id: u32, want: usize) -> Result<&[u32], String> {
+        let t = Instant::now();
+        let mut raw = std::mem::take(&mut self.raw);
+        let r = send_step_id(&mut self.stream, &mut raw, pos as u64, id, want as u32);
+        self.raw = raw;
+        r?;
+        match self.recv(true)? {
+            Msg::Tokens { ids, eos } => {
+                if ids.is_empty() {
+                    return Err(format!("worker {}: empty run-ahead batch", self.addr));
+                }
+                self.batch = ids;
+                self.batch_eos = eos;
+            }
+            other => {
+                return Err(format!(
+                    "worker {}: expected Tokens, got {other:?}",
+                    self.addr
+                ));
+            }
+        }
+        self.net_s += t.elapsed().as_secs_f64();
+        Ok(&self.batch)
+    }
+
     /// Head mode with the worker holding every layer: the id goes out and
     /// the next id comes back. Sixteen bytes of wire for a whole token.
     pub fn step_id(&mut self, pos: usize, id: u32) -> Result<u32, String> {
         let t = Instant::now();
         let mut raw = std::mem::take(&mut self.raw);
-        let r = send_step_id(&mut self.stream, &mut raw, pos as u64, id);
+        let r = send_step_id(&mut self.stream, &mut raw, pos as u64, id, 1);
         self.raw = raw;
         r?;
         let next = self.expect_token()?;
@@ -384,6 +425,8 @@ pub fn generate_split(
         }
     };
     let mut next_pos = input_ids.len();
+    // Run-ahead tokens already fetched and not yet committed.
+    let mut pending: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
 
     while token_ids.len() < max_tokens {
         // Commit `next` (mirrors generate_from_ids: EOS stops unemitted).
@@ -412,7 +455,27 @@ pub fn generate_split(
         if remote.head && split == 0 {
             // Thin client: the worker embeds, runs every layer, and
             // samples. Sixteen bytes of wire and no matmul on this side.
-            next = remote.step_id(next_pos, next)?;
+            if remote.run_ahead > 1 {
+                // Nothing here happens between tokens, so nothing here
+                // needs to be asked between tokens: one round trip
+                // brings back as many as the caller can still use. The
+                // ids are what the one-at-a-time path would have given —
+                // same sequential decode, fewer handshakes.
+                if pending.is_empty() {
+                    let want = max_tokens - token_ids.len();
+                    let got = remote.step_id_many(next_pos, next, want)?;
+                    pending.extend(got.iter().copied());
+                    remote_steps += 1;
+                    // The worker consumed one position per token it
+                    // produced; the next request starts after them.
+                    next_pos += pending.len();
+                }
+                next = pending.pop_front().expect("batch was non-empty");
+            } else {
+                next = remote.step_id(next_pos, next)?;
+                remote_steps += 1;
+                next_pos += 1;
+            }
         } else {
             let emb = p.embed_id(next);
             let boundary = if split > 0 {
@@ -427,9 +490,9 @@ pub fn generate_split(
                 let logits = p.logits_from_hidden(&remote.floats);
                 next = p.sample_next(&logits, &all_ids);
             }
+            remote_steps += 1;
+            next_pos += 1;
         }
-        remote_steps += 1;
-        next_pos += 1;
     }
 
     let decode_s = t_decode.elapsed().as_secs_f64();

@@ -569,6 +569,14 @@ enum Commands {
         /// --peer-split 0 the whole per-token wire becomes 16 bytes.
         #[arg(long, requires = "peer")]
         peer_head: bool,
+        /// Tokens the peer may return for ONE round trip. In head mode
+        /// over the whole stack this side does nothing between tokens, so
+        /// asking each time costs a round trip and buys nothing — and on
+        /// Wi-Fi a round trip is 9 ms at the median and 95 at p99. Not
+        /// speculation: the same sequential decode, identical output,
+        /// fewer handshakes. Default 1.
+        #[arg(long, requires = "peer_head", default_value_t = 1)]
+        peer_run_ahead: u32,
         /// Split the layer stack across N local GPUs, in ONE process:
         /// segment i runs pinned to card i and only a hidden vector
         /// crosses the boundary. This is the CAPACITY mode — for a
@@ -1453,6 +1461,7 @@ async fn main() -> anyhow::Result<()> {
             net_token,
             net_dtype,
             peer_head,
+            peer_run_ahead,
             gpus,
         } => {
             let o1 = O1Flags {
@@ -1486,6 +1495,7 @@ async fn main() -> anyhow::Result<()> {
                 net_token.as_deref(),
                 &net_dtype,
                 peer_head,
+                peer_run_ahead,
                 gpus,
             )
             .await
@@ -2926,6 +2936,7 @@ async fn cmd_run(
     net_token: Option<&str>,
     net_dtype: &str,
     peer_head: bool,
+    peer_run_ahead: u32,
     gpus: Option<usize>,
 ) -> anyhow::Result<()> {
     println!("Loading model: {}", model_path);
@@ -3137,6 +3148,7 @@ async fn cmd_run(
             } else {
                 None
             },
+            run_ahead: peer_run_ahead,
         };
         let mut rs = cortiq_net::RemoteSegment::connect(
             addr,
@@ -4256,6 +4268,7 @@ async fn cmd_bench(
             } else {
                 None
             },
+            run_ahead: 1,
         };
         let mut rs = cortiq_net::RemoteSegment::connect(
             addr,
