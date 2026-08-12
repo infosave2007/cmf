@@ -23,11 +23,13 @@
 //! The `.cmf` container is untouched by all of this: the split is a
 //! property of the run, never of the file.
 
+pub mod beacon;
 pub mod client;
 pub mod nodestat;
 pub mod worker;
 
 pub use client::{generate_split, prefill_on_peer, RemoteSegment, SessionSpec, SplitStats};
+pub use beacon::{discover, Beacon, Found};
 pub use nodestat::NodeStats;
 pub use worker::{worker_serve, WorkerConfig};
 

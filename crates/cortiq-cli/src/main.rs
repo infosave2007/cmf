@@ -609,6 +609,19 @@ enum Commands {
         #[arg(long)]
         token: Option<String>,
     },
+    /// List `cortiq worker`s shouting on this network. A worker listening
+    /// beyond loopback announces itself every two seconds; this waits and
+    /// prints what answered, with the address to hand to `--peer`. The
+    /// beacon carries identity and geometry, never the token.
+    Peers {
+        /// Seconds to listen (a beacon repeats every 2)
+        #[arg(long, default_value_t = 3.0)]
+        wait: f64,
+        /// Only workers holding THIS model — the dir_hash must match or
+        /// the handshake would refuse anyway
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Freeze the current context into a `.cmfstate` (B2): the token prefix
     /// + active skill + seed + model fingerprint. Resume with `run --state`.
     Freeze {
@@ -1511,6 +1524,54 @@ async fn main() -> anyhow::Result<()> {
                 gpus,
             )
             .await
+        }
+        Commands::Peers { wait, model } => {
+            let mine = match model.as_deref() {
+                Some(p) => {
+                    let m = CmfModel::open_sharded(p)?;
+                    Some((format!("{:016x}", m.dir_hash()), p.to_string()))
+                }
+                None => None,
+            };
+            eprintln!("listening {wait:.0}s for workers…");
+            let found = cortiq_net::discover(std::time::Duration::from_secs_f64(wait))
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let shown: Vec<_> = found
+                .iter()
+                .filter(|f| mine.as_ref().is_none_or(|(h, _)| &f.beacon.dir_hash == h))
+                .collect();
+            if shown.is_empty() {
+                // Say which of the two silences this is.
+                if found.is_empty() {
+                    println!("no workers answered");
+                } else {
+                    println!(
+                        "{} worker(s) answered, none holding {}",
+                        found.len(),
+                        mine.map(|(_, p)| p).unwrap_or_default()
+                    );
+                }
+                return Ok(());
+            }
+            for f in shown {
+                let b = &f.beacon;
+                println!(
+                    "{:<22} {} | {}L hidden {} | dir_hash {} | wire v{}{}{}",
+                    f.peer_addr(),
+                    b.model,
+                    b.layers,
+                    b.hidden,
+                    b.dir_hash,
+                    b.wire,
+                    if b.token_required { " | token" } else { "" },
+                    if b.wire == cortiq_net::WIRE_VERSION {
+                        String::new()
+                    } else {
+                        format!(" | INCOMPATIBLE, this build speaks v{}", cortiq_net::WIRE_VERSION)
+                    },
+                );
+            }
+            Ok(())
         }
         Commands::Worker {
             model,
