@@ -55,6 +55,20 @@ pub fn worker_serve(cfg: WorkerConfig) -> Result<(), String> {
         cfg.listen
     );
 
+    // Shout on the LAN so a phone does not have to be told an address.
+    // Loopback has nobody to tell; a cable is one fixed address anyway.
+    if !loopback {
+        crate::beacon::announce(crate::beacon::beacon_for(
+            listener.local_addr().map(|a| a.port()).unwrap_or(0),
+            dir_hash,
+            &model.arch().arch_name,
+            pipeline.num_layers,
+            pipeline.hidden_size,
+            &cfg.model_path,
+            cfg.token.is_some(),
+        ));
+    }
+
     // The active overlay: rebuilding a pipeline is the STATIC skill path
     // (correct for every skill kind); the id is cached so a same-skill
     // session reuses the loaded one.
