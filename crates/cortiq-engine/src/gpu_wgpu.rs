@@ -3384,8 +3384,19 @@ fn q4v_hi4(w: u32) -> vec4<f32> {
 // — same weight traffic, same total unpack, twice the x re-reads — was
 // 52% SLOWER (FFN 20.39 against 13.40 ms, verify 68.5 against 53.1,
 // decode 42 against 51). Registers were not the wall; the 24 activation
-// vec4 a group-iteration are. The move that would pay is FEWER x loads
-// (f16 activations, or more rows a lane), never more.
+// vec4 a group-iteration are. The move that would pay is FEWER x loads,
+// never more.
+//
+// The next step, scoped and unblocked: f16 activations halve the load
+// COUNT (32 f32 a group is eight vec4; as f16 it is four). It cannot go
+// in this module — `enable f16` would make the whole of WGSL require
+// SHADER_F16, and this module has to compile on adapters without it —
+// so it wants its own source string next to COOP_MM_F16_SRC, built only
+// when the adapter reports the feature, which is the pattern those
+// kernels already follow. Worth ~0.8 ms per batch position, ~3.5% of a
+// speculative round. More rows a lane is the other direction and is
+// register-bound: 8 rows needs the packed weights (32), the
+// accumulators (32) and the unpacked window at once.
 @compute @workgroup_size(256)
 fn q4tp_matvec4_bku(@builtin(workgroup_id) wid: vec3<u32>,
                     @builtin(num_workgroups) nwg: vec3<u32>,
