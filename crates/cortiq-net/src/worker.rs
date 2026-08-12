@@ -5,8 +5,8 @@
 //! the wakeup from a cold blocking read costs more than the wire).
 
 use crate::{
-    recv_msg, send_control, send_hidden, send_token, send_tokens, Frame, Msg, O1Wire, WireDtype,
-    WIRE_VERSION,
+    recv_msg, send_control, send_hidden, send_kv, send_token, send_tokens, Frame, Msg, O1Wire,
+    WireDtype, WIRE_VERSION,
 };
 use cortiq_core::TaskMask;
 use cortiq_engine::pipeline::Pipeline;
@@ -364,6 +364,57 @@ fn serve_one(
                 send_control(&mut stream, &mut out, &Frame::Ack { err: String::new() })?;
             }
             Msg::Control(Frame::Ping) => send_control(&mut stream, &mut out, &Frame::Pong)?,
+            Msg::Control(Frame::KvFetch { from, upto }) => {
+                let (lo, hi) = (from as usize, upto as usize);
+                let Some((sfrom, supto)) = span else {
+                    return fatal(&mut stream, &mut out, "KvFetch before Assign".into());
+                };
+                if lo > hi || hi >= p.num_layers || lo < sfrom || hi > supto {
+                    send_control(
+                        &mut stream,
+                        &mut out,
+                        &Frame::Ack {
+                            err: format!(
+                                "KvFetch {lo}..={hi} outside my span {sfrom}..={supto}"
+                            ),
+                        },
+                    )?;
+                    continue;
+                }
+                // Probe the first layer before promising anything: the
+                // refusal conditions (q8 storage, an o1 overlay, frozen
+                // columns) are set the same way for every layer, so one
+                // check speaks for the range — and a refusal must arrive
+                // as an Ack, not as a truncated stream.
+                if let Err(e) = p.kv_cache.layers[lo].export_wire(dtype == WireDtype::F16) {
+                    send_control(&mut stream, &mut out, &Frame::Ack { err: e })?;
+                    continue;
+                }
+                send_control(&mut stream, &mut out, &Frame::Ack { err: String::new() })?;
+                let mut sent = 0usize;
+                for li in lo..=hi {
+                    let payload = match p.kv_cache.layers[li].export_wire(dtype == WireDtype::F16)
+                    {
+                        Ok(b) => b,
+                        // Past the Ack there is no way to refuse politely:
+                        // a short stream would look like a complete one.
+                        Err(e) => {
+                            return fatal(
+                                &mut stream,
+                                &mut out,
+                                format!("kv export failed at layer {li}: {e}"),
+                            );
+                        }
+                    };
+                    sent += payload.len();
+                    send_kv(&mut stream, &mut out, li as u32, &payload)?;
+                }
+                eprintln!(
+                    "worker: shipped layers {lo}..={hi} of KV, {:.1} MB as {:?}",
+                    sent as f64 / 1e6,
+                    dtype
+                );
+            }
             Msg::Control(Frame::Stats) => {
                 let st = crate::nodestat::read(cortiq_engine::pool::Pool::effective_threads());
                 send_control(&mut stream, &mut out, &Frame::StatsReply(st))?;
