@@ -5,7 +5,8 @@
 //! return per the roadmap once this one is measured.
 
 use crate::{
-    recv_msg, send_control, send_prefill, send_step, Frame, Msg, O1Wire, WireDtype, WIRE_VERSION,
+    recv_msg, send_control, send_prefill, send_step, send_step_id, Frame, Msg, O1Wire, WireDtype,
+    WIRE_VERSION,
 };
 use cortiq_core::TaskMask;
 use cortiq_engine::pipeline::{GenerateResult, Pipeline, TokenCallback};
@@ -22,6 +23,14 @@ pub struct SessionSpec {
     pub task: Option<String>,
     /// O(1)-attention config (worker mirrors it over its span).
     pub o1: Option<O1Wire>,
+    /// v5: hand the worker the final norm + lm_head + sampler. It answers
+    /// token ids, so the coordinator's per-token cost drops to detokenizing
+    /// — measured worth 29 ms of a 73 ms token on an Android coordinator.
+    /// Requires the worker to hold the last layer.
+    pub head: bool,
+    /// v5 head mode: the coordinator's `SamplerConfig` as JSON, so the far
+    /// side samples with the caller's settings and not its defaults.
+    pub sampler: Option<String>,
 }
 
 pub struct RemoteSegment {
@@ -34,6 +43,8 @@ pub struct RemoteSegment {
     pub dtype: WireDtype,
     /// Accumulated wall time inside round trips (the wire + remote compute).
     pub net_s: f64,
+    /// v5: the worker owns the head and answers token ids.
+    pub head: bool,
     raw: Vec<u8>,
     floats: Vec<f32>,
 }
@@ -66,6 +77,7 @@ impl RemoteSegment {
             upto,
             dtype,
             net_s: 0.0,
+            head: spec.head,
             raw: Vec::with_capacity(64 * 1024),
             floats: Vec::new(),
         };
@@ -85,6 +97,8 @@ impl RemoteSegment {
             skill: spec.skill.clone(),
             task: spec.task.clone(),
             o1: spec.o1.clone(),
+            head: spec.head,
+            sampler: spec.sampler.clone(),
         })?;
         rs.expect_ack("assign")?;
         Ok(rs)
@@ -175,6 +189,66 @@ impl RemoteSegment {
         self.expect_hidden()?;
         self.net_s += t.elapsed().as_secs_f64();
         Ok(&self.floats)
+    }
+
+    /// What the worker is worth right now — thermal state, mains power,
+    /// the clock its fastest core is actually running at. The planner
+    /// reads this instead of trusting a number measured at connect time.
+    pub fn stats(&mut self) -> Result<crate::NodeStats, String> {
+        self.send_ctl(&Frame::Stats)?;
+        match self.recv(false)? {
+            Msg::Control(Frame::StatsReply(s)) => Ok(s),
+            other => Err(format!(
+                "worker {}: expected StatsReply, got {other:?}",
+                self.addr
+            )),
+        }
+    }
+
+    /// Head mode: hand the worker the id history its repetition penalty
+    /// reads. Once per generation, before the first sample.
+    pub fn send_ids(&mut self, ids: &[u32]) -> Result<(), String> {
+        self.send_ctl(&Frame::Ids { ids: ids.to_vec() })?;
+        self.expect_ack("ids")
+    }
+
+    fn expect_token(&mut self) -> Result<u32, String> {
+        match self.recv(true)? {
+            Msg::Token { id } => Ok(id),
+            other => Err(format!("worker {}: expected Token, got {other:?}", self.addr)),
+        }
+    }
+
+    /// Head mode: the prefill barrier returns the FIRST sampled token
+    /// rather than a boundary hidden — the worker owns the sampler.
+    pub fn sync_token(&mut self) -> Result<u32, String> {
+        self.send_ctl(&Frame::Sync)?;
+        self.expect_token()
+    }
+
+    /// Head mode with a local span: boundary hidden out, token id back.
+    pub fn step_token(&mut self, pos: usize, hidden: &[f32]) -> Result<u32, String> {
+        let t = Instant::now();
+        let mut raw = std::mem::take(&mut self.raw);
+        let r = send_step(&mut self.stream, &mut raw, self.dtype, pos as u64, hidden);
+        self.raw = raw;
+        r?;
+        let id = self.expect_token()?;
+        self.net_s += t.elapsed().as_secs_f64();
+        Ok(id)
+    }
+
+    /// Head mode with the worker holding every layer: the id goes out and
+    /// the next id comes back. Sixteen bytes of wire for a whole token.
+    pub fn step_id(&mut self, pos: usize, id: u32) -> Result<u32, String> {
+        let t = Instant::now();
+        let mut raw = std::mem::take(&mut self.raw);
+        let r = send_step_id(&mut self.stream, &mut raw, pos as u64, id);
+        self.raw = raw;
+        r?;
+        let next = self.expect_token()?;
+        self.net_s += t.elapsed().as_secs_f64();
+        Ok(next)
     }
 }
 
@@ -278,7 +352,18 @@ pub fn generate_split(
     // Prompt absorbed on the local span — freeze o1 skeletons exactly
     // where the local path would; the worker seals at Sync.
     p.o1_seal();
-    let last_hidden = remote.sync()?.to_vec();
+    // Head mode samples on the worker, so it needs the prompt ids its
+    // repetition penalty reads BEFORE the barrier that samples token one.
+    let first_token = if remote.head {
+        remote.send_ids(input_ids)?;
+        Some(remote.sync_token()?)
+    } else {
+        None
+    };
+    let last_hidden = match first_token {
+        Some(_) => Vec::new(),
+        None => remote.sync()?.to_vec(),
+    };
     let prefill_s = t_prefill.elapsed().as_secs_f64();
     // From here net_s counts DECODE round trips only — the honest share.
     remote.net_s = 0.0;
@@ -291,8 +376,13 @@ pub fn generate_split(
     let mut finish_reason = "max_tokens".to_string();
     let mut remote_steps = 0usize;
 
-    let mut logits = p.logits_from_hidden(&last_hidden);
-    let mut next = p.sample_next(&logits, &all_ids);
+    let mut next = match first_token {
+        Some(id) => id,
+        None => {
+            let logits = p.logits_from_hidden(&last_hidden);
+            p.sample_next(&logits, &all_ids)
+        }
+    };
     let mut next_pos = input_ids.len();
 
     while token_ids.len() < max_tokens {
@@ -319,17 +409,27 @@ pub fn generate_split(
             break;
         }
 
-        let emb = p.embed_id(next);
-        let boundary = if split > 0 {
-            p.forward_span(&emb, next_pos, 0, split - 1, task_mask)?
+        if remote.head && split == 0 {
+            // Thin client: the worker embeds, runs every layer, and
+            // samples. Sixteen bytes of wire and no matmul on this side.
+            next = remote.step_id(next_pos, next)?;
         } else {
-            emb
-        };
-        remote.step(next_pos, &boundary)?;
+            let emb = p.embed_id(next);
+            let boundary = if split > 0 {
+                p.forward_span(&emb, next_pos, 0, split - 1, task_mask)?
+            } else {
+                emb
+            };
+            if remote.head {
+                next = remote.step_token(next_pos, &boundary)?;
+            } else {
+                remote.step(next_pos, &boundary)?;
+                let logits = p.logits_from_hidden(&remote.floats);
+                next = p.sample_next(&logits, &all_ids);
+            }
+        }
         remote_steps += 1;
         next_pos += 1;
-        logits = p.logits_from_hidden(&remote.floats);
-        next = p.sample_next(&logits, &all_ids);
     }
 
     let decode_s = t_decode.elapsed().as_secs_f64();

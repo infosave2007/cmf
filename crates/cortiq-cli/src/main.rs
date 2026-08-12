@@ -562,6 +562,13 @@ enum Commands {
         /// bytes (hidden states tolerate it; measure your model).
         #[arg(long, default_value = "f32", requires = "peer")]
         net_dtype: String,
+        /// Hand the peer the final norm, lm_head and sampler: it answers
+        /// token ids instead of hidden states. The head does not shrink
+        /// with --peer-split, so on a weak coordinator it is the floor —
+        /// worth 29 ms of a 73 ms token on an Android phone. With
+        /// --peer-split 0 the whole per-token wire becomes 16 bytes.
+        #[arg(long, requires = "peer")]
+        peer_head: bool,
         /// Split the layer stack across N local GPUs, in ONE process:
         /// segment i runs pinned to card i and only a hidden vector
         /// crosses the boundary. This is the CAPACITY mode — for a
@@ -652,6 +659,10 @@ enum Commands {
         /// Wire dtype: f32 (bit-exact) | f16
         #[arg(long, default_value = "f32")]
         net_dtype: String,
+        /// Give the peer the final norm, lm_head and sampler: it answers
+        /// token ids. Measures the thin-client topology.
+        #[arg(long)]
+        peer_head: bool,
         /// Core timing (llama-bench contract): greedy argmax without a
         /// working copy, no repetition penalty, no per-token confidence
         /// softmax. Default (off) measures the full production loop.
@@ -1441,6 +1452,7 @@ async fn main() -> anyhow::Result<()> {
             peer_split,
             net_token,
             net_dtype,
+            peer_head,
             gpus,
         } => {
             let o1 = O1Flags {
@@ -1473,6 +1485,7 @@ async fn main() -> anyhow::Result<()> {
                 peer_split,
                 net_token.as_deref(),
                 &net_dtype,
+                peer_head,
                 gpus,
             )
             .await
@@ -1648,6 +1661,7 @@ async fn main() -> anyhow::Result<()> {
             peer_split,
             net_token,
             net_dtype,
+            peer_head,
             core,
             o1,
             o1_m,
@@ -1674,6 +1688,7 @@ async fn main() -> anyhow::Result<()> {
                 peer_split,
                 net_token.as_deref(),
                 &net_dtype,
+                peer_head,
                 gpus,
             ).await
         }
@@ -2910,6 +2925,7 @@ async fn cmd_run(
     peer_split: Option<usize>,
     net_token: Option<&str>,
     net_dtype: &str,
+    peer_head: bool,
     gpus: Option<usize>,
 ) -> anyhow::Result<()> {
     println!("Loading model: {}", model_path);
@@ -3112,8 +3128,17 @@ async fn cmd_run(
                 sink: o1.sink.map(|v| v as u32),
                 rect: o1.rect.clone(),
             }),
+            head: peer_head,
+            // The far side must sample with THIS run's settings —
+            // greedy here and a default temperature there would be a
+            // different answer with no error anywhere.
+            sampler: if peer_head {
+                Some(serde_json::to_string(&pipeline.sampler_config)?)
+            } else {
+                None
+            },
         };
-        let rs = cortiq_net::RemoteSegment::connect(
+        let mut rs = cortiq_net::RemoteSegment::connect(
             addr,
             net_token.unwrap_or(""),
             runtime.model().dir_hash(),
@@ -3126,10 +3151,23 @@ async fn cmd_run(
             &spec,
         )
         .map_err(|e| anyhow::anyhow!(e))?;
+        // What the peer is worth RIGHT NOW, not what it was worth once.
+        // A phone whose governor let the clock fall serves the same span
+        // at half the speed with no temperature change, so the clock
+        // percentage here is the first thing to read when a split is slow.
+        match rs.stats() {
+            Ok(st) => println!("peer state: {}", st.summary()),
+            Err(e) => eprintln!("peer state: unavailable ({e})"),
+        }
         println!(
             "peer {addr}: layers {split}..{} remote, 0..{split} local \
-             (embed/head/sampler local), wire {net_dtype}{}{}{}",
+             ({}), wire {net_dtype}{}{}{}",
             nl - 1,
+            if peer_head {
+                "head/sampler REMOTE — this side only tokenizes"
+            } else {
+                "embed/head/sampler local"
+            },
             spec.skill
                 .as_deref()
                 .map(|s| format!(", skill {s}"))
@@ -4117,6 +4155,7 @@ async fn cmd_bench(
     peer_split: Option<usize>,
     net_token: Option<&str>,
     net_dtype: &str,
+    peer_head: bool,
     gpus: Option<usize>,
 ) -> anyhow::Result<()> {
     if !json {
@@ -4211,6 +4250,12 @@ async fn cmd_bench(
             skill: None,
             task: mask.as_ref().map(|_| task.to_string()),
             o1: None,
+            head: peer_head,
+            sampler: if peer_head {
+                Some(serde_json::to_string(&pipeline.sampler_config)?)
+            } else {
+                None
+            },
         };
         let mut rs = cortiq_net::RemoteSegment::connect(
             addr,
