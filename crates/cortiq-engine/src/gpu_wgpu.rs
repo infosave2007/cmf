@@ -3374,6 +3374,18 @@ fn q4v_hi4(w: u32) -> vec4<f32> {
 // registers, and an earlier attempt that did something close to it lost
 // outright: occupancy hides load latency, and this kernel still has to
 // stream weights while it computes.
+//
+// WHAT BINDS IT NOW IS THE ACTIVATION LOADS, not registers — measured,
+// and the opposite of what was assumed. At b=3 this arm leaves the FFN
+// at 237 us a layer where the weight stream alone needs 139 and the
+// arithmetic 123, and the obvious suspect was register pressure (peak
+// ~68 against the one-vector kernel's ~40, so half the resident
+// workgroups). A variant that unpacked ROW PAIRS to halve the live set
+// — same weight traffic, same total unpack, twice the x re-reads — was
+// 52% SLOWER (FFN 20.39 against 13.40 ms, verify 68.5 against 53.1,
+// decode 42 against 51). Registers were not the wall; the 24 activation
+// vec4 a group-iteration are. The move that would pay is FEWER x loads
+// (f16 activations, or more rows a lane), never more.
 @compute @workgroup_size(256)
 fn q4tp_matvec4_bku(@builtin(workgroup_id) wid: vec3<u32>,
                     @builtin(num_workgroups) nwg: vec3<u32>,
