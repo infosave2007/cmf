@@ -7,6 +7,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.69] - 2026-08-12
+
+**Speculative decode stopped costing money and started making it, and the
+27B's decode is now known to be bus-bound — proven three ways, so nobody
+spends another day tuning that matvec.** The headline speed number is
+small and said so plainly: on an RTX 5090 the production loop goes 43.6
+→ 44.3 tok/s and greedy 48.2 → 49.0. Greedy with speculation goes 43.6 →
+**51.1**, which is the real result: that path was an 11% LOSS and is now
+a win.
+
+| Qwen3.6-27B q4tp, RTX 5090, medians of three | before | now |
+|---|---|---|
+| production loop (full sampler) | 43.6 | 44.3 |
+| greedy | 48.2 | 49.0 |
+| greedy + `CMF_GRAPH_SPEC=1` | 43.6 | **51.1** |
+| batched FFN in a k=2 verify | 15.05 ms | **11.15 ms** |
+| speculative verify round | 53.3 ms | **45.9 ms** |
+
+### Added
+- **`CMF_MV_PROBE` — the quad-row matvec with its arithmetic taken
+  out, and the answer it gives: the decode is the weight stream and
+  nothing else.** Bit 1 drops the nibble unpack and the per-weight FMA,
+  +2 the activation loads, +4 the code-plane loads, +8 the cross-lane
+  reduction. Stripped to nothing but weight loads the token goes 17.68
+  → **16.95 ms** — four percent. The answers are garbage on purpose;
+  the time is the point.
+
+- **`q4tp_matvec4_bku` (`CMF_MV_BK`, default 2): a batched matvec that
+  unpacks each packed u32 ONCE and multiplies it by every activation
+  vector.** At b=1 a dense FFN layer needs 8.9 ms of weight stream
+  against 6.3 ms of arithmetic, so the arithmetic hides; at b=3 the
+  stream still needs 6.5 while the arithmetic needs 13.8, dead linear in
+  batch, because the fused unpack-and-multiply redid the unpack per
+  element. Sharing it: batched FFN 15.05 → 11.15 ms, verify round 53.3
+  → 45.9. It also carries batches past four now, in chunks of four — a
+  k=4 draft verifies five positions, fell off the kernel entirely and
+  paid five weight reads, and measured slower than k=3 for that reason
+  alone (43.8 → 50.0).
+
+- **The speculative round's third phase is timed, and the submissions
+  each phase pays are counted** (`CMF_GRAPH_SPEC_TIME`). Draft and
+  verify did not add up to the round; the commit — the MTP block re-run
+  once per accepted token — is 5.4 ms of 68. It earns it:
+  `CMF_SPEC_WARM=0` skips it and acceptance falls 89% → 81% at k=3.
+
+### Changed
+- **`CMF_GRAPH_SPLIT` defaults to 16, i.e. four-layer submit chunks**
+  (49.5 vs 48.4 tok/s, medians of three). Every setting above 16 is the
+  same configuration once the four-layer floor binds — and five such
+  settings measured 44.8/44.7/44.7/44.7/49.4, which is this stand's
+  honest spread on a single end-to-end run and the reason every number
+  here is a median. GPU timestamps are steady to 0.3%; tok/s is not.
+- **`CMF_GRAPH_SPEC_K` defaults to 3**, measured: k=2 46.1, k=3 51.1,
+  k=4 50.0, k=5 47.4, k=6 45.2, with acceptance 89-91% throughout. What
+  turns the curve over is the verify at ~7.4 ms per extra position, not
+  the draft quality. Speculation itself stays opt-in — the greedy
+  continuation is byte-identical to the plain path on this model, but
+  one architecture is not grounds for changing what every greedy decode
+  does.
+- The batched graph shares the token graph's content-addressed constant
+  buffer cache instead of minting a fresh device buffer per norm weight
+  per call. Measured null on time (52.5-53.6 ms verify against
+  52.5-53.9) and kept for being strictly less work, not for being
+  faster.
+
+### Fixed
+- **The sampler allocated a second whole-vocab copy every token.**
+  `apply_top_k` needs its own buffer because `select_nth_unstable`
+  permutes, but it took a fresh one each call — a megabyte at Qwen3.6's
+  248320 vocab, on the decode hot path, next to the `probs` copy that
+  had already been moved into the scratch struct for exactly this
+  reason. Production loop 44.3 → 45.1 tok/s in isolation.
+- **`--no-default-features` did not compile.** The manifest documents it
+  as the CPU-only build; `Commands::Gpu` called into `gpu_wgpu`
+  unconditionally and that module is behind the `gpu` feature.
+
+### Measured and rejected
+Recorded with their numbers in `GPU_KERNEL_RECIPES.md` so they are not
+re-walked:
+- Persistent grids for the matvecs (`CMF_MV_GRID`): 17.66 → 17.67 ms a
+  token; one workgroup per SM is worse at 20.81.
+- Halving the batch kernel's live registers by unpacking row pairs: 52%
+  SLOWER (FFN 13.40 → 20.39 ms). Registers were never the wall — the
+  activation loads are, which is the opposite of the hypothesis.
+- Unpacking into f32 registers before the batch loop: fewer ALU ops and
+  still a loss, because 32 registers of dequantized weight crowd out the
+  occupancy that hides load latency.
+- Lowering `par_copy`'s threshold so the per-token logit readback splits
+  across threads: 44.4 → 42.5 tok/s. `thread::scope` spawns fresh OS
+  threads per call.
+- `CMF_MULTISTEP` (k frames a submit, on-device argmax) on this model:
+  29 tok/s against 49.
+
+### Retracted
+- "The matvec runs at 63% of the card's peak, so there is headroom" —
+  there is not. Two decode processes on one 5090 aggregate 52.8 tok/s
+  against a single process's 48.8: one stream already saturates ~92% of
+  what two can pull, and 1056 GB/s is the bus for this access pattern.
+- "Half of a speculative verify is host command encoding" — the batch
+  graph's encode timer includes queue backpressure from its own chunked
+  submissions, so encode-vs-k came out 16.2/29.0/17.1 ms with no shape
+  at all. Against GPU timestamps the verify is ~86% device.
+- The bench's `Pair: 2 singles 38.56 ms vs fused 1641.00 ms` is not a
+  bug in serve. `measure_pair_fusion` compares device singles against
+  the HOST pair walk; all three production callers of `forward_pair` are
+  already behind graph guards.
+
 ## [0.5.68] - 2026-08-11
 
 **A render is 7.5× faster than it was this morning: 716.6 s → 91.6 s at
