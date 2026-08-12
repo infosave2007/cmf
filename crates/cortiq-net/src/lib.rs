@@ -24,9 +24,11 @@
 //! property of the run, never of the file.
 
 pub mod client;
+pub mod nodestat;
 pub mod worker;
 
 pub use client::{generate_split, RemoteSegment, SessionSpec, SplitStats};
+pub use nodestat::NodeStats;
 pub use worker::{worker_serve, WorkerConfig};
 
 use cortiq_core::quant::{f16_to_f32, f32_to_f16};
@@ -41,7 +43,17 @@ use std::net::TcpStream;
 /// v4: Assign carries the SESSION SPEC — skill overlay id, task-mask
 /// name and O(1)-attention config — so both sides run the same model
 /// configuration, each over its own layers.
-pub const WIRE_VERSION: u32 = 4;
+/// v5: the HEAD can live on the worker (`Assign.head`). The worker then
+/// runs final norm + lm_head + sampler and answers a token ID instead of
+/// a boundary hidden — measured on an Android coordinator, the head cost
+/// 29 ms of a 73 ms token and does not shrink with the split, so a phone
+/// driving a desktop was capped by its own head no matter how fast the
+/// desktop ran. Sampling on the worker needs the id history the
+/// repetition penalty reads, so `Ids` ships the prompt ids once per
+/// generation; the worker appends what it samples. With `from == 0` the
+/// coordinator sends `StepId` (12 bytes) instead of a hidden and the
+/// worker embeds — the whole per-token wire becomes 16 bytes.
+pub const WIRE_VERSION: u32 = 5;
 
 // Prefill chunking follows the engine's `pipeline::prefill_chunk()` —
 // panel width reorders float accumulation, so the network split MUST
@@ -57,6 +69,9 @@ const TAG_HIDDEN_F32: u8 = 3;
 const TAG_HIDDEN_F16: u8 = 4;
 const TAG_PREFILL_F32: u8 = 5;
 const TAG_PREFILL_F16: u8 = 6;
+/// Head-on-worker frames (v5): a token id each way, dtype-free.
+const TAG_STEP_ID: u8 = 7;
+const TAG_TOKEN: u8 = 8;
 
 /// Payload float width on the wire. f32 is bit-exact; f16 halves the
 /// frames and is negotiated EXPLICITLY in Assign — never a silent default.
@@ -109,7 +124,20 @@ pub enum Frame {
         skill: Option<String>,
         task: Option<String>,
         o1: Option<O1Wire>,
+        /// v5: the worker owns final norm + lm_head + sampler and answers
+        /// token ids. Refused unless it holds the LAST layer.
+        head: bool,
+        /// v5, head mode: the coordinator's `SamplerConfig` as JSON. The
+        /// worker MUST sample with the caller's settings — a default
+        /// temperature on the far side would silently rewrite the answer.
+        /// JSON rather than the struct so adding a sampler field cannot
+        /// change the frame encoding behind the version check.
+        sampler: Option<String>,
     },
+    /// v5, head mode only: the id history the sampler's repetition
+    /// penalty reads. Sent once per generation, before the first Step;
+    /// the worker appends every id it samples after that.
+    Ids { ids: Vec<u32> },
     /// Fresh sequence on the worker (clears its KV and state).
     Reset,
     /// Prefill barrier: the worker replies `Hidden` with the output of
@@ -117,6 +145,11 @@ pub enum Frame {
     Sync,
     Ping,
     Pong,
+    /// v5: ask the worker what it is worth right now. Cheap enough to
+    /// send between turns; the answer is measured, never declared.
+    Stats,
+    /// v5: the worker's live capacity signals.
+    StatsReply(crate::nodestat::NodeStats),
     /// Fatal worker-side error; the connection closes after this frame.
     Err { msg: String },
 }
@@ -140,6 +173,11 @@ pub enum Msg {
     Step { pos: u64 },
     Hidden,
     Prefill { start_pos: u64, count: u32 },
+    /// v5: decode step carrying the token id itself — only legal when the
+    /// worker holds layer 0 and does the embedding.
+    StepId { pos: u64, id: u32 },
+    /// v5: the worker's sampled token.
+    Token { id: u32 },
 }
 
 fn spin_budget_us() -> u64 {
@@ -286,6 +324,27 @@ pub fn send_hidden(
     ship(stream, raw)
 }
 
+/// v5 head mode with the worker holding layer 0: the id goes out, the
+/// worker embeds it. Twelve bytes where a hidden was kilobytes.
+pub fn send_step_id(
+    stream: &mut TcpStream,
+    raw: &mut Vec<u8>,
+    pos: u64,
+    id: u32,
+) -> Result<(), String> {
+    begin(raw, TAG_STEP_ID);
+    raw.extend_from_slice(&pos.to_le_bytes());
+    raw.extend_from_slice(&id.to_le_bytes());
+    ship(stream, raw)
+}
+
+/// v5 head mode: the worker's sampled token, four bytes.
+pub fn send_token(stream: &mut TcpStream, raw: &mut Vec<u8>, id: u32) -> Result<(), String> {
+    begin(raw, TAG_TOKEN);
+    raw.extend_from_slice(&id.to_le_bytes());
+    ship(stream, raw)
+}
+
 pub fn send_prefill(
     stream: &mut TcpStream,
     raw: &mut Vec<u8>,
@@ -370,6 +429,23 @@ pub fn recv_msg(
                 start_pos: rd_u64(body),
                 count: rd_u32(&body[8..]),
             }))
+        }
+        TAG_STEP_ID => {
+            if body.len() < 12 {
+                return Err("StepId frame truncated".into());
+            }
+            floats.clear();
+            Ok(Some(Msg::StepId {
+                pos: rd_u64(body),
+                id: rd_u32(&body[8..]),
+            }))
+        }
+        TAG_TOKEN => {
+            if body.len() < 4 {
+                return Err("Token frame truncated".into());
+            }
+            floats.clear();
+            Ok(Some(Msg::Token { id: rd_u32(body) }))
         }
         other => Err(format!("unknown frame tag {other}")),
     }

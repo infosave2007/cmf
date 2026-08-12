@@ -4,7 +4,9 @@
 //! request/reply per token (with a bounded busy-poll before each read:
 //! the wakeup from a cold blocking read costs more than the wire).
 
-use crate::{recv_msg, send_control, send_hidden, Frame, Msg, O1Wire, WireDtype, WIRE_VERSION};
+use crate::{
+    recv_msg, send_control, send_hidden, send_token, Frame, Msg, O1Wire, WireDtype, WIRE_VERSION,
+};
 use cortiq_core::TaskMask;
 use cortiq_engine::pipeline::Pipeline;
 use cortiq_engine::sampler::SamplerConfig;
@@ -142,6 +144,16 @@ fn apply_spec(
     }
 }
 
+/// Head mode: final norm + lm_head + sampler, exactly the three steps the
+/// coordinator would have run, in the same order and off the same
+/// history — so greedy text is identical to the head-local split.
+fn sample_here(p: &mut Pipeline, hist: &mut Vec<u32>, hidden: &[f32]) -> u32 {
+    let logits = p.logits_from_hidden(hidden);
+    let id = p.sample_next(&logits, hist);
+    hist.push(id);
+    id
+}
+
 fn serve_one(
     model: &std::sync::Arc<cortiq_core::CmfModel>,
     p: &mut Pipeline,
@@ -218,6 +230,11 @@ fn serve_one(
     let mut dtype = WireDtype::F32;
     let mut mask: Option<TaskMask> = None;
     let mut last_prefill: Vec<f32> = Vec::new();
+    // v5: head mode — we own final norm + lm_head + sampler, and `hist`
+    // is the id history the repetition penalty reads (prompt via `Ids`,
+    // then every id we sample).
+    let mut head = false;
+    let mut hist: Vec<u32> = Vec::new();
     let hs = p.hidden_size;
     let fatal = |stream: &mut TcpStream, out: &mut Vec<u8>, msg: String| -> Result<(), String> {
         let _ = send_control(stream, out, &Frame::Err { msg: msg.clone() });
@@ -238,6 +255,8 @@ fn serve_one(
                 skill,
                 task,
                 o1,
+                head: want_head,
+                sampler,
             }) => {
                 let (from, upto) = (from as usize, upto as usize);
                 if from > upto || upto >= p.num_layers {
@@ -257,6 +276,21 @@ fn serve_one(
                         continue;
                     }
                 };
+                // The head sits after the LAST layer: a worker that does
+                // not hold it cannot produce logits. Refuse loudly.
+                if want_head && upto + 1 != p.num_layers {
+                    send_control(
+                        &mut stream,
+                        &mut out,
+                        &Frame::Ack {
+                            err: format!(
+                                "head requested but my span ends at {upto}, not the last layer {}",
+                                p.num_layers - 1
+                            ),
+                        },
+                    )?;
+                    continue;
+                }
                 match apply_spec(model, p, cur_skill, &skill, &task, &o1) {
                     Ok(m) => mask = m,
                     Err(e) => {
@@ -264,9 +298,31 @@ fn serve_one(
                         continue;
                     }
                 }
+                // apply_spec may have rebuilt the pipeline with a skill —
+                // the sampler config has to land AFTER that, or a reload
+                // silently restores the default temperature.
+                if want_head {
+                    let json = sampler.as_deref().unwrap_or("{}");
+                    match serde_json::from_str::<SamplerConfig>(json) {
+                        Ok(cfg) => p.set_sampler_config(cfg),
+                        Err(e) => {
+                            send_control(
+                                &mut stream,
+                                &mut out,
+                                &Frame::Ack {
+                                    err: format!("sampler config: {e}"),
+                                },
+                            )?;
+                            continue;
+                        }
+                    }
+                }
+                head = want_head;
+                hist.clear();
                 span = Some((from, upto));
                 eprintln!(
-                    "worker: assigned layers {from}..={upto}, wire {dtype:?}, skill {}, task {}, o1 {}",
+                    "worker: assigned layers {from}..={upto}, wire {dtype:?}, head {}, skill {}, task {}, o1 {}",
+                    if head { "mine" } else { "coordinator's" },
                     skill.as_deref().unwrap_or("—"),
                     task.as_deref().unwrap_or("—"),
                     o1.as_ref().map(|w| w.spec.as_str()).unwrap_or("—"),
@@ -277,9 +333,21 @@ fn serve_one(
                 p.reset_session();
                 p.o1_begin();
                 last_prefill.clear();
+                hist.clear();
+                send_control(&mut stream, &mut out, &Frame::Ack { err: String::new() })?;
+            }
+            Msg::Control(Frame::Ids { ids }) => {
+                if !head {
+                    return fatal(&mut stream, &mut out, "Ids without head mode".into());
+                }
+                hist = ids;
                 send_control(&mut stream, &mut out, &Frame::Ack { err: String::new() })?;
             }
             Msg::Control(Frame::Ping) => send_control(&mut stream, &mut out, &Frame::Pong)?,
+            Msg::Control(Frame::Stats) => {
+                let st = crate::nodestat::read(cortiq_engine::pool::Pool::effective_threads());
+                send_control(&mut stream, &mut out, &Frame::StatsReply(st))?;
+            }
             // Fire-and-forget: the coordinator streams chunks and computes
             // its next one while we chew this one; `Sync` is the barrier.
             Msg::Prefill { start_pos, count } => {
@@ -308,14 +376,52 @@ fn serve_one(
                 // Prompt absorbed on our span — freeze the o1 skeletons
                 // exactly where the local path would (post-prefill).
                 p.o1_seal();
-                send_hidden(&mut stream, &mut out, dtype, &last_prefill)?;
+                if head {
+                    // The first token of the generation is sampled here,
+                    // from the last prefill position — the coordinator
+                    // never sees a hidden in this mode.
+                    let id = sample_here(p, &mut hist, &last_prefill);
+                    send_token(&mut stream, &mut out, id)?;
+                } else {
+                    send_hidden(&mut stream, &mut out, dtype, &last_prefill)?;
+                }
             }
             Msg::Step { pos } => {
                 let Some((from, upto)) = span else {
                     return fatal(&mut stream, &mut out, "Step before Assign".into());
                 };
                 match p.forward_span(&floats, pos as usize, from, upto, mask.as_ref()) {
-                    Ok(h) => send_hidden(&mut stream, &mut out, dtype, &h)?,
+                    Ok(h) => {
+                        if head {
+                            let h = h.to_vec();
+                            let id = sample_here(p, &mut hist, &h);
+                            send_token(&mut stream, &mut out, id)?;
+                        } else {
+                            send_hidden(&mut stream, &mut out, dtype, &h)?;
+                        }
+                    }
+                    Err(e) => return fatal(&mut stream, &mut out, e),
+                }
+            }
+            // v5: the coordinator kept only the tokenizer — it ships the
+            // id, we embed it ourselves. Legal only when we hold layer 0.
+            Msg::StepId { pos, id } => {
+                let Some((from, upto)) = span else {
+                    return fatal(&mut stream, &mut out, "StepId before Assign".into());
+                };
+                if !head || from != 0 {
+                    let msg = format!(
+                        "StepId needs head mode and layer 0 (head {head}, span starts at {from})"
+                    );
+                    return fatal(&mut stream, &mut out, msg);
+                }
+                let emb = p.embed_id(id);
+                match p.forward_span(&emb, pos as usize, from, upto, mask.as_ref()) {
+                    Ok(h) => {
+                        let h = h.to_vec();
+                        let id = sample_here(p, &mut hist, &h);
+                        send_token(&mut stream, &mut out, id)?;
+                    }
                     Err(e) => return fatal(&mut stream, &mut out, e),
                 }
             }
