@@ -4,9 +4,18 @@
 //! fluent text, so nothing looks broken until someone measures quality. This
 //! pins each backend's kernel to `dequant_q4tp`, the format's definition.
 //!
-//! The two tests select their backend through `CMF_GPU`, which cargo's
-//! threads share. Their contexts are independent `OnceLock`s so both do run,
-//! but a backend that fails to come up says so on stderr rather than passing
+//! The tests select their backend through `CMF_GPU`, which is
+//! process-global — and so are the wgpu context and its scratch slots. Run
+//! in parallel they hand each other the same `q4tpmm-stage` buffer, and a
+//! submit lands while the other thread still has it mapped: CI caught
+//! exactly that ("Buffer with 'q4tpmm-stage' label is still mapped"), and
+//! the poisoned scratch mutex then turned one failure into three. The
+//! engine is single-stream by contract (one caller at a time); the parallel
+//! harness is what breaks it, so every test here takes `gpu_serial()`
+//! first. The guard recovers from poisoning on purpose — a real failure
+//! must be reported once, not smeared over its neighbours.
+//!
+//! A backend that fails to come up says so on stderr rather than passing
 //! quietly — check for "skipped" before trusting a green combined run.
 
 use cortiq_core::format::{CMF_VERSION, CmfHeader, CmfModel, TensorSpec};
@@ -14,6 +23,13 @@ use cortiq_core::quant::{
     GROUP_SIZE, dequant_q4tp, f32_to_f16, q4tp_code_stride, q4tp_put_code, q4tp_sections,
 };
 use cortiq_core::types::{ModelArch, QuantType, TensorDtype};
+
+/// Serialize every GPU test in this binary: see the module note. Poison is
+/// recovered, so the first failure is the only failure reported.
+fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Random nibbles plus a per-row ladder whose span varies row to row, so the
 /// codes cover the full 0..31 range instead of clustering on one rung.
@@ -138,6 +154,7 @@ fn check(
 #[cfg(target_os = "macos")]
 #[test]
 fn metal_q4tp_matvec_matches_dequant_reference() {
+    let _gpu = gpu_serial();
     unsafe { std::env::set_var("CMF_GPU", "1") };
     // NOT a silent skip. A broken MSL kernel makes ctx() fail, Metal falls
     // back to CPU, and `enabled()` goes false — so an early return here turns
@@ -155,6 +172,7 @@ fn metal_q4tp_matvec_matches_dequant_reference() {
 #[cfg(feature = "gpu")]
 #[test]
 fn wgpu_q4tp_matvec_matches_dequant_reference() {
+    let _gpu = gpu_serial();
     unsafe { std::env::set_var("CMF_GPU", "wgpu") };
     if !cortiq_engine::gpu_wgpu::enabled() {
         eprintln!("skipped: no wgpu adapter");
@@ -173,6 +191,7 @@ fn wgpu_q4tp_matvec_matches_dequant_reference() {
 #[cfg(feature = "gpu")]
 #[test]
 fn wgpu_q4tp_matvec_batch_matches_dequant_reference() {
+    let _gpu = gpu_serial();
     unsafe { std::env::set_var("CMF_GPU", "wgpu") };
     if !cortiq_engine::gpu_wgpu::enabled() {
         eprintln!("skipped: no wgpu adapter");
@@ -284,6 +303,7 @@ fn check_mm_b(
 #[cfg(target_os = "macos")]
 #[test]
 fn metal_q4tp_matmat_matches_dequant_reference() {
+    let _gpu = gpu_serial();
     unsafe { std::env::set_var("CMF_GPU", "1") };
     // NOT a silent skip. A broken MSL kernel makes ctx() fail, Metal falls
     // back to CPU, and `enabled()` goes false — so an early return here turns
@@ -299,6 +319,7 @@ fn metal_q4tp_matmat_matches_dequant_reference() {
 #[cfg(feature = "gpu")]
 #[test]
 fn wgpu_q4tp_matmat_matches_dequant_reference() {
+    let _gpu = gpu_serial();
     unsafe { std::env::set_var("CMF_GPU", "wgpu") };
     if !cortiq_engine::gpu_wgpu::enabled() {
         eprintln!("skipped: no wgpu adapter");
@@ -319,6 +340,7 @@ fn wgpu_q4tp_matmat_matches_dequant_reference() {
 #[test]
 #[ignore]
 fn wgpu_q4tp_batch_cost() {
+    let _gpu = gpu_serial();
     unsafe { std::env::set_var("CMF_GPU", "wgpu") };
     assert!(cortiq_engine::gpu_wgpu::enabled(), "нет адаптера wgpu");
     // Two shapes off the release: a layer projection, and the head.
