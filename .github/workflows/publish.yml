@@ -18,10 +18,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Publish (core → engine → server → cli)
+      # ORDER IS THE DEPENDENCY ORDER, and `cortiq-net` was missing from
+      # it. It sits between the engine and the server — both the server
+      # and the cli depend on it — so every run since it was introduced
+      # died at `cortiq-server` with "no matching package named
+      # cortiq-net", and the registry sat at 0.5.65 through three
+      # releases while the tags kept moving. Nothing said so: the loop
+      # exits non-zero, but a manual workflow nobody re-reads is a
+      # silent failure.
+      - name: Publish (core → engine → net → server → cli → ffi)
         run: |
           set -e
-          for c in cortiq-core cortiq-engine cortiq-server cortiq-cli cortiq-ffi; do
+          for c in cortiq-core cortiq-engine cortiq-net cortiq-server cortiq-cli cortiq-ffi; do
             echo "── publishing $c ──"
             if cargo publish -p "$c" 2>err.log; then
               echo "$c published"
