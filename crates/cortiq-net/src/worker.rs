@@ -5,7 +5,8 @@
 //! the wakeup from a cold blocking read costs more than the wire).
 
 use crate::{
-    recv_msg, send_control, send_hidden, send_token, Frame, Msg, O1Wire, WireDtype, WIRE_VERSION,
+    recv_msg, send_control, send_hidden, send_token, send_tokens, Frame, Msg, O1Wire, WireDtype,
+    WIRE_VERSION,
 };
 use cortiq_core::TaskMask;
 use cortiq_engine::pipeline::Pipeline;
@@ -234,6 +235,7 @@ fn serve_one(
     // is the id history the repetition penalty reads (prompt via `Ids`,
     // then every id we sample).
     let mut head = false;
+    let mut run_ahead = 1usize;
     let mut hist: Vec<u32> = Vec::new();
     let hs = p.hidden_size;
     let fatal = |stream: &mut TcpStream, out: &mut Vec<u8>, msg: String| -> Result<(), String> {
@@ -257,6 +259,7 @@ fn serve_one(
                 o1,
                 head: want_head,
                 sampler,
+                run_ahead: want_ahead,
             }) => {
                 let (from, upto) = (from as usize, upto as usize);
                 if from > upto || upto >= p.num_layers {
@@ -317,7 +320,24 @@ fn serve_one(
                         }
                     }
                 }
+                // Run-ahead needs the coordinator to be out of the loop
+                // entirely: we embed, we run every layer, we sample. With
+                // a local span on the other side there is a matmul
+                // between tokens that only it can do.
+                if want_ahead > 1 && !(want_head && from == 0) {
+                    send_control(
+                        &mut stream,
+                        &mut out,
+                        &Frame::Ack {
+                            err: format!(
+                                "run_ahead {want_ahead} needs head mode over the whole stack                                  (head {want_head}, span starts at {from})"
+                            ),
+                        },
+                    )?;
+                    continue;
+                }
                 head = want_head;
+                run_ahead = want_ahead.max(1) as usize;
                 hist.clear();
                 span = Some((from, upto));
                 eprintln!(
@@ -405,7 +425,7 @@ fn serve_one(
             }
             // v5: the coordinator kept only the tokenizer — it ships the
             // id, we embed it ourselves. Legal only when we hold layer 0.
-            Msg::StepId { pos, id } => {
+            Msg::StepId { pos, id, want } => {
                 let Some((from, upto)) = span else {
                     return fatal(&mut stream, &mut out, "StepId before Assign".into());
                 };
@@ -415,14 +435,38 @@ fn serve_one(
                     );
                     return fatal(&mut stream, &mut out, msg);
                 }
-                let emb = p.embed_id(id);
-                match p.forward_span(&emb, pos as usize, from, upto, mask.as_ref()) {
-                    Ok(h) => {
-                        let h = h.to_vec();
-                        let id = sample_here(p, &mut hist, &h);
-                        send_token(&mut stream, &mut out, id)?;
+                // One round trip, up to `run_ahead` tokens. Each step is
+                // the same sequential decode the coordinator would have
+                // driven — embed, layers, head, sample — so the text is
+                // identical; what is gone is the handshake between them.
+                let mut fed = id;
+                let mut at = pos as usize;
+                // `want` is the coordinator's remaining budget: running
+                // past it would leave our KV holding positions it never
+                // emitted, and the next turn's reuse would read a history
+                // that does not exist on its side.
+                let steps = run_ahead.min((want as usize).max(1));
+                let mut batch: Vec<u32> = Vec::with_capacity(steps);
+                let mut eos = false;
+                for _ in 0..steps {
+                    let emb = p.embed_id(fed);
+                    let h = match p.forward_span(&emb, at, from, upto, mask.as_ref()) {
+                        Ok(h) => h.to_vec(),
+                        Err(e) => return fatal(&mut stream, &mut out, e),
+                    };
+                    let next = sample_here(p, &mut hist, &h);
+                    batch.push(next);
+                    if p.tokenizer.is_eos(next) {
+                        eos = true;
+                        break;
                     }
-                    Err(e) => return fatal(&mut stream, &mut out, e),
+                    fed = next;
+                    at += 1;
+                }
+                if run_ahead > 1 {
+                    send_tokens(&mut stream, &mut out, &batch, eos)?;
+                } else {
+                    send_token(&mut stream, &mut out, batch[0])?;
                 }
             }
             other => {

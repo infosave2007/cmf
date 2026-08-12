@@ -53,7 +53,15 @@ use std::net::TcpStream;
 /// generation; the worker appends what it samples. With `from == 0` the
 /// coordinator sends `StepId` (12 bytes) instead of a hidden and the
 /// worker embeds — the whole per-token wire becomes 16 bytes.
-pub const WIRE_VERSION: u32 = 5;
+/// v6: `Assign.run_ahead` lets the worker return K tokens for one round
+/// trip. In head mode with `from == 0` the coordinator contributes
+/// NOTHING between tokens — the worker embeds, runs every layer, applies
+/// the head and samples — so asking permission each time buys nothing and
+/// costs a full round trip. This is not speculation: no draft model, no
+/// verification, the same sequential decode with the handshakes removed,
+/// and the output is identical token for token. It exists for Wi-Fi,
+/// whose p99 round trip measured 95 ms against a cable's 2.9.
+pub const WIRE_VERSION: u32 = 6;
 
 // Prefill chunking follows the engine's `pipeline::prefill_chunk()` —
 // panel width reorders float accumulation, so the network split MUST
@@ -72,6 +80,8 @@ const TAG_PREFILL_F16: u8 = 6;
 /// Head-on-worker frames (v5): a token id each way, dtype-free.
 const TAG_STEP_ID: u8 = 7;
 const TAG_TOKEN: u8 = 8;
+/// v6: several tokens for one round trip.
+const TAG_TOKENS: u8 = 9;
 
 /// Payload float width on the wire. f32 is bit-exact; f16 halves the
 /// frames and is negotiated EXPLICITLY in Assign — never a silent default.
@@ -133,6 +143,11 @@ pub enum Frame {
         /// JSON rather than the struct so adding a sampler field cannot
         /// change the frame encoding behind the version check.
         sampler: Option<String>,
+        /// v6: how many tokens the worker may generate for one request.
+        /// 0 or 1 = the classic one-token round trip. Only legal with
+        /// `head` and `from == 0`, because anything else needs the
+        /// coordinator's own layers between tokens.
+        run_ahead: u32,
     },
     /// v5, head mode only: the id history the sampler's repetition
     /// penalty reads. Sent once per generation, before the first Step;
@@ -174,10 +189,16 @@ pub enum Msg {
     Hidden,
     Prefill { start_pos: u64, count: u32 },
     /// v5: decode step carrying the token id itself — only legal when the
-    /// worker holds layer 0 and does the embedding.
-    StepId { pos: u64, id: u32 },
+    /// worker holds layer 0 and does the embedding. v6 adds `want`: how
+    /// many tokens the coordinator can still use, so a run-ahead batch
+    /// never advances the worker's KV past what the caller will emit.
+    StepId { pos: u64, id: u32, want: u32 },
     /// v5: the worker's sampled token.
     Token { id: u32 },
+    /// v6: the run-ahead batch. Fewer than requested means the worker
+    /// stopped early — end of sequence — and the coordinator must not
+    /// ask for more.
+    Tokens { ids: Vec<u32>, eos: bool },
 }
 
 fn spin_budget_us() -> u64 {
@@ -331,10 +352,12 @@ pub fn send_step_id(
     raw: &mut Vec<u8>,
     pos: u64,
     id: u32,
+    want: u32,
 ) -> Result<(), String> {
     begin(raw, TAG_STEP_ID);
     raw.extend_from_slice(&pos.to_le_bytes());
     raw.extend_from_slice(&id.to_le_bytes());
+    raw.extend_from_slice(&want.to_le_bytes());
     ship(stream, raw)
 }
 
@@ -342,6 +365,22 @@ pub fn send_step_id(
 pub fn send_token(stream: &mut TcpStream, raw: &mut Vec<u8>, id: u32) -> Result<(), String> {
     begin(raw, TAG_TOKEN);
     raw.extend_from_slice(&id.to_le_bytes());
+    ship(stream, raw)
+}
+
+/// v6: a run-ahead batch — `[eos u8][count u32][ids…]`.
+pub fn send_tokens(
+    stream: &mut TcpStream,
+    raw: &mut Vec<u8>,
+    ids: &[u32],
+    eos: bool,
+) -> Result<(), String> {
+    begin(raw, TAG_TOKENS);
+    raw.push(u8::from(eos));
+    raw.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    for &id in ids {
+        raw.extend_from_slice(&id.to_le_bytes());
+    }
     ship(stream, raw)
 }
 
@@ -431,14 +470,28 @@ pub fn recv_msg(
             }))
         }
         TAG_STEP_ID => {
-            if body.len() < 12 {
+            if body.len() < 16 {
                 return Err("StepId frame truncated".into());
             }
             floats.clear();
             Ok(Some(Msg::StepId {
                 pos: rd_u64(body),
                 id: rd_u32(&body[8..]),
+                want: rd_u32(&body[12..]),
             }))
+        }
+        TAG_TOKENS => {
+            if body.len() < 5 {
+                return Err("Tokens frame truncated".into());
+            }
+            let eos = body[0] != 0;
+            let n = rd_u32(&body[1..]) as usize;
+            if body.len() < 5 + n * 4 {
+                return Err(format!("Tokens frame claims {n} ids, body is {} B", body.len()));
+            }
+            let ids = (0..n).map(|i| rd_u32(&body[5 + i * 4..])).collect();
+            floats.clear();
+            Ok(Some(Msg::Tokens { ids, eos }))
         }
         TAG_TOKEN => {
             if body.len() < 4 {

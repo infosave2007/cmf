@@ -748,6 +748,11 @@ pub extern "C" fn cortiq_set_peer(config_json: *const c_char) -> i32 {
             split: cfg.get("split").and_then(|v| v.as_u64()).map(|v| v as usize),
             f16: dtype == "f16",
             head: cfg.get("head").and_then(|v| v.as_bool()).unwrap_or(false),
+            run_ahead: cfg
+                .get("run_ahead")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1)
+                .clamp(1, 64) as u32,
         };
         match PEER.lock() {
             Ok(mut g) => {
@@ -780,6 +785,7 @@ struct PeerCfg {
     split: Option<usize>,
     f16: bool,
     head: bool,
+    run_ahead: u32,
 }
 
 struct PeerState {
@@ -846,6 +852,7 @@ fn generate_over_peer(
             task: None,
             o1: None,
             head: state.cfg.head,
+            run_ahead: state.cfg.run_ahead,
             sampler: if state.cfg.head {
                 Some(
                     serde_json::to_string(&pipeline.sampler_config)
