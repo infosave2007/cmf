@@ -577,6 +577,16 @@ enum Commands {
         /// fewer handshakes. Default 1.
         #[arg(long, requires = "peer_head", default_value_t = 1)]
         peer_run_ahead: u32,
+        /// Prefill the prompt on the peer, pull its KV home, then decode
+        /// HERE with the wire idle — pull the cable and the conversation
+        /// continues. Prefill ships whole chunks (a few round trips for a
+        /// whole prompt) while decode pays one per token, which is the
+        /// asymmetry this trades on: 1800 positions cost 86.9 s on a
+        /// phone and 11.3 s on a laptop. The state that comes back is
+        /// ~224 KiB a position, so `--net-dtype f16` usually decides
+        /// whether it pays. Needs `--peer-split 0`.
+        #[arg(long, requires = "peer")]
+        peer_prefill: bool,
         /// Split the layer stack across N local GPUs, in ONE process:
         /// segment i runs pinned to card i and only a hidden vector
         /// crosses the boundary. This is the CAPACITY mode — for a
@@ -1462,6 +1472,7 @@ async fn main() -> anyhow::Result<()> {
             net_dtype,
             peer_head,
             peer_run_ahead,
+            peer_prefill,
             gpus,
         } => {
             let o1 = O1Flags {
@@ -1496,6 +1507,7 @@ async fn main() -> anyhow::Result<()> {
                 &net_dtype,
                 peer_head,
                 peer_run_ahead,
+                peer_prefill,
                 gpus,
             )
             .await
@@ -2937,6 +2949,7 @@ async fn cmd_run(
     net_dtype: &str,
     peer_head: bool,
     peer_run_ahead: u32,
+    peer_prefill: bool,
     gpus: Option<usize>,
 ) -> anyhow::Result<()> {
     println!("Loading model: {}", model_path);
@@ -3227,6 +3240,29 @@ async fn cmd_run(
                 })
             };
             let started = std::time::Instant::now();
+            // Prefill offload: the peer absorbs the prompt, its state
+            // comes home, and the wire goes idle for the rest of the
+            // conversation. Done once — after it the segment is dropped,
+            // so a later turn is a plain local generation.
+            if peer_prefill {
+                if let Some(rs) = remote_opt.as_mut() {
+                    match cortiq_net::prefill_on_peer(pipeline, rs, ids) {
+                        Ok((bytes, pre_s, fetch_s)) => {
+                            eprintln!(
+                                "offload: {} positions prefilled on the peer in {:.2} s, \
+                                 state home in {:.2} s ({:.1} MB, {:.0} MB/s) — decoding locally",
+                                ids.len().saturating_sub(1),
+                                pre_s,
+                                fetch_s,
+                                bytes as f64 / 1e6,
+                                bytes as f64 / 1e6 / fetch_s.max(1e-9),
+                            );
+                        }
+                        Err(e) => anyhow::bail!("prefill offload: {e}"),
+                    }
+                    remote_opt = None;
+                }
+            }
             let gen_res = match remote_opt.as_mut() {
                 Some(rs) => {
                     cortiq_net::generate_split(pipeline, rs, ids, max_tokens, mask.as_ref(), Some(cb)).map(

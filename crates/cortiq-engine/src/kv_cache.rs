@@ -946,6 +946,151 @@ impl LayerKvCache {
     }
 
     /// Memory usage in bytes.
+    /// Serialize this layer's state for the wire: `f16` halves it and is
+    /// the caller's explicit choice, exactly like the hidden-state wire.
+    ///
+    /// REFUSES rather than travelling half-complete. A cache carrying
+    /// frozen columns, accumulated importance, a Nyström overlay or q8
+    /// storage holds state this format does not describe, and shipping
+    /// the rest would land a plausible-looking cache that answers
+    /// differently — the failure mode this whole format exists to avoid.
+    pub fn export_wire(&self, f16: bool) -> Result<Vec<u8>, String> {
+        if !matches!(self.mode, KvMode::F32) {
+            return Err("kv export: only the F32 cache is described by this                         format (CMF_KV=q8 stores int8 rows and per-row scales)"
+                .into());
+        }
+        if self.o1.is_some() {
+            return Err("kv export: an O(1) Nyström overlay is not part of                         this format — the skeletons are irreversible and                         would have to travel with it"
+                .into());
+        }
+        // Frozen columns only exist under q8 storage, which is refused
+        // above. If one shows up under an F32 cache the format is lying
+        // about something and the transfer must not proceed.
+        if self.kcol.iter().any(|c| !c.is_empty()) || self.vcol.iter().any(|c| !c.is_empty()) {
+            return Err("kv export: frozen columns under an F32 cache — refusing to ship \
+                        a state this format does not describe"
+                .into());
+        }
+        let mut out = Vec::with_capacity(self.memory_bytes() / if f16 { 2 } else { 1 } + 64);
+        let mut u = |v: u32, o: &mut Vec<u8>| o.extend_from_slice(&v.to_le_bytes());
+        u(u8::from(f16) as u32, &mut out);
+        u(self.seq_len as u32, &mut out);
+        u(self.num_kv_heads as u32, &mut out);
+        u(self.head_dim as u32, &mut out);
+        u(self.linear_state.len() as u32, &mut out);
+        // Born-rule importance is ordinary state: every attention call
+        // accumulates it and eviction reads it. Leaving it behind would
+        // hand the far side a cache that forgets the RIGHT positions
+        // later — a divergence that shows up only under pressure.
+        u(self.imp.len() as u32, &mut out);
+        let push = |xs: &[f32], o: &mut Vec<u8>| {
+            if f16 {
+                for &x in xs {
+                    o.extend_from_slice(&cortiq_core::quant::f32_to_f16(x).to_le_bytes());
+                }
+            } else {
+                for &x in xs {
+                    o.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        };
+        // The recurrent condensate stays f32 whatever the wire dtype: it
+        // is one small vector per layer and it is the ONLY state a linear
+        // layer has — rounding it rounds the whole history.
+        for &x in &self.linear_state {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        for &x in &self.imp {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        for h in 0..self.num_kv_heads {
+            u(self.k[h].len() as u32, &mut out);
+            push(&self.k[h], &mut out);
+            u(self.v[h].len() as u32, &mut out);
+            push(&self.v[h], &mut out);
+        }
+        Ok(out)
+    }
+
+    /// Install a peer's state over this layer. The geometry must match the
+    /// model both sides hold — it is checked, not assumed.
+    pub fn import_wire(&mut self, buf: &[u8]) -> Result<(), String> {
+        let mut o = 0usize;
+        let mut u32_at = |o: &mut usize| -> Result<u32, String> {
+            if *o + 4 > buf.len() {
+                return Err("kv import: truncated header".into());
+            }
+            let v = u32::from_le_bytes(buf[*o..*o + 4].try_into().unwrap());
+            *o += 4;
+            Ok(v)
+        };
+        let f16 = u32_at(&mut o)? != 0;
+        let seq_len = u32_at(&mut o)? as usize;
+        let heads = u32_at(&mut o)? as usize;
+        let hd = u32_at(&mut o)? as usize;
+        let lin = u32_at(&mut o)? as usize;
+        let nimp = u32_at(&mut o)? as usize;
+        if heads != self.num_kv_heads || hd != self.head_dim {
+            return Err(format!(
+                "kv import: peer sent {heads}×{hd} per position, this layer is {}×{}",
+                self.num_kv_heads, self.head_dim
+            ));
+        }
+        let w = if f16 { 2 } else { 4 };
+        let need = |n: usize, o: usize| -> Result<(), String> {
+            if o + n > buf.len() {
+                Err("kv import: truncated payload".into())
+            } else {
+                Ok(())
+            }
+        };
+        need(lin * 4, o)?;
+        self.linear_state = (0..lin)
+            .map(|i| f32::from_le_bytes(buf[o + i * 4..o + i * 4 + 4].try_into().unwrap()))
+            .collect();
+        o += lin * 4;
+        need(nimp * 4, o)?;
+        let imp: Vec<f32> = (0..nimp)
+            .map(|i| f32::from_le_bytes(buf[o + i * 4..o + i * 4 + 4].try_into().unwrap()))
+            .collect();
+        o += nimp * 4;
+        let mut k: Vec<Vec<f32>> = Vec::with_capacity(heads);
+        let mut v: Vec<Vec<f32>> = Vec::with_capacity(heads);
+        for _ in 0..heads {
+            for which in 0..2 {
+                let n = u32_at(&mut o)? as usize;
+                need(n * w, o)?;
+                let xs: Vec<f32> = (0..n)
+                    .map(|i| {
+                        let at = o + i * w;
+                        if f16 {
+                            cortiq_core::quant::f16_to_f32(u16::from_le_bytes(
+                                buf[at..at + 2].try_into().unwrap(),
+                            ))
+                        } else {
+                            f32::from_le_bytes(buf[at..at + 4].try_into().unwrap())
+                        }
+                    })
+                    .collect();
+                o += n * w;
+                if which == 0 { k.push(xs) } else { v.push(xs) }
+            }
+        }
+        self.mode = KvMode::F32;
+        self.k = k;
+        self.v = v;
+        self.kq = vec![Vec::new(); heads];
+        self.ks = vec![Vec::new(); heads];
+        self.vq = vec![Vec::new(); heads];
+        self.vs = vec![Vec::new(); heads];
+        self.kcol = vec![Vec::new(); heads];
+        self.vcol = vec![Vec::new(); heads];
+        self.imp = imp;
+        self.o1 = None;
+        self.seq_len = seq_len;
+        Ok(())
+    }
+
     pub fn memory_bytes(&self) -> usize {
         let floats: usize = self.k.iter().map(Vec::len).sum::<usize>()
             + self.v.iter().map(Vec::len).sum::<usize>()
@@ -1143,6 +1288,54 @@ impl KvCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_round_trip_reproduces_attention() {
+        // The state has to arrive as state, not as something that looks
+        // like it: the oracle is what the layer ANSWERS, not what it
+        // stores. Same query, same output, bit for bit.
+        let (heads, hd) = (2usize, 4usize);
+        let mut a = LayerKvCache::new(heads, hd);
+        for p in 0..5 {
+            let k: Vec<f32> = (0..heads * hd).map(|i| (p * 10 + i) as f32 * 0.031).collect();
+            let v: Vec<f32> = (0..heads * hd).map(|i| (p * 7 + i) as f32 * -0.017).collect();
+            a.append(&k, &v, &[true, true]);
+        }
+        a.linear_state = vec![0.5, -0.25, 1.0];
+        let q: Vec<f32> = (0..hd).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+
+        let bytes = a.export_wire(false).expect("f32 cache exports");
+        let mut b = LayerKvCache::new(heads, hd);
+        b.import_wire(&bytes).expect("import");
+
+        assert_eq!(b.seq_len, a.seq_len);
+        assert_eq!(b.linear_state, a.linear_state);
+        for h in 0..heads {
+            let (oa, sa) = a.attend(&q, h);
+            let (ob, sb) = b.attend(&q, h);
+            assert_eq!(oa, ob, "head {h} attention output diverged");
+            assert_eq!(sa, sb, "head {h} attention scores diverged");
+        }
+    }
+
+    #[test]
+    fn wire_refuses_what_it_cannot_describe() {
+        // A refusal is the feature: a cache whose extra state this format
+        // does not carry must not travel looking complete.
+        let mut c = LayerKvCache::new(1, 4);
+        c.mode = KvMode::Q8 { k: true, v: true };
+        let err = c.export_wire(false).unwrap_err();
+        assert!(err.contains("F32"), "{err}");
+    }
+
+    #[test]
+    fn wire_import_checks_geometry() {
+        let a = LayerKvCache::new(2, 4);
+        let bytes = a.export_wire(false).unwrap();
+        let mut wrong = LayerKvCache::new(2, 8);
+        let err = wrong.import_wire(&bytes).unwrap_err();
+        assert!(err.contains("2×4"), "{err}");
+    }
 
     #[test]
     fn append_tracks_seq_len_and_layout() {

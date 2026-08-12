@@ -204,6 +204,49 @@ impl RemoteSegment {
         Ok(&self.floats)
     }
 
+    /// v7: pull the worker's KV and recurrent state for a layer range
+    /// into `p`. Returns the bytes that crossed the wire.
+    pub fn fetch_kv(
+        &mut self,
+        p: &mut Pipeline,
+        from: usize,
+        upto: usize,
+    ) -> Result<usize, String> {
+        self.send_ctl(&Frame::KvFetch {
+            from: from as u32,
+            upto: upto as u32,
+        })?;
+        self.expect_ack("kv fetch")?;
+        let mut bytes = 0usize;
+        for expect in from..=upto {
+            match self.recv(false)? {
+                Msg::Kv { layer } => {
+                    let li = layer as usize;
+                    if li != expect {
+                        return Err(format!(
+                            "worker {}: KV arrived for layer {li}, expected {expect}",
+                            self.addr
+                        ));
+                    }
+                    // The payload lives in the scratch the frame landed
+                    // in — hundreds of megabytes, never copied twice.
+                    let payload = &self.raw[5..];
+                    bytes += payload.len();
+                    p.kv_cache.layers[li]
+                        .import_wire(payload)
+                        .map_err(|e| format!("layer {li}: {e}"))?;
+                }
+                other => {
+                    return Err(format!(
+                        "worker {}: expected Kv for layer {expect}, got {other:?}",
+                        self.addr
+                    ));
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
     /// What the worker is worth right now — thermal state, mains power,
     /// the clock its fastest core is actually running at. The planner
     /// reads this instead of trusting a number measured at connect time.
@@ -505,6 +548,68 @@ pub fn generate_split(
     st.remote_steps = remote_steps;
     st.prefilled = input_ids.len() - reuse_from;
     Ok((result(text, token_ids, input_ids.len(), &finish_reason), st))
+}
+
+/// Prefill the whole prompt on the peer and bring the state home, so the
+/// caller can keep talking with the cable unplugged.
+///
+/// The asymmetry this exists for, measured on a phone against a laptop:
+/// 1800 positions cost 86.9 s locally and 11.3 s over there, because
+/// prefill ships whole chunks (7 round trips for the lot) while decode
+/// pays one round trip per token. The state that comes back is 224 KiB a
+/// position, so the wire dtype decides whether the trade pays — f16 on
+/// the wire is the caller's explicit choice, exactly as for hiddens.
+///
+/// The last prompt position is deliberately NOT prefilled remotely: the
+/// local reuse contract wants a history strictly shorter than the prompt
+/// (`kv_history.len() < ids.len()`), so the caller's own generate absorbs
+/// one position and everything downstream — MTP, o1, task masks — stays
+/// on the path it already trusts.
+pub fn prefill_on_peer(
+    p: &mut Pipeline,
+    remote: &mut RemoteSegment,
+    input_ids: &[u32],
+) -> Result<(usize, f64, f64), String> {
+    if remote.from != 0 || remote.upto + 1 != p.num_layers {
+        return Err(format!(
+            "prefill offload needs the peer to hold the WHOLE stack (it has {}..={} of {})",
+            remote.from,
+            remote.upto,
+            p.num_layers - 1
+        ));
+    }
+    if input_ids.len() < 2 {
+        return Err("prefill offload wants a prompt worth offloading".into());
+    }
+    let hs = p.hidden_size;
+    let take = input_ids.len() - 1;
+    p.reset_session();
+    p.o1_begin();
+    remote.reset()?;
+
+    let t0 = Instant::now();
+    let chunk = cortiq_engine::pipeline::prefill_chunk();
+    let mut flat: Vec<f32> = Vec::with_capacity(chunk * hs);
+    let mut pos = 0usize;
+    while pos < take {
+        let end = (pos + chunk).min(take);
+        flat.clear();
+        for &id in &input_ids[pos..end] {
+            flat.extend_from_slice(&p.embed_id(id));
+        }
+        remote.prefill_send(pos, end - pos, &flat)?;
+        pos = end;
+    }
+    remote.sync()?;
+    let prefill_s = t0.elapsed().as_secs_f64();
+
+    let t1 = Instant::now();
+    let bytes = remote.fetch_kv(p, 0, p.num_layers - 1)?;
+    let fetch_s = t1.elapsed().as_secs_f64();
+    // The cache now holds exactly these positions; the reuse check reads
+    // this and prefills only what is left.
+    p.kv_history = input_ids[..take].to_vec();
+    Ok((bytes, prefill_s, fetch_s))
 }
 
 fn result(

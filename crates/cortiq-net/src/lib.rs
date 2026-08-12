@@ -27,7 +27,7 @@ pub mod client;
 pub mod nodestat;
 pub mod worker;
 
-pub use client::{generate_split, RemoteSegment, SessionSpec, SplitStats};
+pub use client::{generate_split, prefill_on_peer, RemoteSegment, SessionSpec, SplitStats};
 pub use nodestat::NodeStats;
 pub use worker::{worker_serve, WorkerConfig};
 
@@ -61,7 +61,14 @@ use std::net::TcpStream;
 /// verification, the same sequential decode with the handshakes removed,
 /// and the output is identical token for token. It exists for Wi-Fi,
 /// whose p99 round trip measured 95 ms against a cable's 2.9.
-pub const WIRE_VERSION: u32 = 6;
+/// v7: `KvFetch` pulls the worker's state for a layer range home. This
+/// is what makes "prefill over there, keep talking here" possible —
+/// measured on this stand, an 1800-token prompt costs 86.9 s on the
+/// phone and 11.3 s on the desktop, and the state is 224 KiB a position
+/// (measured, `kv_state_bytes`), so f16 on the wire pays for itself
+/// several times over. The worker refuses rather than shipping a
+/// half-described cache.
+pub const WIRE_VERSION: u32 = 7;
 
 // Prefill chunking follows the engine's `pipeline::prefill_chunk()` —
 // panel width reorders float accumulation, so the network split MUST
@@ -82,6 +89,8 @@ const TAG_STEP_ID: u8 = 7;
 const TAG_TOKEN: u8 = 8;
 /// v6: several tokens for one round trip.
 const TAG_TOKENS: u8 = 9;
+/// v7: one layer's KV/recurrent state, `[u32 layer][payload]`.
+const TAG_KV: u8 = 10;
 
 /// Payload float width on the wire. f32 is bit-exact; f16 halves the
 /// frames and is negotiated EXPLICITLY in Assign — never a silent default.
@@ -160,6 +169,10 @@ pub enum Frame {
     Sync,
     Ping,
     Pong,
+    /// v7: send this layer range's KV and recurrent state home. The
+    /// worker answers `Ack` (empty = accepted) and then one `Kv` frame
+    /// per layer, in order.
+    KvFetch { from: u32, upto: u32 },
     /// v5: ask the worker what it is worth right now. Cheap enough to
     /// send between turns; the answer is measured, never declared.
     Stats,
@@ -195,6 +208,11 @@ pub enum Msg {
     StepId { pos: u64, id: u32, want: u32 },
     /// v5: the worker's sampled token.
     Token { id: u32 },
+    /// v7: one layer's state. The payload is NOT copied — it stays in the
+    /// caller's `raw` scratch at `raw[5..]`, because a whole cache is
+    /// hundreds of megabytes and copying it twice is the difference
+    /// between a transfer and an out-of-memory.
+    Kv { layer: u32 },
     /// v6: the run-ahead batch. Fewer than requested means the worker
     /// stopped early — end of sequence — and the coordinator must not
     /// ask for more.
@@ -368,6 +386,19 @@ pub fn send_token(stream: &mut TcpStream, raw: &mut Vec<u8>, id: u32) -> Result<
     ship(stream, raw)
 }
 
+/// v7: one layer's state, raw after a 4-byte layer index.
+pub fn send_kv(
+    stream: &mut TcpStream,
+    raw: &mut Vec<u8>,
+    layer: u32,
+    payload: &[u8],
+) -> Result<(), String> {
+    begin(raw, TAG_KV);
+    raw.extend_from_slice(&layer.to_le_bytes());
+    raw.extend_from_slice(payload);
+    ship(stream, raw)
+}
+
 /// v6: a run-ahead batch — `[eos u8][count u32][ids…]`.
 pub fn send_tokens(
     stream: &mut TcpStream,
@@ -479,6 +510,13 @@ pub fn recv_msg(
                 id: rd_u32(&body[8..]),
                 want: rd_u32(&body[12..]),
             }))
+        }
+        TAG_KV => {
+            if body.len() < 4 {
+                return Err("Kv frame truncated".into());
+            }
+            floats.clear();
+            Ok(Some(Msg::Kv { layer: rd_u32(body) }))
         }
         TAG_TOKENS => {
             if body.len() < 5 {
