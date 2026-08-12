@@ -506,6 +506,7 @@ version = "0.5.69"
 dependencies = [
  "cortiq-core",
  "cortiq-engine",
+ "cortiq-net",
  "serde",
  "serde_json",
 ]

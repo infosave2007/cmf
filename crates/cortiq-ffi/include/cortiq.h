@@ -88,6 +88,39 @@ int32_t cortiq_chat_messages(void *handle, const char *messages_json,
  * random. Returns 0, or -1. */
 int32_t cortiq_set_options(void *handle, const char *options_json);
 
+/* ---- Network split (wire v5) -------------------------------------
+ * A phone can be either side of a layer split: the worker that holds a
+ * span of someone else's model, or the coordinator that borrows a
+ * desktop's. Both are additive; an app that calls neither is unchanged.
+ */
+
+/* Serve layer spans to a coordinator — `cortiq worker` as a call, for
+ * platforms that cannot spawn a binary. Runs on a background thread.
+ * config_json: {"model":"/path/x.cmf","listen":"0.0.0.0:9911",
+ *               "token":"secret"}
+ * A token is REQUIRED beyond loopback. Returns 0 once the port is
+ * known-bindable and the file exists, -1 with cortiq_last_error. */
+int32_t cortiq_worker_start(const char *config_json);
+
+/* Run every later generate through a peer holding the SAME model.
+ * config_json: {"addr":"192.168.1.5:9911","token":"secret","split":0,
+ *               "dtype":"f16","head":true}
+ *   split - first layer the peer runs; 0 = all of them, this side keeps
+ *           only the tokenizer. Default: half the stack.
+ *   head  - the peer also owns lm_head and the sampler and answers token
+ *           ids. Worth ~29 ms of a 73 ms token on a phone, because the
+ *           head does not shrink as you move layers away.
+ *   dtype - f32 reproduces local text bit for bit; f16 halves the wire.
+ * NULL or {} clears it. The dial happens on the next generate, so an
+ * unreachable peer fails there, with a message. Returns 0 or -1. */
+int32_t cortiq_set_peer(const char *config_json);
+
+/* What the peer is worth right now, as JSON: thermal_mc, powered,
+ * cpu_khz_cur/max, mem_avail_kb, threads, platform. Absent fields mean
+ * the platform does not expose them - never assume zero. "{}" when no
+ * peer is connected. Valid until the next call on this thread. */
+const char *cortiq_peer_stats(void);
+
 #ifdef __cplusplus
 }
 #endif
