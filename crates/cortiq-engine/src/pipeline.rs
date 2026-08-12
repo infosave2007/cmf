@@ -2535,11 +2535,21 @@ impl Pipeline {
             return None;
         }
         let t_round = std::time::Instant::now();
-        // Submissions per phase. The draft costs ~3.2 ms a step where the
-        // MTP block plus the head is 834 MB — 0.8 ms at this card's
-        // measured 1056 GB/s — so what matters is how many round trips it
-        // pays, and that decides whether fusing the block into a graph is
-        // worth the work. Counted, not estimated.
+        // Submissions per phase — and they say where the round's money is.
+        // Qwen3.6-27B on an RTX 5090, k=3:
+        //
+        //   draft   9.3 ms / 12 submissions   (four per MTP step)
+        //   verify 52.8 ms /  1               (the batched graph)
+        //   commit  5.4 ms /  6               (two per warm)
+        //
+        // The verify is already one submit. The draft's own work is 834 MB
+        // a step — 0.8 ms at this card's measured 1056 GB/s — against 3.1
+        // ms measured, so ~0.58 ms of every step is round trip, not
+        // arithmetic, and the same holds for the warms. Eighteen round
+        // trips a round at roughly half a millisecond each is ~11 ms of a
+        // 68 ms round: fusing the MTP block into ONE submit the way the
+        // trunk already is projects to ~64 tok/s against today's 50.9.
+        // That is the largest measured item left on this path.
         let subs = || crate::gpu_wgpu::SUBMITS.load(std::sync::atomic::Ordering::Relaxed);
         let sub0 = subs();
         // Draft the chain: first from the trunk's tip hidden, then the head
