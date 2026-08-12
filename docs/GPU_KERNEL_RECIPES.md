@@ -122,6 +122,50 @@ the next pass as a prologue/epilogue instead of opening their own:
 | Pair the GDN a/b projections in one dispatch | 99.8 → 98.8 | two nv-row dispatches already overlap in-pass; the pair kernel's flat row space serializes them |
 | Device argmax at k=1 (4-byte readback vs 1 MB) | 100.0 → 98.5 | two extra dispatches cost more than the PCIe transfer they save |
 | vec4 staging in the batched GEMM trio | 18.9 vs 18.6 prefill (noise) | the GEMM already stages through workgroup memory; its loads were never the wall — the ~300 GFLOP/s ceiling is elsewhere (register blocking / K-step shape) |
+| Persistent grid for the q4tp matvecs (`CMF_MV_GRID`) | 17.66 → 17.67 ms/token; one WG per SM is 20.81 | launch and teardown are not what a memory-bound matvec pays |
+| Halve the batch kernel's live registers by unpacking row PAIRS | FFN 13.40 → 20.39 ms, decode 51 → 42 | it buys occupancy with twice the activation re-reads, and the activation loads are the wall — see below |
+| Unpack q4 nibbles into f32 registers before the batch loop | batch FFN 14.64 vs 13.86 packed | fewer ALU ops, but 32 registers of dequantized weight crowd out the occupancy that hides load latency. Keep weights PACKED; unpack one u32 at a time |
+| Cache the batched graph's const buffers (norm weights) | verify 52.5-53.6 vs 52.5-53.9 ms | strictly less work and kept for that, but it bought no time — the buffer churn was not on the critical path |
+| Lower `par_copy`'s threshold so the per-token logit readback splits | 44.4 → 42.5 tok/s (256 KB), same at 64 KB | `thread::scope` spawns fresh OS threads per call; for ~1 MB once a token that costs more than the copy. The 4 MB default is for the bake's 264 MB planes |
+
+### The q4tp matvec is bus-bound — three proofs, so stop tuning it
+
+Measured on Qwen3.6-27B q4tp (14.26 GB, hidden 5120, FFN 17408) on an
+RTX 5090. The token is 17.65 ms of device time and reads as 47% of the
+card's 1.79 TB/s, which invites a rewrite. Do not take it.
+
+1. **`CMF_MV_PROBE`** builds the quad-row kernel with its arithmetic
+   removed and every load kept, and bits drop the activation loads (+2),
+   the code-plane loads (+4) and the cross-lane reduction (+8). Stripped
+   to nothing but weight loads the token goes **17.68 → 16.95 ms**. Four
+   percent. The unpack is free, the codes are free, the reduction is
+   free; the token IS the weight stream.
+2. **`CMF_MV_GRID`** makes the kernels persistent. Null at every size.
+3. **Two decode processes on one card** (14.26 GB each, 28.5 of 32)
+   aggregate **52.8 tok/s against a single process's 48.8** — one stream
+   already saturates ~92% of what two can pull.
+
+So 1056 GB/s is the bus for this access pattern, not the kernel's
+shortfall. What remains is to read fewer bytes a token, or to amortize
+the read over more than one token.
+
+### …but a BATCHED matvec is not
+
+Same kernel, batch > 1, and the budget inverts. At b=1 a dense FFN layer
+needs 8.9 ms of weight stream against 6.3 ms of arithmetic, so the
+arithmetic hides. At b=3 the stream still needs 6.5 and the arithmetic
+needs 13.8 — dead linear in batch (11.83 / 13.83 / 16.03 ms at b=2/3/4)
+— because `q4v_dot8` fuses unpack and multiply and every element unpacks
+again. Sharing the unpack (`q4tp_matvec4_bku`, `CMF_MV_BK=2`) takes the
+batched FFN to 11.15 ms and a k=2 speculative verify from 53.3 to 45.9,
+which is what finally makes a drafted token cheaper than a plain one.
+
+What binds it after that is the ACTIVATION loads — 24 vec4 a
+group-iteration at b=3 against 4 of weight — not registers, which is
+what the row-pair experiment in the table above disproved. Fewer x
+loads is the direction: f16 activations halve the count, and they need
+their own shader module because `enable f16` would make all of WGSL
+require SHADER_F16.
 
 ## The failure mode that looks like slowness
 

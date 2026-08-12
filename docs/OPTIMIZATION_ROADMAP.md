@@ -13,7 +13,7 @@ State as of 0.5.43 (RTX PRO 6000 Blackwell / Vulkan unless noted):
 | KAT-Coder-V2.5 | q4tp MoE | 93.1 | was 69.7 |
 | Nanbeige4.2-3B | q4t | 77.6 | was 37.5 |
 | Bonsai-27B | q1 | 45.3 | recipe not applicable |
-| Qwen3.6-27B dense | q4tp | 39.1 | was 32.3 |
+| Qwen3.6-27B dense | q4tp | 39.1 | was 32.3; see item 6a — 49.4 on a 5090, and bus-bound there |
 | Bonsai-8B | q1t | 37.4 | was 28.8 |
 | Nanbeige4.2-3B (M4, Metal) | q4t | 22.3 | see item 1 |
 
@@ -86,6 +86,51 @@ KDA attention gets graph kernels or an explicit, documented exclusion.
 exact attention falls to 37.8, but its calibration still requires an
 O(n²) CPU prefill (~30 min at 16K). That prefill is the next long-context
 target, not the decode.
+
+On the 27B dense (RTX 5090) the exact path costs 43.1 / 42.7 / **30.4**
+tok/s at ctx 512 / 2048 / 8192, so the crossover is somewhere past 4K.
+`--o1 all` is a zero-training swap — weights pass through unchanged —
+but today it is a LOSS on speed: 26.4 tok/s at ctx 512, and without
+`CMF_O1_GPU=1` it falls off the whole-token graph entirely to 6.7. The
+device port refuses the graph even with the flag. Fix that before
+reaching for o1 as a speed lever; as a MEMORY lever it already works
+(KV+state 203 MB at seq 512, of which 46.6 MB is O(1) state).
+
+## 6a. Qwen3.6-27B dense: the decode is bus-bound, and speculation is the lever
+
+State (RTX 5090, medians of three, `--core`): plain **49.4**,
+speculative k=3 **51.1**, production loop 44.3. Prefill 54.
+
+**Do not tune the matvec.** Three independent proofs that the token is
+the weight stream and the stream is at the card's limit — the
+arithmetic-free probe, the persistent grid, and two decode processes
+aggregating 52.8 against one process's 48.8 — are written up in
+`GPU_KERNEL_RECIPES.md`. 1056 GB/s is the bus.
+
+That leaves two levers, and only two:
+
+**Read fewer bytes.** 14.26 GB a token at 4.18 bits. At 3 bits the model
+is ~10.5 GB, which by the measured bus is ~1.35× (49 → ~66 tok/s). It
+costs quality and it changes the artifact, so it is a product decision,
+not a kernel one. `cortiq requant` is the tool; nobody has taken the
+bits-vs-perplexity curve yet.
+
+**Amortize the read.** The MTP head drafts at 89-91% acceptance and the
+batched verify now costs less per token than a plain forward. The round
+at k=3 is draft 9.3 ms / **12 submissions**, verify 52.8 / 1, commit
+5.4 / 6 — and the draft's own work is 834 MB a step, 0.8 ms at 1056
+GB/s, against 3.1 ms measured. That is ~0.58 ms of round trip per
+submission, eighteen of them a round, **~11 ms of a 68 ms round**.
+
+**Do next:** run the MTP block as a ONE-submit graph the way the trunk
+already is — a single full-attention layer plus the folded head.
+**Expect:** ~64 tok/s against today's 51.
+
+**Watch for:** the MTP keeps its own KV, and the speculative path rewinds
+it every round (`m.kv.truncate_last`). A device mirror that does not
+rewind with it will not crash — it will quietly lower the acceptance
+rate, which reads as "speculation stopped paying". Gate on
+`mtp_accepted/mtp_drafted` from `bench --json`, not on tok/s alone.
 
 ---
 

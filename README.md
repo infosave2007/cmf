@@ -602,6 +602,31 @@ cortiq fcd model.cmf --corpus corpus.txt --gen-check --gen-gate --out model.fcd.
 #        --val-corpus val.txt --gate-threshold 0.35 --gate-slack 0.10
 ```
 
+### Speculative decode off the model's own MTP head
+
+A model that ships an MTP head can draft with it and verify the whole
+chain in one batched submit. Greedy only, and opt-in:
+
+```sh
+CMF_GRAPH_SPEC=1 cortiq bench model.cmf --tokens 160 --core --json
+# CMF_GRAPH_SPEC_K=3 (default) — drafts per round
+```
+
+On Qwen3.6-27B q4tp / RTX 5090, medians of three: **51.1 tok/s against a
+plain 49.4**, 89–91% of drafts accepted, and the greedy continuation is
+byte-identical to the plain path. `bench --json` reports `mtp_drafted`
+and `mtp_accepted` — watch the ratio, not just tok/s, because a broken
+draft path degrades silently into a lower acceptance rate rather than
+into wrong output.
+
+It is worth knowing why the plain number is what it is: that decode is
+**bus-bound**. Two decode processes on one card aggregate 52.8 tok/s
+against a single process's 48.8, and the matvec stripped of all its
+arithmetic runs the same token to within 4% — so the remaining levers
+are reading fewer bytes (quantization) or amortizing the read
+(speculation), not a faster kernel. The proofs are in
+[the kernel recipes](docs/GPU_KERNEL_RECIPES.md).
+
 **Model walkthroughs**: [KAT-Coder 35B MoE](docs/KAT_CODER.md) · [Qwen3.6-35B-A3B (q4tp, MTP head, o1 on GPU)](docs/QWEN36_MOE.md)
 
 **GPU performance**: [kernel recipes and the measured failures](docs/GPU_KERNEL_RECIPES.md) ·
