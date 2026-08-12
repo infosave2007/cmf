@@ -58,6 +58,16 @@ in half over USB). Inverted, it pays enormously — a Xiaomi 12 Lite with
 ### Fixed
 - Nothing behavioural. `serve --peer` keeps the head local (the sampler
   config is per-request there and `Assign` carries it once).
+- **The GPU tests raced each other**, and CI caught it on this release:
+  `gpu_q4tp` failed with "Buffer with 'q4tpmm-stage' label is still
+  mapped" plus two poisoned-mutex panics behind it. The tests set
+  `CMF_GPU` — process-global — from parallel threads and share the wgpu
+  scratch slots, whose lock is dropped before the buffers it hands out
+  are used. The engine is single-stream by contract; the harness broke
+  that contract, so every test in that binary now takes one mutex and
+  recovers from poisoning, which is what turned one failure into three.
+  Test-only; no runtime path changed. Five other GPU test binaries hold
+  the same exposure and are named in the fix rather than changed blind.
 
 ### Measured, not changed
 - **The transport is ranked by its tail, not its bandwidth.** One 4 KB
