@@ -19,6 +19,9 @@ use cortiq_core::CmfModel;
 use cortiq_engine::{Pipeline, SamplerConfig};
 
 struct Ctx {
+    /// Kept so the network split can prove identity (`dir_hash`) and
+    /// geometry to a peer without reopening the file.
+    model: Arc<CmfModel>,
     pipeline: Mutex<Pipeline>,
     /// Clone of the pipeline's cancel flag — reachable while the
     /// pipeline mutex is held by a running generation.
@@ -33,6 +36,22 @@ struct Ctx {
 thread_local! {
     static LAST_ERROR: std::cell::RefCell<CString> =
         std::cell::RefCell::new(CString::new("").unwrap());
+}
+
+thread_local! {
+    /// Return buffer for JSON getters (`cortiq_peer_stats`). Per-thread
+    /// so two callers cannot free each other's string.
+    static LAST_JSON: std::cell::RefCell<CString> =
+        std::cell::RefCell::new(CString::new("{}").unwrap());
+}
+
+/// Park a JSON answer in this thread's buffer and hand out its pointer.
+/// Valid until the next JSON getter call on the same thread.
+fn set_last_json(s: &str) -> *const c_char {
+    LAST_JSON.with(|j| {
+        *j.borrow_mut() = CString::new(s.replace('\0', " ")).unwrap_or_default();
+        j.borrow().as_ptr()
+    })
 }
 
 fn set_error(msg: &str) {
@@ -86,6 +105,7 @@ pub extern "C" fn cortiq_load(path: *const c_char) -> *mut c_void {
             }
         };
         Box::into_raw(Box::new(Ctx {
+            model,
             cancel: pipeline.cancel.clone(),
             pipeline: Mutex::new(pipeline),
             enable_thinking: Mutex::new(None),
@@ -286,6 +306,18 @@ fn run_generate_ids(
             .tokenizer
             .apply_chat_template_opts(&history, thinking),
     };
+    // A configured peer routes the whole generation through the layer
+    // split. Same ids, same callback, same result shape — the caller
+    // cannot tell except by the speed and the model it can now run.
+    if peer_configured() {
+        return match generate_over_peer(ctx, &mut pipeline, &ids, max_tokens as usize, on_token) {
+            Ok(n) => n,
+            Err(e) => {
+                set_error(&format!("peer generate: {e}"));
+                -1
+            }
+        };
+    }
     match pipeline.generate_from_ids(&ids, max_tokens as usize, None, on_token) {
         Ok(res) => res.tokens_generated as i32,
         Err(e) => {
@@ -590,4 +622,287 @@ mod tests {
         let v = unsafe { CStr::from_ptr(cortiq_version()) };
         assert!(v.to_str().unwrap().starts_with("0."));
     }
+}
+
+// ── Network: the worker as a library, and the peer as a setting ──────
+//
+// Phase 4b of the multi-device roadmap needs the worker to BE a library,
+// not only a binary: iOS cannot spawn one, and an Android app that ships
+// a `.so` should not have to ship a second executable next to it. Both
+// entry points are additive — a caller that never touches them sees the
+// old ABI unchanged.
+
+/// `cortiq worker` as a call: hold this device's model and serve layer
+/// spans to a coordinator. Runs on a background thread and returns
+/// immediately; the listener lives until the process exits.
+///
+/// JSON: `{"model":"/path/x.cmf","listen":"0.0.0.0:9911","token":"secret"}`
+/// `token` is REQUIRED for any address beyond loopback — the worker
+/// refuses otherwise rather than serving a stranger's coordinator.
+/// Returns 0 once the socket is bound and listening, −1 with
+/// `cortiq_last_error` if the bind or the model open failed.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_worker_start(config_json: *const c_char) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(cfg) = read_json(config_json, "worker config") else {
+            return -1;
+        };
+        let model = match cfg.get("model").and_then(|v| v.as_str()) {
+            Some(m) => m.to_string(),
+            None => {
+                set_error("worker config: \"model\" (path to the .cmf) is required");
+                return -1;
+            }
+        };
+        let listen = cfg
+            .get("listen")
+            .and_then(|v| v.as_str())
+            .unwrap_or("127.0.0.1:9911")
+            .to_string();
+        let token = cfg
+            .get("token")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        // Bind here, on the caller's thread, so a busy port or a missing
+        // file is an error the app can show — not a silent dead thread.
+        let probe = std::net::TcpListener::bind(&listen);
+        match probe {
+            Ok(l) => drop(l),
+            Err(e) => {
+                set_error(&format!("worker listen {listen}: {e}"));
+                return -1;
+            }
+        }
+        if !std::path::Path::new(&model).exists() {
+            set_error(&format!("worker model {model}: no such file"));
+            return -1;
+        }
+        let cfg = cortiq_net::WorkerConfig {
+            model_path: model,
+            listen: listen.clone(),
+            token,
+        };
+        std::thread::Builder::new()
+            .name("cortiq-worker".into())
+            .spawn(move || {
+                if let Err(e) = cortiq_net::worker_serve(cfg) {
+                    eprintln!("cortiq worker: {e}");
+                }
+            })
+            .map(|_| 0)
+            .unwrap_or_else(|e| {
+                set_error(&format!("worker thread: {e}"));
+                -1
+            })
+    }))
+    .unwrap_or_else(|_| {
+        set_error("panic in cortiq_worker_start");
+        -1
+    })
+}
+
+/// Point this process at a `cortiq worker` holding the tail of the SAME
+/// model: every later generate runs as a layer split.
+///
+/// JSON: `{"addr":"192.168.1.5:9911","token":"secret","split":0,
+///         "dtype":"f16","head":true}`
+/// - `split` — first layer the peer runs; 0 = it runs all of them and
+///   this side keeps only the tokenizer. Default: half the stack.
+/// - `head` — the peer also owns lm_head and the sampler and answers
+///   token ids. On a phone that is worth ~29 ms of a 73 ms token,
+///   because the head does not shrink as you move layers away.
+/// - `dtype` — `f32` reproduces the local text bit for bit; `f16` halves
+///   the wire and legally changes it.
+///
+/// Pass `null` or `{}` to clear and go back to local-only. Returns 0, or
+/// −1 with `cortiq_last_error`. The connection itself is made lazily on
+/// the next generate, so a peer that is not up yet fails THERE, with a
+/// message, instead of at configuration time.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_set_peer(config_json: *const c_char) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if config_json.is_null() {
+            clear_peer();
+            return 0;
+        }
+        let Some(cfg) = read_json(config_json, "peer config") else {
+            return -1;
+        };
+        let Some(addr) = cfg.get("addr").and_then(|v| v.as_str()) else {
+            clear_peer();
+            return 0;
+        };
+        let dtype = cfg.get("dtype").and_then(|v| v.as_str()).unwrap_or("f32");
+        if dtype != "f32" && dtype != "f16" {
+            set_error(&format!("peer config: dtype {dtype:?} is not f32 or f16"));
+            return -1;
+        }
+        let want = PeerCfg {
+            addr: addr.to_string(),
+            token: cfg
+                .get("token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            split: cfg.get("split").and_then(|v| v.as_u64()).map(|v| v as usize),
+            f16: dtype == "f16",
+            head: cfg.get("head").and_then(|v| v.as_bool()).unwrap_or(false),
+        };
+        match PEER.lock() {
+            Ok(mut g) => {
+                // A changed target invalidates the live connection; the
+                // next generate dials the new one.
+                if g.as_ref().map(|c| c.cfg.clone()) != Some(want.clone()) {
+                    *g = Some(PeerState {
+                        cfg: want,
+                        seg: None,
+                    });
+                }
+                0
+            }
+            Err(_) => {
+                set_error("peer mutex poisoned");
+                -1
+            }
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_error("panic in cortiq_set_peer");
+        -1
+    })
+}
+
+#[derive(Clone, PartialEq)]
+struct PeerCfg {
+    addr: String,
+    token: String,
+    split: Option<usize>,
+    f16: bool,
+    head: bool,
+}
+
+struct PeerState {
+    cfg: PeerCfg,
+    /// Kept across generates so cross-turn KV reuse survives a chat turn.
+    seg: Option<cortiq_net::RemoteSegment>,
+}
+
+static PEER: Mutex<Option<PeerState>> = Mutex::new(None);
+
+fn clear_peer() {
+    if let Ok(mut g) = PEER.lock() {
+        *g = None;
+    }
+}
+
+fn peer_configured() -> bool {
+    PEER.lock().map(|g| g.is_some()).unwrap_or(false)
+}
+
+fn read_json(p: *const c_char, what: &str) -> Option<serde_json::Value> {
+    if p.is_null() {
+        set_error(&format!("{what}: NULL"));
+        return None;
+    }
+    let s = match unsafe { CStr::from_ptr(p) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            set_error(&format!("{what}: not valid UTF-8"));
+            return None;
+        }
+    };
+    match serde_json::from_str(s) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            set_error(&format!("{what}: {e}"));
+            None
+        }
+    }
+}
+
+/// Run one generation over the configured peer. The segment is cached
+/// between calls: a chat turn that extends the previous one reuses both
+/// KVs, which is the whole point of holding the connection open.
+fn generate_over_peer(
+    ctx: &Ctx,
+    pipeline: &mut Pipeline,
+    ids: &[u32],
+    max_tokens: usize,
+    on_token: Option<cortiq_engine::TokenCallback>,
+) -> Result<i32, String> {
+    let mut guard = PEER.lock().map_err(|_| "peer mutex poisoned".to_string())?;
+    let state = guard.as_mut().ok_or("no peer configured")?;
+    let nl = pipeline.num_layers;
+    let split = state.cfg.split.unwrap_or(nl / 2).min(nl - 1);
+    if state.seg.is_none() {
+        let dtype = if state.cfg.f16 {
+            cortiq_net::WireDtype::F16
+        } else {
+            cortiq_net::WireDtype::F32
+        };
+        let spec = cortiq_net::SessionSpec {
+            skill: None,
+            task: None,
+            o1: None,
+            head: state.cfg.head,
+            sampler: if state.cfg.head {
+                Some(
+                    serde_json::to_string(&pipeline.sampler_config)
+                        .map_err(|e| format!("sampler config: {e}"))?,
+                )
+            } else {
+                None
+            },
+        };
+        state.seg = Some(cortiq_net::RemoteSegment::connect(
+            &state.cfg.addr,
+            &state.cfg.token,
+            ctx.model.dir_hash(),
+            &ctx.model.arch().arch_name,
+            nl,
+            pipeline.hidden_size,
+            split,
+            nl - 1,
+            dtype,
+            &spec,
+        )?);
+    }
+    let seg = state.seg.as_mut().expect("connected above");
+    match cortiq_net::generate_split(pipeline, seg, ids, max_tokens, None, on_token) {
+        Ok((res, _stats)) => Ok(res.tokens_generated as i32),
+        Err(e) => {
+            // A broken wire must not leave a half-session behind: drop
+            // the segment so the next call redials instead of inheriting
+            // a KV the peer no longer has.
+            state.seg = None;
+            Err(e)
+        }
+    }
+}
+
+/// What the configured peer is worth right now, as JSON — thermal state,
+/// mains power, the clock its fastest core is actually running at, free
+/// memory. `{}` when no peer is configured. The string is valid until
+/// the next call from this thread.
+///
+/// A phone's budget is not a constant: the same worker served a span at
+/// 22.6 ms and then 42.4 ms with no temperature change, purely because
+/// the governor let the clock fall. An app that plans once and never
+/// looks again will keep a plan that stopped being true.
+#[unsafe(no_mangle)]
+pub extern "C" fn cortiq_peer_stats() -> *const c_char {
+    let json = catch_unwind(AssertUnwindSafe(|| {
+        let mut guard = PEER.lock().ok()?;
+        let state = guard.as_mut()?;
+        let seg = state.seg.as_mut()?;
+        match seg.stats() {
+            Ok(s) => serde_json::to_string(&s).ok(),
+            Err(_) => None,
+        }
+    }))
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "{}".to_string());
+    set_last_json(&json)
 }
