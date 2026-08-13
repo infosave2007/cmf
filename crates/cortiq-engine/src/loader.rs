@@ -466,6 +466,9 @@ impl Pipeline {
         if let Some(dir) = model.path.parent() {
             crate::gpu::set_cache_dir(dir.to_path_buf());
         }
+        // A new model gets a fresh verdict on whether the token graph can
+        // be built: the refusal is remembered per model, not per process.
+        crate::gpu::graph_unsupported_reset();
         Self::skill_file_guard(model)?;
         let skill = match ov {
             Overlay::One(s) => Some(*s),

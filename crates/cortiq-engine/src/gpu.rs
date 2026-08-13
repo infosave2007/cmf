@@ -2110,6 +2110,34 @@ const GRAPH_RACE_SAMPLES: u32 = 4;
 
 /// Called at every generation start (fresh KV). Applies a pending
 /// verdict and picks this generation's arm while racing.
+/// A graph that cannot be built for THIS model will never build: the
+/// refusal is a property of the weights, not of the moment. Retrying it
+/// per token is not free — the builder walks every layer and asks each
+/// tensor for a graph view before giving up at layer 0 — and on an
+/// Adreno 642L that retry cost 3x: forcing the graph on a model it
+/// refuses measured 0.3 tok/s against 0.905 for the per-op path it falls
+/// back to. Remembered once, the fallback runs at its own speed.
+static GRAPH_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+/// The builder refused for a STRUCTURAL reason — an unsupported weight
+/// or layer kind. Callers must NOT report the transient refusals (an
+/// unsealed o1 state during prefill, a softcap): those clear on their
+/// own and marking them would disable the graph for good.
+pub fn graph_mark_unsupported() {
+    if !GRAPH_UNSUPPORTED.swap(true, Ordering::Relaxed) {
+        tracing::info!("wgpu token graph: unsupported for this model — not retrying");
+    }
+}
+
+pub fn graph_unsupported() -> bool {
+    GRAPH_UNSUPPORTED.load(Ordering::Relaxed)
+}
+
+/// A different model in the same process starts with a clean slate.
+pub fn graph_unsupported_reset() {
+    GRAPH_UNSUPPORTED.store(false, Ordering::Relaxed);
+}
+
 pub fn graph_race_begin_generation() {
     // One generation has now compiled whatever this model needs; keep it
     // for the next process. Once per run: the blob does not grow after

@@ -4503,7 +4503,13 @@ impl Pipeline {
             Some(_) => true,
             None => crate::gpu::wgpu_graph_default(),
         };
-        if !graph_on {
+        if !graph_on || crate::gpu::graph_unsupported() {
+            // Same memo as the decode site: this path builds the very
+            // same graph, so a model it cannot build for must not be
+            // walked again here either. Missing this guard was worth
+            // 2.5x on an Adreno — 0.361 tok/s against 0.905 — because
+            // the burst retried per token what decode had already given
+            // up on.
             return None;
         }
         let emb = self.embed_single(t_next);
@@ -5744,13 +5750,24 @@ fn draft_probe() -> bool {
         };
         let graph_trusted =
             graph_env.is_some() || crate::gpu::wgpu_graph_default() || self.gdn_cfg.is_some();
-        let race_eligible = graph_on && upto.is_none() && task_mask.is_none() && from == 0;
+        let race_eligible = graph_on
+            && upto.is_none()
+            && task_mask.is_none()
+            && from == 0
+            && !crate::gpu::graph_unsupported();
         let mut tail_start = 0usize;
         if race_eligible && crate::gpu::graph_race_use_graph(graph_trusted) {
             let t_graph = std::time::Instant::now();
             let mut lg = Vec::new();
             let mut gl = 0usize;
             let built = self.try_token_graph_wgpu(hidden, position, &mut lg, &mut gl);
+            // Past the transient guards (o1 still collecting, a softcap)
+            // a refusal is about the weights and will never change —
+            // remember it instead of walking every layer again next
+            // token.
+            if built.is_none() && !self.o1_active() && self.attn_softcap == 0.0 {
+                crate::gpu::graph_mark_unsupported();
+            }
             graph_note(built.is_some());
             if let Some(hh) = built {
                 let dur = t_graph.elapsed();
