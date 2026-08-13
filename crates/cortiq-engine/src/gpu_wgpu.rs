@@ -19428,6 +19428,14 @@ pub fn dit_attention_packed(
     dit_attention_packed_src(qkv, None, nh, n, hd, scale, nr, out, None, 0, None)
 }
 
+/// The two things `dit_attention_packed_src` checks before it can do
+/// anything: a live context and the split pipeline. A caller that is
+/// about to SKIP work on the strength of this arm has to know now — a
+/// refusal discovered later leaves q/k unnormalized with no way back.
+pub fn dit_attention_packed_ready() -> bool {
+    ctx().is_some_and(|c| c.dit_qkv_split.is_some())
+}
+
 /// The same, with the panel possibly ALREADY on the card (`pre`): its
 /// GEMM kept it there, so nothing is uploaded and nothing was read back
 /// — 320 MB a block that used to cross the bus twice.

@@ -884,8 +884,14 @@ impl MiniMaxH3 {
         // size: 104.9 → 98.1 s, frames bit-identical.
         // `CMF_MMH3_FUSEQKV=0` sends the panel home again.
         let t_qkv = std::time::Instant::now();
+        // Ask whether the device can TAKE the norm, not merely whether a
+        // device exists. Skipping the host loop for a backend with no
+        // packed kernel hands the attention unnormalized q/k and there is
+        // no way back from there — which is why the refusal below used to
+        // be an assert.
         let qk_gpu = std::env::var("CMF_MMH3_QKNORM").as_deref() != Ok("cpu")
             && crate::gpu::enabled_here()
+            && crate::gpu::dit_attention_packed_available()
             && n >= 256;
         if qk_gpu && std::env::var("CMF_MMH3_FUSEQKV").as_deref() != Ok("0") {
             // Best case first: qkv, attention and the output projection

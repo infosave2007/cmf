@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`cortiq animate` panicked on every run on macOS.**
+  `gpu::dit_attention_packed` was compiled out under
+  `not(target_os = "macos")`, so on that platform it was a silent
+  `false` — and `mmh3::attention` turns that refusal into
+  `assert!(nr.is_none())`, because the block had already SKIPPED the
+  host qk-norm on the strength of the device taking it. The decision to
+  skip asked only whether a GPU existed (`enabled_here() && n >= 256`),
+  never whether this backend had the kernel. It now asks
+  `dit_attention_packed_available()`, which consults the live wgpu
+  context and its `dit_qkv_split` pipeline, and the wgpu arm compiles on
+  macOS too — `CMF_GPU=wgpu` runs it over Metal like anywhere else. A
+  device that refuses is a fallback again, not a crash.
+
+  Measured on an M4 after the fix, 256×160×22 at four steps: native
+  Metal 46.1 s, wgpu 117.3 s. Both correct, and neither ran at all
+  before.
+
+### Known
+- **The native Metal backend degenerates as the sequence grows.** On an
+  M4, 256×160 renders correctly; 512×256 and 512×288 come out uniform
+  grey. wgpu renders 512×288 on the same machine and the same file
+  correctly (747.7 s against Metal's 249.6 s of grey), so it is the
+  backend and not the model, the file or the resolution's VAE tiling —
+  512×256 fails too, which rules out the 288-pixel edge. Not the
+  documented cooperative-matrix overflow either: that lives in the wgpu
+  kernel and `gpu_metal.rs` has no coop path. Until it is found, use
+  `CMF_GPU=wgpu` on macOS above 256×160.
+
 ## [0.5.73] - 2026-08-13
 
 **A video model fits a 20 GB card by swapping its prompt encoder, not by
