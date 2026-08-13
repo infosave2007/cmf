@@ -14317,6 +14317,13 @@ pub fn forward_token_graph(
     // Encode one matvec, dtype-dispatched: q8_row (encode_matvec + row
     // scales) or q1 (encode_matvec_q1). Each is its own pass.
     //
+    // MEASURED, and it corrects two earlier readings in this file: the
+    // round trip to an Adreno 642L is 0.24-0.49 ms (`cortiq gpu` prints
+    // it), so the 112 dispatches a token cost ~27 ms of a 1100 ms token.
+    // The other 1070 ms is the KERNELS — about 550 MB/s of weight
+    // streaming where the CPU on the same chip does 6900. Latency is not
+    // the wall here; the shaders are, and they are the work.
+    //
     // Pass-grouping: worth doing, but NOT the wall. On an Adreno 642L
     // folding the FFN's `down` into the gate/up/silu pass took a token
     // from 319 passes to 256 and its time from 1437 ms to 1405 — the
@@ -21072,6 +21079,67 @@ fn spin_wait() -> bool {
 /// whether a decode step is compute-bound or latency-bound — and it is not
 /// derivable from anything else the profile prints.
 pub static SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What a round trip to this device costs, with nothing in it.
+///
+/// The number the whole mobile-GPU investigation needed and did not
+/// have: if an EMPTY submit-and-wait already costs milliseconds, no
+/// kernel work can be blamed for a slow token, and no amount of kernel
+/// tuning can help. Returns (empty submit+fence, submit+dispatch+readback)
+/// in milliseconds per iteration.
+pub fn roundtrip_bench(n: usize) -> Option<(f64, f64)> {
+    let c = ctx()?;
+    let n = n.max(1);
+    // 1. Submit an empty encoder and wait for the queue to drain.
+    let t0 = std::time::Instant::now();
+    for _ in 0..n {
+        let enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rt-empty") });
+        c.queue.submit([enc.finish()]);
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+    let empty_ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
+
+    // 2. The shape the per-op path actually pays: one trivial dispatch,
+    //    then a staged readback of its output.
+    let y = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rt-y"),
+        size: 1024,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rt-stage"),
+        size: 1024,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let p_buf = uniform_u32x4(c, [256, 0, 0, 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.zero.get_bind_group_layout(0),
+        entries: &[bind_buf(0, &y), bind_buf(1, &p_buf)],
+    });
+    let mut out = vec![0f32; 256];
+    let t1 = std::time::Instant::now();
+    for _ in 0..n {
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rt-one") });
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(&c.zero);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        if !readback(c, enc, &y, &stage, 1024, &mut out) {
+            return None;
+        }
+    }
+    let one_ms = t1.elapsed().as_secs_f64() * 1e3 / n as f64;
+    Some((empty_ms, one_ms))
+}
 
 /// Weight residency: how much went to the card and how long it took. The
 /// first token pays all of it, and on a 92 GB expert stack that was half an
