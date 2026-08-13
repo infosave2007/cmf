@@ -322,6 +322,51 @@ impl Music3Dit {
         }
         ch
     }
+
+    /// Denoise `[128, n]` from noise to a latent, `steps` Euler steps
+    /// along σ: 1 → 0. `progress` is called with (step, total).
+    pub fn sample(
+        &self,
+        noise: &[f32],
+        condition: &[f32],
+        n: usize,
+        steps: usize,
+        mut progress: impl FnMut(usize, usize),
+    ) -> Vec<f32> {
+        let sigmas = flow_sigmas(steps);
+        let mut x = noise.to_vec();
+        for i in 0..steps {
+            let (s, s_next) = (sigmas[i], sigmas[i + 1]);
+            // ComfyUI's process_timestep for this model.
+            let v = self.forward(&x, condition, n, 1.0 - s);
+            let dt = s_next - s;
+            for (a, b) in x.iter_mut().zip(&v) {
+                *a += dt * b;
+            }
+            progress(i + 1, steps);
+        }
+        x
+    }
+}
+
+/// Euler flow-matching sampler for Music-3.
+///
+/// ComfyUI registers this model as a plain `ModelType.FLOW` with
+/// `multiplier: 1.0` and `process_timestep(t) = 1.0 - t`, so the sampler
+/// is the ordinary one and NOT the `FlowMatchEulerDiscreteScheduler`
+/// named in MiniMax's own `scheduler_config.json` — that belongs to
+/// their diffusers pipeline. Worth stating because the config is the
+/// first thing you find and it sends you somewhere else: with
+/// `num_train_timesteps: 1` its schedule degenerates to a constant,
+/// which is the tell that the caller supplies the sigmas.
+///
+/// σ walks 1 → 0, the DiT is asked at `1 − σ`, and the step is
+/// `x += (σ_next − σ)·v`. The DiT already negates its own output, so
+/// the sign lives there rather than here.
+pub fn flow_sigmas(steps: usize) -> Vec<f32> {
+    (0..=steps)
+        .map(|i| 1.0 - i as f32 / steps as f32)
+        .collect()
 }
 
 /// RMSNorm with a weight and no bias, eps 1e-6.
@@ -527,6 +572,51 @@ impl RvqDepthDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The half that is finished, end to end: noise → Euler sampler →
+    /// vocoder → PCM. It does not make music (the conditioning would
+    /// come from the AR stack), but it proves the three implemented
+    /// components compose — the sampler's σ walk, the DiT's timestep
+    /// convention and the vocoder's hop all have to agree for the
+    /// sample count to land, and the count is fixed by the reference.
+    #[test]
+    fn music3_sampler_and_vocoder_compose() {
+        let Ok(p) = std::env::var("CMF_MUSIC3_DIT") else {
+            eprintln!("CMF_MUSIC3_DIT unset — skipping Music-3 chain test");
+            return;
+        };
+        let model = Arc::new(CmfModel::open(&p).expect("open pack"));
+        let dit = Music3Dit::from_cmf(&model).expect("load DiT");
+        let dav = crate::audiovae::Music3Dav::from_cmf(&model).expect("load DAV");
+        let n = 6usize;
+        // A fixed pseudo-noise: the test must not depend on an RNG.
+        let noise: Vec<f32> = (0..Music3Dit::IN_CH * n)
+            .map(|i| (((i * 2654435761) % 1000) as f32 / 500.0) - 1.0)
+            .collect();
+        let cond = vec![0f32; Music3Dit::COND_CH * n];
+        let steps = 3;
+        let mut seen = 0usize;
+        let latent = dit.sample(&noise, &cond, n, steps, |i, t| {
+            assert_eq!(t, steps);
+            seen = i;
+        });
+        assert_eq!(seen, steps, "sampler reported every step");
+        assert_eq!(latent.len(), Music3Dit::IN_CH * n);
+        assert!(latent.iter().all(|v| v.is_finite()), "latent went non-finite");
+        let pcm = dav.decode(&latent, n, None);
+        assert_eq!(
+            pcm.len(),
+            n * crate::audiovae::Music3Dav::HOP * 2,
+            "the chain's sample count is frames x 512 x 2"
+        );
+        assert!(pcm.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+        let secs = (n * crate::audiovae::Music3Dav::HOP) as f32
+            / crate::audiovae::Music3Dav::SAMPLE_RATE as f32;
+        eprintln!(
+            "music3 chain: {n} frames -> {} stereo samples ({secs:.3} s at 44.1 kHz)",
+            pcm.len() / 2
+        );
+    }
 
     /// The depth decoder must be CAUSAL — that is the only thing its
     /// attention mask does, and losing it lets a codebook level see its
