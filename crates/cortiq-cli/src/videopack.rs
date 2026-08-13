@@ -636,30 +636,53 @@ fn pack_te(
     path: &Path,
     level: Level,
     embed_level: Level,
+    keep: Option<usize>,
 ) -> anyhow::Result<serde_json::Value> {
     let te = StFile::open(path)?;
-    let n = (0..)
-        .take_while(|i| te.has(&format!("model.layers.{i}.self_attn.q_proj.weight")))
+    // Qwen3-VL ships under two roots: a text-only truncation keeps the
+    // plain `model.` of a Qwen3, while a full VL checkpoint (what the
+    // ComfyUI single-files are) puts the LM under `model.language_model.`
+    // beside `model.visual.`. Same tensors either way.
+    let root = ["model.", "model.language_model."]
+        .into_iter()
+        .find(|r| te.has(&format!("{r}layers.0.self_attn.q_proj.weight")))
+        .ok_or_else(|| anyhow!("{}: no layers under model. or model.language_model.", path.display()))?;
+    let have = (0..)
+        .take_while(|i| te.has(&format!("{root}layers.{i}.self_attn.q_proj.weight")))
         .count();
-    if n == 0 {
-        return Err(anyhow!("{}: no layers", path.display()));
+    // The conditioning is a TAP, not a whole encoder: H3's own file is
+    // the 32 B truncated at 50, and a ClipProj stand-in is truncated at
+    // the layer its projection was fitted on. Layers above the tap are
+    // never executed, so packing them is pure file size.
+    let n = match keep {
+        Some(k) if k == 0 || k > have => {
+            return Err(anyhow!(
+                "--te-layers {k}: the checkpoint has {have} layers"
+            ));
+        }
+        Some(k) => k,
+        None => have,
+    };
+    if n < have {
+        eprintln!("te: tapping {n} of {have} layers");
     }
-    let hidden = te.shape("model.layers.0.self_attn.q_proj.weight").unwrap()[1];
-    let head_dim = te.shape("model.layers.0.self_attn.q_norm.weight").unwrap()[0];
-    let nh = te.shape("model.layers.0.self_attn.q_proj.weight").unwrap()[0] / head_dim;
-    let nkv = te.shape("model.layers.0.self_attn.k_proj.weight").unwrap()[0] / head_dim;
-    let inter = te.shape("model.layers.0.mlp.gate_proj.weight").unwrap()[0];
-    let vocab = te.shape("model.embed_tokens.weight").unwrap()[0];
+    let sh = |k: &str| te.shape(&format!("{root}{k}")).map(|s| s.to_vec());
+    let hidden = sh("layers.0.self_attn.q_proj.weight").unwrap()[1];
+    let head_dim = sh("layers.0.self_attn.q_norm.weight").unwrap()[0];
+    let nh = sh("layers.0.self_attn.q_proj.weight").unwrap()[0] / head_dim;
+    let nkv = sh("layers.0.self_attn.k_proj.weight").unwrap()[0] / head_dim;
+    let inter = sh("layers.0.mlp.gate_proj.weight").unwrap()[0];
+    let vocab = sh("embed_tokens.weight").unwrap()[0];
 
     push_exact(
         specs,
         &te,
-        "model.embed_tokens.weight",
+        &format!("{root}embed_tokens.weight"),
         "te.embed_tokens.weight",
         embed_level,
     )?;
     for l in 0..n {
-        let p = format!("model.layers.{l}");
+        let p = format!("{root}layers.{l}");
         for k in [
             "self_attn.q_proj",
             "self_attn.k_proj",
@@ -708,6 +731,64 @@ fn pack_te(
         // layer: the checkpoint is truncated there and ships no
         // final norm.
         "final_norm": false,
+    }))
+}
+
+/// ClipProj: a SMALL Qwen3-VL stands in for the 32 B encoder, and a
+/// fitted affine map carries its tapped hidden state into the space the
+/// DiT was conditioned on —
+///
+/// ```text
+/// cond = ((h - mean_in) / std_in) @ W * std_out + mean_out
+/// ```
+///
+/// with the GELU residual, when the file carries one, added in the
+/// STANDARDIZED space (before `std_out`/`mean_out`), and token 0 —
+/// the attention sink, an outlier no regression fits — overwritten by
+/// a stored vector rather than projected.
+///
+/// Every byte of it stays exact. It is 304 MB deciding whether a 13 GB
+/// saving still reads as the same prompt; quantizing the regression
+/// that carries the whole substitution would be a false economy.
+fn pack_clip_proj(
+    specs: &mut Vec<TensorSpec>,
+    path: &Path,
+) -> anyhow::Result<serde_json::Value> {
+    let p = StFile::open(path)?;
+    let w = p
+        .shape("W")
+        .ok_or_else(|| anyhow!("{}: no W — not a ClipProj file", path.display()))?
+        .to_vec();
+    if w.len() != 2 {
+        return Err(anyhow!("{}: W is {:?}, expected [d_in, d_out]", path.display(), w));
+    }
+    let (d_in, d_out) = (w[0], w[1]);
+    for k in ["W", "mean_in", "std_in", "mean_out", "std_out", "sink_out"] {
+        push_exact(specs, &p, k, &format!("te.proj.{k}"), Level::F32)?;
+    }
+    let mlp = p.has("mlp.0.weight");
+    let mut mlp_hidden = 0usize;
+    if mlp {
+        mlp_hidden = p
+            .shape("mlp.0.weight")
+            .ok_or_else(|| anyhow!("clip-proj: mlp.0.weight has no shape"))?[0];
+        for k in ["mlp.0.weight", "mlp.0.bias", "mlp.2.weight", "mlp.2.bias"] {
+            push_exact(specs, &p, k, &format!("te.proj.{k}"), Level::F32)?;
+        }
+    }
+    eprintln!(
+        "clip-proj: {d_in} -> {d_out}{}",
+        if mlp {
+            format!(" + GELU residual through {mlp_hidden}")
+        } else {
+            String::new()
+        }
+    );
+    Ok(serde_json::json!({
+        "d_in": d_in,
+        "d_out": d_out,
+        "mlp": mlp,
+        "mlp_hidden": mlp_hidden,
     }))
 }
 
@@ -1030,6 +1111,8 @@ pub struct PackArgs<'a> {
     pub time_embedder: Option<&'a str>,
     pub lora_scale: f32,
     pub te: Option<&'a str>,
+    pub clip_proj: Option<&'a str>,
+    pub te_layers: Option<usize>,
     pub video_vae: Option<&'a str>,
     pub audio_vae: Option<&'a str>,
     pub tokenizer: Option<&'a str>,
@@ -1054,12 +1137,26 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
     let mut specs: Vec<TensorSpec> = Vec::new();
     let mut prov = serde_json::Map::new();
+    let mut clip_d_out = 0usize;
 
     if let Some(p) = args.te {
-        let cfg = pack_te(&mut specs, Path::new(p), level, level)?;
+        let cfg = pack_te(&mut specs, Path::new(p), level, level, args.te_layers)?;
         specs.push(config_spec("te", &cfg));
         prov.insert("te".into(), serde_json::json!(p));
         eprintln!("te packed ({:.1}s)", t0.elapsed().as_secs_f64());
+    } else if args.te_layers.is_some() {
+        return Err(anyhow!("--te-layers only means something with --te"));
+    }
+    if let Some(p) = args.clip_proj {
+        if args.te.is_none() && args.carry.is_none() {
+            return Err(anyhow!(
+                "--clip-proj projects FROM an encoder: pass --te, or --in a file that has one"
+            ));
+        }
+        let cfg = pack_clip_proj(&mut specs, Path::new(p))?;
+        clip_d_out = cfg["d_out"].as_u64().unwrap_or(0) as usize;
+        specs.push(config_spec("te.proj", &cfg));
+        prov.insert("clip_proj".into(), serde_json::json!(p));
     }
     if let Some(p) = args.dit {
         let cfg = pack_dit(
@@ -1111,13 +1208,62 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
         )),
         None => None,
     };
+    // A projection that does not land in the DiT's conditioning width
+    // is some other model's projection. Say so before writing 14 GB.
+    if clip_d_out != 0 {
+        let dcfg = specs
+            .iter()
+            .find(|s| s.name == "dit.config_json")
+            .map(|s| s.data.clone())
+            .or_else(|| {
+                carried
+                    .as_ref()
+                    .and_then(|m| m.tensor_bytes("dit.config_json").ok())
+                    .map(|b| b.to_vec())
+            });
+        let want = dcfg
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["text_dim"].as_u64())
+            .unwrap_or(0) as usize;
+        if want != 0 && want != clip_d_out {
+            return Err(anyhow!(
+                "--clip-proj emits {clip_d_out}-wide conditioning, this DiT takes {want}"
+            ));
+        }
+    }
     let mut refs: Vec<TensorSpecRef> = Vec::new();
     let mut vocab_carried: Option<Vec<u8>> = None;
+    // Re-running a component replaces it WHOLE. Name-by-name is not
+    // enough: a 25-layer encoder packed over a carried 50-layer one
+    // leaves `te.layers.25..49` of the old stack in the file — six
+    // gigabytes of weight that `num_hidden_layers` then excludes from
+    // the forward, so it costs disk and VRAM budget and never runs.
+    // `--clip-proj` alone replaces only the projection, because there
+    // the carried encoder is the thing it projects from.
+    let mut drop_pre: Vec<&str> = Vec::new();
+    if args.te.is_some() {
+        drop_pre.push("te.");
+    } else if args.clip_proj.is_some() {
+        drop_pre.push("te.proj.");
+    }
+    for (on, pre) in [
+        (args.dit.is_some(), "dit."),
+        (args.vision.is_some(), "vis."),
+        (args.video_vae.is_some(), "vvae."),
+        (args.audio_vae.is_some(), "avae."),
+    ] {
+        if on {
+            drop_pre.push(pre);
+        }
+    }
     if let Some(m) = &carried {
         let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
         for e in &m.tensors {
             if names.iter().any(|n| n == &e.name) {
                 continue; // a re-run of the same component wins
+            }
+            if drop_pre.iter().any(|p| e.name.starts_with(p)) {
+                continue; // …and takes the rest of its component with it
             }
             refs.push(TensorSpecRef {
                 name: e.name.clone(),

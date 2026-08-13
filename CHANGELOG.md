@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.73] - 2026-08-13
+
+**A video model fits a 20 GB card by swapping its prompt encoder, not by
+spending fewer bits.** Half of MiniMax-H3's file is a Qwen3-VL-32B truncated
+at layer 50 — 12.2 GB that runs once per generation and then sits in the way
+of the DiT that actually draws. The `q2tp` build squeezed it and the model
+stopped following the prompt. Replacing it instead keeps four bits everywhere:
+
+| `mmh3-turbo-*-q4tp.cmf` | encoder | file | prompt encode |
+|---|---|---|---|
+| stock | 32B @ 50 | 23.47 GB | 49.2 s |
+| ClipProj | 4B @ 24 | **13.16 GB** | **1.9 s** |
+
+The conditioning is a tap, so the layers above it never execute and packing
+them is pure file size.
+
+### Added
+- **`animate-pack --clip-proj <file>` and `--te-layers <n>`.** A
+  [ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj) file carries a
+  ridge fit from a small Qwen3-VL's hidden state into the DiT's conditioning
+  space: `cond = ((h - mean_in)/std_in) @ W [+ GELU residual] * std_out +
+  mean_out`, with token 0 — the attention sink, an outlier no regression fits
+  — overwritten by a stored `sink_out`. All ten tensors are packed EXACT
+  (f32): 304 MB deciding whether a 10 GB saving still reads as the same
+  prompt is not where to spend a quantizer.
+- **`CMF_TE_DUMP=<path>`** writes the conditioning the DiT receives as
+  `[u64 n][u64 width]` then f32 rows. This is what makes the substitution
+  checkable without rendering a frame — cosine against the 32B on one prompt:
+  **0.9198** mean at tap 24 (worst token 0.7982), against a floor of 0.5914
+  between two different tokens of the teacher itself, and **0.9999** on the
+  sink. At tap 25 the worst token sits ON that floor, so the off-by-one in a
+  0-based tap index is a real failure mode and now has a cheap detector.
+- **`CMF_TE_TAP=<n>`** runs fewer encoder layers than the file carries, so a
+  tap can be calibrated against the teacher without repacking.
+
+### Fixed
+- **`animate-pack --in` carried components by TENSOR NAME.** A 24-layer
+  encoder packed over a carried 50-layer one left `te.layers.24..49` of the
+  old stack in the output — six gigabytes that `num_hidden_layers` then
+  excludes from the forward, so disk and VRAM budget pay for weight that
+  never runs, and the only symptom is a file that is inexplicably too big.
+  Re-running a component now replaces it whole.
+- **The prompt-encoder packer only knew `model.layers.N`.** A full Qwen3-VL
+  checkpoint — which is what the ComfyUI single-file text encoders are — puts
+  the LM under `model.language_model.` beside `model.visual.`, and packing
+  one failed with "no layers". Both roots are detected.
+- **q8_2f addressed its column-scale plane in whole words.** That plane starts
+  `rows` half-words after the int8 body, so on an ODD row count the old
+  address landed half a word early and every column scale was off by one f16.
+  No shipped file trips it (`down_proj` rows are even), which is exactly why
+  it needed a test rather than a rendering: `wgpu_q8_2f_odd_rows_matches_cpu_reference`.
+
+### Changed
+- **Adreno runs the q1 matvec as 16 rows / 256 threads** instead of the
+  desktop 8 / 128, reusing each staged activation tile twice as far; steady
+  decode 0.589 → 0.856 tok/s on an Adreno 642L. `CMF_Q1_RPG=8|16` pins it.
+  Read that number with its caveat: it is wall-clock, and the 8/128 baseline
+  wandered 0.589 / 0.602 / 0.758 across sessions on that phone, so only the
+  sign is safe. Other GPUs keep the measured desktop default.
+- **`bench --json` reports `tensor_dtypes`,** a histogram over every dtype in
+  the file. A whole Adreno tuning round went into a q8_2f kernel that the
+  measured artifact has zero tensors of, while wall-clock noise obligingly
+  drew an "effect" — two files named `bonsai` with the same 310 tensors and
+  different composition. A histogram, not three hand-picked counters: the q1
+  family alone is `q1`/`q1s`/`q1t`.
+- **`bench --json` GPU counters are steady-state deltas.** `wgpu_submits_per_token`
+  and `wgpu_passes_per_token` divided PROCESS-GLOBAL totals — warmup, prefill
+  and a microbenchmark included — by the tokens measured. They are now taken
+  between the first and last token stamp, the same window as
+  `decode_tok_s_steady`, and the counters themselves were made complete
+  (every pass and submit is counted, not most of them). The honest numbers
+  for a token graph on Adreno are **1 submit and 87 passes per token**, not
+  43 and 319 — which retracts "token time = pass count × 4.4 ms" from 0.5.72's
+  notes, a law derived entirely from the broken denominator.
+
+### Not fixed, stated plainly
+The ClipProj file renders the right clip with plainer set dressing: across the
+39 frames the pancake still leaves the surface and comes back, but the 32B's
+griddle and patterned wallpaper become a white plate and a flat ground. A 0.92
+cosine is close, not equal, and where it is not equal is the furniture. If you
+have the VRAM for the 32B encoder, use it.
+
 ## [0.5.72] - 2026-08-13
 
 **Turning the GPU on stopped costing three minutes.** On a Snapdragon

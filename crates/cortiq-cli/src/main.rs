@@ -15,6 +15,7 @@ mod videopack;
 
 use clap::{Parser, Subcommand};
 use cortiq_core::CmfModel;
+use cortiq_core::types::TensorDtype;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -976,6 +977,19 @@ enum Commands {
         /// Qwen3-VL-32B prompt encoder safetensors
         #[arg(long)]
         te: Option<String>,
+        /// Pack only the first N encoder layers. The conditioning is a
+        /// TAP, so everything above it never runs: H3's own file is the
+        /// 32B cut at 50, and a ClipProj stand-in is cut at the layer
+        /// its projection was fitted on
+        #[arg(long)]
+        te_layers: Option<usize>,
+        /// ClipProj projection (`mmh3-<size>-ClipProj*.safetensors`):
+        /// lets a SMALL Qwen3-VL stand in for the 32B encoder, its
+        /// tapped hidden state mapped into the DiT's conditioning space
+        /// by a fitted affine map. The encoder it projects from is
+        /// whatever `--te` packs — pass the matching one
+        #[arg(long)]
+        clip_proj: Option<String>,
         /// Video VAE (only the ViT3D decoder half is packed)
         #[arg(long)]
         video_vae: Option<String>,
@@ -1666,6 +1680,8 @@ async fn main() -> anyhow::Result<()> {
             time_embedder,
             lora_scale,
             te,
+            te_layers,
+            clip_proj,
             video_vae,
             audio_vae,
             tokenizer,
@@ -1682,6 +1698,8 @@ async fn main() -> anyhow::Result<()> {
             time_embedder: time_embedder.as_deref(),
             lora_scale,
             te: te.as_deref(),
+            te_layers,
+            clip_proj: clip_proj.as_deref(),
             video_vae: video_vae.as_deref(),
             audio_vae: audio_vae.as_deref(),
             tokenizer: tokenizer.as_deref(),
@@ -3569,41 +3587,34 @@ fn spawn_local_gpu_worker(model: &str, n: usize) -> anyhow::Result<LocalGpuWorke
     anyhow::bail!("локальный воркер не поднялся за 180 с")
 }
 
-/// Command-buffer round trips per token on Metal — each costs ~1.3 ms of
-/// completion latency, so this number IS that backend's frame budget.
-/// 0 elsewhere.
-fn metal_submits_per_token(tokens: usize) -> f64 {
-    #[cfg(all(target_os = "macos", feature = "gpu"))]
-    {
-        let n = cortiq_engine::gpu_metal::METAL_SUBMITS
-            .load(std::sync::atomic::Ordering::Relaxed);
-        return n as f64 / tokens.max(1) as f64;
-    }
-    #[cfg(not(all(target_os = "macos", feature = "gpu")))]
-    {
-        let _ = tokens;
-        0.0
-    }
+#[derive(Clone, Copy, Default)]
+struct GpuCounterSnapshot {
+    metal_submits: u64,
+    wgpu_submits: u64,
+    wgpu_passes: u64,
+    wgpu_upload_ns: u64,
+    wgpu_upload_bytes: u64,
 }
 
-/// The same question on wgpu, and one more: a compute PASS boundary is a
-/// tile store-and-restore on a mobile GPU, so passes a token can dominate
-/// even when submits a token is one. Both are 0 off the backend.
-fn wgpu_rate(tokens: usize) -> (f64, f64) {
+/// One coherent counter sample. Bench rates are computed from two samples in
+/// the same inter-token window as steady tok/s; process-global totals include
+/// warmup, prefill and the pair-fusion microbenchmark and are not per-token.
+fn gpu_counter_snapshot() -> GpuCounterSnapshot {
+    let mut s = GpuCounterSnapshot::default();
+    #[cfg(all(target_os = "macos", feature = "gpu"))]
+    {
+        s.metal_submits = cortiq_engine::gpu_metal::METAL_SUBMITS
+            .load(std::sync::atomic::Ordering::Relaxed) as u64;
+    }
     #[cfg(feature = "gpu")]
     {
         use std::sync::atomic::Ordering;
-        let t = tokens.max(1) as f64;
-        return (
-            cortiq_engine::gpu_wgpu::SUBMITS.load(Ordering::Relaxed) as f64 / t,
-            cortiq_engine::gpu_wgpu::PASSES.load(Ordering::Relaxed) as f64 / t,
-        );
+        s.wgpu_submits = cortiq_engine::gpu_wgpu::SUBMITS.load(Ordering::Relaxed);
+        s.wgpu_passes = cortiq_engine::gpu_wgpu::PASSES.load(Ordering::Relaxed);
+        s.wgpu_upload_ns = cortiq_engine::gpu_wgpu::UPLOAD_NS.load(Ordering::Relaxed);
+        s.wgpu_upload_bytes = cortiq_engine::gpu_wgpu::UPLOAD_BYTES.load(Ordering::Relaxed);
     }
-    #[cfg(not(feature = "gpu"))]
-    {
-        let _ = tokens;
-        (0.0, 0.0)
-    }
+    s
 }
 
 /// Milliseconds spent pushing weights to the device, and the megabytes
@@ -4332,6 +4343,23 @@ async fn cmd_bench(
         }
     }
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    // Keep every benchmark self-describing. Kernel conclusions are invalid
+    // if the measured artifact no longer contains the dtype under test —
+    // a whole Adreno tuning round was spent on a q8_2f kernel that this
+    // file has zero tensors of. The FULL histogram, not a hand-picked few:
+    // the q1 family alone is q1/q1s/q1t, and naming three dtypes here only
+    // moves the same trap one requantization along.
+    let tensor_count = model.tensors.len();
+    let mut tensor_dtypes: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    for t in &model.tensors {
+        *tensor_dtypes.entry(t.dtype.name()).or_default() += 1;
+    }
+    let dtype_n = |d: TensorDtype| tensor_dtypes.get(d.name()).copied().unwrap_or(0);
+    let (tensor_q1, tensor_q8_2f, tensor_f16) = (
+        dtype_n(TensorDtype::Q1),
+        dtype_n(TensorDtype::Q8_2f),
+        dtype_n(TensorDtype::F16),
+    );
     let mut pipeline = Pipeline::from_model(
         &model,
         SamplerConfig {
@@ -4493,6 +4521,11 @@ async fn cmd_bench(
         let graph_miss = missn - miss0;
         let out = serde_json::json!({
             "mode": "split",
+            "tensor_count": tensor_count,
+            "tensor_dtypes": tensor_dtypes,
+            "tensor_q1": tensor_q1,
+            "tensor_q8_2f": tensor_q8_2f,
+            "tensor_f16": tensor_f16,
             "split": split,
             "layers": nl,
             "wire": net_dtype,
@@ -4579,7 +4612,7 @@ async fn cmd_bench(
     // Per-token stamps carry the counter snapshots too: steady-state
     // allocations/token and pool dispatches/token come from the same
     // inter-token deltas as the steady tok/s (roadmap этап 0).
-    type Stamp = (std::time::Instant, u64, usize);
+    type Stamp = (std::time::Instant, u64, usize, GpuCounterSnapshot);
     let stamps: Arc<std::sync::Mutex<Vec<Stamp>>> = Arc::default();
     let st = stamps.clone();
     let cb: cortiq_engine::TokenCallback = Box::new(move |_tok| {
@@ -4587,6 +4620,7 @@ async fn cmd_bench(
             std::time::Instant::now(),
             ALLOCS.load(AtomicOrdering::Relaxed),
             cortiq_engine::pool::dispatch_count(),
+            gpu_counter_snapshot(),
         ));
         true
     });
@@ -4622,6 +4656,26 @@ async fn cmd_bench(
     } else {
         (0.0, 0.0)
     };
+    let (
+        metal_submits_per_token,
+        wgpu_submits_per_token,
+        wgpu_passes_per_token,
+        wgpu_steady_upload_ms_per_token,
+        wgpu_steady_upload_mb_per_token,
+    ) = if n_st >= 2 {
+        let steps = (n_st - 1) as f64;
+        let first = stamps[0].3;
+        let last = stamps[n_st - 1].3;
+        (
+            last.metal_submits.saturating_sub(first.metal_submits) as f64 / steps,
+            last.wgpu_submits.saturating_sub(first.wgpu_submits) as f64 / steps,
+            last.wgpu_passes.saturating_sub(first.wgpu_passes) as f64 / steps,
+            last.wgpu_upload_ns.saturating_sub(first.wgpu_upload_ns) as f64 / 1e6 / steps,
+            last.wgpu_upload_bytes.saturating_sub(first.wgpu_upload_bytes) as f64 / 1e6 / steps,
+        )
+    } else {
+        (0.0, 0.0, 0.0, 0.0, 0.0)
+    };
     let ttft_s = stamps
         .first()
         .map(|s| s.0.duration_since(t1).as_secs_f64())
@@ -4642,6 +4696,11 @@ async fn cmd_bench(
         // numbers only — joinable without parsing human text.
         let obj = serde_json::json!({
             "model": model_path,
+            "tensor_count": tensor_count,
+            "tensor_dtypes": tensor_dtypes,
+            "tensor_q1": tensor_q1,
+            "tensor_q8_2f": tensor_q8_2f,
+            "tensor_f16": tensor_f16,
             "task": task,
             "ctx": ctx,
             "o1": pipeline.o1_active(),
@@ -4649,11 +4708,13 @@ async fn cmd_bench(
             "prompt_tokens": prompt_ids.len(),
             "prefill_tok_s": prompt_ids.len() as f64 / prefill_s.max(1e-9),
             "tokens_generated": result.tokens_generated,
-            "metal_submits_per_token": metal_submits_per_token(result.tokens_generated),
-            "wgpu_submits_per_token": wgpu_rate(result.tokens_generated).0,
-            "wgpu_passes_per_token": wgpu_rate(result.tokens_generated).1,
+            "metal_submits_per_token": metal_submits_per_token,
+            "wgpu_submits_per_token": wgpu_submits_per_token,
+            "wgpu_passes_per_token": wgpu_passes_per_token,
             "wgpu_upload_ms": wgpu_uploads().0,
             "wgpu_upload_mb": wgpu_uploads().1,
+            "wgpu_steady_upload_ms_per_token": wgpu_steady_upload_ms_per_token,
+            "wgpu_steady_upload_mb_per_token": wgpu_steady_upload_mb_per_token,
             "decode_tok_s_steady": decode_tps,
             "decode_tok_s_incl_prefill": result.tokens_generated as f64 / total_s.max(1e-9),
             "ttft_s": ttft_s,

@@ -225,6 +225,20 @@ struct P82 { cols4: u32, rows: u32, cols: u32, _pad: u32 };
 
 var<workgroup> partial82: array<f32, 64>;
 
+// Four consecutive f16 values starting at an arbitrary half-word. q8_2f is
+// packed without padding, so an odd row count starts the column-scale plane
+// in the high half of the last row-scale word.
+fn f16x4(half: u32) -> vec4<f32> {
+    let w = half >> 1u;
+    let a = unpack2x16float(q82[w]);
+    let b = unpack2x16float(q82[w + 1u]);
+    if ((half & 1u) == 0u) {
+        return vec4<f32>(a.x, a.y, b.x, b.y);
+    }
+    let c = unpack2x16float(q82[w + 2u]);
+    return vec4<f32>(a.y, b.x, b.y, c.x);
+}
+
 // A pruned model does not give this kernel word-aligned rows: bonsai's
 // FFN is 6137 wide in one layer and 6130 in another, so a row of int8
 // starts mid-word and the whole tensor shears if you index it by
@@ -246,7 +260,7 @@ fn q8_2f_matvec(@builtin(workgroup_id) wid: vec3<u32>,
                 @builtin(local_invocation_index) lid: u32) {
     let qbytes = p82.rows * p82.cols;
     let rs0 = qbytes >> 2u;                 // per-row f16 plane, in words
-    let cs0 = rs0 + (p82.rows >> 1u);       // per-column f16 plane, in words
+    let cs0h = (qbytes >> 1u) + p82.rows;   // per-column plane, in f16 units
     let ngrp = (p82.cols + 3u) / 4u;        // 4 columns a step, last may be short
     var row = wid.x;
     loop {
@@ -271,9 +285,7 @@ fn q8_2f_matvec(@builtin(workgroup_id) wid: vec3<u32>,
                 select(0.0, xs82[c0 + 2u], rem > 2u),
                 select(0.0, xs82[c0 + 3u], rem > 3u),
             );
-            let s0 = unpack2x16float(q82[cs0 + i * 2u]);
-            let s1 = unpack2x16float(q82[cs0 + i * 2u + 1u]);
-            let cv = vec4<f32>(s0.x, s0.y, s1.x, s1.y);
+            let cv = f16x4(cs0h + c0);
             acc = acc + dot(v, xv * cv);
             i = i + 64u;
         }
@@ -400,9 +412,10 @@ fn q8_matmat(@builtin(workgroup_id) wid: vec3<u32>,
 // as the Metal kernel). Bit set → +x; np = gpr/2 tile-pairs/row (64 cols each).
 //
 // FAST kernel (the FFN q1 matvecs are ~59% of a 27B decode token): one
-// workgroup owns 16 output ROWS, 16 lanes/row (256 threads). Activations are
-// staged into shared memory in 1024-col tiles and REUSED across the 16 rows
-// (16× fewer activation loads). Sign unpack is a branchless XOR sign-flip
+// workgroup owns Q1_ROWS output rows, 16 lanes/row. Activations are staged
+// into shared memory in 1024-col tiles and reused across those rows. The
+// desktop default is 8 rows/128 threads; Adreno selects 16 rows/256 threads.
+// CMF_Q1_RPG=8|16 keeps the choice reproducible. Sign unpack is a branchless XOR sign-flip
 // (bit clear ⇒ flip the f32 sign bit) instead of 32 vec4 selects.
 struct Q1Params { np: u32, rows: u32, _p0: u32, _p1: u32 };
 @group(0) @binding(0) var<storage, read>       q1w : array<u32>;
@@ -427,7 +440,7 @@ fn q1_dot8v(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
          + (f32((w >> 28u) & 0xFu) - 8.0) * b.w;
 }
 
-var<workgroup> partial_q1: array<f32, 256>;   // 16 rows × 16 lanes
+var<workgroup> partial_q1: array<f32, 256>;   // up to 16 rows × 16 lanes
 // 1024-col activation tile, PADDED to 33 slots per 32-col group. The read
 // pattern is lane*64 + j*4 (all 16 lanes share bank (j*4) mod 32 with a flat
 // 1024 tile => 16-way bank conflict, ~8x LSU penalty on the dominant inner
@@ -454,14 +467,17 @@ fn q1_tile_sum(bits: u32, xbase: u32) -> f32 {
     return s.x + s.y + s.z + s.w;
 }
 
-@compute @workgroup_size(128)
+override Q1_WG: u32 = 128u;
+override Q1_ROWS: u32 = 8u;
+
+@compute @workgroup_size(Q1_WG)
 fn q1_matvec(@builtin(workgroup_id) wid: vec3<u32>,
              @builtin(num_workgroups) nwg: vec3<u32>,
              @builtin(local_invocation_index) lid: u32) {
     let cols = q1p.np * 64u;
-    let r = lid / 16u;      // which of the 8 rows this thread serves
+    let r = lid / 16u;
     let lane = lid % 16u;   // which tile-pair lane within a column tile
-    var row0 = wid.x * 8u;
+    var row0 = wid.x * Q1_ROWS;
     loop {
         if (row0 >= q1p.rows) { break; }
         let row = row0 + r;
@@ -476,7 +492,7 @@ fn q1_matvec(@builtin(workgroup_id) wid: vec3<u32>,
                 if (k >= 1024u) { break; }
                 let c = c0 + k;
                 q1xs[(k >> 5u) * 33u + (k & 31u)] = select(0.0, q1x[c], c < cols);
-                k = k + 128u;
+                k = k + Q1_WG;
             }
             workgroupBarrier();
             let pi = ti + lane;            // this lane's tile-pair
@@ -505,7 +521,7 @@ fn q1_matvec(@builtin(workgroup_id) wid: vec3<u32>,
         workgroupBarrier();
         if (lane == 0u && row < q1p.rows) { q1y[row] = partial_q1[lid]; }
         workgroupBarrier();
-        row0 = row0 + nwg.x * 8u;
+        row0 = row0 + nwg.x * Q1_ROWS;
     }
 }
 
@@ -10300,6 +10316,8 @@ struct Ctx {
     gate_mul: wgpu::ComputePipeline,
     zero: wgpu::ComputePipeline,
     q1: wgpu::ComputePipeline,
+    /// Rows handled by this adapter's specialized q1 workgroup.
+    q1_rows: u32,
     q1t: wgpu::ComputePipeline,
     q4b: wgpu::ComputePipeline,
     q4t_mv: wgpu::ComputePipeline,
@@ -11189,6 +11207,12 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let vscope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
     let info = adapter.get_info();
+    let q1_rows = match std::env::var("CMF_Q1_RPG").as_deref() {
+        Ok("16") => 16,
+        Ok("8") => 8,
+        _ if info.name.to_ascii_lowercase().contains("adreno") => 16,
+        _ => 8,
+    };
     let discrete = info.device_type == wgpu::DeviceType::DiscreteGpu;
     let vram_budget = std::env::var("CMF_GPU_VRAM_MB")
         .ok()
@@ -11214,7 +11238,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     // of silicon on one backend, and must not be adopted by another.
     crate::gpu::probe_set_device(&format!("{}/{:?}", info.name, info.backend));
     tracing::info!(
-        "wgpu GPU path: on ({} / {:?}, {}, weight budget {})",
+        "wgpu GPU path: on ({} / {:?}, {}, weight budget {}, q1 {} rows/{} threads)",
         info.name,
         info.backend,
         if discrete { "discrete" } else { "uma" },
@@ -11223,6 +11247,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         } else {
             format!("{} MB", vram_budget / 1024 / 1024)
         },
+        q1_rows,
+        q1_rows * 16,
     );
 
     let msc = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -11259,7 +11285,21 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let axpy = pipe("axpy");
     let gate_mul = pipe("gate_mul");
     let zero = pipe("fill_zero");
-    let q1 = pipe("q1_matvec");
+    let q1_constants = [
+        ("Q1_WG", (q1_rows * 16) as f64),
+        ("Q1_ROWS", q1_rows as f64),
+    ];
+    let q1 = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("q1_matvec"),
+        layout: None,
+        module: &module,
+        entry_point: Some("q1_matvec"),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            constants: &q1_constants,
+            ..Default::default()
+        },
+        cache: pcache.as_ref(),
+    });
     let q1t = pipe("q1t_matvec");
     let q4b = pipe("q4b_matvec");
     let q4t_mv = pipe("q4t_matvec");
@@ -11702,6 +11742,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         gate_mul,
         zero,
         q1,
+        q1_rows,
         q1t,
         q4b,
         q4t_mv,
@@ -12424,7 +12465,7 @@ fn moe_expert_bufs(
         // Bound transient memory by ONE projection, not a whole expert
         // pack. Near the VRAM limit, keeping gate + up + down staging alive
         // together can OOM even though their final device buffers fit.
-        c.queue.submit(std::iter::empty());
+        submit_empty(c);
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
         UPLOAD_NS.fetch_add(t_up.elapsed().as_nanos() as u64, Ordering::Relaxed);
         UPLOAD_BYTES.fetch_add((offs.len() * plen) as u64, Ordering::Relaxed);
@@ -12447,7 +12488,7 @@ fn moe_expert_bufs(
     // copies until the graph's first submit — twice the expert weights in
     // memory = device OOM on discrete cards. One submit+wait per layer
     // bounds transient staging to this layer's three buffers.
-    c.queue.submit(std::iter::empty());
+    submit_empty(c);
     let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
     // The card holds these bytes now, so the host copy is dead weight: the
     // page cache otherwise keeps every resident expert a second time, and on
@@ -12539,7 +12580,7 @@ pub fn moe_expert_bufs_requant_gu(
             }
             c.queue.write_buffer(&b, (i * gu_len) as u64, &q2);
         }
-        c.queue.submit(std::iter::empty());
+        submit_empty(c);
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
         Some(b)
     };
@@ -12561,7 +12602,7 @@ pub fn moe_expert_bufs_requant_gu(
             c.queue
                 .write_buffer(&b, (i * d_len) as u64, bytes.get(abs..abs + d_len)?);
         }
-        c.queue.submit(std::iter::empty());
+        submit_empty(c);
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
         Some(b)
     };
@@ -12777,10 +12818,7 @@ fn dispatch_matvec(
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("q8") });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("q8"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("q8"), None);
         // The staged-activation arm reads xs from workgroup memory, so
         // it only fits while xs does: 768 vec4 = 3072 columns.
         let tiled = q8mv_tiled() && cols <= 3072;
@@ -12942,10 +12980,7 @@ fn dispatch_q1t(
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("q1t") });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("q1t"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("q1t"), None);
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
@@ -13020,10 +13055,7 @@ pub fn rmsnorm_row(x: &[f32], w: &[f32], out: &mut [f32], gemma: bool, eps: f32)
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rms") });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("rms"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("rms"), None);
         pass.set_pipeline(&c.rmsnorm);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(1, 1, 1);
@@ -13112,10 +13144,7 @@ pub fn attn_rope_qkn_gpu(
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rq") });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("rq"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("rq"), None);
         pass.set_pipeline(&c.attn_rope);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
@@ -13200,10 +13229,7 @@ pub fn gqa_attend_gpu(
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("at") });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("at"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("at"), None);
         pass.set_pipeline(attend_pipes(c, hd).0);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(nh as u32, 1, 1);
@@ -13687,9 +13713,14 @@ pub fn forward_token_graph(
                 })
             }
             2 | 3 | 5 | 6 | 7 => {
-                // q8_2f addresses its scale planes as words: the int8 body
-                // must end on one. Rows are byte-addressed, so an odd
-                // `cols` is fine — an odd `rows*cols` is not.
+                // The int8 body must end on a word, because the per-ROW f16
+                // plane right after it is still word-indexed (`rs0`). Rows
+                // are byte-addressed, so an odd `cols` is fine — an odd
+                // `rows*cols` is not. The per-COLUMN plane needs no such
+                // gate: it starts `rows` half-words later, which is
+                // word-aligned only for even `rows`, and `f16x4` reads it
+                // from an arbitrary half-word. So this check plus that
+                // helper cover every layout the packer can emit.
                 if gw.kind == 7 && (rows * cols) % 4 != 0 {
                     return None;
                 }
@@ -14276,8 +14307,8 @@ pub fn forward_token_graph(
     // One uniform PER STEP, with stable identities: write_buffer lands at
     // submit, so a single shared buffer would collapse every step to the
     // last position written. Slot 0 is the plain single-step path.
-    let mku = |v: &mut Vec<wgpu::Buffer>, size: u64| {
-        while v.len() < steps {
+    let mku = |v: &mut Vec<wgpu::Buffer>, size: u64, count: usize| {
+        while v.len() < count {
             v.push(c.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("g-step-u"),
                 size,
@@ -14286,9 +14317,9 @@ pub fn forward_token_graph(
             }));
         }
     };
-    mku(&mut gs.kv_us, 16);
-    mku(&mut gs.at_us, 32);
-    mku(&mut gs.rope_us, 32);
+    mku(&mut gs.kv_us, 16, steps);
+    mku(&mut gs.at_us, 32, steps);
+    mku(&mut gs.rope_us, 32, steps * layers.len());
     for st in 0..steps {
         let p = position + st;
         c.queue.write_buffer(
@@ -14317,32 +14348,26 @@ pub fn forward_token_graph(
     // Encode one matvec, dtype-dispatched: q8_row (encode_matvec + row
     // scales) or q1 (encode_matvec_q1). Each is its own pass.
     //
-    // MEASURED, and it corrects two earlier readings in this file: the
-    // round trip to an Adreno 642L is 0.24-0.49 ms (`cortiq gpu` prints
-    // it), so the 112 dispatches a token cost ~27 ms of a 1100 ms token.
-    // The other 1070 ms is the KERNELS — about 550 MB/s of weight
-    // streaming where the CPU on the same chip does 6900. Latency is not
-    // the wall here; the shaders are, and they are the work.
+    // MEASURED on Adreno 642L: the steady graph is one queue submission,
+    // 87 compute passes and zero weight uploads per token. After the Adreno
+    // q1 workgroup retile, a timestamped 0.992 s frame spent ~604 ms in
+    // dense gate/up/down matvecs, ~209 ms in attention and ~178 ms in the
+    // final norm/lm_head. Pass grouping is still useful for ordering and
+    // encoder overhead, but kernel work is the wall; “token time = pass
+    // count × 4.4 ms” was a false model.
     //
-    // Pass-grouping: worth doing, but NOT the wall. On an Adreno 642L
-    // folding the FFN's `down` into the gate/up/silu pass took a token
-    // from 319 passes to 256 and its time from 1437 ms to 1405 — the
-    // work moved inside the passes rather than disappearing. Three
-    // points kill the tempting law that token time is passes x 4.4 ms:
+    // A/B experiments rejected q1 wave64 (-5.7%) and removing q1's
+    // stride-33 padding (~-2%). The q8_2f row sweep was invalidated when the
+    // measured artifact proved to contain zero q8_2f tensors. One change did
+    // win: 16 rows/256 threads reused each staged q1 activation tile twice
+    // as far and raised steady decode 0.589 -> 0.856 tok/s (+45%) on Adreno.
     //
-    //   189 passes  808 ms   4.28 ms/pass   (per-op path)
-    //   319        1437      4.50           (whole-token graph)
-    //   256        1405      5.49           (graph, `down` folded)
-    //
-    // What actually separates those rows is how much of the token runs
-    // on the GPU at all: the graph moves the norms, rope and attention
-    // there too, and on this chip the device is ~16x slower than its own
-    // CPU per unit of work (~0.5 GB/s against 8.5). More work on it is
-    // more time, whatever the dispatches are grouped into.
-    //
-    // The folding stays: it is free, it is byte-identical, and on a
-    // phone GPU that is FASTER than its CPU — which plenty are — the
-    // pass boundary is a real share of a much smaller total.
+    // Read that +45% with the caveat it deserves: it is WALL-CLOCK, and the
+    // 8/128 baseline wandered 0.589/0.602/0.758 across sessions on this
+    // phone — the same instability that made the q8_2f sweep look real.
+    // Only the sign is safe. The kernel-level confirmation (a CMF_GPU_TS=2
+    // frame at CMF_Q1_RPG=8 vs =16; q1 time should be ~1310 ms vs 782 ms)
+    // has not been taken yet.
     let emat = |enc: &mut wgpu::CommandEncoder,
                 m: &GMat,
                 xs: &wgpu::Buffer,
@@ -14434,10 +14459,9 @@ pub fn forward_token_graph(
                 Some((&c.matvec, bind, (rows as u32).min(MAX_WG)))
             }
             7 => {
-                // q8_2f, so the FFN's `down` can ride in the same pass as
-                // gate/up/silu instead of opening one of its own. On a
-                // tiler that pass boundary is 4.4 ms — see the note by
-                // `emat` — so this is a per-layer saving, not a tidy-up.
+                // q8_2f, so the FFN's `down` can ride in the same serialized
+                // pass as gate/up/silu. This removes encoder/pass overhead;
+                // timestamps show that the matvec arithmetic remains the wall.
                 let p_buf = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, cols as u32, 0]);
                 let layout = c.q8_2f_mv.get_bind_group_layout(0);
                 let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -14465,7 +14489,11 @@ pub fn forward_token_graph(
                         bind_buf(3, &p_buf),
                     ],
                 });
-                Some((&c.q1, bind, (rows as u32).div_ceil(8).min(MAX_WG)))
+                Some((
+                    &c.q1,
+                    bind,
+                    (rows as u32).div_ceil(c.q1_rows).min(MAX_WG),
+                ))
             }
             4 => {
                 let p_buf = uniform_u32x4(c, [cols as u32, rows as u32, 0, 0]);
@@ -14740,7 +14768,6 @@ pub fn forward_token_graph(
     for stp in 0..steps {
         let kv_u = kv_us[stp].clone();
         let at_u = at_us[stp].clone();
-        let rope_u = rope_us[stp].clone();
         let position = position + stp;
         // Bootstrap the first layer's attention norm; thereafter each residual is
         // fused with the following norm (add_rmsnorm), saving two dispatches/layer.
@@ -14778,9 +14805,10 @@ pub fn forward_token_graph(
                         label: Some("token-graph"),
                     }),
                 );
-                c.queue.submit([full.finish()]);
+                submit(c, full.finish());
             }
             let lw = &lws[li];
+            let rope_u = rope_us[stp * layers.len() + li].clone();
             let lkind: u8 = if matches!(lw.attn, LAttn::Full { .. }) {
                 1
             } else {
@@ -15423,30 +15451,43 @@ pub fn forward_token_graph(
                         let bg_silu =
                             bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]);
                         let mut pass = begin_pass(&mut enc);
+                        let fine = li < 32;
                         if let Some((p, b, w)) = &ffn_pre {
                             pass.set_pipeline(p);
                             pass.set_bind_group(0, b, &[]);
                             pass.dispatch_workgroups(*w, 1, 1);
                         }
+                        tsp!(pass, fine, 40); // residual + FFN norm
                         pass.set_pipeline(pgp);
                         pass.set_bind_group(0, &bg_g, &[]);
                         pass.dispatch_workgroups(wg, 1, 1);
+                        tsp!(pass, fine, 41); // gate projection
                         pass.set_pipeline(pup);
                         pass.set_bind_group(0, &bg_u, &[]);
                         pass.dispatch_workgroups(wu, 1, 1);
+                        tsp!(pass, fine, 42); // up projection
                         pass.set_pipeline(&c.silu);
                         pass.set_bind_group(0, &bg_silu, &[]);
                         pass.dispatch_workgroups_flat((inter as u32).div_ceil(256));
+                        tsp!(pass, fine, 43); // SiLU × up
                         // `down` rides here too when its dtype can be
                         // prepped: dispatches inside one pass serialize
                         // with memory visibility — the same guarantee the
                         // MoE arm leans on — so it reads the `abuf` silu
-                        // just wrote. One pass a layer saved, and a pass
-                        // is the unit of cost on a mobile GPU.
+                        // just wrote. This saves one pass per layer without
+                        // pretending that pass count predicts kernel time.
                         if let Some((pdp, bg_d, wd)) = &pd {
                             pass.set_pipeline(pdp);
                             pass.set_bind_group(0, bg_d, &[]);
                             pass.dispatch_workgroups(*wd, 1, 1);
+                            tsp!(pass, fine, 44); // down projection
+                            if let Some((p, b, w)) = &ffn_post {
+                                pass.set_pipeline(p);
+                                pass.set_bind_group(0, b, &[]);
+                                pass.dispatch_workgroups(*w, 1, 1);
+                                tail_done = true;
+                            }
+                            tsp!(pass, fine, 45); // residual + next norm
                             down_rode_along = true;
                         }
                     } else {
@@ -16007,6 +16048,12 @@ pub fn forward_token_graph(
                     (32, _) => "|moe:select",
                     (33, _) => "|moe:gu",
                     (34, _) => "|moe:dn",
+                    (40, _) => "|ffn:pre",
+                    (41, _) => "|ffn:gate",
+                    (42, _) => "|ffn:up",
+                    (43, _) => "|ffn:silu",
+                    (44, _) => "|ffn:down",
+                    (45, _) => "|ffn:tail",
                     _ => "start",
                 };
                 let mut line = String::from("gpu-ts:");
@@ -16796,7 +16843,7 @@ pub fn forward_batch_graph(
                     label: Some("batch-graph"),
                 }),
             );
-            c.queue.submit([full.finish()]);
+            submit(c, full.finish());
         }
         let lw = &lws[li];
         let pnw = stor(bytemuck::cast_slice(l.post_norm));
@@ -17448,7 +17495,7 @@ pub fn gdn_spec_restore(kv_id: u64, slot: usize) -> bool {
         enc.copy_buffer_to_buffer(snap, off + ring_sz, s, 0, *s_sz);
         any = true;
     }
-    c.queue.submit([enc.finish()]);
+    submit(c, enc.finish());
     any
 }
 
@@ -17605,10 +17652,7 @@ pub fn gdn_step_gpu(
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gdn") });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gdn"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("gdn"), None);
         pass.set_pipeline(&c.gdn_step);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(nv as u32, 1, 1);
@@ -17913,13 +17957,14 @@ fn dispatch_q1(
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("q1") });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("q1"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("q1"), None);
         pass.set_pipeline(&c.q1);
         pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups((rows as u32).div_ceil(8).min(MAX_WG), 1, 1);
+        pass.dispatch_workgroups(
+            (rows as u32).div_ceil(c.q1_rows).min(MAX_WG),
+            1,
+            1,
+        );
     }
     let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..rows]);
     drop(sc);
@@ -18046,10 +18091,7 @@ pub fn q1_matmat(
             label: Some("q1mm"),
         });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("q1mm"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("q1mm"), None);
         pass.set_pipeline(&c.q1_mm);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(
@@ -18181,10 +18223,7 @@ fn dispatch_matmat(
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("mm") });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("mm"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("mm"), None);
         if use_mm {
             pass.set_pipeline(&c.mul_mm);
             pass.set_bind_group(0, &bind, &[]);
@@ -18746,10 +18785,7 @@ fn tp_matmat_impl(
         encode_act_absmax(c, &mut enc, &xs_buf, b * cols, &asc_buf);
     }
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("q4tpmm"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("q4tpmm"), None);
         pass.set_pipeline(mm_pipe);
         pass.set_bind_group(0, &bind_mm, &[]);
         pass.dispatch_workgroups(
@@ -18768,7 +18804,7 @@ fn tp_matmat_impl(
         }
         None => {
             // No host copy: submit and hand the buffer over.
-            c.queue.submit(Some(enc.finish()));
+            submit(c, enc.finish());
             Some(y_buf)
         }
     }
@@ -18867,10 +18903,7 @@ pub fn q4t_matmat(
             label: Some("q4tmm"),
         });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("q4tmm"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("q4tmm"), None);
         pass.set_pipeline(&c.q4t_mm);
         pass.set_bind_group(0, &bind_mm, &[]);
         pass.dispatch_workgroups(
@@ -19505,7 +19538,7 @@ pub fn dit_attention_packed_src(
     // by nobody else, so it stayed zero and P·V came out exactly zero.
     // That is the VAE's all-zero attention, and the reason the layout
     // experiments all agreed: zero does not depend on addressing.
-    c.queue.submit(Some(enc.finish()));
+    submit(c, enc.finish());
     // qk-norm + RoPE on the card: two dispatches over the SAME kernel,
     // q and k differing only in the output plane, the weight buffer and
     // src_off. When `nr` is None the caller already did this on the host.
@@ -19580,7 +19613,7 @@ pub fn dit_attention_packed_src(
                 let jobs = (n * nh) as u32;
                 pass.dispatch_workgroups(jobs.min(65535), jobs.div_ceil(65535), 1);
             }
-            c.queue.submit(Some(e.finish()));
+            submit(c, e.finish());
         }
     }
     // The planes are on the card now; the shared path skips its uploads.
@@ -19794,7 +19827,7 @@ fn dit_attention_inner(
                 let wgs = ((n * nh * hd) as u32).div_ceil(256);
                 pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
             }
-            c.queue.submit(Some(e.finish()));
+            submit(c, e.finish());
             Some(vt)
         }
         _ => None,
@@ -19924,7 +19957,7 @@ fn dit_attention_inner(
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }),
             );
             let t = std::time::Instant::now();
-            c.queue.submit(Some(e.finish()));
+            submit(c, e.finish());
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
             DIT_PHASE[slot].fetch_add(
                 t.elapsed().as_micros() as u64,
@@ -19932,10 +19965,7 @@ fn dit_attention_inner(
             );
         };
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("dit-qk"),
-                timestamp_writes: None,
-            });
+            let mut pass = begin_pass_with(&mut enc, Some("dit-qk"), None);
             // Matrix units when the device has them and the caller opted
             // in: same NT product, f16 operands, f32 accumulator. The
             // scalar tile kernel below runs this attention at 0.5
@@ -19963,20 +19993,14 @@ fn dit_attention_inner(
         }
         split_now(&mut enc, 0);
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("dit-sm"),
-                timestamp_writes: None,
-            });
+            let mut pass = begin_pass_with(&mut enc, Some("dit-sm"), None);
             pass.set_pipeline(&c.dit_softmax);
             pass.set_bind_group(0, &bg_sm, &[]);
             pass.dispatch_workgroups(n as u32, 1, 1);
         }
         split_now(&mut enc, 1);
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("dit-pv"),
-                timestamp_writes: None,
-            });
+            let mut pass = begin_pass_with(&mut enc, Some("dit-pv"), None);
             match (&coop_dit, &bg_pv_coop) {
                 (Some(p), Some(bgc)) => {
                     pass.set_pipeline(p);
@@ -20021,10 +20045,7 @@ fn dit_attention_inner(
                 },
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("dit-unstack"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("dit-unstack"), None);
         pass.set_pipeline(&c.dit_unstack);
         pass.set_bind_group(0, &bg_un, &[]);
         pass.dispatch_workgroups_flat(total.div_ceil(256));
@@ -20034,7 +20055,7 @@ fn dit_attention_inner(
         // panel where it already is. Nothing crosses the bus, and the
         // queue is never drained mid-block.
         Some(slot) => {
-            c.queue.submit(Some(enc.finish()));
+            submit(c, enc.finish());
             *slot = Some(ab);
             true
         }
@@ -20220,28 +20241,19 @@ pub fn chunk_attend(
         // same scores buffer, and dispatches inside one pass do not
         // order against each other.
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("ca-qk"),
-                timestamp_writes: None,
-            });
+            let mut pass = begin_pass_with(&mut enc, Some("ca-qk"), None);
             pass.set_pipeline(&c.dit_qk);
             pass.set_bind_group(0, &bg_qk, &[]);
             pass.dispatch_workgroups((n as u32).div_ceil(64), (b as u32).div_ceil(64), 1);
         }
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("ca-sm"),
-                timestamp_writes: None,
-            });
+            let mut pass = begin_pass_with(&mut enc, Some("ca-sm"), None);
             pass.set_pipeline(&c.dit_softmax);
             pass.set_bind_group(0, &bg_sm, &[]);
             pass.dispatch_workgroups(b as u32, 1, 1);
         }
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("ca-pv"),
-                timestamp_writes: None,
-            });
+            let mut pass = begin_pass_with(&mut enc, Some("ca-pv"), None);
             pass.set_pipeline(&c.dit_pv);
             pass.set_bind_group(0, &bg_pv, &[]);
             pass.dispatch_workgroups((hd as u32).div_ceil(64), (b as u32).div_ceil(64), 1);
@@ -20266,10 +20278,7 @@ pub fn chunk_attend(
                 },
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("ca-un"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("ca-un"), None);
         pass.set_pipeline(&c.dit_unstack);
         pass.set_bind_group(0, &bg_un, &[]);
         pass.dispatch_workgroups_flat(((nh * b * hd) as u32).div_ceil(256));
@@ -20393,10 +20402,7 @@ pub fn q4t_qkv(
                 bind_buf(3, &pbf),
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("qkv-mm"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("qkv-mm"), None);
         pass.set_pipeline(&c.q4t_mm);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(
@@ -20868,10 +20874,7 @@ fn ffn_q4(
             label: Some("q4tffn"),
         });
     let mm_pass = |enc: &mut wgpu::CommandEncoder, bg: &wgpu::BindGroup, rows: usize| {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("q4tffn-mm"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(enc, Some("q4tffn-mm"), None);
         pass.set_pipeline(mm);
         pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(
@@ -20883,10 +20886,7 @@ fn ffn_q4(
     mm_pass(&mut enc, &bg1, inter);
     mm_pass(&mut enc, &bg3, inter);
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("q4tffn-silu"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("q4tffn-silu"), None);
         pass.set_pipeline(&c.ffn_silu);
         pass.set_bind_group(0, &bg_silu, &[]);
         // 2-D grid: b·inter/256 passes 65 535 workgroups at render batch
@@ -21029,10 +21029,7 @@ fn dispatch_q1t_mm(
             label: Some("q1tmm"),
         });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("q1tmm"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("q1tmm"), None);
         pass.set_pipeline(&c.q1t_mm);
         pass.set_bind_group(0, &bind_mm, &[]);
         pass.dispatch_workgroups(
@@ -21043,10 +21040,7 @@ fn dispatch_q1t_mm(
     }
     {
         // Separate pass = a barrier, so the overlay reads the finished base.
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("q1tov"),
-            timestamp_writes: None,
-        });
+        let mut pass = begin_pass_with(&mut enc, Some("q1tov"), None);
         pass.set_pipeline(&c.q1t_ovmm);
         pass.set_bind_group(0, &bind_ov, &[]);
         pass.dispatch_workgroups((rows as u32).div_ceil(64).min(MAX_WG), 1, 1);
@@ -21096,7 +21090,7 @@ pub fn roundtrip_bench(n: usize) -> Option<(f64, f64)> {
         let enc = c
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rt-empty") });
-        c.queue.submit([enc.finish()]);
+        submit(c, enc.finish());
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
     }
     let empty_ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
@@ -21156,12 +21150,23 @@ fn upload_staged() -> bool {
 }
 
 #[inline]
-fn submit(c: &Ctx, buf: wgpu::CommandBuffer) {
+fn note_submit(c: &Ctx) {
     SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if slot_check() {
         c.slot_writes.lock().unwrap().clear();
     }
+}
+
+#[inline]
+fn submit(c: &Ctx, buf: wgpu::CommandBuffer) {
+    note_submit(c);
     c.queue.submit(Some(buf));
+}
+
+#[inline]
+fn submit_empty(c: &Ctx) {
+    note_submit(c);
+    c.queue.submit(std::iter::empty());
 }
 
 /// `CMF_DSV4_SLOT_CHECK=1`: panic if a per-layer slot is written twice
@@ -22214,7 +22219,6 @@ pub fn coop_matrix_active() -> bool {
 
 #[inline]
 fn begin_pass(enc: &mut wgpu::CommandEncoder) -> wgpu::ComputePass<'_> {
-    PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // A stage label set by the BT frame turns this pass into a timestamped
     // one; everything else stays on the cold path of one atomic load.
     let which = BT_TS_STAGE.load(std::sync::atomic::Ordering::Relaxed);
@@ -22223,10 +22227,17 @@ fn begin_pass(enc: &mut wgpu::CommandEncoder) -> wgpu::ComputePass<'_> {
     } else {
         None
     };
-    enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes,
-    })
+    begin_pass_with(enc, None, timestamp_writes)
+}
+
+#[inline]
+fn begin_pass_with<'a>(
+    enc: &'a mut wgpu::CommandEncoder,
+    label: Option<&'a str>,
+    timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'a>>,
+) -> wgpu::ComputePass<'a> {
+    PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label, timestamp_writes })
 }
 
 fn readback2(
@@ -22558,7 +22569,11 @@ fn encode_matvec_q1(
     let mut pass = begin_pass(enc);
     pass.set_pipeline(&c.q1);
     pass.set_bind_group(0, &bind, &[]);
-    pass.dispatch_workgroups((rows as u32).div_ceil(8).min(MAX_WG), 1, 1);
+    pass.dispatch_workgroups(
+        (rows as u32).div_ceil(c.q1_rows).min(MAX_WG),
+        1,
+        1,
+    );
 }
 
 /// Encode a resident q1 GEMM (batched prefill): Y[k,rows] = X[k,cols] @ Wᵀ, all
@@ -23978,6 +23993,117 @@ mod tests {
         assert!(max_d2 < 1e-3, "wgpu row0 offset ≠ CPU: max|Δ| = {max_d2}");
     }
 
+    #[test]
+    fn wgpu_q8_2f_odd_rows_matches_cpu_reference() {
+        use wgpu::util::DeviceExt;
+
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping q8_2f parity test");
+            return;
+        };
+        // Three rows put the column-scale plane in the high half of the
+        // final row-scale word. This is the packed layout that the old
+        // word-aligned address calculation decoded one half-word late.
+        let (rows, cols) = (3usize, 8usize);
+        let q: Vec<i8> = (0..rows * cols)
+            .map(|i| ((i * 17 + 5) % 29) as i8 - 14)
+            .collect();
+        let rs_src = [0.25f32, 0.5, 0.75];
+        let cs_src = [0.2f32, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let xs = [0.7f32, -0.4, 0.2, 1.1, -0.8, 0.3, 0.6, -0.5];
+        let rs16: Vec<u16> = rs_src
+            .iter()
+            .map(|&v| cortiq_core::quant::f32_to_f16(v))
+            .collect();
+        let cs16: Vec<u16> = cs_src
+            .iter()
+            .map(|&v| cortiq_core::quant::f32_to_f16(v))
+            .collect();
+        let mut payload = bytemuck::cast_slice::<i8, u8>(&q).to_vec();
+        payload.extend_from_slice(bytemuck::cast_slice(&rs16));
+        payload.extend_from_slice(bytemuck::cast_slice(&cs16));
+        payload.resize(payload.len().next_multiple_of(4), 0);
+
+        let weights = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("q8-2f-odd-w"),
+            contents: &payload,
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let xb = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("q8-2f-odd-x"),
+            contents: bytemuck::cast_slice(&xs),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let yb = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("q8-2f-odd-y"),
+            size: (rows * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let params = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("q8-2f-odd-p"),
+            contents: bytemuck::cast_slice(&[(cols / 4) as u32, rows as u32, cols as u32, 0]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let layout = c.q8_2f_mv.get_bind_group_layout(0);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("q8-2f-odd-bg"),
+            layout: &layout,
+            entries: &[
+                bind_buf(0, &weights),
+                bind_buf(1, &xb),
+                bind_buf(2, &yb),
+                bind_buf(3, &params),
+            ],
+        });
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("q8-2f-odd-stage"),
+            size: (rows * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(&c.q8_2f_mv);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(rows as u32, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&yb, 0, &stage, 0, (rows * 4) as u64);
+        submit(c, enc.finish());
+        let (tx, rx) = std::sync::mpsc::channel();
+        stage.map_async(wgpu::MapMode::Read, .., move |r| tx.send(r).unwrap());
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().unwrap().unwrap();
+        let got: Vec<f32> = bytemuck::cast_slice(&stage.get_mapped_range(..).unwrap()).to_vec();
+
+        let rs: Vec<f32> = rs16
+            .iter()
+            .map(|&v| cortiq_core::quant::f16_to_f32(v))
+            .collect();
+        let cs: Vec<f32> = cs16
+            .iter()
+            .map(|&v| cortiq_core::quant::f16_to_f32(v))
+            .collect();
+        let want: Vec<f32> = (0..rows)
+            .map(|r| {
+                rs[r]
+                    * (0..cols)
+                        .map(|i| q[r * cols + i] as f32 * xs[i] * cs[i])
+                        .sum::<f32>()
+            })
+            .collect();
+        let max_d = want
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_d < 2e-2, "wgpu q8_2f odd rows ≠ CPU: max|Δ| = {max_d}");
+    }
+
     /// Quantifies the whole-token-graph ceiling on THIS device: K chained
     /// matvecs run as K separate submit+readback ops (today's per-op path)
     /// vs the same K dispatches in ONE command buffer with a single readback
@@ -25395,7 +25521,7 @@ fn main() {
             for _ in 0..reps {
                 encode_q4_tile_mm(c, &mut enc, mm_pipeline(c, true, false), &wbuf, &xbuf, &ybuf, rows, cols, n);
             }
-            c.queue.submit(Some(enc.finish()));
+            submit(c, enc.finish());
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
         };
         run();
@@ -27986,7 +28112,7 @@ fn dsv4_chain_batch_bt(
                     label: Some("dsv4-chain-batch-bt"),
                 }),
             );
-            c.queue.submit([full.finish()]);
+            submit(c, full.finish());
         }
         // Per-token counts follow from the position alone (window fills by
         // one, a compressed entry appears every `ratio`), so the whole
@@ -30982,7 +31108,7 @@ pub fn vae_conv2d_coop(
             pass.dispatch_workgroups((oc as u32).div_ceil(64), (t as u32).div_ceil(64), 1);
         }
         enc.copy_buffer_to_buffer(&yb, 0, &ybig, (p0 * oc * 4) as u64, (t * oc * 4) as u64);
-        c.queue.submit(Some(enc.finish()));
+        submit(c, enc.finish());
         p0 += t;
     }
     let mut enc = c
@@ -32202,7 +32328,7 @@ pub fn q4tp_qkv(
     enc.copy_buffer_to_buffer(&qy, 0, &stage_q, 0, qs);
     enc.copy_buffer_to_buffer(&ky, 0, &stage_k, 0, ks);
     enc.copy_buffer_to_buffer(&vy, 0, &stage_v, 0, ks);
-    c.queue.submit([enc.finish()]);
+    submit(c, enc.finish());
     let read = |stage: &wgpu::Buffer, bytes: u64, dst: &mut [f32]| -> bool {
         let (tx, rx) = std::sync::mpsc::channel();
         stage.map_async(wgpu::MapMode::Read, ..bytes, move |r| {
@@ -33855,10 +33981,7 @@ fn encode_sparse_attend2(
     // a part where occupancy actually bites.
     if !sa_split() {
         let bind = sa_bind_single(c, q, kv, ixb, sink, out, nh, hd, m, scale, bkey);
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: ts_pair(c, 0),
-        });
+        let mut pass = begin_pass_with(enc, None, ts_pair(c, 0));
         pass.set_pipeline(&c.sparse_attend);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(nh as u32, 1, 1);
@@ -33879,10 +34002,7 @@ fn encode_sparse_attend2(
                 bind_buf(5, &p),
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: ts_pair(c, 1),
-        });
+        let mut pass = begin_pass_with(enc, None, ts_pair(c, 1));
         pass.set_pipeline(&c.sa_scores);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(nh as u32, 1, 1);
@@ -33899,10 +34019,7 @@ fn encode_sparse_attend2(
                 bind_buf(4, &p),
             ],
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: ts_pair(c, 2),
-        });
+        let mut pass = begin_pass_with(enc, None, ts_pair(c, 2));
         pass.set_pipeline(&c.sa_apply);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(((nh * hd) as u32).div_ceil(256), 1, 1);
@@ -35686,10 +35803,7 @@ pub fn dsv4_moe_frame(
             beginning_of_pass_write_index: Some(slot),
             end_of_pass_write_index: Some(slot + 1),
         });
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: tsw,
-        });
+        let mut pass = begin_pass_with(&mut enc, None, tsw);
         pass.set_pipeline(&c.moe_route);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(1, 1, 1);

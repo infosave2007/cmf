@@ -390,6 +390,21 @@ fn generate_inner(
         let enc = Qwen3Encoder::from_cmf(&model)?;
         enc.encode_with_images(&ids, &spans, &embeds, &deepstack)
     };
+    // `CMF_TE_DUMP=<path>`: the conditioning as `[u64 n][u64 width]`
+    // then f32 rows. A stand-in encoder is only as good as the stream
+    // it hands the DiT, and that is measurable against the teacher's
+    // dump on the same prompt WITHOUT rendering a frame.
+    if let Ok(p) = std::env::var("CMF_TE_DUMP") {
+        let w = states.len() / ids.len().max(1);
+        let mut b = Vec::with_capacity(16 + states.len() * 4);
+        b.extend_from_slice(&(ids.len() as u64).to_le_bytes());
+        b.extend_from_slice(&(w as u64).to_le_bytes());
+        for v in &states {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(&p, &b).map_err(|e| format!("CMF_TE_DUMP {p}: {e}"))?;
+        eprintln!("te dump: {} tokens x {w} -> {p}", ids.len());
+    }
     progress("encode", 1, 1);
     lap(&mut marks, "text encode");
 
