@@ -490,6 +490,20 @@ fn generate_inner(
             .collect::<Vec<_>>()
             .join(" · ")
     );
+    // Where a GEMM's wall time goes on unified memory: copies or kernel.
+    // The answer decides whether fusing blocks or tuning the kernel is
+    // the optimization worth doing.
+    #[cfg(target_os = "macos")]
+    if std::env::var("CMF_METAL_MMPROF").is_ok() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = crate::gpu_metal::MM_N.load(Relaxed);
+        eprintln!(
+            "  q4tp mm x{n}: upload {:.1}s · submit+wait {:.1}s · readback {:.1}s",
+            crate::gpu_metal::MM_UP.load(Relaxed) as f64 / 1e6,
+            crate::gpu_metal::MM_GPU.load(Relaxed) as f64 / 1e6,
+            crate::gpu_metal::MM_DN.load(Relaxed) as f64 / 1e6,
+        );
+    }
 
     // The VAE emits latent_t·4 frames; the request snapped to 17k+5,
     // which is one fewer than a multiple of four plus the leading key

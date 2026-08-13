@@ -25,6 +25,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Metal 46.1 s, wgpu 117.3 s. Both correct, and neither ran at all
   before.
 
+### Measured, and it says where Metal time is NOT
+- **`CMF_METAL_MMPROF=1`** splits the q4tp GEMM into upload, submit-and-wait
+  and readback. On an M4 over 1071 calls of a MiniMax-H3 render: **upload
+  0.7 s, submit+wait 41.6 s, readback 1.4 s.** The host↔device copies are
+  5% — on unified memory the round trip is not the cost, the kernel is.
+  That retires the obvious optimization (fuse a block into one command
+  buffer to save round trips) before anyone spends a week on it.
+- **`CMF_MMH3_PROF=1` on Metal, 512×288:** fc1 32.0%, qkv 25.9%, fc2
+  20.8%, out 10.7% — **the GEMMs are 86% of the denoise and attention is
+  11%.** Optimization belongs in `q4tp_mul_mm`'s tiling, not around it.
+- **The Metal flash-attention kernel (`CMF_DIT_FLASH=1`) is a 2×
+  regression** on this workload, not a win: denoise 346.9 s against
+  174.1 s for the scalar path at 512×288. It stays off by default, now
+  with a number attached.
+
+### Fixed
 - **The Metal `q4tp` GEMM overflowed `half` on outlier activations,**
   which is why `cortiq animate` came out uniform grey above 256×160 on
   Apple Silicon while wgpu rendered the same file correctly. The kernel
