@@ -693,14 +693,7 @@ impl Pipeline {
         // position at a time so the resident state is seeded exactly as decode
         // will read it. Pure-attention models keep the batched CPU prefill (its
         // KV mirror re-syncs from the CPU cache, so no seeding gap).
-        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH")
-            .map(|v| v != "0")
-            .unwrap_or_else(|_| {
-                // Default ON for wgpu on DISCRETE adapters (4090:
-                // decode 76 -> 137 tok/s); integrated/mobile GPUs keep
-                // the per-op probe path — see gpu::wgpu_graph_default.
-                crate::gpu::wgpu_graph_default()
-            });
+        let graph_on = crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill);
         if !graph_on || !crate::gpu::enabled_here() {
             return false;
         }
@@ -1596,14 +1589,7 @@ impl Pipeline {
         // Nyström insertion is irreversible by design).
         // The wgpu token graph owns a device K/V mirror that speculative
         // rollback would desync — the two are mutually exclusive.
-        let graph_on = std::env::var("CMF_GPU_WGPU_GRAPH")
-            .map(|v| v != "0")
-            .unwrap_or_else(|_| {
-                // Default ON for wgpu on DISCRETE adapters (4090:
-                // decode 76 -> 137 tok/s); integrated/mobile GPUs keep
-                // the per-op probe path — see gpu::wgpu_graph_default.
-                crate::gpu::wgpu_graph_default()
-            });
+        let graph_on = crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode);
         // Graph speculative decode (`CMF_GRAPH_SPEC=1`): the MTP head
         // drafts, ONE batched graph submit verifies the whole chain.
         //
@@ -4498,11 +4484,7 @@ impl Pipeline {
         if self.o1_active() || self.attn_softcap > 0.0 {
             return None;
         }
-        let graph_on = match std::env::var("CMF_GPU_WGPU_GRAPH").ok().as_deref() {
-            Some("0") => return None,
-            Some(_) => true,
-            None => crate::gpu::wgpu_graph_default(),
-        };
+        let graph_on = crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode);
         if !graph_on || crate::gpu::graph_unsupported() {
             // Same memo as the decode site: this path builds the very
             // same graph, so a model it cannot build for must not be
@@ -5740,6 +5722,7 @@ fn draft_probe() -> bool {
         let graph_env = std::env::var("CMF_GPU_WGPU_GRAPH").ok();
         let graph_on = match graph_env.as_deref() {
             Some("0") => false,
+            Some("prefill") => false, // decode keeps the per-op path
             Some(_) => true,
             // Unset: same discrete-only default as every other graph
             // site. "Is the GPU on" used to stand in here — which made
