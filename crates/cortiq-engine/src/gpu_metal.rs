@@ -3328,6 +3328,12 @@ kernel void q4tp_mul_mm(
     constant uint&       cols_b [[buffer(3)]],
     constant uint&       rows_b [[buffer(4)]],
     constant uint&       nb     [[buffer(5)]],
+    // Activations are staged as `half` below, where anything past 65504
+    // is inf. When the host saw a row that would overflow it scaled the
+    // activations down by a power of two and sends the reciprocal here,
+    // to be folded into the WEIGHT side so the product is unchanged.
+    // Normally 1.0, and then this multiply changes no bit.
+    constant float&      wboost [[buffer(6)]],
     uint tiitg [[thread_index_in_threadgroup]],
     uint sgitg [[simdgroup_index_in_threadgroup]],
     uint2 tg  [[threadgroup_position_in_grid]])
@@ -3392,8 +3398,8 @@ kernel void q4tp_mul_mm(
             uint ib0 = 8u * (2u * il0) + sy;
             uint ib1 = 8u * (2u * il0 + 1u) + sy;
             for (uint i = 0; i < 8u; ++i) {
-                sa[64u * ib0 + 8u * i + lx] = (half)wv[i];
-                sa[64u * ib1 + 8u * i + lx] = (half)wv[i + 8u];
+                sa[64u * ib0 + 8u * i + lx] = (half)(wv[i] * wboost);
+                sa[64u * ib1 + 8u * i + lx] = (half)(wv[i + 8u] * wboost);
             }
         }
         // X: 8 consecutive floats → one 8x8-block row (identical to q8).
@@ -6361,6 +6367,32 @@ pub fn q8_matmat(
 /// shared-memory tiles make this tolerance-class (like the LLM
 /// prefill graph); the probe arbitrates vs the CPU AMX arm per
 /// process.
+/// Bring an activation panel inside `half` range, in place, and return
+/// the factor the kernel must apply to the WEIGHT side to undo it.
+///
+/// The threshold leaves one octave below `half`'s 65504 so a tile sum
+/// has room; the scale is a power of two, so the shift costs no mantissa
+/// and 1.0 — the overwhelmingly common answer — is a no-op on both sides.
+fn activation_boost(pre: &[f32], xs_buf: &Buffer) -> f32 {
+    const SAFE: f32 = 32768.0;
+    let amax = pre
+        .iter()
+        .fold(0f32, |m, &v| if v.is_finite() { m.max(v.abs()) } else { m });
+    if !(amax > SAFE) {
+        return 1.0;
+    }
+    let shift = (amax / SAFE).log2().ceil();
+    let (down, up) = ((-shift).exp2(), shift.exp2());
+    unsafe {
+        let dst = xs_buf.contents() as *mut f32;
+        for i in 0..pre.len() {
+            *dst.add(i) *= down;
+        }
+    }
+    tracing::debug!("metal q4tp: activations absmax {amax:.3e}, scaled by 2^-{shift}");
+    up
+}
+
 pub fn q4tp_matmat(
     model: &Arc<CmfModel>,
     idx: usize,
@@ -6404,6 +6436,21 @@ pub fn q4tp_matmat(
     unsafe {
         std::ptr::copy_nonoverlapping(pre.as_ptr(), xs_buf.contents() as *mut f32, pre.len());
     }
+    // The kernel stages activations into threadgroup memory as `half`,
+    // so an activation past 65504 becomes inf and then NaN. That is not
+    // hypothetical: on MiniMax-H3 one row of the audio segment grows to
+    // 3.0e6 by block 44 and takes the whole audio stream with it — the
+    // grey 512x288 render on this backend was exactly this.
+    //
+    // Scale by a POWER OF TWO (exact, no mantissa lost) and hand the
+    // kernel the reciprocal to fold into the weight side, leaving the
+    // product unchanged. Weights are quantized and O(1), so boosting
+    // them has room to spare where the activations did not.
+    //
+    // When nothing is out of range the scale is 1.0 and every bit of
+    // this is what it was before — which matters, because this kernel
+    // serves every q4tp model on Metal, not just this one.
+    let wboost = activation_boost(pre, &xs_buf);
     let y_buf = get_io(22_000_000_663 + b * rows, b * rows * 4);
 
     let cmd = c.queue.new_command_buffer();
@@ -6418,6 +6465,7 @@ pub fn q4tp_matmat(
         enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
         enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
         enc.set_bytes(5, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(6, 4, &wboost as *const f32 as *const std::ffi::c_void);
         enc.dispatch_thread_groups(
             MTLSize::new((b as u64).div_ceil(32), (rows as u64).div_ceil(64), 1),
             MTLSize::new(128, 1, 1),

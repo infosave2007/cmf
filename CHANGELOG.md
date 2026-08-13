@@ -25,16 +25,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Metal 46.1 s, wgpu 117.3 s. Both correct, and neither ran at all
   before.
 
-### Known
-- **The native Metal backend degenerates as the sequence grows.** On an
-  M4, 256×160 renders correctly; 512×256 and 512×288 come out uniform
-  grey. wgpu renders 512×288 on the same machine and the same file
-  correctly (747.7 s against Metal's 249.6 s of grey), so it is the
-  backend and not the model, the file or the resolution's VAE tiling —
-  512×256 fails too, which rules out the 288-pixel edge. Not the
-  documented cooperative-matrix overflow either: that lives in the wgpu
-  kernel and `gpu_metal.rs` has no coop path. Until it is found, use
-  `CMF_GPU=wgpu` on macOS above 256×160.
+- **The Metal `q4tp` GEMM overflowed `half` on outlier activations,**
+  which is why `cortiq animate` came out uniform grey above 256×160 on
+  Apple Silicon while wgpu rendered the same file correctly. The kernel
+  stages activations into threadgroup memory as `half`, so anything past
+  65504 is `inf` and then NaN. It was not hypothetical and not diffuse:
+  on MiniMax-H3 exactly ONE row of 982 — row 49, inside the audio
+  segment, the same row every run — grows from 1.7e3 through the middle
+  blocks to 4.3e5 at block 36 and 3.0e6 by block 44, then takes the
+  audio stream NaN on the second sampling step and the picture with it.
+
+  The host now measures the panel's absmax on the way in and, only when
+  it would overflow, scales the activations by a POWER OF TWO — exact,
+  no mantissa lost — handing the kernel the reciprocal to fold into the
+  weight side, where quantized values have room to spare. The product is
+  unchanged. **When nothing is out of range the factor is 1.0 and every
+  bit is what it was**, which is the point: this kernel serves every
+  q4tp model on Metal. Verified: a text model over Metal triggers the
+  scale zero times and its output is unchanged.
+
+  512×288 on an M4 now renders correctly in **298.5 s against wgpu's
+  747.7 s** — the backend that was broken is also the fast one.
+
+  Found with two probes kept behind env vars because they are what made
+  it findable: `CMF_MMH3_NANPROBE=1` reports which side of the output
+  head a NaN is on and which rows of the residual stream carry it, and
+  `CMF_MMH3_WATCHROW=<r>` traces one row's magnitude block by block —
+  a growing number is an overflow, a sudden NaN is a kernel.
 
 ## [0.5.73] - 2026-08-13
 
