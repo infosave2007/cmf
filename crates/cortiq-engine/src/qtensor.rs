@@ -550,9 +550,15 @@ impl QTensor {
         }
     }
 
-    /// (model, idx, kind, row_scale) for a graph-capable mapped weight. kind:
-    /// 0=q8_row (per-row scales), 1=q1, 2=q4_tiled, 3=q1t (tile-embedded, no
-    /// rs). None for dtypes the token graph does not handle (q8_2f/q4_block/vbit).
+    /// (model, idx, kind, row_scale) for a graph-capable mapped weight.
+    /// kind: 0=q8_row (per-row scales), 1=q1, 2=q4_block, 3=q1t
+    /// (tile-embedded, no rs), 5=q4_tiled, 6=q4tp, 7=q8_2f (both scale
+    /// planes live inside the tensor). None only for `vbit`.
+    ///
+    /// The old comment here claimed q4_block was unhandled while the arm
+    /// right below mapped it, and it named q8_2f as unhandled after that
+    /// stopped being true — a stale comment on this function is how a
+    /// model silently loses the graph, so it is worth keeping honest.
     pub fn graph_weight(&self) -> Option<(&std::sync::Arc<CmfModel>, usize, u8, &[f32])> {
         match self {
             Self::Mapped {
@@ -593,6 +599,16 @@ impl QTensor {
                 dtype: TensorDtype::Q4Block,
                 ..
             } => Some((model, *idx, 2, &[])),
+            // q8_2f carries BOTH scale planes after the int8 body (rows
+            // f16, then cols f16), so the graph takes the whole tensor
+            // and the kernel reads them where they lie — no host-side
+            // prescale, which is what the per-op path does instead.
+            Self::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q8_2f,
+                ..
+            } => Some((model, *idx, 7, &[])),
             Self::Mapped {
                 model,
                 idx,

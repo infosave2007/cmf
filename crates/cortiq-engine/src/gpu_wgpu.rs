@@ -206,6 +206,97 @@ fn q8_matvec(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// q8_2f in the token graph: int8 body, then a per-ROW f16 plane, then a
+// per-COLUMN one — w[o,i] = q·s_o·c_i. The per-op path folds the column
+// field into the activations on the host and reuses the q8_row kernel;
+// a graph has no host in the loop, so the kernel reads both planes where
+// they lie. Multiply order follows that per-op arm — x·c first, the row
+// scale last — so the two agree, which is the parity that matters.
+//
+// Without this the whole graph refused: one q8_2f tensor per layer (the
+// FFN down_proj on a qwen3 that is otherwise 169 tensors of q1) made
+// every layer unbuildable, and a refusal at layer 0 is a refusal for the
+// model. Measured on the phone that model never once took the graph.
+struct P82 { cols4: u32, rows: u32, cols: u32, _pad: u32 };
+@group(0) @binding(0) var<storage, read>       q82  : array<u32>;
+@group(0) @binding(1) var<storage, read>       xs82 : array<f32>;
+@group(0) @binding(2) var<storage, read_write> y82  : array<f32>;
+@group(0) @binding(3) var<uniform>             p82  : P82;
+
+var<workgroup> partial82: array<f32, 64>;
+
+// A pruned model does not give this kernel word-aligned rows: bonsai's
+// FFN is 6137 wide in one layer and 6130 in another, so a row of int8
+// starts mid-word and the whole tensor shears if you index it by
+// `row * cols/4`. That shear is what produced fluent nonsense — "the the
+// the the" — on a graph that had just started building. Rows are
+// addressed in BYTES here and assembled from two words when they
+// straddle; only the two f16 planes need `rows*cols` to be a multiple of
+// four, which `resolve` checks before offering the arm.
+fn ldu(byte: u32) -> u32 {
+    let w = byte >> 2u;
+    let sh = (byte & 3u) * 8u;
+    if (sh == 0u) { return q82[w]; }
+    return (q82[w] >> sh) | (q82[w + 1u] << (32u - sh));
+}
+
+@compute @workgroup_size(64)
+fn q8_2f_matvec(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(num_workgroups) nwg: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32) {
+    let qbytes = p82.rows * p82.cols;
+    let rs0 = qbytes >> 2u;                 // per-row f16 plane, in words
+    let cs0 = rs0 + (p82.rows >> 1u);       // per-column f16 plane, in words
+    let ngrp = (p82.cols + 3u) / 4u;        // 4 columns a step, last may be short
+    var row = wid.x;
+    loop {
+        if (row >= p82.rows) { break; }
+        let rowbase = row * p82.cols;
+        var acc = 0.0;
+        var i = lid;
+        loop {
+            if (i >= ngrp) { break; }
+            let c0 = i * 4u;
+            var v = i8x4(ldu(rowbase + c0));
+            // Columns past the end contribute nothing.
+            let rem = p82.cols - c0;
+            if (rem < 4u) {
+                if (rem < 2u) { v.y = 0.0; }
+                if (rem < 3u) { v.z = 0.0; }
+                v.w = 0.0;
+            }
+            let xv = vec4<f32>(
+                xs82[c0],
+                select(0.0, xs82[c0 + 1u], rem > 1u),
+                select(0.0, xs82[c0 + 2u], rem > 2u),
+                select(0.0, xs82[c0 + 3u], rem > 3u),
+            );
+            let s0 = unpack2x16float(q82[cs0 + i * 2u]);
+            let s1 = unpack2x16float(q82[cs0 + i * 2u + 1u]);
+            let cv = vec4<f32>(s0.x, s0.y, s1.x, s1.y);
+            acc = acc + dot(v, xv * cv);
+            i = i + 64u;
+        }
+        partial82[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid < stride) { partial82[lid] = partial82[lid] + partial82[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lid == 0u) {
+            let rw = unpack2x16float(q82[rs0 + (row >> 1u)]);
+            var sc = rw.x;
+            if ((row & 1u) == 1u) { sc = rw.y; }
+            y82[row] = partial82[0] * sc;
+        }
+        workgroupBarrier();
+        row = row + nwg.x;
+    }
+}
+
 // The same matvec for a mobile GPU, and the difference is where the
 // activations come from. The kernel above re-reads xs out of GLOBAL
 // memory for every row — on a desktop the L2 absorbs that, on an Adreno
@@ -10199,6 +10290,8 @@ struct Ctx {
     matvec: wgpu::ComputePipeline,
     /// Mobile arm: activations staged in workgroup memory. `CMF_Q8MV=tiled`.
     matvec_tiled: wgpu::ComputePipeline,
+    /// Token-graph matvec for q8_2f (both scale planes inside the tensor).
+    q8_2f_mv: wgpu::ComputePipeline,
     matmat: wgpu::ComputePipeline,
     mul_mm: wgpu::ComputePipeline,
     q1_mm: wgpu::ComputePipeline,
@@ -11158,6 +11251,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     };
     let matvec = pipe("q8_matvec");
     let matvec_tiled = pipe("q8_matvec_tiled");
+    let q8_2f_mv = pipe("q8_2f_matvec");
     let matmat = pipe("q8_matmat");
     let mul_mm = pipe("q8_mul_mm");
     let q1_mm = pipe("q1_mul_mm");
@@ -11599,6 +11693,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         adapter_info: info,
         matvec,
         matvec_tiled,
+        q8_2f_mv,
         matmat,
         mul_mm,
         q1_mm,
@@ -13515,6 +13610,12 @@ pub fn forward_token_graph(
             gate: GMat,
             up: GMat,
             down: GMat,
+            /// This LAYER's intermediate width. Not the model's: a pruned
+            /// model narrows the FFN per layer (bonsai-1.7b runs 6130 …
+            /// 6140 across its 28 layers), and taking the header's number
+            /// here asked for weights that do not exist — the graph then
+            /// refused for the whole model, on every token, silently.
+            width: usize,
         },
         Moe {
             router: GMat,
@@ -13585,12 +13686,28 @@ pub fn forward_token_graph(
                     kind: 1,
                 })
             }
-            2 | 3 | 5 | 6 => {
-                // q4_block / q1t / q4_tiled / q4tp: the tensor carries its own byte
-                // length (tiles + q1t's sparse overlay) — fetch whole,
+            2 | 3 | 5 | 6 | 7 => {
+                // q8_2f addresses its scale planes as words: the int8 body
+                // must end on one. Rows are byte-addressed, so an odd
+                // `cols` is fine — an odd `rows*cols` is not.
+                if gw.kind == 7 && (rows * cols) % 4 != 0 {
+                    return None;
+                }
+                // q4_block / q1t / q4_tiled / q4tp / q8_2f: the tensor
+                // carries its own byte length (tiles, q1t's sparse
+                // overlay, q8_2f's two scale planes) — fetch whole,
                 // device-local.
                 let entry = model.tensors.get(gw.idx)?;
                 if *entry.shape.first()? as usize != rows || *entry.shape.get(1)? as usize != cols {
+                    // A silent refusal here is what made this model look
+                    // like the graph "does not work on mobile" for a day:
+                    // say which gate closed.
+                    if std::env::var("CMF_GRAPH_DEBUG").is_ok() {
+                        eprintln!(
+                            "graph refuse: kind {} idx {} shape {:?} but graph wants {}x{}",
+                            gw.kind, gw.idx, entry.shape, rows, cols
+                        );
+                    }
                     return None;
                 }
                 let abs = model.entry_abs_offset(entry)?;
@@ -13720,15 +13837,29 @@ pub fn forward_token_graph(
         };
         let ffn = match &l.ffn {
             crate::gpu::GraphFfn::Dense { gate, up, down } => {
+                // The tensor knows its own width; the config only knows
+                // the widest. Ask the weight.
+                let ffn_w = model
+                    .tensors
+                    .get(gate.idx)
+                    .and_then(|e| e.shape.first().copied())
+                    .map(|r| r as usize)
+                    .filter(|w| *w > 0 && *w <= inter)
+                    .unwrap_or(inter);
                 let (Some(gate), Some(up), Some(down)) = (
-                    resolve(gate, inter, hidden),
-                    resolve(up, inter, hidden),
-                    resolve(down, hidden, inter),
+                    resolve(gate, ffn_w, hidden),
+                    resolve(up, ffn_w, hidden),
+                    resolve(down, hidden, ffn_w),
                 ) else {
                     graph_decline("weight resolve (dtype/shape outside graph contract)");
                     return false;
                 };
-                LFfn::Dense { gate, up, down }
+                LFfn::Dense {
+                    gate,
+                    up,
+                    down,
+                    width: ffn_w,
+                }
             }
             crate::gpu::GraphFfn::Moe {
                 router,
@@ -14226,6 +14357,26 @@ pub fn forward_token_graph(
                 } else {
                     encode_q1t_like(c, enc, &c.q4tp_mv, &m.buf, xs, y, rows, cols)
                 }
+            }
+            7 => {
+                // Both scale planes live inside the buffer, so the kernel
+                // needs the true `cols` alongside the word count.
+                let p_buf = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, cols as u32, 0]);
+                let layout = c.q8_2f_mv.get_bind_group_layout(0);
+                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layout,
+                    entries: &[
+                        bind_buf(0, &m.buf),
+                        bind_buf(1, xs),
+                        bind_buf(2, y),
+                        bind_buf(3, &p_buf),
+                    ],
+                });
+                let mut pass = begin_pass(enc);
+                pass.set_pipeline(&c.q8_2f_mv);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
             }
             _ => encode_f32matvec(c, enc, &m.buf, xs, y, rows, cols),
         }
@@ -15212,7 +15363,13 @@ pub fn forward_token_graph(
             // SiLU FFN: gate+up matvecs + silu fused in ONE compute pass
             // (dispatches within a pass are serialized — silu safely reads gate/up output).
             match &lw.ffn {
-                LFfn::Dense { gate, up, down } => {
+                LFfn::Dense {
+                    gate,
+                    up,
+                    down,
+                    width,
+                } => {
+                    let inter = *width; // this layer's, not the model's
                     let pg = prep(gate, &n1, &gbuf, inter, hidden);
                     let pu = prep(up, &n1, &ubuf, inter, hidden);
                     if let (Some((pgp, bg_g, wg)), Some((pup, bg_u, wu))) = (pg, pu) {
@@ -15930,6 +16087,12 @@ pub fn forward_batch_graph(
             gate: GMat,
             up: GMat,
             down: GMat,
+            /// This LAYER's intermediate width. Not the model's: a pruned
+            /// model narrows the FFN per layer (bonsai-1.7b runs 6130 …
+            /// 6140 across its 28 layers), and taking the header's number
+            /// here asked for weights that do not exist — the graph then
+            /// refused for the whole model, on every token, silently.
+            width: usize,
         },
         Moe {
             router: GMat,
@@ -16107,10 +16270,19 @@ pub fn forward_batch_graph(
                 up: lu,
                 down: ld,
             } => {
+                // Per-layer FFN width, from the weight rather than the
+                // header — a pruned model narrows it layer by layer.
+                let ffn_w = model
+                    .tensors
+                    .get(lg.idx)
+                    .and_then(|e| e.shape.first().copied())
+                    .map(|r| r as usize)
+                    .filter(|w| *w > 0 && *w <= inter)
+                    .unwrap_or(inter);
                 let (Some(gate), Some(up), Some(down)) = (
-                    resolve(lg, inter, hidden),
-                    resolve(lu, inter, hidden),
-                    resolve(ld, hidden, inter),
+                    resolve(lg, ffn_w, hidden),
+                    resolve(lu, ffn_w, hidden),
+                    resolve(ld, hidden, ffn_w),
                 ) else {
                     bgraph_refused("site:5960");
                     return false;
@@ -16119,7 +16291,12 @@ pub fn forward_batch_graph(
                     bgraph_refused("dense FFN not gemmable");
                     return false;
                 }
-                BFfn::Dense { gate, up, down }
+                BFfn::Dense {
+                    gate,
+                    up,
+                    down,
+                    width: ffn_w,
+                }
             }
             crate::gpu::GraphFfn::Moe {
                 router,
@@ -16436,6 +16613,26 @@ pub fn forward_batch_graph(
                 } else {
                     encode_q1t_like(c, enc, &c.q4tp_mv, &m.buf, xs, y, rows, cols)
                 }
+            }
+            7 => {
+                // Both scale planes live inside the buffer, so the kernel
+                // needs the true `cols` alongside the word count.
+                let p_buf = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, cols as u32, 0]);
+                let layout = c.q8_2f_mv.get_bind_group_layout(0);
+                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layout,
+                    entries: &[
+                        bind_buf(0, &m.buf),
+                        bind_buf(1, xs),
+                        bind_buf(2, y),
+                        bind_buf(3, &p_buf),
+                    ],
+                });
+                let mut pass = begin_pass(enc);
+                pass.set_pipeline(&c.q8_2f_mv);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
             }
             _ => encode_f32matvec(c, enc, &m.buf, xs, y, rows, cols),
         }
@@ -16841,7 +17038,13 @@ pub fn forward_batch_graph(
             k as u32,
         );
         match &lw.ffn {
-            BFfn::Dense { gate, up, down } => {
+            BFfn::Dense {
+                gate,
+                up,
+                down,
+                width,
+            } => {
+                let inter = *width; // this layer's, not the model's
                 ematb(&mut enc, gate, &n1, &gbuf, inter, hidden);
                 ematb(&mut enc, up, &n1, &ubuf, inter, hidden);
                 go(
