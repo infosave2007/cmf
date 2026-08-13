@@ -15,15 +15,17 @@ tags:
 
 # MiniMax-Music-3 → CMF — 20.3 GB of weights in one 5.55 GB file
 
-> **Read this first.** This is a **weight conversion, not a runnable
-> generator yet.** All three stacks are packed and every tensor hash
-> verifies; two of the three — the flow-matching DiT and the DAV vocoder
-> — are implemented in `cortiq` and pass their tests out of this file.
-> The autoregressive driver that produces the conditioning is **not
-> written**, so `cortiq` cannot yet turn a prompt into music from it.
-> Published because the conversion itself is finished, checkable and
-> useful; not published as a working text-to-music model. What is left
-> is spelled out at the bottom.
+```bash
+cortiq music minimax-music3-q4tp.cmf \
+  --prompt "bpm is 92, key is E minor. Electric blues rock, gritty slide \
+guitar, walking bass, brushed drums, warm analog production." \
+  --lyrics "[verse]
+I woke up on a dusty road" \
+  --seconds 15 --steps 8 --seed 42 --out song.wav
+```
+
+**[Listen to that command's output.](https://huggingface.co/infosave/MiniMax-Music-3-cmf/resolve/main/samples/blues_15s.wav)**
+One binary, one file, no Python.
 
 [MiniMax-Music-3](https://huggingface.co/MiniMaxAI/MiniMax-Music3)
 generates music with vocals from a caption and lyrics. This is its
@@ -45,7 +47,7 @@ read by `cortiq`, a Rust binary with no ML framework underneath.
 
 | stack | packed as | status |
 |---|---|---|
-| **AR** — Qwen3-8B backbone (36 layers, 32 q heads / 8 kv of 128), three embedding tables, pruned audio head, 4-layer RVQ depth decoder | `q4tp`, norms exact | packed, **driver not written** |
+| **AR** — Qwen3-8B backbone (36 layers, 32 q heads / 8 kv of 128), three embedding tables, pruned audio head, 4-layer RVQ depth decoder | `q4tp`, norms exact | **implemented, tested** |
 | **DiT** — 36 layers, 32×64 heads, GEGLU 8192, flow matching | `q4tp`, norms and both 1×1 convs exact | **implemented, tested** |
 | **DAV vocoder** — ×8 ×8 ×4 ×2 to 44.1 kHz stereo | **exact throughout** | **implemented, tested** |
 
@@ -116,45 +118,69 @@ zeroing the condition has to change it (catches a wrong concatenation)
 and moving the timestep has to change it (catches a dropped token).
 Measured: rms 0.563, d/dcond 0.254, d/dt 2.445.
 
-Both run out of this single file with the same numbers as their
-standalone packs.
+**Depth decoder** — it must be CAUSAL, since that is the only thing its
+attention mask does and losing it lets a codebook level attend to its
+own answer while the model keeps sampling plausible codes. Measured: 8
+codebooks, head spread 6.188.
 
-## What is left
+**The chain** — noise → sampler → vocoder has to land on the sample
+count all three agree about, `frames × 512 × 2`, because the σ walk, the
+DiT's timestep convention and the vocoder's hop all feed it.
 
-The remaining stack is the autoregressive driver, and it is not a
-forward pass. ComfyUI's node calls
-`clip.tokenize(caption, lyrics, seed, cfg_scale, top_k)`, so the DiT's
-conditioning is **generated**: audio tokens sampled frame by frame at 25
-frames/s with classifier-free guidance at 1.5 over a batch of two and
-top-k 50, running the 8B backbone once per frame plus seven passes of
-the depth decoder, and the conditioning the DiT sees is the eight RVQ
-CODEBOOK levels of that generation — `c0`'s hidden state concatenated
-with the depth decoder's seven, 8 x 4096 per frame — mixed by a learned
-`cond_layer_logits`. (Not eight transformer layers, which is what the
-name and the condition encoder's `num_condition_layers: 8` both suggest
-until you read the loop.)
+And then the ear, which is the only judge of the last mile. The sample
+above is what came out; by numbers it is 3382 zero crossings a second
+(music sits in the low thousands, white noise above ten), band energy
+0.42/0.25/0.25/0.08 from low to high, and an envelope with real onsets
+— sd/mean 0.71, 124 of 149 windows active.
 
-For two minutes of music that is 3000 frames — a full LLM sampling loop
-with a KV cache, not something to bolt on quickly.
+## How it generates
 
-Then the sampler: `FlowMatchEulerDiscreteScheduler` with
-`invert_sigmas`, `shift 1.0`, which is a named diffusers class and can
-be implemented exactly rather than inferred.
+The AR stack does not encode the prompt, it **generates** the
+conditioning. A Qwen3-8B backbone is prefilled at batch two — the words,
+and a copy whose middle is replaced by `<|audio_cfg|>` — then sampled one
+audio frame at a time at 25 fps: `c0` from the pruned head under
+classifier-free guidance at 1.5, with the top-k mask taken from the
+CONDITIONED logits, then seven more codebooks through the depth decoder,
+each fed back through its own embedding table. The eight hidden states
+of that frame are what the DiT sees, softmax-mixed by
+`cond_layer_logits`.
 
-The weights for all of it are in this file and verified. The driver is
-the work.
+Then an ordinary Euler flow walk over the latent — σ from 1 to 0, the
+DiT asked at `1 − σ`, windowed 689 frames at a time with a 344 hop and
+the overlap averaged, exactly as the reference does it — and the vocoder
+turns each latent frame into 512 stereo samples.
 
-## Using what does work today
+Two places where this deliberately is not the reference, both marked in
+the source:
+
+- **The top-k sampler is a plain xorshift, not torch's seeded
+  `Generator`.** Reproducing `torch.multinomial` bit-for-bit is its own
+  project, and nothing here needs one seed to mean the same song across
+  implementations — only that a seed means one song in this one.
+- **The lyrics normaliser skips the reference's markdown scrubbing.**
+  That step only ever removes characters a caption should not carry.
+
+### What it costs
+
+Measured on an Apple M4, 5 s at 8 steps, 206 s total: AR 0.45 s/frame,
+denoise 6.5 s/step over 430 latent frames, vocoder 19 s. The 15-second
+sample above took 823 s.
+
+The vocoder was 75 s before it was handed the thread pool, which is a
+quarter of a short render for a one-word change.
+
+## Running it
 
 ```bash
-cargo install cortiq-cli          # 0.5.73+
+cargo install cortiq-cli          # 0.5.74+
 hf download infosave/MiniMax-Music-3-cmf minimax-music3-q4tp.cmf --local-dir .
 cortiq verify minimax-music3-q4tp.cmf     # → ✓ all tensor hashes match
+cortiq music minimax-music3-q4tp.cmf --prompt "..." --lyrics "..." \
+  --seconds 15 --steps 8 --seed 42 --out song.wav
 ```
 
-The DiT and the vocoder are `cortiq_engine::music3::Music3Dit` and
-`cortiq_engine::audiovae::Music3Dav`; both take this file. Repacking
-from the original sources:
+`--seconds` is a ceiling: the model can stop earlier. Same seed, same
+prompt, same song. Repacking from the original sources:
 
 ```bash
 cortiq animate-pack \
