@@ -1348,12 +1348,41 @@ impl MiniMaxH3 {
         for (i, blk) in self.blocks.iter().enumerate() {
             let mods = blk.adaln.as_ref().unwrap().eval(&ts, pool);
             self.block_forward(blk, &mut h, layout.seq_len, Some(&mods), &layout.pos, &rows);
+            // Per-block watch on the row that dies: growing magnitude is
+            // an overflow, a sudden jump from finite to NaN is a kernel.
+            if let Ok(w) = std::env::var("CMF_MMH3_WATCHROW") {
+                if let Ok(r) = w.parse::<usize>() {
+                    let row = &h[r * hs..(r + 1) * hs];
+                    let amax = row.iter().filter(|v| v.is_finite()).fold(0f32, |a, v| a.max(v.abs()));
+                    let bad = row.iter().filter(|v| !v.is_finite()).count();
+                    if bad > 0 || i == 0 || amax > 1e3 {
+                        eprintln!("  watch blk {i}: row {r} absmax {amax:.3e} nonfinite {bad}");
+                    }
+                }
+            }
             if std::env::var_os("CMF_DIT_PROGRESS").is_some() {
                 eprint!("\r  block {}/{}", i + 1, self.blocks.len());
             }
         }
 
         // ── heads ──
+        if std::env::var("CMF_MMH3_NANPROBE").is_ok() {
+            let bad: Vec<usize> = (0..h.len() / hs)
+                .filter(|r| h[r * hs..(r + 1) * hs].iter().any(|v| !v.is_finite()))
+                .collect();
+            if !bad.is_empty() {
+                eprintln!(
+                    "  nanprobe rows: {} of {} bad, first 8 {:?}, video seg {}..{}, audio seg {}..{}",
+                    bad.len(),
+                    h.len() / hs,
+                    &bad[..bad.len().min(8)],
+                    vseg.start,
+                    vseg.stop,
+                    aseg.start,
+                    aseg.stop
+                );
+            }
+        }
         let fm = self.final_adaln.eval(&ts, pool);
         let mut video_out = vec![0f32; (vseg.stop - vseg.start) * vd];
         let mut audio_out = vec![0f32; (aseg.stop - aseg.start) * self.audio_dim];
@@ -1375,7 +1404,27 @@ impl MiniMaxH3 {
                     *v = *v * (1.0 + sc) + sh;
                 }
             }
+            // `CMF_MMH3_NANPROBE=1`: which side of the head's GEMM a NaN
+            // is on. The stream that dies is the one to instrument, and
+            // "the input was already bad" and "this GEMM made it bad" are
+            // different bugs in different files.
+            let probe = std::env::var("CMF_MMH3_NANPROBE").is_ok();
+            if probe {
+                let bad_in = hn.iter().filter(|v| !v.is_finite()).count();
+                eprintln!(
+                    "  nanprobe dim={dim} n={n} in_bad={bad_in} in_absmax={:.4}",
+                    hn.iter().filter(|v| v.is_finite()).fold(0f32, |a, v| a.max(v.abs()))
+                );
+            }
             w.matmat(&hn, n, dst, pool);
+            if probe {
+                let bad_out = dst.iter().filter(|v| !v.is_finite()).count();
+                eprintln!(
+                    "  nanprobe dim={dim} out_bad={bad_out}/{} out_absmax={:.4}",
+                    dst.len(),
+                    dst.iter().filter(|v| v.is_finite()).fold(0f32, |a, v| a.max(v.abs()))
+                );
+            }
             for r in dst.chunks_exact_mut(dim) {
                 for (v, &bv) in r.iter_mut().zip(b.iter()) {
                     *v += bv;
