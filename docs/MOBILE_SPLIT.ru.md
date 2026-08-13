@@ -146,8 +146,9 @@ cargo ndk -t arm64-v8a -t x86_64 --platform 26 \
 RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384" \
   cargo ndk -t armeabi-v7a --platform 26 build --release -p cortiq-ffi
 
-# iOS
-cargo build --release -p cortiq-ffi --target aarch64-apple-ios
+# iOS — тоже с gpu, и обе цели: устройство и симулятор (arm64)
+cargo build --release -p cortiq-ffi --target aarch64-apple-ios --features gpu
+cargo build --release -p cortiq-ffi --target aarch64-apple-ios-sim --features gpu
 ```
 
 Проверить ПЕРЕД копированием — три символа на месте и выравнивание 0x4000
@@ -158,9 +159,23 @@ llvm-nm -D libcortiq_ffi.so | grep -c "cortiq_\(worker_start\|set_peer\|peer_sta
 llvm-readelf -l libcortiq_ffi.so | awk '/LOAD/{print $NF}' | sort -u        # 0x4000
 ```
 
-Размеры — тоже проверка: arm64 ≈ 14 МБ и x86_64 ≈ 14.5 МБ (с gpu),
-v7a ≈ 4.5 МБ (без). Arm64 на 7 МБ легче ожидаемого означает, что фича gpu
-потерялась.
+Размеры — тоже проверка: arm64 ≈ 14.1 МБ и x86_64 ≈ 14.5 МБ (с gpu),
+v7a ≈ 4.5 МБ (без), обе iOS-библиотеки ≈ 88.7 МБ (с gpu; без неё 53.6 —
+если получилось столько, фича потерялась).
+
+**Символы в iOS-архиве обычным `nm` не видны, и это не поломка.** Профиль
+релиза собирает с `lto = "thin"`, поэтому члены архива — это LLVM-битkod, и
+`nm` возвращает пусто даже для `_cortiq_version`. Проверять надо линковкой:
+
+```sh
+printf 'int32_t cortiq_set_peer(const char*);\nint main(){return cortiq_set_peer("{}");}\n' > probe.c
+xcrun -sdk iphoneos clang -target arm64-apple-ios13.0 probe.c libcortiq_ffi.a \
+  -framework Metal -framework Foundation -framework CoreFoundation \
+  -framework CoreGraphics -framework QuartzCore -framework IOSurface -o probe
+```
+
+`CoreGraphics` в этом списке обязателен: Metal-поверхность wgpu тянет
+`CGColorSpace*`, и без него линковка падает на них, а не на наших символах.
 
 Скопировать `libcortiq_ffi.so` в `android/app/src/main/jniLibs/<abi>/` и
 обновить `native/cortiq_ffi.h` из `crates/cortiq-ffi/include/cortiq.h`.
