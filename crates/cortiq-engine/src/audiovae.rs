@@ -297,6 +297,167 @@ impl ConvT1d {
     }
 }
 
+/// Plain Snake, `x + sin²(α·x)/α`, with α used EXACTLY as stored.
+///
+/// The distinction from `SnakeBeta` below is not cosmetic: H3's BigVGAN
+/// keeps α and β in log scale and this file exponentiates them on load,
+/// while MiniMax-Music-3's decoder reads its α straight
+/// (`(alpha + 1e-9).reciprocal() * sin(alpha * x)**2`). Feeding one
+/// model's parameters to the other's loader silently raises the
+/// activation to an exponent, and the only symptom is worse audio.
+struct Snake {
+    alpha: Vec<f32>,
+}
+
+impl Snake {
+    fn load(model: &Arc<CmfModel>, name: &str) -> Result<Self, String> {
+        Ok(Self {
+            alpha: crate::dit::cmf_f32(model, &format!("{name}.alpha"))?,
+        })
+    }
+
+    fn apply(&self, x: &mut [f32], n: usize) {
+        for (c, row) in x.chunks_exact_mut(n).enumerate() {
+            let a = self.alpha[c];
+            let inv = 1.0 / (a + 1e-9);
+            for v in row.iter_mut() {
+                let s = (a * *v).sin();
+                *v += s * s * inv;
+            }
+        }
+    }
+}
+
+/// One residual unit: Snake → dilated 7-tap → Snake → 1-tap, added back.
+struct DavUnit {
+    a1: Snake,
+    c1: Conv1d,
+    a2: Snake,
+    c2: Conv1d,
+}
+
+impl DavUnit {
+    fn load(model: &Arc<CmfModel>, p: &str, dilation: usize) -> Result<Self, String> {
+        Ok(Self {
+            a1: Snake::load(model, &format!("{p}.block.0"))?,
+            c1: Conv1d::load(model, &format!("{p}.block.1"), 3 * dilation, dilation)?,
+            a2: Snake::load(model, &format!("{p}.block.2"))?,
+            c2: Conv1d::load(model, &format!("{p}.block.3"), 0, 1)?,
+        })
+    }
+
+    fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
+        let mut h = x.to_vec();
+        self.a1.apply(&mut h, n);
+        let mut h = self.c1.apply(&h, n, pool);
+        self.a2.apply(&mut h, n);
+        let r = self.c2.apply(&h, n, pool);
+        // Same padding throughout, so the residual lines up without the
+        // reference's centre-crop; assert rather than trust that.
+        debug_assert_eq!(r.len(), x.len());
+        x.iter().zip(&r).map(|(a, b)| a + b).collect()
+    }
+}
+
+/// Snake → transposed conv (×stride) → three residual units at
+/// dilations 1, 3, 9.
+struct DavStage {
+    act: Snake,
+    up: ConvT1d,
+    units: Vec<DavUnit>,
+}
+
+impl DavStage {
+    fn load(model: &Arc<CmfModel>, p: &str, stride: usize) -> Result<Self, String> {
+        Ok(Self {
+            act: Snake::load(model, &format!("{p}.block.0"))?,
+            up: ConvT1d::load(model, &format!("{p}.block.1"), stride)?,
+            units: [1usize, 3, 9]
+                .iter()
+                .enumerate()
+                .map(|(i, &d)| DavUnit::load(model, &format!("{p}.block.{}", i + 2), d))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> (Vec<f32>, usize) {
+        let mut h = x.to_vec();
+        self.act.apply(&mut h, n);
+        let mut h = self.up.apply(&h, n, pool);
+        let n = n * self.up.stride;
+        for u in &self.units {
+            h = u.apply(&h, n, pool);
+        }
+        (h, n)
+    }
+}
+
+/// MiniMax-Music-3's DAV decoder: latent → 44.1 kHz stereo.
+///
+/// The 128 latent channels are a STEREO PAIR of 64: the reference folds
+/// `[b, 128, t]` to `[b·2, 64, t]`, decodes mono, and unfolds. Reading
+/// 128 as one wide latent — which the vocoder config's `latent_channels`
+/// invites — decodes noise at half the length.
+pub struct Music3Dav {
+    dec_in: Conv1d,
+    conv_pre: Conv1d,
+    stages: Vec<DavStage>,
+    act_post: Snake,
+    conv_post: Conv1d,
+}
+
+impl Music3Dav {
+    pub const STRIDES: [usize; 4] = [8, 8, 4, 2];
+    /// Audio samples per latent frame: 8·8·4·2.
+    pub const HOP: usize = 512;
+    pub const SAMPLE_RATE: usize = 44100;
+
+    pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
+        Ok(Self {
+            dec_in: Conv1d::load(model, "mvae.dec_in_proj", 0, 1)?,
+            conv_pre: Conv1d::load(model, "mvae.decoder.model.0", 3, 1)?,
+            stages: Self::STRIDES
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| {
+                    DavStage::load(model, &format!("mvae.decoder.model.{}", i + 1), s)
+                })
+                .collect::<Result<_, _>>()?,
+            act_post: Snake::load(model, "mvae.decoder.model.5")?,
+            conv_post: Conv1d::load(model, "mvae.decoder.model.6", 3, 1)?,
+        })
+    }
+
+    /// `latent` is `[128, frames]`; the result is interleaved stereo of
+    /// `frames · 512` samples per channel.
+    pub fn decode(&self, latent: &[f32], frames: usize, pool: Option<&Pool>) -> Vec<f32> {
+        let mut chans: Vec<Vec<f32>> = Vec::with_capacity(2);
+        for half in 0..2 {
+            let src = &latent[half * 64 * frames..(half + 1) * 64 * frames];
+            let mut h = self.dec_in.apply(src, frames, pool);
+            h = self.conv_pre.apply(&h, frames, pool);
+            let mut n = frames;
+            for st in &self.stages {
+                let (nh, nn) = st.apply(&h, n, pool);
+                h = nh;
+                n = nn;
+            }
+            self.act_post.apply(&mut h, n);
+            let w = self.conv_post.apply(&h, n, pool);
+            // The reference ends in tanh; without it a loud latent
+            // clips as a wrap rather than a limit.
+            chans.push(w.iter().map(|v| v.tanh()).collect());
+        }
+        let n = chans[0].len();
+        let mut out = vec![0f32; n * 2];
+        for (i, o) in out.chunks_exact_mut(2).enumerate() {
+            o[0] = chans[0][i];
+            o[1] = chans[1][i];
+        }
+        out
+    }
+}
+
 /// `x + sin²(α·x)/β`, with α and β stored in log scale.
 struct SnakeBeta {
     alpha: Vec<f32>,
@@ -750,6 +911,49 @@ impl SendPtr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decode through the packed MiniMax-Music-3 vocoder and check the
+    /// two things the reference fixes exactly: 512 samples per latent
+    /// frame per side, and a `tanh` range. `CMF_MUSIC3_VAE=<file.cmf>`
+    /// points at a pack; without it there is nothing to test against.
+    #[test]
+    fn music3_dav_decodes_to_the_reference_geometry() {
+        let Ok(p) = std::env::var("CMF_MUSIC3_VAE") else {
+            eprintln!("CMF_MUSIC3_VAE unset — skipping Music-3 vocoder test");
+            return;
+        };
+        let model = Arc::new(CmfModel::open(&p).expect("open packed vocoder"));
+        let dav = Music3Dav::from_cmf(&model).expect("load DAV");
+        let frames = 12usize;
+        // A latent with structure rather than noise: a decoder that has
+        // silently lost a stage still returns *something* for noise.
+        let latent: Vec<f32> = (0..128 * frames)
+            .map(|i| {
+                let (c, t) = (i / frames, i % frames);
+                0.4 * ((c as f32 * 0.13 + t as f32 * 0.7).sin())
+            })
+            .collect();
+        let pcm = dav.decode(&latent, frames, None);
+        assert_eq!(
+            pcm.len(),
+            frames * Music3Dav::HOP * 2,
+            "512 samples a frame, two sides interleaved"
+        );
+        assert!(pcm.iter().all(|v| v.is_finite()), "non-finite sample");
+        assert!(
+            pcm.iter().all(|v| v.abs() <= 1.0),
+            "tanh range violated: {}",
+            pcm.iter().fold(0f32, |m, v| m.max(v.abs()))
+        );
+        // Silence would also satisfy the above; a working stack moves.
+        let rms = (pcm.iter().map(|v| v * v).sum::<f32>() / pcm.len() as f32).sqrt();
+        assert!(rms > 1e-4, "decoded to near-silence, rms {rms}");
+        let (l, r): (Vec<f32>, Vec<f32>) =
+            pcm.chunks_exact(2).map(|c| (c[0], c[1])).unzip();
+        let d = l.iter().zip(&r).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(d > 0.0, "both sides identical — the 128 latent was not split");
+        eprintln!("music3 dav: {} samples/side, rms {rms:.4}, L-R max {d:.4}", l.len());
+    }
 
     #[test]
     fn the_resampling_filter_is_the_references() {

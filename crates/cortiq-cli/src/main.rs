@@ -983,6 +983,11 @@ enum Commands {
         /// its projection was fitted on
         #[arg(long)]
         te_layers: Option<usize>,
+        /// MiniMax-Music-3's DAV decoder (`minimax_music3_dav.safetensors`).
+        /// Weight normalisation is folded at pack time and everything
+        /// stays exact — a vocoder is where quantization costs hiss
+        #[arg(long)]
+        music_vae: Option<String>,
         /// ClipProj projection (`mmh3-<size>-ClipProj*.safetensors`):
         /// lets a SMALL Qwen3-VL stand in for the 32B encoder, its
         /// tapped hidden state mapped into the DiT's conditioning space
@@ -1682,6 +1687,7 @@ async fn main() -> anyhow::Result<()> {
             te,
             te_layers,
             clip_proj,
+            music_vae,
             video_vae,
             audio_vae,
             tokenizer,
@@ -1700,6 +1706,7 @@ async fn main() -> anyhow::Result<()> {
             te: te.as_deref(),
             te_layers,
             clip_proj: clip_proj.as_deref(),
+            music_vae: music_vae.as_deref(),
             video_vae: video_vae.as_deref(),
             audio_vae: audio_vae.as_deref(),
             tokenizer: tokenizer.as_deref(),
