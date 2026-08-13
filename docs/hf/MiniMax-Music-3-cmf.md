@@ -127,8 +127,12 @@ forward pass. ComfyUI's node calls
 conditioning is **generated**: audio tokens sampled frame by frame at 25
 frames/s with classifier-free guidance at 1.5 over a batch of two and
 top-k 50, running the 8B backbone once per frame plus seven passes of
-the depth decoder, and the conditioning the DiT sees is eight layer taps
-of that generation at 4096 wide, mixed by a learned `cond_layer_logits`.
+the depth decoder, and the conditioning the DiT sees is the eight RVQ
+CODEBOOK levels of that generation — `c0`'s hidden state concatenated
+with the depth decoder's seven, 8 x 4096 per frame — mixed by a learned
+`cond_layer_logits`. (Not eight transformer layers, which is what the
+name and the condition encoder's `num_condition_layers: 8` both suggest
+until you read the loop.)
 
 For two minutes of music that is 3000 frames — a full LLM sampling loop
 with a KV cache, not something to bolt on quickly.
