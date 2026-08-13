@@ -206,6 +206,57 @@ fn q8_matvec(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// The same matvec for a mobile GPU, and the difference is where the
+// activations come from. The kernel above re-reads xs out of GLOBAL
+// memory for every row — on a desktop the L2 absorbs that, on an Adreno
+// 642L it does not: a 2048-wide layer reads 8 KB back 2048 times, and
+// measured end to end the whole decode moved ~0.5 GB/s on a bus the CPU
+// itself drives at 8.5. Here the group stages xs into workgroup memory
+// once and every row reads it from there. Arithmetic, order and output
+// are unchanged — this is the same sum, fed from a closer shelf.
+//
+// 768 vec4 is 12 KB, inside the 16 KB workgroup-storage floor, so the
+// arm is only offered for cols ≤ 3072; wider layers keep the old path.
+var<workgroup> xsh: array<vec4<f32>, 768>;
+
+@compute @workgroup_size(64)
+fn q8_matvec_tiled(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(num_workgroups) nwg: vec3<u32>,
+                   @builtin(local_invocation_index) lid: u32) {
+    var j = lid;
+    loop {
+        if (j >= p.cols4) { break; }
+        let b = j * 4u;
+        xsh[j] = vec4<f32>(xs[b], xs[b + 1u], xs[b + 2u], xs[b + 3u]);
+        j = j + 64u;
+    }
+    workgroupBarrier();
+    var row = wid.x;
+    loop {
+        if (row >= p.rows) { break; }
+        let base = p.row0_words + row * p.cols4;
+        var acc = 0.0;
+        var i = lid;
+        loop {
+            if (i >= p.cols4) { break; }
+            acc = acc + dot(i8x4(q[base + i]), xsh[i]);
+            i = i + 64u;
+        }
+        partial[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid < stride) { partial[lid] = partial[lid] + partial[lid + stride]; }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (lid == 0u) { y[row] = partial[0] * rs[row]; }
+        workgroupBarrier();
+        row = row + nwg.x;
+    }
+}
+
 // GEMM of the prefill batch: y[bi, o] = rs[o]·Σ q[o,i]·xs[bi,i]. One workgroup
 // per (row, position); the quant row stays hot in cache across bi.
 struct MMParams { cols4: u32, rows: u32, nb: u32, _pad: u32 };
@@ -10146,6 +10197,8 @@ struct Ctx {
     /// the load came from.
     adapter_info: wgpu::AdapterInfo,
     matvec: wgpu::ComputePipeline,
+    /// Mobile arm: activations staged in workgroup memory. `CMF_Q8MV=tiled`.
+    matvec_tiled: wgpu::ComputePipeline,
     matmat: wgpu::ComputePipeline,
     mul_mm: wgpu::ComputePipeline,
     q1_mm: wgpu::ComputePipeline,
@@ -11104,6 +11157,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         })
     };
     let matvec = pipe("q8_matvec");
+    let matvec_tiled = pipe("q8_matvec_tiled");
     let matmat = pipe("q8_matmat");
     let mul_mm = pipe("q8_mul_mm");
     let q1_mm = pipe("q1_mul_mm");
@@ -11544,6 +11598,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         pipeline_cache: pcache,
         adapter_info: info,
         matvec,
+        matvec_tiled,
         matmat,
         mul_mm,
         q1_mm,
@@ -11932,6 +11987,14 @@ fn pipeline_cache_store(cache: Option<&wgpu::PipelineCache>, info: &wgpu::Adapte
     if std::fs::write(&tmp, &data).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
         tracing::debug!("pipeline cache: {} B saved", data.len());
     }
+}
+
+/// `CMF_Q8MV=tiled` picks the workgroup-staged matvec. Off by default:
+/// it is a mobile-GPU arm and has to earn its place per device, which is
+/// what the flag is for.
+fn q8mv_tiled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("CMF_Q8MV").is_ok_and(|v| v == "tiled"))
 }
 
 fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu::Buffer> {
@@ -12623,7 +12686,10 @@ fn dispatch_matvec(
             label: Some("q8"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&c.matvec);
+        // The staged-activation arm reads xs from workgroup memory, so
+        // it only fits while xs does: 768 vec4 = 3072 columns.
+        let tiled = q8mv_tiled() && cols <= 3072;
+        pass.set_pipeline(if tiled { &c.matvec_tiled } else { &c.matvec });
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1); // grid-stride over rows
     }
