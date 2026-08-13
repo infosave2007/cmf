@@ -886,6 +886,49 @@ pub fn upload_bytes() -> u64 {
     0
 }
 
+/// Which half of the run is asking.
+///
+/// The phase exists because the graph is plausibly two decisions, not
+/// one — but on the hardware measured so far it is only ever a decode
+/// decision. On an Adreno 642L with bonsai-1.7b, from identical clean
+/// starts and two repeats each: decode 11.6 tok/s without it and 0.72
+/// with, while prefill is 4.2 either way. A first reading of 3.4 -> 18.0
+/// for prefill did not survive a controlled re-run — it was a dirty
+/// probe cache between configurations, not the graph, and the prefill
+/// route through the graph is GDN-only in the first place, which this
+/// dense model never takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GraphPhase {
+    Prefill,
+    Decode,
+}
+
+/// The one place that decides whether the whole-token graph runs.
+///
+/// `CMF_GPU_WGPU_GRAPH`: `0` off everywhere, `prefill` only for the
+/// prompt, anything else on everywhere. Unset: desktop-class GPUs take
+/// it for both phases; phone-class UMA takes it for PREFILL only, which
+/// is the measurement above rather than a guess — the per-op path keeps
+/// decode, where it is seventeen times better.
+pub fn wgpu_graph_on(phase: GraphPhase) -> bool {
+    match std::env::var("CMF_GPU_WGPU_GRAPH").ok().as_deref() {
+        Some("0") => false,
+        Some("prefill") => phase == GraphPhase::Prefill,
+        Some(_) => true,
+        None => {
+            if wgpu_graph_default() {
+                return true;
+            }
+            // Integrated/mobile keeps the per-op path for BOTH phases —
+            // unchanged, because the measurement that would have bought
+            // prefill a graph did not reproduce. `=prefill` is there for
+            // the device where it does; the default does not guess.
+            let _ = phase;
+            false
+        }
+    }
+}
+
 pub fn wgpu_graph_default() -> bool {
     #[cfg(feature = "gpu")]
     {
