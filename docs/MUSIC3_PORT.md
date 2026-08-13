@@ -146,13 +146,19 @@ against a `[16384, 2048]` GEGLU proj, `in_channels` 128 against
 `postprocess_conv [128, 128, 1]`, and the upsampling ratios against the four
 transposed-conv kernels 16/16/8/4.
 
-And `cond_layer_logits [8]` is answered outright: `num_condition_layers: 8`.
-It is a learned mix over the condition encoder's eight layers — the same
-shape of trick as a layer tap, not a mystery.
+`cond_layer_logits [8]` looks answered by `num_condition_layers: 8`, and
+that reading is WRONG — corrected after reading ComfyUI's `ar.py`. The
+eight are the RVQ CODEBOOK levels, not transformer layers: each frame's
+conditioning is `cat(last_hidden, depth_hidden_1..7)`, the c0 hidden
+state plus the depth decoder's seven, 8 x 4096 wide, and
+`cond_layer_logits` is a softmax mix over those. Two independent things
+in this model come in eights, and the config invites the wrong one.
 
-Still not in any config: the vocoder's residual dilations (BigVGAN's [1,3,5]
-is the near-certain default but it is an assumption until a decode is
-compared), and how `latent_conditioners` enters the sequence.
+Not in any config, and both since read off ComfyUI's
+`comfy/ldm/minimax_music/`: the vocoder's residual dilations are **1, 3, 9**
+— BigVGAN's usual 1, 3, 5 was the wrong guess — and `latent_conditioners`
+is a single `Conv1d(4096 → 2048, k=3)` applied to the mixed codebook
+hiddens, then nearest-interpolated to the latent length.
 
 ## The pipeline is wider than three files
 
