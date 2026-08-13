@@ -111,6 +111,72 @@ mechanical and testable in isolation.
 Under 6 GB puts music generation on hardware that cannot hold the video model
 at all, which is the reason to do it.
 
+## The conventions are NOT unreadable — the upstream configs have them
+
+An earlier draft of this file said the schedules and the conditioning
+semantics could only come from a reference implementation. That was wrong,
+and the correction is worth more than the claim: **`MiniMaxAI/MiniMax-Music3`
+ships the configs**, and they are small JSON files.
+
+```jsonc
+// vocoder/config.json          MiniMaxMusic3Vocoder
+{ "decoder_input_dim": 1024, "decoder_hidden_dim": 1536,
+  "latent_channels": 128, "sampling_rate": 44100,
+  "upsampling_ratios": [8, 8, 4, 2] }          // 512x per latent frame
+
+// scheduler/scheduler_config.json
+{ "_class_name": "FlowMatchEulerDiscreteScheduler",
+  "invert_sigmas": true, "shift": 1.0, "num_train_timesteps": 1,
+  "use_dynamic_shifting": false, "time_shift_type": "exponential" }
+
+// transformer/config.json      MiniMaxMusic3Transformer1DModel
+{ "num_layers": 36, "num_attention_heads": 32, "attention_head_dim": 64,
+  "ff_inner_dim": 8192, "in_channels": 128, "condition_dim": 2048,
+  "fourier_embedding_dim": 256, "rotary_dim": 32 }   // PARTIAL rope
+
+// condition_encoder/config.json
+{ "num_condition_layers": 8, "condition_hidden_dim": 4096, "out_dim": 2048,
+  "input_sampling_rate": 24000, "input_hop_length": 960,
+  "output_sampling_rate": 44100, "output_hop_length": 512 }
+```
+
+Every shape in those matches what the headers say, which is the cross-check
+that makes them trustworthy: 32 × 64 = 2048 hidden, `ff_inner_dim` 8192
+against a `[16384, 2048]` GEGLU proj, `in_channels` 128 against
+`postprocess_conv [128, 128, 1]`, and the upsampling ratios against the four
+transposed-conv kernels 16/16/8/4.
+
+And `cond_layer_logits [8]` is answered outright: `num_condition_layers: 8`.
+It is a learned mix over the condition encoder's eight layers — the same
+shape of trick as a layer tap, not a mystery.
+
+Still not in any config: the vocoder's residual dilations (BigVGAN's [1,3,5]
+is the near-certain default but it is an assumption until a decode is
+compared), and how `latent_conditioners` enters the sequence.
+
+## The pipeline is wider than three files
+
+The Comfy-Org repackage flattens what upstream keeps as six stacks:
+
+| upstream | what it does |
+|---|---|
+| `language_model/` (Qwen 7B/8B) | reads the caption and lyrics |
+| `rvq_depth_decoder/` | 8 codebooks, 1024 audio vocab → audio tokens |
+| `condition_encoder/` | 8 layers, 24 kHz/hop 960 in → 44.1 kHz/hop 512 out |
+| `transformer/` | the 36-layer flow-matching DiT |
+| `flowmatching_vae.pth` | latent 128 → the vocoder's 64 |
+| `vocoder/` (`dav.pth`) | 512× upsample to 44.1 kHz mono |
+
+Comfy-Org's three files cover the DiT, the vocoder, and a text encoder that
+carries `model.audio_decoder.audio_heads.{0..3}` — i.e. the language model
+with the RVQ head attached. So a port that starts from the repackage still
+has to account for the condition encoder and the flow-matching VAE, and the
+`latent_channels: 128` / `dec_in_proj [1024, 64, 1]` mismatch is exactly
+where that second VAE sits.
+
+That is the real measure of this port: H3 was four stacks and its card
+documents what establishing parity on each of them cost. This is six.
+
 ## Why this is not a weekend of packing
 
 The H3 card's parity section is the standard this has to meet: *"Established,
