@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.72] - 2026-08-13
+
+**Turning the GPU on stopped costing three minutes.** On a Snapdragon
+778G the phone app spent 256.8 s producing its first answer with the GPU
+enabled, against 10.5 s on the CPU path, and paid it again on every
+launch. It was the driver's shader compiler, and nothing was keeping
+what it produced.
+
+| Adreno 642L / Vulkan | before | now |
+|---|---|---|
+| CLI bench, whole run | 176 s | **10 s** |
+| app, first answer in a fresh process | 256.8 s | **49 s** |
+| app, a later turn | 3.6–7.0 s | 2.7–4.6 s |
+| steady decode with GPU enabled | 12.40 tok/s | **14.19–14.42** (CPU path: 14.31) |
+
+### Added
+- **A `wgpu::PipelineCache` on disk.** Loaded before the first pipeline
+  is built and passed to every one of them; 1.73 MB on this device.
+  Three things guard a file that goes straight to a driver — which is
+  why wgpu makes `create_pipeline_cache` unsafe: the name is keyed by
+  driver string, device and engine version, so another build or another
+  GPU does not find it; `fallback: true` makes a rejected blob cost a
+  recompile rather than the run; and the write is write-then-rename,
+  because a half-written blob handed over next boot is exactly the crash
+  being avoided. `CMF_PIPELINE_CACHE=0` opts out, `=path` relocates it.
+- **Probe verdicts survive the process** (`CMF_PROBE_CACHE`), keyed the
+  same way. It does not fix the compile — measured, the wall clock did
+  not move — but a verdict reached from cold, unramped samples should
+  not be re-rolled every launch: the CPU arm of one probe measured 7.42
+  ms in one run and 55.23 in the next, which is the governor, not the
+  kernel.
+
+### Fixed
+- **Both caches had nowhere to write on Android.** `std::env::temp_dir()`
+  answers `/tmp` with no `TMPDIR`, which does not exist in an app
+  sandbox, so every save failed silently — and it looked like it worked
+  because the shell binary has `TMPDIR=/data/local/tmp`. They now write
+  beside the model, a directory the caller already writes to.
+
+### Measured, not changed
+- **The GPU still loses on this phone, and the arbitration is right.**
+  Forced onto it, decode is 0.883 tok/s against 14.31 on the CPU. What
+  changed is that the losing option no longer costs minutes to discover.
+  The earlier "−13% for enabling the GPU" is retracted: that was the
+  compile bleeding into the measurement.
+- **Flushing the cache more than once buys nothing.** An exponential
+  backoff (generations 2, 4, 8 …) was tried on the theory that a chat
+  turn compiles shapes the first did not: a fresh process then spent
+  49.0, 58.7 and 61.3 s on its first answer across three passes. One
+  flush, at the start of the second generation.
+- **Unexplained:** the app's first answer is 50–60 s where the CLI on
+  the same phone and model is 10. Not the pipeline cache — the backoff
+  would have caught late pipelines and did not.
+- **The GPU path is correct here, just slow.** Greedy text with
+  `CMF_GPU=1` is byte-identical to the CPU path on the same prompt, so
+  nothing about this is a wrong-answer bug.
+- **And the hardware is not what limits it.** 0.883 tok/s on a 591 MB
+  model is ~0.5 GB/s, on a bus the CPU itself drives at ~8.5. Routing
+  the token through the whole-token graph instead of per-op dispatches
+  makes it worse, not better (0.224 tok/s), so it is not submit
+  overhead either. These kernels are written and tuned for desktop
+  GPUs; an Adreno wants its own pass — subgroup width (64/128 against
+  the 32 the cross-lane reductions assume) and the byte-load pattern of
+  the quantized unpack are where to start. Not attempted here, and the
+  verdict "the GPU loses" belongs to THESE kernels on THIS chip, not to
+  the silicon.
+
 ## [0.5.71] - 2026-08-12
 
 **The wire now does its work and leaves.** Every split mode so far kept
