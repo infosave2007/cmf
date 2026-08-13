@@ -10139,6 +10139,12 @@ struct Ctx {
     _adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// Compiled pipelines, kept between runs where the driver supports
+    /// it. `None` when it does not, or when the cache is switched off.
+    pipeline_cache: Option<wgpu::PipelineCache>,
+    /// The adapter's identity, so a later save writes to the same file
+    /// the load came from.
+    adapter_info: wgpu::AdapterInfo,
     matvec: wgpu::ComputePipeline,
     matmat: wgpu::ComputePipeline,
     mul_mm: wgpu::ComputePipeline,
@@ -10991,6 +10997,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
     // Half precision, where the card has it: the matrix units take f16
     // operands, and without this the shader cannot even name the type.
     let want_f16 = adapter.features().contains(wgpu::Features::SHADER_F16);
+    // Keeping compiled pipelines between runs; see `pipeline_cache_path`.
+    let want_pcache = adapter.features().contains(wgpu::Features::PIPELINE_CACHE);
     COOP_OK.store(want_coop, std::sync::atomic::Ordering::Relaxed);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cortiq-wgpu"),
@@ -11009,6 +11017,10 @@ fn init(dev: usize) -> Result<Ctx, String> {
             wgpu::Features::empty()
         } | if want_f16 {
             wgpu::Features::SHADER_F16
+        } else {
+            wgpu::Features::empty()
+        } | if want_pcache {
+            wgpu::Features::PIPELINE_CACHE
         } else {
             wgpu::Features::empty()
         },
@@ -11078,6 +11090,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         // opaque "Validation Error".
         tracing::warn!("wgpu shader module rejected: {e}");
     }
+    // Compiled pipelines from an earlier run, if this driver keeps them.
+    let pcache = pipeline_cache_load(&device, &info, want_pcache);
     // Auto layout: the bind group layout is inferred from the shader.
     let pipe = |ep: &str| {
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -11086,7 +11100,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             module: &module,
             entry_point: Some(ep),
             compilation_options: Default::default(),
-            cache: None,
+            cache: pcache.as_ref(),
         })
     };
     let matvec = pipe("q8_matvec");
@@ -11193,7 +11207,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             module: &m,
             entry_point: Some("q4tp_mm_coop"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: pcache.as_ref(),
         });
         if let Some(e) = pollster::block_on(sc.pop()) {
             tracing::warn!("cooperative-matrix pipeline rejected: {e}");
@@ -11222,7 +11236,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             module: &m,
             entry_point: Some(entry),
             compilation_options: Default::default(),
-            cache: None,
+            cache: pcache.as_ref(),
         });
         if let Some(e) = pollster::block_on(sc.pop()) {
             tracing::warn!("{entry} pipeline rejected: {e}");
@@ -11267,7 +11281,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             module: &m,
             entry_point: Some(entry),
             compilation_options: Default::default(),
-            cache: None,
+            cache: pcache.as_ref(),
         });
         if let Some(e) = pollster::block_on(sc.pop()) {
             tracing::warn!("{entry} pipeline rejected: {e}");
@@ -11293,7 +11307,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             module: &m,
             entry_point: Some(entry),
             compilation_options: Default::default(),
-            cache: None,
+            cache: pcache.as_ref(),
         })
     };
     let bake_silu = plain(BAKE_SILU_SRC, "bake-silu", "bake_silu_mul");
@@ -11460,7 +11474,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             module: &split_module,
             entry_point: Some(ep),
             compilation_options: Default::default(),
-            cache: None,
+            cache: pcache.as_ref(),
         })
     };
     let attend_part_s = pipe_split("gqa_attend_part_s");
@@ -11484,7 +11498,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 module: &m,
                 entry_point: Some("moe_select_sg"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: pcache.as_ref(),
             }),
         )
     } else {
@@ -11518,11 +11532,17 @@ fn init(dev: usize) -> Result<Ctx, String> {
         return Err(format!("wgpu pipeline validation: {detail}"));
     }
 
+    // Everything the driver compiled during init — written once, read by
+    // every process after this one.
+    pipeline_cache_store(pcache.as_ref(), &info);
+
     Ok(Ctx {
         _instance: instance,
         _adapter: adapter,
         device,
         queue,
+        pipeline_cache: pcache,
+        adapter_info: info,
         matvec,
         matmat,
         mul_mm,
@@ -11815,6 +11835,103 @@ pub fn pin_weights(model: &Arc<CmfModel>, idxs: &[usize]) -> usize {
         }
     }
     n
+}
+
+/// Write out whatever the driver has compiled so far.
+///
+/// Deliberately NOT at the end of `init`: on this Adreno the context
+/// comes up in 1.5 s while the compiling costs ~200 s, so the driver is
+/// clearly building at first USE, and a blob saved before any dispatch
+/// is empty. The engine calls this once, after a generation has run.
+pub fn pipeline_cache_flush() {
+    let Some(c) = ctx() else { return };
+    pipeline_cache_store(c.pipeline_cache.as_ref(), &c.adapter_info);
+}
+
+/// Where this device's compiled pipelines are remembered between runs.
+///
+/// Measured on a Snapdragon 778G (Adreno 642L, Vulkan): building the
+/// compute pipelines costs about **200 seconds, once per process**, and
+/// it lands in whatever the caller thinks is warmup — in the phone app
+/// that was the entire first answer, 209.6 s for 25 tokens against 10.5
+/// on the CPU path. The cost is the same for a 4-token run and a
+/// 40-token one, so it is not the work; it is the driver's compiler, and
+/// nothing was keeping what it produced.
+///
+/// The key includes the driver string and the engine version: a blob
+/// compiled by another driver is not merely stale, it is something the
+/// driver may refuse or crash on, which is why `create_pipeline_cache`
+/// is unsafe in the first place. `CMF_PIPELINE_CACHE=0` opts out.
+fn pipeline_cache_path(info: &wgpu::AdapterInfo) -> Option<std::path::PathBuf> {
+    match std::env::var("CMF_PIPELINE_CACHE") {
+        Ok(v) if v == "0" => return None,
+        Ok(v) => return Some(std::path::PathBuf::from(v)),
+        Err(_) => {}
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    (
+        &info.name,
+        &info.driver,
+        &info.driver_info,
+        info.device,
+        info.vendor,
+        env!("CARGO_PKG_VERSION"),
+    )
+        .hash(&mut h);
+    Some(std::env::temp_dir().join(format!("cortiq-pipelines-{:016x}.bin", h.finish())))
+}
+
+/// Load the blob and hand it to the driver. Unsafe by wgpu's contract —
+/// the data goes straight to the driver — which the key above bounds:
+/// only this build on this driver can produce a matching file name.
+fn pipeline_cache_load(
+    device: &wgpu::Device,
+    info: &wgpu::AdapterInfo,
+    supported: bool,
+) -> Option<wgpu::PipelineCache> {
+    if !supported {
+        return None;
+    }
+    let path = pipeline_cache_path(info)?;
+    let data = std::fs::read(&path).ok();
+    let had = data.as_ref().map(|d| d.len()).unwrap_or(0);
+    let cache = unsafe {
+        device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+            label: Some("cortiq-pipelines"),
+            data: data.as_deref(),
+            // A blob the driver rejects must not take the run down with
+            // it: fall back to compiling, which is the old behaviour.
+            fallback: true,
+        })
+    };
+    tracing::info!(
+        "pipeline cache: {} ({})",
+        if had > 0 {
+            format!("{had} B loaded")
+        } else {
+            "empty, will compile".to_string()
+        },
+        path.display()
+    );
+    Some(cache)
+}
+
+/// Persist what the driver produced. Best-effort: a read-only temp dir
+/// costs a recompile next time, never a failure now.
+fn pipeline_cache_store(cache: Option<&wgpu::PipelineCache>, info: &wgpu::AdapterInfo) {
+    let (Some(cache), Some(path)) = (cache, pipeline_cache_path(info)) else {
+        return;
+    };
+    let Some(data) = cache.get_data() else {
+        return;
+    };
+    // Write-and-rename: a half-written blob handed to a driver next run
+    // is exactly the crash this whole path is careful about.
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, &data).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        tracing::debug!("pipeline cache: {} B saved", data.len());
+    }
 }
 
 fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu::Buffer> {
@@ -24563,7 +24680,7 @@ fn main(@builtin(local_invocation_index) tid: u32,
                 module: &m,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: c.pipeline_cache.as_ref(),
             });
         // What the driver actually gives a 128-thread workgroup: the GEMM
         // derives its subgroup index as `tid / 32`, which is only right if
@@ -24593,7 +24710,7 @@ fn main(@builtin(local_invocation_index) tid: u32,
                     module: &pm,
                     entry_point: Some("main"),
                     compilation_options: Default::default(),
-                    cache: None,
+                    cache: c.pipeline_cache.as_ref(),
                 });
                 let ob2 = c.device.create_buffer(&wgpu::BufferDescriptor {
                     label: None,

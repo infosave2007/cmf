@@ -2074,6 +2074,20 @@ const GRAPH_RACE_SAMPLES: u32 = 4;
 /// Called at every generation start (fresh KV). Applies a pending
 /// verdict and picks this generation's arm while racing.
 pub fn graph_race_begin_generation() {
+    // One generation has now compiled whatever this model needs; keep it
+    // for the next process. Once per run: the blob does not grow after
+    // the pipelines exist, and the write is megabytes against the ~200 s
+    // of compiling it saves on the device that needed this.
+    #[cfg(feature = "gpu")]
+    {
+        static FLUSHED: std::sync::Once = std::sync::Once::new();
+        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        if FIRST.swap(false, Ordering::Relaxed) {
+            // Skip the very first call: nothing has been dispatched yet.
+        } else {
+            FLUSHED.call_once(crate::gpu_wgpu::pipeline_cache_flush);
+        }
+    }
     GRAPH_RACE_TOK.store(0, Ordering::Relaxed);
     if GRAPH_RACE_STATE.load(Ordering::Relaxed) != 0 {
         return;
