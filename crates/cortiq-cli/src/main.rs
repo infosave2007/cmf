@@ -983,6 +983,12 @@ enum Commands {
         /// its projection was fitted on
         #[arg(long)]
         te_layers: Option<usize>,
+        /// MiniMax-Music-3's AR stack
+        /// (`minimax_music3_text_encoder_pruned_bf16.safetensors`): the
+        /// Qwen3-8B backbone, its embedding tables and the RVQ depth
+        /// decoder. Carries the tokenizer, so `--tokenizer` is optional
+        #[arg(long)]
+        music_te: Option<String>,
         /// MiniMax-Music-3's flow-matching DiT
         /// (`minimax_music3_dit_fp16.safetensors`)
         #[arg(long)]
@@ -1693,6 +1699,7 @@ async fn main() -> anyhow::Result<()> {
             clip_proj,
             music_vae,
             music_dit,
+            music_te,
             video_vae,
             audio_vae,
             tokenizer,
@@ -1713,6 +1720,7 @@ async fn main() -> anyhow::Result<()> {
             clip_proj: clip_proj.as_deref(),
             music_vae: music_vae.as_deref(),
             music_dit: music_dit.as_deref(),
+            music_te: music_te.as_deref(),
             video_vae: video_vae.as_deref(),
             audio_vae: audio_vae.as_deref(),
             tokenizer: tokenizer.as_deref(),
