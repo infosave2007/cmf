@@ -1,4 +1,5 @@
 ---
+library_name: cortiq
 license: apache-2.0
 base_model:
 - Comfy-Org/MiniMax-H3
@@ -13,7 +14,7 @@ tags:
 - 4-bit
 ---
 
-# MiniMax-H3 Turbo — one 23.5 GB file, no Python
+# MiniMax-H3 Turbo — one file, no Python
 
 [MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) renders video and
 synchronized stereo audio from one prompt, in one transformer, on two flow
@@ -30,9 +31,11 @@ underneath.
 | prompt encoder | 51.5 GB (bf16) | — |
 | video + audio VAE | 5.8 GB | — |
 | Turbo LoRA | 0.8 GB | — |
-| **total** | **124.4 GB, four files + a ComfyUI checkout** | **23.5 GB, one file** |
+| **total** | **124.4 GB, four files + a ComfyUI checkout** | **13.2–23.9 GB, one file** |
 
-47.83 B parameters, 2 361 tensors, `cortiq verify` clean.
+47.83 B parameters, 2 361 tensors, `cortiq verify` clean. The 13.2 GB end of
+that range swaps the prompt encoder for a 4B stand-in and fits a 20 GB card
+whole — [see below](#making-it-smaller).
 
 ## What comes out
 
@@ -58,10 +61,19 @@ give it a first and/or last frame and it continues from there. The release's
 third path — `ref2va`, conditioning on reference images, clips and audio — is
 not ported.
 
-| file | size | |
-|---|---|---|
-| `mmh3-turbo-fl2va-q4tp.cmf` | 23.94 GB | **use this one** |
-| `mmh3-turbo-fl2va-q2tp.cmf` | 18.74 GB | two bits on the gate/up planes. Smaller, faster, and it stops following the prompt — kept for anyone who wants to push on it, not for rendering. See below |
+### Which file
+
+Start from how much VRAM you have; that decides more than anything else here.
+
+| file | size | keyframes | take it when |
+|---|---|---|---|
+| `mmh3-turbo-fl2va-q4tp.cmf` | 23.94 GB | yes | **the default.** 24 GB of VRAM or more, or you are happy to page |
+| `mmh3-turbo-q4tp.cmf` | 23.47 GB | no | same weights without the vision tower, if you only ever type prompts |
+| **`mmh3-turbo-clipproj4b-q4tp.cmf`** | **13.16 GB** | no | **16–20 GB of VRAM.** A 4B stand-in prompt encoder; peaks at 15.1 GB, so the run stays resident instead of paging. Still four bits everywhere |
+| `mmh3-turbo-fl2va-q2tp.cmf` | 18.74 GB | yes | **don't render with this.** Two bits stopped it following the prompt; kept as a starting point for anyone pushing on it |
+
+Both smaller files are explained under [Making it smaller](#making-it-smaller),
+with the same prompt rendered through each.
 
 ## Keyframe to video
 
@@ -109,7 +121,9 @@ cortiq --version
 
 ### 2. Get the weights
 
-One file, 23.5 GB.
+One file. Pick it from [Which file](#which-file) above — this is the
+text-to-video default; swap the name for `mmh3-turbo-clipproj4b-q4tp.cmf` if
+you are on a 20 GB card.
 
 ```bash
 pip install -U "huggingface_hub[cli]"      # only to fetch the file
@@ -138,12 +152,36 @@ encoder and the RIFF muxer are inside the binary: a pipeline that ends in a
 shell-out to a 20 MB dependency is not a pipeline you can ship. If you want an
 mp4 for a browser, remux it yourself; the model never needs one.
 
-**On a GPU.** The device path is opt-in for this model while its kernels earn
-their keep (see below):
+**On a GPU.** Nothing to opt into any more: `cortiq` probes this file's own
+first qkv weight against the host on startup and takes the device arm only if
+they agree, so the arm that renders is the arm that was checked.
 
 ```bash
-CMF_MMH3_GPU=1 cortiq animate mmh3-turbo-q4tp.cmf --prompt "…" --out corgi.avi
+cortiq animate mmh3-turbo-q4tp.cmf --prompt "…" --out corgi.avi
 ```
+
+On one RTX 5090, 512×288, 39 frames: **60.2 s at the default four steps**
+(91.6 s at eight, 42.8 at two). `RUST_LOG=info` prints a per-stage breakdown
+for every run, and the full table is under *What it costs to run* below. The
+whole pipeline stays on the card —
+the DiT block, both VAE decoders, and the vocoder's dilated convolutions — so
+nothing but the finished frames crosses the bus. `CMF_MMH3_GPU=0` forces the
+host path if you want to compare.
+
+**Two cards.** A render does not split across them, and should not: the DiT
+block and both decoders are already resident, so a second card would only add
+a bus crossing to a pipeline that no longer has one. Two cards double your
+*clips*, not your clip — run two processes, one pinned to each:
+
+```bash
+CMF_GPU_ADAPTER=0 cortiq animate model.cmf --prompt "…" --seed 1 --out a.avi &
+CMF_GPU_ADAPTER=1 cortiq animate model.cmf --prompt "…" --seed 2 --out b.avi &
+wait
+```
+
+`cortiq gpu` lists the cards and their indices. For text models the same
+binary both splits and replicates across cards — see
+[docs/MULTI_GPU.md](https://github.com/infosave2007/cmf/blob/master/docs/MULTI_GPU.md).
 
 ### Options that matter
 
@@ -152,13 +190,14 @@ CMF_MMH3_GPU=1 cortiq animate mmh3-turbo-q4tp.cmf --prompt "…" --out corgi.avi
 | `--width` / `--height` | 512 × 288 | multiples of 32. The trained short edge is 768; below ~256 the model drifts off-distribution |
 | `--frames` | 39 | at 24 fps, snapped **up** to the model's 17k+5 grid: 5, 22, 39, 56, … 124. 124 ≈ 5 s, and 124–362 is the validated range |
 | `--steps` | 4 | what the Turbo LoRA is trained for. More still helps a little |
-| `--seed` | 42 | same seed, same prompt, same size → the same clip, byte for byte |
+| `--seed` | 42 | same seed, same prompt, same size → the same clip, byte for byte. This is now true on the GPU too: the op arbitration used to alternate arms on real data while it made up its mind, and two runs of one binary could differ |
 | `--quality` | 92 | JPEG quality of the AVI's frames |
 | `--stock-sampler` | off | integrate the audio on the video's clock, as a single-schedule sampler does. Wrong at 4 steps — it is here to hear how wrong |
 
 | environment | what it does |
 |---|---|
-| `CMF_MMH3_GPU=1` | opt into the device path |
+| `CMF_MMH3_GPU=1` / `=0` | force the device or the host path instead of letting the parity probe choose |
+| `CMF_GPU_PROBE=0` | pin the op arbitration (already the default for `animate`, so a seed reproduces) |
 | `CMF_THREADS=n` | cap the worker pool (defaults to the machine's cores) |
 | `CMF_ANIM_PROF=1` | per-step rms of both latent streams and both velocities |
 
@@ -168,12 +207,35 @@ RAM at least the file's size — 24 GB — or every step faults on non-resident
 pages; the weights are memory-mapped, not read. Disk: 24 GB. A GPU is optional
 and wants ~14 GB of VRAM for the DiT's planes. No network access at run time.
 
-## Two bits: smaller, faster, and answering a different question
+`mmh3-turbo-clipproj4b-q4tp.cmf` asks for 14 GB of RAM and disk instead, and
+peaks at 15.1 GB of VRAM — a whole-run maximum, polled, not a snapshot. That is
+what makes it the one to reach for on a 20 GB card: below that the prompt
+encoder pages, and on this workload paging costs more than any kernel.
+
+## Making it smaller
+
+Half this file is the PROMPT ENCODER — 12.2 GB of Qwen3-VL against the DiT that
+actually draws. Two ways to act on that were tried. **Squeezing it does not
+work; replacing it does.** Same prompt, same seed, same four steps through all
+three:
+
+| four bits, 32B encoder | four bits, 4B + ClipProj | two bits, 32B encoder |
+|---|---|---|
+| ![32B](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/ab_q4tp.gif) | ![ClipProj](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/ab_clipproj.gif) | ![two bits](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/ab_q2tp.gif) |
+| 23.94 GB — the reference | **13.16 GB — still the right clip** | 18.74 GB — a different clip |
+
+Left and centre are the same scene with different furniture. Right is a
+different animal with no pan and no pancake. The two sections below are why.
+
+### Two bits: smaller, faster, and answering a different question
 
 The obvious next cut is the DeepSeek-V4 policy: gate/up at two bits,
 everything else at four. It builds — 23.94 GB down to **18.74**, and
 with a device kernel of its own it renders *faster* than the four-bit
-file (217.3 s against 258.4, because there is less weight to move).
+file — 217.3 s against 258.4 when the pair was measured, because there is
+less weight to move. (Both numbers are from the build of that day; the
+four-bit file renders the same clip in 60.2 s now. The ratio is what
+carries over, not the seconds.)
 `cortiq verify` passes. The file is here.
 
 It also stops following the prompt, which is why it is not the one to
@@ -182,7 +244,7 @@ reach for.
 | | |
 |---|---|
 | ![four bits](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/ab_q4tp.gif) | ![two bits](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/ab_q2tp.gif) |
-| `q4tp` — 23.94 GB, 258.4 s | `q2tp` — 18.74 GB, 217.3 s |
+| `q4tp` — 23.94 GB | `q2tp` — 18.74 GB |
 
 Same prompt, same seed, same four steps. On the left the corgi is behind
 a pan with batter in it, drawn flat and clean, which is what was asked
@@ -201,22 +263,144 @@ measuring next — the packer's policy is one predicate,
 that experiment starts from something rather than nothing; four bits is
 what to render with.
 
+### A smaller encoder: replace it, don't squeeze it
+
+The two-bit section above ends on a diagnosis: half this file is the PROMPT
+ENCODER, and squeezing it is what broke the prompt. There is a second way to act
+on that diagnosis — **don't compress the encoder, replace it.**
+
+[ClipProj](https://github.com/nicolab28/ComfyUI-ClipProj) fits a ridge
+regression from a small Qwen3-VL's hidden state into the space the DiT was
+conditioned on. Same tokenizer, same family, one affine map:
+
+```text
+cond = ((h - mean_in) / std_in) @ W [+ GELU residual] * std_out + mean_out
+```
+
+`mmh3-turbo-clipproj4b-q4tp.cmf` is the text-to-video file with Qwen3-VL-4B
+tapped at layer 24 standing in for the 32B tapped at 50, plus the 304 MB
+projection kept **exact** — f32, no quantization on the piece that carries the
+whole substitution. Everything else is copied through byte for byte: DiT and
+both VAE decoders, still `q4tp`. Nothing anywhere is two bits.
+
+**23.47 GB → 13.16 GB.** The encoder went from 552 tensors to 277.
+
+#### Does it still mean the same thing?
+
+That is measurable without rendering a frame: dump what the DiT actually
+receives (`CMF_TE_DUMP=<path>`) from both files on one prompt, and take the
+cosine per token.
+
+| | mean cosine to the 32B | worst token |
+|---|---|---|
+| 4B tapped at **24** | **0.9198** | 0.7982 |
+| 4B tapped at 25 | 0.8452 | 0.5910 |
+| *floor — two different tokens of the 32B itself* | *0.5914* | |
+
+The tap index is 0-based, and off-by-one is a real failure mode rather than a
+theoretical one: at 25 the worst token sits **on the floor**, uncorrelated.
+Token 0 is not projected at all but replaced by a stored `sink_out` — the
+attention sink is an outlier no regression fits — and it lands at cosine
+**0.9999** against the teacher's, which is the sharpest single confirmation
+that the mechanism is wired right.
+
+#### What it buys
+
+The one number that transfers between machines is the **encode stage**, because
+that is the only stage ClipProj replaced. Same prompt, seed and four steps,
+512x288x39, measured inside one run:
+
+| | prompt encode |
+|---|---|
+| `mmh3-turbo-q4tp` — 32B tapped at 50 | 49.2 s |
+| `mmh3-turbo-clipproj4b-q4tp` — 4B tapped at 24 | **1.9 s** |
+
+Everything after that is residency, and residency is a property of YOUR card,
+not of this file. On the 24 GB RTX 3090 these were taken on, the whole render
+came out roughly half the time of the 23.47 GB file and the video VAE decode
+more than halved — but totals on that box drifted between 140 s and 210 s for
+one unchanged configuration as the card warmed, so treat the ratio as a
+direction and measure your own.
+
+The point is the 20 GB card this variant exists for, where the difference is
+not a ratio but a cliff: a reader of this repo measured **20 minutes** for one
+512x288 clip on an RTX 3080 20 GB, paging the 23.47 GB file through a ~19 GB
+weight budget. At 13.16 GB, with a polled whole-run peak of 15.1 GB of VRAM,
+there is nothing left to page.
+
+The parity probe takes the device arm on both files at the same `rel rms
+4.65e-3`, which is its own small proof that the DiT came through untouched.
+
+#### What it costs in quality
+
+Judge it on the clip at the top of this section, not on a frame: a still
+catches the pancake at rest and reads as a loss that is not there.
+
+Across the 39 frames the 4B does the whole job: corgi, chef hat, flat clean
+style, and the pancake **leaves the surface and comes back**, the dish empty
+underneath at the top of the toss. The verb survives — that is what `q2tp`
+lost, along with the animal and the pan.
+
+What drifts is set dressing. The 32B renders the cooking surface as a griddle
+and puts patterned wallpaper behind; the 4B gives a rimmed white plate and a
+plain ground. A 0.92 cosine is close, not equal, and where it is not equal is
+the scene's furniture rather than its subject or its action.
+
+So the ordering is not "smaller is worse". The two-bit file answers a different
+question; this one answers the right question with a plainer set, at 56% of
+the size. If you have the VRAM for the 32B encoder, use it —
+its framing is richer. If you are paging, this is the better trade, and unlike
+the two-bit build it is a trade rather than a loss.
+
+Sound is untouched either way: the audio branch never sees the prompt encoder.
+[The clip with its audio.](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/ab_clipproj.mp4)
+
+#### Building one
+
+```bash
+cortiq animate-pack \
+  --in  mmh3-turbo-q4tp.cmf \
+  --te  qwen3vl_4b_bf16.safetensors --te-layers 24 \
+  --clip-proj mmh3-4b-ClipProj-celeb-mlp.safetensors \
+  --quant q4tp --out mmh3-turbo-clipproj4b-q4tp.cmf
+```
+
+`--te-layers` is not a size knob, it is the tap: layers above it never execute,
+so packing them is pure file. `--clip-proj` carries the projection in exact and
+replaces the encoder **as a whole component** — matching tensor names alone
+would leave `te.layers.24..49` of the 32B behind, six gigabytes that
+`num_hidden_layers` then excludes from the forward while disk and VRAM budget
+still pay for them.
+
+The encoder is [`Comfy-Org/Qwen3-VL`](https://huggingface.co/Comfy-Org/Qwen3-VL)
+`text_encoders/qwen3vl_4b_bf16.safetensors`, and the projection is
+[`NicoLab28/ClipProj-MiniMax-H3`](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3)
+`mmh3-4b-ClipProj-celeb-mlp.safetensors` — use the file the projection was
+fitted on, since the map is only valid for those exact weights. An 8B
+projection is published too and scores higher on its author's corpus (0.8037
+against 0.7930); it costs about 4 GB more.
+
 ## What it costs to run
 
 The file is memory-mapped, so plan on RAM at least its size or every step
 touches non-resident pages.
 
-512×288, 39 frames, 4 steps, one machine — 48 CPU cores and one RTX PRO 6000
-Blackwell:
+One RTX 5090, 4 steps, 39 frames. `RUST_LOG=info` prints this breakdown for
+every run:
 
-| | denoise | decode | total |
-|---|---|---|---|
-| host | 198.2 s | 147.8 s | **346.5 s** |
-| `CMF_MMH3_GPU=1` | 96.8 s | 74.7 s | **172.0 s** |
+| | text | denoise | video VAE | audio VAE | total |
+|---|---|---|---|---|---|
+| 512×288 | 2.5 s | 34.8 s | 16.6 s | 4.3 s | **60.2 s** |
+| 512×256 | 2.3 s | 31.4 s | 8.4 s | 4.3 s | **48.5 s** |
+| 256×160, 22 frames | | | | | **15.9 s** |
+| 512×288, host only (`CMF_MMH3_GPU=0`) | 2.6 s | 363.5 s | 271.5 s | 7.1 s | **646.1 s** |
 
-and the smaller size, on the device: 256×160 over 22 frames in **29.2 s**.
+The card is **10.7× the host path** on the same machine, same seed. At 8
+steps a 512×288 clip is **91.6 s**; at 2 it is 42.8. The same 4-step
+render took 172 s when this card was written — the pipeline has since moved
+onto the card end to end, both VAE decoders with it.
 
-Nearly all of the decode is the video VAE — the vocoder is 4 s of it. The
+Nearly all of the decode is the video VAE — the vocoder is 4.3 s of it. The
 packed sequence is `[text | audio | video]` and everything attends to
 everything, so cost grows with the token count and then with its square: a
 512×288 second is five times the tokens of a 256×160 one.
@@ -226,8 +410,9 @@ everything, so cost grows with the token count and then with its square: a
 so a 288-pixel edge is covered by two 256-pixel tiles overlapping by 224, and
 you pay for 512 rows to get 288. An edge of exactly 256 is one tile. 512×256
 therefore decodes three tiles where 512×288 decodes six, for 89% of the
-pixels. The schedule is the reference's and this port reproduces it exactly;
-picking an edge that lands on it is free.
+pixels. Measured on the current build: the video VAE goes 16.6 s → 8.4 s and
+the whole render 60.2 s → 48.5 s. The schedule is the reference's and this
+port reproduces it exactly; picking an edge that lands on it is free.
 
 **Host and device do not agree to the last bit, and neither is wrong.** The
 host arm quantizes activations to int8 (`CMF_SDOT`) where the device
@@ -235,8 +420,9 @@ dequantizes to f32, so the two renders differ by a few per cent in latent rms
 and visibly in fine texture. Set `CMF_SDOT=0` on both sides to compare
 arithmetic instead of that approximation.
 
-**Why the device is opt-in.** Getting it right took three fixes, and one
-thing is still held back.
+**Why the device took a while to trust.** It is no longer opt-in — the parity
+probe decides per file — but getting there took three fixes, and one thing is
+still held back.
 
 The engine's blocked f32 GEMM cached its weight-side device buffer **by
 pointer address**. Every batched attention allocates one k/v scratch pair per

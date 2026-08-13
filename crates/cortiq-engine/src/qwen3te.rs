@@ -49,6 +49,7 @@ pub struct Qwen3Encoder {
     embed: QTensor,
     layers: Vec<Layer>,
     final_norm: Option<Vec<f32>>,
+    proj: Option<ClipProj>,
     pool: Option<Arc<Pool>>,
     pub hidden: usize,
     nh: usize,
@@ -81,6 +82,115 @@ impl SendPtr {
     }
 }
 
+/// Gauss error function, Abramowitz & Stegun 7.1.26 (|ε| < 1.5e-7).
+/// `nn.GELU()` with no `approximate=` is the erf form, and the residual
+/// this feeds was fitted through exactly that.
+fn erf(x: f64) -> f64 {
+    let s = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let y = 1.0
+        - (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736) * t
+            + 0.254_829_592)
+            * t
+            * (-x * x).exp();
+    s * y
+}
+
+fn gelu(v: f32) -> f32 {
+    (0.5 * v as f64 * (1.0 + erf(v as f64 / std::f64::consts::SQRT_2))) as f32
+}
+
+/// The GELU residual of a `-mlp` ClipProj: `d_in → hidden → d_out`,
+/// added to the ridge matrix's output in the STANDARDIZED space.
+struct ProjMlp {
+    w0: Vec<f32>, // [hidden, d_in], torch Linear layout
+    b0: Vec<f32>,
+    w2: Vec<f32>, // [d_out, hidden]
+    b2: Vec<f32>,
+    hidden: usize,
+}
+
+/// ClipProj: the fitted map that lets a SMALL Qwen3-VL stand in for the
+/// 32 B prompt encoder.
+///
+/// ```text
+/// cond = ((h - mean_in) / std_in) @ W [+ mlp(...)] * std_out + mean_out
+/// ```
+///
+/// Token 0 is not projected but OVERWRITTEN with `sink_out`: it is the
+/// attention sink, an outlier the ridge fit cannot represent and would
+/// otherwise smear across the whole conditioning.
+struct ClipProj {
+    w: Vec<f32>, // [d_in, d_out], so the product is a plain row sweep
+    mean_in: Vec<f32>,
+    std_in: Vec<f32>,
+    mean_out: Vec<f32>,
+    std_out: Vec<f32>,
+    sink_out: Vec<f32>,
+    mlp: Option<ProjMlp>,
+    d_in: usize,
+    d_out: usize,
+}
+
+impl ClipProj {
+    /// `[n, d_in]` tapped hidden state → `[n, d_out]` conditioning.
+    fn apply(&self, h: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
+        let (di, dout) = (self.d_in, self.d_out);
+        let mut out = vec![0f32; n * dout];
+        let ptr = SendPtr(out.as_mut_ptr());
+        let work = |lo: usize, hi: usize| {
+            let mut xn = vec![0f32; di];
+            let mut g = vec![0f32; self.mlp.as_ref().map_or(0, |m| m.hidden)];
+            for p in lo..hi {
+                let hp = &h[p * di..(p + 1) * di];
+                for i in 0..di {
+                    xn[i] = (hp[i] - self.mean_in[i]) / self.std_in[i];
+                }
+                // SAFETY: workers own disjoint token ranges.
+                let o = unsafe { ptr.row(p * dout, dout) };
+                o.fill(0.0);
+                for i in 0..di {
+                    let x = xn[i];
+                    let row = &self.w[i * dout..(i + 1) * dout];
+                    for (d, &wv) in o.iter_mut().zip(row) {
+                        *d += x * wv;
+                    }
+                }
+                if let Some(m) = &self.mlp {
+                    for (oi, gv) in g.iter_mut().enumerate() {
+                        let row = &m.w0[oi * di..(oi + 1) * di];
+                        let mut s = m.b0[oi];
+                        for (&r, &x) in row.iter().zip(&xn) {
+                            s += r * x;
+                        }
+                        *gv = gelu(s);
+                    }
+                    for (j, d) in o.iter_mut().enumerate() {
+                        let row = &m.w2[j * m.hidden..(j + 1) * m.hidden];
+                        let mut s = m.b2[j];
+                        for (&r, &gv) in row.iter().zip(&g) {
+                            s += r * gv;
+                        }
+                        *d += s;
+                    }
+                }
+                for (j, d) in o.iter_mut().enumerate() {
+                    *d = *d * self.std_out[j] + self.mean_out[j];
+                }
+            }
+        };
+        match pool {
+            Some(pl) => pl.run_rows(n, &work),
+            None => work(0, n),
+        }
+        if n > 0 {
+            out[..dout].copy_from_slice(&self.sink_out);
+        }
+        out
+    }
+}
+
 /// One image spliced into the prompt: where its tokens start, how many
 /// there are, and the merged patch grid they came from.
 pub struct ImageSpan {
@@ -97,7 +207,14 @@ impl Qwen3Encoder {
         )
         .map_err(|e| format!("te.config_json: {e}"))?;
         let u = |k: &str, d: usize| cfg[k].as_u64().map(|v| v as usize).unwrap_or(d);
-        let nl = u("num_hidden_layers", 0);
+        // `CMF_TE_TAP` runs FEWER layers than the file carries. The tap
+        // a ClipProj was fitted on is an index, and index conventions
+        // differ by one between frameworks; packing one layer spare and
+        // calibrating against the teacher beats repacking to find out.
+        let nl = match std::env::var("CMF_TE_TAP").ok().and_then(|v| v.parse().ok()) {
+            Some(t) if t > 0 && t <= u("num_hidden_layers", 0) => t,
+            _ => u("num_hidden_layers", 0),
+        };
         let f32v = |n: &str| crate::dit::cmf_f32(model, n);
         let mut layers = Vec::with_capacity(nl);
         for l in 0..nl {
@@ -116,6 +233,43 @@ impl Qwen3Encoder {
                 down: Proj::from_model(model, &format!("{p}.mlp.down_proj.weight"))?,
             });
         }
+        let hidden = u("hidden_size", 0);
+        let proj = match model.tensor_bytes("te.proj.config_json") {
+            Ok(b) => {
+                let pc: serde_json::Value =
+                    serde_json::from_slice(b).map_err(|e| format!("te.proj.config_json: {e}"))?;
+                let pu = |k: &str| pc[k].as_u64().unwrap_or(0) as usize;
+                let (d_in, d_out) = (pu("d_in"), pu("d_out"));
+                if d_in != hidden {
+                    return Err(format!(
+                        "te.proj expects a {d_in}-wide encoder, the packed one is {hidden}: \
+                         the projection and the encoder come from different models"
+                    ));
+                }
+                let mlp = match pc["mlp"].as_bool() {
+                    Some(true) => Some(ProjMlp {
+                        w0: f32v("te.proj.mlp.0.weight")?,
+                        b0: f32v("te.proj.mlp.0.bias")?,
+                        w2: f32v("te.proj.mlp.2.weight")?,
+                        b2: f32v("te.proj.mlp.2.bias")?,
+                        hidden: pu("mlp_hidden"),
+                    }),
+                    _ => None,
+                };
+                Some(ClipProj {
+                    w: f32v("te.proj.W")?,
+                    mean_in: f32v("te.proj.mean_in")?,
+                    std_in: f32v("te.proj.std_in")?,
+                    mean_out: f32v("te.proj.mean_out")?,
+                    std_out: f32v("te.proj.std_out")?,
+                    sink_out: f32v("te.proj.sink_out")?,
+                    mlp,
+                    d_in,
+                    d_out,
+                })
+            }
+            Err(_) => None,
+        };
         Ok(Self {
             embed: QTensor::from_model(model, "te.embed_tokens.weight")?,
             layers,
@@ -123,8 +277,9 @@ impl Qwen3Encoder {
                 Some(false) | None => None,
                 Some(true) => Some(f32v("te.norm.weight")?),
             },
+            proj,
             pool: Pool::from_env(),
-            hidden: u("hidden_size", 0),
+            hidden,
             nh: u("num_attention_heads", 0),
             nkv: u("num_key_value_heads", 0),
             hd: u("head_dim", 128),
@@ -339,6 +494,19 @@ impl Qwen3Encoder {
             }
             return out;
         }
-        h
+        // A ClipProj file makes this a STAND-IN encoder: the stream
+        // leaving the tap is in the small model's space and the DiT
+        // never sees it raw.
+        match &self.proj {
+            Some(p) => p.apply(&h, n, self.pool.as_deref()),
+            None => h,
+        }
+    }
+
+    /// Width of what `encode` returns — the DiT's conditioning width,
+    /// which is the projection's output when one is packed and the
+    /// encoder's own hidden size otherwise.
+    pub fn out_hidden(&self) -> usize {
+        self.proj.as_ref().map_or(self.hidden, |p| p.d_out)
     }
 }
