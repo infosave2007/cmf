@@ -70,9 +70,19 @@ what it produced.
   overhead either. These kernels are written and tuned for desktop
   GPUs; an Adreno wants its own pass — subgroup width (64/128 against
   the 32 the cross-lane reductions assume) and the byte-load pattern of
-  the quantized unpack are where to start. Not attempted here, and the
-  verdict "the GPU loses" belongs to THESE kernels on THIS chip, not to
-  the silicon.
+  the quantized unpack are where to start. The verdict "the GPU loses"
+  belongs to THESE kernels on THIS chip, not to the silicon.
+- **The first Adreno arm was tried and it is a null result.** The matvec
+  re-reads the activation vector out of global memory for every row —
+  2048 rows × 8 KB on a 2048-wide layer — so `CMF_Q8MV=tiled` stages it
+  into workgroup memory once and every row reads it from there. Decode
+  went 0.905 → 0.913 tok/s. Kept behind the flag with the number,
+  because the useful part is what it rules out: activation traffic is
+  not what this GPU is spending its time on. At ~112 dispatches a token
+  and 1.1 s a token, that time is ~10 ms per dispatch — a submit and a
+  full readback each — which points at the whole-token graph, not at
+  the kernel. That path exists and today measures WORSE (0.224 tok/s),
+  which makes it the next thing to fix rather than the answer.
 
 ## [0.5.71] - 2026-08-12
 

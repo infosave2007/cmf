@@ -46,6 +46,8 @@ pub fn cpu_scope<R>(f: impl FnOnce() -> R) -> R {
 
 /// Backends: name the device once at init. The probe cache is keyed by
 /// it, because a verdict is a property of THIS silicon and nothing else.
+/// First writer wins: a process runs one backend, and on the rare host
+/// where two initialize, the one that came up first is the one in use.
 pub fn probe_set_device(label: &str) {
     let _ = DEVICE_LABEL.set(label.to_string());
 }
@@ -612,25 +614,30 @@ mod probe_tests {
 
     #[test]
     fn a_remembered_verdict_is_adopted_and_a_stranger_is_not() {
-        // Probing is not free: on a Snapdragon 778G the three deciding
-        // classes cost three minutes of wall clock before the first
-        // token, every process — in the phone app that WAS the first
-        // answer, 209.6 s for 25 tokens against 10.5 s on the CPU path —
-        // and the verdict came out the same every time. The cache exists
-        // so that price is paid once. GemmNt on purpose: the arbitration
-        // test above never touches it, and both run in one process.
-        probe_set_device("TestGPU/Vulkan");
-        let ver = env!("CARGO_PKG_VERSION");
+        // Probing is not free: on a Snapdragon 778G the deciding classes
+        // cost minutes of wall clock before the first token, every
+        // process, and reached the same verdict every time. The cache
+        // exists so that price is paid once.
+        //
+        // The key is built from THIS process's device, never a name this
+        // test sets: `probe_set_device` is first-writer-wins and on a Mac
+        // the Metal backend may already have named the silicon before the
+        // tests run — which is exactly how this test failed on CI while
+        // passing locally. GemmNt on purpose: the arbitration test never
+        // touches it, and both run in one process.
+        let mine = probe_cache_key_named("gemm-nt");
         let state = || PROBES[OpClass::GemmNt as usize].state.load(Ordering::Relaxed);
 
         // Another device's verdict is not mine, whatever it claims.
-        probe_cache_adopt(&format!("{ver}\tOtherGPU/Vulkan\tgemm-nt\tgpu\n"));
+        probe_cache_adopt("SomeOtherGPU/Vulkan\tgemm-nt\tgpu\n");
         assert_eq!(state(), 0);
         // Neither is one from another build of this engine.
-        probe_cache_adopt("0.0.0-old\tTestGPU/Vulkan\tgemm-nt\tgpu\n");
+        let older = mine.replacen(env!("CARGO_PKG_VERSION"), "0.0.0-old", 1);
+        assert_ne!(older, mine);
+        probe_cache_adopt(&format!("{older}\tgpu\n"));
         assert_eq!(state(), 0);
         // Mine is.
-        probe_cache_adopt(&format!("{ver}\tTestGPU/Vulkan\tgemm-nt\tcpu\n"));
+        probe_cache_adopt(&format!("{mine}\tcpu\n"));
         assert_eq!(state(), 2);
 
         PROBES[OpClass::GemmNt as usize]
