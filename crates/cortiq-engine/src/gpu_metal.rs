@@ -6367,6 +6367,14 @@ pub fn q8_matmat(
 /// shared-memory tiles make this tolerance-class (like the LLM
 /// prefill graph); the probe arbitrates vs the CPU AMX arm per
 /// process.
+/// `CMF_METAL_MMPROF=1`: microseconds of the q4tp GEMM split into the
+/// host->device copy, the submit-and-wait, and the readback. Printed by
+/// `metal_mm_prof_report`.
+pub static MM_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MM_GPU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MM_DN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MM_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Bring an activation panel inside `half` range, in place, and return
 /// the factor the kernel must apply to the WEIGHT side to undo it.
 ///
@@ -6432,10 +6440,13 @@ pub fn q4tp_matmat(
             })
             .clone()
     };
+    let tprof = std::env::var("CMF_METAL_MMPROF").is_ok();
+    let t_up = std::time::Instant::now();
     let xs_buf = get_io(21_000_000_659 + pre.len(), pre.len() * 4);
     unsafe {
         std::ptr::copy_nonoverlapping(pre.as_ptr(), xs_buf.contents() as *mut f32, pre.len());
     }
+    let up_us = t_up.elapsed().as_micros() as u64;
     // The kernel stages activations into threadgroup memory as `half`,
     // so an activation past 65504 becomes inf and then NaN. That is not
     // hypothetical: on MiniMax-H3 one row of the audio segment grows to
@@ -6472,9 +6483,21 @@ pub fn q4tp_matmat(
         );
         enc.end_encoding();
     }
+    let t_gpu = std::time::Instant::now();
     submit_and_wait(c, cmd, &[&y_buf]);
+    let gpu_us = t_gpu.elapsed().as_micros() as u64;
+    let t_dn = std::time::Instant::now();
     unsafe {
         std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
+    }
+    if tprof {
+        // Where a GEMM's wall time actually goes on a UNIFIED-memory box:
+        // if the copies dominate, fusing blocks is the win; if the submit
+        // does, the kernel is.
+        MM_UP.fetch_add(up_us, std::sync::atomic::Ordering::Relaxed);
+        MM_GPU.fetch_add(gpu_us, std::sync::atomic::Ordering::Relaxed);
+        MM_DN.fetch_add(t_dn.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        MM_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     tracing::debug!("gpu q4tp matmat: {rows}x{cols} b={b}");
     true
