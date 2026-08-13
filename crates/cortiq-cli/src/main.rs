@@ -3576,6 +3576,26 @@ fn metal_submits_per_token(tokens: usize) -> f64 {
     }
 }
 
+/// The same question on wgpu, and one more: a compute PASS boundary is a
+/// tile store-and-restore on a mobile GPU, so passes a token can dominate
+/// even when submits a token is one. Both are 0 off the backend.
+fn wgpu_rate(tokens: usize) -> (f64, f64) {
+    #[cfg(feature = "gpu")]
+    {
+        use std::sync::atomic::Ordering;
+        let t = tokens.max(1) as f64;
+        return (
+            cortiq_engine::gpu_wgpu::SUBMITS.load(Ordering::Relaxed) as f64 / t,
+            cortiq_engine::gpu_wgpu::PASSES.load(Ordering::Relaxed) as f64 / t,
+        );
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = tokens;
+        (0.0, 0.0)
+    }
+}
+
 async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()> {
     let model = CmfModel::open_sharded(model_path)?;
     let arch = model.arch();
@@ -4601,6 +4621,8 @@ async fn cmd_bench(
             "prefill_tok_s": prompt_ids.len() as f64 / prefill_s.max(1e-9),
             "tokens_generated": result.tokens_generated,
             "metal_submits_per_token": metal_submits_per_token(result.tokens_generated),
+            "wgpu_submits_per_token": wgpu_rate(result.tokens_generated).0,
+            "wgpu_passes_per_token": wgpu_rate(result.tokens_generated).1,
             "decode_tok_s_steady": decode_tps,
             "decode_tok_s_incl_prefill": result.tokens_generated as f64 / total_s.max(1e-9),
             "ttft_s": ttft_s,
