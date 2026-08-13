@@ -459,6 +459,13 @@ impl Pipeline {
         sampler_config: SamplerConfig,
         ov: &Overlay,
     ) -> Result<Self, CmfError> {
+        // Small device caches (probe verdicts, compiled pipelines) go
+        // beside the model: it is a directory the caller demonstrably
+        // writes to, which `std::env::temp_dir()` is not inside an
+        // Android app sandbox.
+        if let Some(dir) = model.path.parent() {
+            crate::gpu::set_cache_dir(dir.to_path_buf());
+        }
         Self::skill_file_guard(model)?;
         let skill = match ov {
             Overlay::One(s) => Some(*s),
