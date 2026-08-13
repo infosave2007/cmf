@@ -21005,6 +21005,16 @@ fn spin_wait() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_GPU_SPIN").map(|v| v != "0").unwrap_or(true))
 }
 
+// An adaptive version of the above was written and reverted. The idea:
+// spinning before the block is a bet that the submission lands in
+// microseconds, and on an Adreno 642L a readback waits 46.5 ms, so watch
+// the waits and stop spinning when they are long. It is worth NOTHING
+// here — four runs, alternating: 0.897 / 0.901 / 0.877 / 0.896 tok/s
+// with the spin on, off, on, off. The 9% that started the chase was one
+// outlier. And the self-switching version tripped on the laptop too,
+// which would have taken the spin away from the platform where it was
+// measured to pay. `CMF_GPU_SPIN=0` remains for anyone who wants to try.
+
 /// Submissions to the device, all sites. A round trip costs a fence
 /// whatever it carries, so "how many a token" is the number that decides
 /// whether a decode step is compute-bound or latency-bound — and it is not
@@ -22184,6 +22194,7 @@ fn readback(
     // microseconds and there are 86 of them a token. Spin on the queue for a
     // short while first, then block — a decode that stalls for a real reason
     // must not burn a core forever. CMF_GPU_SPIN=0 reverts.
+
     if spin_wait() {
         let t0 = std::time::Instant::now();
         loop {
@@ -22204,6 +22215,7 @@ fn readback(
         staging.unmap();
         return false;
     }
+
     {
         let Ok(data) = slice.get_mapped_range() else {
             staging.unmap();
@@ -30463,7 +30475,9 @@ pub fn dsv4_layer_chain(
     );
     CHAIN_LAYERS.fetch_add(layers.len() as u64, std::sync::atomic::Ordering::Relaxed);
     CHAIN_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // From here to the fence is the wait the counter below reports.
     let t_wait = std::time::Instant::now();
+
     let ok = match state_out {
         // The state comes back in the SAME submission as the folded vector.
         // Asking for it afterwards cost a second fence on a token that is
