@@ -14317,21 +14317,25 @@ pub fn forward_token_graph(
     // Encode one matvec, dtype-dispatched: q8_row (encode_matvec + row
     // scales) or q1 (encode_matvec_q1). Each is its own pass.
     //
-    // "Pass-grouping measured as a no-op (the wall is per-dispatch, not
-    // per-barrier)" was true where it was measured and is FALSE on a
-    // tiler. On an Adreno 642L the compute PASS is the unit of cost and
-    // it is ~4.4 ms — a tile store and restore — while submits are
-    // nearly free. Four configurations, differing 2.4x in submits a
-    // token, all land on the same per-pass price:
+    // Pass-grouping: worth doing, but NOT the wall. On an Adreno 642L
+    // folding the FFN's `down` into the gate/up/silu pass took a token
+    // from 319 passes to 256 and its time from 1437 ms to 1405 — the
+    // work moved inside the passes rather than disappearing. Three
+    // points kill the tempting law that token time is passes x 4.4 ms:
     //
-    //   graph off        189 passes/token   808 ms   4.28 ms/pass
-    //   graph, 1 submit  319                1437     4.50
-    //   graph, 4 submits 319                1451     4.55
+    //   189 passes  808 ms   4.28 ms/pass   (per-op path)
+    //   319        1437      4.50           (whole-token graph)
+    //   256        1405      5.49           (graph, `down` folded)
     //
-    // Token time is passes x 4.4 ms on that device, and that is the whole
-    // story of why the graph loses there: it halves the submits and
-    // doubles the passes. Anyone making wgpu pay on mobile has to fuse a
-    // LAYER into one pass, not a token into one submit.
+    // What actually separates those rows is how much of the token runs
+    // on the GPU at all: the graph moves the norms, rope and attention
+    // there too, and on this chip the device is ~16x slower than its own
+    // CPU per unit of work (~0.5 GB/s against 8.5). More work on it is
+    // more time, whatever the dispatches are grouped into.
+    //
+    // The folding stays: it is free, it is byte-identical, and on a
+    // phone GPU that is FASTER than its CPU — which plenty are — the
+    // pass boundary is a real share of a much smaller total.
     let emat = |enc: &mut wgpu::CommandEncoder,
                 m: &GMat,
                 xs: &wgpu::Buffer,
@@ -14421,6 +14425,25 @@ pub fn forward_token_graph(
                     ],
                 });
                 Some((&c.matvec, bind, (rows as u32).min(MAX_WG)))
+            }
+            7 => {
+                // q8_2f, so the FFN's `down` can ride in the same pass as
+                // gate/up/silu instead of opening one of its own. On a
+                // tiler that pass boundary is 4.4 ms — see the note by
+                // `emat` — so this is a per-layer saving, not a tidy-up.
+                let p_buf = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, cols as u32, 0]);
+                let layout = c.q8_2f_mv.get_bind_group_layout(0);
+                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layout,
+                    entries: &[
+                        bind_buf(0, &m.buf),
+                        bind_buf(1, xs),
+                        bind_buf(2, y),
+                        bind_buf(3, &p_buf),
+                    ],
+                });
+                Some((&c.q8_2f_mv, bind, (rows as u32).min(MAX_WG)))
             }
             1 => {
                 let gpr = cols / 32;
@@ -15387,6 +15410,8 @@ pub fn forward_token_graph(
                     let inter = *width; // this layer's, not the model's
                     let pg = prep(gate, &n1, &gbuf, inter, hidden);
                     let pu = prep(up, &n1, &ubuf, inter, hidden);
+                    let pd = prep(down, &abuf, &ob, hidden, inter);
+                    let mut down_rode_along = false;
                     if let (Some((pgp, bg_g, wg)), Some((pup, bg_u, wu))) = (pg, pu) {
                         let bg_silu =
                             bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]);
@@ -15405,8 +15430,18 @@ pub fn forward_token_graph(
                         pass.set_pipeline(&c.silu);
                         pass.set_bind_group(0, &bg_silu, &[]);
                         pass.dispatch_workgroups_flat((inter as u32).div_ceil(256));
-                        // NOTE: the dense arm still emits `down` outside this pass
-                        // (see emat below), so the tail cannot ride here.
+                        // `down` rides here too when its dtype can be
+                        // prepped: dispatches inside one pass serialize
+                        // with memory visibility — the same guarantee the
+                        // MoE arm leans on — so it reads the `abuf` silu
+                        // just wrote. One pass a layer saved, and a pass
+                        // is the unit of cost on a mobile GPU.
+                        if let Some((pdp, bg_d, wd)) = &pd {
+                            pass.set_pipeline(pdp);
+                            pass.set_bind_group(0, bg_d, &[]);
+                            pass.dispatch_workgroups(*wd, 1, 1);
+                            down_rode_along = true;
+                        }
                     } else {
                         group_mats(
                             &mut enc,
@@ -15422,7 +15457,9 @@ pub fn forward_token_graph(
                             (inter as u32).div_ceil(256),
                         );
                     }
-                    emat(&mut enc, down, &abuf, &ob, hidden, inter);
+                    if !down_rode_along {
+                        emat(&mut enc, down, &abuf, &ob, hidden, inter);
+                    }
                 }
                 LFfn::Moe {
                     router,
