@@ -963,6 +963,76 @@ fn push_last_tap(
 
 /// Audio VAE: `dec_in_proj` + BigVGAN. 90 M parameters — f16 all the
 /// way; quantizing a vocoder buys 45 MB and costs audible hiss.
+/// MiniMax-Music-3's DAV decoder.
+///
+/// Two things separate this from `pack_audio_vae`, and both are silent
+/// if got wrong. Its convs carry PyTorch weight normalisation — a
+/// `weight_g` magnitude and a `weight_v` direction, never a `weight` —
+/// so the runtime would find nothing to load; they are folded here,
+/// once, as `g · v / ‖v‖` over each output channel. And its Snake α is
+/// used verbatim by the reference where H3's BigVGAN keeps α and β in
+/// log scale, so it must NOT be packed into that decoder's names.
+///
+/// Everything stays exact. A vocoder is the one stack in these files
+/// where quantization buys tens of megabytes and costs audible hiss —
+/// the H3 conversion already paid to learn that.
+fn pack_music3_vae(specs: &mut Vec<TensorSpec>, path: &Path) -> anyhow::Result<serde_json::Value> {
+    let a = StFile::open(path)?;
+    let mut folded = 0usize;
+    let mut plain = 0usize;
+    for name in a.order.clone() {
+        if !(name.starts_with("decoder.") || name.starts_with("dec_in_proj.")) {
+            continue;
+        }
+        if name.ends_with(".weight_g") {
+            continue; // consumed with its weight_v
+        }
+        if let Some(stem) = name.strip_suffix(".weight_v") {
+            let gname = format!("{stem}.weight_g");
+            let shape = a
+                .shape(&name)
+                .ok_or_else(|| anyhow!("missing shape {name}"))?
+                .to_vec();
+            let v = a.get(&name)?;
+            let g = a.get(&gname)?;
+            let per = v.len() / shape[0];
+            let mut w = vec![0f32; v.len()];
+            for o in 0..shape[0] {
+                let row = &v[o * per..(o + 1) * per];
+                let norm = row.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+                let s = if norm > 0.0 { g[o] as f64 / norm } else { 0.0 };
+                for (d, &sv) in w[o * per..(o + 1) * per].iter_mut().zip(row) {
+                    *d = (sv as f64 * s) as f32;
+                }
+            }
+            specs.push(spec(format!("mvae.{stem}.weight"), &w, shape, Level::F32));
+            folded += 1;
+            continue;
+        }
+        let shape = a.shape(&name).unwrap().to_vec();
+        let vals = a.get(&name)?;
+        specs.push(spec(format!("mvae.{name}"), &vals, shape, Level::F32));
+        plain += 1;
+    }
+    if folded == 0 {
+        return Err(anyhow!(
+            "{}: no weight-normalised convs — not a Music-3 DAV file",
+            path.display()
+        ));
+    }
+    eprintln!("music3 vae: {folded} convs folded, {plain} tensors copied");
+    Ok(serde_json::json!({
+        "kind": "minimax_music3_dav",
+        "latent_channels": 128,
+        "channels_per_side": 64,
+        "upsampling_ratios": [8, 8, 4, 2],
+        "hop": 512,
+        "sampling_rate": 44100,
+        "resblock_dilations": [1, 3, 9],
+        "snake_log_scale": false,
+    }))
+}
+
 fn pack_audio_vae(
     specs: &mut Vec<TensorSpec>,
     path: &Path,
@@ -1112,6 +1182,7 @@ pub struct PackArgs<'a> {
     pub lora_scale: f32,
     pub te: Option<&'a str>,
     pub clip_proj: Option<&'a str>,
+    pub music_vae: Option<&'a str>,
     pub te_layers: Option<usize>,
     pub video_vae: Option<&'a str>,
     pub audio_vae: Option<&'a str>,
@@ -1146,6 +1217,12 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
         eprintln!("te packed ({:.1}s)", t0.elapsed().as_secs_f64());
     } else if args.te_layers.is_some() {
         return Err(anyhow!("--te-layers only means something with --te"));
+    }
+    if let Some(p) = args.music_vae {
+        let cfg = pack_music3_vae(&mut specs, Path::new(p))?;
+        specs.push(config_spec("mvae", &cfg));
+        prov.insert("music_vae".into(), serde_json::json!(p));
+        eprintln!("music3 vae packed ({:.1}s)", t0.elapsed().as_secs_f64());
     }
     if let Some(p) = args.clip_proj {
         if args.te.is_none() && args.carry.is_none() {
