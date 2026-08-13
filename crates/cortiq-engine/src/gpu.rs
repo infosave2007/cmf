@@ -44,6 +44,119 @@ pub fn cpu_scope<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Backends: name the device once at init. The probe cache is keyed by
+/// it, because a verdict is a property of THIS silicon and nothing else.
+pub fn probe_set_device(label: &str) {
+    let _ = DEVICE_LABEL.set(label.to_string());
+}
+
+fn device_label() -> &'static str {
+    DEVICE_LABEL.get().map(String::as_str).unwrap_or("unknown")
+}
+
+static DEVICE_LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Where decided verdicts are remembered between runs. `CMF_PROBE_CACHE`
+/// overrides the path; `0` disables the cache entirely.
+fn probe_cache_path() -> Option<std::path::PathBuf> {
+    match std::env::var("CMF_PROBE_CACHE") {
+        Ok(v) if v == "0" => None,
+        Ok(v) => Some(std::path::PathBuf::from(v)),
+        Err(_) => Some(std::env::temp_dir().join("cortiq-gpu-probe.tsv")),
+    }
+}
+
+/// One line per decided class: `version \t device \t class \t winner`.
+/// A different engine build or a different device simply does not match,
+/// so a stale file is inert rather than wrong.
+fn probe_cache_key_named(class: &str) -> String {
+    format!("{}\t{}\t{}", env!("CARGO_PKG_VERSION"), device_label(), class)
+}
+
+const CLASS_NAMES: [&str; 7] = [
+    "ffn",
+    "matvec",
+    "matmat",
+    "qkv-batch",
+    "matmat-wide",
+    "lm-head",
+    "gemm-nt",
+];
+
+/// Adopt every verdict this device already reached in an earlier run.
+///
+/// Probing is not cheap and it is not free of consequences: on a
+/// Snapdragon 778G the three deciding classes took **three minutes of
+/// wall clock** before the first token, every process, and in the phone
+/// app that was the whole first answer — 209.6 s for 25 tokens against
+/// 10.5 s on the CPU path. The verdict itself was the same every time.
+/// Paying to rediscover it is the defect; the answer is to write it down.
+fn probe_cache_load() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Some(path) = probe_cache_path() else {
+            return;
+        };
+        // Unit tests share this process and its default cache path; a
+        // verdict left by an earlier run would decide a class before the
+        // arbitration tests get to watch it alternate. Tests that mean to
+        // exercise the cache point `CMF_PROBE_CACHE` at their own file.
+        if cfg!(test) && std::env::var("CMF_PROBE_CACHE").is_err() {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        probe_cache_adopt(&text);
+    });
+}
+
+/// Apply verdicts from a cache file's text. Split out from the file
+/// reading so the adoption rule — including which lines must be IGNORED
+/// — is testable without a filesystem.
+fn probe_cache_adopt(text: &str) {
+    for line in text.lines() {
+        let Some((key, verdict)) = line.rsplit_once('\t') else {
+            continue;
+        };
+        let winner = match verdict.trim() {
+            "gpu" => 1u8,
+            "cpu" => 2u8,
+            _ => continue,
+        };
+        for (i, name) in CLASS_NAMES.iter().enumerate() {
+            if probe_cache_key_named(name) == key {
+                let _ =
+                    PROBES[i]
+                        .state
+                        .compare_exchange(0, winner, Ordering::Relaxed, Ordering::Relaxed);
+                tracing::debug!("gpu probe [{name}]: remembered → {verdict}");
+            }
+        }
+    }
+}
+
+/// Remember a verdict for the next run. Best-effort: a read-only cache
+/// directory costs a re-probe, never a failure.
+fn probe_cache_store(c: OpClass, winner: u8) {
+    let Some(path) = probe_cache_path() else {
+        return;
+    };
+    let line = format!(
+        "{}\t{}\n",
+        probe_cache_key_named(CLASS_NAMES[c as usize]),
+        if winner == 1 { "gpu" } else { "cpu" }
+    );
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// Backends: note a one-off cost (weight upload, buffer-cache fill) so
 /// the probe discards this sample.
 pub(crate) fn probe_note_cold() {
@@ -304,6 +417,7 @@ pub fn probe_arm(c: OpClass) -> ProbeArm {
     if !probe_on() {
         return ProbeArm::Gpu;
     }
+    probe_cache_load();
     let p = &PROBES[c as usize];
     match p.state.load(Ordering::Relaxed) {
         1 => ProbeArm::Gpu,
@@ -367,12 +481,12 @@ pub fn probe_record(c: OpClass, gpu: bool, dur: std::time::Duration) {
         {
             tracing::info!(
                 "gpu probe [{}]: gpu {:.2} ms vs cpu {:.2} ms per op → {}",
-                ["ffn", "matvec", "matmat", "qkv-batch", "matmat-wide", "lm-head", "gemm-nt"]
-                    [c as usize],
+                CLASS_NAMES[c as usize],
                 g / 1e6,
                 cp / 1e6,
                 if winner == 1 { "gpu" } else { "cpu" },
             );
+            probe_cache_store(c, winner);
         }
     }
 }
@@ -464,6 +578,34 @@ mod probe_tests {
         let _ = std::panic::catch_unwind(|| cpu_scope(|| panic!("scope test")));
         CPU_ONLY.with(|c| assert!(!c.get()));
         probe_reset();
+    }
+
+    #[test]
+    fn a_remembered_verdict_is_adopted_and_a_stranger_is_not() {
+        // Probing is not free: on a Snapdragon 778G the three deciding
+        // classes cost three minutes of wall clock before the first
+        // token, every process — in the phone app that WAS the first
+        // answer, 209.6 s for 25 tokens against 10.5 s on the CPU path —
+        // and the verdict came out the same every time. The cache exists
+        // so that price is paid once. GemmNt on purpose: the arbitration
+        // test above never touches it, and both run in one process.
+        probe_set_device("TestGPU/Vulkan");
+        let ver = env!("CARGO_PKG_VERSION");
+        let state = || PROBES[OpClass::GemmNt as usize].state.load(Ordering::Relaxed);
+
+        // Another device's verdict is not mine, whatever it claims.
+        probe_cache_adopt(&format!("{ver}\tOtherGPU/Vulkan\tgemm-nt\tgpu\n"));
+        assert_eq!(state(), 0);
+        // Neither is one from another build of this engine.
+        probe_cache_adopt("0.0.0-old\tTestGPU/Vulkan\tgemm-nt\tgpu\n");
+        assert_eq!(state(), 0);
+        // Mine is.
+        probe_cache_adopt(&format!("{ver}\tTestGPU/Vulkan\tgemm-nt\tcpu\n"));
+        assert_eq!(state(), 2);
+
+        PROBES[OpClass::GemmNt as usize]
+            .state
+            .store(0, Ordering::Relaxed);
     }
 }
 
