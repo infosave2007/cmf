@@ -115,6 +115,13 @@ impl StFile {
         self.dir.get(name).map(|e| e.shape.as_slice())
     }
 
+    /// The tensor's bytes as stored. `tokenizer_json` is a byte blob
+    /// wearing a tensor's clothes; decoding it as floats destroys it.
+    fn raw(&self, name: &str) -> Option<&[u8]> {
+        let e = self.dir.get(name)?;
+        self.map.get(e.start..e.end)
+    }
+
     fn has(&self, name: &str) -> bool {
         self.dir.contains_key(name)
     }
@@ -963,6 +970,173 @@ fn push_last_tap(
 
 /// Audio VAE: `dec_in_proj` + BigVGAN. 90 M parameters — f16 all the
 /// way; quantizing a vocoder buys 45 MB and costs audible hiss.
+/// MiniMax-Music-3's AR stack: a Qwen3-8B backbone, three embedding
+/// tables, the pruned audio head, and the 4-layer RVQ depth decoder.
+///
+/// Every projection in this checkpoint is FUSED where the rest of this
+/// engine expects them split — `qkv_proj` instead of q/k/v,
+/// `gate_up_proj` instead of gate/up — so the split happens once, here.
+/// The LM's is a GQA fuse (32 query heads and 8 key/value heads of 128,
+/// hence 6144 rows and not 3×4096); the depth decoder's is not
+/// (12288 = 3×4096). Splitting the first as if it were the second gives
+/// a model that loads, runs, and is wrong.
+/// Split a fused `[sum(rows)·, cols]` projection into named pieces,
+/// row-major. The fuse order is the reference's: q|k|v and gate|up.
+fn split_fused(
+    specs: &mut Vec<TensorSpec>,
+    t: &StFile,
+    level: Level,
+    src: &str,
+    cols: usize,
+    parts: &[(&str, usize)],
+) -> anyhow::Result<()> {
+    let v = t.get(src)?;
+    let mut off = 0usize;
+    for (name, rows) in parts {
+        let n = rows * cols;
+        push_exact_shaped(specs, name, &v[off..off + n], vec![*rows, cols], level);
+        off += n;
+    }
+    if off != v.len() {
+        return Err(anyhow!("{src}: split covered {off} of {}", v.len()));
+    }
+    Ok(())
+}
+
+fn pack_music3_te(
+    specs: &mut Vec<TensorSpec>,
+    path: &Path,
+    level: Level,
+) -> anyhow::Result<(serde_json::Value, Option<Vec<u8>>)> {
+    let t = StFile::open(path)?;
+    let hidden = t
+        .shape("model.layers.0.self_attn.o_proj.weight")
+        .ok_or_else(|| anyhow!("{}: no LM layers", path.display()))?[0];
+    let head_dim = t.shape("model.layers.0.self_attn.q_norm.weight").unwrap()[0];
+    let qkv_rows = t.shape("model.layers.0.self_attn.qkv_proj.weight").unwrap()[0];
+    let nh = hidden / head_dim;
+    // qkv = (nh + 2·nkv)·head_dim, so nkv falls out rather than being assumed.
+    let nkv = (qkv_rows / head_dim - nh) / 2;
+    let inter = t.shape("model.layers.0.mlp.down_proj.weight").unwrap()[1];
+    let n_lm = (0..)
+        .take_while(|i| t.has(&format!("model.layers.{i}.self_attn.qkv_proj.weight")))
+        .count();
+    let n_dec = (0..)
+        .take_while(|i| t.has(&format!("model.audio_decoder.layers.{i}.self_attn.qkv_proj.weight")))
+        .count();
+    let dec_inter = t.shape("model.audio_decoder.layers.0.mlp.down_proj.weight").unwrap()[1];
+
+
+    for l in 0..n_lm {
+        let s = format!("model.layers.{l}");
+        let d = format!("mte.layers.{l}");
+        split_fused(specs, &t, level,
+            &format!("{s}.self_attn.qkv_proj.weight"),
+            hidden,
+            &[
+                (&format!("{d}.self_attn.q_proj.weight"), nh * head_dim),
+                (&format!("{d}.self_attn.k_proj.weight"), nkv * head_dim),
+                (&format!("{d}.self_attn.v_proj.weight"), nkv * head_dim),
+            ],
+        )?;
+        split_fused(specs, &t, level,
+            &format!("{s}.mlp.gate_up_proj.weight"),
+            hidden,
+            &[
+                (&format!("{d}.mlp.gate_proj.weight"), inter),
+                (&format!("{d}.mlp.up_proj.weight"), inter),
+            ],
+        )?;
+        for k in ["self_attn.o_proj", "mlp.down_proj"] {
+            push_exact(&mut *specs, &t, &format!("{s}.{k}.weight"), &format!("{d}.{k}.weight"), level)?;
+        }
+        for k in ["input_layernorm", "post_attention_layernorm", "self_attn.q_norm", "self_attn.k_norm"] {
+            push_exact(&mut *specs, &t, &format!("{s}.{k}.weight"), &format!("{d}.{k}.weight"), Level::F32)?;
+        }
+        eprint!("\rmusic3 te layer {}/{n_lm}   ", l + 1);
+    }
+    for l in 0..n_dec {
+        let s = format!("model.audio_decoder.layers.{l}");
+        let d = format!("mte.audio_decoder.layers.{l}");
+        split_fused(specs, &t, level,
+            &format!("{s}.self_attn.qkv_proj.weight"),
+            hidden,
+            &[
+                (&format!("{d}.self_attn.q_proj.weight"), hidden),
+                (&format!("{d}.self_attn.k_proj.weight"), hidden),
+                (&format!("{d}.self_attn.v_proj.weight"), hidden),
+            ],
+        )?;
+        split_fused(specs, &t, level,
+            &format!("{s}.mlp.gate_up_proj.weight"),
+            hidden,
+            &[
+                (&format!("{d}.mlp.gate_proj.weight"), dec_inter),
+                (&format!("{d}.mlp.up_proj.weight"), dec_inter),
+            ],
+        )?;
+        push_exact(&mut *specs, &t, &format!("{s}.self_attn.o_proj.weight"), &format!("{d}.self_attn.o_proj.weight"), level)?;
+        push_exact(&mut *specs, &t, &format!("{s}.mlp.down_proj.weight"), &format!("{d}.mlp.down_proj.weight"), level)?;
+        for k in ["input_layernorm", "post_attention_layernorm"] {
+            push_exact(&mut *specs, &t, &format!("{s}.{k}.weight"), &format!("{d}.{k}.weight"), Level::F32)?;
+        }
+    }
+    eprintln!();
+    // Embeddings and heads take the codec; norms and the 16-row
+    // positional table do not.
+    for n in [
+        "model.embed_tokens_prefill.weight",
+        "model.embed_tokens_audio.weight",
+        "model.audio_extra_embedding.weight",
+        "model.lm_head_pruned.weight",
+        "model.audio_decoder.projection.weight",
+    ] {
+        push_exact(&mut *specs, &t, n, &format!("mte.{}", n.trim_start_matches("model.")), level)?;
+    }
+    for i in 0.. {
+        let n = format!("model.audio_decoder.audio_heads.{i}.weight");
+        if !t.has(&n) {
+            break;
+        }
+        push_exact(&mut *specs, &t, &n, &format!("mte.audio_decoder.audio_heads.{i}.weight"), level)?;
+    }
+    for n in ["model.norm.weight", "model.audio_decoder.norm.weight", "model.audio_decoder.pos_embedding.weight"] {
+        push_exact(&mut *specs, &t, n, &format!("mte.{}", n.trim_start_matches("model.")), Level::F32)?;
+    }
+
+    let vocab = t.raw("tokenizer_json").map(|b| b.to_vec());
+    let audio_vocab = t.shape("model.audio_decoder.audio_heads.0.weight").unwrap()[0];
+    let codebooks = (0..)
+        .take_while(|i| t.has(&format!("model.audio_decoder.audio_heads.{i}.weight")))
+        .count()
+        + 1;
+    Ok((
+        serde_json::json!({
+            "kind": "minimax_music3_ar",
+            "hidden_size": hidden,
+            "num_hidden_layers": n_lm,
+            "num_attention_heads": nh,
+            "num_key_value_heads": nkv,
+            "head_dim": head_dim,
+            "intermediate_size": inter,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "decoder_num_layers": n_dec,
+            "decoder_intermediate_size": dec_inter,
+            "decoder_num_heads": 16,
+            "audio_vocab_size": audio_vocab,
+            "audio_num_codebooks": codebooks,
+            "c0_vocab_size": t.shape("model.embed_tokens_audio.weight").unwrap()[0],
+            // The AR loop's own constants, from ComfyUI's ar.py.
+            "cfg_scale": 1.5,
+            "top_k": 50,
+            "audio_frames_per_second": 25,
+            "max_audio_frames": 9000,
+        }),
+        vocab,
+    ))
+}
+
 /// MiniMax-Music-3's flow-matching DiT.
 ///
 /// Quantize the wide projections and leave everything else exact. The
@@ -1271,6 +1445,7 @@ pub struct PackArgs<'a> {
     pub clip_proj: Option<&'a str>,
     pub music_vae: Option<&'a str>,
     pub music_dit: Option<&'a str>,
+    pub music_te: Option<&'a str>,
     pub te_layers: Option<usize>,
     pub video_vae: Option<&'a str>,
     pub audio_vae: Option<&'a str>,
@@ -1305,6 +1480,14 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
         eprintln!("te packed ({:.1}s)", t0.elapsed().as_secs_f64());
     } else if args.te_layers.is_some() {
         return Err(anyhow!("--te-layers only means something with --te"));
+    }
+    let mut music_vocab: Option<Vec<u8>> = None;
+    if let Some(p) = args.music_te {
+        let (cfg, vocab) = pack_music3_te(&mut specs, Path::new(p), level)?;
+        specs.push(config_spec("mte", &cfg));
+        music_vocab = vocab;
+        prov.insert("music_te".into(), serde_json::json!(p));
+        eprintln!("music3 te packed ({:.1}s)", t0.elapsed().as_secs_f64());
     }
     if let Some(p) = args.music_dit {
         let cfg = pack_music3_dit(&mut specs, Path::new(p), level)?;
@@ -1457,7 +1640,7 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
 
     let vocab = match args.tokenizer {
         Some(p) => Some(std::fs::read(p).with_context(|| p.to_string())?),
-        None => vocab_carried,
+        None => music_vocab.or(vocab_carried),
     };
 
     // The header describes the PROMPT ENCODER — it is the only stack in
