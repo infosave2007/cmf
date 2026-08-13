@@ -1948,9 +1948,31 @@ pub fn dit_attention_packed(
     out: &mut [f32],
 ) -> bool {
     match backend() {
-        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        // wgpu carries the only implementation, and it is not
+        // platform-specific: `CMF_GPU=wgpu` on macOS runs it over Metal
+        // like anywhere else. It used to be compiled out here on macOS,
+        // which made the call a silent `false` — and the caller's
+        // `assert!` turned that refusal into a panic on every
+        // `cortiq animate` this platform ever ran.
+        #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::dit_attention_packed(qkv, nh, n, hd, scale, nr, out),
         #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// Whether `dit_attention_packed` has an implementation on the backend
+/// that is actually selected.
+///
+/// The caller has to know BEFORE it skips the host qk-norm: deferring
+/// the norm to a device that then refuses leaves q/k unnormalized with
+/// no way back. Native Metal has no packed kernel, so on macOS this is
+/// false unless `CMF_GPU=wgpu` picked the other backend.
+pub fn dit_attention_packed_available() -> bool {
+    #[allow(unreachable_patterns)]
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::dit_attention_packed_ready(),
         _ => false,
     }
 }

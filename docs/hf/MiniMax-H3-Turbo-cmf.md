@@ -25,55 +25,43 @@ prompt encoder, the video VAE decoder and the audio vocoder in a single
 memory-mapped file — running on `cortiq`, a Rust binary with no ML framework
 underneath.
 
-| | reference checkout | here |
-|---|---|---|
-| diffusion model | 66.3 GB (bf16) | — |
-| prompt encoder | 51.5 GB (bf16) | — |
-| video + audio VAE | 5.8 GB | — |
-| Turbo LoRA | 0.8 GB | — |
-| **total** | **124.4 GB, four files + a ComfyUI checkout** | **13.2–23.9 GB, one file** |
+The reference checkout is 124.4 GB across four files plus a ComfyUI install.
+Here it is **one file between 13.2 and 23.9 GB**, and which one you take is
+decided by your VRAM.
 
-47.83 B parameters, 2 361 tensors, `cortiq verify` clean. The 13.2 GB end of
-that range swaps the prompt encoder for a 4B stand-in and fits a 20 GB card
-whole — [see below](#making-it-smaller).
-
-## What comes out
-
-![A corgi in a chef hat over a pan, four-step render](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/corgi_512x288_4step.gif)
+## Same prompt, three files
 
 *"A corgi in a chef hat flipping a pancake, sizzling sounds and a cheerful bark."*
-— 512×288, 39 frames at 24 fps, seed 42, **four steps**, nothing but the prompt.
+— 512×288, 39 frames, seed 42, four steps, nothing but the prompt.
 
-The GIF is silent; the audio is the point, so take the
-**[mp4](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/corgi_512x288_4step.mp4)**.
-It is not a second model: the same transformer denoises both streams in one
-packed sequence, on two different flow schedules.
-[`samples/`](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/tree/main/samples)
-also holds the AVI `cortiq animate` actually wrote and its `.wav` — the mp4 and
-the GIF are remuxes for the browser, and the runtime itself never touches
-ffmpeg.
+| ![32B](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/ab_q4tp.gif) | ![ClipProj](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/ab_clipproj.gif) | ![two bits](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/ab_q2tp.gif) |
+|---|---|---|
+| **23.9 GB** — full 32B prompt encoder | **13.2 GB** — 4B encoder + ClipProj | **18.7 GB** — two-bit encoder |
+| the reference | same scene, plainer set | a different animal, no pan |
 
-The LoRA is not a separate download: it is merged into the weights, so the file
-IS the 4-step model.
+The 13.2 GB file is the one to take if you have 16–20 GB of VRAM: it holds the
+whole run resident instead of paging, and it is still four bits everywhere.
+Two bits is published as a dead end, not a choice —
+[why, with numbers](#making-it-smaller).
 
-**Text-to-video and keyframe-to-video.** Prompt in, video and audio out; or
-give it a first and/or last frame and it continues from there. The release's
-third path — `ref2va`, conditioning on reference images, clips and audio — is
-not ported.
+The GIFs are silent and the audio is half the model, so take an
+**[mp4](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/ab_clipproj.mp4)**.
+One transformer denoises picture and sound together in one packed sequence.
 
 ### Which file
 
-Start from how much VRAM you have; that decides more than anything else here.
+| file | size | VRAM | keyframes | |
+|---|---|---|---|---|
+| `mmh3-turbo-fl2va-q4tp.cmf` | 23.94 GB | 24 GB+ | yes | **the default** |
+| `mmh3-turbo-q4tp.cmf` | 23.47 GB | 24 GB+ | no | same, without the vision tower |
+| **`mmh3-turbo-clipproj4b-q4tp.cmf`** | **13.16 GB** | **16–20 GB** | no | **the small one**, peaks at 15.1 GB |
+| `mmh3-turbo-fl2va-q2tp.cmf` | 18.74 GB | — | yes | don't render with this |
 
-| file | size | keyframes | take it when |
-|---|---|---|---|
-| `mmh3-turbo-fl2va-q4tp.cmf` | 23.94 GB | yes | **the default.** 24 GB of VRAM or more, or you are happy to page |
-| `mmh3-turbo-q4tp.cmf` | 23.47 GB | no | same weights without the vision tower, if you only ever type prompts |
-| **`mmh3-turbo-clipproj4b-q4tp.cmf`** | **13.16 GB** | no | **16–20 GB of VRAM.** A 4B stand-in prompt encoder; peaks at 15.1 GB, so the run stays resident instead of paging. Still four bits everywhere |
-| `mmh3-turbo-fl2va-q2tp.cmf` | 18.74 GB | yes | **don't render with this.** Two bits stopped it following the prompt; kept as a starting point for anyone pushing on it |
-
-Both smaller files are explained under [Making it smaller](#making-it-smaller),
-with the same prompt rendered through each.
+Text-to-video everywhere; the `fl2va` files also take a first and/or last frame
+([keyframes](#keyframe-to-video)). The release's third path, `ref2va`, is not
+ported. The Turbo LoRA is merged into the weights, so the file IS the 4-step
+model — nothing else to download. 47.83 B parameters, 2 361 tensors,
+`cortiq verify` clean.
 
 ## Keyframe to video
 
@@ -215,17 +203,9 @@ encoder pages, and on this workload paging costs more than any kernel.
 ## Making it smaller
 
 Half this file is the PROMPT ENCODER — 12.2 GB of Qwen3-VL against the DiT that
-actually draws. Two ways to act on that were tried. **Squeezing it does not
-work; replacing it does.** Same prompt, same seed, same four steps through all
-three:
-
-| four bits, 32B encoder | four bits, 4B + ClipProj | two bits, 32B encoder |
-|---|---|---|
-| ![32B](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/ab_q4tp.gif) | ![ClipProj](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/ab_clipproj.gif) | ![two bits](https://huggingface.co/infosave/MiniMax-H3-Turbo-cmf/resolve/main/samples/ab_q2tp.gif) |
-| 23.94 GB — the reference | **13.16 GB — still the right clip** | 18.74 GB — a different clip |
-
-Left and centre are the same scene with different furniture. Right is a
-different animal with no pan and no pancake. The two sections below are why.
+actually draws. Two ways to act on that were tried, and the three clips at the
+top of this card are the result: **squeezing the encoder does not work,
+replacing it does.** Here is why, in both directions.
 
 ### Two bits: smaller, faster, and answering a different question
 
