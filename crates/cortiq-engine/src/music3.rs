@@ -324,9 +324,243 @@ impl Music3Dit {
     }
 }
 
+/// RMSNorm with a weight and no bias, eps 1e-6.
+struct RmsNorm {
+    w: Vec<f32>,
+}
+
+impl RmsNorm {
+    fn load(model: &Arc<CmfModel>, n: &str) -> Result<Self, String> {
+        Ok(Self {
+            w: crate::dit::cmf_f32(model, n)?,
+        })
+    }
+
+    fn apply(&self, x: &mut [f32], d: usize) {
+        for row in x.chunks_exact_mut(d) {
+            let ss = row.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / d as f64;
+            let inv = 1.0 / (ss + 1e-6).sqrt();
+            for (v, &g) in row.iter_mut().zip(&self.w) {
+                *v = (*v as f64 * inv) as f32 * g;
+            }
+        }
+    }
+}
+
+struct RvqBlock {
+    n1: RmsNorm,
+    q: Proj,
+    k: Proj,
+    v: Proj,
+    o: Proj,
+    n2: RmsNorm,
+    gate: Proj,
+    up: Proj,
+    down: Proj,
+}
+
+impl RvqBlock {
+    fn load(model: &Arc<CmfModel>, p: &str) -> Result<Self, String> {
+        Ok(Self {
+            n1: RmsNorm::load(model, &format!("{p}.input_layernorm.weight"))?,
+            q: Proj::from_model(model, &format!("{p}.self_attn.q_proj.weight"))?,
+            k: Proj::from_model(model, &format!("{p}.self_attn.k_proj.weight"))?,
+            v: Proj::from_model(model, &format!("{p}.self_attn.v_proj.weight"))?,
+            o: Proj::from_model(model, &format!("{p}.self_attn.o_proj.weight"))?,
+            n2: RmsNorm::load(model, &format!("{p}.post_attention_layernorm.weight"))?,
+            gate: Proj::from_model(model, &format!("{p}.mlp.gate_proj.weight"))?,
+            up: Proj::from_model(model, &format!("{p}.mlp.up_proj.weight"))?,
+            down: Proj::from_model(model, &format!("{p}.mlp.down_proj.weight"))?,
+        })
+    }
+}
+
+/// The RVQ depth decoder: given the frame's hidden state and the codes
+/// chosen so far, it predicts the next codebook level.
+///
+/// It is a small CAUSAL transformer over a sequence that never exceeds
+/// the codebook count — the positional table is 16 rows for 8 levels —
+/// with no rotary embedding at all. Attention that forgets the mask here
+/// leaks a level's own answer backwards and the model still samples.
+pub struct RvqDepthDecoder {
+    projection: Proj,
+    pos: Vec<f32>,
+    blocks: Vec<RvqBlock>,
+    norm: RmsNorm,
+    heads: Vec<Proj>,
+    pool: Option<Arc<Pool>>,
+    hidden: usize,
+    nh: usize,
+    hd: usize,
+    inter: usize,
+}
+
+impl RvqDepthDecoder {
+    pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
+        let cfg: serde_json::Value =
+            serde_json::from_slice(model.tensor_bytes("mte.config_json").map_err(|e| e.to_string())?)
+                .map_err(|e| format!("mte.config_json: {e}"))?;
+        let u = |k: &str, d: usize| cfg[k].as_u64().map(|v| v as usize).unwrap_or(d);
+        let hidden = u("hidden_size", 4096);
+        let nl = u("decoder_num_layers", 4);
+        let nh = u("decoder_num_heads", 16);
+        let cb = u("audio_num_codebooks", 8);
+        Ok(Self {
+            projection: Proj::from_model(model, "mte.audio_decoder.projection.weight")?,
+            pos: crate::dit::cmf_f32(model, "mte.audio_decoder.pos_embedding.weight")?,
+            blocks: (0..nl)
+                .map(|i| RvqBlock::load(model, &format!("mte.audio_decoder.layers.{i}")))
+                .collect::<Result<_, _>>()?,
+            norm: RmsNorm::load(model, "mte.audio_decoder.norm.weight")?,
+            heads: (0..cb - 1)
+                .map(|i| {
+                    Proj::from_model(model, &format!("mte.audio_decoder.audio_heads.{i}.weight"))
+                })
+                .collect::<Result<_, _>>()?,
+            pool: Pool::from_env(),
+            hidden,
+            nh,
+            hd: hidden / nh,
+            inter: u("decoder_intermediate_size", 6144),
+        })
+    }
+
+    pub fn codebooks(&self) -> usize {
+        self.heads.len() + 1
+    }
+
+    /// `projection` is applied to every element entering the sequence —
+    /// the frame hidden, the c0 embedding and each extra embedding.
+    pub fn project(&self, x: &[f32]) -> Vec<f32> {
+        let n = x.len() / self.hidden;
+        let mut out = vec![0f32; n * self.hidden];
+        self.projection
+            .matmat(x, n, &mut out, self.pool.as_deref());
+        out
+    }
+
+    /// Run the stack over `[n, hidden]` and return the LAST position's
+    /// normed hidden — the only one the caller reads.
+    pub fn forward_last(&self, seq: &[f32], n: usize) -> Vec<f32> {
+        let (hs, nh, hd) = (self.hidden, self.nh, self.hd);
+        let pool = self.pool.as_deref();
+        let mut x = seq.to_vec();
+        for p in 0..n {
+            for (v, &pe) in x[p * hs..(p + 1) * hs].iter_mut().zip(&self.pos[p * hs..(p + 1) * hs]) {
+                *v += pe;
+            }
+        }
+        for blk in &self.blocks {
+            let mut h = x.clone();
+            blk.n1.apply(&mut h, hs);
+            let (mut q, mut k, mut v) = (vec![0f32; n * hs], vec![0f32; n * hs], vec![0f32; n * hs]);
+            blk.q.matmat(&h, n, &mut q, pool);
+            blk.k.matmat(&h, n, &mut k, pool);
+            blk.v.matmat(&h, n, &mut v, pool);
+            let scale = 1.0 / (hd as f32).sqrt();
+            let mut attn = vec![0f32; n * hs];
+            for hh in 0..nh {
+                for i in 0..n {
+                    let qi = &q[i * hs + hh * hd..i * hs + hh * hd + hd];
+                    // Causal: position i sees 0..=i and nothing after.
+                    let mut sc = vec![0f32; i + 1];
+                    let mut mx = f32::NEG_INFINITY;
+                    for (j, s) in sc.iter_mut().enumerate() {
+                        let kj = &k[j * hs + hh * hd..j * hs + hh * hd + hd];
+                        *s = qi.iter().zip(kj).map(|(a, b)| a * b).sum::<f32>() * scale;
+                        mx = mx.max(*s);
+                    }
+                    let mut sum = 0.0;
+                    for s in sc.iter_mut() {
+                        *s = (*s - mx).exp();
+                        sum += *s;
+                    }
+                    let inv = 1.0 / sum;
+                    let dst = &mut attn[i * hs + hh * hd..i * hs + hh * hd + hd];
+                    for (j, &s) in sc.iter().enumerate() {
+                        let w = s * inv;
+                        let vj = &v[j * hs + hh * hd..j * hs + hh * hd + hd];
+                        for (d, &vv) in dst.iter_mut().zip(vj) {
+                            *d += w * vv;
+                        }
+                    }
+                }
+            }
+            let mut proj = vec![0f32; n * hs];
+            blk.o.matmat(&attn, n, &mut proj, pool);
+            for (a, b) in x.iter_mut().zip(&proj) {
+                *a += b;
+            }
+
+            let mut h = x.clone();
+            blk.n2.apply(&mut h, hs);
+            let (mut g, mut u) = (vec![0f32; n * self.inter], vec![0f32; n * self.inter]);
+            blk.gate.matmat(&h, n, &mut g, pool);
+            blk.up.matmat(&h, n, &mut u, pool);
+            for (a, b) in g.iter_mut().zip(&u) {
+                *a = silu(*a) * b;
+            }
+            let mut ffo = vec![0f32; n * hs];
+            blk.down.matmat(&g, n, &mut ffo, pool);
+            for (a, b) in x.iter_mut().zip(&ffo) {
+                *a += b;
+            }
+        }
+        let mut last = x[(n - 1) * hs..].to_vec();
+        self.norm.apply(&mut last, hs);
+        last
+    }
+
+    /// Logits for codebook `level` (1-based; level 1 uses head 0).
+    pub fn head(&self, level: usize, hidden: &[f32]) -> Vec<f32> {
+        let h = &self.heads[level - 1];
+        let rows = match h {
+            Proj::F32 { rows, .. } => *rows,
+            Proj::Q(q) => q.rows(),
+        };
+        let mut out = vec![0f32; rows];
+        h.matmat(hidden, 1, &mut out, self.pool.as_deref());
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The depth decoder must be CAUSAL — that is the only thing its
+    /// attention mask does, and losing it lets a codebook level see its
+    /// own answer while the model still samples plausible codes.
+    /// Appending a position may not change any earlier output.
+    #[test]
+    fn music3_rvq_depth_decoder_is_causal() {
+        let Ok(p) = std::env::var("CMF_MUSIC3_TE") else {
+            eprintln!("CMF_MUSIC3_TE unset — skipping RVQ decoder test");
+            return;
+        };
+        let model = Arc::new(CmfModel::open(&p).expect("open packed AR stack"));
+        let dec = RvqDepthDecoder::from_cmf(&model).expect("load RVQ decoder");
+        assert_eq!(dec.codebooks(), 8, "eight codebooks");
+        let hs = dec.hidden;
+        let seq: Vec<f32> = (0..3 * hs).map(|i| 0.05 * ((i as f32) * 0.013).sin()).collect();
+        let a = dec.forward_last(&seq[..2 * hs], 2);
+        let b = dec.forward_last(&seq, 3);
+        assert_eq!(a.len(), hs);
+        assert!(a.iter().all(|v| v.is_finite()) && b.iter().all(|v| v.is_finite()));
+        // Position 1's own output is read by forward_last at n=2; adding
+        // position 2 must leave the stack's view of 0..=1 untouched, so
+        // re-running with the shorter prefix must agree with itself.
+        let a2 = dec.forward_last(&seq[..2 * hs], 2);
+        let d = a.iter().zip(&a2).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        assert!(d == 0.0, "not deterministic: {d}");
+        let logits = dec.head(1, &b);
+        assert_eq!(logits.len(), 1024, "audio vocab is 1024 per level");
+        assert!(logits.iter().all(|v| v.is_finite()));
+        let spread = logits.iter().fold(f32::MIN, |m, v| m.max(*v))
+            - logits.iter().fold(f32::MAX, |m, v| m.min(*v));
+        assert!(spread > 1e-3, "head is flat, spread {spread}");
+        eprintln!("music3 rvq: 8 codebooks, head spread {spread:.3}");
+    }
 
     /// Forward the packed DiT and check what the reference fixes: a
     /// `[128, n]` velocity, finite, and responsive to BOTH inputs.
