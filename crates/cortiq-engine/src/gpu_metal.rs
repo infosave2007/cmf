@@ -4026,6 +4026,7 @@ fn ctx() -> Option<&'static Ctx> {
             // Once: this getter runs per OP, and a bake left 47k copies
             // of the banner in its log.
             if first {
+                crate::gpu::probe_set_device(&format!("{}/Metal", c._device.name()));
                 tracing::info!("Metal GPU path: on ({})", c._device.name());
             }
             Some(c)

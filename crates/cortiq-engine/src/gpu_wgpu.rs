@@ -11052,6 +11052,9 @@ fn init(dev: usize) -> Result<Ctx, String> {
         } else {
             u64::MAX // UMA: the OS pages shared memory
         });
+    // The probe cache is keyed by this: a verdict belongs to one piece
+    // of silicon on one backend, and must not be adopted by another.
+    crate::gpu::probe_set_device(&format!("{}/{:?}", info.name, info.backend));
     tracing::info!(
         "wgpu GPU path: on ({} / {:?}, {}, weight budget {})",
         info.name,
