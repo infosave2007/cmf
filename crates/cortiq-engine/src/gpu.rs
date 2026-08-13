@@ -56,13 +56,43 @@ fn device_label() -> &'static str {
 
 static DEVICE_LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// Somewhere this process may write small caches.
+///
+/// `std::env::temp_dir()` is NOT that place on Android: with no `TMPDIR`
+/// it answers `/tmp`, which does not exist in an app sandbox, and every
+/// write fails silently — measured, after the pipeline cache appeared to
+/// work in a shell (where `TMPDIR=/data/local/tmp`) and did nothing at
+/// all in the app. The loader points this at the model's own directory,
+/// which is somewhere the caller already writes.
+static CACHE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Loader: name a directory this process can write to. First call wins.
+pub fn set_cache_dir(dir: std::path::PathBuf) {
+    let _ = CACHE_DIR.set(dir);
+}
+
+/// Same directory, for the backends.
+pub fn cache_dir_pub() -> std::path::PathBuf {
+    cache_dir()
+}
+
+fn cache_dir() -> std::path::PathBuf {
+    if let Some(d) = CACHE_DIR.get() {
+        return d.clone();
+    }
+    match std::env::var_os("TMPDIR") {
+        Some(t) => std::path::PathBuf::from(t),
+        None => std::env::temp_dir(),
+    }
+}
+
 /// Where decided verdicts are remembered between runs. `CMF_PROBE_CACHE`
 /// overrides the path; `0` disables the cache entirely.
 fn probe_cache_path() -> Option<std::path::PathBuf> {
     match std::env::var("CMF_PROBE_CACHE") {
         Ok(v) if v == "0" => None,
         Ok(v) => Some(std::path::PathBuf::from(v)),
-        Err(_) => Some(std::env::temp_dir().join("cortiq-gpu-probe.tsv")),
+        Err(_) => Some(cache_dir().join("cortiq-gpu-probe.tsv")),
     }
 }
 
@@ -2080,10 +2110,22 @@ pub fn graph_race_begin_generation() {
     // of compiling it saves on the device that needed this.
     #[cfg(feature = "gpu")]
     {
+        // Save once, at the start of the SECOND generation: the first
+        // has dispatched, so there is something to keep, and nothing is
+        // saved before any work (the driver compiles at first use, not
+        // at pipeline creation — the context comes up in 1.5 s while the
+        // compiling costs minutes).
+        //
+        // Flushing again on 4, 8, 16 … was tried on the theory that a
+        // chat turn compiles shapes the first one did not. It buys
+        // nothing: a fresh app process still spent 49.0 s, then 58.7,
+        // then 61.3 on its first answer with the backoff in place. One
+        // flush it is.
         static FLUSHED: std::sync::Once = std::sync::Once::new();
-        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        static FIRST: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(true);
         if FIRST.swap(false, Ordering::Relaxed) {
-            // Skip the very first call: nothing has been dispatched yet.
+            // Nothing dispatched yet.
         } else {
             FLUSHED.call_once(crate::gpu_wgpu::pipeline_cache_flush);
         }

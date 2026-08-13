@@ -11879,7 +11879,7 @@ fn pipeline_cache_path(info: &wgpu::AdapterInfo) -> Option<std::path::PathBuf> {
         env!("CARGO_PKG_VERSION"),
     )
         .hash(&mut h);
-    Some(std::env::temp_dir().join(format!("cortiq-pipelines-{:016x}.bin", h.finish())))
+    Some(crate::gpu::cache_dir_pub().join(format!("cortiq-pipelines-{:016x}.bin", h.finish())))
 }
 
 /// Load the blob and hand it to the driver. Unsafe by wgpu's contract —
