@@ -14314,9 +14314,24 @@ pub fn forward_token_graph(
     let kv_us = std::mem::take(&mut gs.kv_us);
     let at_us = std::mem::take(&mut gs.at_us);
     let rope_us = std::mem::take(&mut gs.rope_us);
-    // Encode one matvec, dtype-dispatched: q8_row (encode_matvec + row scales)
-    // or q1 (encode_matvec_q1). Each is its own pass — pass-grouping measured
-    // as a no-op (the wall is per-dispatch, not per-barrier).
+    // Encode one matvec, dtype-dispatched: q8_row (encode_matvec + row
+    // scales) or q1 (encode_matvec_q1). Each is its own pass.
+    //
+    // "Pass-grouping measured as a no-op (the wall is per-dispatch, not
+    // per-barrier)" was true where it was measured and is FALSE on a
+    // tiler. On an Adreno 642L the compute PASS is the unit of cost and
+    // it is ~4.4 ms — a tile store and restore — while submits are
+    // nearly free. Four configurations, differing 2.4x in submits a
+    // token, all land on the same per-pass price:
+    //
+    //   graph off        189 passes/token   808 ms   4.28 ms/pass
+    //   graph, 1 submit  319                1437     4.50
+    //   graph, 4 submits 319                1451     4.55
+    //
+    // Token time is passes x 4.4 ms on that device, and that is the whole
+    // story of why the graph loses there: it halves the submits and
+    // doubles the passes. Anyone making wgpu pay on mobile has to fuse a
+    // LAYER into one pass, not a token into one submit.
     let emat = |enc: &mut wgpu::CommandEncoder,
                 m: &GMat,
                 xs: &wgpu::Buffer,
