@@ -1866,6 +1866,16 @@ async fn main() -> anyhow::Result<()> {
                 for line in cortiq_engine::gpu_wgpu::adapter_report() {
                     println!("  {line}");
                 }
+                // What a round trip to this device costs with nothing in
+                // it. On a laptop this is microseconds and the per-op
+                // path is fine; where it is milliseconds, every kernel
+                // number is really a latency number and tuning shaders
+                // cannot help.
+                if let Some((empty, one)) = cortiq_engine::gpu_wgpu::roundtrip_bench(30) {
+                    println!(
+                        "  круг до устройства: пустой сабмит {empty:.2} мс · сабмит+диспатч+readback {one:.2} мс"
+                    );
+                }
                 // CMF_GPU_DISPATCH_BENCH=1: what a dispatch costs, and whether
                 // the cost is the launch or the barrier between two that touch
                 // the same buffer. Every fusion decision hangs on which.
@@ -3596,6 +3606,25 @@ fn wgpu_rate(tokens: usize) -> (f64, f64) {
     }
 }
 
+/// Milliseconds spent pushing weights to the device, and the megabytes
+/// that rode. A resident model uploads ONCE for the whole run; more than
+/// the model's size means the cache is missing and the device is being
+/// fed over the upload path, ~40 MB/s on this class of hardware.
+fn wgpu_uploads() -> (f64, f64) {
+    #[cfg(feature = "gpu")]
+    {
+        use std::sync::atomic::Ordering;
+        return (
+            cortiq_engine::gpu_wgpu::UPLOAD_NS.load(Ordering::Relaxed) as f64 / 1e6,
+            cortiq_engine::gpu_wgpu::UPLOAD_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+        );
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        (0.0, 0.0)
+    }
+}
+
 async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()> {
     let model = CmfModel::open_sharded(model_path)?;
     let arch = model.arch();
@@ -4623,6 +4652,8 @@ async fn cmd_bench(
             "metal_submits_per_token": metal_submits_per_token(result.tokens_generated),
             "wgpu_submits_per_token": wgpu_rate(result.tokens_generated).0,
             "wgpu_passes_per_token": wgpu_rate(result.tokens_generated).1,
+            "wgpu_upload_ms": wgpu_uploads().0,
+            "wgpu_upload_mb": wgpu_uploads().1,
             "decode_tok_s_steady": decode_tps,
             "decode_tok_s_incl_prefill": result.tokens_generated as f64 / total_s.max(1e-9),
             "ttft_s": ttft_s,
