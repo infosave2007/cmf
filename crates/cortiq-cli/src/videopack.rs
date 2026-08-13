@@ -963,6 +963,93 @@ fn push_last_tap(
 
 /// Audio VAE: `dec_in_proj` + BigVGAN. 90 M parameters — f16 all the
 /// way; quantizing a vocoder buys 45 MB and costs audible hiss.
+/// MiniMax-Music-3's flow-matching DiT.
+///
+/// Quantize the wide projections and leave everything else exact. The
+/// exceptions are not taste: `project_out` is 128 rows carrying the whole
+/// velocity, the two 1×1 convs are residual corrections whose whole job
+/// is a small delta, and `inv_freq`/`cond_layer_*`/the norms are tiny and
+/// decide geometry rather than magnitude. Together they are a few MB
+/// against 1.3 GB.
+fn pack_music3_dit(
+    specs: &mut Vec<TensorSpec>,
+    path: &Path,
+    level: Level,
+) -> anyhow::Result<serde_json::Value> {
+    let d = StFile::open(path)?;
+    let layers = (0..)
+        .take_while(|i| {
+            d.has(&format!(
+                "diffusion_transformer.transformer.layers.{i}.self_attn.to_qkv.weight"
+            ))
+        })
+        .count();
+    if layers == 0 {
+        return Err(anyhow!("{}: no DiT layers", path.display()));
+    }
+    let mut quantized = 0usize;
+    let mut exact = 0usize;
+    for name in d.order.clone() {
+        if !(name.starts_with("diffusion_transformer.")
+            || name.starts_with("latent_conditioners.")
+            || name.starts_with("cond_layer_"))
+        {
+            continue;
+        }
+        let shape = d.shape(&name).unwrap().to_vec();
+        let vals = d.get(&name)?;
+        // The wide 2-D projections take the codec; the rest is exact.
+        let wide = shape.len() == 2
+            && shape[1] % 32 == 0
+            && shape[0] >= 512
+            && !name.ends_with("project_out.weight");
+        let lv = if wide { level } else { Level::F32 };
+        if wide {
+            quantized += 1;
+        } else {
+            exact += 1;
+        }
+        push_exact_shaped(specs, &format!("mdit.{name}"), &vals, shape, lv);
+    }
+    eprintln!("music3 dit: {layers} layers, {quantized} projections quantized, {exact} exact");
+    Ok(serde_json::json!({
+        "kind": "minimax_music3_dit",
+        "num_layers": layers,
+        "hidden": 2048,
+        "num_heads": 32,
+        "head_dim": 64,
+        "rotary_dim": 32,
+        "ff_inner": 8192,
+        "in_channels": 128,
+        "condition_dim": 2048,
+        "concat_channels": 2304,
+        "fourier_dim": 256,
+        "cond_layers": 8,
+        // The reference windows the transformer over long latents rather
+        // than attending across a whole song, and averages the overlap.
+        "max_condition_frames": 200,
+        "condition_hop_frames": 100,
+        "audio_frames_per_second": 25,
+    }))
+}
+
+/// `push_exact` reads from a file by name; this takes values already in
+/// hand, applying the same "1×1 convs are matrices wearing a hat" rule.
+fn push_exact_shaped(
+    specs: &mut Vec<TensorSpec>,
+    name: &str,
+    vals: &[f32],
+    shape: Vec<usize>,
+    level: Level,
+) {
+    let shape = if shape.len() > 2 && shape[2..].iter().all(|&d| d == 1) {
+        vec![shape[0], shape[1]]
+    } else {
+        shape
+    };
+    specs.push(spec(name.to_string(), vals, shape, level));
+}
+
 /// MiniMax-Music-3's DAV decoder.
 ///
 /// Two things separate this from `pack_audio_vae`, and both are silent
@@ -1183,6 +1270,7 @@ pub struct PackArgs<'a> {
     pub te: Option<&'a str>,
     pub clip_proj: Option<&'a str>,
     pub music_vae: Option<&'a str>,
+    pub music_dit: Option<&'a str>,
     pub te_layers: Option<usize>,
     pub video_vae: Option<&'a str>,
     pub audio_vae: Option<&'a str>,
@@ -1217,6 +1305,12 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
         eprintln!("te packed ({:.1}s)", t0.elapsed().as_secs_f64());
     } else if args.te_layers.is_some() {
         return Err(anyhow!("--te-layers only means something with --te"));
+    }
+    if let Some(p) = args.music_dit {
+        let cfg = pack_music3_dit(&mut specs, Path::new(p), level)?;
+        specs.push(config_spec("mdit", &cfg));
+        prov.insert("music_dit".into(), serde_json::json!(p));
+        eprintln!("music3 dit packed ({:.1}s)", t0.elapsed().as_secs_f64());
     }
     if let Some(p) = args.music_vae {
         let cfg = pack_music3_vae(&mut specs, Path::new(p))?;
