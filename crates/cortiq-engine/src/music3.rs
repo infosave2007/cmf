@@ -19,6 +19,7 @@
 //! `i < 16` the pair is `(x[i], x[i+16])`, rotated by `pos·inv_freq[i]`.
 
 use crate::dit::Proj;
+use crate::qtensor::QTensor;
 use crate::pool::Pool;
 use cortiq_core::CmfModel;
 use std::sync::Arc;
@@ -98,6 +99,12 @@ pub struct Music3Dit {
     hd: usize,
     rot: usize,
     inter: usize,
+    /// The learned mix over the AR stack's eight codebook levels, and
+    /// the 3-tap conv that turns the mixture into the DiT's condition.
+    cond_logits: Vec<f32>,
+    cond_scale: f32,
+    lc_w: Vec<f32>,
+    lc_b: Vec<f32>,
 }
 
 impl Music3Dit {
@@ -132,7 +139,71 @@ impl Music3Dit {
             hd: u("head_dim", 64),
             rot: u("rotary_dim", 32),
             inter: u("ff_inner", 8192),
+            cond_logits: crate::dit::cmf_f32(model, "mdit.cond_layer_logits")?,
+            cond_scale: crate::dit::cmf_f32(model, "mdit.cond_layer_scale")?[0],
+            lc_w: crate::dit::cmf_f32(model, "mdit.latent_conditioners.0.weight")?,
+            lc_b: crate::dit::cmf_f32(model, "mdit.latent_conditioners.0.bias")?,
         })
+    }
+
+    /// Latent frames for `audio_frames` of AR output — the reference's
+    /// `latent_length`: 44100/24000 · 960/512 = 3.4453125 per frame.
+    pub fn latent_length(audio_frames: usize) -> usize {
+        ((audio_frames as f64 * 44100.0 / 24000.0 * 960.0 / 512.0) as usize).max(1)
+    }
+
+    /// AR hidden `[frames, 8·4096]` → the DiT's condition `[2048, L]`.
+    ///
+    /// The eight are RVQ CODEBOOK levels, softmax-mixed by
+    /// `cond_layer_logits`, scaled, passed through one 3-tap conv and
+    /// then NEAREST-resampled to the latent rate. Nearest, not linear:
+    /// the reference interpolates that way and a smoother resample
+    /// smears the onset of every note.
+    pub fn aligned_condition(&self, hidden: &[f32], frames: usize) -> (Vec<f32>, usize) {
+        let levels = self.cond_logits.len();
+        let ar = hidden.len() / (frames * levels);
+        let mx = self.cond_logits.iter().cloned().fold(f32::MIN, f32::max);
+        let ex: Vec<f32> = self.cond_logits.iter().map(|v| (v - mx).exp()).collect();
+        let sum: f32 = ex.iter().sum();
+        // [ar, frames], channel-major, mixed and scaled.
+        let mut mixed = vec![0f32; ar * frames];
+        for t in 0..frames {
+            for l in 0..levels {
+                let w = ex[l] / sum * self.cond_scale;
+                let src = &hidden[(t * levels + l) * ar..(t * levels + l + 1) * ar];
+                for (c, &v) in src.iter().enumerate() {
+                    mixed[c * frames + t] += w * v;
+                }
+            }
+        }
+        // Conv1d(ar -> 2048, k=3, pad=1).
+        let out_ch = self.lc_b.len();
+        let mut conv = vec![0f32; out_ch * frames];
+        for o in 0..out_ch {
+            let dst = &mut conv[o * frames..(o + 1) * frames];
+            dst.fill(self.lc_b[o]);
+            for i in 0..ar {
+                let k = &self.lc_w[(o * ar + i) * 3..(o * ar + i + 1) * 3];
+                let src = &mixed[i * frames..(i + 1) * frames];
+                for t in 0..frames {
+                    for (j, &kv) in k.iter().enumerate() {
+                        let p = t as isize + j as isize - 1;
+                        if p >= 0 && (p as usize) < frames {
+                            dst[t] += kv * src[p as usize];
+                        }
+                    }
+                }
+            }
+        }
+        let l = Self::latent_length(frames);
+        let mut out = vec![0f32; out_ch * l];
+        for o in 0..out_ch {
+            for t in 0..l {
+                let s = (t * frames) / l.max(1);
+                out[o * l + t] = conv[o * frames + s.min(frames - 1)];
+            }
+        }
+        (out, l)
     }
 
     /// `[out, in]` 1×1 conv over the channel axis of a `[in, n]` panel,
@@ -278,6 +349,58 @@ impl Music3Dit {
         }
     }
 
+    /// Latent frames the transformer will attend across in one go, and
+    /// the stride it advances by — `latent_length(200)` and
+    /// `latent_length(100)` in the reference. Attention is quadratic, so
+    /// a whole song in one pass is not merely slow, it is not what the
+    /// model was run as.
+    pub const WINDOW: usize = 689;
+    pub const HOP: usize = 344;
+
+    /// The velocity over any length, windowed like the reference:
+    /// overlapping passes averaged by how many covered each frame.
+    pub fn forward_windowed(&self, x: &[f32], condition: &[f32], n: usize, t: f32) -> Vec<f32> {
+        if n <= Self::WINDOW {
+            return self.forward(x, condition, n, t);
+        }
+        let ch = Self::IN_CH;
+        let cc = Self::COND_CH;
+        let mut out = vec![0f32; ch * n];
+        let mut count = vec![0f32; n];
+        let mut start = 0usize;
+        loop {
+            let end = (start + Self::WINDOW).min(n);
+            let w = end - start;
+            let mut xw = vec![0f32; ch * w];
+            for c in 0..ch {
+                xw[c * w..(c + 1) * w].copy_from_slice(&x[c * n + start..c * n + end]);
+            }
+            let mut cw = vec![0f32; cc * w];
+            for c in 0..cc {
+                cw[c * w..(c + 1) * w].copy_from_slice(&condition[c * n + start..c * n + end]);
+            }
+            let v = self.forward(&xw, &cw, w, t);
+            for c in 0..ch {
+                for i in 0..w {
+                    out[c * n + start + i] += v[c * w + i];
+                }
+            }
+            for i in 0..w {
+                count[start + i] += 1.0;
+            }
+            if end == n {
+                break;
+            }
+            start += Self::HOP;
+        }
+        for c in 0..ch {
+            for i in 0..n {
+                out[c * n + i] /= count[i];
+            }
+        }
+        out
+    }
+
     /// `x` is `[128, n]` and `condition` `[2048, n]`; the result is the
     /// velocity at `[128, n]`.
     pub fn forward(&self, x: &[f32], condition: &[f32], n: usize, t: f32) -> Vec<f32> {
@@ -338,7 +461,7 @@ impl Music3Dit {
         for i in 0..steps {
             let (s, s_next) = (sigmas[i], sigmas[i + 1]);
             // ComfyUI's process_timestep for this model.
-            let v = self.forward(&x, condition, n, 1.0 - s);
+            let v = self.forward_windowed(&x, condition, n, 1.0 - s);
             let dt = s_next - s;
             for (a, b) in x.iter_mut().zip(&v) {
                 *a += dt * b;
@@ -566,6 +689,394 @@ impl RvqDepthDecoder {
         let mut out = vec![0f32; rows];
         h.matmat(hidden, 1, &mut out, self.pool.as_deref());
         out
+    }
+}
+
+// ── the autoregressive stack ────────────────────────────────────────
+
+/// One Qwen3 block: RMSNorm → GQA attention with per-head q/k norms and
+/// split-half RoPE → residual → RMSNorm → SwiGLU → residual.
+struct ArBlock {
+    n1: RmsNorm,
+    q: Proj,
+    k: Proj,
+    v: Proj,
+    o: Proj,
+    qn: RmsNorm,
+    kn: RmsNorm,
+    n2: RmsNorm,
+    gate: Proj,
+    up: Proj,
+    down: Proj,
+}
+
+impl ArBlock {
+    fn load(model: &Arc<CmfModel>, p: &str) -> Result<Self, String> {
+        Ok(Self {
+            n1: RmsNorm::load(model, &format!("{p}.input_layernorm.weight"))?,
+            q: Proj::from_model(model, &format!("{p}.self_attn.q_proj.weight"))?,
+            k: Proj::from_model(model, &format!("{p}.self_attn.k_proj.weight"))?,
+            v: Proj::from_model(model, &format!("{p}.self_attn.v_proj.weight"))?,
+            o: Proj::from_model(model, &format!("{p}.self_attn.o_proj.weight"))?,
+            qn: RmsNorm::load(model, &format!("{p}.self_attn.q_norm.weight"))?,
+            kn: RmsNorm::load(model, &format!("{p}.self_attn.k_norm.weight"))?,
+            n2: RmsNorm::load(model, &format!("{p}.post_attention_layernorm.weight"))?,
+            gate: Proj::from_model(model, &format!("{p}.mlp.gate_proj.weight"))?,
+            up: Proj::from_model(model, &format!("{p}.mlp.up_proj.weight"))?,
+            down: Proj::from_model(model, &format!("{p}.mlp.down_proj.weight"))?,
+        })
+    }
+}
+
+/// Keys and values for one layer, one CFG branch: `[pos][nkv·hd]`.
+#[derive(Default, Clone)]
+struct KvRun {
+    k: Vec<f32>,
+    v: Vec<f32>,
+    len: usize,
+}
+
+/// Deterministic top-k sampler.
+///
+/// NOT torch's: reproducing `torch.multinomial` under a seeded
+/// `Generator` bit-for-bit is its own project, and nothing downstream
+/// needs the same seed to mean the same song — only that one seed here
+/// always means one song.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+    fn next_f32(&mut self) -> f32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        ((x >> 40) as f32) / (1u32 << 24) as f32
+    }
+}
+
+fn sample_topk(logits: &[f32], top_k: usize, rng: &mut Rng) -> usize {
+    let mut idx: Vec<usize> = (0..logits.len()).filter(|&i| logits[i].is_finite()).collect();
+    idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+    idx.truncate(top_k.max(1));
+    let mx = idx.iter().map(|&i| logits[i]).fold(f32::MIN, f32::max);
+    let exps: Vec<f32> = idx.iter().map(|&i| (logits[i] - mx).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    let mut r = rng.next_f32() * sum;
+    for (j, &e) in exps.iter().enumerate() {
+        r -= e;
+        if r <= 0.0 {
+            return idx[j];
+        }
+    }
+    *idx.last().unwrap()
+}
+
+/// MiniMax-Music-3's AR stack: it does not encode a prompt, it GENERATES
+/// the conditioning — audio tokens sampled frame by frame, whose hidden
+/// states become what the DiT is conditioned on.
+pub struct Music3Ar {
+    blocks: Vec<ArBlock>,
+    norm: RmsNorm,
+    embed_prefill: QTensor,
+    embed_audio: QTensor,
+    embed_extra: QTensor,
+    lm_head: Proj,
+    pub depth: RvqDepthDecoder,
+    inv_freq: Vec<f32>,
+    pool: Option<Arc<Pool>>,
+    hidden: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    inter: usize,
+    audio_vocab: usize,
+    codebooks: usize,
+    pub cfg_scale: f32,
+    pub top_k: usize,
+    pub fps: usize,
+    pub max_frames: usize,
+}
+
+/// Token ids the prompt is built from — `comfy/ldm/minimax_music/prompt.py`.
+pub mod tokens {
+    pub const IM_START: u32 = 151644;
+    pub const IM_END: u32 = 151645;
+    pub const AUDIO_CFG: u32 = 151654;
+    pub const AUDIO_START: u32 = 151669;
+    pub const CAPTION_START: u32 = 151671;
+    pub const CAPTION_END: u32 = 151672;
+    pub const LYRICS_START: u32 = 151673;
+    pub const LYRICS_END: u32 = 151674;
+}
+
+impl Music3Ar {
+    pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
+        let cfg: serde_json::Value =
+            serde_json::from_slice(model.tensor_bytes("mte.config_json").map_err(|e| e.to_string())?)
+                .map_err(|e| format!("mte.config_json: {e}"))?;
+        let u = |k: &str, d: usize| cfg[k].as_u64().map(|v| v as usize).unwrap_or(d);
+        let f = |k: &str, d: f64| cfg[k].as_f64().unwrap_or(d);
+        let hidden = u("hidden_size", 4096);
+        let hd = u("head_dim", 128);
+        let theta = f("rope_theta", 1_000_000.0) as f32;
+        Ok(Self {
+            blocks: (0..u("num_hidden_layers", 36))
+                .map(|i| ArBlock::load(model, &format!("mte.layers.{i}")))
+                .collect::<Result<_, _>>()?,
+            norm: RmsNorm::load(model, "mte.norm.weight")?,
+            embed_prefill: QTensor::from_model(model, "mte.embed_tokens_prefill.weight")?,
+            embed_audio: QTensor::from_model(model, "mte.embed_tokens_audio.weight")?,
+            embed_extra: QTensor::from_model(model, "mte.audio_extra_embedding.weight")?,
+            lm_head: Proj::from_model(model, "mte.lm_head_pruned.weight")?,
+            depth: RvqDepthDecoder::from_cmf(model)?,
+            inv_freq: (0..hd / 2)
+                .map(|i| 1.0 / theta.powf(2.0 * i as f32 / hd as f32))
+                .collect(),
+            pool: Pool::from_env(),
+            hidden,
+            nh: u("num_attention_heads", 32),
+            nkv: u("num_key_value_heads", 8),
+            hd,
+            inter: u("intermediate_size", 12288),
+            audio_vocab: u("audio_vocab_size", 1024),
+            codebooks: u("audio_num_codebooks", 8),
+            cfg_scale: f("cfg_scale", 1.5) as f32,
+            top_k: u("top_k", 50),
+            fps: u("audio_frames_per_second", 25),
+            max_frames: u("max_audio_frames", 9000),
+        })
+    }
+
+    /// One embedding row. A table lookup, not a matmul: these are
+    /// `[vocab, hidden]` and only ever read one row at a time.
+    fn embed_row(p: &QTensor, row: usize, hidden: usize) -> Vec<f32> {
+        let mut out = vec![0f32; hidden];
+        p.row_f32(row, &mut out);
+        out
+    }
+
+    /// Run one position through every block, appending to the cache.
+    /// `x` is `[b, hidden]` for the CFG pair; returns the normed hidden.
+    fn step_blocks(&self, x: &mut [f32], b: usize, pos: usize, cache: &mut [Vec<KvRun>]) {
+        let (hs, nh, nkv, hd) = (self.hidden, self.nh, self.nkv, self.hd);
+        let pool = self.pool.as_deref();
+        let kvw = nkv * hd;
+        for (li, blk) in self.blocks.iter().enumerate() {
+            let mut h = x.to_vec();
+            blk.n1.apply(&mut h, hs);
+            let mut q = vec![0f32; b * nh * hd];
+            let mut k = vec![0f32; b * kvw];
+            let mut v = vec![0f32; b * kvw];
+            blk.q.matmat(&h, b, &mut q, pool);
+            blk.k.matmat(&h, b, &mut k, pool);
+            blk.v.matmat(&h, b, &mut v, pool);
+            // Per-head RMSNorm on q and k BEFORE the rotation, then
+            // split-half RoPE — Qwen3's order, not the other way round.
+            for bi in 0..b {
+                for hh in 0..nh {
+                    let s = bi * nh * hd + hh * hd;
+                    blk.qn.apply(&mut q[s..s + hd], hd);
+                    rope_half(&mut q[s..s + hd], pos, &self.inv_freq);
+                }
+                for hh in 0..nkv {
+                    let s = bi * kvw + hh * hd;
+                    blk.kn.apply(&mut k[s..s + hd], hd);
+                    rope_half(&mut k[s..s + hd], pos, &self.inv_freq);
+                }
+            }
+            let mut attn = vec![0f32; b * nh * hd];
+            let per_kv = nh / nkv;
+            for bi in 0..b {
+                let run = &mut cache[li][bi];
+                run.k.extend_from_slice(&k[bi * kvw..(bi + 1) * kvw]);
+                run.v.extend_from_slice(&v[bi * kvw..(bi + 1) * kvw]);
+                run.len += 1;
+                let n = run.len;
+                let scale = 1.0 / (hd as f32).sqrt();
+                for hh in 0..nh {
+                    let g = hh / per_kv;
+                    let qi = &q[bi * nh * hd + hh * hd..bi * nh * hd + hh * hd + hd];
+                    let mut sc = vec![0f32; n];
+                    let mut mx = f32::NEG_INFINITY;
+                    for (j, s) in sc.iter_mut().enumerate() {
+                        let kj = &run.k[j * kvw + g * hd..j * kvw + g * hd + hd];
+                        *s = qi.iter().zip(kj).map(|(a, c)| a * c).sum::<f32>() * scale;
+                        mx = mx.max(*s);
+                    }
+                    let mut sum = 0.0;
+                    for s in sc.iter_mut() {
+                        *s = (*s - mx).exp();
+                        sum += *s;
+                    }
+                    let inv = 1.0 / sum;
+                    let dst = &mut attn[bi * nh * hd + hh * hd..bi * nh * hd + hh * hd + hd];
+                    for (j, &s) in sc.iter().enumerate() {
+                        let w = s * inv;
+                        let vj = &run.v[j * kvw + g * hd..j * kvw + g * hd + hd];
+                        for (d, &vv) in dst.iter_mut().zip(vj) {
+                            *d += w * vv;
+                        }
+                    }
+                }
+            }
+            let mut proj = vec![0f32; b * hs];
+            blk.o.matmat(&attn, b, &mut proj, pool);
+            for (a, c) in x.iter_mut().zip(&proj) {
+                *a += c;
+            }
+            let mut h = x.to_vec();
+            blk.n2.apply(&mut h, hs);
+            let (mut g, mut u2) = (vec![0f32; b * self.inter], vec![0f32; b * self.inter]);
+            blk.gate.matmat(&h, b, &mut g, pool);
+            blk.up.matmat(&h, b, &mut u2, pool);
+            for (a, c) in g.iter_mut().zip(&u2) {
+                *a = silu(*a) * c;
+            }
+            let mut ffo = vec![0f32; b * hs];
+            blk.down.matmat(&g, b, &mut ffo, pool);
+            for (a, c) in x.iter_mut().zip(&ffo) {
+                *a += c;
+            }
+        }
+    }
+
+    /// Generate `frames` of conditioning: `[frames, 8·hidden]`.
+    ///
+    /// The CFG pair runs as batch 2 — the conditioned prompt and one
+    /// whose middle is replaced by `<|audio_cfg|>` — and every sampled
+    /// code is shared by both branches, which is what makes them stay
+    /// in step.
+    pub fn generate(
+        &self,
+        prompt_ids: &[u32],
+        seed: u64,
+        frames: usize,
+        mut progress: impl FnMut(usize, usize),
+    ) -> Result<(Vec<f32>, usize), String> {
+        let hs = self.hidden;
+        let pool = self.pool.as_deref();
+        let want = frames.min(self.max_frames);
+        let mut cache: Vec<Vec<KvRun>> = (0..self.blocks.len())
+            .map(|_| vec![KvRun::default(); 2])
+            .collect();
+        // The unconditioned branch keeps the frame but not the words.
+        let mut uncond = prompt_ids.to_vec();
+        if uncond.len() > 3 {
+            let n = uncond.len();
+            for t in uncond[1..n - 2].iter_mut() {
+                *t = tokens::AUDIO_CFG;
+            }
+        }
+        let mut last = vec![0f32; 2 * hs];
+        for (pos, (&a, &b)) in prompt_ids.iter().zip(&uncond).enumerate() {
+            let mut x = vec![0f32; 2 * hs];
+            x[..hs].copy_from_slice(&Self::embed_row(&self.embed_prefill, a as usize, hs));
+            x[hs..].copy_from_slice(&Self::embed_row(&self.embed_prefill, b as usize, hs));
+            self.step_blocks(&mut x, 2, pos, &mut cache);
+            last = x;
+            if pos % 64 == 0 {
+                progress(0, want);
+            }
+        }
+        let mut rng = Rng::new(seed);
+        let mut out: Vec<f32> = Vec::with_capacity(want * self.codebooks * hs);
+        let mut done = 0usize;
+        let scale = (self.codebooks as f32).powf(-0.5);
+        for frame in 0..want {
+            let mut normed = last.clone();
+            self.norm.apply(&mut normed, hs);
+            // c0 with classifier-free guidance and a top-k mask taken
+            // from the CONDITIONED logits, per the reference.
+            let mut logits = vec![0f32; 2 * self.lm_head_rows()];
+            self.lm_head.matmat(&normed, 2, &mut logits, pool);
+            let vocab = self.lm_head_rows();
+            let (cond, unc) = logits.split_at(vocab);
+            let mut thr: Vec<f32> = cond.to_vec();
+            thr.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
+            let cut = thr[self.top_k.min(vocab) - 1];
+            let guided: Vec<f32> = (0..vocab)
+                .map(|i| {
+                    if cond[i] < cut {
+                        f32::NEG_INFINITY
+                    } else {
+                        unc[i] + (cond[i] - unc[i]) * self.cfg_scale
+                    }
+                })
+                .collect();
+            let code = sample_topk(&guided, self.top_k, &mut rng);
+            if code == 0 {
+                break; // stop token
+            }
+            let c0 = code - 1;
+            let c0_embed = Self::embed_row(&self.embed_audio, c0, hs);
+            // Depth: the remaining seven codebooks, and their hidden
+            // states are seven eighths of what the DiT will see.
+            let mut seq = self.depth.project(&normed[..hs]);
+            seq.extend_from_slice(&self.depth.project(&c0_embed));
+            let mut codes = vec![c0];
+            let mut frame_hidden = normed[..hs].to_vec();
+            for level in 1..self.codebooks {
+                let n = seq.len() / hs;
+                let h = self.depth.forward_last(&seq, n);
+                frame_hidden.extend_from_slice(&h);
+                let lg = self.depth.head(level, &h);
+                let c = sample_topk(&lg, self.top_k, &mut rng);
+                codes.push(c);
+                if level < self.codebooks - 1 {
+                    let e = Self::embed_row(&self.embed_extra, c + (level - 1) * self.audio_vocab, hs);
+                    seq.extend_from_slice(&self.depth.project(&e));
+                }
+            }
+            out.extend_from_slice(&frame_hidden);
+            done += 1;
+            progress(done, want);
+            if done >= want {
+                break;
+            }
+            // Feed the whole frame back: c0's embedding plus the extras,
+            // scaled by 1/sqrt(codebooks).
+            let mut fb = Self::embed_row(&self.embed_audio, codes[0], hs);
+            for (level, &c) in codes.iter().enumerate().skip(1) {
+                let e = Self::embed_row(&self.embed_extra, c + (level - 1) * self.audio_vocab, hs);
+                for (a, b) in fb.iter_mut().zip(&e) {
+                    *a += b;
+                }
+            }
+            for a in fb.iter_mut() {
+                *a *= scale;
+            }
+            let mut x = vec![0f32; 2 * hs];
+            x[..hs].copy_from_slice(&fb);
+            x[hs..].copy_from_slice(&fb);
+            self.step_blocks(&mut x, 2, prompt_ids.len() + frame, &mut cache);
+            last = x;
+        }
+        if done == 0 {
+            return Err("MiniMax-Music-3 generated zero audio frames".into());
+        }
+        Ok((out, done))
+    }
+
+    fn lm_head_rows(&self) -> usize {
+        match &self.lm_head {
+            Proj::F32 { rows, .. } => *rows,
+            Proj::Q(q) => q.rows(),
+        }
+    }
+}
+
+/// Split-half rotation over one head, angle `pos·inv_freq[i]`.
+fn rope_half(x: &mut [f32], pos: usize, inv_freq: &[f32]) {
+    let half = x.len() / 2;
+    for i in 0..half {
+        let (s, c) = (pos as f32 * inv_freq[i]).sin_cos();
+        let (a, b) = (x[i], x[i + half]);
+        x[i] = a * c - b * s;
+        x[i + half] = b * c + a * s;
     }
 }
 

@@ -11,6 +11,7 @@ mod npy;
 mod avout;
 mod sign;
 mod skill;
+mod music;
 mod videopack;
 
 use clap::{Parser, Subcommand};
@@ -950,6 +951,30 @@ enum Commands {
     /// .cmf that `animate` runs straight off the mmap. Each source is
     /// optional and `--in` carries a previous pass through, so a stand
     /// with less disk than the sum of the inputs packs one at a time.
+    /// MiniMax-Music-3 text → music with vocals, from a `.cmf` packed
+    /// by `animate-pack --music-te/--music-dit/--music-vae`
+    Music {
+        /// Path to the packed .cmf
+        model: String,
+        /// Caption: style, instruments, mood, production
+        #[arg(long)]
+        prompt: String,
+        /// Lyrics, with [verse]/[chorus] section tags
+        #[arg(long, default_value = "")]
+        lyrics: String,
+        /// Seconds of audio to ask for; the model can stop earlier
+        #[arg(long, default_value_t = 10.0)]
+        seconds: f32,
+        /// Euler steps for the latent
+        #[arg(long, default_value_t = 8)]
+        steps: usize,
+        /// Same seed, same prompt → the same song
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Output .wav
+        #[arg(long, default_value = "music.wav")]
+        out: String,
+    },
     AnimatePack {
         /// Output .cmf path
         #[arg(long)]
@@ -1687,6 +1712,15 @@ async fn main() -> anyhow::Result<()> {
         Commands::ImaginePack { root, quant, out } => {
             imagepack::cmd_imagine_pack(&root, &quant, &out)
         }
+        Commands::Music {
+            model,
+            prompt,
+            lyrics,
+            seconds,
+            steps,
+            seed,
+            out,
+        } => music::cmd_music(&model, &prompt, &lyrics, seconds, steps, seed, &out),
         Commands::AnimatePack {
             out,
             carry,
