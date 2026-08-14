@@ -4566,6 +4566,18 @@ impl Pipeline {
                 .count();
             let have = o1_views.iter().filter(|v| v.is_some()).count();
             if want == 0 || have != want {
+                // The silent twin of the gpu-side o1 gates, found the
+                // same way: a 15x decode drop with an empty log. Views
+                // stay None until the layer's state SEALS, so `have`
+                // lagging `want` early in a run is the o1 design working
+                // — but it must say so, or the next reader spends a
+                // night proving the kernels innocent.
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::warn!(
+                        "o1 graph: {have} of {want} layers sealed — per-op until all seal"
+                    );
+                });
                 return None;
             }
         }
