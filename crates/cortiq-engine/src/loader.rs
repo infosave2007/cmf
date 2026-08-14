@@ -1082,10 +1082,18 @@ impl Pipeline {
 
         // KV window: the descriptor's max, capped for dev-box safety;
         // CMF_MAX_SEQ overrides the cap (long-context runs).
+        // 8192 was the silent quality cliff of the Qwen3.8 bring-up: at
+        // the cap the wgpu token graph declines, the host evicts half the
+        // KV, and a GDN hybrid's recurrent state goes stale — the model
+        // stays fluent and loses its mind (Django internals, a Turkish
+        // essay, an em-dash loop; one failure, three costumes). 32768
+        // covers every long-form run we actually ship while keeping the
+        // graph's device KV mirror affordable beside the weights;
+        // CMF_MAX_SEQ still overrides in either direction.
         let cap = std::env::var("CMF_MAX_SEQ")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8192);
+            .unwrap_or(32_768);
         let max_seq_len = arch.max_position_embeddings.min(cap);
 
         // Looped Transformer: total virtual layers = physical × num_loops.
