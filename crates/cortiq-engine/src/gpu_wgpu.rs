@@ -21870,12 +21870,21 @@ fn dit_qknorm_rope(@builtin(workgroup_id) wid: vec3<u32>,
         workgroupBarrier();
         st = st >> 1u;
     }
-    let inv = 1.0 / sqrt(qn_red[0] / f32(qn_p.hd) + qn_p.eps);
+    // eps < 0 is the rope-only sentinel: a model with no qk-norm
+    // (Music-3) still needs the rotation done here, because this pass
+    // is the only reason the packed panel ever came home. The branch is
+    // on a uniform, so the barriers around it stay legal.
+    var inv = 1.0;
+    if (qn_p.eps >= 0.0) {
+        inv = 1.0 / sqrt(qn_red[0] / f32(qn_p.hd) + qn_p.eps);
+    }
     workgroupBarrier();
     i = lid;
     loop {
         if (i >= qn_p.hd) { break; }
-        qn_buf[i] = qn_buf[i] * inv * qn_w[i];
+        if (qn_p.eps >= 0.0) {
+            qn_buf[i] = qn_buf[i] * inv * qn_w[i];
+        }
         i = i + 64u;
     }
     workgroupBarrier();
