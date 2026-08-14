@@ -1166,6 +1166,153 @@ kernel void dit_flash_attend(
 // matrix per high-res conv, which is the VAE's real wall. W is dense
 // f32 [oc, ic·k²]; K-tails zero-fill (ic·k² need not divide 32).
 // Output is a [hw, oc] panel; panel_to_nchw adds bias and transposes.
+// The 1D twin of `conv_mul_mm`, for the audio vocoder. Same tile
+// machinery; the only difference is the gather, which walks one axis
+// with a dilation instead of two with a fixed pad. It exists because
+// the host arm of this convolution is 42% of a Metal render of a
+// 95-second song — it builds a `ic·k × out_n` column buffer, transposes
+// it into a second buffer of equal size and multiplies that, three
+// passes over as much as 2.4 GB to consume a source `k` times smaller.
+// Nothing is materialized here.
+//
+// The output panel is [out_n, oc], which is already the layout the
+// caller's epilogue reads, so there is no transpose pass and the bias
+// stays where it was — on the host, added with the residual.
+kernel void conv1d_mul_mm(
+    device const float* wt    [[buffer(0)]],   // [oc, ic·k]
+    device const float* src   [[buffer(1)]],   // [ic, n]
+    device float*       y     [[buffer(2)]],   // [out_n, oc] panel
+    constant uint&      ick   [[buffer(3)]],   // ic·k
+    constant uint&      oc    [[buffer(4)]],
+    constant uint&      onl   [[buffer(5)]],   // out_n
+    constant uint&      nin   [[buffer(6)]],   // n
+    constant uint&      kk    [[buffer(7)]],   // kernel width
+    constant uint&      dil   [[buffer(8)]],
+    constant uint&      padl  [[buffer(9)]],
+    uint tiitg [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint2 tg  [[threadgroup_position_in_grid]])
+{
+    threadgroup char shmem[8192];
+    threadgroup half* sa = (threadgroup half*)shmem;
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+    const uint NK = 32u;
+    uint rows = oc;
+    uint nb = onl;
+    uint r0 = tg.y * 64u;
+    uint r1 = tg.x * 32u;
+    uint nr0 = min(rows - r0, 64u);
+    uint nr1 = min(nb - r1, 32u);
+    uint lr0 = min(tiitg / 2u, nr0 - 1u);
+    uint il0 = tiitg % 2u;
+    uint lr1 = min(tiitg / 4u, nr1 - 1u);
+    uint iy  = 8u * (tiitg % 4u);
+    uint pos = r1 + lr1;
+
+    device const float* wrow = wt + (ulong)(r0 + lr0) * ick + 16u * il0;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8u; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (uint k0 = 0; k0 < ick; k0 += NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint sy = (tiitg / 2u) / 8u;
+            uint lx = (tiitg / 2u) % 8u;
+            uint kb = k0 + 16u * il0;
+            float wv[16];
+            for (uint i = 0; i < 16u; ++i) {
+                wv[i] = kb + i < ick ? wrow[i] : 0.0f;
+            }
+            uint ib0 = 8u * (2u * il0) + sy;
+            uint ib1 = 8u * (2u * il0 + 1u) + sy;
+            for (uint i = 0; i < 8u; ++i) {
+                sa[64u * ib0 + 8u * i + lx] = (half)wv[i];
+                sa[64u * ib1 + 8u * i + lx] = (half)wv[i + 8u];
+            }
+        }
+        // X: eight taps along the one axis, zero outside the signal.
+        {
+            uint sx = tiitg % 4u;
+            uint sy = (tiitg / 4u) / 8u;
+            uint ly = (tiitg / 4u) % 8u;
+            uint ib = 4u * sx + sy;
+            threadgroup half* dst = sb + 64u * ib + 8u * ly;
+            for (uint i = 0; i < 8u; ++i) {
+                uint kki = k0 + iy + i;
+                float v = 0.0f;
+                if (kki < ick) {
+                    uint c = kki / kk;
+                    uint j = kki % kk;
+                    int sp = (int)pos + (int)(j * dil) - (int)padl;
+                    if (sp >= 0 && sp < (int)nin) {
+                        v = src[(ulong)c * nin + (ulong)sp];
+                    }
+                }
+                dst[i] = (half)v;
+            }
+        }
+        wrow += NK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < 4; ++ik) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; ++i) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, ulong2(0, 0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    // Verbatim from `conv_mul_mm`: a full tile stores straight to the
+    // panel, a ragged edge goes through threadgroup memory first.
+    if (r0 + 64u <= rows && r1 + 32u <= nb) {
+        device float* C = y + (r0 + 32u * (sgitg & 1u))
+            + (ulong)(r1 + 16u * (sgitg >> 1u)) * rows;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * (ulong)rows * (i / 4),
+                            rows, ulong2(0, 0), false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* temp_str = ((threadgroup float*)shmem)
+            + 32u * (sgitg & 1u) + (16u * (sgitg >> 1u)) * 64u;
+        for (short i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * 64 * (i / 4),
+                            64, ulong2(0, 0), false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (uint j = tiitg; j < nr1; j += 128u) {
+                device float* D = y + r0 + (ulong)(r1 + j) * rows;
+                threadgroup const float* Cr = ((threadgroup float*)shmem) + j * 64u;
+                for (uint i = 0; i < nr0; ++i) {
+                    D[i] = Cr[i];
+                }
+            }
+        }
+    }
+}
+
 kernel void conv_mul_mm(
     device const float* wt    [[buffer(0)]],   // [oc, ic·k²]
     device const float* img   [[buffer(1)]],   // [ic, h, w]
@@ -3935,6 +4082,7 @@ struct Ctx {
     smaxrows: ComputePipelineState,
     flashatt: ComputePipelineState,
     convmm: ComputePipelineState,
+    conv1dmm: ComputePipelineState,
     p2nchw: ComputePipelineState,
     gnred: ComputePipelineState,
     gnapp: ComputePipelineState,
@@ -4118,6 +4266,7 @@ fn init() -> Result<Ctx, String> {
     let smaxrows = pso("softmax_rows")?;
     let flashatt = pso("dit_flash_attend")?;
     let convmm = pso("conv_mul_mm")?;
+    let conv1dmm = pso("conv1d_mul_mm")?;
     let p2nchw = pso("panel_to_nchw")?;
     let gnred = pso("gn_reduce")?;
     let gnapp = pso("gn_apply")?;
@@ -4184,6 +4333,7 @@ fn init() -> Result<Ctx, String> {
         smaxrows,
         flashatt,
         convmm,
+        conv1dmm,
         p2nchw,
         gnred,
         gnapp,
@@ -6919,6 +7069,82 @@ fn encode_groupnorm(
         );
         enc.end_encoding();
     }
+}
+
+/// A 1D convolution as an implicit GEMM — the column matrix is never
+/// built, on the host or the device. `yt` comes back `[out_n x oc]`
+/// without the bias, which is the layout and the contract the wgpu twin
+/// uses, so the caller's epilogue is the same on both backends.
+///
+/// This is the largest single stage of a Metal render: the host arm was
+/// 2152 s of a 5090 s, 95-second song — 42% — because it materializes a
+/// `ic·k x out_n` column buffer, transposes it into a second buffer of
+/// equal size and multiplies that. The source it expands from is `k`
+/// times smaller than either.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_gemm(
+    x: &[f32],
+    w: &[f32],
+    ic: usize,
+    oc: usize,
+    n: usize,
+    k: usize,
+    pad: usize,
+    dil: usize,
+    out_n: usize,
+    yt: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let ick = ic * k;
+    if w.len() < oc * ick || x.len() < ic * n || yt.len() < out_n * oc || out_n == 0 {
+        return false;
+    }
+    // Below this the round trip costs more than the convolution.
+    if out_n * ick * oc < (1 << 22) {
+        return false;
+    }
+    let w_buf = cached_weight_buf(c, 36_000_000_137, w);
+    let x_buf = io_shared(c, 37_000_000_139 + x.len(), x.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(x.as_ptr(), x_buf.contents() as *mut f32, ic * n);
+    }
+    let y_buf = io_shared(c, 38_000_000_149 + out_n * oc, out_n * oc * 4);
+
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.conv1dmm);
+        enc.set_buffer(0, Some(&w_buf), 0);
+        enc.set_buffer(1, Some(&x_buf), 0);
+        enc.set_buffer(2, Some(&y_buf), 0);
+        let words = [
+            ick as u32,
+            oc as u32,
+            out_n as u32,
+            n as u32,
+            k as u32,
+            dil as u32,
+            pad as u32,
+        ];
+        for (i, wv) in words.iter().enumerate() {
+            enc.set_bytes(3 + i as u64, 4, wv as *const u32 as *const std::ffi::c_void);
+        }
+        enc.dispatch_thread_groups(
+            MTLSize::new((out_n as u64).div_ceil(32), (oc as u64).div_ceil(64), 1),
+            MTLSize::new(128, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            y_buf.contents() as *const f32,
+            yt.as_mut_ptr(),
+            out_n * oc,
+        );
+    }
+    tracing::debug!("gpu conv1d: {ic}x{oc} k={k} dil={dil} n={n} -> {out_n}");
+    true
 }
 
 /// VAE conv2d on the device (implicit GEMM — no im2col matrix). The

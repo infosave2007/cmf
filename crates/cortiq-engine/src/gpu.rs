@@ -1932,6 +1932,10 @@ pub fn conv1d_gemm(
     yt: &mut [f32],
 ) -> bool {
     match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => {
+            crate::gpu_metal::conv1d_gemm(x, w, ic, oc, n, k, pad, dil, out_n, yt)
+        }
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
         Backend::Wgpu => {
             crate::gpu_wgpu::conv1d_gemm(x, w, ic, oc, n, k, pad, dil, out_n, yt)
