@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The vocoder stopped losing to its own CPU fallback.** It was the
+  slowest stage of a `cortiq music` render and the one the GPU made
+  worse — 54.0 s with the device on against 30.2 s with it off. The
+  convolution was never the problem. `Conv1d::apply` built a column
+  buffer on the host, built a second buffer of equal size to transpose
+  it, and uploaded that: up to 2.37 GB of bus traffic for a 20-second
+  song, to send data already on the machine `k` times smaller. The new
+  `conv1d_gemm` uploads the input and expands the columns in a kernel,
+  writing the layout the GEMM wants directly. On a 3090 the vocoder
+  goes 54.0 s → 18.2 s and a whole render 151.4 s → 103.5 s, which is
+  the first time the device path beats the host one end to end.
+  Parity against the host arm on the same latent is 0.086% relative
+  RMS — f16 accumulation in the cooperative-matrix GEMM.
+
+### Changed
+
+- Every render now prints where its time went (`stages: denoise …s,
+  vocoder …s`) alongside the AR timer. Three optimizations in a row
+  had been argued about without this.
+- The AR's whole-token graph is opt-in behind `CMF_MUSIC3_GRAPH=1`. It
+  had been gated on a GPU check that the AR runs too early to see as
+  true, so it was never once attempted; with that removed and the graph
+  genuinely taking the token, it costs 136.7 s of AR against 47.8 s on
+  the host. A batch-1 matvec is too small an errand to amortise a
+  submit when the fallback has 256 cores to spread it over.
+
 ## [0.5.75] - 2026-08-14
 
 Two fixes to `cortiq music`, one that halves a render and one that
