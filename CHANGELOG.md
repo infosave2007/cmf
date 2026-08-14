@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.77] - 2026-08-14
+
+The Qwen3.8-27B bring-up release. The model's recommended sampling
+needs six knobs and `run` exposed two; the missing four — `--top-p`,
+`--top-k`, `--min-p` and a true additive `--presence-penalty` — are the
+difference between a 27B that writes a working Three.js aquarium in one
+shot and one that drifts into a Turkish essay at the same depth every
+time. And the depth itself had a reason: the KV cache's silent 8192
+default. At that boundary the token graph declines, the cache evicts
+half, and a GDN hybrid's device-resident state goes stale — fluent
+output, vanished mind. The default is 32768 now, the eviction warns
+loudly, and `CMF_MAX_SEQ` overrides both ways.
+
 ## [0.5.76] - 2026-08-14
 
 `cortiq music` got its GPU. A 3090's denoise dropped 1.75x and both
