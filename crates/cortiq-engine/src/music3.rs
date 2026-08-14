@@ -250,21 +250,39 @@ impl Music3Dit {
         out
     }
 
-    /// Split-half RoPE over the first `rot` dims of every head.
-    fn rope(&self, q: &mut [f32], k: &mut [f32], n: usize) {
+    /// Split-half RoPE over the first `rot` dims of every head, applied
+    /// in place on the PACKED `[n, 3·hidden]` panel — q at column 0, k
+    /// at column `hidden`, v untouched. The panel stays packed because
+    /// that is the layout the device's split kernel reads.
+    ///
+    /// Two things this does that the twin does not. The angle depends
+    /// only on the position, so `sin_cos` is hoisted out of the head
+    /// loop — it was being recomputed `heads` times for every one of
+    /// them. And tokens own disjoint rows, so the pool splits it.
+    fn rope_packed(&self, qkv: &mut [f32], n: usize) {
+        let (hs, nh, hd) = (self.hidden, self.heads, self.hd);
         let half = self.rot / 2;
-        for p in 0..n {
-            for h in 0..self.heads {
-                let off = p * self.heads * self.hd + h * self.hd;
+        let ptr = SendPtr(qkv.as_mut_ptr());
+        let work = |lo: usize, hi: usize| {
+            for p in lo..hi {
+                let base = p * 3 * hs;
                 for i in 0..half {
                     let (s, c) = (p as f32 * self.inv_freq[i]).sin_cos();
-                    for x in [&mut *q, &mut *k] {
-                        let (a, b) = (x[off + i], x[off + i + half]);
-                        x[off + i] = a * c - b * s;
-                        x[off + i + half] = a * s + b * c;
+                    for h in 0..nh {
+                        for off in [base + h * hd, base + hs + h * hd] {
+                            // SAFETY: token `p` owns this row of the panel.
+                            let x = unsafe { ptr.row(off, hd) };
+                            let (a, b) = (x[i], x[i + half]);
+                            x[i] = a * c - b * s;
+                            x[i + half] = a * s + b * c;
+                        }
                     }
                 }
             }
+        };
+        match self.pool.as_deref() {
+            Some(pl) => pl.run_rows(n, &work),
+            None => work(0, n),
         }
     }
 
@@ -279,17 +297,10 @@ impl Music3Dit {
         blk.qkv.matmat(&h, n, &mut qkv, pool);
         prof::add(&prof::QKV, _t);
         // to_qkv emits q|k|v concatenated along the FEATURE axis, so the
-        // three live at column offsets, not row offsets.
-        let mut q = vec![0f32; n * hs];
-        let mut k = vec![0f32; n * hs];
-        let mut v = vec![0f32; n * hs];
-        for p in 0..n {
-            let s = &qkv[p * 3 * hs..(p + 1) * 3 * hs];
-            q[p * hs..(p + 1) * hs].copy_from_slice(&s[..hs]);
-            k[p * hs..(p + 1) * hs].copy_from_slice(&s[hs..2 * hs]);
-            v[p * hs..(p + 1) * hs].copy_from_slice(&s[2 * hs..]);
-        }
-        self.rope(&mut q, &mut k, n);
+        // three live at column offsets, not row offsets — which is
+        // exactly the packed layout the device's split kernel reads
+        // (`mode 0`). Rope goes on in place; nothing is unpacked here.
+        self.rope_packed(&mut qkv, n);
         let scale = 1.0 / (hd as f32).sqrt();
         let mut attn = vec![0f32; n * hs];
         let _ta = prof::start();
@@ -299,19 +310,8 @@ impl Music3Dit {
         // engine's kernel wants HEAD-major panels where the projections
         // leave them token-major, and three transposes of n x hs are
         // noise against n^2 work.
-        if crate::gpu::enabled_here() {
-            let mut qh = vec![0f32; n * hs];
-            let mut kh = vec![0f32; n * hs];
-            let mut vh = vec![0f32; n * hs];
-            for h in 0..nh {
-                for i in 0..n {
-                    let (s, d) = (i * hs + h * hd, (h * n + i) * hd);
-                    qh[d..d + hd].copy_from_slice(&q[s..s + hd]);
-                    kh[d..d + hd].copy_from_slice(&k[s..s + hd]);
-                    vh[d..d + hd].copy_from_slice(&v[s..s + hd]);
-                }
-            }
-            if crate::gpu::dit_attention(&qh, &kh, &vh, nh, nh, n, hd, scale, &mut attn) {
+        {
+            if crate::gpu::dit_attention_packed(&qkv, nh, n, hd, scale, None, &mut attn) {
                 prof::add(&prof::ATTN, _ta);
                 let mut proj = vec![0f32; n * hs];
                 let _t = prof::start();
@@ -323,6 +323,17 @@ impl Music3Dit {
                 return self.block_ffn(blk, x, n);
             }
             attn.fill(0.0);
+        }
+        // Only the host arm needs the three panels apart, so it unpacks
+        // them here — the device path above never pays for this.
+        let mut q = vec![0f32; n * hs];
+        let mut k = vec![0f32; n * hs];
+        let mut v = vec![0f32; n * hs];
+        for p in 0..n {
+            let s = &qkv[p * 3 * hs..(p + 1) * 3 * hs];
+            q[p * hs..(p + 1) * hs].copy_from_slice(&s[..hs]);
+            k[p * hs..(p + 1) * hs].copy_from_slice(&s[hs..2 * hs]);
+            v[p * hs..(p + 1) * hs].copy_from_slice(&s[2 * hs..]);
         }
         // Heads are independent and write disjoint columns, so the host
         // arm splits without a lock.
