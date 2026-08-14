@@ -159,7 +159,10 @@ def main():
         # rather than the file.
         url = a.url if a.url != FULL else TEXT_ENCODER
         hdr, _ = header(url)
-        names = sorted(k for k in hdr if k.startswith("visual."))
+        # A standalone export keeps the tower at `visual.*`; a stock
+        # transformers checkpoint nests it as `model.visual.*`. The
+        # packer accepts either prefix, so fetch either.
+        names = sorted(k for k in hdr if k.startswith(("visual.", "model.visual.")))
         if not names:
             raise SystemExit(f"{url}: no visual.* tensors")
         print(f"{len(names)} tensors", file=sys.stderr)

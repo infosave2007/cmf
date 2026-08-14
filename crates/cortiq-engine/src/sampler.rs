@@ -19,6 +19,8 @@ pub struct SplitMix64 {
 pub struct SamplerScratch {
     seen_epoch: Vec<u32>,
     epoch: u32,
+    /// Distinct-token set for the presence penalty; reused per token.
+    presence_seen: std::collections::HashSet<u32>,
     /// The working copy of the logits. At a 129k vocab that is half a
     /// megabyte allocated, filled and dropped per token; the struct that
     /// exists to hold scratch may as well hold this one too.
@@ -84,6 +86,12 @@ pub struct SamplerConfig {
     pub top_k: u32,
     pub repetition_penalty: f32,
     pub min_p: f32,
+    /// Flat additive penalty on every token that has appeared at least
+    /// once (OpenAI-style presence penalty). Qwen3.8's instruct sampling
+    /// asks for 1.5 here — the multiplicative repetition_penalty is a
+    /// different curve and cannot stand in for it.
+    #[serde(default)]
+    pub presence_penalty: f32,
     /// Fixed seed for reproducible generation (None = entropy).
     #[serde(default)]
     pub seed: Option<u64>,
@@ -99,6 +107,7 @@ impl Default for SamplerConfig {
             top_p: 0.9,
             top_k: 40,
             repetition_penalty: 1.1,
+            presence_penalty: 0.0,
             min_p: 0.05,
             seed: None,
             suppress_tokens: Vec::new(),
@@ -128,6 +137,7 @@ pub fn sample_with_scratch(
 ) -> u32 {
     if config.temperature < 1e-6
         && config.repetition_penalty == 1.0
+        && config.presence_penalty == 0.0
         && config.suppress_tokens.is_empty()
     {
         return argmax(logits);
@@ -149,6 +159,21 @@ pub fn sample_with_scratch(
 
     if config.repetition_penalty != 1.0 {
         apply_repetition_penalty(&mut probs, past_tokens, config.repetition_penalty, scratch);
+    }
+    if config.presence_penalty != 0.0 {
+        // Once per DISTINCT seen token — presence, not frequency. The
+        // scratch set the repetition penalty uses would serve, but it is
+        // only built on its own branch; a local pass stays correct when
+        // rep-penalty is 1.0 (Qwen3.8's recommended pairing).
+        let mut seen = std::mem::take(&mut scratch.presence_seen);
+        seen.clear();
+        seen.extend(past_tokens.iter().copied());
+        for &tok in &seen {
+            if (tok as usize) < probs.len() {
+                probs[tok as usize] -= config.presence_penalty;
+            }
+        }
+        scratch.presence_seen = seen;
     }
 
     let mut done = |probs: Vec<f32>, tok: u32| -> u32 {
