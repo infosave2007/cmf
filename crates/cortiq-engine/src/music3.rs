@@ -290,11 +290,36 @@ impl Music3Dit {
         self.rope(&mut q, &mut k, n);
         let scale = 1.0 / (hd as f32).sqrt();
         let mut attn = vec![0f32; n * hs];
-        // Attention here is quadratic in the sequence and the DiT runs
-        // 36 of them per step; at 431 latent frames this loop WAS the
-        // denoise, on one core, while the GEMMs around it were already
-        // threaded. Heads are independent and write disjoint columns, so
-        // they parallelize without a lock.
+        // The device first. This is the quadratic part and the reason a
+        // CPU-only run was beating a GPU one: everything around it went
+        // to the card and the biggest single stage stayed home. The
+        // engine's kernel wants HEAD-major panels where the projections
+        // leave them token-major, and three transposes of n x hs are
+        // noise against n^2 work.
+        if crate::gpu::enabled_here() {
+            let mut qh = vec![0f32; n * hs];
+            let mut kh = vec![0f32; n * hs];
+            let mut vh = vec![0f32; n * hs];
+            for h in 0..nh {
+                for i in 0..n {
+                    let (s, d) = (i * hs + h * hd, (h * n + i) * hd);
+                    qh[d..d + hd].copy_from_slice(&q[s..s + hd]);
+                    kh[d..d + hd].copy_from_slice(&k[s..s + hd]);
+                    vh[d..d + hd].copy_from_slice(&v[s..s + hd]);
+                }
+            }
+            if crate::gpu::dit_attention(&qh, &kh, &vh, nh, nh, n, hd, scale, &mut attn) {
+                let mut proj = vec![0f32; n * hs];
+                blk.out.matmat(&attn, n, &mut proj, pool);
+                for (a, b) in x.iter_mut().zip(&proj) {
+                    *a += b;
+                }
+                return self.block_ffn(blk, x, n);
+            }
+            attn.fill(0.0);
+        }
+        // Heads are independent and write disjoint columns, so the host
+        // arm splits without a lock.
         {
             let ptr = SendPtr(attn.as_mut_ptr());
             let work = |lo: usize, hi: usize| {
@@ -336,7 +361,13 @@ impl Music3Dit {
         for (a, b) in x.iter_mut().zip(&proj) {
             *a += b;
         }
+        self.block_ffn(blk, x, n)
+    }
 
+    /// The second half of a block: norm, GEGLU, residual.
+    fn block_ffn(&self, blk: &Block, x: &mut [f32], n: usize) {
+        let hs = self.hidden;
+        let pool = self.pool.as_deref();
         let mut h = x.to_vec();
         blk.ff_norm.apply(&mut h, hs);
         let mut gu = vec![0f32; n * 2 * self.inter];
@@ -762,12 +793,27 @@ impl ArBlock {
     }
 }
 
-/// Keys and values for one layer, one CFG branch: `[pos][nkv·hd]`.
+/// Keys and values for one layer, one CFG branch.
+///
+/// Per HEAD, because that is the shape the token graph mirrors from:
+/// it uploads `cpu_k[h][synced..position]` into its device cache each
+/// step. A flat `[pos][nkv·hd]` buffer would have to be transposed on
+/// every token to hand it over.
 #[derive(Default, Clone)]
 struct KvRun {
-    k: Vec<f32>,
-    v: Vec<f32>,
+    k: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
     len: usize,
+}
+
+impl KvRun {
+    fn init(nkv: usize) -> Self {
+        Self {
+            k: vec![Vec::new(); nkv],
+            v: vec![Vec::new(); nkv],
+            len: 0,
+        }
+    }
 }
 
 /// Deterministic top-k sampler.
@@ -893,6 +939,123 @@ impl Music3Ar {
         out
     }
 
+    /// One decode position through the WHOLE stack in a single device
+    /// submission, per CFG branch.
+    ///
+    /// The op-by-op path spends ~9 µs of arithmetic behind each of five
+    /// dispatches a layer — 360 round trips a token — and the card idles
+    /// between them however cheap the trip is. `forward_token_graph`
+    /// already solves exactly this for text models: it keeps K/V on the
+    /// device per `(kv_id, layer)`, mirrors the newly appended positions
+    /// from the host cache, and folds the final norm and lm_head into
+    /// the same submit. Qwen3 is its native shape, q/k norms included,
+    /// so no kernel is new here — only the wiring.
+    ///
+    /// Returns the logits per branch when the graph took the token.
+    #[allow(clippy::type_complexity)]
+    fn graph_step(
+        &self,
+        x: &mut [f32],
+        pos: usize,
+        cap: usize,
+        cache: &mut [Vec<KvRun>],
+        logits: &mut [Vec<f32>; 2],
+    ) -> bool {
+        let hs = self.hidden;
+        let Some((model, _)) = self.blocks.first().and_then(|b| b.q.graph_w()) else {
+            return false;
+        };
+        let model = model.clone();
+        let Some((_, lm)) = self.lm_head.graph_w() else {
+            return false;
+        };
+        let lm_rows = self.lm_head_rows();
+        let mut staged: [(Vec<f32>, Vec<f32>); 2] = Default::default();
+        for bi in 0..2 {
+            let mut layers: Vec<crate::gpu::GraphLayer> = Vec::with_capacity(self.blocks.len());
+            for (li, blk) in self.blocks.iter().enumerate() {
+                let (Some((_, wq)), Some((_, wk)), Some((_, wv)), Some((_, wo))) = (
+                    blk.q.graph_w(),
+                    blk.k.graph_w(),
+                    blk.v.graph_w(),
+                    blk.o.graph_w(),
+                ) else {
+                    return false;
+                };
+                let (Some((_, g)), Some((_, u)), Some((_, d))) = (
+                    blk.gate.graph_w(),
+                    blk.up.graph_w(),
+                    blk.down.graph_w(),
+                ) else {
+                    return false;
+                };
+                layers.push(crate::gpu::GraphLayer {
+                    input_norm: &blk.n1.w,
+                    attn: crate::gpu::GraphAttn::Full {
+                        wq,
+                        wk,
+                        wv,
+                        wo,
+                        q_norm: Some(&blk.qn.w),
+                        k_norm: Some(&blk.kn.w),
+                        bias: None,
+                        output_gate: false,
+                        cpu_k: &cache[li][bi].k,
+                        cpu_v: &cache[li][bi].v,
+                    },
+                    post_norm: &blk.n2.w,
+                    ffn: crate::gpu::GraphFfn::Dense {
+                        gate: g,
+                        up: u,
+                        down: d,
+                    },
+                });
+            }
+            let mut h = x[bi * hs..(bi + 1) * hs].to_vec();
+            let mut out = Vec::new();
+            let ok = crate::gpu::forward_token_graph(
+                &model,
+                bi as u64,
+                &layers,
+                &[],
+                0,
+                &self.inv_freq,
+                &mut h,
+                self.nh,
+                self.nkv,
+                self.hd,
+                self.hd,
+                hs,
+                self.inter,
+                pos,
+                cap,
+                false,
+                1e-6,
+                Some((&lm, lm_rows)),
+                &self.norm.w,
+                &mut out,
+                &[],
+                1,
+                None,
+                None,
+                None,
+                0,
+            );
+            if !ok || out.len() < lm_rows {
+                return false;
+            }
+            staged[bi] = (h, out);
+        }
+        // Both branches or neither: a half-applied token would leave the
+        // two CFG streams a position apart, which reads as the model
+        // losing the plot rather than as an error.
+        for (bi, (h, out)) in staged.into_iter().enumerate() {
+            x[bi * hs..(bi + 1) * hs].copy_from_slice(&h);
+            logits[bi] = out;
+        }
+        true
+    }
+
     /// Run one position through every block, appending to the cache.
     /// `x` is `[b, hidden]` for the CFG pair; returns the normed hidden.
     fn step_blocks(&self, x: &mut [f32], b: usize, pos: usize, cache: &mut [Vec<KvRun>]) {
@@ -926,8 +1089,10 @@ impl Music3Ar {
             let per_kv = nh / nkv;
             for bi in 0..b {
                 let run = &mut cache[li][bi];
-                run.k.extend_from_slice(&k[bi * kvw..(bi + 1) * kvw]);
-                run.v.extend_from_slice(&v[bi * kvw..(bi + 1) * kvw]);
+                for g in 0..nkv {
+                    run.k[g].extend_from_slice(&k[bi * kvw + g * hd..bi * kvw + (g + 1) * hd]);
+                    run.v[g].extend_from_slice(&v[bi * kvw + g * hd..bi * kvw + (g + 1) * hd]);
+                }
                 run.len += 1;
                 let n = run.len;
                 let scale = 1.0 / (hd as f32).sqrt();
@@ -937,7 +1102,7 @@ impl Music3Ar {
                     let mut sc = vec![0f32; n];
                     let mut mx = f32::NEG_INFINITY;
                     for (j, s) in sc.iter_mut().enumerate() {
-                        let kj = &run.k[j * kvw + g * hd..j * kvw + g * hd + hd];
+                        let kj = &run.k[g][j * hd..(j + 1) * hd];
                         *s = qi.iter().zip(kj).map(|(a, c)| a * c).sum::<f32>() * scale;
                         mx = mx.max(*s);
                     }
@@ -950,7 +1115,7 @@ impl Music3Ar {
                     let dst = &mut attn[bi * nh * hd + hh * hd..bi * nh * hd + hh * hd + hd];
                     for (j, &s) in sc.iter().enumerate() {
                         let w = s * inv;
-                        let vj = &run.v[j * kvw + g * hd..j * kvw + g * hd + hd];
+                        let vj = &run.v[g][j * hd..(j + 1) * hd];
                         for (d, &vv) in dst.iter_mut().zip(vj) {
                             *d += w * vv;
                         }
@@ -995,7 +1160,7 @@ impl Music3Ar {
         let pool = self.pool.as_deref();
         let want = frames.min(self.max_frames);
         let mut cache: Vec<Vec<KvRun>> = (0..self.blocks.len())
-            .map(|_| vec![KvRun::default(); 2])
+            .map(|_| vec![KvRun::init(self.nkv); 2])
             .collect();
         // The unconditioned branch keeps the frame but not the words.
         let mut uncond = prompt_ids.to_vec();
@@ -1005,11 +1170,41 @@ impl Music3Ar {
                 *t = tokens::AUDIO_CFG;
             }
         }
+        let cap = prompt_ids.len() + want + 2;
+        // One path for the whole generation. The graph keeps K/V on the
+        // device and the host loop keeps it here; alternating between
+        // them mid-song would leave the two caches disagreeing.
+        // Opt-in, not opt-out. Measured on a 3090 next to a 256-core EPYC:
+        // the whole-token graph costs 136.7 s of AR against 47.8 s host,
+        // 2.9x SLOWER. The AR is batch-1/2 matvec, so every layer is a
+        // bandwidth errand too small to amortise a submit, while the host
+        // arm has 256 cores to spread it over. The graph is the right
+        // shape for a thin CPU; it is the wrong one here, so it ships off.
+        // (Gating this on `enabled_here()` was also wrong — the AR runs
+        // before the backend is up, so that read false and the graph was
+        // never once attempted. Keep it un-gated so the A/B stays honest.)
+        let mut graph = std::env::var("CMF_MUSIC3_GRAPH").as_deref() == Ok("1");
+        let mut glogits: [Vec<f32>; 2] = Default::default();
         let mut last = vec![0f32; 2 * hs];
         for (pos, (&a, &b)) in prompt_ids.iter().zip(&uncond).enumerate() {
             let mut x = vec![0f32; 2 * hs];
             x[..hs].copy_from_slice(&Self::embed_row(&self.embed_prefill, a as usize, hs));
             x[hs..].copy_from_slice(&Self::embed_row(&self.embed_prefill, b as usize, hs));
+            if graph {
+                if self.graph_step(&mut x, pos, cap, &mut cache, &mut glogits) {
+                    last = x;
+                    if pos % 64 == 0 {
+                        progress(0, want);
+                    }
+                    continue;
+                }
+                // Refused on the first token: nothing has been committed,
+                // so the host arm starts clean from position 0.
+                if pos > 0 {
+                    return Err("the token graph refused mid-prefill".into());
+                }
+                graph = false;
+            }
             self.step_blocks(&mut x, 2, pos, &mut cache);
             last = x;
             if pos % 64 == 0 {
@@ -1024,10 +1219,17 @@ impl Music3Ar {
             let mut normed = last.clone();
             self.norm.apply(&mut normed, hs);
             // c0 with classifier-free guidance and a top-k mask taken
-            // from the CONDITIONED logits, per the reference.
-            let mut logits = vec![0f32; 2 * self.lm_head_rows()];
-            self.lm_head.matmat(&normed, 2, &mut logits, pool);
+            // from the CONDITIONED logits, per the reference. The graph
+            // folds the final norm and lm_head into its own submit, so
+            // when it is driving the logits are already here.
             let vocab = self.lm_head_rows();
+            let mut logits = vec![0f32; 2 * vocab];
+            if graph {
+                logits[..vocab].copy_from_slice(&glogits[0][..vocab]);
+                logits[vocab..].copy_from_slice(&glogits[1][..vocab]);
+            } else {
+                self.lm_head.matmat(&normed, 2, &mut logits, pool);
+            }
             let (cond, unc) = logits.split_at(vocab);
             let mut thr: Vec<f32> = cond.to_vec();
             thr.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
@@ -1086,7 +1288,13 @@ impl Music3Ar {
             let mut x = vec![0f32; 2 * hs];
             x[..hs].copy_from_slice(&fb);
             x[hs..].copy_from_slice(&fb);
-            self.step_blocks(&mut x, 2, prompt_ids.len() + frame, &mut cache);
+            let pos = prompt_ids.len() + frame;
+            if !graph || !self.graph_step(&mut x, pos, cap, &mut cache, &mut glogits) {
+                if graph {
+                    return Err("the token graph refused mid-song".into());
+                }
+                self.step_blocks(&mut x, 2, pos, &mut cache);
+            }
             last = x;
         }
         if done == 0 {

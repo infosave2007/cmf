@@ -83,7 +83,8 @@ pub fn cmd_music(
             }
         })
         .map_err(|e| anyhow!("{e}"))?;
-    eprintln!("\n  ar done: {got} frames ({:.1}s)", t0.elapsed().as_secs_f32());
+    let t_ar = t0.elapsed().as_secs_f32();
+    eprintln!("\n  ar done: {got} frames ({t_ar:.1}s)");
 
     let dit = Music3Dit::from_cmf(&model).map_err(|e| anyhow!("DiT: {e}"))?;
     let (cond, n) = dit.aligned_condition(&hidden, got);
@@ -108,11 +109,17 @@ pub fn cmd_music(
     });
     eprintln!();
 
+    let t_dn = t0.elapsed().as_secs_f32();
     let dav = Music3Dav::from_cmf(&model).map_err(|e| anyhow!("vocoder: {e}"))?;
     // The vocoder is 30 convolutions over 512x the latent length; giving
     // it the pool is the difference between seconds and minutes.
     let pool = cortiq_engine::pool::Pool::from_env();
     let pcm = dav.decode(&latent, n, pool.as_deref());
+    eprintln!(
+        "  stages: denoise {:.1}s, vocoder {:.1}s",
+        t_dn - t_ar,
+        t0.elapsed().as_secs_f32() - t_dn
+    );
     let samples = pcm.len() / 2;
     // `wav_bytes` wants planar; the vocoder hands back interleaved.
     let mut planar = vec![0f32; pcm.len()];
