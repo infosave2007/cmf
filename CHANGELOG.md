@@ -7,7 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.76] - 2026-08-14
+
+`cortiq music` got its GPU. A 3090's denoise dropped 1.75x and both
+vocoders dropped ~3-4.7x, and not one of those seconds came from a
+faster kernel — the q4tp GEMM was measured at ~5 TFLOP/s all along.
+The engine was spending its time on the bus: column matrices built,
+transposed and shipped when the source was `k` times smaller, 45 MB
+readbacks between projections that ran back to back on the same card.
+This release deletes the traffic instead of racing it, and ships the
+instruments that told the truth after four wall-clock A/Bs had lied —
+per-call arm comparison, kernel-vs-readback split, per-stage render
+timers.
+
 ### Fixed
+
+- **The DiT block now runs resident on the card, both halves.** The
+  attention half goes through the engine's fused qkv → RoPE →
+  attention → out-projection chain with ONE readback at the end;
+  Music-3 could not call it before because that path unconditionally
+  applied a qk-norm this model does not have, and `eps < 0` is now the
+  rope-only sentinel. The FFN half keeps `ff_in`'s result on the
+  device, runs the GLU where that result lives, and lets `ff_out` read
+  it in place — 68 MB of traffic per block-step becomes 11. Measured in
+  one clock-stable window against the full host chain, same seed:
+  denoise 50.1 s → 28.6 s, parity 0.105% RMS, worst sample 26 of 32767.
+  `CMF_MUSIC3_DEVATT=0` / `CMF_MUSIC3_DEVFFN=0` restore the host arms
+  independently.
 
 - **The DiT's FFN stopped shipping its activations across the bus.**
   A split timer (`CMF_MM_SPLIT=1`) put the q4tp GEMM at ~5 TFLOP/s and
@@ -60,6 +86,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   genuinely taking the token, it costs 136.7 s of AR against 47.8 s on
   the host. A batch-1 matvec is too small an errand to amortise a
   submit when the fallback has 256 cores to spread it over.
+- The f32 cooperative GEMM stages its K tiles double-buffered — one
+  barrier per K step instead of two — and reads its operands as vec4.
+  Parity-clean at every shape including ragged tiles; measured within
+  noise on the stand it was written on BECAUSE transfers dominated
+  there, kept for the machines where they do not.
+
+### Diagnostics
+
+The reason this release's numbers can be believed, and the previous
+attempts' could not. `CMF_MM_AB=1` runs both matmat arms back to back
+on the same activations inside one call and reports their ratio per
+shape with the worst output disagreement alongside — wall-clock A/B on
+a shared stand had read 2.4x, 1.0x and 1.0x for the same change.
+`CMF_MM_SPLIT=1` times the kernel and its readback separately (that is
+what convicted the bus), `CMF_RB_TRACE=1` splits a readback into
+DMA+fence vs mapped-memory copy, `CMF_MUSIC3_PROF=1` splits a denoise
+step four ways, and a roofline test reports the coop GEMM in GFLOP/s
+on the DiT's own shapes. One stand-level finding worth repeating: a
+virtualized card can sit at P8 / 210 MHz in the middle of a render —
+bursty submits never wake the driver's DVFS, a process lands in a fast
+or slow clock state and stays there, and every whole-process wall-clock
+number taken without pinning the clocks carries up to 7x of that.
 
 ## [0.5.75] - 2026-08-14
 
