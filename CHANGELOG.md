@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The DiT's FFN stopped shipping its activations across the bus.**
+  A split timer (`CMF_MM_SPLIT=1`) put the q4tp GEMM at ~5 TFLOP/s and
+  the readback around it at 82% of the device arm's time — every
+  earlier "the GPU barely wins" number was nine parts PCIe to one part
+  math. The FFN chain now runs resident: ff_in keeps its result on the
+  card, the GLU runs there, ff_out reads it in place, and 68 MB of
+  traffic per block-step becomes 11. Measured on a 3090: ffn
+  29.1 s → 17.3 s, denoise 50.0 s → 35.2 s, parity 0.10% RMS.
+  `CMF_MUSIC3_DEVFFN=0` restores the host chain.
+
 - **The same convolution on Metal, where it was 42% of a render.** The
   wgpu backend stopped shipping the column matrix across the bus; Metal
   kept building it, and on a Mac that made the vocoder the most
