@@ -292,6 +292,60 @@ impl Music3Dit {
         let pool = self.pool.as_deref();
         let mut h = x.to_vec();
         blk.pre_norm.apply(&mut h, hs);
+        // The whole attention half on the card first: qkv GEMM, rope,
+        // attention and the out projection with one readback at the end.
+        // The unfused arm below reads the qkv panel back (17 MB), ships
+        // it up again for the attention, and round-trips the attention
+        // output through the out GEMM — ~45 MB a block-step on a stand
+        // whose split timer put transfers at 82% of the device arm.
+        // eps = -1 is the rope-only sentinel: this model has no qk-norm.
+        // CMF_MUSIC3_DEVATT=0 kills it; the host chain is bit-for-bit
+        // the same math.
+        if std::env::var("CMF_MUSIC3_DEVATT").as_deref() != Ok("0") {
+            if let (Some((m1, i1)), Some((m2, i2))) = (
+                match &blk.qkv {
+                    crate::dit::Proj::Q(q) => q.q4tp_mapped(),
+                    _ => None,
+                },
+                match &blk.out {
+                    crate::dit::Proj::Q(q) => q.q4tp_mapped(),
+                    _ => None,
+                },
+            ) {
+                if std::sync::Arc::ptr_eq(m1, m2) {
+                    let half = self.rot / 2;
+                    let mut ang = vec![0f32; n * half];
+                    for p in 0..n {
+                        for (i, f) in self.inv_freq[..half].iter().enumerate() {
+                            ang[p * half + i] = p as f32 * f;
+                        }
+                    }
+                    let ones = vec![1.0f32; hd];
+                    let scale = 1.0 / (hd as f32).sqrt();
+                    let mut proj = vec![0f32; n * hs];
+                    let _ta = prof::start();
+                    if crate::gpu::dit_qkv_attn_out(
+                        m1,
+                        i1,
+                        i2,
+                        &h,
+                        n,
+                        hs,
+                        nh,
+                        hd,
+                        scale,
+                        (&ang, &ones, &ones, -1.0),
+                        &mut proj,
+                    ) {
+                        prof::add(&prof::ATTN, _ta);
+                        for (a, b) in x.iter_mut().zip(&proj) {
+                            *a += b;
+                        }
+                        return self.block_ffn(blk, x, n);
+                    }
+                }
+            }
+        }
         let mut qkv = vec![0f32; n * 3 * hs];
         let _t = prof::start();
         blk.qkv.matmat(&h, n, &mut qkv, pool);
