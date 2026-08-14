@@ -148,6 +148,87 @@ impl Conv1d {
             && crate::gpu::enabled_here()
         {
             let kk = self.in_ch * self.k;
+            // First ask the device to expand the columns itself. That is
+            // strictly less work than the host arm below: `x` is k times
+            // smaller than the column buffer, the transposed copy is not
+            // built at all, and the tiling the 2 GiB binding limit forces
+            // happens without a host allocation per tile. The host arm
+            // stays for the backends and shapes the kernel refuses.
+            {
+                let mut yt = vec![0f32; out_n * self.out_ch];
+                if crate::gpu::conv1d_gemm(
+                    x,
+                    &self.w,
+                    self.in_ch,
+                    self.out_ch,
+                    n,
+                    self.k,
+                    self.pad,
+                    self.dilation,
+                    out_n,
+                    &mut yt,
+                ) {
+                    for o in 0..self.out_ch {
+                        let bias = self.b.as_ref().map_or(0.0, |b| b[o]);
+                        // SAFETY: single-threaded here.
+                        let dst = unsafe { ptr.row(o * out_n, out_n) };
+                        for (t, d) in dst.iter_mut().enumerate() {
+                            *d = yt[t * self.out_ch + o] + bias;
+                        }
+                    }
+                    return out;
+                }
+            }
+            // The column buffer is kk x out_n floats and out_n is the
+            // AUDIO length, so it grows with the song: 20 s through this
+            // decoder's last stage wants 2.37 GB and Vulkan refuses a
+            // binding over 2 GiB — `Buffer binding range 2147483648
+            // exceeds limit 2147483644`, which is what a 20-second render
+            // died on. Tile the time axis so one pass always fits, and
+            // keep the device arm instead of falling back to the host for
+            // exactly the lengths that need it most.
+            const MAX_COL_FLOATS: usize = 96 << 20; // 384 MB a tile
+            let span = (MAX_COL_FLOATS / kk.max(1)).max(1).min(out_n);
+            if span < out_n {
+                let mut done = 0usize;
+                while done < out_n {
+                    let w = span.min(out_n - done);
+                    // Build the window with its zeros already in it, so
+                    // the sub-convolution runs at pad = 0 and both edges
+                    // are right by construction: a tile that clamped its
+                    // input instead would lose the right-hand padding the
+                    // untiled path applies, and the tail would be short.
+                    let need = w + self.dilation * (self.k - 1);
+                    let mut sub = vec![0f32; self.in_ch * need];
+                    for i in 0..self.in_ch {
+                        let src = &x[i * n..(i + 1) * n];
+                        let dst = &mut sub[i * need..(i + 1) * need];
+                        for (u, d) in dst.iter_mut().enumerate() {
+                            let p = (done + u) as isize - self.pad as isize;
+                            if p >= 0 && (p as usize) < n {
+                                *d = src[p as usize];
+                            }
+                        }
+                    }
+                    let piece = Self {
+                        w: self.w.clone(),
+                        b: self.b.clone(),
+                        out_ch: self.out_ch,
+                        in_ch: self.in_ch,
+                        k: self.k,
+                        pad: 0,
+                        dilation: self.dilation,
+                    }
+                    .apply(&sub, need, pool);
+                    for o in 0..self.out_ch {
+                        // SAFETY: single-threaded here.
+                        let dst = unsafe { ptr.row(o * out_n + done, w) };
+                        dst.copy_from_slice(&piece[o * w..(o + 1) * w]);
+                    }
+                    done += w;
+                }
+                return out;
+            }
             if let Some(col_len) = kk.checked_mul(out_n) {
                 let mut col = vec![0f32; col_len];
                 let pc = SendPtr(col.as_mut_ptr());

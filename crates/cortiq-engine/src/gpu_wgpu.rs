@@ -10408,6 +10408,7 @@ struct Ctx {
     /// Interleaved qkv → head-major q/k/v, on the device.
     dit_qkv_split: Option<wgpu::ComputePipeline>,
     vae_im2col: Option<wgpu::ComputePipeline>,
+    conv1d_im2col: Option<wgpu::ComputePipeline>,
     /// v [h][n][hd] → [h][hd][n], so PV is an NT product.
     dit_v_transpose: Option<wgpu::ComputePipeline>,
     /// qk-norm + RoPE + head-major scatter, one of q/k per dispatch.
@@ -11436,6 +11437,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let act_absmax = mk_coop(COOP_AMAX_SRC, "act-absmax", "act_absmax");
     let dit_qkv_split = mk_coop(DIT_SPLIT_SRC, "dit-split", "dit_qkv_split");
     let vae_im2col = mk_coop(VAE_IM2COL_SRC, "vae-im2col", "vae_im2col");
+    let conv1d_im2col = mk_coop(CONV1D_IM2COL_SRC, "conv1d-im2col", "conv1d_im2col");
     let dit_v_transpose = mk_coop(DIT_VT_SRC, "dit-vt", "dit_v_transpose");
     let dit_qknorm = mk_coop(DIT_QKNORM_SRC, "dit-qknorm", "dit_qknorm_rope");
     let dit_gemm_coop = (q4tp_mm_coop.is_some())
@@ -11807,6 +11809,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         dit_gemm_coop,
         dit_qkv_split,
         vae_im2col,
+        conv1d_im2col,
         dit_v_transpose,
         dit_qknorm,
         act_amax_part,
@@ -21812,6 +21815,37 @@ fn dit_v_transpose(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+const CONV1D_IM2COL_SRC: &str = r#"
+// The 1D twin of `vae_im2col`, and it writes the TRANSPOSED layout the
+// NT GEMM wants directly: col[t·(ic·k) + (i·k + j)] = x[i, t + j·dil - pad].
+// The host arm built this buffer, then built a second one to transpose
+// it, then uploaded the result — three passes over as much as 2.37 GB
+// for a 20-second song, when the source `x` is k times smaller. Here
+// only `x` crosses the bus and the columns are expanded where they are
+// consumed. `p0`/`tile` slice the time axis so one binding stays under
+// Vulkan's 2 GiB, which is the limit a 20-second render died on.
+struct C1P { ic: u32, n: u32, k: u32, dil: u32, pad: u32, p0: u32, tile: u32, _a: u32 };
+@group(0) @binding(0) var<storage, read>       c1_x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> c1_col: array<f32>;
+@group(0) @binding(2) var<uniform>             c1p: C1P;
+
+@compute @workgroup_size(256)
+fn conv1d_im2col(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let kdim = c1p.ic * c1p.k;
+    let total = c1p.tile * kdim;
+    let idx = gid.y * (65535u * 256u) + gid.x;
+    if (idx >= total) { return; }
+    let t = idx / kdim;
+    let r = idx - t * kdim;
+    let i = r / c1p.k;
+    let j = r - i * c1p.k;
+    let p = i32(c1p.p0 + t) + i32(j * c1p.dil) - i32(c1p.pad);
+    var v = 0.0;
+    if (p >= 0 && p < i32(c1p.n)) { v = c1_x[i * c1p.n + u32(p)]; }
+    c1_col[idx] = v;
+}
+"#;
+
 const VAE_IM2COL_SRC: &str = r#"
 // One patch column per pixel: col[t][r] = x[i, y+dy-pad, x+dx-pad] with
 // r = (i·k + dy)·k + dx. That is exactly A for an NT GEMM against a
@@ -31156,6 +31190,142 @@ fn enc_take(e: &mut wgpu::CommandEncoder) -> wgpu::CommandEncoder {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }),
     )
+}
+
+/// A 1D convolution as an NT GEMM whose A matrix never exists on the
+/// host. `yt` comes back as `[out_n x oc]` — the same layout
+/// `gemm_nt_f32` produces, so the caller's epilogue is unchanged.
+///
+/// Measured on a 3090: the host arm of this convolution spent its time
+/// building a `kk x out_n` column buffer, transposing it into a second
+/// buffer of equal size, and uploading that — up to 2.37 GB of traffic
+/// for a 20-second song. Only `x` (k times smaller) crosses the bus now.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_gemm(
+    x: &[f32],
+    w: &[f32],
+    ic: usize,
+    oc: usize,
+    n: usize,
+    k: usize,
+    pad: usize,
+    dil: usize,
+    out_n: usize,
+    yt: &mut [f32],
+) -> bool {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
+        return false;
+    }
+    let Some(c) = ctx() else { return false };
+    let (Some(ic_pipe), Some(gemm)) = (c.conv1d_im2col.as_ref(), c.gemm_nt_coop.as_ref()) else {
+        return false;
+    };
+    let kk = ic * k;
+    // The coop kernel reads its reduction four wide, and a job this small
+    // loses to the round trip either way.
+    if kk % 4 != 0 || out_n == 0 || out_n * kk * oc < (1 << 22) {
+        return false;
+    }
+    if x.len() < ic * n || w.len() < oc * kk || yt.len() < out_n * oc {
+        return false;
+    }
+    if oc.div_ceil(64) > 65_535 {
+        return false;
+    }
+    // One column tile stays well under Vulkan's 2 GiB per-binding limit.
+    const MAX_COL_FLOATS: usize = 128 << 20; // 512 MB
+    let span = (MAX_COL_FLOATS / kk).max(1).min(out_n);
+    if span.div_ceil(64) > 65_535 {
+        return false;
+    }
+    let _bake = BAKE_LOCK.lock().unwrap();
+    let wbuf = bake_weight(c, &w[..oc * kk], "conv1d-w");
+    let xbuf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("conv1d-x"),
+        contents: bytemuck::cast_slice(&x[..ic * n]),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let mut sc = c.scratch.lock().unwrap();
+    let colbuf = Scratch::ensure(
+        &c.device,
+        &mut sc.bx,
+        (span * kk * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "conv1d-col",
+    );
+    let ybuf = Scratch::ensure(
+        &c.device,
+        &mut sc.by,
+        (span * oc * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "conv1d-y",
+    );
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.bst,
+        (span * oc * 4) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "conv1d-stage",
+    );
+    drop(sc);
+    let mut p0 = 0usize;
+    while p0 < out_n {
+        let tile = span.min(out_n - p0);
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("conv1d") });
+        let cu = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[
+                ic as u32, n as u32, k as u32, dil as u32,
+                pad as u32, p0 as u32, tile as u32, 0u32,
+            ]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let cb = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &ic_pipe.get_bind_group_layout(0),
+            entries: &[bind_buf(0, &xbuf), bind_buf(1, &colbuf), bind_buf(2, &cu)],
+        });
+        // The grid folds into y past 65535 workgroups, matching the
+        // shader's `gid.y * (65535 * 256)` unpack.
+        let groups = (tile * kk).div_ceil(256) as u32;
+        let gx = groups.min(65_535);
+        let gy = groups.div_ceil(65_535);
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(ic_pipe);
+            pass.set_bind_group(0, &cb, &[]);
+            pass.dispatch_workgroups(gx, gy, 1);
+        }
+        let gu = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[(kk / 4) as u32, oc as u32, tile as u32, 0u32]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let gb = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &gemm.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &wbuf),
+                bind_buf(1, &colbuf),
+                bind_buf(2, &ybuf),
+                bind_buf(3, &gu),
+            ],
+        });
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(gemm);
+            pass.set_bind_group(0, &gb, &[]);
+            pass.dispatch_workgroups((oc as u32).div_ceil(64), (tile as u32).div_ceil(64), 1);
+        }
+        let bytes = (tile * oc * 4) as u64;
+        if !readback(c, enc, &ybuf, &stage, bytes, &mut yt[p0 * oc..(p0 + tile) * oc]) {
+            return false;
+        }
+        p0 += tile;
+    }
+    true
 }
 
 pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {

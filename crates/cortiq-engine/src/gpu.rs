@@ -1915,6 +1915,32 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
     }
 }
 
+/// A 1D convolution as a GEMM whose column matrix is expanded on the
+/// device instead of being built, transposed and uploaded by the host.
+/// `yt` comes back `[out_n x oc]`. `false` = refused, caller runs host.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_gemm(
+    x: &[f32],
+    w: &[f32],
+    ic: usize,
+    oc: usize,
+    n: usize,
+    k: usize,
+    pad: usize,
+    dil: usize,
+    out_n: usize,
+    yt: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => {
+            crate::gpu_wgpu::conv1d_gemm(x, w, ic, oc, n, k, pad, dil, out_n, yt)
+        }
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// The convolution as a GEMM on the matrix units. `false` = refused.
 #[allow(clippy::too_many_arguments)]
 pub fn vae_conv2d_coop(
