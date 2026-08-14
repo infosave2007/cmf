@@ -590,7 +590,7 @@ fn fir_pad(
         // the bare pointer — 2021 captures disjoint fields, and a
         // captured `*mut f32` is neither Send nor Sync.
         #[allow(clippy::mut_from_ref)]
-        unsafe fn row(&self, off: usize, len: usize) -> &mut [f32] {
+        pub(crate) unsafe fn row(&self, off: usize, len: usize) -> &mut [f32] {
             unsafe { std::slice::from_raw_parts_mut(self.0.add(off), len) }
         }
     }
@@ -897,13 +897,13 @@ pub fn kaiser_sinc_for_test() -> Vec<f32> {
     kaiser_sinc(0.25, 0.3, FILTER_LEN)
 }
 
-struct SendPtr(*mut f32);
+pub(crate) struct SendPtr(pub *mut f32);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 impl SendPtr {
     /// SAFETY: caller guarantees disjoint `[off, off+len)` per worker.
     #[allow(clippy::mut_from_ref)]
-    unsafe fn row(&self, off: usize, len: usize) -> &mut [f32] {
+    pub(crate) unsafe fn row(&self, off: usize, len: usize) -> &mut [f32] {
         unsafe { std::slice::from_raw_parts_mut(self.0.add(off), len) }
     }
 }
