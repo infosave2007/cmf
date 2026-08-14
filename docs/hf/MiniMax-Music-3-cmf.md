@@ -17,15 +17,26 @@ tags:
 
 ```bash
 cortiq music minimax-music3-q4tp.cmf \
-  --prompt "bpm is 92, key is E minor. Electric blues rock, gritty slide \
-guitar, walking bass, brushed drums, warm analog production." \
+  --prompt "Classic 1960s soul, passionate male tenor with rich vibrato, \
+lush female backing vocals, gospel choir harmonies, vintage Motown and \
+Stax atmosphere, groovy bassline, warm Hammond organ, horn section, \
+analog tape saturation, romantic nighttime mood." \
   --lyrics "[verse]
-I woke up on a dusty road" \
-  --seconds 15 --steps 8 --seed 42 --out song.wav
+Baby when the midnight comes around
+I still hear your footsteps on the ground
+[chorus]
+Oh, come back to me" \
+  --seconds 20 --steps 32 --seed 7 --out song.wav
 ```
 
-**[Listen to that command's output.](https://huggingface.co/infosave/MiniMax-Music-3-cmf/resolve/main/samples/blues_15s.wav)**
+**[Listen to that command's output.](https://huggingface.co/infosave/MiniMax-Music-3-cmf/resolve/main/samples/soul_20s_32steps.wav)**
 One binary, one file, no Python.
+
+The lyrics are not English-only — the same command
+[in Russian](https://huggingface.co/infosave/MiniMax-Music-3-cmf/resolve/main/samples/russian_20s_32steps.wav),
+caption and all. And steps buy audible quality: the
+[same soul prompt at 16](https://huggingface.co/infosave/MiniMax-Music-3-cmf/resolve/main/samples/soul_16steps.wav)
+is where the sibilance stops being distracting, 32 is where it settles.
 
 [MiniMax-Music-3](https://huggingface.co/MiniMaxAI/MiniMax-Music3)
 generates music with vocals from a caption and lyrics. This is its
@@ -162,12 +173,33 @@ the source:
 
 ### What it costs
 
-Measured on an Apple M4, 5 s at 8 steps, 206 s total: AR 0.45 s/frame,
-denoise 6.5 s/step over 430 latent frames, vocoder 19 s. The 15-second
-sample above took 823 s.
+Every render prints where its time went. On an RTX 3090, 4 s at 4
+steps:
 
-The vocoder was 75 s before it was handed the thread pool, which is a
-quarter of a short render for a one-word change.
+| stage | GPU | CPU only |
+|---|---|---|
+| AR | 52.3 s | 44.2 s |
+| denoise | 32.9 s | 36.2 s |
+| vocoder | **18.2 s** | 31.3 s |
+| total | **103.5 s** | 111.8 s |
+
+The vocoder was 54.0 s until its convolutions stopped shipping their
+column matrix across the bus — the host built it, transposed it into a
+second buffer of the same size and uploaded that, up to 2.37 GB for a
+20-second song, when the input it expands from is `k` times smaller.
+It is expanded on the card now.
+
+Two things that table will not tell you. The CPU column is a 256-core
+EPYC, so an ordinary machine's fallback is far slower than this and the
+device gap far wider. And the shape that matters for real songs is not
+this one: attention over latent frames is quadratic, so a 20-second
+render at 32 steps spends about **80% of its time in the denoise**,
+around 32-40 s a step. `CMF_MUSIC3_PROF=1` splits a step four ways if
+you want to see it.
+
+Earlier, on an Apple M4, 5 s at 8 steps took 206 s: AR 0.45 s/frame,
+denoise 6.5 s/step over 430 latent frames, vocoder 19 s — and the
+vocoder was 75 s before it was handed the thread pool.
 
 ## Running it
 
@@ -176,7 +208,7 @@ cargo install cortiq-cli          # 0.5.74+
 hf download infosave/MiniMax-Music-3-cmf minimax-music3-q4tp.cmf --local-dir .
 cortiq verify minimax-music3-q4tp.cmf     # → ✓ all tensor hashes match
 cortiq music minimax-music3-q4tp.cmf --prompt "..." --lyrics "..." \
-  --seconds 15 --steps 8 --seed 42 --out song.wav
+  --seconds 20 --steps 32 --seed 7 --out song.wav
 ```
 
 `--seconds` is a ceiling: the model can stop earlier. Same seed, same
