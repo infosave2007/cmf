@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The same convolution on Metal, where it was 42% of a render.** The
+  wgpu backend stopped shipping the column matrix across the bus; Metal
+  kept building it, and on a Mac that made the vocoder the most
+  expensive thing in a song — 2152 s of the 5090 s a 95-second render
+  took. `conv1d_mul_mm` goes one better than the wgpu arm: the columns
+  are not materialized on either side, the gather walking one axis with
+  a dilation straight out of the implicit-GEMM tile loop. On an M4 the
+  vocoder goes 84.8 s → 18.2 s and a whole render 141.8 s → 72.4 s, at
+  0.26% relative RMS against the host arm.
+
+  The kernel ships with a unit test against a reference loop, and that
+  is not ceremony: the first cut was fast and wrong — one digit in the
+  B-tile stride — and an implicit GEMM fails by making plausible audio
+  rather than by crashing. A whole-render parity check said "245% off"
+  without saying where; five shapes against a reference said which line.
+
 - **The vocoder stopped losing to its own CPU fallback.** It was the
   slowest stage of a `cortiq music` render and the one the GPU made
   worse — 54.0 s with the device on against 30.2 s with it off. The
