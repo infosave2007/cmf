@@ -487,6 +487,17 @@ impl NystromGroup {
         self.win_head = 0;
         self.sink_len = 0;
         self.exact_only = t <= self.w + self.sink + EXACT_SLACK;
+        if self.exact_only {
+            // The end of a three-hop silence: exact-only seals are not
+            // portable to the graph (o1_views -> None), which read as
+            // "0 of 16 layers sealed" upstairs, which read as a broken
+            // seal, which read as a broken port. Say the arithmetic.
+            tracing::info!(
+                "o1 seal: exact-only (prompt t={t} <= w {} + sink {} + slack {}) — \
+                 not graph-portable; longer prompt or smaller --o1-window lifts it",
+                self.w, self.sink, EXACT_SLACK
+            );
+        }
 
         if self.exact_only {
             // Everything fits in the exact window (plus slack for a few
