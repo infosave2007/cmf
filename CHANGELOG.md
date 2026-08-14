@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.75] - 2026-08-14
+
+Two fixes to `cortiq music`, one that halves a render and one that
+changes how it sounds. Both came out of a session where measurement
+also killed three optimizations, which is the more useful half of the
+story.
+
+### Fixed
+- **The sigma schedule was uniform, and it should not be.** I walked
+  σ from 1 to 0 in equal steps; ComfyUI's `normal_scheduler` evaluates
+  at `linspace(σ_max, σ_min, steps)` and only THEN appends zero, and
+  this model's `ModelSamplingDiscreteFlow` has σ_min = 1/1000. So the
+  reference measures a velocity essentially at the end of the
+  trajectory while mine stopped at 1/steps — 0.125 at eight steps —
+  and integrated the whole remaining tail from a velocity sampled well
+  before it. That is a smeared final approach, and it is audible.
+  Corrected to the reference's schedule. Measured on the same prompt
+  and seed: rms 0.046 → 0.075 and the spectral centroid 3792 → 2410 Hz
+  at eight steps, 0.094 and 2099 Hz at sixteen. A high centroid over a
+  low rms is hiss carrying the signal; the correction moves energy back
+  into the body.
+
+### Performance
+- **The DiT's attention is parallel over heads**, which it was not.
+  It is quadratic in the sequence and runs 36 times a step, and at 431
+  latent frames it WAS the denoise — on one core, while every GEMM
+  around it was already threaded. Heads are independent and write
+  disjoint columns, so they split without a lock. On an RTX 3090 pod,
+  8 steps over 430 latent frames: denoise **192.1 s → 84.1 s** with the
+  device, **203.8 s → 93.9 s** without; a 5-second render 308 s → 201 s.
+  Verified bit-identical across runs.
+
+### Measured, and reverted
+- **Lowering the `b >= 32` floor on GPU matmats made it slower.** The
+  reasoning was sound — an autoregressive decode runs at b=2 and reads
+  25 M weights to produce two rows, which is bandwidth rather than
+  arithmetic, the regime the matvec arm already admits on `rows * cols`
+  alone. The measurement disagreed: 336 s against 308 s with the device
+  off, and the AR itself went 63.9 s → 75.5 s. Reverted.
+- **On that pod the CPU path beats the GPU path for this workload**
+  (201 s against 228 s). The device wins the denoise (84 s against 94)
+  and loses more than that to initialization and shader compilation.
+
+
 ## [0.5.74] - 2026-08-14
 
 **`cortiq music`: a caption and lyrics become 44.1 kHz stereo, out of one

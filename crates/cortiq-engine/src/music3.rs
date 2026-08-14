@@ -20,6 +20,7 @@
 
 use crate::dit::Proj;
 use crate::qtensor::QTensor;
+use crate::audiovae::SendPtr;
 use crate::pool::Pool;
 use cortiq_core::CmfModel;
 use std::sync::Arc;
@@ -289,30 +290,45 @@ impl Music3Dit {
         self.rope(&mut q, &mut k, n);
         let scale = 1.0 / (hd as f32).sqrt();
         let mut attn = vec![0f32; n * hs];
-        for hh in 0..nh {
-            for i in 0..n {
-                let qi = &q[i * hs + hh * hd..i * hs + hh * hd + hd];
+        // Attention here is quadratic in the sequence and the DiT runs
+        // 36 of them per step; at 431 latent frames this loop WAS the
+        // denoise, on one core, while the GEMMs around it were already
+        // threaded. Heads are independent and write disjoint columns, so
+        // they parallelize without a lock.
+        {
+            let ptr = SendPtr(attn.as_mut_ptr());
+            let work = |lo: usize, hi: usize| {
                 let mut scores = vec![0f32; n];
-                let mut mx = f32::NEG_INFINITY;
-                for (j, sc) in scores.iter_mut().enumerate() {
-                    let kj = &k[j * hs + hh * hd..j * hs + hh * hd + hd];
-                    *sc = qi.iter().zip(kj).map(|(a, b)| a * b).sum::<f32>() * scale;
-                    mx = mx.max(*sc);
-                }
-                let mut sum = 0.0;
-                for sc in scores.iter_mut() {
-                    *sc = (*sc - mx).exp();
-                    sum += *sc;
-                }
-                let inv = 1.0 / sum;
-                let dst = &mut attn[i * hs + hh * hd..i * hs + hh * hd + hd];
-                for (j, &sc) in scores.iter().enumerate() {
-                    let w = sc * inv;
-                    let vj = &v[j * hs + hh * hd..j * hs + hh * hd + hd];
-                    for (d, &vv) in dst.iter_mut().zip(vj) {
-                        *d += w * vv;
+                for hh in lo..hi {
+                    for i in 0..n {
+                        let qi = &q[i * hs + hh * hd..i * hs + hh * hd + hd];
+                        let mut mx = f32::NEG_INFINITY;
+                        for (j, sc) in scores.iter_mut().enumerate() {
+                            let kj = &k[j * hs + hh * hd..j * hs + hh * hd + hd];
+                            *sc = qi.iter().zip(kj).map(|(a, b)| a * b).sum::<f32>() * scale;
+                            mx = mx.max(*sc);
+                        }
+                        let mut sum = 0.0;
+                        for sc in scores.iter_mut() {
+                            *sc = (*sc - mx).exp();
+                            sum += *sc;
+                        }
+                        let inv = 1.0 / sum;
+                        // SAFETY: head `hh` owns these columns of every row.
+                        let dst = unsafe { ptr.row(i * hs + hh * hd, hd) };
+                        for (j, &sc) in scores.iter().enumerate() {
+                            let w = sc * inv;
+                            let vj = &v[j * hs + hh * hd..j * hs + hh * hd + hd];
+                            for (d, &vv) in dst.iter_mut().zip(vj) {
+                                *d += w * vv;
+                            }
+                        }
                     }
                 }
+            };
+            match pool {
+                Some(p) => p.run_rows(nh, &work),
+                None => work(0, nh),
             }
         }
         let mut proj = vec![0f32; n * hs];
@@ -486,10 +502,28 @@ impl Music3Dit {
 /// σ walks 1 → 0, the DiT is asked at `1 − σ`, and the step is
 /// `x += (σ_next − σ)·v`. The DiT already negates its own output, so
 /// the sign lives there rather than here.
+///
+/// The walk is NOT uniform, and that detail is audible. ComfyUI's
+/// `normal_scheduler` evaluates at `linspace(σ_max, σ_min, steps)` and
+/// only THEN appends zero, and this model's `ModelSamplingDiscreteFlow`
+/// has `σ_min = 1/1000` — so the last velocity is measured essentially
+/// at the end of the trajectory. A uniform `1 → 0` in `steps` stops at
+/// `1/steps` and integrates the whole remaining tail from a velocity
+/// sampled well before it, which is a smeared, mushy final approach.
 pub fn flow_sigmas(steps: usize) -> Vec<f32> {
-    (0..=steps)
-        .map(|i| 1.0 - i as f32 / steps as f32)
-        .collect()
+    const SIGMA_MIN: f32 = 0.001;
+    let n = steps.max(1);
+    let mut s: Vec<f32> = (0..n)
+        .map(|i| {
+            if n == 1 {
+                1.0
+            } else {
+                1.0 + (SIGMA_MIN - 1.0) * i as f32 / (n - 1) as f32
+            }
+        })
+        .collect();
+    s.push(0.0);
+    s
 }
 
 /// RMSNorm with a weight and no bias, eps 1e-6.
