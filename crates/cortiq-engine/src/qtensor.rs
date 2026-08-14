@@ -1381,6 +1381,32 @@ impl QTensor {
                             crate::gpu::OpClass::Matmat
                         };
                         if let Self::Mapped { model, idx, .. } = self {
+                            // In-process A/B (`CMF_MM_AB=1`). Three
+                            // wall-clock A/Bs on a shared stand disagreed
+                            // with each other by 25% on the same change,
+                            // because the machine drifts between processes
+                            // and interleaving whole renders does not fix
+                            // that. Here both arms run back to back on the
+                            // SAME data inside one call, so whatever the
+                            // machine is doing, it does to both — and the
+                            // disagreement between their outputs falls out
+                            // for free. Doubles the work; a diagnostic,
+                            // not a mode.
+                            if crate::mm_ab::on() {
+                                let mut g = vec![0f32; b * rows];
+                                let t = std::time::Instant::now();
+                                let took = crate::gpu::q4tp_matmat(
+                                    model, *idx, xs_all, b, rows, cols, &mut g,
+                                );
+                                let dg = t.elapsed();
+                                let t = std::time::Instant::now();
+                                q4tp_matmat(
+                                    self.quant_bytes(), xs_all, b, rows, cols, out, pool,
+                                );
+                                let dc = t.elapsed();
+                                crate::mm_ab::record(b, rows, cols, took, dg, dc, &g, out);
+                                return;
+                            }
                             let t0 = std::time::Instant::now();
                             // A cold call takes the device arm: its sample
                             // is discarded either way, and the upload is
