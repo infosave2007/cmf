@@ -311,6 +311,11 @@ impl Music3Dit {
         // leave them token-major, and three transposes of n x hs are
         // noise against n^2 work.
         {
+            // The packed kernel is wgpu's; Metal carries only the
+            // head-major `dit_attention`, so a refusal here must fall to
+            // THAT and not to the host loop — routing everything at the
+            // packed arm would have quietly taken the attention off the
+            // card on every Mac.
             if crate::gpu::dit_attention_packed(&qkv, nh, n, hd, scale, None, &mut attn) {
                 prof::add(&prof::ATTN, _ta);
                 let mut proj = vec![0f32; n * hs];
@@ -324,8 +329,7 @@ impl Music3Dit {
             }
             attn.fill(0.0);
         }
-        // Only the host arm needs the three panels apart, so it unpacks
-        // them here — the device path above never pays for this.
+        // Everything past the packed arm wants the three panels apart.
         let mut q = vec![0f32; n * hs];
         let mut k = vec![0f32; n * hs];
         let mut v = vec![0f32; n * hs];
@@ -334,6 +338,34 @@ impl Music3Dit {
             q[p * hs..(p + 1) * hs].copy_from_slice(&s[..hs]);
             k[p * hs..(p + 1) * hs].copy_from_slice(&s[hs..2 * hs]);
             v[p * hs..(p + 1) * hs].copy_from_slice(&s[2 * hs..]);
+        }
+        // Metal's arm: head-major panels, three transposes of n x hs
+        // against n^2 work. This is what the packed path spares wgpu,
+        // and what a Mac still needs until the split kernel is ported.
+        if crate::gpu::enabled_here() {
+            let mut qh = vec![0f32; n * hs];
+            let mut kh = vec![0f32; n * hs];
+            let mut vh = vec![0f32; n * hs];
+            for h in 0..nh {
+                for i in 0..n {
+                    let (s, d) = (i * hs + h * hd, (h * n + i) * hd);
+                    qh[d..d + hd].copy_from_slice(&q[s..s + hd]);
+                    kh[d..d + hd].copy_from_slice(&k[s..s + hd]);
+                    vh[d..d + hd].copy_from_slice(&v[s..s + hd]);
+                }
+            }
+            if crate::gpu::dit_attention(&qh, &kh, &vh, nh, nh, n, hd, scale, &mut attn) {
+                prof::add(&prof::ATTN, _ta);
+                let mut proj = vec![0f32; n * hs];
+                let _t = prof::start();
+                blk.out.matmat(&attn, n, &mut proj, pool);
+                prof::add(&prof::OUT, _t);
+                for (a, b) in x.iter_mut().zip(&proj) {
+                    *a += b;
+                }
+                return self.block_ffn(blk, x, n);
+            }
+            attn.fill(0.0);
         }
         // Heads are independent and write disjoint columns, so the host
         // arm splits without a lock.
