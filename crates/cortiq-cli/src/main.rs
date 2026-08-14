@@ -493,6 +493,18 @@ enum Commands {
         /// where repeated identifiers are the point, not a defect)
         #[arg(long, conflicts_with = "greedy")]
         rep_penalty: Option<f32>,
+        /// Nucleus cutoff (Qwen3.8: 0.95 thinking, 0.80 instruct)
+        #[arg(long)]
+        top_p: Option<f32>,
+        /// Top-k cutoff (Qwen3.8: 20)
+        #[arg(long)]
+        top_k: Option<u32>,
+        /// Min-p floor (Qwen3.8: 0.0)
+        #[arg(long)]
+        min_p: Option<f32>,
+        /// Flat penalty on every already-seen token (Qwen3.8 instruct: 1.5)
+        #[arg(long)]
+        presence_penalty: Option<f32>,
         /// Fixed RNG seed for reproducible sampling
         #[arg(long)]
         seed: Option<u64>,
@@ -1520,6 +1532,10 @@ async fn main() -> anyhow::Result<()> {
             greedy,
             temperature,
             rep_penalty,
+            top_p,
+            top_k,
+            min_p,
+            presence_penalty,
             seed,
             raw,
             no_think,
@@ -1558,6 +1574,10 @@ async fn main() -> anyhow::Result<()> {
                 greedy,
                 temperature,
                 rep_penalty,
+                top_p,
+                top_k,
+                min_p,
+                presence_penalty,
                 seed,
                 raw,
                 no_think,
@@ -2277,6 +2297,7 @@ fn fcd_gen_check(
 ) -> anyhow::Result<()> {
     let greedy = SamplerConfig {
         temperature: 0.0,
+        presence_penalty: 0.0,
         top_p: 1.0,
         top_k: 0,
         repetition_penalty: 1.0,
@@ -3077,6 +3098,10 @@ async fn cmd_run(
     greedy: bool,
     temperature: Option<f32>,
     rep_penalty: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    presence_penalty: Option<f32>,
     seed: Option<u64>,
     raw: bool,
     no_think: bool,
@@ -3159,6 +3184,18 @@ async fn cmd_run(
     }
     if let Some(r) = rep_penalty {
         sampler.repetition_penalty = r;
+    }
+    if let Some(v) = top_p {
+        sampler.top_p = v;
+    }
+    if let Some(v) = top_k {
+        sampler.top_k = v;
+    }
+    if let Some(v) = min_p {
+        sampler.min_p = v;
+    }
+    if let Some(v) = presence_penalty {
+        sampler.presence_penalty = v;
     }
     if let Some(s) = seed {
         sampler.seed = Some(s);

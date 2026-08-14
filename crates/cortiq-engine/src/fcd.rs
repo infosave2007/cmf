@@ -2366,6 +2366,7 @@ pub fn run_polish(
             let greedy = SamplerConfig {
                 temperature: 0.0,
                 top_p: 1.0,
+                presence_penalty: 0.0,
                 top_k: 0,
                 repetition_penalty: 1.0,
                 min_p: 0.0,
