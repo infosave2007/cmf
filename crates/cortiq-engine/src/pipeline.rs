@@ -4572,12 +4572,17 @@ impl Pipeline {
                 // lagging `want` early in a run is the o1 design working
                 // — but it must say so, or the next reader spends a
                 // night proving the kernels innocent.
-                static SAID: std::sync::Once = std::sync::Once::new();
-                SAID.call_once(|| {
+                // On CHANGE, not once: the first decline is the legal
+                // unsealed prefill, and a once-print buries the state
+                // that matters — what the count reads AFTER the seal.
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static LAST: AtomicUsize = AtomicUsize::new(usize::MAX);
+                let code = have * 1000 + want;
+                if LAST.swap(code, Ordering::Relaxed) != code {
                     tracing::warn!(
                         "o1 graph: {have} of {want} layers sealed — per-op until all seal"
                     );
-                });
+                }
                 return None;
             }
         }
