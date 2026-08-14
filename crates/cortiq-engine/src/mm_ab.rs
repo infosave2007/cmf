@@ -112,3 +112,54 @@ pub fn report() -> String {
     ));
     s
 }
+
+/// The second question, once the ratio is known: of the device arm's
+/// time, how much is the GEMM and how much is moving the result back.
+/// `CMF_MM_SPLIT=1` submits the kernel alone, waits, then times the
+/// readback separately. The answer decides whether the next work is a
+/// faster kernel or a resident chain that stops shipping activations.
+pub fn split_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_MM_SPLIT").as_deref() == Ok("1"))
+}
+
+#[derive(Default, Clone)]
+struct Split {
+    calls: u64,
+    kernel_ns: u128,
+    rb_ns: u128,
+}
+
+fn splits() -> &'static Mutex<BTreeMap<(usize, usize, usize), Split>> {
+    static T: OnceLock<Mutex<BTreeMap<(usize, usize, usize), Split>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+pub fn split_note(b: usize, rows: usize, cols: usize, kernel: Duration, rb: Duration) {
+    let mut t = splits().lock().unwrap();
+    let e = t.entry((b, rows, cols)).or_default();
+    e.calls += 1;
+    e.kernel_ns += kernel.as_nanos();
+    e.rb_ns += rb.as_nanos();
+}
+
+pub fn split_report() -> String {
+    let t = splits().lock().unwrap();
+    if t.is_empty() {
+        return "no split-timed calls".into();
+    }
+    let mut s = String::from(
+        "\n  device arm, kernel vs readback (CMF_MM_SPLIT=1)\n\
+         \x20   b     rows    cols  calls  kernel ms  readbk ms  rb MB/call\n",
+    );
+    for ((b, r, c), e) in t.iter() {
+        s.push_str(&format!(
+            "  {b:>5} {r:>8} {c:>7} {:>6} {:>10.1} {:>10.1} {:>10.1}\n",
+            e.calls,
+            e.kernel_ns as f64 / 1e6,
+            e.rb_ns as f64 / 1e6,
+            (b * r * 4) as f64 / 1e6,
+        ));
+    }
+    s
+}

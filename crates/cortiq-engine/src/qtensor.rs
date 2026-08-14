@@ -1315,6 +1315,18 @@ impl QTensor {
     /// out — row-major [b, rows]. Element-wise semantics are IDENTICAL
     /// to b matvec calls (same dot kernels in the same order); the win —
     /// the weight row streams from DRAM once per batch, not b times.
+    /// `(model, index)` when this is a memory-mapped q4tp tensor — the
+    /// identity a device-resident chain needs to hand `tp_matmat` the
+    /// weight without going through this struct's own dispatch.
+    pub fn q4tp_mapped(&self) -> Option<(&std::sync::Arc<CmfModel>, usize)> {
+        match self {
+            Self::Mapped { model, idx, dtype, .. } if *dtype == TensorDtype::Q4TiledP => {
+                Some((model, *idx))
+            }
+            _ => None,
+        }
+    }
+
     pub fn matmat(&self, xs_all: &[f32], b: usize, out: &mut [f32], pool: Option<&Pool>) {
         let cols = self.cols();
         let rows = self.rows();

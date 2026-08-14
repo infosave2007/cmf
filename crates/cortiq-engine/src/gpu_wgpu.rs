@@ -10409,6 +10409,7 @@ struct Ctx {
     dit_qkv_split: Option<wgpu::ComputePipeline>,
     vae_im2col: Option<wgpu::ComputePipeline>,
     conv1d_im2col: Option<wgpu::ComputePipeline>,
+    music3_glu: Option<wgpu::ComputePipeline>,
     /// v [h][n][hd] → [h][hd][n], so PV is an NT product.
     dit_v_transpose: Option<wgpu::ComputePipeline>,
     /// qk-norm + RoPE + head-major scatter, one of q/k per dispatch.
@@ -10732,6 +10733,7 @@ struct Scratch {
     dv: Option<(wgpu::Buffer, u64)>,
     dsc: Option<(wgpu::Buffer, u64)>,
     dpan: Option<(wgpu::Buffer, u64)>,
+    m3act: Option<(wgpu::Buffer, u64)>,
     dout: Option<(wgpu::Buffer, u64)>,
     dstage: Option<(wgpu::Buffer, u64)>,
     dpar: Option<wgpu::Buffer>,
@@ -11438,6 +11440,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let dit_qkv_split = mk_coop(DIT_SPLIT_SRC, "dit-split", "dit_qkv_split");
     let vae_im2col = mk_coop(VAE_IM2COL_SRC, "vae-im2col", "vae_im2col");
     let conv1d_im2col = mk_coop(CONV1D_IM2COL_SRC, "conv1d-im2col", "conv1d_im2col");
+    let music3_glu = mk_coop(MUSIC3_GLU_SRC, "music3-glu", "music3_glu");
     let dit_v_transpose = mk_coop(DIT_VT_SRC, "dit-vt", "dit_v_transpose");
     let dit_qknorm = mk_coop(DIT_QKNORM_SRC, "dit-qknorm", "dit_qknorm_rope");
     let dit_gemm_coop = (q4tp_mm_coop.is_some())
@@ -11810,6 +11813,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         dit_qkv_split,
         vae_im2col,
         conv1d_im2col,
+        music3_glu,
         dit_v_transpose,
         dit_qknorm,
         act_amax_part,
@@ -18316,6 +18320,83 @@ pub(crate) fn q4tp_matmat_dev(
     Some(buf)
 }
 
+/// Music-3's FFN with the activations held on the device: ff_in's
+/// GEMM keeps its result, the GLU runs where that result lives, and
+/// ff_out reads it in place — only `h` goes up (5.6 MB) and only the
+/// block's output comes back (5.6 MB). The host arm of the same chain
+/// moved 68 MB more per block-step, and on this class of stand the
+/// split timer put transfers at 82% of the device arm's total; the
+/// GEMMs themselves run at ~5 TFLOP/s and were never the cost.
+///
+/// `false` = refused (no ctx, no pipeline, or a GEMM declined) — the
+/// caller's host arm is the fallback and produces identical audio.
+#[allow(clippy::too_many_arguments)]
+pub fn music3_ffn(
+    model: &Arc<CmfModel>,
+    idx_in: usize,
+    idx_out: usize,
+    h: &[f32],
+    bias_in: &[f32],
+    n: usize,
+    hs: usize,
+    inter: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Some(glu) = c.music3_glu.as_ref() else { return false };
+    if h.len() < n * hs || bias_in.len() < 2 * inter || out.len() < n * hs || n == 0 {
+        return false;
+    }
+    // ff_in: [n, 2·inter] stays on the card.
+    let mut unused = Vec::new();
+    let Some(gu) = tp_matmat_keep(model, idx_in, h, n, 2 * inter, hs, &mut unused, false)
+    else {
+        return false;
+    };
+    // GLU in place. The bias buffer is cached by pointer+fingerprint,
+    // so it crosses the bus once per process, not once per call.
+    let bias = bake_weight(c, &bias_in[..2 * inter], "m3-glu-b");
+    let act = {
+        let mut sc = c.scratch.lock().unwrap();
+        Scratch::ensure(
+            &c.device,
+            &mut sc.m3act,
+            (n * inter * 4) as u64,
+            wgpu::BufferUsages::STORAGE,
+            "m3-act",
+        )
+    };
+    let u = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: None,
+        contents: bytemuck::cast_slice(&[n as u32, inter as u32, 0u32, 0u32]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &glu.get_bind_group_layout(0),
+        entries: &[
+            bind_buf(0, &gu),
+            bind_buf(1, &act),
+            bind_buf(2, &bias),
+            bind_buf(3, &u),
+        ],
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("m3-glu") });
+    {
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(glu);
+        pass.set_bind_group(0, &bind, &[]);
+        let groups = ((n * inter) as u32).div_ceil(256);
+        pass.dispatch_workgroups(groups.min(65_535), groups.div_ceil(65_535), 1);
+    }
+    submit(c, enc.finish());
+    // ff_out reads the resident activations; the queue orders the three
+    // submissions, so nothing here waits until the final readback.
+    tp_matmat_impl(model, idx_out, &[], n, hs, inter, Some(out), Some(&act), false).is_some()
+}
+
 pub fn q4tp_matmat(
     model: &Arc<CmfModel>,
     idx: usize,
@@ -18799,6 +18880,26 @@ fn tp_matmat_impl(
     }
     match out {
         Some(o) => {
+            // CMF_MM_SPLIT=1: land the kernel alone first, then time the
+            // readback separately — the one number that says whether the
+            // next work is a faster GEMM or a resident chain.
+            if crate::mm_ab::split_on() {
+                let t0 = std::time::Instant::now();
+                submit(c, enc.finish());
+                if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+                    return None;
+                }
+                let t_k = t0.elapsed();
+                let enc2 = c
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("mm-split-rb"),
+                    });
+                let t0 = std::time::Instant::now();
+                let ok = readback(c, enc2, &y_buf, &stage_buf, y_size, &mut o[..b * rows]);
+                crate::mm_ab::split_note(b, rows, cols, t_k, t0.elapsed());
+                return if ok { Some(y_buf) } else { None };
+            }
             if readback(c, enc, &y_buf, &stage_buf, y_size, &mut o[..b * rows]) {
                 Some(y_buf)
             } else {
@@ -21815,6 +21916,34 @@ fn dit_v_transpose(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+const MUSIC3_GLU_SRC: &str = r#"
+// The elementwise middle of Music-3's FFN, on the device so the two
+// GEMMs around it never leave. The host arm of this chain read back
+// 45 MB of ff_in output and re-uploaded 23 MB of activations per
+// block-step, on a stand whose DMA measures 6-33 ms per 8.5 MB — the
+// transfers were 82% of the device arm's time. GLU order is VALUE
+// first, gate second, bias added to BOTH halves before they meet,
+// exactly as the host loop spells it.
+struct GluP { n: u32, inter: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read>       glu_gu: array<f32>;
+@group(0) @binding(1) var<storage, read_write> glu_act: array<f32>;
+@group(0) @binding(2) var<storage, read>       glu_bias: array<f32>;
+@group(0) @binding(3) var<uniform>             glup: GluP;
+
+@compute @workgroup_size(256)
+fn music3_glu(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let total = glup.n * glup.inter;
+    let i = gid.y * (65535u * 256u) + gid.x;
+    if (i >= total) { return; }
+    let p = i / glup.inter;
+    let j = i - p * glup.inter;
+    let row = p * 2u * glup.inter;
+    let v = glu_gu[row + j] + glu_bias[j];
+    let g = glu_gu[row + glup.inter + j] + glu_bias[glup.inter + j];
+    glu_act[i] = v * g / (1.0 + exp(-g));
+}
+"#;
+
 const CONV1D_IM2COL_SRC: &str = r#"
 // The 1D twin of `vae_im2col`, and it writes the TRANSPOSED layout the
 // NT GEMM wants directly: col[t·(ic·k) + (i·k + j)] = x[i, t + j·dil - pad].
@@ -22044,16 +22173,52 @@ enable wgpu_cooperative_matrix;
 enable f16;
 
 struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
-@group(0) @binding(0) var<storage, read> wmm: array<f32>;
-@group(0) @binding(1) var<storage, read> xmm: array<f32>;
+@group(0) @binding(0) var<storage, read> wmm: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> xmm: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
 @group(0) @binding(3) var<uniform> pmm: MmP;
 
 const KS: u32 = 32u;
 
-var<workgroup> cm_a: array<f16, 64 * 32>;
-var<workgroup> cm_b: array<f16, 64 * 32>;
+// Two K-tiles of A and B, not one: tile k+1 stages while the matrix
+// units chew tile k, so the global-memory latency hides behind the mma
+// work and each K step costs ONE barrier where the old kernel paid two.
+// That kernel measured 614-1537 GFLOP/s on a 3090 across the DiT's
+// shapes — flat against an 8x spread in work, which is the signature of
+// paying per step, not per flop. Global loads are vec4 for the same
+// reason: four scalar f32 reads per thread per tile were four trips.
+var<workgroup> cm_a: array<f16, 2 * 64 * 32>;
+var<workgroup> cm_b: array<f16, 2 * 64 * 32>;
 var<workgroup> cm_c: array<f32, 64 * 64>;
+
+fn stage_nt(buf: u32, k0: u32, m0: u32, n0: u32, tid: u32) {
+    let cols = pmm.cols4 * 4u;
+    let ab = buf * 2048u;
+    for (var t = tid; t < 512u; t = t + 128u) {
+        let m = t / 8u;
+        let kv = (t % 8u) * 4u;
+        let col0 = k0 + kv;
+        var v = vec4<f32>();
+        if (m0 + m < pmm.nb && col0 < cols) {
+            v = xmm[((m0 + m) * cols + col0) >> 2u];
+        }
+        let dst = ab + m * KS + kv;
+        cm_a[dst] = f16(v.x); cm_a[dst + 1u] = f16(v.y);
+        cm_a[dst + 2u] = f16(v.z); cm_a[dst + 3u] = f16(v.w);
+    }
+    for (var t = tid; t < 512u; t = t + 128u) {
+        let n = t / 8u;
+        let kv = (t % 8u) * 4u;
+        let col0 = k0 + kv;
+        var v = vec4<f32>();
+        if (n0 + n < pmm.rows && col0 < cols) {
+            v = wmm[((n0 + n) * cols + col0) >> 2u];
+        }
+        let dst = ab + n * KS + kv;
+        cm_b[dst] = f16(v.x); cm_b[dst + 1u] = f16(v.y);
+        cm_b[dst + 2u] = f16(v.z); cm_b[dst + 3u] = f16(v.w);
+    }
+}
 
 @compute @workgroup_size(128)
 fn gemm_nt_coop(@builtin(workgroup_id) wid: vec3<u32>,
@@ -22068,62 +22233,43 @@ fn gemm_nt_coop(@builtin(workgroup_id) wid: vec3<u32>,
     var c2: coop_mat16x16<f32, C>;
     var c3: coop_mat16x16<f32, C>;
 
-    var k0 = 0u;
-    loop {
-        if (k0 >= cols) { break; }
-        for (var t = tid; t < 64u * 8u; t = t + 128u) {
-            let m = t / 8u;
-            let k4 = (t % 8u) * 4u;
-            let col0 = k0 + k4;
-            let dst = m * KS + k4;
-            var v = vec4<f32>(0.0);
-            if (m0 + m < pmm.nb && col0 < cols) {
-                let base = (m0 + m) * cols + col0;
-                v = vec4<f32>(xmm[base], xmm[base + 1u], xmm[base + 2u], xmm[base + 3u]);
-            }
-            cm_a[dst] = f16(v.x); cm_a[dst + 1u] = f16(v.y);
-            cm_a[dst + 2u] = f16(v.z); cm_a[dst + 3u] = f16(v.w);
-        }
-        for (var t = tid; t < 64u * 8u; t = t + 128u) {
-            let n = t / 8u;
-            let k4 = (t % 8u) * 4u;
-            let col0 = k0 + k4;
-            var wv = vec4<f32>(0.0);
-            if (n0 + n < pmm.rows && col0 < cols) {
-                let base = (n0 + n) * cols + col0;
-                wv = vec4<f32>(wmm[base], wmm[base + 1u], wmm[base + 2u], wmm[base + 3u]);
-            }
-            let bd = n * KS + k4;
-            cm_b[bd] = f16(wv.x); cm_b[bd + 1u] = f16(wv.y);
-            cm_b[bd + 2u] = f16(wv.z); cm_b[bd + 3u] = f16(wv.w);
-        }
-        workgroupBarrier();
-        {
-            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 0u], 32u);
-            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 0u], 32u);
-            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u + 0u], 32u);
-            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 0u], 32u);
-            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u + 0u], 32u);
-            c0 = coopMultiplyAdd(a, b0, c0);
-            c1 = coopMultiplyAdd(a, b1, c1);
-            c2 = coopMultiplyAdd(a, b2, c2);
-            c3 = coopMultiplyAdd(a, b3, c3);
-        }
-        {
-            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[sg * 512u + 16u], 32u);
-            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[0u + 16u], 32u);
-            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[512u + 16u], 32u);
-            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1024u + 16u], 32u);
-            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[1536u + 16u], 32u);
-            c0 = coopMultiplyAdd(a, b0, c0);
-            c1 = coopMultiplyAdd(a, b1, c1);
-            c2 = coopMultiplyAdd(a, b2, c2);
-            c3 = coopMultiplyAdd(a, b3, c3);
-        }
-        workgroupBarrier();
-        k0 = k0 + KS;
-    }
+    stage_nt(0u, 0u, m0, n0, tid);
     workgroupBarrier();
+    var k0 = 0u;
+    var buf = 0u;
+    loop {
+        let nk = k0 + KS;
+        // Issue the next tile's global loads BEFORE the mma below — by
+        // the barrier they are in flight behind the math, not after it.
+        if (nk < cols) { stage_nt(buf ^ 1u, nk, m0, n0, tid); }
+        let ab = buf * 2048u;
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[ab + sg * 512u + 0u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[ab + 0u + 0u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[ab + 512u + 0u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[ab + 1024u + 0u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[ab + 1536u + 0u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&cm_a[ab + sg * 512u + 16u], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[ab + 0u + 16u], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[ab + 512u + 16u], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[ab + 1024u + 16u], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&cm_b[ab + 1536u + 16u], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        workgroupBarrier();
+        k0 = nk;
+        buf = buf ^ 1u;
+        if (k0 >= cols) { break; }
+    }
     coopStoreT(c0, &cm_c[sg * 16u * 64u + 0u], 64u);
     coopStoreT(c1, &cm_c[sg * 16u * 64u + 16u], 64u);
     coopStoreT(c2, &cm_c[sg * 16u * 64u + 32u], 64u);
@@ -22355,6 +22501,7 @@ fn readback(
     out: &mut [f32],
 ) -> bool {
     enc.copy_buffer_to_buffer(y_buf, 0, staging, 0, y_size);
+    let t_dma = std::time::Instant::now();
     submit(c, enc.finish());
     let slice = staging.slice(..y_size);
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -22390,11 +22537,25 @@ fn readback(
     }
 
     {
+        let t_cp = std::time::Instant::now();
         let Ok(data) = slice.get_mapped_range() else {
             staging.unmap();
             return false;
         };
         par_copy(out, bytemuck::cast_slice(&data[..out.len() * 4]));
+        // One line per big readback under CMF_RB_TRACE=1: how much of it
+        // is the DMA+fence and how much the mapped-memory copy. 45 MB at
+        // 0.8 GB/s effective needed this split to know which half to fix.
+        if y_size > (8 << 20) && std::env::var("CMF_RB_TRACE").as_deref() == Ok("1") {
+            let full = t_dma.elapsed().as_secs_f64() * 1e3;
+            let cp = t_cp.elapsed().as_secs_f64() * 1e3;
+            eprintln!(
+                "rb {:.1} MB: dma+fence {:.1} ms, copy {:.1} ms",
+                y_size as f64 / 1e6,
+                full - cp,
+                cp
+            );
+        }
     }
     staging.unmap();
     true
