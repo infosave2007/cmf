@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.74] - 2026-08-14
+
+**`cortiq music`: a caption and lyrics become 44.1 kHz stereo, out of one
+5.55 GB file.** MiniMax-Music-3 is ported — all five pieces — and the
+converted weights are published at
+[infosave/MiniMax-Music-3-cmf](https://huggingface.co/infosave/MiniMax-Music-3-cmf)
+with a sample this build generated.
+
+| | source | packed |
+|---|---|---|
+| AR stack (Qwen3-8B + RVQ depth decoder) | 15.56 GiB bf16 | `q4tp` |
+| flow-matching DiT | 4.58 GiB fp16 | `q4tp` |
+| DAV vocoder | 207 MiB | exact |
+| **total** | **20.34 GiB, three files** | **5.55 GiB, one** |
+
+### Added
+- **`animate-pack --music-te / --music-dit / --music-vae`** and
+  **`cortiq music`**. The AR stack does not encode the prompt, it
+  GENERATES the conditioning: a Qwen3-8B backbone prefilled at batch two
+  (the words, and a copy whose middle is `<|audio_cfg|>`), then sampled a
+  frame at a time at 25 fps — `c0` from the pruned head under
+  classifier-free guidance at 1.5 with the top-k mask taken from the
+  CONDITIONED logits, then seven codebooks through the depth decoder,
+  each fed back through its own embedding table. Those eight hidden
+  states, softmax-mixed by `cond_layer_logits`, are what the DiT sees.
+  Then an Euler flow walk (σ 1→0, the DiT asked at `1−σ`, windowed
+  689/344 with the overlap averaged) and the vocoder at 512 samples a
+  latent frame.
+- Its own KV cache: `multi_head_attention` takes raw f32 weights, and
+  dequantizing a `q4tp` 8B to reach it would be 3.6 GB of qkv alone.
+
+### Seven conventions that a tensor name cannot tell you
+Each was a wrong guess first, each corrected by reading ComfyUI's
+`comfy/ldm/minimax_music/`, and each fails SILENTLY — the model keeps
+producing plausible sound:
+- the vocoder's residual dilations are **1, 3, 9**, not BigVGAN's 1, 3, 5
+- its Snake reads α **verbatim** where this engine's H3 vocoder keeps α
+  and β in log scale and exponentiates on load
+- the 128 latent channels are a **stereo pair of 64**, not evidence of a
+  second VAE between `latent_channels: 128` and `dec_in_proj [1024,64,1]`
+- the DiT's input is `[x | zeros_like(x) | condition]` on the channel
+  axis, and both its 1×1 convs are **residual**
+- its timestep embedding is a prepended **token**, dropped before
+  `project_out`, and its output is **negated**
+- `cond_layer_logits[8]` mixes RVQ **codebook levels**, not transformer
+  layers — the condition encoder's `num_condition_layers: 8` invites the
+  wrong one of two eights
+- the sampler is NOT the `FlowMatchEulerDiscreteScheduler` named in
+  MiniMax's own config. With `num_train_timesteps: 1` that scheduler's
+  schedule degenerates to a constant; ComfyUI registers this model as a
+  plain `ModelType.FLOW` with `process_timestep = 1 − t`
+
+### Deliberately not the reference, and marked in the source
+- The top-k sampler is a plain xorshift, not torch's seeded `Generator`.
+  Nothing downstream needs one seed to mean the same song across
+  implementations, only that it means one song here.
+- The lyrics normaliser skips the reference's markdown scrubbing, which
+  only ever removes characters a caption should not carry.
+
+### Fixed
+- **`cortiq animate` panicked on every run on macOS** —
+  `gpu::dit_attention_packed` was compiled out under
+  `not(target_os = "macos")`, so it was a silent `false`, and the caller
+  had already skipped the host qk-norm on the strength of it. The
+  decision now asks `dit_attention_packed_available()`, which consults
+  the live wgpu context, and the wgpu arm compiles on macOS.
+- **The Metal `q4tp` GEMM overflowed `half` on outlier activations**, so
+  Apple Silicon rendered uniform grey above 256×160. One row of 982 in a
+  MiniMax-H3 frame reaches 3.0e6 by block 44 against `half`'s 65504. The
+  host now scales by a power of two ONLY when the panel would overflow
+  and folds the reciprocal into the weight side; at 1.0 the path is
+  bit-identical, which a text model over Metal confirms by never
+  triggering it. 512×288 on an M4: **298.5 s, correct**, against 747.7 s
+  over wgpu.
+
+### Measured
+- `CMF_METAL_MMPROF=1` splits the Metal GEMM: over 1071 calls, upload
+  0.7 s, submit+wait 41.6 s, readback 1.4 s. The copies are 5% — on
+  unified memory the round trip is not the cost, so fusing a block into
+  one command buffer buys almost nothing.
+- The GEMMs are 86% of an H3 denoise (fc1 32.0%, qkv 25.9%, fc2 20.8%),
+  attention 11%. The Metal flash-attention kernel is a **2× regression**
+  on that workload, not a win.
+- Music-3 on an M4: 5 s at 8 steps is 206 s — AR 0.45 s/frame, denoise
+  6.5 s/step at 430 latent frames, vocoder 19 s. The vocoder was 75 s
+  until it was handed the thread pool.
+
 ### Fixed
 - **`cortiq animate` panicked on every run on macOS.**
   `gpu::dit_attention_packed` was compiled out under
