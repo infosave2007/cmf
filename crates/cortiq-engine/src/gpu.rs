@@ -1915,6 +1915,30 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
     }
 }
 
+/// Music-3's FFN chain resident on the device — two GEMMs and the GLU
+/// between them with no host round trip. `false` = refused, host runs.
+#[allow(clippy::too_many_arguments)]
+pub fn music3_ffn(
+    model: &std::sync::Arc<CmfModel>,
+    idx_in: usize,
+    idx_out: usize,
+    h: &[f32],
+    bias_in: &[f32],
+    n: usize,
+    hs: usize,
+    inter: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(all(feature = "gpu", not(target_os = "macos")))]
+        Backend::Wgpu => {
+            crate::gpu_wgpu::music3_ffn(model, idx_in, idx_out, h, bias_in, n, hs, inter, out)
+        }
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// A 1D convolution as a GEMM whose column matrix is expanded on the
 /// device instead of being built, transposed and uploaded by the host.
 /// `yt` comes back `[out_n x oc]`. `false` = refused, caller runs host.

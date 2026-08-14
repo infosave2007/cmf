@@ -423,6 +423,46 @@ impl Music3Dit {
         let pool = self.pool.as_deref();
         let mut h = x.to_vec();
         blk.ff_norm.apply(&mut h, hs);
+        // The resident chain first: both GEMMs and the GLU on the card,
+        // with only `h` up and the block's output back. The host arm of
+        // this exchange moved 68 MB more per block-step, and the split
+        // timer put transfers at 82% of the device arm's time on the
+        // stand this was tuned on. CMF_MUSIC3_DEVFFN=0 kills it.
+        if std::env::var("CMF_MUSIC3_DEVFFN").as_deref() != Ok("0") {
+            if let (Some((m1, i1)), Some((m2, i2))) = (
+                match &blk.ff_in {
+                    crate::dit::Proj::Q(q) => q.q4tp_mapped(),
+                    _ => None,
+                },
+                match &blk.ff_out {
+                    crate::dit::Proj::Q(q) => q.q4tp_mapped(),
+                    _ => None,
+                },
+            ) {
+                if std::sync::Arc::ptr_eq(m1, m2) {
+                    let mut ffo = vec![0f32; n * hs];
+                    if crate::gpu::music3_ffn(
+                        m1,
+                        i1,
+                        i2,
+                        &h,
+                        &blk.ff_in_b,
+                        n,
+                        hs,
+                        self.inter,
+                        &mut ffo,
+                    ) {
+                        for p in 0..n {
+                            for j in 0..hs {
+                                x[p * hs + j] += ffo[p * hs + j] + blk.ff_out_b[j];
+                            }
+                        }
+                        prof::add(&prof::FFN, _t);
+                        return;
+                    }
+                }
+            }
+        }
         let mut gu = vec![0f32; n * 2 * self.inter];
         blk.ff_in.matmat(&h, n, &mut gu, pool);
         // GLU here is `value * silu(gate)` with VALUE first, and the
