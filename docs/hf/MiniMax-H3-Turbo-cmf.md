@@ -55,9 +55,17 @@ One transformer denoises picture and sound together in one packed sequence.
 | `mmh3-turbo-fl2va-q4tp.cmf` | 23.94 GB | 24 GB+ | yes | **the default** |
 | `mmh3-turbo-q4tp.cmf` | 23.47 GB | 24 GB+ | no | same, without the vision tower |
 | **`mmh3-turbo-clipproj4b-q4tp.cmf`** | **13.16 GB** | **16–20 GB** | no | **the small one**, peaks at 15.1 GB |
+| **`mmh3-turbo-clipproj4b-fl2va-q4tp.cmf`** | **14.48 GB** | **16–24 GB** | **yes** | the small one WITH start/end frames — the 4B vision tower and the VAE encoder join the compact build |
 | `mmh3-turbo-fl2va-q2tp.cmf` | 18.74 GB | — | yes | don't render with this |
 
 Text-to-video everywhere; the `fl2va` files also take a first and/or last frame
+(`--first-frame`/`--last-frame`, binary P6 PPM). The compact
+`clipproj4b-fl2va` file was verified frame-for-frame: the conditioning
+image comes back as frame 0 of the render. One honest caveat: its
+ClipProj projection was fitted on text-only encoder activations, so with
+a picture in the prompt the conditioning quality on complex scenes is
+still being compared against the full-encoder fl2va files — report what
+you see in the discussions.
 ([keyframes](#keyframe-to-video)). The release's third path, `ref2va`, is not
 ported. The Turbo LoRA is merged into the weights, so the file IS the 4-step
 model — nothing else to download. 47.83 B parameters, 2 361 tensors,
