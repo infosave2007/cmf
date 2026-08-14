@@ -22855,11 +22855,27 @@ fn o1_ensure(
     let g0 = views.first()?;
     let (gcnt, hcnt, m, w, ns) = (views.len(), g0.heads.len(), g0.m_eff, g0.w, g0.sink_len);
     // Landmark threads park at lane 200+ in the attend kernel.
+    //
+    // A refusal here silently costs the whole token its graph — 6.4
+    // against 49.2 tok/s on Qwen3.8 — so every branch says which limit
+    // it is and with what numbers. Silent capability gates are how a
+    // day was once spent reading one KV ceiling as three model bugs.
     if ns + w > 196 || m > 32 || g0.d > 256 || g0.dv > 256 {
+        graph_refused("o1 geometry over kernel limits");
+        tracing::warn!(
+            "o1_ensure L{li}: sink+window {}+{} (cap 196), landmarks {m} (cap 32), \
+             d {} dv {} (cap 256)",
+            ns, w, g0.d, g0.dv
+        );
         return None;
     }
     for v in views {
         if v.m_eff != m || v.w != w || v.sink_len != ns || v.heads.len() != hcnt {
+            graph_refused("o1 groups disagree on geometry");
+            tracing::warn!(
+                "o1_ensure L{li}: group m_eff {} w {} sink {} heads {} vs first {m}/{w}/{ns}/{hcnt}",
+                v.m_eff, v.w, v.sink_len, v.heads.len()
+            );
             return None;
         }
     }
