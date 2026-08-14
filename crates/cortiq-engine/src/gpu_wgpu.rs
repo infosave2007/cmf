@@ -32747,6 +32747,25 @@ pub fn dit_block_seg(
         && c.q4tp_mm_coop_f16.is_some()
         && c.q4tp_dq_f16.is_some()
         && ((c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some());
+    // Say once whether this arm actually engaged. The flag needs three
+    // pipelines and a `cols % 2` that a refusal does not report, so a
+    // measurement that shows no win is otherwise indistinguishable from
+    // one where the arm never ran — which is exactly how the plane cache
+    // came to be judged on a model it never executed under.
+    if std::env::var("CMF_DIT_COOP16").as_deref() == Ok("1") {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                "dit coop16 requested: q4tp {}, mm_coop_f16 {}, dq_f16 {}, amax {} -> {}",
+                a.q4tp,
+                c.q4tp_mm_coop_f16.is_some(),
+                c.q4tp_dq_f16.is_some(),
+                c.act_absmax.is_some() || c.act_amax_part.is_some(),
+                if coop16 { "ACTIVE" } else { "declined" }
+            );
+        }
+    }
     let uid = model.uid() as usize;
     let mm_enc = |enc: &mut wgpu::CommandEncoder,
                   idx: usize,
