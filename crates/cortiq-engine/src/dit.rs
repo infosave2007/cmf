@@ -62,6 +62,54 @@ impl Proj {
         }
     }
 
+    /// The token-graph descriptor for this weight, when it is a
+    /// quantized mapped tensor the graph can read in place.
+    pub(crate) fn graph_w(&self) -> Option<(&Arc<CmfModel>, crate::gpu::GraphW<'_>)> {
+        match self {
+            Proj::Q(q) => q.graph_weight().map(|(m, idx, kind, rs)| {
+                (
+                    m,
+                    crate::gpu::GraphW {
+                        idx,
+                        kind,
+                        row_scale: rs,
+                        data: &[],
+                    },
+                )
+            }),
+            Proj::F32 { .. } => None,
+        }
+    }
+
+    pub(crate) fn cols(&self) -> usize {
+        match self {
+            Proj::F32 { cols, .. } => *cols,
+            Proj::Q(q) => q.cols(),
+        }
+    }
+
+    /// The same product as `matmat`, but as `b` separate matvecs.
+    ///
+    /// For a NARROW batch that is not a pessimisation, it is the point:
+    /// the batched device kernel tiles for 32 columns and at b=2 — an
+    /// autoregressive decode with its classifier-free pair — throws away
+    /// fifteen sixteenths of every tile, which is why simply lowering the
+    /// batch floor measured SLOWER than the host. The matvec kernel is
+    /// written for this shape and carries its own probe and threshold.
+    pub(crate) fn matvec_rows(&self, xs: &[f32], b: usize, out: &mut [f32], pool: Option<&Pool>) {
+        let (rows, cols) = (self.rows(), self.cols());
+        match self {
+            Proj::F32 { w, .. } => {
+                crate::fcd_ops::gemm_nt(xs, w, out, b, cols, rows, pool)
+            }
+            Proj::Q(q) => {
+                for i in 0..b {
+                    q.matvec(&xs[i * cols..(i + 1) * cols], &mut out[i * rows..(i + 1) * rows], pool);
+                }
+            }
+        }
+    }
+
     /// y[b, rows] = x[b, cols] · Wᵀ.
     pub(crate) fn matmat(&self, xs: &[f32], b: usize, out: &mut [f32], pool: Option<&Pool>) {
         match self {

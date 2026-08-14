@@ -26,6 +26,7 @@ pub mod kv_cache;
 pub mod linear_core;
 pub mod loader;
 pub mod mmh3;
+pub mod mm_ab;
 pub mod music3;
 pub mod nystrom;
 pub mod pin;

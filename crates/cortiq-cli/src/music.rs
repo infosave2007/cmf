@@ -115,6 +115,9 @@ pub fn cmd_music(
     // it the pool is the difference between seconds and minutes.
     let pool = cortiq_engine::pool::Pool::from_env();
     let pcm = dav.decode(&latent, n, pool.as_deref());
+    if cortiq_engine::mm_ab::on() {
+        eprintln!("{}", cortiq_engine::mm_ab::report());
+    }
     if cortiq_engine::music3::prof::on() {
         eprintln!("  denoise split: {}", cortiq_engine::music3::prof::report());
     }
