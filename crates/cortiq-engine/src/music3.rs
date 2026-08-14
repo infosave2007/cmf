@@ -275,7 +275,9 @@ impl Music3Dit {
         let mut h = x.to_vec();
         blk.pre_norm.apply(&mut h, hs);
         let mut qkv = vec![0f32; n * 3 * hs];
+        let _t = prof::start();
         blk.qkv.matmat(&h, n, &mut qkv, pool);
+        prof::add(&prof::QKV, _t);
         // to_qkv emits q|k|v concatenated along the FEATURE axis, so the
         // three live at column offsets, not row offsets.
         let mut q = vec![0f32; n * hs];
@@ -290,6 +292,7 @@ impl Music3Dit {
         self.rope(&mut q, &mut k, n);
         let scale = 1.0 / (hd as f32).sqrt();
         let mut attn = vec![0f32; n * hs];
+        let _ta = prof::start();
         // The device first. This is the quadratic part and the reason a
         // CPU-only run was beating a GPU one: everything around it went
         // to the card and the biggest single stage stayed home. The
@@ -309,8 +312,11 @@ impl Music3Dit {
                 }
             }
             if crate::gpu::dit_attention(&qh, &kh, &vh, nh, nh, n, hd, scale, &mut attn) {
+                prof::add(&prof::ATTN, _ta);
                 let mut proj = vec![0f32; n * hs];
+                let _t = prof::start();
                 blk.out.matmat(&attn, n, &mut proj, pool);
+                prof::add(&prof::OUT, _t);
                 for (a, b) in x.iter_mut().zip(&proj) {
                     *a += b;
                 }
@@ -356,8 +362,11 @@ impl Music3Dit {
                 None => work(0, nh),
             }
         }
+        prof::add(&prof::ATTN, _ta);
         let mut proj = vec![0f32; n * hs];
+        let _t = prof::start();
         blk.out.matmat(&attn, n, &mut proj, pool);
+        prof::add(&prof::OUT, _t);
         for (a, b) in x.iter_mut().zip(&proj) {
             *a += b;
         }
@@ -366,6 +375,7 @@ impl Music3Dit {
 
     /// The second half of a block: norm, GEGLU, residual.
     fn block_ffn(&self, blk: &Block, x: &mut [f32], n: usize) {
+        let _t = prof::start();
         let hs = self.hidden;
         let pool = self.pool.as_deref();
         let mut h = x.to_vec();
@@ -394,6 +404,7 @@ impl Music3Dit {
                 x[p * hs + j] += ffo[p * hs + j] + blk.ff_out_b[j];
             }
         }
+        prof::add(&prof::FFN, _t);
     }
 
     /// Latent frames the transformer will attend across in one go, and
@@ -1451,5 +1462,46 @@ mod tests {
             .fold(0f32, f32::max);
         assert!(dt > 1e-5, "timestep changed nothing — the token is lost");
         eprintln!("music3 dit: rms {rms:.4}, d/dcond {dc:.4}, d/dt {dt:.4}");
+    }
+}
+
+/// Where a denoise step's time goes, under `CMF_MUSIC3_PROF=1`. The
+/// stage timers say "denoise"; three optimizations were argued about
+/// without anything saying which part of it.
+pub mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    pub static QKV: AtomicU64 = AtomicU64::new(0);
+    pub static ATTN: AtomicU64 = AtomicU64::new(0);
+    pub static OUT: AtomicU64 = AtomicU64::new(0);
+    pub static FFN: AtomicU64 = AtomicU64::new(0);
+
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CMF_MUSIC3_PROF").as_deref() == Ok("1"))
+    }
+
+    /// `None` when profiling is off, so an untimed run pays one branch.
+    pub fn start() -> Option<Instant> {
+        on().then(Instant::now)
+    }
+
+    pub fn add(c: &AtomicU64, t: Option<Instant>) {
+        if let Some(t) = t {
+            c.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn report() -> String {
+        let g = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e9;
+        format!(
+            "qkv {:.1}s, attention {:.1}s, out {:.1}s, ffn {:.1}s",
+            g(&QKV),
+            g(&ATTN),
+            g(&OUT),
+            g(&FFN)
+        )
     }
 }
