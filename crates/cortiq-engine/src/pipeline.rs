@@ -2068,6 +2068,19 @@ impl Pipeline {
             }
 
             if self.kv_cache.needs_eviction() {
+                // Say it ONCE, loudly: past this point the model keeps
+                // talking but has lost half its context, and on a GDN
+                // hybrid the graph's device state goes stale on top. The
+                // Qwen3.8 bring-up spent a day reading this cliff as
+                // three different model bugs.
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::warn!(
+                        "KV cache full at {} positions — evicting half; quality \
+                         will degrade. Raise CMF_MAX_SEQ.",
+                        self.kv_cache.max_seq_len,
+                    );
+                });
                 let keep = (self.kv_cache.max_seq_len / 2).max(1);
                 self.kv_cache.evict(keep);
             }
