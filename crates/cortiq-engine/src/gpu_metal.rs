@@ -3042,6 +3042,79 @@ kernel void q4b_matvec_h(
 // (lo nibble = even element, hi = odd, value = nibble − 8), so
 // q4_dot8_fast is reused as-is. 18B tiles are only 2-aligned → the
 // nibble words go through the unaligned byte loaders.
+// One dispatch, two independent projections of one input — the dense
+// FFN's gate and up. Exists because a serial Metal encoder pays a
+// full hazard barrier between every pair of dispatches (~0.12 ms on
+// M4 across ~180 dispatches a token = the missing half of the bus,
+// measured by the five-arm bandwidth test), and gate|up never needed
+// one: same input, disjoint outputs. The weight arena makes it clean —
+// both live in the file buffer, bound twice at their own offsets.
+static inline void q4t_mv_side(
+    device const uchar* q,
+    device const float* x,
+    device float*       y,
+    uint gpr, uint rows, uint sg, uint lane, uint tg, uint sgs)
+{
+    uint r0 = (tg * sgs + sg) * 4u;
+    if (r0 >= rows) return;
+    uint nr = min(rows - r0, 4u);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint xb = g * 32u;
+        device const float4* xv = (device const float4*)(x + xb);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        for (uint ri = 0u; ri < nr; ++ri) {
+            ulong t = ((ulong)(r0 + ri) * gpr + (ulong)g) * 18u;
+            device const ushort* p16 = (device const ushort*)(q + t);
+            half scale = as_type<half>(p16[0]);
+            uint b0 = (uint)p16[1] | ((uint)p16[2] << 16);
+            uint b1 = (uint)p16[3] | ((uint)p16[4] << 16);
+            uint b2 = (uint)p16[5] | ((uint)p16[6] << 16);
+            uint b3 = (uint)p16[7] | ((uint)p16[8] << 16);
+            float gsum = q4_dot8_fast(b0, x0, x1)
+                       + q4_dot8_fast(b1, x2, x3)
+                       + q4_dot8_fast(b2, x4, x5)
+                       + q4_dot8_fast(b3, x6, x7);
+            float contrib = (float)scale * gsum;
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    if (lane == 0u) {
+        y[r0] = acc0;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
+    }
+}
+
+kernel void q4t_matvec_dual(
+    device const uchar* qa   [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       ya   [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    device const uchar* qb   [[buffer(5)]],
+    device float*       yb   [[buffer(6)]],
+    constant uint&      rows2 [[buffer(7)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint tg1 = (rows + sgs * 4u - 1u) / (sgs * 4u);
+    if (tgpos < tg1) {
+        q4t_mv_side(qa, x, ya, gpr, rows, sg, lane, tgpos, sgs);
+    } else {
+        q4t_mv_side(qb, x, yb, gpr, rows2, sg, lane, tgpos - tg1, sgs);
+    }
+}
+
 kernel void q4t_matvec(
     device const uchar* q    [[buffer(0)]],
     device const float* x    [[buffer(1)]],
@@ -4065,6 +4138,7 @@ struct Ctx {
     q4b: ComputePipelineState,
     q4bh: ComputePipelineState,
     q4t: ComputePipelineState,
+    q4t_dual: ComputePipelineState,
     q4tp: ComputePipelineState,
     /// Job-batched q4tp matvec + its two MoE companions: the whole
     /// expert block in four dispatches instead of four per expert.
@@ -4253,6 +4327,7 @@ fn init() -> Result<Ctx, String> {
     let q4b = pso("q4b_matvec")?;
     let q4bh = pso("q4b_matvec_h")?;
     let q4t = pso("q4t_matvec")?;
+    let q4t_dual = pso("q4t_matvec_dual")?;
     let q4tp = pso("q4tp_matvec")?;
     let q4tpjobs = pso("q4tp_matvec_jobs")?;
     let q2tpjobs = pso("q2tp_matvec_jobs")?;
@@ -4320,6 +4395,7 @@ fn init() -> Result<Ctx, String> {
         q4b,
         q4bh,
         q4t,
+        q4t_dual,
         q4tp,
         q4tpjobs,
         q2tpjobs,
@@ -4447,7 +4523,30 @@ pub fn q8_resident_or_upload(model: &Arc<CmfModel>, _idx: usize, may_upload: boo
 /// ~1.3 ms of completion latency, so the count IS the frame budget.
 pub static METAL_SUBMITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// CMF_METAL_HOSTPROF=1: how many times a token actually WAITS on a
+/// command buffer, and what those waits cost. The submit counter says
+/// 45 a token; the ~1.3 ms completion latency only bites where the
+/// host blocks — this names the sites worth removing.
+pub(crate) fn waitprof(dt: std::time::Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NS: AtomicU64 = AtomicU64::new(0);
+    static N: AtomicU64 = AtomicU64::new(0);
+    if std::env::var("CMF_METAL_HOSTPROF").as_deref() != Ok("1") {
+        return;
+    }
+    NS.fetch_add(dt.as_nanos() as u64, Ordering::Relaxed);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 500 == 0 {
+        eprintln!(
+            "metal waitprof: {n} waits, {:.2} ms avg, {:.1} ms total",
+            NS.load(Ordering::Relaxed) as f64 / n as f64 / 1e6,
+            NS.load(Ordering::Relaxed) as f64 / 1e6
+        );
+    }
+}
+
 fn submit_and_wait(c: &Ctx, cmd: &metal::CommandBufferRef, outs: &[&Buffer]) {
+    let _wp = std::time::Instant::now();
     // NOTE: a "fast flag" variant (last encoder writes a ticket into a
     // shared buffer, CPU spins on the word) was tried here and REVERTED:
     // the flag becoming visible does not imply the earlier passes' output
@@ -4461,6 +4560,7 @@ fn submit_and_wait(c: &Ctx, cmd: &metal::CommandBufferRef, outs: &[&Buffer]) {
     METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     cmd.commit();
     wait_fast(cmd);
+    waitprof(_wp.elapsed());
 }
 
 /// How long the recent waits took, in microseconds (EWMA). Decides whether
@@ -9658,6 +9758,37 @@ impl TokenGraph {
         }
         {
             let (ag, au) = (self.proj_abs(gate).unwrap(), self.proj_abs(up).unwrap());
+            // Gate and up as ONE dispatch when both are q4t
+            // (CMF_METAL_DUAL=1): a serial encoder pays a hazard
+            // barrier between every dispatch pair, and this pair never
+            // needed one — same input, disjoint outputs. The weight
+            // arena binds twice at each side's own offset.
+            let dual_ok = std::env::var("CMF_METAL_DUAL").as_deref() == Ok("1")
+                && matches!(ag.1, ProjKind::Q4t)
+                && matches!(au.1, ProjKind::Q4t)
+                && gate.1 % 4 == 0;
+            if dual_ok {
+                let c = self.c;
+                enc.set_compute_pipeline_state(&c.q4t_dual);
+                enc.set_buffer(0, Some(&self.fbuf), ag.0 as u64);
+                enc.set_buffer(1, Some(&self.n_b), 0);
+                enc.set_buffer(2, Some(&fg_b), 0);
+                let gpr_u = (gate.2 / GROUP_SIZE) as u32;
+                let rows_u = gate.1 as u32;
+                let rows2_u = up.1 as u32;
+                enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+                enc.set_buffer(5, Some(&self.fbuf), au.0 as u64);
+                enc.set_buffer(6, Some(&fu_b), 0);
+                enc.set_bytes(7, 4, &rows2_u as *const u32 as *const std::ffi::c_void);
+                let sgs = 8u64;
+                let tg1 = (gate.1 as u64).div_ceil(sgs * 4);
+                let tg2 = (up.1 as u64).div_ceil(sgs * 4);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(tg1 + tg2, 1, 1),
+                    MTLSize::new(sgs * 32, 1, 1),
+                );
+            } else {
             encode_proj(
                 self.c,
                 enc,
@@ -9680,6 +9811,7 @@ impl TokenGraph {
                 up.1,
                 up.2 / GROUP_SIZE,
             );
+            }
         }
         {
             enc.set_compute_pipeline_state(&self.c.silu);

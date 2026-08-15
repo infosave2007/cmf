@@ -2512,3 +2512,33 @@ pub fn hostprof_total(t0: std::time::Instant) {
         );
     }
 }
+
+
+/// Per-stage host-encode accumulator for the Metal token loop
+/// (CMF_GRAPH_HOSTPROF=1). Stage 0 = GDN-run encode; everything else
+/// falls out by subtraction from hostprof's encode total.
+pub fn stageprof(stage: u32, dt: std::time::Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NS: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static N: AtomicU64 = AtomicU64::new(0);
+    if std::env::var("CMF_GRAPH_HOSTPROF").as_deref() != Ok("1") {
+        return;
+    }
+    NS[stage as usize % 4].fetch_add(dt.as_nanos() as u64, Ordering::Relaxed);
+    if stage == 1 {
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 200 == 0 {
+            eprintln!(
+                "stageprof: planning {:.2} ms/tok | gdn-item {:.2} ms/tok | attn-item {:.2} ms/tok ({n} tok)",
+                NS[1].load(Ordering::Relaxed) as f64 / n as f64 / 1e6,
+                NS[2].load(Ordering::Relaxed) as f64 / n as f64 / 1e6,
+                NS[3].load(Ordering::Relaxed) as f64 / n as f64 / 1e6
+            );
+        }
+    }
+}
