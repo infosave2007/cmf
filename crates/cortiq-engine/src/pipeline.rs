@@ -2159,9 +2159,14 @@ impl Pipeline {
             }};
         }
 
-        // Speculation watchdog: a draft head that stops agreeing with the
-        // trunk (below 40% after the first 40 drafts) makes every round a
-        // loss — the plain path takes over for the rest of the generation.
+        // Speculation watchdog. A k=4 round costs ~3.8 plain tokens on the
+        // 5090 (draft 6.6 + verify 66.6 + commit 4.8 ms against a 20.6 ms
+        // token), so it pays only when ~2.8 of the 4 drafts land — an
+        // accepted/drafted ratio of ~70%. Predictable text (code, the
+        // bench's prose loop, structured output) runs at 80–95% and gains
+        // up to +25%; free prose sits at 45–60% and would LOSE. Below 70%
+        // after the first 40 drafts the plain path takes over for the rest
+        // of the generation.
         let mut spec_watchdog_off = false;
         // ── Decode ──
         let mut next_pos = input_ids.len();
@@ -2278,7 +2283,7 @@ impl Pipeline {
                     ) {
                         next_pos = n_pos;
                         hidden = new_h;
-                        if drafted >= 40 && accepted * 100 < drafted * 40 {
+                        if drafted >= 40 && accepted * 100 < drafted * 70 {
                             spec_watchdog_off = true;
                             tracing::info!(
                                 "speculation off: {accepted} of {drafted} drafts accepted"
