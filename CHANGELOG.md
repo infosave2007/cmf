@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.78] - 2026-08-15
+
+O(1) decode rides the whole-token graph. Two design requirements had
+collided silently on GDN hybrids — the graph seeds its recurrent
+mirrors during prefill, Nyström records its sealing q-trace only in
+the CPU prefill — and Qwen3.8, the first model with both, ran o1 at
+0.7 tok/s on the per-op path with nothing saying why. Prefill now
+stays on the CPU when o1 is active and the graph's first decode seeds
+the GDN state from the host: ~25 tok/s measured, 35× the per-op path,
+output verified coherent. Four silent gates on that trail now speak
+(the o1 view export, the seal counter, the geometry limits, the
+exact-only seal), because the whole day was spent listening to their
+silence.
+
+Also here: an in-kernel elimination toolkit for the q4tp matvec
+(CMF_MV_PROBE bits for codes, activations, reduction and ladder; a
+dual gate+up dispatch behind CMF_MV_DUAL; a VRAM bandwidth test), and
+the honest verdict it produced — every in-kernel suspect measures
+null on a virtualized 5090 whose clean streams reach 1.6 TB/s, so the
+next decode speedup needs bare metal or a whole-layer fusion, not
+another shave.
+
 ## [0.5.77] - 2026-08-14
 
 The Qwen3.8-27B bring-up release. The model's recommended sampling
