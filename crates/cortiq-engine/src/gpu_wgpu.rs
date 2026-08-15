@@ -4520,6 +4520,240 @@ fn q4tp_matvec4_bku(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+
+// ── INT8-ACTIVATION batched matvec (`CMF_VERIFY_I8=1`): the speculative
+// verify's b ≤ 8 rows over q4tp weights with the activations quantized to
+// int8 per 32-group and the inner product on `dot4I8Packed` (dp4a: four
+// MACs an instruction). The f32 batched kernel above unpacks a weight
+// word into eight f32 (I2F/magic + sub) and pays 32 FMAs per (row,
+// element) — measured 3.2x a single token for 5 rows, +4.7 ms per extra
+// row, i.e. bound by per-row work, not by the weight stream. Here a word's
+// eight nibbles become two packed int8x4 (mask, shift, mask — 3 int ops,
+// shared across the batch) and each element costs two dp4a per word: for
+// a 32-group per row that is 8 dp4a + one I2F + 2 FMA an element against
+// 32 FMA + a share of 32 unpacks. The bias: Σ (n − 8)·x = Σ n·x − 8·Σx,
+// with Σx per group precomputed by the quantizer.
+//
+// NOT bit-exact against the one-vector kernel: x carries an int8 rounding
+// (per-32 symmetric, |err| ≤ s/2 with s = max|x|/127 — the Q8_1
+// activation grid every q4 matvec in llama.cpp runs on). The verify's
+// argmax is the batched kernel's own; a near-tie can therefore resolve
+// differently from the plain path. Opt-in for that reason; the parity
+// test bounds the drift.
+//
+// x8 layout (per element e, group g): two vec4<u32> at (e·gpr + g)·2:
+//   [w0.even, w0.odd, w1.even, w1.odd], [w2.even, w2.odd, w3.even, w3.odd]
+// where word j covers x[8j..8j+8) of the group, `even` packs x[8j+0,2,4,6]
+// and `odd` x[8j+1,3,5,7] as int8 — the order the nibbles come out of a
+// weight word (lo nibbles = even positions, hi = odd).
+// xs (per element, group): vec2(s_x, 8·s_x·Σq).
+@group(0) @binding(9) var<storage, read> q4v_x8 : array<vec4<u32>>;
+@group(0) @binding(10) var<storage, read> q4v_xs : array<vec2<f32>>;
+@group(0) @binding(11) var<storage, read_write> q4v_x8w : array<vec4<u32>>;
+@group(0) @binding(12) var<storage, read_write> q4v_xsw : array<vec2<f32>>;
+
+fn pack_i8x4(a: i32, b: i32, c: i32, d: i32) -> u32 {
+    return (u32(a) & 0xFFu) | ((u32(b) & 0xFFu) << 8u) | ((u32(c) & 0xFFu) << 16u) | ((u32(d) & 0xFFu) << 24u);
+}
+
+// One thread per (element, group): 32 f32 → int8, packed even/odd per
+// word, plus (s, 8·s·Σq). Params: np = gpr, rows = batch.
+@compute @workgroup_size(256)
+fn x_quant_i8(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let gpr = q1p.np;
+    let nb = q1p.rows;
+    let i = gid.x;
+    if (i >= gpr * nb) { return; }
+    let x0 = i * 8u;
+    var amax = 0.0;
+    for (var j = 0u; j < 8u; j = j + 1u) {
+        let v = abs(q4v_x[x0 + j]);
+        amax = max(amax, max(max(v.x, v.y), max(v.z, v.w)));
+    }
+    let s = select(amax / 127.0, 1.0, amax == 0.0);
+    let inv = 1.0 / s;
+    var sum = 0;
+    var out0 = vec4<u32>(0u);
+    var out1 = vec4<u32>(0u);
+    for (var j = 0u; j < 4u; j = j + 1u) {
+        let a = q4v_x[x0 + j * 2u];
+        let b = q4v_x[x0 + j * 2u + 1u];
+        let qa = vec4<i32>(round(a * inv));
+        let qb = vec4<i32>(round(b * inv));
+        let qa2 = clamp(qa, vec4<i32>(-127), vec4<i32>(127));
+        let qb2 = clamp(qb, vec4<i32>(-127), vec4<i32>(127));
+        sum = sum + qa2.x + qa2.y + qa2.z + qa2.w + qb2.x + qb2.y + qb2.z + qb2.w;
+        let ev = pack_i8x4(qa2.x, qa2.z, qb2.x, qb2.z);
+        let od = pack_i8x4(qa2.y, qa2.w, qb2.y, qb2.w);
+        if (j == 0u) { out0.x = ev; out0.y = od; }
+        if (j == 1u) { out0.z = ev; out0.w = od; }
+        if (j == 2u) { out1.x = ev; out1.y = od; }
+        if (j == 3u) { out1.z = ev; out1.w = od; }
+    }
+    q4v_x8w[i * 2u] = out0;
+    q4v_x8w[i * 2u + 1u] = out1;
+    q4v_xsw[i] = vec2<f32>(s, 8.0 * s * f32(sum));
+}
+
+@compute @workgroup_size(256)
+fn q4tp_matvec4_bk8(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(num_workgroups) nwg: vec3<u32>,
+                    @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let nb = min(max(q1p._p0, 1u), 8u);
+    let blocks = (rows + 15u) / 16u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks) { break; }
+        let base = wb * 16u;
+        for (var t = lid; t < 512u; t = t + 256u) {
+            let r = base + (t >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                lad_q4w[t] = exp2(pr.x + f32(t & 31u) * pr.y);
+            }
+        }
+        workgroupBarrier();
+        let r0 = base + sub;
+        let r1 = base + sub + 4u;
+        let r2 = base + sub + 8u;
+        let r3 = base + sub + 12u;
+        // acc[row] = two vec4 (elements 0..3, 4..7)
+        var a0 = vec4<f32>(0.0); var a0h = vec4<f32>(0.0);
+        var a1 = vec4<f32>(0.0); var a1h = vec4<f32>(0.0);
+        var a2 = vec4<f32>(0.0); var a2h = vec4<f32>(0.0);
+        var a3 = vec4<f32>(0.0); var a3h = vec4<f32>(0.0);
+        if (r0 < rows) {
+            let c0 = codes_b + r0 * cstride;
+            let c1 = codes_b + r1 * cstride;
+            let c2 = codes_b + r2 * cstride;
+            let c3 = codes_b + r3 * cstride;
+            let l1 = r1 < rows;
+            let l2 = r2 < rows;
+            let l3 = r3 < rows;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                var cv = q4tp_byte(c0 + cbo);
+                if (sh > 3u) { cv = cv | (q4tp_byte(c0 + cbo + 1u) << 8u); }
+                let s0 = lad_q4w[(sub << 5u) + ((cv >> sh) & 31u)];
+                let v0 = q4v_w[r0 * gpr + g];
+                var s1 = 0.0; var v1 = vec4<u32>(0u);
+                if (l1) {
+                    cv = q4tp_byte(c1 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c1 + cbo + 1u) << 8u); }
+                    s1 = lad_q4w[128u + (sub << 5u) + ((cv >> sh) & 31u)];
+                    v1 = q4v_w[r1 * gpr + g];
+                }
+                var s2 = 0.0; var v2 = vec4<u32>(0u);
+                if (l2) {
+                    cv = q4tp_byte(c2 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c2 + cbo + 1u) << 8u); }
+                    s2 = lad_q4w[256u + (sub << 5u) + ((cv >> sh) & 31u)];
+                    v2 = q4v_w[r2 * gpr + g];
+                }
+                var s3 = 0.0; var v3 = vec4<u32>(0u);
+                if (l3) {
+                    cv = q4tp_byte(c3 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c3 + cbo + 1u) << 8u); }
+                    s3 = lad_q4w[384u + (sub << 5u) + ((cv >> sh) & 31u)];
+                    v3 = q4v_w[r3 * gpr + g];
+                }
+                // packed nibbles: even positions (lo) / odd (hi) per word
+                let m = 0x0F0F0F0Fu;
+                let lo0 = v0 & vec4<u32>(m);       let hi0 = (v0 >> vec4<u32>(4u)) & vec4<u32>(m);
+                let lo1 = v1 & vec4<u32>(m);       let hi1 = (v1 >> vec4<u32>(4u)) & vec4<u32>(m);
+                let lo2 = v2 & vec4<u32>(m);       let hi2 = (v2 >> vec4<u32>(4u)) & vec4<u32>(m);
+                let lo3 = v3 & vec4<u32>(m);       let hi3 = (v3 >> vec4<u32>(4u)) & vec4<u32>(m);
+                var e = 0u;
+                loop {
+                    if (e >= nb) { break; }
+                    let xi = (e * gpr + g) * 2u;
+                    let xa = q4v_x8[xi];
+                    let xb = q4v_x8[xi + 1u];
+                    let xs = q4v_xs[e * gpr + g];
+                    // row 0
+                    var d = dot4I8Packed(lo0.x, xa.x) + dot4I8Packed(hi0.x, xa.y)
+                          + dot4I8Packed(lo0.y, xa.z) + dot4I8Packed(hi0.y, xa.w)
+                          + dot4I8Packed(lo0.z, xb.x) + dot4I8Packed(hi0.z, xb.y)
+                          + dot4I8Packed(lo0.w, xb.z) + dot4I8Packed(hi0.w, xb.w);
+                    let t0 = s0 * fma(f32(d), xs.x, -xs.y);
+                    d = dot4I8Packed(lo1.x, xa.x) + dot4I8Packed(hi1.x, xa.y)
+                      + dot4I8Packed(lo1.y, xa.z) + dot4I8Packed(hi1.y, xa.w)
+                      + dot4I8Packed(lo1.z, xb.x) + dot4I8Packed(hi1.z, xb.y)
+                      + dot4I8Packed(lo1.w, xb.z) + dot4I8Packed(hi1.w, xb.w);
+                    let t1 = s1 * fma(f32(d), xs.x, -xs.y);
+                    d = dot4I8Packed(lo2.x, xa.x) + dot4I8Packed(hi2.x, xa.y)
+                      + dot4I8Packed(lo2.y, xa.z) + dot4I8Packed(hi2.y, xa.w)
+                      + dot4I8Packed(lo2.z, xb.x) + dot4I8Packed(hi2.z, xb.y)
+                      + dot4I8Packed(lo2.w, xb.z) + dot4I8Packed(hi2.w, xb.w);
+                    let t2 = s2 * fma(f32(d), xs.x, -xs.y);
+                    d = dot4I8Packed(lo3.x, xa.x) + dot4I8Packed(hi3.x, xa.y)
+                      + dot4I8Packed(lo3.y, xa.z) + dot4I8Packed(hi3.y, xa.w)
+                      + dot4I8Packed(lo3.z, xb.x) + dot4I8Packed(hi3.z, xb.y)
+                      + dot4I8Packed(lo3.w, xb.z) + dot4I8Packed(hi3.w, xb.w);
+                    let t3 = s3 * fma(f32(d), xs.x, -xs.y);
+                    if (e == 0u) { a0.x += t0; a1.x += t1; a2.x += t2; a3.x += t3; }
+                    if (e == 1u) { a0.y += t0; a1.y += t1; a2.y += t2; a3.y += t3; }
+                    if (e == 2u) { a0.z += t0; a1.z += t1; a2.z += t2; a3.z += t3; }
+                    if (e == 3u) { a0.w += t0; a1.w += t1; a2.w += t2; a3.w += t3; }
+                    if (e == 4u) { a0h.x += t0; a1h.x += t1; a2h.x += t2; a3h.x += t3; }
+                    if (e == 5u) { a0h.y += t0; a1h.y += t1; a2h.y += t2; a3h.y += t3; }
+                    if (e == 6u) { a0h.z += t0; a1h.z += t1; a2h.z += t2; a3h.z += t3; }
+                    if (e == 7u) { a0h.w += t0; a1h.w += t1; a2h.w += t2; a3h.w += t3; }
+                    e = e + 1u;
+                }
+                g = g + 64u;
+            }
+        }
+        // reduce across the 64 lanes, one element at a time
+        var e = 0u;
+        loop {
+            if (e >= nb) { break; }
+            var mine = vec4<f32>(0.0);
+            if (e == 0u) { mine = vec4<f32>(a0.x, a1.x, a2.x, a3.x); }
+            if (e == 1u) { mine = vec4<f32>(a0.y, a1.y, a2.y, a3.y); }
+            if (e == 2u) { mine = vec4<f32>(a0.z, a1.z, a2.z, a3.z); }
+            if (e == 3u) { mine = vec4<f32>(a0.w, a1.w, a2.w, a3.w); }
+            if (e == 4u) { mine = vec4<f32>(a0h.x, a1h.x, a2h.x, a3h.x); }
+            if (e == 5u) { mine = vec4<f32>(a0h.y, a1h.y, a2h.y, a3h.y); }
+            if (e == 6u) { mine = vec4<f32>(a0h.z, a1h.z, a2h.z, a3h.z); }
+            if (e == 7u) { mine = vec4<f32>(a0h.w, a1h.w, a2h.w, a3h.w); }
+            partial_q4k[lid] = mine;
+            workgroupBarrier();
+            var stride = 32u;
+            loop {
+                if (stride == 0u) { break; }
+                if (l < stride) {
+                    partial_q4k[lid] = partial_q4k[lid] + partial_q4k[lid + stride];
+                }
+                workgroupBarrier();
+                stride = stride >> 1u;
+            }
+            if (l == 0u) {
+                let r = partial_q4k[sub << 6u];
+                let yo = e * rows;
+                if (r0 < rows) { q1y[yo + r0] = r.x; }
+                if (r1 < rows) { q1y[yo + r1] = r.y; }
+                if (r2 < rows) { q1y[yo + r2] = r.z; }
+                if (r3 < rows) { q1y[yo + r3] = r.w; }
+            }
+            workgroupBarrier();
+            e = e + 1u;
+        }
+        wb = wb + nwg.x;
+    }
+}
+
 // ── The batched (bku) matvec for TWO weights of one input batch in one
 // dispatch — the x2 fusion for the batch graph (verify / batched
 // prefill): gate+up, GDN qkv+z, attention k+v. Body generated from
@@ -12302,6 +12536,11 @@ struct Ctx {
     gdn_conv_k: wgpu::ComputePipeline,
     q4tp_mv_k: wgpu::ComputePipeline,
     q4tp_mv16w: wgpu::ComputePipeline,
+    /// INT8-activation batched matvec (`CMF_VERIFY_I8=1`) and its quantizer.
+    q4tp_mv4_bk8: wgpu::ComputePipeline,
+    x_quant_i8: wgpu::ComputePipeline,
+    /// Scratch for the int8 activations: (x8 packed, per-group scale/sum).
+    i8x: std::sync::Mutex<Option<(wgpu::Buffer, wgpu::Buffer, u64)>>,
     /// Two wide q4tp projections of one input in one dispatch (gate+up,
     /// GDN qkv+z, attention k+v). `CMF_MV_X2=0` splits them again.
     q4tp_mv16w_x2: wgpu::ComputePipeline,
@@ -13430,6 +13669,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let gdn_conv_k = pipe("gdn_conv_k");
     let q4tp_mv_k = pipe("q4tp_matvec4_k");
     let q4tp_mv16w = pipe("q4tp_matvec16w");
+    let q4tp_mv4_bk8 = pipe("q4tp_matvec4_bk8");
+    let x_quant_i8 = pipe("x_quant_i8");
     let q4tp_mv16w_x2 = pipe("q4tp_matvec16w_x2");
     let use_mv_x2 = std::env::var("CMF_MV_X2").map(|v| v != "0").unwrap_or(true);
     let q4tp_mv16w_gu = pipe("q4tp_matvec16w_gu");
@@ -13747,6 +13988,9 @@ fn init(dev: usize) -> Result<Ctx, String> {
         gdn_conv_k,
         q4tp_mv_k,
         q4tp_mv16w,
+        q4tp_mv4_bk8,
+        x_quant_i8,
+        i8x: std::sync::Mutex::new(None),
         q4tp_mv16w_x2,
         use_mv_x2,
         q4tp_mv16w_gu,
@@ -14292,6 +14536,90 @@ fn wgsl_main_source() -> String {
             "return bitcast<f32>((((w >> sh) & 3u) << 1u) | 0x4B000000u) - 8388611.0;",
             "return f32(((w >> sh) & 3u) << 1u) - 3.0;",
         )
+}
+
+/// `CMF_VERIFY_I8=1`: the batched (verify / small-batch prefill) q4tp
+/// matvec on int8 activations and dp4a (`q4tp_matvec4_bk8`). Not
+/// bit-exact against the one-vector kernel — see the kernel's note.
+fn verify_i8_on() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("CMF_VERIFY_I8").as_deref() == Ok("1"))
+}
+
+/// Quantize `batch` activation vectors (cols wide, f32) to the packed
+/// int8 layout, then the dp4a batched matvec: `y[e*rows + r]`.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4tp_mv4_b_i8(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    batch: usize,
+) {
+    let gpr = cols / 32;
+    let need = (batch * gpr) as u64;
+    let (x8, xsb) = {
+        let mut g = c.i8x.lock().unwrap();
+        let grow = match g.as_ref() {
+            Some((_, _, cap)) => *cap < need,
+            None => true,
+        };
+        if grow {
+            let cap = need.max(8 * 1024);
+            let x8 = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("i8-x8"),
+                size: cap * 32,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            let xsb = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("i8-xs"),
+                size: cap * 8,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            *g = Some((x8, xsb, cap));
+        }
+        let (a, b, _) = g.as_ref().unwrap();
+        (a.clone(), b.clone())
+    };
+    // quantizer: one thread per (element, group)
+    let qp = uniform_u32x4(c, [gpr as u32, batch as u32, 0, 0]);
+    let ql = c.x_quant_i8.get_bind_group_layout(0);
+    let qbind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("i8-quant"),
+        layout: &ql,
+        entries: &[
+            bind_buf(3, &qp),
+            bind_buf(5, xs),
+            bind_buf(11, &x8),
+            bind_buf(12, &xsb),
+        ],
+    });
+    let p_buf = q4tp_mv_params(c, gpr, rows, batch);
+    let layout = c.q4tp_mv4_bk8.get_bind_group_layout(0);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("mv-bk8"),
+        layout: &layout,
+        entries: &[
+            bind_buf(0, weight),
+            bind_buf(2, y),
+            bind_buf(3, &p_buf),
+            bind_buf(4, weight),
+            bind_buf(9, &x8),
+            bind_buf(10, &xsb),
+        ],
+    });
+    let mut pass = begin_pass(enc);
+    pass.set_pipeline(&c.x_quant_i8);
+    pass.set_bind_group(0, &qbind, &[]);
+    pass.dispatch_workgroups(((batch * gpr) as u32).div_ceil(256), 1, 1);
+    pass.set_pipeline(&c.q4tp_mv4_bk8);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(mv_grid((rows as u32).div_ceil(16)), 1, 1);
 }
 
 /// `CMF_MV16W=0`: the wide-row q4tp decode matvec takes the 8-row pair
@@ -26630,6 +26958,10 @@ fn encode_q4tp_mv4_b(
     // Arm 2 chunks the batch internally, so it covers up to 8; arm 1
     // has four accumulator components and stops at 4.
     let bk_max = if c.use_mv_bk >= 2 { 8 } else { 4 };
+    if verify_i8_on() && (2..=8).contains(&batch) && gpr > 64 && cols % 32 == 0 {
+        encode_q4tp_mv4_b_i8(c, enc, weight, xs, y, rows, cols, batch);
+        return true;
+    }
     if c.use_mv_bk > 0 && (2..=bk_max).contains(&batch) && gpr > 64 {
         // A kernel swap that cannot be OBSERVED is a kernel swap that
         // gets credited with someone else's timing. One line, once.
@@ -29296,6 +29628,108 @@ fn main() {
             rel < 1e-5,
             "q2tp kernel drifted from the CPU dequant: {rel:.2e}"
         );
+    }
+
+    /// The int8-activation batched kernel (dp4a) against the f32 singles:
+    /// not bit-exact by design — the activations carry a per-32 int8
+    /// rounding — but the drift must stay in the Q8_1 band (rel rms
+    /// well under 1e-2 on these random rows; llama.cpp's activation grid).
+    #[test]
+    fn wgpu_q4tp_matvec4_bk8_tracks_the_f32_singles() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let (rows, cols, batch) = (1000usize, 4096usize, 5usize);
+        let total =
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+                .unwrap();
+        let (params_off, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+        let mut wb: Vec<u8> = (0..total).map(|i| ((i * 37 + 5) % 251) as u8).collect();
+        let lo = cortiq_core::quant::f32_to_f16(-4.0);
+        let step = cortiq_core::quant::f32_to_f16(0.1);
+        for r in 0..rows {
+            let o = params_off + r * 4;
+            wb[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+            wb[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+        }
+        // activations with a spread of magnitudes (an int8 grid is per 32-group)
+        let xs: Vec<f32> = (0..batch * cols)
+            .map(|i| {
+                let t = ((i * 7919) % 1000) as f32 / 1000.0 - 0.5;
+                t * (1.0 + ((i / 32) % 5) as f32) + (i / cols) as f32 * 0.01
+            })
+            .collect();
+        let mk = |bytes: &[u8]| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let wbuf = mk(&wb);
+        let xall = mk(bytemuck::cast_slice(&xs));
+        let out = |n: usize| {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (n * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let yb = out(batch * rows);
+        let mut singles = Vec::new();
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encode_q4tp_mv4_b_i8(c, &mut enc, &wbuf, &xall, &yb, rows, cols, batch);
+        for e in 0..batch {
+            let xe = mk(bytemuck::cast_slice(&xs[e * cols..(e + 1) * cols]));
+            let ye = out(rows);
+            encode_q4tp_mv4(c, &mut enc, &wbuf, &xe, &ye, rows, cols);
+            singles.push((xe, ye));
+        }
+        let n = batch * rows;
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (2 * n * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        flush_pass(&enc);
+        enc.copy_buffer_to_buffer(&yb, 0, &stage, 0, (n * 4) as u64);
+        for (e, (_, ye)) in singles.iter().enumerate() {
+            enc.copy_buffer_to_buffer(
+                ye,
+                0,
+                &stage,
+                ((n + e * rows) * 4) as u64,
+                (rows * 4) as u64,
+            );
+        }
+        submit(c, finish_enc(enc));
+        let slice = stage.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range().expect("map");
+        let all: &[f32] = bytemuck::cast_slice(&data);
+        let (b, sgl) = all.split_at(n);
+        let nz = sgl.iter().filter(|v| **v != 0.0).count();
+        let (mut num, mut den, mut worst) = (0f64, 0f64, 0f64);
+        for (x, y) in b.iter().zip(sgl) {
+            num += ((x - y) as f64).powi(2);
+            den += (*y as f64).powi(2);
+            worst = worst.max((x - y).abs() as f64);
+        }
+        let amax = sgl.iter().fold(0f32, |m, v| m.max(v.abs())) as f64;
+        drop(data);
+        stage.unmap();
+        let rel = (num / den.max(1e-30)).sqrt();
+        eprintln!("bk8 (int8 x, dp4a) vs f32 singles: rel rms {rel:.2e}, worst |Δ| {worst:.2e} of {amax:.2e}");
+        assert!(nz > n / 2, "singles mostly zero — harness wrong");
+        assert!(rel < 5e-3, "int8-activation kernel drifted from f32: {rel:.2e}");
     }
 
     /// The batched kernel's rows against the one-vector kernel, element
