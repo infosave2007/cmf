@@ -1033,6 +1033,21 @@ impl Pipeline {
         let mut valid = 0usize;
         let mut end = start;
         crate::gpu::stageprof(1, _mt0.elapsed()); // конец планирования
+        if std::env::var("CMF_PLAN_DUMP").is_ok() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                for it in &plan {
+                    match it {
+                        Item::Gdn { first, run } => {
+                            eprintln!("plan: Gdn first={first} len={}", run.len())
+                        }
+                        Item::Attn { li, full_gpu, .. } => {
+                            eprintln!("plan: Attn li={li} full_gpu={full_gpu}")
+                        }
+                    }
+                }
+            });
+        }
         for item in &plan {
 
             let ok = match item {
