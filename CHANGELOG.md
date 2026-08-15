@@ -16,15 +16,22 @@ aquarium example.
 
 ### Added
 
-- **Speculative sampling on the token graph.** `CMF_GRAPH_SPEC=1`
-  used to engage for greedy only; now every sampler configuration
-  goes through draft-from-the-MTP-head's-own-distribution, accept
-  with min(1, p/q), correct from max(0, p − q) — the emitted stream is
-  distributed exactly as the plain sampler's (a 400k-trial test holds
-  the empirical law within L1 0.01 of the target). Greedy without
-  penalties keeps the bit-exact argmax verify. `CMF_GRAPH_SPEC_SAMPLE=0`
-  confines speculation to greedy again. Measured greedy on the RTX 5090
-  pod, q4tp: k=3 51.2 / k=4 51.8 tok/s against a plain 47.1.
+- **Speculative sampling on the token graph** (`CMF_GRAPH_SPEC=1
+  CMF_GRAPH_SPEC_SAMPLE=1`): draft from the MTP head's own post-chain
+  distribution, accept with min(1, p/q), correct from max(0, p − q) —
+  the emitted stream is distributed exactly as the plain sampler's (a
+  400k-trial test holds the empirical law within L1 0.01 of the
+  target). Opt-in: on the RTX 5090 pod at the Qwen instruct row it
+  decoded 19–22 tok/s against a plain 40 (nine post-chain
+  distributions a round, lower acceptance than greedy, a verify that
+  costs ~2.7 single tokens). Greedy — now with penalties too, by
+  argmax equality of penalized rows — stays bit-exact and pays:
+  q4tp k=3 51.2 / k=4 52.3 tok/s against a plain 47.1–48.2.
+- **The MTP draft block runs on the token graph**: one submit for
+  block + fused head with device attention over the block's own
+  mirror, hidden and logits back in one map; the round's accepted
+  pairs warm the block as one batched graph run. `CMF_MTP_GRAPH=0`
+  keeps the per-op arm.
 - **GQA-shared split-K decode attention** (`gqa_attend_gpart`): one
   workgroup per (kv head, 256-position chunk) serves every query head
   of the group, so a K/V row is read once instead of once per query
