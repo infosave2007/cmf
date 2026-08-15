@@ -3622,6 +3622,202 @@ fn q4tp_matvec4_nored(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// Dual bindings: the second projection's weight (u32 + vec4 views)
+// and output. Only the dual entry reads them, so every other entry's
+// auto layout is untouched.
+@group(0) @binding(6) var<storage, read> q1w2 : array<u32>;
+@group(0) @binding(7) var<storage, read> q4v_w2 : array<vec4<u32>>;
+@group(0) @binding(8) var<storage, read_write> q1y2 : array<f32>;
+fn q4tp_byte2(off: u32) -> u32 {
+    return (q1w2[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+// DUAL matvec (CMF_MV_DUAL=1): two independent projections of ONE
+// input in ONE dispatch — gate+up, and q/k/v by pairs. Exists because
+// the elimination table ended at the dispatch boundary: every in-kernel
+// component measured null while the identical access pattern streams
+// 1623 GB/s in isolation, and the pass serializes each 10-17 us wave
+// against the next ("dispatches within a pass are serialized"). Side B
+// mirrors side A over its own bindings; rows differ, so the layout
+// arithmetic (params_w, codes_b) is per side.
+@compute @workgroup_size(256)
+fn q4tp_matvec4_dual(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(num_workgroups) nwg: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let rows2 = q1p._p1;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let params_w2 = rows2 * gpr * 4u;
+    let codes_b2 = rows2 * gpr * 16u + rows2 * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let blocks1 = (rows + 7u) / 8u;
+    let blocks2 = (rows2 + 7u) / 8u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks1 + blocks2) { break; }
+        if (wb < blocks1) {
+            let base = wb * 8u;
+            let bofs = 0u;
+        {
+            let r = base + (lid >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                lad_q4v[lid] = exp2(pr.x + f32(lid & 31u) * pr.y);
+            }
+        }
+        workgroupBarrier();
+        let wrow_a = base + sub;
+        let wrow_b = base + sub + 4u;
+        let row_a = bofs + wrow_a;
+        let row_b = bofs + wrow_b;
+        let live_a = wrow_a < rows;
+        let live_b = wrow_b < rows;
+        // In vec4 units: (row / lora) * gpr * 32 floats.
+        let xblk = 0u;
+        var acc_a = 0.0;
+        var acc_b = 0.0;
+        if (live_a) {
+            let crow_a = codes_b + wrow_a * cstride;
+            let crow_b = codes_b + wrow_b * cstride;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                var cv_a = q4tp_byte(crow_a + cbo);
+                if (sh > 3u) { cv_a = cv_a | (q4tp_byte(crow_a + cbo + 1u) << 8u); }
+                let v_a = q4v_w[wrow_a * gpr + g];
+                // `_p1` is the low-rank group width. Set, it slides the
+                // activation window with the row — which is the ONLY thing
+                // the grouped output projection does differently, and the
+                // reason it had a kernel of its own reading 3.82 ms against
+                // this one's 1.24 on comparable weights. Rows base..base+7
+                // share a window whenever the width is a multiple of 8, and
+                // the caller only takes this path then.
+                let xq = xblk + g * 8u;
+                let x0 = q4v_x[xq];      let x1 = q4v_x[xq + 1u];
+                let x2 = q4v_x[xq + 2u]; let x3 = q4v_x[xq + 3u];
+                let x4 = q4v_x[xq + 4u]; let x5 = q4v_x[xq + 5u];
+                let x6 = q4v_x[xq + 6u]; let x7 = q4v_x[xq + 7u];
+                let sa = lad_q4v[(sub << 5u) + ((cv_a >> sh) & 31u)];
+                acc_a = acc_a + sa
+                    * (q4v_dot8(v_a.x, x0, x1) + q4v_dot8(v_a.y, x2, x3)
+                     + q4v_dot8(v_a.z, x4, x5) + q4v_dot8(v_a.w, x6, x7));
+                if (live_b) {
+                    var cv_b = q4tp_byte(crow_b + cbo);
+                    if (sh > 3u) { cv_b = cv_b | (q4tp_byte(crow_b + cbo + 1u) << 8u); }
+                    let v_b = q4v_w[wrow_b * gpr + g];
+                    let sb = lad_q4v[128u + (sub << 5u) + ((cv_b >> sh) & 31u)];
+                    acc_b = acc_b + sb
+                        * (q4v_dot8(v_b.x, x0, x1) + q4v_dot8(v_b.y, x2, x3)
+                         + q4v_dot8(v_b.z, x4, x5) + q4v_dot8(v_b.w, x6, x7));
+                }
+                g = g + 64u;
+            }
+        }
+        partial_q4v[lid] = acc_a;
+        partial_q4vb[lid] = acc_b;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+                partial_q4v[lid] = partial_q4v[lid] + partial_q4v[lid + stride];
+                partial_q4vb[lid] = partial_q4vb[lid] + partial_q4vb[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u && wrow_a < rows) { q1y[row_a] = partial_q4v[sub << 6u]; }
+        if (l == 0u && wrow_b < rows) { q1y[row_b] = partial_q4vb[sub << 6u]; }
+        } else {
+            let base = (wb - blocks1) * 8u;
+            let bofs = 0u;
+        {
+            let r = base + (lid >> 5u);
+            if (r < rows2) {
+                let pr = unpack2x16float(q1w2[params_w2 + r]);
+                lad_q4v[lid] = exp2(pr.x + f32(lid & 31u) * pr.y);
+            }
+        }
+        workgroupBarrier();
+        let wrow_a = base + sub;
+        let wrow_b = base + sub + 4u;
+        let row_a = bofs + wrow_a;
+        let row_b = bofs + wrow_b;
+        let live_a = wrow_a < rows2;
+        let live_b = wrow_b < rows2;
+        // In vec4 units: (row / lora) * gpr * 32 floats.
+        let xblk = 0u;
+        var acc_a = 0.0;
+        var acc_b = 0.0;
+        if (live_a) {
+            let crow_a = codes_b2 + wrow_a * cstride;
+            let crow_b = codes_b2 + wrow_b * cstride;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                var cv_a = q4tp_byte2(crow_a + cbo);
+                if (sh > 3u) { cv_a = cv_a | (q4tp_byte2(crow_a + cbo + 1u) << 8u); }
+                let v_a = q4v_w2[wrow_a * gpr + g];
+                // `_p1` is the low-rank group width. Set, it slides the
+                // activation window with the row — which is the ONLY thing
+                // the grouped output projection does differently, and the
+                // reason it had a kernel of its own reading 3.82 ms against
+                // this one's 1.24 on comparable weights. Rows base..base+7
+                // share a window whenever the width is a multiple of 8, and
+                // the caller only takes this path then.
+                let xq = xblk + g * 8u;
+                let x0 = q4v_x[xq];      let x1 = q4v_x[xq + 1u];
+                let x2 = q4v_x[xq + 2u]; let x3 = q4v_x[xq + 3u];
+                let x4 = q4v_x[xq + 4u]; let x5 = q4v_x[xq + 5u];
+                let x6 = q4v_x[xq + 6u]; let x7 = q4v_x[xq + 7u];
+                let sa = lad_q4v[(sub << 5u) + ((cv_a >> sh) & 31u)];
+                acc_a = acc_a + sa
+                    * (q4v_dot8(v_a.x, x0, x1) + q4v_dot8(v_a.y, x2, x3)
+                     + q4v_dot8(v_a.z, x4, x5) + q4v_dot8(v_a.w, x6, x7));
+                if (live_b) {
+                    var cv_b = q4tp_byte2(crow_b + cbo);
+                    if (sh > 3u) { cv_b = cv_b | (q4tp_byte2(crow_b + cbo + 1u) << 8u); }
+                    let v_b = q4v_w2[wrow_b * gpr + g];
+                    let sb = lad_q4v[128u + (sub << 5u) + ((cv_b >> sh) & 31u)];
+                    acc_b = acc_b + sb
+                        * (q4v_dot8(v_b.x, x0, x1) + q4v_dot8(v_b.y, x2, x3)
+                         + q4v_dot8(v_b.z, x4, x5) + q4v_dot8(v_b.w, x6, x7));
+                }
+                g = g + 64u;
+            }
+        }
+        partial_q4v[lid] = acc_a;
+        partial_q4vb[lid] = acc_b;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+                partial_q4v[lid] = partial_q4v[lid] + partial_q4v[lid + stride];
+                partial_q4vb[lid] = partial_q4vb[lid] + partial_q4vb[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u && wrow_a < rows2) { q1y2[row_a] = partial_q4v[sub << 6u]; }
+        if (l == 0u && wrow_b < rows2) { q1y2[row_b] = partial_q4vb[sub << 6u]; }
+        }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+
+
 @compute @workgroup_size(256)
 fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
                 @builtin(num_workgroups) nwg: vec3<u32>,
@@ -10814,6 +11010,8 @@ struct Ctx {
     q4tp_mv4_sg: Option<wgpu::ComputePipeline>,
     q4tp_mv4_nored: wgpu::ComputePipeline,
     use_mv_nored: bool,
+    q4tp_mv4_dual: wgpu::ComputePipeline,
+    use_mv_dual: bool,
     /// The same eight rows, but blocked over a SMALL BATCH in registers:
     /// the weight is read from DRAM once for the whole batch instead of
     /// once per element. What makes a speculative verify of k positions
@@ -11795,6 +11993,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let q4tp_mv4 = pipe("q4tp_matvec4");
     let q4tp_mv4_u2 = pipe("q4tp_matvec4_u2");
     let q4tp_mv4_nored = pipe("q4tp_matvec4_nored");
+    let q4tp_mv4_dual = pipe("q4tp_matvec4_dual");
+    let use_mv_dual = std::env::var("CMF_MV_DUAL").as_deref() == Ok("1");
     let use_mv_nored = std::env::var("CMF_MV_NORED").as_deref() == Ok("1");
     // CMF_MV_U2=1: the 2-way unrolled decode matvec — an experiment in
     // in-flight loads, adopted only if the bench says so.
@@ -12257,6 +12457,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mv4_sg,
         q4tp_mv4_nored,
         use_mv_nored,
+        q4tp_mv4_dual,
+        use_mv_dual,
         q4tp_mv4_bk,
         q4tp_mv4_bku,
         use_mv_bk,
@@ -15912,6 +16114,59 @@ pub fn forward_token_graph(
                     width,
                 } => {
                     let inter = *width; // this layer's, not the model's
+                    let mut continue_ffn = false;
+                    // DUAL (CMF_MV_DUAL=1): gate and up in ONE dispatch —
+                    // the elimination table's verdict was the wave drain
+                    // between serialized dispatches, and this deletes one
+                    // of the four per layer. Falls through to the split
+                    // path whenever either side is not plain q4tp.
+                    if c.use_mv_dual && gate.kind == 2 && up.kind == 2 && hidden % 32 == 0 {
+                        let gpr = hidden / 32;
+                        let p_buf = uniform_u32x4(
+                            c,
+                            [gpr as u32, inter as u32, hidden as u32, inter as u32],
+                        );
+                        let layout = c.q4tp_mv4_dual.get_bind_group_layout(0);
+                        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("ffn-dual"),
+                            layout: &layout,
+                            entries: &[
+                                bind_buf(0, &gate.buf),
+                                bind_buf(2, &gbuf),
+                                bind_buf(3, &p_buf),
+                                bind_buf(4, &gate.buf),
+                                bind_buf(5, &n1),
+                                bind_buf(6, &up.buf),
+                                bind_buf(7, &up.buf),
+                                bind_buf(8, &ubuf),
+                            ],
+                        });
+                        let blocks =
+                            ((inter as u32).div_ceil(8) * 2).min(MAX_WG);
+                        let bg_silu =
+                            bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]);
+                        let mut pass = begin_pass(&mut enc);
+                        if let Some((p, b, w)) = &ffn_pre {
+                            pass.set_pipeline(p);
+                            pass.set_bind_group(0, b, &[]);
+                            pass.dispatch_workgroups(*w, 1, 1);
+                        }
+                        pass.set_pipeline(&c.q4tp_mv4_dual);
+                        pass.set_bind_group(0, &bind, &[]);
+                        pass.dispatch_workgroups(blocks, 1, 1);
+                        pass.set_pipeline(&c.silu);
+                        pass.set_bind_group(0, &bg_silu, &[]);
+                        pass.dispatch_workgroups_flat((inter as u32).div_ceil(256));
+                        drop(pass);
+                        if let Some((pdp, bg_d, wd)) = prep(down, &abuf, &ob, hidden, inter) {
+                            let mut pass = begin_pass(&mut enc);
+                            pass.set_pipeline(pdp);
+                            pass.set_bind_group(0, &bg_d, &[]);
+                            pass.dispatch_workgroups(wd, 1, 1);
+                        }
+                        continue_ffn = true;
+                    }
+                    if !continue_ffn {
                     let pg = prep(gate, &n1, &gbuf, inter, hidden);
                     let pu = prep(up, &n1, &ubuf, inter, hidden);
                     let pd = prep(down, &abuf, &ob, hidden, inter);
@@ -15977,6 +16232,7 @@ pub fn forward_token_graph(
                     if !down_rode_along {
                         emat(&mut enc, down, &abuf, &ob, hidden, inter);
                     }
+                    } // !continue_ffn
                 }
                 LFfn::Moe {
                     router,
