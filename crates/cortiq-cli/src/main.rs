@@ -4734,6 +4734,12 @@ async fn cmd_bench(
     // is sampled from the prefill hidden, no decode forward yet).
     let wb_total = cortiq_engine::gpu::weight_bytes_dispatched();
     let n_st = stamps.len();
+    #[cfg(target_os = "macos")]
+    let ffn_calls_per_token = cortiq_engine::gpu_metal::FFN_CALLS
+        .load(std::sync::atomic::Ordering::Relaxed) as f64
+        / n_st.max(1) as f64;
+    #[cfg(not(target_os = "macos"))]
+    let ffn_calls_per_token = 0.0f64;
     let decode_tps = if n_st >= 2 {
         (n_st - 1) as f64 / (stamps[n_st - 1].0 - stamps[0].0).as_secs_f64().max(1e-9)
     } else {
@@ -4814,6 +4820,8 @@ async fn cmd_bench(
             "allocs_per_token": allocs_per_token,
             "weight_gb_per_token": if n_st >= 2 { wb_total as f64 / n_st as f64 / 1e9 } else { 0.0 },
             "weight_gb_by_stage": cortiq_engine::gpu::weight_bytes_by().iter().map(|b| *b as f64 / n_st.max(1) as f64 / 1e9).collect::<Vec<_>>(),
+            "ffn_calls_per_token": ffn_calls_per_token,
+            "n_stamps": n_st,
             "pool_dispatches_per_token": dispatches_per_token,
             "pair_singles_ms": singles_ms,
             "pair_fused_ms": pair_ms,
