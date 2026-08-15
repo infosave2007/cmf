@@ -11142,6 +11142,13 @@ struct Ctx {
     q4tp_mv4_dual: wgpu::ComputePipeline,
     use_mv_dual: bool,
     q4tp_mv4_dsilu: wgpu::ComputePipeline,
+    /// Bind groups reused across tokens: (site, layer, kv_id) → (epoch,
+    /// group). Valid while no buffer under it was reallocated — the
+    /// epoch bumps on every scratch grow and weight eviction. Behind
+    /// CMF_GRAPH_BGCACHE=1 until the parity suite blesses it: the host
+    /// spends 13.7 of a 23.5 ms token CREATING these objects.
+    graph_bgs: Mutex<HashMap<(u32, usize, u64), (u64, wgpu::BindGroup)>>,
+    use_bgcache: bool,
     /// The same eight rows, but blocked over a SMALL BATCH in registers:
     /// the weight is read from DRAM once for the whole batch instead of
     /// once per element. What makes a speculative verify of k positions
@@ -12591,6 +12598,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mv4_dual,
         use_mv_dual,
         q4tp_mv4_dsilu,
+        graph_bgs: Mutex::new(HashMap::new()),
+        use_bgcache: std::env::var("CMF_GRAPH_BGCACHE").as_deref() == Ok("1"),
         q4tp_mv4_bk,
         q4tp_mv4_bku,
         use_mv_bk,
@@ -14843,7 +14852,7 @@ pub fn forward_token_graph(
                 usage: wgpu::BufferUsages::UNIFORM,
             })
     };
-    let bg = |layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| {
+    let mk_bg = |layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| {
         let e: Vec<_> = bufs
             .iter()
             .enumerate()
@@ -14855,6 +14864,31 @@ pub fn forward_token_graph(
             entries: &e,
         })
     };
+    // The host spends 13.7 of a 23.5 ms token creating these objects
+    // (CMF_GRAPH_HOSTPROF). Cache per (site, layer, kv): buffers under a
+    // cached group are stable until ANY cold event — a scratch grow or a
+    // weight upload — which invalidates everything via the global cold
+    // epoch. Positions ride in content-cached uniforms, so a给 (site,
+    // layer) the uniform BUFFER changes when position changes — those
+    // sites pass site=0, which bypasses the cache.
+    let bgc = |site: u32, li: usize, layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| {
+        if site == 0 || !c.use_bgcache {
+            return mk_bg(layout, bufs);
+        }
+        let ep = crate::gpu::cold_epoch();
+        let key = (site, li, kv_id);
+        let mut m = c.graph_bgs.lock().unwrap();
+        if let Some((e, g)) = m.get(&key) {
+            if *e == ep {
+                return g.clone();
+            }
+        }
+        let g = mk_bg(layout, bufs);
+        m.insert(key, (ep, g.clone()));
+        g
+    };
+    let bg = |layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| mk_bg(layout, bufs);
+    let _ = &bg;
     // ── Pooled scratch: all intermediate buffers are reused across tokens ──
     let mut gs = c.graph_scratch.lock().unwrap();
     let st = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC; // COPY_SRC: debug taps (CMF_O1_TRACE)
@@ -15469,7 +15503,7 @@ pub fn forward_token_graph(
             b.0.kind as u32,
             0,
         ]);
-        let bind = bg(&c.layout_mv2, &[&a.0.buf, &b.0.buf, xs, a.1, b.1, &p]);
+        let bind = bgc(0, 0, &c.layout_mv2, &[&a.0.buf, &b.0.buf, xs, a.1, b.1, &p]);
         go(enc, &c.matvec_pair, &bind, ((a.2 + b.2) as u32).min(MAX_WG));
         true
     };
@@ -15580,7 +15614,7 @@ pub fn forward_token_graph(
         go(
             &mut enc,
             &c.rmsnorm,
-            &bg(&c.layout_rmsnorm, &[&h_buf, &inw0, &n1, &rms_u]),
+            &bgc(0, 0, &c.layout_rmsnorm, &[&h_buf, &inw0, &n1, &rms_u]),
             1,
         );
         // Split the submission mid-stack (single-step decode only): the card
@@ -15678,19 +15712,19 @@ pub fn forward_token_graph(
                         go(
                             &mut enc,
                             &c.axpy,
-                            &bg(&c.layout_axpy, &[&bqb, &qraw, &axq]),
+                            &bgc(13, li, &c.layout_axpy, &[&bqb, &qraw, &axq]),
                             ((nh * hd) as u32).div_ceil(256),
                         );
                         go(
                             &mut enc,
                             &c.axpy,
-                            &bg(&c.layout_axpy, &[&bkb, &kb, &axkv]),
+                            &bgc(14, li, &c.layout_axpy, &[&bkb, &kb, &axkv]),
                             ((nkv * hd) as u32).div_ceil(256),
                         );
                         go(
                             &mut enc,
                             &c.axpy,
-                            &bg(&c.layout_axpy, &[&bvb, &vb, &axkv]),
+                            &bgc(15, li, &c.layout_axpy, &[&bvb, &vb, &axkv]),
                             ((nkv * hd) as u32).div_ceil(256),
                         );
                     }
@@ -15767,7 +15801,7 @@ pub fn forward_token_graph(
                             &c.layout_o1_far,
                             &[&dmeta, &drk, &drv, &dqt, &dmz, &dth, &o1_u],
                         );
-                        let bg_push = bg(&c.layout_o1_push, &[&dmeta, &kb, &vb, &drk, &drv, &o1_u]);
+                        let bg_push = bgc(16, li, &c.layout_o1_push, &[&dmeta, &kb, &vb, &drk, &drv, &o1_u]);
                         let bg_att = bg(
                             &c.layout_o1_attend,
                             &[
@@ -15831,13 +15865,13 @@ pub fn forward_token_graph(
                                 // Auto layouts are pipeline-exclusive — the twin's
                                 // binding SET matches, its layout object does not.
                                 dec_l = c.gqa_attend_dec.get_bind_group_layout(0);
-                                bg(&dec_l, &[&qout, kbuf, vbuf, &attn, &at_u])
+                                bgc(17, li, &dec_l, &[&qout, kbuf, vbuf, &attn, &at_u])
                             } else {
                                 bg(al, &[&qout, kbuf, vbuf, &attn, &at_u])
                             };
                             let gm = if *output_gate {
                                 let gm_u = uniform_u32x4(c, [(nh * hd) as u32, 0, 0, 0]);
-                                Some(bg(&c.layout_gate_mul, &[&gout, &attn, &gm_u]))
+                                Some(bgc(18, li, &c.layout_gate_mul, &[&gout, &attn, &gm_u]))
                             } else {
                                 None
                             };
@@ -15847,7 +15881,7 @@ pub fn forward_token_graph(
                                     &c.layout_attn_rope,
                                     &[&qraw, &kb, &qout, &gout, &qnw, &knw, &invf_b, &rope_u],
                                 );
-                                let bg_kv = bg(&c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]);
+                                let bg_kv = bgc(19, li, &c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]);
                                 let mut pass =
                                     begin_pass(&mut enc);
                                 let fine = li < 4;
@@ -15890,7 +15924,7 @@ pub fn forward_token_graph(
                                     &c.layout_attn_rope,
                                     &[&qraw, &kb, &qout, &gout, &qnw, &knw, &invf_b, &rope_u],
                                 );
-                                let bg_kv = bg(&c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]);
+                                let bg_kv = bgc(20, li, &c.layout_kv, &[&kb, &vb, kbuf, vbuf, &kv_u]);
                                 let mut pass =
                                     begin_pass(&mut enc);
                                 pass.set_pipeline(&c.attn_rope);
@@ -15969,7 +16003,7 @@ pub fn forward_token_graph(
                         go(
                             &mut enc,
                             &c.gate_mul,
-                            &bg(&c.layout_gate_mul, &[&gout, &attn, &gm_u]),
+                            &bgc(21, li, &c.layout_gate_mul, &[&gout, &attn, &gm_u]),
                             ((nh * hd) as u32).div_ceil(256),
                         );
                     }
@@ -16015,7 +16049,7 @@ pub fn forward_token_graph(
                         eps.to_bits(),
                         0,
                     ]);
-                    let bg_conv = bg(&c.layout_gdn_conv, &[&qkv_b, &taps, ring, &cq_b, &gc_p]);
+                    let bg_conv = bgc(22, li, &c.layout_gdn_conv, &[&qkv_b, &taps, ring, &cq_b, &gc_p]);
                     let bg_step = bg(
                         &c.layout_gdn,
                         &[
@@ -16203,7 +16237,7 @@ pub fn forward_token_graph(
             // CMF_PASSFUSE=0 puts it back in its own pass.
             let mut ffn_pre: Option<(&wgpu::ComputePipeline, wgpu::BindGroup, u32)> = None;
             if !skip_norm {
-                let nbg = bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &pnw, &n1, &rms_u]);
+                let nbg = bgc(23, li, &c.layout_add_rmsnorm, &[&h_buf, &ob, &pnw, &n1, &rms_u]);
                 if passfuse {
                     ffn_pre = Some((&c.add_rmsnorm, nbg, 1));
                 } else {
@@ -16232,7 +16266,7 @@ pub fn forward_token_graph(
                 } else {
                     (
                         &c.axpy,
-                        bg(&c.layout_axpy, &[&ob, &h_buf, &ax_u]),
+                        bgc(24, li, &c.layout_axpy, &[&ob, &h_buf, &ax_u]),
                         (hidden as u32).div_ceil(256),
                     )
                 });
@@ -16277,7 +16311,7 @@ pub fn forward_token_graph(
                         let blocks =
                             ((inter as u32).div_ceil(8) * 2).min(MAX_WG);
                         let bg_silu =
-                            bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]);
+                            bgc(25, li, &c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]);
                         let mut pass = begin_pass(&mut enc);
                         if let Some((p, b, w)) = &ffn_pre {
                             pass.set_pipeline(p);
@@ -16337,7 +16371,7 @@ pub fn forward_token_graph(
                     let mut down_rode_along = false;
                     if let (Some((pgp, bg_g, wg)), Some((pup, bg_u, wu))) = (pg, pu) {
                         let bg_silu =
-                            bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]);
+                            bgc(26, li, &c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]);
                         let mut pass = begin_pass(&mut enc);
                         let fine = li < 32;
                         if let Some((p, b, w)) = &ffn_pre {
@@ -16389,7 +16423,7 @@ pub fn forward_token_graph(
                         go(
                             &mut enc,
                             &c.silu,
-                            &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]),
+                            &bgc(27, li, &c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]),
                             (inter as u32).div_ceil(256),
                         );
                     }
@@ -16504,7 +16538,7 @@ pub fn forward_token_graph(
                     );
                     let bg_sel_sg = c.moe_select_sg.as_ref().map(|p| {
                         let l = p.get_bind_group_layout(0);
-                        bg(&l, &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &n1])
+                        bgc(28, li, &l, &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &n1])
                     });
                     let bg_gu = bg(l_gu, &[gate_all, up_all, &n1, msel, mact, &gu_u]);
                     let bg_dn = bg(l_dn, &[down_all, mact, msel, mwt, &ob, &dn_u]);
@@ -16671,14 +16705,14 @@ pub fn forward_token_graph(
                     go(
                         &mut enc,
                         &c.add_rmsnorm,
-                        &bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &fnw, &n1, &rms_u]),
+                        &bgc(29, li, &c.layout_add_rmsnorm, &[&h_buf, &ob, &fnw, &n1, &rms_u]),
                         1,
                     );
                     enc.copy_buffer_to_buffer(&n1, 0, &h_buf, 0, (hidden * 4) as u64);
                     go(
                         &mut enc,
                         &c.rmsnorm,
-                        &bg(&c.layout_rmsnorm, &[&h_buf, &inw_next, &n1, &rms_u]),
+                        &bgc(30, li, &c.layout_rmsnorm, &[&h_buf, &inw_next, &n1, &rms_u]),
                         1,
                     );
                 } else {
@@ -16703,7 +16737,7 @@ pub fn forward_token_graph(
                 go(
                     &mut enc,
                     &c.add_rmsnorm,
-                    &bg(&c.layout_add_rmsnorm, &[&h_buf, &ob, &fnw, &n1, &rms_u]),
+                    &bgc(31, li, &c.layout_add_rmsnorm, &[&h_buf, &ob, &fnw, &n1, &rms_u]),
                     1,
                 );
                 enc.copy_buffer_to_buffer(&n1, 0, &h_buf, 0, (hidden * 4) as u64);
@@ -16711,7 +16745,7 @@ pub fn forward_token_graph(
                 go(
                     &mut enc,
                     &c.axpy,
-                    &bg(&c.layout_axpy, &[&ob, &h_buf, &ax_u]),
+                    &bgc(32, li, &c.layout_axpy, &[&ob, &h_buf, &ax_u]),
                     (hidden as u32).div_ceil(256),
                 );
             }
@@ -16727,7 +16761,7 @@ pub fn forward_token_graph(
             go(
                 &mut enc,
                 &c.rmsnorm,
-                &bg(&c.layout_rmsnorm, &[&h_buf, &fnw, &n1, &rms_u]),
+                &bgc(0, 0, &c.layout_rmsnorm, &[&h_buf, &fnw, &n1, &rms_u]),
                 1,
             );
             emat(&mut enc, lm, &n1, lbuf, lrows, hidden);
@@ -16853,7 +16887,7 @@ pub fn forward_token_graph(
         go(
             &mut enc,
             &c.rmsnorm,
-            &bg(&c.layout_rmsnorm, &[&h_buf, &fnw, &n1, &rms_u]),
+            &bgc(0, 0, &c.layout_rmsnorm, &[&h_buf, &fnw, &n1, &rms_u]),
             1,
         );
         let lsize = (lrows * 4) as u64;
@@ -25297,8 +25331,8 @@ mod tests {
                 ],
             })
         };
-        let bg_ab = bg(&a, &b);
-        let bg_ba = bg(&b, &a);
+        let bg_ab = bgc(0, 0, &a, &b);
+        let bg_ba = bgc(0, 0, &b, &a);
         let wg = (n as u32).min(MAX_WG);
         let readback = |buf: &wgpu::Buffer, enc: wgpu::CommandEncoder| {
             let mut enc = enc;
