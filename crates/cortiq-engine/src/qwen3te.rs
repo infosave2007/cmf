@@ -50,6 +50,12 @@ pub struct Qwen3Encoder {
     layers: Vec<Layer>,
     final_norm: Option<Vec<f32>>,
     proj: Option<ClipProj>,
+    /// Optional vision-row twin (`te.proj.vis.*`): a projection fitted
+    /// on VISION activations, routed to image-span rows only. The base
+    /// projection was fitted on text and holds R^2 0.65 there while
+    /// actively wrong on vision (-0.57); one affine map cannot serve
+    /// both distributions — measured, 2026-08-15.
+    proj_vis: Option<ClipProj>,
     pool: Option<Arc<Pool>>,
     pub hidden: usize,
     nh: usize,
@@ -136,6 +142,12 @@ struct ClipProj {
 impl ClipProj {
     /// `[n, d_in]` tapped hidden state → `[n, d_out]` conditioning.
     fn apply(&self, h: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
+        self.apply_inner(h, n, pool, true)
+    }
+
+    /// `sink=false` skips the token-0 overwrite — for span-gathered
+    /// rows, whose first row is NOT the sequence's attention sink.
+    fn apply_inner(&self, h: &[f32], n: usize, pool: Option<&Pool>, sink: bool) -> Vec<f32> {
         let (di, dout) = (self.d_in, self.d_out);
         let mut out = vec![0f32; n * dout];
         let ptr = SendPtr(out.as_mut_ptr());
@@ -184,7 +196,7 @@ impl ClipProj {
             Some(pl) => pl.run_rows(n, &work),
             None => work(0, n),
         }
-        if n > 0 {
+        if sink && n > 0 {
             out[..dout].copy_from_slice(&self.sink_out);
         }
         out
@@ -270,6 +282,25 @@ impl Qwen3Encoder {
             }
             Err(_) => None,
         };
+        let proj_vis = match (&proj, model.tensor_bytes("te.proj.vis.W").is_ok()) {
+            (Some(base), true) => {
+                let g = |n: &str| crate::dit::cmf_f32(model, n);
+                Some(ClipProj {
+                    w: g("te.proj.vis.W")?,
+                    mean_in: g("te.proj.vis.mean_in")?,
+                    std_in: g("te.proj.vis.std_in")?,
+                    mean_out: g("te.proj.vis.mean_out")?,
+                    std_out: g("te.proj.vis.std_out")?,
+                    // vision rows never include token 0; the base sink is
+                    // authoritative. Kept for struct uniformity.
+                    sink_out: base.sink_out.clone(),
+                    mlp: None,
+                    d_in: base.d_in,
+                    d_out: base.d_out,
+                })
+            }
+            _ => None,
+        };
         Ok(Self {
             embed: QTensor::from_model(model, "te.embed_tokens.weight")?,
             layers,
@@ -278,6 +309,7 @@ impl Qwen3Encoder {
                 Some(true) => Some(f32v("te.norm.weight")?),
             },
             proj,
+            proj_vis,
             pool: Pool::from_env(),
             hidden,
             nh: u("num_attention_heads", 0),
@@ -497,8 +529,44 @@ impl Qwen3Encoder {
         // A ClipProj file makes this a STAND-IN encoder: the stream
         // leaving the tap is in the small model's space and the DiT
         // never sees it raw.
+        // `CMF_CP_DUMP=<path>`: the RAW tapped hidden state, before the
+        // projection — one side of a (student, teacher) pair a refit
+        // regresses on. Same [u64 n][u64 width] + f32 rows framing as
+        // CMF_TE_DUMP, so one reader serves both.
+        if let (Ok(path), Some(_)) = (std::env::var("CMF_CP_DUMP"), &self.proj) {
+            let mut b = Vec::with_capacity(16 + h.len() * 4);
+            b.extend_from_slice(&(n as u64).to_le_bytes());
+            b.extend_from_slice(&(self.hidden as u64).to_le_bytes());
+            for v in &h {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            if let Err(e) = std::fs::write(&path, &b) {
+                tracing::warn!("CMF_CP_DUMP {path}: {e}");
+            } else {
+                eprintln!("cp dump: {n} tokens x {} -> {path}", self.hidden);
+            }
+        }
         match &self.proj {
-            Some(p) => p.apply(&h, n, self.pool.as_deref()),
+            Some(p) => {
+                let mut out = p.apply(&h, n, self.pool.as_deref());
+                // Vision rows go through their own map when the file
+                // ships one: gather span rows, project, scatter back.
+                if let Some(pv) = &self.proj_vis {
+                    if !visual.is_empty() {
+                        let (din, dout) = (pv.d_in, pv.d_out);
+                        let mut hv = Vec::with_capacity(visual.len() * din);
+                        for &r in &visual {
+                            hv.extend_from_slice(&h[r * din..(r + 1) * din]);
+                        }
+                        let ov = pv.apply_inner(&hv, visual.len(), self.pool.as_deref(), false);
+                        for (i, &r) in visual.iter().enumerate() {
+                            out[r * dout..(r + 1) * dout]
+                                .copy_from_slice(&ov[i * dout..(i + 1) * dout]);
+                        }
+                    }
+                }
+                out
+            }
             None => h,
         }
     }
