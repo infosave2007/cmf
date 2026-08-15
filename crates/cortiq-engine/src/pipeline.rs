@@ -916,7 +916,12 @@ impl Pipeline {
                     output_gate,
                     softplus_gate: None,
                     bias,
-                } if !self.kv_cache.layers[scan].o1_sealed() => {
+                } if !self.kv_cache.layers[scan].o1_sealed()
+                    // Sealed o1 stays plannable when the Metal o1 port
+                    // is on: full_gpu attends through the device state,
+                    // and any refusal falls to the sandwich, whose CPU
+                    // core routes sealed layers through the nystrom step.
+                    || std::env::var("CMF_O1_METAL").as_deref() == Ok("1") => {
                     let parts = (wq.q1_parts(), wk.q1_parts(), wv.q1_parts(), wo.q1_parts());
                     let (Some(pq), Some(pk), Some(pv), Some(po)) = parts else {
                         break;
@@ -925,9 +930,15 @@ impl Pipeline {
                         model_ref.get_or_insert_with(|| model.clone());
                     }
                     let cache = &self.kv_cache.layers[scan];
+                    // O(1) layer on Metal: the device attends through the
+                    // sealed Nystrom state (opt-in while the port proves
+                    // itself). Unsealed -> sandwich path = the CPU o1 step.
+                    let o1_metal = cache.o1.is_some()
+                        && std::env::var("CMF_O1_METAL").as_deref() == Ok("1")
+                        && cache.o1_views().is_some();
                     let full_gpu = attend_contract
                         && cache.mode == crate::kv_cache::KvMode::F32
-                        && cache.o1.is_none()
+                        && (cache.o1.is_none() || o1_metal)
                         && bias.is_none()
                         && pq.1 == self.num_heads * self.head_dim * (1 + *output_gate as usize)
                         && pk.1 == self.num_kv_heads * self.head_dim
@@ -980,8 +991,14 @@ impl Pipeline {
                 || attend_mode == "256");
         if !dev_attend {
             for it in &mut plan {
-                if let Item::Attn { full_gpu, .. } = it {
-                    *full_gpu = false;
+                if let Item::Attn { li, full_gpu, .. } = it {
+                    // The hd>128 policy is about gqa_attend; an o1 layer
+                    // attends through its own kernel set.
+                    let keep_o1 = self.kv_cache.layers[*li].o1.is_some()
+                        && std::env::var("CMF_O1_METAL").as_deref() == Ok("1");
+                    if !keep_o1 {
+                        *full_gpu = false;
+                    }
                 }
             }
         }
@@ -1151,9 +1168,25 @@ impl Pipeline {
                     // ── Fully device-resident attention: no sync at all.
                     if *full_gpu {
                         let cache = &self.kv_cache.layers[*li];
+                        let o1p = if cache.o1.is_some() {
+                            match cache.o1_views() {
+                                Some(views) => Some(crate::gpu::O1AttnParams {
+                                    views,
+                                    epoch: self.o1_epoch,
+                                }),
+                                // Sealed state gone mid-run: sandwich.
+                                None => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let o1_layer = cache.o1.is_some();
+                        if o1_layer && o1p.is_none() {
+                            // fall to the sandwich (CPU o1 step)
+                        }
                         let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
                         let cpu_v: Vec<&[f32]> = (0..nkv).map(|g| cache.head_values(g)).collect();
-                        let cpu_stored = cpu_k[0].len() / hd;
+                        let cpu_stored = if o1_layer { 0 } else { cpu_k[0].len() / hd };
                         let p = crate::gpu::AttnDeviceParams {
                             kv_id,
                             layer: *li,
@@ -1171,10 +1204,18 @@ impl Pipeline {
                             cpu_k,
                             cpu_v,
                             cpu_stored,
+                            o1: o1p,
                         };
-                        if graph.attn_device_ok(l, &p) && graph.encode_attn_device(l, &p) {
+                        let o1_bad = o1_layer && p.o1.is_none();
+                        if !o1_bad
+                            && graph.attn_device_ok(l, &p)
+                            && graph.encode_attn_device(l, &p)
+                        {
+                            // o1 layers leave no mirror row to pull.
+                            if p.o1.is_none() {
+                                dev_attn.push(*li);
+                            }
                             graph.commit();
-                            dev_attn.push(*li);
                             continue;
                         }
                         // Mirror refused (nothing encoded) → sandwich.

@@ -4508,6 +4508,7 @@ struct Ctx {
     /// buffer does not own its mmap bytes, and pointer-only cache keys can be
     /// reused after a model is dropped (cross-model data corruption).
     file_bufs: Mutex<HashMap<usize, (Arc<WeightArena>, Arc<CmfModel>)>>,
+    o1m: Mutex<HashMap<(u64, usize), O1MetalDev>>,
     /// row_scale buffer per tensor (key — (stable model identity, idx)).
     rs_bufs: Mutex<HashMap<(usize, usize), Buffer>>,
     /// q8_2f input-channel field buffer per tensor.
@@ -4761,6 +4762,7 @@ fn init() -> Result<Ctx, String> {
         mm_fc: Mutex::new(HashMap::new()),
         kv_mirrors: Mutex::new(HashMap::new()),
         file_bufs: Mutex::new(HashMap::new()),
+        o1m: Mutex::new(HashMap::new()),
         rs_bufs: Mutex::new(HashMap::new()),
         cf_bufs: Mutex::new(HashMap::new()),
         io_bufs: Mutex::new(HashMap::new()),
@@ -9312,6 +9314,135 @@ pub struct KvMirror {
 // Buffers are retained ObjC pointers, guarded by the registry Mutex.
 unsafe impl Send for KvMirror {}
 
+/// Device-resident sealed Nystrom state for one o1 layer: ring window,
+/// sinks, landmarks and far accumulators. Uploaded once per seal epoch;
+/// the DEVICE advances meta/ring/far every token afterwards — the CPU
+/// copy goes stale by design, exactly like the wgpu port.
+#[derive(Clone)]
+pub(crate) struct O1MetalDev {
+    epoch: u64,
+    meta: Buffer,
+    ring_k: Buffer,
+    ring_v: Buffer,
+    sink_k: Buffer,
+    sink_v: Buffer,
+    k_tilde: Buffer,
+    qt: Buffer,
+    mu: Buffer,
+    mz: Buffer,
+    that: Buffer,
+    g: usize,
+    h: usize,
+    m: usize,
+    w: usize,
+    d: usize,
+    dv: usize,
+    nsrect: u32,
+    scale: f32,
+}
+unsafe impl Send for O1MetalDev {}
+
+fn o1_ensure_metal(
+    c: &Ctx,
+    kv_id: u64,
+    li: usize,
+    views: &[crate::nystrom::O1DeviceView<'_>],
+    epoch: u64,
+) -> Option<O1MetalDev> {
+    {
+        let reg = c.o1m.lock().unwrap();
+        if let Some(d) = reg.get(&(kv_id, li)) {
+            if d.epoch == epoch {
+                return Some(d.clone());
+            }
+        }
+    }
+    let g0 = views.first()?;
+    let (gcnt, hcnt, m, w, ns) = (views.len(), g0.heads.len(), g0.m_eff, g0.w, g0.sink_len);
+    // Same geometry gates as the wgpu port — and just as loud: a
+    // silent refusal here costs the whole token its graph.
+    if ns + w > 196 || m > 32 || g0.d > 256 || g0.dv > 256 {
+        tracing::warn!(
+            "o1-metal L{li}: sink+window {}+{} (cap 196), landmarks {m} (cap 32), d {} dv {} (cap 256)",
+            ns, w, g0.d, g0.dv
+        );
+        return None;
+    }
+    for v in views {
+        if v.m_eff != m || v.w != w || v.sink_len != ns || v.heads.len() != hcnt {
+            tracing::warn!(
+                "o1-metal L{li}: group m_eff {} w {} sink {} heads {} vs first {m}/{w}/{ns}/{hcnt}",
+                v.m_eff, v.w, v.sink_len, v.heads.len()
+            );
+            return None;
+        }
+    }
+    tracing::info!("o1-metal: uploading layer {li} (epoch {epoch})");
+    let (d, dv) = (g0.d, g0.dv);
+    let mut meta: Vec<u32> = Vec::with_capacity(gcnt * 4);
+    let (mut rk, mut rv, mut sk, mut sv, mut kt) = (vec![], vec![], vec![], vec![], vec![]);
+    let (mut qt, mut mu, mut mz, mut th) = (vec![], vec![], vec![], vec![]);
+    for v in views {
+        meta.extend_from_slice(&[v.win_len as u32, v.win_head as u32, v.far_len as u32, 0]);
+        // Ring buffers are cap-sized already (cap = w in skeleton mode).
+        rk.extend_from_slice(v.win_k);
+        rk.resize(rk.len() + (w * d - v.win_k.len().min(w * d)), 0.0);
+        rv.extend_from_slice(v.win_v);
+        rv.resize(rv.len() + (w * dv - v.win_v.len().min(w * dv)), 0.0);
+        sk.extend_from_slice(v.sink_k);
+        sv.extend_from_slice(v.sink_v);
+        kt.extend_from_slice(v.k_tilde);
+        for hh in &v.heads {
+            qt.extend_from_slice(hh.q_tilde);
+            mu.extend_from_slice(hh.mu);
+            mz.extend_from_slice(hh.m_max);
+            mz.extend_from_slice(hh.z_hat);
+            th.extend_from_slice(hh.t_hat);
+        }
+    }
+    let fb = |data: &[f32]| -> Buffer {
+        let n = data.len().max(1) * 4;
+        let b = c
+            ._device
+            .new_buffer(n as u64, MTLResourceOptions::StorageModeShared);
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), b.contents() as *mut f32, data.len());
+        }
+        b
+    };
+    let rect_fm = g0.heads.first().is_some_and(|h| h.rect_fm);
+    let meta_b = c
+        ._device
+        .new_buffer((meta.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
+    unsafe {
+        std::ptr::copy_nonoverlapping(meta.as_ptr(), meta_b.contents() as *mut u32, meta.len());
+    }
+    let dev = O1MetalDev {
+        epoch,
+        meta: meta_b,
+        ring_k: fb(&rk),
+        ring_v: fb(&rv),
+        sink_k: fb(&sk),
+        sink_v: fb(&sv),
+        k_tilde: fb(&kt),
+        qt: fb(&qt),
+        mu: fb(&mu),
+        mz: fb(&mz),
+        that: fb(&th),
+        g: gcnt,
+        h: hcnt,
+        m,
+        w,
+        d,
+        dv,
+        nsrect: (ns as u32) | (u32::from(rect_fm) << 8),
+        scale: g0.scale,
+    };
+    let ret = dev.clone();
+    c.o1m.lock().unwrap().insert((kv_id, li), dev);
+    Some(ret)
+}
+
 /// A token's worth of layers as few command buffers: hidden lives in a
 /// device buffer across GDN runs AND full-attention layers; the only
 /// syncs are where the CPU genuinely needs data (q/k/v before the KV
@@ -9898,8 +10029,18 @@ impl TokenGraph {
     /// encoding anything if the mirror could not be prepared.
     pub fn encode_attn_device(&mut self, l: &AttnGpuLayer, p: &AttnDeviceParams) -> bool {
         WCAT.store(3, std::sync::atomic::Ordering::Relaxed);
+        // ── O(1) layer: ensure the device state FIRST (upload on seal
+        // epoch change) — a refusal must leave nothing half-encoded.
+        let o1dev = match &p.o1 {
+            Some(o) => match o1_ensure_metal(self.c, p.kv_id, p.layer, &o.views, o.epoch) {
+                Some(d) => Some(d),
+                None => return false,
+            },
+            None => None,
+        };
         // ── KV mirror prep (CPU side; previous token already synced).
-        let (k_mb, v_mb, imp_mb, cap, stored) = {
+        let mirror = if o1dev.is_none() {
+            let (k_mb, v_mb, imp_mb, cap, stored) = {
             let mut reg = self.c.kv_mirrors.lock().unwrap();
             let need = p.cpu_stored + 1;
             let entry = reg.entry((p.kv_id, p.layer)).or_insert_with(|| KvMirror {
@@ -9966,6 +10107,10 @@ impl TokenGraph {
             );
             entry.stored += 1; // this token's append
             out
+        };
+            Some((k_mb, v_mb, imp_mb, cap, stored))
+        } else {
+            None
         };
 
         let cmd = self.ensure_cmd();
@@ -10070,40 +10215,105 @@ impl TokenGraph {
             &[p.eps],
             (((p.nh + p.nkv) * 32) as u64, 256),
         );
-        // 4. append this position's K/V into the mirror
-        disp(
-            enc,
-            &self.c.kvapp,
-            &[(&k_b, 0), (&v_b, 0), (&k_mb, 0), (&v_mb, 0)],
-            &[p.nkv as u32, p.hd as u32, cap as u32, stored as u32],
-            &[],
-            ((p.nkv * p.hd) as u64, 256),
-        );
-        // 5. grouped attend (+ Born importance into the mirror's imp).
-        //    Flash-decoding: one threadgroup per Q-head, its simdgroups
-        //    splitting the stored positions. ~32 positions per simdgroup
-        //    is the point where the split stops paying for itself.
         let ao_b = io_buf(self.c, 43_000_000_057 + nhd, nhd * 4);
-        let n_pos = stored + 1;
-        let cap_sgs = (self.c.gqat.max_total_threads_per_threadgroup() as usize / 32)
-            .clamp(1, gqa_split_max());
-        let sgs = n_pos.div_ceil(32).clamp(1, cap_sgs);
-        let tg_threads = 32 * sgs;
-        disp_tg(
-            enc,
-            &self.c.gqat,
-            &[(&qr_b, 0), (&k_mb, 0), (&v_mb, 0), (&ao_b, 0), (&imp_mb, 0)],
-            &[
-                p.nh as u32,
-                (p.nh / p.nkv) as u32,
-                p.hd as u32,
-                cap as u32,
-                n_pos as u32,
-            ],
-            &[],
-            ((p.nh * tg_threads) as u64, tg_threads as u64),
-            ((sgs * p.hd + 2 * sgs) * 4) as u64,
-        );
+        if let Some(od) = &o1dev {
+            // 4-5. O(1): absorb the ring slot being evicted into the far
+            // accumulators, push this token's K/V, then the whole
+            // Nystrom step into ao_b. The serial encoder is the ordering
+            // guarantee (far reads the slot push overwrites).
+            let (gg, hh, mm) = (od.g as u64, od.h as u64, od.m as u64);
+            disp(
+                enc,
+                &self.c.o1far,
+                &[
+                    (&od.meta, 0),
+                    (&od.ring_k, 0),
+                    (&od.ring_v, 0),
+                    (&od.qt, 0),
+                    (&od.mz, 0),
+                    (&od.that, 0),
+                ],
+                &[od.h as u32, od.m as u32, od.w as u32, od.d as u32, od.dv as u32],
+                &[od.scale],
+                (gg * hh * mm * 64, 64),
+            );
+            disp(
+                enc,
+                &self.c.o1push,
+                &[
+                    (&od.meta, 0),
+                    (&k_b, 0),
+                    (&v_b, 0),
+                    (&od.ring_k, 0),
+                    (&od.ring_v, 0),
+                ],
+                &[od.w as u32, od.d as u32, od.dv as u32],
+                &[],
+                (gg * 256, 256),
+            );
+            disp(
+                enc,
+                &self.c.o1att,
+                &[
+                    (&od.meta, 0),
+                    (&qr_b, 0),
+                    (&od.ring_k, 0),
+                    (&od.ring_v, 0),
+                    (&od.sink_k, 0),
+                    (&od.sink_v, 0),
+                    (&od.k_tilde, 0),
+                    (&od.mu, 0),
+                    (&od.mz, 0),
+                    (&od.that, 0),
+                    (&ao_b, 0),
+                ],
+                &[
+                    od.h as u32,
+                    od.m as u32,
+                    od.w as u32,
+                    od.nsrect,
+                    od.d as u32,
+                    od.dv as u32,
+                ],
+                &[od.scale],
+                (gg * hh * 256, 256),
+            );
+        } else {
+            let (k_mb, v_mb, imp_mb, cap, stored) = mirror.unwrap();
+            // 4. append this position's K/V into the mirror
+            disp(
+                enc,
+                &self.c.kvapp,
+                &[(&k_b, 0), (&v_b, 0), (&k_mb, 0), (&v_mb, 0)],
+                &[p.nkv as u32, p.hd as u32, cap as u32, stored as u32],
+                &[],
+                ((p.nkv * p.hd) as u64, 256),
+            );
+            // 5. grouped attend (+ Born importance into the mirror's imp).
+            //    Flash-decoding: one threadgroup per Q-head, its simdgroups
+            //    splitting the stored positions. ~32 positions per simdgroup
+            //    is the point where the split stops paying for itself.
+            let n_pos = stored + 1;
+            let cap_sgs = (self.c.gqat.max_total_threads_per_threadgroup() as usize / 32)
+                .clamp(1, gqa_split_max());
+            let sgs = n_pos.div_ceil(32).clamp(1, cap_sgs);
+            let tg_threads = 32 * sgs;
+            disp_tg(
+                enc,
+                &self.c.gqat,
+                &[(&qr_b, 0), (&k_mb, 0), (&v_mb, 0), (&ao_b, 0), (&imp_mb, 0)],
+                &[
+                    p.nh as u32,
+                    (p.nh / p.nkv) as u32,
+                    p.hd as u32,
+                    cap as u32,
+                    n_pos as u32,
+                ],
+                &[],
+                ((p.nh * tg_threads) as u64, tg_threads as u64),
+                ((sgs * p.hd + 2 * sgs) * 4) as u64,
+            );
+        }
         // 6. output gate
         if p.output_gate {
             disp(
@@ -10696,6 +10906,13 @@ impl TokenGraph {
 }
 
 /// Host-side inputs for a fully device-resident attention layer.
+/// Sealed O(1) state for one layer's device attend: everything the
+/// three o1 kernels read, plus the seal epoch that keys the upload.
+pub struct O1AttnParams<'a> {
+    pub views: Vec<crate::nystrom::O1DeviceView<'a>>,
+    pub epoch: u64,
+}
+
 pub struct AttnDeviceParams<'a> {
     pub kv_id: u64,
     pub layer: usize,
@@ -10715,6 +10932,9 @@ pub struct AttnDeviceParams<'a> {
     pub cpu_k: Vec<&'a [f32]>,
     pub cpu_v: Vec<&'a [f32]>,
     pub cpu_stored: usize,
+    /// Some = this layer attends through the O(1) Nystrom state; the
+    /// KV mirror is not touched at all.
+    pub o1: Option<O1AttnParams<'a>>,
 }
 
 /// After the token's final sync: copy the row the graph appended for
