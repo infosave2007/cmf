@@ -109,6 +109,18 @@ const DEN_EPS: f32 = 1e-30;
 /// tiny prefills duplicate segment-mean landmarks (singular Au).
 const EXACT_SLACK: usize = 8;
 
+/// Patent-17 claim 1 probe (`CMF_O1_FARONLY=1`): drop the window from
+/// the READOUT — sinks + far field only — while the ring keeps its
+/// staging role (delayed insertion is untouched). In a GDN hybrid the
+/// near field is carried by the linear-core neighbours; the window is
+/// ~70% of the operator's state and most of its per-token work. Only
+/// engages once the far field holds mass (far_len > 0) — before the
+/// first eviction the window is the only history there is.
+fn far_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_O1_FARONLY").as_deref() == Ok("1"))
+}
+
 /// Streaming Nyström attention state for ONE GQA group.
 ///
 /// State splits along the GQA grain, because the operator does:
@@ -681,7 +693,8 @@ impl NystromHead {
         // shift.  Sinks are permanent exact keys (near mask §5b:
         // t-j < w OR j < sink); sink_len = 0 in exact-only mode.
         let ns = g.sink_len;
-        let n = ns + g.win_len;
+        let skip_win = far_only() && !g.exact_only && self.far_len > 0;
+        let n = if skip_win { ns } else { ns + g.win_len };
         self.scr_s.resize(n, 0.0);
         let mut c = f32::NEG_INFINITY;
         for s in 0..ns {
@@ -691,10 +704,13 @@ impl NystromHead {
         }
         // Window scores are the decode hot loop — NEON dot (same
         // products, regrouped sums; parity-gated by the golden tests).
-        for s in 0..g.win_len {
-            let lg = crate::attention::dot_f32(q, &g.win_k[s * d..(s + 1) * d]) * g.scale;
-            self.scr_s[ns + s] = lg;
-            c = c.max(lg);
+        if !skip_win {
+            for s in 0..g.win_len {
+                let lg =
+                    crate::attention::dot_f32(q, &g.win_k[s * d..(s + 1) * d]) * g.scale;
+                self.scr_s[ns + s] = lg;
+                c = c.max(lg);
+            }
         }
 
         // Far field: shifted skeleton (spec §3).  All exp arguments are
