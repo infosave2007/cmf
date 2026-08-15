@@ -557,6 +557,40 @@ enum SpecTrial {
     },
 }
 
+/// The speculation monitor: exponential averages of a round's wall time
+/// and of the tokens it produced, and the plain token's wall time — the
+/// three numbers the keep/stop rule needs. A round pays when
+/// `tokens_per_round · plain_ms > round_ms · 1.03`. The one-shot trial
+/// (four rounds against eight tokens) mis-called prose: the first rounds
+/// after a prompt are formulaic and accept well, the body does not (an
+/// essay measured 39 against a plain 44.8 with the trial saying
+/// "speculate"), so the rule now runs on EVERY round and stops after four
+/// consecutive losing rounds; a stopped speculation is retried 128 tokens
+/// later.
+#[derive(Default, Clone, Copy)]
+struct SpecMon {
+    round_ms: f64,
+    tokens: f64,
+    plain_ms: f64,
+    n: u32,
+    fails: u32,
+}
+
+impl SpecMon {
+    fn round(&mut self, dt_ms: f64, produced: usize) {
+        self.n += 1;
+        if self.n == 1 {
+            return; // round 1 pays the batch scratch and the draft mirror
+        }
+        let a = if self.n == 2 { 1.0 } else { 0.3 };
+        self.round_ms += a * (dt_ms - self.round_ms);
+        self.tokens += a * (produced as f64 - self.tokens);
+    }
+    fn pays(&self) -> bool {
+        self.plain_ms > 0.0 && self.tokens * self.plain_ms > self.round_ms * 1.03
+    }
+}
+
 /// Result of a generation call.
 pub struct GenerateResult {
     pub text: String,
@@ -2226,7 +2260,7 @@ impl Pipeline {
             gen0: generated,
             rounds: 0,
         };
-        let mut spec_rate = 0.0f64;
+        let mut spec_mon = SpecMon::default();
         let mut spec_watchdog_off = false;
         // ── Decode ──
         let mut next_pos = input_ids.len();
@@ -2328,18 +2362,24 @@ impl Pipeline {
             if graph_spec {
                 match spec_trial {
                     SpecTrial::Plain { t0, gen0 } if generated >= gen0 + 8 => {
-                        let plain_rate = (generated - gen0) as f64 / t0.elapsed().as_secs_f64();
-                        let keep = spec_rate > plain_rate * 1.03;
+                        spec_mon.plain_ms =
+                            t0.elapsed().as_secs_f64() * 1e3 / (generated - gen0) as f64;
+                        let keep = spec_mon.pays();
                         tracing::info!(
-                            "speculation trial: spec {spec_rate:.1} tok/s vs plain {plain_rate:.1} — {}",
+                            "speculation trial: {:.2} tok/round in {:.1} ms vs plain {:.1} ms/tok — {}",
+                            spec_mon.tokens,
+                            spec_mon.round_ms,
+                            spec_mon.plain_ms,
                             if keep { "speculating" } else { "plain" }
                         );
+                        spec_mon.fails = 0;
                         spec_trial = SpecTrial::Decided {
                             spec: keep,
-                            recheck_at: generated + 256,
+                            recheck_at: if keep { usize::MAX } else { generated + 128 },
                         };
                     }
                     SpecTrial::Decided { recheck_at, .. } if generated >= recheck_at => {
+                        spec_mon.n = 0;
                         spec_trial = SpecTrial::Spec {
                             t0: std::time::Instant::now(),
                             gen0: generated,
@@ -2362,6 +2402,7 @@ impl Pipeline {
                         && generated + 1 < max_tokens
                         && next_pos > 0 =>
                 {
+                    let t_round = std::time::Instant::now();
                     if let Some((extra, n_pos, new_h)) = self.graph_spec_step(
                         m,
                         &hidden,
@@ -2373,15 +2414,11 @@ impl Pipeline {
                     ) {
                         next_pos = n_pos;
                         hidden = new_h;
-                        // One speculative round done: the trial counts it.
-                        // Round 1 is not timed — it pays the batch scratch
-                        // allocations and the draft block's mirror sync,
-                        // which no later round pays; rounds 2..5 are.
-                        spec_trial = Self::spec_trial_round(
-                            spec_trial,
-                            generated + extra.len() + 1,
-                            &mut spec_rate,
-                        );
+                        // One speculative round done: the monitor counts it
+                        // (round 1 untimed — it pays the batch scratch and
+                        // the draft mirror), and the trial advances.
+                        spec_mon.round(t_round.elapsed().as_secs_f64() * 1e3, extra.len() + 1);
+                        spec_trial = Self::spec_trial_round(spec_trial, &mut spec_mon, generated);
                         let mut stopped = false;
                         for &id in &extra {
                             if self.confidence_on {
@@ -2402,7 +2439,8 @@ impl Pipeline {
                     // ledger, so a graph that keeps refusing is measured out
                     // like a head that keeps missing (it was spinning
                     // forever on a file whose batch graph declines).
-                    spec_trial = Self::spec_trial_round(spec_trial, generated + 1, &mut spec_rate);
+                    spec_mon.round(t_round.elapsed().as_secs_f64() * 1e3, 1);
+                    spec_trial = Self::spec_trial_round(spec_trial, &mut spec_mon, generated);
                     hidden = self.forward_layers(&self.embed_single(t_next), next_pos, task_mask);
                     next_pos += 1;
                     continue 'decode;
@@ -2812,30 +2850,60 @@ impl Pipeline {
         (draft, x)
     }
 
-    /// One speculative round for the trial ledger. `produced_total` is
-    /// `generated` after this round's tokens land. Round 1 only resets the
-    /// clock; rounds 2..5 are timed and set `spec_rate`, after which the
-    /// plain phase starts.
-    fn spec_trial_round(trial: SpecTrial, produced_total: usize, spec_rate: &mut f64) -> SpecTrial {
+    /// One speculative round for the trial: rounds 1..5 of a `Spec` phase
+    /// advance it (the monitor already averaged this round); after five,
+    /// the plain phase runs (once — a known plain rate decides at once);
+    /// a decided speculation keeps re-checking the rule every round and
+    /// stops after four losing rounds in a row.
+    fn spec_trial_round(trial: SpecTrial, mon: &mut SpecMon, generated: usize) -> SpecTrial {
         match trial {
             SpecTrial::Spec { t0, gen0, rounds } => {
                 let rounds = rounds + 1;
-                if rounds == 1 {
-                    // start the clock AFTER the warm-up round
-                    SpecTrial::Spec {
-                        t0: std::time::Instant::now(),
-                        gen0: produced_total,
-                        rounds,
-                    }
-                } else if rounds >= 5 {
-                    let produced = produced_total.saturating_sub(gen0).max(1);
-                    *spec_rate = produced as f64 / t0.elapsed().as_secs_f64().max(1e-6);
-                    SpecTrial::Plain {
-                        t0: std::time::Instant::now(),
-                        gen0: produced_total,
+                if rounds >= 5 {
+                    if mon.plain_ms > 0.0 {
+                        let keep = mon.pays();
+                        mon.fails = 0;
+                        tracing::info!(
+                            "speculation re-check: {:.2} tok/round in {:.1} ms vs plain {:.1} ms/tok — {}",
+                            mon.tokens,
+                            mon.round_ms,
+                            mon.plain_ms,
+                            if keep { "speculating" } else { "plain" }
+                        );
+                        SpecTrial::Decided {
+                            spec: keep,
+                            recheck_at: if keep { usize::MAX } else { generated + 128 },
+                        }
+                    } else {
+                        SpecTrial::Plain {
+                            t0: std::time::Instant::now(),
+                            gen0: generated,
+                        }
                     }
                 } else {
                     SpecTrial::Spec { t0, gen0, rounds }
+                }
+            }
+            SpecTrial::Decided { spec: true, .. } => {
+                if mon.pays() {
+                    mon.fails = 0;
+                    trial
+                } else {
+                    mon.fails += 1;
+                    if mon.fails >= 4 {
+                        tracing::info!(
+                            "speculation stopped: {:.2} tok/round in {:.1} ms vs plain {:.1} ms/tok",
+                            mon.tokens,
+                            mon.round_ms,
+                            mon.plain_ms
+                        );
+                        SpecTrial::Decided {
+                            spec: false,
+                            recheck_at: generated + 128,
+                        }
+                    } else {
+                        trial
+                    }
                 }
             }
             other => other,
@@ -3203,11 +3271,17 @@ impl Pipeline {
         // 4 since the draft moved onto the graph (Qwen3.8-27B / 5090:
         // k=3 51.2, k=4 51.8 with the per-op draft; the graph draft
         // halves the draft cost, so the extra draft is cheaper still).
+        // 5 with the int8 verify (measured 76.5 against k=4's 72-74 and
+        // k=6's 74 on the 5090), 4 with the f32 one.
+        #[cfg(feature = "gpu")]
+        let k_default = if crate::gpu_wgpu::verify_i8_on() { 5 } else { 4 };
+        #[cfg(not(feature = "gpu"))]
+        let k_default = 4;
         let k_spec: usize = std::env::var("CMF_GRAPH_SPEC_K")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&v| (1..=8).contains(&v))
-            .unwrap_or(4);
+            .unwrap_or(k_default);
         if next_pos == 0 {
             return None;
         }
