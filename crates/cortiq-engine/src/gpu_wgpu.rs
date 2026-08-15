@@ -5252,6 +5252,175 @@ fn q4tp_matvec16w(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+var<workgroup> lad_q4w32: array<f32, 1024>;
+var<workgroup> partial_q4k2: array<vec4<f32>, 256>;
+
+// ── q4tp matvec, OCT row blocking: thirty-two rows a workgroup, each
+// 64-lane sub-block owning EIGHT rows 4 apart, so the eight x vec4 loads
+// of a group feed eight dot chains. The quad kernel's LSU is x-bound at
+// the 4-bit weight rate (128 bytes of activations against 64 of weights per group
+// across its four rows); halving the x side again is the same medicine
+// the quad took over the pair. Per-row arithmetic and add order are the
+// quad kernel's exactly — the same lane owns the same groups of a row and
+// the same reduction tree closes it — so a row's result is bit-identical
+// to `q4tp_matvec16w`'s. Two named vec4 accumulators (constant
+// component indexing only, or the registers spill).
+@compute @workgroup_size(256)
+fn q4tp_matvec32w(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(num_workgroups) nwg: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let blocks = (rows + 31u) / 32u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks) { break; }
+        let base = wb * 32u;
+        for (var t = lid; t < 1024u; t = t + 256u) {
+            let r = base + (t >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                lad_q4w32[t] = exp2(pr.x + f32(t & 31u) * pr.y);
+            }
+        }
+        workgroupBarrier();
+        let r0 = base + sub + 0u;
+        let r1 = base + sub + 4u;
+        let r2 = base + sub + 8u;
+        let r3 = base + sub + 12u;
+        let r4 = base + sub + 16u;
+        let r5 = base + sub + 20u;
+        let r6 = base + sub + 24u;
+        let r7 = base + sub + 28u;
+        var acc = vec4<f32>(0.0);
+        var acc2 = vec4<f32>(0.0);
+        if (r0 < rows) {
+            let c0 = codes_b + r0 * cstride;
+            let c1 = codes_b + r1 * cstride;
+            let c2 = codes_b + r2 * cstride;
+            let c3 = codes_b + r3 * cstride;
+            let c4 = codes_b + r4 * cstride;
+            let c5 = codes_b + r5 * cstride;
+            let c6 = codes_b + r6 * cstride;
+            let c7 = codes_b + r7 * cstride;
+            let l1 = r1 < rows;
+            let l2 = r2 < rows;
+            let l3 = r3 < rows;
+            let l4 = r4 < rows;
+            let l5 = r5 < rows;
+            let l6 = r6 < rows;
+            let l7 = r7 < rows;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                let x0 = g * 8u;
+                let xa = q4v_x[x0];      let xb = q4v_x[x0 + 1u];
+                let xc = q4v_x[x0 + 2u]; let xd = q4v_x[x0 + 3u];
+                let xe = q4v_x[x0 + 4u]; let xf = q4v_x[x0 + 5u];
+                let xg = q4v_x[x0 + 6u]; let xh = q4v_x[x0 + 7u];
+                var cv = q4tp_byte(c0 + cbo);
+                if (sh > 3u) { cv = cv | (q4tp_byte(c0 + cbo + 1u) << 8u); }
+                var v = q4v_w[r0 * gpr + g];
+                acc.x = acc.x + lad_q4w32[(sub << 5u) + ((cv >> sh) & 31u)]
+                    * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                     + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                if (l1) {
+                    cv = q4tp_byte(c1 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c1 + cbo + 1u) << 8u); }
+                    v = q4v_w[r1 * gpr + g];
+                    acc.y = acc.y + lad_q4w32[128u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                if (l2) {
+                    cv = q4tp_byte(c2 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c2 + cbo + 1u) << 8u); }
+                    v = q4v_w[r2 * gpr + g];
+                    acc.z = acc.z + lad_q4w32[256u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                if (l3) {
+                    cv = q4tp_byte(c3 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c3 + cbo + 1u) << 8u); }
+                    v = q4v_w[r3 * gpr + g];
+                    acc.w = acc.w + lad_q4w32[384u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                if (l4) {
+                    cv = q4tp_byte(c4 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c4 + cbo + 1u) << 8u); }
+                    v = q4v_w[r4 * gpr + g];
+                    acc2.x = acc2.x + lad_q4w32[512u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                if (l5) {
+                    cv = q4tp_byte(c5 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c5 + cbo + 1u) << 8u); }
+                    v = q4v_w[r5 * gpr + g];
+                    acc2.y = acc2.y + lad_q4w32[640u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                if (l6) {
+                    cv = q4tp_byte(c6 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c6 + cbo + 1u) << 8u); }
+                    v = q4v_w[r6 * gpr + g];
+                    acc2.z = acc2.z + lad_q4w32[768u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                if (l7) {
+                    cv = q4tp_byte(c7 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c7 + cbo + 1u) << 8u); }
+                    v = q4v_w[r7 * gpr + g];
+                    acc2.w = acc2.w + lad_q4w32[896u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                g = g + 64u;
+            }
+        }
+        partial_q4k[lid] = acc;
+        partial_q4k2[lid] = acc2;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+                partial_q4k[lid] = partial_q4k[lid] + partial_q4k[lid + stride];
+                partial_q4k2[lid] = partial_q4k2[lid] + partial_q4k2[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u) {
+            let r = partial_q4k[sub << 6u];
+            let r2 = partial_q4k2[sub << 6u];
+            if (r0 < rows) { q1y[r0] = r.x; }
+            if (r1 < rows) { q1y[r1] = r.y; }
+            if (r2 < rows) { q1y[r2] = r.z; }
+            if (r3 < rows) { q1y[r3] = r.w; }
+            if (r4 < rows) { q1y[r4] = r2.x; }
+            if (r5 < rows) { q1y[r5] = r2.y; }
+            if (r6 < rows) { q1y[r6] = r2.z; }
+            if (r7 < rows) { q1y[r7] = r2.w; }
+        }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+
 // ── TWO projections of one input in ONE dispatch, on the quad-row 16w
 // body: blocks [0, blocks1) stream weight A into y, blocks [blocks1,
 // blocks1+blocks2) stream weight B into y2 (rows2 in `_p1`). Per-row
@@ -5713,6 +5882,165 @@ fn q2tp_matvec16w(@builtin(workgroup_id) wid: vec3<u32>,
             if (r1 < rows) { q1y[r1] = r.y; }
             if (r2 < rows) { q1y[r2] = r.z; }
             if (r3 < rows) { q1y[r3] = r.w; }
+        }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+
+// ── q2tp matvec, OCT row blocking: thirty-two rows a workgroup, each
+// 64-lane sub-block owning EIGHT rows 4 apart, so the eight x vec4 loads
+// of a group feed eight dot chains. The quad kernel's LSU is x-bound at
+// the 2-bit weight rate (128 bytes of activations against 32 of weights per group
+// across its four rows); halving the x side again is the same medicine
+// the quad took over the pair. Per-row arithmetic and add order are the
+// quad kernel's exactly — the same lane owns the same groups of a row and
+// the same reduction tree closes it — so a row's result is bit-identical
+// to `q2tp_matvec16w`'s. Two named vec4 accumulators (constant
+// component indexing only, or the registers spill).
+@compute @workgroup_size(256)
+fn q2tp_matvec32w(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(num_workgroups) nwg: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let params_w = rows * gpr * 2u;
+    let codes_b = rows * gpr * 8u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let blocks = (rows + 31u) / 32u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks) { break; }
+        let base = wb * 32u;
+        for (var t = lid; t < 1024u; t = t + 256u) {
+            let r = base + (t >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                let rung = t & 31u;
+                lad_q4w32[t] = select(exp2(pr.x + f32(max(rung, 1u) - 1u) * pr.y), 0.0, rung == 0u);
+            }
+        }
+        workgroupBarrier();
+        let r0 = base + sub + 0u;
+        let r1 = base + sub + 4u;
+        let r2 = base + sub + 8u;
+        let r3 = base + sub + 12u;
+        let r4 = base + sub + 16u;
+        let r5 = base + sub + 20u;
+        let r6 = base + sub + 24u;
+        let r7 = base + sub + 28u;
+        var acc = vec4<f32>(0.0);
+        var acc2 = vec4<f32>(0.0);
+        if (r0 < rows) {
+            let c0 = codes_b + r0 * cstride;
+            let c1 = codes_b + r1 * cstride;
+            let c2 = codes_b + r2 * cstride;
+            let c3 = codes_b + r3 * cstride;
+            let c4 = codes_b + r4 * cstride;
+            let c5 = codes_b + r5 * cstride;
+            let c6 = codes_b + r6 * cstride;
+            let c7 = codes_b + r7 * cstride;
+            let l1 = r1 < rows;
+            let l2 = r2 < rows;
+            let l3 = r3 < rows;
+            let l4 = r4 < rows;
+            let l5 = r5 < rows;
+            let l6 = r6 < rows;
+            let l7 = r7 < rows;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                let x0 = g * 8u;
+                let xa = q4v_x[x0];      let xb = q4v_x[x0 + 1u];
+                let xc = q4v_x[x0 + 2u]; let xd = q4v_x[x0 + 3u];
+                let xe = q4v_x[x0 + 4u]; let xf = q4v_x[x0 + 5u];
+                let xg = q4v_x[x0 + 6u]; let xh = q4v_x[x0 + 7u];
+                var cv = q4tp_byte(c0 + cbo);
+                if (sh > 3u) { cv = cv | (q4tp_byte(c0 + cbo + 1u) << 8u); }
+                var wi = (r0 * gpr + g) * 2u;
+                acc.x = acc.x + lad_q4w32[(sub << 5u) + ((cv >> sh) & 31u)]
+                    * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                if (l1) {
+                    cv = q4tp_byte(c1 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c1 + cbo + 1u) << 8u); }
+                    wi = (r1 * gpr + g) * 2u;
+                    acc.y = acc.y + lad_q4w32[128u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                }
+                if (l2) {
+                    cv = q4tp_byte(c2 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c2 + cbo + 1u) << 8u); }
+                    wi = (r2 * gpr + g) * 2u;
+                    acc.z = acc.z + lad_q4w32[256u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                }
+                if (l3) {
+                    cv = q4tp_byte(c3 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c3 + cbo + 1u) << 8u); }
+                    wi = (r3 * gpr + g) * 2u;
+                    acc.w = acc.w + lad_q4w32[384u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                }
+                if (l4) {
+                    cv = q4tp_byte(c4 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c4 + cbo + 1u) << 8u); }
+                    wi = (r4 * gpr + g) * 2u;
+                    acc2.x = acc2.x + lad_q4w32[512u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                }
+                if (l5) {
+                    cv = q4tp_byte(c5 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c5 + cbo + 1u) << 8u); }
+                    wi = (r5 * gpr + g) * 2u;
+                    acc2.y = acc2.y + lad_q4w32[640u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                }
+                if (l6) {
+                    cv = q4tp_byte(c6 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c6 + cbo + 1u) << 8u); }
+                    wi = (r6 * gpr + g) * 2u;
+                    acc2.z = acc2.z + lad_q4w32[768u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                }
+                if (l7) {
+                    cv = q4tp_byte(c7 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c7 + cbo + 1u) << 8u); }
+                    wi = (r7 * gpr + g) * 2u;
+                    acc2.w = acc2.w + lad_q4w32[896u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                }
+                g = g + 64u;
+            }
+        }
+        partial_q4k[lid] = acc;
+        partial_q4k2[lid] = acc2;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+                partial_q4k[lid] = partial_q4k[lid] + partial_q4k[lid + stride];
+                partial_q4k2[lid] = partial_q4k2[lid] + partial_q4k2[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u) {
+            let r = partial_q4k[sub << 6u];
+            let r2 = partial_q4k2[sub << 6u];
+            if (r0 < rows) { q1y[r0] = r.x; }
+            if (r1 < rows) { q1y[r1] = r.y; }
+            if (r2 < rows) { q1y[r2] = r.z; }
+            if (r3 < rows) { q1y[r3] = r.w; }
+            if (r4 < rows) { q1y[r4] = r2.x; }
+            if (r5 < rows) { q1y[r5] = r2.y; }
+            if (r6 < rows) { q1y[r6] = r2.z; }
+            if (r7 < rows) { q1y[r7] = r2.w; }
         }
         workgroupBarrier();
         wb = wb + nwg.x;
@@ -12274,6 +12602,8 @@ struct Ctx {
     gdn_conv_k: wgpu::ComputePipeline,
     q4tp_mv_k: wgpu::ComputePipeline,
     q4tp_mv16w: wgpu::ComputePipeline,
+    /// Oct-row (8 rows a lane) decode matvec — `CMF_MV32W`.
+    q4tp_mv32w: wgpu::ComputePipeline,
     /// Two wide q4tp projections of one input in one dispatch (gate+up,
     /// GDN qkv+z, attention k+v). `CMF_MV_X2=0` splits them again.
     q4tp_mv16w_x2: wgpu::ComputePipeline,
@@ -12287,6 +12617,7 @@ struct Ctx {
     q4tp_mv4_bku_x2: wgpu::ComputePipeline,
     /// The dense 2-bit (q2tp profile) decode matvec, kind 9.
     q2tp_mv16w: wgpu::ComputePipeline,
+    q2tp_mv32w: wgpu::ComputePipeline,
     f32_gemm_dx: wgpu::ComputePipeline,
     vae_conv: wgpu::ComputePipeline,
     dit_ropepack: wgpu::ComputePipeline,
@@ -13402,12 +13733,14 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let gdn_conv_k = pipe("gdn_conv_k");
     let q4tp_mv_k = pipe("q4tp_matvec4_k");
     let q4tp_mv16w = pipe("q4tp_matvec16w");
+    let q4tp_mv32w = pipe("q4tp_matvec32w");
     let q4tp_mv16w_x2 = pipe("q4tp_matvec16w_x2");
     let use_mv_x2 = std::env::var("CMF_MV_X2").map(|v| v != "0").unwrap_or(true);
     let q4tp_mv16w_gu = pipe("q4tp_matvec16w_gu");
     let use_mv_gu = std::env::var("CMF_MV_GU").map(|v| v != "0").unwrap_or(true);
     let q4tp_mv4_bku_x2 = pipe("q4tp_matvec4_bku_x2");
     let q2tp_mv16w = pipe("q2tp_matvec16w");
+    let q2tp_mv32w = pipe("q2tp_matvec32w");
     let f32_gemm_dx = pipe("f32_gemm_dx");
     // Per-kernel validation while these are new: a scope around each
     // names the shader the driver rejected, where the module-wide scope
@@ -13719,12 +14052,14 @@ fn init(dev: usize) -> Result<Ctx, String> {
         gdn_conv_k,
         q4tp_mv_k,
         q4tp_mv16w,
+        q4tp_mv32w,
         q4tp_mv16w_x2,
         use_mv_x2,
         q4tp_mv16w_gu,
         use_mv_gu,
         q4tp_mv4_bku_x2,
         q2tp_mv16w,
+        q2tp_mv32w,
         f32_gemm_dx,
         vae_conv,
         dit_ropepack,
@@ -14177,9 +14512,10 @@ fn encode_q2tp_mv16w(
     rows: usize,
     cols: usize,
 ) {
-    let (bind, wg) = q2tp_mv_bind(c, weight, xs, y, rows, cols);
+    let oct = mv32w_on(rows);
+    let (bind, wg) = q2tp_mv_bind(c, weight, xs, y, rows, cols, oct);
     let mut pass = begin_pass(enc);
-    pass.set_pipeline(&c.q2tp_mv16w);
+    pass.set_pipeline(if oct { &c.q2tp_mv32w } else { &c.q2tp_mv16w });
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(wg, 1, 1);
 }
@@ -14192,10 +14528,12 @@ fn q2tp_mv_bind(
     y: &wgpu::Buffer,
     rows: usize,
     cols: usize,
+    oct: bool,
 ) -> (wgpu::BindGroup, u32) {
     let gpr = cols / 32;
     let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, 0]);
-    let layout = c.q2tp_mv16w.get_bind_group_layout(0);
+    let pipe = if oct { &c.q2tp_mv32w } else { &c.q2tp_mv16w };
+    let layout = pipe.get_bind_group_layout(0);
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("mv-q2"),
         layout: &layout,
@@ -14206,7 +14544,25 @@ fn q2tp_mv_bind(
             bind_buf(5, xs),
         ],
     });
-    (bind, mv_grid((rows as u32).div_ceil(16)))
+    (bind, mv_grid((rows as u32).div_ceil(if oct { 32 } else { 16 })))
+}
+
+/// `CMF_MV32W`: the oct-row (8 rows a lane, 32 a workgroup) decode
+/// matvec for wide q4tp/q2tp projections. `1` = every wide shape, `0` =
+/// never; unset = rows ≥ 8192 (the FFN gate/up and the GDN/attention
+/// input planes; the 5120-row down/out planes keep the quad's workgroup
+/// count — 160 oct blocks would leave a 170-SM card idle).
+fn mv32w_on(rows: usize) -> bool {
+    static N: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    match N.get_or_init(|| match std::env::var("CMF_MV32W").as_deref() {
+        Ok("0") => Some(false),
+        Ok("1") => Some(true),
+        _ => None,
+    }) {
+        Some(b) => *b,
+        // unmeasured yet: off until the shape microbench says otherwise
+        None => false && rows >= 8192,
+    }
 }
 
 /// Bind group + grid for the fused gate+up+SiLU kernel: gate and up
@@ -16696,6 +17052,8 @@ pub fn forward_token_graph(
                         (p, 16u32) // CMF_MV_PROBE: garbage answers, real timing
                     } else if !mv16w_on() {
                         (&c.q4tp_mv4, 8u32)
+                    } else if mv32w_on(rows) {
+                        (&c.q4tp_mv32w, 32u32)
                     } else {
                         (&c.q4tp_mv16w, 16u32)
                     };
@@ -26626,6 +26984,8 @@ fn encode_q4tp_mv4_b(
     // two tokens would read one token's weights against the other's x.
     let (pipe, per_wg) = if gpr <= 64 {
         (&c.q4tp_mv16, 16u32)
+    } else if batch == 1 && mv32w_on(rows) {
+        (&c.q4tp_mv32w, 32u32)
     } else if batch == 1 {
         (&c.q4tp_mv16w, 16u32)
     } else {
@@ -29245,6 +29605,137 @@ fn main() {
         );
     }
 
+    /// The oct-row kernels (8 rows a lane) against the quad-row ones on
+    /// the same payload: the same lane owns the same groups of a row and
+    /// the same tree closes it, so the rows must be the same BITS (Metal's
+    /// fast-math gets a 1e-6 band). Both planes, q4tp and q2tp.
+    #[test]
+    fn wgpu_matvec32w_matches_16w_bits() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let (rows, cols) = (1000usize, 4096usize);
+        let gpr = cols / 32;
+        let mk = |bytes: &[u8]| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let xs: Vec<f32> = (0..cols).map(|i| ((i % 97) as f32 - 48.0) / 48.0).collect();
+        let xbuf = mk(bytemuck::cast_slice(&xs));
+        let ybufs = || {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (rows * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (rows * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        for q2 in [false, true] {
+            let dt = if q2 {
+                cortiq_core::TensorDtype::Q2TiledP
+            } else {
+                cortiq_core::TensorDtype::Q4TiledP
+            };
+            let total = cortiq_core::quant::expected_nbytes(dt, &[rows, cols]).unwrap();
+            let (params_off, codes_off, stride) = if q2 {
+                cortiq_core::quant::q2tp_sections(rows, cols)
+            } else {
+                cortiq_core::quant::q4tp_sections(rows, cols)
+            };
+            let mut wb: Vec<u8> = (0..total).map(|i| ((i * 37 + 11) % 251) as u8).collect();
+            let lo = cortiq_core::quant::f32_to_f16(-4.0);
+            let step = cortiq_core::quant::f32_to_f16(0.1);
+            for r in 0..rows {
+                let o = params_off + r * 4;
+                wb[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+                wb[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+                let crow = &mut wb[codes_off + r * stride..codes_off + (r + 1) * stride];
+                crow.fill(0);
+                for g in 0..gpr {
+                    cortiq_core::quant::q4tp_put_code(crow, g, (g * 7 + r) % 32);
+                }
+            }
+            let wbuf = mk(&wb);
+            let run = |pipe: &wgpu::ComputePipeline, per_wg: u32| -> Vec<f32> {
+                let y = ybufs();
+                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, 0]);
+                let layout = pipe.get_bind_group_layout(0);
+                let entries: Vec<wgpu::BindGroupEntry> = if q2 {
+                    vec![
+                        bind_buf(0, &wbuf),
+                        bind_buf(2, &y),
+                        bind_buf(3, &p_buf),
+                        bind_buf(5, &xbuf),
+                    ]
+                } else {
+                    vec![
+                        bind_buf(0, &wbuf),
+                        bind_buf(2, &y),
+                        bind_buf(3, &p_buf),
+                        bind_buf(4, &wbuf),
+                        bind_buf(5, &xbuf),
+                    ]
+                };
+                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layout,
+                    entries: &entries,
+                });
+                let mut enc = c
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                {
+                    let mut pass = begin_pass(&mut enc);
+                    pass.set_pipeline(pipe);
+                    pass.set_bind_group(0, &bind, &[]);
+                    pass.dispatch_workgroups(mv_grid((rows as u32).div_ceil(per_wg)), 1, 1);
+                }
+                let mut got = vec![0f32; rows];
+                assert!(readback(c, enc, &y, &stage, (rows * 4) as u64, &mut got));
+                got
+            };
+            let (a, b) = if q2 {
+                (run(&c.q2tp_mv16w, 16), run(&c.q2tp_mv32w, 32))
+            } else {
+                (run(&c.q4tp_mv16w, 16), run(&c.q4tp_mv32w, 32))
+            };
+            let nz = a.iter().filter(|v| **v != 0.0).count();
+            assert!(nz > rows / 2, "quad kernel mostly zero — harness wrong");
+            let mism = a
+                .iter()
+                .zip(&b)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count();
+            let (mut num, mut den) = (0f64, 0f64);
+            for (x, y) in a.iter().zip(&b) {
+                num += ((x - y) as f64).powi(2);
+                den += (*x as f64).powi(2);
+            }
+            let rel = (num / den.max(1e-30)).sqrt();
+            eprintln!(
+                "{} 32w vs 16w: {mism} of {rows} rows differ in bits, rel rms {rel:.2e}",
+                if q2 { "q2tp" } else { "q4tp" }
+            );
+            if cfg!(target_os = "macos") {
+                assert!(rel < 1e-6, "oct kernel drifted from the quad: {rel:.2e}");
+            } else {
+                assert_eq!(mism, 0, "oct kernel is not the quad's bits: {mism} rows");
+            }
+        }
+    }
+
     /// The batched kernel's rows against the one-vector kernel, element
     /// by element — the verify must land on the plain token's bits.
     #[test]
@@ -29768,6 +30259,73 @@ fn main() {
                 per * 1e6,
                 total as f64 / per / 1e9
             );
+        }
+        // The 2-bit plane on the gate/up shape (its only decode shape),
+        // quad and oct kernels side by side.
+        {
+            let (rows, cols) = (17408usize, 5120usize);
+            let total = cortiq_core::quant::expected_nbytes(
+                cortiq_core::TensorDtype::Q2TiledP,
+                &[rows, cols],
+            )
+            .unwrap();
+            let (params_off, _, _) = cortiq_core::quant::q2tp_sections(rows, cols);
+            let mut wb: Vec<u8> = (0..total).map(|i| (i * 37 % 251) as u8).collect();
+            let lo = cortiq_core::quant::f32_to_f16(-4.0);
+            let step = cortiq_core::quant::f32_to_f16(0.1);
+            for r in 0..rows {
+                let o = params_off + r * 4;
+                wb[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+                wb[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+            }
+            let xs: Vec<f32> = (0..cols).map(|i| ((i % 97) as f32 - 48.0) / 48.0).collect();
+            let mk = |bytes: &[u8]| {
+                c.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytes,
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+            };
+            let wbuf = mk(&wb);
+            let xbuf = mk(bytemuck::cast_slice(&xs));
+            let ybuf = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (rows * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            for oct in [false, true] {
+                let run = || {
+                    let mut enc = c
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                    for _ in 0..reps {
+                        let (bind, wg) = q2tp_mv_bind(c, &wbuf, &xbuf, &ybuf, rows, cols, oct);
+                        let mut pass = begin_pass(&mut enc);
+                        pass.set_pipeline(if oct { &c.q2tp_mv32w } else { &c.q2tp_mv16w });
+                        pass.set_bind_group(0, &bind, &[]);
+                        pass.dispatch_workgroups(wg, 1, 1);
+                    }
+                    submit(c, finish_enc(enc));
+                    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                };
+                run();
+                let mut best = f64::MAX;
+                for _ in 0..3 {
+                    let t = Instant::now();
+                    run();
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
+                let per = best / reps as f64;
+                println!(
+                    "q2tp gate/up 17408x5120 {}: {:.1} MB  {:.1} us/dispatch  {:.0} GB/s",
+                    if oct { "oct(32w)" } else { "quad(16w)" },
+                    total as f64 / 1e6,
+                    per * 1e6,
+                    total as f64 / per / 1e9
+                );
+            }
         }
     }
 

@@ -30,6 +30,11 @@ pub struct SamplerScratch {
     /// and dropped per token, on the same hot path and for the same
     /// reason. Same fix.
     topk: Vec<f32>,
+    /// The sparse chain's candidate list and its per-grain partials.
+    cand: Vec<(u32, f32)>,
+    cand_parts: Vec<Vec<(u32, f32)>>,
+    sum_parts: Vec<f32>,
+    sparse: Sparse,
 }
 
 impl SamplerScratch {
@@ -177,6 +182,18 @@ pub fn sample_with_scratch_pool(
         // greedy over the penalized logits, no working copy
         return argmax_penalized(logits, config, past_tokens, scratch, pool);
     }
+    if sparse_ok(config) {
+        // The sparse chain: same distribution, a tenth of the passes.
+        let mut sp = std::mem::take(&mut scratch.sparse);
+        let ok = sparse_distribution_into(logits, config, past_tokens, scratch, pool, &mut sp);
+        let t = if ok {
+            draw_sparse(&sp, rng)
+        } else {
+            argmax(logits)
+        };
+        scratch.sparse = sp;
+        return t;
+    }
     let mut probs = std::mem::take(&mut scratch.probs);
     let normalized = chain(logits, config, past_tokens, scratch, pool, &mut probs);
 
@@ -304,31 +321,7 @@ fn chain(
 ) -> bool {
     probs.clear();
     probs.extend_from_slice(logits);
-
-    for &tok in &config.suppress_tokens {
-        if (tok as usize) < probs.len() {
-            probs[tok as usize] = f32::NEG_INFINITY;
-        }
-    }
-
-    if config.repetition_penalty != 1.0 {
-        apply_repetition_penalty(probs, past_tokens, config.repetition_penalty, scratch);
-    }
-    if config.presence_penalty != 0.0 {
-        // Once per DISTINCT seen token — presence, not frequency. The
-        // scratch set the repetition penalty uses would serve, but it is
-        // only built on its own branch; a local pass stays correct when
-        // rep-penalty is 1.0 (Qwen3.8's recommended pairing).
-        let mut seen = std::mem::take(&mut scratch.presence_seen);
-        seen.clear();
-        seen.extend(past_tokens.iter().copied());
-        for &tok in &seen {
-            if (tok as usize) < probs.len() {
-                probs[tok as usize] -= config.presence_penalty;
-            }
-        }
-        scratch.presence_seen = seen;
-    }
+    apply_penalties(probs, config, past_tokens, scratch);
 
     if config.temperature < 1e-6 {
         return true;
@@ -361,6 +354,360 @@ fn chain(
     } else {
         false
     }
+}
+
+/// The chain's first stage — suppress, repetition and presence penalties
+/// — in place on a working copy of the logits. Every penalty only LOWERS
+/// a logit, which is what lets the sparse chain below bound its
+/// candidates.
+fn apply_penalties(
+    probs: &mut [f32],
+    config: &SamplerConfig,
+    past_tokens: &[u32],
+    scratch: &mut SamplerScratch,
+) {
+    for &tok in &config.suppress_tokens {
+        if (tok as usize) < probs.len() {
+            probs[tok as usize] = f32::NEG_INFINITY;
+        }
+    }
+    if config.repetition_penalty != 1.0 {
+        apply_repetition_penalty(probs, past_tokens, config.repetition_penalty, scratch);
+    }
+    if config.presence_penalty != 0.0 {
+        // Once per DISTINCT seen token — presence, not frequency. The
+        // scratch set the repetition penalty uses would serve, but it is
+        // only built on its own branch; a local pass stays correct when
+        // rep-penalty is 1.0 (Qwen3.8's recommended pairing).
+        let mut seen = std::mem::take(&mut scratch.presence_seen);
+        seen.clear();
+        seen.extend(past_tokens.iter().copied());
+        for &tok in &seen {
+            if (tok as usize) < probs.len() {
+                probs[tok as usize] -= config.presence_penalty;
+            }
+        }
+        scratch.presence_seen = seen;
+    }
+}
+
+fn config_penalized(config: &SamplerConfig) -> bool {
+    config.repetition_penalty != 1.0
+        || config.presence_penalty != 0.0
+        || !config.suppress_tokens.is_empty()
+}
+
+/// Largest top-k the sparse chain serves. Past this the dense chain is
+/// the better tool anyway.
+pub const SPARSE_TOPK_MAX: usize = 256;
+
+/// Whether `config` can go through the sparse chain: a real temperature
+/// and a top-k in 1..=256. Qwen's recommended instruct settings
+/// (0.7 / top-p 0.8 / top-k 20 / presence 1.5) do.
+pub fn sparse_ok(config: &SamplerConfig) -> bool {
+    config.temperature >= 1e-6 && config.top_k > 0 && (config.top_k as usize) <= SPARSE_TOPK_MAX
+}
+
+/// A distribution over at most `SPARSE_TOPK_MAX` tokens: `(id, prob)`
+/// sorted by id, probs summing to 1.
+pub type Sparse = Vec<(u32, f32)>;
+
+/// The sampler chain's distribution as a SPARSE list — the same
+/// distribution `chain` builds over the whole vocab, for configs with a
+/// top-k, at a fraction of the cost. The dense chain copies the vocab,
+/// exponentiates it, selects, filters and normalises it — six or seven
+/// passes over 248k floats — and every one of them past the selection
+/// touches only the k survivors. Here: penalties on a copy ONLY when
+/// there are penalties, one pooled pass that selects the top-k penalized
+/// logits, one pooled pass for the vocab-wide softmax denominator (top-p
+/// is defined against the FULL normalisation, so the denominator must
+/// see every token), and the rest over k entries.
+///
+/// Why it is the same distribution: softmax → min-p → top-k → top-p →
+/// renormalise, in the dense order. Softmax is monotone in the logit, so
+/// the top-k SET is the top-k of the penalized logits; min-p drops
+/// tokens below `max_prob·min_p`, i.e. below `exp((l − l_max)/T) <
+/// min_p` — every token outside the top-k that fails it is dropped
+/// either way, and the ones inside are tested exactly as the dense chain
+/// tests them; top-p cuts on the cumulative FULL-normalised probs of the
+/// survivors sorted descending, computed here from the same terms. What
+/// differs is floating-point: the denominator's summation order and the
+/// exp of `(l − l_max)/T` against `l/T − max(l/T)`. Ties at the k-th
+/// place resolve by lower id here where the dense chain keeps them all.
+///
+/// Returns false when the chain filtered everything (the dense chain's
+/// `!normalized`) — the caller falls back to greedy the same way.
+pub fn sparse_distribution_into(
+    logits: &[f32],
+    config: &SamplerConfig,
+    past_tokens: &[u32],
+    scratch: &mut SamplerScratch,
+    pool: Option<&crate::pool::Pool>,
+    out: &mut Sparse,
+) -> bool {
+    debug_assert!(sparse_ok(config));
+    out.clear();
+    let k = (config.top_k as usize).min(logits.len());
+    if k == 0 {
+        return false;
+    }
+    let penalized = config_penalized(config);
+    let mut probs = std::mem::take(&mut scratch.probs);
+    if penalized {
+        probs.clear();
+        probs.extend_from_slice(logits);
+        apply_penalties(&mut probs, config, past_tokens, scratch);
+    }
+    let src: &[f32] = if penalized { &probs } else { logits };
+    let t = if config.temperature > 0.0 {
+        config.temperature
+    } else {
+        1.0
+    };
+    let mut cand = std::mem::take(&mut scratch.cand);
+    par_topk(pool, src, k, &mut cand, &mut scratch.cand_parts);
+    // `cand` is by value descending, ties by id — the top-k AND every tie
+    // at the k-th place, as the dense chain keeps them.
+    let ok = if let Some(&(_, lmax)) = cand.first().filter(|c| c.1.is_finite()) {
+        let sum_all = par_sum_exp(pool, src, lmax, t, &mut scratch.sum_parts);
+        // e_i = exp((l_i − l_max)/T); min-p against e_i < min_p (max_prob
+        // is e = 1 over the same denominator); probs e_i / sum_all.
+        let min_p = config.min_p;
+        let mut cum = 0.0f32;
+        let mut cut = false;
+        for &(id, l) in cand.iter() {
+            if cut {
+                break;
+            }
+            let e = ((l - lmax) / t).exp();
+            if min_p > 0.0 && e < min_p {
+                continue;
+            }
+            let pr = e / sum_all;
+            if pr <= 0.0 {
+                continue;
+            }
+            out.push((id, pr));
+            cum += pr;
+            if config.top_p < 1.0 && config.top_p > 0.0 && cum >= config.top_p {
+                cut = true;
+            }
+        }
+        // renormalise over the survivors and order by id
+        let sum: f32 = out.iter().map(|c| c.1).sum();
+        if sum > 0.0 {
+            for c in out.iter_mut() {
+                c.1 /= sum;
+            }
+            out.sort_unstable_by_key(|c| c.0);
+            true
+        } else {
+            out.clear();
+            false
+        }
+    } else {
+        false
+    };
+    scratch.cand = cand;
+    scratch.probs = probs;
+    ok
+}
+
+/// The k largest of `src` as `(id, value)` sorted by value descending,
+/// ties by id ascending — INCLUDING every value tied with the k-th, which
+/// is what the dense chain's `p < threshold → 0` keeps. Two pooled passes:
+/// a per-grain k-slot selection merged in grain order for the k-th value,
+/// then a gather of everything at or above it. Nothing here depends on
+/// scheduling, so a seed reproduces.
+fn par_topk(
+    pool: Option<&crate::pool::Pool>,
+    src: &[f32],
+    k: usize,
+    out: &mut Vec<(u32, f32)>,
+    parts: &mut Vec<Vec<(u32, f32)>>,
+) {
+    let better = |a: (u32, f32), b: (u32, f32)| a.1 > b.1 || (a.1 == b.1 && a.0 < b.0);
+    // sorted insertion into a fixed k-slot list: the compare against the
+    // current k-th is what nearly every element pays, and nothing else.
+    let scan = |s: usize, e: usize, best: &mut Vec<(u32, f32)>| {
+        best.clear();
+        for i in s..e {
+            let c = (i as u32, src[i]);
+            if best.len() < k {
+                let pos = best.iter().position(|&b| better(c, b)).unwrap_or(best.len());
+                best.insert(pos, c);
+            } else if better(c, best[k - 1]) {
+                let pos = best.iter().position(|&b| better(c, b)).unwrap_or(k - 1);
+                best.pop();
+                best.insert(pos, c);
+            }
+        }
+    };
+    let by_value_desc = |a: &(u32, f32), b: &(u32, f32)| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    };
+    // A degenerate row (thousands tied at the k-th place) is capped: the
+    // dense chain would keep them all; nobody samples such a row on
+    // purpose.
+    let cap = k * 4 + 64;
+    // gather everything ≥ kth into `slot`, at most `cap` entries
+    let gather = |s: usize, e: usize, kth: f32, slot: &mut Vec<(u32, f32)>| {
+        slot.clear();
+        for i in s..e {
+            let v = src[i];
+            if v >= kth {
+                slot.push((i as u32, v));
+                if slot.len() >= cap {
+                    break;
+                }
+            }
+        }
+    };
+    out.clear();
+    match pool {
+        Some(p) if src.len() >= PAR_MIN => {
+            let n = src.len();
+            let grain = crate::pool::grain_for(n, p.n_workers() + 1);
+            let ng = n.div_ceil(grain);
+            parts.resize_with(ng, Vec::new);
+            let pp = crate::pool::SendMutT::new(parts.as_mut_ptr());
+            p.run_rows(n, &|s, e| {
+                // SAFETY: grain g is written by exactly one range (start =
+                // g·grain) and `parts` outlives the joined dispatch.
+                let slot = unsafe { &mut *pp.at(s / grain) };
+                scan(s, e, slot);
+            });
+            for g in 0..ng {
+                out.extend_from_slice(&parts[g]);
+            }
+            out.sort_unstable_by(by_value_desc);
+            out.truncate(k);
+            let Some(&(_, kth)) = out.last() else {
+                return;
+            };
+            if !kth.is_finite() {
+                return; // -inf ties are the filtered-out set; keep the k
+            }
+            p.run_rows(n, &|s, e| {
+                let slot = unsafe { &mut *pp.at(s / grain) };
+                gather(s, e, kth, slot);
+            });
+            out.clear();
+            for g in 0..ng {
+                out.extend_from_slice(&parts[g]);
+                if out.len() >= cap {
+                    break;
+                }
+            }
+            out.sort_unstable_by(by_value_desc);
+            out.truncate(cap);
+        }
+        _ => {
+            scan(0, src.len(), out);
+            let Some(&(_, kth)) = out.last() else {
+                return;
+            };
+            if !kth.is_finite() {
+                return;
+            }
+            let mut all = std::mem::take(out);
+            gather(0, src.len(), kth, &mut all);
+            all.sort_unstable_by(by_value_desc);
+            all.truncate(cap);
+            *out = all;
+        }
+    }
+}
+
+/// Σ exp((l − lmax)/t) over the vocab, per-grain partials summed in
+/// grain order (deterministic across runs, so a seed reproduces).
+fn par_sum_exp(
+    pool: Option<&crate::pool::Pool>,
+    src: &[f32],
+    lmax: f32,
+    t: f32,
+    parts: &mut Vec<f32>,
+) -> f32 {
+    let term = |s: usize, e: usize| -> f32 {
+        let mut acc = 0.0f32;
+        for &l in &src[s..e] {
+            acc += ((l - lmax) / t).exp();
+        }
+        acc
+    };
+    match pool {
+        Some(p) if src.len() >= PAR_MIN => {
+            let n = src.len();
+            let grain = crate::pool::grain_for(n, p.n_workers() + 1);
+            let ng = n.div_ceil(grain);
+            parts.clear();
+            parts.resize(ng, 0.0);
+            let pp = crate::pool::SendMut::new(parts.as_mut_ptr());
+            p.run_rows(n, &|s, e| {
+                // SAFETY: one writer per grain slot; joined before read.
+                unsafe { *pp.at(s / grain) = term(s, e) };
+            });
+            parts.iter().sum()
+        }
+        _ => term(0, src.len()),
+    }
+}
+
+/// Draw from a sparse distribution: inverse CDF in id order — the same
+/// walk the dense `categorical_sample` makes over the vocab, so a seed
+/// lands on the same token when the survivor set and probs agree.
+pub fn draw_sparse(p: &[(u32, f32)], rng: &mut SplitMix64) -> u32 {
+    let r = rng.next_f32();
+    let mut cum = 0.0f32;
+    for &(id, pr) in p {
+        cum += pr;
+        if r < cum {
+            return id;
+        }
+    }
+    p.iter().rev().find(|c| c.1 > 0.0).map(|c| c.0).unwrap_or(0)
+}
+
+fn sparse_get(p: &[(u32, f32)], id: u32) -> f32 {
+    p.binary_search_by_key(&id, |c| c.0)
+        .map(|i| p[i].1)
+        .unwrap_or(0.0)
+}
+
+/// `spec_accept_or_correct` over sparse distributions: accept the draft
+/// `d` with min(1, p[d]/q[d]); on rejection draw the correction from the
+/// residual max(0, p − q) over p's support (q's support outside p
+/// contributes nothing to the residual). Empty residual → a draw from p.
+pub fn spec_accept_or_correct_sparse(
+    p: &[(u32, f32)],
+    q: &[(u32, f32)],
+    d: u32,
+    rng: &mut SplitMix64,
+    res: &mut Sparse,
+) -> Option<u32> {
+    let (pd, qd) = (sparse_get(p, d), sparse_get(q, d));
+    let r = rng.next_f32();
+    if qd > 0.0 && r * qd < pd {
+        return None;
+    }
+    res.clear();
+    let mut total = 0.0f32;
+    for &(id, pi) in p {
+        let ri = pi - sparse_get(q, id);
+        if ri > 0.0 {
+            res.push((id, ri));
+            total += ri;
+        }
+    }
+    if total <= 0.0 {
+        return Some(draw_sparse(p, rng));
+    }
+    for c in res.iter_mut() {
+        c.1 /= total;
+    }
+    Some(draw_sparse(res, rng))
 }
 
 /// The distribution the sampler would draw from — the whole chain minus
@@ -978,6 +1325,157 @@ mod tests {
             // and nothing outside p's support was ever emitted
             for i in 0..n {
                 if p[i] == 0.0 {
+                    assert_eq!(counts[i], 0, "q#{qi}: token {i} outside p emitted");
+                }
+            }
+        }
+    }
+
+    /// The sparse chain is the dense chain: same survivor set, same
+    /// probabilities (to fp), serial and pooled, with and without
+    /// penalties, min-p, top-p — and a seed draws the same token.
+    #[test]
+    fn sparse_chain_matches_the_dense_chain() {
+        let pool = crate::pool::Pool::new(3);
+        let n = 40_000usize; // above PAR_MIN: the pooled arms run
+        for seed in 0..5u64 {
+            let mut r = SplitMix64::new(100 + seed);
+            let logits: Vec<f32> = (0..n)
+                .map(|_| ((r.next_u64() % 3000) as f32 - 1500.0) / 120.0)
+                .collect();
+            let past: Vec<u32> = (0..400).map(|_| (r.next_u64() % n as u64) as u32).collect();
+            for cfg in [
+                SamplerConfig {
+                    temperature: 0.7,
+                    top_p: 0.8,
+                    top_k: 20,
+                    min_p: 0.0,
+                    presence_penalty: 1.5,
+                    repetition_penalty: 1.0,
+                    ..Default::default()
+                },
+                SamplerConfig {
+                    temperature: 1.0,
+                    top_p: 0.95,
+                    top_k: 40,
+                    min_p: 0.05,
+                    presence_penalty: 0.0,
+                    repetition_penalty: 1.1,
+                    ..Default::default()
+                },
+                SamplerConfig {
+                    temperature: 0.6,
+                    top_p: 1.0,
+                    top_k: 3,
+                    min_p: 0.0,
+                    presence_penalty: 0.0,
+                    repetition_penalty: 1.0,
+                    suppress_tokens: vec![5, 6, 7],
+                    ..Default::default()
+                },
+            ] {
+                assert!(sparse_ok(&cfg));
+                let mut sd = SamplerScratch::default();
+                let mut dense = Vec::new();
+                distribution_into(&logits, &cfg, &past, &mut sd, None, &mut dense);
+                for pl in [None, Some(&pool)] {
+                    let mut ss = SamplerScratch::default();
+                    let mut sp = Vec::new();
+                    let ok = sparse_distribution_into(&logits, &cfg, &past, &mut ss, pl, &mut sp);
+                    assert!(ok, "seed {seed} cfg {cfg:?}");
+                    let dense_nz: Vec<(u32, f32)> = dense
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &v)| v > 0.0)
+                        .map(|(i, &v)| (i as u32, v))
+                        .collect();
+                    assert_eq!(
+                        dense_nz.len(),
+                        sp.len(),
+                        "seed {seed} pool {} cfg {cfg:?}: support {:?} vs {:?}",
+                        pl.is_some(),
+                        dense_nz,
+                        sp
+                    );
+                    for (a, b) in dense_nz.iter().zip(sp.iter()) {
+                        assert_eq!(a.0, b.0, "seed {seed} cfg {cfg:?}: ids differ");
+                        assert!(
+                            (a.1 - b.1).abs() <= 2e-5 * a.1.max(1e-3),
+                            "seed {seed} cfg {cfg:?}: prob {} vs {}",
+                            a.1,
+                            b.1
+                        );
+                    }
+                    // the seed lands on the same token (both walk the ids
+                    // in order); allow a boundary rounding miss or two
+                    let mut agree = 0usize;
+                    let trials = 400usize;
+                    for k in 0..trials as u64 {
+                        let mut r1 = SplitMix64::new(500 + k);
+                        let mut r2 = SplitMix64::new(500 + k);
+                        let a = categorical_sample(&dense, r1.next_f32());
+                        let b = draw_sparse(&sp, &mut r2);
+                        agree += (a == b) as usize;
+                    }
+                    assert!(agree >= trials - 2, "seed {seed} cfg {cfg:?}: agree {agree}/{trials}");
+                    // and the public entry uses it
+                    let mut r1 = SplitMix64::new(9);
+                    let mut r2 = SplitMix64::new(9);
+                    let a = categorical_sample(&dense, r1.next_f32());
+                    let mut s3 = SamplerScratch::default();
+                    let b = sample_with_scratch_pool(&logits, &cfg, &past, &mut r2, &mut s3, pl);
+                    assert_eq!(a, b, "seed {seed} cfg {cfg:?}: entry draw");
+                }
+            }
+        }
+    }
+
+    /// The sparse accept/correct emits the target distribution, like its
+    /// dense twin — the same 400k-trial law test over sparse p and q.
+    #[test]
+    fn spec_accept_or_correct_sparse_reproduces_the_target() {
+        let n = 40usize;
+        let mk = |seed: u64, sharp: f32| -> Vec<(u32, f32)> {
+            let mut r = SplitMix64::new(seed);
+            let mut v: Vec<f32> = (0..n)
+                .map(|_| ((r.next_u64() % 1000) as f32 / 1000.0).powf(sharp))
+                .collect();
+            for i in 0..n {
+                if (i * 7 + seed as usize) % 5 == 0 {
+                    v[i] = 0.0;
+                }
+            }
+            let s: f32 = v.iter().sum();
+            v.iter()
+                .enumerate()
+                .filter(|&(_, &x)| x > 0.0)
+                .map(|(i, &x)| (i as u32, x / s))
+                .collect()
+        };
+        let p = mk(3, 3.0);
+        for (qi, q) in [mk(3, 3.0), mk(11, 1.0), mk(29, 6.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut rng = SplitMix64::new(77 + qi as u64);
+            let mut counts = vec![0u64; n];
+            let mut res = Vec::new();
+            let trials = 400_000u64;
+            for _ in 0..trials {
+                let d = draw_sparse(&q, &mut rng);
+                let t = match spec_accept_or_correct_sparse(&p, &q, d, &mut rng, &mut res) {
+                    None => d,
+                    Some(c) => c,
+                };
+                counts[t as usize] += 1;
+            }
+            let l1: f64 = (0..n)
+                .map(|i| (counts[i] as f64 / trials as f64 - sparse_get(&p, i as u32) as f64).abs())
+                .sum();
+            eprintln!("sparse spec q#{qi}: L1(empirical, p) = {l1:.4}");
+            assert!(l1 < 0.01, "q#{qi}: drifted, L1 {l1}");
+            for i in 0..n {
+                if sparse_get(&p, i as u32) == 0.0 {
                     assert_eq!(counts[i], 0, "q#{qi}: token {i} outside p emitted");
                 }
             }
