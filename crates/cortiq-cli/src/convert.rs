@@ -3747,7 +3747,13 @@ pub fn run_convert(
             // rides in the same packed buffer (last slot) and the MoE kernels
             // index that buffer with one per-expert stride, so a mismatch
             // makes the whole graph decline, silently, into a CPU MoE.
-            let expert_gu = q2tp_expert_gate_or_up(&name);
+            // The q2tp profile on a DENSE model: no experts to carry the
+            // 2-bit planes, so the dense FFN's gate/up take them (down and
+            // the whole skeleton stay q4tp — the same 2/4 split, at the
+            // model's own FFN). Only for models without MoE experts, so the
+            // MoE profiles above are untouched.
+            let expert_gu = q2tp_expert_gate_or_up(&name)
+                || (arch.moe.is_none() && q2tp_dense_gate_or_up(&name));
             let q_here = if expert_gu { gu_quant } else { quant };
             let (dt, data) = if two_d {
                 quantize_2d(q_here, &vals, m_shape[0], m_shape[1])
@@ -3968,6 +3974,20 @@ pub fn run_convert(
 /// Trunk names are canonicalized to gate/up_proj; DeepSeek-V4's MTP stack
 /// deliberately keeps its upstream ffn.w1/w3 schema, so both are part of
 /// the same q2tp profile.
+/// The dense FFN's gate/up projections (no expert in the name) — what the
+/// q2tp profile puts on the 2-bit plane when the model has no experts.
+pub(crate) fn q2tp_dense_gate_or_up(name: &str) -> bool {
+    !name.contains(".experts.")
+        && !name.contains(".shared_expert")
+        // the MTP draft block stays 4-bit: it is one layer, and its
+        // agreement with the trunk is what speculation lives on
+        && !name.contains(".mtp.")
+        && (name.ends_with(".mlp.gate_proj.weight")
+            || name.ends_with(".mlp.up_proj.weight")
+            || name.ends_with(".mlp.w1.weight")
+            || name.ends_with(".mlp.w3.weight"))
+}
+
 pub(crate) fn q2tp_expert_gate_or_up(name: &str) -> bool {
     let expert = name.contains(".experts.")
         || name.contains(".shared_expert.")

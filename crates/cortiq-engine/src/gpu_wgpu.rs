@@ -5591,6 +5591,134 @@ fn q4tp_matvec16w_gu(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// ── q2tp decode matvec, quad-row 16w shape: the 2-bit plane of the q2tp
+// profile (dense FFN gate/up when the model has no experts). A group is
+// 32 codes in TWO u32 words (8 bytes, half of q4tp's 16), value =
+// (code − 1.5) · scale; the scale is the q4tp ladder with rung 0 the
+// format's exact zero (the ±0.5/±1.5 grid has none of its own), live
+// rungs shifted down one — the same convention as the MoE q2tp kernels.
+// Layout in u32 words: nibbles (row·gpr + g)·2, params rows·gpr·2 + row,
+// codes byte plane at rows·gpr·8 + rows·4 + row·cstride.
+fn q2v_d16(w: u32, a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32>) -> f32 {
+    return (f32(w & 3u) - 1.5) * a.x
+         + (f32((w >> 2u) & 3u) - 1.5) * a.y
+         + (f32((w >> 4u) & 3u) - 1.5) * a.z
+         + (f32((w >> 6u) & 3u) - 1.5) * a.w
+         + (f32((w >> 8u) & 3u) - 1.5) * b.x
+         + (f32((w >> 10u) & 3u) - 1.5) * b.y
+         + (f32((w >> 12u) & 3u) - 1.5) * b.z
+         + (f32((w >> 14u) & 3u) - 1.5) * b.w
+         + (f32((w >> 16u) & 3u) - 1.5) * c.x
+         + (f32((w >> 18u) & 3u) - 1.5) * c.y
+         + (f32((w >> 20u) & 3u) - 1.5) * c.z
+         + (f32((w >> 22u) & 3u) - 1.5) * c.w
+         + (f32((w >> 24u) & 3u) - 1.5) * d.x
+         + (f32((w >> 26u) & 3u) - 1.5) * d.y
+         + (f32((w >> 28u) & 3u) - 1.5) * d.z
+         + (f32((w >> 30u) & 3u) - 1.5) * d.w;
+}
+@compute @workgroup_size(256)
+fn q2tp_matvec16w(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(num_workgroups) nwg: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let params_w = rows * gpr * 2u;
+    let codes_b = rows * gpr * 8u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let blocks = (rows + 15u) / 16u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks) { break; }
+        let base = wb * 16u;
+        // ladder: 32 rungs a row, rung 0 = 0.0, rung r>0 = exp2(lo + (r-1)·step)
+        for (var t = lid; t < 512u; t = t + 256u) {
+            let r = base + (t >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                let rung = t & 31u;
+                lad_q4w[t] = select(exp2(pr.x + f32(max(rung, 1u) - 1u) * pr.y), 0.0, rung == 0u);
+            }
+        }
+        workgroupBarrier();
+        let r0 = base + sub;
+        let r1 = base + sub + 4u;
+        let r2 = base + sub + 8u;
+        let r3 = base + sub + 12u;
+        var acc = vec4<f32>(0.0);
+        if (r0 < rows) {
+            let c0 = codes_b + r0 * cstride;
+            let c1 = codes_b + r1 * cstride;
+            let c2 = codes_b + r2 * cstride;
+            let c3 = codes_b + r3 * cstride;
+            let l1 = r1 < rows;
+            let l2 = r2 < rows;
+            let l3 = r3 < rows;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                let x0 = g * 8u;
+                let xa = q4v_x[x0];      let xb = q4v_x[x0 + 1u];
+                let xc = q4v_x[x0 + 2u]; let xd = q4v_x[x0 + 3u];
+                let xe = q4v_x[x0 + 4u]; let xf = q4v_x[x0 + 5u];
+                let xg = q4v_x[x0 + 6u]; let xh = q4v_x[x0 + 7u];
+                var cv = q4tp_byte(c0 + cbo);
+                if (sh > 3u) { cv = cv | (q4tp_byte(c0 + cbo + 1u) << 8u); }
+                var wi = (r0 * gpr + g) * 2u;
+                acc.x = acc.x + lad_q4w[(sub << 5u) + ((cv >> sh) & 31u)]
+                    * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                if (l1) {
+                    cv = q4tp_byte(c1 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c1 + cbo + 1u) << 8u); }
+                    wi = (r1 * gpr + g) * 2u;
+                    acc.y = acc.y + lad_q4w[128u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                }
+                if (l2) {
+                    cv = q4tp_byte(c2 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c2 + cbo + 1u) << 8u); }
+                    wi = (r2 * gpr + g) * 2u;
+                    acc.z = acc.z + lad_q4w[256u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                }
+                if (l3) {
+                    cv = q4tp_byte(c3 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c3 + cbo + 1u) << 8u); }
+                    wi = (r3 * gpr + g) * 2u;
+                    acc.w = acc.w + lad_q4w[384u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q2v_d16(q1w[wi], xa, xb, xc, xd) + q2v_d16(q1w[wi + 1u], xe, xf, xg, xh));
+                }
+                g = g + 64u;
+            }
+        }
+        partial_q4k[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+                partial_q4k[lid] = partial_q4k[lid] + partial_q4k[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u) {
+            let r = partial_q4k[sub << 6u];
+            if (r0 < rows) { q1y[r0] = r.x; }
+            if (r1 < rows) { q1y[r1] = r.y; }
+            if (r2 < rows) { q1y[r2] = r.z; }
+            if (r3 < rows) { q1y[r3] = r.w; }
+        }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+
 // ── q4tp matvec, k-in-registers batch: ONE weight decode serves up to
 // FOUR activation vectors. The nb-dispatch batch streams the whole weight
 // once per element and hopes for L2; at 2-8 MB a layer there is nothing
@@ -12155,6 +12283,8 @@ struct Ctx {
     use_mv_gu: bool,
     /// The batched (bku) two-weight kernel for the batch graph.
     q4tp_mv4_bku_x2: wgpu::ComputePipeline,
+    /// The dense 2-bit (q2tp profile) decode matvec, kind 9.
+    q2tp_mv16w: wgpu::ComputePipeline,
     f32_gemm_dx: wgpu::ComputePipeline,
     vae_conv: wgpu::ComputePipeline,
     dit_ropepack: wgpu::ComputePipeline,
@@ -13270,6 +13400,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let q4tp_mv16w_gu = pipe("q4tp_matvec16w_gu");
     let use_mv_gu = std::env::var("CMF_MV_GU").map(|v| v != "0").unwrap_or(true);
     let q4tp_mv4_bku_x2 = pipe("q4tp_matvec4_bku_x2");
+    let q2tp_mv16w = pipe("q2tp_matvec16w");
     let f32_gemm_dx = pipe("f32_gemm_dx");
     // Per-kernel validation while these are new: a scope around each
     // names the shader the driver rejected, where the module-wide scope
@@ -13585,6 +13716,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mv16w_gu,
         use_mv_gu,
         q4tp_mv4_bku_x2,
+        q2tp_mv16w,
         f32_gemm_dx,
         vae_conv,
         dit_ropepack,
@@ -14025,6 +14157,48 @@ fn mv_x2_bind(
     });
     let wg = (rows_a as u32).div_ceil(16) + (rows_b as u32).div_ceil(16);
     (bind, mv_grid(wg))
+}
+
+/// One q2tp (2-bit plane, kind 9) matvec dispatch in its own pass.
+fn encode_q2tp_mv16w(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+) {
+    let (bind, wg) = q2tp_mv_bind(c, weight, xs, y, rows, cols);
+    let mut pass = begin_pass(enc);
+    pass.set_pipeline(&c.q2tp_mv16w);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(wg, 1, 1);
+}
+
+/// Bind group + grid for the q2tp decode matvec.
+fn q2tp_mv_bind(
+    c: &Ctx,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+) -> (wgpu::BindGroup, u32) {
+    let gpr = cols / 32;
+    let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, 0]);
+    let layout = c.q2tp_mv16w.get_bind_group_layout(0);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("mv-q2"),
+        layout: &layout,
+        entries: &[
+            bind_buf(0, weight),
+            bind_buf(2, y),
+            bind_buf(3, &p_buf),
+            bind_buf(5, xs),
+        ],
+    });
+    (bind, mv_grid((rows as u32).div_ceil(16)))
 }
 
 /// Bind group + grid for the fused gate+up+SiLU kernel: gate and up
@@ -15620,7 +15794,7 @@ pub fn forward_token_graph(
                     kind: 1,
                 })
             }
-            2 | 3 | 5 | 6 | 7 => {
+            2 | 3 | 5 | 6 | 7 | 9 => {
                 // The int8 body must end on a word, because the per-ROW f16
                 // plane right after it is still word-indexed (`rs0`). Rows
                 // are byte-addressed, so an odd `cols` is fine — an odd
@@ -16362,6 +16536,25 @@ pub fn forward_token_graph(
                 pass.set_bind_group(0, &bind, &[]);
                 pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
             }
+            9 => {
+                let gpr = cols / 32;
+                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, 0]);
+                let layout = c.q2tp_mv16w.get_bind_group_layout(0);
+                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layout,
+                    entries: &[
+                        bind_buf(0, &m.buf),
+                        bind_buf(2, y),
+                        bind_buf(3, &p_buf),
+                        bind_buf(5, xs),
+                    ],
+                });
+                let mut pass = begin_pass(enc);
+                pass.set_pipeline(&c.q2tp_mv16w);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups(mv_grid((rows as u32).div_ceil(16)), 1, 1);
+            }
             _ => encode_f32matvec(c, enc, &m.buf, xs, y, rows, cols),
         }
     };
@@ -16550,6 +16743,26 @@ pub fn forward_token_graph(
                     ],
                 });
                 Some((&c.q1t, bind, (rows as u32).min(MAX_WG)))
+            }
+            9 => {
+                // The 2-bit plane of the q2tp profile: its own quad-row kernel.
+                if cols % 32 != 0 {
+                    return None;
+                }
+                let gpr = cols / 32;
+                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, 0]);
+                let layout = c.q2tp_mv16w.get_bind_group_layout(0);
+                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layout,
+                    entries: &[
+                        bind_buf(0, &m.buf),
+                        bind_buf(2, y),
+                        bind_buf(3, &p_buf),
+                        bind_buf(5, xs),
+                    ],
+                });
+                Some((&c.q2tp_mv16w, bind, mv_grid((rows as u32).div_ceil(16))))
             }
             _ => None,
         }
@@ -18554,7 +18767,7 @@ pub fn forward_batch_graph(
             // Leaving these out is what kept every q4t/q4tp model off the
             // batched path — including its GDN projections, which is where
             // the refusal actually landed.
-            k @ (5 | 6) => {
+            k @ (5 | 6 | 9) => {
                 let (b, r, cc) = tile_weight(c, model, gw.idx)?;
                 if r != rows || cc != cols {
                     return None;
@@ -18923,6 +19136,9 @@ pub fn forward_batch_graph(
         match m.kind {
             0 => encode_q8_mm(c, enc, &m.buf, m.rs.as_ref().unwrap(), xs, y, rows, cols, k),
             5 => encode_q4_tile_mm(c, enc, &c.q4t_mm, &m.buf, xs, y, rows, cols, k),
+            // The 2-bit plane: the tile GEMM handles any k (the MoE prefill's
+            // kernel); a batched q2 matvec for small k is not written yet.
+            9 => encode_q4_tile_mm(c, enc, &c.q2tp_mm, &m.buf, xs, y, rows, cols, k),
             6 => {
                 // The 64-wide GEMM tile wastes a small batch (a k=3 verify
                 // keeps 3 rows of 64 busy). The batched matvec kernel
@@ -19080,6 +19296,25 @@ pub fn forward_batch_graph(
                 pass.set_pipeline(&c.q8_2f_mv);
                 pass.set_bind_group(0, &bind, &[]);
                 pass.dispatch_workgroups((rows as u32).min(MAX_WG), 1, 1);
+            }
+            9 => {
+                let gpr = cols / 32;
+                let p_buf = uniform_u32x4(c, [gpr as u32, rows as u32, 1, 0]);
+                let layout = c.q2tp_mv16w.get_bind_group_layout(0);
+                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layout,
+                    entries: &[
+                        bind_buf(0, &m.buf),
+                        bind_buf(2, y),
+                        bind_buf(3, &p_buf),
+                        bind_buf(5, xs),
+                    ],
+                });
+                let mut pass = begin_pass(enc);
+                pass.set_pipeline(&c.q2tp_mv16w);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups(mv_grid((rows as u32).div_ceil(16)), 1, 1);
             }
             _ => encode_f32matvec(c, enc, &m.buf, xs, y, rows, cols),
         }
@@ -28897,6 +29132,86 @@ fn main() {
         assert_eq!(
             mism, 0,
             "{mism} of {n} outputs differ between the x2 kernel and two singles"
+        );
+    }
+
+    /// The 2-bit decode matvec against the CPU dequant of the same
+    /// payload (random chunks, per-row ladders, random 5-bit rungs
+    /// including rung 0 = exact zero).
+    #[test]
+    fn wgpu_q2tp_matvec16w_matches_cpu_dequant() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let (rows, cols) = (300usize, 4096usize);
+        let gpr = cols / 32;
+        let total =
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q2TiledP, &[rows, cols])
+                .unwrap();
+        let (params_off, codes_off, stride) = cortiq_core::quant::q2tp_sections(rows, cols);
+        let mut wb: Vec<u8> = (0..total).map(|i| ((i * 37 + 11) % 251) as u8).collect();
+        let lo = cortiq_core::quant::f32_to_f16(-4.0);
+        let step = cortiq_core::quant::f32_to_f16(0.1);
+        for r in 0..rows {
+            let o = params_off + r * 4;
+            wb[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+            wb[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+            let crow = &mut wb[codes_off + r * stride..codes_off + (r + 1) * stride];
+            crow.fill(0);
+            for g in 0..gpr {
+                cortiq_core::quant::q4tp_put_code(crow, g, (g * 7 + r) % 32);
+            }
+        }
+        let mut w = vec![0f32; rows * cols];
+        cortiq_core::quant::dequant_q2tp(&wb, rows, cols, &mut w);
+        let xs: Vec<f32> = (0..cols).map(|i| ((i % 97) as f32 - 48.0) / 48.0).collect();
+        let want: Vec<f32> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|i| w[r * cols + i] as f64 * xs[i] as f64)
+                    .sum::<f64>() as f32
+            })
+            .collect();
+        let mk = |bytes: &[u8]| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let wbuf = mk(&wb);
+        let xbuf = mk(bytemuck::cast_slice(&xs));
+        let ybuf = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (rows * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (rows * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encode_q2tp_mv16w(c, &mut enc, &wbuf, &xbuf, &ybuf, rows, cols);
+        let mut got = vec![0f32; rows];
+        assert!(readback(c, enc, &ybuf, &stage, (rows * 4) as u64, &mut got));
+        let (mut num, mut den) = (0f64, 0f64);
+        for (a, b) in got.iter().zip(&want) {
+            num += ((a - b) as f64).powi(2);
+            den += (*b as f64).powi(2);
+        }
+        let rel = (num / den.max(1e-30)).sqrt();
+        eprintln!("q2tp matvec vs cpu dequant: rel rms {rel:.2e}");
+        assert!(
+            rel < 1e-5,
+            "q2tp kernel drifted from the CPU dequant: {rel:.2e}"
         );
     }
 
