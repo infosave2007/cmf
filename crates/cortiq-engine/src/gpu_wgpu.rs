@@ -4595,6 +4595,10 @@ fn x_quant_i8(@builtin(global_invocation_id) gid: vec3<u32>) {
     q4v_xsw[i] = vec2<f32>(s, 8.0 * s * f32(sum));
 }
 
+// The batch is a PIPELINE CONSTANT: one pipeline per batch size 2..8,
+// so the element loop unrolls and the accumulator picks below become
+// static register writes instead of eight predicated selects per row.
+override NB8: u32 = 4u;
 @compute @workgroup_size(256)
 fn q4tp_matvec4_bk8(@builtin(workgroup_id) wid: vec3<u32>,
                     @builtin(num_workgroups) nwg: vec3<u32>,
@@ -4606,7 +4610,7 @@ fn q4tp_matvec4_bk8(@builtin(workgroup_id) wid: vec3<u32>,
     let cstride = (gpr * 5u + 7u) / 8u;
     let sub = lid >> 6u;
     let l = lid & 63u;
-    let nb = min(max(q1p._p0, 1u), 8u);
+    let nb = NB8;
     let blocks = (rows + 15u) / 16u;
     var wb = wid.x;
     loop {
@@ -4674,9 +4678,7 @@ fn q4tp_matvec4_bk8(@builtin(workgroup_id) wid: vec3<u32>,
                 let lo1 = v1 & vec4<u32>(m);       let hi1 = (v1 >> vec4<u32>(4u)) & vec4<u32>(m);
                 let lo2 = v2 & vec4<u32>(m);       let hi2 = (v2 >> vec4<u32>(4u)) & vec4<u32>(m);
                 let lo3 = v3 & vec4<u32>(m);       let hi3 = (v3 >> vec4<u32>(4u)) & vec4<u32>(m);
-                var e = 0u;
-                loop {
-                    if (e >= nb) { break; }
+                for (var e = 0u; e < NB8; e = e + 1u) {
                     let xi = (e * gpr + g) * 2u;
                     let xa = q4v_x8[xi];
                     let xb = q4v_x8[xi + 1u];
@@ -4710,7 +4712,6 @@ fn q4tp_matvec4_bk8(@builtin(workgroup_id) wid: vec3<u32>,
                     if (e == 5u) { a0h.y += t0; a1h.y += t1; a2h.y += t2; a3h.y += t3; }
                     if (e == 6u) { a0h.z += t0; a1h.z += t1; a2h.z += t2; a3h.z += t3; }
                     if (e == 7u) { a0h.w += t0; a1h.w += t1; a2h.w += t2; a3h.w += t3; }
-                    e = e + 1u;
                 }
                 g = g + 64u;
             }
@@ -12536,8 +12537,9 @@ struct Ctx {
     gdn_conv_k: wgpu::ComputePipeline,
     q4tp_mv_k: wgpu::ComputePipeline,
     q4tp_mv16w: wgpu::ComputePipeline,
-    /// INT8-activation batched matvec (`CMF_VERIFY_I8=1`) and its quantizer.
-    q4tp_mv4_bk8: wgpu::ComputePipeline,
+    /// INT8-activation batched matvec (`CMF_VERIFY_I8=1`), one pipeline per
+    /// batch 2..=8 (index = batch), and its quantizer.
+    q4tp_mv4_bk8: Vec<wgpu::ComputePipeline>,
     x_quant_i8: wgpu::ComputePipeline,
     /// Scratch for the int8 activations: (x8 packed, per-group scale/sum).
     i8x: std::sync::Mutex<Option<(wgpu::Buffer, wgpu::Buffer, u64)>>,
@@ -13669,7 +13671,22 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let gdn_conv_k = pipe("gdn_conv_k");
     let q4tp_mv_k = pipe("q4tp_matvec4_k");
     let q4tp_mv16w = pipe("q4tp_matvec16w");
-    let q4tp_mv4_bk8 = pipe("q4tp_matvec4_bk8");
+    let q4tp_mv4_bk8: Vec<wgpu::ComputePipeline> = (0..=8u32)
+        .map(|nb| {
+            let cs = [("NB8", nb.clamp(2, 8) as f64)];
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("q4tp_matvec4_bk8"),
+                layout: None,
+                module: &module,
+                entry_point: Some("q4tp_matvec4_bk8"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &cs,
+                    ..Default::default()
+                },
+                cache: pcache.as_ref(),
+            })
+        })
+        .collect();
     let x_quant_i8 = pipe("x_quant_i8");
     let q4tp_mv16w_x2 = pipe("q4tp_matvec16w_x2");
     let use_mv_x2 = std::env::var("CMF_MV_X2").map(|v| v != "0").unwrap_or(true);
@@ -14541,7 +14558,7 @@ fn wgsl_main_source() -> String {
 /// `CMF_VERIFY_I8=1`: the batched (verify / small-batch prefill) q4tp
 /// matvec on int8 activations and dp4a (`q4tp_matvec4_bk8`). Not
 /// bit-exact against the one-vector kernel — see the kernel's note.
-fn verify_i8_on() -> bool {
+pub(crate) fn verify_i8_on() -> bool {
     static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("CMF_VERIFY_I8").as_deref() == Ok("1"))
 }
@@ -14600,7 +14617,8 @@ fn encode_q4tp_mv4_b_i8(
         ],
     });
     let p_buf = q4tp_mv_params(c, gpr, rows, batch);
-    let layout = c.q4tp_mv4_bk8.get_bind_group_layout(0);
+    let pipe8 = &c.q4tp_mv4_bk8[batch.clamp(2, 8)];
+    let layout = pipe8.get_bind_group_layout(0);
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("mv-bk8"),
         layout: &layout,
@@ -14617,7 +14635,7 @@ fn encode_q4tp_mv4_b_i8(
     pass.set_pipeline(&c.x_quant_i8);
     pass.set_bind_group(0, &qbind, &[]);
     pass.dispatch_workgroups(((batch * gpr) as u32).div_ceil(256), 1, 1);
-    pass.set_pipeline(&c.q4tp_mv4_bk8);
+    pass.set_pipeline(pipe8);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(mv_grid((rows as u32).div_ceil(16)), 1, 1);
 }
