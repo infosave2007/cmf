@@ -829,6 +829,60 @@ impl CmfModel {
 
     /// Absolute offset of the tensor within the primary mapping
     /// (None for tensors from sibling shards).
+    /// Best-effort page-cache release for every tensor whose name passes
+    /// `pred` (unix, primary shard only): the merged ranges are madvised
+    /// DONTNEED so a one-shot stage's weights — a prompt encoder that
+    /// runs once per generation — stop competing for RAM with the
+    /// stages after it. A 25.7 GB fl2va file on a 24 GB Mac spent 40
+    /// minutes paging the SSD during denoise for exactly this reason.
+    /// Re-reading a dropped range later just refaults from disk.
+    /// Returns the bytes released.
+    pub fn advise_done(&self, pred: impl Fn(&str) -> bool) -> usize {
+        #[cfg(unix)]
+        {
+            let base = self.primary_bytes().as_ptr() as usize;
+            let map_len = self.primary_bytes().len();
+            let page = 16384usize.max(unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize);
+            let mut ranges: Vec<(usize, usize)> = self
+                .tensors
+                .iter()
+                .filter(|e| e.shard == 0 && pred(&e.name))
+                .filter_map(|e| {
+                    let abs = self.entry_abs_offset(e)?;
+                    Some((abs, abs + e.nbytes as usize))
+                })
+                .collect();
+            ranges.sort_unstable();
+            let mut dropped = 0usize;
+            let mut merged: Vec<(usize, usize)> = Vec::new();
+            for (s, e) in ranges {
+                match merged.last_mut() {
+                    Some(l) if s <= l.1 => l.1 = l.1.max(e),
+                    _ => merged.push((s, e)),
+                }
+            }
+            for (s, e) in merged {
+                // Align INWARD: a page shared with a kept tensor stays.
+                let s = s.div_ceil(page) * page;
+                let e = (e.min(map_len)) / page * page;
+                if e > s {
+                    let r = unsafe {
+                        libc::madvise((base + s) as *mut libc::c_void, e - s, libc::MADV_DONTNEED)
+                    };
+                    if r == 0 {
+                        dropped += e - s;
+                    }
+                }
+            }
+            dropped
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pred;
+            0
+        }
+    }
+
     pub fn entry_abs_offset(&self, entry: &TensorEntry) -> Option<usize> {
         (entry.shard == 0).then(|| (self.data_off + entry.off) as usize)
     }
