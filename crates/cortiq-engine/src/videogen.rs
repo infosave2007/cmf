@@ -407,6 +407,22 @@ fn generate_inner(
     }
     progress("encode", 1, 1);
     lap(&mut marks, "text encode");
+    // The prompt encoder and vision tower ran their once-per-generation
+    // pass; release their page cache so the denoise loop's DiT does not
+    // fight 12+ GB of dead weights for RAM. On a 24 GB Mac with the
+    // 25.7 GB full-encoder fl2va file this is the difference between
+    // denoise steps at DiT speed and 320 s/step of SSD thrash.
+    {
+        let dropped = model.advise_done(|n| {
+            n.starts_with("model.") || n.starts_with("vis.")
+        });
+        if dropped > 0 {
+            tracing::info!(
+                "encoder pages released after prompt encode: {} MB",
+                dropped / (1024 * 1024)
+            );
+        }
+    }
 
     // ── denoise ──
     let (video, audio) = {

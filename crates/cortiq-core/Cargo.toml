@@ -23,7 +23,7 @@ tracing = { workspace = true }
 
 # posix_fadvise for `CmfModel::evict_ranges` — releasing the page cache
 # behind expert uploads; madvise alone only trims the mapping's RSS.
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
