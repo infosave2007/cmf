@@ -621,6 +621,15 @@ impl QTensor {
                 dtype: TensorDtype::Q1T,
                 ..
             } => Some((model, *idx, 3, &[])),
+            // Kind 9: the 2-bit plane on the q4tp ladder (dense FFN gate/up
+            // of the q2tp profile). Its own kernel — 8 bytes a group where
+            // q4tp has 16, and rung 0 is the exact zero.
+            Self::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q2TiledP,
+                ..
+            } => Some((model, *idx, 9, &[])),
             _ => None,
         }
     }
