@@ -1435,6 +1435,56 @@ pub(crate) fn mm_kill() {
     MM_KILL.store(true, Ordering::Relaxed);
 }
 
+/// Consecutive over-budget ops. ONE slow op is not contention: on a
+/// 24 GB Mac running the 25.7 GB fl2va file the first ops after the
+/// prompt encode page their weights in from the SSD and take seconds —
+/// a field report (hololabs, HF discussion #2) had to neuter the kill
+/// to keep the denoise on the GPU, and then measured 48 s/step where the
+/// CPU fallback took >60. Contention is persistent; a page-in is not.
+static MM_STRIKES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const MM_STRIKES_TO_KILL: u32 = 3;
+
+/// The contention verdict for one wide op: `el` against its
+/// work-proportional `budget`. `exempt` marks ops whose time is not
+/// evidence — the cold probe, or a weight that was not resident before
+/// the call and rode in with it. Kills after `MM_STRIKES_TO_KILL`
+/// consecutive strikes; a within-budget op clears the count.
+/// `CMF_MM_KILL=0` disables the kill entirely (the device is trusted).
+pub(crate) fn mm_budget_check(
+    what: &str,
+    el: std::time::Duration,
+    budget: std::time::Duration,
+    exempt: bool,
+) {
+    if el <= budget {
+        MM_STRIKES.store(0, Ordering::Relaxed);
+        return;
+    }
+    if exempt {
+        return;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("CMF_MM_KILL").as_deref() != Ok("0"));
+    let n = MM_STRIKES.fetch_add(1, Ordering::Relaxed) + 1;
+    if !on {
+        tracing::info!(
+            "gpu {what} took {el:?} (budget {budget:?}) — over budget, CMF_MM_KILL=0 keeps the device"
+        );
+        return;
+    }
+    if n >= MM_STRIKES_TO_KILL {
+        tracing::warn!(
+            "gpu {what} took {el:?} (budget {budget:?}), {n} in a row — \
+             device contended, CPU for the rest of the process (CMF_MM_KILL=0 to override)"
+        );
+        mm_kill();
+    } else {
+        tracing::info!(
+            "gpu {what} took {el:?} (budget {budget:?}) — strike {n} of {MM_STRIKES_TO_KILL}"
+        );
+    }
+}
+
 /// Fused DiT SwiGLU FFN on the device: g=X·W1ᵀ, u=X·W3ᵀ, silu(g)·u,
 /// Causal chunk attention on the device: `b` queries against `s0 + b`
 /// cached keys. wgpu only — Metal's chunk graph keeps attention inside

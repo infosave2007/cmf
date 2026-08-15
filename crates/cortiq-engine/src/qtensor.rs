@@ -1447,13 +1447,12 @@ impl QTensor {
                                         let budget = std::time::Duration::from_secs_f64(
                                             flops / 1.5e12 * 8.0 + 0.020,
                                         );
-                                        if el > budget && !crate::gpu::probe_was_cold() {
-                                            tracing::warn!(
-                                                "gpu q4tp matmat took {el:?} (budget {budget:?}) — \
-                                                 device contended, CPU for the rest of the process"
-                                            );
-                                            crate::gpu::mm_kill();
-                                        }
+                                        crate::gpu::mm_budget_check(
+                                            "q4tp matmat",
+                                            el,
+                                            budget,
+                                            crate::gpu::probe_was_cold() || !resident,
+                                        );
                                         crate::gpu::probe_record(class, true, el);
                                         return;
                                     }
@@ -1574,13 +1573,12 @@ impl QTensor {
                                         let budget = std::time::Duration::from_secs_f64(
                                             flops / 1.5e12 * 8.0 + 0.020,
                                         );
-                                        if el > budget && !crate::gpu::probe_was_cold() {
-                                            tracing::warn!(
-                                                "gpu q4t matmat took {el:?} (budget {budget:?}) — \
-                                                 device contended, CPU for the rest of the process"
-                                            );
-                                            crate::gpu::mm_kill();
-                                        }
+                                        crate::gpu::mm_budget_check(
+                                            "q4t matmat",
+                                            el,
+                                            budget,
+                                            crate::gpu::probe_was_cold(),
+                                        );
                                         crate::gpu::probe_record(class, true, el);
                                         return;
                                     }

@@ -4873,6 +4873,213 @@ fn q4tp_matvec16w(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// ── TWO projections of one input in ONE dispatch, on the quad-row 16w
+// body: blocks [0, blocks1) stream weight A into y, blocks [blocks1,
+// blocks1+blocks2) stream weight B into y2 (rows2 in `_p1`). Per-row
+// arithmetic and add order are `q4tp_matvec16w`'s exactly — the body is
+// generated from it — so the outputs are bit-identical; only the
+// dispatch boundary between the two projections is gone. Measured
+// motive (RTX 5090 pod, 700 tiny dispatches in one submit): a dispatch
+// costs ~10-20 us of launch + drain in this serialized chain, and a
+// token issues ~700 of them — a third of the token. gate+up, the GDN's
+// qkv+z and attention's k+v are pairs over the SAME x. WGSL cannot
+// alias bindings, hence side B mirrors side A over its own slots.
+@compute @workgroup_size(256)
+fn q4tp_matvec16w_x2(@builtin(workgroup_id) wid: vec3<u32>,
+                     @builtin(num_workgroups) nwg: vec3<u32>,
+                     @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let rows2 = q1p._p1;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let params_w2 = rows2 * gpr * 4u;
+    let codes_b2 = rows2 * gpr * 16u + rows2 * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let blocks1 = (rows + 15u) / 16u;
+    let blocks2 = (rows2 + 15u) / 16u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks1 + blocks2) { break; }
+        if (wb < blocks1) {
+        let base = wb * 16u;
+        for (var t = lid; t < 512u; t = t + 256u) {
+            let r = base + (t >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                lad_q4w[t] = exp2(pr.x + f32(t & 31u) * pr.y);
+            }
+        }
+        workgroupBarrier();
+        let r0 = base + sub;
+        let r1 = base + sub + 4u;
+        let r2 = base + sub + 8u;
+        let r3 = base + sub + 12u;
+        var acc = vec4<f32>(0.0);
+        if (r0 < rows) {
+            let c0 = codes_b + r0 * cstride;
+            let c1 = codes_b + r1 * cstride;
+            let c2 = codes_b + r2 * cstride;
+            let c3 = codes_b + r3 * cstride;
+            let l1 = r1 < rows;
+            let l2 = r2 < rows;
+            let l3 = r3 < rows;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                let x0 = g * 8u;
+                let xa = q4v_x[x0];      let xb = q4v_x[x0 + 1u];
+                let xc = q4v_x[x0 + 2u]; let xd = q4v_x[x0 + 3u];
+                let xe = q4v_x[x0 + 4u]; let xf = q4v_x[x0 + 5u];
+                let xg = q4v_x[x0 + 6u]; let xh = q4v_x[x0 + 7u];
+                var cv = q4tp_byte(c0 + cbo);
+                if (sh > 3u) { cv = cv | (q4tp_byte(c0 + cbo + 1u) << 8u); }
+                var v = q4v_w[r0 * gpr + g];
+                acc.x = acc.x + lad_q4w[(sub << 5u) + ((cv >> sh) & 31u)]
+                    * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                     + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                if (l1) {
+                    cv = q4tp_byte(c1 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c1 + cbo + 1u) << 8u); }
+                    v = q4v_w[r1 * gpr + g];
+                    acc.y = acc.y + lad_q4w[128u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                if (l2) {
+                    cv = q4tp_byte(c2 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c2 + cbo + 1u) << 8u); }
+                    v = q4v_w[r2 * gpr + g];
+                    acc.z = acc.z + lad_q4w[256u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                if (l3) {
+                    cv = q4tp_byte(c3 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c3 + cbo + 1u) << 8u); }
+                    v = q4v_w[r3 * gpr + g];
+                    acc.w = acc.w + lad_q4w[384u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                g = g + 64u;
+            }
+        }
+        partial_q4k[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+                partial_q4k[lid] = partial_q4k[lid] + partial_q4k[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u) {
+            let r = partial_q4k[sub << 6u];
+            if (r0 < rows) { q1y[r0] = r.x; }
+            if (r1 < rows) { q1y[r1] = r.y; }
+            if (r2 < rows) { q1y[r2] = r.z; }
+            if (r3 < rows) { q1y[r3] = r.w; }
+        }
+        workgroupBarrier();
+        } else {
+        let base = (wb - blocks1) * 16u;
+        for (var t = lid; t < 512u; t = t + 256u) {
+            let r = base + (t >> 5u);
+            if (r < rows2) {
+                let pr = unpack2x16float(q1w2[params_w2 + r]);
+                lad_q4w[t] = exp2(pr.x + f32(t & 31u) * pr.y);
+            }
+        }
+        workgroupBarrier();
+        let r0 = base + sub;
+        let r1 = base + sub + 4u;
+        let r2 = base + sub + 8u;
+        let r3 = base + sub + 12u;
+        var acc = vec4<f32>(0.0);
+        if (r0 < rows2) {
+            let c0 = codes_b2 + r0 * cstride;
+            let c1 = codes_b2 + r1 * cstride;
+            let c2 = codes_b2 + r2 * cstride;
+            let c3 = codes_b2 + r3 * cstride;
+            let l1 = r1 < rows2;
+            let l2 = r2 < rows2;
+            let l3 = r3 < rows2;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                let x0 = g * 8u;
+                let xa = q4v_x[x0];      let xb = q4v_x[x0 + 1u];
+                let xc = q4v_x[x0 + 2u]; let xd = q4v_x[x0 + 3u];
+                let xe = q4v_x[x0 + 4u]; let xf = q4v_x[x0 + 5u];
+                let xg = q4v_x[x0 + 6u]; let xh = q4v_x[x0 + 7u];
+                var cv = q4tp_byte2(c0 + cbo);
+                if (sh > 3u) { cv = cv | (q4tp_byte2(c0 + cbo + 1u) << 8u); }
+                var v = q4v_w2[r0 * gpr + g];
+                acc.x = acc.x + lad_q4w[(sub << 5u) + ((cv >> sh) & 31u)]
+                    * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                     + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                if (l1) {
+                    cv = q4tp_byte2(c1 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte2(c1 + cbo + 1u) << 8u); }
+                    v = q4v_w2[r1 * gpr + g];
+                    acc.y = acc.y + lad_q4w[128u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                if (l2) {
+                    cv = q4tp_byte2(c2 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte2(c2 + cbo + 1u) << 8u); }
+                    v = q4v_w2[r2 * gpr + g];
+                    acc.z = acc.z + lad_q4w[256u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                if (l3) {
+                    cv = q4tp_byte2(c3 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte2(c3 + cbo + 1u) << 8u); }
+                    v = q4v_w2[r3 * gpr + g];
+                    acc.w = acc.w + lad_q4w[384u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                g = g + 64u;
+            }
+        }
+        partial_q4k[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+                partial_q4k[lid] = partial_q4k[lid] + partial_q4k[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u) {
+            let r = partial_q4k[sub << 6u];
+            if (r0 < rows2) { q1y2[r0] = r.x; }
+            if (r1 < rows2) { q1y2[r1] = r.y; }
+            if (r2 < rows2) { q1y2[r2] = r.z; }
+            if (r3 < rows2) { q1y2[r3] = r.w; }
+        }
+        workgroupBarrier();
+        }
+        wb = wb + nwg.x;
+    }
+}
+
 // ── q4tp matvec, k-in-registers batch: ONE weight decode serves up to
 // FOUR activation vectors. The nb-dispatch batch streams the whole weight
 // once per element and hopes for L2; at 2-8 MB a layer there is nothing
@@ -11426,6 +11633,10 @@ struct Ctx {
     gdn_conv_k: wgpu::ComputePipeline,
     q4tp_mv_k: wgpu::ComputePipeline,
     q4tp_mv16w: wgpu::ComputePipeline,
+    /// Two wide q4tp projections of one input in one dispatch (gate+up,
+    /// GDN qkv+z, attention k+v). `CMF_MV_X2=0` splits them again.
+    q4tp_mv16w_x2: wgpu::ComputePipeline,
+    use_mv_x2: bool,
     f32_gemm_dx: wgpu::ComputePipeline,
     vae_conv: wgpu::ComputePipeline,
     dit_ropepack: wgpu::ComputePipeline,
@@ -12536,6 +12747,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let gdn_conv_k = pipe("gdn_conv_k");
     let q4tp_mv_k = pipe("q4tp_matvec4_k");
     let q4tp_mv16w = pipe("q4tp_matvec16w");
+    let q4tp_mv16w_x2 = pipe("q4tp_matvec16w_x2");
+    let use_mv_x2 = std::env::var("CMF_MV_X2").map(|v| v != "0").unwrap_or(true);
     let f32_gemm_dx = pipe("f32_gemm_dx");
     // Per-kernel validation while these are new: a scope around each
     // names the shader the driver rejected, where the module-wide scope
@@ -12846,6 +13059,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         gdn_conv_k,
         q4tp_mv_k,
         q4tp_mv16w,
+        q4tp_mv16w_x2,
+        use_mv_x2,
         f32_gemm_dx,
         vae_conv,
         dit_ropepack,
@@ -13250,6 +13465,41 @@ fn mv_grid_cap() -> u32 {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
     })
+}
+
+/// Bind group + grid for the two-weight 16w kernel: weight A → ya over
+/// rows_a, weight B → yb over rows_b, both against `xs` (cols wide).
+#[allow(clippy::too_many_arguments)]
+fn mv_x2_bind(
+    c: &Ctx,
+    wa: &wgpu::Buffer,
+    wb: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    ya: &wgpu::Buffer,
+    yb: &wgpu::Buffer,
+    rows_a: usize,
+    rows_b: usize,
+    cols: usize,
+) -> (wgpu::BindGroup, u32) {
+    let gpr = cols / 32;
+    let p_buf = uniform_u32x4(c, [gpr as u32, rows_a as u32, 1, rows_b as u32]);
+    let layout = c.q4tp_mv16w_x2.get_bind_group_layout(0);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("mv-x2"),
+        layout: &layout,
+        entries: &[
+            bind_buf(0, wa),
+            bind_buf(2, ya),
+            bind_buf(3, &p_buf),
+            bind_buf(4, wa),
+            bind_buf(5, xs),
+            bind_buf(6, wb),
+            bind_buf(7, wb),
+            bind_buf(8, yb),
+        ],
+    });
+    let wg = (rows_a as u32).div_ceil(16) + (rows_b as u32).div_ceil(16);
+    (bind, mv_grid(wg))
 }
 
 /// `CMF_MV16W=0`: the wide-row q4tp decode matvec takes the 8-row pair
@@ -15736,6 +15986,29 @@ pub fn forward_token_graph(
             _ => None,
         }
     };
+    // Two projections over the same input in ONE dispatch (the x2
+    // kernel): both q4tp, both wide (gpr > 64, the 16w regime), same
+    // cols. None when the pair does not qualify — the caller falls back
+    // to two `prep`s. Bit-identical per row to the single kernel.
+    let prep2 = |a: &GMat,
+                 b: &GMat,
+                 xs: &wgpu::Buffer,
+                 ya: &wgpu::Buffer,
+                 yb: &wgpu::Buffer,
+                 rows_a: usize,
+                 rows_b: usize,
+                 cols: usize|
+     -> Option<(&wgpu::ComputePipeline, wgpu::BindGroup, u32)> {
+        if !c.use_mv_x2 || !c.use_mv4 || a.kind != 6 || b.kind != 6 || cols % 32 != 0 {
+            return None;
+        }
+        let gpr = cols / 32;
+        if gpr <= 64 || c.q4tp_mv16w_probe.is_some() {
+            return None;
+        }
+        let (bind, wg) = mv_x2_bind(c, &a.buf, &b.buf, xs, ya, yb, rows_a, rows_b, cols);
+        Some((&c.q4tp_mv16w_x2, bind, wg))
+    };
     // Emit a set of mutually-INDEPENDENT matvecs. When grouping is on and every
     // one preps, they share a single compute pass (no barrier between them);
     // otherwise each goes through emat as its own pass. Correctness rests on the
@@ -15974,14 +16247,32 @@ pub fn forward_token_graph(
                     // Gated wq emits 2·nh·hd (q||gate interleaved per head); the rope
                     // kernel splits it, roping q and passing gate through to `gout`.
                     let qrows = nh * hd * (1 + *output_gate as usize);
-                    group_mats(
-                        &mut enc,
-                        &[
-                            (wq, &n1, &qraw, qrows, hidden),
-                            (wk, &n1, &kb, nkv * hd, hidden),
-                            (wv, &n1, &vb, nkv * hd, hidden),
-                        ],
-                    );
+                    // k+v in ONE dispatch (the x2 kernel) next to q, when
+                    // both are wide q4tp; otherwise the grouped pass.
+                    let pkv = if group {
+                        prep2(wk, wv, &n1, &kb, &vb, nkv * hd, nkv * hd, hidden)
+                    } else {
+                        None
+                    };
+                    match (pkv, prep(wq, &n1, &qraw, qrows, hidden)) {
+                        (Some((p2, b2, w2)), Some((pq, bq, wgq))) => {
+                            let mut pass = begin_pass(&mut enc);
+                            pass.set_pipeline(pq);
+                            pass.set_bind_group(0, &bq, &[]);
+                            pass.dispatch_workgroups(wgq, 1, 1);
+                            pass.set_pipeline(p2);
+                            pass.set_bind_group(0, &b2, &[]);
+                            pass.dispatch_workgroups(w2, 1, 1);
+                        }
+                        _ => group_mats(
+                            &mut enc,
+                            &[
+                                (wq, &n1, &qraw, qrows, hidden),
+                                (wk, &n1, &kb, nkv * hd, hidden),
+                                (wv, &n1, &vb, nkv * hd, hidden),
+                            ],
+                        ),
+                    }
                     if let Some((bq, bk, bv)) = bias {
                         let (bqb, bkb, bvb) = (
                             stor(bytemuck::cast_slice(bq)),
@@ -16437,14 +16728,28 @@ pub fn forward_token_graph(
                     // teaching `prep` the q4tp kind collapsed this layer's four
                     // projection passes into one and bought 1.46 ms a token
                     // across 30 layers — ~16 us per pass. Four passes become one.
-                    let projs = [
-                        prep(qkv, &n1, &qkv_b, *cdim, hidden),
-                        prep(z, &n1, &z_b, nv * dv, hidden),
-                        prep(a, &n1, &a_b, *nv, hidden),
-                        prep(b, &n1, &b_b, *nv, hidden),
-                    ];
+                    // qkv+z ride ONE dispatch when both are wide q4tp
+                    // (the x2 kernel); a and b (tiny, f32) stay separate.
+                    let pqz = prep2(qkv, z, &n1, &qkv_b, &z_b, *cdim, nv * dv, hidden);
+                    let n_proj = if pqz.is_some() { 3 } else { 4 };
+                    let projs = if let Some(p2) = pqz {
+                        [
+                            Some(p2),
+                            prep(a, &n1, &a_b, *nv, hidden),
+                            prep(b, &n1, &b_b, *nv, hidden),
+                            None,
+                        ]
+                    } else {
+                        [
+                            prep(qkv, &n1, &qkv_b, *cdim, hidden),
+                            prep(z, &n1, &z_b, nv * dv, hidden),
+                            prep(a, &n1, &a_b, *nv, hidden),
+                            prep(b, &n1, &b_b, *nv, hidden),
+                        ]
+                    };
                     let outp = prep(out, &gdo_b, &ob, hidden, nv * dv);
-                    if projs.iter().all(|p| p.is_some()) && outp.is_some() {
+                    let projs_ok = projs.iter().take(n_proj).all(|p| p.is_some());
+                    if projs_ok && outp.is_some() {
                         let _ = (skip_proj, skip_outp);
                         let mut pass = begin_pass(&mut enc);
                         if !skip_proj {
@@ -16673,11 +16978,55 @@ pub fn forward_token_graph(
                         continue_ffn = true;
                     }
                     if !continue_ffn {
-                        let pg = prep(gate, &n1, &gbuf, inter, hidden);
-                        let pu = prep(up, &n1, &ubuf, inter, hidden);
+                        let pgu = prep2(gate, up, &n1, &gbuf, &ubuf, inter, inter, hidden);
+                        let (pg, pu) = if pgu.is_some() {
+                            (None, None)
+                        } else {
+                            (
+                                prep(gate, &n1, &gbuf, inter, hidden),
+                                prep(up, &n1, &ubuf, inter, hidden),
+                            )
+                        };
                         let pd = prep(down, &abuf, &ob, hidden, inter);
                         let mut down_rode_along = false;
-                        if let (Some((pgp, bg_g, wg)), Some((pup, bg_u, wu))) = (pg, pu) {
+                        if let Some((p2, bg2, w2)) = pgu {
+                            let bg_silu = bgc(
+                                26,
+                                li,
+                                &c.layout_silu,
+                                &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u],
+                            );
+                            let mut pass = begin_pass(&mut enc);
+                            let fine = li < 32;
+                            if let Some((p, b, w)) = &ffn_pre {
+                                pass.set_pipeline(p);
+                                pass.set_bind_group(0, b, &[]);
+                                pass.dispatch_workgroups(*w, 1, 1);
+                            }
+                            tsp!(pass, fine, 40);
+                            pass.set_pipeline(p2);
+                            pass.set_bind_group(0, &bg2, &[]);
+                            pass.dispatch_workgroups(w2, 1, 1);
+                            tsp!(pass, fine, 42); // gate+up in one dispatch
+                            pass.set_pipeline(&c.silu);
+                            pass.set_bind_group(0, &bg_silu, &[]);
+                            pass.dispatch_workgroups_flat((inter as u32).div_ceil(256));
+                            tsp!(pass, fine, 43);
+                            if let Some((pdp, bg_d, wd)) = &pd {
+                                pass.set_pipeline(pdp);
+                                pass.set_bind_group(0, bg_d, &[]);
+                                pass.dispatch_workgroups(*wd, 1, 1);
+                                tsp!(pass, fine, 44);
+                                if let Some((p, b, w)) = &ffn_post {
+                                    pass.set_pipeline(p);
+                                    pass.set_bind_group(0, b, &[]);
+                                    pass.dispatch_workgroups(*w, 1, 1);
+                                    tail_done = true;
+                                }
+                                tsp!(pass, fine, 45);
+                                down_rode_along = true;
+                            }
+                        } else if let (Some((pgp, bg_g, wg)), Some((pup, bg_u, wu))) = (pg, pu) {
                             let bg_silu = bgc(
                                 26,
                                 li,
@@ -27370,6 +27719,230 @@ fn main() {
             best * 1e3 / reps as f64,
             flops / best / 1e9
         );
+    }
+
+    /// The two-weight 16w kernel must equal two single 16w dispatches BIT
+    /// FOR BIT — the fusion moves a dispatch boundary, not a rounding.
+    /// Uneven row counts on purpose (a partial last block on each side).
+    #[test]
+    fn wgpu_q4tp_matvec16w_x2_matches_two_singles() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let cols = 4096usize; // gpr 128 > 64: the 16w regime
+        let mk_w = |rows: usize, seed: usize| -> Vec<u8> {
+            let total = cortiq_core::quant::expected_nbytes(
+                cortiq_core::TensorDtype::Q4TiledP,
+                &[rows, cols],
+            )
+            .unwrap();
+            let (params_off, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+            let mut wb: Vec<u8> = (0..total).map(|i| ((i * 37 + seed * 11) % 251) as u8).collect();
+            let lo = cortiq_core::quant::f32_to_f16(-4.0);
+            let step = cortiq_core::quant::f32_to_f16(0.1);
+            for r in 0..rows {
+                let o = params_off + r * 4;
+                wb[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+                wb[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+            }
+            wb
+        };
+        let (rows_a, rows_b) = (1000usize, 296usize);
+        let (wa, wb) = (mk_w(rows_a, 1), mk_w(rows_b, 2));
+        let xs: Vec<f32> = (0..cols).map(|i| ((i % 97) as f32 - 48.0) / 48.0).collect();
+        let mk = |bytes: &[u8]| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let (wab, wbb, xb) = (mk(&wa), mk(&wb), mk(bytemuck::cast_slice(&xs)));
+        let out = |n: usize| {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (n * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let (ya1, yb1, ya2, yb2) = (out(rows_a), out(rows_b), out(rows_a), out(rows_b));
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // two singles (the 16w path: batch 1, gpr > 64)
+        encode_q4tp_mv4(c, &mut enc, &wab, &xb, &ya1, rows_a, cols);
+        encode_q4tp_mv4(c, &mut enc, &wbb, &xb, &yb1, rows_b, cols);
+        // the pair
+        let (bind, wg) = mv_x2_bind(c, &wab, &wbb, &xb, &ya2, &yb2, rows_a, rows_b, cols);
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(&c.q4tp_mv16w_x2);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(wg, 1, 1);
+        }
+        let n = rows_a + rows_b;
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (2 * n * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        enc.copy_buffer_to_buffer(&ya1, 0, &stage, 0, (rows_a * 4) as u64);
+        enc.copy_buffer_to_buffer(&yb1, 0, &stage, (rows_a * 4) as u64, (rows_b * 4) as u64);
+        enc.copy_buffer_to_buffer(&ya2, 0, &stage, (n * 4) as u64, (rows_a * 4) as u64);
+        enc.copy_buffer_to_buffer(&yb2, 0, &stage, ((n + rows_a) * 4) as u64, (rows_b * 4) as u64);
+        submit(c, enc.finish());
+        let slice = stage.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range().expect("map");
+        let all: &[f32] = bytemuck::cast_slice(&data);
+        let (single, pair) = all.split_at(n);
+        let mism = single.iter().zip(pair).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        let nz = single.iter().filter(|v| **v != 0.0).count();
+        drop(data);
+        stage.unmap();
+        assert!(nz > n / 2, "the singles produced mostly zeros — the harness is wrong");
+        assert_eq!(mism, 0, "{mism} of {n} outputs differ between the x2 kernel and two singles");
+    }
+
+    /// Decode-matvec bandwidth by SHAPE, in one submit: the wide FFN
+    /// gate/up shape (17408 x 5120) against the narrow down/out shape
+    /// (5120 x 17408, the same bytes) through `encode_q4tp_mv4` — the
+    /// exact dispatch the token graph issues. If the narrow shape streams
+    /// visibly slower, the card is short of workgroups there (320 blocks
+    /// of 16 rows on 170 SMs) and split-K is the medicine; if both sit at
+    /// the same fraction of the bus, the kernel is. `cargo test --release
+    /// --features gpu -- --ignored wgpu_q4tp_matvec_shape_bandwidth --nocapture`.
+    #[test]
+    #[ignore]
+    fn wgpu_q4tp_matvec_shape_bandwidth() {
+        use std::time::Instant;
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let reps = env_usize("CMF_MM_REPS", 40);
+        // Per-dispatch floor: a tiny matvec (16 rows) issued 700 times in
+        // ONE submit — the launch + drain cost a serial chain pays per
+        // dispatch on this device, times the ~700 dispatches of a token.
+        {
+            let (rows, cols) = (16usize, 128usize);
+            let total = cortiq_core::quant::expected_nbytes(
+                cortiq_core::TensorDtype::Q4TiledP,
+                &[rows, cols],
+            )
+            .unwrap();
+            let wb: Vec<u8> = (0..total).map(|i| (i * 37 % 251) as u8).collect();
+            let xs: Vec<f32> = (0..cols).map(|i| i as f32 * 0.01).collect();
+            let mk = |bytes: &[u8]| {
+                c.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytes,
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+            };
+            let wbuf = mk(&wb);
+            let xbuf = mk(bytemuck::cast_slice(&xs));
+            let ybuf = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (rows * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            let n = 700usize;
+            let run = || {
+                let mut enc = c
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                for _ in 0..n {
+                    encode_q4tp_mv4(c, &mut enc, &wbuf, &xbuf, &ybuf, rows, cols);
+                }
+                let t = Instant::now();
+                submit(c, enc.finish());
+                let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                t.elapsed().as_secs_f64()
+            };
+            run();
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                best = best.min(run());
+            }
+            println!(
+                "null-dispatch chain: {n} tiny matvecs in one submit = {:.2} ms  ({:.1} us/dispatch)",
+                best * 1e3,
+                best * 1e6 / n as f64
+            );
+        }
+        for (rows, cols, label) in [
+            (17408usize, 5120usize, "gate/up 17408x5120"),
+            (5120, 17408, "down 5120x17408"),
+            (16384, 5120, "gdn qkv 16384x5120"),
+            (5120, 6144, "o/out 5120x6144"),
+            (248320, 5120, "lm_head 248320x5120"),
+        ] {
+            let total = cortiq_core::quant::expected_nbytes(
+                cortiq_core::TensorDtype::Q4TiledP,
+                &[rows, cols],
+            )
+            .unwrap();
+            let (params_off, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+            let mut wb: Vec<u8> = (0..total).map(|i| (i * 37 % 251) as u8).collect();
+            let lo = cortiq_core::quant::f32_to_f16(-4.0);
+            let step = cortiq_core::quant::f32_to_f16(0.1);
+            for r in 0..rows {
+                let o = params_off + r * 4;
+                wb[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+                wb[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+            }
+            let xs: Vec<f32> = (0..cols).map(|i| ((i % 97) as f32 - 48.0) / 48.0).collect();
+            let mk = |bytes: &[u8]| {
+                c.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytes,
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+            };
+            let wbuf = mk(&wb);
+            let xbuf = mk(bytemuck::cast_slice(&xs));
+            let ybuf = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (rows * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            let run = || {
+                let mut enc = c
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                for _ in 0..reps {
+                    encode_q4tp_mv4(c, &mut enc, &wbuf, &xbuf, &ybuf, rows, cols);
+                }
+                submit(c, enc.finish());
+                let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            };
+            run();
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t = Instant::now();
+                run();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            let per = best / reps as f64;
+            println!(
+                "{label}: {:.1} MB  {:.1} us/dispatch  {:.0} GB/s",
+                total as f64 / 1e6,
+                per * 1e6,
+                total as f64 / per / 1e9
+            );
+        }
     }
 
     /// The f16-PLANE tensor-core GEMM with the DEVICE-computed activation
