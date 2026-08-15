@@ -18769,6 +18769,9 @@ pub fn forward_batch_graph(
     let qout_s = rwc(nh * hd);
     let gout_s = rwc(nh * hd);
     let attn_s = rwc(nh * hd);
+    // Split-K attend partials for the per-row attention above 256 positions.
+    let pacc_s = rwc(nh * cap.div_ceil(ATTEND_GCK) * hd);
+    let pml_s = rwc(nh * cap.div_ceil(ATTEND_GCK) * 2);
     let qkv_s = rwc(gcdim);
     // k rows for the k-looped conv/step twins — row i at i*cdim.
     let cq_s = rwc(k * gcdim);
@@ -19217,14 +19220,74 @@ pub fn forward_batch_graph(
                             &[],
                         );
                         pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
-                        let (ap, al) = attend_pipes(c, hd);
-                        pass.set_pipeline(ap);
-                        pass.set_bind_group(
-                            0,
-                            &bg(al, &[&qout_s, kbuf, vbuf, &attn_s, &at_u]),
-                            &[],
-                        );
-                        pass.dispatch_workgroups(nh as u32, 1, 1);
+                        // The same attend arms as the token graph: the
+                        // 256-lane decode kernel at short context, the
+                        // GQA-shared split-K past ATTEND_SPLIT_MIN. The
+                        // 32-lane per-head kernel this loop used to call
+                        // walked every cached position with a barrier
+                        // pair — at a 2.3k-token prompt a k=4 verify spent
+                        // more in it than in all its matvecs (spec decoded
+                        // 26 tok/s against a plain 44 on that prompt).
+                        let n_ctx = p + 1;
+                        let hpk = nh / nkv;
+                        let split_ok = n_ctx > ATTEND_SPLIT_MIN
+                            && c.attend_gpart.is_some()
+                            && hpk <= 8
+                            && hd <= 256
+                            && hd % 4 == 0
+                            && nh % nkv == 0;
+                        if split_ok {
+                            let nc = cap.div_ceil(ATTEND_GCK);
+                            let nc_used = n_ctx.div_ceil(ATTEND_GCK);
+                            let ap_u = unif(&[
+                                nh as u32,
+                                hpk as u32,
+                                hd as u32,
+                                cap as u32,
+                                n_ctx as u32,
+                                ATTEND_GCK as u32,
+                                nc as u32,
+                                0,
+                            ]);
+                            let bg_part = bg(
+                                c.layout_attend_gpart.as_ref().unwrap(),
+                                &[&qout_s, kbuf, vbuf, &pacc_s, &pml_s, &ap_u],
+                            );
+                            let bg_merge = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: None,
+                                layout: &c.layout_attend_merge,
+                                entries: &[
+                                    bind_buf(3, &pacc_s),
+                                    bind_buf(4, &pml_s),
+                                    bind_buf(5, &ap_u),
+                                    bind_buf(6, &attn_s),
+                                ],
+                            });
+                            pass.set_pipeline(c.attend_gpart.as_ref().unwrap());
+                            pass.set_bind_group(0, &bg_part, &[]);
+                            pass.dispatch_workgroups(nkv as u32, nc_used as u32, 1);
+                            pass.set_pipeline(&c.attend_merge);
+                            pass.set_bind_group(0, &bg_merge, &[]);
+                            pass.dispatch_workgroups(nh as u32, 1, 1);
+                        } else if c.attend_dec && hd <= 256 {
+                            let dec_l = c.gqa_attend_dec.get_bind_group_layout(0);
+                            pass.set_pipeline(&c.gqa_attend_dec);
+                            pass.set_bind_group(
+                                0,
+                                &bg(&dec_l, &[&qout_s, kbuf, vbuf, &attn_s, &at_u]),
+                                &[],
+                            );
+                            pass.dispatch_workgroups(nh as u32, 1, 1);
+                        } else {
+                            let (ap, al) = attend_pipes(c, hd);
+                            pass.set_pipeline(ap);
+                            pass.set_bind_group(
+                                0,
+                                &bg(al, &[&qout_s, kbuf, vbuf, &attn_s, &at_u]),
+                                &[],
+                            );
+                            pass.dispatch_workgroups(nh as u32, 1, 1);
+                        }
                         if *output_gate {
                             let gm_u = unif(&[(nh * hd) as u32, 0, 0, 0]);
                             pass.set_pipeline(&c.gate_mul);
