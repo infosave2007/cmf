@@ -5164,6 +5164,9 @@ pub static WEIGHT_BYTES_BY: [std::sync::atomic::AtomicU64; 6] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 pub static WCAT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Calls into the dense-FFN encoder — ~layer count per token unless
+/// something encodes twice.
+pub static FFN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn note_weight_bytes(kind: &ProjKind, rows: usize, gpr: usize) {
     let tile: u64 = match kind {
@@ -9836,7 +9839,17 @@ impl TokenGraph {
         down: (usize, usize, usize),
         delta: Option<&Buffer>,
     ) {
+        if std::env::var("CMF_FFN_TRACE").is_ok() {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let lo: u64 = std::env::var("CMF_FFN_TRACE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            if n >= lo && n < lo + 96 {
+                eprintln!("ffn-call #{n}: gate_rows={} inter={}", gate.1, gate.0);
+            }
+        }
         WCAT.store(1, std::sync::atomic::Ordering::Relaxed);
+        FFN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let inter = gate.1;
         let fg_b = io_buf(self.c, 33_000_000_209 + inter, inter * 4);
         let fu_b = io_buf(self.c, 34_000_000_213 + inter, inter * 4);
