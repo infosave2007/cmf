@@ -48,15 +48,25 @@ var<workgroup> sg_part: array<f32, 16>;
 fn q4tp_byte(off: u32) -> u32 {
     return (q1w[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
 }
+// A nibble as f32 WITHOUT an integer-to-float conversion: OR it into the
+// mantissa of 2^23 and subtract 2^23 + 8. Exact — n − 8 for every n in
+// 0..16 — so each kernel's arithmetic is unchanged to the bit; what
+// changes is the instruction mix. I2F issues at 1/8 of the FMA rate on
+// NVIDIA and there were eight of them per weight word, more than the
+// eight FMAs the word is for. `CMF_MAGIC_UNPACK=0` restores the
+// conversions for an A/B (the Rust side swaps the bodies).
+fn q4v_nib(w: u32, sh: u32) -> f32 {
+    return bitcast<f32>(((w >> sh) & 0xFu) | 0x4B000000u) - 8388616.0;
+}
 fn q4v_dot8(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
-    return (f32(w & 0xFu) - 8.0) * a.x
-         + (f32((w >> 4u) & 0xFu) - 8.0) * a.y
-         + (f32((w >> 8u) & 0xFu) - 8.0) * a.z
-         + (f32((w >> 12u) & 0xFu) - 8.0) * a.w
-         + (f32((w >> 16u) & 0xFu) - 8.0) * b.x
-         + (f32((w >> 20u) & 0xFu) - 8.0) * b.y
-         + (f32((w >> 24u) & 0xFu) - 8.0) * b.z
-         + (f32((w >> 28u) & 0xFu) - 8.0) * b.w;
+    return q4v_nib(w, 0u) * a.x
+         + q4v_nib(w, 4u) * a.y
+         + q4v_nib(w, 8u) * a.z
+         + q4v_nib(w, 12u) * a.w
+         + q4v_nib(w, 16u) * b.x
+         + q4v_nib(w, 20u) * b.y
+         + q4v_nib(w, 24u) * b.z
+         + q4v_nib(w, 28u) * b.w;
 }
 
 @compute @workgroup_size(256)
@@ -3352,15 +3362,25 @@ var<workgroup> lad_q4v: array<f32, 256>;
 var<workgroup> partial_q4v: array<f32, 256>;
 var<workgroup> partial_q4vb: array<f32, 256>;
 
+// A nibble as f32 WITHOUT an integer-to-float conversion: OR it into the
+// mantissa of 2^23 and subtract 2^23 + 8. Exact — n − 8 for every n in
+// 0..16 — so each kernel's arithmetic is unchanged to the bit; what
+// changes is the instruction mix. I2F issues at 1/8 of the FMA rate on
+// NVIDIA and there were eight of them per weight word, more than the
+// eight FMAs the word is for. `CMF_MAGIC_UNPACK=0` restores the
+// conversions for an A/B (the Rust side swaps the bodies).
+fn q4v_nib(w: u32, sh: u32) -> f32 {
+    return bitcast<f32>(((w >> sh) & 0xFu) | 0x4B000000u) - 8388616.0;
+}
 fn q4v_dot8(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
-    return (f32(w & 0xFu) - 8.0) * a.x
-         + (f32((w >> 4u) & 0xFu) - 8.0) * a.y
-         + (f32((w >> 8u) & 0xFu) - 8.0) * a.z
-         + (f32((w >> 12u) & 0xFu) - 8.0) * a.w
-         + (f32((w >> 16u) & 0xFu) - 8.0) * b.x
-         + (f32((w >> 20u) & 0xFu) - 8.0) * b.y
-         + (f32((w >> 24u) & 0xFu) - 8.0) * b.z
-         + (f32((w >> 28u) & 0xFu) - 8.0) * b.w;
+    return q4v_nib(w, 0u) * a.x
+         + q4v_nib(w, 4u) * a.y
+         + q4v_nib(w, 8u) * a.z
+         + q4v_nib(w, 12u) * a.w
+         + q4v_nib(w, 16u) * b.x
+         + q4v_nib(w, 20u) * b.y
+         + q4v_nib(w, 24u) * b.z
+         + q4v_nib(w, 28u) * b.w;
 }
 
 // The 2-way group unroll of `q4tp_matvec4` (CMF_MV_U2=1): two
@@ -4269,12 +4289,10 @@ fn q4v_d8u(lo: vec4<f32>, hi: vec4<f32>, a: vec4<f32>, b: vec4<f32>) -> f32 {
 }
 
 fn q4v_lo4(w: u32) -> vec4<f32> {
-    return vec4<f32>(f32(w & 0xFu), f32((w >> 4u) & 0xFu),
-                     f32((w >> 8u) & 0xFu), f32((w >> 12u) & 0xFu)) - vec4<f32>(8.0);
+    return vec4<f32>(q4v_nib(w, 0u), q4v_nib(w, 4u), q4v_nib(w, 8u), q4v_nib(w, 12u));
 }
 fn q4v_hi4(w: u32) -> vec4<f32> {
-    return vec4<f32>(f32((w >> 16u) & 0xFu), f32((w >> 20u) & 0xFu),
-                     f32((w >> 24u) & 0xFu), f32((w >> 28u) & 0xFu)) - vec4<f32>(8.0);
+    return vec4<f32>(q4v_nib(w, 16u), q4v_nib(w, 20u), q4v_nib(w, 24u), q4v_nib(w, 28u));
 }
 
 // ── q4tp matvec, batch blocked with the unpack SHARED (`CMF_MV_BK=2`).
@@ -5405,16 +5423,16 @@ fn q4tp_matvec32w(@builtin(workgroup_id) wid: vec3<u32>,
             stride = stride >> 1u;
         }
         if (l == 0u) {
-            let r = partial_q4k[sub << 6u];
-            let r2 = partial_q4k2[sub << 6u];
-            if (r0 < rows) { q1y[r0] = r.x; }
-            if (r1 < rows) { q1y[r1] = r.y; }
-            if (r2 < rows) { q1y[r2] = r.z; }
-            if (r3 < rows) { q1y[r3] = r.w; }
-            if (r4 < rows) { q1y[r4] = r2.x; }
-            if (r5 < rows) { q1y[r5] = r2.y; }
-            if (r6 < rows) { q1y[r6] = r2.z; }
-            if (r7 < rows) { q1y[r7] = r2.w; }
+            let ra = partial_q4k[sub << 6u];
+            let rb = partial_q4k2[sub << 6u];
+            if (r0 < rows) { q1y[r0] = ra.x; }
+            if (r1 < rows) { q1y[r1] = ra.y; }
+            if (r2 < rows) { q1y[r2] = ra.z; }
+            if (r3 < rows) { q1y[r3] = ra.w; }
+            if (r4 < rows) { q1y[r4] = rb.x; }
+            if (r5 < rows) { q1y[r5] = rb.y; }
+            if (r6 < rows) { q1y[r6] = rb.z; }
+            if (r7 < rows) { q1y[r7] = rb.w; }
         }
         workgroupBarrier();
         wb = wb + nwg.x;
@@ -5768,23 +5786,30 @@ fn q4tp_matvec16w_gu(@builtin(workgroup_id) wid: vec3<u32>,
 // rungs shifted down one — the same convention as the MoE q2tp kernels.
 // Layout in u32 words: nibbles (row·gpr + g)·2, params rows·gpr·2 + row,
 // codes byte plane at rows·gpr·8 + rows·4 + row·cstride.
+// The 2-bit code's (c − 1.5) by the same magic, doubled: 2c into the
+// mantissa of 2^23, minus 2^23 + 3, is 2c − 3 exactly, and the sum of
+// exactly-doubled terms halved at the end is the undoubled sum to the
+// bit (scaling by two commutes with every rounding here).
+fn q2v_c2(w: u32, sh: u32) -> f32 {
+    return bitcast<f32>((((w >> sh) & 3u) << 1u) | 0x4B000000u) - 8388611.0;
+}
 fn q2v_d16(w: u32, a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32>) -> f32 {
-    return (f32(w & 3u) - 1.5) * a.x
-         + (f32((w >> 2u) & 3u) - 1.5) * a.y
-         + (f32((w >> 4u) & 3u) - 1.5) * a.z
-         + (f32((w >> 6u) & 3u) - 1.5) * a.w
-         + (f32((w >> 8u) & 3u) - 1.5) * b.x
-         + (f32((w >> 10u) & 3u) - 1.5) * b.y
-         + (f32((w >> 12u) & 3u) - 1.5) * b.z
-         + (f32((w >> 14u) & 3u) - 1.5) * b.w
-         + (f32((w >> 16u) & 3u) - 1.5) * c.x
-         + (f32((w >> 18u) & 3u) - 1.5) * c.y
-         + (f32((w >> 20u) & 3u) - 1.5) * c.z
-         + (f32((w >> 22u) & 3u) - 1.5) * c.w
-         + (f32((w >> 24u) & 3u) - 1.5) * d.x
-         + (f32((w >> 26u) & 3u) - 1.5) * d.y
-         + (f32((w >> 28u) & 3u) - 1.5) * d.z
-         + (f32((w >> 30u) & 3u) - 1.5) * d.w;
+    return (q2v_c2(w, 0u) * a.x
+         + q2v_c2(w, 2u) * a.y
+         + q2v_c2(w, 4u) * a.z
+         + q2v_c2(w, 6u) * a.w
+         + q2v_c2(w, 8u) * b.x
+         + q2v_c2(w, 10u) * b.y
+         + q2v_c2(w, 12u) * b.z
+         + q2v_c2(w, 14u) * b.w
+         + q2v_c2(w, 16u) * c.x
+         + q2v_c2(w, 18u) * c.y
+         + q2v_c2(w, 20u) * c.z
+         + q2v_c2(w, 22u) * c.w
+         + q2v_c2(w, 24u) * d.x
+         + q2v_c2(w, 26u) * d.y
+         + q2v_c2(w, 28u) * d.z
+         + q2v_c2(w, 30u) * d.w) * 0.5;
 }
 @compute @workgroup_size(256)
 fn q2tp_matvec16w(@builtin(workgroup_id) wid: vec3<u32>,
@@ -6031,16 +6056,16 @@ fn q2tp_matvec32w(@builtin(workgroup_id) wid: vec3<u32>,
             stride = stride >> 1u;
         }
         if (l == 0u) {
-            let r = partial_q4k[sub << 6u];
-            let r2 = partial_q4k2[sub << 6u];
-            if (r0 < rows) { q1y[r0] = r.x; }
-            if (r1 < rows) { q1y[r1] = r.y; }
-            if (r2 < rows) { q1y[r2] = r.z; }
-            if (r3 < rows) { q1y[r3] = r.w; }
-            if (r4 < rows) { q1y[r4] = r2.x; }
-            if (r5 < rows) { q1y[r5] = r2.y; }
-            if (r6 < rows) { q1y[r6] = r2.z; }
-            if (r7 < rows) { q1y[r7] = r2.w; }
+            let ra = partial_q4k[sub << 6u];
+            let rb = partial_q4k2[sub << 6u];
+            if (r0 < rows) { q1y[r0] = ra.x; }
+            if (r1 < rows) { q1y[r1] = ra.y; }
+            if (r2 < rows) { q1y[r2] = ra.z; }
+            if (r3 < rows) { q1y[r3] = ra.w; }
+            if (r4 < rows) { q1y[r4] = rb.x; }
+            if (r5 < rows) { q1y[r5] = rb.y; }
+            if (r6 < rows) { q1y[r6] = rb.z; }
+            if (r7 < rows) { q1y[r7] = rb.w; }
         }
         workgroupBarrier();
         wb = wb + nwg.x;
@@ -13375,7 +13400,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let msc = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("q8"),
-        source: wgpu::ShaderSource::Wgsl(WGSL.into()),
+        source: wgpu::ShaderSource::Wgsl(wgsl_main_source().into()),
     });
     if let Some(e) = pollster::block_on(msc.pop()) {
         // The module's own diagnostic names the offending line; without
@@ -14595,6 +14620,24 @@ fn mv_gu_bind(
         ],
     });
     (bind, mv_grid((inter as u32).div_ceil(8)))
+}
+
+/// The main module's source, with the nibble unpack swapped back to
+/// integer-to-float conversions under `CMF_MAGIC_UNPACK=0` — the A/B for
+/// the magic-mantissa unpack. Same values to the bit either way.
+fn wgsl_main_source() -> String {
+    if std::env::var("CMF_MAGIC_UNPACK").as_deref() != Ok("0") {
+        return WGSL.to_string();
+    }
+    WGSL
+        .replace(
+            "return bitcast<f32>(((w >> sh) & 0xFu) | 0x4B000000u) - 8388616.0;",
+            "return f32((w >> sh) & 0xFu) - 8.0;",
+        )
+        .replace(
+            "return bitcast<f32>((((w >> sh) & 3u) << 1u) | 0x4B000000u) - 8388611.0;",
+            "return f32(((w >> sh) & 3u) << 1u) - 3.0;",
+        )
 }
 
 /// `CMF_MV16W=0`: the wide-row q4tp decode matvec takes the 8-row pair
