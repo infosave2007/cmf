@@ -1151,6 +1151,7 @@ impl Pipeline {
                     }
                     // Early commit: the GPU starts the run while the
                     // CPU encodes the next layer (nothing to wait on).
+                    graph.commit_kind = 2;
                     graph.commit();
                     crate::gpu::stageprof(0, _ig.elapsed());
                     pending.push((*first, run.len()));
@@ -1215,7 +1216,12 @@ impl Pipeline {
                             if p.o1.is_none() {
                                 dev_attn.push(*li);
                             }
+                            graph.commit_kind = 3;
                             graph.commit();
+                            // The footer below is skipped by `continue`:
+                            // account the device-attn item here or its
+                            // cost hides from the stage profile entirely.
+                            crate::gpu::stageprof(_xkind, _xt0.elapsed());
                             continue;
                         }
                         // Mirror refused (nothing encoded) → sandwich.
@@ -1297,7 +1303,9 @@ impl Pipeline {
                 }
             }
         }
+        let _sy0 = std::time::Instant::now();
         graph.sync();
+        let _rs0 = std::time::Instant::now();
         if !pending.is_empty() {
             let idxs: Vec<usize> = pending.drain(..).flat_map(|(f, n)| f..f + n).collect();
             let mut outs: Vec<&mut [f32]> = self
@@ -1309,6 +1317,22 @@ impl Pipeline {
                 .map(|(_, s)| s.linear_state.as_mut_slice())
                 .collect();
             graph.read_states(&mut outs);
+        }
+        if std::env::var("CMF_GRAPH_HOSTPROF").as_deref() == Ok("1") {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SY: AtomicU64 = AtomicU64::new(0);
+            static RS: AtomicU64 = AtomicU64::new(0);
+            static N: AtomicU64 = AtomicU64::new(0);
+            SY.fetch_add((_rs0 - _sy0).as_nanos() as u64, Ordering::Relaxed);
+            RS.fetch_add(_rs0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 100 == 0 {
+                eprintln!(
+                    "postprof: sync-wait {:.1} ms/ток | read_states {:.1} ms/ток ({n})",
+                    SY.load(Ordering::Relaxed) as f64 / n as f64 / 1e6,
+                    RS.load(Ordering::Relaxed) as f64 / n as f64 / 1e6
+                );
+            }
         }
         if let Some(rows) = lm_rows {
             crate::gpu::hostprof_encode_done(_mt0);

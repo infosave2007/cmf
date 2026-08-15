@@ -3472,6 +3472,71 @@ kernel void q4t_matvec(
     }
 }
 
+// Wide-column variant: 8 rows per simdgroup, halving the x re-read
+// traffic. On the 27B's FFN shapes the x vector is 20-84 KB — too big
+// for L1 — and the 4-row kernel's x traffic (1.78x the weight bytes)
+// runs from L2 at a volume that halves the effective stream. Same
+// per-row math and product order as q4t_matvec.
+kernel void q4t_matvec_r8(
+    device const uchar* q    [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       y    [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint r0 = (tgpos * sgs + sg) * 8u;
+    if (r0 >= rows) return;
+    uint nr = min(rows - r0, 8u);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint xb = g * 32u;
+        device const float4* xv = (device const float4*)(x + xb);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        for (uint ri = 0u; ri < nr; ++ri) {
+            ulong t = ((ulong)(r0 + ri) * gpr + (ulong)g) * 18u;
+            device const ushort* p16 = (device const ushort*)(q + t);
+            half scale = as_type<half>(p16[0]);
+            uint b0 = (uint)p16[1] | ((uint)p16[2] << 16);
+            uint b1 = (uint)p16[3] | ((uint)p16[4] << 16);
+            uint b2 = (uint)p16[5] | ((uint)p16[6] << 16);
+            uint b3 = (uint)p16[7] | ((uint)p16[8] << 16);
+            float gsum = q4_dot8_fast(b0, x0, x1)
+                       + q4_dot8_fast(b1, x2, x3)
+                       + q4_dot8_fast(b2, x4, x5)
+                       + q4_dot8_fast(b3, x6, x7);
+            float contrib = (float)scale * gsum;
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else if (ri == 3u) acc3 += contrib;
+            else if (ri == 4u) acc4 += contrib;
+            else if (ri == 5u) acc5 += contrib;
+            else if (ri == 6u) acc6 += contrib;
+            else acc7 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    acc4 = simd_sum(acc4); acc5 = simd_sum(acc5);
+    acc6 = simd_sum(acc6); acc7 = simd_sum(acc7);
+    if (lane == 0u) {
+        y[r0] = acc0;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
+        if (nr > 4u) y[r0 + 4u] = acc4;
+        if (nr > 5u) y[r0 + 5u] = acc5;
+        if (nr > 6u) y[r0 + 6u] = acc6;
+        if (nr > 7u) y[r0 + 7u] = acc7;
+    }
+}
+
 // q4tp: same nibble values and order as q4t, but the scale is a 5-bit rung
 // on the row's ladder, kept in two side planes that follow all the nibbles.
 // Two consequences here, both good: the nibble stream is a clean 16 B stride
@@ -4484,6 +4549,7 @@ struct Ctx {
     o1far: ComputePipelineState,
     o1push: ComputePipelineState,
     o1att: ComputePipelineState,
+    q4t_r8: ComputePipelineState,
     cattend: ComputePipelineState,
     rmsrows: ComputePipelineState,
     cropekv: ComputePipelineState,
@@ -4674,6 +4740,7 @@ fn init() -> Result<Ctx, String> {
     let o1far = pso("o1_far")?;
     let o1push = pso("o1_push")?;
     let o1att = pso("o1_attend")?;
+    let q4t_r8 = pso("q4t_matvec_r8")?;
     let cattend = pso("chunk_attend")?;
     let rmsrows = pso("rmsnorm_rows")?;
     let cropekv = pso("chunk_rope_kv")?;
@@ -4746,6 +4813,7 @@ fn init() -> Result<Ctx, String> {
         o1far,
         o1push,
         o1att,
+        q4t_r8,
         cattend,
         rmsrows,
         cropekv,
@@ -4858,6 +4926,11 @@ pub(crate) fn waitprof(dt: std::time::Duration) {
             NS.load(Ordering::Relaxed) as f64 / 1e6
         );
     }
+}
+
+fn gpuprof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_METAL_GPUPROF").as_deref() == Ok("1"))
 }
 
 fn submit_and_wait(c: &Ctx, cmd: &metal::CommandBufferRef, outs: &[&Buffer]) {
@@ -5001,9 +5074,27 @@ fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Arc<WeightArena>, usiz
             stride: len.max(1),
         }
     } else {
-        // stride = max/2 caps the addressable tensor at ~6.8 GB on a
-        // 24 GB M4 — two orders above the largest tensor we ship.
-        let stride = (max_len / 2) / page * page;
+        // The driver accounts the working set by BUFFER LENGTHS, not
+        // unique pages: overlapping windows at stride max/2 tripled the
+        // 27B's accounted footprint (22.7 GB vs 14.7 real) past
+        // recommendedMaxWorkingSetSize (17.8 GB on a 24 GB M4) and the
+        // per-commit evict/rewire churn cost ~165 ms/token. Overlap by
+        // exactly the largest tensor instead: any tensor still lands
+        // whole in bufs[abs / stride], and the accounted sum stays
+        // within a tensor of the real mapping.
+        let max_tensor = model
+            .tensors
+            .iter()
+            .map(|e| model.entry_bytes(e).len())
+            .max()
+            .unwrap_or(0)
+            .max(page);
+        let guard = max_tensor.div_ceil(page) * page;
+        let stride = if guard * 2 <= max_len {
+            max_len - guard
+        } else {
+            (max_len / 2) / page * page
+        };
         let mut bufs = Vec::new();
         let mut off = 0usize;
         while off < len {
@@ -5390,7 +5481,12 @@ fn encode_q4t_matvec(
     rows: usize,
     gpr: usize,
 ) {
-    enc.set_compute_pipeline_state(&c.q4t);
+    // Wide-column probe (CMF_MV_R8=1): 8 rows per simdgroup halve the
+    // x re-read volume that dominates the 27B's FFN shapes.
+    static R8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let r8 = *R8.get_or_init(|| std::env::var("CMF_MV_R8").as_deref() == Ok("1"));
+    let rpsg = if r8 { 8u64 } else { 4u64 };
+    enc.set_compute_pipeline_state(if r8 { &c.q4t_r8 } else { &c.q4t });
     fbuf.bind(enc, 0, abs);
     enc.set_buffer(1, Some(xs), 0);
     enc.set_buffer(2, Some(y), 0);
@@ -5400,7 +5496,7 @@ fn encode_q4t_matvec(
     enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
     let sgs = 8u64;
     enc.dispatch_thread_groups(
-        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+        MTLSize::new((rows as u64).div_ceil(sgs * rpsg), 1, 1),
         MTLSize::new(sgs * 32, 1, 1),
     );
 }
@@ -9458,6 +9554,12 @@ pub struct TokenGraph {
     cmd: Option<metal::CommandBuffer>,
     /// Committed-but-unawaited predecessor (see `commit`).
     in_flight: Option<metal::CommandBuffer>,
+    /// CMF_METAL_GPUPROF=1: every command buffer this token committed
+    /// (with the item kind that committed it), so `sync` can sum GPU
+    /// busy time per category and expose the gap to the wall.
+    gpuprof: Vec<(metal::CommandBuffer, u32)>,
+    /// Item kind for the NEXT commit (2=gdn-run, 3=attn, 0=other).
+    pub commit_kind: u32,
     h_b: Buffer,
     n_b: Buffer,
     d_b: Buffer,
@@ -9492,6 +9594,8 @@ impl TokenGraph {
             dims,
             cmd: None,
             in_flight: None,
+            gpuprof: Vec::new(),
+            commit_kind: 0,
             h_b,
             n_b,
             d_b,
@@ -9764,9 +9868,19 @@ impl TokenGraph {
     /// order makes the eventual `sync` wait (on the last buffer) cover
     /// every earlier commit.
     pub fn commit(&mut self) {
+        // CMF_METAL_ONEBUF=1: keep encoding into one command buffer and
+        // let `sync` commit it — probe for the per-buffer scheduling
+        // cost (residency walk over the arena windows at every commit).
+        static ONEBUF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ONEBUF.get_or_init(|| std::env::var("CMF_METAL_ONEBUF").as_deref() == Ok("1")) {
+            return;
+        }
         if let Some(cmd) = self.cmd.take() {
             METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             cmd.commit();
+            if gpuprof_on() {
+                self.gpuprof.push((cmd.clone(), self.commit_kind));
+            }
             self.in_flight = Some(cmd);
         }
     }
@@ -9776,10 +9890,50 @@ impl TokenGraph {
         if let Some(cmd) = self.cmd.take() {
             METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             cmd.commit();
+            if gpuprof_on() {
+                self.gpuprof.push((cmd.clone(), self.commit_kind));
+            }
             self.in_flight = Some(cmd);
         }
         if let Some(cmd) = self.in_flight.take() {
             wait_fast(&cmd);
+        }
+        if gpuprof_on() && !self.gpuprof.is_empty() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static BUSY_US: [AtomicU64; 4] = [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ];
+            static SPAN_US: AtomicU64 = AtomicU64::new(0);
+            static N: AtomicU64 = AtomicU64::new(0);
+            let (mut lo, mut hi) = (f64::MAX, 0.0f64);
+            for (cmd, kind) in self.gpuprof.drain(..) {
+                use metal::objc::{msg_send, sel, sel_impl};
+                let p: *mut metal::objc::runtime::Object =
+                    cmd.as_ref() as *const _ as *mut metal::objc::runtime::Object;
+                let s: f64 = unsafe { msg_send![p, GPUStartTime] };
+                let e: f64 = unsafe { msg_send![p, GPUEndTime] };
+                if e > s {
+                    BUSY_US[kind as usize % 4]
+                        .fetch_add(((e - s) * 1e6) as u64, Ordering::Relaxed);
+                    lo = lo.min(s);
+                    hi = hi.max(e);
+                }
+            }
+            if hi > 0.0 {
+                SPAN_US.fetch_add(((hi - lo) * 1e6) as u64, Ordering::Relaxed);
+                let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 20 == 0 {
+                    let ms = |i: usize| BUSY_US[i].load(Ordering::Relaxed) as f64 / n as f64 / 1e3;
+                    eprintln!(
+                        "gpuprof: gdn-run {:.1} | attn {:.1} | прочее {:.1} ms/ток | span {:.1} ms/ток ({n} синков)",
+                        ms(2), ms(3), ms(0) + ms(1),
+                        SPAN_US.load(Ordering::Relaxed) as f64 / n as f64 / 1e3
+                    );
+                }
+            }
         }
     }
 
