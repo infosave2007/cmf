@@ -605,19 +605,31 @@ cortiq fcd model.cmf --corpus corpus.txt --gen-check --gen-gate --out model.fcd.
 ### Speculative decode off the model's own MTP head
 
 A model that ships an MTP head can draft with it and verify the whole
-chain in one batched submit. Greedy only, and opt-in:
+chain in one batched submit. Opt-in, and it covers every sampler
+configuration: greedy without penalties verifies by argmax equality
+(bit-identical to the plain path); anything else — temperature, top-k,
+top-p, penalties — goes through speculative *sampling*: the draft is a
+draw from the MTP head's own post-chain distribution q, accepted with
+min(1, p/q) against the verified position's p, and a rejected draft is
+replaced by a draw from max(0, p − q). The emitted stream is distributed
+exactly as the plain sampler's (a 400k-trial test holds the empirical
+law within L1 0.01 of the target); the same seed gives a different but
+equally valid continuation, because the two paths consume the RNG
+differently.
 
 ```sh
 CMF_GRAPH_SPEC=1 cortiq bench model.cmf --tokens 160 --core --json
-# CMF_GRAPH_SPEC_K=3 (default) — drafts per round
+CMF_GRAPH_SPEC=1 CMF_GRAPH_SPEC_K=4 cortiq run model.cmf --prompt "..." --temperature 0.7
+# CMF_GRAPH_SPEC_K=3 (default) — drafts per round; CMF_GRAPH_SPEC_SAMPLE=0 confines it to greedy
 ```
 
 On Qwen3.6-27B q4tp / RTX 5090, medians of three: **51.1 tok/s against a
 plain 49.4**, 89–91% of drafts accepted, and the greedy continuation is
-byte-identical to the plain path. `bench --json` reports `mtp_drafted`
-and `mtp_accepted` — watch the ratio, not just tok/s, because a broken
-draft path degrades silently into a lower acceptance rate rather than
-into wrong output.
+byte-identical to the plain path. On Qwen3.8-27B q4tp, same card class:
+k=3 51.2 / k=4 51.8 against a plain 47.1. `bench --json` reports
+`mtp_drafted` and `mtp_accepted` — watch the ratio, not just tok/s,
+because a broken draft path degrades silently into a lower acceptance
+rate rather than into wrong output.
 
 It is worth knowing why the plain number is what it is: that decode is
 **bus-bound**. Two decode processes on one card aggregate 52.8 tok/s
