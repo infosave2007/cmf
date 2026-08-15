@@ -25331,8 +25331,8 @@ mod tests {
                 ],
             })
         };
-        let bg_ab = bgc(0, 0, &a, &b);
-        let bg_ba = bgc(0, 0, &b, &a);
+        let bg_ab = bg(&a, &b);
+        let bg_ba = bg(&b, &a);
         let wg = (n as u32).min(MAX_WG);
         let readback = |buf: &wgpu::Buffer, enc: wgpu::CommandEncoder| {
             let mut enc = enc;
