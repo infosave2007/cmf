@@ -21548,7 +21548,11 @@ fn tp_matmat_impl(
         bind_buf(2, &y_buf),
         bind_buf(3, &p_buf),
     ];
-    if f16_arm {
+    // Both cooperative kernels declare the fifth (scale) binding now —
+    // the in-kernel one grew it for the batched prefill. The scalar tile
+    // GEMMs (q4t, q2tp, and q4tp without cooperative matrices) do not.
+    let coop_in = dq_plane.is_none() && !two_bit && c.q4tp_mm_coop.is_some();
+    if f16_arm || coop_in {
         entries.push(bind_buf(4, if dev_scale { &asc_buf } else { &dummy_scale }));
     }
     let bind_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
