@@ -722,6 +722,7 @@ impl Pipeline {
         position: usize,
         h: &mut [f32],
     ) -> usize {
+        let _mt0 = std::time::Instant::now(); // CMF_METAL_HOSTPROF
         use crate::gpu::{AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GraphDims, MetalFfn, TokenGraph};
         if self.attn_softcap > 0.0 // capped scores: no graph kernel — CPU path
             || !crate::gpu::enabled_here()
@@ -1031,7 +1032,9 @@ impl Pipeline {
         // half-executed, so truncate to the provably encodable prefix.
         let mut valid = 0usize;
         let mut end = start;
+        crate::gpu::stageprof(1, _mt0.elapsed()); // конец планирования
         for item in &plan {
+
             let ok = match item {
                 Item::Gdn { run, .. } => gcfg
                     .as_ref()
@@ -1085,6 +1088,8 @@ impl Pipeline {
         // mirror after the final sync.
         let mut dev_attn: Vec<usize> = Vec::new();
         for item in &plan {
+            let _xt0 = std::time::Instant::now();
+            let _xkind: u32 = match item { Item::Gdn { .. } => 2, Item::Attn { .. } => 3 };
             // Looped Transformer: insert on-device norm at loop boundaries.
             if self.loop_final_norm {
                 let item_start = match item {
@@ -1106,6 +1111,7 @@ impl Pipeline {
                         .iter()
                         .map(|l| l.linear_state.as_slice())
                         .collect();
+                    let _ig = std::time::Instant::now();
                     if !graph.encode_gdn_run(run, &ro, gcfg.as_ref().unwrap()) {
                         // Unreachable: the plan was validated above.
                         tracing::error!("q1 graph: GDN run refused after validation");
@@ -1114,6 +1120,7 @@ impl Pipeline {
                     // Early commit: the GPU starts the run while the
                     // CPU encodes the next layer (nothing to wait on).
                     graph.commit();
+                    crate::gpu::stageprof(0, _ig.elapsed());
                     pending.push((*first, run.len()));
                 }
                 Item::Attn {
@@ -1125,6 +1132,7 @@ impl Pipeline {
                     bias,
                     full_gpu,
                 } => {
+                    let _ia = std::time::Instant::now();
                     // ── Fully device-resident attention: no sync at all.
                     if *full_gpu {
                         let cache = &self.kv_cache.layers[*li];
@@ -1211,6 +1219,8 @@ impl Pipeline {
                     attention::recycle_buf(&mut ao);
                 }
             }
+        
+            crate::gpu::stageprof(_xkind, _xt0.elapsed());
         }
         // Ride the final norm + lm_head in the same command buffer when
         // this run reaches the model's end and the caller wants logits:
@@ -1245,8 +1255,10 @@ impl Pipeline {
             graph.read_states(&mut outs);
         }
         if let Some(rows) = lm_rows {
+            crate::gpu::hostprof_encode_done(_mt0);
             let mut lg = attention::take_buf(rows.min(self.vocab_size));
             graph.read_logits(&mut lg);
+            crate::gpu::hostprof_total(_mt0);
             lg.resize(self.vocab_size, 0.0);
             if let Some(c) = self.final_softcap {
                 for l in lg.iter_mut() {
