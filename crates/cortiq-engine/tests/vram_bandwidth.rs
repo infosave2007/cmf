@@ -231,4 +231,44 @@ fn stream16(@builtin(workgroup_id) wid: vec3<u32>,
         per16 * 1e3,
         bytes as f64 / per16 / 1e9
     );
+
+    // The third arm: the SAME bytes through the GRAPH'S STRUCTURE —
+    // 320 serialized dispatches in one pass, each a small slice, each
+    // barriered against the next by the pass's own semantics. The
+    // dual-kernel null said one deleted wave is under the noise; this
+    // measures all of them at once with clean kernels. Collapse to
+    // ~1 TB/s convicts the structure and prices it; staying at ~1.6
+    // buries the dispatch theory the way ten kernel suspects were
+    // buried before it.
+    let slices: u32 = 320;
+    let vecs_per_slice = nvec / slices;
+    queue.write_buffer(&ubuf, 0, bytemuck::cast_slice(&[vecs_per_slice, 0u32, 0, 0]));
+    let wg_per_slice = 64u32; // ~5.5 MB per slice, 64 workgroups each
+    let run320 = || {
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipe);
+            pass.set_bind_group(0, &bind, &[]);
+            for _ in 0..slices {
+                pass.dispatch_workgroups(wg_per_slice, 1, 1);
+            }
+        }
+        queue.submit([enc.finish()]);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    };
+    // NOTE: every dispatch reads the same first slice (the bind group is
+    // fixed), so the bytes come from L2 after the first — this measures
+    // the DISPATCH structure, deliberately without the DRAM cost.
+    run320();
+    let t = std::time::Instant::now();
+    for _ in 0..reps {
+        run320();
+    }
+    let per320 = t.elapsed().as_secs_f64() / reps as f64;
+    eprintln!(
+        "320 serialized dispatches (structure only): {:.2} ms = {:.2} us per dispatch",
+        per320 * 1e3,
+        per320 * 1e6 / slices as f64
+    );
 }
