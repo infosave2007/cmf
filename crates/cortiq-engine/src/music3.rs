@@ -1203,6 +1203,7 @@ impl Music3Ar {
                 None,
                 None,
                 0,
+                false,
             );
             if !ok || out.len() < lm_rows {
                 return false;

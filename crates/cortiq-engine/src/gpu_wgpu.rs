@@ -15429,6 +15429,10 @@ pub fn forward_token_graph(
     // `layer_base + li` so a span run (network split) and a full run
     // address the SAME per-layer mirrors.
     layer_base: usize,
+    // With a fused lm_head, ALSO read the final hidden back into `h` (the
+    // MTP draft chain feeds the block's hidden to its next step and wants
+    // the head's logits from the same submit).
+    hidden_too: bool,
 ) -> bool {
     let _hp_t0 = std::time::Instant::now(); // CMF_GRAPH_HOSTPROF
     let Some(c) = ctx() else {
@@ -18170,15 +18174,30 @@ pub fn forward_token_graph(
             }
         }
         logits.resize(lrows, 0.0);
+        let hsize = if hidden_too { (hidden * 4) as u64 } else { 0 };
         let stage = GraphScratch::ensure(
             &c.device,
             &mut gs.stage,
-            lsize,
+            lsize + hsize,
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             "g-stage",
         );
         crate::gpu::hostprof_encode_done(_hp_t0);
-        let r = readback(c, enc, &lbuf, &stage, lsize, &mut logits[..lrows]);
+        let r = if hidden_too {
+            readback_two(
+                c,
+                enc,
+                &lbuf,
+                lsize,
+                &h_buf,
+                hsize,
+                &stage,
+                &mut logits[..lrows],
+                &mut h[..hidden],
+            )
+        } else {
+            readback(c, enc, &lbuf, &stage, lsize, &mut logits[..lrows])
+        };
         crate::gpu::hostprof_total(_hp_t0);
         drop(gs);
         r
@@ -24869,6 +24888,67 @@ fn readback2(
         ));
     }
     stage.unmap();
+    true
+}
+
+/// Two buffers in one submit and one map: `a` lands at staging[0..a_size),
+/// `b` right after it. The MTP draft's graph step reads its logits AND
+/// its block hidden back this way instead of paying a second fence.
+#[allow(clippy::too_many_arguments)]
+fn readback_two(
+    c: &Ctx,
+    mut enc: wgpu::CommandEncoder,
+    a_buf: &wgpu::Buffer,
+    a_size: u64,
+    b_buf: &wgpu::Buffer,
+    b_size: u64,
+    staging: &wgpu::Buffer,
+    out_a: &mut [f32],
+    out_b: &mut [f32],
+) -> bool {
+    enc.copy_buffer_to_buffer(a_buf, 0, staging, 0, a_size);
+    enc.copy_buffer_to_buffer(b_buf, 0, staging, a_size, b_size);
+    submit(c, enc.finish());
+    let slice = staging.slice(..a_size + b_size);
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d2 = done.clone();
+    slice.map_async(wgpu::MapMode::Read, move |_| {
+        d2.store(true, std::sync::atomic::Ordering::Release);
+    });
+    if spin_wait() {
+        let t0 = std::time::Instant::now();
+        loop {
+            let _ = c.device.poll(wgpu::PollType::Poll);
+            if done.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            if t0.elapsed() > std::time::Duration::from_millis(2) {
+                if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+                    staging.unmap();
+                    return false;
+                }
+                break;
+            }
+            std::hint::spin_loop();
+        }
+    } else if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        staging.unmap();
+        return false;
+    }
+    {
+        let Ok(data) = slice.get_mapped_range() else {
+            staging.unmap();
+            return false;
+        };
+        let a_len = out_a.len() * 4;
+        par_copy(out_a, bytemuck::cast_slice(&data[..a_len]));
+        let b_off = a_size as usize;
+        par_copy(
+            out_b,
+            bytemuck::cast_slice(&data[b_off..b_off + out_b.len() * 4]),
+        );
+    }
+    staging.unmap();
     true
 }
 

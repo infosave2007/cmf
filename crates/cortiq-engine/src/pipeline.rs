@@ -152,6 +152,13 @@ pub struct Pipeline {
     spec_q: Vec<Vec<f32>>,
     spec_p: Vec<f32>,
     spec_res: Vec<f32>,
+    /// Which arm the MTP draft block runs on this generation: Some(true)
+    /// = the whole-token graph (device attention, one submit a step),
+    /// Some(false) = the per-op path; None = not decided yet. Decided
+    /// on the first draft and held, because the two arms keep the MTP
+    /// KV in different places (device mirror vs the CPU cache) and a
+    /// mid-run switch would read the wrong one.
+    mtp_graph_mode: Option<bool>,
     /// Precomputed RoPE inverse frequencies [head_dim/2]. Arc: the
     /// forward path clones a handle to escape the &mut self borrow —
     /// cloning the table itself was a per-forward allocation.
@@ -1458,6 +1465,7 @@ impl Pipeline {
             spec_q: Vec::new(),
             spec_p: Vec::new(),
             spec_res: Vec::new(),
+            mtp_graph_mode: None,
             inv_freq,
             ws: ForwardScratch::new(hidden_size),
             pool,
@@ -1772,6 +1780,9 @@ impl Pipeline {
         }
         if let Some(m) = &mut mtp {
             m.kv.clear();
+            // The MTP block's own device mirror starts over with its cache.
+            crate::gpu::graph_kv_reset(self.mtp_kv_id());
+            self.mtp_graph_mode = None;
         }
         // Dynamic router detached during decode (same borrow trick as MTP).
         // Speculative decode and dynamic routing are mutually exclusive
@@ -2565,6 +2576,25 @@ impl Pipeline {
         next_token: u32,
         position: usize,
     ) -> (Vec<f32>, Vec<f32>) {
+        // The graph arm: the MTP block as a one-layer token graph with the
+        // head fused — device attention over the block's own KV mirror,
+        // one submit for block + head, hidden and logits back together.
+        // Decided once per generation (see `mtp_graph_mode`).
+        #[cfg(feature = "gpu")]
+        if self.mtp_graph_mode != Some(false) {
+            if let Some(r) = self.mtp_step_graph(m, hidden, next_token, position) {
+                self.mtp_graph_mode = Some(true);
+                return r;
+            }
+            if self.mtp_graph_mode == Some(true) {
+                // The graph carried this generation's MTP KV and just
+                // declined — the CPU cache is not current. A draft from
+                // stale attention is still only a draft (verify decides),
+                // but say so once.
+                tracing::warn!("mtp graph declined mid-run — draft falls to the per-op path");
+            }
+            self.mtp_graph_mode = Some(false);
+        }
         // fc concat order is [enorm(embed); hnorm(hidden)] — EMBEDDING
         // FIRST. Verified by the oracle (converter/mtp_oracle.py):
         // [emb;hid] → 45.8% acceptance, [hid;emb] → 0.00%.
@@ -2654,6 +2684,293 @@ impl Pipeline {
         let draft = sampler::argmax(&lg);
         attention::recycle_buf(&mut lg);
         (draft, x)
+    }
+
+    /// The MTP block's device-mirror id: the trunk's id with a high bit,
+    /// so the (kv_id, layer) mirror keys never collide.
+    fn mtp_kv_id(&self) -> u64 {
+        self.graph_kv_id | (1u64 << 40)
+    }
+
+    /// The MTP block's mirror layer index: 0 — its own kv_id keeps it
+    /// apart from the trunk, and the BATCH graph (the warm-up path) keys
+    /// its mirrors at layer 0 with no base of its own, so the draft's
+    /// token graph must key the same slot.
+    const MTP_LAYER_BASE: usize = 0;
+
+    /// The block's input from (trunk hidden, token): eh_proj · [enorm(e);
+    /// hnorm(h)] — the same arithmetic the per-op path starts with.
+    fn mtp_block_input(&mut self, m: &MtpModule, hidden: &[f32], next_token: u32) -> Vec<f32> {
+        let e = self.embed_single(next_token);
+        let mut cat = vec![0.0f32; 2 * self.hidden_size];
+        let (cat_e, cat_h) = cat.split_at_mut(self.hidden_size);
+        inference::rms_norm_into(&e, &m.enorm, self.rms_eps, self.norm_style, cat_e);
+        inference::rms_norm_into(hidden, &m.hnorm, self.rms_eps, self.norm_style, cat_h);
+        let mut x = vec![0.0f32; self.hidden_size];
+        m.eh_proj.matvec(&cat, &mut x, self.pool.as_deref());
+        x
+    }
+
+    /// Is the MTP block graphable at all (device up, full attention
+    /// without softplus, dense FFN)? The plan itself is built per call.
+    #[cfg(feature = "gpu")]
+    fn mtp_graph_ok(&self, m: &MtpModule) -> bool {
+        if std::env::var("CMF_MTP_GRAPH").as_deref() == Ok("0") {
+            return false;
+        }
+        if !crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode)
+            || !crate::gpu::enabled_here()
+            || self.attn_softcap > 0.0
+            || self.attention_heads_per_layer.is_some()
+        {
+            return false;
+        }
+        matches!(
+            &m.layer.attn,
+            AttnKind::Full {
+                softplus_gate: None,
+                ..
+            }
+        ) && matches!(&m.layer.ffn, FfnKind::Dense(_))
+    }
+
+    /// One MTP block step on the wgpu token graph: block + fused head in
+    /// one submit, the block hidden and the logits read back together.
+    /// None = the graph cannot take this block (softplus gate, non-dense
+    /// FFN, unquantized head, no device) — the caller keeps the per-op
+    /// path for the whole generation.
+    #[cfg(feature = "gpu")]
+    fn mtp_step_graph(
+        &mut self,
+        m: &mut MtpModule,
+        hidden: &[f32],
+        next_token: u32,
+        position: usize,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        if !self.mtp_graph_ok(m) {
+            return None;
+        }
+        let lw = &m.layer;
+        let AttnKind::Full {
+            wq,
+            wk,
+            wv,
+            wo,
+            q_norm,
+            k_norm,
+            output_gate,
+            softplus_gate,
+            bias,
+        } = &lw.attn
+        else {
+            return None;
+        };
+        if softplus_gate.is_some() {
+            return None;
+        }
+        let FfnKind::Dense(d) = &lw.ffn else {
+            return None;
+        };
+        // The block's input first: it borrows `self` mutably (embed scratch,
+        // pool), the plan below borrows the weights immutably.
+        let mut x = self.mtp_block_input(m, hidden, next_token);
+        fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
+            let (_, i, kind, rs) = t.graph_weight()?;
+            Some(crate::gpu::GraphW {
+                idx: i,
+                kind,
+                row_scale: rs,
+                data: &[],
+            })
+        }
+        let (model, _, _, _) = wq.graph_weight()?;
+        let model = model.clone();
+        let (lm_gw, lm_rows) = {
+            let (_, i, kind, rs) = self.weights.lm_head.graph_weight()?;
+            (
+                crate::gpu::GraphW {
+                    idx: i,
+                    kind,
+                    row_scale: rs,
+                    data: &[],
+                },
+                self.weights.lm_head.rows(),
+            )
+        };
+        let layer = crate::gpu::GraphLayer {
+            input_norm: &lw.input_norm,
+            attn: crate::gpu::GraphAttn::Full {
+                wq: gw(wq)?,
+                wk: gw(wk)?,
+                wv: gw(wv)?,
+                wo: gw(wo)?,
+                q_norm: q_norm.as_deref(),
+                k_norm: k_norm.as_deref(),
+                bias: bias
+                    .as_ref()
+                    .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
+                output_gate: *output_gate,
+                cpu_k: m.kv.k_heads(),
+                cpu_v: m.kv.v_heads(),
+            },
+            post_norm: &lw.post_norm,
+            ffn: crate::gpu::GraphFfn::Dense {
+                gate: gw(&d.gate_proj)?,
+                up: gw(&d.up_proj)?,
+                down: gw(&d.down_proj)?,
+            },
+        };
+        let nh = self.num_heads;
+        let (nkv, hd, rd) = self.layer_geom(0);
+        let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
+        let mut logits = Vec::new();
+        let ok = crate::gpu::forward_token_graph(
+            &model,
+            self.mtp_kv_id(),
+            std::slice::from_ref(&layer),
+            &[None],
+            self.o1_epoch,
+            &self.inv_freq,
+            &mut x,
+            nh,
+            nkv,
+            hd,
+            rd,
+            self.hidden_size,
+            self.intermediate_size,
+            position,
+            self.kv_cache.max_seq_len,
+            gemma,
+            self.rms_eps as f32,
+            Some((&lm_gw, lm_rows)),
+            &m.final_norm,
+            &mut logits,
+            &[],
+            1,
+            None,
+            None,
+            None,
+            Self::MTP_LAYER_BASE,
+            true,
+        );
+        if !ok {
+            return None;
+        }
+        logits.resize(self.vocab_size, 0.0);
+        Some((logits, x))
+    }
+
+    /// The warm-ups of one speculative round on the device: every accepted
+    /// (hidden, token) pair as ONE batched graph run over the MTP block
+    /// (no head) — its kv_append lands the pairs in the block's mirror.
+    /// `pairs` are consecutive positions from `first_pos`. False = the
+    /// batch graph declined; the caller warms one by one on the token
+    /// graph (prefix mode) instead.
+    #[cfg(feature = "gpu")]
+    fn mtp_warm_graph(
+        &mut self,
+        m: &mut MtpModule,
+        pairs: &[(&[f32], u32)],
+        first_pos: usize,
+    ) -> bool {
+        if pairs.is_empty() || !self.mtp_graph_ok(m) {
+            return pairs.is_empty();
+        }
+        let hs = self.hidden_size;
+        // Block inputs for every pair (eh_proj on the per-op path, one
+        // matvec each — the plan's own prologue).
+        let mut hiddens = Vec::with_capacity(pairs.len() * hs);
+        for (h, t) in pairs {
+            hiddens.extend_from_slice(&self.mtp_block_input(m, h, *t));
+        }
+        let lw = &m.layer;
+        let AttnKind::Full {
+            wq,
+            wk,
+            wv,
+            wo,
+            q_norm,
+            k_norm,
+            output_gate,
+            bias,
+            ..
+        } = &lw.attn
+        else {
+            return false;
+        };
+        let FfnKind::Dense(d) = &lw.ffn else {
+            return false;
+        };
+        fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
+            let (_, i, kind, rs) = t.graph_weight()?;
+            Some(crate::gpu::GraphW {
+                idx: i,
+                kind,
+                row_scale: rs,
+                data: &[],
+            })
+        }
+        let Some((model, _, _, _)) = wq.graph_weight() else {
+            return false;
+        };
+        let model = model.clone();
+        let (Some(gwq), Some(gwk), Some(gwv), Some(gwo), Some(gg), Some(gu), Some(gd)) = (
+            gw(wq),
+            gw(wk),
+            gw(wv),
+            gw(wo),
+            gw(&d.gate_proj),
+            gw(&d.up_proj),
+            gw(&d.down_proj),
+        ) else {
+            return false;
+        };
+        let layer = crate::gpu::GraphLayer {
+            input_norm: &lw.input_norm,
+            attn: crate::gpu::GraphAttn::Full {
+                wq: gwq,
+                wk: gwk,
+                wv: gwv,
+                wo: gwo,
+                q_norm: q_norm.as_deref(),
+                k_norm: k_norm.as_deref(),
+                bias: bias
+                    .as_ref()
+                    .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
+                output_gate: *output_gate,
+                cpu_k: m.kv.k_heads(),
+                cpu_v: m.kv.v_heads(),
+            },
+            post_norm: &lw.post_norm,
+            ffn: crate::gpu::GraphFfn::Dense {
+                gate: gg,
+                up: gu,
+                down: gd,
+            },
+        };
+        let positions: Vec<usize> = (first_pos..first_pos + pairs.len()).collect();
+        let nh = self.num_heads;
+        let (nkv, hd, rd) = self.layer_geom(0);
+        let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
+        crate::gpu::forward_batch_graph(
+            &model,
+            self.mtp_kv_id(),
+            std::slice::from_ref(&layer),
+            &self.inv_freq,
+            &mut hiddens,
+            nh,
+            nkv,
+            hd,
+            rd,
+            hs,
+            self.intermediate_size,
+            &positions,
+            self.kv_cache.max_seq_len,
+            gemma,
+            self.rms_eps as f32,
+            pairs.len(),
+            None,
+        )
     }
 
     /// The MTP block alone — advance its KV with a (hidden, token) pair the
@@ -2909,11 +3226,40 @@ impl Pipeline {
         // warms are batched instead of assuming either way.
         m.kv.truncate_last(k_spec.saturating_sub(1));
         let warm_off = std::env::var("CMF_SPEC_WARM").is_ok_and(|v| v == "0");
-        if !warm_off {
-            for j in 0..a {
-                let row = &hiddens[j * self.hidden_size..(j + 1) * self.hidden_size];
-                let row = row.to_vec();
-                self.mtp_warm(m, &row, ids[j], next_pos + j);
+        if !warm_off && a > 0 {
+            // Graph arm: all accepted pairs in ONE batched run over the
+            // MTP block; the token graph one by one if the batch declines.
+            let mut warmed = false;
+            if self.mtp_graph_mode == Some(true) {
+                let rows: Vec<Vec<f32>> = (0..a)
+                    .map(|j| hiddens[j * self.hidden_size..(j + 1) * self.hidden_size].to_vec())
+                    .collect();
+                let pairs: Vec<(&[f32], u32)> = rows
+                    .iter()
+                    .zip(ids.iter())
+                    .map(|(r, &t)| (r.as_slice(), t))
+                    .collect();
+                warmed = self.mtp_warm_graph(m, &pairs, next_pos);
+                if !warmed {
+                    // Prefix-mode token graph per pair (kv_append inside).
+                    warmed = true;
+                    for j in 0..a {
+                        if self
+                            .mtp_step_graph(m, &rows[j], ids[j], next_pos + j)
+                            .is_none()
+                        {
+                            warmed = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !warmed {
+                for j in 0..a {
+                    let row = &hiddens[j * self.hidden_size..(j + 1) * self.hidden_size];
+                    let row = row.to_vec();
+                    self.mtp_warm(m, &row, ids[j], next_pos + j);
+                }
             }
         }
         // The sampler's contract: logits of the LAST verified position —
@@ -5174,6 +5520,7 @@ impl Pipeline {
             ids_out,
             layers_run,
             from,
+            false,
         )
         .then_some(h)
     }
