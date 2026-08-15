@@ -4732,6 +4732,7 @@ async fn cmd_bench(
     let stamps = stamps.lock().unwrap();
     // stamp[0] fires right after generation's prefill (the first token
     // is sampled from the prefill hidden, no decode forward yet).
+    let wb_total = cortiq_engine::gpu::weight_bytes_dispatched();
     let n_st = stamps.len();
     let decode_tps = if n_st >= 2 {
         (n_st - 1) as f64 / (stamps[n_st - 1].0 - stamps[0].0).as_secs_f64().max(1e-9)
@@ -4811,6 +4812,7 @@ async fn cmd_bench(
             "decode_tok_s_incl_prefill": result.tokens_generated as f64 / total_s.max(1e-9),
             "ttft_s": ttft_s,
             "allocs_per_token": allocs_per_token,
+            "weight_gb_per_token": if n_st >= 2 { wb_total as f64 / n_st as f64 / 1e9 } else { 0.0 },
             "pool_dispatches_per_token": dispatches_per_token,
             "pair_singles_ms": singles_ms,
             "pair_fused_ms": pair_ms,

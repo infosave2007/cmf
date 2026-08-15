@@ -5146,6 +5146,24 @@ fn encode_q4tp_matvec(
 /// For Q1T the base matvec is followed by the on-device overlay add. Free fn so
 /// it works inside the graph encode loops (which capture `c`/`fbuf`, not self).
 #[allow(clippy::too_many_arguments)]
+/// Active weight bytes actually dispatched since the last read — the
+/// honest floor's numerator. A 2.4 GB MoE file whose token touches
+/// 0.8 GB has a 3x different floor than the file size suggests, and
+/// two days of kernel campaigns argued against floors nobody had
+/// measured.
+pub static WEIGHT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_weight_bytes(kind: &ProjKind, rows: usize, gpr: usize) {
+    let tile: u64 = match kind {
+        ProjKind::Q4t => 18,
+        ProjKind::Q4tp => 17, // 16 B codes + ~1 B/group amortized ladder
+        ProjKind::Q4b => 18,
+        ProjKind::Q1 | ProjKind::Q1t => 5,
+        _ => 16,
+    };
+    WEIGHT_BYTES.fetch_add(rows as u64 * gpr as u64 * tile, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn encode_proj(
     c: &Ctx,
     enc: &metal::ComputeCommandEncoderRef,
@@ -5157,6 +5175,7 @@ fn encode_proj(
     rows: usize,
     gpr: usize,
 ) {
+    note_weight_bytes(kind, rows, gpr);
     match kind {
         ProjKind::Q1t => {
             encode_q1t_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
@@ -9838,6 +9857,7 @@ impl TokenGraph {
                 && matches!(au.1, ProjKind::Q4t)
                 && gate.1 % 4 == 0;
             if dual_ok {
+                note_weight_bytes(&ProjKind::Q4t, gate.1 + up.1, gate.2 / GROUP_SIZE);
                 let c = self.c;
                 enc.set_compute_pipeline_state(&c.q4t_dual);
                 enc.set_buffer(0, Some(&self.fbuf), ag.0 as u64);
@@ -9891,6 +9911,7 @@ impl TokenGraph {
             && matches!(ad.1, ProjKind::Q4t)
             && inter % 4 == 0;
         if dsilu_ok {
+            note_weight_bytes(&ProjKind::Q4t, down.1, down.2 / GROUP_SIZE);
             let c = self.c;
             enc.set_compute_pipeline_state(&c.q4t_dsilu);
             enc.set_buffer(0, Some(&self.fbuf), ad.0 as u64);
