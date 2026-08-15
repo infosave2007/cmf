@@ -713,6 +713,11 @@ enum Commands {
         /// softmax. Default (off) measures the full production loop.
         #[arg(long)]
         core: bool,
+        /// Keep generating past end-of-sequence (the EOS ids are
+        /// suppressed in the sampler): a file whose greedy answer to the
+        /// bench prompt is "stop" measures nothing otherwise.
+        #[arg(long)]
+        ignore_eos: bool,
         /// O(1) Nyström attention: replace KV-cache attention on the
         /// given layers (all | deepN | i,j,k | off). Overrides CMF_O1
         /// and the file's converter hint.
@@ -1848,6 +1853,7 @@ async fn main() -> anyhow::Result<()> {
             net_dtype,
             peer_head,
             core,
+            ignore_eos,
             o1,
             o1_m,
             o1_window,
@@ -1868,6 +1874,7 @@ async fn main() -> anyhow::Result<()> {
                 &o1,
                 json,
                 core,
+                ignore_eos,
                 peer.as_deref(),
                 peer_split,
                 net_token.as_deref(),
@@ -4483,6 +4490,7 @@ async fn cmd_bench(
     o1: &O1Flags,
     json: bool,
     core: bool,
+    ignore_eos: bool,
     peer: Option<&str>,
     peer_split: Option<usize>,
     net_token: Option<&str>,
@@ -4537,6 +4545,18 @@ async fn cmd_bench(
             ..Default::default()
         },
     )?;
+    if ignore_eos {
+        // Every id the tokenizer treats as end-of-sequence, suppressed:
+        // the greedy loop then never sees "stop" (a one-pass penalized
+        // argmax, so the core number stays a core number).
+        let vocab = pipeline.tokenizer.vocab_size() as u32;
+        let eos: Vec<u32> = (0..vocab)
+            .filter(|&id| pipeline.tokenizer.is_eos(id))
+            .collect();
+        let mut cfg = pipeline.sampler_config.clone();
+        cfg.suppress_tokens = eos;
+        pipeline.set_sampler_config(cfg);
+    }
     if core {
         pipeline.set_confidence(false);
         if !json {
