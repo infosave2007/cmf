@@ -90,12 +90,15 @@ def fold_layers(args, model, sd, put, grams, report, layer_ids, layer_types, F, 
             drop = sorted(set(range(F)) - set(keep))
             Pi, resid = solve_pi(G, keep, drop, args.eps)
             Wd_new = Wd.float()[:, keep].double() + Wd.float()[:, drop].double() @ Pi.t()
-            # output-weighted residual: ‖W_P (a_P − Πᵀa_S)‖² / ‖W a‖² (trace form)
-            Gd = G.double() / max(grams[f"ffn.{i}"].n, 1)
-            Wp = Wd.float()[:, drop].double()
-            Rpp = Gd[drop][:, drop] - Gd[drop][:, keep] @ Pi
-            num = torch.einsum("hp,pq,hq->", Wp, Rpp, Wp).item()
-            den = torch.einsum("hp,pq,hq->", Wd.double(), Gd, Wd.double()).item()
+            # output-weighted residual: ‖W_P (a_P − Πᵀa_S)‖² / ‖W a‖² (trace form).
+            # f32 GEMMs: the f64 einsum over the 17408² Gram was 3 TFLOP a
+            # layer and made the fold slower than the calibration.
+            Gf = G / max(grams[f"ffn.{i}"].n, 1)
+            Wp = Wd.float()[:, drop]
+            Rpp = (Gf[drop][:, drop].double() - Gf[drop][:, keep].double() @ Pi).float()
+            num = ((Wp @ Rpp) * Wp).sum().item()
+            Wf = Wd.float()
+            den = ((Wf @ Gf) * Wf).sum().item()
             put(pre + "mlp.gate_proj.weight", Wg[keep])
             put(pre + "mlp.up_proj.weight", Wu[keep])
             put(pre + "mlp.down_proj.weight", Wd_new)
