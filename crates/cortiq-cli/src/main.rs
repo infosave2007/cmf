@@ -4813,6 +4813,7 @@ async fn cmd_bench(
             "ttft_s": ttft_s,
             "allocs_per_token": allocs_per_token,
             "weight_gb_per_token": if n_st >= 2 { wb_total as f64 / n_st as f64 / 1e9 } else { 0.0 },
+            "weight_gb_by_stage": cortiq_engine::gpu::weight_bytes_by().iter().map(|b| *b as f64 / n_st.max(1) as f64 / 1e9).collect::<Vec<_>>(),
             "pool_dispatches_per_token": dispatches_per_token,
             "pair_singles_ms": singles_ms,
             "pair_fused_ms": pair_ms,
