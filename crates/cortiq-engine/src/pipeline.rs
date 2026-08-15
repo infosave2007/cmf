@@ -1789,11 +1789,17 @@ impl Pipeline {
             }
             _ => true,
         });
+        // Penalties break the draft head's agreement with the trunk (a
+        // 1.1 repetition penalty measured 2 of 16 accepted): not by
+        // default there either.
+        let penalized = self.sampler_config.repetition_penalty != 1.0
+            || self.sampler_config.presence_penalty != 0.0
+            || !self.sampler_config.suppress_tokens.is_empty();
         let spec_env = std::env::var("CMF_GRAPH_SPEC").ok();
         let spec_wanted = match spec_env.as_deref() {
             Some("0") => false,
             Some(_) => true,
-            None => spec_default_ok,
+            None => spec_default_ok && !penalized,
         };
         let graph_spec = self.speculative
             && graph_on
@@ -2360,22 +2366,15 @@ impl Pipeline {
                     ) {
                         next_pos = n_pos;
                         hidden = new_h;
-                        // One speculative round done: the trial counts it
-                        // (the tokens it produced are committed below and
-                        // land in `generated` before the next check).
-                        if let SpecTrial::Spec { t0, gen0, rounds } = spec_trial {
-                            let rounds = rounds + 1;
-                            let produced = generated + extra.len() + 1 - gen0;
-                            if rounds >= 4 {
-                                spec_rate = produced as f64 / t0.elapsed().as_secs_f64();
-                                spec_trial = SpecTrial::Plain {
-                                    t0: std::time::Instant::now(),
-                                    gen0: generated + extra.len(),
-                                };
-                            } else {
-                                spec_trial = SpecTrial::Spec { t0, gen0, rounds };
-                            }
-                        }
+                        // One speculative round done: the trial counts it.
+                        // Round 1 is not timed — it pays the batch scratch
+                        // allocations and the draft block's mirror sync,
+                        // which no later round pays; rounds 2..5 are.
+                        spec_trial = Self::spec_trial_round(
+                            spec_trial,
+                            generated + extra.len() + 1,
+                            &mut spec_rate,
+                        );
                         let mut stopped = false;
                         for &id in &extra {
                             if self.confidence_on {
@@ -2391,7 +2390,12 @@ impl Pipeline {
                         }
                         continue 'decode;
                     }
-                    // Declined (batch graph refused): plain forward below.
+                    // Declined (batch graph refused): plain forward below —
+                    // and a round that produced one token for the trial's
+                    // ledger, so a graph that keeps refusing is measured out
+                    // like a head that keeps missing (it was spinning
+                    // forever on a file whose batch graph declines).
+                    spec_trial = Self::spec_trial_round(spec_trial, generated + 1, &mut spec_rate);
                     hidden = self.forward_layers(&self.embed_single(t_next), next_pos, task_mask);
                     next_pos += 1;
                     continue 'decode;
@@ -2799,6 +2803,36 @@ impl Pipeline {
         let draft = sampler::argmax(&lg);
         attention::recycle_buf(&mut lg);
         (draft, x)
+    }
+
+    /// One speculative round for the trial ledger. `produced_total` is
+    /// `generated` after this round's tokens land. Round 1 only resets the
+    /// clock; rounds 2..5 are timed and set `spec_rate`, after which the
+    /// plain phase starts.
+    fn spec_trial_round(trial: SpecTrial, produced_total: usize, spec_rate: &mut f64) -> SpecTrial {
+        match trial {
+            SpecTrial::Spec { t0, gen0, rounds } => {
+                let rounds = rounds + 1;
+                if rounds == 1 {
+                    // start the clock AFTER the warm-up round
+                    SpecTrial::Spec {
+                        t0: std::time::Instant::now(),
+                        gen0: produced_total,
+                        rounds,
+                    }
+                } else if rounds >= 5 {
+                    let produced = produced_total.saturating_sub(gen0).max(1);
+                    *spec_rate = produced as f64 / t0.elapsed().as_secs_f64().max(1e-6);
+                    SpecTrial::Plain {
+                        t0: std::time::Instant::now(),
+                        gen0: produced_total,
+                    }
+                } else {
+                    SpecTrial::Spec { t0, gen0, rounds }
+                }
+            }
+            other => other,
+        }
     }
 
     /// The MTP block's device-mirror id: the trunk's id with a high bit,

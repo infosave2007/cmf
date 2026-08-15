@@ -18792,7 +18792,9 @@ pub fn forward_batch_graph(
     // GEMM-able projection? (q8_row/q1). f32 (a/b) is per-position; anything else bails.
     // kinds 5/6 (q4_tiled, q4tp) have tile GEMMs too — admitting only 0/1
     // is what kept every q4tp model off the batched path.
-    let gemmable = |m: &GMat| matches!(m.kind, 0 | 1 | 5 | 6);
+    // 9 (the 2-bit plane) has the tile GEMM `q2tp_mm`; without it a q2tp
+    // file's speculative verify declined every round and spun.
+    let gemmable = |m: &GMat| matches!(m.kind, 0 | 1 | 5 | 6 | 9);
     let mut lws = Vec::with_capacity(layers.len());
     let mut gdn_dims: Option<(usize, usize, usize, usize, usize, usize)> = None;
     for l in layers {
