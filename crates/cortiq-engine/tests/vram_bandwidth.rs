@@ -1,3 +1,4 @@
+#![cfg(feature = "gpu")]
 //! What this card's DRAM actually gives a single well-behaved stream.
 //!
 //! Exists to split a fork the q4tp campaign hit on an RTX 5090: the
