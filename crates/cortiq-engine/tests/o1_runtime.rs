@@ -155,3 +155,68 @@ fn o1_mixed_layers_split_exact_and_o1() {
     assert_eq!(l1.head_keys(0).len(), 0);
     assert_eq!(l0.seq_len, l1.seq_len, "both layers track the same depth");
 }
+
+/// The speculative-burst contract: snapshot -> k steps -> restore must
+/// leave the state BIT-identical, so a replay of the same tokens (the
+/// accepted prefix of a rejected draft) reproduces the same outputs.
+/// This is the mechanism Patent 16 says cannot exist ("insertion is
+/// irreversible"): the bounded state makes it a memcpy.
+#[test]
+fn snapshot_restore_bit_exact() {
+    let (m, w, sink, d, dv, heads, t_pre) = (8usize, 16usize, 2usize, 32usize, 32usize, 2usize, 96usize);
+    let mut st = cortiq_engine::nystrom::NystromState::new_group(m, w, sink, heads);
+    let det = |i: usize, j: usize, salt: u64| -> f32 {
+        let x = (i as u64)
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add((j as u64).wrapping_mul(1442695040888963407))
+            .wrapping_add(salt);
+        ((x >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+    };
+    let q0: Vec<f32> = (0..t_pre * d).map(|i| det(i, 1, 7)).collect();
+    let q1: Vec<f32> = (0..t_pre * d).map(|i| det(i, 1, 53)).collect();
+    let ks: Vec<f32> = (0..t_pre * d).map(|i| det(i, 2, 11)).collect();
+    let vs: Vec<f32> = (0..t_pre * dv).map(|i| det(i, 3, 13)).collect();
+    st.prefill_group(&[&q0, &q1], &ks, &vs, t_pre, d, dv);
+
+    // a few committed decode steps so the ring is live
+    let mut out = vec![0f32; heads * dv];
+    for s in 0..4usize {
+        let q: Vec<f32> = (0..heads * d).map(|i| det(i, 4 + s, 17)).collect();
+        let k: Vec<f32> = (0..d).map(|i| det(i, 40 + s, 19)).collect();
+        let v: Vec<f32> = (0..dv).map(|i| det(i, 80 + s, 23)).collect();
+        st.step_group(&q, &k, &v, &mut out);
+    }
+
+    let snap = st.snapshot();
+    let mut out_a = vec![0f32; heads * dv];
+    // the burst that will be "rejected"
+    for s in 0..3usize {
+        let q: Vec<f32> = (0..heads * d).map(|i| det(i, 200 + s, 29)).collect();
+        let k: Vec<f32> = (0..d).map(|i| det(i, 240 + s, 31)).collect();
+        let v: Vec<f32> = (0..dv).map(|i| det(i, 280 + s, 37)).collect();
+        st.step_group(&q, &k, &v, &mut out_a);
+    }
+    st.restore(&snap);
+    // replay a DIFFERENT continuation twice: restored state must give
+    // bit-identical outputs to a second restore+replay
+    let replay = |st: &mut cortiq_engine::nystrom::NystromState| -> Vec<f32> {
+        let mut acc = Vec::new();
+        let mut o = vec![0f32; heads * dv];
+        for s in 0..3usize {
+            let q: Vec<f32> = (0..heads * d).map(|i| det(i, 300 + s, 41)).collect();
+            let k: Vec<f32> = (0..d).map(|i| det(i, 340 + s, 43)).collect();
+            let v: Vec<f32> = (0..dv).map(|i| det(i, 380 + s, 47)).collect();
+            st.step_group(&q, &k, &v, &mut o);
+            acc.extend_from_slice(&o);
+        }
+        acc
+    };
+    let a = replay(&mut st);
+    st.restore(&snap);
+    let b = replay(&mut st);
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(&b) {
+        assert!(x.to_bits() == y.to_bits(), "restore is not bit-exact");
+    }
+}
+

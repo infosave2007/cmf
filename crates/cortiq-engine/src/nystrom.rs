@@ -205,6 +205,55 @@ struct NystromHead {
     scr_l: Vec<f32>,
 }
 
+/// Everything `step()`/`advance()` mutate, captured before a
+/// speculative burst and restored bit-for-bit on rejection. The whole
+/// point of the O(1) operator is that this is SMALL — the window ring
+/// plus the far accumulators, ~150 KB a head-group — so speculation,
+/// which Patent 16 disclaims as impossible over the irreversible far
+/// insertion, becomes a memcpy. Immutable-after-seal parts (sinks,
+/// landmarks, mu) are not captured.
+pub struct O1Snapshot {
+    win_k: Vec<f32>,
+    win_v: Vec<f32>,
+    win_len: usize,
+    win_head: usize,
+    /// Per head: (t_hat, z_hat, m_max, far_len).
+    heads: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, usize)>,
+}
+
+impl NystromState {
+    pub fn snapshot(&self) -> O1Snapshot {
+        O1Snapshot {
+            win_k: self.group.win_k.clone(),
+            win_v: self.group.win_v.clone(),
+            win_len: self.group.win_len,
+            win_head: self.group.win_head,
+            heads: self
+                .heads
+                .iter()
+                .map(|h| (h.t_hat.clone(), h.z_hat.clone(), h.m_max.clone(), h.far_len))
+                .collect(),
+        }
+    }
+
+    /// Restore a snapshot taken on THIS state (same geometry). The
+    /// exact-only window grows on decode, so the vectors are assigned,
+    /// not copied into.
+    pub fn restore(&mut self, s: &O1Snapshot) {
+        self.group.win_k = s.win_k.clone();
+        self.group.win_v = s.win_v.clone();
+        self.group.win_len = s.win_len;
+        self.group.win_head = s.win_head;
+        debug_assert_eq!(self.heads.len(), s.heads.len());
+        for (h, (t, z, m, fl)) in self.heads.iter_mut().zip(&s.heads) {
+            h.t_hat = t.clone();
+            h.z_hat = z.clone();
+            h.m_max = m.clone();
+            h.far_len = *fl;
+        }
+    }
+}
+
 /// Borrowed view of a sealed group's state for the GPU upload — every
 /// slice the device mirror needs, in the layout the kernels index.
 /// `exact_only` groups (degenerate short prompts) are not portable and
