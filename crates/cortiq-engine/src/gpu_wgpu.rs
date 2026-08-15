@@ -28991,6 +28991,11 @@ fn main() {
             .filter(|(x, y)| x.to_bits() != y.to_bits())
             .count();
         let nz = sgl.iter().filter(|v| **v != 0.0).count();
+        let (mut num, mut den) = (0f64, 0f64);
+        for (x, y) in b.iter().zip(sgl) {
+            num += ((x - y) as f64).powi(2);
+            den += (*y as f64).powi(2);
+        }
         drop(data);
         stage.unmap();
         assert!(nz > n / 2, "singles mostly zero — harness wrong");
@@ -28998,11 +29003,6 @@ fn main() {
         // reassociation), so the two kernels' bits are not comparable
         // there; on Vulkan they must agree exactly.
         if cfg!(target_os = "macos") {
-            let (mut num, mut den) = (0f64, 0f64);
-            for (x, y) in b.iter().zip(sgl) {
-                num += ((x - y) as f64).powi(2);
-                den += (*y as f64).powi(2);
-            }
             let rel = (num / den.max(1e-30)).sqrt();
             eprintln!(
                 "bku vs single on Metal: {mism} of {n} bits differ, rel rms {rel:.2e} (fast math)"
