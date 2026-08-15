@@ -3190,6 +3190,162 @@ fn q4v_dot8(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
          + (f32((w >> 28u) & 0xFu) - 8.0) * b.w;
 }
 
+// The 2-way group unroll of `q4tp_matvec4` (CMF_MV_U2=1): two
+// independent load chains per lane per iteration, four accumulator
+// registers as the price. MEASURED AND NULL on an RTX 5090 with
+// Qwen3.8-27B: 50.1/50.6 tok/s against the base's 50.0/53.0 (noise
+// band ±3), greedy output bit-identical. Occupancy already hides what
+// a second in-flight vec4 would have hidden — kept opt-in so the idea
+// is not re-opened, the same contract as CMF_MV_GRID's null.
+@compute @workgroup_size(256)
+fn q4tp_matvec4_u2(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(num_workgroups) nwg: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    // 8 rows per workgroup, register-blocked in pairs: sub-block `sub` owns
+    // rows base+sub and base+sub+4, and every x vec4 fetched for a group
+    // feeds BOTH rows' dot chains — the x side of the LSU load nearly
+    // halves. Each row's group order and add order stay those of the
+    // one-row kernel.
+    // `_p0`: how many activation vectors share this weight. One is a matvec;
+    // more is a batch. The BATCH is the fast axis of the dispatch, so the
+    // workgroups that read the same weight rows are neighbours and meet in
+    // L2; walking the whole output space instead put them `rows/16` apart,
+    // which streams the weight once per batch element and defeats the point.
+    // Reuse is still L2's to give — this is not a register-blocked B kernel —
+    // so the win is a measurement, not a claim.
+    let nb = max(q1p._p0, 1u);
+    let blocks = (rows + 7u) / 8u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks * nb) { break; }
+        let bi = wb % nb;
+        let base = (wb / nb) * 8u;
+        let bofs = bi * rows;
+        {
+            let r = base + (lid >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                lad_q4v[lid] = exp2(pr.x + f32(lid & 31u) * pr.y);
+            }
+        }
+        workgroupBarrier();
+        let wrow_a = base + sub;
+        let wrow_b = base + sub + 4u;
+        let row_a = bofs + wrow_a;
+        let row_b = bofs + wrow_b;
+        let live_a = wrow_a < rows;
+        let live_b = wrow_b < rows;
+        // In vec4 units: (row / lora) * gpr * 32 floats.
+        var xblk = 0u;
+        if (nb > 1u) { xblk = bi * gpr * 8u; }
+        else if (q1p._p1 > 0u) { xblk = (wrow_a / q1p._p1) * gpr * 8u; }
+        var acc_a = 0.0;
+        var acc_b = 0.0;
+        var acc_a2 = 0.0;
+        var acc_b2 = 0.0;
+        if (live_a) {
+            let crow_a = codes_b + wrow_a * cstride;
+            let crow_b = codes_b + wrow_b * cstride;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let g2 = g + 64u;
+                let live2 = g2 < gpr;
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                var cv_a = q4tp_byte(crow_a + cbo);
+                if (sh > 3u) { cv_a = cv_a | (q4tp_byte(crow_a + cbo + 1u) << 8u); }
+                let v_a = q4v_w[wrow_a * gpr + g];
+                // `_p1` is the low-rank group width. Set, it slides the
+                // activation window with the row — which is the ONLY thing
+                // the grouped output projection does differently, and the
+                // reason it had a kernel of its own reading 3.82 ms against
+                // this one's 1.24 on comparable weights. Rows base..base+7
+                // share a window whenever the width is a multiple of 8, and
+                // the caller only takes this path then.
+                let xq = xblk + g * 8u;
+                let x0 = q4v_x[xq];      let x1 = q4v_x[xq + 1u];
+                let x2 = q4v_x[xq + 2u]; let x3 = q4v_x[xq + 3u];
+                let x4 = q4v_x[xq + 4u]; let x5 = q4v_x[xq + 5u];
+                let x6 = q4v_x[xq + 6u]; let x7 = q4v_x[xq + 7u];
+                let sa = lad_q4v[(sub << 5u) + ((cv_a >> sh) & 31u)];
+                acc_a = acc_a + sa
+                    * (q4v_dot8(v_a.x, x0, x1) + q4v_dot8(v_a.y, x2, x3)
+                     + q4v_dot8(v_a.z, x4, x5) + q4v_dot8(v_a.w, x6, x7));
+                if (live_b) {
+                    var cv_b = q4tp_byte(crow_b + cbo);
+                    if (sh > 3u) { cv_b = cv_b | (q4tp_byte(crow_b + cbo + 1u) << 8u); }
+                    let v_b = q4v_w[wrow_b * gpr + g];
+                    let sb = lad_q4v[128u + (sub << 5u) + ((cv_b >> sh) & 31u)];
+                    acc_b = acc_b + sb
+                        * (q4v_dot8(v_b.x, x0, x1) + q4v_dot8(v_b.y, x2, x3)
+                         + q4v_dot8(v_b.z, x4, x5) + q4v_dot8(v_b.w, x6, x7));
+                }
+                if (live2) {
+
+                let bit_2 = g2 * 5u;
+                let cbo_2 = bit_2 >> 3u;
+                let sh_2 = bit_2 & 7u;
+                var cv_a_2_2 = q4tp_byte(crow_a + cbo_2);
+                if (sh_2 > 3u) { cv_a_2_2 = cv_a_2_2 | (q4tp_byte(crow_a + cbo_2 + 1u) << 8u); }
+                let v_a_2 = q4v_w[wrow_a * gpr + g2];
+                // `_p1` is the low-rank group width. Set, it slides the
+                // activation window with the row — which is the ONLY thing
+                // the grouped output projection does differently, and the
+                // reason it had a kernel of its own reading 3.82 ms against
+                // this one's 1.24 on comparable weights. Rows base..base+7
+                // sh_2are a window whenever the width is a multiple of 8, and
+                // the caller only takes this path then.
+                let xq_2 = xblk + g2 * 8u;
+                let x0_2 = q4v_x[xq_2];      let x1_2 = q4v_x[xq_2 + 1u];
+                let x2_2 = q4v_x[xq_2 + 2u]; let x3_2 = q4v_x[xq_2 + 3u];
+                let x4_2 = q4v_x[xq_2 + 4u]; let x5_2 = q4v_x[xq_2 + 5u];
+                let x6_2 = q4v_x[xq_2 + 6u]; let x7_2 = q4v_x[xq_2 + 7u];
+                let sa_2 = lad_q4v[(sub << 5u) + ((cv_a_2_2 >> sh_2) & 31u)];
+                acc_a2 = acc_a2 + sa_2
+                    * (q4v_dot8(v_a_2.x, x0_2, x1_2) + q4v_dot8(v_a_2.y, x2_2, x3_2)
+                     + q4v_dot8(v_a_2.z, x4_2, x5_2) + q4v_dot8(v_a_2.w, x6_2, x7_2));
+                if (live_b) {
+                    var cv_b_2_2 = q4tp_byte(crow_b + cbo_2);
+                    if (sh_2 > 3u) { cv_b_2_2 = cv_b_2_2 | (q4tp_byte(crow_b + cbo_2 + 1u) << 8u); }
+                    let v_b_2 = q4v_w[wrow_b * gpr + g2];
+                    let sb_2 = lad_q4v[128u + (sub << 5u) + ((cv_b_2_2 >> sh_2) & 31u)];
+                    acc_b2 = acc_b2 + sb_2
+                        * (q4v_dot8(v_b_2.x, x0_2, x1_2) + q4v_dot8(v_b_2.y, x2_2, x3_2)
+                         + q4v_dot8(v_b_2.z, x4_2, x5_2) + q4v_dot8(v_b_2.w, x6_2, x7_2));
+                }
+                }
+                g = g + 128u;
+            }
+        }
+        partial_q4v[lid] = acc_a + acc_a2;
+        partial_q4vb[lid] = acc_b + acc_b2;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+                partial_q4v[lid] = partial_q4v[lid] + partial_q4v[lid + stride];
+                partial_q4vb[lid] = partial_q4vb[lid] + partial_q4vb[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u && wrow_a < rows) { q1y[row_a] = partial_q4v[sub << 6u]; }
+        if (l == 0u && wrow_b < rows) { q1y[row_b] = partial_q4vb[sub << 6u]; }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+
 @compute @workgroup_size(256)
 fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
                 @builtin(num_workgroups) nwg: vec3<u32>,
@@ -10373,6 +10529,8 @@ struct Ctx {
     /// Tall-matrix q4tp matvec (4 rows/workgroup, vec4 nibble loads); the
     /// per-row math is byte-identical to `q4tp_mv`. `CMF_MV4=0` reverts.
     q4tp_mv4: wgpu::ComputePipeline,
+    q4tp_mv4_u2: wgpu::ComputePipeline,
+    use_mv_u2: bool,
     /// The same eight rows, but blocked over a SMALL BATCH in registers:
     /// the weight is read from DRAM once for the whole batch instead of
     /// once per element. What makes a speculative verify of k positions
@@ -11352,6 +11510,10 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let bt_o_lora_a2 = (wg_storage >= 19_500).then(|| pipe("bt_o_lora_a2"));
     let q4tp_mv = pipe("q4tp_matvec");
     let q4tp_mv4 = pipe("q4tp_matvec4");
+    let q4tp_mv4_u2 = pipe("q4tp_matvec4_u2");
+    // CMF_MV_U2=1: the 2-way unrolled decode matvec — an experiment in
+    // in-flight loads, adopted only if the bench says so.
+    let use_mv_u2 = std::env::var("CMF_MV_U2").as_deref() == Ok("1");
     let q4tp_mv4_bk = pipe("q4tp_matvec4_bk");
     let q4tp_mv4_bku = pipe("q4tp_matvec4_bku");
     // TIMING ONLY, and only when asked: the arithmetic-free twin of the
@@ -11795,6 +11957,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         bt_o_lora_a2,
         q4tp_mv,
         q4tp_mv4,
+        q4tp_mv4_u2,
+        use_mv_u2,
         q4tp_mv4_bk,
         q4tp_mv4_bku,
         use_mv_bk,
@@ -23513,7 +23677,7 @@ fn encode_q4tp_mv4_b(
     } else if batch == 1 {
         (&c.q4tp_mv16w, 16u32)
     } else {
-        (&c.q4tp_mv4, 8u32)
+        (if c.use_mv_u2 { &c.q4tp_mv4_u2 } else { &c.q4tp_mv4 }, 8u32)
     };
     let p_buf = q4tp_mv_params(c, gpr, rows, batch);
     let layout = pipe.get_bind_group_layout(0);
@@ -23617,7 +23781,7 @@ fn encode_q4tp_mvw_p(
     let (pipe, per_wg) = if gpr <= 64 {
         (&c.q4tp_mv16, 16u32)
     } else {
-        (&c.q4tp_mv4, 8u32)
+        (if c.use_mv_u2 { &c.q4tp_mv4_u2 } else { &c.q4tp_mv4 }, 8u32)
     };
     let bind = cached_bind(c, bkey, || {
         let p_buf = q4tp_mv_params(c, gpr, rows, 1);
@@ -23667,7 +23831,7 @@ fn encode_o_lora_mv4_p(
     let (pipe, per_wg) = if gpr <= 64 {
         (&c.q4tp_mv16, 16u32)
     } else {
-        (&c.q4tp_mv4, 8u32)
+        (if c.use_mv_u2 { &c.q4tp_mv4_u2 } else { &c.q4tp_mv4 }, 8u32)
     };
     // The rows a workgroup owns must share one activation window, and a
     // workgroup owns `per_wg` consecutive rows starting at a multiple of
