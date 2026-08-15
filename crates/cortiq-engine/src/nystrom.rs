@@ -116,6 +116,30 @@ const EXACT_SLACK: usize = 8;
 /// ~70% of the operator's state and most of its per-token work. Only
 /// engages once the far field holds mass (far_len > 0) — before the
 /// first eviction the window is the only history there is.
+/// Patent-17 claim 9 (`CMF_O1_RESEAL=R`, 0/absent = off): landmarks and
+/// the mixing matrix are FROZEN at prefill, and the deep-layer stream
+/// drifts away from them — measured x3.5-3.9 ppl on the 0.8B hybrid
+/// where the matrix probe reads x1.075. Every R evictions the operator
+/// rebuilds K-landmarks from a ring of recent evicted keys, Q-landmarks
+/// from recent queries, re-inverts M, and re-warms the far accumulators
+/// by re-inserting the ring — sinks and the window stay exact
+/// throughout. Far mass older than the ring is dropped: under drifted
+/// landmarks it was mis-binned anyway, and the ring covers the depth
+/// the ppl gate scores.
+fn reseal_every() -> usize {
+    static R: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        std::env::var("CMF_O1_RESEAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Sample-ring capacity for reseal (evicted keys/values per group,
+/// recent queries per head).
+const RESEAL_CAP: usize = 256;
+
 fn far_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CMF_O1_FARONLY").as_deref() == Ok("1"))
@@ -188,6 +212,14 @@ struct NystromGroup {
     sink_len: usize,
     /// Key landmarks `[m_eff][d]` — segment means of the group's keys.
     k_tilde: Vec<f32>,
+    /// Reseal sample ring: recent EVICTED keys/values (chronological
+    /// via `samp_head`), empty unless CMF_O1_RESEAL is set.
+    samp_k: Vec<f32>,
+    samp_v: Vec<f32>,
+    samp_len: usize,
+    samp_head: usize,
+    /// Evictions since the last reseal.
+    since_reseal: usize,
 }
 
 /// The part of the state that is private to one Q head: everything that
@@ -215,6 +247,10 @@ struct NystromHead {
     scr_fh: Vec<f32>,
     scr_u: Vec<f32>,
     scr_l: Vec<f32>,
+    /// Reseal: ring of this head's recent queries.
+    samp_q: Vec<f32>,
+    samp_q_len: usize,
+    samp_q_head: usize,
 }
 
 /// Everything `step()`/`advance()` mutate, captured before a
@@ -372,6 +408,11 @@ impl NystromState {
                 sink_v: Vec::new(),
                 sink_len: 0,
                 k_tilde: Vec::new(),
+                samp_k: Vec::new(),
+                samp_v: Vec::new(),
+                samp_len: 0,
+                samp_head: 0,
+                since_reseal: 0,
             },
             heads: (0..q_heads).map(|_| NystromHead::new()).collect(),
         }
@@ -472,12 +513,97 @@ impl NystromState {
         // The current token is part of its own near window (t-j = 0),
         // so insertion happens BEFORE any output is computed.
         Self::advance(&mut self.group, &mut self.heads, k, v);
+        let rs = reseal_every();
         for (h, head) in self.heads.iter_mut().enumerate() {
+            let qh = &q_all[h * d..(h + 1) * d];
+            if rs > 0 && !self.group.exact_only {
+                if head.samp_q.is_empty() {
+                    head.samp_q = vec![0.0; RESEAL_CAP * d];
+                }
+                let sp = head.samp_q_head;
+                head.samp_q[sp * d..(sp + 1) * d].copy_from_slice(qh);
+                head.samp_q_head = (sp + 1) % RESEAL_CAP;
+                head.samp_q_len = (head.samp_q_len + 1).min(RESEAL_CAP);
+            }
             head.step(
                 &self.group,
-                &q_all[h * d..(h + 1) * d],
+                qh,
                 &mut out_all[h * dv..(h + 1) * dv],
             );
+        }
+        if rs > 0
+            && self.group.since_reseal >= rs
+            && self.group.samp_len >= 2 * self.group.m_eff
+        {
+            self.reseal();
+        }
+    }
+
+    /// Rebuild the skeleton against the CURRENT stream (Patent 17):
+    /// K-landmarks from the ring of recently evicted keys, Q-landmarks
+    /// from each head's recent queries, M re-inverted, and the far
+    /// accumulators re-warmed by re-inserting the ring. Sinks and the
+    /// window are untouched — the exact stores anchor the operator
+    /// while the approximation refreshes.
+    fn reseal(&mut self) {
+        let g = &mut self.group;
+        let (d, dv, m_eff) = (g.d, g.dv, g.m_eff);
+        let n = g.samp_len;
+        // Chronological copies (oldest first) out of the rings.
+        let start = if n == RESEAL_CAP { g.samp_head } else { 0 };
+        let mut ks = vec![0.0f32; n * d];
+        let mut vs = vec![0.0f32; n * dv];
+        for i in 0..n {
+            let idx = (start + i) % RESEAL_CAP;
+            ks[i * d..(i + 1) * d].copy_from_slice(&g.samp_k[idx * d..(idx + 1) * d]);
+            vs[i * dv..(i + 1) * dv].copy_from_slice(&g.samp_v[idx * dv..(idx + 1) * dv]);
+        }
+        let k_tilde64 = seg_means(&ks, n, d, m_eff);
+        g.k_tilde = k_tilde64.iter().map(|&x| x as f32).collect();
+        g.since_reseal = 0;
+        for head in &mut self.heads {
+            let qn = head.samp_q_len;
+            if qn < m_eff {
+                continue; // not enough queries yet — keep the old Q̃/M
+            }
+            let qstart = if qn == RESEAL_CAP { head.samp_q_head } else { 0 };
+            let mut qs = vec![0.0f32; qn * d];
+            for i in 0..qn {
+                let idx = (qstart + i) % RESEAL_CAP;
+                qs[i * d..(i + 1) * d]
+                    .copy_from_slice(&head.samp_q[idx * d..(idx + 1) * d]);
+            }
+            let q_tilde64 = seg_means(&qs, qn, d, m_eff);
+            head.q_tilde = q_tilde64.iter().map(|&x| x as f32).collect();
+            let mut au = vec![0.0f64; m_eff * m_eff];
+            for i in 0..m_eff {
+                for j in 0..m_eff {
+                    let mut s = 0.0f64;
+                    for c in 0..d {
+                        s += q_tilde64[i * d + c] * k_tilde64[j * d + c];
+                    }
+                    au[i * m_eff + j] = (s * g.scale as f64).exp();
+                }
+            }
+            let mu64 = ridge_pinv(&au, m_eff);
+            head.mu = mu64.iter().map(|&x| x as f32).collect();
+            // Re-warm: the far field is rebuilt from the ring. Mass
+            // older than the ring is dropped — under the drifted
+            // landmarks it was mis-binned anyway.
+            head.t_hat.iter_mut().for_each(|x| *x = 0.0);
+            head.z_hat.iter_mut().for_each(|x| *x = 0.0);
+            head.m_max.iter_mut().for_each(|x| *x = f32::NEG_INFINITY);
+            head.far_len = 0;
+            for i in 0..n {
+                head.far_absorb(
+                    m_eff,
+                    d,
+                    dv,
+                    g.scale,
+                    &ks[i * d..(i + 1) * d],
+                    &vs[i * dv..(i + 1) * dv],
+                );
+            }
         }
     }
 
@@ -513,6 +639,22 @@ impl NystromState {
             // overwritten by the incoming one.
             for h in heads.iter_mut() {
                 h.far_insert(g, slot);
+            }
+            // Reseal sampling: the evicted (k, v) joins the ring the
+            // next reseal rebuilds landmarks and far mass from.
+            if reseal_every() > 0 {
+                if g.samp_k.is_empty() {
+                    g.samp_k = vec![0.0; RESEAL_CAP * d];
+                    g.samp_v = vec![0.0; RESEAL_CAP * dv];
+                }
+                let sp = g.samp_head;
+                g.samp_k[sp * d..(sp + 1) * d]
+                    .copy_from_slice(&g.win_k[slot * d..(slot + 1) * d]);
+                g.samp_v[sp * dv..(sp + 1) * dv]
+                    .copy_from_slice(&g.win_v[slot * dv..(slot + 1) * dv]);
+                g.samp_head = (sp + 1) % RESEAL_CAP;
+                g.samp_len = (g.samp_len + 1).min(RESEAL_CAP);
+                g.since_reseal += 1;
             }
             g.win_k[slot * d..(slot + 1) * d].copy_from_slice(k);
             g.win_v[slot * dv..(slot + 1) * dv].copy_from_slice(v);
@@ -639,6 +781,9 @@ impl NystromHead {
             scr_fh: Vec::new(),
             scr_u: Vec::new(),
             scr_l: Vec::new(),
+            samp_q: Vec::new(),
+            samp_q_len: 0,
+            samp_q_head: 0,
         }
     }
 
@@ -804,15 +949,41 @@ impl NystromHead {
     /// m_max = -inf).
     fn far_insert(&mut self, g: &NystromGroup, slot: usize) {
         let (d, dv) = (g.d, g.dv);
+        // SAFETY of the two slices: slot < w, buffers are w-sized.
+        let k = &g.win_k[slot * d..(slot + 1) * d];
+        let v = &g.win_v[slot * dv..(slot + 1) * dv];
+        // borrow-friendly copies are avoided: far_absorb takes slices.
+        // (g is &, self is &mut — disjoint.)
+        let (m_eff, scale) = (g.m_eff, g.scale);
         // Runs once per evicted key per head — NEON dot/axpy like the
         // decode loop (same products, regrouped sums).
-        for i in 0..g.m_eff {
-            self.scr_l[i] = crate::attention::dot_f32(
-                &self.q_tilde[i * d..(i + 1) * d],
-                &g.win_k[slot * d..(slot + 1) * d],
-            ) * g.scale;
+        self.far_absorb_slices(m_eff, d, dv, scale, k, v);
+    }
+
+    /// The insertion math itself, over caller-provided (k, v) — shared
+    /// by the streaming path (window slot) and the reseal re-warm
+    /// (sample ring).
+    fn far_absorb(&mut self, m_eff: usize, d: usize, dv: usize, scale: f32, k: &[f32], v: &[f32]) {
+        self.far_absorb_slices(m_eff, d, dv, scale, k, v);
+    }
+
+    fn far_absorb_slices(
+        &mut self,
+        m_eff: usize,
+        d: usize,
+        dv: usize,
+        scale: f32,
+        k: &[f32],
+        v: &[f32],
+    ) {
+        if self.scr_l.len() < m_eff {
+            self.scr_l.resize(m_eff, 0.0);
         }
-        for i in 0..g.m_eff {
+        for i in 0..m_eff {
+            self.scr_l[i] =
+                crate::attention::dot_f32(&self.q_tilde[i * d..(i + 1) * d], k) * scale;
+        }
+        for i in 0..m_eff {
             let l = self.scr_l[i];
             if l > self.m_max[i] {
                 let r = (self.m_max[i] - l).exp();
@@ -824,11 +995,7 @@ impl NystromHead {
             }
             let e = (l - self.m_max[i]).exp();
             self.z_hat[i] += e;
-            crate::attention::axpy_f32(
-                &mut self.t_hat[i * dv..(i + 1) * dv],
-                &g.win_v[slot * dv..(slot + 1) * dv],
-                e,
-            );
+            crate::attention::axpy_f32(&mut self.t_hat[i * dv..(i + 1) * dv], v, e);
         }
         self.far_len += 1;
     }
