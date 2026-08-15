@@ -16,6 +16,52 @@ aquarium example.
 
 ### Added
 
+- **The sparse sampler chain** for configs with a top-k (Qwen's own
+  rows: 0.7/0.8/20 and 1.0/0.95/20): the dense chain built six or
+  seven passes over 248k floats per token — copy, exp, select,
+  filter, sort, renormalise — and every one past the selection
+  touched only the k survivors. Now: penalties on a copy only when
+  there are penalties, one pooled pass for the top-k penalized
+  logits (ties at the k-th place kept, as the dense chain keeps
+  them), one for the vocab-wide softmax denominator (top-p is defined
+  against the FULL normalisation), the rest over k entries. Same
+  distribution — the test checks the survivor set, the probabilities
+  to fp, and that a seed lands on the same token; the draw walks ids
+  in order like the dense inverse-CDF, so seeded runs reproduce.
+  Speculative SAMPLING uses it for its nine distributions a round.
+- **The speculation trial is a measurement, not a guess**: on
+  ambiguous inputs the round pays or does not depending on the text.
+  The loop now times rounds 2–5 (round 1 pays the batch scratch and
+  the draft mirror), then 8 plain tokens, keeps whichever is faster
+  by 3%, re-checks every 256 tokens; a batch graph that keeps
+  DECLINING the verify counts as a round that produced one token (a
+  q2tp file spun forever: 792 drafts, 0 accepted, 35 against 46
+  tok/s). Off by default under penalties (repetition 1.1 lets 2 of
+  16 drafts through). Measured on the 5090 pod: greedy core 60.5
+  against a plain 48.7 tok/s; a penalized full loop 46.4 (was 43.4
+  when the trial still tried).
+- The batch graph admits the 2-bit plane (kind 9) to its GEMM path —
+  a q2tp file's verify declined every round.
+- **Magic-mantissa nibble unpack** in every q4tp/q2tp decode kernel:
+  a nibble ORed into the mantissa of 2^23 minus 2^23 + 8 is exactly
+  n − 8, without an integer-to-float conversion (I2F issues at 1/8 of
+  the FMA rate on NVIDIA and there were eight per weight word). Same
+  bits, greedy output identical; `CMF_MAGIC_UNPACK=0` restores the
+  conversions. Measured neutral on the 5090's token (the one-vector
+  kernel is not ALU-bound), kept for the batched kernels.
+- `cortiq dequant` (one tensor, or a prefix with `--all`, → raw
+  f32/bf16) and `cortiq patch-tensor` (raw f32 → the tensor's own
+  quantization in place, or another dtype into a new file with
+  everything else copied verbatim) — the bridge that lets offline
+  tools (the FCD tail heal, the NVG fold) work on a quantized file's
+  exact numerics and write their result back.
+- `tools/nvg_fold_qwen35.py` — the holographic fold of a Qwen3.5/3.8
+  hybrid in closed form (FFN width, attention q-heads, GDN value
+  heads) from activation Grams, layer-streamed and grouped for a
+  memory-capped box; `tools/fcd_tail_heal.py` — the last layers of a
+  quantized file trained against the bf16 teacher (0.3·CE + 0.7·KL
+  on the teacher's top-k), layer-streamed on one GPU. Both are
+  experiments in flight; see docs/NVG_FOLD_ATTN_GDN.ru.md.
 - **Speculative sampling on the token graph** (`CMF_GRAPH_SPEC=1
   CMF_GRAPH_SPEC_SAMPLE=1`): draft from the MTP head's own post-chain
   distribution, accept with min(1, p/q), correct from max(0, p − q) —
