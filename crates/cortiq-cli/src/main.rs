@@ -1042,6 +1042,10 @@ enum Commands {
         /// whatever `--te` packs — pass the matching one
         #[arg(long)]
         clip_proj: Option<String>,
+        /// Vision-row twin of --clip-proj (fitted on image activations);
+        /// the runtime routes image-span rows through it
+        #[arg(long)]
+        clip_proj_vis: Option<String>,
         /// Video VAE (only the ViT3D decoder half is packed)
         #[arg(long)]
         video_vae: Option<String>,
@@ -1751,6 +1755,7 @@ async fn main() -> anyhow::Result<()> {
             te,
             te_layers,
             clip_proj,
+            clip_proj_vis,
             music_vae,
             music_dit,
             music_te,
@@ -1772,6 +1777,7 @@ async fn main() -> anyhow::Result<()> {
             te: te.as_deref(),
             te_layers,
             clip_proj: clip_proj.as_deref(),
+            clip_proj_vis: clip_proj_vis.as_deref(),
             music_vae: music_vae.as_deref(),
             music_dit: music_dit.as_deref(),
             music_te: music_te.as_deref(),

@@ -761,6 +761,16 @@ fn pack_clip_proj(
     specs: &mut Vec<TensorSpec>,
     path: &Path,
 ) -> anyhow::Result<serde_json::Value> {
+    pack_clip_proj_at(specs, path, "te.proj")
+}
+
+/// Same packing under an arbitrary prefix — `te.proj.vis` carries the
+/// vision-row twin the runtime routes image spans through.
+fn pack_clip_proj_at(
+    specs: &mut Vec<TensorSpec>,
+    path: &Path,
+    prefix: &str,
+) -> anyhow::Result<serde_json::Value> {
     let p = StFile::open(path)?;
     let w = p
         .shape("W")
@@ -771,7 +781,7 @@ fn pack_clip_proj(
     }
     let (d_in, d_out) = (w[0], w[1]);
     for k in ["W", "mean_in", "std_in", "mean_out", "std_out", "sink_out"] {
-        push_exact(specs, &p, k, &format!("te.proj.{k}"), Level::F32)?;
+        push_exact(specs, &p, k, &format!("{prefix}.{k}"), Level::F32)?;
     }
     let mlp = p.has("mlp.0.weight");
     let mut mlp_hidden = 0usize;
@@ -780,7 +790,7 @@ fn pack_clip_proj(
             .shape("mlp.0.weight")
             .ok_or_else(|| anyhow!("clip-proj: mlp.0.weight has no shape"))?[0];
         for k in ["mlp.0.weight", "mlp.0.bias", "mlp.2.weight", "mlp.2.bias"] {
-            push_exact(specs, &p, k, &format!("te.proj.{k}"), Level::F32)?;
+            push_exact(specs, &p, k, &format!("{prefix}.{k}"), Level::F32)?;
         }
     }
     eprintln!(
@@ -1443,6 +1453,7 @@ pub struct PackArgs<'a> {
     pub lora_scale: f32,
     pub te: Option<&'a str>,
     pub clip_proj: Option<&'a str>,
+    pub clip_proj_vis: Option<&'a str>,
     pub music_vae: Option<&'a str>,
     pub music_dit: Option<&'a str>,
     pub music_te: Option<&'a str>,
@@ -1511,6 +1522,15 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
         clip_d_out = cfg["d_out"].as_u64().unwrap_or(0) as usize;
         specs.push(config_spec("te.proj", &cfg));
         prov.insert("clip_proj".into(), serde_json::json!(p));
+    }
+    if let Some(p) = args.clip_proj_vis {
+        if args.clip_proj.is_none() && args.carry.is_none() {
+            return Err(anyhow!(
+                "--clip-proj-vis rides a base projection: pass --clip-proj or --in a file with one"
+            ));
+        }
+        pack_clip_proj_at(&mut specs, Path::new(p), "te.proj.vis")?;
+        prov.insert("clip_proj_vis".into(), serde_json::json!(p));
     }
     if let Some(p) = args.dit {
         let cfg = pack_dit(
@@ -1597,7 +1617,11 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
     let mut drop_pre: Vec<&str> = Vec::new();
     if args.te.is_some() {
         drop_pre.push("te.");
-    } else if args.clip_proj.is_some() {
+    }
+    if args.clip_proj_vis.is_some() {
+        drop_pre.push("te.proj.vis.");
+    }
+    if args.te.is_none() && args.clip_proj.is_some() {
         drop_pre.push("te.proj.");
     }
     for (on, pre) in [

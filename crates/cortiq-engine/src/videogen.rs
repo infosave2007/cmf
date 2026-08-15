@@ -329,18 +329,28 @@ fn generate_inner(
 
     if !keyframes.is_empty() {
         let tower = VisionTower::from_cmf(&model)?;
-        let venc = VideoVaeEncoder::from_cmf(&model)?;
+        // An activation harvest (CMF_TE_ONLY) never denoises, and the
+        // VAE latent is the DiT's food alone — the frame's 3-D conv
+        // encode is 99.5 s of a 102.5 s M4 run. Skip it.
+        let te_only = std::env::var("CMF_TE_ONLY").as_deref() == Ok("1");
+        let venc = if te_only {
+            None
+        } else {
+            Some(VideoVaeEncoder::from_cmf(&model)?)
+        };
         for (i, (frame, _)) in keyframes.iter().enumerate() {
             let (src, sh, sw) = *frame;
             // The picture the DiT sees is on the generation canvas; the
             // one Qwen sees keeps its own resolution policy.
             let fitted = fit_to_canvas(src, *sh, *sw, p.height, p.width, i > 0);
-            let (z, _, _) = venc.encode_frame(
-                &fitted.iter().map(|&v| v * 2.0 - 1.0).collect::<Vec<_>>(),
-                p.height,
-                p.width,
-            );
-            cond.push(z);
+            if let Some(venc) = &venc {
+                let (z, _, _) = venc.encode_frame(
+                    &fitted.iter().map(|&v| v * 2.0 - 1.0).collect::<Vec<_>>(),
+                    p.height,
+                    p.width,
+                );
+                cond.push(z);
+            }
 
             for t in tok.encode(&format!("<Picture {}>: ", i + 1)) {
                 ids.push(t);
@@ -407,6 +417,11 @@ fn generate_inner(
     }
     progress("encode", 1, 1);
     lap(&mut marks, "text encode");
+    // `CMF_TE_ONLY=1`: stop after the dump — an activation-harvest run
+    // (the ClipProj refit) wants hundreds of encodes and zero renders.
+    if std::env::var("CMF_TE_ONLY").as_deref() == Ok("1") {
+        return Err("CMF_TE_ONLY: encode dumped, render skipped".into());
+    }
     // The prompt encoder and vision tower ran their once-per-generation
     // pass; release their page cache so the denoise loop's DiT does not
     // fight 12+ GB of dead weights for RAM. On a 24 GB Mac with the
