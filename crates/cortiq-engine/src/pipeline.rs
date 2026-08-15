@@ -984,9 +984,16 @@ impl Pipeline {
             Item::Gdn { run, .. } => run.iter().any(|l| matches!(l.ffn, MetalFfn::Moe(_))),
             Item::Attn { l, .. } => matches!(l.ffn, MetalFfn::Moe(_)),
         });
+        let has_gdn = plan.iter().any(|it| matches!(it, Item::Gdn { .. }));
         let dev_attend = attend_contract
             && (self.head_dim <= 128
                 || has_moe
+                // A GDN hybrid attends on a quarter of its layers: the
+                // hd>128 caution was measured on pure-dense models where
+                // gqa_attend dominates, and on Qwen3.8-27B (hd 256, 48
+                // GDN + 16 attn) the sandwich costs 2x the whole decode
+                // (1.2 vs 2.21 tok/s measured before the arena fix).
+                || (self.head_dim <= 256 && has_gdn)
                 || attend_mode == "force"
                 || attend_mode == "256");
         if !dev_attend {
