@@ -36,6 +36,18 @@ aquarium example.
   answer from a model that decodes at 45.
 - `CMF_MV16W=0`: the wide-row q4tp decode matvec on the 8-row pair
   kernel (q4t's shape) for like-for-like kernel A/B.
+- **`q4tp_matvec16w_x2`** — two wide projections of one input in ONE
+  dispatch (FFN gate+up, the GDN's qkv+z, attention's k+v), body
+  generated from the 16w kernel so per-row arithmetic is bit-identical
+  (tested). Motive: 700 tiny dispatches issued in one submit cost
+  ~10-20 µs each on the RTX 5090 pod — a third of a token that the
+  kernels themselves never see. `CMF_MV_X2=0` splits them again.
+- Batched prefill can route its wide GEMMs through the tensor-core
+  kernel with a device-computed activation scale (`CMF_BATCH_COOP=1`,
+  opt-in until measured).
+- MiniMax-H3 card: field notes from the 24 GB Mac and 20 GB card
+  reports — what fits, for how many frames, and the draft → final
+  workflow.
 
 ### Changed
 
@@ -47,6 +59,17 @@ aquarium example.
 
 ### Fixed
 
+- **The f16 tensor-core GEMM applied its device-computed activation
+  scale at one end only**: the operand went in unscaled and the result
+  came out divided by 1000/max|x| — off by max|x|/1000 on exactly the
+  inputs large enough to need the scale (fused-FFN fc2, the DiT block's
+  device-scaled path). A test now drives it with activations at 3000:
+  relative rms 2.0 before, 2.8e-4 after.
+- **The contention kill needed one slow op; it needs three now.** A
+  24 GB Mac running the 25.7 GB MiniMax file (field report, HF
+  discussion #2) pages the first post-encode weights from the SSD, and a
+  single seconds-long op sent the whole run to the CPU. Consecutive
+  strikes, page-ins exempt, `CMF_MM_KILL=0` to disable.
 - `bench --json weight_gb_per_token` divided the PROCESS total (warmup,
   the timed prefill, the pair micro-bench) by the steady token count —
   21.9 GB/token on a 15.4 GB file, a 1.5× "amplification" that was the

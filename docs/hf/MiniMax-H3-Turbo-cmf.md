@@ -196,6 +196,7 @@ binary both splits and replicates across cards — see
 | `CMF_GPU_PROBE=0` | pin the op arbitration (already the default for `animate`, so a seed reproduces) |
 | `CMF_THREADS=n` | cap the worker pool (defaults to the machine's cores) |
 | `CMF_ANIM_PROF=1` | per-step rms of both latent streams and both velocities |
+| `CMF_MM_KILL=0` | never fall back to the host on a slow device op. The engine treats three consecutive over-budget GEMMs as "another process owns the card" and finishes the run on the CPU; a weight paging in from disk is exempt, but on a machine where the file exceeds RAM the first steps can be slow for reasons that are not contention (see the field notes) |
 
 ### What it needs
 
@@ -207,6 +208,49 @@ and wants ~14 GB of VRAM for the DiT's planes. No network access at run time.
 peaks at 15.1 GB of VRAM — a whole-run maximum, polled, not a snapshot. That is
 what makes it the one to reach for on a 20 GB card: below that the prompt
 encoder pages, and on this workload paging costs more than any kernel.
+
+### Field notes: 24 GB Macs and 20 GB cards
+
+Two users measured what this card could not, and the engine changed on
+both reports (HF discussions #1 and #2). The numbers, as they sent them:
+
+| machine | file | render | result |
+|---|---|---|---|
+| RTX 3080 20 GB, Windows | `mmh3-turbo-q4tp` (25.2 GB) | 512×288×39, 4 steps | **1218 s** — the encoder did not fit the 19 GB budget and paged every step |
+| RTX 3080 20 GB, Windows | `mmh3-turbo-clipproj4b-q4tp` (13.2 GB) | same | **105 s** — resident; denoise 62.8 s, video VAE 30.6 s |
+| Mac mini M4 24 GB | `mmh3-turbo-clipproj4b-q4tp` | 512×256×39, 4 steps | **174 s** — denoise 122 s, video VAE 41 s |
+| Mac mini M4 24 GB | `mmh3-turbo-clipproj4b-fl2va-q4tp` (14.5 GB) | 22 frames from a keyframe | **92 s**, no swap |
+| Mac mini M4 24 GB | `mmh3-turbo-fl2va-q4tp` (25.7 GB), 0.5.79 | 10 / 40 frames | **48 s / 140 s per denoise step** on the GPU, 20 GB resident, 0.3 GB swap |
+| Mac mini M4 24 GB | same, 150 frames | | 8 GB of swap and a sawtooth — the activation cache no longer fits |
+
+What follows from them, if you are on such a machine:
+
+- **On a 24 GB Mac the 25.7 GB file works after 0.5.79, for clips of
+  ≤ 40 frames.** The prompt encoder's pages are released after the text
+  encode; what remains — DiT, VAE decoders and the activation cache — fits
+  up to ~40 frames. Past that the cache spills to swap. For longer clips
+  chain 40-frame chunks (`--last-frame` of one render becomes
+  `--first-frame` of the next) or use the `clipproj4b` files, which leave
+  the room.
+- **The Metal driver budgets by buffer size, not resident pages.** The
+  weight arena's overlapping windows read as ~27 GB to the driver even
+  after the encoder is released, so the first ops after the encode page
+  from the SSD and can take seconds. Before 0.5.80 a single such op tripped
+  the contention kill and the rest of the run walked the CPU (>60 s a
+  step); the kill now needs three consecutive strikes, exempts weights
+  that were not resident, and `CMF_MM_KILL=0` turns it off. If a run still
+  says `device contended, CPU for the rest of the process` on a machine
+  nobody else is using, that variable is the answer.
+- **The draft → final workflow.** Block the shot on `clipproj4b-fl2va`
+  (90 s on the Mac), then pay the full encoder once for the final take.
+  The v2 clipproj projection keeps faces through a clip; identity of
+  specific real people is still the full encoder's territory.
+- **`--height 256` instead of 288** halves the video-VAE decode on every
+  machine (three 256-pixel tiles instead of six).
+- **Voices are prompt space.** There is no reference-audio input — H3
+  conditions on text and keyframes only — but speaker identity, timbre,
+  pace and emotion respond to stage directions in the prompt, and a fixed
+  seed keeps the same actor across takes.
 
 ## Making it smaller
 
