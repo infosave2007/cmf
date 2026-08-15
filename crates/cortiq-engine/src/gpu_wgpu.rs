@@ -4479,6 +4479,332 @@ fn q4tp_matvec4_bku(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// ── The batched (bku) matvec for TWO weights of one input batch in one
+// dispatch — the x2 fusion for the batch graph (verify / batched
+// prefill): gate+up, GDN qkv+z, attention k+v. Body generated from
+// `q4tp_matvec4_bku`, side B over its own bindings; per-row, per-element
+// arithmetic identical. Same params as x2: rows2 in `_p1`, batch in `_p0`.
+@compute @workgroup_size(256)
+fn q4tp_matvec4_bku_x2(@builtin(workgroup_id) wid: vec3<u32>,
+                       @builtin(num_workgroups) nwg: vec3<u32>,
+                       @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let rows2 = q1p._p1;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let params_w2 = rows2 * gpr * 4u;
+    let codes_b2 = rows2 * gpr * 16u + rows2 * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let nb = max(q1p._p0, 1u);
+    let blocks1 = (rows + 15u) / 16u;
+    let blocks2 = (rows2 + 15u) / 16u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks1 + blocks2) { break; }
+        if (wb < blocks1) {
+        let base = wb * 16u;
+        for (var t = lid; t < 512u; t = t + 256u) {
+            let r = base + (t >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                lad_q4w[t] = exp2(pr.x + f32(t & 31u) * pr.y);
+            }
+        }
+        workgroupBarrier();
+        let r0 = base + sub;
+        let r1 = base + sub + 4u;
+        let r2 = base + sub + 8u;
+        let r3 = base + sub + 12u;
+        // Batches wider than the four accumulator components run in
+        // chunks of four: the weight is re-read once per CHUNK, not once
+        // per element. A k=4 draft is b=5, and before this it fell off
+        // the kernel entirely and paid five reads (measured: k=4 decoded
+        // SLOWER than k=3, 43.8 against 51.0, for exactly that reason).
+        var cbase = 0u;
+        loop {
+        if (cbase >= nb) { break; }
+        var acc0 = vec4<f32>(0.0);
+        var acc1 = vec4<f32>(0.0);
+        var acc2 = vec4<f32>(0.0);
+        var acc3 = vec4<f32>(0.0);
+        if (r0 < rows) {
+            let c0 = codes_b + r0 * cstride;
+            let c1 = codes_b + r1 * cstride;
+            let c2 = codes_b + r2 * cstride;
+            let c3 = codes_b + r3 * cstride;
+            let l1 = r1 < rows;
+            let l2 = r2 < rows;
+            let l3 = r3 < rows;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                var cv = q4tp_byte(c0 + cbo);
+                if (sh > 3u) { cv = cv | (q4tp_byte(c0 + cbo + 1u) << 8u); }
+                let v0 = q4v_w[r0 * gpr + g];
+                let s0 = lad_q4w[(sub << 5u) + ((cv >> sh) & 31u)];
+                var v1 = vec4<u32>(0u, 0u, 0u, 0u);
+                var s1 = 0.0;
+                if (l1) {
+                    cv = q4tp_byte(c1 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c1 + cbo + 1u) << 8u); }
+                    v1 = q4v_w[r1 * gpr + g];
+                    s1 = lad_q4w[128u + (sub << 5u) + ((cv >> sh) & 31u)];
+                }
+                var v2 = vec4<u32>(0u, 0u, 0u, 0u);
+                var s2 = 0.0;
+                if (l2) {
+                    cv = q4tp_byte(c2 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c2 + cbo + 1u) << 8u); }
+                    v2 = q4v_w[r2 * gpr + g];
+                    s2 = lad_q4w[256u + (sub << 5u) + ((cv >> sh) & 31u)];
+                }
+                var v3 = vec4<u32>(0u, 0u, 0u, 0u);
+                var s3 = 0.0;
+                if (l3) {
+                    cv = q4tp_byte(c3 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c3 + cbo + 1u) << 8u); }
+                    v3 = q4v_w[r3 * gpr + g];
+                    s3 = lad_q4w[384u + (sub << 5u) + ((cv >> sh) & 31u)];
+                }
+                var j = 0u;
+                loop {
+                    if (j >= 4u) { break; }
+                    var w0 = v0.x; var w1 = v1.x; var w2 = v2.x; var w3 = v3.x;
+                    if (j == 1u) { w0 = v0.y; w1 = v1.y; w2 = v2.y; w3 = v3.y; }
+                    if (j == 2u) { w0 = v0.z; w1 = v1.z; w2 = v2.z; w3 = v3.z; }
+                    if (j == 3u) { w0 = v0.w; w1 = v1.w; w2 = v2.w; w3 = v3.w; }
+                    let a0 = q4v_lo4(w0); let b0 = q4v_hi4(w0);
+                    let a1 = q4v_lo4(w1); let b1 = q4v_hi4(w1);
+                    let a2 = q4v_lo4(w2); let b2 = q4v_hi4(w2);
+                    let a3 = q4v_lo4(w3); let b3 = q4v_hi4(w3);
+                    let xj = g * 8u + j * 2u;
+                    {
+                        let x0q = xj + gpr * 8u * cbase;
+                        let xa = q4v_x[x0q]; let xb = q4v_x[x0q + 1u];
+                        acc0.x = acc0.x + s0 * (dot(a0, xa) + dot(b0, xb));
+                        acc1.x = acc1.x + s1 * (dot(a1, xa) + dot(b1, xb));
+                        acc2.x = acc2.x + s2 * (dot(a2, xa) + dot(b2, xb));
+                        acc3.x = acc3.x + s3 * (dot(a3, xa) + dot(b3, xb));
+                    }
+                    if (cbase + 1u < nb) {
+                        let xq = xj + gpr * 8u * (cbase + 1u);
+                        let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
+                        acc0.y = acc0.y + s0 * (dot(a0, xa) + dot(b0, xb));
+                        acc1.y = acc1.y + s1 * (dot(a1, xa) + dot(b1, xb));
+                        acc2.y = acc2.y + s2 * (dot(a2, xa) + dot(b2, xb));
+                        acc3.y = acc3.y + s3 * (dot(a3, xa) + dot(b3, xb));
+                    }
+                    if (cbase + 2u < nb) {
+                        let xq = xj + gpr * 8u * (cbase + 2u);
+                        let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
+                        acc0.z = acc0.z + s0 * (dot(a0, xa) + dot(b0, xb));
+                        acc1.z = acc1.z + s1 * (dot(a1, xa) + dot(b1, xb));
+                        acc2.z = acc2.z + s2 * (dot(a2, xa) + dot(b2, xb));
+                        acc3.z = acc3.z + s3 * (dot(a3, xa) + dot(b3, xb));
+                    }
+                    if (cbase + 3u < nb) {
+                        let xq = xj + gpr * 8u * (cbase + 3u);
+                        let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
+                        acc0.w = acc0.w + s0 * (dot(a0, xa) + dot(b0, xb));
+                        acc1.w = acc1.w + s1 * (dot(a1, xa) + dot(b1, xb));
+                        acc2.w = acc2.w + s2 * (dot(a2, xa) + dot(b2, xb));
+                        acc3.w = acc3.w + s3 * (dot(a3, xa) + dot(b3, xb));
+                    }
+                    j = j + 1u;
+                }
+                g = g + 64u;
+            }
+        }
+        var e = 0u;
+        loop {
+            if (cbase + e >= nb || e >= 4u) { break; }
+            var mine = vec4<f32>(acc0.x, acc1.x, acc2.x, acc3.x);
+            if (e == 1u) { mine = vec4<f32>(acc0.y, acc1.y, acc2.y, acc3.y); }
+            if (e == 2u) { mine = vec4<f32>(acc0.z, acc1.z, acc2.z, acc3.z); }
+            if (e == 3u) { mine = vec4<f32>(acc0.w, acc1.w, acc2.w, acc3.w); }
+            partial_q4k[lid] = mine;
+            workgroupBarrier();
+            var stride = 32u;
+            loop {
+                if (stride == 0u) { break; }
+                if (l < stride) {
+                    partial_q4k[lid] = partial_q4k[lid] + partial_q4k[lid + stride];
+                }
+                workgroupBarrier();
+                stride = stride >> 1u;
+            }
+            if (l == 0u) {
+                let r = partial_q4k[sub << 6u];
+                let yo = (cbase + e) * rows;
+                if (r0 < rows) { q1y[yo + r0] = r.x; }
+                if (r1 < rows) { q1y[yo + r1] = r.y; }
+                if (r2 < rows) { q1y[yo + r2] = r.z; }
+                if (r3 < rows) { q1y[yo + r3] = r.w; }
+            }
+            workgroupBarrier();
+            e = e + 1u;
+        }
+        cbase = cbase + 4u;
+        }
+        } else {
+        let base = (wb - blocks1) * 16u;
+        for (var t = lid; t < 512u; t = t + 256u) {
+            let r = base + (t >> 5u);
+            if (r < rows2) {
+                let pr = unpack2x16float(q1w2[params_w2 + r]);
+                lad_q4w[t] = exp2(pr.x + f32(t & 31u) * pr.y);
+            }
+        }
+        workgroupBarrier();
+        let r0 = base + sub;
+        let r1 = base + sub + 4u;
+        let r2 = base + sub + 8u;
+        let r3 = base + sub + 12u;
+        // Batches wider than the four accumulator components run in
+        // chunks of four: the weight is re-read once per CHUNK, not once
+        // per element. A k=4 draft is b=5, and before this it fell off
+        // the kernel entirely and paid five reads (measured: k=4 decoded
+        // SLOWER than k=3, 43.8 against 51.0, for exactly that reason).
+        var cbase = 0u;
+        loop {
+        if (cbase >= nb) { break; }
+        var acc0 = vec4<f32>(0.0);
+        var acc1 = vec4<f32>(0.0);
+        var acc2 = vec4<f32>(0.0);
+        var acc3 = vec4<f32>(0.0);
+        if (r0 < rows2) {
+            let c0 = codes_b2 + r0 * cstride;
+            let c1 = codes_b2 + r1 * cstride;
+            let c2 = codes_b2 + r2 * cstride;
+            let c3 = codes_b2 + r3 * cstride;
+            let l1 = r1 < rows2;
+            let l2 = r2 < rows2;
+            let l3 = r3 < rows2;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                var cv = q4tp_byte2(c0 + cbo);
+                if (sh > 3u) { cv = cv | (q4tp_byte2(c0 + cbo + 1u) << 8u); }
+                let v0 = q4v_w2[r0 * gpr + g];
+                let s0 = lad_q4w[(sub << 5u) + ((cv >> sh) & 31u)];
+                var v1 = vec4<u32>(0u, 0u, 0u, 0u);
+                var s1 = 0.0;
+                if (l1) {
+                    cv = q4tp_byte2(c1 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte2(c1 + cbo + 1u) << 8u); }
+                    v1 = q4v_w2[r1 * gpr + g];
+                    s1 = lad_q4w[128u + (sub << 5u) + ((cv >> sh) & 31u)];
+                }
+                var v2 = vec4<u32>(0u, 0u, 0u, 0u);
+                var s2 = 0.0;
+                if (l2) {
+                    cv = q4tp_byte2(c2 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte2(c2 + cbo + 1u) << 8u); }
+                    v2 = q4v_w2[r2 * gpr + g];
+                    s2 = lad_q4w[256u + (sub << 5u) + ((cv >> sh) & 31u)];
+                }
+                var v3 = vec4<u32>(0u, 0u, 0u, 0u);
+                var s3 = 0.0;
+                if (l3) {
+                    cv = q4tp_byte2(c3 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte2(c3 + cbo + 1u) << 8u); }
+                    v3 = q4v_w2[r3 * gpr + g];
+                    s3 = lad_q4w[384u + (sub << 5u) + ((cv >> sh) & 31u)];
+                }
+                var j = 0u;
+                loop {
+                    if (j >= 4u) { break; }
+                    var w0 = v0.x; var w1 = v1.x; var w2 = v2.x; var w3 = v3.x;
+                    if (j == 1u) { w0 = v0.y; w1 = v1.y; w2 = v2.y; w3 = v3.y; }
+                    if (j == 2u) { w0 = v0.z; w1 = v1.z; w2 = v2.z; w3 = v3.z; }
+                    if (j == 3u) { w0 = v0.w; w1 = v1.w; w2 = v2.w; w3 = v3.w; }
+                    let a0 = q4v_lo4(w0); let b0 = q4v_hi4(w0);
+                    let a1 = q4v_lo4(w1); let b1 = q4v_hi4(w1);
+                    let a2 = q4v_lo4(w2); let b2 = q4v_hi4(w2);
+                    let a3 = q4v_lo4(w3); let b3 = q4v_hi4(w3);
+                    let xj = g * 8u + j * 2u;
+                    {
+                        let x0q = xj + gpr * 8u * cbase;
+                        let xa = q4v_x[x0q]; let xb = q4v_x[x0q + 1u];
+                        acc0.x = acc0.x + s0 * (dot(a0, xa) + dot(b0, xb));
+                        acc1.x = acc1.x + s1 * (dot(a1, xa) + dot(b1, xb));
+                        acc2.x = acc2.x + s2 * (dot(a2, xa) + dot(b2, xb));
+                        acc3.x = acc3.x + s3 * (dot(a3, xa) + dot(b3, xb));
+                    }
+                    if (cbase + 1u < nb) {
+                        let xq = xj + gpr * 8u * (cbase + 1u);
+                        let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
+                        acc0.y = acc0.y + s0 * (dot(a0, xa) + dot(b0, xb));
+                        acc1.y = acc1.y + s1 * (dot(a1, xa) + dot(b1, xb));
+                        acc2.y = acc2.y + s2 * (dot(a2, xa) + dot(b2, xb));
+                        acc3.y = acc3.y + s3 * (dot(a3, xa) + dot(b3, xb));
+                    }
+                    if (cbase + 2u < nb) {
+                        let xq = xj + gpr * 8u * (cbase + 2u);
+                        let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
+                        acc0.z = acc0.z + s0 * (dot(a0, xa) + dot(b0, xb));
+                        acc1.z = acc1.z + s1 * (dot(a1, xa) + dot(b1, xb));
+                        acc2.z = acc2.z + s2 * (dot(a2, xa) + dot(b2, xb));
+                        acc3.z = acc3.z + s3 * (dot(a3, xa) + dot(b3, xb));
+                    }
+                    if (cbase + 3u < nb) {
+                        let xq = xj + gpr * 8u * (cbase + 3u);
+                        let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
+                        acc0.w = acc0.w + s0 * (dot(a0, xa) + dot(b0, xb));
+                        acc1.w = acc1.w + s1 * (dot(a1, xa) + dot(b1, xb));
+                        acc2.w = acc2.w + s2 * (dot(a2, xa) + dot(b2, xb));
+                        acc3.w = acc3.w + s3 * (dot(a3, xa) + dot(b3, xb));
+                    }
+                    j = j + 1u;
+                }
+                g = g + 64u;
+            }
+        }
+        var e = 0u;
+        loop {
+            if (cbase + e >= nb || e >= 4u) { break; }
+            var mine = vec4<f32>(acc0.x, acc1.x, acc2.x, acc3.x);
+            if (e == 1u) { mine = vec4<f32>(acc0.y, acc1.y, acc2.y, acc3.y); }
+            if (e == 2u) { mine = vec4<f32>(acc0.z, acc1.z, acc2.z, acc3.z); }
+            if (e == 3u) { mine = vec4<f32>(acc0.w, acc1.w, acc2.w, acc3.w); }
+            partial_q4k[lid] = mine;
+            workgroupBarrier();
+            var stride = 32u;
+            loop {
+                if (stride == 0u) { break; }
+                if (l < stride) {
+                    partial_q4k[lid] = partial_q4k[lid] + partial_q4k[lid + stride];
+                }
+                workgroupBarrier();
+                stride = stride >> 1u;
+            }
+            if (l == 0u) {
+                let r = partial_q4k[sub << 6u];
+                let yo = (cbase + e) * rows2;
+                if (r0 < rows2) { q1y2[yo + r0] = r.x; }
+                if (r1 < rows2) { q1y2[yo + r1] = r.y; }
+                if (r2 < rows2) { q1y2[yo + r2] = r.z; }
+                if (r3 < rows2) { q1y2[yo + r3] = r.w; }
+            }
+            workgroupBarrier();
+            e = e + 1u;
+        }
+        cbase = cbase + 4u;
+        }
+        }
+        wb = wb + nwg.x;
+    }
+}
+
 // ── TIMING PROBE, answers are GARBAGE (`CMF_MV_PROBE`). The quad-row
 // kernel with its arithmetic removed and every LOAD kept: same grid,
 // same weight/code/x traffic, same loop trip count, but no nibble
@@ -11774,6 +12100,8 @@ struct Ctx {
     /// `CMF_MV_GU=0` returns to gate, up, silu as three dispatches.
     q4tp_mv16w_gu: wgpu::ComputePipeline,
     use_mv_gu: bool,
+    /// The batched (bku) two-weight kernel for the batch graph.
+    q4tp_mv4_bku_x2: wgpu::ComputePipeline,
     f32_gemm_dx: wgpu::ComputePipeline,
     vae_conv: wgpu::ComputePipeline,
     dit_ropepack: wgpu::ComputePipeline,
@@ -12888,6 +13216,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let use_mv_x2 = std::env::var("CMF_MV_X2").map(|v| v != "0").unwrap_or(true);
     let q4tp_mv16w_gu = pipe("q4tp_matvec16w_gu");
     let use_mv_gu = std::env::var("CMF_MV_GU").map(|v| v != "0").unwrap_or(true);
+    let q4tp_mv4_bku_x2 = pipe("q4tp_matvec4_bku_x2");
     let f32_gemm_dx = pipe("f32_gemm_dx");
     // Per-kernel validation while these are new: a scope around each
     // names the shader the driver rejected, where the module-wide scope
@@ -13202,6 +13531,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         use_mv_x2,
         q4tp_mv16w_gu,
         use_mv_gu,
+        q4tp_mv4_bku_x2,
         f32_gemm_dx,
         vae_conv,
         dit_ropepack,
@@ -18566,6 +18896,27 @@ pub fn forward_batch_graph(
             _ => encode_q1_mm(c, enc, &m.buf, xs, y, rows, cols, k),
         }
     };
+    // Two batched projections of one input in one dispatch when both are
+    // wide q4tp and the batch fits the bku kernel; otherwise two `ematb`.
+    let ematb2 = |enc: &mut wgpu::CommandEncoder,
+                  a: &GMat,
+                  b: &GMat,
+                  xs: &wgpu::Buffer,
+                  ya: &wgpu::Buffer,
+                  yb: &wgpu::Buffer,
+                  rows_a: usize,
+                  rows_b: usize,
+                  cols: usize| {
+        if a.kind == 6
+            && b.kind == 6
+            && c.use_mv4
+            && encode_q4tp_mv4_b_x2(c, enc, &a.buf, &b.buf, xs, ya, yb, rows_a, rows_b, cols, k)
+        {
+            return;
+        }
+        ematb(enc, a, xs, ya, rows_a, cols);
+        ematb(enc, b, xs, yb, rows_b, cols);
+    };
     // SINGLE-row matvec for the per-token stretches inside the batch (the MoE
     // router/gate run once per token). `ematb` bakes nb=k into the GEMM: fed a
     // one-row buffer it reads k rows past the end and writes k rows into a
@@ -18754,8 +19105,17 @@ pub fn forward_batch_graph(
                 let knw = stor(bytemuck::cast_slice(k_norm.unwrap_or(&vec![0f32; hd])));
                 let qrows = nh * hd * (1 + *output_gate as usize);
                 ematb(&mut enc, wq, &n1, &qraw_b, qrows, hidden);
-                ematb(&mut enc, wk, &n1, &kb_b, nkv * hd, hidden);
-                ematb(&mut enc, wv, &n1, &vb_b, nkv * hd, hidden);
+                ematb2(
+                    &mut enc,
+                    wk,
+                    wv,
+                    &n1,
+                    &kb_b,
+                    &vb_b,
+                    nkv * hd,
+                    nkv * hd,
+                    hidden,
+                );
                 {
                     // ONE compute pass for every position: the loop's four
                     // dispatches per token each carried their own pass, and
@@ -18906,8 +19266,7 @@ pub fn forward_batch_graph(
                 let dtb = stor(bytemuck::cast_slice(dt_bias));
                 let gnorm = stor(bytemuck::cast_slice(norm));
                 bts!(enc, 6);
-                ematb(&mut enc, qkv, &n1, &qkv_b, *cdim, hidden);
-                ematb(&mut enc, z, &n1, &z_b, nv * dv, hidden);
+                ematb2(&mut enc, qkv, z, &n1, &qkv_b, &z_b, *cdim, nv * dv, hidden);
                 let gc_p = unif(&[*cdim as u32, *kk as u32, 0, 0]);
                 let gd_p = unif(&[
                     *nv as u32,
@@ -19064,8 +19423,7 @@ pub fn forward_batch_graph(
                 width,
             } => {
                 let inter = *width; // this layer's, not the model's
-                ematb(&mut enc, gate, &n1, &gbuf, inter, hidden);
-                ematb(&mut enc, up, &n1, &ubuf, inter, hidden);
+                ematb2(&mut enc, gate, up, &n1, &gbuf, &ubuf, inter, inter, hidden);
                 go(
                     &mut enc,
                     &c.silu,
@@ -25474,6 +25832,51 @@ fn encode_q4tp_mv4(
 /// Always encodes: the row blocking sits inside one batch element by
 /// construction, so no shape is refused.
 #[allow(clippy::too_many_arguments)]
+/// Two batched projections of one input batch in ONE dispatch (the bku
+/// x2 kernel): both q4tp, wide (gpr > 64), batch 2..=8 (arm 2's range).
+/// False = does not qualify; the caller issues two `encode_q4tp_mv4_b`.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4tp_mv4_b_x2(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    wa: &wgpu::Buffer,
+    wb: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    ya: &wgpu::Buffer,
+    yb: &wgpu::Buffer,
+    rows_a: usize,
+    rows_b: usize,
+    cols: usize,
+    batch: usize,
+) -> bool {
+    let gpr = cols / 32;
+    if !c.use_mv_x2 || c.use_mv_bk < 2 || !(2..=8).contains(&batch) || gpr <= 64 || cols % 32 != 0 {
+        return false;
+    }
+    let p_buf = uniform_u32x4(c, [gpr as u32, rows_a as u32, batch as u32, rows_b as u32]);
+    let layout = c.q4tp_mv4_bku_x2.get_bind_group_layout(0);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("mv-bku-x2"),
+        layout: &layout,
+        entries: &[
+            bind_buf(0, wa),
+            bind_buf(2, ya),
+            bind_buf(3, &p_buf),
+            bind_buf(4, wa),
+            bind_buf(5, xs),
+            bind_buf(6, wb),
+            bind_buf(7, wb),
+            bind_buf(8, yb),
+        ],
+    });
+    let mut pass = begin_pass(enc);
+    pass.set_pipeline(&c.q4tp_mv4_bku_x2);
+    pass.set_bind_group(0, &bind, &[]);
+    let wg = (rows_a as u32).div_ceil(16) + (rows_b as u32).div_ceil(16);
+    pass.dispatch_workgroups(mv_grid(wg), 1, 1);
+    true
+}
+
 fn encode_q4tp_mv4_b(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
@@ -28069,6 +28472,108 @@ fn main() {
         assert_eq!(
             mism, 0,
             "{mism} of {n} outputs differ between the x2 kernel and two singles"
+        );
+    }
+
+    /// The batched two-weight kernel against two batched singles (bku
+    /// arm), batch 3, uneven rows — bit for bit.
+    #[test]
+    fn wgpu_q4tp_matvec4_bku_x2_matches_two_singles() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        if c.use_mv_bk < 2 || !c.use_mv_x2 {
+            eprintln!("bku arm or x2 off in this environment — skipping");
+            return;
+        }
+        let (cols, batch) = (4096usize, 3usize);
+        let mk_w = |rows: usize, seed: usize| -> Vec<u8> {
+            let total = cortiq_core::quant::expected_nbytes(
+                cortiq_core::TensorDtype::Q4TiledP,
+                &[rows, cols],
+            )
+            .unwrap();
+            let (params_off, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+            let mut wb: Vec<u8> = (0..total)
+                .map(|i| ((i * 37 + seed * 11) % 251) as u8)
+                .collect();
+            let lo = cortiq_core::quant::f32_to_f16(-4.0);
+            let step = cortiq_core::quant::f32_to_f16(0.1);
+            for r in 0..rows {
+                let o = params_off + r * 4;
+                wb[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+                wb[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+            }
+            wb
+        };
+        let (rows_a, rows_b) = (1000usize, 296usize);
+        let (wa, wb) = (mk_w(rows_a, 1), mk_w(rows_b, 2));
+        let xs: Vec<f32> = (0..batch * cols)
+            .map(|i| ((i % 97) as f32 - 48.0) / 48.0)
+            .collect();
+        let mk = |bytes: &[u8]| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let (wab, wbb, xb) = (mk(&wa), mk(&wb), mk(bytemuck::cast_slice(&xs)));
+        let out = |n: usize| {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (n * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let (na, nb) = (batch * rows_a, batch * rows_b);
+        let (ya1, yb1, ya2, yb2) = (out(na), out(nb), out(na), out(nb));
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        assert!(encode_q4tp_mv4_b(
+            c, &mut enc, &wab, &xb, &ya1, rows_a, cols, batch
+        ));
+        assert!(encode_q4tp_mv4_b(
+            c, &mut enc, &wbb, &xb, &yb1, rows_b, cols, batch
+        ));
+        assert!(encode_q4tp_mv4_b_x2(
+            c, &mut enc, &wab, &wbb, &xb, &ya2, &yb2, rows_a, rows_b, cols, batch
+        ));
+        let n = na + nb;
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (2 * n * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        enc.copy_buffer_to_buffer(&ya1, 0, &stage, 0, (na * 4) as u64);
+        enc.copy_buffer_to_buffer(&yb1, 0, &stage, (na * 4) as u64, (nb * 4) as u64);
+        enc.copy_buffer_to_buffer(&ya2, 0, &stage, (n * 4) as u64, (na * 4) as u64);
+        enc.copy_buffer_to_buffer(&yb2, 0, &stage, ((n + na) * 4) as u64, (nb * 4) as u64);
+        submit(c, enc.finish());
+        let slice = stage.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range().expect("map");
+        let all: &[f32] = bytemuck::cast_slice(&data);
+        let (single, pair) = all.split_at(n);
+        let mism = single
+            .iter()
+            .zip(pair)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let nz = single.iter().filter(|v| **v != 0.0).count();
+        drop(data);
+        stage.unmap();
+        assert!(nz > n / 2, "singles produced mostly zeros — harness wrong");
+        assert_eq!(
+            mism, 0,
+            "{mism} of {n} batched outputs differ between bku_x2 and two singles"
         );
     }
 
