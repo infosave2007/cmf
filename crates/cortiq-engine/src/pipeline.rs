@@ -3075,10 +3075,15 @@ impl Pipeline {
         // each draft is a DRAW from the MTP head's post-chain distribution
         // q_j, kept for the accept test; the verify's rows give p_j.
         let cfg = self.sampler_config.clone();
-        let sampling = !(cfg.temperature < 1e-6
-            && cfg.repetition_penalty == 1.0
+        let penalized = !(cfg.repetition_penalty == 1.0
             && cfg.presence_penalty == 0.0
             && cfg.suppress_tokens.is_empty());
+        // Three verify regimes: plain greedy (argmax of the raw rows),
+        // greedy WITH penalties (argmax of the penalized rows — a single
+        // pass each, no distributions), and sampling (draw / accept /
+        // correct on post-chain distributions).
+        let greedy_pen = cfg.temperature < 1e-6 && penalized;
+        let sampling = cfg.temperature >= 1e-6;
         let base_len = all_ids.len();
         if sampling && self.spec_q.len() < k_spec {
             self.spec_q.resize_with(k_spec, Vec::new);
@@ -3105,6 +3110,16 @@ impl Pipeline {
                 let d = sampler::draw(&q, &mut self.rng);
                 self.spec_q[j] = q;
                 all_ids.push(d); // the next draft's penalties see this one
+                d
+            } else if greedy_pen {
+                let d = sampler::argmax_penalized(
+                    &lg,
+                    &cfg,
+                    all_ids,
+                    &mut self.sampler_scratch,
+                    self.pool.as_deref(),
+                );
+                all_ids.push(d);
                 d
             } else {
                 sampler::argmax(&lg)
@@ -3200,6 +3215,33 @@ impl Pipeline {
             self.spec_res = res;
             // the accepted drafts ARE the verified tokens after inputs 0..a
             drafts.clone()
+        } else if greedy_pen {
+            // Row i's penalized argmax, penalties over the stream that
+            // includes the accepted drafts before it — the plain loop's
+            // exact arithmetic, one pass per row, no working copy.
+            let mut ids: Vec<u32> = Vec::with_capacity(b);
+            for i in 0..b {
+                let t = sampler::argmax_penalized(
+                    &logits[i * lm_rows..(i + 1) * lm_rows],
+                    &cfg,
+                    all_ids,
+                    &mut self.sampler_scratch,
+                    self.pool.as_deref(),
+                );
+                ids.push(t);
+                if i < k_spec && t == drafts[i] {
+                    all_ids.push(t);
+                } else {
+                    break;
+                }
+            }
+            all_ids.truncate(base_len);
+            while a < k_spec && a < ids.len() && ids[a] == drafts[a] {
+                a += 1;
+            }
+            // rows past the first mismatch were never scored; the loop
+            // top re-samples the last verified row itself.
+            ids
         } else {
             let ids: Vec<u32> = (0..b)
                 .map(|i| sampler::argmax(&logits[i * lm_rows..(i + 1) * lm_rows]))

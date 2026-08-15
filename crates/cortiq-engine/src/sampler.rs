@@ -173,6 +173,10 @@ pub fn sample_with_scratch_pool(
     // per token, and the struct that exists to hold scratch may as well
     // hold it. Every early return goes through `done` so the buffer never
     // leaks back to the allocator.
+    if config.temperature < 1e-6 {
+        // greedy over the penalized logits, no working copy
+        return argmax_penalized(logits, config, past_tokens, scratch, pool);
+    }
     let mut probs = std::mem::take(&mut scratch.probs);
     let normalized = chain(logits, config, past_tokens, scratch, pool, &mut probs);
 
@@ -181,10 +185,6 @@ pub fn sample_with_scratch_pool(
         tok
     };
 
-    if config.temperature < 1e-6 {
-        let t = argmax(&probs); // greedy over the penalized logits
-        return done(probs, t);
-    }
     if !normalized {
         // Everything filtered out — fall back to greedy over original logits.
         let t = argmax(logits);
@@ -192,6 +192,101 @@ pub fn sample_with_scratch_pool(
     }
     let t = categorical_sample(&probs, rng.next_f32());
     done(probs, t)
+}
+
+/// Greedy over the PENALIZED logits without the working copy: one pass
+/// that applies the repetition / presence penalty and the suppress list
+/// on the fly (a membership table over the vocab, built from the past
+/// tokens) and keeps the argmax with the same tie rule as `argmax`
+/// (highest index among equal maxima). Bit-identical to
+/// `chain` + `argmax` for temperature 0 — the values compared are the
+/// same expressions — and it is what a greedy decode with penalties pays
+/// per token, and what a speculative round pays per draft and per
+/// verified row (nine such passes a round at k=4).
+pub fn argmax_penalized(
+    logits: &[f32],
+    config: &SamplerConfig,
+    past_tokens: &[u32],
+    scratch: &mut SamplerScratch,
+    pool: Option<&crate::pool::Pool>,
+) -> u32 {
+    let n = logits.len();
+    if config.repetition_penalty == 1.0
+        && config.presence_penalty == 0.0
+        && config.suppress_tokens.is_empty()
+    {
+        return argmax(logits);
+    }
+    // Membership: seen_epoch[i] == epoch for past tokens (each once).
+    let epoch = scratch.begin_seen(n);
+    for &tok in past_tokens {
+        let idx = tok as usize;
+        if idx < n {
+            scratch.seen_epoch[idx] = epoch;
+        }
+    }
+    let rep = config.repetition_penalty;
+    let pres = config.presence_penalty;
+    // Suppressed ids get -inf; a second, rarer set — keep it exact.
+    let suppress = &config.suppress_tokens;
+    let seen = &scratch.seen_epoch;
+    let value = |i: usize| -> f32 {
+        let mut v = logits[i];
+        if suppress.iter().any(|&t| t as usize == i) {
+            return f32::NEG_INFINITY;
+        }
+        if seen[i] == epoch {
+            if rep != 1.0 {
+                if v > 0.0 {
+                    v /= rep;
+                } else {
+                    v *= rep;
+                }
+            }
+            if pres != 0.0 {
+                v -= pres;
+            }
+        }
+        v
+    };
+    // The suppress list is scanned per element above; keep that path
+    // serial and rare. The common (no suppress) case runs the pool.
+    let best_in = |s: usize, e: usize| -> (usize, f32) {
+        let mut bi = s;
+        let mut bv = f32::NEG_INFINITY;
+        for i in s..e {
+            let v = value(i);
+            if v >= bv {
+                bv = v;
+                bi = i;
+            }
+        }
+        (bi, bv)
+    };
+    match pool {
+        Some(p) if n >= PAR_MIN && suppress.is_empty() => {
+            let m = std::sync::Mutex::new(Vec::<(usize, f32)>::new());
+            p.run_rows(n, &|s, e| {
+                let r = best_in(s, e);
+                m.lock().unwrap().push(r);
+            });
+            let mut parts = m.into_inner().unwrap();
+            // Same rule across chunks: the max value, and among equal
+            // maxima the HIGHEST index — chunk order does not matter once
+            // sorted by index.
+            parts.sort_by_key(|(i, _)| *i);
+            let mut bi = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (i, v) in parts {
+                if v >= bv {
+                    bv = v;
+                    bi = i;
+                }
+            }
+            bi as u32
+        }
+        _ => best_in(0, n).0 as u32,
+    }
 }
 
 /// The chain up to the draw, into `probs`: penalties, temperature,
@@ -724,6 +819,54 @@ mod tests {
         };
         let mut rng = SplitMix64::new(1);
         assert_eq!(sample(&logits, &config, &[], &mut rng), 1);
+    }
+
+    /// `argmax_penalized` must equal the copy-and-penalize chain's argmax
+    /// — same values, same tie rule — with and without the pool.
+    #[test]
+    fn argmax_penalized_matches_chain_argmax() {
+        let pool = crate::pool::Pool::new(3);
+        let n = 40_000usize;
+        for seed in 0..8u64 {
+            let mut r = SplitMix64::new(seed + 3);
+            // coarse values so ties happen
+            let logits: Vec<f32> = (0..n)
+                .map(|_| ((r.next_u64() % 41) as f32 - 20.0) / 4.0)
+                .collect();
+            let past: Vec<u32> = (0..2000)
+                .map(|_| (r.next_u64() % n as u64) as u32)
+                .collect();
+            for cfg in [
+                SamplerConfig {
+                    temperature: 0.0,
+                    repetition_penalty: 1.1,
+                    ..Default::default()
+                },
+                SamplerConfig {
+                    temperature: 0.0,
+                    repetition_penalty: 1.0,
+                    presence_penalty: 1.5,
+                    ..Default::default()
+                },
+                SamplerConfig {
+                    temperature: 0.0,
+                    repetition_penalty: 1.3,
+                    presence_penalty: 0.7,
+                    suppress_tokens: vec![5, 77, 3000],
+                    ..Default::default()
+                },
+            ] {
+                let mut s1 = SamplerScratch::default();
+                let mut probs = Vec::new();
+                chain(&logits, &cfg, &past, &mut s1, None, &mut probs);
+                let want = argmax(&probs);
+                let mut s2 = SamplerScratch::default();
+                let got_serial = argmax_penalized(&logits, &cfg, &past, &mut s2, None);
+                let got_pool = argmax_penalized(&logits, &cfg, &past, &mut s2, Some(&pool));
+                assert_eq!(want, got_serial, "serial, seed {seed} cfg {cfg:?}");
+                assert_eq!(want, got_pool, "pool, seed {seed} cfg {cfg:?}");
+            }
+        }
     }
 
     /// The pool chain must sample the SAME token as the serial one on the
