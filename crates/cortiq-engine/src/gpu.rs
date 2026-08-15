@@ -191,7 +191,16 @@ fn probe_cache_store(c: OpClass, winner: u8) {
 
 /// Backends: note a one-off cost (weight upload, buffer-cache fill) so
 /// the probe discards this sample.
+/// Every buffer creation anywhere bumps this; the graph's bind-group
+/// cache treats any cold event as total invalidation — a stale bind
+/// group is silent corruption, a cleared cache is one re-encoded token.
+pub fn cold_epoch() -> u64 {
+    COLD_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+static COLD_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn probe_note_cold() {
+    COLD_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     PROBE_COLD.with(|c| c.set(true));
 }
 
