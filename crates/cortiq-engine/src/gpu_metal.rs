@@ -2127,6 +2127,240 @@ kernel void gqa_attend(
 //   barriers and no combine is simply the fastest form here.
 // The pp2048 depth wall therefore stands (deep chunks fall back to the
 // CPU GEMM-attend via the pos0 bound in the pipeline).
+// ── O(1) Nystrom attention: one decode step ──────────────────────────
+// Direct ports of the wgpu o1_far / o1_push / o1_attend kernels — the
+// same products in the same order, so CPU, Vulkan and Metal agree
+// wherever the compiler keeps scalar order (checked by the parity arm).
+// Layouts per group g (head count hpg, landmarks m, window w, sink ns):
+//   meta[g*4] = win_len | win_head | far_len | 0
+//   ring k/v [g][w][d|dv], sink k/v [g][ns][d|dv], k_tilde [g][m][d]
+//   q_tilde [g*hpg+h][m][d], mu [gh][m][m],
+//   mz [gh][2m] (m_max then z_hat), t_hat [gh][m][dv]
+// Params arrive disp()-style: buffers, then uint words, then floats.
+
+// One threadgroup per (group, head, landmark): absorb the window slot
+// being evicted into this head's far accumulators (nystrom far_insert).
+kernel void o1_far(
+    const device uint*  meta  [[buffer(0)]],
+    const device float* rk    [[buffer(1)]],
+    const device float* rv    [[buffer(2)]],
+    const device float* qt    [[buffer(3)]],
+    device float*       mz    [[buffer(4)]],
+    device float*       th    [[buffer(5)]],
+    constant uint&      hpg   [[buffer(6)]],
+    constant uint&      m     [[buffer(7)]],
+    constant uint&      w     [[buffer(8)]],
+    constant uint&      d     [[buffer(9)]],
+    constant uint&      dv    [[buffer(10)]],
+    constant float&     scale [[buffer(11)]],
+    uint wid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup float part[64];
+    threadgroup float sh_rs, sh_e;
+    uint hm = hpg * m;
+    uint g = wid / hm;
+    uint rr = wid % hm;
+    uint h = rr / m;
+    uint i = rr % m;
+    uint len = meta[g * 4u];
+    if (len < w) { return; }
+    uint slot = meta[g * 4u + 1u];
+    uint qb = ((g * hpg + h) * m + i) * d;
+    uint kb = (g * w + slot) * d;
+    float acc = 0.0f;
+    for (uint t = lid; t < d; t += 64u) { acc += qt[qb + t] * rk[kb + t]; }
+    part[lid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) { part[lid] += part[lid + stride]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint mzb = (g * hpg + h) * 2u * m;
+    if (lid == 0u) {
+        float l = part[0] * scale;
+        float mm = mz[mzb + i];
+        float rs = 1.0f;
+        if (l > mm) {
+            rs = exp(mm - l);
+            mz[mzb + m + i] *= rs;
+            mm = l;
+            mz[mzb + i] = l;
+        }
+        float e = exp(l - mm);
+        mz[mzb + m + i] += e;
+        sh_rs = rs;
+        sh_e = e;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rs = sh_rs;
+    float e = sh_e;
+    uint thb = ((g * hpg + h) * m + i) * dv;
+    uint vb = (g * w + slot) * dv;
+    for (uint u = lid; u < dv; u += 64u) {
+        th[thb + u] = th[thb + u] * rs + e * rv[vb + u];
+    }
+}
+
+// One threadgroup per group: push this token's rotated K and V into the
+// window ring (after o1_far has read the slot being overwritten).
+kernel void o1_push(
+    device uint*        meta [[buffer(0)]],
+    const device float* k    [[buffer(1)]],
+    const device float* v    [[buffer(2)]],
+    device float*       rk   [[buffer(3)]],
+    device float*       rv   [[buffer(4)]],
+    constant uint&      w    [[buffer(5)]],
+    constant uint&      d    [[buffer(6)]],
+    constant uint&      dv   [[buffer(7)]],
+    uint g   [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]])
+{
+    uint len = meta[g * 4u];
+    uint head = meta[g * 4u + 1u];
+    uint slot = (len == w) ? head : len;
+    for (uint t = lid; t < d; t += 256u) {
+        rk[(g * w + slot) * d + t] = k[g * d + t];
+    }
+    for (uint t = lid; t < dv; t += 256u) {
+        rv[(g * w + slot) * dv + t] = v[g * dv + t];
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if (lid == 0u) {
+        if (len == w) {
+            meta[g * 4u + 1u] = (head + 1u) % w;
+            meta[g * 4u + 2u] = meta[g * 4u + 2u] + 1u;
+        } else {
+            meta[g * 4u] = len + 1u;
+        }
+    }
+}
+
+// One threadgroup per (group, head): the whole Nystrom step output.
+// Per-score dots run one THREAD per key/landmark (serial over d) — no
+// barriers in the hot part, and the same product order as the CPU's
+// scalar loop. Keys sit in lanes [0, n), landmarks park at 200+ (n is
+// capped at 196 by o1 geometry, m at 32 — always disjoint).
+kernel void o1_attend(
+    const device uint*  meta   [[buffer(0)]],
+    const device float* q      [[buffer(1)]],
+    const device float* rk     [[buffer(2)]],
+    const device float* rv     [[buffer(3)]],
+    const device float* sk     [[buffer(4)]],
+    const device float* sv     [[buffer(5)]],
+    const device float* kt     [[buffer(6)]],
+    const device float* mu     [[buffer(7)]],
+    const device float* mz     [[buffer(8)]],
+    const device float* th     [[buffer(9)]],
+    device float*       outp   [[buffer(10)]],
+    constant uint&      hpg    [[buffer(11)]],
+    constant uint&      m      [[buffer(12)]],
+    constant uint&      w      [[buffer(13)]],
+    constant uint&      nsrect [[buffer(14)]],
+    constant uint&      d      [[buffer(15)]],
+    constant uint&      dv     [[buffer(16)]],
+    constant float&     scale  [[buffer(17)]],
+    uint wid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup float qs[256];
+    threadgroup float scr[160];
+    threadgroup float fs[32];
+    threadgroup float us[32];
+    threadgroup float sc[4]; // [c_all, far_den, den, have_far]
+    uint g = wid / hpg;
+    uint h = wid % hpg;
+    uint ns = nsrect & 0xFFu;
+    bool rect_fm = (nsrect >> 8u) != 0u;
+    uint len = meta[g * 4u];
+    uint farl = meta[g * 4u + 2u];
+    uint n = ns + len;
+    uint gh = g * hpg + h;
+    // q into shared
+    for (uint t = lid; t < d; t += 256u) { qs[t] = q[gh * d + t]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // near scores: thread s owns key s
+    if (lid < n) {
+        float acc = 0.0f;
+        if (lid < ns) {
+            uint kb = (g * ns + lid) * d;
+            for (uint j = 0u; j < d; j++) { acc += qs[j] * sk[kb + j]; }
+        } else {
+            uint kb = (g * w + (lid - ns)) * d;
+            for (uint j = 0u; j < d; j++) { acc += qs[j] * rk[kb + j]; }
+        }
+        scr[lid] = acc * scale;
+    }
+    // landmark scores: thread 200+a owns landmark a
+    if (lid >= 200u && lid < 200u + m && farl > 0u) {
+        uint a = lid - 200u;
+        float acc = 0.0f;
+        uint ktb = (g * m + a) * d;
+        for (uint j = 0u; j < d; j++) { acc += qs[j] * kt[ktb + j]; }
+        fs[a] = acc * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // softmax merge on a single thread — n <= 196, trivial
+    if (lid == 0u) {
+        float c = -3.0e38f;
+        for (uint s = 0u; s < n; s++) { c = max(c, scr[s]); }
+        float c_all = c;
+        float far_den = 0.0f;
+        float have_far = 0.0f;
+        if (farl > 0u) {
+            float f = -3.0e38f;
+            for (uint a = 0u; a < m; a++) { f = max(f, fs[a]); }
+            for (uint a = 0u; a < m; a++) { fs[a] = exp(fs[a] - f); }
+            for (uint b = 0u; b < m; b++) {
+                float uacc = 0.0f;
+                for (uint a = 0u; a < m; a++) {
+                    uacc += fs[a] * mu[(gh * m + a) * m + b];
+                }
+                if (rect_fm) { uacc = max(uacc, 0.0f); }
+                us[b] = uacc;
+            }
+            uint mzb = gh * 2u * m;
+            for (uint b = 0u; b < m; b++) {
+                c_all = max(c_all, f + mz[mzb + b]);
+            }
+            for (uint b = 0u; b < m; b++) {
+                float gain = us[b] * exp(f + mz[mzb + b] - c_all);
+                us[b] = gain;
+                far_den += gain * mz[mzb + m + b];
+            }
+            if (far_den >= 0.0f) { have_far = 1.0f; } else { far_den = 0.0f; }
+        }
+        float den = far_den;
+        for (uint s = 0u; s < n; s++) {
+            float pv = exp(scr[s] - c_all);
+            scr[s] = pv;
+            den += pv;
+        }
+        sc[0] = c_all;
+        sc[1] = far_den;
+        sc[2] = max(den, 1e-30f);
+        sc[3] = have_far;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float den = sc[2];
+    bool have_far = sc[3] > 0.5f;
+    for (uint t = lid; t < dv; t += 256u) {
+        float acc = 0.0f;
+        if (have_far) {
+            for (uint b = 0u; b < m; b++) {
+                acc += us[b] * th[(gh * m + b) * dv + t];
+            }
+        }
+        for (uint s = 0u; s < ns; s++) {
+            acc += scr[s] * sv[(g * ns + s) * dv + t];
+        }
+        for (uint s = ns; s < n; s++) {
+            acc += scr[s] * rv[(g * w + (s - ns)) * dv + t];
+        }
+        outp[gh * dv + t] = acc / den;
+    }
+}
+
 kernel void chunk_attend(
     device const float* q    [[buffer(0)]],   // [nb, nh, hd] post-rope
     device const float* kbuf [[buffer(1)]],
@@ -4247,6 +4481,9 @@ struct Ctx {
     rqkn: ComputePipelineState,
     kvapp: ComputePipelineState,
     gqat: ComputePipelineState,
+    o1far: ComputePipelineState,
+    o1push: ComputePipelineState,
+    o1att: ComputePipelineState,
     cattend: ComputePipelineState,
     rmsrows: ComputePipelineState,
     cropekv: ComputePipelineState,
@@ -4270,7 +4507,7 @@ struct Ctx {
     /// No-copy buffer per model. Retaining the Arc is essential: a Metal
     /// buffer does not own its mmap bytes, and pointer-only cache keys can be
     /// reused after a model is dropped (cross-model data corruption).
-    file_bufs: Mutex<HashMap<usize, (Buffer, Arc<CmfModel>)>>,
+    file_bufs: Mutex<HashMap<usize, (Arc<WeightArena>, Arc<CmfModel>)>>,
     /// row_scale buffer per tensor (key — (stable model identity, idx)).
     rs_bufs: Mutex<HashMap<(usize, usize), Buffer>>,
     /// q8_2f input-channel field buffer per tensor.
@@ -4433,6 +4670,9 @@ fn init() -> Result<Ctx, String> {
     let rqkn = pso("attn_rope_qkn")?;
     let kvapp = pso("kv_append")?;
     let gqat = pso("gqa_attend")?;
+    let o1far = pso("o1_far")?;
+    let o1push = pso("o1_push")?;
+    let o1att = pso("o1_attend")?;
     let cattend = pso("chunk_attend")?;
     let rmsrows = pso("rmsnorm_rows")?;
     let cropekv = pso("chunk_rope_kv")?;
@@ -4502,6 +4742,9 @@ fn init() -> Result<Ctx, String> {
         rqkn,
         kvapp,
         gqat,
+        o1far,
+        o1push,
+        o1att,
         cattend,
         rmsrows,
         cropekv,
@@ -4696,7 +4939,38 @@ fn model_key(model: &Arc<CmfModel>) -> usize {
 /// No-copy buffer over the file mapping. The cache retains the model Arc so
 /// the mmap cannot disappear underneath Metal and its identity cannot be
 /// recycled for another model in the same process.
-fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Buffer, usize)> {
+/// One or more no-copy windows over the file mapping. A single MTLBuffer
+/// is capped at maxBufferLength (13.6 GB on a 24 GB M4), so a larger
+/// model gets overlapping windows every `stride` bytes: whichever window
+/// starts right below a tensor still reaches `stride` bytes past it, so
+/// any tensor up to `stride` long lands whole in `bufs[abs / stride]`.
+/// The windows alias the same pages — views, not copies.
+pub(crate) struct WeightArena {
+    bufs: Vec<Buffer>,
+    stride: usize,
+}
+
+impl WeightArena {
+    fn locate(&self, abs: usize) -> (&Buffer, usize) {
+        if self.bufs.len() == 1 {
+            return (&self.bufs[0], abs);
+        }
+        let i = (abs / self.stride).min(self.bufs.len() - 1);
+        (&self.bufs[i], abs - i * self.stride)
+    }
+    /// Paths that index the arena from the GPU by absolute bases (the
+    /// MoE jobs kernels) have no per-tensor bind to rebase — they must
+    /// refuse the windowed arena and take the per-tensor fallback.
+    pub(crate) fn is_multi(&self) -> bool {
+        self.bufs.len() > 1
+    }
+    fn bind(&self, enc: &metal::ComputeCommandEncoderRef, index: u64, abs: usize) {
+        let (b, rel) = self.locate(abs);
+        enc.set_buffer(index, Some(b), rel as u64);
+    }
+}
+
+fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Arc<WeightArena>, usize)> {
     let bytes = model.primary_bytes();
     let base = bytes.as_ptr() as usize;
     let key = model_key(model);
@@ -4706,31 +4980,46 @@ fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Buffer, usize)> {
     }
     let len = bytes.len() / page * page; // down to the page
     let mut cache = c.file_bufs.lock().unwrap();
-    if let Some((b, _owner)) = cache.get(&key) {
-        return Some((b.clone(), len));
+    if let Some((a, _owner)) = cache.get(&key) {
+        return Some((a.clone(), len));
     }
     crate::gpu::probe_note_cold();
-    // A no-copy buffer over the whole mmap is the point of the UMA path,
-    // but Metal caps a single buffer at maxBufferLength — on a 24 GB M4
-    // an 18 GB model can sit right at that edge, and a nil buffer here
-    // silently demotes every expert to the CPU.
-    let max_len = c._device.max_buffer_length() as usize;
-    if len > max_len {
-        tracing::warn!(
-            "model mmap {} MB exceeds Metal maxBufferLength {} MB — GPU weight path unavailable",
+    let max_len = c._device.max_buffer_length() as usize / page * page;
+    let mk = |off: usize, wlen: usize| -> Buffer {
+        c._device.new_buffer_with_bytes_no_copy(
+            unsafe { bytes.as_ptr().add(off) } as *const std::ffi::c_void,
+            wlen as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        )
+    };
+    let arena = if len <= max_len {
+        WeightArena {
+            bufs: vec![mk(0, len)],
+            stride: len.max(1),
+        }
+    } else {
+        // stride = max/2 caps the addressable tensor at ~6.8 GB on a
+        // 24 GB M4 — two orders above the largest tensor we ship.
+        let stride = (max_len / 2) / page * page;
+        let mut bufs = Vec::new();
+        let mut off = 0usize;
+        while off < len {
+            bufs.push(mk(off, (len - off).min(max_len)));
+            off += stride;
+        }
+        tracing::info!(
+            "model mmap {} MB over Metal maxBufferLength {} MB — {} overlapping windows, stride {} MB",
             len / (1024 * 1024),
-            max_len / (1024 * 1024)
+            max_len / (1024 * 1024),
+            bufs.len(),
+            stride / (1024 * 1024)
         );
-        return None;
-    }
-    let buf = c._device.new_buffer_with_bytes_no_copy(
-        bytes.as_ptr() as *const std::ffi::c_void,
-        len as u64,
-        MTLResourceOptions::StorageModeShared,
-        None,
-    );
-    cache.insert(key, (buf.clone(), Arc::clone(model)));
-    Some((buf, len))
+        WeightArena { bufs, stride }
+    };
+    let arena = Arc::new(arena);
+    cache.insert(key, (arena.clone(), Arc::clone(model)));
+    Some((arena, len))
 }
 
 /// q8_row/q8_2f matvec on the GPU. `xs` — already prescaled activations (the same
@@ -4859,7 +5148,7 @@ fn q8_matvec_range_field(
     let cmd = c.queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
     enc.set_compute_pipeline_state(if col_field.is_some() { &c.q8f } else { &c.q8 });
-    enc.set_buffer(0, Some(&fbuf), abs as u64);
+    fbuf.bind(enc, 0, abs);
     enc.set_buffer(1, Some(&xs_buf), 0);
     enc.set_buffer(2, Some(&rs_buf), 0);
     enc.set_buffer(3, Some(&y_buf), 0);
@@ -4977,7 +5266,7 @@ fn q1_half() -> bool {
 fn encode_q1_matvec(
     c: &Ctx,
     enc: &metal::ComputeCommandEncoderRef,
-    fbuf: &Buffer,
+    fbuf: &WeightArena,
     abs: usize,
     xs: &Buffer,
     y: &Buffer,
@@ -4985,7 +5274,7 @@ fn encode_q1_matvec(
     gpr: usize,
 ) {
     enc.set_compute_pipeline_state(if q1_half() { &c.q1h } else { &c.q1 });
-    enc.set_buffer(0, Some(fbuf), abs as u64);
+    fbuf.bind(enc, 0, abs);
     enc.set_buffer(1, Some(xs), 0);
     enc.set_buffer(2, Some(y), 0);
     let gpr_u = gpr as u32;
@@ -5004,7 +5293,7 @@ fn encode_q1_matvec(
 fn encode_q1t_matvec(
     c: &Ctx,
     enc: &metal::ComputeCommandEncoderRef,
-    fbuf: &Buffer,
+    fbuf: &WeightArena,
     abs: usize,
     xs: &Buffer,
     y: &Buffer,
@@ -5012,7 +5301,7 @@ fn encode_q1t_matvec(
     gpr: usize,
 ) {
     enc.set_compute_pipeline_state(&c.q1t);
-    enc.set_buffer(0, Some(fbuf), abs as u64);
+    fbuf.bind(enc, 0, abs);
     enc.set_buffer(1, Some(xs), 0);
     enc.set_buffer(2, Some(y), 0);
     let gpr_u = gpr as u32;
@@ -5058,7 +5347,7 @@ enum ProjKind {
 fn encode_q4b_matvec(
     c: &Ctx,
     enc: &metal::ComputeCommandEncoderRef,
-    fbuf: &Buffer,
+    fbuf: &WeightArena,
     abs: usize,
     xs: &Buffer,
     y: &Buffer,
@@ -5072,7 +5361,7 @@ fn encode_q4b_matvec(
             .unwrap_or(false)
     });
     enc.set_compute_pipeline_state(if half { &c.q4bh } else { &c.q4b });
-    enc.set_buffer(0, Some(fbuf), abs as u64);
+    fbuf.bind(enc, 0, abs);
     enc.set_buffer(1, Some(xs), 0);
     enc.set_buffer(2, Some(y), 0);
     let gpr_u = gpr as u32;
@@ -5092,7 +5381,7 @@ fn encode_q4b_matvec(
 fn encode_q4t_matvec(
     c: &Ctx,
     enc: &metal::ComputeCommandEncoderRef,
-    fbuf: &Buffer,
+    fbuf: &WeightArena,
     abs: usize,
     xs: &Buffer,
     y: &Buffer,
@@ -5100,7 +5389,7 @@ fn encode_q4t_matvec(
     gpr: usize,
 ) {
     enc.set_compute_pipeline_state(&c.q4t);
-    enc.set_buffer(0, Some(fbuf), abs as u64);
+    fbuf.bind(enc, 0, abs);
     enc.set_buffer(1, Some(xs), 0);
     enc.set_buffer(2, Some(y), 0);
     let gpr_u = gpr as u32;
@@ -5120,7 +5409,7 @@ fn encode_q4t_matvec(
 fn encode_q4tp_matvec(
     c: &Ctx,
     enc: &metal::ComputeCommandEncoderRef,
-    fbuf: &Buffer,
+    fbuf: &WeightArena,
     abs: usize,
     xs: &Buffer,
     y: &Buffer,
@@ -5128,7 +5417,7 @@ fn encode_q4tp_matvec(
     gpr: usize,
 ) {
     enc.set_compute_pipeline_state(&c.q4tp);
-    enc.set_buffer(0, Some(fbuf), abs as u64);
+    fbuf.bind(enc, 0, abs);
     enc.set_buffer(1, Some(xs), 0);
     enc.set_buffer(2, Some(y), 0);
     let gpr_u = gpr as u32;
@@ -5185,7 +5474,7 @@ fn note_weight_bytes(kind: &ProjKind, rows: usize, gpr: usize) {
 fn encode_proj(
     c: &Ctx,
     enc: &metal::ComputeCommandEncoderRef,
-    fbuf: &Buffer,
+    fbuf: &WeightArena,
     abs: usize,
     kind: &ProjKind,
     in_buf: &Buffer,
@@ -5235,7 +5524,7 @@ fn encode_proj(
 fn encode_q8_matvec(
     c: &Ctx,
     enc: &metal::ComputeCommandEncoderRef,
-    fbuf: &Buffer,
+    fbuf: &WeightArena,
     abs: usize,
     rs_buf: &Buffer,
     col_buf: Option<&Buffer>,
@@ -5245,7 +5534,7 @@ fn encode_q8_matvec(
     gpr: usize,
 ) {
     enc.set_compute_pipeline_state(if col_buf.is_some() { &c.q8f } else { &c.q8 });
-    enc.set_buffer(0, Some(fbuf), abs as u64);
+    fbuf.bind(enc, 0, abs);
     enc.set_buffer(1, Some(in_buf), 0);
     enc.set_buffer(2, Some(rs_buf), 0);
     enc.set_buffer(3, Some(out_buf), 0);
@@ -5273,7 +5562,7 @@ fn encode_q8_matvec(
 fn encode_q1t_overlay(
     c: &Ctx,
     enc: &metal::ComputeCommandEncoderRef,
-    fbuf: &Buffer,
+    fbuf: &WeightArena,
     abs: usize,
     xs: &Buffer,
     y: &Buffer,
@@ -5281,7 +5570,7 @@ fn encode_q1t_overlay(
     gpr: usize,
 ) {
     enc.set_compute_pipeline_state(&c.q1t_ov);
-    enc.set_buffer(0, Some(fbuf), abs as u64);
+    fbuf.bind(enc, 0, abs);
     enc.set_buffer(1, Some(xs), 0);
     enc.set_buffer(2, Some(y), 0);
     let base_len = (rows * gpr * Q1T_TILE) as u32;
@@ -5717,7 +6006,7 @@ fn mm_pipeline(c: &Ctx, rows: usize, cols: usize, kind: u8) -> ComputePipelineSt
 fn enc_mul_mm(
     c: &Ctx,
     enc: &metal::ComputeCommandEncoderRef,
-    fbuf: &Buffer,
+    fbuf: &WeightArena,
     abs: usize,
     rs_buf: &Buffer,
     kind: MmKind,
@@ -5737,7 +6026,7 @@ fn enc_mul_mm(
         } else {
             &c.q4tmm
         });
-        enc.set_buffer(0, Some(fbuf), abs as u64);
+        fbuf.bind(enc, 0, abs);
         enc.set_buffer(1, Some(xs), 0);
         enc.set_buffer(2, Some(y), 0);
         enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
@@ -5746,7 +6035,7 @@ fn enc_mul_mm(
     } else {
         let pso = mm_pipeline(c, rows, cols, 0);
         enc.set_compute_pipeline_state(&pso);
-        enc.set_buffer(0, Some(fbuf), abs as u64);
+        fbuf.bind(enc, 0, abs);
         enc.set_buffer(1, Some(xs), 0);
         enc.set_buffer(2, Some(rs_buf), 0);
         enc.set_buffer(3, Some(y), 0);
@@ -5764,7 +6053,7 @@ fn enc_mul_mm(
 fn encode_mul_mm(
     c: &Ctx,
     cmd: &metal::CommandBufferRef,
-    fbuf: &Buffer,
+    fbuf: &WeightArena,
     abs: usize,
     rs_buf: &Buffer,
     kind: MmKind,
@@ -6220,7 +6509,7 @@ pub fn chunk_run_gpu(
     if let (Some((abs, rs_buf, ids_buf)), Some(e)) = (&embed_prep, embed) {
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&c.embedq8);
-        enc.set_buffer(0, Some(&fbuf), *abs as u64);
+        fbuf.bind(enc, 0, *abs);
         enc.set_buffer(1, Some(rs_buf), 0);
         enc.set_buffer(2, Some(ids_buf), 0);
         enc.set_buffer(3, Some(&h_b), 0);
@@ -6527,7 +6816,7 @@ pub fn chunk_run_gpu(
                 } else {
                     &c.q4tmmsilu
                 });
-                enc.set_buffer(0, Some(&fbuf), prep.abs[6] as u64);
+                fbuf.bind(enc, 0, prep.abs[6]);
                 enc.set_buffer(1, Some(&gb), 0);
                 enc.set_buffer(2, Some(&ub), 0);
                 enc.set_buffer(3, Some(&db), 0);
@@ -6535,7 +6824,7 @@ pub fn chunk_run_gpu(
             } else {
                 let pso = mm_pipeline(c, l.down.1, l.down.2, 1);
                 enc.set_compute_pipeline_state(&pso);
-                enc.set_buffer(0, Some(&fbuf), prep.abs[6] as u64);
+                fbuf.bind(enc, 0, prep.abs[6]);
                 enc.set_buffer(1, Some(&gb), 0);
                 enc.set_buffer(2, Some(&ub), 0);
                 enc.set_buffer(3, Some(&prep.rs[6]), 0);
@@ -6681,7 +6970,7 @@ pub fn q8_matmat(
     // Batches wide enough to fill a C-tile take the simdgroup GEMM;
     // narrow ones keep the row-streaming matvec-style kernel.
     enc.set_compute_pipeline_state(if use_mm { &c.q8mmm } else { &c.q8mm });
-    enc.set_buffer(0, Some(&fbuf), abs as u64);
+    fbuf.bind(enc, 0, abs);
     enc.set_buffer(1, Some(&xs_buf), 0);
     enc.set_buffer(2, Some(&rs_buf), 0);
     enc.set_buffer(3, Some(&y_buf), 0);
@@ -6826,7 +7115,7 @@ pub fn q4tp_matmat(
         // C[b, rows] = X · dequant(W)ᵀ, tiles decoded in the K loop.
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&c.q4tpmm);
-        enc.set_buffer(0, Some(&fbuf), abs as u64);
+        fbuf.bind(enc, 0, abs);
         enc.set_buffer(1, Some(&xs_buf), 0);
         enc.set_buffer(2, Some(&y_buf), 0);
         let (cols_u, rows_u, nb_u) = (cols as u32, rows as u32, b as u32);
@@ -6906,7 +7195,7 @@ pub fn q4t_matmat(
         // C[b, rows] = X · dequant(W)ᵀ, tiles decoded in the K loop.
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&c.q4tmm);
-        enc.set_buffer(0, Some(&fbuf), abs as u64);
+        fbuf.bind(enc, 0, abs);
         enc.set_buffer(1, Some(&xs_buf), 0);
         enc.set_buffer(2, Some(&y_buf), 0);
         let (cols_u, rows_u, nb_u) = (cols as u32, rows as u32, b as u32);
@@ -6990,7 +7279,7 @@ pub fn q4tp_ffn(
     let mm = |abs: usize, xb: &Buffer, yb: &Buffer, rows: usize, cols: usize| {
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&c.q4tpmm);
-        enc.set_buffer(0, Some(&fbuf), abs as u64);
+        fbuf.bind(enc, 0, abs);
         enc.set_buffer(1, Some(xb), 0);
         enc.set_buffer(2, Some(yb), 0);
         let (cu, ru, nbu) = (cols as u32, rows as u32, b as u32);
@@ -7083,7 +7372,7 @@ pub fn q4t_ffn(
     let mm = |abs: usize, xb: &Buffer, yb: &Buffer, rows: usize, cols: usize| {
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&c.q4tmm);
-        enc.set_buffer(0, Some(&fbuf), abs as u64);
+        fbuf.bind(enc, 0, abs);
         enc.set_buffer(1, Some(xb), 0);
         enc.set_buffer(2, Some(yb), 0);
         let (cu, ru, nbu) = (cols as u32, rows as u32, b as u32);
@@ -7907,7 +8196,7 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
               rows: usize,
               cols: usize| {
         enc.set_compute_pipeline_state(if a.q4tp { &c.q4tpmm } else { &c.q4tmm });
-        enc.set_buffer(0, Some(&fbuf), abs as u64);
+        fbuf.bind(enc, 0, abs);
         enc.set_buffer(1, Some(xbuf), 0);
         enc.set_buffer(2, Some(ybuf), 0);
         let (cu, ru, nbu) = (u32c(cols), u32c(rows), u32c(n));
@@ -8154,7 +8443,7 @@ pub fn q1t_matmat(
     {
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&c.q1t_mm);
-        enc.set_buffer(0, Some(&fbuf), abs as u64);
+        fbuf.bind(enc, 0, abs);
         enc.set_buffer(1, Some(&xs_buf), 0);
         enc.set_buffer(2, Some(&y_buf), 0);
         enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
@@ -8170,7 +8459,7 @@ pub fn q1t_matmat(
         // Separate encoder → serialized after the GEMM (reads its y).
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&c.q1t_ovmm);
-        enc.set_buffer(0, Some(&fbuf), abs as u64);
+        fbuf.bind(enc, 0, abs);
         enc.set_buffer(1, Some(&xs_buf), 0);
         enc.set_buffer(2, Some(&y_buf), 0);
         let base_len = (rows * gpr * Q1T_TILE) as u32;
@@ -8229,7 +8518,7 @@ fn moe_jobs_batchable(jobs: &[MoeJob]) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn moe_block_jobs_q4tp(
     c: &Ctx,
-    fbuf: &Buffer,
+    fbuf: &WeightArena,
     jobs: &[MoeJob],
     abs3: &[[usize; 3]],
     inter: usize,
@@ -8237,6 +8526,9 @@ fn moe_block_jobs_q4tp(
     out: &mut [f32],
     get_io: &dyn Fn(usize, usize) -> Buffer,
 ) -> Option<()> {
+    if fbuf.is_multi() {
+        return None; // jobs kernels read absolute bases — no rebase
+    }
     let ne = jobs.len();
     let gcols = jobs[0].gate.2;
     let dcols = jobs[0].down.2;
@@ -8287,7 +8579,7 @@ fn moe_block_jobs_q4tp(
                     q2: bool| {
         let tg_per = (rows as u64).div_ceil(sgs * 4);
         enc.set_compute_pipeline_state(if q2 { &c.q2tpjobs } else { &c.q4tpjobs });
-        enc.set_buffer(0, Some(fbuf), 0);
+        enc.set_buffer(0, Some(&fbuf.bufs[0]), 0);
         enc.set_buffer(1, Some(x), 0);
         enc.set_buffer(2, Some(y), 0);
         let gpr_u = (cols / GROUP_SIZE) as u32;
@@ -8540,7 +8832,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
             None => encode_q1_matvec(c, enc, &fbuf, abs, xs, y, rows, cols / GROUP_SIZE),
             Some(rs) => {
                 enc.set_compute_pipeline_state(&c.q8);
-                enc.set_buffer(0, Some(&fbuf), abs as u64);
+                fbuf.bind(enc, 0, abs);
                 enc.set_buffer(1, Some(xs), 0);
                 enc.set_buffer(2, Some(rs), 0);
                 enc.set_buffer(3, Some(y), 0);
@@ -8769,7 +9061,7 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], outs: &mut [&mut [
         } else {
             let rs_b = rs_of(j.idx, j.row_scale);
             enc.set_compute_pipeline_state(&c.q8);
-            enc.set_buffer(0, Some(&fbuf), *abs as u64);
+            fbuf.bind(enc, 0, *abs);
             enc.set_buffer(1, Some(&xs_b), 0);
             enc.set_buffer(2, Some(&rs_b), 0);
             enc.set_buffer(3, Some(&y_b), 0);
@@ -9029,7 +9321,7 @@ unsafe impl Send for KvMirror {}
 pub struct TokenGraph {
     c: &'static Ctx,
     model: Arc<CmfModel>,
-    fbuf: Buffer,
+    fbuf: Arc<WeightArena>,
     safe_len: usize,
     dims: GraphDims,
     cmd: Option<metal::CommandBuffer>,
@@ -9255,6 +9547,9 @@ impl TokenGraph {
                     && [gate, up, down].iter().all(|t| self.proj_abs(**t).is_some())
             }
             MetalFfn::Moe(m) => {
+                if self.fbuf.is_multi() {
+                    return false; // select kernel emits absolute bases
+                }
                 if m.n_exp == 0
                     || m.n_exp > 256
                     || m.top_k == 0
@@ -9892,7 +10187,7 @@ impl TokenGraph {
                 note_weight_bytes(&ProjKind::Q4t, gate.1 + up.1, gate.2 / GROUP_SIZE);
                 let c = self.c;
                 enc.set_compute_pipeline_state(&c.q4t_dual);
-                enc.set_buffer(0, Some(&self.fbuf), ag.0 as u64);
+                self.fbuf.bind(enc, 0, ag.0);
                 enc.set_buffer(1, Some(&self.n_b), 0);
                 enc.set_buffer(2, Some(&fg_b), 0);
                 let gpr_u = (gate.2 / GROUP_SIZE) as u32;
@@ -9900,7 +10195,7 @@ impl TokenGraph {
                 let rows2_u = up.1 as u32;
                 enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
                 enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
-                enc.set_buffer(5, Some(&self.fbuf), au.0 as u64);
+                self.fbuf.bind(enc, 5, au.0);
                 enc.set_buffer(6, Some(&fu_b), 0);
                 enc.set_bytes(7, 4, &rows2_u as *const u32 as *const std::ffi::c_void);
                 let sgs = 8u64;
@@ -9946,7 +10241,7 @@ impl TokenGraph {
             note_weight_bytes(&ProjKind::Q4t, down.1, down.2 / GROUP_SIZE);
             let c = self.c;
             enc.set_compute_pipeline_state(&c.q4t_dsilu);
-            enc.set_buffer(0, Some(&self.fbuf), ad.0 as u64);
+            self.fbuf.bind(enc, 0, ad.0);
             enc.set_buffer(1, Some(&fg_b), 0);
             enc.set_buffer(2, Some(&self.d_b), 0);
             let gpr_u = (down.2 / GROUP_SIZE) as u32;
@@ -10121,7 +10416,7 @@ impl TokenGraph {
                         q2: bool| {
             let tg_per = (rows as u64).div_ceil(sgs * 4);
             enc.set_compute_pipeline_state(if q2 { &c.q2tpjobs } else { &c.q4tpjobs });
-            enc.set_buffer(0, Some(&self.fbuf), 0);
+            enc.set_buffer(0, Some(&self.fbuf.bufs[0]), 0);
             enc.set_buffer(1, Some(x), 0);
             enc.set_buffer(2, Some(y), 0);
             let gpr_u = (cols / GROUP_SIZE) as u32;
