@@ -1211,6 +1211,8 @@ pub fn forward_token_graph(
     // on it, so a layer SPAN (network split segment) shares mirrors with
     // a full-stack run instead of colliding at slot 0.
     layer_base: usize,
+    // Read the final hidden back alongside the fused head's logits.
+    hidden_too: bool,
 ) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
@@ -1241,6 +1243,7 @@ pub fn forward_token_graph(
             ids_out,
             layers_run,
             layer_base,
+            hidden_too,
         ),
         #[allow(unused_variables)]
         _ => {
@@ -1251,6 +1254,7 @@ pub fn forward_token_graph(
                 loop_norm_at,
                 layers_run,
                 layer_base,
+                hidden_too,
             );
             false
         }
