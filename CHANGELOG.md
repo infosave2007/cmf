@@ -31,7 +31,25 @@ aquarium example.
   block + fused head with device attention over the block's own
   mirror, hidden and logits back in one map; the round's accepted
   pairs warm the block as one batched graph run. `CMF_MTP_GRAPH=0`
-  keeps the per-op arm.
+  keeps the per-op arm. Measured, q4tp on the 5090 pod: speculative
+  greedy k=4 **58.7 tok/s** against 52.5 with the per-op draft and a
+  plain 48.1.
+- **Pass merging** on the two graph encoders: a compute-pass boundary
+  costs ~9 µs on this Vulkan stack and a token issued 147 of them, a
+  batched verify ~500; dispatches inside a pass are serialized with
+  memory visibility, so a graph needs a boundary only where the
+  encoder itself is used (copy, timestamp, swap, finish) — those flush
+  it. `CMF_PASS_MERGE=0` reverts.
+- **The batched verify's rows land on the plain token's bits**: the
+  batched matvec now sums a group's four scalar chains first and scales
+  once, the one-vector kernel's expression — 0 of 3000 outputs apart on
+  the RTX 5090 (Metal's fast math keeps a rounding between them, which
+  the test reports rather than asserts). A speculative greedy decode is
+  therefore identical to the plain one on Vulkan.
+- The batch graph's per-row attention (verify, batched prefill) takes
+  the decode/split kernels — it was walking every cached position with
+  the 32-lane per-head kernel; at a 2.3k-token prompt a k=4 verify spent
+  more there than in its matvecs (26 tok/s against a plain 44).
 - **GQA-shared split-K decode attention** (`gqa_attend_gpart`): one
   workgroup per (kv head, 256-position chunk) serves every query head
   of the group, so a K/V row is read once instead of once per query
