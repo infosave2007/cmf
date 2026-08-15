@@ -12163,6 +12163,8 @@ struct Ctx {
     q4tp_mm: wgpu::ComputePipeline,
     q2tp_mm: wgpu::ComputePipeline,
     q4tp_mm_coop: Option<wgpu::ComputePipeline>,
+    /// Same kernel, the scale read from a device buffer (binding 4).
+    q4tp_mm_coop_s: Option<wgpu::ComputePipeline>,
     /// Dequantize-once path: q4tp plane → packed f16, then a pure f16
     /// coop GEMM. Both or neither.
     ffn_silu_packed: wgpu::ComputePipeline,
@@ -13250,6 +13252,11 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let q4tp_mm_coop_f16 = (q4tp_dq_f16.is_some())
         .then(|| mk_coop(COOP_MM_F16_SRC, "q4tp-mm-f16", "q4tp_mm_coop_f16"))
         .flatten();
+    // The device-scale entry point of the in-kernel coop module (the
+    // batched prefill's operands never reach the host).
+    let q4tp_mm_coop_s = (q4tp_mm_coop.is_some())
+        .then(|| mk_coop(COOP_MM_SRC, "q4tp-coop-s", "q4tp_mm_coop_s"))
+        .flatten();
 
     // The bake's f32 forward/backward GEMMs on the same units, guarded the
     // same way: a validation error must cost the pipeline, never the device.
@@ -13632,6 +13639,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mm,
         q2tp_mm,
         q4tp_mm_coop,
+        q4tp_mm_coop_s,
         ffn_silu_packed,
         act_absmax,
         dit_gemm_coop,
@@ -19171,7 +19179,7 @@ pub fn forward_batch_graph(
                     pass.dispatch_workgroups((rows as u32).div_ceil(8).min(MAX_WG), 1, 1);
                 } else if k <= 16 && c.use_mv4 {
                     let _ = encode_q4tp_mv4_b(c, enc, &m.buf, xs, y, rows, cols, k);
-                } else if batch_coop_on() && c.q4tp_mm_coop.is_some() && cols % 32 == 0 {
+                } else if batch_coop_on() && c.q4tp_mm_coop_s.is_some() && cols % 32 == 0 {
                     // Big-chunk prefill on the matrix units: the scalar
                     // tile GEMM holds ~5 TFLOP/s, the cooperative one ~50.
                     // f16 operands, f32 accumulate; the activation scale is
@@ -19191,7 +19199,7 @@ pub fn forward_batch_graph(
                         encode_q4_tile_mm_full(
                             c,
                             enc,
-                            c.q4tp_mm_coop.as_ref().unwrap(),
+                            c.q4tp_mm_coop_s.as_ref().unwrap(),
                             &m.buf,
                             xs,
                             y,
@@ -21551,8 +21559,7 @@ fn tp_matmat_impl(
     // Both cooperative kernels declare the fifth (scale) binding now —
     // the in-kernel one grew it for the batched prefill. The scalar tile
     // GEMMs (q4t, q2tp, and q4tp without cooperative matrices) do not.
-    let coop_in = dq_plane.is_none() && !two_bit && c.q4tp_mm_coop.is_some();
-    if f16_arm || coop_in {
+    if f16_arm {
         entries.push(bind_buf(4, if dev_scale { &asc_buf } else { &dummy_scale }));
     }
     let bind_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -24448,10 +24455,13 @@ fn cm_byte(off: u32) -> u32 {
     return (qmm[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
 }
 
-@compute @workgroup_size(128)
-fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
-                @builtin(local_invocation_index) tid: u32,
-                @builtin(subgroup_id) sg: u32) {
+// Two entry points over one body: `q4tp_mm_coop` (host scale in
+// `pmm.pad`, four bindings — every existing caller) and
+// `q4tp_mm_coop_s` (the scale from the device buffer at binding 4 when
+// pad is the sentinel — the batched prefill's operands never reach the
+// host). wgpu builds the auto layout PER entry point from the bindings
+// it touches, so the first keeps its four-slot layout.
+fn coop_body(wid: vec3<u32>, tid: u32, sg: u32, asc_in: f32) {
     let cols = pmm.cols4 * 4u;
     let gpr = cols >> 5u;
     let m0 = wid.y * 64u;
@@ -24465,7 +24475,6 @@ fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
     var c1: coop_mat16x16<f32, C>;
     var c2: coop_mat16x16<f32, C>;
     var c3: coop_mat16x16<f32, C>;
-    let asc_in = select(bitcast<f32>(pmm.pad), qmm_s[0], pmm.pad == 0xFFFFFFFFu);
     let ainv = select(1.0, asc_in, asc_in > 0.0);
     let aback = select(1.0, 1.0 / asc_in, asc_in > 0.0);
 
@@ -24561,6 +24570,21 @@ fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
             ymm[(m0 + m) * pmm.rows + n0 + n] = cm_c[m * 64u + n] * aback;
         }
     }
+}
+
+@compute @workgroup_size(128)
+fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) tid: u32,
+                @builtin(subgroup_id) sg: u32) {
+    coop_body(wid, tid, sg, bitcast<f32>(pmm.pad));
+}
+
+@compute @workgroup_size(128)
+fn q4tp_mm_coop_s(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(local_invocation_index) tid: u32,
+                  @builtin(subgroup_id) sg: u32) {
+    let asc = select(bitcast<f32>(pmm.pad), qmm_s[0], pmm.pad == 0xFFFFFFFFu);
+    coop_body(wid, tid, sg, asc);
 }
 "#;
 
@@ -26021,7 +26045,7 @@ fn encode_q4_tile_mm_full(
     // compared by their entry count instead: the coop layouts have five
     // bindings, the scalar tile GEMMs four.
     let coop_kernel = c
-        .q4tp_mm_coop
+        .q4tp_mm_coop_s
         .as_ref()
         .map(|p| std::ptr::eq(p, pipeline))
         .unwrap_or(false)
