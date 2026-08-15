@@ -1737,17 +1737,19 @@ impl Pipeline {
         // rides `gdn_spec_restore` and a batched frame whose numerics
         // are the batch kernels', and that has to be shown on more than
         // one architecture before every greedy decode takes it.
-        // Greedy without penalties verifies by argmax equality; every other
-        // sampler configuration goes through speculative SAMPLING (draft
-        // from the MTP head's own post-chain distribution, accept with
-        // min(1, p/q), correct from max(0, p − q)) — the emitted stream is
-        // distributed exactly as the plain sampler's. `CMF_GRAPH_SPEC_SAMPLE=0`
-        // keeps the sampled configurations on the plain path.
-        let spec_sampling_ok = (self.sampler_config.temperature < 1e-6
-            && self.sampler_config.repetition_penalty == 1.0
-            && self.sampler_config.presence_penalty == 0.0
-            && self.sampler_config.suppress_tokens.is_empty())
-            || std::env::var("CMF_GRAPH_SPEC_SAMPLE").as_deref() != Ok("0");
+        // Greedy (with or without penalties) verifies by argmax equality.
+        // Sampling (temperature > 0) can go through speculative SAMPLING —
+        // draft from the MTP head's own post-chain distribution, accept
+        // with min(1, p/q), correct from max(0, p − q); the emitted stream
+        // is distributed exactly as the plain sampler's — but it is
+        // OPT-IN (`CMF_GRAPH_SPEC_SAMPLE=1`): measured on Qwen3.8-27B /
+        // RTX 5090 at the instruct row (0.7 / 0.80 / 20 / presence 1.5)
+        // it decoded 19-22 tok/s against a plain 40 — nine post-chain
+        // distributions a round plus a lower acceptance than greedy's,
+        // against a verify that costs 2.7 single tokens. The greedy arms
+        // pay +10%; the sampling arm needs a cheaper verify first.
+        let spec_sampling_ok = self.sampler_config.temperature < 1e-6
+            || std::env::var("CMF_GRAPH_SPEC_SAMPLE").as_deref() == Ok("1");
         let graph_spec = self.speculative
             && graph_on
             && self.mtp.is_some()
