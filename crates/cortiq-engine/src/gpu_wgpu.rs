@@ -4260,6 +4260,14 @@ fn q4tp_matvec4_bk(@builtin(workgroup_id) wid: vec3<u32>,
 // unpack and multiply, which is right for ONE activation vector and
 // wrong for a batch: it redoes the shift/mask/convert/bias per nibble
 // for every element. Split, the unpack is paid once.
+// `q4v_dot8` over ALREADY-unpacked nibbles: the same eight products
+// summed left to right, so a kernel that unpacks once for a batch can
+// still land on the one-vector kernel's bits.
+fn q4v_d8u(lo: vec4<f32>, hi: vec4<f32>, a: vec4<f32>, b: vec4<f32>) -> f32 {
+    return lo.x * a.x + lo.y * a.y + lo.z * a.z + lo.w * a.w
+         + hi.x * b.x + hi.y * b.y + hi.z * b.z + hi.w * b.w;
+}
+
 fn q4v_lo4(w: u32) -> vec4<f32> {
     return vec4<f32>(f32(w & 0xFu), f32((w >> 4u) & 0xFu),
                      f32((w >> 8u) & 0xFu), f32((w >> 12u) & 0xFu)) - vec4<f32>(8.0);
@@ -4395,6 +4403,17 @@ fn q4tp_matvec4_bku(@builtin(workgroup_id) wid: vec3<u32>,
                     v3 = q4v_w[r3 * gpr + g];
                     s3 = lad_q4w[384u + (sub << 5u) + ((cv >> sh) & 31u)];
                 }
+                // Per (row, element) the group's four u32 words are summed
+                // FIRST — each word through the one-vector kernel's scalar
+                // chain (`q4v_d8u` == `q4v_dot8` term for term) and the four
+                // words left to right — and only then scaled once into the
+                // accumulator: `acc += s * (d0 + d1 + d2 + d3)`, exactly
+                // `q4tp_matvec16w`'s expression. It used to scale and add
+                // per word with vec4 `dot`, which is a different rounding
+                // and made a speculative verify's row disagree with the
+                // plain token's on near-ties. Bit-identical now (tested).
+                var t0 = vec4<f32>(0.0); var t1 = vec4<f32>(0.0);
+                var t2 = vec4<f32>(0.0); var t3 = vec4<f32>(0.0);
                 var j = 0u;
                 loop {
                     if (j >= 4u) { break; }
@@ -4410,37 +4429,41 @@ fn q4tp_matvec4_bku(@builtin(workgroup_id) wid: vec3<u32>,
                     {
                         let x0q = xj + gpr * 8u * cbase;
                         let xa = q4v_x[x0q]; let xb = q4v_x[x0q + 1u];
-                        acc0.x = acc0.x + s0 * (dot(a0, xa) + dot(b0, xb));
-                        acc1.x = acc1.x + s1 * (dot(a1, xa) + dot(b1, xb));
-                        acc2.x = acc2.x + s2 * (dot(a2, xa) + dot(b2, xb));
-                        acc3.x = acc3.x + s3 * (dot(a3, xa) + dot(b3, xb));
+                        t0.x = t0.x + q4v_d8u(a0, b0, xa, xb);
+                        t1.x = t1.x + q4v_d8u(a1, b1, xa, xb);
+                        t2.x = t2.x + q4v_d8u(a2, b2, xa, xb);
+                        t3.x = t3.x + q4v_d8u(a3, b3, xa, xb);
                     }
                     if (cbase + 1u < nb) {
                         let xq = xj + gpr * 8u * (cbase + 1u);
                         let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
-                        acc0.y = acc0.y + s0 * (dot(a0, xa) + dot(b0, xb));
-                        acc1.y = acc1.y + s1 * (dot(a1, xa) + dot(b1, xb));
-                        acc2.y = acc2.y + s2 * (dot(a2, xa) + dot(b2, xb));
-                        acc3.y = acc3.y + s3 * (dot(a3, xa) + dot(b3, xb));
+                        t0.y = t0.y + q4v_d8u(a0, b0, xa, xb);
+                        t1.y = t1.y + q4v_d8u(a1, b1, xa, xb);
+                        t2.y = t2.y + q4v_d8u(a2, b2, xa, xb);
+                        t3.y = t3.y + q4v_d8u(a3, b3, xa, xb);
                     }
                     if (cbase + 2u < nb) {
                         let xq = xj + gpr * 8u * (cbase + 2u);
                         let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
-                        acc0.z = acc0.z + s0 * (dot(a0, xa) + dot(b0, xb));
-                        acc1.z = acc1.z + s1 * (dot(a1, xa) + dot(b1, xb));
-                        acc2.z = acc2.z + s2 * (dot(a2, xa) + dot(b2, xb));
-                        acc3.z = acc3.z + s3 * (dot(a3, xa) + dot(b3, xb));
+                        t0.z = t0.z + q4v_d8u(a0, b0, xa, xb);
+                        t1.z = t1.z + q4v_d8u(a1, b1, xa, xb);
+                        t2.z = t2.z + q4v_d8u(a2, b2, xa, xb);
+                        t3.z = t3.z + q4v_d8u(a3, b3, xa, xb);
                     }
                     if (cbase + 3u < nb) {
                         let xq = xj + gpr * 8u * (cbase + 3u);
                         let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
-                        acc0.w = acc0.w + s0 * (dot(a0, xa) + dot(b0, xb));
-                        acc1.w = acc1.w + s1 * (dot(a1, xa) + dot(b1, xb));
-                        acc2.w = acc2.w + s2 * (dot(a2, xa) + dot(b2, xb));
-                        acc3.w = acc3.w + s3 * (dot(a3, xa) + dot(b3, xb));
+                        t0.w = t0.w + q4v_d8u(a0, b0, xa, xb);
+                        t1.w = t1.w + q4v_d8u(a1, b1, xa, xb);
+                        t2.w = t2.w + q4v_d8u(a2, b2, xa, xb);
+                        t3.w = t3.w + q4v_d8u(a3, b3, xa, xb);
                     }
                     j = j + 1u;
                 }
+                acc0 = acc0 + s0 * t0;
+                acc1 = acc1 + s1 * t1;
+                acc2 = acc2 + s2 * t2;
+                acc3 = acc3 + s3 * t3;
                 g = g + 64u;
             }
         }
@@ -4572,6 +4595,17 @@ fn q4tp_matvec4_bku_x2(@builtin(workgroup_id) wid: vec3<u32>,
                     v3 = q4v_w[r3 * gpr + g];
                     s3 = lad_q4w[384u + (sub << 5u) + ((cv >> sh) & 31u)];
                 }
+                // Per (row, element) the group's four u32 words are summed
+                // FIRST — each word through the one-vector kernel's scalar
+                // chain (`q4v_d8u` == `q4v_dot8` term for term) and the four
+                // words left to right — and only then scaled once into the
+                // accumulator: `acc += s * (d0 + d1 + d2 + d3)`, exactly
+                // `q4tp_matvec16w`'s expression. It used to scale and add
+                // per word with vec4 `dot`, which is a different rounding
+                // and made a speculative verify's row disagree with the
+                // plain token's on near-ties. Bit-identical now (tested).
+                var t0 = vec4<f32>(0.0); var t1 = vec4<f32>(0.0);
+                var t2 = vec4<f32>(0.0); var t3 = vec4<f32>(0.0);
                 var j = 0u;
                 loop {
                     if (j >= 4u) { break; }
@@ -4587,37 +4621,41 @@ fn q4tp_matvec4_bku_x2(@builtin(workgroup_id) wid: vec3<u32>,
                     {
                         let x0q = xj + gpr * 8u * cbase;
                         let xa = q4v_x[x0q]; let xb = q4v_x[x0q + 1u];
-                        acc0.x = acc0.x + s0 * (dot(a0, xa) + dot(b0, xb));
-                        acc1.x = acc1.x + s1 * (dot(a1, xa) + dot(b1, xb));
-                        acc2.x = acc2.x + s2 * (dot(a2, xa) + dot(b2, xb));
-                        acc3.x = acc3.x + s3 * (dot(a3, xa) + dot(b3, xb));
+                        t0.x = t0.x + q4v_d8u(a0, b0, xa, xb);
+                        t1.x = t1.x + q4v_d8u(a1, b1, xa, xb);
+                        t2.x = t2.x + q4v_d8u(a2, b2, xa, xb);
+                        t3.x = t3.x + q4v_d8u(a3, b3, xa, xb);
                     }
                     if (cbase + 1u < nb) {
                         let xq = xj + gpr * 8u * (cbase + 1u);
                         let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
-                        acc0.y = acc0.y + s0 * (dot(a0, xa) + dot(b0, xb));
-                        acc1.y = acc1.y + s1 * (dot(a1, xa) + dot(b1, xb));
-                        acc2.y = acc2.y + s2 * (dot(a2, xa) + dot(b2, xb));
-                        acc3.y = acc3.y + s3 * (dot(a3, xa) + dot(b3, xb));
+                        t0.y = t0.y + q4v_d8u(a0, b0, xa, xb);
+                        t1.y = t1.y + q4v_d8u(a1, b1, xa, xb);
+                        t2.y = t2.y + q4v_d8u(a2, b2, xa, xb);
+                        t3.y = t3.y + q4v_d8u(a3, b3, xa, xb);
                     }
                     if (cbase + 2u < nb) {
                         let xq = xj + gpr * 8u * (cbase + 2u);
                         let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
-                        acc0.z = acc0.z + s0 * (dot(a0, xa) + dot(b0, xb));
-                        acc1.z = acc1.z + s1 * (dot(a1, xa) + dot(b1, xb));
-                        acc2.z = acc2.z + s2 * (dot(a2, xa) + dot(b2, xb));
-                        acc3.z = acc3.z + s3 * (dot(a3, xa) + dot(b3, xb));
+                        t0.z = t0.z + q4v_d8u(a0, b0, xa, xb);
+                        t1.z = t1.z + q4v_d8u(a1, b1, xa, xb);
+                        t2.z = t2.z + q4v_d8u(a2, b2, xa, xb);
+                        t3.z = t3.z + q4v_d8u(a3, b3, xa, xb);
                     }
                     if (cbase + 3u < nb) {
                         let xq = xj + gpr * 8u * (cbase + 3u);
                         let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
-                        acc0.w = acc0.w + s0 * (dot(a0, xa) + dot(b0, xb));
-                        acc1.w = acc1.w + s1 * (dot(a1, xa) + dot(b1, xb));
-                        acc2.w = acc2.w + s2 * (dot(a2, xa) + dot(b2, xb));
-                        acc3.w = acc3.w + s3 * (dot(a3, xa) + dot(b3, xb));
+                        t0.w = t0.w + q4v_d8u(a0, b0, xa, xb);
+                        t1.w = t1.w + q4v_d8u(a1, b1, xa, xb);
+                        t2.w = t2.w + q4v_d8u(a2, b2, xa, xb);
+                        t3.w = t3.w + q4v_d8u(a3, b3, xa, xb);
                     }
                     j = j + 1u;
                 }
+                acc0 = acc0 + s0 * t0;
+                acc1 = acc1 + s1 * t1;
+                acc2 = acc2 + s2 * t2;
+                acc3 = acc3 + s3 * t3;
                 g = g + 64u;
             }
         }
@@ -4720,6 +4758,17 @@ fn q4tp_matvec4_bku_x2(@builtin(workgroup_id) wid: vec3<u32>,
                     v3 = q4v_w2[r3 * gpr + g];
                     s3 = lad_q4w[384u + (sub << 5u) + ((cv >> sh) & 31u)];
                 }
+                // Per (row, element) the group's four u32 words are summed
+                // FIRST — each word through the one-vector kernel's scalar
+                // chain (`q4v_d8u` == `q4v_dot8` term for term) and the four
+                // words left to right — and only then scaled once into the
+                // accumulator: `acc += s * (d0 + d1 + d2 + d3)`, exactly
+                // `q4tp_matvec16w`'s expression. It used to scale and add
+                // per word with vec4 `dot`, which is a different rounding
+                // and made a speculative verify's row disagree with the
+                // plain token's on near-ties. Bit-identical now (tested).
+                var t0 = vec4<f32>(0.0); var t1 = vec4<f32>(0.0);
+                var t2 = vec4<f32>(0.0); var t3 = vec4<f32>(0.0);
                 var j = 0u;
                 loop {
                     if (j >= 4u) { break; }
@@ -4735,37 +4784,41 @@ fn q4tp_matvec4_bku_x2(@builtin(workgroup_id) wid: vec3<u32>,
                     {
                         let x0q = xj + gpr * 8u * cbase;
                         let xa = q4v_x[x0q]; let xb = q4v_x[x0q + 1u];
-                        acc0.x = acc0.x + s0 * (dot(a0, xa) + dot(b0, xb));
-                        acc1.x = acc1.x + s1 * (dot(a1, xa) + dot(b1, xb));
-                        acc2.x = acc2.x + s2 * (dot(a2, xa) + dot(b2, xb));
-                        acc3.x = acc3.x + s3 * (dot(a3, xa) + dot(b3, xb));
+                        t0.x = t0.x + q4v_d8u(a0, b0, xa, xb);
+                        t1.x = t1.x + q4v_d8u(a1, b1, xa, xb);
+                        t2.x = t2.x + q4v_d8u(a2, b2, xa, xb);
+                        t3.x = t3.x + q4v_d8u(a3, b3, xa, xb);
                     }
                     if (cbase + 1u < nb) {
                         let xq = xj + gpr * 8u * (cbase + 1u);
                         let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
-                        acc0.y = acc0.y + s0 * (dot(a0, xa) + dot(b0, xb));
-                        acc1.y = acc1.y + s1 * (dot(a1, xa) + dot(b1, xb));
-                        acc2.y = acc2.y + s2 * (dot(a2, xa) + dot(b2, xb));
-                        acc3.y = acc3.y + s3 * (dot(a3, xa) + dot(b3, xb));
+                        t0.y = t0.y + q4v_d8u(a0, b0, xa, xb);
+                        t1.y = t1.y + q4v_d8u(a1, b1, xa, xb);
+                        t2.y = t2.y + q4v_d8u(a2, b2, xa, xb);
+                        t3.y = t3.y + q4v_d8u(a3, b3, xa, xb);
                     }
                     if (cbase + 2u < nb) {
                         let xq = xj + gpr * 8u * (cbase + 2u);
                         let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
-                        acc0.z = acc0.z + s0 * (dot(a0, xa) + dot(b0, xb));
-                        acc1.z = acc1.z + s1 * (dot(a1, xa) + dot(b1, xb));
-                        acc2.z = acc2.z + s2 * (dot(a2, xa) + dot(b2, xb));
-                        acc3.z = acc3.z + s3 * (dot(a3, xa) + dot(b3, xb));
+                        t0.z = t0.z + q4v_d8u(a0, b0, xa, xb);
+                        t1.z = t1.z + q4v_d8u(a1, b1, xa, xb);
+                        t2.z = t2.z + q4v_d8u(a2, b2, xa, xb);
+                        t3.z = t3.z + q4v_d8u(a3, b3, xa, xb);
                     }
                     if (cbase + 3u < nb) {
                         let xq = xj + gpr * 8u * (cbase + 3u);
                         let xa = q4v_x[xq]; let xb = q4v_x[xq + 1u];
-                        acc0.w = acc0.w + s0 * (dot(a0, xa) + dot(b0, xb));
-                        acc1.w = acc1.w + s1 * (dot(a1, xa) + dot(b1, xb));
-                        acc2.w = acc2.w + s2 * (dot(a2, xa) + dot(b2, xb));
-                        acc3.w = acc3.w + s3 * (dot(a3, xa) + dot(b3, xb));
+                        t0.w = t0.w + q4v_d8u(a0, b0, xa, xb);
+                        t1.w = t1.w + q4v_d8u(a1, b1, xa, xb);
+                        t2.w = t2.w + q4v_d8u(a2, b2, xa, xb);
+                        t3.w = t3.w + q4v_d8u(a3, b3, xa, xb);
                     }
                     j = j + 1u;
                 }
+                acc0 = acc0 + s0 * t0;
+                acc1 = acc1 + s1 * t1;
+                acc2 = acc2 + s2 * t2;
+                acc3 = acc3 + s3 * t3;
                 g = g + 64u;
             }
         }
@@ -28845,6 +28898,125 @@ fn main() {
             mism, 0,
             "{mism} of {n} outputs differ between the x2 kernel and two singles"
         );
+    }
+
+    /// The batched kernel's rows against the one-vector kernel, element
+    /// by element — the verify must land on the plain token's bits.
+    #[test]
+    fn wgpu_q4tp_matvec4_bku_matches_single_bits() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        if c.use_mv_bk < 2 {
+            eprintln!("bku arm off — skipping");
+            return;
+        }
+        let (rows, cols, batch) = (1000usize, 4096usize, 3usize);
+        let total =
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+                .unwrap();
+        let (params_off, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+        let mut wb: Vec<u8> = (0..total).map(|i| ((i * 37 + 5) % 251) as u8).collect();
+        let lo = cortiq_core::quant::f32_to_f16(-4.0);
+        let step = cortiq_core::quant::f32_to_f16(0.1);
+        for r in 0..rows {
+            let o = params_off + r * 4;
+            wb[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+            wb[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+        }
+        let xs: Vec<f32> = (0..batch * cols)
+            .map(|i| ((i % 97) as f32 - 48.0) / 48.0 + (i / cols) as f32 * 0.01)
+            .collect();
+        let mk = |bytes: &[u8]| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let wbuf = mk(&wb);
+        let xall = mk(bytemuck::cast_slice(&xs));
+        let out = |n: usize| {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (n * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let yb = out(batch * rows);
+        let mut singles = Vec::new();
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        assert!(encode_q4tp_mv4_b(
+            c, &mut enc, &wbuf, &xall, &yb, rows, cols, batch
+        ));
+        for e in 0..batch {
+            let xe = mk(bytemuck::cast_slice(&xs[e * cols..(e + 1) * cols]));
+            let ye = out(rows);
+            encode_q4tp_mv4(c, &mut enc, &wbuf, &xe, &ye, rows, cols);
+            singles.push((xe, ye));
+        }
+        let n = batch * rows;
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (2 * n * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        enc.copy_buffer_to_buffer(&yb, 0, &stage, 0, (n * 4) as u64);
+        for (e, (_, ye)) in singles.iter().enumerate() {
+            enc.copy_buffer_to_buffer(
+                ye,
+                0,
+                &stage,
+                ((n + e * rows) * 4) as u64,
+                (rows * 4) as u64,
+            );
+        }
+        submit(c, finish_enc(enc));
+        let slice = stage.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range().expect("map");
+        let all: &[f32] = bytemuck::cast_slice(&data);
+        let (b, sgl) = all.split_at(n);
+        let mism = b
+            .iter()
+            .zip(sgl)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        let nz = sgl.iter().filter(|v| **v != 0.0).count();
+        drop(data);
+        stage.unmap();
+        assert!(nz > n / 2, "singles mostly zero — harness wrong");
+        // Metal compiles WGSL with fast math (contraction AND
+        // reassociation), so the two kernels' bits are not comparable
+        // there; on Vulkan they must agree exactly.
+        if cfg!(target_os = "macos") {
+            let (mut num, mut den) = (0f64, 0f64);
+            for (x, y) in b.iter().zip(sgl) {
+                num += ((x - y) as f64).powi(2);
+                den += (*y as f64).powi(2);
+            }
+            let rel = (num / den.max(1e-30)).sqrt();
+            eprintln!(
+                "bku vs single on Metal: {mism} of {n} bits differ, rel rms {rel:.2e} (fast math)"
+            );
+            assert!(
+                rel < 1e-5,
+                "batched drifted from the one-vector kernel: rel rms {rel:.2e}"
+            );
+        } else {
+            assert_eq!(
+                mism, 0,
+                "{mism} of {n} batched outputs differ from the one-vector kernel"
+            );
+        }
     }
 
     /// The batched two-weight kernel against two batched singles (bku
