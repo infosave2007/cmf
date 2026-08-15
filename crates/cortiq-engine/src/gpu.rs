@@ -2542,3 +2542,15 @@ pub fn stageprof(stage: u32, dt: std::time::Duration) {
         }
     }
 }
+
+
+/// Active weight bytes dispatched so far (Metal decode path); 0 where
+/// the backend does not count. The honest floor's numerator.
+pub fn weight_bytes_dispatched() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        return crate::gpu_metal::WEIGHT_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    #[allow(unreachable_code)]
+    0
+}
