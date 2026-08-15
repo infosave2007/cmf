@@ -1216,12 +1216,15 @@ pub(crate) mod prof {
                 if an > 0 {
                     let g = |i: usize| {
                         crate::gpu_wgpu::ATT_GPU_NS[i].load(Ordering::Relaxed) as f64
-                            / 1e6 / an as f64
+                            / 1e6
+                            / an as f64
                     };
                     eprintln!(
                         "[dsv4-профиль]   ВНИМАНИЕ НА КАРТЕ на вызов: одиночное {:.3} мс, \
                          оценки {:.3} мс, применение {:.3} мс",
-                        g(0), g(1), g(2),
+                        g(0),
+                        g(1),
+                        g(2),
                     );
                 }
                 let gn = crate::gpu_wgpu::MOE_GPU_N.load(Ordering::Relaxed);
@@ -1346,13 +1349,7 @@ fn attn_frame(
     // exactly the kind of state that drifts silently and shows up as a model
     // that stops early. Not worth carrying for zero.
     if n_comp > 0
-        && !crate::gpu_wgpu::dsv4_cache_write(
-            kv_id,
-            li,
-            cfg.window * hd,
-            &st.compressed[li],
-            cap,
-        )
+        && !crate::gpu_wgpu::dsv4_cache_write(kv_id, li, cfg.window * hd, &st.compressed[li], cap)
     {
         return false;
     }
@@ -1393,7 +1390,18 @@ fn attn_frame(
     // to split a layer). The host has the exact vector either way; one
     // hidden-width upload per call is what correctness costs.
     crate::gpu_wgpu::dsv4_attn_frame(
-        &model, &w, g, hidden, Some(qn), kv_id, li, &idx32, inv_freq, pos, hc, out,
+        &model,
+        &w,
+        g,
+        hidden,
+        Some(qn),
+        kv_id,
+        li,
+        &idx32,
+        inv_freq,
+        pos,
+        hc,
+        out,
     )
 }
 
@@ -1460,12 +1468,15 @@ pub fn attention_step(
     // partial layer keeps device attention everywhere — the canonical
     // stand and the MAX_LI ladder both measure that bit-exact.
     let split_config = st.partial_set.iter().any(|&p| p) && st.split_deep;
-    let past_chain = st.dev_owned
-        && (li >= st.dev_set.len() || !st.dev_set.get(li).copied().unwrap_or(false));
+    let past_chain =
+        st.dev_owned && (li >= st.dev_set.len() || !st.dev_set.get(li).copied().unwrap_or(false));
     if std::env::var("CMF_DSV4_GATE_DBG").is_ok() {
         eprintln!(
             "[gate] li={li} pos={} split={split_config} past={past_chain} dev_owned={} set_len={} part_len={}",
-            st.pos, st.dev_owned, st.dev_set.len(), st.partial_set.len()
+            st.pos,
+            st.dev_owned,
+            st.dev_set.len(),
+            st.partial_set.len()
         );
     }
     let on_gpu = gpu_attn_enabled() && !(split_config && past_chain);
@@ -1739,7 +1750,10 @@ pub fn take_route_counts() -> Vec<Vec<u64>> {
 /// Charge elapsed time to a counter when it goes out of scope — the two
 /// steps have several early returns each, and a timer that only stops on the
 /// long path measures the short one as free.
-struct Charge(Option<std::time::Instant>, &'static std::sync::atomic::AtomicU64);
+struct Charge(
+    Option<std::time::Instant>,
+    &'static std::sync::atomic::AtomicU64,
+);
 impl Drop for Charge {
     fn drop(&mut self) {
         if let Some(t) = self.0 {
@@ -1946,8 +1960,7 @@ fn dsv4_layer_loop(
         cfg,
         pool,
     );
-    if !crate::gpu_wgpu::dsv4_state_write(state)
-        || !crate::gpu_wgpu::dsv4_hc_write(&post0, &comb0)
+    if !crate::gpu_wgpu::dsv4_state_write(state) || !crate::gpu_wgpu::dsv4_hc_write(&post0, &comb0)
     {
         return false;
     }
@@ -2023,8 +2036,18 @@ fn dsv4_layer_loop(
                 let need_qn = run[0] == 0 || !on_dev[run[0] - 1];
                 let captured = *run.last().unwrap();
                 if !dsv4_chain_run(
-                    layers, &run, cfg, g, st, token_id, &mut folded,
-                    Some(state), 1, &[], need_qn, pool,
+                    layers,
+                    &run,
+                    cfg,
+                    g,
+                    st,
+                    token_id,
+                    &mut folded,
+                    Some(state),
+                    1,
+                    &[],
+                    need_qn,
+                    pool,
                 ) {
                     return false;
                 }
@@ -2309,8 +2332,18 @@ fn dsv4_layer_loop(
             let carry = last_on_dev && run.last() == Some(&(layers.len() - 1));
             let ok = if carry {
                 let r = dsv4_chain_run(
-                    layers, &run, cfg, g, st, token_id, &mut folded,
-                    Some(state), 1, &[], need_qn, pool,
+                    layers,
+                    &run,
+                    cfg,
+                    g,
+                    st,
+                    token_id,
+                    &mut folded,
+                    Some(state),
+                    1,
+                    &[],
+                    need_qn,
+                    pool,
                 );
                 state_home = r;
                 state_on_host = r;
@@ -2320,7 +2353,18 @@ fn dsv4_layer_loop(
                 r
             } else {
                 let r = dsv4_chain_run(
-                    layers, &run, cfg, g, st, token_id, &mut folded, None, 1, &[], need_qn, pool,
+                    layers,
+                    &run,
+                    cfg,
+                    g,
+                    st,
+                    token_id,
+                    &mut folded,
+                    None,
+                    1,
+                    &[],
+                    need_qn,
+                    pool,
                 );
                 if r {
                     state_on_host = false;
@@ -2556,7 +2600,11 @@ fn host_cpu_moe() -> bool {
 
 fn chain_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_DSV4_CHAIN").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| {
+        std::env::var("CMF_DSV4_CHAIN")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 /// Encode a maximal run of consecutive device-capable layers and submit it
@@ -2638,7 +2686,11 @@ fn dsv4_chain_run(
                 .into_iter()
                 .map(|gi| pk.to_slot[gi])
                 .collect();
-            if v.iter().any(|&x| x == usize::MAX) { None } else { Some(v) }
+            if v.iter().any(|&x| x == usize::MAX) {
+                None
+            } else {
+                Some(v)
+            }
         });
         if layers[li].tid2eid.is_some() && forced.is_none() {
             return false;
@@ -2667,7 +2719,12 @@ fn dsv4_chain_run(
                     return false;
                 };
                 Some((
-                    crate::gpu_wgpu::Dsv4CompW { wkv: a, wgate: b, norm: &cp.norm, ape: &cp.ape },
+                    crate::gpu_wgpu::Dsv4CompW {
+                        wkv: a,
+                        wgate: b,
+                        norm: &cp.norm,
+                        ape: &cp.ape,
+                    },
                     crate::gpu_wgpu::Dsv4CompGeom {
                         width: cp.wkv.rows(),
                         hidden: dim,
@@ -2693,7 +2750,12 @@ fn dsv4_chain_run(
                 };
                 let ih = ixr.weights_proj.rows();
                 Some((
-                    crate::gpu_wgpu::Dsv4CompW { wkv: a, wgate: b, norm: &cp.norm, ape: &cp.ape },
+                    crate::gpu_wgpu::Dsv4CompW {
+                        wkv: a,
+                        wgate: b,
+                        norm: &cp.norm,
+                        ape: &cp.ape,
+                    },
                     crate::gpu_wgpu::Dsv4CompGeom {
                         width: cp.wkv.rows(),
                         hidden: dim,
@@ -2702,7 +2764,10 @@ fn dsv4_chain_run(
                         rope_dim: cfg.rope_head_dim,
                         eps: cfg.norm_eps,
                     },
-                    crate::gpu_wgpu::Dsv4IxW { wq_b: qb, weights_proj: wp },
+                    crate::gpu_wgpu::Dsv4IxW {
+                        wq_b: qb,
+                        weights_proj: wp,
+                    },
                     crate::gpu_wgpu::Dsv4IxGeom {
                         ih,
                         idim: ixr.wq_b.rows() / ih.max(1),
@@ -2720,23 +2785,34 @@ fn dsv4_chain_run(
         // a chained layer never calls dsv4_cache_write, which is what used
         // to create and grow it.
         let ew_c0 = l.compressor.as_ref().map_or(0, |cp| {
-            if cp.overlap { cp.wkv.rows() / 2 } else { cp.wkv.rows() }
+            if cp.overlap {
+                cp.wkv.rows() / 2
+            } else {
+                cp.wkv.rows()
+            }
         });
-        let comp_extra = l.compressor.as_ref().map_or(0, |cp| {
-            batch.max(1).div_ceil(cp.ratio.max(1))
-        });
+        let comp_extra = l
+            .compressor
+            .as_ref()
+            .map_or(0, |cp| batch.max(1).div_ceil(cp.ratio.max(1)));
         let need = cfg.window * hd
             + (st.dev_n_comp[li] + comp_extra + 1) * ew_c0.max(1)
             + (batch.max(1) + 1) * hd;
         if !crate::gpu_wgpu::dsv4_cache_ensure(st.kv_id, li, need.next_power_of_two()) {
             return false;
         }
-        let ew_c = comp.as_ref().map_or(0, |(_, cg)| {
-            if cg.overlap { cg.width / 2 } else { cg.width }
-        });
-        let ew_i = ix.as_ref().map_or(0, |(_, cg, _, _)| {
-            if cg.overlap { cg.width / 2 } else { cg.width }
-        });
+        let ew_c = comp.as_ref().map_or(
+            0,
+            |(_, cg)| {
+                if cg.overlap { cg.width / 2 } else { cg.width }
+            },
+        );
+        let ew_i = ix.as_ref().map_or(
+            0,
+            |(_, cg, _, _)| {
+                if cg.overlap { cg.width / 2 } else { cg.width }
+            },
+        );
         let prep = crate::gpu_wgpu::Dsv4Prep {
             wkv,
             kv_norm: &l.kv_norm,
@@ -2758,7 +2834,10 @@ fn dsv4_chain_run(
         let nxt = layers.get(li + 1);
         let w = crate::gpu_wgpu::Dsv4LayerW {
             attn: crate::gpu_wgpu::Dsv4AttnW {
-                wq_a, wq_b, wo_a, wo_b,
+                wq_a,
+                wq_b,
+                wo_a,
+                wo_b,
                 q_norm: &l.q_norm,
                 sink: &l.attn_sink,
             },
@@ -2834,7 +2913,11 @@ fn dsv4_chain_run(
                         .into_iter()
                         .map(|gi| packs[i].to_slot[gi])
                         .collect();
-                    if v.iter().any(|&x| x == usize::MAX) { None } else { Some(v) }
+                    if v.iter().any(|&x| x == usize::MAX) {
+                        None
+                    } else {
+                        Some(v)
+                    }
                 }));
                 if layers[li].tid2eid.is_some() && row[i].is_none() {
                     return false;
@@ -2843,8 +2926,16 @@ fn dsv4_chain_run(
             forced_pt.push(row);
         }
         if !crate::gpu_wgpu::dsv4_chain_batch(
-            &model, &items, st.kv_id, first, &freqs, st.pos, batch,
-            Some(&forced_pt), &mut out, state_out,
+            &model,
+            &items,
+            st.kv_id,
+            first,
+            &freqs,
+            st.pos,
+            batch,
+            Some(&forced_pt),
+            &mut out,
+            state_out,
         ) {
             return false;
         }
@@ -2863,20 +2954,20 @@ fn dsv4_chain_run(
     // advanced them once per token, in order, so the host replays the same
     // rule that many times rather than inventing a closed form for it.
     for (i, &li) in run.iter().enumerate() {
-      for t in 0..batch.max(1) {
-        let pos = st.pos + t;
-        st.dev_filled[li] = (st.dev_filled[li] + 1).min(cfg.window);
-        if let Some((_, cg, ..)) = items[i].2.ix.as_ref() {
-            if (pos + 1) % cg.ratio == 0 {
-                st.dev_n_ix[li] += 1;
+        for t in 0..batch.max(1) {
+            let pos = st.pos + t;
+            st.dev_filled[li] = (st.dev_filled[li] + 1).min(cfg.window);
+            if let Some((_, cg, ..)) = items[i].2.ix.as_ref() {
+                if (pos + 1) % cg.ratio == 0 {
+                    st.dev_n_ix[li] += 1;
+                }
+            }
+            if let Some((_, cg)) = items[i].2.comp.as_ref() {
+                if (pos + 1) % cg.ratio == 0 {
+                    st.dev_n_comp[li] += 1;
+                }
             }
         }
-        if let Some((_, cg)) = items[i].2.comp.as_ref() {
-            if (pos + 1) % cg.ratio == 0 {
-                st.dev_n_comp[li] += 1;
-            }
-        }
-      }
     }
     st.dev_owned = true;
     true
@@ -2892,8 +2983,7 @@ fn hc_on_device() -> bool {
         // is no trade to weigh: it must not be the default until it is
         // exact. The toy's near-agreement (129.787 vs 129.792) hid a real
         // fault the release exposes.
-        std::env::var("CMF_DSV4_HC_DEV").is_ok_and(|v| v != "0")
-            && crate::gpu::backend_available()
+        std::env::var("CMF_DSV4_HC_DEV").is_ok_and(|v| v != "0") && crate::gpu::backend_available()
     })
 }
 
@@ -2937,8 +3027,7 @@ fn dsv4_two_frame_loop(
         cfg,
         pool,
     );
-    if !crate::gpu_wgpu::dsv4_state_write(state)
-        || !crate::gpu_wgpu::dsv4_hc_write(&post0, &comb0)
+    if !crate::gpu_wgpu::dsv4_state_write(state) || !crate::gpu_wgpu::dsv4_hc_write(&post0, &comb0)
     {
         return false;
     }
@@ -3036,7 +3125,15 @@ fn dsv4_two_frame_loop(
         // The host's half: the caches and the attended list, untouched.
         let mut prep = AttnPrep::default();
         attention_step(
-            &folded, l, cfg, st, li, freqs_of(l), pool, Some(&mut prep), &mut sink,
+            &folded,
+            l,
+            cfg,
+            st,
+            li,
+            freqs_of(l),
+            pool,
+            Some(&mut prep),
+            &mut sink,
         );
         let hd = cfg.head_dim;
         let n_comp = st.compressed[li].len() / hd;
@@ -3044,7 +3141,11 @@ fn dsv4_two_frame_loop(
         if !crate::gpu_wgpu::dsv4_cache_write(st.kv_id, li, 0, &st.window[li], cap)
             || (n_comp > 0
                 && !crate::gpu_wgpu::dsv4_cache_write(
-                    st.kv_id, li, cfg.window * hd, &st.compressed[li], cap,
+                    st.kv_id,
+                    li,
+                    cfg.window * hd,
+                    &st.compressed[li],
+                    cap,
                 ))
         {
             return false;
@@ -3073,8 +3174,19 @@ fn dsv4_two_frame_loop(
         };
         let scale = (cfg.head_dim as f32).powf(-0.5);
         if !attn_frame(
-            l, cfg, st, li, &folded, &prep.qr, &prep.idxs, freqs_of(l), st.pos,
-            prep.win_len, scale, Some(&a_tail), &mut [],
+            l,
+            cfg,
+            st,
+            li,
+            &folded,
+            &prep.qr,
+            &prep.idxs,
+            freqs_of(l),
+            st.pos,
+            prep.win_len,
+            scale,
+            Some(&a_tail),
+            &mut [],
         ) {
             return false;
         }
@@ -3097,8 +3209,19 @@ fn dsv4_two_frame_loop(
             .tid2eid
             .as_ref()
             .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id));
-        if moe_frame(&[], l, cfg, li, &[], forced.as_deref(), pool, Some(&a_tail), pair, &mut next)
-            .is_none()
+        if moe_frame(
+            &[],
+            l,
+            cfg,
+            li,
+            &[],
+            forced.as_deref(),
+            pool,
+            Some(&a_tail),
+            pair,
+            &mut next,
+        )
+        .is_none()
         {
             return false;
         }
@@ -3168,7 +3291,9 @@ fn hc_fold_norm(
 fn gpu_layer_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("CMF_DSV4_GPU_LAYER").map(|v| v != "0").unwrap_or(true)
+        std::env::var("CMF_DSV4_GPU_LAYER")
+            .map(|v| v != "0")
+            .unwrap_or(true)
             && crate::gpu::backend_available()
     })
 }
@@ -3238,7 +3363,12 @@ fn pack_freq_order(li: usize, n: usize) -> Option<Vec<usize>> {
         return None;
     }
     let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by_key(|&e| (std::cmp::Reverse(map.get(&(li, e)).copied().unwrap_or(0)), e));
+    idx.sort_by_key(|&e| {
+        (
+            std::cmp::Reverse(map.get(&(li, e)).copied().unwrap_or(0)),
+            e,
+        )
+    });
     Some(idx)
 }
 
@@ -3328,12 +3458,19 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
             }
             let remap: Vec<u32> = to_slot
                 .iter()
-                .map(|&sl| if sl == usize::MAX { u32::MAX } else { sl as u32 })
+                .map(|&sl| {
+                    if sl == usize::MAX {
+                        u32::MAX
+                    } else {
+                        sl as u32
+                    }
+                })
                 .collect();
             return Some(Arc::new(Pack {
-                bias: l.gate_bias.as_deref().map(|b| {
-                    globals.iter().map(|&g| b[g]).collect()
-                }),
+                bias: l
+                    .gate_bias
+                    .as_deref()
+                    .map(|b| globals.iter().map(|&g| b[g]).collect()),
                 router,
                 to_slot,
                 remap,
@@ -3355,11 +3492,14 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
         // hottest-first; layers absent from the tally keep id order. The
         // router still ranges over every expert either way — residency
         // choice changes speed, never a bit of the answer.
-        let order = pack_freq_order(li, l.experts.len())
-            .unwrap_or_else(|| (0..l.experts.len()).collect());
+        let order =
+            pack_freq_order(li, l.experts.len()).unwrap_or_else(|| (0..l.experts.len()).collect());
         for gi in order {
             let e = &l.experts[gi];
-            if l.mask.as_deref().is_some_and(|m| !m.get(gi).copied().unwrap_or(true)) {
+            if l.mask
+                .as_deref()
+                .is_some_and(|m| !m.get(gi).copied().unwrap_or(true))
+            {
                 continue;
             }
             if globals.len() >= room {
@@ -3405,12 +3545,19 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
         }
         let remap: Vec<u32> = to_slot
             .iter()
-            .map(|&sl| if sl == usize::MAX { u32::MAX } else { sl as u32 })
+            .map(|&sl| {
+                if sl == usize::MAX {
+                    u32::MAX
+                } else {
+                    sl as u32
+                }
+            })
             .collect();
         Some(Arc::new(Pack {
-            bias: l.gate_bias.as_deref().map(|b| {
-                globals.iter().map(|&g| b[g]).collect()
-            }),
+            bias: l
+                .gate_bias
+                .as_deref()
+                .map(|b| globals.iter().map(|&g| b[g]).collect()),
             router,
             to_slot,
             remap,
@@ -3508,9 +3655,10 @@ fn moe_frame(
         top_k: cfg.top_k,
         route_scale: cfg.route_scale,
         swiglu_limit: cfg.swiglu_limit,
-        gu_q2: l.experts.first().is_some_and(|e| {
-            e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
-        }),
+        gu_q2: l
+            .experts
+            .first()
+            .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)),
     };
     let mut cold = Vec::new();
     let mut cold_x = Vec::new();
@@ -3542,9 +3690,15 @@ fn moe_frame(
     }
     let mut acc = vec![0.0f32; cfg.dim];
     let mut cold_sum = vec![0.0f32; cfg.dim];
-    let cold_input = if hidden.is_empty() { cold_x.as_slice() } else { hidden };
+    let cold_input = if hidden.is_empty() {
+        cold_x.as_slice()
+    } else {
+        hidden
+    };
     for &(gi, wt) in &cold {
-        let Some(exp) = l.experts.get(gi) else { continue };
+        let Some(exp) = l.experts.get(gi) else {
+            continue;
+        };
         // Cold means out-of-core by contract. The tensors remain mmap-backed:
         // missing pages are faulted from the CMF file and the OS may evict
         // them again under RAM pressure. Do not let the generic matvec probe
@@ -3606,7 +3760,9 @@ fn note_compressed(kv_id: u64, li: usize, n: usize) {
 fn gpu_moe2_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("CMF_DSV4_GPU_MOE2").map(|v| v != "0").unwrap_or(true)
+        std::env::var("CMF_DSV4_GPU_MOE2")
+            .map(|v| v != "0")
+            .unwrap_or(true)
             && crate::gpu::backend_available()
     })
 }
@@ -3651,8 +3807,19 @@ pub fn moe_step(
             .tid2eid
             .as_ref()
             .map(|tbl| hash_route(tbl, cfg.vocab, cfg.top_k, token_id));
-        if moe_frame(hidden, l, cfg, li, &logits, forced.as_deref(), pool, None, None, out)
-            .is_some()
+        if moe_frame(
+            hidden,
+            l,
+            cfg,
+            li,
+            &logits,
+            forced.as_deref(),
+            pool,
+            None,
+            None,
+            out,
+        )
+        .is_some()
         {
             // CMF_DSV4_MOE_CHECK=1 recomputes the same block on the CPU and
             // reports where they part. A wrong MoE does not fail — it answers
@@ -3663,8 +3830,17 @@ pub fn moe_step(
                 let mut want = vec![0.0f32; out.len()];
                 let mut acc = vec![0.0f32; cfg.dim];
                 for (e, &ei) in idx.iter().enumerate() {
-                    let Some(exp) = l.experts.get(ei) else { continue };
-                    run_expert(hidden, exp, cfg, w.get(e).copied().unwrap_or(0.0), pool, &mut acc);
+                    let Some(exp) = l.experts.get(ei) else {
+                        continue;
+                    };
+                    run_expert(
+                        hidden,
+                        exp,
+                        cfg,
+                        w.get(e).copied().unwrap_or(0.0),
+                        pool,
+                        &mut acc,
+                    );
                     for (o, a) in want.iter_mut().zip(&acc) {
                         *o += a;
                     }
@@ -3673,7 +3849,11 @@ pub fn moe_step(
                 for (o, a) in want.iter_mut().zip(&acc) {
                     *o += a;
                 }
-                let num: f32 = want.iter().zip(out.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
+                let num: f32 = want
+                    .iter()
+                    .zip(out.iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
                 let den: f32 = want.iter().map(|a| a * a).sum::<f32>().max(1e-20);
                 let rel = (num / den).sqrt();
                 if rel > 1e-3 {
@@ -3737,7 +3917,9 @@ pub fn moe_step(
         let mut model_ref = None;
         let mut ok = true;
         for (e, &ei) in idx.iter().enumerate() {
-            let Some(exp) = l.experts.get(ei) else { continue };
+            let Some(exp) = l.experts.get(ei) else {
+                continue;
+            };
             ok &= crate::pipeline::moe_push_job_parts(
                 &exp.w1,
                 &exp.w3,
@@ -3772,10 +3954,16 @@ pub fn moe_step(
                         let mut want = vec![0.0f32; out.len()];
                         let mut acc = vec![0.0f32; cfg.dim];
                         for (e, &ei) in idx.iter().enumerate() {
-                            let Some(exp) = l.experts.get(ei) else { continue };
+                            let Some(exp) = l.experts.get(ei) else {
+                                continue;
+                            };
                             run_expert(
-                                hidden, exp, cfg,
-                                w.get(e).copied().unwrap_or(0.0), pool, &mut acc,
+                                hidden,
+                                exp,
+                                cfg,
+                                w.get(e).copied().unwrap_or(0.0),
+                                pool,
+                                &mut acc,
                             );
                             for (o, a) in want.iter_mut().zip(&acc) {
                                 *o += a;
@@ -3923,8 +4111,7 @@ fn moe_step_block(
         let n = jobs.len();
         let mut xj = vec![0.0f32; n * dim];
         for (j, &(bi, _, _)) in jobs.iter().enumerate() {
-            xj[j * dim..(j + 1) * dim]
-                .copy_from_slice(&xs[bi * dim..(bi + 1) * dim]);
+            xj[j * dim..(j + 1) * dim].copy_from_slice(&xs[bi * dim..(bi + 1) * dim]);
         }
         let mut gate = vec![0.0f32; n * inter];
         let mut up = vec![0.0f32; n * inter];
@@ -3984,8 +4171,7 @@ fn moe_step_block(
     for bi in 0..b {
         let dst = &mut out[bi * dim..(bi + 1) * dim];
         for slot in 0..picks[bi].len() {
-            let src = &routed[(bi * cfg.top_k + slot) * dim
-                ..(bi * cfg.top_k + slot + 1) * dim];
+            let src = &routed[(bi * cfg.top_k + slot) * dim..(bi * cfg.top_k + slot + 1) * dim];
             for (o, &v) in dst.iter_mut().zip(src) {
                 *o += v;
             }
@@ -4021,8 +4207,8 @@ fn o_project_block(
             wo_a.row_f32(r, &mut wr);
             let group = r / lora;
             for bi in 0..b {
-                let x = &attn[bi * attn_len + group * per_group
-                    ..bi * attn_len + (group + 1) * per_group];
+                let x = &attn
+                    [bi * attn_len + group * per_group..bi * attn_len + (group + 1) * per_group];
                 let v = wr.iter().zip(x).map(|(w, x)| w * x).sum();
                 unsafe { *mid_addr.at(bi * rows + r) = v };
             }
@@ -4195,7 +4381,16 @@ fn forward_chunk_batched(
     #[cfg(not(feature = "gpu"))]
     {
         let _ = (
-            g, layers, cfg, st, ids, pos0, inv_freq, pool, logits, want_logits,
+            g,
+            layers,
+            cfg,
+            st,
+            ids,
+            pos0,
+            inv_freq,
+            pool,
+            logits,
+            want_logits,
         );
         false
     }
@@ -4211,9 +4406,8 @@ fn forward_chunk_batched(
             .iter()
             .enumerate()
             .position(|(li, &on)| {
-                !on
-                    || pack_for(&layers[li], cfg, li)
-                        .is_none_or(|p| p.globals.len() < cfg.n_routed_experts)
+                !on || pack_for(&layers[li], cfg, li)
+                    .is_none_or(|p| p.globals.len() < cfg.n_routed_experts)
             })
             .unwrap_or(st.dev_set.len());
         let why = if b < 2 {
@@ -4228,9 +4422,7 @@ fn forward_chunk_batched(
             || st.dev_set[gpu_end.min(st.dev_set.len())..]
                 .iter()
                 .enumerate()
-                .any(|(i, &on)| {
-                    on && !st.partial_set.get(gpu_end + i).copied().unwrap_or(false)
-                })
+                .any(|(i, &on)| on && !st.partial_set.get(gpu_end + i).copied().unwrap_or(false))
         {
             "слои на карте не образуют префикс"
         } else {
@@ -4475,7 +4667,11 @@ fn host_tail_walk(
         } else {
             &g.inv_freq_window
         };
-        let freqs = if freqs.is_empty() { inv_freq } else { freqs.as_slice() };
+        let freqs = if freqs.is_empty() {
+            inv_freq
+        } else {
+            freqs.as_slice()
+        };
         hc_block(
             state,
             &l.hc_attn_fn,
@@ -4548,7 +4744,11 @@ fn host_tail_walk_batch(
         } else {
             &g.inv_freq_window
         };
-        let freqs = if freqs.is_empty() { inv_freq } else { freqs.as_slice() };
+        let freqs = if freqs.is_empty() {
+            inv_freq
+        } else {
+            freqs.as_slice()
+        };
         for t in 0..b {
             st.pos = pos0 + t;
             let state = &mut states[t * hc * dim..(t + 1) * hc * dim];
@@ -4573,7 +4773,14 @@ fn host_tail_walk_batch(
         let t_glue = std::time::Instant::now();
         for t in 0..b {
             let state = &states[t * hc * dim..(t + 1) * hc * dim];
-            hc_mixes(state, &l.hc_ffn_fn, mix_hc, cfg.norm_eps, pool, &mut scratch.mixes);
+            hc_mixes(
+                state,
+                &l.hc_ffn_fn,
+                mix_hc,
+                cfg.norm_eps,
+                pool,
+                &mut scratch.mixes,
+            );
             hc_split_sinkhorn(
                 &scratch.mixes,
                 &l.hc_ffn_scale,
@@ -4604,7 +4811,9 @@ fn host_tail_walk_batch(
         let tail_pack = {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *ON.get_or_init(|| {
-                std::env::var("CMF_DSV4_TAIL_PACK").map(|v| v != "0").unwrap_or(true)
+                std::env::var("CMF_DSV4_TAIL_PACK")
+                    .map(|v| v != "0")
+                    .unwrap_or(true)
             })
         };
         let mut packed_done = false;
@@ -4633,9 +4842,7 @@ fn host_tail_walk_batch(
         }
         if !packed_done {
             if host_cpu_moe() {
-                crate::gpu::cpu_scope(|| {
-                    moe_step_block(&folds, b, l, cfg, ids, li, pool, &mut mo)
-                });
+                crate::gpu::cpu_scope(|| moe_step_block(&folds, b, l, cfg, ids, li, pool, &mut mo));
             } else {
                 moe_step_block(&folds, b, l, cfg, ids, li, pool, &mut mo);
             }
@@ -4706,9 +4913,7 @@ pub fn dsv4_verify_chunk(
     let full_beyond = st.dev_set[gpu_end.min(st.dev_set.len())..]
         .iter()
         .enumerate()
-        .any(|(i, &on)| {
-            on && !st.partial_set.get(gpu_end + i).copied().unwrap_or(false)
-        });
+        .any(|(i, &on)| on && !st.partial_set.get(gpu_end + i).copied().unwrap_or(false));
     if b < 2
         || !chain_enabled()
         || !st.dev_owned
@@ -4739,7 +4944,11 @@ pub fn dsv4_verify_chunk(
         shadow: Some(shadow),
     };
     // The capture targets that live on the device: photograph their states.
-    let dev_caps: Vec<usize> = cap_targets.iter().copied().filter(|&t| t < gpu_end).collect();
+    let dev_caps: Vec<usize> = cap_targets
+        .iter()
+        .copied()
+        .filter(|&t| t < gpu_end)
+        .collect();
     crate::gpu_wgpu::dsv4_spec_retain_arm(gpu_end, &dev_caps);
 
     // ── seed and run the batch (the prefill batch's own shape) ──
@@ -4814,7 +5023,9 @@ pub fn dsv4_verify_chunk(
         // print a fingerprint, so the fused and per-token folds can be
         // held against each other on the release shapes.
         for li in 0..gpu_end {
-            let Some(ixr) = &layers[li].indexer else { continue };
+            let Some(ixr) = &layers[li].indexer else {
+                continue;
+            };
             let ratio = ixr.compressor.ratio;
             for t in 0..b {
                 if (pos0 + t + 1) % ratio == 0 {
@@ -4822,9 +5033,8 @@ pub fn dsv4_verify_chunk(
                         let w = ixr.compressor.wkv.rows();
                         if ixr.compressor.overlap { w / 2 } else { w }
                     };
-                    let idx_new = txn.dev_n_ix[li] + (0..=t)
-                        .filter(|k| (pos0 + k + 1) % ratio == 0)
-                        .count()
+                    let idx_new = txn.dev_n_ix[li]
+                        + (0..=t).filter(|k| (pos0 + k + 1) % ratio == 0).count()
                         - 1;
                     if let Some(v) =
                         crate::gpu_wgpu::dsv4_dbg_read_ix(st.kv_id, li, idx_new * ew, ew.min(8))
@@ -4849,14 +5059,33 @@ pub fn dsv4_verify_chunk(
     let mut head_in = vec![0.0f32; b * dim];
     let mut host_steps: Vec<(usize, Vec<HostLayerSnap>)> = Vec::new();
     host_tail_walk_batch(
-        g, layers, cfg, st, gpu_end, &mut states, ids, pos0, b, inv_freq, &mut scratch, pool,
+        g,
+        layers,
+        cfg,
+        st,
+        gpu_end,
+        &mut states,
+        ids,
+        pos0,
+        b,
+        inv_freq,
+        &mut scratch,
+        pool,
         Some(&mut host_steps),
     );
     txn.host_steps = host_steps;
     for t in 0..b {
         let state = &states[t * hc * dim..(t + 1) * hc * dim];
         let h = &mut head_in[t * dim..(t + 1) * dim];
-        hc_head_fold(state, &g.hc_head_fn, g.hc_head_scale, &g.hc_head_base, cfg, pool, h);
+        hc_head_fold(
+            state,
+            &g.hc_head_fn,
+            g.hc_head_scale,
+            &g.hc_head_base,
+            cfg,
+            pool,
+            h,
+        );
         rms_weighted(h, &g.norm, cfg.norm_eps);
     }
     // One B-wide head submission instead of B fenced matvecs.
@@ -4871,7 +5100,8 @@ pub fn dsv4_verify_chunk(
     for t in 0..b {
         if !head_gpu {
             let h = &head_in[t * dim..(t + 1) * dim];
-            g.head.matvec(h, &mut logits_out[t * cfg.vocab..(t + 1) * cfg.vocab], pool);
+            g.head
+                .matvec(h, &mut logits_out[t * cfg.vocab..(t + 1) * cfg.vocab], pool);
         }
         let row = &logits_out[t * cfg.vocab..(t + 1) * cfg.vocab];
         let mut best = 0usize;
@@ -4939,7 +5169,9 @@ pub fn dsv4_spec_finish(
         return true;
     }
     // ── device: restore to the snapshot, then replay the accepted tokens ──
-    let Some(sh) = txn.shadow.take() else { sfail!("нет тени") };
+    let Some(sh) = txn.shadow.take() else {
+        sfail!("нет тени")
+    };
     if !crate::gpu_wgpu::dsv4_spec_restore(&sh) {
         sfail!("restore");
     }
@@ -4950,7 +5182,9 @@ pub fn dsv4_spec_finish(
     let mut freqs_own: Vec<&[f32]> = Vec::new();
     for li in 0..txn.gpu_end {
         let l = &layers[li];
-        let Some(wkv) = l.wkv.model_idx() else { sfail!("wkv слоя {li}") };
+        let Some(wkv) = l.wkv.model_idx() else {
+            sfail!("wkv слоя {li}")
+        };
         let comp = match &l.compressor {
             None => None,
             Some(cp) => {
@@ -4958,7 +5192,12 @@ pub fn dsv4_spec_finish(
                     sfail!("компрессор слоя {li}");
                 };
                 Some((
-                    crate::gpu_wgpu::Dsv4CompW { wkv: a, wgate: bx, norm: &cp.norm, ape: &cp.ape },
+                    crate::gpu_wgpu::Dsv4CompW {
+                        wkv: a,
+                        wgate: bx,
+                        norm: &cp.norm,
+                        ape: &cp.ape,
+                    },
                     crate::gpu_wgpu::Dsv4CompGeom {
                         width: cp.wkv.rows(),
                         hidden: dim,
@@ -4984,7 +5223,12 @@ pub fn dsv4_spec_finish(
                 };
                 let ih = ixr.weights_proj.rows();
                 Some((
-                    crate::gpu_wgpu::Dsv4CompW { wkv: a, wgate: bx, norm: &cp.norm, ape: &cp.ape },
+                    crate::gpu_wgpu::Dsv4CompW {
+                        wkv: a,
+                        wgate: bx,
+                        norm: &cp.norm,
+                        ape: &cp.ape,
+                    },
                     crate::gpu_wgpu::Dsv4CompGeom {
                         width: cp.wkv.rows(),
                         hidden: dim,
@@ -4993,7 +5237,10 @@ pub fn dsv4_spec_finish(
                         rope_dim: cfg.rope_head_dim,
                         eps: cfg.norm_eps,
                     },
-                    crate::gpu_wgpu::Dsv4IxW { wq_b: qb, weights_proj: wp },
+                    crate::gpu_wgpu::Dsv4IxW {
+                        wq_b: qb,
+                        weights_proj: wp,
+                    },
                     crate::gpu_wgpu::Dsv4IxGeom {
                         ih,
                         idim: ixr.wq_b.rows() / ih.max(1),
@@ -5007,12 +5254,18 @@ pub fn dsv4_spec_finish(
                 ))
             }
         };
-        let ew_c = comp.as_ref().map_or(0, |(_, cg)| {
-            if cg.overlap { cg.width / 2 } else { cg.width }
-        });
-        let ew_i = ix.as_ref().map_or(0, |(_, cg, _, _)| {
-            if cg.overlap { cg.width / 2 } else { cg.width }
-        });
+        let ew_c = comp.as_ref().map_or(
+            0,
+            |(_, cg)| {
+                if cg.overlap { cg.width / 2 } else { cg.width }
+            },
+        );
+        let ew_i = ix.as_ref().map_or(
+            0,
+            |(_, cg, _, _)| {
+                if cg.overlap { cg.width / 2 } else { cg.width }
+            },
+        );
         let prep = crate::gpu_wgpu::Dsv4Prep {
             wkv,
             kv_norm: &l.kv_norm,
@@ -5024,7 +5277,12 @@ pub fn dsv4_spec_finish(
             n_ix: txn.dev_n_ix[li],
             comp_dst_off: cfg.window * hd + txn.dev_n_comp[li] * ew_c,
             ix_dst_off: txn.dev_n_ix[li] * ew_i,
-            idx_cap: cfg.window + if l.indexer.is_some() { cfg.index_topk } else { 0 },
+            idx_cap: cfg.window
+                + if l.indexer.is_some() {
+                    cfg.index_topk
+                } else {
+                    0
+                },
         };
         let fr = if l.compressor.is_some() {
             g.inv_freq_compress.as_slice()
@@ -5061,15 +5319,17 @@ pub fn dsv4_spec_finish(
         let l = &layers[li];
         st.dev_filled[li] = (txn.dev_filled[li] + k).min(cfg.window);
         let ac = l.compressor.as_ref().map_or(0, |cp| advanced(cp.ratio));
-        let ai = l.indexer.as_ref().map_or(0, |ix| advanced(ix.compressor.ratio));
+        let ai = l
+            .indexer
+            .as_ref()
+            .map_or(0, |ix| advanced(ix.compressor.ratio));
         st.dev_n_comp[li] = txn.dev_n_comp[li] + ac;
         st.dev_n_ix[li] = txn.dev_n_ix[li] + ai;
         note_compressed(st.kv_id, li, st.dev_n_comp[li]);
     }
     // ── host tail: the verify pass already walked these tokens; restore
     //    the per-token snapshot it took instead of walking them again. ──
-    if k >= 1 && txn.host_steps.iter().all(|(_, v)| v.len() >= k) && !txn.host_steps.is_empty()
-    {
+    if k >= 1 && txn.host_steps.iter().all(|(_, v)| v.len() >= k) && !txn.host_steps.is_empty() {
         for (li, v) in &txn.host_steps {
             host_restore(st, *li, &v[k - 1]);
         }
@@ -5080,8 +5340,19 @@ pub fn dsv4_spec_finish(
         let mut scratch = HcScratch::new(cfg);
         let mut states = txn.states.clone();
         host_tail_walk_batch(
-            g, layers, cfg, st, txn.gpu_end, &mut states[..k * hc * dim], ids, txn.pos0, k,
-            inv_freq, &mut scratch, pool, None,
+            g,
+            layers,
+            cfg,
+            st,
+            txn.gpu_end,
+            &mut states[..k * hc * dim],
+            ids,
+            txn.pos0,
+            k,
+            inv_freq,
+            &mut scratch,
+            pool,
+            None,
         );
     }
     st.pos = txn.pos0 + k;
@@ -5111,7 +5382,17 @@ pub fn forward_chunk(
         let mut i = 0;
         if !st.dev_owned && !ids.is_empty() {
             st.pos = pos0;
-            forward_token_inner(g, layers, cfg, st, ids[0], inv_freq, pool, logits, ids.len() == 1);
+            forward_token_inner(
+                g,
+                layers,
+                cfg,
+                st,
+                ids[0],
+                inv_freq,
+                pool,
+                logits,
+                ids.len() == 1,
+            );
             i = 1;
         }
         while i < ids.len() {
@@ -5208,7 +5489,15 @@ fn forward_token_inner(
     #[cfg(feature = "gpu")]
     let layer_frames = gpu_layer_enabled()
         && dsv4_layer_loop(
-            &mut state, layers, g, cfg, st, token_id, inv_freq, pool, &mut scratch,
+            &mut state,
+            layers,
+            g,
+            cfg,
+            st,
+            token_id,
+            inv_freq,
+            pool,
+            &mut scratch,
         );
     #[cfg(not(feature = "gpu"))]
     let layer_frames = false;
@@ -5236,105 +5525,112 @@ fn forward_token_inner(
     #[cfg(feature = "gpu")]
     let two_frame_done = hc_dev
         && dsv4_two_frame_loop(
-            &mut state, layers, g, cfg, st, token_id, inv_freq, pool, &mut scratch,
+            &mut state,
+            layers,
+            g,
+            cfg,
+            st,
+            token_id,
+            inv_freq,
+            pool,
+            &mut scratch,
         );
     #[cfg(not(feature = "gpu"))]
     let two_frame_done = false;
     if !two_frame_done {
-
-    for (li, l) in layers.iter().enumerate() {
-        if layer_frames {
-            break;
-        }
-        // attention half
-        hc_block(
-            &mut state,
-            &l.hc_attn_fn,
-            &l.hc_attn_scale,
-            &l.hc_attn_base,
-            &l.attn_norm,
-            cfg,
-            &mut scratch,
-            pool,
-            |folded, out| {
-                if dump_path().is_some() {
-                    // The body's own input and output, so the reference can be
-                    // fed the port's input: then only the body can differ.
-                    BODY.with(|b| b.borrow_mut().push(vec_json(folded)));
-                }
-                // The layer's kind decides its frequencies, not the model's.
-                let freqs = if l.compressor.is_some() {
-                    &g.inv_freq_compress
-                } else {
-                    &g.inv_freq_window
-                };
-                let freqs = if freqs.is_empty() {
-                    inv_freq
-                } else {
-                    freqs.as_slice()
-                };
-                attention_step(folded, l, cfg, st, li, freqs, pool, None, out);
-                if dump_path().is_some() {
-                    BODY.with(|b| b.borrow_mut().push(vec_json(out)));
-                }
-            },
-        );
-        if dump_path().is_some() {
-            // After the attention half only — this is what separates an
-            // attention discrepancy from an expert one.
-            dump.push(format!(
-                "{}{}",
-                if li == 0 { "" } else { "," },
-                vec_json(&state)
-            ));
-        }
-        // FFN half
-        let _t_hc2 = prof::on().then(std::time::Instant::now);
-        hc_block(
-            &mut state,
-            &l.hc_ffn_fn,
-            &l.hc_ffn_scale,
-            &l.hc_ffn_base,
-            &l.ffn_norm,
-            cfg,
-            &mut scratch,
-            pool,
-            |folded, out| moe_step(folded, l, cfg, token_id, li, pool, out),
-        );
-        if let Some(t) = _t_hc2 {
-            // The block's own time minus the expert step inside it — what the
-            // fold, the norm and the expand cost on their own.
-            prof::HC_NS.fetch_add(
-                t.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
+        for (li, l) in layers.iter().enumerate() {
+            if layer_frames {
+                break;
+            }
+            // attention half
+            hc_block(
+                &mut state,
+                &l.hc_attn_fn,
+                &l.hc_attn_scale,
+                &l.hc_attn_base,
+                &l.attn_norm,
+                cfg,
+                &mut scratch,
+                pool,
+                |folded, out| {
+                    if dump_path().is_some() {
+                        // The body's own input and output, so the reference can be
+                        // fed the port's input: then only the body can differ.
+                        BODY.with(|b| b.borrow_mut().push(vec_json(folded)));
+                    }
+                    // The layer's kind decides its frequencies, not the model's.
+                    let freqs = if l.compressor.is_some() {
+                        &g.inv_freq_compress
+                    } else {
+                        &g.inv_freq_window
+                    };
+                    let freqs = if freqs.is_empty() {
+                        inv_freq
+                    } else {
+                        freqs.as_slice()
+                    };
+                    attention_step(folded, l, cfg, st, li, freqs, pool, None, out);
+                    if dump_path().is_some() {
+                        BODY.with(|b| b.borrow_mut().push(vec_json(out)));
+                    }
+                },
             );
-        }
-        if dump_path().is_some() {
-            dump.push(format!(",{}", vec_json(&state)));
-        }
-        if trace_on() && (st.pos % 64 == 0 || st.pos == 199) {
-            eprintln!(
-                "[dsv4]  кеши слоя {li}: окно={} сжатых={} индекс={} (ratio={:?})",
-                st.window[li].len() / cfg.head_dim.max(1),
-                st.compressed[li].len() / cfg.head_dim.max(1),
-                st.index_kv[li].len().max(1) / 128,
-                l.compressor.as_ref().map(|c| (c.ratio, c.overlap)),
+            if dump_path().is_some() {
+                // After the attention half only — this is what separates an
+                // attention discrepancy from an expert one.
+                dump.push(format!(
+                    "{}{}",
+                    if li == 0 { "" } else { "," },
+                    vec_json(&state)
+                ));
+            }
+            // FFN half
+            let _t_hc2 = prof::on().then(std::time::Instant::now);
+            hc_block(
+                &mut state,
+                &l.hc_ffn_fn,
+                &l.hc_ffn_scale,
+                &l.hc_ffn_base,
+                &l.ffn_norm,
+                cfg,
+                &mut scratch,
+                pool,
+                |folded, out| moe_step(folded, l, cfg, token_id, li, pool, out),
             );
+            if let Some(t) = _t_hc2 {
+                // The block's own time minus the expert step inside it — what the
+                // fold, the norm and the expand cost on their own.
+                prof::HC_NS.fetch_add(
+                    t.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            if dump_path().is_some() {
+                dump.push(format!(",{}", vec_json(&state)));
+            }
+            if trace_on() && (st.pos % 64 == 0 || st.pos == 199) {
+                eprintln!(
+                    "[dsv4]  кеши слоя {li}: окно={} сжатых={} индекс={} (ratio={:?})",
+                    st.window[li].len() / cfg.head_dim.max(1),
+                    st.compressed[li].len() / cfg.head_dim.max(1),
+                    st.index_kv[li].len().max(1) / 128,
+                    l.compressor.as_ref().map(|c| (c.ratio, c.overlap)),
+                );
+            }
+            if trace_on() {
+                let bad = state.iter().filter(|v| !v.is_finite()).count();
+                eprintln!(
+                    "[dsv4]  layer {li:>2}: rms={:.5}{}",
+                    rms_of(&state),
+                    if bad > 0 {
+                        format!("  NON-FINITE x{bad}")
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            dspark_note(li, &state, cfg);
         }
-        if trace_on() {
-            let bad = state.iter().filter(|v| !v.is_finite()).count();
-            eprintln!(
-                "[dsv4]  layer {li:>2}: rms={:.5}{}",
-                rms_of(&state),
-                if bad > 0 {
-                    format!("  NON-FINITE x{bad}")
-                } else {
-                    String::new()
-                }
-            );
-        }
-        dspark_note(li, &state, cfg);
-    }
     }
     st.pos += 1;
 
@@ -5740,8 +6036,16 @@ pub fn load_mtp(
              голова уверенности {}, марков {}",
             out.len(),
             out[0].layer.experts.len(),
-            if out.iter().any(|m| m.confidence.is_some()) { "есть" } else { "нет" },
-            if out.iter().any(|m| m.markov_w1.is_some()) { "есть" } else { "нет" },
+            if out.iter().any(|m| m.confidence.is_some()) {
+                "есть"
+            } else {
+                "нет"
+            },
+            if out.iter().any(|m| m.markov_w1.is_some()) {
+                "есть"
+            } else {
+                "нет"
+            },
         );
     }
     out
@@ -6637,7 +6941,6 @@ mod tests {
     }
 }
 
-
 // ══ DSpark: the block-parallel draft ══════════════════════════════════
 //
 // Not a classic MTP chain. One pass through the three stages produces the
@@ -6968,14 +7271,19 @@ pub static DSPARK_Q2TP_ENCODE: std::sync::OnceLock<fn(&[f32], usize, usize) -> V
 #[cfg(feature = "gpu")]
 pub fn dspark_gpu_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_DSPARK_GPU").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| {
+        std::env::var("CMF_DSPARK_GPU")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 /// The pack, built once per process (the stand runs one model).
 #[cfg(feature = "gpu")]
 pub fn dspark_pack_get(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<&'static DsparkPack> {
     static P: std::sync::OnceLock<Option<Box<DsparkPack>>> = std::sync::OnceLock::new();
-    P.get_or_init(|| dspark_pack_build(mtp, cfg).map(Box::new)).as_deref()
+    P.get_or_init(|| dspark_pack_build(mtp, cfg).map(Box::new))
+        .as_deref()
 }
 
 /// Build and upload the draft's pack. Returns `None` when the stack is
@@ -6994,9 +7302,7 @@ pub fn dspark_pack_get(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<&'static Dspark
 /// the trunk's own expert bytes plus the draft), never a card name.
 #[cfg(feature = "gpu")]
 pub fn dspark_reserve_note(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg, layers: &[Dsv4Layer]) {
-    if mtp.is_empty()
-        || std::env::var("CMF_DSV4_SPEC").is_ok_and(|v| v == "0")
-        || !dspark_gpu_on()
+    if mtp.is_empty() || std::env::var("CMF_DSV4_SPEC").is_ok_and(|v| v == "0") || !dspark_gpu_on()
     {
         return;
     }
@@ -7007,16 +7313,18 @@ pub fn dspark_reserve_note(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg, layers: &[Dsv4Layer])
             cortiq_core::TensorDtype::Q4TiledP
         }
     };
-    let gu_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
-        e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
-    });
-    let dn_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
-        e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
-    });
-    let gu = cortiq_core::quant::expected_nbytes(dt(gu_q2), &[cfg.moe_inter, cfg.dim])
-        .unwrap_or(0);
-    let dn = cortiq_core::quant::expected_nbytes(dt(dn_q2), &[cfg.dim, cfg.moe_inter])
-        .unwrap_or(0);
+    let gu_q2 = mtp[0]
+        .layer
+        .experts
+        .first()
+        .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
+    let dn_q2 = mtp[0]
+        .layer
+        .experts
+        .first()
+        .is_some_and(|e| e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
+    let gu = cortiq_core::quant::expected_nbytes(dt(gu_q2), &[cfg.moe_inter, cfg.dim]).unwrap_or(0);
+    let dn = cortiq_core::quant::expected_nbytes(dt(dn_q2), &[cfg.dim, cfg.moe_inter]).unwrap_or(0);
     let per = (2 * gu + dn) as u64;
     let n_res: usize = std::env::var("CMF_DSPARK_RESIDENT")
         .ok()
@@ -7060,25 +7368,26 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
     if mtp.is_empty() {
         return None;
     }
-    let n_res: usize = std::env::var("CMF_DSPARK_RESIDENT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| {
-            // No knob: take what the card actually has left, whatever the
-            // card is. The stages split the fit evenly after their shared
-            // experts; the clamp keeps the band where drafting is known to
-            // be worth the VRAM at the low end and past diminishing
-            // returns at the high one.
-            let native_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
-                e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
+    let n_res: usize =
+        std::env::var("CMF_DSPARK_RESIDENT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                // No knob: take what the card actually has left, whatever the
+                // card is. The stages split the fit evenly after their shared
+                // experts; the clamp keeps the band where drafting is known to
+                // be worth the VRAM at the low end and past diminishing
+                // returns at the high one.
+                let native_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
+                    e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
+                });
+                let gu_q2 = native_q2 || DSPARK_Q2TP_ENCODE.get().is_some();
+                let dn_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
+                    e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
+                });
+                let room = crate::gpu_wgpu::dsv4_draft_fit(cfg.moe_inter, cfg.dim, gu_q2, dn_q2);
+                (room.saturating_sub(mtp.len() + 1) / mtp.len().max(1)).clamp(8, 64)
             });
-            let gu_q2 = native_q2 || DSPARK_Q2TP_ENCODE.get().is_some();
-            let dn_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
-                e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
-            });
-            let room = crate::gpu_wgpu::dsv4_draft_fit(cfg.moe_inter, cfg.dim, gu_q2, dn_q2);
-            (room.saturating_sub(mtp.len() + 1) / mtp.len().max(1)).clamp(8, 64)
-        });
     // Frequency tallies: lines of `stage<TAB>expert<TAB>count`. Named by
     // `CMF_DSPARK_PACK`, or found as `<model>.dspark.tsv` beside the model
     // file — ship the tally next to the checkpoint and no knob is needed.
@@ -7180,7 +7489,11 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
     // ── upload: the small skeleton FIRST, the expert stacks after — the
     //    documented admission order (experts fill the card and the skeleton
     //    then misses). ──
-    let model = mtp[0].layer.experts.first().and_then(|e| e.w1.model_arc())?;
+    let model = mtp[0]
+        .layer
+        .experts
+        .first()
+        .and_then(|e| e.w1.model_arc())?;
     let mut skeleton = Vec::new();
     for m in mtp {
         let l = &m.layer;
@@ -7202,29 +7515,38 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
     // trunk's 2-bit experts. The at-upload requant is only the fallback for
     // files published before the converter's q2tp profile covered the MTP
     // stack (and only when the binary registered an encoder).
-    let native_q2 = mtp[0].layer.experts.first().is_some_and(|e| {
-        e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
-    });
+    let native_q2 = mtp[0]
+        .layer
+        .experts
+        .first()
+        .is_some_and(|e| e.w1.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
     let gu_q2 = native_q2 || crate::dsv4::DSPARK_Q2TP_ENCODE.get().is_some();
-    let dn_native = mtp[0].layer.experts.first().is_some_and(|e| {
-        e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP)
-    });
+    let dn_native = mtp[0]
+        .layer
+        .experts
+        .first()
+        .is_some_and(|e| e.w2.model_dtype() == Some(cortiq_core::TensorDtype::Q2TiledP));
     for (si, sp) in stages.iter().enumerate() {
         let ok = if native_q2 {
             crate::gpu_wgpu::dsv4_experts_ready(
-                &model, &sp.tensors, cfg.moe_inter, cfg.dim, true, dn_native,
-            )
-        } else if gu_q2 {
-            crate::gpu_wgpu::moe_expert_bufs_requant_gu(
                 &model,
                 &sp.tensors,
                 cfg.moe_inter,
                 cfg.dim,
+                true,
+                dn_native,
             )
-            .is_some()
+        } else if gu_q2 {
+            crate::gpu_wgpu::moe_expert_bufs_requant_gu(&model, &sp.tensors, cfg.moe_inter, cfg.dim)
+                .is_some()
         } else {
             crate::gpu_wgpu::dsv4_experts_ready(
-                &model, &sp.tensors, cfg.moe_inter, cfg.dim, false, false,
+                &model,
+                &sp.tensors,
+                cfg.moe_inter,
+                cfg.dim,
+                false,
+                false,
             )
         };
         if !ok {
@@ -7239,7 +7561,11 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
     eprintln!(
         "DSpark: пак драфта на карте — {} стадии по {} экспертов + shared",
         stages.len(),
-        stages.iter().map(|s| s.n_resident.to_string()).collect::<Vec<_>>().join("/")
+        stages
+            .iter()
+            .map(|s| s.n_resident.to_string())
+            .collect::<Vec<_>>()
+            .join("/")
     );
     Some(DsparkPack {
         stages,
@@ -7379,7 +7705,13 @@ pub fn dspark_draft_gpu(
     };
     // ── seed states: the real token, then noise, replicated over copies ──
     let ids: Vec<u32> = (0..block)
-        .map(|i| if i == 0 { last_token } else { DSPARK_NOISE_TOKEN })
+        .map(|i| {
+            if i == 0 {
+                last_token
+            } else {
+                DSPARK_NOISE_TOKEN
+            }
+        })
         .collect();
     let mut states0 = vec![0.0f32; block * hc * dim];
     let mut emb = vec![0.0f32; dim];
@@ -7541,7 +7873,13 @@ pub fn dspark_draft(
 
     // ── the block: the real token, then noise ──
     let ids: Vec<u32> = (0..block)
-        .map(|i| if i == 0 { last_token } else { DSPARK_NOISE_TOKEN })
+        .map(|i| {
+            if i == 0 {
+                last_token
+            } else {
+                DSPARK_NOISE_TOKEN
+            }
+        })
         .collect();
     let mut states = vec![vec![0.0f32; hc * dim]; block];
     let mut emb = vec![0.0f32; dim];
@@ -7614,11 +7952,7 @@ pub fn dspark_draft(
         let mut qr = vec![0.0f32; block * qrank];
         l.wq_a.matmat(&folded_all, block, &mut qr, pool);
         for i in 0..block {
-            rms_weighted(
-                &mut qr[i * qrank..(i + 1) * qrank],
-                &l.q_norm,
-                cfg.norm_eps,
-            );
+            rms_weighted(&mut qr[i * qrank..(i + 1) * qrank], &l.q_norm, cfg.norm_eps);
         }
         let mut q = vec![0.0f32; block * qdim];
         l.wq_b.matmat(&qr, block, &mut q, pool);
@@ -7641,14 +7975,25 @@ pub fn dspark_draft(
         }
         let mut blk_out = vec![0.0f32; block * dim];
         o_project_block(
-            &attn, block, &l.wo_a, &l.wo_b, cfg.o_groups, cfg.o_lora_rank, pool,
+            &attn,
+            block,
+            &l.wo_a,
+            &l.wo_b,
+            cfg.o_groups,
+            cfg.o_lora_rank,
+            pool,
             &mut blk_out,
         );
         for i in 0..block {
             let mut next = vec![0.0f32; hc * dim];
             hc_expand(
                 &blk_out[i * dim..(i + 1) * dim],
-                &resid[i], &post[i], &comb[i], hc, dim, &mut next,
+                &resid[i],
+                &post[i],
+                &comb[i],
+                hc,
+                dim,
+                &mut next,
             );
             states[i] = next;
         }
@@ -7679,7 +8024,10 @@ pub fn dspark_draft(
                 &mut ffn_comb[i],
             );
             hc_fold(
-                &states[i], &scratch.pre, hc, dim,
+                &states[i],
+                &scratch.pre,
+                hc,
+                dim,
                 &mut ffn_fold[i * dim..(i + 1) * dim],
             );
             rms_weighted(
@@ -7690,14 +8038,17 @@ pub fn dspark_draft(
             ffn_resid[i].copy_from_slice(&states[i]);
         }
         let mut moe_out = vec![0.0f32; block * dim];
-        moe_step_block(
-            &ffn_fold, block, l, cfg, &ids, si, pool, &mut moe_out,
-        );
+        moe_step_block(&ffn_fold, block, l, cfg, &ids, si, pool, &mut moe_out);
         for i in 0..block {
             let mut next = vec![0.0f32; hc * dim];
             hc_expand(
                 &moe_out[i * dim..(i + 1) * dim],
-                &ffn_resid[i], &ffn_post[i], &ffn_comb[i], hc, dim, &mut next,
+                &ffn_resid[i],
+                &ffn_post[i],
+                &ffn_comb[i],
+                hc,
+                dim,
+                &mut next,
             );
             states[i] = next;
         }
@@ -7720,13 +8071,16 @@ pub fn dspark_draft(
     let mut pre_norms = vec![vec![0.0f32; dim]; block];
     for i in 0..block {
         hc_head_fold(
-            &states[i], hfn, hscale, hbase, cfg, pool,
+            &states[i],
+            hfn,
+            hscale,
+            hbase,
+            cfg,
+            pool,
             &mut head_in[i * dim..(i + 1) * dim],
         );
         pre_norms[i].copy_from_slice(&head_in[i * dim..(i + 1) * dim]);
-        rms_weighted(
-            &mut head_in[i * dim..(i + 1) * dim], hnorm, cfg.norm_eps,
-        );
+        rms_weighted(&mut head_in[i * dim..(i + 1) * dim], hnorm, cfg.norm_eps);
     }
     let mut logits = vec![0.0f32; block * cfg.vocab];
     g.head.matmat(&head_in, block, &mut logits, pool);

@@ -18,7 +18,10 @@ fn toy_dir() -> Option<String> {
         "/private/tmp/claude-501/-Users-oleg-Documents-cortiq-bot-cmfpublic/674db62a-643b-4641-b330-5feed6d40b67/scratchpad"
             .to_string()
     });
-    std::path::Path::new(&d).join("q4.cmf").exists().then_some(d)
+    std::path::Path::new(&d)
+        .join("q4.cmf")
+        .exists()
+        .then_some(d)
 }
 
 #[test]
@@ -103,7 +106,13 @@ fn rejected_verify_leaves_the_walk_intact() {
             let st = &mut b.3;
             let pos0 = st.pos;
             let fed: Vec<u32> = (0..5u32)
-                .map(|i| if i == 0 { real } else { (real + 7 + i * 13) % vocab as u32 })
+                .map(|i| {
+                    if i == 0 {
+                        real
+                    } else {
+                        (real + 7 + i * 13) % vocab as u32
+                    }
+                })
                 .collect();
             let mut argmax = Vec::new();
             let mut lg_all = Vec::new();
@@ -151,8 +160,18 @@ fn rejected_verify_leaves_the_walk_intact() {
         for (x, y) in a.iter().zip(&verify_row0) {
             mx = mx.max((x - y).abs());
         }
-        let am_a = a.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0;
-        let am_v = verify_row0.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0;
+        let am_a = a
+            .iter()
+            .enumerate()
+            .max_by(|x, y| x.1.total_cmp(y.1))
+            .unwrap()
+            .0;
+        let am_v = verify_row0
+            .iter()
+            .enumerate()
+            .max_by(|x, y| x.1.total_cmp(y.1))
+            .unwrap()
+            .0;
         if am_a != am_v {
             // Random toy weights sit on ties everywhere; a flip is the
             // round-off contract showing, not a transaction fault. Count it.
@@ -169,7 +188,5 @@ fn rejected_verify_leaves_the_walk_intact() {
         mx = mx.max((x - y).abs());
     }
     assert!(mx < 2e-2, "финальный зонд: дрейф {mx:e}");
-    println!(
-        "транзакция держит walk на {rounds} откатах: дрейф ≤ {mx:e}, argmax-флипов {flips}"
-    );
+    println!("транзакция держит walk на {rounds} откатах: дрейф ≤ {mx:e}, argmax-флипов {flips}");
 }

@@ -28,8 +28,14 @@ fn the_two_ladder_forms_agree() {
         let params = &bytes[params_off..params_off + rows * 4];
         for r in 0..rows {
             let tab = cortiq_core::quant::q4tp_ladder(params, r);
-            let lo = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([params[r * 4], params[r * 4 + 1]]));
-            let st = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([params[r * 4 + 2], params[r * 4 + 3]]));
+            let lo = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([
+                params[r * 4],
+                params[r * 4 + 1],
+            ]));
+            let st = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([
+                params[r * 4 + 2],
+                params[r * 4 + 3],
+            ]));
             for (c, &t) in tab.iter().enumerate() {
                 let closed = (lo + c as f32 * st).exp2();
                 if t == 0.0 && closed == 0.0 {
@@ -38,7 +44,10 @@ fn the_two_ladder_forms_agree() {
                 let d = ((closed - t) as f64 / (t as f64).abs().max(1e-30)).abs();
                 if d > worst {
                     worst = d;
-                    worst_row = format!("{} строка {r} ступень {c}: {t:e} против {closed:e}, lo={lo} шаг={st}", e.name);
+                    worst_row = format!(
+                        "{} строка {r} ступень {c}: {t:e} против {closed:e}, lo={lo} шаг={st}",
+                        e.name
+                    );
                 }
             }
         }
@@ -79,7 +88,11 @@ fn the_two_ladder_forms_agree() {
             .collect();
         let num: f32 = plain.iter().zip(&mv).map(|(a, b)| (a - b) * (a - b)).sum();
         let den: f32 = plain.iter().map(|a| a * a).sum::<f32>().max(1e-20);
-        println!("{}: [{rows}x{cols}] матвек↔деквант {:.3e}", e.name, (num / den).sqrt());
+        println!(
+            "{}: [{rows}x{cols}] матвек↔деквант {:.3e}",
+            e.name,
+            (num / den).sqrt()
+        );
         checked += 1;
         if checked >= 6 {
             break;

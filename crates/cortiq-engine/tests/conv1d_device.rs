@@ -69,9 +69,7 @@ fn device_conv1d_matches_the_host_loop() {
         let w: Vec<f32> = (0..oc * ic * k).map(|_| lcg(&mut seed) * 0.1).collect();
         let want = reference(&x, &w, ic, oc, n, k, pad, dil, out_n);
         let mut got = vec![0f32; out_n * oc];
-        if !cortiq_engine::gpu::conv1d_gemm(
-            &x, &w, ic, oc, n, k, pad, dil, out_n, &mut got,
-        ) {
+        if !cortiq_engine::gpu::conv1d_gemm(&x, &w, ic, oc, n, k, pad, dil, out_n, &mut got) {
             eprintln!("({ic}x{oc} k={k} dil={dil}) refused — host arm covers it");
             continue;
         }
@@ -86,15 +84,18 @@ fn device_conv1d_matches_the_host_loop() {
             / want.len() as f32)
             .sqrt();
         let rel = err / den.max(1e-9);
-        eprintln!("({ic}x{oc} n={n} k={k} pad={pad} dil={dil}) rel err {:.5}", rel);
+        eprintln!(
+            "({ic}x{oc} n={n} k={k} pad={pad} dil={dil}) rel err {:.5}",
+            rel
+        );
         if rel > 0.01 {
             let (i, _) = want
                 .iter()
                 .zip(&got)
                 .enumerate()
                 .max_by(|a, b| {
-                    ((a.1 .0 - a.1 .1).abs())
-                        .partial_cmp(&(b.1 .0 - b.1 .1).abs())
+                    ((a.1.0 - a.1.1).abs())
+                        .partial_cmp(&(b.1.0 - b.1.1).abs())
                         .unwrap()
                 })
                 .map(|(i, v)| (i, v))
@@ -109,5 +110,9 @@ fn device_conv1d_matches_the_host_loop() {
             ));
         }
     }
-    assert!(failures.is_empty(), "device conv1d disagrees:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "device conv1d disagrees:\n{}",
+        failures.join("\n")
+    );
 }

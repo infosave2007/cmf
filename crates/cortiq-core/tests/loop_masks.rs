@@ -9,7 +9,7 @@
 //! silently zeroed the entire second pass's FFN. These tests hold the
 //! repaired contract from both directions.
 
-use cortiq_core::mask::{decode_masks_section, encode_masks_section, MaskCatalog, TaskMask};
+use cortiq_core::mask::{MaskCatalog, TaskMask, decode_masks_section, encode_masks_section};
 use cortiq_core::types::{LayerType, ModelArch, NormStyle};
 
 fn arch(loops: usize) -> ModelArch {
@@ -99,7 +99,10 @@ fn per_visit_rows_round_trip() {
     };
     let bytes = encode_masks_section(&cat, &a).unwrap();
     let back = decode_masks_section(&bytes, &a).unwrap();
-    assert_eq!(back.masks[0].ffn_masks, rows, "per-visit rows changed in flight");
+    assert_eq!(
+        back.masks[0].ffn_masks, rows,
+        "per-visit rows changed in flight"
+    );
     // And the virtual-layer indexing the runtime does is now in range
     // for every visit.
     for vl in 0..4 {
@@ -125,8 +128,14 @@ fn physical_rows_replicate_to_every_pass() {
     let back = decode_masks_section(&bytes, &a).unwrap();
     let m = &back.masks[0];
     assert_eq!(m.ffn_masks.len(), 4, "looped file must carry virtual rows");
-    assert_eq!(m.ffn_masks[2], phys[0], "pass 1, layer 0 must mirror the physical row");
-    assert_eq!(m.ffn_masks[3], phys[1], "pass 1, layer 1 must mirror the physical row");
+    assert_eq!(
+        m.ffn_masks[2], phys[0],
+        "pass 1, layer 0 must mirror the physical row"
+    );
+    assert_eq!(
+        m.ffn_masks[3], phys[1],
+        "pass 1, layer 1 must mirror the physical row"
+    );
 }
 
 /// An unlooped model's mask area is byte-identical to what it always

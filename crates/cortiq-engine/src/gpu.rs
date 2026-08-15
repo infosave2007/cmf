@@ -102,7 +102,12 @@ fn probe_cache_path() -> Option<std::path::PathBuf> {
 /// A different engine build or a different device simply does not match,
 /// so a stale file is inert rather than wrong.
 fn probe_cache_key_named(class: &str) -> String {
-    format!("{}\t{}\t{}", env!("CARGO_PKG_VERSION"), device_label(), class)
+    format!(
+        "{}\t{}\t{}",
+        env!("CARGO_PKG_VERSION"),
+        device_label(),
+        class
+    )
 }
 
 const CLASS_NAMES: [&str; 7] = [
@@ -158,10 +163,12 @@ fn probe_cache_adopt(text: &str) {
         };
         for (i, name) in CLASS_NAMES.iter().enumerate() {
             if probe_cache_key_named(name) == key {
-                let _ =
-                    PROBES[i]
-                        .state
-                        .compare_exchange(0, winner, Ordering::Relaxed, Ordering::Relaxed);
+                let _ = PROBES[i].state.compare_exchange(
+                    0,
+                    winner,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
                 tracing::debug!("gpu probe [{name}]: remembered → {verdict}");
             }
         }
@@ -635,7 +642,11 @@ mod probe_tests {
         // passing locally. GemmNt on purpose: the arbitration test never
         // touches it, and both run in one process.
         let mine = probe_cache_key_named("gemm-nt");
-        let state = || PROBES[OpClass::GemmNt as usize].state.load(Ordering::Relaxed);
+        let state = || {
+            PROBES[OpClass::GemmNt as usize]
+                .state
+                .load(Ordering::Relaxed)
+        };
 
         // Another device's verdict is not mine, whatever it claims.
         probe_cache_adopt("SomeOtherGPU/Vulkan\tgemm-nt\tgpu\n");
@@ -1233,7 +1244,14 @@ pub fn forward_token_graph(
         ),
         #[allow(unused_variables)]
         _ => {
-            let _ = (lm_head, final_norm, logits, loop_norm_at, layers_run, layer_base);
+            let _ = (
+                lm_head,
+                final_norm,
+                logits,
+                loop_norm_at,
+                layers_run,
+                layer_base,
+            );
             false
         }
     }
@@ -1738,9 +1756,7 @@ pub fn vae_upsample_conv(
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::vae_upsample_conv(w, bias, x, ic, oc, h, w_img, k, out),
         #[cfg(feature = "gpu")]
-        Backend::Wgpu => {
-            crate::gpu_wgpu::vae_upsample_conv(w, bias, x, ic, oc, h, w_img, k, out)
-        }
+        Backend::Wgpu => crate::gpu_wgpu::vae_upsample_conv(w, bias, x, ic, oc, h, w_img, k, out),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -1966,13 +1982,9 @@ pub fn conv1d_gemm(
 ) -> bool {
     match backend() {
         #[cfg(target_os = "macos")]
-        Backend::Metal => {
-            crate::gpu_metal::conv1d_gemm(x, w, ic, oc, n, k, pad, dil, out_n, yt)
-        }
+        Backend::Metal => crate::gpu_metal::conv1d_gemm(x, w, ic, oc, n, k, pad, dil, out_n, yt),
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
-        Backend::Wgpu => {
-            crate::gpu_wgpu::conv1d_gemm(x, w, ic, oc, n, k, pad, dil, out_n, yt)
-        }
+        Backend::Wgpu => crate::gpu_wgpu::conv1d_gemm(x, w, ic, oc, n, k, pad, dil, out_n, yt),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -2285,8 +2297,7 @@ pub fn graph_race_begin_generation() {
         // then 61.3 on its first answer with the backoff in place. One
         // flush it is.
         static FLUSHED: std::sync::Once = std::sync::Once::new();
-        static FIRST: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(true);
+        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
         if FIRST.swap(false, Ordering::Relaxed) {
             // Nothing dispatched yet.
         } else {
@@ -2412,8 +2423,7 @@ pub(crate) fn fp_bytes(data: &[u8]) -> u64 {
 /// `fp_bytes` over an f32 slice without a bytemuck dependency (the Metal
 /// backend builds with no GPU feature flags).
 pub(crate) fn fp_f32(data: &[f32]) -> u64 {
-    let bytes =
-        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     fp_bytes(bytes)
 }
 
@@ -2437,7 +2447,11 @@ mod fp_tests {
         for b in dense.iter_mut() {
             *b = b.wrapping_add(1);
         }
-        assert_ne!(h0, fp_bytes(&dense), "a fully different tensor slipped through");
+        assert_ne!(
+            h0,
+            fp_bytes(&dense),
+            "a fully different tensor slipped through"
+        );
         // Length participates: the same prefix at a shorter length is a
         // different key AND a different fingerprint.
         assert_ne!(h0, fp_bytes(&base[..n - 64]));
@@ -2472,7 +2486,6 @@ pub fn bake_precision_strict(on: bool) {
     #[cfg(not(feature = "gpu"))]
     let _ = on;
 }
-
 
 /// CMF_GRAPH_HOSTPROF=1: how a graph token's wall splits between the
 /// host encoding the command stream and the tail the GPU still owes
@@ -2513,7 +2526,6 @@ pub fn hostprof_total(t0: std::time::Instant) {
     }
 }
 
-
 /// Per-stage host-encode accumulator for the Metal token loop
 /// (CMF_GRAPH_HOSTPROF=1). Stage 0 = GDN-run encode; everything else
 /// falls out by subtraction from hostprof's encode total.
@@ -2543,7 +2555,6 @@ pub fn stageprof(stage: u32, dt: std::time::Duration) {
     }
 }
 
-
 /// Active weight bytes dispatched so far (Metal decode path); 0 where
 /// the backend does not count. The honest floor's numerator.
 pub fn weight_bytes_dispatched() -> u64 {
@@ -2558,7 +2569,6 @@ pub fn weight_bytes_dispatched() -> u64 {
     }
     total
 }
-
 
 /// The per-stage split of `weight_bytes_dispatched`:
 /// [misc, dense-ffn, moe, attn, gdn, head].

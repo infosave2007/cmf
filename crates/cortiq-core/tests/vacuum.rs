@@ -10,7 +10,7 @@
 //! These assert equality instead, on inputs where equality is derivable.
 
 use cortiq_core::quant::{
-    dequant_q2tp, q2tp_sections, q4tp_ladder, q2tp_ladder, GROUP_SIZE, Q2TP_CHUNK,
+    GROUP_SIZE, Q2TP_CHUNK, dequant_q2tp, q2tp_ladder, q2tp_sections, q4tp_ladder,
 };
 
 /// f16 bit patterns for a ladder with a base of 2^-3 and a step of 2^0.25
@@ -43,7 +43,11 @@ fn the_two_bit_ladder_is_the_four_bit_one_shifted_one_rung() {
     let two = q2tp_ladder(&p, 0);
 
     assert_eq!(two[0], 0.0, "rung 0 of the two-bit ladder is not zero");
-    assert_eq!(two[0].to_bits(), 0, "rung 0 is a negative or subnormal zero");
+    assert_eq!(
+        two[0].to_bits(),
+        0,
+        "rung 0 is a negative or subnormal zero"
+    );
     for c in 0..31 {
         assert_eq!(
             two[c + 1],
@@ -54,7 +58,11 @@ fn the_two_bit_ladder_is_the_four_bit_one_shifted_one_rung() {
     }
     // And the four-bit ladder itself is geometric from its stated base:
     // t[0] = 2^lo, t[c] = t[c-1]·2^step. Derivable, so assert it.
-    assert!((four[0] - 0.125).abs() < 1e-7, "base rung is {} not 2^-3", four[0]);
+    assert!(
+        (four[0] - 0.125).abs() < 1e-7,
+        "base rung is {} not 2^-3",
+        four[0]
+    );
     let ratio = 2f32.powf(0.25);
     for c in 1..32 {
         let want = four[c - 1] * ratio;

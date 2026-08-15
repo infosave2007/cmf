@@ -68,7 +68,8 @@ fn target_dtype(mode: &Mode, name: &str, src: TensorDtype, shape: &[usize]) -> O
                 && src == TensorDtype::Q4TiledP
                 && name.contains(".mtp.")
                 && (q2tp_expert_gate_or_up(name)
-                    || ((name.contains(".experts.") || name.contains(".shared_experts.")
+                    || ((name.contains(".experts.")
+                        || name.contains(".shared_experts.")
                         || name.contains(".shared_expert."))
                         && name.ends_with(".w2.weight"))) =>
         {
@@ -109,19 +110,18 @@ pub fn cmd_requant(
 
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
 
-    let recode = |entry: &cortiq_core::format::TensorEntry,
-                  dt: TensorDtype|
-     -> anyhow::Result<Vec<u8>> {
-        let (rows, cols) = (entry.shape[0], entry.shape[1]);
-        let mut buf = vec![0.0f32; rows * cols];
-        dequant_tensor(entry, model.entry_bytes(entry), &mut buf)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("dequantizing '{}'", entry.name))?;
-        Ok(match dt {
-            TensorDtype::Q2TiledP => encode_q2tp(&buf, rows, cols),
-            _ => encode_q4tp(&buf, rows, cols),
-        })
-    };
+    let recode =
+        |entry: &cortiq_core::format::TensorEntry, dt: TensorDtype| -> anyhow::Result<Vec<u8>> {
+            let (rows, cols) = (entry.shape[0], entry.shape[1]);
+            let mut buf = vec![0.0f32; rows * cols];
+            dequant_tensor(entry, model.entry_bytes(entry), &mut buf)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("dequantizing '{}'", entry.name))?;
+            Ok(match dt {
+                TensorDtype::Q2TiledP => encode_q2tp(&buf, rows, cols),
+                _ => encode_q4tp(&buf, rows, cols),
+            })
+        };
 
     if in_place {
         // The new payload rides into the old slot; the directory entry keeps
@@ -133,7 +133,10 @@ pub fn cmd_requant(
                 continue;
             };
             if entry.shard != 0 {
-                bail!("'{}' lives in a sibling shard; in-place needs shard 0", entry.name);
+                bail!(
+                    "'{}' lives in a sibling shard; in-place needs shard 0",
+                    entry.name
+                );
             }
             let data = recode(entry, dt)?;
             if data.len() as u64 > entry.nbytes {
@@ -277,8 +280,14 @@ mod tests {
         let m = CmfModel::open(path_s).unwrap();
         assert!(m.verify().is_empty(), "verify(): {:?}", m.verify());
         let by = |n: &str| m.tensors.iter().find(|t| t.name == n).unwrap();
-        assert_eq!(by("model.mtp.0.ffn.experts.0.w1.weight").dtype, TensorDtype::Q2TiledP);
-        assert_eq!(by("model.mtp.0.ffn.experts.0.w2.weight").dtype, TensorDtype::Q4TiledP);
+        assert_eq!(
+            by("model.mtp.0.ffn.experts.0.w1.weight").dtype,
+            TensorDtype::Q2TiledP
+        );
+        assert_eq!(
+            by("model.mtp.0.ffn.experts.0.w2.weight").dtype,
+            TensorDtype::Q4TiledP
+        );
         let trunk = by("model.layers.0.mlp.experts.0.gate_proj.weight");
         assert_eq!(trunk.dtype, TensorDtype::Q4TiledP);
         assert_eq!(m.entry_bytes(trunk), &q4[..], "trunk bytes changed");
@@ -289,7 +298,11 @@ mod tests {
         let mut back = vec![0.0f32; rows * cols];
         dequant_tensor(e, m.entry_bytes(e), &mut back).unwrap();
         let q2_direct = encode_q2tp(&vals_dequant(&q4, rows, cols), rows, cols);
-        assert_eq!(m.entry_bytes(e), &q2_direct[..], "not the conversion-path bytes");
+        assert_eq!(
+            m.entry_bytes(e),
+            &q2_direct[..],
+            "not the conversion-path bytes"
+        );
     }
 
     /// The heap corruption on the stand pointed at 2-bit tensors shaped
@@ -365,12 +378,20 @@ mod tests {
     /// through dequant would degrade the model itself, not just the draft.
     #[test]
     fn q2tp_draft_recode_is_scoped_to_the_mtp_stack() {
-        let t = |name: &str| {
-            target_dtype(&Mode::DraftQ2tp, name, TensorDtype::Q4TiledP, &[64, 256])
-        };
-        assert_eq!(t("model.mtp.0.ffn.experts.42.w1.weight"), Some(TensorDtype::Q2TiledP));
-        assert_eq!(t("model.mtp.2.ffn.experts.7.w3.weight"), Some(TensorDtype::Q2TiledP));
-        assert_eq!(t("model.mtp.1.ffn.shared_experts.w1.weight"), Some(TensorDtype::Q2TiledP));
+        let t =
+            |name: &str| target_dtype(&Mode::DraftQ2tp, name, TensorDtype::Q4TiledP, &[64, 256]);
+        assert_eq!(
+            t("model.mtp.0.ffn.experts.42.w1.weight"),
+            Some(TensorDtype::Q2TiledP)
+        );
+        assert_eq!(
+            t("model.mtp.2.ffn.experts.7.w3.weight"),
+            Some(TensorDtype::Q2TiledP)
+        );
+        assert_eq!(
+            t("model.mtp.1.ffn.shared_experts.w1.weight"),
+            Some(TensorDtype::Q2TiledP)
+        );
         // the draft's own down/skeleton stay 4-bit
         assert_eq!(t("model.mtp.0.ffn.experts.42.w2.weight"), None);
         assert_eq!(t("model.mtp.0.self_attn.wkv.weight"), None);
@@ -379,13 +400,21 @@ mod tests {
         assert_eq!(t("model.layers.7.mlp.experts.42.up_proj.weight"), None);
         // already 2-bit, or the wrong rank — nothing to do
         assert_eq!(
-            target_dtype(&Mode::DraftQ2tp, "model.mtp.0.ffn.experts.1.w1.weight",
-                TensorDtype::Q2TiledP, &[64, 256]),
+            target_dtype(
+                &Mode::DraftQ2tp,
+                "model.mtp.0.ffn.experts.1.w1.weight",
+                TensorDtype::Q2TiledP,
+                &[64, 256]
+            ),
             None
         );
         assert_eq!(
-            target_dtype(&Mode::DraftQ2tp, "model.mtp.0.ffn.experts.1.w1.weight",
-                TensorDtype::Q4TiledP, &[64]),
+            target_dtype(
+                &Mode::DraftQ2tp,
+                "model.mtp.0.ffn.experts.1.w1.weight",
+                TensorDtype::Q4TiledP,
+                &[64]
+            ),
             None
         );
     }

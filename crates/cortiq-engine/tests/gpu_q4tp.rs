@@ -379,7 +379,9 @@ fn wgpu_q4tp_batch_cost() {
         // 3 is the verify width a k=2 draft produces — the one shape the
         // decode actually runs, and the powers of two had skipped it.
         for b in [1usize, 2, 3, 4, 8] {
-            let xs: Vec<f32> = (0..b * cols).map(|i| (i % 97) as f32 / 97.0 - 0.5).collect();
+            let xs: Vec<f32> = (0..b * cols)
+                .map(|i| (i % 97) as f32 / 97.0 - 0.5)
+                .collect();
             let mut got = vec![0f32; b * rows];
             // Warm: the first call uploads the weight and builds the groups.
             for _ in 0..2 {

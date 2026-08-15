@@ -16,7 +16,9 @@ use anyhow::Context as _;
 use base64::Engine as _;
 use cortiq_core::mask::{MaskCatalog, MaskPriority, TaskMask};
 use cortiq_core::quant::f32_to_f16;
-use cortiq_core::{CmfModel, SelectionDescriptor, SkillRecord, TensorDtype, TensorEntry, TensorSpec};
+use cortiq_core::{
+    CmfModel, SelectionDescriptor, SkillRecord, TensorDtype, TensorEntry, TensorSpec,
+};
 use cortiq_engine::{Pipeline, SamplerConfig};
 use std::path::Path;
 use std::sync::Arc;
@@ -697,8 +699,11 @@ pub fn run_skill_export(
             base.header.arch.arch_name
         );
     }
-    let base_by_name: std::collections::HashMap<&str, u64> =
-        base.tensors.iter().map(|t| (t.name.as_str(), t.hash)).collect();
+    let base_by_name: std::collections::HashMap<&str, u64> = base
+        .tensors
+        .iter()
+        .map(|t| (t.name.as_str(), t.hash))
+        .collect();
     let mut refs: Vec<TensorSpecRef> = Vec::new();
     let mut layers: Vec<usize> = Vec::new();
     let sbytes = spec.primary_bytes();
@@ -828,7 +833,13 @@ pub fn run_skill_apply(
     carried.base_dir_hash = None;
     header.skills = vec![carried];
     let catalog = (!skill.masks.masks.is_empty()).then(|| skill.masks.clone());
-    CmfModel::write_ref(output, &header, &refs, catalog.as_ref(), base.vocab.as_deref())?;
+    CmfModel::write_ref(
+        output,
+        &header,
+        &refs,
+        catalog.as_ref(),
+        base.vocab.as_deref(),
+    )?;
     println!(
         "✓ applied skill '{}': {replaced} tensor(s) replaced, {} masks carried → {output}",
         rec.id,
@@ -1174,7 +1185,13 @@ pub fn run_skill_bake(
         default_task: "specialist".into(),
     });
     let tmp = format!("{output}.tmp");
-    CmfModel::write(&tmp, &header, &tensors, catalog.as_ref(), model.vocab.as_deref())?;
+    CmfModel::write(
+        &tmp,
+        &header,
+        &tensors,
+        catalog.as_ref(),
+        model.vocab.as_deref(),
+    )?;
 
     // ── end-to-end gate: held-out PPL through the REAL runtime ──
     let held_ids: Vec<&Vec<u32>> = chunks[..held.min(chunks.len())].iter().collect();

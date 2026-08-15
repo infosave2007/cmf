@@ -136,11 +136,7 @@ fn powered() -> Option<bool> {
             }
         }
     }
-    if any {
-        Some(false)
-    } else {
-        None
-    }
+    if any { Some(false) } else { None }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -242,7 +238,11 @@ mod tests {
         // The measured Android case: a third of peak while decoding.
         let r = s.clock_ratio().unwrap();
         assert!(r > 0.28 && r < 0.29, "{r}");
-        assert!(s.summary().contains("691 of 2400 MHz (29%)"), "{}", s.summary());
+        assert!(
+            s.summary().contains("691 of 2400 MHz (29%)"),
+            "{}",
+            s.summary()
+        );
     }
 
     #[test]

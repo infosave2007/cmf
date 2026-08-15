@@ -8,7 +8,7 @@
 //! is kept. Runtime semantics equal the `CMF_MOE_MASK` runtime mask
 //! (softmax renormalizes over the kept set) — gate on the same ppl A/B.
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use cortiq_core::{CmfModel, TensorDtype, TensorSpecRef};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -131,7 +131,12 @@ pub fn cmd_moe_mask(
     if catalog.masks.iter().any(|m| m.name == name) {
         bail!("mask '{name}' already exists in {model_path}");
     }
-    let task_id = catalog.masks.iter().map(|m| m.task_id + 1).max().unwrap_or(1);
+    let task_id = catalog
+        .masks
+        .iter()
+        .map(|m| m.task_id + 1)
+        .max()
+        .unwrap_or(1);
     let sparsity = 1.0 - kept_total as f32 / (masked_layers * ne) as f32;
     catalog.masks.push(cortiq_core::TaskMask {
         task_id,
@@ -239,7 +244,10 @@ pub fn cmd_moe_defrag(
         kept.sort_unstable();
         remap.insert(
             li,
-            kept.iter().enumerate().map(|(new, &old)| (old, new)).collect(),
+            kept.iter()
+                .enumerate()
+                .map(|(new, &old)| (old, new))
+                .collect(),
         );
     }
     if remap.is_empty() {

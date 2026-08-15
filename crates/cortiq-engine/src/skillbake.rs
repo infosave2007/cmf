@@ -340,51 +340,51 @@ impl Pass<'_> {
         const POS_CHUNK: usize = 64;
         let scored = b * (t - 1);
         for bi in 0..b {
-        let base = bi * t;
-        let mut p0 = 0usize;
-        while p0 < t - 1 {
-            let pc = POS_CHUNK.min(t - 1 - p0);
-            let mut logits = vec![0f32; pc * vocab];
-            ops::gemm_nt(
-                &hn[(base + p0) * hsz..(base + p0 + pc) * hsz],
-                lm,
-                &mut logits,
-                pc,
-                hsz,
-                vocab,
-                pool,
-            );
-            for r in 0..pc {
-                let target = ids[base + p0 + r + 1] as usize;
-                let row = &mut logits[r * vocab..(r + 1) * vocab];
-                let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
-                let mut sum = 0f64;
-                for v in row.iter() {
-                    sum += ((*v as f64) - mx).exp();
-                }
-                nll += mx + sum.ln() - row[target] as f64;
-                if grad.is_some() {
-                    // dCE/dlogit = softmax − onehot, scaled by 1/scored.
-                    let inv_n = 1.0 / scored as f64;
-                    for v in row.iter_mut() {
-                        *v = ((((*v as f64) - mx).exp() / sum) * inv_n) as f32;
-                    }
-                    row[target] -= inv_n as f32;
-                }
-            }
-            if grad.is_some() {
-                ops::gemm_dx(
-                    &logits,
+            let base = bi * t;
+            let mut p0 = 0usize;
+            while p0 < t - 1 {
+                let pc = POS_CHUNK.min(t - 1 - p0);
+                let mut logits = vec![0f32; pc * vocab];
+                ops::gemm_nt(
+                    &hn[(base + p0) * hsz..(base + p0 + pc) * hsz],
                     lm,
-                    &mut dh_n[(base + p0) * hsz..(base + p0 + pc) * hsz],
+                    &mut logits,
                     pc,
                     hsz,
                     vocab,
                     pool,
                 );
+                for r in 0..pc {
+                    let target = ids[base + p0 + r + 1] as usize;
+                    let row = &mut logits[r * vocab..(r + 1) * vocab];
+                    let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+                    let mut sum = 0f64;
+                    for v in row.iter() {
+                        sum += ((*v as f64) - mx).exp();
+                    }
+                    nll += mx + sum.ln() - row[target] as f64;
+                    if grad.is_some() {
+                        // dCE/dlogit = softmax − onehot, scaled by 1/scored.
+                        let inv_n = 1.0 / scored as f64;
+                        for v in row.iter_mut() {
+                            *v = ((((*v as f64) - mx).exp() / sum) * inv_n) as f32;
+                        }
+                        row[target] -= inv_n as f32;
+                    }
+                }
+                if grad.is_some() {
+                    ops::gemm_dx(
+                        &logits,
+                        lm,
+                        &mut dh_n[(base + p0) * hsz..(base + p0 + pc) * hsz],
+                        pc,
+                        hsz,
+                        vocab,
+                        pool,
+                    );
+                }
+                p0 += pc;
             }
-            p0 += pc;
-        }
         }
         let Some((dmask, dffn)) = grad else {
             return (nll, scored);

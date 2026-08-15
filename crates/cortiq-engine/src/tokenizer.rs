@@ -794,8 +794,14 @@ impl Tokenizer {
             .iter()
             .map(|m| {
                 (
-                    m.get("role").and_then(|v| v.as_str()).unwrap_or("user").to_string(),
-                    m.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    m.get("role")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("user")
+                        .to_string(),
+                    m.get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                 )
             })
             .collect();
@@ -860,9 +866,8 @@ impl Tokenizer {
             .iter()
             .map(minijinja::Value::from_serialize)
             .collect();
-        let tools_v: Option<Vec<minijinja::Value>> = tools.map(|ts| {
-            ts.iter().map(minijinja::Value::from_serialize).collect()
-        });
+        let tools_v: Option<Vec<minijinja::Value>> =
+            tools.map(|ts| ts.iter().map(minijinja::Value::from_serialize).collect());
         let tpl = env.get_template("chat")?;
         // Three axes, each present only when meaningful: templates guard
         // with `is defined`, and an explicit null flips those guards.

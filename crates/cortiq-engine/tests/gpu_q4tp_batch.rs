@@ -10,10 +10,10 @@
 
 #![cfg(feature = "gpu")]
 
+use cortiq_core::CmfModel;
 use cortiq_core::format::{CmfHeader, TensorSpec};
 use cortiq_core::quant::{f32_to_f16, q2tp_sections, q4tp_put_code, q4tp_sections};
 use cortiq_core::types::{ModelArch, QuantType, TensorDtype};
-use cortiq_core::CmfModel;
 use std::sync::Arc;
 
 const GROUP: usize = 32;
@@ -34,7 +34,11 @@ fn encode(vals: &[f32], rows: usize, cols: usize, scale: f32) -> Vec<u8> {
                 let q = |v: f32| ((v * inv).round_ties_even().clamp(-8.0, 7.0) as i8 + 8) as u8;
                 dst[k] = (q(tile[k * 2]) & 0x0F) | (q(tile[k * 2 + 1]) << 4);
             }
-            q4tp_put_code(&mut out[codes_off + r * stride..codes_off + (r + 1) * stride], g, 0);
+            q4tp_put_code(
+                &mut out[codes_off + r * stride..codes_off + (r + 1) * stride],
+                g,
+                0,
+            );
         }
         let lo = f32_to_f16(scale.log2());
         out[params_off + r * 4..params_off + r * 4 + 2].copy_from_slice(&lo.to_le_bytes());
@@ -59,12 +63,18 @@ fn encode2(vals: &[f32], rows: usize, cols: usize, scale: f32) -> Vec<u8> {
             for k in 0..8 {
                 let mut byte = 0u8;
                 for j in 0..4 {
-                    let q = (tile[k * 4 + j] * inv + 1.5).round_ties_even().clamp(0.0, 3.0) as u8;
+                    let q = (tile[k * 4 + j] * inv + 1.5)
+                        .round_ties_even()
+                        .clamp(0.0, 3.0) as u8;
                     byte |= q << (2 * j);
                 }
                 dst[k] = byte;
             }
-            q4tp_put_code(&mut out[codes_off + r * stride..codes_off + (r + 1) * stride], g, 1);
+            q4tp_put_code(
+                &mut out[codes_off + r * stride..codes_off + (r + 1) * stride],
+                g,
+                1,
+            );
         }
         let lo = f32_to_f16(scale.log2());
         out[params_off + r * 4..params_off + r * 4 + 2].copy_from_slice(&lo.to_le_bytes());
@@ -174,8 +184,12 @@ fn one_shape(rows: usize, cols: usize, two_bit: bool) {
     // The host reference reads the SAME bytes back, so the comparison
     // is device-versus-host arithmetic and not encoder-versus-kernel.
     let mut wq = vec![0f32; rows * cols];
-    cortiq_core::quant::dequant_tensor(&model.tensors[idx], model.entry_bytes(&model.tensors[idx]), &mut wq)
-        .unwrap();
+    cortiq_core::quant::dequant_tensor(
+        &model.tensors[idx],
+        model.entry_bytes(&model.tensors[idx]),
+        &mut wq,
+    )
+    .unwrap();
 
     let mut worst = 0f32;
     for &b in &[375usize, 1879] {

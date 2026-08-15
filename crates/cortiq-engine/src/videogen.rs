@@ -20,10 +20,10 @@ use crate::audiovae::AudioVae;
 use crate::mmh3::{Layout, MiniMaxH3, time_shift_sigma};
 use crate::qwen3te::{ImageSpan, Qwen3Encoder};
 use crate::qwen3vis::{self, VisionTower};
-use crate::vae3d::VideoVaeEncoder;
 use crate::sampler::SplitMix64;
 use crate::tokenizer::Tokenizer;
 use crate::vae3d::VideoVae;
+use crate::vae3d::VideoVaeEncoder;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -143,8 +143,7 @@ pub fn video_latent_t(frames: usize) -> usize {
 /// `(frames, latent_t, audio_t)` for a requested length.
 pub fn temporal_shape(len: usize) -> (usize, usize, usize) {
     let frames = align_frames(len);
-    let audio_t =
-        ((frames as f64 / FPS as f64) * AUDIO_LATENT_FPS as f64).round() as usize;
+    let audio_t = ((frames as f64 / FPS as f64) * AUDIO_LATENT_FPS as f64).round() as usize;
     (frames, video_latent_t(frames), audio_t)
 }
 
@@ -249,9 +248,7 @@ fn mmh3_gpu_parity_probe(path: &Path) -> Result<bool, String> {
         );
     }
     if !crate::gpu::q4tp_matmat(&model, idx, &xs, b, rows, cols, &mut gpu) {
-        tracing::info!(
-            "mmh3 GPU parity probe: q4tp_matmat refused ({rows}x{cols}) — host path"
-        );
+        tracing::info!("mmh3 GPU parity probe: q4tp_matmat refused ({rows}x{cols}) — host path");
         if std::env::var("CMF_GPU_DEBUG").is_ok() {
             eprintln!("mmh3 probe: q4tp_matmat refused {rows}x{cols}");
         }
@@ -357,8 +354,12 @@ fn generate_inner(
                 tags.push(1);
             }
             let (patches, gh, gw) = qwen3vis::preprocess(
-                &fitted, p.height, p.width,
-                tower.patch_size, tower.temporal_patch, tower.merge,
+                &fitted,
+                p.height,
+                p.width,
+                tower.patch_size,
+                tower.temporal_patch,
+                tower.merge,
             );
             let (merged, deep) = tower.forward(&patches, gh, gw);
             let n_img = merged.len() / tower.out_hidden;
@@ -373,7 +374,12 @@ fn generate_inner(
             }
             ids.push(VISION_END);
             tags.push(0);
-            spans.push(ImageSpan { start, len: n_img, merged_h: gh / tower.merge, merged_w: gw / tower.merge });
+            spans.push(ImageSpan {
+                start,
+                len: n_img,
+                merged_h: gh / tower.merge,
+                merged_w: gw / tower.merge,
+            });
             embeds.push(merged);
             if deepstack.is_empty() {
                 deepstack = deep;
@@ -428,9 +434,7 @@ fn generate_inner(
     // 25.7 GB full-encoder fl2va file this is the difference between
     // denoise steps at DiT speed and 320 s/step of SSD thrash.
     {
-        let dropped = model.advise_done(|n| {
-            n.starts_with("model.") || n.starts_with("vis.")
-        });
+        let dropped = model.advise_done(|n| n.starts_with("model.") || n.starts_with("vis."));
         if dropped > 0 {
             tracing::info!(
                 "encoder pages released after prompt encode: {} MB",
@@ -442,7 +446,10 @@ fn generate_inner(
     // ── denoise ──
     let (video, audio) = {
         let dit = MiniMaxH3::from_cmf(&model)?;
-        let kf: Vec<(usize, usize)> = keyframes.iter().map(|&(_, idx)| (idx, frames_total)).collect();
+        let kf: Vec<(usize, usize)> = keyframes
+            .iter()
+            .map(|&(_, idx)| (idx, frames_total))
+            .collect();
         let layout = if kf.is_empty() {
             Layout::t2va(ids.len(), latent_t, lat_h, lat_w, audio_t)
         } else {
@@ -464,7 +471,9 @@ fn generate_inner(
                 "  text {} tok, refined rms {:.4}, sigmas {:?}",
                 ids.len(),
                 rms(&text),
-                sg.iter().map(|v| (v * 1e4).round() / 1e4).collect::<Vec<_>>()
+                sg.iter()
+                    .map(|v| (v * 1e4).round() / 1e4)
+                    .collect::<Vec<_>>()
             );
         }
         for i in 0..p.steps {
@@ -487,7 +496,10 @@ fn generate_inner(
             if prof {
                 eprintln!(
                     "  step {i}: sv {sv:.4}->{sv_n:.4} v_vel {:.4} a_vel {:.4} | video {:.4} audio {:.4}",
-                    rms(&dv), rms(&da), rms(&v), rms(&a)
+                    rms(&dv),
+                    rms(&da),
+                    rms(&v),
+                    rms(&a)
                 );
             }
             progress("denoise", i + 1, p.steps);

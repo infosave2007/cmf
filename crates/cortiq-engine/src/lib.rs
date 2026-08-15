@@ -13,20 +13,13 @@ pub mod gpu;
 pub mod gpu_metal;
 #[cfg(feature = "gpu")]
 pub mod gpu_wgpu;
-/// The native Vulkan lane — an accelerator behind a capability probe,
-/// present only where Vulkan is.
-#[cfg(all(
-    feature = "gpu",
-    any(target_os = "linux", target_os = "windows", target_os = "android")
-))]
-pub mod vulkan;
 pub mod imagegen;
 pub mod inference;
 pub mod kv_cache;
 pub mod linear_core;
 pub mod loader;
-pub mod mmh3;
 pub mod mm_ab;
+pub mod mmh3;
 pub mod music3;
 pub mod nystrom;
 pub mod pin;
@@ -45,6 +38,13 @@ pub mod tokenizer;
 pub mod vae;
 pub mod vae3d;
 pub mod videogen;
+/// The native Vulkan lane — an accelerator behind a capability probe,
+/// present only where Vulkan is.
+#[cfg(all(
+    feature = "gpu",
+    any(target_os = "linux", target_os = "windows", target_os = "android")
+))]
+pub mod vulkan;
 
 pub use nystrom::NystromState;
 pub use pipeline::{GenerateResult, Pipeline, TokenCallback, TokenTrace};
@@ -87,7 +87,7 @@ pub fn gpu_moe_job_for_test(
         q4t: false,
         q4tp: false,
         gu_q2: false,
-            swiglu_limit: 0.0,
+        swiglu_limit: 0.0,
     }
 }
 

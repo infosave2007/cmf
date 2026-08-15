@@ -967,9 +967,11 @@ impl LayerKvCache {
         // above. If one shows up under an F32 cache the format is lying
         // about something and the transfer must not proceed.
         if self.kcol.iter().any(|c| !c.is_empty()) || self.vcol.iter().any(|c| !c.is_empty()) {
-            return Err("kv export: frozen columns under an F32 cache — refusing to ship \
+            return Err(
+                "kv export: frozen columns under an F32 cache — refusing to ship \
                         a state this format does not describe"
-                .into());
+                    .into(),
+            );
         }
         let mut out = Vec::with_capacity(self.memory_bytes() / if f16 { 2 } else { 1 } + 64);
         let mut u = |v: u32, o: &mut Vec<u8>| o.extend_from_slice(&v.to_le_bytes());
@@ -1297,8 +1299,12 @@ mod tests {
         let (heads, hd) = (2usize, 4usize);
         let mut a = LayerKvCache::new(heads, hd);
         for p in 0..5 {
-            let k: Vec<f32> = (0..heads * hd).map(|i| (p * 10 + i) as f32 * 0.031).collect();
-            let v: Vec<f32> = (0..heads * hd).map(|i| (p * 7 + i) as f32 * -0.017).collect();
+            let k: Vec<f32> = (0..heads * hd)
+                .map(|i| (p * 10 + i) as f32 * 0.031)
+                .collect();
+            let v: Vec<f32> = (0..heads * hd)
+                .map(|i| (p * 7 + i) as f32 * -0.017)
+                .collect();
             a.append(&k, &v, &[true, true]);
         }
         a.linear_state = vec![0.5, -0.25, 1.0];

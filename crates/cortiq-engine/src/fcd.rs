@@ -182,7 +182,6 @@ pub fn select_checkpoint(
 
 // ───────────────────────── model container ─────────────────────────
 
-
 /// Wall-clock phase counters for the bake profiler (CMF_BAKE_PROF=1
 /// prints them). Written from worker threads, so atomics; nanoseconds.
 pub mod prof {
@@ -355,8 +354,6 @@ fn deq(model: &CmfModel, name: &str) -> Result<Vec<f32>, String> {
     Ok(out)
 }
 
-
-
 /// Physical RAM total, for the hard replica ceiling.
 fn physical_total_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
@@ -429,7 +426,6 @@ fn available_ram_bytes() -> Option<u64> {
     #[allow(unreachable_code)]
     None
 }
-
 
 /// `deq` for sibling modules (the bake's Phase-B masters dequant once,
 /// straight from the source container).
@@ -851,7 +847,12 @@ pub(crate) struct LnFfn<'a> {
     pub(crate) gu: Option<&'a [f32]>,
 }
 
-fn ln_ffn<'a>(fm: &'a FcdModel, ts: Option<&'a TrainState>, li: usize, mats: &'a LayerMats) -> LnFfn<'a> {
+fn ln_ffn<'a>(
+    fm: &'a FcdModel,
+    ts: Option<&'a TrainState>,
+    li: usize,
+    mats: &'a LayerMats,
+) -> LnFfn<'a> {
     if let Some(t) = ts {
         if let Some(s) = t.slot(li) {
             let b = s * PARAMS_PER_LAYER;
@@ -1193,8 +1194,7 @@ impl FcdModel {
                 hsz: self.hidden,
             };
             let mut attn_out = vec![0f32; n * self.hidden];
-            if let Some(ch) = crate::gpu_wgpu::attn_chain_f32(n1, &cfg, &mut attn_out, want_acts)
-            {
+            if let Some(ch) = crate::gpu_wgpu::attn_chain_f32(n1, &cfg, &mut attn_out, want_acts) {
                 // Rebuild the host-visible acts from the raw plane, with
                 // exactly the host split's bias/gate arithmetic.
                 let mut qraw = vec![0f32; n * qrows];
@@ -1203,8 +1203,7 @@ impl FcdModel {
                 for r in 0..n {
                     let row = &ch.qkv_plane[r * fused..(r + 1) * fused];
                     qraw[r * qrows..(r + 1) * qrows].copy_from_slice(&row[..qrows]);
-                    kpre[r * kvdim..(r + 1) * kvdim]
-                        .copy_from_slice(&row[qrows..qrows + kvdim]);
+                    kpre[r * kvdim..(r + 1) * kvdim].copy_from_slice(&row[qrows..qrows + kvdim]);
                     vproj[r * kvdim..(r + 1) * kvdim].copy_from_slice(&row[qrows + kvdim..]);
                 }
                 if let Some((bq, bk, bv)) = bias {

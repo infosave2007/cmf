@@ -58,7 +58,13 @@ fn batched_q4tp_matvec_matches_single_bitwise() {
         }
         let mut batched = vec![0.0f32; b * rows];
         assert!(cortiq_engine::gpu_wgpu::q4tp_matvec_batch_for_test(
-            &model, e, &xs, b, rows, cols, &mut batched,
+            &model,
+            e,
+            &xs,
+            b,
+            rows,
+            cols,
+            &mut batched,
         ));
         let n_diff = single
             .iter()

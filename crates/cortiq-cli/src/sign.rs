@@ -74,7 +74,10 @@ pub fn cmd_sign(model_path: &str, key_path: &str) -> anyhow::Result<()> {
             "sig": hex(&sig.to_bytes()),
         }))?,
     )?;
-    println!("signed: {out}\npubkey: {}", hex(key.verifying_key().as_bytes()));
+    println!(
+        "signed: {out}\npubkey: {}",
+        hex(key.verifying_key().as_bytes())
+    );
     Ok(())
 }
 

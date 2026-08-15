@@ -116,7 +116,13 @@ fn scaled(q: &[u8; 64], quality: u32) -> [u8; 64] {
 /// next to a 36-layer decoder.
 fn fdct(block: &mut [f32; 64]) {
     let mut tmp = [0f32; 64];
-    let c = |u: usize| if u == 0 { std::f32::consts::FRAC_1_SQRT_2 } else { 1.0 };
+    let c = |u: usize| {
+        if u == 0 {
+            std::f32::consts::FRAC_1_SQRT_2
+        } else {
+            1.0
+        }
+    };
     let mut cos_t = [[0f32; 8]; 8];
     for (x, row) in cos_t.iter_mut().enumerate() {
         for (u, v) in row.iter_mut().enumerate() {
@@ -151,7 +157,11 @@ struct BitWriter {
 
 impl BitWriter {
     fn new() -> Self {
-        Self { out: Vec::new(), acc: 0, n: 0 }
+        Self {
+            out: Vec::new(),
+            acc: 0,
+            n: 0,
+        }
     }
     fn put(&mut self, code: u16, len: u8) {
         self.acc = (self.acc << len) | code as u32;

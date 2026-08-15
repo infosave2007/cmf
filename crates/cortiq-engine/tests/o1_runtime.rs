@@ -163,7 +163,8 @@ fn o1_mixed_layers_split_exact_and_o1() {
 /// irreversible"): the bounded state makes it a memcpy.
 #[test]
 fn snapshot_restore_bit_exact() {
-    let (m, w, sink, d, dv, heads, t_pre) = (8usize, 16usize, 2usize, 32usize, 32usize, 2usize, 96usize);
+    let (m, w, sink, d, dv, heads, t_pre) =
+        (8usize, 16usize, 2usize, 32usize, 32usize, 2usize, 96usize);
     let mut st = cortiq_engine::nystrom::NystromState::new_group(m, w, sink, heads);
     let det = |i: usize, j: usize, salt: u64| -> f32 {
         let x = (i as u64)
@@ -219,4 +220,3 @@ fn snapshot_restore_bit_exact() {
         assert!(x.to_bits() == y.to_bits(), "restore is not bit-exact");
     }
 }
-

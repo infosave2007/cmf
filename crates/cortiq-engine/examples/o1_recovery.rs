@@ -54,7 +54,9 @@
 use cortiq_engine::nystrom::NystromState;
 
 fn unif(s: &mut u64) -> f32 {
-    *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *s = s
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     ((*s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
 }
 
@@ -121,7 +123,6 @@ fn trial(m: usize, w: usize, sink: usize, amp: f32, depth: usize, seed: u64) -> 
     got[0] / want0
 }
 
-
 /// The background channel on its own: no needle, no signal, just the
 /// skeleton's error in estimating a far field of ordinary keys.
 ///
@@ -179,13 +180,22 @@ fn background_error(m: usize, w: usize, sink: usize, depth: usize, seed: u64) ->
     for (j, &l) in logits.iter().enumerate() {
         let e = ((l - mx) as f64).exp();
         den += e;
-        let src = if j == t { &v_new[..] } else { &vs[j * dv..(j + 1) * dv] };
+        let src = if j == t {
+            &v_new[..]
+        } else {
+            &vs[j * dv..(j + 1) * dv]
+        };
         for (c, wc) in want.iter_mut().enumerate() {
             *wc += e * src[c] as f64;
         }
     }
     let want: Vec<f32> = want.iter().map(|x| (x / den) as f32).collect();
-    let num: f32 = got.iter().zip(&want).map(|(g, x)| (g - x) * (g - x)).sum::<f32>().sqrt();
+    let num: f32 = got
+        .iter()
+        .zip(&want)
+        .map(|(g, x)| (g - x) * (g - x))
+        .sum::<f32>()
+        .sqrt();
     let den2: f32 = want.iter().map(|x| x * x).sum::<f32>().sqrt();
     num / den2.max(1e-9)
 }
@@ -223,7 +233,10 @@ fn cell(m: usize, w: usize, sink: usize, amp: f32, depth: usize, trials: usize) 
 }
 
 fn main() {
-    let trials: usize = std::env::var("TRIALS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
+    let trials: usize = std::env::var("TRIALS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(48);
     let (w, sink, depth) = (128usize, 4usize, 512usize);
     let ms = [4usize, 8, 16, 32, 64];
     let amps = [2.0f32, 4.0, 6.0, 8.0, 12.0];
@@ -278,13 +291,15 @@ fn main() {
         println!();
     }
 
-
     // ── the background channel alone ───────────────────────────────────
     // No needle. This is the sum over ~n far keys that the skeleton
     // estimates from m landmarks, and nothing else — the channel the
     // recovery statistic divides by and therefore cannot see cleanly.
     println!("\nbackground-only error (no needle) — the denominator channel isolated");
-    println!("{:>6}{:>14}{:>14}{:>12}", "m", "rel error", "sd", "log2 drop");
+    println!(
+        "{:>6}{:>14}{:>14}{:>12}",
+        "m", "rel error", "sd", "log2 drop"
+    );
     let mut prev: Option<f32> = None;
     let mut pts: Vec<(f32, f32)> = Vec::new();
     for &m in &ms {
@@ -302,7 +317,9 @@ fn main() {
         pts.push(((m as f32).ln(), mean.max(1e-9).ln()));
     }
     let n = pts.len() as f32;
-    let (sx, sy) = pts.iter().fold((0f32, 0f32), |(a, b), (x, y)| (a + x, b + y));
+    let (sx, sy) = pts
+        .iter()
+        .fold((0f32, 0f32), |(a, b), (x, y)| (a + x, b + y));
     let (mx, my) = (sx / n, sy / n);
     let num: f32 = pts.iter().map(|(x, y)| (x - mx) * (y - my)).sum();
     let den: f32 = pts.iter().map(|(x, _)| (x - mx) * (x - mx)).sum();
@@ -323,8 +340,16 @@ fn main() {
     // partial recoveries in between.
     println!("\nshape of the response in m");
     for (amp, row) in &grid {
-        let m50 = ms.iter().zip(row).find(|(_, c)| c.detected >= 0.5).map(|(m, _)| *m);
-        let m95 = ms.iter().zip(row).find(|(_, c)| c.strict >= 0.5).map(|(m, _)| *m);
+        let m50 = ms
+            .iter()
+            .zip(row)
+            .find(|(_, c)| c.detected >= 0.5)
+            .map(|(m, _)| *m);
+        let m95 = ms
+            .iter()
+            .zip(row)
+            .find(|(_, c)| c.strict >= 0.5)
+            .map(|(m, _)| *m);
         // Deficit vs m on a log-log slope: a power law gives a stable
         // exponent, a step gives a slope that runs away at the edge.
         let slope = {
@@ -338,7 +363,9 @@ fn main() {
                 f32::NAN
             } else {
                 let n = pts.len() as f32;
-                let (sx, sy) = pts.iter().fold((0f32, 0f32), |(a, b), (x, y)| (a + x, b + y));
+                let (sx, sy) = pts
+                    .iter()
+                    .fold((0f32, 0f32), |(a, b), (x, y)| (a + x, b + y));
                 let (mx, my) = (sx / n, sy / n);
                 let num: f32 = pts.iter().map(|(x, y)| (x - mx) * (y - my)).sum();
                 let den: f32 = pts.iter().map(|(x, _)| (x - mx) * (x - mx)).sum();

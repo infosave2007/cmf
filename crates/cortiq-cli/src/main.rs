@@ -1,17 +1,17 @@
 //! Cortiq CLI — sparse task-routed model inference.
 
+mod avout;
+mod awnp;
 mod convert;
 mod gguf;
 mod gptq;
 mod imagepack;
 mod moedefrag;
-mod awnp;
-mod requant;
+mod music;
 mod npy;
-mod avout;
+mod requant;
 mod sign;
 mod skill;
-mod music;
 mod videopack;
 
 use clap::{Parser, Subcommand};
@@ -1645,7 +1645,10 @@ async fn main() -> anyhow::Result<()> {
                     if b.wire == cortiq_net::WIRE_VERSION {
                         String::new()
                     } else {
-                        format!(" | INCOMPATIBLE, this build speaks v{}", cortiq_net::WIRE_VERSION)
+                        format!(
+                            " | INCOMPATIBLE, this build speaks v{}",
+                            cortiq_net::WIRE_VERSION
+                        )
                     },
                 );
             }
@@ -1700,25 +1703,25 @@ async fn main() -> anyhow::Result<()> {
                 unsafe { std::env::set_var("CMF_GPU", "0") };
             }
             cmd_ppl(
-            &model,
-            &file,
-            tokens,
-            skill.as_deref(),
-            blend.as_deref(),
-            route_dynamic,
-            PplWindows {
-                windows,
-                window_len,
-            },
-            &O1Flags {
-                spec: o1,
-                m: o1_m,
-                w: o1_window,
-                sink: o1_sink,
-                rect: o1_rect,
-            },
-            o1_prefill,
-        )
+                &model,
+                &file,
+                tokens,
+                skill.as_deref(),
+                blend.as_deref(),
+                route_dynamic,
+                PplWindows {
+                    windows,
+                    window_len,
+                },
+                &O1Flags {
+                    spec: o1,
+                    m: o1_m,
+                    w: o1_window,
+                    sink: o1_sink,
+                    rect: o1_rect,
+                },
+                o1_prefill,
+            )
         }
         Commands::Info { model, tensors } => cmd_info(&model, tensors.as_deref()).await,
         Commands::Story { model } => cmd_story(&model),
@@ -1850,7 +1853,6 @@ async fn main() -> anyhow::Result<()> {
             o1_window,
             o1_sink,
         } => {
-
             let o1 = O1Flags {
                 spec: o1,
                 m: o1_m,
@@ -1872,7 +1874,8 @@ async fn main() -> anyhow::Result<()> {
                 &net_dtype,
                 peer_head,
                 gpus,
-            ).await
+            )
+            .await
         }
         Commands::Skill { cmd } => match cmd {
             SkillCmd::Add {
@@ -2700,7 +2703,10 @@ fn dump_moe_stats(pipeline: &Pipeline) -> anyhow::Result<()> {
         // "<path>:<layer>,<layer>" — raw f32 rows per requested layer, so an
         // offline tool can form the activation covariance AWNP projects into.
         let (path, want) = spec.split_once(':').unwrap_or((spec.as_str(), ""));
-        let want: Vec<usize> = want.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let want: Vec<usize> = want
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
         for (li, lw) in pipeline.weights.layers.iter().enumerate() {
             if !want.is_empty() && !want.contains(&li) {
                 continue;
@@ -2715,7 +2721,10 @@ fn dump_moe_stats(pipeline: &Pipeline) -> anyhow::Result<()> {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
                 std::fs::write(format!("{path}.{li}.f32"), &bytes)?;
-                println!("activations layer {li} → {path}.{li}.f32 ({} floats)", rows.len());
+                println!(
+                    "activations layer {li} → {path}.{li}.f32 ({} floats)",
+                    rows.len()
+                );
             }
         }
     }
@@ -3412,130 +3421,165 @@ async fn cmd_run(
         tracing::info!("no chat template in this container — running completion mode");
     }
 
-    let mut generate_and_print =
-        |pipeline: &mut Pipeline, ids: &[u32]| -> anyhow::Result<Option<String>> {
-            use std::io::Write;
-            // Stream silently when the confidence view will reprint coloured;
-            // otherwise stream live as before.
-            let cb: cortiq_engine::TokenCallback = if confidence {
-                Box::new(|_tok: &str| true)
-            } else {
-                Box::new(|tok: &str| {
-                    print!("{tok}");
-                    let _ = std::io::stdout().flush();
-                    true
-                })
-            };
-            let started = std::time::Instant::now();
-            // Prefill offload: the peer absorbs the prompt, its state
-            // comes home, and the wire goes idle for the rest of the
-            // conversation. Done once — after it the segment is dropped,
-            // so a later turn is a plain local generation.
-            if peer_prefill {
-                if let Some(rs) = remote_opt.as_mut() {
-                    match cortiq_net::prefill_on_peer(pipeline, rs, ids) {
-                        Ok((bytes, pre_s, fetch_s)) => {
-                            eprintln!(
-                                "offload: {} positions prefilled on the peer in {:.2} s, \
-                                 state home in {:.2} s ({:.1} MB, {:.0} MB/s) — decoding locally",
-                                ids.len().saturating_sub(1),
-                                pre_s,
-                                fetch_s,
-                                bytes as f64 / 1e6,
-                                bytes as f64 / 1e6 / fetch_s.max(1e-9),
-                            );
-                        }
-                        Err(e) => anyhow::bail!("prefill offload: {e}"),
-                    }
-                    remote_opt = None;
-                }
+    let mut generate_and_print = |pipeline: &mut Pipeline,
+                                  ids: &[u32]|
+     -> anyhow::Result<Option<String>> {
+        use std::io::Write;
+        // Stream silently when the confidence view will reprint coloured;
+        // otherwise stream live as before.
+        // The moment the first token lands: everything before it is
+        // prefill (plus, on a cold process, shader compile and the
+        // weight upload); everything after is decode. One number over
+        // the whole window read "6 tok/s" on a 30-token answer from
+        // a model that decodes at 45 — users took it for a defect.
+        let first_tok: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>> =
+            Default::default();
+        let ft = first_tok.clone();
+        let mut mark_first = move || {
+            let mut g = ft.lock().unwrap();
+            if g.is_none() {
+                *g = Some(std::time::Instant::now());
             }
-            let gen_res = match remote_opt.as_mut() {
-                Some(rs) => {
-                    cortiq_net::generate_split(pipeline, rs, ids, max_tokens, mask.as_ref(), Some(cb)).map(
-                        |(r, st)| {
-                            // The numbers that decide whether this wire pays:
-                            // measured, per generation, stderr.
-                            if st.remote_steps > 0 {
-                                let reused = r.prompt_tokens.saturating_sub(st.prefilled);
-                                eprintln!(
-                                    "\nnet: prefill {:.0} ms ({} of {} pos{}) · {} round trips · \
-                                     {:.2} ms avg rtt+remote · {:.0}% of decode wall",
-                                    st.prefill_s * 1e3,
-                                    st.prefilled,
-                                    r.prompt_tokens,
-                                    if reused > 0 {
-                                        format!(", {reused} reused")
-                                    } else {
-                                        String::new()
-                                    },
-                                    st.remote_steps,
-                                    st.net_s * 1e3 / st.remote_steps as f64,
-                                    100.0 * st.net_s / st.decode_s.max(1e-9),
-                                );
-                            }
-                            r
-                        },
-                    )
-                }
-                None => pipeline.generate_from_ids(ids, max_tokens, mask.as_ref(), Some(cb)),
-            };
-            match gen_res {
-                Ok(r) => {
-                    let secs = started.elapsed().as_secs_f64();
-                    // Confidence view: reprint token-by-token, coloured by the
-                    // model's Born mass on each emitted token.
-                    if confidence && !r.token_confidence.is_empty() {
-                        println!();
-                        let mut lo = 1.0f32;
-                        let mut sum = 0.0f32;
-                        for (id, &c) in r.token_ids.iter().zip(&r.token_confidence) {
-                            let piece = pipeline.tokenizer.decode_token(*id);
-                            print!("{}", conf_colour(&piece, c));
-                            lo = lo.min(c);
-                            sum += c;
-                        }
-                        let _ = std::io::stdout().flush();
-                        let avg = sum / r.token_confidence.len() as f32;
-                        println!(
-                            "\n\nconfidence: mean {:.0}% · min {:.0}%  \
-                         (\x1b[38;2;80;220;100mknow\x1b[0m→\
-                         \x1b[38;2;230;90;80mguess\x1b[0m)",
-                            avg * 100.0,
-                            lo * 100.0
+        };
+        let cb: cortiq_engine::TokenCallback = if confidence {
+            Box::new(move |_tok: &str| {
+                mark_first();
+                true
+            })
+        } else {
+            Box::new(move |tok: &str| {
+                mark_first();
+                print!("{tok}");
+                let _ = std::io::stdout().flush();
+                true
+            })
+        };
+        let started = std::time::Instant::now();
+        // Prefill offload: the peer absorbs the prompt, its state
+        // comes home, and the wire goes idle for the rest of the
+        // conversation. Done once — after it the segment is dropped,
+        // so a later turn is a plain local generation.
+        if peer_prefill {
+            if let Some(rs) = remote_opt.as_mut() {
+                match cortiq_net::prefill_on_peer(pipeline, rs, ids) {
+                    Ok((bytes, pre_s, fetch_s)) => {
+                        eprintln!(
+                            "offload: {} positions prefilled on the peer in {:.2} s, \
+                                 state home in {:.2} s ({:.1} MB, {:.0} MB/s) — decoding locally",
+                            ids.len().saturating_sub(1),
+                            pre_s,
+                            fetch_s,
+                            bytes as f64 / 1e6,
+                            bytes as f64 / 1e6 / fetch_s.max(1e-9),
                         );
                     }
+                    Err(e) => anyhow::bail!("prefill offload: {e}"),
+                }
+                remote_opt = None;
+            }
+        }
+        let gen_res = match remote_opt.as_mut() {
+            Some(rs) => {
+                cortiq_net::generate_split(pipeline, rs, ids, max_tokens, mask.as_ref(), Some(cb))
+                    .map(|(r, st)| {
+                        // The numbers that decide whether this wire pays:
+                        // measured, per generation, stderr.
+                        if st.remote_steps > 0 {
+                            let reused = r.prompt_tokens.saturating_sub(st.prefilled);
+                            eprintln!(
+                                "\nnet: prefill {:.0} ms ({} of {} pos{}) · {} round trips · \
+                                     {:.2} ms avg rtt+remote · {:.0}% of decode wall",
+                                st.prefill_s * 1e3,
+                                st.prefilled,
+                                r.prompt_tokens,
+                                if reused > 0 {
+                                    format!(", {reused} reused")
+                                } else {
+                                    String::new()
+                                },
+                                st.remote_steps,
+                                st.net_s * 1e3 / st.remote_steps as f64,
+                                100.0 * st.net_s / st.decode_s.max(1e-9),
+                            );
+                        }
+                        r
+                    })
+            }
+            None => pipeline.generate_from_ids(ids, max_tokens, mask.as_ref(), Some(cb)),
+        };
+        match gen_res {
+            Ok(r) => {
+                let secs = started.elapsed().as_secs_f64();
+                // Confidence view: reprint token-by-token, coloured by the
+                // model's Born mass on each emitted token.
+                if confidence && !r.token_confidence.is_empty() {
+                    println!();
+                    let mut lo = 1.0f32;
+                    let mut sum = 0.0f32;
+                    for (id, &c) in r.token_ids.iter().zip(&r.token_confidence) {
+                        let piece = pipeline.tokenizer.decode_token(*id);
+                        print!("{}", conf_colour(&piece, c));
+                        lo = lo.min(c);
+                        sum += c;
+                    }
+                    let _ = std::io::stdout().flush();
+                    let avg = sum / r.token_confidence.len() as f32;
                     println!(
+                        "\n\nconfidence: mean {:.0}% · min {:.0}%  \
+                         (\x1b[38;2;80;220;100mknow\x1b[0m→\
+                         \x1b[38;2;230;90;80mguess\x1b[0m)",
+                        avg * 100.0,
+                        lo * 100.0
+                    );
+                }
+                // decode tok/s over the tokens AFTER the first one, and
+                // the first token's latency on its own (prefill, plus
+                // shader compile / weight upload on a cold process).
+                let first = first_tok
+                    .lock()
+                    .unwrap()
+                    .map(|t| t.duration_since(started).as_secs_f64());
+                match first {
+                    Some(ttft) if r.tokens_generated >= 2 => println!(
+                        "\n[{} tokens · first token {:.1} s · decode {:.1} tok/s · overall {:.1} tok/s, finish: {}]",
+                        r.tokens_generated,
+                        ttft,
+                        (r.tokens_generated - 1) as f64 / (secs - ttft).max(1e-9),
+                        r.tokens_generated as f64 / secs.max(1e-9),
+                        r.finish_reason
+                    ),
+                    _ => println!(
                         "\n[{} tokens, {:.1} tok/s, finish: {}]",
                         r.tokens_generated,
                         r.tokens_generated as f64 / secs.max(1e-9),
                         r.finish_reason
-                    );
-                    #[cfg(feature = "gpu")]
-                    cortiq_engine::dsv4::profile_report();
-                    let sw = pipeline.route_switches();
-                    if !sw.is_empty() {
-                        println!("route: {} skill switch(es):", sw.len());
-                        for (tok, from, to) in &sw {
-                            println!(
-                                "  @tok{tok}: {} → {}",
-                                from.as_deref().unwrap_or("backbone"),
-                                to.as_deref().unwrap_or("backbone")
-                            );
-                        }
-                    }
-                    if trace {
-                        render_trace(&r.traces, pipeline, trace_json);
-                    }
-                    // `text` is the generated slice only (prompt excluded,
-                    // specials stripped) — exactly the assistant turn to carry
-                    // into the next render.
-                    return Ok(Some(r.text));
+                    ),
                 }
-                Err(e) => println!("error: {e}"),
+                #[cfg(feature = "gpu")]
+                cortiq_engine::dsv4::profile_report();
+                let sw = pipeline.route_switches();
+                if !sw.is_empty() {
+                    println!("route: {} skill switch(es):", sw.len());
+                    for (tok, from, to) in &sw {
+                        println!(
+                            "  @tok{tok}: {} → {}",
+                            from.as_deref().unwrap_or("backbone"),
+                            to.as_deref().unwrap_or("backbone")
+                        );
+                    }
+                }
+                if trace {
+                    render_trace(&r.traces, pipeline, trace_json);
+                }
+                // `text` is the generated slice only (prompt excluded,
+                // specials stripped) — exactly the assistant turn to carry
+                // into the next render.
+                return Ok(Some(r.text));
             }
-            Ok(None)
-        };
+            Err(e) => println!("error: {e}"),
+        }
+        Ok(None)
+    };
 
     // B2: prepend the frozen prefix (empty when not resuming) so the
     // continuation runs from the warm context. Token-level replay ==
@@ -3657,7 +3701,9 @@ fn spawn_local_gpu_worker(model: &str, n: usize) -> anyhow::Result<LocalGpuWorke
     }
     let worker_pin = if coord_pin.trim() == "1" { "0" } else { "1" };
     // Let the OS pick a free port; the tiny bind→spawn race is local.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
     let addr = format!("127.0.0.1:{port}");
     let token = format!("local-gpus-{}", std::process::id());
     let child = std::process::Command::new(std::env::current_exe()?)
@@ -3692,6 +3738,13 @@ struct GpuCounterSnapshot {
     wgpu_passes: u64,
     wgpu_upload_ns: u64,
     wgpu_upload_bytes: u64,
+    /// Weight bytes dispatched so far (both backends) — sampled per token
+    /// so the steady-window delta is a real bytes-per-token, not the
+    /// process total (warmup + prefill + pair micro-bench) divided by
+    /// the decode count. That quotient read 21.9 GB/token on a 15.4 GB
+    /// Qwen3.8 file over wgpu — a 1.5x "amplification" that was the
+    /// bench's own arithmetic.
+    weight_bytes: u64,
 }
 
 /// One coherent counter sample. Bench rates are computed from two samples in
@@ -3712,6 +3765,7 @@ fn gpu_counter_snapshot() -> GpuCounterSnapshot {
         s.wgpu_upload_ns = cortiq_engine::gpu_wgpu::UPLOAD_NS.load(Ordering::Relaxed);
         s.wgpu_upload_bytes = cortiq_engine::gpu_wgpu::UPLOAD_BYTES.load(Ordering::Relaxed);
     }
+    s.weight_bytes = cortiq_engine::gpu::weight_bytes_dispatched();
     s
 }
 
@@ -3746,7 +3800,10 @@ async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()>
             total += e.nbytes;
             n += 1;
         }
-        println!("# {n} tensors, {total} bytes ({:.2} GiB)", total as f64 / (1 << 30) as f64);
+        println!(
+            "# {n} tensors, {total} bytes ({:.2} GiB)",
+            total as f64 / (1 << 30) as f64
+        );
         return Ok(());
     }
 
@@ -3787,7 +3844,12 @@ async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()>
         .tensors
         .iter()
         .find(|e| e.name == "lm_head.weight")
-        .or_else(|| model.tensors.iter().find(|e| e.name == "model.embed_tokens.weight"))
+        .or_else(|| {
+            model
+                .tensors
+                .iter()
+                .find(|e| e.name == "model.embed_tokens.weight")
+        })
     {
         println!("  Head:        {:?} {:?}", e.dtype, e.shape);
     }
@@ -3933,7 +3995,10 @@ fn cmd_animate(
         anim.sample_rate,
     )?;
     let wav = path.with_extension("wav");
-    std::fs::write(&wav, avout::wav_bytes(&anim.audio, anim.samples, anim.sample_rate))?;
+    std::fs::write(
+        &wav,
+        avout::wav_bytes(&anim.audio, anim.samples, anim.sample_rate),
+    )?;
     println!(
         "{out}: {}x{}, {} frames at {} fps ({:.2}s), {:.2}s of {} Hz stereo, {:.1} MB in {:.1}s",
         anim.width,
@@ -4582,11 +4647,10 @@ async fn cmd_bench(
             type Stamp = std::time::Instant;
             let stamps: Arc<std::sync::Mutex<Vec<Stamp>>> = Arc::default();
             let st = stamps.clone();
-            let cb: cortiq_engine::TokenCallback =
-                Box::new(move |_t| {
-                    st.lock().unwrap().push(std::time::Instant::now());
-                    true
-                });
+            let cb: cortiq_engine::TokenCallback = Box::new(move |_t| {
+                st.lock().unwrap().push(std::time::Instant::now());
+                true
+            });
             let t0 = std::time::Instant::now();
             let (_r, sst) = cortiq_net::generate_split(
                 &mut pipeline,
@@ -4602,10 +4666,7 @@ async fn cmd_bench(
             let n = stamps.len();
             if n >= 34 {
                 // Drop 32 ramp tokens from the window as well.
-                steady.push(
-                    (n - 33) as f64
-                        / (stamps[n - 1] - stamps[32]).as_secs_f64().max(1e-9),
-                );
+                steady.push((n - 33) as f64 / (stamps[n - 1] - stamps[32]).as_secs_f64().max(1e-9));
             }
             if let Some(first) = stamps.first() {
                 ttft.push((*first - t0).as_secs_f64() * 1e3);
@@ -4738,8 +4799,20 @@ async fn cmd_bench(
     let stamps = stamps.lock().unwrap();
     // stamp[0] fires right after generation's prefill (the first token
     // is sampled from the prefill hidden, no decode forward yet).
-    let wb_total = cortiq_engine::gpu::weight_bytes_dispatched();
+    // Steady-window weight bytes: the delta between the first and last
+    // per-token stamps, over the same inter-token window as tok/s. The
+    // process total also holds the warmup, the timed prefill (one graph
+    // pass per position on GDN hybrids) and the pair micro-bench.
     let n_st = stamps.len();
+    let wb_total = if n_st >= 2 {
+        stamps[n_st - 1]
+            .3
+            .weight_bytes
+            .saturating_sub(stamps[0].3.weight_bytes)
+    } else {
+        cortiq_engine::gpu::weight_bytes_dispatched()
+    };
+    let wb_steps = if n_st >= 2 { n_st - 1 } else { n_st.max(1) };
     #[cfg(target_os = "macos")]
     let ffn_calls_per_token = cortiq_engine::gpu_metal::FFN_CALLS
         .load(std::sync::atomic::Ordering::Relaxed) as f64
@@ -4776,7 +4849,10 @@ async fn cmd_bench(
             last.wgpu_submits.saturating_sub(first.wgpu_submits) as f64 / steps,
             last.wgpu_passes.saturating_sub(first.wgpu_passes) as f64 / steps,
             last.wgpu_upload_ns.saturating_sub(first.wgpu_upload_ns) as f64 / 1e6 / steps,
-            last.wgpu_upload_bytes.saturating_sub(first.wgpu_upload_bytes) as f64 / 1e6 / steps,
+            last.wgpu_upload_bytes
+                .saturating_sub(first.wgpu_upload_bytes) as f64
+                / 1e6
+                / steps,
         )
     } else {
         (0.0, 0.0, 0.0, 0.0, 0.0)
@@ -4824,7 +4900,7 @@ async fn cmd_bench(
             "decode_tok_s_incl_prefill": result.tokens_generated as f64 / total_s.max(1e-9),
             "ttft_s": ttft_s,
             "allocs_per_token": allocs_per_token,
-            "weight_gb_per_token": if n_st >= 2 { wb_total as f64 / n_st as f64 / 1e9 } else { 0.0 },
+            "weight_gb_per_token": if n_st >= 2 { wb_total as f64 / wb_steps as f64 / 1e9 } else { 0.0 },
             "weight_gb_by_stage": cortiq_engine::gpu::weight_bytes_by().iter().map(|b| *b as f64 / n_st.max(1) as f64 / 1e9).collect::<Vec<_>>(),
             "ffn_calls_per_token": ffn_calls_per_token,
             "n_stamps": n_st,

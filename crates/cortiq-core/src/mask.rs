@@ -122,7 +122,11 @@ impl TaskMask {
         }
         Some(
             (0..num_experts)
-                .map(|e| mask.get(e / 8).map(|b| b & (1 << (e % 8)) != 0).unwrap_or(false))
+                .map(|e| {
+                    mask.get(e / 8)
+                        .map(|b| b & (1 << (e % 8)) != 0)
+                        .unwrap_or(false)
+                })
                 .collect(),
         )
     }
@@ -538,8 +542,7 @@ pub fn decode_masks_section(bytes: &[u8], arch: &ModelArch) -> Result<MaskCatalo
     let vrows = arch.num_layers * arch.num_loops.max(1);
     let legacy_blob = arch.mask_blob_len() as u64;
     let legacy_with_experts = arch.mask_blob_len_with_experts() as u64;
-    let loop_blob =
-        (vrows * ffn_b + arch.num_layers * head_b + arch.gates_mask_bytes()) as u64;
+    let loop_blob = (vrows * ffn_b + arch.num_layers * head_b + arch.gates_mask_bytes()) as u64;
     let loop_with_experts = loop_blob + (arch.num_layers * expert_b) as u64;
 
     let mut masks = Vec::with_capacity(n_masks);

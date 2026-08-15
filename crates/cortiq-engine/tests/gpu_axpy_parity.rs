@@ -30,13 +30,18 @@ fn device_axpy_matches_the_cpu() {
     // Not a round count: the kernel is 256 wide and the tail is where a
     // bounds check either works or reads past the end.
     let n = 700usize;
-    let x: Vec<f32> = (0..n + 64).map(|i| ((i * 17 % 23) as f32) * 0.125 - 1.0).collect();
+    let x: Vec<f32> = (0..n + 64)
+        .map(|i| ((i * 17 % 23) as f32) * 0.125 - 1.0)
+        .collect();
     let y0: Vec<f32> = (0..n).map(|i| ((i * 7 % 13) as f32) * 0.25 - 1.5).collect();
     let w = 0.375f32;
 
     // accumulate
     let mut got = y0.clone();
-    assert!(gpu_wgpu::axpy_for_test(&x, &mut got, w, false, 0), "устройство отказало");
+    assert!(
+        gpu_wgpu::axpy_for_test(&x, &mut got, w, false, 0),
+        "устройство отказало"
+    );
     let want: Vec<f32> = y0.iter().zip(&x).map(|(y, xv)| y + w * xv).collect();
     near(&got, &want, "y += w·x");
 

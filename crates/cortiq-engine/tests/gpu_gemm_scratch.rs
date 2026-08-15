@@ -87,5 +87,8 @@ fn refilling_the_w_buffer_is_not_a_cache_hit() {
     let mut y3 = vec![0f32; n * m];
     assert!(gemm_nt_f32(&x, &w, &mut y3, n, k, m));
     let d2 = worst(&y3, &want);
-    assert!(d2 < 5e-3, "cache hit returned the wrong matrix: rel {d2:.3e}");
+    assert!(
+        d2 < 5e-3,
+        "cache hit returned the wrong matrix: rel {d2:.3e}"
+    );
 }

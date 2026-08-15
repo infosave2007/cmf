@@ -124,11 +124,28 @@ fn device_routing_matches_the_cpu() {
     let mut gi = Vec::new();
     let mut gw = Vec::new();
     assert!(cortiq_engine::gpu_wgpu::moe_route_for_test(
-        &scores, Some(&bias), None, None, top_k, scale, true, &mut gi, &mut gw,
+        &scores,
+        Some(&bias),
+        None,
+        None,
+        top_k,
+        scale,
+        true,
+        &mut gi,
+        &mut gw,
     ));
     let mut ci = Vec::new();
     let mut cw = Vec::new();
-    cortiq_engine::dsv4::route(&scores, Some(&bias), top_k, scale, None, None, &mut ci, &mut cw);
+    cortiq_engine::dsv4::route(
+        &scores,
+        Some(&bias),
+        top_k,
+        scale,
+        None,
+        None,
+        &mut ci,
+        &mut cw,
+    );
     assert_eq!(&gi[..top_k], &ci[..], "слоты маршрутизации разошлись");
     assert_eq!(gi[top_k], n);
     println!("формат msel/mwt: {gi:?}");

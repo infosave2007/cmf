@@ -22,12 +22,16 @@ use cortiq_engine::nystrom::{NystromState, O1Rect};
 /// Deterministic uniform noise in [-1, 1) — no rand dependency, and the
 /// same numbers on every platform, which a vacuum test wants.
 fn unif(s: &mut u64) -> f32 {
-    *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *s = s
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     ((*s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
+    a.iter()
+        .zip(b)
+        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
 }
 
 fn rms(a: &[f32]) -> f32 {
@@ -68,7 +72,10 @@ fn equal_keys_case(m: usize, w: usize, sink: usize, rect: O1Rect) -> (f32, f32) 
     let mut s = 0xC0FFEE_u64;
 
     let k0: Vec<f32> = (0..d).map(|_| unif(&mut s)).collect();
-    let ks: Vec<f32> = std::iter::repeat(k0.iter().copied()).take(t).flatten().collect();
+    let ks: Vec<f32> = std::iter::repeat(k0.iter().copied())
+        .take(t)
+        .flatten()
+        .collect();
     let vs: Vec<f32> = (0..t * dv).map(|_| unif(&mut s)).collect();
     let qs: Vec<f32> = (0..t * d).map(|_| unif(&mut s)).collect();
 
@@ -222,7 +229,10 @@ fn a_dominant_key_in_the_far_field_is_recovered() {
     for &(m, w, sink) in &[(16usize, 64usize, 4usize), (32, 128, 4), (64, 128, 4)] {
         for &depth in &[256usize, 1024] {
             let r = needle_case(m, w, sink, 12.0, depth, 0x5EED_1234);
-            println!("m={m:3} w={w:3} depth={depth:5}: recovered {:.1}%", r * 100.0);
+            println!(
+                "m={m:3} w={w:3} depth={depth:5}: recovered {:.1}%",
+                r * 100.0
+            );
             worst = worst.min(r);
         }
     }

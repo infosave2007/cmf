@@ -5,8 +5,8 @@ pub mod dashboard;
 pub mod openai;
 pub mod streaming;
 
-use axum::{Json, Router, routing::get};
 use axum::extract::State;
+use axum::{Json, Router, routing::get};
 use cortiq_engine::{CortiqRuntime, Pipeline};
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};

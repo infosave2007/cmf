@@ -49,7 +49,10 @@ fn device_rope_heads_matches_the_cpu() {
             let den: f32 = want.iter().map(|a| a * a).sum::<f32>().max(1e-20);
             let rel = (num / den).sqrt();
             println!("rms={rms} inverse={inverse} поз={pos}: {rel:.3e}");
-            assert!(rel < 1e-5, "rms={rms} inverse={inverse} поз={pos}: {rel:.3e}");
+            assert!(
+                rel < 1e-5,
+                "rms={rms} inverse={inverse} поз={pos}: {rel:.3e}"
+            );
         }
     }
 }

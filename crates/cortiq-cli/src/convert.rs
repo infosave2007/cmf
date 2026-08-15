@@ -18,8 +18,8 @@
 use crate::npy;
 use cortiq_core::format::{CMF_VERSION, CmfHeader, TensorSpec, TokenizerBundle};
 use cortiq_core::quant::{
-    Q2TP_CHUNK, Q2TP_LMAX, Q4TP_LMAX, Q4TP_NIB, bf16_to_f32, f16_to_f32, f32_to_f16,
-    q2tp_ladder, q4tp_code_stride, q4tp_ladder, q4tp_put_code,
+    Q2TP_CHUNK, Q2TP_LMAX, Q4TP_LMAX, Q4TP_NIB, bf16_to_f32, f16_to_f32, f32_to_f16, q2tp_ladder,
+    q4tp_code_stride, q4tp_ladder, q4tp_put_code,
 };
 use cortiq_core::types::{
     LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle, QuantType, TensorDtype,
@@ -68,7 +68,8 @@ fn byte_level_table() -> [char; 256] {
     let mut table = ['\0'; 256];
     let mut n = 0u32;
     for b in 0..=255u32 {
-        let printable = (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b);
+        let printable =
+            (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b);
         table[b as usize] = if printable {
             char::from_u32(b).unwrap()
         } else {
@@ -87,10 +88,7 @@ fn byte_level_table() -> [char; 256] {
 /// converter): BPE-split every multi-byte token using only merges of
 /// strictly lower rank; the two parts it stops at are that token's
 /// merge rule. Specials come from tokenizer_config.added_tokens_decoder.
-fn tiktoken_to_tokenizer_json(
-    model: &str,
-    tok_cfg: &serde_json::Value,
-) -> anyhow::Result<String> {
+fn tiktoken_to_tokenizer_json(model: &str, tok_cfg: &serde_json::Value) -> anyhow::Result<String> {
     use base64::Engine as _;
     use std::collections::HashMap;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -163,7 +161,10 @@ fn tiktoken_to_tokenizer_json(
     }
 
     let mut added: Vec<serde_json::Value> = Vec::new();
-    if let Some(atd) = tok_cfg.get("added_tokens_decoder").and_then(|v| v.as_object()) {
+    if let Some(atd) = tok_cfg
+        .get("added_tokens_decoder")
+        .and_then(|v| v.as_object())
+    {
         for (id, tok) in atd {
             if let (Ok(id), Some(content)) = (
                 id.parse::<u32>(),
@@ -698,7 +699,9 @@ fn encode_rows_parallel(
 /// process, or an A/B inside one test binary silently compares an arm with
 /// itself.
 fn q2tp_search() -> bool {
-    std::env::var("CMF_Q2TP_SEARCH").map(|v| v != "0").unwrap_or(true)
+    std::env::var("CMF_Q2TP_SEARCH")
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
@@ -716,151 +719,157 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
         [gpr * Q2TP_CHUNK, 4, stride],
         [&mut chunks, &mut params, &mut codes],
         &|r, chunks_row, params_row, codes_row| {
-        let mut lg = vec![0f32; gpr];
-        let mut dead = vec![false; gpr];
+            let mut lg = vec![0f32; gpr];
+            let mut dead = vec![false; gpr];
 
-        let row = &vals[r * in_dim..(r + 1) * in_dim];
-        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-        for g in 0..gpr {
-            let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
-            let absmax = tile.iter().fold(0f32, |m, v| m.max(v.abs()));
-            dead[g] = absmax == 0.0;
-            lg[g] = f16_scale(absmax / 1.5).log2();
-            if !dead[g] {
-                lo = lo.min(lg[g]);
-                hi = hi.max(lg[g]);
-            }
-        }
-        if !lo.is_finite() {
-            lo = lg[0];
-            hi = lo;
-        }
-        let lo_h = f32_to_f16(lo);
-        let lo_r = f16_to_f32(lo_h);
-        // The ladder spans lo..hi, where hi is the largest group scale in the
-        // row. One loud group therefore stretches the ladder and coarsens the
-        // step for all the quiet ones. Try shorter ladders too and keep the
-        // one whose whole row reconstructs best — the same argument as the
-        // per-group search, one level up.
-        let ladder_for = |top: f32, params: &mut [u8]| -> [f32; 32] {
-            let span = (top - lo_r).max(0.0);
-            let mut st_h = f32_to_f16(span / Q2TP_LMAX as f32);
-            for _ in 0..64 {
-                let st = f16_to_f32(st_h);
-                if st > 0.0 && lo_r + Q2TP_LMAX as f32 * st >= top {
-                    break;
+            let row = &vals[r * in_dim..(r + 1) * in_dim];
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            for g in 0..gpr {
+                let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+                let absmax = tile.iter().fold(0f32, |m, v| m.max(v.abs()));
+                dead[g] = absmax == 0.0;
+                lg[g] = f16_scale(absmax / 1.5).log2();
+                if !dead[g] {
+                    lo = lo.min(lg[g]);
+                    hi = hi.max(lg[g]);
                 }
-                st_h += 1;
             }
-            params[0..2].copy_from_slice(&lo_h.to_le_bytes());
-            params[2..4].copy_from_slice(&st_h.to_le_bytes());
-            q2tp_ladder(params, 0)
-        };
-        let mut tab = ladder_for(hi, params_row);
-        if search && hi > lo_r {
-            // Candidate tops: the full range, then progressively tighter.
-            let mut best = (f32::INFINITY, hi);
-            for frac in [1.0f32, 0.9, 0.8, 0.7] {
-                let top = lo_r + (hi - lo_r) * frac;
-                let mut probe = [0u8; 4];
-                let t = ladder_for(top, &mut probe);
-                let mut err = 0.0f32;
-                for g in 0..gpr {
-                    if dead[g] {
-                        continue;
+            if !lo.is_finite() {
+                lo = lg[0];
+                hi = lo;
+            }
+            let lo_h = f32_to_f16(lo);
+            let lo_r = f16_to_f32(lo_h);
+            // The ladder spans lo..hi, where hi is the largest group scale in the
+            // row. One loud group therefore stretches the ladder and coarsens the
+            // step for all the quiet ones. Try shorter ladders too and keep the
+            // one whose whole row reconstructs best — the same argument as the
+            // per-group search, one level up.
+            let ladder_for = |top: f32, params: &mut [u8]| -> [f32; 32] {
+                let span = (top - lo_r).max(0.0);
+                let mut st_h = f32_to_f16(span / Q2TP_LMAX as f32);
+                for _ in 0..64 {
+                    let st = f16_to_f32(st_h);
+                    if st > 0.0 && lo_r + Q2TP_LMAX as f32 * st >= top {
+                        break;
                     }
-                    let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
-                    // Probe around the rung this ladder would nominally pick
-                    // rather than all 31: the best is always adjacent, and
-                    // scanning the ladder end to end costs 8x for nothing.
-                    let stc = f16_to_f32(u16::from_le_bytes([probe[2], probe[3]]));
-                    let nom = if stc > 0.0 {
-                        1 + ((lg[g] - lo_r) / stc).round_ties_even().clamp(0.0, Q2TP_LMAX as f32)
-                            as usize
-                    } else {
-                        1
-                    };
-                    let mut ge = f32::INFINITY;
-                    for cand in nom.saturating_sub(2).max(1)..=(nom + 2).min(Q2TP_LMAX as usize + 1)
-                    {
-                        let sc = t[cand];
-                        if sc <= 0.0 {
+                    st_h += 1;
+                }
+                params[0..2].copy_from_slice(&lo_h.to_le_bytes());
+                params[2..4].copy_from_slice(&st_h.to_le_bytes());
+                q2tp_ladder(params, 0)
+            };
+            let mut tab = ladder_for(hi, params_row);
+            if search && hi > lo_r {
+                // Candidate tops: the full range, then progressively tighter.
+                let mut best = (f32::INFINITY, hi);
+                for frac in [1.0f32, 0.9, 0.8, 0.7] {
+                    let top = lo_r + (hi - lo_r) * frac;
+                    let mut probe = [0u8; 4];
+                    let t = ladder_for(top, &mut probe);
+                    let mut err = 0.0f32;
+                    for g in 0..gpr {
+                        if dead[g] {
                             continue;
                         }
-                        let iv = 1.0 / sc;
-                        let mut e = 0.0f32;
-                        for &wv in tile {
-                            let q = (wv * iv + 1.5).round_ties_even().clamp(0.0, 3.0);
-                            let d = wv - (q - 1.5) * sc;
-                            e += d * d;
+                        let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+                        // Probe around the rung this ladder would nominally pick
+                        // rather than all 31: the best is always adjacent, and
+                        // scanning the ladder end to end costs 8x for nothing.
+                        let stc = f16_to_f32(u16::from_le_bytes([probe[2], probe[3]]));
+                        let nom = if stc > 0.0 {
+                            1 + ((lg[g] - lo_r) / stc)
+                                .round_ties_even()
+                                .clamp(0.0, Q2TP_LMAX as f32)
+                                as usize
+                        } else {
+                            1
+                        };
+                        let mut ge = f32::INFINITY;
+                        for cand in
+                            nom.saturating_sub(2).max(1)..=(nom + 2).min(Q2TP_LMAX as usize + 1)
+                        {
+                            let sc = t[cand];
+                            if sc <= 0.0 {
+                                continue;
+                            }
+                            let iv = 1.0 / sc;
+                            let mut e = 0.0f32;
+                            for &wv in tile {
+                                let q = (wv * iv + 1.5).round_ties_even().clamp(0.0, 3.0);
+                                let d = wv - (q - 1.5) * sc;
+                                e += d * d;
+                            }
+                            ge = ge.min(e);
                         }
-                        ge = ge.min(e);
-                    }
-                    err += ge;
-                }
-                if err < best.0 {
-                    best = (err, top);
-                }
-            }
-            tab = ladder_for(best.1, params_row);
-        }
-        let st = f16_to_f32(u16::from_le_bytes([params_row[2], params_row[3]]));
-        let crow = &mut *codes_row;
-        for g in 0..gpr {
-            // Rung 0 is the exact zero; live groups start at 1.
-            let nominal = if dead[g] {
-                0
-            } else if st <= 0.0 {
-                1
-            } else {
-                1 + ((lg[g] - lo_r) / st).round_ties_even().clamp(0.0, Q2TP_LMAX as f32) as usize
-            };
-            // The nominal rung comes from absmax/1.5, which pins the outer
-            // level to the largest weight — that minimises the WORST error,
-            // not the mean one, and with only four levels the difference is
-            // large. Try the neighbouring rungs and keep whichever
-            // reconstructs the group best. Costs encode time and nothing
-            // else: the layout, the decoder and the kernels are unchanged.
-            let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
-            let c = if nominal == 0 || !search {
-                nominal
-            } else {
-                let mut best = (f32::INFINITY, nominal);
-                for cand in nominal.saturating_sub(2).max(1)..=(nominal + 1).min(Q2TP_LMAX as usize + 1)
-                {
-                    let s = tab[cand];
-                    if s <= 0.0 {
-                        continue;
-                    }
-                    let inv = 1.0 / s;
-                    let mut err = 0.0f32;
-                    for &w in tile {
-                        let q = (w * inv + 1.5).round_ties_even().clamp(0.0, 3.0);
-                        let d = w - (q - 1.5) * s;
-                        err += d * d;
+                        err += ge;
                     }
                     if err < best.0 {
-                        best = (err, cand);
+                        best = (err, top);
                     }
                 }
-                best.1
-            };
-            q4tp_put_code(crow, g, c);
-            let inv = if tab[c] > 0.0 { 1.0 / tab[c] } else { 0.0 };
-            let dst = &mut chunks_row[g * Q2TP_CHUNK..(g + 1) * Q2TP_CHUNK];
-            for (k, d) in dst.iter_mut().enumerate() {
-                let mut b = 0u8;
-                for j in 0..4 {
-                    // (c − 1.5)·s: quantize w/s + 1.5 onto 0..=3.
-                    let q = (tile[k * 4 + j] * inv + 1.5)
-                        .round_ties_even()
-                        .clamp(0.0, 3.0) as u8;
-                    b |= q << (2 * j);
-                }
-                *d = b;
+                tab = ladder_for(best.1, params_row);
             }
-        }
-            },
+            let st = f16_to_f32(u16::from_le_bytes([params_row[2], params_row[3]]));
+            let crow = &mut *codes_row;
+            for g in 0..gpr {
+                // Rung 0 is the exact zero; live groups start at 1.
+                let nominal = if dead[g] {
+                    0
+                } else if st <= 0.0 {
+                    1
+                } else {
+                    1 + ((lg[g] - lo_r) / st)
+                        .round_ties_even()
+                        .clamp(0.0, Q2TP_LMAX as f32) as usize
+                };
+                // The nominal rung comes from absmax/1.5, which pins the outer
+                // level to the largest weight — that minimises the WORST error,
+                // not the mean one, and with only four levels the difference is
+                // large. Try the neighbouring rungs and keep whichever
+                // reconstructs the group best. Costs encode time and nothing
+                // else: the layout, the decoder and the kernels are unchanged.
+                let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+                let c = if nominal == 0 || !search {
+                    nominal
+                } else {
+                    let mut best = (f32::INFINITY, nominal);
+                    for cand in
+                        nominal.saturating_sub(2).max(1)..=(nominal + 1).min(Q2TP_LMAX as usize + 1)
+                    {
+                        let s = tab[cand];
+                        if s <= 0.0 {
+                            continue;
+                        }
+                        let inv = 1.0 / s;
+                        let mut err = 0.0f32;
+                        for &w in tile {
+                            let q = (w * inv + 1.5).round_ties_even().clamp(0.0, 3.0);
+                            let d = w - (q - 1.5) * s;
+                            err += d * d;
+                        }
+                        if err < best.0 {
+                            best = (err, cand);
+                        }
+                    }
+                    best.1
+                };
+                q4tp_put_code(crow, g, c);
+                let inv = if tab[c] > 0.0 { 1.0 / tab[c] } else { 0.0 };
+                let dst = &mut chunks_row[g * Q2TP_CHUNK..(g + 1) * Q2TP_CHUNK];
+                for (k, d) in dst.iter_mut().enumerate() {
+                    let mut b = 0u8;
+                    for j in 0..4 {
+                        // (c − 1.5)·s: quantize w/s + 1.5 onto 0..=3.
+                        let q = (tile[k * 4 + j] * inv + 1.5)
+                            .round_ties_even()
+                            .clamp(0.0, 3.0) as u8;
+                        b |= q << (2 * j);
+                    }
+                    *d = b;
+                }
+            }
+        },
     );
     chunks.extend_from_slice(&params);
     chunks.extend_from_slice(&codes);
@@ -883,91 +892,94 @@ pub(crate) fn encode_q4tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
         [gpr * Q4TP_NIB, 4, stride],
         [&mut nib, &mut params, &mut codes],
         &|r, nib_row, params_row, codes_row| {
-        let mut lg = vec![0f32; gpr];
-        let mut dead = vec![false; gpr];
+            let mut lg = vec![0f32; gpr];
+            let mut dead = vec![false; gpr];
 
-        let row = &vals[r * in_dim..(r + 1) * in_dim];
-        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-        for g in 0..gpr {
-            let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
-            let absmax = tile.iter().fold(0f32, |m, v| m.max(v.abs()));
-            // An all-zero tile dequantizes to zero whatever its scale, so keep
-            // it out of the row's range — otherwise `f16_scale`'s tiny floor
-            // stretches the ladder and coarsens every live tile in the row.
-            dead[g] = absmax == 0.0;
-            lg[g] = f16_scale(absmax / 7.0).log2();
-            if !dead[g] {
-                lo = lo.min(lg[g]);
-                hi = hi.max(lg[g]);
-            }
-        }
-        if !lo.is_finite() {
-            lo = lg[0];
-            hi = lo;
-        }
-
-        let lo_h = f32_to_f16(lo);
-        let lo_r = f16_to_f32(lo_h);
-        let span = (hi - lo_r).max(0.0);
-        let mut st_h = f32_to_f16(span / Q4TP_LMAX as f32);
-        // Round-to-nearest on `step` can land just short of `hi`; walk up by
-        // single ULPs until rung 31 provably covers the row's top scale.
-        for _ in 0..64 {
-            let st = f16_to_f32(st_h);
-            if st > 0.0 && lo_r + Q4TP_LMAX as f32 * st >= hi {
-                break;
-            }
-            st_h += 1;
-        }
-        params_row[0..2].copy_from_slice(&lo_h.to_le_bytes());
-        params_row[2..4].copy_from_slice(&st_h.to_le_bytes());
-
-        let st = f16_to_f32(st_h);
-        let tab = q4tp_ladder(params_row, 0);
-        let crow = &mut *codes_row;
-        for g in 0..gpr {
-            let nominal = if dead[g] || st <= 0.0 {
-                0
-            } else {
-                ((lg[g] - lo_r) / st).round_ties_even().clamp(0.0, Q4TP_LMAX as f32) as usize
-            };
-            let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
-            // Same reasoning as q2tp: absmax fixes the outer level and one
-            // outlier coarsens the group behind it. Sixteen levels forgive
-            // more than four, so the win is smaller — but it is measured.
-            let c = if dead[g] || st <= 0.0 || !search {
-                nominal
-            } else {
-                let mut best = (f32::INFINITY, nominal);
-                for cand in nominal.saturating_sub(2)..=(nominal + 1).min(Q4TP_LMAX as usize) {
-                    let sc = tab[cand];
-                    if sc <= 0.0 {
-                        continue;
-                    }
-                    let iv = 1.0 / sc;
-                    let mut err = 0.0f32;
-                    for &wv in tile {
-                        let q = (wv * iv).round_ties_even().clamp(-8.0, 7.0);
-                        let d = wv - q * sc;
-                        err += d * d;
-                    }
-                    if err < best.0 {
-                        best = (err, cand);
-                    }
+            let row = &vals[r * in_dim..(r + 1) * in_dim];
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            for g in 0..gpr {
+                let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+                let absmax = tile.iter().fold(0f32, |m, v| m.max(v.abs()));
+                // An all-zero tile dequantizes to zero whatever its scale, so keep
+                // it out of the row's range — otherwise `f16_scale`'s tiny floor
+                // stretches the ladder and coarsens every live tile in the row.
+                dead[g] = absmax == 0.0;
+                lg[g] = f16_scale(absmax / 7.0).log2();
+                if !dead[g] {
+                    lo = lo.min(lg[g]);
+                    hi = hi.max(lg[g]);
                 }
-                best.1
-            };
-            q4tp_put_code(crow, g, c);
-            let inv = if tab[c] > 0.0 { 1.0 / tab[c] } else { 0.0 };
-            let dst = &mut nib_row[g * Q4TP_NIB..(g + 1) * Q4TP_NIB];
-            for k in 0..16 {
-                let q0 = ((tile[k * 2] * inv).round_ties_even().clamp(-8.0, 7.0) as i8 + 8) as u8;
-                let q1 =
-                    ((tile[k * 2 + 1] * inv).round_ties_even().clamp(-8.0, 7.0) as i8 + 8) as u8;
-                dst[k] = (q0 & 0x0F) | (q1 << 4);
             }
-        }
-            },
+            if !lo.is_finite() {
+                lo = lg[0];
+                hi = lo;
+            }
+
+            let lo_h = f32_to_f16(lo);
+            let lo_r = f16_to_f32(lo_h);
+            let span = (hi - lo_r).max(0.0);
+            let mut st_h = f32_to_f16(span / Q4TP_LMAX as f32);
+            // Round-to-nearest on `step` can land just short of `hi`; walk up by
+            // single ULPs until rung 31 provably covers the row's top scale.
+            for _ in 0..64 {
+                let st = f16_to_f32(st_h);
+                if st > 0.0 && lo_r + Q4TP_LMAX as f32 * st >= hi {
+                    break;
+                }
+                st_h += 1;
+            }
+            params_row[0..2].copy_from_slice(&lo_h.to_le_bytes());
+            params_row[2..4].copy_from_slice(&st_h.to_le_bytes());
+
+            let st = f16_to_f32(st_h);
+            let tab = q4tp_ladder(params_row, 0);
+            let crow = &mut *codes_row;
+            for g in 0..gpr {
+                let nominal = if dead[g] || st <= 0.0 {
+                    0
+                } else {
+                    ((lg[g] - lo_r) / st)
+                        .round_ties_even()
+                        .clamp(0.0, Q4TP_LMAX as f32) as usize
+                };
+                let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+                // Same reasoning as q2tp: absmax fixes the outer level and one
+                // outlier coarsens the group behind it. Sixteen levels forgive
+                // more than four, so the win is smaller — but it is measured.
+                let c = if dead[g] || st <= 0.0 || !search {
+                    nominal
+                } else {
+                    let mut best = (f32::INFINITY, nominal);
+                    for cand in nominal.saturating_sub(2)..=(nominal + 1).min(Q4TP_LMAX as usize) {
+                        let sc = tab[cand];
+                        if sc <= 0.0 {
+                            continue;
+                        }
+                        let iv = 1.0 / sc;
+                        let mut err = 0.0f32;
+                        for &wv in tile {
+                            let q = (wv * iv).round_ties_even().clamp(-8.0, 7.0);
+                            let d = wv - q * sc;
+                            err += d * d;
+                        }
+                        if err < best.0 {
+                            best = (err, cand);
+                        }
+                    }
+                    best.1
+                };
+                q4tp_put_code(crow, g, c);
+                let inv = if tab[c] > 0.0 { 1.0 / tab[c] } else { 0.0 };
+                let dst = &mut nib_row[g * Q4TP_NIB..(g + 1) * Q4TP_NIB];
+                for k in 0..16 {
+                    let q0 =
+                        ((tile[k * 2] * inv).round_ties_even().clamp(-8.0, 7.0) as i8 + 8) as u8;
+                    let q1 = ((tile[k * 2 + 1] * inv).round_ties_even().clamp(-8.0, 7.0) as i8 + 8)
+                        as u8;
+                    dst[k] = (q0 & 0x0F) | (q1 << 4);
+                }
+            }
+        },
     );
 
     nib.extend_from_slice(&params);
@@ -1376,9 +1388,7 @@ pub(crate) fn to_f32(dtype: &str, raw: &[u8]) -> anyhow::Result<Vec<f32>> {
         // the writer's force_f16 rule keep them exact.
         "I64" => raw
             .chunks_exact(8)
-            .map(|b| {
-                i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
-            })
+            .map(|b| i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
             .collect(),
         "I32" => raw
             .chunks_exact(4)
@@ -1748,9 +1758,8 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     // linear_attn_config.full_attn_layers (1-BASED layer numbers);
     // everything else is a KDA layer.
     let tc_model_type = tc.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
-    let is_kimi = model_type == "kimi_linear"
-        || model_type == "kimi_k3"
-        || tc_model_type == "kimi_linear";
+    let is_kimi =
+        model_type == "kimi_linear" || model_type == "kimi_k3" || tc_model_type == "kimi_linear";
     let layer_types = if let Some(lac) = tc.get("linear_attn_config").filter(|_| is_kimi) {
         anyhow::ensure!(
             tc.get("attn_res_block_size")
@@ -1773,9 +1782,17 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         let full: std::collections::HashSet<usize> = lac
             .get("full_attn_layers")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .collect()
+            })
             .unwrap_or_default();
-        anyhow::ensure!(!full.is_empty(), "kimi: linear_attn_config.full_attn_layers is empty");
+        anyhow::ensure!(
+            !full.is_empty(),
+            "kimi: linear_attn_config.full_attn_layers is empty"
+        );
         (1..=n_layers)
             .map(|i| {
                 if full.contains(&i) {
@@ -2114,8 +2131,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     };
     // Gemma-3n (E-series): AltUp/LAuReL/PLE/KV-sharing geometry rides
     // in the header; the runtime switches to the dedicated stack.
-    let is_gemma3n =
-        model_type.starts_with("gemma3n") || tc_model_type.starts_with("gemma3n");
+    let is_gemma3n = model_type.starts_with("gemma3n") || tc_model_type.starts_with("gemma3n");
     let g3n_cfg: Option<cortiq_core::G3nConfig> = if is_gemma3n {
         let need = |k: &str| {
             cfg_usize(tc, k).ok_or_else(|| anyhow::anyhow!("gemma3n: config missing {k}"))
@@ -2129,7 +2145,12 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             activation_sparsity: tc
                 .get("activation_sparsity_pattern")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_f64())
+                        .map(|v| v as f32)
+                        .collect()
+                })
                 .unwrap_or_default(),
         })
     } else {
@@ -2138,8 +2159,8 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     let mut rope_freq_factors: Option<Vec<f64>> = None;
     // Phi-3 longrope: exact only within the ORIGINAL context — cap the
     // declared max honestly instead of serving stretched positions.
-    let mut max_pos = cfg_usize(tc, "max_position_embeddings")
-        .unwrap_or(if is_kimi { 1_048_576 } else { 32768 });
+    let mut max_pos =
+        cfg_usize(tc, "max_position_embeddings").unwrap_or(if is_kimi { 1_048_576 } else { 32768 });
     if let Some(rs) = tc.get("rope_scaling").filter(|v| !v.is_null()) {
         let kind = rs
             .get("type")
@@ -2181,10 +2202,14 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             .or_else(|| {
                 // Gemma-3n stores a per-layer LIST; E-models keep it
                 // uniform — take the head and insist on uniformity.
-                tc.get("intermediate_size").and_then(|v| v.as_array()).and_then(|a| {
-                    let first = a.first()?.as_u64()?;
-                    a.iter().all(|v| v.as_u64() == Some(first)).then_some(first as usize)
-                })
+                tc.get("intermediate_size")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| {
+                        let first = a.first()?.as_u64()?;
+                        a.iter()
+                            .all(|v| v.as_u64() == Some(first))
+                            .then_some(first as usize)
+                    })
             })
             .or_else(|| cfg_usize(tc, "moe_intermediate_size"))
             .ok_or_else(|| anyhow::anyhow!("config: missing intermediate_size"))?,
@@ -2249,8 +2274,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         linear_num_value_heads: lnv,
         linear_key_head_dim: cfg_usize(tc, "linear_key_head_dim")
             .or_else(|| kimi_lac.and_then(|l| cfg_usize(l, "head_dim"))),
-        linear_value_head_dim: lvd
-            .or_else(|| kimi_lac.and_then(|l| cfg_usize(l, "head_dim"))),
+        linear_value_head_dim: lvd.or_else(|| kimi_lac.and_then(|l| cfg_usize(l, "head_dim"))),
         hidden_act,
         embed_multiplier,
         // Gemma-4 attends with scaling = 1.0 (q-norm carries the scale).
@@ -2258,7 +2282,11 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             .get("query_pre_attn_scalar")
             .and_then(|v| v.as_f64())
             // Gemma-4 and Gemma-3n attend with scale 1.0 (q-norm carries it).
-            .or(if is_gemma4 || is_gemma3n { Some(1.0) } else { None }),
+            .or(if is_gemma4 || is_gemma3n {
+                Some(1.0)
+            } else {
+                None
+            }),
         sliding_window: cfg_usize(tc, "sliding_window").filter(|_| {
             is_laguna
                 || is_gemma2
@@ -3043,7 +3071,8 @@ pub fn run_convert(
     // therefore goes straight into the output file and is dropped; the head
     // is patched into a reserved gap once the last tensor lands, so the
     // payloads are never held twice — not in RAM and not on disk.
-    let head_reserve = cortiq_core::format::CmfStreamWriter::head_reserve_for(2 * total.max(4096), 96);
+    let head_reserve =
+        cortiq_core::format::CmfStreamWriter::head_reserve_for(2 * total.max(4096), 96);
     let manifest_path = format!("{output}.manifest");
     let mut done_shards: std::collections::HashSet<String> = std::collections::HashSet::new();
     let resuming = resume
@@ -3078,7 +3107,10 @@ pub fn run_convert(
     // MiniCPM residual-branch scale (folded at write).
     let resid_fold: Option<f32> = if arch.arch_name == "minicpm3" {
         let tcv = config.get("text_config").unwrap_or(&config);
-        let sd = tcv.get("scale_depth").and_then(|v| v.as_f64()).unwrap_or(1.0);
+        let sd = tcv
+            .get("scale_depth")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
         Some((sd / (arch.num_layers as f64).sqrt()) as f32)
     } else {
         None
@@ -3122,11 +3154,10 @@ pub fn run_convert(
                     .and_then(|r| r.split_once('.'))
                     .and_then(|(li, rest)| Some((li.parse::<usize>().ok()?, rest)))
                 {
-                    Some((li, rest)) if kda_layers.contains(&li) && rest.starts_with("self_attn.") => {
-                        format!(
-                            "model.layers.{li}.kda_attn.{}",
-                            &rest["self_attn.".len()..]
-                        )
+                    Some((li, rest))
+                        if kda_layers.contains(&li) && rest.starts_with("self_attn.") =>
+                    {
+                        format!("model.layers.{li}.kda_attn.{}", &rest["self_attn.".len()..])
                     }
                     _ => name,
                 }
@@ -3150,8 +3181,7 @@ pub fn run_convert(
             //   * experts  — I8 holding two FP4 (E2M1) values per byte with
             //     one E8M0 scale per 32 values: OCP MXFP4 exactly.
             //   * skeleton — F8_E4M3 with one E8M0 scale per 128x128 tile.
-            let dsv4 = if matches!(m.dtype.as_str(), "I8" | "F8_E4M3")
-                && !name.ends_with(".scale")
+            let dsv4 = if matches!(m.dtype.as_str(), "I8" | "F8_E4M3") && !name.ends_with(".scale")
             {
                 let scale_name = format!("{}.scale", m.name.trim_end_matches(".weight"));
                 let mut sb = None;
@@ -3196,12 +3226,17 @@ pub fn run_convert(
                     .ok_or_else(|| anyhow::anyhow!("missing {scale_name} for mxfp4 unpacking"))?;
                 anyhow::ensure!(m.shape.len() == 2, "{name}: mxfp4 expects 2-D");
                 let (rows, cp) = (m.shape[0], m.shape[1]);
-                Some((vec![rows, cp * 2], unpack_mxfp4(file.bytes(m), scales, rows, cp)?))
+                Some((
+                    vec![rows, cp * 2],
+                    unpack_mxfp4(file.bytes(m), scales, rows, cp)?,
+                ))
             } else {
                 None
             };
             let name = if mxfp4.is_some() {
-                name.strip_suffix("_packed").expect("suffix checked").to_string()
+                name.strip_suffix("_packed")
+                    .expect("suffix checked")
+                    .to_string()
             } else {
                 name
             };
@@ -3308,9 +3343,8 @@ pub fn run_convert(
                         );
                     }
                     for r in 0..dn {
-                        w[(h * hd + dr + r) * cols..(h * hd + dr + r + 1) * cols].copy_from_slice(
-                            &m_vals[(h * hd + r) * cols..(h * hd + r + 1) * cols],
-                        );
+                        w[(h * hd + dr + r) * cols..(h * hd + dr + r + 1) * cols]
+                            .copy_from_slice(&m_vals[(h * hd + r) * cols..(h * hd + r + 1) * cols]);
                     }
                 }
                 let (dt, data) = quantize_2d(quant, &w, m_shape[0], cols);
@@ -3341,7 +3375,11 @@ pub fn run_convert(
                 let cols = m_shape[1];
                 let mut w = m_vals.clone();
                 for r in 0..dr {
-                    let src = if r < dr / 2 { 2 * r } else { 2 * (r - dr / 2) + 1 };
+                    let src = if r < dr / 2 {
+                        2 * r
+                    } else {
+                        2 * (r - dr / 2) + 1
+                    };
                     w[(lora + r) * cols..(lora + r + 1) * cols]
                         .copy_from_slice(&m_vals[(lora + src) * cols..(lora + src + 1) * cols]);
                 }
@@ -3361,7 +3399,11 @@ pub fn run_convert(
             // into the canonical per-expert 2-D matrices; the fused
             // gate_up halves are [gate | up] along the last axis.
             if name.ends_with(".experts.gate_up_proj") || name.ends_with(".experts.down_proj") {
-                anyhow::ensure!(m_shape.len() == 3, "{name}: expected 3-D, got {:?}", m_shape);
+                anyhow::ensure!(
+                    m_shape.len() == 3,
+                    "{name}: expected 3-D, got {:?}",
+                    m_shape
+                );
                 let base = name
                     .strip_suffix(".experts.gate_up_proj")
                     .or_else(|| name.strip_suffix(".experts.down_proj"))
@@ -3373,7 +3415,10 @@ pub fn run_convert(
                 // converts silently, then fails at load with "router present but
                 // no expert tensors", which points nowhere near here.
                 let base = base.strip_suffix(".mlp").unwrap_or(base);
-                let moe = arch.moe.as_ref().ok_or_else(|| anyhow::anyhow!("no moe cfg"))?;
+                let moe = arch
+                    .moe
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("no moe cfg"))?;
                 let (mi, hid) = (moe.moe_intermediate_size, arch.hidden_size);
                 let (ne, d1, d2) = (m_shape[0], m_shape[1], m_shape[2]);
                 let is_gu = name.ends_with("gate_up_proj");
@@ -3469,7 +3514,11 @@ pub fn run_convert(
                 continue;
             }
             if name.ends_with(".router.proj.weight") {
-                anyhow::ensure!(m_shape.len() == 2, "{name}: expected 2-D, got {:?}", m_shape);
+                anyhow::ensure!(
+                    m_shape.len() == 2,
+                    "{name}: expected 2-D, got {:?}",
+                    m_shape
+                );
                 let (ne, hid) = (m_shape[0], m_shape[1]);
                 // Fold router.scale ⊙ hidden^-1/2 into the columns.
                 let scale_name = m.name.replace(".proj.weight", ".scale");
@@ -3712,7 +3761,7 @@ pub fn run_convert(
                 data,
             });
         }
-    
+
         Ok(())
     };
     if let Some(repo) = stream_repo.clone() {
@@ -3725,7 +3774,11 @@ pub fn run_convert(
         let ns = stream_shards.len().max(1);
         for (si, sname) in stream_shards.iter().enumerate() {
             if done_shards.contains(sname) {
-                eprintln!("  [stream {}/{}] {sname} — уже в файле, пропуск", si + 1, ns);
+                eprintln!(
+                    "  [stream {}/{}] {sname} — уже в файле, пропуск",
+                    si + 1,
+                    ns
+                );
                 progress((si as f32 + 1.0) / ns as f32);
                 continue;
             }
@@ -4126,10 +4179,7 @@ pub(crate) mod tests {
                 parallel.len(),
                 "{name}: length differs between 1 and 8 threads"
             );
-            let diff = serial
-                .iter()
-                .zip(&parallel)
-                .position(|(a, b)| a != b);
+            let diff = serial.iter().zip(&parallel).position(|(a, b)| a != b);
             assert!(
                 diff.is_none(),
                 "{name}: byte {} differs between 1 and 8 threads",
@@ -4177,8 +4227,14 @@ pub(crate) mod tests {
             "model.layers.7.post_attention_layernorm.weight"
         );
         // router + the noaux_tc bias + the hash table
-        assert_eq!(m("layers.7.ffn.gate.weight"), "model.layers.7.mlp.gate.weight");
-        assert_eq!(m("layers.7.ffn.gate.bias"), "model.layers.7.mlp.expert_bias");
+        assert_eq!(
+            m("layers.7.ffn.gate.weight"),
+            "model.layers.7.mlp.gate.weight"
+        );
+        assert_eq!(
+            m("layers.7.ffn.gate.bias"),
+            "model.layers.7.mlp.expert_bias"
+        );
         assert_eq!(m("layers.7.ffn.gate.tid2eid"), "model.layers.7.mlp.tid2eid");
         // w1 = gate, w3 = up, w2 = down — for routed AND shared experts
         assert_eq!(
@@ -4278,7 +4334,10 @@ pub(crate) mod tests {
         let mut back = vec![0f32; rows * cols];
         dequant_q2tp(&blob, rows, cols, &mut back);
         let e = q2tp_rel_rms(&back, &v);
-        assert!(e < 0.55, "q2tp rel-RMS {e} — decode is wrong, not just coarse");
+        assert!(
+            e < 0.55,
+            "q2tp rel-RMS {e} — decode is wrong, not just coarse"
+        );
         assert!(e > 0.05, "q2tp rel-RMS {e} — suspiciously exact for 2 bits");
         assert!(
             back[3 * cols..4 * cols].iter().all(|x| *x == 0.0),
@@ -4523,8 +4582,8 @@ pub(crate) mod tests {
         // Mini rank table: single bytes first, then pairs — exactly the
         // shape tiktoken ships (ranks are the merge order).
         let toks: Vec<&[u8]> = vec![
-            b"h", b"e", b"l", b"o", b" ", b"w", b"r", b"d", b"he", b"ll", b"lo",
-            b"hell", b"hello", b" w", b"or", b" wor", b" world",
+            b"h", b"e", b"l", b"o", b" ", b"w", b"r", b"d", b"he", b"ll", b"lo", b"hell", b"hello",
+            b" w", b"or", b" wor", b" world",
         ];
         let model: String = toks
             .iter()
@@ -4544,11 +4603,7 @@ pub(crate) mod tests {
         // UNREACHABLE with this table (merge path stops at " wor"+l+d) —
         // real tiktoken tokenizes it identically, which is exactly the
         // semantics the recovered merge list must reproduce.
-        let strip: Vec<u32> = ids
-            .iter()
-            .copied()
-            .filter(|&i| i != 100)
-            .collect(); // drop a possible auto-BOS
+        let strip: Vec<u32> = ids.iter().copied().filter(|&i| i != 100).collect(); // drop a possible auto-BOS
         assert_eq!(strip, vec![12, 15, 2, 7], "ids: {ids:?}");
         assert_eq!(tok.decode(&strip), "hello world");
     }
@@ -4569,7 +4624,11 @@ pub(crate) mod tests {
             .unwrap_or(serde_json::Value::Null);
         let t0 = std::time::Instant::now();
         let json = tiktoken_to_tokenizer_json(&model, &cfg).unwrap();
-        eprintln!("converted in {:?}, json {} MB", t0.elapsed(), json.len() / 1_000_000);
+        eprintln!(
+            "converted in {:?}, json {} MB",
+            t0.elapsed(),
+            json.len() / 1_000_000
+        );
         let tok = cortiq_engine::tokenizer::Tokenizer::from_json(&json).unwrap();
         for text in [
             "Hello, world!",
@@ -4580,7 +4639,12 @@ pub(crate) mod tests {
             "   spaces    and\ttabs\n\n",
         ] {
             let ids = tok.encode(text);
-            let back = tok.decode(&ids.iter().copied().filter(|&i| Some(i) != tok.bos_token_id).collect::<Vec<_>>());
+            let back = tok.decode(
+                &ids.iter()
+                    .copied()
+                    .filter(|&i| Some(i) != tok.bos_token_id)
+                    .collect::<Vec<_>>(),
+            );
             assert_eq!(back, text, "roundtrip failed for {text:?} → {ids:?}");
             eprintln!("{:3} toks | {text:?}", ids.len());
         }
@@ -4651,7 +4715,10 @@ pub(crate) mod tests {
         let arch = build_arch(&cfg).unwrap();
         assert_eq!(arch.embed_multiplier, 12.0, "scale_emb");
         assert_eq!(arch.logit_multiplier, Some(0.1), "dim_model_base/hidden");
-        let fac = arch.rope_freq_factors.as_ref().expect("short factors carried");
+        let fac = arch
+            .rope_freq_factors
+            .as_ref()
+            .expect("short factors carried");
         assert_eq!(fac.len(), 16);
         assert!((fac[15] - 16.94).abs() < 1e-9);
         assert!(arch.tie_word_embeddings, "no lm_head tensor — tied");
@@ -4690,7 +4757,10 @@ pub(crate) mod tests {
             "model.layers.2.mlp.shared_expert.gate_proj.weight"
         );
         // Vision tower dropped (text tower converts alone).
-        assert_eq!(canon_name("vision_tower.encoder.blocks.0.wqkv.weight"), None);
+        assert_eq!(
+            canon_name("vision_tower.encoder.blocks.0.wqkv.weight"),
+            None
+        );
         assert_eq!(canon_name("mm_projector.proj.0.weight"), None);
     }
 
@@ -5097,7 +5167,10 @@ pub(crate) mod tests {
     #[test]
     fn mtp_head_is_kept_and_renamed_to_the_loader_layout() {
         let m = |s: &str| canon_name(s);
-        assert_eq!(m("mtp.fc.weight").as_deref(), Some("model.mtp.eh_proj.weight"));
+        assert_eq!(
+            m("mtp.fc.weight").as_deref(),
+            Some("model.mtp.eh_proj.weight")
+        );
         assert_eq!(
             m("mtp.pre_fc_norm_embedding.weight").as_deref(),
             Some("model.mtp.enorm.weight")
@@ -5106,7 +5179,10 @@ pub(crate) mod tests {
             m("mtp.pre_fc_norm_hidden.weight").as_deref(),
             Some("model.mtp.hnorm.weight")
         );
-        assert_eq!(m("mtp.norm.weight").as_deref(), Some("model.mtp.norm.weight"));
+        assert_eq!(
+            m("mtp.norm.weight").as_deref(),
+            Some("model.mtp.norm.weight")
+        );
         // The block's own tensors pass through untouched — including the MoE
         // mlp, which is what this head actually carries.
         assert_eq!(

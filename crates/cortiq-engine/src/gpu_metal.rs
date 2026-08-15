@@ -4988,10 +4988,7 @@ fn wait_fast(cmd: &metal::CommandBufferRef) {
         }
     }
     let took = t0.elapsed().as_micros() as u64;
-    WAIT_US.store(
-        (ewma * 7 + took) / 8,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    WAIT_US.store((ewma * 7 + took) / 8, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn page_size() -> usize {
@@ -7240,7 +7237,10 @@ pub fn q4tp_matmat(
         // does, the kernel is.
         MM_UP.fetch_add(up_us, std::sync::atomic::Ordering::Relaxed);
         MM_GPU.fetch_add(gpu_us, std::sync::atomic::Ordering::Relaxed);
-        MM_DN.fetch_add(t_dn.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        MM_DN.fetch_add(
+            t_dn.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         MM_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     tracing::debug!("gpu q4tp matmat: {rows}x{cols} b={b}");
@@ -7529,10 +7529,7 @@ fn io_shared(c: &Ctx, key: usize, nbytes: usize) -> Buffer {
 /// Vecs reuse freed addresses — so a hit whose bytes changed is refreshed
 /// in the same shared buffer instead of served stale.
 fn cached_weight_buf(c: &Ctx, base: usize, data: &[f32]) -> Buffer {
-    let key = (
-        base.wrapping_add(data.as_ptr() as usize),
-        data.len() * 4,
-    );
+    let key = (base.wrapping_add(data.as_ptr() as usize), data.len() * 4);
     let fp = crate::gpu::fp_f32(data);
     let mut cache = c.cv_bufs.lock().unwrap();
     let mut refresh = false;
@@ -7731,11 +7728,7 @@ pub fn conv1d_gemm(
     }
     submit_and_wait(c, cmd, &[&y_buf]);
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            y_buf.contents() as *const f32,
-            yt.as_mut_ptr(),
-            out_n * oc,
-        );
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, yt.as_mut_ptr(), out_n * oc);
     }
     tracing::debug!("gpu conv1d: {ic}x{oc} k={k} dil={dil} n={n} -> {out_n}");
     true
@@ -8698,7 +8691,17 @@ fn moe_block_jobs_q4tp(
     // 1. gate and up for every expert — 2·ne jobs over the shared input.
     {
         let enc = cmd.new_compute_command_encoder();
-        enc_jobs(enc, &bases_gu, &xbuf, &gubuf, inter, gcols, ne * 2, 0, gu_q2);
+        enc_jobs(
+            enc,
+            &bases_gu,
+            &xbuf,
+            &gubuf,
+            inter,
+            gcols,
+            ne * 2,
+            0,
+            gu_q2,
+        );
         enc.end_encoding();
     }
     // 2. silu(gate)·up, all experts.
@@ -8720,7 +8723,9 @@ fn moe_block_jobs_q4tp(
     // 3. every expert's down projection — each reads its own activation row.
     {
         let enc = cmd.new_compute_command_encoder();
-        enc_jobs(enc, &bases_dn, &abuf, &dbuf, hidden, dcols, ne, inter, false);
+        enc_jobs(
+            enc, &bases_dn, &abuf, &dbuf, hidden, dcols, ne, inter, false,
+        );
         enc.end_encoding();
     }
     // 4. weighted sum across experts.
@@ -9305,11 +9310,7 @@ fn const_buf(c: &Ctx, data: &[f32]) -> Buffer {
     if let Some((b, f)) = cache.get_mut(&key) {
         if *f != fp {
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    b.contents() as *mut f32,
-                    data.len(),
-                );
+                std::ptr::copy_nonoverlapping(data.as_ptr(), b.contents() as *mut f32, data.len());
             }
             *f = fp;
         }
@@ -9460,7 +9461,10 @@ fn o1_ensure_metal(
     if ns + w > 196 || m > 32 || g0.d > 256 || g0.dv > 256 {
         tracing::warn!(
             "o1-metal L{li}: sink+window {}+{} (cap 196), landmarks {m} (cap 32), d {} dv {} (cap 256)",
-            ns, w, g0.d, g0.dv
+            ns,
+            w,
+            g0.d,
+            g0.dv
         );
         return None;
     }
@@ -9468,7 +9472,10 @@ fn o1_ensure_metal(
         if v.m_eff != m || v.w != w || v.sink_len != ns || v.heads.len() != hcnt {
             tracing::warn!(
                 "o1-metal L{li}: group m_eff {} w {} sink {} heads {} vs first {m}/{w}/{ns}/{hcnt}",
-                v.m_eff, v.w, v.sink_len, v.heads.len()
+                v.m_eff,
+                v.w,
+                v.sink_len,
+                v.heads.len()
             );
             return None;
         }
@@ -9507,9 +9514,10 @@ fn o1_ensure_metal(
         b
     };
     let rect_fm = g0.heads.first().is_some_and(|h| h.rect_fm);
-    let meta_b = c
-        ._device
-        .new_buffer((meta.len() * 4) as u64, MTLResourceOptions::StorageModeShared);
+    let meta_b = c._device.new_buffer(
+        (meta.len() * 4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
     unsafe {
         std::ptr::copy_nonoverlapping(meta.as_ptr(), meta_b.contents() as *mut u32, meta.len());
     }
@@ -9779,7 +9787,9 @@ impl TokenGraph {
         match f {
             MetalFfn::Dense { gate, up, down } => {
                 down.1 == self.dims.hidden
-                    && [gate, up, down].iter().all(|t| self.proj_abs(**t).is_some())
+                    && [gate, up, down]
+                        .iter()
+                        .all(|t| self.proj_abs(**t).is_some())
             }
             MetalFfn::Moe(m) => {
                 if self.fbuf.is_multi() {
@@ -9916,8 +9926,7 @@ impl TokenGraph {
                 let s: f64 = unsafe { msg_send![p, GPUStartTime] };
                 let e: f64 = unsafe { msg_send![p, GPUEndTime] };
                 if e > s {
-                    BUSY_US[kind as usize % 4]
-                        .fetch_add(((e - s) * 1e6) as u64, Ordering::Relaxed);
+                    BUSY_US[kind as usize % 4].fetch_add(((e - s) * 1e6) as u64, Ordering::Relaxed);
                     lo = lo.min(s);
                     hi = hi.max(e);
                 }
@@ -9929,7 +9938,9 @@ impl TokenGraph {
                     let ms = |i: usize| BUSY_US[i].load(Ordering::Relaxed) as f64 / n as f64 / 1e3;
                     eprintln!(
                         "gpuprof: gdn-run {:.1} | attn {:.1} | прочее {:.1} ms/ток | span {:.1} ms/ток ({n} синков)",
-                        ms(2), ms(3), ms(0) + ms(1),
+                        ms(2),
+                        ms(3),
+                        ms(0) + ms(1),
                         SPAN_US.load(Ordering::Relaxed) as f64 / n as f64 / 1e3
                     );
                 }
@@ -10195,73 +10206,81 @@ impl TokenGraph {
         // ── KV mirror prep (CPU side; previous token already synced).
         let mirror = if o1dev.is_none() {
             let (k_mb, v_mb, imp_mb, cap, stored) = {
-            let mut reg = self.c.kv_mirrors.lock().unwrap();
-            let need = p.cpu_stored + 1;
-            let entry = reg.entry((p.kv_id, p.layer)).or_insert_with(|| KvMirror {
-                k: self
-                    .c
-                    ._device
-                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
-                v: self
-                    .c
-                    ._device
-                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
-                imp: self
-                    .c
-                    ._device
-                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
-                cap: 0,
-                stored: usize::MAX, // force first-touch upload
-            });
-            if entry.cap < need {
-                let cap = need.next_power_of_two().max(1024);
-                let bytes = (p.nkv * cap * p.hd * 4) as u64;
-                entry.k = self
-                    .c
-                    ._device
-                    .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
-                entry.v = self
-                    .c
-                    ._device
-                    .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
-                entry.imp = self
-                    .c
-                    ._device
-                    .new_buffer((cap * 4) as u64, MTLResourceOptions::StorageModeShared);
-                unsafe {
-                    std::ptr::write_bytes(entry.imp.contents() as *mut u8, 0, cap * 4);
-                }
-                entry.cap = cap;
-                entry.stored = usize::MAX;
-            }
-            if entry.stored != p.cpu_stored {
-                // Resync from the owner of record (eviction, rollback,
-                // a CPU-path append, or a fresh mirror).
-                for h in 0..p.nkv {
-                    if p.cpu_k[h].len() != p.cpu_stored * p.hd
-                        || p.cpu_v[h].len() != p.cpu_stored * p.hd
-                    {
-                        return false;
-                    }
+                let mut reg = self.c.kv_mirrors.lock().unwrap();
+                let need = p.cpu_stored + 1;
+                let entry = reg.entry((p.kv_id, p.layer)).or_insert_with(|| KvMirror {
+                    k: self
+                        .c
+                        ._device
+                        .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                    v: self
+                        .c
+                        ._device
+                        .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                    imp: self
+                        .c
+                        ._device
+                        .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                    cap: 0,
+                    stored: usize::MAX, // force first-touch upload
+                });
+                if entry.cap < need {
+                    let cap = need.next_power_of_two().max(1024);
+                    let bytes = (p.nkv * cap * p.hd * 4) as u64;
+                    entry.k = self
+                        .c
+                        ._device
+                        .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+                    entry.v = self
+                        .c
+                        ._device
+                        .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+                    entry.imp = self
+                        .c
+                        ._device
+                        .new_buffer((cap * 4) as u64, MTLResourceOptions::StorageModeShared);
                     unsafe {
-                        let kd = (entry.k.contents() as *mut f32).add(h * entry.cap * p.hd);
-                        std::ptr::copy_nonoverlapping(p.cpu_k[h].as_ptr(), kd, p.cpu_k[h].len());
-                        let vd = (entry.v.contents() as *mut f32).add(h * entry.cap * p.hd);
-                        std::ptr::copy_nonoverlapping(p.cpu_v[h].as_ptr(), vd, p.cpu_v[h].len());
+                        std::ptr::write_bytes(entry.imp.contents() as *mut u8, 0, cap * 4);
                     }
+                    entry.cap = cap;
+                    entry.stored = usize::MAX;
                 }
-                entry.stored = p.cpu_stored;
-            }
-            let out = (
-                entry.k.clone(),
-                entry.v.clone(),
-                entry.imp.clone(),
-                entry.cap,
-                entry.stored,
-            );
-            entry.stored += 1; // this token's append
-            out
-        };
+                if entry.stored != p.cpu_stored {
+                    // Resync from the owner of record (eviction, rollback,
+                    // a CPU-path append, or a fresh mirror).
+                    for h in 0..p.nkv {
+                        if p.cpu_k[h].len() != p.cpu_stored * p.hd
+                            || p.cpu_v[h].len() != p.cpu_stored * p.hd
+                        {
+                            return false;
+                        }
+                        unsafe {
+                            let kd = (entry.k.contents() as *mut f32).add(h * entry.cap * p.hd);
+                            std::ptr::copy_nonoverlapping(
+                                p.cpu_k[h].as_ptr(),
+                                kd,
+                                p.cpu_k[h].len(),
+                            );
+                            let vd = (entry.v.contents() as *mut f32).add(h * entry.cap * p.hd);
+                            std::ptr::copy_nonoverlapping(
+                                p.cpu_v[h].as_ptr(),
+                                vd,
+                                p.cpu_v[h].len(),
+                            );
+                        }
+                    }
+                    entry.stored = p.cpu_stored;
+                }
+                let out = (
+                    entry.k.clone(),
+                    entry.v.clone(),
+                    entry.imp.clone(),
+                    entry.cap,
+                    entry.stored,
+                );
+                entry.stored += 1; // this token's append
+                out
+            };
             Some((k_mb, v_mb, imp_mb, cap, stored))
         } else {
             None
@@ -10387,7 +10406,13 @@ impl TokenGraph {
                     (&od.mz, 0),
                     (&od.that, 0),
                 ],
-                &[od.h as u32, od.m as u32, od.w as u32, od.d as u32, od.dv as u32],
+                &[
+                    od.h as u32,
+                    od.m as u32,
+                    od.w as u32,
+                    od.d as u32,
+                    od.dv as u32,
+                ],
                 &[od.scale],
                 (gg * hh * mm * 64, 64),
             );
@@ -10502,7 +10527,9 @@ impl TokenGraph {
             static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let lo: u64 = std::env::var("CMF_FFN_TRACE")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             if n >= lo && n < lo + 96 {
                 eprintln!("ffn-call #{n}: gate_rows={} inter={}", gate.1, gate.0);
             }
@@ -10570,28 +10597,28 @@ impl TokenGraph {
                     MTLSize::new(sgs * 32, 1, 1),
                 );
             } else {
-            encode_proj(
-                self.c,
-                enc,
-                &self.fbuf,
-                ag.0,
-                &ag.1,
-                &self.n_b,
-                &fg_b,
-                gate.1,
-                gate.2 / GROUP_SIZE,
-            );
-            encode_proj(
-                self.c,
-                enc,
-                &self.fbuf,
-                au.0,
-                &au.1,
-                &self.n_b,
-                &fu_b,
-                up.1,
-                up.2 / GROUP_SIZE,
-            );
+                encode_proj(
+                    self.c,
+                    enc,
+                    &self.fbuf,
+                    ag.0,
+                    &ag.1,
+                    &self.n_b,
+                    &fg_b,
+                    gate.1,
+                    gate.2 / GROUP_SIZE,
+                );
+                encode_proj(
+                    self.c,
+                    enc,
+                    &self.fbuf,
+                    au.0,
+                    &au.1,
+                    &self.n_b,
+                    &fu_b,
+                    up.1,
+                    up.2 / GROUP_SIZE,
+                );
             }
         }
         let ad = self.proj_abs(down).unwrap();
@@ -10619,30 +10646,30 @@ impl TokenGraph {
                 MTLSize::new(sgs * 32, 1, 1),
             );
         } else {
-        {
-            enc.set_compute_pipeline_state(&self.c.silu);
-            enc.set_buffer(0, Some(&fg_b), 0);
-            enc.set_buffer(1, Some(&fu_b), 0);
-            enc.set_buffer(2, Some(&fg_b), 0); // dummy col (has_col = 0)
-            enc.set_buffer(3, Some(&fa_b), 0);
-            let (n_u, hc) = (inter as u32, 0u32);
-            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
-        }
-        {
-            encode_proj(
-                self.c,
-                enc,
-                &self.fbuf,
-                ad.0,
-                &ad.1,
-                &fa_b,
-                &self.d_b,
-                down.1,
-                down.2 / GROUP_SIZE,
-            );
-        }
+            {
+                enc.set_compute_pipeline_state(&self.c.silu);
+                enc.set_buffer(0, Some(&fg_b), 0);
+                enc.set_buffer(1, Some(&fu_b), 0);
+                enc.set_buffer(2, Some(&fg_b), 0); // dummy col (has_col = 0)
+                enc.set_buffer(3, Some(&fa_b), 0);
+                let (n_u, hc) = (inter as u32, 0u32);
+                enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
+            }
+            {
+                encode_proj(
+                    self.c,
+                    enc,
+                    &self.fbuf,
+                    ad.0,
+                    &ad.1,
+                    &fa_b,
+                    &self.d_b,
+                    down.1,
+                    down.2 / GROUP_SIZE,
+                );
+            }
         }
         disp_axpy(self.c, enc, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
     }
@@ -11702,12 +11729,10 @@ mod tests {
                     MTLResourceOptions::StorageModeShared,
                 )
             };
-            let as_bytes = |v: &[u64]| -> Vec<u8> {
-                v.iter().flat_map(|x| x.to_le_bytes()).collect()
-            };
-            let lg_b = buf(unsafe {
-                std::slice::from_raw_parts(logits.as_ptr() as *const u8, n_exp * 4)
-            });
+            let as_bytes =
+                |v: &[u64]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+            let lg_b =
+                buf(unsafe { std::slice::from_raw_parts(logits.as_ptr() as *const u8, n_exp * 4) });
             let sl_b = buf(&slog[0].to_le_bytes());
             let gt_b = buf(&as_bytes(&gtbl));
             let ut_b = buf(&as_bytes(&utbl));
@@ -11749,12 +11774,10 @@ mod tests {
             cmd.commit();
             cmd.wait_until_completed();
 
-            let got_w =
-                unsafe { std::slice::from_raw_parts(w_b.contents() as *const f32, ne) };
+            let got_w = unsafe { std::slice::from_raw_parts(w_b.contents() as *const f32, ne) };
             let got_gu =
                 unsafe { std::slice::from_raw_parts(bgu_b.contents() as *const u64, ne * 2) };
-            let got_dn =
-                unsafe { std::slice::from_raw_parts(bdn_b.contents() as *const u64, ne) };
+            let got_dn = unsafe { std::slice::from_raw_parts(bdn_b.contents() as *const u64, ne) };
             for (s, &e) in idx.iter().enumerate() {
                 assert_eq!(got_gu[s], gtbl[e], "gate base slot {s} (norm={norm})");
                 assert_eq!(got_gu[ne + s], utbl[e], "up base slot {s}");

@@ -121,9 +121,18 @@ fn stream_sum(@builtin(workgroup_id) wid: vec3<u32>,
         label: None,
         layout: &pipe.get_bind_group_layout(0),
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: src.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: dst.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: ubuf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: src.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: dst.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: ubuf.as_entire_binding(),
+            },
         ],
     });
 
@@ -199,14 +208,27 @@ fn stream16(@builtin(workgroup_id) wid: vec3<u32>,
     let rows_total = nvec / vecs_per_row;
     let rows_per_wg: u32 = 16;
     let wgs16 = rows_total / rows_per_wg;
-    queue.write_buffer(&ubuf, 0, bytemuck::cast_slice(&[vecs_per_row, rows_per_wg, 0u32, 0]));
+    queue.write_buffer(
+        &ubuf,
+        0,
+        bytemuck::cast_slice(&[vecs_per_row, rows_per_wg, 0u32, 0]),
+    );
     let bind16 = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &p16.get_bind_group_layout(0),
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: src.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: dst.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: ubuf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: src.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: dst.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: ubuf.as_entire_binding(),
+            },
         ],
     });
     let run16 = || {
@@ -243,7 +265,11 @@ fn stream16(@builtin(workgroup_id) wid: vec3<u32>,
     // buried before it.
     let slices: u32 = 320;
     let vecs_per_slice = nvec / slices;
-    queue.write_buffer(&ubuf, 0, bytemuck::cast_slice(&[vecs_per_slice, 0u32, 0, 0]));
+    queue.write_buffer(
+        &ubuf,
+        0,
+        bytemuck::cast_slice(&[vecs_per_slice, 0u32, 0, 0]),
+    );
     let wg_per_slice = 64u32; // ~5.5 MB per slice, 64 workgroups each
     let run320 = || {
         let mut enc = device.create_command_encoder(&Default::default());
@@ -334,9 +360,18 @@ fn stream_fat(@builtin(workgroup_id) wid: vec3<u32>,
         label: None,
         layout: &pf.get_bind_group_layout(0),
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: src.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: dst.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: ubuf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: src.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: dst.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: ubuf.as_entire_binding(),
+            },
         ],
     });
     let runf = || {
@@ -390,9 +425,18 @@ fn stream_fat(@builtin(workgroup_id) wid: vec3<u32>,
                 label: None,
                 layout: &pipe.get_bind_group_layout(0),
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: bf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: dst.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: ubuf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: bf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dst.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: ubuf.as_entire_binding(),
+                    },
                 ],
             })
         })

@@ -525,16 +525,9 @@ impl NystromState {
                 head.samp_q_head = (sp + 1) % RESEAL_CAP;
                 head.samp_q_len = (head.samp_q_len + 1).min(RESEAL_CAP);
             }
-            head.step(
-                &self.group,
-                qh,
-                &mut out_all[h * dv..(h + 1) * dv],
-            );
+            head.step(&self.group, qh, &mut out_all[h * dv..(h + 1) * dv]);
         }
-        if rs > 0
-            && self.group.since_reseal >= rs
-            && self.group.samp_len >= 2 * self.group.m_eff
-        {
+        if rs > 0 && self.group.since_reseal >= rs && self.group.samp_len >= 2 * self.group.m_eff {
             self.reseal();
         }
     }
@@ -566,12 +559,15 @@ impl NystromState {
             if qn < m_eff {
                 continue; // not enough queries yet — keep the old Q̃/M
             }
-            let qstart = if qn == RESEAL_CAP { head.samp_q_head } else { 0 };
+            let qstart = if qn == RESEAL_CAP {
+                head.samp_q_head
+            } else {
+                0
+            };
             let mut qs = vec![0.0f32; qn * d];
             for i in 0..qn {
                 let idx = (qstart + i) % RESEAL_CAP;
-                qs[i * d..(i + 1) * d]
-                    .copy_from_slice(&head.samp_q[idx * d..(idx + 1) * d]);
+                qs[i * d..(i + 1) * d].copy_from_slice(&head.samp_q[idx * d..(idx + 1) * d]);
             }
             let q_tilde64 = seg_means(&qs, qn, d, m_eff);
             head.q_tilde = q_tilde64.iter().map(|&x| x as f32).collect();
@@ -648,8 +644,7 @@ impl NystromState {
                     g.samp_v = vec![0.0; RESEAL_CAP * dv];
                 }
                 let sp = g.samp_head;
-                g.samp_k[sp * d..(sp + 1) * d]
-                    .copy_from_slice(&g.win_k[slot * d..(slot + 1) * d]);
+                g.samp_k[sp * d..(sp + 1) * d].copy_from_slice(&g.win_k[slot * d..(slot + 1) * d]);
                 g.samp_v[sp * dv..(sp + 1) * dv]
                     .copy_from_slice(&g.win_v[slot * dv..(slot + 1) * dv]);
                 g.samp_head = (sp + 1) % RESEAL_CAP;
@@ -698,7 +693,9 @@ impl NystromGroup {
             tracing::info!(
                 "o1 seal: exact-only (prompt t={t} <= w {} + sink {} + slack {}) — \
                  not graph-portable; longer prompt or smaller --o1-window lifts it",
-                self.w, self.sink, EXACT_SLACK
+                self.w,
+                self.sink,
+                EXACT_SLACK
             );
         }
 
@@ -851,8 +848,7 @@ impl NystromHead {
         // products, regrouped sums; parity-gated by the golden tests).
         if !skip_win {
             for s in 0..g.win_len {
-                let lg =
-                    crate::attention::dot_f32(q, &g.win_k[s * d..(s + 1) * d]) * g.scale;
+                let lg = crate::attention::dot_f32(q, &g.win_k[s * d..(s + 1) * d]) * g.scale;
                 self.scr_s[ns + s] = lg;
                 c = c.max(lg);
             }
@@ -980,8 +976,7 @@ impl NystromHead {
             self.scr_l.resize(m_eff, 0.0);
         }
         for i in 0..m_eff {
-            self.scr_l[i] =
-                crate::attention::dot_f32(&self.q_tilde[i * d..(i + 1) * d], k) * scale;
+            self.scr_l[i] = crate::attention::dot_f32(&self.q_tilde[i * d..(i + 1) * d], k) * scale;
         }
         for i in 0..m_eff {
             let l = self.scr_l[i];

@@ -125,7 +125,10 @@ unsafe fn init() -> Result<Ctx, String> {
         let entry = ash::Entry::load().map_err(|e| format!("no vulkan loader: {e}"))?;
         let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 3, 0));
         let instance = entry
-            .create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None)
+            .create_instance(
+                &vk::InstanceCreateInfo::default().application_info(&app),
+                None,
+            )
             .map_err(|e| format!("instance: {e}"))?;
         let pds = instance
             .enumerate_physical_devices()
@@ -282,10 +285,7 @@ impl Ctx {
         unsafe {
             let mp = self.instance.get_physical_device_memory_properties(self.pd);
             (0..mp.memory_type_count).find(|&i| {
-                bits & (1 << i) != 0
-                    && mp.memory_types[i as usize]
-                        .property_flags
-                        .contains(want)
+                bits & (1 << i) != 0 && mp.memory_types[i as usize].property_flags.contains(want)
             })
         }
     }
@@ -385,9 +385,9 @@ impl Ctx {
                 return false;
             };
             let mem = sc.stage.as_ref().unwrap().m;
-            let Ok(p) = self
-                .device
-                .map_memory(mem, 0, data.len() as u64, vk::MemoryMapFlags::empty())
+            let Ok(p) =
+                self.device
+                    .map_memory(mem, 0, data.len() as u64, vk::MemoryMapFlags::empty())
             else {
                 return false;
             };
@@ -473,8 +473,7 @@ pub fn q4tp_matmat(
         ) else {
             return false;
         };
-        let xb: &[u8] =
-            std::slice::from_raw_parts(xs.as_ptr() as *const u8, b * cols * 4);
+        let xb: &[u8] = std::slice::from_raw_parts(xs.as_ptr() as *const u8, b * cols * 4);
         if !c.upload(&mut sc, xb, xbuf) {
             return false;
         }
@@ -551,12 +550,7 @@ pub fn q4tp_matmat(
             return false;
         };
         if !c.run_once(|cb| {
-            d.cmd_copy_buffer(
-                cb,
-                ybuf,
-                stage,
-                &[vk::BufferCopy::default().size(ybytes)],
-            );
+            d.cmd_copy_buffer(cb, ybuf, stage, &[vk::BufferCopy::default().size(ybytes)]);
         }) {
             return false;
         }

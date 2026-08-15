@@ -66,13 +66,21 @@ fn vision_tower_matches_the_reference() {
     assert!(mx < 2e-5, "preprocessing diverges: max {mx:.3e}");
 
     let (merged, deep) = tower.forward(&patches, gh, gw);
-    assert_eq!(merged.len(), u("merged_n") * tower.out_hidden, "merged shape");
+    assert_eq!(
+        merged.len(),
+        u("merged_n") * tower.out_hidden,
+        "merged shape"
+    );
     let mx = report("merged", &merged, &read_f32(&dir.join("merged.bin")));
     assert!(mx < 5e-4, "vision tower diverges: max {mx:.3e}");
 
     assert_eq!(deep.len(), u("n_deep"), "deepstack count");
     for (i, d) in deep.iter().enumerate() {
-        let mx = report(&format!("deepstack {i}"), d, &read_f32(&dir.join(format!("deep{i}.bin"))));
+        let mx = report(
+            &format!("deepstack {i}"),
+            d,
+            &read_f32(&dir.join(format!("deep{i}.bin"))),
+        );
         assert!(mx < 5e-4, "deepstack {i} diverges: max {mx:.3e}");
     }
 }
