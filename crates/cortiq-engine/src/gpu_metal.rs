@@ -5152,6 +5152,18 @@ fn encode_q4tp_matvec(
 /// two days of kernel campaigns argued against floors nobody had
 /// measured.
 pub static WEIGHT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The same, split by which stage dispatched: [misc, dense-ffn, moe,
+/// attn, gdn, head]. Encoding is single-threaded, so a static current-
+/// category mark set by the semantic encoders is race-free.
+pub static WEIGHT_BYTES_BY: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+pub static WCAT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn note_weight_bytes(kind: &ProjKind, rows: usize, gpr: usize) {
     let tile: u64 = match kind {
@@ -5161,7 +5173,10 @@ fn note_weight_bytes(kind: &ProjKind, rows: usize, gpr: usize) {
         ProjKind::Q1 | ProjKind::Q1t => 5,
         _ => 16,
     };
-    WEIGHT_BYTES.fetch_add(rows as u64 * gpr as u64 * tile, std::sync::atomic::Ordering::Relaxed);
+    let add = rows as u64 * gpr as u64 * tile;
+    WEIGHT_BYTES.fetch_add(add, std::sync::atomic::Ordering::Relaxed);
+    let cat = WCAT.load(std::sync::atomic::Ordering::Relaxed) as usize % 6;
+    WEIGHT_BYTES_BY[cat].fetch_add(add, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn encode_proj(
@@ -9397,6 +9412,7 @@ impl TokenGraph {
     /// sync this graph already pays instead of a separate per-op
     /// submit+wait round trip. Read with `read_logits` after `sync`.
     pub fn encode_lm_head(&mut self, norm: &[f32], lm: (usize, usize, usize)) {
+        WCAT.store(5, std::sync::atomic::Ordering::Relaxed);
         let cmd = self.ensure_cmd();
         enc_simple(
             &cmd,
@@ -9447,6 +9463,7 @@ impl TokenGraph {
     /// norm(h) → n_b, then QKV projections n_b → q/k/v buffers. The
     /// caller must `sync` + `read_qkv` before using the values.
     pub fn encode_attn_prefix(&mut self, l: &AttnGpuLayer) {
+        WCAT.store(3, std::sync::atomic::Ordering::Relaxed);
         let cmd = self.ensure_cmd();
         let aq = self.proj_abs(l.wq).unwrap();
         let ak = self.proj_abs(l.wk).unwrap();
@@ -9582,6 +9599,7 @@ impl TokenGraph {
     /// with the CPU cache re-uploads it). Returns false without
     /// encoding anything if the mirror could not be prepared.
     pub fn encode_attn_device(&mut self, l: &AttnGpuLayer, p: &AttnDeviceParams) -> bool {
+        WCAT.store(3, std::sync::atomic::Ordering::Relaxed);
         // ── KV mirror prep (CPU side; previous token already synced).
         let (k_mb, v_mb, imp_mb, cap, stored) = {
             let mut reg = self.c.kv_mirrors.lock().unwrap();
@@ -9818,6 +9836,7 @@ impl TokenGraph {
         down: (usize, usize, usize),
         delta: Option<&Buffer>,
     ) {
+        WCAT.store(1, std::sync::atomic::Ordering::Relaxed);
         let inter = gate.1;
         let fg_b = io_buf(self.c, 33_000_000_209 + inter, inter * 4);
         let fu_b = io_buf(self.c, 34_000_000_213 + inter, inter * 4);
@@ -9967,6 +9986,7 @@ impl TokenGraph {
         m: &GpuMoe,
         delta: Option<&Buffer>,
     ) {
+        WCAT.store(2, std::sync::atomic::Ordering::Relaxed);
         let c = self.c;
         let ne = m.top_k + 1; // routed experts + the gated shared one
         let inter = m.inter;
@@ -10143,6 +10163,7 @@ impl TokenGraph {
         states: &[&[f32]],
         cfg: &GdnGpuCfg,
     ) -> bool {
+        WCAT.store(4, std::sync::atomic::Ordering::Relaxed);
         if layers.is_empty() || layers.len() != states.len() {
             return false;
         }

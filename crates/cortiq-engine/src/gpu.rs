@@ -2554,3 +2554,19 @@ pub fn weight_bytes_dispatched() -> u64 {
     #[allow(unreachable_code)]
     0
 }
+
+
+/// The per-stage split of `weight_bytes_dispatched`:
+/// [misc, dense-ffn, moe, attn, gdn, head].
+pub fn weight_bytes_by() -> [u64; 6] {
+    #[cfg(target_os = "macos")]
+    {
+        let mut o = [0u64; 6];
+        for (i, a) in crate::gpu_metal::WEIGHT_BYTES_BY.iter().enumerate() {
+            o[i] = a.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        return o;
+    }
+    #[allow(unreachable_code)]
+    [0; 6]
+}
