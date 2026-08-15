@@ -11652,6 +11652,9 @@ struct Scratch {
     dvt: Option<(wgpu::Buffer, u64)>,
     /// Partial maxima of the two-stage activation reduction.
     amaxp: Option<(wgpu::Buffer, u64)>,
+    /// The folded activation scale (one f32) the batched-prefill coop
+    /// GEMMs read; every GEMM in the chunk rewrites it in queue order.
+    amax1: Option<(wgpu::Buffer, u64)>,
     /// DiT attention: Q/K/V uploads, scores, panel, output, staging.
     dq: Option<(wgpu::Buffer, u64)>,
     dk: Option<(wgpu::Buffer, u64)>,
@@ -13254,6 +13257,14 @@ fn mv_grid_cap() -> u32 {
 fn mv16w_on() -> bool {
     static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("CMF_MV16W").as_deref() != Ok("0"))
+}
+
+/// `CMF_BATCH_COOP=1`: the batched prefill's wide GEMMs (k > 16) on the
+/// cooperative-matrix kernel with a device-computed activation scale.
+/// Opt-in until measured on more than one card.
+fn batch_coop_on() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("CMF_BATCH_COOP").as_deref() == Ok("1"))
 }
 
 fn mv_grid(blocks: u32) -> u32 {
@@ -17922,6 +17933,39 @@ pub fn forward_batch_graph(
                     pass.dispatch_workgroups((rows as u32).div_ceil(8).min(MAX_WG), 1, 1);
                 } else if k <= 16 && c.use_mv4 {
                     let _ = encode_q4tp_mv4_b(c, enc, &m.buf, xs, y, rows, cols, k);
+                } else if batch_coop_on() && c.q4tp_mm_coop.is_some() && cols % 32 == 0 {
+                    // Big-chunk prefill on the matrix units: the scalar
+                    // tile GEMM holds ~5 TFLOP/s, the cooperative one ~50.
+                    // f16 operands, f32 accumulate; the activation scale is
+                    // computed ON THE DEVICE (this panel never reaches the
+                    // host) and read by the kernel at both ends.
+                    let asc = {
+                        let mut sc = c.scratch.lock().unwrap();
+                        Scratch::ensure(
+                            &c.device,
+                            &mut sc.amax1,
+                            4,
+                            wgpu::BufferUsages::STORAGE,
+                            "batch-ascale",
+                        )
+                    };
+                    if encode_act_absmax(c, enc, xs, k * cols, &asc) {
+                        encode_q4_tile_mm_full(
+                            c,
+                            enc,
+                            c.q4tp_mm_coop.as_ref().unwrap(),
+                            &m.buf,
+                            xs,
+                            y,
+                            rows,
+                            cols,
+                            k,
+                            0.0,
+                            Some(&asc),
+                        );
+                    } else {
+                        encode_q4_tile_mm(c, enc, &c.q4tp_mm, &m.buf, xs, y, rows, cols, k)
+                    }
                 } else {
                     encode_q4_tile_mm(c, enc, &c.q4tp_mm, &m.buf, xs, y, rows, cols, k)
                 }
@@ -22827,8 +22871,15 @@ fn q4tp_mm_coop_f16(@builtin(workgroup_id) wid: vec3<u32>,
     var c1: coop_mat16x16<f32, C>;
     var c2: coop_mat16x16<f32, C>;
     var c3: coop_mat16x16<f32, C>;
-    let ascale = bitcast<f32>(pmm.pad);
-    let ainv = select(1.0, ascale, ascale > 0.0);
+    // ONE scale for both ends of the kernel. It used to read the uniform
+    // here and the buffer at the store: with the device-computed scale
+    // (pad = sentinel) the operand went in UNSCALED and the result came
+    // out divided by 1000/max|x| — off by max|x|/1000, on exactly the
+    // inputs large enough to have needed the scale. Caught by
+    // wgpu_q4tp_mm_coop_f16_device_scale_matches_scalar (rel rms 2.0
+    // before this line, 3e-4 after).
+    let asc_in = select(bitcast<f32>(pmm.pad), pmm_s[0], pmm.pad == 0xFFFFFFFFu);
+    let ainv = select(1.0, asc_in, asc_in > 0.0);
 
     var k0 = 0u;
     loop {
@@ -22893,8 +22944,7 @@ fn q4tp_mm_coop_f16(@builtin(workgroup_id) wid: vec3<u32>,
     coopStoreT(c2, &cm_c[sg * 16u * 64u + 32u], 64u);
     coopStoreT(c3, &cm_c[sg * 16u * 64u + 48u], 64u);
     workgroupBarrier();
-    let asc = select(bitcast<f32>(pmm.pad), pmm_s[0], pmm.pad == 0xFFFFFFFFu);
-    let aback = select(1.0, 1.0 / asc, asc > 0.0);
+    let aback = select(1.0, 1.0 / asc_in, asc_in > 0.0);
     for (var t = tid; t < 64u * 64u; t = t + 128u) {
         let m = t / 64u;
         let n = t % 64u;
@@ -23011,6 +23061,11 @@ struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
 @group(0) @binding(1) var<storage, read> xmm: array<f32>;
 @group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
 @group(0) @binding(3) var<uniform> pmm: MmP;
+// Activation scale: the value in `pmm.pad` (0 = none), or, when pad is
+// the sentinel 0xFFFFFFFF, the DEVICE-computed one in this buffer — the
+// batched-prefill GEMMs feed on activations the host never sees, and
+// f16 operands cap at 65504.
+@group(0) @binding(4) var<storage, read> qmm_s: array<f32>;
 
 const KS: u32 = 32u;
 
@@ -23048,6 +23103,9 @@ fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
     var c1: coop_mat16x16<f32, C>;
     var c2: coop_mat16x16<f32, C>;
     var c3: coop_mat16x16<f32, C>;
+    let asc_in = select(bitcast<f32>(pmm.pad), qmm_s[0], pmm.pad == 0xFFFFFFFFu);
+    let ainv = select(1.0, asc_in, asc_in > 0.0);
+    let aback = select(1.0, 1.0 / asc_in, asc_in > 0.0);
 
     let params_b = pmm.rows * gpr * 16u;
     let codes_b = params_b + pmm.rows * 4u;
@@ -23067,8 +23125,8 @@ fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
                 let base = (m0 + m) * cols + col0;
                 v = vec4<f32>(xmm[base], xmm[base + 1u], xmm[base + 2u], xmm[base + 3u]);
             }
-            cm_a[dst] = f16(v.x); cm_a[dst + 1u] = f16(v.y);
-            cm_a[dst + 2u] = f16(v.z); cm_a[dst + 3u] = f16(v.w);
+            cm_a[dst] = f16(v.x * ainv); cm_a[dst + 1u] = f16(v.y * ainv);
+            cm_a[dst + 2u] = f16(v.z * ainv); cm_a[dst + 3u] = f16(v.w * ainv);
         }
         for (var t = tid; t < 64u * 8u; t = t + 128u) {
             let n = t / 8u;
@@ -23138,7 +23196,7 @@ fn q4tp_mm_coop(@builtin(workgroup_id) wid: vec3<u32>,
         let m = t / 64u;
         let n = t % 64u;
         if (m0 + m < pmm.nb && n0 + n < pmm.rows) {
-            ymm[(m0 + m) * pmm.rows + n0 + n] = cm_c[m * 64u + n];
+            ymm[(m0 + m) * pmm.rows + n0 + n] = cm_c[m * 64u + n] * aback;
         }
     }
 }
@@ -24352,6 +24410,19 @@ fn encode_q4_tile_mm_full(
     ascale: f32,
     scale_buf: Option<&wgpu::Buffer>,
 ) {
+    // Is this one of the cooperative kernels (both declare binding 4)?
+    // wgpu 30 exposes no identity on pipeline handles, so the layouts are
+    // compared by their entry count instead: the coop layouts have five
+    // bindings, the scalar tile GEMMs four.
+    let coop_kernel = c
+        .q4tp_mm_coop
+        .as_ref()
+        .map(|p| std::ptr::eq(p, pipeline))
+        .unwrap_or(false)
+        || c.q4tp_mm_coop_f16
+            .as_ref()
+            .map(|p| std::ptr::eq(p, pipeline))
+            .unwrap_or(false);
     // 0xFFFFFFFF is not a float the host would ever pass; the kernel
     // reads it as "take the scale from the buffer instead".
     let pad = if scale_buf.is_some() {
@@ -24389,7 +24460,12 @@ fn encode_q4_tile_mm_full(
     // wgpu 30 exposes no identity on either handle, so the caller says
     // so: `scale_buf` is passed exactly when the f16 twin is the
     // pipeline, and that twin is the only one with binding 4.
-    if scale_buf.is_some() {
+    // Both cooperative kernels declare binding 4 now (the in-kernel one
+    // grew it for the batched prefill); the scalar tile GEMMs do not.
+    // The layout is the pipeline's own — ask it whether slot 4 exists
+    // by trying: a caller passing `scale_buf` for a coop kernel, or a
+    // coop kernel with a host scale (dummy buffer), both need the entry.
+    if scale_buf.is_some() || coop_kernel {
         entries.push(bind_buf(4, sbuf));
     }
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -27293,6 +27369,143 @@ fn main() {
             "wgpu q4tp mm {rows}x{cols} n={n}: {:.2} ms/call  {:.0} GFLOP/s",
             best * 1e3 / reps as f64,
             flops / best / 1e9
+        );
+    }
+
+    /// The f16-PLANE tensor-core GEMM with the DEVICE-computed activation
+    /// scale (the fused-FFN / DiT-block path) against the scalar GEMM,
+    /// with activations past the 1000 threshold so the scale is not 1.0.
+    /// The staging must shrink the operand by the same factor the store
+    /// grows the result by — a kernel that reads the scale from the
+    /// buffer at one end and from the (sentinel) uniform at the other is
+    /// off by exactly max|x|/1000, and only on the inputs large enough to
+    /// have needed the scale in the first place.
+    #[test]
+    fn wgpu_q4tp_mm_coop_f16_device_scale_matches_scalar() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let (Some(pipe), Some(_)) = (c.q4tp_mm_coop_f16.as_ref(), c.q4tp_dq_f16.as_ref()) else {
+            eprintln!("no f16 plane GEMM here — skipping");
+            return;
+        };
+        if c.act_amax_part.is_none() && c.act_absmax.is_none() {
+            eprintln!("no device absmax here — skipping");
+            return;
+        }
+        let (rows, cols, n) = (256usize, 128usize, 96usize);
+        let total =
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+                .unwrap();
+        let (params_off, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+        let mut wb: Vec<u8> = (0..total).map(|i| (i * 37 % 251) as u8).collect();
+        let lo = cortiq_core::quant::f32_to_f16(-4.0);
+        let step = cortiq_core::quant::f32_to_f16(0.1);
+        for r in 0..rows {
+            let o = params_off + r * 4;
+            wb[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+            wb[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+        }
+        // |x| up to ~3000 in a few lanes: max|x| > 1000, so the device
+        // scale is 1000/max and the two ends of the kernel must agree.
+        let xs: Vec<f32> = (0..n * cols)
+            .map(|i| {
+                let b = ((i % 97) as f32 - 48.0) / 48.0;
+                if i % 11 == 0 { b * 3000.0 } else { b }
+            })
+            .collect();
+        let mk = |bytes: &[u8]| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let wbuf = mk(&wb);
+        let xbuf = mk(bytemuck::cast_slice(&xs));
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // scalar reference
+        let y_ref = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (n * rows * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        encode_q4_tile_mm(c, &mut enc, &c.q4tp_mm, &wbuf, &xbuf, &y_ref, rows, cols, n);
+        // plane + device scale + f16 GEMM
+        let (plane, fresh) = plane_cached(c, (usize::MAX - 7, 0), &wbuf, rows, cols).unwrap();
+        if let Some(bind_dq) = fresh {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(c.q4tp_dq_f16.as_ref().unwrap());
+            pass.set_bind_group(0, &bind_dq, &[]);
+            let wgs = ((rows * cols / 2) as u32).div_ceil(256);
+            pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+        }
+        let asc = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test-ascale"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        assert!(encode_act_absmax(c, &mut enc, &xbuf, n * cols, &asc));
+        let y_f16 = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (n * rows * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        encode_q4_tile_mm_full(
+            c,
+            &mut enc,
+            pipe,
+            &plane,
+            &xbuf,
+            &y_f16,
+            rows,
+            cols,
+            n,
+            0.0,
+            Some(&asc),
+        );
+        // read both back
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (2 * n * rows * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        enc.copy_buffer_to_buffer(&y_ref, 0, &stage, 0, (n * rows * 4) as u64);
+        enc.copy_buffer_to_buffer(
+            &y_f16,
+            0,
+            &stage,
+            (n * rows * 4) as u64,
+            (n * rows * 4) as u64,
+        );
+        submit(c, enc.finish());
+        let slice = stage.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range().expect("map");
+        let all: &[f32] = bytemuck::cast_slice(&data);
+        let (a, b) = all.split_at(n * rows);
+        let (mut num, mut den) = (0f64, 0f64);
+        for (x, y) in b.iter().zip(a) {
+            num += ((x - y) as f64).powi(2);
+            den += (*y as f64).powi(2);
+        }
+        let r = (num / den.max(1e-30)).sqrt();
+        println!("coop f16 (device scale) vs scalar: relative rms {r:.3e}");
+        drop(data);
+        stage.unmap();
+        assert!(
+            r < 1e-2,
+            "f16 plane GEMM with the device scale drifted from the scalar arm: {r:.3e}"
         );
     }
 
