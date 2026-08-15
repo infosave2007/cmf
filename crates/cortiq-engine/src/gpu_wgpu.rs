@@ -13130,6 +13130,15 @@ fn graph_decline(why: &str) {
     tracing::warn!("wgpu token graph declined: {why}");
 }
 
+/// Active weight bytes dispatched — the honest floor's numerator, the
+/// instrument the Metal campaign ended on: two days of kernel work on
+/// two backends argued with floors computed from file size, and the
+/// "2x amplification" turned out to be a looped transformer doing its
+/// job. Qwen3.8 is NOT looped, so on the 5090 this counter either
+/// finds its own amplification (KV? activations?) or the 52% mystery
+/// is real. Either way: measure the floor before arguing with it.
+pub static WEIGHT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn graph_refused(why: &'static str) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static SAID: AtomicBool = AtomicBool::new(false);
@@ -13692,6 +13701,7 @@ fn q1t_like(
     };
     let bytes = model.primary_bytes();
     let plen = entry.nbytes as usize;
+    WEIGHT_BYTES.fetch_add(plen as u64, std::sync::atomic::Ordering::Relaxed);
     // sanity: the base must at least fit (q1t base 9 B/group, q4b 18 B/group).
     let min_base = if q4 { rows * gpr * 18 } else { rows * gpr * 9 };
     if plen < min_base || abs + plen > bytes.len() {
@@ -14560,6 +14570,7 @@ pub fn forward_token_graph(
                 if abs + plen > bytes.len() {
                     return None;
                 }
+                WEIGHT_BYTES.fetch_add(plen as u64, std::sync::atomic::Ordering::Relaxed);
                 let b = weight_buffer(
                     c,
                     (model.uid() as usize, gw.idx),
