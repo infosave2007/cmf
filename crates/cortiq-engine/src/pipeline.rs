@@ -152,6 +152,10 @@ pub struct Pipeline {
     spec_q: Vec<Vec<f32>>,
     spec_p: Vec<f32>,
     spec_res: Vec<f32>,
+    /// The same three for the sparse chain (top-k configs).
+    spec_qs: Vec<sampler::Sparse>,
+    spec_ps: sampler::Sparse,
+    spec_ress: sampler::Sparse,
     /// Which arm the MTP draft block runs on this generation: Some(true)
     /// = the whole-token graph (device attention, one submit a step),
     /// Some(false) = the per-op path; None = not decided yet. Decided
@@ -1485,6 +1489,9 @@ impl Pipeline {
             spec_q: Vec::new(),
             spec_p: Vec::new(),
             spec_res: Vec::new(),
+            spec_qs: Vec::new(),
+            spec_ps: Vec::new(),
+            spec_ress: Vec::new(),
             mtp_graph_mode: None,
             inv_freq,
             ws: ForwardScratch::new(hidden_size),
@@ -3236,9 +3243,18 @@ impl Pipeline {
         // correct on post-chain distributions).
         let greedy_pen = cfg.temperature < 1e-6 && penalized;
         let sampling = cfg.temperature >= 1e-6;
+        // Sampling with a top-k goes through the SPARSE chain: the dense
+        // one builds nine 248k-float distributions a round (four drafts,
+        // five verify rows) and measured 19-22 tok/s against a plain 40 —
+        // the host, not the card. Sparse, the same nine cost tens of
+        // microseconds each.
+        let sparse = sampling && sampler::sparse_ok(&cfg);
         let base_len = all_ids.len();
-        if sampling && self.spec_q.len() < k_spec {
+        if sampling && !sparse && self.spec_q.len() < k_spec {
             self.spec_q.resize_with(k_spec, Vec::new);
+        }
+        if sparse && self.spec_qs.len() < k_spec {
+            self.spec_qs.resize_with(k_spec, Vec::new);
         }
         // Draft the chain: first from the trunk's tip hidden, then the head
         // iterating on itself. Rows land in the MTP KV; the chain rows past
@@ -3249,7 +3265,29 @@ impl Pipeline {
         for j in 0..k_spec {
             let tok_in = if j == 0 { t_next } else { drafts[j - 1] };
             let (mut lg, hj) = self.mtp_step_hl(m, &hx, tok_in, next_pos - 1 + j);
-            let dj = if sampling {
+            let dj = if sparse {
+                let mut q = std::mem::take(&mut self.spec_qs[j]);
+                let ok = sampler::sparse_distribution_into(
+                    &lg,
+                    &cfg,
+                    all_ids,
+                    &mut self.sampler_scratch,
+                    self.pool.as_deref(),
+                    &mut q,
+                );
+                let d = if ok {
+                    sampler::draw_sparse(&q, &mut self.rng)
+                } else {
+                    // everything filtered: the dense chain's greedy fallback
+                    let t = sampler::argmax(&lg);
+                    q.clear();
+                    q.push((t, 1.0));
+                    t
+                };
+                self.spec_qs[j] = q;
+                all_ids.push(d);
+                d
+            } else if sampling {
                 let mut q = std::mem::take(&mut self.spec_q[j]);
                 sampler::distribution_into(
                     &lg,
@@ -3332,7 +3370,45 @@ impl Pipeline {
         // — that token is committed by the loop top as-is (spec_forced).
         let mut a = 0usize;
         let mut forced: Option<u32> = None;
-        let ids: Vec<u32> = if sampling {
+        let ids: Vec<u32> = if sparse {
+            let mut p = std::mem::take(&mut self.spec_ps);
+            let mut res = std::mem::take(&mut self.spec_ress);
+            while a < k_spec {
+                let ok = sampler::sparse_distribution_into(
+                    &logits[a * lm_rows..(a + 1) * lm_rows],
+                    &cfg,
+                    all_ids,
+                    &mut self.sampler_scratch,
+                    self.pool.as_deref(),
+                    &mut p,
+                );
+                if !ok {
+                    let t = sampler::argmax(&logits[a * lm_rows..(a + 1) * lm_rows]);
+                    p.clear();
+                    p.push((t, 1.0));
+                }
+                match sampler::spec_accept_or_correct_sparse(
+                    &p,
+                    &self.spec_qs[a],
+                    drafts[a],
+                    &mut self.rng,
+                    &mut res,
+                ) {
+                    None => {
+                        all_ids.push(drafts[a]);
+                        a += 1;
+                    }
+                    Some(c) => {
+                        forced = Some(c);
+                        break;
+                    }
+                }
+            }
+            all_ids.truncate(base_len);
+            self.spec_ps = p;
+            self.spec_ress = res;
+            drafts.clone()
+        } else if sampling {
             let mut p = std::mem::take(&mut self.spec_p);
             let mut res = std::mem::take(&mut self.spec_res);
             while a < k_spec {

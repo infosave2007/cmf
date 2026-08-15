@@ -108,7 +108,7 @@ fn spin_budget_from_env() -> usize {
 /// first while the other 48 were woken, found nothing, and left. The
 /// hyper-connection projection has 24 rows and is called 86 times a token:
 /// it paid the full price of a fan-out and ran single-threaded.
-fn grain_for(rows: usize, workers: usize) -> usize {
+pub(crate) fn grain_for(rows: usize, workers: usize) -> usize {
     if rows == 0 || workers <= 1 {
         return rows.max(1);
     }
@@ -605,6 +605,30 @@ pub fn matvec_rows2(
                 out2[o] = s2;
             }
         }
+    }
+}
+
+/// `SendMut` for any element type — the sampler's sparse chain writes
+/// per-grain candidate lists.
+pub(crate) struct SendMutT<T>(*mut T);
+unsafe impl<T> Send for SendMutT<T> {}
+unsafe impl<T> Sync for SendMutT<T> {}
+impl<T> Clone for SendMutT<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for SendMutT<T> {}
+impl<T> SendMutT<T> {
+    #[inline]
+    pub(crate) fn new(p: *mut T) -> Self {
+        Self(p)
+    }
+    /// Same contract as `SendMut::at`: disjoint indices, pointee outlives
+    /// the joined dispatch.
+    #[inline]
+    pub(crate) fn at(self, i: usize) -> *mut T {
+        unsafe { self.0.add(i) }
     }
 }
 
