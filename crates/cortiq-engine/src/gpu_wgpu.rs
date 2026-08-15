@@ -5080,6 +5080,138 @@ fn q4tp_matvec16w_x2(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// ── FFN gate+up+SiLU in ONE dispatch on the quad-row 16w body: a
+// workgroup owns eight rows of BOTH weights (r0/r1 gate, r2/r3 the same
+// rows of up), reduces all four chains, and its lane 0 writes
+// act[r] = silu(gate[r]) * up[r] straight into the down projection's
+// input. Per-row arithmetic and add order are `q4tp_matvec16w`'s (body
+// generated from it) and the SiLU is `silu_mul_pre`'s expression, so
+// the activations are bit-identical to gate-matvec, up-matvec, silu —
+// three dispatches and two 70 KB round trips become one dispatch.
+// Weight A = gate (slots 0/4), weight B = up (slots 6/7), `_p0` = the
+// swiglu limit as f32 bits (0 = none), rows = the FFN width.
+@compute @workgroup_size(256)
+fn q4tp_matvec16w_gu(@builtin(workgroup_id) wid: vec3<u32>,
+                     @builtin(num_workgroups) nwg: vec3<u32>,
+                     @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let params_w2 = params_w;
+    let codes_b2 = codes_b;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let blocks = (rows + 7u) / 8u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks) { break; }
+        let base = wb * 8u;
+        for (var t = lid; t < 512u; t = t + 256u) {
+            let slot = t >> 5u;
+            if (slot < 8u) {
+                let r = base + slot;
+                if (r < rows) {
+                    let pr = unpack2x16float(q1w[params_w + r]);
+                    lad_q4w[t] = exp2(pr.x + f32(t & 31u) * pr.y);
+                }
+            } else {
+                let r = base + slot - 8u;
+                if (r < rows) {
+                    let pr = unpack2x16float(q1w2[params_w2 + r]);
+                    lad_q4w[t] = exp2(pr.x + f32(t & 31u) * pr.y);
+                }
+            }
+        }
+        workgroupBarrier();
+        // r0/r1: gate rows base+sub, base+sub+4; r2/r3: the SAME up rows.
+        let r0 = base + sub;
+        let r1 = base + sub + 4u;
+        let r2 = base + sub;
+        let r3 = base + sub + 4u;
+        var acc = vec4<f32>(0.0);
+        if (r0 < rows) {
+            let c0 = codes_b + r0 * cstride;
+            let c1 = codes_b + r1 * cstride;
+            let c2 = codes_b2 + r2 * cstride;
+            let c3 = codes_b2 + r3 * cstride;
+            let l1 = r1 < rows;
+            let l2 = r2 < rows;
+            let l3 = r3 < rows;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                let x0 = g * 8u;
+                let xa = q4v_x[x0];      let xb = q4v_x[x0 + 1u];
+                let xc = q4v_x[x0 + 2u]; let xd = q4v_x[x0 + 3u];
+                let xe = q4v_x[x0 + 4u]; let xf = q4v_x[x0 + 5u];
+                let xg = q4v_x[x0 + 6u]; let xh = q4v_x[x0 + 7u];
+                var cv = q4tp_byte(c0 + cbo);
+                if (sh > 3u) { cv = cv | (q4tp_byte(c0 + cbo + 1u) << 8u); }
+                var v = q4v_w[r0 * gpr + g];
+                acc.x = acc.x + lad_q4w[(sub << 5u) + ((cv >> sh) & 31u)]
+                    * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                     + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                if (l1) {
+                    cv = q4tp_byte(c1 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte(c1 + cbo + 1u) << 8u); }
+                    v = q4v_w[r1 * gpr + g];
+                    acc.y = acc.y + lad_q4w[128u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                if (l2) {
+                    cv = q4tp_byte2(c2 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte2(c2 + cbo + 1u) << 8u); }
+                    v = q4v_w2[r2 * gpr + g];
+                    acc.z = acc.z + lad_q4w[256u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                if (l3) {
+                    cv = q4tp_byte2(c3 + cbo);
+                    if (sh > 3u) { cv = cv | (q4tp_byte2(c3 + cbo + 1u) << 8u); }
+                    v = q4v_w2[r3 * gpr + g];
+                    acc.w = acc.w + lad_q4w[384u + (sub << 5u) + ((cv >> sh) & 31u)]
+                        * (q4v_dot8(v.x, xa, xb) + q4v_dot8(v.y, xc, xd)
+                         + q4v_dot8(v.z, xe, xf) + q4v_dot8(v.w, xg, xh));
+                }
+                g = g + 64u;
+            }
+        }
+        partial_q4k[lid] = acc;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+                partial_q4k[lid] = partial_q4k[lid] + partial_q4k[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u) {
+            let r = partial_q4k[sub << 6u];
+            // act = (g / (1 + exp(-g))) * u — the silu_mul_pre expression,
+            // term for term, with the reference's asymmetric swiglu limit.
+            var ga = r.x; var gb = r.y; var ua = r.z; var ub = r.w;
+            let lim = bitcast<f32>(q1p._p0);
+            if (lim > 0.0) {
+                ua = clamp(ua, -lim, lim); ub = clamp(ub, -lim, lim);
+                ga = min(ga, lim); gb = min(gb, lim);
+            }
+            if (r0 < rows) { q1y[r0] = (ga / (1.0 + exp(-ga))) * ua; }
+            if (r1 < rows) { q1y[r1] = (gb / (1.0 + exp(-gb))) * ub; }
+        }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+
 // ── q4tp matvec, k-in-registers batch: ONE weight decode serves up to
 // FOUR activation vectors. The nb-dispatch batch streams the whole weight
 // once per element and hopes for L2; at 2-8 MB a layer there is nothing
@@ -11637,6 +11769,11 @@ struct Ctx {
     /// GDN qkv+z, attention k+v). `CMF_MV_X2=0` splits them again.
     q4tp_mv16w_x2: wgpu::ComputePipeline,
     use_mv_x2: bool,
+    /// FFN gate+up+SiLU in one dispatch (the x2 body with the same rows
+    /// of both weights per workgroup and the SiLU in the epilogue).
+    /// `CMF_MV_GU=0` returns to gate, up, silu as three dispatches.
+    q4tp_mv16w_gu: wgpu::ComputePipeline,
+    use_mv_gu: bool,
     f32_gemm_dx: wgpu::ComputePipeline,
     vae_conv: wgpu::ComputePipeline,
     dit_ropepack: wgpu::ComputePipeline,
@@ -12749,6 +12886,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let q4tp_mv16w = pipe("q4tp_matvec16w");
     let q4tp_mv16w_x2 = pipe("q4tp_matvec16w_x2");
     let use_mv_x2 = std::env::var("CMF_MV_X2").map(|v| v != "0").unwrap_or(true);
+    let q4tp_mv16w_gu = pipe("q4tp_matvec16w_gu");
+    let use_mv_gu = std::env::var("CMF_MV_GU").map(|v| v != "0").unwrap_or(true);
     let f32_gemm_dx = pipe("f32_gemm_dx");
     // Per-kernel validation while these are new: a scope around each
     // names the shader the driver rejected, where the module-wide scope
@@ -13061,6 +13200,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mv16w,
         q4tp_mv16w_x2,
         use_mv_x2,
+        q4tp_mv16w_gu,
+        use_mv_gu,
         f32_gemm_dx,
         vae_conv,
         dit_ropepack,
@@ -13500,6 +13641,38 @@ fn mv_x2_bind(
     });
     let wg = (rows_a as u32).div_ceil(16) + (rows_b as u32).div_ceil(16);
     (bind, mv_grid(wg))
+}
+
+/// Bind group + grid for the fused gate+up+SiLU kernel: gate and up
+/// (both [inter x cols] q4tp) against `xs`, activations into `act`.
+fn mv_gu_bind(
+    c: &Ctx,
+    gate: &wgpu::Buffer,
+    up: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    act: &wgpu::Buffer,
+    inter: usize,
+    cols: usize,
+) -> (wgpu::BindGroup, u32) {
+    let gpr = cols / 32;
+    // `_p0` carries the swiglu limit as f32 bits; the token graph's dense
+    // FFN has none (0.0), which is what silu_mul_pre gets there too.
+    let p_buf = uniform_u32x4(c, [gpr as u32, inter as u32, 0, inter as u32]);
+    let layout = c.q4tp_mv16w_gu.get_bind_group_layout(0);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("mv-gu"),
+        layout: &layout,
+        entries: &[
+            bind_buf(0, gate),
+            bind_buf(2, act),
+            bind_buf(3, &p_buf),
+            bind_buf(4, gate),
+            bind_buf(5, xs),
+            bind_buf(6, up),
+            bind_buf(7, up),
+        ],
+    });
+    (bind, mv_grid((inter as u32).div_ceil(8)))
 }
 
 /// `CMF_MV16W=0`: the wide-row q4tp decode matvec takes the 8-row pair
@@ -16729,23 +16902,46 @@ pub fn forward_token_graph(
                     // projection passes into one and bought 1.46 ms a token
                     // across 30 layers — ~16 us per pass. Four passes become one.
                     // qkv+z ride ONE dispatch when both are wide q4tp
-                    // (the x2 kernel); a and b (tiny, f32) stay separate.
+                    // (the x2 kernel); a and b (tiny f32 rows) ride ONE
+                    // dispatch of the pair kernel, whose f32 arm is
+                    // `f32_matvec` lane for lane (64-stride, same tree) —
+                    // four projection launches become two.
                     let pqz = prep2(qkv, z, &n1, &qkv_b, &z_b, *cdim, nv * dv, hidden);
-                    let n_proj = if pqz.is_some() { 3 } else { 4 };
-                    let projs = if let Some(p2) = pqz {
-                        [
+                    let pab = if pqz.is_some() && a.kind == 4 && b.kind == 4 && c.use_mv_x2 {
+                        let pu = unif(&[
+                            *nv as u32,
+                            hidden as u32,
+                            4,
+                            0,
+                            *nv as u32,
+                            hidden as u32,
+                            4,
+                            0,
+                        ]);
+                        let bind = bg(&c.layout_mv2, &[&a.buf, &b.buf, &n1, &a_b, &b_b, &pu]);
+                        Some((&c.matvec_pair, bind, ((2 * *nv) as u32).min(MAX_WG)))
+                    } else {
+                        None
+                    };
+                    let n_proj = match (pqz.is_some(), pab.is_some()) {
+                        (true, true) => 2,
+                        (true, false) => 3,
+                        _ => 4,
+                    };
+                    let projs = match (pqz, pab) {
+                        (Some(p2), Some(pp)) => [Some(p2), Some(pp), None, None],
+                        (Some(p2), None) => [
                             Some(p2),
                             prep(a, &n1, &a_b, *nv, hidden),
                             prep(b, &n1, &b_b, *nv, hidden),
                             None,
-                        ]
-                    } else {
-                        [
+                        ],
+                        (None, _) => [
                             prep(qkv, &n1, &qkv_b, *cdim, hidden),
                             prep(z, &n1, &z_b, nv * dv, hidden),
                             prep(a, &n1, &a_b, *nv, hidden),
                             prep(b, &n1, &b_b, *nv, hidden),
-                        ]
+                        ],
                     };
                     let outp = prep(out, &gdo_b, &ob, hidden, nv * dv);
                     let projs_ok = projs.iter().take(n_proj).all(|p| p.is_some());
@@ -16978,8 +17174,29 @@ pub fn forward_token_graph(
                         continue_ffn = true;
                     }
                     if !continue_ffn {
-                        let pgu = prep2(gate, up, &n1, &gbuf, &ubuf, inter, inter, hidden);
-                        let (pg, pu) = if pgu.is_some() {
+                        // gate+up+SiLU in one dispatch when both are wide q4tp
+                        // (`prep_gu`); else gate+up in one and SiLU separate
+                        // (`prep2`); else the three-dispatch path.
+                        let gu_ok = c.use_mv_gu
+                            && c.use_mv4
+                            && gate.kind == 6
+                            && up.kind == 6
+                            && hidden % 32 == 0
+                            && hidden / 32 > 64
+                            && c.q4tp_mv16w_probe.is_none();
+                        let pgu_fused = if gu_ok {
+                            let (b, w) =
+                                mv_gu_bind(c, &gate.buf, &up.buf, &n1, &abuf, inter, hidden);
+                            Some((&c.q4tp_mv16w_gu, b, w))
+                        } else {
+                            None
+                        };
+                        let pgu = if pgu_fused.is_some() {
+                            None
+                        } else {
+                            prep2(gate, up, &n1, &gbuf, &ubuf, inter, inter, hidden)
+                        };
+                        let (pg, pu) = if pgu.is_some() || pgu_fused.is_some() {
                             (None, None)
                         } else {
                             (
@@ -16989,7 +17206,34 @@ pub fn forward_token_graph(
                         };
                         let pd = prep(down, &abuf, &ob, hidden, inter);
                         let mut down_rode_along = false;
-                        if let Some((p2, bg2, w2)) = pgu {
+                        if let Some((pf, bgf, wf)) = pgu_fused {
+                            let mut pass = begin_pass(&mut enc);
+                            let fine = li < 32;
+                            if let Some((p, b, w)) = &ffn_pre {
+                                pass.set_pipeline(p);
+                                pass.set_bind_group(0, b, &[]);
+                                pass.dispatch_workgroups(*w, 1, 1);
+                            }
+                            tsp!(pass, fine, 40);
+                            pass.set_pipeline(pf);
+                            pass.set_bind_group(0, &bgf, &[]);
+                            pass.dispatch_workgroups(wf, 1, 1);
+                            tsp!(pass, fine, 43); // gate+up+silu in one dispatch
+                            if let Some((pdp, bg_d, wd)) = &pd {
+                                pass.set_pipeline(pdp);
+                                pass.set_bind_group(0, bg_d, &[]);
+                                pass.dispatch_workgroups(*wd, 1, 1);
+                                tsp!(pass, fine, 44);
+                                if let Some((p, b, w)) = &ffn_post {
+                                    pass.set_pipeline(p);
+                                    pass.set_bind_group(0, b, &[]);
+                                    pass.dispatch_workgroups(*w, 1, 1);
+                                    tail_done = true;
+                                }
+                                tsp!(pass, fine, 45);
+                                down_rode_along = true;
+                            }
+                        } else if let Some((p2, bg2, w2)) = pgu {
                             let bg_silu = bgc(
                                 26,
                                 li,
@@ -27739,7 +27983,9 @@ fn main() {
             )
             .unwrap();
             let (params_off, _, _) = cortiq_core::quant::q4tp_sections(rows, cols);
-            let mut wb: Vec<u8> = (0..total).map(|i| ((i * 37 + seed * 11) % 251) as u8).collect();
+            let mut wb: Vec<u8> = (0..total)
+                .map(|i| ((i * 37 + seed * 11) % 251) as u8)
+                .collect();
             let lo = cortiq_core::quant::f32_to_f16(-4.0);
             let step = cortiq_core::quant::f32_to_f16(0.1);
             for r in 0..rows {
@@ -27794,7 +28040,13 @@ fn main() {
         enc.copy_buffer_to_buffer(&ya1, 0, &stage, 0, (rows_a * 4) as u64);
         enc.copy_buffer_to_buffer(&yb1, 0, &stage, (rows_a * 4) as u64, (rows_b * 4) as u64);
         enc.copy_buffer_to_buffer(&ya2, 0, &stage, (n * 4) as u64, (rows_a * 4) as u64);
-        enc.copy_buffer_to_buffer(&yb2, 0, &stage, ((n + rows_a) * 4) as u64, (rows_b * 4) as u64);
+        enc.copy_buffer_to_buffer(
+            &yb2,
+            0,
+            &stage,
+            ((n + rows_a) * 4) as u64,
+            (rows_b * 4) as u64,
+        );
         submit(c, enc.finish());
         let slice = stage.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
@@ -27802,12 +28054,137 @@ fn main() {
         let data = slice.get_mapped_range().expect("map");
         let all: &[f32] = bytemuck::cast_slice(&data);
         let (single, pair) = all.split_at(n);
-        let mism = single.iter().zip(pair).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        let mism = single
+            .iter()
+            .zip(pair)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
         let nz = single.iter().filter(|v| **v != 0.0).count();
         drop(data);
         stage.unmap();
-        assert!(nz > n / 2, "the singles produced mostly zeros — the harness is wrong");
-        assert_eq!(mism, 0, "{mism} of {n} outputs differ between the x2 kernel and two singles");
+        assert!(
+            nz > n / 2,
+            "the singles produced mostly zeros — the harness is wrong"
+        );
+        assert_eq!(
+            mism, 0,
+            "{mism} of {n} outputs differ between the x2 kernel and two singles"
+        );
+    }
+
+    /// The fused gate+up+SiLU kernel against gate matvec + up matvec +
+    /// `silu_mul_pre` on the device — bit for bit.
+    #[test]
+    fn wgpu_q4tp_matvec16w_gu_matches_three_dispatches() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let (inter, cols) = (1000usize, 4096usize);
+        let mk_w = |seed: usize| -> Vec<u8> {
+            let total = cortiq_core::quant::expected_nbytes(
+                cortiq_core::TensorDtype::Q4TiledP,
+                &[inter, cols],
+            )
+            .unwrap();
+            let (params_off, _, _) = cortiq_core::quant::q4tp_sections(inter, cols);
+            let mut wb: Vec<u8> = (0..total)
+                .map(|i| ((i * 37 + seed * 11) % 251) as u8)
+                .collect();
+            let lo = cortiq_core::quant::f32_to_f16(-4.0);
+            let step = cortiq_core::quant::f32_to_f16(0.1);
+            for r in 0..inter {
+                let o = params_off + r * 4;
+                wb[o..o + 2].copy_from_slice(&lo.to_le_bytes());
+                wb[o + 2..o + 4].copy_from_slice(&step.to_le_bytes());
+            }
+            wb
+        };
+        let (wg, wu) = (mk_w(1), mk_w(2));
+        let xs: Vec<f32> = (0..cols)
+            .map(|i| ((i % 97) as f32 - 48.0) / 480.0)
+            .collect();
+        let mk = |bytes: &[u8]| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let (gb, ub, xb) = (mk(&wg), mk(&wu), mk(bytemuck::cast_slice(&xs)));
+        let out = |n: usize| {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (n * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let (gy, uy, act_ref, act) = (out(inter), out(inter), out(inter), out(inter));
+        let dummy = out(4);
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encode_q4tp_mv4(c, &mut enc, &gb, &xb, &gy, inter, cols);
+        encode_q4tp_mv4(c, &mut enc, &ub, &xb, &uy, inter, cols);
+        let silu_u = uniform_u32x4(c, [inter as u32, 0, 0, 0]);
+        let bg_silu = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.layout_silu,
+            entries: &[
+                bind_buf(0, &gy),
+                bind_buf(1, &uy),
+                bind_buf(2, &dummy),
+                bind_buf(3, &act_ref),
+                bind_buf(4, &silu_u),
+            ],
+        });
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(&c.silu);
+            pass.set_bind_group(0, &bg_silu, &[]);
+            pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
+        }
+        let (bind, wgc) = mv_gu_bind(c, &gb, &ub, &xb, &act, inter, cols);
+        {
+            let mut pass = begin_pass(&mut enc);
+            pass.set_pipeline(&c.q4tp_mv16w_gu);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(wgc, 1, 1);
+        }
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (2 * inter * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        enc.copy_buffer_to_buffer(&act_ref, 0, &stage, 0, (inter * 4) as u64);
+        enc.copy_buffer_to_buffer(&act, 0, &stage, (inter * 4) as u64, (inter * 4) as u64);
+        submit(c, enc.finish());
+        let slice = stage.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range().expect("map");
+        let all: &[f32] = bytemuck::cast_slice(&data);
+        let (a, b) = all.split_at(inter);
+        let mism = a
+            .iter()
+            .zip(b)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        let nz = a.iter().filter(|v| **v != 0.0).count();
+        drop(data);
+        stage.unmap();
+        assert!(
+            nz > inter / 2,
+            "reference activations mostly zero — harness wrong"
+        );
+        assert_eq!(
+            mism, 0,
+            "{mism} of {inter} activations differ between the fused kernel and gate/up/silu"
+        );
     }
 
     /// Decode-matvec bandwidth by SHAPE, in one submit: the wide FFN
