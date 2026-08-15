@@ -651,6 +651,46 @@ enum Commands {
         #[arg(long)]
         skill: Option<String>,
     },
+    /// Dequantize one tensor of a .cmf into raw little-endian floats
+    /// (`--dtype f32|bf16`), row-major — the bridge to offline tools
+    /// (the FCD/fold experiments read a quantized model's exact numerics
+    /// this way instead of re-implementing the codecs). `--name` may be a
+    /// prefix with `--all`: one file per tensor under `--out` (a dir).
+    Dequant {
+        /// Path to .cmf model file
+        model: String,
+        /// Tensor name (or prefix with --all)
+        #[arg(long)]
+        name: String,
+        /// Output file (or directory with --all)
+        #[arg(long)]
+        out: String,
+        /// f32 (default) or bf16
+        #[arg(long, default_value = "f32")]
+        dtype: String,
+        /// Treat --name as a prefix and dump every matching tensor
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
+    /// Re-encode one 2-D tensor of a .cmf IN PLACE from raw f32 (row-major,
+    /// rows×cols as in the directory) with the entry's OWN quantization —
+    /// the payload keeps its slot; hashes are recomputed. Verify after.
+    PatchTensor {
+        /// Path to .cmf model file (modified in place unless --output)
+        model: String,
+        /// `name=path.f32` — repeatable; raw f32 rows×cols little-endian
+        #[arg(long = "set")]
+        sets: Vec<String>,
+        /// Encode the patched tensors as this dtype instead of their own
+        /// (f16 | q8_2f | q4tp | q2tp); needs --output when the payload
+        /// grows
+        #[arg(long)]
+        dtype: Option<String>,
+        /// Write a new file (all other tensors copied verbatim) instead
+        /// of patching in place
+        #[arg(long)]
+        output: Option<String>,
+    },
     /// Show model information
     Info {
         /// Path to .cmf model file
@@ -1729,6 +1769,19 @@ async fn main() -> anyhow::Result<()> {
             )
         }
         Commands::Info { model, tensors } => cmd_info(&model, tensors.as_deref()).await,
+        Commands::Dequant {
+            model,
+            name,
+            out,
+            dtype,
+            all,
+        } => cmd_dequant(&model, &name, &out, &dtype, all),
+        Commands::PatchTensor {
+            model,
+            sets,
+            dtype,
+            output,
+        } => cmd_patch_tensor(&model, &sets, dtype.as_deref(), output.as_deref()),
         Commands::Story { model } => cmd_story(&model),
         Commands::Diff { a, b } => cmd_diff(&a, &b),
         Commands::Imagine {
@@ -3793,6 +3846,169 @@ fn wgpu_uploads() -> (f64, f64) {
     {
         (0.0, 0.0)
     }
+}
+
+fn cmd_dequant(model_path: &str, name: &str, out: &str, dtype: &str, all: bool) -> anyhow::Result<()> {
+    let model = CmfModel::open_sharded(model_path)?;
+    let names: Vec<String> = if all {
+        model
+            .tensors
+            .iter()
+            .filter(|e| e.name.starts_with(name))
+            .map(|e| e.name.clone())
+            .collect()
+    } else {
+        vec![name.to_string()]
+    };
+    if all {
+        std::fs::create_dir_all(out)?;
+    }
+    for n in &names {
+        let e = model
+            .tensor(n)
+            .ok_or_else(|| anyhow::anyhow!("no tensor '{n}'"))?;
+        let bytes = model.tensor_bytes(n)?;
+        let mut vals = vec![0f32; e.n_elems()];
+        cortiq_core::quant::dequant_tensor(e, bytes, &mut vals)
+            .map_err(|er| anyhow::anyhow!("dequant {n}: {er}"))?;
+        let mut buf: Vec<u8> = Vec::with_capacity(vals.len() * 4);
+        match dtype {
+            "f32" => {
+                for v in &vals {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            "bf16" => {
+                for v in &vals {
+                    // round-to-nearest-even to bf16
+                    let b = v.to_bits();
+                    let lsb = (b >> 16) & 1;
+                    let r = b.wrapping_add(0x7FFF + lsb) >> 16;
+                    buf.extend_from_slice(&(r as u16).to_le_bytes());
+                }
+            }
+            other => anyhow::bail!("dtype {other}: f32 or bf16"),
+        }
+        let path = if all {
+            format!("{out}/{}.bin", n)
+        } else {
+            out.to_string()
+        };
+        std::fs::write(&path, &buf)?;
+        if all {
+            eprintln!("{n}\t{:?}\t{:?}", e.dtype, e.shape);
+        }
+    }
+    if !all {
+        let e = model.tensor(name).unwrap();
+        println!("{} {:?} {:?} → {out}", name, e.dtype, e.shape);
+    }
+    Ok(())
+}
+
+fn cmd_patch_tensor(
+    model_path: &str,
+    sets: &[String],
+    dtype: Option<&str>,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    if sets.is_empty() {
+        anyhow::bail!("nothing to patch: pass --set name=path.f32 (repeatable)");
+    }
+    let quant_of = |dt: TensorDtype| -> anyhow::Result<convert::Quant> {
+        Ok(match dt {
+            TensorDtype::Q4TiledP => convert::Quant::Q4TiledP,
+            TensorDtype::Q2TiledP => convert::Quant::Q2TiledP,
+            TensorDtype::Q4Tiled => convert::Quant::Q4Tiled,
+            TensorDtype::Q8_2f => convert::Quant::Q8_2f,
+            TensorDtype::Q8Row => convert::Quant::Q8Row,
+            TensorDtype::F16 => convert::Quant::F16,
+            other => anyhow::bail!("cannot re-encode dtype {other:?} here"),
+        })
+    };
+    let forced: Option<convert::Quant> = match dtype {
+        None => None,
+        Some(q) => Some(convert::parse_quant(q)?),
+    };
+    // (directory index, dtype, payload)
+    let mut patches: Vec<(usize, TensorDtype, Vec<u8>)> = Vec::new();
+    let model = CmfModel::open_sharded(model_path)?;
+    for spec in sets {
+        let (name, path) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--set wants name=path, got '{spec}'"))?;
+        let idx = model
+            .tensor_index(name)
+            .ok_or_else(|| anyhow::anyhow!("no tensor '{name}'"))?;
+        let e = &model.tensors[idx];
+        if e.shape.len() != 2 {
+            anyhow::bail!("{name}: 2-D tensors only (shape {:?})", e.shape);
+        }
+        let (rows, cols) = (e.shape[0], e.shape[1]);
+        let raw = std::fs::read(path)?;
+        if raw.len() != rows * cols * 4 {
+            anyhow::bail!(
+                "{path}: {} bytes, want {} (= {rows}×{cols} f32)",
+                raw.len(),
+                rows * cols * 4
+            );
+        }
+        let vals: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let quant = match forced {
+            Some(q) => q,
+            None => quant_of(e.dtype)?,
+        };
+        let (dt, data) = convert::quantize_2d(quant, &vals, rows, cols);
+        if output.is_none() {
+            if e.shard != 0 {
+                anyhow::bail!("{name} lives in a sibling shard; in-place needs shard 0");
+            }
+            if data.len() as u64 > e.nbytes {
+                anyhow::bail!(
+                    "{name}: payload {} bytes > slot {} — use --output",
+                    data.len(),
+                    e.nbytes
+                );
+            }
+        }
+        eprintln!("{name}: {rows}×{cols} {:?} → {dt:?} ({} bytes)", e.dtype, data.len());
+        patches.push((idx, dt, data));
+    }
+    match output {
+        None => {
+            drop(model);
+            CmfModel::recode_entries_in_place(model_path, &patches)?;
+            println!("patched {} tensors in place in {model_path}", patches.len());
+        }
+        Some(out) => {
+            let mut specs: Vec<cortiq_core::format::TensorSpec> =
+                Vec::with_capacity(model.tensors.len());
+            for (i, e) in model.tensors.iter().enumerate() {
+                let (dtype, data) = match patches.iter().find(|p| p.0 == i) {
+                    Some((_, dt, d)) => (*dt, d.clone()),
+                    None => (e.dtype, model.entry_bytes(e).to_vec()),
+                };
+                specs.push(cortiq_core::format::TensorSpec {
+                    name: e.name.clone(),
+                    dtype,
+                    shape: e.shape.clone(),
+                    data,
+                });
+            }
+            CmfModel::write(
+                out,
+                &model.header,
+                &specs,
+                Some(&model.masks),
+                model.vocab.as_deref(),
+            )?;
+            println!("wrote {out} with {} patched tensors", patches.len());
+        }
+    }
+    Ok(())
 }
 
 async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()> {
