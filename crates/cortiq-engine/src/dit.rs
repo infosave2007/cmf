@@ -640,13 +640,7 @@ impl NextDit {
         let flops = 6.0 * n as f64 * self.hidden as f64 * inter as f64;
         let budget = std::time::Duration::from_secs_f64(flops / 1.5e12 * 8.0 + 0.020);
         let el = t0.elapsed();
-        if el > budget && !gpu::probe_was_cold() {
-            tracing::warn!(
-                "gpu ffn took {el:?} (budget {budget:?}) — device contended, \
-                 CPU for the rest of the process"
-            );
-            gpu::mm_kill();
-        }
+        gpu::mm_budget_check("ffn", el, budget, gpu::probe_was_cold());
         true
     }
 
@@ -711,13 +705,7 @@ impl NextDit {
         let flops = 4.0 * nh as f64 * (n as f64) * (n as f64) * hd as f64;
         let budget = std::time::Duration::from_secs_f64(flops / 1.5e12 * 8.0 + 0.020);
         let el = t0.elapsed();
-        if el > budget && !gpu::probe_was_cold() {
-            tracing::warn!(
-                "gpu attention took {el:?} (budget {budget:?}) — device contended, \
-                 CPU for the rest of the process"
-            );
-            gpu::mm_kill();
-        }
+        gpu::mm_budget_check("attention", el, budget, gpu::probe_was_cold());
         true
     }
 
@@ -837,13 +825,7 @@ impl NextDit {
             + 6.0 * n as f64 * hs as f64 * inter as f64;
         let budget = std::time::Duration::from_secs_f64(flops / 1.5e12 * 8.0 + 0.030);
         let el = t0.elapsed();
-        if el > budget && !gpu::probe_was_cold() {
-            tracing::warn!(
-                "gpu dit block took {el:?} (budget {budget:?}) — device contended, \
-                 CPU for the rest of the process"
-            );
-            gpu::mm_kill();
-        }
+        gpu::mm_budget_check("dit block", el, budget, gpu::probe_was_cold());
         true
     }
 
