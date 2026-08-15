@@ -1750,13 +1750,19 @@ impl Pipeline {
         // pay +10%; the sampling arm needs a cheaper verify first.
         let spec_sampling_ok = self.sampler_config.temperature < 1e-6
             || std::env::var("CMF_GRAPH_SPEC_SAMPLE").as_deref() == Ok("1");
+        // ON by default for greedy on the wgpu graph: with the draft on
+        // the graph and the verify bit-exact, it measured 58.7 tok/s
+        // against a plain 48.1 on Qwen3.8-27B q4tp / RTX 5090 (k=4) and
+        // 51.1 against 49.4 on Qwen3.6-27B, and a round that stops
+        // paying turns itself off below (acceptance watchdog).
+        // `CMF_GRAPH_SPEC=0` disables; `=1` was the old opt-in spelling.
         let graph_spec = self.speculative
             && graph_on
             && self.mtp.is_some()
             && task_mask.is_none()
             && !self.o1_active()
             && spec_sampling_ok
-            && std::env::var("CMF_GRAPH_SPEC").is_ok_and(|v| v != "0");
+            && std::env::var("CMF_GRAPH_SPEC").as_deref() != Ok("0");
         // GDN hybrids sit the fused-pair speculation out by default: the
         // recurrence is sequential, so the pair lane cannot parallelize
         // (the bench's own Pair line reads fused 1.28x TWO singles on the
@@ -2153,6 +2159,10 @@ impl Pipeline {
             }};
         }
 
+        // Speculation watchdog: a draft head that stops agreeing with the
+        // trunk (below 40% after the first 40 drafts) makes every round a
+        // loss — the plain path takes over for the rest of the generation.
+        let mut spec_watchdog_off = false;
         // ── Decode ──
         let mut next_pos = input_ids.len();
         'decode: while generated < max_tokens {
@@ -2251,7 +2261,12 @@ impl Pipeline {
             match &mut mtp {
                 // ── Graph speculation: chain-draft, batch-verify on device ──
                 #[cfg(feature = "gpu")]
-                Some(m) if graph_spec && generated + 1 < max_tokens && next_pos > 0 => {
+                Some(m)
+                    if graph_spec
+                        && !spec_watchdog_off
+                        && generated + 1 < max_tokens
+                        && next_pos > 0 =>
+                {
                     if let Some((extra, n_pos, new_h)) = self.graph_spec_step(
                         m,
                         &hidden,
@@ -2263,6 +2278,12 @@ impl Pipeline {
                     ) {
                         next_pos = n_pos;
                         hidden = new_h;
+                        if drafted >= 40 && accepted * 100 < drafted * 40 {
+                            spec_watchdog_off = true;
+                            tracing::info!(
+                                "speculation off: {accepted} of {drafted} drafts accepted"
+                            );
+                        }
                         let mut stopped = false;
                         for &id in &extra {
                             if self.confidence_on {
@@ -3046,11 +3067,14 @@ impl Pipeline {
         // gives 46.1, k=4 50.0, k=5 47.4, k=6 45.2. Acceptance is 89-91%
         // throughout — what turns the curve over is the verify, which
         // costs ~7.4 ms per extra position, and the draft ~3 ms a step.
+        // 4 since the draft moved onto the graph (Qwen3.8-27B / 5090:
+        // k=3 51.2, k=4 51.8 with the per-op draft; the graph draft
+        // halves the draft cost, so the extra draft is cheaper still).
         let k_spec: usize = std::env::var("CMF_GRAPH_SPEC_K")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&v| (1..=8).contains(&v))
-            .unwrap_or(3);
+            .unwrap_or(4);
         if next_pos == 0 {
             return None;
         }
