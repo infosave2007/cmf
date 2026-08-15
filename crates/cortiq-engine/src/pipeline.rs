@@ -697,6 +697,17 @@ impl Pipeline {
         if !graph_on || !crate::gpu::enabled_here() {
             return false;
         }
+        // O(1) needs the CPU prefill: the q-trace that seals the Nyström
+        // skeleton is recorded there and nowhere else. The GDN half of
+        // the hybrid loses nothing — the graph's first decode creates
+        // its (ring, S) entries seeded from `cpu_state`, the same
+        // handoff every graph run relies on when the entry is fresh.
+        // Without this line the two designs collide on hybrids and o1
+        // never becomes graph-portable: prefill through the graph
+        // records no trace, so views stay None forever.
+        if self.o1_active() {
+            return false;
+        }
         self.weights
             .layers
             .iter()
