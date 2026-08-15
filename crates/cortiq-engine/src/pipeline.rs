@@ -1756,13 +1756,32 @@ impl Pipeline {
         // 51.1 against 49.4 on Qwen3.6-27B, and a round that stops
         // paying turns itself off below (acceptance watchdog).
         // `CMF_GRAPH_SPEC=0` disables; `=1` was the old opt-in spelling.
+        // …but only where the batched verify has its register-blocked
+        // kernel: q4tp dense FFNs (graph kind 6). q4t and q8_2f verify
+        // through tile GEMMs today and measured a LOSS (q8_2f 22 against
+        // 29 tok/s), the 2-bit plane the same; those stay opt-in
+        // (`CMF_GRAPH_SPEC=1`).
+        let spec_default_ok = self.weights.layers.iter().all(|lw| match &lw.ffn {
+            FfnKind::Dense(d) => {
+                matches!(d.gate_proj.graph_weight(), Some((_, _, 6, _)))
+                    && matches!(d.up_proj.graph_weight(), Some((_, _, 6, _)))
+                    && matches!(d.down_proj.graph_weight(), Some((_, _, 6, _)))
+            }
+            _ => true,
+        });
+        let spec_env = std::env::var("CMF_GRAPH_SPEC").ok();
+        let spec_wanted = match spec_env.as_deref() {
+            Some("0") => false,
+            Some(_) => true,
+            None => spec_default_ok,
+        };
         let graph_spec = self.speculative
             && graph_on
             && self.mtp.is_some()
             && task_mask.is_none()
             && !self.o1_active()
             && spec_sampling_ok
-            && std::env::var("CMF_GRAPH_SPEC").as_deref() != Ok("0");
+            && spec_wanted;
         // GDN hybrids sit the fused-pair speculation out by default: the
         // recurrence is sequential, so the pair lane cannot parallelize
         // (the bench's own Pair line reads fused 1.28x TWO singles on the
