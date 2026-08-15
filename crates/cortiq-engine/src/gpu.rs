@@ -2463,3 +2463,43 @@ pub fn bake_precision_strict(on: bool) {
     #[cfg(not(feature = "gpu"))]
     let _ = on;
 }
+
+
+/// CMF_GRAPH_HOSTPROF=1: how a graph token's wall splits between the
+/// host encoding the command stream and the tail the GPU still owes
+/// after encode. Fifteen GPU-side suspects measured null while the
+/// bench counted 17.7k allocations a token — this is the instrument
+/// that says whether the thief was on the host all along.
+pub fn hostprof_encode_done(t0: std::time::Instant) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ENC: AtomicU64 = AtomicU64::new(0);
+    static N: AtomicU64 = AtomicU64::new(0);
+    if std::env::var("CMF_GRAPH_HOSTPROF").as_deref() != Ok("1") {
+        return;
+    }
+    ENC.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 100 == 0 {
+        eprintln!(
+            "hostprof: encode {:.2} ms/token over {n} tokens",
+            ENC.load(Ordering::Relaxed) as f64 / n as f64 / 1e6
+        );
+    }
+}
+
+pub fn hostprof_total(t0: std::time::Instant) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TOT: AtomicU64 = AtomicU64::new(0);
+    static N: AtomicU64 = AtomicU64::new(0);
+    if std::env::var("CMF_GRAPH_HOSTPROF").as_deref() != Ok("1") {
+        return;
+    }
+    TOT.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 100 == 0 {
+        eprintln!(
+            "hostprof: total {:.2} ms/token over {n} tokens",
+            TOT.load(Ordering::Relaxed) as f64 / n as f64 / 1e6
+        );
+    }
+}

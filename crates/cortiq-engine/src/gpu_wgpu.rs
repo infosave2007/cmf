@@ -3818,6 +3818,135 @@ fn q4tp_matvec4_dual(@builtin(workgroup_id) wid: vec3<u32>,
 }
 
 
+// Binding 9: the up-projection's output; binding 5 carries gate's.
+@group(0) @binding(9) var<storage, read> q4v_u : array<vec4<f32>>;
+fn fsilu(g: vec4<f32>, u: vec4<f32>) -> vec4<f32> {
+    return u * g / (vec4<f32>(1.0) + exp(-g));
+}
+
+// The FFN's `down` with SiLU folded in (part of CMF_MV_DUAL=1): reads
+// gate and up straight from their matvecs and mixes them per element,
+// deleting the silu dispatch, its barrier, and the act buffer. The
+// elimination table said the cost lives between dispatches; this and
+// the dual cut the FFN from five waves to two.
+@compute @workgroup_size(256)
+fn q4tp_matvec4_dsilu(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(num_workgroups) nwg: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32) {
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    // 8 rows per workgroup, register-blocked in pairs: sub-block `sub` owns
+    // rows base+sub and base+sub+4, and every x vec4 fetched for a group
+    // feeds BOTH rows' dot chains — the x side of the LSU load nearly
+    // halves. Each row's group order and add order stay those of the
+    // one-row kernel.
+    // `_p0`: how many activation vectors share this weight. One is a matvec;
+    // more is a batch. The BATCH is the fast axis of the dispatch, so the
+    // workgroups that read the same weight rows are neighbours and meet in
+    // L2; walking the whole output space instead put them `rows/16` apart,
+    // which streams the weight once per batch element and defeats the point.
+    // Reuse is still L2's to give — this is not a register-blocked B kernel —
+    // so the win is a measurement, not a claim.
+    let nb = max(q1p._p0, 1u);
+    let blocks = (rows + 7u) / 8u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks * nb) { break; }
+        let bi = wb % nb;
+        let base = (wb / nb) * 8u;
+        let bofs = bi * rows;
+        {
+            let r = base + (lid >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                lad_q4v[lid] = exp2(pr.x + f32(lid & 31u) * pr.y);
+            }
+        }
+        workgroupBarrier();
+        let wrow_a = base + sub;
+        let wrow_b = base + sub + 4u;
+        let row_a = bofs + wrow_a;
+        let row_b = bofs + wrow_b;
+        let live_a = wrow_a < rows;
+        let live_b = wrow_b < rows;
+        // In vec4 units: (row / lora) * gpr * 32 floats.
+        let xblk = 0u;
+        var acc_a = 0.0;
+        var acc_b = 0.0;
+        if (live_a) {
+            let crow_a = codes_b + wrow_a * cstride;
+            let crow_b = codes_b + wrow_b * cstride;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                var cv_a = q4tp_byte(crow_a + cbo);
+                if (sh > 3u) { cv_a = cv_a | (q4tp_byte(crow_a + cbo + 1u) << 8u); }
+                let v_a = q4v_w[wrow_a * gpr + g];
+                // `_p1` is the low-rank group width. Set, it slides the
+                // activation window with the row — which is the ONLY thing
+                // the grouped output projection does differently, and the
+                // reason it had a kernel of its own reading 3.82 ms against
+                // this one's 1.24 on comparable weights. Rows base..base+7
+                // share a window whenever the width is a multiple of 8, and
+                // the caller only takes this path then.
+                let xq = xblk + g * 8u;
+                // Inline SiLU: this matvec CONSUMES the FFN's gate/up
+                // directly — act = up * g * sigmoid(g) computed per
+                // element read. Redundant across row-blocks, and that
+                // redundancy buys out a whole dispatch, its barrier,
+                // and the act buffer's round trip.
+                let x0 = fsilu(q4v_x[xq],      q4v_u[xq]);
+                let x1 = fsilu(q4v_x[xq + 1u], q4v_u[xq + 1u]);
+                let x2 = fsilu(q4v_x[xq + 2u], q4v_u[xq + 2u]);
+                let x3 = fsilu(q4v_x[xq + 3u], q4v_u[xq + 3u]);
+                let x4 = fsilu(q4v_x[xq + 4u], q4v_u[xq + 4u]);
+                let x5 = fsilu(q4v_x[xq + 5u], q4v_u[xq + 5u]);
+                let x6 = fsilu(q4v_x[xq + 6u], q4v_u[xq + 6u]);
+                let x7 = fsilu(q4v_x[xq + 7u], q4v_u[xq + 7u]);
+                let sa = lad_q4v[(sub << 5u) + ((cv_a >> sh) & 31u)];
+                acc_a = acc_a + sa
+                    * (q4v_dot8(v_a.x, x0, x1) + q4v_dot8(v_a.y, x2, x3)
+                     + q4v_dot8(v_a.z, x4, x5) + q4v_dot8(v_a.w, x6, x7));
+                if (live_b) {
+                    var cv_b = q4tp_byte(crow_b + cbo);
+                    if (sh > 3u) { cv_b = cv_b | (q4tp_byte(crow_b + cbo + 1u) << 8u); }
+                    let v_b = q4v_w[wrow_b * gpr + g];
+                    let sb = lad_q4v[128u + (sub << 5u) + ((cv_b >> sh) & 31u)];
+                    acc_b = acc_b + sb
+                        * (q4v_dot8(v_b.x, x0, x1) + q4v_dot8(v_b.y, x2, x3)
+                         + q4v_dot8(v_b.z, x4, x5) + q4v_dot8(v_b.w, x6, x7));
+                }
+                g = g + 64u;
+            }
+        }
+        partial_q4v[lid] = acc_a;
+        partial_q4vb[lid] = acc_b;
+        workgroupBarrier();
+        var stride = 32u;
+        loop {
+            if (stride == 0u) { break; }
+            if (l < stride) {
+                partial_q4v[lid] = partial_q4v[lid] + partial_q4v[lid + stride];
+                partial_q4vb[lid] = partial_q4vb[lid] + partial_q4vb[lid + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        if (l == 0u && wrow_a < rows) { q1y[row_a] = partial_q4v[sub << 6u]; }
+        if (l == 0u && wrow_b < rows) { q1y[row_b] = partial_q4vb[sub << 6u]; }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+
 @compute @workgroup_size(256)
 fn q4tp_matvec4(@builtin(workgroup_id) wid: vec3<u32>,
                 @builtin(num_workgroups) nwg: vec3<u32>,
@@ -11012,6 +11141,7 @@ struct Ctx {
     use_mv_nored: bool,
     q4tp_mv4_dual: wgpu::ComputePipeline,
     use_mv_dual: bool,
+    q4tp_mv4_dsilu: wgpu::ComputePipeline,
     /// The same eight rows, but blocked over a SMALL BATCH in registers:
     /// the weight is read from DRAM once for the whole batch instead of
     /// once per element. What makes a speculative verify of k positions
@@ -11994,6 +12124,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let q4tp_mv4_u2 = pipe("q4tp_matvec4_u2");
     let q4tp_mv4_nored = pipe("q4tp_matvec4_nored");
     let q4tp_mv4_dual = pipe("q4tp_matvec4_dual");
+    let q4tp_mv4_dsilu = pipe("q4tp_matvec4_dsilu");
     let use_mv_dual = std::env::var("CMF_MV_DUAL").as_deref() == Ok("1");
     let use_mv_nored = std::env::var("CMF_MV_NORED").as_deref() == Ok("1");
     // CMF_MV_U2=1: the 2-way unrolled decode matvec — an experiment in
@@ -12459,6 +12590,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         use_mv_nored,
         q4tp_mv4_dual,
         use_mv_dual,
+        q4tp_mv4_dsilu,
         q4tp_mv4_bk,
         q4tp_mv4_bku,
         use_mv_bk,
@@ -14255,6 +14387,7 @@ pub fn forward_token_graph(
     // address the SAME per-layer mirrors.
     layer_base: usize,
 ) -> bool {
+    let _hp_t0 = std::time::Instant::now(); // CMF_GRAPH_HOSTPROF
     let Some(c) = ctx() else {
         graph_refused("no ctx");
         return false;
@@ -16154,15 +16287,46 @@ pub fn forward_token_graph(
                         pass.set_pipeline(&c.q4tp_mv4_dual);
                         pass.set_bind_group(0, &bind, &[]);
                         pass.dispatch_workgroups(blocks, 1, 1);
-                        pass.set_pipeline(&c.silu);
-                        pass.set_bind_group(0, &bg_silu, &[]);
-                        pass.dispatch_workgroups_flat((inter as u32).div_ceil(256));
-                        drop(pass);
-                        if let Some((pdp, bg_d, wd)) = prep(down, &abuf, &ob, hidden, inter) {
-                            let mut pass = begin_pass(&mut enc);
-                            pass.set_pipeline(pdp);
-                            pass.set_bind_group(0, &bg_d, &[]);
-                            pass.dispatch_workgroups(wd, 1, 1);
+                        if down.kind == 2 && inter % 32 == 0 {
+                            // Fused down: SiLU inline — the whole FFN is
+                            // two waves (dual, dsilu-down) instead of five.
+                            let gpr_d = inter / 32;
+                            let pd_buf = uniform_u32x4(
+                                c,
+                                [gpr_d as u32, hidden as u32, inter as u32, 0],
+                            );
+                            let layout = c.q4tp_mv4_dsilu.get_bind_group_layout(0);
+                            let bind_d = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("ffn-dsilu"),
+                                layout: &layout,
+                                entries: &[
+                                    bind_buf(0, &down.buf),
+                                    bind_buf(2, &ob),
+                                    bind_buf(3, &pd_buf),
+                                    bind_buf(4, &down.buf),
+                                    bind_buf(5, &gbuf),
+                                    bind_buf(9, &ubuf),
+                                ],
+                            });
+                            pass.set_pipeline(&c.q4tp_mv4_dsilu);
+                            pass.set_bind_group(0, &bind_d, &[]);
+                            pass.dispatch_workgroups(
+                                (hidden as u32).div_ceil(8).min(MAX_WG),
+                                1,
+                                1,
+                            );
+                            drop(pass);
+                        } else {
+                            pass.set_pipeline(&c.silu);
+                            pass.set_bind_group(0, &bg_silu, &[]);
+                            pass.dispatch_workgroups_flat((inter as u32).div_ceil(256));
+                            drop(pass);
+                            if let Some((pdp, bg_d, wd)) = prep(down, &abuf, &ob, hidden, inter) {
+                                let mut pass = begin_pass(&mut enc);
+                                pass.set_pipeline(pdp);
+                                pass.set_bind_group(0, &bg_d, &[]);
+                                pass.dispatch_workgroups(wd, 1, 1);
+                            }
                         }
                         continue_ffn = true;
                     }
@@ -16716,7 +16880,9 @@ pub fn forward_token_graph(
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             "g-stage",
         );
+        crate::gpu::hostprof_encode_done(_hp_t0);
         let r = readback(c, enc, &lbuf, &stage, lsize, &mut logits[..lrows]);
+        crate::gpu::hostprof_total(_hp_t0);
         drop(gs);
         r
     } else {
