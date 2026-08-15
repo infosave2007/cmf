@@ -239,12 +239,20 @@ mod tests {
 
     #[test]
     fn beacon_carries_no_secret() {
-        let b = beacon_for(9911, 0xdead_beef, "qwen3", 28, 2048, "/home/me/secret/x.cmf", true);
+        let b = beacon_for(
+            9911,
+            0xdead_beef,
+            "qwen3",
+            28,
+            2048,
+            "/home/me/secret/x.cmf",
+            true,
+        );
         let json = serde_json::to_string(&b).unwrap();
         // The path leaks a home directory; the token would leak the lot.
         assert!(!json.contains("/home/me"), "{json}");
         assert!(json.contains("x.cmf"), "{json}");
-        assert!(!json.to_lowercase().contains("token\":\"") , "{json}");
+        assert!(!json.to_lowercase().contains("token\":\""), "{json}");
         assert!(json.contains("\"token_required\":true"), "{json}");
     }
 

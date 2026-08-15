@@ -5,8 +5,8 @@
 //! return per the roadmap once this one is measured.
 
 use crate::{
-    recv_msg, send_control, send_prefill, send_step, send_step_id, Frame, Msg, O1Wire, WireDtype,
-    WIRE_VERSION,
+    Frame, Msg, O1Wire, WIRE_VERSION, WireDtype, recv_msg, send_control, send_prefill, send_step,
+    send_step_id,
 };
 use cortiq_core::TaskMask;
 use cortiq_engine::pipeline::{GenerateResult, Pipeline, TokenCallback};
@@ -271,7 +271,10 @@ impl RemoteSegment {
     fn expect_token(&mut self) -> Result<u32, String> {
         match self.recv(true)? {
             Msg::Token { id } => Ok(id),
-            other => Err(format!("worker {}: expected Token, got {other:?}", self.addr)),
+            other => Err(format!(
+                "worker {}: expected Token, got {other:?}",
+                self.addr
+            )),
         }
     }
 

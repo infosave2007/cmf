@@ -18,8 +18,12 @@ fn device_sparse_attend_matches_the_cpu() {
         Some(true) => {}
     }
     let (nh, hd, npos) = (4usize, 64usize, 37usize);
-    let q: Vec<f32> = (0..nh * hd).map(|i| ((i * 11) as f32 * 0.019).sin()).collect();
-    let kv: Vec<f32> = (0..npos * hd).map(|i| ((i * 5) as f32 * 0.013).cos()).collect();
+    let q: Vec<f32> = (0..nh * hd)
+        .map(|i| ((i * 11) as f32 * 0.019).sin())
+        .collect();
+    let kv: Vec<f32> = (0..npos * hd)
+        .map(|i| ((i * 5) as f32 * 0.013).cos())
+        .collect();
     // A sink large enough to dominate on one head and negligible on another:
     // both regimes have to come out right, and the failure modes differ.
     let sink: Vec<f32> = vec![-8.0, 0.1, 6.0, 0.0];
@@ -31,7 +35,13 @@ fn device_sparse_attend_matches_the_cpu() {
         let idx_us: Vec<usize> = idxs.iter().map(|&i| i as usize).collect();
         let mut oh = vec![0.0f32; hd];
         cortiq_engine::dsv4::sparse_attend(
-            &q[h * hd..(h + 1) * hd], &kv, &idx_us, sink[h], scale, hd, &mut oh,
+            &q[h * hd..(h + 1) * hd],
+            &kv,
+            &idx_us,
+            sink[h],
+            scale,
+            hd,
+            &mut oh,
         );
         want[h * hd..(h + 1) * hd].copy_from_slice(&oh);
     }

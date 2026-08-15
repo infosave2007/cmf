@@ -15,7 +15,6 @@ pub use format::{
 pub use hash::hash64;
 pub use mask::{MaskCatalog, MaskDiff, MaskPriority, Quality, TaskMask};
 pub use types::{
-    G3nConfig,
-    ExecutionMode, LayerStats, LayerType, LinearCoreConfig, ModelArch, MoeConfig, MtpConfig,
-    MlaConfig, NormStyle, PerformanceMetrics, QuantType, SimdType, TensorDtype,
+    ExecutionMode, G3nConfig, LayerStats, LayerType, LinearCoreConfig, MlaConfig, ModelArch,
+    MoeConfig, MtpConfig, NormStyle, PerformanceMetrics, QuantType, SimdType, TensorDtype,
 };

@@ -36,7 +36,9 @@ fn tools_render_into_the_system_block() {
             }
         }
     }))];
-    let msgs = vec![j(serde_json::json!({"role": "user", "content": "Weather in Paris?"}))];
+    let msgs = vec![j(
+        serde_json::json!({"role": "user", "content": "Weather in Paris?"}),
+    )];
     let text = t.render_chat_json(&msgs, Some(&tools), None).unwrap();
 
     assert!(text.contains("<tools>"), "tool signatures section missing");
@@ -52,7 +54,10 @@ fn tools_render_into_the_system_block() {
     // on `tools` being defined, which is exactly what tool_choice:"none"
     // relies on server-side.
     let bare = t.render_chat_json(&msgs, None, None).unwrap();
-    assert!(!bare.contains("<tools>"), "tools block must be absent without tools");
+    assert!(
+        !bare.contains("<tools>"),
+        "tools block must be absent without tools"
+    );
 }
 
 /// OpenAI history: an assistant turn whose tool_calls carry `function`
@@ -81,7 +86,9 @@ fn assistant_history_with_tool_calls_renders() {
     let text = t.render_chat_json(&msgs, None, None).unwrap();
 
     assert!(
-        text.contains("<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}"),
+        text.contains(
+            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}"
+        ),
         "assistant tool_calls must render in the trained grammar, got:\n{text}"
     );
     assert!(
@@ -110,7 +117,10 @@ fn consecutive_tool_results_share_one_user_turn() {
     ];
     let text = t.render_chat_json(&msgs, None, None).unwrap();
     let user_starts = text.matches("<|im_start|>user").count();
-    assert_eq!(user_starts, 2, "the two tool results must share one user turn:\n{text}");
+    assert_eq!(
+        user_starts, 2,
+        "the two tool results must share one user turn:\n{text}"
+    );
     assert_eq!(text.matches("<tool_response>").count(), 2);
 }
 
@@ -118,8 +128,7 @@ fn consecutive_tool_results_share_one_user_turn() {
 
 fn nanbeige_tok() -> Tokenizer {
     let mut t = Tokenizer::byte_level();
-    t.chat_template =
-        Some(include_str!("fixtures/nanbeige42_chat_template.jinja").to_string());
+    t.chat_template = Some(include_str!("fixtures/nanbeige42_chat_template.jinja").to_string());
     t
 }
 
@@ -137,9 +146,15 @@ fn nanbeige_tools_render_in_json_grammar() {
         "function": {"name": "get_weather", "description": "d",
                       "parameters": {"type": "object", "properties": {}}}
     }))];
-    let msgs = vec![j(serde_json::json!({"role": "user", "content": "Weather in Paris?"}))];
+    let msgs = vec![j(
+        serde_json::json!({"role": "user", "content": "Weather in Paris?"}),
+    )];
     let text = t.render_chat_json(&msgs, Some(&tools), None).unwrap();
-    assert!(text.contains("<tools>"), "tools section missing:\n{}", &text[..text.len().min(400)]);
+    assert!(
+        text.contains("<tools>"),
+        "tools section missing:\n{}",
+        &text[..text.len().min(400)]
+    );
     assert!(text.contains("\"get_weather\""));
     assert!(
         text.contains("\"arguments\": <args-json-object>"),
@@ -163,5 +178,8 @@ fn nanbeige_tool_history_round_trips() {
     ];
     let text = t.render_chat_json(&msgs, None, None).unwrap();
     assert!(text.contains("get_weather"), "call history lost:\n{text}");
-    assert!(text.contains("<tool_response>"), "tool result lost:\n{text}");
+    assert!(
+        text.contains("<tool_response>"),
+        "tool result lost:\n{text}"
+    );
 }

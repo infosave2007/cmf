@@ -979,7 +979,10 @@ impl CmfModel {
         patches: &[(usize, TensorDtype, Vec<u8>)],
     ) -> Result<(), CmfError> {
         use std::io::{Read, Seek, SeekFrom, Write};
-        let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
         let file_len = f.metadata()?.len();
         let mut head = vec![0u8; ENVELOPE_LEN];
         f.read_exact(&mut head)?;
@@ -1535,7 +1538,12 @@ impl CmfStreamWriter {
                 dtype,
                 shape: v["shape"]
                     .as_array()
-                    .map(|a| a.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_u64())
+                            .map(|x| x as usize)
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 off: v["off"].as_u64().unwrap_or(0),
                 nbytes: v["nbytes"].as_u64().unwrap_or(0),
@@ -1621,9 +1629,9 @@ impl CmfStreamWriter {
             _ => None,
         };
         let index_bytes = match masks {
-            Some(catalog) if !catalog.masks.is_empty() => {
-                Some(encode_sparse_index(&build_sparse_index(catalog, &header.arch)))
-            }
+            Some(catalog) if !catalog.masks.is_empty() => Some(encode_sparse_index(
+                &build_sparse_index(catalog, &header.arch),
+            )),
             _ => None,
         };
         if let Some(mb) = &masks_bytes {

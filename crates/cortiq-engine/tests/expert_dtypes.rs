@@ -26,7 +26,9 @@ fn report_expert_layouts() {
         } else {
             continue;
         };
-        *seen.entry((role, format!("{:?}", e.dtype))).or_insert(0usize) += 1;
+        *seen
+            .entry((role, format!("{:?}", e.dtype)))
+            .or_insert(0usize) += 1;
     }
     for ((role, dt), n) in seen {
         println!("{role:>5}: {dt} × {n}");

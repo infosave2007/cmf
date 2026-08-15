@@ -143,6 +143,15 @@ pub struct Pipeline {
     pub speculative: bool,
     rng: SplitMix64,
     sampler_scratch: SamplerScratch,
+    /// Speculative SAMPLING state (graph_spec_step, temperature > 0): the
+    /// correction token a rejected draft produced — committed by the loop
+    /// top in place of a fresh draw — and the per-round draft
+    /// distributions / target scratch, reused so a round allocates
+    /// nothing at the vocab size.
+    spec_forced: Option<u32>,
+    spec_q: Vec<Vec<f32>>,
+    spec_p: Vec<f32>,
+    spec_res: Vec<f32>,
     /// Precomputed RoPE inverse frequencies [head_dim/2]. Arc: the
     /// forward path clones a handle to escape the &mut self borrow —
     /// cloning the table itself was a per-forward allocation.
@@ -564,6 +573,7 @@ pub struct TokenTrace {
 /// the emitted token) — the confidence signal, cheap from logits already
 /// computed for sampling. `temp` is the calibration temperature (B1):
 /// softmax(logits / temp); 1.0 = raw.
+#[cfg_attr(not(test), allow(dead_code))]
 fn top1_prob_t(logits: &[f32], id: u32, temp: f32) -> f32 {
     let t = if temp > 1e-3 { temp } else { 1.0 };
     let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
@@ -921,7 +931,8 @@ impl Pipeline {
                     // is on: full_gpu attends through the device state,
                     // and any refusal falls to the sandwich, whose CPU
                     // core routes sealed layers through the nystrom step.
-                    || std::env::var("CMF_O1_METAL").as_deref() == Ok("1") => {
+                    || std::env::var("CMF_O1_METAL").as_deref() == Ok("1") =>
+                {
                     let parts = (wq.q1_parts(), wk.q1_parts(), wv.q1_parts(), wo.q1_parts());
                     let (Some(pq), Some(pk), Some(pv), Some(po)) = parts else {
                         break;
@@ -1073,7 +1084,6 @@ impl Pipeline {
             });
         }
         for item in &plan {
-
             let ok = match item {
                 Item::Gdn { run, .. } => gcfg
                     .as_ref()
@@ -1087,8 +1097,7 @@ impl Pipeline {
                         "block-graph: plan item {} ({}) failed graph preflight",
                         valid,
                         match item {
-                            Item::Gdn { run, first } =>
-                                format!("GDN run L{first}+{}", run.len()),
+                            Item::Gdn { run, first } => format!("GDN run L{first}+{}", run.len()),
                             Item::Attn { li, .. } => format!("Attn L{li}"),
                         }
                     );
@@ -1128,7 +1137,10 @@ impl Pipeline {
         let mut dev_attn: Vec<usize> = Vec::new();
         for item in &plan {
             let _xt0 = std::time::Instant::now();
-            let _xkind: u32 = match item { Item::Gdn { .. } => 2, Item::Attn { .. } => 3 };
+            let _xkind: u32 = match item {
+                Item::Gdn { .. } => 2,
+                Item::Attn { .. } => 3,
+            };
             // Looped Transformer: insert on-device norm at loop boundaries.
             if self.loop_final_norm {
                 let item_start = match item {
@@ -1215,9 +1227,7 @@ impl Pipeline {
                             o1: o1p,
                         };
                         let o1_bad = o1_layer && p.o1.is_none();
-                        if !o1_bad
-                            && graph.attn_device_ok(l, &p)
-                            && graph.encode_attn_device(l, &p)
+                        if !o1_bad && graph.attn_device_ok(l, &p) && graph.encode_attn_device(l, &p)
                         {
                             // o1 layers leave no mirror row to pull.
                             if p.o1.is_none() {
@@ -1288,7 +1298,7 @@ impl Pipeline {
                     attention::recycle_buf(&mut ao);
                 }
             }
-        
+
             crate::gpu::stageprof(_xkind, _xt0.elapsed());
         }
         // Ride the final norm + lm_head in the same command buffer when
@@ -1444,6 +1454,10 @@ impl Pipeline {
             speculative: std::env::var("CMF_MTP").map(|v| v != "0").unwrap_or(true),
             rng,
             sampler_scratch: SamplerScratch::default(),
+            spec_forced: None,
+            spec_q: Vec::new(),
+            spec_p: Vec::new(),
+            spec_res: Vec::new(),
             inv_freq,
             ws: ForwardScratch::new(hidden_size),
             pool,
@@ -1715,13 +1729,23 @@ impl Pipeline {
         // rides `gdn_spec_restore` and a batched frame whose numerics
         // are the batch kernels', and that has to be shown on more than
         // one architecture before every greedy decode takes it.
+        // Greedy without penalties verifies by argmax equality; every other
+        // sampler configuration goes through speculative SAMPLING (draft
+        // from the MTP head's own post-chain distribution, accept with
+        // min(1, p/q), correct from max(0, p − q)) — the emitted stream is
+        // distributed exactly as the plain sampler's. `CMF_GRAPH_SPEC_SAMPLE=0`
+        // keeps the sampled configurations on the plain path.
+        let spec_sampling_ok = (self.sampler_config.temperature < 1e-6
+            && self.sampler_config.repetition_penalty == 1.0
+            && self.sampler_config.presence_penalty == 0.0
+            && self.sampler_config.suppress_tokens.is_empty())
+            || std::env::var("CMF_GRAPH_SPEC_SAMPLE").as_deref() != Ok("0");
         let graph_spec = self.speculative
             && graph_on
             && self.mtp.is_some()
             && task_mask.is_none()
             && !self.o1_active()
-            && self.sampler_config.temperature < 1e-6
-            && self.sampler_config.repetition_penalty == 1.0
+            && spec_sampling_ok
             && std::env::var("CMF_GRAPH_SPEC").is_ok_and(|v| v != "0");
         // GDN hybrids sit the fused-pair speculation out by default: the
         // recurrence is sequential, so the pair lane cannot parallelize
@@ -1729,14 +1753,12 @@ impl Pipeline {
         // 35B) and the draft's full-vocab head rides on top — measured 2x
         // SLOWER end to end (16.1 vs 32.4 tok/s on the 48-core stand).
         // CMF_MTP=1 forces it back for study.
-        let pair_pays = self.gdn_cfg.is_none()
-            || std::env::var("CMF_MTP").as_deref() == Ok("1");
+        let pair_pays = self.gdn_cfg.is_none() || std::env::var("CMF_MTP").as_deref() == Ok("1");
         let spec_active = self.speculative
             && self.mtp.is_some()
             && task_mask.is_none()
             && !self.o1_active()
-            && ((!graph_on && pair_pays) || graph_spec)
-            && self.sampler_config.temperature < 1e-6;
+            && ((!graph_on && pair_pays && self.sampler_config.temperature < 1e-6) || graph_spec);
         // The MTP module is detached during generation so its mutable
         // state does not fight the borrow on `self`.
         let mut mtp = if spec_active { self.mtp.take() } else { None };
@@ -1892,8 +1914,7 @@ impl Pipeline {
                                     if p + 2 + j >= input_ids.len() {
                                         break;
                                     }
-                                    let (dj, hj) =
-                                        self.mtp_step_h(m, &hx, d_prev, p + 1 + j);
+                                    let (dj, hj) = self.mtp_step_h(m, &hx, d_prev, p + 1 + j);
                                     extra += 1;
                                     ok = ok && dj == input_ids[p + 2 + j];
                                     Self::chain_probe_note(j, ok);
@@ -1942,8 +1963,7 @@ impl Pipeline {
                             // Same teacher-forced chain table as the tail
                             // loop below, fed from the pair path that owns
                             // most prefill positions.
-                            let (d1, mut hx) =
-                                self.mtp_step_h(m, &h2, input_ids[pos + 2], pos + 1);
+                            let (d1, mut hx) = self.mtp_step_h(m, &h2, input_ids[pos + 2], pos + 1);
                             let mut ok = d1 == input_ids[pos + 3];
                             Self::chain_probe_note(0, ok);
                             let mut d_prev = d1;
@@ -1952,8 +1972,7 @@ impl Pipeline {
                                 if pos + 3 + j >= input_ids.len() {
                                     break;
                                 }
-                                let (dj, hj) =
-                                    self.mtp_step_h(m, &hx, d_prev, pos + 2 + j);
+                                let (dj, hj) = self.mtp_step_h(m, &hx, d_prev, pos + 2 + j);
                                 extra += 1;
                                 ok = ok && dj == input_ids[pos + 3 + j];
                                 Self::chain_probe_note(j, ok);
@@ -2048,8 +2067,7 @@ impl Pipeline {
                             if pos + 2 + j >= input_ids.len() {
                                 break;
                             }
-                            let (dj, hj) =
-                                self.mtp_step_h(m, &hx, d_prev, pos + 1 + j);
+                            let (dj, hj) = self.mtp_step_h(m, &hx, d_prev, pos + 1 + j);
                             extra += 1;
                             ok = ok && dj == input_ids[pos + 2 + j];
                             Self::chain_probe_note(j, ok);
@@ -2132,9 +2150,15 @@ impl Pipeline {
                 finish_reason = "cancelled".to_string();
                 break 'decode;
             }
-            let mut logits = match self.graph_logits.take() {
-                Some(lg) => lg,
-                None => {
+            // A rejected speculative draft already drew this position's
+            // token from the residual distribution (graph_spec_step); it
+            // is committed as-is — sampling again from the row's logits
+            // would bias the stream toward the target's mode.
+            let forced = self.spec_forced.take();
+            let mut logits = match (forced, self.graph_logits.take()) {
+                (Some(_), _) => Vec::new(),
+                (None, Some(lg)) => lg,
+                (None, None) => {
                     inference::rms_norm_into(
                         &hidden,
                         &self.weights.final_norm,
@@ -2145,17 +2169,33 @@ impl Pipeline {
                     self.lm_head_forward(&self.ws.n1)
                 }
             };
-            let t_next = sampler::sample_with_scratch(
-                &logits,
-                &self.sampler_config,
-                &all_ids,
-                &mut self.rng,
-                &mut self.sampler_scratch,
-            );
+            let t_next = match forced {
+                Some(c) => c,
+                None => sampler::sample_with_scratch_pool(
+                    &logits,
+                    &self.sampler_config,
+                    &all_ids,
+                    &mut self.rng,
+                    &mut self.sampler_scratch,
+                    self.pool.as_deref(),
+                ),
+            };
             if self.confidence_on {
-                confidence.push(top1_prob_t(&logits, t_next, calib_temp));
+                confidence.push(if logits.is_empty() {
+                    0.0
+                } else {
+                    sampler::top1_prob_pool(
+                        self.pool.as_deref(),
+                        &mut self.sampler_scratch,
+                        &logits,
+                        t_next,
+                        calib_temp,
+                    )
+                });
             }
-            attention::recycle_buf(&mut logits);
+            if !logits.is_empty() {
+                attention::recycle_buf(&mut logits);
+            }
             if trace_on {
                 // active_skill = the overlay in force while this token was
                 // generated; recon/switched are filled after the post-emit
@@ -2206,6 +2246,7 @@ impl Pipeline {
                         next_pos,
                         &mut drafted,
                         &mut accepted,
+                        &mut all_ids,
                     ) {
                         next_pos = n_pos;
                         hidden = new_h;
@@ -2245,15 +2286,22 @@ impl Pipeline {
                         &mut self.ws.n1,
                     );
                     let mut logits1 = self.lm_head_forward(&self.ws.n1);
-                    let t_after = sampler::sample_with_scratch(
+                    let t_after = sampler::sample_with_scratch_pool(
                         &logits1,
                         &self.sampler_config,
                         &all_ids,
                         &mut self.rng,
                         &mut self.sampler_scratch,
+                        self.pool.as_deref(),
                     );
                     if self.confidence_on {
-                        confidence.push(top1_prob_t(&logits1, t_after, calib_temp));
+                        confidence.push(sampler::top1_prob_pool(
+                            self.pool.as_deref(),
+                            &mut self.sampler_scratch,
+                            &logits1,
+                            t_after,
+                            calib_temp,
+                        ));
                     }
                     attention::recycle_buf(&mut logits1);
                     if trace_on {
@@ -2491,7 +2539,13 @@ impl Pipeline {
             let line: Vec<String> = t
                 .iter()
                 .enumerate()
-                .map(|(d, (n, k))| format!("d{}={:.0}%({n})", d + 1, 100.0 * *k as f64 / (*n).max(1) as f64))
+                .map(|(d, (n, k))| {
+                    format!(
+                        "d{}={:.0}%({n})",
+                        d + 1,
+                        100.0 * *k as f64 / (*n).max(1) as f64
+                    )
+                })
                 .collect();
             eprintln!("mtp-chain: {}", line.join(" "));
         }
@@ -2500,13 +2554,17 @@ impl Pipeline {
     /// `mtp_step` that also hands back the block's own output hidden — the
     /// state a CHAINED draft feeds the next step, the way a multi-token
     /// speculative round iterates the head on itself.
-    fn mtp_step_h(
+    /// One MTP block step from (trunk hidden, token): the head's LOGITS
+    /// and the block's own hidden for chaining. The draft is argmax of the
+    /// logits on the greedy path and a draw from their post-chain
+    /// distribution on the sampling path.
+    fn mtp_step_hl(
         &mut self,
         m: &mut MtpModule,
         hidden: &[f32],
         next_token: u32,
         position: usize,
-    ) -> (u32, Vec<f32>) {
+    ) -> (Vec<f32>, Vec<f32>) {
         // fc concat order is [enorm(embed); hnorm(hidden)] — EMBEDDING
         // FIRST. Verified by the oracle (converter/mtp_oracle.py):
         // [emb;hid] → 45.8% acceptance, [hid;emb] → 0.00%.
@@ -2580,7 +2638,19 @@ impl Pipeline {
             self.norm_style,
             &mut self.ws.n1,
         );
-        let mut lg = self.lm_head_forward(&self.ws.n1);
+        let lg = self.lm_head_forward(&self.ws.n1);
+        (lg, x)
+    }
+
+    /// `mtp_step_hl` reduced to the greedy draft: argmax of the head.
+    fn mtp_step_h(
+        &mut self,
+        m: &mut MtpModule,
+        hidden: &[f32],
+        next_token: u32,
+        position: usize,
+    ) -> (u32, Vec<f32>) {
+        let (mut lg, x) = self.mtp_step_hl(m, hidden, next_token, position);
         let draft = sampler::argmax(&lg);
         attention::recycle_buf(&mut lg);
         (draft, x)
@@ -2597,15 +2667,33 @@ impl Pipeline {
         inference::rms_norm_into(hidden, &m.hnorm, self.rms_eps, self.norm_style, cat_h);
         let mut x = vec![0.0f32; self.hidden_size];
         m.eh_proj.matvec(&cat, &mut x, self.pool.as_deref());
-        inference::rms_norm_into(&x, &m.layer.input_norm, self.rms_eps, self.norm_style, &mut self.ws.n1);
+        inference::rms_norm_into(
+            &x,
+            &m.layer.input_norm,
+            self.rms_eps,
+            self.norm_style,
+            &mut self.ws.n1,
+        );
         let attn = match &m.layer.attn {
-            AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, softplus_gate, bias } => {
+            AttnKind::Full {
+                wq,
+                wk,
+                wv,
+                wo,
+                q_norm,
+                k_norm,
+                output_gate,
+                softplus_gate,
+                bias,
+            } => {
                 let mut cfg = self.attn_cfg(position);
                 cfg.q_norm = q_norm.as_deref();
                 cfg.k_norm = k_norm.as_deref();
                 cfg.output_gate = *output_gate;
                 cfg.softplus_gate = softplus_gate.as_ref().map(|(g, p)| (g, *p));
-                cfg.bias = bias.as_ref().map(|(q, k, v)| (q.as_slice(), k.as_slice(), v.as_slice()));
+                cfg.bias = bias
+                    .as_ref()
+                    .map(|(q, k, v)| (q.as_slice(), k.as_slice(), v.as_slice()));
                 attention::qwen_attention(&self.ws.n1, wq, wk, wv, wo, &mut m.kv, &cfg)
             }
             _ => return,
@@ -2629,6 +2717,10 @@ impl Pipeline {
         next_pos: usize,
         drafted: &mut usize,
         accepted: &mut usize,
+        // The committed stream (prompt + generated so far, `t_next`
+        // included): the sampler chain's penalties read it, and the
+        // sampling arm extends it with the drafts position by position.
+        all_ids: &mut Vec<u32>,
     ) -> Option<(Vec<u32>, usize, Vec<f32>)> {
         // 3 is the measured optimum on Qwen3.6-27B / RTX 5090 (medians
         // of three, greedy): 51.1 tok/s against a plain 49.4, where k=2
@@ -2661,18 +2753,50 @@ impl Pipeline {
         // That is the largest measured item left on this path.
         let subs = || crate::gpu_wgpu::SUBMITS.load(std::sync::atomic::Ordering::Relaxed);
         let sub0 = subs();
+        // Greedy without penalties verifies by argmax equality (bit-exact
+        // against the plain path). Anything else is speculative SAMPLING:
+        // each draft is a DRAW from the MTP head's post-chain distribution
+        // q_j, kept for the accept test; the verify's rows give p_j.
+        let cfg = self.sampler_config.clone();
+        let sampling = !(cfg.temperature < 1e-6
+            && cfg.repetition_penalty == 1.0
+            && cfg.presence_penalty == 0.0
+            && cfg.suppress_tokens.is_empty());
+        let base_len = all_ids.len();
+        if sampling && self.spec_q.len() < k_spec {
+            self.spec_q.resize_with(k_spec, Vec::new);
+        }
         // Draft the chain: first from the trunk's tip hidden, then the head
         // iterating on itself. Rows land in the MTP KV; the chain rows past
         // the first are speculation over speculative state and roll back
         // below, replaced by verified pairs.
         let mut drafts = Vec::with_capacity(k_spec);
-        let (d1, mut hx) = self.mtp_step_h(m, hidden, t_next, next_pos - 1);
-        drafts.push(d1);
-        for j in 1..k_spec {
-            let (dj, hj) = self.mtp_step_h(m, &hx, drafts[j - 1], next_pos - 1 + j);
+        let mut hx = hidden.to_vec();
+        for j in 0..k_spec {
+            let tok_in = if j == 0 { t_next } else { drafts[j - 1] };
+            let (mut lg, hj) = self.mtp_step_hl(m, &hx, tok_in, next_pos - 1 + j);
+            let dj = if sampling {
+                let mut q = std::mem::take(&mut self.spec_q[j]);
+                sampler::distribution_into(
+                    &lg,
+                    &cfg,
+                    all_ids,
+                    &mut self.sampler_scratch,
+                    self.pool.as_deref(),
+                    &mut q,
+                );
+                let d = sampler::draw(&q, &mut self.rng);
+                self.spec_q[j] = q;
+                all_ids.push(d); // the next draft's penalties see this one
+                d
+            } else {
+                sampler::argmax(&lg)
+            };
+            attention::recycle_buf(&mut lg);
             drafts.push(dj);
             hx = hj;
         }
+        all_ids.truncate(base_len);
         *drafted += k_spec;
         let t_draft = t_round.elapsed();
         let sub_draft = subs();
@@ -2688,7 +2812,12 @@ impl Pipeline {
         let (lm_gw, lm_rows) = {
             let (_, i, kind, rs) = self.weights.lm_head.graph_weight()?;
             (
-                crate::gpu::GraphW { idx: i, kind, row_scale: rs, data: &[] },
+                crate::gpu::GraphW {
+                    idx: i,
+                    kind,
+                    row_scale: rs,
+                    data: &[],
+                },
                 self.weights.lm_head.rows(),
             )
         };
@@ -2713,14 +2842,56 @@ impl Pipeline {
         }
         let t_verify = t_round.elapsed();
         let sub_verify = subs();
-        // Acceptance: row i's argmax is the trunk's token after input i.
-        let ids: Vec<u32> = (0..b)
-            .map(|i| sampler::argmax(&logits[i * lm_rows..(i + 1) * lm_rows]))
-            .collect();
+        // Acceptance. Greedy: row i's argmax is the trunk's token after
+        // input i. Sampling: accept draft i with min(1, p_i/q_i), and on
+        // the first rejection draw the correction from max(0, p_i − q_i)
+        // — that token is committed by the loop top as-is (spec_forced).
         let mut a = 0usize;
-        while a < k_spec && ids[a] == drafts[a] {
-            a += 1;
-        }
+        let mut forced: Option<u32> = None;
+        let ids: Vec<u32> = if sampling {
+            let mut p = std::mem::take(&mut self.spec_p);
+            let mut res = std::mem::take(&mut self.spec_res);
+            while a < k_spec {
+                sampler::distribution_into(
+                    &logits[a * lm_rows..(a + 1) * lm_rows],
+                    &cfg,
+                    all_ids,
+                    &mut self.sampler_scratch,
+                    self.pool.as_deref(),
+                    &mut p,
+                );
+                match sampler::spec_accept_or_correct(
+                    &p,
+                    &self.spec_q[a],
+                    drafts[a],
+                    &mut self.rng,
+                    &mut res,
+                    self.pool.as_deref(),
+                ) {
+                    None => {
+                        all_ids.push(drafts[a]);
+                        a += 1;
+                    }
+                    Some(c) => {
+                        forced = Some(c);
+                        break;
+                    }
+                }
+            }
+            all_ids.truncate(base_len);
+            self.spec_p = p;
+            self.spec_res = res;
+            // the accepted drafts ARE the verified tokens after inputs 0..a
+            drafts.clone()
+        } else {
+            let ids: Vec<u32> = (0..b)
+                .map(|i| sampler::argmax(&logits[i * lm_rows..(i + 1) * lm_rows]))
+                .collect();
+            while a < k_spec && ids[a] == drafts[a] {
+                a += 1;
+            }
+            ids
+        };
         // a fully-accepted round needs no restore: every input was real.
         if a + 1 < b {
             crate::gpu::gdn_spec_restore(self.graph_kv_id, a);
@@ -2745,15 +2916,22 @@ impl Pipeline {
                 self.mtp_warm(m, &row, ids[j], next_pos + j);
             }
         }
-        // The sampler's contract: logits of the LAST verified position.
-        let mut row = logits[a * lm_rows..(a + 1) * lm_rows].to_vec();
-        row.resize(self.vocab_size, 0.0);
-        if let Some(c) = self.final_softcap {
-            for l in row.iter_mut() {
-                *l = c * (*l / c).tanh();
+        // The sampler's contract: logits of the LAST verified position —
+        // unless a rejected draft already drew the correction, in which
+        // case the loop top commits that token and samples nothing.
+        if let Some(c) = forced {
+            self.spec_forced = Some(c);
+            self.graph_logits = None;
+        } else {
+            let mut row = logits[a * lm_rows..(a + 1) * lm_rows].to_vec();
+            row.resize(self.vocab_size, 0.0);
+            if let Some(c) = self.final_softcap {
+                for l in row.iter_mut() {
+                    *l = c * (*l / c).tanh();
+                }
             }
+            self.graph_logits = Some(row);
         }
-        self.graph_logits = Some(row);
         let new_hidden = hiddens[a * self.hidden_size..(a + 1) * self.hidden_size].to_vec();
         // Three phases, not two. The round's wall clock was 4 ms longer
         // than draft+verify and the difference had nowhere to be seen:
@@ -5235,12 +5413,12 @@ impl Pipeline {
     }
 
     /// Same, stopping after layer `upto` inclusive (routing probe φ).
-/// `CMF_DSV4_DRAFT_PROBE=1` — grade the draft against what the trunk goes on
-/// to produce. Off by default; it runs a whole draft per decoded token.
-fn draft_probe() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_DSV4_DRAFT_PROBE").is_ok_and(|v| v != "0"))
-}
+    /// `CMF_DSV4_DRAFT_PROBE=1` — grade the draft against what the trunk goes on
+    /// to produce. Off by default; it runs a whole draft per decoded token.
+    fn draft_probe() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CMF_DSV4_DRAFT_PROBE").is_ok_and(|v| v != "0"))
+    }
 
     /// `CMF_DSV4_DRAFT_PROBE=1`: measure how much of the draft the trunk
     /// would have agreed with, WITHOUT verifying or rolling anything back.
@@ -5256,7 +5434,11 @@ fn draft_probe() -> bool {
     #[cfg(feature = "gpu")]
     fn dsv4_spec_on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("CMF_DSV4_SPEC").map(|v| v != "0").unwrap_or(true))
+        *ON.get_or_init(|| {
+            std::env::var("CMF_DSV4_SPEC")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        })
     }
 
     /// One speculative round at the decode tip. `t_next` is the token the
@@ -5282,7 +5464,10 @@ fn draft_probe() -> bool {
             }
             LAST.with(|l| {
                 if let Some(prev) = l.get() {
-                    eprintln!("между раундами {:.1} мс", prev.elapsed().as_secs_f64() * 1e3);
+                    eprintln!(
+                        "между раундами {:.1} мс",
+                        prev.elapsed().as_secs_f64() * 1e3
+                    );
                 }
                 l.set(Some(std::time::Instant::now()));
             });
@@ -5346,7 +5531,11 @@ fn draft_probe() -> bool {
             if dbg {
                 eprintln!(
                     "spec_step: черновик {} (props0={:?} t_next={t_next})",
-                    if props.is_empty() { "пуст" } else { "мимо" },
+                    if props.is_empty() {
+                        "пуст"
+                    } else {
+                        "мимо"
+                    },
                     props.first()
                 );
             }
@@ -5414,9 +5603,7 @@ fn draft_probe() -> bool {
             accepted = 1;
         }
         if std::env::var("CMF_DSV4_SPEC_TRACE").is_ok() {
-            eprintln!(
-                "spec@{next_pos}: fed={fed:?} argmax={argmax:?} accepted={accepted}"
-            );
+            eprintln!("spec@{next_pos}: fed={fed:?} argmax={argmax:?} accepted={accepted}");
         }
         let t_fin = std::time::Instant::now();
         if !crate::dsv4::dsv4_spec_finish(
@@ -5434,7 +5621,10 @@ fn draft_probe() -> bool {
             return None;
         }
         if std::env::var("CMF_DSV4_SPEC_TIME").is_ok() {
-            eprintln!("finish(k={accepted}): {:.1} мс", t_fin.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "finish(k={accepted}): {:.1} мс",
+                t_fin.elapsed().as_secs_f64() * 1e3
+            );
         }
         *accepted_ctr += accepted - 1;
         // Captures per accepted token: device targets photographed by the
@@ -5493,7 +5683,14 @@ fn draft_probe() -> bool {
                     );
                 }
             }
-            crate::dsv4::dspark_ring_append(g, &self.dsv4_mtp, &cfg, ds, next_pos + t, self.pool.as_deref());
+            crate::dsv4::dspark_ring_append(
+                g,
+                &self.dsv4_mtp,
+                &cfg,
+                ds,
+                next_pos + t,
+                self.pool.as_deref(),
+            );
         }
         let row = logits_all[(accepted - 1) * cfg.vocab..accepted * cfg.vocab].to_vec();
         self.graph_logits = Some(row);
@@ -5506,7 +5703,10 @@ fn draft_probe() -> bool {
             crate::dsv4::pick_tally_arm();
         }
         if std::env::var("CMF_DSV4_SPEC_TIME").is_ok() {
-            eprintln!("spec_step total {:.1} мс (k={accepted})", t_all.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "spec_step total {:.1} мс (k={accepted})",
+                t_all.elapsed().as_secs_f64() * 1e3
+            );
         }
         Some((fed[1..accepted].to_vec(), next_pos + accepted))
     }
@@ -5554,7 +5754,10 @@ fn draft_probe() -> bool {
             if t.is_empty() {
                 return;
             }
-            eprintln!("DSpark: захват со слоёв {t:?}, блок {}", crate::dsv4::dspark_block());
+            eprintln!(
+                "DSpark: захват со слоёв {t:?}, блок {}",
+                crate::dsv4::dspark_block()
+            );
             crate::dsv4::dspark_arm(&t, cfg.dim);
             self.dspark = Some(crate::dsv4::DsparkState::new(
                 self.dsv4_mtp.len(),
@@ -5964,8 +6167,7 @@ fn draft_probe() -> bool {
                 // How much of the span the graph actually covered. A
                 // prefix of nothing means every layer walks per-op and
                 // the split's extra cost is elsewhere.
-                static SEEN: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
+                static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                     eprintln!(
                         "span graph: covered {gl} of {} layers [{from}..{upto_excl}) res={}",
@@ -6902,8 +7104,7 @@ fn moe_ffn_batch(
                     }
                     // SAFETY: each worker owns a disjoint panels[ai].
                     unsafe {
-                        *panel_ptr.at(ai) =
-                            dense_ffn_batch(&experts[e], &sub, sb, None, None);
+                        *panel_ptr.at(ai) = dense_ffn_batch(&experts[e], &sub, sb, None, None);
                     }
                 }
             };
@@ -7040,12 +7241,7 @@ thread_local! {
 /// the masked-inference fast path's decode arm. Full fused quant
 /// compute, closed neurons zeroed before down: arithmetically the
 /// pruned network, no dequant, no weight bytes touched.
-fn dense_ffn_masked(
-    d: &DenseFfn,
-    x: &[f32],
-    pool: Option<&Pool>,
-    mask_row: &[u8],
-) -> Vec<f32> {
+fn dense_ffn_masked(d: &DenseFfn, x: &[f32], pool: Option<&Pool>, mask_row: &[u8]) -> Vec<f32> {
     let inter = d.gate_proj.rows();
     FFN_SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
@@ -7137,7 +7333,17 @@ pub(crate) fn moe_parts(
             rows,
             cols,
             ..
-        } => Some((model, *idx, *rows, *cols, &[][..], &[][..], true, false, false)),
+        } => Some((
+            model,
+            *idx,
+            *rows,
+            *cols,
+            &[][..],
+            &[][..],
+            true,
+            false,
+            false,
+        )),
         // q4_tiled: 18-byte tiles with embedded f16 scales — raw xs.
         QTensor::Mapped {
             model,
@@ -7146,7 +7352,17 @@ pub(crate) fn moe_parts(
             rows,
             cols,
             ..
-        } => Some((model, *idx, *rows, *cols, &[][..], &[][..], false, true, false)),
+        } => Some((
+            model,
+            *idx,
+            *rows,
+            *cols,
+            &[][..],
+            &[][..],
+            false,
+            true,
+            false,
+        )),
         // q4tp: same raw-xs contract, different stride and scale plane.
         QTensor::Mapped {
             model,
@@ -7155,7 +7371,17 @@ pub(crate) fn moe_parts(
             rows,
             cols,
             ..
-        } => Some((model, *idx, *rows, *cols, &[][..], &[][..], false, true, false)),
+        } => Some((
+            model,
+            *idx,
+            *rows,
+            *cols,
+            &[][..],
+            &[][..],
+            false,
+            true,
+            false,
+        )),
         // q2tp: the 2-bit expert plane of the mixed profile — q4 family
         // for stride bookkeeping, flagged q2 so the trio validation can
         // demand a q4tp down.
@@ -7166,7 +7392,17 @@ pub(crate) fn moe_parts(
             rows,
             cols,
             ..
-        } => Some((model, *idx, *rows, *cols, &[][..], &[][..], false, true, true)),
+        } => Some((
+            model,
+            *idx,
+            *rows,
+            *cols,
+            &[][..],
+            &[][..],
+            false,
+            true,
+            true,
+        )),
         _ => None,
     }
 }
@@ -7231,11 +7467,7 @@ fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe
             e.down_proj.mapped_q4tp().map(|(_, i)| i)?,
         ))
     };
-    let experts = m
-        .experts
-        .iter()
-        .map(trio)
-        .collect::<Option<Vec<_>>>()?;
+    let experts = m.experts.iter().map(trio).collect::<Option<Vec<_>>>()?;
     let shared = trio(sh)?;
     Some(crate::gpu::GpuMoe {
         router: rf,

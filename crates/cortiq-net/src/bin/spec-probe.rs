@@ -24,13 +24,16 @@ fn argmax(v: &[f32]) -> usize {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let model_path = args.next().expect("usage: spec-probe <model.cmf> <prompt> [gen]");
-    let prompt = args.next().expect("usage: spec-probe <model.cmf> <prompt> [gen]");
+    let model_path = args
+        .next()
+        .expect("usage: spec-probe <model.cmf> <prompt> [gen]");
+    let prompt = args
+        .next()
+        .expect("usage: spec-probe <model.cmf> <prompt> [gen]");
     let gen_n: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(64);
 
-    let model = std::sync::Arc::new(
-        cortiq_core::CmfModel::open_sharded(&model_path).expect("open model"),
-    );
+    let model =
+        std::sync::Arc::new(cortiq_core::CmfModel::open_sharded(&model_path).expect("open model"));
     let mut sampler = SamplerConfig::default();
     sampler.temperature = 0.0;
     sampler.repetition_penalty = 1.0;

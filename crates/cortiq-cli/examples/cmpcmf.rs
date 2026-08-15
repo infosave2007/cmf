@@ -52,7 +52,10 @@ fn main() {
         rows.push((cos, rel, e.name.clone()));
     }
     rows.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
-    println!("{:<58} {:>8} {:>10}", "tensor (worst cosine first)", "cos", "rel-l2");
+    println!(
+        "{:<58} {:>8} {:>10}",
+        "tensor (worst cosine first)", "cos", "rel-l2"
+    );
     for (cos, rel, name) in rows.iter().take(40) {
         println!("{name:<58} {cos:>8.4} {rel:>10.4}");
     }

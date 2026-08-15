@@ -861,7 +861,11 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         hidden_act: "silu".into(),
         embed_multiplier: 1.0,
         query_pre_attn_scalar: None,
-        sliding_window: if is_gemma2 { gu("attention.sliding_window") } else { None },
+        sliding_window: if is_gemma2 {
+            gu("attention.sliding_window")
+        } else {
+            None
+        },
         sliding_window_pattern: if is_gemma2 { Some(2) } else { None },
         rope_local_base_freq: None,
         local_partial_rotary_factor: None,

@@ -104,15 +104,16 @@ fn device_index_scores_match_the_cpu() {
     let q = noise(nh * hd, 0.9);
     let kv = noise(n_pos * hd, 2.2);
     // Mixed signs in the head weights, so relu-after-weighting would show up.
-    let hw: Vec<f32> = (0..nh).map(|h| if h % 3 == 0 { -0.4 } else { 0.6 }).collect();
+    let hw: Vec<f32> = (0..nh)
+        .map(|h| if h % 3 == 0 { -0.4 } else { 0.6 })
+        .collect();
     let limit = 137usize;
 
     let mut cpu = Vec::new();
     cortiq_engine::dsv4::index_scores(&q, &kv, &hw, nh, hd, n_pos, limit, None, &mut cpu);
     let mut gpu = vec![0.0f32; n_pos];
-    if !cortiq_engine::gpu_wgpu::index_scores_for_test(
-        &q, &kv, &hw, nh, hd, n_pos, limit, &mut gpu,
-    ) {
+    if !cortiq_engine::gpu_wgpu::index_scores_for_test(&q, &kv, &hw, nh, hd, n_pos, limit, &mut gpu)
+    {
         panic!("устройство не поднялось — тест не проверил ничего");
     }
     for t in limit..n_pos {
@@ -153,7 +154,11 @@ fn device_top_k_matches_the_cpu() {
             panic!("устройство не поднялось — тест не проверил ничего");
         }
         let cpu32: Vec<u32> = cpu.iter().map(|&x| x as u32).collect();
-        println!("top-k n={n} k={k}: выбрано {} против {}", gpu.len(), cpu.len());
+        println!(
+            "top-k n={n} k={k}: выбрано {} против {}",
+            gpu.len(),
+            cpu.len()
+        );
         assert_eq!(cpu32, gpu, "top-k разошлись при n={n} k={k}");
     }
 }
@@ -187,7 +192,9 @@ fn device_compressor_state_matches_the_cpu() {
         let eps = 1e-6;
         let norm = noise(ew, 3.0);
         let ape = noise(ratio * width, 5.0);
-        let inv_freq: Vec<f32> = (0..rd / 2).map(|i| 1.0 / (10000f32.powf(i as f32 / 4.0))).collect();
+        let inv_freq: Vec<f32> = (0..rd / 2)
+            .map(|i| 1.0 / (10000f32.powf(i as f32 / 4.0)))
+            .collect();
         // One id per CASE: the pending streams are sized at first use per
         // (kind, kv_id, layer), so two flat cases sharing an id would hand
         // ratio-8 a buffer sized for ratio-2 — the copy overruns, and the
@@ -221,13 +228,24 @@ fn device_compressor_state_matches_the_cpu() {
                 let mut folded = vec![0.0f32; ew];
                 if overlap {
                     cortiq_engine::dsv4::compress_window_overlap(
-                        &prev_kv, &prev_sc, &pend_kv, &pend_sc, ratio, ew, &mut folded,
+                        &prev_kv,
+                        &prev_sc,
+                        &pend_kv,
+                        &pend_sc,
+                        ratio,
+                        ew,
+                        &mut folded,
                     );
                     prev_kv = std::mem::take(&mut pend_kv);
                     prev_sc = std::mem::take(&mut pend_sc);
                 } else {
                     cortiq_engine::dsv4::compress_window(
-                        &pend_kv, &pend_sc, &ape, ratio, width, &mut folded,
+                        &pend_kv,
+                        &pend_sc,
+                        &ape,
+                        ratio,
+                        width,
+                        &mut folded,
                     );
                 }
                 cortiq_engine::dsv4::rms_weighted(&mut folded, &norm, eps);
@@ -243,8 +261,17 @@ fn device_compressor_state_matches_the_cpu() {
             let folded = cortiq_engine::gpu_wgpu::dsv4_comp_state_for_test(
                 &ckv,
                 if overlap { &csc_raw } else { &csc },
-                &norm, &ape, &inv_freq, width, ratio, overlap, rd, eps, pos,
-                kv_id, &mut got,
+                &norm,
+                &ape,
+                &inv_freq,
+                width,
+                ratio,
+                overlap,
+                rd,
+                eps,
+                pos,
+                kv_id,
+                &mut got,
             )
             .expect("кадр компрессора отказал");
 
@@ -286,9 +313,9 @@ fn device_index_list_matches_the_host_mapping() {
     }
     let window = 128usize;
     for (win_len, pick) in [
-        (128usize, vec![0u32, 3, 9]),  // full window
-        (5usize, vec![1u32, 2]),       // early: fill != capacity
-        (17usize, vec![]),             // nothing compressed picked
+        (128usize, vec![0u32, 3, 9]), // full window
+        (5usize, vec![1u32, 2]),      // early: fill != capacity
+        (17usize, vec![]),            // nothing compressed picked
     ] {
         // What the host builds today, from `prep.idxs` mapped through the
         // frame's own `win_len`/`window` rule.

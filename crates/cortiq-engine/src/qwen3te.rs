@@ -215,7 +215,9 @@ pub struct ImageSpan {
 impl Qwen3Encoder {
     pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
         let cfg: serde_json::Value = serde_json::from_slice(
-            model.tensor_bytes("te.config_json").map_err(|e| e.to_string())?,
+            model
+                .tensor_bytes("te.config_json")
+                .map_err(|e| e.to_string())?,
         )
         .map_err(|e| format!("te.config_json: {e}"))?;
         let u = |k: &str, d: usize| cfg[k].as_u64().map(|v| v as usize).unwrap_or(d);
@@ -223,7 +225,10 @@ impl Qwen3Encoder {
         // a ClipProj was fitted on is an index, and index conventions
         // differ by one between frameworks; packing one layer spare and
         // calibrating against the teacher beats repacking to find out.
-        let nl = match std::env::var("CMF_TE_TAP").ok().and_then(|v| v.parse().ok()) {
+        let nl = match std::env::var("CMF_TE_TAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             Some(t) if t > 0 && t <= u("num_hidden_layers", 0) => t,
             _ => u("num_hidden_layers", 0),
         };
@@ -426,7 +431,8 @@ impl Qwen3Encoder {
 
         let mut h = vec![0f32; n * hs];
         for (i, &id) in ids.iter().enumerate() {
-            self.embed.row_f32(id as usize, &mut h[i * hs..(i + 1) * hs]);
+            self.embed
+                .row_f32(id as usize, &mut h[i * hs..(i + 1) * hs]);
         }
         for (sp, e) in spans.iter().zip(embeds) {
             h[sp.start * hs..(sp.start + sp.len) * hs].copy_from_slice(&e[..sp.len * hs]);

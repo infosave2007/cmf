@@ -44,7 +44,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (masked, t_mask) = score(&mut p, mask.as_ref());
     // The decomposition probe: same chunks through the replica's f32 math.
     if std::env::var("MS_REPLICA").is_ok() {
-        let chunks: Vec<Vec<u32>> = ids.chunks(256).filter(|c| c.len() > 1).map(|c| c.to_vec()).collect();
+        let chunks: Vec<Vec<u32>> = ids
+            .chunks(256)
+            .filter(|c| c.len() > 1)
+            .map(|c| c.to_vec())
+            .collect();
         let (rb, rm) = cortiq_engine::skillbake::replica_score_file_mask(&m, &chunks)?;
         println!("replica-on-written: bare {rb:.3} | masked {rm:.3}");
     }

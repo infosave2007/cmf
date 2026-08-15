@@ -745,7 +745,10 @@ pub extern "C" fn cortiq_set_peer(config_json: *const c_char) -> i32 {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
-            split: cfg.get("split").and_then(|v| v.as_u64()).map(|v| v as usize),
+            split: cfg
+                .get("split")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
             f16: dtype == "f16",
             head: cfg.get("head").and_then(|v| v.as_bool()).unwrap_or(false),
             run_ahead: cfg

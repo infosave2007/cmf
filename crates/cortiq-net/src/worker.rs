@@ -5,8 +5,8 @@
 //! the wakeup from a cold blocking read costs more than the wire).
 
 use crate::{
-    recv_msg, send_control, send_hidden, send_kv, send_token, send_tokens, Frame, Msg, O1Wire,
-    WireDtype, WIRE_VERSION,
+    Frame, Msg, O1Wire, WIRE_VERSION, WireDtype, recv_msg, send_control, send_hidden, send_kv,
+    send_token, send_tokens,
 };
 use cortiq_core::TaskMask;
 use cortiq_engine::pipeline::Pipeline;
@@ -388,9 +388,7 @@ fn serve_one(
                         &mut stream,
                         &mut out,
                         &Frame::Ack {
-                            err: format!(
-                                "KvFetch {lo}..={hi} outside my span {sfrom}..={supto}"
-                            ),
+                            err: format!("KvFetch {lo}..={hi} outside my span {sfrom}..={supto}"),
                         },
                     )?;
                     continue;
@@ -407,8 +405,7 @@ fn serve_one(
                 send_control(&mut stream, &mut out, &Frame::Ack { err: String::new() })?;
                 let mut sent = 0usize;
                 for li in lo..=hi {
-                    let payload = match p.kv_cache.layers[li].export_wire(dtype == WireDtype::F16)
-                    {
+                    let payload = match p.kv_cache.layers[li].export_wire(dtype == WireDtype::F16) {
                         Ok(b) => b,
                         // Past the Ack there is no way to refuse politely:
                         // a short stream would look like a complete one.

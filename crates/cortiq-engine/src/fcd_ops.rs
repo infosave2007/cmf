@@ -205,7 +205,9 @@ mod accel {
 fn gemm_avx512() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("CMF_GEMM_BLOCK4").map(|v| v != "0").unwrap_or(true)
+        std::env::var("CMF_GEMM_BLOCK4")
+            .map(|v| v != "0")
+            .unwrap_or(true)
             && std::arch::is_x86_feature_detected!("avx512f")
     })
 }
@@ -398,8 +400,7 @@ fn gemm_nt_cpu(
                     let xr = &x[i * k..(i + 1) * k];
                     for dj in 0..4 {
                         let wr = &w[(o + dj) * k..(o + dj + 1) * k];
-                        y[(i - r0) * m + o + dj] =
-                            crate::attention::dot_f32(xr, wr);
+                        y[(i - r0) * m + o + dj] = crate::attention::dot_f32(xr, wr);
                     }
                 }
                 o += 4;
@@ -1871,7 +1872,6 @@ pub fn gdn_seq_bwd<F: Fp>(
     gdn_conv_bwd(&pre, t, c_dim, cfg.kk, cfg.conv, &dcq, dqkv);
 }
 
-
 #[cfg(test)]
 mod gpu_bake_tests {
     /// The bake's GPU backward must answer what the CPU answers: same
@@ -1885,8 +1885,12 @@ mod gpu_bake_tests {
             return;
         }
         let (n, k, m) = (8usize, 512usize, 1024usize);
-        let dy: Vec<f32> = (0..n * m).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
-        let w: Vec<f32> = (0..m * k).map(|i| ((i * 17 % 97) as f32 - 48.0) / 48.0).collect();
+        let dy: Vec<f32> = (0..n * m)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0)
+            .collect();
+        let w: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 % 97) as f32 - 48.0) / 48.0)
+            .collect();
         let mut want = vec![0f32; n * k];
         super::gemm_dx(&dy, &w, &mut want, n, k, m, None);
         let mut got = vec![0f32; n * k];
@@ -1894,8 +1898,16 @@ mod gpu_bake_tests {
             eprintln!("device declined — skip");
             return;
         }
-        let num: f64 = want.iter().zip(&got).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
-        let den: f64 = want.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().max(1e-30);
+        let num: f64 = want
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| ((a - b) as f64).powi(2))
+            .sum();
+        let den: f64 = want
+            .iter()
+            .map(|a| (*a as f64).powi(2))
+            .sum::<f64>()
+            .max(1e-30);
         let rel = (num / den).sqrt();
         assert!(rel < 1e-4, "gemm_dx GPU vs CPU rel {rel:e}");
     }

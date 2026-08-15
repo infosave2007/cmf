@@ -395,12 +395,7 @@ fn merge_adaln(
 // ── components ──────────────────────────────────────────────────────
 
 /// The DiT's per-block projections, in the order the runtime wants them.
-const BLOCK_PROJ: [&str; 4] = [
-    "attn.qkv_proj",
-    "attn.out_proj",
-    "mlp.fc1",
-    "mlp.fc2",
-];
+const BLOCK_PROJ: [&str; 4] = ["attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2"];
 const BLOCK_NORM: [&str; 4] = ["norm1", "norm2", "attn.q_norm", "attn.k_norm"];
 
 /// Merge the LoRA into one projection and push it at `level`.
@@ -420,9 +415,19 @@ fn push_proj(
         .to_vec();
     let mut w = src.get(&name)?;
     if let Some(l) = lora {
-        let (an, bn) = (format!("{key}.lora_A.weight"), format!("{key}.lora_B.weight"));
+        let (an, bn) = (
+            format!("{key}.lora_A.weight"),
+            format!("{key}.lora_B.weight"),
+        );
         if l.has(&an) && l.has(&bn) {
-            lora_merge(&mut w, &l.get(&bn)?, &l.get(&an)?, shape[0], shape[1], scale);
+            lora_merge(
+                &mut w,
+                &l.get(&bn)?,
+                &l.get(&an)?,
+                shape[0],
+                shape[1],
+                scale,
+            );
         }
     }
     specs.push(spec(out_name.to_string(), &w, shape, level));
@@ -563,7 +568,11 @@ fn pack_dit(
                 Level::F32,
             )?;
         }
-        eprint!("\rdit blocks {}/{}   ", specs.len() / 9, n_blocks + n_refiner);
+        eprint!(
+            "\rdit blocks {}/{}   ",
+            specs.len() / 9,
+            n_blocks + n_refiner
+        );
     }
     eprintln!();
 
@@ -592,18 +601,62 @@ fn pack_dit(
         Level::F32,
     ));
     for (k, o, l) in [
-        ("final_layer.adaln_proj.linear.bias", "dit.final_layer.adaln.bias", Level::F32),
-        ("final_layer.norm.weight", "dit.final_layer.norm.weight", Level::F32),
-        ("final_layer.video_out.weight", "dit.final_layer.video_out.weight", Level::F32),
-        ("final_layer.video_out.bias", "dit.final_layer.video_out.bias", Level::F32),
-        ("final_layer.audio_out.weight", "dit.final_layer.audio_out.weight", Level::F32),
-        ("final_layer.audio_out.bias", "dit.final_layer.audio_out.bias", Level::F32),
-        ("video_patch_proj.weight", "dit.video_patch_proj.weight", Level::F32),
-        ("video_patch_proj.bias", "dit.video_patch_proj.bias", Level::F32),
-        ("audio_patch_proj.weight", "dit.audio_patch_proj.weight", Level::F32),
-        ("audio_patch_proj.bias", "dit.audio_patch_proj.bias", Level::F32),
+        (
+            "final_layer.adaln_proj.linear.bias",
+            "dit.final_layer.adaln.bias",
+            Level::F32,
+        ),
+        (
+            "final_layer.norm.weight",
+            "dit.final_layer.norm.weight",
+            Level::F32,
+        ),
+        (
+            "final_layer.video_out.weight",
+            "dit.final_layer.video_out.weight",
+            Level::F32,
+        ),
+        (
+            "final_layer.video_out.bias",
+            "dit.final_layer.video_out.bias",
+            Level::F32,
+        ),
+        (
+            "final_layer.audio_out.weight",
+            "dit.final_layer.audio_out.weight",
+            Level::F32,
+        ),
+        (
+            "final_layer.audio_out.bias",
+            "dit.final_layer.audio_out.bias",
+            Level::F32,
+        ),
+        (
+            "video_patch_proj.weight",
+            "dit.video_patch_proj.weight",
+            Level::F32,
+        ),
+        (
+            "video_patch_proj.bias",
+            "dit.video_patch_proj.bias",
+            Level::F32,
+        ),
+        (
+            "audio_patch_proj.weight",
+            "dit.audio_patch_proj.weight",
+            Level::F32,
+        ),
+        (
+            "audio_patch_proj.bias",
+            "dit.audio_patch_proj.bias",
+            Level::F32,
+        ),
         ("condition_proj.bias", "dit.condition_proj.bias", Level::F32),
-        ("token_refiner.final_norm.weight", "dit.token_refiner.final_norm.weight", Level::F32),
+        (
+            "token_refiner.final_norm.weight",
+            "dit.token_refiner.final_norm.weight",
+            Level::F32,
+        ),
         ("rope.inv_freq", "dit.rope_inv_freq", Level::F32),
     ] {
         push_exact(specs, &dit, k, o, l)?;
@@ -653,7 +706,12 @@ fn pack_te(
     let root = ["model.", "model.language_model."]
         .into_iter()
         .find(|r| te.has(&format!("{r}layers.0.self_attn.q_proj.weight")))
-        .ok_or_else(|| anyhow!("{}: no layers under model. or model.language_model.", path.display()))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "{}: no layers under model. or model.language_model.",
+                path.display()
+            )
+        })?;
     let have = (0..)
         .take_while(|i| te.has(&format!("{root}layers.{i}.self_attn.q_proj.weight")))
         .count();
@@ -663,9 +721,7 @@ fn pack_te(
     // never executed, so packing them is pure file size.
     let n = match keep {
         Some(k) if k == 0 || k > have => {
-            return Err(anyhow!(
-                "--te-layers {k}: the checkpoint has {have} layers"
-            ));
+            return Err(anyhow!("--te-layers {k}: the checkpoint has {have} layers"));
         }
         Some(k) => k,
         None => have,
@@ -757,10 +813,7 @@ fn pack_te(
 /// Every byte of it stays exact. It is 304 MB deciding whether a 13 GB
 /// saving still reads as the same prompt; quantizing the regression
 /// that carries the whole substitution would be a false economy.
-fn pack_clip_proj(
-    specs: &mut Vec<TensorSpec>,
-    path: &Path,
-) -> anyhow::Result<serde_json::Value> {
+fn pack_clip_proj(specs: &mut Vec<TensorSpec>, path: &Path) -> anyhow::Result<serde_json::Value> {
     pack_clip_proj_at(specs, path, "te.proj")
 }
 
@@ -777,7 +830,11 @@ fn pack_clip_proj_at(
         .ok_or_else(|| anyhow!("{}: no W — not a ClipProj file", path.display()))?
         .to_vec();
     if w.len() != 2 {
-        return Err(anyhow!("{}: W is {:?}, expected [d_in, d_out]", path.display(), w));
+        return Err(anyhow!(
+            "{}: W is {:?}, expected [d_in, d_out]",
+            path.display(),
+            w
+        ));
     }
     let (d_in, d_out) = (w[0], w[1]);
     for k in ["W", "mean_in", "std_in", "mean_out", "std_out", "sink_out"] {
@@ -819,7 +876,11 @@ fn pack_video_vae(
 ) -> anyhow::Result<serde_json::Value> {
     let v = StFile::open(path)?;
     let n = (0..)
-        .take_while(|i| v.has(&format!("decoder.transformer_blocks.{i}.attn.to_qkv.weight")))
+        .take_while(|i| {
+            v.has(&format!(
+                "decoder.transformer_blocks.{i}.attn.to_qkv.weight"
+            ))
+        })
         .count();
     if n == 0 {
         return Err(anyhow!("{}: no decoder blocks", path.display()));
@@ -910,28 +971,54 @@ fn pack_video_vae(
             let p = format!("encoder.down.{i}.block.{j}");
             for k in ["conv1", "conv2", "nin_shortcut"] {
                 if v.has(&format!("{p}.{k}.weight")) {
-                    push_last_tap(specs, &v, &format!("{p}.{k}"), &format!("vvae.enc.down.{i}.block.{j}.{k}"), level)?;
+                    push_last_tap(
+                        specs,
+                        &v,
+                        &format!("{p}.{k}"),
+                        &format!("vvae.enc.down.{i}.block.{j}.{k}"),
+                        level,
+                    )?;
                 }
             }
             for k in ["norm1", "norm2"] {
                 for t in ["weight", "bias"] {
-                    push_exact(specs, &v, &format!("{p}.{k}.{t}"),
-                        &format!("vvae.enc.down.{i}.block.{j}.{k}.{t}"), Level::F32)?;
+                    push_exact(
+                        specs,
+                        &v,
+                        &format!("{p}.{k}.{t}"),
+                        &format!("vvae.enc.down.{i}.block.{j}.{k}.{t}"),
+                        Level::F32,
+                    )?;
                 }
             }
         }
         if sd > 1 {
-            push_last_tap(specs, &v, &format!("encoder.down.{i}.downsample.conv"),
-                &format!("vvae.enc.down.{i}.downsample.conv"), level)?;
+            push_last_tap(
+                specs,
+                &v,
+                &format!("encoder.down.{i}.downsample.conv"),
+                &format!("vvae.enc.down.{i}.downsample.conv"),
+                level,
+            )?;
         }
     }
     push_last_tap(specs, &v, "encoder.conv_in", "vvae.enc.conv_in", level)?;
     push_last_tap(specs, &v, "encoder.conv_out", "vvae.enc.conv_out", level)?;
     for t in ["weight", "bias"] {
-        push_exact(specs, &v, &format!("encoder.norm_out.{t}"),
-            &format!("vvae.enc.norm_out.{t}"), Level::F32)?;
-        push_exact(specs, &v, &format!("quant_conv.{t}"),
-            &format!("vvae.quant_conv.{t}"), Level::F32)?;
+        push_exact(
+            specs,
+            &v,
+            &format!("encoder.norm_out.{t}"),
+            &format!("vvae.enc.norm_out.{t}"),
+            Level::F32,
+        )?;
+        push_exact(
+            specs,
+            &v,
+            &format!("quant_conv.{t}"),
+            &format!("vvae.quant_conv.{t}"),
+            Level::F32,
+        )?;
     }
 
     Ok(serde_json::json!({
@@ -973,9 +1060,24 @@ fn push_last_tap(
     }
     // f16 unless the caller asked for exact — the parity gate does, or
     // it measures the codec instead of the port.
-    let lv = if level == Level::F32 { Level::F32 } else { Level::F16 };
-    specs.push(spec(format!("{out_name}.weight"), &tap, vec![o, i, kh, kw], lv));
-    push_exact(specs, src, &format!("{key}.bias"), &format!("{out_name}.bias"), Level::F32)
+    let lv = if level == Level::F32 {
+        Level::F32
+    } else {
+        Level::F16
+    };
+    specs.push(spec(
+        format!("{out_name}.weight"),
+        &tap,
+        vec![o, i, kh, kw],
+        lv,
+    ));
+    push_exact(
+        specs,
+        src,
+        &format!("{key}.bias"),
+        &format!("{out_name}.bias"),
+        Level::F32,
+    )
 }
 
 /// Audio VAE: `dec_in_proj` + BigVGAN. 90 M parameters — f16 all the
@@ -1032,15 +1134,23 @@ fn pack_music3_te(
         .take_while(|i| t.has(&format!("model.layers.{i}.self_attn.qkv_proj.weight")))
         .count();
     let n_dec = (0..)
-        .take_while(|i| t.has(&format!("model.audio_decoder.layers.{i}.self_attn.qkv_proj.weight")))
+        .take_while(|i| {
+            t.has(&format!(
+                "model.audio_decoder.layers.{i}.self_attn.qkv_proj.weight"
+            ))
+        })
         .count();
-    let dec_inter = t.shape("model.audio_decoder.layers.0.mlp.down_proj.weight").unwrap()[1];
-
+    let dec_inter = t
+        .shape("model.audio_decoder.layers.0.mlp.down_proj.weight")
+        .unwrap()[1];
 
     for l in 0..n_lm {
         let s = format!("model.layers.{l}");
         let d = format!("mte.layers.{l}");
-        split_fused(specs, &t, level,
+        split_fused(
+            specs,
+            &t,
+            level,
             &format!("{s}.self_attn.qkv_proj.weight"),
             hidden,
             &[
@@ -1049,7 +1159,10 @@ fn pack_music3_te(
                 (&format!("{d}.self_attn.v_proj.weight"), nkv * head_dim),
             ],
         )?;
-        split_fused(specs, &t, level,
+        split_fused(
+            specs,
+            &t,
+            level,
             &format!("{s}.mlp.gate_up_proj.weight"),
             hidden,
             &[
@@ -1058,17 +1171,37 @@ fn pack_music3_te(
             ],
         )?;
         for k in ["self_attn.o_proj", "mlp.down_proj"] {
-            push_exact(&mut *specs, &t, &format!("{s}.{k}.weight"), &format!("{d}.{k}.weight"), level)?;
+            push_exact(
+                &mut *specs,
+                &t,
+                &format!("{s}.{k}.weight"),
+                &format!("{d}.{k}.weight"),
+                level,
+            )?;
         }
-        for k in ["input_layernorm", "post_attention_layernorm", "self_attn.q_norm", "self_attn.k_norm"] {
-            push_exact(&mut *specs, &t, &format!("{s}.{k}.weight"), &format!("{d}.{k}.weight"), Level::F32)?;
+        for k in [
+            "input_layernorm",
+            "post_attention_layernorm",
+            "self_attn.q_norm",
+            "self_attn.k_norm",
+        ] {
+            push_exact(
+                &mut *specs,
+                &t,
+                &format!("{s}.{k}.weight"),
+                &format!("{d}.{k}.weight"),
+                Level::F32,
+            )?;
         }
         eprint!("\rmusic3 te layer {}/{n_lm}   ", l + 1);
     }
     for l in 0..n_dec {
         let s = format!("model.audio_decoder.layers.{l}");
         let d = format!("mte.audio_decoder.layers.{l}");
-        split_fused(specs, &t, level,
+        split_fused(
+            specs,
+            &t,
+            level,
             &format!("{s}.self_attn.qkv_proj.weight"),
             hidden,
             &[
@@ -1077,7 +1210,10 @@ fn pack_music3_te(
                 (&format!("{d}.self_attn.v_proj.weight"), hidden),
             ],
         )?;
-        split_fused(specs, &t, level,
+        split_fused(
+            specs,
+            &t,
+            level,
             &format!("{s}.mlp.gate_up_proj.weight"),
             hidden,
             &[
@@ -1085,10 +1221,28 @@ fn pack_music3_te(
                 (&format!("{d}.mlp.up_proj.weight"), dec_inter),
             ],
         )?;
-        push_exact(&mut *specs, &t, &format!("{s}.self_attn.o_proj.weight"), &format!("{d}.self_attn.o_proj.weight"), level)?;
-        push_exact(&mut *specs, &t, &format!("{s}.mlp.down_proj.weight"), &format!("{d}.mlp.down_proj.weight"), level)?;
+        push_exact(
+            &mut *specs,
+            &t,
+            &format!("{s}.self_attn.o_proj.weight"),
+            &format!("{d}.self_attn.o_proj.weight"),
+            level,
+        )?;
+        push_exact(
+            &mut *specs,
+            &t,
+            &format!("{s}.mlp.down_proj.weight"),
+            &format!("{d}.mlp.down_proj.weight"),
+            level,
+        )?;
         for k in ["input_layernorm", "post_attention_layernorm"] {
-            push_exact(&mut *specs, &t, &format!("{s}.{k}.weight"), &format!("{d}.{k}.weight"), Level::F32)?;
+            push_exact(
+                &mut *specs,
+                &t,
+                &format!("{s}.{k}.weight"),
+                &format!("{d}.{k}.weight"),
+                Level::F32,
+            )?;
         }
     }
     eprintln!();
@@ -1101,17 +1255,39 @@ fn pack_music3_te(
         "model.lm_head_pruned.weight",
         "model.audio_decoder.projection.weight",
     ] {
-        push_exact(&mut *specs, &t, n, &format!("mte.{}", n.trim_start_matches("model.")), level)?;
+        push_exact(
+            &mut *specs,
+            &t,
+            n,
+            &format!("mte.{}", n.trim_start_matches("model.")),
+            level,
+        )?;
     }
     for i in 0.. {
         let n = format!("model.audio_decoder.audio_heads.{i}.weight");
         if !t.has(&n) {
             break;
         }
-        push_exact(&mut *specs, &t, &n, &format!("mte.audio_decoder.audio_heads.{i}.weight"), level)?;
+        push_exact(
+            &mut *specs,
+            &t,
+            &n,
+            &format!("mte.audio_decoder.audio_heads.{i}.weight"),
+            level,
+        )?;
     }
-    for n in ["model.norm.weight", "model.audio_decoder.norm.weight", "model.audio_decoder.pos_embedding.weight"] {
-        push_exact(&mut *specs, &t, n, &format!("mte.{}", n.trim_start_matches("model.")), Level::F32)?;
+    for n in [
+        "model.norm.weight",
+        "model.audio_decoder.norm.weight",
+        "model.audio_decoder.pos_embedding.weight",
+    ] {
+        push_exact(
+            &mut *specs,
+            &t,
+            n,
+            &format!("mte.{}", n.trim_start_matches("model.")),
+            Level::F32,
+        )?;
     }
 
     let vocab = t.raw("tokenizer_json").map(|b| b.to_vec());
@@ -1270,7 +1446,11 @@ fn pack_music3_vae(specs: &mut Vec<TensorSpec>, path: &Path) -> anyhow::Result<s
             let mut w = vec![0f32; v.len()];
             for o in 0..shape[0] {
                 let row = &v[o * per..(o + 1) * per];
-                let norm = row.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+                let norm = row
+                    .iter()
+                    .map(|x| (*x as f64) * (*x as f64))
+                    .sum::<f64>()
+                    .sqrt();
                 let s = if norm > 0.0 { g[o] as f64 / norm } else { 0.0 };
                 for (d, &sv) in w[o * per..(o + 1) * per].iter_mut().zip(row) {
                     *d = (sv as f64 * s) as f32;
@@ -1365,13 +1545,33 @@ fn pack_vision(
         .take_while(|i| src.has(&format!("{pre}blocks.{i}.attn.qkv.weight")))
         .count();
     let hidden = src.shape(&format!("{pre}patch_embed.proj.weight")).unwrap()[0];
-    let pe = src.shape(&format!("{pre}patch_embed.proj.weight")).unwrap().to_vec();
+    let pe = src
+        .shape(&format!("{pre}patch_embed.proj.weight"))
+        .unwrap()
+        .to_vec();
     // Conv3d over a whole patch IS a linear: flatten [o, in, t, ph, pw].
     let flat: usize = pe[1..].iter().product();
     let w = src.get(&format!("{pre}patch_embed.proj.weight"))?;
-    specs.push(spec("vis.patch_embed.weight".into(), &w, vec![hidden, flat], level));
-    push_exact(specs, src, &format!("{pre}patch_embed.proj.bias"), "vis.patch_embed.bias", Level::F32)?;
-    push_exact(specs, src, &format!("{pre}pos_embed.weight"), "vis.pos_embed.weight", Level::F32)?;
+    specs.push(spec(
+        "vis.patch_embed.weight".into(),
+        &w,
+        vec![hidden, flat],
+        level,
+    ));
+    push_exact(
+        specs,
+        src,
+        &format!("{pre}patch_embed.proj.bias"),
+        "vis.patch_embed.bias",
+        Level::F32,
+    )?;
+    push_exact(
+        specs,
+        src,
+        &format!("{pre}pos_embed.weight"),
+        "vis.pos_embed.weight",
+        Level::F32,
+    )?;
     for i in 0..n {
         let p = format!("{pre}blocks.{i}");
         for (k, o) in [
@@ -1380,12 +1580,30 @@ fn pack_vision(
             ("mlp.linear_fc1", "mlp.linear_fc1"),
             ("mlp.linear_fc2", "mlp.linear_fc2"),
         ] {
-            push_exact(specs, src, &format!("{p}.{k}.weight"), &format!("vis.blocks.{i}.{o}.weight"), level)?;
-            push_exact(specs, src, &format!("{p}.{k}.bias"), &format!("vis.blocks.{i}.{o}.bias"), Level::F32)?;
+            push_exact(
+                specs,
+                src,
+                &format!("{p}.{k}.weight"),
+                &format!("vis.blocks.{i}.{o}.weight"),
+                level,
+            )?;
+            push_exact(
+                specs,
+                src,
+                &format!("{p}.{k}.bias"),
+                &format!("vis.blocks.{i}.{o}.bias"),
+                Level::F32,
+            )?;
         }
         for k in ["norm1", "norm2"] {
             for t in ["weight", "bias"] {
-                push_exact(specs, src, &format!("{p}.{k}.{t}"), &format!("vis.blocks.{i}.{k}.{t}"), Level::F32)?;
+                push_exact(
+                    specs,
+                    src,
+                    &format!("{p}.{k}.{t}"),
+                    &format!("vis.blocks.{i}.{k}.{t}"),
+                    Level::F32,
+                )?;
             }
         }
     }
@@ -1401,21 +1619,45 @@ fn pack_vision(
     }
     for (from, to) in mergers {
         for t in ["weight", "bias"] {
-            push_exact(specs, src, &format!("{from}.norm.{t}"), &format!("{to}.norm.{t}"), Level::F32)?;
+            push_exact(
+                specs,
+                src,
+                &format!("{from}.norm.{t}"),
+                &format!("{to}.norm.{t}"),
+                Level::F32,
+            )?;
         }
         for k in ["linear_fc1", "linear_fc2"] {
-            push_exact(specs, src, &format!("{from}.{k}.weight"), &format!("{to}.{k}.weight"), level)?;
-            push_exact(specs, src, &format!("{from}.{k}.bias"), &format!("{to}.{k}.bias"), Level::F32)?;
+            push_exact(
+                specs,
+                src,
+                &format!("{from}.{k}.weight"),
+                &format!("{to}.{k}.weight"),
+                level,
+            )?;
+            push_exact(
+                specs,
+                src,
+                &format!("{from}.{k}.bias"),
+                &format!("{to}.{k}.bias"),
+                Level::F32,
+            )?;
         }
     }
-    let out_hidden = src.shape(&format!("{pre}merger.linear_fc2.weight")).unwrap()[0];
-    let inter = src.shape(&format!("{pre}blocks.0.mlp.linear_fc1.weight")).unwrap()[0];
+    let out_hidden = src
+        .shape(&format!("{pre}merger.linear_fc2.weight"))
+        .unwrap()[0];
+    let inter = src
+        .shape(&format!("{pre}blocks.0.mlp.linear_fc1.weight"))
+        .unwrap()[0];
     // The patch geometry is in the embedding kernel [o, in, t, ph, pw],
     // and the merge factor falls out of the merger's input width. The
     // head count and which layers feed the deepstack are architecture,
     // written nowhere in the weights — hence the flags.
     let (temporal, patch_size) = (pe[2], pe[3]);
-    let merge_dim = src.shape(&format!("{pre}merger.linear_fc1.weight")).unwrap()[1];
+    let merge_dim = src
+        .shape(&format!("{pre}merger.linear_fc1.weight"))
+        .unwrap()[1];
     let merge = ((merge_dim / hidden) as f64).sqrt().round() as usize;
     let deep: Vec<usize> = deepstack_at.iter().copied().filter(|&d| d < n).collect();
     if deep.len() != n_deep {
@@ -1477,7 +1719,11 @@ pub fn cmd_animate_pack(args: PackArgs<'_>) -> anyhow::Result<()> {
         // Exact, for the parity gate: any quantization noise floor sits
         // above the arithmetic difference the gate is looking for.
         "f32" => Level::F32,
-        other => return Err(anyhow!("--quant {other}: expected q4tp, q2tp, q8, f16 or f32")),
+        other => {
+            return Err(anyhow!(
+                "--quant {other}: expected q4tp, q2tp, q8, f16 or f32"
+            ));
+        }
     };
     let t0 = std::time::Instant::now();
     let mut specs: Vec<TensorSpec> = Vec::new();

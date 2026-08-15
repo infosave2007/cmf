@@ -126,7 +126,9 @@ fn blocked_enabled() -> bool {
         _ => {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *ON.get_or_init(|| {
-                std::env::var("CMF_X86_BLOCKED").map(|v| v != "0").unwrap_or(true)
+                std::env::var("CMF_X86_BLOCKED")
+                    .map(|v| v != "0")
+                    .unwrap_or(true)
             })
         }
     }
@@ -151,7 +153,11 @@ pub fn set_blocked_override(on: Option<bool>) {
 
 fn gpu_lmhead_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CMF_GPU_LMHEAD").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| {
+        std::env::var("CMF_GPU_LMHEAD")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 fn gpu_split_frac() -> f32 {
@@ -1320,9 +1326,9 @@ impl QTensor {
     /// weight without going through this struct's own dispatch.
     pub fn q4tp_mapped(&self) -> Option<(&std::sync::Arc<CmfModel>, usize)> {
         match self {
-            Self::Mapped { model, idx, dtype, .. } if *dtype == TensorDtype::Q4TiledP => {
-                Some((model, *idx))
-            }
+            Self::Mapped {
+                model, idx, dtype, ..
+            } if *dtype == TensorDtype::Q4TiledP => Some((model, *idx)),
             _ => None,
         }
     }
@@ -1412,9 +1418,7 @@ impl QTensor {
                                 );
                                 let dg = t.elapsed();
                                 let t = std::time::Instant::now();
-                                q4tp_matmat(
-                                    self.quant_bytes(), xs_all, b, rows, cols, out, pool,
-                                );
+                                q4tp_matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
                                 let dc = t.elapsed();
                                 crate::mm_ab::record(b, rows, cols, took, dg, dc, &g, out);
                                 return;
@@ -1826,7 +1830,9 @@ impl QTensor {
                     ..
                 }
             )
-        }) && ts.iter().all(|t| t.cols() == ts[0].cols() && t.cols() % GROUP_SIZE == 0);
+        }) && ts
+            .iter()
+            .all(|t| t.cols() == ts[0].cols() && t.cols() % GROUP_SIZE == 0);
         let Some(pool) = pool else {
             for (t, o) in ts.iter().zip(outs.iter_mut()) {
                 t.matvec(x, o, None);
@@ -4461,7 +4467,6 @@ unsafe fn dot_q4tp_row_avx2(nib: &[u8], r: usize, gpr: usize, xq: &[i8], scales:
     }
 }
 
-
 /// VNNI twin of `dot_q4tp_row_avx2` (see `dot_q4t_row_vnni` for why the
 /// 256-bit VL encoding is the one to use here).
 #[cfg(target_arch = "x86_64")]
@@ -5371,11 +5376,8 @@ fn q4tp_matmat(
                                 acts[abase + bi + 6].xq.as_slice(),
                                 acts[abase + bi + 7].xq.as_slice(),
                             ];
-                            let d =
-                                unsafe { dot_q4tp_2x8_avx512(v.nib, r_lo, gpr, xs, &sc, &sc1) };
-                            for (row, dr, scr) in
-                                [(r_lo, &d[0], &sc), (r_lo + 1, &d[1], &sc1)]
-                            {
+                            let d = unsafe { dot_q4tp_2x8_avx512(v.nib, r_lo, gpr, xs, &sc, &sc1) };
+                            for (row, dr, scr) in [(r_lo, &d[0], &sc), (r_lo + 1, &d[1], &sc1)] {
                                 for k in 0..8 {
                                     let act = &acts[abase + bi + k];
                                     let mut acc = dr[k] * act.sx;
@@ -5511,7 +5513,6 @@ fn q4tp_matmat(
                         bi += 1;
                     }
                 }
-        
             }
         };
         dispatch_rows(pool, rows, &run);
@@ -5723,11 +5724,9 @@ fn q4t_matmat(
             .collect();
         let acts = &acts;
         #[cfg(target_arch = "x86_64")]
-        let blocked_ok = avx2_enabled()
-            && blocked_enabled();
+        let blocked_ok = avx2_enabled() && blocked_enabled();
         #[cfg(target_arch = "aarch64")]
-        let blocked_ok = sdot_enabled()
-            && blocked_enabled();
+        let blocked_ok = sdot_enabled() && blocked_enabled();
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let blocked_ok = false;
         let run = move |start: usize, end: usize| {
@@ -7339,11 +7338,9 @@ fn q1_matmat(
             .collect();
         let acts = &acts;
         #[cfg(target_arch = "x86_64")]
-        let blocked_ok = avx2_enabled()
-            && blocked_enabled();
+        let blocked_ok = avx2_enabled() && blocked_enabled();
         #[cfg(target_arch = "aarch64")]
-        let blocked_ok = sdot_enabled()
-            && blocked_enabled();
+        let blocked_ok = sdot_enabled() && blocked_enabled();
         let run = move |start: usize, end: usize| {
             for r in start..end {
                 let mut bi = 0usize;
@@ -7912,9 +7909,7 @@ fn q4matmat(
                     }
                     let mut bi = 0usize;
                     #[cfg(target_arch = "x86_64")]
-                    if avx2_enabled()
-                        && blocked_enabled()
-                    {
+                    if avx2_enabled() && blocked_enabled() {
                         while bi + 4 <= acts.len() {
                             let xs = [
                                 acts[bi].xq.as_slice(),
@@ -8113,9 +8108,7 @@ fn vbitmatmat(
                     // (contiguous f16 per (row·ng + g)), so the same
                     // blocked 1×4 kernel serves the decoded row.
                     #[cfg(target_arch = "x86_64")]
-                    if avx2_enabled()
-                        && blocked_enabled()
-                    {
+                    if avx2_enabled() && blocked_enabled() {
                         while bi + 4 <= acts.len() {
                             let xs = [
                                 acts[bi].xq.as_slice(),
@@ -10022,9 +10015,14 @@ mod tests {
             .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
             .collect();
         let scales: Vec<f32> = (0..gpr).map(|g| 0.5 + g as f32 * 0.25).collect();
-        let x: Vec<f32> = (0..cols).map(|i| if i % 3 == 0 { -1.0 } else { 1.0 }).collect();
+        let x: Vec<f32> = (0..cols)
+            .map(|i| if i % 3 == 0 { -1.0 } else { 1.0 })
+            .collect();
         let act = split_act(&x);
-        assert!(act.outliers.is_empty(), "on-grid input must have no outliers");
+        assert!(
+            act.outliers.is_empty(),
+            "on-grid input must have no outliers"
+        );
         let gsum = q1_group_sums(&act.xq, gpr);
         for r in 0..rows {
             let exact = q2tp_row_exact(&chunks, r, gpr, &x, &scales);
@@ -11363,7 +11361,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod gemm_bench {
     /// `cargo test -p cortiq-engine --release q4tp_matmat_throughput -- --ignored --nocapture`
@@ -11388,17 +11385,14 @@ mod gemm_bench {
             .unwrap_or(296);
         let (rows, cols) = (9216usize, 2304usize);
         let (_, _, _) = (rows, cols, b);
-        let total = cortiq_core::quant::expected_nbytes(
-            cortiq_core::TensorDtype::Q4TiledP,
-            &[rows, cols],
-        )
-        .unwrap();
+        let total =
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+                .unwrap();
         // Random nibbles are fine, but the row params are f16 (lo, step)
         // of a geometric ladder: garbage there gives exp2 of a huge
         // exponent, the scales come back inf, and the whole bench times
         // NaN arithmetic instead of the kernel.
-        let (params_off, codes_off, _) =
-            cortiq_core::quant::q4tp_sections(rows, cols);
+        let (params_off, codes_off, _) = cortiq_core::quant::q4tp_sections(rows, cols);
         let mut bytes: Vec<u8> = (0..total).map(|i| (i * 37 % 251) as u8).collect();
         let lo = cortiq_core::quant::f32_to_f16(-4.0);
         let step = cortiq_core::quant::f32_to_f16(0.1);
@@ -11571,11 +11565,9 @@ mod gemm_bench {
     #[ignore]
     fn q4t_matmat_throughput() {
         let (rows, cols, b) = (9216usize, 2304usize, 296usize);
-        let total = cortiq_core::quant::expected_nbytes(
-            cortiq_core::TensorDtype::Q4Tiled,
-            &[rows, cols],
-        )
-        .unwrap();
+        let total =
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4Tiled, &[rows, cols])
+                .unwrap();
         // q4t carries a per-group f16 scale in the tile's first two bytes;
         // random bytes there decode to inf and the bench would time NaNs.
         let mut bytes: Vec<u8> = (0..total).map(|i| (i * 37 % 251) as u8).collect();
@@ -11607,5 +11599,4 @@ mod gemm_bench {
             out.iter().take(64).sum::<f32>()
         );
     }
-
 }

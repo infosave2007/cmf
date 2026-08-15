@@ -63,8 +63,15 @@ pub fn mmh3_prof_report() -> Option<String> {
         return None;
     }
     const NAMES: [&str; 9] = [
-        "norm+mod", "qkv gemm", "qknorm+rope", "attention", "out gemm", "fc1 gemm",
-        "swiglu", "fc2 gemm", "residual",
+        "norm+mod",
+        "qkv gemm",
+        "qknorm+rope",
+        "attention",
+        "out gemm",
+        "fc1 gemm",
+        "swiglu",
+        "fc2 gemm",
+        "residual",
     ];
     let mut v: Vec<(u64, &str)> = MMH3_PROF
         .iter()
@@ -204,7 +211,13 @@ impl Layout {
     /// t2va: `[text | audio | video]`, the target streams last and in
     /// that order. Keyframe and reference blocks would slot between the
     /// text and the audio; this port does text-to-video only.
-    pub fn t2va(text_len: usize, latent_t: usize, lat_h: usize, lat_w: usize, audio_t: usize) -> Self {
+    pub fn t2va(
+        text_len: usize,
+        latent_t: usize,
+        lat_h: usize,
+        lat_w: usize,
+        audio_t: usize,
+    ) -> Self {
         Self::build(text_len, latent_t, lat_h, lat_w, audio_t, &[], &[])
     }
 
@@ -242,7 +255,16 @@ impl Layout {
         refs: &[Ref],
         text_tags: &[u8],
     ) -> Self {
-        Self::build_full(text_len, latent_t, lat_h, lat_w, audio_t, &[], refs, text_tags)
+        Self::build_full(
+            text_len,
+            latent_t,
+            lat_h,
+            lat_w,
+            audio_t,
+            &[],
+            refs,
+            text_tags,
+        )
     }
 
     fn build(
@@ -254,7 +276,16 @@ impl Layout {
         frames: &[(usize, usize)],
         text_tags: &[u8],
     ) -> Self {
-        Self::build_full(text_len, latent_t, lat_h, lat_w, audio_t, frames, &[], text_tags)
+        Self::build_full(
+            text_len,
+            latent_t,
+            lat_h,
+            lat_w,
+            audio_t,
+            frames,
+            &[],
+            text_tags,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -276,7 +307,11 @@ impl Layout {
         let mut pos: Vec<[f64; 3]> = Vec::new();
         let mut segments = Vec::new();
 
-        segments.push(Segment { start: 0, stop: text_len, kind: Kind::Text });
+        segments.push(Segment {
+            start: 0,
+            stop: text_len,
+            kind: Kind::Text,
+        });
         for i in 0..text_len {
             pos.push([i as f64, 0.0, 0.0]);
         }
@@ -300,18 +335,31 @@ impl Layout {
                             pos.push([cursor, h, w]);
                         }
                     }
-                    segments.push(Segment { start, stop: pos.len(), kind: Kind::RefImg });
+                    segments.push(Segment {
+                        start,
+                        stop: pos.len(),
+                        kind: Kind::RefImg,
+                    });
                     cursor += 1.0;
                 }
                 Ref::Audio { t } => {
                     if *t > 0 {
                         let start = pos.len();
                         push_audio_grid(&mut pos, cursor, *t, w_low_t, w_high_t);
-                        segments.push(Segment { start, stop: pos.len(), kind: Kind::RefAudio });
+                        segments.push(Segment {
+                            start,
+                            stop: pos.len(),
+                            kind: Kind::RefAudio,
+                        });
                     }
                     cursor += *t as f64;
                 }
-                Ref::Video { latent_t: vt, lat_h: rh_, lat_w: rw_, audio_t: rt } => {
+                Ref::Video {
+                    latent_t: vt,
+                    lat_h: rh_,
+                    lat_w: rw_,
+                    audio_t: rt,
+                } => {
                     let area = ((rh_ * rw_) as f64).sqrt();
                     let rh = axis_from_sqrt_area(*rh_, 2, area);
                     let rw = axis_from_sqrt_area(*rw_, 2, area);
@@ -321,7 +369,11 @@ impl Layout {
                     if *rt > 0 {
                         let start = pos.len();
                         push_audio_grid(&mut pos, cursor, *rt, rw[0], rw[rw.len() - 1]);
-                        segments.push(Segment { start, stop: pos.len(), kind: Kind::RefAudio });
+                        segments.push(Segment {
+                            start,
+                            stop: pos.len(),
+                            kind: Kind::RefAudio,
+                        });
                     }
                     let start = pos.len();
                     let mut t_coord = cursor;
@@ -333,7 +385,11 @@ impl Layout {
                         }
                         t_coord += FRAME_RESCALE * FRAME_PER_TOKEN[k % 5];
                     }
-                    segments.push(Segment { start, stop: pos.len(), kind: Kind::RefImg });
+                    segments.push(Segment {
+                        start,
+                        stop: pos.len(),
+                        kind: Kind::RefImg,
+                    });
                     let spans: f64 = (0..*vt)
                         .map(|k| FRAME_RESCALE * FRAME_PER_TOKEN[k % 5])
                         .sum();
@@ -361,7 +417,11 @@ impl Layout {
                     pos.push([cond_t, h, w]);
                 }
             }
-            segments.push(Segment { start, stop: pos.len(), kind: Kind::Cond });
+            segments.push(Segment {
+                start,
+                stop: pos.len(),
+                kind: Kind::Cond,
+            });
         }
 
         // Audio is channel-major stereo: every latent frame once per
@@ -369,7 +429,11 @@ impl Layout {
         // w coordinates so they are distinguishable under RoPE.
         let a_start = pos.len();
         push_audio_grid(&mut pos, cursor, audio_t, w_low_t, w_high_t);
-        segments.push(Segment { start: a_start, stop: pos.len(), kind: Kind::Audio });
+        segments.push(Segment {
+            start: a_start,
+            stop: pos.len(),
+            kind: Kind::Audio,
+        });
 
         // Video: the t axis advances by the per-token frame spans, not
         // by one; h/w come from the shared frame grid.
@@ -383,7 +447,11 @@ impl Layout {
             }
             t_coord += FRAME_RESCALE * FRAME_PER_TOKEN[k % 5];
         }
-        segments.push(Segment { start: v_start, stop: pos.len(), kind: Kind::Video });
+        segments.push(Segment {
+            start: v_start,
+            stop: pos.len(),
+            kind: Kind::Video,
+        });
 
         Self {
             seq_len: pos.len(),
@@ -440,7 +508,13 @@ impl Adaln {
         let b = crate::dit::cmf_f32(model, &format!("{prefix}.bias"))?;
         let out = w.rows();
         let rank = table.len() / CURVE_GRID;
-        Ok(Self { w, b, table, rank, out })
+        Ok(Self {
+            w,
+            b,
+            table,
+            rank,
+            out,
+        })
     }
 
     /// The modulation vectors at `ts`: `[ts.len() · MODALITIES, expand ·
@@ -457,7 +531,10 @@ impl Adaln {
             let i0 = (p.floor() as usize).min(g - 2);
             let f = p - i0 as f32;
             for k in 0..self.rank {
-                let (a, b) = (self.table[i0 * self.rank + k], self.table[(i0 + 1) * self.rank + k]);
+                let (a, b) = (
+                    self.table[i0 * self.rank + k],
+                    self.table[(i0 + 1) * self.rank + k],
+                );
                 coords[i * self.rank + k] = a + (b - a) * f;
             }
         }
@@ -475,12 +552,12 @@ impl Adaln {
 struct Block {
     norm1: Vec<f32>,
     norm2: Vec<f32>,
-    qkv: Proj,   // [3·heads·hd, hidden]
-    out: Proj,   // [hidden, heads·hd]
+    qkv: Proj, // [3·heads·hd, hidden]
+    out: Proj, // [hidden, heads·hd]
     q_norm: Vec<f32>,
     k_norm: Vec<f32>,
-    fc1: Proj,   // [2·ffn, hidden]
-    fc2: Proj,   // [hidden, ffn]
+    fc1: Proj, // [2·ffn, hidden]
+    fc2: Proj, // [hidden, ffn]
     adaln: Option<Adaln>,
 }
 
@@ -540,7 +617,9 @@ fn silu(v: f32) -> f32 {
 impl MiniMaxH3 {
     pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
         let cfg: serde_json::Value = serde_json::from_slice(
-            model.tensor_bytes("dit.config_json").map_err(|e| e.to_string())?,
+            model
+                .tensor_bytes("dit.config_json")
+                .map_err(|e| e.to_string())?,
         )
         .map_err(|e| format!("dit.config_json: {e}"))?;
         let u = |k: &str| cfg[k].as_u64().unwrap_or(0) as usize;
@@ -625,7 +704,10 @@ impl MiniMaxH3 {
             self.block_forward(blk, &mut h, n, None, &ids, &[]);
         }
         let mut out = vec![0f32; n * self.hidden];
-        for (o, x) in out.chunks_exact_mut(self.hidden).zip(h.chunks_exact(self.hidden)) {
+        for (o, x) in out
+            .chunks_exact_mut(self.hidden)
+            .zip(h.chunks_exact(self.hidden))
+        {
             rms_norm_into(x, &self.refiner_norm, self.final_eps, o);
         }
         out
@@ -669,7 +751,11 @@ impl MiniMaxH3 {
         off: usize,
     ) {
         let hd = self.head_dim;
-        let pairs = if angles.is_empty() { 0 } else { angles.len() / n };
+        let pairs = if angles.is_empty() {
+            0
+        } else {
+            angles.len() / n
+        };
         let pool = self.pool.as_deref();
         let ptr = SendPtr(v.as_mut_ptr());
         let work = |lo: usize, hi: usize| {
@@ -771,9 +857,8 @@ impl MiniMaxH3 {
                             // SAFETY: workers own disjoint token ranges,
                             // and each token writes its own head slots.
                             unsafe {
-                                pq.row(dst, hd).copy_from_slice(
-                                    &qkv[base + h * hd..base + (h + 1) * hd],
-                                );
+                                pq.row(dst, hd)
+                                    .copy_from_slice(&qkv[base + h * hd..base + (h + 1) * hd]);
                                 pk.row(dst, hd).copy_from_slice(
                                     &qkv[base + inner + h * hd..base + inner + (h + 1) * hd],
                                 );
@@ -845,7 +930,10 @@ impl MiniMaxH3 {
         if !mmh3_prof_on() {
             return;
         }
-        MMH3_PROF[slot].fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        MMH3_PROF[slot].fetch_add(
+            t.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// One block. `mods` is the block's modulation buffer and `rows` the
@@ -999,7 +1087,15 @@ impl MiniMaxH3 {
         let t = std::time::Instant::now();
         if !qk_on_gpu {
             for (which, w) in [(0usize, &blk.q_norm), (1usize, &blk.k_norm)] {
-                self.norm_rope_w(&mut qkv, n, self.heads, w, &angles, 3 * inner, which * inner);
+                self.norm_rope_w(
+                    &mut qkv,
+                    n,
+                    self.heads,
+                    w,
+                    &angles,
+                    3 * inner,
+                    which * inner,
+                );
             }
         }
         Self::prof(2, t);
@@ -1035,76 +1131,65 @@ impl MiniMaxH3 {
     /// own function so the attention half can return early — the fused
     /// path (`dit_qkv_attention`) finishes attention on the device and
     /// has nowhere to jump to otherwise.
-    fn ffn_tail(
-        &self,
-        blk: &Block,
-        x: &mut [f32],
-        n: usize,
-        mods: Option<&[f32]>,
-        rows: &[u32],
-    ) {
+    fn ffn_tail(&self, blk: &Block, x: &mut [f32], n: usize, mods: Option<&[f32]>, rows: &[u32]) {
         let hs = self.hidden;
         let pool = self.pool.as_deref();
         let mut xn = vec![0f32; n * hs];
         let mut proj = vec![0f32; n * hs];
-            let t = std::time::Instant::now();
-            self.norm_rows(&mut xn, x, n, hs, &blk.norm2, self.eps);
-            if let (Some(m), false) = (mods, rows.is_empty()) {
-                self.modulate(&mut xn, hs, m, rows, 3, 4);
-            }
-            Self::prof(0, t);
-            let t = std::time::Instant::now();
-            // Device-resident FFN: fc1 → SwiGLU → fc2 without the
-            // intermediate crossing the bus. At render size that panel is
-            // hundreds of megabytes each way, per block, per step.
-            // CMF_MMH3_FFN=cpu forces the host chain below.
-            if std::env::var("CMF_MMH3_FFN").as_deref() != Ok("cpu")
-                && crate::gpu::enabled_here()
-                && n >= 64
-            {
-                if let (Proj::Q(q1), Proj::Q(q2)) = (&blk.fc1, &blk.fc2) {
-                    if let (Some((m, i1)), Some((_, i2))) =
-                        (q1.mapped_q4tp(), q2.mapped_q4tp())
+        let t = std::time::Instant::now();
+        self.norm_rows(&mut xn, x, n, hs, &blk.norm2, self.eps);
+        if let (Some(m), false) = (mods, rows.is_empty()) {
+            self.modulate(&mut xn, hs, m, rows, 3, 4);
+        }
+        Self::prof(0, t);
+        let t = std::time::Instant::now();
+        // Device-resident FFN: fc1 → SwiGLU → fc2 without the
+        // intermediate crossing the bus. At render size that panel is
+        // hundreds of megabytes each way, per block, per step.
+        // CMF_MMH3_FFN=cpu forces the host chain below.
+        if std::env::var("CMF_MMH3_FFN").as_deref() != Ok("cpu")
+            && crate::gpu::enabled_here()
+            && n >= 64
+        {
+            if let (Proj::Q(q1), Proj::Q(q2)) = (&blk.fc1, &blk.fc2) {
+                if let (Some((m, i1)), Some((_, i2))) = (q1.mapped_q4tp(), q2.mapped_q4tp()) {
+                    let mut fout = vec![0f32; n * hs];
+                    if crate::gpu::q4tp_ffn_packed(m, i1, i2, &xn, n, hs, self.ffn, None, &mut fout)
                     {
-                        let mut fout = vec![0f32; n * hs];
-                        if crate::gpu::q4tp_ffn_packed(
-                            m, i1, i2, &xn, n, hs, self.ffn, None, &mut fout,
-                        ) {
-                            Self::prof(5, t);
-                            self.residual(x, hs, &fout, mods, rows, 5);
-                            return;
-                        }
+                        Self::prof(5, t);
+                        self.residual(x, hs, &fout, mods, rows, 5);
+                        return;
                     }
                 }
             }
-            let mut gu = vec![0f32; n * 2 * self.ffn];
-            blk.fc1.matmat(&xn, n, &mut gu, pool);
-            Self::prof(5, t);
-            let t = std::time::Instant::now();
-            // SwiGLU: fc1's output is [gate | up] per row.
-            let ffn = self.ffn;
-            let mut act = vec![0f32; n * ffn];
-            let ap = SendPtr(act.as_mut_ptr());
-            pool_rows(pool, n, &|lo, hi| {
-                for p in lo..hi {
-                    let row = &gu[p * 2 * ffn..(p + 1) * 2 * ffn];
-                    let (g, up) = row.split_at(ffn);
-                    // SAFETY: workers own disjoint token ranges.
-                    for (o, (&a, &b)) in unsafe { ap.row(p * ffn, ffn) }
-                        .iter_mut()
-                        .zip(g.iter().zip(up))
-                    {
-                        *o = silu(a) * b;
-                    }
+        }
+        let mut gu = vec![0f32; n * 2 * self.ffn];
+        blk.fc1.matmat(&xn, n, &mut gu, pool);
+        Self::prof(5, t);
+        let t = std::time::Instant::now();
+        // SwiGLU: fc1's output is [gate | up] per row.
+        let ffn = self.ffn;
+        let mut act = vec![0f32; n * ffn];
+        let ap = SendPtr(act.as_mut_ptr());
+        pool_rows(pool, n, &|lo, hi| {
+            for p in lo..hi {
+                let row = &gu[p * 2 * ffn..(p + 1) * 2 * ffn];
+                let (g, up) = row.split_at(ffn);
+                // SAFETY: workers own disjoint token ranges.
+                for (o, (&a, &b)) in unsafe { ap.row(p * ffn, ffn) }
+                    .iter_mut()
+                    .zip(g.iter().zip(up))
+                {
+                    *o = silu(a) * b;
                 }
-            });
-            Self::prof(6, t);
-            let t = std::time::Instant::now();
-            blk.fc2.matmat(&act, n, &mut proj, pool);
-            Self::prof(7, t);
-            self.residual(x, hs, &proj, mods, rows, 5);
+            }
+        });
+        Self::prof(6, t);
+        let t = std::time::Instant::now();
+        blk.fc2.matmat(&act, n, &mut proj, pool);
+        Self::prof(7, t);
+        self.residual(x, hs, &proj, mods, rows, 5);
     }
-
 
     /// RMSNorm every row of `src` into `dst`, across the pool. One
     /// block does this four times over `n·hidden`; on a 1 879-token
@@ -1280,7 +1365,13 @@ impl MiniMaxH3 {
         }
 
         // ── embed ──
-        let v_rows = patchify_video(video, self.latents_dim, layout.latent_t, layout.lat_h, layout.lat_w);
+        let v_rows = patchify_video(
+            video,
+            self.latents_dim,
+            layout.latent_t,
+            layout.lat_h,
+            layout.lat_w,
+        );
         let v_n = v_rows.len() / (self.latents_dim * 4);
         let a_rows = pack_audio(audio, self.audio_dim, layout.audio_t);
         // Condition rows go through the SAME patch projection as the
@@ -1310,9 +1401,13 @@ impl MiniMaxH3 {
         let mut ci = 0usize;
         for s in layout.segments.iter().filter(|s| s.kind == Kind::Cond) {
             let n = s.stop - s.start;
-            let r = cond_rows
-                .get(ci)
-                .unwrap_or_else(|| panic!("layout has {} cond segments, {} latents given", ci + 1, cond_rows.len()));
+            let r = cond_rows.get(ci).unwrap_or_else(|| {
+                panic!(
+                    "layout has {} cond segments, {} latents given",
+                    ci + 1,
+                    cond_rows.len()
+                )
+            });
             self.video_patch
                 .matmat(r, n, &mut h[s.start * hs..s.stop * hs], pool);
             for row in h[s.start * hs..s.stop * hs].chunks_exact_mut(hs) {
@@ -1326,7 +1421,8 @@ impl MiniMaxH3 {
         let aseg = layout.segment(Kind::Audio);
         let tseg = layout.segment(Kind::Text);
         h[tseg.start * hs..tseg.stop * hs].copy_from_slice(&text[..(tseg.stop - tseg.start) * hs]);
-        self.video_patch.matmat(&v_rows, v_n, &mut h[vseg.start * hs..vseg.stop * hs], pool);
+        self.video_patch
+            .matmat(&v_rows, v_n, &mut h[vseg.start * hs..vseg.stop * hs], pool);
         self.audio_patch.matmat(
             &a_rows,
             aseg.stop - aseg.start,
@@ -1353,7 +1449,10 @@ impl MiniMaxH3 {
             if let Ok(w) = std::env::var("CMF_MMH3_WATCHROW") {
                 if let Ok(r) = w.parse::<usize>() {
                     let row = &h[r * hs..(r + 1) * hs];
-                    let amax = row.iter().filter(|v| v.is_finite()).fold(0f32, |a, v| a.max(v.abs()));
+                    let amax = row
+                        .iter()
+                        .filter(|v| v.is_finite())
+                        .fold(0f32, |a, v| a.max(v.abs()));
                     let bad = row.iter().filter(|v| !v.is_finite()).count();
                     if bad > 0 || i == 0 || amax > 1e3 {
                         eprintln!("  watch blk {i}: row {r} absmax {amax:.3e} nonfinite {bad}");
@@ -1387,12 +1486,29 @@ impl MiniMaxH3 {
         let mut video_out = vec![0f32; (vseg.stop - vseg.start) * vd];
         let mut audio_out = vec![0f32; (aseg.stop - aseg.start) * self.audio_dim];
         for (seg, row, w, b, dst, dim) in [
-            (vseg, row_v, &self.video_out, &self.video_out_b, &mut video_out, vd),
-            (aseg, row_a, &self.audio_out, &self.audio_out_b, &mut audio_out, self.audio_dim),
+            (
+                vseg,
+                row_v,
+                &self.video_out,
+                &self.video_out_b,
+                &mut video_out,
+                vd,
+            ),
+            (
+                aseg,
+                row_a,
+                &self.audio_out,
+                &self.audio_out_b,
+                &mut audio_out,
+                self.audio_dim,
+            ),
         ] {
             let n = seg.stop - seg.start;
             let mut hn = vec![0f32; n * hs];
-            for (o, src) in hn.chunks_exact_mut(hs).zip(h[seg.start * hs..seg.stop * hs].chunks_exact(hs)) {
+            for (o, src) in hn
+                .chunks_exact_mut(hs)
+                .zip(h[seg.start * hs..seg.stop * hs].chunks_exact(hs))
+            {
                 rms_norm_into(src, &self.final_norm, self.final_eps, o);
             }
             // The final layer's adaLN has one modality, so the row IS
@@ -1413,7 +1529,9 @@ impl MiniMaxH3 {
                 let bad_in = hn.iter().filter(|v| !v.is_finite()).count();
                 eprintln!(
                     "  nanprobe dim={dim} n={n} in_bad={bad_in} in_absmax={:.4}",
-                    hn.iter().filter(|v| v.is_finite()).fold(0f32, |a, v| a.max(v.abs()))
+                    hn.iter()
+                        .filter(|v| v.is_finite())
+                        .fold(0f32, |a, v| a.max(v.abs()))
                 );
             }
             w.matmat(&hn, n, dst, pool);
@@ -1422,7 +1540,9 @@ impl MiniMaxH3 {
                 eprintln!(
                     "  nanprobe dim={dim} out_bad={bad_out}/{} out_absmax={:.4}",
                     dst.len(),
-                    dst.iter().filter(|v| v.is_finite()).fold(0f32, |a, v| a.max(v.abs()))
+                    dst.iter()
+                        .filter(|v| v.is_finite())
+                        .fold(0f32, |a, v| a.max(v.abs()))
                 );
             }
             for r in dst.chunks_exact_mut(dim) {
@@ -1626,7 +1746,9 @@ mod tests {
         // whole clip further on, minus one span.
         let c: Vec<_> = l.segments.iter().filter(|s| s.kind == Kind::Cond).collect();
         assert_eq!(l.pos[c[0].start][0], tl as f64);
-        let spans: f64 = (0..lt).map(|k| FRAME_RESCALE * FRAME_PER_TOKEN[k % 5]).sum();
+        let spans: f64 = (0..lt)
+            .map(|k| FRAME_RESCALE * FRAME_PER_TOKEN[k % 5])
+            .sum();
         assert!((l.pos[c[1].start][0] - (tl as f64 + spans - FRAME_RESCALE)).abs() < 1e-12);
         // Both share the TARGET spatial grid.
         assert_eq!(l.pos[c[0].start][1], l.pos[v0.start][1]);

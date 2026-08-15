@@ -60,14 +60,18 @@ fn the_fused_attention_block_matches_the_cpu() {
     let hidden: Vec<f32> = (0..dim).map(|i| ((i * 13) as f32 * 0.017).sin()).collect();
     let q_norm: Vec<f32> = (0..q_lora).map(|i| 1.0 + (i as f32) * 0.01).collect();
     let sink: Vec<f32> = (0..nh).map(|h| (h as f32) * 0.7 - 1.0).collect();
-    let inv_freq: Vec<f32> = (0..rd / 2).map(|i| 1.0 / 10000f32.powf(2.0 * i as f32 / rd as f32)).collect();
+    let inv_freq: Vec<f32> = (0..rd / 2)
+        .map(|i| 1.0 / 10000f32.powf(2.0 * i as f32 / rd as f32))
+        .collect();
     let pos = 37usize;
 
     // A cache of 24 positions, only some of them attended — the index list is
     // the whole point of this attention and a frame that ignored it would
     // still look sane against a dense reference.
     let npos = 24usize;
-    let cache: Vec<f32> = (0..npos * hd).map(|i| ((i * 5) as f32 * 0.011).cos()).collect();
+    let cache: Vec<f32> = (0..npos * hd)
+        .map(|i| ((i * 5) as f32 * 0.011).cos())
+        .collect();
     let idxs: Vec<u32> = (0..npos as u32).filter(|i| i % 4 != 2).collect();
     let idx_us: Vec<usize> = idxs.iter().map(|&i| i as usize).collect();
 

@@ -745,8 +745,13 @@ fn stream_writer_resumes_from_its_manifest_after_a_crash() {
         .map(|i| {
             let rows = 8usize;
             let cols = 64usize;
-            let vals: Vec<f32> = (0..rows * cols).map(|k| ((k + i) as f32 * 0.03).cos()).collect();
-            (format!("layer.{i}.weight"), encode_q8_row(&vals, rows, cols))
+            let vals: Vec<f32> = (0..rows * cols)
+                .map(|k| ((k + i) as f32 * 0.03).cos())
+                .collect();
+            (
+                format!("layer.{i}.weight"),
+                encode_q8_row(&vals, rows, cols),
+            )
         })
         .collect();
 
@@ -776,7 +781,11 @@ fn stream_writer_resumes_from_its_manifest_after_a_crash() {
 
     let (w2, st) = CmfStreamWriter::resume(&path, &man).unwrap();
     assert_eq!(st.names.len(), payloads.len(), "manifest lost tensors");
-    assert_eq!(st.marks, vec!["shard-0".to_string()], "the mark did not survive");
+    assert_eq!(
+        st.marks,
+        vec!["shard-0".to_string()],
+        "the mark did not survive"
+    );
     assert!(
         !st.names.contains(&"after.the.mark".to_string()),
         "a tensor written past the last mark was kept"
@@ -818,15 +827,25 @@ fn recode_in_place_shrinks_within_slot_and_stays_verifiable() {
         shape: vec![4, 8],
         data: v.iter().flat_map(|x| x.to_le_bytes()).collect(),
     };
-    let tensors = vec![spec("keep.before", &a), spec("model.mtp.0.x", &b), spec("keep.after", &c)];
+    let tensors = vec![
+        spec("keep.before", &a),
+        spec("model.mtp.0.x", &b),
+        spec("keep.after", &c),
+    ];
     CmfModel::write(&path, &tiny_header(), &tensors, None, None).unwrap();
 
     // Recode the middle tensor F32 → F16: half the bytes, same shape, a
     // dtype the loader's nbytes check knows how to validate.
-    let halves: Vec<u8> = b.iter().flat_map(|&x| f32_to_f16(x).to_le_bytes()).collect();
+    let halves: Vec<u8> = b
+        .iter()
+        .flat_map(|&x| f32_to_f16(x).to_le_bytes())
+        .collect();
     let bi = {
         let m = CmfModel::open(&path).unwrap();
-        m.tensors.iter().position(|t| t.name == "model.mtp.0.x").unwrap()
+        m.tensors
+            .iter()
+            .position(|t| t.name == "model.mtp.0.x")
+            .unwrap()
     };
     CmfModel::recode_entries_in_place(
         path.to_str().unwrap(),
@@ -835,7 +854,11 @@ fn recode_in_place_shrinks_within_slot_and_stays_verifiable() {
     .unwrap();
 
     let m = CmfModel::open(&path).unwrap();
-    assert!(m.verify().is_empty(), "recoded file failed verify(): {:?}", m.verify());
+    assert!(
+        m.verify().is_empty(),
+        "recoded file failed verify(): {:?}",
+        m.verify()
+    );
     let e = &m.tensors[bi];
     assert_eq!(e.dtype, TensorDtype::F16);
     assert_eq!(e.nbytes, halves.len() as u64);
@@ -856,5 +879,8 @@ fn recode_in_place_shrinks_within_slot_and_stays_verifiable() {
     );
     assert!(err.is_err(), "oversized recode was accepted");
     let m2 = CmfModel::open(&path).unwrap();
-    assert!(m2.verify().is_empty(), "refused recode still dirtied the file");
+    assert!(
+        m2.verify().is_empty(),
+        "refused recode still dirtied the file"
+    );
 }

@@ -27,8 +27,12 @@ fn device_hc_join_matches_the_cpu() {
 
     let (hc, dim, iters, eps) = (4usize, 256usize, 20u32, 1e-6f32);
     let mix_hc = (2 + hc) * hc;
-    let state: Vec<f32> = (0..hc * dim).map(|i| ((i * 13) as f32 * 0.017).sin()).collect();
-    let mixes: Vec<f32> = (0..mix_hc).map(|i| ((i * 7) as f32 * 0.31).cos() * 2.0).collect();
+    let state: Vec<f32> = (0..hc * dim)
+        .map(|i| ((i * 13) as f32 * 0.017).sin())
+        .collect();
+    let mixes: Vec<f32> = (0..mix_hc)
+        .map(|i| ((i * 7) as f32 * 0.31).cos() * 2.0)
+        .collect();
     let base: Vec<f32> = (0..mix_hc).map(|i| ((i * 5) as f32 * 0.11).sin()).collect();
     let scale = [1.0f32, 1.0, 1.0];
     let block_out: Vec<f32> = (0..dim).map(|i| ((i * 3) as f32 * 0.023).cos()).collect();
@@ -40,7 +44,17 @@ fn device_hc_join_matches_the_cpu() {
     let rsq = 1.0 / (state.iter().map(|v| v * v).sum::<f32>() / state.len() as f32 + eps).sqrt();
     let scaled: Vec<f32> = mixes.iter().map(|m| m * rsq).collect();
     let (mut pre, mut post, mut comb) = (vec![0.0; hc], vec![0.0; hc], vec![0.0; hc * hc]);
-    dsv4::hc_split_sinkhorn(&scaled, &scale, &base, hc, iters as usize, eps, &mut pre, &mut post, &mut comb);
+    dsv4::hc_split_sinkhorn(
+        &scaled,
+        &scale,
+        &base,
+        hc,
+        iters as usize,
+        eps,
+        &mut pre,
+        &mut post,
+        &mut comb,
+    );
     let mut want_fold = vec![0.0f32; dim];
     dsv4::hc_fold(&state, &pre, hc, dim, &mut want_fold);
     let mut want_exp = vec![0.0f32; hc * dim];
@@ -49,8 +63,17 @@ fn device_hc_join_matches_the_cpu() {
     let mut got_fold = vec![0.0f32; dim];
     let mut got_exp = vec![0.0f32; hc * dim];
     let ok = cortiq_engine::gpu_wgpu::hc_join_for_test(
-        &state, &mixes, &scale, &base, &block_out, hc, dim, iters, eps,
-        &mut got_fold, &mut got_exp,
+        &state,
+        &mixes,
+        &scale,
+        &base,
+        &block_out,
+        hc,
+        dim,
+        iters,
+        eps,
+        &mut got_fold,
+        &mut got_exp,
     );
     if !ok {
         panic!("устройство не поднялось — тест не проверил ничего");

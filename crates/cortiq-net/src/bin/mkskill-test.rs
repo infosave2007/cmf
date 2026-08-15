@@ -23,7 +23,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if ffn0.is_empty() {
         return Err("no model.layers.0.*mlp.* tensors — wrong arch naming?".into());
     }
-    println!("oracle skill 'test' over {} layer-0 FFN tensors:", ffn0.len());
+    println!(
+        "oracle skill 'test' over {} layer-0 FFN tensors:",
+        ffn0.len()
+    );
     for n in &ffn0 {
         println!("  {n}");
     }

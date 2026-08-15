@@ -18,10 +18,10 @@
 //! RoPE covers the first 32 of each head's 64 dims, split-half: for
 //! `i < 16` the pair is `(x[i], x[i+16])`, rotated by `pos·inv_freq[i]`.
 
-use crate::dit::Proj;
-use crate::qtensor::QTensor;
 use crate::audiovae::SendPtr;
+use crate::dit::Proj;
 use crate::pool::Pool;
+use crate::qtensor::QTensor;
 use cortiq_core::CmfModel;
 use std::sync::Arc;
 
@@ -114,9 +114,12 @@ impl Music3Dit {
     pub const CONCAT_CH: usize = 2304;
 
     pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
-        let cfg: serde_json::Value =
-            serde_json::from_slice(model.tensor_bytes("mdit.config_json").map_err(|e| e.to_string())?)
-                .map_err(|e| format!("mdit.config_json: {e}"))?;
+        let cfg: serde_json::Value = serde_json::from_slice(
+            model
+                .tensor_bytes("mdit.config_json")
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("mdit.config_json: {e}"))?;
         let u = |k: &str, d: usize| cfg[k].as_u64().map(|v| v as usize).unwrap_or(d);
         let nl = u("num_layers", 36);
         let dt = "mdit.diffusion_transformer";
@@ -130,7 +133,10 @@ impl Music3Dit {
             t2_b: crate::dit::cmf_f32(model, &format!("{dt}.to_timestep_embed.2.bias"))?,
             project_in: Proj::from_model(model, &format!("{dt}.transformer.project_in.weight"))?,
             project_out: Proj::from_model(model, &format!("{dt}.transformer.project_out.weight"))?,
-            inv_freq: crate::dit::cmf_f32(model, &format!("{dt}.transformer.rotary_pos_emb.inv_freq"))?,
+            inv_freq: crate::dit::cmf_f32(
+                model,
+                &format!("{dt}.transformer.rotary_pos_emb.inv_freq"),
+            )?,
             blocks: (0..nl)
                 .map(|i| Block::load(model, &format!("{dt}.transformer.layers.{i}")))
                 .collect::<Result<_, _>>()?,
@@ -778,9 +784,12 @@ pub struct RvqDepthDecoder {
 
 impl RvqDepthDecoder {
     pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
-        let cfg: serde_json::Value =
-            serde_json::from_slice(model.tensor_bytes("mte.config_json").map_err(|e| e.to_string())?)
-                .map_err(|e| format!("mte.config_json: {e}"))?;
+        let cfg: serde_json::Value = serde_json::from_slice(
+            model
+                .tensor_bytes("mte.config_json")
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("mte.config_json: {e}"))?;
         let u = |k: &str, d: usize| cfg[k].as_u64().map(|v| v as usize).unwrap_or(d);
         let hidden = u("hidden_size", 4096);
         let nl = u("decoder_num_layers", 4);
@@ -815,8 +824,7 @@ impl RvqDepthDecoder {
     pub fn project(&self, x: &[f32]) -> Vec<f32> {
         let n = x.len() / self.hidden;
         let mut out = vec![0f32; n * self.hidden];
-        self.projection
-            .matmat(x, n, &mut out, self.pool.as_deref());
+        self.projection.matmat(x, n, &mut out, self.pool.as_deref());
         out
     }
 
@@ -827,14 +835,18 @@ impl RvqDepthDecoder {
         let pool = self.pool.as_deref();
         let mut x = seq.to_vec();
         for p in 0..n {
-            for (v, &pe) in x[p * hs..(p + 1) * hs].iter_mut().zip(&self.pos[p * hs..(p + 1) * hs]) {
+            for (v, &pe) in x[p * hs..(p + 1) * hs]
+                .iter_mut()
+                .zip(&self.pos[p * hs..(p + 1) * hs])
+            {
                 *v += pe;
             }
         }
         for blk in &self.blocks {
             let mut h = x.clone();
             blk.n1.apply(&mut h, hs);
-            let (mut q, mut k, mut v) = (vec![0f32; n * hs], vec![0f32; n * hs], vec![0f32; n * hs]);
+            let (mut q, mut k, mut v) =
+                (vec![0f32; n * hs], vec![0f32; n * hs], vec![0f32; n * hs]);
             blk.q.matmat(&h, n, &mut q, pool);
             blk.k.matmat(&h, n, &mut k, pool);
             blk.v.matmat(&h, n, &mut v, pool);
@@ -987,7 +999,9 @@ impl Rng {
 }
 
 fn sample_topk(logits: &[f32], top_k: usize, rng: &mut Rng) -> usize {
-    let mut idx: Vec<usize> = (0..logits.len()).filter(|&i| logits[i].is_finite()).collect();
+    let mut idx: Vec<usize> = (0..logits.len())
+        .filter(|&i| logits[i].is_finite())
+        .collect();
     idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
     idx.truncate(top_k.max(1));
     let mx = idx.iter().map(|&i| logits[i]).fold(f32::MIN, f32::max);
@@ -1043,9 +1057,12 @@ pub mod tokens {
 
 impl Music3Ar {
     pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
-        let cfg: serde_json::Value =
-            serde_json::from_slice(model.tensor_bytes("mte.config_json").map_err(|e| e.to_string())?)
-                .map_err(|e| format!("mte.config_json: {e}"))?;
+        let cfg: serde_json::Value = serde_json::from_slice(
+            model
+                .tensor_bytes("mte.config_json")
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("mte.config_json: {e}"))?;
         let u = |k: &str, d: usize| cfg[k].as_u64().map(|v| v as usize).unwrap_or(d);
         let f = |k: &str, d: f64| cfg[k].as_f64().unwrap_or(d);
         let hidden = u("hidden_size", 4096);
@@ -1130,11 +1147,9 @@ impl Music3Ar {
                 ) else {
                     return false;
                 };
-                let (Some((_, g)), Some((_, u)), Some((_, d))) = (
-                    blk.gate.graph_w(),
-                    blk.up.graph_w(),
-                    blk.down.graph_w(),
-                ) else {
+                let (Some((_, g)), Some((_, u)), Some((_, d))) =
+                    (blk.gate.graph_w(), blk.up.graph_w(), blk.down.graph_w())
+                else {
                     return false;
                 };
                 layers.push(crate::gpu::GraphLayer {
@@ -1411,7 +1426,8 @@ impl Music3Ar {
                 let c = sample_topk(&lg, self.top_k, &mut rng);
                 codes.push(c);
                 if level < self.codebooks - 1 {
-                    let e = Self::embed_row(&self.embed_extra, c + (level - 1) * self.audio_vocab, hs);
+                    let e =
+                        Self::embed_row(&self.embed_extra, c + (level - 1) * self.audio_vocab, hs);
                     seq.extend_from_slice(&self.depth.project(&e));
                 }
             }
@@ -1503,7 +1519,10 @@ mod tests {
         });
         assert_eq!(seen, steps, "sampler reported every step");
         assert_eq!(latent.len(), Music3Dit::IN_CH * n);
-        assert!(latent.iter().all(|v| v.is_finite()), "latent went non-finite");
+        assert!(
+            latent.iter().all(|v| v.is_finite()),
+            "latent went non-finite"
+        );
         let pcm = dav.decode(&latent, n, None);
         assert_eq!(
             pcm.len(),
@@ -1533,7 +1552,9 @@ mod tests {
         let dec = RvqDepthDecoder::from_cmf(&model).expect("load RVQ decoder");
         assert_eq!(dec.codebooks(), 8, "eight codebooks");
         let hs = dec.hidden;
-        let seq: Vec<f32> = (0..3 * hs).map(|i| 0.05 * ((i as f32) * 0.013).sin()).collect();
+        let seq: Vec<f32> = (0..3 * hs)
+            .map(|i| 0.05 * ((i as f32) * 0.013).sin())
+            .collect();
         let a = dec.forward_last(&seq[..2 * hs], 2);
         let b = dec.forward_last(&seq, 3);
         assert_eq!(a.len(), hs);
@@ -1542,7 +1563,11 @@ mod tests {
         // position 2 must leave the stack's view of 0..=1 untouched, so
         // re-running with the shorter prefix must agree with itself.
         let a2 = dec.forward_last(&seq[..2 * hs], 2);
-        let d = a.iter().zip(&a2).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let d = a
+            .iter()
+            .zip(&a2)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
         assert!(d == 0.0, "not deterministic: {d}");
         let logits = dec.head(1, &b);
         assert_eq!(logits.len(), 1024, "audio vocab is 1024 per level");
@@ -1606,8 +1631,8 @@ mod tests {
 /// stage timers say "denoise"; three optimizations were argued about
 /// without anything saying which part of it.
 pub mod prof {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
     pub static QKV: AtomicU64 = AtomicU64::new(0);

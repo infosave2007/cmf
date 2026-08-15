@@ -105,7 +105,10 @@ pub fn cmd_music(
         })
         .collect();
     let latent = dit.sample(&noise, &cond, n, steps, |i, t| {
-        eprint!("\r  denoise {i}/{t} ({:.1}s)   ", t0.elapsed().as_secs_f32());
+        eprint!(
+            "\r  denoise {i}/{t} ({:.1}s)   ",
+            t0.elapsed().as_secs_f32()
+        );
     });
     eprintln!();
 

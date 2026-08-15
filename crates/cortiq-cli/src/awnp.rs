@@ -78,7 +78,10 @@ fn chol_solve(l: &[f64], n: usize, b: &mut [f64], nrhs: usize) {
 fn read_acts(path: &str, hidden: usize) -> anyhow::Result<Vec<f32>> {
     let raw = std::fs::read(path).with_context(|| format!("reading {path}"))?;
     if raw.len() % (hidden * 4) != 0 {
-        bail!("{path}: {} bytes is not a whole number of {hidden}-wide rows", raw.len());
+        bail!(
+            "{path}: {} bytes is not a whole number of {hidden}-wide rows",
+            raw.len()
+        );
     }
     Ok(raw
         .chunks_exact(4)
@@ -105,7 +108,8 @@ pub fn cmd_awnp(
     let mut by_layer: HashMap<usize, Vec<usize>> = HashMap::new();
     for (i, e) in model.tensors.iter().enumerate() {
         let n = &e.name;
-        if !(n.contains(".mlp.") && (n.ends_with("gate_proj.weight") || n.ends_with("up_proj.weight")))
+        if !(n.contains(".mlp.")
+            && (n.ends_with("gate_proj.weight") || n.ends_with("up_proj.weight")))
         {
             continue;
         }
@@ -132,7 +136,10 @@ pub fn cmd_awnp(
             continue;
         }
         let idxs = &by_layer[&li];
-        let hidden = *model.tensors[idxs[0]].shape.get(1).context("2-D expert weight")? as usize;
+        let hidden = *model.tensors[idxs[0]]
+            .shape
+            .get(1)
+            .context("2-D expert weight")? as usize;
         let x = read_acts(&path, hidden)?;
         let n_rows = x.len() / hidden;
         if n_rows < 2 * hidden {
@@ -154,8 +161,17 @@ pub fn cmd_awnp(
         }
         let mut c32 = vec![0f32; hidden * hidden];
         sgemm_public(
-            hidden, hidden, n_rows, 1.0 / n_rows as f32,
-            &xt, n_rows, &x, hidden, false, &mut c32, hidden,
+            hidden,
+            hidden,
+            n_rows,
+            1.0 / n_rows as f32,
+            &xt,
+            n_rows,
+            &x,
+            hidden,
+            false,
+            &mut c32,
+            hidden,
         );
         let c: Vec<f64> = c32.iter().map(|&v| v as f64).collect();
 
@@ -270,7 +286,13 @@ pub fn cmd_awnp(
                 .unwrap_or_else(|| model.entry_bytes(e).to_vec()),
         })
         .collect();
-    CmfModel::write(output, &model.header, &specs, Some(&model.masks), model.vocab.as_deref())?;
+    CmfModel::write(
+        output,
+        &model.header,
+        &specs,
+        Some(&model.masks),
+        model.vocab.as_deref(),
+    )?;
 
     let (li, k, h, n) = kept_report[0];
     println!(

@@ -24,8 +24,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// 37.8 s against the denoiser's 19.2 — had none, so every hour of
 /// tuning went to the half that was already instrumented.
 pub static VAE3D_PROF: [AtomicU64; 8] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 
 pub(crate) fn vae3d_prof_on() -> bool {
@@ -45,8 +51,14 @@ pub fn vae3d_prof_report() -> Option<String> {
         return None;
     }
     const NAMES: [&str; 8] = [
-        "norm rows", "qkv gemm", "repack+rope", "attention", "out gemm", "ffn",
-        "head+proj", "pixel shuffle",
+        "norm rows",
+        "qkv gemm",
+        "repack+rope",
+        "attention",
+        "out gemm",
+        "ffn",
+        "head+proj",
+        "pixel shuffle",
     ];
     let mut v: Vec<(u64, &str)> = VAE3D_PROF
         .iter()
@@ -232,7 +244,9 @@ fn split_tiles(input_len: usize, ratio: usize) -> (Vec<usize>, Vec<usize>, Vec<u
 impl VideoVae {
     pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
         let cfg: serde_json::Value = serde_json::from_slice(
-            model.tensor_bytes("vvae.config_json").map_err(|e| e.to_string())?,
+            model
+                .tensor_bytes("vvae.config_json")
+                .map_err(|e| e.to_string())?,
         )
         .map_err(|e| format!("vvae.config_json: {e}"))?;
         let u = |k: &str, d: usize| cfg[k].as_u64().map(|v| v as usize).unwrap_or(d);
@@ -300,7 +314,11 @@ impl VideoVae {
     fn rope_angles(&self, t: usize, h: usize, w: usize, suffix: usize) -> Vec<f32> {
         let k = self.rope_dim / 6; // frequencies per axis
         let inv: Vec<f32> = (0..k)
-            .map(|i| 1.0 / self.rope_theta.powf(i as f32 * 2.0 * 3.0 / self.rope_dim as f32))
+            .map(|i| {
+                1.0 / self
+                    .rope_theta
+                    .powf(i as f32 * 2.0 * 3.0 / self.rope_dim as f32)
+            })
             .collect();
         let (ta, ha, wa) = (Self::axis(t), Self::axis(h), Self::axis(w));
         let tau = 2.0 * std::f32::consts::PI;
@@ -377,18 +395,33 @@ impl VideoVae {
             // the attention math. Next: read `sc.dq` back right after
             // the split and compare it against the host repack — one
             // buffer, one dispatch, no attention involved.
-            if std::env::var("CMF_VAE3D_CHECK").as_deref() == Ok("1")
-                && !CHECKING.with(|c| c.get())
+            if std::env::var("CMF_VAE3D_CHECK").as_deref() == Ok("1") && !CHECKING.with(|c| c.get())
             {
                 CHECKING.with(|c| c.set(true));
                 const SENT: f32 = -12345.0;
                 let mut d1 = vec![SENT; attn.len()];
                 let mut d0 = vec![SENT; attn.len()];
                 let ok1 = crate::gpu::vae_attention_packed_layout(
-                    qkv, nh, n, hd, scale, angles, self.eps as f32, &mut d1, 1,
+                    qkv,
+                    nh,
+                    n,
+                    hd,
+                    scale,
+                    angles,
+                    self.eps as f32,
+                    &mut d1,
+                    1,
                 );
                 let ok0 = crate::gpu::vae_attention_packed_layout(
-                    qkv, nh, n, hd, scale, angles, self.eps as f32, &mut d0, 0,
+                    qkv,
+                    nh,
+                    n,
+                    hd,
+                    scale,
+                    angles,
+                    self.eps as f32,
+                    &mut d0,
+                    0,
                 );
                 let wrote = |v: &[f32]| v.iter().filter(|&&x| x != SENT).count();
                 let mut host = vec![0f32; attn.len()];
@@ -406,7 +439,11 @@ impl VideoVae {
                 let oks = crate::gpu::dit_split_only(qkv, nh, n, hd, 1, None, &mut sq);
                 let mut sqn = vec![SENT; nh * n * hd];
                 let okn = crate::gpu::dit_split_only(
-                    qkv, nh, n, hd, 1,
+                    qkv,
+                    nh,
+                    n,
+                    hd,
+                    1,
                     Some((angles, self.eps as f32)),
                     &mut sqn,
                 );
@@ -466,7 +503,14 @@ impl VideoVae {
             }
             if std::env::var("CMF_VAE3D_SPLIT").as_deref() == Ok("1")
                 && crate::gpu::vae_attention_packed(
-                    qkv, nh, n, hd, scale, angles, self.eps as f32, attn,
+                    qkv,
+                    nh,
+                    n,
+                    hd,
+                    scale,
+                    angles,
+                    self.eps as f32,
+                    attn,
                 )
             {
                 return;
@@ -488,9 +532,8 @@ impl VideoVae {
                             let dst = (h * n + p) * hd;
                             // SAFETY: disjoint token ranges per worker,
                             // and each token owns its own head slots.
-                            let (q, k, v) = unsafe {
-                                (pq.row(dst, hd), pk.row(dst, hd), pv.row(dst, hd))
-                            };
+                            let (q, k, v) =
+                                unsafe { (pq.row(dst, hd), pk.row(dst, hd), pv.row(dst, hd)) };
                             q.copy_from_slice(&qkv[base..base + hd]);
                             k.copy_from_slice(&qkv[base + hd..base + 2 * hd]);
                             v.copy_from_slice(&qkv[base + 2 * hd..base + 3 * hd]);
@@ -715,26 +758,26 @@ impl VideoVae {
                 vprof(1, t);
             }
             if !fused {
-            blk.qkv.matmat(&xn, n, &mut qkv, pool);
-            {
-                let pq = SendPtr(qkv.as_mut_ptr());
-                rows_par(pool, n, &|lo, hi| {
-                    for p in lo..hi {
-                        // SAFETY: disjoint token rows.
-                        for (v, &b) in unsafe { pq.row(p * 3 * dim, 3 * dim) }
-                            .iter_mut()
-                            .zip(&blk.qkv_b)
-                        {
-                            *v += b;
+                blk.qkv.matmat(&xn, n, &mut qkv, pool);
+                {
+                    let pq = SendPtr(qkv.as_mut_ptr());
+                    rows_par(pool, n, &|lo, hi| {
+                        for p in lo..hi {
+                            // SAFETY: disjoint token rows.
+                            for (v, &b) in unsafe { pq.row(p * 3 * dim, 3 * dim) }
+                                .iter_mut()
+                                .zip(&blk.qkv_b)
+                            {
+                                *v += b;
+                            }
                         }
-                    }
-                });
-            }
-            vprof(1, t);
-            self.attention(&qkv, n, &mut attn, &angles);
-            let t = std::time::Instant::now();
-            blk.out.matmat(&attn, n, &mut proj, pool);
-            vprof(4, t);
+                    });
+                }
+                vprof(1, t);
+                self.attention(&qkv, n, &mut attn, &angles);
+                let t = std::time::Instant::now();
+                blk.out.matmat(&attn, n, &mut proj, pool);
+                vprof(4, t);
             }
             {
                 let pxx = SendPtr(x.as_mut_ptr());
@@ -772,9 +815,7 @@ impl VideoVae {
                 && n >= 64
             {
                 if let (Proj::Q(q1), Proj::Q(q2)) = (&blk.w1, &blk.w2) {
-                    if let (Some((m, i1)), Some((_, i2))) =
-                        (q1.mapped_q4tp(), q2.mapped_q4tp())
-                    {
+                    if let (Some((m, i1)), Some((_, i2))) = (q1.mapped_q4tp(), q2.mapped_q4tp()) {
                         let mut fout = vec![0f32; n * dim];
                         if crate::gpu::q4tp_ffn_packed(
                             m,
@@ -868,14 +909,15 @@ impl VideoVae {
         for ti in 0..t {
             for hi in 0..h {
                 for wi in 0..w {
-                    let src = &out[((ti * h + hi) * w + wi) * od..((ti * h + hi) * w + wi + 1) * od];
+                    let src =
+                        &out[((ti * h + hi) * w + wi) * od..((ti * h + hi) * w + wi + 1) * od];
                     for c in 0..3 {
                         for a in 0..pt {
                             for b in 0..ps {
                                 for d in 0..ps {
                                     px[((c * ot + ti * pt + a) * oh + hi * ps + b) * ow
-                                        + wi * ps + d] =
-                                        src[((c * pt + a) * ps + b) * ps + d];
+                                        + wi * ps
+                                        + d] = src[((c * pt + a) * ps + b) * ps + d];
                                 }
                             }
                         }
@@ -1109,7 +1151,16 @@ fn pad_frames(t_lat: usize, pad: usize, chunk_tokens: usize, ratio_t: usize) -> 
 
 /// `[3, f, h, w]` sub-rectangle.
 #[allow(clippy::too_many_arguments)]
-fn crop(x: &[f32], f: usize, h: usize, w: usize, y0: usize, y1: usize, x0: usize, x1: usize) -> Vec<f32> {
+fn crop(
+    x: &[f32],
+    f: usize,
+    h: usize,
+    w: usize,
+    y0: usize,
+    y1: usize,
+    x0: usize,
+    x1: usize,
+) -> Vec<f32> {
     let (nh, nw) = (y1 - y0, x1 - x0);
     let mut out = vec![0f32; 3 * f * nh * nw];
     for c in 0..3 {
@@ -1128,7 +1179,15 @@ fn crop(x: &[f32], f: usize, h: usize, w: usize, y0: usize, y1: usize, x0: usize
 /// 3 = x); the result is `b` with its first `extent` rows/columns
 /// replaced by the blend.
 #[allow(clippy::too_many_arguments)]
-fn blend(a: &[f32], b: &[f32], f: usize, h: usize, w: usize, extent: usize, dim: usize) -> Vec<f32> {
+fn blend(
+    a: &[f32],
+    b: &[f32],
+    f: usize,
+    h: usize,
+    w: usize,
+    extent: usize,
+    dim: usize,
+) -> Vec<f32> {
     let ah = a.len() / (3 * f * w);
     let aw = a.len() / (3 * f * h);
     let mut out = b.to_vec();
@@ -1292,7 +1351,13 @@ impl EncConv {
     }
 
     /// `x` is `[in_ch, h, w]`; reflect-padded by `self.pad` on each side.
-    fn apply(&self, x: &[f32], h: usize, w: usize, pool: Option<&Pool>) -> (Vec<f32>, usize, usize) {
+    fn apply(
+        &self,
+        x: &[f32],
+        h: usize,
+        w: usize,
+        pool: Option<&Pool>,
+    ) -> (Vec<f32>, usize, usize) {
         let (ph, pw) = (h + 2 * self.pad, w + 2 * self.pad);
         let oh = (ph - self.k) / self.stride + 1;
         let ow = (pw - self.k) / self.stride + 1;
@@ -1568,10 +1633,26 @@ impl VideoVaeEncoder {
                 let mut tile = rows[i][j].clone();
                 let (mut ch_, mut cw_) = (th, tw);
                 if i > 0 {
-                    tile = blend_plane(&rows[i - 1][j], &tile, zc, dims[i - 1][j], (ch_, cw_), yo[i - 1] / r, 0);
+                    tile = blend_plane(
+                        &rows[i - 1][j],
+                        &tile,
+                        zc,
+                        dims[i - 1][j],
+                        (ch_, cw_),
+                        yo[i - 1] / r,
+                        0,
+                    );
                 }
                 if j > 0 {
-                    tile = blend_plane(&rows[i][j - 1], &tile, zc, dims[i][j - 1], (ch_, cw_), xo[j - 1] / r, 1);
+                    tile = blend_plane(
+                        &rows[i][j - 1],
+                        &tile,
+                        zc,
+                        dims[i][j - 1],
+                        (ch_, cw_),
+                        xo[j - 1] / r,
+                        1,
+                    );
                 }
                 if i + 1 < rows.len() {
                     tile = crop_plane(&tile, zc, ch_, cw_, 0, ch_ - yo[i] / r, 0, cw_);
@@ -1634,7 +1715,11 @@ fn blend_plane(
     let (ah, aw) = ad;
     let (bh, bw) = bd;
     let mut out = b.to_vec();
-    let e = if dim == 0 { extent.min(ah).min(bh) } else { extent.min(aw).min(bw) };
+    let e = if dim == 0 {
+        extent.min(ah).min(bh)
+    } else {
+        extent.min(aw).min(bw)
+    };
     if e == 0 {
         return out;
     }
@@ -1662,7 +1747,16 @@ fn blend_plane(
 
 /// `[c, h, w]` sub-rectangle.
 #[allow(clippy::too_many_arguments)]
-fn crop_plane(x: &[f32], c: usize, h: usize, w: usize, y0: usize, y1: usize, x0: usize, x1: usize) -> Vec<f32> {
+fn crop_plane(
+    x: &[f32],
+    c: usize,
+    h: usize,
+    w: usize,
+    y0: usize,
+    y1: usize,
+    x0: usize,
+    x1: usize,
+) -> Vec<f32> {
     let (nh, nw) = (y1 - y0, x1 - x0);
     let mut out = vec![0f32; c * nh * nw];
     for ci in 0..c {

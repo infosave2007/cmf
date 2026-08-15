@@ -28,10 +28,10 @@ pub mod client;
 pub mod nodestat;
 pub mod worker;
 
-pub use client::{generate_split, prefill_on_peer, RemoteSegment, SessionSpec, SplitStats};
-pub use beacon::{discover, Beacon, Found};
+pub use beacon::{Beacon, Found, discover};
+pub use client::{RemoteSegment, SessionSpec, SplitStats, generate_split, prefill_on_peer};
 pub use nodestat::NodeStats;
-pub use worker::{worker_serve, WorkerConfig};
+pub use worker::{WorkerConfig, worker_serve};
 
 use cortiq_core::quant::{f16_to_f32, f32_to_f16};
 use serde::{Deserialize, Serialize};
@@ -131,7 +131,9 @@ pub enum Frame {
         hidden_size: u32,
     },
     /// Worker's verdict on Hello / Assign / Reset. Empty `err` = accepted.
-    Ack { err: String },
+    Ack {
+        err: String,
+    },
     /// Layer span [from ..= upto] this worker runs, the payload dtype
     /// BOTH directions use from here on, and the session configuration:
     /// skill overlay id (worker reloads its pipeline with it), task-mask
@@ -163,7 +165,9 @@ pub enum Frame {
     /// v5, head mode only: the id history the sampler's repetition
     /// penalty reads. Sent once per generation, before the first Step;
     /// the worker appends every id it samples after that.
-    Ids { ids: Vec<u32> },
+    Ids {
+        ids: Vec<u32>,
+    },
     /// Fresh sequence on the worker (clears its KV and state).
     Reset,
     /// Prefill barrier: the worker replies `Hidden` with the output of
@@ -174,14 +178,19 @@ pub enum Frame {
     /// v7: send this layer range's KV and recurrent state home. The
     /// worker answers `Ack` (empty = accepted) and then one `Kv` frame
     /// per layer, in order.
-    KvFetch { from: u32, upto: u32 },
+    KvFetch {
+        from: u32,
+        upto: u32,
+    },
     /// v5: ask the worker what it is worth right now. Cheap enough to
     /// send between turns; the answer is measured, never declared.
     Stats,
     /// v5: the worker's live capacity signals.
     StatsReply(crate::nodestat::NodeStats),
     /// Fatal worker-side error; the connection closes after this frame.
-    Err { msg: String },
+    Err {
+        msg: String,
+    },
 }
 
 /// O(1)-attention (Nyström) config on the wire — the CLI flag set,
@@ -200,25 +209,41 @@ pub struct O1Wire {
 #[derive(Debug)]
 pub enum Msg {
     Control(Frame),
-    Step { pos: u64 },
+    Step {
+        pos: u64,
+    },
     Hidden,
-    Prefill { start_pos: u64, count: u32 },
+    Prefill {
+        start_pos: u64,
+        count: u32,
+    },
     /// v5: decode step carrying the token id itself — only legal when the
     /// worker holds layer 0 and does the embedding. v6 adds `want`: how
     /// many tokens the coordinator can still use, so a run-ahead batch
     /// never advances the worker's KV past what the caller will emit.
-    StepId { pos: u64, id: u32, want: u32 },
+    StepId {
+        pos: u64,
+        id: u32,
+        want: u32,
+    },
     /// v5: the worker's sampled token.
-    Token { id: u32 },
+    Token {
+        id: u32,
+    },
     /// v7: one layer's state. The payload is NOT copied — it stays in the
     /// caller's `raw` scratch at `raw[5..]`, because a whole cache is
     /// hundreds of megabytes and copying it twice is the difference
     /// between a transfer and an out-of-memory.
-    Kv { layer: u32 },
+    Kv {
+        layer: u32,
+    },
     /// v6: the run-ahead batch. Fewer than requested means the worker
     /// stopped early — end of sequence — and the coordinator must not
     /// ask for more.
-    Tokens { ids: Vec<u32>, eos: bool },
+    Tokens {
+        ids: Vec<u32>,
+        eos: bool,
+    },
 }
 
 fn spin_budget_us() -> u64 {
@@ -308,7 +333,9 @@ fn pop_floats(body: &[u8], dtype: WireDtype, floats: &mut Vec<f32>) -> Result<()
 fn ship(stream: &mut TcpStream, raw: &mut Vec<u8>) -> Result<(), String> {
     let len = raw.len() as u64 - 4;
     if len > MAX_FRAME as u64 {
-        return Err(format!("wire encode: frame {len} B exceeds cap {MAX_FRAME} B"));
+        return Err(format!(
+            "wire encode: frame {len} B exceeds cap {MAX_FRAME} B"
+        ));
     }
     raw[0..4].copy_from_slice(&(len as u32).to_le_bytes());
     stream
@@ -482,12 +509,20 @@ pub fn recv_msg(
             if body.len() < 8 {
                 return Err("Step frame truncated".into());
             }
-            let dt = if tag == TAG_STEP_F32 { WireDtype::F32 } else { WireDtype::F16 };
+            let dt = if tag == TAG_STEP_F32 {
+                WireDtype::F32
+            } else {
+                WireDtype::F16
+            };
             pop_floats(&body[8..], dt, floats)?;
             Ok(Some(Msg::Step { pos: rd_u64(body) }))
         }
         TAG_HIDDEN_F32 | TAG_HIDDEN_F16 => {
-            let dt = if tag == TAG_HIDDEN_F32 { WireDtype::F32 } else { WireDtype::F16 };
+            let dt = if tag == TAG_HIDDEN_F32 {
+                WireDtype::F32
+            } else {
+                WireDtype::F16
+            };
             pop_floats(body, dt, floats)?;
             Ok(Some(Msg::Hidden))
         }
@@ -495,7 +530,11 @@ pub fn recv_msg(
             if body.len() < 12 {
                 return Err("Prefill frame truncated".into());
             }
-            let dt = if tag == TAG_PREFILL_F32 { WireDtype::F32 } else { WireDtype::F16 };
+            let dt = if tag == TAG_PREFILL_F32 {
+                WireDtype::F32
+            } else {
+                WireDtype::F16
+            };
             pop_floats(&body[12..], dt, floats)?;
             Ok(Some(Msg::Prefill {
                 start_pos: rd_u64(body),
@@ -518,7 +557,9 @@ pub fn recv_msg(
                 return Err("Kv frame truncated".into());
             }
             floats.clear();
-            Ok(Some(Msg::Kv { layer: rd_u32(body) }))
+            Ok(Some(Msg::Kv {
+                layer: rd_u32(body),
+            }))
         }
         TAG_TOKENS => {
             if body.len() < 5 {
@@ -527,7 +568,10 @@ pub fn recv_msg(
             let eos = body[0] != 0;
             let n = rd_u32(&body[1..]) as usize;
             if body.len() < 5 + n * 4 {
-                return Err(format!("Tokens frame claims {n} ids, body is {} B", body.len()));
+                return Err(format!(
+                    "Tokens frame claims {n} ids, body is {} B",
+                    body.len()
+                ));
             }
             let ids = (0..n).map(|i| rd_u32(&body[5 + i * 4..])).collect();
             floats.clear();

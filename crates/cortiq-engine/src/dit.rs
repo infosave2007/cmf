@@ -99,12 +99,14 @@ impl Proj {
     pub(crate) fn matvec_rows(&self, xs: &[f32], b: usize, out: &mut [f32], pool: Option<&Pool>) {
         let (rows, cols) = (self.rows(), self.cols());
         match self {
-            Proj::F32 { w, .. } => {
-                crate::fcd_ops::gemm_nt(xs, w, out, b, cols, rows, pool)
-            }
+            Proj::F32 { w, .. } => crate::fcd_ops::gemm_nt(xs, w, out, b, cols, rows, pool),
             Proj::Q(q) => {
                 for i in 0..b {
-                    q.matvec(&xs[i * cols..(i + 1) * cols], &mut out[i * rows..(i + 1) * rows], pool);
+                    q.matvec(
+                        &xs[i * cols..(i + 1) * cols],
+                        &mut out[i * rows..(i + 1) * rows],
+                        pool,
+                    );
                 }
             }
         }
@@ -845,7 +847,6 @@ impl NextDit {
         true
     }
 
-
     /// Full bidirectional attention over ONE sequence: per head, pack
     /// q/k/v, scores as a GEMM, row softmax, P·V, scatter back. Lifted
     /// out of the block so a batched call can run it per segment
@@ -862,72 +863,70 @@ impl NextDit {
         let (nh, nkv, hd) = (self.nh, self.nkv, self.hd);
         let hpk = nh / nkv;
         let pool = self.pool.as_deref();
-            let mut qh = vec![0f32; n * hd];
-            let mut kh = vec![0f32; n * hd];
-            let mut vt = vec![0f32; hd * n]; // V transposed: gemm_nt's W layout
-            let mut scores = vec![0f32; n * n];
-            let mut oh = vec![0f32; n * hd];
-            for hh in 0..nh {
-                let kv = hh / hpk;
-                {
-                    let _s = prof::span(prof::APACK);
-                    let (sq, sk, sv) = (
-                        SendRows(qh.as_mut_ptr()),
-                        SendRows(kh.as_mut_ptr()),
-                        SendRows(vt.as_mut_ptr()),
-                    );
-                    pool_rows(pool, n, &|start, end| {
-                        for p in start..end {
-                            let qsrc = &q_all[(p * nh + hh) * hd..(p * nh + hh + 1) * hd];
-                            // SAFETY: workers cover disjoint token ranges
-                            // (`vt` columns are indexed by token too).
-                            let qd = unsafe { sq.row(p * hd, hd) };
-                            for (d, &v) in qsrc.iter().enumerate() {
-                                qd[d] = v * scale;
-                            }
-                            unsafe { sk.row(p * hd, hd) }.copy_from_slice(
-                                &k_all[(p * nkv + kv) * hd..(p * nkv + kv + 1) * hd],
-                            );
-                            let vv = &v_all[(p * nkv + kv) * hd..(p * nkv + kv + 1) * hd];
-                            for (d, &val) in vv.iter().enumerate() {
-                                unsafe { sv.set(d * n + p, val) };
-                            }
-                        }
-                    });
-                }
-                {
-                    let _s = prof::span(prof::AQK);
-                    crate::fcd_ops::gemm_nt(&qh, &kh, &mut scores, n, hd, n, pool);
-                }
-                {
-                    let _s = prof::span(prof::SOFTMAX);
-                    let sp = SendRows(scores.as_mut_ptr());
-                    let soft = |start: usize, end: usize| {
-                        for r in start..end {
-                            // SAFETY: workers cover disjoint row ranges.
-                            softmax_inplace(unsafe { sp.row(r * n, n) });
-                        }
-                    };
-                    match pool {
-                        Some(p) => p.run_rows(n, &soft),
-                        None => soft(0, n),
-                    }
-                }
-                {
-                    let _s = prof::span(prof::APV);
-                    crate::fcd_ops::gemm_nt(&scores, &vt, &mut oh, n, n, hd, pool);
-                }
+        let mut qh = vec![0f32; n * hd];
+        let mut kh = vec![0f32; n * hd];
+        let mut vt = vec![0f32; hd * n]; // V transposed: gemm_nt's W layout
+        let mut scores = vec![0f32; n * n];
+        let mut oh = vec![0f32; n * hd];
+        for hh in 0..nh {
+            let kv = hh / hpk;
+            {
                 let _s = prof::span(prof::APACK);
-                let sa = SendRows(attn.as_mut_ptr());
+                let (sq, sk, sv) = (
+                    SendRows(qh.as_mut_ptr()),
+                    SendRows(kh.as_mut_ptr()),
+                    SendRows(vt.as_mut_ptr()),
+                );
                 pool_rows(pool, n, &|start, end| {
                     for p in start..end {
-                        // SAFETY: workers cover disjoint token ranges.
-                        unsafe { sa.row((p * nh + hh) * hd, hd) }
-                            .copy_from_slice(&oh[p * hd..(p + 1) * hd]);
+                        let qsrc = &q_all[(p * nh + hh) * hd..(p * nh + hh + 1) * hd];
+                        // SAFETY: workers cover disjoint token ranges
+                        // (`vt` columns are indexed by token too).
+                        let qd = unsafe { sq.row(p * hd, hd) };
+                        for (d, &v) in qsrc.iter().enumerate() {
+                            qd[d] = v * scale;
+                        }
+                        unsafe { sk.row(p * hd, hd) }
+                            .copy_from_slice(&k_all[(p * nkv + kv) * hd..(p * nkv + kv + 1) * hd]);
+                        let vv = &v_all[(p * nkv + kv) * hd..(p * nkv + kv + 1) * hd];
+                        for (d, &val) in vv.iter().enumerate() {
+                            unsafe { sv.set(d * n + p, val) };
+                        }
                     }
                 });
             }
-        
+            {
+                let _s = prof::span(prof::AQK);
+                crate::fcd_ops::gemm_nt(&qh, &kh, &mut scores, n, hd, n, pool);
+            }
+            {
+                let _s = prof::span(prof::SOFTMAX);
+                let sp = SendRows(scores.as_mut_ptr());
+                let soft = |start: usize, end: usize| {
+                    for r in start..end {
+                        // SAFETY: workers cover disjoint row ranges.
+                        softmax_inplace(unsafe { sp.row(r * n, n) });
+                    }
+                };
+                match pool {
+                    Some(p) => p.run_rows(n, &soft),
+                    None => soft(0, n),
+                }
+            }
+            {
+                let _s = prof::span(prof::APV);
+                crate::fcd_ops::gemm_nt(&scores, &vt, &mut oh, n, n, hd, pool);
+            }
+            let _s = prof::span(prof::APACK);
+            let sa = SendRows(attn.as_mut_ptr());
+            pool_rows(pool, n, &|start, end| {
+                for p in start..end {
+                    // SAFETY: workers cover disjoint token ranges.
+                    unsafe { sa.row((p * nh + hh) * hd, hd) }
+                        .copy_from_slice(&oh[p * hd..(p + 1) * hd]);
+                }
+            });
+        }
     }
 
     fn block_forward(
@@ -1060,8 +1059,18 @@ impl NextDit {
                 {
                     match (q.model_arc(), q.model_idx(), k.model_idx(), v.model_idx()) {
                         (Some(m), Some(iq), Some(ik), Some(iv)) => crate::gpu::dit_qkv(
-                            &m, iq, ik, iv, &xn, n, hs, nh * hd, nkv * hd, &mut q_all,
-                            &mut k_all, &mut v_all,
+                            &m,
+                            iq,
+                            ik,
+                            iv,
+                            &xn,
+                            n,
+                            hs,
+                            nh * hd,
+                            nkv * hd,
+                            &mut q_all,
+                            &mut k_all,
+                            &mut v_all,
                         ),
                         _ => false,
                     }
@@ -1172,7 +1181,7 @@ impl NextDit {
         }
         let _modnorm = prof::span(prof::MODNORM);
         residual(&d_all, &blk.ffn_norm2, gate_mlp.as_deref(), x);
-            false
+        false
     }
 
     /// One denoising forward: latent `[c, h, w]` (NCHW), caption
@@ -1266,7 +1275,8 @@ impl NextDit {
             }
         }
         let mut img = vec![0f32; n_img * hs];
-        self.x_emb.matmat(&tok, n_img, &mut img, self.pool.as_deref());
+        self.x_emb
+            .matmat(&tok, n_img, &mut img, self.pool.as_deref());
         for i in 0..n_img {
             for (v, &b) in img[i * hs..(i + 1) * hs].iter_mut().zip(&self.x_emb_b) {
                 *v += b;

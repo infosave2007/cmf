@@ -415,9 +415,7 @@ async fn chat_completions(
                                 .and_then(|f| f.get_mut("arguments"))
                             {
                                 if let Some(s) = args.as_str() {
-                                    if let Ok(v) =
-                                        serde_json::from_str::<serde_json::Value>(s)
-                                    {
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
                                         if v.is_object() {
                                             *args = v;
                                         }
@@ -451,7 +449,10 @@ async fn chat_completions(
                     m["content"] = serde_json::json!(format!("{directive}\n\n{cur}"));
                 }
             } else {
-                msgs.insert(0, serde_json::json!({"role": "system", "content": directive}));
+                msgs.insert(
+                    0,
+                    serde_json::json!({"role": "system", "content": directive}),
+                );
             }
         }
         eprintln!("[serve] msgs[0]={:?}", msgs.get(0));
@@ -532,8 +533,7 @@ async fn chat_completions(
                             tool_holding = true;
                             let before = tool_tail[..pos].to_string();
                             if !before.is_empty() {
-                                let chunk =
-                                    streaming::token_chunk(&id2, &model2, &before, created);
+                                let chunk = streaming::token_chunk(&id2, &model2, &before, created);
                                 return tx_tokens.blocking_send(chunk).is_ok();
                             }
                             return !tx_tokens.is_closed();
@@ -547,8 +547,7 @@ async fn chat_completions(
                                 .unwrap_or(0);
                             if safe_cut > 0 {
                                 let out: String = tool_tail.drain(..safe_cut).collect();
-                                let chunk =
-                                    streaming::token_chunk(&id2, &model2, &out, created);
+                                let chunk = streaming::token_chunk(&id2, &model2, &out, created);
                                 return tx_tokens.blocking_send(chunk).is_ok();
                             }
                         }
@@ -755,8 +754,6 @@ async fn chat_completions(
     }
 }
 
-
-
 /// Small-model fallback: the whole reply is ONE bare JSON object that
 /// names a REQUESTED tool. Qwen-family minis often emit the call
 /// without its <tool_call> wrapper; vLLM and llama.cpp both accept
@@ -788,7 +785,6 @@ fn bare_call_fallback(text: &str, allowed: &[String]) -> Option<serde_json::Valu
         }
     }))
 }
-
 
 /// Nanbeige's XML tool grammar, normalised to the JSON shape:
 /// `<function=NAME>\n<parameter=K>\nV\n</parameter>...</function>`.
@@ -994,17 +990,22 @@ mod tests {
 
     #[test]
     fn tool_calls_malformed_body_stays_text() {
-        let (text, calls) =
-            extract_tool_calls("<tool_call>\nnot json at all\n</tool_call> done");
+        let (text, calls) = extract_tool_calls("<tool_call>\nnot json at all\n</tool_call> done");
         assert!(calls.is_empty());
-        assert!(text.contains("not json at all"), "broken call must stay readable text");
+        assert!(
+            text.contains("not json at all"),
+            "broken call must stay readable text"
+        );
     }
 
     #[test]
     fn tool_calls_unterminated_stays_text() {
         let (text, calls) = extract_tool_calls("<tool_call>\n{\"name\": \"a\"");
         assert!(calls.is_empty());
-        assert!(text.contains("<tool_call>"), "truncated output must not vanish");
+        assert!(
+            text.contains("<tool_call>"),
+            "truncated output must not vanish"
+        );
     }
 
     use super::*;
@@ -1041,7 +1042,10 @@ mod tests {
                  {"type":"text","text":"the question"}]}"#,
         )
         .unwrap();
-        assert_eq!(blocks.content.as_ref().unwrap().text(), "file context\nthe question");
+        assert_eq!(
+            blocks.content.as_ref().unwrap().text(),
+            "file context\nthe question"
+        );
 
         // A non-text block must not fail the turn — it contributes nothing.
         let mixed: ChatMessage = serde_json::from_str(

@@ -48,7 +48,12 @@ pub fn avae_time_report() -> Option<String> {
         return None;
     }
     const NAMES: [&str; 6] = [
-        "dec_in", "conv_pre", "upsamples", "resblocks", "act_post", "conv_post",
+        "dec_in",
+        "conv_pre",
+        "upsamples",
+        "resblocks",
+        "act_post",
+        "conv_post",
     ];
     let mut v: Vec<(u64, &str)> = AVAE_TIME
         .iter()
@@ -88,7 +93,12 @@ struct Conv1d {
 }
 
 impl Conv1d {
-    fn load(model: &Arc<CmfModel>, name: &str, pad: usize, dilation: usize) -> Result<Self, String> {
+    fn load(
+        model: &Arc<CmfModel>,
+        name: &str,
+        pad: usize,
+        dilation: usize,
+    ) -> Result<Self, String> {
         let e = model
             .tensor(&format!("{name}.weight"))
             .ok_or_else(|| format!("missing {name}.weight"))?;
@@ -144,9 +154,7 @@ impl Conv1d {
         // with W already `[out_ch × in_ch·k]` in the order this loop
         // reads it. Opt-in (`CMF_AVAE_CONV_GPU=1`) until measured — the
         // column buffer is in_ch·k × out_n floats, which is the price.
-        if std::env::var("CMF_AVAE_CONV_GPU").as_deref() != Ok("0")
-            && crate::gpu::enabled_here()
-        {
+        if std::env::var("CMF_AVAE_CONV_GPU").as_deref() != Ok("0") && crate::gpu::enabled_here() {
             let kk = self.in_ch * self.k;
             // First ask the device to expand the columns itself. That is
             // strictly less work than the host arm below: `x` is k times
@@ -291,7 +299,8 @@ impl Conv1d {
                 let bias = self.b.as_ref().map_or(0.0, |b| b[o]);
                 dst.fill(bias);
                 for i in 0..self.in_ch {
-                    let ker = &self.w[(o * self.in_ch + i) * self.k..(o * self.in_ch + i + 1) * self.k];
+                    let ker =
+                        &self.w[(o * self.in_ch + i) * self.k..(o * self.in_ch + i + 1) * self.k];
                     let src = &x[i * n..(i + 1) * n];
                     for (tt, d) in dst.iter_mut().enumerate() {
                         let t = t0 + tt;
@@ -353,7 +362,8 @@ impl ConvT1d {
                 let dst = unsafe { ptr.row(o * out_n, out_n) };
                 dst.fill(self.b[o]);
                 for i in 0..self.in_ch {
-                    let ker = &self.w[(i * self.out_ch + o) * self.k..(i * self.out_ch + o + 1) * self.k];
+                    let ker =
+                        &self.w[(i * self.out_ch + o) * self.k..(i * self.out_ch + o + 1) * self.k];
                     let src = &x[i * n..(i + 1) * n];
                     for (t, &sv) in src.iter().enumerate() {
                         if sv == 0.0 {
@@ -500,9 +510,7 @@ impl Music3Dav {
             stages: Self::STRIDES
                 .iter()
                 .enumerate()
-                .map(|(i, &s)| {
-                    DavStage::load(model, &format!("mvae.decoder.model.{}", i + 1), s)
-                })
+                .map(|(i, &s)| DavStage::load(model, &format!("mvae.decoder.model.{}", i + 1), s))
                 .collect::<Result<_, _>>()?,
             act_post: Snake::load(model, "mvae.decoder.model.5")?,
             conv_post: Conv1d::load(model, "mvae.decoder.model.6", 3, 1)?,
@@ -757,7 +765,16 @@ impl Activation1d {
         }
         self.act.apply(&mut mid, keep);
         // LowPassFilter1d at stride 2: even kernel pads 5 left, 6 right.
-        fir_pad(&mid, ch, keep, &self.down, FILTER_LEN / 2 - 1, FILTER_LEN / 2, 2, pool)
+        fir_pad(
+            &mid,
+            ch,
+            keep,
+            &self.down,
+            FILTER_LEN / 2 - 1,
+            FILTER_LEN / 2,
+            2,
+            pool,
+        )
     }
 }
 
@@ -788,7 +805,9 @@ fn get_padding(k: usize, d: usize) -> usize {
 impl AudioVae {
     pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
         let cfg: serde_json::Value = serde_json::from_slice(
-            model.tensor_bytes("avae.config_json").map_err(|e| e.to_string())?,
+            model
+                .tensor_bytes("avae.config_json")
+                .map_err(|e| e.to_string())?,
         )
         .map_err(|e| format!("avae.config_json: {e}"))?;
         let rates: Vec<usize> = cfg["upsample_rates"]
@@ -825,7 +844,14 @@ impl AudioVae {
             for (j, (&k, d)) in rk.iter().zip(&rd).enumerate() {
                 let p = format!("avae.decoder.resblocks.{}", i * rk.len() + j);
                 let convs1 = (0..d.len())
-                    .map(|q| Conv1d::load(model, &format!("{p}.convs1.{q}"), get_padding(k, d[q]), d[q]))
+                    .map(|q| {
+                        Conv1d::load(
+                            model,
+                            &format!("{p}.convs1.{q}"),
+                            get_padding(k, d[q]),
+                            d[q],
+                        )
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 let convs2 = (0..d.len())
                     .map(|q| Conv1d::load(model, &format!("{p}.convs2.{q}"), get_padding(k, 1), 1))
@@ -833,7 +859,11 @@ impl AudioVae {
                 let acts = (0..convs1.len() + convs2.len())
                     .map(|q| Activation1d::load(model, &format!("{p}.activations.{q}")))
                     .collect::<Result<Vec<_>, _>>()?;
-                resblocks.push(AmpBlock { convs1, convs2, acts });
+                resblocks.push(AmpBlock {
+                    convs1,
+                    convs2,
+                    acts,
+                });
             }
         }
         Ok(Self {
@@ -891,9 +921,9 @@ impl AudioVae {
             // `CMF_AVAE_PROF=1`: per-stage rms, to diff against the
             // reference stage by stage rather than at the waveform.
             let prof = std::env::var_os("CMF_AVAE_PROF").is_some();
-            let rms = |x: &[f32]| (x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>()
-                / x.len() as f64)
-                .sqrt();
+            let rms = |x: &[f32]| {
+                (x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / x.len() as f64).sqrt()
+            };
             let tt = std::time::Instant::now();
             let mut x = self.dec_in.apply(&lat, t, pool);
             atime(0, tt);
@@ -1029,11 +1059,20 @@ mod tests {
         // Silence would also satisfy the above; a working stack moves.
         let rms = (pcm.iter().map(|v| v * v).sum::<f32>() / pcm.len() as f32).sqrt();
         assert!(rms > 1e-4, "decoded to near-silence, rms {rms}");
-        let (l, r): (Vec<f32>, Vec<f32>) =
-            pcm.chunks_exact(2).map(|c| (c[0], c[1])).unzip();
-        let d = l.iter().zip(&r).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-        assert!(d > 0.0, "both sides identical — the 128 latent was not split");
-        eprintln!("music3 dav: {} samples/side, rms {rms:.4}, L-R max {d:.4}", l.len());
+        let (l, r): (Vec<f32>, Vec<f32>) = pcm.chunks_exact(2).map(|c| (c[0], c[1])).unzip();
+        let d = l
+            .iter()
+            .zip(&r)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            d > 0.0,
+            "both sides identical — the 128 latent was not split"
+        );
+        eprintln!(
+            "music3 dav: {} samples/side, rms {rms:.4}, L-R max {d:.4}",
+            l.len()
+        );
     }
 
     #[test]
@@ -1045,11 +1084,13 @@ mod tests {
         assert!((f.iter().sum::<f32>() - 1.0).abs() < 1e-6);
         // Symmetric about the centre, and its peak is at the centre.
         for i in 0..FILTER_LEN / 2 {
-            assert!((f[i] - f[FILTER_LEN - 1 - i]).abs() < 1e-6, "asymmetric at {i}");
+            assert!(
+                (f[i] - f[FILTER_LEN - 1 - i]).abs() < 1e-6,
+                "asymmetric at {i}"
+            );
         }
         let peak = f.iter().cloned().fold(f32::MIN, f32::max);
         assert!((f[5] - peak).abs() < 1e-6);
-
     }
 
     #[test]

@@ -39,7 +39,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         CmfModel::write(&out, &m.header, &tensors, None, m.vocab.as_deref())?;
         println!("wrote {out} with NO masks");
     } else {
-        CmfModel::write(&out, &m.header, &tensors, Some(&catalog), m.vocab.as_deref())?;
+        CmfModel::write(
+            &out,
+            &m.header,
+            &tensors,
+            Some(&catalog),
+            m.vocab.as_deref(),
+        )?;
         println!("wrote {out} with open head masks");
     }
     Ok(())

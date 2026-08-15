@@ -80,18 +80,42 @@ fn first_divergent_stage() {
         let st = &mut b.3;
         let pos0 = st.pos;
         let fed: Vec<u32> = (0..5u32)
-            .map(|i| if i == 0 { real } else { (real + 7 + i * 13) % vocab as u32 })
+            .map(|i| {
+                if i == 0 {
+                    real
+                } else {
+                    (real + 7 + i * 13) % vocab as u32
+                }
+            })
             .collect();
         let mut argmax = Vec::new();
         let mut lg_all = Vec::new();
         let mut walked = Vec::new();
         let txn = cortiq_engine::dsv4::dsv4_verify_chunk(
-            g, layers, &cfg, st, &fed, pos0, &g.inv_freq_window.clone(), None, &[],
-            &mut argmax, &mut lg_all, &mut walked,
+            g,
+            layers,
+            &cfg,
+            st,
+            &fed,
+            pos0,
+            &g.inv_freq_window.clone(),
+            None,
+            &[],
+            &mut argmax,
+            &mut lg_all,
+            &mut walked,
         )
         .expect("verify отказал");
         assert!(cortiq_engine::dsv4::dsv4_spec_finish(
-            g, layers, &cfg, st, txn, 1, &fed, &g.inv_freq_window.clone(), None,
+            g,
+            layers,
+            &cfg,
+            st,
+            txn,
+            1,
+            &fed,
+            &g.inv_freq_window.clone(),
+            None,
         ));
     }
     let nhhd = {

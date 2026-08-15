@@ -121,7 +121,7 @@ fn erf(x: f64) -> f64 {
                                 + t * (-1.135_203_98
                                     + t * (1.488_515_87
                                         + t * (-0.822_152_23 + t * 0.170_872_77)))))))))
-        .exp();
+            .exp();
     // `ans` is erfc(|x|); erfc is 2 − that on the negative side.
     if x >= 0.0 { 1.0 - ans } else { ans - 1.0 }
 }
@@ -167,7 +167,14 @@ impl Merger {
     }
 
     /// `[n, hidden]` → `[n/merge², out]`. `merge_dim = hidden·merge²`.
-    fn apply(&self, x: &[f32], n: usize, hidden: usize, merge_dim: usize, pool: Option<&Pool>) -> Vec<f32> {
+    fn apply(
+        &self,
+        x: &[f32],
+        n: usize,
+        hidden: usize,
+        merge_dim: usize,
+        pool: Option<&Pool>,
+    ) -> Vec<f32> {
         let groups = n * hidden / merge_dim;
         let mut buf = vec![0f32; n * hidden];
         if self.post_shuffle {
@@ -518,20 +525,20 @@ pub fn preprocess(
         for bbx in 0..gw / merge {
             for iy in 0..merge {
                 for ix in 0..merge {
-            let (by, bx) = (bby * merge + iy, bbx * merge + ix);
-            let dst = &mut out[k * per..(k + 1) * per];
-            k += 1;
-            let mut j = 0;
-            for c in 0..3 {
-                for _t in 0..temporal {
-                    for y in 0..patch {
-                        for x in 0..patch {
-                            dst[j] = img[(c * hb + by * patch + y) * wb + bx * patch + x];
-                            j += 1;
+                    let (by, bx) = (bby * merge + iy, bbx * merge + ix);
+                    let dst = &mut out[k * per..(k + 1) * per];
+                    k += 1;
+                    let mut j = 0;
+                    for c in 0..3 {
+                        for _t in 0..temporal {
+                            for y in 0..patch {
+                                for x in 0..patch {
+                                    dst[j] = img[(c * hb + by * patch + y) * wb + bx * patch + x];
+                                    j += 1;
+                                }
+                            }
                         }
                     }
-                }
-            }
                 }
             }
         }

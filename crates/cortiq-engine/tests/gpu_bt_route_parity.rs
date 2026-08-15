@@ -61,11 +61,7 @@ fn batched_routing_matches_the_single_router() {
                 &si[..],
                 "токен {t} (bias={use_bias}): другие эксперты"
             );
-            for (j, (a, e)) in bw[t * slots..(t + 1) * slots]
-                .iter()
-                .zip(&sw)
-                .enumerate()
-            {
+            for (j, (a, e)) in bw[t * slots..(t + 1) * slots].iter().zip(&sw).enumerate() {
                 assert!(
                     (a - e).abs() <= 1e-6 * e.abs().max(1.0),
                     "токен {t} слот {j} (bias={use_bias}): вес {a} против {e}"

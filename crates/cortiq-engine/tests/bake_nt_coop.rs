@@ -30,8 +30,12 @@ fn bake_gemm_matches_cpu_reference_on_tile_edges() {
     // (n, k, m): all past the size gate; 63 and 321 are deliberately not
     // multiples of the 64-wide tile, and 66_048 is past the scalar arm's
     // dispatch ceiling — the vocabulary-head case only the coop arm takes.
-    let shapes: [(usize, usize, usize); 4] =
-        [(64, 512, 320), (63, 512, 321), (256, 768, 1024), (64, 512, 66_048)];
+    let shapes: [(usize, usize, usize); 4] = [
+        (64, 512, 320),
+        (63, 512, 321),
+        (256, 768, 1024),
+        (64, 512, 66_048),
+    ];
     let mut ran = 0;
     for &(n, k, m) in &shapes {
         let x: Vec<f32> = (0..n * k)
@@ -347,8 +351,7 @@ fn bake_attn_chain_matches_host_reference() {
                 for c in 0..hd {
                     let mut acc = 0f64;
                     for j in 0..=ti {
-                        acc += sc[j] / den
-                            * vproj[(bi * t + j) * kvdim + gi * hd + c] as f64;
+                        acc += sc[j] / den * vproj[(bi * t + j) * kvdim + gi * hd + c] as f64;
                     }
                     ao[(bi * t + ti) * qdim + h * hd + c] = acc as f32;
                 }
@@ -368,7 +371,11 @@ fn bake_attn_chain_matches_host_reference() {
     }
     let cmp = |name: &str, a: &[f32], r: &[f32], tol: f32| {
         let scale = r.iter().fold(0f32, |m, v| m.max(v.abs()));
-        let worst = a.iter().zip(r).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let worst = a
+            .iter()
+            .zip(r)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
         assert!(
             worst <= tol * scale.max(1.0),
             "{name}: worst |Δ| {worst} (scale {scale})"
@@ -418,8 +425,7 @@ fn bake_ffn_bwd_chain_matches_host_composition() {
         return;
     }
     let mut dn2 = vec![0f32; n * hsz];
-    if !cortiq_engine::gpu_wgpu::ffn_bwd_chain_f32(&dh2, &down, &gu, li, &mut dn2, n, hsz, inter)
-    {
+    if !cortiq_engine::gpu_wgpu::ffn_bwd_chain_f32(&dh2, &down, &gu, li, &mut dn2, n, hsz, inter) {
         // The forward parked a plane; on a cooperative device the
         // backward must take it (a non-discrete adapter may not).
         eprintln!("bwd chain declined (uma adapter?) — skipped");

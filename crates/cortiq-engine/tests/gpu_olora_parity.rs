@@ -51,9 +51,8 @@ fn device_o_lora_a_matches_the_cpu() {
             }
 
             let mut gpu = vec![0.0f32; rows];
-            if !cortiq_engine::gpu_wgpu::o_lora_a_for_test(
-                &model, idx, &attn, rows, lora, &mut gpu,
-            ) {
+            if !cortiq_engine::gpu_wgpu::o_lora_a_for_test(&model, idx, &attn, rows, lora, &mut gpu)
+            {
                 eprintln!("устройство отказалось от {} — пропуск", e.name);
                 continue;
             }

@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The Qwen3.8-27B q4tp release, converted straight from the bf16
+checkpoint (streamed shard by shard from the hub — never re-coded
+from q4t: a second quantization is a quality cut). 14.27 GB against
+q4t's 15.43, wikitext-2 perplexity 8.793 against 8.857 on the same
+windows. Published to `infosave/Qwen3.8-27B-cmf` with its own
+aquarium example.
+
+### Added
+
+- **Speculative sampling on the token graph.** `CMF_GRAPH_SPEC=1`
+  used to engage for greedy only; now every sampler configuration
+  goes through draft-from-the-MTP-head's-own-distribution, accept
+  with min(1, p/q), correct from max(0, p − q) — the emitted stream is
+  distributed exactly as the plain sampler's (a 400k-trial test holds
+  the empirical law within L1 0.01 of the target). Greedy without
+  penalties keeps the bit-exact argmax verify. `CMF_GRAPH_SPEC_SAMPLE=0`
+  confines speculation to greedy again. Measured greedy on the RTX 5090
+  pod, q4tp: k=3 51.2 / k=4 51.8 tok/s against a plain 47.1.
+- **GQA-shared split-K decode attention** (`gqa_attend_gpart`): one
+  workgroup per (kv head, 256-position chunk) serves every query head
+  of the group, so a K/V row is read once instead of once per query
+  head — Qwen3.8 has six per kv head, and at 12k context the old
+  kernel streamed ~600 MB a layer against a 100 MB cache. Parity with
+  the CPU reference 2.7e-7 on the 5090. `CMF_ATTEND_GQA=0` reverts.
+- `run` prints first-token latency and decode tok/s separately — the
+  single number over the whole window read "6 tok/s" on a short
+  answer from a model that decodes at 45.
+- `CMF_MV16W=0`: the wide-row q4tp decode matvec on the 8-row pair
+  kernel (q4t's shape) for like-for-like kernel A/B.
+
+### Changed
+
+- **The sampler runs its whole-vocab passes over the CPU pool** and
+  finds top-k's threshold with a streaming k-slot heap instead of a
+  second vocab-sized copy and `select_nth`. Bit-identical token for
+  the same seed (tested); at Qwen3.8's 248k vocab the serial chain
+  had cost the production loop ~8% of the token.
+
+### Fixed
+
+- `bench --json weight_gb_per_token` divided the PROCESS total (warmup,
+  the timed prefill, the pair micro-bench) by the steady token count —
+  21.9 GB/token on a 15.4 GB file, a 1.5× "amplification" that was the
+  arithmetic. It is the steady-window delta now.
+
 ## [0.5.78] - 2026-08-15
 
 O(1) decode rides the whole-token graph. Two design requirements had

@@ -90,7 +90,11 @@ fn skill_keys_round_trip_and_raise_the_feature_bit() {
     CmfModel::write(
         &base_p,
         &header,
-        &[t("model.layers.0.mlp.down_proj.weight", 1), t("model.layers.1.mlp.down_proj.weight", 2), t("lm_head.weight", 3)],
+        &[
+            t("model.layers.0.mlp.down_proj.weight", 1),
+            t("model.layers.1.mlp.down_proj.weight", 2),
+            t("lm_head.weight", 3),
+        ],
         None,
         None,
     )
@@ -132,7 +136,10 @@ fn skill_keys_round_trip_and_raise_the_feature_bit() {
         "a bound skill record must raise the SKILL_FILE bit"
     );
     let rec = &skill.header.skills[0];
-    assert_eq!(rec.base_dir_hash.as_deref(), Some(format!("{:016x}", base.dir_hash()).as_str()));
+    assert_eq!(
+        rec.base_dir_hash.as_deref(),
+        Some(format!("{:016x}", base.dir_hash()).as_str())
+    );
     assert_eq!(rec.base_arch.as_deref(), Some("tiny-looped"));
     assert_eq!(rec.task.as_deref(), Some("specialist"));
     assert_eq!(rec.layers, vec![1]);

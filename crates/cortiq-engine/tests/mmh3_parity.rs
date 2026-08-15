@@ -103,7 +103,11 @@ fn keyframes_match_the_reference() {
     }
     let u = |k: &str| meta[k].as_u64().unwrap() as usize;
     let (text_len, latent_t, lat_h, lat_w, audio_t) = (
-        u("text_len"), u("latent_t"), u("lat_h"), u("lat_w"), u("audio_t"),
+        u("text_len"),
+        u("latent_t"),
+        u("lat_h"),
+        u("lat_w"),
+        u("audio_t"),
     );
     let fc = u("frame_count");
     let sigma = meta["sigma"].as_f64().unwrap();
@@ -114,7 +118,11 @@ fn keyframes_match_the_reference() {
     // rows at timestep 1.0 rather than 0.999.
     dit.cond_aug = 1.0;
     let layout = Layout::fl2va(
-        text_len, latent_t, lat_h, lat_w, audio_t,
+        text_len,
+        latent_t,
+        lat_h,
+        lat_w,
+        audio_t,
         &[(0, fc), (fc - 1, fc)],
         &[],
     );
@@ -173,7 +181,9 @@ fn reference_blocks_lay_out_like_the_reference() {
                     lat_h: g("latent_h"),
                     lat_w: g("latent_w"),
                 },
-                "audio" => cortiq_engine::mmh3::Ref::Audio { t: g("ref_audio_t") },
+                "audio" => cortiq_engine::mmh3::Ref::Audio {
+                    t: g("ref_audio_t"),
+                },
                 _ => cortiq_engine::mmh3::Ref::Video {
                     latent_t: g("latent_t"),
                     lat_h: g("latent_h"),
@@ -193,7 +203,11 @@ fn reference_blocks_lay_out_like_the_reference() {
         &refs,
         &[],
     );
-    assert_eq!(l.seq_len, seg["seq_len"].as_u64().unwrap() as usize, "row count");
+    assert_eq!(
+        l.seq_len,
+        seg["seq_len"].as_u64().unwrap() as usize,
+        "row count"
+    );
 
     let want_kinds: Vec<&str> = seg["segments"]
         .as_array()
@@ -215,8 +229,16 @@ fn reference_blocks_lay_out_like_the_reference() {
         .collect();
     assert_eq!(got_kinds, want_kinds, "segment kinds");
     for (i, s) in seg["segments"].as_array().unwrap().iter().enumerate() {
-        assert_eq!(l.segments[i].start, s[0].as_u64().unwrap() as usize, "seg {i} start");
-        assert_eq!(l.segments[i].stop, s[1].as_u64().unwrap() as usize, "seg {i} stop");
+        assert_eq!(
+            l.segments[i].start,
+            s[0].as_u64().unwrap() as usize,
+            "seg {i} start"
+        );
+        assert_eq!(
+            l.segments[i].stop,
+            s[1].as_u64().unwrap() as usize,
+            "seg {i} stop"
+        );
     }
 
     let want = read_f32(&dir.join("ref_pos.bin"));
@@ -232,6 +254,9 @@ fn reference_blocks_lay_out_like_the_reference() {
             }
         }
     }
-    println!("ref2va positions: {} rows, worst {worst:.3e} at row {at}", l.seq_len);
+    println!(
+        "ref2va positions: {} rows, worst {worst:.3e} at row {at}",
+        l.seq_len
+    );
     assert!(worst < 1e-5, "position {at} diverges by {worst:.3e}");
 }
