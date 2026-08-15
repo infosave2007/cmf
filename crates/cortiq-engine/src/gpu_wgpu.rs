@@ -27,6 +27,179 @@ const MAX_WG: u32 = 65_535;
 /// subgroups` fails validation on devices without the feature, and one
 /// invalid function kills every entry point of a module (0.5.40's Metal
 /// lesson, re-learned on Vulkan this afternoon).
+// The subgroup-reduction decode matvec, in its OWN module: `enable
+// subgroups` must never reach a device without the feature (the same
+// rule the MoE select follows). Bindings mirror the q4tp module
+// verbatim so the existing bind groups fit unchanged.
+const MV_SG_SRC: &str = r#"
+enable subgroups;
+
+struct Q1Params { np: u32, rows: u32, _p0: u32, _p1: u32 };
+@group(0) @binding(0) var<storage, read>       q1w : array<u32>;
+@group(0) @binding(1) var<storage, read>       q1x : array<f32>;
+@group(0) @binding(2) var<storage, read_write> q1y : array<f32>;
+@group(0) @binding(3) var<uniform>             q1p : Q1Params;
+@group(0) @binding(4) var<storage, read> q4v_w : array<vec4<u32>>;
+@group(0) @binding(5) var<storage, read> q4v_x : array<vec4<f32>>;
+
+var<workgroup> lad_q4v: array<f32, 256>;
+var<workgroup> sg_part: array<f32, 16>;
+
+fn q4tp_byte(off: u32) -> u32 {
+    return (q1w[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+fn q4v_dot8(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
+    return (f32(w & 0xFu) - 8.0) * a.x
+         + (f32((w >> 4u) & 0xFu) - 8.0) * a.y
+         + (f32((w >> 8u) & 0xFu) - 8.0) * a.z
+         + (f32((w >> 12u) & 0xFu) - 8.0) * a.w
+         + (f32((w >> 16u) & 0xFu) - 8.0) * b.x
+         + (f32((w >> 20u) & 0xFu) - 8.0) * b.y
+         + (f32((w >> 24u) & 0xFu) - 8.0) * b.z
+         + (f32((w >> 28u) & 0xFu) - 8.0) * b.w;
+}
+
+@compute @workgroup_size(256)
+fn q4tp_matvec4_sg(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(num_workgroups) nwg: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32,
+                @builtin(subgroup_invocation_id) sg_inv: u32,
+                @builtin(subgroup_size) ssz: u32) {
+    // Plain `enable subgroups` has no subgroup_id builtin — that is the
+    // cooperative-matrix extension's gift, and asking for it here is
+    // the validation error that took the whole device down (the init
+    // path had no error scope; it does now). Linear tiling makes the
+    // index arithmetic: lanes [i*ssz, (i+1)*ssz) are subgroup i.
+    let sg_id = lid / ssz;
+    let gpr = q1p.np;
+    let rows = q1p.rows;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    // 8 rows per workgroup, register-blocked in pairs: sub-block `sub` owns
+    // rows base+sub and base+sub+4, and every x vec4 fetched for a group
+    // feeds BOTH rows' dot chains — the x side of the LSU load nearly
+    // halves. Each row's group order and add order stay those of the
+    // one-row kernel.
+    // `_p0`: how many activation vectors share this weight. One is a matvec;
+    // more is a batch. The BATCH is the fast axis of the dispatch, so the
+    // workgroups that read the same weight rows are neighbours and meet in
+    // L2; walking the whole output space instead put them `rows/16` apart,
+    // which streams the weight once per batch element and defeats the point.
+    // Reuse is still L2's to give — this is not a register-blocked B kernel —
+    // so the win is a measurement, not a claim.
+    let nb = max(q1p._p0, 1u);
+    let blocks = (rows + 7u) / 8u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks * nb) { break; }
+        let bi = wb % nb;
+        let base = (wb / nb) * 8u;
+        let bofs = bi * rows;
+        {
+            let r = base + (lid >> 5u);
+            if (r < rows) {
+                let pr = unpack2x16float(q1w[params_w + r]);
+                lad_q4v[lid] = exp2(pr.x + f32(lid & 31u) * pr.y);
+            }
+        }
+        workgroupBarrier();
+        let wrow_a = base + sub;
+        let wrow_b = base + sub + 4u;
+        let row_a = bofs + wrow_a;
+        let row_b = bofs + wrow_b;
+        let live_a = wrow_a < rows;
+        let live_b = wrow_b < rows;
+        // In vec4 units: (row / lora) * gpr * 32 floats.
+        var xblk = 0u;
+        if (nb > 1u) { xblk = bi * gpr * 8u; }
+        else if (q1p._p1 > 0u) { xblk = (wrow_a / q1p._p1) * gpr * 8u; }
+        var acc_a = 0.0;
+        var acc_b = 0.0;
+        if (live_a) {
+            let crow_a = codes_b + wrow_a * cstride;
+            let crow_b = codes_b + wrow_b * cstride;
+            var g = l;
+            loop {
+                if (g >= gpr) { break; }
+                let bit = g * 5u;
+                let cbo = bit >> 3u;
+                let sh = bit & 7u;
+                var cv_a = q4tp_byte(crow_a + cbo);
+                if (sh > 3u) { cv_a = cv_a | (q4tp_byte(crow_a + cbo + 1u) << 8u); }
+                let v_a = q4v_w[wrow_a * gpr + g];
+                // `_p1` is the low-rank group width. Set, it slides the
+                // activation window with the row — which is the ONLY thing
+                // the grouped output projection does differently, and the
+                // reason it had a kernel of its own reading 3.82 ms against
+                // this one's 1.24 on comparable weights. Rows base..base+7
+                // share a window whenever the width is a multiple of 8, and
+                // the caller only takes this path then.
+                let xq = xblk + g * 8u;
+                let x0 = q4v_x[xq];      let x1 = q4v_x[xq + 1u];
+                let x2 = q4v_x[xq + 2u]; let x3 = q4v_x[xq + 3u];
+                let x4 = q4v_x[xq + 4u]; let x5 = q4v_x[xq + 5u];
+                let x6 = q4v_x[xq + 6u]; let x7 = q4v_x[xq + 7u];
+                let sa = lad_q4v[(sub << 5u) + ((cv_a >> sh) & 31u)];
+                acc_a = acc_a + sa
+                    * (q4v_dot8(v_a.x, x0, x1) + q4v_dot8(v_a.y, x2, x3)
+                     + q4v_dot8(v_a.z, x4, x5) + q4v_dot8(v_a.w, x6, x7));
+                if (live_b) {
+                    var cv_b = q4tp_byte(crow_b + cbo);
+                    if (sh > 3u) { cv_b = cv_b | (q4tp_byte(crow_b + cbo + 1u) << 8u); }
+                    let v_b = q4v_w[wrow_b * gpr + g];
+                    let sb = lad_q4v[128u + (sub << 5u) + ((cv_b >> sh) & 31u)];
+                    acc_b = acc_b + sb
+                        * (q4v_dot8(v_b.x, x0, x1) + q4v_dot8(v_b.y, x2, x3)
+                         + q4v_dot8(v_b.z, x4, x5) + q4v_dot8(v_b.w, x6, x7));
+                }
+                g = g + 64u;
+            }
+        }
+        // Subgroup reduction: 64 lanes of a sub-block are exactly two
+        // 32-wide subgroups. One barrier replaces the tree's eight —
+        // which the bandwidth test convicted as the missing third of
+        // the bus (stream 1570 GB/s, this kernel's pattern 1623, the
+        // kernel itself ~1000).
+        // Keep binding 1 in the auto layout: an entry point only owns
+        // the bindings it READS, and a five-entry layout against the
+        // caller's six-entry bind group is a validation error per
+        // dispatch — which fell this kernel back to the CPU at 5.3
+        // tok/s while producing bit-identical (host) output. The qknorm
+        // module documents the same trap.
+        if (q1p._p0 == 0xFFFFFFFFu) { q1y[0] = q1x[0]; }
+        let sga = subgroupAdd(acc_a);
+        let sgb = subgroupAdd(acc_b);
+        if (sg_inv == 0u) {
+            sg_part[sg_id * 2u] = sga;
+            sg_part[sg_id * 2u + 1u] = sgb;
+        }
+        workgroupBarrier();
+        if (l == 0u) {
+            // Sub-block = 64 lanes = 64/ssz subgroups; sum whatever the
+            // width made, so a 64-wide device stays correct.
+            let per = 64u / ssz;
+            let base_sg = lid / ssz;
+            var suma = 0.0;
+            var sumb = 0.0;
+            var k = 0u;
+            loop {
+                if (k >= per) { break; }
+                suma = suma + sg_part[(base_sg + k) * 2u];
+                sumb = sumb + sg_part[(base_sg + k) * 2u + 1u];
+                k = k + 1u;
+            }
+            if (wrow_a < rows) { q1y[row_a] = suma; }
+            if (wrow_b < rows) { q1y[row_b] = sumb; }
+        }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+"#;
+
 const SELECT_SG_SRC: &str = r#"
 struct MoeSelP { n_exp: u32, top_k: u32, norm: u32, pk: u32 };
 @group(0) @binding(0) var<storage, read>       sg_logit : array<f32>;
@@ -10531,6 +10704,7 @@ struct Ctx {
     q4tp_mv4: wgpu::ComputePipeline,
     q4tp_mv4_u2: wgpu::ComputePipeline,
     use_mv_u2: bool,
+    q4tp_mv4_sg: Option<wgpu::ComputePipeline>,
     /// The same eight rows, but blocked over a SMALL BATCH in registers:
     /// the weight is read from DRAM once for the whole batch instead of
     /// once per element. What makes a speculative verify of k positions
@@ -11841,6 +12015,16 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let attend_merge = pipe_split("gqa_attend_merge");
     // Subgroup select: its own module — `enable subgroups` must never
     // reach a device without the feature.
+    // CMF_MV_SG=1: the barrier-light decode matvec — the experiment
+    // the bandwidth test funded. Own module, subgroup feature required.
+    let q4tp_mv4_sg = if want_sg && std::env::var("CMF_MV_SG").as_deref() == Ok("1") {
+        // Through mk_coop for the error scopes: a rejected module logs
+        // its reason and degrades to None — the first version created
+        // the pipeline bare, and one naga error killed the device.
+        mk_coop(MV_SG_SRC, "cmf-mv-sg", "q4tp_matvec4_sg")
+    } else {
+        None
+    };
     let moe_select_sg = if want_sg && std::env::var("CMF_SELECT_SG").as_deref() != Ok("0") {
         let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cmf-select-sg"),
@@ -11959,6 +12143,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mv4,
         q4tp_mv4_u2,
         use_mv_u2,
+        q4tp_mv4_sg,
         q4tp_mv4_bk,
         q4tp_mv4_bku,
         use_mv_bk,
@@ -23677,7 +23862,7 @@ fn encode_q4tp_mv4_b(
     } else if batch == 1 {
         (&c.q4tp_mv16w, 16u32)
     } else {
-        (if c.use_mv_u2 { &c.q4tp_mv4_u2 } else { &c.q4tp_mv4 }, 8u32)
+        (c.q4tp_mv4_sg.as_ref().unwrap_or(if c.use_mv_u2 { &c.q4tp_mv4_u2 } else { &c.q4tp_mv4 }), 8u32)
     };
     let p_buf = q4tp_mv_params(c, gpr, rows, batch);
     let layout = pipe.get_bind_group_layout(0);
@@ -23781,7 +23966,7 @@ fn encode_q4tp_mvw_p(
     let (pipe, per_wg) = if gpr <= 64 {
         (&c.q4tp_mv16, 16u32)
     } else {
-        (if c.use_mv_u2 { &c.q4tp_mv4_u2 } else { &c.q4tp_mv4 }, 8u32)
+        (c.q4tp_mv4_sg.as_ref().unwrap_or(if c.use_mv_u2 { &c.q4tp_mv4_u2 } else { &c.q4tp_mv4 }), 8u32)
     };
     let bind = cached_bind(c, bkey, || {
         let p_buf = q4tp_mv_params(c, gpr, rows, 1);
@@ -23831,7 +24016,7 @@ fn encode_o_lora_mv4_p(
     let (pipe, per_wg) = if gpr <= 64 {
         (&c.q4tp_mv16, 16u32)
     } else {
-        (if c.use_mv_u2 { &c.q4tp_mv4_u2 } else { &c.q4tp_mv4 }, 8u32)
+        (c.q4tp_mv4_sg.as_ref().unwrap_or(if c.use_mv_u2 { &c.q4tp_mv4_u2 } else { &c.q4tp_mv4 }), 8u32)
     };
     // The rows a workgroup owns must share one activation window, and a
     // workgroup owns `per_wg` consecutive rows starting at a multiple of
