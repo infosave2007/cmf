@@ -13873,8 +13873,9 @@ fn weight_buffer(c: &Ctx, key: (usize, usize), full_quant: &[u8]) -> Option<wgpu
         let mut enc = c
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wup") });
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&stg, 0, &buf, 0, n);
-        submit(c, enc.finish());
+        submit(c, finish_enc(enc));
         // The staging buffer must outlive the copy; polling here also keeps
         // the peak at one tensor rather than the whole stack.
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
@@ -14909,10 +14910,13 @@ pub fn attn_rope_qkn_gpu(
     let sq = mk_stage(nh * hd);
     let sk = mk_stage(nkv * hd);
     let sgt = mk_stage(nh * hd);
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&qout_b, 0, &sq, 0, (nh * hd * 4) as u64);
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&k_b, 0, &sk, 0, (nkv * hd * 4) as u64);
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&gout_b, 0, &sgt, 0, (nh * hd * 4) as u64);
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     for s in [&sq, &sk, &sgt] {
         s.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     }
@@ -16158,6 +16162,10 @@ pub fn forward_token_graph(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("token-graph"),
         });
+    // Pass merging for this encoder (and its chunk successors — same
+    // slot, same key): every begin_pass below hands back one open pass;
+    // copies, timestamps, swaps and finishes flush it first.
+    let _merge_guard = PassMergeGuard::new(&enc);
     let go =
         |enc: &mut wgpu::CommandEncoder, p: &wgpu::ComputePipeline, b: &wgpu::BindGroup, g: u32| {
             let mut pass = begin_pass(enc);
@@ -16579,6 +16587,7 @@ pub fn forward_token_graph(
             if steps == 1 {
                 if let Some((qs, _, _)) = &c.ts_query {
                     if ts_n < 255 {
+                        flush_pass(&$enc);
                         $enc.write_timestamp(qs, ts_n);
                         ts_lbl.push(($stage, $kind));
                         ts_n += 1;
@@ -16697,6 +16706,7 @@ pub fn forward_token_graph(
                 break;
             }
             if li > 0 && chunk != usize::MAX && li % chunk == 0 {
+                flush_pass(&enc);
                 let full = std::mem::replace(
                     &mut enc,
                     c.device
@@ -16704,7 +16714,7 @@ pub fn forward_token_graph(
                             label: Some("token-graph"),
                         }),
                 );
-                submit(c, full.finish());
+                submit(c, finish_enc(full));
             }
             let lw = &lws[li];
             let rope_u = rope_us[stp * layers.len() + li].clone();
@@ -16917,6 +16927,7 @@ pub fn forward_token_graph(
                                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                                 mapped_at_creation: false,
                             });
+                            flush_pass(&enc);
                             enc.copy_buffer_to_buffer(&attn, 0, &dbgb, 0, (nh * hd * 4) as u64);
                             o1_dbg.push((li, dbgb));
                             let dbgq = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -16925,8 +16936,11 @@ pub fn forward_token_graph(
                                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                                 mapped_at_creation: false,
                             });
+                            flush_pass(&enc);
                             enc.copy_buffer_to_buffer(&qout, 0, &dbgq, 0, 16);
+                            flush_pass(&enc);
                             enc.copy_buffer_to_buffer(&kb, 0, &dbgq, 16, 16);
+                            flush_pass(&enc);
                             enc.copy_buffer_to_buffer(&vb, 0, &dbgq, 32, 16);
                             o1_dbg.push((li + 10_000, dbgq));
                         }
@@ -17872,6 +17886,7 @@ pub fn forward_token_graph(
                                 }
                             }
                             drop(pass);
+                            flush_pass(&enc);
                             enc.copy_buffer_to_buffer(&n1, 0, &h_buf, 0, 0);
                             // (zero-length copy: keeps the borrow checker shape
                             // identical to the non-fold arm; no-op on device)
@@ -17970,6 +17985,7 @@ pub fn forward_token_graph(
                         ),
                         1,
                     );
+                    flush_pass(&enc);
                     enc.copy_buffer_to_buffer(&n1, 0, &h_buf, 0, (hidden * 4) as u64);
                     go(
                         &mut enc,
@@ -18007,6 +18023,7 @@ pub fn forward_token_graph(
                     ),
                     1,
                 );
+                flush_pass(&enc);
                 enc.copy_buffer_to_buffer(&n1, 0, &h_buf, 0, (hidden * 4) as u64);
             } else {
                 go(
@@ -18103,8 +18120,9 @@ pub fn forward_token_graph(
         let ids_b = ids_buf.as_ref().unwrap();
         let stage = ids_stage.as_ref().unwrap();
         let sz = (steps * 4) as u64;
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(ids_b, 0, stage, 0, sz);
-        submit(c, enc.finish());
+        submit(c, finish_enc(enc));
         let (tx, rx) = std::sync::mpsc::channel();
         stage.map_async(wgpu::MapMode::Read, ..sz, move |r| {
             let _ = tx.send(r);
@@ -18169,7 +18187,9 @@ pub fn forward_token_graph(
         ts!(enc, 3, 0);
         if let Some((qs, resolve, tstage)) = &c.ts_query {
             if steps == 1 && ts_n > 0 {
+                flush_pass(&enc);
                 enc.resolve_query_set(qs, 0..ts_n, resolve, 0);
+                flush_pass(&enc);
                 enc.copy_buffer_to_buffer(resolve, 0, tstage, 0, ts_n as u64 * 8);
             }
         }
@@ -18821,6 +18841,10 @@ pub fn forward_batch_graph(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("batch-graph"),
         });
+    // Pass merging for this encoder (and its chunk successors — same
+    // slot, same key): every begin_pass below hands back one open pass;
+    // copies, timestamps, swaps and finishes flush it first.
+    let _merge_guard = PassMergeGuard::new(&enc);
     let go =
         |enc: &mut wgpu::CommandEncoder, p: &wgpu::ComputePipeline, b: &wgpu::BindGroup, g: u32| {
             let mut pass = begin_pass(enc);
@@ -19079,6 +19103,7 @@ pub fn forward_batch_graph(
                 if let Some((qs, _, _)) = c.ts_query.as_ref() {
                     let n = bts_lbl.len() as u32;
                     if n < 250 {
+                        flush_pass(&$enc);
                         $enc.write_timestamp(qs, n);
                         bts_lbl.push($lbl);
                     }
@@ -19098,6 +19123,7 @@ pub fn forward_batch_graph(
     };
     for (li, l) in layers.iter().enumerate() {
         if li > 0 && bchunk != usize::MAX && li % bchunk == 0 {
+            flush_pass(&enc);
             let full = std::mem::replace(
                 &mut enc,
                 c.device
@@ -19105,7 +19131,7 @@ pub fn forward_batch_graph(
                         label: Some("batch-graph"),
                     }),
             );
-            submit(c, full.finish());
+            submit(c, finish_enc(full));
         }
         let lw = &lws[li];
         let pnw = stor(bytemuck::cast_slice(l.post_norm));
@@ -19698,7 +19724,9 @@ pub fn forward_batch_graph(
         bts!(enc, 5);
         if bts_on && bts_lbl.len() > 1 {
             if let Some((qs, resolve, tstage)) = c.ts_query.as_ref() {
+                flush_pass(&enc);
                 enc.resolve_query_set(qs, 0..bts_lbl.len() as u32, resolve, 0);
+                flush_pass(&enc);
                 enc.copy_buffer_to_buffer(resolve, 0, tstage, 0, bts_lbl.len() as u64 * 8);
             }
         }
@@ -19712,7 +19740,9 @@ pub fn forward_batch_graph(
     } else {
         if bts_on && bts_lbl.len() > 1 {
             if let Some((qs, resolve, tstage)) = c.ts_query.as_ref() {
+                flush_pass(&enc);
                 enc.resolve_query_set(qs, 0..bts_lbl.len() as u32, resolve, 0);
+                flush_pass(&enc);
                 enc.copy_buffer_to_buffer(resolve, 0, tstage, 0, bts_lbl.len() as u64 * 8);
             }
         }
@@ -19793,12 +19823,14 @@ pub fn gdn_spec_restore(kv_id: u64, slot: usize) -> bool {
         };
         let off = slot as u64 * (ring_sz + s_sz);
         if *ring_sz > 0 {
+            flush_pass(&enc);
             enc.copy_buffer_to_buffer(snap, off, ring, 0, *ring_sz);
         }
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(snap, off + ring_sz, s, 0, *s_sz);
         any = true;
     }
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     any
 }
 
@@ -19869,9 +19901,11 @@ pub fn gdn_conv_gpu(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&rb, 0, &sr, 0, rsz);
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&cb, 0, &scq, 0, csz);
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     sr.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     scq.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
@@ -19975,9 +20009,11 @@ pub fn gdn_step_gpu(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&sb, 0, &stage_s, 0, ssz);
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&ob, 0, &stage_o, 0, osz);
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     stage_s.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     stage_o.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
@@ -20688,7 +20724,7 @@ pub fn music3_ffn(
         let groups = ((n * inter) as u32).div_ceil(256);
         pass.dispatch_workgroups(groups.min(65_535), groups.div_ceil(65_535), 1);
     }
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     // ff_out reads the resident activations; the queue orders the three
     // submissions, so nothing here waits until the final readback.
     tp_matmat_impl(
@@ -21203,7 +21239,7 @@ fn tp_matmat_impl(
             // next work is a faster GEMM or a resident chain.
             if crate::mm_ab::split_on() {
                 let t0 = std::time::Instant::now();
-                submit(c, enc.finish());
+                submit(c, finish_enc(enc));
                 if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
                     return None;
                 }
@@ -21226,7 +21262,7 @@ fn tp_matmat_impl(
         }
         None => {
             // No host copy: submit and hand the buffer over.
-            submit(c, enc.finish());
+            submit(c, finish_enc(enc));
             Some(y_buf)
         }
     }
@@ -22005,7 +22041,7 @@ pub fn dit_attention_packed_src(
     // by nobody else, so it stayed zero and P·V came out exactly zero.
     // That is the VAE's all-zero attention, and the reason the layout
     // experiments all agreed: zero does not depend on addressing.
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     // qk-norm + RoPE on the card: two dispatches over the SAME kernel,
     // q and k differing only in the output plane, the weight buffer and
     // src_off. When `nr` is None the caller already did this on the host.
@@ -22090,7 +22126,7 @@ pub fn dit_attention_packed_src(
                 let jobs = (n * nh) as u32;
                 pass.dispatch_workgroups(jobs.min(65535), jobs.div_ceil(65535), 1);
             }
-            submit(c, e.finish());
+            submit(c, finish_enc(e));
         }
     }
     // The planes are on the card now; the shared path skips its uploads.
@@ -22316,7 +22352,7 @@ fn dit_attention_inner(
                 let wgs = ((n * nh * hd) as u32).div_ceil(256);
                 pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
             }
-            submit(c, e.finish());
+            submit(c, finish_enc(e));
             Some(vt)
         }
         _ => None,
@@ -22440,13 +22476,14 @@ fn dit_attention_inner(
             if !prof {
                 return;
             }
+            flush_pass(&enc);
             let e = std::mem::replace(
                 enc,
                 c.device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }),
             );
             let t = std::time::Instant::now();
-            submit(c, e.finish());
+            submit(c, finish_enc(e));
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
             DIT_PHASE[slot].fetch_add(
                 t.elapsed().as_micros() as u64,
@@ -22528,7 +22565,7 @@ fn dit_attention_inner(
         // panel where it already is. Nothing crosses the bus, and the
         // queue is never drained mid-block.
         Some(slot) => {
-            submit(c, enc.finish());
+            submit(c, finish_enc(enc));
             *slot = Some(ab);
             true
         }
@@ -23569,7 +23606,7 @@ pub fn roundtrip_bench(n: usize) -> Option<(f64, f64)> {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("rt-empty"),
             });
-        submit(c, enc.finish());
+        submit(c, finish_enc(enc));
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
     }
     let empty_ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
@@ -24802,7 +24839,7 @@ pub fn coop_matrix_active() -> bool {
 }
 
 #[inline]
-fn begin_pass(enc: &mut wgpu::CommandEncoder) -> wgpu::ComputePass<'_> {
+fn begin_pass(enc: &mut wgpu::CommandEncoder) -> PassHandle {
     // A stage label set by the BT frame turns this pass into a timestamped
     // one; everything else stays on the cold path of one atomic load.
     let which = BT_TS_STAGE.load(std::sync::atomic::Ordering::Relaxed);
@@ -24815,16 +24852,194 @@ fn begin_pass(enc: &mut wgpu::CommandEncoder) -> wgpu::ComputePass<'_> {
 }
 
 #[inline]
+// ── Pass merging. A compute-pass boundary costs ~9 µs on this Vulkan
+// stack (measured: 700 one-dispatch passes 9.7 ms against 3.4 ms for
+// the same 700 dispatches in ONE pass), and a token issued 147 of them,
+// a batched verify ~500. Dispatches inside a pass are serialized with
+// memory visibility, so a graph needs no boundary at all except where
+// the ENCODER itself is used — a copy, a timestamp, a submit. An
+// encoder that opts in (`PassMergeGuard`, the two graph functions) gets
+// ONE open pass per thread that every `begin_pass` on it hands back
+// (`forget_lifetime` detaches it from the borrow), and every direct
+// encoder use flushes it first (`flush_pass`, `finish_enc`). Encoders
+// that did not opt in behave exactly as before. `CMF_PASS_MERGE=0`
+// turns the merge off.
+thread_local! {
+    static MERGE_KEYS: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+    static OPEN_PASS: std::cell::RefCell<Option<(usize, wgpu::ComputePass<'static>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn pass_merge_on() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("CMF_PASS_MERGE").as_deref() != Ok("0"))
+}
+
+/// The address of the encoder object, whether the caller holds it by
+/// value or behind a reference — the merge state is keyed on it.
+trait EncAddr {
+    fn enc_addr(&self) -> usize;
+}
+impl EncAddr for wgpu::CommandEncoder {
+    fn enc_addr(&self) -> usize {
+        self as *const wgpu::CommandEncoder as usize
+    }
+}
+impl EncAddr for &mut wgpu::CommandEncoder {
+    fn enc_addr(&self) -> usize {
+        (&**self) as *const wgpu::CommandEncoder as usize
+    }
+}
+impl EncAddr for &wgpu::CommandEncoder {
+    fn enc_addr(&self) -> usize {
+        (*self) as *const wgpu::CommandEncoder as usize
+    }
+}
+
+/// End the merged pass open on this thread, if any. Call before any
+/// direct use of an encoder (copy, timestamp, resolve, finish, swap).
+/// Deliberately NOT keyed on the encoder: a helper that takes the graph's
+/// encoder BY VALUE (readback) sees it at a new address, and a local
+/// encoder finishing while the graph's pass is open only splits that
+/// pass early — harmless, since dispatch order inside the graph's own
+/// encoder is unchanged.
+fn flush_pass<E: EncAddr>(enc: &E) {
+    let _ = enc.enc_addr();
+    OPEN_PASS.with(|o| {
+        let mut o = o.borrow_mut();
+        if o.is_some() {
+            *o = None; // drop ends the pass into its encoder
+        }
+    });
+}
+
+/// `finish_enc(enc)` with the merged pass flushed first.
+fn finish_enc(enc: wgpu::CommandEncoder) -> wgpu::CommandBuffer {
+    flush_pass(&enc);
+    enc.finish()
+}
+
+/// Opt an encoder into pass merging for the guard's lifetime; drop
+/// flushes and unregisters.
+struct PassMergeGuard {
+    key: usize,
+}
+impl PassMergeGuard {
+    fn new<E: EncAddr>(enc: &E) -> Self {
+        let key = enc.enc_addr();
+        if pass_merge_on() {
+            MERGE_KEYS.with(|m| {
+                m.borrow_mut().insert(key);
+            });
+        }
+        Self { key }
+    }
+}
+impl Drop for PassMergeGuard {
+    fn drop(&mut self) {
+        let key = self.key;
+        OPEN_PASS.with(|o| {
+            let mut o = o.borrow_mut();
+            if matches!(&*o, Some((k, _)) if *k == key) {
+                *o = None;
+            }
+        });
+        MERGE_KEYS.with(|m| {
+            m.borrow_mut().remove(&key);
+        });
+    }
+}
+
+/// What `begin_pass` hands out: a compute pass that is either this
+/// encoder's merged open pass (given back to the thread-local on drop)
+/// or a plain pass ended on drop. Derefs to the pass, so call sites are
+/// unchanged.
+pub struct PassHandle {
+    pass: Option<wgpu::ComputePass<'static>>,
+    key: usize,
+    merged: bool,
+}
+impl std::ops::Deref for PassHandle {
+    type Target = wgpu::ComputePass<'static>;
+    fn deref(&self) -> &Self::Target {
+        self.pass.as_ref().expect("pass handle")
+    }
+}
+impl std::ops::DerefMut for PassHandle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.pass.as_mut().expect("pass handle")
+    }
+}
+impl Drop for PassHandle {
+    fn drop(&mut self) {
+        if let Some(p) = self.pass.take() {
+            if self.merged {
+                OPEN_PASS.with(|o| {
+                    *o.borrow_mut() = Some((self.key, p));
+                });
+            }
+            // else: `p` drops here and the pass ends.
+        }
+    }
+}
+
 fn begin_pass_with<'a>(
     enc: &'a mut wgpu::CommandEncoder,
     label: Option<&'a str>,
     timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'a>>,
-) -> wgpu::ComputePass<'a> {
+) -> PassHandle {
+    let key = (&*enc).enc_addr();
+    let merge = timestamp_writes.is_none() && MERGE_KEYS.with(|m| m.borrow().contains(&key));
+    if merge {
+        // Hand back the open pass if it is this encoder's; otherwise
+        // flush whatever is open (another encoder's) and open ours.
+        let taken = OPEN_PASS.with(|o| {
+            let mut o = o.borrow_mut();
+            match o.take() {
+                Some((k, p)) if k == key => Some(p),
+                Some((_, p)) => {
+                    drop(p);
+                    None
+                }
+                None => None,
+            }
+        });
+        if let Some(p) = taken {
+            return PassHandle {
+                pass: Some(p),
+                key,
+                merged: true,
+            };
+        }
+        PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = enc
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label,
+                timestamp_writes: None,
+            })
+            .forget_lifetime();
+        return PassHandle {
+            pass: Some(p),
+            key,
+            merged: true,
+        };
+    }
+    // A plain pass: make sure no merged pass is open on this encoder
+    // (a second pass on a locked encoder is a validation error).
+    flush_pass(&*enc);
     PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label,
-        timestamp_writes,
-    })
+    let p = enc
+        .begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label,
+            timestamp_writes,
+        })
+        .forget_lifetime();
+    PassHandle {
+        pass: Some(p),
+        key,
+        merged: false,
+    }
 }
 
 fn readback2(
@@ -24848,9 +25063,11 @@ fn readback2(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "dsv4-pair-stage",
     );
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(a_buf, 0, &stage, 0, a_bytes);
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(b_buf, 0, &stage, off, b_bytes);
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     let slice = stage.slice(..off + b_bytes);
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let d2 = done.clone();
@@ -24906,9 +25123,11 @@ fn readback_two(
     out_a: &mut [f32],
     out_b: &mut [f32],
 ) -> bool {
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(a_buf, 0, staging, 0, a_size);
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(b_buf, 0, staging, a_size, b_size);
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     let slice = staging.slice(..a_size + b_size);
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let d2 = done.clone();
@@ -24960,9 +25179,10 @@ fn readback(
     y_size: u64,
     out: &mut [f32],
 ) -> bool {
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(y_buf, 0, staging, 0, y_size);
     let t_dma = std::time::Instant::now();
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     let slice = staging.slice(..y_size);
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let d2 = done.clone();
@@ -26417,10 +26637,11 @@ fn matvec_batch_q1(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f3
     );
     let mut off = 0u64;
     for (y_b, j) in y_bufs.iter().zip(jobs) {
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(y_b, 0, &stage, off, (j.rows * 4) as u64);
         off += (j.rows * 4) as u64;
     }
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     stage.slice(..total).map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
         return false;
@@ -26690,10 +26911,11 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f
     );
     let mut off = 0u64;
     for (y_b, j) in y_bufs.iter().zip(jobs) {
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(y_b, 0, &stage, off, (j.rows * 4) as u64);
         off += (j.rows * 4) as u64;
     }
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     stage.slice(..total).map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
         return false;
@@ -26865,8 +27087,9 @@ mod tests {
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(rows as u32, 1, 1);
         }
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&yb, 0, &stage, 0, (rows * 4) as u64);
-        submit(c, enc.finish());
+        submit(c, finish_enc(enc));
         let (tx, rx) = std::sync::mpsc::channel();
         stage.map_async(wgpu::MapMode::Read, .., move |r| tx.send(r).unwrap());
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
@@ -26983,8 +27206,9 @@ mod tests {
         let wg = (n as u32).min(MAX_WG);
         let readback = |buf: &wgpu::Buffer, enc: wgpu::CommandEncoder| {
             let mut enc = enc;
+            flush_pass(&enc);
             enc.copy_buffer_to_buffer(buf, 0, &stage, 0, (n * 4) as u64);
-            submit(c, enc.finish());
+            submit(c, finish_enc(enc));
             stage.slice(..).map_async(wgpu::MapMode::Read, |_| {});
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
             let _ = stage.slice(..).get_mapped_range();
@@ -27596,8 +27820,9 @@ mod tests {
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            flush_pass(&enc);
             enc.copy_buffer_to_buffer(&ob, 0, &stage, 0, (gcnt * hpg * dv * 4) as u64);
-            submit(c, enc.finish());
+            submit(c, finish_enc(enc));
             let (tx, rx) = std::sync::mpsc::channel();
             stage.map_async(wgpu::MapMode::Read, .., move |r| tx.send(r).unwrap());
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
@@ -28430,7 +28655,7 @@ fn main() {
                     n,
                 );
             }
-            submit(c, enc.finish());
+            submit(c, finish_enc(enc));
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
         };
         run();
@@ -28520,9 +28745,13 @@ fn main() {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&ya1, 0, &stage, 0, (rows_a * 4) as u64);
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&yb1, 0, &stage, (rows_a * 4) as u64, (rows_b * 4) as u64);
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&ya2, 0, &stage, (n * 4) as u64, (rows_a * 4) as u64);
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(
             &yb2,
             0,
@@ -28530,7 +28759,7 @@ fn main() {
             ((n + rows_a) * 4) as u64,
             (rows_b * 4) as u64,
         );
-        submit(c, enc.finish());
+        submit(c, finish_enc(enc));
         let slice = stage.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
@@ -28631,11 +28860,15 @@ fn main() {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&ya1, 0, &stage, 0, (na * 4) as u64);
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&yb1, 0, &stage, (na * 4) as u64, (nb * 4) as u64);
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&ya2, 0, &stage, (n * 4) as u64, (na * 4) as u64);
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&yb2, 0, &stage, ((n + na) * 4) as u64, (nb * 4) as u64);
-        submit(c, enc.finish());
+        submit(c, finish_enc(enc));
         let slice = stage.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
@@ -28745,9 +28978,11 @@ fn main() {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&act_ref, 0, &stage, 0, (inter * 4) as u64);
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&act, 0, &stage, (inter * 4) as u64, (inter * 4) as u64);
-        submit(c, enc.finish());
+        submit(c, finish_enc(enc));
         let slice = stage.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
@@ -28827,7 +29062,7 @@ fn main() {
                     encode_q4tp_mv4(c, &mut enc, &wbuf, &xbuf, &ybuf, rows, cols);
                 }
                 let t = Instant::now();
-                submit(c, enc.finish());
+                submit(c, finish_enc(enc));
                 let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
                 t.elapsed().as_secs_f64()
             };
@@ -28840,6 +29075,55 @@ fn main() {
                 "null-dispatch chain: {n} tiny matvecs in one submit = {:.2} ms  ({:.1} us/dispatch)",
                 best * 1e3,
                 best * 1e6 / n as f64
+            );
+            // The same 700 dispatches inside ONE compute pass: what a
+            // pass boundary costs is the difference.
+            let (bind1, _) = {
+                let gpr = cols / 32;
+                let p_buf = q4tp_mv_params(c, gpr, rows, 1);
+                let layout = c.q4tp_mv16.get_bind_group_layout(0);
+                (
+                    c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &layout,
+                        entries: &[
+                            bind_buf(0, &wbuf),
+                            bind_buf(2, &ybuf),
+                            bind_buf(3, &p_buf),
+                            bind_buf(4, &wbuf),
+                            bind_buf(5, &xbuf),
+                        ],
+                    }),
+                    0,
+                )
+            };
+            let run1 = || {
+                let mut enc = c
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                {
+                    let mut pass = begin_pass(&mut enc);
+                    pass.set_pipeline(&c.q4tp_mv16);
+                    pass.set_bind_group(0, &bind1, &[]);
+                    for _ in 0..n {
+                        pass.dispatch_workgroups(1, 1, 1);
+                    }
+                }
+                let t = Instant::now();
+                submit(c, finish_enc(enc));
+                let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                t.elapsed().as_secs_f64()
+            };
+            run1();
+            let mut best1 = f64::MAX;
+            for _ in 0..3 {
+                best1 = best1.min(run1());
+            }
+            println!(
+                "same {n} dispatches in ONE pass = {:.2} ms  ({:.1} us/dispatch) — pass boundary ≈ {:.1} us",
+                best1 * 1e3,
+                best1 * 1e6 / n as f64,
+                (best - best1) * 1e6 / n as f64
             );
         }
         for (rows, cols, label) in [
@@ -28887,7 +29171,7 @@ fn main() {
                 for _ in 0..reps {
                     encode_q4tp_mv4(c, &mut enc, &wbuf, &xbuf, &ybuf, rows, cols);
                 }
-                submit(c, enc.finish());
+                submit(c, finish_enc(enc));
                 let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
             };
             run();
@@ -29014,7 +29298,9 @@ fn main() {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&y_ref, 0, &stage, 0, (n * rows * 4) as u64);
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(
             &y_f16,
             0,
@@ -29022,7 +29308,7 @@ fn main() {
             (n * rows * 4) as u64,
             (n * rows * 4) as u64,
         );
-        submit(c, enc.finish());
+        submit(c, finish_enc(enc));
         let slice = stage.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
@@ -30017,9 +30303,11 @@ pub fn top_k_for_test(scores: &[f32], k: usize, out: &mut Vec<u32>) -> bool {
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "topk-stage",
     );
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&ib, 0, &stage, 0, (kk * 4) as u64);
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&cb, 0, &stage, (kk * 4) as u64, 4);
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     let slice = stage.slice(..bytes);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
@@ -30866,8 +31154,9 @@ fn dsv4_index_cache(kv_id: u64, li: usize, floats: usize) -> Option<wgpu::Buffer
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("ixkv-grow"),
             });
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&old, 0, &bigger, 0, (have * 4) as u64);
-        submit(c, enc.finish());
+        submit(c, finish_enc(enc));
         m.insert((kv_id, li), (bigger, cap));
         // The same epoch the KV cache bumps: a cached bind group outlives
         // the buffer it points at otherwise.
@@ -31439,6 +31728,7 @@ fn dsv4_layer_frame_enc(
     }
     // Outside the pass: a buffer-to-buffer copy cannot be recorded inside one.
     if copy_qn {
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&qn2, 0, &qnb, 0, (a.q_lora * 4) as u64);
     }
 
@@ -31447,6 +31737,7 @@ fn dsv4_layer_frame_enc(
     // copy and no round trip. The wrapper below reads it when a caller
     // still wants the value on the host.
     let src = if w.hc_next_fn.is_some() { &x2 } else { &ao };
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(src, 0, &folded, 0, (dim * 4) as u64);
     Some(folded)
 }
@@ -31484,8 +31775,9 @@ pub fn dsv4_cache_ensure(kv_id: u64, li: usize, cap: usize) -> bool {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("dsv4-kv-grow"),
                 });
+            flush_pass(&enc);
             enc.copy_buffer_to_buffer(&old, 0, &bigger, 0, (have * 4) as u64);
-            submit(c, enc.finish());
+            submit(c, finish_enc(enc));
             map.insert((kv_id, li), (bigger, cap));
             GREW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -31937,6 +32229,7 @@ fn dsv4_chain_batch_bt(
     let mut last: Option<(wgpu::Buffer, wgpu::Buffer)> = None;
     for (i, (w, g, p)) in layers.iter().enumerate() {
         if i > 0 && i % chunk == 0 {
+            flush_pass(&enc);
             let full = std::mem::replace(
                 &mut enc,
                 c.device
@@ -31944,7 +32237,7 @@ fn dsv4_chain_batch_bt(
                         label: Some("dsv4-chain-batch-bt"),
                     }),
             );
-            submit(c, full.finish());
+            submit(c, finish_enc(full));
         }
         // Per-token counts follow from the position alone (window fills by
         // one, a compressed entry appears every `ratio`), so the whole
@@ -32061,7 +32354,9 @@ fn dsv4_chain_batch_bt(
             if (n as u64 + 1) * 16 > 256 * 8 {
                 break;
             }
+            flush_pass(&enc);
             enc.resolve_query_set(qs, *slot..*slot + 2, resolve, 0);
+            flush_pass(&enc);
             enc.copy_buffer_to_buffer(resolve, 0, tstage, (n as u64) * 16, 16);
         }
     }
@@ -33039,8 +33334,9 @@ pub fn dsv4_dbg_read_ix(kv_id: u64, li: usize, off: usize, n: usize) -> Option<V
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&b, (off * 4) as u64, &stage, 0, (n * 4) as u64);
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     let slice = stage.slice(..);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
@@ -33149,6 +33445,7 @@ pub fn dsv4_spec_cap_read(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("dsv4-cap-read"),
         });
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(
         &cap,
         ((slot * batch + tok) * hc_dim * 4) as u64,
@@ -33157,7 +33454,7 @@ pub fn dsv4_spec_cap_read(
         bytes,
     );
     let ok = {
-        submit(c, enc.finish());
+        submit(c, finish_enc(enc));
         let slice = stage.slice(..bytes);
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let d2 = done.clone();
@@ -33231,6 +33528,7 @@ pub fn dsv4_spec_shadow(
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
+            flush_pass(&enc);
             enc.copy_buffer_to_buffer(&cache, 0, &b, 0, (dk * hd * 4) as u64);
             Some(b)
         } else {
@@ -33250,6 +33548,7 @@ pub fn dsv4_spec_shadow(
                         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
                         mapped_at_creation: false,
                     });
+                    flush_pass(&enc);
                     enc.copy_buffer_to_buffer(&bufs[i], 0, &b, 0, bufs[i].size());
                     b
                 });
@@ -33266,7 +33565,7 @@ pub fn dsv4_spec_shadow(
             comp,
         });
     }
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     Some(Dsv4SpecShadow {
         kv_id,
         batch,
@@ -33298,7 +33597,9 @@ pub fn dsv4_spec_restore(sh: &Dsv4SpecShadow) -> bool {
             let keep = l.filled - l.dk;
             if keep > 0 {
                 let scratch = frame_buf(c, BT_SPEC_SCRATCH, l.window * l.hd * 4, true);
+                flush_pass(&enc);
                 enc.copy_buffer_to_buffer(&cache, 0, &scratch, 0, (keep * l.hd * 4) as u64);
+                flush_pass(&enc);
                 enc.copy_buffer_to_buffer(
                     &scratch,
                     0,
@@ -33308,6 +33609,7 @@ pub fn dsv4_spec_restore(sh: &Dsv4SpecShadow) -> bool {
                 );
             }
             if let Some(head) = &l.head {
+                flush_pass(&enc);
                 enc.copy_buffer_to_buffer(head, 0, &cache, 0, (l.dk * l.hd * 4) as u64);
             }
         }
@@ -33319,11 +33621,12 @@ pub fn dsv4_spec_restore(sh: &Dsv4SpecShadow) -> bool {
             let Some(live) = live else { return false };
             for i in 0..4 {
                 let n = live[i].size().min(clones[i].size());
+                flush_pass(&enc);
                 enc.copy_buffer_to_buffer(&clones[i], 0, &live[i], 0, n);
             }
         }
     }
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     true
 }
 
@@ -33355,7 +33658,7 @@ pub fn dsv4_spec_commit_windows(
         let srow0 = (cap / hd).saturating_sub(batch + 1);
         encode_staged_commit(c, &mut enc, &cache, filled, window, hd, srow0, k);
     }
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     true
 }
 
@@ -33510,7 +33813,7 @@ pub fn dsv4_spec_replay(
             }
         }
     }
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     true
 }
 
@@ -33537,6 +33840,7 @@ fn encode_staged_commit(
     let scratch = frame_buf(c, BT_SPEC_SCRATCH, window * hd * 4, true);
     if shift > 0 {
         if keep > 0 {
+            flush_pass(&enc);
             enc.copy_buffer_to_buffer(
                 cache,
                 (shift * hd * 4) as u64,
@@ -33545,6 +33849,7 @@ fn encode_staged_commit(
                 (keep * hd * 4) as u64,
             );
         }
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(
             cache,
             (srow0 * hd * 4) as u64,
@@ -33552,8 +33857,10 @@ fn encode_staged_commit(
             (keep * hd * 4) as u64,
             (k * hd * 4) as u64,
         );
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&scratch, 0, cache, 0, ((keep + k) * hd * 4) as u64);
     } else {
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(
             cache,
             (srow0 * hd * 4) as u64,
@@ -33561,6 +33868,7 @@ fn encode_staged_commit(
             0,
             (k * hd * 4) as u64,
         );
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(
             &scratch,
             0,
@@ -35371,8 +35679,9 @@ pub fn vae_conv2d_coop(
             pass.set_bind_group(0, &bgg, &[]);
             pass.dispatch_workgroups((oc as u32).div_ceil(64), (t as u32).div_ceil(64), 1);
         }
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&yb, 0, &ybig, (p0 * oc * 4) as u64, (t * oc * 4) as u64);
-        submit(c, enc.finish());
+        submit(c, finish_enc(enc));
         p0 += t;
     }
     let mut enc = c
@@ -35412,6 +35721,7 @@ unsafe impl Send for SendPtrC {}
 unsafe impl Sync for SendPtrC {}
 
 fn enc_take(e: &mut wgpu::CommandEncoder) -> wgpu::CommandEncoder {
+    flush_pass(&e);
     std::mem::replace(
         e,
         ctx()
@@ -36027,11 +36337,13 @@ pub fn ffn_chain_f32(
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((hsz as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
     }
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&ybuf, 0, &stage, 0, ffn_bytes);
     if both_out.is_some() {
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(&both, 0, &stage, off, both_bytes);
     }
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     let slice = stage.slice(..stage_need);
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let d2 = done.clone();
@@ -36444,13 +36756,15 @@ pub fn attn_chain_f32(
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((hsz as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
     }
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&ybuf, 0, &stage, offs[0].0, offs[0].1);
     if want_acts {
         for (i, buf) in [&plane, &qrot, &krot, &qinv, &kinv, &ao].iter().enumerate() {
+            flush_pass(&enc);
             enc.copy_buffer_to_buffer(buf, 0, &stage, offs[i + 1].0, offs[i + 1].1);
         }
     }
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     let slice = stage.slice(..need);
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let d2 = done.clone();
@@ -36888,10 +37202,13 @@ pub fn q4tp_qkv(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&qy, 0, &stage_q, 0, qs);
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&ky, 0, &stage_k, 0, ks);
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&vy, 0, &stage_v, 0, ks);
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     let read = |stage: &wgpu::Buffer, bytes: u64, dst: &mut [f32]| -> bool {
         let (tx, rx) = std::sync::mpsc::channel();
         stage.map_async(wgpu::MapMode::Read, ..bytes, move |r| {
@@ -37517,7 +37834,7 @@ pub fn dit_block_seg(
     if a.resident_out {
         // Nothing to wait for: the next block reads `xb` where this one
         // left it, and the submission is the only thing that must happen.
-        submit(c, enc.finish());
+        submit(c, finish_enc(enc));
         return true;
     }
     let stage = pooled(
@@ -37718,6 +38035,7 @@ pub fn dsv4_state_add_cold(cold: &[f32], hc: usize, state_out: &mut [f32]) -> bo
     encode_hc_expand(
         c, &mut enc, &cold_buf, &state, &post, &comb, &corrected, &p, hc, dim,
     );
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&corrected, 0, &state, 0, (state_out.len() * 4) as u64);
     let bytes = (state_out.len() * 4) as u64;
     let mut sc = c.scratch.lock().unwrap();
@@ -37942,10 +38260,13 @@ pub fn moe_route_for_test(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "route-stage",
     );
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&ib, 0, &stage, 0, (slots * 4) as u64);
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&wb, 0, &stage, (slots * 4) as u64, (slots * 4) as u64);
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&cb, 0, &stage, (2 * slots * 4) as u64, 4);
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     let slice = stage.slice(..bytes);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
@@ -38274,7 +38595,7 @@ pub fn dispatch_bench() -> Vec<String> {
                     pass.dispatch_workgroups(4, 1, 1);
                 }
             }
-            submit(c, enc.finish());
+            submit(c, finish_enc(enc));
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
             if round == 1 {
                 let us = t0.elapsed().as_secs_f64() * 1e6 / N as f64;
@@ -39677,7 +39998,7 @@ pub fn dsv4_comp_state_for_test(
     )
     .is_some();
     if !folded {
-        submit(c, enc.finish());
+        submit(c, finish_enc(enc));
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
         return Some(false);
     }
@@ -39736,8 +40057,9 @@ pub fn dsv4_idx_build_for_test(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "idx-build-stage",
     );
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&ob, 0, &stage, 0, bytes);
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     let slice = stage.slice(..bytes);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
@@ -40337,7 +40659,7 @@ pub fn dsv4_attn_frame(
     // MoE frame reads it from the same buffer, so the token does not stop
     // here at all.
     if out.is_empty() {
-        submit(c, enc.finish());
+        submit(c, finish_enc(enc));
         ATT_ENC_NS.fetch_add(
             t_all.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -40360,7 +40682,9 @@ pub fn dsv4_attn_frame(
     let pairs: Vec<(usize, u32)> = std::mem::take(&mut TS_PAIRS.lock().unwrap());
     if let Some((qs, resolve, tstage)) = &c.ts_query {
         for (n, (_, slot)) in pairs.iter().enumerate() {
+            flush_pass(&enc);
             enc.resolve_query_set(qs, *slot..*slot + 2, resolve, 0);
+            flush_pass(&enc);
             enc.copy_buffer_to_buffer(resolve, 0, tstage, (n as u64) * 16, 16);
         }
     }
@@ -40545,7 +40869,7 @@ pub fn dsv4_moe_frame(
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         let xin = frame_buf(c, 45, g.hidden * 4, true);
         encode_f32matvec(c, &mut e0, &rb, &xin, &lb, n_route, g.hidden);
-        submit(c, e0.finish());
+        submit(c, finish_enc(e0));
         lb
     } else {
         frame_up(c, 16, bytemuck::cast_slice(&w.logits[..n_route]))
@@ -40828,7 +41152,9 @@ pub fn dsv4_moe_frame(
         // 256-byte aligned, and slot*8 is not for any slot but the first
         // thirty-two. The pair still comes from the rotating slots; only
         // where it lands is fixed.
+        flush_pass(&enc);
         enc.resolve_query_set(qs, slot..slot + 2, resolve, 0);
+        flush_pass(&enc);
         enc.copy_buffer_to_buffer(resolve, 0, tstage, 0, 16);
     }
     let t_enc = std::time::Instant::now();
@@ -40857,6 +41183,7 @@ pub fn dsv4_moe_frame(
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "dsv4-moe-stage",
     );
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(
         hc_out.as_ref().unwrap_or(&ob),
         0,
@@ -40864,9 +41191,11 @@ pub fn dsv4_moe_frame(
         0,
         (g.hidden * 4) as u64,
     );
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&coldb, 0, &stage2, (g.hidden * 4) as u64, cold_bytes);
+    flush_pass(&enc);
     enc.copy_buffer_to_buffer(&xb, 0, &stage2, x_off, (g.hidden * 4) as u64);
-    submit(c, enc.finish());
+    submit(c, finish_enc(enc));
     let slice = stage2.slice(..total);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
