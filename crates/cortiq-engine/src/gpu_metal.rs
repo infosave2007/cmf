@@ -3093,6 +3093,73 @@ static inline void q4t_mv_side(
     }
 }
 
+// The FFN's down with SiLU folded in: reads gate and up straight from
+// their buffers and mixes act = up * g * sigmoid(g) per element —
+// deletes the silu dispatch and one dependent-stage drain per layer.
+// Same per-element redundancy trade the wgpu twin made; the answer is
+// bit-compatible because the mix happens in the same f32 as the silu
+// kernel it replaces.
+kernel void q4t_matvec_dsilu(
+    device const uchar* q    [[buffer(0)]],
+    device const float* xg   [[buffer(1)]],
+    device float*       y    [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    device const float* xu   [[buffer(5)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    if (r0 >= rows) return;
+    uint nr = min(rows - r0, 4u);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint xb = g * 32u;
+        device const float4* gv = (device const float4*)(xg + xb);
+        device const float4* uv = (device const float4*)(xu + xb);
+        float4 x0, x1, x2, x3, x4, x5, x6, x7;
+        {
+            float4 gg; float4 uu;
+            gg = gv[0]; uu = uv[0]; x0 = uu * gg / (float4(1.0f) + exp(-gg));
+            gg = gv[1]; uu = uv[1]; x1 = uu * gg / (float4(1.0f) + exp(-gg));
+            gg = gv[2]; uu = uv[2]; x2 = uu * gg / (float4(1.0f) + exp(-gg));
+            gg = gv[3]; uu = uv[3]; x3 = uu * gg / (float4(1.0f) + exp(-gg));
+            gg = gv[4]; uu = uv[4]; x4 = uu * gg / (float4(1.0f) + exp(-gg));
+            gg = gv[5]; uu = uv[5]; x5 = uu * gg / (float4(1.0f) + exp(-gg));
+            gg = gv[6]; uu = uv[6]; x6 = uu * gg / (float4(1.0f) + exp(-gg));
+            gg = gv[7]; uu = uv[7]; x7 = uu * gg / (float4(1.0f) + exp(-gg));
+        }
+        for (uint ri = 0u; ri < nr; ++ri) {
+            ulong t = ((ulong)(r0 + ri) * gpr + (ulong)g) * 18u;
+            device const ushort* p16 = (device const ushort*)(q + t);
+            half scale = as_type<half>(p16[0]);
+            uint b0 = (uint)p16[1] | ((uint)p16[2] << 16);
+            uint b1 = (uint)p16[3] | ((uint)p16[4] << 16);
+            uint b2 = (uint)p16[5] | ((uint)p16[6] << 16);
+            uint b3 = (uint)p16[7] | ((uint)p16[8] << 16);
+            float gsum = q4_dot8_fast(b0, x0, x1)
+                       + q4_dot8_fast(b1, x2, x3)
+                       + q4_dot8_fast(b2, x4, x5)
+                       + q4_dot8_fast(b3, x6, x7);
+            float contrib = (float)scale * gsum;
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+    if (lane == 0u) {
+        y[r0] = acc0;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
+    }
+}
+
 kernel void q4t_matvec_dual(
     device const uchar* qa   [[buffer(0)]],
     device const float* x    [[buffer(1)]],
@@ -4139,6 +4206,7 @@ struct Ctx {
     q4bh: ComputePipelineState,
     q4t: ComputePipelineState,
     q4t_dual: ComputePipelineState,
+    q4t_dsilu: ComputePipelineState,
     q4tp: ComputePipelineState,
     /// Job-batched q4tp matvec + its two MoE companions: the whole
     /// expert block in four dispatches instead of four per expert.
@@ -4328,6 +4396,7 @@ fn init() -> Result<Ctx, String> {
     let q4bh = pso("q4b_matvec_h")?;
     let q4t = pso("q4t_matvec")?;
     let q4t_dual = pso("q4t_matvec_dual")?;
+    let q4t_dsilu = pso("q4t_matvec_dsilu")?;
     let q4tp = pso("q4tp_matvec")?;
     let q4tpjobs = pso("q4tp_matvec_jobs")?;
     let q2tpjobs = pso("q2tp_matvec_jobs")?;
@@ -4396,6 +4465,7 @@ fn init() -> Result<Ctx, String> {
         q4bh,
         q4t,
         q4t_dual,
+        q4t_dsilu,
         q4tp,
         q4tpjobs,
         q2tpjobs,
@@ -9813,6 +9883,30 @@ impl TokenGraph {
             );
             }
         }
+        let ad = self.proj_abs(down).unwrap();
+        // Part two of the fusion stack (same CMF_METAL_DUAL=1 gate):
+        // down consumes gate and up directly with SiLU inline — the
+        // silu dispatch and its dependent-stage drain disappear.
+        let dsilu_ok = std::env::var("CMF_METAL_DUAL").as_deref() == Ok("1")
+            && matches!(ad.1, ProjKind::Q4t)
+            && inter % 4 == 0;
+        if dsilu_ok {
+            let c = self.c;
+            enc.set_compute_pipeline_state(&c.q4t_dsilu);
+            enc.set_buffer(0, Some(&self.fbuf), ad.0 as u64);
+            enc.set_buffer(1, Some(&fg_b), 0);
+            enc.set_buffer(2, Some(&self.d_b), 0);
+            let gpr_u = (down.2 / GROUP_SIZE) as u32;
+            let rows_u = down.1 as u32;
+            enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+            enc.set_buffer(5, Some(&fu_b), 0);
+            let sgs = 8u64;
+            enc.dispatch_thread_groups(
+                MTLSize::new((down.1 as u64).div_ceil(sgs * 4), 1, 1),
+                MTLSize::new(sgs * 32, 1, 1),
+            );
+        } else {
         {
             enc.set_compute_pipeline_state(&self.c.silu);
             enc.set_buffer(0, Some(&fg_b), 0);
@@ -9825,7 +9919,6 @@ impl TokenGraph {
             enc.dispatch_threads(MTLSize::new(inter as u64, 1, 1), MTLSize::new(256, 1, 1));
         }
         {
-            let ad = self.proj_abs(down).unwrap();
             encode_proj(
                 self.c,
                 enc,
@@ -9837,6 +9930,7 @@ impl TokenGraph {
                 down.1,
                 down.2 / GROUP_SIZE,
             );
+        }
         }
         disp_axpy(self.c, enc, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
     }
