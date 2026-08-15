@@ -533,6 +533,26 @@ pub struct MtpModule {
     pub kv: crate::kv_cache::LayerKvCache,
 }
 
+/// The speculation trial's phases (see the decode loop): four timed
+/// speculative rounds, eight timed plain tokens, then the faster arm
+/// until a re-check.
+#[derive(Clone, Copy)]
+enum SpecTrial {
+    Spec {
+        t0: std::time::Instant,
+        gen0: usize,
+        rounds: usize,
+    },
+    Plain {
+        t0: std::time::Instant,
+        gen0: usize,
+    },
+    Decided {
+        spec: bool,
+        recheck_at: usize,
+    },
+}
+
 /// Result of a generation call.
 pub struct GenerateResult {
     pub text: String,
@@ -2178,14 +2198,22 @@ impl Pipeline {
             }};
         }
 
-        // Speculation watchdog. A k=4 round costs ~3.8 plain tokens on the
-        // 5090 (draft 6.6 + verify 66.6 + commit 4.8 ms against a 20.6 ms
-        // token), so it pays only when ~2.8 of the 4 drafts land — an
-        // accepted/drafted ratio of ~70%. Predictable text (code, the
-        // bench's prose loop, structured output) runs at 80–95% and gains
-        // up to +25%; free prose sits at 45–60% and would LOSE. Below 70%
-        // after the first 40 drafts the plain path takes over for the rest
-        // of the generation.
+        // Speculation is decided by MEASUREMENT, not by an acceptance
+        // model. A k=4 round costs ~3.8 plain tokens on the 5090 (draft
+        // 6.6 + verify 66.6 + commit 4.8 ms against a 20.6 ms token), so it
+        // pays only when the head lands ~2.8 of 4 — predictable text (code,
+        // structured output) does, free prose often does not, and the
+        // ratio at which the two cross depends on the card and the context
+        // depth. So: four speculative rounds timed, then eight plain
+        // tokens timed, and the faster arm runs until a re-check 256
+        // tokens later (context growth moves the balance). The trial
+        // costs at most a few tokens of the slower arm per 256.
+        let mut spec_trial = SpecTrial::Spec {
+            t0: std::time::Instant::now(),
+            gen0: generated,
+            rounds: 0,
+        };
+        let mut spec_rate = 0.0f64;
         let mut spec_watchdog_off = false;
         // ── Decode ──
         let mut next_pos = input_ids.len();
@@ -2282,6 +2310,36 @@ impl Pipeline {
                 self.kv_cache.evict(keep);
             }
 
+            // Advance the speculation trial: plain-phase accounting and
+            // the periodic re-check happen here, on every token.
+            if graph_spec {
+                match spec_trial {
+                    SpecTrial::Plain { t0, gen0 } if generated >= gen0 + 8 => {
+                        let plain_rate = (generated - gen0) as f64 / t0.elapsed().as_secs_f64();
+                        let keep = spec_rate > plain_rate * 1.03;
+                        tracing::info!(
+                            "speculation trial: spec {spec_rate:.1} tok/s vs plain {plain_rate:.1} — {}",
+                            if keep { "speculating" } else { "plain" }
+                        );
+                        spec_trial = SpecTrial::Decided {
+                            spec: keep,
+                            recheck_at: generated + 256,
+                        };
+                    }
+                    SpecTrial::Decided { recheck_at, .. } if generated >= recheck_at => {
+                        spec_trial = SpecTrial::Spec {
+                            t0: std::time::Instant::now(),
+                            gen0: generated,
+                            rounds: 0,
+                        };
+                    }
+                    _ => {}
+                }
+                spec_watchdog_off = matches!(
+                    spec_trial,
+                    SpecTrial::Plain { .. } | SpecTrial::Decided { spec: false, .. }
+                );
+            }
             match &mut mtp {
                 // ── Graph speculation: chain-draft, batch-verify on device ──
                 #[cfg(feature = "gpu")]
@@ -2302,11 +2360,21 @@ impl Pipeline {
                     ) {
                         next_pos = n_pos;
                         hidden = new_h;
-                        if drafted >= 40 && accepted * 100 < drafted * 70 {
-                            spec_watchdog_off = true;
-                            tracing::info!(
-                                "speculation off: {accepted} of {drafted} drafts accepted"
-                            );
+                        // One speculative round done: the trial counts it
+                        // (the tokens it produced are committed below and
+                        // land in `generated` before the next check).
+                        if let SpecTrial::Spec { t0, gen0, rounds } = spec_trial {
+                            let rounds = rounds + 1;
+                            let produced = generated + extra.len() + 1 - gen0;
+                            if rounds >= 4 {
+                                spec_rate = produced as f64 / t0.elapsed().as_secs_f64();
+                                spec_trial = SpecTrial::Plain {
+                                    t0: std::time::Instant::now(),
+                                    gen0: generated + extra.len(),
+                                };
+                            } else {
+                                spec_trial = SpecTrial::Spec { t0, gen0, rounds };
+                            }
                         }
                         let mut stopped = false;
                         for &id in &extra {
