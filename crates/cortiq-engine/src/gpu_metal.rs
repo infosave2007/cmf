@@ -2214,6 +2214,146 @@ kernel void gqa_attend(
     }
 }
 
+// ── GQA-shared, split-K attend (long context) ────────────────────────
+// One threadgroup per (kv head, 128-position block, row): its hpk
+// simdgroups are that kv head's query heads, so every K/V row is fetched
+// ONCE from DRAM for all of them (the per-head `gqa_attend` re-read the
+// group's K/V hpk times — 6× on Qwen3.8, 440 MB a layer at 9k context).
+// Each simdgroup keeps its head's online-softmax partial (m, l, acc[hd])
+// over the block, lane-sliced (dim d in lane d%32 slot d/32); the
+// partials go to `part` ([nb][nh][nblk][hd+2]) and `gqa_combine` folds
+// the blocks. Row e attends positions 0..s0+e (its own prefix). No Born
+// importance from this path.
+kernel void gqa_attend_blk(
+    device const float* q    [[buffer(0)]],   // [nb][nh][hd] rope'd
+    device const float* kbuf [[buffer(1)]],
+    device const float* vbuf [[buffer(2)]],
+    device float*       part [[buffer(3)]],
+    constant uint& nh   [[buffer(4)]],
+    constant uint& hpk  [[buffer(5)]],
+    constant uint& hd   [[buffer(6)]],
+    constant uint& cap  [[buffer(7)]],
+    constant uint& s0   [[buffer(8)]],
+    constant uint& nb   [[buffer(9)]],
+    constant uint& nblk [[buffer(10)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint kh = tg.x, j = tg.y, e = tg.z;
+    if (kh * hpk + sg >= nh || e >= nb || j >= nblk) return;
+    uint h = kh * hpk + sg;
+    uint n = s0 + e + 1u;
+    uint p0 = j * 128u;
+    uint p1 = min(p0 + 128u, n);
+    uint nt = (hd + 31u) / 32u;
+    device float* out = part + (((ulong)e * nh + h) * nblk + j) * (hd + 2u);
+    if (p0 >= n) {
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) out[d] = 0.0f;
+        }
+        if (lane == 0) { out[hd] = -INFINITY; out[hd + 1u] = 0.0f; }
+        return;
+    }
+    device const float* kh0 = kbuf + (ulong)kh * cap * hd;
+    device const float* vh0 = vbuf + (ulong)kh * cap * hd;
+    device const float* qh = q + ((ulong)e * nh + h) * hd;
+    float scale = 1.0f / sqrt((float)hd);
+    float qv[8];
+    for (uint t = 0; t < nt; ++t) {
+        uint d = t * 32u + lane;
+        qv[t] = d < hd ? qh[d] * scale : 0.0f;
+    }
+    float m = -INFINITY, l = 0.0f;
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    // Four positions a step: four independent dot/simd_sum chains in
+    // flight instead of one dependent chain per position (the serial
+    // loop was latency-bound at ~100 cycles a position).
+    uint p = p0;
+    for (; p + 4u <= p1; p += 4u) {
+        device const float* k0 = kh0 + (ulong)p * hd;
+        device const float* k1 = k0 + hd;
+        device const float* k2 = k1 + hd;
+        device const float* k3 = k2 + hd;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) {
+                float qd = qv[t];
+                a0 += qd * k0[d]; a1 += qd * k1[d]; a2 += qd * k2[d]; a3 += qd * k3[d];
+            }
+        }
+        float s0 = simd_sum(a0), s1 = simd_sum(a1), s2 = simd_sum(a2), s3 = simd_sum(a3);
+        float mp = max(max(m, s0), max(max(s1, s2), s3));
+        float f = exp(m - mp);
+        float w0 = exp(s0 - mp), w1 = exp(s1 - mp), w2 = exp(s2 - mp), w3 = exp(s3 - mp);
+        l = l * f + (w0 + w1) + (w2 + w3);
+        device const float* v0 = vh0 + (ulong)p * hd;
+        device const float* v1 = v0 + hd;
+        device const float* v2 = v1 + hd;
+        device const float* v3 = v2 + hd;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) acc[t] = acc[t] * f + (w0 * v0[d] + w1 * v1[d]) + (w2 * v2[d] + w3 * v3[d]);
+        }
+        m = mp;
+    }
+    for (; p < p1; ++p) {
+        device const float* kr = kh0 + (ulong)p * hd;
+        float partial = 0.0f;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) partial += qv[t] * kr[d];
+        }
+        float sv = simd_sum(partial);
+        float mp = max(m, sv);
+        float f = exp(m - mp), w = exp(sv - mp);
+        l = l * f + w;
+        device const float* vr = vh0 + (ulong)p * hd;
+        for (uint t = 0; t < nt; ++t) {
+            uint d = t * 32u + lane;
+            if (d < hd) acc[t] = acc[t] * f + w * vr[d];
+        }
+        m = mp;
+    }
+    for (uint t = 0; t < nt; ++t) {
+        uint d = t * 32u + lane;
+        if (d < hd) out[d] = acc[t];
+    }
+    if (lane == 0) { out[hd] = m; out[hd + 1u] = l; }
+}
+
+// Fold the block partials of `gqa_attend_blk` per (row, head):
+// out = Σ_j acc_j·exp(m_j − M) / Σ_j l_j·exp(m_j − M). One threadgroup
+// per (head, row), a thread per dim (hd ≤ 1024).
+kernel void gqa_combine(
+    device const float* part [[buffer(0)]],
+    device float*       outb [[buffer(1)]],   // [nb][nh][hd]
+    constant uint& nh   [[buffer(2)]],
+    constant uint& hd   [[buffer(3)]],
+    constant uint& nb   [[buffer(4)]],
+    constant uint& nblk [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]])
+{
+    uint h = tg.x, e = tg.y, d = tid.x;
+    if (h >= nh || e >= nb || d >= hd) return;
+    device const float* base = part + (((ulong)e * nh + h) * nblk) * (hd + 2u);
+    float M = -INFINITY;
+    for (uint j = 0; j < nblk; ++j) M = max(M, base[(ulong)j * (hd + 2u) + hd]);
+    float L = 0.0f, a = 0.0f;
+    for (uint j = 0; j < nblk; ++j) {
+        device const float* pj = base + (ulong)j * (hd + 2u);
+        float mj = pj[hd];
+        if (mj == -INFINITY) continue;
+        float w = exp(mj - M);
+        L += pj[hd + 1u] * w;
+        a += pj[d] * w;
+    }
+    outb[((ulong)e * nh + h) * hd + d] = L > 0.0f ? a / L : 0.0f;
+}
+
 // Chunk (prefill) attend: gqa_attend batched over the chunk's query
 // positions with the causal bound — query bi sees cache rows
 // 0 .. s0+bi. One simdgroup per (query, head), online softmax, the
@@ -5365,6 +5505,8 @@ struct Ctx {
     gdnstb64: ComputePipelineState,
     gdnstb128: ComputePipelineState,
     kvappb: ComputePipelineState,
+    gqablk: ComputePipelineState,
+    gqacomb: ComputePipelineState,
     rowpow2: ComputePipelineState,
     f32mv2b: ComputePipelineState,
     silurows: ComputePipelineState,
@@ -5574,6 +5716,8 @@ fn init() -> Result<Ctx, String> {
     let gdnstb64 = pso("gdn_state_b64")?;
     let gdnstb128 = pso("gdn_state_b128")?;
     let kvappb = pso("kv_append_b")?;
+    let gqablk = pso("gqa_attend_blk")?;
+    let gqacomb = pso("gqa_combine")?;
     let rowpow2 = pso("row_pow2_scale")?;
     let f32mv2b = pso("f32_matvec2_b")?;
     let silurows = pso("silu_rows")?;
@@ -5662,6 +5806,8 @@ fn init() -> Result<Ctx, String> {
         gdnstb64,
         gdnstb128,
         kvappb,
+        gqablk,
+        gqacomb,
         rowpow2,
         f32mv2b,
         silurows,
@@ -11503,6 +11649,9 @@ impl TokenGraph {
                 if entry.stored != p.cpu_stored {
                     // Resync from the owner of record (eviction, rollback,
                     // a CPU-path append, or a fresh mirror).
+                    if std::env::var("CMF_MIRROR_DBG").is_ok() {
+                        eprintln!("kv-mirror resync L{} : mirror {} vs cpu {} rows", p.layer, entry.stored as i64, p.cpu_stored);
+                    }
                     for h in 0..p.nkv {
                         if p.cpu_k[h].len() != p.cpu_stored * p.hd
                             || p.cpu_v[h].len() != p.cpu_stored * p.hd
@@ -11727,11 +11876,18 @@ impl TokenGraph {
             //    Flash-decoding: one threadgroup per Q-head, its simdgroups
             //    splitting the stored positions. ~32 positions per simdgroup
             //    is the point where the split stops paying for itself.
+            //    Deep contexts take the GQA-shared split-K kernel (K/V read
+            //    once for the group's heads; no importance pass).
             let n_pos = stored + 1;
+            let thr = gqa_blk_threshold();
+            let blk = thr > 0
+                && n_pos > thr
+                && encode_gqa_attend_blk(self.c, enc, &qr_b, &k_mb, &v_mb, &ao_b, p.nh, p.nkv, p.hd, cap, stored, 1);
             let cap_sgs = (self.c.gqat.max_total_threads_per_threadgroup() as usize / 32)
                 .clamp(1, gqa_split_max());
             let sgs = n_pos.div_ceil(32).clamp(1, cap_sgs);
             let tg_threads = 32 * sgs;
+            if !blk {
             disp_tg(
                 enc,
                 &self.c.gqat,
@@ -11747,6 +11903,7 @@ impl TokenGraph {
                 ((p.nh * tg_threads) as u64, tg_threads as u64),
                 ((sgs * p.hd + 2 * sgs) * 4) as u64,
             );
+            }
         }
         // 6. output gate
         if p.output_gate {
@@ -13040,7 +13197,13 @@ impl VerifyGraph {
             enc.set_bytes(4 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
         }
         enc.dispatch_threads(MTLSize::new(kvd as u64, b as u64, 1), MTLSize::new(256, 1, 1));
-        if b >= 2 {
+        let thr = gqa_blk_threshold();
+        let blk = b >= 2
+            && thr > 0
+            && stored + b > thr
+            && !verify_skip('a')
+            && encode_gqa_attend_blk(c, enc, &qr_b, &k_mb, &v_mb, &ao_b, p.nh, p.nkv, p.hd, cap, stored, b);
+        if b >= 2 && !blk {
             // the chunk attend: one simdgroup per (row, head), row e over
             // positions 0..=stored+e (one dispatch; the per-row flash split
             // below stays for the single row)
@@ -13255,6 +13418,68 @@ pub fn gdn_block(
 /// How many simdgroups may split one Q-head's positions in the decode
 /// attend (`CMF_GQA_SPLIT`, default 8). More splitting buys parallelism
 /// at depth and costs a wider threadgroup-memory combine.
+/// The GQA-shared split-K attend for `nb` rows: `q` [nb][nh][hd] rope'd,
+/// `ao` [nb][nh][hd] out; row e attends positions 0..=stored+e. Used past
+/// `gqa_blk_threshold()` positions (below it the per-head kernels are
+/// cheaper); needs hpk ≤ 8 (one simdgroup per query head of the group).
+#[allow(clippy::too_many_arguments)]
+fn encode_gqa_attend_blk(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    q: &Buffer,
+    k_mb: &Buffer,
+    v_mb: &Buffer,
+    ao: &Buffer,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    cap: usize,
+    stored: usize,
+    nb: usize,
+) -> bool {
+    let hpk = nh / nkv;
+    if hpk == 0 || hpk > 8 || hd > 1024 || nb == 0 {
+        return false;
+    }
+    let n_max = stored + nb;
+    let nblk = n_max.div_ceil(128);
+    let part = io_buf(c, 48_000_000_131 + nb * nh * nblk * (hd + 2), nb * nh * nblk * (hd + 2) * 4);
+    enc.set_compute_pipeline_state(&c.gqablk);
+    enc.set_buffer(0, Some(q), 0);
+    enc.set_buffer(1, Some(k_mb), 0);
+    enc.set_buffer(2, Some(v_mb), 0);
+    enc.set_buffer(3, Some(&part), 0);
+    let w = [nh as u32, hpk as u32, hd as u32, cap as u32, stored as u32, nb as u32, nblk as u32];
+    for (i, v) in w.iter().enumerate() {
+        enc.set_bytes(4 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
+    }
+    enc.dispatch_thread_groups(
+        MTLSize::new(nkv as u64, nblk as u64, nb as u64),
+        MTLSize::new((hpk * 32) as u64, 1, 1),
+    );
+    enc.set_compute_pipeline_state(&c.gqacomb);
+    enc.set_buffer(0, Some(&part), 0);
+    enc.set_buffer(1, Some(ao), 0);
+    let w2 = [nh as u32, hd as u32, nb as u32, nblk as u32];
+    for (i, v) in w2.iter().enumerate() {
+        enc.set_bytes(2 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
+    }
+    enc.dispatch_thread_groups(MTLSize::new(nh as u64, nb as u64, 1), MTLSize::new(hd as u64, 1, 1));
+    true
+}
+
+/// Positions past which the attend goes GQA-shared/split-K
+/// (`CMF_GQA_BLK`, default 512; 0 = never).
+fn gqa_blk_threshold() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CMF_GQA_BLK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512)
+    })
+}
+
 fn gqa_split_max() -> usize {
     use std::sync::OnceLock;
     static N: OnceLock<usize> = OnceLock::new();

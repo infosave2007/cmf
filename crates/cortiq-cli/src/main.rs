@@ -3668,6 +3668,14 @@ async fn cmd_run(
         println!("\nPrompt: {p}\n");
         let history = vec![("user".to_string(), p.to_string())];
         let ids = build_ids(&pipeline, &history, p);
+        // CMF_PROMPT_DUMP=1: the rendered prompt as the model sees it
+        // (template applied, decoded back to text) — for template audits.
+        if std::env::var("CMF_PROMPT_DUMP").is_ok() {
+            eprintln!("--- rendered prompt ({} tokens) ---\n{}\n--- end ---", ids.len(), pipeline.tokenizer.decode(&ids));
+            let head: Vec<String> = ids.iter().take(12).map(|&t| format!("{t}:{:?}", pipeline.tokenizer.decode(&[t]))).collect();
+            let tail: Vec<String> = ids.iter().rev().take(12).rev().map(|&t| format!("{t}:{:?}", pipeline.tokenizer.decode(&[t]))).collect();
+            eprintln!("head {}\ntail {}", head.join(" "), tail.join(" "));
+        }
         generate_and_print(&mut pipeline, &ids)?;
     } else {
         println!("\nType your message (Ctrl+C to exit):\n");
