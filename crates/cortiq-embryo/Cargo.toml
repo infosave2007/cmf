@@ -24,6 +24,15 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+fancy-regex = { workspace = true }
+flate2 = "1"
+# Corpus readers for the birth data (FineWeb parquet, C4 json.gz). Optional:
+# the trainer itself needs neither.
+parquet = { version = "59", default-features = false, features = ["snap", "zstd", "brotli", "flate2", "lz4"], optional = true }
+
+[features]
+default = []
+data = ["dep:parquet"]
 
 # The training kernels are Metal (Apple Silicon: unified memory, simdgroup
 # matrices). Everything else in the crate — the model, the CPU reference
