@@ -1822,14 +1822,23 @@ impl Pipeline {
         // through tile GEMMs today and measured a LOSS (q8_2f 22 against
         // 29 tok/s), the 2-bit plane the same; those stay opt-in
         // (`CMF_GRAPH_SPEC=1`).
-        let spec_default_ok = self.weights.layers.iter().all(|lw| match &lw.ffn {
-            FfnKind::Dense(d) => {
-                matches!(d.gate_proj.graph_weight(), Some((_, _, 6, _)))
+        // …at least in nine dense FFNs of ten: a healed file carries its
+        // last two layers at q8_2f, and two tile-GEMM verifies among 64 do
+        // not change the arithmetic (measured: the healed q4tp file
+        // decodes at the plain file's rate and would otherwise sit out).
+        let (mut dense_n, mut dense_q4tp) = (0usize, 0usize);
+        for lw in &self.weights.layers {
+            if let FfnKind::Dense(d) = &lw.ffn {
+                dense_n += 1;
+                if matches!(d.gate_proj.graph_weight(), Some((_, _, 6, _)))
                     && matches!(d.up_proj.graph_weight(), Some((_, _, 6, _)))
                     && matches!(d.down_proj.graph_weight(), Some((_, _, 6, _)))
+                {
+                    dense_q4tp += 1;
+                }
             }
-            _ => true,
-        });
+        }
+        let spec_default_ok = dense_n == 0 || dense_q4tp * 10 >= dense_n * 9;
         // Penalties break the draft head's agreement with the trunk (a
         // 1.1 repetition penalty measured 2 of 16 accepted): not by
         // default there either.
