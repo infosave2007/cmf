@@ -2454,7 +2454,14 @@ impl Pipeline {
                     // ledger, so a graph that keeps refusing is measured out
                     // like a head that keeps missing (it was spinning
                     // forever on a file whose batch graph declines).
+                    // A declined round is not a cheap one-token round — it
+                    // is a verify that does not exist for this file (a
+                    // healed q8_2f tail measured 760 drafts, 0 accepted, 33
+                    // against 48.8 tok/s while the monitor called the draft
+                    // alone "paying"). Count it as the losing streak in one.
                     spec_mon.round(t_round.elapsed().as_secs_f64() * 1e3, 1);
+                    spec_mon.tokens = 0.0;
+                    spec_mon.fails = 3;
                     spec_trial = Self::spec_trial_round(spec_trial, &mut spec_mon, generated + 1);
                     hidden = self.forward_layers(&self.embed_single(t_next), next_pos, task_mask);
                     next_pos += 1;
