@@ -47,6 +47,15 @@ pub struct Ctx {
     hk_chunk_fwd: ComputePipelineState,
     hk_dstates_bwd: ComputePipelineState,
     hk_chunk_bwd: ComputePipelineState,
+    rope: ComputePipelineState,
+    causal_softmax: ComputePipelineState,
+    softmax_bwd: ComputePipelineState,
+    sigmoid_fwd: ComputePipelineState,
+    sigmoid_bwd: ComputePipelineState,
+    embed_scatter_add: ComputePipelineState,
+    copy: ComputePipelineState,
+    kappa_fwd: ComputePipelineState,
+    kappa_bwd: ComputePipelineState,
 }
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
@@ -132,6 +141,15 @@ fn init() -> Result<Ctx, String> {
         hk_chunk_fwd: pso("hk_chunk_fwd_f32")?,
         hk_dstates_bwd: pso("hk_dstates_bwd_f32")?,
         hk_chunk_bwd: pso("hk_chunk_bwd_f32")?,
+        rope: pso("rope_f32")?,
+        causal_softmax: pso("causal_softmax_rows_f32")?,
+        softmax_bwd: pso("softmax_bwd_rows_f32")?,
+        sigmoid_fwd: pso("sigmoid_fwd_f32")?,
+        sigmoid_bwd: pso("sigmoid_bwd_f32")?,
+        embed_scatter_add: pso("embed_scatter_add_f32")?,
+        copy: pso("copy_f32")?,
+        kappa_fwd: pso("kappa_fwd_f32")?,
+        kappa_bwd: pso("kappa_bwd_f32")?,
         gemm,
         _lib: lib,
         queue,
@@ -594,6 +612,212 @@ impl<'a> Cmd<'a> {
             self.set_f32(4, beta_th);
             self.grid1(rows * d.nh * d.nph, 256);
         }
+    }
+
+    // ---------------- anchor attention companions ----------------
+
+    /// RoPE in place on x[rows, nheads·hd] (neox halves), position = row % t.
+    /// `inverse` applies the transpose rotation (the backward).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope(&self, x: &GBuf, x_off: usize, rows: usize, t: usize, nheads: usize, hd: usize, base: f32, inverse: bool) {
+        assert!(hd % 2 == 0 && x.len >= x_off + rows * nheads * hd);
+        #[repr(C)]
+        struct Args {
+            t: u32,
+            nheads: u32,
+            hd: u32,
+            base: f32,
+            sign: f32,
+        }
+        let a = Args { t: t as u32, nheads: nheads as u32, hd: hd as u32, base, sign: if inverse { -1.0 } else { 1.0 } };
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.rope);
+        e.set_buffer(0, Some(&x.buf), (x_off * 4) as u64);
+        e.set_bytes(1, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+        self.grid1(rows * nheads * (hd / 2), 256);
+    }
+
+    /// Causal row softmax in place on an [t,t] block at `off` (row stride t).
+    pub fn causal_softmax(&self, s: &GBuf, off: usize, t: usize) {
+        assert!(s.len >= off + t * t);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.causal_softmax);
+        e.set_buffer(0, Some(&s.buf), (off * 4) as u64);
+        self.set_u32(1, t as u32);
+        e.dispatch_thread_groups(MTLSize::new(t as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// dS = P ⊙ (dP − rowsum(P⊙dP)) in place on dP ([t,t] blocks at offsets).
+    pub fn softmax_bwd(&self, p: &GBuf, p_off: usize, dp: &GBuf, dp_off: usize, t: usize) {
+        assert!(p.len >= p_off + t * t && dp.len >= dp_off + t * t);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.softmax_bwd);
+        e.set_buffer(0, Some(&p.buf), (p_off * 4) as u64);
+        e.set_buffer(1, Some(&dp.buf), (dp_off * 4) as u64);
+        self.set_u32(2, t as u32);
+        e.dispatch_thread_groups(MTLSize::new(t as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// y = σ(x + bias) over n.
+    pub fn sigmoid_fwd(&self, x: &GBuf, y: &GBuf, bias: f32, n: usize) {
+        assert!(x.len >= n && y.len >= n);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.sigmoid_fwd);
+        e.set_buffer(0, Some(&x.buf), 0);
+        e.set_buffer(1, Some(&y.buf), 0);
+        self.set_f32(2, bias);
+        self.set_u32(3, n as u32);
+        self.grid1(n, 256);
+    }
+
+    /// dx = dy·y·(1−y) over n.
+    pub fn sigmoid_bwd(&self, y: &GBuf, dy: &GBuf, dx: &GBuf, n: usize) {
+        assert!(y.len >= n && dy.len >= n && dx.len >= n);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.sigmoid_bwd);
+        e.set_buffer(0, Some(&y.buf), 0);
+        e.set_buffer(1, Some(&dy.buf), 0);
+        e.set_buffer(2, Some(&dx.buf), 0);
+        self.set_u32(3, n as u32);
+        self.grid1(n, 256);
+    }
+
+    /// dE[tok[row],:] += dx[row,:] (atomic).
+    pub fn embed_scatter_add(&self, de: &GBuf, de_off: usize, tok: &GBuf, dx: &GBuf, rows: usize, d: usize) {
+        assert!(tok.len >= rows && dx.len >= rows * d);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.embed_scatter_add);
+        e.set_buffer(0, Some(&de.buf), (de_off * 4) as u64);
+        e.set_buffer(1, Some(&tok.buf), 0);
+        e.set_buffer(2, Some(&dx.buf), 0);
+        self.set_u32(3, d as u32);
+        let tgx = 64u64.min(d as u64).max(1);
+        e.dispatch_thread_groups(
+            MTLSize::new((d as u64).div_ceil(tgx), rows as u64, 1),
+            MTLSize::new(tgx, 1, 1),
+        );
+    }
+
+    /// dst[dst_off..+n] = src[src_off..+n].
+    pub fn copy(&self, src: &GBuf, src_off: usize, dst: &GBuf, dst_off: usize, n: usize) {
+        assert!(src.len >= src_off + n && dst.len >= dst_off + n);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.copy);
+        e.set_buffer(0, Some(&src.buf), (src_off * 4) as u64);
+        e.set_buffer(1, Some(&dst.buf), (dst_off * 4) as u64);
+        self.set_u32(2, n as u32);
+        self.grid1(n, 256);
+    }
+
+    /// Embedding gather with a table offset (the tied table lives inside
+    /// the parameter arena).
+    pub fn embed_gather_at(&self, e_tab: &GBuf, e_off: usize, tok: &GBuf, out: &GBuf, rows: usize, d: usize) {
+        assert!(tok.len >= rows && out.len >= rows * d);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.embed_gather);
+        e.set_buffer(0, Some(&e_tab.buf), (e_off * 4) as u64);
+        e.set_buffer(1, Some(&tok.buf), 0);
+        e.set_buffer(2, Some(&out.buf), 0);
+        self.set_u32(3, d as u32);
+        let tgx = 64u64.min(d as u64).max(1);
+        e.dispatch_thread_groups(
+            MTLSize::new((d as u64).div_ceil(tgx), rows as u64, 1),
+            MTLSize::new(tgx, 1, 1),
+        );
+    }
+
+    /// RMSNorm forward where w lives at an offset inside a bigger buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_fwd_at(&self, x: &GBuf, w: &GBuf, w_off: usize, y: &GBuf, inv: &GBuf, rows: usize, d: usize, eps: f32) {
+        assert!(x.len >= rows * d && y.len >= rows * d && w.len >= w_off + d && inv.len >= rows);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.rms_fwd);
+        e.set_buffer(0, Some(&x.buf), 0);
+        e.set_buffer(1, Some(&w.buf), (w_off * 4) as u64);
+        e.set_buffer(2, Some(&y.buf), 0);
+        e.set_buffer(3, Some(&inv.buf), 0);
+        self.set_u32(4, d as u32);
+        self.set_f32(5, eps);
+        e.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(128, 1, 1));
+    }
+
+    /// RMSNorm backward with w and dw at offsets inside bigger buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_bwd_at(
+        &self,
+        x: &GBuf,
+        w: &GBuf,
+        w_off: usize,
+        dy: &GBuf,
+        inv: &GBuf,
+        dx: &GBuf,
+        beta: f32,
+        dw: &GBuf,
+        dw_off: usize,
+        rows: usize,
+        d: usize,
+    ) {
+        assert!(x.len >= rows * d && dy.len >= rows * d && dx.len >= rows * d && dw.len >= dw_off + d && w.len >= w_off + d);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.rms_bwd_dx);
+        e.set_buffer(0, Some(&x.buf), 0);
+        e.set_buffer(1, Some(&w.buf), (w_off * 4) as u64);
+        e.set_buffer(2, Some(&dy.buf), 0);
+        e.set_buffer(3, Some(&inv.buf), 0);
+        e.set_buffer(4, Some(&dx.buf), 0);
+        self.set_u32(5, d as u32);
+        self.set_f32(6, beta);
+        e.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(128, 1, 1));
+        e.set_compute_pipeline_state(&self.c.rms_dw);
+        e.set_buffer(0, Some(&x.buf), 0);
+        e.set_buffer(1, Some(&dy.buf), 0);
+        e.set_buffer(2, Some(&inv.buf), 0);
+        e.set_buffer(3, Some(&dw.buf), (dw_off * 4) as u64);
+        self.set_u32(4, d as u32);
+        self.set_u32(5, rows as u32);
+        self.grid1(d, 128);
+    }
+
+    /// Fused softmax-CE where the logits block sits at an offset.
+    pub fn softmax_ce_at(&self, logits: &GBuf, l_off: usize, target: &GBuf, t_off: usize, loss: &GBuf, l2_off: usize, rows: usize, n: usize, scale: f32) {
+        assert!(logits.len >= l_off + rows * n && target.len >= t_off + rows && loss.len >= l2_off + rows);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.softmax_ce);
+        e.set_buffer(0, Some(&logits.buf), (l_off * 4) as u64);
+        e.set_buffer(1, Some(&target.buf), (t_off * 4) as u64);
+        e.set_buffer(2, Some(&loss.buf), (l2_off * 4) as u64);
+        self.set_u32(3, n as u32);
+        self.set_f32(4, scale);
+        e.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// κ = σ(pre[:, :nh] + bias) from a padded [rows, ld] pre-activation.
+    pub fn kappa_fwd(&self, pre: &GBuf, kap: &GBuf, rows: usize, nh: usize, ld: usize, bias: f32) {
+        assert!(pre.len >= rows * ld && kap.len >= rows * nh);
+        #[repr(C)]
+        struct Args { rows: u32, nh: u32, ld: u32, bias: f32 }
+        let a = Args { rows: rows as u32, nh: nh as u32, ld: ld as u32, bias };
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.kappa_fwd);
+        e.set_buffer(0, Some(&pre.buf), 0);
+        e.set_buffer(1, Some(&kap.buf), 0);
+        e.set_bytes(2, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+        self.grid1(rows * nh, 256);
+    }
+
+    /// dpre (padded [rows, ld]) from dκ.
+    pub fn kappa_bwd(&self, kap: &GBuf, dkap: &GBuf, dpre: &GBuf, rows: usize, nh: usize, ld: usize) {
+        assert!(dpre.len >= rows * ld && kap.len >= rows * nh && dkap.len >= rows * nh);
+        #[repr(C)]
+        struct Args { rows: u32, nh: u32, ld: u32, bias: f32 }
+        let a = Args { rows: rows as u32, nh: nh as u32, ld: ld as u32, bias: 0.0 };
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.kappa_bwd);
+        e.set_buffer(0, Some(&kap.buf), 0);
+        e.set_buffer(1, Some(&dkap.buf), 0);
+        e.set_buffer(2, Some(&dpre.buf), 0);
+        e.set_bytes(3, std::mem::size_of::<Args>() as u64, &a as *const Args as *const c_void);
+        self.grid1(rows * ld, 256);
     }
 
     /// Submit and wait. Returns GPU time in milliseconds (GPUEndTime −
