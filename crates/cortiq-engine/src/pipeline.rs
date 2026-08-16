@@ -1386,7 +1386,8 @@ impl Pipeline {
                     };
                     // CMF_ATTN_ORACLE=1: diff the device attend against
                     // this CPU attend on identical inputs (bring-up).
-                    let oracle = std::env::var("CMF_ATTN_ORACLE").as_deref() == Ok("1");
+                    let oracle = std::env::var("CMF_ATTN_ORACLE").as_deref() == Ok("1")
+                        || std::env::var("CMF_ATTN_DUMP").is_ok();
                     let _ = full_gpu;
                     let oracle_in = oracle.then(|| (q_raw.clone(), k.clone(), v.clone()));
                     let mut ao = attention::qwen_attention_core(
@@ -1396,7 +1397,35 @@ impl Pipeline {
                         &mut self.kv_cache.layers[*li],
                         &cfg,
                     );
-                    if let Some((qr0, k0, v0)) = oracle_in {
+                    // CMF_ATTN_DUMP=<dir>: this token's rope'd Q and the layer's whole
+                    // K/V cache as raw f32 (offline attention-statistics probes:
+                    // block bounds, mass concentration). Needs CMF_GPU_ATTEND=0.
+                    if let Ok(dir) = std::env::var("CMF_ATTN_DUMP") {
+                        if let Some((qr0, k0, v0)) = oracle_in.clone() {
+                            let (cq, _cg, _ck, _cv) = attention::finish_projection_debug(qr0, k0, v0, &cfg, position);
+                            let cache = &self.kv_cache.layers[*li];
+                            let n = cache.head_keys(0).len() / hd;
+                            let mut bytes: Vec<u8> = Vec::new();
+                            for v in [nh as u32, nkv as u32, hd as u32, n as u32, position as u32] {
+                                bytes.extend_from_slice(&v.to_le_bytes());
+                            }
+                            for v in &cq {
+                                bytes.extend_from_slice(&v.to_le_bytes());
+                            }
+                            for g in 0..nkv {
+                                for v in cache.head_keys(g) {
+                                    bytes.extend_from_slice(&v.to_le_bytes());
+                                }
+                            }
+                            for g in 0..nkv {
+                                for v in cache.head_values(g) {
+                                    bytes.extend_from_slice(&v.to_le_bytes());
+                                }
+                            }
+                            let _ = std::fs::write(format!("{dir}/L{li}_pos{position}.bin"), &bytes);
+                        }
+                    }
+                    if let Some((qr0, k0, v0)) = oracle_in.filter(|_| std::env::var("CMF_ATTN_ORACLE").as_deref() == Ok("1")) {
                         let (cq, _cg, ck, cv) = attention::finish_projection_debug(qr0, k0, v0, &cfg, position);
                         let mut h_now = vec![0f32; hs];
                         graph.read_h(&mut h_now);
