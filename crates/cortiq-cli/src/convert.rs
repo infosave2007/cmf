@@ -1950,6 +1950,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                     .and_then(|v| v.as_f64())
                     .map(|v| v as f32)
                     .filter(|&v| (v - 1.0).abs() > 1e-9),
+                router_resonance: false,
             }
         });
     let head_dim = cfg_usize(tc, "head_dim").unwrap_or(hidden / n_heads.max(1));
@@ -2263,6 +2264,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             }),
         moe,
         linear_core,
+        head_clusters: None,
         max_position_embeddings: max_pos,
         // GDN spells it `linear_conv_kernel_dim`; LFM2 spells it
         // `conv_L_cache`; Kimi nests KDA geometry in linear_attn_config.
