@@ -273,3 +273,98 @@ fn hybrid_k_chunk_scan_matches_cpu_oracle() {
         }
     }
 }
+
+#[test]
+fn gemm_batched_with_causal_mask() {
+    use cortiq_embryo::metal::GemmBatch;
+    let Some(c) = ctx() else { return };
+    // 2×3×4 batches of [64×64]·[64×128]ᵀ... use NT: A [64,32] (lda 32), B [64,32] → C [64,64], causal.
+    let (nb, nh, nc) = (2usize, 3usize, 4usize);
+    let (m, n, k) = (64usize, 64usize, 32usize);
+    let sa = [nh * nc * m * k, nc * m * k, m * k];
+    let sb = [nh * nc * n * k, nc * n * k, n * k];
+    let sc = [nh * nc * m * n, nc * m * n, m * n];
+    let a = lcg_vec(1, nb * nh * nc * m * k);
+    let b = lcg_vec(2, nb * nh * nc * n * k);
+    let ga = GBuf::from_slice(c, &a);
+    let gb = GBuf::from_slice(c, &b);
+    let gc = GBuf::zeros(c, nb * nh * nc * m * n);
+    let cmd = Cmd::new(c);
+    cmd.gemm_ex(Op::N, Op::T, m, n, k, 1.0, &ga, 0, k, &gb, 0, k, 0.0, &gc, 0, n, &GemmBatch { nb, nh, nc, sa, sb, sc }, true);
+    cmd.commit();
+    let got = gc.to_vec();
+    for bi in 0..nb {
+        for hi in 0..nh {
+            for ci in 0..nc {
+                let ao = bi * sa[0] + hi * sa[1] + ci * sa[2];
+                let bo = bi * sb[0] + hi * sb[1] + ci * sb[2];
+                let co = bi * sc[0] + hi * sc[1] + ci * sc[2];
+                let mut want = vec![0.0f32; m * n];
+                gemm_ref(false, true, m, n, k, 1.0, &a[ao..ao + m * k], k, &b[bo..bo + n * k], k, 0.0, &mut want, n);
+                for i in 0..m {
+                    for j in 0..n {
+                        if j > i {
+                            want[i * n + j] = 0.0;
+                        }
+                    }
+                }
+                let d = max_abs_diff(&got[co..co + m * n], &want);
+                assert!(d < 1e-4, "batch ({bi},{hi},{ci}) max|Δ|={d}");
+            }
+        }
+    }
+}
+
+#[test]
+fn hybrid_k_gemm_formulation_matches_oracle_and_simt() {
+    use cortiq_embryo::metal::{HkGrads, HkScratch, HkWork, hk_pow_table};
+    use cortiq_embryo::ops::{HkDims, hk_decay_grid, hk_ref_bwd, hk_ref_fwd};
+    let Some(c) = ctx() else { return };
+    for &(b, t, nh, nph, dv, hmin) in &[(2usize, 192usize, 2usize, 32usize, 128usize, 8.0f64), (1, 256, 3, 32, 64, 1.5)] {
+        let d = HkDims { b, t, nh, nph, dv };
+        let rows = b * t;
+        let p2 = 2 * nph;
+        let thq: Vec<f32> = lcg_vec(1, rows * nh * nph).iter().map(|x| x * 3.0).collect();
+        let thk: Vec<f32> = lcg_vec(2, rows * nh * nph).iter().map(|x| x * 3.0).collect();
+        let v = lcg_vec(3, rows * nh * dv);
+        let kappa: Vec<f32> = lcg_vec(4, rows * nh).iter().map(|x| 0.5 + 0.4 * x).collect();
+        let dout = lcg_vec(5, rows * nh * dv);
+        let decay = hk_decay_grid(nh, nph, hmin, 2.0 * t as f64);
+        let to64 = |v: &[f32]| v.iter().map(|x| *x as f64).collect::<Vec<f64>>();
+        let o_ref = hk_ref_fwd(&d, &to64(&thq), &to64(&thk), &to64(&v), &to64(&kappa), &to64(&decay));
+        let (dthq_ref, dthk_ref, dv_ref, dkap_ref) =
+            hk_ref_bwd(&d, &to64(&thq), &to64(&thk), &to64(&v), &to64(&kappa), &to64(&decay), &to64(&dout));
+        let g = |n: usize| GBuf::zeros(c, n);
+        let (gthq, gthk, gv, gkap) = (GBuf::from_slice(c, &thq), GBuf::from_slice(c, &thk), GBuf::from_slice(c, &v), GBuf::from_slice(c, &kappa));
+        let gpow = GBuf::from_slice(c, &hk_pow_table(&decay, nh, nph));
+        let (gphq, gphk, gkv, gout) = (g(rows * nh * p2), g(rows * nh * p2), g(rows * nh * dv), g(rows * nh * dv));
+        let nst = b * nh * (t / 64 + 1) * p2 * dv;
+        let gstates = g(nst);
+        let w = HkWork { thq: &gthq, thk: &gthk, v: &gv, kappa: &gkap, pow: &gpow, phq: &gphq, phk: &gphk, kv: &gkv, states: &gstates, out: &gout };
+        let gdout = GBuf::from_slice(c, &dout);
+        let (gdst, gdkv, gdphq, gdphk) = (g(nst), g(rows * nh * dv), g(rows * nh * p2), g(rows * nh * p2));
+        let (gdthq, gdthk, gdv, gdkap) = (g(rows * nh * nph), g(rows * nh * nph), g(rows * nh * dv), g(rows * nh));
+        let gr = HkGrads { dout: &gdout, dstates: &gdst, dkv: &gdkv, dphq: &gdphq, dphk: &gdphk, dthq: &gdthq, dthk: &gdthk, dv: &gdv, dkappa: &gdkap };
+        let cl = HkScratch::chunk_len(&d);
+        let al = HkScratch::a_len(&d);
+        let (qt, kt, qp, kh, dqt, dkt, dqi, dki, a) = (g(cl), g(cl), g(cl), g(cl), g(cl), g(cl), g(cl), g(cl), g(al));
+        let sc = HkScratch { qt: &qt, kt: &kt, qp: &qp, kh: &kh, dqt: &dqt, dkt: &dkt, dqi: &dqi, dki: &dki, a: &a };
+        let cmd = Cmd::new(c);
+        cmd.hk_forward_gemm(&d, &w, &sc);
+        cmd.hk_backward_gemm(&d, &w, &gr, &sc, 0.0);
+        let ms = cmd.commit();
+        let rel = |got: &[f32], want: &[f64]| -> f64 {
+            let scale = want.iter().fold(0.0f64, |m, x| m.max(x.abs())).max(1e-12);
+            got.iter().zip(want).map(|(a, b)| (*a as f64 - b).abs()).fold(0.0, f64::max) / scale
+        };
+        let e_o = rel(&gout.to_vec(), &o_ref);
+        let e_q = rel(&gdthq.to_vec(), &dthq_ref);
+        let e_k = rel(&gdthk.to_vec(), &dthk_ref);
+        let e_v = rel(&gdv.to_vec(), &dv_ref);
+        let e_kap = rel(&gdkap.to_vec(), &dkap_ref);
+        eprintln!("hk-gemm b={b} t={t} nh={nh} nph={nph} dv={dv} hmin={hmin}: {ms:.2} ms; rel err out {e_o:.2e} dthq {e_q:.2e} dthk {e_k:.2e} dv {e_v:.2e} dkappa {e_kap:.2e}");
+        for (name, e) in [("out", e_o), ("dthq", e_q), ("dthk", e_k), ("dv", e_v), ("dkappa", e_kap)] {
+            assert!(e < 5e-4, "hybrid_k gemm {name}: rel err {e:e}");
+        }
+    }
+}

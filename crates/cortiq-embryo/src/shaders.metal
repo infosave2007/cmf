@@ -33,9 +33,15 @@ constant bool TA [[function_constant(0)]];
 constant bool TB [[function_constant(1)]];
 
 struct GemmArgs {
+    // batch strides (elements) for the (b, h, c) decomposition of tgid.z
+    ulong sa_b, sa_h, sa_c;
+    ulong sb_b, sb_h, sb_c;
+    ulong sc_b, sc_h, sc_c;
     uint M, N, K;
     uint lda, ldb, ldc;
     float alpha, beta;
+    uint nb_h, nb_c;   // z = (b·nb_h + h)·nb_c + c
+    uint mask;         // 1: causal — C[i,j] = 0 for j > i (global indices)
 };
 
 #define BM 64u
@@ -48,10 +54,20 @@ kernel void gemm_f32(
     device const float* B [[buffer(1)]],
     device float*       C [[buffer(2)]],
     constant GemmArgs&  g [[buffer(3)]],
-    uint2 tgid [[threadgroup_position_in_grid]],
+    uint3 tgid [[threadgroup_position_in_grid]],
     uint  tid  [[thread_index_in_threadgroup]],
     uint  sgid [[simdgroup_index_in_threadgroup]])
 {
+    {
+        uint z = tgid.z;
+        uint cb = z % g.nb_c;
+        uint rem = z / g.nb_c;
+        uint hb = rem % g.nb_h;
+        uint bb = rem / g.nb_h;
+        A += bb * g.sa_b + hb * g.sa_h + cb * g.sa_c;
+        B += bb * g.sb_b + hb * g.sb_h + cb * g.sb_c;
+        C += bb * g.sc_b + hb * g.sc_h + cb * g.sc_c;
+    }
     // One 16 KB arena: sA = [BM][BK] (m-major, k contiguous),
     // sB = [BK][BN] (k-major, n contiguous). After the K loop the same
     // 4096 floats are the [BM][BN] C staging tile.
@@ -168,6 +184,13 @@ kernel void gemm_f32(
         float4 v = *(threadgroup float4*)(smem + r * BN + c4 * 4u) * g.alpha;
         device float4* dst = (device float4*)(C + (ulong)(m0 + r) * g.ldc + n0 + c4 * 4u);
         if (accumulate) { v += *dst * g.beta; }
+        if (g.mask == 1u) {
+            uint i = m0 + r, j0 = n0 + c4 * 4u;
+            if (j0 + 0u > i) v.x = 0.0f;
+            if (j0 + 1u > i) v.y = 0.0f;
+            if (j0 + 2u > i) v.z = 0.0f;
+            if (j0 + 3u > i) v.w = 0.0f;
+        }
         *dst = v;
     }
 }
@@ -510,9 +533,12 @@ kernel void hk_dkv_split_f32(
     dkap[gid] = s;
 }
 
-// Forward states: one threadgroup per (b,h), one thread per value channel
-// d; the literal recurrence over all T positions, S at every chunk
-// boundary written out. Threadgroup = dv threads.
+// Forward states: one threadgroup per (b,h), threads = dv × FS where each
+// thread owns value channel d and a 16-feature slice fg (FS = ceil(P2/16))
+// — 16 accumulators per thread keeps the register file small enough for
+// several threadgroups per core; φk of the chunk is staged once per
+// threadgroup. The literal recurrence; S at every chunk boundary written.
+#define HK_FT 16u
 kernel void hk_states_fwd_f32(
     device const float* phk    [[buffer(0)]],
     device const float* kv     [[buffer(1)]],
@@ -520,34 +546,42 @@ kernel void hk_states_fwd_f32(
     device float*       states [[buffer(3)]],
     constant HkArgs&    a      [[buffer(4)]],
     uint tg  [[threadgroup_position_in_grid]],
-    uint d   [[thread_index_in_threadgroup]])
+    uint tid [[thread_index_in_threadgroup]],
+    uint nth [[threads_per_threadgroup]])
 {
     threadgroup float sk[HK_C * HK_P2];   // φk of the current chunk
     uint b = tg / a.nh, h = tg % a.nh;
     uint p2 = 2u * a.nph;
     uint nchunks = a.T / HK_C;
-    // γ_f = pow[h][1][f]
+    uint d = tid % a.dv, fg = tid / a.dv;
+    uint f0 = fg * HK_FT;
     device const float* gam = pow_t + ((ulong)h * (HK_C + 1u) + 1u) * p2;
-    float S[HK_P2];
-    for (uint f = 0; f < HK_P2; ++f) S[f] = 0.0f;
+    float S[HK_FT], gm[HK_FT];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < HK_FT; ++i) { S[i] = 0.0f; gm[i] = (f0 + i < p2) ? gam[f0 + i] : 0.0f; }
     ulong st_base = ((ulong)b * a.nh + h) * (nchunks + 1u) * p2 * a.dv;
     for (uint c = 0; c < nchunks; ++c) {
-        // S entering chunk c
-        for (uint f = 0; f < p2; ++f) states[st_base + ((ulong)c * p2 + f) * a.dv + d] = S[f];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < HK_FT; ++i) {
+            if (f0 + i < p2) states[st_base + ((ulong)c * p2 + f0 + i) * a.dv + d] = S[i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = d; i < HK_C * p2; i += a.dv) {
-            uint s = i / p2, f = i % p2;
-            sk[s * HK_P2 + f] = phk[((ulong)(b * a.T + c * HK_C + s) * a.nh + h) * p2 + f];
+        for (uint i = tid; i < HK_C * HK_P2; i += nth) {
+            uint s = i / HK_P2, f = i % HK_P2;
+            sk[i] = (f < p2) ? phk[((ulong)(b * a.T + c * HK_C + s) * a.nh + h) * p2 + f] : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint s = 0; s < HK_C; ++s) {
             float kvv = kv[((ulong)(b * a.T + c * HK_C + s) * a.nh + h) * a.dv + d];
-            for (uint f = 0; f < p2; ++f) {
-                S[f] = gam[f] * S[f] + sk[s * HK_P2 + f] * kvv;
-            }
+            threadgroup const float* skr = sk + s * HK_P2 + f0;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < HK_FT; ++i) S[i] = gm[i] * S[i] + skr[i] * kvv;
         }
     }
-    for (uint f = 0; f < p2; ++f) states[st_base + ((ulong)nchunks * p2 + f) * a.dv + d] = S[f];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < HK_FT; ++i) {
+        if (f0 + i < p2) states[st_base + ((ulong)nchunks * p2 + f0 + i) * a.dv + d] = S[i];
+    }
 }
 
 // Forward per chunk: one threadgroup per (b,h,c), nth threads (≥ dv).
@@ -604,10 +638,11 @@ kernel void hk_chunk_fwd_f32(
     }
 }
 
-// Backward state gradients (reverse over positions):
+// Backward state gradients (reverse over positions), same thread layout
+// as hk_states_fwd_f32:
 //   G ← γ ⊙ (G + φq_t ⊗ do_t)   for t = T−1 … 0,
 // G at each chunk boundary written to dstates[c] = ∂L/∂S_c restricted
-// to reads by chunks ≥ c (dstates[nchunks] = 0). Threadgroup = dv threads.
+// to reads by chunks ≥ c (dstates[nchunks] = 0).
 kernel void hk_dstates_bwd_f32(
     device const float* phq     [[buffer(0)]],
     device const float* dout    [[buffer(1)]],
@@ -615,33 +650,43 @@ kernel void hk_dstates_bwd_f32(
     device float*       dstates [[buffer(3)]],
     constant HkArgs&    a       [[buffer(4)]],
     uint tg  [[threadgroup_position_in_grid]],
-    uint d   [[thread_index_in_threadgroup]])
+    uint tid [[thread_index_in_threadgroup]],
+    uint nth [[threads_per_threadgroup]])
 {
     threadgroup float sq[HK_C * HK_P2];
     uint b = tg / a.nh, h = tg % a.nh;
     uint p2 = 2u * a.nph;
     uint nchunks = a.T / HK_C;
+    uint d = tid % a.dv, fg = tid / a.dv;
+    uint f0 = fg * HK_FT;
     device const float* gam = pow_t + ((ulong)h * (HK_C + 1u) + 1u) * p2;
-    float G[HK_P2];
-    for (uint f = 0; f < HK_P2; ++f) G[f] = 0.0f;
+    float G[HK_FT], gm[HK_FT];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < HK_FT; ++i) { G[i] = 0.0f; gm[i] = (f0 + i < p2) ? gam[f0 + i] : 0.0f; }
     ulong st_base = ((ulong)b * a.nh + h) * (nchunks + 1u) * p2 * a.dv;
-    for (uint f = 0; f < p2; ++f) dstates[st_base + ((ulong)nchunks * p2 + f) * a.dv + d] = 0.0f;
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < HK_FT; ++i) {
+        if (f0 + i < p2) dstates[st_base + ((ulong)nchunks * p2 + f0 + i) * a.dv + d] = 0.0f;
+    }
     for (uint cc = 0; cc < nchunks; ++cc) {
         uint c = nchunks - 1u - cc;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = d; i < HK_C * p2; i += a.dv) {
-            uint s = i / p2, f = i % p2;
-            sq[s * HK_P2 + f] = phq[((ulong)(b * a.T + c * HK_C + s) * a.nh + h) * p2 + f];
+        for (uint i = tid; i < HK_C * HK_P2; i += nth) {
+            uint s = i / HK_P2, f = i % HK_P2;
+            sq[i] = (f < p2) ? phq[((ulong)(b * a.T + c * HK_C + s) * a.nh + h) * p2 + f] : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint ss = 0; ss < HK_C; ++ss) {
             uint s = HK_C - 1u - ss;
             float dov = dout[((ulong)(b * a.T + c * HK_C + s) * a.nh + h) * a.dv + d];
-            for (uint f = 0; f < p2; ++f) {
-                G[f] = gam[f] * (G[f] + sq[s * HK_P2 + f] * dov);
-            }
+            threadgroup const float* sqr = sq + s * HK_P2 + f0;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < HK_FT; ++i) G[i] = gm[i] * (G[i] + sqr[i] * dov);
         }
-        for (uint f = 0; f < p2; ++f) dstates[st_base + ((ulong)c * p2 + f) * a.dv + d] = G[f];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < HK_FT; ++i) {
+            if (f0 + i < p2) dstates[st_base + ((ulong)c * p2 + f0 + i) * a.dv + d] = G[i];
+        }
     }
 }
 
@@ -911,4 +956,151 @@ kernel void kappa_bwd_f32(
         g = dkap[(ulong)row * a.nh + j] * k * (1.0f - k);
     }
     dpre[gid] = g;
+}
+
+// hybrid_k chunk scan, GEMM formulation (log-space decay trick):
+//   Q̃[t][f] = φq·γ^t,  K̃[s][f] = φk·γ^{−s},  Q⁺[t][f] = φq·γ^{t+1},  K̂[s][f] = φk·γ^{C−1−s}
+// (t, s relative to the chunk; f32 range is ample for horizons ≥ 1 at C = 64).
+// Chunk-major layout [B, nh, nchunks, 64, P2]; source phq/phk are the row-major
+// [B·T, nh·P2] tables. One thread per (row, h, f).
+kernel void hk_scale_f32(
+    device const float* phq   [[buffer(0)]],
+    device const float* phk   [[buffer(1)]],
+    device const float* pow_t [[buffer(2)]],
+    device float*       qt    [[buffer(3)]],
+    device float*       kt    [[buffer(4)]],
+    device float*       qp    [[buffer(5)]],
+    device float*       kh    [[buffer(6)]],
+    constant HkArgs&    a     [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])   // over B·T·nh·P2
+{
+    uint p2 = 2u * a.nph;
+    uint rows = a.B * a.T;
+    if (gid >= rows * a.nh * p2) return;
+    uint row = gid / (a.nh * p2), r = gid % (a.nh * p2);
+    uint h = r / p2, f = r % p2;
+    uint b = row / a.T, tt = row % a.T;
+    uint c = tt / HK_C, t = tt % HK_C;
+    uint nch = a.T / HK_C;
+    ulong dst = (((ulong)(b * a.nh + h) * nch + c) * HK_C + t) * p2 + f;
+    device const float* pw = pow_t + (ulong)h * (HK_C + 1u) * p2;
+    float q = phq[gid], k = phk[gid];
+    float g_t = pw[t * p2 + f];
+    qt[dst] = q * g_t;
+    kt[dst] = k / g_t;
+    qp[dst] = q * pw[(t + 1u) * p2 + f];
+    kh[dst] = k * pw[(HK_C - 1u - t) * p2 + f];
+}
+
+// Inverse: dφq = dQ̃·γ^t + dqi·γ^{t+1};  dφk = dK̃·γ^{−s} + dki·γ^{C−1−s}
+// (chunk-major inputs → row-major dphq/dphk).
+kernel void hk_unscale_f32(
+    device const float* dqt   [[buffer(0)]],
+    device const float* dkt   [[buffer(1)]],
+    device const float* dqi   [[buffer(2)]],
+    device const float* dki   [[buffer(3)]],
+    device const float* pow_t [[buffer(4)]],
+    device float*       dphq  [[buffer(5)]],
+    device float*       dphk  [[buffer(6)]],
+    constant HkArgs&    a     [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint p2 = 2u * a.nph;
+    uint rows = a.B * a.T;
+    if (gid >= rows * a.nh * p2) return;
+    uint row = gid / (a.nh * p2), r = gid % (a.nh * p2);
+    uint h = r / p2, f = r % p2;
+    uint b = row / a.T, tt = row % a.T;
+    uint c = tt / HK_C, t = tt % HK_C;
+    uint nch = a.T / HK_C;
+    ulong src = (((ulong)(b * a.nh + h) * nch + c) * HK_C + t) * p2 + f;
+    device const float* pw = pow_t + (ulong)h * (HK_C + 1u) * p2;
+    float g_t = pw[t * p2 + f];
+    dphq[gid] = dqt[src] * g_t + dqi[src] * pw[(t + 1u) * p2 + f];
+    dphk[gid] = dkt[src] / g_t + dki[src] * pw[(HK_C - 1u - t) * p2 + f];
+}
+
+// Chunk-state scans, cell-parallel: the recurrence is independent per
+// (f, d) cell, sequential only in t — one thread per cell, threadgroup =
+// 8 features × 32 value channels (φk broadcast across d, kv coalesced
+// across d). Grid: (B·nh, ceil(P2/8), ceil(dv/32)).
+#define HK_FB 8u
+#define HK_DB 32u
+
+kernel void hk_states_fwd_par_f32(
+    device const float* phk    [[buffer(0)]],
+    device const float* kv     [[buffer(1)]],
+    device const float* pow_t  [[buffer(2)]],
+    device float*       states [[buffer(3)]],
+    constant HkArgs&    a      [[buffer(4)]],
+    uint3 tg  [[threadgroup_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]])   // x: d (32), y: f (8)
+{
+    uint b = tg.x / a.nh, h = tg.x % a.nh;
+    uint p2 = 2u * a.nph;
+    uint f = tg.y * HK_FB + tid.y;
+    uint d = tg.z * HK_DB + tid.x;
+    if (f >= p2 || d >= a.dv) return;
+    uint nchunks = a.T / HK_C;
+    float gam = pow_t[((ulong)h * (HK_C + 1u) + 1u) * p2 + f];
+    ulong st_base = ((ulong)b * a.nh + h) * (nchunks + 1u) * p2 * a.dv;
+    device const float* pk = phk + ((ulong)b * a.T * a.nh + h) * p2 + f;
+    device const float* kvp = kv + ((ulong)b * a.T * a.nh + h) * a.dv + d;
+    ulong step_k = (ulong)a.nh * p2, step_v = (ulong)a.nh * a.dv;
+    float S = 0.0f;
+    states[st_base + (ulong)f * a.dv + d] = 0.0f;
+    for (uint c = 0; c < nchunks; ++c) {
+        // 16 positions a batch: all loads issued before the dependent FMAs
+        for (uint s0 = 0; s0 < HK_C; s0 += 16u) {
+            float kk[16], vv[16];
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 16u; ++i) {
+                ulong t = (ulong)c * HK_C + s0 + i;
+                kk[i] = pk[t * step_k];
+                vv[i] = kvp[t * step_v];
+            }
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 16u; ++i) S = gam * S + kk[i] * vv[i];
+        }
+        states[st_base + ((ulong)(c + 1u) * p2 + f) * a.dv + d] = S;
+    }
+}
+
+kernel void hk_dstates_bwd_par_f32(
+    device const float* phq     [[buffer(0)]],
+    device const float* dout    [[buffer(1)]],
+    device const float* pow_t   [[buffer(2)]],
+    device float*       dstates [[buffer(3)]],
+    constant HkArgs&    a       [[buffer(4)]],
+    uint3 tg  [[threadgroup_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]])
+{
+    uint b = tg.x / a.nh, h = tg.x % a.nh;
+    uint p2 = 2u * a.nph;
+    uint f = tg.y * HK_FB + tid.y;
+    uint d = tg.z * HK_DB + tid.x;
+    if (f >= p2 || d >= a.dv) return;
+    uint nchunks = a.T / HK_C;
+    float gam = pow_t[((ulong)h * (HK_C + 1u) + 1u) * p2 + f];
+    ulong st_base = ((ulong)b * a.nh + h) * (nchunks + 1u) * p2 * a.dv;
+    device const float* pq = phq + ((ulong)b * a.T * a.nh + h) * p2 + f;
+    device const float* dop = dout + ((ulong)b * a.T * a.nh + h) * a.dv + d;
+    ulong step_q = (ulong)a.nh * p2, step_o = (ulong)a.nh * a.dv;
+    float G = 0.0f;
+    dstates[st_base + ((ulong)nchunks * p2 + f) * a.dv + d] = 0.0f;
+    for (uint cc = 0; cc < nchunks; ++cc) {
+        uint c = nchunks - 1u - cc;
+        for (uint s0 = 0; s0 < HK_C; s0 += 16u) {
+            float qq[16], oo[16];
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 16u; ++i) {
+                ulong t = (ulong)c * HK_C + (HK_C - 1u - (s0 + i));
+                qq[i] = pq[t * step_q];
+                oo[i] = dop[t * step_o];
+            }
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 16u; ++i) G = gam * (G + qq[i] * oo[i]);
+        }
+        dstates[st_base + ((ulong)c * p2 + f) * a.dv + d] = G;
+    }
 }
