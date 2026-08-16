@@ -434,6 +434,7 @@ mod gpu {
         pub moe_dffn: GBuf, // [E, cap, I]
         pub moe_dgte: GBuf, // [E, cap, I]
         pub moe_dup: GBuf,  // [E, cap, I]
+        pub hh_pre: GBuf,   // [M, I] pre-mask FFN activation (skill bake)
         // hybrid_k GEMM-formulation scratch (chunk-major tables + A)
         pub hk_qt: GBuf,
         pub hk_kt: GBuf,
@@ -485,6 +486,8 @@ mod gpu {
         /// reuse the previous step's expert assignments instead of routing (the
         /// gradcheck freezes the piecewise-linear region; never set in training)
         pub route_frozen: std::cell::Cell<bool>,
+        /// skill bake state (masks over the shared FFN of selected layers)
+        pub skill: Option<SkillState>,
         /// descriptors seeded from data (first training forward)
         pub desc_seeded: std::cell::Cell<bool>,
         pub desc_seed_rows: GBuf,
@@ -613,6 +616,7 @@ mod gpu {
                 moe_dffn: z(ne * moe_cap * cfg.inter),
                 moe_dgte: z(ne * moe_cap * cfg.inter),
                 moe_dup: z(ne * moe_cap * cfg.inter),
+                hh_pre: z(m * cfg.inter),
                 hk_qt: z(m * 2 * nhp),
                 hk_kt: z(m * 2 * nhp),
                 hk_qp: z(m * 2 * nhp),
@@ -654,6 +658,7 @@ mod gpu {
                 moe_cap,
                 desc_updates: std::cell::Cell::new(true),
                 route_frozen: std::cell::Cell::new(false),
+                skill: None,
                 desc_seeded: std::cell::Cell::new(false),
                 desc_seed_rows: GBuf::from_u32(c, &(0..ne.max(1)).map(|e| ((e * 7919 + 13) % (b * t)) as u32).collect::<Vec<u32>>()),
                 scratch,
@@ -688,6 +693,11 @@ mod gpu {
             cmd.gemm(Op::N, Op::T, m, i, h, 1.0, x2, 0, h, &self.p, ffn.wg, h, 0.0, gte, 0, i);
             cmd.gemm(Op::N, Op::T, m, i, h, 1.0, x2, 0, h, &self.p, ffn.wu, h, 0.0, up, 0, i);
             cmd.swiglu_fwd(gte, up, hh, m * i);
+            if let Some(sk) = self.skill.as_ref() {
+                if let Some(mi) = sk.slot(l) {
+                    cmd.mask_fwd(hh, &sk.logits, mi * i, m, i, sk.hard.get(), sk.tau);
+                }
+            }
             // x_out = x_mid + hh·Wdᵀ  ([M,I]·[H,I]ᵀ)
             cmd.copy(x_mid, 0, x_out, 0, m * h);
             cmd.gemm(Op::N, Op::T, m, h, i, 1.0, hh, 0, i, &self.p, ffn.wd, i, 1.0, x_out, 0, h);
@@ -748,6 +758,13 @@ mod gpu {
             cmd.gemm(Op::N, Op::N, m, i, h, 1.0, &s.dx, 0, h, &self.p, ffn.wd, i, 0.0, &s.dffn, 0, i);
             // dWd += dxᵀ·hh  ([H,M]·[M,I])
             cmd.gemm(Op::T, Op::N, h, i, m, 1.0, &s.dx, 0, h, hh, 0, i, 1.0, &self.g, ffn.wd, i);
+            if let Some(sk) = self.skill.as_ref() {
+                if let Some(mi) = sk.slot(l) {
+                    // pre-mask activation recomputed; dm from the masked-input grad
+                    cmd.swiglu_fwd(gte, up, &s.hh_pre, m * i);
+                    cmd.mask_bwd(&s.dffn, &s.hh_pre, &sk.logits, mi * i, &sk.g, m, i, sk.hard.get(), sk.tau, sk.l1.get());
+                }
+            }
             cmd.swiglu_bwd(gte, up, &s.dffn, &s.dgte, &s.dup, m * i);
             // dx2 = dgte·Wg + dup·Wu
             cmd.gemm(Op::N, Op::N, m, h, i, 1.0, &s.dgte, 0, i, &self.p, ffn.wg, h, 0.0, &s.dx2, 0, h);
@@ -1393,4 +1410,156 @@ pub fn top_eigenvectors(a: &[f32], n: usize, k: usize, iters: usize, seed: u64) 
         orth(&mut q);
     }
     q
+}
+
+#[cfg(target_os = "macos")]
+use crate::metal::GBuf;
+
+#[cfg(target_os = "macos")]
+/// Skill-bake state: DTG-MA neuron masks over the shared FFN of the
+/// selected layers (one logit per neuron), with their AdamW state.
+pub struct SkillState {
+    pub layers: Vec<usize>,
+    pub inter: usize,
+    /// [layers.len(), I] mask logits
+    pub logits: GBuf,
+    pub g: GBuf,
+    pub m: GBuf,
+    pub v: GBuf,
+    /// apply the binarized mask 1[σ>τ] instead of σ
+    pub hard: std::cell::Cell<bool>,
+    pub tau: f32,
+    /// L1 pressure on σ(m) (phase A), added to the mask gradient
+    pub l1: std::cell::Cell<f32>,
+}
+
+#[cfg(target_os = "macos")]
+impl SkillState {
+    pub fn new(c: &crate::metal::Ctx, layers: Vec<usize>, inter: usize, init_logit: f32, tau: f32) -> SkillState {
+        let n = layers.len() * inter;
+        SkillState {
+            layers,
+            inter,
+            logits: GBuf::from_slice(c, &vec![init_logit; n.max(1)]),
+            g: GBuf::zeros(c, n),
+            m: GBuf::zeros(c, n),
+            v: GBuf::zeros(c, n),
+            hard: std::cell::Cell::new(false),
+            tau,
+            l1: std::cell::Cell::new(0.0),
+        }
+    }
+    pub fn slot(&self, layer: usize) -> Option<usize> {
+        self.layers.iter().position(|&l| l == layer)
+    }
+    /// Kept-neuron mask per selected layer from the current logits.
+    pub fn hard_masks(&self) -> Vec<Vec<bool>> {
+        let lg = self.logits.to_vec();
+        self.layers
+            .iter()
+            .enumerate()
+            .map(|(i, _)| lg[i * self.inter..(i + 1) * self.inter].iter().map(|&m| 1.0 / (1.0 + (-m).exp()) > self.tau).collect())
+            .collect()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl EmbryoGpu {
+    /// One skill-bake step: full fwd/bwd with the masks active; then AdamW
+    /// over the trainable set only — phase A: the mask logits; phase B: the
+    /// shared-FFN tensors of the selected layers. Everything else stays
+    /// byte-identical. Returns (loss, grad norm of the trainable set).
+    pub fn train_step_skill(&mut self, tokens: &[u32], targets: &[u32], lr: f32, wd: f32, clip: f32, phase_b: bool) -> (f32, f32) {
+        use crate::metal::Cmd;
+        let m = self.b * self.t;
+        assert!(tokens.len() == m && targets.len() == m);
+        let c = self.ctx();
+        unsafe {
+            std::ptr::copy_nonoverlapping(tokens.as_ptr(), self.tok.buf.contents() as *mut u32, m);
+            std::ptr::copy_nonoverlapping(targets.as_ptr(), self.tgt.buf.contents() as *mut u32, m);
+        }
+        self.prepare_head(targets);
+        let sk = self.skill.as_ref().expect("skill state");
+        // trainable ranges of the arena (phase B): shared FFN of the selected layers
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        if phase_b {
+            let (h, i) = (self.cfg.hidden, self.cfg.inter);
+            for &l in &sk.layers {
+                let ffn = match &self.lay.layers[l] {
+                    LayerOffs::Mixer { ffn, .. } | LayerOffs::Anchor { ffn, .. } => ffn,
+                };
+                ranges.push((ffn.wg, i * h));
+                ranges.push((ffn.wu, i * h));
+                ranges.push((ffn.wd, h * i));
+            }
+        }
+        let cmd = Cmd::new(c);
+        cmd.axpby(0.0, &sk.g, 0.0, &sk.g, sk.g.len);
+        self.encode_fwd_bwd(&cmd);
+        // grad norm over the trainable set
+        let mut groups = Vec::new();
+        let mut poff = 0usize;
+        if phase_b {
+            for &(off, n) in &ranges {
+                let g = cmd.sumsq_at(&self.g, off, n, &self.scratch.partial, poff);
+                groups.push((poff, g));
+                poff += g;
+            }
+        } else {
+            let g = cmd.sumsq_at(&sk.g, 0, sk.g.len, &self.scratch.partial, 0);
+            groups.push((0, g));
+            poff = g;
+        }
+        let _ = poff;
+        cmd.commit();
+        let part = self.scratch.partial.as_slice();
+        let gnorm = groups.iter().map(|&(o, g)| part[o..o + g].iter().map(|x| *x as f64).sum::<f64>()).sum::<f64>().sqrt() as f32;
+        let loss = self.read_loss();
+        let gscale = if gnorm > clip { clip / gnorm } else { 1.0 };
+        self.step += 1;
+        let cmd = Cmd::new(c);
+        if phase_b {
+            for &(off, n) in &ranges {
+                cmd.adamw_at(&self.p, &self.g, &self.m, &self.v, off, n, lr, 0.9, 0.95, 1e-8, wd, self.step, gscale);
+            }
+        } else {
+            cmd.adamw(&sk.logits, &sk.g, &sk.m, &sk.v, sk.g.len, lr, 0.9, 0.95, 1e-8, 0.0, self.step, gscale);
+        }
+        cmd.commit();
+        (loss, gnorm)
+    }
+
+    /// Mean-pooled hidden state entering `phi_layer` for each sequence of the
+    /// batch (the P1 routing descriptor's φ(x)) — [B, H].
+    pub fn probe_phi(&self, tokens: &[u32], phi_layer: usize) -> Vec<Vec<f32>> {
+        use crate::metal::Cmd;
+        let m = self.b * self.t;
+        assert_eq!(tokens.len(), m);
+        unsafe { std::ptr::copy_nonoverlapping(tokens.as_ptr(), self.tok.buf.contents() as *mut u32, m) };
+        let cfg = &self.cfg;
+        let h = cfg.hidden;
+        let cmd = Cmd::new(self.ctx());
+        cmd.embed_gather_at(&self.p, self.lay.embed, &self.tok, self.x_in(0), m, h);
+        for l in 0..phi_layer.min(cfg.layers) {
+            let out: &GBuf = if l + 1 < cfg.layers { self.x_in(l + 1) } else { &self.x_out };
+            self.layer_fwd(&cmd, l, out, false);
+        }
+        cmd.commit();
+        let x: &GBuf = if phi_layer < cfg.layers { self.x_in(phi_layer) } else { &self.x_out };
+        let xs = x.as_slice();
+        (0..self.b)
+            .map(|bi| {
+                let mut acc = vec![0.0f32; h];
+                for t in 0..self.t {
+                    for j in 0..h {
+                        acc[j] += xs[(bi * self.t + t) * h + j];
+                    }
+                }
+                for v in &mut acc {
+                    *v /= self.t as f32;
+                }
+                acc
+            })
+            .collect()
+    }
 }

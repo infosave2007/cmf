@@ -1420,3 +1420,56 @@ kernel void moe_center_f32(
     uint e = es / a.cap, s = es % a.cap;
     hgc[gid] = (s < min(count[e], a.cap)) ? hg[gid] - mu[e * a.H + j] : 0.0f;
 }
+
+// ---------------------------------------------------------------------
+// Skill masks (DTG-MA, P2): a logit per FFN neuron; the down_proj input
+// is multiplied by σ(m) (soft) or by 1[σ(m) > τ] (hard).
+// ---------------------------------------------------------------------
+struct MaskArgs { uint rows, n; uint hard; float tau; float l1; };
+
+// hh[r][j] *= mask_j
+kernel void mask_fwd_f32(
+    device float*       hh   [[buffer(0)]],
+    device const float* m    [[buffer(1)]],
+    constant MaskArgs&  a    [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= a.rows * a.n) return;
+    uint j = gid % a.n;
+    float s = 1.0f / (1.0f + exp(-m[j]));
+    float w = a.hard ? ((s > a.tau) ? 1.0f : 0.0f) : s;
+    hh[gid] *= w;
+}
+
+// dm[j] += Σ_r dhhm[r][j]·hh_pre[r][j]·σ'(m_j) + l1·σ'(m_j)   (soft only)
+// one thread per column
+kernel void mask_bwd_dm_f32(
+    device const float* dhhm   [[buffer(0)]],
+    device const float* hh_pre [[buffer(1)]],
+    device const float* m      [[buffer(2)]],
+    device float*       dm     [[buffer(3)]],
+    constant MaskArgs&  a      [[buffer(4)]],
+    uint j [[thread_position_in_grid]])
+{
+    if (j >= a.n) return;
+    if (a.hard) return;
+    float s = 1.0f / (1.0f + exp(-m[j]));
+    float ds = s * (1.0f - s);
+    float acc = 0.0f;
+    for (uint r = 0; r < a.rows; ++r) acc += dhhm[(ulong)r * a.n + j] * hh_pre[(ulong)r * a.n + j];
+    dm[j] += (acc + a.l1) * ds;
+}
+
+// dhhm[r][j] *= mask_j  (→ the gradient w.r.t. the pre-mask activation)
+kernel void mask_bwd_dh_f32(
+    device float*       dhhm [[buffer(0)]],
+    device const float* m    [[buffer(1)]],
+    constant MaskArgs&  a    [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= a.rows * a.n) return;
+    uint j = gid % a.n;
+    float s = 1.0f / (1.0f + exp(-m[j]));
+    float w = a.hard ? ((s > a.tau) ? 1.0f : 0.0f) : s;
+    dhhm[gid] *= w;
+}

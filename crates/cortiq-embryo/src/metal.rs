@@ -73,6 +73,9 @@ pub struct Ctx {
     moe_indirect: ComputePipelineState,
     moe_init_mu: ComputePipelineState,
     moe_center: ComputePipelineState,
+    mask_fwd: ComputePipelineState,
+    mask_bwd_dm: ComputePipelineState,
+    mask_bwd_dh: ComputePipelineState,
 }
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
@@ -184,6 +187,9 @@ fn init() -> Result<Ctx, String> {
         moe_indirect: pso("moe_indirect_args_f32")?,
         moe_init_mu: pso("moe_init_mu_f32")?,
         moe_center: pso("moe_center_f32")?,
+        mask_fwd: pso("mask_fwd_f32")?,
+        mask_bwd_dm: pso("mask_bwd_dm_f32")?,
+        mask_bwd_dh: pso("mask_bwd_dh_f32")?,
         gemm,
         _lib: lib,
         queue,
@@ -492,6 +498,71 @@ impl<'a> Cmd<'a> {
         e.set_buffer(3, Some(&v.buf), 0);
         e.set_bytes(4, std::mem::size_of::<Args>() as u64, &args as *const Args as *const c_void);
         self.grid1(n, 256);
+    }
+
+    /// AdamW over the sub-range [off, off+n) of p/g/m/v (same offset in each).
+    #[allow(clippy::too_many_arguments)]
+    pub fn adamw_at(
+        &self,
+        p: &GBuf,
+        g: &GBuf,
+        m: &GBuf,
+        v: &GBuf,
+        off: usize,
+        n: usize,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        wd: f32,
+        step: u32,
+        gscale: f32,
+    ) {
+        assert!(p.len >= off + n && g.len >= off + n && m.len >= off + n && v.len >= off + n);
+        #[repr(C)]
+        struct Args {
+            n: u32,
+            lr: f32,
+            beta1: f32,
+            beta2: f32,
+            eps: f32,
+            wd: f32,
+            bc1: f32,
+            bc2: f32,
+            gscale: f32,
+        }
+        let t = step.max(1) as f64;
+        let args = Args {
+            n: n as u32,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            wd,
+            bc1: (1.0 / (1.0 - (beta1 as f64).powf(t))) as f32,
+            bc2: (1.0 / (1.0 - (beta2 as f64).powf(t))) as f32,
+            gscale,
+        };
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.adamw);
+        e.set_buffer(0, Some(&p.buf), (off * 4) as u64);
+        e.set_buffer(1, Some(&g.buf), (off * 4) as u64);
+        e.set_buffer(2, Some(&m.buf), (off * 4) as u64);
+        e.set_buffer(3, Some(&v.buf), (off * 4) as u64);
+        e.set_bytes(4, std::mem::size_of::<Args>() as u64, &args as *const Args as *const c_void);
+        self.grid1(n, 256);
+    }
+
+    /// Sum of squares of x[off..off+n] into partial[part_off..]; returns groups.
+    pub fn sumsq_at(&self, x: &GBuf, off: usize, n: usize, partial: &GBuf, part_off: usize) -> usize {
+        let groups = n.div_ceil(256).clamp(1, 4096).min(partial.len - part_off);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.sumsq);
+        e.set_buffer(0, Some(&x.buf), (off * 4) as u64);
+        e.set_buffer(1, Some(&partial.buf), (part_off * 4) as u64);
+        self.set_u32(2, n as u32);
+        e.dispatch_thread_groups(MTLSize::new(groups as u64, 1, 1), MTLSize::new(256, 1, 1));
+        groups
     }
 
     /// Partial sums of squares of x[..n] into `partial` (one per
@@ -1358,6 +1429,48 @@ impl<'a> Cmd<'a> {
         e.set_buffer(3, Some(&hgc.buf), 0);
         self.route_args(4, r);
         self.grid1(r.e * r.cap * r.h, 256);
+    }
+
+    // ---------------- skill masks ----------------
+    fn mask_args(&self, idx: u64, rows: usize, n: usize, hard: bool, tau: f32, l1: f32) {
+        #[repr(C)]
+        struct A {
+            rows: u32,
+            n: u32,
+            hard: u32,
+            tau: f32,
+            l1: f32,
+        }
+        let a = A { rows: rows as u32, n: n as u32, hard: hard as u32, tau, l1 };
+        self.enc.set_bytes(idx, std::mem::size_of::<A>() as u64, &a as *const A as *const c_void);
+    }
+    /// hh[rows, n] *= mask(m[m_off..]) (soft σ or hard 1[σ>τ]).
+    pub fn mask_fwd(&self, hh: &GBuf, m: &GBuf, m_off: usize, rows: usize, n: usize, hard: bool, tau: f32) {
+        assert!(hh.len >= rows * n && m.len >= m_off + n);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.mask_fwd);
+        e.set_buffer(0, Some(&hh.buf), 0);
+        e.set_buffer(1, Some(&m.buf), (m_off * 4) as u64);
+        self.mask_args(2, rows, n, hard, tau, 0.0);
+        self.grid1(rows * n, 256);
+    }
+    /// dm += column reduction (soft), then dhhm *= mask (in place).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mask_bwd(&self, dhhm: &GBuf, hh_pre: &GBuf, m: &GBuf, m_off: usize, dm: &GBuf, rows: usize, n: usize, hard: bool, tau: f32, l1: f32) {
+        assert!(dhhm.len >= rows * n && hh_pre.len >= rows * n && m.len >= m_off + n && dm.len >= m_off + n);
+        let e = &self.enc;
+        e.set_compute_pipeline_state(&self.c.mask_bwd_dm);
+        e.set_buffer(0, Some(&dhhm.buf), 0);
+        e.set_buffer(1, Some(&hh_pre.buf), 0);
+        e.set_buffer(2, Some(&m.buf), (m_off * 4) as u64);
+        e.set_buffer(3, Some(&dm.buf), (m_off * 4) as u64);
+        self.mask_args(4, rows, n, hard, tau, l1);
+        self.grid1(n, 128);
+        e.set_compute_pipeline_state(&self.c.mask_bwd_dh);
+        e.set_buffer(0, Some(&dhhm.buf), 0);
+        e.set_buffer(1, Some(&m.buf), (m_off * 4) as u64);
+        self.mask_args(2, rows, n, hard, tau, 0.0);
+        self.grid1(rows * n, 256);
     }
 
     /// Submit and wait. Returns GPU time in milliseconds (GPUEndTime −

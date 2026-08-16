@@ -88,6 +88,55 @@ enum Sub {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Bake a skill from a genome checkpoint on a task corpus and append it to a .cmf (P2/P15).
+    SkillBake {
+        /// genome checkpoint (frozen)
+        #[arg(long)]
+        ckpt: PathBuf,
+        /// tokenizer.json (ours)
+        #[arg(long)]
+        tokenizer: PathBuf,
+        /// task corpus files (txt / jsonl.gz / parquet)
+        #[arg(long, required = true, num_args = 1..)]
+        corpus: Vec<PathBuf>,
+        /// base .cmf to append to (exported genome)
+        #[arg(long)]
+        base: PathBuf,
+        /// output .cmf (defaults to overwrite --base)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        id: String,
+        /// layers whose shared FFN the skill specialises (default: last two)
+        #[arg(long, num_args = 1.., value_delimiter = ',')]
+        layers: Option<Vec<usize>>,
+        #[arg(long, default_value_t = 240)]
+        steps_a: usize,
+        #[arg(long, default_value_t = 120)]
+        steps_b: usize,
+        #[arg(long, default_value_t = 3e-2)]
+        lr_a: f32,
+        #[arg(long, default_value_t = 5e-5)]
+        lr_b: f32,
+        /// final L1 pressure on σ(m) (ramps from 0)
+        #[arg(long, default_value_t = 2e-4)]
+        l1: f32,
+        #[arg(long, default_value_t = 0.5)]
+        tau: f32,
+        #[arg(long, default_value_t = 30)]
+        eval_every: usize,
+        #[arg(long, default_value_t = 4)]
+        batch: usize,
+        #[arg(long, default_value_t = 512)]
+        seq: usize,
+        /// φ-layer of the routing descriptor (default: 2/3 depth)
+        #[arg(long)]
+        phi_layer: Option<usize>,
+        #[arg(long, default_value_t = 8)]
+        rank: usize,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
     /// Birth: train from scratch (or resume) on a token shard.
     Birth {
         /// token shards (u16 LE), `path[:weight]`, repeatable — mixed by weight
@@ -164,6 +213,52 @@ fn main() {
         }
         Sub::SampleText { input, skip, docs, out } => {
             cortiq_embryo::corpus::sample_text(&input, skip, docs, &out);
+        }
+        Sub::SkillBake { ckpt, tokenizer, corpus, base, out, id, layers, steps_a, steps_b, lr_a, lr_b, l1, tau, eval_every, batch, seq, phi_layer, rank, seed } => {
+            #[cfg(target_os = "macos")]
+            {
+                use cortiq_embryo::skill::{BakeArgs, append_to_cmf, bake};
+                let ck = cortiq_embryo::train::load_checkpoint(&ckpt).expect("load checkpoint");
+                // tokenize the corpus with our tokenizer
+                let bpe = cortiq_embryo::tokenizer::Bpe::load(&tokenizer).expect("tokenizer");
+                let eot = bpe.special_id(cortiq_embryo::tokenizer::EOT).unwrap_or(0) as u16;
+                let mut toks: Vec<u16> = Vec::new();
+                let mut cache = std::collections::HashMap::new();
+                for p in &corpus {
+                    cortiq_embryo::data::for_each_doc(p, |text| {
+                        let mut ids = Vec::new();
+                        bpe.encode(text, &mut cache, &mut ids);
+                        toks.extend(ids.iter().map(|&i| i as u16));
+                        toks.push(eot);
+                    })
+                    .expect("read corpus");
+                }
+                println!("skill corpus: {} tokens", toks.len());
+                let shard = cortiq_embryo::train::Shard { tokens: toks };
+                let nl = ck.cfg.layers;
+                let layers = layers.unwrap_or_else(|| vec![nl.saturating_sub(2), nl.saturating_sub(1)]);
+                let a = BakeArgs {
+                    id: id.clone(), layers: layers.clone(), steps_a, steps_b, lr_a, lr_b, l1, tau, eval_every, batch, seq,
+                    phi_layer: phi_layer.unwrap_or(nl * 2 / 3), rank, seed,
+                };
+                let (tensors, sel, kept, (l0, la, lb)) = bake(&ck, &shard, &a).expect("bake");
+                let quality = serde_json::json!({
+                    "held_out_loss": {"base": l0, "mask": la, "mask+fcd": lb},
+                    "held_out_ppl": {"base": l0.exp(), "mask": la.exp(), "mask+fcd": lb.exp()},
+                    "kept_fraction": kept,
+                });
+                let out_path = out.unwrap_or_else(|| base.clone());
+                let tmp = out_path.with_extension("cmf.tmp");
+                let unchanged = append_to_cmf(&base, &tmp, &id, &layers, &tensors, sel, quality).expect("append");
+                std::fs::rename(&tmp, &out_path).expect("rename");
+                println!("skill '{id}' appended → {} ({} tensors over layers {:?}; {unchanged} base tensors byte-identical; held-out ppl {:.1} → {:.1})", out_path.display(), tensors.len(), layers, l0.exp(), lb.exp());
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (ckpt, tokenizer, corpus, base, out, id, layers, steps_a, steps_b, lr_a, lr_b, l1, tau, eval_every, batch, seq, phi_layer, rank, seed);
+                eprintln!("needs Metal (macOS)");
+                std::process::exit(1);
+            }
         }
         Sub::Fetch { dir, urls } => {
             cortiq_embryo::corpus::fetch(&urls, &dir);
