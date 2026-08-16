@@ -803,6 +803,11 @@ fn project_matvecs(
 
 /// Everything between the QKV matvecs and the attend: bias, gate
 /// split, qk-norm, partial RoPE (the shared tail of `project_position`).
+pub(crate) fn finish_projection_debug(q_raw: Vec<f32>, k: Vec<f32>, v: Vec<f32>, cfg: &QwenAttnCfg, position: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let p = finish_projection(q_raw, k, v, cfg, position);
+    (p.q.clone(), p.gate.clone(), p.k.clone(), p.v.clone())
+}
+
 fn finish_projection(
     mut q_raw: Vec<f32>,
     mut k: Vec<f32>,

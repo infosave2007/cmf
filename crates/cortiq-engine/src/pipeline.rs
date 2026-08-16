@@ -163,6 +163,10 @@ pub struct Pipeline {
     /// KV in different places (device mirror vs the CPU cache) and a
     /// mid-run switch would read the wrong one.
     mtp_graph_mode: Option<bool>,
+    /// The Metal verify graph of the round in flight, between its sync
+    /// (logits read) and the commit that replays the accepted prefix.
+    #[cfg(target_os = "macos")]
+    metal_verify: Option<MetalVerifyPending>,
     /// Precomputed RoPE inverse frequencies [head_dim/2]. Arc: the
     /// forward path clones a handle to escape the &mut self borrow —
     /// cloning the table itself was a per-forward allocation.
@@ -535,6 +539,18 @@ pub struct MtpModule {
     pub layer: LayerWeights,
     pub final_norm: Vec<f32>,
     pub kv: crate::kv_cache::LayerKvCache,
+}
+
+/// A Metal verify graph after its sync: what the commit needs — the
+/// graph (per-layer replay scratch), the GDN layers in encode order (their
+/// CPU states receive the replay), and the attention layers with the CPU
+/// row count they were encoded against (the accepted rows are pulled from
+/// the mirror from there).
+#[cfg(target_os = "macos")]
+struct MetalVerifyPending {
+    graph: crate::gpu_metal::VerifyGraph,
+    gdn_layers: Vec<usize>,
+    attn_layers: Vec<(usize, usize)>,
 }
 
 /// The speculation trial's phases (see the decode loop): four timed
@@ -1349,6 +1365,11 @@ impl Pipeline {
                         norm_style,
                         pool: pool.as_deref(),
                     };
+                    // CMF_ATTN_ORACLE=1: diff the device attend against
+                    // this CPU attend on identical inputs (bring-up).
+                    let oracle = std::env::var("CMF_ATTN_ORACLE").as_deref() == Ok("1");
+                    let _ = full_gpu;
+                    let oracle_in = oracle.then(|| (q_raw.clone(), k.clone(), v.clone()));
                     let mut ao = attention::qwen_attention_core(
                         q_raw,
                         k,
@@ -1356,6 +1377,44 @@ impl Pipeline {
                         &mut self.kv_cache.layers[*li],
                         &cfg,
                     );
+                    if let Some((qr0, k0, v0)) = oracle_in {
+                        let (cq, _cg, ck, cv) = attention::finish_projection_debug(qr0, k0, v0, &cfg, position);
+                        let mut h_now = vec![0f32; hs];
+                        graph.read_h(&mut h_now);
+                        let cache = &self.kv_cache.layers[*li];
+                        let n_after = cache.head_keys(0).len() / hd;
+                        let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| &cache.head_keys(g)[..(n_after - 1) * hd]).collect();
+                        let cpu_v: Vec<&[f32]> = (0..nkv).map(|g| &cache.head_values(g)[..(n_after - 1) * hd]).collect();
+                        let p = crate::gpu::AttnDeviceParams {
+                            kv_id,
+                            layer: *li,
+                            nh,
+                            nkv,
+                            hd,
+                            rd,
+                            position,
+                            eps: eps as f32,
+                            gemma,
+                            output_gate: *output_gate,
+                            q_norm: *q_norm,
+                            k_norm: *k_norm,
+                            inv_freq: &inv_freq,
+                            cpu_k,
+                            cpu_v,
+                            cpu_stored: n_after - 1,
+                            o1: None,
+                        };
+                        if let Some((dq, dk, dv, dao)) = graph.debug_attn_device(l, &p, &h_now) {
+                            let md = |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                            let nn = |a: &[f32]| a.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            eprintln!(
+                                "attn-oracle L{li} pos {position}: |q| {:.2} max|dq| {:.4} | |k| {:.2} max|dk| {:.4} | |v| {:.2} max|dv| {:.4} | |ao| {:.2} max|dao| {:.4}",
+                                nn(&cq), md(&cq, &dq), nn(&ck), md(&ck, &dk), nn(&cv), md(&cv, &dv), nn(&ao), md(&ao, &dao)
+                            );
+                        } else {
+                            eprintln!("attn-oracle L{li}: device probe declined");
+                        }
+                    }
                     graph.encode_attn_suffix(l, &ao);
                     // Early commit: the GPU starts O+FFN while the CPU
                     // encodes the following GDN run / attention prefix.
@@ -1527,6 +1586,8 @@ impl Pipeline {
             spec_ps: Vec::new(),
             spec_ress: Vec::new(),
             mtp_graph_mode: None,
+            #[cfg(target_os = "macos")]
+            metal_verify: None,
             inv_freq,
             ws: ForwardScratch::new(hidden_size),
             pool,
@@ -1867,8 +1928,16 @@ impl Pipeline {
             }
             None => spec_default_ok && !penalized && !metal_wgpu,
         };
+        // Native Metal: the b-row verify graph (`try_batch_graph_metal`)
+        // stands where the wgpu batch graph stands on discrete cards.
+        #[cfg(target_os = "macos")]
+        let metal_graph = crate::gpu::q1_force()
+            && crate::gpu::enabled_here()
+            && std::env::var("CMF_GPU_BLOCK").map(|v| v != "0").unwrap_or(true);
+        #[cfg(not(target_os = "macos"))]
+        let metal_graph = false;
         let graph_spec = self.speculative
-            && graph_on
+            && (graph_on || metal_graph)
             && self.mtp.is_some()
             && task_mask.is_none()
             && !self.o1_active()
@@ -2316,6 +2385,22 @@ impl Pipeline {
                     self.lm_head_forward(&self.ws.n1)
                 }
             };
+            // CMF_LOGIT_DUMP=<path>: the first decode step's hidden + logits
+            // as raw f32 (hidden first) — cross-backend numerics diffing.
+            if generated
+                == std::env::var("CMF_LOGIT_DUMP_STEP")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            {
+                if let Ok(path) = std::env::var("CMF_LOGIT_DUMP") {
+                    let mut bytes: Vec<u8> = Vec::with_capacity((hidden.len() + logits.len()) * 4);
+                    for v in hidden.iter().chain(logits.iter()) {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                    let _ = std::fs::write(&path, &bytes);
+                }
+            }
             let t_next = match forced {
                 Some(c) => c,
                 None => sampler::sample_with_scratch_pool(
@@ -2439,6 +2524,13 @@ impl Pipeline {
                     ) {
                         next_pos = n_pos;
                         hidden = new_h;
+                        if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+                            eprintln!(
+                                "spec-round wall {:.1} ms → {} tokens",
+                                t_round.elapsed().as_secs_f64() * 1e3,
+                                extra.len() + 1
+                            );
+                        }
                         // One speculative round done: the monitor counts it
                         // (round 1 untimed — it pays the batch scratch and
                         // the draft mirror), and the trial advances.
@@ -2782,6 +2874,14 @@ impl Pipeline {
         // head fused — device attention over the block's own KV mirror,
         // one submit for block + head, hidden and logits back together.
         // Decided once per generation (see `mtp_graph_mode`).
+        #[cfg(target_os = "macos")]
+        if self.mtp_graph_mode != Some(false) && crate::gpu::q1_force() {
+            if let Some(r) = self.mtp_step_metal(m, hidden, next_token, position, true) {
+                self.mtp_graph_mode = Some(true);
+                return r;
+            }
+            self.mtp_graph_mode = Some(false);
+        }
         #[cfg(feature = "gpu")]
         if self.mtp_graph_mode != Some(false) {
             if let Some(r) = self.mtp_step_graph(m, hidden, next_token, position) {
@@ -3311,8 +3411,20 @@ impl Pipeline {
         // halves the draft cost, so the extra draft is cheaper still).
         // 5 with the int8 verify (the default: measured 76.5 against
         // k=4's 72-74 and k=6's 74 on the 5090), 4 with the f32 one.
+        #[cfg(target_os = "macos")]
+        let metal_native = crate::gpu::q1_force();
+        #[cfg(not(target_os = "macos"))]
+        let metal_native = false;
         #[cfg(feature = "gpu")]
-        let k_default = if crate::gpu_wgpu::verify_i8_on() { 5 } else { 4 };
+        let k_default = if metal_native {
+            // the Metal verify's GEMM tile is 8 rows wide and flat in b:
+            // seven drafts + the tip fill it for free
+            7
+        } else if crate::gpu_wgpu::verify_i8_on() {
+            5
+        } else {
+            4
+        };
         #[cfg(not(feature = "gpu"))]
         let k_default = 4;
         let k_spec: usize = std::env::var("CMF_GRAPH_SPEC_K")
@@ -3374,9 +3486,35 @@ impl Pipeline {
         // below, replaced by verified pairs.
         let mut drafts = Vec::with_capacity(k_spec);
         let mut hx = hidden.to_vec();
+        // CMF_SPEC_DBG=1: draft 0 through BOTH MTP arms (graph and per-op)
+        // from the same inputs — are the arms the difference, or the inputs?
+        let spec_dbg = std::env::var("CMF_SPEC_DBG").is_ok();
         for j in 0..k_spec {
             let tok_in = if j == 0 { t_next } else { drafts[j - 1] };
+            let mut dbg_ref: Option<(Vec<f32>, Vec<f32>)> = None;
+            if spec_dbg {
+                let saved = self.mtp_graph_mode;
+                self.mtp_graph_mode = Some(false);
+                let r = self.mtp_step_hl(m, &hx, tok_in, next_pos - 1 + j);
+                self.mtp_graph_mode = saved;
+                m.kv.truncate_last(1);
+                dbg_ref = Some(r);
+            }
             let (mut lg, hj) = self.mtp_step_hl(m, &hx, tok_in, next_pos - 1 + j);
+            if let Some((lg_cpu, h_cpu)) = dbg_ref {
+                let n = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let dl = lg.iter().zip(&lg_cpu).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                let dh = hj.iter().zip(&h_cpu).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                eprintln!(
+                    "spec-dbg j={j} pos {} tok_in {tok_in}: per-op draft {} graph draft {} | max|dlogit| {dl:.3} | |h_cpu| {:.2} |h_graph| {:.2} max|dh| {dh:.3} | kv rows {}",
+                    next_pos - 1 + j,
+                    sampler::argmax(&lg_cpu),
+                    sampler::argmax(&lg),
+                    n(&h_cpu),
+                    n(&hj),
+                    m.kv.seq_len
+                );
+            }
             let dj = if sparse {
                 let mut q = std::mem::take(&mut self.spec_qs[j]);
                 let ok = sampler::sparse_distribution_into(
@@ -3457,6 +3595,24 @@ impl Pipeline {
         };
         let mut logits = Vec::new();
         let final_norm = self.weights.final_norm.clone();
+        #[cfg(target_os = "macos")]
+        let ok = if metal_native {
+            let lm = self.weights.lm_head.q1_parts()?;
+            self.try_batch_graph_metal(&mut hiddens, &positions, b, Some((lm, &final_norm, &mut logits)))
+        } else {
+            self.try_batch_graph_wgpu(
+                &mut hiddens,
+                &positions,
+                b,
+                Some(crate::gpu::SpecTail {
+                    lm: lm_gw,
+                    lm_rows,
+                    final_norm: &final_norm,
+                    logits_out: &mut logits,
+                }),
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
         let ok = self.try_batch_graph_wgpu(
             &mut hiddens,
             &positions,
@@ -3473,6 +3629,55 @@ impl Pipeline {
             // the caller runs the plain path, nothing has changed.
             m.kv.truncate_last(k_spec);
             return None;
+        }
+        // `CMF_METAL_VERIFY_CHECK=1`: run the same b tokens through the
+        // plain per-token path and compare each row's argmax + logits with
+        // the verify's — the bring-up oracle for the batched graph. The
+        // plain forwards mutate the CPU state; it is snapshotted and put
+        // back, and the K/V mirrors re-pointed, before the round goes on.
+        #[cfg(target_os = "macos")]
+        if metal_native && std::env::var("CMF_METAL_VERIFY_CHECK").as_deref() == Ok("1") {
+            let snap: Vec<Vec<f32>> = self.kv_cache.layers.iter().map(|l| l.linear_state.clone()).collect();
+            let attn_lens: Vec<usize> = self.kv_cache.layers.iter().map(|l| l.seq_len).collect();
+            let toks: Vec<u32> = std::iter::once(t_next).chain(drafts.iter().copied()).collect();
+            let want_save = self.graph_want_logits;
+            self.graph_want_logits = false;
+            for (i, &t) in toks.iter().enumerate() {
+                let hi = self.forward_layers(&self.embed_single(t), next_pos + i, None);
+                let _ = self.graph_logits.take();
+                let ref_lg = self.logits_from_hidden(&hi);
+                let row = &logits[i * lm_rows..(i + 1) * lm_rows];
+                let ra = sampler::argmax(&ref_lg);
+                let va = sampler::argmax(row);
+                let mut md = 0f32;
+                let mut rms = 0f64;
+                for j in 0..lm_rows.min(ref_lg.len()) {
+                    let d = (ref_lg[j] - row[j]).abs();
+                    md = md.max(d);
+                    rms += (d as f64) * (d as f64);
+                }
+                let mut hd = 0f32;
+                for j in 0..self.hidden_size {
+                    hd = hd.max((hi[j] - hiddens[i * self.hidden_size + j]).abs());
+                }
+                eprintln!(
+                    "verify-check row {i} tok {t} pos {}: ref argmax {ra} verify argmax {va} {} | max|dlogit| {md:.3} rms {:.4} | max|dhidden| {hd:.4}",
+                    next_pos + i,
+                    if ra == va { "OK" } else { "MISMATCH" },
+                    (rms / lm_rows as f64).sqrt()
+                );
+            }
+            self.graph_want_logits = want_save;
+            for (l, st) in self.kv_cache.layers.iter_mut().zip(snap) {
+                l.linear_state = st;
+            }
+            for (li, (l, n0)) in self.kv_cache.layers.iter_mut().zip(attn_lens).enumerate() {
+                let extra = l.seq_len.saturating_sub(n0);
+                if extra > 0 {
+                    l.truncate_last(extra);
+                    crate::gpu_metal::kv_mirror_set_stored(self.graph_kv_id, li, n0);
+                }
+            }
         }
         let t_verify = t_round.elapsed();
         let sub_verify = subs();
@@ -3591,7 +3796,19 @@ impl Pipeline {
             }
             ids
         };
+        if spec_dbg {
+            eprintln!("spec-dbg round: t_next {t_next} drafts {:?} verified {:?} accepted {a}", drafts, ids);
+        }
         // a fully-accepted round needs no restore: every input was real.
+        #[cfg(target_os = "macos")]
+        if metal_native {
+            // the Metal verify never wrote its states: the commit replays the
+            // accepted prefix into the CPU owners and appends the K/V rows
+            self.metal_verify_commit(a);
+        } else if a + 1 < b {
+            crate::gpu::gdn_spec_restore(self.graph_kv_id, a);
+        }
+        #[cfg(not(target_os = "macos"))]
         if a + 1 < b {
             crate::gpu::gdn_spec_restore(self.graph_kv_id, a);
         }
@@ -3612,7 +3829,18 @@ impl Pipeline {
             // Graph arm: all accepted pairs in ONE batched run over the
             // MTP block; the token graph one by one if the batch declines.
             let mut warmed = false;
-            if self.mtp_graph_mode == Some(true) {
+            #[cfg(target_os = "macos")]
+            if metal_native && self.mtp_graph_mode == Some(true) {
+                warmed = true;
+                for j in 0..a {
+                    let row = hiddens[j * self.hidden_size..(j + 1) * self.hidden_size].to_vec();
+                    if self.mtp_step_metal(m, &row, ids[j], next_pos + j, false).is_none() {
+                        warmed = false;
+                        break;
+                    }
+                }
+            }
+            if !warmed && self.mtp_graph_mode == Some(true) && !metal_native {
                 let rows: Vec<Vec<f32>> = (0..a)
                     .map(|j| hiddens[j * self.hidden_size..(j + 1) * self.hidden_size].to_vec())
                     .collect();
@@ -4601,6 +4829,19 @@ impl Pipeline {
                 for (bi, &id) in ids.iter().enumerate() {
                     let e = me.embed_single(id);
                     h[bi * hs..(bi + 1) * hs].copy_from_slice(&e);
+                }
+                if let Ok(tp) = std::env::var("CMF_TRACE_POS") {
+                    if let Some(t) = tp.parse::<usize>().ok() {
+                        if t >= start_pos && t < start_pos + ids.len() {
+                            let bi = t - start_pos;
+                            let row = &h[bi * hs..(bi + 1) * hs];
+                            let n: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            eprintln!(
+                                "BATCH pos {t} embed: id {} |h| = {n:.6} h0 {:.6} h1 {:.6} | b={} start={start_pos} ids[..8]={:?}",
+                                ids[bi], row[0], row[1], ids.len(), &ids[..ids.len().min(8)]
+                            );
+                        }
+                    }
                 }
             }
         };
@@ -5911,6 +6152,461 @@ impl Pipeline {
     /// graph in ONE submit (projections/FFN as GEMMs). `hiddens` is [k·hidden]
     /// in/out (embeddings in, layer output out); KV mirror / GDN state advance.
     /// false ⇒ unsupported → caller keeps the per-position graph.
+    /// Native-Metal twin of `try_batch_graph_wgpu`: the b rows through the
+    /// whole model on the `VerifyGraph` (one submit), the head folded in
+    /// when `spec` asks; `hiddens` come back as the last layer's output
+    /// rows, `spec.2` as `[b][lm_rows]` logits. The graph is parked in
+    /// `metal_verify` for `metal_verify_commit`. All-or-nothing: any layer
+    /// outside the graph's contract declines the whole batch (the caller
+    /// runs plain), nothing is half-encoded.
+    #[cfg(target_os = "macos")]
+    fn try_batch_graph_metal(
+        &mut self,
+        hiddens: &mut [f32],
+        positions: &[usize],
+        b: usize,
+        spec: Option<((usize, usize, usize), &[f32], &mut Vec<f32>)>,
+    ) -> bool {
+        use crate::gpu_metal::{
+            AttnDeviceParams, AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GraphDims, MetalFfn, VerifyGraph,
+        };
+        let _t0 = std::time::Instant::now();
+        if !crate::gpu::q1_force()
+            || !crate::gpu::enabled_here()
+            || self.attn_softcap > 0.0
+            || self.o1_active()
+            || self.swa.is_some()
+            || self.global_attn.is_some()
+            || self.attention_heads_per_layer.is_some()
+            || self.attn_v_norm
+            || self.loop_final_norm
+            || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
+            || positions.len() != b
+            || positions.windows(2).any(|w| w[1] != w[0] + 1)
+            || hiddens.len() != b * self.hidden_size
+        {
+            return false;
+        }
+        let attend_contract = self.head_dim % 4 == 0
+            && self.head_dim <= 256
+            && self.rotary_dim >= 2
+            && self.rotary_dim <= self.head_dim
+            && (self.rotary_dim / 2) % 32 == 0
+            && self.num_kv_heads > 0
+            && self.num_heads % self.num_kv_heads == 0;
+        if !attend_contract {
+            return false;
+        }
+        enum Item<'a> {
+            Gdn { run: Vec<GdnGpuLayer<'a>>, first: usize },
+            Attn {
+                l: AttnGpuLayer<'a>,
+                li: usize,
+                q_norm: Option<&'a [f32]>,
+                k_norm: Option<&'a [f32]>,
+                output_gate: bool,
+            },
+        }
+        let mut plan: Vec<Item> = Vec::new();
+        let mut model_ref: Option<std::sync::Arc<cortiq_core::CmfModel>> = None;
+        for li in 0..self.num_layers {
+            let lw = &self.weights.layers[self.phys_layer(li)];
+            if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
+                return false;
+            }
+            let ffn = match &lw.ffn {
+                FfnKind::Dense(d) if d.act == Act::Silu => {
+                    let (Some(g), Some(u), Some(dn)) =
+                        (d.gate_proj.q1_parts(), d.up_proj.q1_parts(), d.down_proj.q1_parts())
+                    else {
+                        return false;
+                    };
+                    MetalFfn::Dense { gate: g, up: u, down: dn }
+                }
+                _ => return false,
+            };
+            match &lw.attn {
+                AttnKind::LinearGdn(w) if self.gdn_cfg.is_some() => {
+                    let (Some(qkv), Some(z), Some(a), Some(bb), Some(out)) = (
+                        w.in_proj_qkv.q1_parts(),
+                        w.in_proj_z.q1_parts(),
+                        w.in_proj_a.f32_parts(),
+                        w.in_proj_b.f32_parts(),
+                        w.out_proj.q1_parts(),
+                    ) else {
+                        return false;
+                    };
+                    if let QTensor::Mapped { model, .. } = &w.in_proj_qkv {
+                        model_ref.get_or_insert_with(|| model.clone());
+                    }
+                    let gl = GdnGpuLayer {
+                        attn_norm: &lw.input_norm,
+                        post_norm: &lw.post_norm,
+                        qkv,
+                        z,
+                        a,
+                        b: bb,
+                        out,
+                        ffn,
+                        conv1d: &w.conv1d,
+                        a_log: &w.a_log,
+                        dt_bias: &w.dt_bias,
+                        gnorm: &w.norm,
+                    };
+                    match plan.last_mut() {
+                        Some(Item::Gdn { run, .. }) => run.push(gl),
+                        _ => plan.push(Item::Gdn { run: vec![gl], first: li }),
+                    }
+                }
+                AttnKind::Full {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                    output_gate,
+                    softplus_gate: None,
+                    bias: None,
+                } => {
+                    let (Some(pq), Some(pk), Some(pv), Some(po)) =
+                        (wq.q1_parts(), wk.q1_parts(), wv.q1_parts(), wo.q1_parts())
+                    else {
+                        return false;
+                    };
+                    if let QTensor::Mapped { model, .. } = wq {
+                        model_ref.get_or_insert_with(|| model.clone());
+                    }
+                    let cache = &self.kv_cache.layers[li];
+                    if cache.mode != crate::kv_cache::KvMode::F32 || cache.o1.is_some() {
+                        return false;
+                    }
+                    plan.push(Item::Attn {
+                        l: AttnGpuLayer {
+                            attn_norm: &lw.input_norm,
+                            post_norm: &lw.post_norm,
+                            wq: pq,
+                            wk: pk,
+                            wv: pv,
+                            wo: po,
+                            ffn,
+                        },
+                        li,
+                        q_norm: q_norm.as_deref(),
+                        k_norm: k_norm.as_deref(),
+                        output_gate: *output_gate,
+                    });
+                }
+                _ => return false,
+            }
+        }
+        let Some(model) = model_ref else { return false };
+        let dims = GraphDims {
+            hidden: self.hidden_size,
+            eps: self.rms_eps as f32,
+            gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
+        };
+        let gcfg = self.gdn_cfg.map(|cfg| GdnGpuCfg {
+            nv: cfg.num_v_heads,
+            nk: cfg.num_k_heads,
+            dk: cfg.key_head_dim,
+            dv: cfg.value_head_dim,
+            kk: cfg.conv_kernel,
+            hidden: self.hidden_size,
+            inter: self.intermediate_size,
+            c_dim: cfg.conv_dim(),
+            eps: cfg.rms_eps as f32,
+            gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
+        });
+        let want = self.gdn_cfg.map(|c| c.state_len()).unwrap_or(0);
+        for l in &mut self.kv_cache.layers {
+            if l.linear_state.len() != want && want > 0 {
+                l.linear_state = vec![0f32; want];
+            }
+        }
+        let Some(mut graph) = VerifyGraph::new(&model, dims, hiddens, b) else {
+            return false;
+        };
+        let (nh, nkv, hd, rd) = (self.num_heads, self.num_kv_heads, self.head_dim, self.rotary_dim);
+        let gemma = self.norm_style == cortiq_core::NormStyle::Gemma;
+        let eps = self.rms_eps as f32;
+        let kv_id = self.graph_kv_id;
+        let inv_freq = self.inv_freq.clone();
+        let pos0 = positions[0];
+        fn mk_params<'a>(
+            li: usize,
+            cache: &'a crate::kv_cache::LayerKvCache,
+            q_norm: Option<&'a [f32]>,
+            k_norm: Option<&'a [f32]>,
+            output_gate: bool,
+            inv_freq: &'a [f32],
+            geom: (usize, usize, usize, usize),
+            pos0: usize,
+            kv_id: u64,
+            eps: f32,
+            gemma: bool,
+        ) -> (AttnDeviceParams<'a>, usize) {
+            let (nh, nkv, hd, rd) = geom;
+            let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
+            let cpu_v: Vec<&[f32]> = (0..nkv).map(|g| cache.head_values(g)).collect();
+            let cpu_stored = cpu_k[0].len() / hd;
+            (
+                AttnDeviceParams {
+                    kv_id,
+                    layer: li,
+                    nh,
+                    nkv,
+                    hd,
+                    rd,
+                    position: pos0,
+                    eps,
+                    gemma,
+                    output_gate,
+                    q_norm,
+                    k_norm,
+                    inv_freq,
+                    cpu_k,
+                    cpu_v,
+                    cpu_stored,
+                    o1: None,
+                },
+                cpu_stored,
+            )
+        }
+        let geom = (nh, nkv, hd, rd);
+        // Validate everything before encoding anything.
+        for item in &plan {
+            let ok = match item {
+                Item::Gdn { run, .. } => gcfg
+                    .as_ref()
+                    .map(|gc| run.iter().all(|l| graph.gdn_ok(l, gc)))
+                    .unwrap_or(false),
+                Item::Attn { l, li, q_norm, k_norm, output_gate } => {
+                    let (p, _) = mk_params(*li, &self.kv_cache.layers[*li], *q_norm, *k_norm, *output_gate, &inv_freq, geom, pos0, kv_id, eps, gemma);
+                    graph.attn_ok(l, &p)
+                }
+            };
+            if !ok {
+                {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static SAID: AtomicBool = AtomicBool::new(false);
+                    if !SAID.swap(true, Ordering::Relaxed) {
+                        tracing::warn!("metal verify graph: a layer failed preflight — speculation declines");
+                    }
+                }
+                return false;
+            }
+        }
+        let lm = match &spec {
+            Some((lm, _, _)) => {
+                if !graph.lm_head_ok(*lm) {
+                    return false;
+                }
+                Some(*lm)
+            }
+            None => None,
+        };
+        let mut gdn_layers = Vec::new();
+        let mut attn_layers = Vec::new();
+        for item in &plan {
+            match item {
+                Item::Gdn { run, first } => {
+                    let ro: Vec<&[f32]> = self.kv_cache.layers[*first..*first + run.len()]
+                        .iter()
+                        .map(|l| l.linear_state.as_slice())
+                        .collect();
+                    if !graph.encode_gdn_run_b(run, &ro, gcfg.as_ref().unwrap()) {
+                        return false;
+                    }
+                    gdn_layers.extend(*first..*first + run.len());
+                }
+                Item::Attn { l, li, q_norm, k_norm, output_gate } => {
+                    let (p, cpu_stored) = mk_params(*li, &self.kv_cache.layers[*li], *q_norm, *k_norm, *output_gate, &inv_freq, geom, pos0, kv_id, eps, gemma);
+                    if !graph.encode_attn_b(l, &p) {
+                        return false;
+                    }
+                    attn_layers.push((*li, cpu_stored));
+                }
+            }
+        }
+        if let (Some(lm), Some((_, final_norm, _))) = (lm, spec.as_ref()) {
+            if !graph.encode_lm_head_b(final_norm, lm) {
+                return false;
+            }
+        }
+        let _t_enc = _t0.elapsed();
+        graph.sync();
+        let _t_sync = _t0.elapsed();
+        if let Some((lm, _, logits)) = spec {
+            logits.resize(b * lm.1, 0.0);
+            graph.read_logits(logits);
+        }
+        graph.read_hidden(hiddens);
+        if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
+            eprintln!(
+                "metal-verify: encode {:.1} ms | gpu+wait {:.1} ms | b={b}",
+                _t_enc.as_secs_f64() * 1e3,
+                (_t_sync - _t_enc).as_secs_f64() * 1e3
+            );
+        }
+        self.metal_verify = Some(MetalVerifyPending { graph, gdn_layers, attn_layers });
+        true
+    }
+
+    /// Commit a Metal verify round: replay the GDN recurrences over the
+    /// `a + 1` accepted positions into the CPU states, append the accepted
+    /// K/V rows from the mirrors to the CPU caches, re-point the mirrors.
+    #[cfg(target_os = "macos")]
+    fn metal_verify_commit(&mut self, a: usize) -> bool {
+        let Some(mut pending) = self.metal_verify.take() else {
+            return false;
+        };
+        let n = a + 1;
+        // encode order == ascending layer order (the plan walks 0..layers)
+        let idxs = pending.gdn_layers.clone();
+        let mut outs: Vec<&mut [f32]> = self
+            .kv_cache
+            .layers
+            .iter_mut()
+            .enumerate()
+            .filter(|(i, _)| idxs.binary_search(i).is_ok())
+            .map(|(_, l)| l.linear_state.as_mut_slice())
+            .collect();
+        if !pending.graph.commit(n, &mut outs) {
+            return false;
+        }
+        let (nkv, hd) = (self.num_kv_heads, self.head_dim);
+        let mut kbuf = vec![0f32; n * nkv * hd];
+        let mut vbuf = vec![0f32; n * nkv * hd];
+        for (li, cpu_stored) in &pending.attn_layers {
+            if crate::gpu_metal::kv_mirror_read_rows(self.graph_kv_id, *li, nkv, hd, *cpu_stored, n, &mut kbuf, &mut vbuf) {
+                let cache = &mut self.kv_cache.layers[*li];
+                for r in 0..n {
+                    cache.append(&kbuf[r * nkv * hd..(r + 1) * nkv * hd], &vbuf[r * nkv * hd..(r + 1) * nkv * hd], &[]);
+                }
+                crate::gpu_metal::kv_mirror_set_stored(self.graph_kv_id, *li, cpu_stored + n);
+            }
+        }
+        true
+    }
+
+    /// One MTP block step on the native Metal token graph: block input on
+    /// the host, the attention layer + FFN device-resident over the MTP
+    /// mirror, the head folded in when `want_logits`. The appended K/V row
+    /// is pulled into the CPU MTP cache (owner of record) after the sync.
+    #[cfg(target_os = "macos")]
+    fn mtp_step_metal(
+        &mut self,
+        m: &mut MtpModule,
+        hidden: &[f32],
+        next_token: u32,
+        position: usize,
+        want_logits: bool,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        use crate::gpu_metal::{AttnDeviceParams, AttnGpuLayer, GraphDims, MetalFfn, TokenGraph};
+        if std::env::var("CMF_MTP_GRAPH").as_deref() == Ok("0")
+            || !crate::gpu::q1_force()
+            || !crate::gpu::enabled_here()
+            || self.attn_softcap > 0.0
+            || self.attention_heads_per_layer.is_some()
+            || m.kv.mode != crate::kv_cache::KvMode::F32
+            || m.kv.o1.is_some()
+        {
+            return None;
+        }
+        let AttnKind::Full {
+            wq,
+            wk,
+            wv,
+            wo,
+            q_norm,
+            k_norm,
+            output_gate,
+            softplus_gate: None,
+            bias: None,
+        } = &m.layer.attn
+        else {
+            return None;
+        };
+        let FfnKind::Dense(d) = &m.layer.ffn else { return None };
+        if d.act != Act::Silu {
+            return None;
+        }
+        let (pq, pk, pv, po) = (wq.q1_parts()?, wk.q1_parts()?, wv.q1_parts()?, wo.q1_parts()?);
+        let (g, u, dn) = (d.gate_proj.q1_parts()?, d.up_proj.q1_parts()?, d.down_proj.q1_parts()?);
+        let QTensor::Mapped { model, .. } = wq else { return None };
+        let model = model.clone();
+        let lm = if want_logits { Some(self.weights.lm_head.q1_parts()?) } else { None };
+        let mut x = self.mtp_block_input(m, hidden, next_token);
+        let dims = GraphDims {
+            hidden: self.hidden_size,
+            eps: self.rms_eps as f32,
+            gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
+        };
+        let mut graph = TokenGraph::new(&model, dims, &x)?;
+        let l = AttnGpuLayer {
+            attn_norm: &m.layer.input_norm,
+            post_norm: &m.layer.post_norm,
+            wq: pq,
+            wk: pk,
+            wv: pv,
+            wo: po,
+            ffn: MetalFfn::Dense { gate: g, up: u, down: dn },
+        };
+        let (nh, nkv, hd, rd) = (self.num_heads, self.num_kv_heads, self.head_dim, self.rotary_dim);
+        let inv_freq = self.inv_freq.clone();
+        {
+            let cache = &m.kv;
+            let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
+            let cpu_v: Vec<&[f32]> = (0..nkv).map(|g| cache.head_values(g)).collect();
+            let cpu_stored = cpu_k[0].len() / hd;
+            let p = AttnDeviceParams {
+                kv_id: self.mtp_kv_id(),
+                layer: Self::MTP_LAYER_BASE,
+                nh,
+                nkv,
+                hd,
+                rd,
+                position,
+                eps: self.rms_eps as f32,
+                gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
+                output_gate: *output_gate,
+                q_norm: q_norm.as_deref(),
+                k_norm: k_norm.as_deref(),
+                inv_freq: &inv_freq,
+                cpu_k,
+                cpu_v,
+                cpu_stored,
+                o1: None,
+            };
+            if !graph.attn_device_ok(&l, &p) || !graph.encode_attn_device(&l, &p) {
+                return None;
+            }
+        }
+        if let Some(lm) = lm {
+            if !graph.lm_head_ok(lm) {
+                return None;
+            }
+            graph.encode_lm_head(&m.final_norm, lm);
+        }
+        graph.sync();
+        let mut logits = Vec::new();
+        if let Some(lm) = lm {
+            logits = attention::take_buf(lm.1.min(self.vocab_size));
+            graph.read_logits(&mut logits);
+            logits.resize(self.vocab_size, 0.0);
+        }
+        graph.finish(&mut x);
+        let mut krow = attention::take_buf(nkv * hd);
+        let mut vrow = attention::take_buf(nkv * hd);
+        if crate::gpu_metal::kv_mirror_read_last(self.mtp_kv_id(), Self::MTP_LAYER_BASE, nkv, hd, &mut krow, &mut vrow) {
+            m.kv.append(&krow, &vrow, &[]);
+        }
+        attention::recycle_buf(&mut krow);
+        attention::recycle_buf(&mut vrow);
+        Some((logits, x))
+    }
+
     fn try_batch_graph_wgpu(
         &self,
         hiddens: &mut [f32],

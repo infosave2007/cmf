@@ -1881,12 +1881,19 @@ kernel void attn_rope_qkn(
     constant uint&  pos   [[buffer(11)]],
     constant uint&  flags [[buffer(12)]], // 1=gate 2=qnorm 4=knorm 8=gemma
     constant float& eps   [[buffer(13)]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint tg [[threadgroup_position_in_grid]],
-    uint sgs [[simdgroups_per_threadgroup]])
+    uint gid [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
 {
-    uint head = tg * sgs + sg;
+    // Head = simdgroup index IN THE GRID. This kernel is launched with
+    // dispatch_threads over (nh+nkv)·32 threads, and the last threadgroup
+    // is partial whenever that is not a multiple of 256 — there
+    // `simdgroups_per_threadgroup` reports the PARTIAL group's count, so
+    // `tg·sgs + sg` re-derived heads 0..k for it instead of the tail
+    // heads: the K heads of every model with (nh+nkv) % 8 != 0
+    // (Qwen3.5-0.8B: 8+2, Qwen3.8-27B: 24+4) were never normed nor
+    // rotated, the raw K went into the cache, and the device attend ran
+    // 15-20% off the CPU's on every token.
+    uint head = gid >> 5u;
     if (head >= nh + nkv) return;
     bool isq = head < nh;
     bool gate = (flags & 1u) != 0u;
@@ -2882,6 +2889,292 @@ kernel void gdn_state_update(
     float inv = rsqrt(tot / (float)dv + eps);
     float zz = z[h * dv + dj];
     of[h * dv + dj] = o * inv * gnorm[dj] * (zz / (1.0f + exp(-zz)));
+}
+
+// ── Batched (b ≤ 8) speculative-verify kernels ─────────────────────────
+// Every projection of the verify goes through `q4tp_mul_mm_n8`; these
+// are the b-row twins of the token graph's small kernels. Row e of every
+// [nb][·] buffer is speculative position e.
+
+// y[e][row] = Σ_i w[row][i]·x[e][i] — the f32 GDN in_proj_a/b, read once
+// for the whole batch. One simdgroup per row.
+kernel void f32_matvec_b(
+    device const float*  w    [[buffer(0)]],
+    device const float*  xs   [[buffer(1)]],
+    device float*        y    [[buffer(2)]],
+    constant uint&       cols [[buffer(3)]],
+    constant uint&       rows [[buffer(4)]],
+    constant uint&       nb   [[buffer(5)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint row = tgpos * sgs + sg;
+    if (row >= rows) return;
+    device const float* wr = w + (ulong)row * cols;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f, a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+    for (uint i = lane; i < cols; i += 32u) {
+        float wv = wr[i];
+        a0 += wv * xs[i];
+        if (nb > 1u) a1 += wv * xs[(ulong)1u * cols + i];
+        if (nb > 2u) a2 += wv * xs[(ulong)2u * cols + i];
+        if (nb > 3u) a3 += wv * xs[(ulong)3u * cols + i];
+        if (nb > 4u) a4 += wv * xs[(ulong)4u * cols + i];
+        if (nb > 5u) a5 += wv * xs[(ulong)5u * cols + i];
+        if (nb > 6u) a6 += wv * xs[(ulong)6u * cols + i];
+        if (nb > 7u) a7 += wv * xs[(ulong)7u * cols + i];
+    }
+    a0 = simd_sum(a0); a1 = simd_sum(a1); a2 = simd_sum(a2); a3 = simd_sum(a3);
+    a4 = simd_sum(a4); a5 = simd_sum(a5); a6 = simd_sum(a6); a7 = simd_sum(a7);
+    if (lane == 0u) {
+        y[row] = a0;
+        if (nb > 1u) y[(ulong)1u * rows + row] = a1;
+        if (nb > 2u) y[(ulong)2u * rows + row] = a2;
+        if (nb > 3u) y[(ulong)3u * rows + row] = a3;
+        if (nb > 4u) y[(ulong)4u * rows + row] = a4;
+        if (nb > 5u) y[(ulong)5u * rows + row] = a5;
+        if (nb > 6u) y[(ulong)6u * rows + row] = a6;
+        if (nb > 7u) y[(ulong)7u * rows + row] = a7;
+    }
+}
+
+// Depthwise conv over the batch: position e's window is the last kk
+// rows of the virtual sequence [ring (kk-1 rows); qkv[0..e]] —
+// cq[e][i] = silu(Σ_j taps[i][j]·seq(e+j)[i]). Position 0 is
+// `gdn_conv` term for term. Nothing is shifted: the ring is committed
+// separately once the accepted count is known.
+kernel void gdn_conv_b(
+    device const float* qkv   [[buffer(0)]],   // [nb][c_dim]
+    device const float* ring  [[buffer(1)]],   // [(kk-1)][c_dim]
+    device const float* taps  [[buffer(2)]],   // [c_dim][kk]
+    device float*       cq    [[buffer(3)]],   // [nb][c_dim]
+    constant uint&      c_dim [[buffer(4)]],
+    constant uint&      kk    [[buffer(5)]],
+    constant uint&      nb    [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint i = gid.x, e = gid.y;
+    if (i >= c_dim || e >= nb) return;
+    float acc = 0.0f;
+    for (uint j = 0u; j < kk; ++j) {
+        uint t = e + j;
+        float v = t < kk - 1u ? ring[t * c_dim + i]
+                              : qkv[(ulong)(t - (kk - 1u)) * c_dim + i];
+        acc += v * taps[i * kk + j];
+    }
+    cq[(ulong)e * c_dim + i] = acc / (1.0f + exp(-acc));
+}
+
+// Ring commit after n_pos accepted positions: the ring becomes the last
+// kk-1 rows of [ring; qkv[0..n_pos]]. Column per thread, so the in-place
+// shift has no cross-thread hazard (kk ≤ 8).
+kernel void gdn_ring_commit_b(
+    device float*       ring  [[buffer(0)]],
+    device const float* qkv   [[buffer(1)]],
+    constant uint&      c_dim [[buffer(2)]],
+    constant uint&      kk    [[buffer(3)]],
+    constant uint&      n_pos [[buffer(4)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= c_dim) return;
+    float v[7];
+    for (uint j = 0u; j + 1u < kk; ++j) {
+        uint t = n_pos + j;
+        v[j] = t < kk - 1u ? ring[t * c_dim + i]
+                           : qkv[(ulong)(t - (kk - 1u)) * c_dim + i];
+    }
+    for (uint j = 0u; j + 1u < kk; ++j) ring[j * c_dim + i] = v[j];
+}
+
+// gdn_gates over [nb][nv]: the per-head constants indexed modulo nv.
+kernel void gdn_gates_b(
+    device const float* a       [[buffer(0)]],
+    device const float* b       [[buffer(1)]],
+    device const float* a_log   [[buffer(2)]],
+    device const float* dt_bias [[buffer(3)]],
+    device float*       g       [[buffer(4)]],
+    device float*       beta    [[buffer(5)]],
+    constant uint&      nv      [[buffer(6)]],
+    constant uint&      n       [[buffer(7)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n) return;
+    uint h = i % nv;
+    float x = a[i] + dt_bias[h];
+    float sp = x > 20.0f ? x : log(1.0f + exp(x));
+    g[i] = exp(-exp(a_log[h]) * sp);
+    beta[i] = 1.0f / (1.0f + exp(-b[i]));
+}
+
+// gdn_qk_norms per (position, K head): invq/invk are [nb][nk].
+kernel void gdn_qk_norms_b(
+    device const float* cq    [[buffer(0)]],
+    device float*       invq  [[buffer(1)]],
+    device float*       invk  [[buffer(2)]],
+    constant uint&      nk    [[buffer(3)]],
+    constant uint&      dk    [[buffer(4)]],
+    constant uint&      c_dim [[buffer(5)]],
+    constant uint&      nb    [[buffer(6)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint idx = tg * sgs + sg;
+    uint e = idx / nk, h = idx % nk;
+    if (e >= nb) return;
+    device const float* cqe = cq + (ulong)e * c_dim;
+    uint kd = nk * dk;
+    float nq = 0.0f, nkn = 0.0f;
+    for (uint d = lane; d < dk; d += 32u) {
+        float q = cqe[h * dk + d];      nq  += q * q;
+        float k = cqe[kd + h * dk + d]; nkn += k * k;
+    }
+    nq = simd_sum(nq); nkn = simd_sum(nkn);
+    if (lane == 0) {
+        invq[e * nk + h] = 1.0f / (sqrt(nq + 1e-6f) * sqrt((float)dk));
+        invk[e * nk + h] = 1.0f / sqrt(nkn + 1e-6f);
+    }
+}
+
+// The GDN recurrence over nb consecutive positions with the head's S
+// column held in registers (DK floats a thread) — one threadgroup per V
+// head, dv threads. mode bit 0: emit the gated-normed outputs of[e];
+// bit 1: write the final S back. The verify runs (nb, mode 1) and never
+// touches S; the commit re-runs (accepted+1, mode 2) from the same
+// initial S, which is what makes a rejected suffix free to roll back.
+// Every position is `gdn_state_update` term for term.
+template <uint DK>
+inline void gdn_state_b_impl(
+    device float* S, device const float* cq, device const float* z,
+    device const float* g, device const float* beta,
+    device const float* invq, device const float* invk,
+    device const float* gnorm, device float* of,
+    uint nv, uint nk, uint dv, uint c_dim, uint nb, uint mode, float eps,
+    threadgroup float* part, uint h, uint dj, uint lane, uint sg)
+{
+    uint rep = nv / nk;
+    uint ko = h / rep;
+    uint kd = nk * DK;
+    uint vd = nv * dv;
+    device float* s = S + (ulong)h * DK * dv;
+    float sc[DK];
+    #pragma clang loop unroll(full)
+    for (uint di = 0u; di < DK; ++di) sc[di] = s[di * dv + dj];
+    for (uint e = 0u; e < nb; ++e) {
+        device const float* cqe = cq + (ulong)e * c_dim;
+        float gh = g[e * nv + h];
+        float bh = beta[e * nv + h];
+        float iq = invq[e * nk + ko];
+        float ik = invk[e * nk + ko];
+        float vt = cqe[2u * kd + h * dv + dj];
+        device const float* ke = cqe + kd + ko * DK;
+        device const float* qe = cqe + ko * DK;
+        float kv = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint di = 0u; di < DK; ++di) kv += ke[di] * ik * sc[di];
+        float delta = (vt - gh * kv) * bh;
+        float o = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint di = 0u; di < DK; ++di) {
+            float kf = ke[di] * ik;
+            float qf = qe[di] * iq;
+            float cell = gh * sc[di] + kf * delta;
+            sc[di] = cell;
+            o += qf * cell;
+        }
+        if (mode & 1u) {
+            float ss = simd_sum(o * o);
+            if (lane == 0) part[sg] = ss;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float tot = 0.0f;
+            for (uint k2 = 0; k2 < (dv + 31u) / 32u; ++k2) tot += part[k2];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float inv = rsqrt(tot / (float)dv + eps);
+            float zz = z[(ulong)e * vd + h * dv + dj];
+            of[(ulong)e * vd + h * dv + dj] = o * inv * gnorm[dj] * (zz / (1.0f + exp(-zz)));
+        }
+    }
+    if (mode & 2u) {
+        #pragma clang loop unroll(full)
+        for (uint di = 0u; di < DK; ++di) s[di * dv + dj] = sc[di];
+    }
+}
+#define GDN_STATE_B_KERNEL(NAME, DK) \
+kernel void NAME( \
+    device float*       S     [[buffer(0)]], \
+    device const float* cq    [[buffer(1)]], \
+    device const float* z     [[buffer(2)]], \
+    device const float* g     [[buffer(3)]], \
+    device const float* beta  [[buffer(4)]], \
+    device const float* invq  [[buffer(5)]], \
+    device const float* invk  [[buffer(6)]], \
+    device const float* gnorm [[buffer(7)]], \
+    device float*       of    [[buffer(8)]], \
+    constant uint&      nv    [[buffer(9)]], \
+    constant uint&      nk    [[buffer(10)]], \
+    constant uint&      dv    [[buffer(11)]], \
+    constant uint&      c_dim [[buffer(12)]], \
+    constant uint&      nb    [[buffer(13)]], \
+    constant uint&      mode  [[buffer(14)]], \
+    constant float&     eps   [[buffer(15)]], \
+    uint h    [[threadgroup_position_in_grid]], \
+    uint dj   [[thread_position_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]], \
+    uint sg   [[simdgroup_index_in_threadgroup]]) \
+{ \
+    threadgroup float part[32]; \
+    gdn_state_b_impl<DK>(S, cq, z, g, beta, invq, invk, gnorm, of, nv, nk, dv, c_dim, nb, mode, eps, part, h, dj, lane, sg); \
+}
+GDN_STATE_B_KERNEL(gdn_state_b64, 64u)
+GDN_STATE_B_KERNEL(gdn_state_b128, 128u)
+
+// kv_append over nb positions: row e lands at index stored + e.
+kernel void kv_append_b(
+    device const float* k    [[buffer(0)]],   // [nb][nkv·hd]
+    device const float* v    [[buffer(1)]],
+    device float*       kbuf [[buffer(2)]],
+    device float*       vbuf [[buffer(3)]],
+    constant uint& nkv    [[buffer(4)]],
+    constant uint& hd     [[buffer(5)]],
+    constant uint& cap    [[buffer(6)]],
+    constant uint& stored [[buffer(7)]],
+    constant uint& nb     [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint i = gid.x, e = gid.y;
+    if (i >= nkv * hd || e >= nb) return;
+    uint h = i / hd, d = i % hd;
+    ulong dst = ((ulong)h * cap + stored + e) * hd + d;
+    ulong src = (ulong)e * nkv * hd + i;
+    kbuf[dst] = k[src];
+    vbuf[dst] = v[src];
+}
+
+// Per-row power-of-two pre-scale for the half-staged GEMM: rows whose
+// max |x| would overflow half get scaled down (the GEMM undoes it).
+kernel void row_pow2_scale(
+    device const float* x   [[buffer(0)]],
+    device float*       xsc [[buffer(1)]],
+    constant uint&      n   [[buffer(2)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint row  [[threadgroup_position_in_grid]])
+{
+    threadgroup float part[8];
+    device const float* xr = x + (ulong)row * n;
+    float m = 0.0f;
+    for (uint i = tid; i < n; i += 256u) m = max(m, fabs(xr[i]));
+    m = simd_max(m);
+    if (lane == 0) part[sg] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (uint k = 0; k < 8u; ++k) tot = max(tot, part[k]);
+        xsc[row] = tot > 16384.0f ? exp2(-ceil(log2(tot / 16384.0f))) : 1.0f;
+    }
 }
 
 // q1t: 9-byte tiles [f16 scale][7B base-3 codes, 5 ternary/byte] per 32-group;
@@ -4152,6 +4445,139 @@ kernel void q4tp_mul_mm(
     }
 }
 
+// ── Narrow q4tp GEMM for the speculative verify: 64 rows × (nb ≤ 8)
+// activations per threadgroup on the simdgroup matrix unit. The wide
+// GEMM above tiles 32 batch columns and is MAC-bound at ~2 ms a 46 MB
+// gate call on the M4 whatever nb is; the batched matvec is ALU-bound on
+// the unpack × nb. Here the weight tile is unpacked ONCE (magic-mantissa
+// half pairs, ~2 ops a weight), the x tile is 8 wide, and the 8×8×8
+// multiply-accumulates run on the matrix unit — the kernel is meant to
+// sit near the one-vector matvec's bandwidth cost at nb = 8.
+//
+// K order inside every 8-block is permuted (0,4,1,5,2,6,3,7): that is the
+// order the half2 unpack yields for free, and the x staging applies the
+// same permutation, so the dot product is unchanged. Activations are
+// staged as half after a per-row power-of-two pre-scale `xsc[b]` (the
+// output row is multiplied by its inverse) so a row past 65504 does not
+// turn to inf; `xsc` is all-ones when the host knows the range is safe.
+kernel void q4tp_mul_mm_n8(
+    device const uchar*  q      [[buffer(0)]],
+    device const float*  xs     [[buffer(1)]],   // [nb][cols]
+    device float*        y      [[buffer(2)]],   // [nb][rows]
+    constant uint&       cols_b [[buffer(3)]],
+    constant uint&       rows_b [[buffer(4)]],
+    constant uint&       nb     [[buffer(5)]],
+    device const float*  xsc    [[buffer(6)]],   // [nb] power-of-two pre-scales
+    uint tiitg [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tg    [[threadgroup_position_in_grid]])
+{
+    // NK = 64 (two q4tp groups) an iteration: thread (row lr, group
+    // parity il) owns one whole 16 B tile — 32 nibbles → 32 halves, four
+    // 16 B stores. sa: [kb 8][row 64][k 8] halves; sb: [kb 8][b 8][k 8].
+    threadgroup half sa[8u * 512u];
+    threadgroup half sb[8u * 64u];
+    // the output scratch aliases the (finished) weight tile: 9 KB of
+    // threadgroup memory a group instead of 11 — occupancy
+    threadgroup float* sc = (threadgroup float*)sa;
+    uint rows = rows_b, cols = cols_b;
+    uint gpr = cols >> 5u;
+    uint r0 = tg * 64u;
+    uint lr = tiitg >> 1u;
+    uint il = tiitg & 1u;
+    uint r = min(r0 + lr, rows - 1u);
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint cstride = (gpr * 5u + 7u) / 8u;
+    device const half* prow = (device const half*)(q + params_off + (ulong)r * 4ul);
+    float row_lo = (float)prow[0], row_st = (float)prow[1];
+    device const uchar* codes_row = q + codes_off + (ulong)r * (ulong)cstride;
+    device const uint4* wrow = (device const uint4*)(q + (ulong)r * (ulong)gpr * 16ul);
+    // x staging role: threads 0..63 → (b = t>>3, kb = t&7)
+    uint xb = tiitg >> 3u, xkb = tiitg & 7u;
+    bool xrole = tiitg < 64u && xb < nb;
+    device const float* xrow = xs + (ulong)xb * cols + xkb * 8u;
+    float xscale = xrole ? xsc[xb] : 1.0f;
+    threadgroup half* my_sa = sa + (4u * il) * 512u + lr * 8u;
+    threadgroup half* my_sb = sb + xkb * 64u + xb * 8u;
+
+    simdgroup_half8x8 ma0, ma1, mb;
+    simdgroup_float8x8 mc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 mc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const half2 c1032 = half2(1032.0h);
+    uint niter = gpr >> 1u;   // cols % 64 == 0 (host contract)
+    // software pipeline: the tile + code of iteration it+1 are fetched
+    // while iteration it unpacks and multiplies
+    uint g = il;
+    uint4 w = wrow[g];
+    uint bit = g * 5u; uint shf = bit & 7u;
+    uint code = (((uint)codes_row[bit >> 3u] | ((shf > 3u) ? ((uint)codes_row[(bit >> 3u) + 1u] << 8) : 0u)) >> shf) & 31u;
+    for (uint it = 0u; it < niter; ++it) {
+        uint4 wn = w; uint coden = code;
+        uint gn = g + 2u;
+        if (it + 1u < niter) {
+            wn = wrow[gn];
+            uint bitn = gn * 5u; uint shfn = bitn & 7u;
+            coden = (((uint)codes_row[bitn >> 3u] | ((shfn > 3u) ? ((uint)codes_row[(bitn >> 3u) + 1u] << 8) : 0u)) >> shfn) & 31u;
+        }
+        float4 xv0 = float4(0.0f), xv1 = float4(0.0f);
+        if (xrole) {
+            device const float4* x4 = (device const float4*)xrow;
+            xv0 = x4[0]; xv1 = x4[1];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            half s = (half)exp2(row_lo + (float)code * row_st);
+            half2 s2 = half2(s);
+            #pragma clang loop unroll(full)
+            for (uint j = 0u; j < 4u; ++j) {
+                uint wj = w[j];
+                half2 a0 = (as_type<half2>((wj         & 0x000F000Fu) | 0x64006400u) - c1032) * s2;
+                half2 a1 = (as_type<half2>(((wj >> 4u)  & 0x000F000Fu) | 0x64006400u) - c1032) * s2;
+                half2 a2 = (as_type<half2>(((wj >> 8u)  & 0x000F000Fu) | 0x64006400u) - c1032) * s2;
+                half2 a3 = (as_type<half2>(((wj >> 12u) & 0x000F000Fu) | 0x64006400u) - c1032) * s2;
+                *(threadgroup uint4*)(my_sa + j * 512u) =
+                    uint4(as_type<uint2>(half4(a0, a1)), as_type<uint2>(half4(a2, a3)));
+            }
+        }
+        if (xrole) {
+            // permuted (0,4,1,5,2,6,3,7), pre-scaled
+            half4 p0 = half4((half)(xv0.x * xscale), (half)(xv1.x * xscale),
+                             (half)(xv0.y * xscale), (half)(xv1.y * xscale));
+            half4 p1 = half4((half)(xv0.z * xscale), (half)(xv1.z * xscale),
+                             (half)(xv0.w * xscale), (half)(xv1.w * xscale));
+            *(threadgroup uint4*)(my_sb) = uint4(as_type<uint2>(p0), as_type<uint2>(p1));
+            xrow += 64u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* la = sa + sgitg * 128u;   // this simdgroup's 16 rows
+        // C(rows × b) += A(rows × k) · B(k × b): A straight from the
+        // row-major tile, B transposed out of the [b][k] staging.
+        #pragma clang loop unroll(full)
+        for (short kb = 0; kb < 8; ++kb) {
+            simdgroup_load(mb, sb + kb * 64, 8, ulong2(0, 0), true);
+            simdgroup_load(ma0, la + kb * 512, 8, ulong2(0, 0), false);
+            simdgroup_load(ma1, la + kb * 512 + 64, 8, ulong2(0, 0), false);
+            simdgroup_multiply_accumulate(mc0, ma0, mb, mc0);
+            simdgroup_multiply_accumulate(mc1, ma1, mb, mc1);
+        }
+        w = wn; code = coden; g = gn;
+    }
+    // mc(16 rows × b) → threadgroup scratch [row 16][b 8] → y[b][r], pre-scale undone
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* my_sc = sc + sgitg * 128u;
+    simdgroup_store(mc0, my_sc, 8, ulong2(0, 0), false);
+    simdgroup_store(mc1, my_sc + 64, 8, ulong2(0, 0), false);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint orow = r0 + lr;
+    if (orow < rows) {
+        threadgroup const float* src = sc + (lr >> 4u) * 128u + (lr & 15u) * 8u;
+        for (uint b = il * 4u; b < min(il * 4u + 4u, nb); ++b) {
+            y[(ulong)b * rows + orow] = src[b] / xsc[b];
+        }
+    }
+}
+
 kernel void q4tp_mul_mm_silu(
     device const uchar*  q      [[buffer(0)]],
     device const float*  gs     [[buffer(1)]],
@@ -4616,6 +5042,8 @@ struct Ctx {
     q4tmmsilu: ComputePipelineState,
     q4tpmm: ComputePipelineState,
     q4tpmmsilu: ComputePipelineState,
+    /// Narrow (nb ≤ 8) simdgroup-matrix q4tp GEMM — the verify's projection kernel.
+    q4tpmmn8: ComputePipelineState,
     smaxrows: ComputePipelineState,
     flashatt: ComputePipelineState,
     convmm: ComputePipelineState,
@@ -4658,6 +5086,16 @@ struct Ctx {
     embedq8: ComputePipelineState,
     addnorm: ComputePipelineState,
     sgate: ComputePipelineState,
+    /// Batched-verify twins (b ≤ 8 rows).
+    f32mvb: ComputePipelineState,
+    gdnconvb: ComputePipelineState,
+    gdnringcb: ComputePipelineState,
+    gdngatesb: ComputePipelineState,
+    gdnqknb: ComputePipelineState,
+    gdnstb64: ComputePipelineState,
+    gdnstb128: ComputePipelineState,
+    kvappb: ComputePipelineState,
+    rowpow2: ComputePipelineState,
     /// Compiled MSL library — shape-specialized pipelines are built
     /// from it lazily.
     lib: metal::Library,
@@ -4808,6 +5246,7 @@ fn init() -> Result<Ctx, String> {
     let q4tmmsilu = pso("q4t_mul_mm_silu")?;
     let q4tpmm = pso("q4tp_mul_mm")?;
     let q4tpmmsilu = pso("q4tp_mul_mm_silu")?;
+    let q4tpmmn8 = pso("q4tp_mul_mm_n8")?;
     let smaxrows = pso("softmax_rows")?;
     let flashatt = pso("dit_flash_attend")?;
     let convmm = pso("conv_mul_mm")?;
@@ -4850,6 +5289,15 @@ fn init() -> Result<Ctx, String> {
     let embedq8 = pso("embed_q8_rows")?;
     let addnorm = pso("add_rmsnorm_rows")?;
     let sgate = pso("sig_gate")?;
+    let f32mvb = pso("f32_matvec_b")?;
+    let gdnconvb = pso("gdn_conv_b")?;
+    let gdnringcb = pso("gdn_ring_commit_b")?;
+    let gdngatesb = pso("gdn_gates_b")?;
+    let gdnqknb = pso("gdn_qk_norms_b")?;
+    let gdnstb64 = pso("gdn_state_b64")?;
+    let gdnstb128 = pso("gdn_state_b128")?;
+    let kvappb = pso("kv_append_b")?;
+    let rowpow2 = pso("row_pow2_scale")?;
     let queue = device.new_command_queue();
     let flag_buf = device.new_buffer(64, MTLResourceOptions::StorageModeShared);
     unsafe { *(flag_buf.contents() as *mut u32) = 0 };
@@ -4882,6 +5330,7 @@ fn init() -> Result<Ctx, String> {
         q4tmmsilu,
         q4tpmm,
         q4tpmmsilu,
+        q4tpmmn8,
         smaxrows,
         flashatt,
         convmm,
@@ -4924,6 +5373,15 @@ fn init() -> Result<Ctx, String> {
         embedq8,
         addnorm,
         sgate,
+        f32mvb,
+        gdnconvb,
+        gdnringcb,
+        gdngatesb,
+        gdnqknb,
+        gdnstb64,
+        gdnstb128,
+        kvappb,
+        rowpow2,
         lib,
         mm_fc: Mutex::new(HashMap::new()),
         kv_mirrors: Mutex::new(HashMap::new()),
@@ -5657,6 +6115,38 @@ fn encode_q4tp_matvec_bk(
     );
 }
 
+/// The narrow simdgroup-matrix GEMM: `xs` is `[nb][cols]` f32, `y`
+/// `[nb][rows]`, `xsc` `[nb]` power-of-two activation pre-scales (all
+/// ones when the caller knows the rows fit half). nb ≤ 8.
+#[allow(clippy::too_many_arguments)]
+fn encode_q4tp_mm_n8(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &WeightArena,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    xsc: &Buffer,
+    rows: usize,
+    cols: usize,
+    nb: usize,
+) {
+    debug_assert!((1..=8).contains(&nb));
+    enc.set_compute_pipeline_state(&c.q4tpmmn8);
+    fbuf.bind(enc, 0, abs);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let (cols_u, rows_u, nb_u) = (cols as u32, rows as u32, nb as u32);
+    enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+    enc.set_buffer(6, Some(xsc), 0);
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(64), 1, 1),
+        MTLSize::new(128, 1, 1),
+    );
+}
+
 /// The batched q4tp matvec as one submit (tests, microbench): `pre` is
 /// `b` activation vectors end to end, `out` receives `b·rows`.
 pub fn q4tp_matvec_batch(
@@ -5709,6 +6199,64 @@ pub fn q4tp_matvec_batch(
     true
 }
 
+/// The narrow GEMM as one submit (tests, microbench) — same contract as
+/// `q4tp_matvec_batch`.
+pub fn q4tp_mm_n8_batch(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    pre: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % 32 != 0 || !(1..=8).contains(&b) || pre.len() < b * cols || out.len() < b * rows {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let Some(need) =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+    else {
+        return false;
+    };
+    if abs + need > safe_len {
+        return false;
+    }
+    let xs_buf = c._device.new_buffer_with_data(
+        pre.as_ptr() as *const std::ffi::c_void,
+        (b * cols * 4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let ones = vec![1.0f32; 8];
+    let sc_buf = c._device.new_buffer_with_data(
+        ones.as_ptr() as *const std::ffi::c_void,
+        32,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let y_buf = c._device.new_buffer(
+        (b * rows * 4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        encode_q4tp_mm_n8(c, enc, &fbuf, abs, &xs_buf, &y_buf, &sc_buf, rows, cols, b);
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
+    }
+    true
+}
+
 /// Kernel-time microbench (tests): `reps` dispatches of one projection in
 /// ONE command buffer, so the per-submit cost drops out. `which`: 0 = the
 /// one-vector matvec (b must be 1), 1 = the batched matvec, 2 = the
@@ -5740,6 +6288,11 @@ pub fn q4tp_kernel_bench(
             match which {
                 0 => encode_q4tp_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, cols / 32),
                 1 => encode_q4tp_matvec_bk(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, cols / 32, b),
+                3 => {
+                    let ones = vec![1.0f32; 8];
+                    let sc = c._device.new_buffer_with_data(ones.as_ptr() as *const std::ffi::c_void, 32, MTLResourceOptions::StorageModeShared);
+                    encode_q4tp_mm_n8(c, enc, &fbuf, abs, &xs_buf, &y_buf, &sc, rows, cols, b)
+                }
                 _ => {
                     let rs = c._device.new_buffer(16, MTLResourceOptions::StorageModeShared);
                     enc_mul_mm(c, enc, &fbuf, abs, &rs, MmKind::Q4tp, &xs_buf, &y_buf, b, rows, cols)
@@ -6354,6 +6907,14 @@ fn enc_mul_mm(
         enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
         enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
         enc.set_bytes(5, 4, &b_u as *const u32 as *const std::ffi::c_void);
+        // The q4tp kernel reads a weight boost at slot 6 (`q4tp_matmat`
+        // folds a host-side activation pre-scale there). Device-resident
+        // activations have none: bind 1.0 EXPLICITLY — an unbound constant
+        // is undefined, and it read as garbage here, which is what turned
+        // every q4tp batched prefill on Metal (chunk graph, fused FFN,
+        // DiT blocks) into noise after the boost landed.
+        let one = 1.0f32;
+        enc.set_bytes(6, 4, &one as *const f32 as *const std::ffi::c_void);
     } else {
         let pso = mm_pipeline(c, rows, cols, 0);
         enc.set_compute_pipeline_state(&pso);
@@ -7600,8 +8161,12 @@ pub fn q4tp_ffn(
     let u_buf = get_io(15_000_000_083 + b * inter, b * inter * 4);
     let y_buf = get_io(12_000_000_469 + b * hidden, b * hidden * 4);
 
+    // Host-visible activations get the half-range pre-scale (see
+    // `q4tp_matmat`); the down projection's input lives on the device
+    // and rides at 1.0.
+    let xboost = activation_boost(xs, &xs_buf);
     let cmd = c.queue.new_command_buffer();
-    let mm = |abs: usize, xb: &Buffer, yb: &Buffer, rows: usize, cols: usize| {
+    let mm = |abs: usize, xb: &Buffer, yb: &Buffer, rows: usize, cols: usize, wboost: f32| {
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&c.q4tpmm);
         fbuf.bind(enc, 0, abs);
@@ -7611,14 +8176,15 @@ pub fn q4tp_ffn(
         enc.set_bytes(3, 4, &cu as *const u32 as *const std::ffi::c_void);
         enc.set_bytes(4, 4, &ru as *const u32 as *const std::ffi::c_void);
         enc.set_bytes(5, 4, &nbu as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(6, 4, &wboost as *const f32 as *const std::ffi::c_void);
         enc.dispatch_thread_groups(
             MTLSize::new((b as u64).div_ceil(32), (rows as u64).div_ceil(64), 1),
             MTLSize::new(128, 1, 1),
         );
         enc.end_encoding();
     };
-    mm(a1, &xs_buf, &g_buf, inter, hidden);
-    mm(a3, &xs_buf, &u_buf, inter, hidden);
+    mm(a1, &xs_buf, &g_buf, inter, hidden, xboost);
+    mm(a3, &xs_buf, &u_buf, inter, hidden, xboost);
     {
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&c.silu);
@@ -7636,7 +8202,7 @@ pub fn q4tp_ffn(
         );
         enc.end_encoding();
     }
-    mm(a2, &g_buf, &y_buf, hidden, inter);
+    mm(a2, &g_buf, &y_buf, hidden, inter, 1.0);
     submit_and_wait(c, cmd, &[&y_buf]);
     unsafe {
         std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * hidden);
@@ -8521,6 +9087,10 @@ pub fn dit_block(model: &Arc<CmfModel>, a: &crate::gpu::DitBlockArgs, x: &mut [f
         enc.set_bytes(3, 4, &cu as *const u32 as *const std::ffi::c_void);
         enc.set_bytes(4, 4, &ru as *const u32 as *const std::ffi::c_void);
         enc.set_bytes(5, 4, &nbu as *const u32 as *const std::ffi::c_void);
+        // q4tp weight boost slot (device-resident activations: 1.0; an
+        // unbound constant reads as garbage — see enc_mul_mm)
+        let one = 1.0f32;
+        enc.set_bytes(6, 4, &one as *const f32 as *const std::ffi::c_void);
         enc.dispatch_thread_groups(
             MTLSize::new((n as u64).div_ceil(32), (rows as u64).div_ceil(64), 1),
             MTLSize::new(128, 1, 1),
@@ -10201,6 +10771,73 @@ impl TokenGraph {
         }
     }
 
+    /// Hidden state readback (after `sync`) — debug/oracle use.
+    pub fn read_h(&self, out: &mut [f32]) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.h_b.contents() as *const f32, out.as_mut_ptr(), out.len().min(self.dims.hidden));
+        }
+    }
+
+    /// Bring-up oracle for the device attend: run `encode_attn_device`
+    /// on a SCRATCH graph over the same hidden and a throwaway mirror,
+    /// then hand back the device's rope'd q, appended k/v row and the
+    /// pre-gate/post-gate attention output for the caller to diff against
+    /// the CPU's. Restores h_b afterwards (the scratch graph shares the
+    /// io buffers).
+    #[allow(clippy::type_complexity)]
+    pub fn debug_attn_device(
+        &mut self,
+        l: &AttnGpuLayer,
+        p: &AttnDeviceParams,
+        h_now: &[f32],
+    ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let mut g2 = TokenGraph::new(&self.model, self.dims, h_now)?;
+        let mut p2 = AttnDeviceParams {
+            kv_id: p.kv_id ^ (1u64 << 50),
+            layer: p.layer,
+            nh: p.nh,
+            nkv: p.nkv,
+            hd: p.hd,
+            rd: p.rd,
+            position: p.position,
+            eps: p.eps,
+            gemma: p.gemma,
+            output_gate: p.output_gate,
+            q_norm: p.q_norm,
+            k_norm: p.k_norm,
+            inv_freq: p.inv_freq,
+            cpu_k: p.cpu_k.clone(),
+            cpu_v: p.cpu_v.clone(),
+            cpu_stored: p.cpu_stored,
+            o1: None,
+        };
+        // fresh mirror every time
+        kv_mirror_drop(p2.kv_id);
+        p2.o1 = None;
+        if !g2.attn_device_ok(l, &p2) || !g2.encode_attn_device(l, &p2) {
+            return None;
+        }
+        g2.sync();
+        let nhd = p.nh * p.hd;
+        let qr_b = io_buf(self.c, 44_000_000_007 + nhd, nhd * 4);
+        let ao_b = io_buf(self.c, 43_000_000_057 + nhd, nhd * 4);
+        let mut qr = vec![0f32; nhd];
+        let mut ao = vec![0f32; nhd];
+        unsafe {
+            std::ptr::copy_nonoverlapping(qr_b.contents() as *const f32, qr.as_mut_ptr(), nhd);
+            std::ptr::copy_nonoverlapping(ao_b.contents() as *const f32, ao.as_mut_ptr(), nhd);
+        }
+        let mut krow = vec![0f32; p.nkv * p.hd];
+        let mut vrow = vec![0f32; p.nkv * p.hd];
+        kv_mirror_read_last(p2.kv_id, p2.layer, p.nkv, p.hd, &mut krow, &mut vrow);
+        kv_mirror_drop(p2.kv_id);
+        // restore the shared hidden buffer
+        unsafe {
+            std::ptr::copy_nonoverlapping(h_now.as_ptr(), self.h_b.contents() as *mut f32, self.dims.hidden);
+        }
+        Some((qr, krow, vrow, ao))
+    }
+
     /// Looped Transformer: apply RMS norm to the hidden state on-device
     /// between loop iterations — avoids a CPU round-trip at the boundary.
     /// h_b → rmsn → n_b → blit back → h_b.
@@ -11402,6 +12039,611 @@ pub fn kv_mirror_drop(kv_id: u64) {
             .lock()
             .unwrap()
             .retain(|(id, _), _| *id != kv_id);
+    }
+}
+
+/// Copy `n` consecutive mirror rows starting at `from` (after the final
+/// sync) — the accepted prefix of a speculative round, appended to the
+/// CPU cache by the caller. Outputs are `[n][nkv × hd]`.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_mirror_read_rows(
+    kv_id: u64,
+    layer: usize,
+    nkv: usize,
+    hd: usize,
+    from: usize,
+    n: usize,
+    k_out: &mut [f32],
+    v_out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let reg = c.kv_mirrors.lock().unwrap();
+    let Some(m) = reg.get(&(kv_id, layer)) else {
+        return false;
+    };
+    if from + n > m.cap || k_out.len() < n * nkv * hd || v_out.len() < n * nkv * hd {
+        return false;
+    }
+    unsafe {
+        let ks = m.k.contents() as *const f32;
+        let vs = m.v.contents() as *const f32;
+        for r in 0..n {
+            for h in 0..nkv {
+                let off = (h * m.cap + from + r) * hd;
+                let dst = (r * nkv + h) * hd;
+                std::ptr::copy_nonoverlapping(ks.add(off), k_out[dst..].as_mut_ptr(), hd);
+                std::ptr::copy_nonoverlapping(vs.add(off), v_out[dst..].as_mut_ptr(), hd);
+            }
+        }
+    }
+    true
+}
+
+/// Re-point a mirror's row count at the CPU cache's after a speculative
+/// round committed fewer rows than it appended: rows past `stored` are
+/// simply overwritten next time, no re-upload.
+pub fn kv_mirror_set_stored(kv_id: u64, layer: usize, stored: usize) {
+    if let Some(c) = ctx() {
+        if let Some(m) = c.kv_mirrors.lock().unwrap().get_mut(&(kv_id, layer)) {
+            if stored <= m.cap {
+                m.stored = stored;
+            }
+        }
+    }
+}
+
+/// One GDN layer's per-position scratch inside a verify graph — what the
+/// commit replays from once the accepted count is known.
+struct VerifyGdnSlot {
+    st: Buffer,
+    st_len: usize,
+    qkv: Buffer,
+    cq: Buffer,
+    z: Buffer,
+    g: Buffer,
+    beta: Buffer,
+    iq: Buffer,
+    ik: Buffer,
+    gnorm: Buffer,
+    cfg: GdnGpuCfg,
+}
+
+/// The b-row speculative-verify graph on Metal (b ≤ 8): every
+/// projection is ONE `q4tp_mul_mm_n8` over the batch (weights read once
+/// for all rows), norms/FFN run over b rows, attention appends b rows to
+/// the layer's KV mirror and attends each row over its own prefix, and
+/// the GDN recurrence runs the b positions in registers WITHOUT writing
+/// the state — `commit(n)` replays the accepted n positions from the
+/// same initial state and hands the CPU owner the result. Contract as
+/// the token graph's: the pipeline builds the layer plan, calls the
+/// encoders in layer order, `encode_lm_head_b`, `sync`, reads logits and
+/// hiddens, decides acceptance, then `commit`.
+pub struct VerifyGraph {
+    tg: TokenGraph,
+    b: usize,
+    cmd: Option<metal::CommandBuffer>,
+    h_b: Buffer,
+    n_b: Buffer,
+    d_b: Buffer,
+    ones: Buffer,
+    xsc: Buffer,
+    imp_scratch: Buffer,
+    gdn: Vec<VerifyGdnSlot>,
+    logits_b: Option<(Buffer, usize)>,
+}
+
+const VBUF_BASE: usize = 60_000_000_000;
+
+impl VerifyGraph {
+    fn vbuf(c: &Ctx, kind: usize, slot: usize, nbytes: usize) -> Buffer {
+        // the key carries the size (io_buf caches by key alone)
+        io_buf(c, VBUF_BASE + kind * 1_000_000_000 + slot * 1_000_000 + nbytes / 16, nbytes)
+    }
+
+    pub fn new(model: &Arc<CmfModel>, dims: GraphDims, h: &[f32], b: usize) -> Option<VerifyGraph> {
+        if !(1..=8).contains(&b) || h.len() != b * dims.hidden || dims.hidden % 64 != 0 {
+            return None;
+        }
+        let tg = TokenGraph::new(model, dims, &h[..dims.hidden])?;
+        let c = tg.c;
+        let hb = b * dims.hidden * 4;
+        let h_b = Self::vbuf(c, 1, 0, hb);
+        let n_b = Self::vbuf(c, 2, 0, hb);
+        let d_b = Self::vbuf(c, 3, 0, hb);
+        unsafe {
+            std::ptr::copy_nonoverlapping(h.as_ptr(), h_b.contents() as *mut f32, b * dims.hidden);
+        }
+        let ones = Self::vbuf(c, 4, 0, 32);
+        let xsc = Self::vbuf(c, 5, 0, 32);
+        unsafe {
+            let p = ones.contents() as *mut f32;
+            for i in 0..8 {
+                *p.add(i) = 1.0;
+            }
+        }
+        let imp_scratch = Self::vbuf(c, 6, 0, 1 << 20);
+        Some(VerifyGraph {
+            tg,
+            b,
+            cmd: None,
+            h_b,
+            n_b,
+            d_b,
+            ones,
+            xsc,
+            imp_scratch,
+            gdn: Vec::new(),
+            logits_b: None,
+        })
+    }
+
+    fn ensure_cmd(&mut self) -> metal::CommandBuffer {
+        if self.cmd.is_none() {
+            self.cmd = Some(self.tg.c.queue.new_command_buffer().to_owned());
+        }
+        self.cmd.as_ref().unwrap().clone()
+    }
+
+    /// A projection the n8 GEMM can take: q4tp with cols % 64 == 0.
+    fn n8_abs(&self, t: (usize, usize, usize)) -> Option<usize> {
+        if t.2 % 64 != 0 {
+            return None;
+        }
+        match self.tg.proj_abs(t) {
+            Some((abs, ProjKind::Q4tp)) => Some(abs),
+            _ => None,
+        }
+    }
+
+    fn ffn_n8_ok(&self, f: &MetalFfn) -> bool {
+        match f {
+            MetalFfn::Dense { gate, up, down } => {
+                down.1 == self.tg.dims.hidden
+                    && [gate, up, down].iter().all(|t| self.n8_abs(**t).is_some())
+            }
+            MetalFfn::Moe(_) => false,
+        }
+    }
+
+    /// Pre-flight for a GDN layer (call before any encode).
+    pub fn gdn_ok(&self, l: &GdnGpuLayer, cfg: &GdnGpuCfg) -> bool {
+        self.tg.gdn_ok(l, cfg)
+            && (cfg.dk == 64 || cfg.dk == 128)
+            && cfg.kk <= 8
+            && cfg.nv % cfg.nk == 0
+            && [l.qkv, l.z, l.out].iter().all(|t| self.n8_abs(*t).is_some())
+            && self.ffn_n8_ok(&l.ffn)
+    }
+
+    /// Pre-flight for a full-attention layer (F32 KV mirror, no o1).
+    pub fn attn_ok(&self, l: &AttnGpuLayer, p: &AttnDeviceParams) -> bool {
+        self.tg.attn_device_ok(l, p)
+            && p.o1.is_none()
+            && [l.wq, l.wk, l.wv, l.wo].iter().all(|t| self.n8_abs(*t).is_some())
+            && self.ffn_n8_ok(&l.ffn)
+    }
+
+    pub fn lm_head_ok(&self, lm: (usize, usize, usize)) -> bool {
+        lm.2 == self.tg.dims.hidden && self.n8_abs(lm).is_some()
+    }
+
+    fn rows_norm(&self, enc: &metal::ComputeCommandEncoderRef, w: &[f32]) {
+        let c = self.tg.c;
+        disp(
+            enc,
+            &c.rmsrows,
+            &[(&self.h_b, 0), (&const_buf(c, w), 0), (&self.n_b, 0)],
+            &[self.tg.dims.hidden as u32, self.tg.dims.gemma as u32],
+            &[self.tg.dims.eps],
+            ((self.b * 256) as u64, 256),
+        );
+    }
+
+    fn gemm(&self, enc: &metal::ComputeCommandEncoderRef, t: (usize, usize, usize), xs: &Buffer, y: &Buffer, xsc: &Buffer) {
+        let abs = self.n8_abs(t).unwrap();
+        note_weight_bytes(&ProjKind::Q4tp, t.1, t.2 / GROUP_SIZE);
+        encode_q4tp_mm_n8(self.tg.c, enc, &self.tg.fbuf, abs, xs, y, xsc, t.1, t.2, self.b);
+    }
+
+    /// h += d; n = rmsnorm(h, post_norm); gate/up/silu/down over b rows;
+    /// h += down.
+    fn post_ffn(&self, enc: &metal::ComputeCommandEncoderRef, post_norm: &[f32], ffn: &MetalFfn) {
+        let c = self.tg.c;
+        let hidden = self.tg.dims.hidden;
+        let MetalFfn::Dense { gate, up, down } = ffn else { return };
+        {
+            let pn = const_buf(c, post_norm);
+            enc.set_compute_pipeline_state(&c.addnorm);
+            enc.set_buffer(0, Some(&self.h_b), 0);
+            enc.set_buffer(1, Some(&self.d_b), 0);
+            enc.set_buffer(2, Some(&pn), 0);
+            enc.set_buffer(3, Some(&self.n_b), 0);
+            let (n_u, g_u, hd_u) = (hidden as u32, self.tg.dims.gemma as u32, 1u32);
+            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &g_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(6, 4, &self.tg.dims.eps as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(MTLSize::new(self.b as u64, 1, 1), MTLSize::new(256, 1, 1));
+        }
+        let inter = gate.1;
+        let fg = Self::vbuf(c, 7, 0, self.b * inter * 4);
+        let fu = Self::vbuf(c, 8, 0, self.b * inter * 4);
+        let fa = Self::vbuf(c, 9, 0, self.b * inter * 4);
+        self.gemm(enc, *gate, &self.n_b, &fg, &self.ones);
+        self.gemm(enc, *up, &self.n_b, &fu, &self.ones);
+        disp(
+            enc,
+            &c.silu,
+            &[(&fg, 0), (&fu, 0), (&fg, 0), (&fa, 0)],
+            &[(self.b * inter) as u32, 0u32],
+            &[],
+            ((self.b * inter) as u64, 256),
+        );
+        disp(
+            enc,
+            &c.rowpow2,
+            &[(&fa, 0), (&self.xsc, 0)],
+            &[inter as u32],
+            &[],
+            ((self.b * 256) as u64, 256),
+        );
+        self.gemm(enc, *down, &fa, &self.d_b, &self.xsc);
+        disp_axpy(c, enc, &self.d_b, &self.h_b, 1.0, self.b * hidden);
+    }
+
+    /// A run of consecutive GDN layers over the b rows. `states` are the
+    /// CPU owners' `[ring | S]` (read here, never written — see `commit`).
+    pub fn encode_gdn_run_b(&mut self, layers: &[GdnGpuLayer], states: &[&[f32]], cfg: &GdnGpuCfg) -> bool {
+        WCAT.store(4, std::sync::atomic::Ordering::Relaxed);
+        if layers.is_empty() || layers.len() != states.len() {
+            return false;
+        }
+        let ring_len = (cfg.kk - 1) * cfg.c_dim;
+        let s_len = cfg.nv * cfg.dk * cfg.dv;
+        for (l, st) in layers.iter().zip(states) {
+            if !self.gdn_ok(l, cfg) || st.len() != ring_len + s_len {
+                return false;
+            }
+        }
+        let c = self.tg.c;
+        let b = self.b;
+        let vd = cfg.nv * cfg.dv;
+        let cmd = self.ensure_cmd();
+        for (l, st) in layers.iter().zip(states) {
+            let slot = self.gdn.len();
+            let s_b = Self::vbuf(c, 10, slot, (ring_len + s_len) * 4);
+            let qkv_b = Self::vbuf(c, 11, slot, b * cfg.c_dim * 4);
+            let cq_b = Self::vbuf(c, 12, slot, b * cfg.c_dim * 4);
+            let z_b = Self::vbuf(c, 13, slot, b * vd * 4);
+            let g_b = Self::vbuf(c, 14, slot, b * cfg.nv * 4);
+            let bt_b = Self::vbuf(c, 15, slot, b * cfg.nv * 4);
+            let iq_b = Self::vbuf(c, 16, slot, b * cfg.nk * 4);
+            let ik_b = Self::vbuf(c, 17, slot, b * cfg.nk * 4);
+            let a_b = Self::vbuf(c, 18, 0, b * cfg.nv * 4);
+            let bb_b = Self::vbuf(c, 19, 0, b * cfg.nv * 4);
+            let of_b = Self::vbuf(c, 20, 0, b * vd * 4);
+            unsafe {
+                std::ptr::copy_nonoverlapping(st.as_ptr(), s_b.contents() as *mut f32, st.len());
+            }
+            let gnorm_b = const_buf(c, l.gnorm);
+            let enc = cmd.new_compute_command_encoder();
+            // 1. norm
+            self.rows_norm(enc, l.attn_norm);
+            // 2. mixer projections
+            self.gemm(enc, l.qkv, &self.n_b, &qkv_b, &self.ones);
+            self.gemm(enc, l.z, &self.n_b, &z_b, &self.ones);
+            for (t, y) in [(&l.a, &a_b), (&l.b, &bb_b)] {
+                let (data, rows, cols) = *t;
+                disp(
+                    enc,
+                    &c.f32mvb,
+                    &[(&const_buf(c, data), 0), (&self.n_b, 0), (y, 0)],
+                    &[cols as u32, rows as u32, b as u32],
+                    &[],
+                    ((rows as u64).div_ceil(8) * 256, 256),
+                );
+            }
+            // 3. conv over the virtual sequence
+            enc.set_compute_pipeline_state(&c.gdnconvb);
+            enc.set_buffer(0, Some(&qkv_b), 0);
+            enc.set_buffer(1, Some(&s_b), 0);
+            enc.set_buffer(2, Some(&const_buf(c, l.conv1d)), 0);
+            enc.set_buffer(3, Some(&cq_b), 0);
+            let (cd_u, kk_u, nb_u) = (cfg.c_dim as u32, cfg.kk as u32, b as u32);
+            enc.set_bytes(4, 4, &cd_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &kk_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(6, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new(cfg.c_dim as u64, b as u64, 1), MTLSize::new(256, 1, 1));
+            // 4. gates + qk norms
+            disp(
+                enc,
+                &c.gdngatesb,
+                &[(&a_b, 0), (&bb_b, 0), (&const_buf(c, l.a_log), 0), (&const_buf(c, l.dt_bias), 0), (&g_b, 0), (&bt_b, 0)],
+                &[cfg.nv as u32, (b * cfg.nv) as u32],
+                &[],
+                ((b * cfg.nv) as u64, 64),
+            );
+            disp(
+                enc,
+                &c.gdnqknb,
+                &[(&cq_b, 0), (&iq_b, 0), (&ik_b, 0)],
+                &[cfg.nk as u32, cfg.dk as u32, cfg.c_dim as u32, b as u32],
+                &[],
+                (((b * cfg.nk) as u64).div_ceil(8) * 256, 256),
+            );
+            // 5. recurrence over the b positions (outputs only)
+            Self::state_dispatch(c, enc, &s_b, ring_len, &cq_b, &z_b, &g_b, &bt_b, &iq_b, &ik_b, &gnorm_b, &of_b, cfg, b, 1);
+            // 6. out_proj → d; 7. post-norm + FFN
+            self.gemm(enc, l.out, &of_b, &self.d_b, &self.ones);
+            self.post_ffn(enc, l.post_norm, &l.ffn);
+            enc.end_encoding();
+            self.gdn.push(VerifyGdnSlot {
+                st: s_b,
+                st_len: st.len(),
+                qkv: qkv_b,
+                cq: cq_b,
+                z: z_b,
+                g: g_b,
+                beta: bt_b,
+                iq: iq_b,
+                ik: ik_b,
+                gnorm: gnorm_b,
+                cfg: *cfg,
+            });
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn state_dispatch(
+        c: &Ctx,
+        enc: &metal::ComputeCommandEncoderRef,
+        s_b: &Buffer,
+        ring_len: usize,
+        cq: &Buffer,
+        z: &Buffer,
+        g: &Buffer,
+        beta: &Buffer,
+        iq: &Buffer,
+        ik: &Buffer,
+        gnorm: &Buffer,
+        of: &Buffer,
+        cfg: &GdnGpuCfg,
+        n_pos: usize,
+        mode: u32,
+    ) {
+        let pso = if cfg.dk == 64 { &c.gdnstb64 } else { &c.gdnstb128 };
+        enc.set_compute_pipeline_state(pso);
+        enc.set_buffer(0, Some(s_b), (ring_len * 4) as u64);
+        enc.set_buffer(1, Some(cq), 0);
+        enc.set_buffer(2, Some(z), 0);
+        enc.set_buffer(3, Some(g), 0);
+        enc.set_buffer(4, Some(beta), 0);
+        enc.set_buffer(5, Some(iq), 0);
+        enc.set_buffer(6, Some(ik), 0);
+        enc.set_buffer(7, Some(gnorm), 0);
+        enc.set_buffer(8, Some(of), 0);
+        let w = [cfg.nv as u32, cfg.nk as u32, cfg.dv as u32, cfg.c_dim as u32, n_pos as u32, mode];
+        for (i, v) in w.iter().enumerate() {
+            enc.set_bytes(9 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
+        }
+        enc.set_bytes(15, 4, &cfg.eps as *const f32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(MTLSize::new(cfg.nv as u64, 1, 1), MTLSize::new(cfg.dv as u64, 1, 1));
+    }
+
+    /// One full-attention layer over the b rows: rows land in the mirror
+    /// at cpu_stored..cpu_stored+b, row e attends its own prefix. The
+    /// mirror's `stored` is left at cpu_stored + b — the caller re-points
+    /// it (`kv_mirror_set_stored`) once the accepted count is known.
+    pub fn encode_attn_b(&mut self, l: &AttnGpuLayer, p: &AttnDeviceParams) -> bool {
+        WCAT.store(3, std::sync::atomic::Ordering::Relaxed);
+        if !self.attn_ok(l, p) {
+            return false;
+        }
+        let c = self.tg.c;
+        let b = self.b;
+        let (k_mb, v_mb, cap, stored) = {
+            let mut reg = c.kv_mirrors.lock().unwrap();
+            let need = p.cpu_stored + b;
+            let entry = reg.entry((p.kv_id, p.layer)).or_insert_with(|| KvMirror {
+                k: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
+                v: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
+                imp: c._device.new_buffer(0, MTLResourceOptions::StorageModeShared),
+                cap: 0,
+                stored: usize::MAX,
+            });
+            if entry.cap < need {
+                let cap = need.next_power_of_two().max(1024);
+                let bytes = (p.nkv * cap * p.hd * 4) as u64;
+                entry.k = c._device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+                entry.v = c._device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+                entry.imp = c._device.new_buffer((cap * 4) as u64, MTLResourceOptions::StorageModeShared);
+                unsafe {
+                    std::ptr::write_bytes(entry.imp.contents() as *mut u8, 0, cap * 4);
+                }
+                entry.cap = cap;
+                entry.stored = usize::MAX;
+            }
+            if entry.stored != p.cpu_stored {
+                for h in 0..p.nkv {
+                    if p.cpu_k[h].len() != p.cpu_stored * p.hd || p.cpu_v[h].len() != p.cpu_stored * p.hd {
+                        return false;
+                    }
+                    unsafe {
+                        let kd = (entry.k.contents() as *mut f32).add(h * entry.cap * p.hd);
+                        std::ptr::copy_nonoverlapping(p.cpu_k[h].as_ptr(), kd, p.cpu_k[h].len());
+                        let vd = (entry.v.contents() as *mut f32).add(h * entry.cap * p.hd);
+                        std::ptr::copy_nonoverlapping(p.cpu_v[h].as_ptr(), vd, p.cpu_v[h].len());
+                    }
+                }
+                entry.stored = p.cpu_stored;
+            }
+            let out = (entry.k.clone(), entry.v.clone(), entry.cap, entry.stored);
+            entry.stored += b;
+            out
+        };
+        let cmd = self.ensure_cmd();
+        let enc = cmd.new_compute_command_encoder();
+        self.rows_norm(enc, l.attn_norm);
+        let nhd = p.nh * p.hd;
+        let kvd = p.nkv * p.hd;
+        let q_b = Self::vbuf(c, 21, 0, b * l.wq.1 * 4);
+        let k_b = Self::vbuf(c, 22, 0, b * kvd * 4);
+        let v_b = Self::vbuf(c, 23, 0, b * kvd * 4);
+        let qr_b = Self::vbuf(c, 24, 0, b * nhd * 4);
+        let g_b = Self::vbuf(c, 25, 0, b * nhd * 4);
+        let ao_b = Self::vbuf(c, 26, 0, b * nhd * 4);
+        self.gemm(enc, l.wq, &self.n_b, &q_b, &self.ones);
+        self.gemm(enc, l.wk, &self.n_b, &k_b, &self.ones);
+        self.gemm(enc, l.wv, &self.n_b, &v_b, &self.ones);
+        let flags = (p.output_gate as u32)
+            | ((p.q_norm.is_some() as u32) << 1)
+            | ((p.k_norm.is_some() as u32) << 2)
+            | ((p.gemma as u32) << 3);
+        let qn_b = p.q_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| qr_b.clone());
+        let kn_b = p.k_norm.map(|w| const_buf(c, w)).unwrap_or_else(|| qr_b.clone());
+        let invf_b = const_buf(c, p.inv_freq);
+        for e in 0..b {
+            disp(
+                enc,
+                &c.rqkn,
+                &[
+                    (&q_b, (e * l.wq.1 * 4) as u64),
+                    (&k_b, (e * kvd * 4) as u64),
+                    (&qr_b, (e * nhd * 4) as u64),
+                    (&g_b, (e * nhd * 4) as u64),
+                    (&qn_b, 0),
+                    (&kn_b, 0),
+                    (&invf_b, 0),
+                ],
+                &[p.nh as u32, p.nkv as u32, p.hd as u32, p.rd as u32, (p.position + e) as u32, flags],
+                &[p.eps],
+                (((p.nh + p.nkv) * 32) as u64, 256),
+            );
+        }
+        // append the b rows
+        enc.set_compute_pipeline_state(&c.kvappb);
+        enc.set_buffer(0, Some(&k_b), 0);
+        enc.set_buffer(1, Some(&v_b), 0);
+        enc.set_buffer(2, Some(&k_mb), 0);
+        enc.set_buffer(3, Some(&v_mb), 0);
+        let w = [p.nkv as u32, p.hd as u32, cap as u32, stored as u32, b as u32];
+        for (i, v) in w.iter().enumerate() {
+            enc.set_bytes(4 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
+        }
+        enc.dispatch_threads(MTLSize::new(kvd as u64, b as u64, 1), MTLSize::new(256, 1, 1));
+        // attend row e over positions 0..=stored+e
+        for e in 0..b {
+            let n_pos = stored + e + 1;
+            let cap_sgs = (c.gqat.max_total_threads_per_threadgroup() as usize / 32).clamp(1, gqa_split_max());
+            let sgs = n_pos.div_ceil(32).clamp(1, cap_sgs);
+            let tg_threads = 32 * sgs;
+            disp_tg(
+                enc,
+                &c.gqat,
+                &[
+                    (&qr_b, (e * nhd * 4) as u64),
+                    (&k_mb, 0),
+                    (&v_mb, 0),
+                    (&ao_b, (e * nhd * 4) as u64),
+                    (&self.imp_scratch, 0),
+                ],
+                &[p.nh as u32, (p.nh / p.nkv) as u32, p.hd as u32, cap as u32, n_pos as u32],
+                &[],
+                ((p.nh * tg_threads) as u64, tg_threads as u64),
+                ((sgs * p.hd + 2 * sgs) * 4) as u64,
+            );
+        }
+        if p.output_gate {
+            disp(enc, &c.sgate, &[(&ao_b, 0), (&g_b, 0)], &[(b * nhd) as u32], &[], ((b * nhd) as u64, 256));
+        }
+        self.gemm(enc, l.wo, &ao_b, &self.d_b, &self.ones);
+        self.post_ffn(enc, l.post_norm, &l.ffn);
+        enc.end_encoding();
+        true
+    }
+
+    /// Final norm + lm_head over the b rows; read with `read_logits`
+    /// after `sync` (`[b][rows]`).
+    pub fn encode_lm_head_b(&mut self, norm: &[f32], lm: (usize, usize, usize)) -> bool {
+        WCAT.store(5, std::sync::atomic::Ordering::Relaxed);
+        if !self.lm_head_ok(lm) {
+            return false;
+        }
+        let c = self.tg.c;
+        let cmd = self.ensure_cmd();
+        let lg_b = Self::vbuf(c, 27, 0, self.b * lm.1 * 4);
+        let enc = cmd.new_compute_command_encoder();
+        self.rows_norm(enc, norm);
+        self.gemm(enc, lm, &self.n_b, &lg_b, &self.ones);
+        enc.end_encoding();
+        self.logits_b = Some((lg_b, lm.1));
+        true
+    }
+
+    /// Submit and wait.
+    pub fn sync(&mut self) {
+        if let Some(cmd) = self.cmd.take() {
+            METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            cmd.commit();
+            wait_fast(&cmd);
+        }
+    }
+
+    pub fn read_logits(&mut self, out: &mut [f32]) -> bool {
+        let Some((lg_b, rows)) = self.logits_b.take() else {
+            return false;
+        };
+        let n = (self.b * rows).min(out.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(lg_b.contents() as *const f32, out.as_mut_ptr(), n);
+        }
+        true
+    }
+
+    /// The b output hiddens (after `sync`).
+    pub fn read_hidden(&self, h: &mut [f32]) {
+        let n = (self.b * self.tg.dims.hidden).min(h.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.h_b.contents() as *const f32, h.as_mut_ptr(), n);
+        }
+    }
+
+    /// Commit the accepted prefix: replay the first `n_pos` positions of
+    /// every GDN layer's recurrence from the initial state, writing the
+    /// state and shifting the ring, then copy the results to the CPU
+    /// owners (order = the `encode_gdn_run_b` calls). One submit + wait.
+    pub fn commit(&mut self, n_pos: usize, states_out: &mut [&mut [f32]]) -> bool {
+        if n_pos == 0 || n_pos > self.b || states_out.len() != self.gdn.len() {
+            return false;
+        }
+        let c = self.tg.c;
+        let cmd = c.queue.new_command_buffer().to_owned();
+        let enc = cmd.new_compute_command_encoder();
+        for slot in &self.gdn {
+            let cfg = &slot.cfg;
+            let ring_len = (cfg.kk - 1) * cfg.c_dim;
+            Self::state_dispatch(c, enc, &slot.st, ring_len, &slot.cq, &slot.z, &slot.g, &slot.beta, &slot.iq, &slot.ik, &slot.gnorm, &slot.cq, cfg, n_pos, 2);
+            disp(
+                enc,
+                &c.gdnringcb,
+                &[(&slot.st, 0), (&slot.qkv, 0)],
+                &[cfg.c_dim as u32, cfg.kk as u32, n_pos as u32],
+                &[],
+                (cfg.c_dim as u64, 256),
+            );
+        }
+        enc.end_encoding();
+        METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        cmd.commit();
+        wait_fast(&cmd);
+        for (slot, out) in self.gdn.iter().zip(states_out.iter_mut()) {
+            debug_assert_eq!(slot.st_len, out.len());
+            unsafe {
+                std::ptr::copy_nonoverlapping(slot.st.contents() as *const f32, out.as_mut_ptr(), slot.st_len.min(out.len()));
+            }
+        }
+        true
     }
 }
 

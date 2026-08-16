@@ -69,6 +69,9 @@ pub fn record(
             .fold(0f32, |m, (&a, &b)| m.max((a - b).abs()))
             / scale;
         e.worst = e.worst.max(d);
+        if d > 1e-2 {
+            eprintln!("mm-ab: b={b} {rows}x{cols}: GPU vs CPU max rel diff {d:.3e} (call {})", e.calls);
+        }
     } else {
         e.refused += 1;
     }
