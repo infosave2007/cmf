@@ -1,0 +1,11 @@
+[2m2026-08-16T06:14:42.543070Z[0m [32m INFO[0m [2mcortiq_core::format[0m[2m:[0m Opened CMF v2: qwen3_5 | 866 tensors | 0 masks | vocab embedded | 14271.2 MB
+[2m2026-08-16T06:14:42.673058Z[0m [32m INFO[0m [2mcortiq_engine::tokenizer[0m[2m:[0m Tokenizer loaded: 248077 vocab, 247587 merges, 33 added, eos=Some(248044)
+[2m2026-08-16T06:14:42.673120Z[0m [32m INFO[0m [2mcortiq_engine::loader[0m[2m:[0m chat bundle: template 8952 chars, 2 stop ids
+[2m2026-08-16T06:14:42.697622Z[0m [32m INFO[0m [2mcortiq_engine::loader[0m[2m:[0m Pipeline loaded: qwen3_5 | 64L (48 linear) | 27.32B params | storage: quantized mmap | MTP: yes
+[2m2026-08-16T06:14:42.697740Z[0m [32m INFO[0m [2mcortiq_engine::pipeline[0m[2m:[0m worker pool: 9 threads
+[2m2026-08-16T06:14:42.731444Z[0m [32m INFO[0m [2mcortiq_engine::gpu_wgpu[0m[2m:[0m wgpu GPU path: on (Apple M4 / Metal, uma, weight budget unlimited, q1 8 rows/128 threads)
+[2m2026-08-16T06:15:20.217801Z[0m [32m INFO[0m [2mcortiq_engine::pipeline[0m[2m:[0m wgpu whole-token graph: ACTIVE
+[2m2026-08-16T06:18:16.145055Z[0m [32m INFO[0m [2mcortiq_engine::gpu[0m[2m:[0m gpu q4tp matmat took 144.275417ms (budget 42.928862ms) — strike 1 of 3
+[2m2026-08-16T06:18:16.208809Z[0m [32m INFO[0m [2mcortiq_engine::gpu[0m[2m:[0m gpu q4tp matmat took 62.241ms (budget 33.757317ms) — strike 2 of 3
+[2m2026-08-16T06:18:16.293313Z[0m [33m WARN[0m [2mcortiq_engine::gpu[0m[2m:[0m gpu q4tp matmat took 52.614167ms (budget 33.757317ms), 3 in a row — device contended, CPU for the rest of the process (CMF_MM_KILL=0 to override)
+[2m2026-08-16T06:21:20.204414Z[0m [32m INFO[0m [2mcortiq_engine::gpu_metal[0m[2m:[0m Metal GPU path: on (Apple M4)

@@ -3623,6 +3623,100 @@ kernel void q4tp_matvec(
     }
 }
 
+
+// ── Batched q4tp matvec: b activation vectors (b ≤ 8) against ONE weight
+// stream — the speculative verify's kernel. Same lanes/rows/ladder as
+// `q4tp_matvec` (four rows a simdgroup, one rung a lane), the nibbles of a
+// row-group unpacked ONCE and multiplied against every element's x. Per
+// (row, group, element) the sum is q4tp_matvec's expression term for
+// term (dot(lo)+dot(hi) per word, four words, then scale), so a batch row
+// lands where the one-vector kernel lands. x is [b][cols], y is [b][rows].
+inline void q4_unpack8_fast(uint b, thread float4& lo, thread float4& hi) {
+    lo = float4((float)(b & 0xFu) - 8.0f, (float)((b >> 4u) & 0xFu) - 8.0f,
+                (float)((b >> 8u) & 0xFu) - 8.0f, (float)((b >> 12u) & 0xFu) - 8.0f);
+    hi = float4((float)((b >> 16u) & 0xFu) - 8.0f, (float)((b >> 20u) & 0xFu) - 8.0f,
+                (float)((b >> 24u) & 0xFu) - 8.0f, (float)(b >> 28u) - 8.0f);
+}
+kernel void q4tp_matvec_bk(
+    device const uchar* q    [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       y    [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    constant uint&      nb   [[buffer(5)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float lad[8u * 4u * 32u];
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    bool active = r0 < rows;
+    uint nr = active ? min(rows - r0, 4u) : 0u;
+    uint cols = gpr * 32u;
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint  stride     = (gpr * 5u + 7u) / 8u;
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* ph = (device const half*)(q + params_off + (ulong)(r0 + ri) * 4ul);
+        lad[(sg * 4u + ri) * 32u + lane] = exp2((float)ph[0] + (float)lane * (float)ph[1]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    // acc[element][row]: one float4 per element (rows r0..r0+3), 8 elements
+    float4 acc[8];
+    for (uint e = 0u; e < 8u; ++e) acc[e] = float4(0.0f);
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint xb = g * 32u;
+        uint bit = g * 5u;
+        uint cb  = bit >> 3u;
+        uint shf = bit & 7u;
+        // the four rows' packed words and scales — 16 uints + 4 floats resident
+        uint4 w[4];
+        float4 sc = float4(0.0f);
+        for (uint ri = 0u; ri < 4u; ++ri) {
+            if (ri < nr) {
+                uint r = r0 + ri;
+                device const uint4* p4 = (device const uint4*)(q + ((ulong)r * gpr + (ulong)g) * 16ul);
+                w[ri] = p4[0];
+                device const uchar* cp = q + codes_off + (ulong)r * (ulong)stride + cb;
+                uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+                sc[ri] = lad[(sg * 4u + ri) * 32u + code];
+            } else {
+                w[ri] = uint4(0u);
+            }
+        }
+        // x once per element, the four rows re-unpacked from their words
+        // (q4_dot8_fast fuses unpack and multiply): measured 1.85 ms a gate
+        // call at b=5 on the M4 against 4.0 with x reloaded per row and 2.3
+        // with the rows' unpacked weights held in registers (occupancy).
+        for (uint e = 0u; e < nb; ++e) {
+            device const float4* xv = (device const float4*)(x + (ulong)e * cols + xb);
+            float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+            float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+            float4 gs;
+            for (uint ri = 0u; ri < 4u; ++ri) {
+                uint4 ww = w[ri];
+                gs[ri] = q4_dot8_fast(ww.x, x0, x1) + q4_dot8_fast(ww.y, x2, x3)
+                       + q4_dot8_fast(ww.z, x4, x5) + q4_dot8_fast(ww.w, x6, x7);
+            }
+            acc[e] += sc * gs;
+        }
+    }
+    for (uint e = 0u; e < 8u; ++e) {
+        if (e >= nb) break;
+        float4 v = acc[e];
+        v.x = simd_sum(v.x); v.y = simd_sum(v.y); v.z = simd_sum(v.z); v.w = simd_sum(v.w);
+        if (lane == 0u) {
+            device float* yr = y + (ulong)e * rows + r0;
+            yr[0] = v.x;
+            if (nr > 1u) yr[1] = v.y;
+            if (nr > 2u) yr[2] = v.z;
+            if (nr > 3u) yr[3] = v.w;
+        }
+    }
+}
+
 // Job-batched q4tp matvec: ONE dispatch covers every routed expert of a
 // MoE layer.
 //
@@ -4507,6 +4601,8 @@ struct Ctx {
     q4t_dual: ComputePipelineState,
     q4t_dsilu: ComputePipelineState,
     q4tp: ComputePipelineState,
+    /// Batched (b ≤ 8) q4tp matvec — the speculative verify's kernel.
+    q4tpbk: ComputePipelineState,
     /// Job-batched q4tp matvec + its two MoE companions: the whole
     /// expert block in four dispatches instead of four per expert.
     q4tpjobs: ComputePipelineState,
@@ -4702,6 +4798,7 @@ fn init() -> Result<Ctx, String> {
     let q4t_dual = pso("q4t_matvec_dual")?;
     let q4t_dsilu = pso("q4t_matvec_dsilu")?;
     let q4tp = pso("q4tp_matvec")?;
+    let q4tpbk = pso("q4tp_matvec_bk")?;
     let q4tpjobs = pso("q4tp_matvec_jobs")?;
     let q2tpjobs = pso("q2tp_matvec_jobs")?;
     let moesel = pso("moe_topk_select")?;
@@ -4775,6 +4872,7 @@ fn init() -> Result<Ctx, String> {
         q4t_dual,
         q4t_dsilu,
         q4tp,
+        q4tpbk,
         q4tpjobs,
         q2tpjobs,
         moesel,
@@ -5524,6 +5622,135 @@ fn encode_q4tp_matvec(
         MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
         MTLSize::new(sgs * 32, 1, 1),
     );
+}
+
+/// Batched q4tp matvec: `xs` holds `nb` activation vectors of `gpr·32`
+/// floats end to end, `y` receives `nb·rows` outputs (element-major).
+/// One weight stream for the whole batch — the speculative verify's
+/// projection. `nb` ≤ 8.
+fn encode_q4tp_matvec_bk(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &WeightArena,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    rows: usize,
+    gpr: usize,
+    nb: usize,
+) {
+    debug_assert!((1..=8).contains(&nb));
+    enc.set_compute_pipeline_state(&c.q4tpbk);
+    fbuf.bind(enc, 0, abs);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let gpr_u = gpr as u32;
+    let rows_u = rows as u32;
+    let nb_u = nb as u32;
+    enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+    let sgs = 8u64;
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
+}
+
+/// The batched q4tp matvec as one submit (tests, microbench): `pre` is
+/// `b` activation vectors end to end, `out` receives `b·rows`.
+pub fn q4tp_matvec_batch(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    pre: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if cols % 32 != 0 || !(1..=8).contains(&b) || pre.len() < b * cols || out.len() < b * rows {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let Some(need) =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+    else {
+        return false;
+    };
+    if abs + need > safe_len {
+        return false;
+    }
+    let xs_buf = c._device.new_buffer_with_data(
+        pre.as_ptr() as *const std::ffi::c_void,
+        (b * cols * 4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let y_buf = c._device.new_buffer(
+        (b * rows * 4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        encode_q4tp_matvec_bk(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, cols / 32, b);
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
+    }
+    true
+}
+
+/// Kernel-time microbench (tests): `reps` dispatches of one projection in
+/// ONE command buffer, so the per-submit cost drops out. `which`: 0 = the
+/// one-vector matvec (b must be 1), 1 = the batched matvec, 2 = the
+/// simdgroup GEMM. Returns wall ms per dispatch.
+pub fn q4tp_kernel_bench(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    b: usize,
+    rows: usize,
+    cols: usize,
+    which: u32,
+    reps: usize,
+) -> Option<f64> {
+    let c = ctx()?;
+    let entry = &model.tensors[idx];
+    let abs = model.entry_abs_offset(entry)?;
+    let (fbuf, _safe) = file_buffer(c, model)?;
+    let xs: Vec<f32> = (0..b * cols).map(|i| ((i % 97) as f32 - 48.0) / 48.0).collect();
+    let xs_buf = c._device.new_buffer_with_data(
+        xs.as_ptr() as *const std::ffi::c_void,
+        (b * cols * 4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let y_buf = c._device.new_buffer((b * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        for _ in 0..reps {
+            match which {
+                0 => encode_q4tp_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, cols / 32),
+                1 => encode_q4tp_matvec_bk(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, cols / 32, b),
+                _ => {
+                    let rs = c._device.new_buffer(16, MTLResourceOptions::StorageModeShared);
+                    enc_mul_mm(c, enc, &fbuf, abs, &rs, MmKind::Q4tp, &xs_buf, &y_buf, b, rows, cols)
+                }
+            }
+        }
+        enc.end_encoding();
+    }
+    let t = std::time::Instant::now();
+    submit_and_wait(c, cmd, &[&y_buf]);
+    Some(t.elapsed().as_secs_f64() * 1e3 / reps as f64)
 }
 
 /// Encode a projection `in_buf → out_buf` for a Q1 / Q1T / Q4-block weight.
