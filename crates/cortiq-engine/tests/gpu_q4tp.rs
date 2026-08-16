@@ -300,7 +300,6 @@ fn check_mm_b(
     }
 }
 
-#[cfg(target_os = "macos")]
 /// The Metal batched matvec (the speculative verify's kernel) against
 /// the dequant reference on every batch it serves — same 1e-4 band as
 /// the wgpu one; on macOS only.
@@ -395,6 +394,7 @@ fn metal_q4tp_mm_n8_matches_dequant_reference() {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn metal_q4tp_matmat_matches_dequant_reference() {
     let _gpu = gpu_serial();
